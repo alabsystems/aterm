@@ -8,6 +8,7 @@ use aterm_predict::{EditKey, EditOutcome, KeySample, PredictMode, Seen};
 use aterm_time::Instant;
 
 /// The predictor's one clock read, for every export below: the real monotonic
+/// clock, or the instant a test pinned ([`pin_clock`]).
 #[inline]
 fn clock() -> Instant {
     #[cfg(test)]
@@ -43,6 +44,7 @@ pub(crate) struct PredRows {
 
 impl PredRows {
     /// Refill the extracted row from visible row `row` of `term`: the frame's
+    /// own extraction of it (`Terminal::logical_row_into`).
     #[inline]
     fn read(&mut self, term: &Terminal, row: u16) {
         self.logical = term.logical_row_into(
@@ -54,6 +56,9 @@ impl PredRows {
     }
 
     /// Column `col` of the extracted row as the predictor reads it: its glyph,
+    /// OPAQUE on either half of a wide glyph, on a cluster or combining marks, and
+    /// anywhere on a row drawn at DEC double size; a column past a trimmed row is
+    /// the implicit blank.
     #[inline]
     fn seen(&self, col: usize) -> Seen {
         let Some(cell) = self.cells.get(col) else {
@@ -257,6 +262,7 @@ mod tests {
     use crate::WebTerminal;
 
     /// A terminal on the system font, or COULD NOT RUN where the host has
+    /// none (the same posture as the other binding tests).
     fn terminal() -> WebTerminal {
         super::pin_clock(Some(aterm_time::Instant::now()));
         crate::system_font_terminal(4, 20, 16.0)
@@ -285,6 +291,10 @@ mod tests {
     }
 
     /// An edit key goes through `predict_edit_key`: on a line whose glyphs have
+    /// echoed, `←` is armed as an edit and paints no cell, its cursor handed over
+    /// by `predict_overlay_cursor` until its echo retires it; a Backspace at the
+    /// end of the line is an erase, its vacated cell a blank ghost; an unknown
+    /// code is ignored.
     #[test]
     fn an_edit_key_is_armed_and_its_cursor_handed_over() {
         let mut t = terminal();
@@ -319,6 +329,9 @@ mod tests {
     }
 
     /// A glyph typed inside a line whose glyphs have echoed is a SHIFT: the
+    /// overlay is the state it leaves, the typed glyph and the text it moved,
+    /// each a `[row, col, codepoint]` triple, with the state's cursor; the echo
+    /// that writes the glyph, the shifted tail and steps back retires it.
     #[test]
     fn a_shift_s_moved_text_comes_out_as_triples() {
         let mut t = terminal();
@@ -498,6 +511,7 @@ mod tests {
     }
 
     /// A run's first press hands the predictor the cursor row, the tail guard's
+    /// reference: a right prompt the echo leaves in place proves the line.
     #[test]
     fn a_run_s_first_press_hands_the_predictor_its_row() {
         let mut t = terminal();
@@ -516,6 +530,7 @@ mod tests {
     }
 
     /// A press with the page scrolled back hands no row: the view's row at the
+    /// cursor's index is history, not the line the cursor is on.
     #[test]
     fn a_press_while_scrolled_back_hands_no_row() {
         let mut t = terminal();

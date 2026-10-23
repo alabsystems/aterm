@@ -1,23 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// ─── The warm spare's holds, on real shells (docs/DESIGN-warm-spare-2026-10-16.md) ───
-//
-// `include!`d into lib.rs's `#[cfg(test)] mod tests` after tests_tty.rs, whose
-// helpers (`LiveShell`, `folder_with_edits`, `stdout_between`) it uses.
-//
-// A spare is a shell aterm spawned before anyone asked for it. Its wrapper waits
-// at the PARKED hold, before any startup file, for one line on a FIFO the host
-// holds open: `go` runs the startup files in view, as a cold tab would; `run`
-// runs them unseen, and the integration waits again at the WARM hold, the top of
-// the first prompt hook, before any prompt work. These tests drive /bin/zsh and
-// /bin/bash on a real pty (`script`), started the way aterm starts a tab, with
-// the FIFO at the path the shell derives from its re-key path, and measure what
-// the design claims: nothing of the user's runs before the line that asks for
-// it, the shell signs exactly one start record, a warm tab's first prompt reads
-// as a cold tab's (its `$?`, `$SECONDS`, history and prompt hooks), the holds
-// ride out a resize's SIGWINCH, and a discarded spare writes no history.
-
 /// The capability nonce the rig hands every shell (64 lowercase hex).
 #[cfg(unix)]
 const SPARE_NONCE: &str = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
@@ -32,8 +15,6 @@ fn signed_p(prop: &str) -> String {
     format!("\x1b]633;P;{prop};id={SPARE_NONCE}\x07")
 }
 
-/// One spare's world: a home, this build's scripts, and a control dir whose
-/// `rekey/<sid>` names the shell's re-key file and whose `spare/<sid>` is its
 /// FIFO (made by [`Self::fifo`], or never, for a cold shell).
 #[cfg(unix)]
 struct SpareRig {
@@ -73,8 +54,6 @@ impl SpareRig {
         self.home.join(marker).exists()
     }
 
-    /// Make the spare's FIFO and hold it open read-write, as the host does for
-    /// the spare's life: the shell's open never blocks, and a line written
     /// before the shell reads waits in the pipe.
     fn fifo(&self) -> std::fs::File {
         self.make_fifo();
@@ -85,7 +64,6 @@ impl SpareRig {
             .expect("hold the FIFO")
     }
 
-    /// Make the spare's FIFO and hold nothing of it: a hold's open then waits
     /// for a writer ([`Self::writer_met_by`]).
     fn make_fifo(&self) {
         let made = Command::new("/usr/bin/mkfifo")
@@ -97,12 +75,6 @@ impl SpareRig {
         assert!(made.success(), "mkfifo {}", self.fifo.display());
     }
 
-    /// A writer of the FIFO [`Self::make_fifo`] made, opened as `sh`'s hold opens
-    /// it to read: a FIFO's open for writing waits for a reader, so when this
-    /// returns the hold has the FIFO open, and what is written and closed now is
-    /// what it reads, then end of file. Its parked mark is printed before that
-    /// open, so a writer let go of on seeing the mark could close before the
-    /// open and leave it waiting for a writer for good. A hang detector: a hold
     /// that never opens the FIFO fails at [`LiveShell::TIMEOUT`].
     fn writer_met_by(&self, sh: &LiveShell) -> std::fs::File {
         let path = self.fifo.clone();
@@ -128,15 +100,11 @@ impl SpareRig {
         }
     }
 
-    /// An interactive `shell` on a real pty, started from this build's folder the
-    /// way aterm starts a tab, with the rig's nonce and re-key path. Unlike
     /// `spawn_pty_shell` it waits for nothing: a spare prints no prompt.
     fn spawn(&self, shell: ShellType, program: &str) -> LiveShell {
         self.spawn_from(shell, program, &self.dir)
     }
 
-    /// An rc that leaves a job running lends its private PID file to the
-    /// shell guard before the first wait can fail. Unknown custody retains
     /// this entire rig as well as the shell's hermetic home.
     fn spawn_with_job(&self, shell: ShellType, program: &str, host: &std::fs::File) -> LiveShell {
         let release = host.try_clone().expect("duplicate the rig's own FIFO");
@@ -150,7 +118,6 @@ impl SpareRig {
         sh
     }
 
-    /// [`Self::spawn`] started in folder `cwd`, as a tab asked for there, with
     /// `env` added to what it inherits.
     fn spawn_in(
         &self,
@@ -212,9 +179,6 @@ impl SpareRig {
             cmd.env(key, value);
         }
         if shell == ShellType::Fish {
-            // As the live fish lanes start it: its config and data in the
-            // rig's home, its data dirs aterm's conf.d and the hermetic one,
-            // and a terminal it sends no queries to (nothing here answers).
             cmd.env("XDG_CONFIG_HOME", self.home.join(".config"))
                 .env("XDG_DATA_HOME", self.home.join(".local").join("share"))
                 .env(
@@ -279,7 +243,6 @@ impl LiveShell {
         self.wait_exit_status("did not exit");
     }
 
-    /// End a shell the test no longer needs: `script` killed, its pty closed,
     /// the shell hung up.
     fn kill_now(mut self) {
         if self.job.is_some() {
@@ -331,7 +294,6 @@ fn spare_bash() -> &'static str {
     bash_shell()
 }
 
-/// `${BASH_VERSINFO[0]}` of `bash`: the spare hold's SIGWINCH negative control
 /// holds only where a signal fails the hold's FIFO open (bash 3.2).
 #[cfg(unix)]
 fn bash_major_version(bash: &str) -> u32 {
@@ -354,18 +316,12 @@ fn spare_shells() -> Vec<(ShellType, &'static str, &'static str)> {
     ]
 }
 
-/// S1, the PARKED hold. With the FIFO present no startup file runs until a line
-/// arrives: `go` runs them in view, then the shell signs `cold` and its first
-/// prompt; `run` runs them unseen, then it signs `spare` and draws no prompt
-/// until `go`. What was typed meanwhile waits in the tty and runs after the
-/// release (S7). Negative control: with no FIFO the same shell runs its startup
 /// files at once and signs `cold`, never `parked`.
 #[cfg(unix)]
 #[test]
 fn a_spare_runs_no_startup_file_until_asked_and_signs_one_start_record() {
     for (shell, program, rc) in spare_shells() {
         let rc_body = ": > \"$HOME/rc.ran\"\nPS1='P> '\n".to_owned();
-        // Negative control: no FIFO, a cold shell.
         let rig = SpareRig::new();
         rig.rc(rc, &rc_body);
         let mut sh = rig.spawn(shell, program);
@@ -379,7 +335,6 @@ fn a_spare_runs_no_startup_file_until_asked_and_signs_one_start_record() {
         );
         sh.finish();
 
-        // `go`: in view, as a cold shell started now.
         let rig = SpareRig::new();
         rig.rc(rc, &rc_body);
         let mut host = rig.fifo();
@@ -397,7 +352,6 @@ fn a_spare_runs_no_startup_file_until_asked_and_signs_one_start_record() {
         );
         sh.finish();
 
-        // `run`: unseen, then held at the first prompt hook until `go`.
         let rig = SpareRig::new();
         rig.rc(rc, &rc_body);
         let mut host = rig.fifo();
@@ -406,8 +360,6 @@ fn a_spare_runs_no_startup_file_until_asked_and_signs_one_start_record() {
         tell(&mut host, "run");
         let spare = sh.wait_for_after(&signed_p("AtermStart=spare"), parked);
         assert!(rig.ran("rc.ran"), "{program}: told to run, the rc ran");
-        // What is typed before the release: the kernel echoes it now, and no
-        // prompt was drawn before it.
         sh.send("echo TYPED$((40+2))");
         let echoed = sh.wait_for_after("echo TYPED$((40+2))", spare);
         assert!(
@@ -428,33 +380,20 @@ fn a_spare_runs_no_startup_file_until_asked_and_signs_one_start_record() {
     }
 }
 
-/// THE PARKED RETARGET (2026-10-18): a parked shell started in one folder and
-/// told `go <folder>` reads, at its first prompt, as a cold shell started in
-/// that folder: its `$PWD`, the folder its commands run in (`pwd -P`), and its
-/// `$OLDPWD`, set or not and handed to a command or not, before and after its
-/// first `cd` (zsh starts with `$OLDPWD` at `$PWD`; bash with it unset but
-/// exported, or the one it inherited). NEGATIVE CONTROL: a plain `go` leaves
-/// it in the folder it was started in, even with a `__aterm_spare_cd` in the
 /// environment it inherited: only a line told names a folder.
 #[cfg(unix)]
 #[test]
 fn a_parked_shell_told_a_folder_reads_as_a_cold_shell_started_there() {
-    // `$PWD`, the physical folder, `$OLDPWD` (or `unset`) and whether a
-    // command's environment carries it; the last two again after `cd /`.
     const PROBE: &str = "printf 'RD=%s|%s|%s|%s|' \"$PWD\" \"$(pwd -P)\" \"${OLDPWD-unset}\" \
          \"$(env | grep -c '^OLDPWD=')\"; cd /; printf '%s|%s|E%s\\n' \"${OLDPWD-unset}\" \
          \"$(env | grep -c '^OLDPWD=')\" \"$((40+2))\"";
     for (shell, program, rc) in spare_shells() {
-        // Both folders spelled as the kernel names them (the host's
-        // `retarget_folder` names nothing else).
         let scratch = aterm_tempfile::tempdir().expect("tempdir");
         let root = std::fs::canonicalize(scratch.path()).expect("canonical scratch");
         let (there, elsewhere) = (root.join("there"), root.join("elsewhere"));
         for d in [&there, &elsewhere] {
             std::fs::create_dir(d).expect("folder");
         }
-        // `None`: a cold shell started there; else a parked one started
-        // elsewhere and released with this line.
         let reading = |release: Option<&str>, env: &[(&str, &Path)]| -> String {
             let rig = SpareRig::new();
             rig.rc(rc, ": rc ran\n");
@@ -504,20 +443,11 @@ fn a_parked_shell_told_a_folder_reads_as_a_cold_shell_started_there() {
     }
 }
 
-/// S2, zsh: a warm tab's first prompt reads as a cold tab's. The `$?` an rc
-/// ending in `false` leaves; a hook the rc put ahead of aterm's re-run after
-/// the release, silenced
-/// (it reads what the file holds now, and its stderr appears once, from its run
-/// at spare time). A history parameter of the rc's is readonly (a hardened rc:
-/// SAVEHIST, which the hold zeroes, then HISTFILE, which `fc -p` sets) and its
-/// history file is not there yet, so the release would read it again: the hold
-/// and the release leave them as they are. The flags name what would keep a
 /// generation from running unseen: a `sched` event, a job, a periodic hook.
 #[cfg(unix)]
 #[test]
 fn a_warm_zsh_first_prompt_reads_as_a_cold_one() {
     let zsh = spare_zsh();
-    // The rc's history parameters readonly, one and then the other.
     for ro in ["SAVEHIST", "HISTFILE"] {
         let rc = format!(
             "PS1='ST=%? P> '\nHISTFILE=\"$HOME/hist\"\ntypeset -r {ro}\n\
@@ -525,7 +455,6 @@ fn a_warm_zsh_first_prompt_reads_as_a_cold_one() {
              precmd_functions=(ahead $precmd_functions)\n\
              false\n"
         );
-        // Cold: the reference prompt.
         let rig = SpareRig::new();
         rig.rc(".zshrc", &rc);
         std::fs::write(rig.home.join("f"), "before").unwrap();
@@ -573,7 +502,6 @@ fn a_warm_zsh_first_prompt_reads_as_a_cold_one() {
         sh.finish();
     }
 
-    // The flags: a pending `sched` event, a job and a periodic hook.
     for unwinding in [false, true] {
         let rig = SpareRig::new();
         rig.rc(
@@ -595,8 +523,6 @@ fn a_warm_zsh_first_prompt_reads_as_a_cold_one() {
     }
 }
 
-/// Observe the real job before normal cleanup or an assertion-like unwind.
-/// Both must retire that same process and close both pumps; killing `script`
 /// alone leaves the job-control process group and its pipe descriptors alive.
 #[cfg(unix)]
 fn assert_job_cleanup(sh: LiveShell, unwinding: bool) {
@@ -622,8 +548,6 @@ fn assert_job_cleanup(sh: LiveShell, unwinding: bool) {
     }
 }
 
-/// The history a shell holds and leaves, read back the same way for a cold tab
-/// and a warm one: the in-memory list with its event numbers, `$HISTCMD`, the
 /// prompt's `%!`, `$SAVEHIST`, then the file after `exit`. Timestamps are blanked.
 #[cfg(unix)]
 fn zsh_history_reading(rig: &SpareRig, warm: bool, append_during_hold: &str) -> String {
@@ -649,7 +573,6 @@ fn zsh_history_reading(rig: &SpareRig, warm: bool, append_during_hold: &str) -> 
     }
     sh.wait_for_line_editor();
     let from = sh.output().len();
-    // `DU""MP`: the listing quotes this line, and must not hold the marker.
     sh.send(
         "print -r -- \"DU\"\"MP $HISTCMD ${(%):-%!} $SAVEHIST\"; fc -l 1; print -r -- END$((40+2))",
     );
@@ -661,7 +584,7 @@ fn zsh_history_reading(rig: &SpareRig, warm: bool, append_during_hold: &str) -> 
     let blank = |text: &str| -> String {
         text.lines()
             .map(|l| {
-                // `: <epoch>:<elapsed>;cmd` (EXTENDED_HISTORY) loses its stamp.
+                // Blank extended-history timestamp.
                 match l.strip_prefix(": ").and_then(|r| r.split_once(';')) {
                     Some((_, cmd)) => format!(": T;{cmd}"),
                     None => l.to_owned(),
@@ -673,21 +596,10 @@ fn zsh_history_reading(rig: &SpareRig, warm: bool, append_during_hold: &str) -> 
     format!("{}\n--- file ---\n{}", dump.replace('\r', ""), blank(&file))
 }
 
-/// S3, zsh: the history a warm tab holds after its release is exactly a cold
-/// tab's, for 8 history options set as the 16 words of the extended Hamming
-/// code (a strength-3 covering array: every three options take each of their
-/// eight on/off assignments in some rc, so a difference that any three options
-/// make between a warm and a cold tab is met), plus a zsh with no append option
-/// (it rewrites its file at exit) and SAVEHIST under HISTSIZE, and one whose rc
-/// unsets SAVEHIST (at 0: zsh goes on saving at an unset SAVEHIST's last value,
-/// which no parameter reads back), with the file
-/// appended during the hold and left unchanged. The release reads the file
-/// again as a cold start reads it (`fc -p`, the rc's sizes kept), with the
 /// stale list pushed under at SAVEHIST 0, so it is never written back.
 #[cfg(unix)]
 #[test]
 fn a_warm_zsh_holds_and_leaves_the_history_a_cold_one_does() {
-    // COULD NOT RUN here, before any worker starts, where the host lacks zsh or a pty.
     spare_zsh();
     const OPTS: [&str; 8] = [
         "extended_history",
@@ -699,9 +611,6 @@ fn a_warm_zsh_holds_and_leaves_the_history_a_cold_one_does() {
         "hist_expire_dups_first",
         "hist_find_no_dups",
     ];
-    // The extended Hamming code [8,4,4]: the XOR of any subset of these four
-    // words, bit `i` setting `OPTS[i]`. Its dual distance is 4, so any three bits
-    // run through all eight assignments over its 16 words.
     const GENERATORS: [u8; 4] = [0b0000_1111, 0b0011_0011, 0b0101_0101, 0b1111_1111];
     let words: Vec<u8> = (0..16u8)
         .map(|k| {
@@ -765,13 +674,6 @@ fn a_warm_zsh_holds_and_leaves_the_history_a_cold_one_does() {
     );
 }
 
-/// A warm zsh's release reads the history file again only when the file moved
-/// during the hold (its mtime, size or inode), so a release the file did not
-/// move pays no read. Seen through a rewrite of the same size in place: with the
-/// file's mtime put back, the list after the release is the one the shell read
-/// at its start; with it moved, the one on disk. The rig's home has no atpkg
-/// hook, so zsh/stat is not yet loaded at the hold (a session shell defers it to
-/// the first hook it stamps); a hold that does not load it itself has no stamp
 /// and reads the file again at every release, which fails the first case.
 #[cfg(unix)]
 #[test]
@@ -862,7 +764,6 @@ fn bash_history_reading(rig: &SpareRig, warm: bool, append_during_hold: &str) ->
         .map(|l| if l.starts_with('#') { "#T" } else { l })
         .collect::<Vec<_>>()
         .join("\n");
-    // `history`'s own timestamps (HISTTIMEFORMAT) are the clock's: blanked.
     let dump: String = dump
         .replace('\r', "")
         .lines()
@@ -875,22 +776,10 @@ fn bash_history_reading(rig: &SpareRig, warm: bool, append_during_hold: &str) ->
     format!("{dump}\n--- file ---\n{blank}")
 }
 
-/// S4, bash: the same for four history knobs set as the eight masks of even
-/// weight (each knob is the parity of the other three, so every three knobs
-/// take all eight of their assignments, all four set and none among them), plus
-/// a shell with HISTFILE unset, one under `set -e` whose HISTFILE is a
-/// directory (bash's own load reads nothing and goes on; a release that read
-/// anything but a regular file would end the shell), one whose rc saved a
-/// line of its own (`history -s`: bash then reads no file at its start, and
-/// the release reads none either), and one under `set -e` whose history
-/// variables are readonly (a hardened /etc/profile: the release's assignments
-/// fail alone, and its first prompt is drawn). bash 3.2 has no fork-free stat,
-/// so the release always reads the list again (`history -c; history -r`),
 /// which is what a cold start reads from the same file.
 #[cfg(unix)]
 #[test]
 fn a_warm_bash_holds_and_leaves_the_history_a_cold_one_does() {
-    // COULD NOT RUN here, before any worker starts, where the host lacks a pty.
     spare_bash();
     const KNOBS: [&str; 4] = [
         "shopt -s histappend\n",
@@ -959,11 +848,6 @@ fn a_warm_bash_holds_and_leaves_the_history_a_cold_one_does() {
     );
 }
 
-/// S5: both holds ride out a resize. Ten SIGWINCHes (what each TIOCSWINSZ on
-/// the master sends the foreground group) at the parked hold and at the warm
-/// hold release neither; `go` releases each. Negative control: bash's warm hold
-/// with its loop cut and no writer held is released by the signals, as the
-/// design's probe found (bash 3.2's `read < fifo` fails when a signal
 /// interrupts the open, and the shell runs on; bash 5 restarts the open).
 #[cfg(unix)]
 #[test]
@@ -985,8 +869,6 @@ fn a_spare_hold_survives_sigwinch_and_only_go_releases_it() {
         for _ in 0..10 {
             signal("WINCH", pid);
         }
-        // `run` releases the parked hold; had a signal released it, the rc
-        // would have run before the line and the start record would say so.
         tell(&mut host, "run");
         let spare = sh.wait_for_after(&signed_p("AtermStart=spare"), parked);
         assert!(
@@ -1010,13 +892,6 @@ fn a_spare_hold_survives_sigwinch_and_only_go_releases_it() {
         sh.finish();
     }
 
-    // Negative control: bash's warm hold without the loop or the host's writer.
-    // It needs a bash whose `read < fifo` fails when a signal interrupts the
-    // open: 3.2, whatever bash the suite runs (the `bash-3.2` tool: macOS's
-    // /bin/bash, GNU's 3.2.57 in the Linux lane's guest). Bash 5 restarts the
-    // open (Linux's 5.2 and Homebrew's 5.3 on macOS: sixty seconds of SIGWINCH
-    // every 20 ms never released it), so under it the cut hold cannot be
-    // released and there is nothing to control — the loop exists for 3.2's hold.
     let bash_3_2 = aterm_spec::host::tool("bash-3.2");
     let bash = aterm_spec::host::test_shell(bash_3_2.name)
         .map(|path| path.to_string_lossy().into_owned())
@@ -1047,9 +922,6 @@ fn a_spare_hold_survives_sigwinch_and_only_go_releases_it() {
     rig.make_fifo();
     let mut sh = rig.spawn_from(ShellType::Bash, &bash, &cut);
     let parked = sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
-    // `run` to the parked hold that has the FIFO open, and the writer let go of
-    // at once: the hold reads the line, and the warm hold's open waits for a
-    // writer.
     let mut host = rig.writer_met_by(&sh);
     tell(&mut host, "run");
     drop(host);
@@ -1070,10 +942,6 @@ fn a_spare_hold_survives_sigwinch_and_only_go_releases_it() {
     sh.kill_now();
 }
 
-/// S6: a spare discarded at either hold writes no history (its HISTFILE is
-/// byte for byte what it was, a line another tab appended during the hold
-/// included), for shells that would write at a hang-up: a zsh with no append
-/// option rewrites its file from its list, and a bash whose rc saved a line
 /// appends it. A shell whose FIFO is gone ends itself.
 #[cfg(unix)]
 #[test]
@@ -1118,8 +986,6 @@ fn a_discarded_spare_writes_no_history_and_ends_without_its_fifo() {
                 if at_warm { "warm" } else { "parked" }
             );
         }
-        // The FIFO gone and the host's writer closed: the hold that holds it
-        // reads end of file and ends the shell.
         let rig = SpareRig::new();
         rig.rc(rc_name, rc);
         rig.make_fifo();
@@ -1132,15 +998,6 @@ fn a_discarded_spare_writes_no_history_and_ends_without_its_fifo() {
     }
 }
 
-/// S8: a warm tab's `$SECONDS` carries on from its rc's run, not the hold's.
-/// An rc that sets it to 1000 reads at least 1000 after the release in both
-/// shells (a release that restarted the clock reads less). zsh also proves
-/// the hold's own time is left out, with no wall-clock bound: from the rc's
-/// realtime stamp taken just before it set the clock (`rc_at`), the start
-/// record seen (`marked`), the release written (`released`) and the shell's
-/// realtime at the read (`now`), a clock restored at the release reads at most
-/// `(marked - rc_at) + (now - released)` past 1000 however loaded the host is,
-/// and one that ran through the hold reads `released - marked` (the hold this
 /// test keeps) more.
 #[cfg(unix)]
 #[test]
@@ -1168,7 +1025,6 @@ fn a_warm_spare_carries_seconds_on_from_its_rc_run() {
         tell(&mut host, "run");
         let spare = sh.wait_for_after(&signed_p("AtermStart=spare"), parked);
         let marked = wall();
-        // A hold whose time a clock that ran through it would carry.
         std::thread::sleep(std::time::Duration::from_millis(300));
         let released = wall();
         tell(&mut host, "go");
@@ -1193,7 +1049,6 @@ fn a_warm_spare_carries_seconds_on_from_its_rc_run() {
                 .trim()
                 .parse()
                 .expect("rc-at");
-            // A millisecond for the six digits the stamps print.
             let bound = (marked - rc_at) + (now - released) + 0.001;
             assert!(
                 secs - 1000.0 <= bound,
@@ -1214,18 +1069,6 @@ fn spare_fish() -> &'static str {
     fish
 }
 
-/// No live fish of this crate's makes its man-page completions. A first prompt
-/// that finds the mark of their making missing starts fish_update_completions,
-/// a detached python that outlives the test ([`mark_fish_completions_made`]),
-/// and fish 3 and fish 4 alike ask `__fish_anypython` for that python first. A
-/// conf.d snippet of the test's answers the ask: it notes it in the home and
-/// says there is none, so no python starts. Two lanes each run a fish to its
-/// first prompt and a command typed after it, which runs once that prompt's
-/// handlers have: `spawn_live_fish`, whose cache and data dirs are the
-/// hermetic home's, and the spare rig's, whose data dir is its own home's.
-/// NEGATIVE CONTROL, in the test: the same snippet first removes the marks
-/// where the shell's environment points fish (`$XDG_CACHE_HOME`,
-/// `$XDG_DATA_HOME`), and that fish asks, so a fish that never asked could not
 /// pass the test.
 #[cfg(unix)]
 #[test]
@@ -1233,11 +1076,9 @@ fn no_live_fish_starts_its_completion_generator() {
     const ANSWER: &str = "function __fish_anypython; touch $HOME/python-asked; return 1; end\n";
     const UNMARK: &str = "rmdir $XDG_CACHE_HOME/fish/generated_completions \
                           $XDG_DATA_HOME/fish/generated_completions\n";
-    /// Whether `sh`, its home `home`, asked by the time a command typed at its
     /// first prompt ran.
     fn asked(mut sh: LiveShell, home: &Path) -> bool {
         let prompt = sh.wait_for_after("\x1b]133;A", 0);
-        // Computed, so the echoed line never matches it.
         sh.send("echo RAN(math 40 + 2)");
         sh.wait_for_after("RAN42", prompt);
         let asked = home.join("python-asked").exists();
@@ -1268,12 +1109,6 @@ fn no_live_fish_starts_its_completion_generator() {
     }
 }
 
-/// S1, fish: the WARM hold alone. fish reads no file of aterm's before its
-/// startup files, so with the FIFO present its config runs at once, unseen,
-/// then it signs `spare` and draws no prompt until `go`; what is typed
-/// meanwhile (unechoed: fish has the tty in its own mode) runs after the
-/// release. It never says it is parked, and signs
-/// one start record. Negative control: with no FIFO the same fish signs
 /// `cold` and draws its prompt at once.
 #[cfg(unix)]
 #[test]
@@ -1294,8 +1129,6 @@ fn a_warm_fish_runs_its_startup_files_at_once_and_holds_its_first_prompt() {
     let mut sh = rig.spawn(ShellType::Fish, fish);
     let spare = sh.wait_for_after(&signed_p("AtermStart=spare"), 0);
     assert!(rig.ran("rc.ran"), "fish: a spare's config ran at once");
-    // fish has the tty in its own mode by now, so nothing echoes what is
-    // typed: it waits in the tty for the line editor.
     sh.send("echo TYPED(math 40 + 2)");
     assert!(
         !sh.output().contains("\x1b]133;A"),
@@ -1314,9 +1147,6 @@ fn a_warm_fish_runs_its_startup_files_at_once_and_holds_its_first_prompt() {
     sh.finish();
 }
 
-/// One fish's first prompt as the test reads it: the `$status` its prompt
-/// function was handed, the start record's flags, and what a prompt-event
-/// handler defined ahead of aterm's (a conf.d snippet sourced first) read when
 /// it last ran. Warm: held, `state` rewritten, then released.
 #[cfg(unix)]
 fn fish_first_prompt(fish: &str, warm: bool) -> (String, String, String) {
@@ -1329,8 +1159,6 @@ fn fish_first_prompt(fish: &str, warm: bool) -> (String, String, String) {
         "conf.d/00-ahead.fish",
         "function __ahead --on-event fish_prompt; cat $HOME/state >$HOME/seen; end\n",
     );
-    // What the file holds when the shell starts: a warm one is released into
-    // "after", as a cold one starts into it.
     rig.rc("state", if warm { "before\n" } else { "after\n" });
     let mut host = warm.then(|| rig.fifo());
     let mut sh = rig.spawn(ShellType::Fish, fish);
@@ -1357,7 +1185,6 @@ fn fish_first_prompt(fish: &str, warm: bool) -> (String, String, String) {
         .and_then(|f| f.split(';').next())
         .unwrap_or_default()
         .to_owned();
-    // The markers are computed, so the echoed lines never match them.
     sh.send("echo SEEN(math 40 + 2)=(cat $HOME/seen)");
     let end = sh.wait_for_after("SEEN42=", prompt);
     let seen_end = sh.wait_for_after("\n", end);
@@ -1366,12 +1193,6 @@ fn fish_first_prompt(fish: &str, warm: bool) -> (String, String, String) {
     (status, flags, seen)
 }
 
-/// S2, fish: a warm tab's first prompt reads as a cold tab's. Its prompt is
-/// handed the `$status` a cold one's is (a config ending in `false`), and a
-/// prompt-event handler defined ahead of aterm's (`pre:1` in the flags) runs
-/// again at the release, so what it read is what the file held then, not at
-/// the spawn. The cold shell, started into what the warm one is released
-/// into, is the reading the warm one must give; without the re-run the warm
 /// one read `before` (the negative control, run by hand).
 #[cfg(unix)]
 #[test]
@@ -1385,8 +1206,6 @@ fn a_warm_fish_first_prompt_reads_as_a_cold_one() {
     );
     assert_eq!(warm, cold, "fish: (status, flags, the handler's reading)");
 
-    // The flags: a job the config left running, retired on normal cleanup
-    // and on an assertion-like unwind while fish is still in its hold.
     for unwinding in [false, true] {
         let rig = SpareRig::new();
         rig.fish_rc("config.fish", "sleep 600 &\necho $last_pid >$HOME/job\n");
@@ -1403,11 +1222,6 @@ fn a_warm_fish_first_prompt_reads_as_a_cold_one() {
     }
 }
 
-/// The prompt-event handlers a fish start record counts as ahead of aterm's
-/// (`pre:`), and a warm spare runs again at its release: the user's, defined
-/// before the integration loaded, in their order — not one named `__aterm_*`,
-/// not one defined after aterm's — and none where aterm's is the first left
-/// (fish's own first-prompt handler and aterm's two erase themselves before
 /// aterm's runs, so the test erases them as that prompt would have).
 #[cfg(unix)]
 #[test]
@@ -1443,10 +1257,6 @@ fn a_fish_counts_the_prompt_handlers_defined_ahead_of_aterms_alone() {
     );
 }
 
-/// A fish start record names the config folder as 633;E escapes a command
-/// line: a folder with nothing to escape as it is, and one holding any one of
-/// the reserved bytes (a space, `;`, a backslash, a tab) escaped. It is written
-/// to the shell's stdout, where every other mark of fish's goes (not /dev/tty,
 /// which this test's fish has none of).
 #[cfg(unix)]
 #[test]
@@ -1465,10 +1275,6 @@ fn a_fish_start_record_names_its_config_folder_escaped_on_stdout() {
                     "XDG_CONFIG_HOME",
                     config.to_str().expect("a UTF-8 temp path")
                 )],
-                // fish's own first-prompt handler, which erases itself before
-                // aterm's runs at a real first prompt; and the startup roots
-                // (fish 4 names them even to a copy sourced by hand), which
-                // are the next test's.
                 "functions -e __fish_on_interactive; set -e __aterm_start_roots; \
                  __aterm_start_mark cold",
             ),
@@ -1481,15 +1287,6 @@ fn a_fish_start_record_names_its_config_folder_escaped_on_stdout() {
     }
 }
 
-/// R7: a fish start record names the startup roots fish's own conf.d loop
-/// walks — its sysconf folder, then every vendor conf.d folder, among them the
-/// one an inherited `$XDG_DATA_DIRS` entry adds, which aterm's script is read
-/// from — joined by `\x00`, ahead of the rc folder: folders holding a space
-/// (left as it is) and a `;` (escaped as the rc folder's is, all at once), and
-/// a folder holding a tab (each through the 633 E encoder, which escapes the
-/// space too: the host decodes both alike). The oracle is fish itself:
-/// a user conf.d snippet, sourced by the same loop ahead of aterm's, writes
-/// down the list that loop walks (fish 4's global one, fish 3's local one).
 /// Negative control: the script before the record named its roots wrote none.
 #[cfg(unix)]
 #[test]
@@ -1533,8 +1330,6 @@ fn a_fish_start_record_names_the_roots_its_conf_d_loop_walks() {
             walked.contains(&vendor.to_str().expect("a UTF-8 temp path")),
             "fish: the inherited folder is walked: {walked:?}"
         );
-        // A space escaped only where the encoder ran (a folder list holding a
-        // control byte); these folders hold no backslash, so `\x20` is a space.
         let encoded = |folder: &&str| {
             let one = String::from_utf8(osc633_encode(folder)).expect("UTF-8 in, UTF-8 out");
             if name.contains('\t') {
@@ -1555,32 +1350,6 @@ fn a_fish_start_record_names_the_roots_its_conf_d_loop_walks() {
     }
 }
 
-/// The `history` a fish holds at its first prompt, cold or warm: `rc_reads`,
-/// its config reads the history at the start (so a warm one holds the file as
-/// it was then); `appended`, another session adds two commands after the
-/// start (during the hold, or before a cold start); `named`, the config names
-/// its own history session (`fish_history`).
-///
-/// fish shows another session's entry only once it is no later than the
-/// boundary its own last `history merge` (or its start) set, in whole seconds,
-/// and a merge only marks the file to be read again at the next use. So the
-/// two a warm hold appends are stamped as a concurrent session stamps them,
-/// AFTER the hold began: the second after its start mark was seen. The release
-/// is sent only once fish's own clock has reached that second, so a merge made
-/// at the release shows them, and one made before the hold began (or none)
-/// never does, however fast the machine is. A cold start reads them stamped
-/// long ago.
-///
-/// fish's clock is not the test's. fish 3 stamps and merges by libc's `time()`,
-/// which glibc serves from `CLOCK_REALTIME_COARSE`, up to a tick behind the
-/// wall clock (`CLOCK_REALTIME`, fish 4's and [`unix_secs`]'s). Measured in the
-/// Linux lane's guest (fish 3.7.0, glibc 2.39), at the wall clock's turn of a
-/// second `time()` still read the old one 8 of 8 times, for 0.7-1.7 ms: a
-/// release sent at the turn merged a second early and missed the appends. And
-/// the test's own `time()` is no stand-in for fish's: an x86_64 test under
-/// Rosetta read the new second at the turn 8 of 8 times while the guest's
-/// coarse clock, fish's, still read the old one. So the release waits until the
-/// wall clock reads the second after the stamps': a clock fish reads trails it
 /// by a tick, far less than that second, so by then each has reached them.
 #[cfg(unix)]
 fn fish_history_reading(
@@ -1640,7 +1409,6 @@ fn fish_history_reading(
         tell(host, "go");
     }
     let prompt = sh.wait_for_after("\x1b]133;A", start);
-    // A leading space keeps the line out of the history it reads.
     sh.send(" echo HIST(math 40 + 2)=(history | string join ,)");
     let at = sh.wait_for_after("HIST42=", prompt);
     let reading_end = sh.wait_for_after("\n", at);
@@ -1649,7 +1417,6 @@ fn fish_history_reading(
     reading
 }
 
-/// Whole seconds since the epoch by the wall clock, which leads every clock
 /// fish stamps its history with.
 #[cfg(unix)]
 fn unix_secs() -> u64 {
@@ -1659,7 +1426,6 @@ fn unix_secs() -> u64 {
         .as_secs()
 }
 
-/// Return once the wall clock reads second `at` or later: a wait for the
 /// clock, which must happen (within two seconds here), never for a process.
 #[cfg(unix)]
 fn until_the_clock_reads(at: u64) {
@@ -1669,14 +1435,6 @@ fn until_the_clock_reads(at: u64) {
     }
 }
 
-/// S3, fish: the history a warm tab holds after its release is a cold tab's,
-/// over the matrix of a config that reads the history at its start or not,
-/// commands another session adds during the hold or not, and the default
-/// history session or one the config names: the release takes in what
-/// arrived (`history merge`), a history nothing read yet is read afresh at
-/// first use, as a cold start reads it. The cold reading is the control each
-/// warm one must match. A merge made before the hold began, or none, misses
-/// the commands added during it ([`fish_history_reading`]'s stamps). The eight
 /// cases share nothing and run side by side.
 #[cfg(unix)]
 #[test]

@@ -1498,19 +1498,17 @@ impl TypingHold {
         sent_from: Option<aterm_core::grid::Cursor>,
         tick: std::time::Duration,
         deadline: std::time::Instant,
-    ) -> Result<(aterm_core::grid::Cursor, bool), &'static str> {
-        let mut waited = false;
+    ) -> Result<aterm_core::grid::Cursor, &'static str> {
         loop {
             let look = self.look(&term_lock(term), ctx, sent_from);
             match look {
-                Look::Held(cursor) => return Ok((cursor, waited)),
+                Look::Held(cursor) => return Ok(cursor),
                 Look::Stop(why) => return Err(why),
                 Look::Wait => {
                     let now = hold_wait_now();
                     if now >= deadline {
                         return Err("deadline");
                     }
-                    waited = true;
                     let _ = sub.wait(tick.min(deadline - now));
                 }
             }
@@ -2327,15 +2325,14 @@ pub(crate) fn cmd_turn(
             use aterm_grapheme::GraphemeClusters;
             let (head, remainder) = split_typed_cap(text, typed_cap);
             let keys = typed_key_events(head);
-            let mut type0 = Instant::now();
+            let mut due = Instant::now();
             let last_due =
-                type0 + cadence * u32::try_from(keys.len().saturating_sub(1)).unwrap_or(u32::MAX);
+                due + cadence * u32::try_from(keys.len().saturating_sub(1)).unwrap_or(u32::MAX);
             if !keys.is_empty() && last_due >= deadline {
                 return typed_cut(term, "deadline", 0, 0, turn_id);
             }
             let mut sent_from = None;
-            for (i, ev) in keys.into_iter().enumerate() {
-                let due = type0 + cadence * i as u32;
+            for ev in keys {
                 let now = Instant::now();
                 if due > now {
                     std::thread::sleep(due - now);
@@ -2346,7 +2343,6 @@ pub(crate) fn cmd_turn(
                 if exited(store) {
                     return "ERR exited\n".to_string();
                 }
-                let mut waited = false;
                 if let Some(h) = &hold {
                     let digit = is_digit_key(&ev);
                     match h.held(
@@ -2357,10 +2353,7 @@ pub(crate) fn cmd_turn(
                         cadence,
                         deadline,
                     ) {
-                        Ok((cursor, held)) => {
-                            waited = held;
-                            sent_from = Some(cursor);
-                        }
+                        Ok(cursor) => sent_from = Some(cursor),
                         Err(why) => return typed_cut(term, why, typed_keys, 0, turn_id),
                     }
                 }
@@ -2370,11 +2363,12 @@ pub(crate) fn cmd_turn(
                 if typed_keys == 0 {
                     note_ctl_input();
                 }
+                // The next key is due a cadence after this one goes out, however late
+                // that is (a wait for a frame, or a stall under load): the keys behind a
+                // late one never go out in a burst to catch up.
+                due = Instant::now() + cadence;
                 if !(io.key)(ev) {
                     return "ERR key delivery failed\n".to_string();
-                }
-                if waited {
-                    type0 += Instant::now().saturating_duration_since(due);
                 }
                 committed.get_or_insert_with(crate::control::CommittedInput::enter);
                 typed_keys += 1;
@@ -2891,20 +2885,6 @@ impl RingPage {
             n => suffix.len().saturating_sub(n),
         };
         suffix.skip(skip).cloned().collect()
-    }
-
-    fn copy_where<'a, T: Clone + 'a>(
-        &self,
-        rows: impl DoubleEndedIterator<Item = &'a T>,
-        keep: impl Fn(&T) -> bool,
-    ) -> Vec<T> {
-        let take = match self.n {
-            0 => usize::MAX,
-            n => n,
-        };
-        let mut out: Vec<T> = rows.rev().filter(|r| keep(r)).take(take).cloned().collect();
-        out.reverse();
-        out
     }
 }
 
@@ -3545,17 +3525,17 @@ fn attention_owners(meta: &crate::session_timeline::SessionMeta) -> usize {
     }
 }
 
-/// `timeline [<n>] [since=<id>]` -> the session's event timeline, oldest first, framed `OK <count>\n` + one `event <id> t=<ms> kind=<k> <payload>` line per record, with `history`'s window grammar over a drop-oldest ring.
+/// `timeline [<n>] [since=<id>]` -> the session's event timeline, oldest first, framed `OK <count>\n` + one `event <id> t=<ms> kind=<k> <payload>` line per row, with `history`'s window grammar, read from the session log's view: its rows' `Arc`s copied under the timeline's lock and formatted after it.
 pub(crate) fn cmd_timeline(ctx: &SessionCtx, rest: &str) -> String {
     let page = match RingPage::parse(rest, "timeline") {
         Ok(page) => page,
         Err(usage) => return usage,
     };
-    let events = {
+    let copy = {
         let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-        page.copy(tl.since(page.since))
+        tl.view_copy(page.since, page.n)
     };
-    timeline_reply(&events)
+    timeline_reply(&copy.rows())
 }
 
 fn timeline_reply(events: &[crate::session_timeline::TimelineEvent]) -> String {
@@ -4293,7 +4273,7 @@ pub(crate) fn cmd_raise(
     }
 }
 
-/// `exits [<n>] [since=<id>]` -> the instance's exit ledger, oldest-first, framed `OK <count>\n` + one `exit <id> t=<ms> sid=<sid> local=<n> reason=<…> exit_code=<n|-> by=<sid|human|ctl|bridge|->` line per session that left the registry — the `history`/`timeline` grammar (`<n>` keeps the last n; `since=<id>` keeps rows with id strictly greater) over the roster journal, whose seq is the row id.
+/// `exits [<n>] [since=<id>]` -> the instance's exit ledger, oldest-first, framed `OK <count>\n` + one `exit <id> t=<ms> sid=<sid> local=<n> reason=<…> exit_code=<n|-> by=<sid|human|ctl|bridge|->` line per session that left the registry — the `history`/`timeline` grammar (`<n>` keeps the last n; `since=<id>` keeps rows with id strictly greater) over the closed-session index, whose slots are linked in the write that records the roster's `Exited` row, in its seq order (the row id); bounded by the index's last 512 closes.
 pub(crate) fn cmd_exits(store: &Store, rest: &str) -> String {
     let page = match RingPage::parse(rest, "exits") {
         Ok(page) => page,
@@ -4301,14 +4281,12 @@ pub(crate) fn cmd_exits(store: &Store, rest: &str) -> String {
     };
     let rows = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
-        page.copy_where(g.roster_since(page.since.unwrap_or(0)), |r| {
-            r.change == crate::session_store::RosterChange::Exited
-        })
+        page.copy(g.closed_logs().exits_since(page.since.unwrap_or(0)))
     };
     exits_reply(&rows)
 }
 
-fn exits_reply(rows: &[crate::session_store::RosterRecord]) -> String {
+fn exits_reply(rows: &[crate::session_log::ClosedExit]) -> String {
     use std::fmt::Write as _;
     #[cfg(test)]
     crate::session_log::encode_probe();
@@ -4324,7 +4302,7 @@ fn exits_reply(rows: &[crate::session_store::RosterRecord]) -> String {
             "exit {} t={} sid={} local={} reason={} exit_code={exit_code} by={}",
             r.seq,
             r.t_ms,
-            r.sid,
+            r.sid.as_str(),
             r.local_id,
             r.reason.as_str(),
             pct_encode(r.actor.as_wire()),
@@ -4543,7 +4521,7 @@ mod tests {
         assert_eq!(cmd_history(&h.ctx, "1 since=0"), "OK 0\n");
         assert_eq!(cmd_timeline(&h.ctx, "1 since=0"), "OK 0\n");
 
-        for i in 1..=(LEDGER_CAP.max(TIMELINE_CAP) + 7) as u64 {
+        for i in 1..=(LEDGER_CAP + 7) as u64 {
             h.ctx.turns.lock().unwrap().push(TurnRecord {
                 id: i * 2,
                 started_ms: i,
@@ -4557,17 +4535,19 @@ mod tests {
                 by: TurnBy::Ctl,
                 carried: i.is_multiple_of(2),
             });
+        }
+        for i in 1..=(aterm_slog::MAX_RECORDS + 7) as u64 {
             h.ctx
                 .timeline
                 .lock()
                 .unwrap()
-                .record("title-change", format!("title=tab%20{i}"));
+                .record_hand_row("title-change", format!("title=tab%20{i}"));
         }
 
         type HistoryQuery = fn(&SessionCtx, &str) -> String;
-        let verbs: [(HistoryQuery, usize, bool); 2] = [
-            (cmd_history, LEDGER_CAP, false),
-            (cmd_timeline, TIMELINE_CAP, true),
+        let verbs: [(HistoryQuery, Option<usize>, bool); 2] = [
+            (cmd_history, Some(LEDGER_CAP), false),
+            (cmd_timeline, None, true),
         ];
         for (verb, cap, above_reads_all) in verbs {
             let all = verb(&h.ctx, "");
@@ -4581,6 +4561,13 @@ mod tests {
                     )
                 })
                 .collect();
+            if cap.is_none() {
+                assert!(
+                    rows.len() > TIMELINE_CAP,
+                    "the view holds more than the ring did"
+                );
+            }
+            let cap = cap.unwrap_or(rows.len());
             assert_eq!(rows.len(), cap, "fixture must reach ring eviction");
             let low = rows[0].0;
             let high = rows.last().unwrap().0;
@@ -4634,7 +4621,7 @@ mod tests {
     #[test]
     fn ring_reads_format_after_their_lock_is_released() {
         use crate::session_log::ENCODE_PROBE;
-        use crate::session_store::{ExitActor, ExitReason, RosterChange, new_store, test_handle};
+        use crate::session_store::{ExitActor, ExitReason, new_store, test_handle};
         use crate::turn_ledger::{ArchMark, TurnRecord};
 
         let store = new_store();
@@ -4662,7 +4649,7 @@ mod tests {
             .timeline
             .lock()
             .unwrap()
-            .record("title-change", "title=t".to_string());
+            .record_hand_row("title-change", "title=t".to_string());
 
         let held: Arc<Mutex<Vec<[bool; 3]>>> = Arc::new(Mutex::new(Vec::new()));
         let (ctx, probe_store, probe_held) =
@@ -4702,13 +4689,11 @@ mod tests {
             },
             {
                 let tl = h.ctx.timeline.lock().unwrap();
-                timeline_reply(&all.copy(tl.since(None)))
+                timeline_reply(&tl.view_copy(all.since, all.n).rows())
             },
             {
                 let g = store.read().unwrap();
-                exits_reply(
-                    &all.copy_where(g.roster_since(0), |r| r.change == RosterChange::Exited),
-                )
+                exits_reply(&all.copy(g.closed_logs().exits_since(0)))
             },
         ];
         let probes = std::mem::take(&mut *held.lock().unwrap());

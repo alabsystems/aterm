@@ -4,6 +4,7 @@
 //! The mug's clicks and its right-click menu, pure: what a click means, which rows the menu
 //! shows, and the stable tags its items carry to the AppKit target.
 
+use crate::launchd::Startup;
 use crate::model::{Choice, Mode, describe_left};
 
 /// What a click on the mug does.
@@ -111,12 +112,17 @@ pub fn about_line(version: &str) -> String {
 pub const QUIT_LABEL: &str = "Quit Caffeine";
 /// The title of Enable at Startup.
 pub const STARTUP_LABEL: &str = "Enable at Startup";
+/// Its title while Login Items' switch keeps its login plist from loading
+/// ([`Startup::Blocked`]): choosing it opens Login Items, where the person turns it on.
+pub const STARTUP_BLOCKED_LABEL: &str = "Enable at Startup \u{2014} Allow in Login Items\u{2026}";
 
-/// The menu at `now` for `mode`, with Enable at Startup checked when `startup`: the about
-/// row, the four Activate choices (the one in effect checked, a timed one with its time
-/// left), Enable at Startup, and Quit.
+/// The menu at `now` for `mode`, with Enable at Startup checked when `startup` is on (and
+/// titled for Login Items while it is blocked there; unchecked then, and while launchd has
+/// it disabled, where choosing it lifts that): the about row, the four
+/// Activate choices (the one in effect checked, a timed one with its time left), Enable at
+/// Startup, and Quit.
 #[must_use]
-pub fn compose(mode: Mode, now: u64, startup: bool, version: &str) -> Vec<Row> {
+pub fn compose(mode: Mode, now: u64, startup: Startup, version: &str) -> Vec<Row> {
     let current = mode.choice(now);
     let left = mode.remaining(now);
     let mut rows = vec![Row::Info(about_line(version)), Row::Separator];
@@ -136,9 +142,14 @@ pub fn compose(mode: Mode, now: u64, startup: bool, version: &str) -> Vec<Row> {
     }
     rows.push(Row::Separator);
     rows.push(Row::Action {
-        label: STARTUP_LABEL.to_string(),
+        label: if startup == Startup::Blocked {
+            STARTUP_BLOCKED_LABEL
+        } else {
+            STARTUP_LABEL
+        }
+        .to_string(),
         action: MenuAction::ToggleStartup,
-        checked: startup,
+        checked: startup == Startup::On,
     });
     rows.push(Row::Separator);
     rows.push(Row::Action {
@@ -199,7 +210,7 @@ mod tests {
 
     #[test]
     fn the_menu_is_about_activate_startup_quit() {
-        let rows = compose(Mode::Off, NOW, false, "0.106.0");
+        let rows = compose(Mode::Off, NOW, Startup::Off, "0.106.0");
         assert_eq!(rows[0], Row::Info(about_line("0.106.0")));
         assert_eq!(rows.iter().filter(|r| matches!(r, Row::Info(_))).count(), 1);
         let shape: Vec<_> = rows
@@ -237,7 +248,7 @@ mod tests {
     #[test]
     fn the_choice_in_effect_is_checked_with_its_time_left() {
         let mode = Mode::chosen(Choice::Hours8, NOW);
-        let items = actions(&compose(mode, NOW + 48 * 60, true, "1"));
+        let items = actions(&compose(mode, NOW + 48 * 60, Startup::On, "1"));
         let checked: Vec<_> = items
             .iter()
             .filter(|(_, _, c)| *c)
@@ -253,7 +264,7 @@ mod tests {
                 (STARTUP_LABEL, MenuAction::ToggleStartup),
             ]
         );
-        let forever = actions(&compose(Mode::Forever, NOW, false, "1"));
+        let forever = actions(&compose(Mode::Forever, NOW, Startup::Off, "1"));
         let checked: Vec<_> = forever
             .iter()
             .filter(|(_, _, c)| *c)
@@ -261,8 +272,34 @@ mod tests {
             .collect();
         assert_eq!(checked, ["Activate Forever"]);
         // Expired: nothing checked, no time left shown.
-        let expired = actions(&compose(mode, NOW + 8 * HOUR, false, "1"));
+        let expired = actions(&compose(mode, NOW + 8 * HOUR, Startup::Off, "1"));
         assert!(expired.iter().all(|(l, _, c)| !c && !l.contains("left")));
+    }
+
+    /// Blocked in Login Items, the row says where startup is turned on, unchecked: the plist
+    /// is there, but no login loads it.
+    #[test]
+    fn a_blocked_startup_points_at_login_items() {
+        let startup_row = |startup| {
+            actions(&compose(Mode::Off, NOW, startup, "1"))
+                .into_iter()
+                .find(|(_, a, _)| *a == MenuAction::ToggleStartup)
+                .map(|(l, _, c)| (l, c))
+                .expect("the startup row")
+        };
+        assert_eq!(
+            startup_row(Startup::Off),
+            (STARTUP_LABEL.to_string(), false)
+        );
+        assert_eq!(startup_row(Startup::On), (STARTUP_LABEL.to_string(), true));
+        assert_eq!(
+            startup_row(Startup::Blocked),
+            (STARTUP_BLOCKED_LABEL.to_string(), false)
+        );
+        assert_eq!(
+            startup_row(Startup::Disabled),
+            (STARTUP_LABEL.to_string(), false)
+        );
     }
 
     #[test]

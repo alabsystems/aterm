@@ -4,23 +4,12 @@
 // Derived from winit 0.30.13 src/platform_impl/macos/event.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE.
-// (Every `objc2` binding call in this file was replaced with a typed send
-// through `aterm_objc`; `objc2_foundation::run_on_main` became
-// `aterm_objc::run_on_main`; the `NSEvent`-typed parameters became raw `Id`,
-// which is what this backend's trampolines already hold. Search for the aterm
-// local-patch marker.)
-
 use std::ffi::c_void;
 
 use aterm_objc::send::{
     send_id, send_id_usize_point_usize_f64_isize_id_i16_isize_isize, send_u16, send_usize,
 };
-// LOCAL PATCH (aterm): `objc2::rc::Retained`, `objc2_app_kit`'s four `NSEvent`
-// types and `objc2_foundation`'s `run_on_main`/`NSPoint` are gone. `Obj` is the
-// +1 handle `Retained<NSEvent>` was, `Id` is the borrowed receiver, and the
-// four enum/bitmask types are plain integers whose values live in the seam's
-// `consts` module beside every other AppKit constant this fork reads.
+
 use crate::keyboard::SmolStr;
 use aterm_objc::cf::{CFDataGetBytePtr, CFDataRef, CFRelease};
 use aterm_objc::{autoreleasepool, class, run_on_main, sel, CGPoint, Id, Obj};
@@ -88,8 +77,6 @@ pub fn get_modifierless_char(scancode: u16) -> Key {
         return Key::Unidentified(NativeKey::MacOS(scancode));
     }
     if result_len == 0 {
-        // This is fine - not all keys have text representation.
-        // For instance, users that have mapped the `Fn` key to toggle
         // keyboard layouts will hit this code path.
         return Key::Unidentified(NativeKey::MacOS(scancode));
     }
@@ -97,12 +84,9 @@ pub fn get_modifierless_char(scancode: u16) -> Key {
     Key::Character(SmolStr::new(chars))
 }
 
-/// LOCAL PATCH (aterm), 2026-10-20: what a keyboard layout's key types, as
-/// `UCKeyTranslate` answers with dead keys off, so a dead key answers its own accent (German
-/// Option+N is `~`): one character, `None` for nothing or more.
+/// LOCAL PATCH (aterm), 2026-10-20.
 pub(crate) trait LayoutKeys {
-    /// The character `scancode` types with `mods`, Carbon's `UCKeyTranslate` modifier byte
-    /// ([`UC_SHIFT`], [`UC_OPTION`]).
+    /// The character `scancode` types with `mods`, Carbon's `UCKeyTranslate` modifier byte.
     fn typed(&self, scancode: u16, mods: u32) -> Option<char>;
 }
 
@@ -110,10 +94,7 @@ pub(crate) trait LayoutKeys {
 pub(crate) const UC_SHIFT: u32 = 0x02;
 pub(crate) const UC_OPTION: u32 = 0x08;
 
-/// The printable ASCII character the Option chord on `scancode` types (with Shift when `shift`)
-/// when no key of `keys` types it without Option, bare or with Shift: the only way to reach it
-/// on that layout (`platform::macos::option_only_character`). Every key code is asked, so a
-/// character a dead key puts down without Option (German `^`) counts as reachable.
+/// The printable ASCII character the Option chord on `scancode` types (with Shift when `shift`).
 pub(crate) fn option_only_ascii(
     keys: &impl LayoutKeys,
     scancode: u16,
@@ -139,8 +120,7 @@ impl CurrentLayout {
     /// The selected keyboard layout (`TISCopyCurrentKeyboardLayoutInputSource`), or `None`
     /// when it has no Unicode key table.
     fn copy() -> Option<CurrentLayout> {
-        // SAFETY: both calls take and return Carbon references: the source is +1 (released in
-        // `Drop`), and the layout data is owned by it, so it lives as long as `source` does.
+        // SAFETY: both calls take and return Carbon references: the source is +1.
         unsafe {
             let source = ffi::TISCopyCurrentKeyboardLayoutInputSource();
             if source.is_null() {
@@ -171,8 +151,7 @@ impl LayoutKeys for CurrentLayout {
         let mut string = [0; 4];
         let mut len = 0;
         let mut dead_keys = 0;
-        // SAFETY: `layout` is the live table `source` owns; the out-pointers name locals whose
-        // lengths are the ones passed.
+        // SAFETY: `layout` is the live table `source` owns; the out-pointers name locals whose.
         let status = unsafe {
             ffi::UCKeyTranslate(
                 self.layout,
@@ -204,20 +183,12 @@ pub(crate) fn option_only_character(key: PhysicalKey, shift: bool) -> Option<cha
     option_only_ascii(&CurrentLayout::copy()?, scancode, shift)
 }
 
-// Ignores all modifiers except for SHIFT (yes, even ALT is ignored).
 fn get_logical_key_char(ns_event: Id, modifierless_chars: &str) -> Key {
-    // LOCAL PATCH (aterm): `-charactersIgnoringModifiers` answers a +0
-    // autoreleased `NSString` (encoding `@16@0:8`). The pool is explicit
-    // because this is reachable from the key rows, which a caller can enter
-    // outside AppKit's own event pool (`replace_event`, the path this note
-    // first named, was cut in winit-core step 5 and restored on 2026-10-16).
     let string = autoreleasepool(|_| {
-        // SAFETY: `ns_event` is the live `NSEvent` the caller borrows for the
-        // whole of this call, and the cast matches the read encoding.
+        // SAFETY: `ns_event` is the live `NSEvent` the caller borrows for the whole of this call.
         unsafe { seam::nsstring_to_rust(send_id(ns_event, sel!(charactersIgnoringModifiers))) }
     });
     if string.is_empty() {
-        // Probably a dead key
         let first_char = modifierless_chars.chars().next();
         return Key::Dead(first_char);
     }
@@ -225,23 +196,13 @@ fn get_logical_key_char(ns_event: Id, modifierless_chars: &str) -> Key {
 }
 
 /// Create `KeyEvent` for the given `NSEvent`.
-///
-/// This function shouldn't be called when the IME input is in process.
 pub(crate) fn create_key_event(ns_event: Id, is_press: bool, is_repeat: bool) -> KeyEvent {
     use ElementState::{Pressed, Released};
     let state = if is_press { Pressed } else { Released };
 
-    // SAFETY: `ns_event` is live for the call; `-keyCode` encodes `S16@0:8`,
-    // an UNSIGNED short — see `send_u16`.
+    // SAFETY: `ns_event` is live for the call; `-keyCode` encodes `S16@0:8`, an UNSIGNED short.
     let scancode = unsafe { send_u16(ns_event, sel!(keyCode)) };
     let mut physical_key = scancode_to_physicalkey(scancode as u32);
-
-    // NOTE: The logical key should heed both SHIFT and ALT if possible.
-    // For instance:
-    // * Pressing the A key: logical key should be "a"
-    // * Pressing SHIFT A: logical key should be "A"
-    // * Pressing CTRL SHIFT A: logical key should also be "A"
-    // This is not easy to tease out of `NSEvent`, but we do our best.
 
     // SAFETY: as above; `-characters` answers a +0 autoreleased `NSString`.
     let characters =
@@ -258,7 +219,6 @@ pub(crate) fn create_key_event(ns_event: Id, is_press: bool, is_repeat: bool) ->
 
     let key_from_code = code_to_key(physical_key, scancode);
     let (logical_key, key_without_modifiers) = if matches!(key_from_code, Key::Unidentified(_)) {
-        // `get_modifierless_char/key_without_modifiers` ignores ALL modifiers.
         let key_without_modifiers = get_modifierless_char(scancode);
 
         // SAFETY: as above; `-modifierFlags` encodes `Q16@0:8`.
@@ -267,21 +227,14 @@ pub(crate) fn create_key_event(ns_event: Id, is_press: bool, is_repeat: bool) ->
         let has_cmd = has_flag(modifiers, consts::NS_EVENT_MODIFIER_FLAG_COMMAND);
 
         let logical_key = match text_with_all_modifiers.as_ref() {
-            // Only checking for ctrl and cmd here, not checking for alt because we DO want to
-            // include its effect in the key. For example if -on the German layout- one
-            // presses alt+8, the logical key should be "{"
-            // Also not checking if this is a release event because then this issue would
-            // still affect the key release.
             Some(text) if !has_ctrl && !has_cmd => {
                 // Character heeding both SHIFT and ALT.
                 Key::Character(text.clone())
             },
 
             _ => match key_without_modifiers.as_ref() {
-                // Character heeding just SHIFT, ignoring ALT.
                 Key::Character(ch) => get_logical_key_char(ns_event, ch),
 
-                // Character ignoring ALL modifiers.
                 _ => key_without_modifiers.clone(),
             },
         };
@@ -331,7 +284,6 @@ pub fn code_to_key(key: PhysicalKey, scancode: u16) -> Key {
         KeyCode::AudioVolumeUp => NamedKey::AudioVolumeUp,
         KeyCode::AudioVolumeDown => NamedKey::AudioVolumeDown,
 
-        // Other numpad keys all generate text on macOS (if I understand correctly)
         KeyCode::NumpadEnter => NamedKey::Enter,
 
         KeyCode::F1 => NamedKey::F1,
@@ -369,7 +321,7 @@ pub fn code_to_key(key: PhysicalKey, scancode: u16) -> Key {
     })
 }
 
-pub fn code_to_location(key: PhysicalKey) -> KeyLocation {
+pub const fn code_to_location(key: PhysicalKey) -> KeyLocation {
     let code = match key {
         PhysicalKey::Code(code) => code,
         PhysicalKey::Unidentified(_) => return KeyLocation::Standard,
@@ -408,9 +360,6 @@ pub fn code_to_location(key: PhysicalKey) -> KeyLocation {
     }
 }
 
-// While F1-F20 have scancodes we can match on, we have to check against UTF-16
-// constants for the rest.
-// https://developer.apple.com/documentation/appkit/1535851-function-key_unicodes?preferredLanguage=occ
 pub fn extra_function_key_to_code(scancode: u16, string: &str) -> PhysicalKey {
     if let Some(ch) = string.encode_utf16().next() {
         match ch {
@@ -425,7 +374,6 @@ pub fn extra_function_key_to_code(scancode: u16, string: &str) -> PhysicalKey {
     }
 }
 
-// The values are from the https://github.com/apple-oss-distributions/IOHIDFamily/blob/19666c840a6d896468416ff0007040a10b7b46b8/IOHIDSystem/IOKit/hidsystem/IOLLEvent.h#L258-L259
 const NX_DEVICELCTLKEYMASK: usize = 0x0000_0001;
 const NX_DEVICELSHIFTKEYMASK: usize = 0x0000_0002;
 const NX_DEVICERSHIFTKEYMASK: usize = 0x0000_0004;
@@ -436,22 +384,13 @@ const NX_DEVICERALTKEYMASK: usize = 0x0000_0040;
 const NX_DEVICERCTLKEYMASK: usize = 0x0000_2000;
 
 /// LOCAL PATCH (aterm): `NSEventModifierFlags::contains`, spelled out.
-///
-/// `objc2-app-kit` generated these as `bitflags`, whose `contains` is
-/// `self & other == other` — NOT `!= 0`. Every mask this file tests is a single
-/// bit, so the two agree today; the stricter form is written anyway because it
-/// is the one the binding had, and a future multi-bit mask would silently mean
-/// something different under the looser spelling.
 #[inline]
-fn has_flag(flags: usize, mask: usize) -> bool {
+const fn has_flag(flags: usize, mask: usize) -> bool {
     flags & mask == mask
 }
 
-/// Whether `option_as_alt` makes the Option a key event's `-modifierFlags` hold an Alt
-/// (`WindowExtMacOS::set_option_as_alt`): the held Option it names, with no Control or Command,
-/// whose chords AppKit already reads without Option (`create_key_event` takes their logical key
-/// from `-charactersIgnoringModifiers`). Upstream's `replace_event` test, on the flags alone.
-pub(super) fn option_is_alt(option_as_alt: OptionAsAlt, flags: usize) -> bool {
+/// Whether `option_as_alt` makes the Option a key event's `-modifierFlags` hold an Alt.
+pub(super) const fn option_is_alt(option_as_alt: OptionAsAlt, flags: usize) -> bool {
     let option = match option_as_alt {
         OptionAsAlt::OnlyLeft => has_flag(flags, NX_DEVICELALTKEYMASK),
         OptionAsAlt::OnlyRight => has_flag(flags, NX_DEVICERALTKEYMASK),
@@ -489,15 +428,7 @@ pub(super) fn event_mods(event: Id) -> Modifiers {
 }
 
 pub(super) fn dummy_event() -> Option<Obj> {
-    // LOCAL PATCH (aterm): the constructor answers a +0 AUTORELEASED `NSEvent`,
-    // which is why the result is retained into an `Obj` rather than wrapped.
-    // `Retained<NSEvent>` carried its own +1 and the binding did the retain
-    // invisibly; here it is written.
-    //
-    // SAFETY: the receiver is the live `NSEvent` class object and the argument
-    // list is the prototype
-    // `send_id_usize_point_usize_f64_isize_id_i16_isize_isize` names, read from
-    // `method_getTypeEncoding` — note `subtype:` is a SIGNED short.
+    // SAFETY: the receiver is the live `NSEvent` class object and the argument list is.
     let raw = unsafe {
         send_id_usize_point_usize_f64_isize_id_i16_isize_isize(
             class(c"NSEvent").as_id(),
@@ -515,12 +446,11 @@ pub(super) fn dummy_event() -> Option<Obj> {
             0,
         )
     };
-    // SAFETY: `raw` is nil or the live autoreleased event just constructed;
-    // `Obj::retain` answers `None` for nil and takes its own +1 otherwise.
+    // SAFETY: `raw` is nil or the live autoreleased event just constructed; `Obj::retain` answers.
     unsafe { Obj::retain(raw) }
 }
 
-pub(crate) fn scancode_to_physicalkey(scancode: u32) -> PhysicalKey {
+pub(crate) const fn scancode_to_physicalkey(scancode: u32) -> PhysicalKey {
     PhysicalKey::Code(match scancode {
         0x00 => KeyCode::KeyA,
         0x01 => KeyCode::KeyS,
@@ -532,7 +462,6 @@ pub(crate) fn scancode_to_physicalkey(scancode: u32) -> PhysicalKey {
         0x07 => KeyCode::KeyX,
         0x08 => KeyCode::KeyC,
         0x09 => KeyCode::KeyV,
-        // 0x0a => World 1,
         0x0b => KeyCode::KeyB,
         0x0c => KeyCode::KeyQ,
         0x0d => KeyCode::KeyW,
@@ -574,7 +503,6 @@ pub(crate) fn scancode_to_physicalkey(scancode: u32) -> PhysicalKey {
         0x31 => KeyCode::Space,
         0x32 => KeyCode::Backquote,
         0x33 => KeyCode::Backspace,
-        // 0x34 => unknown,
         0x35 => KeyCode::Escape,
         0x36 => KeyCode::SuperRight,
         0x37 => KeyCode::SuperLeft,
@@ -588,23 +516,14 @@ pub(crate) fn scancode_to_physicalkey(scancode: u32) -> PhysicalKey {
         0x3f => KeyCode::Fn,
         0x40 => KeyCode::F17,
         0x41 => KeyCode::NumpadDecimal,
-        // 0x42 -> unknown,
         0x43 => KeyCode::NumpadMultiply,
-        // 0x44 => unknown,
         0x45 => KeyCode::NumpadAdd,
-        // 0x46 => unknown,
         0x47 => KeyCode::NumLock,
-        // 0x48 => KeyCode::NumpadClear,
 
-        // TODO: (Artur) for me, kVK_VolumeUp is 0x48
-        // macOS 10.11
-        // /System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/HIToolbox.framework/
-        // Versions/A/Headers/Events.h
         0x49 => KeyCode::AudioVolumeUp,
         0x4a => KeyCode::AudioVolumeDown,
         0x4b => KeyCode::NumpadDivide,
         0x4c => KeyCode::NumpadEnter,
-        // 0x4d => unknown,
         0x4e => KeyCode::NumpadSubtract,
         0x4f => KeyCode::F18,
         0x50 => KeyCode::F19,
@@ -621,25 +540,18 @@ pub(crate) fn scancode_to_physicalkey(scancode: u32) -> PhysicalKey {
         0x5b => KeyCode::Numpad8,
         0x5c => KeyCode::Numpad9,
         0x5d => KeyCode::IntlYen,
-        // 0x5e => JIS Ro,
-        // 0x5f => unknown,
         0x60 => KeyCode::F5,
         0x61 => KeyCode::F6,
         0x62 => KeyCode::F7,
         0x63 => KeyCode::F3,
         0x64 => KeyCode::F8,
         0x65 => KeyCode::F9,
-        // 0x66 => JIS Eisuu (macOS),
         0x67 => KeyCode::F11,
-        // 0x68 => JIS Kanna (macOS),
         0x69 => KeyCode::F13,
         0x6a => KeyCode::F16,
         0x6b => KeyCode::F14,
-        // 0x6c => unknown,
         0x6d => KeyCode::F10,
-        // 0x6e => unknown,
         0x6f => KeyCode::F12,
-        // 0x70 => unknown,
         0x71 => KeyCode::F15,
         0x72 => KeyCode::Insert,
         0x73 => KeyCode::Home,
@@ -654,10 +566,7 @@ pub(crate) fn scancode_to_physicalkey(scancode: u32) -> PhysicalKey {
         0x7c => KeyCode::ArrowRight,
         0x7d => KeyCode::ArrowDown,
         0x7e => KeyCode::ArrowUp,
-        // 0x7f =>  unknown,
 
-        // 0xA is the caret (^) an macOS's German QERTZ layout. This key is at the same location as
-        // backquote (`) on Windows' US layout.
         0xa => KeyCode::Backquote,
         _ => return PhysicalKey::Unidentified(NativeKeyCode::MacOS(scancode as u16)),
     })
@@ -723,8 +632,7 @@ mod option_only_tests {
     const GRAVE: u16 = 50;
     const CIRCUMFLEX: u16 = 10;
 
-    /// The keys these rows press, as the U.S. layout has them (`UCKeyTranslate`, keyboard
-    /// type 91): no Option character is an ASCII one only Option reaches.
+    /// The keys these rows press, as the U.S.
     fn us() -> Table {
         Table(HashMap::from([
             ((L, 0), 'l'),
@@ -737,7 +645,6 @@ mod option_only_tests {
             ((SIX, UC_OPTION), '§'),
             ((GRAVE, 0), '`'),
             ((GRAVE, UC_SHIFT), '~'),
-            // Option+` is the grave dead key, whose accent the ` key types bare.
             ((GRAVE, UC_OPTION), '`'),
         ]))
     }
@@ -748,12 +655,10 @@ mod option_only_tests {
             ((L, 0), 'l'),
             ((L, UC_OPTION), '@'),
             ((N, 0), 'n'),
-            // Option+N is the tilde dead key; no key types `~` without Option.
             ((N, UC_OPTION), '~'),
             ((SIX, 0), '6'),
             ((SIX, UC_SHIFT), '&'),
             ((SIX, UC_OPTION), ']'),
-            // Option+Shift+6 is the circumflex dead key, whose accent the ^ key types bare.
             ((SIX, UC_OPTION | UC_SHIFT), '^'),
             ((CIRCUMFLEX, 0), '^'),
             ((GRAVE, 0), '<'),

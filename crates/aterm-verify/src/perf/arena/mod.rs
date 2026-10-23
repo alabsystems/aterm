@@ -599,7 +599,9 @@ pub(crate) fn target_dir() -> Result<PathBuf, String> {
 /// caller's terminal-specific settings must not change the run.
 pub(crate) fn without_aterm_env(cmd: &mut Command) -> &mut Command {
     for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("ATERM_") {
+        let name = key.to_string_lossy();
+        // The verify run's mark is no setting and stays (`VERIFY_RUN_VAR`).
+        if name.starts_with("ATERM_") && name != aterm_uds::process::VERIFY_RUN_VAR {
             cmd.env_remove(key);
         }
     }

@@ -17,6 +17,7 @@ use crate::{
 };
 
 /// Complete lines only: a text cut mid-line (at the 4 KiB cap) loses its
+/// last, torn line rather than parsing half a number.
 fn whole_lines(text: &str) -> impl Iterator<Item = &str> {
     let end = if text.ends_with('\n') {
         text.len()
@@ -398,6 +399,7 @@ fn in_dir<T>(dir: &mut PathBuf, file: &str, f: impl FnOnce(&Path) -> T) -> T {
 }
 
 /// `row` joined to the sysfs facts in `dir`, its `/sys/class/net/<if>`
+/// ([`links_under_into`]); `dir` is given back as it came.
 fn sys_link(dir: &mut PathBuf, row: NetDev) -> LinkReading {
     let flags = in_dir(dir, "flags", |p| crate::with_bounded(p, hex_flags))
         .flatten()
@@ -521,6 +523,8 @@ pub fn layout_from(
 }
 
 /// [`layout_from`]'s first rule: `None` unless at least two PMUs partition
+/// the online cores among `present` exactly; each offline present core then
+/// joins its nearest online neighbour's cluster.
 fn layout_of_pmus(
     present: &[u16],
     online: &[u16],
@@ -586,6 +590,8 @@ fn layout_of_pmus(
 }
 
 /// A hybrid PMU's level name: `cpu_core` "Performance", `cpu_atom`
+/// "Efficiency", `cpu_<kind>` its kind with a capital (`cpu_lowpower`
+/// "Lowpower").
 fn pmu_name(pmu: &str) -> String {
     match pmu {
         "cpu_core" => "Performance".to_owned(),
@@ -710,6 +716,7 @@ pub const STATUS_CAP: usize = 1 << 20;
 pub const MAX_CARDS: usize = 16;
 
 /// DRM drivers that drive a firmware framebuffer, not a GPU: a card of one
+/// is no GPU.
 const FRAMEBUFFER_DRIVERS: &[&str] = &[
     "simpledrm",
     "simple-framebuffer",
@@ -720,6 +727,7 @@ const FRAMEBUFFER_DRIVERS: &[&str] = &[
 ];
 
 /// Why a DRM driver publishes no device-wide busy figure [`Root::gpu`]
+/// reads (amdgpu's sysfs file and NVIDIA's NVML are read there).
 fn gpu_unread(driver: &str) -> Why {
     match driver {
         "i915" | "xe" => Why::NeedsPrivilege("cap_perfmon"),
@@ -748,6 +756,7 @@ pub(crate) fn pm_settled(runtime_status: &str, control: &str, boot_vga: &str) ->
 }
 
 /// The owner of a `/proc/<pid>` entry: the process's user (its effective
+/// uid while it is dumpable).
 fn owner(entry: &std::fs::DirEntry) -> Option<u32> {
     #[cfg(unix)]
     {
@@ -805,6 +814,7 @@ impl Root {
     }
 
     /// The names in directory `rel` that are `prefix` followed by digits,
+    /// with those digits, ascending, at most `cap` of them.
     fn numbered(&self, rel: &str, prefix: &str, cap: usize) -> Vec<(u32, String)> {
         let Ok(dir) = std::fs::read_dir(self.at(rel)) else {
             return Vec::new();
@@ -1120,6 +1130,10 @@ impl Root {
     }
 
     /// Process `pid`'s footprint from its `status` ([`status_footprint`]):
+    /// `Some(Some(bytes))`; `Some(None)` when the file is past
+    /// [`STATUS_CAP`] (the footprint is unknown, and no other figure stands
+    /// in for it); `None` when it is unreadable or names no anonymous
+    /// memory (a kernel thread), for the caller's fallback.
     fn status_footprint(&self, pid: u32) -> Option<Option<u64>> {
         let path = self.at(&format!("proc/{pid}/status"));
         let mut buf = [0u8; crate::READ_CAP];

@@ -2,44 +2,18 @@
 // Copyright 2026 Andrew Yates
 
 //! The cursor aurora's bloom and SDR crown, one law for both renderers.
-//!
-//! The GPU draws the bloom as a post pass (`aterm-gpu`'s `build_bloom_glow`,
-//! `fs_bloom` and `fs_sdr_glow`): the `cursor_glow_add` stream is drawn into a
-//! half-resolution target ([`BLOOM_DOWNSCALE`]), read back through a 25-tap
-//! gaussian at two radii (the white part of each sample at the radius, its
-//! chroma at [`chroma_radius`]), scaled by the strength and SCREEN-composited
-//! over the frame; on an SDR screen the glow quads are then SCREEN-composited
-//! once more, scaled by the SDR budget. This module owns the constants and the
-//! extract set the GPU uploads ([`source_quads_into`]), and evaluates the same
-//! passes on a CPU [`Frame`] ([`apply`], [`sdr_crown`]), so a frame the CPU
-//! renderer draws (the Settings preview) blooms as the live terminal does.
-//!
-//! The CPU twin evaluates each pass as the GPU's fixed function does: the
-//! extract covers a half-res texel when its centre lies in a quad, at the
-//! quad's own column there ([`crate::glow_lerp`]), blending as
-//! [`crate::over_premul`] does on the Unorm8 target; the blur samples that
-//! target bilinearly with clamped edges at every full-res pixel's centre;
-//! SCREEN is `src + dst·(1 − src)` on 8-bit channels, rounded once.
 
 use crate::{Frame, GlowQuad};
 
-/// Half-resolution divisor for the bloom target: the halo is soft, so a
-/// quarter of the pixels is plenty and keeps the blur cheap and naturally
-/// wider.
+/// Half-resolution divisor for the bloom target.
 pub const BLOOM_DOWNSCALE: u32 = 2;
-/// The default bloom strength: the share of the blurred glow added back over
-/// the frame.
+/// The default bloom strength: the share of the blurred glow added back over the frame.
 pub const BLOOM_STRENGTH: f32 = 0.85;
-/// The default blur radius in half-res texels: how far the halo spreads. It
-/// is the WHITE part's radius ([`BLOOM_CHROMA_RADIUS`] is the colour's).
+/// The default blur radius in half-res texels: how far the halo spreads.
 pub const BLOOM_RADIUS: f32 = 2.2;
-/// The chroma radius of the same 25-tap kernel (half-res texels): colour
-/// spreads less than white, so less coloured light smears into neighbouring
-/// glyphs. Always the shorter radius, so a scissor dilated by the white
-/// radius bounds it.
+/// The chroma radius of the same 25-tap kernel (half-res texels).
 pub const BLOOM_CHROMA_RADIUS: f32 = 1.2;
-/// The chroma radius as a share of the white one, so a configured radius
-/// moves both halves together.
+/// The chroma radius as a share of the white one.
 pub const BLOOM_CHROMA_SHARE: f32 = BLOOM_CHROMA_RADIUS / BLOOM_RADIUS;
 
 /// The chroma radius paired with a white blur `radius`.
@@ -49,31 +23,14 @@ pub const fn chroma_radius(radius: f32) -> f32 {
     radius * BLOOM_CHROMA_SHARE
 }
 
-/// How far the bloom's light reaches past the glow's bounding box, in
-/// full-res pixels, saturating at `u32::MAX`: `(2·radius + 1)` half-res texels
-/// (the taps plus one texel of linear filtering) and one pixel of rounding.
-/// Outside it the added light is exactly zero, which lets the GPU scissor its
-/// composite there.
+/// How far the bloom's light reaches past the glow's bounding box.
 #[inline]
 #[must_use]
 pub fn reach_px(radius: f32) -> u32 {
     (((2.0 * radius + 1.0) * BLOOM_DOWNSCALE as f32).ceil() as u32).saturating_add(1)
 }
 
-/// The bloom's extract set for a frame of `rows` grid rows: every
-/// `cursor_glow_add` quad on the grid (a quad past the last row is skipped,
-/// as the glow pass skips it), into `out`, cleared first.
-///
-/// Half-res stability: a quad thinner than one half-res texel covers a texel
-/// centre only at some alignments, so a hairline would blink in the halo.
-/// When any quad is that thin, a second copy of the set is appended with the
-/// thin axes widened to one texel and both colours of its ramp scaled by the
-/// area ratio, which conserves its energy. The extract draws
-/// `out[extract_first..]`; the SDR crown draws `out[..extract_first]` when
-/// there is a copy, else the whole set (`extract_first == 0`).
-///
-/// Returns the window-space bounding box of the set (`[x0, y0, x1, y1]`, x1
-/// and y1 exclusive, thin axes at their widened extent) and `extract_first`.
+/// The bloom's extract set for a frame of `rows` grid rows.
 pub fn source_quads_into(
     glow: &[GlowQuad],
     rows: usize,
@@ -112,8 +69,6 @@ pub fn source_quads_into(
             };
             let (num, den) = (num_w * num_h, den_w * den_h);
             if den > 1 {
-                // Both ends of the ramp scale by the same area ratio, so the
-                // widened quad's gradient is the thin quad's, dimmed.
                 let scale = |c: u32| {
                     let ch = |sh: u32| (((c >> sh) & 0xff) * num + den / 2) / den;
                     (ch(16) << 16) | (ch(8) << 8) | ch(0)
@@ -143,8 +98,7 @@ pub fn source_quads_into(
 pub struct BloomParams {
     /// The share of the blurred glow added back ([`BLOOM_STRENGTH`] default).
     pub strength: f32,
-    /// The white part's blur radius in half-res texels ([`BLOOM_RADIUS`]
-    /// default); the chroma's is [`chroma_radius`] of it.
+    /// The white part's blur radius in half-res texels; the chroma's is [`chroma_radius`] of it.
     pub radius: f32,
 }
 
@@ -157,7 +111,6 @@ impl Default for BloomParams {
     }
 }
 
-/// The colour channels of a frame pixel (`0xTTRRGGBB`, `TT` transmittance)
 /// as floats in `0..=1`.
 #[inline]
 const fn channels(p: u32) -> [f32; 3] {
@@ -168,8 +121,6 @@ const fn channels(p: u32) -> [f32; 3] {
     ]
 }
 
-/// SCREEN `src` (`0..=1` per channel, clamped first as a Unorm target clamps a
-/// fragment) over the pixel `dst`, rounded once on store; the transmittance
 /// byte rides through (the GPU writes colour only).
 #[inline]
 fn screen(dst: u32, src: [f32; 3]) -> u32 {
@@ -183,14 +134,9 @@ fn screen(dst: u32, src: [f32; 3]) -> u32 {
     out
 }
 
-/// Bloom `frame` (a grid of `rows` rows) with its `glow` stream, as the GPU's
-/// post pass does: extract at half res, blur at two radii, SCREEN the result
-/// over the frame inside the glow's box dilated by [`reach_px`]. A frame with
-/// no glow on its grid is untouched.
-///
+/// Bloom `frame` (a grid of `rows` rows) with its `glow` stream, as the GPU's post pass does.
 /// # Errors
-/// Invalid frame geometry, nonfinite tunables, a negative radius or scratch
-/// reservation failure is reported before any frame pixel changes.
+/// Invalid frame geometry.
 pub fn apply(
     frame: &mut Frame,
     glow: &[GlowQuad],
@@ -217,7 +163,6 @@ pub fn apply(
     };
     let ds = BLOOM_DOWNSCALE as usize;
     let (bw, bh) = ((w / ds).max(1), (h / ds).max(1));
-    // 1) The extract: the set over a cleared half-res Unorm8 target.
     crate::checked_frame_size_px(bh, bw, 1, 1, 0, 0)?;
     let mut half = Vec::new();
     let len = bw
@@ -236,8 +181,6 @@ pub fn apply(
             usize::from(q.w),
             usize::from(q.h),
         );
-        // Texel t is covered when its centre, full-res 2t + 1 (odd, so never
-        // on an integer edge), lies in [q, q + extent).
         let first = |start: usize| start / ds;
         let last = |end: usize| end.saturating_sub(1).div_ceil(ds);
         let (tx0, tx1) = (first(qx), last(qx + qw).min(bw));
@@ -265,7 +208,6 @@ pub fn apply(
             }
         }
     }
-    // A linear, clamp-to-edge sample of the half-res target at `uv`.
     let sample = |u: f32, v: f32| -> [f32; 3] {
         let fx = u * bw as f32 - 0.5;
         let fy = v * bh as f32 - 0.5;
@@ -286,16 +228,12 @@ pub fn apply(
         out
     };
     let white_part = |c: [f32; 3]| c[0].min(c[1]).min(c[2]);
-    // At one complete target extent every nonzero tap already clamps to an
-    // edge. Capping each radius there preserves those samples and keeps finite
-    // but enormous requests out of overflowing texture-coordinate arithmetic.
     let extent = bw.max(bh) as f32;
     let (rw, rc) = (
         params.radius.min(extent),
         chroma_radius(params.radius).min(extent),
     );
     let (tu, tv) = (1.0 / bw as f32, 1.0 / bh as f32);
-    // 2) Blur and composite, inside the dilated box.
     let d = reach_px(params.radius) as usize;
     let sx0 = (x0 as usize).saturating_sub(d);
     let sy0 = (y0 as usize).saturating_sub(d);
@@ -345,11 +283,7 @@ fn check_frame(frame: &Frame) -> Result<(), String> {
     Ok(())
 }
 
-/// The SDR crown over `frame` (a grid of `rows` rows): every glow quad on the
-/// grid SCREEN-composited once more at its ramped colour times `budget`
-/// (`hdr::sdr_glow_budget`), as the GPU's `fs_sdr_glow` draws it on an SDR
-/// screen. `budget <= 0` draws nothing; this pass allocates no scratch.
-///
+/// The SDR crown over `frame` (a grid of `rows` rows).
 /// # Errors
 /// Invalid frame geometry or a nonfinite budget is reported before any pixel changes.
 pub fn sdr_crown(
@@ -397,8 +331,6 @@ mod tests {
         }
     }
 
-    /// The bloom spreads the glow's light past its own rect, falls off with
-    /// distance, and leaves the frame untouched beyond its reach; the halo of
     /// a red quad is red. NEGATIVE CONTROL: no glow, no change.
     #[test]
     fn the_bloom_spreads_light_past_the_glow_and_no_further_than_its_reach() {
@@ -429,7 +361,6 @@ mod tests {
         )
         .unwrap();
         let p = f.pixels[3 * 20 + 3];
-        // 255·0.4 + 16·(1 − 0.4) = 111.6 -> 112.
         assert_eq!((p >> 16) & 0xff, 112);
         assert_eq!(p & 0xff, 0x10, "a channel the quad lacks keeps the ground");
         assert_eq!(f.pixels[0], 0x0010_1010, "outside the quad nothing changes");

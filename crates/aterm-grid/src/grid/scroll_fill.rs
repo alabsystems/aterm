@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Fill grid rows from scrollback [`Line`]s (Kitty CSI +T unscroll, checkpoint
-//! restore, reflow), walking grapheme units so combining marks, ZWJ sequences
-//! and other multi-codepoint clusters stay whole.
+//! Populates grid rows from scrollback [`Line`]s while preserving grapheme clusters and extras.
 
 use std::sync::Arc;
 
@@ -17,16 +15,7 @@ use super::scroll_materialize::filled_span_cols;
 use crate::Row;
 use crate::{Cell, CellCoord, CellExtras};
 
-/// Fill a detached [`Row`] from a scrollback [`Line`] and return its extras in
-/// the [`ScrolledRowExtras`] form ring rows store: scrollback reflow rebuilds
-/// ring rows at a new width with it ([`Grid::fill_row_from_line`] fills a
-/// visible row).
-///
-/// `row` must be fresh from [`Row::new`] (blank, `len` 0), as
-/// `Grid::build_scrollback_row` makes it: a second clear per rebuilt row would
-/// be pure overhead. Links and underline colours come back only on cells that
-/// got a glyph back ([`filled_span_cols`]): a one-column row cannot hold a wide
-/// glyph, so it rebuilds empty and the glyph's link must not outlive it.
+/// Fills a detached [`Row`] from `line` and returns its [`ScrolledRowExtras`].
 pub(crate) fn fill_row_into(row: &mut Row, line: &Line, cols: u16) -> ScrolledRowExtras {
     debug_assert_eq!(row.len(), 0, "fill_row_into takes a fresh row");
     let mut extras = ScrolledRowExtras::default();
@@ -64,9 +53,6 @@ pub(crate) fn fill_row_into(row: &mut Row, line: &Line, cols: u16) -> ScrolledRo
                 ));
         }
     }
-    // Images stay in span form: clipping the end column to the new width is the
-    // whole conversion, as a live footprint clips at a narrower window's margin.
-    // An image covers blank cells by design, so `filled_span_cols` does not apply.
     if let Some(spans) = line.images() {
         for span in spans {
             if span.start_col >= cols {
@@ -78,8 +64,6 @@ pub(crate) fn fill_row_into(row: &mut Row, line: &Line, cols: u16) -> ScrolledRo
             });
         }
     }
-    // SGR 58 spans back to the per-column form (re-coalesced on the next
-    // scroll), under an O(cols) budget against crafted overlapping spans.
     if let Some(spans) = line.underline_colors() {
         let mut budget = cols;
         'ul: for span in spans {
@@ -95,8 +79,7 @@ pub(crate) fn fill_row_into(row: &mut Row, line: &Line, cols: u16) -> ScrolledRo
     extras
 }
 
-/// The wide glyph that opens `row` when it continues the row before: the glyph
-/// whose early wrap left a hole at the end of that row.
+/// Returns the wide glyph opening `row` when it continues the previous row.
 pub(super) fn wrap_opening(row: &Row) -> Option<Cell> {
     row.get(0)
         .filter(|glyph| row.is_wrapped() && glyph.is_wide())
@@ -104,11 +87,7 @@ pub(super) fn wrap_opening(row: &Row) -> Option<Cell> {
 }
 
 impl Grid {
-    /// Paint the early-wrap holes closing visible rows `rows` as the print path
-    /// painted them: the blank in the background of the wide glyph that wrapped,
-    /// which opens the row below (`blank_wide_wrap_tail`). A history line leaves
-    /// its hole out, as it is no text, so a row that comes back from history
-    /// would show it unpainted. Call once the row below each is in place.
+    /// Paints early-wrap holes at the end of visible rows in `rows`.
     pub(super) fn paint_wrap_holes(&mut self, rows: core::ops::Range<u16>) {
         for row in rows {
             let Some(glyph) = self
@@ -140,8 +119,7 @@ impl Grid {
         }
     }
 
-    /// Fill visible row `row_idx` from a scrollback [`Line`]: the cells first,
-    /// then, with the row borrow released, the grid's `CellExtras`.
+    /// Fills visible row `row_idx` and its `CellExtras` from `line`.
     pub(crate) fn fill_row_from_line(&mut self, row_idx: u16, line: &Line, cols: u16) {
         let Some(text) = line.as_str() else {
             if let Some(row) = self.row_mut(row_idx) {
@@ -151,8 +129,6 @@ impl Grid {
             return;
         };
 
-        // Phase 1: populate row cells, collect deferred extras and how far
-        // the line's cells reach (the bound on every span restored below).
         let (deferred, filled) = {
             let Some(row) = self.row_mut(row_idx) else {
                 return;
@@ -163,8 +139,6 @@ impl Grid {
             result
         };
 
-        // Phase 2, row borrow released: the extras, noting their columns for
-        // HAS_EXTRAS.
         let deferred_cols: aterm_alloc::SmallVec<u16, 4> = deferred
             .iter()
             .map(|d| match d {
@@ -186,12 +160,6 @@ impl Grid {
             }
         }
 
-        // Restore hyperlinks. Column writes are bounded to O(cols): a legitimate
-        // line's spans are disjoint and never hit the budget, but a crafted
-        // stored line (checkpoint restore, Kitty unscroll) can carry up to
-        // u16::MAX overlapping full-width spans, O(spans × cols) under the
-        // terminal lock. Both passes walk the spans with the same budget, so they
-        // cover the same columns without a column list.
         if let Some(spans) = line.hyperlinks() {
             let mut any_hyperlink = false;
             let mut budget = cols;
@@ -210,8 +178,6 @@ impl Grid {
                     budget -= 1;
                 }
             }
-            // HAS_EXTRAS on exactly the cells the first pass wrote (same spans,
-            // same budget).
             if any_hyperlink {
                 if let Some(idx) = self.storage.row_index(row_idx)
                     && let Some(r) = self.storage.rows.get_mut(idx)
@@ -229,13 +195,10 @@ impl Grid {
                         }
                     }
                 }
-                // Defence in depth: a restored line may carry accumulated spam.
                 self.storage.extras.enforce_hyperlink_limit();
             }
         }
 
-        // SGR 58 underline colours, under the same budget as the hyperlinks
-        // (both passes cover the same columns).
         if let Some(spans) = line.underline_colors() {
             let mut any_ul = false;
             let mut budget = cols;
@@ -271,9 +234,6 @@ impl Grid {
             }
         }
 
-        // Images go back in the one-ref-per-cell form a live placement has,
-        // stacked in draw order under the crafted-input budget (O(cols) per
-        // layer a cell can hold).
         if let Some(spans) = line.images() {
             let mut any_image = false;
             let mut budget = usize::from(cols) * crate::extra::MAX_IMAGE_LAYERS;
@@ -310,7 +270,6 @@ impl Grid {
             }
         }
 
-        // Last, so it reads what every restore above wrote.
         self.mirror_wide_spacer_extras(row_idx);
     }
 
@@ -327,8 +286,6 @@ impl Grid {
         let Some(r) = self.storage.rows.get(idx) else {
             return;
         };
-        // The predicate the scroll-off extractor uses to drop a spacer column,
-        // so the columns healed here are exactly the columns it drops.
         let cells = r.as_slice();
         let mut pairs: aterm_alloc::SmallVec<(u16, u16), 4> = aterm_alloc::SmallVec::new();
         for i in 1..cells.len() {
@@ -342,9 +299,6 @@ impl Grid {
         }
 
         for (lead, spacer) in pairs {
-            // Ring-aware reads: `fill_row_from_line` writes RGB into the map, but
-            // a row it fills can already hold ring entries, and these are the
-            // accessors the extractor itself reads through.
             let fg = self.storage.extras.fg_rgb_for(row_idx, lead);
             let bg = self.storage.extras.bg_rgb_for(row_idx, lead);
             let underline = self
@@ -355,8 +309,6 @@ impl Grid {
             if fg.is_none() && bg.is_none() && underline.is_none() {
                 continue;
             }
-            // Copy only where the spacer has nothing of its own, so a span that
-            // already covers the pair keeps its value and the pass is idempotent.
             let have_fg = self.storage.extras.fg_rgb_for(row_idx, spacer).is_some();
             let have_bg = self.storage.extras.bg_rgb_for(row_idx, spacer).is_some();
             let have_underline = self
@@ -401,9 +353,6 @@ fn fill_row_cells(row: &mut Row, text: &str, line: &Line, cols: u16) -> (Vec<Def
 
     let mut deferred = Vec::new();
     let mut col: u16 = 0;
-    // The cells the line is drawn in, as materialize lays them out: VS16/VS15
-    // replayed so a restored `❤️` keeps two columns, with the live writer's
-    // row-edge exception, and cells the grid drew apart kept apart.
     for cell in super::scroll_materialize::StoredCells::new(line, text, cols) {
         let style = LineCellStyle {
             fg: PackedColor(cell.attrs.fg),
@@ -418,7 +367,6 @@ fn fill_row_cells(row: &mut Row, text: &str, line: &Line, cols: u16) -> (Vec<Def
         if let Some(e) = extra {
             deferred.push(e);
         }
-        // RGB colours go to the extras, deferred.
         if style.fg.is_rgb() {
             let (r, g, b) = style.fg.rgb_components();
             deferred.push(DeferredExtra::RgbFg(cell.col, [r, g, b]));
@@ -429,22 +377,8 @@ fn fill_row_cells(row: &mut Row, text: &str, line: &Line, cols: u16) -> (Vec<Def
         }
         col = new_col;
     }
-    // Every cell the line filled is content, so a printed blank stays inside
-    // the row's length as the write path counts it (`Row::set` counts only
-    // non-empty cells, and a ring row spilling to the store is staged at its
-    // length).
     row.update_len(col);
-    // A line that fills all but the last cell left that cell as the rewrap's
-    // early-wrap hole (the next glyph was wide); record it so a rewrap that
-    // rejoins this row with its continuation drops that cell and nothing else.
-    // On an uncontinued row the mark is harmless: the rejoining readers consult
-    // it only for a continued row, and history staging
-    // (`DeferredLine::new_boxed`) cuts a last cell this line never filled.
-    // The line left the hole out, so it is painted once the row below is in
-    // place (`Grid::paint_wrap_holes`).
     row.set_early_wrap_hole(super::scroll_materialize::leaves_wrap_hole(col, cols));
-    // A line that ends two or more cells short goes on at its length if the
-    // next row continues it, as it does in the store (`RowFlags::ENDS_AT_LEN`).
     row.set_ends_at_len(u32::from(col) + 1 < u32::from(cols));
     (deferred, col)
 }
@@ -470,7 +404,6 @@ fn place_line_cell(
     let c = super::scroll_materialize::char_at(unit_str, 0);
     let base_is_bmp = (c as u32) <= Cell::MAX_DIRECT_CODEPOINT;
 
-    // BMP base + only combining marks → normal cell + deferred combining.
     let combining_only = base_is_bmp
         && chars_consumed > 1
         && unit_str[c.len_utf8()..]
@@ -503,8 +436,6 @@ fn set_cell(row: &mut Row, col: u16, cols: u16, c: char, s: &LineCellStyle, is_w
     };
     if is_wide && col + 1 < cols {
         row.set(col, Cell::with_style(c, s.fg, s.bg, flags));
-        // The spacer inherits the lead's rendition (see `wide_continuation_of`);
-        // a bare role bit would un-highlight wide glyphs on scroll-back.
         row.set(
             col + 1,
             Cell::with_style(' ', s.fg, s.bg, flags.wide_continuation_of()),
@@ -635,7 +566,6 @@ mod tests {
         use aterm_scrollback::HyperlinkSpan;
         let cols = 4u16;
 
-        // Disjoint spans never hit the budget: each cell gets its span's URL.
         let mut grid = Grid::new(1, cols);
         let disjoint = vec![
             HyperlinkSpan::new(0, 2, Arc::from("a")),
@@ -654,8 +584,6 @@ mod tests {
         assert_eq!(url(&grid, 2).as_deref(), Some("b"));
         assert_eq!(url(&grid, 3).as_deref(), Some("b"));
 
-        // Crafted overlapping spans: the budget caps column writes at `cols`, so
-        // the first full-width span fills every column and the rest are skipped.
         let mut grid2 = Grid::new(1, cols);
         let overlap = vec![
             HyperlinkSpan::new(0, cols, Arc::from("first")),
@@ -679,7 +607,6 @@ mod tests {
     #[test]
     fn a_glyph_the_row_cannot_hold_takes_its_link_and_underline_colour() {
         use aterm_scrollback::{HyperlinkSpan, UnderlineColorSpan};
-        // (text, row width, the span's end, columns that hold a glyph)
         for (text, cols, end, held) in [("\u{1F680}", 1u16, 2u16, 0u16), ("a\u{4E2D}", 2, 3, 1)] {
             let mut line = Line::with_hyperlinks(
                 text,

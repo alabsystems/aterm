@@ -1,26 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Windows ConPTY end-to-end smoke tests (the Windows lane of the crate's
-//! spawn/IO coverage; the forkpty lane lives unix-gated in `src/unix.rs`).
-//!
-//! These drive the REAL seam on a real Windows 11 ConPTY: spawn → ConPTY read →
-//! child exit → waiter `ClosePseudoConsole` → broken-pipe EOF → reap → close.
-//! Every read loop is iteration-BOUNDED so a regression in the waiter-thread
-//! EOF design (the load-bearing ConPTY gotcha: `ReadFile` does NOT return when
-//! the child exits) fails the test instead of wedging the harness.
-//!
-//! ITERATION BOUNDS ARE NOT ENOUGH. They cap the NUMBER of reads, but each
-//! `aterm_pty::read` is a single blocking `ReadFile` with NO timeout — if the
-//! waiter never breaks the pipe (the exact regression these tests guard), read
-//! #1 simply never returns and the loop counter never advances, so the test
-//! binary wedges instead of failing. Hence [`run_with_deadline`]: every
-//! `#[test]` body runs on a named worker thread with a hard wall-clock
-//! deadline, and a timeout panics naming the suspected waiter/EOF
-//! regression. The wedged thread CANNOT be
-//! cancelled (there is no portable way to interrupt a parked `ReadFile` from
-//! std); it stays parked, and libtest's process exit reaps it — acceptable
-//! precisely because a timeout already means the run is a failure.
+//! Windows ConPTY end-to-end smoke tests.
 
 #![cfg(windows)]
 
@@ -28,44 +9,28 @@ use std::io;
 use std::sync::mpsc;
 use std::time::Duration;
 
-/// Hard per-test wall-clock budget. GENEROUS on purpose: the slowest body
-/// (interactive cmd.exe + `ping -n 2` ≈ seconds) finishes in well under a
-/// minute on a loaded machine, so a trip here is a real wedge, never flake.
+/// Hard per-test wall-clock budget.
 const DEADLINE: Duration = Duration::from_secs(120);
 
 /// Run `body` on a named thread and fail HARD if it outlives [`DEADLINE`].
-///
-/// Why this exists: the bounded read loops below cannot bound TIME (see the
-/// header). The completion channel is the deadline primitive — the worker
-/// sends `()` as its final statement, so `recv_timeout` distinguishes the
-/// three outcomes exactly: `Ok` = body finished, `Disconnected` = body
-/// panicked (the sender was dropped mid-body; join and re-raise the ORIGINAL
-/// panic so the assertion message survives), `Timeout` = a read is parked in
-/// `ReadFile` with no EOF coming. In the timeout arm we deliberately do NOT
-/// join — that would just move the forever-block here. The parked thread
-/// stays parked; libtest's process exit reaps it. The thread is named after
-/// the test so a debugger/stack dump of a wedged run points at the culprit.
 fn run_with_deadline(name: &str, body: impl FnOnce() + Send + 'static) {
     let (tx, rx) = mpsc::channel::<()>();
     let worker = std::thread::Builder::new()
         .name(format!("deadline:{name}"))
         .spawn(move || {
             body();
-            let _ = tx.send(()); // LAST statement: `Ok` ⇔ the body completed
+            let _ = tx.send(());
         })
         .expect("spawning the deadline worker thread must succeed");
     match rx.recv_timeout(DEADLINE) {
         Ok(()) => {
-            // Body completed; join is instantaneous (nothing runs after the
             // send), and a post-send panic is impossible by construction.
             if let Err(payload) = worker.join() {
                 std::panic::resume_unwind(payload);
             }
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            // The sender was dropped without sending ⇒ the body panicked.
-            // Join (already dead, returns immediately) and re-raise the real
-            // payload so the test failure shows the original assertion.
+            // Re-raise worker panic.
             match worker.join() {
                 Ok(()) => unreachable!("worker completed without sending its completion signal"),
                 Err(payload) => std::panic::resume_unwind(payload),
@@ -94,16 +59,14 @@ fn caps() -> (
 }
 
 /// Read until `marker` is seen (returns the accumulated bytes) or EOF/error.
-/// Bounded: at most `max_reads` blocking reads — the EOF side is guaranteed by
-/// the waiter thread breaking the pipe, so a hang here means the waiter died
-/// (and [`run_with_deadline`] converts that hang into a test failure).
 fn read_until(master: i32, marker: &[u8], max_reads: usize) -> (Vec<u8>, bool) {
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];
     for _ in 0..max_reads {
         let n = aterm_pty::read(master, &mut buf);
         if n <= 0 {
-            return (out, true); // EOF (0) or error (<0) — the reader-exit path
+            // EOF (0) or error (<0) — the reader-exit path
+            return (out, true);
         }
         out.extend_from_slice(&buf[..n as usize]);
         if !marker.is_empty() && out.windows(marker.len()).any(|w| w == marker) {
@@ -119,9 +82,6 @@ fn drain_to_eof(master: i32, max_reads: usize) -> bool {
     eof
 }
 
-// End to end: spawn `cmd /c echo`, see the marker in the ConPTY stream, watch
-// the waiter manufacture EOF after child exit, reap within the bounded budget,
-// close the master, and verify the registry-miss semantics afterwards.
 #[test]
 fn conpty_spawns_cmd_echo_and_reaps() {
     run_with_deadline("conpty_spawns_cmd_echo_and_reaps", || {
@@ -132,8 +92,8 @@ fn conpty_spawns_cmd_echo_and_reaps() {
             &spawn_cap,
             &sandbox_cap,
             &[],
-            None, // shell_override
-            None, // shell_args
+            None,
+            None,
             None,
             Some(&[
                 "cmd.exe".into(),
@@ -155,15 +115,11 @@ fn conpty_spawns_cmd_echo_and_reaps() {
             s.contains("ATERM-WIN-MARKER"),
             "echo output must appear in the ConPTY stream: {s:?}"
         );
-        // The child exits on its own; the WAITER must break the pipe → EOF. This is
-        // the load-bearing design point: without ClosePseudoConsole the read would
-        // block forever (the deadline harness catches that as a failure, not a hang).
         assert!(
             drain_to_eof(master, 200),
             "reader must observe EOF after child exit (waiter-thread ClosePseudoConsole)"
         );
 
-        // Reap is bounded (~2 s budget) and must return.
         let t0 = std::time::Instant::now();
         aterm_pty::reap(pid);
         assert!(
@@ -172,8 +128,6 @@ fn conpty_spawns_cmd_echo_and_reaps() {
         );
 
         aterm_pty::close_master(master);
-        // Registry-miss semantics after close: read errors, write_some is NotFound
-        // (proves the key is gone from the SESSIONS registry).
         let mut buf = [0u8; 8];
         assert!(
             aterm_pty::read(master, &mut buf) < 0,
@@ -189,23 +143,18 @@ fn conpty_spawns_cmd_echo_and_reaps() {
     });
 }
 
-// The write path, interactively: spawn a bare cmd.exe, type an echo + exit,
-// read the echoed marker AND the manufactured EOF, then check the recorded
-// exit code (the waitpid-status replacement).
 #[test]
 fn conpty_write_path_echoes_interactively() {
     run_with_deadline("conpty_write_path_echoes_interactively", || {
         let (spawn_cap, sandbox_cap) = caps();
-        // exec_command = ["cmd.exe"] (not shell selection) for hermeticity: the
-        // harness environment may carry ATERM_SHELL/COMSPEC variations.
         let shell = aterm_pty::spawn_shell_with_pid(
             24,
             80,
             &spawn_cap,
             &sandbox_cap,
             &[],
-            None, // shell_override
-            None, // shell_args
+            None,
+            None,
             None,
             Some(&["cmd.exe".into()]),
             None,
@@ -228,8 +177,6 @@ fn conpty_write_path_echoes_interactively() {
                 "reader must observe EOF after `exit` (waiter-thread ClosePseudoConsole)"
             );
         }
-        // EOF ⇒ the waiter already recorded the exit status (it stores the code
-        // BEFORE breaking the pipe), so this is race-free by construction.
         assert_eq!(
             aterm_pty::exit_code(pid),
             Some(0),
@@ -240,10 +187,6 @@ fn conpty_write_path_echoes_interactively() {
     });
 }
 
-// Fail-closed: a bogus -e program must surface CreateProcessW's error (the
-// `_exit(127)` analog) and leak NO session — a subsequent op on any key the
-// spawn could have minted is impossible because no SpawnedShell was returned;
-// we additionally verify resize/hangup-by-guess stay no-ops.
 #[test]
 fn bogus_exec_command_fails_closed_no_session() {
     run_with_deadline("bogus_exec_command_fails_closed_no_session", || {
@@ -254,8 +197,8 @@ fn bogus_exec_command_fails_closed_no_session() {
             &spawn_cap,
             &sandbox_cap,
             &[],
-            None, // shell_override
-            None, // shell_args
+            None,
+            None,
             None,
             Some(&["C:\\nonexistent\\aterm-no-such.exe".into()]),
             None,
@@ -263,7 +206,6 @@ fn bogus_exec_command_fails_closed_no_session() {
             aterm_sandbox::Limits::inherit(),
         )
         .expect_err("a nonexistent -e program must fail the spawn, not hand back a session");
-        // ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND surface as NotFound.
         assert_eq!(
             err.kind(),
             io::ErrorKind::NotFound,
@@ -272,11 +214,6 @@ fn bogus_exec_command_fails_closed_no_session() {
     });
 }
 
-// PATHEXT end-to-end: a bare `.cmd` shim name (the npm/yarn shape) must
-// resolve via the resolver's PATHEXT retry and launch through CreateProcessW
-// by its resolved full path.
-// Hermetic: probes a stock System32 `.cmd` (SearchPathW always searches
-// System32); a trimmed SKU without it cannot run the test (COULD NOT RUN).
 #[test]
 fn bare_cmd_shim_resolves_via_pathext_and_launches() {
     run_with_deadline("bare_cmd_shim_resolves_via_pathext_and_launches", || {
@@ -296,17 +233,16 @@ fn bare_cmd_shim_resolves_via_pathext_and_launches() {
             &spawn_cap,
             &sandbox_cap,
             &[],
-            None, // shell_override
-            None, // shell_args
             None,
-            Some(&["winrm".into()]), // bare name: only PATHEXT can resolve it
+            None,
+            None,
+            Some(&["winrm".into()]),
             None,
             None,
             aterm_sandbox::Limits::inherit(),
         )
         .expect("bare .cmd shim must spawn via the PATHEXT resolution retry");
         let (master, pid) = (shell.master, shell.pid);
-        // winrm with no args prints usage and exits; EOF proves the child ran.
         assert!(
             drain_to_eof(master, 400),
             "reader must observe EOF after the .cmd child exits"
@@ -316,9 +252,6 @@ fn bare_cmd_shim_resolves_via_pathext_and_launches() {
     });
 }
 
-// resize is callable from any thread concurrently with a parked read and with
-// writes (the control-socket threads do exactly this): drive it from a second
-// thread while the main thread reads, then tear down cleanly.
 #[test]
 fn resize_is_thread_safe_against_parked_reader() {
     run_with_deadline("resize_is_thread_safe_against_parked_reader", || {
@@ -329,13 +262,12 @@ fn resize_is_thread_safe_against_parked_reader() {
             &spawn_cap,
             &sandbox_cap,
             &[],
-            None, // shell_override
-            None, // shell_args
+            None,
+            None,
             None,
             Some(&[
                 "cmd.exe".into(),
                 "/c".into(),
-                // ping -n 2 ≈ a ~1 s child: long enough to resize while it runs.
                 "ping -n 2 127.0.0.1 > nul & echo ATERM-RESIZE-DONE".into(),
             ]),
             None,
@@ -363,12 +295,6 @@ fn resize_is_thread_safe_against_parked_reader() {
     });
 }
 
-// hangup() must end a shell that would otherwise sit at its prompt forever:
-// the close event → waiter ClosePseudoConsole → console-close signal → child
-// exits → EOF. This is the non-blocking UI-thread teardown path — and the
-// single most hang-prone assertion in the file: a waiter regression here
-// parks `drain_to_eof` in ReadFile forever, which is exactly what the
-// deadline harness exists to convert into a failure.
 #[test]
 fn hangup_ends_an_interactive_shell_with_eof() {
     run_with_deadline("hangup_ends_an_interactive_shell_with_eof", || {
@@ -379,8 +305,8 @@ fn hangup_ends_an_interactive_shell_with_eof() {
             &spawn_cap,
             &sandbox_cap,
             &[],
-            None, // shell_override
-            None, // shell_args
+            None,
+            None,
             None,
             Some(&["cmd.exe".into()]),
             None,
@@ -390,7 +316,6 @@ fn hangup_ends_an_interactive_shell_with_eof() {
         .expect("ConPTY spawn of bare cmd.exe must succeed");
         let (master, pid) = (shell.master, shell.pid);
 
-        // Wait for the first prompt bytes so the shell is definitely live.
         let (_, eof_early) = read_until(master, b">", 100);
         assert!(
             !eof_early,
@@ -407,7 +332,6 @@ fn hangup_ends_an_interactive_shell_with_eof() {
     });
 }
 
-// set_nonblocking honesty: never pretend a mode we cannot actuate succeeded.
 #[test]
 fn set_nonblocking_true_is_unsupported() {
     run_with_deadline("set_nonblocking_true_is_unsupported", || {
@@ -421,7 +345,6 @@ fn set_nonblocking_true_is_unsupported() {
     });
 }
 
-// The locale stub keeps the identical signature and injects nothing.
 #[test]
 fn resolve_spawn_locale_is_an_empty_stub() {
     run_with_deadline("resolve_spawn_locale_is_an_empty_stub", || {
@@ -433,8 +356,7 @@ fn resolve_spawn_locale_is_an_empty_stub() {
 /// Tiny test-local FFI to read a foreign process's priority class back from
 /// the KERNEL (the crate's ffi module is private by design; the smoke suite
 /// verifies through the public OS surface, in the crate's tiny-FFI house
-/// style). `PROCESS_QUERY_LIMITED_INFORMATION` (0x1000) suffices for
-/// `GetPriorityClass`.
+/// style).
 mod prio_ffi {
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -463,11 +385,6 @@ fn priority_class_of(pid: i32) -> u32 {
     class
 }
 
-// Focus boost end-to-end against the real kernel: boost ON must move the
-// spawned shell ROOT process to ABOVE_NORMAL, boost OFF must restore NORMAL —
-// verified by reading GetPriorityClass back from the OS, not by trusting the
-// call. (The conhost half has no stable public identity to assert on here;
-// its lane shares this exact code path and degrades to 0 = skip by design.)
 #[test]
 fn focus_boost_actuates_shell_priority_and_restores() {
     run_with_deadline("focus_boost_actuates_shell_priority_and_restores", || {
@@ -478,10 +395,10 @@ fn focus_boost_actuates_shell_priority_and_restores() {
             &spawn_cap,
             &sandbox_cap,
             &[],
-            None, // shell_override
-            None, // shell_args
             None,
-            Some(&["cmd.exe".into()]), // hermetic interactive child
+            None,
+            None,
+            Some(&["cmd.exe".into()]),
             None,
             None,
             aterm_sandbox::Limits::inherit(),
@@ -489,11 +406,6 @@ fn focus_boost_actuates_shell_priority_and_restores() {
         .expect("ConPTY spawn of bare cmd.exe must succeed");
         let (master, pid) = (shell.master, shell.pid);
 
-        // Live at the prompt (also proves the pid is running, so the class
-        // reads below are of a live process, not a zombie). No assert on the
-        // FRESH class: a niced test runner legally starts children below
-        // NORMAL (the Win32 inheritance rule) — the ON/OFF transitions below
-        // are the invariant, not the starting point.
         let (_, eof_early) = read_until(master, b">", 100);
         assert!(!eof_early, "shell must be alive at its prompt");
         assert_ne!(

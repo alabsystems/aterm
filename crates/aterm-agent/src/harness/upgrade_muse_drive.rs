@@ -47,12 +47,16 @@ pub(super) trait MuseKernel: Kernel {
     /// `pid`'s working directory.
     fn cwd(&self, pid: u32) -> Option<String>;
     /// Whether `pid` is still the foreground group of `tab` by the host's own
+    /// roster: asked right before every typed act.
     fn in_tab(&self, c: &mut Client, pid: u32, tab: &str) -> bool;
     /// Every descendant of `pid` (`(pid, basename)`), `None` where the
+    /// process table cannot be read: the live upgrade's process rule (G-M3,
+    /// an idle Muse Code has no child at all).
     fn descendants(&self, pid: u32) -> Option<Vec<(u32, String)>> {
         descendants_in(&table(), pid)
     }
     /// When `pid` started, unix milliseconds (the kernel's): where a
+    /// session's log begins to be this process's.
     fn started_ms(&self, pid: u32) -> Option<u64> {
         started_ms(pid)
     }
@@ -101,6 +105,7 @@ impl MuseKernel for Live {
 }
 
 /// The Muse Code lane's per-tab record prefix ([`Agent::record_prefix`]),
+/// `muse-`: placed at compile time, which fails where Muse Code keys none.
 const PREFIX: &str = match Agent::Muse.record_prefix() {
     Some(prefix) => prefix,
     None => panic!("the Muse Code lane keys its records by tab"),
@@ -116,6 +121,9 @@ fn canonical(p: &Path) -> PathBuf {
 }
 
 /// THE MANAGED MUSE CODE A RELAUNCH TYPES: atpkg's twin
+/// (`<prefix>/agents/muse`, whose `exec '<store build>' "$@"` names a
+/// `muse`), never the store build the crashed process ran (critic X3: typed,
+/// it pins that build and skips whatever the twin exports).
 fn relaunch_program(program: &Path, twin: Option<PathBuf>) -> Result<PathBuf, &'static str> {
     if !mz::store_build(program) {
         return Ok(program.to_path_buf());
@@ -124,6 +132,11 @@ fn relaunch_program(program: &Path, twin: Option<PathBuf>) -> Result<PathBuf, &'
 }
 
 /// THE SESSION `pid` HOLDS, by the kernel and by Muse Code's own lock: among
+/// the files `pid` holds open (`files`, `lsof`'s canonical paths), the
+/// `.session.lock`s at session depth under `root`
+/// ([`mz::session_of_lock`]: never a subagent's), each read for the pid its
+/// body names ([`mz::lock_pid`]); exactly one naming `pid` is its session,
+/// with that lock's path.
 fn witness(root: &Path, files: &[PathBuf], pid: u32) -> Option<(String, PathBuf)> {
     let held: BTreeSet<&PathBuf> = files.iter().collect();
     let mut found = held.into_iter().filter_map(|lock| {
@@ -136,6 +149,11 @@ fn witness(root: &Path, files: &[PathBuf], pid: u32) -> Option<(String, PathBuf)
 }
 
 /// THE SESSIONS WHOSE LOCK NAMES `pid`, under `root`, written no earlier
+/// than `since_ms` (the process's start, a second's slack): every lock at
+/// session depth read, no `lsof` asked — the follow's read, where the lock
+/// the witness found names its pid no more (`/new`, an in-TUI `/resume`),
+/// and the exit's, where a crash left `pid=` in the lock of the session its
+/// process held last.
 fn locks_naming(root: &Path, pid: u32, since_ms: u64) -> Vec<(String, PathBuf)> {
     let dirs = |p: &Path| -> Vec<PathBuf> {
         std::fs::read_dir(p)
@@ -167,6 +185,8 @@ fn locks_naming(root: &Path, pid: u32, since_ms: u64) -> Vec<(String, PathBuf)> 
 }
 
 /// The lock of `session` under `root`, wherever its date shard is
+/// (`<root>/YYYY/MM/DD/<session>/.session.lock`): a session resumed on a
+/// later day keeps the directory it began in.
 fn find_lock(root: &Path, session: &str) -> Option<PathBuf> {
     if !mz::is_session_uuid(session) {
         return None;
@@ -189,6 +209,8 @@ fn find_lock(root: &Path, session: &str) -> Option<PathBuf> {
 }
 
 /// The session's own log beside its lock: at most `cap` bytes from its end
+/// (a log longer than that is read from there, its first partial line
+/// dropped).
 fn session_log_tail(lock: &Path, cap: u64) -> Option<String> {
     use std::io::{Read as _, Seek as _, SeekFrom};
     let log = lock.parent()?.join(mz::LOG);
@@ -208,9 +230,12 @@ fn session_log_tail(lock: &Path, cap: u64) -> Option<String> {
 }
 
 /// How much of a session log's end the exit's fallback reads (its last
+/// run's start must be in it): the measured log of a session resumed twenty
+/// times was 1.2 MB.
 const LOG_BYTES: u64 = 32 << 20;
 
 /// How much of it a snapshot reads for the session's workspace, at every
+/// idle point: past that, the process's own directory stands in.
 const WORKSPACE_BYTES: u64 = 4 << 20;
 
 /// [`session_log_tail`] as the exit's fallback reads it.
@@ -219,11 +244,14 @@ fn session_log(lock: &Path) -> Option<String> {
 }
 
 /// The session's workspace as its log's newest start names it, read off
+/// [`WORKSPACE_BYTES`] of its end ([`mz::log_workspace`]).
 fn workspace_of(lock: &Path) -> Option<String> {
     session_log_tail(lock, WORKSPACE_BYTES).and_then(|log| mz::log_workspace(&log))
 }
 
 /// The data home `args` names ([`mz::data_home`]), its sessions root, and
+/// the homes its relaunch carries ([`mz::relaunch_env`]: its `HOME` too
+/// where that is another than `user_home`, the user's own).
 fn homes_of(
     args: &atpkg::caller_shell::ProcArgs,
     user_home: &Path,
@@ -240,11 +268,19 @@ fn homes_of(
 }
 
 /// THE WORD OF THE RELAUNCH LINE'S OWN COMMAND (its block `block`,
+/// [`St::line_block`], read right before the line was typed), once it ended
+/// ([`mz::line_exit_kind`]): Muse Code refused the resume (`1`, `2`), or the
+/// shell could not run the line (`cd` failed, no program: refused too), or
+/// the relaunched Muse ended by its own or someone's hand, or crashed.
 fn line_word(c: &mut Client, tab: &str, block: Option<u64>) -> Option<ExitKind> {
     line_status(c, tab, block).map(mz::line_exit_kind)
 }
 
 /// WHETHER `st` IS THE RECORD OF AN EARLIER ATTEMPT AT THIS VERY EXIT THAT
+/// TYPED ITS LINE: the same tab's record (its key), naming `snap`'s process,
+/// its line typed ([`St::relaunched_at`]) after that process started (a
+/// record of an earlier process that had the same pid number was typed
+/// before it).
 fn typed_for_exit(st: &St, snap: &super::super::relaunch::Snapshot) -> bool {
     let started_ms = snap.muse().map_or(0, |run| run.started_ms);
     st.agent == Agent::Muse
@@ -333,6 +369,8 @@ pub(super) fn follow(snap: &mut super::super::relaunch::Snapshot) -> bool {
 }
 
 /// THE WORD THE EXIT OF `snap`'S MUSE CODE LEFT: its shell's exit status of
+/// the block it ran in ([`super::super::relaunch::MuseRun::block`]), read by
+/// Muse Code's table ([`mz::exit_kind`]); `None` while no word is drawn.
 fn shell_word(opts: &Opts, snap: &super::super::relaunch::Snapshot) -> Option<ExitKind> {
     let block = snap.muse()?.block;
     connect(opts, &snap.tab)
@@ -342,6 +380,8 @@ fn shell_word(opts: &Opts, snap: &super::super::relaunch::Snapshot) -> Option<Ex
 }
 
 /// THE WORD OF THE SESSION'S OWN LOG for an exit whose shell said nothing
+/// ([`mz::log_verdict`]): only for a snapshot whose process the witness saw
+/// holding that session — a start Muse refused wrote nothing there.
 fn log_word(snap: &super::super::relaunch::Snapshot) -> Option<ExitKind> {
     let run = snap.muse()?;
     let session = snap.session.as_deref()?;
@@ -376,6 +416,8 @@ pub(super) fn look_at_exit(
 }
 
 /// The dialect of `shell` from its executable, as the relaunch line is
+/// written for it ([`shell_dialect_of`]); `None` for a shell no line is
+/// written for (`sh`, tcsh, nushell…), which [`plan`] waits on for ever.
 fn shell_dialect(shell: u32, k: &dyn MuseKernel) -> Option<Dialect> {
     shell_dialect_of(shell, k.args(shell))
 }
@@ -615,6 +657,8 @@ pub(super) fn after_exit_onto(
 }
 
 /// [`super::expired`] for a Muse Code relaunch: its exit over [`STALE_S`] ago
+/// — or the last hand that held its line, whichever is later — and not
+/// relaunched, its shell gone, or relaunched and never come up.
 fn expired(st: &St, now: u64, k: &dyn MuseKernel) -> Option<(&'static str, String)> {
     match st.phase {
         Phase::Exiting { at_s }
@@ -689,6 +733,7 @@ pub(super) fn plan(opts: &Opts, st: &St, k: &dyn MuseKernel) -> Result<Plan, NoP
 }
 
 /// Relaunch the Muse Code `st` records at its tab's shell, the harness's
+/// hand on the tab through every wait and until the new TUI's first idle.
 fn relaunch(opts: &Opts, r: Report, st: &mut St, c: &mut Client, k: &dyn MuseKernel) -> Report {
     let mut hand = Hand::take_or_none(c, &st.tab);
     let r = relaunch_held(opts, r, st, c, &mut hand, k);
@@ -795,6 +840,8 @@ fn fail(opts: &Opts, r: Report, st: &mut St, why: &str, detail: &str) -> Report 
 }
 
 /// THE RELAUNCH LINE RAN AND ENDED with no relaunched Muse Code found
+/// leading the tab ([`line_word`]'s `kind`): it never came up, or was gone
+/// before it was adopted.
 fn line_ended(opts: &Opts, r: Report, st: &mut St, kind: ExitKind) -> Report {
     let now = now_s();
     let (step, detail) = match kind {
@@ -826,6 +873,8 @@ fn line_ended(opts: &Opts, r: Report, st: &mut St, kind: ExitKind) -> Report {
 }
 
 /// Whether `pid` (argv `argv`) is the relaunch this lane typed: a child of
+/// the line's shell, not the exited TUI, a Muse Code TUI resuming the
+/// recorded session.
 fn relaunched_by_us(pid: u32, argv: &[String], st: &St, k: &dyn MuseKernel) -> bool {
     pid != st.pid
         && matches!(st.phase, Phase::Relaunched { .. } | Phase::Exiting { .. })
@@ -835,6 +884,7 @@ fn relaunched_by_us(pid: u32, argv: &[String], st: &St, k: &dyn MuseKernel) -> b
 }
 
 /// After the relaunch line: find the new TUI and carry on with it, or hand it
+/// back to its loop ([`adopt`]).
 fn await_new(opts: &Opts, r: Report, st: &mut St, c: &mut Client, k: &dyn MuseKernel) -> Report {
     let mut hand = Hand::take_or_none(c, &st.tab);
     let r = await_held(opts, r, st, c, &mut hand, k);
@@ -905,6 +955,7 @@ fn await_held(
 }
 
 /// The relaunched TUI `new`, on the record whatever becomes of it: once it is
+/// gone, a Muse Code leaving the tab is that TUI, its exit its own.
 fn found<K: Kernel + ?Sized>(st: &mut St, new: u32, k: &K) {
     if st.relaunched_pid == 0 {
         st.relaunched_start = k.process_start(new).map(|s| squash(&s)).unwrap_or_default();
@@ -915,6 +966,10 @@ fn found<K: Kernel + ?Sized>(st: &mut St, new: u32, k: &K) {
 }
 
 /// Hand the relaunched Muse Code back to its supervisor (`adopted`): the new
+/// TUI leads the tab by the host's own roster and the record stays in
+/// flight; at its loop's next idle point the relaunch primitive's
+/// continuation ([`super::super::relaunch::resume`]) types the carry-on
+/// ([`carry_on`]).
 fn adopt(
     opts: &Opts,
     mut r: Report,
@@ -1011,6 +1066,8 @@ fn carry_in_flight_with(
 }
 
 /// Whether Muse Code's composer on `scr` is empty: its caret row holds
+/// nothing, or only its prompt hint (drawn at column 2 in its dim grey,
+/// [`aterm_phase::ScreenReader::placeholder_fg`]) with nothing under it.
 fn composer_empty(c: &mut Client, tab: &str, scr: &super::Screen) -> bool {
     let Some((caret, lines)) = aterm_phase::muse::composer_draft(&scr.rows) else {
         return false;
@@ -1030,6 +1087,9 @@ fn composer_empty(c: &mut Client, tab: &str, scr: &super::Screen) -> bool {
 }
 
 /// The last look before typing into Muse Code's composer: a fresh read
+/// reading idle by its reader (no box, no turn running, its composer drawn)
+/// with the composer empty, and that read's generation, which the typed turn
+/// is fenced on.
 fn typing_fence(c: &mut Client, tab: &str) -> Result<Option<String>, &'static str> {
     let _ = turn_takes_gen(c);
     let Some(scr) = screen(c, tab) else {
@@ -1047,6 +1107,7 @@ fn typing_fence(c: &mut Client, tab: &str) -> Result<Option<String>, &'static st
 }
 
 /// Type `text` into Muse Code's composer as one turn, fenced on `generation`
+/// using the standard turn echo settle and guarded submit.
 fn type_text(c: &mut Client, tab: &str, text: &str, generation: Option<&str>) -> Result<(), Typed> {
     let fence = generation
         .filter(|g| is_generation(g))
@@ -1063,6 +1124,8 @@ fn type_text(c: &mut Client, tab: &str, text: &str, generation: Option<&str>) ->
 }
 
 /// The relaunched TUI `new` is up: once its composer is drawn, its session's
+/// lock is held by it and it reads idle and empty with no person at the tab,
+/// the continuation is typed (`continued`); a quiet relaunch types nothing.
 #[allow(clippy::too_many_arguments)]
 fn carry_on(
     opts: &Opts,
@@ -1210,6 +1273,8 @@ pub(super) fn sweep_prune(opts: &Opts, live_tabs: Option<&[LiveTab]>) {
 }
 
 /// [`prune`] with the tabs `known_live` proven live, the rendezvous registry
+/// read for the rest only where it can vouch for this state root
+/// ([`registry_graph`], [`registry_life`]).
 fn prune_known(opts: &Opts, known_live: Vec<String>) {
     let graph = registry_graph();
     prune(opts, now_s(), registry_life(graph.as_deref(), &known_live));

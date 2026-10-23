@@ -2,45 +2,24 @@
 // Copyright 2026 Andrew Yates
 
 //! CSPRNG bytes for token minting: the one audited entropy surface for the workspace.
-//!
-//! Callers that need random bytes or a hex token use [`fill`] / [`hex_token`] instead of
-//! reading `/dev/urandom` themselves: an unbounded `fs::read` of a device that never reaches
-//! EOF grows its buffer until memory runs out. Here the read is bounded (`getentropy(2)`, else
-//! `read_exact` into the caller's buffer), and the aterm-census guard `dev-read` fails any
-//! `fs::read` of a `/dev/` path.
-//!
-//! Unix mints from `getentropy(2)` with a bounded `/dev/urandom` fallback; Windows from
-//! `BCryptGenRandom` (the system-preferred RNG). On Linux and Android the fallback first
-//! waits, once per process, for `/dev/random` to report readable: unlike `getentropy(2)`,
-//! `/dev/urandom` answers before the kernel pool is seeded. `ring` (every TLS nonce and
-//! ephemeral key) draws on the same source through the first-party `getrandom` package
-//! (crates/aterm-getrandom).
 
 use std::io;
 
-/// `N` CSPRNG bytes as `2N` lowercase-hex chars: the single-use-token shape
-/// (control-socket auth token, seamless-handoff nonce, update re-exec nonce).
-///
+/// `N` CSPRNG bytes as `2N` lowercase-hex chars: the single-use-token shape.
 /// # Errors
-/// When no OS entropy source is available (see [`fill`]). The caller chooses
-/// to fail closed (no token, no socket bind) or degrade with a documented
-/// non-secret fallback; it must never retry with its own device read.
+/// When no OS entropy source is available (see [`fill`]).
 pub fn hex_token<const N: usize>() -> io::Result<String> {
     let mut buf = [0u8; N];
     fill(&mut buf)?;
     Ok(hex_encode(&buf))
 }
 
-/// Lowercase-hex encode a fixed-size byte array: exactly `2N` chars for `N` bytes,
-/// most-significant nibble first.
+/// Lowercase-hex encode a fixed-size byte array.
 #[cfg_attr(trust_verify, trust::skip)] // String allocation can panic; HEX indexing is < 16
 pub fn hex_encode<const N: usize>(bytes: &[u8; N]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    // The capacity is only a hint; `push` grows past it.
     let mut out = String::with_capacity(N.saturating_mul(2).min(4096));
     for &b in bytes {
-        // `wrapping_shr(4)` on a `u8` is exactly `>> 4`; the `& 0xf` masks are
-        // no-ops that make the `HEX` index provably < 16.
         out.push(HEX[usize::from(b.wrapping_shr(4)) & 0xf] as char);
         out.push(HEX[usize::from(b) & 0xf] as char);
     }
@@ -48,17 +27,11 @@ pub fn hex_encode<const N: usize>(bytes: &[u8; N]) -> String {
 }
 
 /// Fill `buf` from the OS CSPRNG.
-///
 /// # Errors
-/// When no OS entropy source is available. The caller must then fail closed
-/// (no token, no socket bind), never fall back to something guessable. An
-/// error never comes with a partly filled `buf` presented as success.
+/// When no OS entropy source is available.
 #[cfg(unix)]
-// Skip: bottoms out at the `getentropy(2)` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn fill(buf: &mut [u8]) -> io::Result<()> {
-    // getentropy(2) fills up to 256 bytes per call from the system CSPRNG
-    // with no fd (macOS and modern Linux).
     unsafe extern "C" {
         fn getentropy(buf: *mut core::ffi::c_void, len: usize) -> i32;
     }
@@ -66,9 +39,7 @@ pub fn fill(buf: &mut [u8]) -> io::Result<()> {
         buf,
         |chunk| {
             // `as *mut c_void` rather than `.cast()`, so the verifier sees the slice's
-            // provenance.
             // SAFETY: `chunk` is a live &mut [u8] for the call, valid for `chunk.len()`
-            // writes; `fill_from` hands over at most 256 bytes, getentropy(2)'s maximum.
             let rc =
                 unsafe { getentropy(chunk.as_mut_ptr() as *mut core::ffi::c_void, chunk.len()) };
             rc == 0
@@ -77,13 +48,8 @@ pub fn fill(buf: &mut [u8]) -> io::Result<()> {
     )
 }
 
-/// [`fill`] over an injected per-chunk source (`true`: the chunk is filled)
-/// and fallback device, so a test can force each failure.
-///
-/// The fallback re-reads the whole buffer, and a device that ends early is an error
 /// (`read_exact`), never a short fill.
 #[cfg(unix)]
-// Skip: bottoms out at the device open/read and the readiness poll's FFI.
 #[cfg_attr(trust_verify, trust::skip)]
 fn fill_from(
     buf: &mut [u8],
@@ -93,7 +59,6 @@ fn fill_from(
     if buf.chunks_mut(256).all(entropy) {
         return Ok(());
     }
-    // On Linux and Android the device answers before the pool is seeded: wait for it first.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     wait_until_rng_ready()?;
     use std::io::Read;
@@ -101,21 +66,8 @@ fn fill_from(
     f.read_exact(buf)
 }
 
-/// Block until the kernel CSPRNG has been seeded, once per process: the wait
-/// `getrandom(2)` does on its own and a `/dev/urandom` read does not.
-///
-/// Derived from `wait_until_rng_ready` in getrandom 0.2.17 `src/use_file.rs`
-/// (Copyright 2018-2024 The rust-random Project Developers; MIT OR
-/// Apache-2.0, taken here under Apache-2.0) and modified by the aterm project
-/// in 2026: std opens and closes the device, the answer is remembered in an
-/// atomic rather than in a cached descriptor, and it compiles on every Unix
-/// under test so the poll runs on a macOS box too.
-///
-/// Once is enough: `/dev/random` turns readable when the pool is first
-/// initialised, and before Linux 5.6 it could turn unreadable again as its
 /// entropy estimate drained, which `/dev/urandom` never needs to wait for.
 #[cfg(all(unix, any(target_os = "linux", target_os = "android", test)))]
-// Skip: bottoms out at the `poll(2)` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
 fn wait_until_rng_ready() -> io::Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -128,11 +80,8 @@ fn wait_until_rng_ready() -> io::Result<()> {
     Ok(())
 }
 
-/// Poll `path` for `POLLIN` with no timeout, retrying `EINTR` and `EAGAIN`.
-/// Any return of `poll(2)` but -1 is readiness, as upstream reads it (one
 /// descriptor and no timeout cannot return 0).
 #[cfg(all(unix, any(target_os = "linux", target_os = "android", test)))]
-// Skip: bottoms out at the `poll(2)` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
 fn wait_readable(path: &str) -> io::Result<()> {
     use core::ffi::{c_int, c_short};
@@ -145,8 +94,6 @@ fn wait_readable(path: &str) -> io::Result<()> {
         revents: c_short,
     }
     const POLLIN: c_short = 0x1;
-    // `nfds_t`: `unsigned long` in glibc and musl, `unsigned int` on Darwin,
-    // the BSDs and Android's bionic (as `hangup::poll_now` declares it).
     #[cfg(target_os = "linux")]
     type Nfds = core::ffi::c_ulong;
     #[cfg(not(target_os = "linux"))]
@@ -154,7 +101,6 @@ fn wait_readable(path: &str) -> io::Result<()> {
     unsafe extern "C" {
         fn poll(fds: *mut PollFd, nfds: Nfds, timeout: c_int) -> c_int;
     }
-    // Read-only and close-on-exec; dropped (closed) on every return.
     let device = std::fs::File::open(path)?;
     let mut pfd = PollFd {
         fd: device.as_raw_fd(),
@@ -162,8 +108,7 @@ fn wait_readable(path: &str) -> io::Result<()> {
         revents: 0,
     };
     loop {
-        // SAFETY: `pfd` is a live, exclusively borrowed `struct pollfd` for the
-        // call and `nfds` is 1; `device` keeps the descriptor open.
+        // SAFETY: pfd is a live, exclusively borrowed struct pollfd for the call and nfds.
         let rc = unsafe { poll(&mut pfd, 1, -1) };
         if rc >= 0 {
             return Ok(());
@@ -177,19 +122,15 @@ fn wait_readable(path: &str) -> io::Result<()> {
 }
 
 /// Fill `buf` from the OS CSPRNG.
-///
 /// # Errors
-/// When `BCryptGenRandom` reports failure. The caller must then fail closed
-/// (no token, no socket bind), never fall back to something guessable.
+/// When `BCryptGenRandom` reports failure.
 #[cfg(windows)]
-// Skip: bottoms out at the `BCryptGenRandom` FFI call (unverifiable C body).
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn fill(buf: &mut [u8]) -> io::Result<()> {
     /// NULL algorithm handle + this flag is the documented system-RNG form.
     const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
     for chunk in buf.chunks_mut(u32::MAX as usize) {
-        // SAFETY: `chunk` is a live &mut [u8] for the duration of the call;
-        // 0 == STATUS_SUCCESS.
+        // SAFETY: `chunk` is a live &mut [u8] for the duration of the call; 0 == STATUS_SUCCESS.
         let status = unsafe {
             crate::win::ffi::BCryptGenRandom(
                 core::ptr::null_mut(),
@@ -211,8 +152,6 @@ pub fn fill(buf: &mut [u8]) -> io::Result<()> {
 mod tests {
     use super::hex_encode;
 
-    /// Each output pair depends on its input byte alone, so every byte value is the whole
-    /// domain: each encodes to two lowercase-hex chars that `u8::from_str_radix` maps back,
     /// and a longer input is the concatenation of its bytes' pairs.
     #[test]
     fn hex_encode_is_exact_lowercase_and_injective() {
@@ -230,8 +169,6 @@ mod tests {
             assert!(seen.insert(hex), "{b:#04x} prints like another byte");
         }
         assert_eq!(hex_encode(&[]), "");
-        // Every byte value at every position of the two widths the workspace
-        // mints (8: the tempfile suffix, 16: the handoff nonce).
         fn concat<const N: usize>() {
             for pos in 0..N {
                 for b in 0..=u8::MAX {
@@ -247,7 +184,6 @@ mod tests {
         concat::<16>();
     }
 
-    /// The source is asked in chunks of at most 256 bytes (getentropy(2)'s cap), and a source
     /// that fills everything leaves the (nonexistent) device unopened.
     #[cfg(unix)]
     #[test]
@@ -271,8 +207,6 @@ mod tests {
         assert!(r.is_ok(), "an empty buffer asks nothing: {r:?}");
     }
 
-    /// A forced failure is an error, never a partly filled buffer: a failing source with a
-    /// missing device, or one chunk filled and a device that ends early (`/dev/null`). A
     /// fallback that succeeds (`/dev/zero`) replaces the whole buffer.
     #[cfg(unix)]
     #[test]
@@ -313,7 +247,6 @@ mod tests {
         );
     }
 
-    /// The readiness poll returns on a readable device and reports a missing one; it compiles
     /// on every Unix under test, so this runs on macOS too.
     #[cfg(unix)]
     #[test]

@@ -3305,7 +3305,8 @@ pub(crate) fn scrub_overlay_card(
 /// card's edge) and keeps the drawn icons it carries beside the card, which
 /// are per cell; an icon on the card's cells goes, and so does one that would
 /// spill into a blank cell of the card (`aterm_render::chrome_icon_spills`,
-/// the renderers' own rule). A raster left with nothing to draw goes. A
+/// the renderers' own rule: a band's badge between blanks, never a glass mark,
+/// which keeps to its own cell). A raster left with nothing to draw goes. A
 /// raster off the card's rows is untouched.
 fn cut_chrome_rasters(
     rasters: &mut Vec<aterm_render::ChromeRaster>,
@@ -3324,7 +3325,7 @@ fn cut_chrome_rasters(
             let c = usize::from(icon.col);
             let meets = |n: Option<usize>| n.is_some_and(|n| cols.contains(&n));
             !cols.contains(&c)
-                && !(aterm_render::chrome_icon_spills(line, c)
+                && !(aterm_render::chrome_icon_spills(icon.icon, line, c)
                     && (meets(c.checked_sub(1)) || meets(c.checked_add(1))))
         });
         if raster.icons.is_empty() {

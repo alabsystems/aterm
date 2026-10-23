@@ -1,20 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Where a vault lives and how its bytes move: a URL (`http://` on the LAN, `https://`
-//! anywhere, through aterm-http with `ProxyMode::Direct` and a bounded body) or a local path.
-//!
-//! A URL names the vault by its last path segment (`…/v1/<name>`); a `#<signer>` fragment
-//! (padded base64 of the signing key, `+`/`/` allowed, or URL-safe `-`/`_`) pins it.
-//!
-//! Every response body is bounded (`RequestBuilder::limit`, aterm-http's NET-6: an unbounded
-//! read is the client's default). aterm-http resolves a host on a helper and bounds the wait
-//! by the request's deadline. A slow `.local` (mDNS) resolver can outlive that wait: its helper
-//! is left to finish, not joined by the request.
-//!
-//! Errors name the scheme, host and path of a URL, never its query or fragment, and quote a
-//! server's refusal, or what went wrong talking to it, only as one line of at most 200
-//! printable ASCII characters.
+//! HTTP and local-path vault transport.
 
 use crate::Error;
 use crate::envelope::MAX_ENVELOPE;
@@ -36,15 +23,13 @@ pub enum Source {
 pub enum Fetched {
     /// The bytes at the source.
     Body(Vec<u8>),
-    /// A long-poll that ended with nothing newer (`204`), and the seq the server holds, as its
-    /// `ETag` names it (none without one).
+    /// A long-poll that ended with nothing newer (`204`).
     NoNewer(Option<u64>),
     /// Nothing there: a `404`, or no file at the path.
     Missing,
 }
 
-/// What [`fetch`] adds to `wait` for the request's own deadline, so a long-poll the server
-/// ends at exactly `wait` still reads its answer.
+/// What [`fetch`] adds to `wait` for the request's own deadline.
 pub const FETCH_MARGIN: Duration = Duration::from_secs(5);
 /// The deadline of a publish (up to 16 MiB on a LAN) and of the join exchanges.
 const EXCHANGE: Duration = Duration::from_secs(120);
@@ -55,8 +40,7 @@ const JOINS_BODY: usize = 1 << 20;
 /// The most characters of a server's reason quoted in an error.
 const REASON_CHARS: usize = 200;
 
-/// Parse what a person typed: a URL (with an optional `#<signer>` pin) or a path (absolute
-/// or starting `~/`, expanded against `home`). Returns the source and the pin, if any.
+/// Parse what a person typed.
 pub fn parse_source(
     text: &str,
     home: &std::path::Path,
@@ -81,8 +65,6 @@ pub fn parse_source(
         let pin = fragment.map(parse_pin).transpose()?;
         return Ok((Source::Url(url.to_owned()), pin));
     }
-    // A path may end in `#<signer>` like a URL; a `#` followed by anything but a key is part
-    // of the file name.
     let (path, pin) = match text.rsplit_once('#') {
         Some((path, fragment)) if !path.is_empty() => match parse_pin(fragment) {
             Ok(pin) => (path, Some(pin)),
@@ -143,8 +125,7 @@ fn parse_pin(fragment: &str) -> crate::Result<[u8; 32]> {
         .ok_or_else(refused)
 }
 
-/// The vault name a source implies: a URL's last path segment, a path's file stem. Must be
-/// `[a-z0-9][a-z0-9-]{0,62}`.
+/// The vault name a source implies: a URL's last path segment, a path's file stem.
 pub fn vault_name(source: &Source) -> crate::Result<String> {
     match source {
         Source::Url(url) => {
@@ -196,8 +177,7 @@ fn join_url(url: &str) -> String {
     }
 }
 
-/// How human-readable output names a URL: scheme, host and path (never userinfo, query or fragment, where
-/// a credential could ride).
+/// How human-readable output names a URL: scheme, host and path.
 pub fn describe(url: &str) -> String {
     match Uri::parse(base(url)) {
         Some(uri) => format!(
@@ -210,8 +190,7 @@ pub fn describe(url: &str) -> String {
     }
 }
 
-/// A server's reason: the first line of its body, at most 200 characters, printable ASCII
-/// (anything else becomes `?`). Empty when there is none.
+/// A server's reason.
 pub fn reason(body: &[u8]) -> String {
     let line = body.split(|&b| b == b'\n').next().unwrap_or_default();
     let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -246,8 +225,7 @@ fn client(timeout: Duration) -> Client {
     Client::new(Trust::PlatformVerifier, ProxyMode::Direct, timeout)
 }
 
-/// A failure to talk to the server. aterm-http quotes a malformed answer's lines in its
-/// error, so the text is cut to one printable line as a refusal's reason is.
+/// A failure to talk to the server.
 fn transport_error(what: &str, url: &str, error: &aterm_http::Error) -> Error {
     Error::new(format!(
         "{what} {}: {}",
@@ -256,19 +234,11 @@ fn transport_error(what: &str, url: &str, error: &aterm_http::Error) -> Error {
     ))
 }
 
-/// Fetch the bytes at `source` (at most [`crate::envelope::MAX_ENVELOPE`]). For a URL with
-/// `after`, a long-poll: `GET <url>?after=<n>`, which the server holds up to its hold time;
-/// `wait` bounds the whole request. A path ignores `after`.
-///
-/// The request's own deadline is `wait` plus [`FETCH_MARGIN`]. `200` is the body, `204` is
-/// [`Fetched::NoNewer`] with the seq its `ETag: "<seq>"` names, `404` (or no file at a path)
-/// is [`Fetched::Missing`], anything else an error naming the status and the server's reason.
+/// Fetch bytes at `source` ([`FETCH_MARGIN`], [`Fetched::NoNewer`], [`Fetched::Missing`]).
 pub fn fetch(source: &Source, after: Option<u64>, wait: Duration) -> crate::Result<Fetched> {
     match source {
         Source::Url(url) => match get(url, after, wait)? {
             Answer::Fetched(fetched) => Ok(fetched),
-            // To a reader of the vault an answer no vault server gives is as much a failure
-            // as a refusal; only a probe tells the two apart.
             Answer::Foreign(why) => Err(Error::new(why)),
         },
         Source::Path(path) => Ok(read_path(path)?.map_or(Fetched::Missing, Fetched::Body)),
@@ -280,17 +250,11 @@ pub fn fetch(source: &Source, after: Option<u64>, wait: Duration) -> crate::Resu
 pub enum Answer {
     /// What [`fetch`] returns for it.
     Fetched(Fetched),
-    /// An answer the vault server never gives a GET (a redirect, a `401` or `403`, bytes that
-    /// are not HTTP, a body larger than any envelope): something else answers at that
-    /// address, and asking it again tells nothing new. Why, as one line naming the URL as an
-    /// error does.
+    /// An answer the vault server never gives a GET (e.g. a redirect).
     Foreign(String),
 }
 
-/// One GET of the vault at `url` ([`fetch`]'s, with `after` a long-poll), telling an answer
-/// no vault server gives ([`Answer::Foreign`]) apart from a failure to reach the server or a
-/// refusal it does give, which stay errors: a later try may get past those (a `503` over a
-/// cap, a `5xx` from a server restarting, a `408` on a slow link, a timeout, no route).
+/// Execute one GET of the vault at `url` ([`fetch`], [`Answer::Foreign`]).
 pub fn get(url: &str, after: Option<u64>, wait: Duration) -> crate::Result<Answer> {
     let target = match after {
         Some(seq) => with_query(url, &format!("after={seq}")),
@@ -329,17 +293,12 @@ fn etag_seq(value: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
-/// A status the vault server never answers a GET with: a redirect (server.rs has none), or a
-/// demand for credentials (`401`; `403` it gives only to a PUT), where the envelope it serves
-/// is public and signed. Whatever answered that way is not it.
+/// A status the vault server never answers a GET with.
 fn foreign_status(status: u16) -> bool {
     (300..400).contains(&status) || matches!(status, 401 | 403)
 }
 
-/// A failure that is itself an answer the vault server never gives: bytes that are not HTTP
-/// (a banner on its port, a mangled head) or a body larger than any envelope it accepts.
-/// aterm-http says [`aterm_http::Error::Io`] for a peer that closed before a byte, so a
-/// vault server that stopped before it answered is never one of these.
+/// Whether `err` is an answer the vault server never gives ([`aterm_http::Error::Io`]).
 fn foreign_reply(error: &aterm_http::Error) -> bool {
     matches!(
         error,
@@ -360,10 +319,7 @@ fn read_path(path: &std::path::Path) -> crate::Result<Option<Vec<u8>>> {
     )))
 }
 
-/// Publish an envelope: `PUT <url>` (success is 2xx; the server's refusal text is in the
-/// error), or an atomic write at the path (mode 0644: an envelope is ciphertext and other
-/// users' machines may read a shared path), refused like the server's 409 when the path holds
-/// a version of the vault that is not older.
+/// Publish an envelope (`PUT <url>`).
 pub fn publish(source: &Source, envelope: &[u8]) -> crate::Result<()> {
     if envelope.len() > MAX_ENVELOPE {
         return Err(Error::new(format!(
@@ -393,13 +349,7 @@ pub fn publish(source: &Source, envelope: &[u8]) -> crate::Result<()> {
     }
 }
 
-/// [`publish`] over `over`, the version the source served that the caller judged it must not
-/// keep: one it does not verify (a removed admin's fork, a damaged file) or one older than the
-/// caller's own copy. A server judges that itself (it floors only a version it verifies, and
-/// nothing on a key that gave way), so a URL is published to as ever. A path checks no
-/// signature, so a version of its own vault there that the caller does not verify would
-/// floor the caller's copy for good: it takes `envelope` while it still holds exactly `over`,
-/// and keeps its newer-only rule for anything written there since.
+/// [`publish`] over `over`, the version the source served that the caller judged it must not keep.
 pub fn replace(source: &Source, envelope: &[u8], over: &[u8]) -> crate::Result<()> {
     match source {
         Source::Path(path) if envelope.len() <= MAX_ENVELOPE => replace_path(path, envelope, over),
@@ -420,11 +370,7 @@ fn replace_path(path: &std::path::Path, envelope: &[u8], _over: &[u8]) -> crate:
     write_path(path, envelope)
 }
 
-/// A path keeps the server's rule (its 409): it takes a version of the vault it holds only
-/// when it is newer, and the same bytes again change nothing. Without it, an admin whose text
-/// began before another admin's publish (an `edit` left open while `approve` ran elsewhere)
-/// would write over that version at the same seq, and never learn the vault moved. Two
-/// admins writing in the same instant can still race between the read and the rename.
+/// A path keeps the server's rule (its 409).
 #[cfg(unix)]
 fn write_path(path: &std::path::Path, envelope: &[u8]) -> crate::Result<()> {
     if let (Ok(new), Some(held)) = (crate::envelope::parse(envelope), read_path(path)?) {
@@ -477,10 +423,7 @@ pub fn post_join(url: &str, line: &str) -> crate::Result<()> {
     }
 }
 
-/// `GET <url>/join`: the pending request lines.
-///
-/// The server's lines are `age1… <host> <code> <unix secs>[ proof=<b64>]` (the time it
-/// queued the request); [`parse_join_line`] reads them.
+/// `GET <url>/join`: the pending request lines ([`parse_join_line`]).
 pub fn list_joins(url: &str) -> crate::Result<Vec<String>> {
     let target = join_url(url);
     let response = client(EXCHANGE)
@@ -505,8 +448,7 @@ pub fn list_joins(url: &str) -> crate::Result<Vec<String>> {
         .collect())
 }
 
-/// One join request: what a machine POSTs (`age1… <host> <code> [proof=<b64>]`) and, in the
-/// server's listing, when it was queued.
+/// One join request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoinRequest {
     /// The machine's `age1…` recipient, as sent.
@@ -522,8 +464,7 @@ pub struct JoinRequest {
 }
 
 impl JoinRequest {
-    /// The request line a machine POSTs: `age1… <host> <code>`, then ` proof=<b64>` when it
-    /// carries one.
+    /// The request line a machine POSTs.
     pub fn line(&self) -> String {
         let mut line = format!("{} {} {}", self.recipient, self.host, self.code);
         if let Some(proof) = &self.proof {
@@ -553,12 +494,7 @@ impl JoinRequest {
 /// `age1` + 52 data characters (32 bytes) + 6 checksum characters.
 const RECIPIENT_LEN: usize = 62;
 
-/// Read one join request line: `age1… <host> <code>`, or with the queue time after it, as
-/// the server lists them, either one optionally ending ` proof=<b64>`. Fields are separated
-/// by one space. The recipient must be a valid age X25519 recipient; the host is a machine
-/// name (`[a-z0-9][a-z0-9-]{0,62}`, not `machines`, `admins` or `everyone`); the code is
-/// four groups of four `[a-z2-7]` joined by `-`; a proof is 44 characters of padded base64
-/// (an HMAC-SHA256 tag).
+/// Read one join request line.
 pub fn parse_join_line(line: &str) -> crate::Result<JoinRequest> {
     let (line, proof) = match line.rsplit_once(" proof=") {
         Some((rest, proof)) => {
@@ -624,8 +560,7 @@ fn machine_name_ok(name: &str) -> bool {
     crate::text::valid_machine_name(name)
 }
 
-/// A join code's shape: four groups of four lowercase base32 letters (`[a-z2-7]`) joined by
-/// `-`.
+/// A join code's shape: four groups of four lowercase base32 letters (`[a-z2-7]`) joined by `-`.
 pub fn valid_code(code: &str) -> bool {
     let bytes = code.as_bytes();
     bytes.len() == 19
@@ -708,7 +643,6 @@ mod tests {
                 "{bad:?}"
             );
         }
-        // Mixing the two alphabets is no spelling of a key.
         let mixed = format!("-{}", &standard[1..]);
         if mixed.contains(['+', '/']) {
             assert!(parse_source(&format!("http://h/v1/alab#{mixed}"), home()).is_err());
@@ -843,7 +777,6 @@ mod tests {
         };
         let first = version(41, b"one admin's text");
         publish(&source, &first).expect("published");
-        // Another admin's text, begun at seq 40 too: the path refuses it, as the server would.
         let error = publish(&source, &version(41, b"another admin's text")).expect_err("not newer");
         assert!(error.0.contains("not newer than seq 41"), "{error}");
         assert!(publish(&source, &version(40, b"older")).is_err());
@@ -852,7 +785,6 @@ mod tests {
         let next = version(42, b"on top");
         publish(&source, &next).expect("newer");
         held(&next);
-        // A file that is no envelope is no version to compare with.
         std::fs::write(&path, b"not an envelope\n").expect("write");
         publish(&source, &first).expect("replaced");
         held(&first);

@@ -8,7 +8,7 @@
 
 use std::fs::File;
 use std::io::{self, Read as _};
-use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd, RawFd};
 use std::process::{ExitStatus, Output};
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,44 @@ struct PollFd {
 /// closed reports `POLLHUP` in `revents` whatever was asked, which any
 /// nonzero `revents` covers.
 const POLLIN: i16 = 0x1;
+
+/// `POLLHUP`: the same bit on Darwin, the BSDs and Linux.
+const POLLHUP: i16 = 0x10;
+
+/// `ESRCH`: the same number on Darwin, the BSDs and Linux.
+const ESRCH: i32 = 3;
+
+/// Whether every writer of the pipe `fd` reads has closed it: what it still holds is all it
+/// will ever hold, so its end is a read away.
+pub(super) fn writers_gone(fd: BorrowedFd<'_>) -> bool {
+    let mut fds = [PollFd {
+        fd: fd.as_raw_fd(),
+        events: POLLIN,
+        revents: 0,
+    }];
+    matches!(poll(&mut fds, Duration::ZERO), Ok(true)) && fds[0].revents & POLLHUP != 0
+}
+
+/// Whether a descendant of an exited child may still hold the pipe `fd` reads: a writer
+/// holds it and the process group the child led (`group`, its pid) still has a member, or
+/// the group is unknown. A descendant that leaves the group is not seen.
+pub(super) fn descendant_may_hold(fd: BorrowedFd<'_>, group: Option<u32>) -> bool {
+    !writers_gone(fd) && group.is_none_or(group_left)
+}
+
+/// Whether any process is left in the process group `group`.
+fn group_left(group: u32) -> bool {
+    let Ok(group) = i32::try_from(group) else {
+        return true;
+    };
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    // SAFETY: a plain syscall; signal 0 delivers nothing.
+    let none =
+        unsafe { kill(-group, 0) } != 0 && io::Error::last_os_error().raw_os_error() == Some(ESRCH);
+    !none
+}
 
 /// `poll(2)` over `fds` for at most `timeout` (rounded UP to a millisecond,
 /// so a wait never returns early and spins), retrying `EINTR` while time remains.
@@ -198,6 +236,21 @@ impl Run {
         }
     }
 
+    /// Close the streams a descendant may still hold open; one nothing else holds is read
+    /// on, to its end or the deadline (as [`super::Grace`] says).
+    fn close_held_streams(&mut self) {
+        let group = self.child.as_ref().ok().map(Child::id);
+        for stream in &mut self.streams {
+            if stream
+                .pipe
+                .as_ref()
+                .is_some_and(|pipe| descendant_may_hold(pipe.as_fd(), group))
+            {
+                stream.pipe = None;
+            }
+        }
+    }
+
     /// Reap it if it has exited; a wait that fails kills it.
     fn observe(&mut self, now: Instant, reap_by: Instant) {
         let Ok(child) = self.child.as_mut() else {
@@ -280,7 +333,7 @@ fn run_until(
         // gave by then is its report, whatever descendant still holds one.
         for run in &mut runs {
             if run.exited_at.is_some_and(|at| now >= at + DRAIN_GRACE) {
-                run.close_streams();
+                run.close_held_streams();
             }
         }
         if runs.iter().all(Run::settled) {
@@ -340,7 +393,9 @@ fn run_until(
                     }
                 }
             }
-            if let Some(at) = run.exited_at {
+            if let Some(at) = run.exited_at
+                && now < at + DRAIN_GRACE
+            {
                 wake = wake.min(at + DRAIN_GRACE);
             }
         }
@@ -376,4 +431,32 @@ fn run_until(
         }
     }
     runs.into_iter().map(Run::into_result).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+    use std::os::fd::AsFd as _;
+
+    use super::writers_gone;
+
+    /// A pipe is writer-less once its last writer closes it, with data left in it or not.
+    /// A child another test's thread forks meanwhile holds a copy until its exec, so the
+    /// last look waits (a hang detector) for it to let go.
+    #[test]
+    fn a_pipe_is_writer_less_once_its_last_writer_closes() {
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        assert!(!writers_gone(reader.as_fd()), "open and empty");
+        writer.write_all(b"x").expect("write");
+        assert!(!writers_gone(reader.as_fd()), "open with data");
+        let second = writer.try_clone().expect("a second writer");
+        drop(writer);
+        assert!(!writers_gone(reader.as_fd()), "a second writer holds it");
+        drop(second);
+        let hang = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !writers_gone(reader.as_fd()) {
+            assert!(std::time::Instant::now() < hang, "closed with data left");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
 }

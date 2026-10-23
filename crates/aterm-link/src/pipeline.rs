@@ -33,6 +33,7 @@ pub(crate) struct Link<T> {
     client: Conn,
     unacked: VecDeque<Unacked<T>>,
     /// The most acks this connection has had unread at once: what a test reads
+    /// to know a burst went out without waiting on each answer.
     #[cfg(test)]
     peak: usize,
 }
@@ -49,6 +50,7 @@ impl<T> From<Conn> for Link<T> {
 }
 
 /// Read-only access, for what asks the client nothing over the wire
+/// (`seen_log_identity`).
 impl<T> Deref for Link<T> {
     type Target = Conn;
     fn deref(&self) -> &Conn {
@@ -202,6 +204,7 @@ mod tests {
     use super::*;
 
     /// Serve a scratch broker and connect a [`Link`] to it, with a second plain
+    /// client for reading what landed.
     fn served() -> (
         aterm_tempfile::TempDir,
         astream_broker::BrokerHandle,
@@ -227,6 +230,11 @@ mod tests {
     }
 
     /// **A BURST GOES OUT WHOLE, AND EACH ANSWER FINDS ITS OWN RECORD.** Ten
+    /// publishes are written before one ack is read; while any is owed the
+    /// client is not handed out for a request that reads its own reply; the
+    /// acks come back in send order, each naming its own sequence and its own
+    /// offset; and once they are read the connection serves a `Fetch` that
+    /// sees all ten.
     #[test]
     fn a_burst_is_sent_before_any_ack_and_every_answer_is_its_own() {
         let (_dir, _server, mut link, mut reader) = served();
@@ -292,6 +300,8 @@ mod tests {
     }
 
     /// **A REQUEST BEHIND AN OWED ACK FAILS LOUDLY, AND SENDS NOTHING** — the
+    /// FIRST guard (the module doc), astream's own, reached the one way nothing
+    /// in this crate can: past [`Link::ready`], straight to the client.
     #[test]
     fn a_request_behind_an_owed_ack_fails_loudly_and_sends_nothing() {
         let (_dir, _server, mut link, _reader) = served();
@@ -336,6 +346,7 @@ mod tests {
     }
 
     /// **A PIPELINED COMMIT IS OWED LIKE A PUBLISH, IN ORDER, AND A TRY WAITS
+    /// FOR NOTHING** — on a real broker.
     #[test]
     fn a_pipelined_commit_is_owed_in_order_and_a_try_waits_for_nothing() {
         let dir = aterm_tempfile::Builder::new()
@@ -415,6 +426,10 @@ mod tests {
     }
 
     /// **A RIDER COMES BACK WITH THE ACK IT WAS HUNG ON, AND ONLY THEN.** It
+    /// hangs on the newest owed ack its predicate names — not on a newer one
+    /// it does not — keeps the larger of two values, comes back with that
+    /// ack's answer and with no other, and finds nothing to hang on while
+    /// only acks it does not name are owed.
     #[test]
     fn a_rider_comes_back_with_the_ack_it_was_hung_on() {
         let (_dir, _server, mut link, _reader) = served();
@@ -460,6 +475,9 @@ mod tests {
     }
 
     /// **A REFUSED BATCH LANDS THE PUBLISH SENT AFTER IT** — the hazard that
+    /// makes a caller whose records must land in its own order keep one of
+    /// them in flight at a time (`Bridge::settle_sender`), shown on a REAL
+    /// Strict broker rather than a scripted one.
     #[test]
     fn a_refused_batch_lands_the_publish_sent_after_it() {
         let dir = aterm_tempfile::Builder::new()

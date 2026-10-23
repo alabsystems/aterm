@@ -1,52 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! GPU time per presented frame: how long the device spent executing one
-//! present's work, which neither `present_latency` (a CPU span) nor the
-//! present-to-glass ledger (`crate::present_glass`) can see.
-//!
-//! # What is measured
-//!
-//! A frame is opened when a present begins (`open_frame`) and sealed when
-//! the present returns (`FrameToken::seal`). Every piece of GPU work the
-//! present commits in between is a *part*: on Metal each command buffer the
-//! encode session commits (Submit A, Submit B, inline staging copies) hangs an
-//! `addCompletedHandler:` that reads `-[MTLCommandBuffer GPUStartTime]` and
-//! `GPUEndTime`; wgpu timestamps each timed render pass. The frame's GPU
-//! time is the SUM of its parts' spans: a frame's Metal command buffers share
-//! its textures, so the device runs them one after another in commit order
-//! (measured: Submit B starts after Submit A ends), and the sum is device busy
-//! time without the idle gaps a first-start-to-last-end span would count. A
-//! wgpu readback reports its passes as one held part counting one part per
-//! pass ([`FrameToken::complete_parts`]) whose span is the UNION of their
-//! intervals: a tiled GPU starts a pass's vertex work under the previous
-//! pass's fragment work, so the passes overlap and their sum would count the
-//! overlap twice (`crate::wgpu_timer`). The presentation-only command buffer
-//! (`presentDrawable:`) carries no draws and is not a part. GL reports
-//! nothing: it has no completion clock that does not stall the context.
-//!
-//! # Zero cost at rest, no wait on the present path
-//!
-//! `open_frame` returns `None` unless a sink is installed, so with no
-//! listener no handler is registered and nothing is counted. A handler runs on
-//! a Metal completion thread; the present never waits for it. The frame is
-//! delivered by whichever side finishes last: the final completion handler, or
-//! the seal when every part had already completed (the virtual present, which
-//! waits for its own Submit B).
-//!
-//! # Lock-free accounting
-//!
-//! Frames live in a fixed ring indexed by serial, so the handlers neither lock
-//! nor allocate. A slot is claimed only when its previous frame has been
-//! delivered; a present that finds its slot still busy (the device is a whole
-//! ring of frames behind) goes untimed and is counted ([`skipped`]). A frame
-//! any part of which failed (a command-buffer error, a lost readback) is
-//! dropped and counted ([`dropped`]), never reported as a short GPU time.
-//!
-//! The frontend installs one sink with [`install_sink`]; it runs on a
-//! framework thread, so it must be lock-free and must not block or unwind.
-//! [`settled`] answers the same result by serial for a reader that polls (the
-//! effects perf lane).
+//! Per-frame GPU execution timing ([`FrameToken::complete_parts`]).
 
 #[cfg(any(target_os = "macos", wgpu_arm, test))]
 use std::sync::OnceLock;
@@ -77,23 +32,20 @@ pub enum Settled {
     Untimed,
 }
 
-/// The frontend's receiver. Called on a framework thread; must not block.
+/// The frontend's receiver.
 pub type GpuTimeSink = fn(GpuFrameTime);
 
-/// Whether this build has a device execution clock. A wgpu device must also
-/// grant timestamp queries; GL has no clock here.
+/// Whether this build has a device execution clock.
 pub const SUPPORTED: bool = cfg!(any(target_os = "macos", wgpu_arm));
 
 #[cfg(any(target_os = "macos", wgpu_arm, test))]
 static FRAMES: FrameRing = FrameRing::new();
 
-/// Frames in flight at once. A frame's slot is reused `RING` serials later,
-/// long after its command buffers completed on any device that is presenting.
+/// Frames in flight at once.
 #[cfg(any(target_os = "macos", wgpu_arm, test))]
 const RING: usize = 64;
 
-/// `pending` while a slot is being delivered: no open can claim it and no
-/// part can be added to it.
+/// `pending` while a slot is being delivered: no open can claim it and no part can be added to it.
 #[cfg(any(target_os = "macos", wgpu_arm, test))]
 const DELIVERING: u32 = u32::MAX;
 
@@ -101,13 +53,11 @@ const DELIVERING: u32 = u32::MAX;
 #[cfg(any(target_os = "macos", wgpu_arm, test))]
 #[derive(Debug)]
 struct Slot {
-    /// Outstanding holds: the seal's one plus one per unfinished part. 0 is a
-    /// free slot; [`DELIVERING`] is a slot whose result is being published.
+    /// Outstanding holds: the seal's one plus one per unfinished part ([`DELIVERING`]).
     pending: AtomicU32,
     /// The serial of the open frame using this slot.
     serial: AtomicU64,
-    /// The serial whose result `gpu_ns`/`parts`/`failed` hold, once delivered
-    /// (0 while a frame is open). The seqlock word [`settled`] reads twice.
+    /// Serial whose result `gpu_ns`/`parts`/`failed` hold once delivered (0 while open).
     done_serial: AtomicU64,
     gpu_ns: AtomicU64,
     parts: AtomicU32,
@@ -129,8 +79,7 @@ impl Slot {
     }
 }
 
-/// One accounting domain. Production uses `FRAMES`; tests own independent
-/// instances of the same ring so eviction never crosses fixture boundaries.
+/// One accounting domain.
 #[cfg(any(target_os = "macos", wgpu_arm, test))]
 #[derive(Debug)]
 pub(crate) struct FrameRing {
@@ -165,8 +114,7 @@ impl FrameRing {
         &self.slots[usize::try_from(serial % RING as u64).unwrap_or(0)]
     }
 
-    /// A present found no room to time it outside the ring (every wgpu
-    /// readback slot still in flight): counted with the ring's own skips.
+    /// Record a frame skipped outside the ring (such as when all wgpu readback slots are busy).
     #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) fn note_skipped(&self) {
@@ -187,16 +135,14 @@ impl FrameRing {
     }
 }
 
-/// The process's ring, for an arm that opens frames through its own
-/// readback machinery (`crate::wgpu_timer`).
+/// Return the process's ring for readback machinery (`crate::wgpu_timer`).
 #[inline]
 #[cfg(wgpu_arm)]
 pub(crate) const fn frames() -> &'static FrameRing {
     &FRAMES
 }
 
-/// Install the process's one sink. First install wins; `false` when a sink was
-/// already installed or this backend has no device clock. Installing turns timing on.
+/// Install the process's one sink.
 pub fn install_sink(sink: GpuTimeSink) -> bool {
     #[cfg(any(target_os = "macos", wgpu_arm, test))]
     {
@@ -209,11 +155,7 @@ pub fn install_sink(sink: GpuTimeSink) -> bool {
     }
 }
 
-/// Pause the clock (a development seam a shipped binary never has): while
-/// paused a present opens no frame, exactly as with no sink, so it registers
-/// no completion handler, opens no readback and counts nothing. The effects
-/// harness prices the clock with it: the same frame presented timed and
-/// paused.
+/// Pause the clock (a development seam a shipped binary never has).
 #[inline]
 #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
 pub fn set_paused(paused: bool) {
@@ -280,8 +222,7 @@ pub fn skipped() -> u64 {
 }
 
 #[cfg(any(target_os = "macos", wgpu_arm, test))]
-/// One open frame: the handle every part of it reports through. `Copy` so a
-/// completion handler can capture it without allocating.
+/// One open frame: the handle every part of it reports through.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FrameToken<'a> {
     serial: u64,
@@ -289,9 +230,7 @@ pub(crate) struct FrameToken<'a> {
 }
 
 #[cfg(target_os = "macos")]
-/// Open a frame for the present about to run, or `None` when nothing listens
-/// (no sink: zero cost at rest) or its ring slot is still in flight. Metal's
-/// encoder asks it; the wgpu timer opens frames on its own ring.
+/// Open a frame for the present about to run, or `None` when no sink is installed.
 #[inline]
 pub(crate) fn open_frame() -> Option<FrameToken<'static>> {
     FRAMES.open_frame()
@@ -314,9 +253,6 @@ impl FrameRing {
             self.skipped.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        // Claimed: the previous frame in this slot was delivered and nothing else
-        // writes it until this frame's last release. `done_serial` is cleared
-        // first so a concurrent `settled` reader of the old result sees it change.
         s.done_serial.store(0, Ordering::SeqCst);
         s.gpu_ns.store(0, Ordering::SeqCst);
         s.parts.store(0, Ordering::SeqCst);
@@ -334,8 +270,7 @@ impl FrameToken<'_> {
         self.serial
     }
 
-    /// One more part is about to be submitted. Call before the work can
-    /// complete (before `commit`), so the frame cannot be delivered without it.
+    /// One more part is about to be submitted.
     #[inline]
     pub(crate) fn hold(self) {
         self.ring
@@ -344,16 +279,13 @@ impl FrameToken<'_> {
             .fetch_add(1, Ordering::AcqRel);
     }
 
-    /// A held part finished: `Some(ns)` is its GPU span, `None` a failure or
-    /// a missing clock (the frame is then dropped), as is an overflowing sum.
+    /// A held part finished.
     #[inline]
     pub(crate) fn complete(self, span_ns: Option<u64>) {
         self.complete_parts(span_ns, 1);
     }
 
-    /// A held part that timed `parts` pieces of the frame's work as one span
-    /// finished (a wgpu readback: the union of its passes' intervals), so the
-    /// frame counts `parts` parts for it. As [`Self::complete`] otherwise.
+    /// Complete a held multi-part span (such as a wgpu readback union) counting `parts` parts.
     pub(crate) fn complete_parts(self, span_ns: Option<u64>, parts: u32) {
         let s = self.ring.slot(self.serial);
         match span_ns {
@@ -373,8 +305,7 @@ impl FrameToken<'_> {
         release(self);
     }
 
-    /// The present returned: release the frame's own hold. The frame is
-    /// delivered here when every part already completed.
+    /// The present returned: release the frame's own hold.
     #[inline]
     pub(crate) fn seal(self) {
         release(self);
@@ -438,9 +369,7 @@ fn deliver(token: FrameToken<'_>, s: &Slot) {
     }
 }
 
-/// The result of frame `serial`, once delivered and until its ring slot is
-/// reused; `None` while any part is outstanding, and for a serial never
-/// opened or already evicted.
+/// The result of frame `serial`, once delivered and until its ring slot is reused.
 #[must_use]
 #[inline]
 pub fn settled(serial: u64) -> Option<Settled> {
@@ -468,8 +397,6 @@ impl FrameRing {
         let gpu_ns = s.gpu_ns.load(Ordering::SeqCst);
         let parts = s.parts.load(Ordering::SeqCst);
         let failed = s.failed.load(Ordering::SeqCst);
-        // A reopen clears `done_serial` before touching the fields, so an
-        // unchanged word means the three reads belong to `serial`.
         if s.done_serial.load(Ordering::SeqCst) != serial {
             return None;
         }
@@ -488,10 +415,7 @@ impl FrameRing {
 }
 
 #[cfg(any(target_os = "macos", test))]
-/// One part's GPU span from a start and end on the same seconds clock
-/// (`GPUStartTime`/`GPUEndTime`), or `None` when the device reported no
-/// clock: a zero or non-finite reading, an end before the start, or a span
-/// outside the unsigned 64-bit nanosecond domain.
+/// Compute a GPU span in nanoseconds from `(start_s, end_s)`, or `None` if invalid.
 #[must_use]
 #[inline]
 pub(crate) fn span_ns(start_s: f64, end_s: f64) -> Option<u64> {
@@ -512,7 +436,6 @@ mod tests {
         FrameRing::listening()
     }
 
-    /// A zero, non-finite or reversed reading is no clock; a real one is its
     /// span in nanoseconds.
     #[test]
     fn a_span_needs_a_real_clock_reading() {
@@ -540,7 +463,6 @@ mod tests {
         assert_eq!(span_ns(5.0, 5.0), Some(0));
     }
 
-    /// The frame is the sum of its parts and is delivered exactly once, by
     /// whichever release is last: here a part completing after the seal.
     #[test]
     fn a_frame_sums_its_parts_and_settles_after_the_last_one() {
@@ -580,8 +502,6 @@ mod tests {
         assert_eq!(ring.settled(f.serial()), Some(Settled::Failed));
         assert!(ring.dropped.load(super::Ordering::Relaxed) > before);
 
-        // Each part is representable in the metric, but their sum is not.
-        // It must follow the same failed-frame path, never wrap to zero.
         let overflow = ring.open_frame().expect("a sink is installed");
         overflow.hold();
         overflow.hold();
@@ -600,7 +520,6 @@ mod tests {
         assert_eq!(ring.settled(f.serial()), Some(Settled::Untimed));
     }
 
-    /// A slot still in flight a whole ring later is not reclaimed: that
     /// present goes untimed and is counted, and the old frame still settles.
     #[test]
     fn a_busy_ring_slot_skips_the_present_instead_of_corrupting_it() {
@@ -613,7 +532,6 @@ mod tests {
         let held = ring.open_frame().expect("a sink is installed");
         held.hold();
         held.seal();
-        // Walk this fixture's serial counter round to the held frame's slot.
         let before = ring.skipped.load(super::Ordering::Relaxed);
         for _ in 1..super::RING {
             ring.open_frame().expect("the other slots are free").seal();

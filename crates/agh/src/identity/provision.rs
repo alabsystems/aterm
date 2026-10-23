@@ -2,13 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! `agh auth add` and `agh auth remove` (design §6.7): a person provisions; the library edits
-//! agh.toml without losing its comments.
-//!
-//! The edit is aterm-toml's comment-preserving document. An `[[owners]]` array cannot be edited
-//! in place, so it is cloned, edited and set back whole: each table keeps its position, decor
-//! and trailing comments, and a table pushed new prints after the last one. A rewritten `read`
-//! or `write` value takes the old value's decor, so a comment at the end of its line survives.
+//! `agh auth add` and `agh auth remove` (design §6.7).
 
 #[cfg(unix)]
 use std::collections::BTreeMap;
@@ -43,8 +37,7 @@ pub enum AddFrom {
     Stdin,
 }
 
-/// What `auth add` was asked. `drafts` (`--drafts`, which needs `--write`) records the new
-/// token's fingerprint as the profile's `drafts_fp` (design §6.4).
+/// What `auth add` was asked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AddRequest {
     /// The profile's name.
@@ -84,11 +77,8 @@ const OFF_UNIX: &str =
     "provisioning needs unix permission checks; agh on Windows is anonymous only";
 
 /// Provision `req`.
-///
 /// # Errors
-///
-/// Refused for a loose `--file` (with its remedy), a fault the edit would make, or a tier
-/// change; Unauthenticated when `GET /user` refuses the token; could_not_run on I/O.
+/// Refused for a loose `--file` (with its remedy), a fault the edit would make, or a tier change.
 pub fn add(
     gh: &Github,
     dirs: &Dirs,
@@ -98,12 +88,8 @@ pub fn add(
     add_metered(gh, dirs, req, stdin).map(|(added, _)| added)
 }
 
-/// `add`, with the meter of the one-profile client that sent `GET /user` as the new token:
-/// that client is not `gh`, so `gh.meter()` never sees the request, and the verb's receipt
-/// reads this one instead.
-///
+/// `add`, with the meter of the one-profile client that sent `GET /user` as the new token.
 /// # Errors
-///
 /// As `add`.
 pub(crate) fn add_metered(
     gh: &Github,
@@ -134,9 +120,7 @@ pub struct Removed {
 }
 
 /// Remove profile `name` and every reference to it.
-///
 /// # Errors
-///
 /// Usage for an unknown profile; Refused when the result would fault; could_not_run on I/O.
 pub fn remove(dirs: &Dirs, name: &str) -> Result<Removed> {
     #[cfg(unix)]
@@ -150,18 +134,9 @@ pub fn remove(dirs: &Dirs, name: &str) -> Result<Removed> {
     }
 }
 
-/// The pure edit `add` makes (aterm-toml's `edit` document, comments kept). Under
-/// `req.drafts` the profile row gains `drafts_fp = "{fingerprint}"`; otherwise any `drafts_fp`
-/// the row had is removed, so a re-provisioned token is never vouched by an old line.
-///
-/// Either table spelling, `[profiles.NAME]` or `NAME = { … }` inline, is edited in place. An
-/// existing row loses `env`, and `covers_all_repos` too: that line claims the old token's
-/// reach, and a new token, perhaps of another login, may see less.
-///
+/// The pure edit `add` makes (aterm-toml's `edit` document, comments kept).
 /// # Errors
-///
-/// Usage when the text does not parse, when `profiles` or the profile's row is not a table,
-/// or when `owners` is not `[[owners]]` tables.
+/// Usage when the text does not parse.
 pub fn edit_config(
     text: &str,
     req: &AddRequest,
@@ -244,14 +219,8 @@ pub fn edit_config(
 }
 
 /// The pure edit `remove` makes: the new text and the owners whose rows changed.
-///
-/// The owners may be `[[owners]]` tables or an inline `owners = [{ … }]` array; either is
-/// edited in its own spelling.
-///
 /// # Errors
-///
-/// Usage when the text does not parse, names no profile `name`, or has an `owners` that is
-/// neither `[[owners]]` tables nor an array of inline tables.
+/// Usage when the text does not parse.
 pub fn remove_from_config(text: &str, name: &str) -> Result<(String, Vec<String>)> {
     let mut doc = parse_document(text)?;
     let present = doc
@@ -293,7 +262,6 @@ pub fn remove_from_config(text: &str, name: &str) -> Result<(String, Vec<String>
             }
         }
     }
-    // Either spelling: `[default]`, or `default = { read = [...] }` inline.
     if let Some(default) = doc
         .as_table_mut()
         .get_mut("default")
@@ -419,8 +387,6 @@ impl Drop for Scrubbed {
 #[cfg(unix)]
 fn read_current(dirs: &Dirs) -> Result<Option<String>> {
     use config::ConfigText;
-    // One read through the shared reader (plan §16.5), which gives `config::load`'s refusal
-    // and its remedy (a linked agh directory, a directory no chmod of this user's lifts).
     match config::read_config(&dirs.config, CONFIG_FILE, &dirs.home) {
         ConfigText::Text(text) => Ok(Some(text)),
         ConfigText::Missing => Ok(None),
@@ -490,9 +456,6 @@ fn private_dir(dir: &Path, home: &Path) -> Result<()> {
             return Error::could_not_run(format!("{shown}: {why}"));
         }
         let error = Error::refused(format!("{shown}: {why}"));
-        // `chmod 700 {dir} (inverse: chmod {mode:o} {dir})`, the path one shell word by
-        // identity's quoting rule, the token files' remedy's. The empty path has no mode, so
-        // no file is named.
         let remedy = match existing {
             Ok(meta) if meta.is_dir() => identity::chmod_remedy(dir, Path::new(""), home),
             _ => None,
@@ -571,8 +534,6 @@ struct AuthEdit(std::fs::File);
 impl AuthEdit {
     fn take(dirs: &Dirs) -> Result<Self> {
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
-        // A directory agh.toml's load refuses (a linked agh directory) refuses the edit in the
-        // load's words and with its remedy, as every reader of agh.toml does.
         let as_load = |refused: Error| load_refusal_of_dir(dirs).unwrap_or(refused);
         config_dir(dirs).map_err(as_load)?;
         let path = dirs.config.join(".auth-edit.lock");
@@ -720,7 +681,6 @@ fn read_stdin_token(
                 .with_next(ADD_HELP),
         );
     }
-    // The loader's own shape rule, so `auth add` and `identity::load` agree on what a token is.
     let token = match identity::token_bytes(&buf.0[..read]) {
         Ok(token) => token,
         Err(LoadError::Malformed(why)) => return Err(Error::usage(why).with_next(ADD_HELP)),
@@ -789,9 +749,6 @@ fn add_unix(
     if let Some(fault) = config::profile_name_fault(&req.name) {
         return Err(Error::usage(fault).with_next(ADD_HELP));
     }
-    // agh.toml holds TOML strings, so it can name only a UTF-8 path: a lossy one would
-    // validate (its file is simply missing) and leave the profile Absent on every later run.
-    // Refused first, before anything is read, staged or sent.
     let named = match &req.from {
         AddFrom::File(path) => path.clone(),
         AddFrom::Stdin => dirs.tokens().join(format!("{}.token", req.name)),
@@ -803,8 +760,6 @@ fn add_unix(
         ))
         .with_next(ADD_HELP));
     }
-    // Staging names are reserved for a transaction's owned scratch file. An
-    // interrupted token must move to a name of its own before agh.toml names it.
     if let AddFrom::File(path) = &req.from
         && is_staged(dirs, path)
     {
@@ -814,8 +769,6 @@ fn add_unix(
         ))
         .with_next(ADD_HELP));
     }
-    // Invalid bytes or a missing --file make no directory, as before. Reads that
-    // decide the edit itself start only once the cross-process guard is held.
     let stdin_token = match &req.from {
         AddFrom::Stdin => Some(read_stdin_token(dirs, req, stdin)?),
         AddFrom::File(path) => {
@@ -846,8 +799,6 @@ fn add_unix(
         }
         Some(current)
     };
-    // A dry edit first: a refusal of the file's shape stages nothing and sends nothing. Only
-    // the values differ in the real edit, and edit_config refuses shapes, never values.
     edit_config(&text, req, "", "", "")?;
     match &req.from {
         AddFrom::File(path) => {
@@ -860,8 +811,6 @@ fn add_unix(
         }
         AddFrom::Stdin => {
             let staging = dirs.tokens().join(new_token_name(&req.name));
-            // A hand-written agh.toml may still name the staging file: staging would rewrite
-            // that profile's token, so the person moves it first.
             if current.as_ref().is_some_and(|c| names_file(c, &staging)) {
                 return Err(Error::refused(format!(
                     "agh.toml names agh's staging file {} as a token_file",
@@ -887,8 +836,6 @@ fn add_unix(
                 Ok(added)
             })();
             let (added, new_text, meter) = placed?;
-            // The rename made durable before agh.toml names the file: after a power loss,
-            // agh.toml never names a token that is missing or the old one.
             aterm_durable::durable_dir(&dirs.tokens()).map_err(|e| {
                 Error::could_not_run(format!(
                     "{}: {e}; the new token is in place at {}, and agh.toml is as it was",
@@ -927,11 +874,7 @@ fn bind_and_edit(
     };
     let bound = gh.with_router(Router::from_validated(validated));
     let login = bound.users().me(&req.name)?.login;
-    // The one-profile client meters its own requests; the verb's receipt reads them here.
     let meter = bound.meter();
-    // The one-profile client read the token file again for `GET /user`: the login is bound
-    // only when those were the bytes the fingerprint was taken from (design §6.1), so a file
-    // swapped between the two reads never gets one token's login and another's fingerprint.
     let sent_as_loaded = matches!(
         &meter.as_,
         Some(IdentityRef::Profile { name, fingerprint })
@@ -1003,9 +946,6 @@ fn remove_unix(dirs: &Dirs, name: &str) -> Result<Removed> {
             Error::usage("no agh.toml: there is no profile to remove").with_next("agh auth status")
         );
     };
-    // Read as `add` reads it: an edit starts only from a valid file, so a fault the file
-    // already had is never blamed on the edit, and no token file is deleted on the word of a
-    // file that breaks a rule (L7: two profiles naming one file).
     let current = config::judge(&text, &dirs.home).verdict.map_err(|_| {
         Error::refused("agh.toml is invalid; agh auth remove edits only a valid file")
             .with_next(config::POLICY_CHECK)
@@ -1025,14 +965,10 @@ fn remove_unix(dirs: &Dirs, name: &str) -> Result<Removed> {
     let after = config::judge(&new_text, &dirs.home)
         .verdict
         .map_err(|faults| would_break(&faults, "remove"))?;
-    // agh writes into tokens/ only when it is its own private directory, so a file reached
-    // through a linked or loose tokens/ is none agh wrote, and stays. Belt and braces: the
-    // file is deleted only when no profile left still names it.
     let own_dir = aterm_uds::private_file::check_private_dir(&dirs.tokens()).is_ok();
     let deletable = own_dir
         && names_own(&profile.source)
         && !after.profiles().values().any(|p| names_own(&p.source));
-    // The directory check passes: `read_current` has just read agh.toml from it.
     write_config(dirs, &new_text, None)?;
     let token_file_deleted = if deletable {
         aterm_uds::private_file::remove_private(&dirs.tokens(), &format!("{name}.token")).map_err(
@@ -1046,8 +982,6 @@ fn remove_unix(dirs: &Dirs, name: &str) -> Result<Removed> {
     } else {
         false
     };
-    // No live transaction can own a stage while this guard is held. An occupied
-    // staging name may hold the only copy of an interrupted token: retain it for recovery.
     Ok(Removed {
         profile: name.to_string(),
         token_file_deleted,

@@ -1,33 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Corpus tests for [`atpkg::tarread`], the first-party read-only tar parser:
-//! the bytes it parses are a DOWNLOADED PACKAGE BUNDLE, read before its
-//! signature has bought anything.
-//!
-//! Each test folds what the reader reports — accept-or-reject, and per entry
-//! the path, kind, mode, effective and raw size, link target and content — into
-//! an FNV-1a digest, recorded when every answer matched the `tar` crate this
-//! reader replaced. The corpus:
-//!
-//!   * hand-built archives: ustar with a split `prefix`, every entry type the
-//!     extractor classifies, GNU long names and PAX records;
-//!   * adversarial headers: bad checksums, base-256 sizes, octal garbage,
-//!     sizes that overflow, truncation at every block boundary, malformed PAX
-//!     records, every magic/version combination crossed with a non-empty
-//!     `prefix`, magic-less and duplicated extension headers, and the PAX
-//!     `size` override in every shape;
-//!   * tens of thousands of MUTATED archives from a fixed PRNG — single-byte
-//!     flips, truncations and splices of the valid ones above;
-//!   * tens of thousands of CHECKSUM-REPAIRED archives. A flip that lands in a
-//!     header invalidates its checksum and is refused for that reason alone, so
-//!     the repaired corpora choose the fields FIRST and make the checksum valid
-//!     afterwards: the space where tar parsers actually differ (the PAX `size`
-//!     override, the typeflag-versus-magic asymmetry that suppresses it, the
-//!     empty long-link override that is `Some("")` and not `None`, GNU sparse).
-//!
-//! GNU sparse (`S`) entries are REFUSED rather than parsed: a sparse entry
-//! classifies as `Other`, which the extractor refuses anyway.
+//! Corpus tests for [`atpkg::tarread`], the first-party read-only tar parser.
 
 use std::cell::Cell;
 use std::io::Read;
@@ -40,12 +14,9 @@ struct Record {
     kind: &'static str,
     mode: u32,
     /// The EFFECTIVE content length — after a PAX `size` record has overridden
-    /// the header field. This is the number that decides where the next header
-    /// begins, so a disagreement here is a disagreement about the whole rest of
-    /// the archive.
+    /// the header field.
     size: u64,
-    /// The RAW `size` field, unoverridden. Recorded separately so a change in
-    /// the override and a change in the field parse cannot cancel.
+    /// The RAW `size` field, unoverridden.
     header_size: u64,
     link: Option<PathBuf>,
     content: Vec<u8>,
@@ -172,8 +143,6 @@ fn pin(expected: &str) {
     assert_eq!(format!("{got:016x}"), expected, "the pinned corpus changed");
 }
 
-// Corpus builders
-
 /// Write `s` at `off` in a header block, clipped at the block's end.
 fn put(h: &mut [u8; 512], off: usize, s: &[u8]) {
     for (i, b) in s.iter().enumerate() {
@@ -286,21 +255,14 @@ fn ustar_archive() -> Vec<u8> {
 /// system tars emit.
 fn handmade_archive() -> Vec<u8> {
     let mut v = Vec::new();
-    // Plain file.
     v.extend_from_slice(&raw_header("plain.txt", b'0', "", 5, 0o644));
     v.extend_from_slice(&padded(b"12345"));
-    // Directory.
     v.extend_from_slice(&raw_header("dir/", b'5', "", 0, 0o755));
-    // Symlink.
     v.extend_from_slice(&raw_header("link", b'2', "plain.txt", 0, 0o777));
-    // Hard link.
     v.extend_from_slice(&raw_header("hard", b'1', "plain.txt", 0, 0o644));
-    // Continuation type — treated as a regular file.
     v.extend_from_slice(&raw_header("cont.txt", b'7', "", 3, 0o644));
     v.extend_from_slice(&padded(b"abc"));
-    // A FIFO: "other".
     v.extend_from_slice(&raw_header("fifo", b'6', "", 0, 0o644));
-    // GNU long name, then the entry it names.
     let long = "g/".repeat(80) + "name.txt";
     let body = {
         let mut b = long.clone().into_bytes();
@@ -317,7 +279,6 @@ fn handmade_archive() -> Vec<u8> {
     v.extend_from_slice(&padded(&body));
     v.extend_from_slice(&raw_header("truncated-name", b'0', "", 2, 0o644));
     v.extend_from_slice(&padded(b"gg"));
-    // PAX extended header carrying a path, then its entry.
     let paxpath = "p/".repeat(90) + "pax.txt";
     let pax = pax_record("path", &paxpath);
     v.extend_from_slice(&raw_header("PaxHeader", b'x', "", pax.len() as u64, 0o644));
@@ -332,8 +293,6 @@ fn handmade_archive() -> Vec<u8> {
 /// makes the format its own parsing hazard.
 fn pax_record(key: &str, value: &str) -> Vec<u8> {
     let payload = format!("{key}={value}\n");
-    // The length counts its own digits, so it is a fixed point: grow until the
-    // written length matches.
     let mut len = payload.len() + 2;
     loop {
         let candidate = format!("{len} {payload}");
@@ -363,8 +322,6 @@ impl Rng {
         }
     }
 }
-
-// Tests
 
 #[test]
 fn ustar_archive_is_pinned() {
@@ -396,8 +353,6 @@ fn empty_and_marker_only_archives_are_pinned() {
 #[test]
 fn truncation_at_every_boundary_is_pinned() {
     for source in [ustar_archive(), handmade_archive()] {
-        // Every block boundary, plus a handful of ragged offsets inside the
-        // first few blocks where the header itself is cut in half.
         let mut cuts: Vec<usize> = (0..=source.len()).step_by(512).collect();
         cuts.extend([1, 7, 100, 148, 156, 257, 511, 513, 700, 1023]);
         for cut in cuts {
@@ -412,26 +367,21 @@ fn truncation_at_every_boundary_is_pinned() {
 
 #[test]
 fn adversarial_headers_are_pinned() {
-    // A header whose checksum is wrong by one.
     let mut bad_sum = raw_header("x", b'0', "", 0, 0o644);
     bad_sum[148] = b'1';
     record(&[&bad_sum[..], &end_marker()].concat());
 
-    // Non-octal garbage in the size field.
     let mut bad_size = raw_header("x", b'0', "", 0, 0o644);
     bad_size[124..136].copy_from_slice(b"9999999999\0\0");
     checksum(&mut bad_size);
     record(&[&bad_size[..], &end_marker()].concat());
 
-    // A size field that overflows u64 in octal (24 octal digits would, but the
-    // field is 12 — so use the base-256 form, which can).
     let mut b256 = raw_header("x", b'0', "", 0, 0o644);
     b256[124] = 0x80 | 0x7f;
     b256[125..136].fill(0xff);
     checksum(&mut b256);
     record(&[&b256[..], &end_marker()].concat());
 
-    // A legitimate base-256 size, small enough to be real.
     let mut b256_ok = raw_header("x", b'0', "", 0, 0o644);
     b256_ok[124] = 0x80;
     b256_ok[125..135].fill(0);
@@ -439,20 +389,17 @@ fn adversarial_headers_are_pinned() {
     checksum(&mut b256_ok);
     record(&[&b256_ok[..], &padded(b"data"), &end_marker()].concat());
 
-    // An enormous declared size with no body behind it.
     let mut huge = raw_header("x", b'0', "", 0, 0o644);
     huge[124..136].copy_from_slice(b"77777777777\0");
     checksum(&mut huge);
     record(&[&huge[..], &end_marker()].concat());
 
-    // A ustar prefix that must be joined to the name with a slash.
     let mut prefixed = raw_header("tail.txt", b'0', "", 0, 0o644);
     let pre = b"some/long/prefix/path";
     prefixed[345..345 + pre.len()].copy_from_slice(pre);
     checksum(&mut prefixed);
     record(&[&prefixed[..], &end_marker()].concat());
 
-    // An empty name.
     let empty_name = raw_header("", b'0', "", 0, 0o644);
     record(&[&empty_name[..], &end_marker()].concat());
     pin(ADVERSARIAL_HEADERS);
@@ -491,7 +438,6 @@ fn malformed_pax_records_are_pinned() {
 
 #[test]
 fn malformed_gnu_long_names_are_pinned() {
-    // A long-name header with no entry after it.
     let body = b"dangling\0".to_vec();
     let mut v = Vec::new();
     v.extend_from_slice(&raw_header(
@@ -505,7 +451,6 @@ fn malformed_gnu_long_names_are_pinned() {
     v.extend_from_slice(&end_marker());
     record(&v);
 
-    // A long LINK name applied to a symlink.
     let target = "t/".repeat(70) + "target";
     let mut body = target.into_bytes();
     body.push(0);
@@ -522,7 +467,6 @@ fn malformed_gnu_long_names_are_pinned() {
     v.extend_from_slice(&end_marker());
     record(&v);
 
-    // A zero-length long name.
     let mut v = Vec::new();
     v.extend_from_slice(&raw_header("././@LongLink", b'L', "", 0, 0o644));
     v.extend_from_slice(&raw_header("fallback.txt", b'0', "", 0, 0o644));
@@ -533,18 +477,8 @@ fn malformed_gnu_long_names_are_pinned() {
 
 /// A PAX `size` record OVERRIDES the header's `size` field — the whole
 /// file-list-substitution vector on the bundle path.
-///
-/// An `x` header saying `size=4` in front of a ustar header saying `size=512`
-/// makes two readers that differ here disagree about where the NEXT header
-/// starts, and from there about every entry in the rest of the archive. The
-/// `tar` crate carries the reason in its own source: "Disagreement among
-/// parsers allows construction of malicious archives that appear different when
-/// parsed."
 #[test]
 fn pax_size_records_are_pinned() {
-    // A PAX size SMALLER than the header's, with the header's declared bytes
-    // present. A reader that ignores the record reads 512 content bytes; a
-    // reader that honours it reads 4, and the other 508 become the next header.
     let mut v = Vec::new();
     let rec = pax_record("size", "4");
     v.extend_from_slice(&raw_header("PaxHeader", b'x', "", rec.len() as u64, 0o644));
@@ -554,9 +488,6 @@ fn pax_size_records_are_pinned() {
     v.extend_from_slice(&end_marker());
     record(&v);
 
-    // …and the same shape with a SECOND real entry behind it, so a divergence
-    // in where the next header starts shows up as a different entry list rather
-    // than only a different content length.
     let mut v = Vec::new();
     let rec = pax_record("size", "4");
     v.extend_from_slice(&raw_header("PaxHeader", b'x', "", rec.len() as u64, 0o644));
@@ -568,7 +499,6 @@ fn pax_size_records_are_pinned() {
     v.extend_from_slice(&end_marker());
     record(&v);
 
-    // A PAX size LARGER than the header's.
     let mut v = Vec::new();
     let rec = pax_record("size", "600");
     v.extend_from_slice(&raw_header("PaxHeader", b'x', "", rec.len() as u64, 0o644));
@@ -578,8 +508,6 @@ fn pax_size_records_are_pinned() {
     v.extend_from_slice(&end_marker());
     record(&v);
 
-    // A PAX size on a DIRECTORY — the entry kind `extract.rs` guards with
-    // `declared != 0`, so which number that is matters.
     for (_, declared, pax_size) in [
         ("directory: header 0, pax 512", 0u64, "512"),
         ("directory: header 512, pax 0", 512u64, "0"),
@@ -594,8 +522,6 @@ fn pax_size_records_are_pinned() {
         record(&v);
     }
 
-    // A PAX size in front of a GLOBAL header. An extension header's own body
-    // length is its own business, so the override must NOT apply there.
     let mut v = Vec::new();
     let rec = pax_record("size", "4");
     v.extend_from_slice(&raw_header("PaxHeader", b'x', "", rec.len() as u64, 0o644));
@@ -608,7 +534,6 @@ fn pax_size_records_are_pinned() {
     v.extend_from_slice(&end_marker());
     record(&v);
 
-    // Values a `size` record has no business carrying.
     for (_, value) in [
         ("non-numeric", "abc"),
         ("signed", "-4"),
@@ -629,8 +554,6 @@ fn pax_size_records_are_pinned() {
         record(&v);
     }
 
-    // `size` alongside `path` and `linkpath`, in both orders — the combination
-    // a real bsdtar archive emits for a long-named large file.
     for (_, body) in [
         ("size then path", {
             let mut b = pax_record("size", "4");
@@ -673,12 +596,6 @@ fn pax_size_records_are_pinned() {
 }
 
 /// A PAX GLOBAL (`g`) header is an ORDINARY entry, not an extension header.
-///
-/// It must never supply a `path` to the entry after it: a global header is a
-/// default for every following member, and honouring one as a rename primitive
-/// hands a crafted archive a name override that `vet_entry` has never been
-/// exercised against. The `g` block is yielded as an entry, which `classify`
-/// maps to `Other` and the extractor refuses.
 #[test]
 fn pax_global_headers_are_pinned() {
     let cases: Vec<(&str, Vec<u8>)> = vec![
@@ -704,8 +621,6 @@ fn pax_global_headers_are_pinned() {
         record(&v);
     }
 
-    // A global header as the LAST thing in the archive — nothing for a reader
-    // that thinks it is an extension header to attach it to.
     let body = pax_record("path", "dangling.txt");
     let mut v = Vec::new();
     v.extend_from_slice(&raw_header(
@@ -719,7 +634,6 @@ fn pax_global_headers_are_pinned() {
     v.extend_from_slice(&end_marker());
     record(&v);
 
-    // A global header with a GNU magic rather than a POSIX one.
     let body = pax_record("path", "global/override.txt");
     let mut v = Vec::new();
     v.extend_from_slice(&raw_header_magic(
@@ -741,10 +655,6 @@ fn pax_global_headers_are_pinned() {
 
 /// Duplicate PAX keys resolve to the FIRST record, and a malformed record does
 /// not end the scan.
-///
-/// Both are cases where "obviously the last one wins" and "obviously junk is
-/// fatal" are each defensible and each WRONG, because being the only reader
-/// that picks them is what lets one archive show two readers two names.
 #[test]
 fn duplicate_and_recovered_pax_records_are_pinned() {
     let cases: Vec<(&str, Vec<u8>)> = vec![
@@ -814,11 +724,6 @@ fn duplicate_and_recovered_pax_records_are_pinned() {
 }
 
 /// `prefix` is a POSIX-ustar field and nothing else.
-///
-/// Bytes 345..500 are `prefix` on a POSIX header and `atime`/`ctime`/`offset` on
-/// a GNU one, so a reader that keys on `magic.starts_with("ustar")` reads a GNU
-/// header's timestamps as a directory component and invents a path no other
-/// reader produces.
 #[test]
 fn magic_and_version_combinations_are_pinned() {
     let magics: [(&str, &[u8], &[u8]); 6] = [
@@ -846,8 +751,7 @@ fn magic_and_version_combinations_are_pinned() {
 }
 
 /// `L`/`K`/`x` are extension typeflags only on a header that speaks ustar or
-/// GNU. With neither magic the block is an ordinary entry — which the extractor
-/// then refuses as a disallowed kind.
+/// GNU.
 #[test]
 fn magicless_extension_headers_are_pinned() {
     for flag in *b"LKxg" {
@@ -970,14 +874,8 @@ fn duplicate_extension_headers_are_pinned() {
 }
 
 /// The GNU base-256 numeric extension belongs to the fields that DEFINE it.
-///
-/// `chksum` and `mode` are octal-only: a high-bit checksum field lets a header
-/// carry a base-256 checksum equal to its own byte sum, and a high-bit mode
-/// field turns "unreadable, fall back to 0o644" into "attacker-chosen, and the
-/// `0o111` bits drive `safe_mode` to 0o755".
 #[test]
 fn base256_numeric_fields_are_pinned() {
-    // Base-256 in the CHECKSUM field, numerically correct for the header.
     let mut h = raw_header("x.txt", b'0', "", 0, 0o644);
     h[148..156].fill(b' ');
     let sum: u64 = h.iter().map(|&b| u64::from(b)).sum();
@@ -987,7 +885,6 @@ fn base256_numeric_fields_are_pinned() {
     }
     record(&[&h[..], &end_marker()].concat());
 
-    // Base-256 in the MODE field.
     let mut h = raw_header("x.txt", b'0', "", 0, 0o644);
     h[100] = 0x80;
     h[101..106].fill(0);
@@ -996,8 +893,6 @@ fn base256_numeric_fields_are_pinned() {
     checksum(&mut h);
     record(&[&h[..], &end_marker()].concat());
 
-    // A 12-byte base-256 size whose LEADING bytes are non-zero. Only the last 8
-    // are read, so this is size 4 — not an overflow.
     let mut h = raw_header("x.txt", b'0', "", 0, 0o644);
     h[124] = 0x80;
     h[125] = 0x01;
@@ -1006,8 +901,6 @@ fn base256_numeric_fields_are_pinned() {
     checksum(&mut h);
     record(&[&h[..], &padded(b"data"), &end_marker()].concat());
 
-    // The same shape with an all-zero low 8 bytes: size ZERO despite a set
-    // leading byte.
     let mut h = raw_header("x.txt", b'0', "", 0, 0o644);
     h[124] = 0x80;
     h[125] = 0x7f;
@@ -1017,7 +910,6 @@ fn base256_numeric_fields_are_pinned() {
     checksum(&mut h);
     record(&[&h[..], &end_marker()].concat());
 
-    // Base-256 in every other numeric field, one at a time — uid, gid, mtime.
     for (_, off, len) in [
         ("uid", 108usize, 8usize),
         ("gid", 116, 8),
@@ -1031,8 +923,6 @@ fn base256_numeric_fields_are_pinned() {
         record(&[&h[..], &end_marker()].concat());
     }
 
-    // A base-256 size that saturates all 8 read bytes: u64::MAX, which the
-    // block rounding cannot advance past.
     let mut h = raw_header("x.txt", b'0', "", 0, 0o644);
     h[124] = 0x80;
     h[125..136].fill(0xff);
@@ -1044,12 +934,11 @@ fn base256_numeric_fields_are_pinned() {
 /// GNU SPARSE (`S`) entries are refused outright, where the `tar` crate parsed
 /// the sparse block map: a sparse entry classifies as `Other` and `vet_entry`
 /// aborts the whole staged group on one anyway, so a second content-assembly
-/// path would buy nothing. The entries before the refusal are pinned.
+/// path would buy nothing.
 #[test]
 fn gnu_sparse_entries_are_refused() {
     let mut sparse_cases: Vec<(&str, Vec<u8>)> = Vec::new();
 
-    // A GNU-magic sparse header with an all-zero sparse map.
     let mut v = Vec::new();
     v.extend_from_slice(&raw_header_magic(
         "sparse.bin",
@@ -1064,9 +953,7 @@ fn gnu_sparse_entries_are_refused() {
     v.extend_from_slice(&end_marker());
     sparse_cases.push(("gnu magic, empty sparse map", v));
 
-    // The same with a plausible sparse map and realsize written in.
     let mut h = raw_header_magic("sparse.bin", b'S', "", 512, 0o644, b"ustar ", b" \0");
-    // sparse[0] = (offset 0, numbytes 512) at 386; realsize at 483.
     put(&mut h, 386, b"00000000000\0");
     put(&mut h, 398, b"00000001000\0");
     put(&mut h, 483, b"00000001000\0");
@@ -1077,7 +964,6 @@ fn gnu_sparse_entries_are_refused() {
     v.extend_from_slice(&end_marker());
     sparse_cases.push(("gnu magic, one sparse block", v));
 
-    // A sparse typeflag on a POSIX ustar header — not a GNU header at all.
     let mut v = Vec::new();
     v.extend_from_slice(&raw_header("sparse.bin", b'S', "", 0, 0o644));
     v.extend_from_slice(&raw_header("after.txt", b'0', "", 2, 0o644));
@@ -1085,8 +971,6 @@ fn gnu_sparse_entries_are_refused() {
     v.extend_from_slice(&end_marker());
     sparse_cases.push(("posix magic sparse typeflag", v));
 
-    // A sparse entry AFTER a legitimate one, so the refusal is not merely
-    // "the archive was broken from byte zero".
     let mut v = Vec::new();
     v.extend_from_slice(&raw_header("good.txt", b'0', "", 4, 0o644));
     v.extend_from_slice(&padded(b"good"));
@@ -1115,14 +999,6 @@ fn gnu_sparse_entries_are_refused() {
 }
 
 /// The header fields, RANDOMISED, with the checksum recomputed afterwards.
-///
-/// This is the corpus the byte/block mutators structurally cannot reach. They
-/// flip bytes without repairing the checksum, so any mutation landing in a
-/// header is refused on the checksum and says nothing about field semantics.
-///
-/// Here the checksum is made VALID after the fields are chosen, so every trial
-/// lands in valid-checksum/hostile-field space: magic and version combinations,
-/// every typeflag, base-256 in every numeric field, prefixes, and PAX bodies.
 #[test]
 fn checksum_repaired_header_mutations_are_pinned() {
     let mut rng = Rng(0x7A12_0005);
@@ -1134,10 +1010,6 @@ fn checksum_repaired_header_mutations_are_pinned() {
 }
 
 /// Real archives, mutated in a header, with that header's checksum REPAIRED.
-///
-/// The same idea as [`checksum_repaired_header_mutations_are_pinned`] but
-/// starting from archives a real writer produced, so the mutated field sits in
-/// an otherwise coherent multi-entry structure.
 #[test]
 fn repaired_mutations_of_real_archives_are_pinned() {
     let sources = [ustar_archive(), handmade_archive()];
@@ -1152,8 +1024,6 @@ fn repaired_mutations_of_real_archives_are_pinned() {
             let block = rng.below(blocks);
             let base = block * 512;
             for _ in 0..1 + rng.below(6) {
-                // Anywhere in the header EXCEPT its own checksum field, which
-                // is about to be rewritten.
                 let mut off = rng.below(504);
                 if off >= 148 {
                     off += 8;
@@ -1190,7 +1060,6 @@ fn random_valid_checksum_archive(rng: &mut Rng) -> Vec<u8> {
 fn random_valid_header(rng: &mut Rng) -> ([u8; 512], Vec<u8>) {
     let mut h = [0u8; 512];
 
-    // name / linkname / prefix: real-ish, empty, oversized, or binary.
     let name: Vec<u8> = match rng.below(6) {
         0 => b"a.txt".to_vec(),
         1 => Vec::new(),
@@ -1221,8 +1090,8 @@ fn random_valid_header(rng: &mut Rng) -> ([u8; 512], Vec<u8>) {
     };
     put(&mut h, 345, &prefix);
 
-    // Numeric fields: octal, base-256, or garbage — independently per field.
     let numeric = |h: &mut [u8; 512], off: usize, len: usize, small: u64, rng: &mut Rng| {
+        // Octal, base-256, or garbage.
         match rng.below(6) {
             0 => put(
                 h,
@@ -1235,7 +1104,6 @@ fn random_valid_header(rng: &mut Rng) -> ([u8; 512], Vec<u8>) {
                 format!("{:0width$o} ", small, width = len - 1).as_bytes(),
             ),
             2 => {
-                // base-256
                 h[off..off + len].fill(0);
                 h[off] = 0x80;
                 let v = rng.next_u64() % 4096;
@@ -1258,12 +1126,11 @@ fn random_valid_header(rng: &mut Rng) -> ([u8; 512], Vec<u8>) {
             ),
         }
     };
-    numeric(&mut h, 100, 8, u64::from(rng.below(4096) as u32), rng); // mode
-    numeric(&mut h, 108, 8, 501, rng); // uid
-    numeric(&mut h, 116, 8, 20, rng); // gid
-    numeric(&mut h, 136, 12, 0, rng); // mtime
+    numeric(&mut h, 100, 8, u64::from(rng.below(4096) as u32), rng);
+    numeric(&mut h, 108, 8, 501, rng);
+    numeric(&mut h, 116, 8, 20, rng);
+    numeric(&mut h, 136, 12, 0, rng);
 
-    // Size: overwhelmingly small so the body is buildable, occasionally absurd.
     let declared: u64 = match rng.below(8) {
         0 => 0,
         1 => 5,
@@ -1286,7 +1153,6 @@ fn random_valid_header(rng: &mut Rng) -> ([u8; 512], Vec<u8>) {
         _ => put(&mut h, 124, format!("{declared:011o}\0").as_bytes()),
     }
 
-    // Typeflag: every one a reader distinguishes, plus noise.
     const FLAGS: &[u8] = &[
         b'0', 0, b'1', b'2', b'5', b'7', b'6', b'3', b'L', b'K', b'x', b'g', b'S', b'V',
     ];
@@ -1295,8 +1161,6 @@ fn random_valid_header(rng: &mut Rng) -> ([u8; 512], Vec<u8>) {
         _ => (rng.next_u64() & 0xff) as u8,
     };
 
-    // Magic / version: the two real combinations, the two crossed ones, and
-    // neither.
     let (magic, version): (&[u8], &[u8]) = match rng.below(6) {
         0 | 1 => (b"ustar\0", b"00"),
         2 => (b"ustar ", b" \0"),
@@ -1308,7 +1172,6 @@ fn random_valid_header(rng: &mut Rng) -> ([u8; 512], Vec<u8>) {
     put(&mut h, 263, version);
     checksum(&mut h);
 
-    // A body: for an extension typeflag, a PAX-ish or long-name-ish one.
     let body_len = usize::try_from(declared.min(2048)).unwrap_or(0);
     let body: Vec<u8> = match h[156] {
         b'x' | b'g' => {
@@ -1445,9 +1308,6 @@ const MALFORMED_GNU_LONG_NAMES: &str = "dfcb97d991201c19";
 const PAX_SIZE_RECORDS: &str = "c81421544fe5ae0b";
 const PAX_GLOBAL_HEADERS: &str = "921b7363448ceb57";
 const DUPLICATE_AND_RECOVERED_PAX_RECORDS: &str = "709decb1b388bf9a";
-// The four corpora below carry non-UTF-8 path bytes, and pin a second digest on Windows:
-// there `tarread` refuses such a path (`path is not valid unicode`) where unix reads the
-// bytes as they are, since a Windows path has no spelling for them.
 const MAGIC_AND_VERSION_COMBINATIONS: &str = if cfg!(windows) {
     "bee39615eac71f98"
 } else {

@@ -2,10 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! `aterm-spec-macros`: proc macros for TLA+ specification refinement attributes.
-//!
-//! Input is parsed with `aterm-macro-support` on std `proc_macro` alone (no `syn`,
-//! `proc-macro2`, or `quote`).
+//! Proc macros for TLA+ specification refinement attributes (`aterm-macro-support` on std `proc_macro`).
 
 mod item;
 mod model;
@@ -16,19 +13,6 @@ use proc_macro::{Ident, Literal, Span, TokenStream, TokenTree};
 
 use crate::item::FnItem;
 
-// `#[refines]` and `#[spec_unmodeled]` register compile-time records in
-// `aterm_spec_anchor::registry` (`aterm_spec_anchor::xref`), collected at test
-// time by `spec_xref_closure`.
-//
-// Because these attributes sit on methods inside `impl` blocks—where bare
-// anonymous `const` items from `registry::submit!` are illegal—each emitter
-// wraps the submission in a uniquely named associated `const`
-// (`const __aterm_spec_<kind>_<fn>_<action>: () = { registry::submit!{…} };`).
-//
-// The registry record is emitted only on targets with load-time constructor
-// sections (Apple, Linux, Android, Windows); on other targets (e.g. `wasm32`)
-// only the thread-local entry probe is emitted.
-
 /// The name the anchor's const and `rust_method` take from: the item's `fn` ident, or
 /// `anon` when the item is not a plain fn (defensive; all current usages are methods).
 fn item_fn_ident(item: &FnItem) -> Ident {
@@ -37,8 +21,7 @@ fn item_fn_ident(item: &FnItem) -> Ident {
 }
 
 /// Map an arbitrary spec name (action/id) to a legal Rust identifier fragment for
-/// use in a unique const name: non-alphanumeric chars become `_`. Empty maps to
-/// `none` so a bare (machine-less) waiver still produces a valid suffix.
+/// use in a unique const name: non-alphanumeric chars become `_`.
 fn sanitize_ident(s: &str) -> String {
     if s.is_empty() {
         return "none".to_string();
@@ -49,9 +32,6 @@ fn sanitize_ident(s: &str) -> String {
 }
 
 /// The anchor's const, `__aterm_spec_<kind>_<fn>[_<suffix>]`, at the fn ident's span.
-///
-/// A raw `r#name` contributes `name`. A name that still is not an identifier (an
-/// alphanumeric character Rust does not take in one) is an error, not a panic.
 fn anchor_const(kind: &str, suffix: Option<&str>, fn_ident: &Ident) -> Result<Ident, Error> {
     let fn_name = fn_ident.to_string();
     let fn_name = fn_name.strip_prefix("r#").unwrap_or(&fn_name);
@@ -72,30 +52,12 @@ fn anchor_const(kind: &str, suffix: Option<&str>, fn_ident: &Ident) -> Result<Id
     }
 }
 
-// `#[refines]` prepends `::aterm_spec_anchor::xref::note_entered("<machine>::<action> @ <fn>")`
-// as the first statement of the annotated fn's body, using the same `entry_id`
-// stored in `RefinementAnchor` so Tier-1 conformance tests can verify that every
-// anchored fn actually executed.
-//
-// In release builds without `test` or `debug_assertions`, `cfg_attr` strips the
-// attribute before expansion. On Trust build/test/check/doc/verify lanes,
-// `aterm_spec_anchor` uses its `macro_rules!` equivalents (`src/attrs.rs`);
-// these proc macros are used on stock compilers and Trust's lint driver.
-//
-// `const fn` items and bodyless declarations cannot call `note_entered` and
-// receive `entry_id: ""`, which fails gates that require execution evidence.
-
 /// The execution-evidence key for one anchor: `"<machine>::<action> @ <rust_method>"`.
-/// Human-readable because it is what a failing gate prints.
 fn entry_id_for(machine: &str, action: &str, rust_method: &str) -> String {
     format!("{machine}::{action} @ {rust_method}")
 }
 
 /// The annotated fn with the entry probe as the first statement of its body.
-///
-/// Returns `None` when the item is not an instrumentable fn (`const fn` or bodyless
-/// item); the caller then emits `entry_id: ""` so the gate sees the gap. Inner
-/// attributes (`fn f() { #![allow(…)] … }`) stay first in the body.
 fn inject_entry_probe(item: &FnItem, entry_id: &str) -> Option<TokenStream> {
     let probe = q!(
         "::aterm_spec_anchor::xref::note_entered(#id);",
@@ -104,8 +66,7 @@ fn inject_entry_probe(item: &FnItem, entry_id: &str) -> Option<TokenStream> {
     item.with_probe(&probe)
 }
 
-/// The `key = "value"` list an anchor attribute takes, each key one of `keys`. A key
-/// written twice keeps its last value.
+/// The `key = "value"` list an anchor attribute takes, each key one of `keys`.
 struct Keys(Vec<(&'static str, String)>);
 
 impl Keys {
@@ -159,8 +120,7 @@ fn emit(expansion: Result<TokenStream, Error>) -> TokenStream {
     expansion.unwrap_or_else(|e| e.to_compile_error())
 }
 
-/// Bind a fn to the model action it performs: `machine`, `action` and the
-/// `project` fn Tier-1 reads the real state through, all required.
+/// Bind a fn to the model action it performs (`machine`, `action`, and `project` required).
 ///
 /// ```compile_fail
 /// #[aterm_spec_macros::refines(machine = "Ring", action = "Push")]
@@ -175,10 +135,6 @@ fn expand_refines(attr: TokenStream, item: TokenStream) -> Result<TokenStream, E
     let keys = Keys::parse(attr, &["machine", "action", "project"])?;
     let machine = keys.require("machine")?;
     let action = keys.require("action")?;
-    // The projection fn path (`project="…"`): names the &self -> abstract vars mapping
-    // Tier-1 conformance reads the real state through. Required and non-empty: an anchor
-    // with no projection binds a fn to an action with nothing to compare the real state
-    // against.
     let project = keys
         .get("project")
         .filter(|p| !p.is_empty())
@@ -191,11 +147,8 @@ fn expand_refines(attr: TokenStream, item: TokenStream) -> Result<TokenStream, E
         })?;
     let item = FnItem::new(item);
     let fn_ident = item_fn_ident(&item);
-    // Disambiguate the anchor const by action as well as fn name so multiple
-    // `#[refines]` attributes on one fn emit distinct associated consts.
     let const_name = anchor_const("refines", Some(&sanitize_ident(&action)), &fn_ident)?;
     let rust_method = fn_ident.to_string();
-    // Un-probeable items stay unchanged and emit an empty `entry_id`.
     let candidate_id = entry_id_for(&machine, &action, &rust_method);
     let (item_out, entry_id) = match inject_entry_probe(&item, &candidate_id) {
         Some(probed) => (probed, candidate_id),
@@ -233,7 +186,6 @@ pub fn spec_unmodeled(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 fn expand_spec_unmodeled(attr: TokenStream, item: TokenStream) -> Result<TokenStream, Error> {
-    // Optional `machine` and `action` tie the waiver to a specific model action.
     let keys = Keys::parse(attr, &["reason", "machine", "action"])?;
     let reason = keys.require("reason")?;
     let machine = keys.get("machine").unwrap_or_default();
@@ -266,40 +218,7 @@ fn expand_spec_unmodeled(attr: TokenStream, item: TokenStream) -> Result<TokenSt
     ))
 }
 
-// ty_model! — the "light annotation" surface for aterm-spec's derived TLA+.
-//
-// Write a bounded state machine as near-plain Rust; expands to an
-// `::aterm_spec::derive::Model` literal (the single source from which both the
-// `ty`-checkable TLA+ spec and the executable interpreter are generated). E.g.:
-//
-//   ty_model! {
-//       Ring {
-//           const MaxSeq = 6;
-//           const Cap = 3;
-//           var seq = 0;
-//           var lo = 1;
-//           action Push when (seq <= MaxSeq - 1) {
-//               seq = seq + 1;
-//               lo = if (seq + 1) - lo + 1 > Cap { lo + 1 } else { lo };
-//           }
-//           invariant LenBounded: seq - lo + 1 <= Cap;
-//           bound SeqBounded: seq <= MaxSeq;
-//       }
-//   }
-//
-// Identifiers declared `const` become TLA+ CONSTANTS; everything else resolves to
-// a state variable. `scenario Budget = 2;` declares a configuration the real code
-// also runs under (constant overrides, never `Buggy`): the sweeps hold the model
-// in it beside the committed one. `invariant` states a design claim, which some
-// mutant must break; `bound` states the box the checkers walk (a range over one
-// variable), which none is expected to. Supported operators: + - > <= == && || and if/else (mapped to the `Expr`
-// builders in `aterm_spec::derive`: `==` -> `eq` = TLA+ `=`, `&&` ->
-// `and_` = TLA+ `/\`). The `==`/`&&` forms support the `Buggy`-convention guards
-// (e.g. `Buggy == 1 && active == 1`) the proves-and-catches models use. The macro
-// emits absolute `::aterm_spec::derive::*` paths, so it works in any crate
-// depending on aterm-spec (and in aterm-spec's own integration tests).
-
-/// See module-level note above. Expands to an `::aterm_spec::derive::Model`.
+/// Expand a bounded state-machine DSL into an `::aterm_spec::derive::Model`.
 #[proc_macro]
 pub fn ty_model(input: TokenStream) -> TokenStream {
     emit(model::expand(input))
@@ -317,11 +236,7 @@ fn registered_fn(item: TokenStream, attribute: &str) -> Result<(FnItem, Ident), 
     }
 }
 
-/// Register a hand-built model: `#[aterm_spec::model]` on a `fn() -> Model`.
-///
-/// `ty_model!` registers what it writes; this is the door for a model built as
-/// a `Model` literal or by a `derive::props` generator (function-valued state,
-/// shapes the macro cannot spell).
+/// Register a hand-built `fn() -> Model`.
 #[proc_macro_attribute]
 pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
     emit(expand_model(attr, item))
@@ -349,9 +264,7 @@ fn expand_model(attr: TokenStream, item: TokenStream) -> Result<TokenStream, Err
     ))
 }
 
-/// Register a liveness obligation with the model it is stated over:
-/// `#[aterm_spec::liveness(some_model)]` on a `fn() -> Liveness`, where
-/// `some_model` is the `fn() -> Model` it holds of.
+/// Register a `fn() -> Liveness` obligation with its model.
 #[proc_macro_attribute]
 pub fn liveness(attr: TokenStream, item: TokenStream) -> TokenStream {
     emit(expand_liveness(attr, item))

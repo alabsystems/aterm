@@ -1,54 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The export's source rewrites, which the publication engine runs over each export
-//! (`pub stage`, after the manifest's selection and before its guards) through
-//! `publish/transforms.sh` → `ship hook transforms`.
-//!
-//! * vendor/astream — a submodule of a PRIVATE repository, and a gitlink is not
-//!   source — is written as files: astream's root Cargo.toml and, for every astream
-//!   crate the export reaches ([`astream_closure`]), each crate's tree but its tests/,
-//!   examples/ and benches/ (its build script and the files its src/ includes from
-//!   beside it go with it), from the gitlink commit of the EXPORTED commit, read from
-//!   the submodule's object store (never its working tree), plus aterm's LICENSE and a
-//!   README saying what it is.
-//!   The root keeps its `[workspace]` tables, which the crates inherit from, and no members
-//!   ([`memberless_root`]): its member list names crates the export does not write, and the
-//!   engine's workspace-closure guard loads every workspace in the export.
-//! * A `[[test]]`/`[[bench]]`/`[[example]]`/`[[bin]]` table whose file the export
-//!   withholds is dropped with the comment block above it, so a public clone's build
-//!   resolves every target it declares.
-//! * A workspace package the export withholds (its manifest is in the exported commit
-//!   but not in the export) leaves Cargo.lock, with whatever only it reached: the
-//!   exported lock is the one cargo writes for the exported workspace, and names
-//!   nothing the export withholds ([`prune_lock`]).
-//! * The private org becomes the public one, and developer homes are anonymized to
-//!   exactly the guards' shapes — nothing wider: a bare `/Users/` is behaviour
-//!   (relocate.rs's machine-local prefix) and ships as written. The rewrite is
-//!   `aterm_census::export::rewrite`, defined once: the census's `export-content`
-//!   guard reads the checkout through it, so a line the engine would refuse is a
-//!   finding before a push.
-//!
-//! The version and rust-toolchain.toml ship as committed. No content rule refuses
-//! here: every rule is a guard pattern, reported together by the engine.
+//! Export source rewrites (`vendor/astream` materialization, `Cargo.lock` pruning, target stripping, and content rewrite).
 
 use std::path::{Path, PathBuf};
 
 use aterm_census::export::rewrite;
 
-/// What the engine hands the transforms.
+/// Inputs to the export transforms.
 #[derive(Debug, Clone)]
 pub struct Inputs {
-    /// The repository root (`ROOT`).
+    /// Repository root (`ROOT`).
     pub root: PathBuf,
-    /// The export being staged (`EXPORT`).
+    /// Staged export directory (`EXPORT`).
     pub export: PathBuf,
-    /// The commit the export was made from (`CAPTURED_COMMIT`; `HEAD` when unset).
+    /// Commit the export was made from (`CAPTURED_COMMIT`; `HEAD` when unset).
     pub captured: String,
 }
 
 impl Inputs {
-    /// The engine's variables.
+    /// Reads transform inputs from environment variables.
     ///
     /// # Errors
     /// `ROOT` or `EXPORT` unset.
@@ -79,11 +50,10 @@ fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     }
 }
 
-/// Run every rewrite over `inputs.export`; each line of what was done, as the
-/// engine's transcript shows it.
+/// Runs all export rewrites over `inputs.export` and returns transcript lines.
 ///
 /// # Errors
-/// The astream gitlink cannot be written as files.
+/// Returns an error if `vendor/astream` or manifest/lock rewrites fail.
 pub fn run(inputs: &Inputs) -> Result<Vec<String>, String> {
     let mut said = Vec::new();
     let (rev, crates) = astream(inputs)?;
@@ -165,9 +135,6 @@ fn astream(inputs: &Inputs) -> Result<(String, Vec<String>), String> {
     let crates = astream_closure(&inputs.export, &sub, &rev)
         .map_err(|e| format!("could not derive the astream crates the export depends on: {e}"))?;
     std::fs::create_dir_all(&dest).map_err(|e| format!("{}: {e}", dest.display()))?;
-    // A crate's build reads more than src/: its build script, and the files src/ and
-    // the script include from beside src/ (astream-wire's contract_fn.rs,
-    // twin_answers.rs and clean_islands.rs, which every astream crate includes).
     let mut paths = vec!["Cargo.toml".to_string()];
     let mut roots = vec!["Cargo.toml".to_string()];
     for c in &crates {
@@ -269,11 +236,6 @@ fn in_target_dir(path: &str) -> bool {
 }
 
 /// astream's root manifest as the export writes it: the `[workspace]` table's `members`
-/// emptied and its `default-members` dropped, every other byte as committed. The crates
-/// the export writes build as aterm's path dependencies, which inherit from this root
-/// without being its members, so a member list naming crates the export leaves out only
-/// makes the root a workspace nothing can load (the engine's closure guard loads it).
-///
 /// # Errors
 /// The manifest has no `[workspace]` table, an array in it does not close, or the result
 /// does not parse with empty members.
@@ -364,11 +326,7 @@ fn array_end(s: &str) -> Option<usize> {
 /// A manifest's dependency rows that cargo follows: its `[dependencies]` and
 /// `[build-dependencies]`, target-specific and `[workspace.dependencies]` ones included,
 /// optional ones too (a feature can turn any on), and with `dev` its
-/// `[dev-dependencies]`. Cargo reads a WORKSPACE MEMBER's dev-dependencies whenever it
-/// loads the workspace (they are in the lock, and a missing path is a load error), and
-/// no DEPENDENCY's: so an exported manifest's are followed (aterm-conformance's
-/// astream-term, the differential VT oracle's fold), an astream crate's never. Each row
-/// is (name, `path`, `workspace = true`).
+/// `[dev-dependencies]`.
 fn dependency_rows(manifest: &aterm_toml::Value, dev: bool) -> Vec<(String, Option<String>, bool)> {
     use aterm_toml::Value;
     const KINDS: [&str; 5] = [
@@ -418,24 +376,16 @@ fn join_lexically(base: &str, path: &str) -> String {
     parts.join("/")
 }
 
-/// The astream crates the export needs, by directory name, sorted: each one an exported
-/// manifest path-depends on under `vendor/astream/crates/` (dev-dependencies included:
-/// see [`dependency_rows`]), and each one those reach in
-/// turn at `rev` (`path = …`, or `workspace = true` through astream's root
-/// `[workspace.dependencies]`). DERIVED, never listed: a hand list went stale when
-/// astream-cap came to depend on astream-digest, and the export would have carried a
-/// manifest naming a crate it did not carry.
+/// Computes the sorted closure of `vendor/astream/crates/*` path dependencies reached by `export` at `rev`.
 ///
 /// # Errors
-/// No exported manifest reaches astream (the scan is wrong), a crate the export reaches
-/// is not at `rev`, or an astream crate path-depends outside astream's `crates/`.
+/// Returns an error if no manifest reaches astream or a dependency is missing at `rev`.
 pub fn astream_closure(export: &Path, sub: &Path, rev: &str) -> Result<Vec<String>, String> {
     let parse = |text: &str, what: &str| {
         aterm_toml::from_str::<aterm_toml::Value>(text).map_err(|e| format!("{what}: {e}"))
     };
     let mut found = Vec::new();
     manifests(export, &mut found);
-    // crate directory -> the manifest that first named it
     let mut reached: std::collections::BTreeMap<String, String> = Default::default();
     for manifest in found {
         let rel_manifest = manifest.strip_prefix(export).unwrap_or(&manifest);
@@ -500,7 +450,6 @@ pub fn astream_closure(export: &Path, sub: &Path, rev: &str) -> Result<Vec<Strin
                     Some(p) => join_lexically("", p),
                     None => continue,
                 },
-                // a crates.io dependency
                 (None, false) => continue,
             };
             let Some(dep) = target
@@ -574,15 +523,10 @@ struct LockPackage {
     text: String,
 }
 
-/// `lock` without the path packages named in `withheld` and every package only they
-/// reached, each remaining dependency spelled as cargo spells it for what is left (the
-/// version only when two versions share the name, the source only when two sources share
-/// both) — the file cargo writes for the export's workspace.
-/// `None` when nothing changes; else the text and the packages dropped (`name version`).
+/// Prunes path packages in `withheld` and packages reachable only through them from `lock`.
 ///
 /// # Errors
-/// The lock does not parse, or a package the export carries depends on one it withholds
-/// (no public clone could resolve that, whatever the lock says).
+/// Returns an error if `lock` fails to parse or a kept package depends on a withheld package.
 pub fn prune_lock(
     lock: &str,
     withheld: &std::collections::BTreeSet<String>,
@@ -623,7 +567,6 @@ pub fn prune_lock(
     if !packages.iter().any(is_withheld) {
         return Ok(None);
     }
-    // a dependency spec, `name [version [(source)]]`, against the packages it can mean
     let resolve = |spec: &str| -> Option<usize> {
         let mut words = spec.splitn(3, ' ');
         let name = words.next()?;
@@ -662,7 +605,6 @@ pub fn prune_lock(
             todo.push(j);
         }
     }
-    // cargo's spelling of a kept package as a dependency, given what is kept
     let spelled = |j: usize| {
         let p = &packages[j];
         let same_name = (0..packages.len()).filter(|&k| kept[k] && packages[k].name == p.name);
@@ -691,7 +633,6 @@ pub fn prune_lock(
         }
         out.push_str(&text);
     }
-    // the last kept package ends the file with one newline, as cargo writes it
     while out.ends_with("\n\n") {
         out.pop();
     }
@@ -757,7 +698,6 @@ fn strip_manifest(text: &str, dir: &Path) -> Option<(String, Vec<(String, String
     if starts.is_empty() {
         return None;
     }
-    // a table owns the comment block directly above it
     let cuts: Vec<usize> = starts
         .iter()
         .map(|s| {
@@ -875,7 +815,6 @@ mod tests {
              [workspace.package]\nversion = \"0.2.0\"\n\n[workspace.dependencies]\na = { path = \
              \"crates/a\" }\nmembers = \"1\"\n"
         );
-        // no workspace table, or one whose list never closes, writes nothing
         assert!(memberless_root("[package]\nname = \"a\"\n").is_err());
         assert!(memberless_root("[workspace]\nmembers = [\n  \"crates/a\",\n").is_err());
     }
@@ -915,7 +854,6 @@ mod tests {
         let (pruned, gone) = prune_lock(&sample_lock(true), &withheld).unwrap().unwrap();
         assert_eq!(pruned, sample_lock(false));
         assert_eq!(gone, ["dup 2.0.0", "lab 0.1.0", "only-lab 1.0.0"]);
-        // a lock that names nothing withheld is not rewritten
         assert_eq!(prune_lock(&sample_lock(false), &withheld).unwrap(), None);
         let nothing = std::collections::BTreeSet::new();
         assert_eq!(prune_lock(&sample_lock(true), &nothing).unwrap(), None);
@@ -950,7 +888,6 @@ mod tests {
             "[package]\nname = \"fixture\"\nautotests = false\n\n[[test]]\nname = \
              \"suite\"\npath = \"tests/suite.rs\"\n\n[lints]\nworkspace = true\n"
         );
-        // a manifest whose every target is there is not touched
         assert_eq!(strip_manifest(&text, dir.path()), None);
     }
 }

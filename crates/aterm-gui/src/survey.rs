@@ -14,6 +14,7 @@ use crate::session_store::{SessionHandle, Store};
 mod redaction;
 
 /// The excerpts the footer resolver publishes for a Claude Code process
+/// (`SessionTimeline::set_claude_excerpts`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 /// Excerpts published by the footer resolver for a Claude Code process.
 pub(crate) struct ClaudeExcerpts {
@@ -102,6 +103,7 @@ const REDACTED_WORD: &str = "[redacted]";
 const REDACTED_LINE: &str = "[redacted: sensitive]";
 
 /// The fleet code's prefix (`aterm fleet init`): never quoted, whatever
+/// follows it.
 const FLEET_CODE: &str = "atf1-";
 
 /// Redact credential assignments, flags, URL userinfo, bearer headers, and high-entropy tokens in `text`.
@@ -131,6 +133,8 @@ pub(crate) fn redact(text: &str) -> String {
 }
 
 /// One line of [`redact`]'s words onto `out`, emptied: withheld whole
+/// ([`REDACTED_LINE`]) when the privacy check's phrase rules find it
+/// sensitive.
 fn judge_line(line: &mut String, out: &mut String) {
     if redaction::contains_sensitive_phrase(line) {
         out.push_str(REDACTED_LINE);
@@ -141,6 +145,11 @@ fn judge_line(line: &mut String, out: &mut String) {
 }
 
 /// `text` as its stretches in order, each fleet join code in it — wherever
+/// it sits: its secret's groups with or without the `atf1-` before them, in
+/// any case, with dashes or white space (a line break too) between them,
+/// its `@<host>:<port>` with it ([`aterm_net::fleet_member::code_spans`]) —
+/// a stretch of its own (`true`), which the caller replaces by
+/// `atf1-[redacted]`.
 fn code_stretches(text: &str) -> Vec<(bool, &str)> {
     let mut out = Vec::new();
     let mut at = 0;
@@ -157,18 +166,21 @@ fn code_stretches(text: &str) -> Vec<(bool, &str)> {
 }
 
 /// Where a join code sits in `text` ([`code_stretches`]); none off unix,
+/// where no machine joins a fleet.
 #[cfg(unix)]
 fn code_spans(text: &str) -> Vec<std::ops::Range<usize>> {
     aterm_net::fleet_member::code_spans(text)
 }
 
 /// Where a join code sits in `text` ([`code_stretches`]); none off unix,
+/// where no machine joins a fleet.
 #[cfg(not(unix))]
 fn code_spans(_text: &str) -> Vec<std::ops::Range<usize>> {
     Vec::new()
 }
 
 /// [`redact`]'s word pass over one line: the breaks between its tokens kept
+/// as they are.
 fn redact_words(line: &str) -> String {
     use redaction::is_token_break;
     let mut out = String::with_capacity(line.len());
@@ -186,7 +198,7 @@ fn redact_words(line: &str) -> String {
     out
 }
 
-/// [`redact_words`] for one token, onto `out`. A token that carries a fleet
+/// [`redact_words`] for one token, onto `out`.
 fn redact_word(word: &str, out: &mut String) {
     let variable = word.starts_with('$') && word.contains('/');
     if let Some(at) = word.to_ascii_lowercase().find(FLEET_CODE) {
@@ -206,9 +218,21 @@ fn redact_word(word: &str, out: &mut String) {
 }
 
 /// How many digits of a 40-digit hex word [`redact`] keeps: a commit id's
+/// short form, which still names the commit in any repository a person works
+/// in, and never the whole of a 160-bit secret of the same shape — a fleet
+/// key file's text is one (`aterm fleet init`), and so are other services'
+/// keys.
 const COMMIT_SHOWN: usize = 12;
 
 /// One word or path segment onto `out`: a credential-shaped one
+/// ([`redaction::looks_like_raw_credential`]) replaced, unless it is a
+/// 40-digit hex word — judged without the punctuation around it, which is
+/// copied through, so a credential that ends a sentence (`…EXAMPLE.`) is
+/// replaced as one alone is, and judged whole too, for a shape whose own
+/// characters end it; then each run of exactly 40 hex digits in it (a git
+/// object name, or a secret of that shape, alone or after a `key=` or in an
+/// `a..b` range; either case) cut to its first [`COMMIT_SHOWN`] digits and
+/// `…`.
 fn redact_plain(word: &str, out: &mut String) {
     let start = word
         .find(|c: char| c.is_ascii_alphanumeric())
@@ -251,6 +275,8 @@ fn redact_plain(word: &str, out: &mut String) {
 }
 
 /// Whether `word` is exactly 40 hex digits, in either case: git prints a
+/// commit id in lowercase, but a 160-bit secret of the same shape may come
+/// uppercase.
 fn is_hex40(word: &str) -> bool {
     word.len() == 40 && word.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -264,6 +290,7 @@ fn excerpt_token(text: Option<&str>) -> String {
 }
 
 /// A branch for the wire: capped and pct-encoded, a fleet code replaced as
+/// [`redact`] replaces one, `-` for none.
 fn branch_token(text: Option<&str>) -> String {
     match text.map(str::trim).filter(|t| !t.is_empty()) {
         Some(text) => {
@@ -293,7 +320,7 @@ fn branch_token(text: Option<&str>) -> String {
 /// The most bytes of a role facts carry ([`role_token`]).
 const ROLE_LABEL_MAX: usize = 32;
 
-/// A role for the wire at `level`. A role is a label someone stamped for
+/// A role for the wire at `level`.
 fn role_token(role: Option<&str>, level: SurveyLevel) -> String {
     let role = role.map(str::trim);
     let label = |role: &&str| {
@@ -421,6 +448,11 @@ pub(crate) fn survey_rows(store: &Store, level: SurveyLevel, max: usize, here: &
 }
 
 /// This machine's fleet node id for the header's `node=` — which a fleet
+/// reader checks against the node its book holds for the address it dialled,
+/// and against the node this listener proved, refusing a reply that names
+/// another (`aterm_net::fleet_member::survey_all`) — as `aterm fleet
+/// init|join` wrote it, never minted here; `-` for none, or one that cannot
+/// be read.
 fn node_token() -> String {
     #[cfg(unix)]
     if let Some(node) = aterm_types::dirs::state_dir()
@@ -432,10 +464,13 @@ fn node_token() -> String {
 }
 
 /// One session's row ([`session_row`]) and how much its excerpts are worth
+/// keeping when a reply must shrink ([`survey_rows`]).
 struct Row {
     /// The `session …` line, no newline.
     text: String,
     /// Least first: `0` a session no agent reads (a shell's command and
+    /// rows), `1` an agent at rest, `2` an agent at work, asking or at a
+    /// wall, or any session raising attention.
     keep: u8,
     /// Answered at facts to fit the reply (`cut=`).
     cut: bool,
@@ -566,6 +601,9 @@ fn session_row(h: &SessionHandle, level: SurveyLevel, now_us: u64, now_unix_ms: 
 }
 
 /// What kind of program a session runs in front, for a reader that must not
+/// keep its own list of shells: `agent` (an identified agent reads it),
+/// `shell` (`quit_safety::is_shell_name`), `program` (anything else), `-`
+/// (none seen yet).
 fn program_kind(is_agent: bool, program: Option<&str>) -> &'static str {
     match program {
         _ if is_agent => "agent",
@@ -591,6 +629,8 @@ struct EngineRead {
 }
 
 /// One `try_lock` of `h`'s engine: the facts every row carries and, with
+/// `shell` (a session no transcript excerpt speaks for), its command line
+/// and last rows.
 fn engine_read(h: &SessionHandle, shell: bool) -> EngineRead {
     let read = |t: &aterm_core::terminal::Terminal| {
         use crate::cwd_native::ReportedCwd as _;
@@ -617,9 +657,12 @@ fn engine_read(h: &SessionHandle, shell: bool) -> EngineRead {
 }
 
 /// The most screen rows one logical line of [`last_rows`] joins: past it the
+/// line is withheld whole ([`REDACTED_LINE`]), so the work under the engine's
+/// lock stays bounded and no part of a line too long to judge leaves.
 const LINE_ROWS_MAX: i32 = 64;
 
 /// The last [`SHELL_ROWS`] non-blank LOGICAL lines that end on `t`'s screen,
+/// oldest first, trailing blanks trimmed; `None` for a blank screen.
 fn last_rows(t: &aterm_core::terminal::Terminal) -> Option<String> {
     let mut lines: Vec<String> = Vec::with_capacity(SHELL_ROWS);
     let mut r = i32::from(t.rows()) - 1;
@@ -640,6 +683,8 @@ fn last_rows(t: &aterm_core::terminal::Terminal) -> Option<String> {
 }
 
 /// Rows `first..=last` of `t` (negative rows are its scrollback) as one line:
+/// each as written, trailing blanks included — a wrapped row's last cells are
+/// the line's — control characters as spaces, and the end trimmed.
 fn logical_line(t: &aterm_core::terminal::Terminal, first: i32, last: i32) -> String {
     let mut line = String::new();
     for row in first..=last {
@@ -652,6 +697,9 @@ fn logical_line(t: &aterm_core::terminal::Terminal, first: i32, last: i32) -> St
 }
 
 /// The session's prompt: its task's head for a session with a task record,
+/// else the newest transcript prompt the window harness did not type —
+/// passed over when its key is one a `by=harness` turn ledger record's text
+/// has ([`harness_keys`]).
 fn prompt_of(h: &SessionHandle, tasked: bool, excerpts: Option<&ClaudeExcerpts>) -> Option<String> {
     let excerpts = excerpts?;
     if tasked && let Some(task) = &excerpts.task {

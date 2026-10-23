@@ -1,25 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A move over a fading band leaves no hole in the line.
-//!
-//! Two back-cursor-movement cases, both in the corridor `Ribbon::wake` lays behind a moving caret
-//! while the band under the move is on its way out:
-//!
-//! * Home / End over a fading band (the takeover arm). The cap binds at the corridor's far edge:
-//!   light the corridor keeps past it moves that edge out, and the drained columns between are
-//!   laid (v3 §2.10, K2).
-//! * A word hop at the end of the swoosh (the hop arm): ⌥← ×2 (a scrub), a pause, then ⌥→ landing
-//!   in the last ~20 ms of the band's fade. The hop covers leaving light from the level it has,
-//!   as the jump does. A visibility floor would not do: the drain empties neighbouring columns a
-//!   few ms apart, so any floor splits the corridor at some instant.
-//!
-//! At the host seam through a real `Terminal`, on a 16 ms frame train, a line is typed at 12 cps
-//! into an Ink-shaped composer (whole-line redraw inside a DECTCEM bracket, split so a present
-//! lands while the caret is hidden) and a Claude-Code-shaped one (bottom-pinned, a spinner row
-//! repainting every 100 ms). Every frame censuses the typed row (`#` at ≥ `LIT_COV`, `.` dark); a
-//! hole is a dark run strictly between two lit cells. No frame from the move to the end of the
-//! take may carry one, past the short limits each test states.
+//! Integration tests verifying that cursor jumps and word hops over a fading band leave no holes.
 
 use crate::common::{
     LIT_COV, caret_sample, coverage, holes_of, note_blink, observe_caret_row, observe_ribbon_rows,
@@ -166,8 +148,6 @@ impl Host {
             moves: Vec::new(),
         };
         if composer == Composer::Claude {
-            // The static chrome: the box's rules above and below the line and
-            // the status row under them.
             let r = composer.row();
             let rule: String = "─".repeat(COLS);
             let s = format!(
@@ -464,15 +444,8 @@ const BAND_EXIT_FRAMES: usize = 16;
 /// its grace: a scrub, the control), 1.5 s (inside the swoosh), 2.2 s and 4.0 s (the band gone),
 /// on both composers: no frame from the Home on carries a hole, except the leaving band's own
 /// head for up to [`BAND_EXIT_FRAMES`] frames.
-///
-/// At a 1.5 s settle the band's body has drained under the census bar and only its retract edge
-/// still reads as ink. The corridor stops where the light stops ([`WAKE_MAX_CELLS`]), so the
-/// census sees two islands while that head sweeps off the row: the band finishing on its own
-/// clock, not a hole a key left.
 #[test]
 fn home_then_end_over_a_fading_band_then_typing_leaves_no_hole_in_the_line() {
-    // Each take replays on its own host and clock on the binary's threads (`par_map`); findings
-    // join in order.
     let mut takes = Vec::new();
     for composer in [Composer::Ink, Composer::Claude] {
         for settle in [900u64, 1500, 2200, 4000] {
@@ -497,9 +470,6 @@ fn home_then_end_over_a_fading_band_then_typing_leaves_no_hole_in_the_line() {
                     .join("\n")
             ));
         }
-        // The early frames may carry one leaving cell beyond the
-        // corridor, never a gap in the corridor: every hole has the
-        // corridor whole to its left.
         for i in h.hole_frames_from(jump) {
             let f = &h.frames[i];
             let lit = f.map.chars().filter(|&c| c == '#').count();
@@ -600,10 +570,6 @@ fn a_word_hop_landing_in_the_last_twenty_ms_of_the_swoosh_lays_its_corridor_whol
 
 /// The same hop over a band still retracting: the first ⌥→ at a 1.0–1.2 s pause lands before the
 /// band's drain reaches the corridor, and the hop covers the leaving band from its level.
-///
-/// The second hop's cells are born 15 ms apart along its 60 ms flight (K3), so a landing cell's
-/// left vertex can read the next column before that column's corridor cell is born: one dark
-/// column for up to two frames. The bar is that no hole outlives three frames.
 #[test]
 fn a_word_hop_over_a_retracting_band_leaves_nothing_to_the_band_s_clock() {
     let mut bad = Vec::new();

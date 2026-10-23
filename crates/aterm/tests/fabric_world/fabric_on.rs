@@ -17,6 +17,7 @@ use aterm_link::ctl::Ctl;
 use aterm_link::fabric::kv;
 
 /// The scratch world, short and under `/tmp`: the broker's socket path has to fit
+/// `sun_path`, and a per-user `$TMPDIR` does not.
 struct Scratch {
     dir: PathBuf,
 }
@@ -75,6 +76,7 @@ impl Scratch {
     }
 
     /// `aterm link <verb> <args>` in the same environment (the read-side verbs,
+    /// whose flags the rendezvous file defaults).
     fn link(&self, args: &[&str]) -> (i32, String, String) {
         let mut cmd = Command::new(harness::aterm_to_launch());
         prepare_gui_environment(&mut cmd);
@@ -122,6 +124,8 @@ fn write_secret(s: &Scratch, bytes: &[u8], mode: u32) {
 }
 
 /// `aterm link broker <sock> <log> --secret-file <root>/mint.secret` — the
+/// GUARDED bus `on` deploys under launchd, started here instead; killed on
+/// drop.
 struct Broker {
     child: Child,
 }
@@ -132,6 +136,7 @@ impl Broker {
     }
 
     /// [`Broker::spawn`] with `extra` words after the secret (a
+    /// `--durability`, as the manual's by-hand step 1 adds it).
     fn spawn_with(s: &Scratch, extra: &[&str]) -> Self {
         use aterm_uds::spawnfd::InheritNothing as _;
         chmod(&s.root(), 0o700);
@@ -169,6 +174,9 @@ impl Drop for Broker {
 }
 
 /// The caps `on` minted, checked against the broker it deploys (the root's socket, guarded
+/// by the root's secret): every grant attaches and a `Last` walk under the ring answers,
+/// while a cap minted under another secret and a halt published with no cap are refused,
+/// which tells a guarded broker from one that checks nothing.
 fn deployed_broker_checks_the_minted_caps(s: &Scratch, node: &str) {
     let caps = aterm_link::bridge::read_cap_file(&s.path("root/node.cap")).expect("cap file");
     assert_eq!(caps.len(), 8);
@@ -276,6 +284,7 @@ impl Drop for Gui {
 }
 
 /// The step lines named `<name>` (e.g. `node already n-…`), from the STEPS block
+/// only: the status report that follows a real run has a `node` row of its own.
 fn step<'a>(out: &'a str, name: &str) -> Vec<&'a str> {
     let steps = out
         .find("\naterm fabric — fleet")
@@ -293,6 +302,8 @@ fn step<'a>(out: &'a str, name: &str) -> Vec<&'a str> {
 }
 
 /// **THE DEV APP'S PATH HOLDS A SPACE** (`~/Applications/aterm (dev).app/…`,
+/// what `targo --unverified ship dev-app` installs), and `on` used to refuse
+/// it at the argv step: `[fabric] command` is a whitespace-split line.
 #[test]
 fn on_with_an_aterm_path_holding_a_space_runs_it_through_a_link() {
     let s = Scratch::new("sp");
@@ -402,7 +413,7 @@ fn on_with_an_aterm_path_holding_a_space_runs_it_through_a_link() {
     }
 }
 
-/// End to end, twice. With no fabric command and no broker, the first `on` provisions the
+/// End to end, twice.
 #[test]
 fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
     let bin = harness::aterm();
@@ -641,6 +652,7 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
 }
 
 /// `--dry-run` on a bare world with no broker prints every step as `would` and leaves no
+/// root, config or rendezvous file.
 #[test]
 fn dry_run_names_every_step_and_creates_nothing() {
     let s = Scratch::new("dry");
@@ -670,7 +682,61 @@ fn dry_run_names_every_step_and_creates_nothing() {
     );
 }
 
+/// `--dry-run` over a 0755 root reads a 0600 secret in it as the narrowed root will (`already`)
+/// and changes nothing; the control: a 0644 secret there is still refused for its own mode.
+#[test]
+fn dry_run_reads_the_secret_as_the_narrowed_root_will() {
+    for (tag, mode) in [("kept", 0o600), ("wide", 0o644)] {
+        let s = Scratch::new(&format!("dry-open-{tag}"));
+        let bytes: Vec<u8> = (0..32u8).map(|i| i.wrapping_mul(11)).collect();
+        write_secret(&s, &bytes, mode);
+        chmod(&s.root(), 0o755);
+        let (code, out, err) = s.fabric(&["on", "--dry-run", "--service", "none"]);
+        let secret = step(&out, "secret");
+        assert!(
+            step(&out, "root")
+                .iter()
+                .any(|l| l.split_whitespace().nth(1) == Some("would")),
+            "{tag}: the root step would narrow the root:\n{out}"
+        );
+        if mode == 0o600 {
+            assert!(
+                secret
+                    .iter()
+                    .any(|l| l.split_whitespace().nth(1) == Some("already")),
+                "{tag}: the secret the real run keeps reads `already`:\n{out}\n{err}"
+            );
+            assert!(secret.iter().all(|l| !l.contains("FAILED")), "{tag}: {out}");
+            // No broker answers: the dry run says so with its exit, past every step.
+            assert_eq!(code, 1, "{tag}:\n{out}\n{err}");
+        } else {
+            assert!(
+                secret
+                    .iter()
+                    .any(|l| l.contains("FAILED") && l.contains("chmod 600")),
+                "{tag}: the secret's own mode still refuses:\n{out}\n{err}"
+            );
+            assert_eq!(code, 2, "{tag}:\n{out}\n{err}");
+        }
+        assert_eq!(
+            mode_of(&s.root()),
+            0o755,
+            "{tag}: a dry run narrows nothing"
+        );
+        assert_eq!(
+            std::fs::read(s.root().join("mint.secret")).expect("secret"),
+            bytes,
+            "{tag}: a dry run replaces no secret"
+        );
+        assert_eq!(mode_of(&s.root().join("mint.secret")), mode, "{tag}");
+        assert!(!s.root().join("link-state").exists(), "{tag}: made state");
+        assert!(!s.root().join("node.cap").exists(), "{tag}: minted a cap");
+        assert!(!s.config().exists(), "{tag}: wrote the config");
+    }
+}
+
 /// A rejected mint publishes nothing and supervises nothing; the effect trace runs through
+/// `fabric_capability_publication_model` with eight grants.
 #[test]
 fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
     let mut model = aterm_models_session::fabric_capability_publication_model();
@@ -877,6 +943,13 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
     }
 }
 /// **LAUNCHD IS ASKED THROUGH A DERIVED LABEL, THE PLIST IS THE SCRIPT'S, AND
+/// A BROKER LAUNCHD DOES NOT MANAGE IS NEVER BOOTSTRAPPED OVER.** A FAKE
+/// `launchctl` on `$PATH` that behaves like the real one where it matters:
+/// `bootstrap` starts the broker the plist names and `print gui/<uid>/<label>`
+/// shows it with its pid until `bootout` kills it, while the legacy `list`
+/// shows nothing — the CALLER's domain, as an SSH session's reads, so a run
+/// that still asked `list` would miss launchd's own job (and a domain that
+/// does not exist, no GUI login, is `print`'s exit 112).
 #[test]
 fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
     let bin = harness::aterm();
@@ -1203,6 +1276,7 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
 }
 
 /// **REFUSALS**: a flag `on` does not take (`--tcp`, the removed sealed wire's)
+/// and a bad `--service` are usage errors, refused BEFORE anything is written.
 #[test]
 fn a_usage_error_is_refused_before_anything_is_written() {
     let s = Scratch::new("usage");
@@ -1218,7 +1292,7 @@ fn a_usage_error_is_refused_before_anything_is_written() {
     assert_eq!(code, 2, "{out}");
 }
 
-/// An unreadable or invalid role is not a new one-host fabric. Even without
+/// An unreadable or invalid role is not a new one-host fabric.
 #[test]
 fn role_identity_unreadable_state_never_writes() {
     let bin = harness::aterm();
@@ -1288,6 +1362,7 @@ fn role_identity_unreadable_state_never_writes() {
 }
 
 /// Repairing a missing cap must keep the fleet named by the existing bridge
+/// command.
 #[test]
 fn role_identity_reapplication_preserves_the_nondefault_fleet() {
     let s = Scratch::new("role-fleet");
@@ -1342,6 +1417,7 @@ fn role_identity_reapplication_preserves_the_nondefault_fleet() {
 }
 
 /// Naming a different fleet is a deliberate departure, so `off` must precede
+/// it.
 #[test]
 fn role_identity_conflicting_fleet_is_refused_before_writes() {
     let s = Scratch::new("role-conflict");
@@ -1377,6 +1453,7 @@ fn role_identity_conflicting_fleet_is_refused_before_writes() {
 }
 
 /// **A BARE `on` RE-APPLIES THE ROOT AS IT IS** — doctor's remedy for a
+/// broker that does not answer.
 #[test]
 fn a_bare_on_runs_the_unix_broker_and_refuses_a_job_it_cannot_read() {
     let bin = harness::aterm();
@@ -1555,7 +1632,7 @@ fn a_bare_on_keeps_the_tier_and_only_a_named_one_restarts_for_it() {
     }
 }
 
-/// Wait for `@<sid> status` to read `hold=<want>`. A hang detector (the
+/// Wait for `@<sid> status` to read `hold=<want>`.
 fn until_hold(gui: &Gui, sid: &str, want: u8) -> std::time::Duration {
     let started = std::time::Instant::now();
     loop {
@@ -1573,6 +1650,8 @@ fn until_hold(gui: &Gui, sid: &str, want: u8) -> std::time::Duration {
 }
 
 /// **A PERSON HALTS THE FLEET AND WITHDRAWS IT, AND `off` NAMES EVERY SESSION
+/// THE FLEET HOLDS.** On the guarded broker `on` deploys, with the commands a
+/// person runs: `mint-for h-review`, `halt`, and `halt off`.
 #[test]
 fn review_off_names_a_session_the_fleet_holds() {
     let s = Scratch::new("held");
@@ -1643,6 +1722,11 @@ fn review_off_names_a_session_the_fleet_holds() {
 }
 
 /// **`(0600)` IS TRUE WHEN IT IS SAID.** `mint-for --out` over an IDENTICAL
+/// cap another user could read makes it 0600 before it says so, and stderr
+/// says it was readable and what voids a copy; over a DIFFERENT file it is
+/// refused, the file untouched; and a symlink at `--out` is refused, its
+/// target's bytes and mode untouched: a cap is never written — or chmodded —
+/// through one.
 #[test]
 fn mint_for_never_claims_0600_of_a_file_that_is_not() {
     let s = Scratch::new("mint-out");
@@ -1699,6 +1783,11 @@ fn mint_for_never_claims_0600_of_a_file_that_is_not() {
 }
 
 /// **A PERSON READS AN ASK AND ANSWERS IT, AS A HUMAN.** An agent's `post
+/// to=h-review kind=ask` lands on the person's mail lane; `inbox` with the
+/// person's cap prints it with its answer spelled out and marks it read (a
+/// second `inbox` has nothing new); the `post … kind=answer re=<off>` it names
+/// reaches the asking session as an ANSWER from `h-review`, `trust=human` —
+/// the reply is from the principal the ask went to.
 #[test]
 fn a_person_reads_an_ask_and_answers_it_as_a_human() {
     let s = Scratch::new("person");
@@ -1771,7 +1860,7 @@ fn a_person_reads_an_ask_and_answers_it_as_a_human() {
     drop(broker);
 }
 
-/// `off` acts on the root the fabric is on. After `on` under root A, `off` under another
+/// `off` acts on the root the fabric is on.
 #[test]
 fn review_off_acts_on_the_root_the_config_names() {
     let s = Scratch::new("offroot");

@@ -1,39 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The light-rod cursor: the cursor-shape treatment every trail style shares,
-//! tinted by the host with the style's colour and haze (a style with a bespoke
-//! block body takes only the bar). It follows the live cursor shape:
-//!
-//! * **Bar** (DECSCUSR bar / `cursor_style beam`): a vertical rod of light, a
-//!   white-hot axis inside a haze sleeve ([`BEAM_SPACE_HAZE`] for beam, shared
-//!   with the trail), overshooting the cell slightly. It breathes at rest and
-//!   flares with the aurora's blaze. The bar keeps its shape; the light is
-//!   additive on a dark page and ink under the letters on a light one (see
-//!   below).
-//! * **Block**: a charged emitter. The fill locks to the style's hue beside a
-//!   soft round aura, inside the caret's row, that fades into the haze at its
-//!   rim (the rows above and below take none of it). On a dark page the fill
-//!   whitens with the blaze; on a light page it deepens instead
-//!   ([`crate::color_math::light_body_fill`]) and the aura is not drawn, since
-//!   additive light cannot brighten a white ground and over a glyph it only
-//!   lifts the ink toward the page.
-//!
-//! Text safety: the host floors the fill against the page
-//! ([`crate::cursor_fx::floor_block_fill`]), so the caret and the glyph cut
-//! out of it in the page colour stay legible; the renderer's
-//! `floor_cursor_fill` adds the user's `minimum_contrast` on top (off by
-//! default). Rod and aura light is additive [`GlowQuad`]s with capped coverage.
-//! A clockless pure function of an injected `now`; it goes inactive when the
-//! blaze dies (the resting rod rides the blink cadence) and emits identical
-//! premultiplied quads on CPU and Metal.
-//!
-//! On a LIGHT GROUND (additive light cannot show on white) the bar's rod has
-//! a light mode of its own, ink UNDER the letters inside the cursor's row,
-//! solved against the theme's text (`cursor_glow::light_body_ink`): a narrow
-//! sleeve of the style's ink around a deeper core. The emitter block lays no
-//! aura there; its fill concentrates the hue as it charges instead of
-//! whitening ([`crate::color_math::light_body_fill`]).
+//! Light-rod bar and emitter-block cursor effects ([`BEAM_SPACE_HAZE`],
+//! [`crate::color_math::light_body_fill`], [`crate::cursor_fx::floor_block_fill`], [`GlowQuad`]).
 
 use aterm_time::Instant;
 
@@ -44,17 +13,14 @@ use crate::effect_util::TWINKLE_FLASH_BOUND_HZ;
 use crate::effect_util::push_fx_rect as push_rect;
 use crate::effect_util::{lerp_rgb, push_fx_ramp};
 
-/// Breathing rate in turns/second: a slow, calm shimmer. The phase advances
-/// only when frames render, so a settled rod breathes at the blink cadence.
+/// Breathing rate in turns/second: a slow, calm shimmer.
 const BREATHE_IDLE: f32 = 0.55;
 const BREATHE_ACTIVE: f32 = 1.6;
 
 /// Sparkle's shimmer runs the same sine this many times faster: a glitter
 /// tremble rather than a breath.
 const SHIMMER_RATE_MUL: f32 = 4.5;
-/// The shimmer's ceiling in turns/second. The breath is one unrectified sine,
-/// one peak per turn, so turns/second is its flash rate, and it stays inside
-/// the crate's general-flash bound however hard the keys charge the rod.
+/// The shimmer's ceiling in turns/second.
 const SHIMMER_MAX_TURNS_PER_S: f32 = TWINKLE_FLASH_BOUND_HZ;
 const _: () = assert!(
     BREATHE_IDLE * SHIMMER_RATE_MUL <= SHIMMER_MAX_TURNS_PER_S
@@ -67,8 +33,7 @@ const _: () = assert!(
 const OVERSHOOT_IDLE: f32 = 0.06;
 const OVERSHOOT_MAX: f32 = 0.22;
 
-/// Axis coverage before intensity, rest → full blaze. The sleeve layers scale
-/// down from it and every quad is clamped to [`COV_CAP`].
+/// Axis coverage before intensity, rest → full blaze.
 const COV_IDLE: f32 = 70.0;
 const COV_MAX: f32 = 150.0;
 /// Per-quad additive coverage ceiling (the comet and droplet cursors use the
@@ -80,15 +45,7 @@ const COV_CAP: f32 = 92.0;
 /// the host stops the 60 fps tick and the resting glow rides the blink cadence.
 const SETTLED_BLAZE: f32 = 0.02;
 
-/// The least WCAG contrast the emitter block keeps against a LIGHT page at
-/// rest, as the comet's nucleus does
-/// ([`crate::cursor_comet::LIGHT_NUCLEUS_CONTRAST`]): the style's hue,
-/// deepened by lightness alone ([`crate::color_math::floor_contrast_keeping_hue`],
-/// so Sparkle's gold stays gold and Beam's ice stays ice, never greyed and
-/// never whitened) until it reads clearly above the caret's page floor
-/// ([`crate::cursor_fx::CARET_PAGE_MIN_CONTRAST`]) rather than resting on it.
-/// The heat deepens it further from there. A pinned cursor colour is not
-/// moved ([`BeamRodConfig::pinned`]).
+/// The least WCAG contrast the emitter block keeps against a light page at rest.
 pub const LIGHT_EMITTER_CONTRAST: f32 = crate::cursor_comet::LIGHT_NUCLEUS_CONTRAST;
 
 /// The block aura's brightest light outside the cell at full blaze: the
@@ -104,40 +61,28 @@ const AURA_ROW_DIV: f32 = 12.0;
 /// Resolved per-frame inputs (Copy so the host reads it out before borrowing state).
 #[derive(Clone, Copy, Debug)]
 pub struct BeamRodConfig {
-    /// The trail is on and the cursor is a focused bar, or a block under a style
-    /// with no bespoke block body.
+    /// The trail is on and the cursor is a focused bar.
     pub enabled: bool,
-    /// Reduced-motion / load-shed amplitude `0..1`; 0 ⇒ fully inert.
+    /// Reduced-motion / load-shed amplitude `0..1`.
     pub intensity: f32,
-    /// The rod's hue `0x00RRGGBB` (`GlowConfig::color`, or the style's
-    /// signature shade), so the rod, the fill and the trail are one light.
+    /// The rod's hue `0x00RRGGBB` (`GlowConfig::color`, or the style's signature shade).
     pub color: u32,
-    /// The sleeve colour `0x00RRGGBB` the outer layers and aura rim mix toward:
-    /// beam's `BEAM_SPACE_HAZE`, otherwise a deepened shade of the style's hue.
+    /// The sleeve colour `0x00RRGGBB` the outer layers and aura rim mix toward.
     pub haze: u32,
     /// The live cursor is a bar (rod treatment) rather than a block (emitter).
     pub bar: bool,
-    /// Sparkle's twinkle: the breathing runs [`SHIMMER_RATE_MUL`] times
-    /// faster (capped at [`SHIMMER_MAX_TURNS_PER_S`]) so the emitter glitters
-    /// instead of breathing; its depth is unchanged. Everyone else passes
-    /// `false`.
+    /// Sparkle's twinkle: the breathing runs [`SHIMMER_RATE_MUL`] times faster.
     pub shimmer: bool,
-    /// The ground is dark (the rod is light) or light (the bar's rod is ink
-    /// under the letters, the emitter block deepens and lays no aura).
+    /// The ground is dark (the rod is light) or light.
     pub dark_theme: bool,
-    /// The theme's text and paper, which a light ground's ink is solved
-    /// against.
+    /// The theme's text and paper, against which a light ground's ink is solved.
     pub theme_fg: u32,
     pub theme_bg: u32,
-    /// [`Self::color`] is a PINNED cursor colour (a configured `cursor_color`
-    /// or a program's OSC 12, which the style's colour follows): the settled
-    /// emitter block is exactly that colour, and only the blaze moves it
-    /// ([`crate::color_math::wear_pinned`]).
+    /// [`Self::color`] is a pinned cursor colour.
     pub pinned: bool,
 }
 
-/// What a tick produced: the emitter block fill (`None` for the bar, whose body
-/// stays the themed cursor) and a fingerprint that changes on every visible step.
+/// What a tick produced.
 #[derive(Clone, Copy, Debug)]
 pub struct BeamRodFrame {
     /// The emitter block-fill colour `0x00RRGGBB`, or `None` when off / bar.
@@ -146,8 +91,7 @@ pub struct BeamRodFrame {
     pub fp: u64,
 }
 
-/// Per-window light-rod animation state: a breathing phase, the last clock
-/// reading and a latched blaze.
+/// Per-window light-rod animation state.
 #[derive(Default)]
 pub struct CursorBeamRod {
     /// Rolling breathing phase in turns `0..1`.
@@ -160,19 +104,14 @@ pub struct CursorBeamRod {
 }
 
 impl CursorBeamRod {
-    /// Whether the host must keep arming the animation tick: only while the
-    /// beam is charged (typing or a jump flare cooling).
+    /// Whether the host must keep arming the animation tick.
     #[must_use]
     #[inline]
     pub const fn is_active(&self) -> bool {
         self.blaze > SETTLED_BLAZE
     }
 
-    /// Advance one frame: `blaze` is [`crate::cursor_glow::CursorGlow::blaze`]
-    /// read after the aurora tick, `cur` the cursor cell (`None` ⇒ hidden). Appends
-    /// the additive rod/aura to `out` on a dark ground, its ink to `under` (the
-    /// under-ink stream) on a light one; returns the emitter fill and a
-    /// fingerprint.
+    /// Advance one frame using [`crate::cursor_glow::CursorGlow::blaze`].
     #[allow(
         clippy::too_many_arguments,
         reason = "cursor cell + clock + blaze + geometry + config + the two streams it draws into"
@@ -188,8 +127,6 @@ impl CursorBeamRod {
         under: &mut Vec<GlowQuad>,
     ) -> BeamRodFrame {
         let e = (blaze.clamp(0.0, 1.0) * cfg.intensity.clamp(0.0, 1.0)).clamp(0.0, 1.0);
-        // Inert (identical to the plain themed cursor) when off, when the
-        // geometry is degenerate, or at zero amplitude (reduced motion / shed).
         if !cfg.enabled || geom.cw == 0 || geom.ch == 0 || cfg.intensity <= 0.0 {
             self.blaze = 0.0; // inert: report settled so the host disarms the tick
             self.last = Some(now);
@@ -197,8 +134,6 @@ impl CursorBeamRod {
         }
         self.blaze = e;
 
-        // Advance the breathing by real dt (clamped so a long stall — e.g. the
-        // window slept — doesn't fling the phase). Faster while charged.
         let dt = self
             .last
             .map(|t| now.saturating_duration_since(t).as_secs_f32())
@@ -213,16 +148,8 @@ impl CursorBeamRod {
         };
         self.breathe = (self.breathe + dt * rate).fract();
         let phase = self.breathe * std::f32::consts::TAU;
-        // A single sine: steady light breathes, and sparkle's faster tremble is
-        // still that sine under the flash bound, never a strobe.
         let breathe = 0.5 + 0.5 * phase.sin();
 
-        // Block fill: the style's hue. On a dark page it whitens as the blaze
-        // climbs, capped below pure white so the additive axis stays
-        // brightest; on a light page it deepens instead. The host floors it
-        // against the page either way.
-        // A pinned cursor colour is the settled block itself; the lift (or
-        // the deepening) comes in only with the blaze.
         let fill = (!cfg.bar).then(|| {
             let styled = if cfg.dark_theme {
                 let k = 0.10 + 0.35 * e;
@@ -245,8 +172,6 @@ impl CursorBeamRod {
             }
         });
 
-        // The rod/aura, drawn only over a visible in-grid cursor cell: light
-        // on a dark ground, ink under the letters on a light one.
         if let Some((cr, cc)) = cur
             && (cr as usize) < geom.rows
             && (cc as usize) < geom.cols
@@ -255,14 +180,10 @@ impl CursorBeamRod {
                 (true, true) => self.emit_rod(cr, cc, e, breathe, geom, cfg, out),
                 (true, false) => self.emit_aura(cr, cc, e, breathe, geom, cfg, out),
                 (false, true) => self.emit_rod_light(cr, cc, e, breathe, geom, cfg, under),
-                // The opaque block carries the caret on paper; an aura of ink
-                // beside it would only stand over the letter just typed.
                 (false, false) => {}
             }
         }
 
-        // Fingerprint: quantized phase + blaze + fill, so a settled rod
-        // early-outs the present but any visible step forces a repaint.
         let fp = ((self.breathe * 512.0) as u64)
             .wrapping_mul(1_000_003)
             .wrapping_add((e * 255.0) as u64)
@@ -272,9 +193,7 @@ impl CursorBeamRod {
         BeamRodFrame { fill, fp }
     }
 
-    /// The bar treatment: a vertical rod of light on the bar's own x, a
-    /// white-hot axis inside a cool sleeve, overshooting the cell slightly.
-    /// Bounded: 4 layers × ≤3 vertical segments each.
+    /// The bar treatment: a vertical rod of light on the bar's own x.
     #[allow(
         clippy::too_many_arguments,
         reason = "cursor cell + blaze/breathe + geometry/config; one internal call site"
@@ -290,10 +209,7 @@ impl CursorBeamRod {
         out: &mut Vec<GlowQuad>,
     ) {
         let (cw, ch) = (geom.cw as f32, geom.ch as f32);
-        // Window px: everything below is grid-relative + origin.
         let (ox, oy) = (geom.origin_x as f32, geom.origin_y as f32);
-        // The rod's axis sits ON the bar: the renderer draws the bar hugging
-        // the cell's left edge, so centre the light just inside it.
         let ax = ox + (cc as f32) * cw + cw * 0.10;
         let over =
             (OVERSHOOT_IDLE + (OVERSHOOT_MAX - OVERSHOOT_IDLE) * e) * ch * (0.85 + 0.15 * breathe);
@@ -310,10 +226,6 @@ impl CursorBeamRod {
             };
             (m(16) << 16) | (m(8) << 8) | m(0)
         };
-        // (half-width in cell-widths, coverage ×, mix target, mix amount),
-        // axis first so a saturated quad budget sheds sleeve, never filament.
-        // Inner layers mix toward white, outer toward the haze. The end caps
-        // (the overshoot) run only the two inner layers, narrower.
         let layers: [(f32, f32, u32, f32); 4] = [
             (0.045, 1.00, WHITE, 0.55),   // white-hot axis
             (0.13, 0.55, WHITE, 0.12),    // inner sleeve
@@ -345,10 +257,7 @@ impl CursorBeamRod {
         }
     }
 
-    /// The bar on a LIGHT GROUND: a narrow sleeve of the style's ink around a
-    /// deeper core on the bar's own x, under the letters and held inside the
-    /// cursor's row, charging with the blaze and breathing as the light rod
-    /// does. Bounded: two rects.
+    /// The bar on a light ground.
     #[allow(
         clippy::too_many_arguments,
         reason = "cursor cell + blaze/breathe + geometry/config; one internal call site"
@@ -388,8 +297,6 @@ impl CursorBeamRod {
                 ink
             }
         };
-        // (half-width in cell-widths, share of the body ceiling), sleeve first
-        // so the core composites over it.
         for (hw, share) in [(0.30, 0.45), (0.11, 1.0)] {
             let a = (LIGHT_BODY_ALPHA_CAP * share * strength) as u8;
             if a == 0 {
@@ -410,19 +317,7 @@ impl CursorBeamRod {
         }
     }
 
-    /// The block treatment: a soft round aura beside the emitter cell, inside
-    /// the caret's row.
-    ///
-    /// One `(1 − ρ²)²` profile over an ellipse as wide as the cell plus the
-    /// reach (a quarter of a cell-height at rest, over half of one at full
-    /// blaze, breathing) and exactly
-    /// as tall as the row, so it melts to nothing at the row's top and bottom
-    /// edges and the rows above and below take no light. Only the part
-    /// outside the cell is laid (the opaque block covers the rest), scaled so
-    /// its brightest pixel, at the cell's edge, carries at most
-    /// [`OVER_INK_COV_CAP`] (the letter just typed beside the caret keeps the
-    /// over-ink bar), as per-row ramps of [`AURA_SEGMENTS`] pieces a side that
-    /// meet but never overlap: one smooth falloff, not nested steps.
+    /// The block treatment: a soft round aura beside the emitter cell, inside the caret's row.
     #[allow(
         clippy::too_many_arguments,
         reason = "cursor cell + blaze/breathe + geometry/config; one internal call site"
@@ -441,8 +336,6 @@ impl CursorBeamRod {
         let (cx, cy) = geom.cell_center(cr, cc);
         let reach = (0.28 + 0.30 * e) * (0.85 + 0.15 * breathe) * ch;
         let (rx, ry) = (cw * 0.5 + reach, ch * 0.5);
-        // The profile at the cell's edge on the row's centre line: the
-        // brightest point outside the block, which the budget scales to.
         let rho_edge = (cw * 0.5) / rx;
         let f_edge = (1.0 - rho_edge * rho_edge).powi(2);
         let peak = AURA_PEAK_COV * (0.55 + 0.45 * e) * (0.9 + 0.1 * breathe) * cfg.intensity;
@@ -467,10 +360,6 @@ impl CursorBeamRod {
                 let half = rx * w2.sqrt();
                 if half > hw {
                     let span = half - hw;
-                    // Knot `k`: from the cell's edge (`k = 0`) out to the
-                    // ellipse's rim at this row, its rounded edges and
-                    // premultiplied light (the hue sliding into the haze
-                    // toward the rim).
                     let knot = |k: usize| {
                         let t = k as f32 / AURA_SEGMENTS as f32;
                         let dx = hw + span * t;
@@ -579,13 +468,11 @@ mod tests {
         let cell_x0 = 3 * g.cw as i32;
         for q in &out {
             assert!((q.x as usize) < g.cols * g.cw && (q.y as usize) < g.rows * g.ch);
-            // Everything stays within one neighbour of the bar's own column.
             assert!(
                 (q.x as i32) >= cell_x0 - g.cw as i32 && (q.x as i32) <= cell_x0 + g.cw as i32,
                 "rod light strays from the bar: x={}",
                 q.x
             );
-            // Any quad reaching past the cursor cell's own column is a tint.
             let a = (q.color >> 24) & 0xff;
             if (q.x as i32) < cell_x0 {
                 assert!(a <= COV_CAP as u32, "neighbour-crossing wash too hot: {a}");
@@ -659,9 +546,7 @@ mod tests {
 
     /// On a white page at full blaze the emitter block (GitHub Light's cursor
     /// `#0969DA` as its colour) keeps 3:1 with everything it emits composited
-    /// over the caret cell, and the bar draws no additive rod. Negative
-    /// control: the dark arm on the same page whitens the block under 3:1,
-    /// the defect the light arm exists for.
+    /// over the caret cell, and the bar draws no additive rod.
     #[test]
     fn the_light_emitter_keeps_its_caret_on_a_white_page() {
         const WHITE: u32 = 0x00FF_FFFF;
@@ -729,10 +614,7 @@ mod tests {
     /// ON PAPER THE RESTING EMITTER READS CLEARLY ABOVE THE CARET FLOOR, IN
     /// ITS OWN HUE: Sparkle's gold and Beam's ice at rest (and charged) keep
     /// [`LIGHT_EMITTER_CONTRAST`] on GitHub Light and Default Light, within a
-    /// few degrees of their hue and no greyer than the hue itself. A pinned
-    /// cursor colour still rests exactly as pinned. Negative control: the
-    /// deepening alone (the arm before the floor) leaves the gold under 4.5:1
-    /// and the ice on the floor, which the host then lifted to exactly 4.5.
+    /// few degrees of their hue and no greyer than the hue itself.
     #[test]
     fn the_light_emitter_rests_clearly_above_the_floor_in_its_hue() {
         use crate::color_math::{contrast_ratio, light_body_fill, rgb2hsv};
@@ -832,7 +714,6 @@ mod tests {
                 &mut Vec::new(),
             );
             let before = rod.breathe;
-            // 0.2 s: under the 0.25 s stall clamp and under one turn.
             rod.tick(
                 Some((2, 3)),
                 t0 + std::time::Duration::from_millis(200),
@@ -881,10 +762,7 @@ mod tests {
     /// letters), no pixel outside the cell carries more than the over-ink
     /// budget, the light shows on both sides of the block, it melts toward
     /// the row's top and bottom edges instead of stopping at them, and along
-    /// the row it falls away from the block a few levels a pixel. Negative
-    /// control: the nested box the aura used to stack (three rectangles
-    /// around the cell) lights the rows above and below and steps in jumps
-    /// along the row.
+    /// the row it falls away from the block a few levels a pixel.
     #[test]
     fn the_block_aura_is_a_round_glow_inside_the_caret_row() {
         let g = geom();
@@ -893,8 +771,6 @@ mod tests {
         let band = usize::from(cr) * g.ch..(usize::from(cr) + 1) * g.ch;
         let cell = usize::from(cc) * g.cw..(usize::from(cc) + 1) * g.cw;
         let mid = band.start + g.ch / 2;
-        // The largest jump between neighbouring pixels along the centre line
-        // left of the block, and the light outside the row.
         let shape = |quads: &[GlowQuad]| {
             let light = light_per_pixel(quads, w, h);
             let outside_row: u32 = (0..h)
@@ -955,7 +831,6 @@ mod tests {
                 "blaze {blaze}: a {step}-level step along the row"
             );
         }
-        // The nested box the aura used to stack, at full blaze.
         let mut boxed = Vec::new();
         let (x, y) = (
             (usize::from(cc) * g.cw) as i32,

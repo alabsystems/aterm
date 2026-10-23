@@ -32,6 +32,7 @@ impl OsAppearanceSource {
     }
 
     /// [`Self::for_launch`] with the seam already read: an injected reading
+    /// wins, then headless is inert.
     #[must_use]
     fn choose(headless: bool, injected: Option<Appearance>) -> Self {
         match injected {
@@ -123,6 +124,7 @@ pub(crate) fn parse_appearance_word(word: &str) -> Option<Appearance> {
 }
 
 /// Whether this build accepts an injected flip (`appearance dark|light`): a
+/// development build only, like every `dev_seam!`.
 const INJECTION_ENABLED: bool = cfg!(any(debug_assertions, feature = "dev-seams"));
 
 /// The `appearance [dark|light]` control verb, on a control worker.
@@ -141,6 +143,7 @@ pub(crate) fn cmd_appearance(proxy: &EventLoopProxy<Wake>, rest: &str) -> String
 }
 
 /// The `appearance` verb's arguments: none (read), or one `dark`|`light` to
+/// inject, which only a build with `injection` admits.
 fn appearance_request(rest: &str, injection: bool) -> Result<Option<Appearance>, &'static str> {
     let mut words = rest.split_whitespace();
     let set = match (words.next(), words.next()) {
@@ -219,10 +222,11 @@ mod desktop {
     /// GNOME's own key, read where no portal answers.
     const GNOME_SCHEMA: &str = "org.gnome.desktop.interface";
 
-    /// How long one read may take. The launch read runs on the main thread
+    /// How long one read may take.
     const READ_BOUND: std::time::Duration = std::time::Duration::from_millis(200);
 
     /// How long the watcher's portal read may take, on its own thread: `gdbus`'s
+    /// own call timeout (`--timeout=1`, [`portal_read_args`]).
     const WATCH_READ_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
 
     /// The portal's `color-scheme` value.
@@ -314,6 +318,9 @@ mod desktop {
     }
 
     /// The portal's reading if it is running, asked in-process
+    /// (`portal_settings`, which never starts it): no `gdbus` child, and no
+    /// wait for a portal that cannot start (200 ms of a Linux window's launch
+    /// before, 2026-10-20).
     #[cfg(target_os = "linux")]
     fn read_running_portal() -> Option<Appearance> {
         crate::portal_settings::read(APPEARANCE_NAMESPACE, COLOR_SCHEME_KEY, READ_BOUND)
@@ -323,6 +330,7 @@ mod desktop {
     }
 
     /// The other unixes have no in-process portal reader (aterm-dbus is a
+    /// Linux dependency): the bounded `gdbus` read.
     #[cfg(not(target_os = "linux"))]
     fn read_running_portal() -> Option<Appearance> {
         read_portal(READ_BOUND)
@@ -344,6 +352,7 @@ mod desktop {
     }
 
     /// The shell around a tethered watcher: start it, drop this shell's own
+    /// stdout, wait for the tether to close, then end it.
     const TETHER_SCRIPT: &str =
         r#""$@" & pid=$!; exec >/dev/null; read -r _line || :; kill "$pid" 2>/dev/null; wait"#;
 
@@ -394,6 +403,7 @@ mod desktop {
     }
 
     /// The worker body: watch the portal, else gsettings, posting the current
+    /// value first and then every change.
     #[cfg(all(not(target_os = "macos"), not(windows)))]
     fn watch(post: &dyn Fn(Appearance)) {
         let portal_monitor = [
@@ -431,6 +441,7 @@ mod desktop {
     }
 
     /// Post `now`, then every reading `parse` finds in the watcher's lines,
+    /// until the watcher ends.
     #[cfg(all(not(target_os = "macos"), not(windows)))]
     fn follow(
         mut watcher: Tethered,
@@ -560,7 +571,7 @@ mod mac {
             const NAME: &str = "ATermOsAppearanceTarget";
             type Ivars = OsAppearanceIvars;
 
-            /// `v@:@@@^v`. Registered for one key path on one object, so
+            /// `v@:@@@^v`.
             @sel(observeValueForKeyPath:ofObject:change:context:)
             fn observe_value(
                 &self,
@@ -624,6 +635,9 @@ mod mac {
         use aterm_types::Appearance;
 
         /// The KVO callback the runtime dispatches reaches the relay: the
+        /// class is registered under its name, and a real
+        /// `observeValueForKeyPath:ofObject:change:context:` send runs the
+        /// Rust body.
         #[test]
         fn the_kvo_callback_runs_the_relay() {
             use aterm_objc::{ClassType, class};
@@ -663,6 +677,7 @@ mod mac {
         }
 
         /// The best-match answer maps DarkAqua to dark and Aqua to light;
+        /// nil is no reading.
         #[test]
         fn best_match_names_map_to_appearances() {
             // SAFETY: AppKit's own name globals, and nil.
@@ -698,6 +713,7 @@ mod tests {
     use aterm_types::Appearance;
 
     /// The portal's three values: prefer-dark, prefer-light and no preference
+    /// (light, as GNOME draws it); an unknown value is no reading.
     #[test]
     fn the_portal_mapping_covers_prefer_dark_prefer_light_and_none() {
         assert_eq!(portal_color_scheme(1), Some(Appearance::Dark));
@@ -711,6 +727,7 @@ mod tests {
     }
 
     /// `gdbus call` prints Read's double variant and ReadOne's single one;
+    /// an error prints neither.
     #[test]
     fn a_portal_read_parses_both_variant_depths() {
         assert_eq!(parse_portal_read("(<<uint32 1>>,)\n"), Some(1));
@@ -724,6 +741,7 @@ mod tests {
     }
 
     /// Only the appearance key's `SettingChanged` is a reading; another
+    /// setting's signal on the same interface is not.
     #[test]
     fn a_portal_signal_is_read_only_for_the_color_scheme_key() {
         let line = "/org/freedesktop/portal/desktop: org.freedesktop.portal.Settings.SettingChanged \
@@ -773,6 +791,7 @@ mod tests {
     }
 
     /// A development build's injected launch reading is what launch builds
+    /// for, on any lane, and nothing is observed after it.
     #[test]
     fn an_injected_launch_reading_wins_and_observes_nothing() {
         for headless in [true, false] {
@@ -788,6 +807,7 @@ mod tests {
     }
 
     /// The verb reads bare, injects one word, and refuses anything else; a
+    /// shipped build (no injection) refuses the injection but still reads.
     #[test]
     fn the_appearance_verb_parses_and_gates_injection() {
         use super::appearance_request;
@@ -815,6 +835,7 @@ mod tests {
     }
 
     /// The tether law: closing the tether ends the watched program, so a
+    /// watcher never outlives the process holding it.
     #[cfg(unix)]
     #[test]
     fn closing_the_tether_ends_the_watcher() {

@@ -15,18 +15,22 @@ use aterm_uds::CtlStream;
 use crate::native_document_host::HeldAdvisoryLock;
 
 /// The graph-entry filename for a session id, under `<sock_dir>/graph/`: the
+/// one place a session id is joined into a path.
 fn graph_path(sock_dir: &Path, sid: Sid<'_>) -> std::path::PathBuf {
     sock_dir.join("graph").join(sid.as_str())
 }
 
 /// [`graph_path`] for a session id this process holds, or `None` when the id
+/// is no [`Sid`]: such an id is never written, read or removed as an entry.
 fn entry_path(sock_dir: &Path, sid: &SessionId) -> Option<std::path::PathBuf> {
     Sid::parse(sid.as_str()).map(|sid| graph_path(sock_dir, sid))
 }
 
 /// This instance's discovery state: its own bound control socket, the thread
+/// that writes its graph entries, and (under test) where its mirror goes.
 struct Discovery {
     /// This instance's own bound control socket `(sock_dir, sock_path)`, recorded
+    /// by the control server at bind time.
     self_sock: RwLock<Option<(PathBuf, String)>>,
     /// The `aterm-publish` thread ([`publisher`]).
     publisher: std::sync::OnceLock<Option<Publisher>>,
@@ -50,6 +54,7 @@ impl Discovery {
 static PROCESS_DISCOVERY: Discovery = Discovery::new();
 
 /// The discovery state this thread's calls answer to: [`PROCESS_DISCOVERY`], in
+/// every build.
 fn discovery() -> &'static Discovery {
     #[cfg(test)]
     if let Some(own) = OWN_DISCOVERY.get() {
@@ -61,11 +66,14 @@ fn discovery() -> &'static Discovery {
 #[cfg(test)]
 thread_local! {
     /// TESTS ONLY: the state [`discovery`] answers on this thread, when not the
+    /// process's.
     static OWN_DISCOVERY: std::cell::Cell<Option<&'static Discovery>> =
         const { std::cell::Cell::new(None) };
 }
 
 /// TESTS ONLY: a test sets discovery state only on a state of its own
+/// ([`self_sock_test_guard`], lent to the thread that binds): the process's is
+/// every other test's, whose Commit would wait behind this one's writes.
 #[cfg(test)]
 fn assert_own_discovery(what: &str) {
     assert!(
@@ -218,8 +226,10 @@ enum Publication {
         recorded_sock: Option<String>,
     },
     /// Answered once every write queued before it has been processed (a rendezvous
+    /// channel holds the thread until the answer is taken: a test's).
     Flush(std::sync::mpsc::SyncSender<()>),
     /// TESTS ONLY: a test's publication thread ends here, behind every write
+    /// queued before it ([`OwnDiscovery`]'s drop).
     #[cfg(test)]
     Stop,
 }
@@ -262,12 +272,15 @@ impl Publication {
 }
 
 /// The `aterm-publish` thread's queue, and how many writes on it have not
+/// landed.
 struct Publisher {
     tx: std::sync::mpsc::Sender<Publication>,
     pending: std::sync::atomic::AtomicUsize,
 }
 
 /// The publication thread of this thread's discovery state ([`discovery`]),
+/// started with the bind ([`set_self_sock`], on the control thread), so no
+/// tab's landing pays for the thread.
 fn publisher() -> Option<&'static Publisher> {
     let state = discovery();
     state
@@ -307,6 +320,7 @@ fn publisher() -> Option<&'static Publisher> {
 }
 
 /// Hand `publication` to the publication thread; written here when there is
+/// none.
 fn queue_publication(publication: Publication) {
     let Some(p) = publisher() else {
         publication.write();
@@ -356,6 +370,7 @@ pub(crate) fn retire_own_sessions(
 }
 
 /// The spelling of our socket path a graph entry carries: the canonical path
+/// with a Windows verbatim-disk prefix removed (`\\?\C:\x` → `C:\x`).
 fn published_sock_spelling(sock: &str) -> String {
     let stripped = sock.strip_prefix(r"\\?\").unwrap_or(sock);
     let drive = stripped.len() >= 2
@@ -425,6 +440,8 @@ pub(crate) fn set_mirror_dir_override(dir: Option<PathBuf>) {
 }
 
 /// The default control dir (`aterm_uds::control_socket_dir`) to also publish a
+/// graph entry into, or `None` when `sock_dir` already is it or the per-user
+/// base cannot be resolved.
 fn rendezvous_mirror_dir(sock_dir: &Path) -> Option<PathBuf> {
     #[cfg(test)]
     {
@@ -446,6 +463,8 @@ fn rendezvous_mirror_dir(sock_dir: &Path) -> Option<PathBuf> {
 }
 
 /// Best-effort same-directory test: canonical when both resolve (so a symlinked
+/// ancestor like `/var` → `/private/var` does not read as different), else
+/// lexical.
 fn same_dir(a: &Path, b: &Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
@@ -474,7 +493,7 @@ pub(crate) fn retire_graph_entry(sock_dir: &Path, sid: &SessionId) {
     }
 }
 
-/// Open (create/truncate) a private sidecar file for writing. Unix: mode
+/// Open (create/truncate) a private sidecar file for writing.
 #[cfg(unix)]
 fn open_private(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -578,6 +597,8 @@ pub(crate) struct EdgeFile {
 }
 
 /// What an [`EdgeFile`] holds: on unix the owner's `flock`, as a guard that lets
+/// go by `LOCK_UN`; elsewhere no sweep tells owners apart, so the open file is
+/// all there is (a Windows lock would also refuse the child's read).
 #[cfg(unix)]
 type OwnerLock = HeldAdvisoryLock;
 #[cfg(not(unix))]
@@ -591,6 +612,7 @@ impl EdgeFile {
 }
 
 /// Take `f`'s exclusive owner lock without waiting (`flock(LOCK_EX|LOCK_NB)` on
+/// its own open description): `None`, holding nothing, if it cannot be taken.
 #[cfg(unix)]
 fn take_owner_lock(f: std::fs::File) -> Option<OwnerLock> {
     HeldAdvisoryLock::try_lock(f).ok()
@@ -611,7 +633,7 @@ fn owner_file(lock: &OwnerLock) -> &std::fs::File {
     lock
 }
 
-/// Remove the edge-token files in `dir` whose owning parent is gone. A file is
+/// Remove the edge-token files in `dir` whose owning parent is gone.
 #[cfg(unix)]
 fn sweep_dead_edge_files(dir: &Path) {
     use crate::crash_signal::markers::{Owner, probe};
@@ -714,7 +736,7 @@ pub(crate) fn read_graph_entry(sock_dir: &Path, sid: Sid<'_>) -> Option<(String,
     parse_graph_entry(&body)
 }
 
-/// Parse a graph-entry body's `sock` and `nonce` lines. The `sock` line is the
+/// Parse a graph-entry body's `sock` and `nonce` lines.
 fn parse_graph_entry(body: &str) -> Option<(String, LaunchNonce)> {
     let sock = aterm_types::control_socket::graph_entry_sock(body)?;
     let nonce = body
@@ -728,8 +750,11 @@ fn parse_graph_entry(body: &str) -> Option<(String, LaunchNonce)> {
 #[derive(Debug)]
 pub(crate) enum ForwardError {
     /// The entry names no hop: nothing listens at its socket (`ENOENT`,
+    /// `ECONNREFUSED`: a crashed or quit instance's leftover), or no token can
+    /// be read beside it.
     NotAHop,
     /// The host could not be reached for another reason (a connect error that
+    /// does not say nobody listens): the caller answers `ERR forward`.
     Unreachable(std::io::Error),
 }
 
@@ -771,6 +796,8 @@ pub(crate) fn forward_first_line(token: &str, verb: &str) -> String {
 }
 
 /// How long a forward waits for the host to prove it is serving the
+/// connection (its answer to the connect probe) before telling the caller the
+/// host accepted nothing.
 pub(crate) const FORWARD_ACCEPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Verify the host serves on `hop`, send `line` and `client_prebuffered`, and splice `client`.
@@ -796,6 +823,8 @@ pub(crate) fn is_connection_refusal(line: &str) -> bool {
 }
 
 /// The connect probe of a forward: authenticate with `token` and ask `version`
+/// (answered by every aterm generation, for any scope, with one line and no
+/// main-thread hop), then read that line within `within`.
 fn prove_host_serving(
     host: &CtlStream,
     token: &str,
@@ -809,6 +838,9 @@ fn prove_host_serving(
 }
 
 /// The connect probe's exchange: `TOKEN <token> version` written on `host`,
+/// and the one line it answers within `within`, without its `\r?\n` — `OK
+/// …`, or a refusal. `TimedOut` when nothing answers in time,
+/// `UnexpectedEof` when the connection closes first.
 fn probe_answer(
     host: &CtlStream,
     token: &str,
@@ -886,6 +918,10 @@ fn read_probe_line(host: &CtlStream, within: std::time::Duration) -> std::io::Re
 }
 
 /// The aterm at the far end of a forward, as its relay judges a hang-up that
+/// comes from it ([`ForwardHost::gone_line`]): the socket it was reached at,
+/// the token presented there, its pid (`None` where the platform cannot read a
+/// peer's), and the listening socket the forward's connection went through
+/// (`None` where none can be read: the pid alone then decides).
 struct ForwardHost {
     sock: String,
     token: String,
@@ -894,16 +930,26 @@ struct ForwardHost {
 }
 
 /// How long the relay waits for a host that hung up first to answer one look
+/// ([`ForwardHost::gone_line`]): a live aterm answers `version` well within it,
+/// and a process that is going cannot answer at all.
 const HOST_LOOK: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl ForwardHost {
     /// What the client is told when the host hung up first: the host-gone line
+    /// ([`aterm_types::control_verbs::host_gone_line`]) when the host no longer
+    /// serves at its socket (nothing answers there, another process does, or the
+    /// same pid does through another listener), and nothing when it does (it ended
+    /// the exchange on purpose) or when its pid could not be read.
     fn gone_line(&self) -> Option<String> {
         let pid = self.pid?;
         (!self.serves(pid)).then(|| aterm_types::control_verbs::host_gone_line(pid, &self.sock))
     }
 
     /// Whether `pid` still answers at the host's socket through the listener the
+    /// forward went through: a connection there is that process's, answers the
+    /// connect probe with any line (`OK`, or a busy/auth refusal, which only a live
+    /// listener gives), and the socket file still names the listener that accepted
+    /// the forward, read after the answer.
     fn serves(&self, pid: u32) -> bool {
         let Ok(look) = CtlStream::connect(&self.sock) else {
             return false;
@@ -923,6 +969,10 @@ impl ForwardHost {
 }
 
 /// [`relay_hop`] with its relay stage as a parameter: the reply-fidelity
+/// contract (`reply_fidelity_model`) lives entirely here and in
+/// [`connect_hop`], so the Tier-1 bind (`reply_fidelity_conformance`) drives it
+/// with the real relay and with one that fails after delivery (a worker thread
+/// the system refuses to start cannot be staged in a shared test process).
 fn deliver_then_relay(
     hop: Hop,
     line: &str,
@@ -956,6 +1006,9 @@ fn deliver_then_relay(
 }
 
 /// Pump bytes both ways between two connected streams, preserving graceful
+/// half-close order: the child's EOF becomes `Shutdown::Write` on the client only
+/// after every preceding byte was copied and flushed, and the client's EOF then
+/// becomes `Shutdown::Write` on the child.
 fn relay_bidirectional(
     client: &CtlStream,
     child: &CtlStream,
@@ -1032,6 +1085,8 @@ fn relay_bidirectional(
 }
 
 /// Runs its hang-up when an unwind drops it: a relay pump that panics still
+/// ends both sides with a shutdown, so neither peer, nor the other pump, nor
+/// the scope that joins them waits on it.
 struct HangUpOnUnwind<F: Fn()>(F);
 
 impl<F: Fn()> Drop for HangUpOnUnwind<F> {
@@ -1043,6 +1098,8 @@ impl<F: Fn()> Drop for HangUpOnUnwind<F> {
 }
 
 /// Wait until the relay's end `end` has something for a read (bytes, its end
+/// of file or an error, any of which a read returns at once) or the relay has
+/// hung it up (`stop`): `true` to read, `false` to stop.
 fn readable_unless_stopped(end: &CtlStream, stop: &std::sync::atomic::AtomicBool) -> bool {
     #[cfg(unix)]
     {
@@ -1072,12 +1129,16 @@ fn readable_unless_stopped(end: &CtlStream, stop: &std::sync::atomic::AtomicBool
 /// How the host-to-client half of a forward ended.
 enum HostLeg {
     /// The host's side ended: its end of file, or the connection it reset
+    /// (Linux resets a socket closed with unread input) — the host closed it,
+    /// on purpose or by going away.
     HostEnded,
     /// Anything else: the client's side failed, or an error that says
+    /// nothing about the host.
     Broke,
 }
 
 /// Copy the host's bytes to the client in 32 KiB chunks until either side
+/// ends, saying which ([`HostLeg`]).
 fn copy_host_to_client<R: Read, W: Write>(
     host: &mut R,
     client: &mut W,
@@ -1115,7 +1176,7 @@ fn copy_host_to_client<R: Read, W: Write>(
     }
 }
 
-/// Copy `reader` → `writer` in 32 KiB chunks until EOF or error. `ready` is
+/// Copy `reader` → `writer` in 32 KiB chunks until EOF or error.
 fn copy_until_eof<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
@@ -1149,6 +1210,7 @@ mod tests {
     use std::io::{BufRead, BufReader};
 
     /// A host whose pid was not read: a hang-up from it is relayed as a bare end of
+    /// stream.
     fn unknown_host() -> ForwardHost {
         ForwardHost {
             sock: String::new(),
@@ -1159,6 +1221,7 @@ mod tests {
     }
 
     /// Plant `token` beside the host socket `sock`, where [`connect_hop`] reads
+    /// it ([`read_sibling_token`]).
     fn token_beside(sock: &Path, token: &str) {
         let name = aterm_types::control_socket::token_name_for_sock(
             &sock.file_name().expect("a socket file").to_string_lossy(),
@@ -1174,6 +1237,8 @@ mod tests {
     }
 
     /// The published spelling of a Windows socket path drops the verbatim
+    /// prefix and nothing else, so the bind-time entry and every later
+    /// session entry spell one socket the same way.
     #[test]
     fn published_sock_spelling_drops_only_the_verbatim_drive_prefix() {
         assert_eq!(
@@ -1195,6 +1260,9 @@ mod tests {
     }
 
     /// An instance on an explicit `--control-sock` mirrors its graph entry into the
+    /// default rendezvous dir (the only one the flagless `aterm-ctl` reads), and the
+    /// client's own parse (`control_socket::graph_entry_sock`) recovers the absolute
+    /// socket path and nonce from it.
     #[test]
     fn explicit_socket_instance_resolvable_from_default_dir_entry() {
         let default_dir =
@@ -1227,6 +1295,8 @@ mod tests {
     }
 
     /// The mirror targets the default rendezvous dir only for an instance whose
+    /// own socket dir is not the default; a default instance already lives
+    /// there and writes once.
     #[test]
     fn mirror_dir_only_for_out_of_default_instances() {
         let _guard = self_sock_test_guard();
@@ -1265,6 +1335,8 @@ mod tests {
     }
 
     /// A session id is joined into a path only as a [`Sid`]: an id that is no
+    /// session id (`../x` would name `<dir>/x`, `*` a wildcard entry) is never
+    /// written, read or removed as a graph entry.
     #[test]
     fn an_id_that_is_no_sid_is_never_joined_into_a_path() {
         let dir = crate::test_scratch::short_dir("the graph dir");
@@ -1290,6 +1362,8 @@ mod tests {
     }
 
     /// A wedged child, whose listener queues connections without accepting them, is
+    /// reported within the connect-probe bound as having accepted nothing (an error
+    /// before any relay), and the verb never reaches it.
     #[test]
     fn a_child_that_accepts_nothing_fails_the_forward_fast() {
         let dir = crate::test_scratch::short_dir("a hop's socket");
@@ -1324,6 +1398,7 @@ mod tests {
     }
 
     /// A host that refuses the probe (a token it did not mint: `ERR auth`) fails
+    /// the forward before the verb is sent.
     #[test]
     fn a_child_that_refuses_the_probe_never_receives_the_verb() {
         let dir = crate::test_scratch::short_dir("a hop's socket");
@@ -1352,7 +1427,7 @@ mod tests {
         assert_eq!(child.join().unwrap(), "", "the verb was never sent");
     }
 
-    /// A HOST'S UNASKED BYTES ARE NEVER RELAYED AS AN ANSWER. A host sends
+    /// A HOST'S UNASKED BYTES ARE NEVER RELAYED AS AN ANSWER.
     #[test]
     fn a_probe_surplus_is_refused_before_delivery() {
         for surplus in [true, false] {
@@ -1402,6 +1477,9 @@ mod tests {
     }
 
     /// A saturated host still answers: a listener with no lane free writes its busy
+    /// line and closes without reading, so the probe's write fails (`EPIPE`) and the
+    /// line left behind is the answer [`ForwardHost::serves`] takes as proof the
+    /// host is alive.
     #[cfg(unix)]
     #[test]
     fn a_busy_line_left_behind_answers_a_probe_whose_write_failed() {
@@ -1422,6 +1500,8 @@ mod tests {
     }
 
     /// A host that goes away under a forward leaves its client a typed line before
+    /// the EOF, `ERR gone pid=<host> sock=<its socket>` (never `ERR forward`: the
+    /// verb was delivered).
     #[test]
     fn a_host_that_goes_away_under_a_forward_leaves_a_typed_line() {
         #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1506,7 +1586,7 @@ mod tests {
         }
     }
 
-    /// The relay carries an arbitrary request → response (incl. a multi-line body
+    /// The relay carries an arbitrary request → response (incl.
     #[test]
     fn relay_hop_pipes_handshake_and_response() {
         let dir_guard = crate::test_scratch::short_dir("the child's socket");
@@ -1644,12 +1724,18 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum RelayFault {
         /// The child-bound socket loses its send half: the main thread's
+        /// client-to-child write fails the moment the original client sends a
+        /// request, while the worker is parked reading a child that never speaks.
         ChildBound,
         /// The client-bound socket loses its send half: the worker's
+        /// child-to-client write fails the moment the child answers, while the
+        /// main thread is parked reading an original client that never speaks.
         ClientBound,
     }
 
     /// Tear the real relay down under `fault` while both peers stay open and
+    /// otherwise silent, and project what it left onto `RelayTeardown`'s
+    /// variables.
     #[cfg(unix)]
     fn relay_teardown_under(
         fault: RelayFault,
@@ -1708,6 +1794,9 @@ mod tests {
     }
 
     /// Tier-1 conformance of the real relay to
+    /// `aterm_models_session::relay_teardown_model` (`RelayTeardown`): on teardown both
+    /// read halves of both local sockets are shut, so a pump parked on a clone of
+    /// either gets EOF and the worker joins.
     #[test]
     #[cfg(unix)]
     fn relay_teardown_conforms_to_readers_unblock_after_teardown() {
@@ -1750,6 +1839,7 @@ mod tests {
     }
 
     /// The host pump ends on the stop flag alone: the lost wake, staged by sending
+    /// none.
     #[test]
     #[cfg(unix)]
     fn the_host_pump_ends_on_the_stop_flag_without_a_wake() {
@@ -1779,6 +1869,8 @@ mod tests {
     }
 
     /// What the socket `end` names holds for its reader, peeked without blocking
+    /// or consuming: the bytes queued (up to 64), `Ok(0)` at its end of file, and
+    /// `WouldBlock` for an open socket with nothing queued.
     #[cfg(unix)]
     fn peek_now(end: &CtlStream) -> std::io::Result<usize> {
         use std::os::fd::AsRawFd as _;
@@ -1796,6 +1888,8 @@ mod tests {
     }
 
     /// A child that half-closed reads end-of-file when the relay ends, though a copy
+    /// of the relay's end of it survives (a `try_clone` here, as a fork holds one
+    /// until it execs).
     #[test]
     #[cfg(unix)]
     fn a_child_that_half_closed_reads_eof_when_the_relay_ends_though_a_copy_survives() {
@@ -1847,6 +1941,7 @@ mod tests {
     }
 
     /// Edge-token secrets round-trip through a 0600 file, and the read is repeatable
+    /// (a child relaunched in the same shell re-reads it).
     #[test]
     fn edge_tokens_file_is_0600_and_read_is_repeatable() {
         let dir = std::env::temp_dir().join(format!("aterm-edges-{}", std::process::id()));
@@ -1879,7 +1974,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A dead parent's edge file is swept, a live one's never. A parent holds
+    /// A dead parent's edge file is swept, a live one's never.
     #[cfg(unix)]
     #[test]
     fn a_dead_parents_edge_file_is_swept_and_a_live_ones_never() {
@@ -1933,6 +2028,9 @@ mod tests {
     }
 
     /// Sibling discovery lifecycle: before the control socket binds,
+    /// `publish_session` is a safe no-op; after `set_self_sock`, it writes the
+    /// session's graph entry pointing at our instance socket, and
+    /// `unpublish_session` retires it on close.
     #[test]
     fn publish_session_lifecycle_follows_bind_and_close() {
         let _guard = self_sock_test_guard();
@@ -2014,9 +2112,12 @@ mod tests {
     }
 
     /// A session's discovery write is queued, not made in the registration's
+    /// turn: held behind a write the thread cannot finish, a publish has not
+    /// landed when `publish_session` returns, and lands once the thread moves.
     #[test]
     fn a_session_publication_is_queued_off_the_caller_and_kept_in_order() {
         /// This test's discovery state, cleared on every exit path: the queue
+        /// drained while the scratch mirror still stands.
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {
@@ -2090,6 +2191,8 @@ mod tests {
     }
 
     /// A sibling's token file is read the way every control client reads its
+    /// own: one planted as a symlink is refused rather than followed, and one
+    /// larger than any token is refused rather than read whole.
     #[cfg(unix)]
     #[test]
     fn a_symlinked_or_oversized_sibling_token_is_refused() {
@@ -2109,6 +2212,8 @@ mod tests {
     }
 
     /// An instance's quit retires only the discovery entries that name its
+    /// socket: a rolled-back update candidate carries its live parent's session
+    /// ids, whose entries must survive.
     #[test]
     fn a_quit_retires_only_its_own_graph_entries() {
         let dir = crate::test_scratch::short_dir("a hop's socket");

@@ -1,16 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Muse Code live upgrade's quiet flow, driven: a stand-in aterm instance
-//! on a real socket (every request recorded) whose screen is Muse Code
-//! 1.4.10's until the `signal`, the shell's prompt after it, and the
-//! relaunched Muse once the relaunch line is typed; a scripted kernel whose
-//! Muse lives until the signal and whose relaunch appears under the shell
-//! when its line is, writing the session's lock as Muse does; a store with
-//! the running build and a newer one the twin execs, each with its record;
-//! and the session's own log on disk. Each guard of the gate positive and
-//! negative, the claim on disk before the signal, nothing typed after, and
-//! the Tier-1 bind of `HarnessMuseQuietUpgrade`.
+//! The Muse Code live upgrade's quiet flow, driven: a stand-in aterm instance on a real socket (every request recorded) whose screen is Muse Code 1.4.10's until the `signal`, the shell's prompt after it, and the relaunched Muse once the relaunch line is typed; a scripted kernel whose Muse lives until the signal and whose relaunch appears under the shell when its line is, writing the session's lock as Muse does; a store with the running build and a newer one the twin execs, each with its record; and the session's own log on disk.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -214,8 +205,6 @@ impl MuseKernel for Kernel2 {
         if self.knobs.table_unread {
             return None;
         }
-        // The child a backgrounded shell leaves where its `sh` exec'd its
-        // last command: a bare `sleep`, which a shell-name rule misses.
         let table = if self.knobs.child && pid == TUI && MuseKernel::alive(self, TUI) {
             vec![(TUI, SHELL, "muse".into()), (CHILD, TUI, "sleep".into())]
         } else {
@@ -509,7 +498,6 @@ impl LiveRig {
             hand_back: knobs.hand_back,
             background: knobs.background,
             aterm_state: None,
-            // `[harness] upgrade_ask` on: Muse Code's flow is quiet whatever it says.
             ask: true,
             several_logins: false,
             usage_credits: false,
@@ -608,9 +596,7 @@ impl Drop for LiveRig {
 /// quiet), which makes its exit the harness's own restart; one line typed —
 /// the managed twin `resume <uuid>` with the launch's flags — and no
 /// continuation; the record done once the session's lock names the new
-/// process (`done:resumed`). `[harness] upgrade_ask` is on in this rig: the
-/// flow is quiet whatever it says. NEGATIVE CONTROL: a crash relaunch's
-/// record of the same process (its cause) is no claim.
+/// process (`done:resumed`).
 #[test]
 fn an_idle_muse_behind_is_restarted_onto_the_new_build_and_nothing_is_typed() {
     let rig = LiveRig::new("idle", Knobs::default());
@@ -706,8 +692,7 @@ fn an_idle_muse_behind_is_restarted_onto_the_new_build_and_nothing_is_typed() {
 /// THE HOST'S STEP hands the relaunched Muse back to its loop (`adopted`),
 /// whose next idle point owes its carry (`relaunch::owed_of`, its agent's
 /// alone) and carries it on QUIETLY: the lock names the new process, nothing
-/// is typed (`done:resumed`). The exit the restart made is the harness's own
-/// while it is in flight (`relaunch::restarted`).
+/// is typed (`done:resumed`).
 #[test]
 fn the_hosts_step_adopts_and_its_carry_types_nothing() {
     let rig = LiveRig::new(
@@ -740,10 +725,7 @@ fn the_hosts_step_adopts_and_its_carry_types_nothing() {
 
 /// THE EXIT CARRIED BY THE HOST'S EXIT WATCH: a shell slow to take its
 /// terminal back leaves the step `wait:shell-prompt` with the claim in
-/// flight. The host reads that exit as the harness's own restart
-/// (`relaunch::restarted`), never `ended:graceful-exit`: its carry
-/// (`relaunch::carry_restart`) finds the claim and hands it to the lane's
-/// own carry, which types the line once the prompt is back.
+/// flight.
 #[test]
 fn a_restart_left_in_flight_is_carried_as_the_harnesss_own() {
     let ready = Arc::new(AtomicBool::new(false));
@@ -1031,15 +1013,7 @@ fn a_change_before_the_signal_or_its_refusal_takes_the_claim_back() {
 }
 
 /// G-M1'S SCREEN HALF IS THE READER'S AUTHORITATIVE IDLE AND NO WALL
-/// ([`live::screen_idle`]). A turn that ended on a FAULT (Muse's own words, `◆
-/// A configuration problem stopped this turn.`, at the measured turn end's
-/// place) reads `(Idle, false)` with its composer drawn and EMPTY: a message
-/// only a person can act on stands there. So does the screen Muse leaves as
-/// it exits. A final server error and a refused key read `(Idle, true)` with
-/// an empty composer AND A WALL, and the sign-in wall the same with no
-/// composer. Each holds the restart as `wait:screen-not-idle` exactly, nothing
-/// signalled or typed. NEGATIVE CONTROL: the measured turn end reads idle with
-/// no wall, and the same rig restarts.
+/// ([`live::screen_idle`]).
 #[test]
 fn a_fault_or_a_wall_on_an_idle_screen_holds_the_restart() {
     use aterm_phase::Phase;
@@ -1120,8 +1094,7 @@ fn a_fault_or_a_wall_on_an_idle_screen_holds_the_restart() {
 /// process by the time the claim is on disk (another Muse took the session
 /// between the looks) puts the record back AS IT STOOD — here an earlier
 /// restart's, done — and nothing is signalled or typed
-/// (`wait:changed-before-signal`). NEGATIVE CONTROL: the same rig whose lock
-/// stays its own restarts.
+/// (`wait:changed-before-signal`).
 #[test]
 fn a_lock_naming_another_process_at_the_last_look_takes_the_claim_back() {
     let rig = LiveRig::new(
@@ -1163,8 +1136,7 @@ fn a_lock_naming_another_process_at_the_last_look_takes_the_claim_back() {
 /// record, and its step reaches this lane with the shell in the foreground)
 /// is CARRIED by the lane's own rules — the relaunch line typed once the
 /// prompt is back, done once the lock names the new process — never left
-/// `current` with the Muse at its shell. NEGATIVE CONTROL: once it is done,
-/// the same tab with the shell leading is no tab of this lane's (`None`).
+/// `current` with the Muse at its shell.
 #[test]
 fn a_restart_in_flight_is_carried_while_the_shell_leads_the_tab() {
     let ready = Arc::new(AtomicBool::new(false));
@@ -1202,13 +1174,7 @@ fn a_restart_in_flight_is_carried_while_the_shell_leads_the_tab() {
 /// A MUSE RESTART THE STEP FINISHED BEFORE THE HOST'S CARRY OF ITS EXIT
 /// (`relaunch::carry_restart`'s Muse Code half, `muse_landed`): the host read
 /// the exit as the restart's while it was in flight, and the step's own
-/// relaunch closed the record `done` before the carry's try. The tab's record
-/// names the old process, ended it (the upgrade's cause), saw it gone at most
-/// `STOPPED_OWN_S` ago, and the process it resumed still runs: `landed`,
-/// nothing owed, nobody asked. NEGATIVE CONTROLS, each
-/// `refused:no-restart-in-flight`: the resumed process gone, a record of
-/// another process, an exit older than `STOPPED_OWN_S`, and a crash
-/// relaunch's record of the same process (its cause).
+/// relaunch closed the record `done` before the carry's try.
 #[test]
 fn a_muse_restart_finished_before_its_carry_has_landed() {
     use crate::harness::relaunch::{CAUSE_EXIT, STOPPED_OWN_S, carry_restart};
@@ -1225,7 +1191,6 @@ fn a_muse_restart_finished_before_its_carry_has_landed() {
         phase: Phase::Done,
         quiet: true,
         exited_at: now - 5,
-        // A process that runs: this test's own.
         resumed_pid: std::process::id(),
         ..St::default()
     };
@@ -1320,8 +1285,6 @@ fn the_tab_is_due_while_its_build_is_behind() {
     );
 }
 
-// ---------------------------------------------------------------- Tier-1
-
 type State = BTreeMap<&'static str, i64>;
 
 /// The running build's version, and the twin's for each `landed`.
@@ -1390,7 +1353,6 @@ fn real_restarts(s: &State) -> bool {
     } else {
         vec![(TUI, SHELL, "muse".into())]
     };
-    // The look composed as the drive's own `look_at` composes it.
     let look: Look = live::look_of(
         crate::harness::upgrade_drive::held_by_status(&status, 120),
         Some(&rows),
@@ -1443,14 +1405,7 @@ impl LiveRig {
 /// `harness_muse_quiet_upgrade_model`): every state the model reaches before
 /// the move is replayed through the real order, log reader, screen reader,
 /// person rule, process rule and gate, and the model's `Restart` is enabled
-/// EXACTLY where the real quiet flow restarts. Its `ReadExit` relaunches
-/// exactly as the real claim makes the exit the harness's own
-/// (`ended_by_restart`), where the unclaimed exit, Muse's `143`, is read by
-/// its own table as someone's end (`exit_kind`: clean, never relaunched).
-/// Negative controls, each mutant caught alone in a reachable state: a
-/// restart over open work, mid-turn or over a child is where the real gate
-/// holds; `RevisionReadAsOlder` where the real order moves; `RevisionReadAsNewer`
-/// where it does not; `RestartUnclaimed` where the real claim relaunches.
+/// EXACTLY where the real quiet flow restarts.
 #[test]
 fn tier1_the_real_muse_quiet_upgrade_conforms_to_the_model() {
     let model = aterm_models_harness::harness_muse_quiet_upgrade_model();
@@ -1463,8 +1418,6 @@ fn tier1_the_real_muse_quiet_upgrade_conforms_to_the_model() {
         "RevisionReadAsOlder",
         "RevisionReadAsNewer",
     ];
-    // The model's Buggy members are exactly these: the actions no state of
-    // the faithful model fires.
     let fired = aterm_spec::interp::fired_actions(&model);
     let dead: BTreeSet<&str> = model
         .actions
@@ -1530,8 +1483,6 @@ fn tier1_the_real_muse_quiet_upgrade_conforms_to_the_model() {
             let caught_here = match mutant {
                 "RevisionReadAsOlder" => real,
                 "RestartUnclaimed" => {
-                    // The mutant's exit is left as someone's; the real
-                    // restart claims it first and it is relaunched.
                     let mut wrong = s.clone();
                     assert!(buggy.fire(mutant, &mut wrong));
                     assert!(buggy.fire("Exit", &mut wrong));

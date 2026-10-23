@@ -1,58 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The stub's Gemini API: the Generative Language API (`v1beta`) that the
-//! real Gemini CLI (`@google/genai`, measured on 0.46.0) and agy (the
-//! Antigravity CLI, `google-genai` for Go, measured on 1.4.0) speak once
-//! `GOOGLE_GEMINI_BASE_URL` names the stub and `GEMINI_API_KEY` holds the
-//! lab's fake key ([`LAB_GEMINI_KEY`], sent as `x-goog-api-key` and logged as
-//! `auth=gemini-key`).
-//!
-//! Routes: `POST /v1beta/models/<model>:streamGenerateContent?alt=sse` (one
-//! `data: {json}\r\n\r\n` line per chunk, chunked), `POST
-//! …:generateContent` (one JSON answer), `POST …:countTokens`
-//! (`{"totalTokens": N}`), and `GET /v1beta/models[/<model>]` (neither CLI
-//! asks it: both carry their catalog). A chunk is `{"candidates":
-//! [{"content": {"role": "model", "parts": […]}, "index": 0}], "modelVersion",
-//! "responseId"}`, the last with `"finishReason": "STOP"` and
-//! `usageMetadata`. A part is `{"text"}`, a thought `{"text": "**Subject**\n\n…",
-//! "thought": true}` (both TUIs' spinners show the subject) or a call
-//! `{"functionCall": {"name", "args"}, "thoughtSignature"}` (neither CLI needs
-//! an id; Gemini CLI names it `<tool>_<ms>_0`). The tool's result comes back
-//! as a `functionResponse` part of a later content: a `user` one from Gemini
-//! CLI, a `model` one from agy.
-//!
-//! What a request is (`kind=` in the log): `gemini` a turn (it offers
-//! function declarations), `gemini-json` a structured side request
-//! (`generationConfig.responseJsonSchema`, `responseSchema` or `responseMimeType
-//! application/json`: Gemini CLI's model router before every turn under its
-//! Auto model, its next-speaker and loop checks), `gemini-aux` any other side
-//! request (no tools: agy's conversation title, Gemini CLI's summary of the
-//! previous session). A side request is answered in EVERY mode, a JSON one
-//! filled from its schema ([`schema_fill`]: `complexity_score` 10, which routes
-//! the turn to the flash model), so a wall comes from the turn, as on the
-//! measured runs. A turn is answered by the lab's modes: `ok`, `long`,
-//! `numbered`, `bg` as text; `slow` as one thought a second for half of
-//! `--slow-seconds` (the busy row's "thinking"), then one `tick N` of text a
-//! second (its streaming); `tool` the scripted calls ([`tool_turn`]), and an
-//! agy subagent's turns held for a step's delay ([`held_reply`]);
-//! `rate-limit` and `limit:CLAIM:RESET` the 429 `RESOURCE_EXHAUSTED` whose
-//! `QuotaFailure` names a per-day quota, which both CLIs take as terminal
-//! ([`quota_error`]: an API key's spent day) — but `limit:code_assist:RESET`
-//! the 429 a Google account's spent usage limit gets from Code Assist, its
-//! `QUOTA_EXHAUSTED` reason and the reset in its `RetryInfo`, on which Gemini
-//! CLI's usage-limit dialog names the reset ([`exhausted_error`],
-//! [`ACCOUNT_CLAIM`]); and the walls of [`mode_error`]. A custom mode streams
-//! its `text` (a 200 that does not say `"stream": false`), else answers as the
-//! other APIs' custom modes do.
-//!
-//! What the two CLIs did with the walls (measured 2026-10-16 on Gemini CLI
-//! 0.46.0 and agy 1.4.0, `gemini-captures` and `agy-captures`): neither
-//! retries a 401 or a 400; Gemini CLI retries a 503 and a 500 without end,
-//! under its busy spinner (a backoff of about 4, 9, 15, 37 s), and answers the
-//! per-day 429 with its usage-limit dialog; agy retries a 503 (eight times by
-//! default, `AGY_CLI_MODEL_API_MAX_RETRIES`) but not a 500, takes a 429 as
-//! terminal by its `RetryInfo` alone, and draws every wall as an inline error.
+//! The stub's Gemini API.
 
 use std::io;
 use std::time::Duration;
@@ -62,11 +11,9 @@ use super::{est_tokens, limit_params, rand_hex, script_calls, spec_headers, spli
 use crate::pyjson::{COMPACT, J};
 use crate::util::one_line;
 
-/// The fixed fake key the lab gives Gemini CLI and agy (`GEMINI_API_KEY`):
-/// never a credential anywhere (the stub logs it as `auth=gemini-key`).
+/// The fixed fake key the lab gives Gemini CLI and agy: never a credential anywhere.
 pub const LAB_GEMINI_KEY: &str = "lab-gemini-not-a-key";
 
-/// The `thoughtSignature` of a call the stub makes (base64 of a fixed text):
 /// agy echoes it back with the call's result, Gemini CLI stores it.
 const SIGNATURE: &str = "bGFiLXN0dWItdGhvdWdodC1zaWduYXR1cmU=";
 
@@ -81,8 +28,7 @@ pub enum Verb {
     CountTokens,
 }
 
-/// The model and the verb of a `POST /v1beta/models/<model>:<verb>` (`/v1/`
-/// too), or `None` for any other request.
+/// The model and the verb of a `POST /v1beta/models/<model>:<verb>` (`/v1/` too).
 #[must_use]
 pub fn route(method: &str, path: &str) -> Option<(String, Verb)> {
     if method != "POST" {
@@ -104,14 +50,7 @@ pub fn route(method: &str, path: &str) -> Option<(String, Verb)> {
     Some((model.to_string(), verb))
 }
 
-/// The lab's label for the credentials a Gemini API request carried, never
-/// their values: [`super::auth_label`] of its API key (`x-goog-api-key`, or a
-/// `key` query, which neither CLI sends) and of its `Authorization` header,
-/// which neither sends beside the key. One credential is its label
-/// (`gemini-key` for [`LAB_GEMINI_KEY`]), none is `none`, and a key with a
-/// bearer token beside it is both labels joined by `+`
-/// (`gemini-key+other(129 chars)`), so a Google login sent with the lab's key
-/// is never logged as the key alone.
+/// The lab's label for the credentials a Gemini API request carried, never their values.
 #[must_use]
 pub fn credential_label(api_key: Option<&str>, authorization: Option<&str>) -> String {
     match (api_key, authorization) {
@@ -168,12 +107,7 @@ fn results_in(content: &J) -> usize {
         .count()
 }
 
-/// Whether a Gemini API request's conversation carries a function's result
-/// back: a content holds a `functionResponse` part (Gemini CLI's in a `user`
-/// content, agy's in a `model` one) — the newest, or one before a turn the
-/// agent sent of its own after it (agy's `Error: model output error: …` after
-/// an empty reply), so a scripted call is made once a conversation, never
-/// again at each retry.
+/// Whether a Gemini API request's conversation carries a function's result back.
 #[must_use]
 pub fn results_answered(body: &[u8]) -> bool {
     let Ok(j) = J::parse_bytes(body) else {
@@ -186,8 +120,7 @@ pub fn results_answered(body: &[u8]) -> bool {
         .any(|c| results_in(c) > 0)
 }
 
-/// The text between `<USER_REQUEST>` and `</USER_REQUEST>` (agy wraps the
-/// typed prompt so), else the text itself.
+/// The text between `<USER_REQUEST>` and `</USER_REQUEST>`, else the text itself.
 #[must_use]
 pub fn unwrap_request(text: &str) -> String {
     text.split_once("<USER_REQUEST>")
@@ -197,9 +130,7 @@ pub fn unwrap_request(text: &str) -> String {
         .to_string()
 }
 
-/// The user texts of a Gemini API request, oldest first: each user content's
-/// text parts, unwrapped from agy's `<USER_REQUEST>` ([`unwrap_request`]);
-/// a content that holds none (a function's result) is left out.
+/// The user texts of a Gemini API request, oldest first.
 #[must_use]
 pub fn gemini_users(body: &[u8]) -> Vec<String> {
     let Ok(j) = J::parse_bytes(body) else {
@@ -279,11 +210,7 @@ pub fn analyse_gemini(body: &[u8]) -> GInfo {
     info
 }
 
-/// What the `tool` mode answers a turn: the step is the count of
-/// `functionResponse` parts after the last user content holding `toolstart`
-/// (a content of either role: agy sends a result as a `model` one), so the stub
-/// keeps no state and a second `toolstart` starts over. A call with `when` (a
-/// Claude Code subagent's) is never one of these.
+/// What the `tool` mode answers a turn.
 #[must_use]
 pub fn tool_turn(body: &[u8], script: &J) -> Option<ToolTurn> {
     let j = J::parse_bytes(body).ok()?;
@@ -309,15 +236,7 @@ pub fn tool_turn(body: &[u8], script: &J) -> Option<ToolTurn> {
     })
 }
 
-/// A HELD REPLY of the `tool` mode: a script step with no `name`, a `when`
-/// and a `text` (`{"when": "LABSUB-HOLD", "text": "DONE", "delay_ms":
-/// 150000}`) answers every turn of the conversation whose FIRST user content
-/// holds `when` — an agy subagent's, whose prompt the main conversation's
-/// `invoke_subagent` call wrote — with its `text`, after `delay_ms`: a
-/// subagent whose model call is outstanding that long (agy draws it `●
-/// Agent(…)  Working` in its panel meanwhile, and goes on with the main
-/// conversation). `(text, delay in ms)`; `None` where no such step is this
-/// conversation's.
+/// A HELD REPLY of the `tool` mode.
 #[must_use]
 pub fn held_reply(body: &[u8], script: &J) -> Option<(String, f64)> {
     let j = J::parse_bytes(body).ok()?;
@@ -353,12 +272,7 @@ pub fn held_reply(body: &[u8], script: &J) -> Option<(String, f64)> {
     })
 }
 
-/// A value that fits `schema` (Gemini's `responseSchema` or a JSON schema):
-/// an enum's first value, an object's required properties (else all) each
-/// filled, `[]`, `0`, `false`, `lab stub` (cut to its `maxLength`); the
-/// properties the CLIs' side requests read by name are answered as a quiet
-/// session needs them (`complexity_score` 10: the router's flash model;
-/// `next_speaker` `user`).
+/// A value that fits `schema` (Gemini's `responseSchema` or a JSON schema).
 #[must_use]
 pub fn schema_fill(schema: &J, name: Option<&str>) -> J {
     match name {
@@ -417,8 +331,7 @@ pub fn schema_fill(schema: &J, name: Option<&str>) -> J {
     }
 }
 
-/// Google's error body: `{"error": {"code", "message", "status", "details"}}`
-/// (`details` left out when there are none).
+/// Google's error body: `{"error": {"code", "message", "status", "details"}}`.
 #[must_use]
 pub fn google_error(code: u16, status: &str, message: &str, details: Vec<J>) -> J {
     let mut e = J::obj([
@@ -432,10 +345,7 @@ pub fn google_error(code: u16, status: &str, message: &str, details: Vec<J>) -> 
     J::obj([("error", e)])
 }
 
-/// The 429 `RESOURCE_EXHAUSTED` of a spent per-day quota on `model`: its
-/// `QuotaFailure` names `GenerateRequestsPerDayPerProjectPerModel-FreeTier`
-/// (Gemini CLI then raises its terminal quota error, agy stops at once), with
-/// the API's help link and a `RetryInfo` of `retry_secs`.
+/// The 429 `RESOURCE_EXHAUSTED` of a spent per-day quota on `model`.
 #[must_use]
 pub fn quota_error(model: &str, retry_secs: i64) -> J {
     quota_error_for(
@@ -446,8 +356,7 @@ pub fn quota_error(model: &str, retry_secs: i64) -> J {
     )
 }
 
-/// [`quota_error`] for the quota `quota_id` of `limit` requests, its
-/// `RetryInfo` `retry_delay` as Google writes it (`47.218363629s`).
+/// [`quota_error`] for the quota `quota_id` of `limit` requests.
 #[must_use]
 pub fn quota_error_for(model: &str, quota_id: &str, limit: u32, retry_delay: &str) -> J {
     let metric = "generativelanguage.googleapis.com/generate_content_free_tier_requests";
@@ -495,31 +404,13 @@ pub fn quota_error_for(model: &str, quota_id: &str, limit: u32, retry_delay: &st
     )
 }
 
-/// The `RetryInfo` of the `rate-limit` mode's spent day quota, in seconds: an
-/// hour. agy takes a 429 as terminal by its delay alone (more than 30 s); it
-/// retried the same per-day body with a 5 s delay (agy 1.4.0, measured).
+/// The `RetryInfo` of the `rate-limit` mode's spent day quota, in seconds.
 pub const DAY_QUOTA_RETRY: i64 = 3600;
 
-/// The claim of `limit:CLAIM:RESET` whose Gemini API answer is a Google
-/// ACCOUNT's spent usage limit ([`exhausted_error`]) rather than an API key's
-/// spent per-day quota ([`quota_error`], every other claim).
+/// The claim of `limit:CLAIM:RESET` whose Gemini API answer is a Google ACCOUNT's spent usage.
 pub const ACCOUNT_CLAIM: &str = "code_assist";
 
-/// The 429 `RESOURCE_EXHAUSTED` Google's Code Assist server
-/// (`cloudcode-pa.googleapis.com`, the API a Google sign-in's Gemini CLI
-/// speaks) answers once the ACCOUNT's usage limit on `model` is spent: the
-/// message `You have exhausted your capacity on this model. Your quota will
-/// reset after <span>.`, an `ErrorInfo` whose reason is `QUOTA_EXHAUSTED` in
-/// the Code Assist domain with the reset in its metadata (`quotaResetDelay`,
-/// `quotaResetTimeStamp`), and a `RetryInfo` of the same delay. Gemini CLI
-/// 0.46.0 reads the details, never the host that sent them
-/// (`classifyGoogleError`: a `QUOTA_EXHAUSTED` of a Code Assist domain is its
-/// terminal quota error carrying the `RetryInfo` delay), so its usage-limit
-/// dialog names the reset (`useQuotaAndFallback`: `Usage limit reached for
-/// <model>.` over `Access resets at <time>.`) under the lab's API key too,
-/// with no sign-in. An API key's per-day quota ([`quota_error`]) draws the same
-/// dialog with no reset: its `QuotaFailure` names `PerDay`, which the CLI
-/// takes as terminal before it reads any delay.
+/// The 429 `RESOURCE_EXHAUSTED` Google's Code Assist server (`cloudcode-pa.googleapis.com`.
 #[must_use]
 pub fn exhausted_error(model: &str, retry_secs: i64, reset_s: i64) -> J {
     let secs = retry_secs.max(0);
@@ -557,13 +448,7 @@ pub fn exhausted_error(model: &str, retry_secs: i64, reset_s: i64) -> J {
     )
 }
 
-/// The wall a fixed mode puts on a turn, in Google's shape: `rate-limit` the
-/// per-day [`quota_error`] (`RetryInfo` [`DAY_QUOTA_RETRY`]),
-/// `overloaded` 503 `UNAVAILABLE`, `500` 500 `INTERNAL`, `401` 401
-/// `UNAUTHENTICATED`, `bad-key` 400 `INVALID_ARGUMENT` with the
-/// `API_KEY_INVALID` reason (what Google answers a key that is no key),
-/// `too-long` 400 `INVALID_ARGUMENT` over the input token limit. `None` for
-/// every other mode.
+/// The wall a fixed mode puts on a turn, in Google's shape.
 #[must_use]
 pub fn mode_error(mode: &str, model: &str) -> Option<(u16, J)> {
     Some(match mode {
@@ -641,17 +526,7 @@ pub fn mode_error(mode: &str, model: &str) -> Option<(u16, J)> {
     })
 }
 
-/// The Gemini API's other refusals the lab measured Gemini CLI and agy
-/// under, after the walls of [`mode_error`]: each `(name, what, spec)` a
-/// custom mode (`modes/<name>.json`, the shape `mode TAG <name> '<spec>'`
-/// writes) in Google's documented error shape — a 403 `PERMISSION_DENIED`
-/// with the `SERVICE_DISABLED` reason (the API not enabled on the key's
-/// project) and one with none, a 404 `NOT_FOUND` model, a 400
-/// `FAILED_PRECONDITION` location, a 504 `DEADLINE_EXCEEDED`, a 429
-/// `RESOURCE_EXHAUSTED` with no details, and per-minute and per-day 429s
-/// whose RetryInfo is longer than agy waits by itself (47 s, 41397 s).
-/// Custom modes, not built-in ones: a built-in mode is every API's, and
-/// these are the Gemini API's alone.
+/// The Gemini API's other refusals the lab measured Gemini CLI and agy under.
 #[must_use]
 pub fn measured_refusals() -> Vec<(&'static str, &'static str, J)> {
     let model = "gemini-3.1-pro-preview";
@@ -771,8 +646,7 @@ pub fn measured_refusals() -> Vec<(&'static str, &'static str, J)> {
     ]
 }
 
-/// One chunk of an answer: `parts` of the model's content; the last one
-/// carries `finishReason` and `usageMetadata` (`(prompt, candidates)` tokens).
+/// One chunk of an answer.
 #[must_use]
 pub fn chunk(parts: Vec<J>, model: &str, rid: &str, usage: Option<(i64, i64)>) -> J {
     let mut cand = J::obj([
@@ -817,8 +691,7 @@ fn text_steps(t: &str) -> Steps {
         .collect()
 }
 
-/// The `slow` turn: a thought a second for half of `secs` (`**Lab stub
-/// thinking**`, the subject both spinners show), then a `tick N` of text a second.
+/// The `slow` turn: a thought a second for half of `secs`, then a `tick N` of text a second.
 #[must_use]
 pub fn slow_steps(secs: i64) -> Vec<(f64, Vec<J>)> {
     let n = secs.max(2);
@@ -839,8 +712,7 @@ pub fn slow_steps(secs: i64) -> Vec<(f64, Vec<J>)> {
 }
 
 impl Stub {
-    /// A Gemini API request (the module docs), `label` the credentials it
-    /// carried ([`credential_label`]).
+    /// A Gemini API request, `label` the credentials it carried.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(super) fn gemini(
         &self,
@@ -876,7 +748,6 @@ impl Stub {
         let in_tok = est_tokens(blen);
         let t = (method, path, blen, mode, model, verb, in_tok);
         if kind != "gemini" {
-            // a side request is answered in every mode, its budget untouched: the wall comes from the turn
             let answer = if kind == "gemini-json" {
                 schema_fill(info.schema.as_ref().unwrap_or(&J::Obj(Vec::new())), None).dump(COMPACT)
             } else {
@@ -912,9 +783,6 @@ impl Stub {
                     let s = format!("{summary} tool:done");
                     return self.gemini_answer(t, &s, text_steps("Tool call done."), &[], out);
                 }
-                // Its script holds named calls only (`script_calls`): a text
-                // step, or calls made in one message, is a Claude Code
-                // script's (`stub::tool_turn`).
                 Some(ToolTurn::Say(..) | ToolTurn::Calls(..)) | None => {}
             }
         }
@@ -959,7 +827,6 @@ impl Stub {
                 let t = (method, path, blen, mode.as_str(), model, verb, in_tok);
                 return self.gemini_answer(t, &s, steps, &spec_headers(&spec), out);
             }
-            // the shared custom answer reads only the request facts every API logs
             let msg_info = analyse(b"");
             let ct = Turn {
                 method,
@@ -1013,7 +880,6 @@ impl Stub {
         self.gemini_answer(t, &summary, steps, &[], out)
     }
 
-    /// An answer of `steps`: streamed as SSE chunks (each after its pause, the
     /// last one finishing), or merged into one JSON answer for `generateContent`.
     #[allow(clippy::type_complexity)]
     fn gemini_answer(
@@ -1075,9 +941,7 @@ impl Stub {
         Ok(())
     }
 
-    /// `GET /v1beta/models[/<model>]`: a model's card, or a short catalog,
-    /// logged with the credentials it carried (`label`, [`credential_label`])
-    /// as every Gemini API request is.
+    /// `GET /v1beta/models[/<model>]`.
     pub(super) fn gemini_models(
         &self,
         method: &str,

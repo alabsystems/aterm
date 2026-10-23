@@ -24,11 +24,7 @@ impl Terminal {
             .map(Arc::as_ref)
     }
 
-    /// Hyperlink URL attached to the cell at viewport-relative `(visible_row, col)`,
-    /// accounting for `display_offset` via [`Grid::visible_row_view`] (coincides
-    /// with [`Self::hyperlink_at`] at `display_offset == 0`).
-    ///
-    /// [`Grid::visible_row_view`]: aterm_grid::Grid::visible_row_view
+    /// Returns the hyperlink URL attached to the cell at viewport-relative `(visible_row, col)`.
     #[must_use]
     #[inline]
     pub fn hyperlink_at_visible(&self, visible_row: u16, col: u16) -> Option<Arc<str>> {
@@ -40,10 +36,7 @@ impl Terminal {
             .cloned()
     }
 
-    /// Get the hyperlink ID (OSC 8 `id=` parameter) attached to a rendered cell, if any.
-    ///
-    /// The `id=` parameter groups cells into the same hyperlink span. When present,
-    /// two cells belong to the same hyperlink only if both the URL and `id=` match.
+    /// Returns the hyperlink ID (OSC 8 `id=` parameter) attached to a rendered cell, if any.
     #[must_use]
     #[inline]
     pub fn hyperlink_id_at(&self, row: u16, col: u16) -> Option<&str> {
@@ -53,35 +46,21 @@ impl Terminal {
             .map(Arc::as_ref)
     }
 
-    /// The percent-decoded path of the working directory URL the shell set
-    /// (OSC 7).
+    /// Returns the percent-decoded working directory path reported by the shell (OSC 7).
     #[must_use]
     #[inline]
     pub fn current_working_directory(&self) -> Option<&str> {
         self.current_working_directory.as_deref()
     }
 
-    /// The host the report that set [`Self::current_working_directory`]
-    /// named: an OSC 7 `file://<host>/…`'s host, verbatim (never
-    /// percent-decoded). `None` for an empty host or `localhost`, for a cwd
-    /// the shell's own `633;P;Cwd=` set, with no cwd, and on an engine
-    /// restored from a checkpoint until its shell reports again. The engine
-    /// cannot know its own name, so whether a named host is this machine is
-    /// the embedder's call: a shell reporting its own hostname is common.
+    /// Returns the non-local host named by the OSC 7 report that set [`Self::current_working_directory`].
     #[must_use]
     #[inline]
     pub fn reported_cwd_host(&self) -> Option<&str> {
         self.shell.cwd_host.as_deref()
     }
 
-    /// Which report the stored cwd and its host
-    /// ([`Self::reported_cwd_host`]) came from: `Some(n)` after the `n`th
-    /// report this engine stored (OSC 7 or `633;P;Cwd=`, a clear included;
-    /// `Some(0)` before any), `None` while the cwd is a checkpoint's carry
-    /// that no report since has replaced. Monotonic across a RIS and an
-    /// in-place restore, so an embedder can note which process group was in
-    /// front when it first saw report `n` and know a later report by its new
-    /// number.
+    /// Returns the sequence number of the CWD report that set [`Self::current_working_directory`], or `None` if carried from a checkpoint.
     #[must_use]
     #[inline]
     pub const fn reported_cwd_seq(&self) -> Option<u64> {
@@ -106,13 +85,7 @@ impl Terminal {
         self.color.palette().get(index)
     }
 
-    /// Set a host-configured indexed color in the palette.
-    ///
-    /// This seeds both the live slot and its reset baseline: a later OSC 4 may
-    /// replace the live value, while OSC 104 and RIS restore `color`. The first
-    /// configured slot starts from the built-in palette rather than cloning the
-    /// live palette, so a prior program-issued OSC 4 mutation can never become a
-    /// host reset default accidentally.
+    /// Sets a host-configured indexed color in the palette and its reset baseline.
     #[inline]
     pub fn set_palette_color(&mut self, index: u8, color: Rgb) {
         self.color.palette_mut().set(index, color);
@@ -129,20 +102,14 @@ impl Terminal {
         self.set_palette_color(index, Rgb { r, g, b });
     }
 
-    /// Get the default foreground color.
-    ///
-    /// This is the color used for cells with default foreground styling.
-    /// Modified via OSC 10, reset via OSC 110.
+    /// Returns the default foreground color.
     #[must_use]
     #[inline]
     pub const fn default_foreground(&self) -> Rgb {
         self.color.default_foreground
     }
 
-    /// Set the host-configured default foreground color.
-    ///
-    /// This seeds both the live value and the reset baseline: a later OSC 10
-    /// may replace the live value, while OSC 110 restores `color`.
+    /// Sets the host-configured default foreground color and reset baseline.
     #[inline]
     pub fn set_default_foreground(&mut self, color: Rgb) {
         self.color.default_foreground = color;
@@ -151,20 +118,14 @@ impl Terminal {
         self.grid.damage_mut().mark_full();
     }
 
-    /// Get the default background color.
-    ///
-    /// This is the color used for cells with default background styling.
-    /// Modified via OSC 11, reset via OSC 111.
+    /// Returns the default background color.
     #[must_use]
     #[inline]
     pub const fn default_background(&self) -> Rgb {
         self.color.default_background
     }
 
-    /// Set the host-configured default background color.
-    ///
-    /// This seeds both the live value and the reset baseline: a later OSC 11
-    /// may replace the live value, while OSC 111 restores `color`.
+    /// Sets the host-configured default background color and reset baseline.
     #[inline]
     pub fn set_default_background(&mut self, color: Rgb) {
         self.color.default_background = color;
@@ -174,10 +135,7 @@ impl Terminal {
         let _ = self.reconcile_color_scheme();
     }
 
-    /// Set the host-configured cursor color.
-    ///
-    /// This seeds both the live OSC 12 value and the OSC 112/RIS reset
-    /// baseline. `None` makes the configured fallback the default foreground.
+    /// Sets the host-configured cursor color and reset baseline.
     #[inline]
     pub fn set_default_cursor_color(&mut self, color: Option<Rgb>) {
         self.color.cursor_color = color;
@@ -186,38 +144,28 @@ impl Terminal {
         self.grid.damage_mut().mark_full();
     }
 
-    /// Get the cursor color, if explicitly set.
-    ///
-    /// Returns `None` if the cursor uses the default foreground color.
-    /// Modified via OSC 12, reset via OSC 112.
+    /// Returns the cursor color, if explicitly set.
     #[must_use]
     #[inline]
     pub const fn cursor_color(&self) -> Option<Rgb> {
         self.color.cursor_color
     }
 
-    /// Whether a program has overridden the cursor color via OSC 12 relative to
-    /// the host baseline set by [`Self::set_default_cursor_color`].
+    /// Returns whether the cursor color has been overridden via OSC 12 relative to the host baseline.
     #[must_use]
     #[inline]
     pub fn cursor_color_recoloured(&self) -> bool {
         self.color.cursor_color != self.color.configured_cursor
     }
 
-    /// Get the selection background color, if explicitly set.
-    ///
-    /// Returns `None` if the selection uses the renderer default color.
-    /// Modified via OSC 17 / OSC 21 `selection_background`.
+    /// Returns the selection background color, if explicitly set.
     #[must_use]
     #[inline]
     pub const fn selection_background(&self) -> Option<Rgb> {
         self.color.selection_background
     }
 
-    /// Set the host-configured selection background.
-    ///
-    /// Seeds both the live OSC 17/21 value and the OSC 117/RIS baseline.
-    /// `None` delegates selection fill to the renderer theme.
+    /// Sets the host-configured selection background color and reset baseline.
     #[inline]
     pub fn set_default_selection_background(&mut self, color: Option<Rgb>) {
         self.color.selection_background = color;
@@ -225,20 +173,14 @@ impl Terminal {
         self.grid.damage_mut().mark_full();
     }
 
-    /// Get the selection foreground color, if explicitly set.
-    ///
-    /// Returns `None` if selected text uses the renderer's automatic/default
-    /// foreground. Modified via OSC 19 and reset via OSC 119.
+    /// Returns the selection foreground color, if explicitly set.
     #[must_use]
     #[inline]
     pub const fn selection_foreground(&self) -> Option<Rgb> {
         self.color.selection_foreground
     }
 
-    /// Set the host-configured selection foreground.
-    ///
-    /// Seeds both the live OSC 19 value and the OSC 119/RIS baseline. `None`
-    /// leaves selected-text contrast resolution to the renderer.
+    /// Sets the host-configured selection foreground color and reset baseline.
     #[inline]
     pub fn set_default_selection_foreground(&mut self, color: Option<Rgb>) {
         self.color.selection_foreground = color;

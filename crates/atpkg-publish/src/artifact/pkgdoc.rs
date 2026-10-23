@@ -1,25 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `pkg-<program>-<build>.toml` writer.
-//!
-//! One typed row (`target`, `kind` = binary | sysroot-bundle, `protocol =
-//! "github-release"`, `asset`, `sha256`, `tree_root`, `size`, `reloc` for a bundle,
-//! `[artifact.cost]`, `[artifact.provenance]` from the scan record), rendered once and used
-//! by both modes:
-//!
-//! * fresh: the header (`schema`, `program`, `version`, `build_number`, `exposes`) and the
-//!   row;
-//! * merge: a published manifest's bytes verbatim, a newline, the row. Refused unless the
-//!   base is this program, build and version, shims exactly this pack's tools (one build has
-//!   one exposed set), carries no row for this target and names no asset of the same name.
-//!   The result is a byte-prefix extension by construction, which the Linux lane's "no
-//!   other machine extended it" check relies on.
-//!
-//! A signed manifest is parsed back through the client's verifier
-//! ([`super::sign::Authority::verify_pkg`]) and held to what was packed ([`check_parsed`])
-//! before it is written. This writer authors no `https` vendor rows or `shim_env`; a merge
-//! carries a base's existing ones verbatim.
+//! Writer and verifier for `pkg-<program>-<build>.toml` manifests.
 
 use atpkg::manifest::Provenance;
 
@@ -27,20 +9,20 @@ use crate::api::{Build, Lineage};
 use crate::error::{Error, Result};
 use crate::triple::{AARCH64_APPLE_DARWIN, Triple};
 
-/// The pkg document schema this writer produces (`parse_pkg` rejects only newer ones).
+/// Package manifest schema version produced by this writer.
 pub const SCHEMA: i64 = 1;
 
-/// A row's payload shape.
+/// Artifact payload shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
-    /// A plain program's `bin/` (shimmed by its `exposes`).
+    /// Plain program `bin/` directory shimmed by `exposes`.
     Binary,
-    /// A whole sysroot, relocated at pack time (`reloc = "self-contained"`).
+    /// Self-contained sysroot bundle relocated at pack time.
     SysrootBundle,
 }
 
 impl Kind {
-    /// The manifest's spelling.
+    /// Manifest token for this payload kind.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -50,21 +32,19 @@ impl Kind {
     }
 }
 
-/// `pkg-<program>-<build>.toml`: a program build's manifest asset, the one spelling.
+/// Returns `pkg-<program>-<build>.toml`.
 #[must_use]
 pub fn manifest_name(program: &str, build: Build) -> String {
     format!("pkg-{program}-{build}.toml")
 }
 
-/// `pkg-<program>-<build>.toml.sig`: its signature asset.
+/// Returns `pkg-<program>-<build>.toml.sig`.
 #[must_use]
 pub fn sig_name(program: &str, build: Build) -> String {
     format!("pkg-{program}-{build}.toml.sig")
 }
 
-/// The asset name of one target's pack. `aarch64-apple-darwin` keeps the bare
-/// `<program>-<build>.tar.zst` that published packs use; every other target embeds the
-/// triple, so a second target at the same build lands beside it on the one release tag.
+/// Returns the tarball asset name for `(program, build, triple)`.
 #[must_use]
 pub fn asset_name(program: &str, build: Build, triple: Triple) -> String {
     if triple == AARCH64_APPLE_DARWIN {
@@ -74,7 +54,7 @@ pub fn asset_name(program: &str, build: Build, triple: Triple) -> String {
     }
 }
 
-/// A manifest's header.
+/// Package manifest header fields.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Header {
     /// The program.
@@ -104,12 +84,11 @@ pub struct Row {
     pub size: u64,
     /// `[artifact.cost] disk_installed`.
     pub disk_installed: u64,
-    /// `[artifact.provenance]`: the compiler that built the payload, as its scan recorded.
+    /// `[artifact.provenance]` compiler and scan record.
     pub provenance: Provenance,
 }
 
-/// A rendered manifest: the base it extends (empty when fresh) and the bytes, of which
-/// the base is the prefix by construction.
+/// Rendered manifest bytes and the prefix length of any base manifest it extends.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Doc {
     bytes: Vec<u8>,
@@ -117,27 +96,26 @@ pub struct Doc {
 }
 
 impl Doc {
-    /// The document's exact bytes — what is signed.
+    /// Exact manifest bytes to be signed.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
 
-    /// The base it extends, verbatim (empty for a fresh document).
+    /// Verbatim base manifest prefix (empty for a fresh manifest).
     #[must_use]
     pub fn base(&self) -> &[u8] {
         &self.bytes[..self.base_len]
     }
 
-    /// Whether these bytes extend `base` without changing a byte of it.
+    /// Returns whether this document extends `base` as an exact byte prefix.
     #[must_use]
     pub fn extends(&self, base: &[u8]) -> bool {
         self.bytes.starts_with(base)
     }
 }
 
-/// The provenance record of a payload: the admitted compiler's record and the scan's
-/// count (a signed row records zero findings, always).
+/// Builds a [`Provenance`] record from the admitted `compiler` and `scan_objects` count.
 #[must_use]
 pub fn provenance(compiler: &atpkg::lineage::Compiler, scan_objects: usize) -> Provenance {
     let mut p = Provenance::default();
@@ -162,11 +140,10 @@ pub fn provenance(compiler: &atpkg::lineage::Compiler, scan_objects: usize) -> P
     p
 }
 
-/// How a provenance record says its compiler's lineage was proven.
+/// Parses the [`Lineage`] variant from `p.lineage`.
 ///
 /// # Errors
-///
-/// A refusal for a `lineage` that is none of the three.
+/// Returns an error if `p.lineage` is not a recognized lineage token.
 pub fn lineage_of(p: &Provenance) -> Result<Lineage> {
     match p.lineage.as_str() {
         "lineage" => Ok(Lineage::Lineage),
@@ -209,13 +186,10 @@ fn plain(what: &str, v: &str) -> Result<()> {
     }
 }
 
-/// The record a release row is signed with must be one: every key a plain value, a
-/// 40-hex compiler commit, a known lineage, and zero findings — a payload carrying
-/// another compiler's evidence is never signed.
+/// Validates that `p` has plain TOML fields, a 40-hex commit, a known lineage, and zero findings.
 ///
 /// # Errors
-///
-/// The first thing wrong with it.
+/// Returns an error describing the first invalid provenance field.
 pub fn check_provenance(p: &Provenance) -> Result<()> {
     for (k, v) in provenance_fields(p) {
         plain(&format!("provenance `{k}`"), v)?;
@@ -279,14 +253,10 @@ fn render_row(row: &Row) -> Result<String> {
     Ok(s)
 }
 
-/// Refuse an exposed set naming a tool the client lays no shim for
-/// ([`atpkg::store::shim_allowed`]: a shell, another command a shim must never intercept,
-/// or no tool name): a signed manifest never names one, so a pack cannot plant a core
-/// command on its users' PATH, and none ships a tool its users could not run (design S13).
+/// Validates that `exposes` is non-empty and every tool name is permitted by `shim_allowed`.
 ///
 /// # Errors
-///
-/// A refusal naming every such tool.
+/// Returns an error listing any disallowed tool names.
 pub fn check_exposes(program: &str, exposes: &[String]) -> Result<()> {
     let refused: Vec<String> = exposes
         .iter()
@@ -310,12 +280,10 @@ pub fn check_exposes(program: &str, exposes: &[String]) -> Result<()> {
     )))
 }
 
-/// A fresh manifest: the header and this row.
+/// Renders a fresh manifest containing `header` and `row`.
 ///
 /// # Errors
-///
-/// A refusal for a header or row value that is not plain, a record that is not one, an
-/// empty `exposes`, or one naming a tool no shim may carry ([`check_exposes`]).
+/// Returns an error if any field, `exposes` list, or provenance record is invalid.
 pub fn fresh(header: &Header, row: &Row) -> Result<Doc> {
     plain("the program", &header.program)?;
     plain("the version", &header.version)?;
@@ -354,17 +322,10 @@ fn tool_set<'a>(tools: impl IntoIterator<Item = &'a str>) -> std::collections::B
     tools.into_iter().collect()
 }
 
-/// `base` (a published manifest, verbatim) extended with this target's row, so one build
-/// number serves every target.
+/// Appends `row` to an existing published manifest `base` as a byte-prefix extension.
 ///
 /// # Errors
-///
-/// A refusal when the base does not parse, is another schema, program, build or version,
-/// shims another set of tools than this pack's `header` (one build, one exposed set: a
-/// shim the appended target cannot serve would break there), names a tool no shim may
-/// carry ([`check_exposes`], so a base signed before that name was refused is never
-/// extended), already carries a row for this target, or already names this asset (two
-/// rows, one release asset: their uploads would replace each other).
+/// Returns an error if `base` fails to parse or conflicts with `header` or `row`.
 pub fn merge(base: Vec<u8>, header: &Header, row: &Row) -> Result<Doc> {
     let (program, build) = (header.program.as_str(), header.build);
     check_exposes(program, &header.exposes)?;
@@ -450,20 +411,15 @@ pub fn merge(base: Vec<u8>, header: &Header, row: &Row) -> Result<Doc> {
     let rendered = render_row(row)?;
     let base_len = base.len();
     let mut bytes = base;
-    // A lone newline separates without reflowing: the base bytes stay untouched, and a
-    // base lacking a trailing newline still ends cleanly.
     bytes.push(b'\n');
     bytes.extend_from_slice(rendered.as_bytes());
     Ok(Doc { bytes, base_len })
 }
 
-/// The self-check after a manifest is parsed back: its header (program, build, version,
-/// exposed set) and its `triple` row (asset, digests, size, kind, provenance) must be what
-/// was packed.
+/// Verifies that `parsed` matches `header` and `row`.
 ///
 /// # Errors
-///
-/// A refusal naming what differs.
+/// Returns an error naming the first field that differs.
 pub fn check_parsed(parsed: &atpkg::PkgManifest, header: &Header, row: &Row) -> Result<()> {
     if parsed.program != header.program || parsed.build_number != header.build {
         return Err(Error::refused(format!(

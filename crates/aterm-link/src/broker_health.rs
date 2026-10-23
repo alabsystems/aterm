@@ -38,11 +38,13 @@ pub fn poisoned_line(log: &str, reason: &str, restart: Option<&str>) -> String {
 }
 
 /// `text` on one line: a line break in astream's reason would split the one
+/// line `broker.err`'s reader quotes.
 fn one_line(text: &str) -> String {
     text.replace(['\n', '\r'], " ")
 }
 
 /// The flushes a log has issued since it opened ([`astream_broker::FlushCounts`]),
+/// as one phrase.
 fn flushes(f: &astream_broker::FlushCounts) -> String {
     format!(
         "flushes since it opened: {} full, {} barrier, {} skipped, {} failed",
@@ -132,6 +134,7 @@ pub fn snapshot_row(
 }
 
 /// `n` bytes as a person reads them: `512 B`, `3.1 KiB`, `2.0 MiB`, rounded to
+/// a tenth, in integers.
 fn bytes(n: u64) -> String {
     const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
     if n < 1024 {
@@ -164,6 +167,8 @@ pub fn supervised() -> bool {
 }
 
 /// [`supervised`]'s rule on what the process was told: launchd's service name,
+/// and the text of `/proc/self/cgroup` (one `<id>:<controllers>:<path>` line a
+/// hierarchy).
 fn supervised_by(xpc_service: Option<&OsStr>, cgroup: Option<&str>) -> bool {
     let launchd = xpc_service
         .and_then(OsStr::to_str)
@@ -180,6 +185,7 @@ fn supervised_by(xpc_service: Option<&OsStr>, cgroup: Option<&str>) -> bool {
 }
 
 /// Whether `name` is a label `aterm fabric on` gives a broker job: the plain
+/// [`crate::enable::LABEL`] (the default root) or `LABEL.<cksum>` (any other).
 fn is_job_label(name: &str) -> bool {
     use crate::enable::LABEL;
     name == LABEL
@@ -223,7 +229,7 @@ impl Seam {
         Self::parse(&raw.to_string_lossy(), fired_marker(log).exists())
     }
 
-    /// The words of `raw`; `sync` only while it has not `fired`. An unknown
+    /// The words of `raw`; `sync` only while it has not `fired`.
     fn parse(raw: &str, fired: bool) -> Self {
         let mut seam = Self::default();
         for word in raw.split([' ', ',']).filter(|w| !w.is_empty()) {
@@ -305,6 +311,10 @@ mod tests {
     use super::*;
 
     /// **THE EXIT LINE SAYS WHAT DOCTOR READS FIRST AND ASTREAM'S REASON
+    /// LAST, ON ONE LINE, AND WHO REOPENS THE LOG.** Supervised, the
+    /// supervisor; with no `aterm fabric on` job, the line says so and names
+    /// the command — unless something else restarts it, which this build
+    /// cannot see.
     #[test]
     fn the_exit_line_names_astreams_reason_and_who_reopens_the_log() {
         let reason = "a flush failed (EIO)\nbadly";
@@ -344,6 +354,9 @@ mod tests {
     }
 
     /// **A SUPERVISOR IS READ OFF THE PROCESS, AND ONLY `aterm fabric on`'S
+    /// JOB COUNTS.** launchd's service name and systemd's unit cgroup name the
+    /// job: the default root's plain label and a per-root `LABEL.<cksum>` are
+    /// supervised.
     #[test]
     fn a_supervisor_is_the_jobs_own_word() {
         use crate::enable::LABEL;
@@ -373,6 +386,9 @@ mod tests {
     }
 
     /// **THE SEAM'S `sync` IS ONE-SHOT, ITS SWITCHES ARE NOT.** With the
+    /// marker absent `sync` is armed; once it exists (the broker that armed it
+    /// wrote it) the restarted broker arms nothing, while `escalate=` and
+    /// `stay` still hold.
     #[test]
     fn the_seam_arms_its_fault_once() {
         let first = Seam::parse("sync,escalate=/f/*/in/> stay escalate=/x bogus", false);
@@ -391,6 +407,12 @@ mod tests {
     }
 
     /// **ARMING WRITES THE MARKER FIRST, AND THE FAULT IS ASTREAM'S OWN.** On a
+    /// real broker at Relaxed, with the seam's escalation naming one subject:
+    /// before arming, an escalated publish is acked and nothing is poisoned
+    /// (the negative control); armed, an ordinary publish is still acked — a
+    /// relaxed batch flushes nothing — and the next escalated one's full flush
+    /// fails, which poisons the log; the marker is beside it, so the seam
+    /// read again for the same log arms nothing.
     #[test]
     fn the_armed_seam_poisons_a_relaxed_log_at_its_first_escalated_record() {
         let dir = aterm_tempfile::Builder::new()
@@ -433,6 +455,10 @@ mod tests {
     }
 
     /// **THE FACTS ARE ASTREAM'S OWN, IN BAND AND ON DISK**, read off a real
+    /// broker kept the way the serving loop keeps it (Relaxed, astream's
+    /// `<log>.health` every [`HEALTH_EVERY`]) through astream's own readers —
+    /// a fresh `Hello`'s entry 0x04 and `read_health` — and said by this
+    /// module's rows.
     #[test]
     fn the_facts_name_what_astream_decided() {
         use astream_broker::{HealthWriter, ServedReason, Tier};
@@ -554,6 +580,8 @@ mod tests {
     }
 
     /// The rows' arithmetic and whose-word wording: bytes in tenths, rounded
+    /// in integers; a snapshot whose writer the reader cannot tell is never
+    /// current, and its row says so.
     #[test]
     fn a_snapshot_says_whose_word_it_is() {
         use astream_broker::{BrokerHealth, HealthRead, HealthWriter};
@@ -588,6 +616,8 @@ mod tests {
     }
 
     /// **A HEALTHY LOG READS UNPOISONED AFTER ITS LISTENERS GO** — the
+    /// negative control of the look the stop path makes after the drop: a
+    /// relaxed log closed cleanly is not reported poisoned.
     #[test]
     fn a_healthy_log_reads_unpoisoned_after_its_listeners_go() {
         let dir = aterm_tempfile::Builder::new()

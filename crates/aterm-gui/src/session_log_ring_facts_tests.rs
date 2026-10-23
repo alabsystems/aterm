@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE LOG HOLDS EVERY FACT THE RING HOLDS (6F-5 to
-//! 6F-7): each ring row's writer writes, in the row's own hold, a mark (or a
-//! record's fields) the row's whole payload reads from. Here: each new
-//! writer's mark wakes a parked `await log` (a one-minute hang detector),
-//! and what is content tier (a topic's name, a reason, a closer, a reply)
-//! is in RAM and in no record that leaves it — the journal, the carry, a
-//! bus body, `brief`, or `log` below `tier=content`. The
-//! row-for-record equalities are `session_log_overlap_tests`'.
+//! Tests for ring-only session-log marks, `await log` wakeups, and content-tier redaction.
 
 use std::sync::Arc;
 
@@ -18,11 +11,7 @@ use super::overlap_tests::{fetch_answered, link_up, queued};
 use super::tests::{fabric_rig, parked_log_await, returned};
 use crate::session_store::{ExitActor, ExitReason, SessionHandle, SessionState};
 
-/// Every place `h`'s log is written below the content tier: `log` at the
-/// host and wire tiers, the journal's record frames, the carry's lines, a
-/// bus body of every record (at the meta tier, the most the bus carries:
-/// what the mirror publishes of a bus-class record, and what it would of
-/// any other) and `brief`. Each line is tagged with where it is.
+/// Collects all renderings of `h`'s log below the content tier.
 pub(super) fn below_content(h: &SessionHandle) -> Vec<(&'static str, String)> {
     below_content_of(h, true)
 }
@@ -88,14 +77,10 @@ fn content(h: &SessionHandle) -> String {
 /// one-minute hang detector: `mark - state state=spawning|alive`, `mark - policy
 /// gen=7`, `mark - topic change=add|drop fp=`, `mark - mail-fetch off=7`,
 /// `mark - advisory origin=fleet gen=`, `log`'s host tier printing no
-/// topic name and no reason. NEGATIVE CONTROLS: a state set again and a
-/// topic added again move nothing and write no mark.
+/// topic name and no reason.
 #[test]
 fn each_ring_only_fact_wakes_a_parked_await_log() {
     let (h, store) = fabric_rig(71);
-    // The registry's moves that leave the session running (an exited
-    // session's parked reads end `ERR exited`): back to spawning (a test
-    // handle is alive), the same again, then its reader's first read.
     let rx = parked_log_await(&h, &store, "state");
     store.write().unwrap().set_state(71, SessionState::Spawning);
     let got = returned(&rx, "set_state");
@@ -159,13 +144,7 @@ fn each_ring_only_fact_wakes_a_parked_await_log() {
 }
 
 /// T14, AMENDED: A TOPIC IS A FINGERPRINT WHEREVER ITS RECORD
-/// LEAVES RAM. A planted topic name and its `since=` token are on the
-/// `topic` mark at the content tier (beside the name's `fp=`), and in no
-/// journal frame, no carry line, no bus body, no `brief` and no `log` line
-/// below `tier=content`, which say the fingerprint. NEGATIVE CONTROL (by
-/// scratch revert): the name's key marked host tier puts it in the journal,
-/// the carry and `log`, and this fails; in-test, the content tier holds both
-/// plants, so the absence below it is the tier's, not the writer's.
+/// LEAVES RAM.
 #[test]
 fn a_topic_is_a_fingerprint_wherever_its_record_leaves_ram() {
     let (h, _store) = fabric_rig(73);
@@ -176,7 +155,6 @@ fn a_topic_is_a_fingerprint_wherever_its_record_leaves_ram() {
         Ok(true)
     );
     assert!(ctx.fabric.topic_drop("QZP6TOPIC1", &ctx.timeline));
-    // A broadcast on a topic (6F-6): the post's `to=say:<topic>`.
     let reply =
         crate::fabric::cmd_post(&ctx, "to=say:qzp6topic3 kind=note --wait=0 SENTINEL", None);
     assert!(queued(&reply, 1), "{reply}");
@@ -218,9 +196,6 @@ fn a_topic_is_a_fingerprint_wherever_its_record_leaves_ram() {
 /// reason is the `hold` mark's at the content tier, beside the row's
 /// `origin=` and `hold_origin=` below it, and in no journal frame, no carry
 /// line, no bus body, no `brief` and no `log` line below `tier=content`.
-/// NEGATIVE CONTROL (by scratch revert): `reason=` marked host tier puts it
-/// in the journal and `log`, and this fails; in-test, the content tier
-/// holds it, so its absence below is the tier's.
 #[test]
 fn a_hold_reason_is_never_journaled_carried_or_published() {
     let (h, store) = fabric_rig(74);
@@ -259,17 +234,13 @@ fn a_hold_reason_is_never_journaled_carried_or_published() {
 /// `closer=`, and the first two words of a keyed write's reply the
 /// `in-doubt` mark's `reply=`, each at the content tier beside the fields
 /// below it, and in no journal frame, no carry line, no bus body, no
-/// `brief` and no `log` line below `tier=content`. NEGATIVE CONTROL (by
-/// scratch revert): `closer=` marked host tier puts it in the journal and
-/// `log`, and this fails; in-test, the content tier holds both, so their
-/// absence below is the tier's.
+/// `brief` and no `log` line below `tier=content`.
 #[test]
 fn a_closer_and_a_reply_never_leave_ram() {
     let (h, store) = fabric_rig(76);
     let key = crate::pty_idem::parse_key(&format!("{}:3:9", h.ctx.nonce.to_hex()), h.ctx.nonce)
         .expect("a key");
     let _ = crate::pty_idem::record_in_doubt(&h.ctx, "send", key, "QZP6REPLY2 failed\n");
-    // The reply, while the session is open (and so carried).
     let open = below_content(&h);
     assert!(
         open.iter()
@@ -292,7 +263,6 @@ fn a_closer_and_a_reply_never_leave_ram() {
         held.contains(" mark - in-doubt verb=send producer=3 key_seq=9 reply=QZP6REPLY2-failed "),
         "{held}"
     );
-    // The close names no session for a sid no one minted (no `by=`, R1).
     let close = held
         .lines()
         .find(|l| l.contains(" close - "))
@@ -303,8 +273,6 @@ fn a_closer_and_a_reply_never_leave_ram() {
             && !close.contains(" by="),
         "{close}"
     );
-    // The closer, once the session closed: a closed session is carried no
-    // more.
     let out = below_content_of(&h, false);
     assert!(
         out.iter()
@@ -329,10 +297,6 @@ fn a_closer_and_a_reply_never_leave_ram() {
 /// planted `via=` and `key=` are the `mail dir=out` mark's `via=` and
 /// `idem=` (never `key=`, the config key's) in `log` at the host tier and
 /// the journal, and in no bus body and no `log` line at the wire tier.
-/// NEGATIVE CONTROLS (by scratch revert): the caller's key written to a
-/// wire key reaches the bus, and this fails; `idem=` marked wire tier is
-/// refused by the key table (a text key is host or content only), and the
-/// mark then holds no `idem=`, and this fails.
 #[test]
 fn a_posts_idem_and_via_never_reach_a_bus_body() {
     let (h, _store) = fabric_rig(75);
@@ -365,10 +329,7 @@ fn a_posts_idem_and_via_never_reach_a_bus_body() {
 /// A REPEATED `inbox seen` MOVES NO MAIL COUNT (6F-6), through the verb:
 /// two rows delivered, the first seen with a verdict, then seen again
 /// twice; every seen is a `mail-seen` mark, the repeats `moved=0`, and the
-/// fold's mail counts are the first seen's. NEGATIVE CONTROL (by scratch
-/// revert): a fold that reads the unmoved marks closes the second row's
-/// mail too (`aterm-slog`'s `a_repeated_inbox_seen_moves_no_mail_count`
-/// fails beside this).
+/// fold's mail counts are the first seen's.
 #[test]
 fn a_repeated_inbox_seen_leaves_the_folds_mail_counts() {
     let (h, store) = fabric_rig(76);

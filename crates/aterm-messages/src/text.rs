@@ -1,22 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Text shaping: control-stripping sanitization, truncation, the detail
-//! shaper that keeps a command whole and a path's file name, the split of a
-//! sentence across detail lines, and the glass title form. Pure,
-//! char-counted (the host measures cells with its own width function; these
-//! functions only ever make strings shorter, so a grapheme-aware measure can
-//! only find them narrower than counted).
+//! Text shaping: control-stripping sanitization, truncation, the detail shaper that keeps a command whole and a path's file name, the split of a sentence across detail lines, and the glass title form.
 
 use crate::{GLASS_TITLE_CHARS, GLASS_TITLE_WORDS, PIECE_SEP};
 
-/// Strip control characters (escape-sequence injection) and the invisible
-/// format characters a spoof rides on ([`is_stripped`]), then cap length
-/// before a string reaches a cell. Stripped first, an invisible character
-/// cannot hide a clause seam or a period from the glass title form. The cap
-/// is in characters, applied after the strip; an elided tail is marked `…`,
-/// so an elided result is `cap + 1` chars (the
-/// `atpkg::progress::sanitize_for_tty` shape, without the dependency).
+/// Strip control characters (escape-sequence injection) and the invisible format characters a spoof rides on ([`is_stripped`]), then cap length before a string reaches a cell.
 #[must_use]
 pub(crate) fn sanitize(s: &str, cap: usize) -> String {
     let mut out = String::with_capacity(s.len().min(cap.saturating_add(4)));
@@ -30,62 +19,43 @@ pub(crate) fn sanitize(s: &str, cap: usize) -> String {
     out
 }
 
-/// A character no chrome surface prints: a control (C0 and C1, so every ASCII
-/// line break and tab), a noncharacter, or an invisible format character that
-/// re-orders or hides the text around it (bidi controls, zero-width and
-/// filler characters, separators, the tag block's invisible ASCII that an
-/// agent reading the text still reads).
-///
-/// The one table: the band's strip (`is_stripped`), the presence row's
-/// tokens ([`crate::presence::sanitize_token`]) and the host's user-metadata
-/// gate (`aterm-gui`'s `is_forbidden_metadata_char`) all read it. ZWJ, ZWNJ
-/// and the variation selectors are not here: emoji sequences, joining scripts
-/// and ideographic variants need them; a surface that drops the joiners too
-/// says so.
+/// A character no chrome surface prints: a control (C0 and C1, so every ASCII line break and tab), a noncharacter, or an invisible format character that re-orders or hides the text around it (bidi controls, zero-width and filler characters, separators, the tag block's invisible ASCII that an agent reading the text still reads).
 #[inline]
 #[must_use]
 pub const fn is_hidden_char(c: char) -> bool {
-    // `char::is_control` (general category Cc), spelled out: it is not a
-    // `const fn` on stable Rust, which the cross cells build with.
     matches!(c, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}')
         || matches!(
             c,
-            '\u{00ad}' // SOFT HYPHEN
-                | '\u{034f}' // COMBINING GRAPHEME JOINER
-                | '\u{061c}' // ARABIC LETTER MARK
-                | '\u{115f}'..='\u{1160}' // Hangul fillers
-                | '\u{17b4}'..='\u{17b5}' // Khmer inherent-vowel controls
-                | '\u{180b}'..='\u{180f}' // Mongolian selectors / vowel separator
-                | '\u{200b}' // ZERO WIDTH SPACE
-                | '\u{200e}'..='\u{200f}' // directional marks
-                | '\u{2028}'..='\u{202e}' // line/paragraph separators, bidi embedding/override
-                | '\u{2060}'..='\u{206f}' // word joiner, invisible operators, bidi isolates
-                | '\u{3164}' // HANGUL FILLER
-                | '\u{fdd0}'..='\u{fdef}' // noncharacters
-                | '\u{feff}' // BOM / ZERO WIDTH NO-BREAK SPACE
-                | '\u{ffa0}' // HALFWIDTH HANGUL FILLER
-                | '\u{fff0}'..='\u{fffb}' // specials, interlinear annotation anchors
-                | '\u{13430}'..='\u{1343f}' // Egyptian hieroglyph format controls
-                | '\u{1bca0}'..='\u{1bca3}' // shorthand format controls
-                | '\u{1d173}'..='\u{1d17a}' // musical symbol format controls
-                | '\u{e0000}'..='\u{e007f}' // the tag block
+            '\u{00ad}'
+                | '\u{034f}'
+                | '\u{061c}'
+                | '\u{115f}'..='\u{1160}'
+                | '\u{17b4}'..='\u{17b5}'
+                | '\u{180b}'..='\u{180f}'
+                | '\u{200b}'
+                | '\u{200e}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{3164}'
+                | '\u{fdd0}'..='\u{fdef}'
+                | '\u{feff}'
+                | '\u{ffa0}'
+                | '\u{fff0}'..='\u{fffb}'
+                | '\u{13430}'..='\u{1343f}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0000}'..='\u{e007f}'
         )
-        // The noncharacters at the end of every plane (U+xFFFE, U+xFFFF).
         || (c as u32) & 0xfffe == 0xfffe
 }
 
-/// A character the band and the presence row strip: [`is_hidden_char`] and
-/// the two joiners (ZWNJ, ZWJ). The band prints paths and commands a joiner
-/// could hide inside (and the log page copies them to a clipboard), and the
-/// row paints one character per cell, where a joiner would only fold the
-/// glyph after it out of sight.
+/// A character the band and the presence row strip: [`is_hidden_char`] and the two joiners (ZWNJ, ZWJ).
 #[inline]
 pub(crate) const fn is_stripped(c: char) -> bool {
     is_hidden_char(c) || matches!(c, '\u{200c}' | '\u{200d}')
 }
 
-/// `s` in at most `max` chars, the last one `…` when it was cut. `max == 0`
-/// is the empty string.
+/// `s` in at most `max` chars, the last one `…` when it was cut.
 #[must_use]
 pub(crate) fn truncate(s: &str, max: usize) -> String {
     let n = s.chars().count();
@@ -100,22 +70,13 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
     t
 }
 
-/// Sanitize, then fit in `cap` chars including the ellipsis: what every
-/// message field is stored as.
+/// Sanitize, then fit in `cap` chars including the ellipsis: what every message field is stored as.
 #[must_use]
 pub(crate) fn clip(s: &str, cap: usize) -> String {
     truncate(&sanitize(s, usize::MAX), cap)
 }
 
-/// A sentence received from elsewhere, kept whole across lines of at most
-/// `cap` chars (sanitized first): while the rest is longer than `cap`, it is
-/// cut at the last `; ` whose head fits (the joint dropped), else the last
-/// ` · ` (dropped), else the last `. ` (the period kept), else the last space,
-/// else between the last two CJK characters that fit, kinsoku kept
-/// ([`aterm_grapheme::word_breaks`]), else hard at `cap`. Pieces are trimmed and never empty; rejoined at the
-/// joints they cut, they are the sanitized sentence. No reporter pre-cuts a
-/// sentence it received: the log entry is the whole of it, and the band
-/// shapes only `detail[0]`.
+/// A sentence received from elsewhere, kept whole across lines of at most `cap` chars (sanitized first): while the rest is longer than `cap`, it is cut at the last `; ` whose head fits (the joint dropped), else the last ` · ` (dropped), else the last `.`
 #[must_use]
 pub fn split_sentence(s: &str, cap: usize) -> Vec<String> {
     const JOINTS: [(&str, bool); 4] = [
@@ -128,15 +89,8 @@ pub fn split_sentence(s: &str, cap: usize) -> Vec<String> {
     let cap = cap.max(1);
     let mut lines = Vec::new();
     let mut rest = clean.trim();
-    // Linear in the sentence: each cut looks at the head it cuts and no
-    // further, so a sentence of any length costs one pass (a caller's error
-    // text is not bounded before it gets here). `limit` is the byte offset
-    // just past the rest's `cap`-th char: a joint must end inside the head
-    // for the head to fit.
     while let Some((limit, _)) = rest.char_indices().nth(cap) {
         let cut = JOINTS.iter().find_map(|(joint, keep_head)| {
-            // Every joint that could end inside the head starts at or before
-            // `limit`, so it lies within the head plus one joint's length.
             let end = (limit + joint.len()..=rest.len())
                 .find(|b| rest.is_char_boundary(*b))
                 .unwrap_or(rest.len());
@@ -150,9 +104,6 @@ pub fn split_sentence(s: &str, cap: usize) -> Vec<String> {
                     (head_end, i + joint.len())
                 })
         });
-        // A sentence written without spaces breaks between its characters:
-        // read through the char just past the head, which says whether the
-        // head may end before it, and no further.
         let cut = cut.or_else(|| {
             let scan = rest[limit..]
                 .chars()
@@ -184,25 +135,13 @@ pub fn char_width(s: &str) -> usize {
     s.chars().count()
 }
 
-/// A detail that always keeps its command and its file name. Sanitized like
-/// every other cell string; when longer than `cap`, a detail of ` · `-joined
-/// pieces first sheds its trailing pieces whole, down to the piece that holds
-/// the command. Still too long, the prose gives way: the tail from the
-/// backtick-quoted command sentence to the end is kept whole and the prefix
-/// is cut to fit, with the ellipsis on the prose. A detail with a path atom
-/// (`~/…` or `/…`, no spaces) and no command has the path cut from the left,
-/// keeping the file name ([`shape_path`]); plain prose is cut on a word
-/// boundary. The result is at most `cap` chars, ellipsis included.
+/// A detail that always keeps its command and its file name.
 #[must_use]
 pub fn shape_detail(detail: &str, cap: usize) -> String {
     let mut clean = sanitize(detail, usize::MAX);
     if char_width(&clean) <= cap {
         return clean;
     }
-    // A correction (`windw_padding → window_padding`) is cut to its right side
-    // with the arrow, so the fix never reads as the misspelling; a fix too long
-    // for the cap is dropped whole, since a clipped key is a key that is not
-    // there.
     if let Some((_, fix)) = clean.split_once(" \u{2192} ")
         && !fix.contains(" \u{2192} ")
         && !fix.trim().is_empty()
@@ -216,11 +155,6 @@ pub fn shape_detail(detail: &str, cap: usize) -> String {
     }
     if clean.contains('`') && clean.contains(PIECE_SEP) {
         let pieces: Vec<&str> = clean.split(PIECE_SEP).collect();
-        // The piece the cut below anchors on is never shed: everything after
-        // it is a trailing figure, worth showing only whole. It is the same
-        // command `command_anchor` picks (a `Run \`…\`` sentence anywhere
-        // first, else the last piece carrying a backtick), so the two stages
-        // never keep different pieces.
         let anchor = pieces
             .iter()
             .position(|p| p.contains("Run `"))
@@ -247,19 +181,11 @@ pub fn shape_detail(detail: &str, cap: usize) -> String {
 }
 
 /// The least a cut prose head may be before it gives way whole to the command
-/// it stood in front of: two words and twelve cells. Below either, a fragment
-/// ("1… `…`") says nothing a person can act on.
+/// it stood in front of: two words and twelve cells.
 const MIN_HEAD_WORDS: usize = 2;
 const MIN_HEAD_CELLS: usize = 12;
 
-/// An excerpt's lead clause: its words before its first joint (a `: ` or the
-/// ` · ` that ends its first piece), where they are a whole statement on their
-/// own: at least [`MIN_HEAD_WORDS`] words and [`MIN_HEAD_CELLS`] cells, no
-/// command quoting, and words after it. `behind for 7 h: its turn is still
-/// running` → `behind for 7 h`; `was: …`, `line 3: …` and `tab 1 · …` say
-/// nothing alone. The width law paints it whole, with no ellipsis, where the
-/// floor would drop the excerpt or a cut would say no word past it
-/// ([`crate::glass`]).
+/// An excerpt's lead clause: its words before its first joint (a `: ` or the ` · ` that ends its first piece), where they are a whole statement on their own: at least [`MIN_HEAD_WORDS`] words and [`MIN_HEAD_CELLS`] cells, no command quoting, and words after it.
 #[must_use]
 pub(crate) fn lead_clause(detail: &str) -> Option<String> {
     let clean = sanitize(detail, usize::MAX);
@@ -278,8 +204,7 @@ pub(crate) fn lead_clause(detail: &str) -> Option<String> {
 /// The prose before a command gives way to the command: back up to the start
 /// of the sentence (or ` · ` clause) the backtick sits in, so the kept tail
 /// reads as a sentence; when even that sentence is too long, the tail starts
-/// at the command itself. A head cut below [`MIN_HEAD_WORDS`] /
-/// [`MIN_HEAD_CELLS`] is dropped whole rather than emitted as a stub.
+/// at the command itself.
 fn keep_command(clean: &str, command: usize, cap: usize) -> String {
     let sentence = sentence_start(clean, command);
     for (at, head_from) in [(sentence, 0), (command, sentence)] {
@@ -291,8 +216,6 @@ fn keep_command(clean: &str, command: usize, cap: usize) -> String {
         let head_budget = cap - tail_len - 2;
         let head = clean[head_from..at].trim_end();
         let mut out: String = head.chars().take(head_budget).collect();
-        // A cut head ends on a word, not inside one ("1 tab from…", not "1
-        // tab from befo…"), when it has a word to end on.
         if head
             .chars()
             .nth(head_budget)
@@ -303,8 +226,6 @@ fn keep_command(clean: &str, command: usize, cap: usize) -> String {
             out.truncate(space);
         }
         out = out.trim_end().to_string();
-        // A cut head is a clause or nothing: below the floor the prose goes
-        // whole and the command stands alone.
         if out.split_whitespace().count() < MIN_HEAD_WORDS || char_width(&out) < MIN_HEAD_CELLS {
             return tail.to_string();
         }
@@ -312,16 +233,11 @@ fn keep_command(clean: &str, command: usize, cap: usize) -> String {
         out.push_str(tail);
         return out;
     }
-    // Even the sentence is too long: the tail from the backtick, cut on a word
-    // boundary while the command itself survives whole; else as much of the
-    // command as fits.
     let tail = &clean[command..];
     let shaped = trim_words(tail, cap);
     let kept = shaped
         .strip_suffix('\u{2026}')
         .map_or(shaped.len(), str::len);
-    // The command runs to the backtick closing the first one in the tail
-    // (after `Run ` when the anchor is a `Run \`…\`` sentence).
     let command_len = tail
         .find('`')
         .and_then(|open| tail[open + 1..].find('`').map(|close| open + 1 + close + 1));
@@ -334,9 +250,7 @@ fn keep_command(clean: &str, command: usize, cap: usize) -> String {
 
 /// Where the command a cut detail must keep begins: a `Run` sentence (`Run`
 /// followed by a backtick-quoted command) when there is one, else the first
-/// backtick of the last ` · ` clause that carries one. A remedy is said last,
-/// and it is the remedy, not the name of the program the row is about, that a
-/// person acts on.
+/// backtick of the last ` · ` clause that carries one.
 fn command_anchor(clean: &str) -> Option<usize> {
     if let Some(at) = clean.find("Run `") {
         return Some(at);
@@ -392,10 +306,7 @@ fn is_path_atom(token: &str) -> bool {
     body.starts_with('/') && body[1..].contains('/')
 }
 
-/// A path cut from the left so it fits in `cap` chars: the longest tail
-/// starting at a `/` boundary, prefixed `…` (`…/aterm/crash.log`,
-/// `…/crash.log`); when even the file name is too long, the file name's own
-/// tail. Whole when it fits; `cap < 2` is `…` alone (or nothing at 0).
+/// A path cut from the left so it fits in `cap` chars: the longest tail starting at a `/` boundary, prefixed `…` (`…/aterm/crash.log`, `…/crash.log`); when even the file name is too long, the file name's own tail.
 #[must_use]
 pub(crate) fn shape_path(path: &str, cap: usize) -> String {
     if char_width(path) <= cap {
@@ -410,7 +321,7 @@ pub(crate) fn shape_path(path: &str, cap: usize) -> String {
             let tail = &path[i..];
             if char_width(tail) < cap {
                 best = Some(tail);
-                break; // the first boundary past the start is the longest tail
+                break;
             }
         }
     }
@@ -439,10 +350,7 @@ fn shape_path_in(clean: &str, cap: usize) -> Option<String> {
     Some(format!("{}{shaped}{}", &clean[..s], &clean[e..]))
 }
 
-/// Prose cut to at most `cap` chars on a word boundary, ending in `…`:
-/// "these are what…", never "these are wha…". A word ends at a space, and
-/// in a script written without spaces at each of its characters, kinsoku
-/// kept ([`aterm_grapheme::word_breaks`]).
+/// Prose cut to at most `cap` chars on a word boundary, ending in `…`: "these are what…", never "these are wha…".
 #[must_use]
 pub(crate) fn trim_words(s: &str, cap: usize) -> String {
     if char_width(s) <= cap {
@@ -452,7 +360,6 @@ pub(crate) fn trim_words(s: &str, cap: usize) -> String {
         return String::new();
     }
     let keep = cap - 1;
-    // The byte just past the `keep` chars that fit.
     let limit = s.char_indices().nth(keep).map_or(s.len(), |(at, _)| at);
     let mut out = &s[..limit];
     if s[limit..].starts_with(|next: char| next != ' ')
@@ -469,8 +376,7 @@ pub(crate) fn trim_words(s: &str, cap: usize) -> String {
     out
 }
 
-/// The words of a title: whitespace tokens carrying a letter, so a route's
-/// `▸`, a name's `&` and a bare number (the `2` of `in tab 2`) spend no word.
+/// The words of a title: whitespace tokens carrying a letter, so a route's `▸`, a name's `&` and a bare number (the `2` of `in tab 2`) spend no word.
 #[must_use]
 pub fn title_words(title: &str) -> usize {
     title
@@ -482,11 +388,7 @@ pub fn title_words(title: &str) -> usize {
 /// The clause seams a glass title may not carry.
 const TITLE_SEAMS: [&str; 3] = [" \u{2014} ", "; ", ": "];
 
-/// Why `title` may not be a glass title, or `None`: the one copy of the rule,
-/// read by the host's `attention` and by the wire's parser. In order: at most
-/// [`GLASS_TITLE_WORDS`] words ([`title_words`]), at most
-/// [`GLASS_TITLE_CHARS`] characters, no clause seam (` — `, `; `, `: `), no
-/// trailing period.
+/// Why `title` may not be a glass title, or `None`: the one copy of the rule, read by the host's `attention` and by the wire's parser.
 #[must_use]
 pub fn glass_title_fault(title: &str) -> Option<&'static str> {
     if title_words(title) > GLASS_TITLE_WORDS {
@@ -575,15 +477,12 @@ mod tests {
         assert_eq!(lines.concat(), hard, "no joint: a hard cut, nothing lost");
         assert_eq!(split_sentence("short", 240), vec!["short"]);
         assert!(split_sentence("", 240).is_empty());
-        // A period keeps its place at the end of its line.
         let dots = format!("{}. {}", "a".repeat(30), "b".repeat(30));
         assert_eq!(
             split_sentence(&dots, 40),
             vec![format!("{}.", "a".repeat(30)), "b".repeat(30)]
         );
-        // Hostile text is sanitized first.
         assert_eq!(split_sentence("a\u{1b}[31mb", 240), vec!["a[31mb"]);
-        // Megabytes of words split and rejoin exactly, in one pass.
         let huge: String = (0..400_000)
             .map(|n| format!("w{n}"))
             .collect::<Vec<_>>()
@@ -593,7 +492,6 @@ mod tests {
         assert!(lines.len() > 10_000, "{}", lines.len());
         assert!(lines.iter().all(|l| char_width(l) <= 240));
         assert_eq!(lines.join(" "), huge);
-        // A message of such lines round-trips the record the log writes.
         let msg = crate::model::Message::new(crate::tags::UPDATE, crate::Severity::Warn, "t")
             .sentence(&long);
         assert_eq!(msg.detail.join("; "), long);
@@ -606,33 +504,28 @@ mod tests {
     fn a_path_is_cut_from_the_left_and_keeps_its_file_name() {
         assert_eq!(CRASH.chars().count(), 71);
         assert_eq!(shape_detail(CRASH, 71), CRASH);
-        // The 120-column crash row: room 57 → cap 54 → the file name, whole.
         let at_54 = shape_detail(CRASH, 54);
         assert_eq!(
             at_54,
             "crash log at \u{2026}/crash-signal-8123-1758470000.log.seen"
         );
         assert_eq!(at_54.chars().count(), 52);
-        // Wider: the longest tail at a `/` boundary that fits.
         assert_eq!(
             shape_detail(CRASH, 60),
             "crash log at \u{2026}/aterm/crash-signal-8123-1758470000.log.seen"
         );
-        // Narrower than the file name: the file name's own tail.
         let at_40 = shape_detail(CRASH, 40);
         assert_eq!(at_40.chars().count(), 40);
         assert!(
             at_40.starts_with("crash log at \u{2026}") && at_40.ends_with(".log.seen"),
             "{at_40}"
         );
-        // No room for even `…/`: prose gives way on a word boundary instead.
         assert_eq!(shape_detail(CRASH, 14), "crash log at\u{2026}");
         assert_eq!(shape_path("/a/b/c.log", 100), "/a/b/c.log");
         assert_eq!(shape_path("/a/b/c.log", 7), "\u{2026}/c.log");
         assert_eq!(shape_path("/a/b/c.log", 9), "\u{2026}/b/c.log");
         assert_eq!(shape_path("/a/b/c.log", 1), "\u{2026}");
         assert_eq!(shape_path("/a/b/c.log", 0), "");
-        // Prose without a path cuts on a word, and never leaves a stub.
         let prose = "skipping \"cmd+shift+k\": unknown action \"foo\"";
         assert_eq!(
             shape_detail(prose, 42),
@@ -664,8 +557,6 @@ mod tests {
         for cap in [whole - 1, whole - 40, pointer.chars().count()] {
             assert_eq!(shape_detail(&detail, cap), pointer, "cap {cap}");
         }
-        // Narrower than the pointer: the cut lands inside it, on a word, with
-        // its command whole, never the front of the revert.
         assert_eq!(
             shape_detail(&detail, 35),
             "`aterm pkg doctor` prints the\u{2026}"
@@ -677,16 +568,13 @@ mod tests {
         assert_eq!(shape_detail(&detail, 25), "`aterm pkg doctor`\u{2026}");
         let cut = shape_detail(&detail, 30);
         assert!(!cut.contains("defaults"), "{cut}");
-        // The commands stay whole while the prose carries the ellipsis.
         let managed = "what `claude` and `codex` run in every aterm tab, this one too \u{00b7} build 2026091001";
         let d = shape_detail(managed, 40);
         assert!(d.contains("`claude`") && d.contains('\u{2026}'), "{d}");
         assert!(d.chars().count() <= 40, "{d}");
-        // A `Run \`…\`` sentence is the anchor wherever it sits.
         let run = "the shims are stale. Run `aterm pkg repair` to relay them \u{00b7} 3 tabs";
         let d = shape_detail(run, 40);
         assert!(d.contains("Run `aterm pkg repair`"), "{d}");
-        // Even the command's own words are too long: the command's front.
         let d = shape_detail("see `a very long command that goes on and on`", 12);
         assert!(d.starts_with("`a very") && d.ends_with('\u{2026}'), "{d}");
         assert_eq!(d.chars().count(), 12);
@@ -703,12 +591,9 @@ mod tests {
         );
         let cmd_len = command.chars().count();
         assert_eq!(cmd_len, 33);
-        // Room for the command and a stub ("", "1", "1 tab", "1 tab from") is
-        // room for the command alone.
         for cap in cmd_len..cmd_len + 19 {
             assert_eq!(shape_detail(&installed, cap), command, "cap {cap}");
         }
-        // Room for a clause keeps it, ellipsis on the prose.
         assert_eq!(
             shape_detail(&installed, cmd_len + 19),
             format!("1 tab from before\u{2026} {command}")
@@ -717,7 +602,6 @@ mod tests {
             shape_detail(&installed, cmd_len + 22),
             format!("1 tab from before it\u{2026} {command}")
         );
-        // The prose before a `Run` sentence goes the same way.
         let run = "the shims are stale. Run `aterm pkg repair` to relay them";
         assert_eq!(
             shape_detail(run, 40),
@@ -750,9 +634,6 @@ mod tests {
         let clean = sanitize(bad, usize::MAX);
         assert_eq!(clean, "bad[31m thingtail");
         assert!(clean.chars().all(|c| !c.is_control()));
-        // The invisible format characters go too: a bidi override could
-        // paint `Run \`rm -rf x\`` reversed, a zero-width joiner could hide
-        // inside a path the page copies to the clipboard.
         assert_eq!(
             sanitize(
                 "a\u{202e}b\u{200b}c\u{feff}d\u{2066}e\u{2028}f\u{200d}g\u{2029}h",
@@ -761,9 +642,6 @@ mod tests {
             "abcdefgh",
             "bidi overrides, zero-width characters and line separators are stripped"
         );
-        // The rest of the one table goes too: a combining grapheme joiner,
-        // the Hangul fillers, a Mongolian selector, Khmer's inherent vowels,
-        // a shorthand and a musical format control.
         assert_eq!(
             sanitize(
                 "a\u{034f}b\u{115f}c\u{3164}d\u{ffa0}e\u{180b}f\u{17b4}g\u{1bca0}h\u{1d173}i\u{e0000}j",

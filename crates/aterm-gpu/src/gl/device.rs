@@ -29,6 +29,10 @@ pub(crate) struct GlCaps {
     /// The name of the context's `glGetGraphicsResetStatus` ([`reset_query`]), which a context made to report resets is asked at every present.
     #[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
     pub(crate) reset_query: Option<&'static CStr>,
+    /// `EXT_read_format_bgra`: a readback can be `GL_BGRA_EXT`, the byte
+    /// order of an X11 window's pixels (`surface`'s readback post).
+    #[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
+    pub(crate) bgra_read: bool,
 }
 
 /// The shared half of a device: the EGL or GLX objects (on wasm32, the WebGL2 context and its canvas), the function table and the lock.
@@ -43,19 +47,29 @@ pub(crate) struct GlShared {
     #[cfg(target_arch = "wasm32")]
     context: u32,
     /// The canvas the context draws into, held in the glue's object table
+    /// for the context's life.
     #[cfg(target_arch = "wasm32")]
     _canvas: aterm_wasm_abi::js::JsObject,
     /// Latched when the device is lost (the module header's "Loss"); the
+    /// device is then dead, and `GpuRenderer::device_lost` reports it to the
+    /// frontend's CPU fallback.
     lost: AtomicBool,
     /// The first latched loss's cause, for the frontend's downgrade line.
     #[cfg(not(target_arch = "wasm32"))]
     loss_reason: std::sync::OnceLock<String>,
     /// The injected-loss drill (`ATERM_GL_INJECT_LOSS`) on an EGL device: the
+    /// next [`GlShared::enter`] answers its `eglMakeCurrent` as a lost context
+    /// does, so the latch is driven through the path a real loss takes.
     inject_loss: AtomicBool,
     /// The context's `glGetGraphicsResetStatus`, where the context was made
+    /// to report resets (a robust GLX context); `None` elsewhere, where it
+    /// could only answer `GL_NO_ERROR`.
     #[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
     reset_status: Option<ffi::GetGraphicsResetStatusFn>,
     /// A reset status the next [`Current::poll_reset`] reads in place of the
+    /// driver's (`GL_NO_ERROR`: none): the drill on a GLX device, so its
+    /// latch comes from the check a real reset hits, after the present's GLX
+    /// calls; and the tests' statuses.
     #[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
     inject_reset: AtomicU32,
     pub(crate) gl: GlFns,
@@ -97,8 +111,10 @@ pub(crate) struct EglBinding {
     pub(crate) display: EGLDisplay,
     context: EGLContext,
     /// The context's draw surface when the display cannot bind without one (a
+    /// 1x1 pbuffer), else `EGL_NO_SURFACE` (`EGL_KHR_surfaceless_context`).
     surface: EGLSurface,
     /// Whether the display was opened with reference tracking, so this
+    /// device's `eglTerminate` releases only its own reference.
     tracked: bool,
     /// The config the context was made with, or `EGL_NO_CONFIG_KHR` for a context any surface of the display can bind.
     #[cfg_attr(
@@ -312,6 +328,7 @@ impl GlShared {
     }
 
     /// `code`, an EGL error `call` raised, as a message; `EGL_CONTEXT_LOST`
+    /// latches the device lost.
     fn egl_error(&self, call: &str, code: EGLint) -> String {
         let e = format!("gl: {call}: {}", ffi::egl_error_name(code));
         if code == ffi::EGL_CONTEXT_LOST {
@@ -417,6 +434,8 @@ impl GlShared {
 #[cfg(not(target_arch = "wasm32"))]
 impl GlShared {
     /// Bind the context on this thread (`eglMakeCurrent`, or
+    /// `glXMakeContextCurrent` on its pbuffer), or fail as a lost context's
+    /// bind does when the drill is armed.
     fn make_current(&self) -> Result<(), String> {
         if self.inject_loss.swap(false, Ordering::AcqRel) {
             return Err(self.egl_error("eglMakeCurrent", ffi::EGL_CONTEXT_LOST));
@@ -459,6 +478,7 @@ impl GlShared {
 #[cfg(target_arch = "wasm32")]
 impl GlShared {
     /// Point the GL imports at this context, and latch a context the browser
+    /// lost (or the drill's) as lost.
     fn make_current(&self) -> Result<(), String> {
         let lost = "gl: the WebGL2 context is lost (webglcontextlost)";
         if self.inject_loss.swap(false, Ordering::AcqRel) {
@@ -662,6 +682,8 @@ impl GlDevice {
     }
 
     /// A device on an X11 display's GLX (see `super::glx` for why X11 is
+    /// GLX's): a GLX OpenGL ES 3 context, current on its pbuffer between
+    /// posts, which a present asks for resets where the context reports them.
     #[cfg(not(wgpu_arm))]
     fn on_glx(display: usize, screen: i32, ws: WindowSystem) -> Result<Self, String> {
         Self::on_glx_context(
@@ -707,6 +729,7 @@ impl GlDevice {
     }
 
     /// The device a headless display opens on: the first with a DRM node (a
+    /// hardware GPU), else the first enumerated (Mesa's software device).
     fn pick_device(egl: &Egl, client_exts: &str) -> Option<ffi::EGLDeviceEXT> {
         // SAFETY: eglGetProcAddress returns null or the named extension function, whose registry signature the alias types declare.
         let (query_devices, query_string) = unsafe {
@@ -741,6 +764,7 @@ impl GlDevice {
     }
 
     /// Initialize `display`, pick an RGBA8 GLES 3 config, create the context
+    /// and load GL through it.
     fn on_display(
         egl: &'static Egl,
         display: EGLDisplay,
@@ -917,6 +941,7 @@ impl GlDevice {
     }
 
     /// Load the GL table through `lookup` (`eglGetProcAddress`,
+    /// `glXGetProcAddressARB`) and read the caps.
     fn load_gl(lookup: &mut dyn FnMut(&CStr) -> *const c_void) -> Result<(GlFns, GlCaps), String> {
         // SAFETY: the lookup returns null or the named GL function, whose registry signature the table declares.
         let gl = unsafe { GlFns::load(lookup) }?;
@@ -942,6 +967,8 @@ impl GlDevice {
         let caps = GlCaps {
             #[cfg(not(wgpu_arm))]
             reset_query: reset_query(&version, has),
+            #[cfg(not(wgpu_arm))]
+            bgra_read: has("GL_EXT_read_format_bgra"),
             renderer,
             version,
             max_texture_dim: u32::try_from(max_tex).unwrap_or(0),
@@ -952,6 +979,9 @@ impl GlDevice {
 }
 
 /// The name of `glGetGraphicsResetStatus` on a context whose `GL_VERSION` is
+/// `version` and whose extensions `has` names: GLES 3.2's core name, else the
+/// spelling of the robustness extension it lists (`KHR`, `EXT`, then `ARB`);
+/// `None` when it has none.
 #[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
 fn reset_query(version: &str, has: impl Fn(&str) -> bool) -> Option<&'static CStr> {
     let minor = version
@@ -1011,7 +1041,7 @@ impl GlDevice {
         Ok(dev)
     }
 
-    /// Read the caps of the current WebGL2 context. The GPU's name is the
+    /// Read the caps of the current WebGL2 context.
     fn load_webgl(gl: &GlFns) -> Result<GlCaps, String> {
         // SAFETY: the context is current; glGetString returns null or a NUL-terminated string the module owns for the context's life.
         let string = |name| unsafe { ffi::c_string((gl.get_string)(name).cast()) };
@@ -1041,6 +1071,7 @@ impl GlDevice {
 
 impl GlDevice {
     /// The state every encode assumes and nothing changes: no dithering, depth,
+    /// culling or blending until a pipeline asks.
     fn init_state(&self) -> Result<(), String> {
         let cur = self.0.enter()?;
         let gl = cur.gl();
@@ -1081,6 +1112,9 @@ mod tests {
     use super::super::test_device as device;
 
     /// The device makes its context current under the guard, releases it on
+    /// drop (another thread can then take it), nests on one thread until a
+    /// loss latches, and refuses a second device while the first is held on
+    /// the thread.
     #[test]
     fn the_context_is_current_only_inside_a_guard_and_moves_between_threads() {
         let dev = device();
@@ -1143,6 +1177,8 @@ mod tests {
     }
 
     /// A lost context latches at the first `eglMakeCurrent` that reports it,
+    /// the call every frame and resource operation starts with: the device
+    /// reads lost from then on and refuses every later guard.
     #[test]
     fn a_lost_context_at_make_current_latches_the_device_lost() {
         let dev = device();
@@ -1175,6 +1211,8 @@ mod tests {
     }
 
     /// A present's reset check latches the device lost on any reset status
+    /// but `GL_NO_ERROR`, NVIDIA's purge among them, and names the status as
+    /// the cause the frontend's downgrade line prints.
     #[cfg(not(wgpu_arm))]
     #[test]
     fn a_reset_status_other_than_no_error_latches_the_device_lost() {
@@ -1216,6 +1254,11 @@ mod tests {
     }
 
     /// The reset check's function is read by name, never guessed (glvnd
+    /// hands out a stub for any name): GLES 3.2's core
+    /// `glGetGraphicsResetStatus` (NVIDIA's and Mesa's ES contexts on this
+    /// desk are 3.2), else the spelling of the robustness extension the
+    /// context lists, `KHR` before `EXT` before `ARB`; none on a 3.0 or 3.1
+    /// context that lists none.
     #[cfg(not(wgpu_arm))]
     #[test]
     fn the_reset_query_is_gles_3_2_s_or_the_robustness_extension_s() {

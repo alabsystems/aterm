@@ -1,22 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Settings ▸ Themes' rows: one per theme the catalog can draw or the
-//! community pack offers, each with a 56×20 slab (40×20 on a narrow
-//! chooser) painted in that theme's own colours.
-//!
-//! The row list is built once per catalog generation ([`showcase_cards`])
-//! from the schemes the config worker already parsed and the embedded pack,
-//! so hovering, focusing or scrolling the chooser resolves no theme and reads
-//! no file. A row's colours are the theme as authored: the person's
-//! `aterm.toml` colour overrides would make every slab the same, so they
-//! appear only in the demo and in the live trial.
-//!
-//! The slab itself ([`paint_row_slab`]) is the theme's background, "Aa" in
-//! its foreground, and dots of its red, green, blue and magenta — as many as
-//! fit, two on the narrow slab. It never builds a terminal or forks a font, so a page
-//! of rows costs what a page of buttons costs. The faithful view is the
-//! demo.
+//! Settings ▸ Themes' rows.
 
 use aterm_types::{Appearance, ColorScheme, Rgb};
 
@@ -28,19 +13,15 @@ use crate::widget::{DrawPrim, TextFace, TextWeight, rgba, text_prim};
 /// Which section of the chooser a row belongs to, in list order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Section {
-    /// Theme files that did not load: listed first, never tried.
+    /// Theme files that did not load.
     Attention,
-    /// aterm's own signature themes (Aterm Night, Aterm Day, Hearth, Linen),
-    /// in the registry's order. They lead the list with no caption — save
-    /// under NEEDS ATTENTION, where they take one of their own
-    /// ([`Section::caption_after_rows`]).
+    /// aterm's own signature themes (Aterm Night, Aterm Day, Hearth, Linen), in the registry's order.
     Signature,
     /// Every other built-in, Default included, in the registry's order.
     Builtin,
     /// The person's own theme files that loaded, by name.
     Yours,
-    /// The community pack's themes not yet in the themes folder: tried from
-    /// the embedded pack, added on Keep.
+    /// The community pack's themes not yet in the themes folder.
     Community,
 }
 
@@ -56,13 +37,7 @@ impl Section {
         }
     }
 
-    /// The section's caption where other rows precede it (`after_rows`):
-    /// [`Self::caption`], and for the signature themes ATERM — leading the
-    /// list they need none, but under NEEDS ATTENTION (a theme file that did
-    /// not load) uncaptioned rows read as that section's, its caption
-    /// repeated over whichever of them starts a screen (the review of the
-    /// themes page, ox4-1: Linen, and Aterm Day in use, listed as needing
-    /// attention).
+    /// The section's caption where other rows precede it (`after_rows`).
     pub(crate) const fn caption_after_rows(self, after_rows: bool) -> Option<&'static str> {
         match self {
             Self::Signature if after_rows => Some("ATERM"),
@@ -84,8 +59,7 @@ impl Section {
 
 /// The format the parser names another terminal's theme by (`label`,
 /// [`ForeignFormat::label`]), in the one word a chooser row has room for:
-/// `JSON` for `JSON (Windows Terminal)`. A label this does not know keeps
-/// its first word.
+/// `JSON` for `JSON (Windows Terminal)`.
 fn format_word(label: &str) -> &str {
     use aterm_types::scheme::ForeignFormat;
     for format in [
@@ -108,8 +82,7 @@ fn format_word(label: &str) -> &str {
     label.split_whitespace().next().unwrap_or(label)
 }
 
-/// A theme file that did not load: its id, a key-safe slug unique among the
-/// rows, and why — whole, and in the few words its row has room for.
+/// A theme file that did not load.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AttentionRow {
     pub(crate) id: String,
@@ -119,14 +92,7 @@ pub(crate) struct AttentionRow {
     pub(crate) summary: String,
 }
 
-/// A theme file's load failure (`reason`, as the catalog words it) in the
-/// few words a chooser row has room for: where in the file, then what is
-/// wrong there, the key first (`Line 2: background isn't a color`), so the
-/// words a row's edge keeps are the ones that say where to look. Another
-/// terminal's theme says what to do first, its format in a word after
-/// (`Import… converts it (JSON)`): the whole of it fits a row at every
-/// chooser width. A reason this does not know reads as written, its parser
-/// preamble gone.
+/// A theme file's load failure (`reason`, as the catalog words it) in the few words a chooser row has room for.
 pub(crate) fn reason_summary(reason: &str) -> String {
     let reason = reason.trim();
     let capitalized = |text: &str| {
@@ -136,13 +102,10 @@ pub(crate) fn reason_summary(reason: &str) -> String {
             .map(|first| first.to_uppercase().chain(chars).collect::<String>())
             .unwrap_or_default()
     };
-    // Another terminal's theme: the whole file is, wherever the parser
-    // stopped.
     if let Some((_, format)) = reason.split_once(" (this looks like a ") {
         let format = format.split_once(" theme").map_or(format, |(name, _)| name);
         return format!("Import\u{2026} converts it ({})", format_word(format));
     }
-    // `theme parse error on line N: <what>`, line 0 for the whole file.
     let (line, what) = reason
         .strip_prefix("theme parse error on line ")
         .and_then(|rest| rest.split_once(": "))
@@ -183,8 +146,7 @@ pub(crate) fn reason_summary(reason: &str) -> String {
     }
 }
 
-/// The theme files in the folder that did not load, by name, each with a
-/// slug no row of `cards` uses.
+/// The theme files in the folder that did not load, by name, each with a slug no row of `cards` uses.
 pub(crate) fn attention_rows(
     themes: &crate::app_config::ThemeCatalog,
     cards: &[ShowcaseCard],
@@ -219,15 +181,14 @@ pub(crate) fn attention_rows(
 /// One theme in the chooser.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ShowcaseCard {
-    /// The catalog id: what `theme = "…"` names.
+    /// The catalog id.
     pub(crate) id: String,
-    /// A key- and wire-safe spelling of the id, unique in the chooser
-    /// (`ctl act` takes a key as one word, and ids hold spaces).
+    /// A key- and wire-safe spelling of the id, unique in the chooser (`ctl act` takes a key as one word, and ids hold spaces).
     pub(crate) slug: String,
     pub(crate) section: Section,
-    /// What the person sees: a built-in's name, a file's own `name =`.
+    /// What the person sees.
     pub(crate) label: String,
-    /// The theme's description, its first sentence; may be empty.
+    /// The theme's description, its first sentence.
     pub(crate) description: String,
     /// The appearance the theme is drawn for (declared or measured).
     pub(crate) appearance: Appearance,
@@ -236,25 +197,20 @@ pub(crate) struct ShowcaseCard {
     pub(crate) bg: u32,
     pub(crate) cursor: u32,
     pub(crate) selection: u32,
-    /// The selected text's colour; `None` keeps each cell's own.
+    /// The selected text's colour.
     pub(crate) selection_fg: Option<u32>,
     pub(crate) ansi: [u32; 16],
     /// Text contrast, foreground on background.
     pub(crate) contrast: f64,
-    /// The theme's type settings in one line ("Berkeley Mono · 1.15×"),
-    /// `None` for a theme that names none.
+    /// The theme's type settings in one line ("Berkeley Mono · 1.15×"), `None` for a theme that names none.
     pub(crate) typography: Option<String>,
-    /// The same in words for a screen reader ("sets font Berkeley Mono,
-    /// line height 1.15").
+    /// The same in words for a screen reader ("sets font Berkeley Mono, line height 1.15").
     pub(crate) typography_spoken: Option<String>,
-    /// The theme file was written for a newer theme schema and some of its
-    /// settings were skipped.
+    /// The theme file was written for a newer theme schema and some of its settings were skipped.
     pub(crate) partial: bool,
     /// The label, id, description, type summary and section words lowercased
     /// once, for the filter: a keystroke in the filter matches every row
-    /// without allocating. A theme that names a font matches "font" and
-    /// "type"; a file of the person's "yours" and "mine"; a pack theme
-    /// "community" and "pack".
+    /// without allocating.
     search: [String; 5],
 }
 
@@ -363,9 +319,7 @@ impl ShowcaseCard {
         }
     }
 
-    /// The row's spoken value: `dark|light, contrast X:1 AAA`, then
-    /// `, in use` / `, trying`, the type it sets in words, and where a
-    /// community theme comes from.
+    /// The row's spoken value.
     pub(crate) fn row_value(&self, in_use: bool, trying: bool) -> String {
         let mut value = format!(
             "{}, contrast {}:1 {}",
@@ -389,10 +343,7 @@ impl ShowcaseCard {
         value
     }
 
-    /// The paint-only slab's value: the background, the foreground and the
-    /// four hues it dots (red, green, blue, magenta), packed hex, then
-    /// whether the narrow slab is asked for. One string because a custom
-    /// paint node carries one; [`paint_row_slab`] reads it back.
+    /// The paint-only slab's value.
     pub(crate) fn slab_value(&self, narrow: bool) -> String {
         let mut value = String::with_capacity(48);
         for color in [
@@ -409,11 +360,7 @@ impl ShowcaseCard {
         value
     }
 
-    /// Whether the chooser's filter `query` (lowercased, trimmed) admits the
-    /// row at `reach` (the filter's over the whole list:
-    /// `ShowcaseState::reach_for`): its name, id, description, appearance or
-    /// section words, by the ladder Settings search and the theme picker use.
-    /// An empty query admits every row.
+    /// Whether the lowercased, trimmed filter `query` admits the row at `reach` (`ShowcaseState::reach_for`).
     pub(crate) fn matches(
         &self,
         query: &str,
@@ -461,8 +408,7 @@ pub(crate) fn contrast_grade(ratio: f64) -> ContrastGrade {
     }
 }
 
-/// A contrast ratio to one decimal, rounded down so a floor is never
-/// overstated (2.96 reads 2.9), and without a trailing `.0`.
+/// A contrast ratio to one decimal, rounded down so a floor is never overstated (2.96 reads 2.9), and without a trailing `.0`.
 pub(crate) fn contrast_figure(ratio: f64) -> String {
     let tenths = (ratio * 10.0).floor() / 10.0;
     if tenths.fract() == 0.0 {
@@ -472,12 +418,7 @@ pub(crate) fn contrast_figure(ratio: f64) -> String {
     }
 }
 
-/// Every theme the catalog can draw, as chooser rows, in chooser order:
-/// the signature themes (registry order), then every other built-in, Default
-/// included (registry order), then the person's own theme files that loaded,
-/// by name, then the community pack's themes the folder has no file for
-/// (by id). Built from the parsed catalog and the embedded pack: no file is
-/// read.
+/// Every theme the catalog can draw, as chooser rows, in chooser order.
 pub(crate) fn showcase_cards(themes: &crate::app_config::ThemeCatalog) -> Vec<ShowcaseCard> {
     let builtins = aterm_types::scheme::builtin_theme_list();
     let mut cards = Vec::with_capacity(builtins.len() + 8);
@@ -522,8 +463,6 @@ pub(crate) fn showcase_cards(themes: &crate::app_config::ThemeCatalog) -> Vec<Sh
             .then_with(|| a.id.cmp(&b.id))
     });
     cards.extend(yours);
-    // Then every pack theme the folder has no file for at all: a file that
-    // did not load keeps its Needs-attention row instead of a card here.
     for (theme, parsed) in aterm_theme_pack::themes().iter().zip(parsed_pack()) {
         if themes.lists(theme.id) {
             continue;
@@ -542,7 +481,6 @@ pub(crate) fn showcase_cards(themes: &crate::app_config::ThemeCatalog) -> Vec<Sh
             .with_typography(&parsed.typography, parsed.skipped_count > 0),
         );
     }
-    // Slugs last, over the final order, so a collision's suffix is stable.
     let mut seen = std::collections::BTreeSet::new();
     for card in &mut cards {
         let base = slug_of(&card.id);
@@ -559,8 +497,7 @@ pub(crate) fn showcase_cards(themes: &crate::app_config::ThemeCatalog) -> Vec<Sh
 
 /// Every pack theme parsed, in [`aterm_theme_pack::themes`]'s order, once per
 /// process: the pack is embedded, so every Settings view built over it
-/// ([`showcase_cards`]) would parse the same text into the same themes. `None`
-/// for a pack file that does not parse.
+/// ([`showcase_cards`]) would parse the same text into the same themes.
 fn parsed_pack() -> &'static [Option<aterm_types::scheme::ParsedTheme>] {
     static PARSED: std::sync::OnceLock<Box<[Option<aterm_types::scheme::ParsedTheme>]>> =
         std::sync::OnceLock::new();
@@ -572,8 +509,7 @@ fn parsed_pack() -> &'static [Option<aterm_types::scheme::ParsedTheme>] {
     })
 }
 
-/// The slab's size: wide ("Aa" and four hues), and narrow ("Aa" and two;
-/// a chooser under 240pt).
+/// The slab's size.
 pub(crate) const SLAB_WIDTH: f32 = 56.0;
 pub(crate) const SLAB_NARROW_WIDTH: f32 = 40.0;
 pub(crate) const SLAB_HEIGHT: f32 = 20.0;
@@ -601,11 +537,7 @@ fn parse_slab(value: &str) -> Option<SlabColors> {
     })
 }
 
-/// Paint one row's slab into `rect`: the theme's background with a hairline
-/// rim (so a background equal to the panel still reads as an object), "Aa"
-/// in its foreground, and dots of its red, green, blue and magenta (two on a
-/// narrow slab). Panels and text only, from the slab's value; a malformed
-/// value paints nothing.
+/// Paint one row's slab into `rect`.
 pub(crate) fn paint_row_slab(
     prims: &mut Vec<DrawPrim>,
     rect: LogicalRect,
@@ -648,7 +580,6 @@ pub(crate) fn paint_row_slab(
     ));
     const DOT: f32 = 5.0;
     const DOT_GAP: f32 = 3.0;
-    // As many of the hues as fit beside "Aa" (two on the narrow slab).
     let words = crate::tray_raster::ui_text_width("Aa", px.get());
     let room = rect.width - 4.0 - words - 4.0 - 4.0;
     let fit = (((room + DOT_GAP) / (DOT + DOT_GAP)).floor().max(0.0) as usize)
@@ -677,9 +608,7 @@ mod tests {
     /// A NEEDS ATTENTION ROW SAYS WHERE, THEN WHAT, IN A ROW'S FEW WORDS: each
     /// way the parser refuses a theme file reads as its line, its key and the
     /// trouble, never the parser's preamble; another terminal's theme says
-    /// Import converts it, then its format. The reasons come from the parser
-    /// itself, so a change to its words shows here. Negative control: a
-    /// reason the summary has no words for keeps its own, after its line.
+    /// Import converts it, then its format.
     #[test]
     fn a_load_failure_reads_as_its_line_and_key() {
         let dir = aterm_tempfile::tempdir().expect("a themes folder");
@@ -800,8 +729,6 @@ mod tests {
             );
             assert!(slugs.insert(card.slug.clone()), "duplicate {}", card.slug);
         }
-        // Every built-in is in the chooser exactly once, and after them,
-        // every pack theme the folder has no file for.
         assert_eq!(
             cards
                 .iter()
@@ -842,9 +769,7 @@ mod tests {
 
     /// The slab paints the row's own colours: its background fills the slab,
     /// "Aa" is inked in its foreground, and its four hues are dots — for
-    /// three themes of different looks. A card with foreground and
-    /// background swapped paints the other way round (the negative control:
-    /// the audit tells the two apart), and a malformed value paints nothing.
+    /// three themes of different looks.
     #[test]
     fn the_row_slab_paints_the_cards_own_colours() {
         let cards = showcase_cards(&crate::app_config::ThemeCatalog::empty());

@@ -1,59 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance of `edit` tickets (`app_edit`) to
-//! `aterm_models_native::models_amacs_ticket::amacs_edit_ticket_model`
-//! (`AmacsEditTicket`, amacs design §4.9).
-//!
-//! A headless `App` serving `edit` is driven through the shipping seams: the
-//! request and its two-phase admission (`begin_edit`, or the in-flight seam
-//! and `complete_document_admission`), `await edit` and its withdrawal, the
-//! lazy orphan sweep, typing (`dispatch_native_event`), saves (a held save
-//! landed through `finish_native_document_save`), closes of a whole tab
-//! (`close_active_native_tab`, refused while a dirty view's save is in flight)
-//! and of one leaf of a split tab (`close_focused_mixed_leaf`, which waits in
-//! the close protocol for `checkpoint_ack`), both reaching
-//! `remove_view_link`, the person's own open of the file, `cancel_edit`, and
-//! the person's done and abort (`finish-edit`, `abort-edit`, dispatched as the
-//! keys' commands to the Editor, which asks the host to finish or abort). After
-//! each step [`Rig::project`] reads the real state onto the model's variables and the step is checked as the named chain of model
-//! actions (a seam that does several things at once, such as a save landing
-//! and the close it held then retiring the view, is a chain), and every
-//! invariant is evaluated on the state reached.
-//!
-//! Projection: `state` from the ticket's place in `EditTickets` (admitting,
-//! open, orphaned, in the resolved ring, or gone without an outcome);
-//! `view`/`other` from whether the ticket's view and the person's own view are
-//! still linked; `head`/`durable` from the document store's sequence and
-//! durable checkpoint, relative to the checkpoint the document opened with;
-//! `start` from the ticket's open phase; `closing` from the close protocol's
-//! pending close (a refused whole-tab close requests nothing); `waiter` from the parked waiters; `outcomes` from the ring;
-//! `answered` from what the rig's own `await edit` channels received; and
-//! `saved`/`answer_seq`/`result` from the recorded outcome. `close_seq` is the
-//! head the rig saw when it asked for the close (the model's `RequestClose`
-//! sets it to the head, deterministically). Once the store no longer has the
-//! document, the last numbers read stand. `finishing`/`aborting` from what the
-//! person pressed in the ticket's view (`EditTickets::endings`), `finish_seq`
-//! from that press's sequence (the head the rig saw when it pressed, once the
-//! press has retired); `writes` counts the steps, begun with the ticket's view
-//! open, after which the file on disk is no longer the file it was (its bytes
-//! or its identity: a save renames a new file in), and `abort_writes` is that
-//! count when abort was pressed. `foreign` from the open ticket's
-//! `foreign_at` against the durable checkpoint (0 once it has resolved), and
-//! `lost` is the rig's: an abort pressed while `foreign` was 1 after which
-//! the document's text moved (a discard).
-//!
-//! NEGATIVE CONTROLS: the same real run with the ticket resolved while its
-//! dirty close still waits for `checkpoint_ack` (the shape the model's
-//! `AnswerAtRequest`, `Buggy = 1`, allows) projects to a step the model
-//! rejects and a state that breaks `WaiterAnsweredOnlyAfterViewGone`; the
-//! model's own answer-before-ack successor breaks `SavedOnlyWhenAcked` too.
-//! An abort rigged to save the buffer instead of discarding it (`AbortSaves`,
-//! `Buggy = 5`) projects to a step the model rejects and a state that breaks
-//! `AbortNeverAdvancesCheckpoint`. An abort rigged to discard while the
-//! person's own view holds unsaved text (`AbortDiscardsOthersText`,
-//! `Buggy = 7`) projects to a step the model rejects and a state that breaks
-//! `AbortKeepsOthersText`.
+//! Conformance tests for `edit` tickets against `amacs_edit_ticket_model` ([`Rig::project`]).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -460,9 +408,7 @@ impl Rig {
         self.step("select a tab", &[]);
     }
 
-    /// Close the ticket's view's tab. A close that was requested (it closed, or
-    /// it waits for its checkpoint) froze the head as the model's `close_seq`;
-    /// a refused one requested nothing.
+    /// Close the ticket's view's tab.
     fn close_edit_view(&mut self, actions: &[&str]) -> Result<(), String> {
         self.front(self.edit_view.expect("the ticket's view"));
         let head = self.state["head"];
@@ -501,9 +447,7 @@ impl Rig {
         closed
     }
 
-    /// The person presses done (C-c C-c) in the ticket's view. The press
-    /// froze the head as the model's `finish_seq`, and a close it led to the
-    /// head then as `close_seq` (a save made the head no newer).
+    /// The person presses done (C-c C-c) in the ticket's view.
     fn finish(&mut self, actions: &[&str]) {
         let head = self.state["head"];
         self.finish_seq = head;
@@ -512,12 +456,7 @@ impl Rig {
         self.step("done (C-c C-c)", actions);
     }
 
-    /// The person presses abort (C-c C-k) in the ticket's view. Its discard
-    /// moved the head on only when the buffer was dirty and held no text the
-    /// edit did not type; the close it then asks for freezes the head the
-    /// discard left. A refused abort (nobody waits, a save is landing, or
-    /// nothing would keep the person's text) changes nothing, `abort_writes`
-    /// included.
+    /// The person presses abort (C-c C-k) in the ticket's view.
     fn abort(&mut self, actions: &[&str]) {
         let dirty = self.state["durable"] < self.state["head"];
         let foreign = self.state["foreign"] == 1;
@@ -589,8 +528,7 @@ impl Rig {
         self.step("the caller's tab in front", &[]);
     }
 
-    /// Another program writes the file. aterm wrote nothing, so the rig
-    /// counts no write.
+    /// Another program writes the file.
     fn write_externally(&mut self, bytes: &[u8]) {
         std::fs::write(&self.path, bytes).unwrap();
         self.file = read_file(&self.path);
@@ -681,8 +619,7 @@ fn broken_invariants(model: &Model, state: &State) -> BTreeSet<&'static str> {
 }
 
 /// A dirty leaf's close waits in the close protocol for its save; the outcome
-/// comes once the save is durable, and the waiter hears it then. Also the
-/// in-flight admission and the late waiter that reads the ring.
+/// comes once the save is durable, and the waiter hears it then.
 fn dirty_close_after_its_ack() {
     let mut rig = Rig::new("dirty");
     let admission = rig.edit_in_flight();
@@ -745,8 +682,6 @@ fn orphan_and_adopt() {
     let mut rig = Rig::new("orphan");
     rig.edit();
     let waiter = rig.wait(&["Await"]);
-    // The clock is the rig's: the withdrawal starts it at `now`, so no wall
-    // time between these steps can orphan the ticket early.
     let now = Instant::now();
     rig.app.withdraw_edit_waiter_at(waiter, now);
     rig.step("the waiter hangs up", &["Withdraw"]);
@@ -784,8 +719,6 @@ fn the_persons_view_never_answers() {
     rig.app.close_active_native_tab(rig.wid).unwrap();
     rig.step("the person closes their view", &["PersonCloses"]);
     assert_eq!(rig.state["answered"], 0);
-    // The control: an implementation that answered here is `Buggy = 4`, whose
-    // successor breaks the law the real step kept.
     let buggy = interp::with_buggy(&rig.model, 4);
     let answered_early = buggy.successors("PersonCloses", &before);
     assert!(!answered_early.contains(&rig.state));
@@ -821,9 +754,6 @@ fn refuse_and_cancel() {
 
 /// The `edit` gives up just as its view opens (the cancel-after-admit race:
 /// its deadline or a hangup, with the install already on the main thread).
-/// Nobody learned the ticket, so it is orphaned at once and keeps its view; a
-/// waiter that found it first by `uri=` holds it, and the cancel changes
-/// nothing.
 fn cancel_after_the_view_opened() {
     let mut rig = Rig::new("cancel-open");
     let admission = rig.edit_in_flight();
@@ -860,7 +790,6 @@ fn answer_before_ack_is_caught() {
     assert!(rig.close_edit_leaf(&["RequestClose"]).is_err());
     let before = rig.state.clone();
 
-    // The model's own answer-before-ack successor breaks both laws.
     let buggy = interp::with_buggy(&rig.model, 1);
     let early = buggy.successors("AnswerAtRequest", &before);
     assert!(!early.is_empty(), "Buggy = 1 can answer here");
@@ -872,7 +801,6 @@ fn answer_before_ack_is_caught() {
         );
     }
 
-    // The rigged implementation: resolve now, before the save lands.
     rig.app.resolve_edit(rig.ticket.unwrap(), None);
     rig.settle();
     let rigged = rig.project();
@@ -938,9 +866,6 @@ fn finish_waits_for_its_save() {
         (2, 0, 0)
     );
 
-    // With the person's own view of the file open, done saves too: the
-    // close of a view that is not the document's last forces no save, so
-    // finish is what makes it durable.
     let mut rig = Rig::new("finish-shared");
     let uri = rig.uri.clone();
     rig.app.open_document_tab(AppKind::Editor, &uri).unwrap();
@@ -961,9 +886,7 @@ fn finish_waits_for_its_save() {
 
 /// Abort discards the buffer's changes, writing nothing, and closes: the
 /// ticket answers `aborted saved=0` and the file is as the last save left
-/// it. An orphan's abort is refused: nobody would hear it, so nothing is
-/// discarded (a stutter; the model allows an orphan's abort, which the
-/// implementation never takes).
+/// it.
 fn abort_discards_and_writes_nothing() {
     let mut rig = Rig::new("abort");
     rig.edit();
@@ -981,7 +904,6 @@ fn abort_discards_and_writes_nothing() {
     );
     assert_eq!(std::fs::read_to_string(&rig.path).unwrap(), "base\n");
 
-    // A save the person made before the abort stays; what came after goes.
     let mut rig = Rig::new("abort-after-save");
     rig.edit();
     rig.wait(&["Await"]);
@@ -1014,7 +936,6 @@ fn abort_discards_and_writes_nothing() {
         (3, 1, 0),
         "refused: the view and its text stay"
     );
-    // Its done still saves and closes, recorded for a waiter yet to come.
     rig.finish(&["Finish", "SaveAck", "RequestClose", "Retire"]);
     assert_eq!((rig.state["result"], rig.state["saved"]), (2, 1));
 }
@@ -1030,7 +951,6 @@ fn abort_that_saves_is_caught() {
     rig.abort_writes = rig.state["writes"];
     let view = rig.edit_view.unwrap();
     let document = rig.document.unwrap();
-    // The rigged implementation: abort recorded, then a save, then the close.
     rig.app
         .native_documents
         .edits
@@ -1059,7 +979,6 @@ fn abort_that_saves_is_caught() {
         broken_invariants(&rig.model, &rigged).contains("AbortNeverAdvancesCheckpoint"),
         "{rigged:?} must break AbortNeverAdvancesCheckpoint"
     );
-    // It is the mutant's run: `Buggy = 5` reaches exactly this state.
     let buggy = interp::with_buggy(&rig.model, 5);
     assert!(chain_admits(
         &buggy,
@@ -1069,13 +988,7 @@ fn abort_that_saves_is_caught() {
     ));
 }
 
-/// Done whose save does not land stops finishing (`FinishHalts`). Done is
-/// pressed behind a save in flight, so its own save queues; an abort pressed
-/// then is refused and leaves the done finishing. The save in flight finds
-/// the file changed on disk: the view stays, its status gives the save's own
-/// words (not the "Saving, then closing" it showed), and nothing answers. A
-/// second done is refused at once, the conflict blocking its save, and an
-/// abort then discards to the file's new text and closes, writing nothing.
+/// Done whose save does not land stops finishing (`FinishHalts`).
 fn finish_halts_when_its_save_does_not_land() {
     let mut rig = Rig::new("finish-halts");
     rig.edit();
@@ -1129,13 +1042,7 @@ fn finish_halts_when_its_save_does_not_land() {
     assert_eq!(std::fs::read_to_string(&rig.path).unwrap(), "theirs\n");
 }
 
-/// Abort throws away only what the edit typed. With the person's own view
-/// of the file clean, the discard reverts that view too. When the document
-/// holds unsaved text the edit did not type (it was dirty when the edit
-/// opened, or the person typed in their view since), abort closes only the
-/// ticket's view, which forces no save, and the person's view keeps every
-/// unsaved change. With no other view left to keep it, abort is refused, and
-/// done saves it.
+/// Abort throws away only what the edit typed.
 fn abort_keeps_text_it_did_not_type() {
     let mut rig = Rig::new("abort-shared-clean");
     rig.person_opens();
@@ -1224,8 +1131,6 @@ fn abort_that_discards_others_text_is_caught() {
     rig.abort_writes = rig.state["writes"];
     let view = rig.edit_view.unwrap();
     let document = rig.document.unwrap();
-    // The rigged implementation: abort recorded, the document discarded,
-    // then the close.
     rig.app
         .native_documents
         .edits
@@ -1257,7 +1162,6 @@ fn abort_that_discards_others_text_is_caught() {
         broken_invariants(&rig.model, &rigged).contains("AbortKeepsOthersText"),
         "{rigged:?} must break AbortKeepsOthersText"
     );
-    // It is the mutant's run: `Buggy = 7` reaches exactly this state.
     let buggy = interp::with_buggy(&rig.model, 7);
     assert!(chain_admits(
         &buggy,

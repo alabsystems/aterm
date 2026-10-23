@@ -74,6 +74,7 @@ impl Chosen {
 }
 
 /// The options a question answers with ([`answer_question`]'s "Which
+/// option"): every `Label` one, else every `Wrapped` one, else option 1.
 fn recommended(options: &[QuestionOption]) -> (Vec<u8>, Chosen) {
     let label: Vec<u8> = options
         .iter()
@@ -228,15 +229,21 @@ pub fn wrapped_rows(text: &str, width: usize) -> Option<usize> {
 }
 
 /// How much narrower than the pane, past the label column, a typed text is
+/// estimated to wrap: the focused field wraps one or two cells short of the
+/// pane's edge, so four keeps the estimate at or above the rows drawn.
 const WRAP_MARGIN: usize = 4;
 
 /// Why a tab is answered with its recommended option under a text priority
+/// when [`text_fits`] says the text would not fit its pane.
 const FIT: &str = "the answer would not fit the pane";
 
 /// The same, on a later read of a tab the loop began that way
+/// ([`choose_text`]: a fallback begun is kept to).
 const FIT_KEPT: &str = "the answer would not fit the pane when this tab was begun";
 
 /// Why a multi-select tab is answered with its recommended option under a
+/// text priority when [`text_keeps_its_rows`] says the dialog would draw its
+/// button over the text once the focus left the text's row.
 const OVERDRAWN: &str = "the answer would not fit the pane: the dialog would draw its button over \
                          the text's last row once the focus left it";
 
@@ -284,12 +291,19 @@ pub fn text_fits(
 }
 
 /// The cells of a multi-select free-text row's checkbox as Claude Code draws
+/// it, `[ ] ` or `[✔] ` with the space after the box: its basis in the row's
+/// layout ([`unfocused_row`]).
 const CHECKBOX_CELLS: usize = 4;
 
 /// The cells left of a select row's number: the pointer column and the gap
+/// after it ([`unfocused_row`]).
 const POINTER_CELLS: usize = 2;
 
 /// The width of each row Claude Code's renderer wraps `text` onto in rows
+/// `width` cells wide (Ink's `wrap-ansi` with `trim: false`): greedily at
+/// single spaces; a row keeps the space before the word that went on to the
+/// next row (it counts in the row's width, drawn blank), and a row filled to
+/// its last cell leaves the next row starting with the space between.
 fn wrapped_widths(text: &str, width: usize) -> Option<Vec<usize>> {
     let mut rows = Vec::new();
     let mut line = 0usize;
@@ -368,6 +382,8 @@ pub fn text_keeps_its_rows(text: &str, cols: u16, label_col: usize) -> bool {
 }
 
 /// The destructive word a question with no recommended option names in its
+/// question, its labels or its descriptions, lowercased like the
+/// turn-end policy's own test.
 fn destructive(question: &QuestionText, options: &[QuestionOption]) -> Option<&'static str> {
     let mut text = question.text.to_lowercase();
     for o in options {
@@ -380,6 +396,8 @@ fn destructive(question: &QuestionText, options: &[QuestionOption]) -> Option<&'
 }
 
 /// Whether an option's label refuses what its question asks: `No` itself, or
+/// `No` then a separator (`No, keep it`, `No — leave it`, `No (skip)`), never
+/// a word that starts with it (`None of these`, `Not now`, `Now`).
 fn refuses(label: &str) -> bool {
     let l = label.trim().to_lowercase();
     l.strip_prefix("no")
@@ -387,6 +405,7 @@ fn refuses(label: &str) -> bool {
 }
 
 /// The one option that refuses a question that would `w`, naming no act
+/// itself, or why none can answer it.
 fn the_refusal<'a, T>(
     w: &str,
     options: &'a [T],
@@ -409,6 +428,11 @@ fn the_refusal<'a, T>(
 }
 
 /// Why the option labelled `label`, described `description`, is no answer
+/// the harness gives: its words say the answer is kept for every later ask
+/// ([`aterm_phase::prompt::settles_later`], label and description), or its
+/// whole label is a vendor's answer kept for good
+/// ([`aterm_phase::prompt::kept_answer`]; an agent's option that only holds
+/// one, `Enable selected suites`, is answered).
 fn kept(label: &str, description: &str) -> Option<String> {
     let said = if description.is_empty() {
         String::new()
@@ -431,6 +455,7 @@ fn refused(w: &str) -> String {
 }
 
 /// Why the focus note is appended to `unproven`: the focus was on a row the
+/// answer never chooses, and was moved off it first.
 fn moved_off(focus: QuestionFocus) -> Option<&'static str> {
     match focus {
         QuestionFocus::FreeText => Some("the focus was on the free-text row: moved off it first"),
@@ -551,6 +576,9 @@ pub fn answer_question(
 }
 
 /// The fallback said, spelled once: a tab answered by its recommended option
+/// under text word `word` because `why`: the subject `<subject> (recommended:
+/// <why>)` (what `CHOSE` and the ledger name) and the journal's `policy <word>:
+/// <why>: <how>`, where `subject` and `how` are the recommended path's own.
 fn said_fallback(subject: &str, word: &str, why: &str, how: &str) -> (String, String) {
     (
         format!("{subject} (recommended: {why})"),
@@ -587,6 +615,8 @@ pub(crate) fn fall_back_to(decision: Decision, priority: QuestionPriority, why: 
 }
 
 /// What a question's decider chose: the row its keys go to, whether the
+/// policy text is written there (`typed`: [`Answer::Type`]) or Enter is
+/// pressed on it, what the ledger names, and the journal's `unproven`.
 struct TextChosen {
     target: AnswerTarget,
     typed: bool,
@@ -595,6 +625,7 @@ struct TextChosen {
 }
 
 /// The policy text's decision on one tab (module header) under `priority`,
+/// whose fixed text is `text`, the loop remembering `own` in the field:
 fn choose_text(
     prompt: &PromptV2,
     dialog: &QuestionDialog,
@@ -754,6 +785,8 @@ fn choose_text(
 pub const NOTES_UNREAD: &str = "its notes field did not read open after Tab";
 
 /// The answer `None of the above` of a question read by its answers' roles
+/// (Muse Code's `muse.question.none`, the row [`Role::Other`] gives it): the
+/// one a note goes under.
 fn none_of_the_above(prompt: &PromptV2) -> Option<usize> {
     let none = aterm_phase::anchor("muse.question.none");
     prompt
@@ -763,11 +796,19 @@ fn none_of_the_above(prompt: &PromptV2) -> Option<usize> {
 }
 
 /// Muse Code's single question, by its key row (`muse.question.keys`, the one
+/// whose answers carry roles): its note is Muse Code's
+/// ([`aterm_phase::muse::question_notes`]), opened with Tab, and a note
+/// sends it to its review ([`review_answer`]).
 fn is_muse_question(prompt: &PromptV2) -> bool {
     prompt.footer.as_deref() == Some(aterm_phase::anchor("muse.question.keys"))
 }
 
 /// Why Muse Code's question is a person's by its key row (measured on
+/// 1.4.10): a call of several questions (`muse.question.keys_multi`) or a
+/// multi-select (`muse.question.keys_toggle`) is answered across screens —
+/// each question, then a review whose second row stops the turn — on which
+/// the loop cannot tell its own keys' answers from a person's (Left revisits
+/// an answered question with no mark of its answer).
 fn muses_persons_question(prompt: &PromptV2) -> Option<String> {
     let footer = prompt.footer.as_deref()?;
     let what = if footer == aterm_phase::anchor("muse.question.keys_multi") {
@@ -798,6 +839,13 @@ pub fn roles_question_notes(
 }
 
 /// MUSE CODE'S REVIEW ([`aterm_phase::muse::is_review`], measured on
+/// 1.4.10): a question answered `None of the above` with a note is shown
+/// once more before it is sent, `⟩ Submit answers` focused over `Interrupt
+/// turn`. Under a text word it is submitted — Enter on `Submit answers`,
+/// guarded on the review's key row (the head's clock ticks) — only while it
+/// holds ONE answer and that answer is exactly `<header>: None of the above;
+/// note: <the word's text>`, the text the loop remembers writing (`own`), with
+/// the cursor where Muse Code draws it.
 fn review_answer(
     prompt: &PromptV2,
     rows: &[String],
@@ -999,6 +1047,9 @@ pub fn note_step(
 }
 
 /// A question read by its answers' roles (Muse Code's) under a text priority
+/// (module header): the word's text as a note under `None of the above`
+/// ([`Choice::Note`], carried out one keystroke at a time by the loop on
+/// [`note_step`]).
 fn note_answer(
     prompt: &PromptV2,
     rows: &[String],
@@ -1073,10 +1124,12 @@ fn note_answer(
 }
 
 /// Why a question read by its answers' roles is a person's when none of its
+/// options was read as an answer ([`answer_by_role`], [`note_answer`]).
 const NOT_READ_WHOLE: &str =
     "a question aterm could not read whole: no dialog, and no answer to choose";
 
 /// A question read by its answers' roles, not as a dialog (agy's, Muse
+/// Code's): the answer marked `(Recommended)`, else the first.
 fn answer_by_role(prompt: &PromptV2, rows: &[String]) -> Decision {
     let answers: Vec<&aterm_phase::Opt> = prompt
         .options
@@ -1211,6 +1264,7 @@ fn stay_on_model(dialog: &QuestionDialog) -> Option<TextChosen> {
 }
 
 /// The row to press Enter on, what the ledger names, and the journal's
+/// `unproven` — or why the question is the person's.
 fn choose(dialog: &QuestionDialog) -> Result<(AnswerTarget, String, String), String> {
     let no_mark_that_would = |question: &QuestionText, options: &[QuestionOption]| {
         destructive(question, options).map(|w| {
@@ -1322,6 +1376,9 @@ fn choose(dialog: &QuestionDialog) -> Result<(AnswerTarget, String, String), Str
 }
 
 /// A single-select or preview question's answer ([`choose`]): its
+/// recommended option (else its first), by number — or, unmarked and
+/// destructive, its one refusal — with what the ledger names and the
+/// journal's `unproven`.
 fn choose_one(
     question: &QuestionText,
     options: &[QuestionOption],
@@ -1351,6 +1408,8 @@ fn choose_one(
 }
 
 /// A review's questions still unanswered, as its answer names them (their
+/// headers, else `the headers not read`) — `None` when every one is
+/// answered.
 fn review_open(dialog: &QuestionDialog, unanswered: bool) -> Option<String> {
     let open: Vec<&str> = dialog
         .tabs

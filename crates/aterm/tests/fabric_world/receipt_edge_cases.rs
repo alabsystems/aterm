@@ -1,29 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **Receipts and deadlines at their edges.**
-//!
-//! Every count is records on the BUS, read with `Fetch` — the log is the
-//! authority, not the endpoint's ring — on the whole path (a guarded broker, a
-//! headless `aterm`, and the real `aterm link serve` child it launches):
-//!
-//! * A RECEIPT IS NOT LOST (X1, X1b). A verdict given while the broker is
-//!   down, or while the bridge is being replaced
-//!   reaches the sender exactly once: it is OWED at the endpoint, on the
-//!   `outbox` peek, until the bridge retires it.
-//! * `truncated=1` BECOMES FETCHABLE (X2): `inbox get @<off>` of a row the
-//!   delivery cut returns the whole body, from the ring's slot and after the
-//!   ring let the row go.
-//! * A REPLY TO SOMEBODY ELSE DOES NOT CANCEL MY `expired` (X3, and the same
-//!   defect reached by a stranger's publish).
-//! * A KEYED `ask` DEDUPED ONTO AN EARLIER `note` RECORDS NO `expired` (X4).
-//! * `post --wait-ack` BOUNDED BY `dl=` ANSWERS `ERR expired` (X5).
-//! * AN OVERSIZE RECORD'S FETCH IS ANSWERED ONCE, PROMPTLY, `truncated=1`
-//!   (the privacy/load pass's D1), not re-fetched every drain.
-//!
-//! Every wait is `until <observable state>`, bounded by the harness deadline,
-//! and every count of something that must NOT have happened is read behind an
-//! ordering barrier that must come after it.
+//! **Receipts and deadlines at their edges.** Every count is records on the BUS, read with `Fetch`.
 
 #![cfg(unix)]
 
@@ -66,18 +44,12 @@ fn lane_re(w: &World, lane: &str, off: u64) -> usize {
 
 /// Poll `f` for the fair wait, the harness's minute; `None` when it never
 /// answered (NOT a panic) — for the counts that must be read after a fair wait
-/// whatever they are. Each wait is for a record that must land (an ack, an
-/// `expired`), returns the moment it does, and is read by an assertion that
-/// fails if it never did — so it is a hang detector, and the ten seconds it was
-/// (which included up to a 5 s `RECONNECT_MAX` back-off) read a loaded machine
-/// as a lost record.
+/// whatever they are.
 fn poll<T>(f: impl FnMut() -> Option<T>) -> Option<T> {
     aterm_spec::wait::within(DEADLINE, Duration::from_millis(50), f)
 }
 
-/// X1. A RECEIPT GIVEN WHILE THE LINK IS DOWN IS ACKED ONCE WHEN IT RETURNS —
-/// and the exactly-once re-post under `ERR fabric stalled queued=1` and a
-/// broker restart still holds.
+/// X1.
 #[test]
 fn x1_receipt_given_while_the_link_is_down_is_not_lost() {
     let mut w = World::boot_flags("rvx1", &["--receipts"]);
@@ -95,11 +67,9 @@ fn x1_receipt_given_while_the_link_is_down_is_not_lost() {
 
     w.stop_broker();
 
-    // B decides while the link is down.
     let seen = w.verb(&format!("@{b} inbox seen {id} handled"));
     assert!(seen.ok(), "inbox seen: {}", seen.header());
 
-    // A re-posts under one key on the stalled fabric (must be ONE record).
     let p1 = w.verb(&format!(
         "@{a} post to=@{b} kind=note key=k-stall --wait=5000 stalled-once"
     ));
@@ -121,8 +91,6 @@ fn x1_receipt_given_while_the_link_is_down_is_not_lost() {
     let notes = lane_len(&w, &note_lane);
 
     let _ = poll(|| (lane_len(&w, &ack_lane) > 0).then_some(()));
-    // Saying the same word again must not ack twice: counted after a drain
-    // that came after it (`World::drained`).
     let again = w.verb(&format!("@{b} inbox seen {id} handled"));
     assert!(again.ok());
     w.drained(&b);
@@ -143,9 +111,7 @@ fn x1_receipt_given_while_the_link_is_down_is_not_lost() {
     );
 }
 
-/// X1b. A RECEIPT GIVEN WHILE THE BRIDGE IS BEING REPLACED IS ACKED BY ITS
-/// REPLACEMENT. The dead bridge never saw the event and the new one subscribes
-/// with no replay: `after relaunch=0 after same-word re-seen=0`.
+/// X1b.
 #[test]
 fn x1b_receipt_given_while_the_bridge_restarts_is_not_lost() {
     let w = World::boot_flags("rvx1b", &["--receipts"]);
@@ -181,8 +147,6 @@ fn x1b_receipt_given_while_the_bridge_restarts_is_not_lost() {
     let acks = lane_len(&w, &ack_lane);
     let again = w.verb(&format!("@{b} inbox seen {id} handled"));
     assert!(again.ok());
-    // The barrier also orders the pin check below: the replacement retired the
-    // receipt (and forgot its pin) in a drain before the one that lands this.
     w.drained(&b);
     let acks_after = lane_len(&w, &ack_lane);
     eprintln!(
@@ -193,17 +157,13 @@ fn x1b_receipt_given_while_the_bridge_restarts_is_not_lost() {
         (1, 1),
         "a verdict given while the bridge was being replaced is acked once by its replacement"
     );
-    // And nothing is left owed: the receipt was retired, so no later drain
-    // publishes it again and the bridge holds no pin for it.
     let pins = std::fs::read_dir(w.state.join("acks"))
         .map(|d| d.count())
         .unwrap_or(0);
     assert_eq!(pins, 0, "the pinned sequence is forgotten at retirement");
 }
 
-/// X2. `truncated=1` IS FETCHABLE WHOLE BY OFFSET: the bus holds the full body,
-/// and `inbox get @<off>` returns all of it — while the ring still holds the cut
-/// row, and after the ring let it go.
+/// X2.
 #[test]
 fn x2_a_truncated_body_is_fetchable_whole_by_offset() {
     let w = World::boot("rvx2", &[]);
@@ -212,7 +172,6 @@ fn x2_a_truncated_body_is_fetchable_whole_by_offset() {
     let mut text = "x ".repeat(19_999);
     text.push('x');
     assert_eq!(text.len(), 39_999);
-    // THE FRAME FORM (`len=`): the endpoint accepts up to BODY_MAX (256 KiB).
     let r = w
         .ctl()
         .request_with_body(
@@ -225,7 +184,6 @@ fn x2_a_truncated_body_is_fetchable_whole_by_offset() {
         .expect("post frame");
     assert!(r.ok(), "post: {}", r.header());
     let off = off_of(r.header());
-    // BUS TRUTH: one record, the whole body.
     let lane = format!("/f/{FLEET}/in/{}/{b}/{}/note", w.node, w.node);
     let rows = lane_rows(&w, &lane);
     assert_eq!(rows.len(), 1);
@@ -252,7 +210,6 @@ fn x2_a_truncated_body_is_fetchable_whole_by_offset() {
     assert!(!ring.header().contains("truncated=1"), "{}", ring.header());
     assert_eq!(ring.body(), text.as_bytes(), "whole, byte for byte");
 
-    // Push it out of the ring so the read MUST go to the log.
     const SRCS: u64 = 16;
     {
         let mut seq = [0u64; SRCS as usize];
@@ -282,7 +239,6 @@ fn x2_a_truncated_body_is_fetchable_whole_by_offset() {
         bus.body().len()
     );
 
-    // A row beyond head is `ERR no such record`, promptly.
     let head = {
         let mut c = w.god();
         let (_, (_, head)) = c.fetch(0, &format!("/f/{FLEET}/in/>"), 0).expect("head");
@@ -304,17 +260,7 @@ fn x2_a_truncated_body_is_fetchable_whole_by_offset() {
     );
 }
 
-/// X3. A REPLY ADDRESSED TO SOMEBODY ELSE DOES NOT CANCEL MY `expired`. A asks
-/// B twice; B answers X — to C. Y (no reply anywhere) is the control that proves
-/// the sweep ran.
-///
-/// THE DEADLINES ARE NEVER WAITED OUT. The bridge's `expire-deadlines-at-once`
-/// fault collapses the wait once the test writes its marker, and the test writes
-/// it only after the misrouted answer has been delivered to C — so the order the
-/// bug needs (a delivery that could wrongly settle X, then the sweep) is held by
-/// the test, not by a clock the load can stretch. The marker is the ONLY thing
-/// that can start the sweep, and the test asserts that rather than assuming it:
-/// a seam that sweeps without the marker would let the bug pass unseen.
+/// X3.
 #[test]
 fn x3_a_reply_to_another_session_does_not_cancel_my_expired() {
     let w = World::boot_with(
@@ -337,13 +283,6 @@ fn x3_a_reply_to_another_session_does_not_cancel_my_expired() {
     let expired_lane = format!("/f/{FLEET}/in/{}/{a}/{}/expired", w.node, w.node);
     let a_lane = format!("/f/{FLEET}/in/{}/{a}/>", w.node);
 
-    // The scenario must land before the deadline: two asks, a misrouted answer
-    // and its delivery through the bridge and broker, each post waiting on the
-    // bus ack. At 4 s against a 3.5 s precondition that was a race the bridge and
-    // broker could lose on a loaded machine, failing the test on a correct
-    // tree; 10 s and then 30 s only moved the race. Nothing waits this one
-    // out — the marker below fires it — so it is the hang detector's ten
-    // minutes and the race is gone.
     const DL_MS: u64 = 600_000;
     let x = off_of(
         w.verb(&format!(
@@ -357,7 +296,6 @@ fn x3_a_reply_to_another_session_does_not_cancel_my_expired() {
         ))
         .header(),
     );
-    // B answers X — but to C, not to A.
     let ans = w.verb(&format!(
         "@{b} post to=@{c} kind=answer re={x} --wait=60000 misrouted"
     ));
@@ -368,18 +306,11 @@ fn x3_a_reply_to_another_session_does_not_cancel_my_expired() {
             .any(|r| r.contains("text=misrouted"))
             .then_some(())
     });
-    // THE ORDER THE BUG NEEDS, PINNED: the delivery (which is where a wrongly
-    // settled X would be forgotten) came BEFORE any sweep. A seam that ignored
-    // its marker would sweep from the first loop turn, and this test would then
-    // pass with the X3 bug present; an `expired` on either ask here is that.
     assert_eq!(
         (lane_re(&w, &expired_lane, x), lane_re(&w, &expired_lane, y)),
         (0, 0),
         "no sweep may have run before the marker"
     );
-    // THE DELIVERY IS BEHIND US, so the sweep may run now: both asks are past
-    // their deadline as far as the bridge is concerned, and nothing else about
-    // the sweep changes.
     std::fs::write(w.state.join("expire-deadlines-now"), b"1\n")
         .expect("arm the impatient deadline sweep");
     until_within(PERIODIC_DEADLINE, "expired re=Y on A's lane", || {
@@ -397,7 +328,6 @@ fn x3_a_reply_to_another_session_does_not_cancel_my_expired() {
         expired_x, 1,
         "A's ask X was answered to someone else, so A's bridge owes one `expired`"
     );
-    // And C's row for the misrouted answer is not `late=1`: C asked nothing.
     let row = w
         .inbox(&c)
         .into_iter()
@@ -408,12 +338,6 @@ fn x3_a_reply_to_another_session_does_not_cancel_my_expired() {
 
 /// X3, reached by a stranger: an `answer re=<X>` published onto B's lane (not
 /// A's) settles nothing of A's.
-///
-/// THE DEADLINE IS NEVER WAITED OUT, as in X3: the scenario runs under one the
-/// hang detector outlasts, and the `expire-deadlines-at-once` marker, written
-/// once the stranger's answer is at B, fires the sweep. A real `dl=2000` both
-/// cost the test its two seconds and raced the answer's delivery: an answer
-/// landing after the sweep tests nothing.
 #[test]
 fn a_strangers_reply_to_someone_else_does_not_settle_the_askers_deadline() {
     const DL_MS: u64 = 600_000;
@@ -444,8 +368,6 @@ fn a_strangers_reply_to_someone_else_does_not_settle_the_askers_deadline() {
         )
         .expect("answer to B");
     until("the stranger's answer at B", || id_at_off(&w, &b, ans));
-    // THE ORDER THE BUG NEEDS, PINNED: the answer was delivered before any
-    // sweep could judge X.
     assert_eq!(
         lane_re(&w, &expired_lane, x),
         0,
@@ -459,10 +381,6 @@ fn a_strangers_reply_to_someone_else_does_not_settle_the_askers_deadline() {
             .find(|r| kv(r, "kind") == Some("expired") && kv(r, "re") == Some(&x.to_string()))
     });
     eprintln!("A's expired row: {expired}");
-    // AND ONLY ONE, counted behind a barrier rather than a pause: a second ask
-    // expires in a later sweep, every sweep judges its due deadlines in offset
-    // order, and A's inbox is delivered in offset order — so once the second
-    // ask's `expired` is in A's inbox, a repeat for X would be there before it.
     let y = off_of(
         w.verb(&format!(
             "@{a} post to=@{b} kind=ask dl={DL_MS} --wait=60000 barrier"
@@ -485,8 +403,7 @@ fn a_strangers_reply_to_someone_else_does_not_settle_the_askers_deadline() {
     );
 }
 
-/// X4. AN `ask dl=` DEDUPED ONTO A `note` UNDER THE SAME KEY RECORDS NO
-/// `expired`: the re-post appended nothing, so there is no ask to expire.
+/// X4.
 #[test]
 fn x4_an_ask_deduped_onto_a_note_records_no_expired() {
     let w = World::boot("rvx4", &[]);
@@ -505,17 +422,12 @@ fn x4_an_ask_deduped_onto_a_note_records_no_expired() {
         "{}",
         ask.header()
     );
-    // The control: an un-keyed ask with the same `dl=` DOES expire, which is
-    // what proves the sweep ran in the window the note is judged in.
     let y = off_of(
         w.verb(&format!(
             "@{a} post to=@{b} kind=ask dl=300 --wait=60000 control"
         ))
         .header(),
     );
-    // The control is also the BARRIER: its deadline is due no earlier than
-    // anything held for X's, and a sweep judges due deadlines in offset order
-    // (X < Y), so a wrong `expired re=X` is on the lane before Y's.
     until_within(PERIODIC_DEADLINE, "the control ask to expire", || {
         (lane_re(&w, &expired_lane, y) == 1).then_some(())
     });
@@ -531,23 +443,12 @@ fn x4_an_ask_deduped_onto_a_note_records_no_expired() {
     );
 }
 
-/// X5. `post --wait-ack` with `dl=` and no receipt answers `ERR expired` when
-/// the deadline passes first. (The privacy/load pass reached the
-/// same defect with `dl=1500`.) And an ack to a node that is not here is still
-/// queued on the bus.
+/// X5.
 #[test]
 fn x5_wait_ack_past_its_deadline_answers_expired() {
     let w = World::boot_flags("rvx5", &["--receipts"]);
     w.wait_ready();
     let (a, b) = w.two_sessions();
-    // THE TWO DEADLINES RUN AT ONCE, each post on its own control connection:
-    // both are real wall-clock `dl=`s (the bound under test is the endpoint's
-    // `dl=` plus grace), so in sequence the test sat out their sum.
-    //
-    // AND EACH WAIT IS RELEASED BY ITS OWN VERDICT. Two waits parked on A's
-    // endpoint at once are a case the sequence never had: the first `expired`
-    // must not answer the second. So at the moment of each answer, A's inbox
-    // holds an `expired` naming THAT post's offset — the row the wait matched.
     let answers: Vec<(String, bool)> = std::thread::scope(|scope| {
         let posts: Vec<_> = [700u64, 1500]
             .into_iter()
@@ -578,8 +479,6 @@ fn x5_wait_ack_past_its_deadline_answers_expired() {
             .map(|post| post.join().expect("a --wait-ack post"))
             .collect()
     });
-    // A verdict given to a node that is not here: the ack is still queued on
-    // the bus.
     {
         let mut c = w.god();
         let src = "n-00000000000000aa";
@@ -644,9 +543,6 @@ fn an_oversize_record_fetch_is_answered_once_truncated() {
         r.header()
     );
     assert!(r.ok(), "{}", r.header());
-    // The re-fetch loop is told by `r.ok()` (it ended `ERR timeout`) and by
-    // `refused`; the clock is only the harness's DEADLINE, a minute's hang
-    // detector (AGENTS.md), never a latency budget.
     assert!(took < DEADLINE, "promptly: {took:?}");
     assert_eq!(refused, 0, "the endpoint takes the answer the first time");
     assert!(

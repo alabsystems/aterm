@@ -147,12 +147,12 @@ impl InitialSetupAuthorization {
     }
 
     /// The revision from the same coherent observation that bound this ticket.
-    pub fn revision(&self) -> u64 {
+    pub const fn revision(&self) -> u64 {
         self.revision
     }
 
     /// Whether this bound choice can still be persisted or confirmed.
-    pub fn pending(&self) -> bool {
+    pub const fn pending(&self) -> bool {
         !matches!(self.state, AuthorizationState::Ended)
     }
 

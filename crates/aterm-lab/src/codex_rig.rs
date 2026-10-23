@@ -1,32 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CODEX RIG: what a lab run of a REAL Codex in a private headless aterm
-//! needs (`codex-alab-proof`, [`crate::codex_alab_proof`]).
-//!
-//! * **The jail** ([`jail_policy`]): the instance runs under `sandbox-exec`
-//!   with all network denied but one loopback port, where the lab answers as
-//!   the model: no key, no account, no byte off the machine; and the owner's
-//!   homes fenced ([`home_guards`]): none of the protected list read or
-//!   written, and no write anywhere in them.
-//! * **The fake model** ([`serve`]): the Responses API on that port, every
-//!   request answered by the caller's [`Answer`] and logged one JSON object a
-//!   line (`t` its unix milliseconds, `tag` what the answer named it, `u` the
-//!   tail of its last user text, `tool_output`, `status`, `n` its input
-//!   items and `turn` the Codex turn it belongs to, [`request_marks`]: a
-//!   request sent again carries the same both, a second turn another turn and
-//!   more items; `said` the reply's text, [`said_of`], and `hold_ms` how long
-//!   the answer was held). A separate `.responses.log` `event=response_written` row, bound
-//!   by `request_id`, witnesses a successful full HTTP write and flush, not
-//!   that the client read it. Both events carry `mono_ms` from the run's
-//!   shared monotonic clock; response events have no `tag`, so request-only
-//!   readers remain request-only. With the item and
-//!   stream builders an answer is made of ([`message_item`], [`call_item`],
-//!   [`sse`]).
-//! * **The stand-ins**: `/bin/ps` is setuid, which the sandbox refuses to
-//!   exec, so a copy of the lab answers `ps` itself ([`ps_main`]), first on
-//!   the instance's `PATH` ([`stand_ins`]); `mcp-standin` is a do-nothing MCP
-//!   server ([`mcp_main`]).
+//! THE CODEX RIG: what a lab run of a REAL Codex in a private headless aterm needs.
 
 use std::io::{BufRead as _, Write as _};
 use std::net::{TcpListener, TcpStream};
@@ -36,11 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::pyjson::{J, PY};
 
-// ------------------------------------------------------------------ the jail
-
-/// The instance's `sandbox-exec` profile: only `localhost:<port>` (the fake
-/// model) is reachable over IP, and the regular lab's preferences channels
-/// are denied too. A scratch HOME does not move the UID account's daemons.
+/// The instance's `sandbox-exec` profile.
 #[must_use]
 pub fn jail_policy(port: u16) -> String {
     format!(
@@ -51,14 +22,7 @@ pub fn jail_policy(port: u16) -> String {
     )
 }
 
-/// The owner's homes fenced, for a profile that otherwise allows every file
-/// ([`jail_policy`]): in each of `homes` (every home the lab guards: the
-/// account's, whatever `HOME` says, and the caller's,
-/// [`crate::paths::Paths::guarded_homes`]) each entry of the lab jail's
-/// protected list ([`crate::protected::protected_paths`]: the agents' data,
-/// aterm's package store, keys, browser profiles) neither read nor written,
-/// each rule once, and no write anywhere in the home.
-///
+/// The owner's homes fenced, for a profile that otherwise allows every file ([`jail_policy`]).
 /// # Errors
 /// No home, or one that is not an absolute non-root path a profile can quote.
 pub fn home_guards(homes: &[String]) -> Result<String, String> {
@@ -83,10 +47,7 @@ pub fn home_guards(homes: &[String]) -> Result<String, String> {
     Ok(rules.concat())
 }
 
-/// Lay the stand-ins into `bin`: a copy of this program as `bin/aterm-lab`
-/// (the MCP stand-in's command) and, hard-linked to it, `bin/ps`. Returns the
-/// copy's path.
-///
+/// Lay the stand-ins into `bin`.
 /// # Errors
 /// The copy or the link could not be made.
 pub fn stand_ins(bin: &Path) -> std::io::Result<PathBuf> {
@@ -97,8 +58,7 @@ pub fn stand_ins(bin: &Path) -> std::io::Result<PathBuf> {
     Ok(lab)
 }
 
-/// Every process's command line, as `ps -axo pid=,command=` prints it (the
-/// lab's own `ps`, outside the jail).
+/// Every process's command line, as `ps -axo pid=,command=` prints it.
 #[must_use]
 pub fn commands() -> Vec<(i32, String)> {
     aterm_uds::spawnfd::command("/bin/ps")
@@ -117,10 +77,7 @@ pub fn commands() -> Vec<(i32, String)> {
         .unwrap_or_default()
 }
 
-/// Every process a run started: the instance `root`'s tree, whatever carries
-/// the scratch root `scratch` in its command line (a Codex daemon, a process
-/// that left the tree), and their descendants. Walked before anything is
-/// ended; never this process.
+/// Every process a run started.
 #[must_use]
 pub fn ours(root: i32, scratch: &Path) -> Vec<i32> {
     let s = scratch.to_string_lossy().into_owned();
@@ -155,8 +112,6 @@ pub fn end_all(root: i32, scratch: &Path) {
         let _ = crate::sys::kill(p, libc::SIGKILL);
     }
 }
-
-// ------------------------------------------------------------------ the fake model
 
 /// One answer of the fake model.
 #[derive(Clone, Debug)]
@@ -261,9 +216,7 @@ pub fn call_item(name: &str, args: &J) -> J {
     ])
 }
 
-/// The Responses API's stream of one response holding `items`:
-/// `response.created`, one `response.output_item.done` per item, then
-/// `response.completed` with the items and a token usage.
+/// The Responses API's stream of one response holding `items`.
 #[must_use]
 pub fn sse(items: Vec<J>) -> String {
     let rid = format!("resp_{}", nanos());
@@ -318,8 +271,7 @@ pub fn sse(items: Vec<J>) -> String {
         .collect()
 }
 
-/// The fake Responses API on `listener`: every POST answered by `answer` and
-/// logged to `log` (module header); a GET lists one model.
+/// The fake Responses API on `listener`.
 pub fn serve(listener: TcpListener, log: Arc<Mutex<ApiLog>>, answer: Answer) {
     for conn in listener.incoming().flatten() {
         let (log, answer) = (Arc::clone(&log), Arc::clone(&answer));
@@ -327,8 +279,7 @@ pub fn serve(listener: TcpListener, log: Arc<Mutex<ApiLog>>, answer: Answer) {
     }
 }
 
-/// Owned request and successful-response journals, sharing one monotonic
-/// clock and one mutex for identity allocation, append and observation.
+/// Owned request and successful-response journals.
 pub struct ApiLog {
     path: PathBuf,
     clock: Instant,
@@ -336,8 +287,7 @@ pub struct ApiLog {
 }
 
 impl ApiLog {
-    /// Start a fresh proof's journal. The world and clock outlive all of
-    /// its packaged processes and their re-execs.
+    /// Start a fresh proof's journal.
     #[must_use]
     pub fn new(path: PathBuf, clock: Instant) -> Self {
         Self {
@@ -347,10 +297,7 @@ impl ApiLog {
         }
     }
 
-    /// Called while holding the same mutex as every append: neither a
-    /// partial line nor a request stamped before an unfinished append can
-    /// disappear from a quiet verdict. Malformed evidence is not skipped.
-    ///
+    /// Called while holding the same mutex as every append.
     /// # Errors
     /// A journal cannot be read or contains malformed JSON.
     pub fn snapshot(&self) -> std::io::Result<(Vec<J>, Vec<J>)> {
@@ -500,7 +447,7 @@ fn serve_one(conn: TcpStream, log: &Mutex<ApiLog>, answer: &Answer) {
 }
 
 /// The witness is published only after the complete response and flush
-/// succeeded. A flush is a server write witness, not a client-read receipt.
+/// succeeded.
 fn write_response(
     w: &mut impl std::io::Write,
     a: &Answered,
@@ -528,8 +475,7 @@ fn write_response(
     written()
 }
 
-/// The text of the assistant messages a streamed answer ([`sse`]) holds, one
-/// line each; empty for any other body (a 429's JSON, a tool call alone).
+/// The text of the assistant messages a streamed answer ([`sse`]) holds, one line each.
 #[must_use]
 pub fn said_of(body: &str) -> String {
     body.lines()
@@ -550,8 +496,7 @@ pub fn said_of(body: &str) -> String {
         .join("\n")
 }
 
-/// How many input items a Responses request carries, and the Codex turn it
-/// belongs to (its `client_metadata.turn_id`, `-` where it names none).
+/// How many input items a Responses request carries, and the Codex turn it belongs to.
 #[must_use]
 pub fn request_marks(body: &J) -> (usize, String) {
     let n = body.get("input").and_then(J::as_arr).map_or(0, |i| i.len());
@@ -564,8 +509,7 @@ pub fn request_marks(body: &J) -> (usize, String) {
     (n, turn)
 }
 
-/// The last user text of a Responses request, and its last input item when
-/// that is a tool's output.
+/// The last user text of a Responses request, and its last input item when that is a tool's output.
 #[must_use]
 pub fn request_view(body: &J) -> (String, Option<J>) {
     let input = body.get("input").and_then(J::as_arr).unwrap_or_default();
@@ -600,12 +544,7 @@ pub fn nanos() -> u128 {
         .map_or(0, |d| d.as_nanos())
 }
 
-// ------------------------------------------------------------------ the stand-ins
-
-/// `ps [-A|-e] [-p PIDS] -o FIELD[=],…` from the kernel's process records,
-/// for the sandboxed instance (`/bin/ps` is setuid, which the sandbox refuses
-/// to exec). Fields: `pid ppid pgid tpgid tty tt lstart etime`; any other
-/// (`comm`, `args`, `command`) is the command name. Exit 1 when no process matched.
+/// `ps [-A|-e] [-p PIDS] -o FIELD[=],…` from the kernel's process records.
 #[must_use]
 pub fn ps_main(args: &[String]) -> i32 {
     let (mut fields, mut pids, mut every) = (Vec::new(), Vec::new(), false);
@@ -699,11 +638,7 @@ pub fn etime(secs: i64) -> String {
     }
 }
 
-/// A do-nothing MCP server (`aterm-lab mcp-standin`): `initialize` and an
-/// empty `tools/list` answered, everything else `{}`, so Codex keeps a live
-/// MCP server beside a background terminal. With `echo` (`aterm-lab
-/// mcp-standin echo`) it serves one tool, `lab_echo`, whose call answers
-/// `echo: <text>` — what draws Gemini CLI's MCP box in `gemini-captures`.
+/// A do-nothing MCP server (`aterm-lab mcp-standin`).
 #[must_use]
 pub fn mcp_main(args: &[String]) -> i32 {
     let echo = args.first().map(String::as_str) == Some("echo");
@@ -833,7 +768,6 @@ mod tests {
             said_of(&body),
             "Nothing left: all of it.\nNEEDS YOU: nothing"
         );
-        // NEGATIVE CONTROLS: a call alone, and a 429's JSON, say nothing.
         let call = sse(vec![call_item("exec_command", &J::obj([]))]);
         assert_eq!(said_of(&call), "");
         assert_eq!(said_of(r#"{"error":{"type":"usage_limit_reached"}}"#), "");
@@ -871,8 +805,6 @@ mod tests {
         assert_eq!(output, 2);
         assert!(jail_policy(4242).contains("localhost:4242"));
 
-        // Only a complete write AND flush publishes the exact request's
-        // witness. Partial headers/bodies and failed flushes prove nothing.
         struct Broken {
             left: usize,
             fail_flush: bool,
@@ -957,9 +889,7 @@ mod tests {
 
     /// `mcp-standin echo` serves its one tool, `lab_echo`, and answers a call
     /// of it with the text back; plain `mcp-standin` (Codex's) still lists
-    /// none and answers a call with `{}`. A notification and a line that is
-    /// no JSON get no answer. NEGATIVE CONTROL: the plain server's call names
-    /// no echo.
+    /// none and answers a call with `{}`.
     #[test]
     fn the_mcp_standin_echoes_only_when_asked_to() {
         let list = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;

@@ -3,15 +3,6 @@
 // Author: Andrew Yates
 
 //! The terminal grid's layout of a line, one character at a time.
-//!
-//! The grid (`aterm_core`'s `handler_write`) advances its cursor per
-//! CHARACTER, and whether a character opens a cell or joins the one before it
-//! depends on what that cell already holds: its base, whether it is drawn
-//! wide, whether its last stored character is a ZWJ. That state crosses UAX #29
-//! cluster boundaries (Sinhala `ශ්‍රී` ends one cluster with a ZWJ and the grid
-//! folds the next cluster's first letter into the same cell), so a measurer
-//! that charges each cluster on its own disagrees with the grid. Every column
-//! measurer walks a line with one [`GridColumns`] instead.
 
 use aterm_types::text_shaping::AmbiguousWidth;
 
@@ -25,8 +16,7 @@ const VS16: char = '\u{FE0F}';
 const ZWJ: char = '\u{200D}';
 
 /// Characters one cell stores after its base (`aterm_grid`'s
-/// `CellExtra::MAX_COMBINING`). The grid drops the rest, so a dropped
-/// character changes neither the cell's last character nor its flag count.
+/// `CellExtra::MAX_COMBINING`).
 const MAX_JOINED: u8 = 16;
 
 /// The cell the last printing character opened, as the grid holds it.
@@ -72,11 +62,7 @@ impl Cell {
     /// Whether the grid folds printing character `c` into this cell rather
     /// than open a new one, in `write_char`'s order: a skin-tone modifier onto
     /// a wide `Emoji_Modifier_Base`, a flag's second regional indicator onto
-    /// its first, and any non-ASCII character after a stored ZWJ. The grid
-    /// folds printable ASCII after a ZWJ on no path (UAX #29 GB11 joins a ZWJ
-    /// only to Extended_Pictographic, and no ASCII character is one): neither
-    /// the run writer (`print_ascii_bulk`) nor `write_char` under IRM, DECAWM
-    /// off or a national charset.
+    /// its first, and any non-ASCII character after a stored ZWJ.
     #[inline]
     const fn folds(&self, c: char) -> bool {
         (is_skin_tone_modifier(c) && self.wide && is_emoji_modifier_base(self.base))
@@ -88,23 +74,19 @@ impl Cell {
 /// What one character did to the grid (see [`GridColumns::step`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GridStep {
-    /// A printing character opened a cell of its own at column `col`, `width`
-    /// columns wide.
+    /// A printing character opened a cell of its own at column `col`, `width` columns wide.
     Opens {
         /// The cell's first column.
         col: usize,
         /// Its width, 1 or 2.
         width: usize,
     },
-    /// A printing character the grid folded into the cell before it, at
-    /// column `col`: after a stored ZWJ, a skin tone onto its base, a flag's
-    /// second half. It is drawn in that cell and moves no cursor.
+    /// A printing character the grid folded into the cell before it, at column `col`.
     Folds {
         /// The first column of the cell it joined.
         col: usize,
     },
-    /// A zero-width character stored in the cell before it (with none, it
-    /// lands under the cursor and keeps nothing).
+    /// A zero-width character stored in the cell before it.
     Joins {
         /// VS16 widened that cell from 1 column to 2, moving the cursor one.
         widened: bool,
@@ -124,33 +106,7 @@ impl GridStep {
     }
 }
 
-/// The grid's layout of one line, fed a character at a time from the line's
-/// first column.
-///
-/// Each printing character takes [`char_width`](crate::char_width) cells
-/// ([`char_width_cjk`](crate::char_width_cjk) under
-/// [`AmbiguousWidth::Double`], the terminal's `ambiguous_width = "wide"`), except
-/// that
-///
-/// * a zero-width character joins the cell before it, and VS16 widens that cell
-///   from 1 to 2 when its base [`is_vs16_emoji_capable`]
-///   (`widen_previous_cell_for_vs16`), `©️ ▶️ ℹ️ 1️⃣` as much as `❤️`;
-/// * VS15 narrows a wide cell's glyph without moving the cursor; the emptied
-///   column after it becomes the cell later characters join
-///   (`narrow_previous_cell_for_vs15`);
-/// * a skin-tone modifier folds into a wide [`is_emoji_modifier_base`] cell
-///   (`try_combine_skin_tone_modifier`); after anything else it is its own
-///   2-cell glyph;
-/// * a regional indicator folds into a cell holding a lone one (a flag);
-/// * a non-ASCII character folds into a cell whose last stored character is a
-///   ZWJ (`should_combine_with_previous_zwj`), whatever the cell holds and
-///   wherever UAX #29 puts the cluster boundary: `❤‍🔥` keeps its narrow
-///   base's one cell, `👨‍👩‍👧` its first person's two, and Sinhala `ක්‍ය` is one
-///   cell though it is two clusters.
-///
-/// `aterm-core/tests/grid_column_agreement.rs` checks this against the real
-/// grid. A line edge (VS16 on the last column, a fold across a soft wrap) is
-/// beyond a measurer that is not told the grid's width.
+/// The grid's layout of one line, fed a character at a time from the line's first column.
 #[derive(Clone, Debug, Default)]
 pub struct GridColumns {
     /// The cursor column.
@@ -163,17 +119,14 @@ pub struct GridColumns {
 }
 
 impl GridColumns {
-    /// A walk from a line's first column, East Asian Ambiguous characters one
-    /// cell wide (the terminal's default).
+    /// A walk from a line's first column, East Asian Ambiguous characters one cell wide.
     #[must_use]
     #[inline]
     pub const fn new() -> Self {
         Self::with_ambiguous_width(AmbiguousWidth::Single)
     }
 
-    /// A walk from a line's first column, East Asian Ambiguous characters as
-    /// wide as `ambiguous` says: two cells under [`AmbiguousWidth::Double`],
-    /// as the grid writes them with `ambiguous_width = "wide"`.
+    /// A walk from a line's first column.
     #[must_use]
     #[inline]
     pub const fn with_ambiguous_width(ambiguous: AmbiguousWidth) -> Self {
@@ -207,7 +160,6 @@ impl GridColumns {
                     return GridStep::Joins { widened: true };
                 }
                 if c == VS15 && cell.wide {
-                    // The glyph narrows; the cursor stays past the emptied
                     // column, which is now the cell before it.
                     *cell = Cell::open(cell.col.saturating_add(1), ' ', false);
                 }
@@ -217,8 +169,6 @@ impl GridColumns {
                 cell.store(c);
                 GridStep::Folds { col: cell.col }
             }
-            // Nothing before it: a zero-width character lands on the cell
-            // under the cursor, which the next printing character overwrites.
             None if width == 0 => GridStep::Joins { widened: false },
             _ => {
                 let col = self.cursor;
@@ -240,11 +190,7 @@ impl GridColumns {
     }
 }
 
-/// The number of grid cells a terminal lays `s` out in, written from the first
-/// column of a line.
-///
-/// Can exceed `s`'s display width: a Devanagari conjunct is one UAX #29
-/// cluster the grid paints in three cells (`न्`, `द`, `ी`).
+/// The number of grid cells a terminal lays `s` out in, written from the first column of a line.
 #[must_use]
 #[inline]
 pub fn str_grid_columns(s: &str) -> usize {
@@ -258,22 +204,16 @@ pub fn str_grid_columns_with(s: &str, ambiguous: AmbiguousWidth) -> usize {
     GridColumns::with_ambiguous_width(ambiguous).advance_str(s)
 }
 
-/// One grapheme cluster and the grid columns it is drawn in (see
-/// [`grid_graphemes`]).
+/// One grapheme cluster and the grid columns it is drawn in (see [`grid_graphemes`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GridGrapheme<'a> {
     /// The cluster.
     pub text: &'a str,
     /// Its byte offset in the line.
     pub byte_offset: usize,
-    /// The first column it is drawn in: the cursor column before it, or,
-    /// when the grid folds its first character into the cell before it, that
-    /// cell's first column.
+    /// The first column it is drawn in.
     pub start_col: usize,
-    /// The cursor column after it. `start_col..end_col` is every column the
-    /// cluster is drawn in: the cell it folded into, and the cells it opened.
-    /// A cluster of zero-width characters only (a ZWSP, a mark after a
-    /// control) is drawn in none.
+    /// The cursor column after it.
     pub end_col: usize,
 }
 
@@ -307,23 +247,14 @@ impl<'a> Iterator for GridGraphemes<'a> {
     }
 }
 
-/// `s`'s grapheme clusters, each with the grid columns it is drawn in when `s`
-/// is written from the first column of a line.
-///
-/// The one walk every byte↔column conversion uses, so the find bar, a copied
-/// selection and a double-click name the cells the grid painted. Columns are
-/// measured in context: a cluster the grid folds into the cell before it (the
-/// `ය` of Sinhala `ක්‍ය`, the second `👍` of `👍‍‍👍`) adds no column and is
-/// drawn in the cell it joined.
+/// `s`'s grapheme clusters.
 #[must_use]
 #[inline]
 pub fn grid_graphemes(s: &str) -> GridGraphemes<'_> {
     grid_graphemes_with(s, AmbiguousWidth::Single)
 }
 
-/// [`grid_graphemes`] under the terminal's `ambiguous_width` policy: with
-/// [`AmbiguousWidth::Double`] an East Asian Ambiguous character (`→`, `─`,
-/// `°`) is drawn in two columns, as the grid writes it.
+/// [`grid_graphemes`] under the terminal's `ambiguous_width` policy.
 #[must_use]
 #[inline]
 pub fn grid_graphemes_with(s: &str, ambiguous: AmbiguousWidth) -> GridGraphemes<'_> {

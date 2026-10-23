@@ -245,6 +245,9 @@ pub struct NeedFact {
     pub key: (u8, u64),
     /// Its words, one clipped line, without the tab's label.
     pub what: String,
+    /// Whether to display a tab-bar pill for this need. A worker's reported
+    /// need stays available in its hover and menus without a persistent pill.
+    pub show_pill: bool,
 }
 
 /// Everything one refresh reads.
@@ -317,6 +320,7 @@ impl<V: Host> Default for Facts<V> {
 }
 
 /// Which of a driven turn's two ends was told ([`Slot::absorb`]): the
+/// ledger's settle, or the program's own report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TurnEnd {
     Settle,
@@ -338,6 +342,7 @@ struct ToldEnd {
 }
 
 /// Whether a program turn that began at `program` is the ledger turn that
+/// opened at `ledger`: it began no earlier ([`ToldEnd::began`]).
 fn began_in(program: Option<Instant>, ledger: Option<Instant>) -> bool {
     match (program, ledger) {
         (Some(program), Some(ledger)) => program >= ledger,
@@ -503,6 +508,7 @@ impl<V: Host> Slot<V> {
     }
 
     /// Note a point; `news` false keeps it out of the news a level reads (the
+    /// person saw it happen), as aterm's own points are.
     fn note_as(&mut self, verb: StoryVerb, now: Instant, news: bool) -> bool {
         self.story_seq += 1;
         let aterm = self.noting_aterm || self.aterm_hand;
@@ -523,6 +529,8 @@ impl<V: Host> Slot<V> {
     }
 
     /// The second end of a told turn, `news` the news it would have carried
+    /// told alone: the turn is one story point either way, and news when
+    /// either end would have been, whichever was read first.
     fn pair_end(&mut self, told: ToldEnd, news: bool) -> bool {
         self.told_end = None;
         let aterm = self.noting_aterm || self.aterm_hand;
@@ -731,7 +739,7 @@ impl<V: Host> Slot<V> {
 
     /// The tab chip's mark from the published need and the person's hold.
     #[must_use]
-    pub fn chip(&self) -> ChipLevel {
+    pub const fn chip(&self) -> ChipLevel {
         match &self.need {
             Some(need) => match need.severity {
                 NeedSeverity::Stuck => ChipLevel::Stop(need.cause),

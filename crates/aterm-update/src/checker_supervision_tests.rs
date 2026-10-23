@@ -1,18 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! These tests drive the real loop ([`crate::run_checker`]) and the real lock gate
-//! ([`crate::checker_gate`]), asked once ([`the_gate_asked_once`]): a held lock is the
-//! deferral the bounded wait ends in, and the bound itself is `FileLock::acquire_within`'s,
-//! tested in aterm-update-core.
-//!
-//! Every loop-level test ends its thread through the generation token — the
-//! replacement mechanism itself — from inside the settings hook, and none ever
-//! reaches the network: the tests that take the check lane stop at a held
-//! `checker.lock` or at a sibling's fresh receipt in a scratch staging root, or
-//! find the lane already held. The per-user staging root is never read. Each loop
-//! takes a check lane of its own ([`args`]), as each process has one, so the tests
-//! run side by side.
+//! These tests drive the real loop ([`crate::run_checker`]) and the real lock gate ([`crate::checker_gate`]), asked once ([`the_gate_asked_once`]): a held lock is the deferral the bounded wait ends in, and the bound itself is `FileLock::acquire_within`'s, tested in aterm-update-core.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -44,27 +33,21 @@ fn args(provider: crate::SourceProvider) -> CheckerArgs {
         checker_ungated_after: crate::checker_watch::CHECKER_UNGATED_AFTER,
         lane: Box::leak(Box::new(crate::check_lane::Lane::new())),
         gate: the_gate_asked_once(),
-        // Never the network.
         check: Arc::new(|_, _| Ok(None)),
         pause: Some(Duration::ZERO),
-        // Nothing here posts to it; the wake test brings its own.
         wake: &UNPOSTED,
-        // A wake's settle is a pause no assertion here can see.
         wake_settle: Duration::from_millis(10),
     }
 }
 
 /// The real gate ([`crate::checker_gate`]) with no wait: one try, so a held lock defers
-/// at once, where the loop's bounded wait would defer after it. What these tests pin is
-/// what a cycle does with the gate's answer, never how long the wait took.
+/// at once, where the loop's bounded wait would defer after it.
 fn the_gate_asked_once() -> Arc<crate::GateFn> {
     Arc::new(|path, _wait| crate::checker_gate(path, Duration::ZERO))
 }
 
 /// Runs the loop to its exit on a thread of its own and hands back the lines it
-/// logged there. The wait is a hang detector, never a latency budget: a cycle that
-/// parks (on a sibling's lock, behind the lane) fails its test within the minute
-/// instead of holding the binary open.
+/// logged there.
 fn run_to_exit(
     watch: &'static CheckerWatch,
     generation: u64,
@@ -87,10 +70,7 @@ static UNPOSTED: crate::cadence::WakeSignal = crate::cadence::WakeSignal::new();
 /// wait — here a ten-minute pause no check outlives within this test's one-minute hang
 /// detector — ends at once, the loop settles (`wake_settle`) and checks again, and that
 /// check runs inside the wake's grace (`check_follows_wake`, which books a failed
-/// asset GET as `network`). The post lands during the first check, as a lid closed
-/// mid-check posts it, and still ends the wait after it. Negative controls: the check
-/// before the wake is not after one, and a check run without the loop's wake scope
-/// reads `false`.
+/// asset GET as `network`).
 #[test]
 fn a_posted_wake_ends_the_wait_and_the_next_check_follows_it() {
     static WATCH: CheckerWatch = CheckerWatch::new();
@@ -106,7 +86,6 @@ fn a_posted_wake_ends_the_wait_and_the_next_check_follows_it() {
             let mut seen = followed.lock().unwrap();
             seen.push(crate::check_follows_wake());
             match seen.len() {
-                // The lid closes and opens while this check runs.
                 1 => WAKE.post(),
                 _ => {
                     WATCH.supersede(generation);
@@ -119,7 +98,6 @@ fn a_posted_wake_ends_the_wait_and_the_next_check_follows_it() {
     std::thread::spawn(move || {
         let _ = tx.send(crate::run_checker(&WATCH, generation, &loop_args));
     });
-    // A hang detector, not a latency budget: the second check is the settle away.
     let exit = rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
     let followed = followed.lock().unwrap().clone();
     assert_eq!(
@@ -141,12 +119,7 @@ fn a_posted_wake_ends_the_wait_and_the_next_check_follows_it() {
 /// failed on: the loop dates the wake its wait ended on and books that failure offline
 /// (`cadence::after_wake` into `cadence::note_failure`) — the quick rung, said at INFO —
 /// where the same kind of failure with no wake behind it lengthens the backoff and is
-/// warned. Driven through the real loop: the first check fails before any wake while the
-/// lid closes and opens (a post), the loop's wait ends on that post and settles, and the
-/// second check fails inside the grace. The loop's own lines are read on its thread
-/// (`log_capture` is per thread), from the settings hook of the cycle after. Negative
-/// controls: a loop that books the failure by the channel alone, or that never dates the
-/// wake it settled, warns the second failure too.
+/// warned.
 #[test]
 fn a_check_that_fails_inside_a_wakes_grace_is_booked_offline() {
     const BEFORE: &str = "curl: (35) TLS connect error before the lid closed";
@@ -165,14 +138,12 @@ fn a_check_that_fails_inside_a_wakes_grace_is_booked_offline() {
             Some(source())
         })
     });
-    // Short: the wait after the second check ends on its own. The first ends on the post.
     loop_args.pause = Some(Duration::from_millis(10));
     loop_args.wake = &WAKE;
     loop_args.check = {
         let checks = Arc::new(AtomicU64::new(0));
         Arc::new(move |_, _| {
             if checks.fetch_add(1, Ordering::SeqCst) == 0 {
-                // The lid closes and opens while this check runs.
                 WAKE.post();
                 Err(BEFORE.to_string())
             } else {
@@ -184,7 +155,6 @@ fn a_check_that_fails_inside_a_wakes_grace_is_booked_offline() {
     std::thread::spawn(move || {
         let _ = tx.send(crate::run_checker(&WATCH, generation, &loop_args));
     });
-    // A hang detector, not a latency budget: the second check is the settle away.
     let exit = rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
     let lines = lines.lock().unwrap().clone();
     assert_eq!(
@@ -214,13 +184,7 @@ fn a_check_that_fails_inside_a_wakes_grace_is_booked_offline() {
 }
 
 /// A wake that ends the wait after a panicked cycle is settled and answered, as at
-/// every other wait. The lid closes and opens while a cycle runs, and the cycle
-/// panics; the backed-off wait after the panic — ten minutes here, which nothing
-/// outlives within this test's one-minute hang detector — ends on the post, the loop
-/// settles, and the next check runs inside the wake's grace (`check_follows_wake`).
-/// A post that wait left unanswered would end every later wait at once, so a cycle
-/// that kept panicking would spin with no wait at all. Negative control: the loop
-/// that dropped that wait's answer runs the next check outside any wake.
+/// every other wait.
 #[test]
 fn a_wake_that_ends_the_wait_after_a_panic_is_answered() {
     static WATCH: CheckerWatch = CheckerWatch::new();
@@ -250,7 +214,6 @@ fn a_wake_that_ends_the_wait_after_a_panic_is_answered() {
     std::thread::spawn(move || {
         let _ = tx.send(crate::run_checker(&WATCH, generation, &loop_args));
     });
-    // A hang detector, not a latency budget: the check is the settle away.
     let exit = rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
     let followed = followed.lock().unwrap().clone();
     assert_eq!(
@@ -268,11 +231,7 @@ fn a_wake_that_ends_the_wait_after_a_panic_is_answered() {
 }
 
 /// The loop defers on a held `checker.lock`, logs on the streak's edges, and resumes
-/// the cycle the lock comes free. This drives [`crate::run_checker`] through the real
-/// gate, in a scratch staging root, with a sibling holding the lock for
-/// [`crate::CHECKER_DEFERRAL_LOG_EVERY`] cycles, so the streak is restated once. Drop
-/// the deferral's streak log, its published count or the recovery line, and the
-/// assertions after it fail.
+/// the cycle the lock comes free.
 #[test]
 fn the_loop_defers_each_cycle_a_sibling_holds_the_checker_lock_and_resumes_when_it_lets_go() {
     static WATCH: CheckerWatch = CheckerWatch::new();
@@ -282,11 +241,9 @@ fn the_loop_defers_each_cycle_a_sibling_holds_the_checker_lock_and_resumes_when_
     let sibling = Arc::new(Mutex::new(Some(
         aterm_update_core::FileLock::acquire(&lock_path).expect("the sibling takes it"),
     )));
-    // A sibling mid-check that writes nothing: no progress to read.
     stamp_an_hour_ago(&lock_path);
     let every = crate::CHECKER_DEFERRAL_LOG_EVERY;
     let calls = Arc::new(AtomicU64::new(0));
-    // Counted, not asserted here: the loop catches a panicking cycle.
     let wrong = Arc::new(AtomicU64::new(0));
     let provider: crate::SourceProvider = {
         let (calls, wrong, sibling, staging) = (
@@ -305,11 +262,6 @@ fn the_loop_defers_each_cycle_a_sibling_holds_the_checker_lock_and_resumes_when_
                 }
             }
             if n == every + 1 {
-                // The sibling finishes its check: it lets go of the lock and leaves
-                // its receipt, so the next cycle gets the lock and skips the
-                // network as the machine's check is already done. The next cycle
-                // asks the gate once, no wait at all, so this relies on the release
-                // being deterministic: `FileLock`'s drop is `LOCK_UN`.
                 drop(sibling.lock().unwrap().take());
                 crate::check_receipt::record(&staging, 1, &source(), false, None);
             }
@@ -328,8 +280,6 @@ fn the_loop_defers_each_cycle_a_sibling_holds_the_checker_lock_and_resumes_when_
         let staging = staging.clone();
         Arc::new(move || Some(staging.clone()))
     };
-    // Pins the streak over more cycles than the loop defers before checking without the
-    // lock; that bound is `a_checker_lock_held_forever_does_not_stop_checks`'s.
     loop_args.checker_ungated_after = u64::MAX;
     let (exit, lines) = run_to_exit(
         &WATCH,
@@ -373,16 +323,13 @@ fn a_checker_lock_held_forever_does_not_stop_checks() {
     let staging = crate::paths::Staging::scratch("checker-lock-held-forever");
     let lock_path = staging.status.with_file_name("checker.lock");
     let _sibling = aterm_update_core::FileLock::acquire(&lock_path).expect("the sibling takes it");
-    // The holder names a live pid, as a stopped aterm's lock does.
     std::fs::write(&lock_path, format!("{}\n", std::process::id()))
         .expect("the holder names itself");
-    // ...when it took the lock, an hour ago: it has written nothing since.
     stamp_an_hour_ago(&lock_path);
     let bound = crate::checker_watch::CHECKER_UNGATED_AFTER;
     let cycles = bound + 2;
     let checks = Arc::new(AtomicU64::new(0));
     let calls = Arc::new(AtomicU64::new(0));
-    // (cycle, deferrals published, checks run) as each cycle began.
     let seen: Arc<Mutex<Vec<(u64, u64, u64)>>> = Arc::default();
     let provider: crate::SourceProvider = {
         let (calls, checks, seen) = (Arc::clone(&calls), Arc::clone(&checks), Arc::clone(&seen));
@@ -422,8 +369,6 @@ fn a_checker_lock_held_forever_does_not_stop_checks() {
             phase: CheckerPhase::Settings
         }
     );
-    // The first `bound - 1` cycles deferred; from the `bound`-th on every cycle checked,
-    // and the streak kept counting.
     assert_eq!(
         checks.load(Ordering::SeqCst),
         cycles - bound + 1,
@@ -469,7 +414,6 @@ fn a_stale_machine_ledger_checks_past_a_held_lock_at_once() {
         let lock_path = staging.status.with_file_name("checker.lock");
         let _sibling =
             aterm_update_core::FileLock::acquire(&lock_path).expect("the sibling takes it");
-        // A holder showing no progress: its lock written an hour ago.
         stamp_an_hour_ago(&lock_path);
         let now = aterm_time::unix_secs().unwrap();
         let checked = if stale {
@@ -477,8 +421,6 @@ fn a_stale_machine_ledger_checks_past_a_held_lock_at_once() {
         } else {
             now - 30
         };
-        // Another channel's receipt: it cannot excuse this cycle's check
-        // (`checker_skip_for`), only date the machine's last.
         std::fs::write(
             crate::check_receipt::path(&staging),
             format!(
@@ -601,7 +543,6 @@ fn a_replacement_blocked_behind_a_stuck_check_says_so_and_keeps_the_stall_standi
         crate::manual_check_blocked(&WATCH).is_some(),
         "a manual check does not queue"
     );
-    // The stuck check lets go: the stall is over and a manual check may run.
     drop(lane);
     drop(mark);
     assert_eq!(crate::manual_check_blocked(&WATCH), None);
@@ -619,12 +560,10 @@ fn an_unanswered_settings_query_is_logged_on_its_edges_and_not_every_miss() {
     let misses = 2 * every;
     let calls = Arc::new(AtomicU64::new(0));
     let counted = Arc::clone(&calls);
-    // Counted, not asserted here: the loop catches a panic in the hook.
     let unstamped = Arc::new(AtomicU64::new(0));
     let seen = Arc::clone(&unstamped);
     let provider: crate::SourceProvider = Arc::new(move || {
         let n = counted.fetch_add(1, Ordering::SeqCst) + 1;
-        // Every miss is stamped and counted: visibly alive, visibly not checking.
         if n > 1
             && WATCH.snapshot().is_none_or(|beat| {
                 beat.phase != CheckerPhase::Settings || beat.settings_misses != n - 1
@@ -635,7 +574,6 @@ fn an_unanswered_settings_query_is_logged_on_its_edges_and_not_every_miss() {
         if n <= misses {
             return None;
         }
-        // The window answers, and the test ends the thread as a replacement would.
         WATCH.supersede(generation);
         Some(source())
     });
@@ -723,7 +661,6 @@ fn a_panic_in_a_cycle_is_logged_and_the_loop_goes_round_again() {
 /// the lane, the lock or the network, or every replacement would leave two checkers.
 #[test]
 fn a_superseded_generation_exits_without_checking_and_leaves_the_replacements_stamp() {
-    // (a) Replaced before it ever ran: it never asks for its settings.
     static FIRST: CheckerWatch = CheckerWatch::new();
     let stale = FIRST.register(1_000);
     let live = FIRST.supersede(stale).expect("replaced");
@@ -742,8 +679,6 @@ fn a_superseded_generation_exits_without_checking_and_leaves_the_replacements_st
     assert_eq!(asked.load(Ordering::SeqCst), 0);
     assert_eq!(FIRST.snapshot().unwrap().generation, live);
 
-    // (b) Replaced mid settings query: it wakes with an answer and still leaves, and the
-    // replacement's `Starting` stamp is untouched.
     static SECOND: CheckerWatch = CheckerWatch::new();
     let stalled = SECOND.register(1_000);
     let calls = Arc::new(AtomicU64::new(0));
@@ -783,10 +718,7 @@ fn stamp_an_hour_ago(path: &std::path::Path) {
 
 /// The gate a cycle meets behind a sibling holding `checker.lock`, still checking
 /// while `beating`: [`the_gate_asked_once`], with the holder's beat landing in the
-/// wait, as a live holder's does every quarter of it (`crate::HolderBeat`). Once the
-/// holder stops, the lock's stamp is an hour old: a stopped holder writes nothing
-/// through a wait. Each ask's wait goes into `asked`: the bound the loop hands the
-/// gate is what this stand-in does not spend, so it is read instead.
+/// wait, as a live holder's does every quarter of it (`crate::HolderBeat`).
 fn gate_behind_a_holder(
     beating: Arc<AtomicBool>,
     asked: Arc<Mutex<Vec<Duration>>>,
@@ -844,8 +776,6 @@ fn a_holder_still_checking_is_never_called_stopped() {
         })
     };
     let mut loop_args = args(provider);
-    // The shipping wait: the half of it a sibling reads as progress is thirty
-    // seconds, which no descheduling between a beat and its read comes near.
     loop_args.checker_lock_wait = crate::checker_watch::CHECKER_LOCK_WAIT;
     let asked: Arc<Mutex<Vec<Duration>>> = Arc::default();
     loop_args.gate = gate_behind_a_holder(Arc::clone(&beating), Arc::clone(&asked));
@@ -873,8 +803,6 @@ fn a_holder_still_checking_is_never_called_stopped() {
         }
     );
     let seen = seen.lock().unwrap().clone();
-    // Cycles behind a working holder publish and check nothing; behind a stopped one the
-    // streak counts, and the bound-th such cycle checks without the lock.
     for (n, deferrals, ran) in &seen[1..] {
         let stalled_before = (n - 1).saturating_sub(working);
         assert_eq!(*deferrals, stalled_before, "cycle {n}: {seen:?}");
@@ -889,14 +817,11 @@ fn a_holder_still_checking_is_never_called_stopped() {
         cycles - working - bound + 1,
         "{seen:?}"
     );
-    // Each cycle asked the gate once, with the loop's own bound: the wait a cycle
-    // spends behind a holder before it reads the holder's progress.
     assert_eq!(
         *asked.lock().unwrap(),
         vec![crate::checker_watch::CHECKER_LOCK_WAIT; usize::try_from(cycles).unwrap()],
         "every cycle waits the loop's bound at the gate"
     );
-    // Said once, after the cycles the holder was seen working.
     let said: Vec<_> = lines
         .iter()
         .filter(|(_, line)| line.starts_with("update check without the checker lock"))
@@ -983,18 +908,12 @@ fn a_stale_ledger_waits_for_a_holder_that_is_working() {
 /// checker is alive, so its siblings read it as working
 /// (`crate::checker_holder_progressing`); a retired generation's beat writes
 /// nothing, so a checker the watchdog replaced cannot vouch for itself.
-///
-/// Each half starts from a lock stamped an hour ago, so the beat's own write is the
-/// only progress there is to read; the retired half reads the lock after two beats
-/// have run to their end (the beat's test-only count), not after a stretch of sleep.
 #[test]
 fn the_holder_writes_the_lock_while_its_checker_is_alive() {
     static WATCH: CheckerWatch = CheckerWatch::new();
     let staging = crate::paths::Staging::scratch("checker-lock-holder-beat");
     let path = staging.status.with_file_name("checker.lock");
     let _lock = aterm_update_core::FileLock::acquire(&path).expect("the cycle takes it");
-    // The shipping window: a write just made reads as fresh however long a loaded
-    // machine holds this thread between it and the read.
     let fresh = crate::holder_fresh(crate::checker_watch::CHECKER_LOCK_WAIT);
     let every = Duration::from_millis(1);
     let written_within = || crate::checker_holder_progressing(&path, fresh);
@@ -1049,8 +968,6 @@ fn a_stamp_just_past_the_readers_clock_is_progress_and_a_wrong_clock_is_not() {
             .and_then(|file| file.set_modified(at))
             .expect("the lock's stamp is set");
     };
-    // Wide on purpose: a recent beat must stay recent however long a loaded machine
-    // deschedules this thread between the stamp and the reader's clock read.
     let fresh = Duration::from_secs(30);
     let now = std::time::SystemTime::now;
 

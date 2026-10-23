@@ -132,6 +132,8 @@ pub fn probe(bytes: &[u8], index: u32) -> Option<VfProbe> {
 }
 
 /// The design-space coords of the named instance whose subfamily name is
+/// "Regular", from the raw `fvar` table (bounds-checked; `None` on any
+/// structural inconsistency).
 fn regular_instance_coords(face: &aterm_font::Face<'_>, axis_count: usize) -> Option<Vec<f32>> {
     let data = face
         .raw_face()
@@ -174,6 +176,7 @@ fn regular_instance_coords(face: &aterm_font::Face<'_>, axis_count: usize) -> Op
 }
 
 /// Whether `name` record `name_id` decodes to "Regular" (case-insensitive,
+/// trimmed) in any Unicode-encoded entry.
 fn name_is_regular(face: &aterm_font::Face<'_>, name_id: u16) -> bool {
     face.names().into_iter().any(|n| {
         n.name_id == name_id
@@ -311,6 +314,7 @@ impl<'a> VariedFace<'a> {
 }
 
 /// `px / units_per_em`, the scale every unhinted raster and linear advance in this module
+/// applies to design units.
 #[inline]
 fn px_scale(face: &aterm_font::Face, px: f32) -> Option<f32> {
     let upem = f32::from(face.units_per_em());
@@ -318,6 +322,8 @@ fn px_scale(face: &aterm_font::Face, px: f32) -> Option<f32> {
 }
 
 /// Glyph `g`'s linear advance at `scale`: its `hmtx` advance (`HVAR` applied at the
+/// face's coords, `0` past the table) times `scale`, the product `font::Font` reports for
+/// a static face.
 #[inline]
 fn linear_advance(face: &aterm_font::Face, g: aterm_font::GlyphId, scale: f32) -> f32 {
     f32::from(face.glyph_hor_advance(g).unwrap_or(0)) * scale
@@ -396,6 +402,7 @@ pub(crate) fn crop_padded_coverage(ras: &crate::raster::Rasterizer, w: usize, h:
 }
 
 /// Feeds an aterm-font glyph outline (design units, y up) into a [`crate::raster`]
+/// coverage grid (pixels, y down, origin at the ink box's top-left).
 struct OutlineToRaster<'a> {
     ras: &'a mut crate::raster::Rasterizer,
     scale: f32,
@@ -411,6 +418,7 @@ impl OutlineToRaster<'_> {
         crate::raster::point(x * self.scale - self.ox, self.oy - y * self.scale)
     }
     /// Close the current contour back to its start: outlines are implicitly closed, and
+    /// the rasterizer needs the closing edge for winding.
     fn close_contour(&mut self) {
         if self.last != self.start {
             self.ras.draw_line(self.last, self.start);
@@ -478,6 +486,8 @@ mod tests {
     use super::*;
 
     /// Why [`RASTER_PAD`] exists, on a bare rasterizer: the segment
+    /// `(1.828125, 0.21875) → (0.0, 0.875)` marches to `x = -1.19e-7`, floors to `-1`,
+    /// and its scanline's area is skipped.
     #[test]
     fn a_boundary_hugging_outline_needs_the_raster_pad() {
         let tri = [(0.0f32, 0.875f32), (1.828125, 0.21875), (1.828125, 3.0)];
@@ -521,6 +531,9 @@ mod tests {
     }
 
     /// The portable raster's coverage does not depend on how much empty grid surrounds
+    /// the outline (a scaled `bbox.x_min` of 0 puts it flush against the left edge):
+    /// held against a 4×-slack refill over printable ASCII and the box-drawing run at
+    /// every desktop ppem on the bundled face.
     #[test]
     #[cfg(feature = "embedded-font")]
     fn varied_raster_is_invariant_to_grid_slack() {
@@ -596,6 +609,7 @@ mod tests {
     }
 
     /// A blank glyph (the bundled JetBrains Mono's space) rasters to a 0x0 tile carrying
+    /// just the advance.
     #[test]
     fn varied_raster_blank_glyph_is_zero_sized() {
         let bytes = include_bytes!("../assets/bundled/JetBrainsMono-Regular.ttf");

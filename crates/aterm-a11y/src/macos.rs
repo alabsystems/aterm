@@ -856,7 +856,7 @@ fn screen_frame(cx: &Context, rect: Option<crate::model::Rect>) -> CGRect {
     }
 }
 
-fn role(role: Role) -> &'static str {
+const fn role(role: Role) -> &'static str {
     match role {
         Role::TextRun | Role::Label | Role::Heading => "AXStaticText",
         Role::Link => "AXLink",
@@ -887,7 +887,7 @@ fn role(role: Role) -> &'static str {
     }
 }
 
-fn not_found() -> NSRange {
+const fn not_found() -> NSRange {
     NSRange {
         location: isize::MAX as usize,
         length: 0,

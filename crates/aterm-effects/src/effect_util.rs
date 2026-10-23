@@ -249,7 +249,7 @@ const FIRE_STOPS: [(f32, u32); 5] = [
     (1.0, 0x00FF_F0C0),
 ];
 
-/// The water ramp's stops: abyss → open-ocean blue → turquoise → aqua crest → foam. Saturated
+/// The water ramp's stops: abyss → open-ocean blue → turquoise → aqua crest → foam.
 const WATER_STOPS: [(f32, u32); 5] = [
     (0.0, 0x0005_2C48),
     (0.35, 0x000E_66B4),
@@ -258,7 +258,7 @@ const WATER_STOPS: [(f32, u32); 5] = [
     (1.0, 0x00C2_F2F5),
 ];
 
-/// The shared 5-stop ramp core. The window index is the count of interior stop positions
+/// The shared 5-stop ramp core.
 #[allow(clippy::manual_clamp)]
 #[inline]
 const fn ramp_5stop(stops: &[(f32, u32); 5], t: f32) -> u32 {
@@ -695,6 +695,7 @@ mod tests {
     }
 
     /// The envelope's measured flash rate matches [`TWINKLE_FLASH_HZ`]: `|sin|` peaks twice per
+    /// sine cycle, so dropping the rectification would halve it.
     #[test]
     fn twinkle_law_stays_under_the_photosensitivity_bound() {
         let (dt, span) = (1.0f32 / 240.0, 10.0f32);
@@ -716,6 +717,7 @@ mod tests {
     }
 
     /// The arm conversion truncates: at every shipping cell height the heaviest named grain is
+    /// a hairline, and somewhere in that band rounding would fatten it.
     #[test]
     fn the_one_arm_conversion_truncates_and_floors() {
         assert_eq!(
@@ -749,6 +751,7 @@ mod tests {
     }
 
     /// The additive star's proportions (arm and waist, nucleus, glint offset and dimming)
+    /// come from the shared constants.
     #[test]
     fn the_additive_star_draws_the_family_silhouette() {
         let g = geom();
@@ -849,6 +852,7 @@ mod tests {
     }
 
     /// The windowed-walk ramp (`windows(2)` walk, divide guard, raw-crest fall-through): the
+    /// byte-identity oracle for the branchless [`ramp_5stop`].
     fn walked_ramp(stops: &[(f32, u32); 5], t: f32) -> u32 {
         let t = t.clamp(0.0, 1.0);
         for w in stops.windows(2) {
@@ -878,6 +882,8 @@ mod tests {
     }
 
     /// The branchless ramps are bit-equal to the walk (frame fingerprints miss a one-count
+    /// drift): a prime-strided march over the f32 bit space, a ±16Ki-ULP band around every stop
+    /// with its sign-bit mirror, and the named specials.
     #[test]
     fn ramp_rewrite_is_bit_identical_to_the_stop_walk() {
         for bits in (0..=u32::MAX).step_by(4099) {

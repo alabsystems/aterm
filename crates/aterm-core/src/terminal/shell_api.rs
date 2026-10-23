@@ -224,6 +224,7 @@ mod tests {
     use crate::terminal::Terminal;
 
     /// `completed_command_seq` rises once per OSC 133;D, even for two completions in one
+    /// millisecond, and survives a reset.
     #[test]
     fn completed_command_seq_is_strictly_per_completion() {
         let mut term = Terminal::new(6, 40);
@@ -247,6 +248,10 @@ mod tests {
     }
 
     /// `started_command_seq` counts each C the A→B→C→D gate accepts, block or
+    /// no block, and nothing takes one back: RIS drops the blocks (and the
+    /// running command's D, which `completed_command_seq` then never counts),
+    /// ED 3 and Cmd-K the ones wholly in the history they erase (a running
+    /// `clear` keeps its own), and a checkpoint round trip carries it.
     #[test]
     fn started_command_seq_counts_every_accepted_c_and_no_clear_takes_one() {
         let prompt = b"\x1b]133;A\x07$ \x1b]133;B\x07";
@@ -298,6 +303,7 @@ mod tests {
     }
 
     /// The `B` aterm's integration sends where the buffer starts: signed, and
+    /// saying so (`aterm_input=start`).
     fn signed_b() -> Vec<u8> {
         signed("B;aterm_input=start")
     }
@@ -308,6 +314,7 @@ mod tests {
     }
 
     /// A 4×20 engine whose host authorized [`KEY`] and turned the nonce gate
+    /// on, at a signed prompt `$ ` on row 0 with nothing typed.
     fn at_signed_prompt() -> Terminal {
         let mut t = Terminal::new(4, 20);
         t.authorize_shell_integration(KEY);
@@ -319,6 +326,9 @@ mod tests {
     }
 
     /// `input_region_start` is the visible cell of the prompt's AUTHENTICATED
+    /// `B`, and that prompt's id: where the shell said its buffer starts,
+    /// whatever is typed after it, until the next prompt's own `B`, whose id
+    /// is another.
     #[test]
     fn input_region_start_is_the_signed_prompt_s_b() {
         let mut t = at_signed_prompt();
@@ -359,6 +369,10 @@ mod tests {
     }
 
     /// A signed `B` that does not say it stands at the buffer's start names
+    /// none: zsh sends its `B` from zle-line-init after zle drew a line
+    /// pre-filled from its buffer stack (accept-and-hold: `P> echo hi` with
+    /// the mark at column 10, measured on zsh 5.9), and aterm's integration
+    /// says `aterm_input=start` only over an empty buffer.
     #[test]
     fn a_b_that_does_not_say_it_starts_the_buffer_names_no_start() {
         let mut t = Terminal::new(4, 20);
@@ -385,6 +399,8 @@ mod tests {
     }
 
     /// In the window of a re-key the shell has not taken, the marks it signs
+    /// with the new key before then were dropped: the phase, and the `B` the
+    /// engine holds, may belong to a prompt that is over.
     #[test]
     fn input_region_start_is_none_while_the_phase_is_not_the_shell_s_last_word() {
         let mut t = at_signed_prompt();
@@ -408,6 +424,10 @@ mod tests {
     }
 
     /// Once the prompt in front is not the one the `B` belongs to, or is not
+    /// where the grid's coordinates say, there is no input region: a command
+    /// started (`C`), a program a key binding started holds the foreground, the
+    /// alternate screen is up, the prompt's row scrolled off the top, or the
+    /// viewport is scrolled back into history.
     #[test]
     fn input_region_start_is_none_once_its_prompt_is_not_in_front() {
         let mut t = at_signed_prompt();
@@ -453,6 +473,9 @@ mod tests {
     }
 
     /// A predecessor's checkpoint carries no `started_seq` (the wire's
+    /// default reads 0): the restore starts the count at the carried blocks
+    /// that reached C, finished or running, and a carried count above them
+    /// (a clear took some) stands.
     #[test]
     fn a_restore_never_counts_fewer_starts_than_its_blocks_prove() {
         let prompt = b"\x1b]133;A\x07$ \x1b]133;B\x07";

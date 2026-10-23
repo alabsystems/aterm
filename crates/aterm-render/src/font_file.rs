@@ -35,6 +35,7 @@ fn not_regular() -> io::Error {
 }
 
 /// Open once and prove that the handle which will be read is a regular file,
+/// returning it with the path that was actually opened.
 #[cfg(unix)]
 fn open_regular(path: &Path) -> io::Result<(std::fs::File, Cow<'_, Path>)> {
     match open_regular_no_follow(path) {
@@ -52,6 +53,7 @@ fn open_regular(path: &Path) -> io::Result<(std::fs::File, Cow<'_, Path>)> {
 }
 
 /// The one `open` [`open_regular`] performs per path: never through a
+/// final-component link, never blocking, and only a regular file is kept.
 #[cfg(unix)]
 fn open_regular_no_follow(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -77,6 +79,7 @@ fn open_regular(path: &Path) -> io::Result<(std::fs::File, Cow<'_, Path>)> {
 }
 
 /// [`open_regular`] with an explicit share mode: the copy path shares everything (std's
+/// default); the mapping path ([`open_for_admission`]) refuses write sharing.
 #[cfg(windows)]
 fn open_regular_shared(path: &Path, share: u32) -> io::Result<std::fs::File> {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
@@ -98,7 +101,7 @@ fn open_regular_shared(path: &Path, share: u32) -> io::Result<std::fs::File> {
     Ok(file)
 }
 
-/// Portable fallback. Targets without a non-blocking filesystem-open flag use
+/// Portable fallback.
 #[cfg(not(any(unix, windows)))]
 fn open_regular(path: &Path) -> io::Result<(std::fs::File, Cow<'_, Path>)> {
     if !std::fs::symlink_metadata(path)?.file_type().is_file() {
@@ -146,6 +149,8 @@ pub fn read_bounded_font_file_into(
 }
 
 /// The read half of [`read_bounded_font_file_into`], over a handle
+/// [`open_regular`] + [`check_observed_size`] already admitted, so the mapping
+/// path can fall back to the copy without reopening the pathname.
 fn read_admitted_handle(
     file: std::fs::File,
     length: u64,
@@ -183,6 +188,7 @@ pub struct MappedFontFile {
     len: usize,
     identity: (u64, u64),
     /// A duplicate of the admission handle, held so its no-write-share mode lasts as long as
+    /// the bytes are addressable.
     #[cfg(windows)]
     _file: std::fs::File,
 }
@@ -201,7 +207,7 @@ unsafe impl Sync for MappedFontFile {}
 
 #[cfg(unix)]
 impl MappedFontFile {
-    /// Map `len` bytes of an already-admitted handle. `len` is the `fstat`
+    /// Map `len` bytes of an already-admitted handle.
     fn map(file: &std::fs::File, len: u64) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt as _;
         use std::os::unix::io::AsRawFd as _;
@@ -246,6 +252,8 @@ impl MappedFontFile {
 #[cfg(windows)]
 impl MappedFontFile {
     /// Map `len` bytes of an already-admitted handle, read-only, as the unix `map` does: `len`
+    /// is the size [`check_observed_size`] bounded, and an empty file (which
+    /// `CreateFileMappingW` refuses) is refused up front.
     fn map(file: &std::fs::File, len: u64) -> io::Result<Self> {
         use std::os::windows::io::AsRawHandle as _;
 
@@ -307,6 +315,7 @@ impl MappedFontFile {
 #[cfg(not(any(unix, windows)))]
 impl MappedFontFile {
     /// No mapping on this target: [`admit_font_file`] never asks for one
+    /// ([`open_for_admission`] answers `false`), and this says why if it did.
     fn map(_file: &std::fs::File, _len: u64) -> io::Result<Self> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
@@ -423,6 +432,7 @@ pub struct FaceTables {
 }
 
 /// Most table records a face directory may declare before it is refused as
+/// malformed.
 const MAX_TABLE_RECORDS: usize = 1024;
 
 /// Read tables `tags` of face `face_index` at `path` (each at most `max_table_bytes`) via [`open_regular`].
@@ -492,6 +502,9 @@ pub fn read_face_tables(
 }
 
 /// [`admit_font_file`]'s one open, and whether its handle may be MAPPED:
+/// `mappable` ([`maps_in_place`] in production) judges the path the handle
+/// was opened at, which for a link is its canonical target ([`open_regular`]),
+/// so a link on the system font volume to a user-writable file is copied.
 #[cfg(unix)]
 fn open_for_admission(
     path: &Path,
@@ -503,6 +516,8 @@ fn open_for_admission(
 }
 
 /// Windows: a file [`maps_in_place`] would map is opened without write sharing, which the
+/// mapping keeps ([`MappedFontFile`]), so no process can open it for writing while its bytes
+/// are a live `&[u8]`.
 #[cfg(windows)]
 fn open_for_admission(
     path: &Path,
@@ -544,6 +559,8 @@ mod win {
     pub(super) const FILE_MAP_READ: u32 = 0x0004;
 
     /// `BY_HANDLE_FILE_INFORMATION` (52 bytes): the attributes and three
+    /// `FILETIME`s, the volume serial number, the size and link count, then
+    /// the file index.
     #[repr(C)]
     #[derive(Default)]
     struct ByHandleFileInformation {
@@ -635,6 +652,7 @@ mod tests {
     }
 
     /// A reused buffer reads what a fresh one does, including after a larger file (the stale
+    /// tail a missing `clear()` would leave).
     #[test]
     fn a_reused_buffer_reads_the_same_bytes_a_fresh_one_does() {
         let root = fixture_dir("reuse");
@@ -658,7 +676,7 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove font-file fixtures");
     }
 
-    /// A refused path must not leave the previous font in a reused buffer. One case per
+    /// A refused path must not leave the previous font in a reused buffer.
     #[test]
     fn a_refused_path_leaves_no_stale_font_in_a_reused_buffer() {
         let root = fixture_dir("stale");
@@ -690,6 +708,7 @@ mod tests {
     }
 
     /// A one-shot read allocates no slack: the blob is interned for the process's life, so
+    /// over-reserved capacity would stay resident.
     #[test]
     fn a_fresh_read_allocates_no_slack() {
         let root = fixture_dir("exact-capacity");
@@ -722,6 +741,8 @@ mod tests {
     }
 
     /// A file under the system font directory maps; one under any user-writable directory (the
+    /// per-user `$HOME` dirs, `/Library/Fonts`) copies, as does a `..` traversal that begins in
+    /// the system directory.
     #[test]
     fn maps_in_place_admits_the_system_font_volume_and_nothing_user_writable() {
         #[cfg(target_os = "macos")]
@@ -776,6 +797,8 @@ mod tests {
     }
 
     /// The residency policy is [`maps_in_place`]: a file outside the system
+    /// font volume — here a fixture directory, standing in for every
+    /// user-writable path — is COPIED, empty or not, with exactly its bytes.
     #[test]
     fn admit_font_file_copies_a_file_off_the_system_font_volume() {
         let root = fixture_dir("admit-policy");
@@ -801,6 +824,8 @@ mod tests {
     }
 
     /// The mapping arm answers the SAME bytes the copy arm does: a file on the
+    /// admitted system font volume is MAPPED (macOS, Windows; elsewhere nothing
+    /// is).
     #[cfg(any(target_os = "macos", windows))]
     #[test]
     fn admit_font_file_maps_a_file_on_the_system_font_volume() {
@@ -844,6 +869,8 @@ mod tests {
     }
 
     /// The Windows stand-in for a read-only volume, checked against the OS: while a view is live,
+    /// opening the file for writing fails with a sharing violation (the mapping keeps the
+    /// no-write-share handle), readers still open it, and the refusal lifts with the view.
     #[cfg(windows)]
     #[test]
     fn a_mapped_font_refuses_writers_until_it_is_dropped() {
@@ -879,6 +906,10 @@ mod tests {
     }
 
     /// The servicing path the mapping keeps open, checked against the OS: the
+    /// admission grants `FILE_SHARE_DELETE`, so while a view is live the file
+    /// can still be RENAMED and its name reused (a font replaced while aterm
+    /// runs), and the view, bound to the file object rather than to its name,
+    /// still reads the original bytes.
     #[cfg(windows)]
     #[test]
     fn a_mapped_font_can_be_renamed_and_replaced_and_its_view_keeps_the_original() {
@@ -910,6 +941,7 @@ mod tests {
     }
 
     /// A mappable file a writer already holds is not mapped (its bytes could change under the
+    /// view) nor refused: it is copied through the fully-shared open.
     #[cfg(windows)]
     #[test]
     fn a_mappable_font_a_writer_holds_is_copied_not_refused() {
@@ -1044,6 +1076,9 @@ mod tests {
     }
 
     /// A font installed as a LINK (Ubuntu's `UbuntuMono-R.ttf`, a stow or
+    /// home-manager font in `~/.local/share/fonts`) admits as the file it
+    /// names, through every entry point; a link loop and a dangling link do
+    /// not; and residency is decided on the file opened, so a copy is a copy.
     #[cfg(unix)]
     #[test]
     fn a_link_to_a_regular_font_admits_as_its_target() {

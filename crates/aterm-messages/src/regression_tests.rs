@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Regression repros across the engine: each test states the behaviour it
-//! pins.
+//! Regression repros across the engine: each test states the behaviour it pins.
 
 use crate::carry::{CarriedMessage, Carry};
 use crate::center::{EchoKind, MessageCenter, Outcome};
@@ -90,12 +89,8 @@ fn drained(c: &mut MessageCenter) -> Vec<LogLine> {
         .collect()
 }
 
-// ---- center ---------------------------------------------------------------
-
 /// A row that leaves the glass without retiring is demoted, and its patience
-/// re-bases so it re-anchors on its return. A host heartbeat restating the
-/// unchanged hold (`messages_host::restatement_of`) must not move that
-/// patience back to the post.
+/// re-bases so it re-anchors on its return.
 #[test]
 fn a_hold_restate_keeps_a_demoted_rows_patience() {
     let now = t0();
@@ -220,11 +215,7 @@ fn a_reveal_that_moves_the_glass_bumps_the_revision() {
 /// The host's contract (`messages_host.rs` `App::seed_carried_messages`,
 /// `PARKED_PARENT_ID_RESERVE`): the parked parent keeps minting in
 /// `[next_id, next_id + reserve)` until Commit and this process mints above
-/// it. A squatter the seed moves off a carried number lands above the band,
-/// never on the parent's next id. The host reserves before the seed; this
-/// test replays that order, and the host's
-/// `a_record_the_seed_moves_off_a_carried_id_lands_above_the_parked_band`
-/// pins the order itself.
+/// it.
 #[test]
 fn a_squatter_moved_by_the_seed_lands_above_the_parents_band() {
     const RESERVE: u64 = 1000;
@@ -261,7 +252,6 @@ fn a_squatter_moved_by_the_seed_lands_above_the_parents_band() {
             repeats: 1,
         }],
     };
-    // The host's order: the parked parent's reserve, then the seed.
     c.raise_next_id(carry.next_id + RESERVE);
     c.seed_carried(&carry, stamp(4), now);
     assert_eq!(
@@ -281,8 +271,6 @@ fn a_squatter_moved_by_the_seed_lands_above_the_parents_band() {
         carry.next_id + RESERVE
     );
 }
-
-// ---- log --------------------------------------------------------------------
 
 /// `ReadQuery::select` returns records ascending by id, with `since=` the
 /// oldest ones above it, so a reader paging with the last id it saw never
@@ -339,7 +327,6 @@ fn a_remapped_record_retired_after_the_boot_merges_into_one() {
     let mut boot = boot_lines();
     boot.push(posted(4, 300, tags::SYSTEM, "Four"));
     ring.replay_all(boot);
-    // After the boot the parent wrote 6 and retired its 3; sorted by id.
     let mut disk_lines = boot_lines();
     disk_lines.push(retired(
         3,
@@ -448,8 +435,6 @@ fn a_decoded_record_offers_at_most_max_actions() {
     );
 }
 
-// ---- carry ------------------------------------------------------------------
-
 /// A carried wire row stays the wire's (`Origin::wire_owned`): a keyless
 /// wire row (`notice post … sev=warn` with no `key=`) carried across the
 /// handoff files its Retired line on the wire's shelf, beside its Posted
@@ -520,8 +505,6 @@ fn a_rows_repeats_cross_the_handoff() {
         "the carried row folded 5 posts and reads"
     );
 }
-
-// ---- wire -------------------------------------------------------------------
 
 /// `messages` reads a live row's current severity, as the glass and the page
 /// do: a live row restated to Warn prints `sev=warn`, and the `sev=` floor
@@ -617,8 +600,6 @@ fn messages_refuses_a_signed_number() {
     assert_eq!(parse_read_args("+5"), Err(crate::wire::READ_USAGE));
     assert_eq!(parse_read_args("since=+3"), Err(crate::wire::READ_USAGE));
 }
-
-// ---- render -----------------------------------------------------------------
 
 fn band(msgs: &[Message], cols: usize) -> Presentation {
     let now = Instant::now();
@@ -743,12 +724,8 @@ fn a_run_sentence_keeps_as_much_of_its_command_as_fits() {
     assert_eq!(shaped, "Run `x --flag-long-\u{2026}");
 }
 
-// ---- marks and reloads across the handoff --------------------------------
-
 /// A row restated to another mark retires under the mark it shows, written on
-/// its Retired line when it differs from the Posted line's. The ring's record
-/// reads the shown mark while the row lives, so the line is weighed against
-/// `logged_mark`, never the record: a replay of the file reads the shown mark.
+/// its Retired line when it differs from the Posted line's.
 #[test]
 fn a_restated_mark_still_rides_the_retired_line() {
     let now = t0();
@@ -880,15 +857,12 @@ fn a_commit_that_moves_the_glass_bumps_the_revision() {
 
 /// A record the seed moved off a carried number (another writer's, under the
 /// parent's row's id) keeps its file id, so Commit's reload merges its ending
-/// into it once its words have changed: one post, one record. Both kinds of
-/// squatter: the file's own record of that number, and one a boot collision
-/// had loaded under it.
+/// into it once its words have changed: one post, one record.
 #[test]
 fn a_squatter_the_seed_moved_merges_its_ending_on_reload() {
     let other = || posted(4, 100, tags::TOOLCHAIN, "Updating ALab tools");
     let ended = || retired(4, Retired::Resolved(Outcome::Ok), 500, "Updated ALab tools");
     let first = || posted(4, 10, tags::SYSTEM, "First");
-    // (the boot's file, the parent's row's id, the file at Commit)
     let scenes: [(Vec<LogLine>, u64, Vec<LogLine>); 2] = [
         (
             vec![other()],
@@ -967,10 +941,7 @@ fn a_squatter_the_seed_moved_merges_its_ending_on_reload() {
 }
 
 /// The late park: the parent posted its row (Warn) after the successor's boot
-/// load, restated it to Info and parked. The seed has no Posted line to weigh
-/// the mark against and takes the carried Info; Commit's reload reads the
-/// file's Posted line (Warn), and the row's Retired line still carries Info,
-/// so the file reads what the row showed.
+/// load, restated it to Info and parked.
 #[test]
 fn a_late_parked_rows_restated_mark_rides_its_retired_line() {
     let now = t0();
@@ -998,7 +969,6 @@ fn a_late_parked_rows_restated_mark_rides_its_retired_line() {
         now + secs(1),
     ));
     let carry = parent.carried();
-    // The boot loaded the file before the parent's post.
     let mut c = MessageCenter::new(MessageLog::empty(), now);
     c.seed_carried(&carry, stamp(2), now);
     let _ = c.drain_shelved_for_persist();
@@ -1022,13 +992,9 @@ fn a_late_parked_rows_restated_mark_rides_its_retired_line() {
     );
 }
 
-// ---- progress -------------------------------------------------------------
-
 /// A count's patience is max(STALL_AFTER, COUNT_STALL_GAPS × its own mean gap
 /// between advances) and restarts when a held phase ends; the plateau is no
-/// part of the count's pace. A count that moved once a second before a
-/// two-minute held phase, and then really stops, says `stalled` 10 s after
-/// the phase ends.
+/// part of the count's pace.
 #[test]
 fn a_held_plateau_never_inflates_the_counts_pace() {
     let base = t0();
@@ -1040,17 +1006,14 @@ fn a_held_plateau_never_inflates_the_counts_pace() {
         unit,
     };
     let mut t = ProgressTrack::default();
-    // Four advances, one a second.
     for k in 0..=4u64 {
         t.observe(at(k * 1000), steps(k * 10, Unit::Steps));
     }
-    // A two-minute held phase: the fill holds, re-fed every 2 s.
     for k in 0..=60u64 {
         let now = at(4_000 + k * 2_000);
         t.observe(now, steps(40, Unit::HeldSteps));
         assert_ne!(t.eta(now), Eta::Stalled, "held at {k}");
     }
-    // The next download starts at the same share, and hangs.
     let resumed = at(126_000);
     t.observe(resumed, steps(40, Unit::Steps));
     assert_eq!(
@@ -1060,8 +1023,6 @@ fn a_held_plateau_never_inflates_the_counts_pace() {
     );
     assert_eq!(t.eta(at(136_000)), Eta::Stalled);
 }
-
-// ---- words: the finished-verb table ----------------------------------------
 
 /// A live row withdrawn by a Fault is logged `… stopped` (by a Vanish
 /// `… ended`), with its live title as the first detail line.
@@ -1113,8 +1074,6 @@ fn a_paste_whose_session_went_away_is_logged_ended() {
     );
 }
 
-// ---- words: the spoken description ----------------------------------------
-
 /// A page entry at `at_unix_ms`.
 fn view_at(at_unix_ms: u64) -> MessageView {
     MessageView {
@@ -1163,8 +1122,6 @@ fn the_spoken_when_agrees_with_the_local_day_header() {
     );
 }
 
-// ---- waits: line counts -----------------------------------------------------
-
 /// `lines_words`: a figure that would round to ten of the tenths unit reads
 /// as the whole unit, so 9,950–9,999 lines read `10K`, never `10.0K`.
 #[test]
@@ -1174,8 +1131,6 @@ fn a_count_that_rounds_to_ten_thousand_reads_10k() {
     assert_eq!(lines_words(9_999), "10K");
     assert_eq!(rewrap_stats(9_960, 10_000), "10K of 10K lines");
 }
-
-// ---- center: the retired record's mark -------------------------------------
 
 /// The ring's and the replayed file's mark for `id`.
 fn marks(c: &mut MessageCenter, id: MessageId) -> ((Severity, Glyph), Option<(Severity, Glyph)>) {
@@ -1264,8 +1219,6 @@ fn a_row_restated_back_to_info_and_folded_reads_info_in_the_ring() {
     assert_eq!(ring, info_mark, "the ring reads the mark the file does");
 }
 
-// ---- log: the reload merge --------------------------------------------------
-
 /// The reload merge gives a Stale record the ending the file has for that
 /// record: of two records with one stamp, tag and title (the first folded,
 /// the second still open when aterm stopped), the successor's own post
@@ -1301,7 +1254,6 @@ fn the_reload_merge_never_hands_one_records_ending_to_its_twin() {
     assert_eq!(boot.get(mid(2)).unwrap().retired(), Some(&Retired::Stale));
     let now = t0();
     let mut c = MessageCenter::new(boot, now);
-    // The successor records something before Commit.
     c.post(
         Message::new(tags::SYSTEM, Severity::Info, "Before commit").hold(Hold::LogOnly),
         stamp(30_000),
@@ -1327,8 +1279,7 @@ fn the_reload_merge_never_hands_one_records_ending_to_its_twin() {
 /// measured finer than its count is held one permille under the percent the
 /// next count paints: `3 of 10 programs` at 45 % paints `39%`, not `4 of
 /// 10`'s `40%`; `9 of 10` never fills the bar; `1 of 3` stops at `65%`
-/// because `2 of 3` paints `66%` (667). Every count of every total up to
-/// twelve, wherever the two counts' percents differ.
+/// because `2 of 3` paints `66%` (667).
 #[test]
 fn a_measured_fill_never_paints_the_next_counts_percent() {
     let fill = |fill: u16, stats: &str, amount: bool| {
@@ -1405,7 +1356,7 @@ fn messages_prints_load_only_where_the_glass_says_it() {
 /// carry, 2026-10-20: `lab instance --image` waited half a second of quiet
 /// and imaged a band with no standing ask on it, its two-second grace still
 /// running): `reveal=pending` until the row is eligible for the band, then
-/// never again. NEGATIVE CONTROL: a row posted with no grace never says it.
+/// never again.
 #[test]
 fn messages_says_a_row_in_its_grace_is_pending_until_it_is_revealed() {
     let now = t0();
@@ -1428,7 +1379,6 @@ fn messages_says_a_row_in_its_grace_is_pending_until_it_is_revealed() {
     assert_eq!(pending(&c), [true]);
     c.settle(now + PROGRESS_GRACE, true);
     assert_eq!(pending(&c), [false], "revealed");
-    // NEGATIVE CONTROL.
     let mut c = fresh(now);
     let msg = Message::new(tags::UPDATE, Severity::Info, "Downloading aterm v0.92.0")
         .in_flight()
@@ -1477,11 +1427,7 @@ impl Host for Plain {
 }
 
 /// `still open when aterm stopped` is for a record replayed open from a
-/// process that was killed or crashed. A seamless handoff ends the parent
-/// gracefully: the rows its carry did not take (unrevealed rows) are closed by
-/// the parent at Commit
-/// (`MessageCenter::close_uncarried`), never read in the successor as cut
-/// off by a crash.
+/// process that was killed or crashed.
 #[test]
 fn rows_the_carry_drops_are_not_read_as_a_crash_in_the_successor() {
     let now = t0();
@@ -1522,11 +1468,8 @@ fn rows_the_carry_drops_are_not_read_as_a_crash_in_the_successor() {
         "premise: neither row is carried: {:?}",
         carry.live.iter().map(|m| m.id).collect::<Vec<_>>()
     );
-    // The parent's Commit: what the carry did not take ends with it, right
-    // before its last write.
     let carried: Vec<u64> = carry.live.iter().map(|m| m.id).collect();
     assert_eq!(parent.close_uncarried(&carried, now), 2);
-    // The parent's file, as it flushed it before handing off.
     let mut disk = MessageLog::empty();
     disk.replay_all(drained(&mut parent));
     let mut c = MessageCenter::new(disk.clone(), now);

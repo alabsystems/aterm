@@ -1,47 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm ctl await task`: a manager's ONE wait over its workers, wherever on
-//! this machine they run (`docs/DESIGN-sessions-as-subagents-2026-10-15.md`
-//! §2.2).
-//!
-//! ```text
-//! aterm ctl await task @a,@b,@c [any|all] [since=<rev>] [timeout=<ms>]
-//! aterm ctl @a await task [since=<rev>] [timeout=<ms>]
-//! ```
-//!
-//! The server answers for the sessions of its own instance; this client:
-//!
-//! 1. GROUPS the targets by the instance that hosts them — a global sid by its
-//!    graph entry (`<dir>/graph/<sid>`, the rendezvous `ls` walks), a local id
-//!    or `@.` on the instance the call resolves to, everything on the one
-//!    instance `--sock`/`--pid` names (so a sibling's sid there is that
-//!    instance's `ERR no such session`: the list form is never relayed);
-//! 2. reads each target once (a `timeout=0` leg): the server answers a row per
-//!    target in request order, so row `i` names target `i`'s global sid, which
-//!    every later leg uses, and its rev, the BASELINE every later leg waits
-//!    past (`@<sid>:<rev>`) — the wait is one edge however many legs it takes:
-//!    news reached during a re-arm is still news, and news a target already
-//!    had at the start is not (a `since=` the caller gives is the baseline
-//!    instead: `since=0` takes any news);
-//! 3. asks every instance AT ONCE, one thread each, and combines them: `any`
-//!    answers with the first instance that has news, `all` once every one has;
-//! 4. RE-ARMS each instance past the server's 600 s bound until its own
-//!    deadline — the verb's `timeout=<ms>`, else `--timeout`, else
-//!    [`DEFAULT_TOTAL`] — and FOLLOWS A SELF-UPDATE: a leg cut before its reply
-//!    by a server that went away is asked again of its successor
-//!    ([`redial::Redial::host`]), with the same baselines;
-//! 5. KEEPS A WORKER THAT IS GONE: a row that says `state=closed`, or a leg
-//!    refused `ERR no such session` for a target already read (its session
-//!    closed between two legs, or the update's successor did not carry it),
-//!    is that target's news — its row stands, as `closed`, and it leaves every
-//!    later leg — so a person closing one finished worker's tab never ends a
-//!    manager's wait on the others.
-//!
-//! It prints every target's row (`@<sid> rev= state= agent= attention=
-//! result_bytes=`), instance by instance, and exits 0 when the wait was
-//! answered, 124 at the deadline (`OK timeout` on stderr), 75 when an
-//! instance went away with no successor.
+//! `aterm ctl await task`: a manager's ONE wait over its workers, wherever on this machine they run (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §2.2).
 
 use std::io::{self, BufReader};
 use std::path::Path;
@@ -55,18 +15,13 @@ use super::{
     stdout_handle, stream_count,
 };
 
-/// The whole wait when neither the verb's `timeout=` nor `--timeout` names one:
-/// a worker's task is minutes to an hour, and the manager runs this as a
-/// background command whose exit wakes it.
+/// The whole wait when neither the verb's `timeout=` nor `--timeout` names one: a worker's task is minutes to an hour, and the manager runs this as a background command whose exit wakes it.
 pub(crate) const DEFAULT_TOTAL: Duration = Duration::from_secs(3600);
 
-/// The longest one leg asks for: the server's clamp on every `await`
-/// (`aterm_control::wire::WAIT_MAX_MS`). A server with a lower clamp answers
-/// its own timeout sooner, and the leg is simply re-armed.
+/// The longest one leg asks for: the server's clamp on every `await` (`aterm_control::wire::WAIT_MAX_MS`).
 pub(crate) const LEG_MAX: Duration = Duration::from_secs(600);
 
-/// What a leg's socket may take beyond the wait it asked for: the reply's own
-/// write, and a loaded machine.
+/// What a leg's socket may take beyond the wait it asked for: the reply's own write, and a loaded machine.
 pub(crate) const LEG_SLACK: Duration = Duration::from_secs(30);
 
 /// The client's usage line for this form.
@@ -91,7 +46,7 @@ enum Combine {
 }
 
 impl Combine {
-    fn word(self) -> &'static str {
+    const fn word(self) -> &'static str {
         match self {
             Self::Any => "any",
             Self::All => "all",
@@ -119,9 +74,7 @@ fn usage() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, USAGE)
 }
 
-/// Parse `[@<sel>] await task <words…>`. A leading selector is the one target;
-/// otherwise the list names them; neither is the session the call resolves to
-/// (`@.`).
+/// Parse `[@<sel>] await task <words…>`.
 fn parse(parts: &[String]) -> io::Result<Request> {
     let (leading, rest) = match parts.first() {
         Some(sel) if sel.starts_with('@') => (Some(sel.as_str()), &parts[1..]),
@@ -181,7 +134,6 @@ fn parse(parts: &[String]) -> io::Result<Request> {
             since: None,
         });
     }
-    // A target named twice is waited on once.
     let mut seen: Vec<String> = Vec::new();
     request.targets.retain(|t| {
         let fresh = !seen.contains(&t.selector);
@@ -191,10 +143,7 @@ fn parse(parts: &[String]) -> io::Result<Request> {
     Ok(request)
 }
 
-/// One list element, `@<sel>` or `@<sel>:<rev>`. A selector that names
-/// nothing (`@`, `@:3`, an empty `@$W` in `@$W1,@$W2`) is refused
-/// ([`aterm_types::control_verbs::EMPTY_SELECTOR`]), never waited on as the
-/// session the call resolves to.
+/// One list element, `@<sel>` or `@<sel>:<rev>`.
 fn target(element: &str) -> io::Result<Target> {
     let body = element.strip_prefix('@').ok_or_else(usage)?;
     let (selector, since) = match body.split_once(':') {
@@ -230,8 +179,7 @@ struct Group {
 
 /// Group `targets` by the instance hosting each: `pinned` (`--sock`/`--pid`)
 /// takes them all; else a global sid goes where its graph entry points, and
-/// anything else to `default`, the instance the call resolves to. A sid no
-/// live instance hosts is the caller's error, said before anything is sent.
+/// anything else to `default`, the instance the call resolves to.
 fn group(
     targets: Vec<Target>,
     pinned: bool,
@@ -241,8 +189,6 @@ fn group(
     let mut groups: Vec<Group> = Vec::new();
     for target in targets {
         let sock = match global_sid(&target.selector) {
-            // The graph entry's socket, with a listener on it: a sid no live
-            // instance hosts is refused here, before anything is sent.
             Some(sid) if !pinned => dir
                 .and_then(|dir| self_instance_sock_in(dir, Some(sid)))
                 .filter(|sock| aterm_uds::CtlStream::connect(sock).is_ok())
@@ -283,8 +229,7 @@ enum Leg {
     /// A leg over a drive the peer did not serve, which the same leg a
     /// moment later may be: its share for this machine's address full,
     /// nothing listening at its port (an aterm restarting, its listener
-    /// rebinding), or the connection cut before the rows. Asked again within
-    /// the wait's deadline ([`Legs::again`]).
+    /// rebinding), or the connection cut before the rows.
     Again(io::Error),
     /// A connect phase that already said why on stderr.
     Code(ExitCode),
@@ -344,10 +289,7 @@ const AGAIN_AFTER: Duration = Duration::from_secs(1);
 const AGAIN_FOR: Duration = Duration::from_secs(60);
 
 /// Send one `await task` leg over a fresh drive connection to `host` and read
-/// its rows. A leg the peer did not serve — a dial it refused for its share,
-/// one nothing answered, a connection cut before the rows — is
-/// [`Leg::Again`]: on another Mac there is no successor to follow, and the
-/// worker it waits on lives on through its aterm's restart or update.
+/// its rows.
 fn driven_leg(drive: crate::FleetDriveFn, host: &str, request: &str, wait: Duration) -> Leg {
     let mut link = match drive(host, wait + DRIVEN_SLACK) {
         Ok(link) => link,
@@ -403,8 +345,6 @@ fn read_leg<R: io::BufRead>(reader: &mut R, max_bytes: usize, hung_up: impl Fn()
         Err(e) if redial::is_hangup(&e) => return hung_up(),
         Err(e) => return Leg::Failed(e),
     };
-    // Keep this reader's existing normalization of trailing CRs as well as
-    // the collector's one wire CRLF; every row is charged before it is kept.
     for row in &mut rows {
         row.truncate(row.trim_end_matches(['\r', '\n']).len());
     }
@@ -529,12 +469,9 @@ fn run_group(
     tx: &mpsc::Sender<Report>,
 ) -> End {
     let n = group.targets.len();
-    // Each target's newest row, and whether it is GONE: a `closed` row stands
-    // for the rest of the wait, and the target leaves every later leg.
     let mut rows: Vec<Option<String>> = vec![None; n];
     let mut gone = vec![false; n];
     let mut baseline_read = false;
-    // When the legs the peer has not served began, while none has been since.
     let mut unserved_since: Option<Instant> = None;
     loop {
         let live: Vec<usize> = (0..n).filter(|&i| !gone[i]).collect();
@@ -542,8 +479,6 @@ fn run_group(
             // Every target closed: each is news, so `all` has its answer too.
             return End::Answered(rows.into_iter().flatten().collect());
         }
-        // A gone target is `any`'s answer: one zero leg reads the others'
-        // rows as they stand, and the group answers with them.
         let wait = if !baseline_read || (combine == Combine::Any && gone.contains(&true)) {
             Duration::ZERO
         } else {
@@ -558,11 +493,6 @@ fn run_group(
             Leg::Answered(latest) => (true, latest),
             Leg::TimedOut(latest) => (false, latest),
             Leg::Failed(e) => {
-                // A target this wait already read that its instance no longer
-                // hosts — its session closed between two legs, or the
-                // successor of a self-update did not carry it — is its news,
-                // as a close inside a leg is. Before the baseline no target
-                // was read yet, and the refusal is the run's.
                 let Some(i) = baseline_read
                     .then(|| gone_target(&e, &group.targets, &live))
                     .flatten()
@@ -594,10 +524,6 @@ fn run_group(
                 continue;
             }
             Leg::HungUp { server, listener } => {
-                // A group of global sids follows the instance that
-                // republishes one's graph entry (every target is one past the
-                // baseline); before it, local ids follow the call's own policy
-                // (its session's entry, or the alias).
                 let policy = match live
                     .iter()
                     .find_map(|&i| global_sid(&group.targets[i].selector))
@@ -636,7 +562,6 @@ fn run_group(
             }
         };
         unserved_since = None;
-        // One row per target sent, in its order (the server's contract).
         if latest.len() != live.len() {
             return End::Failed(malformed(&format!(
                 "{} rows for {} targets",
@@ -646,8 +571,6 @@ fn run_group(
         }
         for (&i, row) in live.iter().zip(latest) {
             if !baseline_read {
-                // THE BASELINE: the sid every later leg names (`@3`, `@.` and
-                // a sid's own spelling alike), and the rev it waits past.
                 let Some(sid) = row_sid(&row) else {
                     return End::Failed(malformed(&row));
                 };
@@ -698,9 +621,6 @@ fn wait_task_groups(
             })?;
     }
     drop(tx);
-    // Every group's latest rows, and which have answered; the run ends at the
-    // combine's answer, or once every group has ended (its deadline). A group
-    // still parked when `any` answers is left to the process's exit.
     let mut rows: Vec<Vec<String>> = vec![Vec::new(); count];
     let mut ended = vec![false; count];
     let mut answered = vec![false; count];
@@ -735,9 +655,6 @@ fn wait_task_groups(
 }
 
 /// `[@<sel>] await task …`: the whole client wait ([the module](self)).
-/// `pinned` is a `--sock`/`--pid` call, `default` the socket the call
-/// resolves to, `total` the explicit `--timeout` when one was given (`Some(None)`:
-/// `--timeout 0`, no deadline).
 pub(crate) fn run_await_task(
     parts: &[String],
     pinned: bool,
@@ -746,7 +663,6 @@ pub(crate) fn run_await_task(
     total: Option<Option<Duration>>,
 ) -> io::Result<ExitCode> {
     let request = parse(parts)?;
-    // The verb's `timeout=` is the whole wait; then `--timeout`; then the default.
     let total = match (request.timeout, total) {
         (Some(verb), _) => Some(verb),
         (None, Some(flag)) => flag,
@@ -777,12 +693,7 @@ pub(crate) fn run_await_task(
     )?)
 }
 
-/// `await task …` over the fleet (`aterm ctl --host <host>`,
-/// [`crate::remote`]): every target a worker of that Mac named by its sid, the
-/// one group asked in legs of at most [`DRIVEN_LEG_MAX`], each a fresh drive
-/// connection `drive` dials, up to the same deadline as on one Mac (the
-/// verb's `timeout=`, else `--timeout`, else [`DEFAULT_TOTAL`]), printed as
-/// on one Mac.
+/// `await task …` over the fleet (`aterm ctl --host <host>`, [`crate::remote`]): every target a worker of that Mac named by its sid, the one group asked in legs of at most [`DRIVEN_LEG_MAX`], each a fresh drive connection `drive` dials, up to the same deadline as on one Mac (the verb's `timeout=`, else `--timeout`, else [`DEFAULT_TOTAL`]), printed as on one Mac.
 pub(crate) fn run_driven(
     parts: &[String],
     total: Option<Option<Duration>>,
@@ -928,9 +839,6 @@ mod tests {
         ] {
             assert!(parse(&parts(bad)).is_err(), "{bad:?}");
         }
-        // An element that names nothing (`@$W` with `$W` empty) is the empty
-        // selector refusal, never the session the call resolves to; the same
-        // list with `@.` written out (the negative control) is three targets.
         for empty in [
             "await task @s-a,@,@s-c",
             "await task @",
@@ -995,8 +903,7 @@ mod tests {
     }
 
     /// A leg retains no more than its aggregate wire budget, on the exact
-    /// boundary too. A truncated reply is a retryable cut, while malformed or
-    /// over-budget data is a failed answer, never a retry.
+    /// boundary too.
     #[test]
     fn a_legs_rows_share_one_byte_budget() {
         use std::io::Cursor;
@@ -1044,9 +951,7 @@ mod tests {
     type Step = (String, Reply);
 
     /// One scripted instance per socket: each leg must be the request the
-    /// script names next, and answers what its step returns. The script's
-    /// lock is released before a step runs, so a step that blocks holds up
-    /// only its own group.
+    /// script names next, and answers what its step returns.
     fn scripted(script: Vec<(&'static str, &'static str, Reply)>) -> Legs {
         let mut by_sock: std::collections::HashMap<String, std::collections::VecDeque<Step>> =
             std::collections::HashMap::new();
@@ -1179,8 +1084,6 @@ mod tests {
             ]
         );
 
-        // A closed row inside a leg is the same news: it leaves the next leg,
-        // and with every target gone the group has its answer.
         let legs = scripted(vec![
             (
                 x,
@@ -1206,8 +1109,6 @@ mod tests {
             ]
         );
 
-        // NEGATIVE CONTROL: before the baseline nothing was read, so a target
-        // the instance does not host is the run's refusal, not a closed row.
         let legs = scripted(vec![(
             x,
             "await task @s-d all timeout=0\n",
@@ -1229,9 +1130,7 @@ mod tests {
     /// A LEG THE PEER DID NOT SERVE IS ASKED AGAIN (a drive's `Leg::Again`:
     /// its share for this address full, its listener restarting, a cut), the
     /// baseline and a re-arm alike, and the wait goes on to the worker's
-    /// news. NEGATIVE CONTROLS: a refusal the peer said (`ERR`) ends the run,
-    /// as on one Mac; and legs unserved past their bound in a row end it with
-    /// the last one's words.
+    /// news.
     #[test]
     fn a_leg_the_peer_did_not_serve_is_asked_again() {
         let x = "lab-mini";
@@ -1334,7 +1233,6 @@ mod tests {
             )
         );
 
-        // `any`: y parks after its baseline (it says so first), x answers.
         let (armed_tx, armed_rx) = mpsc::channel::<()>();
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let legs = scripted(vec![
@@ -1347,7 +1245,6 @@ mod tests {
                 x,
                 "await task @s-a:1 any timeout=600\n",
                 step(move || {
-                    // A hang detector, never a budget: y always arms.
                     armed_rx
                         .recv_timeout(Duration::from_secs(60))
                         .expect("y parks");
@@ -1383,7 +1280,6 @@ mod tests {
         );
         drop(release_tx);
 
-        // A deadline already behind: the baseline's rows, unanswered.
         let legs = scripted(vec![
             (
                 x,

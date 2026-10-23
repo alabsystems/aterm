@@ -1,51 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `screen-watch` (design §6): the part of `screen`'s lock that outlives the controller.
-//!
-//! `screen` locks a session the admin logged in to over its relay once the walk ends or is
-//! stopped (`controller::screen`). A controller that is killed (`SIGKILL`), crashes, loses
-//! power or stays cut off from the host never sends that lock, and the Mac stays logged in and
-//! unlocked at its display. So when `screen` finds nobody logged in, it arms a watcher on the
-//! host before it relays anything, and disarms it after its own lock:
-//!
-//! | verb | what |
-//! |---|---|
-//! | `screen-watch arm --uid <uid> --user <name>` | records the arm (`<id>.armed`), starts `screen-watch run <id>` detached, and prints `armed <id>` once the watcher watches ([`arm`]) |
-//! | `screen-watch run <id>` | the watcher, started by `arm` alone ([`run`], [`watch`]) |
-//! | `screen-watch disarm <id>` | removes the arm and what its watcher left; a watcher whose arm is gone ends without locking ([`disarm`]) |
-//!
-//! All three run as root. `arm` and `disarm` come as signed `exec` envelopes like every other
-//! request `screen` makes, so nothing here adds a way to root, and all the watcher can do is
-//! lock one account's login session. It holds no run lock, so the walk's own requests are never
-//! `busy` because of it. The watcher leads a session of its own ([`System::spawn_detached`]), so
-//! it outlives the run that started it, and it ignores hang-ups.
-//!
-//! The heartbeat is the agent's own record of signed requests, which only root writes: a run's
-//! start is `state/run.lock` naming it, its end `state/last_run` naming it, and a request
-//! refused because another run holds the host is `state/last_busy` naming it (a walk's
-//! requests are all refused for as long as another command's `apply` lasts). A walk makes a
-//! signed request every few seconds (each re-probe, each reading of the session), so once none
-//! of the three has changed for [`QUIET`], or the watcher has watched for [`LIFE`], the
-//! controller is taken to be gone. A run in progress does not hold the lock off: one that hung
-//! would hold it off for good. The watcher probes the login session (`launchctl print
-//! gui/<uid>`) and attempts the agent's `lock-screen` even if that reading failed or was
-//! signaled: no failed reading establishes absence. The existing lock reports an absent
-//! session through its own refusal. The watcher writes what happened to `<id>.ended` and ends. A Mac that
-//! loses power needs nothing: it comes back with no session, or with auto-login's own.
-//!
-//! `state/screen-watch/` (root:wheel 0700) holds, for each arm `<id>` (`<unix seconds>-<pid of
-//! the arm>`):
-//!
-//! * `<id>.armed` (0600): the account and when it was armed ([`Armed`]); the watcher watches
-//!   while it is there;
-//! * `<id>.watching` (0600): the watcher's pid, written once it watches;
-//! * `<id>.log` (0600): the watcher's standard output and error;
-//! * `<id>.ended` (0600): the one line the watcher ended with, when it ended of its own accord.
-//!
-//! One watch per account once startup is acknowledged: only then does `arm` remove other
-//! arms whose parsed uid matches (their watchers then end without locking). Unknown records,
-//! other accounts and leftover diagnostics stay. A failed replacement leaves the prior watch armed.
+//! Detached `screen-watch` lock watcher ([`arm`], [`run`], [`watch`], [`disarm`], [`Armed`]).
+//! Spawns via [`System::spawn_detached`] and locks after [`QUIET`] idle or [`LIFE`] elapsed.
 
 use super::{Layout, state};
 use crate::model::User;
@@ -56,18 +13,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-/// How long no signed request may reach the host (no run starting or ending, none refused
-/// `busy`) before the watcher takes the controller to be gone. A walk's requests come one
-/// every few seconds, its pause between re-probes (`controller::screen::POLL`, 2 s) plus a
-/// request's own time, so this is a hang detector over the walk's gaps, never a latency
-/// budget. The longest come while a login over the relay keeps the host busy, well under this
-/// but not by the margin of a step's wait (design §11); a walk that sees a gap of half this
-/// arms the watch again (`controller::screen`), in case it locked and ended meanwhile.
+/// How long no signed request may reach the host before the watcher locks.
 pub const QUIET: Duration = Duration::from_secs(60);
 
-/// The longest a watcher watches. Each of a walk's waits ends at its hang detector
-/// (`controller::screen::PERSON_HANG`, 15 minutes), so a walk of a dozen steps ends well
-/// before this; a watcher that reaches it locks and ends.
+/// The longest a watcher watches.
 pub const LIFE: Duration = Duration::from_secs(4 * 3600);
 
 /// The pause between two readings of the heartbeat.
@@ -79,8 +28,7 @@ pub const START_HANG: Duration = Duration::from_secs(10);
 /// The pause between two looks for `<id>.watching`.
 const START_POLL: Duration = Duration::from_millis(100);
 
-/// The bound on the watcher's `lock-screen` (which reads the lock back for at most
-/// `lock::LOCK_HANG`).
+/// Timeout for the watcher's `lock-screen` command.
 const LOCK_BUDGET: Duration = Duration::from_secs(30);
 
 /// Time as `arm` and the watcher see it, so a test watches for hours without sleeping.
@@ -211,8 +159,7 @@ fn not_armed(out: &mut dyn Write, why: &str) -> ExitCode {
     say(out, &format!("not armed: {why}"), ExitCode::FAILURE)
 }
 
-/// Whether `path` is root's alone: owned by root, not a link, of the kind asked for, and
-/// neither readable nor writable by anyone else.
+/// Whether `path` is root's alone.
 fn root_only(sys: &dyn System, path: &Path, dir: bool) -> Result<(), String> {
     let st = sys
         .stat(path)
@@ -238,8 +185,7 @@ fn read_armed(sys: &dyn System, layout: &Layout, id: &str) -> Result<Armed, Stri
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Remove every file of arm `id`, its `.armed` first: the watcher reads that one, and ends
-/// without locking once it is gone.
+/// Remove every file of arm `id`, its `.armed` first.
 ///
 /// # Errors
 /// The first removal that failed; the others are still tried.
@@ -255,10 +201,7 @@ fn forget(sys: &dyn System, layout: &Layout, id: &str) -> std::io::Result<()> {
     first
 }
 
-/// After the new watcher acknowledges startup: remove only other arms whose parsed uid
-/// matches `uid`. Unknown records, other accounts and leftover diagnostics stay: a failed
-/// read or a PID probe does not establish that another watch may be retired. Returns the
-/// same-account arms it replaced.
+/// Retire other same-account arms after the new watcher acknowledges startup.
 fn prune(sys: &dyn System, layout: &Layout, uid: u32, new: &str) -> Vec<String> {
     let Ok(names) = sys.list_dir(&layout.screen_watch()) else {
         return Vec::new();
@@ -271,7 +214,6 @@ fn prune(sys: &dyn System, layout: &Layout, uid: u32, new: &str) -> Vec<String> 
     ids.dedup();
     let mut replaced = Vec::new();
     for id in ids {
-        // Only positive same-account ownership authorizes retiring another arm.
         // Unknown records and other accounts stay, regardless of a PID reading.
         if let Ok(armed) = read_armed(sys, layout, id)
             && armed.uid == uid
@@ -283,11 +225,7 @@ fn prune(sys: &dyn System, layout: &Layout, uid: u32, new: &str) -> Vec<String> 
     replaced
 }
 
-/// `screen-watch arm --uid <uid> --user <name>`: check that `user` is an account with that
-/// uid, record the arm, start the watcher detached ([`System::spawn_detached`], its output to
-/// `<id>.log`), and wait until it writes `<id>.watching` ([`START_HANG`]). Prints `armed <id>`
-/// (with the arms it replaced) and exits 0, or `not armed: <why>` and exits 1, with no arm
-/// left behind. `pid` is this process's own (the id names it).
+/// `screen-watch arm`: spawn the watcher ([`System::spawn_detached`]) and wait [`START_HANG`].
 pub fn arm(
     sys: &dyn System,
     layout: &Layout,
@@ -365,7 +303,6 @@ pub fn arm(
         }
         clock.pause(START_POLL);
     }
-    // Retire the prior watch only after its replacement has acknowledged startup.
     let replaced = prune(sys, layout, uid, &id);
     let line = if replaced.is_empty() {
         format!("armed {id}")
@@ -384,10 +321,7 @@ pub enum Ended {
     Done(String),
 }
 
-/// The heartbeat: the run the run lock names (one in progress), the newest finished run, and
-/// the newest signed request refused `busy`. Any one changing is a signed request reaching the
-/// host: a run starting or ending, or one refused while another command's run holds the host.
-/// A run still in progress is not one: a run that hung would hold the lock off for good.
+/// The heartbeat: the run the run lock names (one in progress).
 fn heartbeat(sys: &dyn System, layout: &Layout) -> [Option<String>; 3] {
     [
         state::holder(sys, layout).map(|h| h.run),
@@ -396,8 +330,7 @@ fn heartbeat(sys: &dyn System, layout: &Layout) -> [Option<String>; 3] {
     ]
 }
 
-/// Whether arm `id` is gone. Only its absence counts: a reading that fails otherwise keeps
-/// the watch going.
+/// Whether arm `id` is gone.
 fn gone(sys: &dyn System, layout: &Layout, id: &str) -> bool {
     matches!(
         sys.stat(&file(layout, id, "armed")),
@@ -405,16 +338,13 @@ fn gone(sys: &dyn System, layout: &Layout, id: &str) -> bool {
     )
 }
 
-/// Probe `user`'s login session with `launchctl print gui/<uid>`. Success reads it present;
-/// non-success alone cannot establish absence, so the watcher still attempts the lock.
+/// Probe `user`'s login session with `launchctl print gui/<uid>`.
 #[must_use]
 pub fn session_cmd(user: &User) -> Cmd {
     Cmd::new(crate::items::person::LAUNCHCTL).args(["print", &format!("gui/{}", user.uid)])
 }
 
-/// The lock: the agent's own `lock-screen` (through the stable `bin/aterm`, which an upgrade
-/// while the watcher runs leaves in place) as `user` in `user`'s login session, the way
-/// `controller::screen::lock_cmd` runs it (`launchctl asuser`, `sudo -n -u`, `env -i`).
+/// Build the `lock-screen` command for `user`'s login session.
 #[must_use]
 pub fn lock_cmd(layout: &Layout, user: &User) -> Cmd {
     Cmd::new(layout.exe_link())
@@ -424,8 +354,7 @@ pub fn lock_cmd(layout: &Layout, user: &User) -> Cmd {
         .budget(LOCK_BUDGET)
 }
 
-/// What a `lock-screen` that did not exit 0 said: its own `not locked: <why>`, else how it
-/// ended.
+/// What a `lock-screen` that did not exit 0 said: its own `not locked: <why>`, else how it ended.
 fn refusal(ran: &Ran) -> String {
     let out = ran.out();
     match out.lines().map(str::trim).find(|l| !l.is_empty()) {
@@ -436,11 +365,7 @@ fn refusal(ran: &Ran) -> String {
     }
 }
 
-/// Watch arm `id` for `user` until it is gone ([`Ended::Disarmed`]), or until no signed
-/// request has reached the host ([`heartbeat`]) for `bounds.quiet`, or it has watched for
-/// `bounds.life`. Then read
-/// the login session and attempt its lock ([`lock_cmd`]); a failed or signaled probe is
-/// unknown, never positive absence. Its diagnostic is retained beside the lock's outcome.
+/// Watch `id` until [`Ended::Disarmed`], [`heartbeat`] quiet, or `bounds.life`, then [`lock_cmd`].
 pub fn watch(
     sys: &dyn System,
     layout: &Layout,
@@ -478,18 +403,15 @@ pub fn watch(
         }
         clock.pause(bounds.poll);
     };
-    // A disarm that came with the last reading still wins.
     if gone(sys, layout, id) {
         return Ended::Disarmed;
     }
     let unread = match sys.run(&session_cmd(user)) {
         Ok(ran) if ran.success() => String::new(),
-        // A failed or signaled query cannot establish that the session is absent.
         Ok(ran) => format!(
             " (whether it has a login session could not be read: {})",
             ran.describe()
         ),
-        // Not known to be absent: the safe side is to try the lock.
         Err(e) => format!(" (whether it has a login session could not be read: {e})"),
     };
     Ended::Done(match sys.run(&lock_cmd(layout, user)) {
@@ -499,19 +421,14 @@ pub fn watch(
     })
 }
 
-/// The checks before the watcher trusts arm `id`: `state/screen-watch/` and `<id>.armed` are
-/// root's alone, and the arm parses.
+/// The checks before the watcher trusts arm `id`.
 fn accept(sys: &dyn System, layout: &Layout, id: &str) -> Result<Armed, String> {
     root_only(sys, &layout.screen_watch(), true)?;
     root_only(sys, &file(layout, id, "armed"), false)?;
     read_armed(sys, layout, id)
 }
 
-/// `screen-watch run <id>`: the watcher `arm` started. It refuses an arm that is not root's
-/// own or names an account that no longer has that uid; otherwise it ignores hang-ups
-/// ([`System::ignore_hangups`]), writes `<id>.watching` (`pid`, this process's own), and
-/// [`watch`]es. A watch that ended of its own accord leaves its line in `<id>.ended` and
-/// removes the arm. Everything it prints goes to `<id>.log`.
+/// `screen-watch run <id>`: the watcher `arm` started ([`System::ignore_hangups`], [`watch`]).
 pub fn run(
     sys: &dyn System,
     layout: &Layout,
@@ -571,9 +488,6 @@ pub fn run(
 }
 
 /// `screen-watch disarm <id>`: remove arm `id` and everything its watcher left ([`forget`]).
-/// Prints `disarmed <id>`, with the watcher's last line when it had ended of its own accord,
-/// or `nothing was armed` when no arm was there (a later `arm` replaced it); `not disarmed:
-/// <why>` and status 1 when a file stayed.
 pub fn disarm(sys: &dyn System, layout: &Layout, id: &str, out: &mut dyn Write) -> ExitCode {
     if sys.euid() != 0 {
         return super::refuse(
@@ -689,7 +603,6 @@ mod tests {
                 *at += d;
                 *at
             };
-            // Past the longest watch with room to spare: a loop that never ends fails here.
             assert!(now <= LIFE * 2, "still waiting after {}s", now.as_secs());
             (self.each)(now);
         }
@@ -769,7 +682,6 @@ mod tests {
         let (code, out) = arm_as(&fake, "502", "bob", &starts(&fake));
         assert_eq!(out, "not armed: no account bob\n");
         assert_eq!(code, ExitCode::FAILURE);
-        // Not a number, or not root: refused before anything is read.
         let fake = host();
         let (code, out) = arm_as(&fake, "admin", "admin", &starts(&fake));
         assert!(out.starts_with("refused: "), "{out}");
@@ -838,8 +750,6 @@ mod tests {
         let (code, out) = arm_as(&fake, "501", "admin", &starts(&fake));
         assert_eq!(out, format!("armed {ID} (replaced {old})\n"));
         assert_eq!(code, ExitCode::SUCCESS);
-        // Positive same-account replacement still works; every unknown or different
-        // owner stays even if no live PID was observed for it.
         assert!(fake.written(&path(old, "armed")).is_none());
         assert!(fake.written(&path(other, "armed")).is_some());
         let removes: Vec<String> = fake
@@ -862,8 +772,6 @@ mod tests {
     }
 
     /// A replacement that never starts must leave the existing watch in charge.
-    /// Successful replacement and cleanup are ordinary controls; the final outcome
-    /// comes from the actual surviving old watch, not a duplicate admission predicate.
     #[test]
     fn an_arm_that_cannot_start_keeps_the_watch_it_would_replace() {
         let old = "1799999000-7";
@@ -953,7 +861,6 @@ mod tests {
     #[test]
     fn the_watcher_waits_while_signed_runs_come_and_locks_once_none_has_for_the_quiet_time() {
         let fake = armed_host(Some(Ran::ok("")), Some(Ran::ok("locked\n")));
-        // A walk: one signed run every 4 s, starting and ending, for 100 s; then nothing.
         let clock = Script::new(|t| {
             let s = t.as_secs();
             if s <= 100 && s % 4 == 0 {
@@ -973,9 +880,7 @@ mod tests {
             )
         );
         assert_eq!(locks(&fake), 1);
-        // The last run ended at 100 s: the lock came one quiet time after it, not before.
         assert_eq!(clock.elapsed(), Duration::from_secs(160));
-        // The lock is the admin's own `lock-screen`, in the admin's session.
         assert_eq!(
             lock_cmd(&layout(), &admin()).display(),
             "admin@gui$ /A/bin/aterm machines agent lock-screen"
@@ -986,7 +891,6 @@ mod tests {
     #[test]
     fn a_run_still_in_progress_is_one_that_started_and_a_long_one_does_not_hold_off_the_lock() {
         let fake = armed_host(Some(Ran::ok("")), Some(Ran::ok("locked\n")));
-        // A run starts at 10 s and never ends (the controller died with it in flight).
         let clock = Script::new(|t| {
             if t == Duration::from_secs(10) {
                 runs(&fake, Some("1800000010-3"), None);
@@ -1000,8 +904,6 @@ mod tests {
     #[test]
     fn requests_refused_busy_while_another_run_holds_the_host_keep_the_watch_waiting() {
         let fake = armed_host(Some(Ran::ok("")), Some(Ran::ok("locked\n")));
-        // Another command's run holds the host from 10 s on and is still going at the end; the
-        // walk's requests, one every 4 s, are all refused `busy` until 148 s; then nothing.
         let clock = Script::new(|t| {
             let s = t.as_secs();
             if s == 10 {
@@ -1022,7 +924,6 @@ mod tests {
             )
         );
         assert_eq!(locks(&fake), 1);
-        // One quiet time after the last refusal, the other run still in progress.
         assert_eq!(clock.elapsed(), Duration::from_secs(208));
     }
 
@@ -1181,9 +1082,7 @@ mod tests {
         assert!(fake.written(&path(ID, "watching")).is_none());
         let calls = fake.calls();
         let at = |c: &str| calls.iter().position(|x| x == c).unwrap();
-        // Hang-ups are ignored before it watches; `.watching` says it does.
         assert!(at("ignore hangups") < at(&format!("write {} 600", path(ID, "watching"))));
-        // A disarmed watch writes nothing.
         let fake = armed_host(Some(Ran::ok("")), Some(Ran::ok("locked\n")));
         let clock = Script::new(|_| {
             let _ = forget(&fake, &layout(), ID);
@@ -1197,7 +1096,6 @@ mod tests {
 
     #[test]
     fn the_watcher_trusts_only_an_arm_that_is_roots_alone_for_an_account_with_that_uid() {
-        // Another uid now.
         let fake = armed_host(Some(Ran::ok("")), Some(Ran::ok("locked\n")));
         put(
             &fake,
@@ -1210,7 +1108,6 @@ mod tests {
             out.contains("account admin is uid 501 now, not 502"),
             "{out}"
         );
-        // A directory others may read.
         let fake = armed_host(Some(Ran::ok("")), Some(Ran::ok("locked\n")));
         fake.stat_of(
             DIR,
@@ -1226,7 +1123,6 @@ mod tests {
         let (code, out) = run_watcher(&fake, &Script::new(|_| {}));
         assert_eq!(code, ExitCode::from(super::super::REFUSED));
         assert!(out.contains("is not root's alone"), "{out}");
-        // Not root.
         let mut fake = armed_host(Some(Ran::ok("")), Some(Ran::ok("locked\n")));
         fake.euid = 501;
         let (code, _) = run_watcher(&fake, &Script::new(|_| {}));
@@ -1260,7 +1156,6 @@ mod tests {
             ["armed", "watching", "ended", "log"].map(|ext| format!("remove {}", path(ID, ext)))
         );
         assert!(fake.written(&path(ID, "armed")).is_none());
-        // The watcher had locked and ended.
         let fake = host();
         fake.file(
             &path(ID, "ended"),
@@ -1272,7 +1167,6 @@ mod tests {
             "disarmed 1800000000-4242 (it had ended: locked admin's session: no signed \
              request reached the host for 61s)\n"
         );
-        // Nothing there: a later arm replaced it.
         let (code, out) = disarm_it(&host(), ID);
         assert_eq!(
             (code, out.as_str()),
@@ -1281,7 +1175,6 @@ mod tests {
                 "disarmed 1800000000-4242 (nothing was armed)\n"
             )
         );
-        // An id that is not one, or not root: refused, nothing removed.
         let fake = host();
         let (code, _) = disarm_it(&fake, "../../etc/passwd");
         assert_eq!(code, ExitCode::from(super::super::REFUSED));

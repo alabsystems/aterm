@@ -217,7 +217,7 @@ impl Rect {
 
     /// The same rectangle with its corners ordered.
     #[inline]
-    pub fn abs(&self) -> Rect {
+    pub const fn abs(&self) -> Rect {
         let Rect { x0, y0, x1, y1 } = *self;
         Rect::new(x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1))
     }
@@ -242,7 +242,7 @@ impl Rect {
 
     /// The smallest rectangle holding both.
     #[inline]
-    pub fn union(&self, other: Rect) -> Rect {
+    pub const fn union(&self, other: Rect) -> Rect {
         Rect::new(
             self.x0.min(other.x0),
             self.y0.min(other.y0),
@@ -253,7 +253,7 @@ impl Rect {
 
     /// The overlap of the two, empty (and ordered) when there is none.
     #[inline]
-    pub fn intersect(&self, other: Rect) -> Rect {
+    pub const fn intersect(&self, other: Rect) -> Rect {
         let x0 = self.x0.max(other.x0);
         let y0 = self.y0.max(other.y0);
         let x1 = self.x1.min(other.x1);

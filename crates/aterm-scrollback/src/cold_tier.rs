@@ -1,10 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! In-memory cold tier: compressed pages.
-//!
-//! Pages are compressed with the cold codec: the warm tier's size-prepended
-//! LZ4 (`encode_cold_block`), the same in every build.
+//! In-memory cold tier.
 
 use super::line::{Line, deserialize_page_lines};
 use super::tier::WarmBlock;
@@ -41,8 +38,6 @@ fn take_cold_find_page_steps() -> usize {
 }
 
 /// A cold page (compressed with the LZ4 cold codec).
-///
-/// Stored in memory.
 #[derive(Debug, Clone)]
 struct ColdPage {
     /// Cold-codec compressed data (re-compressed from the LZ4 warm block).
@@ -51,7 +46,6 @@ struct ColdPage {
     line_count: usize,
     /// Its rows are blank stand-ins for text already counted as lost: the page
     /// a quarantined warm block leaves in its place ([`ColdTier::push_lost_block`]).
-    /// Evicting it loses nothing more ([`Evicted::already_lost`]).
     lost: bool,
 }
 
@@ -79,19 +73,11 @@ impl ColdPage {
 pub(crate) struct Evicted {
     /// Logical lines removed.
     pub(crate) lines: usize,
-    /// Of those, the rows of lost pages: blank stand-ins for text the loss
-    /// counter already holds, which their eviction must not count again.
+    /// Of those, the rows of lost pages.
     pub(crate) already_lost: usize,
 }
 
 /// Cold tier: LZ4 compressed pages in memory.
-///
-/// Uses cumulative line counts for O(log P) page lookup and caches the
-/// last decompressed page to avoid redundant decompression.
-///
-/// The `front_offset` field enables O(1) line-limit enforcement: instead of
-/// decompressing the boundary page to remove a few oldest lines, we simply
-/// advance the offset. The first page is dropped when fully consumed.
 #[derive(Debug)]
 pub(crate) struct ColdTier {
     /// Compressed pages (VecDeque for O(1) pop_front during eviction).
@@ -100,17 +86,13 @@ pub(crate) struct ColdTier {
     line_count: usize,
     /// Cumulative *physical* line counts, absolute since the last full rebuild:
     /// live entry `i` (`cumulative_lines[cum_start + i]`, page `i` of `pages`)
-    /// holds `cumulative_base` + physical lines in pages `0..=i`. Front drops
-    /// advance `cum_start`/`cumulative_base` in O(dropped) instead of rebasing
-    /// every entry; lookups add the base to the search target. Unchanged by
-    /// `front_offset` (callers adjust indices before lookup).
+    /// holds `cumulative_base` + physical lines in pages `0..=i`.
     cumulative_lines: Vec<usize>,
     /// Dead-prefix length of `cumulative_lines` (entries of dropped pages),
     /// reclaimed once it outgrows the live half (`drop_front_index_entries`).
     cum_start: usize,
     /// Absolute cumulative value at the current front: physical lines in pages
-    /// dropped since the last full rebuild. Bounded by lines ever stored, so
-    /// its saturating bumps are exact.
+    /// dropped since the last full rebuild.
     cumulative_base: usize,
     /// Recently decompressed pages, filled round-robin ([`CACHE_SLOTS`]).
     last_page_cache: PageCache,
@@ -156,18 +138,11 @@ impl ColdTier {
     }
 
     /// Push a warm block (re-compresses with the cold codec).
-    ///
-    /// Returns the number of lines accepted. On a decompression or
-    /// re-compression failure, logs a warning, drops the block and returns 0,
-    /// so callers can adjust their line counts.
     pub(crate) fn push_block(&mut self, block: &WarmBlock) -> usize {
         self.push(block, false)
     }
 
-    /// Push `block` as the blank stand-in for a quarantined warm block's
-    /// lines, whose loss is already counted: its eviction reports them as
-    /// [`Evicted::already_lost`]. Returns the lines accepted, as
-    /// [`Self::push_block`].
+    /// Push `block` as the blank stand-in for a quarantined warm block's lines, whose loss is already counted.
     pub(crate) fn push_lost_block(&mut self, block: &WarmBlock) -> usize {
         self.push(block, true)
     }
@@ -177,11 +152,8 @@ impl ColdTier {
             Ok(mut page) => {
                 page.lost = lost;
                 let accepted = page.line_count;
-                // Saturating: exact on every real path.
                 self.bytes_used = self.bytes_used.saturating_add(page.compressed.len());
                 self.line_count = self.line_count.saturating_add(accepted);
-                // `last()` is the last live entry (the dead prefix is at the
-                // front); when empty, the base is the absolute floor.
                 let cumulative = self
                     .cumulative_lines
                     .last()
@@ -200,18 +172,12 @@ impl ColdTier {
     }
 
     /// Get a line by index (0 = oldest available line, after `front_offset`).
-    ///
-    /// Returns `Ok(None)` for out-of-bounds, `Err` for decompression failures.
-    // Skip: typed-TrustIr lowering does not complete for this body (a toolchain
-    // gap).
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn get_line(&self, idx: usize) -> Result<Option<Line>, super::ScrollbackError> {
         if idx >= self.line_count {
             return Ok(None);
         }
 
-        // Logical (0 = oldest available) to physical (0 = first line of the
-        // first page, consumed lines included). Saturating: exact.
         let physical_idx = idx.saturating_add(self.front_offset);
 
         let Some((page_idx, line_in_page)) = self.locate(physical_idx) else {
@@ -223,7 +189,6 @@ impl ColdTier {
             )));
         };
 
-        // Check every cache slot first.
         {
             let cache = self.last_page_cache.borrow();
             if let Some((_, lines)) = cache
@@ -243,7 +208,6 @@ impl ColdTier {
             }
         }
 
-        // Decompress and cache.
         let Some(page) = self.pages.get(page_idx) else {
             return Err(super::ScrollbackError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -266,14 +230,9 @@ impl ColdTier {
     /// Resolve a physical line index to `(page_idx, line_in_page)`: the one
     /// home of the cumulative-index geometry, shared by `get_line` and the bulk
     /// path (`take_lines_from`/`segment_len_at`).
-    // Skip: guarded-index class. `find_page` returned an in-range index and
-    // `page_start <= physical_idx` by construction; the verifier cannot chain
-    // either fact.
     #[cfg_attr(trust_verify, trust::skip)]
     fn locate(&self, physical_idx: usize) -> Option<(usize, usize)> {
         let page_idx = self.find_page(physical_idx)?;
-        // Absolute page start: the dropped-prefix base for live page 0, else
-        // the previous live entry.
         let page_start = if page_idx == 0 {
             self.cumulative_base
         } else {
@@ -290,11 +249,7 @@ impl ColdTier {
         ))
     }
 
-    /// Decode the page containing logical line `idx` and return owned lines
-    /// from `idx` through the end of that page: the bulk-walk primitive. It
-    /// never touches the page cache (a full-history walk must not evict the
-    /// viewport's slots). Empty for an out-of-bounds `idx`.
-    // Skip: same class as `get_line`.
+    /// Decode the page containing logical line `idx` and return owned lines from `idx` through the end of that page.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn take_lines_from(&self, idx: usize) -> Result<Vec<Line>, super::ScrollbackError> {
         if idx >= self.line_count {
@@ -316,20 +271,14 @@ impl ColdTier {
             )));
         };
         let mut lines = page.decompress()?;
-        // A whole page is already the segment; skip split_off(0)'s allocation.
         if line_in_page == 0 {
             return Ok(lines);
         }
-        // `min` keeps split_off total; a short decode yields a short segment,
-        // which the streaming iterator treats as end-of-data.
         let split_at = line_in_page.min(lines.len());
         Ok(lines.split_off(split_at))
     }
 
-    /// Logical lines from `idx` through the end of its page: how far a bulk walk
-    /// skips when that page fails to decode. Zero when out of bounds; never
-    /// decodes.
-    // Skip: same guarded-index class as `locate`.
+    /// Logical lines from `idx` through the end of its page.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn segment_len_at(&self, idx: usize) -> usize {
         if idx >= self.line_count {
@@ -339,16 +288,12 @@ impl ColdTier {
         let Some((page_idx, _)) = self.locate(physical_idx) else {
             return 0;
         };
-        // Absolute live entry minus the base: the physical end relative to the
-        // live front.
         let page_end = self
             .live_cumulative()
             .get(page_idx)
             .copied()
             .unwrap_or(self.cumulative_base)
             .saturating_sub(self.cumulative_base);
-        // Physical page end -> logical, clamped by the tier's logical count
-        // (the last page's physical end is the logical end), minus `idx`.
         page_end
             .saturating_sub(self.front_offset)
             .min(self.line_count)
@@ -359,8 +304,6 @@ impl ColdTier {
     fn cache_page(&self, page_idx: usize, lines: Vec<Line>) {
         let mut cache = self.last_page_cache.borrow_mut();
         let slot = self.cache_next.get() % CACHE_SLOTS;
-        // `slot < CACHE_SLOTS`, so the `get_mut` always hits; it keeps the
-        // write index-panic-free.
         if let Some(entry) = cache.get_mut(slot) {
             *entry = Some((page_idx, lines));
         }
@@ -368,17 +311,12 @@ impl ColdTier {
     }
 
     /// Drop every cached page.
-    ///
-    /// Every mutation that reaches here renumbers pages, so an entry keyed by
-    /// its old index would serve the wrong lines. Never make this selective,
-    /// and route every invalidation through it.
     fn clear_cache(&self) {
         *self.last_page_cache.borrow_mut() = [const { None }; CACHE_SLOTS];
         self.cache_next.set(0);
     }
 
-    /// Live (non-dropped) region of the cumulative index. Total `get` keeps
-    /// it panic-free; `cum_start <= len` is a maintained invariant.
+    /// Live (non-dropped) region of the cumulative index.
     #[inline]
     fn live_cumulative(&self) -> &[usize] {
         self.cumulative_lines.get(self.cum_start..).unwrap_or(&[])
@@ -386,11 +324,7 @@ impl ColdTier {
 
     /// Drop the first `k` live cumulative entries in amortized O(k): advance
     /// `cum_start` and `cumulative_base`, leaving the absolute values
-    /// untouched. The dead prefix is reclaimed by one memmove once it outgrows
-    /// the live half. When no live entry survives, everything resets, so
-    /// `empty => base == 0`.
-    // Skip: `Vec::drain` under its guard, the unmodeled drain class (guards
-    // don't chain).
+    /// untouched.
     #[cfg_attr(trust_verify, trust::skip)]
     fn drop_front_index_entries(&mut self, k: usize) {
         if k == 0 {
@@ -403,8 +337,6 @@ impl ColdTier {
             self.cumulative_base = 0;
             return;
         }
-        // New base = absolute value of the last dropped entry; the `None` arm
-        // is unreachable (`1 <= k < live_len`).
         let last_dropped = self.cum_start.saturating_add(k).saturating_sub(1);
         self.cumulative_base = self
             .cumulative_lines
@@ -412,7 +344,6 @@ impl ColdTier {
             .copied()
             .unwrap_or(self.cumulative_base);
         self.cum_start = self.cum_start.saturating_add(k);
-        // Amortized reclamation of the dead prefix.
         if self.cum_start > self.cumulative_lines.len().saturating_sub(self.cum_start) {
             let dead = self.cum_start;
             self.cumulative_lines.drain(..dead);
@@ -422,15 +353,7 @@ impl ColdTier {
 
     /// Find the page containing the given line index via binary search.
     fn find_page(&self, line_idx: usize) -> Option<usize> {
-        // Plain `&mut usize` step counter (was a `fn()`/closure callback): the
-        // Trust lane (`ship trust run`) treats an opaque callback as an absent callee that
-        // may panic. The counter is diagnostic-only; tests fold it into the
-        // same thread-local the old per-step callback incremented, so the
-        // observable count is unchanged.
         let mut steps = 0usize;
-        // Absolute target (stored entries are never rebased), searched over the
-        // live suffix, whose indices are the live page indices. Saturating: a
-        // saturated target still reads "not found".
         let target = line_idx
             .saturating_add(self.cumulative_base)
             .saturating_add(1);
@@ -451,11 +374,6 @@ impl ColdTier {
     }
 
     /// Remove the oldest `k` pages in a single batch.
-    ///
-    /// Returns total *logical* lines evicted (the first page's count is
-    /// adjusted for `front_offset`). O(P), not the O(k*P) of k `pop_front()`s.
-    // Skip: `drain(..)` (unmodeled; guards don't chain) and its guarded slice
-    // read.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn pop_front_batch(&mut self, k: usize) -> usize {
         if k == 0 || self.pages.is_empty() {
@@ -463,7 +381,6 @@ impl ColdTier {
         }
         let k = k.min(self.pages.len());
 
-        // Drain evicted pages and sum their line counts.
         let mut evicted_lines = 0usize;
         let mut evicted_bytes = 0usize;
         for (i, page) in self.pages.drain(..k).enumerate() {
@@ -472,13 +389,12 @@ impl ColdTier {
             } else {
                 page.line_count
             };
-            // Saturating: bounded by `line_count` and `bytes_used`; exact.
             evicted_lines = evicted_lines.saturating_add(logical);
             evicted_bytes = evicted_bytes.saturating_add(page.compressed.len());
         }
         self.bytes_used = self.bytes_used.saturating_sub(evicted_bytes);
         self.line_count = self.line_count.saturating_sub(evicted_lines);
-        self.front_offset = 0; // New front page starts fresh.
+        self.front_offset = 0;
 
         self.drop_front_index_entries(k);
         self.clear_cache();
@@ -487,24 +403,12 @@ impl ColdTier {
     }
 
     /// Evict oldest pages until at least `target_bytes` of compressed memory is freed.
-    ///
-    /// Returns the lines evicted, and how many of them were a lost page's
-    /// already-counted rows. Counts pages to evict first, then batch-removes
-    /// them in O(P) total instead of the O(k*P) cost of repeated `pop_front()`.
-    // Skip: the eviction walk drives a std iterator whose `next` is an absent
-    // body (generic trait path). Pure bookkeeping over owned blocks; the
-    // budget contract is ARENA-SCROLL-exercised. Re-measured 2026-09-27 on seal 321aaeda7 with this skip removed:
-    // INCONCLUSIVE (1 of 2 obligations unknown). Needed from $HOME/trust, in a
-    // promoted seal: totality for std iterator `next`; then drop this.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn evict_bytes(&mut self, target_bytes: usize) -> Evicted {
         if target_bytes == 0 || self.pages.is_empty() {
             return Evicted::default();
         }
 
-        // Count pages needed to free target_bytes, and the lost rows among
-        // them (the first page's count adjusted for `front_offset`, as
-        // `pop_front_batch` adjusts it).
         let mut bytes_freed = 0usize;
         let mut pages_to_evict = 0usize;
         let mut already_lost = 0usize;
@@ -518,10 +422,8 @@ impl ColdTier {
                 } else {
                     page.line_count
                 };
-                // Bounded by the lines in memory, like `pop_front_batch`'s sum.
                 already_lost = already_lost.saturating_add(logical);
             }
-            // Saturating: bounded by `bytes_used` and the page count; exact.
             bytes_freed = bytes_freed.saturating_add(page.compressed.len());
             pages_to_evict = pages_to_evict.saturating_add(1);
         }
@@ -534,22 +436,13 @@ impl ColdTier {
 
     /// Remove the oldest `n` logical lines from the front of the cold tier.
     ///
-    /// Advances `front_offset` by `n` and drops pages that become fully
-    /// consumed, without decompressing: O(1), or O(pages dropped).
-    ///
     /// # Panics
-    ///
-    /// Debug-asserts `n <= self.line_count` under `cfg(test)`; other builds warn
-    /// and saturate.
-    // Skip: guarded ring pops plus the drain behind `drop_front_index_entries`
-    // (the unmodeled drain class).
+    /// Debug-asserts `n <= self.line_count` under `cfg(test)`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn truncate_front_lines(&mut self, n: usize) {
         if n == 0 {
             return;
         }
-        // Asserted under `cfg(test)` only: a contract assert is a reachable
-        // panic the strict L0 gate cannot refute.
         #[cfg(test)]
         debug_assert!(
             n <= self.line_count,
@@ -557,9 +450,6 @@ impl ColdTier {
             self.line_count
         );
         if n > self.line_count {
-            // Pre-composed message via the log shim: identical rendered
-            // record, but no macro-expanded `format_args!` unsafe in THIS
-            // function (which the Trust lane would escalate — see log_shim.rs).
             let mut msg = String::from("truncate_front_lines(");
             msg.push_str(&crate::error::dec_string(n));
             msg.push_str(") exceeds line_count(");
@@ -568,21 +458,12 @@ impl ColdTier {
             crate::log_shim::warn_str(&msg);
         }
 
-        // Saturating: `front_offset` and `n` are bounded by lines this process
-        // actually stored, so the sum always fits in `usize` — the saturation
-        // just discharges the Trust lane's unconstrained-input counterexample.
         self.front_offset = self.front_offset.saturating_add(n);
         self.line_count = self.line_count.saturating_sub(n);
 
-        // Drop fully consumed pages from the front.
         let mut pages_dropped = 0usize;
         while let Some(front) = self.pages.front() {
             if self.front_offset >= front.line_count {
-                // `let-else` + break instead of `.expect(..)`: the loop
-                // condition just witnessed a front page, so the `None` arm is
-                // unreachable and behavior identical — but the Trust lane
-                // must refute every reachable panic and cannot carry the
-                // witness across the `pop_front` call.
                 let Some(page) = self.pages.pop_front() else {
                     break;
                 };
@@ -600,10 +481,7 @@ impl ColdTier {
         }
     }
 
-    // Back-removal (truncate_back_lines) is in cold_tier_back_removal.rs.
-
     /// Clear all pages.
-    // Skip: the page ring's element drop glue (std/alloc internals).
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn clear(&mut self) {
         self.pages.clear();

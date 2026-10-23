@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Claude's mode pill relabelled on the glass (`YOLO on` / `YOLO off`,
-//! owner 2026-10-19) and the glass→grid column map behind it
-//! ([`collect_pill_relabel`], [`GlassColumns`], `App::pixel_to_cell`).
+//! Claude footer mode-pill relabelling and glass-column mapping tests
+//! ([`collect_pill_relabel`], [`GlassColumns`]).
 
 use super::*;
 
@@ -23,11 +22,9 @@ const COLS: usize = 120;
 const BYPASS: &str = "  \u{23F5}\u{23F5} bypass permissions on \u{B7} 14 shells \u{B7} \u{2190} for agents \u{B7} \u{2193} to manage";
 const MANUAL: &str = "  \u{23F8} manual mode on \u{B7} ? for shortcuts \u{B7} \u{2190} for agents";
 const AUTO: &str = "  \u{23F5}\u{23F5} auto mode on \u{B7} 14 shells \u{B7} \u{2190} for agents \u{B7} \u{2193} to manage";
-/// Vim INSERT's indicator and its one cell, before the pill (MEASURED on
-/// 2.1.304: the indicator dim at column 2, the pill at column 15).
+/// Vim `INSERT` indicator and its trailing cell before the pill.
 const VIM_LEAD: &str = "  -- INSERT -- ";
-/// The owner's footer row under vim INSERT: the indicator, then [`BYPASS`]'s
-/// pill and items.
+/// The owner's footer row under vim INSERT: the indicator, then [`BYPASS`]'s pill and items.
 const VIM_BYPASS: &str = "  -- INSERT -- \u{23F5}\u{23F5} bypass permissions on \u{B7} 14 shells \u{B7} \u{2190} for agents \u{B7} \u{2193} to manage";
 /// The same row in auto mode, the measured screen's.
 const VIM_AUTO: &str = "  -- INSERT -- \u{23F5}\u{23F5} auto mode on \u{B7} 14 shells \u{B7} \u{2190} for agents \u{B7} \u{2193} to manage";
@@ -37,9 +34,7 @@ const DIM_FG: [u8; 3] = [130, 130, 130];
 /// Claude's right-hand notice, at the row's end.
 const NOTICE: &str = "/rc active";
 
-/// A headless App, `COLS` wide, whose one session writes its PTY input to
-/// a private socket, and no harness host: its composer wears no harness
-/// border, so nothing relabels Claude's pill.
+/// A headless App, `COLS` wide, whose one session writes its PTY input to a private socket.
 fn bare() -> (App, WindowId, u64, UnixStream) {
     let (reader, writer) = UnixStream::pair().expect("private PTY observer");
     reader.set_nonblocking(true).expect("nonblocking observer");
@@ -51,8 +46,7 @@ fn bare() -> (App, WindowId, u64, UnixStream) {
     (app, wid, session, reader)
 }
 
-/// This window's harness host, holding the session; dropped, it shuts
-/// down.
+/// This window's harness host, holding the session; dropped, it shuts down.
 struct Held(crate::harness_host::HostHandle);
 
 impl Drop for Held {
@@ -61,9 +55,7 @@ impl Drop for Held {
     }
 }
 
-/// [`bare`] with a harness host holding its session (Cruise, the table's
-/// default): the composer wears aterm's border and its switch, the gate the
-/// relabel follows (`relabels_pill`).
+/// [`bare`] with a harness host holding its session (Cruise, the table's default).
 fn app() -> (App, WindowId, u64, UnixStream, Held) {
     let (mut app, wid, session, reader) = bare();
     let host = crate::harness_host::HostHandle::for_supervised_test(
@@ -88,8 +80,7 @@ fn feed(app: &App, session: u64, bytes: &[u8]) {
     term_lock(&term).process(bytes);
 }
 
-/// The session is Claude Code's, with its facts published: what the
-/// footer, and the relabel, are drawn for.
+/// The session is Claude Code's, with its facts published.
 fn claude(app: &App, session: u64) {
     let entry = app.pool.get(session).expect("session");
     let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -108,11 +99,7 @@ fn claude(app: &App, session: u64) {
     ));
 }
 
-/// Claude Code's bottom block on the 24-row engine: a transcript row, the
-/// composer between its rules (the caret at row 22, column 3), and `mode`
-/// on the last row — vim INSERT's indicator ([`VIM_LEAD`]), where it leads,
-/// in [`DIM_FG`], its pill to `on` in [`PILL_FG`], the rest in [`DIM_FG`],
-/// [`NOTICE`] right-aligned.
+/// Claude Code's bottom block on the 24-row engine.
 fn draw(app: &App, session: u64, mode: &str) {
     let rule = "\u{2500}".repeat(COLS);
     let lead = if mode.starts_with(VIM_LEAD) {
@@ -135,8 +122,7 @@ fn draw(app: &App, session: u64, mode: &str) {
     feed(app, session, screen.as_bytes());
 }
 
-/// One frame through the capture route's splices: extract, the strip, the
-/// footer.
+/// One frame through the capture route's splices: extract, the strip, the footer.
 fn frame(app: &mut App, wid: WindowId) {
     let prepared = app.prepare_terminal_capture_grid_with_cursor_fx_and_plan_outcome(
         wid,
@@ -188,8 +174,7 @@ fn px_of(app: &App, wid: WindowId, (row, col): (usize, usize)) -> (f64, f64) {
     (x, y)
 }
 
-/// What the session's PTY received: up to a minute for `want` bytes (a
-/// hang detector), and every byte already written past them.
+/// What the session's PTY received.
 fn pty(reader: &mut UnixStream, want: usize) -> Vec<u8> {
     let mut got = Vec::new();
     let mut buf = [0u8; 256];
@@ -267,9 +252,7 @@ fn the_bypass_pill_reads_yolo_on_on_the_glass_and_the_grid_keeps_claudes_row() {
             "the run keeps its ink"
         );
         assert_eq!(cells.len(), vendor.len());
-        // The grid is Claude's, whatever the glass shows.
         assert_eq!(grid_text(&app, session, 23).trim_end(), drawn.trim_end());
-        // The undo restores every cell.
         let ws = app.windows.get_mut(&wid).unwrap();
         assert!(undo(&mut ws.claude_footer_undo, &mut ws.input_scratch));
         assert_eq!(ws.input_scratch.cells[row], vendor, "{label}: undone");
@@ -385,7 +368,6 @@ fn no_relabel_where_the_row_is_not_plainly_claudes_or_the_harness_is_off() {
         "harness off: Claude's row"
     );
     assert_eq!(col, 12);
-    // The window lets its host go (the guard shuts it down after the run).
     let unhosted = |app: &mut App, _: WindowId, _: u64| app.harness = None;
     let (glass, vendor, col) = vendor_after(BYPASS, &unhosted);
     assert_eq!(glass.trim_end(), vendor.trim_end(), "no host: Claude's row");
@@ -495,7 +477,6 @@ fn the_pill_after_vim_inserts_indicator_relabels_at_its_own_column() {
                 );
             }
         }
-        // The press's report, read for as many bytes as `want` holds.
         let mut press = |col: usize, want: &str| {
             let (x, y) = px_of(&app, wid, (row, col));
             app.on_cursor_moved(wid, x, y);

@@ -18,15 +18,16 @@ pub const APPLICATIONS: &str = "/Applications";
 pub const STAGE_ROOT: &str = "/Library/Management/aterm/stage";
 
 /// The bound on one `codesign --verify --deep` run: a hang detector, not a latency budget
+/// (Emacs.app, 180 MB of nested code, took 5.6 s in the VM).
 const VERIFY_BUDGET: Duration = Duration::from_secs(180);
 
-/// The bound on one `spctl -a`. Also a hang detector, and longer: an app with no stapled
+/// The bound on one `spctl -a`.
 const GATEKEEPER_BUDGET: Duration = Duration::from_secs(900);
 
 /// The bound on `ditto`, `hdiutil` and `pkgutil --expand-full` over one artifact.
 const STAGE_BUDGET: Duration = Duration::from_secs(900);
 
-/// The bound on `installer -pkg`. Homebrew.pkg took 3 s in the VM; a large vendor pkg can
+/// The bound on `installer -pkg`.
 const INSTALLER_BUDGET: Duration = Duration::from_secs(1800);
 
 /// Artifact packaging kind.
@@ -217,6 +218,7 @@ impl App {
     }
 
     /// What is installed now, as one line, when it is not what the row wants; `Ok(None)`
+    /// when it is.
     fn differs(&self, sys: &dyn System) -> Result<Option<String>, String> {
         match self.row.kind {
             Kind::DmgApp | Kind::ZipApp => {
@@ -543,6 +545,7 @@ pub fn verify_team(sys: &dyn System, path: &Path, team: &str) -> Signed {
 }
 
 /// Whether codesign's `stderr` says it could not open `path` itself: its first line is
+/// `<path>: <errno text>` for a permission refusal or a missing path.
 fn unreadable(path: &Path, stderr: &str) -> bool {
     let first = first_line(stderr);
     [
@@ -617,6 +620,7 @@ pub fn assess(sys: &dyn System, path: &Path, kind: Assess) -> Gatekeeper {
 }
 
 /// Require Gatekeeper's acceptance of `path`; an override is noted and passes, because
+/// the Team ID check the caller also requires still vouches for the bytes.
 fn require_gatekeeper(
     sys: &dyn System,
     path: &Path,
@@ -649,6 +653,10 @@ fn require_gatekeeper(
 }
 
 /// Why a Mac rejects a notarized Developer ID app, when it is the Mac's own setting:
+/// `spctl --status -v` prints `developer id disabled` where System Settings allows apps
+/// from the App Store only (VM, macOS 27.0, after `spctl --global-enable`: every Developer
+/// ID rule then reads disabled and syspolicyd logs `rejecting due to lack of matching
+/// active rule`).
 fn app_store_only(sys: &dyn System) -> &'static str {
     match sys.run(&Cmd::new("/usr/sbin/spctl").args(["--status", "-v"])) {
         Ok(ran) if format!("{}\n{}", ran.out(), ran.err()).contains("developer id disabled") => {
@@ -685,6 +693,7 @@ pub fn bundle_info(sys: &dyn System, bundle: &Path, key: &str) -> Read<String> {
 }
 
 /// What the bundle at `target` is, when it is not `version` signed by `team`; `Ok(None)`
+/// when it is.
 fn installed_bundle(
     sys: &dyn System,
     target: &Path,
@@ -1152,6 +1161,7 @@ pub fn receipt_version(sys: &dyn System, pkg_id: &str) -> Read<String> {
 }
 
 /// The start of the `Status:` line `pkgutil --check-signature` prints for a pkg signed
+/// through a Developer ID chain it trusts (Homebrew.pkg, VM).
 const DEVELOPER_ID_STATUS: &str =
     "signed by a developer certificate issued by Apple for distribution";
 
@@ -1322,6 +1332,7 @@ pub(crate) fn vet_pkg(
 }
 
 /// [`vet_pkg`] for a pkg with no installer signature: no scripts, a Distribution whose
+/// JavaScript cannot run programs, and at least one Mach-O, every one the team's.
 fn vet_unsigned_pkg(
     sys: &dyn System,
     pkg: &Path,
@@ -2754,6 +2765,7 @@ pub(crate) mod tests {
         );
     }
     /// The actual swap -> cleanup sequence retains displaced original bytes on
+    /// failed restoration.
     #[test]
     fn a_failed_restore_keeps_the_old_bundle_out_of_stage_cleanup() {
         use std::sync::atomic::{AtomicU32, Ordering};

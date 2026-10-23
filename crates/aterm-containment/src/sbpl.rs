@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 pub const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
 
 /// Defines [`MACH_LOOKUP_ALLOWLIST`] and [`BASE_PROFILE`] from one list of
+/// global names, so the names the profile allows and the names its proofs read
+/// are the same list by construction.
 macro_rules! base_profile_allowing {
     ($($name:literal,)+) => {
         /// Global Mach service names a contained process is permitted to look up.
@@ -40,6 +42,7 @@ pub const WRITABLE_ROOTS: &[&str] = &["/private/tmp", "/private/var/tmp", "/dev"
 pub const USER_TEMP_PARENT: &str = "/private/var/folders";
 
 /// The user's own `$TMPDIR` as a canonical write root, admitted only in the one
+/// shape macOS gives it: `<USER_TEMP_PARENT>/<xx>/<id>/T`.
 fn admitted_user_temp(temp: &Path) -> Option<PathBuf> {
     let canon = std::fs::canonicalize(temp).ok()?;
     let bucket = canon.parent()?.parent()?;
@@ -60,6 +63,8 @@ pub const HISTORY_FILES: &[&[(&str, &str)]] = &[
 ];
 
 /// The write-confinement rules of a `TmpOnly` profile: deny every write, then allow
+/// [`WRITABLE_ROOTS`], the user's `$TMPDIR` where [`admitted_user_temp`] admits
+/// it, and, with a home, the [`HISTORY_FILES`] under it.
 fn push_write_confinement(
     profile: &mut String,
     user_temp: Option<&Path>,
@@ -80,6 +85,8 @@ fn push_write_confinement(
 }
 
 /// Append the [`HISTORY_FILES`] allows under `canon_home`: for each row whose
+/// history file is absent or a plain regular file with one link, every name of
+/// the row as ` (require-all (literal "<home>/<name>") (vnode-type <type>))`.
 fn push_history_allows(out: &mut String, canon_home: &Path) {
     for row in HISTORY_FILES {
         let Some((file, _)) = row.first() else {
@@ -99,6 +106,7 @@ fn push_history_allows(out: &mut String, canon_home: &Path) {
 }
 
 /// Whether `path` is absent, or a regular file (not followed through a symlink)
+/// with exactly one link.
 fn plain_or_absent(path: &Path) -> bool {
     match std::fs::symlink_metadata(path) {
         Err(e) => e.kind() == std::io::ErrorKind::NotFound,
@@ -188,6 +196,7 @@ pub fn profile_for_home(home: Option<&str>, user_temp: Option<&Path>, fs: FsCapa
 }
 
 /// [`profile_for_home`], and whether the home resolved — i.e. whether the
+/// home-scoped read denies are in the profile.
 fn profile_scoped(
     home: Option<&str>,
     user_temp: Option<&Path>,
@@ -251,6 +260,7 @@ fn profile_scoped(
 }
 
 /// Emit the deny clause(s) for the secret/private entry `<canon_home>/<entry>`,
+/// resolving symlinks as Seatbelt does.
 fn push_resolved_clause(
     out: &mut String,
     canon_home: &Path,
@@ -274,6 +284,7 @@ fn push_resolved_clause(
 }
 
 /// Resolve symlinks in the deepest existing ancestor of `path` and re-append
+/// the missing trailing components, for a path whose leaf does not exist yet.
 fn resolve_existing_prefix(path: &Path) -> Option<PathBuf> {
     for ancestor in path.ancestors().skip(1) {
         if let Ok(canon_ancestor) = std::fs::canonicalize(ancestor) {
@@ -285,6 +296,8 @@ fn resolve_existing_prefix(path: &Path) -> Option<PathBuf> {
 }
 
 /// Append ` (literal "<node>")` write-deny operands for the existing ancestor
+/// nodes of `entry` whose rename would relocate the protected leaf, deduped
+/// against `denied` (see [`profile_for_home`]).
 fn push_existing_ancestor_write_denies(
     out: &mut String,
     canon_home: &Path,
@@ -305,6 +318,7 @@ fn push_existing_ancestor_write_denies(
 }
 
 /// Write-deny each existing directory node strictly between `canon_home` and
+/// `path`'s leaf, shallow-first, deduped against `denied`.
 fn push_ancestor_literals(
     out: &mut String,
     canon_home: &Path,
@@ -344,6 +358,8 @@ fn push_literal_clause(out: &mut String, path: &Path) {
 }
 
 /// Append `path` to `out` as the inside of an SBPL string literal, backslash-
+/// escaping `\` and `"` so the emitted `"…"` is always well-formed regardless of
+/// the home path.
 fn push_sbpl_escaped(out: &mut String, path: &Path) {
     for ch in path.to_string_lossy().chars() {
         match ch {
@@ -364,6 +380,7 @@ mod tests {
     use crate::policy::ContainmentPolicy;
 
     /// Expected-marker helper: render `path` exactly as the emitter's SBPL
+    /// string escaping does ([`push_sbpl_escaped`]).
     fn sbpl_str(path: &Path) -> String {
         let mut s = String::new();
         push_sbpl_escaped(&mut s, path);
@@ -396,6 +413,8 @@ mod tests {
     }
 
     /// `TmpOnly` confines writes: every write denied, the temp roots, `/dev`
+    /// and the shell's history files allowed back, and nothing of `$HOME`
+    /// beyond those files.
     #[test]
     fn tmp_only_confines_writes_to_the_writable_roots() {
         let home = aterm_tempfile::tempdir().unwrap();
@@ -474,6 +493,8 @@ mod tests {
     }
 
     /// A history file that is not a plain single-link file gets no allowance
+    /// (a `~/.zsh_history` symlink to `$HOME` would otherwise allow all of
+    /// `$HOME`): its row is dropped whole; the other shell's row is untouched.
     #[cfg(unix)]
     #[test]
     fn a_history_file_that_is_not_a_plain_file_gets_no_allowance() {
@@ -536,6 +557,9 @@ mod tests {
     }
 
     /// Only the user's own `$TMPDIR` (`/private/var/folders/<xx>/<id>/T`) is
+    /// added to the write roots — never its siblings (`C`, which holds clang's
+    /// module cache that later unsandboxed builds read; `0`), never the folders
+    /// above it, never a `$TMPDIR` pointed somewhere else.
     #[test]
     fn only_the_users_own_tmpdir_joins_the_write_roots() {
         let home = aterm_tempfile::tempdir().unwrap();
@@ -902,6 +926,7 @@ mod tests {
     }
 
     /// Unix-only: the profile is scoped under `$HOME` ([`home_dir`]), which a native
+    /// Windows process does not have, and only macOS ever applies one.
     #[cfg(unix)]
     #[test]
     fn private_data_is_gated_on_the_fs_capability_not_network() {

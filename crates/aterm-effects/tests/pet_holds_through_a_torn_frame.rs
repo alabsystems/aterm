@@ -2,23 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! The pet holds through a torn frame.
-//!
-//! A present the host makes while a program's DEC-2026 bracket is still open (the
-//! 150 ms hold ran out, or the terminal's 1 s timeout cleared the mode) shows the
-//! cursor hidden wherever Ink's partial write stopped: `CSI H` parks it at (0,0)
-//! before every repaint, and a transcript redraw walks it down the transcript rows.
-//! Read as the caret, that write position pulls the pet up the screen, sets off the
-//! move sensor, and makes the caret's return read as a line change.
-//!
-//! These laws replay Claude Code's recorded bytes through a real `Terminal` and the
-//! shipping `CompanionOwner`, fed by `TerminalFacts::read` and presented under the
-//! native host's frame hold, each bracket split at the rows Ink writes and spread so
-//! the hold runs out mid-bracket. Under [`Contract::Shipping`] a hidden cursor on an
-//! unfinished frame reads as the last finished frame's caret; [`Contract::Raw`]
-//! hands it over as a caret. The brain's own repaint hold (`HIDDEN_HOLD_MAX`,
-//! 0.25 s) covers even the raw contract for a 280 ms bracket; past it the raw
-//! contract brings the defect back, the negative control that keeps these laws from
-//! passing vacuously.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -219,7 +202,6 @@ struct Host {
 impl Host {
     fn new(contract: Contract) -> Self {
         let mut term = Terminal::new(ROWS, COLS);
-        // A presented host resolves its default background.
         term.process(b"\x1b]11;#000000\x07");
         let mut owner = CompanionOwner::default();
         owner.set_enabled_seed(true, 0x5EED);
@@ -495,10 +477,6 @@ fn conform(model: &Model, seat: &Shot, shots: &[Shot]) -> Result<usize, String> 
 /// leaves the pet where it sat, at the same opacity, with no reaction, and the torn
 /// path conforms to `ConsoleCursorHome` (hide, `RepaintMove` per torn present,
 /// show).
-///
-/// Negative control: the raw contract holds inside the brain's repaint hold (280
-/// ms); past it (1.3 s) the pet reacts to the write position and the model refuses
-/// the present that shows it.
 #[test]
 fn a_torn_full_repaint_neither_moves_nor_fades_the_settled_pet() {
     let model = console_cursor_home_model();
@@ -535,9 +513,6 @@ fn a_torn_full_repaint_neither_moves_nor_fades_the_settled_pet() {
             let broken = after.iter().find(|s| disturbed(&settled, s));
             let conformed = conform(&model, &settled, after);
             if contract == Contract::Raw && open_ms == PAST_TIMEOUT_MS {
-                // How far the pet strays is not the control: the full screen's
-                // live-edge hug is gated separately (`PetBrain::note_full_screen`),
-                // so the raw contract's cost here is the perk at the write row.
                 assert!(
                     broken.is_some() && conformed.is_err(),
                     "{label}: negative control: the write cursor must disturb the pet \
@@ -564,9 +539,6 @@ fn a_torn_full_repaint_neither_moves_nor_fades_the_settled_pet() {
 /// first painted caret on, no torn present puts the body away from the composer,
 /// dims it, or starts a reaction. Negative control: the raw contract past the
 /// repaint hold chases the write cursor off the composer.
-///
-/// The six takes (the four fixtures at 280 ms, the popup at 1.3 s, and the
-/// raw control) replay side by side on `crate::common::par_map`.
 #[test]
 fn every_bracket_torn_keeps_the_pet_at_the_composer_while_typing() {
     let takes = [
@@ -590,8 +562,6 @@ fn every_bracket_torn_keeps_the_pet_at_the_composer(
     let (name, src) = FIXTURES[fixture];
     let label = format!("{name} {contract:?} {open_ms} ms");
     let h = Host::replay(src, open_ms, contract);
-    // From two seconds after the first paint put the caret in the
-    // composer: the pet crosses from the startup's (0,0) to it first.
     let first = h
         .shots
         .iter()
@@ -609,7 +579,6 @@ fn every_bracket_torn_keeps_the_pet_at_the_composer(
             continue;
         }
         torn += 1;
-        // Off the composer's rows: where the write cursor led.
         if let Some((_, dy)) = off_home(s)
             && dy > 2.0
         {

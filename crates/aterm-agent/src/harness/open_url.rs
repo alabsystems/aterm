@@ -1,36 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-open-url <url>`: THE OPENER A RENEWAL'S SIGN-IN RUNS AS `BROWSER`
-//! (`docs/DESIGN-claude-accounts-v2-2026-10-15.md` §5.3 step 2): the one
-//! binary answers to it as an argv0 alias, so the variable names ONE
-//! executable, as Claude Code needs (READ in the 2.1.300 bundle: the opener
-//! is spawned with no shell, `BROWSER || "open"` and the URL as its one
-//! argument).
-//!
-//! It opens the URL in the browser profile that holds the account's
-//! claude.ai session: [`PROFILE_ENV`] names the profile by its DISPLAY name
-//! (`Claude m7-a`, what Chrome shows), Chrome's own `Local State` maps that
-//! name to the profile's directory ([`profile_dir_of`]), and `open -na
-//! "Google Chrome" --args --profile-directory=<dir> <url>` opens it
-//! ([`open_command`]).
-//!
-//! WITH NO PROFILE NAMED — what a renewal over SSH hands it — it opens
-//! NOTHING (exit 1): the owner's browser is on the machine they are at, and
-//! Claude Code calls its opener under `SSH_CONNECTION` too (MEASURED on
-//! 2.1.300; with `BROWSER` unset that is `open`, a browser on this machine's
-//! screen).
-//!
-//! It NEVER LOGS OR PRINTS THE URL (it names the account's address as its
-//! `login_hint`). The manual profile path takes only an `https://` URL.
-//! An explicitly configured mailbox can instead complete one same-origin
-//! Claude authorization flow, with no provider cookies at its exact local
-//! callback. Unknown origins or flows fall back to the printed URL; this is
-//! not a browser or a general cookie jar. ANY failure — no profile named, Chrome's state
-//! unreadable, no such profile, a non-macOS machine, `open` refused — is exit
-//! 1 with one line on stderr that names no URL, and Claude Code then prints
-//! the URL itself (`If the browser didn't open, visit: …`) for the owner to
-//! open by hand.
+//! Profile-aware URL opener and headless mailbox OAuth flow for `aterm-open-url`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -42,24 +13,19 @@ use std::time::{Duration, Instant};
 
 use aterm_json::Value;
 
-/// The argv0 name the one binary answers as the opener, and the name of the
-/// link a renewal makes to it (`<accounts store>/bin/aterm-open-url`).
+/// Executable alias name for the URL opener.
 pub const OPENER: &str = "aterm-open-url";
 
 /// The variable a renewal's flow carries the profile's display name in.
 pub const PROFILE_ENV: &str = "ATERM_OPEN_URL_PROFILE";
 
-/// The variable naming a directory of incoming verification / magic-link
-/// emails (`<accounts store>/mailbox` or test mailbox) for headless OAuth +
-/// email-link authorization.
+/// Environment variable naming the mailbox directory for headless OAuth authorization.
 pub const MAILBOX_ENV: &str = "ATERM_OPEN_URL_MAILBOX";
 
-/// The variable naming the target account email address for headless OAuth +
-/// email-link authorization (falls back to `login_hint` in the authorize URL).
+/// Environment variable naming the target account email for headless OAuth authorization.
 pub const EMAIL_ENV: &str = "ATERM_OPEN_URL_EMAIL";
 
-/// Default subdirectory under `<accounts store>` checked for incoming
-/// verification / magic-link emails when [`MAILBOX_ENV`] is unset.
+/// Default mailbox subdirectory under `<accounts store>` when [`MAILBOX_ENV`] is unset.
 pub const DEFAULT_MAILBOX_DIR: &str = "mailbox";
 
 /// The most bytes of Chrome's `Local State` that are read.
@@ -81,12 +47,7 @@ pub fn local_state_path(home: &Path) -> PathBuf {
         .join("Local State")
 }
 
-/// THE PROFILE DIRECTORY whose display name is `name` in Chrome's `Local
-/// State` text (`profile.info_cache.<dir>.name`), compared exactly. `None`
-/// for text that is not that document, no such profile, two profiles of the
-/// one name (which one the owner meant is not known), and a directory name
-/// that is not one (`Default`, `Profile 3`: no path separator, no leading
-/// `-`, no control character).
+/// Resolves a Chrome profile directory name by exact display name in `Local State`.
 #[must_use]
 pub fn profile_dir_of(local_state: &str, name: &str) -> Option<String> {
     let doc: Value = aterm_json::from_str(local_state).ok()?;
@@ -106,9 +67,7 @@ pub fn profile_dir_of(local_state: &str, name: &str) -> Option<String> {
     plain.then(|| dir.clone())
 }
 
-/// `open -na "Google Chrome" --args --profile-directory=<dir> <url>`: the
-/// URL in that profile, a new window if Chrome runs already. Built by the
-/// workspace's own command, which hands the child its stdio and nothing else.
+/// Builds the `open -na "Google Chrome"` command for a profile directory and URL.
 #[must_use]
 pub fn open_command(dir: &str, url: &str) -> aterm_uds::spawnfd::Command {
     let mut cmd = aterm_uds::spawnfd::command("open");
@@ -118,9 +77,7 @@ pub fn open_command(dir: &str, url: &str) -> aterm_uds::spawnfd::Command {
     cmd
 }
 
-/// Why `url` is not opened, or `None`: only an `https://` URL with no
-/// whitespace or control character in it — what Claude Code's sign-in hands
-/// over, and nothing an opener should take that is not.
+/// Returns a refusal reason if `url` is not a valid `https://` URL without control chars.
 #[must_use]
 pub fn url_refusal(url: &str) -> Option<&'static str> {
     if !url.starts_with("https://") {
@@ -132,10 +89,7 @@ pub fn url_refusal(url: &str) -> Option<&'static str> {
     }
 }
 
-/// The opener's work, the machine's reads injected: `profile` is
-/// [`PROFILE_ENV`]'s value, `local_state` reads Chrome's state, `run` starts
-/// the command and answers whether it exited 0. Answers the exit code and,
-/// for a failure, the one line said (never the URL).
+/// Runs the opener with injected profile, `Local State` reader, and command runner.
 pub fn open_with(
     args: &[String],
     profile: Option<&str>,
@@ -247,8 +201,7 @@ pub fn extract_login_hint(authorize_url: &str) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
-/// Decode RFC 2045 Quoted-Printable soft line breaks (`=\r\n`, `=\n`) and `=XX`
-/// hex escapes so wrapped magic-link URLs in `.eml` files are reconstructed.
+/// Decodes RFC 2045 Quoted-Printable soft line breaks and `=XX` hex escapes.
 #[must_use]
 pub fn decode_quoted_printable(input: &str) -> String {
     let bytes = input.as_bytes();
@@ -483,8 +436,7 @@ fn is_non_auth_link(url: &str) -> bool {
         || path.ends_with(".js")
 }
 
-/// Extract a verification / magic-link URL from an incoming email message
-/// (`.eml` RFC 5322, HTML, plain text, or JSON) addressed to `target_email`.
+/// Extracts a verification or magic-link URL from an incoming email addressed to `target_email`.
 #[must_use]
 pub fn extract_magic_link_from_email(
     raw_email: &str,
@@ -611,8 +563,7 @@ fn extract_attr(tag: &str, attr_name: &str) -> Option<String> {
     None
 }
 
-/// Parse an OAuth consent / authorization page (after clicking the email magic
-/// link) into `(HTTP method, resolved action URL, optional form body)`.
+/// Parses an OAuth consent page into `(HTTP method, resolved action URL, optional form body)`.
 #[must_use]
 pub fn parse_html_approval_action(
     html: &str,
@@ -811,8 +762,6 @@ fn https_curl_exchange(
     form_body: Option<&str>,
 ) -> Result<HttpResponse, &'static str> {
     let mut cmd = aterm_uds::spawnfd::command("curl");
-    // Ignore curlrc before any other option: it must not add redirects or
-    // another destination behind the flow's per-request origin admission.
     cmd.args([
         "--disable",
         "--globoff",
@@ -856,9 +805,7 @@ fn http_exchange(
     }
 }
 
-/// Deliberately narrow admission, not a URL or cookie standard. This is
-/// the Claude origin the existing opener contract names. Any other
-/// origin (including a new vendor login origin) needs the manual browser.
+/// Deliberately narrow admission, not a URL or cookie standard.
 fn provider_url(url: &str) -> bool {
     url.starts_with("https://claude.ai/")
         && !url.chars().any(|c| c.is_whitespace() || c.is_control())
@@ -891,8 +838,7 @@ fn one_query_param(url: &str, key: &str) -> Option<String> {
 }
 
 /// Only the callback endpoint and state actually named by this authorize
-/// request can leave the provider origin. Its request gets no cookies or
-/// consent form, and its response cannot add provider cookies.
+/// request can leave the provider origin.
 struct MailboxFlow {
     callback_port: u16,
     callback_path: String,
@@ -1044,20 +990,11 @@ pub(super) fn poll_mailbox_for_magic_link(
     }
 }
 
-/// Complete the OAuth + email magic-link authorization flow end-to-end:
-/// 1. Visits `authorize_url` (`GET`), capturing session cookies and checking
-///    whether an already-authenticated session redirects straight to `redirect_uri`.
-/// 2. Polls `mailbox_dir` for an incoming verification / magic-link email
-///    addressed to `target_email` (or `login_hint` from `authorize_url`).
-/// 3. Clicks (fetches) the magic link URL from the email.
-/// 4. Submits the OAuth consent / approval form (`POST` or `GET`) and delivers
-///    the resulting authorization `code` and `state` to `claude`'s localhost
-///    callback listener.
+/// Completes the OAuth and email magic-link authorization flow end-to-end.
 ///
 /// # Errors
 ///
-/// Returns a static diagnostic string (never containing any URL or email
-/// address) if any stage of the flow fails or times out.
+/// Returns a static diagnostic string (without URLs or emails) on failure or timeout.
 pub fn authorize_with_mailbox(
     authorize_url: &str,
     mailbox_dir: &Path,
@@ -1072,9 +1009,7 @@ pub fn authorize_with_mailbox(
     )
 }
 
-/// The real flow with its two effects passed as capabilities. Tests replace
-/// both, so exercising the complete admission/redirect/form path reads no
-/// mailbox and starts no curl, callback listener or browser.
+/// The real flow with its two effects passed as capabilities.
 pub(super) fn authorize_using(
     authorize_url: &str,
     target_email: Option<&str>,
@@ -1157,11 +1092,7 @@ fn discover_mailbox_dir() -> Option<PathBuf> {
     None
 }
 
-/// `aterm-open-url <url>` (the argv0 alias, `crates/aterm`'s router): when
-/// [`MAILBOX_ENV`] (or `<accounts store>/mailbox` with no [`PROFILE_ENV`]) names
-/// a mailbox directory, drives the automated OAuth + email magic-link
-/// authorization flow ([`authorize_with_mailbox`]); otherwise opens the URL in
-/// [`PROFILE_ENV`]'s Chrome profile ([`open_with`]).
+/// Entry point for the `aterm-open-url` argv0 alias.
 #[must_use]
 pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     let args: Vec<String> = args

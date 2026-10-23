@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! EVERY INK DERIVED FROM THE INSTANCE THEME READS ON THE PANE'S GROUND
-//! (design §8): the footer's marks are the instance theme's accent
-//! (`chrome_band::band_colors(app.theme)`: the window's chrome follows the
-//! instance), and a tab may wear a theme of its own (`theme session set`,
-//! Choose Tab Theme, `spawn theme=`, a split), whose paper the accent was
-//! never chosen for. On every built-in instance theme over every built-in
-//! tab theme, each such ink holds its floor on the ground it is laid on —
-//! a graphic 3:1 (WCAG 1.4.11), a letter 4.5:1 (WCAG 1.4.3), its hue kept —
-//! and a quiet ink that already reads keeps its quietness: it sits at the
-//! floor, never under it, and where it clears the floor it is the theme's
-//! own mix, unchanged.
+//! Instance-theme contrast floor tests across built-in and custom tab themes.
 
 use super::*;
 use crate::autopilot::AutopilotView;
@@ -146,16 +136,7 @@ fn every_fact() -> footer::RuleFit {
 /// wall's `♻`, a hidden fact's stub's included — at rest and with each fact
 /// lit, reads at 3:1 or more on the tab's ground, under every built-in
 /// instance's accent, on every built-in tab theme, over each grey a program
-/// draws its rule in. At rest a mark whose theme's own mix (the accent
-/// halfway to the rule's grey) already clears 3:1 is that mix, unchanged.
-/// A lit fact's own mark (the model's, the path's, the branch's, the
-/// context's, the usage's; the effort leads with none) is the accent at the
-/// text floor, 4.5:1 or more, as the top line's is: an accent that already
-/// reads there is the accent itself.
-///
-/// NEGATIVE CONTROLS: that mix, as it was laid unfloored, reads under 3:1 —
-/// Dracula's accent on a Default Light tab over a `#999999` rule — and the
-/// accent floored to the graphics floor alone (3:1) reads under 4.5:1 there.
+/// draws its rule in.
 #[test]
 fn every_fact_mark_reads_on_every_ground() {
     let sides = sides();
@@ -164,7 +145,6 @@ fn every_fact_mark_reads_on_every_ground() {
     let mut checked = 0usize;
     let mut kept = 0usize;
     let (mut lit_marks, mut lit_kept) = (0usize, 0usize);
-    // The mark a lit fact leads with.
     let lit_mark = |kind: FactKind| match kind {
         FactKind::Model => Some(footer::MODEL_MARK),
         FactKind::Path => Some(footer::PATH_MARK),
@@ -248,7 +228,6 @@ fn every_fact_mark_reads_on_every_ground() {
         "every lit fact's mark"
     );
     assert!(lit_kept > 0, "some accent reads and is kept lit");
-    // CONTROLS: the mix as it was laid, and the accent at the graphics floor.
     let dracula = side(&sides, "Dracula").accent;
     let light = side(&sides, "Default Light").blank;
     let old = mix(dracula, [0x99; 3], 0.5);
@@ -276,10 +255,6 @@ fn every_fact_mark_reads_on_every_ground() {
 ///   reads at 3:1 or more and below the line's values, and where the
 ///   program's grey already reads below them at 3:1 or more it is that grey
 ///   exactly.
-///
-/// NEGATIVE CONTROLS: on a Default Light tab over a `#999999` rule the
-/// values as they were laid read under 4.5:1 and the grey under 3:1, and on
-/// the soft theme the pane's ink, a lit value as it was laid, under 4.5:1.
 #[test]
 fn every_fact_word_reads_on_every_ground() {
     let sides = sides();
@@ -357,7 +332,6 @@ fn every_fact_word_reads_on_every_ground() {
         kept_values > 0 && kept_stubs > 0,
         "a theme's own inks that read are kept: {kept_values} values, {kept_stubs} stubs"
     );
-    // CONTROLS: the inks as they were laid.
     let light = side(&sides, "Default Light").blank;
     let old_value = mix([0x99; 3], light.fg, VALUE_LIFT);
     assert!(
@@ -430,14 +404,7 @@ fn ghost_glyphs(
 
 /// THE KEY'S GHOST READS ON EVERY GROUND (design §10.6.14): ` KEY off ` on
 /// Claude Code's top rule is greyed as a hidden fact's `off` is
-/// ([`FactInks`]). Under every built-in instance, on every built-in tab
-/// theme and a soft theme of one's own, over each grey a program draws its
-/// rule in, its glyphs at rest read at 3:1 or more and below the same glyphs
-/// lit, which read at 4.5:1 or more; at rest a grey that already reads so is
-/// the grey exactly, lit a theme's own mix that reads is that mix exactly.
-///
-/// NEGATIVE CONTROL: on a Default Light tab over a `#999999` rule the ghost
-/// as it was laid reads under 3:1 at rest and under 4.5:1 lit.
+/// ([`FactInks`]).
 #[test]
 fn the_keys_ghost_reads_on_every_ground() {
     let sides = sides();
@@ -495,9 +462,6 @@ fn the_keys_ghost_reads_on_every_ground() {
 /// instance on every built-in tab theme it reads at the chips' floor (4.5:1,
 /// the floor Land's amber and the permission light's hues are held to) on
 /// the tab's ground, and an accent that already reads there is kept as it is.
-///
-/// NEGATIVE CONTROL: Dracula's accent, unfloored, reads under 1.5:1 on a
-/// Default Light tab.
 #[test]
 fn the_cruise_chip_reads_on_every_ground() {
     let sides = sides();
@@ -629,13 +593,7 @@ fn transcript_edits(
 /// on, in agy's transcript and in Muse Code's: the leads `●` and `◆`, `✓`,
 /// `•`, `☐` and `◦` at 3:1 or more; the headings' (an H3's too), the
 /// link's, the inline code's (on its pill), the ordered item's and the
-/// quote's letters at 4.5:1 or more. The rule's `─` and the quote's `▎` are
-/// structure, in the program's own grey exactly.
-///
-/// NEGATIVE CONTROLS: the lead `●` in Dracula's accent, as it was laid,
-/// reads under 3:1 on a Default Light tab; a quote's words as they were
-/// laid (the rule's grey lifted a third) under 4.5:1 on Solarized Light over
-/// a `#999999` rule.
+/// quote's letters at 4.5:1 or more.
 #[test]
 fn the_accented_transcript_reads_on_every_ground() {
     let sides = sides();
@@ -670,8 +628,6 @@ fn the_accented_transcript_reads_on_every_ground() {
                                 assert!(k >= ICON_CONTRAST, "{what}: a mark at {k:.2}:1");
                                 checked += 1;
                             } else if c.fg != blank.fg {
-                                // The tab's own ink is the tab's: only the
-                                // inks the rewrite makes are judged here.
                                 let k = reads(c.fg, c.bg);
                                 assert!(k >= NAME_CONTRAST, "{what}: a letter at {k:.2}:1");
                                 checked += 1;
@@ -682,8 +638,6 @@ fn the_accented_transcript_reads_on_every_ground() {
             }
         }
     }
-    // 59 inked glyphs across each program's rows; fewer where an ink is the
-    // tab's own.
     assert!(checked >= 2 * sides.len().pow(2) * 3 * 40, "{checked}");
     let dracula = side(&sides, "Dracula").accent;
     let light = side(&sides, "Default Light").blank;

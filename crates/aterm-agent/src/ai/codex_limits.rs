@@ -119,6 +119,7 @@ pub struct CodexLimits {
 }
 
 /// A word of the vendor's file ([`Word`]); `None` for null, another type, or
+/// text that is no word.
 fn word_of(v: Option<&Value>) -> Option<Word> {
     v.and_then(Value::as_str).and_then(Word::new)
 }
@@ -134,6 +135,8 @@ fn window(slot: Slot, v: Option<&Value>) -> Option<Window> {
 }
 
 /// One rollout line read as a `token_count`'s `rate_limits` ([`CodexLimits`],
+/// its `account` none); `None` for any other line, one with no readable
+/// stamp, and a family that names no word.
 fn limits_line(line: &str) -> Option<CodexLimits> {
     if !line.contains("\"token_count\"") || !line.contains("\"rate_limits\"") {
         return None;
@@ -197,6 +200,8 @@ pub fn opening_account(first_line: &str) -> Option<AccountKey> {
 }
 
 /// Where the rollout at `path`'s own lines begin (module header): the byte
+/// offset of its first line past a fork's copied prefix, read from its start
+/// through a [`TurnReader`], at most `reach` bytes.
 fn copy_end(path: &Path, reach: u64) -> Option<u64> {
     let mut reader = TurnReader::default();
     let mut own = None;
@@ -365,6 +370,7 @@ mod tests {
     }
 
     /// Recorded readings: 99% of the weekly window is picked, with its reset;
+    /// 1% twenty minutes after a usage reset is picked as the new window's.
     #[test]
     fn the_incidents_readings_pick_the_largest_share_of_the_window() {
         let first = [
@@ -417,6 +423,7 @@ mod tests {
     }
 
     /// The lab's two composed logins (Codex 0.163.0 wrote them into its
+    /// `session_meta`s, 2026-10-16): stand-in ids, no real account's.
     const LOGIN_A: (&str, &str) = ("acct-lab-1", "user-lab");
 
     const LOGIN_B: (&str, &str) = ("acct-lab-2", "user-lab");
@@ -426,6 +433,7 @@ mod tests {
     }
 
     /// A reading of the `codex` family at `ms` under `account`: each window a
+    /// `(slot, used_percent, window_minutes, resets_at)`.
     fn reading(
         ms: i64,
         account: Option<AccountKey>,
@@ -460,6 +468,12 @@ mod tests {
     }
 
     /// EVERY FAMILY, AND WHAT CODEX WRITES BESIDE ITS WINDOWS (design F10,
+    /// §4.3): a `token_count` in 0.163.0's shape gives its family and name,
+    /// each window with its slot and kind (a weekly window in `primary`, the
+    /// `0` placeholder placed by its slot), the credits, the plan, the
+    /// individual limit (a number written as text), the spend-control flag
+    /// and the reached type; another model's family and a metadata-only one
+    /// are readings too.
     #[test]
     fn every_family_is_read_with_what_codex_writes_beside_it() {
         let line = "{\"timestamp\":\"2026-10-16T22:20:05.645Z\",\"ordinal\":14,\"type\":\"event_msg\",\
@@ -565,6 +579,9 @@ mod tests {
     }
 
     /// THE ACCOUNT KEY IS THE FIRST LINE'S (design §3.1, F14): a rollout's
+    /// readings are keyed by the login its `session_meta` names, hashed; a
+    /// subagent's copy of its parent's `session_meta` further on (measured on
+    /// 0.163.0) does not rename it.
     #[test]
     fn a_rollouts_readings_are_keyed_by_its_first_lines_login() {
         let first = meta_as(T0, SUB, ROOT, Some(ROOT), Some(PAGINATED), Some(LOGIN_A));
@@ -613,6 +630,17 @@ mod tests {
     }
 
     /// THE PICK (design §3.5, §4.3), decision by decision, each beside the
+    /// figure the rule it replaces — the newest reading by stamp — would
+    /// have given:
+    /// * a passed reset is void: the 95% of a window that has reset never
+    ///   stands, and a kind with nothing else reads empty;
+    /// * resets within [`ANCHOR_SLACK_S`] of the latest are one anchor, and
+    ///   the largest share within it wins: a later reading of 60% (a fork's
+    ///   copy, a stale process) never hides the real 95%;
+    /// * an earlier anchor is another window: a 99% read before an early
+    ///   reset moved the anchor 601 s later does not stand; at 600 s it is
+    ///   the same window;
+    /// * on a tie the earliest stamp is kept.
     #[test]
     fn the_pick_voids_passed_resets_and_keeps_the_largest_share_of_the_latest_anchor() {
         let now = T0 / 1000;
@@ -668,6 +696,8 @@ mod tests {
     }
 
     /// ONE LOGIN'S FIGURES (design §3.5: the max rule merges by account key
+    /// and kind): after the home signs in to another login, the pick reads
+    /// the login the newest reading names, never the signed-out one's 97%.
     #[test]
     fn the_pick_reads_the_newest_login_only() {
         let now = T0 / 1000;
@@ -711,6 +741,9 @@ mod tests {
     }
 
     /// A DROP WITHIN ONE ROLLOUT OPENS THE WINDOW ANEW (design §3.5): the
+    /// lab's thread made under login A read 95% of its five-hour window;
+    /// resumed under login B (no second `session_meta`, so still A's key) its
+    /// next count read 20%, the anchor 42 s later.
     #[test]
     fn a_drop_within_one_rollout_opens_the_window_anew() {
         let now = T0 / 1000;
@@ -734,6 +767,9 @@ mod tests {
     }
 
     /// A LEGACY FORK'S COPY GIVES NO READING (module header, design §3.5):
+    /// 0.163.0's fork of a legacy thread copies its parent's counts, their
+    /// rate limits among them, under one fresh stamp; the readings of the
+    /// file are those past the copy, keyed by the fork's login.
     #[test]
     fn a_legacy_forks_copied_readings_are_none_of_its_own() {
         let dir = aterm_tempfile::Builder::new()
@@ -780,6 +816,10 @@ mod tests {
     }
 
     /// ONE PICK, THE WAY THE AI CONNECTIONS READ IT ([`home_pick`]): a legacy
+    /// fork written
+    /// last, whose copy holds a fresh-stamped 60% of the window, does not
+    /// hide the real 95%; once the home's newest rollout is another login's,
+    /// that login's 10% is read.
     #[test]
     fn a_home_pick_trusts_neither_a_copy_nor_another_login() {
         let home = aterm_tempfile::Builder::new()

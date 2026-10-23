@@ -18,8 +18,7 @@ fn feed(parser: &mut Parser, bytes: &[u8], sink: &mut RecordingSink) {
 
 /// Split `STREAM` at every byte: the prefix goes to one parser, the carry to
 /// a fresh one, the suffix to that — and the actions are exactly the actions
-/// of one parser fed the whole stream. The carry at every split restores
-/// (the negative control for the refusal table below: real carries pass).
+/// of one parser fed the whole stream.
 #[test]
 fn a_carry_continues_every_split_exactly() {
     let mut whole = RecordingSink::default();
@@ -102,33 +101,20 @@ fn parser_c1(c1: bool) -> Parser {
 /// `carry_unhooking` carries a hooked DCS string as one to IGNORE: the
 /// successor swallows the rest of its payload to the terminator — never
 /// printing it, never hooking a handler it did not start — and then reads
-/// what follows exactly as the live parser does. That includes UTF-8 in the
-/// payload (a tmux control-mode line, a kitty command's JSON) and an 8-bit ST,
-/// in either C1 mode. Everywhere else it is `carry` itself. (A tmux
-/// passthrough wrapper hooks no string: `tests::tmux` carries it.)
-///
-/// RED with the first carried form, `DcsIgnore`: the tmux control-mode tail
-/// printed `\u{fffd} \u{276f} ls` and `%end` before `after`, the kitty tail
-/// `\u{fffd}llo"}`, and the sixel ended by `0x9C` swallowed `after`.
+/// what follows exactly as the live parser does.
 #[test]
 fn a_hooked_dcs_carried_unhooking_is_swallowed_to_its_terminator() {
     let cases: [(&[u8], &[u8]); 5] = [
         (b"\x1bPq#0;2;0;0;0", b"#0!10~-\x1b\\after"),
-        // tmux control mode (`DCS 1000 p`): UTF-8 in its lines.
         (
             b"\x1bP1000p%begin 1 1 0\n",
             "%output %1 caf\u{e9} \u{276f} ls\n%end\x1b\\after".as_bytes(),
         ),
-        // A kitty remote-control command: UTF-8 in its JSON.
         (
             b"\x1bP@kitty-cmd{\"t\":\"",
             "h\u{e9}llo \u{672c}\"}\x1b\\after".as_bytes(),
         ),
-        // A sixel ended by the 8-bit ST.
         (b"\x1bPq#0;2;0;0;0", b"#0!10~-\x9cafter"),
-        // An 8-bit ST after a character holding 0x9C (本 is E6 9C AC): with C1
-        // off that 0x9C is the character's; with C1 on it ends the string
-        // early, in both parsers.
         (b"\x1bP@x", b"y\xe6\x9c\xac\x9cafter"),
     ];
     for c1 in [false, true] {
@@ -168,8 +154,6 @@ fn a_hooked_dcs_carried_unhooking_is_swallowed_to_its_terminator() {
             assert!(sink.apc_starts == 0 && sink.apc_data.is_empty() && sink.apc_ends == 0);
         }
     }
-    // The control-mode tail's whole text is swallowed, the 8-bit-ST sixel's too: only
-    // `after` prints (the live parser's answer, which the loop compares).
     let mut successor = Parser::new();
     successor
         .restore_carry(&ParserCarry {
@@ -191,10 +175,7 @@ fn a_hooked_dcs_carried_unhooking_is_swallowed_to_its_terminator() {
 
 /// A hooked DCS at the ESC that may begin its ST still holds its string: the
 /// next byte decides whether it ends complete (`\`) or broken off (anything
-/// else), and only the handler holds what it collected. So `carry` holds none,
-/// as inside the payload, and `carry_unhooking` carries the ESC alone: the
-/// successor reads the next byte as the ESC's, which is what follows the string
-/// either way, and the string itself, which it never hooked, ends with nothing.
+/// else), and only the handler holds what it collected.
 #[test]
 fn a_dcs_at_the_escape_that_may_begin_its_st_is_still_hooked() {
     for c1 in [false, true] {
@@ -259,13 +240,7 @@ fn a_dcs_at_the_escape_that_may_begin_its_st_is_still_hooked() {
 }
 
 /// THE HOOKED STRING'S CARRY READS EVERY BYTE AS THE HOOKED STRING DOES
-/// ([`HOOKED_STRING_CARRY`]). The table, entry by entry: for every byte the
-/// carried state stays in itself exactly where `DcsPassthrough` stays in
-/// itself, and where either leaves, both go to the same state by the same
-/// action. Then the parsers: a hooked live parser and a successor restored
-/// from its `carry_unhooking`, fed every one- and two-byte tail (65,792 of
-/// them), with C1 controls off and on, agree on everything outside the hook and end in corresponding
-/// states — and, once out of the string, in the same one.
+/// ([`HOOKED_STRING_CARRY`]).
 #[test]
 fn the_hooked_string_carry_reads_every_byte_as_the_hooked_string() {
     for byte in 0..=u8::MAX {
@@ -315,10 +290,6 @@ fn the_hooked_string_carry_reads_every_byte_as_the_hooked_string() {
                     "c1={c1} tail={tail:02x?}: still in the string"
                 );
             } else {
-                // Out of it alike, the live parser's ESC that may begin its ST
-                // included: that one still holds the string, which its own
-                // unhooking carry leaves behind, as the successor's string
-                // state did.
                 assert_eq!(
                     (successor.state(), Some(successor.carry_unhooking())),
                     (live.state(), Some(live.carry_unhooking())),
@@ -786,9 +757,6 @@ fn restore_carry_accepts_the_edge_of_every_bound() {
             osc_overflowed: true,
             ..ParserCarry::default()
         },
-        // The highest and lowest well-formed prefixes (U+10FFFF's head, the
-        // first non-overlong two-byte lead) and the edges of the lead-specific
-        // second-byte ranges.
         ParserCarry {
             utf8_tail: vec![0xF4, 0x8F, 0xBF],
             utf8_expected: 4,
@@ -853,12 +821,7 @@ fn restore_carry_accepts_the_edge_of_every_bound() {
     }
 }
 
-/// UTF-8 tails for a carry. Pending prefixes: each Table 3-7 row's lead alone,
-/// then (three- and four-byte rows) with the row's lowest second byte, then
-/// (four-byte rows) with a third byte. Beside them, tails no stream ends in: a
-/// second byte just outside each range-checked row (`E0`, `ED`, `F0`, `F4`),
-/// ASCII, continuation bytes and non-leads as heads, and a complete character
-/// of each length.
+/// UTF-8 tails for a carry.
 fn utf8_tails() -> Vec<Vec<u8>> {
     let mut tails = vec![vec![]];
     for lead in [
@@ -895,20 +858,7 @@ fn utf8_tails() -> Vec<Vec<u8>> {
 /// `restore_carry` either installs a carry that reads back exactly and leaves
 /// a safe parser ([`assert_restored_state_is_safe`], both C1 modes) or refuses
 /// it and installs nothing, over carries no parser wrote, at, inside and past
-/// every bound. Two products over all 14 states:
-///
-/// * the sequence fields, UTF-8 tails empty: 0, 1, 2, `MAX_PARAMS` and
-///   `MAX_PARAMS + 1` parameters × subparameter masks 0, 1, 2, the bit at the
-///   count and all bits × `current_param` 0, 1, `u32::MAX` × both flags ×
-///   intermediates of every length to `MAX_INTERMEDIATES + 1`, each of six
-///   bytes, and two mixed × an empty or one-byte OSC × both `osc_overflowed`;
-/// * the UTF-8 fields, sequence fields empty: every [`utf8_tails`] tail ×
-///   `utf8_expected` 0..=5 × every tail as `string_utf8_tail`.
-///
-/// No check reads fields of both groups, and a state that takes one group's
-/// fields refuses the other's, so a mixed carry is refused by a check a
-/// product already reaches. Every nameable state is accepted and every refusal
-/// met, so neither product is vacuous.
+/// every bound.
 #[test]
 fn restore_carry_installs_only_safe_carries_whoever_wrote_them() {
     let mut start = Parser::new();
@@ -1033,7 +983,6 @@ fn restore_carry_installs_only_safe_carries_whoever_wrote_them() {
 /// keeps subparameter bits below the parameters, holds a UTF-8 tail only at
 /// `Ground` and still incomplete, and a string's UTF-8 head only in a
 /// string — and the invariant still holds after every possible next byte.
-/// The next byte goes through `advance_fast`, the successor's path.
 fn assert_restored_state_is_safe(parser: &Parser, at: &str) {
     parser.assert_invariants();
     assert_ne!(
@@ -1082,9 +1031,7 @@ fn state_names_round_trip() {
 
 /// `carry_swallows_sequence` names exactly the carries that lose a sequence
 /// this parser would deliver: an OSC over the carry's cap and an APC string
-/// with its consumer started. What this parser swallows itself (SOS, PM,
-/// `DcsIgnore`, an OSC it discards) and every sequence the carry continues (a
-/// DCS header among them) are not named.
+/// with its consumer started.
 #[test]
 fn carry_swallows_sequence_names_the_lossy_carries_only() {
     let at = |bytes: &[u8]| {
@@ -1096,7 +1043,6 @@ fn carry_swallows_sequence_names_the_lossy_carries_only() {
     big_osc.extend(std::iter::repeat_n(b'A', OSC_CARRY_CAP + 1));
     let mut big_image = b"\x1b]1337;File=inline=1:".to_vec();
     big_image.extend(std::iter::repeat_n(b'A', OSC_CARRY_CAP + 1));
-    // (bytes, swallowed, a picture the next frame replaces)
     for (bytes, swallowed, picture) in [
         (&big_osc[..], true, false),
         (&big_image[..], true, true),
@@ -1126,9 +1072,6 @@ fn carry_swallows_sequence_names_the_lossy_carries_only() {
 /// A carry taken inside a DCS or APC payload holds the head of a split UTF-8
 /// character, since whether the next `0x9C` is ST depends on it
 /// (`tests::c1::a_0x9c_inside_a_utf8_character_does_not_end_the_string`).
-/// Split at every byte of a payload holding `0x9C` as second, third and fourth
-/// byte, the successor swallows the rest of the string and prints only what
-/// follows.
 #[test]
 fn a_string_carry_continues_a_split_utf8_character() {
     let payload = "\u{71c}\u{672c}\u{d71c}\u{1f71c}\u{1c71c}x";
@@ -1156,19 +1099,7 @@ fn a_string_carry_continues_a_split_utf8_character() {
     }
 }
 
-/// A DCS HEADER IS CARRIED AS ITSELF (round fifteen, R15-PARSER-P1). A header
-/// that had not reached its final byte (`DcsEntry`, `DcsParam`,
-/// `DcsIntermediate`) was carried as `DcsIgnore`, which reads the next bytes
-/// differently from the live parser, beyond losing the string: with C1
-/// controls off a `0x9C` ended it and the payload printed (`ESC P` then
-/// `0x9C q#0~~payload ESC \` printed `q#0~~payload`), and a GR byte or a C1
-/// control the live parser leaves the header on kept it, swallowing the real
-/// output after it up to the next ESC. Now the header rides with its
-/// parameters and intermediates, and the successor reads EVERY tail as the
-/// live parser does: from a header in each state, every one- and two-byte
-/// tail (65,792 of them) and the longer ones the finding measured, C1 off and
-/// on, end in the same sink — the
-/// hook, its parameters and the payload included — and the same parser.
+/// A DCS HEADER IS CARRIED AS ITSELF (round fifteen, R15-PARSER-P1).
 #[test]
 fn a_dcs_header_carry_reads_every_tail_as_the_live_parser() {
     let heads: [(&[u8], State); 4] = [
@@ -1232,12 +1163,7 @@ fn a_dcs_header_carry_reads_every_tail_as_the_live_parser() {
 
 /// EVERY SPLIT OF A STREAM OF DCS STRINGS CONTINUES EXACTLY: a sixel with
 /// parameters, a DECRQSS and an XTGETTCAP query, a private-marker string, a
-/// header holding GR bytes and an ignored one. Split at every byte, the
-/// prefix to one parser, its carry to a fresh one and the rest to that: the
-/// sink is the sink of one parser fed the whole stream, C1 controls off and
-/// on. A split inside a hooked string, or at the ESC that may begin its ST,
-/// has no carry (`a_hooked_dcs_is_not_carried`) and is skipped; one inside
-/// every header state is met.
+/// header holding GR bytes and an ignored one.
 #[test]
 fn every_split_of_a_dcs_stream_continues_exactly() {
     const DCS_STREAM: &[u8] = b"a\x1bP0;1;0q#0;2;0;0;0#0!10~-\x1b\\b\x1bP$qm\x1b\\c\
@@ -1281,7 +1207,7 @@ fn every_split_of_a_dcs_stream_continues_exactly() {
 
 /// A header carry's [`ParserCarry::for_older_builds`] form is `DcsIgnore`
 /// holding nothing, which a build without header carries accepts and which
-/// swallows the string to its terminator. Every other carry has no such form.
+/// swallows the string to its terminator.
 #[test]
 fn a_header_carry_has_the_older_builds_form_beside_it() {
     for head in [&b"\x1bP"[..], b"\x1bP1;2", b"\x1bP>1;2 $"] {

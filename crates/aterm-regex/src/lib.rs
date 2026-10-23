@@ -18,7 +18,7 @@ use compile::Program;
 use parse::Flags;
 use pikevm::Cache;
 
-/// Default ceiling on a compiled program, in bytes. Matches the `regex` crate's
+/// Default ceiling on a compiled program, in bytes.
 const DEFAULT_SIZE_LIMIT: usize = 10 * (1 << 20);
 
 /// Default ceiling on the work one search may do; see [`RegexBuilder::step_limit`].
@@ -80,6 +80,7 @@ pub struct Regex {
     /// Work ceiling for one search. See [`RegexBuilder::step_limit`].
     step_limit: u64,
     /// Sticky: set the first time any search on this program (or on a clone of
+    /// it — the flag is shared, like the program) is cut short.
     cut_short: Arc<AtomicBool>,
 }
 
@@ -146,7 +147,7 @@ impl Regex {
             .map(|(start, end)| Match { text, start, end }))
     }
 
-    /// The work ceiling one search on this pattern may spend. See
+    /// The work ceiling one search on this pattern may spend.
     #[inline]
     #[must_use]
     /// Per-search work ceiling ([`RegexBuilder::step_limit`]).
@@ -171,6 +172,7 @@ impl Regex {
     }
 
     /// [`find_iter`](Self::find_iter), held to `step_limit` units instead of the pattern's
+    /// own [`RegexBuilder::step_limit`].
     #[inline]
     #[must_use]
     /// Like [`find_iter`](Self::find_iter), using `step_limit` instead of the pattern's budget.
@@ -190,6 +192,7 @@ impl Regex {
     }
 
     /// The leftmost-first match starting at or after byte offset `start`,
+    /// charged against `budget` and leaving it holding what remains.
     fn search(
         &self,
         text: &str,
@@ -299,7 +302,7 @@ impl<'t> Match<'t> {
     }
 }
 
-/// Iterator over the non-overlapping matches in a haystack. See
+/// Iterator over the non-overlapping matches in a haystack.
 #[derive(Debug)]
 /// Iterator over non-overlapping matches in a haystack ([`Regex::find_iter`]).
 pub struct Matches<'r, 't> {
@@ -314,6 +317,7 @@ pub struct Matches<'r, 't> {
 
 impl Matches<'_, '_> {
     /// Did this iterator stop early because a search exhausted the
+    /// [step budget](RegexBuilder::step_limit)?
     #[inline]
     #[must_use]
     /// Whether iteration stopped early because a search exhausted the [step budget](RegexBuilder::step_limit).
@@ -402,6 +406,7 @@ impl RegexBuilder {
     }
 
     /// Ceiling, in bytes, on a lazy-DFA cache: accepted for source compatibility and
+    /// ignored.
     #[inline]
     #[must_use]
     /// Accepted for source compatibility with `regex`; ignored by the Pike VM.
@@ -444,10 +449,11 @@ impl RegexBuilder {
 }
 
 /// Escape every character `pattern` uses as syntax, so the result matches
+/// `pattern` literally.
 #[must_use]
 /// Escape all regex metacharacters in `pattern` so it matches literally.
 pub fn escape(pattern: &str) -> String {
-    /// The characters this engine reads as syntax. `<` and `>` are pointedly
+    /// The characters this engine reads as syntax.
     const META: &str = r"\.+*?()|[]{}^$#&-~";
 
     let mut out = String::with_capacity(pattern.len());
@@ -538,6 +544,7 @@ pub const fn clamp_step_limit(steps: u64, min_steps: u64) -> u64 {
 }
 
 /// Debit `cost` work units from `remaining`, returning `Some(next_remaining)`
+/// when `cost <= remaining` or `None` when the step budget is exhausted.
 #[inline]
 #[must_use]
 /// Debit `cost` work units from `remaining`, returning `None` when `cost > remaining`.
@@ -562,6 +569,7 @@ pub const fn match_span_len(start: usize, end: usize) -> usize {
 }
 
 /// Return `true` iff two match spans `[a_start, a_end)` and `[b_start, b_end)`
+/// are non-overlapping and ordered (`a_start <= a_end <= b_start <= b_end`).
 #[inline]
 #[must_use]
 /// Return `true` iff `[a_start, a_end)` and `[b_start, b_end)` are non-overlapping and ordered.
@@ -690,6 +698,7 @@ mod step_budget_tests {
     }
 
     /// The smallest budget that lets a whole `find_iter` finish, to within 2%: double,
+    /// then bisect.
     fn budget_needed(pattern: &str, haystack: &str) -> u64 {
         let mut hi = 1u64;
         while !completes_within(pattern, haystack, hi) {
@@ -708,6 +717,7 @@ mod step_budget_tests {
     }
 
     /// At the call sites' budget both amplifiers stop at once, over a row and over 3 MB,
+    /// and report exhaustion.
     #[test]
     fn the_amplifiers_terminate_promptly_instead_of_hanging() {
         let row = row();
@@ -729,7 +739,7 @@ mod step_budget_tests {
         }
     }
 
-    /// The default budget refuses each amplifier's 3 MB scan. It still answers one row,
+    /// The default budget refuses each amplifier's 3 MB scan.
     #[test]
     fn the_default_budget_stops_the_runaway_scan() {
         let scrollback = scrollback();
@@ -744,6 +754,7 @@ mod step_budget_tests {
     }
 
     /// Exhaustion is not "no match": a starved search refuses where a fed one finds a real
+    /// match.
     #[test]
     fn exhaustion_never_masquerades_as_no_match() {
         let haystack = format!("{}z", "x".repeat(4096));
@@ -811,6 +822,8 @@ mod step_budget_tests {
     }
 
     /// A `find_iter` is held to one budget, not one per match: `\w+=|\w` over a row of `n`
+    /// word characters walks `n²/2` positions in all, though no single search walks more
+    /// than `n`.
     #[test]
     fn a_find_iter_is_held_to_one_budget_not_one_per_match() {
         let row = row();
@@ -882,6 +895,8 @@ mod step_budget_tests {
     }
 
     /// Every built-in selection rule finds every match in a full row within an eighth of
+    /// the call sites' budget, and completes under the default: the evidence for the
+    /// numbers in [`RegexBuilder::step_limit`].
     #[test]
     fn every_builtin_selection_rule_stays_far_inside_the_default() {
         let rules: [(&str, &str); 11] = [
@@ -895,7 +910,7 @@ mod step_budget_tests {
             ),
             (
                 r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}",
-                "trex.m21@example.test and someone.else@example.co.uk ",
+                "first.last@example.test and someone.else@example.co.uk ",
             ),
             (
                 r"(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(?::\d{1,5})?",
@@ -956,6 +971,7 @@ mod step_budget_tests {
     }
 
     /// The heaviest program a 128 KiB `size_limit` admits finishes a full row under the
+    /// default budget.
     #[test]
     fn the_worst_admitted_program_still_fits_the_default_budget() {
         for pattern in ["(?:x?){1020}z", "(?:x|x|x|x|x|x|x|x){100}z"] {
@@ -1052,6 +1068,7 @@ mod step_budget_tests {
     }
 
     /// `find_iter_with_limit` spends the budget it is handed, not the pattern's own, and
+    /// reports truncation per haystack.
     #[test]
     fn find_iter_with_limit_spends_the_budget_it_is_handed() {
         let text = format!("{} needle", "x".repeat(10_000));

@@ -38,9 +38,11 @@ impl fmt::Display for PrivateFileError {
 impl std::error::Error for PrivateFileError {}
 
 /// What a file or directory an extended access list opens to others is
+/// refused as.
 const ACL_OPEN: &str = "an access list (ACL) grants other users access; `chmod -N` removes it";
 
 /// astream-sys's verdict on an open FILE ([`astream_sys::owner_private`]) in
+/// this module's words.
 fn file_verdict(file: &std::fs::File) -> Result<std::fs::Metadata, PrivateFileError> {
     use astream_sys::NotPrivate;
     match astream_sys::owner_private(file).map_err(PrivateFileError::Io)? {
@@ -74,7 +76,7 @@ pub fn read_private(dir: &Path, name: &str, max: usize) -> Result<Vec<u8>, Priva
 /// What a name of more than one path component is refused as.
 const ONE_COMPONENT: &str = "a private file's name is one path component";
 
-/// Whether `name` is one path component: not empty, `.` or `..`, and no `/`. Only `dir`
+/// Whether `name` is one path component: not empty, `.` or `..`, and no `/`.
 fn one_component(name: &str) -> bool {
     !(name.is_empty() || name == "." || name == ".." || name.contains('/'))
 }
@@ -95,6 +97,7 @@ enum DirIs {
     /// This user's, no access-list grant, no group or other mode bit.
     Private,
     /// This user's and no access-list grant, but these mode bits (`& 0o777`) open
+    /// it to others: narrowing them makes it private.
     Open(u32),
     /// A symlink, which the rule never follows.
     Symlink,
@@ -107,6 +110,11 @@ enum DirIs {
 }
 
 /// `dir` judged by astream's one owner-only rule on the OPEN directory
+/// ([`astream_sys::owner_private_dir`]): opened read-only, non-blocking and
+/// refusing a symlink at its last component, then judged off the descriptor —
+/// a directory, this user's (the effective uid), no access-list entry that
+/// allows anyone anything (macOS), and no group or other mode bit, in that
+/// order, so [`DirIs::Open`] means every other clause held.
 fn dir_is(dir: &Path) -> io::Result<DirIs> {
     use astream_sys::NotPrivate;
     use std::os::unix::fs::MetadataExt as _;
@@ -442,6 +450,7 @@ mod tests {
     }
 
     /// A 0600 file in a 0700 directory reads whole, and the identity it names is the
+    /// file's own.
     #[test]
     fn a_private_file_reads_into_the_buffer_with_its_identity() {
         use std::os::unix::fs::MetadataExt as _;
@@ -510,6 +519,7 @@ mod tests {
     }
 
     /// A name of more than one path component is refused before anything is opened, even
+    /// when the file it reaches is private: only `dir` would be judged.
     #[test]
     fn a_name_of_more_than_one_component_is_malformed() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -533,6 +543,7 @@ mod tests {
     }
 
     /// `write_private` and `remove_private` refuse a name of more than one path component
+    /// as `InvalidInput`: nothing is made below `dir` or written or removed beside it.
     #[test]
     fn a_name_of_more_than_one_component_is_neither_written_nor_removed() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -566,6 +577,7 @@ mod tests {
     }
 
     /// On macOS a new directory that inherits its parent's access list is no private one:
+    /// `create_private_dir` refuses it, and accepts it once `chmod -N` removes the list.
     #[cfg(target_os = "macos")]
     #[test]
     fn create_private_dir_refuses_an_inherited_access_list() {
@@ -597,6 +609,8 @@ mod tests {
     }
 
     /// On macOS an access list that allows anyone anything makes a 0700 directory no
+    /// private one: `judge_private_dir` and `ensure_private_dir` refuse it, naming
+    /// `chmod -N`, and leave it as it was.
     #[cfg(target_os = "macos")]
     #[test]
     fn ensure_private_dir_refuses_an_access_list_that_allows_others() {
@@ -640,6 +654,9 @@ mod tests {
     }
 
     /// `judge_private_dir` says what `ensure_private_dir` would do and changes nothing: a
+    /// missing directory stays missing, an open one keeps its mode until
+    /// `ensure_private_dir` narrows it (returning the mode it had), and a symlink is
+    /// refused with no OS error code.
     #[test]
     fn judge_private_dir_says_what_ensure_would_do_and_changes_nothing() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -663,6 +680,9 @@ mod tests {
     }
 
     /// The file's clauses are astream's owner-only rule, worded here: a FIFO in the file's
+    /// place is refused as no regular file AT ONCE (the open does not wait for a writer;
+    /// the read runs behind the one-minute hang detector), and on macOS a 0600 file with
+    /// an `everyone allow read` entry is not private, naming `chmod -N`.
     #[test]
     fn a_fifo_or_an_access_list_in_the_files_place_is_refused() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -726,6 +746,8 @@ mod tests {
     }
 
     /// `create_private_dir` makes a missing directory 0700, accepts a private one, and
+    /// never narrows: a loose one is refused and left as it was, a symlink is refused, and
+    /// a missing parent is `NotFound`.
     #[test]
     fn create_private_dir_makes_or_accepts_and_never_narrows() {
         let root = aterm_tempfile::tempdir().unwrap();

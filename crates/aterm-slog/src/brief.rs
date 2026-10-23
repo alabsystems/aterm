@@ -241,7 +241,8 @@ impl Scan<'_> {
 /// are Phase 6's ring facts (6F-2): a session's state, a policy's
 /// generation, a topic, an advisory, the program's own report,
 /// a mail fetch and what the person was shown (6F-9: `shown`, one count
-/// line, [`Scan::shown`], shed with the others).
+/// line, [`Scan::shown`], shed with the others). And a row the log holds as
+/// its row alone (`row`, the timeline's).
 const fn mark_worth_a_line(k: Kind) -> bool {
     !matches!(
         k,
@@ -280,6 +281,7 @@ const fn mark_worth_a_line(k: Kind) -> bool {
             | Kind::Program
             | Kind::MailFetch
             | Kind::Shown
+            | Kind::Row
     )
 }
 

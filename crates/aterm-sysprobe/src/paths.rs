@@ -23,6 +23,7 @@ pub fn windows_under(path: &Path, dir: &Path) -> Option<bool> {
 }
 
 /// A [`windows_key`]'s root (`C:\`, `\\SRV\SHARE\`): through its first `\`,
+/// or a UNC key's fourth.
 fn root(key: &str) -> &str {
     let nth = if key.starts_with(r"\\") { 3 } else { 0 };
     let end = key
@@ -109,6 +110,8 @@ pub fn short_spelled(p: &Path) -> Option<ShortSpelled<'_>> {
 }
 
 /// The root `root` of a path [`root_of`] cut (`C:\`, `C:/`, `\\?\C:\`,
+/// `\??\C:\`, `\\srv\share\`, `\\?\UNC\srv\share\`), spelled verbatim with
+/// its separator: `\\?\C:\`, `\\?\UNC\srv\share\`.
 fn verbatim_root(root: &str, verbatim: bool) -> String {
     if verbatim {
         // `\\?\` and `\??\` are both four characters.
@@ -129,6 +132,8 @@ fn key_of(s: &str) -> Option<String> {
 }
 
 /// [`key_of`], admitting names shaped like 8.3 short names when `short`
+/// ([`short_spelled`]: the key such a path would have once it is spelled
+/// long — never a key to compare by).
 fn key_with(s: &str, short: bool) -> Option<String> {
     let (mut key, rest, verbatim) = root_of(s)?;
     if verbatim && s.contains('/') {
@@ -161,6 +166,8 @@ fn key_with(s: &str, short: bool) -> Option<String> {
 }
 
 /// The keyed root of `s` (`C:\`, `\\SRV\SHARE\`), the text after it, and
+/// whether `s` is verbatim (`\\?\`, `\??\`: nothing after it is
+/// normalized).
 fn root_of(s: &str) -> Option<(String, &str, bool)> {
     if let Some(v) = s.strip_prefix(r"\\?\").or_else(|| s.strip_prefix(r"\??\")) {
         let (root, rest) = match v.get(..4) {
@@ -184,6 +191,7 @@ fn root_of(s: &str) -> Option<(String, &str, bool)> {
 }
 
 /// `X:\` keyed (`C:\`) and the text after it; a verbatim path takes only
+/// `\` after the colon.
 fn drive_root(s: &str, verbatim: bool) -> Option<(String, &str)> {
     match s.as_bytes() {
         [drive, b':', sep, ..]
@@ -199,6 +207,7 @@ fn drive_root(s: &str, verbatim: bool) -> Option<(String, &str)> {
 }
 
 /// `srv\share` keyed (`\\SRV\SHARE\`) and the text after it: both names
+/// present and non-empty.
 fn unc_root(s: &str) -> Option<(String, &str)> {
     let mut it = s.splitn(3, ['\\', '/']);
     let (server, share) = (it.next()?, it.next()?);
@@ -214,6 +223,8 @@ fn unc_root(s: &str) -> Option<(String, &str)> {
 }
 
 /// Whether the name `name` has the shape of a generated 8.3 short name
+/// (`PROGRA~1`, `ABCDE~10.TXT`, `AB12CD~1`): at most eight characters, the
+/// last of them `~` and digits, then at most one dot and three more.
 fn short_shaped(name: &str) -> bool {
     let (base, ext) = name.rsplit_once('.').unwrap_or((name, ""));
     let Some((_, digits)) = base.rsplit_once('~') else {
@@ -227,6 +238,11 @@ fn short_shaped(name: &str) -> bool {
 }
 
 /// The characters whose simple uppercase differs from both themselves and
+/// what `char::to_uppercase` answers: Rust's mapping is Unicode's FULL one
+/// (`SpecialCasing.txt`), which spells each of these as two characters
+/// (`ᾀ` as `ἈΙ`), while their simple uppercase — the one NTFS's `$UpCase`
+/// folds by — is one character: the Greek letters with ypogegrammeni, each
+/// to its prosgegrammeni form.
 const SIMPLE_ONLY: &[(u32, u32, u32)] = &[
     (0x1F80, 0x1F87, 8),
     (0x1F90, 0x1F97, 8),
@@ -243,6 +259,8 @@ pub fn fold_case(c: char) -> char {
 }
 
 /// `c`'s simple uppercase where both are one UTF-16 unit, else `c`
+/// ([`windows_key`]): `char::to_uppercase` where that is one character,
+/// [`SIMPLE_ONLY`] where it is two or more.
 fn fold(c: char) -> char {
     let u = u32::from(c);
     if u > 0xFFFF {

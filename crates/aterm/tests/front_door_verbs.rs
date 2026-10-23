@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The front door routes every verb before the mode fork. With a TTY on stdin the mode fork
-//! selects the session, whose parser rejects a verb it does not know, so these tests drive the
-//! real binary under a real pty: piped stdio takes the window route and would hide a verb wired
-//! into only one mode's parser.
+//! Front-door CLI verb routing tests under a real PTY and piped stdio.
 
 #![cfg(unix)]
 #![allow(
@@ -53,17 +50,7 @@ fn on_a_terminal(root: &Path, args: &[&str]) -> String {
 
 /// Run `cmd` with a real terminal on all three streams and return everything it wrote, CR
 /// stripped.
-///
-/// The parent holds its slave end until it has read the master dry: on macOS, output a child
-/// wrote is discarded when the last slave descriptor closes before the master has read it
-/// (measured: `/bin/echo` under a pty, the master read after the child exited, 20 of 20
-/// outputs lost; 0 of 20 with the slave held). With the slave held the master never sees EOF,
-/// so it is read without blocking while the child runs (the child never stalls on a full
-/// buffer) and once more after its exit. What a descendant writes after the direct child
-/// exited is not waited for.
 fn capture_on_a_terminal(mut cmd: Command) -> String {
-    // Both ends close-on-exec from birth: the child holds its terminal and never
-    // a copy of its master, and no sibling test's child inherits either end.
     let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
     // SAFETY: both fds come from the successful open above and are owned
     // here — nothing else holds or closes them.
@@ -77,8 +64,6 @@ fn capture_on_a_terminal(mut cmd: Command) -> String {
         .stderr(Stdio::from(slave.try_clone().expect("dup pty slave")))
         .spawn()
         .expect("spawn the child under a pty");
-    // A `Command` keeps the descriptors it was given until it is dropped: drop it now, so
-    // `slave` below is the one copy this process holds, held on purpose.
     drop(cmd);
 
     let mut pty = std::fs::File::from(master);
@@ -96,11 +81,8 @@ fn capture_on_a_terminal(mut cmd: Command) -> String {
             None => std::thread::sleep(Duration::from_millis(10)),
         }
     }
-    // Everything the child wrote is in the terminal's queue, kept there by the
-    // slave this process still holds.
     read_available(&mut pty, &mut out, start);
     drop(slave);
-    // A pty writes CRLF; strip the CR so callers match on plain text.
     String::from_utf8_lossy(&out).replace('\r', "")
 }
 
@@ -114,7 +96,6 @@ fn read_available(pty: &mut std::fs::File, out: &mut Vec<u8>, start: Instant) {
             Ok(0) => return,
             Ok(n) => out.extend_from_slice(&chunk[..n]),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            // Read dry for now. The slave is held, so nothing else ends a read.
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
             Err(e) => panic!("reading the pty master failed: {e}"),
         }
@@ -142,8 +123,6 @@ fn through_a_pipe(root: &Path, args: &[&str]) -> String {
 /// loop, so a new verb is covered when it joins the roster.
 #[test]
 fn every_verb_is_routed_by_the_front_door_at_a_terminal() {
-    // A flag no verb's tool defines: it provokes each tool's own usage error without asking
-    // any of them to do anything.
     const PROBE: &str = "--aterm-front-door-routing-probe";
     let first = |s: &str| {
         s.lines()
@@ -155,8 +134,6 @@ fn every_verb_is_routed_by_the_front_door_at_a_terminal() {
     let root = private_root();
     for verb in aterm_cli::Verb::ALL {
         let out = on_a_terminal(root.path(), &[verb.name(), PROBE]);
-        // An answer that says nothing proves nothing: an empty terminal
-        // capture would pass the check below whatever parser ran.
         assert!(
             !out.trim().is_empty(),
             "`aterm {} {PROBE}` wrote nothing at a terminal",
@@ -206,8 +183,6 @@ fn edit_answers_as_aterm_edit_aterm_amacs_and_the_amacs_alias() {
         if let Some(sid) = session {
             cmd.env("ATERM_PARENT_SESSION_ID", sid);
         }
-        // A session of its own, with no controlling terminal: the terminal face's
-        // `/dev/tty` is never the one this test runner was started from.
         // SAFETY: the hook runs in the forked child before `exec` and calls only
         // `setsid`, which is async-signal-safe.
         unsafe {
@@ -269,8 +244,6 @@ fn an_uninstalled_roster_tool_names_the_install_not_an_unknown_command() {
         assert!(!out.contains("unknown option"), "{out:?}");
         assert!(!out.contains("unknown command"), "{out:?}");
     }
-    // A command a program ships (`targo` comes with `trust`), which `aterm --help`
-    // names beside the programs: its program's install, never "unknown command".
     for out in [
         on_a_terminal(root.path(), &["targo", "build"]),
         through_a_pipe(root.path(), &["targo", "build"]),

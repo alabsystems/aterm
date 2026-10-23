@@ -604,6 +604,7 @@ mod tests {
     }
 
     /// DECLRMM margins: a valid pair is set and flagged, an empty one (and a
+    /// reset) returns to the full width with the flag lowered.
     #[test]
     fn horizontal_margins_set_reject_and_reset() {
         let mut g = make_storage(24, 80);
@@ -619,6 +620,7 @@ mod tests {
     }
 
     /// A row's addressable width halves on every double-width or
+    /// double-height line size, and columns clamp to it.
     #[test]
     fn line_size_halves_the_addressable_columns() {
         for (size, cols) in [
@@ -660,6 +662,7 @@ mod tests {
     }
 
     /// Every visible row's first cell, top to bottom: the snapshot a no-op
+    /// shift must leave unchanged.
     fn first_cells(g: &Grid) -> Vec<Option<char>> {
         (0..g.storage.visible_rows)
             .map(|r| {
@@ -671,6 +674,7 @@ mod tests {
     }
 
     /// A distinct letter at column 0 of every visible row, so a shift that
+    /// moved any row would show up in [`first_cells`].
     fn label_rows(g: &mut Grid) {
         for (r, ch) in (0..g.storage.visible_rows).zip('A'..) {
             g.set_cursor(r, 0);
@@ -679,6 +683,7 @@ mod tests {
     }
 
     /// Every ring row's slice identity — `(cell pointer, cells length, page id)`,
+    /// the tuple PROOF_CARRYING_PERFORMANCE.md A3 names — as a sorted multiset.
     fn ring_slice_identities(g: &Grid) -> Vec<(usize, usize, usize)> {
         let mut v: Vec<(usize, usize, usize)> = g
             .storage
@@ -691,6 +696,9 @@ mod tests {
     }
 
     /// A3, bounded and exhaustive: with the ring full and its head at every
+    /// rotation, every `shift_visible_rows_up/down(top, bottom, n)` a 6-row
+    /// screen admits keeps the multiset of row slices and allocates nothing
+    /// from the page store.
     #[test]
     fn shift_visible_rows_permutes_row_slices_and_allocates_nothing_at_capacity() {
         const ROWS: u16 = 6;
@@ -744,6 +752,7 @@ mod tests {
     }
 
     /// Negative control: replacing one ring row with a fresh allocation (what a
+    /// copy-based shift would do) changes both readings the A3 test compares.
     #[test]
     fn a_row_replaced_by_a_fresh_allocation_is_seen_by_both_readings() {
         let mut g = Grid::with_scrollback(6, 8, 4);

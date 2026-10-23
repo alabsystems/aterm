@@ -10,6 +10,7 @@ use crate::session_store::{SessionHandoff, Store, new_store, test_handle};
 use super::with_link_reset as with_link;
 
 /// A registered session with process-local id `local_id`: the real
+/// `SessionHandle` the store builds.
 fn registered(store: &Store, local_id: u64) -> (String, std::sync::Arc<SessionCtx>) {
     let h = test_handle(local_id);
     let sid = h.sid.as_str().to_string();
@@ -27,6 +28,7 @@ fn deliver(store: &Store, sid: &str, off: u64, from: &str, kind: &str, text: &st
 }
 
 /// A broadcast delivery on `topic`, as the bridge sends one to a subscribed
+/// session.
 fn broadcast(store: &Store, sid: &str, off: u64, topic: &str, text: &str) -> String {
     cmd_deliver(
         store,
@@ -37,6 +39,8 @@ fn broadcast(store: &Store, sid: &str, off: u64, topic: &str, text: &str) -> Str
 }
 
 /// The outgoing store drawn into a manifest and read back as the
+/// successor reads it, each record seeded onto a FRESH session through
+/// the spawn's seam and registered in a fresh store.
 fn hand_over(store: &Store) -> (Store, Vec<(String, std::sync::Arc<SessionCtx>)>) {
     let manifest = SessionHandoff::from_store(&store.read().unwrap());
     let wire = manifest.to_toml().expect("serializes");
@@ -60,6 +64,12 @@ fn hand_over(store: &Store) -> (Store, Vec<(String, std::sync::Arc<SessionCtx>)>
 }
 
 /// **`dropped=` SURVIVES A SEAMLESS UPDATE, AND THE UNREAD BROADCASTS THE
+/// UPDATE DROPS ARE COUNTED IN IT AND LOGGED.** The ring is not carried,
+/// and under a bridge that does not refill broadcasts (no `hello`, as
+/// here) every broadcast a session held unhandled at the draw is gone from
+/// the successor's inbox; the counter is monotone so that a loss is
+/// visible to the next drain, and the successor used to start it at 0 —
+/// erasing the update's own loss and every drop counted before it.
 #[test]
 fn a_seamless_update_keeps_dropped_and_counts_the_unread_broadcasts_it_drops() {
     crate::test_log::install();
@@ -113,6 +123,10 @@ fn a_seamless_update_keeps_dropped_and_counts_the_unread_broadcasts_it_drops() {
 }
 
 /// **A BROADCAST ITS BRIDGE OFFERS AGAIN IS NOT COUNTED LOST.** Under a
+/// bridge that said `refill=…say`, the successor's bridge rewinds each
+/// topic to its oldest unhandled broadcast and offers it again, so
+/// counting it in `dropped=` as well would report a loss that did not
+/// happen.
 #[test]
 fn a_seamless_update_does_not_count_the_broadcasts_its_bridge_offers_again() {
     crate::test_log::install();
@@ -174,6 +188,15 @@ fn a_seamless_update_does_not_count_the_broadcasts_its_bridge_offers_again() {
 }
 
 /// **A BROADCAST ITS REFILLING BRIDGE HAS LET GO OF IS COUNTED LOST.** Two
+/// ways that bridge stops holding the refill floor of a row this ring
+/// still holds unhandled, and no successor is offered it: a `topic drop`
+/// takes the topic's floor with it (aterm-link's
+/// `Bridge::forget_unhandled_topic`) — and a `topic add` of the same name
+/// resumes from a new cursor, so the topic being held again at the draw
+/// says nothing about the old rows; and the bridge remembers a session's
+/// newest [`RING_CAP`] unhandled broadcasts only (`UNHANDLED_KEEP`), so a
+/// person's broadcast the ring keeps ahead of that many newer agent ones
+/// (evicting those instead) is gone from the floor.
 #[test]
 fn a_broadcast_its_refilling_bridge_let_go_of_is_counted_lost() {
     with_link(|| {
@@ -228,6 +251,8 @@ fn a_broadcast_its_refilling_bridge_let_go_of_is_counted_lost() {
 }
 
 /// a post still queued and a receipt still owed at the park are
+/// on the SUCCESSOR's `outbox` peek — its bridge drains them — under the
+/// ids the old process gave them.
 #[test]
 fn a_seamless_update_carries_the_outbox_the_receipts_and_the_ids() {
     with_link(|| {
@@ -306,6 +331,7 @@ fn a_seamless_update_carries_the_outbox_the_receipts_and_the_ids() {
 }
 
 /// **A RECEIPT FOR A ROW OF AN EARLIER LOG IS LISTED AS ONE, AND STAYS
+/// ONE ACROSS AN UPDATE** (r2-01's residual).
 #[test]
 fn a_receipt_for_a_row_of_an_earlier_log_is_listed_as_one_across_an_update() {
     with_link(|| {
@@ -409,6 +435,7 @@ fn unknown_carried_receipts_stay_fenced_before_the_first_log_report() {
 }
 
 /// A PTY KEEPER RECOVERY IS NOT A FRESH MAILBOX (the fabric audit's fourth
+/// round).
 #[cfg(unix)]
 #[test]
 fn a_keeper_recovery_holds_resubscribes_and_counts_above_the_dead_window() {
@@ -579,6 +606,9 @@ fn a_keeper_recovery_holds_resubscribes_and_counts_above_the_dead_window() {
 }
 
 /// `dropped=` GOES ON COUNTING ACROSS A PTY KEEPER RECOVERY (audit r3-07,
+/// the keeper half), as it does across an update: the META carries the
+/// session's count and the recovered session's `inbox` header reads it,
+/// then counts on from it.
 #[cfg(unix)]
 #[test]
 fn a_keeper_recovery_goes_on_counting_dropped() {
@@ -655,6 +685,11 @@ fn a_keeper_recovery_goes_on_counting_dropped() {
 }
 
 /// THE COMMIT SEES THE OUTBOX MOVE, and a move past its reading WAITS: a
+/// post queued, a receipt owed or a post retired after the park changes
+/// [`SessionFabric::carry_serial`] (the Commit then stands down, a lossless
+/// retry), and under the fence ([`SessionFabric::fence_hold`]) a post is
+/// not answered until the attempt stands down — never `OK` for a row the
+/// successor would not carry.
 #[cfg(unix)]
 #[test]
 fn the_commit_sees_the_outbox_move_and_a_post_waits_on_its_fence() {
@@ -706,6 +741,8 @@ fn the_commit_sees_the_outbox_move_and_a_post_waits_on_its_fence() {
 }
 
 /// an `await inbox since=` above every id this session has handed out
+/// names no row of this process's, and is refused at once — never parked
+/// over unread mail until `OK timeout`.
 #[test]
 fn an_inbox_anchor_this_process_never_minted_is_refused() {
     with_link(|| {
@@ -729,6 +766,7 @@ fn an_inbox_anchor_this_process_never_minted_is_refused() {
 }
 
 /// THE MAIL BUDGET CHARGES WHAT TOML WRITES,
+/// AND IT HOLDS THE RECEIPTS TOO.
 #[test]
 fn the_mail_budget_charges_what_toml_writes_and_holds_the_receipts() {
     with_link(|| {
@@ -802,6 +840,8 @@ fn the_mail_budget_charges_what_toml_writes_and_holds_the_receipts() {
 }
 
 /// SHEDDING THE CARRY keeps the counters and
+/// retires every post dead in the successor, `not-carried`, said; the
+/// receipts are counted.
 #[test]
 fn a_shed_carry_keeps_its_counters_and_says_what_it_dropped() {
     with_link(|| {
@@ -849,6 +889,7 @@ fn a_shed_carry_keeps_its_counters_and_says_what_it_dropped() {
 }
 
 /// INBOUND MAIL IN THE OVERLAP
+/// NEVER VETOES THE UPDATE.
 #[cfg(unix)]
 #[test]
 fn mail_in_the_overlap_is_numbered_below_the_successor_and_vetoes_nothing() {
@@ -896,12 +937,17 @@ fn mail_in_the_overlap_is_numbered_below_the_successor_and_vetoes_nothing() {
 }
 
 /// The notice cadence this test process waits on: the production one
+/// read through the timing value.
 #[cfg(unix)]
 fn notice_every() -> std::time::Duration {
     aterm_gui_timing::current().of(MSG_ROOM_NOTICE_EVERY)
 }
 
 /// Watch deliveries waiting on the Commit's fence until each of `sids`
+/// has logged a WARN whose own `waited` is past `bound` — those sessions'
+/// [`SessionFabric::fence_wait`], the longest any fenced path on them waits
+/// before a `hold`, a post and a retirement answer [`HOLD_BUSY`] — failing
+/// the moment one answers.
 #[cfg(unix)]
 fn still_waiting_past_every_fenced_bound(
     waiters: Vec<std::thread::JoinHandle<String>>,
@@ -942,6 +988,11 @@ fn still_waiting_past_every_fenced_bound(
 }
 
 /// A
+/// DELIVERY THAT MUST NOT BE ANSWERED UNDER THE COMMIT'S FENCE WAITS FOR
+/// THE ATTEMPT, for as long as the fence stands, and is never answered an
+/// `ERR`: the bridge books any non-`OK` reply as a verdict (the
+/// record refused to its sender, a broadcast dropped) and commits its
+/// cursor past it.
 #[cfg(unix)]
 #[test]
 fn a_fenced_delivery_waits_past_every_bound_and_is_never_refused() {
@@ -999,6 +1050,7 @@ fn a_fenced_delivery_waits_past_every_bound_and_is_never_refused() {
 }
 
 /// THE FENCE HOLDS A RETIREMENT BACK ONLY FOR
+/// A SUCCESSOR THAT READS THE CARRY.
 #[cfg(unix)]
 #[test]
 fn the_fence_holds_a_retirement_back_only_for_a_successor_that_reads_the_carry() {

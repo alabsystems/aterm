@@ -2,29 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! An exported momentum trace as one file, and its replay in another process.
-//!
-//! [`super::MomentumHost::aos_trace`] exports the identity, the encoded ancestor checkpoint,
-//! the encoded log since it (sealed: its last record names how many events precede it and
-//! their trace digest) and the head the live run reached from that checkpoint: the state
-//! digest and the observation chain. [`MomentumTrace::encode`] writes them as one file:
-//!
-//! ```text
-//! TRACE_FILE_MAGIC ‖ identity ‖ head state digest ‖ head chain ‖ bytes(checkpoint) ‖
-//!     bytes(log) ‖ Digest::of(TRACE_FILE_DOMAIN, [everything before it])
-//! ```
-//!
-//! and [`MomentumTrace::decode`] reads exactly that back, refusing any other bytes (another
-//! magic or format, a closing digest that does not name the bytes before it, a field that
-//! does not decode, a trailing byte).
-//!
-//! Every time inside the checkpoint and the log is a signed offset from the recording
-//! epoch, so a reader in another process supplies its own epoch instant.
-//! [`MomentumTrace::read`] decodes the checkpoint and then the log on that epoch, checking
-//! the log against the identity and against the checkpoint it extends, and refuses a log
-//! that is torn or unsealed. [`MomentumTrace::replay`] then refuses a broken log, finds the
-//! code the identity names among this build's, restores the checkpoint, replays the log
-//! through that code with no effects, and compares the state digest and the observation chain
-//! it reaches with the recorded head. Nothing in a read or a replay reads a clock.
 
 use core::fmt;
 
@@ -48,15 +25,13 @@ pub const TRACE_FILE_DOMAIN: &[u8] = b"aterm-aos-momentum-trace-file-v1\0";
 /// The closing digest's length.
 const SEAL_LEN: usize = 32;
 
-/// An exported trace: the identity, the encoded ancestor checkpoint and the encoded log, with
-/// the head the live run reached from that checkpoint over that log.
+/// An exported trace.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MomentumTrace {
     pub identity: TaskIdentity,
     pub checkpoint: Vec<u8>,
     pub log: Vec<u8>,
-    /// The live state's digest when the trace was exported: what a replay of the log from
-    /// the checkpoint must reach.
+    /// The live state's digest when the trace was exported.
     pub head_state: Digest,
     /// The live observation chain since the checkpoint when the trace was exported.
     pub head_chain: Digest,
@@ -122,7 +97,7 @@ pub struct TraceReplay {
     pub observation_chain: Digest,
 }
 
-/// Why a trace file was not read or did not replay. Nothing is changed.
+/// Why a trace file was not read or did not replay.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TraceFault {
     /// The bytes do not open with `AOSMTR\0`.
@@ -225,13 +200,9 @@ impl MomentumTrace {
         e.finish()
     }
 
-    /// The trace a file holds. The checkpoint and the log come back as bytes; [`Self::read`]
-    /// decodes them.
-    ///
+    /// The trace a file holds.
     /// # Errors
-    ///
-    /// [`TraceFault::Magic`], [`TraceFault::Format`], [`TraceFault::Seal`] (checked before
-    /// any field is read) or [`TraceFault::Wire`].
+    /// [`TraceFault::Magic`], [`TraceFault::Format`], [`TraceFault::Seal`] or [`TraceFault::Wire`].
     pub fn decode(bytes: &[u8]) -> Result<MomentumTrace, TraceFault> {
         let magic = bytes
             .get(..TRACE_FILE_MAGIC.len())
@@ -278,11 +249,8 @@ impl MomentumTrace {
         Ok(trace)
     }
 
-    /// The checkpoint and the log decoded on the reader's recording `epoch`: the log checked
-    /// against the identity and against the checkpoint it extends, and whole.
-    ///
+    /// The checkpoint and the log decoded on the reader's recording `epoch`.
     /// # Errors
-    ///
     /// [`TraceFault::Checkpoint`], [`TraceFault::Log`], or [`TraceFault::Tail`] for a torn or
     /// unsealed log.
     pub fn read(&self, epoch: Instant) -> Result<ReadTrace, TraceFault> {
@@ -308,11 +276,9 @@ impl MomentumTrace {
         })
     }
 
-    /// Reads the trace on `epoch`, replays its log from its checkpoint through the code of
-    /// `build` the identity names, and checks the replay reached the recorded head.
-    ///
+    /// Reads the trace on `epoch`, replays its log from its checkpoint through the code of `build`
+    /// the identity names, and checks the replay reached the recorded head.
     /// # Errors
-    ///
     /// Any of [`Self::read`]'s, then [`TraceFault::Broken`], [`TraceFault::UnknownCode`],
     /// [`TraceFault::Restore`], [`TraceFault::Refused`], [`TraceFault::State`] or
     /// [`TraceFault::Chain`], in that order.

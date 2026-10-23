@@ -1,23 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Claude Code's composer, the second wrap and after: a long prompt's band follows each wrapped
-//! line up and continues the spectrum, and a Space typed at the end of a full line goes up with
-//! it.
-//!
-//! `tests/composer_box_growth_wrap.rs` pins the first wrap. At the second the line wraps under
-//! the first line of prose, and Ink's diff writes that repaint sparsely: every cell where the
-//! second line's glyph equals the first line's at the same column is skipped. The follow pass
-//! (`Witness::follow_runs`) must not read those coincidences as holes, or it refuses the run,
-//! the band melts on the caret's new row in `RETIRE_MELT_S`, and the next keys join a stale
-//! cohort and restart the colours.
-//!
-//! The bytes are Claude Code 2.1.282's at 91×53, captured in an isolated aterm and under a
-//! Python pty (run `run1`): its two wrap chunks are quoted below verbatim. The DEC 2026 bracket
-//! is the window's own.
-//!
-//! Every law runs at the host seam (`trail_host::Core`, the frame hold) on a 16.7 ms train,
-//! keys at the capture's 80 ms.
+//! Claude Code's composer, the second wrap and after: a long prompt's band follows each wrapped line up and continues the spectrum, and a Space typed at the end of a full line goes up with it.
 
 use crate::trail_host::{Core, LOCK_A, Theme};
 use aterm_effects::rainbow_kitty::TypedClass;
@@ -36,8 +20,7 @@ const FRAME_US: u64 = 16_667;
 const KEY_MS: u64 = 80;
 
 /// Claude Code's box before it grows, 1-based: top rule on 50, text row on 51,
-/// bottom rule on 52, status on 53. The box grows upward: a wrap repaints the
-/// top rule and every text row one row higher and leaves the bottom rule.
+/// bottom rule on 52, status on 53.
 const TOP_RULE_ROW: usize = 50;
 const TEXT_ROW: usize = 51;
 const BOTTOM_RULE_ROW: usize = 52;
@@ -56,14 +39,11 @@ const TEXT_PEN: &str = "\x1b[39m";
 /// text row; a continuation row holds two blanks there.
 const PROMPT: &str = "\u{276f}\u{a0}";
 
-/// `run1`'s first text row: 86 glyphs on 1-based columns 3..=88. The Space after
-/// it fits (the caret goes to 90) and the `k` of the next word wraps.
+/// `run1`'s first text row: 86 glyphs on 1-based columns 3..=88.
 const LINE1: &str =
     "the quick brown fox jumps over the lazy dog while the rainbow kitty trail follows each";
 /// `run1`'s second text row: 87 glyphs on 1-based columns 3..=89, starting with
-/// the wrapped `k`. It shares five letters with `LINE1` at the same column (`o`
-/// `e` `r` `h` `l`, 0-based 28, 30, 31, 47, 79), which the sparse repaint skips.
-/// The Space after it wraps.
+/// the wrapped `k`.
 const LINE2: &str =
     "key we type into this composer so we can watch exactly what happens when the line wraps";
 /// The keys typed on the third row.
@@ -79,9 +59,7 @@ fn captured_first_wrap() -> String {
 }
 
 /// `run1` key 174, the Space that wraps the second line, verbatim from the
-/// on-glass byte log (578 bytes). Row 50 is written sparsely: `ESC[7G`,
-/// `ESC[30G`, `ESC[34G`, `ESC[49G`, `ESC[71G`, `ESC[81G`, `ESC[85G` step over the
-/// cells where `LINE2` already matches `LINE1`.
+/// on-glass byte log (578 bytes).
 fn captured_second_wrap() -> String {
     format!(
         "\x1b[?2026h\x1b[?25l\x1b[H\r\x1b[47B\x1b[38;2;136;136;136m{}\r\x1b[1B\x1b[39m\u{276f}\u{a0}the quick brown fox jumps over the lazy dog while the rainbow kitty trail follows each\x1b[K\r\x1b[1B  key\x1b[7Gwe type into this comp\x1b[30Gs\x1b[34Gso we can watc\x1b[49G exactly what happens\x1b[71Gwhen the \x1b[81Gine\x1b[85Gwraps\r\x1b[2C\x1b[1B\x1b[K\x1b[53;1H\x1b[51;3H\x1b[?25h\x1b[?2026l",
@@ -96,8 +74,7 @@ fn rule() -> String {
 
 /// A labelled rule in Claude Code 2.1.278's shape (78 cells of rule, `ESC[80G`,
 /// the label in its own pen, the rule's last cell at the margin; Ink's diff
-/// steps over the blanks between). Not captured at 91 columns: the label sits
-/// on 1-based columns 80.. as at 90, the last cell on 91.
+/// steps over the blanks between).
 fn labelled_rule(label: &str) -> String {
     format!(
         "{}\x1b[80G\x1b[38;2;175;135;255m{label}\x1b[{COLS}G{RULE_PEN}\u{2500}",
@@ -337,7 +314,7 @@ fn typed_to_the_first_wrap(rule: &str, line1: &str) -> Host {
 }
 
 /// `run1` up to the second wrap: the first wrap on its `k`, then the rest of
-/// `line2` typed on the continuation row. `line2` must begin with `k`.
+/// `line2` typed on the continuation row.
 fn typed_to_the_second_wrap(line2: &str) -> Host {
     let mut h = typed_to_the_first_wrap(&rule(), LINE1);
     h.wrap('k', &first_wrap_bytes(&rule(), LINE1, LINE1, "k"), 4);
@@ -430,9 +407,7 @@ fn the_row_after_the_second_wrap_continues_the_walk_the_second_line_left_off() {
 }
 
 /// A Space typed at the end of the line goes up with it (`run1` keys 86 and 87:
-/// the Space after `each` fits on column 89, then `k` wraps). The Space's cell,
-/// never armed since a Space writes no glyph, rides up to row 49 with its line,
-/// and nothing is left on the continuation row right of the moved `k`.
+/// the Space after `each` fits on column 89, then `k` wraps).
 #[test]
 fn a_space_typed_at_the_end_of_a_full_line_goes_up_with_it_when_the_next_glyph_wraps() {
     let mut h = typed_to_the_first_wrap(&rule(), LINE1);
@@ -457,9 +432,7 @@ fn a_space_typed_at_the_end_of_a_full_line_goes_up_with_it_when_the_next_glyph_w
 
 /// The first wrap under a labelled rule follows too: a labelled rule can share a
 /// letter with the line (`…and then at` puts the `t` of `then` under the `t` of
-/// `extension`, a stand-in 9-letter label). The band follows the whole line.
-/// (The chunk writes the line whole where Ink's diff would skip that `t`; the
-/// screen is the same.)
+/// `extension`, a stand-in 9-letter label).
 #[test]
 fn the_first_wrap_under_a_labelled_rule_follows_despite_a_letter_the_label_shares() {
     let label = "extension";
@@ -492,9 +465,7 @@ fn the_first_wrap_under_a_labelled_rule_follows_despite_a_letter_the_label_share
 
 /// A line typed under a near-copy of itself follows too: a repeated instruction
 /// with one word changed, each sentence one full row (87 columns, the Space
-/// wrapping). Only the three glyphs of `new` under `old` can testify (the rest
-/// are twins standing where the moved text puts them), and they arrived, so the
-/// band follows whole. Twins are neutral, not counted against the half.
+/// wrapping).
 #[test]
 fn a_line_typed_under_a_near_copy_of_itself_follows_on_the_letters_that_differ() {
     let s1 =
@@ -558,11 +529,7 @@ fn a_second_line_that_shares_no_letter_with_the_first_follows_on_both_trees() {
     assert!(h.cells(CARET_ROW).is_empty());
 }
 
-/// Negative control: other text a row up is not followed. The row the second
-/// line would move to gets different text (its letters rotated by 13): the
-/// band's glyphs are found nowhere, nothing follows, the walk releases the band
-/// (`ribbon_retired=` counts it) and its cohort drains on the caret's row,
-/// while the other text's row never lights.
+/// Negative control: other text a row up is not followed.
 #[test]
 fn a_second_wrap_that_writes_other_text_a_row_up_follows_nothing() {
     let mut h = typed_to_the_second_wrap(LINE2);
@@ -614,18 +581,7 @@ fn a_second_wrap_that_writes_other_text_a_row_up_follows_nothing() {
 }
 
 /// The limit, stated as a law: a line identical to the one above it, or one glyph off
-/// (`step 1:` then `step 2:`), melts instead of following. At the second wrap it moves a row up
-/// onto a row that already held it, glyph for glyph but at most one: too little evidence for a
-/// move, and exactly the screen of a line erased under an identical line
-/// (`tests/erased_under_its_twin.rs`). If a future witness can tell them apart, flip this law;
-/// do not loosen the erase laws to pass it.
-///
-/// What the limit must not become: the first line re-laid a row higher is identical text
-/// arriving two rows up, and a twin one row away does not stop the search two rows away
-/// (`a_twin_testifies_only_about_its_own_row`). The band stays off the first line because
-/// nothing samples its row at that wrap (`a_waiting_key_s_arming_rows_have_slots_of_their_own`);
-/// stopping the search at a whole text one row away would melt a line under an identical command
-/// pushed down two rows (`tests/moves_are_followed.rs`).
+/// (`step 1:` then `step 2:`), melts instead of following.
 #[test]
 fn the_limit_a_line_identical_to_the_one_above_it_or_one_column_off_melts_instead_of_following() {
     let step1 =
@@ -666,10 +622,7 @@ fn the_limit_a_line_identical_to_the_one_above_it_or_one_column_off_melts_instea
 
 /// `agy`'s composer has a 3-column prompt (`" > "`, first glyph at 0-based
 /// column 3) on line 1 and a 2-column indent (`"  "`, first glyph at 0-based
-/// column 2) on continuation rows. When a word (`"LOOK! "`) wraps from line 1's
-/// tail onto the continuation row at column 2, `note_rewrap_start` lowers the
-/// row's `hand_floor` from 3 to 2 so `re_anchor` relays `"LOOK!"` at `2..7`
-/// alongside the wrap key at `7`, leaving no unlit gap before `"a gap"`.
+/// column 2) on continuation rows.
 #[test]
 fn agy_three_col_prompt_wraps_to_two_col_continuation_without_a_gap() {
     let agy_prompt = " > ";
@@ -703,8 +656,6 @@ fn agy_three_col_prompt_wraps_to_two_col_continuation_without_a_gap() {
         "line 1's 3-column ` > ` prompt starts live cells at column 3"
     );
 
-    // Typing Space after `LOOK!` wraps `LOOK! ` onto the continuation row at
-    // 0-based column 2 (`"  LOOK! "`), while line 1 moves up to row 50.
     let moved = format!("{wrapped_word} ");
     let wrap_bytes = format!(
         "{SYNC_BEGIN}\x1b[?25l\x1b[H\r\x1b[{}B{RULE_PEN}{}\r\x1b[1B{TEXT_PEN}{agy_prompt}{line1_kept} \x1b[K{}\x1b[{TEXT_ROW};{}H\x1b[?25h{SYNC_END}",

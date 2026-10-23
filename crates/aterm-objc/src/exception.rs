@@ -19,6 +19,7 @@ core::arch::global_asm!(include_str!("objc_try_x86_64.s"), options(att_syntax));
 #[link(name = "objc")]
 unsafe extern "C-unwind" {
     /// `@try { body(data); return 0 } @catch (id e) { on_exc(data, e); return 1 }`,
+    /// defined by the `global_asm!` above.
     fn aterm_objc_try(
         data: *mut u8,
         body: unsafe extern "C-unwind" fn(*mut u8),
@@ -44,6 +45,7 @@ impl Contained {
 }
 
 /// What [`objc_try`]'s two callbacks share: the body, the handler and the
+/// body's result.
 struct Slot<R, B, H> {
     body: ManuallyDrop<B>,
     on_exc: ManuallyDrop<H>,
@@ -61,7 +63,7 @@ impl<R, B, H> Drop for Slot<R, B, H> {
     }
 }
 
-/// The body callback: move the closure out and run it. Its result is stored
+/// The body callback: move the closure out and run it.
 unsafe extern "C-unwind" fn run_body<R, B: FnOnce() -> R, H>(data: *mut u8) {
     // SAFETY: `data` points to a live `Slot<R, B, H>` and `run_body` is called once.
     let slot = unsafe { &mut *data.cast::<Slot<R, B, H>>() };
@@ -70,6 +72,7 @@ unsafe extern "C-unwind" fn run_body<R, B: FnOnce() -> R, H>(data: *mut u8) {
 }
 
 /// The handler callback, run between `objc_begin_catch` and `objc_end_catch`
+/// with the exception object live.
 unsafe extern "C-unwind" fn run_on_exc<R, B, H: FnOnce(Id)>(data: *mut u8, exception: Id) {
     // SAFETY: `data` points to a live `Slot<R, B, H>` and `run_on_exc` is called at most once.
     let slot = unsafe { &mut *data.cast::<Slot<R, B, H>>() };
@@ -209,6 +212,7 @@ pub(crate) fn report(method: &str, exception: Id) -> u64 {
 }
 
 /// `(class, name, reason, call stack)` of a live exception object, through
+/// ordinary sends.
 fn describe(exception: Id) -> (String, String, String, String) {
     if exception.is_null() {
         return (
@@ -309,6 +313,7 @@ inert_zero! {
 
 // SAFETY: `Option<NonNull<T>>` and `Option<&T>` are null-pointer-optimized to `None`.
 /// `Option<T>` of a pointer-shaped `T` is `None` at zero, which is the inert
+/// answer for a method that returns one.
 unsafe impl<T> InertZero for Option<std::ptr::NonNull<T>> {}
 
 #[cfg(test)]
@@ -347,6 +352,7 @@ mod tests {
     }
 
     /// The handler is released on every way out of the wrapper, including the
+    /// Rust-panic pass-through where it never ran.
     #[test]
     fn the_unrun_handler_is_dropped_on_both_the_ok_and_the_panic_path() {
         use std::rc::Rc;

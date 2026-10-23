@@ -48,6 +48,7 @@ pub(crate) struct StartClock {
 
 impl From<i64> for StartClock {
     /// A wall-clock reading alone: what an older build's record holds, and what a
+    /// system with no steady clock to read gives.
     fn from(unix: i64) -> Self {
         Self { unix, steady: None }
     }
@@ -148,7 +149,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    /// The start rule as a machine. `young`: the stamped start (the latest within the
+    /// The start rule as a machine.
     fn start_model() -> aterm_spec::derive::Model {
         aterm_spec::ty_model! {
             LinuxTrialStartSettles {
@@ -196,6 +197,8 @@ mod tests {
     }
 
     /// The machine proves no rollback is taken over a start that could still confirm, and
+    /// catches the count-only rule (`Buggy = 1`); then the shipping [`start_rolls_back`]
+    /// is bound to the model's guards over every count and every age that matters.
     #[test]
     fn a_start_rolls_back_only_once_the_start_before_it_has_settled() {
         let model = start_model();
@@ -236,6 +239,8 @@ mod tests {
     }
 
     /// A wall-clock step between two starts of one boot moves no verdict: for every count,
+    /// real age and step (an hour either way, a second back, none), the shipping decision
+    /// on [`judged_now`] is the model's `RollBack` guard at the real age.
     #[test]
     fn a_wall_clock_step_between_two_starts_of_one_boot_moves_no_verdict() {
         let model = start_model();
@@ -318,7 +323,7 @@ mod tests {
     /// Seconds per tick of [`deferral_model`]: its settle window `W` is two ticks.
     const TICK_SECS: i64 = START_SETTLES_SECS / 2;
 
-    /// How long the verdict waits, as a machine with a clock. `age` is ticks since the
+    /// How long the verdict waits, as a machine with a clock.
     fn deferral_model() -> aterm_spec::derive::Model {
         aterm_spec::ty_model! {
             LinuxTrialDeferralBounded {
@@ -364,6 +369,7 @@ mod tests {
     }
 
     /// Past the budget the verdict waits at most one settle window, plus less than one more
+    /// for a silent session, however fast the starts come.
     #[test]
     fn the_verdict_waits_at_most_one_window_past_the_budget() {
         let model = deferral_model();
@@ -459,6 +465,8 @@ mod tests {
     }
 
     /// The two lanes as a machine: `healthy` is the trial confirmed (checks and applies go
+    /// on), `proven` a window confirmed it, `crashed` a window start counted with no
+    /// window's confirmation since.
     fn lane_model() -> aterm_spec::derive::Model {
         aterm_spec::ty_model! {
             LinuxTrialLanes {
@@ -492,6 +500,7 @@ mod tests {
     }
 
     /// A session never vouches for a window: the model is proved (catching `Buggy = 1`),
+    /// and in all eight states [`start_counts`] and [`confirm`] match its guards and actions.
     #[test]
     fn a_session_never_vouches_for_a_window() {
         let model = lane_model();

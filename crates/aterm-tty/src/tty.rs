@@ -1,27 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The terminal a program draws on, as one trait with a real and an in-memory side
-//! (docs/DESIGN-amacs-2026-10-19.md §5.1).
-//!
-//! [`Tty`] is everything a terminal program's loop asks of its terminal: wait for input
-//! until a deadline, write, the size, the clock the deadlines are on, the signals that
-//! arrived, the private modes it sets, and suspension. [`DevTty`] is `/dev/tty` in raw
-//! mode ([`crate::raw::RawGuard`]) with the signal wake ([`crate::signals`]);
-//! `MemTty` is a scripted terminal on a virtual clock, so a loop runs headless and
-//! deterministic in tests.
-//!
-//! [`Mode`] names the private modes a program sets and must put back. The bytes that set
-//! and reset each are here, in the one order every restore path uses: the screen state
-//! first, the kitty keyboard stack while the alternate screen is still up, the alternate
-//! screen last. Each screen has its own kitty stack, so the kitty entry follows the
-//! screen shown: entering or leaving the alternate screen with it set pops it from the
-//! screen left and pushes it onto the one entered. It is then always on the screen
-//! shown, where every restore pops it, whatever order the modes were set in.
-//!
-//! A signal stays pending until [`Tty::take_signals`] takes it, and every read returns
-//! [`Readiness::Signal`] while one is: a wait that did not take it (the probe's) never
-//! hides it from the next.
+//! The terminal a program draws on, as one trait with a real and an in-memory side (docs/DESIGN-amacs-2026-10-19.md §5.1).
 
 use std::io;
 use std::time::Instant;
@@ -42,8 +22,7 @@ pub enum Readiness {
     Bytes(usize),
     /// The deadline passed with nothing to read.
     Timeout,
-    /// Signals are pending; [`Tty::take_signals`] takes them. A read returns this, at
-    /// once, for as long as any are, so a wait that did not take them hides none.
+    /// Signals are pending; [`Tty::take_signals`] takes them.
     Signal,
     /// The terminal hung up: nothing more will be read.
     Closed,
@@ -54,9 +33,7 @@ pub enum Readiness {
 pub enum Mode {
     /// The alternate screen (DEC 1049): the program's own page, the shell's left as it was.
     AltScreen,
-    /// Kitty's keyboard protocol with these flags pushed onto the stack of the screen
-    /// shown (amacs pushes 1|4, D-20), and carried to the other screen when the
-    /// alternate screen is entered or left. Put back by popping that entry.
+    /// Kitty's keyboard protocol with these flags pushed onto the stack of the screen shown (amacs pushes 1|4, D-20), and carried to the other screen when the alternate screen is entered or left.
     KittyKeys(u8),
     /// Mouse reports for presses, releases and drags (1002), SGR-encoded (1006).
     Mouse,
@@ -66,9 +43,7 @@ pub enum Mode {
     Focus,
     /// DEC 2048's in-band size reports.
     InBandResize,
-    /// The cursor and the drawing state: the screen writer hides the cursor during a
-    /// frame and sets its shape. Setting it writes nothing; putting it back ends a frame
-    /// cut short (synchronized output, SGR) and shows the terminal's default cursor.
+    /// The cursor and the drawing state: the screen writer hides the cursor during a frame and sets its shape.
     Cursor,
 }
 
@@ -154,9 +129,7 @@ impl Mode {
         }
     }
 
-    /// The bytes that set it again on a terminal that may have lost it (after the
-    /// process was stopped and continued) without stacking a second kitty entry: kitty's
-    /// flags are set in place (`CSI = flags ; 1 u`), not pushed.
+    /// The bytes that set it again on a terminal that may have lost it (after the process was stopped and continued) without stacking a second kitty entry: kitty's flags are set in place (`CSI = flags ; 1 u`), not pushed.
     #[must_use]
     pub fn reassert_bytes(self) -> Vec<u8> {
         match self {
@@ -175,9 +148,7 @@ impl Mode {
     }
 }
 
-/// Each mode's reset bytes, in the order a restore writes them: the drawing state first,
-/// the kitty stack popped while the alternate screen it belongs to is still up, the
-/// alternate screen last. Static, so a signal handler writes them without allocating.
+/// Each mode's reset bytes, in the order a restore writes them: the drawing state first, the kitty stack popped while the alternate screen it belongs to is still up, the alternate screen last.
 pub(crate) const RESET_ORDER: [(Modes, &[u8]); 7] = [
     (Modes::CURSOR, b"\x1b[?2026l\x1b[m\x1b[0 q\x1b[?25h"),
     (Modes::IN_BAND_RESIZE, b"\x1b[?2048l"),
@@ -188,8 +159,7 @@ pub(crate) const RESET_ORDER: [(Modes, &[u8]); 7] = [
     (Modes::ALT_SCREEN, b"\x1b[?1049l"),
 ];
 
-/// The order modes are set in again after a suspension: the reverse of
-/// [`RESET_ORDER`]. `kitty` is the flags the kitty entry carries.
+/// The order modes are set in again after a suspension: the reverse of [`RESET_ORDER`].
 pub(crate) fn set_order(modes: Modes, kitty: u8) -> impl Iterator<Item = Mode> {
     [
         Mode::AltScreen,
@@ -204,15 +174,12 @@ pub(crate) fn set_order(modes: Modes, kitty: u8) -> impl Iterator<Item = Mode> {
     .filter(move |mode| modes.contains(mode.bit()))
 }
 
-/// The bytes that set `mode` on a terminal where the modes in `set` (which lacks it) are
-/// set, a kitty entry among them carrying `kitty`'s flags: entering the alternate screen
-/// carries that entry onto it (see the module docs).
+/// The bytes that set `mode` on a terminal where the modes in `set` (which lacks it) are set, a kitty entry among them carrying `kitty`'s flags: entering the alternate screen carries that entry onto it (see the module docs).
 pub(crate) fn enable_bytes(mode: Mode, set: Modes, kitty: u8) -> Vec<u8> {
     carry_kitty(mode, set, kitty, mode.set_bytes())
 }
 
-/// The bytes that put `mode` back where the modes in `set` (which hold it) are set:
-/// leaving the alternate screen carries a kitty entry back to the main screen.
+/// The bytes that put `mode` back where the modes in `set` (which hold it) are set: leaving the alternate screen carries a kitty entry back to the main screen.
 pub(crate) fn disable_bytes(mode: Mode, set: Modes, kitty: u8) -> Vec<u8> {
     carry_kitty(mode, set, kitty, mode.reset_bytes().to_vec())
 }
@@ -231,8 +198,7 @@ fn carry_kitty(mode: Mode, set: Modes, kitty: u8, switch: Vec<u8>) -> Vec<u8> {
     out
 }
 
-/// The bytes that put back every mode in `modes`, in the one order every restore uses
-/// (see the module docs).
+/// The bytes that put back every mode in `modes`, in the one order every restore uses (see the module docs).
 #[must_use]
 pub fn reset_bytes(modes: Modes) -> Vec<u8> {
     RESET_ORDER
@@ -244,21 +210,17 @@ pub fn reset_bytes(modes: Modes) -> Vec<u8> {
 
 /// A terminal a program reads keys from and draws on.
 pub trait Tty {
-    /// Wait until input can be read, a signal arrives or `deadline` passes (`None`:
-    /// wait for input or a signal), and read what can be read into `buf`.
-    ///
+    /// Wait until input can be read, a signal arrives or `deadline` passes (`None`: wait for input or a signal), and read what can be read into `buf`.
     /// # Errors
     /// The read's or the wait's OS error.
     fn read(&mut self, buf: &mut [u8], deadline: Option<Instant>) -> io::Result<Readiness>;
 
     /// Write all of `bytes`.
-    ///
     /// # Errors
     /// The write's OS error.
     fn write_all(&mut self, bytes: &[u8]) -> io::Result<()>;
 
     /// The terminal's size now.
-    ///
     /// # Errors
     /// The size query's OS error.
     fn size(&self) -> io::Result<Size>;
@@ -266,31 +228,22 @@ pub trait Tty {
     /// The clock [`Self::read`]'s deadlines and the decoder's timeouts are measured on.
     fn now(&self) -> Instant;
 
-    /// The signals that arrived since the last call. After [`Signals::CONT`] the terminal
-    /// is raw again with every mode set (the process may have been stopped and its
-    /// terminal reset while it was); the caller repaints in full.
-    ///
+    /// The signals that arrived since the last call.
     /// # Errors
     /// Setting raw mode again failed.
     fn take_signals(&mut self) -> io::Result<Signals>;
 
-    /// Set `mode`, and put it back however the program leaves. Setting a mode already
-    /// set writes nothing.
-    ///
+    /// Set `mode`, and put it back however the program leaves.
     /// # Errors
     /// The write's OS error.
     fn enable(&mut self, mode: Mode) -> io::Result<()>;
 
     /// Put `mode` back now.
-    ///
     /// # Errors
     /// The write's OS error.
     fn disable(&mut self, mode: Mode) -> io::Result<()>;
 
     /// Stop the process as SIGTSTP's default does (C-z), the terminal put back first.
-    /// Returns once the process is continued, the terminal raw again with every mode
-    /// set; the caller repaints in full.
-    ///
     /// # Errors
     /// Putting the terminal back or setting it raw again failed.
     fn suspend(&mut self) -> io::Result<()>;
@@ -312,10 +265,6 @@ mod dev {
     use crate::signals::{self, SignalWake, Signals};
 
     /// The controlling terminal, raw, with the signal wake installed.
-    ///
-    /// Dropping it puts the terminal back: every mode set, then the settings it had
-    /// (the guard drops first, while the descriptor is open), then the signal
-    /// dispositions.
     pub struct DevTty {
         guard: RawGuard,
         signals: SignalWake,
@@ -324,10 +273,8 @@ mod dev {
 
     impl DevTty {
         /// Open `/dev/tty` (`O_RDWR | O_CLOEXEC`), not stdio, and set it raw.
-        ///
         /// # Errors
-        /// There is no controlling terminal, or it cannot be set raw, or a terminal is
-        /// already raw in this process.
+        /// There is no controlling terminal, or it cannot be set raw, or a terminal is already raw in this process.
         pub fn open() -> io::Result<Self> {
             let file = File::options()
                 .read(true)
@@ -338,7 +285,6 @@ mod dev {
         }
 
         /// A terminal already open, set raw: a pty's slave in a test.
-        ///
         /// # Errors
         /// As [`Self::open`].
         pub fn from_fd(fd: OwnedFd) -> io::Result<Self> {
@@ -374,7 +320,6 @@ mod dev {
                         if now >= deadline {
                             return Ok(Readiness::Timeout);
                         }
-                        // Rounded up, so the wait never ends before the deadline.
                         let left = deadline.duration_since(now);
                         let ms = left.as_micros().div_ceil(1000);
                         libc::c_int::try_from(ms).unwrap_or(libc::c_int::MAX)
@@ -418,7 +363,6 @@ mod dev {
                     }
                     match signals::errno() {
                         libc::EINTR | libc::EAGAIN => continue,
-                        // A hung-up terminal reads EIO.
                         libc::EIO => return Ok(Readiness::Closed),
                         _ => return Err(io::Error::last_os_error()),
                     }
@@ -517,16 +461,7 @@ mod mem {
         suspended: usize,
     }
 
-    /// A terminal program's side of an in-memory terminal: a script of input on a
-    /// virtual clock, and the bytes the program wrote.
-    ///
-    /// A read reports pending signals first, as [`super::DevTty`]'s does; otherwise it
-    /// takes the next scripted item when it has arrived by the read's deadline, moving
-    /// the clock to its arrival, or the clock moves to the deadline and the read times
-    /// out. With nothing left to read and no deadline the terminal has hung up
-    /// ([`Readiness::Closed`]), so a loop run on a finished script ends.
-    /// [`Tty::enable`], [`Tty::disable`] and [`Tty::suspend`] write what [`super::DevTty`]
-    /// writes; a suspension returns at once, continued, with [`Signals::CONT`] pending.
+    /// A terminal program's side of an in-memory terminal: a script of input on a virtual clock, and the bytes the program wrote.
     #[derive(Debug)]
     pub struct MemTty {
         state: Arc<Mutex<State>>,
@@ -768,14 +703,12 @@ mod tests {
         let mut buf = [0u8; 3];
         assert_eq!(tty.read(&mut buf, None).unwrap(), Readiness::Bytes(2));
         assert_eq!(&buf[..2], b"ab");
-        // The next bytes arrive after this deadline: the clock moves to it.
         let deadline = start + Duration::from_millis(100);
         assert_eq!(
             tty.read(&mut buf, Some(deadline)).unwrap(),
             Readiness::Timeout
         );
         assert_eq!(tty.now(), deadline);
-        // A short buffer leaves the rest for the next read, at the same moment.
         assert_eq!(tty.read(&mut buf, None).unwrap(), Readiness::Bytes(3));
         assert_eq!(&buf, b"cde");
         assert_eq!(tty.now(), start + Duration::from_millis(300));
@@ -826,7 +759,6 @@ mod tests {
         );
         assert_eq!(peer.take_output(), expected);
         assert_eq!(peer.suspensions(), 1);
-        // Continued: the modes are set again in place, never stacked.
         assert_eq!(tty.take_signals().unwrap(), Signals::CONT);
         assert_eq!(
             peer.take_output(),
@@ -872,7 +804,6 @@ mod tests {
             seen.extend(peer.take_output());
             assert_eq!(shown(&seen), ("5".to_owned(), true), "{order:?}");
 
-            // Back to the main screen: the entry comes with it, and goes back again.
             tty.disable(Mode::AltScreen).unwrap();
             seen.extend(peer.take_output());
             assert_eq!(shown(&seen), ("5".to_owned(), false), "{order:?}");
@@ -880,11 +811,9 @@ mod tests {
             seen.extend(peer.take_output());
             assert_eq!(shown(&seen), ("5".to_owned(), true), "{order:?}");
 
-            // Put back: the main screen shown, with no flags.
             seen.extend(reset_bytes(peer.modes()));
             assert_eq!(shown(&seen), ("0".to_owned(), false), "{order:?}");
         }
-        // The kitty entry alone is popped from the main screen.
         let (mut tty, peer) = MemTty::pair(SIZE);
         tty.enable(Mode::KittyKeys(5)).unwrap();
         let mut seen = peer.take_output();

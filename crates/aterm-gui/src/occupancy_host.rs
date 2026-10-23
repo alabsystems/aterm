@@ -1,34 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE OCCUPANCY FACTS BOARD (`docs/DESIGN-harness-occupancy-2026-10-20.md`,):
-//! where the machine's occupancy stands —
-//! its cores and load, the memory it can hand out, its memory pressure, the
-//! home volume's level and the build slots — taken at each look of the
-//! harness's disk watch (once a [`crate::harness_host::DISK_TICK`]).
-//!
-//! The board keeps no reader of its own. The vitals probe thread's one slot
-//! reader fills each snapshot ([`crate::vitals_host`]'s `set_occupancy_facts`),
-//! and the board projects the newest whole snapshot the `sys` host holds
-//! ([`crate::sys_host::Shared::held_now`], never a pull) beside the disk
-//! board's home row: so the board and `await sys slots>=…` read one proof.
-//! That reader reads the slots once a minute at rest, and every few seconds
-//! while an `await sys` names them ([`SLOTS_ARMED`]; design §3.1, the
-//! cadence).
-//! The disk look tells the window it looked first, so the reading it takes
-//! then lands for the next look; a board whose snapshot is older than
-//! [`STALE_AFTER`] says so.
-//!
-//! Stores the board and logs each change of its slots and disk word.
-//! Judges at each look what needs `await sys`'s grammar or more than
-//! one look ([`Judged`]; the red-team's F15): the supervisor loop is not
-//! called while its agent's turn runs, so it cannot bridge looks it never
-//! saw. So the board holds `hold-room`'s slot term (`slots>=1 for=20m`,
-//! latched over its own looks by their snapshots' stamps), its machine
-//! terms, and, per supervised session, the last look at which a build slot's
-//! holder lay in that session's tab ([`slot_tabs`]). Each loop's host reads
-//! it as one [`OccupancyReading`] ([`reading_for`], `IdleHost::occupancy`).
-//! Nothing here decides or types anything.
+//! THE OCCUPANCY FACTS BOARD (`docs/DESIGN-harness-occupancy-2026-10-20.md`,).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -48,9 +21,7 @@ use aterm_vitals::sys::predicate::{AwaitSys, Latch, Parsed, evaluate};
 pub(crate) const STALE_AFTER: Duration =
     Duration::from_millis(aterm_agent::supervise::occupancy::reading::STALE_AFTER_MS as u64);
 
-/// How long the board remembers that a session's tab held a build slot: past
-/// any hold `hold-room` still asks about (four asks two hours apart, from two
-/// hours in), with room to spare.
+/// How long the board remembers that a session's tab held a build slot.
 pub(crate) const HELD_KEEP: Duration = Duration::from_secs(48 * 3600);
 
 /// `d` in whole milliseconds, saturating.
@@ -75,8 +46,7 @@ pub(crate) struct FactsBoard {
     pub(crate) avail_mib: Option<u64>,
     /// The kernel's memory pressure; `None` where unread.
     pub(crate) pressure: Option<Pressure>,
-    /// The home volume's level on the disk watch; `None` where the watch has
-    /// not judged it.
+    /// The home volume's level on the disk watch; `None` where the watch has not judged it.
     pub(crate) disk: Option<Level>,
     /// The build slots, as the slot reader last proved them.
     pub(crate) slots: Option<SlotsView>,
@@ -90,9 +60,7 @@ fn x100(load: f64) -> Option<u32> {
         .then(|| (load * 100.0).round().min(f64::from(u32::MAX)) as u32)
 }
 
-/// The board of `snap`, which landed at `snap_unix_ms` (`None`: no snapshot
-/// yet, `snap` then the empty one), with the home volume at `disk`, taken at
-/// `now_unix_ms`. Pure.
+/// The board of `snap`, which landed at `snap_unix_ms` (`None`.
 pub(crate) fn board_of(
     snap: &Snapshot,
     snap_unix_ms: Option<i64>,
@@ -118,7 +86,7 @@ pub(crate) fn board_of(
     }
 }
 
-/// The slot reader's reading as a snapshot carries it. Pure.
+/// The slot reader's reading as a snapshot carries it.
 pub(crate) fn slots_view(r: &SlotsRead) -> SlotsView {
     match r {
         SlotsRead::Unread(why) => SlotsView::Unread(match why {
@@ -138,18 +106,7 @@ pub(crate) fn slots_view(r: &SlotsRead) -> SlotsView {
     }
 }
 
-/// THE TABS THAT HOLD A BUILD SLOT (their keys, each once, in order): each
-/// holder the slot reader proved in `read` found by its pid in the sweep
-/// `procs`, attributed to a tab of `tabs` under `self_pid`
-/// ([`aterm_vitals::model::attribute`]: the nearest tab shell on its parent
-/// chain), with its identity joined by `current_start` (asked after the
-/// sweep, of a holder in a tab alone): its boot-clock start must match the
-/// sweep, and its wall-clock birth must match the slot reader's holder.
-/// [`aterm_uds::process::read_process_start`] reads both for one process.
-/// Either reading may precede the other, so neither a reused pid nor an
-/// unknown identity can attribute a holder through an old parent chain.
-/// `None` where the reader read no holders or there is no sweep (a hidden
-/// deck's reading). Pure but for `current_start`.
+/// THE TABS THAT HOLD A BUILD SLOT (their keys, each once, in order).
 pub(crate) fn slot_tabs(
     read: &SlotsRead,
     procs: Option<&[ProcSample]>,
@@ -232,9 +189,7 @@ pub(crate) struct Judged {
 }
 
 impl Judged {
-    /// THE LOOK that took `board` from `snap` (`None`: no snapshot held),
-    /// with the supervised `sessions` (each its tab's key and its session
-    /// id). A stale board judges nothing, and its slot term starts over.
+    /// THE LOOK that took `board` from `snap`, with the supervised `sessions`.
     pub(crate) fn step(
         &mut self,
         board: FactsBoard,
@@ -273,10 +228,7 @@ impl Judged {
         self.board = Some(board);
     }
 
-    /// The board as session `sid`'s host reads it at `now_unix_ms`: the empty
-    /// reading before the first look, and a stale one where the board itself
-    /// is older than [`STALE_AFTER`] (its looks stopped, so what it judged
-    /// then no longer speaks for now).
+    /// The board as session `sid`'s host reads it at `now_unix_ms`.
     pub(crate) fn reading(&self, sid: &str, now_unix_ms: i64) -> OccupancyReading {
         let Some(b) = &self.board else {
             return OccupancyReading::default();
@@ -358,8 +310,7 @@ impl Arming {
         }
     }
 
-    /// Count one wait as armed until the guard drops; the first armed and
-    /// the last gone are logged, since the slots' cadence changes then.
+    /// Count one wait as armed until the guard drops.
     pub(crate) fn arm(&self) -> Armed<'_> {
         if self.armed.fetch_add(1, Ordering::AcqRel) == 0 {
             aterm_log::info!("{}", aterm_sysprobe::slots::ARMED_LINE);
@@ -381,10 +332,7 @@ impl Drop for Armed<'_> {
     }
 }
 
-/// THE WAITS ON THE BUILD SLOTS: while one is armed (`await sys` naming
-/// `slots`, [`crate::sys_host`]), the vitals thread's reader reads them every
-/// `aterm_sysprobe::slots::PERIOD`; at rest, every
-/// `aterm_sysprobe::slots::IDLE_PERIOD`, which the board's look needs.
+/// THE WAITS ON THE BUILD SLOTS.
 pub(crate) static SLOTS_ARMED: Arming = Arming::new();
 
 /// The board and what it judged, as last taken ([`look`]); `None` before
@@ -398,11 +346,7 @@ fn home_level() -> Option<Level> {
     board.row_at(&home).map(|r| r.level)
 }
 
-/// TAKE THE BOARD at `now_unix_ms` (the disk look's): the newest whole
-/// snapshot as held, never pulled, and the home volume's level; judged for
-/// the supervised `sessions` (each its tab's key and its session id,
-/// [`Judged::step`]), stored, and logged when its slots or its disk word
-/// moved. Takes each lock alone.
+/// TAKE THE BOARD at `now_unix_ms` (the disk look's).
 pub(crate) fn look(now_unix_ms: i64, sessions: &[(u64, String)]) {
     let held = crate::sys_host::SYS.held_now();
     let disk = home_level();
@@ -428,9 +372,7 @@ pub(crate) fn look(now_unix_ms: i64, sessions: &[(u64, String)]) {
     }
 }
 
-/// THE BOARD AS SESSION `sid`'S HOST READS IT NOW (`IdleHost::occupancy`,
-/// [`Judged::reading`]): the empty reading before the first look; a wall
-/// clock that cannot be read reads the board as stale.
+/// THE BOARD AS SESSION `sid`'S HOST READS IT NOW (`IdleHost::occupancy`, [`Judged::reading`]).
 pub(crate) fn reading_for(sid: &str) -> OccupancyReading {
     let now_unix_ms = aterm_time::unix_millis()
         .and_then(|ms| i64::try_from(ms).ok())

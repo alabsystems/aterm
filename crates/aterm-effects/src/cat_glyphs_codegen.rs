@@ -1,36 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Glyph codegen (docs/cat-art-v4-design.md §1): turns the glyph asset TOMLs
-//! under `art/glyphs/` into the checked-in `cat_glyphs_gen` drawlist module.
-//!
-//! [`generate_from_assets`] is a pure function (asset texts → Rust source), run by
-//! the `gen_cat_glyphs` example and pinned byte-for-byte by the
-//! `cat_glyphs_gen_matches_assets` drift test. The generator is mounted only in
-//! those dev examples and unit tests; product libraries use the generated
-//! drawlists. It opens no file: the shipped engine names no `std::fs`
-//! (docs/ATERM_DESIGN.md §2.7; aterm-census guard `engine-platform`), so the reader
-//! lives in `examples/support/asset_dir.rs`.
-//!
-//! The pet, dog and animal generators share the parse/quantize/fail-closed
-//! path and emit separate modules that import the cat module's shape types, so one
-//! drawlist walker paints every roster. They never join `GLYPHS`: every
-//! `GlyphKind::Special` there is a collectible kitty-log row, and the spec model
-//! pins `RosterCap` to `GLYPH_IDS.len()`.
-//!
-//! Only roster kinds (`head`, `special`, `accessory`) not marked `excluded = true`
-//! are emitted. Coordinates are quantized from the `viewbox` frame to the integer
-//! `0..=FIXED_ONE` frame, so the drawlist is `Eq`-safe and byte-deterministic.
+//! Glyph codegen (docs/cat-art-v4-design.md §1).
 
 use aterm_scene::vector::{FIXED_ONE, PathCmd};
 
 /// The kinds that make it into the roster (in emit order: heads, then specials, then
-/// accessories). `prop` / `unknown` assets are held out (§0/§4/§8).
+/// accessories).
 const INCLUDED_KINDS: &[&str] = &["head", "special", "accessory"];
 
 /// Canonical `role` vocabulary → Rust variant, in fixed painter-role order
-/// (docs/cat-art-v4-design.md §0). The emitted `GlyphRole` enum is this list
-/// filtered to roles the roster uses; an unknown asset role is a hard error.
+/// (docs/cat-art-v4-design.md §0).
 const ROLE_VOCAB: &[(&str, &str)] = &[
     ("outline", "Outline"),
     ("coat", "Coat"),
@@ -58,8 +38,7 @@ const RECOLOR_VOCAB: &[(&str, &str)] = &[
     ("fixed", "Fixed"),
 ];
 
-/// Canonical `kind` vocabulary → variant. Only [`INCLUDED_KINDS`] are ever emitted, but
-/// the table also validates that an included asset's kind is a known one.
+/// Canonical `kind` vocabulary → variant.
 const KIND_VOCAB: &[(&str, &str)] = &[
     ("head", "Head"),
     ("special", "Special"),
@@ -93,8 +72,7 @@ struct Glyph {
     kind_rank: usize,
     kind: &'static str,
     variant: String,
-    /// Viewbox width/height, quantized to a fixed thousandth. Runtime layout
-    /// preserves the authored art's proportions without parsing asset TOML.
+    /// Viewbox width/height, quantized to a fixed thousandth.
     aspect_x1000: u16,
     eye_y: u16,
     center_x: u16,
@@ -102,21 +80,15 @@ struct Glyph {
     layers: Vec<Layer>,
 }
 
-/// Generate `cat_glyphs_gen.rs` from `(file name, TOML text)` pairs read from
-/// `art/glyphs/`. Deterministic: glyphs are ordered (heads, specials,
-/// accessories; each by `id`) and every coordinate is integer-quantized.
+/// Generate `cat_glyphs_gen.rs` from `(file name, TOML text)` pairs read from `art/glyphs/`.
 ///
 /// # Errors
-/// Any malformed TOML, unknown role/recolor/kind, missing viewbox/anchor, unknown
-/// roster-schema key, unparseable path `d`-string, or colliding variant name.
+/// Any malformed TOML, unknown role/recolor/kind, missing viewbox/anchor, unknown roster-schema key, unparseable path `d`-string, or colliding variant name.
 pub fn generate_from_assets(assets: &[(String, String)]) -> Result<String, String> {
     Ok(emit(&load_glyphs(assets)?))
 }
 
-/// Generate `pet_glyphs_gen.rs` from the pose texts `assets`: the same parse,
-/// quantization and key rejection as [`generate_from_assets`], emitted as the
-/// separate `PetGlyphId` / `PET_GLYPHS` roster reusing the cat module's types.
-/// The poses are one kind, so the order is by id.
+/// Generate `pet_glyphs_gen.rs` from the pose texts `assets`.
 ///
 /// # Errors
 /// As [`generate_from_assets`].
@@ -124,8 +96,7 @@ pub fn generate_pet_from_assets(assets: &[(String, String)]) -> Result<String, S
     Ok(emit_pet(&load_glyphs(assets)?))
 }
 
-/// Generate `dog_glyphs_gen.rs` from the breed texts `assets`: a separate roster
-/// reusing the cat module's shape types (the dog cameo is not a collectible).
+/// Generate `dog_glyphs_gen.rs` from the breed texts `assets`.
 ///
 /// # Errors
 /// As [`generate_from_assets`].
@@ -133,10 +104,7 @@ pub fn generate_dog_from_assets(assets: &[(String, String)]) -> Result<String, S
     Ok(emit_dog(&load_glyphs(assets)?))
 }
 
-/// Generate `animal_glyphs_gen.rs` from the species-head texts `assets`: the
-/// separate `AnimalGlyphId` / `ANIMAL_GLYPHS` roster for the ambient animal-word
-/// decoration. The asset `id` doubles as the lexicon's `species` key, so it also
-/// emits the key → id resolver.
+/// Generate `animal_glyphs_gen.rs` from the species-head texts `assets`.
 ///
 /// # Errors
 /// As [`generate_from_assets`].
@@ -145,7 +113,6 @@ pub fn generate_animal_from_assets(assets: &[(String, String)]) -> Result<String
 }
 
 /// Parse, order and collision-check every roster asset text, for all rosters.
-/// Texts are visited in file-name order, so the first error named is stable.
 fn load_glyphs(assets: &[(String, String)]) -> Result<Vec<Glyph>, String> {
     let mut files: Vec<&(String, String)> = assets.iter().collect();
     files.sort_by(|a, b| a.0.cmp(&b.0));
@@ -158,11 +125,8 @@ fn load_glyphs(assets: &[(String, String)]) -> Result<Vec<Glyph>, String> {
         }
     }
 
-    // Emit order: kind rank (head < special < accessory), then id.
     glyphs.sort_by(|a, b| a.kind_rank.cmp(&b.kind_rank).then_with(|| a.id.cmp(&b.id)));
 
-    // Variant-name collision guard: the ids are unique, but the derived
-    // variants must be too.
     let mut seen = std::collections::BTreeSet::new();
     for g in &glyphs {
         if !seen.insert(g.variant.clone()) {
@@ -334,8 +298,7 @@ fn quantize_path(cmds: &[PathCmd], vw: f32, vh: f32) -> Vec<String> {
         .collect()
 }
 
-/// `round(v / extent * FIXED_ONE)`, clamped to `0..=FIXED_ONE`. The integer rule is the
-/// same on every host (no platform float variance in the const data).
+/// `round(v / extent * FIXED_ONE)`, clamped to `0..=FIXED_ONE`.
 fn quant(v: f32, extent: f32) -> u16 {
     let q = (v / extent * f32::from(FIXED_ONE)).round();
     q.clamp(0.0, f32::from(FIXED_ONE)) as u16
@@ -349,7 +312,7 @@ fn quant_frac(f: f32) -> u16 {
 }
 
 /// Snake-case asset id → UpperCamel Rust variant (`s1_00` → `S100`, `spec_maneki` →
-/// `SpecManeki`, `acc_bow` → `AccBow`). Injective over the asset ids (guarded).
+/// `SpecManeki`, `acc_bow` → `AccBow`).
 fn variant_name(id: &str) -> String {
     let mut out = String::with_capacity(id.len());
     let mut cap = true;
@@ -393,7 +356,6 @@ fn emit(glyphs: &[Glyph]) -> String {
     let mut s = String::new();
     s.push_str(HEADER);
 
-    // Enum variant sets that the roster actually uses (canonical order, filtered).
     let used_roles = present(
         ROLE_VOCAB,
         glyphs.iter().flat_map(|g| g.layers.iter().map(|l| l.role)),
@@ -439,9 +401,6 @@ fn emit(glyphs: &[Glyph]) -> String {
     }
     s.push_str("}\n\n");
 
-    // Stable roster: persistence stores the `GlyphDef::id` string and resolves
-    // it through this table, never a Rust discriminant that could shift. Every
-    // other roster's `*_GLYPH_IDS` follows the same rule.
     s.push_str("/// Every glyph id in [`GLYPHS`] order. Pair with `GLYPHS[i].id` for stable string lookup.\n");
     s.push_str("pub const GLYPH_IDS: &[CatGlyphId] = &[\n");
     for g in glyphs {

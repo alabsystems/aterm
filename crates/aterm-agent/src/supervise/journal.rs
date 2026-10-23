@@ -432,6 +432,9 @@ impl Journal {
     }
 
     /// A write that failed: said once ([`Self::warn`]), and when the file
+    /// system is out of space or quota, the window's disk watch is asked to
+    /// look now ([`crate::harness::disk::poke`]) — aterm's own failing write
+    /// is a sighting of the full disk like an agent's screen.
     fn failed(&mut self, e: &std::io::Error, what: &str, warn: &mut dyn Write) {
         if crate::harness::disk::poke::is_out_of_space(e) {
             let path = self
@@ -480,6 +483,7 @@ mod tests {
     use super::*;
 
     /// Every kind of line the loops print, read into its kind, phase, `seq=`
+    /// and free-text tail: one row per arm of the reader.
     #[test]
     fn each_printed_line_is_read_into_its_fields() {
         let rec = |line: &str| JournalRecord::of_line(7, Some("@s-1"), line, None);
@@ -705,6 +709,7 @@ mod tests {
     }
 
     /// The JSON round-trips, escapes what it must, and prints `null` for what
+    /// the line did not say.
     #[test]
     fn a_record_round_trips_through_its_json() {
         let r = JournalRecord::of_line(
@@ -768,6 +773,10 @@ mod tests {
     }
 
     /// AN OUT-OF-SPACE WRITE ASKS THE DISK WATCH TO LOOK: a journal write
+    /// that fails with `ENOSPC` or `EDQUOT` pokes the watch
+    /// ([`crate::harness::disk::poke`]) naming the journal, as the watch's
+    /// handler hears it; NEGATIVE CONTROL: any other failure (a permission
+    /// denied) pokes nothing.
     #[test]
     fn a_journal_write_out_of_space_pokes_the_disk_watch() {
         use crate::harness::disk::poke::{Cause, set_handler};

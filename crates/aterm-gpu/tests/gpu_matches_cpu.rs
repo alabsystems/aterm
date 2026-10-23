@@ -16,7 +16,7 @@ use aterm_render::{Frame, Renderer, Theme};
 
 use crate::common::{backends, bb, gg, max_channel_delta_frame as max_channel_delta, rr};
 
-const BG: u32 = 0x0011_1318; // Theme::default().bg
+const BG: u32 = 0x0011_1318;
 
 fn dist(a: u32, c: u32) -> i32 {
     (rr(a) - rr(c)).abs() + (gg(a) - gg(c)).abs() + (bb(a) - bb(c)).abs()
@@ -80,9 +80,6 @@ fn gpu_matches_cpu_with_pane_local_mixed_dec_widths() {
 
     let (rows, cols) = (2usize, 17usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
-    // Row 0: red cell in the left pane, a magenta poison cell in its
-    // clipped-away half, green in the right pane. Row 1 reverses the widths.
-    // Cursor hidden.
     term.process(
         b"\x1b[?25l\
 \x1b[1;1H\x1b[48;2;190;20;20m \x1b[0m\
@@ -154,9 +151,7 @@ fn gpu_matches_cpu_with_pane_local_mixed_dec_widths() {
 
 /// Glyph enlargement per pane: a real glyph in each pane of a composed row,
 /// with a span only for the DEC pane and `line_sizes[row]` set to that pane's
-/// size (as the compositor writes it). The unclaimed pane's glyph must stay 1×
-/// on both backends. Row 0 tests width (DECDWL), row 1 height and anchor
-/// (DECDHL bottom).
+/// size (as the compositor writes it).
 #[test]
 fn gpu_matches_cpu_for_glyph_enlargement_inside_its_own_dec_run() {
     let theme = Theme::default();
@@ -165,14 +160,9 @@ fn gpu_matches_cpu_for_glyph_enlargement_inside_its_own_dec_run() {
 
     let (rows, cols) = (2usize, 17usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
-    // One bright-red 'M' at the head of each pane on each row (cursor hidden).
-    // A 2× 'M' occupies the next physical cell, a 1× does not. Assertions
-    // count red ink, since written blank cells carry the terminal default bg.
     term.process(b"\x1b[?25l\x1b[38;2;255;0;0m\x1b[1;1HM\x1b[1;10HM\x1b[2;1HM\x1b[2;10HM\x1b[0m");
     let mut input = term.cell_frame(rows, cols);
     input.line_size_spans.resize_with(rows, Vec::new);
-    // Row 0: left pane DECDWL, right pane unclaimed. Row 1: right pane
-    // DECDHL-bottom, left unclaimed. `line_sizes[r]` is the row summary.
     input.line_size_spans[0] = vec![LineSizeSpan::new(0, 8, LineSize::DoubleWidth)];
     input.line_size_spans[1] = vec![LineSizeSpan::new(9, 17, LineSize::DoubleHeightBottom)];
     input.line_sizes[0] = LineSize::DoubleWidth;
@@ -200,8 +190,6 @@ fn gpu_matches_cpu_for_glyph_enlargement_inside_its_own_dec_run() {
             .count()
     };
     for (label, frame) in [("CPU", &cpu_frame), ("GPU", &gpu_frame)] {
-        // Negative control: the second physical cell of each spanned pane
-        // carries the 2× glyph's right half.
         assert!(
             ink(frame, 0, 1) > 4,
             "{label}: DECDWL pane's glyph did not spill into its own second cell"
@@ -210,8 +198,6 @@ fn gpu_matches_cpu_for_glyph_enlargement_inside_its_own_dec_run() {
             ink(frame, 1, 10) > 4,
             "{label}: DECDHL pane's glyph did not spill into its own second cell"
         );
-        // The unclaimed pane keeps a 1× glyph, so the cell after its 'M' has
-        // no ink.
         assert_eq!(
             ink(frame, 0, 10),
             0,
@@ -235,8 +221,6 @@ fn gpu_matches_cpu_for_partial_double_width_pane_undercurl() {
 
     let (rows, cols) = (1usize, 15usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
-    // Logical col 3 starts at physical col 6; the pane ends at physical col 7,
-    // leaving one base cell of the 2× undercurl visible.
     term.process(b"\x1b[?25l\x1b[1;4H\x1b[4:3;58;2;255;255;255m \x1b[0m");
     let mut input = term.cell_frame(rows, cols);
     input.line_sizes.fill(LineSize::SingleWidth);
@@ -329,14 +313,12 @@ fn gpu_matches_cpu_and_clips_italic_ink_at_pane_edge() {
 }
 
 /// Mixed DPI: two sizes through one renderer pair via `activate_px`, which
-/// switches size without dropping the atlas. CPU/GPU parity holds at each size,
-/// interleaved A, B, A, B, so the switch is order-independent and never mixes
-/// one size's metrics into the other's frame.
+/// switches size without dropping the atlas.
 #[test]
 fn gpu_matches_cpu_mixed_dpi_activate_px() {
     let theme = Theme::default();
-    let px_a = 18.0; // a 1× (laptop) window
-    let px_b = 36.0; // a 2× (external Retina) window
+    let px_a = 18.0;
+    let px_b = 36.0;
 
     let (mut cpu, mut gpu) = backends(px_a, theme);
 
@@ -344,8 +326,6 @@ fn gpu_matches_cpu_mixed_dpi_activate_px() {
     let (mut term, rows, cols) = demo_term();
     let input = term.cell_frame(rows, cols);
 
-    // The size-A and size-B cell metrics resolved purely (no mutation), and they
-    // must genuinely differ (the mixed-DPI case is non-vacuous).
     let (cwa, cha, _) = cpu.cell_geometry(px_a);
     let (cwb, chb, _) = cpu.cell_geometry(px_b);
     assert!(
@@ -399,16 +379,7 @@ fn gpu_matches_cpu_mixed_dpi_activate_px() {
 
 /// Escape-sequence fixtures render the same on both backends, at an odd
 /// interior pad that flips the ░▒▓ dither's absolute-pixel phase in every
-/// cell. Hard-coverage procedural cells (box drawing, blocks, shades, braille,
-/// sextants, eighths, octants) match EXACTLY. Within the glyph tolerance:
-/// anti-aliased procedural cells (arcs, diagonals, Powerline, wedges);
-/// synthetic bold/italic, whose wide bold-italic W overflows into the block
-/// cursor both backends paint last; emoji clusters (ZWJ family, skin tone,
-/// keycap, flag, and an unligated ZWJ pair composited from two glyphs); a VS15
-/// one-cell emoji beside an X; condensed symbol-tier arrows, on a primary
-/// that maps none of them; every underline style with descender skip on and
-/// off; combining marks stacked at a tight and a roomy line height; and a mark
-/// on a space base, which the CPU drops, so the GPU mark loop must too.
+/// cell.
 #[test]
 fn escape_fixtures_match_cpu() {
     const PAD: usize = 3;
@@ -416,7 +387,6 @@ fn escape_fixtures_match_cpu() {
     let underlines = "\x1b[?25l\x1b[4:3mgyqj\x1b[0m\r\n\x1b[4:3;58;2;255;80;80mwavy\x1b[0m\r\n\
                       \x1b[4:4mdotdotdo\x1b[0m\r\n\x1b[4:5mdashdash\x1b[0m";
     let stacked = "\x1b[?25l\x1b[2;1He\u{0301}\u{0301} e\u{0302}\u{0301} e\u{0323}\u{0323} e\u{0301} e\u{0323}";
-    // (name, (rows, cols), max per-channel delta, line height, skip descenders, bytes)
     let fixtures = [
         (
             "orthogonal procedural cells",
@@ -507,18 +477,6 @@ fn escape_fixtures_match_cpu() {
             "\x1b[?25le\u{0301} \u{0301}b",
         ),
     ];
-    // The condensed arrows' primary is the checked-in Cascadia Mono PL, which
-    // maps none of them, so every one reaches the symbol tier.
-    //
-    // A PRIMARY face's arrows are not condensed, on purpose. The JetBrains Mono
-    // fixture maps U+27F5..27F7 itself and draws them past its 600-unit advance
-    // by design — U+27F5/27F6 span -40..640 and U+27F7 -80..680, as its U+2500
-    // spans -20..620 — so a run of them, or one beside a box-drawing rule, joins
-    // into one line; at the fixture's px that is U+27F5's 2 px past the cell on
-    // the CPU path, and the GPU draws the same raster. Condensing would break
-    // the joins the face was drawn for. A FALLBACK face is condensed because it
-    // was never drawn for this grid's cell, and its spill is arbitrary rather
-    // than designed.
     let symbol_primary = std::path::Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../aterm-render/assets/bundled/CascadiaMonoPL-Regular.ttf"
@@ -566,8 +524,7 @@ fn escape_fixtures_match_cpu() {
 }
 
 /// Parity in the `linear` text-blending mode as well as the default: the demo
-/// grid within tolerance and procedural cells exactly. Also checks the two
-/// modes differ on antialiased text, so the mode flag is live.
+/// grid within tolerance and procedural cells exactly.
 #[test]
 fn linear_mode_matches_cpu_and_keeps_procedural_exact() {
     let theme = Theme::default();
@@ -579,8 +536,6 @@ fn linear_mode_matches_cpu_and_keeps_procedural_exact() {
     let (mut term, rows, cols) = demo_term();
     let input = term.cell_frame(rows, cols);
 
-    // Default (corrected) CPU frame for the control below, settled because the
-    // fallback chain can land on any render (see `settled_cpu`).
     let corrected_frame = common::settled_cpu(&mut cpu, &input);
 
     cpu.set_text_blending(aterm_render::TextBlending::Linear);
@@ -595,15 +550,11 @@ fn linear_mode_matches_cpu_and_keeps_procedural_exact() {
         "linear-mode GPU/CPU pixels diverge: max per-channel delta {delta} > 8"
     );
 
-    // Non-vacuity: the modes must actually differ on antialiased glyph texels
-    // (identical output would mean the mode flag reaches neither backend).
     assert!(
         max_channel_delta(&cpu_frame, &corrected_frame) > 8,
         "linear vs linear-corrected must differ on AA texels"
     );
 
-    // Procedural cells are hard coverage, so the mode is invisible there and
-    // parity is exact.
     let (prows, pcols) = (2usize, 8usize);
     let mut pterm = Terminal::new(prows as u16, pcols as u16);
     pterm.process(
@@ -621,9 +572,7 @@ fn linear_mode_matches_cpu_and_keeps_procedural_exact() {
 
 /// A subscript cell (`Script::Sub`, chrome-only) draws its glyph smaller and
 /// lower, with no ink above `SUB_CEILING` (a parenthesis taller than the letters
-/// included), while the rule glyph beside it stays full size. A nudged one moves
-/// sideways by exactly its nudge, to a fraction of a pixel (its coverage-weighted
-/// ink centre). The GPU takes the CPU's raster and placement, and matches it.
+/// included), while the rule glyph beside it stays full size.
 #[test]
 fn sub_script_gpu_matches_cpu() {
     use aterm_core::terminal::Script;
@@ -636,7 +585,6 @@ fn sub_script_gpu_matches_cpu() {
     for cell in &mut input.cells[0] {
         cell.script = Script::Sub { nudge: 0 };
     }
-    // Row 2: the same sub H one cell right, nudged half a cell back left.
     let half = Script::NUDGES_PER_CELL / 2;
     input.cells[2][1].script = Script::Sub { nudge: -half };
     let mut win = aterm_gpu::WindowGpu::new();
@@ -650,8 +598,6 @@ fn sub_script_gpu_matches_cpu() {
     let (cw, ch) = cpu.cell_size();
     let ink_rows = |f: &Frame, row: usize, col: usize| {
         let px = cell_pixels(f, cw, ch, row, col);
-        // The cell's ground is its corner pixel (the frame's palette, not
-        // the theme's).
         let ground = px[0];
         let inked = |p: &u32| dist(*p, ground) > 24;
         let rows: Vec<usize> = (0..ch)
@@ -663,8 +609,6 @@ fn sub_script_gpu_matches_cpu() {
             px.iter().filter(|p| inked(p)).count(),
         )
     };
-    // The coverage-weighted centre column of `row`'s ink within its first
-    // `span` cells: where a glyph stands, to a fraction of a pixel.
     let ink_centre = |f: &Frame, row: usize, span: usize| {
         let ground = f.pixels[row * ch * f.width];
         let (mut sum, mut weight) = (0.0f64, 0.0f64);
@@ -710,19 +654,14 @@ fn sub_script_gpu_matches_cpu() {
 /// Last-resort fontless symbols (`font_chain::Tier::Synthetic`) draw the same
 /// pixels on both backends: the narrow `⏵⏵` family, ⭘ and the procedural `⎿`,
 /// and the wide emoji-presentation symbols (⏩ ⏪ ⏫ ⚪ ⚫) rasterized as one
-/// `2 * cell_w` bitmap across both cells. Built from bundled DejaVu Sans Mono
-/// with runtime discovery off, so the synthesis is the only answer; each glyph
-/// is asserted `FaceId::Procedural`.
+/// `2 * cell_w` bitmap across both cells.
 #[test]
 fn synthetic_symbol_cells_match_cpu_within_tolerance() {
     let theme = Theme::default();
     let px = 18.0;
     let ctx = aterm_gpu::GpuContext::new()
         .unwrap_or_else(|e| aterm_spec::host::could_not_run(format!("no GPU available: {e}")));
-    // aterm-gpu builds aterm-render without `embedded-font`, so read the
-    // bundled asset directly (the same bytes `embedded_font()` would return).
     let face: &[u8] = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
-    // Runtime discovery off on both, so no system face answers first.
     let fontless = || {
         let mut r = Renderer::from_bytes(face, px, theme).expect("bundled face parses");
         r.set_runtime_font_discovery(false);
@@ -750,7 +689,6 @@ fn synthetic_symbol_cells_match_cpu_within_tolerance() {
             key.cell_span
         );
     }
-    // Cursor hidden; each glyph, then one blank separator column.
     let line = |glyphs: &[char]| glyphs.iter().map(|g| format!("{g} ")).collect::<String>();
     let mut win = aterm_gpu::WindowGpu::new();
     let (cpu_frame, gpu_frame) = render_both(
@@ -773,10 +711,7 @@ fn synthetic_symbol_cells_match_cpu_within_tolerance() {
 }
 
 /// Combining diacritics (é = e + U+0301, …) are overlaid as extra mono-glyph
-/// instances on the base cell, pulled by the GPU from the same atlas. Sparse
-/// marks keep their column order across wide gaps and changing frames.
-/// A host-built duplicate must use the accessor's chosen entry only once;
-/// entries beyond the viewport or the materialized row have no base to paint.
+/// instances on the base cell, pulled by the GPU from the same atlas.
 #[test]
 fn sparse_combining_columns_and_duplicates_match_cpu() {
     let (mut cpu, mut gpu) = backends(18.0, Theme::default());
@@ -815,7 +750,7 @@ fn sparse_combining_columns_and_duplicates_match_cpu() {
 }
 
 /// Small footer marks use the base's script raster and horizontal nudge in
-/// both passes: atlas collection and emission. Ordinary marks stay unchanged.
+/// both passes: atlas collection and emission.
 #[test]
 fn small_script_combining_marks_and_nudges_match_cpu() {
     use aterm_core::terminal::Script;
@@ -867,13 +802,9 @@ fn reused_renderer_across_dims_matches_fresh_render() {
     let theme = Theme::default();
     let px = 16.0;
     let mut reused = common::gpu(px, theme);
-    // Deterministic pixels: block on the lazy fallback parses so the reused
-    // renderer and every fresh oracle rasterize the CJK/emoji identically.
     reused.debug_block_on_lazy_fallbacks();
     let mut win_reused = aterm_gpu::WindowGpu::new();
 
-    // Glyph-rich content (mono, CJK, emoji, combining, decorations), so every
-    // pass runs.
     let content: &[u8] = "\u{1b}[31mRR\u{1b}[0m \u{1b}[44mbg\u{1b}[0m \u{65e5}\u{672c} \
 \u{2764}\u{fe0f} e\u{0301} \u{1b}[4;9mUu\u{1b}[0m"
         .as_bytes();
@@ -884,8 +815,6 @@ fn reused_renderer_across_dims_matches_fresh_render() {
         let mut term = Terminal::new(rows as u16, cols as u16);
         term.process(content);
 
-        // A fresh renderer is the oracle: it has no resident resources, so its
-        // frame is the canonical full render for these exact dimensions.
         let mut fresh = common::gpu(px, theme);
         fresh.debug_block_on_lazy_fallbacks();
         let mut win_fresh = aterm_gpu::WindowGpu::new();
@@ -923,13 +852,10 @@ fn cursor_trail_gpu_matches_cpu() {
         input.cells[5].get(6).is_none(),
         "regression requires a trail cell in an unmaterialized sparse tail"
     );
-    // Differ from both `theme.bg` and the frame scalar: trail cells must blend
-    // over their pane's live background, checked against an exact oracle.
     input.default_bg = 0x0012_3456;
     let pane_default_bg = 0x0024_4668;
     input.default_bg_spans.resize_with(rows, Vec::new);
     input.default_bg_spans[5].push(aterm_render::DefaultBgSpan::new(0, cols, pane_default_bg));
-    // A comet across the empty bottom row (row 5): faint tail → bright head.
     input.cursor_trail = vec![
         aterm_render::TrailCell {
             row: 5,
@@ -947,7 +873,7 @@ fn cursor_trail_gpu_matches_cpu() {
             alpha: 200,
         },
     ];
-    input.cursor_trail_color = 0x0050_FA7B; // Dracula green
+    input.cursor_trail_color = 0x0050_FA7B;
     let expected_head = aterm_render::blend_rgb(pane_default_bg, input.cursor_trail_color, 200);
     let cpu_frame = cpu.render_input(&input);
     let gpu_frame = gpu.render_input(&mut win, &input, None);
@@ -964,8 +890,6 @@ fn cursor_trail_gpu_matches_cpu() {
         "trail GPU/CPU pixels diverge: max per-channel delta {delta} > 8"
     );
 
-    // The comet is drawn, head exactly the trail colour over the pane default,
-    // and head-brighter-than-tail, on BOTH.
     for (label, f) in [("cpu", &cpu_frame), ("gpu", &gpu_frame)] {
         let head = cell_pixels(f, cw, ch, 5, 6);
         assert!(
@@ -988,7 +912,6 @@ fn cursor_trail_gpu_matches_cpu() {
         );
     }
 
-    // The trail is opaque, so swept cells are byte-exact.
     for (r, c) in [(5, 4), (5, 5), (5, 6)] {
         assert_eq!(
             cell_pixels(&cpu_frame, cw, ch, r, c),
@@ -1011,7 +934,6 @@ fn word_decorations_gpu_match_cpu() {
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (3usize, 16usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
-    // Row 0 DEC double-width, row 1 selected over cols 0..=3, cursor hidden.
     term.process(b"\x1b[?25lcat\r\nfuck here\r\nmore\x1b[1;1H\x1b#6");
     {
         let sel = term.text_selection_mut();
@@ -1072,8 +994,6 @@ fn minimum_contrast_floored_cells_gpu_match_cpu() {
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (2usize, 8usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
-    // Cursor hidden. Row 0: bright white on near-white (~1.2:1). Row 1: SGR 8
-    // concealed text on the same bg.
     term.process(
         b"\x1b[?25l\x1b[48;2;230;230;230m\x1b[38;2;255;255;255mXY\x1b[0m\r\n\
 \x1b[48;2;230;230;230m\x1b[8mhid\x1b[0m",
@@ -1125,9 +1045,7 @@ fn minimum_contrast_floored_cells_gpu_match_cpu() {
 }
 
 /// Background and cursor opacity parity at 0.5, including alpha (the CPU's
-/// top-byte transmittance). Opacity 1.0 is identical to the defaults,
-/// default-bg pixels carry alpha 128, SGR-coloured cells stay opaque, and the
-/// translucent cursor blends instead of cutting out.
+/// top-byte transmittance).
 #[test]
 fn background_and_cursor_opacity_gpu_match_cpu() {
     let theme = Theme::default();
@@ -1135,19 +1053,13 @@ fn background_and_cursor_opacity_gpu_match_cpu() {
     let (mut cpu, mut gpu) = backends(px, theme);
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (2usize, 8usize);
-    // Frame A: block cursor on a blank default cell, for the baseline and the
-    // opacity-1.0 identity check (avoids opaque-cursor overflow on a glyph).
     let input_at = |cursor_seq: &[u8]| {
         let mut term = Terminal::new(rows as u16, cols as u16);
-        // Seed the engine default bg to the theme bg, so written default cells
-        // count as default background.
         term.set_default_background(aterm_core::terminal::Rgb {
             r: 0x11,
             g: 0x13,
             b: 0x18,
         });
-        // Col 0: SGR truecolor bg (must stay opaque). Cols 1-2: text on the
-        // default bg.
         term.process(b"\x1b[48;2;0;0;128m \x1b[0mAB");
         term.process(cursor_seq);
         let blank = term.implicit_blank_render_cell();
@@ -1158,18 +1070,13 @@ fn background_and_cursor_opacity_gpu_match_cpu() {
         input
     };
     let mut input_blank = input_at(b"\x1b[1;6H");
-    // Frame B: the same grid with the cursor on the 'A' glyph — the
-    // translucent-cursor-over-text case (glyph shows through on both paths).
     let mut input_glyph = input_at(b"\x1b[1;2H");
-    // The pane's OSC-11 provenance differs from the frame scalar; the opacity
-    // classifier must consult the pane span.
     for input in [&mut input_blank, &mut input_glyph] {
         input.default_bg = 0x0022_3344;
         input.default_bg_spans = vec![vec![aterm_render::DefaultBgSpan::new(0, cols, BG)]; rows];
     }
     let (cw, ch) = cpu.cell_size();
 
-    // Baseline (defaults): parity holds and the 1.0 setters are byte-identical.
     let cpu_off = cpu.render_input(&input_blank);
     let gpu_off = gpu.render_input(&mut win, &input_blank, None);
     assert!(
@@ -1191,8 +1098,6 @@ fn background_and_cursor_opacity_gpu_match_cpu() {
         "GPU: opacity 1.0 must be byte-identical to the default"
     );
 
-    // Both opacities active, cursor over a glyph: per-channel parity including
-    // the alpha channel (top byte = transmittance on both paths).
     cpu.set_background_opacity(0.5);
     cpu.set_cursor_opacity(0.5);
     gpu.set_background_opacity(0.5);
@@ -1209,9 +1114,6 @@ fn background_and_cursor_opacity_gpu_match_cpu() {
         "opacity CPU/GPU pixels diverge: max per-channel delta {delta} > 8"
     );
 
-    // On both frames: a blank default cell has alpha 128 with unchanged RGB,
-    // the SGR-bg cell is opaque, and the translucent cursor never shows the raw
-    // fill.
     for (name, frame) in [("CPU", &cpu_on), ("GPU", &gpu_on)] {
         assert!(
             cell_pixels(frame, cw, ch, 1, 6)
@@ -1219,8 +1121,6 @@ fn background_and_cursor_opacity_gpu_match_cpu() {
                 .all(|&p| ((p >> 24) as i32 - 127).abs() <= 1 && dist(p & 0x00ff_ffff, BG) <= 3),
             "{name}: blank default-bg cell must carry ~alpha 128 with the bg RGB"
         );
-        // Every pixel opaque (the neighbour glyph's AA overflow may tint a few
-        // edge pixels' RGB, but never their alpha); the body is the SGR navy.
         let sgr = cell_pixels(frame, cw, ch, 0, 0);
         assert!(
             sgr.iter().all(|&p| p >> 24 == 0),
@@ -1242,8 +1142,6 @@ fn background_and_cursor_opacity_gpu_match_cpu() {
         );
     }
 
-    // Additive glow over a translucent ground preserves the ground's
-    // transmittance on both backends.
     let mut input_glow = input_at(b"\x1b[1;6H");
     input_glow.default_bg = 0x0022_3344;
     input_glow.default_bg_spans = vec![vec![aterm_render::DefaultBgSpan::new(0, cols, BG)]; rows];
@@ -1292,8 +1190,7 @@ fn background_and_cursor_opacity_gpu_match_cpu() {
 
 /// Animated ink parity: (1) on the GPU, ink equals the same SGR truecolour
 /// recolour (glyph, combining, wide lead, underline, strike, curl); (2) inked
-/// frames match the CPU within tolerance; (3) cleared ink changes nothing. An
-/// SGR 58 underline colour still wins over ink.
+/// frames match the CPU within tolerance; (3) cleared ink changes nothing.
 #[test]
 fn ink_gpu_matches_cpu() {
     use aterm_core::render::InkCell;
@@ -1304,9 +1201,6 @@ fn ink_gpu_matches_cpu() {
     let (rows, cols) = (3usize, 16usize);
     let ink: [u8; 3] = [0x7C, 0xC8, 0xFF];
 
-    // Row 0: combining é, underlined x, struck s, curly-underlined w; row 1:
-    // wide 猫; row 2: an SGR 58 underlined space (ink must not reach it). The
-    // curly cell exercises the separate undercurl pass.
     let mut term_a = Terminal::new(rows as u16, cols as u16);
     term_a.process(
         "\x1b[?25le\u{0301} \x1b[4mx\x1b[24m \x1b[9ms\x1b[29m \x1b[4:3mw\x1b[24m\r\n猫\r\n\
@@ -1334,21 +1228,19 @@ fn ink_gpu_matches_cpu() {
             row: 0,
             col: 6,
             color: ink,
-        }, // curly-underlined w: the curl follows the ink too
+        },
         InkCell {
             row: 1,
             col: 0,
             color: ink,
-        }, // 猫's lead cell
+        },
         InkCell {
             row: 2,
             col: 0,
             color: ink,
-        }, // SGR 58 wins here
+        },
     ];
 
-    // The same text recoloured via SGR truecolor fg (rows 0-1); row 2's SGR 58
-    // underline keeps its explicit colour, so it is not recoloured.
     let mut term_b = Terminal::new(rows as u16, cols as u16);
     term_b.process(
         "\x1b[?25l\x1b[38;2;124;200;255me\u{0301}\x1b[39m \x1b[38;2;124;200;255m\x1b[4mx\x1b[24m\
@@ -1359,8 +1251,6 @@ fn ink_gpu_matches_cpu() {
     );
     let recolored = term_b.cell_frame(rows, cols);
 
-    // (1) Exact substitution on the GPU: ink == SGR recolor, byte-for-byte
-    // (the CPU twin is aterm-render's `ink.rs`).
     let cpu_ink = cpu.render_input(&inked);
     let gpu_ink = gpu.render_input(&mut win, &inked, None);
     let gpu_sgr = gpu.render_input(&mut win, &recolored, None);
@@ -1370,12 +1260,10 @@ fn ink_gpu_matches_cpu() {
          on an ink-only diff)"
     );
 
-    // (2) Whole-frame parity within the suite's existing glyph-AA budget.
     let delta = max_channel_delta(&cpu_ink, &gpu_ink);
     eprintln!("ink GPU vs CPU max per-channel delta = {delta}");
     assert!(delta <= 8, "inked frame CPU/GPU diverge: delta {delta} > 8");
 
-    // (3) Cleared ink renders the plain frame on the GPU.
     let plain = term_a.cell_frame(rows, cols);
     let gpu_plain = gpu.render_input(&mut win, &plain, None);
     let mut cleared = term_a.cell_frame(rows, cols);
@@ -1386,7 +1274,6 @@ fn ink_gpu_matches_cpu() {
         gpu_plain.pixels,
         "GPU: cleared ink must render the bare frame"
     );
-    // Non-vacuous: the ink really recoloured pixels vs the plain frame.
     assert_ne!(gpu_ink.pixels, gpu_plain.pixels);
 }
 
@@ -1403,7 +1290,6 @@ fn ink_selection_and_decdwl_gpu_match_cpu() {
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (2usize, 16usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
-    // Row 0 = DEC double-width "cat"; row 1 = "fuck here", cols 0..=3 selected.
     term.process(b"\x1b[?25lcat\r\nfuck here");
     term.process(b"\x1b[1;1H\x1b#6");
     {
@@ -1413,30 +1299,28 @@ fn ink_selection_and_decdwl_gpu_match_cpu() {
         sel.complete_selection();
     }
     let mut input = term.cell_frame(rows, cols);
-    // Ink chosen near the selection band colour so the selection floor must
-    // move it — pinning the ink→selection-floor order on both backends.
     let ink: [u8; 3] = [0x33, 0x41, 0x5E];
     input.ink = vec![
         InkCell {
             row: 0,
             col: 0,
             color: [0xF7, 0xA8, 0xB8],
-        }, // DECDWL row
+        },
         InkCell {
             row: 1,
             col: 0,
             color: ink,
-        }, // selected
+        },
         InkCell {
             row: 1,
             col: 1,
             color: ink,
-        }, // selected
+        },
         InkCell {
             row: 1,
             col: 5,
             color: [0xF7, 0xA8, 0xB8],
-        }, // unselected
+        },
     ];
 
     let cpu_frame = cpu.render_input(&input);
@@ -1452,7 +1336,6 @@ fn ink_selection_and_decdwl_gpu_match_cpu() {
         "ink selection/DECDWL CPU/GPU diverge: delta {delta} > 8"
     );
 
-    // Non-vacuous: ink changed the frame vs no ink.
     let plain = term.cell_frame(rows, cols);
     assert_ne!(
         gpu_frame.pixels,
@@ -1461,8 +1344,7 @@ fn ink_selection_and_decdwl_gpu_match_cpu() {
 }
 
 /// Two panes selected on the same rows, each with its own OSC 17/19 colours and
-/// focus. Both backends resolve bands through `RenderInput::selection_hit` and
-/// `Renderer::selection_palette`, and must match.
+/// focus.
 #[test]
 fn per_pane_selection_colours_gpu_match_cpu() {
     use aterm_core::render::{PaneSelection, SelectionClip};
@@ -1475,7 +1357,6 @@ fn per_pane_selection_colours_gpu_match_cpu() {
 
     let (rows, cols) = (2usize, 17usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
-    // Two panes of 8 columns with a 1-cell divider at column 8.
     term.process(b"\x1b[?25lleft one|right on\r\nleft two|right tw");
     let mut input = term.cell_frame(rows, cols);
 
@@ -1493,7 +1374,6 @@ fn per_pane_selection_colours_gpu_match_cpu() {
         }
     };
     input.selections = vec![
-        // Focused pane: a live OSC 17 band with an explicit OSC 19 ink.
         pane(
             0,
             7,
@@ -1502,8 +1382,6 @@ fn per_pane_selection_colours_gpu_match_cpu() {
             0x00fe_dcba,
             false,
         ),
-        // Unfocused pane: no live colour at all, so it takes the theme policy —
-        // and, being unfocused, its inactive derivation.
         pane(
             9,
             16,
@@ -1527,8 +1405,6 @@ fn per_pane_selection_colours_gpu_match_cpu() {
         "per-pane selection CPU/GPU diverge: delta {delta} > 8"
     );
 
-    // Non-vacuity: dropping the list hands the frame back to the scalar
-    // authority, which here paints no band.
     let plain = term.cell_frame(rows, cols);
     assert_ne!(
         gpu_frame.pixels,
@@ -1548,7 +1424,7 @@ fn scroll_seeded_term(rows: usize, cols: usize) -> Terminal {
         };
         t.process(line.as_bytes());
     }
-    t.scroll_display(5); // show scrollback
+    t.scroll_display(5);
     t
 }
 
@@ -1578,7 +1454,6 @@ fn sub_row_scroll_translate_gpu_matches_cpu_at_asymmetric_origin() {
         grid_top, PAD,
         "regression must exercise the asymmetric origin"
     );
-    // The chrome partition: row 0 = strip, last row = bottom chrome; middle = terminal grid.
     let with_partition = |t: &mut Terminal, frac: i32| {
         let mut input = t.cell_frame(rows, cols);
         input.grid_top_row = 1;
@@ -1586,12 +1461,10 @@ fn sub_row_scroll_translate_gpu_matches_cpu_at_asymmetric_origin() {
         input.scroll_frac_px = frac;
         input
     };
-    // The grid band in device px (renderer row→px mapping) for the chrome check.
-    let y0 = grid_top + ch; // grid_top_row = 1
-    let y1 = grid_top + (rows - 1) * ch; // grid_bot_row = rows-1
+    let y0 = grid_top + ch;
+    let y1 = grid_top + (rows - 1) * ch;
 
     let mut win = aterm_gpu::WindowGpu::new();
-    // The GPU's frac-0 baseline.
     let gpu_zero = {
         let mut t = scroll_seeded_term(rows, cols);
         gpu.render_input(&mut win, &with_partition(&mut t, 0), None)
@@ -1600,7 +1473,6 @@ fn sub_row_scroll_translate_gpu_matches_cpu_at_asymmetric_origin() {
 
     let mut any_moved = false;
     let mut any_down = false;
-    // Positive fracs shift the band up (glide), negative down (bounce).
     for frac in [
         -(ch as i32 - 1),
         -((ch as i32) / 2),
@@ -1621,16 +1493,12 @@ fn sub_row_scroll_translate_gpu_matches_cpu_at_asymmetric_origin() {
             "dims stable across frac and backend"
         );
 
-        // (1) CPU == GPU for the translated frame, within the standard tolerance.
         let delta = max_channel_delta(&cpu_f, &gpu_f);
         assert!(
             delta <= 8,
             "M1b frac={frac}: GPU/CPU translated frames diverge (max delta {delta} > 8)"
         );
 
-        // (2) GPU chrome invariance (the CPU's is aterm-render's
-        //     `scroll_frac_translate`): rows outside [y0, y1) equal the frac-0
-        //     frame byte-for-byte (the shift touched only the grid band).
         for y in (0..y0).chain(y1..h) {
             assert_eq!(
                 &gpu_f.pixels[y * w..y * w + w],
@@ -1638,7 +1506,6 @@ fn sub_row_scroll_translate_gpu_matches_cpu_at_asymmetric_origin() {
                 "M1b frac={frac}: GPU chrome row {y} must be invariant"
             );
         }
-        // (3) Non-vacuity: the grid band genuinely shifted on the GPU.
         if gpu_f.pixels != gpu_zero.pixels {
             any_moved = true;
             if frac < 0 {
@@ -1678,7 +1545,6 @@ fn incoming_row_apron_gpu_matches_cpu() {
     };
     let mut win = aterm_gpu::WindowGpu::new();
 
-    // The glide frame at the fixture's offset (`scroll_seeded_term` scrolls 5).
     let mut tg = scroll_seeded_term(rows, cols);
     let glide_in = partitioned(&mut tg, frac);
     assert!(
@@ -1687,12 +1553,11 @@ fn incoming_row_apron_gpu_matches_cpu() {
     );
     let cpu_glide = cpu.render_input(&glide_in);
     let gpu_glide = gpu.render_input(&mut win, &glide_in, None);
-    // The placeholder's source: the same offset, whole-row.
     let gpu_flat = gpu.render_input(&mut win, &partitioned(&mut tg, 0), None);
 
     let w = cpu_glide.width;
     assert_eq!((gpu_glide.width, gpu_glide.height), (w, cpu_glide.height));
-    let y1 = grid_top + rows * ch; // grid_bot_row == rows
+    let y1 = grid_top + rows * ch;
     let band = |f: &Frame, y0: usize, k: usize| f.pixels[y0 * w..(y0 + k) * w].to_vec();
     let gpu_strip = band(&gpu_glide, y1 - n, n);
     assert_eq!(
@@ -1709,9 +1574,7 @@ fn incoming_row_apron_gpu_matches_cpu() {
         gpu_strip.iter().any(|&p| dist(p, BG) > 0),
         "non-vacuity: the strip carries ink"
     );
-    // Chrome invariance with the strip painted: rows outside the band equal
-    // the frac-0 frame.
-    let y0 = grid_top + ch; // grid_top_row == 1
+    let y0 = grid_top + ch;
     for y in (0..y0).chain(y1..gpu_glide.height) {
         assert_eq!(
             &gpu_glide.pixels[y * w..y * w + w],
@@ -1742,9 +1605,7 @@ fn band_depth(f: &Frame, cw: usize, ch: usize, col: usize, ink: u32) -> usize {
 }
 
 /// The overline's own colour channel on the GPU (aterm-render's
-/// `overline_color` is the CPU oracle). Both resolve it through
-/// `aterm_render::deco_inks`; a seam must hold one tone, exactly, across a row
-/// whose cells have different foregrounds, and colour only its own rule.
+/// `overline_color` is the CPU oracle).
 #[test]
 fn the_overline_colour_channel_paints_the_same_seam_on_both_backends() {
     let theme = Theme::default();
@@ -1753,11 +1614,8 @@ fn the_overline_colour_channel_paints_the_same_seam_on_both_backends() {
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (1usize, 8usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
-    // Two runs of overlined text in two very different inks; the cursor is
-    // hidden so no blink phase can move a pixel between the renders compared.
     term.process(b"\x1b[?25l\x1b[53m\x1b[38;2;80;80;80mdim\x1b[38;2;255;255;255mLIT");
 
-    // The un-channelled frame: with no channel a rule follows each cell's fg.
     let plain = term.cell_frame(rows, cols);
     let gpu_plain = gpu.render_input(&mut win, &plain, None);
 
@@ -1802,8 +1660,6 @@ fn the_overline_colour_channel_paints_the_same_seam_on_both_backends() {
             "column {col} wears the seam to a different depth"
         );
     }
-    // The channel colours ONE rule, not the text under it: everything below
-    // the band is what it was before any seam colour was set.
     assert_eq!(
         &f.pixels[f.width * t..],
         &plain_f.pixels[plain_f.width * t..],
@@ -1835,8 +1691,7 @@ fn padding_rgb(cpu: &Frame, gpu: &Frame, pad: usize, grid_w: usize, grid_h: usiz
 }
 
 /// Chrome bleed with per-row tones: two chrome rows over a padded frame, the
-/// second metered (`row_edges`), with the seam. Every padding pixel matches
-/// exactly across backends; the grid stays within tolerance.
+/// second metered (`row_edges`), with the seam.
 #[test]
 fn gpu_matches_cpu_with_a_metered_chrome_bleed() {
     let theme = Theme::default();
@@ -1885,8 +1740,7 @@ fn gpu_matches_cpu_with_a_metered_chrome_bleed() {
 
 /// A seamed chrome bleed whose last row carries an edge-to-edge rail: the rail
 /// covers the gutters (`chrome_rail_covers_gutters`), so neither backend draws
-/// the bleed's own seam segment there. Padding pixels match exactly, the
-/// gutters' lowest pixel row is the rail and the row above it the band's ground.
+/// the bleed's own seam segment there.
 #[test]
 fn gpu_matches_cpu_with_a_seamed_bleed_under_an_edge_to_edge_rail() {
     let theme = Theme::default();
@@ -1966,7 +1820,6 @@ fn gpu_matches_cpu_with_a_chrome_raster() {
     let mut input = term.cell_frame(rows, cols);
     let w = cols * cw + 2 * P;
     let edge = P + 3 * cw + cw / 3;
-    // A smooth gradient to the edge, one AA pixel, the track after.
     let ground: std::sync::Arc<[u32]> = (0..w)
         .map(|x| {
             if x < edge {
@@ -2009,8 +1862,6 @@ fn gpu_matches_cpu_with_a_chrome_raster() {
     let h = cpu_frame.height;
     assert_eq!((gpu_frame.width, gpu_frame.height), (w, h));
     let top = cpu.grid_top();
-    // The band's top pixel row and its rail rows carry no glyph ink: there the
-    // raster's pixels must be byte-identical across the backends.
     let mut seen = [false; 3];
     for y in [top, top + ch - 3, top + ch - 2, top + ch - 1] {
         for x in 0..w {
@@ -2107,10 +1958,7 @@ fn gpu_matches_cpu_with_a_clear_rail_row() {
     );
 }
 
-/// The band's drawn icons (every icon, regular and bold, spilling into blank
-/// neighbours, and side by side) and an outlined capsule over a gradient. Icons
-/// come through `Renderer::chrome_icon_key` and match within tolerance; the
-/// ring from `aterm_render::chrome_ring_runs` matches exactly.
+/// The band's drawn icons (every icon, regular and bold, between blank neighbours, and side by side).
 #[test]
 fn gpu_matches_cpu_with_band_icons_and_an_outlined_capsule() {
     let theme = Theme::default();
@@ -2122,7 +1970,6 @@ fn gpu_matches_cpu_with_band_icons_and_an_outlined_capsule() {
     cpu.set_pad(P);
     let mut win = aterm_gpu::WindowGpu::new();
     let icons = aterm_render::BandIcon::ALL;
-    // ` G ` per icon (the band's layout): each icon at column 3k + 1.
     let spaced = 3 * icons.len();
     let cols = spaced + 10;
     let rows = 4usize;
@@ -2168,8 +2015,6 @@ fn gpu_matches_cpu_with_band_icons_and_an_outlined_capsule() {
                 end: u16::try_from(spaced + 8).unwrap(),
                 ring: RING,
                 inner: INNER,
-                // As on a band's last row: the ring draws the seam across
-                // its end cells.
                 seam: Some(0x00A0_A2A8),
             }]
         } else {
@@ -2187,8 +2032,6 @@ fn gpu_matches_cpu_with_band_icons_and_an_outlined_capsule() {
     input.chrome_rasters.push(with_icons(0, true));
     input.chrome_rasters.push(with_icons(1, false));
     input.chrome_rasters.push(with_icons(2, false));
-    // The capsule's floor is its cells' underline in the ring's colour, as the
-    // band stamps it.
     let floor_cols = aterm_render::chrome_ring_floor_cols(&input.chrome_rasters[0].rings[0]);
     let blank = aterm_core::terminal::RenderCell {
         bg: [0x30, 0x31, 0x35],
@@ -2213,21 +2056,20 @@ fn gpu_matches_cpu_with_band_icons_and_an_outlined_capsule() {
             icon.ch(),
             "the cell keeps its character"
         );
-        // Spilled between blanks, kept to its cell beside another icon.
         let key = |r: usize, c: usize| {
             cpu.chrome_icon_key(input.chrome_raster(r), &input.cells[r], c)
                 .expect("an icon cell")
         };
-        assert_ne!(
-            key(0, 3 * c + 1).ch_or_id & aterm_render::CHROME_ICON_SPILL_BIT,
-            0
+        assert_eq!(
+            key(0, 3 * c + 1).ch_or_id & aterm_render::CHROME_ICON_SPILL_BIT != 0,
+            !icon.is_glass_mark(),
+            "{icon:?}"
         );
         if c > 0 && c + 1 < icons.len() {
             assert_eq!(key(2, c).ch_or_id & aterm_render::CHROME_ICON_SPILL_BIT, 0);
         }
     }
     let top = cpu.grid_top();
-    // The ring's pixels, from the one builder, are the same on both.
     let floor = cpu.chrome_ring_floor();
     let runs = aterm_render::chrome_ring_runs(&input.chrome_rasters[0], w, P, cw, ch, floor);
     assert!(!runs.is_empty(), "the ring is drawn");
@@ -2236,7 +2078,6 @@ fn gpu_matches_cpu_with_band_icons_and_an_outlined_capsule() {
     for (x0, x1, ya, yb, color) in runs {
         for y in ya..yb {
             for x in x0..x1 {
-                // The floor's underline, on both, over the builder's inside.
                 let color = if (floor.0..floor.1).contains(&y) && (lx0..lx1).contains(&x) {
                     RING
                 } else {

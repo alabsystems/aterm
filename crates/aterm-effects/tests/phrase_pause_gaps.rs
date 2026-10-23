@@ -1,35 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A phrase boundary's space keeps its light: in a line like
-//! `› Adding Fable. HEY! zoom out. git pull▮` typed in bursts with thinking pauses
-//! between, the spaces at phrase boundaries stay lit like every other cell of the
-//! one continuous walk.
-//!
-//! `scrub_gaps.rs`'s host-seam harness (a real `Terminal` driven byte for byte, rows
-//! sampled as `app_render.rs`'s frame hold samples them, fed to `CursorGlow` on a
-//! 16 ms frame train) aimed at that gesture: four phrases at 12 cps with 0.3–3 s
-//! pauses, the boundary space as the last key before the pause or the first after
-//! it, through zsh and an Ink-shaped composer (this file's `Composer::Ink`), plus
-//! what a real Ink composer adds: its own inverse-video cursor cell, keys coalesced
-//! into one repaint, repaints during a pause with no content change, and a space's
-//! repaint landing past the typed hint's quarter-second freshness.
-//!
-//! [`Composer::ClaudeCode`] writes the frames a `targo --unverified lab ptyrec`
-//! take (agent-live) recorded from Claude Code mid-turn: a letter is one DEC 2026
-//! bracket (hide, home, CR, CUF to the column, CUD to the row, one glyph, park at
-//! the last row, CUP back after the glyph, show), a space is a bracket with only
-//! the CUP, and ~0.95 s into a pause one frame erases
-//! part of a status row. Its dials ([`CcShape`]): the spinner frame every 100 ms on
-//! `ROW - 3`, keys coalesced into one frame, PTY-sized chunks with the host's present
-//! rule between, and a key's frame up to half a second after its key. The present
-//! rule is `app_render.rs`'s: the frame hold runs when a bracket closes, when one has
-//! stayed open past `SYNC_HOLD_CAP` (150 ms, sampling the partial state), and every
-//! 16 ms while no bracket is open; a held frame runs no probe and no tick.
-//!
-//! Every take's census is printed (typed columns with no owner or coverage, and every
-//! cohort on the row), and every take asserts no hole on the final frame or on any
-//! settled post-burst frame.
+//! A phrase boundary's space keeps its light.
 
 use crate::common::{
     FrameHold, caret_sample, class_of, note_blink, observe_caret_row, observe_ribbon_rows,
@@ -63,8 +35,6 @@ const PAUSES: [u64; 7] = [300, 700, 950, 1200, 1500, 2000, 3000];
 /// How long after the last key the final census is read: inside the grace, so
 /// every cell of the line should be lit and past its attack.
 const SETTLE_MS: u64 = 200;
-
-// ---- Claude Code's recorded shapes -------------------------------------
 
 /// The turn's spinner cadence.
 const SPINNER_MS: u64 = 100;
@@ -111,20 +81,18 @@ struct Shape {
     /// Never show the DEC caret again after the first hide (log-update
     /// hides it for the session and Ink's cursor cell stands in).
     hidden_caret: bool,
-    /// Keys per repaint under load; `0` or `1` is one repaint per key. A
-    /// burst's last key always flushes.
+    /// Keys per repaint under load; `0` or `1` is one repaint per key.
     coalesce: usize,
     /// A content-free repaint half-way through every pause.
     idle_repaint: bool,
     /// A space's repaint lands this many ms after its key (word-boundary work);
-    /// keys typed meanwhile fold into it. `0` is on the key.
+    /// keys typed meanwhile fold into it.
     late_space_ms: u64,
     /// A rewrite of the line starts [`MID_REWRITE_KEY_MS`] before every pause
     /// ends and is sampled mid-way (the last letter read blank by one present);
     /// the next burst's first key lands while the letter is owed, and the
     /// rewrite completes [`MID_REWRITE_DONE_MS`] after that key's caret is
-    /// shown. The content witness's partial release meets this on a loaded
-    /// composer.
+    /// shown.
     mid_rewrite_blank: bool,
 }
 
@@ -160,8 +128,7 @@ struct CcShape {
     /// parked at the last row, caret returned to its cell).
     spinner: bool,
     /// Keys per frame: `0` or `1` is one frame per key; a burst's last key
-    /// always flushes. One frame writes every glyph (home, CR, CUF, CUD, glyph
-    /// each) and places the caret after the last.
+    /// always flushes.
     coalesce: usize,
     /// How the frame's bytes arrive.
     chunk: Chunk,
@@ -304,7 +271,6 @@ struct Host {
     defer_until: Option<Instant>,
     /// Every frame on which the caret was hidden, counted.
     hidden_frames: usize,
-    // ---- Claude Code ----
     /// Keys typed and not yet framed: `(index into the line, glyph)`.
     cc_pending: Vec<(u16, char)>,
     /// When the owed key frame lands.
@@ -324,7 +290,6 @@ struct Host {
     /// The Ink composer's rewrite in progress: the index into `text` of the
     /// letter it has blanked and still owes ([`Shape::mid_rewrite_blank`]).
     blank_idx: Option<usize>,
-    // ---- the host's sync hold ----
     hold: FrameHold,
     /// Presents the hold skipped (the frame hold never ran).
     held_frames: usize,
@@ -339,12 +304,8 @@ impl Host {
         let mut glow = CursorGlow::default();
         glow.note_pane_columns(0, COLS);
         match composer {
-            // The shell's prompt, two cells, on the composer's row.
             Composer::Zsh => term.process(format!("\x1b[{};1H% ", ROW + 1).as_bytes()),
-            // The Ink-shaped composer's entry: the alt screen, cleared.
             Composer::Ink(_) => term.process(b"\x1b[?1049h\x1b[2J"),
-            // Claude Code's: the alt screen, the empty composer a bare `❯`, the
-            // caret two cells in.
             Composer::ClaudeCode(_) => term.process(
                 format!(
                     "\x1b[?1049h\x1b[2J\x1b[{};1H❯\x1b[{};{}H",
@@ -388,7 +349,6 @@ impl Host {
         };
         match composer {
             Composer::Zsh => h.frame(),
-            // The empty composer on glass — its prefix and its cursor cell.
             Composer::Ink(_) => h.ink_redraw(),
             Composer::ClaudeCode(s) => {
                 if s.spinner {
@@ -436,7 +396,7 @@ impl Host {
     /// The host's present rule (`app_render.rs`, SYNC-1): read the pane's sync
     /// level, close counter and open-dirty bit, run the hold machine, and either
     /// skip this present (no probe, no tick) or run the frame hold on the
-    /// terminal as it stands. For composers that never bracket this is `frame`.
+    /// terminal as it stands.
     fn present(&mut self) {
         let active = self.term.modes().synchronized_output();
         if self.hold.withholds(&self.term, self.now) {
@@ -525,8 +485,6 @@ impl Host {
     fn schedule(&mut self, ms: u64) {
         let t = self.last_event + Duration::from_millis(ms);
         self.idle_to(t);
-        // A repaint the composer owed may have carried the clock past `t`:
-        // the key lands when the composer is free, never in the past.
         let t = t.max(self.now);
         self.now = t;
         self.last_event = t;
@@ -538,8 +496,6 @@ impl Host {
     /// keeps it hidden) `INK_SPLIT_MS` later on the next.
     fn ink_redraw(&mut self) {
         let s = self.composer.shape();
-        // A rewrite still in progress carries its blank: the owed letter is
-        // not back until the rewrite completes below.
         let shown: String = self
             .text
             .chars()
@@ -561,8 +517,6 @@ impl Host {
         self.frame();
         self.pending = 0;
         if let Some(idx) = self.blank_idx.take() {
-            // The rewrite completes: the letter put back where it was, the
-            // caret placed again, one present.
             self.now += Duration::from_millis(MID_REWRITE_DONE_MS);
             let ch = self.text.chars().nth(idx).unwrap_or(' ');
             let done = format!(
@@ -577,8 +531,6 @@ impl Host {
             self.frame();
         }
     }
-
-    // ---- Claude Code's frames, byte for byte -----------------------------
 
     /// `ESC[H CR ESC[<col>C ESC[<row>B <text>`: home, carriage return, cursor
     /// forward to the column, cursor down to the row, the text.
@@ -607,8 +559,7 @@ impl Host {
     /// The key frame for every pending key: a letter is home, CR, CUF, CUD and
     /// one glyph (repeated per glyph when coalesced); a space writes nothing;
     /// any glyph written parks at the last row; then the caret is placed after
-    /// the last key and shown. A space's frame (hide, CUP, show) is this with
-    /// nothing to write.
+    /// the last key and shown.
     fn cc_key_frame(&mut self) -> String {
         let keys = std::mem::take(&mut self.cc_pending);
         let mut f = String::from(SYNC_ON);
@@ -710,8 +661,7 @@ impl Host {
     }
 
     /// One typed key `ms` after the last event: arms the typed hint, the
-    /// program echoes it (now or later per the shape), frames present. `last`
-    /// marks a burst's last key, which always flushes a coalesced repaint.
+    /// program echoes it (now or later per the shape), frames present.
     fn key_after(&mut self, ch: char, ms: u64, last: bool) {
         self.schedule(ms);
         self.arm(ch);
@@ -727,13 +677,9 @@ impl Host {
                 self.caret += 1;
                 self.pending += 1;
                 if ch == ' ' && s.late_space_ms > 0 {
-                    // The composer is busy with the word boundary: this key
-                    // and anything typed meanwhile repaint when it is done.
                     let d = self.now + Duration::from_millis(s.late_space_ms);
                     self.defer_until = Some(self.defer_until.map_or(d, |e| e.max(d)));
                 }
-                // Still busy (this key folds into the owed repaint) or under
-                // load (the repaint waits for more keys): no repaint now.
                 let owed = self.defer_until.is_some();
                 let waits = s.coalesce > 1 && self.pending < s.coalesce && !last;
                 if !owed && !waits {
@@ -750,7 +696,6 @@ impl Host {
                     if s.split_ms == 0 {
                         self.run(Job::KeyFrame);
                     } else {
-                        // The composer is busy: the frame lands later, with
                         // every key typed meanwhile folded in.
                         self.cc_frame_at = Some(self.now + Duration::from_millis(s.split_ms));
                     }
@@ -771,9 +716,6 @@ impl Host {
             self.ink_redraw();
         }
         if s.mid_rewrite_blank && ms > MID_REWRITE_KEY_MS + FRAME_MS {
-            // The composer starts rewriting the line: the present mid-way
-            // samples the last typed letter blank with the caret hidden, and
-            // the next key comes before the rewrite completes.
             let at = self.last_event + Duration::from_millis(ms - MID_REWRITE_KEY_MS);
             self.idle_to(at);
             self.now = self.now.max(at);
@@ -992,12 +934,6 @@ fn take_at(composer: Composer, seam: Seam, placement: Placement, pause: u64, key
             typed += 1;
         }
         let _ = write!(report, " b{}@{}:{:?}", i + 1, h.ms(), h.gaps(typed, false));
-        // Post-burst census on every take. A Claude Code take settles past its
-        // split; an Ink or zsh take settles inside the grace and by the pause's
-        // mid-point, keeping the idle redraw's and next key's instants; the
-        // last burst is read by the final settle below. Only keys on glass are
-        // read: a late composer's owed repaint (`Shape::late_space_ms`) is not
-        // a hole yet.
         let last_burst = i + 1 == BURSTS.len();
         if cc.is_some() || !last_burst {
             let post = if cc.is_some() {
@@ -1042,8 +978,6 @@ fn take_at(composer: Composer, seam: Seam, placement: Placement, pause: u64, key
     if cc.is_none() {
         let landing = h.gaps(typed, false);
         let _ = write!(report, " land@{}:{:?}", h.ms(), landing);
-        // Settle inside the grace and past a late composer's owed repaint, or
-        // text not yet on glass reads as a hole.
         h.idle(SETTLE_MS.max(composer.shape().late_space_ms + 100));
     }
     let final_gaps = h.gaps(typed, true);
@@ -1124,9 +1058,7 @@ fn sweep(runs: &[(Composer, Seam)]) -> Vec<Take> {
     takes
 }
 
-/// Every take of `grid`, in order. Each take builds its own host on its own
-/// clock (nothing shared), so they run on the binary's threads
-/// ([`crate::common::par_map`]) and are printed and judged in order after.
+/// Every take of `grid`, in order.
 fn run_takes<T: Sync>(grid: &[T], f: impl Fn(&T) -> Take + Sync) -> Vec<Take> {
     crate::common::par_map(grid, f)
 }
@@ -1158,23 +1090,6 @@ fn ink(shape: Shape) -> Composer {
 
 /// (1) The bare gesture through zsh and the plain Ink-shaped redraw
 /// (`Shape::default()`), both seams.
-///
-/// (2) What a real Ink composer does that the plain Ink shape does not, each with
-/// Claude Code's own inverse-video cursor cell after the text, redrawn with
-/// the whole line on every key (the DEC caret shown at the caret):
-///
-/// * (i) the cursor cell alone;
-/// * (ii) keys coalesced into one repaint under load — two, and the three the
-///   owner's ring showed licensed as one key;
-/// * (iii) a content-free repaint half-way through every pause;
-/// * (iv) the space's repaint landing late, either side of the typed hint's
-///   250 ms freshness, with nothing after it at a burst's end;
-/// * (v) the row sampled mid-rewrite with one letter blank and the next
-///   burst's first key 50 ms later, inside the partial release's melt, then
-///   the rewrite completing. The witness must not take the run's never-armed
-///   spaces onto the retract with the blanked glyph, and the identical
-///   redraw's restore (`Ribbon::restore_releases`) must survive the new key
-///   changing the cohort's cell count.
 #[test]
 fn phrases_typed_in_bursts_keep_every_boundary_space_lit() {
     let cell = Shape {
@@ -1235,9 +1150,6 @@ fn an_ink_composer_with_a_hidden_caret_keeps_every_boundary_space_lit() {
         }),
         Seam::Classed,
     )]);
-    // A caret never shown licenses nothing: the whole line stays dark on every
-    // take, which is not a hole. Lighting part of it under a hidden caret would
-    // be a licence with no caret. Asserted so the sweep cannot pass vacuously.
     assert_takes(&takes);
     let dark = takes
         .iter()
@@ -1261,24 +1173,15 @@ fn an_ink_composer_with_a_hidden_caret_keeps_every_boundary_space_lit() {
     );
 }
 
-// ---- (3) Claude Code's own bytes, mid-turn ------------------------------
-
 /// The Claude Code sweep: every split × coalesce × pause, the three dials with
 /// more than two values, each once, with the four two-valued dials (spinner,
 /// cadence, chunk, placement) laid over them so every pair of values of any
-/// two dials meets in some take: 36 takes where the full product is 576. The
-/// product was the search for the owner's 2026-09-21 holes (`b920e29a65`: 588
-/// takes, none reproduced them); a hole that needs one dial's value, or two
-/// dials' values together, is in this grid. One printed line per take,
-/// buffered so parallel tests never interleave.
+/// two dials meets in some take: 36 takes where the full product is 576.
 fn cc_sweep() -> Vec<Take> {
     let mut grid = Vec::new();
     for (s, &split_ms) in CC_SPLITS.iter().enumerate() {
         for (c, coalesce) in [1, 2, 3].into_iter().enumerate() {
             for (p, &pause) in CC_PAUSES.iter().enumerate() {
-                // Each two-valued dial reads its own sum of the indices, so
-                // any two of them, and any one beside a three- or four-valued
-                // dial, take every pair of values across the 36.
                 let odd = |n: usize| n % 2 == 1;
                 let shape = CcShape {
                     spinner: odd(s + c),

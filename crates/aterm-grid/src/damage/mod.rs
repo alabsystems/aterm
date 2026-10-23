@@ -22,6 +22,7 @@
 //! damage.mark_full();
 //! assert!(damage.is_full());
 //! ```
+//! use aterm_grid::damage::{Damage, DamageTracker};
 
 mod display_offset;
 mod iter;

@@ -1,27 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Raw Win32 declarations for the Windows volume, drive-kind and identity
-//! readers (`crate::volumes`) and for the one reader of another process's
-//! parameters (`crate::peb`) — the ONLY FFI of this crate on Windows, kept in
-//! one auditable file, each call behind a safe wrapper here. `kernel32` and
-//! `ntdll` only (`NtQueryInformationProcess`, which names where a process's
-//! environment block is; and, for one test, the upcase table), which std
-//! already links: the first-party `windows-sys` closure carries no
-//! `Win32_Storage_FileSystem`, and these names do not earn regenerating it.
-//! Nothing checks a hand declaration against the SDK, so every struct
-//! declared here has a layout test (`FILE_ID_INFO` in `src/volumes_tests.rs`,
-//! the process environment block's in `src/peb.rs`).
-//!
-//! Every wrapper that may reach a file system runs under [`quiet`]: an empty
-//! card reader or optical drive otherwise answers a query with a "There is no
-//! disk in the drive" system box on the owner's desktop, and the asking
-//! thread waits until someone answers it.
-//!
-//! Every path handed to Win32 here is verbatim (`\\?\…`), or goes through
-//! std's own open, which spells a long path verbatim itself:
-//! `LongPathsEnabled` is 0 on most machines, and a cargo profile's paths run
-//! past `MAX_PATH`.
+//! Raw Win32 declarations for the Windows volume, drive-kind and identity readers (`crate::volumes`) and for the one reader of another process's parameters (`crate::peb`) — the ONLY FFI of this crate on Windows, kept in one auditable file, each call behind a safe wrapper here.
 
 use crate::volumes::FileId;
 use std::ffi::{OsStr, OsString, c_void};
@@ -66,8 +46,7 @@ const MAX_VOLUMES: usize = 4 * crate::volumes::MAX_MOUNTS;
 /// The longest `MULTI_SZ` answer (UTF-16 units) a buffer grows to.
 const MULTI_SZ_CAP: u32 = 1 << 16;
 
-/// `FILE_ID_INFO`: the 64-bit volume serial and the 128-bit file id
-/// (`FILE_ID_128`, a byte array) — 24 bytes, 8-aligned.
+/// `FILE_ID_INFO`: the 64-bit volume serial and the 128-bit file id (`FILE_ID_128`, a byte array) — 24 bytes, 8-aligned.
 #[repr(C)]
 pub(crate) struct FileIdInfo {
     /// `VolumeSerialNumber`.
@@ -144,8 +123,7 @@ unsafe extern "system" {
 unsafe extern "system" {
     /// One class of facts about a process, read through a handle: where its
     /// environment block is (`ProcessBasicInformation`), or its 32-bit one
-    /// under WOW64 (`ProcessWow64Information`). An NTSTATUS (negative is a
-    /// failure).
+    /// under WOW64 (`ProcessWow64Information`).
     fn NtQueryInformationProcess(
         process: Handle,
         class: u32,
@@ -160,16 +138,13 @@ const DRIVE_NO_ROOT_DIR: u32 = 1;
 /// `GetDriveTypeW`: a fixed disk — the one kind a reclaim may touch.
 pub(crate) const DRIVE_FIXED: u32 = 3;
 
-// The system's upcase table, which `crate::paths`' fold is held to by a
-// test: `ntdll`, which std already links.
 #[cfg(test)]
 #[link(name = "ntdll")]
 unsafe extern "system" {
     fn RtlUpcaseUnicodeChar(source_character: u16) -> u16;
 }
 
-/// The system's uppercase of the UTF-16 unit `unit` (`RtlUpcaseUnicodeChar`:
-/// the table NTFS writes a new volume's `$UpCase` from).
+/// The system's uppercase of the UTF-16 unit `unit` (`RtlUpcaseUnicodeChar`: the table NTFS writes a new volume's `$UpCase` from).
 #[cfg(test)]
 pub(crate) fn upcase(unit: u16) -> u16 {
     // SAFETY: a pure table lookup of a value; no memory is touched.
@@ -191,9 +166,7 @@ fn until_nul(buf: &[u16]) -> &[u16] {
     &buf[..buf.iter().position(|&c| c == 0).unwrap_or(buf.len())]
 }
 
-/// Are this thread's critical-error and open-file system boxes both off
-/// now (`GetThreadErrorMode` holds `SEM_FAILCRITICALERRORS` and
-/// `SEM_NOOPENFILEERRORBOX`)? [`crate::errors_quiet`], a test seam.
+/// Are this thread's critical-error and open-file system boxes both off now (`GetThreadErrorMode` holds `SEM_FAILCRITICALERRORS` and `SEM_NOOPENFILEERRORBOX`)? [`crate::errors_quiet`], a test seam.
 #[cfg(any(test, debug_assertions))]
 pub(crate) fn errors_quiet() -> bool {
     let both = SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX;
@@ -202,22 +175,13 @@ pub(crate) fn errors_quiet() -> bool {
     mode & both == both
 }
 
-/// The existing `path` with each 8.3 short name replaced by the long name
-/// its own directory lists for it (`\\?\C:\Users\Long Folder` of
-/// `\\?\C:\Users\LONGFO~1`): `GetLongPathNameW`, under [`quiet`], every
-/// other part of the spelling kept and no link followed
-/// (`crate::volumes::long_name`). Hand it a verbatim path: a plain one past
-/// `MAX_PATH` fails. The Win32 error on failure (a name gone, a listing
-/// refused, an empty drive), or `ERROR_INSUFFICIENT_BUFFER` for an answer
-/// longer than any path.
+/// The existing `path` with each 8.3 short name replaced by the long name its own directory lists for it (`\\?\C:\Users\Long Folder` of `\\?\C:\Users\LONGFO~1`): `GetLongPathNameW`, under [`quiet`], every other part of the spelling kept and no link followed (`crate::volumes::long_name`).
 pub(crate) fn long_path(path: &Path) -> Result<PathBuf, i32> {
     let _quiet = quiet();
     let short = wide(path.as_os_str());
     let mut buf = vec![0u16; 32768];
     let cap = u32::try_from(buf.len()).unwrap_or(u32::MAX);
-    // SAFETY: `short` is NUL-terminated; `buf` is `cap` writable units, and
-    // the call writes at most that many (or answers the length it needs,
-    // which is then at least `cap` and refused below).
+    // SAFETY: `short` is NUL-terminated; `buf` is `cap` writable units, and the call writes at most that many (or answers the length it needs, which is then at least `cap` and refused below).
     let n = unsafe { GetLongPathNameW(short.as_ptr(), buf.as_mut_ptr(), cap) };
     if n == 0 {
         return Err(last_error());
@@ -236,28 +200,20 @@ unsafe extern "system" {
     fn GetShortPathNameW(long_path: *const u16, short_path: *mut u16, buffer: u32) -> u32;
 }
 
-/// The 8.3 short spelling of the existing `path` as the file system
-/// generated it (`GetShortPathNameW`), for a test that must make a process
-/// or a tab hold a short-spelled path (`crate::short_spelling`). `None` when
-/// the call fails or answers the path unchanged: a volume, or a name, with
-/// no short name.
+/// The 8.3 short spelling of the existing `path` as the file system generated it (`GetShortPathNameW`), for a test that must make a process or a tab hold a short-spelled path (`crate::short_spelling`).
 #[cfg(any(test, debug_assertions))]
 pub(crate) fn short_path(path: &Path) -> Option<PathBuf> {
     let long = wide(path.as_os_str());
     let mut buf = vec![0u16; 32768];
     let cap = u32::try_from(buf.len()).ok()?;
-    // SAFETY: `long` is NUL-terminated; `buf` is `cap` writable units, and
-    // the call writes at most that many (or answers the length it needs,
-    // which is then more than `cap` and refused below).
+    // SAFETY: `long` is NUL-terminated; `buf` is `cap` writable units, and the call writes at most that many (or answers the length it needs, which is then more than `cap` and refused below).
     let n = unsafe { GetShortPathNameW(long.as_ptr(), buf.as_mut_ptr(), cap) };
     let short = buf.get(..usize::try_from(n).ok()?).filter(|_| n != 0)?;
     let short = PathBuf::from(OsString::from_wide(short));
     (short.as_os_str() != path.as_os_str()).then_some(short)
 }
 
-/// This thread's error mode with the critical-error and open-file boxes
-/// off, restored when dropped ([`quiet`]): on the thread that made it, so
-/// neither `Send` nor `Sync`.
+/// This thread's error mode with the critical-error and open-file boxes off, restored when dropped ([`quiet`]): on the thread that made it, so neither `Send` nor `Sync`.
 pub(crate) struct Quiet {
     /// The mode to restore; `None` when setting it failed.
     old: Option<u32>,
@@ -265,17 +221,12 @@ pub(crate) struct Quiet {
     _this_thread: std::marker::PhantomData<*const ()>,
 }
 
-/// Turn this thread's critical-error and open-file system boxes off until
-/// the answer drops: a query on an empty removable or optical drive then
-/// fails with `ERROR_NOT_READY` instead of waiting on a box nobody asked
-/// for. Thread-scoped (`SetThreadErrorMode`, never the process-wide
-/// `SetErrorMode`); every other bit of the thread's mode is kept.
+/// Turn this thread's critical-error and open-file system boxes off until the answer drops: a query on an empty removable or optical drive then fails with `ERROR_NOT_READY` instead of waiting on a box nobody asked for.
 pub(crate) fn quiet() -> Quiet {
     // SAFETY: no arguments; it reads this thread's error mode.
     let now = unsafe { GetThreadErrorMode() };
     let mut old = 0u32;
-    // SAFETY: `old` is a writable u32 for the previous mode; the call sets
-    // only the calling thread's mode.
+    // SAFETY: `old` is a writable u32 for the previous mode; the call sets only the calling thread's mode.
     let ok = unsafe {
         SetThreadErrorMode(
             now | SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX,
@@ -291,27 +242,23 @@ pub(crate) fn quiet() -> Quiet {
 impl Drop for Quiet {
     fn drop(&mut self) {
         if let Some(old) = self.old {
-            // SAFETY: a null old-mode pointer is allowed; it restores the
-            // mode this guard replaced on this same thread.
+            // SAFETY: a null old-mode pointer is allowed; it restores the mode this guard replaced on this same thread.
             unsafe { SetThreadErrorMode(old, std::ptr::null_mut()) };
         }
     }
 }
 
-/// This thread's error mode now (`GetThreadErrorMode`), for a test of
-/// [`quiet`].
+/// This thread's error mode now (`GetThreadErrorMode`), for a test of [`quiet`].
 #[cfg(test)]
 pub(crate) fn thread_error_mode() -> u32 {
     // SAFETY: no arguments; it reads this thread's error mode.
     unsafe { GetThreadErrorMode() }
 }
 
-/// Set this thread's error mode to `mode`, for a test of [`quiet`] that must
-/// start from a mode without its bits; `false` when the call failed.
+/// Set this thread's error mode to `mode`, for a test of [`quiet`] that must start from a mode without its bits; `false` when the call failed.
 #[cfg(test)]
 pub(crate) fn set_thread_error_mode(mode: u32) -> bool {
-    // SAFETY: a null old-mode pointer is allowed; it sets only the calling
-    // thread's mode.
+    // SAFETY: a null old-mode pointer is allowed; it sets only the calling thread's mode.
     unsafe { SetThreadErrorMode(mode, std::ptr::null_mut()) != 0 }
 }
 
@@ -319,16 +266,11 @@ pub(crate) fn set_thread_error_mode(mode: u32) -> bool {
 #[cfg(test)]
 pub(crate) const QUIET_BITS: u32 = SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX;
 
-/// Every volume the mount manager knows (`\\?\Volume{…}\`), and whether the
-/// enumeration finished: `FindFirstVolumeW` / `FindNextVolumeW` until
-/// `ERROR_NO_MORE_FILES`. Any other end — a failed start, a name that is
-/// not Unicode or too long, more than [`MAX_VOLUMES`] — is not complete.
-/// Asks no file system.
+/// Every volume the mount manager knows (`\\?\Volume{…}\`), and whether the enumeration finished: `FindFirstVolumeW` / `FindNextVolumeW` until `ERROR_NO_MORE_FILES`.
 pub(crate) fn volume_names() -> (Vec<String>, bool) {
     let mut buf = [0u16; 260];
     let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
-    // SAFETY: `buf` is `len` writable UTF-16 units; the call writes at most
-    // that many, NUL included.
+    // SAFETY: `buf` is `len` writable UTF-16 units; the call writes at most that many, NUL included.
     let find = unsafe { FindFirstVolumeW(buf.as_mut_ptr(), len) };
     if find.addr() == usize::MAX {
         return (Vec::new(), false);
@@ -352,19 +294,14 @@ pub(crate) fn volume_names() -> (Vec<String>, bool) {
     (names, complete)
 }
 
-/// Every path volume `name` (`\\?\Volume{…}\`) is mounted at — drive
-/// letters and folder mount points (`C:\`, `C:\mnt\data\`) — from the mount
-/// manager, which asks no file system. Empty for a volume mounted nowhere;
-/// `None` when the call failed (the buffer grows once, to the length the
-/// first call asked for, at most [`MULTI_SZ_CAP`]).
+/// Every path volume `name` (`\\?\Volume{…}\`) is mounted at — drive letters and folder mount points (`C:\`, `C:\mnt\data\`) — from the mount manager, which asks no file system.
 pub(crate) fn volume_path_names(name: &str) -> Option<Vec<PathBuf>> {
     let name = wide(OsStr::new(name));
     let mut buf = vec![0u16; 1024];
     for _ in 0..2 {
         let len = u32::try_from(buf.len()).ok()?;
         let mut need = 0u32;
-        // SAFETY: `name` is NUL-terminated; `buf` is `len` writable units;
-        // `need` is a writable u32 for the length written or wanted.
+        // SAFETY: `name` is NUL-terminated; `buf` is `len` writable units; `need` is a writable u32 for the length written or wanted.
         let ok = unsafe {
             GetVolumePathNamesForVolumeNameW(name.as_ptr(), buf.as_mut_ptr(), len, &raw mut need)
         };
@@ -385,19 +322,13 @@ pub(crate) fn volume_path_names(name: &str) -> Option<Vec<PathBuf>> {
     None
 }
 
-/// What the object manager says `name` (`Volume{…}`, `C:`) points at
-/// (`\Device\HarddiskVolume3`, `\??\C:\work` for a `subst`, a redirector's
-/// device for a network letter): `QueryDosDeviceW`'s first answer, in this
-/// session's view (a per-session `subst` or `net use` first). Asks no file
-/// system and no server. `None` when the call failed or the answer is not
-/// Unicode.
+/// What the object manager says `name` (`Volume{…}`, `C:`) points at (`\Device\HarddiskVolume3`, `\??\C:\work` for a `subst`, a redirector's device for a network letter): `QueryDosDeviceW`'s first answer, in this session's view (a per-session `subst` or `net use` first).
 pub(crate) fn dos_device(name: &str) -> Option<String> {
     let name = wide(OsStr::new(name));
     let mut buf = vec![0u16; 1024];
     for _ in 0..2 {
         let len = u32::try_from(buf.len()).ok()?;
-        // SAFETY: `name` is NUL-terminated; `buf` is `len` writable units,
-        // and the call writes at most that many.
+        // SAFETY: `name` is NUL-terminated; `buf` is `len` writable units, and the call writes at most that many.
         let n = unsafe { QueryDosDeviceW(name.as_ptr(), buf.as_mut_ptr(), len) };
         if n != 0 {
             let used = usize::try_from(n).map_or(buf.len(), |n| n.min(buf.len()));
@@ -418,15 +349,12 @@ pub(crate) fn logical_drives() -> u32 {
     unsafe { GetLogicalDrives() }
 }
 
-/// The bytes free to this caller (its quota honoured: the `f_bavail`
-/// analogue) and the volume's size, through `root` (a verbatim directory,
-/// `\\?\Volume{…}\`): `GetDiskFreeSpaceExW`. The Win32 error on failure.
+/// The bytes free to this caller (its quota honoured: the `f_bavail` analogue) and the volume's size, through `root` (a verbatim directory, `\\?\Volume{…}\`): `GetDiskFreeSpaceExW`.
 pub(crate) fn disk_free(root: &Path) -> Result<(u64, u64), i32> {
     let root = wide(root.as_os_str());
     let (mut free, mut total) = (0u64, 0u64);
     let _quiet = quiet();
-    // SAFETY: `root` is NUL-terminated; `free` and `total` are writable u64s
-    // (`ULARGE_INTEGER`'s layout); the total-free out-param is optional.
+    // SAFETY: `root` is NUL-terminated; `free` and `total` are writable u64s (`ULARGE_INTEGER`'s layout); the total-free out-param is optional.
     let ok = unsafe {
         GetDiskFreeSpaceExW(
             root.as_ptr(),
@@ -441,18 +369,14 @@ pub(crate) fn disk_free(root: &Path) -> Result<(u64, u64), i32> {
     Ok((free, total))
 }
 
-/// The file-system flags (`FILE_READ_ONLY_VOLUME`, …) and the file
-/// system's name (`NTFS`, `ReFS`, `FAT32`, `exFAT`) of the volume at `root`
-/// (a verbatim root, `\\?\Volume{…}\`): `GetVolumeInformationW`. The Win32
-/// error on failure.
+/// The file-system flags (`FILE_READ_ONLY_VOLUME`, …) and the file system's name (`NTFS`, `ReFS`, `FAT32`, `exFAT`) of the volume at `root` (a verbatim root, `\\?\Volume{…}\`): `GetVolumeInformationW`.
 pub(crate) fn volume_info(root: &Path) -> Result<(u32, String), i32> {
     let root = wide(root.as_os_str());
     let mut flags = 0u32;
     let mut name = [0u16; 64];
     let len = u32::try_from(name.len()).unwrap_or(0);
     let _quiet = quiet();
-    // SAFETY: `root` is NUL-terminated; `flags` is a writable u32; `name` is
-    // `len` writable units; every other out-param is optional and null.
+    // SAFETY: `root` is NUL-terminated; `flags` is a writable u32; `name` is `len` writable units; every other out-param is optional and null.
     let ok = unsafe {
         GetVolumeInformationW(
             root.as_ptr(),
@@ -471,26 +395,16 @@ pub(crate) fn volume_info(root: &Path) -> Result<(u32, String), i32> {
     Ok((flags, String::from_utf16_lossy(until_nul(&name))))
 }
 
-/// What kind of drive the volume at `root` (a verbatim root,
-/// `\\?\Volume{…}\`) is: `GetDriveTypeW`, which asks the volume's device and
-/// reads no file system — `DRIVE_FIXED`, `DRIVE_REMOVABLE`, `DRIVE_CDROM`,
-/// `DRIVE_RAMDISK`, `DRIVE_REMOTE`. `None` for `DRIVE_UNKNOWN` and
-/// `DRIVE_NO_ROOT_DIR`: the kind could not be named.
+/// What kind of drive the volume at `root` (a verbatim root, `\\?\Volume{…}\`) is: `GetDriveTypeW`, which asks the volume's device and reads no file system — `DRIVE_FIXED`, `DRIVE_REMOVABLE`, `DRIVE_CDROM`, `DRIVE_RAMDISK`, `DRIVE_REMOTE`.
 pub(crate) fn drive_type(root: &Path) -> Option<u32> {
     let root = wide(root.as_os_str());
     let _quiet = quiet();
-    // SAFETY: `root` is NUL-terminated and outlives the call, which only
-    // reads it.
+    // SAFETY: `root` is NUL-terminated and outlives the call, which only reads it.
     let kind = unsafe { GetDriveTypeW(root.as_ptr()) };
     (kind > DRIVE_NO_ROOT_DIR).then_some(kind)
 }
 
-/// The identity of the file or directory at `path` (`crate::volumes::
-/// file_id`): opened for `FILE_READ_ATTRIBUTES` alone, every sharing mode
-/// granted, `OPEN_EXISTING`, `FILE_FLAG_BACKUP_SEMANTICS`, plus
-/// `FILE_FLAG_OPEN_REPARSE_POINT` unless `follow` (a link answers as
-/// itself). std's open spells a long path verbatim itself. The Win32 error
-/// on failure.
+/// The identity of the file or directory at `path` (`crate::volumes:: file_id`): opened for `FILE_READ_ATTRIBUTES` alone, every sharing mode granted, `OPEN_EXISTING`, `FILE_FLAG_BACKUP_SEMANTICS`, plus `FILE_FLAG_OPEN_REPARSE_POINT` unless `follow` (a link answers as itself). std's open spells a long path verbatim itself.
 pub(crate) fn file_id(path: &Path, follow: bool) -> Result<FileId, i32> {
     let _quiet = quiet();
     let flags = FILE_FLAG_BACKUP_SEMANTICS
@@ -508,19 +422,14 @@ pub(crate) fn file_id(path: &Path, follow: bool) -> Result<FileId, i32> {
     file_id_of_handle(f.as_handle())
 }
 
-/// The identity of the open `handle`: `GetFileInformationByHandleEx
-/// (FileIdInfo)` — the 64-bit volume serial and the 128-bit file id, read
-/// little-endian (an NTFS id's low 64 bits are its file reference number).
-/// FAT and exFAT keep no such id: the Win32 error, never a narrower
-/// stand-in.
+/// The identity of the open `handle`: `GetFileInformationByHandleEx (FileIdInfo)` — the 64-bit volume serial and the 128-bit file id, read little-endian (an NTFS id's low 64 bits are its file reference number).
 pub(crate) fn file_id_of_handle(handle: BorrowedHandle<'_>) -> Result<FileId, i32> {
     let mut info = FileIdInfo {
         volume_serial_number: 0,
         file_id: [0; 16],
     };
     let size = u32::try_from(std::mem::size_of::<FileIdInfo>()).unwrap_or(0);
-    // SAFETY: `handle` is open for the borrow; `info` is a writable
-    // `FILE_ID_INFO` of exactly `size` bytes.
+    // SAFETY: `handle` is open for the borrow; `info` is a writable `FILE_ID_INFO` of exactly `size` bytes.
     let ok = unsafe {
         GetFileInformationByHandleEx(
             handle.as_raw_handle(),
@@ -538,8 +447,6 @@ pub(crate) fn file_id_of_handle(handle: BorrowedHandle<'_>) -> Result<FileId, i3
     })
 }
 
-// Another process of this account, read through a handle (`crate::peb`).
-
 /// `OpenProcess` right: the image, where the environment block is.
 pub(crate) const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 /// `OpenProcess` right: the environment block and its strings.
@@ -553,9 +460,7 @@ const PROCESS_BASIC_INFORMATION: u32 = 0;
 /// `NtQueryInformationProcess` class: a WOW64 process's `PEB32`, else null.
 const PROCESS_WOW64_INFORMATION: u32 = 26;
 
-/// `PROCESS_BASIC_INFORMATION`: where a process's environment block is
-/// (`NtQueryInformationProcess`, class 0). Pointer-sized fields, so one
-/// declaration serves either width of this process.
+/// `PROCESS_BASIC_INFORMATION`: where a process's environment block is (`NtQueryInformationProcess`, class 0).
 #[repr(C)]
 #[derive(Default)]
 pub(crate) struct ProcessBasicInformation {
@@ -573,26 +478,16 @@ pub(crate) struct ProcessBasicInformation {
     pub(crate) inherited_from_unique_process_id: usize,
 }
 
-/// A structure of plain integers, every byte pattern of which is a valid
-/// value: what a read of ANOTHER process's memory may fill whole
-/// ([`read_plain`]). Its pointers are that process's addresses, held as
-/// integers and never dereferenced here.
-///
+/// A structure of plain integers, every byte pattern of which is a valid value: what a read of ANOTHER process's memory may fill whole ([`read_plain`]).
 /// # Safety
-///
-/// Implement it only for a `#[repr(C)]` structure whose fields are integers,
-/// arrays of integers or other `Plain` structures. (Its gaps are spelled as
-/// `_pad*` fields for the reader's sake; padding the compiler would add in
-/// their place holds no value either, and the read writes it too.)
+/// Implement it only for a `#[repr(C)]` structure whose fields are integers, arrays of integers or other `Plain` structures.
 pub(crate) unsafe trait Plain: Copy {}
 
-/// The head of a 64-bit process's environment block (`PEB`), up to its
-/// `ProcessParameters` pointer: where its `RTL_USER_PROCESS_PARAMETERS` are.
+/// The head of a 64-bit process's environment block (`PEB`), up to its `ProcessParameters` pointer: where its `RTL_USER_PROCESS_PARAMETERS` are.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct PebHead64 {
-    /// `InheritedAddressSpace`, `ReadImageFileExecOptions`, `BeingDebugged`,
-    /// `BitField`, and the 4 bytes of padding before `Mutant`.
+    /// `InheritedAddressSpace`, `ReadImageFileExecOptions`, `BeingDebugged`, `BitField`, and the 4 bytes of padding before `Mutant`.
     pub(crate) head: [u8; 8],
     /// `Mutant`.
     pub(crate) mutant: u64,
@@ -604,8 +499,7 @@ pub(crate) struct PebHead64 {
     pub(crate) process_parameters: u64,
 }
 
-/// [`PebHead64`] of a 32-bit process under WOW64 (`PEB32`): every pointer 4
-/// bytes.
+/// [`PebHead64`] of a 32-bit process under WOW64 (`PEB32`): every pointer 4 bytes.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct PebHead32 {
@@ -621,8 +515,7 @@ pub(crate) struct PebHead32 {
     pub(crate) process_parameters: u32,
 }
 
-/// A `UNICODE_STRING` in a 64-bit process's memory: `length` bytes of UTF-16
-/// at the address `buffer` THERE.
+/// A `UNICODE_STRING` in a 64-bit process's memory: `length` bytes of UTF-16 at the address `buffer` THERE.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct RemoteString64 {
@@ -676,11 +569,7 @@ pub(crate) struct DriveLetterCurdir32 {
     pub(crate) dos_path: RemoteString32,
 }
 
-/// `RTL_USER_PROCESS_PARAMETERS` of a 64-bit process, through
-/// `EnvironmentVersion` (the structure goes on past it on Windows 8 and
-/// later, and every Windows this crate runs on lays at least this much): its
-/// working directory (`CurrentDirectory.DosPath`), its command line, and its
-/// environment block with that block's size in bytes.
+/// `RTL_USER_PROCESS_PARAMETERS` of a 64-bit process, through `EnvironmentVersion` (the structure goes on past it on Windows 8 and later, and every Windows this crate runs on lays at least this much): its working directory (`CurrentDirectory.DosPath`), its command line, and its environment block with that block's size in bytes.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct ProcessParameters64 {
@@ -688,8 +577,7 @@ pub(crate) struct ProcessParameters64 {
     pub(crate) maximum_length: u32,
     /// `Length`: how much of the structure the process lays.
     pub(crate) length: u32,
-    /// `RTL_USER_PROC_PARAMS_NORMALIZED` (`0x1`) once its strings' `Buffer`s
-    /// are addresses (before, offsets from the structure).
+    /// `RTL_USER_PROC_PARAMS_NORMALIZED` (`0x1`) once its strings' `Buffer`s are addresses (before, offsets from the structure).
     pub(crate) flags: u32,
     /// `DebugFlags`.
     pub(crate) debug_flags: u32,
@@ -789,8 +677,7 @@ pub(crate) struct ProcessParameters32 {
     pub(crate) environment_version: u32,
 }
 
-// SAFETY: each is `#[repr(C)]` over integers, integer arrays and `Plain`
-// structures only: every byte pattern is a valid value.
+// SAFETY: each is `#[repr(C)]` over integers, integer arrays and `Plain` structures only: every byte pattern is a valid value.
 unsafe impl Plain for PebHead64 {}
 // SAFETY: as above.
 unsafe impl Plain for PebHead32 {}
@@ -807,34 +694,28 @@ unsafe impl Plain for ProcessParameters64 {}
 // SAFETY: as above.
 unsafe impl Plain for ProcessParameters32 {}
 
-/// Process `pid` opened with `access`, or `None` when the open is refused
-/// (no such process, another account's, or one that refuses this access).
+/// Process `pid` opened with `access`, or `None` when the open is refused (no such process, another account's, or one that refuses this access).
 pub(crate) fn open_process(pid: u32, access: u32) -> Option<OwnedHandle> {
     // SAFETY: a plain open by pid; a handle it returns is owned below.
     let h = unsafe { OpenProcess(access, 0, pid) };
     if h.is_null() {
         return None;
     }
-    // SAFETY: `h` is a live handle this call opened, owned by nothing else:
-    // the `OwnedHandle` closes it once.
+    // SAFETY: `h` is a live handle this call opened, owned by nothing else: the `OwnedHandle` closes it once.
     Some(unsafe { OwnedHandle::from_raw_handle(h as RawHandle) })
 }
 
-/// Has the process `h` exited? Only a signalled handle says so (one opened
-/// with [`SYNCHRONIZE`]); a wait that fails answers "running", so a read
-/// that failed leaves its process unknown, never exited.
+/// Has the process `h` exited? Only a signalled handle says so (one opened with [`SYNCHRONIZE`]); a wait that fails answers "running", so a read that failed leaves its process unknown, never exited.
 pub(crate) fn exited(h: BorrowedHandle<'_>) -> bool {
     // SAFETY: `h` is a live process handle for the borrow.
     unsafe { WaitForSingleObject(h.as_raw_handle(), 0) == WAIT_OBJECT_0 }
 }
 
-/// The image `h` runs, as `QueryFullProcessImageNameW` spells it
-/// (`C:\...\x.exe`), or `None` when the call fails.
+/// The image `h` runs, as `QueryFullProcessImageNameW` spells it (`C:\...\x.exe`), or `None` when the call fails.
 pub(crate) fn image_path(h: BorrowedHandle<'_>) -> Option<PathBuf> {
     let mut buf = vec![0u16; 32768];
     let mut len = u32::try_from(buf.len()).ok()?;
-    // SAFETY: `h` is live; `buf` is `len` writable units and `len` a live
-    // local the call updates to the length written.
+    // SAFETY: `h` is live; `buf` is `len` writable units and `len` a live local the call updates to the length written.
     let ok =
         unsafe { QueryFullProcessImageNameW(h.as_raw_handle(), 0, buf.as_mut_ptr(), &raw mut len) };
     let name = buf.get(..usize::try_from(len).ok()?).filter(|_| ok != 0)?;
@@ -859,9 +740,7 @@ pub(crate) fn basic_peb(h: BorrowedHandle<'_>) -> Option<u64> {
     (st >= 0 && info.peb_base_address != 0).then_some(info.peb_base_address as u64)
 }
 
-/// The 32-bit PEB base of a WOW64 process, or `None` when the process is
-/// native (`ProcessWow64Information` answers a null pointer) or the query
-/// fails (read as native, where [`basic_peb`] then decides).
+/// The 32-bit PEB base of a WOW64 process, or `None` when the process is native (`ProcessWow64Information` answers a null pointer) or the query fails (read as native, where [`basic_peb`] then decides).
 pub(crate) fn wow64_peb(h: BorrowedHandle<'_>) -> Option<u64> {
     let mut peb32: usize = 0;
     let mut ret: u32 = 0;
@@ -885,9 +764,7 @@ pub(crate) fn read_plain<T: Plain>(h: BorrowedHandle<'_>, addr: u64) -> Option<T
     let mut out = std::mem::MaybeUninit::<T>::zeroed();
     let mut got: usize = 0;
     let at = usize::try_from(addr).ok()? as *const c_void;
-    // SAFETY: `h` is live and opened with PROCESS_VM_READ; `out` is `size`
-    // writable bytes; `at` is an address in `h`'s process, which the kernel
-    // reads and this process never dereferences.
+    // SAFETY: `h` is live and opened with PROCESS_VM_READ; `out` is `size` writable bytes; `at` is an address in `h`'s process, which the kernel reads and this process never dereferences.
     let ok = unsafe {
         ReadProcessMemory(
             h.as_raw_handle(),
@@ -900,28 +777,22 @@ pub(crate) fn read_plain<T: Plain>(h: BorrowedHandle<'_>, addr: u64) -> Option<T
     if ok == 0 || got != size {
         return None;
     }
-    // SAFETY: zeroed, then every byte written by the read; `T: Plain` makes
-    // every byte pattern a valid `T`.
+    // SAFETY: zeroed, then every byte written by the read; `T: Plain` makes every byte pattern a valid `T`.
     Some(unsafe { out.assume_init() })
 }
 
-/// The string of `len` bytes at `addr` in `h`, as UTF-16 units, read whole:
-/// empty for no bytes; `None` for an odd length (no UTF-16 string), a null
-/// address with a length, or a read that fails or comes up short.
+/// The string of `len` bytes at `addr` in `h`, as UTF-16 units, read whole: empty for no bytes; `None` for an odd length (no UTF-16 string), a null address with a length, or a read that fails or comes up short.
 pub(crate) fn read_units(h: BorrowedHandle<'_>, addr: u64, len: usize) -> Option<Vec<u16>> {
     if len == 0 {
         return Some(Vec::new());
     }
-    // A length is a byte count; an odd one names no UTF-16 string (`& 1` is
-    // the odd test, side-stepping the toolchain's `% 2` lint).
     if addr == 0 || len & 1 != 0 {
         return None;
     }
     let mut units = vec![0u16; len / 2];
     let mut got: usize = 0;
     let at = usize::try_from(addr).ok()? as *const c_void;
-    // SAFETY: `h` is live and PROCESS_VM_READ; `units` is `len` writable
-    // bytes; `at` is read by the kernel, never dereferenced here.
+    // SAFETY: `h` is live and PROCESS_VM_READ; `units` is `len` writable bytes; `at` is read by the kernel, never dereferenced here.
     let ok = unsafe {
         ReadProcessMemory(
             h.as_raw_handle(),
@@ -933,8 +804,6 @@ pub(crate) fn read_units(h: BorrowedHandle<'_>, addr: u64, len: usize) -> Option
     };
     (ok != 0 && got == len).then_some(units)
 }
-
-// The tests' own writes: a directory junction made without a child process.
 
 #[cfg(test)]
 #[link(name = "kernel32")]
@@ -958,18 +827,8 @@ const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
 #[cfg(test)]
 const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
 
-/// Make `link`, a new directory, a junction to the directory `target` (a
-/// verbatim or plain drive path): the reparse data `mklink /J` writes — an
-/// `IO_REPARSE_TAG_MOUNT_POINT` whose substitute name is `\??\C:\…` and whose
-/// print name is the plain path — set on the empty directory through
-/// `FSCTL_SET_REPARSE_POINT`, which needs no privilege on a directory this
-/// account owns. Laid out by hand (`REPARSE_DATA_BUFFER`'s mount-point arm),
-/// field after field in native order: the tag, the length of what follows
-/// the first eight bytes, a reserved word, each name's offset and length in
-/// bytes (no NUL) in the path buffer, then both names, each NUL-terminated.
-///
+/// Make `link`, a new directory, a junction to the directory `target` (a verbatim or plain drive path): the reparse data `mklink /J` writes — an `IO_REPARSE_TAG_MOUNT_POINT` whose substitute name is `\??\C:\…` and whose print name is the plain path — set on the empty directory through `FSCTL_SET_REPARSE_POINT`, which needs no privilege on a directory this account owns.
 /// # Errors
-///
 /// Making the directory, opening it, or the control code failed.
 #[cfg(test)]
 pub(crate) fn make_junction(link: &Path, target: &Path) -> std::io::Result<()> {
@@ -982,8 +841,6 @@ pub(crate) fn make_junction(link: &Path, target: &Path) -> std::io::Result<()> {
     let bytes =
         |n: usize| u16::try_from(n).map_err(|_| std::io::Error::other("a name too long to link"));
     let names = (substitute.len() + 1 + print.len() + 1) * 2;
-    // The tag, the data length and the reserved word; then the four name
-    // fields, which the data length counts.
     let header = 8 + 8;
     let fields = [
         bytes(header - 8 + names)?,
@@ -1011,9 +868,7 @@ pub(crate) fn make_junction(link: &Path, target: &Path) -> std::io::Result<()> {
         .open(link)?;
     let size = u32::try_from(data.len()).map_err(std::io::Error::other)?;
     let mut returned = 0u32;
-    // SAFETY: `dir` is a live handle open for writing; the input is `data`,
-    // alive for the call and exactly `size` bytes; no output buffer; a
-    // synchronous call (no OVERLAPPED).
+    // SAFETY: `dir` is a live handle open for writing; the input is `data`, alive for the call and exactly `size` bytes; no output buffer; a synchronous call (no OVERLAPPED).
     let ok = unsafe {
         DeviceIoControl(
             dir.as_raw_handle(),

@@ -1,38 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The platform clipboard layer: the general clipboard (`pbcopy`/`pbpaste`) and the X11
-//! PRIMARY selection (`primary_set`/`primary_get`), over macOS `NSPasteboard`, the X11 and
-//! Wayland backends and the Win32 clipboard. Reached through `crate::control`'s re-exports.
-//!
-//! Nothing else in the crate touches a platform clipboard: every copy, paste, OSC 52 operation
-//! and Windows file-list paste comes through here and asks [`route`] first. The routes: the
-//! platform clipboard (the only one a shipped binary has), the development seam's stand-in file
-//! (`ATERM_DEBUG_CLIPBOARD_FILE`, so a live test never writes the user's clipboard), and a test
-//! build's thread-local board.
+//! Platform clipboard and X11 `PRIMARY` selection layer ([`route`]).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-/// Where one clipboard read or write goes. [`route`] picks it and every function
-/// in this file obeys it, so the choice is made in exactly one place.
+/// Where one clipboard read or write goes ([`route`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClipboardRoute {
-    /// The platform clipboard: `NSPasteboard`, the X11 / Wayland selections, the
-    /// Win32 clipboard.
+    /// The platform clipboard: `NSPasteboard`, the X11 / Wayland selections, the Win32 clipboard.
     System,
-    /// `ATERM_DEBUG_CLIPBOARD_FILE=<path>`: the file stands in for CLIPBOARD (and
-    /// its `.primary` sibling for PRIMARY); the platform clipboard is untouched.
+    /// `ATERM_DEBUG_CLIPBOARD_FILE=<path>`.
     File(PathBuf),
-    /// A test build's thread-local board ([`PBPASTE_STUB`], and PRIMARY's twin on
-    /// Linux): a unit test never reads or writes the developer's clipboard.
+    /// A test build's thread-local board ([`PBPASTE_STUB`], and PRIMARY's twin on Linux).
     #[cfg(test)]
     TestBoard,
 }
 
-/// The routing decision; `seam` is `ATERM_DEBUG_CLIPBOARD_FILE`'s value. Unset
-/// keeps the platform clipboard. Any value, even empty (no file: copies fail,
-/// reads find nothing), keeps the platform clipboard out of it.
+/// The routing decision; `seam` is `ATERM_DEBUG_CLIPBOARD_FILE`'s value.
 fn route_for(seam: Option<OsString>) -> ClipboardRoute {
     match seam {
         None => ClipboardRoute::System,
@@ -40,9 +26,7 @@ fn route_for(seam: Option<OsString>) -> ClipboardRoute {
     }
 }
 
-/// The route every read and write takes. The seam is read per call through
-/// `dev_seam!`, so a shipped binary compiles it out and always takes
-/// [`ClipboardRoute::System`]. A test build always takes the thread-local board.
+/// The route every read and write takes ([`ClipboardRoute::System`]).
 fn route() -> ClipboardRoute {
     #[cfg(test)]
     {
@@ -58,8 +42,6 @@ fn route() -> ClipboardRoute {
 const CLIPBOARD_FILE_CAP: u64 = 64 << 20;
 
 /// A clipboard write needs an owner until after the clipboard has closed.
-/// Keep acquisition and teardown ordering independent of the platform API so
-/// failure paths can be exercised without touching the system clipboard.
 #[cfg(any(windows, test))]
 pub(crate) fn write_with_owner<O, G>(
     owner: impl FnOnce() -> Option<O>,
@@ -75,10 +57,7 @@ pub(crate) fn write_with_owner<O, G>(
     write()
 }
 
-/// A copy under [`ClipboardRoute::File`]: `path` is overwritten with `text` via a
-/// sibling and rename, so a poller never reads a half-written copy (the OSC 52
-/// worker and the event loop can both write). `false` when the file cannot be
-/// written.
+/// A copy under [`ClipboardRoute::File`].
 fn file_copy(path: &Path, text: &str) -> bool {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -100,9 +79,7 @@ fn file_copy(path: &Path, text: &str) -> bool {
     false
 }
 
-/// A read under [`ClipboardRoute::File`]: the file's text (bounded by
-/// [`CLIPBOARD_FILE_CAP`]), or `None` when missing, empty or not UTF-8, as
-/// [`pbpaste`] maps an empty pasteboard.
+/// A read under [`ClipboardRoute::File`] ([`CLIPBOARD_FILE_CAP`], [`pbpaste`]).
 fn file_paste(path: &Path) -> Option<String> {
     use std::io::Read as _;
     let mut text = String::new();
@@ -114,8 +91,7 @@ fn file_paste(path: &Path) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// PRIMARY's stand-in, `<path>.primary`: separate so a drag-select never
-/// clobbers an explicit copy (see [`primary_set`]).
+/// PRIMARY's stand-in, `<path>.primary` ([`primary_set`]).
 #[cfg(any(test, target_os = "linux"))]
 fn primary_file(path: &Path) -> PathBuf {
     let mut primary = path.as_os_str().to_owned();
@@ -123,10 +99,6 @@ fn primary_file(path: &Path) -> PathBuf {
     PathBuf::from(primary)
 }
 
-// The test build's CLIPBOARD board (`ClipboardRoute::TestBoard`), which `pbcopy` writes and
-// `pbpaste`/`pbpaste_owned` read. Thread-local because libtest runs each test on its own thread
-// and the paths under test read the clipboard on the calling thread; a worker thread sees its
-// own empty board. A plain comment: rustc discards doc comments on macro invocations.
 #[cfg(test)]
 thread_local! {
     pub(crate) static PBPASTE_STUB: std::cell::RefCell<Option<String>> =
@@ -152,19 +124,7 @@ fn board_paste(board: &'static TestBoard) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-/// Place `text` on the clipboard; returns whether it was placed. Shared by the `copy` verb, the
-/// GUI copy shortcut, copy-on-select and OSC 52.
-///
-/// macOS writes the general `NSPasteboard` in-process (no fork/exec on the event loop; `NSString`
-/// ⇄ `String` is a direct UTF-8 conversion, so the launch locale does not matter). The OSC 52
-/// worker and the `copy` verb call this off the main thread, which `NSPasteboard` string get/set
-/// allows.
-///
-/// On Wayland the event loop does the copy and the compositor may refuse it. Off the loop thread
-/// this waits for the loop's verdict, so `aterm ctl copy` reports a dropped copy; on the loop
-/// thread (copy shortcut, copy-on-select, which carry the input serial the compositor wants) it
-/// cannot wait on itself and answers `true` for an accepted request. The return value is the
-/// only report (`tracing` is a no-op facade).
+/// Place `text` on the clipboard; returns whether it was placed.
 pub(crate) fn pbcopy(text: &str) -> bool {
     match route() {
         ClipboardRoute::System => system_pbcopy(text),
@@ -181,11 +141,7 @@ fn system_pbcopy(text: &str) -> bool {
         use aterm_objc::{Id, Sel, autoreleasepool, class, sel};
 
         use crate::appkit;
-        // SAFETY: `+generalPasteboard` is `-(id)`, a valid singleton on any
-        // thread; `-clearContents` is `-(NSInteger)` (result discarded) and takes
-        // ownership before writing, per the documented protocol;
-        // `-setString:forType:` is `-(BOOL)(NSString *, NSPasteboardType)`, the
-        // type is an `NSString *`, and both arguments outlive the call.
+        // SAFETY: `+generalPasteboard` is `-(id)`, a valid singleton on any thread.
         autoreleasepool(|_| unsafe {
             let Some(ns) = appkit::nsstring(text) else {
                 return false;
@@ -208,8 +164,6 @@ fn system_pbcopy(text: &str) -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        // A window on Wayland owns its selections through its own seat
-        // (`clipboard_wayland`); everything else is the X11 backend.
         if let Some(wayland) = crate::clipboard_wayland::handle() {
             return wayland.copy(crate::clipboard_wayland::WaylandSelection::Clipboard, text);
         }
@@ -227,24 +181,19 @@ fn system_pbcopy(text: &str) -> bool {
     }
 }
 
-/// `NSPasteboardTypeString`, the UTF-8 plain-text pasteboard type. Linked rather
-/// than transcribed: unlike most AppKit constants (header-only, see
-/// `appkit::consts`), the `NSPasteboardType` family is an exported
-/// `APPKIT_EXTERN NSPasteboardType const`.
+/// `NSPasteboardTypeString`, the UTF-8 plain-text pasteboard type.
 #[cfg(target_os = "macos")]
 fn pasteboard_type_string() -> aterm_objc::Id {
-    // SAFETY: AppKit exports this as an immortal `NSString *` constant; reading
-    // the symbol is a load, and the object it names outlives the process.
+    // SAFETY: AppKit exports this as an immortal `NSString *` constant.
     #[link(name = "AppKit", kind = "framework")]
     unsafe extern "C" {
         static NSPasteboardTypeString: *mut std::ffi::c_void;
     }
-    // SAFETY: as above.
+    // SAFETY: As above.
     aterm_objc::Id::from_ptr(unsafe { NSPasteboardTypeString })
 }
 
-/// Read the clipboard as UTF-8 text, or `None` when empty or unavailable (so no Paste event
-/// fires on an empty clipboard). Used by the GUI paste shortcut and the menu Paste.
+/// Read the clipboard as UTF-8 text, or `None` when empty or unavailable.
 pub(crate) fn pbpaste() -> Option<String> {
     match route() {
         ClipboardRoute::System => system_pbpaste(),
@@ -261,9 +210,7 @@ fn system_pbpaste() -> Option<String> {
         use aterm_objc::{autoreleasepool, class, sel};
 
         use crate::appkit;
-        // SAFETY: `+generalPasteboard` is `-(id)`, a valid singleton on any
-        // thread; `-stringForType:` is `-(NSString *)(NSPasteboardType)` and
-        // returns a borrowed string, copied out to Rust inside this pool.
+        // SAFETY: `+generalPasteboard` is `-(id)`, a valid singleton on any thread.
         let s = autoreleasepool(|_| unsafe {
             let pb = appkit::send_id(class(c"NSPasteboard").as_id(), sel!(generalPasteboard));
             if pb.is_null() || pasteboard_type_string().is_null() {
@@ -295,9 +242,7 @@ fn system_pbpaste() -> Option<String> {
     }
 }
 
-/// The file list on the Windows clipboard (`CF_HDROP`, as Explorer's Ctrl+C puts
-/// up), for the terminal paste's no-text arm. The stand-in file and test board
-/// hold text only, so under either there is no file list.
+/// Read the `CF_HDROP` file list from the Windows clipboard.
 #[cfg(windows)]
 pub(crate) fn pbpaste_paths() -> Option<Vec<String>> {
     match route() {
@@ -308,18 +253,12 @@ pub(crate) fn pbpaste_paths() -> Option<Vec<String>> {
     }
 }
 
-/// Non-blocking X11 twin of [`pbpaste`]: the CLIPBOARD text only when this
-/// process owns the selection (`X11Clipboard::get_owned`), `None` when a foreign
-/// client does. The GUI paste delivers the own-selection case synchronously and
-/// offloads only the blocking foreign read. Linux-only; the stand-in file is
-/// always instant, so under the seam this answers with it.
+/// Non-blocking X11 twin of [`pbpaste`].
 #[cfg(target_os = "linux")]
 pub(crate) fn pbpaste_owned() -> Option<String> {
     match route() {
         ClipboardRoute::System => system_pbpaste_owned(),
         ClipboardRoute::File(path) => file_paste(&path),
-        // The same board as `pbpaste`, answered here so a Linux test never falls
-        // to the foreign-owner worker thread.
         #[cfg(test)]
         ClipboardRoute::TestBoard => board_paste(&PBPASTE_STUB),
     }
@@ -336,8 +275,6 @@ fn system_pbpaste_owned() -> Option<String> {
 }
 
 /// Set the X11 PRIMARY selection (select-to-copy, middle-click paste) to `text`.
-/// Linux-only. Kept distinct from CLIPBOARD ([`pbcopy`]) so a drag-select never
-/// clobbers an explicit copy; the seam gives it its own file ([`primary_file`]).
 #[cfg(target_os = "linux")]
 pub(crate) fn primary_set(text: &str) -> bool {
     match route() {
@@ -359,10 +296,6 @@ fn system_primary_set(text: &str) -> bool {
 }
 
 /// Read the X11 PRIMARY selection as UTF-8 text, or `None` when empty or off X11.
-///
-/// Blocks on a foreign owner (a `ConvertSelection` round-trip bounded at ~1 s),
-/// so the middle-click path probes [`primary_get_owned`] first and runs this
-/// only on its paste worker (`App::paste_primary_into`).
 #[cfg(target_os = "linux")]
 pub(crate) fn primary_get() -> Option<String> {
     match route() {
@@ -383,19 +316,13 @@ fn system_primary_get() -> Option<String> {
         .and_then(|c| c.get(crate::clipboard_x11::Sel::Primary))
 }
 
-// The test build's PRIMARY board (thread-local, as `PBPASTE_STUB`). Only the own-slot fast
-// path (`primary_get_owned`) sees it — the foreign-owner worker runs on another thread with an
-// empty board — so a test that set it always takes the synchronous branch.
 #[cfg(all(test, target_os = "linux"))]
 thread_local! {
     pub(crate) static PRIMARY_STUB: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Non-blocking twin of [`primary_get`]: the PRIMARY text only when this process
-/// owns the selection, `None` when a foreign client does. The common case: a
-/// drag-select in aterm takes PRIMARY (`finish_selection`), so select-here /
-/// paste-here stays on the UI thread.
+/// Non-blocking twin of [`primary_get`].
 #[cfg(target_os = "linux")]
 pub(crate) fn primary_get_owned() -> Option<String> {
     match route() {
@@ -452,8 +379,6 @@ mod tests {
             state.calls.push("write");
             state.owner && state.open
         };
-        // Negative control: the Win32 NULL-owner sequence opens the clipboard,
-        // but cannot transfer data after EmptyClipboard clears its owner.
         let unowned = Rc::new(RefCell::new(State {
             open: true,
             ..State::default()
@@ -494,9 +419,6 @@ mod tests {
         }
     }
 
-    /// Unset, the seam leaves every clipboard read and write on the platform;
-    /// set, its file stands in whatever the path — an empty value included,
-    /// which names no file, so a copy fails and a read finds nothing and the
     /// platform clipboard is untouched. PRIMARY rides a sibling file.
     #[test]
     fn the_seam_routes_to_the_system_clipboard_or_its_file() {
@@ -516,8 +438,6 @@ mod tests {
         );
     }
 
-    /// The stand-in file behaves as a clipboard: a missing file is empty, a copy
-    /// overwrites it with the latest text (no temporary left beside it), an empty
     /// copy reads as empty, and a directory that is not there refuses the copy.
     #[test]
     fn the_file_stands_in_for_the_clipboard() {

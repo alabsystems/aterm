@@ -199,7 +199,7 @@ unsafe impl Encode for *mut crate::runtime::Id {
     const ENCODING: &'static str = "^@";
 }
 
-/// `@encode(BOOL *)` for the target being compiled. Not `"^"` plus
+/// `@encode(BOOL *)` for the target being compiled.
 #[cfg(target_arch = "aarch64")]
 const BOOL_PTR_ENCODING: &str = "^B";
 /// See the `aarch64` arm.

@@ -13,6 +13,7 @@ pub(crate) const LEDGER_CAP: usize = 512;
 pub(crate) const HARNESS_SHARE: usize = LEDGER_CAP / 2;
 
 /// The record's bound on submitted text, so a multi-megabyte `turn` payload cannot bloat the
+/// ring; the full text still reached the PTY.
 const MAX_TEXT: usize = 512;
 
 /// One completed turn, in the order `cmd_turn` finished it.
@@ -133,19 +134,34 @@ pub(crate) struct TurnLedger {
     /// How many of `records` are the window harness's ([`TurnBy::Harness`]).
     harness: usize,
     /// Turn ids below this may have named a harness record evicted from
+    /// INSIDE the ring ([`HARNESS_SHARE`]): every record from here on is
+    /// held, so [`TurnLedger::low_id`] reports it and a resumed
+    /// `since-turn=` below it is told, as for a record evicted from the
+    /// front.
     shed_below: u64,
     /// Turn ids below this may have named records the ledger never got: a self-update handoff
+    /// could not carry it whole (no sidecar, a bad one, a lock held elsewhere, records shed to
+    /// fit, a turn open at the export).
     unheld_below: u64,
     /// Turn ids begun on this session whose record has not landed ([`TurnLedger::begin`] …
+    /// [`TurnLedger::record`] / [`TurnLedger::abandon`]); [`TurnLedger::carry_floor`] keeps a
+    /// handoff's carried ledger from vouching for them.
     open: Vec<u64>,
     /// The session's watchers ([`crate::SessionCtx::watchers`]), rung by
+    /// [`TurnLedger::record`] so the `events` digest pushes a landed turn at
+    /// once.
     watchers: std::sync::Arc<crate::session_watch::Watchers>,
     /// The text the window harness typed and has not submitted yet
+    /// ([`Typed`]): this process's alone, never carried.
     typed: Option<Typed>,
     /// How many records the ledger has taken ([`TurnLedger::push`]): what a
+    /// carry of it last saw, so the crash journal's control slot is
+    /// rewritten only when it moved (`crash_restore`, increment 7).
     #[cfg(any(unix, test))]
     generation: u64,
     /// Told after every record the ledger takes ([`TurnLedger::watch`]):
+    /// the session's crash journal, whose worker then carries the ledger
+    /// into the session's region.
     watch: Option<LedgerWatch>,
 }
 
@@ -417,6 +433,9 @@ mod tests {
     }
 
     /// Every word `by=` prints reads back as the same caller, the shape a
+    /// carried record is held to: the reserved `fleet`, an older sender's
+    /// missing field and anything not a word or a sid this build mints read
+    /// as `-`, never as a sid.
     #[test]
     fn by_words_round_trip_and_anything_else_is_unknown() {
         let sid = aterm_session::SessionId::generate();
@@ -436,6 +455,9 @@ mod tests {
     }
 
     /// THE CRASH JOURNAL'S WATCH (`crash_restore`'s increment 7): every
+    /// record the ledger takes moves its generation and tells the watch once,
+    /// an eviction past the cap included; nothing else does (a turn begun or
+    /// abandoned, a typed text).
     #[test]
     fn every_record_moves_the_generation_and_tells_the_watch() {
         use std::sync::Arc;
@@ -471,6 +493,9 @@ mod tests {
     }
 
     /// The window's companion reacts to the newest turn the window harness
+    /// did not type ([`TurnLedger::newest_not_harness`]): a `keep going`
+    /// (`status=pressed`, carried or not) after a manager's turn leaves the
+    /// manager's as the room's.
     #[test]
     fn the_room_turn_is_the_newest_the_harness_did_not_type() {
         let harness = |id: u64, carried: bool| TurnRecord {
@@ -493,6 +518,9 @@ mod tests {
     }
 
     /// A LONG RUN OF THE HARNESS'S OWN TURNS NEVER EVICTS THE MANAGER'S:
+    /// past [`HARNESS_SHARE`] the harness's records make room among
+    /// themselves, so a manager's turn followed by twice [`LEDGER_CAP`]
+    /// continuations is still held, beside the harness's newest.
     #[test]
     fn the_harness_makes_room_among_its_own_and_the_managers_turn_stays() {
         let harness = |id: u64| TurnRecord {
@@ -537,6 +565,7 @@ mod tests {
     }
 
     /// The `partition_point` seek agrees with a linear filter for every watermark, including
+    /// below the low-water and at or past the high.
     #[test]
     fn since_seek_matches_the_linear_filter_for_every_watermark() {
         let mut l = TurnLedger::default();
@@ -591,6 +620,8 @@ mod tests {
     }
 
     /// A turn a `lease release force` preempted finishes after the turn that took its slot:
+    /// it is re-numbered past the newer record, so ids rise in landing order and a watcher
+    /// past the newer turn is sent it.
     #[test]
     fn a_preempted_turn_that_records_late_is_renumbered_and_streamed() {
         let mut l = TurnLedger::default();
@@ -619,6 +650,8 @@ mod tests {
     }
 
     /// A turn still open when the handoff exports the ledger records into the exiting
+    /// process: the export carries a floor past it, and the adopted ledger's low-water is that
+    /// floor even with older records held.
     #[test]
     fn an_open_turn_is_carried_as_an_id_the_ledger_does_not_vouch_for() {
         let mut l = TurnLedger::default();
@@ -634,6 +667,7 @@ mod tests {
     }
 
     /// A floor stays live until [`LEDGER_CAP`] records at or past it have landed, then is
+    /// neither reported nor carried on.
     #[test]
     fn a_floor_goes_stale_once_the_records_under_it_would_have_aged_out() {
         let cap = LEDGER_CAP as u64;

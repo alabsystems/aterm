@@ -2534,8 +2534,8 @@ mod tests {
     }
 
     #[test]
-    fn the_hover_says_a_harness_need_in_its_own_words() {
-        let (mut app, _wid, sid, ctx) = app_with_stub();
+    fn a_harness_need_stays_in_the_hover_without_a_tab_bar_pill() {
+        let (mut app, wid, sid, ctx) = app_with_stub();
         ctx.meta
             .lock()
             .unwrap()
@@ -2546,6 +2546,10 @@ mod tests {
             )
             .expect("a slot");
         app.refresh_presence_session(sid);
+        assert!(app.presence_pill(wid).is_none());
+        assert!(app.presence_pill_key(wid).is_none());
+        #[cfg(a11y_tree)]
+        assert!(app.presence_a11y_message(wid).is_none());
         let hover = app.presence_hover(sid, None).expect("the need is said");
         let lines: Vec<&str> = hover.lines().collect();
         assert_eq!(
@@ -2564,6 +2568,11 @@ mod tests {
             .expect("cleared");
         ask(&ctx, Some("please look"));
         app.refresh_presence_session(sid);
+        assert!(
+            app.presence_pill(wid).is_some(),
+            "an interactive ask keeps its pill"
+        );
+        assert!(app.presence_pill_key(wid).is_some());
         let hover = app.presence_hover(sid, None).expect("the ask is said");
         assert_eq!(
             hover.lines().next(),

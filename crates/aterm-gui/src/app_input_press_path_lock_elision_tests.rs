@@ -24,9 +24,7 @@ fn character_event(ch: char, state: ElementState) -> aterm_window::event::KeyEve
 
 /// An App whose session capability (not merely the window's mirror) writes to
 /// an observer pipe, since the release path writes through
-/// `pool.get(session).ctx.sink`. Returns the nonblocking read end. The sink owns
-/// the write end, so the fd closes with the last `Arc<SinkWriter>` and no write
-/// can reach a parallel test's pipe on a recycled number.
+/// `pool.get(session).ctx.sink`.
 #[cfg(unix)]
 fn app_observing_pty() -> (App, i32) {
     use std::os::fd::{FromRawFd, OwnedFd};
@@ -162,10 +160,7 @@ fn glow_tick(
 /// echo is laid as one delivered insert) and an IME / dead-key commit — keeps
 /// the banked typed stamps of glyphs whose echoes are still in flight (the
 /// pre-fix `clear_typed` emptied the bank), and its own response move is
-/// licensed; bare, on an empty bank, only its own arm can fund that move. The
-/// Control release between a ⌃V and its echo (`clear_move_license`, which wipes
-/// the bank) must not kill the insert. The class-aware take and consume-once
-/// laws are the engine's (`a_glyph_echo_does_not_spend_the_enter_pressed_behind_it`).
+/// licensed; bare, on an empty bank, only its own arm can fund that move.
 #[cfg(unix)]
 #[test]
 fn a_self_licensing_press_keeps_banked_stamps_and_licenses_its_response() {
@@ -179,8 +174,6 @@ fn a_self_licensing_press_keeps_banked_stamps_and_licenses_its_response() {
     }
     let none = Modifiers::empty();
     let ctrl_v = || Act::Press(Key::Character('v'), Modifiers::CTRL);
-    // (label, act, response row, response cells past the caret, echo delay ms,
-    //  release fence, licence)
     let cases = [
         (
             "Enter",
@@ -269,20 +262,7 @@ fn a_self_licensing_press_keeps_banked_stamps_and_licenses_its_response() {
     }
 }
 
-/// A press keeps the glow's hand on its row exactly when the seam does. The
-/// engine reads the hand's row (where the last licensed typed echo landed) to
-/// tell a status tick inside a hesitated key's window from that key's echo.
-/// Every route a press takes (`on_key`'s pre-dispatch fence, `App::input`'s entry
-/// fence, the dispatch arm, a modifier edge, `control_input::control_fence`, the
-/// menu's fence) closes the licence cohort ahead of it, and all of them ask the
-/// one classification, `press_fence`, whether the hand keeps its row.
-///
-/// Observed: 3 s after the press the next key is followed 3 ms later by a status
-/// row's advance ending on that key's glyph; a hand kept on the caret's row
-/// refuses it `program-row`, a hand taken off lets `spawn` judge it as the echo.
-/// Kept: line edits, a Shift edge, a paste, ⌘V, Enter into a program's composer.
-/// Taken: Ctrl-R (zle's minibuffer), Escape (vi's `/` after it), ⌘← (no line
-/// edit), Enter at a shell prompt.
+/// A press keeps the glow's hand on its row exactly when the seam does.
 #[cfg(unix)]
 #[test]
 fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
@@ -378,7 +358,6 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
         ("ctl key esc", Via::Control("key", "esc"), false),
     ];
     if super::HARDCODED_SUPER_CHORDS {
-        // ⌘-chords are the window's own there (Linux hands Super to the PTY).
         let cmd_v = WinitKey::Character(SmolStr::new("v"));
         cases.push((
             "physical ⌘V",
@@ -411,8 +390,6 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
                 glow.observe_caret_drawn(true);
                 glow.tick(Some((0, col)), at, &glow_cfg, geom, &mut out);
             };
-        // A status row's first print (no brand), then `h` and its echo:
-        // the licensed typed move puts the hand on row 0.
         frame(
             &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow,
             Some((3, 11, '✻')),
@@ -481,8 +458,6 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
             }
             Via::ModifierEdge(mods) => app.on_modifiers_changed(wid, mods),
             Via::Control(verb, body) => {
-                // The dispatch records its fence on the session; the seam's
-                // look applies it before the press arms anything.
                 let session = app.front_terminal(wid).unwrap().session;
                 if let Some(keep_hand) = crate::control::control_fence(
                     aterm_types::control_verbs::input_of(verb),
@@ -515,8 +490,6 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
             }
         }
         let _ = drain(pipe);
-        // The next key, 3 s on the glow's clock, and the status row's
-        // advance ending on its glyph 3 ms after its press.
         let later = Instant::now() + Duration::from_secs(3);
         let glow = &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow;
         glow.note_typed_expected(later, 1, false, TypedClass::Glyph, 'x');
@@ -543,10 +516,7 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
 
 /// The insert arm is Rainbow Kitty's alone: a bare Tab and a bare ⌃V arm
 /// the delivered-insert licence under Rainbow Kitty and no other style,
-/// the same gate the paste's delivery edge applies. Only a PLAIN Tab is an
-/// insert: ⇧Tab (Claude Code's mode cycle, readline's reverse menu-complete)
-/// and a modified Tab arm none, yet each keeps the gesture class (a completion
-/// sweep to the classic trail), which every style arms.
+/// the same gate the paste's delivery edge applies.
 #[cfg(unix)]
 #[test]
 fn a_tab_or_ctrl_v_arms_an_insert_under_rainbow_kitty_only() {
@@ -601,9 +571,7 @@ use aterm_window::keyboard::ModifiersState;
 /// kitty reports a modifier's release with the state it leaves: with both
 /// Shifts down and one let go, `shift` is still in force, so the release
 /// carries the bit (`CSI 57441;2:3u`); the last one's release clears it
-/// (`CSI 57447;1:3u`), as does a lone Shift's. The window decides from its
-/// physical-press record. Control: in legacy mode a bare Shift writes nothing
-/// and its release is swallowed with it.
+/// (`CSI 57447;1:3u`), as does a lone Shift's.
 #[cfg(unix)]
 #[test]
 fn a_modifier_release_keeps_its_bit_while_the_other_side_is_held() {
@@ -630,7 +598,6 @@ fn a_modifier_release_keeps_its_bit_while_the_other_side_is_held() {
         drain(pipe).is_empty(),
         "legacy: a bare Shift writes nothing"
     );
-    // Report all keys (8) and event types (2): releases are reported.
     term_lock(&term).process(b"\x1b[>10u");
     app.on_key(wid, shift(KeyCode::ShiftLeft, ElementState::Pressed));
     assert_eq!(drain(pipe), b"\x1b[57441;2u".to_vec(), "left down");
@@ -648,7 +615,6 @@ fn a_modifier_release_keeps_its_bit_while_the_other_side_is_held() {
         b"\x1b[57447;1:3u".to_vec(),
         "the last Shift up clears the bit"
     );
-    // A lone Shift: its release clears the bit, whatever its press saw.
     app.on_key(wid, shift(KeyCode::ShiftLeft, ElementState::Pressed));
     assert_eq!(drain(pipe), b"\x1b[57441;2u".to_vec(), "lone down");
     app.on_key(wid, shift(KeyCode::ShiftLeft, ElementState::Released));
@@ -709,8 +675,6 @@ fn caps_lock_reaches_legacy_and_kitty_while_unmapped_keys_write_nothing() {
 
 /// The HID read is retained for a mapped key even while the mirror says
 /// legacy: the PTY reader may publish a Kitty push immediately afterward.
-/// Switch modes *inside* the injected read, before the egress seam samples
-/// its mode, and require the newly selected CSI-u wire form to carry Caps.
 #[cfg(target_os = "macos")]
 #[test]
 fn mapped_press_keeps_caps_when_kitty_arrives_between_hid_and_egress() {
@@ -782,10 +746,7 @@ fn scrolled_back_with_a_selection(app: &mut App, wid: WindowId) -> Arc<Mutex<Ter
     term
 }
 
-/// Selection custody: ⌘-A selects what you are looking at. The visible rows
-/// are mapped through the live `display_offset` (as the mouse path maps a
-/// click), so Select All while reading history neither snaps to live nor
-/// loses your place.
+/// Selection custody: ⌘-A selects what you are looking at.
 #[test]
 fn select_all_selects_the_visible_screen_without_snapping() {
     let mut app = App::headless_for_test();
@@ -823,9 +784,7 @@ fn select_all_selects_the_visible_screen_without_snapping() {
     );
 }
 
-/// Selection custody: ⌘↓ / ⌘↑ are the deliberate return to live. Routed as
-/// a `ScrollIntent`, which moves the viewport without snapping and without
-/// clearing, so you return to live with your selection intact.
+/// Selection custody: ⌘↓ / ⌘↑ are the deliberate return to live.
 #[test]
 fn cmd_arrows_are_the_deliberate_return_to_live() {
     use crate::input::ScrollIntent;
@@ -833,10 +792,6 @@ fn cmd_arrows_are_the_deliberate_return_to_live() {
     let down = modifier_event(WNamed::ArrowDown, KeyCode::ArrowDown, ElementState::Pressed);
     let up = modifier_event(WNamed::ArrowUp, KeyCode::ArrowUp, ElementState::Pressed);
 
-    // ⌘-arrow is part of the hardcoded Cmd suite: live on macOS/Windows,
-    // off on Linux, where Super+arrow is a desktop chord (GNOME
-    // tiling/unmaximize) and must fall through.
-    // ⌘↓ end to end: `cmd_down_returns_to_live_through_on_key_without_clearing_the_selection`.
     if super::HARDCODED_SUPER_CHORDS {
         assert!(matches!(
             super::scrollback_chord(ModifiersState::SUPER, &up),
@@ -846,14 +801,10 @@ fn cmd_arrows_are_the_deliberate_return_to_live() {
         assert!(super::scrollback_chord(ModifiersState::SUPER, &down).is_none());
         assert!(super::scrollback_chord(ModifiersState::SUPER, &up).is_none());
     }
-    // ⌘⌥arrow stays pane focus; ⌘-arrow must not shadow it.
     assert!(
         super::scrollback_chord(ModifiersState::SUPER | ModifiersState::ALT, &down).is_none(),
         "cmd+alt+arrow belongs to pane focus"
     );
-    // …and the existing Shift forms are untouched: Shift+End off Windows, and
-    // Windows Terminal's Ctrl+Shift+End on Windows, where Shift+End is
-    // PSReadLine's SelectLine and reaches the shell.
     let end = modifier_event(WNamed::End, KeyCode::End, ElementState::Pressed);
     let jump = if cfg!(windows) {
         ModifiersState::CONTROL | ModifiersState::SHIFT
@@ -879,16 +830,12 @@ fn cmd_arrows_are_the_deliberate_return_to_live() {
         cfg!(windows),
         "Ctrl+Shift+PageUp pages on Windows only"
     );
-    // A bare arrow still belongs to the PTY.
     assert!(super::scrollback_chord(ModifiersState::empty(), &down).is_none());
 }
 
 /// Selection custody: a bare Cmd chord no shortcut claims is swallowed
 /// (terminals never forward Cmd combos) and writes nothing, so it does not move
-/// the viewport; its window half still drops the banked glide residual. On Linux
-/// (`HARDCODED_SUPER_CHORDS` off) Super belongs to the desktop: the chord falls
-/// through to the seam, whose legacy encoding ignores Super as xterm does, so
-/// Super+J types `j` and snaps.
+/// the viewport; its window half still drops the banked glide residual.
 #[cfg(unix)]
 #[test]
 fn a_swallowed_cmd_chord_no_longer_snaps_the_viewport() {
@@ -953,7 +900,6 @@ fn a_sample_answers_only_for_the_session_it_was_taken_on() {
     );
     publish_release_relevance(41, true);
     assert_eq!(sampled_release_relevance(41), Some(true));
-    // Session 0 is a real id and must not collide with the "unsampled" encoding.
     publish_release_relevance(0, false);
     assert_eq!(sampled_release_relevance(0), Some(false));
 }
@@ -961,8 +907,6 @@ fn a_sample_answers_only_for_the_session_it_was_taken_on() {
 /// Selection custody for the two byte-producing press payloads with no event
 /// type: a `[key_sequences]` chord's `InputEvent::KeySequence` and the
 /// `option_as_meta = false` / IME-commit fallback's `InputEvent::Text`.
-/// `repeat_literal` replays the payload verbatim, so `PressPhase` carries the
-/// repeat and an auto-repeat does not re-run the press-path snap+clear.
 #[test]
 fn a_held_literal_payload_repeats_without_re_taking_the_reading_position() {
     for (code, payload) in [
@@ -974,9 +918,6 @@ fn a_held_literal_payload_repeats_without_re_taking_the_reading_position() {
         let physical = PhysicalKey::Code(code);
         let term = scrolled_back_with_a_selection(&mut app, wid);
 
-        // The press still takes custody: the control proving this payload
-        // reaches the press path, so the repeat assertion cannot pass by
-        // absence.
         app.forward_literal_press(wid, physical, payload.clone(), None);
         {
             let t = term_lock(&term);
@@ -991,11 +932,9 @@ fn a_held_literal_payload_repeats_without_re_taking_the_reading_position() {
             );
         }
 
-        // Mid-hold the user wheels back into history and drags a new selection.
         let _ = scrolled_back_with_a_selection(&mut app, wid);
         let offset = term_lock(&term).grid().display_offset();
 
-        // …and the key is still down: more auto-repeat ticks arrive.
         for tick in 0..3 {
             app.route_physical_repeat(wid, physical);
             let t = term_lock(&term);
@@ -1012,25 +951,10 @@ fn a_held_literal_payload_repeats_without_re_taking_the_reading_position() {
     }
 }
 
-/// Selection custody: a bare modifier or lock key is inert. No snap, no clear
-/// (Shift's keydown clearing the selection would make shift-click-extend
-/// impossible on macOS), no glide cancel, no blink reset, and no revoked move
-/// licence: Option+Left/Right have no key-time cue, so a word move's sound is
-/// minted when its echo's caret delta is licensed by the press's `nav_hint`,
-/// and macOS delivers `flags_changed` as a synthesized Pressed for
-/// `Named(Alt|Shift|…)`, then `ModifiersChanged` edges as Option is released,
-/// while that echo is in flight. AltGr and `Fn` have no engine key
-/// (`map_logical_key` is `None`), so they never reach the seam and rely on
-/// `on_key`'s own `keymap::press_is_inert` gate. The gate is on inertness only,
-/// never on auto-repeat: a repeat tick keeps the cursor solid, and ordinary
-/// typing still snaps, deselects, drops the glide's banked residual and
-/// restarts the blink, while an intent-bearing chord revokes the licence.
+/// Selection custody: a bare modifier or lock key is inert.
 #[test]
 fn a_bare_modifier_or_lock_key_is_inert() {
     use aterm_window::keyboard::NamedKey as WNamed;
-    // Park the cursor mid-blink-OFF with a live blink deadline, bank a
-    // sub-row scroll residual, as an in-flight wheel glide would, and stamp
-    // the only licence a word move gets (Option+Left, echo not landed yet).
     fn park(app: &mut App, wid: WindowId, deadline: std::time::Instant) {
         let ws = app.windows.get_mut(&wid).expect("window");
         ws.blink_phase = false;
@@ -1093,15 +1017,11 @@ fn a_bare_modifier_or_lock_key_is_inert() {
     ] {
         park(&mut app, wid, deadline);
         app.on_key(wid, modifier_event(named, code, ElementState::Pressed));
-        // Option released before the echo lands (was: `on_modifiers_changed`
-        // revoked the `nav_hint`, and the word move failed `no-fresh-hint`).
         app.on_modifiers_changed(wid, aterm_window::keyboard::ModifiersState::ALT);
         app.on_modifiers_changed(wid, aterm_window::keyboard::ModifiersState::empty());
         assert_inert(&app, &format!("bare {named:?}"));
     }
 
-    // The seam half: the same press arriving as an engine event (a controller
-    // verb, or a held modifier routed to its press-time session).
     park(&mut app, wid, deadline);
     let _ = app.input(
         wid,
@@ -1116,8 +1036,6 @@ fn a_bare_modifier_or_lock_key_is_inert() {
     );
     assert_inert(&app, "a seam-routed bare Shift");
 
-    // An auto-repeat tick of a held ordinary key keeps the cursor solid for
-    // the whole hold (the blink is never gated on `PressKind::disturbs()`).
     park(&mut app, wid, deadline);
     let _ = app.input(
         wid,
@@ -1135,7 +1053,6 @@ fn a_bare_modifier_or_lock_key_is_inert() {
         "a repeat tick must keep the cursor solid mid-hold"
     );
 
-    // Control: an intent-bearing press closes the licence cohort.
     for (named, code) in [
         (WNamed::Escape, KeyCode::Escape),
         (WNamed::Backspace, KeyCode::Backspace),
@@ -1145,7 +1062,6 @@ fn a_bare_modifier_or_lock_key_is_inert() {
         assert_eq!(licensed(&app, wid), (false, false), "{named:?} revokes it");
     }
 
-    // Control: ordinary typing.
     let _ = scrolled_back_with_a_selection(&mut app, wid);
     park(&mut app, wid, deadline);
     app.on_key(wid, character_event('a', ElementState::Pressed));
@@ -1169,8 +1085,6 @@ fn a_repeat_into_a_hidden_session_leaves_its_viewport_and_selection_alone() {
     let term = scrolled_back_with_a_selection(&mut app, wid);
     let offset = term_lock(&term).grid().display_offset();
 
-    // Push a second tab so session 0 is no longer fronted by any window,
-    // the state `input_to_hidden_session` exists for.
     let sid = app.next_session_id;
     app.push_stub_tab(wid, stub_session(sid));
     assert_ne!(
@@ -1187,8 +1101,6 @@ fn a_repeat_into_a_hidden_session_leaves_its_viewport_and_selection_alone() {
         event_type,
     };
 
-    // The hold's auto-repeat ticks (the same press continuing) must not take
-    // custody a second time.
     for _ in 0..4 {
         app.input_to_hidden_session(
             hidden_session,
@@ -1210,7 +1122,6 @@ fn a_repeat_into_a_hidden_session_leaves_its_viewport_and_selection_alone() {
         );
     }
 
-    // A bare modifier is inert on this path too.
     app.input_to_hidden_session(
         hidden_session,
         InputEvent::Key {
@@ -1229,8 +1140,6 @@ fn a_repeat_into_a_hidden_session_leaves_its_viewport_and_selection_alone() {
         "a bare modifier expresses no intent, hidden or not"
     );
 
-    // …and the control: a genuine press still takes custody, so the gate is a
-    // scoped exclusion, not a blanket "hidden input never disturbs".
     app.input_to_hidden_session(
         hidden_session,
         held(KeyEventType::Press),
@@ -1346,7 +1255,6 @@ fn single_char_text_event_arms_predictive_local_echo() {
         "a single-width printable Text commit arms predictive local echo"
     );
 
-    // Multi-char text commits flush any pending prediction.
     assert_eq!(
         app.input(wid, InputEvent::Text("ab".into()), Source::Controller),
         crate::input::InputOutcome::Ok

@@ -42,6 +42,8 @@ fn radians(deg: f64) -> f64 {
 }
 
 /// The Euclidean norm the rigs were measured with: the two-term case of
+/// CPython 3.9's `math.hypot` (scaled by the larger magnitude, compensated
+/// summation from 1.0), so a joint normal lands on the same last bit.
 fn hypot(dx: f64, dy: f64) -> f64 {
     let v = [dx.abs(), dy.abs()];
     let max = v[0].max(v[1]);
@@ -60,6 +62,7 @@ fn hypot(dx: f64, dy: f64) -> f64 {
 }
 
 /// [`hypot`], with a zero length read as one (a degenerate segment has no
+/// direction to divide by).
 fn length_or_one(dx: f64, dy: f64) -> f64 {
     let ln = hypot(dx, dy);
     if ln == 0.0 { 1.0 } else { ln }
@@ -214,6 +217,7 @@ mod dogs {
     }
 
     /// An upright rounded-triangle ear: base centred at (cx, base_y), apex
+    /// above by h, half-width w; `tip_round` softens the apex.
     fn teardrop(cx: f64, base_y: f64, w: f64, h: f64, tip_round: f64) -> Path {
         let (ax, ay) = (cx, base_y - h);
         let r = w * tip_round;
@@ -313,6 +317,7 @@ mod dogs {
     }
 
     /// One breed's feature table; every field but the first five has the
+    /// default [`Breed::new`] gives it.
     struct Breed {
         id: &'static str,
         note: &'static str,
@@ -504,6 +509,7 @@ mod dogs {
     }
 
     /// The inner ear of a prick ear, both sides; it pivots where the default
+    /// prick ear does (`44 / 2` above its base) whatever its own height.
     fn inner_prick(cx: f64, base_y: f64, w: f64, hh: f64, tilt: f64) -> Vec<Path> {
         let left = rotate(
             &teardrop(cx, base_y, w, hh, 0.55),
@@ -821,6 +827,7 @@ mod pet {
         }
 
         /// The unit normal at each joint of a polyline, averaged across the
+        /// joint, with a miter compensation so a bend does not pinch.
         fn normals(ps: &[Pt]) -> Vec<Pt> {
             let n = ps.len();
             let segn: Vec<Pt> = ps
@@ -904,6 +911,7 @@ mod pet {
         }
 
         /// A semicircular cap from rail point `a` to rail point `b`, bulging
+        /// `r` along the unit vector `out`.
         fn cap(a: Pt, b: Pt, r: f64, out: Pt) -> String {
             let k = 1.3333 * r;
             let c1 = (a.0 + out.0 * k, a.1 + out.1 * k);
@@ -1096,6 +1104,7 @@ mod pet {
         /// The off-side pair sits back and up: an instant 3/4 read.
         const FAR_OFFSET: Pt = (-7.0, -2.0);
         /// Face-on, the off-side foreleg mirrors across the chest (24 units
+        /// apart: any closer and the two mitts' outlines fuse into one paw).
         const FRONT_OFFSET: Pt = (-24.0, 0.0);
 
         fn hip(p: &Pose, far: bool) -> Pt {
@@ -1384,6 +1393,8 @@ mod pet {
         }
 
         /// The dog's inner lobe insets harder: on a hanging ear only the upper
+        /// inside shows, so a cat-sized inner shape would paint pink over the
+        /// whole flap and read as a tongue.
         fn inner_ear_paths(p: &Pose) -> Vec<String> {
             let inset = if dog(p) { 13.0 } else { 9.0 };
             vec![ear_shape(p, -1.0, inset), ear_shape(p, 1.0, inset)]
@@ -1395,6 +1406,7 @@ mod pet {
         }
 
         /// A dog's tail is a thicker, blunter club than a cat's tapering whip:
+        /// with the tabby rings gone its OUTLINE has to carry it.
         fn tail_paths(p: &Pose) -> Part {
             let ps = tail_pts(p);
             let t = p.tail_thick * if dog(p) { 1.18 } else { 1.0 };
@@ -1432,6 +1444,8 @@ mod pet {
         }
 
         /// The muzzle group's x offset: at rest a hint toward the near cheek;
+        /// yawed ~0.22 head radii into the travel direction (the strongest
+        /// "the face turned" cue); face-on dead centre.
         fn muzzle_dx(p: &Pose) -> f64 {
             if p.front {
                 0.0
@@ -1472,6 +1486,7 @@ mod pet {
         }
 
         /// The snout: the cat's round muzzle drawn out along the facing axis,
+        /// shallower on top and longer ahead (90 degrees is the +x side).
         fn dog_muzzle_paths(p: &Pose) -> Vec<String> {
             if p.front {
                 let (cx, cy) = face_anchor(p, dog_snout_dx(p), 0.46);
@@ -1507,7 +1522,7 @@ mod pet {
             )]
         }
 
-        /// The eye line rides the skull's equator. Yawed, both eyes slide
+        /// The eye line rides the skull's equator.
         fn eye_centres(p: &Pose) -> (Pt, Pt) {
             if p.front {
                 return (face_anchor(p, 0.42, 0.04), face_anchor(p, -0.42, 0.04));
@@ -1521,6 +1536,8 @@ mod pet {
         }
 
         /// (near_r, far_rx, far_ry): the far eye foreshortens in WIDTH with
+        /// the yaw and only mildly in height: a turning eyeball loses azimuth,
+        /// not elevation.
         fn eye_scales(p: &Pose) -> (f64, f64, f64) {
             let rn = 8.6;
             if p.front {
@@ -1556,7 +1573,7 @@ mod pet {
             }
         }
 
-        /// A closed sleeping lid: a shallow downward arc with body. Fat on
+        /// A closed sleeping lid: a shallow downward arc with body.
         fn lid((x, y): Pt, r: f64, thick: f64) -> String {
             let w = r * 1.15;
             let t = 4.8 * thick;
@@ -1572,6 +1589,9 @@ mod pet {
         }
 
         /// A half-lidded eye: a slim lens on the upper half of the aperture
+        /// (where a half-closed lid sits, clear of the whisker roots) whose
+        /// OUTER corner (`sgn`, +1 near / -1 far) droops a step lower: drowsy
+        /// contentment, not the squint's wince.
         fn half((x, y): Pt, r: f64, sgn: f64) -> String {
             let yy = y - r * 0.14;
             let w = r * 0.90;
@@ -1814,6 +1834,7 @@ mod pet {
         }
 
         /// Dogs have whiskers in life and never in drawings of dogs: the fan is
+        /// a CAT cue, and leaving it on undoes the ears and the snout.
         fn whisker_paths(p: &Pose) -> Vec<String> {
             if dog(p) {
                 return Vec::new();
@@ -1870,6 +1891,7 @@ mod pet {
         type Fan = (f64, f64, f64, f64);
 
         /// Tucked just under the eyes, not beside the muzzle: the kawaii
+        /// placement.
         fn blush_paths(p: &Pose) -> Vec<String> {
             if !p.blush {
                 return Vec::new();
@@ -1890,7 +1912,7 @@ mod pet {
             ]
         }
 
-        /// The tabby: three back bars and two tail rings, riding the torso. A
+        /// The tabby: three back bars and two tail rings, riding the torso.
         fn pattern_paths(p: &Pose) -> Vec<String> {
             if dog(p) {
                 return Vec::new();
@@ -2036,7 +2058,7 @@ mod pet {
                 .collect()
         }
 
-        /// The pose's (dx, dy) into the viewbox. `dy` PLANTS the pose: the
+        /// The pose's (dx, dy) into the viewbox.
         fn registration(raw: &[Layer], p: &Pose) -> Pt {
             (OX, GROUND_INK - p.airborne - bbox(raw)[3])
         }
@@ -2316,6 +2338,8 @@ mod pet {
         }
 
         /// An upright chest over a seated haunch: the hind legs fold away and
+        /// the rump is the ground contact, the forelegs dropping straight down
+        /// the front edge.
         fn sit_base(p: Pose) -> Pose {
             Pose {
                 bx: 104.0,
@@ -2382,6 +2406,9 @@ mod pet {
         }
 
         /// Both whisker fans are spent here: the FAR fan lands on the curled
+        /// torso's dome (strokes on coat read as scratches), and the NEAR fan
+        /// roots under an eye this pose tips toward it (eye, fan and outline
+        /// clot into a black smear).
         fn sleep_base(p: Pose) -> Pose {
             Pose {
                 curl: true,
@@ -2602,6 +2629,8 @@ mod pet {
         }
 
         /// The bell: a compact seated silhouette whose base is about one
+        /// head-width across, the head overlapping the chest by a third: the
+        /// classic face-on cat, not a totem pole.
         fn sit_front(ident: &str, note: &str) -> Pose {
             Pose {
                 front: true,
@@ -2627,6 +2656,7 @@ mod pet {
         }
 
         /// The over-the-shoulder seat, built on body/head OPPOSITION: the body
+        /// faces AWAY while the head comes BACK.
         fn shoulder_seat(ident: &str, note: &str) -> Pose {
             Pose {
                 hide_hind: true,
@@ -2759,6 +2789,9 @@ mod pet {
         }
 
         /// The awake bread: one smooth arc, zero visible limbs, the head
+        /// RESTING on the dome's front end (leading edge flush with the
+        /// bread's), the tail trimmed to a nub-and-tip, and the off-side fan
+        /// flat against the bread.
         fn loaf_base(p: Pose) -> Pose {
             Pose {
                 curl: true,
@@ -3425,6 +3458,7 @@ mod pet {
         }
 
         /// THE DOG IS THE SAME POSE SHEET, RE-SKINNED (owner, 2026-08-11:
+        /// "make a dog like the walking cat … you can use the same code").
         fn dog_poses(cats: &[Pose]) -> Vec<Pose> {
             cats.iter()
                 .map(|p| Pose {

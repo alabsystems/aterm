@@ -1,78 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Developer Tools helper panel's driver: the panel's AppKit views
-//! (`devtools_helper::live`), built exactly as the live arm builds them, in NO
-//! window, captured to PNGs and read back — the look the unit tests cannot give
-//! (libtest is never on the main thread, and a test that needs WindowServer is a
-//! driver, never a unit test).
-//!
-//! # What it refuses to do, which is why it may run beside the owner
-//!
-//! * Before it touches anything else it makes the application object with the
-//!   PROHIBITED activation policy: no Dock icon, no menu bar, never activated.
-//! * It never orders a window in and never makes one key. The panel window it
-//!   reads back is built and released without being shown; every capture is
-//!   `-cacheDisplayInRect:` of a content view that sits in no window.
-//! * It reads no other app: not System Settings, not the window list, not which
-//!   app is in front.
-//! * It writes PNGs only into the directory it is handed (none without one),
-//!   and exits on its own. The directory is the example's argument, never an
-//!   environment variable: this file ships in the `aterm` binary, and shipped code
-//!   reads no `ATERM_*` name a person could set.
-//!
-//! # What it checks
-//!
-//! 1. Every state of the panel's words builds, in the light and the dark
-//!    appearance: the content view is [`PANEL_W`] wide, every view on it lies
-//!    inside it, every label is as tall as its words need at its width (the
-//!    layout measured them with the same labels), the tile is there exactly when
-//!    the words carry one, and the capture is not one flat colour.
-//! 2. The panel window reads back as built: its style mask, level, collection
-//!    behaviour and flags, its title and delegate — and it is not visible.
-//! 3. The drag's payload for a bundle path with a space and parentheses,
-//!    written through AppKit's pasteboard machinery to a private, uniquely named
-//!    pasteboard (never the owner's clipboard): the file URL percent-encoded with
-//!    its trailing slash under both URL types and the plain path — and the old
-//!    filenames list, which aterm does not write (AppKit refuses it as a written
-//!    type) and AppKit derives from the file URL.
-//! 4. The strings the panel spells for the window list's keys and for the
-//!    activation notification equal the SDK's exported symbols (`dlsym`).
-//! 5. The tile's NSDraggingSource rows and the target's `windowShouldClose:` are
-//!    registered with the encodings their protocols declare.
-//!
-//! Its sends go through `crate::appkit`, as the panel's do: a debug build checks
-//! each typed send against the runtime's encoding (`aterm_objc::send`), and this
-//! reads what they built.
-//!
-//! # Exit contract (read by `examples/objc_devtools_helper_drive.rs`)
-//!
-//! | code | meaning |
-//! |---|---|
-//! | 0 | every check passed |
-//! | 1 | at least one finding; the transcript names each |
-//! | 2 | not run: not on the process main thread. Never a pass. |
-//!
-//! It is NOT an `aterm_verify::stages::OBJC_DRIVES` row: a look at the panel is
-//! not a check every verify should pay for. Run it by hand:
-//! `targo --unverified run -p aterm-gui --example objc_devtools_helper_drive --
-//! <dir>`.
-
-/// Every check passed.
+//! Headless AppKit driver that renders and verifies the Developer Tools helper panel (`devtools_helper::live`).
+/// Exit code when every check passes.
 const PASS: i32 = 0;
-/// At least one finding. See the transcript.
+/// Exit code when at least one finding is recorded.
 const FINDING: i32 = 1;
-/// The drive could not execute here. NOT a pass.
+/// Exit code when the drive could not execute.
 const NOT_RUN: i32 = 2;
 
-/// Drive the panel's views and return the exit code above, with the PNGs under
-/// `snapshots` when given. Called from `examples/objc_devtools_helper_drive.rs`,
-/// which owns `fn main` and its argument; the body lives here because
-/// `devtools_helper` is library-private.
+/// Drives the Developer Tools helper panel views and returns the process exit code.
 #[must_use]
 pub fn run_devtools_helper_drive(snapshots: Option<&Path>) -> i32 {
-    // The drive is a windowed process of its own: it makes the application
-    // object and builds AppKit views, so it mints the proof a windowed launch
     // carries and hands it to the body that sends `+sharedApplication`.
     run(crate::platform::Windowed::launch(), snapshots)
 }
@@ -131,11 +70,7 @@ fn run(_windowed: crate::platform::Windowed, out: Option<&Path>) -> i32 {
         println!("{ME}: NOT RUN — not on the process main thread");
         return NOT_RUN;
     };
-    // (a) The application object, Prohibited, before anything else: never
-    // activated, no Dock icon, no menu bar.
-    // SAFETY: main thread; `+sharedApplication` is `+(NSApplication *)`, +0 and
-    // process-lifetime; `-setActivationPolicy:` is `-(BOOL)(NSInteger)` and
-    // `-activationPolicy` `-(NSInteger)`.
+    // SAFETY: Main thread; `+sharedApplication`, `-setActivationPolicy:`, and `-activationPolicy` are valid on `NSApplication`.
     let policy = unsafe {
         let app = appkit::send_id(class(c"NSApplication").as_id(), sel!(sharedApplication));
         if app.is_null() {
@@ -232,8 +167,6 @@ fn scenarios() -> Vec<(&'static str, Content)> {
             .content(),
         ),
         (
-            // The hand-over's `spctl` run failed on an empty list: why, the +
-            // route, and Show it.
             "list-not-shown",
             shown_after(
                 list(DevToolListing::Absent, DevToolListLabel::Read, Some(0)),
@@ -255,8 +188,6 @@ fn scenarios() -> Vec<(&'static str, Content)> {
             .content(),
         ),
         (
-            // On the list and switched on while macOS still checks (the joined
-            // verdict not granted): nothing to drag, nothing to switch on.
             "listed-on",
             shown(
                 list(DevToolListing::On, DevToolListLabel::Read, Some(2)),
@@ -303,8 +234,6 @@ fn scenarios() -> Vec<(&'static str, Content)> {
         t0,
     );
     out.push(("done", done.content()));
-    // The Full Disk Access page's panel (owner ask 2026-10-16): no list read, so no
-    // listed, unread or unconfirmed states.
     let fda = |bundle: bool| {
         Panel::new(
             Show {
@@ -346,9 +275,9 @@ fn states(mtm: MainThread, out: Option<&Path>, findings: &mut Findings) {
                 findings.check(false, || format!("{at}: the views did not build"));
                 continue;
             };
-            // SAFETY: main thread; the preview's views are live.
+            // SAFETY: Main thread; `preview`'s views are live.
             unsafe { view_checks(&preview, content.blocks.len(), wants_tile, &at, findings) };
-            // SAFETY: as above.
+            // SAFETY: Main thread; `preview.view` is a live `NSView`.
             match unsafe { capture(preview.view.as_id(), dark) } {
                 Some((w, h, png, flat)) => {
                     findings.check(!flat, || format!("{at}: the capture is one flat colour"));
@@ -369,12 +298,10 @@ fn states(mtm: MainThread, out: Option<&Path>, findings: &mut Findings) {
     }
 }
 
-/// The content view's shape: its width, at least one view per block, its views
-/// inside it, each label tall enough for its words, the tile present exactly
-/// when wanted.
+/// Verifies the content view layout and subviews.
 ///
 /// # Safety
-/// Main thread; `preview`'s views are live.
+/// Must be called on the main thread while `preview`'s views are live.
 unsafe fn view_checks(
     preview: &Preview,
     blocks: usize,
@@ -382,10 +309,7 @@ unsafe fn view_checks(
     at: &str,
     findings: &mut Findings,
 ) {
-    // SAFETY: `-bounds`/`-frame` are `-(NSRect)`; `-subviews` `-(NSArray *)`,
-    // +0, read with `-count`/`-objectAtIndex:`; `-isKindOfClass:` is
-    // `-(BOOL)(Class)`; `-cell` `-(id)` and `-cellSizeForBounds:`
-    // `-(NSSize)(NSRect)`.
+    // SAFETY: Main thread; AppKit geometry and subview selectors match their Objective-C signatures.
     unsafe {
         let view = preview.view.as_id();
         let bounds = appkit::send_rect(view, sel!(bounds));
@@ -446,20 +370,12 @@ unsafe fn view_checks(
     }
 }
 
-/// `view` in the light or dark appearance, through AppKit's caching pair, as a
-/// PNG: `(width px, height px, png, flat)` — `flat` when every sampled pixel is
-/// the first one's colour.
+/// Renders `view` in light or dark appearance to PNG bytes `(width, height, png, flat)`.
 ///
 /// # Safety
-/// Main thread; `view` is a live NSView in no window.
+/// Must be called on the main thread while `view` is a live `NSView`.
 unsafe fn capture(view: Id, dark: bool) -> Option<(usize, usize, Vec<u8>, bool)> {
-    // SAFETY: `+appearanceNamed:` is `+(NSAppearance *)(NSString *)`, +0, given
-    // AppKit's own name global; `-setAppearance:` `-(void)(id)`; the caching
-    // pair `-(NSBitmapImageRep *)(NSRect)` and `-(void)(NSRect, id)`; the rep's
-    // accessors `-(NSInteger)` and `-(unsigned char *)`;
-    // `-representationUsingType:properties:` `-(NSData *)(NSUInteger, id)`;
-    // `-length` `-(NSUInteger)` and `-getBytes:length:` `-(void)(void *,
-    // NSUInteger)` into a buffer of exactly that length.
+    // SAFETY: Main thread; `NSAppearance` and `NSBitmapImageRep` selectors match their Objective-C signatures.
     unsafe {
         let look = appkit::send_id_id(
             class(c"NSAppearance").as_id(),
@@ -523,9 +439,7 @@ fn panel_window(mtm: MainThread, findings: &mut Findings) {
         return;
     };
     let p = panel.id();
-    // SAFETY: main thread; read-only `-(NSUInteger)`, `-(NSInteger)`, `-(BOOL)`
-    // and `-(id)` accessors on the live, never-shown panel; then `-setDelegate:`
-    // nil before it goes.
+    // SAFETY: Main thread; read-only window property selectors and `-setDelegate:nil` on a live `NSPanel`.
     unsafe {
         let mask = appkit::send_usize(p, sel!(styleMask));
         findings.check(mask == consts::NS_WINDOW_STYLE_MASK_UTILITY_PANEL, || {
@@ -559,11 +473,6 @@ fn panel_window(mtm: MainThread, findings: &mut Findings) {
         }
         let title = appkit::nsstring_to_rust(appkit::send_id(p, sel!(title)));
         findings.check(title == "aterm", || format!("title {title:?}"));
-        // The window holds the whole layout: its content rect is the size the same
-        // words lay out to in no window. `-setContentView:` fits the view to the
-        // window's first square, so a panel sized from the view's bounds kept that
-        // square and cut off the buttons under taller words (measured live
-        // 2026-10-16: a 384-point frame around 540 points of words).
         match live::preview(mtm, &content, false) {
             Some(bare) => {
                 let laid = appkit::send_rect(bare.view.as_id(), sel!(frame));
@@ -589,8 +498,6 @@ fn panel_window(mtm: MainThread, findings: &mut Findings) {
         findings.check(delegate == preview.target.as_id(), || {
             "the panel's delegate is not its target".to_string()
         });
-        // The tile lights up from one hover area active always (cursor rects
-        // work only in the key window, which the panel never is).
         match preview.tile.as_ref() {
             Some(tile) => {
                 let areas = appkit::send_id(tile.as_id(), sel!(trackingAreas));
@@ -609,8 +516,6 @@ fn panel_window(mtm: MainThread, findings: &mut Findings) {
                     count == 1 && options == consts::NS_TRACKING_HOVER_IN_VISIBLE_RECT,
                     || format!("the tile has {count} tracking area(s), options {options:#x}"),
                 );
-                // What that area drives: the pointer coming over the live tile
-                // lights it, and leaving puts it out.
                 appkit::send_v_id(tile.as_id(), sel!(mouseEntered:), Id::NIL);
                 let entered = tile.hovered();
                 appkit::send_v_id(tile.as_id(), sel!(mouseExited:), Id::NIL);
@@ -631,16 +536,12 @@ fn panel_window(mtm: MainThread, findings: &mut Findings) {
 /// private, uniquely named pasteboard, never the owner's clipboard, and read
 /// back type by type.
 fn payload(findings: &mut Findings) {
-    // SAFETY: main thread; the item is built as the drag builds it.
+    // SAFETY: Main thread; builds the pasteboard item for `AWKWARD_BUNDLE`.
     let Some(item) = (unsafe { live::pasteboard_item(Path::new(AWKWARD_BUNDLE)) }) else {
         findings.check(false, || "no drag payload was built".to_string());
         return;
     };
-    // SAFETY: main thread. `+pasteboardWithUniqueName` is `+(NSPasteboard *)`,
-    // +0, a pasteboard of this process's own; `-clearContents` is
-    // `-(NSInteger)`; `-writeObjects:` `-(BOOL)(NSArray *)`; `-stringForType:`/
-    // `-propertyListForType:` `-(id)(NSPasteboardType)`, +0; `-releaseGlobally`
-    // `-(void)` gives the pasteboard back.
+    // SAFETY: Main thread; operates on a unique process-local `NSPasteboard` and releases it globally.
     unsafe {
         let board = appkit::send_id(
             class(c"NSPasteboard").as_id(),
@@ -694,9 +595,7 @@ fn symbols(findings: &mut Findings) {
         let Ok(symbol) = std::ffi::CString::new(*name) else {
             continue;
         };
-        // SAFETY: `dlsym` with `RTLD_DEFAULT` and a C string; a non-null answer
-        // is the address of an exported `CFStringRef`/`NSString *` constant,
-        // read once and only as a string.
+        // SAFETY: `dlsym` with `RTLD_DEFAULT` and a NUL-terminated symbol name returns a valid `NSString *` symbol or null.
         let value = unsafe {
             let at = dlsym(RTLD_DEFAULT, symbol.as_ptr()).cast::<Id>();
             if at.is_null() {
@@ -742,8 +641,7 @@ fn encodings(findings: &mut Findings) {
         ),
     ];
     for (proto, cls, name) in rows {
-        // SAFETY: `cls` is a registered class and `name` an interned selector;
-        // the protocol is looked up, never registered here.
+        // SAFETY: `cls` is a registered class and `name` is an interned selector.
         let (got, want) = unsafe {
             (
                 aterm_objc::method_types(cls, name).map(|t| aterm_objc::strip_method_offsets(&t)),

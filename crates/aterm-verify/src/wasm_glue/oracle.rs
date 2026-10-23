@@ -1,35 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `wasm-glue` check's oracle row: the toy's goldens and `drive.mjs` held
-//! to wasm-bindgen 0.2.108, the code `verify glue` replaces
-//! (docs/AUDIT-third-party-2026-10-15.md, wasm-platform WP.6).
-//!
-//! 1. Write a `#[wasm_bindgen]` twin of the toy: its source with `#[export]`
-//!    spelled `#[wasm_bindgen]` and its host calls bound through wasm-bindgen
-//!    imports ([`twin_source`]), staged as the toy is, with `wasm-bindgen =
-//!    "=0.2.108"` in place of the export feature ([`twin_manifest`]).
-//! 2. Build it (wasm32, release, offline) and bind it with the wasm-bindgen
-//!    0.2.108 CLI in both flavors. STOCK EXCEPTION as for the toy: rustup's
-//!    `stable` carries the wasm32 std Trust lacks, and the crate comes from
-//!    cargo's registry cache. Nothing it builds is in the workspace.
-//! 3. Run `drive.mjs` on that glue. Every check must hold but the two it marks
-//!    STRICTER (`another class`, and the misuse throws), and `another class`
-//!    must fail in both flavors: the NEGATIVE CONTROL that shows the run was
-//!    wasm-bindgen's and not vacuous ([`judge_drive`]).
-//! 4. The generated .d.ts: each flavor's golden and wasm-bindgen must have
-//!    the same top-level declarations and class/interface members, with
-//!    their owning declarations, names, types and parameters included
-//!    ([`declarations`]). Declaration order, comments and the raw `InitOutput`
-//!    interface (the ABI's own) are not compared. NEGATIVE CONTROL: the
-//!    golden with one parameter renamed must not match.
-//!
-//! The 0.2.108 CLI is looked for on PATH, beside rustup, in the checkout's
-//! `target/tooling` and in the machine's `tooling` ([`host_tooling`]), where
-//! `targo --unverified verify provision --record` lays it for every checkout
-//! (adopting a copy already there at the pin). A machine without
-//! node, the stable wasm32 std or the CLI skips the row with the fix.
-//! Progress goes to the caller's log, never the terminal.
+//! `wasm-glue` oracle lane holding toy goldens and `drive.mjs` against `wasm-bindgen` 0.2.108.
+//! STOCK EXCEPTION: `rustup`'s `stable` carries the `wasm32` `std` that Trust lacks.
 
 use aterm_uds::output::CommandOutput as _;
 use std::fmt::Write as _;
@@ -41,22 +14,13 @@ use super::Flavor;
 use super::toy::{STEM, flavor_name, golden_dir, toy_dir};
 use crate::perf::{LaneRun, Status};
 
-/// The wasm-bindgen the goldens are held to, crate and CLI: the version both
-/// web modules left (aterm-wasm at WP.7, aterm-gpu-web at WP.8). This row is
-/// the only user of the CLI: no module aterm ships is bound with it. The pin is
-/// the `wasm-bindgen` row of `aterm_uds::host::TOOLS` (a `When::Record` row,
-/// which `verify provision --record` provides), which the resolver reads too.
+/// Pinned `wasm-bindgen` crate and CLI version.
 pub const BINDGEN: &str = aterm_uds::host::pinned_version("wasm-bindgen");
 
 /// The machine-wide tooling directory's name in aterm's user cache.
 const TOOLING: &str = aterm_uds::host::TOOLING;
 
-/// The machine-wide tooling directory under `home` and `xdg_cache`: aterm's
-/// `tooling` in the user's cache ([`crate::user_cache`]: on macOS
-/// `~/Library/Caches/aterm/tooling.noindex`, elsewhere
-/// `$XDG_CACHE_HOME/aterm/tooling`, else `~/.cache/aterm/tooling`).
-/// `verify provision --record` lays the CLI here ([`bindgen_root`]), and this row
-/// reads it from every checkout and worktree; `None` where no home names one.
+/// Machine-wide `tooling` cache directory under `home` and `xdg_cache`.
 #[must_use]
 pub fn tooling(home: Option<&Path>, xdg_cache: Option<&Path>) -> Option<PathBuf> {
     crate::user_cache(std::env::consts::OS, home, xdg_cache, TOOLING)
@@ -68,23 +32,13 @@ pub fn host_tooling() -> Option<PathBuf> {
     crate::host_user_cache(TOOLING)
 }
 
-/// Where the CLI at [`BINDGEN`] is installed under a tooling directory (the
-/// machine-wide one, or a checkout's `target/tooling`): `cargo install
-/// --root`'s root, the binary at `bin/wasm-bindgen`.
+/// Installation root for the pinned `wasm-bindgen` CLI under `tooling`.
 #[must_use]
 pub fn bindgen_root(tooling: &Path) -> PathBuf {
     tooling.join(format!("wasm-bindgen-{BINDGEN}"))
 }
 
-/// `targo --unverified`'s arguments that lay the CLI at [`BINDGEN`], `--locked`
-/// to its own lockfile, ahead of `--root` and a [`bindgen_root`]: `verify
-/// provision --record` runs it into a scratch root it places whole, and the skip
-/// names it where no `$HOME` names the machine's tooling. `--force` because each runs it only
-/// where the root holds no wasm-bindgen that answers the pin, and cargo
-/// replaces neither one its records there do not know (laid by hand: it
-/// refuses) nor one they call current (one that stopped answering: it says
-/// "already installed" and builds nothing). The root is the pin's alone, so
-/// nothing else is overwritten.
+/// `targo --unverified` arguments to install the pinned `wasm-bindgen-cli`.
 pub const BINDGEN_INSTALL: [&str; 6] = [
     "install",
     "wasm-bindgen-cli",
@@ -100,8 +54,7 @@ fn reported_version(stdout: &str) -> Option<&str> {
     stdout.lines().next()?.split_whitespace().nth(1)
 }
 
-/// Whether a `wasm-bindgen --version` stdout reports exactly [`BINDGEN`]: a
-/// substring test reads 0.2.1080 as 0.2.108.
+/// Returns whether a `wasm-bindgen --version` stdout reports [`BINDGEN`] exactly.
 #[must_use]
 pub fn reports_pin(stdout: &str) -> bool {
     reported_version(stdout) == Some(BINDGEN)
@@ -219,8 +172,7 @@ const TWIN_HOST: &str = r#"mod host {
 const TOY_USE: &str = "use aterm_wasm_abi::{export, host, panic_hook};";
 const TOY_RUNTIME: &str = "aterm_wasm_abi::export_runtime!();";
 
-/// The row over the checkout at `root`, building in `work`; its progress lines
-/// are appended to `log`.
+/// Runs the `wasm-glue` oracle check over `root`, building in `work`.
 pub(crate) fn gate(root: &Path, work: &Path, log: &mut String) -> LaneRun {
     let rustup = match super::toy::stable_wasm32() {
         Ok(rustup) => rustup,
@@ -319,8 +271,6 @@ fn read(path: &Path) -> Result<String, String> {
 }
 
 /// The twin's source: the toy's, with `#[export]` spelled `#[wasm_bindgen]`
-/// and `export_runtime!()` replaced by wasm-bindgen imports ([`TWIN_HOST`]).
-///
 /// # Errors
 /// The toy no longer has a line the rewrite needs.
 fn twin_source(toy: &str) -> Result<String, String> {
@@ -343,8 +293,6 @@ fn twin_source(toy: &str) -> Result<String, String> {
 }
 
 /// The staged toy manifest with its `[dependencies]` table replaced: the
-/// pinned wasm-bindgen, and aterm-wasm-abi without the export layer.
-///
 /// # Errors
 /// The manifest has no `[dependencies]` table to replace.
 fn twin_manifest(staged: &str) -> Result<String, String> {
@@ -377,7 +325,7 @@ fn twin_manifest(staged: &str) -> Result<String, String> {
 
 /// `drive.mjs`'s run on wasm-bindgen's glue, judged: it must fail, and only
 /// the checks it marks STRICTER ([`stricter`]), `another class` among them in
-/// both flavors. The findings; none is a pass.
+/// both flavors.
 fn judge_drive(passed: bool, stderr: &str) -> Vec<String> {
     let mut findings = Vec::new();
     let fails: Vec<&str> = stderr
@@ -431,10 +379,6 @@ fn stricter(line: &str) -> bool {
 /// Compare the toy's generated .d.ts shape, not general TypeScript: each
 /// declaration occupies one line, and an exported class or interface has
 /// its opening brace on the header and a closing brace on its own line.
-/// Keep the header and qualify each member with it, so sorting ignores
-/// declaration order without losing class identity or member ownership.
-/// All other non-comment lines remain; only `InitOutput`'s interface is
-/// omitted because it describes the generators' different raw Wasm ABIs.
 fn declarations(dts: &str) -> Vec<String> {
     let (mut found, mut owner) = (Vec::new(), None);
     for line in dts.lines().map(str::trim) {
@@ -479,7 +423,7 @@ fn missing_from<'a>(a: &'a [String], b: &[String]) -> Vec<&'a str> {
 
 /// One flavor's golden .d.ts against wasm-bindgen's `theirs` declarations,
 /// and the NEGATIVE CONTROL: the golden with its first `(v: ` parameter
-/// renamed must not match. The findings; none is a pass.
+/// renamed must not match.
 fn judge_declarations(flavor: &str, golden: &str, theirs: &[String]) -> Vec<String> {
     let mut findings = Vec::new();
     let ours = declarations(golden);
@@ -557,18 +501,15 @@ mod tests {
     #[test]
     fn the_drive_verdict_wants_exactly_the_stricter_failures() {
         assert_eq!(judge_drive(false, RUN), Vec::<String>::new());
-        // A glue that held `another class` is not wasm-bindgen's.
         let held = RUN.replace("wasm-glue: FAIL web classes another class: no throw\n", "");
         let found = judge_drive(false, &held);
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("held on web"), "{found:?}");
-        // A conversion wasm-bindgen gets otherwise is a finding.
         let extra = RUN.replace(
             "wasm-glue: 3",
             "wasm-glue: FAIL nodejs scalars u32 max is unsigned: -1\nwasm-glue: 4",
         );
         assert!(judge_drive(false, &extra)[0].contains("u32 max"));
-        // A run that passed, or died before its count, decided nothing.
         let passed = "wasm-glue: every check held\n";
         assert_eq!(judge_drive(true, passed).len(), 3);
         let died = RUN.replace("wasm-glue: 3 checks FAILED\n", "TypeError: boom\n");
@@ -596,7 +537,7 @@ mod tests {
     }
 
     /// Member order is immaterial; class identity, member ownership,
-    /// properties and parameter names matter. The planted control must run.
+    /// properties and parameter names matter.
     #[test]
     fn a_golden_matches_only_wasm_bindgens_declarations() {
         let theirs = declarations(DTS);
@@ -665,12 +606,10 @@ mod tests {
             "{}",
             found[0]
         );
-        // No `(v: ` to plant in: the control could not run, which is a finding.
         let bare = DTS.replace("(v: ", "(x: ");
         let found = judge_declarations("web", &bare, &declarations(&bare));
         assert_eq!(found.len(), 1);
         assert!(found[0].contains("no `(v: `"), "{found:?}");
-        // A control planted where no declaration sees it passes vacuously.
         let comment = format!("// (v: x\n{DTS}");
         let found = judge_declarations("web", &comment, &theirs);
         assert!(found[0].contains("matched wasm-bindgen's"), "{found:?}");
@@ -688,9 +627,7 @@ mod tests {
 
     /// Only a wasm-bindgen that answers exactly the pin is found, in the
     /// checkout's `target/tooling` or the machine's `tooling`: a version the
-    /// pin is a prefix of, and one that does not answer, are not. The skip
-    /// installs where the lookup reads. NEGATIVE CONTROL: the machine's is
-    /// read only where a tooling directory is named.
+    /// pin is a prefix of, and one that does not answer, are not.
     #[cfg(unix)]
     #[test]
     fn only_a_bindgen_answering_exactly_the_pin_is_found() {
@@ -708,7 +645,6 @@ mod tests {
             }
             _ => false,
         };
-        // Where the machine names its tooling, the fix is the verb that lays it there.
         assert!(matches!(
             bindgen_skip(&checkout, Some(&machine)).status,
             Status::Skip { fix, .. } if fix == "targo --unverified verify provision --record"
@@ -725,7 +661,6 @@ mod tests {
                 ("exit 1".to_string(), false),
                 (format!("echo 'wasm-bindgen {BINDGEN}'"), true),
             ] {
-                // Replaced, not rewritten in place: a running text file is busy.
                 let _ = std::fs::remove_file(&cache);
                 std::fs::write(&cache, format!("#!/bin/sh\n{body}\n")).expect("stub");
                 std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o755))

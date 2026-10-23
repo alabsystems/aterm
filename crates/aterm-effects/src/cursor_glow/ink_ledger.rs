@@ -20,20 +20,29 @@ pub(crate) struct InkLedger {
     /// The caret cell, whose light the block caret covers.
     caret: Option<(i32, i32)>,
     /// The light laid on each band of each text cell so far, per channel in
+    /// `add_sat` levels: `lines` slot-major, `stride` cells a slot,
+    /// [`Self::BANDS`] bands a cell, top first.
     laid: Vec<[f32; 3]>,
     stride: usize,
     /// The pair the account keeps legible: the stroke's ink and the page.
     pair: (u32, u32),
     /// What lies under each text cell's letters before any light (the page,
+    /// or the bed's composite over it), `lines` slot-major as `laid` is, one
+    /// entry a cell.
     under: Vec<u32>,
     /// Each text cell's letter ink, as `under` (the pair's ink, or the
+    /// frame's own cell's).
     ink: Vec<u32>,
     /// [`Self::admit_quads`]'s scratch: the text cells one light reaches
+    /// (indices into `under`), and the summed light on each of their pixels,
+    /// cell-major.
     reached: Vec<usize>,
     px: Vec<[f32; 3]>,
     /// Each reached cell's brightest pixel per band and channel, cell-major
+    /// ([`Self::quad_peaks`]).
     peaks: Vec<[f32; 3]>,
     /// The text cells the light being masked keeps less than its whole
+    /// strength over ([`Self::admit_masked`]).
     dims: Vec<Dim>,
     /// The masked light's pieces, spliced back over the light they cut.
     pieces: Vec<GlowQuad>,
@@ -45,10 +54,13 @@ pub(crate) struct InkLedger {
     #[cfg(test)]
     uniform: bool,
     /// A print of every cut this frame's masked lights took (each dimmed
+    /// cell and the share it kept), so a frame whose cuts differ prints
+    /// differently ([`CursorGlow::over_ink_print`]).
     print: u64,
 }
 
 /// One text cell a light was admitted over at less than its whole strength:
+/// the cell's pixel box and the share of the light it keeps.
 #[derive(Clone, Copy, Debug)]
 struct Dim {
     x0: f32,
@@ -87,6 +99,8 @@ impl InkLedger {
     const FEATHER_STEP: i32 = 2;
 
     /// The account index of band 0 of text cell `(row, col)`, or `None` for a
+    /// cell the account does not hold (off every line, past the grid, or the
+    /// caret's own).
     #[inline]
     const fn slot(&self, row: i32, col: i32) -> Option<usize> {
         if matches!(self.caret, Some((cr, cc)) if cr == row && cc == col)
@@ -110,6 +124,7 @@ impl InkLedger {
     }
 
     /// The text cell at `(row, col)`'s index into `under`, as
+    /// [`Self::slot`] finds it.
     #[inline]
     const fn cell(&self, row: i32, col: i32) -> Option<usize> {
         match self.slot(row, col) {
@@ -159,6 +174,8 @@ impl InkLedger {
     }
 
     /// Whether the account's ink keeps `floor` over `ground` under `lift`,
+    /// with ink and ground lifted together and clipped at 255 as `add_sat`
+    /// does.
     #[inline]
     fn reads_with(
         table: &crate::color_math::RelativeLuminanceTable,
@@ -176,6 +193,7 @@ impl InkLedger {
     }
 
     /// The largest share `0..=1` of `add` account `at` can still take while
+    /// the account's ink keeps `floor` over what lies under that cell.
     fn room(&self, at: usize, add: [f32; 3], floor: f32) -> f32 {
         if add == [0.0; 3] {
             return 1.0;
@@ -326,6 +344,11 @@ impl InkLedger {
     }
 
     /// The light `quads` (its additive quads; source-over ones pass
+    /// uncharged) lays on each band of each text cell it reaches, summed as
+    /// the renderer adds it (a gradient quad at each column's own value):
+    /// fills `reached` (indices into `under`) and `peaks` (each band's
+    /// brightest pixel per channel, [`Self::BANDS`] a cell), and says whether
+    /// it reaches any.
     fn quad_peaks(&mut self, quads: &[GlowQuad]) -> bool {
         let (ox, oy, cw, ch) = self.grid;
         let (cwi, chi) = (cw as i32, ch as i32);
@@ -420,6 +443,7 @@ impl InkLedger {
     }
 
     /// Window px of the top-left corner of text cell `cell` (an index into
+    /// `under`).
     #[inline]
     const fn cell_origin(&self, cell: usize) -> (i32, i32) {
         let (ox, oy, cw, ch) = self.grid;
@@ -526,6 +550,9 @@ impl InkLedger {
     }
 
     /// The share of a masked light kept at window px `(x, y)`: each dimmed
+    /// cell's share inside it, rising to the whole light over the feather's
+    /// reach off its box (a smoothstep of the normalised distance), the
+    /// least of every dimmed cell's.
     #[inline]
     fn mask_at(&self, x: f32, y: f32) -> f32 {
         let (_, _, cw, ch) = self.grid;
@@ -549,6 +576,9 @@ impl InkLedger {
     }
 
     /// Fill `knots_x`/`knots_y` with the slice edges of the box
+    /// `[x0, x1) × [y0, y1)` against the dimmed cells: its own edges, each
+    /// dimmed cell's edges, and the feather's slices off them, inside the
+    /// box.
     fn knots(&mut self, (x0, y0, x1, y1): (i32, i32, i32, i32)) -> bool {
         let (_, _, cw, ch) = self.grid;
         let (fx, fy) = (
@@ -595,6 +625,10 @@ impl InkLedger {
     }
 
     /// One quad of a masked light, cut into the pieces [`Self::mask_at`]
+    /// asks for, into `out`: a source-over quad, or one no dimmed cell's
+    /// feather reaches, whole; otherwise each slice a gradient piece whose
+    /// ends carry the quad's own colour there times the mask there (the
+    /// column law makes a piece's ends meet its neighbours').
     fn mask_quad(&mut self, q: GlowQuad, out: &mut Vec<GlowQuad>) {
         let (x0, y0) = (i32::from(q.x), i32::from(q.y));
         let (x1, y1) = (x0 + i32::from(q.w), y0 + i32::from(q.h));
@@ -706,6 +740,9 @@ impl InkLedger {
     }
 
     /// One radial halo's account, cell by cell ([`Self::admit_halos_masked`]):
+    /// each text cell it reaches is charged the share of the halo its bands
+    /// can take down to `floor` at the halo's falloff there, and a cell that
+    /// keeps less than the whole halo joins `dims`.
     fn halo_dims(&mut self, (cx, cy): (f32, f32), (rx, ry): (f32, f32), premul: u32, floor: f32) {
         if rx <= 0.0 || ry <= 0.0 {
             return;

@@ -1,38 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The disk watch's pass: which tier a measured level admits, where each tier
-//! stops, and the order of a unit's steps (design
-//! `docs/DESIGN-disk-awareness-2026-10-17.md` §6.1).
-//!
-//! The Tier-1 bind is `crates/aterm-agent/tests/conformance_disk_pass.rs`: it
-//! drives the real `pass_plan` and `apply_auto` with scripted re-measures and
-//! removals and holds every step they take to this model's guards.
+//! The disk watch's pass.
 
 use aterm_spec::derive::Model;
 
-/// THE PASS. `measured` is the level the look read (0 ok, 1 low, 2 short, 3
-/// emergency), once (`looked`); `demand` an agent's adopted wait. `tier` is the
-/// tier running (0 none yet, 1 ended owners, 2 idle `incremental/`, 3 whole
-/// idle build directories, 4 recent `incremental/`), reached in order through
-/// `Admit<n>`; `stopped` says it stopped at its target. `free` is the last
-/// re-measure against the running tier's target (0 below the emergency, 1
-/// below the floor, 2 below the target, 3 at or above it); tier 1 takes all
-/// and reads none. A unit is `Journal` (its intent on record), then for a
-/// whole one (tiers 1 and 3) `LockHeld` (every lock of every profile taken and
-/// the recheck passed) or `LockRefused`, then `Remove`. The reserve is
-/// released before any tier, at a measured emergency only.
-///
-/// History variables carry what an action did: `unjournalled` (a removal with
-/// no intent), `unheld` (a whole removal without its locks), `recent_by` (the
-/// measured level plus one when tier 4 was admitted), `released_at` (the level
-/// the reserve was released at), `past_target` (a unit removed after free
-/// space reached its tier's target), `whole_at_low` (tier 3 admitted at a
-/// measured `low` with no demand).
-///
-/// Each invariant has its own mutant (`Buggy = n`): `RemoveUnjournalled` (1),
-/// `RemoveUnheld` (2), `AdmitRecentOnDemand` (3), `ReleaseOnDemand` (4),
-/// `JournalPastTarget` (5), `AdmitWholeAtLow` (6).
+/// THE PASS.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn disk_reclaim_pass_model() -> Model {
@@ -55,19 +28,15 @@ pub fn disk_reclaim_pass_model() -> Model {
             var past_target = 0;
             var whole_at_low = 0;
 
-            // The look's one measure.
             action MeasureOk when (looked == 0) { looked = 1; measured = 0; free = 3; }
             action MeasureLow when (looked == 0) { looked = 1; measured = 1; free = 2; }
             action MeasureShort when (looked == 0) { looked = 1; measured = 2; free = 1; }
             action MeasureEmergency when (looked == 0) { looked = 1; measured = 3; free = 0; }
-            // An agent's wait adopted before the first tier.
             action Adopt when (looked == 1 && tier == 0 && demand == 0) { demand = 1; }
-            // The reserve, first, at a measured emergency.
             action ReleaseReserve when (looked == 1 && tier == 0 && reserve == 1 && measured == 3) {
                 reserve = 0;
                 released_at = measured;
             }
-            // The tiers, in order, each at the level that admits it.
             action Admit1 when (looked == 1 && tier == 0 && (measured > 0 || demand == 1)) {
                 tier = 1;
                 stopped = 0;
@@ -93,13 +62,11 @@ pub fn disk_reclaim_pass_model() -> Model {
                 held = 0;
                 recent_by = measured + 1;
             }
-            // The re-measure before a row of a tier with a target.
             action ReadBelowEmergency when (tier > 1 && stopped == 0 && intent == 0) { free = 0; }
             action ReadBelowFloor when (tier > 1 && stopped == 0 && intent == 0) { free = 1; }
             action ReadBelowTarget when (tier > 1 && stopped == 0 && intent == 0) { free = 2; }
             action ReadAtTarget when (tier > 1 && stopped == 0 && intent == 0) { free = 3; }
             action Stop when (tier > 1 && stopped == 0 && intent == 0 && free == 3) { stopped = 1; }
-            // One unit: its intent, its locks (a whole unit), its removal.
             action Journal when (
                 tier > 0 && stopped == 0 && intent == 0 && (tier == 1 || free <= 2)
             ) {
@@ -117,7 +84,6 @@ pub fn disk_reclaim_pass_model() -> Model {
                 held = 0;
             }
 
-            // Mutants (dead at Buggy = 0), one per invariant.
             action RemoveUnjournalled when (Buggy == 1 && tier > 0 && intent == 0) {
                 unjournalled = 1;
             }
@@ -168,25 +134,7 @@ pub fn disk_reclaim_pass_model() -> Model {
     }
 }
 
-/// THE WAIT (`await sys`, design §3.3). `reply` is 0 while parked, then 1 met,
-/// 2 unmet, 3 timed out or 4 stalled; `free_ok` whether the reading the wait
-/// last read holds its terms; `beat_old` whether the watch's beat is a minute
-/// old; `watch` 0 running, 1 suspended (a seamless successor before its
-/// Commit); `pass` the last pass for this wait's demand: 0 none, 1 running,
-/// 2 spent (every tier it may, free still short), 3 stopped for another
-/// reason; `demand` 1 while the wait's demand is on the board.
-///
-/// The world moves freely while the wait is parked (readings, beats, the
-/// host suspended and back, passes); the wait's answers are `Met`, `Unmet`,
-/// `Stall` and `Timeout`, each taking the demand off the board.
-///
-/// Each invariant has its own mutant (`Buggy = n`): `MetStale` (1, latches on
-/// a reading that does not hold), `UnmetStopped` (2, unmet on a pass that
-/// stopped for another reason), `StallFresh` (3, stalls while a long pass
-/// beats), `StallSuspended` (4, stalls while the host is suspended),
-/// `ReplyKeepsDemand` (5, answers and leaves its demand registered),
-/// `LoseTimer` (1, a park that drops its deadline: the wait never ends, the
-/// liveness's mutant too).
+/// THE WAIT (`await sys`, design §3.3).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn disk_await_model() -> Model {
@@ -201,7 +149,6 @@ pub fn disk_await_model() -> Model {
             var demand = 1;
             var timer = 1;
 
-            // The world, while the wait is parked.
             action ReadHolds when (reply == 0) { free_ok = 1; }
             action ReadShort when (reply == 0) { free_ok = 0; }
             action BeatFresh when (reply == 0) { beat_old = 0; }
@@ -213,7 +160,6 @@ pub fn disk_await_model() -> Model {
             action PassStops when (reply == 0 && pass == 1) { pass = 3; }
             action PassAgain when (reply == 0 && pass == 3) { pass = 1; }
 
-            // The wait's answers.
             action Met when (reply == 0 && free_ok == 1) { reply = 1; demand = 0; }
             action Unmet when (reply == 0 && free_ok == 0 && demand == 1 && pass == 2) {
                 reply = 2;
@@ -227,7 +173,6 @@ pub fn disk_await_model() -> Model {
             }
             action Timeout when (reply == 0 && timer == 1) { reply = 3; demand = 0; }
 
-            // Mutants (dead at Buggy = 0), one per invariant.
             action MetStale when (Buggy == 1 && reply == 0 && free_ok == 0) {
                 reply = 1;
                 demand = 0;
@@ -262,10 +207,7 @@ pub fn disk_await_model() -> Model {
     }
 }
 
-/// AN AWAIT ENDS (`[]<>(reply ≠ 0)`): a parked wait answers, at the latest at
-/// its timeout. Fairness: `Timeout` (the caller's patience runs out). The
-/// world is not fair: readings, beats and passes may go on forever.
-/// `LoseTimer` alone breaks it.
+/// AN AWAIT ENDS (`[]<>(reply ≠ 0)`): a parked wait answers, at the latest at its timeout.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::liveness(disk_await_model)]

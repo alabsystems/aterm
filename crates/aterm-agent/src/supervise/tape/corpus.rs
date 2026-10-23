@@ -151,6 +151,7 @@ pub fn render(rows: &[Checked]) -> String {
 }
 
 /// One name a scrub takes: its bytes, its token, and whether it is a word
+/// (a user, a host) or a path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Rule {
     from: Vec<u8>,
@@ -170,6 +171,7 @@ fn path_goes_on(b: u8) -> bool {
 }
 
 /// Whether a word goes on with `b` ([`Scrub`]): an ASCII letter, or a byte of
+/// a character past ASCII.
 fn word_goes_on(b: u8) -> bool {
     b.is_ascii_alphabetic() || b >= 0x80
 }
@@ -226,6 +228,9 @@ impl Scrub {
     }
 
     /// Take `from` as `to`, and — where the press guard spells it otherwise
+    /// (a `.` as `\.`, a space as `\x20`: `policy::guard::row_guard`, which
+    /// writes the `key if=<re>` a press is bound to the judged row by) — its
+    /// guard spelling as the token's.
     fn add(&mut self, from: &[u8], to: &str, word: bool) {
         let mut push = |from: Vec<u8>, to: String| {
             if !self.rules.iter().any(|r| r.from == from) {
@@ -383,6 +388,7 @@ impl Scrub {
 }
 
 /// Where `needle` stands in `text`, ASCII case aside: the 1-based line of
+/// each place.
 fn found(text: &str, needle: &[u8], word: bool) -> Vec<usize> {
     let hay = text.as_bytes();
     let mut lines = Vec::new();
@@ -535,6 +541,7 @@ pub struct Promoted {
 }
 
 /// The requests a replay's loop asked that are acts, in order, each word
+/// passed through `map`.
 fn acts_asked(report: &Report, map: impl Fn(&str) -> String) -> Vec<Vec<String>> {
     report
         .requests

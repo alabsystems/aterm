@@ -1,22 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The response-framing primitives every verb shares: glyph sanitization and
-//! the one collapse-and-trim rule for a row of text ([`push_visible`]) with its
-//! blank-tail count ([`trimmed_len`]), percent-encoding for single-token fields,
-//! the one JSON escape and the typed record sinks ([`fields`]) (these three
-//! re-exported from `aterm_codec`), and the one reading of a wait verb's `<ms>`
-//! ([`wait_ms`]).
-//! `aterm-gui`'s `control` module re-exports them, so the poll face, the push
-//! face and the asciicast emitter produce identical bytes; keep one copy.
+//! The response-framing primitives every verb shares: glyph sanitization and the one collapse-and-trim rule for a row of text ([`push_visible`]) with its blank-tail count ([`trimmed_len`]), percent-encoding for single-token fields, the one JSON escape and the typed record sinks ([`fields`]) (these three re-exported from `aterm_codec`), and the one reading of a wait verb's `<ms>` ([`wait_ms`]).
 
-/// Map a [`RenderCell`](aterm_core::terminal::RenderCell) char to its on-screen
-/// glyph, collapsing NUL/control chars to a space. Shared so the push face
-/// produces byte-identical rows to the poll face.
+/// Map a [`RenderCell`](aterm_core::terminal::RenderCell) char to its on-screen glyph, collapsing NUL/control chars to a space.
 #[must_use]
 #[inline]
 pub const fn visible_char(ch: char) -> char {
-    // NUL and the rest of `char::is_control` (general category Cc), spelled
     // out: `is_control` is not a `const fn` on stable Rust.
     if matches!(ch, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}') {
         ' '
@@ -30,22 +20,13 @@ pub const fn visible_char(ch: char) -> char {
 pub enum VisibleTrim {
     /// Nothing: `offscreen`'s archived rows, stored already shown and trimmed.
     None,
-    /// Trailing U+0020 only: `line`'s rule. Its row is the line as written,
-    /// blanks the program wrote included, so the spaces padding it go while a
-    /// written NBSP or U+3000 stays text.
+    /// Trailing U+0020 only: `line`'s rule.
     Spaces,
-    /// Trailing Unicode White_Space ([`str::trim_end`]): a screen row as `text`,
-    /// the `status` hash and `cast drift` read it ([`visible_row`]), and each row
-    /// of `blocktext`.
+    /// Trailing Unicode White_Space ([`str::trim_end`]): a screen row as `text`, the `status` hash and `cast drift` read it ([`visible_row`]), and each row of `blocktext`.
     Whitespace,
 }
 
-/// Append `s` to `out` as the wire shows text: every NUL and control char a
-/// space ([`visible_char`]), then the appended text's tail trimmed per `trim`,
-/// so a row ending in a control char ends no differently from one ending in a
-/// blank. What `out` held is never changed. Text with no control char (nearly
-/// every row) costs one `push_str` and a scan. The collapse-and-trim rule:
-/// [`visible_row`], `line`, `offscreen` and `blocktext` all append through it.
+/// Append `s` to `out` as the wire shows text: every NUL and control char a space ([`visible_char`]), then the appended text's tail trimmed per `trim`, so a row ending in a control char ends no differently from one ending in a blank.
 pub fn push_visible(out: &mut String, s: &str, trim: VisibleTrim) {
     let start = out.len();
     out.push_str(s);
@@ -55,9 +36,6 @@ pub fn push_visible(out: &mut String, s: &str, trim: VisibleTrim) {
 /// [`push_visible`]'s rule applied to the text already at `out[start..]`.
 fn show_tail(out: &mut String, start: usize, trim: VisibleTrim) {
     if out[start..].chars().any(|c| visible_char(c) != c) {
-        // Rare (a control char a cell or a stored line kept): the collapse can
-        // shorten the text (a C1 char is two bytes, its space one), so the tail
-        // is rebuilt rather than patched.
         let raw = out.split_off(start);
         out.extend(raw.chars().map(visible_char));
     }
@@ -69,26 +47,14 @@ fn show_tail(out: &mut String, start: usize, trim: VisibleTrim) {
     out.truncate(kept);
 }
 
-/// Whether `row` shows nothing: every char is whitespace once collapsed
-/// ([`visible_char`]), so [`push_visible`] under [`VisibleTrim::Whitespace`]
-/// appends nothing for it. A raw line and its shown form answer alike, so a
-/// reply can count its blank tail before it frames a row.
+/// Whether `row` shows nothing: every char is whitespace once collapsed ([`visible_char`]), so [`push_visible`] under [`VisibleTrim::Whitespace`] appends nothing for it.
 #[must_use]
 #[inline]
 pub fn is_blank_row(row: &str) -> bool {
     row.chars().all(|c| visible_char(c).is_whitespace())
 }
 
-/// How many leading rows a reply keeps once its trailing blank rows
-/// ([`is_blank_row`]) are dropped: the index of the last row that is not blank
-/// plus one, and 0 when every row is blank. Interior blank rows are kept, only
-/// the tail goes, so row `i` of a trimmed reply is still row `i` of the read,
-/// and the `line`/`cell`/`search` coordinates an agent reads off it stay valid.
-/// The blank-tail rule: `text trim`, `text --json trim`, `turn … trim=1`,
-/// `blocktext … trim`, `temporal … trim` and the `subscribe … screen,trim` delta
-/// all count with it, so the polled and pushed faces cannot disagree about what
-/// a trailing blank is. The count on a trimmed header is the count of rows
-/// actually sent.
+/// How many leading rows a reply keeps once its trailing blank rows ([`is_blank_row`]) are dropped: the index of the last row that is not blank plus one, and 0 when every row is blank.
 pub fn trimmed_len<'a>(rows: impl Iterator<Item = &'a str>) -> usize {
     rows.enumerate()
         .filter(|(_, r)| !is_blank_row(r))
@@ -97,13 +63,7 @@ pub fn trimmed_len<'a>(rows: impl Iterator<Item = &'a str>) -> usize {
         .unwrap_or(0)
 }
 
-/// The visible, trailing-trimmed text of screen row `r`: the engine's
-/// combining-aware `get_line_text` with interior control chars collapsed to
-/// spaces and the tail trimmed ([`push_visible`] under
-/// [`VisibleTrim::Whitespace`]). The single source for a row's text:
-/// `aterm-gui`'s `visible_row` (behind `text`, `text --json`, the `subscribe
-/// screen` delta and the `status` hash) delegates here, as does `cast drift`.
-/// Caller holds whatever lock guards `t`.
+/// The visible, trailing-trimmed text of screen row `r`: the engine's combining-aware `get_line_text` with interior control chars collapsed to spaces and the tail trimmed ([`push_visible`] under [`VisibleTrim::Whitespace`]).
 #[must_use]
 pub fn visible_row(t: &aterm_core::terminal::Terminal, r: usize) -> String {
     let mut out = String::with_capacity(usize::from(t.cols()));
@@ -111,26 +71,14 @@ pub fn visible_row(t: &aterm_core::terminal::Terminal, r: usize) -> String {
     out
 }
 
-/// [`visible_row`] appended to `out`, with no `String` of its own: the engine
-/// appends the row ([`Terminal::push_line_text`]) and [`push_visible`]'s rule
-/// collapses and trims it where it landed. What `out` held is kept; a row off
-/// the screen appends nothing. The whole-screen text (`aterm-gui`'s
-/// `ScreenText`, built once per frame change) writes every row straight into
-/// its one buffer through this. Caller holds whatever lock guards `t`.
-///
-/// [`Terminal::push_line_text`]: aterm_core::terminal::Terminal::push_line_text
+/// [`visible_row`] appended to `out`, with no `String` of its own: the engine appends the row ([`Terminal::push_line_text`]) and [`push_visible`]'s rule collapses and trims it where it landed.
 pub fn visible_row_into(t: &aterm_core::terminal::Terminal, r: usize, out: &mut String) {
     let start = out.len();
     t.push_line_text(r, out);
     show_tail(out, start, VisibleTrim::Whitespace);
 }
 
-/// The control wire's percent escape under the names verbs and hosts use:
-/// [`pct_encode`] makes one space-free token (non-graphic bytes and `%` as
-/// uppercase `%XX`), [`pct_encode_into`] appends into a caller buffer, and
-/// [`pct_decode`] is the total inverse. The implementation lives in
-/// `aterm_codec::pct` (std plus the dependency-free astream-wire, no platform
-/// code), shared with clients and wasm32 hosts.
+/// The control wire's percent escape under the names verbs and hosts use: [`pct_encode`] makes one space-free token (non-graphic bytes and `%` as uppercase `%XX`), [`pct_encode_into`] appends into a caller buffer, and [`pct_decode`] is the total inverse.
 pub use aterm_codec::pct::{
     decode as pct_decode, encode as pct_encode, encode_into as pct_encode_into,
 };
@@ -148,8 +96,7 @@ pub const fn clamp_wait_ms(ms: u64) -> u64 {
     if ms > WAIT_MAX_MS { WAIT_MAX_MS } else { ms }
 }
 
-/// Resolve an optional `<ms>` wait parameter to [`WAIT_DEFAULT_MS`] when `None`
-/// or `clamp_wait_ms(ms)` when `Some(ms)`.
+/// Resolve an optional `<ms>` wait parameter to [`WAIT_DEFAULT_MS`] when `None` or `clamp_wait_ms(ms)` when `Some(ms)`.
 #[must_use]
 #[inline]
 pub const fn resolve_wait_timeout_ms(requested: Option<u64>) -> u64 {
@@ -174,35 +121,17 @@ pub const fn hangup_slice_ms(remaining_ms: u64, poll_ms: u64) -> u64 {
     if remaining_ms < p { remaining_ms } else { p }
 }
 
-/// A wait verb's `<ms>`: a whole number of milliseconds, held at
-/// [`WAIT_MAX_MS`]. `None` for anything else (`2s`, `1.5`, `-1`, empty), which
-/// the verb answers with its usage line: read leniently, `wait 2s` waited the
-/// whole 30 s default where `turn timeout=2s` and `await consent timeout=2s`
-/// refused it. One reading, so the family cannot disagree again.
+/// A wait verb's `<ms>`: a whole number of milliseconds, held at [`WAIT_MAX_MS`].
 #[must_use]
 #[inline]
 pub fn wait_ms(token: &str) -> Option<u64> {
     token.parse::<u64>().ok().map(clamp_wait_ms)
 }
 
-/// The one JSON string escape under the names every `*_json` emitter, the
-/// `subscribe … cells` frame and the asciicast emitter use: [`json_escape`]
-/// returns a string body (no quotes), [`json_escape_into`] appends into a
-/// caller buffer (the styled frame escapes a glyph per cell). Two-character
-/// escapes for `"`, `\` and the C0 whitespace controls, `\u00XX` for the rest
-/// of C0, and — because a reply is often read raw on a terminal — `\uXXXX`
-/// for every character a terminal acts on or reorders text around (DEL, C1,
-/// the bidi controls, U+2028/U+2029: a cwd from OSC 7 or a command line from
-/// OSC 633 is text a program chose). Still valid JSON that decodes to the same
-/// string; every other character, non-ASCII included, is verbatim UTF-8. The
-/// implementation is `aterm_codec::json`, shared with the supervisor's JSON.
+/// The one JSON string escape under the names every `*_json` emitter, the `subscribe … cells` frame and the asciicast emitter use: [`json_escape`] returns a string body (no quotes), [`json_escape_into`] appends into a caller buffer (the styled frame escapes a glyph per cell).
 pub use aterm_codec::json::{escape as json_escape, escape_into as json_escape_into};
 
-/// The typed record sinks: a producer writes each field once to a
-/// [`fields::FieldSink`], and [`fields::TextSink`] spells the `key=value` line
-/// while [`fields::JsonSink`] spells the `--json` object, so a verb's two forms
-/// come from one emit function. Shared with the supervisor, which reaches
-/// `aterm_codec` but not this crate.
+/// The typed record sinks: a producer writes each field once to a [`fields::FieldSink`], and [`fields::TextSink`] spells the `key=value` line while [`fields::JsonSink`] spells the `--json` object, so a verb's two forms come from one emit function.
 pub use aterm_codec::fields;
 
 /// A JSON string member, escaping both its key and value.
@@ -216,9 +145,7 @@ pub fn json_str_field(key: &str, val: &str) -> String {
     out
 }
 
-/// Wrap a one-line JSON object body in the read-verb framing:
-/// `OK 1\n<json>\n`, the same `OK <n>` framing as the other read verbs, so
-/// clients stream it unchanged.
+/// Wrap a one-line JSON object body in the read-verb framing: `OK 1\n<json>\n`, the same `OK <n>` framing as the other read verbs, so clients stream it unchanged.
 #[must_use]
 pub fn json_ok(body: &str) -> String {
     format!("OK 1\n{body}\n")
@@ -263,9 +190,7 @@ mod tests {
     }
 
     /// `push_visible` collapses first and trims second, under each rule, and
-    /// never touches what the buffer held. Negative control: trimming before the
-    /// collapse (the order `text order=display` reads its rows in) leaves a space
-    /// where a row ends in a control char.
+    /// never touches what the buffer held.
     #[test]
     fn push_visible_collapses_then_trims_each_rule() {
         use VisibleTrim::{None, Spaces, Whitespace};
@@ -305,8 +230,7 @@ mod tests {
 
     /// The blank rule counts a raw line and its shown form alike, which is what
     /// lets `blocktext` count its tail before it frames a row; interior blank rows
-    /// stay. Negative control: a spaces-only blank test counts an NBSP or a
-    /// control char as content.
+    /// stay.
     #[test]
     fn trimmed_len_is_last_nonblank_plus_one() {
         assert_eq!(trimmed_len(["", "", ""].into_iter()), 0, "all blank");

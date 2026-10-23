@@ -71,6 +71,9 @@ impl Theme {
     }
 
     /// The theme's own selection colour as an SGR truecolour triple
+    /// (aterm-types scheme.rs: the renderer default #33415e, GitHub Light
+    /// #b6e3ff): `context` PAINTS its selected row, since a keypress clears a
+    /// real selection.
     fn selection(self) -> &'static str {
         match self {
             Theme::Dark => "51;65;94",
@@ -575,6 +578,7 @@ pub fn roster_of(prefs: &str) -> Option<Vec<String>> {
 }
 
 /// A running instance and its scratch world: dropped, the instance is stopped
+/// (its process group) before the world is removed (fields drop in order).
 struct Live {
     inst: Instance,
     _world: World,
@@ -671,6 +675,7 @@ impl Shot<'_> {
     }
 
     /// `ctl image …` (`OK <w> <h> <path>`, a file under the instance's
+    /// socket dir), copied to `dest` at once.
     fn grab(&mut self, request: &[&str], dest: &Path) -> bool {
         let r = self.inst.ctl(request);
         let line = r.stdout.lines().next().unwrap_or("");
@@ -738,6 +743,7 @@ impl Shot<'_> {
     }
 
     /// A typed burst, a key per 60 ms (~17 keys/s) unless a frame is slower,
+    /// each followed by a frame: key `mid` is kept as `mid`.
     fn burst(&mut self, mid: Option<u64>, keys: &[String]) -> Result<(), Stopped> {
         self.mark("burst-start");
         let start = self.mark;
@@ -936,6 +942,7 @@ struct Gallery {
 
 impl Gallery {
     /// A fresh world whose `aterm.toml` is `lines` over the lanes-off base,
+    /// the scenario's paint, and the instance started in it (not yet ready).
     fn launch(
         &mut self,
         name: &str,
@@ -1128,6 +1135,8 @@ impl Gallery {
     }
 
     /// Every launched instance must be gone: one still running (its pid
+    /// checked against its own socket in its arguments, so a recycled pid is
+    /// never mistaken) is reported and killed by pid.
     fn survivors(&self) -> u32 {
         let mut alive = 0;
         for (pid, sock, name) in &self.launched {
@@ -1142,6 +1151,7 @@ impl Gallery {
 }
 
 /// Wait for a launched instance to answer and settle: its socket, `ready`,
+/// then half a second with no output.
 fn settle(inst: &mut Instance) -> Result<(), Fail> {
     inst.await_socket(instance::BOOT)?;
     let ready = inst.ctl(&["ready"]);

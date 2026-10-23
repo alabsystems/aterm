@@ -1,59 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `targo --unverified winsign` — Authenticode signing and verification of the
-//! shipped Windows exe: Tier WINDOWS, the twin of the mac lane's Tier APPLE
-//! (`crates/aterm-release/src/sign.rs`).
-//!
-//! # Why: Code Integrity, not SmartScreen
-//!
-//! With Smart App Control on, Windows 11 runs an unsigned exe only while
-//! Microsoft's reputation service allows it; once Code Integrity refuses it
-//! (event 3077), only a signature chaining to a trusted root satisfies the
-//! policy: **Azure Artifact Signing** (formerly Trusted Signing) or a
-//! **publicly trusted code-signing certificate** (EV or OV). A self-signed
-//! certificate satisfies neither, so it is not a lane here.
-//!
-//! # The two states, and nothing in between
-//!
-//! Tier WINDOWS is driven by one committed constant,
-//! `aterm_update_core::pins::WINDOWS_SIGNING_PUBLISHER`:
-//!
-//! * **anchor empty → [`Tier::Inactive`].** Signing is optional: with a lane
-//!   configured the exe is signed and the result reported; without one the
-//!   verbs say what is missing and exit non-zero, so a script that expected a
-//!   signature does not read silence as success. No publisher is required here
-//!   ([`judge`] is `Ok` for every report), though an unsigned exe or untrusted
-//!   chain still exits 1.
-//! * **anchor set → [`Tier::Active`].** Signing is required, and after signing
-//!   the tool reads the signature back off the file: it must verify under the
-//!   default Authenticode policy, its leaf must be issued to the anchored
-//!   publisher, and it must carry a timestamp — or the verb fails. The anchor
-//!   is the leaf certificate's subject Common Name as `signtool verify /v`
-//!   prints it after the last, most indented `Issued to:` of the signing chain
-//!   (signtool lists the root first; see [`parse_verify_output`]), and as
-//!   `winsign verify` prints it after `signed by`.
-//!
-//! # Where each value comes from
-//!
-//! The identity is never in the tree. Precedence is flag > `ATERM_WINSIGN_*`
-//! environment > the credentials profile (`--credentials <file>`, the release
-//! cutter's `key = "value"` grammar, keys `winsign_*`). No lane takes a
-//! password: the thumbprint lane names a certificate already in the user's
-//! store (`signtool /sha1`, never `/f <pfx> /p <password>`), and the Trusted
-//! Signing lane authenticates through Azure identity (an `az login` session or
-//! the `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` triple
-//! when present, else a browser sign-in). The plug-in is a .NET 8 component; a
-//! user-local runtime (`dotnet-install.ps1`) is handed to signtool as
-//! `DOTNET_ROOT`.
-//!
-//! # What it drives
-//!
-//! `signtool.exe` from the Windows SDK (`PATH`, else the newest SDK under the
-//! Windows Kits root) and, for Artifact Signing, the `Azure.CodeSigning.Dlib.dll`
-//! of the client NuGet package. Every decision is pure and tested against a
-//! fake [`Host`]; [`RealHost`] reaches the machine — except that `sign` unlinks
-//! its temporary metadata file through `std::fs` directly.
+//! `targo --unverified winsign`.
 #![allow(
     clippy::disallowed_types,
     reason = "never linked into the shipped binary: Authenticode signing behind targo --unverified winsign"
@@ -66,15 +14,10 @@ use std::process::Command;
 
 pub use aterm_update_core::pins;
 
-// The tier
-
 /// Tier WINDOWS, read off the committed anchor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Tier {
-    /// No anchor: signing is optional and the tier itself refuses nothing —
-    /// but verification is not advisory, because the verdict is Code
-    /// Integrity's: an unsigned exe, or one whose chain the Authenticode
-    /// policy does not trust, is reported and exits 1 in this state too.
+    /// No anchor: signing is optional and the tier itself refuses nothing.
     Inactive,
     /// The anchor names the publisher every shipped exe must be signed by.
     Active {
@@ -115,8 +58,6 @@ impl fmt::Display for Tier {
         }
     }
 }
-
-// The host seam
 
 /// The result of running a tool.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -190,8 +131,7 @@ pub const fn decode_winsign_summary_le(bytes: [u8; 16]) -> (u64, i32, u32) {
     (publisher_hash, code as i32, flags)
 }
 
-/// Everything this tool needs from the machine, behind one trait so every
-/// decision is testable against a fake.
+/// Everything this tool needs from the machine, behind one trait so every decision is testable against a fake.
 pub trait Host {
     fn env(&self, key: &str) -> Option<String>;
     fn is_file(&self, path: &Path) -> bool;
@@ -272,13 +212,10 @@ impl Host for RealHost {
     }
 }
 
-// Configuration: flags > environment > credentials profile
-
-/// The signing lane — which identity signs, and through what.
+/// The signing lane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Lane {
-    /// Azure Trusted Signing: the account and certificate profile on the
-    /// service, reached through the client dlib and Azure identity.
+    /// Azure Trusted Signing.
     TrustedSigning {
         endpoint: String,
         account: String,
@@ -306,7 +243,7 @@ const KEYS: &[&str] = &[
 /// Values gathered from one source, keyed by the bare key name.
 pub type Values = BTreeMap<String, String>;
 
-/// Environment values: `ATERM_WINSIGN_<KEY>`.
+/// Environment values.
 pub fn values_from_env(host: &dyn Host) -> Values {
     KEYS.iter()
         .filter_map(|k| {
@@ -316,8 +253,7 @@ pub fn values_from_env(host: &dyn Host) -> Values {
         .collect()
 }
 
-/// Credentials-profile values: `winsign_<key> = "…"` lines, the release
-/// cutter's grammar (comments, blank lines, quoted strings, nothing else).
+/// Credentials-profile values.
 pub fn values_from_profile(text: &str) -> Result<Values, String> {
     let mut out = Values::new();
     for line in text.lines() {
@@ -355,9 +291,9 @@ pub fn values_from_profile(text: &str) -> Result<Values, String> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
     pub lane: Option<Lane>,
-    /// RFC 3161 timestamp server. `None` = the lane's default.
+    /// RFC 3161 timestamp server.
     pub timestamp: Option<String>,
-    /// An explicit `signtool.exe`; `None` = find it.
+    /// An explicit `signtool.exe`.
     pub signtool: Option<PathBuf>,
 }
 
@@ -421,9 +357,7 @@ pub fn resolve_config(sources: &[&Values]) -> Result<Config, String> {
     })
 }
 
-/// The timestamp server a lane uses when none is configured. Trusted Signing
-/// publishes its own; the DigiCert one is a widely trusted public RFC 3161
-/// responder for store certificates.
+/// The timestamp server a lane uses when none is configured.
 #[must_use]
 pub fn default_timestamp(lane: &Lane) -> &'static str {
     match lane {
@@ -432,21 +366,10 @@ pub fn default_timestamp(lane: &Lane) -> &'static str {
     }
 }
 
-// Finding the tools
-
 /// Join components onto a Windows path with `\`, whatever the build host.
-///
-/// Every path assembled here (SDK layout, NuGet cache, dotnet root) lives on
-/// the machine that signs. `Path::join` uses the build host's separator, so
-/// off Windows it would write `/` and the tests would not exercise the
-/// discovery Windows gets. On Windows the two agree byte for byte: every part
-/// joined is a plain relative name.
 fn win_join<'a>(base: impl Into<PathBuf>, parts: impl IntoIterator<Item = &'a str>) -> PathBuf {
     let mut out = base.into().into_os_string();
     for part in parts {
-        // Neither double a separator the caller already wrote nor put one
-        // after a bare drive (`C:` + `x` is `C:x`, drive-relative, exactly as
-        // Windows' own join has it).
         let tail = out.as_encoded_bytes().last().copied();
         if !matches!(tail, None | Some(b'\\') | Some(b'/') | Some(b':')) {
             out.push("\\");
@@ -474,8 +397,7 @@ pub fn versions_newest_first<'a>(names: impl IntoIterator<Item = &'a str>) -> Ve
 }
 
 /// Resolve a bare program name against `PATH` (Windows executable extensions
-/// tried when the name has none). Host-native joins are right here: `PATH`
-/// comes from the machine this runs on.
+/// tried when the name has none).
 fn find_on_path(host: &dyn Host, program: &str) -> Option<PathBuf> {
     let paths = host.env("PATH")?;
     for dir in std::env::split_paths(&paths) {
@@ -492,8 +414,7 @@ fn find_on_path(host: &dyn Host, program: &str) -> Option<PathBuf> {
     None
 }
 
-/// `signtool.exe`: configured, on `PATH` (a Developer prompt), else the newest
-/// Windows SDK under either program-files root. Every miss is named.
+/// `signtool.exe`.
 pub fn find_signtool(host: &dyn Host, configured: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(p) = configured {
         if host.is_file(p) {
@@ -534,17 +455,12 @@ pub fn find_signtool(host: &dyn Host, configured: Option<&Path>) -> Result<PathB
 }
 
 /// The NuGet package ids that carry the signtool plug-in, newest lineage first.
-/// `Microsoft.Trusted.Signing.Client` was renamed `Microsoft.ArtifactSigning.Client`;
-/// the dll, metadata file and `net8.0` runtime config are the same, so both are
-/// searched and an older cache still signs.
 pub const DLIB_PACKAGES: &[&str] = &[
     "microsoft.artifactsigning.client",
     "microsoft.trusted.signing.client",
 ];
 
-/// `Azure.CodeSigning.Dlib.dll`: configured, else the newest version of the
-/// newest package lineage in [`DLIB_PACKAGES`] under the NuGet cache
-/// (`NUGET_PACKAGES`, else `~\.nuget\packages`).
+/// `Azure.CodeSigning.Dlib.dll`.
 pub fn find_dlib(host: &dyn Host, configured: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(p) = configured {
         if host.is_file(p) {
@@ -592,8 +508,7 @@ pub struct DotnetRuntime {
     pub root: PathBuf,
     /// The newest `Microsoft.NETCore.App` version found there.
     pub version: String,
-    /// A user-local install the host loader would not find on its own: the
-    /// child gets `DOTNET_ROOT` set to `root`.
+    /// A user-local install the host loader would not find on its own.
     pub needs_root_env: bool,
 }
 
@@ -617,10 +532,7 @@ fn dotnet_version_under(host: &dyn Host, root: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Find a .NET runtime the dlib can load, in the order the host loader itself
-/// resolves one: `DOTNET_ROOT`, the machine-wide install under Program Files,
-/// then the user-local install `dotnet-install.ps1` makes without admin — which
-/// the loader does not find by itself, so that one is passed as `DOTNET_ROOT`.
+/// Find a .NET runtime the dlib can load, in the order the host loader itself resolves one.
 pub fn find_dotnet_runtime(host: &dyn Host) -> Result<DotnetRuntime, String> {
     let mut looked = Vec::new();
     let mut candidates: Vec<(PathBuf, bool)> = Vec::new();
@@ -656,8 +568,6 @@ pub fn find_dotnet_runtime(host: &dyn Host) -> Result<DotnetRuntime, String> {
     ))
 }
 
-// Argument shapes (pure)
-
 /// The Trusted Signing metadata file the dlib reads (`/dmdf`).
 #[must_use]
 pub fn trusted_signing_metadata(endpoint: &str, account: &str, profile: &str) -> String {
@@ -684,10 +594,7 @@ pub fn trusted_signing_metadata(endpoint: &str, account: &str, profile: &str) ->
     )
 }
 
-/// `signtool sign …` for one lane over the given files. `/fd SHA256` and an
-/// RFC 3161 `/tr … /td SHA256` timestamp always: a signature without a
-/// timestamp dies with its certificate, and an SHA-1 file digest is refused by
-/// modern policy.
+/// `signtool sign …` for one lane over the given files.
 #[must_use]
 pub fn sign_args(
     lane: &Lane,
@@ -726,9 +633,7 @@ pub fn sign_args(
     a
 }
 
-/// `signtool verify /pa /v <file>` — the default Authenticode policy (`/pa`),
-/// which is the chain Code Integrity and SmartScreen both evaluate; the
-/// verbose form prints the chain this tool reads back.
+/// `signtool verify /pa /v <file>`.
 #[must_use]
 pub fn verify_args(file: &Path) -> Vec<String> {
     vec![
@@ -739,17 +644,14 @@ pub fn verify_args(file: &Path) -> Vec<String> {
     ]
 }
 
-// Reading the verdict back (pure)
-
 /// What `signtool verify /pa /v` said about one file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VerifyReport {
-    /// Exit 0 and "Successfully verified": the chain is trusted under `/pa`.
+    /// Exit 0 and "Successfully verified".
     pub verified: bool,
     /// A signature is present at all.
     pub signed: bool,
-    /// The chain terminates in a root the trust provider does not trust —
-    /// the self-signed case, and the one Code Integrity refuses.
+    /// The chain terminates in a root the trust provider does not trust.
     pub untrusted_root: bool,
     /// The leaf's `Issued to:` (the subject CN), when a chain was printed.
     pub issued_to: Option<String>,
@@ -759,16 +661,7 @@ pub struct VerifyReport {
     pub timestamped: bool,
 }
 
-/// Parse signtool's verbose verify output. Tolerant of wording drift on
-/// purpose: absence of a marker reads as absence of the property, never as a
-/// panic, and the raw text is what the verb prints when something is off.
-///
-/// `signtool verify /pa /v` prints the Signing Certificate Chain from the root
-/// down, with each certificate indented one level deeper than its issuer, so
-/// the signer's leaf certificate comes last and deepest. The leaf is accepted
-/// only when it is indented deeper than every certificate before it in the
-/// block (a single-certificate self-signed chain is its own leaf); a flat or
-/// malformed block yields no leaf so an active tier refuses it.
+/// Parse signtool's verbose verify output.
 #[must_use]
 pub fn parse_verify_output(ran: &Ran) -> VerifyReport {
     /// One certificate of the printed chain: its depth (leading whitespace) and
@@ -792,15 +685,12 @@ pub fn parse_verify_output(ran: &Ran) -> VerifyReport {
     for line in text.lines() {
         let l = line.trim();
         if l.starts_with("Signing Certificate Chain:") {
-            // The primary signature's chain is the one that counts; a second
-            // block is never merged into it.
             in_chain = chain.is_empty();
             continue;
         }
         if !in_chain {
             continue;
         }
-        // The indentation in bytes: where the first non-blank character starts.
         let depth = line
             .find(|c: char| !c.is_whitespace())
             .unwrap_or(line.len());
@@ -835,8 +725,7 @@ pub fn parse_verify_output(ran: &Ran) -> VerifyReport {
     report
 }
 
-/// The tier's judgement of one verified file. `Ok(())` is "ship it";
-/// `Err` names the one thing that is wrong.
+/// The tier's judgement of one verified file.
 pub fn judge(tier: &Tier, report: &VerifyReport) -> Result<(), String> {
     match tier {
         Tier::Inactive => Ok(()),
@@ -869,8 +758,6 @@ pub fn judge(tier: &Tier, report: &VerifyReport) -> Result<(), String> {
         }
     }
 }
-
-// The verbs
 
 pub const USAGE: &str =
     "aterm-winsign — Authenticode signing of the shipped Windows exe (Tier WINDOWS)
@@ -937,7 +824,7 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
     Ok(f)
 }
 
-/// Run the tool. Returns the exit code.
+/// Run the tool.
 pub fn run(args: Vec<String>, host: &dyn Host) -> i32 {
     match run_inner(&args, host) {
         Ok(code) => code,
@@ -1018,8 +905,6 @@ fn run_inner(args: &[String], host: &dyn Host) -> Result<i32, String> {
                             runtime.root.display().to_string(),
                         ));
                     }
-                    // Host-native, not `win_join`: we create this file under
-                    // this host's temp dir.
                     let meta = host
                         .temp_dir()
                         .join(format!("aterm-winsign-{}.json", std::process::id()));
@@ -1057,8 +942,6 @@ fn run_inner(args: &[String], host: &dyn Host) -> Result<i32, String> {
             let ran = ran?;
             if ran.code != Some(0) {
                 eprint!("{}{}", ran.stdout, ran.stderr);
-                // Exit 1, not `Err` (which `run` maps to 2): signtool ran and
-                // refused, so this is a signing failure, not a missing tool.
                 eprintln!("aterm-winsign: signtool sign failed (exit {:?})", ran.code);
                 return Ok(1);
             }
@@ -1175,9 +1058,6 @@ fn doctor(host: &dyn Host, tier: &Tier, config: &Config) -> i32 {
                     ok = false;
                 }
             }
-            // Default metadata excludes no Azure.Identity credential, so with
-            // nothing else set the plug-in opens a browser sign-in; a missing
-            // unattended route is not a failure.
             let sp = ["AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET"]
                 .iter()
                 .all(|k| host.env(k).is_some());
@@ -1223,26 +1103,15 @@ mod tests {
     /// One path, spelled the way the Windows machine this fake models would
     /// spell it: `/` and `\` are both separators, runs of them collapse, and a
     /// trailing one is nothing.
-    ///
-    /// `Path`'s own equality uses the host's component parser, which on Unix
-    /// reads `C:\PF\dotnet` as one component, so the fake cannot key on it.
-    /// Both spellings reach the fake ([`win_join`] writes `\`; [`find_on_path`]
-    /// and the temp metadata file use host joins).
-    ///
-    /// Case is deliberately not folded, though Windows would: the fake should
-    /// never answer to a name no test wrote.
     fn win_path(path: &Path) -> String {
         let s = path.to_string_lossy().replace('/', "\\");
         let body = s.trim_start_matches('\\');
-        // A leading run is the one run that carries meaning: `\\server\share`
-        // is a UNC root and `\dir` is root-relative, so keep what Windows keeps.
         let lead = "\\".repeat((s.len() - body.len()).min(2));
         let segments: Vec<&str> = body.split('\\').filter(|s| !s.is_empty()).collect();
         format!("{lead}{}", segments.join("\\"))
     }
 
-    /// `win_path` on both sides of an `assert_eq!`, so a mismatch prints the two
-    /// Windows spellings rather than two host-mangled ones.
+    /// `win_path` on both sides of an `assert_eq!`, so a mismatch prints the two Windows spellings rather than two host-mangled ones.
     macro_rules! assert_same_path {
         ($got:expr, $want:expr $(,)?) => {
             assert_eq!(win_path($got.as_ref()), win_path($want.as_ref()))
@@ -1497,8 +1366,6 @@ Successfully verified: aterm.exe
         let no_ts = VERIFIED.replace("The signature is timestamped", "The signature is not");
         let e = judge(&active, &parse_verify_output(&ran(0, &no_ts))).unwrap_err();
         assert!(e.contains("timestamped"), "{e}");
-        // Inactive: `judge` refuses nothing (the publisher check is off);
-        // `report_file` still exits 1 for an unsigned or untrusted chain.
         assert!(judge(&Tier::Inactive, &parse_verify_output(&ran(1, UNTRUSTED))).is_ok());
     }
 
@@ -1564,7 +1431,6 @@ Successfully verified: aterm.exe
         let mut env = Values::new();
         env.insert("timestamp".into(), "http://env".into());
         env.insert("thumbprint".into(), "ab".repeat(20));
-        // One backslash in the file: the grammar is verbatim between the quotes.
         let prof = values_from_profile(
             "# comment\nsigning_key = \"ignored-by-us\"\nwinsign_timestamp = \"http://profile\"\nwinsign_signtool = \"C:\\st.exe\"\n",
         )
@@ -1581,7 +1447,6 @@ Successfully verified: aterm.exe
         let c = resolve_config(&[&ts]).unwrap();
         assert!(matches!(c.lane, Some(Lane::TrustedSigning { .. })));
 
-        // Both configured and no --lane: refuse rather than guess.
         let e = resolve_config(&[&ts, &env]).unwrap_err();
         assert!(e.contains("--lane"), "{e}");
         let mut pick = Values::new();
@@ -1589,7 +1454,6 @@ Successfully verified: aterm.exe
         let c = resolve_config(&[&pick, &ts, &env]).unwrap();
         assert!(matches!(c.lane, Some(Lane::Thumbprint(_))));
 
-        // A partial Trusted Signing triple is an error that names the missing keys.
         let mut partial = Values::new();
         partial.insert("account".into(), "a".into());
         assert!(
@@ -1597,11 +1461,9 @@ Successfully verified: aterm.exe
                 .unwrap_err()
                 .contains("endpoint")
         );
-        // A malformed thumbprint is refused.
         let mut bad = Values::new();
         bad.insert("thumbprint".into(), "nope".into());
         assert!(resolve_config(&[&bad]).unwrap_err().contains("40 hex"));
-        // Nothing configured is not an error here; `sign` refuses later, by name.
         assert_eq!(resolve_config(&[]).unwrap().lane, None);
     }
 
@@ -1616,8 +1478,6 @@ Successfully verified: aterm.exe
                 .unwrap()
                 .is_empty()
         );
-        // Between the quotes is verbatim, like the release cutter's
-        // `credentials_value`: no escape processing, so `\\` stays doubled.
         let v = values_from_profile("winsign_signtool = \"C:\\st.exe\"\n").unwrap();
         assert_eq!(v.get("signtool").map(String::as_str), Some(r"C:\st.exe"));
         let v = values_from_profile("winsign_signtool = \"C:\\\\st.exe\"\n").unwrap();
@@ -1626,7 +1486,6 @@ Successfully verified: aterm.exe
 
     #[test]
     fn the_fake_spells_paths_the_way_the_windows_machine_it_models_would() {
-        // Both separators, runs collapse, a trailing one is nothing.
         for spelling in [
             r"C:\PF\dotnet",
             "C:/PF/dotnet",
@@ -1636,13 +1495,11 @@ Successfully verified: aterm.exe
         ] {
             assert_eq!(win_path(Path::new(spelling)), r"C:\PF\dotnet", "{spelling}");
         }
-        // A leading run is the one run that means something.
         assert_eq!(
             win_path(Path::new(r"\\server\share\x")),
             r"\\server\share\x"
         );
         assert_eq!(win_path(Path::new(r"\dir\x")), r"\dir\x");
-        // And it does not fuse two different paths into one.
         assert_ne!(win_path(Path::new(r"C:\PF")), win_path(Path::new(r"C:\pf")));
         assert_ne!(
             win_path(Path::new(r"C:\PF\dotnet")),
@@ -1660,22 +1517,17 @@ Successfully verified: aterm.exe
             bin.clone(),
             vec!["10.0.9600.0".into(), "10.0.26100.0".into(), "x64".into()],
         );
-        // Both SDKs have a signtool.exe, so this checks "newest first".
         let want = win_join(&bin, ["10.0.26100.0", "x64", "signtool.exe"]);
         h.files
             .push(win_join(&bin, ["10.0.9600.0", "x64", "signtool.exe"]));
         h.files.push(want.clone());
-        // The literal pins the Windows spelling on any build host.
         assert_eq!(
             win_path(&find_signtool(&h, None).unwrap()),
             r"C:\PFx86\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe"
         );
-        // A configured path that does not exist is an error, not a fallback.
         assert!(find_signtool(&h, Some(Path::new(r"C:\nope.exe"))).is_err());
-        // Nothing anywhere: the error names the roots it looked under.
         let e = find_signtool(&Fake::new(), None).unwrap_err();
         assert!(e.contains("signtool on PATH"), "{e}");
-        // An SDK root with no versioned bin is named with a placeholder.
         let mut empty = Fake::new();
         empty.env.insert("ProgramFiles".into(), r"C:\PF".into());
         let e = find_signtool(&empty, None).unwrap_err();
@@ -1689,8 +1541,6 @@ Successfully verified: aterm.exe
         h.dirs
             .insert(pkg.clone(), vec!["1.0.52".into(), "1.0.60".into()]);
         let want = win_join(&pkg, ["1.0.60", "bin", "x64", "Azure.CodeSigning.Dlib.dll"]);
-        // Both versions carry the dll, so this measures "newest version first"
-        // rather than "the only one present".
         h.files.push(win_join(
             &pkg,
             ["1.0.52", "bin", "x64", "Azure.CodeSigning.Dlib.dll"],
@@ -1714,13 +1564,9 @@ Successfully verified: aterm.exe
             win_join(r"C:\PFx86", ["Windows Kits", "10", "bin"]),
             PathBuf::from(r"C:\PFx86\Windows Kits\10\bin")
         );
-        // A base that already ends in a separator does not grow a second one,
-        // and a bare drive stays drive-relative — Windows' own join, exactly.
         assert_eq!(win_join(r"C:\", ["x"]), PathBuf::from(r"C:\x"));
         assert_eq!(win_join("C:", ["x"]), PathBuf::from(r"C:x"));
-        // A separator the operator typed is left as they typed it.
         assert_eq!(win_join("D:/cache", ["p"]), PathBuf::from(r"D:/cache\p"));
-        // Nothing to join is the base itself.
         assert_eq!(
             win_join(r"C:\a", std::iter::empty::<&str>()),
             PathBuf::from(r"C:\a")
@@ -1807,7 +1653,6 @@ Successfully verified: aterm.exe
         h.env.insert("ProgramFiles".into(), r"C:\PF".into());
         h.env
             .insert("LOCALAPPDATA".into(), r"C:\Users\u\AppData\Local".into());
-        // Only a user-local install: found, and flagged for DOTNET_ROOT.
         let local = PathBuf::from(r"C:\Users\u\AppData\Local\Microsoft\dotnet");
         h.dirs.insert(
             PathBuf::from(
@@ -1819,7 +1664,6 @@ Successfully verified: aterm.exe
         assert_same_path!(&r.root, &local);
         assert_eq!(r.version, "8.0.31");
         assert!(r.needs_root_env);
-        // A machine-wide install wins and needs nothing passed.
         let global = PathBuf::from(r"C:\PF\dotnet");
         h.dirs.insert(
             PathBuf::from(r"C:\PF\dotnet\shared\Microsoft.NETCore.App"),
@@ -1828,7 +1672,6 @@ Successfully verified: aterm.exe
         let r = find_dotnet_runtime(&h).unwrap();
         assert_same_path!(&r.root, &global);
         assert_eq!((r.version.as_str(), r.needs_root_env), ("9.0.4", false));
-        // A runtime older than the dlib's floor does not count.
         let mut old = Fake::new();
         old.env.insert("ProgramFiles".into(), r"C:\PF".into());
         old.dirs.insert(
@@ -1843,8 +1686,7 @@ Successfully verified: aterm.exe
     }
 
     /// `USAGE`'s exit codes: 1 is "the signing or the verdict is bad", 2 is
-    /// "nothing was signed and no verdict was read". The two causes must not
-    /// share a code.
+    /// "nothing was signed and no verdict was read".
     #[test]
     fn a_signtool_that_ran_and_refused_is_exit_one_not_two() {
         let exe = PathBuf::from(r"C:\d\aterm.exe");
@@ -1857,7 +1699,6 @@ Successfully verified: aterm.exe
             "ATERM_WINSIGN_THUMBPRINT".into(),
             "A1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4".into(),
         );
-        // signtool itself ran and said no — a bad credential, a refused profile.
         h.reply = ran(
             1,
             "SignTool Error: An unexpected internal error has occurred.",
@@ -1869,7 +1710,6 @@ Successfully verified: aterm.exe
         );
         assert_eq!(h.runs.borrow().len(), 1, "it stopped at the failed sign");
 
-        // …and the missing-tool cause still has exit 2 to itself.
         let mut gone = Fake::new();
         gone.files.push(exe.clone());
         gone.env.insert(
@@ -1921,7 +1761,6 @@ Successfully verified: aterm.exe
             r"C:\Users\u\AppData\Local\Microsoft\dotnet"
         );
         assert!(runs[1].2.is_empty(), "verify needs no runtime");
-        // Without any runtime the sign refuses before running signtool.
         let mut none = Fake::new();
         none.files.extend([exe.clone(), st.clone(), dlib.clone()]);
         none.env = h.env.clone();

@@ -21,24 +21,33 @@ use crate::typing_momentum::TypingMomentum;
 pub const HOST_ID: u64 = 0x6E79_616E;
 
 /// The high band: the metric value at/above which typing counts toward the
+/// summon dwell.
 const CAT_BAND: f32 = 0.65;
 /// Seconds the metric must be held in the band (per-key credit capped at
+/// [`SUSTAIN_CREDIT_MAX`]) before the cat is eligible: ~2.6 s of typing at
+/// 25–60 ms/key; above ~135 ms/key the [`MIN_RUN_KEYS`] floor dominates.
 const CAT_DWELL: f32 = 1.2;
 /// Per-key ceiling on dwell credit (seconds): the dwell is bought by keys
+/// landing in rhythm, so one key after a long thought cannot claim the whole
+/// gap as "sustained high typing".
 const SUSTAIN_CREDIT_MAX: f32 = 0.25;
 /// How fast the dwell drains while the metric sits under [`CAT_BAND`], as a
+/// multiple of the elapsed gap: a one-second stall costs 1.5 s of dwell.
 const SUSTAIN_LEAK: f32 = 1.5;
 /// Minimum forward keystrokes in the current high-band run before the cat can summon.
 pub const MIN_RUN_KEYS: u32 = 16;
 /// Below this metric value the cat lets go and fades out: with the metric's
+/// 2 s τ, a full run grounds after ~3.9 s of silence.
 const LOW: f32 = 0.14;
 /// Metric at/above which resumed typing revives a cat that already began its
+/// fade-out, so a thinking pause does not force a full re-earn.
 const REVIVE_GATE: f32 = 0.35;
 /// Fade-in / fade-out durations (seconds).
 const FADE_IN: f32 = 0.35;
 const FADE_OUT: f32 = 0.75;
 
 /// How far the goodbye must have faded before the exit flourish's baked head
+/// is swapped in (see [`CatFrame::render_look`]).
 const EXIT_FACE_FADE: f32 = 0.25;
 /// Total wall-clock time of the classic cursor kitty's off-glass line-fold seam.
 pub const CURSOR_FOLD_DURATION: Duration = Duration::from_millis(280);
@@ -50,20 +59,26 @@ const _: () = assert!(
             <= crate::effect_util::TWINKLE_FLASH_BOUND_HZ,
     "the exit star wink must glint within the photosensitivity flash bound"
 );
-/// The collection hello's guaranteed, bounded hold. It is independent of cursor
+/// The collection hello's guaranteed, bounded hold.
 const DISCOVERY_HOLD: f32 = 2.8;
 /// Short input reactions never extend the companion's overall flight.
 const CELEBRATE_HOLD: f32 = 0.7;
 
 /// How long the tongue-out expression holds after the last delete of a burst:
+/// noticeable yet under [`CELEBRATE_HOLD`].
 const OOPS_HOLD: f32 = 0.60;
 /// Deletes closer together than this belong to one burst: each extends the
+/// hold but does not re-fire the pose kick.
 const OOPS_REARM: f32 = 0.30;
 /// Backward recoil while the oops is live, as a fraction of cell width: the
+/// cat rocks away from the deletion, since the glyph swap alone is easy to
+/// miss at terminal size.
 const OOPS_RECOIL: f32 = 0.12;
 /// Sustained brace crouch while the oops holds (the `land_at` bounce decays
+/// in ~0.4 s): shorter by this fraction, wider by 0.6× of it.
 const OOPS_SQUASH: f32 = 0.07;
 /// Recoil envelope: ease in over `OOPS_ATTACK` from the burst kick, ease out
+/// over the final `OOPS_SETTLE` of the hold.
 const OOPS_ATTACK: f32 = 0.07;
 const OOPS_SETTLE: f32 = 0.18;
 
@@ -75,6 +90,7 @@ const WINCE_RECOIL: f32 = 0.16;
 const WINCE_SQUASH: f32 = 0.11;
 const MAX_WINCE_CHAIN: u8 = 4;
 /// The wince tumble: on top of the recoil the body rocks side to side in a
+/// decaying oscillation whose frequency rides the chain.
 const WINCE_TUMBLE: f32 = 0.13;
 const WINCE_TUMBLE_FREQ: f32 = 3.1;
 const WINCE_TUMBLE_DECAY: f32 = 3.4;
@@ -90,37 +106,46 @@ const MAX_DELIGHT_CHAIN: u8 = 4;
 /// Spine follower time constant (seconds).
 const DISP_TAU: f32 = 0.13;
 /// Spine range mapped to the banking curve: no lean below `BANK_LO`, full flying
+/// lean by `BANK_HI`.
 const BANK_LO: f32 = 0.32;
 const BANK_HI: f32 = 0.96;
 /// At full bank the cat stretches along its motion axis (wider) and thins a
+/// touch (shorter).
 const STRETCH_X: f32 = 0.17;
 const THIN_Y: f32 = 0.10;
 /// At full bank the cat also leans this fraction of a cell ahead of its rest
+/// anchor.
 const LEAD_MAX: f32 = 0.22;
 /// Sustained-fast display momentum at/above which the cruising face squints
+/// happily; a brief blink interrupts either face while visible.
 const HAPPY_GATE: f32 = 0.80;
 /// Deterministic idle-blink cadence: a full closure of `BLINK_DUR` every
+/// `BLINK_PERIOD`, phased off the flight clock (never at the entrance).
 const BLINK_PERIOD: f32 = 1.7;
 const BLINK_DUR: f32 = 0.13;
-/// Hover-bob amplitude (fraction of cell height). Every still path
+/// Hover-bob amplitude (fraction of cell height).
 const BOB_AMP: f32 = 0.09;
-/// Stride pump: phase advance per committed forward keystroke, in cycles. The
+/// Stride pump: phase advance per committed forward keystroke, in cycles.
 const STRIDE_PER_KEY: f32 = 0.5;
 /// Idle drift (cycles/sec) between keystrokes, so a pause eases the cat
+/// through its step instead of freezing it mid-stride.
 const STRIDE_IDLE_HZ: f32 = 1.4;
 /// Time constant (seconds) of the drawn stride phase's follow of the pump.
 const STRIDE_TAU: f32 = 0.05;
 /// The fastest (cycles/s) the drawn stride phase follows the pump, whatever the
+/// display's rate.
 const STRIDE_RATE_MAX: f32 = 5.5;
-/// Body compression on each footfall. Small: the step should read as weight, not
+/// Body compression on each footfall.
 const STRIDE_SQUASH: f32 = 0.05;
 /// Landing squash→stretch settle: a damped bounce of length `LAND_DUR`,
+/// amplitude `LAND_AMP`, `LAND_FREQ` oscillations, decaying at `LAND_DECAY`.
 const LAND_DUR: f32 = 0.42;
 const LAND_AMP: f32 = 0.26;
 const LAND_FREQ: f32 = 1.35;
 const LAND_DECAY: f32 = 3.0;
 
 /// Sing-along dance depths at full drive (`crate::kitty_sing`): the on-beat
+/// squash pulse and the two-beat lean sway.
 const SING_SQUASH: f32 = 0.14;
 const SING_SWAY: f32 = 0.12;
 
@@ -345,6 +370,7 @@ impl CatFrame {
 }
 
 /// The inert hidden/retired frame: alpha 0, plain exit, no reaction, STILL
+/// pose — byte-identical across frames, so [`CatFrame::fp`] settles to 0.
 #[inline]
 const fn hidden_frame(look: KittyLook) -> CatFrame {
     CatFrame {
@@ -364,10 +390,13 @@ const fn hidden_frame(look: KittyLook) -> CatFrame {
 /// The earned cat's decision layer: the canonical typing-momentum metric, a high-band dwell clock and a fade/exit state machine.
 pub struct CursorCat {
     /// The canonical typing-momentum metric, run on the same keystream as the
+    /// glow engine's (`momentum_unifies_glow_and_cat_metrics` pins them equal).
     momentum: TypingMomentum,
     /// Seconds of high-band dwell accrued across in-rhythm keys; leaks
+    /// ([`SUSTAIN_LEAK`]) while keys land below [`CAT_BAND`].
     sustain: f32,
     /// Forward keys in the current uninterrupted high-band run: the
+    /// [`MIN_RUN_KEYS`] travel floor.
     run_keys: u32,
     last: Option<Instant>,
     state: State,
@@ -375,14 +404,18 @@ pub struct CursorCat {
     /// When the current flight began (FadeIn entry) — the hover-bob clock.
     flight: Option<Instant>,
     /// Stride pump phase, in cycles (see [`STRIDE_PER_KEY`]): advanced per
+    /// committed forward keystroke, drifting at [`STRIDE_IDLE_HZ`] between.
     stride: f32,
-    /// The last stride advance (the idle-drift `dt` source). `None` re-seeds without
+    /// The last stride advance (the idle-drift `dt` source).
     stride_at: Option<Instant>,
     /// The stride phase the pose draws (the bob, the footfall squash),
+    /// following [`Self::stride`] at [`STRIDE_TAU`], never faster than
+    /// [`STRIDE_RATE_MAX`].
     stride_shown: f32,
     /// The collected identity currently accompanying the cursor.
     look: KittyLook,
     /// A look synced while on screen, applied at the next appearance so one appearance
+    /// wears one cat ([`Self::set_look`]).
     pending_look: Option<KittyLook>,
     reaction: CatReaction,
     reaction_until: Option<Instant>,
@@ -390,21 +423,27 @@ pub struct CursorCat {
     discovery_until: Option<Instant>,
     /// The full collection presentation stays drawable through fade-out.
     collection_hello: bool,
-    /// Start of a paused (unfocused/suppressed) collection hello. The hold counts drawable
+    /// Start of a paused (unfocused/suppressed) collection hello.
     collection_paused_at: Option<Instant>,
     /// Terminal colour context frozen for this flight/hello: sampled on the first visible
+    /// frame and reused, so text churn cannot fragment the atlas cache.
     colors: Option<CatColorKey>,
     /// Eased "display momentum" spine (0..1): a lagged follower of the live
+    /// score that drives every pose choice, giving the body follow-through.
     disp: f32,
-    /// Last spine advance instant. `None` reseeds the spine to its target, so a
+    /// Last spine advance instant.
     disp_at: Option<Instant>,
     /// Start of a landing squash→stretch bounce (Enter stomp, a delete
+    /// flinch, or the fade-out touchdown).
     land_at: Option<Instant>,
     /// The meteor the head is flying ([`Self::on_meteor`]): its whip and squint
+    /// ride the pose until [`Flight::settled_at`].
     meteor: Option<Flight>,
     /// The current oops burst's kick instant, the recoil envelope's attack
+    /// clock.
     oops_at: Option<Instant>,
     /// The last delete of the current burst: the [`OOPS_REARM`] gap decides
+    /// between extending this burst and re-kicking a new one.
     oops_last: Option<Instant>,
     /// First sample of the current curse-wince kick.
     wince_at: Option<Instant>,
@@ -419,12 +458,15 @@ pub struct CursorCat {
     /// Burst-scaled hop strength, bounded at [`MAX_DELIGHT_CHAIN`].
     delight_chain: u8,
     /// Sing-along drive 0..=1, synced by the host each frame
+    /// ([`Self::set_singing`]) from the `kitty_sing` detector.
     sing: f32,
     /// The shared dance-beat phase in beats (fractional), from the same
+    /// host sync.
     sing_beat: f32,
     /// The authenticated line-fold episode: CursorGlow classifies and clocks it,
+    /// WordDecorations resolves it into pixels.
     fold: Option<CatFold>,
-    /// Resting direction after a reverse fold. An active fold's own direction
+    /// Resting direction after a reverse fold.
     facing_left: bool,
     rng: u32,
 }
@@ -629,6 +671,7 @@ impl CursorCat {
     }
 
     /// The Hidden → FadeIn summon shared by [`Self::on_key`] and [`Self::set_singing`] (each
+    /// keeps its own gate); a latched look lands here.
     #[inline]
     const fn summon(&mut self, now: Instant) {
         self.sustain = 0.0;
@@ -644,6 +687,8 @@ impl CursorCat {
     }
 
     /// Fire (or sustain) the delete oops on a live companion: every delete extends the hold
+    /// to [`OOPS_HOLD`] past it; the flinch and recoil kick only on a burst's first delete
+    /// ([`OOPS_REARM`]).
     #[inline]
     fn note_oops(&mut self, now: Instant) {
         if !self.is_active() {
@@ -905,7 +950,7 @@ impl CursorCat {
         self.reaction
     }
 
-    /// Drift the stride phase to `now` at [`STRIDE_IDLE_HZ`]. `dt` is clamped
+    /// Drift the stride phase to `now` at [`STRIDE_IDLE_HZ`].
     #[inline]
     fn stride_advance(&mut self, now: Instant) {
         if self.stride_at == Some(now) {
@@ -953,6 +998,7 @@ impl CursorCat {
     }
 
     /// Advance the eased display-momentum spine toward `target` (the live
+    /// score) with time constant `DISP_TAU`.
     #[inline]
     fn advance_spine(&mut self, now: Instant, target: f32) {
         let target = target.clamp(0.0, 1.0);
@@ -970,6 +1016,7 @@ impl CursorCat {
     }
 
     /// Deterministic idle blink: a `BLINK_DUR` closure once per `BLINK_PERIOD`,
+    /// phased off the flight clock so it never fires the instant the cat appears.
     #[inline]
     fn blink_active(&self, now: Instant) -> bool {
         match self.flight {
@@ -983,6 +1030,8 @@ impl CursorCat {
     }
 
     /// Resolve the living-cartoon pose for this present: advance the spine,
+    /// map it to a banking squash/stretch and forward lean, overlay any landing
+    /// bounce, and select the baked eye frame.
     fn resolve_pose(
         &mut self,
         now: Instant,
@@ -1135,6 +1184,8 @@ impl CursorCat {
     }
 
     /// Settle the spine to fully idle: display momentum resets, the follower
+    /// disarms and any landing bounce clears, so the next hidden frame is
+    /// byte-identical.
     #[inline]
     const fn reset_spine(&mut self) {
         self.disp = 0.0;
@@ -1152,6 +1203,7 @@ impl CursorCat {
     }
 
     /// Settle a finished flight or collection hello back to `State::Hidden`,
+    /// applying any parked look and clearing per-appearance state.
     #[inline]
     const fn settle_hidden(&mut self) {
         self.state = State::Hidden;
@@ -1387,6 +1439,9 @@ impl CursorCat {
     }
 
     /// The shared grounded-exit edge of the FadeIn/Shown arms: a grounded
+    /// non-discovery flight begins its fade-out — a collection hello's
+    /// goodbye starts at the promised hold deadline, an earned flight at the
+    /// analytic [`LOW`] crossing.
     #[inline]
     fn grounded_exit(&mut self, discovery_until: Option<Instant>, now: Instant) -> CatFrame {
         let started = if self.collection_hello {
@@ -1398,6 +1453,8 @@ impl CursorCat {
     }
 
     /// Exact wall-clock instant at which an earned flight crossed [`LOW`],
+    /// derived from the metric's decay ([`TypingMomentum::low_crossing`]) so
+    /// the lifecycle is frame-rate independent.
     #[inline]
     fn low_crossing_at(&self, now: Instant) -> Instant {
         self.momentum.low_crossing(LOW).unwrap_or(now)
@@ -1573,6 +1630,8 @@ pub fn emit_exit_fx(
 }
 
 /// Push one source-over radial veil ([`HaloMode::Over`]) of the exit flourish: `rgb` is a
+/// straight `0x00RRGGBB` ink and `alpha` the centre opacity ceiling, carried in the colour's
+/// high byte (`aterm_render::halo_over_cap`).
 #[allow(
     clippy::too_many_arguments,
     reason = "centre + per-axis radii + ink + alpha; a param struct would obscure the geometry at the flourish call sites"
@@ -1714,6 +1773,7 @@ mod tests {
     }
 
     /// Photosensitivity: the exit star wink (a 255-coverage white star with a
+    /// 40% swing) stays under the crate's flash bound.
     #[test]
     fn cat_exit_starwink_flash_rate_stays_under_the_photosensitivity_bound() {
         let hz = EXIT_STAR_SCINT / FADE_OUT / std::f32::consts::TAU;
@@ -1770,6 +1830,7 @@ mod tests {
     }
 
     /// A casual burst (a word or two at speed) never summons the companion or
+    /// enters the high band.
     #[test]
     fn casual_word_or_two_never_summons_the_cat() {
         let mut c = CursorCat::default();
@@ -1791,6 +1852,8 @@ mod tests {
     }
 
     /// The 16-key travel floor is load-bearing independently of the stricter
+    /// canonical band and dwell: even a pre-warmed, fully-dwelled metric stays
+    /// hidden through fifteen qualifying keys, then summons on the sixteenth.
     #[test]
     fn sixteen_high_band_keys_are_required_even_after_full_dwell() {
         let t = Instant::now();
@@ -1818,6 +1881,7 @@ mod tests {
     }
 
     /// Touching the high band is not enough: the metric must be held there for
+    /// the full [`CAT_DWELL`].
     #[test]
     fn cat_requires_the_high_band_held_not_merely_touched() {
         let mut c = CursorCat::default();
@@ -1851,6 +1915,8 @@ mod tests {
     }
 
     /// Two-sided summon latency: every summoning cadence owes a 2.2–3.6 s run (the 16-key
+    /// floor stops sparse cadences arriving early), and a stroll slower than ~0.60 s/key
+    /// never holds the band.
     #[test]
     fn summon_latency_is_bounded_across_typing_cadences() {
         for (gap_ms, max_keys) in [(25u64, 320usize), (60, 160), (120, 90)] {
@@ -1882,6 +1948,7 @@ mod tests {
     }
 
     /// Sustained fast typing always summons the cat, which fades in to full
+    /// opacity and then out completely when momentum stops.
     #[test]
     fn sustained_typing_summons_then_fades_out_completely() {
         let mut c = CursorCat::default();
@@ -1914,6 +1981,8 @@ mod tests {
     }
 
     /// The band tolerates rhythm but not pauses: short breaths keep the dwell
+    /// accruing (the metric's 2 s τ holds a hot run above [`CAT_BAND`]), while
+    /// casual prose with thinking pauses never builds the metric into the band.
     #[test]
     fn breaths_keep_the_dwell_but_word_pauses_stay_cat_free() {
         let mut flow = CursorCat::default();
@@ -1952,6 +2021,7 @@ mod tests {
     }
 
     /// A collection hello's goodbye is exempt from the revive: typing during
+    /// the hello fade lets it finish, and the cat re-earns normally after.
     #[test]
     fn hello_goodbye_is_not_revived_by_typing() {
         let t = Instant::now();
@@ -1970,6 +2040,7 @@ mod tests {
     }
 
     /// A cat that began fading out revives when typing resumes at speed, with
+    /// continuous opacity.
     #[test]
     fn fading_cat_revives_on_resumed_typing() {
         let mut c = CursorCat::default();
@@ -2003,6 +2074,7 @@ mod tests {
     }
 
     /// The goodbye face never appears at full opacity, so a revive a frame later cannot swap
+    /// the head back.
     #[test]
     fn the_exit_flourish_head_never_shows_at_full_opacity() {
         let mut saw_flourish = 0u32;
@@ -2051,6 +2123,8 @@ mod tests {
     }
 
     /// Reduced motion draws only a cat the machine has summoned: from cold the
+    /// drive can be up while the machine is `Hidden` (the travel floor is
+    /// unmet), and `static_frame` must then draw nothing, as `frame` does.
     #[test]
     fn reduced_motion_never_draws_a_cat_the_machine_calls_hidden() {
         let mut c = CursorCat::default();
@@ -2078,6 +2152,8 @@ mod tests {
     }
 
     /// A collection hello owns an absolute hold deadline: if the compositor
+    /// skips every frame spanning hold + fade, the next present is Hidden and
+    /// never an opaque restart frame.
     #[test]
     fn sparse_frame_after_collection_deadline_settles_directly_hidden() {
         let t = Instant::now();
@@ -2097,6 +2173,7 @@ mod tests {
     }
 
     /// Launch kitties are a pure function of the seed (stable for the process,
+    /// identical on every machine) and differ across seeds.
     #[test]
     fn launch_kitties_are_unique_per_seed_and_stable() {
         let looks: Vec<KittyLook> = (0..64u64).map(KittyLook::for_launch).collect();
@@ -2129,6 +2206,7 @@ mod tests {
     }
 
     /// Both typed-word reactions are expression on a live companion: they never
+    /// summon a hidden one, and `on_delight` never touches the identity.
     #[test]
     fn typed_word_reactions_are_bounded_expression() {
         let t = Instant::now();
@@ -2159,6 +2237,8 @@ mod tests {
     }
 
     /// The companion does not leap at its own name (the word's own cat celebrates); what
+    /// remains is expression: happy eyes and a brief swell, while `bob` is identical to
+    /// an undelighted twin at the same active stride phase.
     #[test]
     fn delight_is_expression_not_displacement() {
         let mut t = Instant::now();
@@ -2249,6 +2329,8 @@ mod tests {
     }
 
     /// A flight earned under reduced motion is presented only through `static_frame`, which
+    /// drives FadeIn→Shown→FadeOut→Hidden on the clock: the flight retires, `is_active`
+    /// clears, and a look parked mid-flight applies.
     #[test]
     fn reduced_motion_flight_retires_and_releases_the_look_latch() {
         let mut cat = CursorCat::default();
@@ -2423,6 +2505,8 @@ mod tests {
     }
 
     /// A look synced while the companion is mid-flight never morphs the
+    /// sprite: it holds for the appearance, and the parked look lands on the
+    /// next wake with no re-sync.
     #[test]
     fn mid_flight_look_sync_is_latched_until_the_next_wake() {
         let mut c = CursorCat::default();
@@ -2493,6 +2577,8 @@ mod tests {
     }
 
     /// `on_collect` presents the chosen cat immediately, even mid-flight, and
+    /// supersedes any parked look so a stale deferred sync cannot overwrite the
+    /// hello at the next wake.
     #[test]
     fn discovery_hello_presents_the_new_look_mid_flight() {
         let mut c = CursorCat::default();
@@ -2573,6 +2659,8 @@ mod tests {
     }
 
     /// A placement rebase changes the cells under the cursor cat, so its contrast key is
+    /// resampled; collection and song keep identity and lifecycle across the host's
+    /// retirement/rebase sequence.
     #[test]
     fn coordinate_rebase_invalidates_only_the_promised_cat_palette() {
         let t = Instant::now();
@@ -2641,6 +2729,7 @@ mod tests {
     }
 
     /// On dark, exit fx emit additive quads only while fading (peaked), nothing
+    /// for Plain, and never touch the veil sink.
     #[test]
     fn exit_fx_emits_for_wink_and_heart_only() {
         let g = geom();
@@ -2689,6 +2778,8 @@ mod tests {
     }
 
     /// On light, the exit flourish emits no additive white/pink (invisible on a
+    /// pale ground); the heart and star come through as source-over veils
+    /// ([`HaloMode::Over`]) in darkened, saturated inks that darken the ground.
     #[test]
     fn exit_fx_light_theme_is_a_darkening_source_over_veil() {
         let g = geom();
@@ -2736,6 +2827,7 @@ mod tests {
     }
 
     /// The light veil fades to nothing at the exit ends (`fade_out` near 0 or
+    /// 1 ⇒ `pop → 0`), dissolving with the cat.
     #[test]
     fn exit_fx_light_veil_vanishes_at_the_exit_ends() {
         let g = geom();
@@ -2760,6 +2852,9 @@ mod tests {
     }
 
     /// A key steps the hover bob over a few frames, never in one: typing at
+    /// 9 and at 15 keys a second on a 120 Hz and on a 60 Hz display, no present
+    /// moves the bob by more than 0.06 of a row, and it still moves with the
+    /// keys.
     #[test]
     fn a_key_steps_the_hover_bob_over_frames_not_in_one() {
         for (frame_us, key_us) in [
@@ -2811,6 +2906,7 @@ mod tests {
     }
 
     /// Stride pump: the pose moves as you type, driven by the keys rather than
+    /// the rate-normalized level (which pins at 1.0 while the cat is visible).
     #[test]
     fn stride_pump_animates_from_cadence_not_from_the_pinned_level() {
         let look = KittyLook::default();
@@ -2890,6 +2986,7 @@ mod tests {
     }
 
     /// Banking is a pure function of the eased spine: sustained forward momentum
+    /// leans + stretches the cat along its motion axis; a resting cat rides level.
     #[test]
     fn banking_leans_and_stretches_with_momentum() {
         let look = KittyLook::default();
@@ -2935,6 +3032,7 @@ mod tests {
     }
 
     /// A sudden stop (the fade-out touchdown) and an Enter stomp both fire the
+    /// squash→stretch landing bounce, which then settles back toward neutral.
     #[test]
     fn landing_squash_fires_on_stop_and_on_enter() {
         let look = KittyLook::default();
@@ -2970,6 +3068,7 @@ mod tests {
     }
 
     /// The idle blink is deterministic and windowed: the eyes are open outside
+    /// the blink window and closed inside it, identically for identical instants.
     #[test]
     fn idle_blink_is_deterministic_and_windowed() {
         let build = || {
@@ -3031,6 +3130,8 @@ mod tests {
     }
 
     /// A key-repeat delete run reads as one sustained oops: the expression
+    /// holds across the burst, but the squash kick fires only on the first
+    /// delete, so a later repeat finds the bounce decaying, not re-frozen.
     #[test]
     fn delete_burst_is_one_sustained_oops_with_one_kick() {
         let t = Instant::now();
@@ -3074,6 +3175,8 @@ mod tests {
     }
 
     /// The oops hold: the tongue-out still reads 0.4 s after the delete, the
+    /// pose recoils back off the rest anchor while it holds, and everything
+    /// decays to the base look after.
     #[test]
     fn oops_holds_visibly_then_decays_to_base_look() {
         let t = Instant::now();
@@ -3104,6 +3207,7 @@ mod tests {
     }
 
     /// Kill chords fire the same bounded oops on a live companion and never
+    /// summon a hidden one.
     #[test]
     fn kill_chords_fire_the_same_oops_and_never_summon() {
         let t = Instant::now();
@@ -3123,6 +3227,8 @@ mod tests {
     }
 
     /// Kills drain mildly: one kill dents the metric and breaks the dwell,
+    /// while a kill flood walks it under [`LOW`] and grounds the flight, whose
+    /// fade carries the tongue-out.
     #[test]
     fn a_kill_flood_grounds_the_flight_and_the_goodbye_keeps_the_oops() {
         let t = Instant::now();
@@ -3165,6 +3271,8 @@ mod tests {
     }
 
     /// Reduced motion: the oops is a static swap (full opacity, S121 face,
+    /// pose `STILL`, zero bob) that decays back to the discovery face with its
+    /// own armed wake.
     #[test]
     fn reduced_motion_oops_is_a_static_swap_with_a_decay_wake() {
         let t = Instant::now();
@@ -3200,6 +3308,7 @@ mod tests {
     }
 
     /// Hidden ⇒ zero animation work: neutral pose, `fp() == 0`, timer disarmed —
+    /// and a fully faded-out flight settles the spine back to exactly that.
     #[test]
     fn hidden_settles_to_zero_work() {
         let t = Instant::now();
@@ -3249,6 +3358,8 @@ mod tests {
     }
 
     /// An armed celebration pins the metric to 1.0, bypasses dwell only after
+    /// sixteen qualifying events, wears the open-mouth meow head, and dances on
+    /// the shared beat clock (the pose cycles within a beat).
     #[test]
     fn singing_pins_momentum_summons_and_dances_on_the_beat() {
         let mut c = CursorCat::default();
@@ -3281,6 +3392,7 @@ mod tests {
     }
 
     /// The singing head never blinks, including at the `companion::sing_face_live` gate
+    /// value (the eyes are baked into the tile, so a blink is a distinct head).
     #[test]
     fn the_singing_head_never_blinks_at_the_gate_value() {
         for drive in [0.33_f32, 0.3300001, 0.34, 0.5, 1.0] {
@@ -3320,6 +3432,7 @@ mod tests {
     }
 
     /// The delete oops outranks the song: a backspace mid-celebration shows the
+    /// tongue-out face over the singing head for its bounded hold.
     #[test]
     fn oops_outranks_the_singing_face() {
         let mut c = CursorCat::default();
@@ -3333,6 +3446,8 @@ mod tests {
     }
 
     /// Wind-down is a crossfade: at half drive the frame still sings (face +
+    /// scaled dance); at zero the overlay is gone and the companion glides out
+    /// on natural momentum decay.
     #[test]
     fn wind_down_crossfades_the_dance_out() {
         let mut c = CursorCat::default();
@@ -3364,6 +3479,7 @@ mod tests {
     }
 
     /// Reduced motion: a static celebration (full opacity, singing face, pose
+    /// `STILL`, `bob = 0`), disappearing in one step below the 0.33 face swap.
     #[test]
     fn reduced_motion_celebration_is_a_static_singing_pose() {
         let mut c = CursorCat::default();

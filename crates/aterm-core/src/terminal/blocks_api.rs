@@ -2,38 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Block-based output model API for [`Terminal`]: OSC 133 command+output blocks for
-//! navigation, per-block copy and agent context ([`Terminal::all_blocks`],
-//! [`Terminal::current_block`], [`Terminal::block_output`]).
+//! Block-based output model API for [`Terminal`]: OSC 133 command+output blocks for navigation, per-block copy and agent context ([`Terminal::all_blocks`], [`Terminal::current_block`], [`Terminal::block_output`]).
 
 use super::{OutputBlock, Terminal};
 
 /// Result of reading a block's command or output text from the grid.
-///
-/// Blocks record monotonic absolute rows, and scrollback keeps only the newest
-/// `scrollback_lines()`, so a block can outlive its text; so can a finished
-/// block on a screen a full clear blanked (`OutputBlock::text_cleared`), whose
-/// rows the next command writes, and the command line of a block that lost
-/// its command rows while it was being built, to a full clear or a
-/// scrollback erase (`OutputBlock::command_text_cleared`). `Evicted` keeps
-/// those cases distinct from empty text, so a caller never gets shifted lines
-/// or another command's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockText {
-    /// The text was read from retained history + the visible screen: in full,
-    /// but for a block whose command was still running when a full clear or a
-    /// scrollback erase took some of its rows. That one reads only what is
-    /// left (the history the clear did not blank, or what the erase kept, then
-    /// what its command wrote after), and nothing here says a part is
-    /// missing. Once its command has finished (its D came), the same loss
-    /// reads `Evicted`, as an archived block's does.
+    /// The text was read from retained history + the visible screen: in full, but for a block whose command was still running when a full clear or a scrollback erase took some of its rows.
     Text(String),
-    /// The block's rows are older than the oldest retained line, or a full
-    /// clear blanked them after its command finished (its command rows: a
-    /// full clear or an erase while it was being built): its content is gone.
+    /// The block's rows are older than the oldest retained line, or a full clear blanked them after its command finished (its command rows: a full clear or an erase while it was being built): its content is gone.
     Evicted,
-    /// The block has not reached the requested phase yet (no command entered, or
-    /// no output produced), so there is no row range to read.
+    /// The block has not reached the requested phase yet (no command entered, or no output produced), so there is no row range to read.
     NotAvailable,
 }
 
@@ -79,17 +59,14 @@ impl BlockText {
 }
 
 impl Terminal {
-    /// The block shell integration is building, in any state from
-    /// `PromptOnly` to `Complete`; a `Complete` one stays current until the
-    /// next prompt (OSC 133 A) archives it.
+    /// The block shell integration is building, in any state from `PromptOnly` to `Complete`; a `Complete` one stays current until the next prompt (OSC 133 A) archives it.
     #[must_use]
     #[inline]
     pub const fn current_block(&self) -> Option<&OutputBlock> {
         self.shell.current_block.as_ref()
     }
 
-    /// All blocks, completed then current. Ids strictly increase front to back,
-    /// so a watermarked consumer walks backwards and stops at `id <= watermark`.
+    /// All blocks, completed then current.
     #[inline]
     pub fn all_blocks(&self) -> impl DoubleEndedIterator<Item = &OutputBlock> {
         self.shell
@@ -98,10 +75,7 @@ impl Terminal {
             .chain(self.shell.current_block.as_ref())
     }
 
-    /// The id the next block will take: one past every block id this engine
-    /// has issued. Ids only grow, kept across `reset` (RIS) and a checkpoint
-    /// round trip, so a reader's cursor at or past it names blocks of some
-    /// other engine (one that did not cross, say, an engine started blank).
+    /// The id the next block will take: one past every block id this engine has issued.
     #[must_use]
     #[inline]
     pub const fn next_block_id(&self) -> u64 {
@@ -119,14 +93,7 @@ impl Terminal {
             .or_else(|| self.shell.current_block.as_ref().filter(|b| b.id == id))
     }
 
-    /// The newest archived block, whose row extent the next prompt's OSC 133 A
-    /// sealed.
-    ///
-    /// Never the current block, even when
-    /// [`Complete`](crate::terminal::BlockState::Complete): its `end_row` is
-    /// `None`, so a multi-line output would read back truncated. Shells send the
-    /// next A right after D, so that window is short; an archived block may lack
-    /// an exit code when a prompt closed it without D.
+    /// The newest archived block, whose row extent the next prompt's OSC 133 A sealed.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::spec_unmodeled(
@@ -141,12 +108,7 @@ impl Terminal {
         self.shell.output_blocks.back()
     }
 
-    /// The newest block in state [`Complete`](crate::terminal::BlockState::Complete),
-    /// current block included: an O(1) "last `Complete` in `all_blocks()`" for
-    /// the `wait` verb, which asks on every output burst under the terminal
-    /// lock. Unlike [`last_completed_block`](Self::last_completed_block) it
-    /// includes the unsealed current block: its `id`/`exit_code`/`state` are
-    /// final at D.
+    /// The newest block in state [`Complete`](crate::terminal::BlockState::Complete), current block included: an O(1) "last `Complete` in `all_blocks()`" for the `wait` verb, which asks on every output burst under the terminal lock.
     #[must_use]
     #[inline]
     pub fn newest_completed_block(&self) -> Option<&OutputBlock> {
@@ -162,44 +124,27 @@ impl Terminal {
             .find(|b| b.is_complete())
     }
 
-    /// The block the latest accepted OSC 133/633 D completed, as it stood at
-    /// that D: its id, exit code and stamps (its rows are not kept up to
-    /// date). Held after a scrollback erase (ED 3, Cmd-K) or the block store's
-    /// cap has dropped the block itself, so the latest finished command's exit
-    /// status does not go with its rows; a reader matches its id to the block
-    /// it asks about. `None` before the first D, when that D landed on no
-    /// block, and after a seamless update (never checkpointed). Kept across
-    /// `reset`.
+    /// The block the latest accepted OSC 133/633 D completed, as it stood at that D: its id, exit code and stamps (its rows are not kept up to date).
     #[must_use]
     #[inline]
     pub const fn last_finished_block(&self) -> Option<&OutputBlock> {
         self.shell.last_finished.as_ref()
     }
 
-    /// Text of the absolute rows `[start_row, end_row)`, joined with newlines.
-    ///
-    /// Rows are in the space `OutputBlock` records and
-    /// `Grid::visible_to_absolute()` produces; history rows map through
-    /// `absolute_row - Grid::oldest_absolute_row()`, and rows at or below the
-    /// top visible row map onto the screen. Returns `BlockText::Evicted` when
-    /// `start_row` is older than `oldest_absolute_row()`.
+    /// Text of the absolute rows `start_row, end_row)`, joined with newlines.
     pub(crate) fn text_range(&self, start_row: u64, end_row: u64) -> BlockText {
         let oldest = self.grid.oldest_absolute_row();
         let scrollback_lines = self.grid.scrollback_lines() as u64;
         let visible_rows = u64::from(self.grid.rows());
 
-        // Only a non-empty range can be evicted; an empty one has nothing to read.
         if end_row > start_row && start_row < oldest {
             return BlockText::Evicted;
         }
 
         let mut result = String::new();
-        // Where the logical line now being read starts in `result`.
         let mut line_start = 0usize;
         for row in start_row..end_row {
             let rel = row.saturating_sub(oldest);
-            // `is_wrapped()`: this row continues the previous one (soft wrap), as in
-            // `selection_to_string`.
             let (is_continuation, text) = if rel < scrollback_lines {
                 usize::try_from(rel)
                     .ok()
@@ -215,7 +160,6 @@ impl Terminal {
                     })
                     .unwrap_or((false, String::new()))
             } else {
-                // Screen row, independent of the display offset.
                 let visible_row = rel - scrollback_lines;
                 u16::try_from(visible_row)
                     .ok()
@@ -229,12 +173,6 @@ impl Terminal {
                     })
                     .unwrap_or((false, String::new()))
             };
-            // A soft-wrap continuation is not a new logical line: `selection`/`copy`
-            // join these, so this must too, or a long command line is chopped at the
-            // terminal width. Rows come back as written, trailing blanks included,
-            // and a logical line is trimmed whole where it ends, as `copy` does: a
-            // row the next continues keeps its blanks (a space in its last column
-            // separates two words).
             if row > start_row && !is_continuation {
                 result.truncate(line_start + result[line_start..].trim_end().len());
                 result.push('\n');
@@ -246,8 +184,7 @@ impl Terminal {
         BlockText::Text(result)
     }
 
-    /// Number of block command/output reads that found the block's rows already
-    /// evicted from scrollback, over this session's lifetime.
+    /// Number of block command/output reads that found the block's rows already evicted from scrollback, over this session's lifetime.
     #[must_use]
     #[cfg(test)]
     pub fn block_eviction_read_count(&self) -> u64 {
@@ -257,13 +194,6 @@ impl Terminal {
     /// Record that a block read hit eviction: every read bumps the session counter;
     /// the first read to find a newer block's `side` evicted is news, and the 1st,
     /// 2nd, 4th … piece of news is logged.
-    ///
-    /// Not a line per read: an evicted block never comes back, and the status
-    /// observer re-reads a running block's command up to 4 times a second where no
-    /// OSC 633;E names it. Rows and block ids only grow, so a block no newer than the
-    /// newest seen for `side` is evicted there too: counted, not news. Not a line per
-    /// block either: where no nonce guards OSC 133 a program can start and scroll out
-    /// a block per look, so news is thinned by doubling. Each line carries both counts.
     fn record_block_eviction(&self, block_id: u64, side: BlockSide, start: u64, end: u64) {
         let count = self.shell.eviction_reads.get().saturating_add(1);
         self.shell.eviction_reads.set(count);
@@ -285,17 +215,9 @@ impl Terminal {
         );
     }
 
-    /// The command text from a block: OSC 633;E's explicit commandline when
-    /// present, else the text of the command rows.
-    ///
-    /// Returns [`BlockText::NotAvailable`] if no command was entered and
-    /// [`BlockText::Evicted`] if its rows left the scrollback or a full clear
-    /// blanked them after its command finished, or it lost them to a full
-    /// clear or an erase while it was being built
-    /// (`OutputBlock::command_text_cleared`).
+    /// The command text from a block: OSC 633;E's explicit commandline when present, else the text of the command rows.
     #[must_use]
     pub fn block_command_text(&self, block: &OutputBlock) -> BlockText {
-        // OSC 633;E's commandline is clean of prompt decorations and, stored on the
         // block, survives eviction.
         if let Some(ref cmd) = block.commandline {
             let trimmed = cmd.trim();
@@ -324,13 +246,6 @@ impl Terminal {
     }
 
     /// The output text from a block.
-    ///
-    /// Returns [`BlockText::NotAvailable`] if the command has not started
-    /// output and [`BlockText::Evicted`] if its rows left the scrollback or a
-    /// full clear blanked them after its command finished. A full clear while
-    /// the command ran moved the rows it blanked to the cleared screen's top
-    /// row, and an erase the rows it took to the oldest row left: the output
-    /// reads what is still in the history, then what the command wrote after.
     #[must_use]
     pub fn block_output_text(&self, block: &OutputBlock) -> BlockText {
         let Some((start, end)) = block.output_rows() else {
@@ -346,16 +261,14 @@ impl Terminal {
         result
     }
 
-    /// [`block_command_text`](Self::block_command_text) as an `Option`: `None` when
-    /// not available or evicted (an eviction is still logged and counted).
+    /// [`block_command_text`](Self::block_command_text) as an `Option`: `None` when not available or evicted (an eviction is still logged and counted).
     #[must_use]
     #[inline]
     pub fn block_command(&self, block: &OutputBlock) -> Option<String> {
         self.block_command_text(block).into_text()
     }
 
-    /// [`block_output_text`](Self::block_output_text) as an `Option`: `None` when not
-    /// available or evicted (an eviction is still logged and counted).
+    /// [`block_output_text`](Self::block_output_text) as an `Option`: `None` when not available or evicted (an eviction is still logged and counted).
     #[must_use]
     #[inline]
     pub fn block_output(&self, block: &OutputBlock) -> Option<String> {
@@ -371,40 +284,34 @@ mod eviction_tests {
     /// Drive one OSC 133 command block (prompt → command → output → done),
     /// with `cmd` typed and `output_lines` printed, then return.
     fn run_block(term: &mut Terminal, cmd: &str, output_lines: &[&str]) {
-        term.process(b"\x1b]133;A\x07"); // prompt start
+        term.process(b"\x1b]133;A\x07");
         term.process(format!("$ {cmd}").as_bytes());
-        term.process(b"\x1b]133;B\x07"); // command entered
+        term.process(b"\x1b]133;B\x07");
         term.process(b"\r\n");
-        term.process(b"\x1b]133;C\x07"); // command executing (output starts)
+        term.process(b"\x1b]133;C\x07");
         for line in output_lines {
             term.process(line.as_bytes());
             term.process(b"\r\n");
         }
-        term.process(b"\x1b]133;D;0\x07"); // command done, exit 0
+        term.process(b"\x1b]133;D;0\x07");
     }
 
     /// With a small scrollback cap, an old block whose rows scrolled away
     /// reports evicted, while a still-retained block returns its true output.
     #[test]
     fn evicted_block_returns_evicted_marker_retained_block_returns_true_output() {
-        // 4 visible rows + only 6 lines of ring scrollback: a tight cap so a few
-        // commands push the earliest block off the top.
         let mut term = TerminalBuilder::new()
             .size(4, 40)
             .ring_buffer_size(6)
             .build();
 
-        // Block 0: the one we will force out of scrollback.
         run_block(&mut term, "first", &["EVICT-ME-0", "EVICT-ME-1"]);
-        // Block 1: an older block that should still be retained after the churn.
         run_block(&mut term, "second", &["KEEP-ME-0", "KEEP-ME-1"]);
 
         let ids: Vec<u64> = term.all_blocks().map(|b| b.id).collect();
         assert!(ids.len() >= 2, "expected at least two blocks, got {ids:?}");
         let (evict_id, keep_id) = (ids[0], ids[1]);
 
-        // Churn: print many lines to scroll block 0's rows past the 6-line cap
-        // (well beyond visible_rows + scrollback_lines).
         for i in 0..40 {
             term.process(format!("filler-{i}\r\n").as_bytes());
         }
@@ -418,33 +325,25 @@ mod eviction_tests {
             .cloned()
             .expect("retained block id still tracked");
 
-        // The old block's output rows are now older than the oldest retained row:
-        // it must return the evicted marker, not shifted/empty text.
         let evicted = term.block_output_text(&evict_block);
         assert_eq!(
             evicted,
             BlockText::Evicted,
             "block whose rows scrolled past the cap must report Evicted, got {evicted:?}",
         );
-        // The `Option` wrapper returns None for an evicted block.
         assert_eq!(term.block_output(&evict_block), None);
 
-        // The eviction read was counted (we did two: enum + Option wrapper).
         assert!(
             term.block_eviction_read_count() >= 1,
             "eviction read must bump the session counter",
         );
 
-        // The id is known (monotonic), so this is genuinely "evicted", not
-        // "never existed": querying a never-assigned id returns no block at all.
         let bogus_id = ids.iter().copied().max().unwrap() + 1_000;
         assert!(
             term.block_by_id(bogus_id).is_none(),
             "a never-existed block id has no block (distinct from Evicted)",
         );
 
-        // The second block is also old but should still be within the retained
-        // window: its true output must come back, never shifted text.
         match term.block_output_text(&keep_block) {
             BlockText::Text(text) => {
                 assert!(
@@ -456,16 +355,13 @@ mod eviction_tests {
                     "retained block output must not be shifted into unrelated filler rows: {text:?}",
                 );
             }
-            // If the tight cap also evicted block 1, that is acceptable as long as
-            // it is reported as Evicted (never shifted text) — the core property.
             BlockText::Evicted => {}
             BlockText::NotAvailable => panic!("retained block unexpectedly NotAvailable"),
         }
     }
 
     /// The `aterm_log` records (level and message) written on this thread while
-    /// `body` runs. The logger keeps only a capturing thread's records, so tests
-    /// running beside it add nothing.
+    /// `body` runs.
     fn logged_on_this_thread(body: impl FnOnce()) -> Vec<String> {
         use std::cell::RefCell;
         thread_local! {
@@ -502,8 +398,6 @@ mod eviction_tests {
             .size(4, 40)
             .ring_buffer_size(6)
             .build();
-        // A finished block, then a running one with no 633;E whose output
-        // scrolls its own command line out of the history.
         run_block(&mut term, "first", &["out-a", "out-b"]);
         term.process(b"\x1b]133;A\x07$ long-job\x1b]133;B\x07\r\n\x1b]133;C\x07");
         for i in 0..40 {
@@ -515,13 +409,10 @@ mod eviction_tests {
 
         let lines = logged_on_this_thread(|| {
             for _ in 0..50 {
-                // The observer's read of the running command.
                 assert_eq!(term.block_command_text(&running), BlockText::Evicted);
                 assert_eq!(term.block_command(&running), None);
             }
-            // An older block's eviction is implied by the newer one's.
             assert_eq!(term.block_command_text(&older), BlockText::Evicted);
-            // The other side of a block is its own fact: once, too.
             for _ in 0..50 {
                 assert_eq!(term.block_output_text(&older), BlockText::Evicted);
             }
@@ -612,7 +503,6 @@ mod eviction_tests {
             "no shell integration yet: no completed block",
         );
 
-        // Complete but still current (no next A yet): its extent is unsealed.
         term.process(b"\x1b]133;A\x07$ ls");
         term.process(b"\x1b]133;B\x07\r\n");
         term.process(b"\x1b]133;C\x07OUT-1\r\nOUT-2\r\n\x1b]133;D;0\x07");
@@ -621,7 +511,6 @@ mod eviction_tests {
             "a Complete-but-current block has an open end_row (truncated span)",
         );
 
-        // The next prompt's A seals and archives it; both output lines read.
         term.process(b"\x1b]133;A\x07");
         let archived = term
             .last_completed_block()
@@ -643,7 +532,6 @@ mod eviction_tests {
             .size(6, 10)
             .ring_buffer_size(100)
             .build();
-        // 25 chars soft-wrap across rows 0..3 (no scroll: absolute rows 0..3).
         term.process(b"ABCDEFGHIJKLMNOPQRSTUVWXY");
         match term.text_range(0, 3) {
             BlockText::Text(t) => assert!(
@@ -652,7 +540,6 @@ mod eviction_tests {
             ),
             other => panic!("expected text, got {other:?}"),
         }
-        // A hard newline still separates logical lines (the join is wrap-only).
         let mut t2 = TerminalBuilder::new().size(6, 10).build();
         t2.process(b"AAA\r\nBBB");
         match t2.text_range(0, 2) {
@@ -668,9 +555,6 @@ mod eviction_tests {
     /// window reads as its text).
     #[test]
     fn block_output_reads_a_wrapped_line_as_printed() {
-        // `abcdefghi ` fills row 0 (the space lands in the last column) and
-        // `jklmn` soft-wraps onto the next row; `pad   ` ends a line in blanks;
-        // `foo` and its padding wrap.
         for (lines, want) in [
             (["abcdefghi jklmn", "pad   "], "abcdefghi jklmn\npad"),
             (["foo            ", "bar"], "foo\nbar"),

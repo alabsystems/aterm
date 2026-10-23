@@ -1,29 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHY LAND STILL HOLDS, AS THE WINDOW SAYS IT (
-//! `docs/DESIGN-harness-autopilot-2026-10-15.md` §12.3.1, §12.3.7): the wants
-//! a forever run holds each Land chain's hold to. Each is read from
-//! `status`'s `land_held= land_nudges= land_since=` (the record's status
-//! words, [`super::super::status_words`]), the tab's hover as the strip was
-//! last stamped with it (`driven by aterm (land: not landed yet, …)`,
-//! [`super::Window::hover`]) and, where its row is on the page's screen, its
-//! SESSIONS state line ([`super::Window::page`]).
-//!
-//! * From Land's instruction (L1, L16, L17): no hold before `land@v1`; after
-//!   it, `land_since=` the act's ledgered second and `land_nudges=` the
-//!   nudges typed since.
-//! * At a land act's yield that did not land (L2, L3, L4, L6, L8–L11): its
-//!   legs, and only its legs, on `status` (`land_held=open`, `needs`,
-//!   `repo`); the hover and the state line in their words —
-//!   each repository chain its own counts and no other leg, so every chain
-//!   is the live negative control of the others; L2's open words those its
-//!   nudge named (`open work in its report: <words>`, never quoted); a hover
-//!   still `driven by aterm (land)` long after `status` read the hold is a
-//!   stale push.
-//! * At the landing (L5, L16, L17): the three `-`, and no hold said.
-//!
-//! A `status` with no such field (a build before 3c, `?`) fails.
+//! WHY LAND STILL HOLDS.
 
 use aterm_agent::supervise::policy::turn_end;
 
@@ -31,28 +9,21 @@ use super::super::{at, word};
 use super::{Ctx, Seen, Verdict, observed, page_field, told};
 use crate::util::one_line;
 
-/// How far before the land act's journal line a read may already show its
 /// hold (the hold is told as the act is typed, the line written after).
 const TOLD_SLACK_MS: i64 = 2_000;
 
-/// How long after a nudge's journal line a read may still count the
 /// nudges before it (a read between the tell and the line).
 const NUDGE_SLACK_MS: i64 = 5_000;
 
-/// How long after `status` first reads a hold the strip may still show the
-/// hover from before it: the hold is on the timeline as the loop's call
-/// returns, the strip stamped again when the window's wake for it is
 /// applied, a look or two later at most.
 const HOVER_SLACK_MS: i64 = 10_000;
 
-/// One `status` read's hold, `[land_held, land_nudges, land_since]`;
 /// `None` where it prints no such field (`?`).
 fn fields(s: &str) -> Option<[String; 3]> {
     let f = |k: &str| word(s, k).filter(|v| v != "?");
     Some([f("land_held")?, f("land_nudges")?, f("land_since")?])
 }
 
-/// The first land act (`land@v1`): its journal time and its ledger row's
 /// second.
 fn began(seen: &Seen) -> Option<(i64, Option<i64>)> {
     let t = seen.acts(turn_end::RULE_LAND).first()?.0;
@@ -62,7 +33,6 @@ fn began(seen: &Seen) -> Option<(i64, Option<i64>)> {
     Some((t, row))
 }
 
-/// When the landing after `t` was journaled (`DONE `); past the watch where
 /// none was.
 fn landed_after(seen: &Seen, t: i64) -> i64 {
     seen.first_after("DONE ", t)
@@ -77,7 +47,6 @@ fn nudges_between(seen: &Seen, from: i64, until: i64) -> usize {
         .count()
 }
 
-/// Whether a read at `t` printing `n` nudges counts those typed since
 /// `from`: the nudges journaled before it, or before it less the slack.
 fn counts_nudges(seen: &Seen, from: i64, t: i64, n: &str) -> bool {
     let n = n.parse::<usize>().ok();
@@ -85,13 +54,11 @@ fn counts_nudges(seen: &Seen, from: i64, t: i64, n: &str) -> bool {
         || n == Some(nudges_between(seen, from, t - NUDGE_SLACK_MS))
 }
 
-/// The actual `status` reads in `(from, until)`, each with its hold
 /// fields; the first read with none, where one is.
 fn reads(seen: &Seen, from: i64, until: i64) -> Result<Vec<(i64, [String; 3])>, String> {
     reads_of(observed(&seen.status, &seen.status_reads, from, until))
 }
 
-/// The `status` reads of `list`, each with its hold fields; the first read
 /// with none, where one is.
 fn reads_of(list: Vec<(i64, &str)>) -> Result<Vec<(i64, [String; 3])>, String> {
     let mut out = Vec::new();
@@ -109,10 +76,7 @@ fn reads_of(list: Vec<(i64, &str)>) -> Result<Vec<(i64, [String; 3])>, String> {
     Ok(out)
 }
 
-/// L1 (and L16's and L17's start): the hold from Land's instruction — none
-/// before `land@v1` (every read then `land_held=- land_nudges=-
-/// land_since=-`), and after it `land_since=` the act's ledgered second
-/// with `land_nudges=` the nudges typed since (`0` before the first).
+/// L1 (and L16's and L17's start).
 pub fn begins(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let Some((t1, row_s)) = began(seen) else {
         return Verdict::Unobserved("no land act (its records)".into());
@@ -250,10 +214,7 @@ pub const L4: Legs = Legs {
     hover: &["1 untracked file"],
     not: &others(1),
 };
-/// L6: its need. The reply is taller than the window, and the loop reads
-/// it whole from the history above (`said_read_whole`), so it is not cut:
-/// no `cut` leg (§12.3.7's `needs,cut` is the reading of a reply the
-/// history cannot give whole, which 3a's unit test holds).
+/// L6: its need.
 pub const L6: Legs = Legs {
     legs: "needs",
     line: &["needs you"],
@@ -303,9 +264,6 @@ pub const L11: Legs = Legs {
     not: &others(4),
 };
 
-/// The words the open leg in `line` names (`open work in its report:
-/// follow-up, still open; …`: `follow-up`, `still open`), up to the next
-/// leg, the line's next part or the hover's end; split as the nudge's suffix
 /// is ([`nudge_named`]), so a word with a comma in it splits alike on both.
 fn named_words(line: &str) -> Vec<&str> {
     let Some((_, rest)) = line.split_once("open work in its report: ") else {
@@ -319,7 +277,6 @@ fn named_words(line: &str) -> Vec<&str> {
     rest[..end].split(", ").collect()
 }
 
-/// L2: the words the nudge after `t1` named open (`Your report still names
 /// open work (<words>): …`); `None` before a nudge.
 fn nudge_named(seen: &Seen, t1: i64) -> Option<Vec<String>> {
     let nudge = seen
@@ -341,13 +298,7 @@ fn nudge_named(seen: &Seen, t1: i64) -> Option<Vec<String>> {
     )
 }
 
-/// L2, L3, L4, L6, L8–L11: at a land act's yield that did not land, its
-/// legs and no other on `status` (`land_held=<legs>`), the nudges counted;
-/// the hover `driven by aterm (land: not landed yet, …)` in its words and
-/// no other leg's — a hover still `driven by aterm (land)` past
-/// [`HOVER_SLACK_MS`] after `status` read the hold, while it stands, is a
-/// stale push; the state line `not landed yet: …` alike where its row is on
-/// the page's screen. L2's open words are those its nudge named.
+/// L2, L3, L4, L6, L8–L11.
 pub fn legs(seen: &Seen, cx: &Ctx<'_>, want: Legs) -> Verdict {
     let Some((t1, _)) = began(seen) else {
         return Verdict::Unobserved("no land act (its records)".into());
@@ -382,7 +333,6 @@ pub fn legs(seen: &Seen, cx: &Ctx<'_>, want: Legs) -> Verdict {
             nudges_between(seen, t1, *t)
         ));
     }
-    // The hover, in its words.
     let w = &seen.window;
     let says = |line: &str, words: &[&str]| {
         words.iter().all(|x| line.contains(x)) && !want.not.iter().any(|x| line.contains(x))
@@ -395,8 +345,6 @@ pub fn legs(seen: &Seen, cx: &Ctx<'_>, want: Legs) -> Verdict {
         .collect();
     let hover = hovers.iter().find(|(_, h)| says(h, want.hover));
     if hover.is_none() {
-        // A STALE PUSH: `status` read the hold and still reads it a look or
-        // two later, and the strip still shows the hover from before it.
         let late = held
             .first()
             .map(|(t, _)| t + HOVER_SLACK_MS)
@@ -432,23 +380,12 @@ pub fn legs(seen: &Seen, cx: &Ctx<'_>, want: Legs) -> Verdict {
             ));
         }
     }
-    // The state line, where its row is on the page's screen.
-    // A line that says the hold counts from the land act on: no state line
-    // says `not landed yet: ` before the act's yield, so the page read of
-    // the look that first saw the hold on `status`, stamped a moment before
-    // that `status` read (Claude Code 2.1.308's L4, 2026-10-22: +128.0 s
-    // against +128.1 s), still counts.
     let lines: Vec<(i64, &str)> = observed(&w.page, &w.page_reads, t1, until)
         .into_iter()
         .filter_map(|(t, p)| Some((t, page_field(p, "state")?)))
         .filter(|(_, l)| l.starts_with("not landed yet: "))
         .collect();
     let line = lines.iter().find(|(_, l)| says(l, want.line));
-    // Whether the row was on the screen is read only once status has
-    // observed the leg: the page may have been on screen before the yield,
-    // then off screen while the leg stood. An unchanged row actually read
-    // during the hold still counts. A row cut off by the screen's bottom
-    // edge reads `-` (`surfaces::page_of`).
     let page_from = held.first().map_or(until, |(t, _)| t.saturating_sub(1));
     let page_reads = observed(&w.page, &w.page_reads, page_from, until);
     let on_page = page_reads.iter().any(|(_, p)| *p != "-");
@@ -464,7 +401,6 @@ pub fn legs(seen: &Seen, cx: &Ctx<'_>, want: Legs) -> Verdict {
     } else if page_reads.is_empty() {
         unread.push("no Harness page read after Land's instruction".into());
     }
-    // L2: the open words are those its nudge named, never quoted.
     if want.legs == "open" {
         match nudge_named(seen, t1) {
             Some(named) => {
@@ -511,16 +447,11 @@ pub fn legs(seen: &Seen, cx: &Ctx<'_>, want: Legs) -> Verdict {
     told(said, &bad, &unread)
 }
 
-/// L5 (and L16's and L17's end): at the landing the hold goes — every read
-/// after it `land_held=- land_nudges=- land_since=-`, no hover saying `not
-/// landed yet`, no state line `landing since` or `not landed yet`.
+/// L5 (and L16's and L17's end).
 pub fn gone(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let Some((d, _)) = seen.first_after("DONE ", cx.t0) else {
         return Verdict::Unobserved("no landing (its records)".into());
     };
-    // Only actual observations after the landing's propagation slack. A
-    // repeated stale value is still observed even though its change history
-    // has no new entry; a pre-landing value alone proves nothing either way.
     let after = *d + TOLD_SLACK_MS;
     let read = match reads(seen, after, seen.end_ms + 1) {
         Ok(r) => r,
@@ -573,8 +504,7 @@ pub fn gone(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     )
 }
 
-/// L16, L17: a hold from Land's instruction ([`begins`]), gone at the
-/// landing ([`gone`]).
+/// L16, L17: a hold from Land's instruction ([`begins`]), gone at the landing ([`gone`]).
 pub fn begins_then_gone(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let (a, b) = (begins(seen, cx), gone(seen, cx));
     let why = format!(

@@ -304,15 +304,15 @@ macro_rules! copy_property {
     ($(#[$doc:meta])* $field:ident: $ty:ty, $getter:ident, $setter:ident, $clearer:ident) => {
         $(#[$doc])*
         #[inline]
-        pub fn $getter(&self) -> Option<$ty> {
+        pub const fn $getter(&self) -> Option<$ty> {
             self.$field
         }
         #[inline]
-        pub fn $setter(&mut self, value: $ty) {
+        pub const fn $setter(&mut self, value: $ty) {
             self.$field = Some(value);
         }
         #[inline]
-        pub fn $clearer(&mut self) {
+        pub const fn $clearer(&mut self) {
             self.$field = None;
         }
     };
@@ -342,15 +342,15 @@ macro_rules! flag {
     ($(#[$doc:meta])* $field:ident, $getter:ident, $setter:ident, $clearer:ident) => {
         $(#[$doc])*
         #[inline]
-        pub fn $getter(&self) -> bool {
+        pub const fn $getter(&self) -> bool {
             self.$field
         }
         #[inline]
-        pub fn $setter(&mut self) {
+        pub const fn $setter(&mut self) {
             self.$field = true;
         }
         #[inline]
-        pub fn $clearer(&mut self) {
+        pub const fn $clearer(&mut self) {
             self.$field = false;
         }
     };
@@ -366,32 +366,32 @@ impl Node {
     }
 
     #[inline]
-    pub fn role(&self) -> Role {
+    pub const fn role(&self) -> Role {
         self.role
     }
 
     #[inline]
-    pub fn set_role(&mut self, value: Role) {
+    pub const fn set_role(&mut self, value: Role) {
         self.role = value;
     }
 
     #[inline]
-    pub fn supports_action(&self, action: Action) -> bool {
+    pub const fn supports_action(&self, action: Action) -> bool {
         (self.actions & action.mask()) != 0
     }
 
     #[inline]
-    pub fn add_action(&mut self, action: Action) {
+    pub const fn add_action(&mut self, action: Action) {
         self.actions |= action.mask();
     }
 
     #[inline]
-    pub fn remove_action(&mut self, action: Action) {
+    pub const fn remove_action(&mut self, action: Action) {
         self.actions &= !(action.mask());
     }
 
     #[inline]
-    pub fn clear_actions(&mut self) {
+    pub const fn clear_actions(&mut self) {
         self.actions = 0;
     }
 
@@ -625,7 +625,7 @@ pub struct Tree {
 
 impl Tree {
     #[inline]
-    pub fn new(root: NodeId) -> Tree {
+    pub const fn new(root: NodeId) -> Tree {
         Tree {
             root,
             toolkit_name: None,

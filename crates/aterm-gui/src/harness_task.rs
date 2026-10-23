@@ -264,6 +264,8 @@ pub(crate) fn task_record(
 }
 
 /// `{head} {place}` (`Autopilot landed in tab 3`), or where that breaks the
+/// glass title rule (a place that names a window), `{head}, {place past its
+/// "in "}`; a session no tab shows, `{head}` alone.
 fn placed(head: &str, place: &str) -> String {
     let Some(bare) = place.strip_prefix("in ").filter(|b| *b != "its tab") else {
         return head.to_string();
@@ -277,6 +279,7 @@ fn placed(head: &str, place: &str) -> String {
 }
 
 /// `{Place}: {text}` (`Tab 3: all of the work …`), or `text` alone for a
+/// session no tab shows: the line leads with the tab it is about.
 fn tab_led(place: &str, text: &str) -> String {
     match place.strip_prefix("in ") {
         Some(bare) if bare != "its tab" => {

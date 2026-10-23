@@ -2,35 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-// Registers the `trust` tool attribute (`#[trust::skip]`) under the `trust_verify` cfg.
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
 
 //! Shell integration injection for aterm.
-//!
-//! Embeds the zsh, bash, fish and PowerShell integration scripts and injects them at
-//! shell startup with no user configuration:
-//!
-//! | Shell | Mechanism | How |
-//! |-------|-----------|-----|
-//! | zsh   | ZDOTDIR override | Wrapper `.zshenv` sources user config then ours |
-//! | bash  | `--rcfile` (Git Bash: `--login --posix` + `ENV`) | Loader reads `~/.bashrc` (macOS: the login profiles too; Git Bash: what a login shell reads) then ours |
-//! | fish  | `XDG_DATA_DIRS` | Vendor conf.d auto-loading |
-//! | pwsh/powershell | `-NoExit -Command` | Argv override dot-sources our `.ps1` after profiles, then lays readline's chords over PSReadLine's Windows mode (`prepare_powershell`) |
-//! | wsl   | `WSLENV` + `wsl.exe --exec` | `/p` path-translates our dir, then bash's `--rcfile` runs inside the distro |
-//! | cmd   | `PROMPT` | `$e` OSC 0 title + OSC 133 A/B + OSC 633 `Cwd=` woven around the user's prompt |
-//!
-//! # Usage
-//!
-//! ```rust,no_run
-//! use aterm_shell_integration::{ShellType, prepare};
-//!
-//! let shell = ShellType::detect("/bin/zsh");
-//! if let Ok(Some(injection)) = prepare(shell) {
-//!     // Add injection.env_add to the child's environment before fork
-//!     // Use injection.argv_override if Some (bash --rcfile)
-//! }
-//! ```
 #![cfg_attr(
     test,
     allow(
@@ -45,8 +20,7 @@ use std::sync::{Mutex, PoisonError};
 mod shell_args;
 pub use shell_args::{ArgsMerge, merge_shell_args, shell_args_bypass};
 
-/// The shell integration scripts, compiled in. `aterm-core` re-exports this crate as
-/// `shell_integration`.
+/// The shell integration scripts, compiled in.
 pub mod scripts {
     /// zsh shell integration (OSC 7/133 + prompt override).
     pub const ZSH: &str = include_str!("scripts/aterm_shell_integration.zsh");
@@ -57,26 +31,20 @@ pub mod scripts {
     /// PowerShell / pwsh shell integration (OSC 7/133 + the readline key layer).
     pub const POWERSHELL: &str = include_str!("scripts/aterm_shell_integration.ps1");
 
-    /// Sourced once by the zsh body (`aterm_shell_integration_old_bin.zsh`) when
-    /// upgrading an already-running shell in place (`__aterm_old_bin_off` unset) to
-    /// remove any legacy `~/.aterm/bin` PATH entry. Kept separate so fresh shells
-    /// do not pay to parse it.
+    /// Sourced once by the zsh body (`aterm_shell_integration_old_bin.zsh`) when upgrading an already-running shell in place (`__aterm_old_bin_off` unset) to remove any legacy `~/.aterm/bin` PATH entry.
     pub const ZSH_OLD_BIN: &str = include_str!("scripts/aterm_shell_integration_old_bin.zsh");
     /// The bash twin of [`ZSH_OLD_BIN`].
     pub const BASH_OLD_BIN: &str = include_str!("scripts/aterm_shell_integration_old_bin.bash");
     /// The fish twin of [`ZSH_OLD_BIN`].
     pub const FISH_OLD_BIN: &str = include_str!("scripts/aterm_shell_integration_old_bin.fish");
 
-    /// Marker comment opening the live-reloadable body section of the zsh, bash,
-    /// and fish scripts.
+    /// Marker comment opening the live-reloadable body section of the zsh, bash, and fish scripts.
     pub const BODY_BEGIN: &str = "# @@ATERM-INTEGRATION-BODY-BEGIN@@";
 
     /// Marker comment closing the body section ([`BODY_BEGIN`]).
     pub const BODY_END: &str = "# @@ATERM-INTEGRATION-BODY-END@@";
 
-    /// Extract the reloadable body of `script` ([`ZSH`], [`BASH`], or [`FISH`]) from
-    /// the start of its [`BODY_BEGIN`] line through the end of its [`BODY_END`]
-    /// line, or `None` if absent.
+    /// Extract the reloadable body of `script` ([`ZSH`], [`BASH`], or [`FISH`]) from the start of its [`BODY_BEGIN`] line through the end of its [`BODY_END`] line, or `None` if absent.
     #[must_use]
     #[inline]
     pub fn body(script: &str) -> Option<&str> {
@@ -102,17 +70,13 @@ const BODY_FILE_HEADER: &str = "\
 /// File stem for standalone body scripts (`aterm_shell_integration_body.<ext>`).
 pub const BODY_FILE_STEM: &str = "aterm_shell_integration_body";
 
-/// Environment variable naming the per-session body pointer file. Captured and
-/// scrubbed by the zsh/bash/fish loaders and checked at every prompt
-/// (`__aterm_body_check`) for a 16-hex script folder address to reload.
+/// Environment variable naming the per-session body pointer file.
 pub const BODY_POINTER_VAR: &str = "ATERM_INTEGRATION_POINTER";
 
 /// OSC 633 `P` property key signed before every prompt (`633;P;AtermIntegration=<16-hex>;id=<nonce>`).
 pub const INTEGRATION_REV_KEY: &str = "AtermIntegration";
 
-/// OSC 633 `P` property key signed alongside OSC 7 before each prompt
-/// (`633;P;AtermCwd=<URI>;id=<nonce>`) to authenticate the shell's CWD report
-/// while leaving plain OSC 7 unnonced.
+/// OSC 633 `P` property key signed alongside OSC 7 before each prompt (`633;P;AtermCwd=<URI>;id=<nonce>`) to authenticate the shell's CWD report while leaving plain OSC 7 unnonced.
 pub const CWD_REPORT_KEY: &str = "AtermCwd";
 
 /// Whether `shell` has a loader that supports live body reloading via [`BODY_POINTER_VAR`].
@@ -139,8 +103,7 @@ pub enum ShellType {
     Bash,
     /// Fish (injected via XDG_DATA_DIRS vendor conf.d).
     Fish,
-    /// PowerShell / pwsh (injected via `-NoExit -Command` argv override
-    /// that dot-sources the embedded `.ps1` after profiles load).
+    /// PowerShell / pwsh (injected via `-NoExit -Command` argv override that dot-sources the embedded `.ps1` after profiles load).
     PowerShell,
     /// `wsl.exe` (injected via `WSLENV` and `wsl.exe --exec`; see [`prepare_wsl`]).
     Wsl,
@@ -151,15 +114,10 @@ pub enum ShellType {
 }
 
 impl ShellType {
-    /// Detect shell type from a command path (e.g. "/bin/zsh", "bash",
-    /// `C:\Program Files\PowerShell\7\pwsh.exe`).
-    ///
-    /// Matching is case-insensitive and ignores a trailing `.exe`.
+    /// Detect shell type from a command path (e.g. "/bin/zsh", "bash", `C:\Program Files\PowerShell\7\pwsh.exe`).
     #[must_use]
     #[inline]
     pub fn detect(shell_path: &str) -> Self {
-        // Split on both `/` and `\` regardless of host OS so Windows paths in
-        // configs, handoffs, or test fixtures parse on Unix too.
         let tail = shell_path.rsplit(['/', '\\']).next().unwrap_or(shell_path);
         let name = tail.to_ascii_lowercase();
         let name = name.strip_suffix(".exe").unwrap_or(&name);
@@ -174,8 +132,7 @@ impl ShellType {
         }
     }
 
-    /// Detect the default interactive shell aterm will launch (`$SHELL` on Unix,
-    /// `PowerShell` on Windows).
+    /// Detect the default interactive shell aterm will launch (`$SHELL` on Unix, `PowerShell` on Windows).
     #[must_use]
     #[inline]
     pub fn detect_current() -> Self {
@@ -285,7 +242,7 @@ pub const fn decode_integration_rev_le(bytes: [u8; 16]) -> (u64, u32, u32) {
 pub struct InjectionEnv {
     /// Environment variables to set in the child process.
     pub env_add: Vec<(String, String)>,
-    /// For bash: override argv to use `--rcfile`. `None` for other shells.
+    /// For bash: override argv to use `--rcfile`.
     pub argv_override: Option<Vec<String>>,
 }
 
@@ -297,10 +254,6 @@ pub const SHELL_NONCE_BYTES: usize = 32;
 pub const SHELL_NONCE_HEX_LEN: usize = SHELL_NONCE_BYTES * 2;
 
 /// A freshly generated 32-byte CSPRNG nonce for OSC 133/633 gating.
-///
-/// Produced by [`generate_nonce`]. Carries both the raw bytes (for
-/// `Terminal::authorize_shell_integration` in `aterm-core`) and the hex
-/// encoding (for the `ATERM_SHELL_NONCE` child env var).
 #[derive(Debug, Clone)]
 pub struct ShellNonce {
     raw: [u8; SHELL_NONCE_BYTES],
@@ -308,17 +261,14 @@ pub struct ShellNonce {
 }
 
 impl ShellNonce {
-    /// 64-char lowercase hex encoding to set as `ATERM_SHELL_NONCE` in the
-    /// child shell environment.
+    /// 64-char lowercase hex encoding to set as `ATERM_SHELL_NONCE` in the child shell environment.
     #[must_use]
     #[inline]
     pub const fn hex(&self) -> &str {
         self.hex.as_str()
     }
 
-    /// Consume the nonce and return both halves: the raw bytes authorize the
-    /// terminal (`Terminal::authorize_shell_integration`), the hex is injected
-    /// into the child environment.
+    /// Consume the nonce and return both halves: the raw bytes authorize the terminal (`Terminal::authorize_shell_integration`), the hex is injected into the child environment.
     #[must_use]
     #[inline]
     pub fn into_parts(self) -> ([u8; SHELL_NONCE_BYTES], String) {
@@ -327,14 +277,7 @@ impl ShellNonce {
 }
 
 /// Generate a fresh 32-byte shell-integration capability-nonce from the OS CSPRNG.
-///
-/// The host is responsible for:
-/// 1. Installing the raw bytes via `Terminal::authorize_shell_integration`.
-/// 2. Setting `ATERM_SHELL_NONCE=<hex>` in the spawned shell's environment
-///    (see [`augment_with_nonce`]).
-/// 3. Enabling `TerminalModes::require_shell_integration_nonce`.
 #[must_use]
-// Trust: `fill_nonce_entropy` panics only on unrecoverable OS CSPRNG failure.
 #[cfg_attr(trust_verify, trust::skip)]
 #[cfg(any(unix, windows))]
 pub fn generate_nonce() -> ShellNonce {
@@ -356,8 +299,6 @@ fn fill_nonce_entropy(buf: &mut [u8; SHELL_NONCE_BYTES]) {
 #[cfg(any(unix, windows))]
 pub fn hex_encode(bytes: &[u8; SHELL_NONCE_BYTES]) -> String {
     let mut out = String::with_capacity(SHELL_NONCE_HEX_LEN);
-    // Trust: bind `&b` by value so shifts/masks lower as primitive `u8` MIR ops
-    // rather than `&u8` reference-operator shims absent from the bundle.
     for &b in bytes {
         out.push(nibble_to_hex(b >> 4));
         out.push(nibble_to_hex(b & 0x0F));
@@ -370,16 +311,14 @@ const fn nibble_to_hex(n: u8) -> char {
     match n {
         0..=9 => (b'0' + n) as char,
         10..=15 => (b'a' + (n - 10)) as char,
-        _ => '0', // unreachable: caller masks to 4 bits
+        _ => '0',
     }
 }
 
-/// Placeholder token substituted by [`augment_with_nonce`] in `%PROMPT%` for
-/// `cmd.exe` (which does not expand `%VAR%` inside an inherited `PROMPT`).
+/// Placeholder token substituted by [`augment_with_nonce`] in `%PROMPT%` for `cmd.exe` (which does not expand `%VAR%` inside an inherited `PROMPT`).
 pub const NONCE_PLACEHOLDER: &str = "@ATERM_SHELL_NONCE@";
 
-/// Append `ATERM_SHELL_NONCE=<hex>` to an [`InjectionEnv`]'s env list, and
-/// substitute [`NONCE_PLACEHOLDER`] wherever an injector left it.
+/// Append `ATERM_SHELL_NONCE=<hex>` to an [`InjectionEnv`]'s env list, and substitute [`NONCE_PLACEHOLDER`] wherever an injector left it.
 pub fn augment_with_nonce(injection: &mut InjectionEnv, hex: &str) {
     injection.env_add.retain(|(k, _)| k != "ATERM_SHELL_NONCE");
     for (_, value) in &mut injection.env_add {
@@ -395,9 +334,7 @@ pub fn augment_with_nonce(injection: &mut InjectionEnv, hex: &str) {
 /// Environment variable naming a session's re-key file (`__aterm_rekey_check`).
 pub const REKEY_PATH_VAR: &str = "ATERM_REKEY_PATH";
 
-/// Suffix appended to [`REKEY_PATH_VAR`] (`<re-key path>.trap`) for handing over
-/// the startup DEBUG trap to the bash integration without a subshell fork
-/// (`bash_debug_trap_handover!`).
+/// Suffix appended to [`REKEY_PATH_VAR`] (`<re-key path>.trap`) for handing over the startup DEBUG trap to the bash integration without a subshell fork (`bash_debug_trap_handover!`).
 pub const DEBUG_TRAP_SUFFIX: &str = ".trap";
 
 /// Whether `shell` carries the re-key hook (`__aterm_rekey_check`).
@@ -407,8 +344,7 @@ pub const fn has_rekey_hook(shell: ShellType) -> bool {
     matches!(shell, ShellType::Zsh | ShellType::Bash | ShellType::Fish)
 }
 
-/// Subdirectory under the host's control dir holding warm-spare hold FIFOs
-/// (`<control dir>/spare/<sid>`, derived by the shell from [`REKEY_PATH_VAR`]).
+/// Subdirectory under the host's control dir holding warm-spare hold FIFOs (`<control dir>/spare/<sid>`, derived by the shell from [`REKEY_PATH_VAR`]).
 pub const SPARE_DIR: &str = "spare";
 
 /// OSC 633 `P` key emitted when a spare shell parks before startup files (`633;P;AtermSpare=parked;id=<nonce>`).
@@ -423,8 +359,7 @@ pub const START_RC_KEY: &str = "AtermStartRc";
 /// Start record's flags (`pre:<n>,s:<n>,j:<n|->,r:<0|1>`).
 pub const START_FLAGS_KEY: &str = "AtermStartFlags";
 
-/// Start record's additional startup roots for fish (sysconf and vendor `conf.d`
-/// directories joined by `\x00` and 633 `E`-escaped).
+/// Start record's additional startup roots for fish (sysconf and vendor `conf.d` directories joined by `\x00` and 633 `E`-escaped).
 pub const START_ROOTS_KEY: &str = "AtermStartRoots";
 
 /// Whether `shell` supports a warm-spare hold at its first prompt (macOS and Linux).
@@ -435,16 +370,14 @@ pub const fn has_spare_hold(shell: ShellType) -> bool {
         && matches!(shell, ShellType::Zsh | ShellType::Bash | ShellType::Fish)
 }
 
-/// Whether `shell`'s wrapper supports a parked hold before user startup files
-/// (zsh `.zshenv` and bash `--rcfile`).
+/// Whether `shell`'s wrapper supports a parked hold before user startup files (zsh `.zshenv` and bash `--rcfile`).
 #[must_use]
 #[inline]
 pub const fn has_parked_hold(shell: ShellType) -> bool {
     has_spare_hold(shell) && matches!(shell, ShellType::Zsh | ShellType::Bash)
 }
 
-/// System startup files `shell` reads before aterm's parked hold (`/etc/zshenv`
-/// and `/etc/zsh/zshenv` for zsh; `/etc/bash.bashrc` for bash on Linux).
+/// System startup files `shell` reads before aterm's parked hold (`/etc/zshenv` and `/etc/zsh/zshenv` for zsh; `/etc/bash.bashrc` for bash on Linux).
 #[must_use]
 #[inline]
 pub const fn pre_hold_files(shell: ShellType) -> &'static [&'static str] {
@@ -455,10 +388,7 @@ pub const fn pre_hold_files(shell: ShellType) -> &'static [&'static str] {
     }
 }
 
-/// Build a shell snippet that reads a new nonce from `quoted_path`, updates
-/// `__aterm_shell_nonce` and `__aterm_id_suffix_str` with stderr silenced (so
-/// `set -x` on stderr does not trace the key), and deletes `quoted_path`. Used
-/// for shells spawned before the re-key file channel existed.
+/// Build a shell snippet that reads a new nonce from `quoted_path`, updates `__aterm_shell_nonce` and `__aterm_id_suffix_str` with stderr silenced (so `set -x` on stderr does not trace the key), and deletes `quoted_path`.
 #[must_use]
 pub fn typed_rekey(shell: ShellType, quoted_path: &str) -> Option<String> {
     let p = quoted_path;
@@ -476,11 +406,7 @@ pub fn typed_rekey(shell: ShellType, quoted_path: &str) -> Option<String> {
     }
 }
 
-/// Build a shell snippet that performs [`typed_rekey`] and upgrades a pre-loader
-/// shell's integration in place by reading up to three lines from `quoted_path`
-/// (nonce key, script directory, and body pointer path), assigning the key first
-/// so the immediate revision mark is signed with it, and sourcing the loader.
-/// Nested shells lack the unexported prompt hook function and stop at the loader guard.
+/// Build a shell snippet that performs [`typed_rekey`] and upgrades a pre-loader shell's integration in place by reading up to three lines from `quoted_path` (nonce key, script directory, and body pointer path), assigning the key first so the immediate revision mark is signed with it, and sourcing the loader.
 #[must_use]
 pub fn typed_rekey_with_loader(shell: ShellType, quoted_path: &str) -> Option<String> {
     let p = quoted_path;
@@ -516,26 +442,18 @@ pub fn typed_rekey_with_loader(shell: ShellType, quoted_path: &str) -> Option<St
 static SCRIPTS_WRITTEN: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// Prepare shell integration for `shell`.
-///
-/// Installs this build's scripts under `<cache>/<content address>/`
-/// ([`script_set_address`], write-once via temp dir + rename so concurrent builds
-/// never overwrite each other's scripts) and returns the child environment
-/// modifications. Returns `None` for [`ShellType::Unknown`].
 #[inline]
 pub fn prepare(shell: ShellType) -> Result<Option<InjectionEnv>, std::io::Error> {
     prepare_cached(shell, cache_dir(), &SCRIPTS_WRITTEN)
 }
 
-/// Ensure this build's content-addressed script directory (`<cache>/<address>/`)
-/// is installed and return its path.
+/// Ensure this build's content-addressed script directory (`<cache>/<address>/`) is installed and return its path.
 #[inline]
 pub fn ensure_script_set() -> Result<PathBuf, std::io::Error> {
     ensure_cached(cache_dir(), &SCRIPTS_WRITTEN)
 }
 
-/// Compile the zsh loader and body in `dir` to `.zwc` wordcode (`zcompile -U`
-/// under `zsh -f`, staged via a `.zwc` temp file and renamed into place).
-///
+/// Compile the zsh loader and body in `dir` to `.zwc` wordcode (`zcompile -U` under `zsh -f`, staged via a `.zwc` temp file and renamed into place).
 /// # Errors
 /// When `zsh` cannot be run, `zcompile` fails, or the rename fails.
 #[cfg(any(unix, windows))]
@@ -548,7 +466,6 @@ pub fn compile_zsh_scripts(dir: &Path, zsh: &Path) -> Result<(), std::io::Error>
         if compiled.exists() {
             continue;
         }
-        // Ends in `.zwc`, or `zcompile` would append it.
         let scratch = dir.join(format!(".{name}.tmp-{}.zwc", scratch_suffix()));
         let status = aterm_uds::spawnfd::command(zsh)
             .args(["-f", "-c", "zcompile -U -- \"$1\" \"$2\"", "zsh"])
@@ -574,8 +491,6 @@ pub fn compile_zsh_scripts(dir: &Path, zsh: &Path) -> Result<(), std::io::Error>
 }
 
 /// [`prepare`] body with the cache root and memoization state injected for testing.
-// Skip: `Option<PathBuf>::as_deref` dispatches PathBuf's Deref through the
-// generic trait path.
 #[cfg_attr(trust_verify, trust::skip)]
 fn prepare_cached(
     shell: ShellType,
@@ -588,7 +503,6 @@ fn prepare_cached(
 
 /// Install this build's folder under `root` unless `written` already records it
 /// and its primary script still exists on disk.
-// Skip: `Option<PathBuf>::as_deref` through the generic trait path.
 #[cfg_attr(trust_verify, trust::skip)]
 fn ensure_cached(
     root: PathBuf,
@@ -653,8 +567,6 @@ fn script_set() -> [(&'static str, std::borrow::Cow<'static, str>); 14] {
             "aterm_shell_integration_old_bin.fish",
             lf_only(scripts::FISH_OLD_BIN),
         ),
-        // Written without a BOM (ASCII-only so Windows PowerShell 5.1 ANSI
-        // decoding reads it cleanly).
         (
             "aterm_shell_integration.ps1",
             std::borrow::Cow::Borrowed(scripts::POWERSHELL),
@@ -688,8 +600,6 @@ fn installed_bash() -> &'static str {
 }
 
 /// Strip standalone `#` comment lines from `script` (preserving a leading `#!`
-/// and [`scripts::BODY_BEGIN`] / [`scripts::BODY_END`] markers) to reduce shell
-/// parse time at startup (~1.2 ms faster on zsh 5.9, ~1.9 ms on bash 3.2).
 fn strip_comment_lines(script: &str) -> String {
     let mut out = String::with_capacity(script.len());
     for (index, line) in script.split_inclusive('\n').enumerate() {
@@ -705,8 +615,7 @@ fn strip_comment_lines(script: &str) -> String {
     out
 }
 
-/// Compute the 16-hex content address of [`script_set`] using `aterm_hash::FxHasher`
-/// (0.028 ms over the script set; verified byte-for-byte on disk by [`script_set_matches`]).
+/// Compute the 16-hex content address of [`script_set`] using `aterm_hash::FxHasher` (0.028 ms over the script set; verified byte-for-byte on disk by [`script_set_matches`]).
 #[must_use]
 pub fn script_set_address() -> &'static str {
     static ADDRESS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -770,7 +679,6 @@ fn install_script_set(root: &Path) -> Result<PathBuf, std::io::Error> {
         return Err(e);
     }
     for _ in 0..2 {
-        // `rename(2)` over a non-empty directory fails, preventing a racing writer
         // from overwriting a completed folder.
         if std::fs::rename(&tmp, &dir).is_ok() {
             return Ok(dir);
@@ -875,9 +783,7 @@ fn injection_for(shell: ShellType, base: &Path) -> Option<InjectionEnv> {
 
 /// Cache directory for shell integration files (`$XDG_CACHE_HOME/aterm/shell-integration`
 /// or `~/.cache/aterm/shell-integration` on Unix; `%LOCALAPPDATA%\aterm\shell-integration`
-/// on Windows). Kept outside temp roots so Seatbelt-contained shells cannot modify
-/// scripts read by unsandboxed tabs. In test binaries without `XDG_CACHE_HOME`,
-/// routes under `aterm_uds::test_binary::scratch_root()`.
+/// on Windows).
 fn cache_dir() -> PathBuf {
     #[cfg(any(unix, windows))]
     if let Some(root) = aterm_uds::test_binary::scratch_root()
@@ -914,7 +820,6 @@ fn per_user_cache_dir() -> PathBuf {
 }
 
 /// Write one integration script or wrapper file.
-// Skip: `File::create`'s `raw_path_api` hardening flag requires capability contracts.
 #[cfg_attr(trust_verify, trust::skip)]
 fn write_script(path: &Path, contents: &str) -> Result<(), std::io::Error> {
     use std::io::Write;
@@ -946,10 +851,7 @@ fn ensure_scripts(base: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-/// Parked-hold prelude shared by zsh (`.zshenv`) and bash (`--rcfile`) wrappers:
-/// if the session's spare FIFO exists, emit `633;P;AtermSpare=parked` and wait for
-/// `run` (proceed to warm hold at first prompt), `go`, or `go <folder>` (retarget
-/// working directory and preserve `OLDPWD` per shell convention).
+/// Parked-hold prelude shared by zsh (`.zshenv`) and bash (`--rcfile`) wrappers: if the session's spare FIFO exists, emit `633;P;AtermSpare=parked` and wait for `run` (proceed to warm hold at first prompt), `go`, or `go <folder>` (retarget working directory and preserve `OLDPWD` per shell convention).
 macro_rules! spare_parked_hold {
     () => {
         "\
@@ -990,11 +892,7 @@ unset __aterm_spare_n __aterm_spare_go __aterm_spare_cd __aterm_spare_o
     };
 }
 
-/// Capture any DEBUG trap set by user startup files into `<re-key path>.trap`
-/// (or `$__aterm_rc_debug_trap`) and clear it before sourcing the bash
-/// integration, since `.` hides the caller's DEBUG trap unless `functrace` is set
-/// (and bash 3.2 restores the caller's trap on return from `.`). Skipped if
-/// `ATERM_SHELL_INTEGRATION_INSTALLED` is already set by a user rc file.
+/// Capture any DEBUG trap set by user startup files into `<re-key path>.trap` (or `$__aterm_rc_debug_trap`) and clear it before sourcing the bash integration, since `.` hides the caller's DEBUG trap unless `functrace` is set (and bash 3.2 restores the caller's trap on return from `.`).
 macro_rules! bash_debug_trap_handover {
     () => {
         "\
@@ -1040,8 +938,7 @@ source \"$ATERM_SHELL_INTEGRATION_DIR/aterm_shell_integration.zsh\"
 );
 
 /// Login-style bash `--rcfile` wrapper used on macOS and inside WSL
-/// ([`WSL_LAUNCH_SH`]). Sources `/etc/profile`, the first login profile
-/// (`.bash_profile`, `.bash_login`, or `.profile`), `.bashrc`, and our integration.
+/// ([`WSL_LAUNCH_SH`]).
 const BASH_WRAPPER: &str = concat!(
     spare_parked_hold!(),
     "\
@@ -1067,13 +964,6 @@ fi
 
 /// Bash loader used on non-macOS Unix (`bash --rcfile`) and Git Bash
 /// (`bash --login --posix` via `$ENV`, [`BASH_LOGIN_START`]).
-///
-/// For non-login shells (`--rcfile`), bash has already read `/etc/bash.bashrc`,
-/// so this reads `~/.bashrc` (or `ATERM_BASH_RCFILE`) once without re-sourcing
-/// `/etc/profile` or `~/.profile`. For login shells or `--norc`, `ATERM_BASH_POSIX`
-/// starts bash with `--posix` and `$ENV` pointing here so bash reads nothing else
-/// first; this loader then exits POSIX mode, restores `HISTFILE` and `ENV`, and
-/// sources the login profile chain (unless `ATERM_BASH_NOPROFILE` is set).
 const BASH_LOADER: &str = concat!(
     spare_parked_hold!(),
     "\
@@ -1148,15 +1038,10 @@ builtin source \"$ATERM_SHELL_INTEGRATION_DIR/aterm_shell_integration.bash\"
 /// Convert a path to a lossy UTF-8 `String` for child environment variables
 /// without calling `Path::to_string_lossy` (a hardened `byte_loss` boundary in
 /// the Trust lane).
-///
-/// [`OsStr::as_encoded_bytes`]: std::ffi::OsStr::as_encoded_bytes
-// Skip: `Utf8Chunks::next` is an absent std iterator body rendered via generic trait dispatch.
 #[cfg_attr(trust_verify, trust::skip)]
 fn path_env_value(path: &Path) -> String {
-    // Function-path call avoids inlining `as_encoded_bytes`'s internal unsafe block.
     const EMPTY: &[u8] = &[];
     let bytes = Some(path.as_os_str()).map_or(EMPTY, std::ffi::OsStr::as_encoded_bytes);
-    // Clamp capacity under each branch so `len < 4096` dominates the allocation site.
     let len = bytes.len();
     let mut out = if len < 4096 {
         String::with_capacity(len)
@@ -1182,8 +1067,6 @@ fn prepare_zsh(base: &Path) -> InjectionEnv {
         ("ZDOTDIR".to_string(), path_env_value(&zdotdir)),
     ];
 
-    // Treat empty ZDOTDIR as unset so the wrapper's `[ -n "$ATERM_ORIGINAL_ZDOTDIR" ]`
-    // does not leave ZDOTDIR pointing at our wrapper dir.
     match std::env::var("ZDOTDIR") {
         Ok(original) if !original.is_empty() => {
             env_add.push(("ATERM_ORIGINAL_ZDOTDIR".to_string(), original));
@@ -1199,13 +1082,10 @@ fn prepare_zsh(base: &Path) -> InjectionEnv {
     }
 }
 
-/// On Windows (Git Bash), start integrated bash as `bash --login --posix` with
-/// `$ENV` naming [`BASH_LOADER`] so `/etc/profile` and `git-prompt.sh` run once
-/// rather than three times under `--rcfile`.
+/// On Windows (Git Bash), start integrated bash as `bash --login --posix` with `$ENV` naming [`BASH_LOADER`] so `/etc/profile` and `git-prompt.sh` run once rather than three times under `--rcfile`.
 pub(crate) const BASH_LOGIN_START: bool = cfg!(windows);
 
-/// Bash loader filename under `bash/`: `"bashrc"` ([`BASH_LOADER`]) on non-macOS
-/// Unix and Git Bash, `"rcfile"` ([`BASH_WRAPPER`]) on macOS.
+/// Bash loader filename under `bash/`: `"bashrc"` ([`BASH_LOADER`]) on non-macOS Unix and Git Bash, `"rcfile"` ([`BASH_WRAPPER`]) on macOS.
 pub(crate) const BASH_LOADER_FILE: &str =
     if cfg!(all(unix, not(target_os = "macos"))) || BASH_LOGIN_START {
         "bashrc"
@@ -1244,9 +1124,6 @@ fn prepare_fish(base: &Path) -> InjectionEnv {
     let fish_xdg = base.join("fish-xdg");
     let mut xdg_data = path_env_value(&fish_xdg);
 
-    // Prepend to existing XDG_DATA_DIRS (falling back to the XDG default
-    // `/usr/local/share:/usr/share` when unset) so third-party vendor conf.d
-    // scripts still load.
     let existing = std::env::var("XDG_DATA_DIRS")
         .unwrap_or_else(|_| "/usr/local/share:/usr/share".to_string());
     xdg_data.push(':');
@@ -1267,8 +1144,7 @@ fn prepare_fish(base: &Path) -> InjectionEnv {
 /// PowerShell/pwsh injection: `-ExecutionPolicy Bypass -NoExit -Command`
 /// dot-sources `aterm_shell_integration.ps1` after the user's profiles load,
 /// wrapping any profile-installed `prompt` and layering readline chords over
-/// PSReadLine's Windows edit mode. `-ExecutionPolicy Bypass` is required on
-/// stock Windows where the default `Restricted` policy blocks dot-sourcing files.
+/// PSReadLine's Windows edit mode.
 fn prepare_powershell(base: &Path) -> InjectionEnv {
     InjectionEnv {
         env_add: vec![(
@@ -1330,8 +1206,7 @@ fn merge_wslenv(existing: &str) -> String {
     out
 }
 
-/// Build the `ATERM_WSL_CWD` env pair when `shell` is [`ShellType::Wsl`] and
-/// `cwd` is a non-UNC POSIX-absolute path (`/home/...`).
+/// Build the `ATERM_WSL_CWD` env pair when `shell` is [`ShellType::Wsl`] and `cwd` is a non-UNC POSIX-absolute path (`/home/...`).
 #[must_use]
 #[inline]
 pub fn wsl_cwd_env(shell: ShellType, cwd: Option<&str>) -> Option<(String, String)> {
@@ -1378,8 +1253,7 @@ const CMD_PROMPT_MODES: &str = "$e[?2004l$e[?2048l";
 /// `cmd.exe` partial integration via `%PROMPT%`: wraps any inherited `PROMPT`
 /// with [`CMD_PROMPT_TITLE`] (`OSC 0`), [`CMD_PROMPT_MODES`], `OSC 133;A`,
 /// `OSC 633;P;Cwd=$P` (after `133;A` so the CWD is recorded on the new block),
-/// and `OSC 133;B`. `133;C` and `133;D` are omitted because `cmd.exe` has no
-/// preexec hook and cannot expand `%ERRORLEVEL%` inside `PROMPT`.
+/// and `OSC 133;B`.
 fn prepare_cmd() -> InjectionEnv {
     let inherited = std::env::var("PROMPT").ok();
     InjectionEnv {

@@ -1,36 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! PEB — another process of this account on Windows, read through a handle:
-//! the image it runs and what its process environment block (`PEB`) holds —
-//! the directory it works in, and what it was started with, its command line
-//! and its environment block. THE one reader of a process's parameters on
-//! Windows: [`crate::process_cwd`] asks it for a working directory,
-//! [`parameters`] answers a command line and an environment (atpkg's
-//! `caller_shell::process_args` splits them), and the path-user scan
-//! (`aterm_uds::holders`) reads [`cwd_of`] and [`image_of`] through the handle
-//! it already holds. Every call it makes and every structure it reads is
-//! declared in `crate::win_paths`, and the structures' layouts are tested here.
-//!
-//! The parameters (`RTL_USER_PROCESS_PARAMETERS`) are found through the PEB:
-//! `NtQueryInformationProcess(ProcessBasicInformation)` names a native
-//! process's PEB, `ProcessWow64Information` a 32-bit process's own `PEB32`
-//! under WOW64, whose 32-bit parameters its runtime reads and writes (the
-//! 64-bit ones WOW64 keeps beside them go stale). Each structure is read
-//! whole, in one `ReadProcessMemory`, all or nothing, and only once its
-//! parameters say they are normalized (their strings' `Buffer`s addresses,
-//! not the offsets a process still being created holds) and are as long as
-//! the structure this reads.
-//!
-//! A process changes its parameters while it runs: its environment under its
-//! own PEB lock, which another process cannot take, and its working
-//! directory in place when it changes directory. So [`parameters`] reads the
-//! parameters, then the command line and the environment block they name,
-//! then the parameters again, and answers only when the second read names the
-//! same command line, the same block, its size and its version; and
-//! [`cwd_of`] reads the directory twice between two reads of the parameters:
-//! never a block caught mid-change, or a path torn by a `cd`, passed off as
-//! whole.
+//! PEB — another process of this account on Windows, read through a handle.
 
 use crate::win_paths::{self, Plain};
 use std::ffi::OsString;
@@ -43,47 +14,26 @@ const PARAMS_NORMALIZED: u32 = 0x1;
 
 /// The access [`parameters`] and [`crate::process_cwd`] open a process with:
 /// `PROCESS_QUERY_LIMITED_INFORMATION` (its image, where its PEB is),
-/// `PROCESS_VM_READ` (the PEB) and `SYNCHRONIZE` (whether it exited). An
-/// elevated process of this account, or a system helper that grants only the
-/// limited rights, refuses it.
+/// `PROCESS_VM_READ` (the PEB) and `SYNCHRONIZE` (whether it exited).
 const PEB_READ: u32 = win_paths::PROCESS_QUERY_LIMITED_INFORMATION
     | win_paths::PROCESS_VM_READ
     | win_paths::SYNCHRONIZE;
 
-/// The largest environment block [`parameters`] reads, in bytes: 16 MiB. A
-/// block is a few KiB (one variable holds at most 32 767 characters, and a
-/// process carries a few dozen); a size past this is refused, never cut.
+/// The largest environment block [`parameters`] reads, in bytes.
 pub const ENVIRONMENT_CAP: usize = 16 << 20;
 
-/// What one Windows process was started with, as its process environment
-/// block holds it now ([`parameters`]): the raw UTF-16 its own runtime reads,
-/// never split or decoded here (atpkg's `caller_shell::process_args` splits
-/// it as the C runtime does).
+/// What one Windows process was started with, as its process environment block holds it now ([`parameters`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessParameters {
-    /// The image it runs, as the kernel names the file
-    /// (`QueryFullProcessImageNameW`: `C:\...\x.exe`).
+    /// The image it runs, as the kernel names the file (`QueryFullProcessImageNameW`: `C:\...\x.exe`).
     pub image: PathBuf,
-    /// Its command line (`ProcessParameters.CommandLine`), whole, with no
-    /// terminating NUL: what `GetCommandLineW` answered it as it started,
-    /// unless it rewrote its own.
+    /// Its command line (`ProcessParameters.CommandLine`), whole, with no terminating NUL.
     pub command_line: Vec<u16>,
-    /// Its environment block (`ProcessParameters.Environment`, its
-    /// `EnvironmentSize` bytes): `KEY=value` strings, each ending in a NUL,
-    /// then an empty one; the drive letters' working directories among them
-    /// (`=C:=C:\x`). The CURRENT environment, a `SetEnvironmentVariableW`
-    /// since the start included, unlike the exec record macOS and Linux keep.
+    /// Its environment block (`ProcessParameters.Environment`, its `EnvironmentSize` bytes).
     pub environment: Vec<u16>,
 }
 
-/// `pid`'s image, command line and environment block ([`ProcessParameters`]),
-/// read from its process environment block (a 32-bit process's own under
-/// WOW64) through a handle with [`PEB_READ`]; the command line and the block
-/// are read between two reads of the parameters that must name the same of
-/// each. `None` when the open is refused (another account's process, an
-/// elevated one, a system helper that refuses `VM_READ`), when it has exited,
-/// and on any read that fails or comes up short: never a partial read passed
-/// off as whole.
+/// Read `pid`'s [`ProcessParameters`] from its PEB (including WOW64 32-bit PEB) via [`PEB_READ`].
 #[must_use]
 pub fn parameters(pid: u32) -> Option<ProcessParameters> {
     let process = win_paths::open_process(pid, PEB_READ)?;
@@ -105,11 +55,7 @@ pub fn parameters(pid: u32) -> Option<ProcessParameters> {
     )
 }
 
-/// `pid`'s working directory as [`crate::process_cwd`] answers it: the
-/// process's [`cwd_of`], read through a handle with [`PEB_READ`], spelled
-/// as that process's own `GetCurrentDirectoryW` answers it — the trailing
-/// separator the PEB keeps dropped, but at a root (`C:\`, `\\srv\share\`).
-/// `None` on the same terms as [`parameters`].
+/// `pid`'s working directory as [`crate::process_cwd`] answers it.
 pub(crate) fn cwd(pid: u32) -> Option<PathBuf> {
     let process = win_paths::open_process(pid, PEB_READ)?;
     let h = process.as_handle();
@@ -117,16 +63,7 @@ pub(crate) fn cwd(pid: u32) -> Option<PathBuf> {
     (!win_paths::exited(h)).then(|| without_trailing_separator(cwd))
 }
 
-/// The working directory of the process `h` names (`CurrentDirectory.
-/// DosPath`, which keeps a trailing separator: `C:\x\`), read through a
-/// handle the caller opened with at least `PROCESS_QUERY_LIMITED_INFORMATION`
-/// and `PROCESS_VM_READ`; `None` when any read fails, it is empty, or it
-/// moved while read: a process rewrites it in place when it changes
-/// directory, so it is read twice between two reads of the parameters and
-/// answered only when all four agree. What `SetCurrentDirectoryW` set, which
-/// a shell's own idea of its directory need not be (pwsh's `Set-Location`
-/// does not move it). The spelling is the one the process was handed: an 8.3
-/// short name stays one (`crate::volumes::long_spelling` places it).
+/// Read `CurrentDirectory.DosPath` of process `h` (`PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ`).
 #[must_use]
 pub fn cwd_of(h: BorrowedHandle<'_>) -> Option<PathBuf> {
     let before = params(h)?;
@@ -138,9 +75,7 @@ pub fn cwd_of(h: BorrowedHandle<'_>) -> Option<PathBuf> {
         .then(|| PathBuf::from(OsString::from_wide(&units)))
 }
 
-/// The image the process `h` names runs, as `QueryFullProcessImageNameW`
-/// spells it (`C:\...\x.exe`), through a handle the caller opened with at
-/// least `PROCESS_QUERY_LIMITED_INFORMATION`; `None` when the call fails.
+/// Read the executable path of process `h` via `QueryFullProcessImageNameW`.
 #[must_use]
 pub fn image_of(h: BorrowedHandle<'_>) -> Option<PathBuf> {
     win_paths::image_path(h)
@@ -329,11 +264,7 @@ mod tests {
 
     /// This process's own working directory reads through its environment
     /// block as `std` reads it, in its own spelling (`GetCurrentDirectoryW`'s:
-    /// no trailing separator). Other processes' are read by the same calls in
-    /// the path-user scan's tests (`aterm_uds::holders`: a Git Bash child, a
-    /// 32-bit one) and atpkg's (a WOW64 child that changed directory).
-    /// NEGATIVE CONTROL: a pid that cannot exist reads as nothing, and so
-    /// does the System process (pid 4), which refuses this account the reads.
+    /// no trailing separator).
     #[test]
     fn a_processs_working_directory_is_read_from_its_environment_block() {
         let own = crate::process_cwd(std::process::id()).expect("our own working directory");

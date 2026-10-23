@@ -48,7 +48,7 @@ impl<T> EventLoopBuilder<T> {
     /// Builds a new event loop.
     /// ## Panics
     ///
-    /// Attempting to create the event loop off the main thread will panic. This
+    /// Attempting to create the event loop off the main thread will panic.
     #[inline]
     pub fn build(&mut self) -> Result<EventLoop<T>, EventLoopError> {
         let _span = tracing::debug_span!("aterm_window::EventLoopBuilder::build").entered();

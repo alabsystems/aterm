@@ -1,25 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The input/egress contract, driven through the GUI's real seams: the
-//! per-session ordered writer ([`super::paste_order`]) admits against one
-//! bounded budget and refuses what it cannot hold, a paste or report never
-//! taking the keys' reserve; a key into a full input queue is refused and said
-//! once, never parked or falsely delivered; replies never land inside a paste's
-//! bracketed envelope; a key that waited behind a paste arms the echo clock at
-//! its own write; closing a session releases everything waiting on it; a
-//! report waits behind what was queued before it; and the Windows (ConPTY)
-//! route runs here on unix.
-//!
-//! Every fixture wedges a real fd (a socketpair or pipe filled until the
-//! kernel refuses more), so "the program stopped reading" is a kernel fact.
+//! The input/egress contract, driven through the GUI's real seams.
 
 use super::paste_order;
 use crate::input::{Delivery, Egress, InputEvent, InputOutcome, PasteFraming, Source};
 use crate::{App, WindowId};
 use aterm_session::sink::{BulkMeter, BulkState, SinkWriter};
-// The wait for anything that must happen here: a hang detector, never a
-// latency budget.
+
 use aterm_spec::wait::MUST_HAPPEN;
 use std::io::Read;
 use std::os::fd::AsRawFd;
@@ -43,8 +31,7 @@ fn fill(fd: i32) -> usize {
 }
 
 /// Write 4097-byte frames into `sink`'s spill until its cap refuses one, each
-/// accepted whole; returns the accepted frames, in order. Upper case: nothing
-/// accepted may look like a key a test refuses (`k`).
+/// accepted whole; returns the accepted frames, in order.
 fn fill_spill(sink: &SinkWriter) -> Vec<Vec<u8>> {
     let mut accepted: Vec<Vec<u8>> = Vec::new();
     for i in 0usize.. {
@@ -84,15 +71,12 @@ fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
 
 /// The park witness for the never-parks tests: a thread that reads the
 /// program's input out only if `done` is not set within a minute, and returns
-/// whether it had to. A dispatch that parks on the wedged fd returns only after
-/// this unwedges it, so `true` is the park, decided by order rather than a wall
-/// clock. The minute is a hang detector, never a latency budget.
+/// whether it had to.
 fn park_witness(reader: i32, done: Arc<AtomicBool>) -> std::thread::JoinHandle<bool> {
     std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(60);
         while !done.load(Ordering::Acquire) {
             if Instant::now() >= deadline {
-                // The dispatch parked: unwedge it so the test can fail.
                 let mut buf = [0u8; 65536];
                 while unsafe { libc::read(reader, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
                 return true;
@@ -159,14 +143,7 @@ fn read_until(fd: i32, want: usize) -> Vec<u8> {
     got
 }
 
-/// Close a fixture's pipe, taking the test's last handle on its sink. The sink
-/// borrows `pipe[1]`, and each job its ordered writer admitted holds a clone
-/// that keeps its serializer registered under this fd number; closing under
-/// such a job hands the number to the next fixture's `pipe()`, whose jobs then
-/// reach this serializer. `ordered_egress_count() == 0` comes slightly early
-/// (`Reservation::drop` retires the count before its `sink` clone drops), so
-/// this waits until `sink` is the last clone. Drop the app first: its session
-/// holds one.
+/// Close a fixture's pipe, taking the test's last handle on its sink.
 fn close_pipe(sink: Arc<SinkWriter>, pipe: [i32; 2]) {
     assert!(
         wait_until(MUST_HAPPEN, || Arc::strong_count(&sink) == 1),
@@ -182,18 +159,13 @@ fn close_pipe(sink: Arc<SinkWriter>, pipe: [i32; 2]) {
 /// A key typed into a full input queue (program stalled, spill at its cap) is
 /// refused (docs/AUDIT-typing-to-pixels-2026-08-26.md P0): dispatch returns at
 /// once, the outcome is a failure, and the refusal is counted and said once per
-/// session (one "Couldn't send your input" row, never a bell per key). Once the
-/// program reads, every byte accepted before arrives in order without the
-/// refused keys, and a key typed then goes through. [`park_witness`] turns a
-/// park into a failure instead of a hang.
+/// session (one "Couldn't send your input" row, never a bell per key).
 #[test]
 fn a_key_into_a_full_input_queue_is_refused_and_said_once_never_parked() {
     let (mut app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
     aterm_pty::set_nonblocking(pipe[1], true).expect("nonblocking master");
     sink.note_master_nonblocking(true);
     let filled = fill(pipe[1]);
-    // Earlier input filled the spill to its cap (the program has not read
-    // any of it).
     let accepted = fill_spill(&sink);
 
     let done = Arc::new(AtomicBool::new(false));
@@ -233,7 +205,6 @@ fn a_key_into_a_full_input_queue_is_refused_and_said_once_never_parked() {
     );
     assert_eq!(said(&app), 1, "and said once for the session");
 
-    // The program reads: the fill, then every accepted frame in order; no `k`.
     let expect = filled + accepted.iter().map(Vec::len).sum::<usize>();
     let mut got = Vec::with_capacity(expect);
     assert!(
@@ -255,7 +226,6 @@ fn a_key_into_a_full_input_queue_is_refused_and_said_once_never_parked() {
     }
     assert!(!got.contains(&b'k'), "the refused key was never delivered");
 
-    // The spill has drained: the retyped key goes through.
     assert!(wait_until(MUST_HAPPEN, || sink.egress_drained_to_kernel()));
     let outcome = app.input(WindowId(0), InputEvent::Text("z".into()), Source::Human);
     assert_eq!(outcome, InputOutcome::Ok);
@@ -275,9 +245,7 @@ fn a_key_into_a_full_input_queue_is_refused_and_said_once_never_parked() {
 
 /// Into a program that stopped reading, the first maximum paste parks and every
 /// later one is refused at submission: admission never holds more than a paste
-/// may use. Then the session's sever (`Session::drop`) releases the parked
-/// writer, settles its meter and returns every admitted byte. Negative control:
-/// before the sever the paste still waits.
+/// may use.
 #[test]
 fn repeated_maximum_pastes_plateau_and_teardown_unblocks_every_waiter() {
     let (app, app_sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -339,12 +307,11 @@ fn repeated_maximum_pastes_plateau_and_teardown_unblocks_every_waiter() {
 /// Terminal replies stay wholly outside a paste's bracketed envelope: a reply
 /// answered before the paste reaches the program first; one answered while the
 /// paste is parked, and a key typed then, arrive after the closing bracket; the
-/// envelope is one contiguous run. Real reply writer, real ordered writer.
+/// envelope is one contiguous run.
 #[test]
 fn replies_stay_outside_the_paste_envelope_before_and_during_it() {
     let (app, app_sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
     let (reader, writer) = UnixStream::pair().expect("socketpair");
-    // Every read below is of bytes that must arrive: a hang detector.
     reader.set_read_timeout(Some(MUST_HAPPEN)).expect("timeout");
     writer.set_nonblocking(true).expect("nonblocking master");
     let owned: std::os::fd::OwnedFd = writer.into();
@@ -370,8 +337,6 @@ fn replies_stay_outside_the_paste_envelope_before_and_during_it() {
         None,
     )
     .expect("the paste");
-    // The program reads the paste's head, then answers nothing for a while:
-    // the paste parks on the full socket with the envelope open.
     let mut head = vec![0u8; 64 * 1024];
     reader.read_exact(&mut head).expect("the paste's head");
     assert!(head.starts_with(b"\x1b[200~"));
@@ -417,10 +382,7 @@ fn replies_stay_outside_the_paste_envelope_before_and_during_it() {
 }
 
 /// The ConPTY route, on unix: ConPTY has no non-blocking write, so every key
-/// goes through the ordered writer and the UI thread only enqueues. A key with
-/// no paste in flight is still handed to the writer and reaches the program;
-/// once the writer admits nothing more, the next key is refused (`queue_full`),
-/// never written around the FIFO.
+/// goes through the ordered writer and the UI thread only enqueues.
 #[test]
 fn the_conpty_route_sends_every_key_through_the_ordered_writer() {
     let (app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -473,7 +435,6 @@ fn the_conpty_route_sends_every_key_through_the_ordered_writer() {
 /// A key that waited behind a paste arms the echo clock at its own write: the
 /// UI thread's bracket closes before the key is written, the writer arms once
 /// the key's receipt carries an accepted order, and the bracket arms nothing.
-/// Exactly one arm, no coalesced double.
 #[test]
 fn a_key_deferred_behind_a_paste_arms_the_echo_clock_at_its_write() {
     let _echo = crate::echo_rtt::fresh_for_test();
@@ -490,7 +451,6 @@ fn a_key_deferred_behind_a_paste_arms_the_echo_clock_at_its_write() {
         event_type: aterm_types::keyboard::KeyEventType::Press,
     };
     assert_eq!(app.input(wid, key, Source::Human), InputOutcome::Ok);
-    // The writer takes the key and writes it (the pin holds only its slot).
     let mut got = Vec::new();
     assert!(wait_until(MUST_HAPPEN, || {
         let mut buf = [0u8; 8];
@@ -525,7 +485,6 @@ fn closing_the_session_releases_its_parked_writer_and_queued_input() {
     fill(pipe[1]);
     let wid = WindowId(0);
     let session = app.front_terminal_mirror(wid).expect("terminal").session;
-    // A paste too large to spill whole in one frame: parked on the direct lane.
     let outcome = app.input(
         wid,
         InputEvent::Paste(
@@ -547,7 +506,6 @@ fn closing_the_session_releases_its_parked_writer_and_queued_input() {
     );
     assert!(!sink.is_severed());
 
-    // Close the session: the last view detaches and the Session drops.
     while app.pool.get(session).is_some() {
         let _ = app.pool.detach(session);
     }
@@ -593,7 +551,6 @@ fn a_reply_flood_into_a_stalled_program_plateaus_at_the_reply_budget() {
         crate::metrics::METRICS.window.input.reply_dropped.get() >= counted_before + dropped as u64,
         "every dropped reply is counted (`reply_dropped` under `metrics percentiles`)"
     );
-    // Teardown releases what the parked writer and the queue still hold.
     sink.sever_input();
     assert!(
         wait_until(MUST_HAPPEN, || sink.reply_reserved() == 0),
@@ -604,10 +561,6 @@ fn a_reply_flood_into_a_stalled_program_plateaus_at_the_reply_budget() {
 
 /// The ConPTY route for reports, on unix: a mouse, wheel or focus report written
 /// inline could park the UI thread on ConPTY, so there it takes the keys' route.
-/// With tracking off nothing is queued or written; with tracking on, a press and
-/// a focus report are encoded on the calling thread and written in order by the
-/// ordered writer; once the writer admits nothing more, the next report is
-/// refused (`queue_full`).
 #[test]
 fn the_conpty_route_sends_every_report_through_the_ordered_writer() {
     let (app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -707,7 +660,6 @@ fn a_mouse_report_waits_behind_the_pastes_queued_before_it() {
         wait_until(MUST_HAPPEN, || meter.progress().state == BulkState::Writing),
         "paste A is being written"
     );
-    // A parks on the full pipe, holding the fd lock; B waits in the FIFO.
     assert_eq!(sink.ordered_egress_count(), 2, "A and B both wait");
 
     assert_eq!(
@@ -800,8 +752,7 @@ fn a_tab_switch_focus_report_waits_behind_the_pastes_queued_before_it() {
 
 /// On the ConPTY route (`force_conpty_route_for_test`) a tab switch's focus
 /// report goes through the ordered writer, so with the writer admitting nothing
-/// it is refused and nothing is written. Negative control: on the unix route
-/// with nothing queued, the same delta is written inline.
+/// it is refused and nothing is written.
 #[test]
 fn a_tab_switch_focus_report_takes_the_conpty_route() {
     let (mut app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -811,8 +762,6 @@ fn a_tab_switch_focus_report_takes_the_conpty_route() {
         let _route = paste_order::force_conpty_route_for_test();
         app.recompute_focus_reports();
     }
-    // An inline write is synchronous: had the report been written, it is
-    // already readable.
     let mut buf = [0u8; 16];
     assert!(
         unsafe { libc::read(pipe[0], buf.as_mut_ptr().cast(), buf.len()) } <= 0,
@@ -907,8 +856,6 @@ fn a_motion_flood_behind_a_paste_never_refuses_a_key() {
     );
     assert!(receipt.is_queued());
     sink.sever_input();
-    // Drain before closing: each admitted job holds this borrowed sink (see
-    // `close_pipe`).
     assert!(
         wait_until(MUST_HAPPEN, || sink.ordered_egress_count() == 0),
         "the sever released the paste, the flood and the key"
@@ -921,8 +868,7 @@ fn a_motion_flood_behind_a_paste_never_refuses_a_key() {
 /// An OS appearance change into a stalled program with DEC 2031 on never parks
 /// the UI thread: the colour-scheme report takes the reports' route, is refused
 /// at the full spill rather than queued without bound, and everything accepted
-/// before it arrives in order. The split `theme` gives the flip a light palette
-/// to report. [`park_witness`] turns a park into a failure.
+/// before it arrives in order.
 #[test]
 fn an_os_appearance_change_into_a_stalled_program_never_parks_the_ui_thread() {
     let (mut app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();

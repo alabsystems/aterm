@@ -1,82 +1,41 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The release manifest, the `aterm-appcast.toml` asset on every GitHub release: one serde
-//! type the publisher (`aterm-release`, [`Manifest::to_toml`]) and the updater
-//! ([`Manifest::parse`]) both compile against.
-//!
-//! The wire format is `schema = 1` permanently, with parse semantics frozen to what deployed
-//! clients accept: absent `schema` ⇒ `0`; unknown keys tolerated (no `deny_unknown_fields`),
-//! so an older client reads a manifest that grew a key; every key beyond `version`,
-//! `build_number`, `sha256` and `dmg` optional.
+//! The release manifest, the `aterm-appcast.toml` asset on every GitHub release.
 
 use serde::{Deserialize, Serialize};
 
-/// The highest manifest `schema` this build understands; a higher one is rejected (the client
-/// stays on its build) rather than misread.
+/// The highest manifest `schema` this build understands.
 pub const SUPPORTED_SCHEMA: u32 = 1;
 
 /// The release manifest attached to a GitHub Release as `aterm-appcast.toml`.
-///
-/// Field order matters for emission only: serde writes keys in declaration order, and
-/// `min_build` and `changelog` come last (one usually absent, the other the lone multiline
-/// value). `PartialEq` serves the publisher's round-trip self-check
-/// (`Manifest::parse(&m.to_toml()?)? == m`) before any byte is uploaded.
-// Skip (propagates to the derived impls): the serde expansion dispatches into toml's generic
-// `Deserializer::deserialize_struct`, a cross-crate body the verifier cannot bundle; the
-// publish round-trip self-check covers it.
 #[cfg_attr(trust_verify, trust::skip)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
-    /// Manifest format version (the publisher emits `schema = 1`). Absent ⇒ 0.
+    /// Manifest format version (the publisher emits `schema = 1`).
     #[serde(default)]
     pub schema: u32,
-    /// The release version, the workspace `MAJOR.MINOR.0` (e.g. `"0.2.0"`), and an identity
-    /// bind on both sides: the client derives it from the release's canonical
-    /// `vMAJOR.MINOR.PATCH` tag, refuses a manifest whose `version` differs, and requires the
-    /// DMG to be `aterm-<version>.dmg` (`aterm-update/src/github.rs`); the publisher
-    /// self-checks the same triple (`aterm-release/src/verify.rs`). Not the ordering key:
-    /// selection orders by tag and [`build_number`](Self::build_number) gates the apply. One
-    /// version lineage (`VERSIONING.md`): this string, the tag, the DMG name and the source
-    /// snapshot are the same number.
+    /// The release version.
     pub version: String,
-    /// Monotonic build number: the downgrade gate. Claimed from the append-only
-    /// `RELEASES.ledger` (`n = max(tail + 1, unix_now)`) and stamped identically into the
-    /// binary (`ATERM_BUILD_NUMBER`), `CFBundleVersion` and here; the publisher's self-check
-    /// asserts all three agree. Clients rely only on strict monotonicity, never the scale.
+    /// Monotonic build number: the downgrade gate.
     pub build_number: u64,
-    /// Full git commit hash of the source the release was built from, binding the build
-    /// number to an exact commit. Absent ⇒ None.
+    /// Full git commit hash of the source the release was built from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
-    /// The DMG asset's file name within the same release; clients require exactly
-    /// `aterm-<version>.dmg`.
+    /// The DMG asset's file name within the same release.
     pub dmg: String,
     /// SHA-256 (lowercase hex) of the DMG asset's bytes.
     pub sha256: String,
-    /// Absolute browser download URL of the DMG. Never followed, but required: the in-app
-    /// updater checks it names the pointer's tag and [`Self::dmg`]
-    /// (`aterm-update`'s `web_container_url_agrees`), and `tools/install.sh` binds it too.
-    /// Absent ⇒ None.
+    /// Absolute browser download URL of the DMG.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    /// The ZIP asset's file name, e.g. `"aterm-0.10.0-mac.zip"`: a `ditto -c -k --keepParent`
-    /// archive (bytes only, no extended attributes) of the same signed `aterm.app` the DMG
-    /// carries. Absent ⇒ None, and the release updates through the DMG.
-    ///
-    /// The in-app updater stages from the zip because `hdiutil attach` needs a live bootstrap
-    /// context (it talks to the `com.apple.hdiejectd` XPC service), and the survivor of a
-    /// seamless overlap update is an orphan whose launchd job has exited: every attach there
-    /// fails ENXIO. `ditto -x -k` uses no XPC service. The DMG stays the human download.
+    /// The ZIP asset's file name, e.g. `"aterm-0.10.0-mac.zip"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zip: Option<String>,
-    /// SHA-256 (lowercase hex) of [`Self::zip`]'s bytes. Absent ⇒ None; a zip without a digest
-    /// is never staged from, and the client falls back to the DMG.
+    /// SHA-256 (lowercase hex) of [`Self::zip`]'s bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zip_sha256: Option<String>,
-    /// Native Linux raw ELF assets. Each target's name, digest and size are one declaration:
-    /// a partial one is refused, not treated as absent. Names are bound to this manifest's
-    /// version; URLs are derived from the authenticated source and tag, never read from here.
+    /// Native Linux raw ELF assets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linux_x86_64: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -89,61 +48,37 @@ pub struct Manifest {
     pub linux_aarch64_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linux_aarch64_size: Option<u64>,
-    /// The Intel batteries-included DMG's asset name, e.g. `"aterm-0.47.0-x86_64.dmg"`: the
-    /// same signed universal app with the toolchain seed filtered to `x86_64-apple-darwin`.
-    /// Absent ⇒ None (an arm64-only cut). A dual-arch DMG came to 97% of
-    /// [`crate::RELEASE_ASSET_DOWNLOAD_BOUND`], ~1 GB of it seed the receiving CPU cannot run.
-    ///
-    /// The bare `aterm-<version>.dmg` stays the canonical arm64 asset, since clients bind that
-    /// spelling. No updater downloads this one (updates stage from the zip); only
-    /// `tools/install.sh`'s Intel first-install lane does.
+    /// The Intel batteries-included DMG's asset name, e.g. `"aterm-0.47.0-x86_64.dmg"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dmg_x86_64: Option<String>,
-    /// SHA-256 (lowercase hex) of [`Self::dmg_x86_64`]'s bytes. Absent ⇒ None; a name without
-    /// a digest is never installed from.
+    /// SHA-256 (lowercase hex) of [`Self::dmg_x86_64`]'s bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dmg_x86_64_sha256: Option<String>,
-    /// Minimum macOS version the bundle declares (`LSMinimumSystemVersion`),
-    /// e.g. `"11.0"`. Display/tooling only. Absent ⇒ None.
+    /// Minimum macOS version the bundle declares (`LSMinimumSystemVersion`), e.g. `"11.0"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_os: Option<String>,
-    /// Apple Team ID the release is signed under; `""` is the ad hoc tier. Absent ⇒ None.
+    /// Apple Team ID the release is signed under; `""` is the ad hoc tier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_id: Option<String>,
-    /// RFC3339 UTC publish time, e.g. `"2026-07-06T21:29:44Z"`. Display only.
-    /// Absent ⇒ None.
+    /// RFC3339 UTC publish time, e.g. `"2026-07-06T21:29:44Z"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pub_date: Option<String>,
-    /// Optional operator apply floor: clients refuse to stage or apply any build below it,
-    /// even a genuine signed one, so the owner can retire a bad release after the fact
-    /// (`ship yank`). Ratcheted monotonically client-side (`Floor` in aterm-update); once
-    /// raised, the cutter carries the channel's newest floor into every successor. Absent ⇒
-    /// None.
+    /// Optional operator apply floor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_build: Option<u64>,
-    /// The id of the machine that signed this release, e.g. `"m3"`. Inside the signed bytes,
-    /// so a signature by one machine cannot be relabelled as another; a stolen key claiming
-    /// another id is refused by the roster's id-to-key map (`roster::Attribution::bind`).
-    ///
-    /// Absent ⇒ None. A client with an armed paper master refuses an unattributed release;
-    /// one with an unpinned master ignores the field. It is never written to
-    /// `RELEASES.ledger`, whose parser hard-fails on any line that is not exactly two fields.
+    /// The id of the machine that signed this release, e.g. `"m3"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
-    /// The `roster_seq` of the roster that authorized [`Self::machine_id`] at cut time, so an
-    /// old roster cannot be paired with a new release (or the reverse) after a revocation.
-    /// Absent ⇒ None.
+    /// The `roster_seq` of the roster that authorized [`Self::machine_id`] at cut time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roster_seq: Option<u64>,
-    /// The release's CHANGELOG.md section body, verbatim, shown by the updater's status query
-    /// and the Software Update window. Absent ⇒ None.
+    /// The release's CHANGELOG.md section body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changelog: Option<String>,
 }
 
 impl Manifest {
-    /// Select a native target only when all its signed identity fields agree. `None` means
-    /// this release does not ship that target, not "up to date".
+    /// Select a native target only when all its signed identity fields agree.
     pub fn linux_artifact(
         &self,
         target: crate::linux::LinuxTarget,
@@ -164,7 +99,6 @@ impl Manifest {
     }
 
     /// Parse a manifest from TOML text, rejecting a schema this build is too old to understand.
-    // Skip: as `Manifest`; every error path returns `Err`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn parse(text: &str) -> Result<Self, String> {
         let m: Manifest = aterm_toml::from_str(text).map_err(|e| format!("parse manifest: {e}"))?;
@@ -172,9 +106,7 @@ impl Manifest {
         Ok(m)
     }
 
-    /// Wire invariants shared by parsing and emission. A manifest may retire older builds but
-    /// cannot demand one newer than itself, which would wedge the ratcheted client floor above
-    /// every published successor.
+    /// Wire invariants shared by parsing and emission.
     fn validate(&self) -> Result<(), String> {
         if self.schema > SUPPORTED_SCHEMA {
             return Err(format!(
@@ -196,10 +128,7 @@ impl Manifest {
         Ok(())
     }
 
-    /// Serialize to the published TOML shape: serde's serializer for everything but
-    /// `changelog`, which is rendered by hand as a `'''` multiline literal (diffable on the
-    /// releases page, no escaping layer). Refuses a body a literal cannot represent: one
-    /// containing `'''`, or a control character other than `\n`/`\t`.
+    /// Serialize to the published TOML shape.
     pub fn to_toml(&self) -> Result<String, String> {
         self.validate()?;
         if let Some(body) = &self.changelog {
@@ -220,8 +149,6 @@ impl Manifest {
                 ));
             }
         }
-        // The changelog goes last. TOML trims a newline right after the opening `'''`, so the
-        // block parses back to the body byte for byte, with or without a trailing newline.
         let mut head = self.clone();
         head.changelog = None;
         let mut out =
@@ -325,7 +252,6 @@ mod tests {
                 m.linux_aarch64_size = None;
             }
             assert!(m.to_toml().is_err(), "partial mask {fields}");
-            // Bypass the validating emitter to build an invalid wire input.
             let wire = aterm_toml::to_string(&m).unwrap();
             assert!(Manifest::parse(&wire).is_err(), "partial mask {fields}");
         }
@@ -500,7 +426,6 @@ min_build = 551
         let err = m.to_toml().unwrap_err();
         assert!(err.contains("exceeds its build_number"), "{err}");
 
-        // Negative control: `min_build == build` is valid.
         m.min_build = Some(m.build_number);
         assert_eq!(
             Manifest::parse(&m.to_toml().unwrap()).unwrap().min_build,

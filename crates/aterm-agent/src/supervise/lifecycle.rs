@@ -10,6 +10,7 @@ use super::escalate::{NEEDS_LEFT, kinds_name_owner, point_label, status_field};
 use super::*;
 
 /// The `<why>` of the `CLEARED seq=<n> attention=<said> <why>` line that takes
+/// a limit's badge down as an Off park starts ([`Session::lower_badges`]).
 const PARKED_OFF: &str = "the session's autopilot is off";
 
 /// The journal's note AN OFF PARK STARTS WITH ([`Session::park_while_off`]): `PARKED seq=<n> autopilot=off: …`.
@@ -378,6 +379,13 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// THE TURN-END POLICY'S BADGE SET AGAIN as an Off park ends on a word
+    /// ([`Self::park_while_off`], after the claim is taken again): the text
+    /// [`Self::lower_badges`] kept ([`Session::badge_parked`]) is set as
+    /// this loop's entry again — no second ask (the ask went when it was
+    /// first raised), journaled `ESCALATED seq=<n> attention=<reply>
+    /// again=set again after an off park` ([`AGAIN_UNPARKED`]), which
+    /// the harness's stats read as a badge up again, not a second
+    /// escalation — and cleared as before, once the worker works.
     fn raise_parked_badge(&mut self, seq: u64, review: &mut dyn Review) -> Result<(), Fail> {
         let Some(text) = self.badge_parked.take() else {
             return Ok(());

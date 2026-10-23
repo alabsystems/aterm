@@ -72,6 +72,8 @@ pub enum Admit {
     /// Paused: a skip-class input the task does not observe while paused.
     Skipped,
     /// Paused with a full queue: the update was rejected, and the `delivered_after` queued
+    /// inputs and then this one were delivered, in order, to the old pair
+    /// ([`Boundary::take_delivered`] holds what each returned).
     Rejected {
         /// How many queued inputs were delivered before this one.
         /// How many queued inputs were delivered before this one.
@@ -186,6 +188,7 @@ pub enum PublishRefusal {
     /// The replay range is not inside the log.
     Range(RangeFault),
     /// The candidate (or the boundary's schema) has another schema digest than the live
+    /// identity.
     SchemaChanged {
         /// The live identity's schema digest.
         live: Digest,
@@ -199,6 +202,7 @@ pub enum PublishRefusal {
         kind: ArtifactKind,
     },
     /// The boundary's own contract (the one it was constructed with) is not the one the task
+    /// identity names.
     ContractMismatch {
         /// The identity's contract digest.
         live: Digest,
@@ -233,6 +237,7 @@ pub enum PublishRefusal {
     /// The checkpoint, log and identity of the live pair do not descend from one another.
     LineageMismatch,
     /// The log extends another checkpoint than the boundary's ancestor: its header names
+    /// another ancestor digest.
     AncestorMismatch {
         /// The digest of the boundary's ancestor checkpoint.
         checkpoint: Digest,
@@ -241,7 +246,7 @@ pub enum PublishRefusal {
     },
     /// The witness does not match this boundary's own ancestor, log or pair (the named part).
     WitnessMismatch(&'static str),
-    /// The queue holds `cap` inputs. No operation of this boundary returns it: an input that
+    /// The queue holds `cap` inputs.
     QueueFull {
         /// The queue's capacity.
         /// The queue's capacity.
@@ -350,6 +355,8 @@ impl<S: Schema> Clone for Recording<S> {
 }
 
 /// Everything a commit or restore replaces, held in one value so that replacing it is one
+/// assignment: the pair, the identity, the recording, and whether the head's state digest is
+/// current.
 struct Live<S: Schema, C> {
     pair: Pair<S, C>,
     identity: TaskIdentity,
@@ -406,7 +413,7 @@ enum Pending {
     Admitted { recorded: bool },
 }
 
-/// The gate every primitive store of `commit` passes. The production gate never stops
+/// The gate every primitive store of `commit` passes.
 trait StoreGate {
     type Stop;
     fn store(&mut self) -> Result<(), Self::Stop>;
@@ -489,7 +496,7 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> fmt::Debug for Boundary<S, C
 }
 
 #[inline]
-fn bump(n: &mut u64) {
+const fn bump(n: &mut u64) {
     *n = n.saturating_add(1);
 }
 
@@ -664,7 +671,7 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
 
     /// The live code and state, for the host's live step.
     #[inline]
-    pub fn pair_mut(&mut self) -> (&C, &mut S::State) {
+    pub const fn pair_mut(&mut self) -> (&C, &mut S::State) {
         self.live.digest_fresh = false;
         (&self.live.pair.code, &mut self.live.pair.state)
     }
@@ -993,6 +1000,7 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
     }
 
     /// Every check commit makes, and everything it installs besides the prepared code and
+    /// state.
     fn next_publication(
         &self,
         prepared: &Prepared<S, C>,
@@ -1272,6 +1280,8 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
     }
 
     /// Before an input is recorded: a broken or full log is replaced by a fresh checkpoint
+    /// of the current state (a true boundary) and an empty log of the next epoch, whose
+    /// parent is the checkpoint it replaces.
     fn ensure_room(&mut self) {
         let Some(rec) = &self.live.recording else {
             return;
@@ -1293,6 +1303,7 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
     }
 
     /// Delivers one input the boundary holds (queued or overflowing) to the live pair through
+    /// `C::step`, recording it if the step accepted it.
     fn deliver(&mut self, input: S::Input) -> Result<S::Observation, StepRefusal> {
         self.ensure_room();
         self.live.digest_fresh = false;
@@ -1320,6 +1331,7 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
     }
 
     /// Ends a pause without publishing: the old pair resumes and receives the queue, then
+    /// `extra`, once each, in order.
     fn resume_old(&mut self, extra: Option<S::Input>) -> Vec<Result<S::Observation, StepRefusal>> {
         let queue = match core::mem::replace(&mut self.mode, Mode::Running) {
             Mode::Paused { queue, .. } => queue,

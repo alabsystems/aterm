@@ -212,6 +212,14 @@ keys! {
     LandAt "land_at" Host Cap::I,
     Sev "sev" Wire Cap::Word(SEV_WORDS),
     Held "held" Wire Cap::Word(HELD_WORDS),
+    // Appended so no discriminant moves: a `row` mark's
+    // fields, a timeline row the log holds as its row alone. The ring's
+    // kind as a token (`row=job-change`, a space a `-`), WIRE; and the
+    // row's whole payload (`row_text=`, the ring's 256 bytes, a space and
+    // an escape's `%` each three encoded), CONTENT, RAM only as the ring
+    // row it stands for always was: never journaled, carried or published.
+    RowKind "row" Wire Cap::Tok(Charset::Lower, 32),
+    RowText "row_text" Content Cap::Text(360),
 }
 
 impl Key {
@@ -388,6 +396,8 @@ impl Val {
 }
 
 /// Whether `val` is held to `key` itself (see [`Fields::set`]): a token or
+/// text is a fixed point of `key`'s own sanitizer, and an id below the host
+/// tier names no broker offset.
 fn held_to_key(key: Key, val: &Val) -> bool {
     match val {
         Val::Tok(t) => BoundedToken::new(key, t.as_str()).as_ref() == Some(t),

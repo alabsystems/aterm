@@ -153,7 +153,7 @@ impl Inflater {
 
     /// Bytes decoded but not yet handed to the caller.
     #[inline]
-    fn pending(&self) -> usize {
+    const fn pending(&self) -> usize {
         self.out.len().saturating_sub(self.out_at)
     }
 

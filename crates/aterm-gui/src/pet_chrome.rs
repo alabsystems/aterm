@@ -1,55 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE HOST'S CHROME ON THE GRID, AS THE RESIDENT PET SEES IT. aterm paints
-//! some of its own chrome INTO grid cells after the pet has looked at the
-//! frame: the footer's one write (`claude_footer`: Claude Code's rule — its
-//! chips and facts — the harness card's line, and the Codex chips, which sit
-//! on the BLANK row Codex keeps over its status row) and the Autopilot menu.
-//! The pet judges a seat by the grid it observed (`aterm_effects::pet_world`),
-//! so on that blank Codex row the chips looked like empty ground and the cat
-//! sat on them, hiding the timer chip (the Together run, 2026-10-16:
-//! `∞ ⤓[cat]36`).
-//!
-//! So every cell those splices write over the FOCUSED pane is recorded here,
-//! pane-local, and the next observation takes them as exclusions
-//! (`app_render::pet_console_exclusions`): protected, like a selection or the
-//! find bar — the pet never rests on them and seats itself beside them.
-//!
-//! * A RULE'S STROKES ARE THE RULE'S. A footer write that repaints a rule
-//!   (the harness tints the composer's whole upper rule) records only the
-//!   runs that carry words and marks ([`PetChrome::note_painted`]): its `─`
-//!   strokes are the program's own rule, ink to the pet, and walled whole
-//!   they kept the cat off the composer's first line. A line the host does
-//!   not repaint is never written between its marks: on Codex's slab the
-//!   pad's own blanks between the CLI's lockup and the switch stay Codex's
-//!   (`claude_footer`'s `ComposedTop::glass`), and only the lockup and the
-//!   switch are held.
-//! * ONE FRAME LATE, NEVER LEFT STALE. The splices run after the pet's tick,
-//!   so a frame's pet reads the cells the previous frame painted ([`held`]).
-//!   Where a pass paints a different set than the one its pet read, the
-//!   window is owed one more frame ([`PetChrome::commit`]), whose pet reads
-//!   the new set — so chips that appear, grow or move are never sat on for
-//!   longer than that frame, and nothing at rest differs: a still frame
-//!   paints what it painted before and owes nothing.
-//! * AT REST, NOTHING. Collecting is a clear and a few pushes into buffers
-//!   kept for their capacity, made only on a frame that runs anyway; no
-//!   clock, no lock, no wake.
-//! * THE MENU IS AN OVERLAY, NOT GROUND. The Autopilot menu opens and
-//!   closes under the hand; its card is noted apart ([`PetChrome::note_overlay`],
-//!   read by [`PetChrome::held_overlays`]). It protects its cells like the
-//!   rest, but the pet's rest seat is solved without it
-//!   (`aterm_effects::pet_world::PetWorld::observe_with_overlays`), so opening
-//!   the menu over the sleeping cat moves it no farther than any selection
-//!   does (a step aside within `HOME_REACH`, or it yields where it lies)
-//!   instead of sending it to sleep under the card, and closing the menu
-//!   puts it back where it was.
-//! * ONLY A PASS ENDS A PASS. A route that paints the menu with no footer
-//!   pass before it (a capture whose layout is not the window's, where
-//!   `splice_claude_footer` does not run) began nothing, so its commit keeps
-//!   the held set as it stands and owes nothing.
-//!
-//! [`held`]: PetChrome::held
+//! THE HOST'S CHROME ON THE GRID, AS THE RESIDENT PET SEES IT. aterm paints some of its own chrome INTO grid cells after the pet has looked at the frame: the footer's one write (`claude_footer`: Claude Code's rule — its chips and facts — the harness card's line, and the Codex chips, which sit on the BLANK row Codex keeps over its status row) and the Autopilot menu.
 
 use aterm_core::terminal::RenderCell;
 use aterm_effects::pet_world::PetRect;
@@ -57,9 +9,7 @@ use aterm_effects::pet_world::PetRect;
 /// The stroke a composer's rule is drawn in ([`PetChrome::note_painted`]).
 const RULE_STROKE: char = '\u{2500}';
 
-/// The cells the host's chrome splices painted over the focused pane, for
-/// the resident pet (module docs). Held on the window
-/// (`WindowState::pet_chrome`).
+/// The cells the host's chrome splices painted over the focused pane, for the resident pet (module docs).
 #[derive(Debug, Default)]
 pub(crate) struct PetChrome {
     /// What the pet reads: the cells the last finished pass painted,
@@ -81,22 +31,19 @@ pub(crate) struct PetChrome {
 }
 
 impl PetChrome {
-    /// The cells the pet takes as occupied, marked read: the pass that
-    /// moves them owes the window the frame that shows them to the pet.
+    /// The cells the pet takes as occupied, marked read: the pass that moves them owes the window the frame that shows them to the pet.
     pub(crate) fn held(&self) -> &[PetRect] {
         self.read.set(true);
         &self.held
     }
 
-    /// The transient overlays the pet takes as occupied, marked read the
-    /// same way: the Autopilot menu's card ([`PetChrome::note_overlay`]).
+    /// The transient overlays the pet takes as occupied, marked read the same way: the Autopilot menu's card ([`PetChrome::note_overlay`]).
     pub(crate) fn held_overlays(&self) -> &[PetRect] {
         self.read.set(true);
         &self.held_overlays
     }
 
-    /// Start a pass over the focused pane at `pane` (frame cells `(row, col,
-    /// rows, cols)`; `None`: no focused terminal pane, so nothing is noted).
+    /// Start a pass over the focused pane at `pane` (frame cells `(row, col, rows, cols)`; `None`: no focused terminal pane, so nothing is noted).
     pub(crate) fn begin(&mut self, pane: Option<(usize, usize, usize, usize)>) {
         self.next.clear();
         self.next_overlays.clear();
@@ -104,29 +51,14 @@ impl PetChrome {
         self.begun = true;
     }
 
-    /// A splice painted `cols` cells from frame cell `(row, col)` down `rows`
-    /// rows: the part inside the focused pane, pane-local.
+    /// A splice painted `cols` cells from frame cell `(row, col)` down `rows` rows: the part inside the focused pane, pane-local.
     pub(crate) fn note(&mut self, row: usize, col: usize, rows: usize, cols: usize) {
         if let Some(rect) = self.pane_local(row, col, rows, cols) {
             self.next.push(rect);
         }
     }
 
-    /// A splice painted `cells` from frame cell `(row, col)`: the runs of them
-    /// that carry the host's words and marks, as [`PetChrome::note`] notes a
-    /// write. A rule's stroke (`─`) is a rule, whoever paints it: the harness
-    /// repaints the composer's whole upper rule in its tint
-    /// (`claude_footer::compose_top`), the same
-    /// strokes over the same cells as the program's own rule, which the pet
-    /// reads as ink. Noted whole, the rule was protected from end to end, a
-    /// cat on the composer's first line (its 1.7-row body reaches into the
-    /// rule) was refused at every column, and it waited off the line up to
-    /// fifty columns behind the caret and bounded back at every line
-    /// (2026-10-20, real Claude Code 2.1.305 with the harness on, windowed).
-    /// The lockup on that rule (its pads, the icon's two blank cells under
-    /// the CLI's sprite, and the CLI's name), the key's mark and the switch,
-    /// the chips and facts on the lower one, the card's line, stay
-    /// protected: the cat never sits on the CLI's icon.
+    /// A splice painted `cells` from frame cell `(row, col)`: the runs of them that carry the host's words and marks, as [`PetChrome::note`] notes a write.
     pub(crate) fn note_painted(&mut self, row: usize, col: usize, cells: &[RenderCell]) {
         let mut run: Option<usize> = None;
         for (i, cell) in cells.iter().enumerate() {
@@ -144,9 +76,7 @@ impl PetChrome {
         }
     }
 
-    /// As [`PetChrome::note`], for a TRANSIENT overlay (the Autopilot menu's
-    /// card): protected alike, but never ground the pet's rest seat is
-    /// solved on (module docs).
+    /// As [`PetChrome::note`], for a TRANSIENT overlay (the Autopilot menu's card): protected alike, but never ground the pet's rest seat is solved on (module docs).
     pub(crate) fn note_overlay(&mut self, row: usize, col: usize, rows: usize, cols: usize) {
         if let Some(rect) = self.pane_local(row, col, rows, cols) {
             self.next_overlays.push(rect);
@@ -168,11 +98,7 @@ impl PetChrome {
         })
     }
 
-    /// End the pass: what it gathered becomes what the pet reads. `true`
-    /// when that moved and a pet read the old set since the last commit —
-    /// the window owes the pet one more frame. With no pass begun since the
-    /// last commit, nothing: `next` then holds the set before last (the
-    /// swap's), which is no pass's.
+    /// End the pass: what it gathered becomes what the pet reads.
     pub(crate) fn commit(&mut self) -> bool {
         if !std::mem::take(&mut self.begun) {
             return false;
@@ -195,17 +121,14 @@ mod tests {
     /// pane's write is no pet's business; a pass that paints what the last
     /// one did owes nothing, and one that moves the cells owes a frame only
     /// where a pet read the old ones.
-    ///
-    /// NEGATIVE CONTROL: the same passes with no pet reading owe nothing.
     #[test]
     fn writes_are_pane_local_and_a_moved_set_owes_the_pet_a_frame() {
         let mut chrome = PetChrome::default();
-        // The focused pane: frame rows 1.. (a strip row above), columns 73..144.
         let pane = Some((1, 73, 49, 71));
         chrome.begin(pane);
-        chrome.note(47, 74, 1, 6); // the Codex chips, frame cells
-        chrome.note(30, 2, 1, 10); // the sibling pane's rule
-        chrome.note(48, 140, 1, 10); // clipped at the pane's right edge
+        chrome.note(47, 74, 1, 6);
+        chrome.note(30, 2, 1, 10);
+        chrome.note(48, 140, 1, 10);
         assert!(!chrome.commit(), "no pet read anything yet");
         assert_eq!(
             chrome.held(),
@@ -214,13 +137,10 @@ mod tests {
                 PetRect::new(47.0, 67.0, 1.0, 4.0)
             ]
         );
-        // At rest: the same cells again owe nothing.
         chrome.begin(pane);
         chrome.note(47, 74, 1, 6);
         chrome.note(48, 140, 1, 10);
         assert!(!chrome.commit(), "a still pass owes nothing");
-        // The chips grow (a timer): the pet read the old set, so a frame is owed,
-        // once.
         let _ = chrome.held();
         chrome.begin(pane);
         chrome.note(47, 74, 1, 9);
@@ -229,12 +149,10 @@ mod tests {
         chrome.begin(pane);
         chrome.note(47, 74, 1, 9);
         assert!(!chrome.commit(), "and only one");
-        // No focused pane: nothing is noted, and the cleared set moves.
         chrome.begin(None);
         chrome.note(47, 74, 1, 9);
         assert!(chrome.commit());
         assert!(chrome.held().is_empty());
-        // Negative control: moved, but unread.
         let mut quiet = PetChrome::default();
         quiet.begin(pane);
         quiet.note(47, 74, 1, 6);
@@ -246,10 +164,6 @@ mod tests {
     /// [`PetChrome::held`]), and a pass where only it moves (the menu opens
     /// or closes over still chrome) owes a pet that read the old sets a
     /// frame.
-    ///
-    /// NEGATIVE CONTROLS (as run, each failing this test): the card noted
-    /// as chrome (`note_overlay` pushing to `next`); a commit that compares
-    /// the chrome alone.
     #[test]
     fn a_menu_is_held_apart_from_the_chrome_and_its_move_owes_a_frame() {
         let pane = Some((1, 0, 30, 100));
@@ -282,9 +196,6 @@ mod tests {
     /// moved commit `next` holds the older set, and a bare commit that swapped
     /// it back would hand the pet the cells of two frames ago and owe the
     /// window a redraw for them.
-    ///
-    /// NEGATIVE CONTROL: the same commit after a `begin` that notes the
-    /// older set does move the held set back, and owes the frame.
     #[test]
     fn a_commit_with_no_pass_begun_keeps_the_held_set() {
         let pane = Some((0, 0, 30, 80));
@@ -303,7 +214,6 @@ mod tests {
         assert_eq!(chrome.held(), nine);
         assert!(!chrome.commit(), "no pass begun: nothing owed");
         assert_eq!(chrome.held(), nine, "no pass begun: the held set stands");
-        // Negative control: a real pass that paints the older cells again.
         chrome.begin(pane);
         chrome.note(28, 2, 1, 6);
         assert!(chrome.commit());

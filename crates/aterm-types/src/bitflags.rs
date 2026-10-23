@@ -20,6 +20,7 @@
 /// assert_eq!(Flags::AB, Flags::A | Flags::B);
 /// assert!(Flags::AB.contains(Flags::A));
 /// ```
+/// aterm_types::bitflags!
 #[macro_export]
 macro_rules! bitflags {
     (

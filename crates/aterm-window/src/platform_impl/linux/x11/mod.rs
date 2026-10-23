@@ -4,19 +4,6 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/mod.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE. (Dropped the startup
-// notification flow's token request, which served only the deleted `startup_notify`
-// extension; the launchee's half lives on in `startup_notify.rs`. A broken X connection ends
-// the loop, as `EventLoopError::DisplayLost` when its transport failed and as an error of its
-// own when libxcb closed it: `end_if_connection_lost`. The server is spoken to through
-// first-party `aterm-x11` and the loop waits in `common::poll`, where upstream used x11rb,
-// x11-dl and calloop: docs/AUDIT-third-party-2026-10-15.md, LW.7. No failed request panics:
-// a request the backend makes for the application reports its failure (`XConnection::report`),
-// and one the loop makes to start ends it with an error, the display's loss when it has gone:
-// X11-GONE. Each turn ends by answering the window manager's resize sync requests no frame is
-// coming for, the loop wakes for one's deadline, and a window's drop destroys its sync counter:
-// `sync_request.rs`.)
-
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CStr;
@@ -53,11 +40,7 @@ mod background_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod bell_tests;
 
-/// Held by each test that makes windows on the process's one X11 connection
-/// (`X11_BACKEND`), so they take turns. Under an XIM server (IBus on the desk) two
-/// input contexts made at once on one `Display` can each take the other's XIM reply
-/// and wait forever: two of six parallel runs of the X11 tests hung on the desk, none
-/// with `XMODIFIERS` unset. aterm makes its windows on one thread.
+/// Held by each test that makes windows on the process's one X11 connection (`X11_BACKEND`).
 #[cfg(test)]
 pub(super) fn shared_display_turn() -> std::sync::MutexGuard<'static, ()> {
     static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -194,8 +177,7 @@ pub struct ActiveEventLoop {
 
 pub struct EventLoop<T: 'static> {
     loop_running: bool,
-    /// What the run ends with in place of `ExitFailure` once the connection ended under it
-    /// (`end_if_connection_lost`).
+    /// Run exit status once the connection ended under it (`end_if_connection_lost`).
     failure: Option<EventLoopError>,
     waker: Waker,
     event_processor: EventProcessor,
@@ -215,9 +197,7 @@ impl<T: 'static> Clone for EventLoopProxy<T> {
 }
 
 impl<T: 'static> EventLoop<T> {
-    /// The loop on `xconn`. A request it makes to set up that fails ends it here, as the
-    /// failure ([`startup_failure`]): a display that went while it started is
-    /// [`EventLoopError::DisplayLost`], where upstream's `expect`s panicked.
+    /// The loop on `xconn` ([`startup_failure`], [`EventLoopError::DisplayLost`]).
     pub(crate) fn new(xconn: Arc<XConnection>) -> Result<EventLoop<T>, EventLoopError> {
         let root = xconn.default_root().root;
         let atoms = xconn.atoms();
@@ -229,17 +209,10 @@ impl<T: 'static> EventLoop<T> {
 
         let (ime_sender, ime_receiver) = mpsc::channel();
         let (ime_event_sender, ime_event_receiver) = mpsc::channel();
-        // Input methods will open successfully without setting the locale, but it won't be
-        // possible to actually commit pre-edit sequences.
         unsafe {
-            // Remember default locale to restore it if target locale is unsupported
-            // by Xlib
             let default_locale = setlocale(LC_CTYPE, ptr::null());
             setlocale(LC_CTYPE, c"".as_ptr());
 
-            // Check if set locale is supported by Xlib.
-            // If not, calls to some Xlib functions like `XSetLocaleModifiers`
-            // will fail.
             let locale_supported = (xconn.xlib.XSupportsLocale)() == 1;
             if !locale_supported {
                 let _unsupported_locale = setlocale(LC_CTYPE, ptr::null());
@@ -248,7 +221,6 @@ impl<T: 'static> EventLoop<T> {
                     CStr::from_ptr(_unsupported_locale).to_string_lossy(),
                     CStr::from_ptr(default_locale).to_string_lossy()
                 );
-                // Restore default locale
                 setlocale(LC_CTYPE, default_locale);
             }
         }
@@ -265,8 +237,6 @@ impl<T: 'static> EventLoop<T> {
         let failed = |e: X11Error| startup_failure(&xconn, e);
         let randr_event_offset = xconn.select_xrandr_input(root).map_err(failed)?;
 
-        // `XConnection::new` refused a server without XInput 2 or XKB, so a missing one here
-        // is a server that changed under it.
         let extension = |name: &'static [u8], missing: &'static str| {
             xconn
                 .xcb_connection()
@@ -278,18 +248,14 @@ impl<T: 'static> EventLoop<T> {
         let xi2ext = extension(xinput::NAME, "XInputExtension")?;
         let xkbext = extension(xdisplay::XKB_EXTENSION_NAME, "XKEYBOARD")?;
 
-        // Check for XInput2 support.
         xconn.request(xinput::xi_query_version(xi2ext.major_opcode, 2, 3)).map_err(failed)?;
 
         xconn.update_cached_wm_info(root);
 
-        // The loop waits on the X connection's socket and this waker.
         let waker = Waker::new().map_err(|e| failed(X11Error::Io(e)))?;
 
-        // Create a channel for handling redraw requests.
         let (redraw_sender, redraw_channel) = mpsc::channel();
 
-        // Create a channel for sending user events.
         let (user_sender, user_channel) = mpsc::channel();
 
         let xkb_context =
@@ -339,8 +305,6 @@ impl<T: 'static> EventLoop<T> {
             composing: None,
         };
 
-        // Register for device hotplug events
-        // (The request buffer is flushed during `init_device`)
         let xconn = &EventProcessor::window_target(&event_processor.target).xconn;
 
         xconn
@@ -396,17 +360,6 @@ impl<T: 'static> EventLoop<T> {
             }
         };
 
-        // Applications aren't allowed to carry windows between separate
-        // `run_on_demand` calls but if they have only just dropped their
-        // windows we need to make sure those last requests are sent to the
-        // X Server. A lost display (a broken connection, or a socket the poll
-        // saw hang up before Xlib read that far) has no server to sync with.
-        // An X error the sync reports answers some earlier request nobody
-        // checked (`x_error_callback` keeps the latest), not the run's end:
-        // the run ends as its loop did, so an application that asked to exit
-        // gets `Ok`. The error goes to stderr, not to `warn!`: aterm's
-        // `tracing` has no subscriber, and the unchecked request is a bug
-        // someone should see.
         let wt = EventProcessor::window_target(&self.event_processor.target);
         let lost = matches!(exit, Err(EventLoopError::DisplayLost(_)));
         if !lost && !wt.x_connection().is_broken() {
@@ -428,12 +381,9 @@ impl<T: 'static> EventLoop<T> {
         if !self.loop_running {
             self.loop_running = true;
 
-            // run the initial loop iteration
             self.single_iteration(&mut callback, StartCause::Init);
         }
 
-        // Consider the possibility that the `StartCause::Init` iteration could
-        // request to Exit.
         if !self.exiting() && !self.end_if_connection_lost(false) {
             self.poll_events_with_timeout(timeout, &mut callback);
         }
@@ -448,16 +398,7 @@ impl<T: 'static> EventLoop<T> {
         }
     }
 
-    /// End the loop once the connection to the X server is broken, or the
-    /// poll saw its socket hang up or fail (`hung_up`): no further iteration
-    /// runs, so no callback makes a request on the dead connection. The run
-    /// then ends with the connection's end ([`XConnection::connection_end`]):
-    /// [`EventLoopError::DisplayLost`] when its transport failed, the server
-    /// dead (the Linux lane, 2026-10-17, both arches: Xvfb killed at rest read
-    /// as end of file in every run, and killed mid-resize, with aterm-gui's
-    /// requests unread in it, as `ECONNRESET`); libxcb's error
-    /// when it closed the connection for a reason of its own. An exit the
-    /// application asked for first stands. Whether it was broken.
+    /// End the loop on a broken X connection ([`EventLoopError::DisplayLost`]).
     fn end_if_connection_lost(&mut self, hung_up: bool) -> bool {
         let wt = EventProcessor::window_target(&self.event_processor.target);
         let Some(end) = wt.x_connection().connection_end(hung_up) else {
@@ -482,8 +423,6 @@ impl<T: 'static> EventLoop<T> {
     {
         let start = Instant::now();
 
-        // `XPending` reads the connection, so it is where Xlib usually finds
-        // it broken.
         let has_pending = self.has_pending();
         if self.end_if_connection_lost(false) {
             return;
@@ -503,8 +442,6 @@ impl<T: 'static> EventLoop<T> {
 
             min_timeout(control_flow_timeout, timeout)
         };
-        // A resize sync request is answered by its deadline even when nothing else wakes the
-        // loop (`sync_request.rs`, step 5).
         let wait = min_timeout(
             timeout,
             self.sync_deadline().map(|deadline| deadline.saturating_duration_since(start)),
@@ -529,15 +466,11 @@ impl<T: 'static> EventLoop<T> {
             // No extra handling is required, we just need to wake-up.
             self.waker.drain();
         }
-        // A socket that hung up or failed is a dead server's, whether or not
-        // Xlib has read that far yet.
         let hung_up = fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0;
         if self.end_if_connection_lost(hung_up) {
             return;
         }
 
-        // NB: `StartCause::Init` is handled as a special case and doesn't need
-        // to be considered here
         let cause = match self.control_flow() {
             ControlFlow::Poll => StartCause::Poll,
             ControlFlow::Wait => StartCause::WaitCancelled { start, requested_resume: None },
@@ -550,19 +483,10 @@ impl<T: 'static> EventLoop<T> {
             },
         };
 
-        // False positive / spurious wake ups could lead to us spamming
-        // redundant iterations of the event loop with no new events to
-        // dispatch.
-        //
-        // If there's no readable event source then we just double check if we
-        // have any pending `_receiver` events and if not we return without
-        // running a loop iteration.
-        // If we don't have any pending `_receiver`
         if !self.has_pending()
             && !matches!(&cause, StartCause::ResumeTimeReached { .. } | StartCause::Poll)
             && timeout.is_none()
         {
-            // No turn for the application; a sync request's deadline may be what woke it.
             self.end_turn_of_sync_requests();
             return;
         }
@@ -576,28 +500,21 @@ impl<T: 'static> EventLoop<T> {
     {
         callback(Event::NewEvents(cause), &self.event_processor.target);
 
-        // NB: For consistency all platforms must emit a 'resumed' event even though X11
-        // applications don't themselves have a formal suspend/resume lifecycle.
         if cause == StartCause::Init {
             callback(Event::Resumed, &self.event_processor.target);
         }
 
-        // Process all pending events
         self.drain_events(callback);
-        // Reading them can find the connection broken: nothing after this
-        // may make a request on it.
         if self.end_if_connection_lost(false) {
             return;
         }
 
-        // Empty the user event buffer
         {
             while let Ok(event) = self.user_receiver.try_recv() {
                 callback(Event::UserEvent(event), &self.event_processor.target);
             }
         }
 
-        // Empty the redraw requests
         {
             let mut windows = HashSet::new();
 
@@ -606,8 +523,6 @@ impl<T: 'static> EventLoop<T> {
             }
 
             for window_id in windows {
-                // A redraw the server's Expose asked for, whoever else asked too, is dispatched
-                // as an exposure (`platform::x11::redraw_is_exposure`).
                 let exposed = self
                     .event_processor
                     .with_window(u64::from(window_id) as xproto::Window, |w| w.take_exposed())
@@ -623,7 +538,6 @@ impl<T: 'static> EventLoop<T> {
             }
         }
 
-        // This is always the last event we dispatch before poll again
         {
             callback(Event::AboutToWait, &self.event_processor.target);
         }
@@ -631,10 +545,7 @@ impl<T: 'static> EventLoop<T> {
         self.end_turn_of_sync_requests();
     }
 
-    /// A turn ended, or the loop woke for a deadline: answer each window manager's resize sync
-    /// request the next turn cannot bring a frame for, or whose deadline came (`sync_request.rs`,
-    /// steps 4 and 5). Whether a redraw is queued is asked once, and only of a turn that left a
-    /// request waiting for its frame.
+    /// A turn ended, or the loop woke for a deadline.
     fn end_turn_of_sync_requests(&mut self) {
         if self.connection_broken() {
             return;
@@ -650,8 +561,7 @@ impl<T: 'static> EventLoop<T> {
         }
     }
 
-    /// The earliest deadline of the windows' pending resize sync requests (`sync_request.rs`,
-    /// step 5).
+    /// Earliest deadline of pending resize sync requests (`sync_request.rs`).
     fn sync_deadline(&self) -> Option<Instant> {
         let wt = EventProcessor::window_target(&self.event_processor.target);
         let windows = wt.windows.borrow();
@@ -664,10 +574,6 @@ impl<T: 'static> EventLoop<T> {
     {
         let mut xev = MaybeUninit::uninit();
 
-        // Xlib keeps handing out the events it queued before it found the
-        // connection broken; handling one makes requests on the dead
-        // connection (its own round trips, and the callback's). Once broken,
-        // the rest stay queued and the loop ends.
         while !self.connection_broken()
             && unsafe { self.event_processor.poll_one_event(xev.as_mut_ptr()) }
         {
@@ -713,8 +619,7 @@ impl<T: 'static> EventLoop<T> {
     }
 }
 
-/// What a run ends with once its connection ended: [`EventLoopError::DisplayLost`] when its
-/// transport failed, libxcb's error when it closed the connection for a reason of its own.
+/// Error returned once the X connection ended ([`EventLoopError::DisplayLost`]).
 fn connection_ended(end: xdisplay::ConnectionEnd) -> EventLoopError {
     match end {
         xdisplay::ConnectionEnd::Transport(why) => EventLoopError::DisplayLost(why),
@@ -724,8 +629,7 @@ fn connection_ended(end: xdisplay::ConnectionEnd) -> EventLoopError {
     }
 }
 
-/// What a request that failed while the loop started ends it with: the connection's end when
-/// it has ended ([`connection_ended`]), as a running loop's would be; else the failure itself.
+/// Error returned when a startup request fails ([`connection_ended`]).
 fn startup_failure(xconn: &XConnection, error: impl Into<X11Error>) -> EventLoopError {
     match xconn.connection_end(false) {
         Some(end) => connection_ended(end),
@@ -753,7 +657,7 @@ impl ActiveEventLoop {
         &self,
     ) -> Result<rwh_06::RawDisplayHandle, rwh_06::HandleError> {
         let display_handle = rwh_06::XlibDisplayHandle::new(
-            // SAFETY: display will never be null
+            // SAFETY: Display will never be null.
             Some(
                 std::ptr::NonNull::new(self.xconn.display as *mut _)
                     .expect("X11 display should never be null"),
@@ -880,9 +784,7 @@ pub enum X11Error {
     /// An error from the Xlib library.
     Xlib(XError),
 
-    /// A request, its reply or the connection under Xlib failed: the server's error for
-    /// the request, a broken connection, an answer that did not parse, or the XID range
-    /// spent.
+    /// A request, its reply or the connection under Xlib failed.
     X11(aterm_x11::Error),
 
     /// Got `null` from an Xlib function without a reason.
@@ -964,8 +866,7 @@ impl From<util::GetPropertyError> for X11Error {
 /// Type alias for a void cookie.
 type VoidCookie<'a> = aterm_x11::VoidCookie<'a>;
 
-/// x11rb's name for dropping a void request's cookie: the request's error, if the server
-/// sends one, is discarded when it arrives.
+/// x11rb's name for dropping a void request's cookie.
 trait IgnoreError {
     fn ignore_error(self);
 }
@@ -975,15 +876,7 @@ impl IgnoreError for VoidCookie<'_> {
 }
 
 impl XConnection {
-    /// A request the backend made for the application failed (`what`, the error): it goes to
-    /// stderr, unless the connection is broken. Nothing here ends the process: a request to a
-    /// display that has gone fails, and the event loop's next look at the connection ends the
-    /// run with the loss (`EventLoop::end_if_connection_lost`, `EventLoopError::DisplayLost`),
-    /// which says how it went, so a broken connection's failures say nothing more. Upstream
-    /// unwrapped these, and a display lost between two of the loop's looks panicked whoever
-    /// asked (the Linux lane, 2026-10-20: the crash journal's `outer_position` at
-    /// `XTranslateCoordinates`, `docs/LINUX-RUNTIME-LANE.md`, "The display gone"). The line
-    /// is stderr's, not `tracing`'s, for the reason `EventLoop::run_on_demand` gives.
+    /// A request the backend made for the application failed (`what`, the error).
     pub(crate) fn report(&self, what: &str, error: impl fmt::Display) {
         if !self.is_broken() {
             eprintln!("aterm-window: {what}: {error}");
@@ -993,8 +886,7 @@ impl XConnection {
 
 /// Extension trait for `Result<VoidCookie, E>`.
 trait CookieResultExt {
-    /// Ignore the request's reply as [`IgnoreError::ignore_error`] does; a request that could
-    /// not be sent is [`XConnection::report`]ed as `what`.
+    /// Ignore the reply ([`IgnoreError::ignore_error`]) or [`XConnection::report`] failure.
     fn ignore_error_or_report(self, xconn: &XConnection, what: &str);
 }
 
@@ -1030,8 +922,6 @@ fn mkdid(w: xinput::DeviceId) -> crate::event::DeviceId {
 pub struct Device {
     _name: String,
     scroll_axes: Vec<(i32, ScrollAxis)>,
-    // For master devices, this is the paired device (pointer <-> keyboard).
-    // For slave devices, this is the master.
     attachment: c_int,
 }
 
@@ -1054,7 +944,6 @@ impl Device {
         let mut scroll_axes = Vec::new();
 
         if Device::physical_device(info) {
-            // Identify scroll axes
             for &class_ptr in Device::classes(info) {
                 let ty = unsafe { (*class_ptr).type_ };
                 if ty == ffi::xi::SCROLL_CLASS {

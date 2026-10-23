@@ -28,6 +28,8 @@ use crate::native_document_io::{
 mod owner;
 
 /// Where no image can carry an owner set (neither an extended attribute nor an
+/// alternate data stream), nothing is marked and nothing is taken: every
+/// journal stays, as it always did there.
 #[cfg(not(any(unix, windows)))]
 mod owner {
     use std::fs::File;
@@ -924,6 +926,7 @@ pub(crate) fn hold_journal_lock_for_test(
 #[cfg(all(test, unix))]
 thread_local! {
     /// Some while a [`ForkedJournalLockCopies`] lives on this thread: the
+    /// copies of every journal lock description this thread has locked since.
     static FORKED_LOCK_COPIES: std::cell::RefCell<Option<Vec<File>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -974,6 +977,7 @@ fn lock_opened_for_test() {
 }
 
 /// The fork a [`ForkedJournalLockCopies`] stands in for, at the instant the
+/// lock is held.
 #[cfg(all(test, unix))]
 fn copy_held_lock_for_test(lock: &File) {
     FORKED_LOCK_COPIES.with(|copies| {
@@ -1011,11 +1015,13 @@ pub(crate) fn verify_carried_draft(
 }
 
 /// Whether a journal image holds no draft: its first snapshot alone, the file as opened or last
+/// saved.
 fn holds_no_draft(recovered: &StoredJournalRecovery) -> bool {
     recovered.record_count == 1
 }
 
 /// How an open reads one decoded image against the file on disk: the one rule
+/// for a keyed journal and a legacy one alike ([`DraftJournalHost::inspect_open`]).
 struct OpenReading {
     /// Its draft was made against exactly the file on disk and is not the file.
     recover: bool,
@@ -1045,6 +1051,10 @@ fn read_for_open(recovered: &StoredJournalRecovery, disk_bytes: &[u8]) -> OpenRe
 }
 
 /// What a legacy draft that wins an open ([`LegacyJournal`]) does to the keyed
+/// image beside it (`keyed`, as it decoded), as the notice that says so: one that does not
+/// decode is kept aside as `Corrupt`; one holding a draft the legacy image does
+/// not is kept aside as `DiskConflict`; `None` leaves it to be replaced, for it
+/// holds nothing the legacy one lacks (no draft, or that draft's migration).
 fn keyed_set_aside_by_legacy(
     keyed: &Result<StoredJournalRecovery, crate::native_document_io::JournalError>,
     legacy: &StoredJournalRecovery,
@@ -1074,6 +1084,7 @@ impl OpenReading {
 }
 
 /// The first snapshot of a journal image for `key` — the file contents its
+/// draft was made against.
 fn journal_baseline_text(key: JournalDocumentKey, bytes: &[u8]) -> Option<String> {
     let records = crate::native_document_io::decode_journal(bytes).ok()?;
     let first = records.into_iter().next()?;
@@ -1190,6 +1201,7 @@ fn synthetic_snapshot(document: DocumentId, seq: Seq, text: Arc<str>) -> Documen
 }
 
 /// Narrow two document snapshots to the one replaced range between their common prefix and
+/// common suffix.
 fn single_edit(before: &str, after: &str) -> JournalEdit {
     let mut prefix = before
         .as_bytes()
@@ -1436,6 +1448,7 @@ impl DraftJournalHost {
     }
 
     /// Set the existing journal aside as `<stem>.preserved-<n>.atdj`, the first
+    /// free `n`, beside the live one.
     fn preserve_locked(&self, path: &Path, expected: JournalImageGeneration) -> Result<(), String> {
         debug_assert_eq!(path.parent(), Some(self.root.as_path()));
         preserve_journal_locked(path, expected)
@@ -1443,6 +1456,7 @@ impl DraftJournalHost {
 }
 
 /// [`DraftJournalHost::preserve_locked`] for a caller holding only the path —
+/// the worker's re-seat ([`execute_journal_reseat`]).
 fn preserve_journal_locked(path: &Path, expected: JournalImageGeneration) -> Result<(), String> {
     let root = path
         .parent()
@@ -1478,6 +1492,7 @@ fn preserve_journal_locked(path: &Path, expected: JournalImageGeneration) -> Res
 }
 
 /// Retire a [`LegacyJournal`] under its own lock: gone already is retired; still the image the
+/// open read, it is set aside first when its draft was not carried, then unlinked.
 fn retire_legacy_journal(
     legacy: &LegacyJournal,
     patience: JournalLockPatience,
@@ -1509,6 +1524,7 @@ fn retire_legacy_journal(
 }
 
 /// [`retire_legacy_journal`] for a write plan that owes one, before the write
+/// takes its own lock (so no thread ever holds two journal locks).
 fn retire_owed_legacy(
     legacy: Option<&LegacyJournal>,
     patience: JournalLockPatience,
@@ -1524,7 +1540,7 @@ const JOURNAL_SECRET_FILE: &str = ".journal-key";
 const JOURNAL_SECRET_MAGIC: [u8; 8] = *b"ATDJKEY1";
 const JOURNAL_SECRET_FILE_LEN: usize = JOURNAL_SECRET_MAGIC.len() + JOURNAL_SECRET_LEN;
 
-/// The journal secret of the draft directory `root`, minted when it has none. Fail-closed:
+/// The journal secret of the draft directory `root`, minted when it has none.
 fn load_or_mint_journal_secret(root: &Path) -> Result<JournalSecret, String> {
     let path = root.join(JOURNAL_SECRET_FILE);
     let unusable = |error: String| {
@@ -1600,6 +1616,7 @@ fn decode_journal_secret(bytes: &[u8; JOURNAL_SECRET_FILE_LEN]) -> Result<Journa
 }
 
 /// Mint and publish a secret (see [`load_or_mint_journal_secret`]), or read
+/// the one another aterm published first.
 fn mint_journal_secret(root: &Path, path: &Path) -> Result<JournalSecret, String> {
     let mut raw = [0u8; JOURNAL_SECRET_LEN];
     aterm_uds::rand::fill(&mut raw).map_err(|error| format!("no OS entropy: {error}"))?;
@@ -1663,6 +1680,7 @@ fn create_journal_secret_temporary(path: &Path) -> std::io::Result<File> {
 }
 
 /// Open the secret without following or waiting on a hostile final component;
+/// the handle, not the pathname, is then proved a regular file.
 #[cfg(unix)]
 fn open_journal_secret(path: &Path) -> std::io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -1846,6 +1864,8 @@ pub(crate) fn checkpoint_plan(
 const TEST_DRAFT_ROOT_PREFIX: &str = "aterm-test-drafts-";
 
 /// aterm's shared per-user state root — the ONE rule
+/// ([`aterm_types::dirs::state_dir`]), so the journal, the harness and the
+/// session identities never disagree about the directory.
 #[cfg(not(test))]
 fn default_state_root() -> Option<PathBuf> {
     aterm_types::dirs::state_dir()
@@ -1919,6 +1939,7 @@ fn journal_not_regular(kind: &str) -> std::io::Error {
 }
 
 /// Open the sibling advisory lock without following or waiting on a hostile
+/// final component.
 #[cfg(unix)]
 fn open_journal_lock(path: &Path) -> std::io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -1997,7 +2018,7 @@ fn with_journal_lock<T>(
     operation()
 }
 
-/// Take the journal's lock on the file its lock path names. A release or the
+/// Take the journal's lock on the file its lock path names.
 fn take_linked_journal_lock(
     lock_path: &Path,
     path: &Path,
@@ -2054,6 +2075,9 @@ impl JournalLockPatience {
 }
 
 /// The journal's rendering of the crate's ONE bounded advisory-lock retry
+/// (`native_document_host::acquire_advisory_lock_within` — same loop, same
+/// exponential backoff clamped to the remaining budget, same "retry `WouldBlock`
+/// only, never `Error`" rule).
 fn take_journal_lock(
     lock: File,
     path: &Path,
@@ -2074,6 +2098,8 @@ fn take_journal_lock(
 }
 
 /// The sole production journal-image reader: one non-blocking, no-follow open whose handle is
+/// proved regular, reading at most `MAX_JOURNAL_BYTES + 1` so growth during the read cannot
+/// allocate unboundedly.
 fn read_journal_image(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
     match aterm_effects::file_feed::read_bounded_regular_file(path, MAX_JOURNAL_BYTES) {
         Ok(bytes) => Ok(Some(bytes)),
@@ -2128,6 +2154,7 @@ impl std::fmt::Display for JournalReplaceError {
 }
 
 /// `owner` is the publishing store's owner identity, named on the image
+/// (`owner::mark_publication`); `None` publishes it with its holders unknown.
 fn atomic_replace_locked(
     path: &Path,
     bytes: &[u8],
@@ -2385,6 +2412,8 @@ mod tests {
     }
 
     /// A second descriptor onto the open file description behind the one
+    /// descriptor this process holds on `path` — what a child forked at this
+    /// instant would hold until it execs.
     #[cfg(unix)]
     fn copy_of_the_open_description_of(path: &Path) -> File {
         use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -2415,6 +2444,7 @@ mod tests {
     }
 
     /// The journal lock is free the instant the locked operation returns, even while a copy of
+    /// its description lives, as in a shell another thread forked mid-append.
     #[cfg(unix)]
     #[test]
     fn a_released_journal_lock_is_free_while_a_forked_copy_of_it_lives() {
@@ -2647,6 +2677,7 @@ mod tests {
     }
 
     /// Opened and never edited, then changed on disk (a `git pull`): the reopen is plain, with
+    /// no conflict and no copy kept, and the one image is replaced by the file as it is now.
     #[test]
     fn a_clean_journal_reopened_over_a_changed_file_holds_no_draft() {
         let root = test_root("clean-reopen");
@@ -3264,6 +3295,7 @@ mod tests {
     }
 
     /// `single_edit` must equal the char-scan definition: its delta feeds the `MAX_INSERT_BYTES`
+    /// delta-vs-snapshot decision and is proof-checked against the durable image.
     #[test]
     fn single_edit_matches_the_char_scan_definition_on_multi_byte_boundaries() {
         /// The char-scan definition.
@@ -3340,6 +3372,7 @@ mod tests {
     }
 
     /// One outgoing store with one journaled edit ("disk" → "disk+"), ready to
+    /// meet whatever an update's successor left in its journal.
     fn journaled_edit(
         name: &str,
     ) -> (
@@ -3420,6 +3453,9 @@ mod tests {
     }
 
     /// A successor republished the image (its own sequence numbers, the same
+    /// draft): the re-seat puts back `[baseline, head]` under this store's
+    /// sequences, preserves nothing (it held nothing new), and the next append
+    /// lands where the successor's image made every append fail.
     #[test]
     fn a_reseat_takes_back_a_successors_republication() {
         let (root, mut journals, mut store, id, disk, path, key) =
@@ -3516,6 +3552,8 @@ mod tests {
     }
 
     /// An image holding a draft this store never had is preserved aside before
+    /// the re-seat replaces it; one whose baseline is not this store's leaves
+    /// the target as its own baseline, a draft to every later open and re-seat.
     #[test]
     fn a_reseat_preserves_what_it_never_had() {
         let (root, mut journals, store, id, _disk, path, key) = journaled_edit("reseat-foreign");
@@ -3610,6 +3648,9 @@ mod tests {
     }
 
     /// A save after a re-seat that recorded its draft as its own baseline makes
+    /// the baseline the file again: a later clean re-seat writes one snapshot,
+    /// and an open over newer contents reads it as clean (DJ1,
+    /// docs/AUDIT-persisted-state-2026-10-07.md).
     #[test]
     fn a_save_after_a_reseat_makes_the_baseline_the_file_again() {
         let (root, mut journals, store, id, _disk, path, key) = journaled_edit("save-after-reseat");
@@ -3661,6 +3702,7 @@ mod tests {
     }
 
     /// While the fence stands (an update attempt is in flight) an owed re-seat
+    /// is not planned, and neither is anything behind it.
     #[test]
     fn a_fenced_reseat_holds_every_effect() {
         let (root, mut journals, mut store, id, _disk, _path, _key) =
@@ -3695,6 +3737,7 @@ mod tests {
     }
 
     /// A re-seat that fails (the journal lock held past the event loop's budget) is owed again
+    /// and refuses the draft by name, not by waiting, until a retry lands.
     #[test]
     fn a_failed_reseat_is_refused_by_name_until_a_retry_lands() {
         let (root, mut journals, store, id, _disk, path, _key) = journaled_edit("reseat-failed");
@@ -3733,6 +3776,7 @@ mod tests {
     }
 
     /// Open `uri` (empty on disk) in `journals` and journal `draft` as its
+    /// unsaved head, durably: what a crash or an update leaves behind.
     fn journal_a_draft(
         journals: &mut DocumentJournalStore,
         store: &mut DocumentStore,
@@ -3768,6 +3812,7 @@ mod tests {
     }
 
     /// Two names in one directory whose unkeyed FNV-1a/64 identities are equal name two
+    /// journals, and neither document recovers the other's draft.
     #[test]
     fn colliding_legacy_names_never_share_a_journal() {
         const A: &str = "file:///Users//alice/Downloads/7ykhvtpwaxxug.txt";
@@ -3814,12 +3859,14 @@ mod tests {
     }
 
     /// Write `uri`'s journal as an older aterm did: under the unkeyed name, every record
+    /// carrying the unkeyed key — the file's snapshot, then the draft as an appended delta.
     fn write_legacy_journal(root: &Path, uri: &str, disk: &str, draft: &str) -> PathBuf {
         let typed: &[&str] = if draft == disk { &[] } else { &[draft] };
         write_legacy_journal_typing(root, uri, disk, typed)
     }
 
     /// [`write_legacy_journal`] for a draft typed as `texts`, one appended
+    /// delta to each in turn.
     fn write_legacy_journal_typing(root: &Path, uri: &str, disk: &str, texts: &[&str]) -> PathBuf {
         let key = JournalDocumentKey::legacy_unkeyed(uri);
         let mut store = crate::test_document_store();
@@ -3840,6 +3887,7 @@ mod tests {
     }
 
     /// Open `uri` over `disk` as the App does: inspect, install any recovered
+    /// draft, initialize.
     fn open_as_the_app_does(
         journals: &mut DocumentJournalStore,
         store: &mut DocumentStore,
@@ -3893,6 +3941,7 @@ mod tests {
     }
 
     /// A draft an older aterm journaled under the unkeyed name is recovered and moved to the
+    /// keyed journal.
     #[test]
     fn a_legacy_journal_is_recovered_and_retired_by_the_first_write() {
         const URI: &str = "file:///tmp/legacy-migration.md";
@@ -3943,6 +3992,9 @@ mod tests {
     }
 
     /// An update from an older aterm rolled back after its successor migrated
+    /// the draft, and the older aterm journaled on: its legacy journal is the
+    /// newer and wins the next open; the keyed image the successor left, which
+    /// holds a draft the legacy one does not, is set aside, not replaced.
     #[test]
     fn a_legacy_journal_rewritten_after_a_migration_wins_and_the_keyed_one_is_kept() {
         const URI: &str = "file:///tmp/legacy-rollback.md";
@@ -3970,6 +4022,8 @@ mod tests {
     }
 
     /// A legacy journal an older aterm wrote again after this one read it is
+    /// newer than the migration: the write that owes its retirement refuses,
+    /// and the legacy image is left whole for the next open.
     #[test]
     fn a_legacy_journal_changed_after_the_read_refuses_the_retiring_write() {
         const URI: &str = "file:///tmp/legacy-changed.md";
@@ -3993,6 +4047,7 @@ mod tests {
     }
 
     /// A legacy journal with nothing to carry goes at the open: a clean one
+    /// outright, one whose draft conflicts with the file set aside first.
     #[test]
     fn a_legacy_journal_with_nothing_to_carry_is_retired_at_the_open() {
         const CLEAN: &str = "file:///tmp/legacy-clean.md";
@@ -4046,6 +4101,7 @@ mod tests {
     }
 
     /// An older aterm that runs after this one cannot see a keyed journal, so opening the file
+    /// it writes a clean legacy image.
     #[test]
     fn a_clean_legacy_journal_never_hides_a_keyed_draft() {
         const URI: &str = "file:///tmp/legacy-clean-after-keyed.md";
@@ -4086,6 +4142,8 @@ mod tests {
     }
 
     /// A legacy draft that is the file itself (an older aterm typed, then undid) still wins:
+    /// its document is dirty there, so an outgoing older aterm's update Commit check reads it
+    /// back, and it stays until the first write.
     #[test]
     fn a_legacy_draft_that_is_the_file_never_sets_a_keyed_draft_aside_silently() {
         const URI: &str = "file:///tmp/legacy-undone-after-keyed.md";
@@ -4124,6 +4182,8 @@ mod tests {
     }
 
     /// The secret is minted once, private and exact, and every store over the
+    /// directory reads the same one back; another directory's secret keys the
+    /// same URI elsewhere.
     #[test]
     fn the_journal_secret_is_minted_private_once_and_read_back() {
         const URI: &str = "file:///tmp/secret.md";
@@ -4177,6 +4237,8 @@ mod tests {
     }
 
     /// A secret that cannot be used refuses the store, and nothing is minted
+    /// over it: the secret, a keyed journal and a legacy journal stay exactly as
+    /// they were.
     #[cfg(unix)]
     #[test]
     fn an_unusable_journal_secret_refuses_the_store_and_is_never_replaced() {
@@ -4263,6 +4325,8 @@ mod tests {
     }
 
     /// A secret that is gone is minted afresh — a first run looks the same —
+    /// and the journals keyed under the old one stay on disk untouched, read by
+    /// no key again (never deleted, never mistaken for the new key's).
     #[test]
     fn a_deleted_journal_secret_is_reminted_and_its_journals_stay() {
         const URI: &str = "file:///tmp/secret-deleted.md";

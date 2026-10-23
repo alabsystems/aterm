@@ -132,6 +132,8 @@ impl Writer {
 }
 
 /// A take's lines as the writer before phase 2B's fix wrote them: each snap
+/// restating the open path as the log stood at the take, past the snap's
+/// head (NEGATIVE CONTROL).
 fn present_frames(tk: &aterm_slog::journal::Take, snap: bool, t: u64) -> Vec<Frame> {
     let mut out = take_frames(sid(), tk, false, t);
     let restate = |head: u64| {
@@ -200,6 +202,7 @@ fn cmd(log: &mut Log, ms: u64) -> Node {
 }
 
 /// Random traffic: commands that open and close, marks, and turns under an
+/// agent run, on `log`.
 fn traffic(log: &mut Log, rng: &mut XorShift, ms: &mut u64) {
     *ms += 7;
     match rng.below(6) {
@@ -551,6 +554,7 @@ fn an_update_reads_once_across_both_chains_and_says_a_shortfall() {
 }
 
 /// One process's log of the session at epoch `ep`: its open at `start` ms
+/// and `marks` person marks after it.
 fn relaunched(ep: u32, start: u64, marks: u64) -> Log {
     let mut log = Log::new(ep);
     open_session(&mut log, start);
@@ -565,6 +569,9 @@ fn relaunched(ep: u32, start: u64, marks: u64) -> Log {
 }
 
 /// THE JOURNAL SHOWS THE RELAUNCH'S OWN OPEN:
+/// a session relaunched under the same sid (a
+/// `$ATERM_SESSION_ID` re-adoption) by a process that quit, journaled by
+/// two chains.
 #[test]
 fn the_journal_shows_the_relaunchs_own_open() {
     let shown = |a_ep: u32, b_ep: u32, rules: ViewRules| -> Vec<Rec> {
@@ -612,6 +619,11 @@ fn the_journal_shows_the_relaunchs_own_open() {
 }
 
 /// A `#handed` LINK KEEPS ONE SPACE THROUGH A DISAGREEMENT (the view splits two chains "that no `#handed`
+/// line links"):
+/// a seamless update's predecessor journals the session and
+/// hands it on (`#handed`); its carried successor, in the same base,
+/// journals its own records and one record at a seq of the predecessor's
+/// that is not the predecessor's (a restatement that does not match).
 #[test]
 fn a_handed_link_keeps_one_space_through_a_disagreement() {
     let mut a_log = Log::new(1);
@@ -688,6 +700,9 @@ fn a_handed_link_keeps_one_space_through_a_disagreement() {
 }
 
 /// A READER HOLDS EVERY RECORD IT READ: 10⁵ journaled records read back are
+/// all in the view and none is said lost (a reply's ring is sized to its
+/// read, which the read's own budget bounds), and `n=`-style paging reaches
+/// the oldest.
 #[test]
 fn a_reader_holds_every_record_it_read() {
     let mut log = Log::new(1);
@@ -714,6 +729,8 @@ fn a_reader_holds_every_record_it_read() {
 }
 
 /// ONE TAKE PER PASS: the host's writer takes at most `max` records of a
+/// track per pass and owes the rest, so it is often behind its log when it
+/// starts a segment or snaps after a loss.
 #[test]
 fn one_take_per_pass_never_invents_a_loss() {
     let walk = |seed: u64, mark: bool, before_fix: bool| -> Vec<String> {
@@ -798,6 +815,9 @@ fn one_take_per_pass_never_invents_a_loss() {
 }
 
 /// THE RING AND THE WRITER: a ring told how far the writer read evicts what
+/// the writer holds before what it has not reached, so a burst of commands
+/// between two passes, smaller than the ring, loses nothing the writer can
+/// still take; the ring keeps its bounds.
 #[test]
 fn a_burst_between_passes_loses_nothing_the_writer_could_write() {
     let burst = |mark: bool| -> (u64, usize) {
@@ -837,11 +857,19 @@ fn a_burst_between_passes_loses_nothing_the_writer_could_write() {
 }
 
 /// A host's row rule for [`a_burst_loses_nothing_the_writer_could_write_with_rows_kept`]:
+/// a status mark is a timeline row.
 fn status_rows(r: &Rec) -> u8 {
     u8::from(r.op == Op::Mark && r.k == Kind::Status)
 }
 
 /// THE ROW FLOOR YIELDS TO THE WRITER (6G-1's floor, the review of 6G-1):
+/// the burst above on a ring that keeps a host's rows (16 status rows, the
+/// floor of a ring of 64, then 20 commands, all taken by the writer, then
+/// 25 commands before its next pass) still loses nothing the writer could
+/// write: within the records the writer holds the floor runs last, and
+/// every record it holds goes before one it has not reached, so the rows
+/// the batch took are rows the writer holds (the view tells their ids as a
+/// hole).
 #[test]
 fn a_burst_loses_nothing_the_writer_could_write_with_rows_kept() {
     let burst = |rows: bool| -> (u64, Log) {
@@ -908,6 +936,8 @@ fn a_burst_loses_nothing_the_writer_could_write_with_rows_kept() {
 }
 
 /// A TAKE IS DONE only when the session's close is among what it took: a
+/// session that closes during an update's overlap is fenced past its close,
+/// and its writer must keep it to write the close after a rollback.
 #[test]
 fn a_take_is_done_only_with_the_close_taken() {
     let mut log = Log::new(1);
@@ -933,6 +963,11 @@ fn a_take_is_done_only_with_the_close_taken() {
 }
 
 /// THE RECORDS A REPLY DERIVES (a crash gap and its closes) are numbered
+/// past the journal's head in the journal's own epoch, in the same seq
+/// space, and the reply hands out the journal's own cursor, its epoch and
+/// head: following it shows what the reply derived again, and nothing else,
+/// never a reset; a cursor of the dead process at or below the head reads
+/// on; one past it is reset.
 #[test]
 fn the_reply_hands_out_the_journals_cursor_never_one_into_what_it_derived() {
     let mut log = Log::new(1);
@@ -970,6 +1005,8 @@ fn the_reply_hands_out_the_journals_cursor_never_one_into_what_it_derived() {
 }
 
 /// A READ THAT DID NOT REACH ALL OF THE JOURNAL SAYS SO: what it missed past
+/// its head (a newer segment it could not list) reads as a `gap why=unread`
+/// record of the reply's, and the chain is never read as a crash.
 #[test]
 fn a_read_that_missed_newer_lines_says_unread() {
     let mut log = Log::new(1);
@@ -991,6 +1028,7 @@ fn a_read_that_missed_newer_lines_says_unread() {
 }
 
 /// A SESSION THE WRITER LET GO (its backstop) is said in its space: a snap
+/// first, then `#gap why=dropped` over what it had not written.
 #[test]
 fn a_dropped_session_is_said_in_its_space() {
     let mut log = Log::new(1);
@@ -1013,6 +1051,9 @@ fn a_dropped_session_is_said_in_its_space() {
 }
 
 /// THE WRITER'S WAKE lives in the log: every append (each record
+/// of a cascade), every eviction, an overlap and a fence change ring the
+/// host's notifier; a log without one rings nothing, and a copy kept for the
+/// closed index rings nothing either.
 #[test]
 fn every_append_and_eviction_rings_the_journal_wake() {
     use std::sync::Arc;
@@ -1065,6 +1106,8 @@ fn every_append_and_eviction_rings_the_journal_wake() {
 }
 
 /// The cursor a reply hands a reader: the rule's ([`View::reply_cursor`]),
+/// or, as a NEGATIVE CONTROL, the reply's own last record's (`Read::next`),
+/// which names a record the reply derived.
 #[derive(Clone, Copy)]
 enum Hand {
     Rule,
@@ -1072,6 +1115,8 @@ enum Hand {
 }
 
 /// One reply a reader following cursors gets from `v`: its cursor placed by
+/// [`View::cursor`] (none: the whole view), the records read on from it,
+/// and the cursor the reply hands back (`hand`).
 fn follow(v: &View, c: Option<Cursor>, hand: Hand) -> (Vec<Rec>, Cursor) {
     let from = c.map_or(Cursor::new(v.log.ep(), 0), |c| v.cursor(c));
     let read = v.log.read(from, usize::MAX);
@@ -1084,6 +1129,8 @@ fn follow(v: &View, c: Option<Cursor>, hand: Hand) -> (Vec<Rec>, Cursor) {
 }
 
 /// What a reader following cursors across `views` (one reply each) never
+/// saw of the last view's journaled records, and the seqs any one reply
+/// showed twice.
 fn followed(views: &[View], hand: Hand) -> (Vec<u64>, Vec<u64>) {
     let mut seen = std::collections::BTreeSet::new();
     let mut twice = Vec::new();
@@ -1111,6 +1158,9 @@ fn followed(views: &[View], hand: Hand) -> (Vec<u64>, Vec<u64>) {
 }
 
 /// A READER FOLLOWING ONE REPLY'S CURSOR INTO THE NEXT NEVER SKIPS A RECORD
+/// THE JOURNAL HOLDS: a cut read says `gap why=unread` by a record it derives
+/// past its head; the whole read that follows holds journaled records at
+/// those seqs and derives a crash.
 #[test]
 fn a_cut_read_then_a_whole_one_skips_no_journaled_record() {
     let mut log = Log::new(1);
@@ -1150,6 +1200,9 @@ fn a_cut_read_then_a_whole_one_skips_no_journaled_record() {
 }
 
 /// THE SAME ON A LIVE CHAIN THAT GROWS between two replies, each deriving an
+/// `out=unknown` close past its head (a run whose close the writer never
+/// saw): the first reply handed out its head, so the records journaled since
+/// are shown, and the unknown close is shown again, past the new head.
 #[test]
 fn a_growing_live_chain_read_twice_skips_no_journaled_record() {
     let limits = Limits::new(3, 1 << 20).expect("a tiny ring");
@@ -1194,6 +1247,9 @@ fn a_growing_live_chain_read_twice_skips_no_journaled_record() {
 }
 
 /// THE CURSOR RULE'S EDGES: the dead process's cursor past the head (a
+/// reply's over more of the journal than this read reached among them), an
+/// epoch past the journal's (the largest too) and one before its space's
+/// base are reset; one of the journal's at or below the head reads on.
 #[test]
 fn a_cursor_the_view_cannot_place_is_reset() {
     let mut log = Log::new(1);
@@ -1230,6 +1286,11 @@ fn a_cursor_the_view_cannot_place_is_reset() {
 }
 
 /// A RESTATEMENT PAST ITS SNAP'S HEAD ACCOUNTS FOR NOTHING (the reader's
+/// half of the restatement rule, over hand-built frames as a writer before
+/// phase 2B's fix or a corrupt segment writes them, whatever this build's
+/// writer does): a dead chain journaled through seq 3 whose newest snap, at
+/// head 3, restates a run opened at seq 6 reads no pruned range, its crash
+/// gap says `after=3`, its head is 3, and the run is never shown.
 #[test]
 fn a_restatement_past_its_snaps_head_accounts_for_nothing() {
     let mut log = Log::new(1);
@@ -1372,6 +1433,8 @@ fn a_restatement_past_its_snaps_head_accounts_for_nothing() {
 }
 
 /// A crash recovery's log of the session (its epoch `ep`, the Unix seconds
+/// `Epochs::crash` gives one): its crash gap, its open and `n` marks,
+/// journaled whole by `inst`'s writer.
 fn recovered_space(ep: u32, n: u64, inst: &str, ms: u64) -> Writer {
     let mut log = Log::new(ep);
     let _ = log.gap(GapWhy::Crash, 0, at(ms));
@@ -1388,6 +1451,7 @@ fn recovered_space(ep: u32, n: u64, inst: &str, ms: u64) -> Writer {
 }
 
 /// Where `v` reads a reader's cursor `c` on from, placed by `place`: the
+/// first seq it shows and the gap it says.
 fn placed_by(
     v: &View,
     c: Cursor,
@@ -1403,6 +1467,8 @@ fn placed(v: &View, c: Cursor) -> (Option<u64>, Option<GapWhy>) {
 }
 
 /// NEGATIVE CONTROL: the placement the rule replaced, which read any epoch
+/// above the journal's as a reply's built over head `(ep - journal ep - 1) /
+/// 2` and moved the cursor into the journal's epoch at or below that head.
 fn keyed_placement(v: &View, c: Cursor) -> Cursor {
     let reset = Cursor::new(v.ep, u64::MAX);
     if c.ep <= v.ep {
@@ -1416,7 +1482,7 @@ fn keyed_placement(v: &View, c: Cursor) -> Cursor {
     }
 }
 
-/// A CURSOR OF ANOTHER SEQ SPACE IS RESET, SAID, in both directions. Two
+/// A CURSOR OF ANOTHER SEQ SPACE IS RESET, SAID, in both directions.
 #[test]
 fn a_cursor_of_another_space_is_reset_said() {
     let s: u32 = 1_792_100_000;
@@ -1457,6 +1523,9 @@ fn a_cursor_of_another_space_is_reset_said() {
 }
 
 /// A SUCCESSOR'S CURSOR AGAINST A JOURNAL THAT LAGS IS RESET, SAID: a
+/// carried update's log continues the space in the next epoch (the
+/// predecessor's plus one), and its writer had not written when the journal
+/// was read.
 #[test]
 fn a_successors_cursor_against_a_lagging_journal_is_reset_said() {
     let mut log = Log::new(1);

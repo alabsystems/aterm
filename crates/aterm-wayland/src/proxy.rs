@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The runtime: proxies, event queues and a dispatcher, over libwayland's
-//! own C objects. A request is marshalled by opcode with its arguments in a
-//! `union wl_argument` array (`wl_proxy_marshal_array_flags`); an event
-//! reaches one Rust closure per proxy through `wl_proxy_add_dispatcher`,
-//! its arguments decoded by the message's signature. The generated protocol
-//! modules (`crate::protocols`) name the opcodes and argument types; this
-//! module does the calls.
-//!
-//! The display, and objects such as a window's `wl_surface`, may belong to
-//! someone else (winit): a [`Proxy`] is a handle, not an owner, and every
-//! call that can outlive what it points at is `unsafe`. Objects this crate
-//! creates for itself go on a private [`Queue`], so their events are
-//! dispatched only when this crate asks, on whichever thread asks.
+//! Wayland proxies, event queues, and dispatcher over libwayland C objects ([`Proxy`], [`Queue`]).
 
 use std::ffi::{CStr, c_int, c_void};
 use std::fmt;
@@ -25,13 +13,11 @@ use crate::sys::{self, Client, MARSHAL_FLAG_DESTROY, WlArgument, WlArray};
 /// Why a call failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// libwayland-client is not on this machine (or this platform has no
-    /// loader).
+    /// Libwayland-client is not on this machine (or this platform has no loader).
     Load(aterm_dl::Error),
-    /// The display failed: libwayland's `errno` for it (`EPROTO` after a
-    /// protocol error).
+    /// The display failed: libwayland's `errno` for it (`EPROTO` after a protocol error).
     Display(c_int),
-    /// libwayland returned no object (out of memory, or a dead display).
+    /// Libwayland returned no object (out of memory, or a dead display).
     NoObject,
 }
 
@@ -69,13 +55,12 @@ impl Fixed {
     }
 }
 
-/// What a [`Display::try_flush`] that did not fail left behind.
+/// What a [`Display::try_flush`] that did not fail left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Flushed {
     /// Every queued request is on the socket.
     All,
-    /// The socket is full: the rest stays queued for a later flush, once the
-    /// socket polls writable.
+    /// The socket is full: the rest stays queued for a later flush, once the socket polls writable.
     Queued,
 }
 
@@ -83,21 +68,16 @@ pub enum Flushed {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Display(NonNull<c_void>);
 
-// SAFETY: libwayland's display calls are thread-safe.
+// SAFETY: Libwayland's display calls are thread-safe.
 unsafe impl Send for Display {}
-// SAFETY: as above.
+// SAFETY: As above.
 unsafe impl Sync for Display {}
 
 impl Display {
     /// Wrap someone else's display.
     ///
     /// # Safety
-    /// `raw` remains a live `wl_display *` through every use and drop of
-    /// this handle and every queue, proxy, wrapper and listener derived
-    /// from it. All queues must be destroyed before the display is closed.
-    /// For each private queue, dispatch must be serialized with the use
-    /// and destruction of its proxies and listeners; destroying a proxy
-    /// does not wait for a callback already running on another thread.
+    /// `raw` remains a live `wl_display *` through every use and drop of this handle.
     #[inline]
     pub const unsafe fn from_ptr(raw: NonNull<c_void>) -> Display {
         Display(raw)
@@ -115,14 +95,10 @@ impl Display {
         Proxy(self.0)
     }
 
-    /// Write queued requests. On failure, the display's fatal error if it has
-    /// one, else the errno the write failed with: `EAGAIN` when the socket is
-    /// full (the rest stays queued for the next flush, so it is not fatal),
-    /// `EPIPE` when the compositor closed it (which libwayland does not record
-    /// as the display's error).
+    /// Write queued requests.
     pub fn flush(self) -> Result<(), Error> {
         let c = client()?;
-        // SAFETY: a live display (the constructor's contract).
+        // SAFETY: A live display (the constructor's contract).
         if unsafe { (c.display_flush)(self.0.as_ptr()) } < 0 {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
             return Err(self.error_or(Error::Display(errno)));
@@ -130,11 +106,7 @@ impl Display {
         Ok(())
     }
 
-    /// Write queued requests as a client that never blocks on the socket
-    /// does: a full socket is [`Flushed::Queued`], not an error, while the
-    /// display itself has not failed. Once libwayland's own buffer is full
-    /// too it ends the connection with the write's `EAGAIN` as the display's
-    /// error (1.22), and that `EAGAIN` is fatal like any other.
+    /// Write queued requests as a client that never blocks on the socket.
     pub fn try_flush(self) -> Result<Flushed, Error> {
         match self.flush() {
             Ok(()) => Ok(Flushed::All),
@@ -152,7 +124,7 @@ impl Display {
     /// The display's fatal error, if it has one.
     pub fn error(self) -> Option<Error> {
         let c = client().ok()?;
-        // SAFETY: a live display.
+        // SAFETY: A live display.
         match unsafe { (c.display_get_error)(self.0.as_ptr()) } {
             0 => None,
             errno => Some(Error::Display(errno)),
@@ -166,12 +138,12 @@ impl Display {
     /// The display's socket.
     pub fn fd(self) -> Result<c_int, Error> {
         let c = client()?;
-        // SAFETY: a live display.
+        // SAFETY: A live display.
         Ok(unsafe { (c.display_get_fd)(self.0.as_ptr()) })
     }
 }
 
-/// A display this crate connected to itself; disconnected on drop.
+/// A display this crate connected to itself.
 pub struct OwnedDisplay(Display);
 
 impl OwnedDisplay {
@@ -179,20 +151,18 @@ impl OwnedDisplay {
     pub fn connect(name: Option<&CStr>) -> Result<OwnedDisplay, Error> {
         let c = client()?;
         let name = name.map_or(std::ptr::null(), CStr::as_ptr);
-        // SAFETY: a NUL-terminated name or null.
+        // SAFETY: A NUL-terminated name or null.
         let raw = unsafe { (c.display_connect)(name) };
         NonNull::new(raw)
             .map(|p| OwnedDisplay(Display(p)))
             .ok_or(Error::NoObject)
     }
 
-    /// Connect over `fd`, a socket already connected to a compositor (what
-    /// `WAYLAND_SOCKET` hands a client). libwayland owns it from here: it is
-    /// closed when the display is, or at once when the connection fails.
+    /// Connect over `fd`, a socket already connected to a compositor.
     pub fn connect_to_fd(fd: std::os::fd::OwnedFd) -> Result<OwnedDisplay, Error> {
         use std::os::fd::IntoRawFd as _;
         let c = client()?;
-        // SAFETY: a connected socket whose ownership passes to libwayland.
+        // SAFETY: A connected socket whose ownership passes to libwayland.
         let raw = unsafe { (c.display_connect_to_fd)(fd.into_raw_fd()) };
         NonNull::new(raw)
             .map(|p| OwnedDisplay(Display(p)))
@@ -202,12 +172,7 @@ impl OwnedDisplay {
     /// Borrow the raw display as a copyable handle.
     ///
     /// # Safety
-    /// This owner must remain alive through every use and drop of the
-    /// returned handle and every queue, proxy, wrapper and listener derived
-    /// from it. All queues must be destroyed before this owner is dropped.
-    /// For each private queue, dispatch must be serialized with the use
-    /// and destruction of its proxies and listeners; destroying a proxy
-    /// does not wait for a callback already running on another thread.
+    /// This owner must remain alive through every use and drop of the returned handle.
     #[inline]
     pub const unsafe fn display(&self) -> Display {
         self.0
@@ -217,28 +182,26 @@ impl OwnedDisplay {
 impl Drop for OwnedDisplay {
     fn drop(&mut self) {
         if let Ok(c) = client() {
-            // SAFETY: a display this value connected, disconnected once.
+            // SAFETY: A display this value connected, disconnected.
             unsafe { (c.display_disconnect)(self.0.as_ptr()) }
         }
     }
 }
 
-/// A private event queue on a display; destroyed on drop.
+/// A private event queue on a display.
 pub struct Queue {
     display: Display,
     raw: NonNull<c_void>,
 }
 
-// SAFETY: the queue moves with its owner. The Display admission contract
-// requires serialized dispatch and proxy/listener destruction on this
-// queue; libwayland's display lock does not join callbacks already running.
+// SAFETY: The queue moves with its owner.
 unsafe impl Send for Queue {}
 
 impl Queue {
     /// A fresh queue on `display`.
     pub fn new(display: Display) -> Result<Queue, Error> {
         let c = client()?;
-        // SAFETY: a live display.
+        // SAFETY: A live display.
         let raw = unsafe { (c.display_create_queue)(display.as_ptr()) };
         NonNull::new(raw)
             .map(|raw| Queue { display, raw })
@@ -251,12 +214,10 @@ impl Queue {
         self.raw.as_ptr()
     }
 
-    /// A proxy for the display whose new objects land on this queue
-    /// (`wl_proxy_create_wrapper` + `wl_proxy_set_queue`), for requests such
-    /// as `wl_display.get_registry` that make this crate's own objects.
+    /// A proxy for the display whose new objects land on this queue.
     pub fn display_wrapper(&self) -> Result<Wrapper, Error> {
         let c = client()?;
-        // SAFETY: a live display, wrapped; the wrapper is this queue's.
+        // SAFETY: A live display; the wrapper belongs to this queue.
         unsafe {
             let raw = (c.proxy_create_wrapper)(self.display.as_ptr());
             let raw = NonNull::new(raw).ok_or(Error::NoObject)?;
@@ -268,7 +229,7 @@ impl Queue {
     /// Send a `wl_display.sync` and dispatch this queue until it answers.
     pub fn roundtrip(&self) -> Result<(), Error> {
         let c = client()?;
-        // SAFETY: a live display and this queue.
+        // SAFETY: A live display and this queue.
         let n = unsafe { (c.display_roundtrip_queue)(self.display.as_ptr(), self.raw.as_ptr()) };
         if n < 0 {
             return Err(self.display.error_or(Error::Display(-1)));
@@ -276,12 +237,10 @@ impl Queue {
         Ok(())
     }
 
-    /// Dispatch this queue's events, reading the socket (blocking) when none
-    /// is queued. Safe with other readers of the same display: libwayland's
-    /// read protocol hands each queue its own events.
+    /// Dispatch this queue's events, reading the socket (blocking) when none is queued.
     pub fn dispatch(&self) -> Result<usize, Error> {
         let c = client()?;
-        // SAFETY: a live display and this queue.
+        // SAFETY: A live display and this queue.
         let n = unsafe { (c.display_dispatch_queue)(self.display.as_ptr(), self.raw.as_ptr()) };
         usize::try_from(n).map_err(|_| self.display.error_or(Error::Display(-1)))
     }
@@ -289,22 +248,16 @@ impl Queue {
     /// Dispatch the events already queued, without reading.
     pub fn dispatch_pending(&self) -> Result<usize, Error> {
         let c = client()?;
-        // SAFETY: a live display and this queue.
+        // SAFETY: A live display and this queue.
         let n =
             unsafe { (c.display_dispatch_queue_pending)(self.display.as_ptr(), self.raw.as_ptr()) };
         usize::try_from(n).map_err(|_| self.display.error_or(Error::Display(-1)))
     }
 
-    /// Announce a read of the display's socket for this queue, so a caller can
-    /// wait on the socket in its own `poll(2)` (libwayland's
-    /// `wl_display_prepare_read_queue`). `Ok(None)` when the queue already
-    /// holds events: dispatch them ([`Queue::dispatch_pending`]) and ask
-    /// again. The intent, once announced, must end in [`ReadIntent::read`] or
-    /// be dropped (which cancels it), or every other reader of the display
-    /// waits for ever.
+    /// Announce a read of the display's socket for this queue.
     pub fn prepare_read(&self) -> Result<Option<ReadIntent<'_>>, Error> {
         let c = client()?;
-        // SAFETY: a live display and this queue.
+        // SAFETY: A live display and this queue.
         let rc =
             unsafe { (c.display_prepare_read_queue)(self.display.as_ptr(), self.raw.as_ptr()) };
         Ok((rc == 0).then(|| ReadIntent {
@@ -315,8 +268,7 @@ impl Queue {
     }
 }
 
-/// An announced read of a display's socket ([`Queue::prepare_read`]):
-/// [`ReadIntent::read`] reads, a drop cancels.
+/// An announced read of a display's socket ([`Queue::prepare_read`]).
 pub struct ReadIntent<'q> {
     display: Display,
     client: &'static Client,
@@ -324,16 +276,12 @@ pub struct ReadIntent<'q> {
 }
 
 impl ReadIntent<'_> {
-    /// Read what the socket holds into each queue's list
-    /// (`wl_display_read_events`), without dispatching. Call it once the
-    /// socket polled readable; it does not block on an empty socket (another
-    /// reader may have taken the bytes, or the wake was the caller's own).
+    /// Read what the socket holds into each queue's list (`wl_display_read_events`).
     pub fn read(self) -> Result<(), Error> {
         let display = self.display;
         let client = self.client;
         std::mem::forget(self);
-        // SAFETY: a live display with a read announced by this value, which
-        // is consumed here, so it is read or cancelled exactly once.
+        // SAFETY: A live display with a read announced by this value, which is consumed here.
         if unsafe { (client.display_read_events)(display.as_ptr()) } < 0 {
             return Err(display.error_or(Error::Display(-1)));
         }
@@ -343,7 +291,7 @@ impl ReadIntent<'_> {
 
 impl Drop for ReadIntent<'_> {
     fn drop(&mut self) {
-        // SAFETY: a read this value announced and did not perform.
+        // SAFETY: A read this value announced and did not perform.
         unsafe { (self.client.display_cancel_read)(self.display.as_ptr()) }
     }
 }
@@ -351,14 +299,13 @@ impl Drop for ReadIntent<'_> {
 impl Drop for Queue {
     fn drop(&mut self) {
         if let Ok(c) = client() {
-            // SAFETY: a queue this value made; every proxy on it is destroyed
-            // first (its owners' contract).
+            // SAFETY: A queue this value made.
             unsafe { (c.event_queue_destroy)(self.raw.as_ptr()) }
         }
     }
 }
 
-/// A display wrapper on a private queue; destroyed on drop.
+/// A display wrapper on a private queue.
 pub struct Wrapper(Proxy);
 
 impl Wrapper {
@@ -372,7 +319,7 @@ impl Wrapper {
 impl Drop for Wrapper {
     fn drop(&mut self) {
         if let Ok(c) = client() {
-            // SAFETY: a wrapper this value made, destroyed once.
+            // SAFETY: A wrapper this value made, destroyed.
             unsafe { (c.proxy_wrapper_destroy)(self.0.as_ptr()) }
         }
     }
@@ -382,13 +329,12 @@ impl Drop for Wrapper {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Proxy(NonNull<c_void>);
 
-// SAFETY: libwayland's proxy calls are thread-safe.
+// SAFETY: Libwayland's proxy calls are thread-safe.
 unsafe impl Send for Proxy {}
-// SAFETY: as above.
+// SAFETY: As above.
 unsafe impl Sync for Proxy {}
 
-/// One request argument (`union wl_argument`): transparent, so a slice of
-/// them is the C array `marshal` hands libwayland.
+/// One request argument (`union wl_argument`).
 #[derive(Clone, Copy)]
 #[repr(transparent)]
 pub struct Arg(WlArgument);
@@ -437,8 +383,7 @@ impl Arg {
         Arg(WlArgument { a: v })
     }
 
-    /// A descriptor, duplicated by libwayland for the send; the caller
-    /// keeps (and closes) its own.
+    /// A descriptor, duplicated by libwayland for the send.
     #[inline]
     pub const fn fd(v: c_int) -> Arg {
         Arg(WlArgument { h: v })
@@ -463,8 +408,7 @@ pub enum EventArg<'a> {
     Fixed(Fixed),
     Str(Option<&'a CStr>),
     Object(Option<Proxy>),
-    /// An object the event created (libwayland made the proxy, on the
-    /// receiving proxy's queue); the receiver owns it.
+    /// An object the event created (libwayland made the proxy, on the receiving proxy's queue).
     NewId(Option<Proxy>),
     Array(&'a [u8]),
     /// A descriptor the receiver owns and must close.
@@ -494,23 +438,20 @@ impl EventArg<'_> {
 /// The most arguments one event carries here (the protocols' longest is 5).
 pub const MAX_ARGS: usize = 16;
 
-/// What a dispatcher closure receives: the proxy, the event's opcode, and
-/// its arguments.
+/// What a dispatcher closure receives.
 pub type Handler = dyn FnMut(Proxy, u32, &[EventArg<'_>]) + Send;
 
-/// The closure behind a proxy's dispatcher; freed on drop, which must come
-/// after the proxy is destroyed.
+/// The closure behind a proxy's dispatcher.
 pub struct Listener(*mut Box<Handler>);
 
-// SAFETY: the closure is `Send`; the pointer is this value's alone.
+// SAFETY: The closure is `Send`; the pointer is this value's alone.
 unsafe impl Send for Listener {}
-// SAFETY: a shared `&Listener` can do nothing (it has no `&self` methods), so
-// it may be shared with any thread; only its owner's drop touches the closure.
+// SAFETY: A shared `&Listener` can do nothing (it has no `&self` methods), so it may be shared.
 unsafe impl Sync for Listener {}
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        // SAFETY: made by `Box::into_raw` in `Proxy::listen`, freed once.
+        // SAFETY: Made by `Box::into_raw` in `Proxy::listen`, freed.
         drop(unsafe { Box::from_raw(self.0) });
     }
 }
@@ -536,8 +477,7 @@ impl Proxy {
     /// # Safety
     /// The proxy is live.
     pub unsafe fn version(self) -> u32 {
-        // SAFETY: the caller's contract; a proxy exists only once the
-        // library is loaded.
+        // SAFETY: The caller's contract; a proxy exists only once the library is loaded.
         client().map_or(0, |c| unsafe { (c.proxy_get_version)(self.0.as_ptr()) })
     }
 
@@ -546,31 +486,26 @@ impl Proxy {
     /// # Safety
     /// The proxy is live.
     pub unsafe fn id(self) -> u32 {
-        // SAFETY: as for `version`.
+        // SAFETY: As for `version`.
         client().map_or(0, |c| unsafe { (c.proxy_get_id)(self.0.as_ptr()) })
     }
 
     /// The object's interface name.
     ///
     /// # Safety
-    /// The proxy is live; the name lives as long as its interface table.
+    /// The proxy is live.
     pub unsafe fn class(self) -> Option<&'static CStr> {
         let c = client().ok()?;
-        // SAFETY: the caller's contract.
+        // SAFETY: The caller's contract.
         let p = unsafe { (c.proxy_get_class)(self.0.as_ptr()) };
-        // SAFETY: a NUL-terminated name from a static interface table.
+        // SAFETY: A NUL-terminated name from a static interface table.
         (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) })
     }
 
-    /// Send request `opcode` with `args` (one per signature argument). With
-    /// `new`, the request creates an object of that interface and version
-    /// (its `new_id` argument is [`Arg::new_id`]), returned on this proxy's
-    /// queue. With `destroy`, the proxy is destroyed after the send (a
-    /// destructor request).
+    /// Send request `opcode` with `args` (one per signature argument).
     ///
     /// # Safety
-    /// The proxy is live, `args` match the request's signature, and a
-    /// destroyed proxy is not used again.
+    /// The proxy is live, `args` match the request's signature.
     pub unsafe fn marshal(
         self,
         opcode: u32,
@@ -581,13 +516,13 @@ impl Proxy {
         let c = client().ok()?;
         let (iface, version) = match new {
             Some((i, v)) => (std::ptr::from_ref(i), v),
-            // SAFETY: the caller's live proxy.
+            // SAFETY: The caller's live proxy.
             None => (std::ptr::null(), unsafe {
                 (c.proxy_get_version)(self.0.as_ptr())
             }),
         };
         let flags = if destroy { MARSHAL_FLAG_DESTROY } else { 0 };
-        // SAFETY: the caller's contract; `Arg` is `union wl_argument`.
+        // SAFETY: The caller's contract; `Arg` is `union wl_argument`.
         let out = unsafe {
             (c.proxy_marshal_array_flags)(
                 self.0.as_ptr(),
@@ -601,14 +536,13 @@ impl Proxy {
         NonNull::new(out).map(Proxy)
     }
 
-    /// Destroy the proxy without a request (an object the protocol ends with
-    /// an event, such as `wl_callback`).
+    /// Destroy the proxy without a request.
     ///
     /// # Safety
     /// The proxy is live and is not used again.
     pub unsafe fn destroy(self) {
         if let Ok(c) = client() {
-            // SAFETY: the caller's contract.
+            // SAFETY: The caller's contract.
             unsafe { (c.proxy_destroy)(self.0.as_ptr()) }
         }
     }
@@ -619,18 +553,15 @@ impl Proxy {
     /// The proxy is live and outlived by the queue.
     pub unsafe fn set_queue(self, queue: &Queue) {
         if let Ok(c) = client() {
-            // SAFETY: the caller's contract.
+            // SAFETY: The caller's contract.
             unsafe { (c.proxy_set_queue)(self.0.as_ptr(), queue.as_ptr()) }
         }
     }
 
-    /// Deliver the proxy's events to `handler`. A proxy takes one listener,
-    /// once.
+    /// Deliver the proxy's events to `handler`.
     ///
     /// # Safety
-    /// The proxy is live and was made by this crate (a foreign proxy has its
-    /// owner's listener), and the returned [`Listener`] outlives it (drop the
-    /// listener only after destroying the proxy).
+    /// The proxy is live and was made by this crate (a foreign proxy has its owner's listener).
     pub unsafe fn listen(
         self,
         handler: impl FnMut(Proxy, u32, &[EventArg<'_>]) + Send + 'static,
@@ -638,8 +569,7 @@ impl Proxy {
         let c = client()?;
         let boxed: Box<Box<Handler>> = Box::new(Box::new(handler));
         let data = Box::into_raw(boxed);
-        // SAFETY: a live proxy without a listener; `data` lives until the
-        // returned Listener drops.
+        // SAFETY: A live proxy without a listener; `data` lives until the returned Listener drops.
         let rc = unsafe {
             (c.proxy_add_dispatcher)(
                 self.0.as_ptr(),
@@ -666,36 +596,29 @@ fn arg_kinds(msg: &Message) -> impl Iterator<Item = u8> + '_ {
         .filter(|c| matches!(c, b'i' | b'u' | b'f' | b's' | b'o' | b'n' | b'a' | b'h'))
 }
 
-/// Close the descriptors of an event no handler receives: libwayland hands
-/// them to the dispatcher, so nothing else would.
+/// Close the descriptors of an event no handler receives.
 ///
 /// # Safety
-/// `msg` and `args` are the event's, as libwayland passed them, and no
-/// handler has seen them.
+/// `msg` and `args` are the event's, as libwayland passed them, and no handler has seen them.
 unsafe fn close_fds(msg: &Message, args: *const WlArgument) {
     for (i, kind) in arg_kinds(msg).enumerate() {
         if kind != b'h' {
             continue;
         }
-        // SAFETY: one argument per signature argument, and this one is a
-        // descriptor.
+        // SAFETY: One argument per signature argument, and this one is a descriptor.
         let fd = unsafe { (*args.add(i)).h };
         #[cfg(unix)]
         {
             use std::os::fd::{FromRawFd, OwnedFd};
-            // SAFETY: a descriptor this side owns, closed once here.
+            // SAFETY: A descriptor this side owns, closed once here.
             drop(unsafe { OwnedFd::from_raw_fd(fd) });
         }
-        // No libwayland, so no event, off unix.
         #[cfg(not(unix))]
         let _ = fd;
     }
 }
 
-/// The one dispatcher: decode the arguments by the signature, call the
-/// proxy's closure. A panic in the closure is caught here (it cannot unwind
-/// into C) and logged. An event it cannot hand to a closure has its
-/// descriptors closed.
+/// The one dispatcher: decode the arguments by the signature, call the proxy's closure.
 unsafe extern "C" fn dispatch(
     data: *const c_void,
     target: *mut c_void,
@@ -703,22 +626,21 @@ unsafe extern "C" fn dispatch(
     msg: *const Message,
     args: *mut WlArgument,
 ) -> c_int {
-    // SAFETY: libwayland's table for this event.
+    // SAFETY: Libwayland's table for this event.
     let Some(msg) = (unsafe { msg.as_ref() }) else {
         return 0;
     };
     let (Some(proxy), Some(handler)) = (
         NonNull::new(target),
-        // SAFETY: the pointer `listen` registered, live until its Listener
-        // drops after the proxy.
+        // SAFETY: The pointer `listen` registered, live until its Listener drops after the proxy.
         unsafe { data.cast_mut().cast::<Box<Handler>>().as_mut() },
     ) else {
-        // SAFETY: the event's own arguments, which no handler saw.
+        // SAFETY: The event's own arguments, which no handler saw.
         unsafe { close_fds(msg, args) };
         return 0;
     };
     if arg_kinds(msg).count() > MAX_ARGS {
-        // SAFETY: as above.
+        // SAFETY: As above.
         unsafe { close_fds(msg, args) };
         return 0;
     }
@@ -728,9 +650,9 @@ unsafe extern "C" fn dispatch(
         let Some(slot) = decoded.get_mut(n) else {
             return 0;
         };
-        // SAFETY: libwayland passes one argument per signature argument.
+        // SAFETY: Libwayland passes one argument per signature argument.
         let a = unsafe { *args.add(n) };
-        // SAFETY: each union field read is the one the signature names.
+        // SAFETY: Each union field read is the one the signature names.
         *slot = unsafe {
             match kind {
                 b'i' => EventArg::Int(a.i),
@@ -815,7 +737,7 @@ mod tests {
             WlArgument { u: 2 },
         ];
         let target = NonNull::<c_void>::dangling().as_ptr();
-        // SAFETY: the event's arguments match its signature; no handler.
+        // SAFETY: The event's arguments match its signature; no handler.
         unsafe {
             dispatch(
                 std::ptr::null(),
@@ -836,7 +758,7 @@ mod tests {
         let mut handler: Box<Handler> = Box::new(|_, _, _| panic!("past MAX_ARGS, never called"));
         let data = std::ptr::from_mut(&mut handler).cast_const().cast();
         let target = NonNull::<c_void>::dangling().as_ptr();
-        // SAFETY: as above, with a handler that is not reached.
+        // SAFETY: As above, with a handler that is not reached.
         unsafe { dispatch(data, target, 0, &raw const WIDE, args.as_mut_ptr()) };
         assert!(far_closed(&mut near), "the descriptor stayed open");
     }
@@ -859,14 +781,14 @@ mod tests {
         });
         let data = std::ptr::from_mut(&mut handler).cast_const().cast();
         let target = NonNull::<c_void>::dangling().as_ptr();
-        // SAFETY: as above.
+        // SAFETY: As above.
         unsafe { dispatch(data, target, 0, &raw const KEYMAP, args.as_mut_ptr()) };
         assert_eq!(*got.lock().expect("lock"), Some(fd));
         assert!(
             !far_closed(&mut near),
             "the dispatcher closed a handled descriptor"
         );
-        // SAFETY: the descriptor the handler was given, closed by its owner.
+        // SAFETY: The descriptor the handler was given, closed by its owner.
         drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
         assert!(far_closed(&mut near));
     }

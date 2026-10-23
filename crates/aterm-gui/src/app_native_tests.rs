@@ -105,6 +105,7 @@ fn messages_quiet_gap_folds_mixed_split_feedback_and_visibility() {
 }
 
 /// Whether `pid` is still this process's child, polled with `WNOWAIT` so the helper under test
+/// keeps the reap, until it is not or `within` (a hang detector) runs out.
 #[cfg(unix)]
 fn child_still_ours(pid: libc::pid_t, within: std::time::Duration) -> bool {
     use std::time::{Duration, Instant};
@@ -128,7 +129,7 @@ fn child_still_ours(pid: libc::pid_t, within: std::time::Duration) -> bool {
     }
 }
 
-/// A timed-out read reaps the child it owns. The child sleeps `JOB`, far past the budget, so a
+/// A timed-out read reaps the child it owns.
 #[cfg(unix)]
 #[test]
 fn machine_command_timeout_reaps_owned_child() {
@@ -157,7 +158,7 @@ fn machine_command_timeout_reaps_owned_child() {
     );
 }
 
-/// An exited child is not stdout EOF, and a flood is capped; both bounded by cause. The grandchild
+/// An exited child is not stdout EOF, and a flood is capped; both bounded by cause.
 #[cfg(unix)]
 #[test]
 fn machine_command_bounds_inherited_pipe_eof_and_output_flood() {
@@ -199,6 +200,8 @@ fn machine_command_bounds_inherited_pipe_eof_and_output_flood() {
 }
 
 /// atpkg's `machine apply` stdout protocol: a failed-write marker settles the
+/// apply as a failure even beside a verdict line, and the settings marker is
+/// posted once.
 #[cfg(unix)]
 #[test]
 fn machine_apply_failed_write_settles_as_failure() {
@@ -359,6 +362,9 @@ fn machine_read_dispatch_conforms_and_rejects_the_historical_orphan() {
 }
 
 /// A control `settings set serious_mode` and the native toggle share one
+/// semantic projection: a toggle queued behind the control write toggles the
+/// queued `true` intent, not the live `false` policy, and each completion
+/// moves the live policy in queue order.
 #[test]
 fn legacy_serious_mode_set_and_native_toggle_share_one_semantic_projection() {
     fn complete_next(app: &mut App) {
@@ -441,6 +447,8 @@ fn malformed_legacy_serious_mode_value_cannot_poison_toggle_projection() {
 }
 
 /// A reconciliation worker that comes back broken answers every queued request, so a blocked
+/// `aterm ctl settings set` gets a bounded ERR instead of holding its one-shot until the wire
+/// deadline.
 #[test]
 fn failed_reconciliation_answers_queued_callers_instead_of_leaving_them_pending() {
     let mut app = App::headless_for_test();
@@ -476,6 +484,8 @@ fn failed_reconciliation_answers_queued_callers_instead_of_leaving_them_pending(
 }
 
 /// A hand-broken `aterm.toml` is reported as what it is: the watcher posts
+/// "not valid TOML" on the config lane's row and the reconciliation sample
+/// fails the same way.
 #[test]
 fn a_failed_reconciliation_with_nothing_queued_leaves_the_true_row_standing() {
     let mut app = App::headless_for_test();
@@ -512,6 +522,10 @@ fn a_failed_reconciliation_with_nothing_queued_leaves_the_true_row_standing() {
 }
 
 /// A SAVE AN UNREADABLE aterm.toml REFUSES IS SAID IN WORDS THROUGH THE READ
+/// AFTER IT: the worker's save is refused ("aterm.toml isn't readable ·
+/// check its permissions"), and the read it makes for the lane to
+/// resynchronize, refused the same way, carries the same words, never the
+/// host's account; the `settings set` reply says the cause once.
 #[cfg(unix)]
 #[test]
 fn a_save_an_unreadable_file_refuses_is_worded_through_the_read_after_it() {
@@ -640,6 +654,7 @@ fn legacy_control_completion_never_translates_conflict_or_unverified_publication
 }
 
 /// Enqueue one `aterm ctl settings set|unset` write, reduce it at the lane
+/// head and publish it with its snapshot: the reply the caller gets.
 fn complete_control_field(app: &mut App, key: &str, value: Option<&str>) -> Result<String, String> {
     let (reply, completion) = std::sync::mpsc::channel();
     app.enqueue_control_settings_field_intent(key.to_string(), value.map(str::to_string), reply);
@@ -666,6 +681,10 @@ fn complete_control_field(app: &mut App, key: &str, value: Option<&str>) -> Resu
 }
 
 /// THE REPLY SAYS WHAT THE WRITE DID: `settings unset` answers "removed"
+/// with what the key now reads as, in one grammar for every kind — the words
+/// its Settings row's control says, then "(default)" — a `settings set` to
+/// the key's default is written as a removal and answered the same way, and
+/// a write that changed nothing says so.
 #[test]
 fn control_settings_replies_name_removals_defaults_and_no_ops() {
     let mut app = App::headless_for_test();
@@ -720,6 +739,10 @@ fn control_settings_replies_name_removals_defaults_and_no_ops() {
 }
 
 /// ONE GRAMMAR FOR WHAT A KEY NOW READS AS, from the row: a list's empty
+/// field says "none", never its input hint; a choice its picker's words, not
+/// its config token; a value a theme supplies is the theme's, never aterm's
+/// default (a theme setting `line_height = 1.5` and `ligatures = false` reads
+/// "1.5 … (from theme …)" and "Off (from theme …)").
 #[test]
 fn control_settings_unset_says_the_rows_value_and_where_it_comes_from() {
     let mut app = App::headless_for_test();
@@ -782,6 +805,10 @@ fn control_settings_unset_says_the_rows_value_and_where_it_comes_from() {
 }
 
 /// A ROW HELD OFF IS NEVER ITS KEY'S DEFAULT: under Serious Mode the cursor
+/// style and Music effects read Off, and with every word effect switched off
+/// Keyword kitties does, yet each key's own default is a trail or On; so
+/// `settings unset` says the key's value and then what holds the row Off,
+/// never "now Off (default)".
 #[test]
 fn control_settings_unset_never_calls_a_held_off_row_its_default() {
     let unset = |source: &str, key: &str| {
@@ -834,6 +861,10 @@ fn control_settings_unset_never_calls_a_held_off_row_its_default() {
 }
 
 /// A CHOICE SET IN ITS ROW'S WORDS IS THE OPTION THEY NAME: `settings set
+/// motion Reduce` (the segment's word) and `Always animate` (the picker's)
+/// save `reduced` and `full`, a switch's "On"/"Off" its `true`/`false`; a
+/// value no option takes is refused with every option and its words, before
+/// anything is queued.
 #[test]
 fn control_settings_take_a_rows_words_and_refuse_with_every_option() {
     let mut app = App::headless_for_test();
@@ -878,6 +909,12 @@ fn control_settings_take_a_rows_words_and_refuse_with_every_option() {
 }
 
 /// A DURABLE WRITE WHOSE DISK GENERATION COULD NOT BE ADMITTED ANSWERS WITH
+/// WHAT IT WROTE, not the text it was asked for: the worker proved the
+/// service's candidate on disk, so a `settings set` to the key's default is
+/// "removed" (it used to say "saved: window_theme = auto" for a key the file
+/// no longer holds), a number is spelled as written ("15", not the "15.0"
+/// typed), and that the save still needs reconciling comes after what it
+/// did.
 #[test]
 fn a_durable_write_awaiting_reconciliation_answers_with_what_it_wrote() {
     let publish_unadmitted = |app: &mut App, key: &str, value: &str| {
@@ -1027,6 +1064,10 @@ fn legacy_control_enqueue_reports_an_unknown_key_without_stranding_a_reply() {
 }
 
 /// NO CTL VERB WRITES THE OCCUPANCY GRANT (`docs/DESIGN-harness-occupancy-2026-10-20.md` §1.1):
+/// `[harness] occupancy = "prompt"` is the owner's to write by hand, so `aterm ctl settings
+/// set|unset harness.occupancy` is refused at once with the hand-written key's answer, nothing
+/// queued and the file untouched, because Settings carries no row for it
+/// (`prefs::editable_fields`).
 #[test]
 fn settings_set_never_writes_the_occupancy_grant() {
     let mut app = App::headless_for_test();
@@ -1694,6 +1735,7 @@ fn idle_reconcile_park_never_materializes_a_destination_or_warning_path() {
 }
 
 /// Tier-1 binding for `NativeUpdateWorkerQueue`: the real capacity through `try_send`
+/// Full/drain/retry, the purpose coalescer and the disconnected restart path.
 #[test]
 fn native_update_worker_queue_conforms_to_saturation_coalescing_and_disconnect() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -2226,6 +2268,7 @@ fn reconcile_facts_with_installed(
 }
 
 /// The sealed `ATermGitCommit` an installed bundle carries is the 12-char
+/// short sha, not the manifest's full 40, so the fixture uses one.
 fn installed_update(build: u64) -> InstalledUpdate {
     InstalledUpdate {
         build,
@@ -2238,6 +2281,7 @@ fn installed_update(build: u64) -> InstalledUpdate {
 }
 
 /// The stage the activation lane imports for an installed bundle: the sealed
+/// identity under `installed_activation_digest`, and nothing else.
 fn assert_activation_stage(app: &App, build: u64, commit: &str) {
     let staged =
         app.native_updater_service.snapshot().staged.clone().expect(
@@ -2264,6 +2308,8 @@ fn assert_activation_stage(app: &App, build: u64, commit: &str) {
 }
 
 /// The activation lane: an on-disk bundle already at the staged build while the process runs the
+/// older image is imported as an activation stage, the bundle under the executable as the
+/// artifact.
 #[test]
 fn a_returned_apply_whose_child_swapped_the_bundle_arms_the_activation() {
     let mut app = App::headless_for_test();
@@ -2463,6 +2509,7 @@ fn a_freshly_imported_stage_raises_no_card_and_no_glow_and_a_repeat_import_is_qu
 }
 
 /// A copy's Linux facts holding `staged` downloaded and unapplied, as the facts
+/// worker reads them on a Linux host.
 fn linux_status_holding(running: u64, staged: Option<u64>) -> DurableUpdateStatus {
     let mut durable = status(None, 0);
     durable.current_build = running;
@@ -2481,7 +2528,7 @@ fn linux_status_holding(running: u64, staged: Option<u64>) -> DurableUpdateStatu
     durable
 }
 
-/// A LINUX BUILD HELD FOR A PERSON IS ON THE BAND. With
+/// A LINUX BUILD HELD FOR A PERSON IS ON THE BAND.
 #[test]
 fn a_linux_build_held_for_a_person_is_said_once_and_leaves_with_its_stage() {
     let mut app = App::headless_for_test();
@@ -2794,7 +2841,7 @@ fn installed_environment_repair_conforms_and_preserves_unrelated_budgets() {
     }
 }
 
-/// A non-writable install location is the person's. A standard user runs a signed aterm.app from
+/// A non-writable install location is the person's.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_non_writable_install_location_is_booked_as_the_persons_at_the_arm() {
@@ -2848,6 +2895,9 @@ fn a_non_writable_install_location_is_booked_as_the_persons_at_the_arm() {
 }
 
 /// A folder that took the swap's write since it refused releases its block: a person's retry
+/// that passed the pre-park check (which asks the folder for the swap's write) and then failed for
+/// an ordinary reason (a successor that died) proves the folder, so the reconcile that follows
+/// releases the block.
 #[cfg(unix)]
 #[test]
 fn a_folder_that_took_the_write_since_it_refused_releases_its_block() {
@@ -3029,6 +3079,7 @@ fn a_folder_that_took_the_write_since_it_refused_releases_its_block() {
 }
 
 /// An attempt that outran the arm-time read and met the folder's refusal is the person's, not the
+/// build's.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_returned_attempt_the_folder_refused_is_the_persons_not_the_builds() {
@@ -3101,7 +3152,7 @@ fn a_returned_attempt_the_folder_refused_is_the_persons_not_the_builds() {
     }
 }
 
-/// A standing block names its own remedy over a later booking. With the folder's block standing
+/// A standing block names its own remedy over a later booking.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_standing_block_names_its_own_remedy_over_a_later_booking() {
@@ -3164,7 +3215,7 @@ fn a_standing_block_names_its_own_remedy_over_a_later_booking() {
     }
 }
 
-/// A press the folder answered is not sent back to the folder. With the folder's block standing
+/// A press the folder answered is not sent back to the folder.
 #[cfg(unix)]
 #[test]
 fn a_press_the_folder_answered_is_not_sent_back_to_the_folder() {
@@ -3240,7 +3291,7 @@ fn a_press_the_folder_answered_is_not_sent_back_to_the_folder() {
     }
 }
 
-/// A later refusal of another cause names the standing block. With the folder's block standing
+/// A later refusal of another cause names the standing block.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_later_refusal_of_another_cause_names_the_standing_block() {
@@ -3335,6 +3386,8 @@ fn a_later_refusal_of_another_cause_names_the_standing_block() {
 }
 
 /// The OS banner of an update-health announcement is owed to one cause: the copy in Applications
+/// is not the signed release, so no lane can install over it until the owner acts
+/// (`NeedsPerson`).
 #[cfg(unix)]
 #[test]
 fn the_health_banner_is_posted_for_an_install_only_the_owner_can_mend() {
@@ -3510,6 +3563,8 @@ fn deferred_reconcile_merges_strongest_purpose_independently_of_fact_order() {
 }
 
 /// "Check for Updates…" parks a Refresh behind its own check; when the check
+/// stages, the parked pre-stage facts are dropped for a fresh observation
+/// and the stage survives.
 #[test]
 fn facts_parked_behind_a_check_cannot_retire_the_stage_that_check_imports() {
     let mut app = App::headless_for_test();
@@ -3546,6 +3601,7 @@ fn facts_parked_behind_a_check_cannot_retire_the_stage_that_check_imports() {
 }
 
 /// A read that began before the check staged (its wake lands after, so it is
+/// not parked) must not retire the stage either; `observed_at` is the floor.
 #[test]
 fn facts_read_before_the_stage_import_cannot_retire_it_however_late_they_land() {
     let mut app = App::headless_for_test();
@@ -3594,6 +3650,8 @@ fn facts_read_before_the_stage_import_cannot_retire_it_however_late_they_land() 
 }
 
 /// A control apply parked while the reducer was busy rides the newer facts
+/// of the failed attempt's own Startup wake, instead of being dropped as
+/// stale.
 #[test]
 fn a_parked_control_apply_rides_the_next_newer_facts_instead_of_going_stale() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -3688,6 +3746,11 @@ fn start(service: &mut NativeUpdaterService) -> UpdaterWorkTicket {
 }
 
 /// `arm_native_auto_apply` applies each `arm` decision to the retained
+/// intent (the decisions themselves are `native_update_auto_intent`'s): the
+/// same exact target keeps its backoff and attempt count; a newer build
+/// replaces it, fresh, due at once; a manual-only latch on exactly
+/// these bytes survives duplicate wakes while new bytes re-arm and release
+/// it; and `[update] auto_apply = false` clears the retained intent.
 #[test]
 fn arm_applies_each_decision_to_the_retained_intent() {
     let mut app = App::headless_for_test();
@@ -3748,6 +3811,7 @@ fn arm_applies_each_decision_to_the_retained_intent() {
 }
 
 /// Presentation-ack liveness trace: HiddenOutput -> WakeHandledNoPresent ->
+/// quiet epoch.
 #[test]
 fn old_hidden_output_without_present_ages_to_quiet() {
     let mut app = App::headless_for_test();
@@ -3801,6 +3865,7 @@ fn old_hidden_output_without_present_ages_to_quiet() {
 
 #[cfg(unix)]
 /// An activity-revoked overlap schedules spaced re-attempts that saturate at the last rung (inside
+/// the ladder's one-minute bound) and never exhaust.
 #[test]
 fn activity_revoked_retry_spacing_saturates_and_never_exhausts() {
     let rungs: Vec<_> = (0..ACTIVITY_REVOKED_LADDER_RUNGS)
@@ -3829,6 +3894,7 @@ fn activity_revoked_retry_spacing_saturates_and_never_exhausts() {
 
 #[cfg(unix)]
 /// A fork-lane park miss is booked as a refusal (`apply_refusal=`), never a failure, with the
+/// activity retry armed; a person's apply is told it failed.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_fork_lane_park_miss_is_booked_as_a_refusal_not_a_failure() {
@@ -3886,6 +3952,8 @@ fn a_fork_lane_park_miss_is_booked_as_a_refusal_not_a_failure() {
 
 #[cfg(unix)]
 /// A capture refusal gets one verdict per asker whichever lane carried it:
+/// a person's press answers `Failed` on the fork lane as on the launched
+/// lane.
 #[test]
 fn a_capture_refusal_answers_by_who_asked_on_both_lanes() {
     use crate::native_updater_service::ApplyMode;
@@ -3915,6 +3983,7 @@ fn a_capture_refusal_answers_by_who_asked_on_both_lanes() {
 }
 
 /// Converge automatic apply structurally on the activation of `installed` (imported at reconcile
+/// sequence `observation`) through the shipping completion lane, and return its digest.
 fn converge_structurally_on_the_activation(
     app: &mut App,
     installed: &InstalledUpdate,
@@ -3943,6 +4012,7 @@ fn converge_structurally_on_the_activation(
 }
 
 /// One structural failure of the activation of `installed`, returned through
+/// the shipping completion lane.
 fn fail_the_activation_structurally(
     app: &mut App,
     installed: &InstalledUpdate,
@@ -3962,6 +4032,8 @@ fn fail_the_activation_structurally(
 }
 
 /// The observation the facts worker posts after a failed attempt returned:
+/// nothing newer on disk, and the boot sentinel's count for `installed` read
+/// after the attempt, the only count a structural latch may act on.
 fn observe_after_the_attempt(app: &mut App, installed: &InstalledUpdate, observation: u64) {
     assert!(
         app.native_installed_trial.is_none(),
@@ -3981,6 +4053,7 @@ fn observe_after_the_attempt(app: &mut App, installed: &InstalledUpdate, observa
 }
 
 /// Put a structural latch's one re-sample deadline (the latch's and the verdict's, the same
+/// instant) in the past: the day passing.
 fn let_the_day_pass(app: &mut App) {
     let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
     let latch = app
@@ -4004,6 +4077,9 @@ fn let_the_day_pass(app: &mut App) {
 }
 
 /// A converged latch on the activation is superseded by a newer release: build 12 arriving starts
+/// the retire of 11's activation, naming the exact sealed bytes it may take off the install path,
+/// and while it runs a press on the activation waits (a candidate launched now could come up as
+/// build 11 from the bundle being retired).
 #[test]
 fn a_newer_release_starts_the_retire_of_a_converged_activation_latch() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -4085,6 +4161,7 @@ fn a_newer_release_starts_the_retire_of_a_converged_activation_latch() {
 }
 
 /// A landed retire with no observation leaves the latch standing, so an older in-flight
+/// observation cannot arm build 11; the observation of the new disk releases it and arms 12.
 #[test]
 fn only_an_observation_of_the_new_disk_releases_a_superseded_activation_latch() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -4139,6 +4216,7 @@ fn only_an_observation_of_the_new_disk_releases_a_superseded_activation_latch() 
 }
 
 /// Build 11's latched activation converged under a running 10, and a verified
+/// download of 12 reconciled, so the look started the retire.
 fn converge_and_start_the_retire(
     app: &mut App,
     installed: &InstalledUpdate,
@@ -4177,6 +4255,7 @@ fn let_the_retry_come_due(app: &mut App) {
 }
 
 /// A refused retire leaves the latch as it was and the event loop folds the
+/// release's retry deadline.
 #[test]
 fn a_refused_supersede_keeps_the_latch_and_says_only_a_refusal_of_the_disk() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -4230,6 +4309,8 @@ fn a_refused_supersede_keeps_the_latch_and_says_only_a_refusal_of_the_disk() {
 }
 
 /// The backoff doubles per consecutive refusal up to its ceiling; a still
+/// newer release is not held to the refused one's deadline; and a refused
+/// release that left the disk is dropped with its retry.
 #[test]
 fn a_refused_release_backs_off_and_a_newer_one_does_not_wait_for_it() {
     assert_eq!(supersede_retry_after(40), SUPERSEDE_RETRY_CEILING);
@@ -4307,6 +4388,8 @@ fn a_refused_release_backs_off_and_a_newer_one_does_not_wait_for_it() {
 }
 
 /// A retire whose disarm was deferred is a retire: the running build is back
+/// at the install path and only the trial disarm is left to the next boot
+/// apply.
 #[test]
 fn a_retire_with_its_disarm_deferred_is_not_said_as_a_refusal() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -4359,6 +4442,8 @@ fn a_retire_with_its_disarm_deferred_is_not_said_as_a_refusal() {
 }
 
 /// A newer release already on disk at convergence supersedes at the first
+/// look: the first observation after convergence starts the retire, though
+/// nothing about the release changed.
 #[test]
 fn a_newer_release_already_on_disk_at_convergence_supersedes_at_the_first_look() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -4398,6 +4483,8 @@ fn a_newer_release_already_on_disk_at_convergence_supersedes_at_the_first_look()
 }
 
 /// With no newer release the latch holds, with no press: a converged activation latch whose
+/// re-sample the boot trial cannot afford has no deadline, and no start of the build may be
+/// offered (its next launch is the one the trial reverts on).
 #[cfg(target_os = "macos")]
 #[test]
 fn a_converged_activation_latch_with_no_newer_release_is_said_and_left_to_a_newer_release() {
@@ -4494,6 +4581,8 @@ fn a_converged_activation_latch_with_no_newer_release_is_said_and_left_to_a_newe
 }
 
 /// A structural re-sample that fails the same way says so again, though the
+/// convergence already said "re-sampling": the stopped lane's notice and its
+/// decision row with the press.
 #[test]
 fn a_failed_structural_resample_is_said_again_with_its_decision_row() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -4524,6 +4613,7 @@ fn a_failed_structural_resample_is_said_again_with_its_decision_row() {
 }
 
 /// A night asleep counts toward the day: an `Instant` stops while a Mac sleeps, so the event
+/// loop's first turn after a sleep brings the re-sample's deadline forward by the time slept.
 #[test]
 fn a_structural_resample_counts_the_night_the_mac_slept() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -4553,6 +4643,7 @@ fn a_structural_resample_counts_the_night_the_mac_slept() {
 }
 
 /// A structural latch whose count no observation has measured spends nothing when its day comes
+/// due and moves its deadline off the past, so the event loop does not spin on it.
 #[test]
 fn an_unmeasured_structural_latch_spends_nothing_and_moves_its_deadline() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -4578,6 +4669,9 @@ fn an_unmeasured_structural_latch_spends_nothing_and_moves_its_deadline() {
 }
 
 /// A count read before the build's latest launch says nothing about the next one: every attempt
+/// at the installed activation (a Version-menu press included) launches it, and whether that
+/// launch stays counted is decided after the completion (`forgives_the_counted_trial_launch`), so
+/// a count held from before may be one launch low.
 #[test]
 fn a_trial_count_read_before_the_latest_attempt_never_authorizes_the_next() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -4623,6 +4717,8 @@ fn a_trial_count_read_before_the_latest_attempt_never_authorizes_the_next() {
 }
 
 /// One failing attempt at the activation of `installed` by a person (the
+/// Version menu), returned through the shipping completion lane: it charges
+/// the automatic lane nothing, but it launched the build.
 fn fail_the_activation_by_hand(
     app: &mut App,
     installed: &InstalledUpdate,
@@ -4642,6 +4738,10 @@ fn fail_the_activation_by_hand(
 }
 
 /// The second arc of
+/// [`a_trial_count_read_before_the_latest_attempt_never_authorizes_the_next`]:
+/// facts read while a person's attempt was in flight are replayed as
+/// `Deferred` once it returns, before the worker's post-failure observation,
+/// and their count predates the launch; the re-sample is not released off it.
 #[test]
 fn a_trial_count_read_mid_attempt_never_authorizes_the_next() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -4689,6 +4789,8 @@ fn a_trial_count_read_mid_attempt_never_authorizes_the_next() {
 }
 
 /// The shared counter is shape-blind: it counts physical failures for these
+/// bytes, so an artifact that already cost round trips does not buy a fresh
+/// pair by failing in a new way.
 #[test]
 fn a_structural_failure_inherits_the_round_trips_the_artifact_already_cost() {
     let mut app = App::headless_for_test();
@@ -4720,6 +4822,8 @@ fn a_structural_failure_inherits_the_round_trips_the_artifact_already_cost() {
 }
 
 /// The ledger reason the submission-time arm reads back from a pre-park check
+/// that ran out of the apply budget, spelled as the verifier spells it, with
+/// the key from the one constant.
 fn passing_pre_park_reason() -> String {
     format!(
         "staged update failed pre-park verification: bundle policy: codesign --verify \
@@ -4730,6 +4834,8 @@ fn passing_pre_park_reason() -> String {
 }
 
 /// Project the lane after a physical failure booked for `build` onto `NativeUpdateApplyLadder`'s
+/// latch variables over `before`; `converged` is a verdict for these bytes or a deadline-less
+/// latch.
 fn project_passing_failure(
     before: &aterm_spec::interp::State,
     app: &App,
@@ -4820,7 +4926,7 @@ fn real_passing_refusal_keeps_a_deadline_as_the_model_s_passing_failure() {
     assert!(!buggy.check_invariant("APassingFailureNeverConverges", &held));
 }
 
-/// A cold relaunch that keeps being refused converges, like any failure inside one process. Each
+/// A cold relaunch that keeps being refused converges, like any failure inside one process.
 #[cfg(unix)]
 #[test]
 fn a_refused_cold_relaunch_converges_across_its_own_relaunches() {
@@ -4922,6 +5028,7 @@ fn a_refused_cold_relaunch_converges_across_its_own_relaunches() {
 }
 
 /// A physical-failure latch lapsing keeps the ladder's anchor: the landing bound counts from the
+/// first arming, so the lapse re-arms the intent where the clock is.
 #[test]
 fn a_physical_latch_lapse_resumes_the_ladder_where_the_clock_left_it() {
     use crate::native_update_auto_intent::{ApplyPhase, LANDS_WITHIN};
@@ -4992,6 +5099,8 @@ fn a_physical_latch_lapse_resumes_the_ladder_where_the_clock_left_it() {
 
 #[cfg(unix)]
 /// A candidate that fails after booting has already swapped the installed
+/// bundle, so the retry for the same update arrives as an activation with a
+/// different digest.
 #[test]
 fn the_activation_of_a_failed_download_continues_its_ladder_instead_of_refilling_it() {
     let rung = |n: u8| automatic_retry_delay(n, AutomaticRetryKind::ActivityRevoked);
@@ -5099,6 +5208,8 @@ fn a_physical_failure_ladder_survives_the_download_to_activation_flip() {
 }
 
 /// A latch with a deadline lapses, restoring automatic apply and the artifact's activity budget;
+/// a deadline-less one (the policy fail-safe, an environment block, a spent structural re-sample)
+/// does not.
 #[test]
 fn a_deadlined_manual_only_latch_lapses_but_the_fail_safe_one_does_not() {
     let mut app = App::headless_for_test();
@@ -5151,6 +5262,7 @@ fn a_deadlined_manual_only_latch_lapses_but_the_fail_safe_one_does_not() {
 const PREFLIGHT_TEST_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
 /// Drive the real check reducer to a Staged phase for `build`, as a completed updater worker
+/// does, so the intent under test is the one production arms.
 fn stage_one_build_for_test(app: &mut App, build: u64) {
     #[cfg(unix)]
     {
@@ -5196,6 +5308,7 @@ fn stage_one_build_for_test(app: &mut App, build: u64) {
 }
 
 /// The read a held press waits on: `build`'s pre-park verification, running
+/// until the returned flag is raised.
 #[cfg(unix)]
 fn preverify_read_running(
     app: &mut App,
@@ -5214,6 +5327,8 @@ fn preverify_read_running(
 }
 
 /// What a person's press leaves when the fork lane holds it for the candidate's read
+/// ([`crate::UpdateHandoffStartError::HeldForRead`]): its installing row, its switch on record,
+/// and the hold.
 #[cfg(unix)]
 fn press_held_for_the_read(app: &mut App, build: u64) {
     let running = app.native_updater_service.snapshot().current_build;
@@ -5225,7 +5340,7 @@ fn press_held_for_the_read(app: &mut App, build: u64) {
     });
 }
 
-/// A person's install held for the candidate's read runs when the read ends. With `[update]
+/// A person's install held for the candidate's read runs when the read ends.
 #[cfg(unix)]
 #[test]
 fn a_person_s_install_held_for_the_read_runs_when_it_ends_and_says_how_it_ended() {
@@ -5289,6 +5404,8 @@ fn a_person_s_install_held_for_the_read_runs_when_it_ends_and_says_how_it_ended(
 }
 
 /// The held press's bounds: a read that outruns the hold's window does not keep the press (it
+/// runs, as the fork lane parks once the window is spent), and a stage that moved on under the
+/// hold drops it, running nothing, its row put back and its switch closed as a person's stop.
 #[cfg(unix)]
 #[test]
 fn a_held_press_is_bounded_by_its_window_and_its_stage_and_the_lane_waits_for_it() {
@@ -5367,6 +5484,8 @@ fn a_held_press_is_bounded_by_its_window_and_its_stage_and_the_lane_waits_for_it
 }
 
 /// A held press run again does not double up: `run_held_person_apply` runs a held press as a
+/// second start of the same attempt, which finds the row installing and its switch on record
+/// already.
 #[cfg(unix)]
 #[test]
 fn a_press_begun_twice_puts_its_row_back_and_is_one_switch_on_record() {
@@ -5412,6 +5531,7 @@ fn a_press_begun_twice_puts_its_row_back_and_is_one_switch_on_record() {
 }
 
 /// The durable marker a download stage of `build` leaves on disk, as the
+/// reconcile tests below feed it back.
 fn durable_download_status(app: &App, build: u64) -> DurableUpdateStatus {
     DurableUpdateStatus {
         linux_host: false,
@@ -5438,6 +5558,8 @@ fn durable_download_status(app: &App, build: u64) -> DurableUpdateStatus {
 }
 
 /// A retired download takes its older latches with it, carries its own to the activation with its
+/// deadline, and leaves a newer one alone (a completion can land out of order, as in the
+/// `Retired` arm of `reconcile_returned_native_apply_with_facts`).
 #[test]
 fn retiring_a_download_for_its_activation_carries_only_its_own_latch() {
     for offset in [-1_i64, 0, 1] {
@@ -5517,6 +5639,7 @@ fn retiring_a_download_for_its_activation_carries_only_its_own_latch() {
 }
 
 /// One Settings view holding an unsaved draft, parked in a background tab while the person works
+/// in the terminal tab; returns its instance and view.
 fn park_a_settings_draft_in_a_background_tab(
     app: &mut App,
 ) -> (crate::tab_model::AppInstanceId, crate::tab_model::ViewId) {
@@ -5561,6 +5684,8 @@ fn park_a_settings_draft_in_a_background_tab(
 }
 
 /// Clear the draft through the app's recovery command, as a user would: go
+/// to the Settings tab, discard, come back (so later "nothing moved"
+/// assertions start from elsewhere).
 fn discard_settings_drafts(app: &mut App, view: crate::tab_model::ViewId) {
     let wid = WindowId(0);
     app.switch_tab_in(wid, 1);
@@ -5626,6 +5751,8 @@ fn assert_no_probe_disturbance(app: &App, wid: WindowId, active_tab: crate::tab_
 }
 
 /// Make the retained intent eligible now with its ladder at `Land`, so the
+/// attempt takes the `AutomaticPastGrace` lane and no activity gate holds
+/// it, whatever the machine's load.
 fn force_auto_apply_attempt_now(app: &mut App) {
     let mut intent = app
         .auto_apply_intent
@@ -5642,6 +5769,7 @@ fn force_auto_apply_attempt_now(app: &mut App) {
 }
 
 /// Drive the automatic lane through one whole preflight-block budget against
+/// whatever blocker the caller has already installed.
 fn spend_one_preflight_block_budget(app: &mut App) {
     for attempt in 1..=u32::from(MAX_AUTOMATIC_UPDATE_CYCLES) {
         force_auto_apply_attempt_now(app);
@@ -5655,6 +5783,10 @@ fn spend_one_preflight_block_budget(app: &mut App) {
 }
 
 /// The overdue notice only claims a lane that lands by itself: the updater
+/// is told `false` with `[update] auto_apply` off, when the in-session
+/// handoff cannot run (`HandoffDisabled`), while a person's unsaved work
+/// holds the lane, and while a process that keeps its image has no terminal
+/// for its only lane to hand over (`KeptImageNeedsTerminal`).
 #[test]
 fn a_lane_that_waits_by_design_is_not_reported_as_landing_by_itself() {
     use crate::app_update_handoff::HandoffUnavailable;
@@ -5700,6 +5832,8 @@ fn a_lane_that_waits_by_design_is_not_reported_as_landing_by_itself() {
 }
 
 /// Every wait on a person has its notice: the standing row's key is shared by every wait and a
+/// read keeps a key quiet for a day, yet a wait that begins after a read one ended is news with a
+/// row of its own.
 #[test]
 fn a_wait_that_begins_after_a_read_one_ended_is_said_again() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -5755,6 +5889,8 @@ fn a_wait_that_begins_after_a_read_one_ended_is_said_again() {
 }
 
 /// The wait ends with the lane that waited: a `PollDecision::Clear` (`[update] auto_apply` turned
+/// off, the stage retired or consumed) ends it, and the loop's own reconcile
+/// (`settle_update_wait_on_person`) ends one whose intent another path dropped.
 #[test]
 fn a_wait_on_a_person_ends_when_the_lane_stops_trying() {
     for path in ["auto_apply off, the Clear", "the intent dropped, the loop"] {
@@ -5807,6 +5943,7 @@ fn a_wait_on_a_person_ends_when_the_lane_stops_trying() {
 }
 
 /// An editor blocking the install is one row through the whole budget: the exhaustion's repeat is
+/// the center's Duplicate, never a second row or record.
 #[test]
 fn an_announced_editor_block_stays_one_row_through_the_budget() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -5849,6 +5986,8 @@ fn an_announced_editor_block_stays_one_row_through_the_budget() {
 }
 
 /// The refusal the swap's gate 4d and the pre-park checks give a stage whose
+/// signer no check has confirmed for a day (`aterm_update`'s
+/// `Ready::roster_authorization_stale`), as the worker reports it.
 #[cfg(unix)]
 fn roster_confirmation_wait(build: u64) -> String {
     format!(
@@ -5861,6 +6000,7 @@ fn roster_confirmation_wait(build: u64) -> String {
 }
 
 /// An automatic attempt on a stage waiting for a check to confirm its signer books no failure and
+/// no latch, and goes on once a check reports the stage.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_stage_waiting_for_its_roster_confirmation_is_held_and_never_a_failure() {
@@ -5953,7 +6093,7 @@ fn a_stage_waiting_for_its_roster_confirmation_is_held_and_never_a_failure() {
     );
 }
 
-/// AN ARMED LANE LOOKS AT ONCE AND STARTS AS ITS CANDIDATE'S PRE-PARK READ ENDS. The arm makes the
+/// AN ARMED LANE LOOKS AT ONCE AND STARTS AS ITS CANDIDATE'S PRE-PARK READ ENDS.
 #[cfg(unix)]
 #[test]
 fn an_armed_lane_looks_at_once_and_starts_as_its_pre_park_read_ends() {
@@ -6007,6 +6147,7 @@ fn an_armed_lane_looks_at_once_and_starts_as_its_pre_park_read_ends() {
 }
 
 /// At a launch that met a stale stage, the first attempt is never made: the arm-time pre-park read
+/// ends waiting for a check, and the poll holds on that answer (no attempt, nothing to book).
 #[cfg(target_os = "macos")]
 #[test]
 fn the_arm_time_read_holds_the_lane_before_its_first_attempt() {
@@ -6091,7 +6232,7 @@ fn the_arm_time_read_holds_the_lane_before_its_first_attempt() {
     assert_eq!(app.auto_apply_intent.map(|intent| intent.attempts), Some(1));
 }
 
-/// A cold relaunch whose boot swap waits for a roster confirmation books nothing. On a desk with
+/// A cold relaunch whose boot swap waits for a roster confirmation books nothing.
 #[cfg(unix)]
 #[test]
 fn a_cold_relaunch_waiting_for_its_roster_confirmation_holds_and_books_nothing() {
@@ -6346,6 +6487,7 @@ fn a_check_report_is_never_lost_to_a_read_that_began_before_it() {
 }
 
 /// Drives the real nonannounced timer path into a dirty-Settings refusal and reads its durable
+/// answer, in a child process so the shared scratch ledger is isolated from other updater tests.
 #[cfg(target_os = "macos")]
 #[test]
 fn nonannounced_automatic_blocks_are_durable_only_after_real_attempts() {
@@ -6420,6 +6562,10 @@ fn nonannounced_automatic_blocks_are_durable_only_after_real_attempts() {
 }
 
 /// A close-preflight block exhausting its budget neither retires automatic apply nor becomes a
+/// scheduled disturbance: two full cooldown rounds of the real lane
+/// (`try_pending_native_auto_apply` → `apply_native_update` → `prepare_all_native_shutdown` →
+/// the preflight reducer) cost one attempt per cooldown, no row after the first and nothing on
+/// screen, with a way back once the blocker (an unsaved Settings draft) clears.
 #[test]
 fn an_exhausted_preflight_block_budget_neither_latches_forever_nor_nags_on_a_schedule() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -6540,6 +6686,7 @@ fn an_exhausted_preflight_block_budget_neither_latches_forever_nor_nags_on_a_sch
 }
 
 /// With the same Settings draft, a background probe and a person's press get the same verdict,
+/// but only the press surfaces Close Recovery.
 #[test]
 fn an_automatic_probe_is_silent_while_a_person_s_apply_still_surfaces_recovery() {
     let mut app = App::headless_for_test();
@@ -6588,7 +6735,7 @@ fn an_automatic_probe_is_silent_while_a_person_s_apply_still_surfaces_recovery()
     }
 }
 
-/// The pre-park verdict answers for one artifact only. A downloaded `.app` and the same build
+/// The pre-park verdict answers for one artifact only.
 #[cfg(unix)]
 #[test]
 fn a_pre_park_verdict_answers_only_for_its_own_artifact() {
@@ -6632,6 +6779,9 @@ fn a_pre_park_verdict_answers_only_for_its_own_artifact() {
 }
 
 /// Every physical lane shares one budget, the budget runs out, and the person is told once, when
+/// it has: failures returning through `abort_reaped_native_apply_before_reconcile` consult the
+/// budget, the stand-down never resets the counter, a late completion past convergence buys no
+/// fourth epoch, and only the lane running out of retries posts a row.
 #[test]
 fn the_async_physical_lane_converges_and_stops_nagging() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -6733,6 +6883,7 @@ fn the_async_physical_lane_converges_and_stops_nagging() {
 }
 
 /// The standing health row, when one is live: its title, its detail joined,
+/// and its capsules.
 fn health_row(app: &App) -> Option<(String, String, Vec<aterm_messages::Intent>)> {
     app.messages.live_health().map(|live| {
         (
@@ -6744,6 +6895,9 @@ fn health_row(app: &App) -> Option<(String, String, Vec<aterm_messages::Intent>)
 }
 
 /// A structural convergence is said at once: the second failure through the shipping completion
+/// lane posts the install half's health warning (the updater's own streak gate needs 3;
+/// structural converges at 2), naming the one re-sample a day out and the Version menu, with no
+/// decision row while it is pending.
 #[test]
 fn a_structural_convergence_posts_the_health_notice_at_once() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -6817,6 +6971,9 @@ fn a_structural_convergence_posts_the_health_notice_at_once() {
 
 #[cfg(unix)]
 /// A spent unexplained budget converges into a quiet re-sample one epoch
+/// cooldown out: the health row is posted once at convergence, the latch
+/// lapses at its deadline and the intent re-arms, and a re-sample that fails
+/// again converges quietly onto the next cooldown.
 #[test]
 fn a_spent_unexplained_budget_resamples_after_the_cooldown_and_announces_once() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -6881,6 +7038,8 @@ fn a_spent_unexplained_budget_resamples_after_the_cooldown_and_announces_once() 
 }
 
 /// Every latch writes its standing note: the asynchronous completion lane queues its schedule's
+/// note with the latch, and the surfacing writes it after the failure it explains (booking a
+/// failure clears any standing refusal).
 #[cfg(target_os = "macos")]
 #[test]
 fn the_async_physical_lane_records_its_schedule_after_the_failure() {
@@ -6924,6 +7083,8 @@ fn the_async_physical_lane_records_its_schedule_after_the_failure() {
 }
 
 /// The Staged bar never outlives its promise: a handoff worker that killed and reaped its child
+/// latches manual-only on the physical budget, and a Staged bar still up for that build restates
+/// at once.
 #[test]
 fn a_reaped_abort_restates_the_staged_bar_it_stands_down() {
     use crate::update_words::{ApplyPosture, staged_detail};
@@ -6990,6 +7151,8 @@ fn a_reaped_abort_restates_the_staged_bar_it_stands_down() {
 }
 
 /// A native-close reducer `Err` is a failure, not a block: `Ok(false)` (an app kept its view) is
+/// live user state, `Err` a broken reducer, driven here by removing the Settings view's instance
+/// from the runtime (`RuntimeError::UnknownInstance`).
 #[test]
 fn a_broken_close_reducer_is_a_failure_not_a_block() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -7047,6 +7210,8 @@ fn a_broken_close_reducer_is_a_failure_not_a_block() {
 
 #[cfg(unix)]
 /// The retry spacing starts over after a long idle gap: a busy hour widens
+/// the spacing to its last rung, a quiet half hour brings it back to the
+/// first.
 #[test]
 fn an_idle_gap_restarts_the_activity_revoked_retry_spacing() {
     let rung = |n: u8| automatic_retry_delay(n, AutomaticRetryKind::ActivityRevoked);
@@ -7201,6 +7366,8 @@ fn rejected_native_completion_clears_the_settings_tab_busy_indicator() {
 }
 
 /// A FOCUS THAT LEFT THE FOCUS ORDER RESUMES WHERE IT STOOD (s-25): a control that
+/// disabled itself under the keyboard (the Activity pager's Older at its end) left
+/// the order, and Tab jumped to the page's first control, Shift-Tab to its last.
 #[test]
 fn tab_from_a_focus_that_left_the_order_resumes_where_it_stood() {
     let mut app = App::headless_for_test();
@@ -7298,6 +7465,9 @@ fn tab_focus_walks_the_compiled_semantic_order() {
 }
 
 /// TAB WALKS THE WHOLE LIST: a Settings list has no Next button, so Tab from
+/// the last control a screen shows moves on to the list's next one, Tab into
+/// the list starts at its first, and the list scrolls to each; every control
+/// Tab lands on is on screen.
 #[test]
 fn tab_walks_the_whole_settings_list() {
     let mut app = App::headless_for_test();
@@ -7416,6 +7586,8 @@ fn focused_native_text_field_receives_space_and_submit_before_activation() {
 }
 
 /// Searching a font list through the real key path: once a name is begun,
+/// Space is part of it ("iosevka t") instead of pressing the highlighted
+/// font, and the list stays open on what was typed.
 #[test]
 fn space_types_into_a_font_list_search_once_a_name_is_begun() {
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
@@ -7495,6 +7667,10 @@ fn space_types_into_a_font_list_search_once_a_name_is_begun() {
 }
 
 /// The keypad on a native page through the real key path (`App::on_key` ->
+/// `on_key_native_mode` -> `keymap::build_key_input` -> `App::input` ->
+/// `native_input_event`): KP_5 reaches the reducer as `Numpad5` and types
+/// `5` in a focused Settings search field; NumLock-off KP_Decimal
+/// (`NumpadDelete`) is a forward delete.
 #[test]
 fn keypad_digit_and_delete_reach_a_focused_settings_field() {
     use aterm_window::event::{ElementState, KeyEvent};
@@ -7677,6 +7853,8 @@ fn settings_search_field_honors_readline_control_keys() {
 }
 
 /// Off macOS, Ctrl+←/→ and Ctrl+⌫ are word operations in Settings text fields (the cfg'd
+/// `alt_word || readline` term); the Ctrl-letter readline arms stay by-character because they
+/// match first.
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn settings_search_field_ctrl_arrows_walk_words_off_macos() {
@@ -7760,6 +7938,7 @@ fn explicit_font_metrics_seed_additional_headless_windows() {
 }
 
 /// Tier-1 conformance for the exact-observation handoff: a failed reconciliation keeps the
+/// deferred external bytes, and the retry admits that generation.
 #[test]
 fn exact_observation_handoff_conforms_and_preserves_failed_reconciliation() {
     fn project(
@@ -7968,6 +8147,10 @@ fn matching_prepared_generation_reconciliation_admits_without_requeue() {
 }
 
 /// Keep-stale must not swap rungs: on a contended terminal lock,
+/// `refresh_active_split_presentation` keeps this tab's own previous title
+/// (or the titleless `aterm`) and never imports the window's
+/// `tab_title_cache` (a different rung that can hold `meta set title` or the
+/// abbreviated cwd).
 #[test]
 fn contended_split_presentation_keeps_its_own_title_rung() {
     let mut app = App::headless_for_test();
@@ -8021,6 +8204,8 @@ fn contended_split_presentation_keeps_its_own_title_rung() {
 }
 
 /// The watcher is the one writer of the harness policy: a valid edit A still in the config lane
+/// when the next save R was refused cannot lift R's kill switch when A lands
+/// (`apply_prepared_config_generation` admits A's settings under the running policy).
 #[test]
 fn a_late_admission_never_moves_the_watchers_harness_policy() {
     use crate::app_config::{Config, HarnessPolicy};
@@ -8081,6 +8266,7 @@ fn a_late_admission_never_moves_the_watchers_harness_policy() {
 }
 
 /// Run one queued control `settings set` request through the lane the way the
+/// worker would: reduce it against the service and publish its completion.
 fn complete_control_theme_set(
     app: &mut App,
     value: &str,
@@ -8135,6 +8321,7 @@ fn complete_queued_control_theme_field(
 }
 
 /// `settings set theme Nrod` (and `theme set Nrod`, the same lane) saves, but
+/// its OK says the name is unavailable and Default is drawn.
 #[test]
 fn control_theme_set_of_an_unavailable_name_says_so_in_the_reply() {
     let mut app = App::headless_for_test();
@@ -8159,6 +8346,8 @@ fn control_theme_set_of_an_unavailable_name_says_so_in_the_reply() {
 }
 
 /// `settings set theme dark:Work,light:GitHub Light` against a catalog that
+/// holds Work saves with no miss, and once the write is adopted the side the
+/// OS appearance picks is what every session draws.
 #[test]
 fn control_theme_set_of_a_split_installs_the_os_side() {
     let mut app = App::headless_for_test();
@@ -8204,6 +8393,7 @@ fn control_theme_set_of_a_split_installs_the_os_side() {
 }
 
 /// Run the palette's one queued theme-choice request through the lane the way
+/// the worker would, returning the authoritative snapshot.
 fn complete_theme_choice(app: &mut App) -> crate::native_config_service::ConfigSnapshot {
     let NativeConfigRequest { origin, work } = app.native_config_pending.pop_front().unwrap();
     assert!(matches!(&origin, NativeConfigOrigin::ThemeChoice { .. }));
@@ -8222,6 +8412,7 @@ fn complete_theme_choice(app: &mut App) -> crate::native_config_service::ConfigS
 }
 
 /// Choosing the named dark Default is an explicit selection, including on a
+/// light OS.
 #[test]
 fn palette_explicit_default_stays_dark_after_save_on_a_light_os() {
     use crate::control_theme::PreviewHold;
@@ -8293,6 +8484,7 @@ fn palette_explicit_default_stays_dark_after_save_on_a_light_os() {
 }
 
 /// A commit that the disk lane admitted is no longer a timed trial: an
+/// injected clock cannot expire it while the save is pending.
 #[test]
 fn control_theme_commit_stands_past_its_ttl_until_its_own_completion() {
     let t0 = std::time::Instant::now();
@@ -8365,6 +8557,7 @@ fn control_theme_commit_stands_past_its_ttl_until_its_own_completion() {
 }
 
 /// A's real disk completion remains configured truth while a newer B preview
+/// is standing.
 #[test]
 fn older_theme_save_completion_preserves_a_newer_committing_preview() {
     use crate::control_theme::PreviewHold;
@@ -8429,7 +8622,7 @@ fn older_theme_save_completion_preserves_a_newer_committing_preview() {
     }
 }
 
-/// The queue pump can complete unchanged work inline. Binding after that
+/// The queue pump can complete unchanged work inline.
 #[test]
 fn control_theme_commit_inline_completion_or_queue_refusal_leaves_no_hold() {
     for admitted in [true, false] {
@@ -8474,6 +8667,7 @@ fn control_theme_commit_inline_completion_or_queue_refusal_leaves_no_hold() {
 }
 
 /// An older control commit still changes configured truth after its preview
+/// is cancelled or replaced by another trial.
 #[test]
 fn control_theme_saved_truth_survives_preview_cancellation_or_replacement() {
     let now = std::time::Instant::now();
@@ -8517,6 +8711,7 @@ fn control_theme_saved_truth_survives_preview_cancellation_or_replacement() {
 }
 
 /// An ordinary theme set supersedes a trial already standing when it was
+/// queued.
 #[test]
 fn ordinary_theme_set_retires_older_preview_but_preserves_newer_trial() {
     let now = std::time::Instant::now();
@@ -8616,6 +8811,10 @@ fn ordinary_theme_set_retires_older_preview_but_preserves_newer_trial() {
 }
 
 /// A theme chosen in the palette is ONE write of `theme`, and the screen goes
+/// straight from the preview to the configured (now chosen) theme: the
+/// Committing preview stands while the write is in flight, and its completion
+/// adopts the durable `theme` and ends the preview without a flash of the old
+/// theme.
 #[test]
 fn palette_theme_choice_is_one_write_and_lands_without_a_flash() {
     use crate::control_theme::PreviewHold;
@@ -8687,6 +8886,8 @@ fn theme_choice_app(toml: &str, os: aterm_types::Appearance) -> App {
 }
 
 /// A palette choice while `theme` is a light/dark pair replaces only the side
+/// the OS shows, as the Settings pickers do, so the pair keeps following the
+/// OS; Enter on the side already drawn writes nothing.
 #[test]
 fn palette_choice_keeps_a_follow_system_pair() {
     use aterm_types::Appearance::{Dark, Light};
@@ -8729,6 +8930,8 @@ fn palette_choice_keeps_a_follow_system_pair() {
 }
 
 /// A palette choice while `theme` is unset (Default, one theme) writes the
+/// chosen name, as Settings ▸ Themes' Keep and the Settings pickers do, on
+/// either OS appearance: choosing never starts following the OS.
 #[test]
 fn palette_choice_from_an_unset_theme_is_its_plain_name() {
     use aterm_types::Appearance::{Dark, Light};
@@ -8746,6 +8949,7 @@ fn palette_choice_from_an_unset_theme_is_its_plain_name() {
 }
 
 /// A theme file whose `name =` is not its id reads the same in the palette's
+/// Theme section as in Settings: its name, the one fact separator, its id.
 #[test]
 fn a_theme_file_reads_in_the_palette_as_it_does_in_settings() {
     let mut app = App::headless_for_test();
@@ -8780,6 +8984,7 @@ fn a_theme_file_reads_in_the_palette_as_it_does_in_settings() {
 }
 
 /// A refused theme choice reverts its preview to the configured theme and
+/// says so; the config is untouched.
 #[test]
 fn palette_theme_choice_refused_reverts_and_says_why() {
     use crate::control_theme::PreviewHold;
@@ -8831,6 +9036,9 @@ fn palette_theme_choice_refused_reverts_and_says_why() {
 }
 
 /// THE THEME LIST IS ONE TAB STOP: with a theme tried from the filter, Tab
+/// from the filter lands on the highlighted row (not the list's first), the
+/// next Tab leaves the list in one step, and Shift-Tab comes back to the
+/// highlighted row.
 #[test]
 fn tab_enters_the_theme_list_at_the_highlighted_row_and_leaves_in_one_step() {
     use crate::native_ui::UiKey;
@@ -8905,6 +9113,10 @@ fn tab_enters_the_theme_list_at_the_highlighted_row_and_leaves_in_one_step() {
 }
 
 /// A SEGMENTED CONTROL IS ONE CONTROL TO THE KEYBOARD, on every page that
+/// draws one ([`crate::native_ui::UiNode::segmented`]): one Tab stop (the
+/// chosen segment, or the one the keyboard is on); Left and Right move
+/// between its segments and stop at its ends, choosing nothing; Return or
+/// Space chooses the one the keyboard is on.
 #[test]
 fn a_segmented_control_is_one_tab_stop_and_one_arrow_model() {
     use crate::native_ui::UiKey;
@@ -9067,6 +9279,7 @@ fn a_segmented_control_is_one_tab_stop_and_one_arrow_model() {
 }
 
 /// An Editor on `text` in a fresh file under `dir`, in window 0, laid out
+/// large enough for the M-x rows: `(app, view, document, path)`.
 fn editor_app(
     dir: &std::path::Path,
     name: &str,
@@ -9114,6 +9327,8 @@ fn editor_key(
 }
 
 /// `act` is a control client's gesture, so an editor command it names runs
+/// only within a control client's grant (`command_registry::editor_grant`:
+/// Read, Edit, Save).
 #[test]
 fn act_dispatch_consults_authority() {
     use crate::native_editor::{EditorCommand, EditorCompletionAction};
@@ -9193,6 +9408,9 @@ fn act_dispatch_consults_authority() {
 }
 
 /// A person's kill reaches the system clipboard, the kill ring's bridge
+/// (design §2.1); a control client's stays in the ring, because its input
+/// carries no Clipboard authority (`command_registry::editor_grant`), even
+/// when it joins the person's kill.
 #[test]
 fn a_persons_kill_reaches_the_clipboard_and_a_controllers_does_not() {
     use aterm_types::keyboard::{Key, Modifiers};
@@ -9220,6 +9438,8 @@ fn a_persons_kill_reaches_the_clipboard_and_a_controllers_does_not() {
 }
 
 /// The closing keys close the Editor view the way ⌘W does: `C-x k` with
+/// another buffer's file URI closes that buffer's tab and leaves the person
+/// where they were, and `C-x C-c` closes this one.
 #[test]
 fn closing_keys_close_the_editor_view() {
     use aterm_types::keyboard::{Key, Modifiers, NamedKey};
@@ -9291,6 +9511,13 @@ fn closing_keys_close_the_editor_view() {
 }
 
 /// THE HARNESS SWITCH'S WRITES ARE ONES THE LANE APPLIES (owner,
+/// 2026-10-20: "there needs to be an \"on\" button drawn for the claude
+/// harness"): for each aterm.toml switch that can hold a Claude Code
+/// session off — the master switch, the headless gate, Claude Code's own
+/// switch, and all three — the writes the top rule's `on` button queues
+/// (`autopilot::switch_on_plan`, each `true`), reduced in order on a config
+/// holding it off, give a policy under which the session is supervised, and
+/// none writes the session's word (the table's default carries it).
 #[test]
 fn the_harness_switch_writes_turn_every_switch_on() {
     use crate::autopilot::{HarnessPosture, switch_on_plan};
@@ -9441,6 +9668,10 @@ fn the_harness_switch_writes_turn_every_switch_on() {
 }
 
 /// TAB ENTERS A LIST WHOSE SCREEN SHOWS NONE OF ITS CONTROLS: Software
+/// Update at 220x12 with 2× text opens on its status hero, words only, so
+/// the list's screen held no control Tab could land on, and Tab from the
+/// search field went round the sidebar and back — the keyboard never got
+/// into the list (the lab found 13 such pages at 220x12, 17 at 102x12).
 #[test]
 fn tab_enters_a_settings_list_whose_screen_shows_no_control() {
     let preferences = crate::native_appearance::current_preferences();

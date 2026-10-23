@@ -2,37 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! The foreground handback, live under a real shell's job control.
-//!
-//! A program killed while it held the terminal leaves its modes armed under the shell that
-//! takes the terminal back (Claude Code's: the alternate screen, kitty keyboard flags,
-//! modifyOtherKeys, any-motion SGR mouse, focus reports, bracketed paste, 2026 and a hidden
-//! cursor). aterm cuts the PTY stream where `tcgetpgrp(master)` changes and hands the terminal
-//! back there. These tests type jobs into zsh and bash in a private headless instance and read
-//! `modes`, `who` and `timeline`'s `modes-restored` events:
-//!
-//! * a killed holder's modes are handed back, once, and 1007 (alternate scroll, on by
-//!   default) is never named;
-//! * display modes a one-shot sets on purpose (`tput rmam`, `tput civis`, `tput smcup; cmd`)
-//!   are kept and record nothing; an input mode a one-shot sets is handed back at its exit
-//!   (the documented residual: nothing tells a clean exit from a kill);
-//! * a stopped job keeps its modes (Ctrl-Z, `fg`) until it dies, also as a pipeline whose
-//!   group leader has exited, and one `bg`'d beside a command;
-//! * a live holder that hands the terminal to its own child (gdb's shape) keeps its modes,
-//!   and its death is one handback;
-//! * a one-shot the reader never saw while it held the terminal loses its own handback and
-//!   only its own: the next job's death is handed back.
-//!
-//! Every job is a Rust program ([`Job`], played by this binary through `support/standin.rs`)
-//! answered where its timing matters: it asks the cursor position and goes on only once aterm
-//! answered, so every byte it wrote was read while its own group held the terminal.
-//!
-//! Every key goes to the holder `who`'s `fgpgid=` names, never one guessed from a quiet screen:
-//! zsh's `fg` prints the job line before it `tcsetpgrp`s the job, so a key sent in that gap
-//! reaches zsh. A marker a job prints is never in the line typed to start it, and a command's
-//! end is the output of a builtin typed after it ([`Shell::settle`]).
-//!
-//! macOS only: the bash test expects /bin/bash 3.2, which has no bracketed paste.
-//! `-e <shell>` runs without shell integration.
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -98,17 +67,13 @@ enum Job {
     /// A killed Claude Code: arm [`INCIDENT_MODES`], be answered, die by SIGKILL.
     Incident,
     /// Arm the modes, print `armed-<n>`, and live until a signal ends it
-    /// (30 s at most). SIGINT is at its default and unblocked whatever mask
-    /// the shell handed it: /bin/zsh 5.9 can leave SIGINT blocked in its own
-    /// mask after it takes the terminal back from a stopped job, and every
-    /// job it starts inherits the block.
+    /// (30 s at most).
     Armed(Arm, u32),
     /// Set mouse tracking (an input mode), be answered, print `answered`,
     /// exit 0.
     MouseOneShot,
     /// Run `vim -u NONE -c q` (the vim the test resolved, which it exports as
-    /// `ATERM_TEST_VIM`), be answered, print `answered`, exit 0. A vim that did not run
-    /// cleanly prints `vim did not run` and exits 1, never `answered`.
+    /// `ATERM_TEST_VIM`), be answered, print `answered`, exit 0.
     Vim,
     /// gdb's shape: arm the alternate screen, mouse and a hidden cursor, fork
     /// a child into its own group and hand it the terminal, take the terminal
@@ -160,8 +125,6 @@ impl Job {
             }
             Job::Armed(arm, n) => {
                 // SAFETY: the default disposition, then this thread's mask: a
-                // SIGINT sent to the job's group reaches this thread whatever
-                // the inherited mask of the others.
                 unsafe {
                     libc::signal(libc::SIGINT, libc::SIG_DFL);
                     let mut set: libc::sigset_t = std::mem::zeroed();
@@ -182,8 +145,6 @@ impl Job {
             }
             Job::Vim => {
                 // Checked: a vim that did not run is never answered, so the lane cannot
-                // pass having run no vim (docs/DESIGN-init-system-2026-10-20.md §8,
-                // rule 5).
                 let ran = aterm_spec::host::find_tool("vim").map(|vim| {
                     #[expect(
                         clippy::disallowed_types,
@@ -206,28 +167,23 @@ impl Job {
     }
 }
 
-/// End this process by SIGKILL, as a killed holder ends. The signal may land after `kill`
-/// returns (another thread can take it), so this thread waits for it.
+/// End this process by SIGKILL, as a killed holder ends.
 fn kill_self() -> ! {
     // SAFETY: a signal to this process; SIGKILL cannot be caught.
     unsafe {
         libc::kill(libc::getpid(), libc::SIGKILL);
     }
     loop {
-        // SAFETY: `pause` blocks this thread until a signal arrives; the
-        // SIGKILL sent above ends the process there.
+        // SAFETY: `pause` blocks this thread until a signal arrives; the SIGKILL sent above ends.
         unsafe {
             libc::pause();
         }
     }
 }
 
-/// [`Job::Holder`]. The child is forked only once aterm has answered the
-/// holder, so the modes were read as the holder's; the child is answered
-/// before it exits, so aterm saw its group hold the terminal.
+/// [`Job::Holder`].
 fn holder() -> ! {
-    // SAFETY: SIGTTOU ignored, so the holder may take the terminal back from
-    // its child's group.
+    // SAFETY: SIGTTOU ignored, so the holder may take the terminal back from its child's group.
     unsafe {
         libc::signal(libc::SIGTTOU, libc::SIG_IGN);
     }
@@ -254,8 +210,6 @@ fn holder() -> ! {
         libc::tcsetpgrp(0, libc::getpgrp());
     }
     standin::put(b"parent-back\r\n");
-    // The release: a line on stdin. Two minutes is a backstop for a lane
-    // that never sends it, past which the holder dies all the same.
     let mut fd = libc::pollfd {
         fd: 0,
         events: libc::POLLIN,
@@ -421,7 +375,6 @@ impl Shell {
     fn await_modes(&mut self, what: &str, want: &[(&str, &str)]) {
         let _ = aterm_spec::wait::within(MUST_HAPPEN, Duration::from_millis(20), || {
             let (modes, all) = self.modes_of(want);
-            // A mode the reply does not name never converges: report it now.
             let unnamed = want.iter().any(|(k, _)| !modes.contains_key(*k));
             (all || unnamed).then_some(())
         });
@@ -484,7 +437,7 @@ fn held_fifo(path: &Path) -> std::fs::File {
 
 /// A killed holder under zsh: after `zsh: killed` the modes are back at the host's values,
 /// zle's own bracketed paste is on again, and the timeline holds exactly one handback, which
-/// keeps 1007. The gate re-arms after it: a one-shot's mouse is the next handback.
+/// keeps 1007.
 #[test]
 fn zsh_hands_a_killed_holders_modes_back_once() {
     play_standin_if_asked();
@@ -519,8 +472,6 @@ fn zsh_keeps_the_display_modes_a_one_shot_sets() {
     sh.type_line("tput cnorm");
     sh.assert_handbacks("tput rmam and civis record nothing", 0);
 
-    // The wrapped command lives until the test releases it with a line on a FIFO: the
-    // alternate screen is read while it provably runs.
     let release = sh.inst.tmp.join("wrapped.release");
     let mut fifo = held_fifo(&release);
     sh.type_line(&format!(
@@ -546,12 +497,9 @@ fn zsh_keeps_the_display_modes_a_one_shot_sets() {
 }
 
 /// vim's own exit resets what it armed: run as an answered job, a clean exit
-/// records nothing. Bare, its exit races the reader, and a reader that parses
-/// vim's exit reset as the shell's hands back at the cut: at most one.
+/// records nothing.
 #[test]
 fn zsh_records_nothing_for_a_clean_vim_exit() {
-    // One vim for the job and the bare line: the one the resolver names, exported so the
-    // job (a child of the shell) resolves the same file.
     let vim = aterm_spec::host::need_tool("vim");
     let vim = format!("'{}'", vim.display().to_string().replace('\'', r"'\''"));
     let mut sh = Shell::boot("zv", ZSH);
@@ -560,8 +508,6 @@ fn zsh_records_nothing_for_a_clean_vim_exit() {
     sh.ctl.expect_on_screen("answered");
     sh.settle();
     sh.assert_handbacks("a clean vim exit records nothing", 0);
-    // vim reads the terminal while it runs, so nothing is typed until the
-    // shell's own marker after it.
     sh.type_line(&format!("{vim} -u NONE -c q && echo vim\"\"-done"));
     sh.ctl.expect_on_screen("vim-done");
     let bare = sh.handback_count();
@@ -611,9 +557,6 @@ fn zsh_a_bgd_leaderless_pipeline_keeps_its_modes_beside_a_command() {
         Job::Armed(Arm::AltMouse, 3).line()
     ));
     sh.ctl.expect_on_screen("armed-3");
-    // Leaderless before its Ctrl-Z: `sleep 0` (the group's leader, its id) exits by itself
-    // and zsh reaps it. Until then it may still be exec'ing, and Darwin mishandles a stop
-    // that lands mid-exec (7d71bf733f); the job printed `armed-3` after its last exec.
     let shell = sh.pgrp;
     aterm_spec::wait::until_within(MUST_HAPPEN, "the pipeline's leader to exit", || {
         let group = sh.ctl.fg_pgrp().filter(|g| *g > 0 && *g != shell)?;
@@ -661,8 +604,6 @@ fn zsh_a_live_holder_keeps_its_modes_across_its_child() {
         ],
     );
     sh.assert_handbacks("the child's exit hands nothing back", 0);
-    // The release: Enter on the holder's (cooked) terminal completes the line
-    // it waits for, and it SIGKILLs itself.
     sh.await_holder(
         Holder::Job,
         "the live holder holds the terminal for its release",
@@ -676,12 +617,6 @@ fn zsh_a_live_holder_keeps_its_modes_across_its_child() {
 /// A one-shot whose bytes the reader reads only after zsh took the terminal back is parsed as
 /// the shell's, so its handback is lost (the documented residual), and only its own: the next
 /// job, which re-arms mouse reporting and dies, is handed back once.
-///
-/// The miss is forced, never left to load: once zsh runs the line (its first word, a builtin,
-/// makes a file), the instance is SIGSTOPped; the one-shot, held behind a FIFO read until
-/// then, writes `?1000h` and exits, and zsh reclaims the terminal (`: >flag` is its last
-/// word); only then is the instance continued, so its reader wakes to the one-shot's bytes and
-/// zsh's reclaim together.
 #[test]
 fn zsh_a_missed_one_shot_loses_only_its_own_handback() {
     let mut sh = Shell::boot("zm", ZSH);
@@ -695,7 +630,6 @@ fn zsh_a_missed_one_shot_loses_only_its_own_handback() {
         gate.display(),
         flag.display()
     ));
-    // The shell has the whole line once it runs its first word.
     aterm_spec::wait::until_within(
         MUST_HAPPEN,
         "the shell to start the missed one-shot's line",
@@ -713,17 +647,12 @@ fn zsh_a_missed_one_shot_loses_only_its_own_handback() {
     );
     sh.ctl.expect_on_screen("missed-done");
     sh.settle();
-    // The miss took: the one-shot's mouse is read as the shell's and stays,
-    // and nothing was handed back. Without it the recovery below checks
-    // nothing.
     sh.assert_modes(
         "the missed one-shot's mouse stays (the residual)",
         &[("mouse_mode", "normal")],
     );
     sh.assert_handbacks("the missed one-shot loses its handback", 0);
 
-    // Re-arming is owning: the job's `?1003h` over the stale shell-owned
-    // mode makes the mouse the job's, so its death is the one handback.
     sh.start(Job::Armed(Arm::Mouse, 4));
     sh.ctl.expect_on_screen("armed-4");
     sh.job_ctrl('c', "the re-arming job holds the terminal for its Ctrl-C");

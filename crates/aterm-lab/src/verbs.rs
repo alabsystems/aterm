@@ -127,6 +127,7 @@ pub fn custom_mode_name(m: &str) -> Result<String, Fail> {
 }
 
 /// The `bg` mode's tool use runs `sleep N` in the background: let Claude run it
+/// without asking (a prompt would stall it).
 fn allow_sleep(run: &Run) -> Result<(), Fail> {
     let p = run.settings();
     let text = read_scratch(&p)?;
@@ -482,6 +483,7 @@ pub fn cmd_enter(args: &[String]) -> Res {
 }
 
 /// Whether `text` stands in the composer of the agent in the tab now;
+/// `None` when the screen could not be read (never taken for "sent").
 fn standing(door: &Door<'_>, text: &str) -> Option<bool> {
     let r = door.ctl(&["text"]).ok()?;
     if r.code != 0 {
@@ -710,6 +712,7 @@ pub fn cmd_journal(args: &[String]) -> Res {
 }
 
 /// The pids of a lab's processes that live: everything in its jail (the
+/// instance's tree, the agents, codex-runs) and the stub.
 fn live_pids(run: &Run) -> Vec<String> {
     crate::procs::lab_tree(run)
         .into_iter()
@@ -1056,6 +1059,9 @@ pub fn capture(
 }
 
 /// What of the owner's a capture's `text` carries, by the PII guard: the
+/// login name, the host's short name, and every home the lab guards (the
+/// account's, whatever `HOME` says, and the caller's `HOME` when it names
+/// another: [`crate::paths::Paths::guarded_homes`]).
 fn pii_found(p: &crate::paths::Paths, host: &str, text: &str) -> Vec<String> {
     [p.user.clone(), host.to_string()]
         .into_iter()
@@ -1223,6 +1229,9 @@ mod tests {
     use super::*;
 
     /// THE CAPTURE'S PII GUARD LOOKS FOR EVERY HOME THE LAB GUARDS: under a
+    /// scratch `HOME` (a fake account home handed in through
+    /// [`crate::paths::Paths::resolve_with`]) a capture naming the account's
+    /// home or the scratch one is flagged, as is the login name.
     #[test]
     fn the_capture_pii_guard_looks_for_the_account_home_and_a_scratch_home() {
         let top = aterm_tempfile::Builder::new()
@@ -1258,6 +1267,7 @@ mod tests {
     }
 
     /// `survey on|off [--reread]`: `on` sets the flag, `off` removes it, and
+    /// `--reread` after either waits for Claude Code's re-read.
     #[test]
     fn survey_takes_on_or_off_and_reread_after_it() {
         let w = |s: &str| -> Vec<String> { s.split_whitespace().map(str::to_string).collect() };
@@ -1303,6 +1313,8 @@ mod tests {
     }
 
     /// `harness TAG approve=none` writes `approve = "none"`, a file aterm can
+    /// read; a TOML value is written as typed, and a word with a quote or a
+    /// backslash is escaped.
     #[test]
     fn a_harness_value_is_written_as_toml() {
         let parses = |t: &str| aterm_toml::from_str::<aterm_toml::Value>(t).is_ok();
@@ -1358,6 +1370,8 @@ mod tests {
     }
 
     /// Both verbs write the one `--headers-file` through [`write_headers`],
+    /// and each leaves the other's entries: `headers` then `ratelimits` on
+    /// one file reads back the block and the flat entry.
     #[test]
     fn both_headers_verbs_writes_stand_in_the_one_file() {
         let d = std::fs::canonicalize(std::env::temp_dir())

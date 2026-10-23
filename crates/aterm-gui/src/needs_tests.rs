@@ -42,6 +42,7 @@ fn facts() -> NeedFacts {
 }
 
 /// A stall whose restart the pill carries (or a stopped job's, whose Resume
+/// it carries): its words alone are the need's.
 fn stall(stopped: bool) -> Option<StallFact> {
     Some(StallFact {
         text: format!("claude is frozen: not reading input since 14:02 {STALL_REMEDY}"),
@@ -53,9 +54,12 @@ fn stall(stopped: bool) -> Option<StallFact> {
 }
 
 /// The agent-facing remedy a stall's text ends with
+/// (`input_stall::attention_text`).
 const STALL_REMEDY: &str = "\u{2014} restart it: aterm ctl @s-b7cf523445a1b0d8658e signal term";
 
 /// An identified agent's verdict while the server publishes its input
+/// stall (`AgentPublication::effective`): `wall:unresponsive`, detail
+/// `stopped` for a stopped job.
 fn unresponsive(stopped: bool, rev: u64) -> Option<AgentFact> {
     Some(AgentFact {
         word: "wall:unresponsive",
@@ -82,6 +86,7 @@ fn words(v: &Verdict) -> (Option<NeedWord>, Option<WaitWord>) {
 }
 
 /// THE TABLE: every §2.2 case and every Waiting cause, each row naming the
+/// need and the wait it gives.
 #[test]
 fn every_need_and_every_wait_has_its_row() {
     use AttentionKind::{Ask, Wait};
@@ -616,6 +621,7 @@ fn every_need_and_every_wait_has_its_row() {
 }
 
 /// An unsupervised limit before its reset arms the publisher's wake AT the
+/// reset (the injected clock), and the same facts read past it are a `wall`.
 #[test]
 fn an_unsupervised_limit_rechecks_at_its_reset() {
     let at = NOW + 90;
@@ -644,6 +650,7 @@ fn an_unsupervised_limit_rechecks_at_its_reset() {
 }
 
 /// The keys: one stall episode, one task entry, one agent rev, one text — so
+/// a re-read of the same need is the same transition and a new one is new.
 #[test]
 fn a_needs_key_is_its_transitions_identity() {
     let frozen = of(&NeedFacts {
@@ -723,6 +730,7 @@ fn the_words_carry_their_severity() {
 }
 
 /// The ask that shows is the most recent ask; a wait beside it does not hide
+/// it, and a hold is the owner's own act, never a need.
 #[test]
 fn the_most_recent_ask_shows_and_a_hold_is_no_need() {
     let v = of(&NeedFacts {
@@ -759,6 +767,8 @@ fn held_words() -> (&'static str, &'static str) {
 }
 
 /// A deterministic stream of facts for the agreement property: every corner
+/// of the inputs the classifier reads, drawn by a seeded xorshift so a
+/// failure names its case and reruns it.
 struct Gen(u64);
 
 impl Gen {
@@ -776,7 +786,7 @@ impl Gen {
         of[at].clone()
     }
 
-    /// One session's facts. Each attention text is a distinct token the
+    /// One session's facts.
     fn facts(&mut self, case: u64) -> NeedFacts {
         let words: [&'static str; 14] = [
             "busy",
@@ -866,6 +876,14 @@ impl Gen {
 }
 
 /// THE AGREEMENT PROPERTY (`docs/DESIGN-owner-surfaces-2026-10-16.md` §10):
+/// for generated facts, [`of`]'s verdict, once published on the session's
+/// timeline, is what every reader says — `status needs=` and `hold_by=`, the
+/// survey's facts row as `aterm ctl survey` ranks it (stuck is stalled,
+/// decide is asking, no need is neither), and the menu-bar glance's badge
+/// and row, the window's presence border and the tab's mark (folded from
+/// the facts the presence driver senses, projected by the App's own driver,
+/// with nothing published again) — and the facts row carries no byte of any
+/// attention text.
 #[test]
 fn every_reader_says_the_published_verdict() {
     use aterm_messages::presence::drive::{self, Desk};
@@ -996,6 +1014,9 @@ fn every_reader_says_the_published_verdict() {
 }
 
 /// AN OUTAGE IS ONE ENTRY, NOT A ROW PER TAB (§2.2, scenario 6): two tabs
+/// whose agent cannot reach its API raise no need, no menu row and no
+/// notice, and the digest holds ONE `ApiOutage` entry for both; it is stated
+/// again as tabs leave the wait, and the last one leaving names nothing.
 #[test]
 fn an_api_outage_is_one_digest_entry_and_no_need() {
     let mut app = crate::App::headless_for_test();
@@ -1072,6 +1093,8 @@ fn an_api_outage_is_one_digest_entry_and_no_need() {
 }
 
 /// The memory remedy names the tab's OWN conversation whole — the line with
+/// its flags, else a shorter form, else the restart alone — and never the
+/// banner's `claude --continue` (2026-09-26): a cut id names no conversation.
 #[test]
 fn the_memory_remedy_names_the_tabs_own_resume_line_whole() {
     let id = "5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
@@ -1099,6 +1122,8 @@ fn the_memory_remedy_names_the_tabs_own_resume_line_whole() {
 }
 
 /// A STALLED TASK IS A NEED ONCE ITS WAKE LANDS (§9 S3): the mark posts
+/// `Wake::TaskChanged`, its arm publishes the verdict, and `status` says
+/// `needs=stalled`; the worker moving again clears it the same way.
 #[test]
 fn a_stalled_task_is_a_need_once_its_wake_lands() {
     use crate::task_record::{TaskMark, TaskState, mark_session_task};
@@ -1136,6 +1161,8 @@ fn a_stalled_task_is_a_need_once_its_wake_lands() {
 }
 
 /// THE COALESCED GLANCE (§9 S3): thirty-two tabs whose need moves in one
+/// turn owe ONE rebuild of the menu-bar item's glance, taken once on the
+/// loop's way to its wait.
 #[test]
 fn a_turn_of_many_changes_owes_one_glance_rebuild() {
     let mut app = crate::App::headless_for_test();
@@ -1161,6 +1188,7 @@ fn a_turn_of_many_changes_owes_one_glance_rebuild() {
 }
 
 /// Put session `id`'s agent at `word` (a wall) with `detail` and `subject`,
+/// a new reading each call.
 fn publish_wall(
     app: &crate::App,
     id: u64,
@@ -1211,6 +1239,10 @@ fn needs_of(app: &crate::App, id: u64) -> Option<String> {
 }
 
 /// A TAB CLOSED IN AN OUTAGE LEAVES IT (scenario 6): no
+/// publication runs for a closed tab again, so its close is what takes it out
+/// of the one `ApiOutage` entry's count and drops its need's recheck — the
+/// entry counts the tab left, and goes once the last tab in the outage
+/// closes.
 #[test]
 fn a_tab_closed_in_an_outage_leaves_its_count() {
     let mut app = crate::App::headless_for_test();
@@ -1255,6 +1287,10 @@ fn a_tab_closed_in_an_outage_leaves_its_count() {
 }
 
 /// AN OUTAGE ENTRY AN EARLIER PROCESS LEFT OPEN ENDS (scenario 6):
+/// the family is told only as tabs enter and leave the wait, so
+/// this process states its whole answer at its first look whether or not a
+/// tab moved, and the entry goes through the digest's clock when no tab here
+/// waits on the API.
 #[test]
 fn an_outage_entry_an_earlier_process_left_ends_when_no_tab_waits() {
     let earlier = || crate::message_reporters::api_outage_entry(3, Some("14:02"));
@@ -1283,6 +1319,10 @@ fn an_outage_entry_an_earlier_process_left_ends_when_no_tab_waits() {
 }
 
 /// A RESET SLEPT THROUGH IS DUE AT THE FIRST TURN AFTER THE WAKE (§2.2):
+/// an unsupervised limit's recheck is kept on the wall
+/// clock, which a Mac's sleep advances and `Instant` does not, so a wall
+/// clock past the reset with the presence clock not moved at all finds the
+/// recheck due now, and the tick publishes the `wall` need.
 #[test]
 fn a_reset_slept_through_is_due_at_the_first_turn_after_the_wake() {
     use crate::app_presence::{set_need_unix_clock_for_test, set_presence_clock_for_test};
@@ -1322,6 +1362,10 @@ fn a_reset_slept_through_is_due_at_the_first_turn_after_the_wake() {
 }
 
 /// AN ENTRY CLEARED UNDER A NEWER ONE MOVES THE NEED:
+/// the classifier reads every attention entry, so clearing an older ask under
+/// a newer wait — the bare one, or a keyed one — answers a change (what the
+/// wire's `meta` arm posts `Wake::MetaChanged` on), and the need it
+/// republishes is none.
 #[test]
 fn clearing_an_older_ask_under_a_newer_wait_moves_the_need() {
     let mut app = crate::App::headless_for_test();
@@ -1360,6 +1404,10 @@ fn clearing_an_older_ask_under_a_newer_wait_moves_the_need() {
 }
 
 /// A FROZEN PROGRAM THE PILL OFFERS NO RESTART FOR SAYS WHAT TO DO: an
+/// unsupervised Claude Code, a program that is no agent, and a tab under a
+/// hold all keep a person's remedy — the window's own ways out and the tab's
+/// resume line, whole (its shorter form where the whole does not fit), or
+/// Hand Back where only a hold Hand Back lifts refuses the restart.
 #[test]
 fn a_frozen_program_with_no_act_keeps_a_persons_remedy() {
     let line = "claude --model opus --resume 5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
@@ -1430,6 +1478,8 @@ fn a_frozen_program_with_no_act_keeps_a_persons_remedy() {
 }
 
 /// AN UNSUPERVISED LIMIT PAST ITS RESET says it passed and what to do, never
+/// `until`, which reads as a limit still waited out; before its reset it is
+/// the Waiting row's, `until` intact there.
 #[test]
 fn a_limit_past_its_reset_says_continue_it() {
     let usage = |reset_unix: Option<i64>| NeedFacts {
@@ -1455,6 +1505,9 @@ fn a_limit_past_its_reset_says_continue_it() {
 }
 
 /// A WRITER'S `kind=wait` IS A WAIT IN ITS OWN WORDS, never a usage limit
+/// by default: the entry's words and whose they are ride the Waiting, the
+/// most recent entry first, and the Overview's words for it are the same
+/// ([`wait_words`]).
 #[test]
 fn a_writers_wait_carries_its_words() {
     let v = of(&NeedFacts {
@@ -1506,6 +1559,10 @@ fn a_writers_wait_carries_its_words() {
 }
 
 /// A WORKER'S NEEDS YOU ENTRY IS AN ASK (Autopilot Cruise / Land): the
+/// loop raises `owner=needs kind=ask "<program> needs you: … — carrying on"`
+/// for a report's `NEEDS YOU:` lines, and the classifier reads it as the ask
+/// it is — the border, the pill, `◇`, `❯N` and the menu bar's "needs you" —
+/// with no reader of its own.
 #[test]
 fn a_workers_needs_you_entry_is_an_ask() {
     let owner = crate::harness_host::NEEDS_ATTENTION_OWNER;
@@ -1531,11 +1588,13 @@ fn a_workers_needs_you_entry_is_an_ask() {
 }
 
 /// Need (a) of design §12.2.1, whole: longer than the 64 cells the entry's
+/// writer keeps.
 const NEED_A: &str = "grant Screen Recording to com.aterm.aterm in System Settings \u{25b8} \
                       Privacy & Security \u{25b8} Screen Recording, so the windowed check \
                       can capture the menu";
 
 /// `need` cut as the entry's writer cuts it (`escalate::clip_to`, 64 cells,
+/// `…` the last), for a need of one-cell characters.
 fn cut64(need: &str) -> String {
     if need.chars().count() <= 64 {
         return need.to_string();
@@ -1546,6 +1605,7 @@ fn cut64(need: &str) -> String {
 }
 
 /// The harness's entry as its writer words it
+/// (`escalate::needs_attention_text`).
 fn harness_entry(program: &str, first: &str, more: u16) -> String {
     let more = if more == 0 {
         String::new()
@@ -1568,6 +1628,10 @@ fn harness_verdict(text: &str) -> Verdict {
 }
 
 /// THE NEED WITHOUT ATERM'S FRAME (Autopilot v5 §12.2.3, §12.2.6): a whole
+/// entry gives its need and program; one a byte cap cut inside ` — carrying
+/// on` gives the same need; `(+3 more)` is counted and comes off; a text that
+/// names no program, and another owner's ask, are not read (they stay
+/// whole).
 #[test]
 fn need_words_takes_the_frame_off_a_harness_entry() {
     use aterm_phase::Program;
@@ -1615,6 +1679,10 @@ fn need_words_takes_the_frame_off_a_harness_entry() {
 }
 
 /// A HARNESS'S ASK KEEPS ITS LINE WITHIN ITS BYTES (§12.2.3, §12.2.6): need
+/// (a), and a need of `▸`s and CJK text, each cut at 64 cells by the entry's
+/// writer and counted `(+1 more)`: `what` is at most [`ROW_WHAT_MAX`] bytes
+/// with ` (+1 more)` whole at its end, and `harness.first` holds the need
+/// as the entry carried it.
 #[test]
 fn a_harness_ask_keeps_its_line_within_its_bytes() {
     let wide = format!(
@@ -1648,6 +1716,7 @@ fn a_harness_ask_keeps_its_line_within_its_bytes() {
 const NEED_B: &str = "the release credential (~/.aterm/release-credentials.toml) to sign 0.48.0";
 
 /// The facts of a lone needs owner's entry `entry`, with `needs` told to
+/// the window with `told_with` (the set told last).
 fn told_with(entry: &str, needs: &[&str], told_with: &str) -> NeedFacts {
     let set: Vec<String> = needs.iter().map(|need| (*need).to_string()).collect();
     let mut told = ToldNeeds::default();
@@ -1671,7 +1740,80 @@ fn entry_of(text: &str) -> AttentionFact {
     )
 }
 
+#[test]
+fn a_reported_need_yields_to_other_outstanding_asks() {
+    let report = harness_entry("claude", "sign the release", 0);
+    for report_first in [true, false] {
+        let mut attention = vec![
+            entry("ops", "check the deploy", Some(AttentionKind::Ask)),
+            entry("ci", "older ask", Some(AttentionKind::Ask)),
+            entry("build", "building", Some(AttentionKind::Wait)),
+        ];
+        attention.insert(usize::from(!report_first), entry_of(&report));
+        let mut f = NeedFacts {
+            attention,
+            ..facts()
+        };
+        let v = of(&f);
+        let need = v.need.unwrap();
+        assert_eq!(need.what, "check the deploy");
+        assert!(crate::presence::need_fact(&need).show_pill);
+        assert_eq!(v.waiting.unwrap().word, WaitWord::Entry);
+
+        f.attention.retain(|entry| entry.owner != "ops");
+        assert_eq!(of(&f).need.unwrap().what, "older ask");
+        f.attention.retain(|entry| entry.owner != "ci");
+        let restored = of(&f).need.unwrap();
+        assert_eq!(restored.key, ask_key(&report));
+        assert!(!crate::presence::need_fact(&restored).show_pill);
+    }
+}
+
+#[test]
+fn a_reported_need_yields_to_an_unanswered_box_and_returns_afterward() {
+    let report = harness_entry("claude", "sign the release", 0);
+    for (agent, word) in [
+        (boxed("bash:ask", "git push"), NeedWord::Approval),
+        (agent("question"), NeedWord::Question),
+    ] {
+        for (supervised, hold) in [(false, None), (true, Some(HoldWord::Local))] {
+            let mut f = NeedFacts {
+                agent: agent.clone(),
+                attention: vec![entry_of(&report)],
+                supervised,
+                hold,
+                ..facts()
+            };
+            let need = of(&f).need.expect("the unanswered box");
+            assert_eq!(need.word, word);
+            assert!(crate::presence::need_fact(&need).show_pill);
+            f.agent = None;
+            let restored = of(&f).need.expect("the report still stands");
+            assert_eq!(restored.key, ask_key(&report));
+            assert!(restored.harness.is_some());
+            assert!(!crate::presence::need_fact(&restored).show_pill);
+
+            f.agent = agent.clone();
+            f.attention = vec![entry("-", "please look", Some(AttentionKind::Ask))];
+            assert_eq!(of(&f).need.unwrap().word, NeedWord::Ask);
+        }
+        let supervised = NeedFacts {
+            agent,
+            attention: vec![entry_of(&report)],
+            supervised: true,
+            ..facts()
+        };
+        assert!(of(&supervised).harness_ask().is_some());
+    }
+}
+
 /// A HARNESS'S NEED READS IN ITS OWN WORDS (Autopilot v5 §12.2.3 item 4,
+/// §12.2.6): where the loop told the window the whole set with
+/// the very entry that stands, the verdict's `harness.first` is need (a)
+/// whole — longer than the 64 cells the entry carries — with `more = 1`
+/// and need (b) among its `others`; `what` stays within [`ROW_WHAT_MAX`]
+/// with ` (+1 more)` whole, `needs_n=` counts 2, and the key stays the
+/// entry's.
 #[test]
 fn a_harness_need_reads_in_its_own_words() {
     let entry = harness_entry("claude", &cut64(NEED_A), 1);
@@ -1719,7 +1861,47 @@ fn a_harness_need_reads_in_its_own_words() {
     );
 }
 
+#[test]
+fn an_old_truncated_report_stays_out_of_the_pill() {
+    // The original writer capped the whole frame at 200 bytes. A three-byte
+    // subject could fill that cap before the count and carrying-on suffix.
+    let long = format!("claude needs you: {}", "\u{915}".repeat(60));
+    assert_eq!(long.len(), 198);
+    for text in [long.as_str(), "agy needs you: sign it (+1 mo"] {
+        assert_eq!(need_words(text), None);
+        let v = of(&NeedFacts {
+            attention: vec![entry_of(text)],
+            ..facts()
+        });
+        let need = v.need.expect("the stored report still stands");
+        let ask = need
+            .harness
+            .as_ref()
+            .expect("the report's known owner and program");
+        assert_eq!(ask.first, text.split_once(NEEDS_YOU).unwrap().1);
+        assert_eq!(ask.more, 0);
+        assert!(!crate::presence::need_fact(&need).show_pill);
+
+        let direct = of(&NeedFacts {
+            attention: vec![entry("ops", text, Some(AttentionKind::Ask))],
+            ..facts()
+        });
+        assert!(crate::presence::need_fact(&direct.need.unwrap()).show_pill);
+    }
+    for text in ["nobody needs you: sign it", "claude needs you: "] {
+        let v = of(&NeedFacts {
+            attention: vec![entry_of(text)],
+            ..facts()
+        });
+        assert!(v.harness_ask().is_none());
+    }
+}
+
 /// THE PROGRAM IS THE ENTRY'S, AND A NEED THAT FOLDS TO NOTHING IS NO
+/// NEED: the told set is said under the program the entry names
+/// (`agy needs you:` reads as agy), even where a cap cut the entry past its
+/// count, so its parse reads nothing; a told need that folds to nothing is
+/// passed over, and a set of none such falls back to the parse.
 #[test]
 fn a_told_set_reads_under_its_entrys_program() {
     let cut = "agy needs you: sign the release (+1 mo";
@@ -1746,6 +1928,12 @@ fn a_told_set_reads_under_its_entrys_program() {
 }
 
 /// A NEED IN ANY SCRIPT READS WHOLE (§12.2.1's hover, "each need whole, up
+/// to the policy's 160 characters"; the review of 2d): two needs of the
+/// policy's full 160 characters in letters of three bytes each (480 bytes,
+/// twice the banner's [`NEED_WHAT_MAX`]) told with the entry that stands
+/// read whole in the verdict and say themselves whole on the tab's hover,
+/// a line each; the banner's body still clips the first to its own
+/// [`NEED_WHAT_MAX`].
 #[test]
 fn a_told_need_in_any_script_reads_whole() {
     let long: String = "\u{9700}".repeat(aterm_agent::supervise::policy::needs::NEED_CHARS);

@@ -1,20 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The source-build lane's cargo gate (`find_cargo_and_rustup`,
-//! `cargo_honours_pin`, `cargo_build_pinned`): a build runs only under a
-//! toolchain that honours rust-toolchain.toml. The aterm-managed Trust store's
-//! targo comes first; else rustup's proxy, PROVED to dispatch to the file's
-//! pin; anything else is refused naming one remedy.
-//!
-//! No real cargo, rustup or toolchain takes part. The stand-ins are rustup's
-//! own layout (one script dispatched by the name it is run as, `cargo` and
-//! `rustc` linked to it) resolving a toolchain by rustup's precedence, a
-//! Homebrew cargo and rustc, a plain cargo of the pin's own release, and an
-//! atpkg store with its shim, alias and an `aterm` that answers `pkg which`.
-//! Every build is refused (exit 97) and recorded with the toolchain and the
-//! `rustc` it would have run, so a regression is a recorded build under the
-//! wrong cargo, never a real one.
+//! Source-build cargo gate (`find_cargo_and_rustup`, `cargo_honours_pin`, `cargo_build_pinned`) tests.
 
 use std::path::{Path, PathBuf};
 
@@ -35,11 +22,7 @@ const UNVERIFIED_LANE: &str = "target.'cfg(trust_verify)'.rustflags=[\"-Ztrust-v
 
 /// rustup, faked: dispatched by its name; RUSTUP_TOOLCHAIN, then a directory
 /// override on the cwd (FAKE_DIR_OVERRIDE), then the cwd's rust-toolchain.toml
-/// named as getcwd() spells it. Every probe must carry RUSTUP_AUTO_INSTALL=0
-/// (rustup otherwise downloads a pinned-but-absent toolchain). A build is
-/// recorded with the `rustc` it would resolve on the PATH rustup hands the
-/// toolchain's cargo: the inherited PATH, `$CARGO_HOME/bin` added in front
-/// only when that PATH lacks it.
+/// named as getcwd() spells it.
 const RUSTUP: &str = r#"#!/bin/sh
 pin="${FAKE_TOOLCHAIN_NAME:?}"
 foreign="${FAKE_FOREIGN_NAME:?}"
@@ -278,9 +261,6 @@ impl Lab {
         for dir in ["nohome", "none"] {
             scratch.mkdir(&format!("lab/{dir}"));
         }
-        // The managed store: build 9192 selected by `current`, its shim and
-        // alias, an `aterm` that answers for it; a store with no trustc; a
-        // targo outside any store.
         lay("atpkg/store/trust/9192/bin/targo", STORE_TARGO);
         lay(
             "atpkg/store/trust/9192/bin/trustc",
@@ -550,8 +530,7 @@ struct Layout<'a> {
 /// The proxy wins over a Homebrew cargo first on PATH — at `$CARGO_HOME`, on
 /// PATH behind the shadow, beside a keg rustup, or split from its rustc — and
 /// the proof names the pin file, the pin's version and the rustc the build
-/// will take. A symlinked or case-changed checkout, and an ambient
-/// RUSTUP_TOOLCHAIN naming another toolchain, change none of it.
+/// will take.
 #[test]
 fn the_rustup_lane_takes_the_proxy_and_proves_the_pin() {
     let scratch = Scratch::new();
@@ -810,8 +789,6 @@ fn a_cargo_that_cannot_honour_the_pin_is_refused_naming_its_remedy() {
             )
         })
         .collect();
-    // An override on a checkout reached through a case-changed path: the
-    // unset names the path as rustup spells it, the disk's case.
     let flipped = case_changed(&lab.checkout).map(|flipped| {
         gate(
             &mut lib,
@@ -869,8 +846,7 @@ fn a_cargo_that_cannot_honour_the_pin_is_refused_naming_its_remedy() {
 
 /// The build runs under exactly what the proof chose: rustup's cargo from the
 /// checkout, the unverified lane named, RUSTUP_TOOLCHAIN scrubbed, and the
-/// proved rustc first on PATH for that one command. Negative controls: the
-/// same cargo with PATH left alone compiles with the shadow's rustc.
+/// proved rustc first on PATH for that one command.
 #[test]
 fn a_build_runs_under_exactly_what_the_proof_chose() {
     let scratch = Scratch::new();
@@ -907,7 +883,6 @@ fn a_build_runs_under_exactly_what_the_proof_chose() {
             "find_cargo_and_rustup {r} && cargo_honours_pin {r}",
             r = q(&root)
         ));
-        // The control: the same cargo, the caller's PATH and environment.
         let control = lib.call(
             format!(
                 "(cd {r} && \"$CARGO_BIN\" build --release -p aterm --target-dir {r}/target)",
@@ -971,8 +946,7 @@ fn a_build_runs_under_exactly_what_the_proof_chose() {
 /// Homebrew cargo first on PATH and over rustup's proxies; it is proved by
 /// targo's own line and the trustc beside it, and builds on targo's explicit
 /// unverified lane with the store's bin dir first and no ambient compiler
-/// steer. Negative controls: targo refuses the implicit lane, and an ambient
-/// RUSTC reaches a build that leaves the environment alone.
+/// steer.
 #[test]
 fn the_managed_store_lane_comes_first_and_builds_on_targos_explicit_lane() {
     let scratch = Scratch::new();
@@ -994,7 +968,6 @@ fn the_managed_store_lane_comes_first_and_builds_on_targos_explicit_lane() {
         .iter()
         .map(|(dirs, home)| gate(&mut lib, &lab, &lab.path(dirs), home, &root, "", true))
         .collect();
-    // The build, under the first route, with RUSTC and CARGO_BUILD_RUSTC set.
     let path = lab.path(&["shadow", "atpkg-cli"]);
     lib.step(format!(
         "export PATH={} CARGO_HOME={}",
@@ -1080,12 +1053,7 @@ fn the_managed_store_lane_comes_first_and_builds_on_targos_explicit_lane() {
 
 /// atpkg's macOS `targo` shim runs aterm's build-dir block before its exec (the block is
 /// atpkg's own, `build_cache::shim_block`, so the shim writer and this reader answer to
-/// one contract): about a hundred and twenty lines of builtins, the exec last. With no `aterm` to
-/// ask, that shim on PATH still names the store. Only the decided shape is followed
-/// (`gate_shim_target`): a second exec (atpkg's compat route guard), an exec that is not
-/// last, a relative or unquoted target, a file that is not `#!/bin/sh`, a
-/// here-document, a line continued into the exec, or a file past the size cap reads as
-/// the file itself, which the shape proof then declines.
+/// one contract): about a hundred and twenty lines of builtins, the exec last.
 #[test]
 fn a_shim_is_followed_to_its_last_lines_exec_only_in_the_decided_shape() {
     let scratch = Scratch::new();
@@ -1122,7 +1090,6 @@ fn a_shim_is_followed_to_its_last_lines_exec_only_in_the_decided_shape() {
         scratch.exe(&format!("lab/shims/{name}/targo"), &format!("{body}\n"));
     }
     let mut lib = lab.lib();
-    // past the cap by one comment line as long as the cap itself
     lib.step(format!(
         "mkdir -p {dir} && {{ printf '%s\\n#' {head}; head -c \"$GATE_SHIM_MAX_BYTES\" /dev/zero | tr '\\0' x; printf '\\n%s\\n' {exec}; }} >{dir}/targo && chmod +x {dir}/targo",
         dir = q(&lab.p("shims/oversize")),
@@ -1196,8 +1163,7 @@ fn a_shim_is_followed_to_its_last_lines_exec_only_in_the_decided_shape() {
 /// A targo that is not the store's never takes the lane: alone on PATH it is
 /// declined by name; ahead of the store's shim it does not hide it; and when
 /// atpkg answers SHADOWED, the alias names the managed copy (or, with no alias
-/// laid, the PATH scan finds the shim). A store with no trustc beside its
-/// targo is taken and refused, naming the product's repair.
+/// laid, the PATH scan finds the shim).
 #[test]
 fn the_store_is_found_past_a_stray_targo_and_a_damaged_one_is_refused() {
     let scratch = Scratch::new();
@@ -1595,8 +1561,7 @@ fn dry_run(scratch: &Scratch, lab: &Lab, n: usize, row: &DryRun) -> Plan {
 
 /// The plan tells the truth about the cargo: every refusal is the skip it is,
 /// with its remedy, and a refused cargo is never announced as the build's;
-/// every proved toolchain is announced with its version and cargo. A dry run
-/// never builds or reaches the network.
+/// every proved toolchain is announced with its version and cargo.
 #[test]
 fn the_dry_run_plan_reports_the_source_build_as_the_run_would() {
     let scratch = Scratch::new();
@@ -1818,8 +1783,7 @@ fn the_dry_run_plan_reports_the_source_build_as_the_run_would() {
 
 /// A source build that fails ends the run with the installer's own line — what
 /// failed and that the command was not installed — and status 1, not with
-/// cargo's status and its error as the run's last words. (A Linux run: off
-/// macOS the CLI half never looks for an installed aterm.app to link.)
+/// cargo's status and its error as the run's last words.
 #[test]
 fn a_failed_source_build_is_said_and_installs_nothing() {
     let scratch = Scratch::new();

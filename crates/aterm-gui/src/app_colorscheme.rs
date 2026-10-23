@@ -65,6 +65,7 @@ impl ThemeChange {
     }
 
     /// Whether this install reloads what a selector draws, so a kept preview
+    /// must be re-checked against the new config and catalog.
     const fn reloads(self) -> bool {
         matches!(self, Self::ConfigReload | Self::CatalogReload)
     }
@@ -322,6 +323,9 @@ mod tests {
     }
 
     /// BROKEN-2 — an OS light/dark flip that moves the palette's appearance
+    /// updates the SESSION FACTORY's scheme baseline, so a tab/split spawned AFTER
+    /// the flip starts at it (its engine is built from the factory's
+    /// `terminal_config`, whose `color_scheme` it carries).
     #[test]
     fn os_flip_updates_the_session_factory_appearance() {
         let mut app = crate::App::headless_for_test();
@@ -367,6 +371,9 @@ pub(crate) mod install_resolved_colors {
     use aterm_types::{Appearance, ColorScheme, Rgb};
 
     /// A CHROME-ONLY EDIT REPAINTS: re-resolving with only `accent_color`
+    /// changed leaves the renderer theme alone but reports the chrome change,
+    /// drops every window's strip-row cache, and the new accent is what the
+    /// header's tokens carry.
     #[test]
     fn a_chrome_only_edit_repaints() {
         let mut app = App::headless_for_test();
@@ -455,6 +462,7 @@ pub(crate) mod install_resolved_colors {
     }
 
     /// A light theme on a dark OS reports light: the palette on screen, not the
+    /// desktop.
     #[test]
     fn a_light_theme_on_a_dark_os_reports_light() {
         let dir = scratch_dir("dsr");
@@ -496,6 +504,9 @@ pub(crate) mod install_resolved_colors {
     }
 
     /// A mode-2031 subscriber is pushed `?997;2n` when the config switches
+    /// Dracula → Solarized Light, and by the time the push reaches the PTY the
+    /// engine already answers OSC 11 with the new background (APPEAR-8: the
+    /// palette and the push land in one critical section, palette first).
     #[cfg(unix)]
     #[test]
     fn a_theme_switch_pushes_997_after_the_new_palette_and_an_unrelated_edit_does_not() {
@@ -553,6 +564,8 @@ pub(crate) mod install_resolved_colors {
     }
 
     /// A program's own background outranks the theme in what its session
+    /// reports (DSR 996 / mode 2031 / `status`), and a theme switch that leaves
+    /// that background alone tells the program nothing.
     #[cfg(unix)]
     #[test]
     fn a_program_background_outranks_the_theme_until_it_resets() {
@@ -638,6 +651,7 @@ pub(crate) mod install_resolved_colors {
     }
 
     /// A theme file nothing draws changes no projection, so it costs no
+    /// `apply_config` fan-out.
     #[test]
     fn an_unused_theme_file_sends_no_apply_config() {
         let mut app = App::headless_for_test();
@@ -685,6 +699,9 @@ pub(crate) mod install_resolved_colors {
     }
 
     /// A change of the engine projection rings every session's screen
+    /// readers: a styled frame's colours resolve against it, so the hold that
+    /// installs it moves the frame, and a content subscription pushes the
+    /// reload on that ring.
     #[test]
     fn a_projection_change_rings_every_sessions_watchers() {
         let mut app = App::headless_for_test();
@@ -730,6 +747,7 @@ pub(crate) mod install_resolved_colors {
     }
 
     /// Two themes that differ only in an ANSI slot draw the same chrome but give
+    /// different image-meta fingerprints.
     #[test]
     fn themes_that_differ_only_in_ansi_fingerprint_differently() {
         let mut app = App::headless_for_test();
@@ -762,6 +780,7 @@ pub(crate) mod install_resolved_colors {
     }
 
     /// A theme file's `selection_foreground` reaches the renderer knob, not only
+    /// the engine; the config key still wins over it.
     #[test]
     fn a_theme_files_selection_foreground_reaches_the_renderer() {
         let mut app = App::headless_for_test();
@@ -796,6 +815,8 @@ pub(crate) mod install_resolved_colors {
 }
 
 /// The OS appearance as its own source (APPEAR-1/2/10/12): a forced window
+/// chrome does not mask a flip, launch builds for the side the OS shows, and
+/// `status` says which side is drawn and reported.
 #[cfg(test)]
 mod appearance_source {
     use crate::App;
@@ -829,6 +850,8 @@ mod appearance_source {
     }
 
     /// APPEAR-2: `window_theme = "dark"` forces the chrome, yet a light OS
+    /// reading (the event the platform observer posts) draws and reports the
+    /// light side.
     #[test]
     fn a_forced_dark_chrome_still_follows_an_injected_light_flip() {
         let mut app = App::headless_for_test();
@@ -861,6 +884,9 @@ mod appearance_source {
     }
 
     /// APPEAR-12: a launch built for the light reading (what `warm_config` and
+    /// `main_entry` build when the early read says light) needs nothing at
+    /// attach, which reads light again: session 0 already draws and reports
+    /// the light side, and no second `apply_config` fans out.
     #[test]
     fn a_launch_built_for_light_needs_no_second_apply_config_at_attach() {
         let launch = |read: Appearance| {
@@ -899,6 +925,8 @@ mod appearance_source {
     }
 
     /// APPEAR-10: `status` and the `appearance` line say which OS reading is
+    /// in effect, which side it picked, what the session reports and whether
+    /// its background is dark, and the four agree after a flip.
     #[test]
     fn status_appearance_fields_agree_after_a_flip() {
         let mut app = App::headless_for_test();
@@ -948,6 +976,12 @@ mod appearance_source {
     }
 
     /// Linux `window_theme = "auto"`: the variant the window's chrome takes
+    /// (`chrome_theme_for_apprt`, X11's `_GTK_THEME_VARIANT` and the Wayland
+    /// header) follows an OS light/dark flip through the side of a split
+    /// `theme` it draws, and a single theme keeps its own side whatever the OS
+    /// shows: the title bar matches the terminal under it, the Windows caption's
+    /// rule (`platform_win::resolve_chrome_theme`) and what macOS's transparent
+    /// title bar shows.
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_auto_chrome_follows_the_os_through_the_theme_it_draws() {

@@ -1,70 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `aos` lane's harness (`verify perf aos`): what hosting the momentum glow under Aos
-//! costs, measured on one matched, recorded, deterministic workload.
-//!
-//! ```text
-//! targo --unverified run --release -q -p aterm-bench --example aos_harness
-//! targo --unverified run --release -q -p aterm-bench --example aos_harness -- --cold OP
-//! targo --unverified run --profile opt-test -q -p aterm-bench --example aos_harness -- --stranded
-//! targo --unverified run --release -q -p aterm-bench --example aos_harness -- --export PATH
-//! targo --unverified run --release -q -p aterm-bench --example aos_harness -- --import PATH
-//! ```
-//!
-//! THE WORKLOAD. A fixed typing story, generated once per process, closed loop, against the
-//! shipped engine and the host's frame lane (frame cadence while the glow is active, the
-//! settle wake it names while it settles, park otherwise). It has bursts of 24 keys at 3, 6,
-//! 10 and 16 keys/s on a dark page and then on a light page. After each burst comes a
-//! cool-down that either runs until the lane parks (then 500 ms idle) or is cut 400 ms after
-//! the last key by the next burst. One reset (the page change) sits between the pages. The
-//! geometry is real: 15×28 px cells, a 24×100 grid at window origin (24, 84) under an 80 px
-//! chrome band, and a 16 666 667 ns frame interval. Every instant is the story origin plus a
-//! recorded offset, so nothing the measured code runs reads a clock.
-//!
-//! THE PATHS. The recorded calls are played open loop, identically, into:
-//! 1. a bare `MomentumGlow` (`direct`);
-//! 2. an unattached `MomentumHost`, which production runs today (`host`);
-//! 3. a `MomentumHost` attached under the shipped code (`attached`).
-//!
-//! Each path's frames, quads and wakes must digest to the story's. A mismatch fails the run:
-//! that is a correctness check, not a budget.
-//!
-//! WHAT IT PRINTS. One JSON line on stdout (the last line), with progress on stderr. The
-//! default (warm) run reports:
-//! * per-call latency for each path and call kind, from timed passes;
-//! * throughput and the counters an untimed pass moves;
-//! * attach and detach;
-//! * checkpoint capture, encode, decode and restore over every state the story passes
-//!   through, the bytes each one changes, a retained-checkpoint sweep and a state-size sweep;
-//! * the event log's encode, decode and trace digest, and its bytes;
-//! * shadow replay throughput;
-//! * a full repair (pause, then prepare + commit), Shipped -> Shipped.
-//!
-//! `--cold OP` measures OP's first run in a fresh process; the `checkpoint` and `replay` ops
-//! also report the full state digest (and the checkpoint digest, or the observation chain)
-//! they reached. `--stranded` needs a build with debug assertions (the demonstration fault
-//! exists only there): it records a stranded trace with the faulty code running the lane,
-//! then repairs it to the shipped code.
-//!
-//! `--export PATH` plays the story into a host attached under the shipped code and writes
-//! its trace file (`MomentumTrace::encode`: identity, ancestor checkpoint, sealed log, and
-//! the head's state digest and observation chain) to PATH, reporting the head. `--import
-//! PATH`, run as another process, decodes that file on its own epoch (this process's
-//! `Instant::now()`), restores the checkpoint, replays the log through the shipped code and
-//! reports the state digest and the chain it reached; it fails unless they are the head
-//! the file records (`MomentumTrace::replay`). `verify perf aos` runs the two and checks
-//! both against the cold `checkpoint` and `replay` runs.
-//!
-//! THE COUNTERS, over named intervals, each stated where it is reported:
-//! * the thread's CPU time;
-//! * the process's instructions, cycles and page-ins (`proc_pid_rusage`);
-//! * the task's faults, Unix and Mach system calls, Mach messages and context switches (Mach
-//!   `task_info(TASK_EVENTS_INFO)`);
-//! * this harness's allocation tallies (a counting global allocator around `System`).
-//!
-//! An empty interval's median is subtracted from each. Nothing here is judged: there is no
-//! budget and no floor.
+//! `aos` performance lane harness (`verify perf aos`) measuring momentum glow under Aos.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fmt::Write as _;
@@ -92,11 +29,8 @@ use aterm_effects::cursor_momentum::{
 };
 use aterm_render::GlowQuad;
 
-// ---- the counting allocator ----
-
 /// `System`, counted: every allocation, deallocation and reallocation, the bytes asked for,
-/// the bytes live and their peak. Each counted call adds three or four relaxed atomic
-/// read-modify-writes, on every path alike.
+/// the bytes live and their peak.
 struct Counting;
 
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
@@ -111,8 +45,7 @@ fn grew(by: u64) {
     PEAK.fetch_max(live, Relaxed);
 }
 
-// SAFETY: every method forwards the caller's own arguments to `System`, unchanged, and only
-// counts around the call; the counters are atomics, so this is as thread-safe as `System`.
+// SAFETY: forwards arguments to `System` and updates atomic counters.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: the caller's `GlobalAlloc::alloc` contract, passed through.
@@ -166,8 +99,6 @@ static GLOBAL: Counting = Counting;
 fn live_bytes() -> u64 {
     LIVE.load(Relaxed)
 }
-
-// ---- host counters ----
 
 const COUNT_NAMES: [&str; 14] = [
     "cpu_ns",
@@ -369,8 +300,7 @@ mod os {
     pub(super) fn rusage() -> Option<Rusage> {
         let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
         let pid = libc::c_int::try_from(std::process::id()).ok()?;
-        // SAFETY: `info` is writable for one `rusage_info_v4`, the flavor asked for; the call
-        // fills it or fails, and a zeroed one is a valid value either way.
+        // SAFETY: `info` is writable for one `rusage_info_v4`.
         let rc = unsafe {
             libc::proc_pid_rusage(
                 pid,
@@ -394,8 +324,7 @@ mod os {
     pub(super) fn task_events() -> Option<TaskEvents> {
         let mut info = TaskEventsInfo::default();
         let mut count = TASK_EVENTS_INFO_COUNT;
-        // SAFETY: `info` is eight writable `integer_t`s and `count` says so; `mach_task_self_`
-        // is this process's own task port, set before `main` runs and never written after.
+        // SAFETY: `info` is eight writable `integer_t`s and `mach_task_self_` is this task's port.
         let kr = unsafe {
             task_info(
                 mach_task_self_,
@@ -548,8 +477,6 @@ mod os {
     }
 }
 
-// ---- JSON ----
-
 /// One JSON object, built in order.
 struct Obj(String);
 
@@ -665,8 +592,6 @@ fn dist(v: &mut [u64]) -> Obj {
         .u("max", v.last().copied().unwrap_or(0))
         .f("mean", ratio(sum, n as u64))
 }
-
-// ---- the story ----
 
 /// The frame interval the host's lane runs at (the momentum fixtures' `LANE`).
 const LANE_NS: u64 = 16_666_667;
@@ -1131,8 +1056,6 @@ fn call_kind(e: &MomentumEvent) -> usize {
     }
 }
 
-// ---- playing the story into a path ----
-
 trait Meter {
     fn time<R>(&mut self, call: usize, f: impl FnOnce() -> R) -> R;
 }
@@ -1190,9 +1113,7 @@ impl Bufs {
     }
 }
 
-/// Plays the recorded calls into `g`. A tick's call includes the lane's two predicate reads
-/// after it (`is_active`, `settling`), as the host makes them; a query is
-/// `next_change_deadline`.
+/// Plays the recorded calls into `g`.
 fn play<M: Meter>(
     g: &mut impl Glow,
     t0: Instant,
@@ -1265,7 +1186,7 @@ struct Pass {
     /// `aos_attach`'s time (the attached path), outside the pass's interval.
     attach_ns: Option<u64>,
     /// The play's wall time and counters: from just before the first call to just after the
-    /// last. A fresh path's construction and attach are outside it.
+    /// last.
     wall_ns: u64,
     count: Count,
     host: Option<MomentumHost>,
@@ -1307,8 +1228,6 @@ fn pass<M: Meter>(
         }
     }
 }
-
-// ---- calibration ----
 
 struct Calibration {
     empty: Count,
@@ -1386,8 +1305,6 @@ fn footprint() -> Obj {
         .u("heap_peak_live_bytes", PEAK.load(Relaxed))
 }
 
-// ---- the warm measurements ----
-
 const WARMUP_PASSES: usize = 5;
 const TIMED_PASSES: usize = 30;
 const UNTIMED_PASSES: usize = 100;
@@ -1401,8 +1318,7 @@ fn fail(why: impl std::fmt::Display) -> ! {
 }
 
 /// The three paths: a digest check each, warm-up, timed passes and untimed passes, round
-/// robin. Returns the report and the attached host of the digest check (its trace feeds the
-/// log, checkpoint and replay measurements).
+/// robin.
 fn measure_paths(story: &Story, cal: &Calibration) -> Result<(Obj, MomentumHost), String> {
     let mut bufs = Bufs::new();
     let mut checked = None;
@@ -1422,10 +1338,6 @@ fn measure_paths(story: &Story, cal: &Calibration) -> Result<(Obj, MomentumHost)
         }
     }
     let checked = checked.ok_or("the attached path kept no host")?;
-    // WHAT A PATH HOLDS after the whole story: the heap live while its state is kept, less
-    // the heap live before it was made (the engine and the unattached host hold their state
-    // inline: no heap; the attached host holds its boundary, the attach checkpoint and the
-    // log since it).
     let mut held = Obj::new();
     for kind in PathKind::ALL {
         let before = live_bytes();
@@ -1890,8 +1802,6 @@ fn measure_replay(
         black_box(run);
     }
     let net = count.net(cal.empty, REPLAY_REPEATS as u64);
-    // THE FOLD ALONE: each observation the replay made, encoded into a fresh `Enc` and linked
-    // into a chain, as both the attached host's live chain and the replay fold every input.
     let mut port = ShadowPort::new(&[]);
     let run = replay(schema, &code, d.s0, d.log.inputs(), first, &mut port);
     let (mut fold, mut obs_bytes) = (Vec::new(), Vec::new());
@@ -2019,7 +1929,7 @@ fn measure_shipped_repair(story: &Story, cal: &Calibration) -> Result<Obj, Strin
 
 /// The recorded stranded trace: the demonstration fault runs the lane itself (closed loop,
 /// attached), so the trace holds the settle queries it answered with no wake; then the
-/// repair to the shipped code. Only a build with debug assertions has the fault.
+/// repair to the shipped code.
 #[cfg(debug_assertions)]
 fn measure_stranded_repair(story: &Story, cal: &Calibration) -> Result<Obj, String> {
     let mut done = Vec::new();
@@ -2064,8 +1974,6 @@ fn measure_stranded_repair(story: &Story, cal: &Calibration) -> Result<Obj, Stri
     ))
 }
 
-// ---- cold ----
-
 const COLD_OPS: [&str; 7] = [
     "direct",
     "host",
@@ -2076,8 +1984,7 @@ const COLD_OPS: [&str; 7] = [
     "repair",
 ];
 
-/// OP's first run in this process. The story was generated first (that ran the engine's
-/// tick and deadline code once, closed loop); every other setup step is named in `setup`.
+/// OP's first run in this process.
 fn cold(op: &str, story: &Story, cal: &Calibration) -> Result<Obj, String> {
     let schema = MomentumSchema::new(story.t0);
     let code = PrebuiltMomentum::new(MomentumCode::Shipped, BUILD);
@@ -2147,7 +2054,6 @@ fn cold(op: &str, story: &Story, cal: &Calibration) -> Result<Obj, String> {
             )
         }
         "log" => {
-            // The log extends the attach checkpoint of the default state.
             let c0 = Checkpoint::capture(&schema, &s0, attach_provenance(&identity));
             let header = LogHeader {
                 identity: identity.clone(),
@@ -2220,8 +2126,6 @@ fn cold(op: &str, story: &Story, cal: &Calibration) -> Result<Obj, String> {
         .t("setup", setup)
         .o("ns", ns)
         .o("digests", digests)
-        // Cycles over CPU time is a clock rate only over an interval far longer than the two
-        // counters' own granularity: under a millisecond of CPU it is left out (null).
         .f("ghz", {
             let net = count.net(cal.empty, 1);
             if net.0[CPU_NS] < 1_000_000 {
@@ -2232,8 +2136,6 @@ fn cold(op: &str, story: &Story, cal: &Calibration) -> Result<Obj, String> {
         })
         .o("interval", count.net(cal.empty, 1).json()))
 }
-
-// ---- main ----
 
 enum Mode {
     Warm,
@@ -2301,8 +2203,7 @@ fn export(story: &Story, path: &str) -> Result<Obj, String> {
 }
 
 /// `--import PATH`: the trace file decoded on this process's own epoch, replayed from its
-/// checkpoint through the shipped code, and what the replay reached. `MomentumTrace::replay`
-/// refuses unless that is the head the file records.
+/// checkpoint through the shipped code, and what the replay reached.
 fn import(story: &Story, path: &str) -> Result<Obj, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("could not read {path}: {e}"))?;
     let trace = MomentumTrace::decode(&bytes).map_err(|e| format!("{path}: {e}"))?;
@@ -2336,8 +2237,6 @@ fn main() {
         [flag, path] if flag == "--import" => Mode::Import(path.clone()),
         _ => usage(),
     };
-    // The glow runs on the app's user-interactive thread; a default-QoS harness on a busy
-    // machine is the first thread the scheduler moves to an efficiency core.
     aterm_pty::declare_interactive_thread();
     let load_start = load();
     let started = Instant::now();

@@ -100,7 +100,6 @@ fn the_tap_value_is_exact_and_only_it_is_ours() {
         let forged = format!("{VALUE_HEAD}{exe}{COMMAND_TAIL}{VALUE_TAIL}");
         assert!(!is_ours(&forged), "{exe}");
     }
-    // Carried in either spelling, and never past `--`.
     let argv = |rest: &[&str]| -> Vec<String> {
         std::iter::once("claude")
             .chain(rest.iter().copied())
@@ -114,13 +113,7 @@ fn the_tap_value_is_exact_and_only_it_is_ours() {
     assert!(!carried_by(&argv(&[])));
 }
 
-/// ON WINDOWS THE VALUE NAMES A DRIVE PATH WITH `/` SEPARATORS. Claude Code runs a status-line
-/// command through Git Bash (else PowerShell), where a `\` is an escape: the path the window's
-/// canonical `current_exe` gives (`\\?\C:\…`) is spelled `C:/…`, which Git Bash, pwsh 7 and
-/// Windows PowerShell 5.1 each ran (measured 2026-10-17), and the value round-trips as ours.
-/// Every path refused before still is (the census found every Windows path refused: a drive
-/// colon and backslashes), and so are a UNC path, a drive-relative one and a value spelled with
-/// backslashes.
+/// ON WINDOWS THE VALUE NAMES A DRIVE PATH WITH `/` SEPARATORS.
 #[cfg(windows)]
 #[test]
 fn a_windows_exe_is_named_with_forward_slashes() {
@@ -155,8 +148,7 @@ fn a_windows_exe_is_named_with_forward_slashes() {
 
 /// The tap's command names the console image: on Windows the window runs `aterm-gui.exe` (a
 /// build tree's `aterm-windowed.exe`), which would open a window for `harness tap`, so the
-/// console `aterm.exe` beside it is named, and no tap where there is none. Elsewhere, and for
-/// the console image itself, the running image.
+/// console `aterm.exe` beside it is named, and no tap where there is none.
 #[test]
 fn the_tap_names_the_console_image_beside_a_windowed_one() {
     let dir = Path::new(r"C:\Users\u\AppData\Local\Programs\aterm");
@@ -215,7 +207,6 @@ fn the_verb_writes_its_reading_and_always_prints_one_line_and_exits_zero() {
     assert_eq!(read.warm, Some(false));
     let text = std::fs::read_to_string(&file).expect("read");
     assert!(text.contains("\"v\":1"), "{text}");
-    // No temp file is left beside it.
     let names: Vec<_> = std::fs::read_dir(&rl)
         .expect("ls")
         .flatten()
@@ -223,8 +214,6 @@ fn the_verb_writes_its_reading_and_always_prints_one_line_and_exits_zero() {
         .collect();
     assert_eq!(names.len(), 1, "{names:?}");
 
-    // An occupied candidate is borrowed, so a failed write leaves it and
-    // the last published reading alone. The verb still prints its line.
     let candidate = rl.join(format!(".{SID}-68537.json.tmp{}", std::process::id()));
     std::fs::write(&candidate, "borrowed sentinel").expect("candidate");
     let (_, collision_line) = tap(payload(19, five, seven).as_bytes(), &vars(), Some(&rl));
@@ -274,10 +263,8 @@ fn the_verb_writes_its_reading_and_always_prints_one_line_and_exits_zero() {
         assert_eq!(line, format!("{NO_FIGURES}\n"));
         assert!(!line.trim().is_empty());
     }
-    // A window the vendor left out is a dash on its side alone.
     let (_, line) = tap(payload(0, five, None).as_bytes(), &vars(), Some(&rl));
     assert_eq!(line, "5h 42% \u{b7} 7d \u{2013}\n");
-    // No tab, no process: the line, nothing written.
     let nowhere = dir.join("nowhere");
     for vars in [
         TapVars {
@@ -302,7 +289,6 @@ fn the_verb_writes_its_reading_and_always_prints_one_line_and_exits_zero() {
         assert_eq!(line, format!("{NO_FIGURES}\n"));
         assert!(!nowhere.exists(), "{vars:?}");
     }
-    // A directory that cannot be made: the line all the same.
     let blocked = dir.join("blocked");
     std::fs::write(&blocked, "a file where the directory would go").expect("write");
     let (code, line) = tap(
@@ -312,7 +298,6 @@ fn the_verb_writes_its_reading_and_always_prints_one_line_and_exits_zero() {
     );
     assert_eq!(code, std::process::ExitCode::SUCCESS);
     assert_eq!(line, "5h 42% \u{b7} 7d 61%\n");
-    // No state root: the line all the same.
     let (code, line) = tap(payload(1, five, seven).as_bytes(), &vars(), None);
     assert_eq!(code, std::process::ExitCode::SUCCESS);
     assert_eq!(line, "5h 42% \u{b7} 7d 61%\n");
@@ -321,13 +306,7 @@ fn the_verb_writes_its_reading_and_always_prints_one_line_and_exits_zero() {
 /// NOTHING OF STDIN IS WRITTEN AS IT CAME, and no variable but the four is
 /// read: a payload carrying a token-shaped value in a field the tap does not
 /// keep, and a process whose environment carries two credentials, leave
-/// neither in the file nor on the line. Run as the real front door
-/// (`aterm harness tap`, [`super::super::cli::main_entry`]) in a child of
-/// this test binary, so the environment is a real one. NEGATIVE CONTROL:
-/// the child did write its reading (the figures are there). The seam names
-/// the state root the scratch `HOME` resolves to, so a build that compiles no
-/// seam (an optimized test build) keeps its reading where a development build
-/// does.
+/// neither in the file nor on the line.
 #[test]
 fn the_verb_never_writes_a_secret_it_was_handed() {
     if std::env::var_os("ATERM_TAP_TEST_CHILD").is_some() {
@@ -394,14 +373,7 @@ fn the_verb_never_writes_a_secret_it_was_handed() {
 /// re-reporting the figure it holds, and the file's `at` stays the run's
 /// that first reported it — so a figure read late is as old as it is, and
 /// one from before a limit reset used inside its window is cut by that
-/// reset however late the host reads it. Session B's 100%, first reported
-/// before session A's refill at `E`, re-reported after it and read then:
-/// the account keeps A's 3%, and B's next served reply (2%, dropped from
-/// that 100%) opens no second epoch. NEGATIVE CONTROLS: a request served
-/// since (`api_ms` rose) or a figure that moved is a new report, stamped by
-/// its own run; and the same late reading stamped by its late write — what
-/// the tap wrote before — is taken as served after the reset, so 100%
-/// stands again and B's next reply writes a second `reset` row.
+/// reset however late the host reads it.
 #[test]
 fn a_re_report_keeps_the_first_reports_stamp() {
     use crate::harness::accounts::{self, Kind, State, TapRead, WindowRead};
@@ -429,8 +401,6 @@ fn a_re_report_keeps_the_first_reports_stamp() {
     assert_eq!(report(18, 100, 1010).at, 1000, "a re-report");
     let late = report(18, 100, 1366);
     assert_eq!(late.at, 1000, "a re-report, read late");
-    // The account: A's 100% (served at 990), A's refill to 3% at E = 1100,
-    // then B's late reading, then B's next reply.
     let five = |pct_x10: u32, refilled: Option<u32>, at: i64| TapRead {
         five_hour: Some(WindowRead {
             pct_x10,
@@ -464,17 +434,13 @@ fn a_re_report_keeps_the_first_reports_stamp() {
         refilled: [None, None],
     };
     assert_eq!(account(late.tap_read(beside, None)), (30, 1));
-    // NEGATIVE CONTROL: stamped by its late write, it stands again.
     let rewritten = TapRead {
         at: 1366,
         ..late.tap_read(beside, None)
     };
     assert_eq!(account(rewritten), (1000, 2));
-    // NEGATIVE CONTROLS: served since; a figure that moved.
     assert_eq!(report(31, 100, 1376).at, 1376, "served since");
     assert_eq!(report(31, 99, 1386).at, 1386, "a figure moved");
-    // Both windows compare their served values, including a tenth that
-    // moves without changing the whole-percent row.
     let mut legacy = report(31, 42, 1396);
     legacy.five_hour.as_mut().expect("five hour").pct_x10 = None;
     legacy.seven_day = Some(Window {
@@ -503,8 +469,7 @@ fn a_re_report_keeps_the_first_reports_stamp() {
 }
 
 /// A reading is read only from its own process's regular file: tab and pid in name and text,
-/// written since the process started. Negative controls: another tab's, another pid's, an older
-/// one, a symlink and another format version are each refused.
+/// written since the process started.
 #[test]
 fn a_reading_is_read_only_from_its_own_processes_file() {
     let root = scratch("read");
@@ -530,10 +495,8 @@ fn a_reading_is_read_only_from_its_own_processes_file() {
         Reading::read(&dir, SID, 68537, now + 3600).is_none(),
         "older than the process"
     );
-    // The same text under another pid's name names the wrong process.
     std::fs::copy(dir.join(&name), dir.join(format!("{SID}-1.json"))).expect("copy");
     assert!(Reading::read(&dir, SID, 1, 0).is_none());
-    // A symlink is never followed.
     #[cfg(unix)]
     {
         let link_dir = dir.join("links");
@@ -541,7 +504,6 @@ fn a_reading_is_read_only_from_its_own_processes_file() {
         std::os::unix::fs::symlink(dir.join(&name), link_dir.join(&name)).expect("symlink");
         assert!(Reading::read(&link_dir, SID, 68537, 0).is_none());
     }
-    // Another format version is not read.
     let text = std::fs::read_to_string(dir.join(&name)).expect("read");
     std::fs::write(dir.join(&name), text.replace("\"v\":1", "\"v\":2")).expect("write");
     assert!(Reading::read(&dir, SID, 68537, 0).is_none());
@@ -576,11 +538,7 @@ fn reading(pid: u32, api_ms: u64, five: Option<u32>, seven: Option<u32>) -> Read
 /// THE TENTHS AND THE MODEL (the account-stats design §4.2, F1): Claude Code
 /// hands `used_percentage` with one decimal (`42.6` in the lab, 2.1.301):
 /// the row prints the whole percent it rounds to, the file keeps the tenths
-/// and the process's `model.id` beside it, and both read back. A file an
-/// older tap wrote — no `pct_x10`, no `model` — still reads, with neither
-/// (`FORMAT_V` stays 1). A `model.id` that is no model id is not kept.
-/// NEGATIVE CONTROL: a whole-percent payload has whole tenths, and the
-/// figure in tenths of an old file is its whole percent times ten.
+/// and the process's `model.id` beside it, and both read back.
 #[test]
 fn a_reading_keeps_the_vendors_tenths_and_its_model() {
     let text = r#"{"model":{"id":"claude-opus-5-5"},"cost":{"total_api_duration_ms":9},
@@ -598,7 +556,6 @@ fn a_reading_keeps_the_vendors_tenths_and_its_model() {
     assert_eq!(r.model.as_deref(), Some("claude-opus-5-5"));
     let back = Reading::of_json(&r.to_json()).expect("reads back");
     assert_eq!(back, r);
-    // An older tap's file: no tenths, no model.
     let old = r#"{"v":1,"at":5,"sid":"s-1","pid":7,"session":null,"login":null,"home":null,
 "api_ms":3,"five_hour":{"pct":42,"resets_at":9},"seven_day":null,"cache":{},"version":null}"#;
     let old = Reading::of_json(old).expect("an older file reads");
@@ -614,9 +571,7 @@ fn a_reading_keeps_the_vendors_tenths_and_its_model() {
 /// same process read before is `seen`; a window is REFILLED, from the
 /// figure that process read before, where it was served since (`api_ms`
 /// rose) and reads lower by a whole point or more under the same reset —
-/// the drop a limit reset used inside the window makes. NEGATIVE CONTROLS: the same drop with no API time since
-/// (an idle repeat), another process, another reset, and a tenth's wobble
-/// are no refill; and another process is not `seen`.
+/// the drop a limit reset used inside the window makes.
 #[test]
 fn a_refill_is_a_drop_in_one_process_served_since_under_one_reset() {
     let at = |pct_x10: u32, reset: i64| {
@@ -660,7 +615,6 @@ fn a_refill_is_a_drop_in_one_process_served_since_under_one_reset() {
         Beside::default(),
         "another process"
     );
-    // `tap_read` carries what was said, in tenths, at the file's time.
     let r = Reading {
         at: 77,
         ..read(7, 200, at(50, 50))
@@ -689,7 +643,6 @@ fn a_refill_is_a_drop_in_one_process_served_since_under_one_reset() {
 /// whatever it repeats; a reading with no figures never is.
 #[test]
 fn freshness_admits_news_and_never_an_idle_repeat() {
-    // tap-refresh2: (api_ms, 5h, 7d) as the tap saw them.
     let refresh2 = [(0, None, None), (0, Some(75), Some(43))]
         .into_iter()
         .chain(std::iter::repeat_n((0, Some(75), Some(43)), 10));
@@ -699,7 +652,6 @@ fn freshness_admits_news_and_never_an_idle_repeat() {
         .collect();
     assert_eq!(admitted.iter().filter(|a| **a).count(), 1, "{admitted:?}");
     assert!(admitted[1], "the first figures");
-    // tap-bgagent-refresh1: 58 → 64 → 66 → 68 → 70 → 74 on the timer.
     let bgagent = [
         (0, None, Some(60)),
         (0, Some(58), Some(60)),
@@ -713,11 +665,8 @@ fn freshness_admits_news_and_never_an_idle_repeat() {
     for (api, five, seven) in bgagent {
         assert!(fresh.admit(&reading(11, api, five, seven)), "{five:?}");
     }
-    // The same figures again with no request served: stale; a request
-    // served (api_ms rose) with the same figures: fresh.
     assert!(!fresh.admit(&reading(11, 96, Some(74), Some(60))));
     assert!(fresh.admit(&reading(11, 97, Some(74), Some(60))));
-    // A relaunch: its first figures are fresh even where they repeat.
     assert!(fresh.admit(&reading(12, 0, Some(74), Some(60))));
     assert!(!fresh.admit(&reading(12, 0, Some(74), Some(60))));
     assert!(!Fresh::default().admit(&reading(13, 50, None, None)));
@@ -725,7 +674,6 @@ fn freshness_admits_news_and_never_an_idle_repeat() {
 
 /// A tap is marked silent, once, only for a process up at least 30 s that served a turn, whose
 /// file is missing or older than 30 s at two points 30 s apart; heard again, it is unmarked.
-/// Negative controls: no turn served, up for less, a fresh file, strikes too close together.
 #[test]
 fn a_tap_is_silent_only_after_two_strikes_on_a_served_process() {
     let mut s = Silence::default();
@@ -736,7 +684,6 @@ fn a_tap_is_silent_only_after_two_strikes_on_a_served_process() {
     assert_eq!(s.step(200, 7, 160, true, None), Heard::Same, "once");
     assert_eq!(s.step(210, 7, 170, true, Some(3)), Heard::Again);
     assert!(!s.silent());
-    // Negative controls.
     for (up, served, age) in [
         (60, false, None),
         (10, true, None),
@@ -753,7 +700,6 @@ fn a_tap_is_silent_only_after_two_strikes_on_a_served_process() {
         }
         assert!(!s.silent());
     }
-    // A new process starts over.
     let mut s = Silence::default();
     assert_eq!(s.step(0, 7, 60, true, None), Heard::Same);
     assert_eq!(
@@ -765,8 +711,7 @@ fn a_tap_is_silent_only_after_two_strikes_on_a_served_process() {
 }
 
 /// A silent mark ends, once ([`Heard::Again`]), at the first point of a relaunched process or when
-/// the tab's agent carries no tap; the new process needs two strikes of its own. Negative
-/// controls: the marked process stays marked and quiet; an unmarked process replaced says nothing.
+/// the tab's agent carries no tap; the new process needs two strikes of its own.
 #[test]
 fn a_silent_mark_ends_with_its_process() {
     let marked = || {
@@ -788,7 +733,6 @@ fn a_silent_mark_ends_with_its_process() {
     assert_eq!(s.untapped(9), Heard::Again);
     assert!(!s.silent());
     assert_eq!(s.untapped(9), Heard::Same, "once");
-    // Negative controls.
     let mut s = marked();
     assert_eq!(s.step(60, 7, 120, true, None), Heard::Same, "still marked");
     assert!(s.silent());
@@ -858,12 +802,7 @@ fn all_clear<'a>(argv: &'a [String], settings: &'a [(String, Source)]) -> GateFa
 /// store, a person's `--settings` (either spelling) or `--bare`, an argv the
 /// rewrite refuses, a `statusLine`, `disableAllHooks`, an `apiKeyHelper` or
 /// a credential, profile or route in any document of the chain, a document
-/// that cannot be read or parsed. NEGATIVE CONTROLS: aterm's own tap on the
-/// argv is shed, not refused; a set-and-empty login is the default one; the
-/// login a renewal bound the machine's one account to is the machine's own
-/// too ([`Armed::lone_login`]) — but not another login beside it, nor it in
-/// a home of its own; a quiet document and one with a harmless `env` key let
-/// it through.
+/// that cannot be read or parsed.
 #[cfg(unix)]
 #[test]
 fn each_guard_alone_refuses_the_tap() {
@@ -878,7 +817,6 @@ fn each_guard_alone_refuses_the_tap() {
     let quiet = chain(r#"{"permissions":{"allow":["Bash(ls)"]},"env":{"FOO":"1"}}"#);
     let want = settings_value(Path::new(EXE));
     assert_eq!(gate(&all_clear(&argv, &quiet)), want);
-    // Set and empty is the default login named.
     assert_eq!(
         gate(&GateFacts {
             login: Some(""),
@@ -886,7 +824,6 @@ fn each_guard_alone_refuses_the_tap() {
         }),
         want
     );
-    // The one account's renewed login is the machine's own.
     let renewed = "/Users//example/.aterm/logins/home-a.1";
     assert_eq!(
         gate(&GateFacts {
@@ -896,7 +833,6 @@ fn each_guard_alone_refuses_the_tap() {
         }),
         want
     );
-    // aterm's own tap on the argv is shed: the next line gets it again.
     let tapped: Vec<String> = argv
         .iter()
         .cloned()
@@ -1009,7 +945,6 @@ fn each_guard_alone_refuses_the_tap() {
     ] {
         refused(all_clear(&argv, &chain(text)), text);
     }
-    // Each place in the chain counts: a status line in any one document.
     for at in 0..3 {
         let mut c = quiet.clone();
         c[at].1 = Source::Text(r#"{"statusLine":{"type":"command","command":"x"}}"#.into());
@@ -1050,11 +985,6 @@ fn with_tap_row(rows: &[String], row: &str) -> Vec<String> {
 /// credits`): with every line the tap prints in its row, the phase reads
 /// idle with no wall, the footer's mode row and the live REPL's row are
 /// found under it, and the line holds no guarded string of the vendor's.
-/// NEGATIVE CONTROLS: Claude Code's own usage-limit banner in that row
-/// reads as a wall (the readers do read the row), and a blank row there hides the mode row from the
-/// footer — which a tap that prints nothing would cost (on 2.1.300 a silent
-/// or failing command takes no row at all: the `tap-row-silent-command`
-/// capture).
 #[test]
 fn the_taps_row_reads_idle_and_keeps_the_mode_row_for_every_reader() {
     use super::super::footer;
@@ -1116,10 +1046,6 @@ fn the_taps_row_reads_idle_and_keeps_the_mode_row_for_every_reader() {
                 assert!(!line.contains(anchor.text), "{line} holds {}", anchor.id);
             }
         }
-        // Negative controls. The vendor's banner there (its `⚠` first, as
-        // 2.1.304 draws it above a status line) is read; a status line's
-        // own words naming a limit are not (KI-1015-14: the footer reads
-        // only where Claude Code draws its notices).
         let walled = with_tap_row(&rows, "  ⚠ Usage limit reached · limit resets 12:23pm");
         let read = aterm_phase::read(Some("claude"), &walled, None);
         assert!(
@@ -1139,8 +1065,6 @@ fn the_taps_row_reads_idle_and_keeps_the_mode_row_for_every_reader() {
             "a blank row hides the mode row"
         );
     }
-    // A command that prints nothing, or fails, takes no row on 2.1.300: the
-    // mode row is the one under the rule.
     for capture in [
         include_str!("../../../aterm-phase/src/fixtures/claude-2.1.300-tap-row-silent-command.txt"),
         include_str!(

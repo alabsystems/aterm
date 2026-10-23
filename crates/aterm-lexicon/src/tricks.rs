@@ -208,6 +208,7 @@ pub fn row_line(row: &TrickRow) -> String {
 }
 
 /// `a,b,c`, or `-` for an empty list (so every field always has a value and a
+/// consumer can split on single spaces).
 fn push_surface_list(line: &mut String, surfaces: &[String]) {
     if surfaces.is_empty() {
         line.push('-');
@@ -275,6 +276,8 @@ struct TrickEntry {
     /// The role as authored (which list the surface sat in).
     role: TrickRole,
     /// The marks-required gate, as in the sparkle lexicon: every claiming surface folded marks
+    /// away into a bare-ASCII key, which unmarked typing spells as another word, so the key admits
+    /// only a token that itself carries folded-away marks.
     marks_required: bool,
     /// A one-character no-space surface; [`effective_role`] forces `needs_vocative` for it.
     single_cjk: bool,
@@ -282,7 +285,7 @@ struct TrickEntry {
     unglued: bool,
 }
 
-/// The role a lookup reports: the authored role with the lone-ideograph law applied. The lookup
+/// The role a lookup reports: the authored role with the lone-ideograph law applied.
 #[inline]
 const fn effective_role(entry: &TrickEntry) -> TrickRole {
     match entry.role {
@@ -302,7 +305,7 @@ const fn effective_role(entry: &TrickEntry) -> TrickRole {
 #[derive(Debug, Clone, Default)]
 pub struct TrickLexicon {
     table: FxHashMap<String, TrickEntry>,
-    /// Data problems found at load. Empty for well-formed data; the test
+    /// Data problems found at load.
     conflicts: Vec<String>,
 }
 
@@ -420,10 +423,11 @@ impl TrickLexicon {
     }
 }
 
-/// The shortest run the elongation fold treats as a held key. Two identical
+/// The shortest run the elongation fold treats as a held key.
 const ELONGATED_RUN: usize = 3;
 
 /// Characters of folded token the elongation fold will look at: the
+/// listener's token window, doubled for the folds that expand (`ß` → `ss`).
 const ELONGATION_WINDOW: usize = TrickLexicon::MAX_SURFACE_CHARS * 2;
 
 /// Length of the run of identical characters that starts at `at`.
@@ -440,6 +444,7 @@ fn run_len(chars: &[char], at: usize) -> usize {
 }
 
 /// Whether any run of identical characters reaches [`ELONGATED_RUN`] — the
+/// gate that keeps the retry off every ordinary miss.
 #[inline]
 fn has_elongated_run(chars: &[char]) -> bool {
     let mut at = 0usize;
@@ -454,6 +459,7 @@ fn has_elongated_run(chars: &[char]) -> bool {
 }
 
 /// `chars` with every run of [`ELONGATED_RUN`] or more cut down to `keep`;
+/// shorter runs are copied untouched.
 fn push_collapsed(chars: &[char], keep: usize, out: &mut String) {
     let mut at = 0usize;
     while let Some(&c) = chars.get(at) {
@@ -467,6 +473,7 @@ fn push_collapsed(chars: &[char], keep: usize, out: &mut String) {
 }
 
 /// The panic payload for an embedded file that fails to parse — unreachable
+/// for shipped data (the test suite parses it), composed without `format!`.
 fn embedded_parse_panic(e: &LexError) -> String {
     let mut msg = String::from("embedded tricks vocabulary must parse: ");
     msg.push_str(&DebugText(e).to_string());
@@ -474,6 +481,9 @@ fn embedded_parse_panic(e: &LexError) -> String {
 }
 
 /// Resolve the three raw arrays into listing rows: unknown trick ids and
+/// rows without a language are recorded and skipped, surfaces are trimmed
+/// and empties dropped, and the result is grouped by language (see
+/// [`TrickLexicon::all_rows`] for the order and why).
 fn ordered_rows(raw: RawTricks, conflicts: &mut Vec<String>) -> Vec<TrickRow> {
     let mut rows: Vec<TrickRow> = Vec::new();
     for r in raw.trick {
@@ -538,6 +548,8 @@ fn ordered_rows(raw: RawTricks, conflicts: &mut Vec<String>) -> Vec<TrickRow> {
 }
 
 /// Normalise one row (trim the language and every surface, drop empty
+/// surfaces) and stage it; a row with no language is recorded and skipped —
+/// the gate, the listing and the coverage pin all key on it.
 fn stage_row(rows: &mut Vec<TrickRow>, conflicts: &mut Vec<String>, mut row: TrickRow) {
     row.lang = row.lang.trim().to_string();
     if row.lang.is_empty() {
@@ -569,6 +581,7 @@ fn push_kind_label(msg: &mut String, kind: RowKind) {
 }
 
 /// Compile listing rows into the lookup table under the load laws (module
+/// docs).
 fn compile(rows: &[TrickRow], langs: &Langs, mut conflicts: Vec<String>) -> TrickLexicon {
     let mut table: FxHashMap<String, TrickEntry> = FxHashMap::default();
     for row in rows {
@@ -689,6 +702,7 @@ fn claim_surface(
 }
 
 /// `surface "<s>" (lang <l>) <what>` — composed without `format!` (see
+/// `DebugText`).
 fn push_surface_conflict(conflicts: &mut Vec<String>, surface: &str, lang: &str, what: &str) {
     let mut msg = String::from("surface ");
     msg.push_str(&DebugText(surface).to_string());

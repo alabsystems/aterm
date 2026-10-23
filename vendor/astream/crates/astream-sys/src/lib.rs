@@ -28,7 +28,12 @@
 //!   broker ends with, [`File::sync_all`] and [`File::sync_data`] (`F_FULLFSYNC` on
 //!   Apple, `fsync(2)` / `fdatasync(2)` on Linux), in every build. Debug assertions do
 //!   not weaken a full flush: Strict acknowledgements, durable heads and recovery
-//!   identity rely on the same persistence contract in a debug application.
+//!   identity rely on the same persistence contract in a debug application. Only a
+//!   TEST's process tree, which a test binary marks with [`TEST_PLAIN_FSYNC_ENV`] before
+//!   any test runs, takes a plain `fsync(2)` in a debug build on Apple: the same flush
+//!   at the same point, without the drain of the drive's cache, which only a power loss
+//!   shows and no test makes. No application sets the mark, and a release build never
+//!   reads it.
 //! - [`boot_session`]: THIS BOOT of the machine as the kernel names it, as 16 bytes.
 //!   Two readings are equal exactly when no boot came between them, which is the
 //!   question a log that trusts the page cache asks — "has the kernel holding my
@@ -64,6 +69,7 @@
 //! The crate root is `deny(unsafe_code)`, and exactly two modules re-permit it, for
 //! hand-declared FFI calls with a `// SAFETY:` note each. `apple`
 //! (`cfg(target_vendor = "apple")`): `fcntl(F_BARRIERFSYNC)` behind [`barrier_sync`],
+//! `fsync` behind [`full_sync`] in a test's debug process,
 //! `sysctlbyname("kern.bootsessionuuid")` behind [`boot_session`], `poll` behind
 //! `socket_hung_up`, and `signal(SIGHUP)` behind [`install_sighup_handler`]. `owner`
 //! (`cfg(unix)`): `geteuid` behind [`euid`] and [`owner_private`], and on Apple
@@ -111,6 +117,10 @@ macro_rules! apple_ffi {
     (barrier_fsync($fd:expr, $cmd:expr)) => {
         // SAFETY: `fd` is a valid open descriptor owned by `file` and `F_BARRIERFSYNC` takes no extra arguments.
         unsafe { fcntl($fd, $cmd) }
+    };
+    (fsync($fd:expr)) => {
+        // SAFETY: `fd` is a valid open descriptor owned by `file`; `fsync` takes it by value.
+        unsafe { fsync($fd) }
     };
     (sysctlbyname($name:expr, $oldp:expr, $oldlenp:expr, $newp:expr, $newlen:expr)) => {
         // SAFETY: NUL-terminated name, writable buffer, and length pointer are valid for the duration of the call.
@@ -278,21 +288,53 @@ pub const fn is_apple_barrier_refused_errno(errno: i32) -> bool {
     matches!(errno, 19 | 22 | 25 | 45)
 }
 
+/// The environment variable that marks a TEST's process tree: a test binary sets it to
+/// `1` before any test runs, and every process it starts inherits it. Such a process,
+/// built with debug assertions for an Apple target, takes a plain `fsync(2)` for
+/// [`full_sync`] and [`full_sync_data`] ([`test_plain_fsync`]). No application sets it,
+/// and a release build never reads it.
+pub const TEST_PLAIN_FSYNC_ENV: &str = "ASTREAM_TEST_PLAIN_FSYNC";
+
+/// Whether this process belongs to a test's process tree ([`TEST_PLAIN_FSYNC_ENV`] is
+/// `1`), read once. Always `false` in a release build and off Apple targets.
+#[must_use]
+pub fn test_plain_fsync() -> bool {
+    #[cfg(all(debug_assertions, target_vendor = "apple"))]
+    {
+        static MARKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *MARKED.get_or_init(|| std::env::var_os(TEST_PLAIN_FSYNC_ENV).is_some_and(|v| v == "1"))
+    }
+    #[cfg(not(all(debug_assertions, target_vendor = "apple")))]
+    {
+        false
+    }
+}
+
 /// Make everything written to `file` durable, its data and metadata: [`File::sync_all`]
-/// (`F_FULLFSYNC` on Apple), in every build.
+/// (`F_FULLFSYNC` on Apple), in every build, except a test's process tree in a debug
+/// build on Apple, which takes a plain `fsync(2)` ([`TEST_PLAIN_FSYNC_ENV`]).
 ///
 /// # Errors
 /// The flush's own error.
 pub fn full_sync(file: &File) -> io::Result<()> {
+    #[cfg(all(debug_assertions, target_vendor = "apple"))]
+    if test_plain_fsync() {
+        return apple::plain_fsync(file);
+    }
     file.sync_all()
 }
 
 /// [`full_sync`] for `file`'s data and the metadata a read of it needs:
-/// [`File::sync_data`] (`F_FULLFSYNC` on Apple, `fdatasync(2)` on Linux), in every build.
+/// [`File::sync_data`] (`F_FULLFSYNC` on Apple, `fdatasync(2)` on Linux), in every build,
+/// except a test's process tree as [`full_sync`] says.
 ///
 /// # Errors
 /// The flush's own error.
 pub fn full_sync_data(file: &File) -> io::Result<()> {
+    #[cfg(all(debug_assertions, target_vendor = "apple"))]
+    if test_plain_fsync() {
+        return apple::plain_fsync(file);
+    }
     file.sync_data()
 }
 

@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm machines scan`: Macs on the LAN, from Bonjour (`_ssh._tcp`, `_sftp-ssh._tcp`,
-//! `_rfb._tcp`) and an optional sweep of a subnet's port 22 (design §4.3).
-//!
-//! Bonjour comes from `/usr/bin/dns-sd`, which never exits on its own: each run is bounded
-//! by the port's deadline and kept to it ([`Cmd::until_deadline`]), so what it printed by
-//! then is the answer. A Mac advertises `_ssh._tcp` only when Remote Login was turned on in
-//! System Settings (design §1.11); the sweep finds the others.
-//!
-//! The fixtures in the tests are `dns-sd` output captured in the VM (macOS 27.0): this
-//! Mac's advertisement, the VM's own on two interfaces, and a service registered there
-//! for the capture, whose name has spaces, an accent, a curly apostrophe and parentheses.
+//! LAN discovery of Macs via Bonjour (`_ssh._tcp`, `_sftp-ssh._tcp`, `_rfb._tcp`) and port-22 sweep.
 
 use super::inventory::{Inventory, Paths};
 use super::ssh::{LOCAL_NETWORK_ROW, fan_out, is_local_address};
@@ -30,18 +20,13 @@ pub const SSH_SERVICE: &str = "_ssh._tcp";
 /// Screen Sharing's service type.
 pub const RFB_SERVICE: &str = "_rfb._tcp";
 
-/// The SFTP service type macOS's Remote Login advertises beside [`SSH_SERVICE`], under the
-/// same instance name (`/System/Library/LaunchDaemons/ssh.plist` lists both in its Bonjour
-/// key; measured in the VM): what tells a Mac from another host advertising `_ssh._tcp` (a
-/// Linux box's Avahi advertises that alone).
+/// SFTP service type macOS Remote Login advertises beside [`SSH_SERVICE`].
 pub const SFTP_SERVICE: &str = "_sftp-ssh._tcp";
 
-/// How long one `dns-sd -L` resolve runs. A resolve answers in milliseconds when the
-/// instance is there (measured in the VM: under 2 ms); this bounds one that is not.
+/// How long one `dns-sd -L` resolve runs.
 pub const RESOLVE_BUDGET: Duration = Duration::from_secs(2);
 
-/// Resolves run at once. Each `dns-sd -L` runs its whole budget (it never exits), so a lab
-/// of 65 Macs resolves in three rounds.
+/// Resolves run at once.
 const RESOLVE_PARALLEL: usize = 32;
 
 /// Apple's host-key scanner.
@@ -52,10 +37,8 @@ pub const WIDEST_PREFIX: u8 = 22;
 
 /// Connects a sweep has in flight at once.
 const KNOCK_PARALLEL: usize = 64;
-
 /// Bonjour's refusal of a process macOS's Local Network privacy has not allowed:
-/// `kDNSServiceErr_PolicyDenied` in `dns_sd.h`. Not measured here (an SSH session is exempt
-/// from Local Network privacy, so the VM cannot show it); read from Apple's header.
+/// `kDNSServiceErr_PolicyDenied` in `dns_sd.h`.
 const POLICY_DENIED: &str = "-65570";
 
 /// Where a row came from.
@@ -100,27 +83,16 @@ pub struct Instance {
 pub struct Browse {
     /// The Macs it found, one row per advertised host, sorted by name.
     pub found: Vec<Found>,
-    /// Advertised instances no resolve answered for within [`RESOLVE_BUDGET`]: seen, but
-    /// not located. Never dropped silently.
+    /// Advertised instances no resolve answered for within [`RESOLVE_BUDGET`].
     pub unresolved: Vec<String>,
-    /// Why the `_sftp-ssh._tcp` browse failed, when it did: then no row's `sftp` says
-    /// anything, and `enroll --found` takes only the Macs Screen Sharing marks. The other two
-    /// browses' failures fail the whole browse, as before.
+    /// Why the `_sftp-ssh._tcp` browse failed, when it did.
     pub sftp_failed: Option<String>,
 }
 
-/// Browse `_ssh._tcp`, `_sftp-ssh._tcp` and `_rfb._tcp` for `wait`, then resolve each
-/// instance.
-///
-/// A Mac that advertises Remote Login and Screen Sharing is one row (`ssh` and
-/// `screen_sharing`); one that advertises only Screen Sharing is a row with `ssh: false`
-/// (Remote Login off, or turned on without the Sharing pane, which does not advertise it).
-/// `sftp` marks a Remote Login row whose instance also advertises `_sftp-ssh._tcp`, as
-/// macOS's does; it needs no resolve of its own.
+/// Browse `_ssh._tcp`, `_sftp-ssh._tcp` and `_rfb._tcp` for `wait`, then resolve each instance.
 ///
 /// # Errors
-/// One line when `dns-sd` could not run, or quit on its own with an error (Bonjour's
-/// refusal of this process names Local Network privacy).
+/// One line when `dns-sd` could not run, or quit on its own with an error.
 pub fn browse(sys: &dyn System, wait: Duration) -> Result<Browse, String> {
     let services = [SSH_SERVICE, RFB_SERVICE, SFTP_SERVICE];
     let mut seen = fan_out(&services, services.len(), |service| {
@@ -129,8 +101,6 @@ pub fn browse(sys: &dyn System, wait: Duration) -> Result<Browse, String> {
     .into_iter();
     let ssh = seen.next().unwrap_or_else(|| Ok(Vec::new()))?;
     let rfb = seen.next().unwrap_or_else(|| Ok(Vec::new()))?;
-    // A browse aterm's Info.plist did not declare (an older build's) may be refused by Local
-    // Network privacy on its own: `scan` goes on without it.
     let (sftp, sftp_failed) = match seen.next().unwrap_or_else(|| Ok(Vec::new())) {
         Ok(sftp) => (sftp, None),
         Err(why) => (Vec::new(), Some(why)),
@@ -167,8 +137,6 @@ pub fn browse(sys: &dyn System, wait: Duration) -> Result<Browse, String> {
         }
     }
 
-    // A Mac's two advertisements share its Computer Name; only a Screen-Sharing-only one
-    // needs a resolve of its own.
     let mut lone: Vec<&Instance> = Vec::new();
     for inst in &rfb {
         let mut matched = false;
@@ -222,8 +190,6 @@ fn browse_one(sys: &dyn System, service: &str, wait: Duration) -> Result<Vec<Ins
         .map_err(|e| format!("dns-sd -B {service}: {e}"))?;
     let text = ran.out();
     let said = format!("{text}\n{}", ran.err());
-    // dns-sd's own error line, never a row: an advertised name is any text another device
-    // chose, `-65570` included.
     let denied = said
         .lines()
         .filter(|l| !is_browse_row(l))
@@ -234,19 +200,13 @@ fn browse_one(sys: &dyn System, service: &str, wait: Duration) -> Result<Vec<Ins
              {LOCAL_NETWORK_ROW}"
         ));
     }
-    // Killed at the deadline (`None`) is how a browse ends; an exit of its own is a failure.
     if ran.status.is_some_and(|s| s != 0) {
         return Err(format!("dns-sd -B {service}: {}", ran.describe()));
     }
     Ok(parse_browse(&text, service))
 }
 
-/// The instances a `dns-sd -B` transcript leaves advertised, in the order first seen.
-///
-/// Each row is `Timestamp A/R Flags if Domain Service-Type Instance-Name`; the instance name
-/// is the rest of the line after the sixth column, as advertised (spaces, `’`, any Unicode).
-/// `Add` and `Rmv` are per interface, so an instance is kept while any interface still has
-/// it. Header lines, and rows for another service type, are not rows.
+/// Parse advertised instances from a `dns-sd -B` transcript in first-seen order.
 #[must_use]
 pub fn parse_browse(text: &str, service: &str) -> Vec<Instance> {
     let want = format!("{service}.");
@@ -308,9 +268,7 @@ fn columns(line: &str, n: usize) -> Option<(Vec<&str>, &str)> {
     Some((cols, rest.trim_start()))
 }
 
-/// Resolve one instance: `dns-sd -L <name> <service> local.`, kept to `budget`. The
-/// `(host, port)` targets it answered, without the trailing dot, each once; none when it
-/// did not answer in time or could not run.
+/// Resolve one instance via `dns-sd -L <name> <service> local.` within `budget`.
 #[must_use]
 pub fn resolve(
     sys: &dyn System,
@@ -327,8 +285,7 @@ pub fn resolve(
         .unwrap_or_default()
 }
 
-/// The targets in a `dns-sd -L` transcript: each `… can be reached at <host>.:<port>
-/// (interface <n>)` line, once per distinct target.
+/// Parse distinct `(host, port)` targets from a `dns-sd -L` transcript.
 #[must_use]
 pub fn parse_resolve(text: &str) -> Vec<(String, u16)> {
     const REACHED: &str = " can be reached at ";
@@ -398,8 +355,7 @@ impl Knock for TcpKnock {
     }
 }
 
-/// The addresses of `cidr` (`a.b.c.d/n`, IPv4, `n` from [`WIDEST_PREFIX`] to 32): every
-/// host address, without the network and broadcast addresses of a /30 or wider.
+/// Host IPv4 addresses of `cidr` (`a.b.c.d/n`, `n` from [`WIDEST_PREFIX`] to 32).
 ///
 /// # Errors
 /// One line: not an IPv4 CIDR, or wider than a /22.
@@ -432,13 +388,10 @@ pub fn hosts_of(cidr: &str) -> Result<Vec<Ipv4Addr>, String> {
     Ok((first..=last).map(Ipv4Addr::from).collect())
 }
 
-/// Sweep `cidr`'s port 22 with `knock`, `timeout` per address, and return the addresses
-/// that accepted, in address order.
+/// Sweep `cidr`'s port 22 with `knock` and return the addresses that accepted.
 ///
 /// # Errors
-/// One line: a bad or too wide `cidr`, or every address of a local subnet answering
-/// `No route to host`, which is Local Network privacy refusing this process, not a
-/// subnet of Macs that are all missing.
+/// One line: a bad or too wide `cidr`, or every address of a local subnet answering `NoRoute`.
 pub fn subnet(knock: &dyn Knock, cidr: &str, timeout: Duration) -> Result<Vec<Found>, String> {
     let hosts = hosts_of(cidr)?;
     let answers = fan_out(&hosts, KNOCK_PARALLEL, |ip| {
@@ -468,16 +421,7 @@ pub fn subnet(knock: &dyn Knock, cidr: &str, timeout: Duration) -> Result<Vec<Fo
         .collect())
 }
 
-/// Which inventory host `found` is, by its SSH host key: `Value(name)` when the ed25519 key
-/// it presents is the one `known_hosts` pins under that host's UUID (`enrolled <name>`),
-/// `Absent` when its key matches no pinned one (`new`), `Unusable` when its key could not be
-/// read (no Remote Login, no answer). A name or address alone never marks a Mac enrolled:
-/// another Mac can take either.
-///
-/// The mark is a hint, not a proof. `ssh-keyscan` prints the public key a host offers and
-/// aborts the key exchange before the host signs anything, so a device that copied an
-/// enrolled Mac's public key would show as that Mac here. Every connection the controller
-/// makes (`ssh` under `StrictHostKeyChecking=yes`) checks the signature and refuses it.
+/// Match `found`'s offered SSH host key against `known_hosts` and the inventory.
 #[must_use]
 pub fn pinned_host(
     sys: &dyn System,
@@ -521,8 +465,7 @@ pub fn offered_keys(sys: &dyn System, found: &Found) -> Result<Vec<String>, Stri
     Ok(offered)
 }
 
-/// Which inventory host pins one of the `offered` key blobs: `Value(name)`, `Absent` for
-/// none, `Unusable` when `known_hosts` cannot be read.
+/// Which inventory host pins one of the `offered` key blobs.
 #[must_use]
 pub fn pinned_name(
     sys: &dyn System,
@@ -656,9 +599,7 @@ DATE: ---Fri 16 Oct 2026---
     const RESOLVE_NOBODY: &str = "";
 
     /// A later capture in the VM (macOS 27.0, then named lab-02), while `dns-sd -R spark-1
-    /// _ssh._tcp local. 22` advertised a host with Remote Login alone, as a Linux box's Avahi
-    /// does: `dns-sd -B _ssh._tcp local.`, then `_sftp-ssh._tcp` and `_rfb._tcp`. This Mac
-    /// (m14) shows on interface 5 in the first two.
+    /// _ssh._tcp local.
     const BROWSE_SSH_LAB: &str = "Browsing for _ssh._tcp.local.
 DATE: ---Sun 18 Oct 2026---
  6:21:48.496  ...STARTING...
@@ -748,7 +689,6 @@ DATE: ---Sun 18 Oct 2026---
                 "Managed\u{2019}s Virtual Machine"
             ]
         );
-        // Withdrawn on one interface only, it stays on the other.
         let half = BROWSE_SSH_ADD_RMV
             .lines()
             .filter(|l| !l.contains("Rmv        0   5"))
@@ -837,8 +777,6 @@ DATE: ---Sun 18 Oct 2026---
             ]
         );
         assert!(got.unresolved.is_empty());
-        // The three browses and one resolve per Remote Login Mac; Screen Sharing and SFTP on
-        // the same Mac need none.
         let calls = fake.calls();
         assert_eq!(calls.len(), 5, "{calls:?}");
         assert!(
@@ -848,7 +786,7 @@ DATE: ---Sun 18 Oct 2026---
         );
     }
 
-    /// The fake answering the lab-02 session's captures.
+    /// Fake system fixture for the lab-02 capture session.
     pub(crate) fn lab_session() -> Fake {
         lab_session_with(killed(BROWSE_SFTP_LAB))
     }
@@ -961,7 +899,6 @@ DATE: ---Sun 18 Oct 2026---
         denied.on(&browse_key(SFTP_SERVICE), killed(""));
         let err = browse(&denied, Duration::from_secs(1)).unwrap_err();
         assert!(err.contains("Local Network"), "{err}");
-        // A Mac named with that number is a Mac, not a refusal.
         let named = Fake::root();
         named.on(
             &browse_key(SSH_SERVICE),
@@ -977,7 +914,7 @@ DATE: ---Sun 18 Oct 2026---
     }
 
     /// Every accepted CIDR's endpoints are representable, including the
-    /// ranges ending at IPv4's maximum. No socket or Knock is involved.
+    /// ranges ending at IPv4's maximum.
     #[test]
     fn a_subnet_ending_at_ipv4_max_never_overflows_its_endpoint() {
         let ordinary = hosts_of("10.0.0.0/24").expect("ordinary /24");
@@ -989,9 +926,6 @@ DATE: ---Sun 18 Oct 2026---
             [Ipv4Addr::new(10, 0, 0, 7)]
         );
 
-        // Observe both checked-build panics before the aggregate assertion.
-        // Unchecked wrapping happens to give the right endpoints; that is
-        // not a reason for a valid argument to panic in a checked build.
         let observed: Vec<_> = [
             (
                 "255.255.255.0/24",
@@ -1081,7 +1015,6 @@ DATE: ---Sun 18 Oct 2026---
         let knock = Scripted(BTreeMap::new(), Answer::NoRoute);
         let err = subnet(&knock, "192.168.64.0/28", Duration::from_millis(1)).unwrap_err();
         assert!(err.starts_with(LOCAL_NETWORK_ROW), "{err}");
-        // One host answering at all means the process can reach the LAN.
         let knock = Scripted(
             BTreeMap::from([(Ipv4Addr::new(192, 168, 64, 3), Answer::Closed)]),
             Answer::NoRoute,
@@ -1156,7 +1089,6 @@ manageds-virtual-machine.local ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHv2Xf9kgkNkp
                 .as_bytes(),
         );
         assert_eq!(pinned_host(&fake, &paths, &inv, &vm_row()), Read::Absent);
-        // No known_hosts yet: nothing is pinned, so everything is new.
         let fresh = Fake::root();
         fresh.on(KEYSCAN_KEY, Ran::ok(KEYSCAN_VM));
         assert_eq!(pinned_host(&fresh, &paths, &inv, &vm_row()), Read::Absent);
@@ -1166,7 +1098,6 @@ manageds-virtual-machine.local ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHv2Xf9kgkNkp
     fn a_mac_that_shows_no_key_is_unknown_never_new() {
         let (paths, inv) = lab();
         let fake = Fake::root();
-        // Measured for a silent address: nothing printed, exit 1.
         fake.on(KEYSCAN_KEY, Ran::exit(1, ""));
         assert!(matches!(
             pinned_host(&fake, &paths, &inv, &vm_row()),

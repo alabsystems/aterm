@@ -288,6 +288,7 @@ impl Grid {
     ///
     /// [`Live`]: VisibleRowView::Live
     /// [`History`]: VisibleRowView::History
+    /// [`Empty`]: VisibleRowView::Empty
     #[must_use]
     #[inline]
     pub fn visible_row_view(&self, visible_row: u16) -> VisibleRowView<'_> {

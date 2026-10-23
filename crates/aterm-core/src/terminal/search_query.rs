@@ -16,8 +16,10 @@ use crate::search::{
 #[derive(Clone, Copy, Debug)]
 pub struct WrapFrame {
     /// Display columns one grid row holds — the width each continued row was
+    /// padded out to before the join.
     cols: usize,
     /// The index joins soft-wrap runs ([`super::SearchLayout::Logical`]); an
+    /// index of one line per row needs no re-expression.
     joined: bool,
     /// [`WrapFrame::to_logical`] of the caller's anchor, when it has one.
     logical_anchor: Option<(usize, usize)>,
@@ -66,6 +68,7 @@ impl WrapFrame {
     }
 
     /// Carry a physical `(row, col)` point into the joined line's columns,
+    /// given the row that line starts on.
     #[inline]
     const fn to_logical(cols: usize, origin: usize, row: usize, col: usize) -> (usize, usize) {
         (
@@ -184,6 +187,8 @@ pub fn query_search_index(
 }
 
 /// Anchored point-match selection over ALREADY-COMPUTED batch results — split
+/// out of [`query_search_index`] verbatim so the narrowing path shares the
+/// exact anchored/point/cap-edge policy instead of re-implementing it.
 #[allow(
     clippy::too_many_arguments,
     reason = "verbatim split of query_search_index's policy tail; every flag is load-bearing"
@@ -263,6 +268,8 @@ fn select_point_match(
 struct NarrowFrame {
     query: String,
     /// Ascending retained lines whose folded text contains the folded query —
+    /// absolute rows, held as `u32` offsets from the frame's own base, so a
+    /// frame costs four bytes a line past row `u32::MAX` too.
     occurrence_lines: LineFrame,
 }
 
@@ -274,7 +281,7 @@ pub struct NarrowStack {
     frames: Vec<NarrowFrame>,
 }
 
-/// Retained-entry budget per stack (~1.6 MB of `u32` offsets at the bound). The
+/// Retained-entry budget per stack (~1.6 MB of `u32` offsets at the bound).
 const NARROW_STACK_MAX_ENTRIES: usize = 4 * MAX_SEARCH_MATCHES;
 
 #[cfg(any(test, debug_assertions))]
@@ -425,6 +432,7 @@ mod tests {
     }
 
     /// `query` through the narrowing layer and the batch layer: (narrowed
+    /// results, batch results, whether it was served off a frame).
     fn step(
         index: &TerminalSearch,
         stack: &mut Option<NarrowStack>,
@@ -466,6 +474,9 @@ mod tests {
     }
 
     /// A case-sensitive frame holds only the lines the exact prefix occurs on,
+    /// so a folded query grown from it must not be verified over it: the stack
+    /// the holder hands back for the index generation is read only at its own
+    /// case sensitivity.
     #[test]
     fn a_narrowing_stack_is_read_only_at_its_own_case_sensitivity() {
         let index = index(&["Find one", "find two", "FIND three", "nothing"]);

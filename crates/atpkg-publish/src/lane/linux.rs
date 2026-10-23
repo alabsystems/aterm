@@ -1,17 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Linux lane: for every pinned plain program whose published manifest lacks a row
-//! for a Linux target this builder can produce, build that row at the exact pinned commit
-//! and extend the published manifest with it (systemd user timer, hourly). Like the Apple
-//! lane it runs the snapshot binary, so nothing of the aterm tree is fetched or built on
-//! the box that holds the machine key.
-//!
-//! A builder produces its own target, and another only with that target's std in the
-//! Trust seal and a cross linker ([`Builder`]). With the machine key and the channel token
-//! a ready manifest passes the signing gates (`Run::signable`), is signed, uploaded to both
-//! owners and followed by an index with an empty delta; without them the lane writes
-//! `READY.md`, the ceremony a rostered machine runs.
+//! Linux build and publication lane ([`Builder`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -48,13 +38,10 @@ pub struct Options {
 }
 
 impl Options {
-    /// The run for `host`, serving `requested` (default: every Linux target the client
-    /// ships, derived so a new Linux target arrives by itself).
+    /// The run for `host`, serving `requested`.
     ///
     /// # Errors
-    ///
-    /// A refusal on a host that is not Linux; a usage error for a requested target that
-    /// is not Linux.
+    /// Refused on non-Linux hosts; usage error for non-Linux targets.
     pub fn new(_ctx: &Ctx, host: Triple, dry_run: bool, requested: &[Triple]) -> Result<Self> {
         if host.os() != Os::Linux {
             return Err(Error::refused(format!(
@@ -84,14 +71,12 @@ pub trait Builder {
     /// Whether it can build `t` (not its host), else why not.
     ///
     /// # Errors
-    ///
     /// The reason, for the table and `READY.md`.
     fn can_build(&self, t: Triple) -> std::result::Result<(), String>;
 
     /// The build environment a cross target needs (cargo's own linker variable).
     ///
     /// # Errors
-    ///
     /// The reason it vanished since [`Builder::can_build`].
     fn env_for(&self, t: Triple) -> std::result::Result<Vec<(String, String)>, String>;
 }
@@ -111,18 +96,12 @@ pub struct Deps<'a> {
 /// The switch from the trust checkout (`$HOME/trust`) — what the packs read.
 ///
 /// # Errors
-///
 /// What the switch answers.
 pub fn live_switch(ctx: &Ctx) -> Result<Switch> {
     lineage_switch::read(ctx, &lineage_switch::default_trust_repo(ctx))
 }
 
-/// The production builder: a cross target needs its std in the store's Trust seal
-/// (`trustc --print target-libdir --target <t>` holding a `libcore-*.rlib`) and a cross
-/// linker (`<arch>-linux-gnu-gcc`, else `-cc`, on PATH), and every pack needs the `zstd`
-/// CLI on PATH ([`tarwrite::COMPRESSOR`]). All three are probed, not assumed: the failure
-/// they prevent is a pack that dies deep inside a build and latches a program with
-/// nothing wrong with it. Fail-closed: anything unread is "this box cannot".
+/// Production Linux builder ([`tarwrite::COMPRESSOR`]).
 #[derive(Debug)]
 pub struct TrustBuilder {
     trustc: PathBuf,
@@ -230,9 +209,7 @@ impl RowState {
     }
 }
 
-/// A row's state — pure. The order is the precedence: a latch outranks every quieter
-/// reading of the same row set, because blocked and unbuildable leave identical holes in a
-/// manifest, and reading the first as the second reports a failed pack as a clean publish.
+/// A row's state — pure.
 #[must_use]
 pub fn row_state(published: bool, staged: bool, latched: bool, buildable: bool) -> RowState {
     if published {
@@ -253,11 +230,9 @@ pub fn row_state(published: bool, staged: bool, latched: bool, buildable: bool) 
 pub enum Class {
     /// Built here.
     Plain,
-    /// A sysroot bundle: the bundle lane's, which the agent cutting it runs on a
-    /// release-credential machine; never packed here.
+    /// A sysroot bundle.
     Bundle,
-    /// Vendor-direct (`atpkg::vendor_direct::is_vendor`): a head pin of it is carried until
-    /// retired; no lane packs it.
+    /// Vendor-direct (`atpkg::vendor_direct::is_vendor`).
     Vendor,
     /// Not a [`crate::programs::PROGRAMS`] row.
     Unknown,
@@ -271,8 +246,6 @@ impl Class {
         match def.map(|d| d.shape) {
             Some(Shape::Plain { .. }) => Self::Plain,
             Some(Shape::Bundle(_)) => Self::Bundle,
-            // A package row's program is an ALab-built agent program, vendor-direct (above)
-            // wherever ALab does not build it, and Linux is such a target.
             Some(Shape::Package(_)) => Self::Vendor,
             None => Self::Unknown,
         }
@@ -330,8 +303,7 @@ pub enum Decision {
     Error(String),
     /// Every served row is published.
     Ok,
-    /// A sysroot bundle: the bundle lane's, which the agent cutting it runs on a
-    /// release-credential machine; never packed here.
+    /// A sysroot bundle.
     ManualBundle,
     /// Vendor-direct: nothing to do.
     Vendor,
@@ -412,10 +384,7 @@ pub fn decide(p: &Program, holds: &Holds) -> Decision {
     Decision::Partial
 }
 
-/// Narrow `can` to the targets that resolve every program to the same build as
-/// `reference`: one manifest cannot carry rows for two builds. Answers the kept targets
-/// and each dropped one with why — a channel fact, never a builder fault, so it costs the
-/// run a target and never the row it already ships.
+/// Narrow `can` to the targets that resolve every program to the same build as `reference`.
 #[must_use]
 pub fn narrow(
     channel: &atpkg::Channel,
@@ -465,8 +434,7 @@ pub struct Outcome {
     pub ready: Vec<String>,
     /// Programs held by their group.
     pub held: Vec<String>,
-    /// Programs with staged rows that cannot be signed this run: their published manifest
-    /// did not verify.
+    /// Programs with staged rows that cannot be signed this run.
     pub unsignable: Vec<String>,
     /// Programs signed and uploaded this run.
     pub signed: Vec<String>,
@@ -477,9 +445,7 @@ pub struct Outcome {
 /// One run of the Linux lane.
 ///
 /// # Errors
-///
-/// A refusal for a downgrade, a refused signing step, or a run that finished with
-/// BLOCKED/ERROR rows; a could-not-run when the channel head cannot be read.
+/// Refused on downgrade, signing failure, or BLOCKED/ERROR rows.
 pub fn run(ctx: &Ctx, opts: &Options, deps: &Deps<'_>, tx: &Transcript) -> Result<Outcome> {
     let state = LaneState::of(LaneKind::Linux, &ctx.state_dir);
     state.ensure()?;
@@ -549,9 +515,6 @@ impl Run<'_> {
             std::process::id(),
             if opts.dry_run { " (DRY_RUN)" } else { "" }
         ));
-        // A real run reads, clones and fetches the private staging repos as the staging
-        // identity's token: without it gh would fall back to an ambient login, and a box
-        // with none would latch every program on its clone.
         if !opts.dry_run && !std::fs::metadata(&ctx.tokens.staging).is_ok_and(|m| m.len() > 0) {
             return Err(Error::cannot_run(format!(
                 "staging token file missing/empty: {} — the lane reads the private staging \
@@ -559,7 +522,6 @@ impl Run<'_> {
                 ctx.shown(&ctx.tokens.staging)
             )));
         }
-        // --- which of the served targets this builder can produce ---
         let mut can = Vec::new();
         let mut cannot: Vec<(Triple, String)> = Vec::new();
         for t in &opts.triples {
@@ -594,14 +556,12 @@ impl Run<'_> {
             )));
         }
 
-        // --- the newest index the fleet can see, verified ---
         let work = self.state.root.join("work-atpkg");
         let _ = std::fs::remove_dir_all(&work);
         std::fs::create_dir_all(&work)
             .map_err(|e| Error::io(format!("mkdir {}", work.display()), &e))?;
         let slug = ctx.index_slug();
         let (n, head) = quad::fetch_head(ctx, &slug, &work.join("head"))?;
-        // Whatever this lane signs is verified under the generation this head elects.
         crate::artifact::sign::elect_from_head(ctx, &head);
         self.state.check_index(n)?;
         self.tx.say(format!(
@@ -629,7 +589,6 @@ impl Run<'_> {
         self.state.check_pins(&can, &pins, n, self.tx)?;
         let groups = super::hold::groups_of(&head.index, pins.keys().map(String::as_str))?;
 
-        // --- fetch every pinned manifest; classify ---
         let staged_dir = self.state.root.join(format!("staged-index-{n}"));
         let mut programs: Vec<Program> = Vec::new();
         let mut detail: BTreeMap<String, Detail> = BTreeMap::new();
@@ -699,9 +658,6 @@ impl Run<'_> {
             programs.push(p);
             detail.insert(name, d);
         }
-        // A group is held per target when a member that is not plain still lacks that
-        // target's row: a partial tuple aborts the group on that target's clients, where no
-        // rows at all is a clean skip.
         let mut holds = Holds::new();
         for p in &programs {
             if let (Some(g), true) = (&p.group, p.class != Class::Plain) {
@@ -738,7 +694,6 @@ impl Run<'_> {
             return Ok(outcome);
         }
 
-        // --- build and stage ---
         for &i in &build_list {
             let p = &mut programs[i];
             let published = detail.get(&p.name).and_then(|d| d.published.clone());
@@ -747,8 +702,6 @@ impl Run<'_> {
             }
         }
 
-        // A member whose row for a target is neither published nor staged holds its group
-        // there: a member blocked mid-build must not let its siblings publish a partial tuple.
         for p in &programs {
             let Some(g) = &p.group else { continue };
             let staged_rows = self.staged_rows(&staged_dir, &p.name, p.build);
@@ -758,10 +711,6 @@ impl Run<'_> {
                 }
             }
         }
-        // READY/HOLD partition of everything staged (this run or earlier): one file carries
-        // every new row and one signature covers it, so a held row holds all of them. A
-        // program whose published manifest did not verify this run is in neither: nothing
-        // proves the staged merge still extends what is published.
         let mut ready: Vec<(&Program, Vec<Triple>)> = Vec::new();
         let mut held: Vec<(&Program, Vec<Triple>)> = Vec::new();
         let mut signed_earlier: Vec<&Program> = Vec::new();
@@ -788,7 +737,6 @@ impl Run<'_> {
                 .filter(|t| opts.triples.contains(t) && !d.published_rows.contains(t))
                 .collect();
             if new.is_empty() {
-                // Signed earlier only when the staging owner serves exactly what this lane
                 // signed: a manifest another machine extended since is not this lane's.
                 if staged.with_extension("toml.sig").exists()
                     && same_bytes(&staged, d.published.as_deref())
@@ -862,8 +810,6 @@ impl Run<'_> {
                     return Err(e);
                 }
             }
-            // Every signature is verified through the client's chain before any upload: a
-            // pair a client refuses must never replace one it accepts.
             for (p, _) in &ready {
                 if let Err(e) = self.sign_verified(&key, p, &head, &staged_dir) {
                     let _ = std::fs::remove_file(staged_dir.join("READY.md"));
@@ -970,8 +916,7 @@ impl Run<'_> {
         Ok(outcome)
     }
 
-    /// The targets this lane staged for `name` `build` (its own unsigned manifest, read
-    /// into the client's type); none when there is no staged manifest.
+    /// The targets this lane staged for `name` `build`; none when there is no staged manifest.
     fn staged_rows(&self, staged_dir: &Path, name: &str, build: Build) -> BTreeSet<Triple> {
         let path = staged_manifest(staged_dir, name, build);
         if !path.exists() {
@@ -1069,8 +1014,7 @@ impl Run<'_> {
         self.failures = true;
     }
 
-    /// Clone, resolve, check out and pack every absent target of `p`, chaining each merge
-    /// onto the last so one manifest carries every row. Whether a row landed this run.
+    /// Build and pack every absent target of `p`, chaining each merge onto the last.
     fn stage(
         &mut self,
         p: &mut Program,
@@ -1210,7 +1154,6 @@ impl Run<'_> {
                 .map_err(|e| Error::io(format!("stage {}", staged.display()), &e))?;
             std::fs::copy(&outcome.manifest, &base)
                 .map_err(|e| Error::io(format!("copy {}", base.display()), &e))?;
-            // A signature from an earlier run covers bytes this row just changed.
             let _ = std::fs::remove_file(staged.with_extension("toml.sig"));
             let _ = std::fs::remove_dir_all(&out);
             p.rows.insert(t, RowState::Staged);
@@ -1226,12 +1169,7 @@ impl Run<'_> {
         Ok(any)
     }
 
-    /// The gates a ready manifest passes before the key touches it: both owners' published
-    /// bytes, fetched again now and verified, are each an exact byte-prefix of the staged
-    /// merge (the clobbering upload replaces both, and a manifest read hours ago may since
-    /// carry another machine's row); every new row's tarball is staged; and a new row
-    /// packed by a compiler with no lineage receipt is signed only while the live switch
-    /// still reads dormant (asked once a run; the base's rows were judged when signed).
+    /// The gates a ready manifest passes before the key touches it.
     fn signable(
         &self,
         p: &Program,
@@ -1302,8 +1240,7 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// The two owners a signed manifest is uploaded to, each with the host that speaks for
-    /// it.
+    /// The two owners a signed manifest is uploaded to, each with the host that speaks for it.
     fn owners(&self, p: &Program) -> [(Owner, Slug); 2] {
         [
             (Owner::Staging, self.ctx.staging_slug(&p.repo)),
@@ -1311,8 +1248,7 @@ impl Run<'_> {
         ]
     }
 
-    /// `p`'s manifest as `slug` publishes it now, verified under the head's roster: its
-    /// bytes and the client's reading of them.
+    /// `p`'s manifest as `slug` publishes it now, verified under the head's roster.
     fn published_now(
         &self,
         p: &Program,
@@ -1343,9 +1279,7 @@ impl Run<'_> {
         }
     }
 
-    /// Sign the staged manifest and verify the pair through the client's own chain (the
-    /// head's roster, revocation first) as the program and build it claims to be; a pair
-    /// that does not verify loses its signature.
+    /// Sign the staged manifest and verify the pair against the channel head's roster.
     fn sign_verified(
         &self,
         key: &crate::identity::MachineKey,
@@ -1404,10 +1338,7 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// An earlier run signed and uploaded `p` to staging; the public owner must serve the
-    /// same bytes before the follow-up index pins them there. A public copy that is a
-    /// byte-prefix of them (that run's public upload failed) receives the signed pair;
-    /// anything else refuses the index.
+    /// An earlier run signed and uploaded `p` to staging.
     fn converge_public(
         &self,
         p: &Program,
@@ -1466,8 +1397,7 @@ impl Run<'_> {
     }
 }
 
-/// `bytes` and `signature` verified through the client's chain (the head's roster,
-/// revocation first) as `p`'s program and build — never another's.
+/// Verify `bytes` and `signature` through the client's chain.
 fn verify_as(
     head: &VerifiedQuad,
     bytes: &[u8],
@@ -1577,8 +1507,7 @@ fn render(p: &Program, d: &Decision, staged_name: &str) -> String {
     }
 }
 
-/// The pinned programs in table order: [`crate::programs::PROGRAMS`] first, then any the
-/// table does not know, by name.
+/// The pinned programs in table order: [`crate::programs::PROGRAMS`] first.
 fn ordered(pins: &BTreeMap<String, Build>) -> Vec<(String, Build)> {
     let mut out: Vec<(String, Build)> = programs::PROGRAMS
         .iter()

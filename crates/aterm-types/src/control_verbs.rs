@@ -412,23 +412,45 @@ macro_rules! aux_targets {
 aux_targets! {
     front:
         /// The frontmost terminal window (the plain `window`/`chrome`
+        /// capture).
         Front = "front" | "window" | "terminal";
     opens:
-        /// The native Settings tab. `controls prefs` keeps its historical
+        /// The native Settings tab.
         Prefs = "prefs" | "preferences" | "settings",
         /// The native Settings `/about` route, projected from its compiled
+        /// semantic frame while that route is open.
         About = "about",
         /// The in-window command palette, an own-rendered card on the front
+        /// window; `controls menu` lists its (filtered) command rows.
         Menu = "menu" | "palette",
         /// The in-grid session context menu (the tab menu); `controls
+        /// tab-menu` lists the open card's rows and cursor, and a closed one
+        /// is `tab-menu open=false`.
         TabMenu = "tab-menu",
         /// The Autopilot menu, the chip's card over the pane; `controls
+        /// autopilot-menu` lists the open card's rows by their stable keys
+        /// (`autopilot-menu/mode/<word>`, `autopilot-menu/land-in/<minutes>`,
+        /// `autopilot-menu/land-at`, `autopilot-menu/land-cancel`,
+        /// `autopilot-menu/settings`), and `open autopilot-menu` opens it
+        /// from the front window's focused session's chip.
         AutopilotMenu = "autopilot-menu",
         /// A fact's menu, the same card hung from a fact of Claude Code's
+        /// composer rule (the usage's: its Traffic card, a graph over time);
+        /// `open fact-menu <model|effort|path|branch|context|usage>` opens the front
+        /// window's focused session's, `open fact-menu close`
+        /// closes it, and `controls fact-menu` lists its rows by their stable
+        /// keys (`fact-menu/<fact>/<act>`), its first line naming the fact.
         FactMenu = "fact-menu",
         /// The Overview (`docs/DESIGN-owner-surfaces-2026-10-16.md` §6, was
+        /// the Connection Map); `open overview` raises it on the front window,
+        /// `controls overview` reads the open card's groups, chips and manages
+        /// lines (where this aterm's fabric is on, its "On the fabric" group
+        /// too: `overview fabric chip node= sid= need= age= mark= older=`
+        /// lines, read off the fabric's log and never acted on), and every
+        /// wire read of it is Owner-gated.
         Overview = "overview" | "connections",
         /// The native Settings `/updates` route, projected from its compiled
+        /// semantic frame while that route is open.
         Update = "update" | "software-update";
     gestures: ;
 }
@@ -667,6 +689,7 @@ use Target::{App, Meta, Session};
 use When::{AnyOf, Args, AtWord, Flag, Word};
 
 /// A `const`-friendly [`VerbSpec`] constructor for a normally-`Scoped` verb (keeps
+/// the table terse; the vast majority of rows).
 const fn v(
     name: &'static str,
     op: OpClass,
@@ -717,6 +740,7 @@ impl VerbSpec {
 }
 
 /// A driven write's class: the halt, the unread-input gate, the self-feed floor,
+/// the drive lease, the front-surface fence and the licence fence all ask it.
 const DRIVEN: Input = Input::PTY
     .with(Input::WRITES)
     .with(Input::FLOORED)
@@ -725,6 +749,7 @@ const DRIVEN: Input = Input::PTY
     .with(Input::FENCES);
 
 /// A [`Form`] matching `when` that differs from its row in nothing yet; the chained
+/// setters below state how it differs.
 const fn form(when: When) -> Form {
     Form {
         when,
@@ -782,6 +807,7 @@ impl Form {
 }
 
 /// A [`VerbSpec`] constructor with an explicit non-`Scoped` [`Access`] gate, so the dispatch
+/// reads the exception from the table instead of hardcoding a verb list.
 const fn va(
     name: &'static str,
     op: OpClass,
@@ -1562,9 +1588,11 @@ pub const VERBS: &[VerbSpec] = &[
         App,
         "the front window's native UI (toolbar + menu bar) and its presence line",
         "Read-only. Ends with `presence rim=<none|stuck|decide|yours> pressing=<@sid|-> \
-         pill=\"<sentence>\"` (the window's needs border and titlebar pill: `stuck`/`decide` from \
-         the most pressing session's `status needs=`, `yours` under a front person hold, `\"\"` \
-         with no border or `[presence] rim` off; escapes `\"` and `\\`). Off macOS there is no \
+         pill=\"<sentence>\"` (the window's needs border and tab-bar pill; escapes `\"` and `\\`). \
+         `pressing` names the border's session; the pill can name another session. Worker \
+         reports can light the border without a pill. `stuck`/`decide` come from the most \
+         pressing session's `status needs=`, `yours` from a front person hold; `[presence] rim` \
+         off hides both. Off macOS there is no \
          menu bar (`menu \"<title>\"` lines report the menu model; `controls menu` shows the live \
          palette); macOS `--headless` prints `menu (none)` and `toolbar (none)` followed by \
          `toolbar-tabs` (including `\"done\"` tab states). On Windows a `strip-version \
@@ -1780,7 +1808,9 @@ pub const VERBS: &[VerbSpec] = &[
          task_state=<working|done|exited|stalled|-> task_rev=<n> last_act=<act|-> \
          supervisor=<pct|-> supervisor_proven=<0|1> upgrade=<-|<state>/<to>/<why>/<age>> \
          rollout=<ok|missing|stalled|-> rollout_asks=<n> copy=<managed|foreign|-> \
-         path=<frozen|live> path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|->`. Needs & \
+         path=<frozen|live> path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|->`; \
+         `agent_detail=bash:read-only` is the read-only rule's verdict on a Bash box's command \
+         alone, advisory: the supervisor's own decider still reads the box and the session. Needs & \
          level: `level=<quiet|note|story|driving|driven|attention|limited|hold> \
          needs=<none|approval|question|wall|ask|stuck|frozen|stopped> needs_n=<n> need=<word|-> \
          need_since_ms=<ms|-> needs_told=<0|1> attention_owner=<pct|-> story=<n> \
@@ -1793,12 +1823,13 @@ pub const VERBS: &[VerbSpec] = &[
          resizes=<n> flaps=<n> bells=<n> (at most once per 100 ms) bells_sounded=<n> last_bell=<ms|-> \
          os_appearance=<dark|light> theme_side=<dark|light|-> reported_scheme=<dark|light> \
          scheme_from=<theme|program> bg_dark=<0|1> conpty=<0|1> history_lost=<n> \
-         journal_ring=<live|shedding|shed> journal_bytes=<n> spare_age_ms=<ms|-> \
-         born=<spawn|split|restored|handoff> fg_rss_mb=<n|-> job=<verdict|-> job_quiet_ms=<ms|-> \
+         journal_ring=<live|shedding|shed> journal_bytes=<n> \
+         born=<cold|spare-parked|spare-warming|spare-ready> (a spare's adds spare_age_ms=<ms>) \
+         fg_rss_mb=<n|-> job=<verdict|-> job_quiet_ms=<ms|-> \
          disk=<ok|warn|critical> disk_free_mb=<n> disk_room_mb=<n> disk_age_ms=<ms> \
          syspolicyd=<-|ok|full|stuck> syspolicyd_workers=<n>/<limit|->|- \
-         syspolicyd_full_ms=<ms|-> attribution=<self|inherited|unknown> \
-         fs_consent=<ok|denied|asking|unknown> log_ep=<e> log_seq=<n>`. Additional \
+         syspolicyd_full_ms=<ms|-> attribution=<live|adopted|unknown> \
+         fs_consent=<covered|denied|unknown> log_ep=<e> log_seq=<n>`. Additional \
          cross-reference keys (`app=`, `as=`, `enabled=`, `ep=`, ` fleet=`, `hash=`, `kind=`, \
          `origin=`, `pid=`, `reason=`, `reasons=`, `rev=`, `run=`, `since=`, `src=`, `step=`, \
          `subject=`, `subject_source=`, `ticket=`, `view=`, `wait=`, `warn=`, `why=`, `window=`) \
@@ -1810,7 +1841,8 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Session,
         "timeline [<n>] [since=<id>]: the session EVENT TIMELINE",
-        "— one `event <id> t=<ms> kind=<k> ...` line per event (drop-oldest ring of 512; \
+        "— one `event <id> t=<ms> kind=<k> ...` line per event, read from the session `log` \
+         (it takes its newest rows, up to 512 or 64 KiB, only after its other closed detail; \
          monotonic ids carried across seamless updates with a `handoff` row). Lifecycle kinds: \
          `spawned`, `state-change` (`state=closed`), `title-change`, `cwd-change`, `meta-change`, \
          `agent-change`, `task-change` (`rev= state= attention=<0|1> [why=] [exit=]`), \
@@ -1820,8 +1852,8 @@ pub const VERBS: &[VerbSpec] = &[
          `hold`, `inbox`, `inbox-seen`, `post`, `fetch`, `post-landed`, `topic`. Other kinds: \
          `render` (`desync-risk run=<r> displaced=<+-k> net=zero at=<ms>` or `healed run=<r> \
          after_ms=<ms>`), `harness-act` (`act=<act> holder=<holder>`), and `program-state` \
-         (`state=<idle|working|blocked|done|error|-> kind=<permission|question|auth|->`, capped \
-         at half the ring; `log` coalesces flaps with `coalesced=<n>`). Final `closing reason= \
+         (`state=<idle|working|blocked|done|error|-> kind=<permission|question|auth|->`, the \
+         newest 64 a run; `log` coalesces flaps with `coalesced=<n>`). Final `closing reason= \
          by=` is delivered via `subscribe @<sid> events` and retained in `exits`.",
     ),
     v(
@@ -1836,16 +1868,18 @@ pub const VERBS: &[VerbSpec] = &[
          [re=] [dropped= [pool=shared]] [cause= cause_k=]`), `task` (`rev= state= attention= \
          [why=] [code=<exit>]`), `agent`, and `program` (OSC 7501 `status program_state=`: \
          `state=<idle|working|blocked|done|error|none> [ask=<permission|question|auth>] \
-         [coalesced=<n>] src=engine conf=claim`). Header (stderr on `aterm ctl`): `OK <n> v=2 \
-         as_of=<seq> ep=<e> oldest=<seq>[ lost=<k>][ more=<k>]`, then `<seq> \
+         [coalesced=<n>] src=engine conf=claim`), and `row` (`row=<kind>`: a timeline row the \
+         log holds as its row alone, such as `job-change`). Header (stderr on `aterm ctl`): \
+         `OK <n> v=2 as_of=<seq> ep=<e> oldest=<seq>[ lost=<k>][ more=<k>]`, then `<seq> \
          <open|close|mark|amend|gap> <node> <kind> [par=<node>] <k=v ...> [by=<actor>] \
          src=<where> conf=<exact|strong|heuristic|claim> t=<wall ms>` (`close` adds `out=`, \
          `dur_ms=`, `dur=wall`, `steps= appr= qs= walls= stalls= errs= lost=`; `detail=` holds \
          sanitized command or wall reset). Never logs command args or typed bytes; `tier=content` \
          adds in-memory-only `title=`, `meta field=attention attn_text=` (`fp=`), `reason=`, \
-         `topic_name=`, `since=`, `closer=`, `reply=`. Page with `since=<as_of> ep=<ep>` (updates \
-         write `mark - handoff carried=<n> shed=<m> epoch=<ep>` or `gap why=handoff epoch=<ep>`; \
-         evictions/resets emit `gap why=<evicted|reset> lost=<k> resync_to=<seq>`). Filter by \
+         `topic_name=`, `since=`, `closer=`, `reply=`, `row_text=`. Page with `since=<as_of> \
+         ep=<ep>` (updates write `mark - handoff carried=<n> shed=<m> epoch=<ep>` or \
+         `gap why=handoff epoch=<ep>`; evictions/resets emit `gap why=<evicted|reset> lost=<k> \
+         resync_to=<seq>`). Filter by \
          `<node>`, `lvl=session|run|turn|step`, `n=`, `kinds=`, `class=turn`, `--json`. Closed \
          sessions remain readable via `log @<sid>` (last 512, journaled unless `[session_log] \
          journal = false`, mirrored under `[fabric] log = \"auto\"|\"turns\"`). `log n` \
@@ -3474,6 +3508,7 @@ pub fn catalog_lines_full() -> impl Iterator<Item = String> {
 #[cfg(test)]
 mod tests {
     /// The forward's host-gone line reads back what it wrote — a socket path
+    /// with spaces included, as it is last — and no other line reads as one.
     #[test]
     fn the_host_gone_line_round_trips_and_nothing_else_reads_as_it() {
         use super::{host_gone, host_gone_line};
@@ -3494,6 +3529,7 @@ mod tests {
     }
 
     /// The rows fence's wire spelling round-trips, refuses other shapes, and hashes the rows
+    /// as the screen's `hash=` does.
     #[test]
     fn a_rows_fence_round_trips_refuses_bad_shapes_and_hashes_the_rows_joined() {
         use super::RowsFence;
@@ -3526,6 +3562,8 @@ mod tests {
     use super::*;
 
     /// A selector body names something only when it is a non-empty run with no
+    /// whitespace or control character: the bare `@` of an empty `$W`, and `@`
+    /// followed by blanks, name nothing; every form the help teaches does.
     #[test]
     fn a_selector_body_names_something_only_when_it_is_a_nonblank_word() {
         for named in [".", "self", "env", "12", "s-0f1e", "*", "s-ab:3"] {
@@ -3539,6 +3577,7 @@ mod tests {
     }
 
     /// The wire spelling round-trips, and every other shape (a `u64` overflow included) is
+    /// refused.
     #[test]
     fn screen_gen_parses_exactly_the_wire_spelling() {
         let g = ScreenGen::parse("3.15").expect("canonical spelling");
@@ -3568,6 +3607,7 @@ mod tests {
     }
 
     /// Under `--json`/`json` every json-capable verb frames as Lines, so the client keeps the
+    /// JSON body.
     #[test]
     fn json_flag_switches_every_json_capable_verb_to_lines() {
         assert!(json_verbs().count() >= 10, "non-vacuity");
@@ -3693,6 +3733,7 @@ mod tests {
     }
 
     /// `entry_lines` wraps every verb within the width (bar a lone long word), indents
+    /// continuations to the text column, and re-joins to `help_line` exactly.
     #[test]
     fn entry_lines_wrap_every_verb_deterministically_and_losslessly() {
         let gutter = " ".repeat(CATALOG_TEXT_COLUMN);
@@ -3754,6 +3795,7 @@ mod tests {
     }
 
     /// The fabric rows carry the classes the fabric design's §11.2 gives them; a silent change
+    /// to one is a protocol change.
     #[test]
     fn fabric_verbs_carry_their_designed_classes() {
         for (name, op, framing, target, access) in [
@@ -3797,6 +3839,7 @@ mod tests {
     }
 
     /// `copy` (clipboard exfil) and `settings` (durable config) each have their own op-class,
+    /// out of a read-only or keystroke-only edge's reach.
     #[test]
     fn copy_and_settings_have_their_own_op_class() {
         assert_eq!(spec("copy").unwrap().op, OpClass::ClipboardWrite);
@@ -3806,6 +3849,8 @@ mod tests {
     }
 
     /// The `privacy` row's shape is load-bearing: `AnyScopeMeta` so a `--headless` instance
+    /// answers it, `Meta` to reject a selector, `Read` because each fact is one `status` already
+    /// exposes or one the user's own processes can read, `Lines` for `OK <n>` + rows.
     #[test]
     fn privacy_is_a_headless_answerable_meta_read() {
         let s = spec("privacy").expect("privacy is in the table");
@@ -3833,6 +3878,9 @@ mod tests {
     }
 
     /// The `theme` rows carry the class each sub-form needs (the read forms
+    /// Read, the runtime preview lane Write, the forms that rewrite `aterm.toml`
+    /// ConfigWrite), and `theme list` and `theme palette` alone flip to Lines
+    /// framing.
     #[test]
     fn theme_rows_carry_their_classes_and_only_list_is_lines() {
         for (name, op) in [
@@ -3873,6 +3921,10 @@ mod tests {
     }
 
     /// [`spec_for`] reads the longest name a request spells, then the first form of
+    /// that row matching what follows: a listed sub-form row wins over its verb's
+    /// forms, a word no form names falls to the catch-all, and an `@` word, an
+    /// argument or a sub-word moves the lane and authority exactly where the table
+    /// says — and nowhere else.
     #[test]
     fn spec_for_prefers_the_listed_sub_form_row() {
         let r = |verb: &str, rest: &str| spec_for(verb, rest).expect("a table verb");
@@ -3927,6 +3979,7 @@ mod tests {
     }
 
     /// THE SHIPPED `help hold` TEXT ENUMERATES THE HALT SET, SO IT IS PINNED TO
+    /// THE HALT SET: the rows whose [`Input`] class has [`Input::PTY`].
     #[test]
     fn the_hold_help_enumerates_exactly_the_halt_set() {
         const MARKER: &str = "from ANY scope — `";

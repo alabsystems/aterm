@@ -8,20 +8,6 @@
 // See ../../../LICENSE-FONTATIONS for the upstream license.
 
 //! Apply edge hints to an outline.
-//!
-//! This happens in three passes:
-//! 1. Align points that are directly attached to edges. These are the points
-//!    which originally generated the edge and are coincident with the edge
-//!    coordinate (within a threshold) for a given axis. This may include
-//!    points that were originally classified as weak.
-//! 2. Interpolate non-weak points that were not touched by the previous pass.
-//!    This searches for the edges that enclose the point and interpolates the
-//!    coordinate based on the adjustment applied to those edges.
-//! 3. Interpolate remaining untouched points. These are generally the weak
-//!    points: those that are very near other points or lacking a dominant
-//!    inward or outward direction.
-//!
-//! The final result is a fully hinted outline.
 
 use super::super::{
     glyf::PointMarker,
@@ -33,8 +19,6 @@ use super::super::{
 use core::cmp::Ordering;
 
 /// Align all points of an edge to the same coordinate value.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afhints.c#L1324>
 pub(crate) fn align_edge_points(
     outline: &mut Outline,
     axis: &Axis,
@@ -44,8 +28,6 @@ pub(crate) fn align_edge_points(
     let edges = axis.edges.as_slice();
     let segments = axis.segments.as_slice();
     let points = outline.points.as_mut_slice();
-    // Snapping is configurable for CJK
-    // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afcjk.c#L2195>
     let snap = group == ScriptGroup::Default
         || (axis.dim == Dimension::Horizontal && scale.flags.contains(ScaleFlags::HORIZONTAL_SNAP))
         || (axis.dim == Dimension::Vertical && scale.flags.contains(ScaleFlags::VERTICAL_SNAP));
@@ -83,8 +65,6 @@ pub(crate) fn align_edge_points(
 }
 
 /// Align the strong points; equivalent to the TrueType `IP` instruction.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afhints.c#L1399>
 pub(crate) fn align_strong_points(outline: &mut Outline, axis: &mut Axis) -> Option<()> {
     if axis.edges.is_empty() {
         return Some(());
@@ -97,8 +77,6 @@ pub(crate) fn align_strong_points(outline: &mut Outline, axis: &mut Axis) -> Opt
     };
     let points = outline.points.as_mut_slice();
     'points: for point in points.iter_mut() {
-        // Skip points that are already touched; do weak interpolation in the
-        // next pass
         if point
             .flags
             .has_marker(touch_flag | PointMarker::WEAK_INTERPOLATION)
@@ -111,26 +89,18 @@ pub(crate) fn align_strong_points(outline: &mut Outline, axis: &mut Axis) -> Opt
             (point.fx, point.ox)
         };
         let edges = axis.edges.as_mut_slice();
-        // Is the point before the first edge?
         let edge = edges.first()?;
         let delta = edge.fpos as i32 - u;
         if delta >= 0 {
             store_point(point, dim, edge.pos - (edge.opos - ou));
             continue;
         }
-        // Is the point after the last edge?
         let edge = edges.last()?;
         let delta = u - edge.fpos as i32;
         if delta >= 0 {
             store_point(point, dim, edge.pos + (ou - edge.opos));
             continue;
         }
-        // Find enclosing edges; for a small number of edges, use a linear
-        // search.
-        // Note: this is actually critical for matching FreeType in cases where
-        // we have more than one edge with the same fpos. When this happens,
-        // linear and binary searches can produce different results.
-        // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afhints.c#L1489>
         let min_ix = if edges.len() <= 8 {
             if let Some((min_ix, edge)) = edges
                 .iter()
@@ -156,7 +126,6 @@ pub(crate) fn align_strong_points(outline: &mut Outline, axis: &mut Axis) -> Opt
                     Ordering::Less => max_ix = mid_ix,
                     Ordering::Greater => min_ix = mid_ix + 1,
                     Ordering::Equal => {
-                        // We are on an edge
                         store_point(point, dim, edge.pos);
                         continue 'points;
                     }
@@ -164,7 +133,6 @@ pub(crate) fn align_strong_points(outline: &mut Outline, axis: &mut Axis) -> Opt
             }
             min_ix
         };
-        // Point is not on an edge
         if let Some(before_ix) = min_ix.checked_sub(1) {
             let edge_before = edges.get(before_ix)?;
             let before_pos = edge_before.pos;
@@ -187,8 +155,6 @@ pub(crate) fn align_strong_points(outline: &mut Outline, axis: &mut Axis) -> Opt
 }
 
 /// Align the weak points; equivalent to the TrueType `IUP` instruction.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afhints.c#L1673>
 pub(crate) fn align_weak_points(outline: &mut Outline, dim: Dimension) -> Option<()> {
     let touch_marker = if dim == Dimension::Horizontal {
         for point in &mut outline.points {
@@ -205,7 +171,6 @@ pub(crate) fn align_weak_points(outline: &mut Outline, dim: Dimension) -> Option
     };
     for contour in &outline.contours {
         let points = outline.points.get_mut(contour.range())?;
-        // Find first touched point
         let Some(first_touched_ix) = points
             .iter()
             .position(|point| point.flags.has_marker(touch_marker))
@@ -216,12 +181,10 @@ pub(crate) fn align_weak_points(outline: &mut Outline, dim: Dimension) -> Option
         let mut point_ix = first_touched_ix;
         let mut last_touched_ix;
         'outer: loop {
-            // Skip any touched neighbors
             while point_ix < last_ix && points.get(point_ix + 1)?.flags.has_marker(touch_marker) {
                 point_ix += 1;
             }
             last_touched_ix = point_ix;
-            // Find the next touched point
             point_ix += 1;
             loop {
                 if point_ix > last_ix {
@@ -241,10 +204,8 @@ pub(crate) fn align_weak_points(outline: &mut Outline, dim: Dimension) -> Option
             );
         }
         if last_touched_ix == first_touched_ix {
-            // Special case: only one point was touched
             iup_shift(points, 0, last_ix, first_touched_ix);
         } else {
-            // Interpolate the remainder
             if last_touched_ix < last_ix {
                 iup_interpolate(
                     points,
@@ -265,7 +226,6 @@ pub(crate) fn align_weak_points(outline: &mut Outline, dim: Dimension) -> Option
             }
         }
     }
-    // Save interpolated values
     if dim == Dimension::Horizontal {
         for point in &mut outline.points {
             point.x = point.u;
@@ -289,14 +249,7 @@ fn store_point(point: &mut Point, dim: Dimension, u: i32) {
     }
 }
 
-/// Shift original coordinates of all points between `p1_ix` and `p2_ix`
-/// (inclusive) to get hinted coordinates using the same difference as
-/// given by the point at `ref_ix`.
-///
-/// The `u` and `v` members are the current and original coordinate values,
-/// respectively.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afhints.c#L1578>
+/// Shift coordinates in `p1_ix..=p2_ix` by the delta of the reference point at `ref_ix`.
 fn iup_shift(points: &mut [Point], p1_ix: usize, p2_ix: usize, ref_ix: usize) -> Option<()> {
     let ref_point = points.get(ref_ix)?;
     let delta = ref_point.u - ref_point.v;
@@ -312,14 +265,7 @@ fn iup_shift(points: &mut [Point], p1_ix: usize, p2_ix: usize, ref_ix: usize) ->
     Some(())
 }
 
-/// Interpolate the original coordinates all of points between `p1_ix` and
-/// `p2_ix` (inclusive) to get hinted coordinates, using the points at
-/// `ref1_ix` and `ref2_ix` as the reference points.
-///
-/// The `u` and `v` members are the current and original coordinate values,
-/// respectively.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afhints.c#L1605>
+/// Interpolate coordinates in `p1_ix..=p2_ix` using reference points `ref1_ix` and `ref2_ix`.
 fn iup_interpolate(
     points: &mut [Point],
     p1_ix: usize,

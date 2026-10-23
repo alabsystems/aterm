@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the login lifecycle's core (`docs/DESIGN-claude-accounts-v2-2026-10-15.md`
-//! §4.5, §5): the roster's `email` and `browser`, `logins.json` and its
-//! bounds, the forecast, the states, the binding read byte for byte, and the
-//! advice at a login's end. Every clock is the fixed [`NOW`]; every address
-//! is an example.com one; nothing here reads a login, a keychain or a home.
+//! Tests for the login lifecycle's core (`docs/DESIGN-claude-accounts-v2-2026-10-15.md` §4.5, §5).
 
 use super::*;
 use crate::harness::host_path::abs;
@@ -81,7 +77,6 @@ fn an_email_and_a_browser_are_admitted_and_a_bad_one_refuses_the_file_unquoted()
         (r.rows[1].email.clone(), r.rows[1].browser.clone()),
         (None, None)
     );
-    // A v1 file reads as it did: no email, no browser, nothing superseded.
     let v1 =
         Roster::parse("[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n").expect("admits");
     assert_eq!(
@@ -111,11 +106,9 @@ fn an_email_and_a_browser_are_admitted_and_a_bad_one_refuses_the_file_unquoted()
         let why = Roster::parse(&with("browser", bad)).expect_err(bad);
         assert!(why.contains("its browser"), "{why}");
     }
-    // …and a key that is not a string.
     let why = Roster::parse("[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\nemail = 1\n")
         .expect_err("a number");
     assert!(why.contains("its email is a TOML integer"), "{why}");
-    // One address is one account, whatever its case.
     let twice = format!(
         "{}\n[[account]]\nlabel = \"two\"\nclass = \"shared\"\ndir = \"{}\"\nemail = \"OWNER@example.com\"\n",
         with("email", "owner@example.com"),
@@ -127,7 +120,6 @@ fn an_email_and_a_browser_are_admitted_and_a_bad_one_refuses_the_file_unquoted()
         "{why}"
     );
     assert!(!why.to_lowercase().contains("owner@"), "{why}");
-    // An unknown key is still refused.
     let why = Roster::parse(&with("phone", "x")).expect_err("unknown");
     assert!(why.contains("unknown key `phone`"), "{why}");
 }
@@ -145,7 +137,6 @@ fn a_row_with_an_email_is_written_as_it_reads_back_and_never_printed() {
         Roster::parse(&text).expect("reads back").rows,
         vec![row.clone()]
     );
-    // A refusal the owner adds by hand prints a placeholder, never the address.
     let inline = format!(
         "account = [ {{ label = \"w\", class = \"shared\", dir = \"{}\" }} ]\n",
         abs("/l/w")
@@ -153,7 +144,6 @@ fn a_row_with_an_email_is_written_as_it_reads_back_and_never_printed() {
     let why = append_rows(&inline, std::slice::from_ref(&row)).expect_err("inline");
     assert!(why.contains(EMAIL_BY_HAND), "{why}");
     assert!(!why.contains("owner@example.com"), "{why}");
-    // A bad row is refused before anything is joined, the address unquoted.
     let bad = Row {
         email: Some("owner".into()),
         ..row
@@ -175,7 +165,6 @@ fn logins_round_trip_bounded_and_beside_an_untouched_state() {
     assert_eq!(Logins::from_json(&text, NOW), Ok(logins.clone()));
     assert!(text.starts_with("{\"labels\":"), "keys sorted: {text}");
 
-    // Observation metadata stays bounded without weakening identity reads.
     let mut labels = Map::new();
     for i in 0..MAX_ACCOUNTS {
         labels.insert(
@@ -219,8 +208,6 @@ fn logins_round_trip_bounded_and_beside_an_untouched_state() {
         Err(Unread::Torn(_))
     ));
 
-    // In the store: the logins are their own file, and a transaction that
-    // changes only them leaves `state.json` byte for byte.
     let dir = tmp("store");
     let store = Store::at(dir.path());
     let mut note = None;
@@ -244,7 +231,6 @@ fn logins_round_trip_bounded_and_beside_an_untouched_state() {
         read.get("main").and_then(|b| b.notice_end),
         Some(NOW + 3 * DAY)
     );
-    // A file this build must not guess at is never saved over.
     std::fs::write(store.logins_file(), "{\"schema\":7}").expect("write");
     let refused = store.transact_logins(NOW, &mut note, |_, logins| {
         note_served_login(logins, "main", NOW);
@@ -280,8 +266,6 @@ fn a_renewal_supersedes_the_login_it_replaces_and_wakes_the_waiting() {
     assert_eq!(b.dir.as_deref(), Some("/s/main.1"));
     assert_eq!(b.was, vec![None], "the default login, superseded");
     assert_eq!(b.subscription.as_deref(), Some("max"));
-    // Each renewal after it puts the one before first, at most four kept, and
-    // what the old login's notice and end said goes with it.
     note_login_notice(&mut logins, "main", 2, NOW + DAY);
     note_wrong_account(&mut logins, "main", NOW + DAY);
     for n in 2..=7 {
@@ -305,7 +289,6 @@ fn a_renewal_supersedes_the_login_it_replaces_and_wakes_the_waiting() {
         (b.notice_end, b.wrong_at, b.subscription.clone()),
         (None, None, None)
     );
-    // A row with a dir of its own supersedes that dir.
     let mut logins = Logins::default();
     note_renewed(
         &mut state,
@@ -320,9 +303,6 @@ fn a_renewal_supersedes_the_login_it_replaces_and_wakes_the_waiting() {
         logins.get("work-2").expect("bound").was,
         vec![Some("/logins/work-2".to_string())]
     );
-    // The staging directory is made by its claim: the next name nobody has
-    // used — and never one a claim made before, signed in to or not, so two
-    // renewals at one moment sign in to two homes.
     let dir = tmp("staging");
     let store = Store::at(dir.path());
     let first = store.claim_staging_dir("main").expect("free");
@@ -406,7 +386,6 @@ fn only_an_absent_binding_file_means_legacy_identities() {
     );
     std::fs::remove_file(&file).unwrap();
 
-    // A regular-file link remains supported; its known contents decide.
     std::fs::write(&target, Logins::default().to_json()).unwrap();
     std::os::unix::fs::symlink(&target, &file).unwrap();
     assert_eq!(store.bound(&original, NOW).unwrap(), original);
@@ -422,17 +401,14 @@ fn the_forecast_learns_from_notices_and_ends_and_never_lengthens() {
     let (state, mut logins) = renewed(NOW);
     let b = |l: &Logins| l.get("main").expect("bound").clone();
     assert_eq!(forecast(&b(&logins)), Some(NOW + 21 * DAY));
-    // Due five days ahead, not a second sooner.
     let at = |l: &Logins, t: i64| login_state(&main, l, &state, t);
     assert_eq!(at(&logins, NOW + 16 * DAY - 1), LoginState::Idle);
     assert_eq!(
         at(&logins, NOW + 16 * DAY),
         LoginState::Due { by: NOW + 21 * DAY }
     );
-    // No notice for a fortnight lengthens nothing.
     assert_eq!(forecast(&b(&logins)), Some(NOW + 21 * DAY));
 
-    // A notice on day 10 naming 2 days: due at once, the lifetime learned.
     assert!(note_login_notice(&mut logins, "main", 2, NOW + 10 * DAY));
     assert_eq!(forecast(&b(&logins)), Some(NOW + 12 * DAY));
     assert_eq!(
@@ -440,7 +416,6 @@ fn the_forecast_learns_from_notices_and_ends_and_never_lengthens() {
         LoginState::Due { by: NOW + 12 * DAY }
     );
     assert_eq!(b(&logins).lifetime(), 12 * DAY);
-    // A later notice naming more days moves nothing later.
     assert!(!note_login_notice(
         &mut logins,
         "main",
@@ -448,13 +423,11 @@ fn the_forecast_learns_from_notices_and_ends_and_never_lengthens() {
         NOW + 10 * DAY + HOUR
     ));
     assert_eq!(forecast(&b(&logins)), Some(NOW + 12 * DAY));
-    // NEGATIVE CONTROL: no such notice (0 days, or more than the vendor shows).
     let before = logins.clone();
     assert!(!note_login_notice(&mut logins, "main", 0, NOW + 11 * DAY));
     assert!(!note_login_notice(&mut logins, "main", 4, NOW + 11 * DAY));
     assert_eq!(logins, before);
 
-    // The next cycle is forecast by what was learned.
     let mut state2 = state.clone();
     note_renewed(
         &mut state2,
@@ -466,8 +439,6 @@ fn the_forecast_learns_from_notices_and_ends_and_never_lengthens() {
         NOW + 11 * DAY,
     );
     assert_eq!(forecast(&b(&logins)), Some(NOW + 23 * DAY));
-    // An end nine days on lowers it again; one a day after a renewal is a
-    // revocation and teaches nothing.
     let events = note_login_end(&mut state2, &mut logins, "main", NOW + 20 * DAY);
     assert_eq!(
         events.iter().map(|e| e.kind).collect::<Vec<_>>(),
@@ -494,8 +465,6 @@ fn the_forecast_learns_from_notices_and_ends_and_never_lengthens() {
         "a revocation is no lifetime"
     );
 
-    // The bounds: a notice implying two days is a week; a stored ninety days
-    // is thirty.
     let (_, mut short) = renewed(NOW);
     note_login_notice(&mut short, "main", 1, NOW + DAY);
     assert_eq!(b(&short).lifetime(), LIFETIME_MIN_S);
@@ -504,7 +473,6 @@ fn the_forecast_learns_from_notices_and_ends_and_never_lengthens() {
         ..Binding::default()
     };
     assert_eq!(long.lifetime(), LIFETIME_MAX_S);
-    // A row never renewed here has no forecast, until a notice speaks of it.
     let mut fresh = Logins::default();
     assert_eq!(fresh.get("main").and_then(forecast), None);
     note_login_notice(&mut fresh, "main", 3, NOW);
@@ -521,7 +489,6 @@ fn the_states_in_their_order() {
     note_served_login(&mut logins, "main", NOW);
     assert_eq!(at(&state, &logins, NOW + 6 * HOUR - 1), LoginState::Ok);
     assert_eq!(at(&state, &logins, NOW + 6 * HOUR), LoginState::Idle);
-    // Due wins over a served turn; expired over both.
     note_login_notice(&mut logins, "main", 1, NOW);
     assert_eq!(at(&state, &logins, NOW), LoginState::Due { by: NOW + DAY });
     note_login_end(&mut state, &mut logins, "main", NOW + HOUR);
@@ -585,13 +552,11 @@ fn a_login_signed_back_in_is_ok_again_and_due_no_more() {
         (Some(back), None, Some(back))
     );
     assert!(renew_due(&r, &logins, &state, &enrolled, back).is_empty());
-    // A struck row with no email.
     note_auth(&mut state, "work-2", Auth::SignedOut, back);
     assert_eq!(signed_out(&r, &state, &enrolled, back), ["work-2"]);
     assert!(!note_signed_back(&mut state, &mut logins, "work-2", back + 60).is_empty());
     assert!(signed_out(&r, &state, &enrolled, back + 60).is_empty());
     assert!(logins.get("work-2").is_none(), "no binding made");
-    // NEGATIVE CONTROLS: not signed out; older than the word on record.
     let before = (state.clone(), logins.clone());
     assert!(note_signed_back(&mut state, &mut logins, "main", back + HOUR).is_empty());
     assert_eq!((state.clone(), logins.clone()), before);
@@ -645,8 +610,6 @@ fn due_logins_and_none_working_are_the_renewable_rows() {
         NOW + HOUR,
         NONE_SOON_S
     ));
-    // NEGATIVE CONTROLS: a row with no email is never due, and a login not
-    // made here is not either; with no renewable row nothing is "none".
     let mut ended = state.clone();
     note_auth(&mut ended, "work-2", Auth::SignedOut, NOW);
     assert_eq!(
@@ -722,15 +685,11 @@ fn a_bound_roster_reads_the_renewed_login_and_the_superseded_one_byte_for_byte()
         "another string, another login"
     );
     assert_eq!(on(Some(&w_1)), (Some("work-2"), None));
-    // The same account all the same: judged, recorded and shown as it.
     assert_eq!(judged_label(&b, &who(None)), Some("main"));
-    // NEGATIVE CONTROL: the file as written knows no renewal.
     let file = roster();
     let me = who(None).me(&file);
     assert_eq!((me.account, me.left), (Some("main"), None));
     assert_eq!(who(Some(&main_1)).me(&file).label(), None);
-    // The store reads the roster through its file, and a file it cannot read
-    // binds nothing.
     let dir = tmp("bound");
     let store = Store::at(dir.path());
     store.save_logins(&logins).expect("save");
@@ -810,7 +769,6 @@ fn a_superseded_logins_usage_is_recorded_for_its_rows_account() {
         "usage",
         "the renewed login's"
     );
-    // NEGATIVE CONTROLS: a login no row has held; the unbound file.
     assert_eq!(
         record_usage(
             &store,
@@ -855,7 +813,6 @@ fn the_one_accounts_login_follows_its_renewal() {
         lone_login_at(Some(&path), &store, NOW).as_deref(),
         Some(main_1.as_str())
     );
-    // NEGATIVE CONTROLS.
     std::fs::write(&path, roster_text()).expect("two rows");
     assert_eq!(bound(&roster(), &logins).lone_login(), None);
     assert_eq!(lone_login_at(Some(&path), &store, NOW), None, "two rows");
@@ -947,8 +904,6 @@ fn a_login_end_is_advised_the_sessions_own_label_and_never_another() {
             "{mode:?}: a usable account is never moved to"
         );
     }
-    // NEGATIVE CONTROL: the same state at a lost login after a move rotates
-    // (to the dedicated account first).
     assert_eq!(
         advise_at(
             &r,
@@ -964,8 +919,6 @@ fn a_login_end_is_advised_the_sessions_own_label_and_never_another() {
             takes_canary: false,
         }
     );
-    // Renewed: a session still on the old login moves onto its own label —
-    // at its lost login, and ahead at a plain turn end — under every mode.
     let mut logins = Logins::default();
     let mut renewed_state = state.clone();
     note_renewed(
@@ -1003,7 +956,6 @@ fn a_login_end_is_advised_the_sessions_own_label_and_never_another() {
             );
         }
     }
-    // A renewed login that has itself ended is no place to go.
     let mut dead = renewed_state.clone();
     note_auth(&mut dead, "main", Auth::SignedOut, NOW + 1);
     assert_eq!(
@@ -1014,7 +966,6 @@ fn a_login_end_is_advised_the_sessions_own_label_and_never_another() {
         advise_at(&b, &dead, &me, &Point::TurnEnd, Mode::Early),
         Advice::Stay(StayWhy::NothingDue)
     );
-    // Its own home or a key of its own: the session is no account's.
     let keyed = Me {
         stored_login: false,
         ..me
@@ -1023,8 +974,6 @@ fn a_login_end_is_advised_the_sessions_own_label_and_never_another() {
         advise_at(&b, &renewed_state, &keyed, &Point::TurnEnd, Mode::Off),
         Advice::Stay(StayWhy::NotAStoredLogin)
     );
-    // At a usage wall the superseded session is its account's, and rotates
-    // as any session there.
     let wall = Point::Wall {
         window: "five_hour".into(),
         at: Some(NOW),
@@ -1096,8 +1045,6 @@ fn a_renewal_made_under_a_wall_is_followed_at_once() {
                 );
             }
         }
-        // NEGATIVE CONTROL: the row's own login ended under the same wall,
-        // no renewal made — nothing to follow.
         let mut own = self::state();
         note_auth(&mut own, "main", Auth::SignedOut, NOW - HOUR);
         walled(&mut own);
@@ -1120,7 +1067,6 @@ fn a_renewal_made_under_a_wall_is_followed_at_once() {
             Advice::Stay(StayWhy::NoCandidate),
             "{window}"
         );
-        // NEGATIVE CONTROL: the renewed login has itself ended since.
         note_auth(&mut state, "main", Auth::SignedOut, NOW);
         assert_eq!(
             advise_at(&state, &me, &Point::LoginEnded, Mode::Off),

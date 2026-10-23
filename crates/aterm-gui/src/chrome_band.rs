@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Shared themed cells for compact in-grid chrome such as the find bar, the
-//! message band and native-tab backing rows. Callers provide the content and own its
-//! lifecycle.
+//! Shared themed cells for compact in-grid chrome (find bar, message band, native-tab rows).
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -14,30 +12,14 @@ use aterm_messages::ink::{AnsiHues, BarBase, ThemeInks};
 use aterm_messages::tokens::{AuthoredChrome, ChromeSeeds, ChromeTokens};
 use aterm_render::Theme;
 
-// The OS-forced chrome palette (Windows High Contrast). While a High Contrast scheme is
-// active the OS palette owns every chrome surface: `platform_win::apply_chrome_appearance`
-// defers the caption, and this palette drives the tab strip, find bar and message band.
-// The terminal grid keeps its scheme, which is user content. A process-global latch, not
-// an argument, because every chrome tone derives from a `Theme` alone at many paint sites;
-// its one writer is `platform_win::resync_forced_chrome_palette`.
-
-/// The OS-forced chrome palette: the five Win32 system colours chrome is painted from
-/// while a High Contrast scheme is active ([`aterm_messages::ink::ForcedPalette`]).
-/// Stored in theme byte order; the platform arm swaps from COLORREF (`0x00BBGGRR`).
+/// The OS-forced chrome palette.
 pub(crate) type ForcedChrome = aterm_messages::ink::ForcedPalette;
 
 /// Sentinel in slot 0 for "no forced palette" — an RGB triple packs to 24 bits, so
 /// `u32::MAX` cannot collide with a real colour.
 const FORCED_ABSENT: u32 = u32::MAX;
 
-/// The published palette, packed `0x00RRGGBB`, in [`ForcedChrome`] field order. Atomics
-/// rather than a `Mutex<Option<_>>`, since `band_colors` / `strip_colors` run on paint
-/// paths.
-///
-/// Publication protocol: slot 0 is the gate, written last when installing and first
-/// when clearing, so a reader sees either `FORCED_ABSENT` (and paints the ordinary
-/// theme tones) or a fully written set. Writer and readers share the winit main thread
-/// in production; `published_forced_chrome_is_all_or_nothing` holds the order.
+/// The published palette, packed `0x00RRGGBB`, in [`ForcedChrome`] field order.
 static FORCED_CHROME: [AtomicU32; 5] = [
     AtomicU32::new(FORCED_ABSENT),
     AtomicU32::new(0),
@@ -46,19 +28,12 @@ static FORCED_CHROME: [AtomicU32; 5] = [
     AtomicU32::new(0),
 ];
 
-// Libtest runs independent Apps on a reused worker pool, so tests use a thread-local
-// palette instead of the process-global one (as `native_appearance`'s preference
-// snapshot does).
 #[cfg(test)]
 thread_local! {
     static TEST_FORCED_CHROME: Cell<Option<ForcedChrome>> = const { Cell::new(None) };
 }
 
-/// Publish (or retract, with `None`) the OS-forced chrome palette. Returns `true` only
-/// when the palette moved, so the host can skip a strip-cache invalidation and repaint.
-/// A move also arms [`crate::native_appearance::note_chrome_inputs_moved`], so the
-/// settling re-sample learns of it even when another caller got the `true` (window attach
-/// and startup both republish the palette).
+/// Publish (or retract, with `None`) the OS-forced chrome palette.
 #[cfg(any(windows, test))]
 pub(crate) fn install_forced_chrome(palette: Option<ForcedChrome>) -> bool {
     let moved = {
@@ -78,8 +53,7 @@ pub(crate) fn install_forced_chrome(palette: Option<ForcedChrome>) -> bool {
     moved
 }
 
-/// The live OS-forced chrome palette, or `None` when the app owns its own tones
-/// (every platform but Windows, and Windows whenever High Contrast is off).
+/// The live OS-forced chrome palette, or `None` when the app owns its own tones.
 #[must_use]
 pub(crate) fn forced_chrome() -> Option<ForcedChrome> {
     #[cfg(test)]
@@ -94,8 +68,7 @@ pub(crate) fn forced_chrome() -> Option<ForcedChrome> {
 }
 
 /// The shipping half of [`install_forced_chrome`]: pack the palette into
-/// [`FORCED_CHROME`] under the publication protocol. Compiled under test too, so the
-/// bit-packing and slot order have test coverage. Writers are Windows-only.
+/// [`FORCED_CHROME`] under the publication protocol.
 #[cfg(any(windows, test))]
 fn publish_forced_chrome(palette: Option<ForcedChrome>) -> bool {
     if published_forced_chrome() == palette {
@@ -141,8 +114,7 @@ fn published_forced_chrome() -> Option<ForcedChrome> {
     })
 }
 
-/// Pack one RGB triple into `0x00RRGGBB`. Write side, so `cfg`-gated with its only
-/// caller; [`unpack`] is not, because every platform reads.
+/// Pack one RGB triple into `0x00RRGGBB`.
 #[cfg(any(windows, test))]
 fn pack(c: [u8; 3]) -> u32 {
     (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2])
@@ -156,13 +128,9 @@ fn unpack(c: u32) -> [u8; 3] {
     ]
 }
 
-/// On-theme tones for compact chrome bands ([`aterm_messages::ink::BandInks`]). The
-/// band's painter names word inks by slot (`BandInks::slot`): `Ink::Label` → `label`,
-/// `Value` → `value`, `Warn` → `warn`, `Error` → `error`, `Accent` → `accent`.
+/// On-theme tones for compact chrome bands ([`aterm_messages::ink::BandInks`]).
 pub(crate) type BandColors = aterm_messages::ink::BandInks;
 
-// The chrome colour helpers live in the engine (one implementation for band, tab
-// strip, find bar, notices, Settings and presence), re-exported under local paths.
 #[cfg(test)]
 pub(crate) use aterm_messages::ink::{PRIMARY_HOVER_LIFT, TRACK_TINT, hover_ink};
 pub(crate) use aterm_messages::ink::{contrast, ensure_contrast, forced_ink, mix3, warn_mark};
@@ -176,52 +144,13 @@ fn rgb(c: u32) -> [u8; 3] {
     ]
 }
 
-/// The Adwaita headerbar fills of the band on Linux, `(48, 48, 48)` dark and
-/// `(235, 235, 235)` light: sctk-adwaita's active `ColorMap::headerbar`, which the
-/// band had to match exactly while that crate drew a titlebar above it (even a
-/// 2-luma-step mismatch showed a seam). Since LW.5 the band IS the header of a
-/// window the compositor leaves undecorated (`crate::client_frame`, its window
-/// buttons included), and it keeps the headerbar's tones so it reads as a GNOME
-/// header.
-///
-/// Active tones on purpose: the band does not repaint on focus change.
-///
-/// # The band/page split is intended
-///
-/// With a mid-tone terminal background the band and the native page rail below it
-/// separate visibly (e.g. `background = "#8A8A8A"`: band `#303030`, Settings rail
-/// `#797676`). This is correct: the band is the header, and the break sits at the
-/// chrome/content boundary, where GTK apps put it.
-///
-/// The band follows the chrome-resolved palette (`App::chrome_palette_theme`), so
-/// `window_theme = dark` over a light terminal theme gives `#303030` in step with
-/// native pages; only the terminal grid keeps its own palette.
-///
-/// Under server-side decorations (or an X11 window manager's frame) the window
-/// system's titlebar sits above the band, which could then follow the page instead;
-/// it keeps these tones for now. `linux_band_base_tone_is_the_exact_csd_headerbar_gray`
-/// pins the choice.
+/// The Adwaita headerbar fills of the band on Linux.
 #[cfg(target_os = "linux")]
 pub(crate) const CSD_HEADERBAR_DARK: [u8; 3] = [0x30, 0x30, 0x30];
 #[cfg(target_os = "linux")]
 pub(crate) const CSD_HEADERBAR_LIGHT: [u8; 3] = [0xEB, 0xEB, 0xEB];
 
-/// Appearance-aware, theme-derived band tones with WCAG-AA text contrast, over the
-/// chrome tokens of `p` ([`ChromePalette::tokens`]): where the theme's cursor is
-/// near-grey and the palette's ANSI hues are known, the accent and meter fill are the
-/// blue (or the cyan, where only the cyan carries the band's words), chosen by
-/// `aterm_messages::palette::MeterHue`; an authored accent or border wins. A hue the
-/// 3:1 floor would darken into brown keeps its pastel with a darker edge
-/// (`aterm_messages::palette::keeps_pastel`). A bare [`Theme`] converts with no
-/// palette and nothing authored.
-///
-/// Under an OS-forced chrome palette (Windows High Contrast) this defers wholesale to
-/// `BandInks::forced`.
-///
-/// On Linux the base tone is the adwaita headerbar gray of the CSD titlebar above
-/// ([`CSD_HEADERBAR_DARK`]/[`CSD_HEADERBAR_LIGHT`]), picked by
-/// [`crate::tab_bar::bg_is_light`]. The inks are contrast-floored against their
-/// surface, so theme foregrounds still clear AA on the fixed gray.
+/// Appearance-aware, theme-derived band tones with WCAG-AA text contrast.
 pub(crate) fn band_colors(p: impl Into<ChromePalette>) -> BandColors {
     if let Some(hc) = forced_chrome() {
         return BandColors::forced(hc);
@@ -229,13 +158,6 @@ pub(crate) fn band_colors(p: impl Into<ChromePalette>) -> BandColors {
     let p = p.into();
     let inks = p.inks();
     let seeds = p.seeds();
-    // The tones are a pure function of the seeds (the base among them), and
-    // the paint paths ask for them again every frame — the Claude Code
-    // footer's splice and its lights' block each frame a pane shows one —
-    // while each derivation floors a dozen inks by WCAG contrast (`powf`
-    // per channel): the last answer is kept for the same seeds, per thread
-    // (owner, 2026-10-15: "the user experince must be extremely smooth and
-    // zero latency!").
     std::thread_local! {
         static LAST: std::cell::Cell<Option<(ChromeSeeds, ThemeInks, BandColors)>> =
             const { std::cell::Cell::new(None) };
@@ -252,14 +174,10 @@ pub(crate) fn band_colors(p: impl Into<ChromePalette>) -> BandColors {
     })
 }
 
-/// The theme's ANSI hues the band borrows: blue and cyan (slots 4 and 6) for
-/// a meter when the cursor is near-grey (ruling 250), red and yellow (slots 1
-/// and 3) as the seeds of its error and warn inks, and red and green (slot 2)
-/// as the chrome's danger and success hues.
+/// The theme's ANSI hues the band borrows.
 pub(crate) type MeterAnsi = AnsiHues;
 
-/// A scheme's borrowed hues (the tests' builtin grounds; the app reads its
-/// configured palette, [`ansi_of_palette`]).
+/// A scheme's borrowed hues.
 #[cfg(test)]
 pub(crate) fn ansi_of_scheme(s: &aterm_types::ColorScheme) -> MeterAnsi {
     let rgb = |c: aterm_types::Rgb| [c.r, c.g, c.b];
@@ -284,10 +202,7 @@ pub(crate) fn ansi_of_palette(p: &aterm_types::ColorPalette) -> MeterAnsi {
     }
 }
 
-/// What every chrome surface paints from: the theme its surface draws on
-/// ([`crate::app_render::ChromeSurface`]), the terminal palette's hues when the host
-/// knows them, and the chrome colours the theme or the config authored. A bare
-/// [`Theme`] converts with neither, and derives every token from the theme alone.
+/// What every chrome surface paints.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ChromePalette {
     pub theme: Theme,
@@ -320,8 +235,7 @@ impl ChromePalette {
         }
     }
 
-    /// What the tokens derive from, on this thread's band base ([`bar_base`]: the
-    /// platform's, or a test's choice), so the kept tones and tokens are keyed on it too.
+    /// Seeds from which chrome tokens are derived.
     pub(crate) fn seeds(&self) -> ChromeSeeds {
         let inks = self.inks();
         ChromeSeeds {
@@ -330,17 +244,13 @@ impl ChromePalette {
             cursor: inks.cursor,
             ansi: self.ansi,
             authored: self.authored,
-            // Windows' accent colour, in the shade for this surface's side, where
-            // the platform installed one (`native_appearance::system_accent`).
             system_accent: crate::native_appearance::system_accent()
                 .map(|accent| accent.for_surface(inks.bg)),
             base: bar_base(),
         }
     }
 
-    /// The chrome tokens of this palette (`aterm_messages::tokens`). Kept for the
-    /// last seeds asked for, per thread, as [`band_colors`] keeps its tones: every
-    /// surface asks per paint.
+    /// The chrome tokens of this palette (`aterm_messages::tokens`).
     pub(crate) fn tokens(&self) -> ChromeTokens {
         let seeds = self.seeds();
         std::thread_local! {
@@ -387,18 +297,13 @@ std::thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Derive this test thread's bands on the theme blend, the web module's base
-/// (`aterm_wasm`'s `BandInks::derive(.., BarBase::Blend)`), in place of the
-/// platform's: Linux's band sits on its CSD headerbar grey instead
-/// ([`PLATFORM_BAR_BASE`]), so a host test of the band the web module must
-/// match draws it on the blend there too.
+/// Derive this test thread's bands on the theme blend.
 #[cfg(test)]
 pub(crate) fn lay_bands_on_the_theme_blend_for_test() {
     BAR_BASE_FOR_TEST.set(Some(BarBase::Blend));
 }
 
-/// Where this platform's band ground comes from: on Linux the CSD headerbar grey
-/// ([`CSD_HEADERBAR_DARK`]/[`CSD_HEADERBAR_LIGHT`]), elsewhere the theme blend.
+/// Where this platform's band ground comes from.
 #[cfg(target_os = "linux")]
 pub(crate) const PLATFORM_BAR_BASE: BarBase = BarBase::Fixed {
     light: CSD_HEADERBAR_LIGHT,
@@ -407,19 +312,16 @@ pub(crate) const PLATFORM_BAR_BASE: BarBase = BarBase::Fixed {
 #[cfg(not(target_os = "linux"))]
 pub(crate) const PLATFORM_BAR_BASE: BarBase = BarBase::Blend;
 
-/// The presence tones: the needs border's two alarm hues and the person's dim
-/// outline (`aterm_messages::presence::PresenceTones`).
+/// The presence tones: the needs border's two alarm hues and the person's dim outline.
 pub(crate) use aterm_messages::presence::PresenceTones;
 
-/// The presence tones for `theme` on its band, or the High Contrast vocabulary's own
-/// words for them under an OS-forced palette (`aterm_messages::presence::tones`).
+/// The presence tones for `theme` on its band.
 pub(crate) fn presence_tones(p: impl Into<ChromePalette>) -> PresenceTones {
     let p = p.into();
     aterm_messages::presence::tones(rgb(p.theme.bg), &band_colors(p), forced_chrome())
 }
 
-/// Build one render cell for compact chrome: `aterm_render::band::cell`, the one table
-/// the native window and the web module share.
+/// Build one render cell for compact chrome.
 pub(crate) use aterm_render::band::cell;
 
 /// A theme-derived blank band cell with a top seam.
@@ -429,18 +331,7 @@ pub(crate) fn blank_cell(p: impl Into<ChromePalette>) -> RenderCell {
     cell(' ', colors.label, colors.bar_bg, false, true)
 }
 
-/// Close a band's content-facing top edge in place, across the whole row in one
-/// tone; the counterpart of the strip's bottom seam ([`crate::tab_bar::strip_seam_rail`]).
-///
-/// Blanking with [`blank_cell`] or `settings::blank_row` stamps the seam, but every
-/// writer then rebuilds the cells it writes from scratch (`settings::write_str` calls
-/// [`cell`] with `seam: false`), leaving the rule only where there are no words.
-/// Drawing it here across the finished row keeps it continuous.
-///
-/// [`blank_cell`] and `settings::blank_row` stamp the seam, but writers rebuild the cells
-/// they write (`settings::write_str` passes `seam: false`), so the rule would survive only
-/// where there are no words. `ink` is the seam's own tone, not each cell's `fg`: a title
-/// row can carry several inks, and a structural edge keeps one.
+/// Close a band's content-facing top edge in place, across the whole row in one tone.
 pub(crate) fn seal_band_top(row: &mut [RenderCell], ink: [u8; 3]) {
     for cell in row.iter_mut() {
         cell.overline = true;
@@ -452,11 +343,7 @@ pub(crate) fn seal_band_top(row: &mut [RenderCell], ink: [u8; 3]) {
 pub(crate) mod hc_fixtures {
     use super::ForcedChrome;
 
-    /// The four stock Windows High Contrast schemes as `GetSysColor` reports them
-    /// (`WINDOW`, `WINDOWTEXT`, `HIGHLIGHT`, `HIGHLIGHTTEXT`, `BTNFACE`), from Settings ▸
-    /// Accessibility ▸ Contrast themes ("Background" = `WINDOW`/`BTNFACE`, "Text" =
-    /// `WINDOWTEXT`, "Selected text" = `HIGHLIGHT`/`HIGHLIGHTTEXT`). Test fixtures, so
-    /// chrome legibility is checked without an HC desktop.
+    /// The four stock Windows High Contrast schemes as `GetSysColor` reports them.
     pub(crate) const STOCK: [(&str, ForcedChrome); 4] = [
         (
             "Aquatic",
@@ -500,9 +387,7 @@ pub(crate) mod hc_fixtures {
         ),
     ];
 
-    /// Install `palette` for `body` on this test thread, restoring the previous value
-    /// (see `TEST_FORCED_CHROME`). A failing assertion ends the thread, and the next
-    /// test on that worker installs its own.
+    /// Install `palette` for `body` on this test thread, restoring the previous value.
     pub(crate) fn with_forced<R>(palette: ForcedChrome, body: impl FnOnce() -> R) -> R {
         let previous = super::forced_chrome();
         super::install_forced_chrome(Some(palette));
@@ -523,8 +408,6 @@ mod tests {
     fn forced_band_colors_meet_wcag_aa_on_every_stock_high_contrast_scheme() {
         for (name, palette) in hc_fixtures::STOCK {
             hc_fixtures::with_forced(palette, || {
-                // The theme is irrelevant under a forced palette, so pass a hostile
-                // one and check none of it reaches the band.
                 let hostile = Theme {
                     fg: 0x0011_1318,
                     bg: 0x0011_1318,
@@ -532,8 +415,6 @@ mod tests {
                     selection: 0x0011_1318,
                 };
                 let colors = band_colors(hostile);
-                // The meter is one palette ink on the WINDOW well (HIGHLIGHT under High
-                // Contrast, whatever the row's severity), with HIGHLIGHTTEXT words.
                 assert_eq!(colors.accent, palette.highlight, "{name}");
                 assert_eq!(colors.meter_track, palette.window, "{name}");
                 assert_eq!(
@@ -557,8 +438,6 @@ mod tests {
                     contrast(colors.caret, colors.field_bg) >= 4.5,
                     "{name} caret must meet WCAG-AA in the well"
                 );
-                // The hovered capsule is HIGHLIGHT under HC with its ink HIGHLIGHTTEXT
-                // floored on it, the scheme's own selected-surface pair.
                 assert_eq!(colors.capsule_hover, palette.highlight, "{name}");
                 assert!(
                     contrast(colors.capsule_hover_ink, colors.capsule_hover) >= 4.5,
@@ -572,9 +451,6 @@ mod tests {
                     ) >= 4.5,
                     "{name} hovered Primary ink must meet WCAG-AA under High Contrast"
                 );
-                // Stock HC schemes set WINDOW == BTNFACE, so the well's fill collapses
-                // into the band; HC separates surfaces with borders, so a border must
-                // appear and contrast against the fill beneath it.
                 if colors.field_bg == colors.bar_bg {
                     let rule = colors.well_rule.unwrap_or_else(|| {
                         panic!(
@@ -621,13 +497,11 @@ mod tests {
         let previous = forced_chrome();
         let _ = crate::native_appearance::take_chrome_inputs_moved();
 
-        // The window attach reads first and takes the edge.
         assert!(install_forced_chrome(Some(hc_fixtures::STOCK[0].1)));
         assert!(
             !install_forced_chrome(Some(hc_fixtures::STOCK[0].1)),
             "the edge is gone: a second install reports no movement"
         );
-        // The re-sample runs later and must still be told to settle the windows.
         assert!(
             crate::native_appearance::take_chrome_inputs_moved(),
             "the palette move was swallowed by the non-resample reader"
@@ -645,7 +519,6 @@ mod tests {
     /// thread-local under `cfg(test)`, so the five-slot atomic codec needs its own test.
     #[test]
     fn the_shipping_palette_codec_round_trips_every_channel() {
-        // Channel-distinct on purpose: a `[0,1,2] -> [2,1,0]` swap has to show.
         for c in [
             [0x00, 0x00, 0x00],
             [0xFF, 0xFF, 0xFF],
@@ -661,8 +534,6 @@ mod tests {
             0x0012_3456,
             "packed as 0x00RRGGBB"
         );
-        // The sentinel has to be unreachable from a real colour, or "no palette" and
-        // white-on-white become the same 32 bits.
         assert!(
             (0..=0xFF).all(|v| pack([v, v, v]) != FORCED_ABSENT),
             "FORCED_ABSENT must not collide with any packed colour"
@@ -670,8 +541,7 @@ mod tests {
     }
 
     /// The publication protocol order: the gate slot closes first, the four tail slots
-    /// follow, and the gate reopens last with the real `window`. Read from
-    /// [`publish_sequence`], since the order is unobservable after the write.
+    /// follow, and the gate reopens last with the real `window`.
     #[test]
     fn the_palette_gate_slot_is_written_last() {
         let p = hc_fixtures::STOCK[1].1;
@@ -692,8 +562,7 @@ mod tests {
     }
 
     /// The shipping codec on the real atomics: each field lands in its own slot, and
-    /// the gate slot alone decides whether a palette is visible. The only test that
-    /// touches [`FORCED_CHROME`].
+    /// the gate slot alone decides whether a palette is visible.
     #[test]
     fn published_forced_chrome_is_all_or_nothing() {
         assert_eq!(published_forced_chrome(), None, "starts absent");
@@ -708,7 +577,6 @@ mod tests {
             assert!(!publish_forced_chrome(Some(palette)), "{name}: idempotent");
             last = Some(palette);
         }
-        // The gate alone gates: close it and the tail slots become invisible.
         FORCED_CHROME[0].store(FORCED_ABSENT, Ordering::Release);
         assert_eq!(
             published_forced_chrome(),
@@ -754,22 +622,18 @@ mod tests {
     /// Warn/Error row), floored against the band, and the glint is one fixed
     /// perceptual step of that fill away from its words' ink, so the words only gain
     /// contrast under it and the hot head clears 3:1 on the track wherever the fill
-    /// does. The tail gradient and the warn wash are decorative and exempt.
+    /// does.
     fn meter_floors(name: &str, colors: &BandColors) {
         for fill in [colors.accent, colors.warn] {
             let inks = crate::message_band::MeterInks::of(colors, fill);
-            // The head is a comet's: its inks are the comet's (a bar has none).
             let comet = crate::message_band::MeterInks::comet(colors, fill).0;
             let head = crate::message_band::tone_rgb(aterm_messages::Tone::HEAD, &comet);
             let words = crate::message_band::fill_ink(colors, fill);
-            // The glint is the fill's one step away from those words.
             assert_eq!(
                 inks.glint,
                 crate::message_band::glint_step(fill, words, false),
                 "{name}"
             );
-            // One of black and white always clears AA on the fill, so the
-            // floor, which crosses to the far pole when it must, always meets it.
             assert!(
                 contrast(ensure_contrast(colors.label, fill, 4.5), fill) >= 4.5,
                 "{name}: no ink reaches AA on {fill:?}"
@@ -796,8 +660,7 @@ mod tests {
     /// for the theme last asked for, nothing is derived and the tones are the
     /// derivation's exactly; every other theme, the same theme with the
     /// meter's hues, and the first theme again each derive anew, their tones
-    /// their own. NEGATIVE CONTROLS: the counter sees each derivation, and the
-    /// themes' tones differ, so a tone kept for the wrong theme would show.
+    /// their own.
     #[test]
     fn band_tones_are_derived_once_per_theme() {
         let derive = |theme: Theme, ansi: Option<MeterAnsi>| {
@@ -851,7 +714,6 @@ mod tests {
                 "the hues are the key's too"
             );
             assert_eq!(crate::work_counts::take_band_derives(), 1);
-            // So is what the theme authored.
             let _ = band_colors(ChromePalette {
                 theme,
                 ansi: Some(ansi),
@@ -871,7 +733,6 @@ mod tests {
 
     #[test]
     fn band_colors_meet_wcag_aa_on_every_builtin_scheme() {
-        // Theme-derived tones exist only with no OS palette; a leaked palette fails here.
         assert_eq!(
             forced_chrome(),
             None,
@@ -891,15 +752,10 @@ mod tests {
                     "{name} {role} must meet WCAG-AA"
                 );
             }
-            // The inset well carries the find query and its caret, which must clear AA
-            // against the well's background, not the band's.
             assert!(
                 contrast(colors.caret, colors.field_bg) >= 4.5,
                 "{name} caret must meet WCAG-AA in the well"
             );
-            // Message band capsules: the hovered chip's label clears AA on the hover
-            // fill, and the Primary chip's ink (`bar_bg` on `accent`) clears the 3:1
-            // non-text floor the meter fill is held to.
             assert!(
                 contrast(colors.capsule_hover_ink, colors.capsule_hover) >= 4.5,
                 "{name} hovered capsule label must meet WCAG-AA"
@@ -913,11 +769,7 @@ mod tests {
                 contrast(colors.bar_bg, colors.accent) >= 3.0,
                 "{name} Primary capsule ink must clear 3:1 on the accent fill"
             );
-            // The meter's glint and hot head keep their floors.
             meter_floors(name, &colors);
-            // The lit Primary keeps that floor with the same ink and is a visible step
-            // off the resting accent wherever the ink is not the accent itself, so a
-            // hovered `Apply now` reads as lit, not disabled.
             assert_eq!(colors.capsule_primary_hover_ink, colors.bar_bg, "{name}");
             assert!(
                 contrast(
@@ -931,9 +783,6 @@ mod tests {
                     colors.capsule_primary_hover, colors.accent,
                     "{name}: the lit Primary must move off the resting accent"
                 );
-                // At least `PRIMARY_HOVER_LIFT` of the way from accent to ink on every
-                // channel (up to two `mix3` roundings); the 3:1 floor against `bar_bg`
-                // can only push it further.
                 let lifted = mix3(colors.accent, rgb(theme.fg), PRIMARY_HOVER_LIFT);
                 for (c, &want) in lifted.iter().enumerate() {
                     let (a, f, lit, want) = (
@@ -942,7 +791,6 @@ mod tests {
                         f32::from(colors.capsule_primary_hover[c]),
                         f32::from(want),
                     );
-                    // Progress along the accent→ink axis, signed by that axis.
                     let toward = (f - a).signum();
                     assert!(
                         (lit - a) * toward + 1.0 >= (want - a) * toward,
@@ -956,8 +804,6 @@ mod tests {
                 colors.capsule_primary_hover, colors.capsule_hover,
                 "{name}: the lit Primary is not the grey hover"
             );
-            // …and the hover fill is a real step off the band wherever the ink allows
-            // one, so a hovered chip is visibly raised.
             if contrast(colors.value, mix3(colors.bar_bg, rgb(theme.fg), 0.05)) >= 4.5 {
                 assert_ne!(
                     colors.capsule_hover, colors.bar_bg,

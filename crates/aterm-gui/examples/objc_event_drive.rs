@@ -49,6 +49,7 @@ mod macos {
     use super::{ABORTED, FAIL, NOT_RUN, PASS};
 
     /// The fatal-signal trap: turn the abort a row's trampoline performs into
+    /// `exit 3` with the row's name on stdout, instead of a crash dialog.
     mod trap {
         use std::cell::UnsafeCell;
         use std::ffi::{c_int, c_void};
@@ -148,6 +149,7 @@ mod macos {
     const CONTROL_PANIC: &str = "panic";
 
     /// Long enough for macOS to launch its `NSApplication`, hand back a window
+    /// and run every stage; past it the drive reports NOT RUN.
     const BUDGET: Duration = Duration::from_secs(60);
     /// How long the control child may take to abort before it is a hang.
     const CONTROL_WATCHDOG: Duration = Duration::from_secs(20);
@@ -500,6 +502,9 @@ mod macos {
 
     aterm_objc::declare_class! {
         /// The controls' class: `poke:` sends a key-only accessor to whatever event
+        /// arrived, inside the same `declare_class!` trampoline the view's rows run
+        /// under; `panicInside` panics in Rust there; `alive` is the later send that
+        /// proves the object and runtime survive a containment.
         struct EventDriveControl: NSObject {
             const NAME: &str = "ATermObjcEventDriveControl";
             type Ivars = ();
@@ -582,6 +587,7 @@ mod macos {
     }
 
     /// What a control child did: its signal, or its exit code with both
+    /// output streams.
     enum ControlOutcome {
         Signalled(i32, String),
         Exited(Option<i32>, String, String),
@@ -693,6 +699,7 @@ mod macos {
         }
 
         /// The `NSWindow` holding the view, and its number — the number is
+        /// what the factories take so `-[NSEvent window]` resolves.
         fn window_number(&self) -> Option<isize> {
             let view = self.view()?;
             // SAFETY: `-window` is `@@:` on `NSView` and `-windowNumber` is `q@:` on `NSWindow`.
@@ -711,7 +718,7 @@ mod macos {
             events.iter().filter(|e| e.as_str() == name).count()
         }
 
-        /// Enter one row with one event and log the survival. A nil event means the
+        /// Enter one row with one event and log the survival.
         fn drive(&mut self, view: Id, row: Sel, row_name: &str, event: Id, shape: &str) {
             if event.is_null() {
                 let why = format!("{row_name} <- {shape}: the event could not be built");
@@ -1295,6 +1302,8 @@ mod macos {
         }
 
         /// Every shape through `-[NSApplication sendEvent:]` — `app.rs`'s
+        /// override, and behind it AppKit's own routing into the window and
+        /// the view.
         fn stage_send_event(&mut self, win: isize) {
             println!("\n=== 7. -[NSApplication sendEvent:] with every shape ===");
             let _ = self.drain();
@@ -1392,6 +1401,9 @@ mod macos {
     }
 
     /// A row that never returns (a deadlock in a trampoline, a modal tracking loop
+    /// entered from a button row) would sit inside `about_to_wait` forever, since
+    /// `BUDGET` is consulted only between pumps; this thread names the row through the
+    /// trap's buffer and exits 3.
     fn arm_hang_watchdog() {
         std::thread::Builder::new()
             .name("objc-event-drive-hang".into())

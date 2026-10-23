@@ -65,6 +65,13 @@ pub use shim::{Instant, SystemTime, SystemTimeError, UNIX_EPOCH};
 /// }
 /// aterm_time::wasm_clock_host!(performance_now, date_now);
 /// ```
+/// fn performance_now() -> f64 {
+///     0.0
+/// }
+/// fn date_now() -> f64 {
+///     0.0
+/// }
+/// aterm_time::wasm_clock_host!(performance_now, date_now);
 #[macro_export]
 macro_rules! wasm_clock_host {
     ($performance_now:path, $date_now:path $(,)?) => {

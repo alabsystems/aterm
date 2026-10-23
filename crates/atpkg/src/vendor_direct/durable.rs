@@ -1,8 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The vendor lane's small-file I/O: a durable replace, a bounded read, and the lock a
-//! read-modify-write holds.
+//! The vendor lane's small-file I/O.
 
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -18,12 +17,7 @@ const LOCK_WAIT: Duration = Duration::from_secs(5);
 /// Per-process sequence for temp names, so no two writes share a temp.
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Replace `path` with `bytes`: a fresh `0644` temp sibling, fsync, rename, directory
-/// fsync. A reader sees the old file or the new one, never a torn one. Every call stages
-/// through its own exclusively created temp (pid plus a per-process sequence), so two
-/// writers — threads or processes — never write through one inode; a crash leaves at most
-/// a `.<name>.tmp-<pid>-<seq>` that no reader opens.
-///
+/// Replace `path` with `bytes`: a fresh `0644` temp sibling, fsync, rename, directory fsync.
 /// # Errors
 /// The temp could not be created, written, flushed or renamed; the temp is removed.
 pub(crate) fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -31,11 +25,7 @@ pub(crate) fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
     replace_via(&tmp, path, bytes)
 }
 
-/// [`write_durable`], every flush only ORDERED ([`aterm_durable::ordered`]): the temp's bytes
-/// land before the rename names them, and the name before any later write, so a reader
-/// after a power loss finds the old file or the whole new one, never a torn one, but
-/// perhaps the old one. For a record the next pass writes again (the vendor stamp).
-///
+/// [`write_durable`], every flush only ORDERED ([`aterm_durable::ordered`]).
 /// # Errors
 /// As [`write_durable`].
 pub(crate) fn write_ordered(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -53,7 +43,6 @@ pub(crate) fn write_ordered(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 /// [`write_durable`] through the temp `tmp`.
 fn replace_via(tmp: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
-    // Only a dead process that had our pid can have left this name.
     let _ = std::fs::remove_file(tmp);
     if let Err(error) =
         stage(tmp, bytes).and_then(|()| again_while_refused(|| std::fs::rename(tmp, path)))
@@ -72,17 +61,6 @@ const REFUSED_TRIES: u64 = 20;
 
 /// `op`, tried again while Windows refuses it with `ERROR_ACCESS_DENIED`; elsewhere, `op`
 /// once.
-///
-/// POSIX `rename(2)` replaces a name atomically whoever else is replacing it, and hands
-/// a reader the old file or the new one. Windows refuses both for as long as another
-/// replace of that name is in flight: `MoveFileExW` answers `ERROR_ACCESS_DENIED` to a
-/// second writer the contract above admits, and an open answers it while the old file is
-/// delete-pending. The snapshot of 2026-09-29 (6ad1a274d8) measured both on Windows in
-/// `concurrent_writers_never_tear_the_file`: a writer failed within the 800 writes, and a
-/// reader met the refusal, which [`read_toml`] would have answered as "absent". The other
-/// replace finishes in microseconds, so a refusal is tried again, briefly; one that
-/// outlasts the tries (a real denial, a scanner holding the file without delete sharing)
-/// is the caller's error as before.
 fn again_while_refused<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     #[cfg(windows)]
     {
@@ -103,13 +81,7 @@ fn again_while_refused<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T
     }
 }
 
-/// Hold the exclusive lock `<path>.lock` (created `0600`) while a caller reads, changes
-/// and replaces `path`. `flock` excludes other open descriptions, so this serializes
-/// threads of one process as well as processes. Released by `LOCK_UN` on drop
-/// ([`Flock`]): a lock released only by the close stays held while any child another
-/// thread is spawning still holds a copy of the descriptor, and every writer queued behind
-/// it waits that spawn out of its [`LOCK_WAIT`] too.
-///
+/// Hold the exclusive lock `<path>.lock` while a caller reads, changes and replaces `path`.
 /// # Errors
 /// The lock could not be created or was not granted within [`LOCK_WAIT`].
 pub(super) fn lock_for_update(path: &Path) -> io::Result<Flock> {
@@ -168,7 +140,6 @@ fn stage_with(
     crate::platform::set_mode_on(&f, 0o644)?;
     f.write_all(bytes)?;
     match flush(&f) {
-        // A volume that cannot flush (some network or FUSE mounts) is not a failure.
         Err(e)
             if !matches!(
                 e.kind(),
@@ -200,8 +171,7 @@ fn create_temp(tmp: &Path) -> io::Result<std::fs::File> {
         .open(tmp)
 }
 
-/// Read `path` as TOML of type `T`: `None` when it is absent, not a bounded regular file,
-/// not UTF-8, or does not parse.
+/// Read `path` as TOML of type `T`.
 pub(super) fn read_toml<T: serde::de::DeserializeOwned>(path: &Path, limit: usize) -> Option<T> {
     let text = read_durable(path, limit).ok()?;
     aterm_toml::from_str(&text).ok()
@@ -329,7 +299,6 @@ mod tests {
                     })
                 })
                 .collect();
-            // Through the lane's own reader, as every reader of these files reads them.
             let reader = s.spawn(|| {
                 while !done.load(Ordering::Relaxed) {
                     let got = read_durable(&dest, 1024 * 1024).unwrap().into_bytes();

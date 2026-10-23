@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! Native casks install the plain-data artifact kinds (app, binary,
-//! font, manpage, suites, plugins, generic artifacts, generated
-//! wrappers) from bounded zip/tar payloads and read-only mounted
-//! disk images, including `container nested:` archives and
-//! `depends_on` dependencies poured first. Recipe-executing
-//! artifacts and pkg installers need Homebrew's full recipe and
-//! pass through before any native installation changes.
+
+//! Native cask installation from bounded archives and read-only disk images.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -22,7 +17,6 @@ use super::machine::Machine;
 use super::prefix::{Kind, Prefix, owned_receipt};
 
 /// Apply the variation for `machine`, when the cask carries any.
-/// The resolved clone drops `variations` so re-resolving is a no-op.
 pub(super) fn resolve<'c>(
     cask: &'c Cask,
     machine: &Machine,
@@ -68,8 +62,7 @@ pub(super) fn resolve<'c>(
     Ok(std::borrow::Cow::Owned(resolved))
 }
 
-/// The pre-lock delegation check for one cask on `machine`: every
-/// PassThrough the install itself would raise before downloading.
+/// The pre-lock delegation check for one cask on `machine`.
 pub(super) fn preflight(
     prefix: &Prefix,
     cask: &Cask,
@@ -141,10 +134,7 @@ pub(super) fn preflight(
     Ok(())
 }
 
-/// The dependency half of preflight: every `depends_on` formula or
-/// cask that is not already installed must itself plan natively
-/// (cask deps recursively), so delegation still happens before any
-/// effect — a cask never half-lands and then delegates its dep.
+/// The dependency half of preflight.
 pub(super) fn preflight_deps(
     catalog: &dyn Catalog,
     prefix: &Prefix,
@@ -190,10 +180,7 @@ fn preflight_deps_inner(
     Ok(())
 }
 
-/// Install a cask after its `depends_on` dependencies, brew's
-/// order: formula deps as dependencies (receipts record them as
-/// not-on-request), cask deps recursively, then the cask itself.
-/// Deps already installed are left exactly as they stand.
+/// Install a cask after its `depends_on` dependencies, brew's order.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn install_with_deps(
     api: &super::api::Api,
@@ -269,9 +256,7 @@ fn install_deps_inner(
     Ok(())
 }
 
-/// Install one cask the user named (on request). Unsupported recipes
-/// refuse before downloading or placing artifacts. A missing
-/// `no_check` cache entry still has to be downloaded.
+/// Install one cask the user named (on request).
 pub fn install(
     prefix: &Prefix,
     cask: &Cask,
@@ -312,8 +297,6 @@ fn install_inner(
     }
     let mut replacing = false;
     let mut same_version_reinstall = false;
-    // Upgrade/reinstall preserve the recorded install intent, like brew
-    // preserves the tab; only a fresh install takes the caller's word.
     let mut effective_on_request = on_request;
     if let Some(inst) = prefix.installed_one(Kind::Cask, &cask.token) {
         if let Some(old) = super::prefix::receipt_word(
@@ -385,9 +368,6 @@ fn install_inner(
     prefix.ensure()?;
     let dest = prefix.cache().join(&file);
     let expected = cask.sha256.as_deref().unwrap_or("no_check");
-    // A no_check payload is bound to neither version nor URL, so its
-    // cache entry is never reused: always re-download, never receipt
-    // stale bytes under the current version.
     let reusable = cask.sha256.is_some() && fetch::verify_sha256(&dest, expected).is_ok();
     if !reusable {
         eprintln!("==> Fetching cask {} ({})", cask.token, cask.version);
@@ -398,9 +378,6 @@ fn install_inner(
         aterm_tempfile::TempDir::new_in(prefix.caskroom()).map_err(|e| format!("abrew: {e}"))?;
     let payload = work.path().join("payload");
     if cask.naked {
-        // The download is the single payload file; stage it under its
-        // URL basename (template-expanded like the cache name minus the
-        // token prefix), executable when a binary artifact names it.
         std::fs::create_dir_all(&payload).map_err(|e| format!("abrew: {e}"))?;
         let cached_name = dest
             .file_name()
@@ -412,10 +389,6 @@ fn install_inner(
             .to_string();
         let staged_file = payload.join(&base);
         fetch::copy_regular(&dest, &staged_file)?;
-        // Brew stages a naked download under the artifact's stated
-        // source name, which need not be the URL basename (p4's binary
-        // source is its URL's parent directory). Stage a copy under
-        // every single-component artifact source name.
         for (relative, _, _, _) in &artifacts {
             if relative.components().count() == 1
                 && relative.to_string_lossy() != base.as_str()
@@ -445,9 +418,6 @@ fn install_inner(
     if !cask.naked {
         let extraction_error = |e: String| extraction_error(&cask.token, e);
         if let Some(nested) = &cask.nested {
-            // `container nested:` — the download only wraps the real
-            // payload archive. Unpack the outer archive privately,
-            // then the named inner archive becomes the payload.
             let outer = work.path().join("outer");
             std::fs::create_dir_all(&outer).map_err(|e| format!("abrew: {e}"))?;
             fetch::untar(&dest, &outer).map_err(extraction_error)?;
@@ -481,14 +451,12 @@ fn install_inner(
         #[cfg(unix)]
         let valid = {
             use std::os::unix::fs::PermissionsExt;
-            // Only binaries must be executable; fonts and manpages are data.
             valid
                 && (!*exec
                     || src
                         .metadata()
                         .is_ok_and(|m| m.permissions().mode() & 0o111 != 0))
         };
-        // No mode bits off unix: an artifact there is valid by its kind alone.
         #[cfg(not(unix))]
         let _ = exec;
         if !valid {
@@ -518,8 +486,6 @@ fn install_inner(
         ("version", &cask.version),
         ("installed_by", "abrew"),
         ("installed_on_request", on_request_word),
-        // Casks resolve from the homebrew/cask API, where the token
-        // is the full identity (`list --full-name` adds the tap).
         ("full_name", &cask.token),
     ];
     for (k, v) in &artifact_fields {
@@ -551,8 +517,6 @@ fn install_inner(
 }
 
 /// Record the complete destination set only when every path is lossless UTF-8.
-/// Otherwise retain the legacy, identity-checked target survey for this version;
-/// a lossy spelling must never exclude an owned link while its payload is removed.
 fn artifact_receipt_fields(links: &[InstallLink]) -> Vec<(String, String)> {
     links
         .iter()
@@ -567,8 +531,7 @@ fn artifact_receipt_fields(links: &[InstallLink]) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-/// New writes record prefix-relative names too: the artifact path remains lossless
-/// when the prefix itself is not UTF-8. Legacy absolute fields stay for old readers.
+/// New writes record prefix-relative names too.
 fn complete_artifact_receipt_fields(
     prefix: &Prefix,
     links: &[InstallLink],
@@ -621,8 +584,6 @@ fn recorded_artifact_paths(
         }
         relative.insert(prefix.root.join(path));
     }
-    // Absolute-only receipts under a non-UTF8 prefix may have been written lossily.
-    // Preserve that version's legacy, identity-checked survey instead of trusting it.
     if relative.is_empty() && prefix.root.to_str().is_none() {
         return Ok(None);
     }
@@ -702,7 +663,6 @@ fn wrapper_program(
         return Ok(None);
     }
     let relative = if executable.starts_with("$HOMEBREW_PREFIX/") {
-        // prince's wrapper execs from its own staged Caskroom tree.
         rebase_prefix_source(cask, executable).ok_or_else(|| {
             InstallError::PassThrough(
                 "wrapper executable is outside the admitted payload mapping".to_string(),
@@ -723,16 +683,7 @@ fn wrapper_program(
     Ok(Some(PathBuf::from(relative)))
 }
 
-/// Some casks ship an artifact inside a same-named nested tar
-/// (restic-browser: the zip holds only `Restic-Browser.app.tar`,
-/// and brew's container handling unpacks it to the app). When an
-/// artifact source is missing but `<source>.tar` sits in the
-/// payload as a regular file, extract it in place with the same
-/// bounded extractor; the artifact census below still judges the
-/// result. Nothing else about the payload changes.
-/// Classify an extraction failure for cask payloads. Container
-/// FORMATS the vetted readers do not speak (bzip2/xz magic) and zip
-/// Payload names cannot turn a disk-image vetting refusal into delegation.
+/// Unpack a single same-named nested tar if present.
 fn dmg_error(token: &str, e: fetch::DmgError) -> InstallError {
     match e {
         fetch::DmgError::Attach(_) => InstallError::PassThrough(format!(
@@ -743,14 +694,7 @@ fn dmg_error(token: &str, e: fetch::DmgError) -> InstallError {
     }
 }
 
-/// STRUCTURES the strict central-directory reader refuses (trailing
-/// bytes after the end record, multi-disk, encryption, an unknown
-/// method — real casks ship such zips, e.g. an appended signature
-/// blob past the end record, and brew's `ditto` tolerates them)
-/// delegate to real brew. The download's sha256 gate already proved
-/// the bytes are upstream's, so a structural refusal is an upstream
-/// shape, not corruption. Vetting refusals (slip entries, bomb caps)
-/// render differently and stay hard failures.
+/// Extract a zip archive using the system `unzip` when the strict reader refuses it.
 fn extraction_error(token: &str, e: String) -> InstallError {
     if e.contains("unsupported archive") || e.contains("io: zip: ") {
         InstallError::PassThrough(format!(
@@ -774,10 +718,6 @@ fn extract_nested_tars(
         if std::fs::symlink_metadata(&nested)
             .is_ok_and(|m| m.file_type().is_file() && !m.file_type().is_symlink())
         {
-            // The bounded extractor wants an empty destination:
-            // unpack beside the payload trees, then rename the
-            // top-level entries in. A name already in the payload
-            // is a refusal, never an overwrite.
             let staging = aterm_tempfile::TempDir::new_in(payload)
                 .map_err(|e| InstallError::Failed(format!("abrew: {e}")))?;
             fetch::untar(&nested, staging.path()).map_err(|e| extraction_error(token, e))?;
@@ -890,8 +830,7 @@ fn stage_wrappers(
     Ok(())
 }
 
-/// Rebase an `/Applications/<installed>/...` source onto the app
-/// artifact's payload path, when this cask installs that app.
+/// Rebase an `/Applications/<installed>/...` source onto the app artifact's payload path.
 fn rebase_app_source(app_bases: &[(String, String)], name: &str) -> Option<String> {
     let rest = name.strip_prefix("/Applications/")?;
     let (installed, tail) = rest.split_once('/')?;
@@ -899,13 +838,7 @@ fn rebase_app_source(app_bases: &[(String, String)], name: &str) -> Option<Strin
     Some(format!("{src}/{tail}"))
 }
 
-/// Rebase a `$HOMEBREW_PREFIX/...` artifact source onto this cask's
-/// payload: its own staged Caskroom tree
-/// (`$HOMEBREW_PREFIX/Caskroom/<token>/<version>/...`: brew stages the
-/// payload in exactly that tree, and so does abrew), or the install tree
-/// of one of its generic artifacts (`$HOMEBREW_PREFIX/share/<x>/.../bin/tool`
-/// sources from that artifact's payload path). Another cask's or version's
-/// tree, and any other prefix path, has no payload mapping.
+/// Rebase a `$HOMEBREW_PREFIX/...` artifact source onto this cask's payload.
 fn rebase_prefix_source(cask: &Cask, name: &str) -> Option<String> {
     let rest = name.strip_prefix("$HOMEBREW_PREFIX/")?;
     let own = format!("Caskroom/{}/{}/", cask.token, cask.version);
@@ -935,23 +868,17 @@ fn wrapper_rel(file: &str) -> PathBuf {
 }
 
 /// Map a generic artifact's absolute stated target into the prefix.
-/// Only `$HOMEBREW_PREFIX/...`, home-`Library/...` and `$APPDIR/...`
-/// targets have a prefix-local meaning; everything else delegates.
 fn map_generic_target(prefix: &Prefix, target: &str) -> Option<PathBuf> {
     super::formula::generic_target_relative(target).map(|relative| prefix.root.join(&*relative))
 }
 
-/// (payload-relative source, destination, is-directory, must-be-executable)
+/// (payload-relative source, destination, is-directory, must-be-executable).
 fn artifact_paths(
     prefix: &Prefix,
     cask: &Cask,
 ) -> Result<Vec<(PathBuf, PathBuf, bool, bool)>, InstallError> {
     let mut paths = Vec::new();
     let mut destinations = BTreeSet::new();
-    // A later artifact may also source from inside this cask's own
-    // installed app (`/Applications/<App>.app/Contents/...` — brew
-    // links such binaries into the installed app; abrew links into
-    // the same app inside its payload tree).
     let app_bases: Vec<(String, String)> = cask
         .artifacts
         .iter()
@@ -1096,9 +1023,6 @@ fn artifact_paths(
                 continue;
             }
             Artifact::Other(kind) => {
-                // Name the artifact that forced delegation: a bare
-                // "unsupported" makes every upstream recipe change
-                // look like an abrew regression (1password-cli's
                 // generate_completions_from_executable did).
                 return Err(InstallError::PassThrough(format!(
                     "cask {} has an unsupported artifact recipe ({kind})",
@@ -1113,9 +1037,6 @@ fn artifact_paths(
             }
         };
         let rebased;
-        // An artifact may source from inside the prefix: its own staged
-        // Caskroom tree (android-platform-tools' binaries) or a generic
-        // artifact's install tree.
         let name: &str = if name.starts_with("$HOMEBREW_PREFIX/") {
             let Some(r) = rebase_prefix_source(cask, name) else {
                 return Err(InstallError::PassThrough(format!(
@@ -1170,14 +1091,12 @@ fn artifact_paths(
 }
 
 /// Remove links into receipt-admitted versions and only those payloads.
-/// Unknown sibling versions and user data (`zap`) remain untouched.
 pub fn uninstall(prefix: &Prefix, token: &str, dry_run: bool) -> Result<(), InstallError> {
     let directories = artifact_directories(prefix, PathBuf::from("/Applications"))?;
     uninstall_from(prefix, token, dry_run, &directories)
 }
 
-/// Legacy unrecorded artifacts used these roots. New complete receipts add their
-/// exact checked parents in UninstallPlan, with no guessed depth-limited tree census.
+/// Legacy unrecorded artifacts used these roots.
 fn artifact_directories(
     prefix: &Prefix,
     applications: PathBuf,
@@ -1192,9 +1111,6 @@ fn artifact_directories(
         prefix.root.join("Library/Services"),
         applications,
     ];
-    // Retain the discoverable legacy Generic subset. Bound depth as before,
-    // propagate uncertainty, and never traverse an alias. Recorded new artifacts
-    // add their exact parents separately, without depending on this depth limit.
     let mut pending = vec![
         (prefix.root.join("share"), 3_u8),
         (prefix.root.join("Library"), 2_u8),
@@ -1226,8 +1142,6 @@ fn artifact_directories(
     if std::fs::symlink_metadata(&man).is_ok_and(|metadata| {
         metadata.file_type().is_symlink() || crate::platform::is_reparse(&metadata)
     }) {
-        // A recorded Generic final artifact may be this name. Do not follow it;
-        // the plan must admit that exact leaf or refuse it as a directory alias.
         directories.push(man);
         return Ok(directories);
     }
@@ -1247,7 +1161,6 @@ fn artifact_directories(
             .file_type()
             .map_err(|error| format!("abrew: cannot inspect manpage entry: {error}"))?;
         if entry.file_name().to_string_lossy().starts_with("man") {
-            // A final artifact link belongs to its physical parent survey;
             // it is never traversed as a manpage directory.
             if kind.is_dir() {
                 directories.push(entry.path());
@@ -1257,8 +1170,6 @@ fn artifact_directories(
     Ok(directories)
 }
 
-// The production directory roster is fixed above. Captures supply only their own
-// directories, so the preservation regression never enumerates global applications.
 fn uninstall_from(
     prefix: &Prefix,
     token: &str,
@@ -1334,10 +1245,7 @@ impl UninstallPlan {
                 }
             }
         }
-        // Survey every artifact directory before removing any entry or payload.
-        // Only NotFound proves a directory absent; a planned pathname is not authority.
         for dir in &directories {
-            // A declared final directory link is removed from its checked parent,
             // never surveyed through. Other directory aliases still refuse below.
             if recorded.iter().any(|(version, paths)| {
                 paths.contains(dir)
@@ -1452,8 +1360,6 @@ impl UninstallPlan {
     }
 
     fn apply(self, prefix: &Prefix) -> Result<(), InstallError> {
-        // Admit the whole plan first, then recheck each entry immediately before
-        // removal. Independent filesystem writers are not an atomic transaction.
         for parent in self.parents.keys() {
             self.check_parent(prefix, parent)?;
         }
@@ -1496,8 +1402,6 @@ mod tests {
             map_generic_target(&prefix, "/$HOME/Library/Services/W.workflow"),
             Some(prefix.root.join("Library/Services/W.workflow"))
         );
-        // $APPDIR is the cask appdir: brew's /Applications, abrew's
-        // prefix Applications (electricbinary, liclipse).
         assert_eq!(
             map_generic_target(&prefix, "$APPDIR/Demo.app"),
             Some(prefix.root.join("Applications/Demo.app"))
@@ -1533,7 +1437,6 @@ mod tests {
             "Library/QuickLook".to_string(),
         )];
         assert!(artifact_paths(&prefix, &library).is_err());
-        // The actual writer emits only into a namespace it just reserved.
         let payload = tmp.path().join("payload");
         std::fs::create_dir(&payload).unwrap();
         let wrapper = Cask {
@@ -1741,8 +1644,6 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"naked ready\n");
-        // A plain reinstall of the same cask at a newer version is a
-        // replacement (delegated); as an upgrade it swaps natively.
         std::fs::write(&download, b"#!/bin/sh\nprintf 'naked ready2\\n'\n").unwrap();
         c.version = "2".to_string();
         assert!(matches!(
@@ -1757,7 +1658,6 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(output.stdout, b"naked ready2\n");
-        // Same-version reinstall swaps the payload in place.
         std::fs::write(&download, b"#!/bin/sh\nprintf 'naked readyR\\n'\n").unwrap();
         assert_eq!(install(&prefix, &c, false, true, false, true).unwrap(), "2");
         let output = aterm_uds::spawnfd::command(prefix.bin().join("staged-name"))
@@ -1768,8 +1668,6 @@ mod tests {
             std::fs::symlink_metadata(prefix.caskroom().join(".abrew-reinstall-demo-2")).is_err()
         );
         uninstall(&prefix, "demo", false).unwrap();
-        // A dependency install records not-on-request, and a later
-        // upgrade preserves that recorded intent.
         std::fs::write(&download, b"#!/bin/sh\nprintf 'dep ready\\n'\n").unwrap();
         c.version = "1".to_string();
         assert_eq!(
@@ -1798,7 +1696,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn container_nested_archive_becomes_the_payload() {
-        // gearboy's shape: the download wraps the real payload zip.
         let tmp = aterm_tempfile::tempdir().unwrap();
         let prefix = Prefix::at(&tmp.path().join("prefix"));
         let inner = zip_bytes(
@@ -1844,7 +1741,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn nested_app_tar_inside_the_zip_is_extracted() {
-        // restic-browser's shape: the zip holds only Demo.app.tar.
         let tmp = aterm_tempfile::tempdir().unwrap();
         let prefix = Prefix::at(&tmp.path().join("prefix"));
         let inner = tar_bytes(&[
@@ -1918,8 +1814,6 @@ mod tests {
                 InstallError::Failed(_)
             ));
         }
-        // Zip structures the strict reader refuses (empoche ships
-        // ~80KB past its end record) delegate to brew's extractor.
         assert!(matches!(
             extraction_error(
                 "empoche",
@@ -1935,7 +1829,6 @@ mod tests {
             ),
             InstallError::PassThrough(_)
         ));
-        // Vetting refusals and plain IO failures stay hard failures.
         assert!(matches!(
             extraction_error(
                 "x",
@@ -1957,8 +1850,6 @@ mod tests {
         let tmp = aterm_tempfile::tempdir().unwrap();
         let prefix = Prefix::at(&tmp.path().join("prefix"));
         let c = cask("unused.zip".to_string());
-        // prince's shape: the wrapper execs from its own staged
-        // Caskroom tree.
         assert_eq!(
             wrapper_program(
                 &prefix,
@@ -1968,7 +1859,6 @@ mod tests {
             .unwrap(),
             Some(PathBuf::from("staged/bin/tool"))
         );
-        // Another cask's tree, or another version, does not rebase.
         for exe in [
             "$HOMEBREW_PREFIX/Caskroom/other/1/bin/tool",
             "$HOMEBREW_PREFIX/Caskroom/demo/2/bin/tool",
@@ -1985,8 +1875,6 @@ mod tests {
     fn caskroom_sourced_binary_rebases_onto_own_payload() {
         let tmp = aterm_tempfile::tempdir().unwrap();
         let prefix = Prefix::at(&tmp.path().join("prefix"));
-        // android-platform-tools' shape: each binary sources from the
-        // cask's own staged Caskroom tree.
         let mut c = cask("unused.zip".to_string());
         c.artifacts = vec![Artifact::Binary(
             "$HOMEBREW_PREFIX/Caskroom/demo/1/platform-tools/adb".to_string(),
@@ -2002,8 +1890,6 @@ mod tests {
                 true
             )]
         );
-        // Another cask's tree, another version's, or an escape from
-        // its own still delegates.
         for source in [
             "$HOMEBREW_PREFIX/Caskroom/other/1/platform-tools/adb",
             "$HOMEBREW_PREFIX/Caskroom/demo/2/platform-tools/adb",
@@ -2024,9 +1910,6 @@ mod tests {
     fn applications_sourced_binary_rebases_onto_the_app_payload() {
         let tmp = aterm_tempfile::tempdir().unwrap();
         let prefix = Prefix::at(&tmp.path().join("prefix"));
-        // ruffle's shape: the binary sources from inside the app the
-        // same cask installs, spelled by its installed /Applications
-        // path.
         let mut c = cask("unused.zip".to_string());
         c.artifacts = vec![
             Artifact::App("Demo.app".to_string(), None),
@@ -2041,7 +1924,6 @@ mod tests {
                 && dst == &prefix.bin().join("tool")
                 && *exec
         }));
-        // Renamed app: the installed name is the rebase key.
         c.artifacts = vec![
             Artifact::App(
                 "build/Demo.app".to_string(),
@@ -2058,7 +1940,6 @@ mod tests {
                 .iter()
                 .any(|(src, _, _, _)| src == &PathBuf::from("build/Demo.app/Contents/MacOS/tool"))
         );
-        // No matching app artifact: still delegates.
         c.artifacts = vec![Artifact::Binary(
             "/Applications/Other.app/Contents/MacOS/tool".to_string(),
             None,
@@ -2085,9 +1966,6 @@ mod tests {
             ));
             assert!(!prefix.root.exists());
         }
-        // The delegation message names the artifact kind, so an
-        // upstream recipe change reads as upstream, not as abrew
-        // silently losing a cask it used to pour.
         let mut named = cask("unused.zip".to_string());
         named.artifacts.push(Artifact::Other(
             "generate_completions_from_executable".to_string(),
@@ -2108,8 +1986,6 @@ mod tests {
             Err(InstallError::PassThrough(_))
         ));
         assert!(!prefix.root.exists());
-        // `depends_on` formula/cask names are data now: they parse
-        // into dependency lists the dep preflight/install walks.
         let with_deps = aterm_json::from_str(
             r#"{"token":"demo","version":"1","url":"unused.zip","sha256":"no_check","depends_on":{"formula":["other"],"cask":["helper"],"macos":{}},"artifacts":[{"app":["Demo.app"]}]}"#,
         )
@@ -2118,7 +1994,6 @@ mod tests {
         assert_eq!(with_deps.unsupported_constraints, None);
         assert_eq!(with_deps.depends_formula, ["other"]);
         assert_eq!(with_deps.depends_cask, ["helper"]);
-        // Selecting artifacts must not erase an unsupported top-level constraint.
         for constraint in [
             r#""container":{"type":"unknown"}"#,
             r#""depends_on":{"formula":[42]}"#,
@@ -2133,7 +2008,6 @@ mod tests {
             ));
             assert!(!prefix.root.exists());
         }
-        // A conflict census that cannot be read must not say no conflict exists.
         prefix.ensure().unwrap();
         std::fs::remove_dir(prefix.cellar()).unwrap();
         std::fs::write(prefix.cellar(), b"unknown census").unwrap();
@@ -2167,7 +2041,6 @@ mod tests {
         assert!(prefix.installed(Kind::Cask).is_empty());
         assert!(!prefix.cask_dir("demo", "1").exists());
         assert!(std::fs::symlink_metadata(prefix.bin().join("tool")).is_err());
-        // A promised Binary with no executable mode is not a successful install.
         std::fs::write(
             &archive,
             zip_bytes(
@@ -2228,7 +2101,6 @@ mod tests {
                 .unwrap();
             let earlier = prefix.applications().join("also-owned");
             symlink_file(&payload.join("tool"), &earlier).unwrap();
-            // Stand in for /Applications without reading or changing the real directory.
             let applications = tmp.path().join("captured-applications");
             std::fs::create_dir(&applications).unwrap();
             let artifact = applications.join("tool");
@@ -2243,7 +2115,6 @@ mod tests {
 
             match change {
                 "foreign-file" | "same-target-link" => {
-                    // Keep the old inode alive, so this control cannot depend on reuse.
                     std::fs::rename(&artifact, tmp.path().join("held-link")).unwrap();
                     if change == "foreign-file" {
                         std::fs::write(&artifact, b"foreign artifact").unwrap();
@@ -2268,7 +2139,6 @@ mod tests {
                     std::fs::rename(&payload, &held).unwrap();
                     std::fs::create_dir(&payload).unwrap();
                     std::fs::write(payload.join("tool"), b"foreign payload").unwrap();
-                    // Even a copied valid receipt does not transfer the old inode's authority.
                     std::fs::copy(
                         held.join("INSTALL_RECEIPT.json"),
                         payload.join("INSTALL_RECEIPT.json"),
@@ -2317,11 +2187,6 @@ mod tests {
                 );
             }
         }
-        // Legacy and recorded versions coexist. One version's receipt must not
-        // exclude another version's owned link, including a non-UTF8 prefix.
-        // Some filesystems (including this Mac's) reject non-UTF8 names.
-        // Exercise the actual producer and reader's captured-path fallback with
-        // captured paths everywhere; retain the full filesystem worlds on Linux.
         let captured = Prefix::at(&PathBuf::from(std::ffi::OsString::from_vec(
             b"/captured-\xff".to_vec(),
         )));
@@ -2380,8 +2245,6 @@ mod tests {
                 );
                 prefix.write_receipt(&payload, &receipt).unwrap();
                 if version == "2" && spelling == "old-lossy" {
-                    // The predecessor wrote this lossy absolute path. Its owned
-                    // target must still be found without comparing that spelling.
                     let old = destination.to_string_lossy();
                     prefix
                         .write_receipt(
@@ -2478,13 +2341,11 @@ mod tests {
         );
         assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 2);
         assert!(payload.join("INSTALL_RECEIPT.json").is_file());
-        // A non-directory survey root also refuses before the earlier eligible link.
         std::fs::remove_file(prefix.bin()).unwrap();
         std::fs::write(prefix.bin(), b"foreign root file").unwrap();
         assert!(uninstall_from(&prefix, "demo", false, &directories).is_err());
         assert_eq!(std::fs::read(&artifact).unwrap(), b"owned payload");
         assert_eq!(std::fs::read(prefix.bin()).unwrap(), b"foreign root file");
-        // Ordinary physical roots remove only admitted payload links and versions.
         std::fs::remove_file(prefix.bin()).unwrap();
         std::fs::create_dir(prefix.bin()).unwrap();
         let foreign = prefix.bin().join("foreign");
@@ -2602,8 +2463,6 @@ mod tests {
                 .all(|path| std::fs::symlink_metadata(path).is_err())
         );
         assert!(!generic_payload.exists());
-        // Old receipts without artifact fields retain the already-discoverable
-        // share/x subset, rather than deleting its payload behind a dangling link.
         let legacy_world = aterm_tempfile::TempDir::new().unwrap();
         let legacy_prefix = Prefix::at(&legacy_world.path().join("prefix"));
         legacy_prefix.ensure().unwrap();
@@ -2638,7 +2497,6 @@ mod tests {
         assert!(std::fs::symlink_metadata(&legacy_link).is_err());
         assert!(std::fs::symlink_metadata(&legacy_library_link).is_err());
         assert!(!legacy_payload.exists());
-        // Generic directory links at man traversal names are final leaves.
         for relative in ["share/man/man1", "share/man"] {
             let world = aterm_tempfile::TempDir::new().unwrap();
             let prefix = Prefix::at(&world.path().join("prefix"));

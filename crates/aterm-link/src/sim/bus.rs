@@ -136,6 +136,7 @@ struct Will {
     subject: String,
     body: Vec<u8>,
     /// The offset of its registration record: the log holds the will only
+    /// while it holds this.
     reg_off: u64,
     /// The connection it was registered on, while that connection lives.
     conn: Option<u64>,
@@ -152,6 +153,7 @@ struct ConnState {
     inbound: Vec<u8>,
     out: VecDeque<u8>,
     /// Answers the broker has made and not yet SENT, oldest first: a write
+    /// whose batch is still in its flush ([`State::answer`]).
     held: VecDeque<Held>,
     open: bool,
     /// `Some((cursor, filter))` once it is a subscription.
@@ -162,6 +164,7 @@ struct ConnState {
 #[derive(Debug)]
 struct Held {
     /// The record a `PublishAck` names: what the reorder count reads
+    /// ([`State::seen_before_ack`]).
     ack_of: Option<u64>,
     /// The framed answer.
     frame: Vec<u8>,
@@ -189,6 +192,8 @@ pub(crate) struct State {
     /// producer -> its highest sequence below the ack half.
     max_seq: BTreeMap<u64, u64>,
     /// producer -> the subjects its registered wills hold against its subject
+    /// budget until a record of its lands on them ([`State::reserve`]):
+    /// astream's `will_reserved`.
     reserved: BTreeMap<u64, std::collections::BTreeSet<String>>,
     wills: Vec<Will>,
     conns: BTreeMap<u64, ConnState>,
@@ -624,6 +629,8 @@ impl State {
     }
 
     /// Rebuild the dedup map, the index, the group cursors and the fence
+    /// from the log, as an open does; forget the firing of a will whose
+    /// firing record the log no longer holds.
     fn rebuild(&mut self) {
         self.dedup.clear();
         self.index.clear();
@@ -676,6 +683,7 @@ impl State {
     }
 
     /// Hold `subject` against `producer`'s budget for its will, unless the
+    /// index holds it already (`reserve_will_subject`).
     fn reserve(&mut self, producer: u64, subject: String) {
         if !astream_broker::store::is_hidden_subject(&subject) && !self.index.contains_key(&subject)
         {
@@ -684,6 +692,7 @@ impl State {
     }
 
     /// Whether the log holds will `i`: its registration record is on it (a
+    /// power loss may have cut it, and a later record taken its offset).
     fn holds_will(&self, i: usize) -> bool {
         self.wills.get(i).is_some_and(|w| {
             usize::try_from(w.reg_off)
@@ -694,6 +703,7 @@ impl State {
     }
 
     /// Each producer's LATEST will on the log, by its registration
+    /// (`BrokerLog::latest_wills`): producer -> will.
     fn latest_wills(&self) -> BTreeMap<u64, usize> {
         let mut latest: BTreeMap<u64, usize> = BTreeMap::new();
         for i in (0..self.wills.len()).filter(|&i| self.holds_will(i)) {
@@ -709,6 +719,7 @@ impl State {
     }
 
     /// Whether a record of will `i`'s producer ABOVE its registration says
+    /// its key or outranks it (astream's `settled_above`).
     fn settled_above(&self, i: usize) -> bool {
         let w = &self.wills[i];
         self.log
@@ -728,6 +739,8 @@ impl State {
     }
 
     /// Whether will `w` could still append: no record of its producer
+    /// outranks it, and its own key is not on the log
+    /// (`will_can_still_append`).
     fn can_still_append(&self, w: &Will) -> bool {
         !self
             .max_seq
@@ -737,6 +750,8 @@ impl State {
     }
 
     /// Whether a will that can still append targets `subject`: one a live
+    /// connection holds, or a producer's latest on the log
+    /// (`will_targets_subject`) — what refuses a retire of it.
     fn will_targets(&self, subject: &str) -> bool {
         let latest = self.latest_wills();
         self.wills.iter().enumerate().any(|(i, w)| {
@@ -752,6 +767,8 @@ impl State {
     }
 
     /// Whether `producer`'s record on `subject` would open a subject past its
+    /// budget: the index entries charged to it and its wills' reservations
+    /// but this subject's (`subject_bound_exceeded`).
     fn past_the_budget(&self, producer: u64, subject: &str) -> bool {
         if self.index.contains_key(subject) {
             return false;
@@ -822,6 +839,9 @@ impl State {
     }
 
     /// THE RACE ([`Race`]) at one of a NODE producer's will requests: the
+    /// one it refuses, and the later one inside which the sibling attaches at
+    /// the refused incarnation — while nothing of that incarnation is on the
+    /// log, so the sibling takes it as a bridge takes `max(local, Last) + 1`.
     fn race_at_will(&mut self, producer: u64, seq: u64) -> Option<Vec<Response>> {
         if !self
             .principal(producer)
@@ -928,6 +948,12 @@ impl State {
     }
 
     /// QUEUE `responses` ON `conn`'S STREAM, in order: sent at once, or HELD
+    /// (aterm-0) — an ack the broker answers late, its batch still in its
+    /// flush, while the record it names is already readable, as a real
+    /// broker's writer wakes its tails and writes its acks in no fixed order
+    /// — when this broker holds acks ([`State::holds`]) and the seed says so;
+    /// and always behind an answer already held, because a connection is
+    /// answered in the order it wrote.
     fn answer(&mut self, conn: u64, responses: &[Response]) {
         let State {
             conns,
@@ -960,6 +986,10 @@ impl State {
     }
 
     /// One publish, as astream's `serve_publish` and the writer's
+    /// `stage_publish` take it: `/a/retire` is a retire ([`State::retire`]);
+    /// a malformed subject or one of the broker's own is refused; a resent
+    /// key dedups; a new subject past the producer's budget is refused; the
+    /// append.
     fn publish(
         &mut self,
         producer: u64,
@@ -971,6 +1001,7 @@ impl State {
     }
 
     /// [`State::publish`], held to the subject budget or not: a will's
+    /// firing is exempt (its registration was held to it, and reserved it).
     fn publish_bounded(
         &mut self,
         producer: u64,
@@ -1041,6 +1072,11 @@ impl State {
     }
 
     /// A SUBJECT RETIRE (`/a/retire`, its body the target), as astream's
+    /// `serve_publish` and `stage_retire` take one: a target that is not a
+    /// subject, or is the broker's own (`/a/...`), is refused; an absent one
+    /// is moot (the head, deduped); one charged to another producer is
+    /// refused `charged: `, one a will can still append to `will: `;
+    /// otherwise the index forgets it and a hidden record says so.
     fn retire(&mut self, producer: u64, body: &[u8]) -> Result<(u64, bool), Box<Response>> {
         use astream_broker::proto::{
             ERR_BAD_SUBJECT, ERR_RECORD_REFUSED, ERR_RETIRE_REFUSED, RETIRE_CHARGED_PREFIX,
@@ -1098,6 +1134,7 @@ impl State {
     }
 
     /// Will `i`'s connection ended: it fires, unless a later will on that
+    /// connection replaced it or it fired already.
     fn fire(&mut self, i: usize) {
         if self
             .wills
@@ -1109,6 +1146,9 @@ impl State {
     }
 
     /// FIRE will `i` (astream's `stage_will_fire`): FENCED — nothing appended —
+    /// when a record of its producer outranks it; otherwise an ordinary
+    /// publish under its key, so one already said dedups, exempt from the
+    /// subject budget.
     fn fire_will(&mut self, i: usize) {
         let Some(w) = self.wills.get(i).cloned() else {
             return;
@@ -1389,6 +1429,10 @@ impl State {
     }
 
     /// REGISTER A WILL on `conn`, as astream's `serve_will` and the writer's
+    /// `stage_will_register` take one: a subject a publish could not take is
+    /// refused; so is a second producer's on a connection that holds one; so
+    /// is a sequence in the ack half, which no later record could fence; and
+    /// a subject new to the index past its producer's budget.
     fn register(
         &mut self,
         conn: u64,
@@ -1479,6 +1523,7 @@ impl State {
 }
 
 /// Why a publish (or a will) may not name `subject`, as astream's
+/// `publish_subject_error` says: not a subject, or one of the broker's own.
 fn subject_error(subject: &str) -> Option<Box<Response>> {
     if astream_wire::Subject::new(subject).is_err() {
         Some(refused(
@@ -1496,6 +1541,7 @@ fn subject_error(subject: &str) -> Option<Box<Response>> {
 }
 
 /// A name in `req` past astream's bound (`MAX_NAME_LEN`), as its
+/// `oversized_name` refuses one before anything parses it.
 fn oversized_name(req: &Request) -> Option<String> {
     let names: Vec<(&str, &str)> = match req {
         Request::Publish { subject, .. } | Request::Will { subject, .. } => {

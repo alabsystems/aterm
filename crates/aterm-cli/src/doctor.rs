@@ -498,7 +498,7 @@ pub fn answer(text: &str, code: u8, stdout: bool) -> std::process::ExitCode {
 
 /// A row's mark from what the engine made of it: done is `ok`, a fact or a wait is a
 /// `note`, an essential row left wrong is `FAIL`, anything else left wrong a `warn`.
-fn mark_of(row: &ItemReport) -> Mark {
+const fn mark_of(row: &ItemReport) -> Mark {
     match row.outcome {
         Outcome::Ok | Outcome::Changed => Mark::Ok,
         Outcome::NotApplicable | Outcome::Deferred => Mark::Note,

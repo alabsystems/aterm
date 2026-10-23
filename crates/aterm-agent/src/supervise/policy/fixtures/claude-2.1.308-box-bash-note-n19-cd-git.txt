@@ -1,0 +1,50 @@
+# claude-code 2.1.308 · MEASURED 2026-10-22, `aterm ctl text` of a private headless aterm (144x50, aterm 0.115.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the Bash box over `Probe n19`: cd then git (one tool call scripted into the lab's stub, manual mode)
+❯ toolstart
+
+⏺ Bash(diff <(cat README.md) README.md)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Worked for 0s · done 3:30 PM
+
+❯ toolstart
+
+  Read 1 file (ctrl+o to expand)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Cogitated for 0s · done 3:30 PM
+
+❯ toolstart
+
+  Searched for 1 pattern (ctrl+o to expand)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Churned for 0s · done 3:30 PM
+
+❯ toolstart
+
+⏺ Bash(sed 's/a/b/w out.txt' README.md)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Churned for 0s · done 3:30 PM
+
+❯ toolstart
+
+⏺ Bash(cd sub && git status)
+  ⎿  Waiting…
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Tip: auto mode handles these prompts for you — choose "switch to auto mode" below
+ Probe n19
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ cd sub && git status
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ This command changes directory before running a version-control command, which can pick up untrusted hooks or repository configuration from
+ │ the target directory. Approve only if you trust it.
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and switch to auto mode · auto mode handles these prompts for you
+   3. No
+
+ Esc to cancel · Tab to amend

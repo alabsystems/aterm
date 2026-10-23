@@ -21,6 +21,7 @@ pub const SIXEL_MAX_DIMENSION: usize = 4096;
 pub const SIXEL_MAX_PIXELS: usize = 4 * 1024 * 1024;
 
 /// The six pixel rows a sixel byte paints, top first: bit `row` of the data
+/// value.
 const SIXEL_ROW_MASKS: [u8; 6] = [1, 2, 4, 8, 16, 32];
 
 /// Maximum decoded-image byte budget (packed RGBA, 4 bytes/px) for a single sixel sequence.
@@ -345,6 +346,7 @@ impl SixelDecoder {
     }
 
     /// Drop the raster/mask/param buffers (keep palette small; it is reset on
+    /// the next hook).
     fn release(&mut self) {
         self.raster = Vec::new();
         self.params = Vec::new();
@@ -365,7 +367,7 @@ impl SixelDecoder {
         self.mode = mode;
     }
 
-    /// Apply the just-collected params for the pending introducer. `#` selects/
+    /// Apply the just-collected params for the pending introducer.
     #[inline]
     fn finish_params(&mut self) {
         if self.mode == ParamMode::None && self.params.is_empty() {
@@ -520,6 +522,7 @@ impl SixelDecoder {
     }
 
     /// Grow the raster/mask so coordinates up to `(want_x, want_y)` inclusive
+    /// are addressable, clamped to [`SIXEL_MAX_DIMENSION`].
     #[cfg_attr(trust_verify, trust::skip)]
     fn ensure_capacity(&mut self, want_x: usize, want_y: usize) {
         let need_w = want_x.saturating_add(1).min(SIXEL_MAX_DIMENSION);

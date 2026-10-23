@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The engine: every item through probe, plan, apply and read-back, in the order its
-//! `after` edges give, the items that share an activation read back only after it ran
-//! once (design §3.3).
+//! The engine: every item through probe, plan, apply and read-back, in the order its `after` edges give, the items that share an activation read back only after it ran once (design §3.3).
 
 use crate::model::{Explain, ItemReport, Mode, Outcome, Probe, Remedy, Requires, StoodAside};
 use crate::scope::Scope;
@@ -14,7 +12,6 @@ use std::sync::Arc;
 /// Where the engine records a value before it changes it.
 pub trait Journal {
     /// Record that `id` held `from` and is about to become `to`; `revert` undoes it.
-    ///
     /// # Errors
     /// One line; the engine then does not apply the change.
     fn before_change(
@@ -38,8 +35,7 @@ impl Journal for NoJournal {
     }
 }
 
-/// The journal of a surface that only reads (`aterm pkg doctor`): it refuses every
-/// record, so a plan never asks it and an apply that reached a change could not make it.
+/// The journal of a surface that only reads (`aterm pkg doctor`): it refuses every record, so a plan never asks it and an apply that reached a change could not make it.
 #[derive(Debug, Default)]
 pub struct ReadOnly;
 
@@ -54,8 +50,7 @@ impl Journal for ReadOnly {
 /// Why a composition of items cannot be run: nothing was probed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
-    /// `id`'s `after` names `want`, which no other item of the run is (or, for a `*`
-    /// prefix, starts).
+    /// `id`'s `after` names `want`, which no other item of the run is (or, for a `*` prefix, starts).
     Dangling {
         /// The item whose edge dangles.
         id: String,
@@ -93,10 +88,7 @@ fn names(want: &str, id: &str) -> bool {
     }
 }
 
-/// The items of a run (`ids`, in composition order) that the `after` edge `want` of the
-/// item at `me` names: the one with that id, or, for a `*` prefix, every other item the
-/// prefix starts. One rule for [`order`] and for a surface that keeps only the edges its
-/// own composition can meet (`aterm_machines::engine::bind`).
+/// The items of a run (`ids`, in composition order) that the `after` edge `want` of the item at `me` names: the one with that id, or, for a `*` prefix, every other item the prefix starts.
 pub fn named_by<'a>(
     want: &'a str,
     me: usize,
@@ -109,14 +101,9 @@ pub fn named_by<'a>(
         .map(|(other, _)| other)
 }
 
-/// The order `items` run in: each after every item its `after` names, and otherwise in
-/// the order given, so a composition that is already ordered keeps its order. An item that
-/// waits on an item with an [`Item::activation`] it does not share runs after every item of
-/// that activation: that item is read back only once the last of them is done.
-///
+/// The order `items` run in: each after every item its `after` names, and otherwise in the order given, so a composition that is already ordered keeps its order.
 /// # Errors
-/// An edge that names no other item ([`Refusal::Dangling`]; an item that names itself
-/// exactly waits on itself, a [`Refusal::Cycle`]), or items that wait on each other.
+/// An edge that names no other item ([`Refusal::Dangling`]; an item that names itself exactly waits on itself, a [`Refusal::Cycle`]), or items that wait on each other.
 pub fn order(items: &[Box<dyn Item + '_>]) -> Result<Vec<usize>, Refusal> {
     let ids: Vec<String> = items.iter().map(|item| item.id()).collect();
     let activations: Vec<Option<String>> = items
@@ -169,25 +156,6 @@ pub fn order(items: &[Box<dyn Item + '_>]) -> Result<Vec<usize>, Refusal> {
 }
 
 /// Run `items` in [`order`] and report each, in run order.
-///
-/// In [`Mode::Apply`] a planned change is journaled, applied, and probed again. Only a
-/// read-back that probes `Ok` counts as [`Outcome::Changed`]. Anything else is
-/// [`Outcome::Failed`], with the read-back in `why`. A failure does not stop the run.
-/// An applied item with an [`Item::activation`] is read back only after that activation
-/// ran: once, after the last item of the run that names it, journaled first (its id, and
-/// the `from` and `to` its [`Activation::pending`] gives). When nothing is pending it is
-/// not run. One that fails, or whose line the journal refuses, fails each item it was to
-/// activate, and nothing of it is undone; one whose part for an item failed fails that
-/// item alone, and the others are read back.
-/// An item whose [`Item::after`] names an earlier item that did not end `Ok` or `Changed`
-/// is not probed in an apply run: it is [`Outcome::Blocked`] on that item. In a plan
-/// run it is probed as usual, since its prerequisite may only be planned; when that
-/// probe [`Probe::Waits`] on an item this plan changes first (git's settings before the
-/// Command Line Tools exist), the row is [`Outcome::Planned`]: the apply judges it after
-/// that change. Any other block stays [`Outcome::Blocked`], and an unreadable probe stays
-/// [`Outcome::Unknown`], whatever is planned before it: a read that failed is a failure,
-/// never a plan.
-///
 /// # Errors
 /// The composition cannot be ordered ([`order`]); nothing was probed.
 pub fn run(
@@ -198,9 +166,7 @@ pub fn run(
     run_with(items, mode, journal, &mut |_| {})
 }
 
-/// [`run`], handing each row to `on_row` as soon as its item finishes: the machines
-/// agent's run job streams them to `progress.ndjson`.
-///
+/// [`run`], handing each row to `on_row` as soon as its item finishes: the machines agent's run job streams them to `progress.ndjson`.
 /// # Errors
 /// As [`run`].
 pub fn run_with(
@@ -213,7 +179,6 @@ pub fn run_with(
 }
 
 /// [`run_with`] within what a surface allows (design §3.2, [`Scope`]).
-///
 /// # Errors
 /// As [`run`].
 pub fn run_scoped(
@@ -224,12 +189,9 @@ pub fn run_scoped(
     on_row: &mut dyn FnMut(&ItemReport),
 ) -> Result<Vec<ItemReport>, Refusal> {
     let order = order(items)?;
-    // Outside a shell of the account's own (root, another `$HOME`, a private state root),
-    // an account item is read and its change named, never made (design §3.2).
     let hold = scope.not_own_account.map(crate::scope::not_own_account);
     let activations: Vec<Option<Arc<dyn Activation + '_>>> =
         items.iter().map(|item| item.activation()).collect();
-    // Each activation runs once the last item (in run order) that names it is done.
     let mut last: Vec<(String, usize)> = Vec::new();
     for (position, &index) in order.iter().enumerate() {
         if let Some(activation) = &activations[index] {
@@ -240,7 +202,6 @@ pub fn run_scoped(
             }
         }
     }
-    // The rows applied and not yet read back: their activation's id, the row, the item.
     let mut awaiting: Vec<(String, usize, usize)> = Vec::new();
     let mut rows: Vec<ItemReport> = Vec::with_capacity(items.len());
     for (position, &index) in order.iter().enumerate() {
@@ -248,8 +209,6 @@ pub fn run_scoped(
         let activation = activations[index].as_deref();
         let (row, awaits) =
             if item.requires() == Requires::Console && !scope.admits(Requires::Console) {
-                // Where a console item may not run, nothing of it is read (a workstation item
-                // over SSH reads another login's session otherwise).
                 let why = scope.not_own_account.map_or_else(
                     || crate::scope::NOT_AT_CONSOLE.to_owned(),
                     crate::scope::not_own_account,
@@ -260,8 +219,6 @@ pub fn run_scoped(
                 row.why = Some(why);
                 (row, false)
             } else {
-                // A class this surface does not apply is planned in an apply run: probed,
-                // never applied, and anything after it waits.
                 let mode = if mode == Mode::Apply && !scope.applies(item.class()) {
                     Mode::Plan
                 } else {
@@ -271,8 +228,6 @@ pub fn run_scoped(
                     .then(|| unmet_prerequisite(item, &rows))
                     .flatten();
                 match blocker {
-                    // The prerequisite stood aside (a lock, the network): so does what waits
-                    // for it, with the same line, so a surface's 75/69 counts it.
                     Some((on, Some(aside))) => {
                         let mut row = blank(item);
                         row.outcome = Outcome::Blocked;
@@ -326,7 +281,7 @@ pub fn run_scoped(
 
 /// Run `activation` once for the rows `awaiting` it (each a row and its item), its line
 /// journaled first, then read each of those items back, but for one whose part of it
-/// failed. Nothing awaits it: it is not run.
+/// failed.
 fn settle(
     activation: &dyn Activation,
     awaiting: &[(usize, usize)],
@@ -338,10 +293,6 @@ fn settle(
     if awaiting.is_empty() {
         return;
     }
-    // Whether the journal refused its line, and why it did not run; else the items whose
-    // part of it failed. A refused line is explained as a refused item line is
-    // (`Blocked`): nothing the items' own remedy runs lifts it, the journal must take the
-    // record first.
     let activated: Result<Vec<(String, String)>, (bool, String)> = match activation.pending() {
         Err(why) => Err((false, why)),
         Ok(None) => Ok(Vec::new()),
@@ -379,8 +330,7 @@ fn settle(
 }
 
 /// Probe `item` again after its change: only an `Ok` read-back makes `row` `Changed`; any
-/// other fails it, saying what the read-back found. The read-back, for the row's
-/// explanation.
+/// other fails it, saying what the read-back found.
 fn read_back(item: &dyn Item, row: &mut ItemReport) -> Probe {
     let back = item.probe();
     match &back {
@@ -455,11 +405,6 @@ fn blank(item: &dyn Item) -> ItemReport {
 }
 
 /// One item through probe, plan, apply and read-back; `earlier` are the rows before it.
-/// With `hold`, the change the item would make is named and `Blocked` with that line, and
-/// nothing of it is applied, refreshed or journaled. With `activated`, an apply that did
-/// its work is not read back here: the row is returned with `true`, applied (`Changed`, as
-/// an item of the same activation that waits on it reads it), for [`settle`] to read back
-/// and complete after the activation.
 fn run_one(
     item: &dyn Item,
     mode: Mode,
@@ -469,13 +414,10 @@ fn run_one(
     activated: bool,
 ) -> (ItemReport, bool) {
     let mut row = blank(item);
-    // The probe the row's explanation reads: the first, or the read-back that judged it.
     let mut last = item.probe();
     match last.clone() {
         Probe::Ok { now } => {
             row.to = Some(now.clone());
-            // A refresh that changes the machine is journaled before it runs, as an apply
-            // is ([`Item::refresh_changes`]); a refused record leaves it unrun.
             let recorded = if mode == Mode::Apply && hold.is_none() && item.refresh_changes() {
                 journal
                     .before_change(&row.id, &now, &now, item.revert().as_deref())
@@ -494,8 +436,6 @@ fn run_one(
                 match refreshed {
                     Err(why) => {
                         row.outcome = Outcome::Failed;
-                        // The row is explained by the refresh that failed, never by the
-                        // probe that read the value right before it.
                         last = Probe::Unusable { why: why.clone() };
                         row.why = Some(why);
                     }
@@ -562,7 +502,6 @@ fn run_one(
             row.to = Some(to.clone());
             row.revert = item.revert();
             if let Some(why) = hold {
-                // Named, never made: not even a plan, since no apply from here makes it.
                 row.outcome = Outcome::Blocked;
                 last = Probe::Blocked {
                     why: why.to_owned(),
@@ -571,8 +510,6 @@ fn run_one(
             } else if mode == Mode::Plan {
                 row.outcome = Outcome::Planned;
             } else if let Some(aside) = item.stands_aside() {
-                // It stands aside before it acts (`standing_aside`: a lock the change
-                // needs is held): no journal line for a change nobody makes.
                 row.outcome = Outcome::Blocked;
                 row.why = Some(aside.why().to_owned());
                 row.stood_aside = Some(aside);
@@ -581,8 +518,6 @@ fn run_one(
             {
                 let why = format!("not applied: the journal refused the record ({why})");
                 row.outcome = Outcome::Failed;
-                // Nothing the item's own remedy runs lifts it: the journal must take the
-                // record first.
                 last = Probe::Blocked { why: why.clone() };
                 row.why = Some(why);
             } else {
@@ -612,10 +547,7 @@ fn run_one(
 }
 
 /// A stood-aside row's explanation: the line the apply stood aside with, and the remedy
-/// its kind gives. Offline, the next pass once the network is back
-/// ([`Remedy::Network`]); a lock or a wait on someone else, the item's own remedy for a
-/// change put off to its next run; a missing permission, the item's remedy for that
-/// precondition.
+/// its kind gives.
 fn explain_aside(item: &dyn Item, aside: &StoodAside) -> Explain {
     let why = aside.why().to_owned();
     let remedy = match aside {
@@ -631,9 +563,7 @@ fn explain_aside(item: &dyn Item, aside: &StoodAside) -> Explain {
 #[cfg(test)]
 pub(crate) mod tests {
     //! The machines engine's tests, moved with the engine (design §10 S3: the regression
-    //! proof). Each case and assertion is as it was in `aterm-machines/src/engine.rs` at
-    //! b6dd34bf6e; only the fixtures changed, because an item now owns its ports and the
-    //! engine passes it no `System` and no context.
+    //! proof).
     use super::*;
     use crate::model::{Class, Effect, Layer};
     use std::sync::Arc;
@@ -908,8 +838,6 @@ pub(crate) mod tests {
 
     #[test]
     fn a_reading_a_user_could_not_make_stays_unknown_with_its_own_reason() {
-        // `here plan` as a user: `socketfilterfw --get…` answers root or not (firewall.rs),
-        // so a garbled read is reported as it is, never as a missing privilege.
         let item = Scripted {
             family: "firewall",
             ..Scripted::new(
@@ -989,7 +917,6 @@ pub(crate) mod tests {
         assert_eq!(rows[1].outcome, Outcome::Blocked);
         assert_eq!(rows[1].why.as_deref(), Some("waits for developer.clt"));
         assert_eq!(rows[2].outcome, Outcome::Ok);
-        // A plan run probes the dependent anyway.
         let rows = run(&items, Mode::Plan, &mut NoJournal).unwrap();
         assert_eq!(rows[1].outcome, Outcome::Ok);
     }
@@ -1011,13 +938,11 @@ pub(crate) mod tests {
                 probe: waits("developer.clt"),
                 after: vec!["developer.clt".into()],
             }),
-            // Waiting on a row the plan made planned the same way.
             Box::new(Named {
                 id: "github.after-urls",
                 probe: waits("github.ssh-urls"),
                 after: vec!["github.ssh-urls".into()],
             }),
-            // With no planned prerequisite, a wait is a block.
             Box::new(Named {
                 id: "github.other",
                 probe: waits("github.absent"),
@@ -1034,8 +959,6 @@ pub(crate) mod tests {
 
     #[test]
     fn a_plan_keeps_a_block_its_prerequisite_does_not_lift() {
-        // Homebrew in a prefix another uid owns: installing the Command Line Tools first
-        // changes nothing about that, so the plan says blocked, as the apply will.
         let items: Vec<Box<dyn Item>> = vec![
             Box::new(Named {
                 id: "developer.command-line-tools",
@@ -1076,7 +999,6 @@ pub(crate) mod tests {
                 probe: change(),
                 after: vec![],
             }),
-            // git's settings file is mode 000: no answer, whatever the CLT will be.
             Box::new(Named {
                 id: "github.git",
                 probe: Probe::Unusable {
@@ -1084,7 +1006,6 @@ pub(crate) mod tests {
                 },
                 after: vec!["developer.clt".into()],
             }),
-            // Nor does it carry what waits for it into the plan.
             Box::new(Named {
                 id: "github.ssh-urls",
                 probe: Probe::Waits {
@@ -1145,8 +1066,6 @@ pub(crate) mod tests {
         assert!(rows[0].why.as_deref().unwrap().contains("disk full"));
     }
 
-    // ── the order (design §3.3) ─────────────────────────────────────────────────────────
-
     /// [`Named`], counting its probes.
     struct Counted {
         named: Named,
@@ -1202,7 +1121,6 @@ pub(crate) mod tests {
 
     #[test]
     fn an_out_of_order_composition_runs_each_prerequisite_first() {
-        // Three crates' items, composed dependants first: develop's before base's.
         let probes = Arc::new(AtomicU32::new(0));
         let items = vec![
             counted(
@@ -1233,13 +1151,10 @@ pub(crate) mod tests {
                 "develop.workspace-tools@~/aterm",
             ]
         );
-        // The prerequisite ran first, so its failure blocks what waits for it.
         assert_eq!(rows[1].outcome, Outcome::Unknown);
         assert_eq!(rows[3].outcome, Outcome::Blocked);
         assert_eq!(rows[3].why.as_deref(), Some("waits for base.pkg.toolset"));
         assert_eq!(rows[4].outcome, Outcome::Blocked);
-        // A composition already in order keeps it: a machines report's rows stay in the
-        // order `items::expand` gives.
         assert_eq!(order(&items[2..]).unwrap(), [0, 1, 2]);
     }
 
@@ -1250,7 +1165,6 @@ pub(crate) mod tests {
             counted("a", change(), &["c"], &probes),
             counted("b", ok(), &[], &probes),
             counted("c", change(), &["a"], &probes),
-            // An item behind the cycle cannot be placed either.
             counted("d", ok(), &["c"], &probes),
         ];
         assert_eq!(
@@ -1259,7 +1173,6 @@ pub(crate) mod tests {
                 ids: vec!["a".into(), "c".into(), "d".into()]
             }
         );
-        // An item that names itself exactly waits on itself.
         let alone = vec![counted("a", ok(), &["a"], &probes)];
         assert!(matches!(order(&alone), Err(Refusal::Cycle { .. })));
         assert_eq!(probes.load(Ordering::SeqCst), 0);
@@ -1271,7 +1184,6 @@ pub(crate) mod tests {
         for (after, items_refused) in [
             ("developer.clt", true),
             ("developer.*", true),
-            // A prefix never matches the item that names it.
             ("base.*", true),
             ("names.*", false),
         ] {
@@ -1292,11 +1204,8 @@ pub(crate) mod tests {
                 assert_eq!(result.unwrap()[0].id, "names.computer");
             }
         }
-        // Only the one composition that was not refused probed anything.
         assert_eq!(probes.load(Ordering::SeqCst), 2);
     }
-
-    // ── what a row adds (design §3.3, report) ───────────────────────────────────────────
 
     /// [`Scripted`] whose apply stands aside, and whose remedy for a change put off to
     /// its next run is its own command.
@@ -1373,7 +1282,6 @@ pub(crate) mod tests {
                 permission(),
             ),
         ] {
-            // The second probe would read Ok: a stood-aside apply must not reach it.
             let item = Scripted::new(vec![change(), ok()], Ok(()));
             let probed = Arc::clone(&item.probed);
             let items: Vec<Box<dyn Item>> = vec![Box::new(Aside(item, aside.clone()))];
@@ -1385,9 +1293,6 @@ pub(crate) mod tests {
                 Some(status)
             );
             assert_eq!(probed.load(Ordering::SeqCst), 1, "{aside:?} was read back");
-            // Explained by the line it stood aside with, never by the change it planned:
-            // offline waits for the network, a lock for the item's own next run,
-            // and permission for the item's blocked-precondition remedy.
             assert_eq!(
                 rows[0].explain,
                 Some(Explain {
@@ -1400,8 +1305,6 @@ pub(crate) mod tests {
 
     #[test]
     fn a_failed_refresh_and_a_refused_record_are_explained_by_what_failed() {
-        // The refresh failed after a probe that read the value as wanted: the row is a
-        // failure, so its explanation is the failure's, not the Ok read's "nothing to do".
         let item = Refreshing {
             inner: Scripted::new(vec![ok()], Ok(())),
             refreshed: Arc::new(AtomicU32::new(0)),
@@ -1416,7 +1319,6 @@ pub(crate) mod tests {
                 why: "native refused".into()
             }))
         );
-        // A record the journal refused: the change was never made, and the row says why.
         let items: Vec<Box<dyn Item>> = vec![Box::new(Scripted::new(vec![change()], Ok(())))];
         let rows = run(&items, Mode::Apply, &mut Refusing).unwrap();
         let why = rows[0].why.clone().unwrap();
@@ -1456,7 +1358,6 @@ pub(crate) mod tests {
             rows.iter().map(|r| r.explain.is_some()).collect::<Vec<_>>(),
             [false, false, true, true]
         );
-        // A failed read-back is explained by that read-back, not the first probe.
         assert_eq!(rows[2].explain, Some(explained(&change())));
         assert_eq!(
             rows[3].explain.as_ref().unwrap().why,
@@ -1625,12 +1526,7 @@ pub(crate) mod tests {
 
     /// The Dock read what `init.desktop` and `init.dock` wrote, and was relaunched after
     /// each; the one relaunched after the first could write what it read at its start
-    /// back over the second. Items that share an activation are therefore all applied,
-    /// the activation journaled and run once after the last of them, and each read back
-    /// only after it, while an item of no activation between them is read back at once.
-    /// The rows keep run order; each is handed out when it is complete. Negative control:
-    /// reading an activated item back right after its apply (as before) puts `probe a`
-    /// before `apply b`.
+    /// back over the second.
     #[test]
     fn items_sharing_an_activation_are_applied_before_it_runs_once_and_read_back_after_it() {
         let events = Events::default();
@@ -1674,7 +1570,6 @@ pub(crate) mod tests {
                 "row b",
             ]
         );
-        // A plan reads, and never asks the activation anything.
         let events = Events::default();
         let dock = relaunch("relaunch.dock", &events);
         let items: Vec<Box<dyn Item>> = vec![
@@ -1692,10 +1587,6 @@ pub(crate) mod tests {
     /// The activation is what makes the change felt, so an activation that fails, cannot
     /// say what awaits it, or whose line the journal refuses (it is then not run) fails
     /// every item it was to activate, with why; their read-back is not taken for success.
-    /// A refused line is explained as a refused item line is (`Blocked`, which no remedy
-    /// of the item lifts); a failed one as a read that did not answer (`Unusable`, which
-    /// the surface's next run may). Negative control: explaining the refusal as
-    /// `Unusable` fails the third case.
     #[test]
     fn an_activation_that_does_not_run_fails_every_item_it_was_to_activate() {
         for (pending, result, refuses, ran, refused) in [
@@ -1750,7 +1641,6 @@ pub(crate) mod tests {
                 ran,
                 "{events:?}"
             );
-            // No read-back after the apply: the row is judged by the activation.
             assert_eq!(events.iter().filter(|event| *event == "probe a").count(), 1);
         }
     }
@@ -1758,8 +1648,7 @@ pub(crate) mod tests {
     /// Each item settles alone: an activation whose part for one item failed (a consumer
     /// of only that item's keys did not start again) fails that item, with why, and reads
     /// the others back, so one consumer's trouble does not unverify, and so roll back, a
-    /// change another consumer took. Negative control: failing every awaiting item on any
-    /// named failure fails `b`.
+    /// change another consumer took.
     #[test]
     fn an_activation_that_fails_for_one_item_fails_only_that_item() {
         let events = Events::default();
@@ -1791,7 +1680,6 @@ pub(crate) mod tests {
             ]
         );
         let events = events.lock().unwrap();
-        // `a` is judged by the activation, `b` by its read-back after it.
         assert_eq!(events.iter().filter(|event| *event == "probe a").count(), 1);
         assert_eq!(events.iter().filter(|event| *event == "probe b").count(), 2);
     }
@@ -1801,7 +1689,6 @@ pub(crate) mod tests {
     /// item whose apply fails is failed at once, and the others are still activated.
     #[test]
     fn an_activation_runs_only_when_an_applied_item_awaits_it_and_something_is_pending() {
-        // Nothing pending: read back at once, no line.
         let events = Events::default();
         let dock = Arc::new(Relaunch {
             id: "relaunch.dock",
@@ -1823,7 +1710,6 @@ pub(crate) mod tests {
                 "row a"
             ]
         );
-        // Already as wanted, or an apply that failed: nothing awaits it.
         let events = Events::default();
         let dock = relaunch("relaunch.dock", &events);
         let mut wanted = Writer::new("a", &events, Some(&dock));
@@ -1844,7 +1730,6 @@ pub(crate) mod tests {
             "{:?}",
             events.lock()
         );
-        // A failed apply beside an applied one: that one is still activated.
         let events = Events::default();
         let dock = relaunch("relaunch.dock", &events);
         let mut fails = Writer::new("a", &events, Some(&dock));
@@ -1871,8 +1756,6 @@ pub(crate) mod tests {
 
     /// An item a run selects (`--only`, [`crate::select`]) keeps its activation: the two
     /// selected items of one activation still apply first and run it once, after both.
-    /// Negative control: `Narrowed` not forwarding [`Item::activation`] reads each back at
-    /// once after its own apply, and never runs the activation.
     #[test]
     fn a_selected_item_keeps_its_activation() {
         let events = Events::default();
@@ -1910,9 +1793,7 @@ pub(crate) mod tests {
     }
 
     /// An item that waits on an activated item runs once that item is read back: after
-    /// every item of its activation, whatever the composition order. An item of the same
-    /// activation that waits on another applies after it, reading it as applied, and both
-    /// are read back after the activation.
+    /// every item of its activation, whatever the composition order.
     #[test]
     fn an_item_waiting_on_an_activated_item_runs_after_its_whole_activation() {
         let events = Events::default();
@@ -1942,7 +1823,6 @@ pub(crate) mod tests {
         let at = |event: &str| events.iter().position(|e| e == event).unwrap();
         assert!(at("apply b") < at("activate relaunch.dock"));
         assert!(at("activate relaunch.dock") < at("probe d"));
-        // A dependant of an activation that fails waits, and is not applied.
         let events = Events::default();
         let dock = Arc::new(Relaunch {
             id: "relaunch.dock",

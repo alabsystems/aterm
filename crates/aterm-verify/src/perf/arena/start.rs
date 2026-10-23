@@ -1,33 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `start` lane — fresh-process, real-window startup timing of one aterm —
-//! and the launch and sample validation the `compare` lane shares.
-//!
-//! Every launch is a fresh process and a real window, in private HOME/XDG
-//! directories with session restore and auto-update off. The observer waits
-//! for the control socket without issuing a request, lets startup settle, then
-//! makes ONE `metrics --json` read: `first_present` is a persistent stamp, so
-//! one late read gives the exact internal timestamp without perturbing the
-//! path it measures.
-//!
-//! Two independent totals. `internal_first_present_ms` (GUI `main_entry` to
-//! the startup-metrics publication inside the first successful-present
-//! finalizer) and `rust_main_to_first_present_ms` (the same, from Rust `main`,
-//! router included) are time-to-CONTENT. `rust_main_to_first_visible_ms` is
-//! time-to-VISIBLE — the first window on glass — which an early reveal moves
-//! without moving any first-present phase, and which may legally sit below
-//! first-present. Neither substitutes for the other. All exclude the
-//! dyld/process loader, which `process_birth_to_rust_main_ms` (the kernel's
-//! birth record to Rust `main`) measures on its own;
-//! `external_observation_ms` (spawn to the one read) is an upper bound that
-//! also holds the socket wait, settle and observer cost.
-//!
-//! `--warm` is a REACHABILITY switch: a cold launch's home has never held a
-//! previous launch, so code gated on persisted state (the L1 early reveal and
-//! its cell-metrics hit) is absent from the cold lane, not slow in it. Warm
-//! measures the second launch into a home a discarded primer filled; never
-//! compare a warm arm with a cold one.
+//! The `start` lane.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -39,9 +13,6 @@ use super::{Args, Halt, Scratch, await_socket, private, sha256_file, without_ate
 use crate::perf::LaneRun;
 use crate::perf::stats::{median, tail_summary};
 
-/// Every launch's scratch `aterm.toml`: no persisted window, no update or
-/// package cadence, and the audible bell off (this window is never the
-/// owner's terminal, so a BEL its shell rings must not play their alert
 /// sound; the key is read once with the rest and costs the start nothing).
 const CONFIG: &str = "restore_session = false\nbell_sound = false\n\n\
                       [update]\nenabled = false\nauto_apply = false\n\
@@ -51,8 +22,6 @@ const CONFIG: &str = "restore_session = false\nbell_sound = false\n\n\
 pub(crate) const COLS: u64 = 110;
 pub(crate) const ROWS: u64 = 32;
 
-/// The metrics JSON rounds every phase and total to 0.01 ms, so a sum of eight
-/// reconciles within 0.05 ms; this is that wire-rounding allowance, not a
 /// timing tolerance.
 const ROUNDING_MS: f64 = 0.06;
 
@@ -72,7 +41,6 @@ const PHASE_GUI_PREPARE: usize = 1;
 const PHASE_ATTACH: usize = 3;
 
 /// Prepare schema 1: the ten exclusive phases of `startup_gui_prepare_ms`.
-/// Additive, like the worker's: a binary without it still measures.
 pub(crate) const PREPARE: [&str; 10] = [
     "startup_prepare_boot_ms",
     "startup_prepare_warm_ms",
@@ -86,7 +54,6 @@ pub(crate) const PREPARE: [&str; 10] = [
     "startup_prepare_arm_ms",
 ];
 
-/// The kernel's birth record to Rust `main`: the loader's share, outside every
 /// partition. `null` where the binary cannot read it.
 const BIRTH: &str = "process_birth_to_rust_main_ms";
 
@@ -103,8 +70,7 @@ pub(crate) const ATTACH: [&str; 8] = [
 ];
 const ATTACH_BACKEND_FINALIZE: usize = 4;
 
-/// Worker schema 1: the backend-build worker's wall time split at the join,
-/// then its own legs. Additive: a binary without it still measures.
+/// Worker schema 1: the backend-build worker's wall time split at the join, then its own legs.
 pub(crate) const WORKER: [&str; 9] = [
     "startup_worker_overlap_ms",
     "startup_worker_after_join_ms",
@@ -177,8 +143,7 @@ impl BackendRequest {
     }
 }
 
-/// What one launch saw: the metrics read, the observer's bound, and the
-/// thermal state read just before it.
+/// What one launch saw.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Observation {
     pub metrics: Value,
@@ -223,8 +188,7 @@ pub(crate) struct Sample {
     pub last_drop_parked: bool,
 }
 
-/// Which optional schemas a sample carried; every sample of one arm must
-/// carry the same ones.
+/// Which optional schemas a sample carried; every sample of one arm must carry the same ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Shape {
     pub router: bool,
@@ -367,8 +331,6 @@ impl Sample {
             return Err(format!("startup_phase_schema is absent; {LEGACY_HINT}"));
         };
 
-        // GUI preparation split at the boot's own stamps. Only a schema the
-        // binary marks valid is judged; its parent is the phase it splits.
         let prepare = if m.get("startup_prepare_schema").is_some()
             && m.get("startup_prepare_valid") == Some(&Value::Bool(true))
         {
@@ -402,8 +364,6 @@ impl Sample {
             return Err(format!("startup_attach_schema is absent; {LEGACY_HINT}"));
         };
 
-        // The worker's wall time splits at the join; the join's at the worker's
-        // finish. Only a schema the binary marks valid is judged.
         let worker = if m.get("startup_worker_schema").is_some()
             && m.get("startup_worker_valid") == Some(&Value::Bool(true))
         {
@@ -430,8 +390,6 @@ impl Sample {
             None
         };
 
-        // The GPU legs close against the worker's own measurement of the same
-        // call, so a leg that escaped the probe lands in the tail.
         let gpu = if m.get("startup_gpu_schema").is_some()
             && m.get("startup_gpu_valid") == Some(&Value::Bool(true))
         {
@@ -480,10 +438,6 @@ impl Sample {
             None
         };
 
-        // Time-to-visible is optional (an older binary lacks the stamp) and is
-        // bracketed by the observer only: an early reveal precedes first-present,
-        // so ordering it against first-present would make one platform's
-        // behaviour a law.
         let visible = optional_number(m, "rust_main_to_first_visible_ms")?;
         if let Some(v) = visible {
             if v <= 0.0 {
@@ -501,9 +455,6 @@ impl Sample {
             }
         }
 
-        // The loader's share: before Rust main, so it and the Rust-main total
-        // together still fit inside the observer's bound, which starts before
-        // the spawn the kernel's birth record names.
         let birth = match m.get(BIRTH) {
             None | Some(Value::Null) => None,
             Some(_) => optional_number(m, BIRTH)?,
@@ -736,17 +687,13 @@ pub(crate) struct Launcher {
     pub timeout: Duration,
 }
 
-/// The persisted cell box a primer must leave for the launch after it to be
 /// warm.
 fn cell_metrics_cache(home: &Path) -> PathBuf {
     home.join("Library/Application Support/aterm/cell-metrics.toml")
 }
 
 impl Launcher {
-    /// One launch into `root`'s private HOME/XDG tree, its control socket at
-    /// `sock` ([`Scratch::sock`]: the tree under `$TMPDIR` is too deep for
-    /// one). A `primer` is judged only on the persisted cell box it leaves,
-    /// and returns `None`.
+    /// One launch into `root`'s private HOME/XDG tree, its control socket at `sock`.
     pub(crate) fn launch(
         &self,
         root: &Path,
@@ -770,13 +717,8 @@ impl Launcher {
                 .map_err(|e| format!("could not create {}: {e}", d.display()))?;
             private(d)?;
         }
-        // No persisted window may enter the measurement and no update cadence
-        // may turn it into an update benchmark: off through the config, the
-        // way a person turns them off ([`CONFIG`]).
         std::fs::write(root.join("config/aterm/aterm.toml"), CONFIG)
             .map_err(|e| format!("could not write the config: {e}"))?;
-        // The readiness gate is "the socket exists", so a warm root's previous
-        // socket file must not satisfy it.
         let _ = std::fs::remove_file(sock);
         let log_path = root.join("aterm.log");
         let log = std::fs::File::create(&log_path)
@@ -816,7 +758,6 @@ impl Launcher {
             let started = Instant::now();
             let mut group = super::Group::spawn(&mut cmd)?;
             await_socket(&mut group, sock, self.timeout)?;
-            // The settle is the protocol: no request may race startup.
             std::thread::sleep(self.settle);
             let mut query = super::ctl(&self.binary, sock);
             without_aterm_env(&mut query).env("HOME", &home).args([
@@ -825,7 +766,6 @@ impl Launcher {
                 "metrics",
                 "--json",
             ]);
-            // ctl bounds its own request; HUNG bounds a client that wedges.
             let out =
                 aterm_uds::deadline::output_until(&mut query, Instant::now() + self.timeout + HUNG)
                     .map_err(|e| format!("the metrics query: {e}"))?;
@@ -866,8 +806,7 @@ impl Launcher {
         Ok(Some(obs))
     }
 
-    /// One independent trial in a fresh `root`: the measured launch, after a
-    /// discarded primer when `warm`.
+    /// One independent trial in a fresh `root`.
     pub(crate) fn trial(
         &self,
         root: &Path,
@@ -892,8 +831,7 @@ fn tail(path: &Path) -> String {
     lines[lines.len().saturating_sub(30)..].join("\n")
 }
 
-/// An artifact copied to an immutable path before trial 1, so a concurrent
-/// rebuild of the source path cannot mix revisions under one hash.
+/// An artifact copied to an immutable path before trial 1.
 #[derive(Debug, Clone)]
 pub(crate) struct Frozen {
     pub source: PathBuf,
@@ -905,14 +843,10 @@ pub(crate) struct Frozen {
 /// How long a child may run past its own budget before it is called hung.
 const HUNG: Duration = Duration::from_secs(60);
 
-/// How long a new copy's first run may take: the system assesses a new file at
-/// its first exec, which a loaded host has held for minutes (a fresh 167 MB
-/// debug build took 64 s, `aterm_spec::wait::FIRST_EXEC`). A hang detector of
 /// its own, never a budget.
 const FIRST_EXEC: Duration = Duration::from_secs(10 * 60);
 
-/// `aterm --version`'s first line, which must name aterm (the lines after it
-/// name the copy that runs, so a frozen copy answers them differently).
+/// `aterm --version`'s first line, which must name aterm.
 pub(crate) fn identity(path: &Path) -> Result<String, String> {
     identity_within(path, HUNG)
 }
@@ -937,10 +871,7 @@ fn identity_within(path: &Path, hang: Duration) -> Result<String, String> {
     Ok(first)
 }
 
-/// Freeze `source` into `dir/<label>-aterm` (`dir` a [`super::Scratch`]'s). The
-/// copy is a new file the system assesses at its first exec, its identity run:
-/// `dir` is kept, not removed, unless that run printed aterm's line
-/// ([`super::live::starting_from`]).
+/// Freeze `source` into `dir/<label>-aterm` (`dir` a [`super::Scratch`]'s).
 pub(crate) fn freeze(label: &str, source: &Path, dir: &Path) -> Result<Frozen, String> {
     let source = source
         .canonicalize()
@@ -976,7 +907,6 @@ pub(crate) fn freeze(label: &str, source: &Path, dir: &Path) -> Result<Frozen, S
     })
 }
 
-/// Without `--binary`: the profiling build when present, else the release
 /// build, wherever `targo` puts the target directory.
 fn default_binary() -> Result<PathBuf, String> {
     let target = super::target_dir()?;
@@ -988,8 +918,7 @@ fn default_binary() -> Result<PathBuf, String> {
     })
 }
 
-/// Write `value` to `path` atomically (a temp file in the same directory, then
-/// a rename).
+/// Write `value` to `path` atomically (a temp file in the same directory, then a rename).
 pub(crate) fn write_json_atomic(path: &Path, value: &Value) -> Result<(), String> {
     let parent = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)
@@ -1242,7 +1171,6 @@ fn print_summary(samples: &[Sample]) {
     );
 }
 
-/// Each of `names` with its values across samples, when every sample carries
 /// the group `pick` reads (in `names` order).
 fn named(
     samples: &[Sample],
@@ -1262,7 +1190,6 @@ fn named(
     )
 }
 
-/// The per-slot cell pipelines, each with its values across the samples that
 /// built it (the slots are the binary's, not this lane's).
 fn cell_pipelines(samples: &[Sample]) -> Vec<(String, Vec<f64>)> {
     let mut slots: std::collections::BTreeMap<String, Vec<f64>> = Default::default();
@@ -1338,8 +1265,6 @@ fn start_json(artifact: &Frozen, chip: &str, args: &Args, samples: &[Sample]) ->
 pub(crate) mod tests {
     use super::*;
 
-    /// Every launch starts with the audible bell off (aterm's default is on)
-    /// and the restore, update and package lanes off, as one document
     /// aterm's parser reads.
     #[test]
     fn a_start_launch_has_the_audible_bell_off() {
@@ -1357,10 +1282,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// A frozen copy whose first run printed aterm's line leaves its run root
-    /// free to go; one whose run did not keeps it (macOS may still be assessing
-    /// a copy that never showed it ran). The stand-in answers as aterm from its
-    /// own path and as something else from the frozen copy's (`*-aterm`).
     /// NEGATIVE CONTROL: the first half, whose root goes.
     #[cfg(unix)]
     #[test]
@@ -1398,7 +1319,6 @@ case \"$0\" in *-aterm) echo '{frozen_says}' ;; \
         let refused = freeze("kept", &source, &root);
         drop(silent);
         let kept = root.join("kept-aterm").is_file();
-        // The frozen copy ran to its exit (it printed the wrong line): removing it is safe.
         let _ = std::fs::remove_dir_all(&root);
         assert!(refused.is_err(), "{refused:?}");
         assert!(
@@ -1407,9 +1327,6 @@ case \"$0\" in *-aterm) echo '{frozen_says}' ;; \
         );
     }
 
-    /// A valid current-schema metrics read: every partition reconciles, the
-    /// reveal sits BELOW first-present (an early-reveal platform), and `bias`
-    /// rides the whole reconciling chain (both totals, the attach phase and its
     /// window-setup child) so a slot offset survives every sum check.
     pub(crate) fn metrics(bias: f64) -> Value {
         json!({
@@ -1629,8 +1546,6 @@ case \"$0\" in *-aterm) echo '{frozen_says}' ;; \
         );
     }
 
-    /// [`metrics`] plus a valid worker drill-down (gpu_build 4.0) and a GPU
-    /// drill-down whose legs close against it and whose pipeline groups
     /// (0.1 each) fill their 0.8 parent.
     fn drilled() -> Value {
         let mut m = metrics(0.0);
@@ -1714,7 +1629,6 @@ case \"$0\" in *-aterm) echo '{frozen_says}' ;; \
         ] {
             refused(with(m.clone(), key, v), &LAWS, why);
         }
-        // A schema the binary marks invalid is unavailable, not judged.
         let s = Sample::from_observation(
             &obs(with(m.clone(), "startup_worker_valid", json!(false))),
             &LAWS,
@@ -1757,7 +1671,6 @@ case \"$0\" in *-aterm) echo '{frozen_says}' ;; \
             column(&samples, |s| s.worker.as_ref().map(|w| w.total_ms)),
             Some(vec![8.0, 8.0])
         );
-        // One sample without the drill-down makes the group unavailable.
         let plain = Sample::from_observation(&obs(metrics(0.0)), &LAWS).expect("valid");
         assert_eq!(
             named(&[samples[0].clone(), plain], &GPU, |s| {
@@ -1767,8 +1680,6 @@ case \"$0\" in *-aterm) echo '{frozen_says}' ;; \
         );
     }
 
-    /// [`metrics`] plus the loader's share and a valid preparation split: ten
-    /// phases filling its 1.0 ms `startup_gui_prepare_ms` (binary fractions,
     /// so the sum is exact).
     fn prepared() -> Value {
         let mut m = with(metrics(0.0), BIRTH, json!(3.5));
@@ -1807,7 +1718,6 @@ case \"$0\" in *-aterm) echo '{frozen_says}' ;; \
         ] {
             refused(with(prepared(), key, v), &LAWS, why);
         }
-        // A split the binary marks invalid is unavailable, not judged.
         let invalid = with(prepared(), "startup_prepare_valid", json!(false));
         let s = Sample::from_observation(
             &obs(with(invalid, "startup_prepare_app_ms", json!(9.0))),
@@ -1832,8 +1742,6 @@ case \"$0\" in *-aterm) echo '{frozen_says}' ;; \
             &LAWS,
             "process_birth_to_rust_main_ms",
         );
-        // External 20.0, Rust main to first present 15.0: 6 ms before main
-        // cannot have happened inside the observation.
         refused(
             with(prepared(), BIRTH, json!(6.0)),
             &LAWS,

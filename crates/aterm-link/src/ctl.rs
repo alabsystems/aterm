@@ -22,7 +22,7 @@ pub const REPLY_ROWS_MAX: usize = 1024 * 1024;
 pub struct Ctl {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
-    /// Latched on the first I/O failure. A stream that failed mid-request may be
+    /// Latched on the first I/O failure.
     lost: bool,
 }
 
@@ -254,12 +254,16 @@ impl Ctl {
 }
 
 /// The first character of `line` that aterm would read as framing rather than
+/// as part of the field it sits in: any control character (`\n` ends the
+/// request, `\r` and `\t` split a field) and any whitespace but the ASCII space
+/// (aterm's `split_whitespace` splits on U+00A0, U+2028 and the rest too).
 fn misframing_char(line: &str) -> Option<char> {
     line.chars()
         .find(|c| c.is_control() || (c.is_whitespace() && *c != ' '))
 }
 
 /// The verb keyword of a request line, read by the wire's request grammar the
+/// server reads it by ([`aterm_types::control_request::head`]).
 fn request_verb(line: &str) -> &str {
     aterm_types::control_request::head(line).verb
 }
@@ -322,6 +326,7 @@ mod tests {
     }
 
     /// Each framing is consumed to the byte, so the next request's reply lands
+    /// in the right place.
     #[test]
     fn every_framing_is_consumed_exactly() {
         let (near, far) = UnixStream::pair().expect("socketpair");
@@ -355,6 +360,8 @@ mod tests {
     }
 
     /// A line aterm would misread — over the bound, or holding a byte it
+    /// frames or splits on — is refused without writing anything, and the
+    /// connection is not lost.
     #[test]
     fn a_line_aterm_would_misread_is_refused_without_writing_and_the_lane_survives() {
         let (near, far) = UnixStream::pair().expect("socketpair");
@@ -405,6 +412,7 @@ mod tests {
     }
 
     /// A server-declared count above the ceiling is refused (`InvalidData`) in
+    /// both units rather than allocated.
     #[test]
     fn a_hostile_reply_count_is_refused_rather_than_allocated() {
         for (verb, header) in [

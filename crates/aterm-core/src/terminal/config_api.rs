@@ -200,6 +200,8 @@ impl Terminal {
     /// assert!(changes.contains(&ConfigChange::CursorStyle));
     /// assert!(changes.contains(&ConfigChange::CursorBlink));
     /// ```
+    /// use aterm_core::config::{ConfigChange, TerminalConfig};
+    /// use aterm_core::terminal::{CursorStyle, Terminal};
     ///
     /// # Change detection
     ///

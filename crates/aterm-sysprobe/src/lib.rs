@@ -225,6 +225,7 @@ pub fn stdin_sharers(leader: u32) -> Option<Vec<u32>> {
 }
 
 /// [`stdin_sharers`] on Linux: the leader's children still in its group
+/// whose `/proc/<pid>/fd/0` is the leader's own device.
 #[cfg(target_os = "linux")]
 fn linux_stdin_sharers(leader: u32) -> Option<Vec<u32>> {
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};

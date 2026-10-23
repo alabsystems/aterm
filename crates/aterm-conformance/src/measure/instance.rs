@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A private headless instance of the binary under measurement, and the client that
-//! drives it.
-//!
-//! The instance runs in a scratch world under `/tmp` (a socket path must fit
-//! `sun_path`): its own HOME, config and runtime dirs, `/bin/sh` with a fixed
-//! two-column prompt, and every automatic lane off. It holds a lifeline
-//! ([`aterm_uds::lifeline`]), so a measuring process killed any way takes its
-//! instance with it. The client is the binary's own `ctl`.
+//! A private headless instance of the binary under measurement, and the client that drives it.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -16,12 +9,10 @@ use std::time::{Duration, Instant};
 
 use aterm_uds::spawnfd;
 
-/// A wait for something that must happen: a hang detector, never a latency
-/// budget. A correct run leaves the moment the event lands.
+/// A wait for something that must happen: a hang detector, never a latency budget.
 pub const MUST_HAPPEN: Duration = Duration::from_secs(60);
 
-/// The gap between two observations of a bounded poll. Not synchronisation:
-/// the observation decides; this only keeps the poll off a core.
+/// The gap between two observations of a bounded poll.
 const POLL_GAP: Duration = Duration::from_millis(50);
 
 /// The most a single `ctl --timeout` asks for, in seconds: past every
@@ -46,8 +37,7 @@ pub fn could_not_run<T>(why: impl Into<String>) -> Result<T, CouldNotRun> {
     Err(CouldNotRun(why.into()))
 }
 
-/// A take's whole-run limit. Every wait and every request gives up at its
-/// end, so a slow but live instance cannot stretch one take without bound.
+/// A take's whole-run limit.
 #[derive(Clone, Copy, Debug)]
 pub struct Budget {
     ends: Instant,
@@ -81,10 +71,7 @@ impl Budget {
         ))
     }
 
-    /// Poll `probe` until it answers `Some`: for at most [`MUST_HAPPEN`], and
-    /// never past the budget. An event that already happened is no wait, so
-    /// the probe is always asked once.
-    ///
+    /// Poll `probe` until it answers `Some`: for at most [`MUST_HAPPEN`], and never past the budget.
     /// # Errors
     /// [`CouldNotRun`] naming `what` once the minute or the budget is gone.
     pub fn await_event<T>(
@@ -110,8 +97,7 @@ impl Budget {
     }
 }
 
-/// Run `program --version` once, unclocked: a fresh binary's first exec waits
-/// on the system's code check, which no take's timeline should carry.
+/// Run `program --version` once, unclocked: a fresh binary's first exec waits on the system's code check, which no take's timeline should carry.
 pub fn first_exec(program: &Path) {
     let _ = spawnfd::command(program)
         .arg("--version")
@@ -121,8 +107,7 @@ pub fn first_exec(program: &Path) {
         .status();
 }
 
-/// A private `0700` directory under `/tmp`, removed on drop unless kept for a
-/// diagnostic read.
+/// A private `0700` directory under `/tmp`, removed on drop unless kept for a diagnostic read.
 pub struct Scratch {
     path: PathBuf,
     /// The removal guard; `None` once kept.
@@ -131,7 +116,6 @@ pub struct Scratch {
 
 impl Scratch {
     /// A fresh directory named `<prefix>-<pid>_<random>_<n>`, made exclusively.
-    ///
     /// # Errors
     /// The directory could not be made.
     pub fn new(prefix: &str) -> std::io::Result<Self> {
@@ -171,21 +155,13 @@ pub struct World {
     pub log: PathBuf,
 }
 
-/// The automatic lanes off: no update check, no package loop, the machine's
-/// own preferences left alone.
+/// The automatic lanes off: no update check, no package loop, the machine's own preferences left alone.
 pub const CONFIG_OFF: &str = "[update]\nenabled = false\nauto_apply = false\n\
                               [packages]\nenabled = false\n\
                               [machine]\nuniversal_control = \"leave\"\n";
 
 impl World {
-    /// Lay out `root`: `home/` with a two-column `/bin/sh` prompt (so a typed
-    /// burst never wraps on a long host name), `cfg/aterm/aterm.toml` holding
-    /// the audible bell off, `config_head` then [`CONFIG_OFF`], and `run/`.
-    /// The bell line leads because `config_head` may open a table; it is off
-    /// because the binary under measurement (`--app`) may be a build from
-    /// before a headless aterm stopped beeping, and its BEL would play the
-    /// owner's alert sound with nothing on screen.
-    ///
+    /// Lay out `root`: `home/` with a two-column `/bin/sh` prompt (so a typed burst never wraps on a long host name), `cfg/aterm/aterm.toml` holding the audible bell off, `config_head` then [`CONFIG_OFF`], and `run/`.
     /// # Errors
     /// A file or directory could not be written.
     pub fn prepare(root: &Path, config_head: &str) -> std::io::Result<Self> {
@@ -195,8 +171,6 @@ impl World {
             std::fs::create_dir_all(&dir)?;
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         }
-        // The login shell reads ~/.profile after /etc/profile (which sets a
-        // host-named prompt); an interactive sh reads $ENV.
         std::fs::write(home.join(".profile"), "PS1='$ '\n")?;
         std::fs::write(home.join(".shrc"), "PS1='$ '\n")?;
         std::fs::write(
@@ -221,10 +195,8 @@ impl World {
             ("TERM", "xterm-256color".into()),
             ("XDG_CONFIG_HOME", self.root.join("cfg").into_os_string()),
             ("XDG_RUNTIME_DIR", self.root.join("run").into_os_string()),
-            // The sandbox shell writes no history after the world is removed.
             ("HISTFILE", "/dev/null".into()),
         ];
-        // A development build's spawn trace, passed through when asked for.
         if let Some(v) = std::env::var_os("ATERM_TRACE_SPAWN") {
             env.push(("ATERM_TRACE_SPAWN", v));
         }
@@ -233,7 +205,7 @@ impl World {
 }
 
 /// `PRIO_DARWIN_ROLE` (`<sys/resource.h>`, private): `setpriority`'s darwin-role
-/// selector. Not in `libc` (aterm-pty and aterm-lab name it the same way).
+/// selector.
 #[cfg(target_os = "macos")]
 const PRIO_DARWIN_ROLE: libc::c_int = 6;
 
@@ -241,44 +213,19 @@ const PRIO_DARWIN_ROLE: libc::c_int = 6;
 #[cfg(target_os = "macos")]
 const ROLE_UI_FOCAL: libc::c_int = 1;
 
-/// The scheduling band the subject runs in: aterm.app's, whatever launched
-/// the measurement.
-///
-/// A spawned process holds no darwin role, whatever its launcher holds: roles
-/// are not inherited (measured 2026-10-20: a parent holding role 2 spawned a
-/// child that read 0), so even from an aterm shell, which holds one, the
-/// subject starts with none. macOS squashes the user-interactive threads of
-/// an app-type task without a role to the legacy band, 31: the band every
-/// build runs in.
-/// aterm.app runs at its role's: `UI_FOCAL` when it is the app being typed
-/// into, its main thread at 47. In 31 the subject's render loop waits behind
-/// the machine's other work and its recorder misses presents, so a take
-/// measures the role-less band, not the artifact's. Measured 2026-10-20
-/// (DESK-2, M4 Pro; the streamer paint row beside 12 busy loops, load 16-35,
-/// 6 takes an arm): role-less, the recorder's nominal interval was 18.9-19.4
-/// ms and its widest hole 22.4-36.3 ms, and one `verify measure` at load 8
-/// starved the row at 56.9 ms; at `UI_FOCAL` every take held 17.7 ms with
-/// holes of 17.9-18.4 (`docs/measured/desk2-2026-10-20.md`).
-///
-/// Only the role: the subject stays in its launcher's resource coalition,
-/// where aterm.app heads one of its own (aterm-lab's `Band::App` gives an
-/// instance both). The role alone held the cadence; a coalition of its own
-/// was not measured.
+/// The scheduling band the subject runs in: aterm.app's, whatever launched the measurement.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Band {
     /// The subject holds `UI_FOCAL`, aterm.app's band when frontmost.
     Focal,
-    /// The kernel refused the role, with its errno (a DAEMON-type task, such
-    /// as a launchd job's, gets `ENOTSUP`): the subject runs in the role-less
-    /// band.
+    /// The kernel refused the role, with its errno (a DAEMON-type task, such as a launchd job's, gets `ENOTSUP`): the subject runs in the role-less band.
     Refused(i32),
     /// Not macOS: there are no darwin roles.
     NoRoles,
 }
 
 impl Band {
-    /// Give `pid`, a child of this process, aterm.app's band. The role is the
-    /// whole task's, so the threads it already started move with it.
+    /// Give `pid`, a child of this process, aterm.app's band.
     #[must_use]
     pub fn take(pid: u32) -> Self {
         #[cfg(target_os = "macos")]
@@ -310,7 +257,7 @@ impl std::fmt::Display for Band {
     }
 }
 
-/// A running headless instance. Dropping it kills and reaps it.
+/// A running headless instance.
 pub struct Instance {
     child: spawnfd::Child,
     _lifeline: aterm_uds::lifeline::Lifeline,
@@ -321,13 +268,9 @@ pub struct Instance {
 }
 
 impl Instance {
-    /// Launch `bin --headless` in `world` and wait until its control socket
-    /// listens and its session is ready. Every request its client makes, and
-    /// every wait on it, ends with `budget`.
-    ///
+    /// Launch `bin --headless` in `world` and wait until its control socket listens and its session is ready.
     /// # Errors
-    /// The launch failed, the instance exited before it listened (its log
-    /// tail is in the reason), or it never listened.
+    /// The launch failed, the instance exited before it listened (its log tail is in the reason), or it never listened.
     pub fn launch(bin: &Path, world: &World, budget: Budget) -> Result<Self, CouldNotRun> {
         let log = std::fs::File::create(&world.log)
             .map_err(|e| CouldNotRun(format!("cannot create {}: {e}", world.log.display())))?;
@@ -432,8 +375,6 @@ pub struct Ctl {
 
 impl Ctl {
     /// Run `bin ctl --sock <sock> --timeout <secs> <args…>` and collect it.
-    /// The deadline is [`CTL_TIMEOUT_SECS`] or what is left of the budget,
-    /// whichever is less; a spent budget runs nothing (`code` is `None`).
     #[must_use]
     pub fn call(&self, args: &[&str]) -> Reply {
         let Some(left) = self.budget.left() else {
@@ -471,7 +412,6 @@ impl Ctl {
     }
 
     /// A request that must succeed: its first stdout line.
-    ///
     /// # Errors
     /// The request failed; the reason quotes it.
     pub fn ok(&self, args: &[&str]) -> Result<String, CouldNotRun> {
@@ -492,7 +432,6 @@ impl Ctl {
     }
 
     /// [`Budget::await_event`] on this client's budget.
-    ///
     /// # Errors
     /// [`CouldNotRun`] naming `what` once the minute or the budget is gone.
     pub fn await_event<T>(
@@ -504,7 +443,6 @@ impl Ctl {
     }
 
     /// The `key=value` field `key` of a request's first line.
-    ///
     /// # Errors
     /// The request failed or its line has no such field.
     pub fn field(&self, args: &[&str], key: &str) -> Result<String, CouldNotRun> {
@@ -602,9 +540,7 @@ mod tests {
 
     /// A child starts with no role (the band the subject ran in before), and
     /// [`Band::take`] moves it to `UI_FOCAL`, or names the kernel's refusal
-    /// with the child still role-less. A refusal is the kernel's only when it
-    /// is `EPERM` or `ENOTSUP`: `EINVAL` (no such role) or `ESRCH` (no such
-    /// process) is this code asking wrongly, and fails.
+    /// with the child still role-less.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_child_takes_the_app_band_or_names_the_refusal() {

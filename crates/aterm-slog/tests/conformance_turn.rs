@@ -1,50 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance: the shipping [`TurnTracker`] (over a real [`Log`])
-//! against the derived `TurnTracker` model
-//! (`aterm_models_session::turn_tracker_model`, checked at Tier-0 in
-//! `aterm-models/tests/derived_ring_ty.rs`).
-//!
-//! Seeded random host schedules, and the hand-written replays of
-//! `turn_replays.rs`, drive the real tracker the way the host does: one call
-//! per verdict, time passing in half-second steps (the model's `Tick`), and
-//! wakes that are not tied to the deadline: early (nothing changes), on
-//! time and late (time passes with no wake, and the next call, a verdict
-//! included, applies the settle first: the model's `Rest` then the verdict).
-//! A `ctl turn` while the agent rests is the model's `CtlTurn`. The
-//! transcript (phase 3B) drives the same tracker: a vendor turn's prompt and
-//! end on a measured build (`TxClose` when no screen step holds the turn,
-//! else only its amends), and the wall judge refuting the screen's wall
-//! (`TxRefute`). After every
-//! step the real state is projected onto the model's variables, the step
-//! must be a path of the model's actions with every invariant holding, and
-//! the turn records the step appended must be exactly the turn opens and
-//! closes along that path: a tracker that splits one turn into two, or
-//! supersedes its own turn, is not the model's.
-//!
-//! Inputs: the host ADMITS an input under the lock it
-//! takes before a byte (`TurnTracker::admit`) and ACCEPTS it after the write
-//! (`TurnTracker::accept`), the model's `AdmitCtl` or `AdmitHarness` (by
-//! the input's actor, phase 6, 6A-5) and `Accept`, one in flight
-//! at a time; a person's input is both at once (`Person`); time passing
-//! past `STEP_ACT_MS` and `STEP_INPUT_LEAD_MS` is its `Age` and `LeadOut`.
-//! The rig keeps the model's ghosts from what it fed and what the log
-//! shows: an input bound to a step it was neither admitted under nor led to
-//! (`gn`), a binding still held after it attributed a close (`ab`), a close
-//! read approved, declined or answered with no fresh, proven, acted input
-//! bound to it (`ga`), and who sent the input the open step is bound to
-//! (`bs`), which the tracker's binding must name (`ba`).
-//!
-//! NEGATIVE CONTROLS: the Codex mid-answer idle closed at once, an early
-//! wake that closes, a turn closed on `unknown`, a projection that forgets
-//! a step's parent, a transcript end that closes the screen's wall with its
-//! turn, a refutation that leaves the wall's settle armed, and T1's five
-//! mutants (an acceptance after box 1 closed that binds box 2, a stale input
-//! that approves, an act a person's input does not supersede, on the box or
-//! on the lead, a binding a close keeps) are each rejected, and so is a
-//! binding that names the other acting actor (`ActorSwap`, 6A-5), from a
-//! ctl act and from the harness's.
+//! Tier-1 conformance.
 
 use aterm_models_session::turn_tracker_model;
 use aterm_slog::{
@@ -164,19 +121,15 @@ pub struct Rig {
     pub now: u64,
     /// The last `ctl turn` ledger id handed out.
     pub ledger: u64,
-    /// The transcript's read offset: each row ends past the last.
+    /// The transcript's read offset.
     pub tx_off: u64,
     /// The vendor turns prompted so far.
     pub vturns: u64,
-    /// A ghost (the model's `wg`): a transcript call left the screen's
-    /// wall with no step holding its need, and retracted none.
+    /// A ghost (the model's `wg`).
     pub wall_gone: bool,
-    /// The input admitted and not yet accepted (T1): its admission, author
-    /// and act, and the approval and question steps opened and closed by
-    /// then.
+    /// The input admitted and not yet accepted (T1).
     pub pending: Option<(Admission, Actor, Option<ActWord>, u64, u64)>,
-    /// The open approval or question step and when the rig saw it open
-    /// (`None`: carried across an update).
+    /// The open approval or question step and when the rig saw it open (`None`: carried across an update).
     pub opened: Option<(Node, Option<u64>)>,
     /// The step a person's input bound, and when (the model's `pp`).
     pub person_on: Option<(Node, u64)>,
@@ -184,14 +137,12 @@ pub struct Rig {
     pub bound_next: bool,
     pub bound_twice: bool,
     pub approved_unseen: bool,
-    /// Who sent the input the open step is bound to, as the rig fed it
-    /// (the model's `bs`, 6A-5), and who sent the act accepted on the lead.
+    /// Who sent the input the open step is bound to, as the rig fed it (the model's `bs`, 6A-5), and who sent the act accepted on the lead.
     pub bound_sender: Option<Actor>,
     pub lead_sender: Option<Actor>,
     /// The ring's bounds, which an update's successor keeps.
     pub limits: Limits,
-    /// Its birth order and the host calls it made, while
-    /// [`crate::seq_twins::record`] records (nothing otherwise).
+    /// Its birth order and the host calls it made, while [`crate::seq_twins::record`] records (nothing otherwise).
     pub born: usize,
     pub path: Vec<Took>,
 }
@@ -272,7 +223,7 @@ impl Rig {
         self.ledger
     }
 
-    /// The host wakes the tracker now; its next deadline.
+    /// The host wakes the tracker now.
     pub fn tick(&mut self) -> Option<u64> {
         let before = self.before();
         let stamp = self.stamp();
@@ -281,16 +232,14 @@ impl Rig {
         next
     }
 
-    /// The host admits an input from `by` with `act` now (T1): what the
-    /// tracker holds under the lock the host takes before a byte.
+    /// The host admits an input from `by` with `act` now (T1).
     pub fn admit(&mut self, by: Actor, act: Option<ActWord>) {
         let adm = self.tracker.admit(self.stamp());
         let a = self.tracker.attribution();
         self.pending = Some((adm, by, act, a.opens, a.closes));
     }
 
-    /// The host accepts the admitted input now (its bytes written), or
-    /// `None` when none is in flight.
+    /// The host accepts the admitted input now (its bytes written), or `None` when none is in flight.
     pub fn accept(&mut self) -> Option<Binding> {
         let before = self.before();
         let (adm, by, act, ..) = self.pending.take()?;
@@ -347,8 +296,6 @@ impl Rig {
             self.opened = open.map(|n| (n, Some(self.now)));
         }
         let a = self.tracker.attribution();
-        // A binding the call made: only to the open step, and only the one
-        // the call's input was admitted under or led to.
         if let Some((node, by, ..)) = a.bound
             && a.bound != b.bound
         {
@@ -362,12 +309,9 @@ impl Rig {
                     Call::Other => false,
                 };
             self.bound_next |= !legit;
-            // An act's lead the open bound: its sender is the lead's.
             if matches!(call, Call::See) && by != Actor::Human {
                 self.bound_sender = self.lead_sender;
             }
-            // A person's lead the open bound: the step's latest input is
-            // the person's, from when it was accepted (the model's `pp`).
             if matches!(call, Call::See)
                 && by == Actor::Human
                 && let Some((_, _, _, acc)) = a.bound
@@ -397,9 +341,7 @@ impl Rig {
         }
     }
 
-    /// One transcript row of a measured build, dated `wall_ms`, at the next
-    /// offset of the one file (bound at the first row, with nothing in it
-    /// before: the session started with the run).
+    /// Feed one transcript row of a measured build dated `wall_ms` at the next offset.
     pub fn tx(&mut self, ev: TxEvent<'_>, wall_ms: u64) -> Option<u64> {
         let stamp = self.stamp();
         let pos = |off: u64, wall_ms: u64| TxPos {
@@ -432,9 +374,6 @@ impl Rig {
             TxState::On,
             stamp,
         );
-        // The wall's need is lost when no wall step holds it after the call
-        // (its own, or the run's that a due settle continued it into) and
-        // the call retracted none.
         let held = self
             .tracker
             .view(self.now)
@@ -451,10 +390,7 @@ impl Rig {
         next
     }
 
-    /// The vendor turn of the open turn: its prompt (dated at the turn's
-    /// open: it caused it) unless the turn already maps one, then its end.
-    /// `false` when the open turn's vendor turn already ended (a screen step
-    /// held it open): its transcript has nothing more to say.
+    /// The vendor turn of the open turn.
     pub fn tx_turn(&mut self) -> bool {
         let view = self.tracker.tx_view();
         if let Some(t) = self.tracker.turn() {
@@ -477,8 +413,7 @@ impl Rig {
         true
     }
 
-    /// The records appended after seq `after`. Seqs the log never held (an
-    /// update's overlap) are no loss; an evicted one is.
+    /// The records appended after seq `after`.
     pub fn since(&self, after: u64) -> Vec<Rec> {
         let read = self.log.read(Cursor::new(self.log.ep(), after), usize::MAX);
         assert!(
@@ -561,17 +496,10 @@ fn person_lead(rig: &Rig) -> i64 {
     }
 }
 
-/// The seqs an update's host reserves past the carried head (its successor
-/// starts above them: a read across says `gap why=handoff`).
+/// The seqs an update's host reserves past the carried head (its successor starts above them: a read across says `gap why=handoff`).
 pub const HANDOFF_RESERVE: u64 = 8;
 
-/// A seamless update of `log` and `tracker` at `at` (design §5.2), as the
-/// glue's adoption makes it (`session_log.rs`'s `adopt`): CARRIED, the log
-/// and the tracker's line cross (`Log::carry`, `Log::from_carry`, the line
-/// as a host line); UNCARRIED, the successor starts a fresh log after a
-/// `gap why=handoff` at the next epoch, continuing the node ids, its session
-/// `open - adopt` and the agent's run opened again, a fresh tracker on it.
-/// Returns the run.
+/// A seamless update of `log` and `tracker` at `at` (design §5.2), as the glue's adoption makes it (`session_log.rs`'s `adopt`).
 pub fn handoff(
     log: &mut Log,
     tracker: &mut TurnTracker,
@@ -625,8 +553,7 @@ pub fn handoff(
     run
 }
 
-/// The projection onto the model's variables. `sturn_override` replaces
-/// the step's parent for the negative control.
+/// The projection onto the model's variables.
 pub fn project(rig: &Rig, sturn_override: Option<i64>) -> State {
     let view = rig.tracker.view(rig.now);
     let turn = view.turn.is_some_and(|t| rig.log.is_open(t));
@@ -652,8 +579,6 @@ pub fn project(rig: &Rig, sturn_override: Option<i64>) -> State {
             c.settled_ms.map_or(0, |ms| (ms / TICK_MS).min(2) as i64),
         )
     });
-    // T1: the input bound to the open approval or question step, fresh
-    // (`dismisses` at now) or stale, a person's or not.
     let open = rig.open_binding();
     let bk = match rig.tracker.attribution().bound {
         None => 0,
@@ -669,8 +594,6 @@ pub fn project(rig: &Rig, sturn_override: Option<i64>) -> State {
     let pp = rig
         .person_on
         .is_some_and(|(n, t)| Some(n) == open && rig.now - t <= STEP_ACT_MS);
-    // 6A-5: who sent the input in flight or on the lead (`pa`), whom the
-    // fresh act's binding names (`ba`) and who sent it (`bs`, the rig's).
     let a = rig.tracker.attribution();
     let pd = pending_code(rig);
     let pa = match rig.pending {
@@ -713,9 +636,7 @@ pub fn project(rig: &Rig, sturn_override: Option<i64>) -> State {
     .collect()
 }
 
-/// The states of a path of the model's `actions` from `from` that ends at
-/// `to`, or `None` (the model is deterministic per action, but the search
-/// does not rely on it).
+/// States along a path of `actions` from `from` to `to`, or `None`.
 pub fn path_to(m: &Model, actions: &[&str], from: &State, to: &State) -> Option<Vec<State>> {
     let Some((first, rest)) = actions.split_first() else {
         return (from == to).then(|| vec![from.clone()]);
@@ -790,60 +711,43 @@ fn admitted(
 /// One host step against the model.
 #[derive(Clone, Copy, Debug)]
 pub enum Step {
-    /// The verdict moved (a repeat is sent too: it must change nothing but
-    /// an overdue settle).
+    /// The verdict moved (a repeat is sent too: it must change nothing but an overdue settle).
     See(Verdict),
-    /// Half a second passes, then the host wakes the tracker: early (it
-    /// changes nothing) or once the settle is due.
+    /// Half a second passes, then the host wakes the tracker.
     Half,
-    /// Half a second passes with no wake: the host's timer is late.
+    /// Half a second passes with no wake.
     Elapse,
     /// The host wakes the tracker now, due or not.
     Wake,
     /// A `ctl turn` exchange from the harness.
     Ctl,
-    /// [`Step::Ctl`] naming what it acted on (`turn cause=`): the same
-    /// model step.
+    /// [`Step::Ctl`] naming what it acted on (`turn cause=`).
     CtlCaused(ShortId),
-    /// The open turn's vendor turn is prompted and ends in the transcript
-    /// (after a wake, when a settle is due).
+    /// The open turn's vendor turn is prompted and ends in the transcript (after a wake, when a settle is due).
     TxEnd,
-    /// The wall judge refutes the screen's wall (any wall, when none is
-    /// open: nothing to refute).
+    /// The wall judge refutes the screen's wall (any wall, when none is open: nothing to refute).
     TxRefute,
     /// [`Step::See`] with the publication's detail (a wall's reset).
     SeeWith(Verdict, ShortId),
-    /// `ms` pass, then the host wakes the tracker if its deadline passed
-    /// (`Rig::wait`): the model's `Tick`s for the settle's half-seconds
-    /// held, then its `Rest` when due.
+    /// `ms` pass, then the host wakes the tracker if its deadline passed (`Rig::wait`).
     Wait(u64),
-    /// `ms` pass with no wake (the host's timer is late): `Tick`s only.
+    /// `ms` pass with no wake (the host's timer is late).
     Pass(u64),
-    /// Input from the actor reached the session: it attributes, and moves
-    /// nothing the model holds.
+    /// Input from the actor reached the session.
     Input(Actor),
-    /// The screen reported the turn interrupted: its idle close says so,
-    /// and nothing the model holds moves.
+    /// The screen reported the turn interrupted.
     Interrupted,
-    /// A seamless update, carried (`true`) or not ([`handoff`]). Carried,
-    /// the tracker holds what it held but the last close (a view's, which
-    /// does not cross) and every input's binding (T1: none is carried);
-    /// uncarried, it starts as the model's initial state.
+    /// A seamless update, carried (`true`) or not ([`handoff`]).
     Handoff(bool),
-    /// The host admits an input from the actor with its act (T1's
-    /// admission: the model's `AdmitCtl` or `AdmitHarness` by the actor,
-    /// 6A-5; one is in flight at a time).
+    /// The host admits an input from the actor with its act (`AdmitCtl` or `AdmitHarness`).
     Admit(Actor, Option<ActWord>),
-    /// The host accepts the input in flight (`Accept`; nothing when none
-    /// is).
+    /// The host accepts the input in flight (`Accept`; nothing when none is).
     Accept,
-    /// A person's input (`Person` while an approval or question step is
-    /// open; else `PersonLeads`: it waits on the lead, taking it from an act
-    /// waiting there).
+    /// A person's input (`Person` when an approval/question step is open, else `PersonLeads`).
     Person,
 }
 
-/// Drive `steps`, checking each against the model; returns the rig.
+/// Drive `steps`, checking each against the model.
 pub fn drive(steps: &[Step]) -> Rig {
     let m = turn_tracker_model();
     let mut rig = Rig::new();
@@ -928,8 +832,7 @@ fn see_step(m: &Model, rig: &mut Rig, v: Verdict, detail: Option<ShortId>) {
     admitted(m, rig, &path, &prev, &project(rig, None), before);
 }
 
-/// One host step on `rig`, checked against `m` (the derived model), and
-/// noted on its path while the twins record.
+/// One host step on `rig`, checked against `m` (the derived model), and noted on its path while the twins record.
 pub fn apply(m: &Model, rig: &mut Rig, step: Step) {
     let seq0 = rig.log.last_seq();
     apply_step(m, rig, step);
@@ -1056,8 +959,6 @@ fn apply_step(m: &Model, rig: &mut Rig, step: Step) {
         Step::Handoff(carried) => {
             let stamp = rig.stamp();
             rig.run = handoff(&mut rig.log, &mut rig.tracker, rig.limits, carried, stamp);
-            // An input in flight is the predecessor's; a carried step was
-            // not seen to open here (T1).
             rig.pending = None;
             rig.person_on = None;
             (rig.bound_sender, rig.lead_sender) = (None, None);
@@ -1228,7 +1129,6 @@ fn turn_tracker_conforms_to_derived_model() {
                 }
             }
         }
-        // Every turn the tracker opened is the run's only open turn.
         assert!(rig.log.open_under(rig.run, Lvl::Turn).count() <= 1);
     }
     for a in [
@@ -1270,7 +1170,6 @@ fn turn_tracker_conforms_to_derived_model() {
     ] {
         assert!(ran.contains(a), "the walks never drove `{a}`");
     }
-    // A late wake: verdicts arrive while the settle is due but unwoken.
     for a in ["SeeBusy", "SeeIdle", "SeeUnknown", "SeeWall"] {
         assert!(
             from_due.contains(a),
@@ -1278,7 +1177,6 @@ fn turn_tracker_conforms_to_derived_model() {
         );
     }
 
-    // The ty tier re-checks one real transition where it is installed.
     let mut rig = Rig::new();
     let prev = project(&rig, None);
     rig.observe(Verdict::Busy);
@@ -1339,12 +1237,10 @@ fn turn_tracker_conformance_rejects_early_and_unknown_closes() {
     let m = turn_tracker_model();
     let buggy = with_buggy(&m, 1);
 
-    // The Codex mid-answer idle: busy, idle, and 220 ms later busy again.
     let mut rig = drive(&[Step::See(Verdict::Busy), Step::See(Verdict::Idle)]);
     let armed = project(&rig, None);
     assert_eq!((armed["turn"], armed["pend"]), (1, 1));
     rig.now += 220;
-    // An early wake 220 ms in closes nothing and keeps its deadline.
     let asked = rig.tracker.wake_at();
     let stamp = rig.stamp();
     let again = rig.tracker.tick(&mut rig.log, stamp);
@@ -1358,17 +1254,14 @@ fn turn_tracker_conformance_rejects_early_and_unknown_closes() {
         rig.tracker.turn().is_some(),
         "the mid-answer idle kept its turn"
     );
-    // A tracker that closed on the idle at once is not the model's...
     let mut early = armed.clone();
     for (k, v) in [("turn", 0), ("pend", 0), ("cw", 2), ("cticks", 0)] {
         early.insert(k, v);
     }
     assert!(aterm_spec::interp::admits(&m, &armed, &early).is_none());
-    // ...and is exactly the Buggy model's EarlyRest, which its law catches.
     assert!(buggy.successors("EarlyRest", &armed).contains(&early));
     assert!(!m.check_invariant("IdleClosesOnlyAfterSettle", &early));
 
-    // A turn closed on `unknown` is rejected.
     let busy = project(&drive(&[Step::See(Verdict::Busy)]), None);
     let mut closed = busy.clone();
     for (k, v) in [("turn", 0), ("word", 0), ("cw", 0)] {
@@ -1377,8 +1270,6 @@ fn turn_tracker_conformance_rejects_early_and_unknown_closes() {
     assert!(!m.successors("SeeUnknown", &busy).contains(&closed));
     assert!(!m.check_invariant("UnknownNeverClosesATurn", &closed));
 
-    // A projection that hangs every step from the turn: the wall the turn
-    // closed on stays open on the run, and that projection breaks the law.
     let rested = drive(&[
         Step::See(Verdict::Busy),
         Step::See(Verdict::Wall(WallKind::UsageSession)),
@@ -1406,8 +1297,6 @@ fn turn_tracker_conformance_rejects_tx_closes_that_take_a_wall() {
     let m = turn_tracker_model();
     let buggy = with_buggy(&m, 1);
 
-    // The vendor turn ends while the screen shows a wall under its turn:
-    // the turn and the wall stay open, and the end only amends.
     let mut rig = drive(&[
         Step::See(Verdict::Busy),
         Step::See(Verdict::Wall(WallKind::UsageSession)),
@@ -1421,8 +1310,6 @@ fn turn_tracker_conformance_rejects_tx_closes_that_take_a_wall() {
         "the end moved nothing it holds"
     );
     assert!(rig.tracker.tx_view().ended);
-    // A join that closed the turn, its cascade taking the wall, is not the
-    // model's, and is exactly the Buggy model's TxCloseTakesWall.
     let mut taken = walled.clone();
     for (k, v) in [
         ("turn", 0),
@@ -1442,8 +1329,6 @@ fn turn_tracker_conformance_rejects_tx_closes_that_take_a_wall() {
     );
     assert!(!m.check_invariant("WallNeedOutlivesTxClose", &taken));
 
-    // The judge refutes it: the wall closes `out=retracted`, its settle is
-    // disarmed, and the turn waits for the screen's next word.
     let mut rig = drive(&[
         Step::See(Verdict::Busy),
         Step::See(Verdict::Wall(WallKind::UsageSession)),
@@ -1470,7 +1355,6 @@ fn turn_tracker_conformance_rejects_tx_closes_that_take_a_wall() {
             .contains(&kept)
     );
     assert!(!m.check_invariant("RefutedWallStaysShut", &kept));
-    // Its turn now ends in the transcript as done.
     checked(&mut rig, Step::TxEnd);
     assert_eq!(project(&rig, None)["cw"], 12);
 }
@@ -1500,8 +1384,6 @@ fn turn_tracker_conformance_rejects_inputs_that_bind_the_wrong_box() {
         );
     };
 
-    // Admitted under box 1, accepted after one observe replaced it with box
-    // 2: the real acceptance binds nothing; binding box 2 is ActBindsNextBox.
     let mut rig = drive(&[
         Step::See(Verdict::Busy),
         Step::See(edit),
@@ -1532,8 +1414,6 @@ fn turn_tracker_conformance_rejects_inputs_that_bind_the_wrong_box() {
     }
     caught("ActBindsNextBox", "ActNeverBindsNextBox", &late, &bad);
 
-    // A harness approve accepted 600 ms before the box goes: the close reads
-    // `by=- out=passed`; reading it approved is AttributeStaleInput.
     let mut rig = drive(&[
         Step::See(Verdict::Busy),
         Step::See(edit),
@@ -1565,9 +1445,6 @@ fn turn_tracker_conformance_rejects_inputs_that_bind_the_wrong_box() {
         &bad,
     );
 
-    // A person's key after the harness's approve: the person's input is
-    // the box's latest, and the close reads `by=human out=passed`; leaving
-    // the act bound is ActOverPerson.
     let mut rig = drive(&[
         Step::See(Verdict::Busy),
         Step::See(edit),
@@ -1590,12 +1467,6 @@ fn turn_tracker_conformance_rejects_inputs_that_bind_the_wrong_box() {
     bad.insert("pp", 1);
     caught("ActOverPerson", "PersonSupersedesAct", &acted, &bad);
 
-    // A harness approve accepted on the lead (no box open yet), then a
-    // person's key before the box shows: the person's is the latest input,
-    // so it takes the lead and the box it leads to closes `by=human
-    // out=passed`; leaving the act on the lead to bind that box is
-    // ActLeadOverPerson. NEGATIVE CONTROL (by scratch revert): a `person`
-    // that binds only an open step closed it `out=approved by=harness`.
     let mut rig = drive(&[
         Step::See(Verdict::Busy),
         Step::Admit(Actor::Harness, Some(ActWord::Approve)),
@@ -1623,8 +1494,6 @@ fn turn_tracker_conformance_rejects_inputs_that_bind_the_wrong_box() {
     bad.insert("pl", 1);
     caught("ActLeadOverPerson", "PersonSupersedesAct", &led, &bad);
 
-    // The harness's approve closes box 1 `approved` and is spent: box 2
-    // opens unbound; keeping the binding for it is ActTwice.
     let mut rig = drive(&[
         Step::See(Verdict::Busy),
         Step::See(edit),
@@ -1653,11 +1522,6 @@ fn turn_tracker_conformance_rejects_inputs_that_bind_the_wrong_box() {
     }
     caught("ActTwice", "AttributesOnce", &bound, &bad);
 
-    // 6A-5: an act binds as the actor who sent it. The harness's approve
-    // closes its box `approved by=harness`; reading it as ctl's
-    // (`ActorSwap`) breaks HarnessActNotCtl. A ctl approve, bound under the
-    // box or on the lead, closes `passed by=ctl` (ctl is no proven author);
-    // reading it as the harness's breaks ActorKeepsItsAct.
     assert_eq!((bound["bk"], bound["ba"], bound["bs"]), (1, 2, 2));
     let bad = with(&bound, &[("ba", 1)]);
     caught("ActorSwap", "HarnessActNotCtl", &bound, &bad);

@@ -1,10 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `self-uninstall` and `shell-setup` over scratch accounts. Every run is SCOPED to a
-//! scratch `install_dir` and a scratch HOME, so nothing here can reach this machine's
-//! `/Applications` or its real profile; the stand-ins a sweep runs write only into the
-//! scratch tree, by absolute path.
+//! `self-uninstall` and `shell-setup` over scratch accounts.
 
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
@@ -78,8 +75,7 @@ fn bundle(app: &Path, atpkg: Option<&str>) {
 }
 
 /// A stand-in atpkg that sweeps as `uninstall --all` does — records the decline under
-/// `support` when none is there — and logs to `log`. Absolute paths: the child inherits
-/// this test process's HOME, which is the real one.
+/// `support` when none is there — and logs to `log`.
 fn sweeping_atpkg(support: &Path, log: &Path) -> String {
     format!(
         "#!/bin/sh\necho swept >>'{}'\np='{}/pkg'\nmkdir -p \"$p\" && {{ [ -f \"$p/declined\" ] || \
@@ -137,7 +133,7 @@ fn an_uninstall_dry_run_plans_and_changes_nothing() {
 /// The sweep removes from the store only what the store lanes place there — the aterm
 /// binary, its argv0 aliases, the updater's dir, a staging leftover — and keeps a bundle
 /// whose toolchain sweep failed (exit 75: a pass holds the store), since the remedy it
-/// prints runs that bundle's atpkg. A SKIPPED item makes the sweep's answer false.
+/// prints runs that bundle's atpkg.
 #[test]
 fn uninstall_removes_only_what_it_placed() {
     let mut a = Account::new("own");
@@ -146,14 +142,10 @@ fn uninstall_removes_only_what_it_placed() {
     exe(&store.join("backup.sh"), "#!/bin/sh\necho backup\n");
     exe(&store.join("aterm"), "#!/bin/sh\necho \"aterm 0.0.0\"\n");
     write(&store.join(".aterm-install.Ab12Cd"), "");
-    // argv0 aliases are known by what they are, a link to exactly `aterm`; a link to
-    // anything else is not the store's.
     for alias in ["aterm-cli", "aterm-ctl", "atpkg", "aterm-gui", "aterm-next"] {
         symlink("aterm", store.join(alias)).expect("alias");
     }
     symlink("backup.sh", store.join("backup")).expect("a foreign link");
-    // Asked once first, as the install that placed it did, so the system's first-exec
-    // assessment is not what the probe's bound measures.
     aterm_spec::wait::first_exec(&store.join("aterm"), &["--version"]);
     let apps = a.dir.join("apps");
     bundle(&apps.join("aterm.app"), Some("#!/bin/sh\nexit 75\n"));
@@ -179,9 +171,7 @@ fn uninstall_removes_only_what_it_placed() {
 }
 
 /// A scoped sweep removes the bundle it scopes and leaves what another aterm.app on the
-/// account uses — the toolchain store, the PATH links, the PATH block, the man pages. Once
-/// the scoped copy is the only aterm, its sweep runs, and the decline it records goes with
-/// it.
+/// account uses — the toolchain store, the PATH links, the PATH block, the man pages.
 #[test]
 fn a_scoped_uninstall_leaves_what_another_aterm_uses() {
     let mut a = Account::new("scoped");
@@ -245,9 +235,6 @@ fn a_scoped_uninstall_leaves_what_another_aterm_uses() {
 
 #[test]
 fn shell_setup_selects_the_cli_before_an_inherited_bundle_and_preserves_the_profile() {
-    // The one tool resolver (`$ATERM_TEST_FISH`, the pinned copy, the usual install
-    // paths, then `$PATH`), so a host that names its fish for one crate names it here;
-    // without one the test ends COULD NOT RUN naming fish's provider.
     let fish = aterm_spec::host::need_tool("fish");
     for shell in [
         Path::new("/bin/zsh"),
@@ -256,7 +243,6 @@ fn shell_setup_selects_the_cli_before_an_inherited_bundle_and_preserves_the_prof
     ] {
         let is_fish = shell.file_name().is_some_and(|name| name == "fish");
         let mut account = Account::new("selected-cli");
-        // Each shell must quote a real CLI path, including its metacharacters.
         account.places.bin_dir = account.home().join("CLI $selected `app` 'links'");
         let bin = &account.places.bin_dir;
         let release = account.home().join("aterm.app/Contents/MacOS");
@@ -329,8 +315,6 @@ fn shell_setup_selects_the_cli_before_an_inherited_bundle_and_preserves_the_prof
                 "aterm --version; . \"$PROFILE\"; . \"$PROFILE\"; aterm init --help; printf '%s\\n' \"$PATH\" \"$UNCHANGED\"",
             ]
         };
-        // Nothing inherited (a live session's markers would re-order PATH), then the
-        // hermetic HOME and XDG dirs of every real shell a test runs: the scratch account's.
         command.args(args).env_clear();
         for (key, value) in aterm_spec::host::hermetic_env(account.home()) {
             command.env(key, value);
@@ -371,8 +355,7 @@ fn shell_setup_selects_the_cli_before_an_inherited_bundle_and_preserves_the_prof
 
 /// THE PATH BLOCK ROUND TRIP: `shell-setup --path` appends one marker-fenced block (the
 /// hook, and the bin dir PATH lacks), once; the sweep removes exactly it and keeps the
-/// rest of the profile. With no hook and none coming nothing is written; an unknown shell
-/// is told, never guessed at. The plan says each of these before anything is done.
+/// rest of the profile.
 #[test]
 fn the_path_block_is_written_once_and_swept_exactly() {
     let a = Account::new("path");
@@ -545,7 +528,6 @@ fn completions_come_from_the_binary_and_are_swept() {
     for f in &files {
         assert!(!f.exists(), "{} swept", f.display());
     }
-    // A binary that cannot generate the front door's: the sibling's alone.
     exe(
         &stand_in,
         "#!/bin/sh\nif [ \"$1\" = ctl ]; then echo ok; fi\n",
@@ -581,9 +563,7 @@ fn only_a_plain_absolute_path_rides_an_unquoted_exec_line() {
 
 /// `--desktop` writes the entry for `<bin dir>/aterm` with the checkout's every icon size,
 /// and the sweep removes exactly that: the entry by its marker line, the icons it vouches
-/// for. The marker is spelled out here as an OLDER installer wrote it — entries already on
-/// disk carry this exact line, so it may never change. A foreign entry is replaced loudly,
-/// and the sweep leaves one it finds without the line.
+/// for.
 #[test]
 fn the_desktop_entry_is_written_with_its_icons_and_swept_by_its_marker() {
     const ON_DISK: &str =
@@ -596,7 +576,6 @@ fn the_desktop_entry_is_written_with_its_icons_and_swept_by_its_marker() {
         .expect("the checkout's icons")
         .count();
     assert_eq!(shipped, 5, "fixture: the checkout ships five icon sizes");
-    // No PATH: nothing like update-desktop-database is run.
     let env = zsh("");
     let entry = a.places.xdg_data.join("applications/aterm.desktop");
     write(&entry, "[Desktop Entry]\nName=the X11 aterm\n");
@@ -656,14 +635,12 @@ fn the_desktop_entry_is_written_with_its_icons_and_swept_by_its_marker() {
         );
     }
 
-    // The stand-in binary is no link this installer placed; the sweep here is the entry's.
     std::fs::remove_file(&bin).expect("rm the stand-in");
     let (ok, out, err) = a.sweep(None, false);
     assert!(ok, "{out}{err}");
     assert!(!entry.exists(), "{out}");
     assert!(placed.iter().all(|icon| !icon.exists()), "{out}");
 
-    // An entry without the line is someone else's: left, and said.
     write(&entry, "[Desktop Entry]\nName=the X11 aterm\n");
     write(&placed[0], "png");
     let (ok, out, err) = a.sweep(None, false);
@@ -674,8 +651,7 @@ fn the_desktop_entry_is_written_with_its_icons_and_swept_by_its_marker() {
 
 /// A piped install has no checkout, so the binary writes what it carries: `--own-man` its
 /// man page, and `--desktop` with no `--icons` (on Linux) the icon at every shipped size —
-/// byte for byte the repo's, at the paths the sweep takes them from. A dry run names
-/// the source and writes nothing; a checkout's `--man` wins over `--own-man`.
+/// byte for byte the repo's, at the paths the sweep takes them from.
 #[test]
 fn a_piped_install_takes_the_man_page_and_icons_the_binary_carries() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -749,14 +725,12 @@ fn a_piped_install_takes_the_man_page_and_icons_the_binary_carries() {
     #[cfg(not(target_os = "linux"))]
     assert!(icons.iter().all(|icon| !icon.exists()), "{out}");
 
-    // The sweep takes them all: the page by name, the icons by the entry's marker.
     std::fs::remove_file(&bin).expect("rm the stand-in");
     let (ok, out, err) = a.sweep(None, false);
     assert!(ok, "{out}{err}");
     assert!(!page.exists(), "{out}");
     assert!(icons.iter().all(|icon| !icon.exists()), "{out}");
 
-    // A checkout's pages win over the carried ones.
     let src = a.dir.join("checkout/man");
     write(&src.join("aterm.1"), ".TH ATERM 1 checkout\n");
     let (ok, out, err) = a.setup(
@@ -796,7 +770,7 @@ fn dir_within_judges_by_identity() {
 }
 
 /// Step 0's actual admission is exercised without running self-uninstall or any
-/// helper. Executable-mode files hold inert text; only the bounded plist reader runs.
+/// helper.
 #[test]
 fn an_uninstall_helper_is_selected_only_from_an_identified_aterm_bundle() {
     let mut refused = Vec::new();
@@ -838,8 +812,7 @@ fn an_uninstall_helper_is_selected_only_from_an_identified_aterm_bundle() {
 }
 
 /// The actual desktop writer gets an admitted, non-executed command file and an empty
-/// injected PATH. Its staging name may already be somebody else's file or link: neither
-/// the entry nor that person's bytes may be published, truncated or removed.
+/// injected PATH.
 #[test]
 fn a_desktop_write_preserves_a_preexisting_staging_file_or_link() {
     let mut preserved = Vec::new();
@@ -855,7 +828,7 @@ fn a_desktop_write_preserves_a_preexisting_staging_file_or_link() {
             desktop_exec_path_ok(&bin),
             "the fixture admits the Exec path"
         );
-        let env = ShellEnv::default(); // no desktop-database command can be found
+        let env = ShellEnv::default();
         let (mut out, mut err) = (Vec::new(), Vec::new());
         install_desktop_entry(&p, &env, None, false, &mut out, &mut err);
         let app_dir = p.xdg_data.join("applications");
@@ -900,7 +873,7 @@ fn a_desktop_write_preserves_a_preexisting_staging_file_or_link() {
 }
 
 /// A failure after exclusive creation only cleans this call's stage; the destination
-/// directory and its contents survive. This control is POSTFIX-only, with no old RED claim.
+/// directory and its contents survive.
 #[test]
 fn a_failed_setup_publish_cleans_only_its_own_stage() {
     let dir = aterm_tempfile::tempdir().expect("exclusive scratch");
@@ -927,16 +900,13 @@ const OPEN_UMASK_PROBE: &str =
 /// The child half of [`shell_setup_under_an_open_umask_shares_no_directory`]: an account
 /// as `tools/install.sh` leaves it before shell setup (a private HOME, `~/.local/bin` made
 /// `0755`, no `~/.local/share`), then shell setup's man page, desktop entry and icons under
-/// umask `002`. Every directory it made is closed to group and other
-/// writes, `~/.local/share` (the atpkg prefix's ancestor) `0755`. Outside that child (the
-/// env unset) it does nothing: the umask is the whole process's.
+/// umask `002`.
 #[test]
 fn probe_shell_setup_under_an_open_umask_shares_no_directory() {
     let Some(dir) = std::env::var_os(OPEN_UMASK_ENV) else {
         return;
     };
-    // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail; this
-    // process runs this one test (`--exact`), so no other create sees the mask.
+    // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail; this process.
     unsafe { libc::umask(0o022) };
     let home = PathBuf::from(dir).join("home");
     std::fs::create_dir(&home).expect("mkdir home");
@@ -960,7 +930,6 @@ fn probe_shell_setup_under_an_open_umask_shares_no_directory() {
         String::from_utf8_lossy(&out),
         String::from_utf8_lossy(&err)
     );
-    // Octal text, so a failure reads `775`, not `509`.
     let mode = |rel: &str| {
         let meta = std::fs::symlink_metadata(home.join(rel)).expect("made");
         format!("{:o}", meta.permissions().mode() & 0o7777)
@@ -991,9 +960,7 @@ fn probe_shell_setup_under_an_open_umask_shares_no_directory() {
 /// (`tools/install.sh` runs it before the toolchain lands), and it made its directories
 /// with `create_dir_all`'s `0777 & ~umask`: under umask `002` (a user-private-group
 /// login's default) `~/.local/share` came out `0775`, a group-writable directory above the
-/// atpkg prefix, so `targo trust` refused every Trust toolchain installed below it. The
-/// umask is process-wide, so the setup runs in a child of this test binary that runs only
-/// [`probe_shell_setup_under_an_open_umask_shares_no_directory`].
+/// atpkg prefix, so `targo trust` refused every Trust toolchain installed below it.
 #[test]
 fn shell_setup_under_an_open_umask_shares_no_directory() {
     let scratch = crate::testdir::dir("atpkg-selfsetup-umask-");
@@ -1016,8 +983,7 @@ fn shell_setup_under_an_open_umask_shares_no_directory() {
 /// `help caffeine` first, then `caffeine startup off` and `caffeine quit` — and its files in
 /// the support dir go after a free lock is held (the rendezvous stays, made when no mug ever
 /// made it); what `quit` itself removed or wrote is looked at afresh; a dry run runs no
-/// helper. Refused or unsupported helpers and a busy lock preserve the files, and a bundle
-/// whose step failed is kept for that step.
+/// helper.
 #[test]
 fn an_uninstall_quits_the_caffeine_mug_and_removes_its_files() {
     let a = Account::new("caffeine");
@@ -1026,7 +992,6 @@ fn an_uninstall_quits_the_caffeine_mug_and_removes_its_files() {
     let app = home.join("Applications/aterm.app");
     bundle(&app, None);
     let aterm = app.join("Contents/MacOS/aterm");
-    // Absolute paths: the child inherits this test process's HOME, which is the real one.
     exe(
         &aterm,
         &format!("#!/bin/sh\necho \"$*\" >>'{}'\n", log.display()),
@@ -1090,8 +1055,6 @@ fn an_uninstall_quits_the_caffeine_mug_and_removes_its_files() {
     );
     assert!(!app.exists(), "the bundle went after its aterm was asked");
 
-    // A real `quit` takes the ended mug's copy with it, and an older one may save Off where no
-    // state file was: both are seen after the steps, and no lock yet is made for the cleanup.
     let a = Account::new("caffeine-quit-acts");
     let home = a.home().to_path_buf();
     let support = home.join("Library/Application Support/aterm");
@@ -1121,8 +1084,6 @@ fn an_uninstall_quits_the_caffeine_mug_and_removes_its_files() {
         "the rendezvous made for the cleanup stays: {out}"
     );
 
-    // A direct bare `caffeine serve` can hold only the lock: no copied bundle, plist or saved
-    // Off state. A failed quit must still keep the executable needed to stop that mug.
     for kind in ["quit-fails", "unsupported", "busy", "lock-only-quit-fails"] {
         let a = Account::new(kind);
         let support = a.home().join("Library/Application Support/aterm");
@@ -1173,10 +1134,105 @@ fn an_uninstall_quits_the_caffeine_mug_and_removes_its_files() {
     }
 }
 
+/// A root sweep of an account's own home asks the Caffeine helpers as that account (sudo
+/// keeps the person's HOME, which `aterm caffeine` refuses for root's account).
+#[test]
+fn a_root_sweep_asks_caffeine_as_the_homes_owner() {
+    let me = aterm_uds::peer::our_uid();
+    assert_ne!(me, 0, "the tests run unprivileged");
+    let own = aterm_uds::account::home_of(me).expect("this account's home");
+    let meta = std::fs::metadata(&own).expect("home");
+    assert_eq!(
+        caffeine_account(0, &own),
+        Some((me, meta.gid())),
+        "root, the account's own home"
+    );
+    assert_eq!(caffeine_account(me, &own), None, "not root");
+    let a = Account::new("caffeine-account");
+    assert_eq!(
+        caffeine_account(0, a.home()),
+        None,
+        "the account's directory, not its home"
+    );
+    assert_eq!(caffeine_account(0, Path::new("/")), None, "root's own");
+    assert_eq!(caffeine_account(0, &a.home().join("missing")), None);
+    let aterm = Path::new("/A/aterm.app/Contents/MacOS/aterm");
+    let args = ["caffeine", "quit", "own"];
+    assert_eq!(
+        as_account_argv(501, aterm, &args),
+        [
+            "-n",
+            "-H",
+            "-u",
+            "#501",
+            "--",
+            "/A/aterm.app/Contents/MacOS/aterm"
+        ]
+        .into_iter()
+        .chain(args)
+        .map(OsString::from)
+        .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        helper_line(aterm, &args, Some((501, 20))),
+        "/usr/bin/sudo -n -H -u #501 -- /A/aterm.app/Contents/MacOS/aterm caffeine quit own"
+    );
+    assert_eq!(
+        helper_line(aterm, &args, None),
+        "/A/aterm.app/Contents/MacOS/aterm caffeine quit own"
+    );
+}
+
+/// The cleanup's hold takes only a lock of the account the sweep is for: this process's,
+/// made here where missing, or for a root sweep the account's own, which that account makes
+/// where missing: never this process, as root creating there would hand the account a root
+/// file.
+#[test]
+fn the_caffeine_cleanup_holds_only_the_accounts_lock() {
+    thread_local! {
+        static MADE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    fn refuse(_: &Path, _: u32) -> bool {
+        panic!("only a root sweep's missing lock is made by its account")
+    }
+    fn cannot(_: &Path, _: u32) -> bool {
+        MADE.with(|n| n.set(n.get() + 1));
+        false
+    }
+    fn makes(path: &Path, _: u32) -> bool {
+        MADE.with(|n| n.set(n.get() + 1));
+        std::fs::write(path, b"").is_ok()
+    }
+    /// Made, then gone before the open (another sweep's, or the account's own doing).
+    fn gone(_: &Path, _: u32) -> bool {
+        MADE.with(|n| n.set(n.get() + 1));
+        true
+    }
+    let dir = crate::testdir::dir("atpkg-caffeine-hold-");
+    let lock = dir.join("caffeine.lock");
+    let me = aterm_uds::peer::our_uid();
+    let gid = std::fs::metadata(&dir).expect("dir").gid();
+    assert!(caffeine_cleanup_hold(&lock, Some((me, gid)), cannot).is_none());
+    assert!(caffeine_cleanup_hold(&lock, Some((me, gid)), gone).is_none());
+    assert!(!lock.exists(), "made by nobody but its account");
+    let held = caffeine_cleanup_hold(&lock, Some((me, gid)), makes).expect("its account's");
+    assert_eq!(MADE.with(std::cell::Cell::get), 3);
+    let mode = std::fs::metadata(&lock).expect("lock").mode();
+    assert_eq!(mode & 0o777, 0o600, "private, as a mug makes it");
+    drop(held);
+    assert!(caffeine_cleanup_hold(&lock, Some((me + 1, gid)), refuse).is_none());
+    let second = dir.join("second-name");
+    std::fs::hard_link(&lock, &second).expect("link");
+    assert!(caffeine_cleanup_hold(&lock, Some((me, gid)), refuse).is_none());
+    assert!(caffeine_cleanup_hold(&lock, None, refuse).is_none());
+    std::fs::remove_file(&second).expect("unlink");
+    std::fs::remove_file(&lock).expect("unlink");
+    assert!(caffeine_cleanup_hold(&lock, None, refuse).is_some());
+    assert!(lock.is_file(), "this process's own sweep makes it");
+}
+
 /// Code cleanup keeps every unproven young copy and refuses the whole plan if any metadata,
-/// enumeration or entry is unknown. The shipping collector sees an error after a yielded
-/// entry too: a partial list must not license removal of unseen copies. All fixtures are
-/// ordinary owned files; this calls the cleanup itself, not an uninstall or an executable.
+/// enumeration or entry is unknown.
 #[test]
 fn an_uninstall_keeps_a_caffeine_copy_macos_may_still_be_assessing() {
     use std::cell::Cell;
@@ -1222,8 +1278,6 @@ fn an_uninstall_keeps_a_caffeine_copy_macos_may_still_be_assessing() {
     for ran in ["a/9-0", "l/9-2", "m/9-5"] {
         write(&code.join(ran).join(aterm_uds::deadline::RAN), "");
     }
-    // A just-stamped copy remains young even when its wall-clock age is old. No comparison
-    // between wall-clock minute boundaries or minimum machine uptime is needed.
     let stamped = aterm_uds::process::awake_ms().map(|awake| {
         let copy = code.join("l/9-6");
         write(&copy.join(plist), "<plist/>");
@@ -1242,8 +1296,6 @@ fn an_uninstall_keeps_a_caffeine_copy_macos_may_still_be_assessing() {
             .expect("age the copy");
     }
     let before = tree(&code);
-    // Fail both before reading anything and after an earlier safe-to-remove branch was
-    // inspected. No failure may turn the plan accumulated so far into deletion authority.
     for (bad_meta, bad_list, partial) in [
         (Some(code.clone()), None, false),
         (Some(code.join("l")), None, false),
@@ -1295,8 +1347,6 @@ fn an_uninstall_keeps_a_caffeine_copy_macos_may_still_be_assessing() {
         );
     }
 
-    // A missing entry is known absence. Everything else is inspected normally: proven,
-    // partial and old copies go, while every young copy and its ancestors stay.
     let entries = |path: &Path| {
         let mut entries = caffeine_code_entries(path)?;
         if path == code {
@@ -1326,8 +1376,6 @@ fn an_uninstall_keeps_a_caffeine_copy_macos_may_still_be_assessing() {
     for gone in ["a", "l/9-2", "l/9-3.partial", "l/9-4", "m", "stray"] {
         assert!(!present(&code.join(gone)), "{gone}: {out}");
     }
-    // Once the remaining images have proof, the full root is removable. The production
-    // entry is used here; an absent root on the following call is a no-op, not a skip.
     write(&code.join("l/9-1").join(aterm_uds::deadline::RAN), "");
     for expected_removed in [1, 0] {
         let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -1349,8 +1397,7 @@ fn an_uninstall_keeps_a_caffeine_copy_macos_may_still_be_assessing() {
 
 /// A file gone between the sweep's look and its removal (a Caffeine bridge removes its own
 /// once `caffeine quit` has saved off) is neither removed nor SKIPPED: the uninstall still
-/// succeeds. One that cannot be removed is SKIPPED, as before. NEGATIVE CONTROL: before, the
-/// gone file was SKIPPED "cannot remove, try sudo" and the uninstall reported failure.
+/// succeeds.
 #[test]
 fn a_file_gone_before_its_removal_is_not_skipped() {
     let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -1368,7 +1415,6 @@ fn a_file_gone_before_its_removal_is_not_skipped() {
     };
     s.rm(&gone, "Caffeine file");
     assert_eq!((s.removed, s.skipped), (0, 0));
-    // A directory entry inside a file is no path at all: that one stays SKIPPED.
     let blocked = dir.path().join("a-file");
     write(&blocked, "");
     s.rm(&blocked.join("inside"), "Caffeine file");
@@ -1380,8 +1426,7 @@ fn a_file_gone_before_its_removal_is_not_skipped() {
 
 /// A mug started from the store's `aterm` (the source lane: a bare build runs where it is) is
 /// stopped through that `aterm` before step 3 removes it, as a bundle's is; a store `aterm`
-/// whose step failed stays, with the mug's files. NEGATIVE CONTROL: with only the bundles
-/// asked, nothing asked the store's `aterm`, and it went with its mug still running.
+/// whose step failed stays, with the mug's files.
 #[test]
 fn an_uninstall_quits_a_mug_the_stores_aterm_runs() {
     for fails in [false, true] {
@@ -1428,9 +1473,7 @@ fn an_uninstall_quits_a_mug_the_stores_aterm_runs() {
 
 /// With another aterm staying, a scoped uninstall asks its build to quit only its own mug
 /// (`caffeine quit own`) once its startup is off, and leaves the shared files to the aterm
-/// that stays. A build from before `own` answers a usage error (exit 2), which is not a
-/// failure: its bundle goes, and a mug it runs keeps running, as before. NEGATIVE CONTROL: a
-/// scoped run asked only `caffeine startup off`.
+/// that stays.
 #[test]
 fn a_scoped_uninstall_quits_only_its_own_mug() {
     for old in [false, true] {

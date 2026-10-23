@@ -1,45 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Which build a run measures: the lane's `--profile dev|opt`, and how the
-//! bench names the build it is running from.
-//!
-//! TWO ARMS, ONE CODE PATH. Both enable debug assertions, so
-//! every `#[cfg(any(test, debug_assertions))]` seam the harness calls compiles
-//! (AGENTS.md) and the headless `aterm` reads the `ATERM_FABRIC_COMMAND`
-//! development seam that points it at the bridge. They differ only in code
-//! generation:
-//!
-//! - **dev** explicitly selects the `test` profile, which inherits `dev`: opt-level
-//!   0 except the root `Cargo.toml`'s per-crate speed rows, from two tables —
-//!   `[profile.dev.package.<name>]`, which `test` inherits (aterm-core,
-//!   aterm-grid, aterm-render … at 2, aterm-spec at 1), and
-//!   `[profile.test.package.<name>]`, the test profile's own (aterm-effects at
-//!   opt-level 1) — with overflow checks on. Every ledger entry before the opt
-//!   arm is this arm, so it stays the default; which crates the rows reach is
-//!   the lane's to read off cargo's plan, not this table's to list.
-//! - **opt** is the root `Cargo.toml`'s `[profile.opt-test]`: it inherits
-//!   `release`, NOT `dev`, so no dev speed row reaches it — a custom profile
-//!   that inherited `dev` would keep those rows, and a named row outranks the
-//!   profile's own `package."*"`, so aterm-spec would stay at opt-level 1 under
-//!   an "optimized" label. Opt-level 3 on every crate, no LTO, 16 codegen
-//!   units, debug assertions on (the seams), overflow checks off (release's:
-//!   the arm stands in for the shipped build, which has none). The lane checks
-//!   the build it measures against that claim, crate by crate, before it
-//!   measures (`aterm-verify`'s `perf/fabric.rs`).
-//!
-//! WHERE EACH ARM'S BINARY IS. cargo writes a profile's binaries to
-//! `<target dir>/<profile dir>/` — `debug` for `dev` and `test`, the profile's
-//! own name for a custom one, wherever its intermediates go (atpkg's shim puts
-//! those in its own build directory) — and hands a test or bench target that path in
-//! `CARGO_BIN_EXE_<name>`. The harness launches its `aterm` (the window and,
-//! through the seam, the bridge) by that path, which other builds write too,
-//! so the bench reports the path, the arm it names ([`Profile::of_binary`]) and
-//! the file's [`identity`] at its start and at its end; the lane holds all of
-//! it to the binary its own build reported, read right after that build.
-//!
-//! Std-only: the lane mounts this file the way it mounts `spec.rs`, so the two
-//! sides read one table.
+//! Benchmark build profile selection (`dev` or `opt`) and binary identity checks.
 
 use std::path::Path;
 
@@ -78,8 +40,7 @@ impl Profile {
             .ok_or_else(|| format!("`--profile` is `dev` or `opt`, not `{raw}`"))
     }
 
-    /// The explicit cargo profile: `test` keeps the dev measurement unchanged
-    /// when the entry is built as a bench, whose default profile is release.
+    /// Explicit cargo profile name for this arm.
     #[must_use]
     pub fn cargo_profile(self) -> &'static str {
         match self {
@@ -114,9 +75,7 @@ impl Profile {
         }
     }
 
-    /// The opt-level the arm promises every crate on the measured path, which
-    /// the lane holds its build to; `None` for dev, whose mix of speed rows is
-    /// what dev means (and is reported, not held).
+    /// Required opt-level across all crates on the measured path, or `None` for dev.
     #[must_use]
     pub fn every_crate_at(self) -> Option<&'static str> {
         match self {
@@ -125,11 +84,7 @@ impl Profile {
         }
     }
 
-    /// The arm whose build directory holds the binary at `exe`: its parent
-    /// directory's name, which is the profile's (`<target>/<profile dir>/<bin>`,
-    /// or `<target>/<triple>/<profile dir>/<bin>` for a cross build). `None` for
-    /// a binary no arm builds — `target/release/aterm`, an installed one.
-    /// Pure (unit-tested).
+    /// Returns the arm whose build directory holds `exe`, if any.
     #[must_use]
     pub fn of_binary(exe: &Path) -> Option<Profile> {
         let dir = exe.parent()?.file_name()?.to_str()?;
@@ -137,11 +92,7 @@ impl Profile {
     }
 }
 
-/// The built file's length and nanosecond modification time. Profile binary
-/// paths are shared with other builds, so the lane compares this immediately
-/// after building with the bench's readings at its start and end. A changed
-/// reading refuses the report. Inodes are excluded: atpkg's cache copies a
-/// fresh target by clone on macOS, preserving modification time with a new inode.
+/// Returns the built file's length and nanosecond modification time.
 ///
 /// # Errors
 ///
@@ -196,12 +147,10 @@ mod tests {
             Profile::of_binary(Path::new("/w/target/opt-test/aterm")),
             Some(Profile::Opt)
         );
-        // A cross build nests the profile dir under the triple.
         assert_eq!(
             Profile::of_binary(Path::new("/w/target/aarch64-apple-darwin/opt-test/aterm")),
             Some(Profile::Opt)
         );
-        // No arm builds these.
         for other in [
             "/w/target/release/aterm",
             "/w/target/profiling/aterm",
@@ -211,8 +160,6 @@ mod tests {
         ] {
             assert_eq!(Profile::of_binary(Path::new(other)), None, "{other}");
         }
-        // The arm's dir is the binary's PARENT, not any ancestor: a checkout
-        // that happens to live under a `debug` directory is not the dev arm.
         assert_eq!(
             Profile::of_binary(Path::new("/debug/w/target/opt-test/aterm")),
             Some(Profile::Opt)
@@ -229,14 +176,9 @@ mod tests {
 
         for p in Profile::ALL {
             match p.cargo_profile() {
-                // A custom profile's binaries land in a directory of its own
-                // name.
                 custom if custom != "test" => assert_eq!(p.dir(), custom, "{p:?}"),
-                // `targo test`'s own profile, `test`, writes to `debug`.
                 _ => assert_eq!(p.dir(), "debug", "{p:?}"),
             }
-            // What the ledger says of an arm is the level the lane holds its
-            // build to.
             if let Some(level) = p.every_crate_at() {
                 let promise = format!("opt-level {level} on every crate");
                 assert!(p.describe().contains(&promise), "{p:?}: {}", p.describe());
@@ -255,7 +197,6 @@ mod tests {
         let first = identity(&exe).expect("reads");
         assert_eq!(identity(&exe), Ok(first.clone()), "one file reads the same");
         assert!(first.starts_with("9 bytes, modified "), "{first}");
-        // Another build written to the same path.
         std::fs::write(&exe, b"another build").expect("write");
         assert_ne!(identity(&exe).expect("reads"), first);
         std::fs::remove_dir_all(&dir).expect("cleanup");

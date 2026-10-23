@@ -1,32 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! One desktop setting read from the Settings portal
-//! (`org.freedesktop.portal.Settings` on `org.freedesktop.portal.Desktop`,
-//! xdg-desktop-portal) over aterm-dbus, the whole read within a bound: the
-//! a11y ruling's optional step 7 (docs/AUDIT-third-party-2026-10-15.md, unit
-//! a11y), which replaced the `gsettings get` child the motion read spawned.
-//!
-//! The portal asks its backends (GTK's and GNOME's serve every
-//! `org.gnome.desktop.*` GSettings schema) and answers with the value as
-//! GSettings holds it. `ReadOne` is the interface's version 2; a portal that
-//! predates it answers `UnknownMethod`, and `Read`, which wraps the value in
-//! one more variant, is asked instead.
-//!
-//! ONLY A RUNNING PORTAL IS ASKED (`NO_AUTO_START`). Its reads run on a
-//! window's main thread, the appearance read before session 0 and the event
-//! loop, the motion read at the first window's attach, and on Wayland the
-//! header's `button-layout` read (`client_frame::ButtonLayout::desktop`,
-//! once a process) at the first client-decorated window's first `Resized`,
-//! each within its own 200 ms bound. A call that starts
-//! the portal waits for its start, and xdg-desktop-portal installed with no
-//! backend for the desktop never finishes starting: each read waited out its
-//! 200 ms bound, about 400 ms before a Linux window's first frame (the lane's
-//! Ubuntu guest, 2026-10-20, docs/measured/linux-launch-order-2026-10-20.md).
-//! The bus answers a call that may not start its destination at once, with an
-//! error when nothing owns the name. The appearance watcher's `gdbus` read
-//! (`os_appearance`), off the main thread, still starts a portal that can
-//! start, and posts what it reads.
+//! Desktop setting reader via `org.freedesktop.portal.Settings` over `aterm-dbus`.
 
 use std::time::{Duration, Instant};
 
@@ -41,21 +16,15 @@ const SETTINGS: &str = "org.freedesktop.portal.Settings";
 /// The bus's answer to a member an object does not have.
 const UNKNOWN_METHOD: &str = "org.freedesktop.DBus.Error.UnknownMethod";
 
-/// GNOME's interface schema and its animations key, which GTK desktops share:
-/// `false` is the person's reduced motion.
+/// GNOME's interface schema and its animations key, which GTK desktops share.
 pub(crate) const GNOME_INTERFACE: &str = "org.gnome.desktop.interface";
 pub(crate) const ENABLE_ANIMATIONS: &str = "enable-animations";
 
-/// GNOME's window-manager schema and its key for where a window's header
-/// puts its buttons (`appmenu:close`), which sctk-adwaita read before LW.5
-/// ([`crate::client_frame::ButtonLayout`]).
+/// Read GNOME's header button layout (`button-layout`, [`crate::client_frame::ButtonLayout`]).
 pub(crate) const GNOME_WM_PREFERENCES: &str = "org.gnome.desktop.wm.preferences";
 pub(crate) const BUTTON_LAYOUT: &str = "button-layout";
 
-/// `namespace`'s `key` as the portal on the session bus answers it, the
-/// handshake and the call within `bound`: `None` for no session bus, no
-/// running portal (it is never started), a key it does not have, any other
-/// error, or the bound passed.
+/// `namespace`'s `key` as the portal on the session bus answers it.
 pub(crate) fn read(namespace: &str, key: &str, bound: Duration) -> Option<Value> {
     let addresses = aterm_dbus::address::session_bus().ok()?;
     read_at(&addresses, namespace, key, bound)
@@ -73,8 +42,7 @@ pub(crate) fn read_at(
     read_on(&mut conn, namespace, key, deadline).ok()
 }
 
-/// One read on `conn` by `deadline`: `ReadOne`, else `Read`, the answer's
-/// variants unwrapped, each asked of a running portal only (`NO_AUTO_START`).
+/// One read on `conn` by `deadline`.
 fn read_on(
     conn: &mut Connection,
     namespace: &str,
@@ -102,9 +70,7 @@ fn read_on(
     Ok(value)
 }
 
-/// Whether GNOME's `enable-animations`, as the portal answered it, is the
-/// person's reduced motion: only a boolean `false` is. No answer, or one of
-/// another type, is no preference, and config `motion` alone decides.
+/// Whether GNOME's `enable-animations`, as the portal answered it, is the person's reduced motion.
 pub(crate) fn animations_disabled(answer: Option<&Value>) -> bool {
     matches!(answer, Some(Value::Bool(false)))
 }
@@ -147,8 +113,7 @@ mod tests {
     }
 
     /// The daemon and its address; the services it can start are the
-    /// `.service` files in `<scratch>/services`, read at its start. A Linux
-    /// host with no `dbus-daemon` on PATH ends the test COULD NOT RUN.
+    /// `.service` files in `<scratch>/services`, read at its start.
     fn private_bus(scratch: &std::path::Path) -> (Daemon, Vec<aterm_dbus::address::Address>) {
         let Some(daemon) = std::env::var_os("PATH").and_then(|path| {
             std::env::split_paths(&path)
@@ -212,10 +177,6 @@ mod tests {
         how: Portal,
     ) -> std::thread::JoinHandle<Vec<String>> {
         let mut server = Connection::open(addresses).unwrap();
-        // The last case's stand-in let go of the name when its connection
-        // closed, which the daemon handles when it will: the name is asked
-        // for without queueing (DO_NOT_QUEUE, 4) until this one owns it
-        // (1, not 3 EXISTS), a hang detector.
         let asked = Instant::now();
         loop {
             let owned = server
@@ -315,8 +276,6 @@ mod tests {
             (false, vec!["ReadOne".into(), "Read".into()])
         );
         assert_eq!(reduced(Portal::NotFound), (false, vec!["ReadOne".into()]));
-        // No portal on the bus: the bus answers ServiceUnknown, never a
-        // preference.
         assert_eq!(
             read_at(&addresses, GNOME_INTERFACE, ENABLE_ANIMATIONS, HANG),
             None
@@ -325,14 +284,7 @@ mod tests {
 
     /// A PORTAL THE BUS COULD START BUT NOBODY RUNS IS NEVER STARTED BY THE
     /// READ: xdg-desktop-portal installed with no backend for the desktop, or
-    /// not started yet. The read asks with `NO_AUTO_START`, so the bus answers
-    /// at once that nothing owns the name. Before, it started the portal, and
-    /// a window's main thread waited out the read's bound for an answer that a
-    /// portal that cannot start never gives (200 ms at each of a Linux
-    /// window's two launch reads in the lane's guest, 2026-10-20).
-    ///
-    /// NEGATIVE CONTROL: asked without `NO_AUTO_START`, the bus starts the
-    /// service, whose start leaves its marker.
+    /// not started yet.
     #[test]
     fn a_portal_that_is_not_running_is_never_started_by_the_read() {
         let scratch = aterm_tempfile::tempdir().unwrap();
@@ -352,9 +304,6 @@ mod tests {
             read_at(&addresses, GNOME_INTERFACE, ENABLE_ANIMATIONS, HANG),
             None
         );
-        // The bus decides whether to start a destination before it answers
-        // the call, and a started service's marker is written before the
-        // bus could answer that it exited without the name.
         assert!(
             !started.exists(),
             "the read started the portal's service on the bus"
@@ -381,7 +330,6 @@ mod tests {
         );
         let waited = asked.elapsed();
         assert_eq!(answer, None);
-        // The two bounds compared, not the machine's speed.
         assert!(
             waited < aterm_dbus::conn::HANDSHAKE_TIMEOUT,
             "the read gave up after {waited:?}, the handshake default's, not the 100 ms it was \
@@ -391,9 +339,7 @@ mod tests {
 
     /// The desktop's own portal: GNOME's `enable-animations` set with
     /// `gsettings` and read back through `org.freedesktop.portal.Desktop` on
-    /// the session bus, both ways, then put back. The Linux lane provisions
-    /// xdg-desktop-portal with its GTK backend and dconf, and runs it by name
-    /// (`--ignored`).
+    /// the session bus, both ways, then put back.
     #[test]
     #[ignore = "needs a session bus with xdg-desktop-portal and dconf: the Linux lane runs it"]
     fn the_desktop_s_portal_follows_enable_animations() {
@@ -409,8 +355,6 @@ mod tests {
         let was = gsettings(&["get", GNOME_INTERFACE, ENABLE_ANIMATIONS]);
         for on in ["false", "true", "false"] {
             gsettings(&["set", GNOME_INTERFACE, ENABLE_ANIMATIONS, on]);
-            // The portal's backend hears the change from dconf when it will:
-            // a hang detector, then the reading.
             let started = Instant::now();
             let answer = loop {
                 let answer = read(GNOME_INTERFACE, ENABLE_ANIMATIONS, HANG);
@@ -426,9 +370,6 @@ mod tests {
                 "{answer:?}"
             );
         }
-        // How long a read of the warm portal takes, the session bus's
-        // handshake included, beside the motion read's 200 ms bound
-        // (platform.rs): printed for the lane's record, never judged.
         let took: Vec<Duration> = (0..5)
             .map(|_| {
                 let asked = Instant::now();
@@ -443,8 +384,7 @@ mod tests {
     /// The desktop's own portal answers the header's button layout
     /// (`client_frame::ButtonLayout::desktop`'s read): GNOME's
     /// `button-layout` set with `gsettings` reads back as the portal's string,
-    /// which lays the buttons out where it says, then put back. Run by name
-    /// in the Linux lane, beside the motion read (`--ignored`).
+    /// which lays the buttons out where it says, then put back.
     #[test]
     #[ignore = "needs a session bus with xdg-desktop-portal and dconf: the Linux lane runs it"]
     fn the_desktop_s_portal_answers_the_button_layout() {
@@ -468,7 +408,6 @@ mod tests {
             ("appmenu:close", &[][..], &[LayoutButton::Close][..]),
         ] {
             gsettings(&["set", GNOME_WM_PREFERENCES, BUTTON_LAYOUT, value]);
-            // The backend hears dconf when it will: a hang detector.
             let started = Instant::now();
             let answer = loop {
                 let answer = read(GNOME_WM_PREFERENCES, BUTTON_LAYOUT, HANG);
@@ -491,8 +430,7 @@ mod tests {
     /// (`os_appearance`'s Linux `read_running_portal`, this module's `read` of
     /// `org.freedesktop.appearance color-scheme`): GNOME's `color-scheme` set
     /// with `gsettings` reads back as the portal's `uint32`, `1` for
-    /// `prefer-dark` and `0` for `default`, then put back. Run by name in the
-    /// Linux lane, beside the motion read (`--ignored`).
+    /// `prefer-dark` and `0` for `default`, then put back.
     #[test]
     #[ignore = "needs a session bus with xdg-desktop-portal and dconf: the Linux lane runs it"]
     fn the_desktop_s_portal_answers_the_color_scheme() {
@@ -508,7 +446,6 @@ mod tests {
         let was = gsettings(&["get", GNOME_INTERFACE, "color-scheme"]);
         for (scheme, value) in [("prefer-dark", 1), ("default", 0), ("prefer-dark", 1)] {
             gsettings(&["set", GNOME_INTERFACE, "color-scheme", scheme]);
-            // The backend hears dconf when it will: a hang detector.
             let started = Instant::now();
             let answer = loop {
                 let answer = read("org.freedesktop.appearance", "color-scheme", HANG);

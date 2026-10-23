@@ -292,6 +292,25 @@ fn a_supervised_prompt_gives_no_border_and_no_pill() {
     assert!(d.view(1).pill.is_some());
 }
 
+#[test]
+fn a_need_without_a_pill_does_not_hide_another_tabs_prompt() {
+    let mut d = desk(vec![vec![1], vec![2]]);
+    let mut reported = decide(1).expect("a need");
+    reported.show_pill = false;
+    d.publish(1, Some(reported));
+    assert_eq!(d.view(1).rim, Rim::Decide);
+    assert!(d.view(1).pill.is_none());
+    d.publish(2, decide(2));
+    assert_eq!(d.view(1).pressing, Some(1));
+    assert_eq!(d.view(1).pill.as_ref().map(|pill| pill.session), Some(2));
+    assert_eq!(d.view(1).pill.as_ref().map(|pill| pill.more), Some(1));
+    assert_eq!(d.next_need_after(1, 2), Some(1));
+    d.wins.get_mut(&1).unwrap().front_tab = 1;
+    assert_eq!(d.next_need_after(1, 2), Some(1));
+    d.publish(2, None);
+    assert!(d.view(1).pill.is_none());
+}
+
 /// THE MOST PRESSING SESSION across a window's tabs and panes: stuck before
 /// decide wherever they are; within a severity the front session wins the
 /// tie, then the oldest need; `more` counts the rest.

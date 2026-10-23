@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Metal present arm, twin of the wgpu present path's seams:
-//!
-//! 1. [`MetalWindowSurface`]: one [`Swapchain`] plus the config it was last
-//!    configured to; [`MetalWindowSurface::reconcile`] maps alpha-mode, usage,
-//!    HDR and size drift onto `Swapchain::reconfigure`, and the acquire is
-//!    drift-checked.
-//! 2. [`AcquireRefusal`] and [`surface_present_failure`]: the
-//!    `SurfacePresentFailure` mapping.
-//! 3. [`encode_present_sequence`]: Submit B as one command buffer, with the
-//!    tap copy appended before commit.
-//!
-//! Attached GUI surfaces use a demand-driven drawable worker; standalone tests
-//! acquire synchronously.
+//! Metal window surface, drawable acquisition/reconcile, and Submit B present sequence encoding.
 
 use std::sync::Arc;
 
@@ -29,8 +17,7 @@ use super::swapchain::{
 };
 use crate::renderer::SurfacePresentFailure;
 
-/// The Metal `GpuSurface` shape: one swapchain plus the config it holds, so the
-/// reconcile detects drift without re-reading the layer.
+/// Metal window swapchain paired with its last applied [`SwapchainConfig`].
 pub(crate) struct MetalWindowSurface {
     swapchain: SurfaceSwapchain,
     config: SwapchainConfig,
@@ -42,7 +29,6 @@ pub(crate) struct MetalWindowSurface {
     completed_queue_ns: Option<u64>,
 }
 
-// The holder permits retirement without changing the borrow-shaped Frame API.
 struct SurfaceSwapchain(Option<Swapchain>);
 impl std::ops::Deref for SurfaceSwapchain {
     type Target = Swapchain;
@@ -57,8 +43,7 @@ impl std::ops::DerefMut for SurfaceSwapchain {
 }
 
 /// Routes the final unparent and release to the UI thread after acquisition
-/// has stopped. Only the worker waits for that dispatch. The outer pool covers
-/// `Obj`'s driver-side dealloc work.
+/// has stopped.
 struct RetiredSwapchain(Option<Swapchain>);
 impl Drop for RetiredSwapchain {
     fn drop(&mut self) {
@@ -76,15 +61,13 @@ impl Drop for MetalWindowSurface {
             let mt = aterm_objc::MainThread::new().expect("attached surface retires on main");
             let retirement =
                 aterm_objc::MainThreadBound::new(RetiredSwapchain(self.swapchain.0.take()), mt);
-            // Disconnected means acquisition already ended; the returned
-            // payload can be dropped here. No blocking send or worker join.
             drop(worker.close(retirement));
         }
     }
 }
 
 impl MetalWindowSurface {
-    /// Attach under a parent `CALayer` (the winit view's layer).
+    /// Create a surface attached under a parent `CALayer` with a background acquire worker.
     pub(crate) fn attached(
         device: &ffi::Device,
         parent: &Obj,
@@ -103,8 +86,7 @@ impl MetalWindowSurface {
         })
     }
 
-    /// Headless twin — the shape every test drives (a `CAMetalLayer` vends
-    /// drawables without a window).
+    /// Create a headless surface without a parent layer or worker.
     #[cfg(test)]
     pub(crate) fn standalone(
         device: &ffi::Device,
@@ -144,12 +126,7 @@ impl MetalWindowSurface {
         self.worker.is_some()
     }
 
-    /// Request the next frame's drawable now, so the next redraw finds it
-    /// ready instead of composing, requesting and composing again. Called after
-    /// a successful present, not at the top of a redraw: a redraw that returns
-    /// early would hand back an unpresented drawable, which is not immediately
-    /// re-vendable and stalls later acquires for about a display period.
-    /// Idempotent and non-blocking.
+    /// Request the next frame's drawable asynchronously on the worker thread.
     pub(crate) fn prefetch_drawable(&mut self) {
         if self.ready.is_some() {
             return;
@@ -163,8 +140,7 @@ impl MetalWindowSurface {
         let _ = worker.try_request(self.generation, self.swapchain.acquire_request());
     }
 
-    /// Invalidating never touches the layer or waits for the worker. In-flight
-    /// results retain their old epoch, including resize-away-and-back cases.
+    /// Advance the acquire epoch to invalidate any in-flight worker result.
     pub(crate) fn discard_pending_acquire(&mut self) {
         self.generation = self
             .generation
@@ -179,10 +155,7 @@ impl MetalWindowSurface {
         self.completed_wait_ns.take()
     }
 
-    /// The latest completed acquisition's queue span (admission to worker
-    /// dequeue), published separately from
-    /// [`Self::take_completed_acquire_wait_ns`] because the two legs have
-    /// different causes (scheduling vs CoreAnimation).
+    /// Take the latest completed drawable acquisition's queue wait duration in nanoseconds.
     #[inline]
     pub(crate) const fn take_completed_acquire_queue_ns(&mut self) -> Option<u64> {
         self.completed_queue_ns.take()
@@ -195,8 +168,6 @@ impl MetalWindowSurface {
         match completed.outcome {
             AcquireOutcome::Ready(output) => {
                 self.completed_wait_ns = Some(output.wait_ns);
-                // Paired with the wait, so both legs of one acquisition are
-                // read together. Terminal outcomes book neither.
                 self.completed_queue_ns = Some(completed.queue_ns);
                 if result_is_current(completed.generation, self.generation, false) {
                     self.ready = Some(output.drawable.ok_or(AcquireRefusal::AcquireNil));
@@ -208,31 +179,20 @@ impl MetalWindowSurface {
         }
     }
 
-    /// The config the swapchain currently holds.
+    /// Current swapchain configuration.
     #[cfg(not(wgpu_arm))]
     #[inline]
     pub(crate) const fn config(&self) -> &SwapchainConfig {
         &self.config
     }
 
-    /// The live `contentsScale` read off the `CAMetalLayer`; must equal the
-    /// parent view's backing scale or the drawable composites as points.
+    /// Live `contentsScale` of the underlying `CAMetalLayer`.
     #[cfg(test)]
     pub(crate) fn contents_scale(&self) -> f64 {
         self.swapchain.contents_scale()
     }
 
-    /// Per-present reconcile, Metal twin of the wgpu drift check in
-    /// `present_input_with_crop`: reconfigure only when the wanted config
-    /// differs from the retained one. Axis mapping:
-    ///
-    /// * wgpu `alpha_mode` Opaque/PostMultiplied -> `opaque`;
-    /// * wgpu `usage` `COPY_SRC` -> `framebuffer_only` (the tap needs a
-    ///   non-framebufferOnly drawable);
-    /// * wgpu format `Bgra8`/`Rgba16Float` -> `format`;
-    /// * `resize_surface` -> `width`/`height`.
-    ///
-    /// Returns whether a reconfigure happened.
+    /// Reconfigure the swapchain when `want` drifts from the retained config and sync `contentsScale`.
     pub(crate) fn reconcile(
         &mut self,
         device: &ffi::Device,
@@ -243,14 +203,9 @@ impl MetalWindowSurface {
             self.discard_pending_acquire();
         }
         self.collect_acquire();
-        // nextDrawable and geometry/configuration setters never overlap. The
-        // UI records its latest desires and returns immediately while pending.
         if self.worker.as_ref().is_some_and(AcquireWorker::is_pending) {
             return Ok(false);
         }
-        // `contentsScale` is not a config axis: the parent layer owns it and it
-        // changes with no resize when a window moves between displays. Poll it
-        // here, before the no-drift early-out. Change-gated.
         self.swapchain.sync_layer_geometry();
         let drift = self.config != *want;
         if !drift {
@@ -261,18 +216,11 @@ impl MetalWindowSurface {
         Ok(true)
     }
 
-    /// Acquire the next drawable with typed refusals: the loss latch and the
-    /// bounded nil acquire each have an arm, and a drawable whose texture no
-    /// longer matches the retained config is [`AcquireRefusal::Drift`] (the
-    /// caller reconfigures and skips the frame, like wgpu's Outdated).
+    /// Acquire the next drawable, returning a typed [`AcquireRefusal`] on pending, loss, drift, or nil.
     pub(crate) fn acquire(&mut self) -> Result<Frame<'_>, AcquireRefusal> {
         if self.swapchain.latch().reason().is_some() {
             return Err(AcquireRefusal::LatchLost);
         }
-        // One acquire, geometry-checked on the vended frame. A probe-then-acquire
-        // shape stalls: a just-dropped drawable is not immediately re-vendable,
-        // so the second `nextDrawable` waits about a display period. The wanted
-        // geometry is copied first so the error arm borrows nothing.
         let (want_w, want_h) = (self.config.width, self.config.height);
         let frame = if let Some(worker) = self.worker.as_mut() {
             if let Some(ready) = self.ready.take() {
@@ -315,41 +263,27 @@ fn terminal_worker_refusal(latch: &LossLatch) -> AcquireRefusal {
     AcquireRefusal::LatchLost
 }
 
-/// The window view's backing `CALayer` from the target's content view: the
-/// parent [`MetalWindowSurface::attached`] attaches under. `None` for a target
-/// with no view (nil off the main thread) or a layerless view. Main thread only.
+/// Return the backing `CALayer` of `target`'s `NSView`.
 pub(crate) fn parent_layer_of<W: aterm_objc::HasNsView>(target: &W) -> Option<Obj> {
     let view: ffi::Id = target.ns_view();
     if view.is_null() {
         return None;
     }
-    // SAFETY: `view` is a live NSView while `target` is borrowed (`HasNsView`);
-    // `layer` is a +0 property read retained to +1 by `Obj::retain`.
+    // SAFETY: `view` is a live `NSView` borrowed via `HasNsView` on the main thread.
     unsafe {
         let f: unsafe extern "C-unwind" fn(ffi::Id, ffi::Sel) -> ffi::Id = ffi::checked_msg();
         Obj::retain(f(view, ffi::sel(c"layer")))
     }
 }
 
-/// The EDR potential of the target window's screen
-/// (`NSScreen.maximumPotentialExtendedDynamicRangeColorComponentValue`, 1.0 on
-/// an SDR-only screen). `None` for a target with no view, a view with no
-/// window, or a window on no screen; the attach's f16 gate
-/// (`format_plan::hdr_swapchain_wants_f16_on_screen`) then keeps its pick and
-/// `GpuRenderer::upgrade_surface_for_screen` upgrades nothing. Read afresh on
-/// each call; a window not yet ordered front already reports its screen. Main
-/// thread only.
+/// Query `maximumPotentialExtendedDynamicRangeColorComponentValue` for `target`'s window screen.
 #[cfg(not(wgpu_arm))]
 pub(crate) fn screen_edr_potential_of<W: aterm_objc::HasNsView>(target: &W) -> Option<f32> {
     let view: ffi::Id = target.ns_view();
     if view.is_null() {
         return None;
     }
-    // SAFETY: `view` is live while `target` is borrowed (`HasNsView`). Callers
-    // run on the main thread. `-window` and `-screen` are +0 reads,
-    // nil-checked. The potential getter exists on macOS 10.15+ (the app
-    // requires 11.0) and returns a `CGFloat` in the FP register plain
-    // `objc_msgSend` returns. Nothing is retained.
+    // SAFETY: `view` is a live `NSView` borrowed via `HasNsView` on the main thread.
     unsafe {
         let obj: unsafe extern "C-unwind" fn(ffi::Id, ffi::Sel) -> ffi::Id = ffi::checked_msg();
         let window = obj(view, ffi::sel(c"window"));
@@ -374,8 +308,7 @@ pub(crate) fn screen_edr_potential_of<W: aterm_objc::HasNsView>(target: &W) -> O
     }
 }
 
-/// Why a Metal acquire vended nothing — the typed pre-image of
-/// [`SurfacePresentFailure`].
+/// Reason a Metal drawable acquisition returned no frame.
 #[derive(Debug)]
 pub(crate) enum AcquireRefusal {
     /// A demand-driven acquisition is queued or running off the UI thread.
@@ -389,19 +322,7 @@ pub(crate) enum AcquireRefusal {
     AcquireNil,
 }
 
-/// The `SurfacePresentFailure` mapping:
-///
-/// | failure | Metal signal |
-/// |---|---|
-/// | `AcquirePending` | the drawable worker has not vended yet |
-/// | `Validation` | the process [`LossLatch`] is set; acquire and present refuse before FFI |
-/// | `Reconfigured` | drawable texture extent differs from the retained config |
-/// | `Occluded` | nil acquire with the frontend's occlusion hint set (`NSWindow.occlusionState`; the layer has no such signal, and wgpu-hal reads the same window bit) |
-/// | `Timeout` | `nextDrawable` nil after the bounded wait (`allowsNextDrawableTimeout=YES`) with the hint clear |
-///
-/// The occlusion hint is a parameter because the frontend owns the window
-/// (winit's `WindowEvent::Occluded`). `Occluded` parks until a stimulus;
-/// `Timeout` retries on a bound.
+/// Map an [`AcquireRefusal`] to a [`SurfacePresentFailure`].
 #[inline]
 pub(crate) const fn surface_present_failure(
     refusal: &AcquireRefusal,
@@ -416,8 +337,7 @@ pub(crate) const fn surface_present_failure(
     }
 }
 
-/// One fullscreen post pass over the present copy (bloom composite, shimmer)
-/// or the drawable (blit): the row's PSO and its `BindSpec::POST_FS` bindings.
+/// Fullscreen post-processing pass bindings.
 pub(crate) struct PostPass<'a> {
     pub(crate) pso: &'a Obj,
     /// Fragment texture at the row's `fragment_textures[0]` slot.
@@ -431,7 +351,7 @@ pub(crate) struct PostPass<'a> {
     pub(crate) uniform_slot: usize,
 }
 
-/// The bloom pair: extract pass and composite pass.
+/// Half-resolution bloom extract and fullscreen composite passes.
 pub(crate) struct BloomPasses<'a> {
     /// Half-res target, cleared transparent, drawn with row 4 `GlowAdd`.
     pub(crate) half_target: &'a SealedTexture,
@@ -451,7 +371,7 @@ pub(crate) struct BloomPasses<'a> {
     pub(crate) composite_scissor: Option<[u32; 4]>,
 }
 
-/// The shimmer pass: stage copy plus scissored refract (row 13).
+/// Stage copy and scissored refraction pass for shimmer.
 pub(crate) struct ShimmerPass<'a> {
     /// Frame-sized scratch the pass samples (stage-copied below).
     pub(crate) scratch: &'a SealedTexture,
@@ -463,10 +383,7 @@ pub(crate) struct ShimmerPass<'a> {
     pub(crate) region: [u32; 4],
 }
 
-/// The sub-row band shift: two staged whole-width copies over the present
-/// copy, between the shimmer and the tray, using the same `BandShift` plan as
-/// the wgpu arm (`shift_present_copy_band`). It never touches the offscreen,
-/// which stays the untranslated scissor base during a glide.
+/// Staged sub-row scroll translation pass over the present copy.
 pub(crate) struct BandShiftPass<'a> {
     pub(crate) shift: crate::renderer::BandShift,
     /// Frame-sized resident scratch (`WindowGpu::metal_shift_scratch`); an
@@ -474,11 +391,7 @@ pub(crate) struct BandShiftPass<'a> {
     pub(crate) scratch: &'a SealedTexture,
 }
 
-/// The incoming-row apron: one whole-width copy over the present copy after the
-/// band shift and before the tray. The top `rows` px of the CPU-rastered
-/// incoming row (`WindowGpu::metal_apron_tex`) land on the exposed strip at
-/// `[dst_y, dst_y + rows)`, the same bytes as CPU `paint_incoming_strip`.
-/// Refused without a present copy.
+/// Whole-width apron strip copy filling the gap exposed by [`BandShiftPass`].
 pub(crate) struct ApronStripPass<'a> {
     pub(crate) tex: &'a SealedTexture,
     /// First framebuffer row of the exposed strip (`y1 - frac`).
@@ -487,7 +400,7 @@ pub(crate) struct ApronStripPass<'a> {
     pub(crate) rows: usize,
 }
 
-/// The tray pass: row 17, 4-vertex strip, straight-alpha src-over.
+/// Straight-alpha tray overlay pass.
 pub(crate) struct TrayPass<'a> {
     pub(crate) pso: &'a Obj,
     pub(crate) card_tex: &'a Obj,
@@ -500,8 +413,7 @@ pub(crate) struct TrayPass<'a> {
     pub(crate) uniform_slot: usize,
 }
 
-/// The crown, drawn in the blit pass (`hdr_glow` on f16, else `sdr_glow`),
-/// crown-scissored, instanced over the ungated glow stream.
+/// Scissored instanced glow crown pass drawn during blit.
 pub(crate) struct CrownPass<'a> {
     pub(crate) pso: &'a Obj,
     /// `HdrGlowUniform` at the row's `vertex_uniform` slot and its
@@ -515,17 +427,14 @@ pub(crate) struct CrownPass<'a> {
     pub(crate) scissor: (u32, u32, u32, u32),
 }
 
-/// Submit B, minus acquire/present (the caller owns the frame boundary).
+/// Submit B pass sequence inputs from offscreen composition through final drawable blit.
 pub(crate) struct PresentSequence<'a> {
     /// The clean offscreen (base + aurora — the scissor base).
     pub(crate) offscreen: &'a SealedTexture,
-    /// The present copy the effects composite over and the blit samples. `None`
-    /// for an effect-free present: the blit samples `offscreen` and the compose
-    /// copy is skipped.
+    /// The present copy the effects composite over and the blit samples.
     pub(crate) present_off: Option<&'a SealedTexture>,
     /// The compose copy's half-open rect from `renderer::present_copy_rect`;
-    /// full frame only for the first sync into a fresh copy. Ignored when
-    /// `present_off` is `None`.
+    /// full frame only for the first sync into a fresh copy.
     pub(crate) copy_rect: [u32; 4],
     pub(crate) bloom: Option<BloomPasses<'a>>,
     pub(crate) shimmer: Option<ShimmerPass<'a>>,
@@ -543,10 +452,7 @@ pub(crate) struct PresentSequence<'a> {
     pub(crate) crown: Option<CrownPass<'a>>,
 }
 
-/// Encode Submit B onto `cb`, targeting `dest` (the drawable's sealed render
-/// target) at `dest_w`×`dest_h`, in the wgpu path's order: compose copy, bloom,
-/// shimmer, band shift, apron, tray, then one blit pass carrying the letterbox
-/// blit and the crown. The caller appends the tap copy before commit.
+/// Encode the Submit B post-processing, blit, and tap-copy sequence onto `cb`.
 pub(crate) fn encode_present_sequence(
     cb: &mut CommandBuffer<'_>,
     dest: &SealedTexture,
@@ -569,8 +475,6 @@ pub(crate) fn encode_present_sequence(
     }
     let composed = seq.present_off.unwrap_or(seq.offscreen);
 
-    // 2. Bloom: extract into the cleared half-res target, then composite
-    //    (SCREEN) over the copy, scissored to the dilated glow bbox.
     if let Some(bloom) = &seq.bloom {
         {
             let pass = cb.render_pass(&RenderPassDesc {
@@ -614,8 +518,6 @@ pub(crate) fn encode_present_sequence(
         }
     }
 
-    // 3. Shimmer: stage the sample rect, then the scissored refract, after
-    //    the halo so the haze refracts the finished frame.
     if let Some(shimmer) = &seq.shimmer {
         let [sx0, sy0, sx1, sy1] = shimmer.stage_rect;
         cb.copy_texture_sub_rect(
@@ -647,9 +549,6 @@ pub(crate) fn encode_present_sequence(
         pass.draw_fullscreen_triangle()?;
     }
 
-    // 3b. Sub-row band shift over the copy: after halo and haze (they ride the
-    //     glide), before the tray (chrome stays pinned). Refused without a
-    //     present copy, so it never lands on the scissor base.
     if let Some(bs) = &seq.band_shift {
         if seq.present_off.is_none() {
             return Err(
@@ -664,15 +563,10 @@ pub(crate) fn encode_present_sequence(
             bs.shift.dst_y as usize,
             bs.shift.moved as usize,
         );
-        // 1. Stage the moved rows `[src_y, src_y+moved)` into the scratch.
         cb.copy_texture_sub_rect(composed, (0, src_y), bs.scratch, (0, 0), w, moved)?;
-        // 2. Lay them back at `[dst_y, dst_y+moved)`; the exposed strip keeps
-        //    the copy's pixels until 3c.
         cb.copy_texture_sub_rect(bs.scratch, (0, 0), composed, (0, dst_y), w, moved)?;
     }
 
-    // 3c. The incoming row over the exposed strip, inside the band
-    //     (`ApronStripPass`).
     if let Some(ap) = &seq.apron {
         if seq.present_off.is_none() {
             return Err(
@@ -681,8 +575,6 @@ pub(crate) fn encode_present_sequence(
                     .to_owned(),
             );
         }
-        // Clamp to the apron's width, as the CPU and wgpu arms do, so an
-        // oversized copy does not make the copy verb refuse Submit B.
         let w = composed.width().min(ap.tex.width());
         let rows = ap.rows.min(ap.tex.height());
         if w > 0 && rows > 0 {
@@ -690,8 +582,6 @@ pub(crate) fn encode_present_sequence(
         }
     }
 
-    // 4. Tray: the card over the finished copy (straight-alpha src-over,
-    //    4-vertex strip), so chrome sits above halo and haze.
     if let Some(tray) = &seq.tray {
         let pass = cb.render_pass(&RenderPassDesc {
             target: composed,
@@ -707,9 +597,6 @@ pub(crate) fn encode_present_sequence(
         pass.draw_strip_quad()?;
     }
 
-    // 5. The blit pass: Clear (live bg), full-destination viewport and scissor
-    //    (`fs_blit` places the frame and paints the bands), the fullscreen
-    //    triangle, then the crown in the same pass.
     {
         let pass = cb.render_pass(&RenderPassDesc {
             target: dest,
@@ -760,7 +647,7 @@ mod tests {
     fn parent_at_scale(scale: f64) -> Obj {
         let layer = plain_calayer();
         let _pool = ffi::AutoreleasePool::new();
-        // SAFETY: a scalar `CGFloat` setter on the live layer.
+        // SAFETY: sets `contentsScale` on a live `CALayer`.
         unsafe {
             let set: unsafe extern "C-unwind" fn(ffi::Id, ffi::Sel, f64) = ffi::checked_msg();
             set(layer.id(), ffi::sel(c"setContentsScale:"), scale);
@@ -794,9 +681,8 @@ mod tests {
             surface.contents_scale()
         );
 
-        // The display move, with the config unchanged.
         let _pool = ffi::AutoreleasePool::new();
-        // SAFETY: scalar `CGFloat` setter on the live parent layer.
+        // SAFETY: sets `contentsScale` on the live parent `CALayer`.
         unsafe {
             let set: unsafe extern "C-unwind" fn(ffi::Id, ffi::Sel, f64) = ffi::checked_msg();
             set(parent.id(), ffi::sel(c"setContentsScale:"), 1.0);
@@ -851,8 +737,6 @@ mod tests {
         let mut surface =
             MetalWindowSurface::standalone(&dev, config, Arc::clone(&latch)).expect("surface");
 
-        // Drift: the layer's drawable is 16x16 but the retained config says
-        // 24x16.
         surface.config.width = 24;
         let refusal = surface.acquire().expect_err("a drifted acquire refuses");
         assert!(
@@ -865,8 +749,7 @@ mod tests {
         );
         surface.config.width = 16;
 
-        // The nil arm: strip the layer's device so the acquire returns nil.
-        // SAFETY: `setDevice:` accepts nil; the layer stays live.
+        // SAFETY: `setDevice:` accepts nil on a live `CAMetalLayer`.
         unsafe {
             let set_obj: unsafe extern "C-unwind" fn(ffi::Id, ffi::Sel, ffi::Id) =
                 ffi::checked_msg();
@@ -885,8 +768,6 @@ mod tests {
             matches!(nil, AcquireRefusal::AcquireNil),
             "the deviceless refusal is the nil arm, not drift/latch: {nil:?}"
         );
-        // A hang detector: the deviceless nil is immediate; a parked thread
-        // never returns.
         assert!(
             waited < std::time::Duration::from_secs(60),
             "the live nil is BOUNDED — {waited:?} is not a parked thread"
@@ -899,8 +780,7 @@ mod tests {
             surface_present_failure(&nil, true),
             SurfacePresentFailure::Occluded
         );
-        // Recovery: hand the device back and the surface vends again.
-        // SAFETY: as the strip above, with the real device.
+        // SAFETY: `setDevice:` restores the valid `MTLDevice` on the live `CAMetalLayer`.
         unsafe {
             let set_obj: unsafe extern "C-unwind" fn(ffi::Id, ffi::Sel, ffi::Id) =
                 ffi::checked_msg();
@@ -916,7 +796,6 @@ mod tests {
                 .expect("restoring the device must restore acquire"),
         );
 
-        // Latch lost: inject the loss; acquire refuses before FFI.
         latch.record(&CbOutcome::Lost {
             code: None,
             name: "injected",

@@ -5,6 +5,9 @@
 //! Lexical source censuses and guards over an aterm checkout.
 
 //! * OB-1  marker ↔ registry: every `// COST: UNBOUNDED(<dim>)` marker in the
+//!   derived GUI-process closure ([`scan_set::derive_gui_scan_set`], workspace
+//!   `src/` only) maps to a registered sink, and every registered sink is still
+//!   marked.
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -69,7 +72,7 @@ impl CensusOutcome {
         self
     }
 
-    /// Turn a clean walk red when a floor is missed. A red walk keeps its own
+    /// Turn a clean walk red when a floor is missed.
     fn hold_floors(&mut self) {
         let missed: Vec<String> = self
             .floors
@@ -247,6 +250,7 @@ pub fn run_all(root: &Path) -> Vec<(&'static str, CensusOutcome)> {
 }
 
 /// The walker's limits, printed after a red verdict that found an
+/// unbounded-work site.
 pub const PRECISION_NOTE: &str = "    PRECISION / SCOPE (this census's limits):
       - LEXICAL, name-based: fns are segmented by rustfmt's
         closing-brace-at-fn-indent layout and calls matched as `<ident>(`,
@@ -269,6 +273,7 @@ pub const PRECISION_NOTE: &str = "    PRECISION / SCOPE (this census's limits):
 
 /// A grid/terminal function that performs O(session-history) work. Each is
 /// pinned at its definition by a `// COST: UNBOUNDED(<dim>)` marker whose
+/// presence the census verifies (fail-closed both ways).
 struct UnboundedSink {
     /// The fn name as it appears at its `fn <symbol>` definition.
     symbol: &'static str,
@@ -279,6 +284,9 @@ struct UnboundedSink {
 }
 
 /// The O(history) sinks the width-reflow funnels into (`Terminal::resize` ->
+/// `Grid::resize` -> `resize_with_reflow_mode`, whose width branch calls
+/// `take_scrollback_lines` + `reflow_scrollback_lines`), and the disk walker's
+/// O(tree) entry points.
 const UNBOUNDED_REGISTRY: &[UnboundedSink] = &[
     UnboundedSink {
         symbol: "reflow_scrollback_lines",
@@ -308,6 +316,7 @@ const UNBOUNDED_REGISTRY: &[UnboundedSink] = &[
 ];
 
 /// The winit `ApplicationHandler` handlers and the resize timer arm: the entry
+/// points that run on the event-loop (main) thread.
 const MAIN_THREAD_ROOTS: &[&str] = &[
     "new_events",
     "resumed",
@@ -318,9 +327,11 @@ const MAIN_THREAD_ROOTS: &[&str] = &[
 ];
 
 /// The Terminal (`term_lock` hop) methods that reach an unbounded sink
+/// synchronously under the lock (OB-5).
 const UNBOUNDED_TERM_METHODS: &[&str] = &["resize"];
 
 /// A deliberate offload/deferral boundary: bounded work on the lock, the
+/// unbounded work handed off.
 struct OffloadBoundary {
     /// The method name as called on the `term_lock` guard.
     symbol: &'static str,
@@ -330,7 +341,7 @@ struct OffloadBoundary {
     justification: &'static str,
 }
 
-/// The audited offload boundaries of the scrollback-reflow protocol. A guarded
+/// The audited offload boundaries of the scrollback-reflow protocol.
 const OFFLOAD_ALLOWLIST: &[OffloadBoundary] = &[
     OffloadBoundary {
         symbol: "resize_offloading_scrollback",
@@ -409,6 +420,7 @@ pub fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<(
 }
 
 /// A parsed source function: its name, and the masked (comment-stripped) body
+/// lines used for token scans + callee extraction.
 struct GuiFn {
     name: String,
     /// Repo-relative `file:line` of the definition (for the failure path).
@@ -434,6 +446,8 @@ pub(crate) fn gui_split_src_dirs(root: &Path) -> Vec<PathBuf> {
 }
 
 /// Non-test `*.rs` files under `<root>/crates/aterm-gui/src` and the window
+/// crate's split-out libraries ([`gui_split_src_dirs`]): one GUI source,
+/// wherever a module of it was moved to cut the window crate's rebuild.
 fn gui_source_files(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let _ = collect_rs_files(&root.join("crates/aterm-gui/src"), &mut files);
@@ -446,16 +460,20 @@ fn gui_source_files(root: &Path) -> Vec<PathBuf> {
 }
 
 /// Blank every in-file item whose `cfg` gate entails `test`
+/// ([`cfg_attr_never_ships`]): the in-file half of the non-test scope that
+/// [`gui_source_files`] applies by path.
 fn mask_unshipped_items(text: &str) -> String {
     crate::lock_order::mask_items_where(text, &|attr| cfg_attr_never_ships(attr))
 }
 
 /// Per line of a lexed code view, whether it is outside every item whose
+/// `cfg` proves it test-only (see [`mask_unshipped_items`]).
 fn shipped_lines(code: &str) -> Vec<bool> {
     crate::lock_order::unmasked_lines(code, &|attr| cfg_attr_never_ships(attr))
 }
 
 /// Does this trimmed attribute line prove its item absent from a shipped
+/// build?
 fn cfg_attr_never_ships(attr: &str) -> bool {
     let Some(rest) = attr.strip_prefix("#[cfg(") else {
         return false;
@@ -467,6 +485,7 @@ fn cfg_attr_never_ships(attr: &str) -> bool {
 }
 
 /// Does `pred` (a `cfg` predicate without the `cfg(..)` wrapper) hold only when
+/// `test` is set?
 fn cfg_pred_entails_unshipped(pred: &str) -> bool {
     let pred = pred.trim();
     if pred == "test" {
@@ -491,6 +510,8 @@ fn cfg_pred_entails_unshipped(pred: &str) -> bool {
 }
 
 /// Split a `cfg` argument list on its top-level commas — commas inside nested
+/// parentheses or inside a string literal (`target_os = "linux"`) do not
+/// separate arguments.
 fn split_top_level_commas(args: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut depth = 0usize;
@@ -519,6 +540,7 @@ fn split_top_level_commas(args: &str) -> Vec<&str> {
 }
 
 /// Strip a whole-line `//` comment and any inline ` // …` trailing comment, so
+/// token scans never fire on commented-out code or prose.
 fn strip_line_comment(line: &str) -> &str {
     let t = line.trim_start();
     if t.starts_with("//") {
@@ -531,6 +553,7 @@ fn strip_line_comment(line: &str) -> &str {
 }
 
 /// Extract `<ident>` from a `fn <ident>` occurrence starting at `after_fn` (the
+/// slice right after `"fn "`).
 fn ident_after_fn(after_fn: &str) -> Option<String> {
     let id: String = after_fn
         .trim_start()
@@ -540,7 +563,7 @@ fn ident_after_fn(after_fn: &str) -> Option<String> {
     if id.is_empty() { None } else { Some(id) }
 }
 
-/// Is `line` a function definition? Returns `(indent, name)`. Recognises the
+/// Is `line` a function definition?
 fn parse_fn_def(line: &str) -> Option<(usize, String)> {
     let indent = line.len() - line.trim_start().len();
     let mut rest = line.trim_start();
@@ -587,6 +610,7 @@ fn parse_fn_def(line: &str) -> Option<(usize, String)> {
 }
 
 /// Segment every function in `text` using rustfmt's closing-brace-at-fn-indent
+/// invariant.
 fn parse_source_fns(text: &str, rel: &str, out: &mut Vec<GuiFn>) {
     let lines: Vec<&str> = text.lines().collect();
     let mut i = 0;
@@ -645,6 +669,7 @@ pub(crate) fn is_bodyless_declaration(lines: &[&str], at: usize) -> bool {
 }
 
 /// The identifier ending exactly at byte offset `end` in `s` (the receiver before
+/// a `.method(`), if the char before it is not an identifier char.
 fn ident_ending_at(s: &str, end: usize) -> Option<&str> {
     let bytes = s.as_bytes();
     let mut start = end;
@@ -664,6 +689,8 @@ fn ident_ending_at(s: &str, end: usize) -> Option<&str> {
 }
 
 /// Term-lock guard variables bound in `body` via `let [mut] <ident> =
+/// term_lock(` or the UI thread's registering `[crate::]term_lock_ui(`, which
+/// returns the same guard.
 fn guard_vars(body: &[String]) -> std::collections::BTreeSet<String> {
     let mut guards = std::collections::BTreeSet::new();
     for line in body {
@@ -691,12 +718,15 @@ fn guard_vars(body: &[String]) -> std::collections::BTreeSet<String> {
 }
 
 /// A synchronous term-hop call found in a function body: the unbounded sink method
+/// it lands on and the source line (for the failure text).
 struct TermHopHazard {
     method: String,
     line: String,
 }
 
 /// Detect synchronous `term_lock`-guarded calls to an unbounded term method in
+/// `body`: chained (`term_lock(...).<m>(`) or via a bound guard
+/// (`<guard>.<m>(`).
 fn term_hop_calls(body: &[String]) -> (Vec<TermHopHazard>, usize) {
     let guards = guard_vars(body);
     let mut hazards = Vec::new();
@@ -770,6 +800,7 @@ fn callee_names(body: &[String]) -> std::collections::BTreeSet<String> {
 }
 
 /// One swept `// COST: UNBOUNDED(<dim>)` marker: the fn it annotates, its
+/// declared cost dimension, and the repo-relative `file:line` of the marker.
 struct Marker {
     symbol: String,
     dim: String,
@@ -777,11 +808,13 @@ struct Marker {
 }
 
 /// The marker-sweep file exclusions shared by both sweep scopes: test files
+/// and this crate (its tests synthesize marker lines).
 fn marker_sweep_file(p: &Path) -> bool {
     !is_test_file(p) && !p.to_string_lossy().contains("/aterm-census/")
 }
 
 /// Sweep `files` for `// COST: UNBOUNDED(<dim>)` markers, mapping each to the
+/// `fn <name>` it annotates (spans repo-relative to `root`).
 fn sweep_markers(root: &Path, files: &[PathBuf]) -> Vec<Marker> {
     let mut found = Vec::new();
     for file in files {
@@ -820,6 +853,8 @@ fn sweep_markers(root: &Path, files: &[PathBuf]) -> Vec<Marker> {
 }
 
 /// The OB-1 marker sweep over the derived GUI-process closure (`scan_dirs`,
+/// the workspace-member `src/` set OB-7 uses; build scripts and examples are
+/// other processes).
 fn collect_closure_markers(root: &Path, scan_dirs: &[String]) -> Vec<Marker> {
     let mut files = Vec::new();
     for dir in scan_dirs {
@@ -831,6 +866,8 @@ fn collect_closure_markers(root: &Path, scan_dirs: &[String]) -> Vec<Marker> {
 }
 
 /// The out-of-closure marker sweep: every crate dir under `<root>/crates` not
+/// in the derived GUI-process closure (CLI tools, spec tooling, proc-macros,
+/// separate-process binaries).
 fn collect_out_of_closure_markers(root: &Path, scan_dirs: &[String]) -> Vec<Marker> {
     let closure_crate_dirs: std::collections::BTreeSet<&str> = scan_dirs
         .iter()
@@ -859,6 +896,7 @@ fn collect_out_of_closure_markers(root: &Path, scan_dirs: &[String]) -> Vec<Mark
 }
 
 /// Does `<root>/<rel_file>` still hold a `fn <symbol>` definition (comment lines
+/// excluded)?
 fn fn_defined_in(root: &Path, rel_file: &str, symbol: &str) -> bool {
     let Ok(text) = tree::read_to_string(&root.join(rel_file)) else {
         return false;
@@ -1278,6 +1316,9 @@ mod tests {
     }
 
     /// [`collect_rs_files`] collects every `.rs` below the directory at any
+    /// depth, and none under a `target/` or any dot directory (a worktree under
+    /// `.claude/`, a tool's hidden scratch), whose copies are not the
+    /// checkout's sources.
     #[test]
     fn the_rs_walk_skips_target_and_dot_directories() {
         let root = empty_files(
@@ -1304,6 +1345,8 @@ mod tests {
     }
 
     /// What the walk cannot read ends it with the error, however deep: an
+    /// entry a directory's listing cannot read, or a directory it may not list
+    /// (the disk's unreadable directory).
     #[test]
     fn the_rs_walk_stops_where_it_cannot_read() {
         use std::io::ErrorKind;
@@ -1414,6 +1457,8 @@ mod tests {
     }
 
     /// A body-less declaration (an extern block's import, a trait's required
+    /// method) is no fn: the fns after it stay themselves, each with its own
+    /// body, and the declaration contributes none.
     #[test]
     fn a_bodyless_declaration_does_not_swallow_the_fns_after_it() {
         let src = "\
@@ -1513,6 +1558,7 @@ fn table() -> [f32; 256] {
     }
 
     /// The registering `term_lock_ui` binds the same guard, so `term.resize(`
+    /// under it is a hazard.
     #[test]
     fn guard_vars_captures_the_term_lock_ui_binding() {
         let g = guard_vars(&body(
@@ -1582,6 +1628,7 @@ fn table() -> [f32; 256] {
     }
 
     /// A derivable synthetic workspace: the marker sweep is closure-scoped, so
+    /// every synthetic tree needs manifests.
     fn synth_manifests() -> Vec<(String, String)> {
         let mut files = crate::scan_set::test_fixtures::workspace_manifests(&[
             ("aterm-core", ""),
@@ -1601,6 +1648,7 @@ fn table() -> [f32; 256] {
     }
 
     /// Manifests + support files: the green base every mainloop synthetic
+    /// tree starts from.
     fn synth_base() -> Vec<(String, String)> {
         let mut files = synth_manifests();
         files.extend(synth_support_files());

@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! By-id asset downloads (design §11.1): a fresh `.agh-part` file, sha256 while writing, the
-//! exact size, the digest check, then durable and renamed.
+//! Release asset downloads with SHA-256 verification and atomic `.agh-part` staging.
 
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
@@ -100,10 +99,7 @@ pub fn part_path(dest: &std::path::Path) -> std::path::PathBuf {
     std::path::PathBuf::from(name)
 }
 
-/// Whether `path`'s file name ends in [`PART_SUFFIX`], in any ASCII letter case: the part file
-/// of another destination, which a download of that destination removes before it starts. The
-/// case is ignored because a case-insensitive volume (APFS's default, NTFS) gives
-/// `X.AGH-PART` and `X.agh-part` one file.
+/// Returns whether `path`'s file name ends in [`PART_SUFFIX`] (case-insensitive).
 #[inline]
 #[must_use]
 pub fn is_part_name(path: &Path) -> bool {
@@ -114,9 +110,7 @@ pub fn is_part_name(path: &Path) -> bool {
     })
 }
 
-/// Whether `name` is one plain path component that names itself (no separator, no `.` or
-/// `..`, no root or drive prefix; on Windows no `:`, an alternate data stream's mark), so
-/// `dir.join(name)` stays in `dir`.
+/// Returns whether `name` is a single plain file name component.
 #[inline]
 #[must_use]
 pub fn plain_file_name(name: &str) -> bool {
@@ -130,13 +124,11 @@ pub fn plain_file_name(name: &str) -> bool {
     )
 }
 
-/// Usage for a destination that exists and is not a regular file (a directory, a FIFO, a
-/// device, a socket; a symlink is judged by what it names): its bytes cannot be compared, and
-/// a FIFO's open would wait for a writer. Nothing there, or a regular file, passes.
+/// Rejects a destination that exists and is not a regular file.
 ///
 /// # Errors
 ///
-/// Usage as above; CouldNotRun `Local` when the destination cannot be looked at.
+/// Returns a usage error for a non-regular file or a local error if metadata cannot be read.
 pub(crate) fn refuse_non_file(dest: &Path) -> Result<()> {
     match std::fs::metadata(dest) {
         Ok(meta) if meta.is_file() => Ok(()),
@@ -310,15 +302,11 @@ impl Drop for Part {
         if self.kept {
             return;
         }
-        // Closed first, so Windows can remove it by name. A file `finish` already closed was
-        // judged this download's just before.
         let ours = self
             .file
             .take()
             .is_none_or(|file| still_named(&self.path, &file));
         if ours {
-            // The part file is deleted on every error; a failed delete leaves a part file the
-            // next download of this destination removes before it starts.
             let _ = remove_quietly(&self.path);
         }
     }
@@ -346,8 +334,7 @@ fn copy(
     }
 }
 
-/// Stream `body` into a fresh part file of `dest`, then durable, rename and (unix) `durable_dir`:
-/// `Public::fetch`. The byte count; the part file is removed on any error.
+/// Streams `body` to `dest` via a durable part file and returns the byte count.
 pub(crate) fn stream_to_file(
     body: &mut dyn Read,
     dest: &Path,
@@ -386,7 +373,6 @@ fn file_digest(path: &Path) -> Result<Option<Sha256Digest>> {
     let mut file = match open_to_hash(path) {
         Ok(file) => file,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-        // A directory cannot be opened to read on some systems (EISDIR on Windows).
         Err(_) if path.is_dir() => return Err(not_a_file(path)),
         Err(e) => return Err(local("cannot read", path, &e)),
     };
@@ -432,26 +418,7 @@ enum Dest<'a> {
     Writer(&'a mut dyn Write),
 }
 
-/// The download (design §11.1), `Releases::download`'s body. A `Sink::File` path whose name
-/// ends in `.agh-part` (any letter case) is usage first, before any request (it is another
-/// destination's part file, which that destination's download removes), and so is one that
-/// exists and is not a regular file (`refuse_non_file`). Then:
-/// 1. a state other than `uploaded` → Incomplete `NotUploaded { state }`;
-/// 2. a `Sink::File` destination that already holds the known digest → `written: false`, 0
-///    requests; one holding other bytes, with a known digest and no `clobber` → the Conflict
-///    of step 6, 0 requests;
-/// 3. the request: routed, `GET /repos/{o}/{r}/releases/assets/{id}` with Accept
-///    OctetStream; under `how.anonymous`, the asset's `browser_download_url` on the web
-///    origin. Either way one hop, `Deadlines::for_transfer(size)`, `limit(size)`, streamed;
-/// 4. the bytes, hashed while they stream; more than `size` → `Wire(TooLarge)`, fewer →
-///    `Wire(Truncated)`;
-/// 5. a known digest that differs → Conflict `DigestMismatch`; a null digest → the bracket
-///    recheck (`size` and `updated_at` re-read, unchanged, else Conflict);
-/// 6. the part file made durable, then renamed into place (a destination with the same bytes
-///    is left alone, `written: false`; different bytes need `clobber`), then (unix) `durable_dir`.
-///
-/// The part file is removed on every error. A writer's bytes cannot be taken back, so a
-/// mismatch there still fails after the last byte.
+/// Downloads release asset `asset` into `sink` with size and digest verification.
 pub(crate) fn fetch(
     gh: &Github,
     slug: &Slug,
@@ -506,13 +473,10 @@ fn fetch_inner(
                     requests: 0,
                 });
             }
-            // Other bytes there, no clobber, a known digest: whatever arrives (the digest's
-            // bytes, or a mismatch) ends in Conflict, so nothing is sent.
             Some(_) if !clobber => return Err(exists_with_other_bytes(path)),
             _ => {}
         }
     }
-    // A `Sink::Bounded` below the asset's limit holds the stream to its own cap.
     let limit = match &sink {
         Sink::Bounded(cap) => expect.limit.min(*cap),
         Sink::File { .. } | Sink::Writer(_) => expect.limit,

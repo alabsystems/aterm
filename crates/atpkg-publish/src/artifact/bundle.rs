@@ -199,6 +199,8 @@ fn home_of(stage: &aterm_tempfile::TempDir) -> PathBuf {
 }
 
 /// The packed compiler a bundle names its triple and its hello by: the program's own
+/// (trust-mc's `bin/trust-mc-compiler`), else `bin/rustc`, else `bin/trustc` — the first
+/// that is there.
 fn packed_compiler(def: &BundleDef, root: &Path) -> Option<PathBuf> {
     let own = match def.hello {
         Hello::TrustSysroot { compiler } => Some(compiler),

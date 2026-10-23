@@ -1,27 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `atpkg-publish mirror <quad-dir>`: make every pack a signed index pins public on the
-//! channel owner. [`super::index`] runs it before it publishes; the verb is for a dry run
-//! and a convergence by hand.
-//!
-//! The work list is [`crate::pins::union`] of the verified quad (`pin` and every overlay).
-//! Per `(program, build)`:
-//! 1. the public copy, read as a client reads it (download host, no credential): the
-//!    manifest pair verified under the quad's roster
-//!    ([`crate::quad::VerifiedQuad::verify_pkg`]), bound to this program and build, and
-//!    every release asset it names probed; a complete public copy is skipped, with no
-//!    staging read;
-//! 2. else the staging copy, downloaded (retried) and checked ([`check_staged`]); a public
-//!    manifest that exists must be byte-identical to staging's (a public pack is
-//!    immutable);
-//! 3. publish: create the release ([`public_notes`]: for an ALab package, the upstream base
-//!    its staged archive records), or upload exactly what is missing (never replacing); a
-//!    public release that serves no manifest (an orphaned draft) is refused;
-//! 4. confirm every asset answers on the download host ([`super::probe_served`]).
-//!
-//! An answer the download host does not give ([`Probe::Unknown`]) is never read as
-//! "absent": nothing is decided about that pack, and the run stops.
+//! `atpkg-publish mirror`: mirrors verified staging packs to the public channel owner.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -69,7 +49,6 @@ pub struct MirrorReport {
     pub planned: Vec<(String, Vec<String>)>,
 }
 
-/// The release assets a verified manifest names: its `github-release` rows (an `https`
 /// row's bytes live on the vendor's host and are never mirrored).
 fn release_assets(pkg: &atpkg::PkgManifest) -> Vec<(String, String)> {
     pkg.artifacts
@@ -91,13 +70,11 @@ fn bind(pkg: &atpkg::PkgManifest, program: &str, build: u64, which: &str, tag: &
     }
 }
 
-/// The staging release in `dir`, verified: the signed manifest pair under the client's
-/// rule, the program/build bind, every release asset's sha256, and exactly the signed set.
-/// Returns the expected file names, manifest pair first, and the verified manifest.
+/// Checks the asset list and hashes of the staged release in `dir`.
 ///
 /// # Errors
 ///
-/// A refusal naming what does not hold.
+/// Returns an error if a manifest file is missing, mismatched, or unexpected.
 pub fn check_staged(
     quad: &VerifiedQuad,
     dir: &Path,
@@ -137,7 +114,6 @@ pub fn check_staged(
             expected.push(asset);
         }
     }
-    // By exact name: an asset name is never a pattern.
     if let Some(extra) = staged.iter().find(|f| !expected.contains(f)) {
         return Err(Error::refused(format!(
             "{tag} staging release carries unverifiable extra file {extra} — refusing to \
@@ -153,15 +129,11 @@ pub const PUBLIC_NOTES: &str = "Signed atpkg package, published byte-identical f
      paper master, through the machine roster published beside the index — the host is never \
      an authenticity input.";
 
-/// The notes the public release of `program`'s verified staging pack `pkg` (its files in
-/// `dir`) is created with: [`PUBLIC_NOTES`], then, for an ALab package whose record names
-/// one, its upstream base (`Based on upstream openai/codex …`), read off the archive as a
-/// client stages it ([`package::staged_upstream`]) and never off the staging release's
-/// text, which nothing signs.
+/// Builds the release notes for the verified staging pack `pkg` of `program` in `dir`.
 ///
 /// # Errors
 ///
-/// A refusal when an ALab package's archive does not stage.
+/// Returns an error if an ALab package archive fails to stage.
 pub fn public_notes(program: &str, pkg: &atpkg::PkgManifest, dir: &Path) -> Result<String> {
     let upstream = package::staged_upstream(program, pkg, dir)?;
     Ok(match package::upstream_line(program, upstream.as_ref()) {
@@ -170,12 +142,11 @@ pub fn public_notes(program: &str, pkg: &atpkg::PkgManifest, dir: &Path) -> Resu
     })
 }
 
-/// Make every pack `quad` pins public on the channel owner.
+/// Mirrors every pack pinned by `quad` to the public channel owner.
 ///
 /// # Errors
 ///
-/// The first pack that is not, or cannot be made, public — with why. Nothing about a
-/// pack is decided from a download host that did not answer.
+/// Returns an error on the first pack that is not or cannot be made public.
 pub fn mirror(
     ctx: &Ctx,
     quad: &VerifiedQuad,
@@ -275,7 +246,6 @@ fn one(
         ))
     };
 
-    // 1. The public copy, as a client reads it.
     let pub_dir = work.join("public").join(&tag);
     let public_mf = match channel.fetch_public(&public, &tag, &mf, &pub_dir.join(&mf), MANIFEST_CAP)
     {
@@ -316,7 +286,6 @@ fn one(
         }
     }
 
-    // 2. The staging copy, whole, verified.
     log.say(format!("fetching {staging}@{tag}"));
     let staged_release = ctx
         .hosts
@@ -358,7 +327,6 @@ fn one(
          signed manifest, no extras)"
     ));
 
-    // 3. Publish.
     let written: Vec<String> = if public_mf {
         let mut missing = Vec::new();
         for name in &expected {
@@ -377,8 +345,6 @@ fn one(
             return Ok(());
         }
         let files: Vec<PathBuf> = missing.iter().map(|n| dir.join(n)).collect();
-        // Never a clobber: these answered 404 a moment ago, and one appearing in the window
-        // is another publisher's.
         channel
             .upload(&public, &tag, &files, Replace::Never)
             .map_err(|e| host_error(format!("upload to {public}@{tag}"), &e))?;
@@ -423,7 +389,6 @@ fn one(
         expected
     };
 
-    // 4. Confirm, as a client would fetch it.
     for name in &written {
         let answer = probe_served(channel, &public, &tag, name);
         if answer != Probe::Present {
@@ -437,12 +402,11 @@ fn one(
     Ok(())
 }
 
-/// `atpkg-publish mirror <quad-dir> [--dry-run]`.
+/// Entry point for `atpkg-publish mirror <quad-dir> [--dry-run]`.
 ///
 /// # Errors
 ///
-/// A usage error for a bad command line; a refusal when the quad does not verify or a
-/// pack cannot be made public.
+/// Returns an error on bad CLI arguments, verification failure, or mirror failure.
 pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     let mut dir: Option<PathBuf> = None;
     let mut opts = MirrorOptions::publish();

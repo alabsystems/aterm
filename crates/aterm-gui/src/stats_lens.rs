@@ -1,42 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE LENS, a row's close-up (`docs/DESIGN-stats-deck-v2-2026-10-20.md`
-//! §7.7, §11.3, §11.4): a card hung 4 pt under the Deck (4 pt over the sill)
-//! that says what one instrument's heat is made of. It reserves no row: a
-//! summoned overlay, folded into the window's one tray surface with the bars
-//! (`App::fold_stats_deck`), so `image` captures carry it.
-//!
-//! * **Frame.** Line 1 names the instrument, where its reading comes from and
-//!   when, and the keys; the explainer says what its heat measures; Disk
-//!   answers "Wrong?" and the other rows say where they stand now; then the
-//!   body in sections ([`lens_body`]): two columns on a shell 640 pt wide or
-//!   more, one column below, where each section takes its largest form that
-//!   leaves room for the one-line forms after it, and drops, with every
-//!   section after it in the priority order (in either column), when not
-//!   even its one-line form fits. Disk's Space now always shows: the
-//!   explainer and the answer above it are cut short to leave its line.
-//! * **Opening.** The pointer resting on a Deck row, the cores, the header or
-//!   a sill instrument for [`REST`] with no motion (the `StatsLens` deadline,
-//!   armed by motion and re-armed at each motion, so passing over never opens
-//!   it); a click on one, which pins it; or ⌘I (`ToggleStatsLens`), the
-//!   keyboard lens on CPU or on the last instrument a lens showed. It never
-//!   opens itself, not for a stuck job, an agent or a value (O33). Whenever
-//!   Disk becomes the lens's instrument, the "where" survey is asked for
-//!   (`App::disk_lens_opened`, at most hourly).
-//! * **Closing.** An unpinned hover lens closes when the pointer has left the
-//!   lens and the form for [`LEAVE`]; any lens closes on a click outside, on
-//!   focus loss, on ⌘I and on Esc.
-//! * **Keys.** A pinned or keyboard lens takes ←/→ (the instrument, over
-//!   `Instrument::ALL`), ↑/↓ (the scope its lists show), ⌘C or the chord
-//!   Copy is bound to (the instrument's sentence, `words::row_sentence`) and
-//!   Esc; Return pins the keyboard lens. Any other key closes the lens and
-//!   goes on to the terminal (one frame, no spring); a hover lens takes no
-//!   key.
-//! * **Material.** The shell is an opaque step off the band ground with a
-//!   rim and a soft shadow (its words sit on it, so nothing of the terminal
-//!   or its effects may show through), in the Deck's inks, so the words keep
-//!   their floors over any terminal theme.
+//! Stats Deck instrument lens overlay ([`lens_body`], [`REST`], [`LEAVE`]).
 
 use std::time::{Duration, Instant};
 
@@ -55,19 +20,17 @@ use crate::widget::{DrawPrim, Rgba, TextFace, TextWeight, rgba, text_prim};
 
 /// How long the pointer rests on an instrument before the hover lens opens.
 pub(crate) const REST: Duration = Duration::from_millis(250);
-/// How long an unpinned hover lens outlives the pointer leaving it and the
-/// form it opened from.
+/// How long an unpinned hover lens outlives the pointer leaving it and the form it opened on.
 pub(crate) const LEAVE: Duration = Duration::from_millis(300);
-/// The vitals cadence while a lens is open (2 Hz, design §6.1).
+/// The vitals cadence while a lens is open (2 Hz).
 pub(crate) const LENS_PERIOD: Duration = Duration::from_millis(500);
 
 /// How a lens was opened, which decides how it closes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Opened {
-    /// The pointer rested on an instrument: it leaves with the pointer.
+    /// The pointer rested on an instrument.
     Hover,
-    /// A click pinned it: it stays until a click outside, Esc or a key it
-    /// does not take.
+    /// A click pinned it: it stays until a click outside, Esc or a key it does not take.
     Pinned,
     /// ⌘I: it takes ←/→/↑/↓, Return, ⌘C and Esc.
     Keyboard,
@@ -95,20 +58,19 @@ pub(crate) struct Rest {
 /// The lens's per-window state.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LensSlot {
-    /// The open lens, if any.
+    /// The open lens.
     pub(crate) open: Option<Lens>,
     /// A rest armed over an instrument.
     pub(crate) rest: Option<Rest>,
     /// When an unpinned hover lens closes, the pointer having left.
     pub(crate) leave_due: Option<Instant>,
-    /// The lens card's placement in the frame: `(x, y, w, h)` of the card.
+    /// The lens card's placement in the frame.
     pub(crate) rect: Option<(u32, u32, u32, u32)>,
-    /// The instrument and scope the last lens showed: ⌘I opens there.
+    /// The instrument and scope the last lens showed.
     pub(crate) last: Option<(Instrument, Bar)>,
 }
 
-/// The lens card's geometry: the card (shell plus shadow margin) in frame
-/// device pixels.
+/// The lens card's geometry.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct LensGeom {
     /// The card's frame origin.
@@ -134,11 +96,7 @@ impl LensGeom {
     }
 }
 
-/// Where the lens hangs for a form card at `(card_dy, card_h)` over a grid
-/// whose left edge is `grid_x`, `grid_w` × `grid_h` device px from
-/// `grid_y`: `min(1024, grid_w − 24) × min(250, 0.7 · grid_h)` pt, centred
-/// on the grid. `None` when the window is too small to hold one (under
-/// 160 × 90 pt).
+/// Where the lens hangs for a form card at `(card_dy, card_h)` over the grid.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lens_geom(
     form: StatsBars,
@@ -177,8 +135,7 @@ pub(crate) fn lens_geom(
     })
 }
 
-/// What the How to read lens says to a reader, and what its ⌘C copies
-/// (§12), naming the machine as the deck does on `platform`.
+/// What the How to read lens says to a reader, and what its ⌘C copies.
 pub(crate) fn how_to_read_words(platform: Platform) -> String {
     format!(
         "Each row is one resource. The row covers the last 10 minutes, oldest on the left; each \
@@ -190,7 +147,7 @@ pub(crate) fn how_to_read_words(platform: Platform) -> String {
     )
 }
 
-/// The instrument ⌘C copies: the row's sentence (§12), or How to read's.
+/// The instrument ⌘C copies.
 pub(crate) fn lens_sentence(
     snap: &Snapshot,
     focus: Instrument,
@@ -203,8 +160,7 @@ pub(crate) fn lens_sentence(
     }
 }
 
-/// The next instrument ←/→ moves to over `Instrument::ALL`, wrapping; How
-/// to read steps out to the first or the last.
+/// The next instrument ←/→ moves to over `Instrument::ALL`, wrapping.
 pub(crate) fn step_instrument(focus: Instrument, forward: bool) -> Instrument {
     let all = Instrument::ALL;
     let n = all.len();
@@ -226,8 +182,6 @@ fn step_bar(bar: Bar, forward: bool) -> Bar {
         (i + n - 1) % n
     }]
 }
-
-// The frame's measures (§11.3), pt from the shell's top-left corner.
 
 /// The shell's side margin: the explainer wraps to the shell width − 24.
 const SIDE: f64 = 12.0;
@@ -257,7 +211,7 @@ const ROW0_BASE: f64 = 24.0;
 /// A tolerance for measured widths.
 const EPS: f64 = 0.01;
 
-/// Where a section is laid: its box, pt.
+/// Where a section is laid.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Place {
     pub(crate) x: f64,
@@ -268,13 +222,11 @@ pub(crate) struct Place {
 
 type Draw<'d> = Box<dyn Fn(&mut Pen<'_>, Place) + 'd>;
 
-/// One form a section can take: its height (the least, for a form that
-/// grows into the room left), and how it draws in its box.
+/// One form a section can take.
 pub(crate) struct Form<'d> {
     h: f64,
     grow: bool,
-    /// A one-line form's label: the one-liners stacked in a column start
-    /// their words at one tab.
+    /// A one-line form's label.
     label: Option<String>,
     draw: Draw<'d>,
 }
@@ -308,15 +260,12 @@ fn line_form<'d>(label: &str, forms: Vec<String>) -> Form<'d> {
     }
 }
 
-/// One section of a lens's body: its heading and lines as a reader hears
-/// them, its column on a two-column shell, and its forms, largest first; the
-/// last is its one-line form.
+/// One section of a lens's body.
 pub(crate) struct Section<'d> {
     pub(crate) name: String,
     pub(crate) words: Vec<String>,
     pub(crate) right: bool,
-    /// The parts it draws under labels of their own (Space now's Freed),
-    /// each a well of its own after the section's: its label and its lines.
+    /// The parts it draws under labels of their own (Space now's Freed).
     pub(crate) parts: Vec<(String, String)>,
     forms: Vec<Form<'d>>,
 }
@@ -327,19 +276,13 @@ pub(crate) struct LensDoc<'d> {
     /// Where the reading comes from and when, longest first.
     sources: Vec<String>,
     explainer: String,
-    /// "Wrong?" (Disk) or the row's state now: its label, its words and
-    /// their ink, the state's mark's (§9.3) or words2.
+    /// "Wrong?" (Disk) or the row's state now.
     answer: Option<(&'static str, String, InkKind)>,
     /// In priority order: one column stacks them in this order.
     sections: Vec<Section<'d>>,
-    /// The order two columns stack them in, top down (each column keeps
-    /// its own); empty for the priority order.
+    /// The order two columns stack them in, top down (each column keeps its own).
     two_order: Vec<usize>,
-    /// Whether the first section always shows (Disk's Space now, §11.3):
-    /// it takes its largest form that fits whatever drops after it, its
-    /// one-line form only where no other fits, and the explainer and the
-    /// answer leave room for that one-line form, cut short where they would
-    /// not.
+    /// Whether the first section always shows (Disk's Space now).
     keeps_first: bool,
 }
 
@@ -360,17 +303,7 @@ pub(crate) struct Placed {
     pub(crate) place: Place,
 }
 
-/// The body (§11.3): on a shell `lw` pt wide, two columns of `(lw − 36)/2`
-/// from 640 pt, else one of `lw − 24`, from `top` to `bottom`. The sections
-/// shown are the most of the priority order's first sections that fit, so a
-/// section drops with everything after it in that order, whichever column
-/// it stands in. In each column they stack in order, two columns in
-/// `two_order` (the priority order when it is empty), and each takes its
-/// largest form that leaves room for the one-line forms of the sections
-/// shown after it in its column; a form that grows takes the room those
-/// leave. Where `keeps_first`, the first section takes its largest form
-/// that fits on its own, and the sections after it drop before it shrinks
-/// (Disk's Space now with Freed, `dark_1100_lens_disk_short`).
+/// The body: on a shell `lw` pt wide, two columns of `(lw − 36)/2` from 640 pt.
 pub(crate) fn lens_body(
     lw: f64,
     top: f64,
@@ -457,11 +390,7 @@ fn stack(
     Some(out)
 }
 
-// The pen: text, rules, bars and marks in pt from the shell's corner, each
-// edge on a whole device pixel.
-
-/// A drawn text's box (advance, ascent, descent), pt from the shell's
-/// corner: what T-G16 checks.
+/// A drawn text's box (advance, ascent, descent), pt from the shell's corner.
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TextBox {
@@ -473,16 +402,15 @@ pub(crate) struct Pen<'a> {
     p: Painter<'a>,
     m: &'a FaceMetrics,
     inks: VitalsInks,
-    /// Increase Contrast (§9.5).
+    /// Increase Contrast.
     ic: bool,
     s: f64,
     /// The shell's corner in the card, device px.
     ox: f32,
     oy: f32,
-    /// Draw the prims, or only lay out (T-G16's sweep).
+    /// Draw the prims, or only lay out.
     draw: bool,
-    /// Where the one-liners stacked in this section's column start their
-    /// words.
+    /// Where the one-liners stacked in this section's column start their words.
     line_tab: f64,
     #[cfg(test)]
     boxes: Vec<TextBox>,
@@ -815,8 +743,6 @@ fn line_section<'d>(name: &str, label: &str, forms: Vec<String>, right: bool) ->
     }
 }
 
-// Lists: a chip, a name, a scope, a bar and a figure a row.
-
 /// One row of a list.
 #[derive(Clone, Debug, PartialEq)]
 struct Row {
@@ -903,8 +829,6 @@ fn draw_rows(pen: &mut Pen<'_>, p: Place, rows: &[Row], tab_key: Option<u64>) {
         .iter()
         .map(|r| pen.width(&r.figure, BODY_PT, false))
         .fold(0.0, f64::max);
-    // Every row starts 10 pt in: a chip's room, kept where there is none so
-    // the names align under the heading's second word.
     let lead = 10.0;
     let avail = (p.w - lead - fig_w - 8.0).max(0.0);
     let has_scope = rows.iter().any(|r| r.scope.is_some());
@@ -1010,15 +934,11 @@ fn list_section<'d>(
     }
 }
 
-// Step traces (§7.7): a line per bucket, because the axis does not start at
-// zero.
-
 /// A step trace's data and words.
 struct Trace {
-    /// The values, oldest first; `None` was not read.
+    /// The values, oldest first.
     vals: Vec<Option<f64>>,
-    /// The labels under the plot: the share of the width from the left, and
-    /// the words.
+    /// The labels under the plot.
     under: &'static [(f64, &'static str)],
     /// The least span the axis shows, in the values' unit.
     min_span: f64,
@@ -1143,7 +1063,6 @@ fn draw_trace(pen: &mut Pen<'_>, p: Place, t: &Trace) {
     let pitch = (x1 - x0) / cols as f64;
     let yv = |v: f64| y1 - (v - lo) / (hi - lo) * ch;
     let ink = rgba(inks.words2, 0xFF);
-    // Runs of one level draw as one segment.
     let mut run: Option<(f64, f64)> = None;
     for (j, v) in t.vals.iter().enumerate() {
         let xa = x0 + j as f64 * pitch;
@@ -1167,7 +1086,6 @@ fn draw_trace(pen: &mut Pen<'_>, p: Place, t: &Trace) {
     if let Some((sx, sy)) = run {
         pen.line(sx, sy, x1, sy, ink);
     }
-    // Unread spans: an outlined band, and its words where they fit.
     let mut said: Vec<(f64, f64)> = Vec::new();
     let mut j = 0;
     while j < cols {
@@ -1180,8 +1098,6 @@ fn draw_trace(pen: &mut Pen<'_>, p: Place, t: &Trace) {
             j += 1;
         }
         let (xa, xb) = (x0 + start as f64 * pitch, x0 + j as f64 * pitch);
-        // An outlined cell a bucket, as a strip's unread cells are; one
-        // outline when the buckets are too narrow to tell apart.
         if pitch * pen.s >= 3.0 {
             for k in start..j {
                 let xk = x0 + k as f64 * pitch;
@@ -1212,8 +1128,6 @@ fn draw_trace(pen: &mut Pen<'_>, p: Place, t: &Trace) {
             }
         }
     }
-    // The labels under the plot: the ends first, then each between that
-    // clears the ones placed.
     let base = y1 + 12.0;
     let mut placed: Vec<(f64, f64)> = Vec::new();
     let last = t.under.len().saturating_sub(1);
@@ -1246,8 +1160,7 @@ fn draw_trace(pen: &mut Pen<'_>, p: Place, t: &Trace) {
     }
 }
 
-/// A trace section: the trace growing in two columns, at `heights` in one,
-/// then its one-line form; only the one-line form while nothing was read.
+/// A trace section: the trace growing in two columns, at `heights` in one, then its one-line form.
 #[expect(
     clippy::too_many_arguments,
     reason = "a trace section's words and forms"
@@ -1293,8 +1206,6 @@ fn trace_section<'d>(
         forms,
     }
 }
-
-// Words the lens prints.
 
 /// Bytes printed alone, as the deck and its Details print them
 /// ([`words::bytes_lone`], §6.0, §7.7: "69 GB", "8.6 GB", "1.2 TB"), so a
@@ -1429,7 +1340,6 @@ fn trace_said(what: &str, unit: &str, t: &Trace, span: (i64, i64), loc: &Locale)
             j += 1;
         }
         if j < n {
-            // Within the trace's day a time needs no weekday.
             let at = |i: usize| {
                 let mut t = clock_s(start_ms + i as i64 * bucket_ms, loc.utc_offset_s);
                 t.truncate(5);
@@ -1451,8 +1361,6 @@ fn trace_said(what: &str, unit: &str, t: &Trace, span: (i64, i64), loc: &Locale)
 fn gib(bytes: u64) -> f64 {
     bytes as f64 / 1_073_741_824.0
 }
-
-// The lenses.
 
 /// What every lens's builder reads.
 #[derive(Clone, Copy)]
@@ -1591,7 +1499,6 @@ fn disk_doc(c: Ctx<'_>) -> LensDoc<'_> {
         ),
     };
     let answer = words::disk_wrong(snap, &c.loc).map(|t| {
-        // A yes takes the row's state ink, as the deck's row draws it.
         let ink = if t.starts_with("Yes") {
             words::state(Resource::Disk, snap, &c.loc).map_or(InkKind::Warn, |st| st.ink)
         } else {
@@ -1611,7 +1518,6 @@ fn disk_doc(c: Ctx<'_>) -> LensDoc<'_> {
         explainer,
         answer,
         sections,
-        // Two columns: Writing now over Where the space is (§7.7).
         two_order: vec![0, 1, 3, 2],
         keeps_first: true,
     }
@@ -1678,9 +1584,6 @@ fn space_section(c: Ctx<'_>) -> Section<'_> {
         .map(|f| ("Freed".to_owned(), f.clone()))
         .into_iter()
         .collect();
-    // The one-line form a short shell keeps (§11.3: Space now with Freed,
-    // always): "1.11 TB used · 0.89 TB free · freed 41 GB", the parts
-    // without their whole, then free alone.
     let pieces: Vec<&str> = space.split(" \u{b7} ").collect();
     let parts_line = pieces[..pieces.len().min(2)].join(" \u{b7} ");
     let free_line = pieces.get(1).copied().unwrap_or(&space).to_owned();
@@ -1885,7 +1788,6 @@ fn writing_section(c: Ctx<'_>) -> Section<'_> {
         };
         return line_section(&name, "Writing", vec![says.into()], true);
     }
-    // The bars stand against the writers' peak, rounded up to 1, 2 or 5.
     let peak = nice_up(writers.iter().map(|w| w.2).fold(1.0, f64::max));
     let rows: Vec<Row> = writers
         .iter()
@@ -2270,7 +2172,6 @@ fn classes_section(c: Ctx<'_>) -> Section<'_> {
         return line_section("Where it is", "Classes", vec!["not read yet".into()], false);
     };
     let s = &m.sample;
-    // (mem ink index, alpha, long word, short word, bytes)
     let classes: Vec<(usize, f32, &str, &str, u64)> = [
         (0, 1.0, "app", "app", Some(s.app)),
         (0, 0.7, "wired", "wired", Some(s.wired)),
@@ -2315,17 +2216,12 @@ fn classes_section(c: Ctx<'_>) -> Section<'_> {
             if *i == 3 {
                 continue;
             }
-            // The classes can sum past the total (compressed and cache
-            // overlap, and the reads are not atomic): the bar stops at its
-            // track's end.
             let w = (p.w * (*b as f64 / total as f64))
                 .min(p.x + p.w - x)
                 .max(0.0);
             pen.rect(x, by, w, bh, 0.0, a(inks.mem[*i], *al));
             x += w;
         }
-        // The legend: a swatch and a figure a class, the first with the
-        // unit, long words while they fit, then short, then as many as fit.
         let base = p.y + 39.0;
         let item = |pen: &Pen<'_>, word: &str, b: u64, k: usize| {
             let unit = if k == 0 { " GiB" } else { "" };
@@ -2628,7 +2524,6 @@ fn jobs_section(c: Ctx<'_>) -> Section<'_> {
         snap.tab(key)
             .map_or_else(|| "a tab".to_owned(), |t| t.label.clone())
     };
-    // (mark, its arc, who, the sentence, its short form)
     let mut lines: Vec<(WellMark, f32, String, String, String)> = Vec::new();
     let rank = |v: Verdict| match v {
         Verdict::Stuck => Some((0, WellMark::Stuck)),
@@ -2645,8 +2540,6 @@ fn jobs_section(c: Ctx<'_>) -> Section<'_> {
         .collect();
     rows.sort_by_key(|((order, _), r)| (*order, std::cmp::Reverse(r.quiet_ms.unwrap_or(0))));
     for ((_, mark), r) in rows {
-        // A quiet job with no φ read draws the deck's quarter arc (◔), never
-        // a full disc, which is the pressure dot.
         let frac = r
             .phi_milli
             .map_or(crate::stats_paint::QUIET_ARC, crate::stats_paint::quiet_arc);
@@ -2684,7 +2577,6 @@ fn jobs_section(c: Ctx<'_>) -> Section<'_> {
             format!("{} zombies", z.count),
         ));
     }
-    // Zombies rank second, after stuck jobs.
     lines.sort_by_key(|(mark, ..)| *mark);
     let marks = crate::stats_paint::marks_of(view);
     let summary = if marks.is_empty() {
@@ -2724,8 +2616,6 @@ fn jobs_section(c: Ctx<'_>) -> Section<'_> {
             };
             for (i, (mark, frac, who, said, short)) in lines.iter().take(shown).enumerate() {
                 let base = p.y + ROW0_BASE + PITCH * i as f64;
-                // The deck's inks for the same marks (§6.7): ⊘ ◔ ◇ in stuck
-                // ink, ☠ in warn.
                 let ink = match mark {
                     WellMark::Zombies => inks.warn_text,
                     _ => inks.stuck,
@@ -2755,7 +2645,6 @@ fn jobs_section(c: Ctx<'_>) -> Section<'_> {
         counts.dedup();
         for k in counts {
             let draw = std::rc::Rc::clone(&draw);
-            // A list cut short keeps a line for the count of the rest.
             let rows = if k < n { k + 1 } else { k };
             forms.push(form(rows_h(rows, false), move |pen, p| draw(pen, p)));
         }
@@ -2776,7 +2665,6 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
     let m = c.m;
     let cw = c.cw;
     let mut sections = Vec::new();
-    // Heat: the ramp, cold to hot.
     let heat_words = ["cold, under 5% of the maximum", "under 5%"];
     let hot_words = ["hot, 95% and over", "95%+"];
     sections.push(Section {
@@ -2799,8 +2687,6 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
                         "share of max".into(),
                     ],
                 );
-                // The ramp: seven steps over at most 280 pt, its ends' words
-                // under its ends.
                 let sw = ((p.w.min(280.0) + 2.0) / 7.0 - 2.0).max(4.0);
                 for k in 0..7 {
                     let ink = if pen.ic {
@@ -2841,7 +2727,6 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
             ),
         ],
     });
-    // Cells: over max, not read, now.
     let cells: Vec<(u8, [String; 2])> = vec![
         (
             0,
@@ -2907,7 +2792,6 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
             ),
         ],
     });
-    // Scopes: the bar's inks.
     let machine = c.loc.platform.machine();
     let mut said = format!("{machine} in grey, aterm in green, this tab in bright green.");
     if let Some(first) = said.get(..1) {
@@ -2956,7 +2840,6 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
             ),
         ],
     });
-    // Marks: a row's state beside its name.
     let marks: [(WellMark, &str); 6] = [
         (WellMark::Stuck, "stuck"),
         (WellMark::Quiet, "quiet"),
@@ -3003,8 +2886,6 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
                         x = 0.0;
                     }
                     let base = p.y + ROW0_BASE + PITCH * row as f64;
-                    // Each mark as the deck's well draws it: ◔ a quarter, in
-                    // stuck ink like ⊘ and ◇.
                     let ink = match kind {
                         WellMark::Zombies | WellMark::Low | WellMark::Dot => inks.warn_text,
                         _ => inks.stuck,
@@ -3028,7 +2909,6 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
             ),
         ],
     });
-    // Gestures.
     let gestures: Vec<String> = vec![
         "rest on a row for its close-up; click to pin it".into(),
         "command-I opens it from the keyboard".into(),
@@ -3098,7 +2978,6 @@ fn text_well(c: Ctx<'_>, focus: Instrument) -> LensDoc<'_> {
         _ => ("GPU", "Heat is how much of the time the GPU was busy."),
     };
     let details = words::details(res, snap, &c.loc);
-    // The sentence without its Details, which the right column lists.
     let mut sentence = words::row_sentence(res, snap, c.tab_key, &c.loc);
     for d in &details {
         if let Some(i) = sentence.find(&d.spoken) {
@@ -3113,8 +2992,6 @@ fn text_well(c: Ctx<'_>, focus: Instrument) -> LensDoc<'_> {
     let f = &snap.facts;
     match res {
         Resource::Network => {
-            // Details names the link and its rate; a link whose bytes are
-            // counted elsewhere says where.
             let counted = f.link.as_ref().and_then(|link| match link.kind {
                 LinkKind::Vpn => Some(format!(
                     "{}: VPN, its bytes are counted on the link that carries them",
@@ -3143,7 +3020,6 @@ fn text_well(c: Ctx<'_>, focus: Instrument) -> LensDoc<'_> {
                     ));
                 }
                 None => {
-                    // The long form says what the Details' short one does.
                     lines.retain(|l| !l.starts_with("plan limit"));
                     lines.push(
                         "No current plan reading: Claude Code writes one when you open /usage"
@@ -3162,8 +3038,6 @@ fn text_well(c: Ctx<'_>, focus: Instrument) -> LensDoc<'_> {
                 if !stages.is_empty() {
                     lines.push(stages.join(" \u{b7} "));
                 }
-                // Details says the memory in use; the lens adds what is
-                // allocated.
                 if let Some(a) = g.alloc_bytes {
                     lines.push(format!("{} GPU memory allocated", words::mem(a)));
                 }
@@ -3240,8 +3114,6 @@ fn lines_section<'d>(
     }
 }
 
-// Line 1, the explainer and the answer.
-
 /// A key hint's pieces: words, or a pair of drawn arrows.
 #[derive(Clone, Copy, Debug)]
 enum Seg {
@@ -3292,9 +3164,7 @@ fn hint_w(m: &FaceMetrics, hint: &[Seg]) -> f64 {
 /// Line 1, the explainer and the answer, each line drawn only while it
 /// clears the foot, and while it leaves `reserve` pt of body under the rule
 /// (the first section's one-line form, when the doc always keeps it); the
-/// last line drawn of a cut paragraph ends in "…". Answers where the body
-/// starts: the shell's height when nothing is left for it, unless room is
-/// reserved.
+/// last line drawn of a cut paragraph ends in "…".
 fn head(pen: &mut Pen<'_>, doc: &LensDoc<'_>, how: Opened, lw: f64, lh: f64, reserve: f64) -> f64 {
     let m = pen.m;
     let inks = pen.inks;
@@ -3339,8 +3209,6 @@ fn head(pen: &mut Pen<'_>, doc: &LensDoc<'_>, how: Opened, lw: f64, lh: f64, res
     }
     let mut last = LINE1_BASE;
     let mut base = EXPLAINER_BASE;
-    // A line at `base` puts the rule at `base + 7` and the body at
-    // `base + 12`.
     let fits = |base: f64| {
         base + DESCENT_EM * HEAD_PT <= limit && (reserve <= 0.0 || base + 12.0 + reserve <= limit)
     };
@@ -3378,8 +3246,7 @@ fn head(pen: &mut Pen<'_>, doc: &LensDoc<'_>, how: Opened, lw: f64, lh: f64, res
 
 /// A wrapped paragraph's `lines` from `x`, one a pitch from `*base`, while
 /// `fits` the baseline; the last line drawn ends in "…" when lines are left
-/// over. Leaves `*base` at the next line's baseline; answers how many were
-/// drawn.
+/// over.
 fn draw_lines(
     pen: &mut Pen<'_>,
     (x, right): (f64, f64),
@@ -3406,8 +3273,6 @@ fn draw_lines(
     shown
 }
 
-// Laying the lens.
-
 /// A laid lens: its prims, what a reader hears, and how its body went.
 pub(crate) struct LensLaid {
     pub(crate) prims: Vec<DrawPrim>,
@@ -3417,17 +3282,15 @@ pub(crate) struct LensLaid {
     pub(crate) explainer: String,
     /// The answer's and each placed section's heading and lines.
     pub(crate) wells: Vec<(String, String)>,
-    /// Each column's sections in the order it stacks them (one column, or
-    /// the left and the right), by index in the doc.
+    /// Each column's sections in the order it stacks them (one column, or the left and the right).
     pub(crate) stacks: Vec<Vec<usize>>,
-    /// Each column's placed sections, top down: the section and its form.
+    /// Each column's placed sections, top down.
     pub(crate) placed: Vec<Vec<(usize, usize)>>,
     #[cfg(test)]
     pub(crate) boxes: Vec<TextBox>,
 }
 
-/// Lay the lens `lens` on `lg` from `input`, measuring its words with `m`,
-/// drawing its prims when `draw`.
+/// Lay the lens `lens` on `lg` from `input`, measuring its words with `m`.
 pub(crate) fn lay_lens(
     lg: &LensGeom,
     input: &DeckInput<'_>,
@@ -3496,8 +3359,6 @@ pub(crate) fn lay_lens(
                 cw,
             };
             let doc = doc_for(c, lens.focus);
-            // A doc that always keeps its first section keeps room for its
-            // one-line form under the rule.
             let reserve = doc
                 .sections
                 .first()
@@ -3512,7 +3373,6 @@ pub(crate) fn lay_lens(
                 &doc.sections,
                 (&doc.two_order, doc.keeps_first),
             );
-            // The one-liners stacked in a column share the widest label's tab.
             let tab_of = |x: f64| {
                 placed
                     .iter()
@@ -3576,8 +3436,7 @@ pub(crate) fn lens_paint(lg: &LensGeom, input: &DeckInput<'_>, lens: &Lens) -> V
 }
 
 impl crate::App {
-    /// The lens card's geometry for `wid`, when a lens is open and the
-    /// window shows a form to hang it from.
+    /// The lens card's geometry for `wid`.
     pub(crate) fn lens_frame(
         &self,
         wid: crate::WindowId,
@@ -3615,7 +3474,7 @@ impl crate::App {
         )
     }
 
-    /// Whether `wid` can show a lens now: it draws a form and has room.
+    /// Whether `wid` can show a lens now.
     pub(crate) fn stats_lens_fits(&self, wid: crate::WindowId) -> bool {
         self.deck_frame(wid)
             .is_some_and(|f| self.lens_geom_for(wid, &f).is_some())
@@ -3642,8 +3501,7 @@ impl crate::App {
         }
     }
 
-    /// The open lens's fingerprint for `wid` (`0` when none), folded into the
-    /// stats term of the `RepaintKey`.
+    /// The open lens's fingerprint for `wid` (`0` when none).
     pub(crate) fn stats_lens_fp(&self, wid: crate::WindowId) -> u64 {
         use std::hash::{Hash, Hasher};
         let Some((lg, lens, f)) = self.lens_frame(wid) else {
@@ -3657,20 +3515,16 @@ impl crate::App {
         f.tab_key.hash(&mut h);
         f.tab_label.hash(&mut h);
         (f.dwc, f.contrast).hash(&mut h);
-        // The words are measured in the UI face: a new one re-lays them.
         std::sync::Arc::as_ptr(&deck_metrics()).hash(&mut h);
         h.finish().rotate_left(17) | 1
     }
 
-    /// Rasterize the open lens into `wid`'s `lens_card`, only when its
-    /// fingerprint moved; clear it when the lens is closed.
+    /// Rasterize the open lens into `wid`'s `lens_card`, only when its fingerprint moved.
     pub(crate) fn splice_stats_lens(&mut self, wid: crate::WindowId) {
         let Some((lg, lens, f)) = self.lens_frame(wid) else {
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.lens_card = None;
                 ws.stats_lens.rect = None;
-                // A lens the window can no longer show (the bars went off,
-                // the window shrank) is closed, not kept invisibly.
                 ws.stats_lens.open = None;
                 ws.stats_lens.leave_due = None;
             }
@@ -3706,8 +3560,7 @@ impl crate::App {
         });
     }
 
-    /// The open lens laid out, not drawn, for the accessibility tree: its
-    /// title, its explainer and its wells.
+    /// The open lens laid out, not drawn, for the accessibility tree.
     #[cfg(any(a11y_tree, test))]
     pub(crate) fn stats_lens_words(
         &self,
@@ -3751,7 +3604,6 @@ impl crate::App {
             return;
         }
         self.set_stats_lens(wid, Lens { focus, bar, how });
-        // The lens reads at 2 Hz: ask for the next reading now.
         self.vitals.next_due = Some(Instant::now());
     }
 
@@ -3769,9 +3621,7 @@ impl crate::App {
         was
     }
 
-    /// ⌘I (`ToggleStatsLens`): open the keyboard lens on the front window,
-    /// on the last instrument a lens showed there (CPU at first), or close
-    /// the open one.
+    /// ⌘I (`ToggleStatsLens`).
     pub(crate) fn toggle_stats_lens(&mut self) -> bool {
         let Some(wid) = self
             .frontmost_window
@@ -3815,12 +3665,7 @@ impl crate::App {
         ((0.0..f64::from(w)).contains(&fx) && (0.0..f64::from(h)).contains(&fy)).then_some((fx, fy))
     }
 
-    /// Pointer motion over the stats surfaces (§11.1, §11.2): arm the rest
-    /// over a row, the cores or the header (a hover lens moves to another
-    /// one only after a rest there; a pinned or keyboard lens stays put),
-    /// and start the hover lens's leave. True when the stats surfaces own the
-    /// pointer (the Deck's band, a sill instrument, the open lens), so the
-    /// motion never reaches the pane.
+    /// Pointer motion over the stats surfaces.
     pub(crate) fn stats_pointer_motion(&mut self, wid: crate::WindowId, now: Instant) -> bool {
         if self.windows.get(&wid).is_none_or(|ws| ws.overlay_open()) {
             return false;
@@ -3848,11 +3693,8 @@ impl crate::App {
             Some(hit) => {
                 ws.stats_lens.leave_due = None;
                 ws.stats_lens.rest = match open {
-                    // A pinned or keyboard lens stays where it was put.
                     Some(l) if l.how != Opened::Hover => None,
-                    // The hover lens shows this one already.
                     Some(l) if l.focus == hit.instrument() && l.bar == hit.bar() => None,
-                    // Re-armed at each motion: the hand pays for the lens.
                     _ => Some(Rest {
                         due: now + REST,
                         hit,
@@ -3872,8 +3714,7 @@ impl crate::App {
         owns
     }
 
-    /// The pointer left the window: no rest can complete, and a hover lens
-    /// starts its leave.
+    /// The pointer left the window.
     pub(crate) fn stats_pointer_left(&mut self, wid: crate::WindowId, now: Instant) {
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.stats_lens.rest = None;
@@ -3883,9 +3724,7 @@ impl crate::App {
         }
     }
 
-    /// A press: on the lens it pins a hover lens; on a row, the cores or the
-    /// header it pins the lens there (true: consumed); elsewhere it closes
-    /// an open lens (false: the press goes on, except on the Deck's band).
+    /// A press: on the lens it pins a hover lens.
     pub(crate) fn stats_press(&mut self, wid: crate::WindowId) -> bool {
         if self.windows.get(&wid).is_none_or(|ws| ws.overlay_open()) {
             return false;
@@ -3928,12 +3767,7 @@ impl crate::App {
         }
     }
 
-    /// The lens's keys (§11.4): ⌘I closes any lens; a pinned or keyboard
-    /// lens takes ←/→ (the instrument), ↑/↓ (the scope), ⌘C or `copy_chord`
-    /// (a press of the chord `[keybindings]` binds to Copy, Ctrl+Shift+C off
-    /// macOS: copy the sentence) and Esc, and Return pins the keyboard lens
-    /// (true: consumed). Any other key closes the lens and passes through
-    /// (false), as does every key over a hover lens. A bare modifier is inert.
+    /// The lens's keys: ⌘I closes any lens.
     pub(crate) fn stats_lens_key(
         &mut self,
         wid: crate::WindowId,
@@ -3993,13 +3827,11 @@ impl crate::App {
                 return true;
             }
         }
-        // Any other key closes the lens and goes on to the terminal.
         self.close_stats_lens(wid);
         false
     }
 
-    /// The open lens's sentence: its row's (`words::row_sentence`, with the
-    /// window's front tab), or How to read's.
+    /// The open lens's sentence.
     pub(crate) fn stats_lens_sentence(&self, wid: crate::WindowId) -> Option<String> {
         let open = self.windows.get(&wid).and_then(|ws| ws.stats_lens.open)?;
         let snap = self.vitals.snapshot.as_deref()?;
@@ -4017,8 +3849,7 @@ impl crate::App {
             .is_some_and(|text| crate::control::pbcopy(&text))
     }
 
-    /// The soonest lens deadline: a rest that opens it, a leave that closes
-    /// it. `None` when neither is armed.
+    /// The soonest lens deadline.
     pub(crate) fn stats_lens_deadline(&self) -> Option<Instant> {
         self.windows
             .values()
@@ -4027,11 +3858,8 @@ impl crate::App {
             .min()
     }
 
-    /// The `StatsLens` deadline's work, judged every wake: open a lens whose
-    /// rest completed with the pointer still on its instrument, close a hover
-    /// lens whose leave ran out.
+    /// The `StatsLens` deadline's work, judged every wake.
     pub(crate) fn service_stats_lens(&mut self, now: Instant) {
-        // Nothing armed or nothing due (the steady case): no work, and no
         // allocation on a wake that is not this deadline's.
         if self.stats_lens_deadline().is_none_or(|due| due > now) {
             return;

@@ -81,7 +81,7 @@ impl VerifiedRoster {
 
     /// Which master keyset member verified the roster.
     #[must_use]
-    pub fn master_index(&self) -> usize {
+    pub const fn master_index(&self) -> usize {
         self.master_index
     }
 }
@@ -193,6 +193,7 @@ impl Roster {
     /// **Step 4–5.** Parse a roster from bytes that passed master verification.
     pub fn parse(verified: &VerifiedRoster) -> Result<Self, RosterReject> {
         /// The schema alone, every other key ignored, so a newer schema is refused for its
+        /// version before the closed key set can call its new keys malformed.
         #[derive(Deserialize)]
         struct Head {
             schema: u32,
@@ -405,6 +406,7 @@ mod tests {
     }
 
     /// Emit and master-sign a roster, then take it back through `verify_roster` →
+    /// `Roster::parse`, so tests exercise the bytes.
     fn through_the_chain(r: &Roster, master: &Ed25519KeyPair, anchors: &[&str]) -> Roster {
         let raw = r.to_toml().unwrap().into_bytes();
         let sig = sign(master, &raw);
@@ -552,6 +554,7 @@ mod tests {
     }
 
     /// An older roster's master signature stays valid forever, so a client that has durably
+    /// seen seq 4 refuses seq 3.
     #[test]
     fn an_older_roster_is_refused_once_a_newer_one_has_been_seen() {
         let master = kp(&MASTER_SEED);
@@ -603,6 +606,7 @@ mod tests {
     }
 
     /// An old roster cannot be paired with a newer release, a newer roster with an older
+    /// release is admitted, and an unattributed release is refused.
     #[test]
     fn the_manifest_must_name_its_machine_and_not_outrun_its_roster_generation() {
         let a = Attribution {
@@ -644,6 +648,7 @@ mod tests {
     }
 
     /// A key the schema does not declare is refused, never dropped: `revoked` written after
+    /// the tables, a misspelt head key, an undeclared machine key.
     #[test]
     fn a_key_the_schema_does_not_declare_is_refused_not_dropped() {
         let master = kp(&MASTER_SEED);
@@ -701,6 +706,7 @@ mod tests {
     }
 
     /// Duplicate ids, empty ids and revocations, and an over-long roster are refused on both
+    /// parse and emission.
     #[test]
     fn malformed_rosters_are_refused_on_parse_and_on_emission() {
         let mut dup = roster();
@@ -744,6 +750,7 @@ mod tests {
     }
 
     /// One key under two ids would survive `machine-revoke` of either name (see
+    /// [`Roster::validate`]), so it is refused on parse and on emission.
     #[test]
     fn one_public_key_may_not_appear_under_two_machine_ids() {
         let shared = pk(&kp(&M3_SEED));
@@ -784,6 +791,7 @@ mod tests {
     }
 
     /// A malformed anchor member neither grants nor denies: a good master beside it verifies,
+    /// and the reported index is the one that did, so a stalled rotation is visible.
     #[test]
     fn a_malformed_anchor_member_neither_grants_nor_denies() {
         let master = kp(&MASTER_SEED);
@@ -800,6 +808,7 @@ mod tests {
     }
 
     /// An offset stamp is refused rather than read as UTC (which would move the deadline the
+    /// wrong way): `None`, lapsed at every caller, as `atpkg::flow` reads the same string.
     #[test]
     fn an_offset_stamp_is_refused_rather_than_silently_read_as_utc() {
         let mut r = roster();
@@ -820,6 +829,8 @@ mod tests {
     }
 
     /// The roster reads only the shape `roster_ops` emits: a fractional-seconds stamp is
+    /// lapsed, never truncated to its whole second (the strict `parse_utc`, not
+    /// `parse_utc_fractional`).
     #[test]
     fn a_fractional_stamp_is_lapsed_not_truncated() {
         let mut r = roster();

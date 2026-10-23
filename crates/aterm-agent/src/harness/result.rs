@@ -31,9 +31,14 @@ pub const SETTLE_WITHIN: Duration = Duration::from_secs(5);
 pub const SETTLE_EVERY: Duration = Duration::from_millis(150);
 
 /// How much of the transcript's end each read again takes while it waits:
+/// the newest turn's end row, and its prompt where the turn is short.
 const END_READ_BYTES: u64 = 256 * 1024;
 
 /// The misses a reply Claude Code had not written yet explains: either rule
+/// found the newest turn's reply missing or unfinished ([`reread`]) —
+/// `no-reply`, the one this build writes, and `no-marker`, an older build's
+/// (its marker rule wanted the retired token), whose turn is read again by
+/// today's rules.
 const LAG_MISSES: [&str; 2] = ["no-reply", "no-marker"];
 
 /// A worker's report, as its transcript holds it ([`report`]).
@@ -59,6 +64,8 @@ enum Item {
         uuid: String,
         session: String,
         /// The message's last content block is a tool's call: the turn goes
+        /// on past it (its result, then more of the model's words), so
+        /// whatever it said is no turn's last word ([`ends_in_call`]).
         calls: Option<bool>,
     },
 }
@@ -89,6 +96,7 @@ impl Item {
 }
 
 /// Whether a `message.content`'s last block is a tool's call (`tool_use`);
+/// `None` for a row that holds no block (the message's `calls` kept).
 fn last_block_calls(content: Option<&Value>) -> Option<bool> {
     match content {
         Some(Value::String(_)) => Some(false),
@@ -100,6 +108,11 @@ fn last_block_calls(content: Option<&Value>) -> Option<bool> {
 }
 
 /// Whether the last assistant message of `items` ends in a tool's call
+/// ([`Item::Said`]'s `calls`): its turn's reply is not written yet — the
+/// call's result and the words after it are still to come (Claude Code
+/// writes a turn's last rows a moment after its screen shows the turn
+/// over), so a preamble before the call (`Task is done; trying the result
+/// again`) is never taken for the turn's last word.
 fn ends_in_call(items: &[Item]) -> bool {
     items.iter().rev().find_map(|i| match i {
         Item::Said { calls, .. } => Some(*calls),
@@ -108,6 +121,7 @@ fn ends_in_call(items: &[Item]) -> bool {
 }
 
 /// The text parts of a `message.content`: the whole content when it is a
+/// string, else every `text` block's text.
 fn texts_of(content: Option<&Value>) -> Vec<String> {
     match content {
         Some(Value::String(t)) => vec![t.clone()],
@@ -122,6 +136,9 @@ fn texts_of(content: Option<&Value>) -> Vec<String> {
 }
 
 /// One transcript `line` as this reader parses it; `None` for a row that is
+/// no one's words — a subagent's (`isSidechain`), an `isMeta` row, a
+/// compaction summary, Claude Code's own API error — and for a line that is
+/// not JSON (a tail's cut first line, a half-written last one).
 fn row_of(line: &str) -> Option<Value> {
     let v = super::transcript::exchange(line).ok()?;
     let flag = |key: &str| v.get(key).and_then(Value::as_bool) == Some(true);
@@ -137,6 +154,8 @@ fn row_of(line: &str) -> Option<Value> {
 }
 
 /// A user row's words: its text (a paste read as what was pasted), Claude
+/// Code's tagged rows (`<task-notification>`, `<command-name>`, …) as they
+/// stand; `None` for a row with none (a tool's result).
 fn words_of(message: &Value) -> Option<String> {
     let typed = texts_of(message.get("content")).join("\n");
     let words = super::upgrade::typed_words(&typed);
@@ -144,6 +163,8 @@ fn words_of(message: &Value) -> Option<String> {
 }
 
 /// What one transcript `line` is to this reader; `None` for every row that
+/// is no one's words or opens no turn, and for a line that is not JSON (a
+/// tail's cut first line, a half-written last one).
 fn item_of(line: &str) -> Option<Item> {
     if !line.contains("\"user\"") && !line.contains("assistant") {
         return None;
@@ -183,6 +204,7 @@ fn item_of(line: &str) -> Option<Item> {
 }
 
 /// The conversation `jsonl` holds, in order: its prompts, and its assistant
+/// messages with each message's later rows merged into its first.
 fn items(jsonl: &str) -> Vec<Item> {
     let mut out: Vec<Item> = Vec::new();
     for line in jsonl.lines() {
@@ -233,6 +255,7 @@ fn final_said(items: &[Item]) -> Option<Report> {
 }
 
 /// One turn of a conversation: the words that opened it (`None` for the rows
+/// before a tail's first prompt) and what was said in it.
 struct TurnRows<'a> {
     prompt: Option<&'a str>,
     said: &'a [Item],
@@ -240,6 +263,7 @@ struct TurnRows<'a> {
 
 impl TurnRows<'_> {
     /// Whether a harness check opened this turn: a land act ([`Self::is_land`])
+    /// or an older build's done check.
     fn is_check(&self) -> bool {
         self.is_land() || self.prompt.is_some_and(is_done_check)
     }
@@ -250,12 +274,15 @@ impl TurnRows<'_> {
     }
 
     /// Whether what this turn said is a done ([`says_done`]: a defense, a
+    /// done phrase, `DONE`, the retired token — what the policy reads a done
+    /// claim by), or nothing.
     fn answered_done(&self) -> bool {
         final_said(self.said).is_none_or(|r| says_done(Some(&r.text)))
     }
 }
 
 /// `items` cut into turns, in order, the ones the live upgrade's
+/// announcement opened ([`ANNOUNCE_HEAD`]) left out: the worker's turns.
 fn worker_turns(items: &[Item]) -> Vec<TurnRows<'_>> {
     let mut out = Vec::new();
     let mut prompt = None;
@@ -321,14 +348,21 @@ pub fn report(jsonl: &str, by: DoneBy) -> Result<Report, &'static str> {
 /// What [`read`] read.
 struct Reading {
     /// The rule it read by: `by`, or [`DoneBy::Check`] where the newest turn
+    /// is a check.
     by: DoneBy,
     /// [`report`]'s answer.
     report: Result<Report, &'static str>,
     /// The user row that started the done edge's turn — the newest in the
+    /// settled tail, which stops at that turn's end ([`Opener::of`]: a
+    /// prompt, or a `<task-notification>` that woke the worker) — where
+    /// either rule found the newest turn's reply missing or unfinished
+    /// ([`LAG_MISSES`]): a reply Claude Code may not have written yet, which
+    /// [`reread`] reads again for that turn alone.
     turn: Option<String>,
 }
 
 /// [`report`], the rule it read by and the turn a lag miss names
+/// ([`Reading`]).
 fn read(jsonl: &str, by: DoneBy) -> Reading {
     let items = items(jsonl);
     let turns = worker_turns(&items);
@@ -356,6 +390,12 @@ fn read(jsonl: &str, by: DoneBy) -> Reading {
 }
 
 /// THE LANDING, `newest` the turn a harness check opened and `before` the
+/// turns before it ([the module's](self) rule): the REPORT — the final
+/// message of the turn before the check, the land acts of the episode
+/// passed over where `newest` is one (their replies are the landing's
+/// progress), and an older build's done checks answered with a done passed
+/// over — then what each passed-over done check's reply and `newest`'s say
+/// beyond the done ([`check_words`]), oldest first, a blank line apart.
 fn by_check(newest: &TurnRows<'_>, before: &[TurnRows<'_>]) -> Result<Report, &'static str> {
     if !newest.is_check() {
         return Err("no-check");
@@ -393,6 +433,11 @@ fn by_check(newest: &TurnRows<'_>, before: &[TurnRows<'_>]) -> Result<Report, &'
 }
 
 /// What a check turn's reply says beyond the done it answered with, as a
+/// plain turn is read ([`by_turn`]): its last message with words once lines
+/// that are the retired token alone are dropped ([`without_finished_lines`])
+/// and a bare `DONE` is read as none — its final message, or where that is a
+/// bare done, the last earlier one with words (a report, then a commit, then
+/// the token alone).
 fn check_words(turn: &TurnRows<'_>) -> Option<Report> {
     turn.said
         .iter()
@@ -408,6 +453,12 @@ fn check_words(turn: &TurnRows<'_>) -> Option<Report> {
 /// What one transcript line is to a turn's end ([`end_of`]).
 enum Mark {
     /// A main-chain user row with words — any of which can start Claude
+    /// Code on a turn: a prompt [`report`] reads (`prompt`), or one it
+    /// reads past — a background command's `<task-notification>`, which
+    /// wakes a manager that ended its turn to wait, a slash command, the
+    /// `isMeta` rows Claude Code starts a turn on itself (a peer session's
+    /// message, its continuation after a usage limit resets; `meta`) — the
+    /// row's id, and when it was written (`at`, unix milliseconds).
     Opens {
         uuid: Option<String>,
         prompt: bool,
@@ -417,11 +468,13 @@ enum Mark {
     /// A main-chain assistant row: the turn has run.
     Said,
     /// Claude Code's own main-chain `turn_duration` row, which it writes as a
+    /// turn ends, after the turn's last reply row.
     End,
 }
 
 impl Mark {
     /// Whether this row, read after a turn's own row, ENDS that turn —
+    /// `said`: an assistant row of the turn came before it.
     fn ends_turn(&self, said: bool) -> bool {
         match self {
             Mark::End => true,
@@ -433,6 +486,7 @@ impl Mark {
 }
 
 /// What `line` is to a turn's end; `None` for every other row, a
+/// subagent's rows and a row still half written among them.
 fn mark_of(line: &str) -> Option<Mark> {
     if line.contains("turn_duration") && is_turn_end(line) {
         return Some(Mark::End);
@@ -465,6 +519,7 @@ fn mark_of(line: &str) -> Option<Mark> {
 }
 
 /// A row's `timestamp` as Claude Code writes it (`2026-10-15T17:28:25.422Z`,
+/// UTC to the millisecond) in unix milliseconds; `None` for any other shape.
 fn stamp_ms(stamp: &str) -> Option<i64> {
     let secs = aterm_types::rfc3339::parse_utc_fractional(stamp)?;
     let digits = stamp.get(20..stamp.len() - 1).unwrap_or("");
@@ -477,6 +532,8 @@ fn stamp_ms(stamp: &str) -> Option<i64> {
 }
 
 /// Whether `line` can be a [`Mark::Opens`] or a [`Mark::End`] — a user row
+/// or an end row — read cheaply: once a turn has said something, its other
+/// assistant rows tell nothing more, and are not parsed.
 fn may_open_or_end(line: &str) -> bool {
     line.contains("\"user\"") || line.contains("turn_duration")
 }
@@ -492,11 +549,13 @@ fn is_turn_end(line: &str) -> bool {
 }
 
 /// THE DONE EDGE'S TURN, as its first read of the transcript places it
+/// ([`Opener::of`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Opener {
     /// The row that started it, by its id.
     Row(String),
     /// The read holds no such row: a tail inside one long turn, which every
+    /// later read's prompt follows.
     Before,
     /// Its row names no id (Claude Code's always do): each read's newest.
     Newest,
@@ -504,6 +563,9 @@ enum Opener {
 
 impl Opener {
     /// The done edge's turn in its first read, `jsonl`: THE NEWEST TURN
+    /// THE DONE WAS READ ON — begun by a row stamped no later than `shown`,
+    /// the harness's read that decided the done (unix milliseconds; `None`,
+    /// or a row with no stamp: no row is later).
     fn of(jsonl: &str, shown: Option<i64>) -> Self {
         let mut newest = Opener::Before;
         let mut ended = false;
@@ -538,12 +600,19 @@ impl Opener {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct End {
     /// Whether it has ended: a `turn_duration` row after its row, or the
+    /// next turn's start ([`Mark::ends_turn`]): a later prompt — one typed
+    /// after the turn was over, at its prompt again — or a tagged row after
+    /// the turn's words.
     ended: bool,
     /// Where its rows stop in the read (a line's start: just past its end
+    /// row, at the next turn's row, else the read's end); `None` where the
+    /// read does not hold its row (it began after it), so nothing is cut.
     upto: Option<usize>,
 }
 
 /// Where THE TURN `opener` started ends in the transcript read `jsonl`:
+/// after its row, the first `turn_duration` row or next turn's start
+/// decides ([`End`], [`Mark::ends_turn`]).
 fn end_of(jsonl: &str, opener: &Opener) -> End {
     let mut at = 0;
     let mut from = None;
@@ -599,6 +668,7 @@ fn end_of(jsonl: &str, opener: &Opener) -> End {
 }
 
 /// `jsonl` up to `end` ([`End::upto`]): the read with every row after the
+/// turn's end left out; whole where the read does not place the turn.
 fn upto(jsonl: String, end: End) -> String {
     match end.upto {
         Some(at) if at < jsonl.len() => jsonl[..at].to_string(),
@@ -702,6 +772,9 @@ pub fn settled(
 }
 
 /// A PLAIN TURN's rule on the newest turn ([`report`]): its final message
+/// with words, no token required — the lines that are the retired token
+/// alone dropped ([`without_finished_lines`]), and where nothing is left of
+/// the final message, the turn's last earlier message with words.
 fn by_turn(newest: &TurnRows<'_>) -> Result<Report, &'static str> {
     if ends_in_call(newest.said) {
         return Err("no-reply");
@@ -1010,6 +1083,8 @@ fn check_stem(stem: &str) -> std::io::Result<()> {
 }
 
 /// The result's `text` and its `source` written under `tasks` (0700, made
+/// where missing) as `<stem>.result.md` and its sidecar, each 0600 through a
+/// rename, the text first.
 fn write_snapshot(
     tasks: &Path,
     stem: &str,
@@ -1055,6 +1130,7 @@ fn framed(stamp: &str, bytes: usize, extra: &str, lines: &[String]) -> String {
 }
 
 /// `text` as reply lines, at most `max` characters of it, then — where it
+/// was cut — `… truncated; full: <path>`.
 fn head_lines(text: &str, max: usize, path: &Path) -> Vec<String> {
     let cut = text.char_indices().nth(max).map(|(at, _)| at);
     let shown = cut.map_or(text, |at| &text[..at]);
@@ -1073,6 +1149,8 @@ fn head_lines(text: &str, max: usize, path: &Path) -> Vec<String> {
 }
 
 /// `text` as reply lines, its last `max` characters, led — where anything
+/// before them was cut, or the read did not reach the file's start — by
+/// `… earlier turns cut; the transcript: <path>`.
 fn tail_lines(text: &str, max: usize, transcript: &Path, whole: bool) -> Vec<String> {
     let skip = text.chars().count().saturating_sub(max);
     let at = text
@@ -1096,6 +1174,7 @@ fn tail_lines(text: &str, max: usize, transcript: &Path, whole: bool) -> Vec<Str
 }
 
 /// At most the last `bytes` of the regular file at `path`, and whether that
+/// is the whole file.
 fn tail_of(path: &Path, bytes: u64) -> Option<(String, bool)> {
     let mut f = super::footer::open_regular(path)?;
     let len = f.metadata().ok()?.len();
@@ -1144,6 +1223,8 @@ fn source_of(path: &Path) -> Option<Source> {
 }
 
 /// [`answer`] over a result read from `transcript` (`session`, row `uuid`):
+/// its `text()` (`None`: unreadable) for `result`, the thread read now for
+/// `result full`.
 fn reply(
     session: &str,
     uuid: &str,

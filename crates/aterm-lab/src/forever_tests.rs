@@ -28,6 +28,8 @@ fn scripted_reply(spec: &J, users: &[String]) -> Option<String> {
 }
 
 /// The reply the lab's spec picks for a conversation of `chain` whose
+/// user texts after its prompt are `acts` (every mode's rules at once: no
+/// chain's word holds another's).
 fn reply(chain: Chain, acts: &[&str]) -> Option<String> {
     let mut u = vec![chain.prompt()];
     u.extend(acts.iter().map(|s| (*s).to_string()));
@@ -109,6 +111,8 @@ fn each_chain_is_scripted_turn_by_turn_by_the_harness_acts() {
 }
 
 /// C4'S CONTINUATION IS THE LAB'S `[harness] continue_text`, read back by
+/// the one reader of that table as the owner's two paragraphs, blank line
+/// and all, with no warning.
 #[test]
 fn the_owners_continuation_is_the_labs_continue_text_blank_line_and_all() {
     use aterm_agent::supervise::SupervisorConfig;
@@ -132,6 +136,8 @@ fn the_owners_continuation_is_the_labs_continue_text_blank_line_and_all() {
 }
 
 /// C4 as a live run that passes it records it: the work reply, its back-off,
+/// the owner's continuation typed as one line and sent so, its reply (the
+/// done claim) read and watched 20 s more.
 fn owner_continued() -> Seen {
     let owner = aterm_agent::supervise::limit::one_line(OWNER_CONTINUE);
     Seen {
@@ -217,6 +223,7 @@ fn cruise_o_passes_only_where_the_owners_continuation_is_one_line_and_never_the_
 }
 
 /// C4'S WITNESS reads the user texts of the conversation's own requests
+/// that carry the owner's words, in each API's shape, each once.
 #[test]
 fn the_owners_words_are_read_from_the_conversations_requests() {
     let token = Chain::CruiseO.token();
@@ -246,6 +253,7 @@ fn the_owners_words_are_read_from_the_conversations_requests() {
 }
 
 /// C4'S WITNESS READS THE TURNS ALONE ([`dumps_in`]): a side call's copy of
+/// the conversation is no text that reached the agent.
 #[test]
 fn the_owners_words_are_read_from_the_turns_never_a_side_calls_copy() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -395,6 +403,7 @@ fn the_request_readers_find_each_apis_user_texts() {
 }
 
 /// Whether a request carries a new harness turn past `baseline`, as
+/// [`StubSeen::of`] counts one.
 fn new_harness_turn(body: &[u8], tok: &str, baseline: usize) -> bool {
     StubSeen::of(
         &marked_turns(body, tok)
@@ -424,6 +433,10 @@ fn messages(tok: &str, texts: &[&str]) -> Vec<u8> {
 }
 
 /// THE STUB'S WITNESS COUNTS THE HARNESS'S TURNS: a request after the
+/// landing holding more harness-marked user texts than the conversation held
+/// at it is a new turn of the harness's — a new act, and THE SAME ACT TYPED
+/// AGAIN (the likeliest regression, which a reader that skipped texts typed
+/// before missed).
 #[test]
 fn only_a_new_harness_turn_counts_after_the_landing() {
     let tok = Chain::LandA.token();
@@ -462,6 +475,7 @@ fn only_a_new_harness_turn_counts_after_the_landing() {
 }
 
 /// The witness's baseline is the most harness turns any request before the
+/// landing held, or the acts typed, whichever is more; Off's is none.
 #[test]
 fn the_stub_witness_counts_from_the_landing() {
     let dumps = [(100, 0), (200, 1), (300, 2), (400, 2), (500, 3)];
@@ -496,6 +510,10 @@ fn no_scripted_reply_opens_like_a_muse_tool_row() {
 }
 
 /// P2 LIVE: every reply of the P2 chains opens `Wrote ` with a SENTENCE after
+/// it, the shape Muse Code's fixed reader reads as the agent's words
+/// (`aterm_phase::muse`'s `names_a_path` is false: its first word holds no
+/// `/`, `.` or `…`, it is no lone word, and no `(+` or `— ` row tail follows
+/// it); before the fix any `Wrote ` head was its tool row.
 #[test]
 fn the_p2_replies_open_wrote_with_a_sentence_after_it() {
     let mut n = 0;
@@ -520,6 +538,11 @@ fn the_p2_replies_open_wrote_with_a_sentence_after_it() {
 }
 
 /// The coverage chains' words read as the product reads them: the question
+/// is a question (no choice, nothing destructive) and no done claim; the
+/// person's reply asks and claims nothing; P2's replies carry the claim, the
+/// need and the clean defenses L14 and C3 need; Land's answer opens with the
+/// key the stub picks its yield by; and the harness's answers, unmarked,
+/// still count as its turns.
 #[test]
 fn the_coverage_replies_read_as_their_scenarios_need() {
     assert_eq!(classify_said(Some(QUESTION)), Said::Question);
@@ -613,6 +636,8 @@ fn the_coverage_chains_are_scripted_turn_by_turn() {
 }
 
 /// A walled run's Gemini CLI runs in a zone whose offset is not the
+/// machine's, and is a half-hour one, so the reset its dialog names is placed
+/// right only by reading its zone ([`foreign_tz`]).
 #[test]
 fn a_walled_gemini_cli_runs_in_a_zone_not_the_machines() {
     let now = crate::util::now_ms() / 1000;
@@ -626,6 +651,9 @@ fn a_walled_gemini_cli_runs_in_a_zone_not_the_machines() {
 }
 
 /// W2's wall resets far enough past the land act (two minutes on), its take
+/// window (half a minute) and every command the hide may enter (about four
+/// seconds each) that the notice is out of sight at least
+/// [`HIDE_BEFORE_RESET_MS`] before the reset; W1's is as it was.
 #[test]
 fn the_remembered_walls_reset_leaves_room_for_the_hide() {
     assert_eq!(Chain::Wall.wall_ahead_ms(), WALL_AHEAD_MS);
@@ -638,6 +666,7 @@ fn the_remembered_walls_reset_leaves_room_for_the_hide() {
 }
 
 /// W1's wall resets on a whole minute at least four minutes ahead, so the
+/// land act two minutes on meets it and Muse Code's words name its reset.
 #[test]
 fn the_wall_resets_on_a_whole_minute_past_the_land_act() {
     for now in [1_792_500_010_000_i64, 1_792_500_059_999, 1_792_500_060_000] {
@@ -895,6 +924,9 @@ fn the_modes_pick_their_chains_and_off_runs_in_each() {
 }
 
 /// THE P4 CHAINS ANSWER AT ONCE, THE OTHERS PACED: each rule of an instant
+/// chain carries a zero delay and pace of its own, which the stub's reply
+/// takes over the spec's; a paced chain's rules carry none, so its replies
+/// wait [`REPLY_DELAY_MS`].
 #[test]
 fn the_instant_chains_answer_at_once_and_the_others_are_paced() {
     let s = spec(&Chain::ALL);
@@ -1004,6 +1036,8 @@ fn words_and_escapes_are_read() {
 }
 
 /// `status`'s `end= end_seen= end_cheered=` (§12.5.2) are read by key, and
+/// a line from an aterm without them (main before 5a) reads as before: its
+/// old keys the same, the new ones absent — never `-`, which says "no end".
 #[test]
 fn the_end_fields_are_read_by_key_and_an_older_line_reads_as_before() {
     let tail = "task_state=done task_seq=3 editing=0 gen=1 seq=9";
@@ -1213,7 +1247,7 @@ fn the_words_are_read() {
 
 const T0: i64 = 1_000_000;
 
-/// A journal line at `t` after [`T0`]. A back-off's `until=x` reads as the
+/// A journal line at `t` after [`T0`].
 fn j(t: i64, line: &str) -> (i64, String) {
     let line = match line.split_once("until=x ") {
         Some((head, words)) => match words
@@ -1315,6 +1349,8 @@ fn needs_nudge() -> String {
 }
 
 /// L1, L3 and L5 as a live run that passes them records them: the landing
+/// at +375 s closed three short turns, so it is watched past the ladder's
+/// next step (8 min) and a minute more.
 fn landed_a() -> Seen {
     Seen {
         journal: vec![
@@ -1388,6 +1424,9 @@ fn land_a_passes_on_a_landing_with_its_need_raised_then_cleared() {
 }
 
 /// THE WATCH AFTER A LANDING RUNS PAST THE LADDER'S NEXT STEP: the step
+/// the streak at the landing would take next (2 min doubling: 8 min after
+/// three short turns, 16 after four), a minute more, at least 90 s; none for
+/// a worker its manager waits on through its first three.
 #[test]
 fn a_landing_is_watched_past_the_ladders_next_step() {
     let s = landed_a();
@@ -1495,6 +1534,7 @@ fn land_a_fails_what_it_must_and_says_what_it_did_not_see() {
 }
 
 /// The repository suffix the product types for `repo` (`repo_work_suffix`
+/// over the probe's own parse of what `git` says of it).
 fn repo_suffix(repo: Repo) -> String {
     let r = "/r/proj/land-x";
     let work = match repo {
@@ -1513,6 +1553,7 @@ fn open_suffix() -> String {
 }
 
 /// L2, L4 and L8–L11 as a live run that passes them records them: the
+/// nudge, and its yield read and waited on.
 fn nudged(suffix: &str) -> Seen {
     Seen {
         journal: vec![
@@ -1690,6 +1731,8 @@ fn land_d_passes_unlanded_with_the_need_raised_and_carried_on() {
 }
 
 /// L7 as a live run that passes it records it: the record `working` before
+/// the agent started, the land act at once (its manager waits: no back-off),
+/// the landing at its yield, the record `done why=landed`.
 fn tasked() -> Seen {
     Seen {
         journal: vec![
@@ -1961,6 +2004,9 @@ fn off_passes_only_with_no_supervisor_and_quiet_past_a_four_minute_step() {
 }
 
 /// P4L as a live run that passes it records it: the first prompt's reply
+/// read at once and backed off (one short turn), `land@v1` typed, its clean
+/// defense judged 1 s after it — the landing — and nothing typed through
+/// the ladder's next step (two short turns: 4 min) and a minute more.
 fn instant_landed() -> Seen {
     Seen {
         journal: vec![
@@ -2075,6 +2121,8 @@ fn p4_land_passes_only_where_every_instant_reply_is_judged_once() {
 }
 
 /// P4C as a live run that passes it records it: the done claim read at once
+/// and backed off, the check typed, its defense read 0.6 s after it and
+/// backed off (two short turns), the next point's act after it.
 fn instant_cruised() -> Seen {
     Seen {
         journal: vec![
@@ -2165,6 +2213,8 @@ fn p4_cruise_passes_only_where_the_checks_instant_defense_is_its_answer() {
 }
 
 /// P4P's record: the check's instant defense judged and decided at +121.7 s,
+/// a person's prompt at +127 s, its instant reply judged at +127.9 s and
+/// decided there (an 8 min back-off), the act at its due.
 fn instant_asked() -> Seen {
     let mut s = instant_cruised();
     s.journal.truncate(5);
@@ -2334,6 +2384,8 @@ fn the_persons_prompt_has_its_own_instant_reply() {
 }
 
 /// P3'S REPORT: a tab whose first point record follows its first prompt
+/// reports it, the first back-off at 2 min, and no point record before the
+/// prompt.
 #[test]
 fn a_point_before_the_first_prompt_is_reported_and_none_after_it() {
     let clean = Seen {
@@ -2423,6 +2475,9 @@ fn the_window_witness_counts_inside_its_window() {
 }
 
 /// L12 as a live run that passes it records it: land@v1 at +125 s, the
+/// question read, Land's answer after the 4 min step, its clean defense
+/// landing the task at +375 s, watched past the next step (8 min) and a
+/// minute more.
 fn answered() -> Seen {
     Seen {
         journal: vec![
@@ -2565,6 +2620,9 @@ fn land_q_passes_on_lands_answer_and_the_landing_at_its_yield() {
 }
 
 /// L13 as a live run that passes it records it: the person's Enter at +10 s,
+/// their answer left to them (LEFT, task=theirs; Claude Code's skipped row),
+/// nothing typed to the orchestrator's turn at +310 s, then Land's act after
+/// its 2 min step and the landing.
 fn left_to_them() -> Seen {
     Seen {
         journal: vec![
@@ -2718,6 +2776,7 @@ fn land_p_passes_only_on_a_persons_exchange_left_to_them() {
 }
 
 /// `--window` UNDER `LAB_RESTORE=1` IS A USAGE ERROR (exit 2), refused
+/// before any lab is made, never a harness's COULD NOT RUN.
 #[test]
 fn forever_window_under_the_restore_seam_is_a_usage_error_not_could_not_run() {
     let restored = crate::lab::UpOpts {
@@ -2747,6 +2806,8 @@ fn forever_window_under_the_restore_seam_is_a_usage_error_not_could_not_run() {
 }
 
 /// L13 TYPED THROUGH HWKEY (`forever --window`): the stamp is the keys' and
+/// theirs alone (`status human_seq=` moved by exactly the presses `hwkey`
+/// posted), and the verdict says how the prompt was typed.
 #[test]
 fn land_p_typed_through_hwkey_passes_only_where_the_keys_account_for_the_stamp() {
     let l13 = |s: &Seen| one(Chain::LandP, s, "claude", Scenario::L13);
@@ -2826,6 +2887,7 @@ fn land_p_typed_through_hwkey_passes_only_where_the_keys_account_for_the_stamp()
 }
 
 /// Every character of land-p's prompt is a key `hwkey` names (printable
+/// U.S.
 #[test]
 fn land_p_s_prompt_is_typed_key_by_key_through_hwkey() {
     let prompt = Chain::LandP.prompt();
@@ -2907,6 +2969,7 @@ fn wrote_c_passes_only_where_the_done_claim_is_read() {
 }
 
 /// P5 as a live run that passes it records it: the record `working` from
+/// before the agent started to age 152 s, then landed.
 fn started() -> Seen {
     let rec = |age: i64| {
         format!(
@@ -2977,6 +3040,7 @@ fn land_t_passes_on_a_record_working_past_its_startup_deadline() {
 }
 
 /// The `result` header a worker of `program` answers with: Claude Code's
+/// from its transcript, every other harness's from its screen.
 fn result_head(program: &str) -> String {
     if program == "claude" {
         "OK 3 source=transcript session=8f0e uuid=41aa bytes=129".into()
@@ -2986,6 +3050,9 @@ fn result_head(program: &str) -> String {
 }
 
 /// L15 as a live run that passes it records it: L7's landing on a worker
+/// of `program` the manager `@s-mgr` (running it) spawned, `meta` naming
+/// it, its wait returning at the landing, the result as stubbed from the
+/// source its harness has.
 fn spawned_on(program: &str) -> Seen {
     let mut s = tasked();
     s.task[0].1 =
@@ -3150,6 +3217,8 @@ fn a_worker_shells_gemini_runs_the_labs_build_and_its_project_is_trusted() {
 }
 
 /// CAP as a live run that passes it records it: land@v1 at +125 s, the next
+/// point escalated at +370 s naming the cap, nothing typed for the hour, the
+/// orchestrator's turn 30 s past it, and the nudge after its 8 min step.
 fn capped() -> Seen {
     let turn = 125_000 + 3_600_000 + 30_000;
     Seen {
@@ -3327,6 +3396,8 @@ fn cap_passes_on_acts_stopped_for_the_hour_and_resumed_at_a_new_point() {
 }
 
 /// The lab's drive of the coverage chains: each orchestrator turn once, at
+/// its time; CAP watched to an act in the hour or a minute past the act after
+/// the turn.
 #[test]
 fn the_orchestrator_turns_come_once_at_their_time_and_cap_is_watched_to_its_verdict() {
     let mut s = left_to_them();
@@ -3367,6 +3438,8 @@ fn the_orchestrator_turns_come_once_at_their_time_and_cap_is_watched_to_its_verd
 }
 
 /// W1's records: the wall raised at the first point (+6 s), land@v1 meeting
+/// it, the limited point read and waited out, the resume typed past the
+/// reset (+300 s) and its grace, and the clean defense landing it.
 const WALL_END: &str = "wall-wait-end@v1";
 
 fn walled() -> Seen {
@@ -3604,6 +3677,8 @@ fn wall_passes_on_nothing_typed_into_it_gone_on_past_it_and_landed() {
 }
 
 /// AN ACT BEFORE THE DUE ITS BACK-OFF NAMED FAILS EVERY SCENARIO OF ITS
+/// CHAIN (F10 of the review of `b9/forever-gaps`: no verdict compared an act
+/// with its `WAITING`'s `until=`).
 #[test]
 fn an_act_before_the_due_its_back_off_named_fails_every_scenario_of_its_chain() {
     let moved = |t: i64| {
@@ -3657,6 +3732,8 @@ fn an_act_before_the_due_its_back_off_named_fails_every_scenario_of_its_chain() 
 }
 
 /// AN ACT TYPED TWICE FAILS ANY CHAIN (F12 of the review of
+/// `b9/forever-gaps`: only P4's chains asked): `land-b`'s nudge typed again
+/// a second after itself, no point judged between, fails L2 (it passed).
 #[test]
 fn an_act_typed_twice_with_no_point_between_fails_any_chain() {
     let open = open_suffix();
@@ -3690,6 +3767,10 @@ fn an_act_typed_twice_with_no_point_between_fails_any_chain() {
 }
 
 /// P3 IS A VERDICT (F11 of the review of `b9/forever-gaps`: it was reported
+/// only): a point judged before the first prompt, or a first point that
+/// closed two short turns, fails every scenario of the chain (each passed
+/// it); the first point closing one passes, and so does one closing none
+/// that was left to its person (L13's, above).
 #[test]
 fn a_point_before_the_first_prompt_or_a_late_ladder_fails_the_chain() {
     let mut s = landed_a();
@@ -3712,6 +3793,10 @@ fn a_point_before_the_first_prompt_or_a_late_ladder_fails_the_chain() {
 }
 
 /// THE INSTANT CRUISE CHAIN IS WATCHED UNTIL IT GOES ON (F5 of the review of
+/// `b9/forever-gaps`: the watch ended 3 s after the person's point was
+/// decided, so nothing after it was ever judged): past the decision, until
+/// an act follows it (3 s after that act), or past its back-off's due and a
+/// minute more.
 #[test]
 fn the_instant_cruise_tab_is_watched_until_the_chain_goes_on() {
     let tab = |seen: Seen| Tab {
@@ -3740,6 +3825,7 @@ fn the_instant_cruise_tab_is_watched_until_the_chain_goes_on() {
 }
 
 /// W1's records with everything from the resume on moved `by` ms later: the
+/// first act past the reset and the landing after it.
 fn walled_late(by: i64) -> Seen {
     let mut s = walled();
     for (t, _) in s.journal.iter_mut().skip(5) {
@@ -3756,6 +3842,9 @@ fn walled_late(by: i64) -> Seen {
 }
 
 /// W1 holds each harness to its OWN program's grace past the reset
+/// ([`wall_grace_ms`]): a resume 400 s past the reset is in time on Claude
+/// Code (150 s grace: its own continue comes 30 to 90 s past the reset), and
+/// persistence lost on the programs with no auto-continue (60 s).
 #[test]
 fn the_walls_deadline_is_the_programs_own_grace() {
     let reset = T0 + 300_000;
@@ -3786,6 +3875,11 @@ fn the_walls_deadline_is_the_programs_own_grace() {
 }
 
 /// W1 WHERE THE PROGRAM GOES ON BY ITSELF (the review of the W1 judge on
+/// Claude Code): Claude Code's own continuation reached the stub past the
+/// reset ([`Cover::went_on_ms`]), and the loop's `usage-resume@v1` came after
+/// it, typed into a conversation the vendor had already carried past the
+/// wall — a double continue (`r21amc15b`'s class): FAIL by name, though it
+/// came inside the grace and the defense landed.
 #[test]
 fn an_act_after_the_programs_own_continuation_fails_w1() {
     let reset = T0 + 300_000;
@@ -3823,6 +3917,9 @@ fn an_act_after_the_programs_own_continuation_fails_w1() {
 }
 
 /// THE PROGRAM'S OWN CONTINUATION IN THE STUB'S DUMPS ([`first_continuation`],
+/// [`carries_continuation`]): the first request of the conversation from the
+/// wall's lift on whose user texts hold Claude Code's words for it
+/// ([`CLAUDE_CONTINUES`], as 2.1.306 sent them beside the cut act).
 #[test]
 fn the_programs_own_continuation_is_the_first_request_holding_its_words() {
     let tok = Chain::Wall.token();
@@ -3856,10 +3953,14 @@ fn the_programs_own_continuation_is_the_first_request_holding_its_words() {
 }
 
 /// The reason the policy escalates Gemini CLI's usage-limit dialog with
+/// (`approval.rs`'s `foreign_limit`).
 const GEMINI_LIMIT_HELD: &str = "Gemini CLI's usage limit: neither Keep trying nor Stop is \
      pressed; /stats model in this tab says which limit holds it";
 
 /// W1 on Gemini CLI as the live lab drew it (Gemini CLI 0.46.0 on the stub's
+/// `limit:code_assist`, 2026-10-21): the land act met by the usage-limit
+/// dialog, a box (`EVENT prompt … kind=usage-limit`), escalated to a person
+/// (`needs=ask`), and nothing going on past the reset.
 fn gemini_walled() -> Seen {
     let mut s = walled();
     s.journal.truncate(3);
@@ -3879,6 +3980,8 @@ fn gemini_walled() -> Seen {
 }
 
 /// A usage-limit DIALOG reads the wall (Gemini CLI draws its limit as a box,
+/// not a notice at a turn's end), and the dialog handed to a person is a stall
+/// W1 FAILS by name — never "typed into the wall", never unobserved.
 #[test]
 fn a_usage_limit_dialog_reads_the_wall_and_its_escalation_fails_w1() {
     let w1 = |s: &Seen| one(Chain::Wall, s, "gemini", Scenario::W1);
@@ -3914,6 +4017,12 @@ fn a_usage_limit_dialog_reads_the_wall_and_its_escalation_fails_w1() {
 }
 
 /// W1's records on Gemini CLI kept trying (`limit-retry@v1`): the land act
+/// met by the account's usage-limit dialog, a box read as the wall's point,
+/// its reset named in the CLI's own zone (`1:05 PM GMT+5:30`, the walled
+/// run's `TZ`), waited on to the end of the minute it names and a minute's
+/// grace past the reset (+300 s, its wait ledgered `waiting`), its `Keep
+/// trying` pressed then (ledgered `approved`), and the turn it sent again
+/// landing the task.
 fn gemini_kept_trying() -> Seen {
     let mut s = walled();
     s.journal.truncate(3);
@@ -3968,6 +4077,9 @@ fn gemini_kept_trying() -> Seen {
 }
 
 /// GEMINI CLI KEPT TRYING PASSES W1: the usage-limit dialog takes no typing,
+/// so the harness going on past the wall is its `Keep trying` pressed past
+/// the reset (`limit-retry@v1`, ledgered `approved`) at the due its wait
+/// named, and the turn that press sent landing the task.
 #[test]
 fn a_keep_trying_pressed_past_the_reset_goes_on_past_the_wall() {
     let w1 = |s: &Seen| one(Chain::Wall, s, "gemini", Scenario::W1);
@@ -4017,10 +4129,17 @@ fn a_keep_trying_pressed_past_the_reset_goes_on_past_the_wall() {
 }
 
 /// The reason the loop raises its badge for Gemini CLI's usage-limit dialog
+/// that names no reset (`approval.rs`'s `limit_no_reset_reason`).
 const GEMINI_NO_RESET: &str = "Gemini CLI's usage limit names no reset: Keep trying is tried on a \
      back-off ladder; /stats model says which limit";
 
 /// W1's records on Gemini CLI's per-day quota (`--mode wall-day`): the land
+/// act met by the usage-limit dialog that names no reset (+140 s), the person
+/// told at once (`ESCALATED`, its `escalated` row, `needs=ask`) beside the
+/// ladder's own wait (`WAITING … rule=limit-retry@v1 … on the back-off
+/// ladder`, ledgered `waiting`) for its first rung 30 min on; the lab's wall
+/// lifted at +25 min; `Keep trying` pressed at the rung (+1941 s), the badge
+/// cleared, the task landed.
 fn gemini_day_kept_trying() -> Seen {
     let mut s = walled();
     let due = 140_000 + 1_800_000;
@@ -4085,6 +4204,10 @@ fn gemini_day_kept_trying() -> Seen {
 }
 
 /// THE PER-DAY QUOTA'S DIALOG KEPT TRYING ON ITS LADDER PASSES W1
+/// (`--mode wall-day`, T5 of the review of `b9/walls-2`): the person told
+/// beside the ladder's own wait is FOREVER's NEEDS YOU, no stall, and its
+/// `needs=ask` no reply's need; the harness goes on at the ladder's first
+/// due, past the lab's lift, and the deadline counts from there.
 #[test]
 fn a_per_day_dialogs_badge_is_no_stall_and_its_ladder_goes_on() {
     let w1 = |s: &Seen| one(Chain::WallDay, s, "gemini", Scenario::W1);
@@ -4126,6 +4249,12 @@ fn a_per_day_dialogs_badge_is_no_stall_and_its_ladder_goes_on() {
 }
 
 /// W1's records on Gemini CLI's per-day quota standing past the ladder's
+/// first rung (`--mode wall-climb`): [`gemini_day_kept_trying`]'s dialog and
+/// badge, its first `Keep trying` at the rung (+1941 s) in the wall, the
+/// dialog drawn again (`… (drawn again after its Keep trying, try 1)`, its
+/// next due 2 h on), the badge standing (`needs=ask`); the lab's wall
+/// lifted at +45 min; the climbed try (+9142 s) got through, the badge
+/// cleared, the task landed, watched past the ladder's window after it.
 fn gemini_day_climbed() -> Seen {
     let mut s = gemini_day_kept_trying();
     let due = 140_000 + 1_800_000;
@@ -4186,6 +4315,11 @@ fn gemini_day_climbed() -> Seen {
 }
 
 /// THE LADDER CLIMBED WHILE NEEDS YOU STOOD PASSES W1 (`--mode
+/// wall-climb`): the try at the first rung came in the wall — no act typed
+/// into it — and was answered by the dialog drawn again; the next due
+/// climbed (2 h after that try, past the first rung's 30 min); the badge
+/// stood (`needs=ask` at every status read, no `CLEARED`) until the climbed try got
+/// through, which took it down; the deadline counts from that climbed due.
 #[test]
 fn the_per_day_dialogs_ladder_climbs_while_needs_you_stands() {
     let w1 = |s: &Seen| one(Chain::WallClimb, s, "gemini", Scenario::W1);
@@ -4254,10 +4388,13 @@ fn the_per_day_dialogs_ladder_climbs_while_needs_you_stands() {
 }
 
 /// Muse Code's `/rules` output, entered once ([`HIDE_COMMAND`]; measured on
+/// 1.4.10, 2026-10-21).
 const RULES_ROWS: &str =
     "  Rules loaded this session (in precedence order):\n  user: none\n  project: none\n";
 
 /// Muse Code's usage wall ([`USAGE_WALL`](aterm_phase::muse::fixtures::USAGE_WALL))
+/// split at its composer frame: the rows above it, and the frame with what
+/// follows.
 fn wall_split() -> (String, String) {
     let body = aterm_phase::muse::fixtures::USAGE_WALL
         .split_once('\n')
@@ -4267,6 +4404,8 @@ fn wall_split() -> (String, String) {
 }
 
 /// Muse Code's usage wall taken off the screen ([`notice_gone`]): `/rules`
+/// output over the composer, the notice's words scrolled out of sight (the
+/// tail of its wrapped reset still at the top, as measured).
 #[test]
 fn the_notice_is_gone_only_when_no_row_draws_it() {
     let (above, frame) = wall_split();
@@ -4284,6 +4423,8 @@ fn the_notice_is_gone_only_when_no_row_draws_it() {
 }
 
 /// The hide's guard ([`menu_offers`]): Muse Code's composer holding
+/// `/rules` with its argument hint, the menu's first row that command — as
+/// measured.
 #[test]
 fn the_hide_enters_only_the_command_the_menu_offers_first() {
     let (above, _) = wall_split();
@@ -4332,9 +4473,13 @@ fn the_hide_enters_only_the_command_the_menu_offers_first() {
 }
 
 /// agy's `/title` output, entered once ([`AGY_HIDE_COMMAND`]; measured on
+/// 1.4.0, 2026-10-21, with no `title` block in the lab's settings).
 const TITLE_ROWS: &str = "> /title\n  ⎿  Error: No title command configured in settings.json. Please add a \"title\" block.\n";
 
 /// agy's per-day quota wall ([`ERROR_429`](aterm_phase::agy::fixtures::lab::ERROR_429),
+/// measured) split at its composer frame: the rows above it (the `⚠ agent
+/// executor error: …` block and its `Error ID:` row), and the frame — its
+/// top rule, the empty composer, its bottom rule, the footer.
 fn agy_wall_split() -> (String, String) {
     let body = aterm_phase::agy::fixtures::lab::ERROR_429
         .split_once('\n')
@@ -4345,6 +4490,7 @@ fn agy_wall_split() -> (String, String) {
 }
 
 /// agy's quota wall taken off the screen ([`notice_gone`]): `/title` output
+/// over the composer, every row of the `⚠` block scrolled out of sight.
 #[test]
 fn agys_notice_is_gone_only_when_no_row_of_its_block_draws() {
     let (above, frame) = agy_wall_split();
@@ -4377,6 +4523,8 @@ fn agys_notice_is_gone_only_when_no_row_of_its_block_draws() {
 }
 
 /// The hide's guard on agy ([`menu_offers`]): the composer holding `/title`
+/// alone and the menu's focused row, right under the composer's bottom rule,
+/// that command — as measured.
 #[test]
 fn agys_hide_enters_only_the_command_its_menu_offers_first() {
     let (above, frame) = agy_wall_split();
@@ -4418,6 +4566,11 @@ fn agys_hide_enters_only_the_command_its_menu_offers_first() {
 }
 
 /// W2's records: W1's ([`walled`]) with the wall resetting further ahead
+/// (+420 s), the loop waiting on it (+156 s), the notice scrolled away by ten
+/// `/rules` (from +160 s; the hiding Enter at +170 s, out of sight at +172.5 s,
+/// screen seq 40), a screen without the wall read (+168.4 s, seq 30, a row of
+/// the notice still in sight) and waited on, and the resume typed at the
+/// hidden screen past the reset and its grace, landed.
 fn walled_hidden() -> Seen {
     Seen {
         journal: vec![
@@ -4515,6 +4668,8 @@ fn walled_hidden() -> Seen {
 }
 
 /// The waits the remembered wall's look writes while the conversation is
+/// unread (`limit-conversation-unread`, 0ab6eaf3e6): five minutes at a time,
+/// the reset or not.
 const UNREAD_LOOK: &str =
     "until=x the remembered limit's conversation is unread; no act on its account";
 
@@ -4625,6 +4780,7 @@ fn st(t: i64, task: &str, needs: &str, n: &str, end: &str, seen: &str) -> (i64, 
 }
 
 /// `line` with Land's hold's three fields (§12.3.1): `land_held=`
+/// its legs, `land_nudges=`, `land_since=` its land act's second.
 fn hold(line: (i64, String), held: &str, nudges: &str, since: &str) -> (i64, String) {
     (
         line.0,
@@ -4648,6 +4804,8 @@ fn behind(program: &str, face: &str) -> String {
 }
 
 /// L1, L3, L5 with the window read as a passing run reads it: land-a behind,
+/// its need's row and attention while it stood, landed under the floor (no
+/// end, no •, no row), the page's state `landed <time>`.
 fn seen_land_a(program: &str) -> Seen {
     let mut s = landed_a();
     s.meta[1] = needs_meta(131_000, program);
@@ -4840,6 +4998,7 @@ fn the_window_wants_are_named_skips_without_the_window() {
 }
 
 /// N1–N4 as a passing run records them: cruise-n the front tab, its chip
+/// drawn `∞` throughout; two needs, none, one, two.
 fn seen_cruise_n() -> Seen {
     let need = |t: i64, more: &str| {
         j(
@@ -4977,6 +5136,7 @@ fn cruise_n_passes_on_its_needs_moving_drawn_as_its_face() {
 }
 
 /// §12.5.6's controls on cruise-n: `drawn=` unequal to `face=` fails each
+/// step; a step after a failed one is unobserved, never a pass.
 #[test]
 fn cruise_n_fails_a_wrong_window_read_and_leaves_a_step_after_a_failed_one_unobserved() {
     let mut s = seen_cruise_n();
@@ -5091,6 +5251,8 @@ fn cruise_n_fails_a_wrong_window_read_and_leaves_a_step_after_a_failed_one_unobs
 }
 
 /// cruise-n's OTHER NEEDS ON ROWS ONE LEVEL IN (§12.5.4's
+/// N1–N4 row): each step wants exactly its other needs on rows one level in
+/// under its row — (b) at N1, none at N2 and N3, (c) at N4.
 #[test]
 fn cruise_n_wants_each_other_need_on_a_row_one_level_in() {
     let row = |others: &[&str]| {
@@ -5140,6 +5302,7 @@ fn cruise_n_wants_each_other_need_on_a_row_one_level_in() {
 }
 
 /// A tab behind is judged by its face, never its cells: Cruise's C1 passes
+/// on `face=cruise drawn=- why=not-drawn` and fails on a stale face drawn.
 #[test]
 fn a_tab_behind_passes_on_its_face_with_nothing_drawn() {
     let mut s = cruised();
@@ -5174,6 +5337,10 @@ fn a_tab_behind_passes_on_its_face_with_nothing_drawn() {
 }
 
 /// L16 (land-j) as a passing run records it: the land act's defense long,
+/// landed 40 s after it, the end standing unseen with its • and its row;
+/// END's sweep left it, and so did the look begun on the front tab; under
+/// the look, `tab <land-j>` saw land-j's (`look`) and left land-k's
+/// (`still`); the press saw land-k's.
 fn seen_land_j(label: &str) -> Seen {
     let status = |t: i64, task: &str, end: &str, seen: &str| {
         j(
@@ -5638,6 +5805,7 @@ fn end_passes_on_a_window_at_rest_and_each_chain_drawn_as_its_face() {
 }
 
 /// Every chain of the measured pass is held to the window, and every
+/// scenario §12.5.4 gives 5c has a want of its own.
 #[test]
 fn every_chain_and_scenario_of_the_pass_has_its_window_wants() {
     let wanted = |c: Chain, s: Scenario| {
@@ -5872,6 +6040,7 @@ fn each_apis_reader_tells_a_request_carrying_a_tools_result_back() {
 }
 
 /// A standing one-short-turn back-off due at `due` (ms past [`T0`]) told
+/// again at `t` under `seq` — a re-read of its point.
 fn retold(t: i64, seq: u32, due: i64) -> (i64, String) {
     j(
         t,
@@ -5883,6 +6052,7 @@ fn retold(t: i64, seq: u32, due: i64) -> (i64, String) {
 }
 
 /// A turn-end back-off journaled at `t` (after [`T0`]): its point's `seq`,
+/// `streak` short turns, due `step` ms later (the stamp cut to its second).
 fn backoff(t: i64, seq: u32, streak: u32, step: i64) -> (i64, String) {
     let words = if step < 120_000 {
         format!("{} s", step / 1000)
@@ -5899,6 +6069,9 @@ fn backoff(t: i64, seq: u32, streak: u32, step: i64) -> (i64, String) {
 }
 
 /// F18 as a live run that passes it records it: P4P's record up to the
+/// person's Enter at +127 s, typed as a person types it (a stamp), its
+/// instant reply read at +127.9 s and LEFT to them there, `task=theirs`, and
+/// nothing typed in the 282 s watched after it.
 fn person_instant() -> Seen {
     let mut s = instant_cruised();
     s.journal.truncate(5);
@@ -6081,6 +6254,12 @@ fn f18_passes_only_where_the_persons_instant_turn_is_left_to_them() {
 }
 
 /// `same-words` as a live run that passes it records it: its first reply
+/// judged at +5 s (one short turn, due +125 s), the tab resized at +10.2 s
+/// and its screen read again at +11 s with nothing judged, the first point's
+/// back-off told again there under the re-read's own `seq=` (as
+/// `r3-res-claude`, agy and Muse Code journaled it), the orchestrator's turn
+/// at +40.3 s answered with the same words, judged at +44 s as its own point
+/// (two short turns, a 4 min step), its act at that due.
 fn same_words() -> Seen {
     Seen {
         journal: vec![
@@ -6215,6 +6394,9 @@ fn the_rewrapped_opener_is_judged_once_and_the_same_words_turn_as_its_own_point(
 }
 
 /// `tall-scroll` as the harness journals it: its first point (one short
+/// turn, 2 min back-off), the wheel from 6.8 s bringing the opener into
+/// sight (8 notches, the last at 8.3 s), the scrolled screen read as a point
+/// and the first back-off told again there, watched 40 s.
 fn tall_scroll() -> Seen {
     Seen {
         journal: vec![
@@ -6249,6 +6431,8 @@ fn tall_scroll() -> Seen {
 }
 
 /// F1 BY A SCROLL (`tall-scroll`, [`judge_scrolled`]): PASS where the
+/// scrolled screen was read as a point and the first point's back-off told
+/// again there, nothing judged or typed.
 #[test]
 fn a_judged_opener_scrolled_into_sight_is_not_judged_again() {
     let f1s = |s: &Seen| one(Chain::TallScroll, s, "muse", Scenario::Scrolled);
@@ -6378,6 +6562,11 @@ fn a_judged_opener_scrolled_into_sight_is_not_judged_again() {
 }
 
 /// `tall-scroll`'s tab runs the renderer that takes the wheel
+/// ([`scroll_launcher`]): Claude Code's fullscreen one, Gemini CLI's
+/// alternate buffer (its system settings file), agy's no-flickering one in a
+/// home of the tab's own (the run's trust, onboarding done, its `HOME` after
+/// the run's, so it is the one `env` keeps); Muse Code, which has none, the
+/// run's own.
 #[test]
 fn the_scroll_chains_tab_runs_the_renderer_that_takes_the_wheel() {
     let tmp = aterm_tempfile::tempdir().unwrap();
@@ -6471,6 +6660,9 @@ fn the_scroll_chains_tab_runs_the_renderer_that_takes_the_wheel() {
 }
 
 /// `search` and `scroll` as the scroll drive reads them: the newest match's
+/// absolute row (the client's stdout) and the live screen's first (its
+/// header, which the client writes to stderr, measured `r4-f3`), the
+/// viewport's offset and its most.
 #[test]
 fn the_scroll_drive_reads_search_and_scroll_replies() {
     let reply = |stderr: &str, stdout: &str| Reply {
@@ -6508,6 +6700,9 @@ fn the_scroll_drive_reads_search_and_scroll_replies() {
 }
 
 /// `tool-end` as a live run that passes it records it: the first reply's
+/// call run (its result carried back), the turn ended on the tool's row and
+/// judged at +6 s (one short turn, 2 min), Land's act at that due, its clean
+/// defense landing the task.
 fn tool_ended() -> Seen {
     Seen {
         journal: vec![
@@ -6601,6 +6796,8 @@ fn f3_passes_only_where_the_tool_ended_first_turn_is_judged() {
 }
 
 /// `ladder` as a live run under the seam at `scale` records it: seven points,
+/// each one short turn more, each step the ladder's at that scale, each act
+/// 0.3 s past its due and its reply judged 3 s after.
 fn laddered(scale: f64) -> Seen {
     laddered_late(scale, 0, 0)
 }
@@ -6821,6 +7018,9 @@ fn the_backoff_helpers_read_a_points_own_decision() {
 }
 
 /// Gemini CLI's usage-limit dialog as measured (a Google account's spent
+/// quota, `Access resets at …`), its focus on `1. Keep trying`; the same
+/// answered `2. Stop`: the turn's `✕ [API Error: An unknown error occurred.]`
+/// and the composer back.
 fn gemini_dialog_and_stopped() -> (String, String) {
     let strip = |f: &str| {
         f.lines()
@@ -6835,6 +7035,9 @@ fn gemini_dialog_and_stopped() -> (String, String) {
 }
 
 /// GEMINI CLI'S NOTICE IS GONE ONCE ITS DIALOG IS ANSWERED `2. Stop`
+/// ([`notice_gone`]): the composer back, no usage-limit dialog, no row of its
+/// words — though the screen draws the error the Stop leaves, a wall its
+/// reader reads.
 #[test]
 fn gemini_clis_notice_is_gone_once_its_dialog_is_answered_stop() {
     let (dialog, stopped) = gemini_dialog_and_stopped();
@@ -6860,6 +7063,9 @@ fn gemini_clis_notice_is_gone_once_its_dialog_is_answered_stop() {
 }
 
 /// Claude Code 2.1.307's screen under the stub's five-hour limit (measured,
+/// 2026-10-21, `aterm ctl text` of the lab's tab): `armed` its countdown
+/// standing (the footer's banner), `cancelled` after Esc, `scrolled` after
+/// twelve `/rename w2probe` — the rule carrying the session's name.
 fn claude_limit_screens() -> (String, String, String) {
     let rule = "─".repeat(144);
     let named = format!("{} w2probe ─", "─".repeat(134));
@@ -6879,6 +7085,11 @@ fn claude_limit_screens() -> (String, String, String) {
 }
 
 /// CLAUDE CODE'S NOTICE IS GONE ONLY ONCE ITS COUNTDOWN IS CANCELLED AND ITS
+/// ROWS HAVE SCROLLED AWAY ([`notice_gone`]), the composer read between rules
+/// one of which carries the session's name ([`claude_composer`]); the
+/// countdown's key is pressed only where it stands armed ([`CLAUDE_CANCEL`]),
+/// and `/rename` entered only where the composer holds it with no menu row
+/// focused ([`menu_offers`]).
 #[test]
 fn claude_codes_notice_is_gone_once_cancelled_and_scrolled_away() {
     let (armed, cancelled, scrolled) = claude_limit_screens();
@@ -6903,6 +7114,9 @@ fn claude_codes_notice_is_gone_once_cancelled_and_scrolled_away() {
 }
 
 /// W2's records on Gemini CLI: the dialog read and waited on to its reset
+/// (`limit-retry@v1`), answered `2. Stop` at +160 s, the Stop's error read at
+/// the screen without the notice, waited on to the reset, and the resume
+/// typed past it there.
 fn gemini_stopped() -> Seen {
     let mut s = walled_hidden();
     s.journal[3].1 = "EVENT prompt seq=2 kind=usage-limit classify=- command=-".into();
@@ -6925,6 +7139,8 @@ fn gemini_stopped() -> Seen {
 }
 
 /// W2 ON GEMINI CLI ([`cover::judge_wall_hidden`] under [`Hidden::stopped`]):
+/// a point read after the Stop on the error it leaves — an `EVENT limited`
+/// that names none of the dialog's words — is the screen without the notice.
 #[test]
 fn the_remembered_wall_on_gemini_cli_reads_the_stops_error_as_a_screen_without_the_notice() {
     let w2 = |s: &Seen| one(Chain::WallHid, s, "gemini", Scenario::W2);

@@ -1,45 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The render epoch: the resize ledger's second judge, read from the engine's debt
-//! instead of from the shape of a run.
-//!
-//! The ledger judges net-zero runs, and a run closes when the app draws, so a flap
-//! whose halves an app frame separates is two net-changed runs and neither is judged
-//! (the ledger's named blind spot: every row ends one higher and only `cast drift`
-//! says so). The engine's undo makes the quiet flap an identity but cannot help once
-//! anything is written, so a repair needs a trigger that does not depend on run shape.
-//!
-//! An epoch opens at the first alternate-screen resize after the screen was last
-//! repainted from scratch and remembers the geometry before it (`start`). The
-//! engine's [`Terminal::render_debt`] says what is owed: nothing when every row sits
-//! where the program painted it and no drawn cell was cut. Rows and columns are one
-//! debt: a column flap that cut the cells past the narrower width brings blanks back
-//! where the program drew, as a row flap leaves the rows one higher. The epoch is at
-//! risk when anything is owed, the geometry is back at `start` and [`RISK_AFTER_MS`]
-//! has passed since the last resize: a program that compares the size it reads with
-//! the size it drew for can never read the intermediate size again, so it has no
-//! reason to repaint. While the geometry differs from `start` the program's handler
-//! still reads a change and repaints, so the epoch is only `displaced`. Whether the
-//! program has drawn since is information (`drew=`), not a condition: an undrawn
-//! residual (a mode set between the halves, an idle tab) is as displaced as a drawn
-//! one.
-//!
-//! Whether an epoch at risk is accused depends on the program's class:
-//! [`ProgramClass::Agent`] (Claude Code, the one program whose repaint contract, an
-//! ED 2 on a changed size read and nothing on an unchanged one, was measured),
-//! [`ProgramClass::Learned`] (a run of this session was healed by a full clear within
-//! [`RISK_AFTER_MS`] of its last resize), or [`ProgramClass::Unknown`]. An unknown
-//! program that repaints with cursor addressing and no ED 2 is indistinguishable from
-//! one that missed, so its at-risk epoch reads `unjudged` (on `status` and `resizes`,
-//! never pushed as an event).
-//!
-//! The ledger books every resize at the one funnel and, when that leaves an epoch
-//! open, registers its next look at `last_resize + RISK_AFTER_MS` ([`note_look`]);
-//! the event loop folds that instant under `DeadlineOwner::RenderEpoch` and runs the
-//! look (`App::observe_render_epochs`). An idle machine folds nothing; the status
-//! sweep and `subscribe` only read the verdict. No clock is read here: the host
-//! passes `now_ms`.
+//! Render-debt resize epoch judge for `status render=` and `resizes`.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,27 +10,26 @@ use aterm_core::terminal::ResizeReport;
 
 use crate::resize_ledger::{EngineProbe, RISK_AFTER_MS, Transition};
 
-/// Closed epochs kept for `resizes` (drop-oldest).
+/// Maximum number of closed epochs retained for `resizes`.
 pub(crate) const EPOCHS_KEPT: usize = 8;
-/// Asking again after a look found the terminal locked: after this long, at most
-/// [`LOOK_RETRIES`] times, then at the next [`RISK_AFTER_MS`].
+/// Delay before retrying an epoch look when the terminal lock is contended.
 pub(crate) const LOOK_RETRY_MS: u64 = 100;
-/// See [`LOOK_RETRY_MS`].
+/// Maximum lock-contention retries before deferring to the next risk window.
 pub(crate) const LOOK_RETRIES: u32 = 20;
 
-/// What the ledger knows of the program behind a session.
+/// Classification of the program running in a session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProgramClass {
-    /// The presence classifier identifies Claude Code.
+    /// Identified as Claude Code.
     Agent,
-    /// This session cleared its screen when resized (see the module note).
+    /// Observed clearing its screen on resize.
     Learned,
-    /// Neither.
+    /// Neither identified as an agent nor observed clearing on resize.
     Unknown,
 }
 
 impl ProgramClass {
-    /// The wire word (`class=`).
+    /// Returns the wire token (`class=`).
     pub(crate) const fn wire(self) -> &'static str {
         match self {
             Self::Agent => "agent",
@@ -77,30 +38,29 @@ impl ProgramClass {
         }
     }
 
-    /// An epoch at risk of this class is accused (`desync-risk`), not
-    /// `unjudged`.
+    /// Returns whether an at-risk epoch of this class reports `desync-risk`.
     pub(crate) const fn judged(self) -> bool {
         !matches!(self, Self::Unknown)
     }
 }
 
-/// An epoch's state (`verdict=`).
+/// Verdict state of a resize epoch (`verdict=`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EpochVerdict {
-    /// Open: debt is owed and the program may still read the change.
+    /// Debt is owed and the program may still respond.
     Open,
-    /// At risk, and the class is judged.
+    /// At risk of render desync for a judged program class.
     DesyncRisk,
-    /// At risk, and the program has not shown it clears the screen.
+    /// At risk, for a program class that has not shown it clears on resize.
     Unjudged,
-    /// A full clear or a screen switch repainted it.
+    /// Repainted by a full clear or screen switch.
     Healed,
-    /// The debt returned to zero with no heal: an undo handed the rows back.
+    /// Render debt returned to zero via engine undo.
     Restored,
 }
 
 impl EpochVerdict {
-    /// The wire token.
+    /// Returns the wire token.
     pub(crate) const fn wire(self) -> &'static str {
         match self {
             Self::Open => "open",
@@ -112,21 +72,21 @@ impl EpochVerdict {
     }
 }
 
-/// Who closed an epoch (`by=`).
+/// Actor that closed a resize epoch (`by=`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EpochBy {
     /// Still open.
     None,
-    /// The program repainted (a full clear or a screen switch).
+    /// Closed by an application repaint.
     App,
-    /// The engine's undo handed the rows back.
+    /// Closed by engine undo.
     Undo,
-    /// The repaint nudge (`crate::app_nudge`) made the program repaint.
+    /// Closed after a repaint nudge.
     Nudge,
 }
 
 impl EpochBy {
-    /// The wire token.
+    /// Returns the wire token.
     pub(crate) const fn wire(self) -> &'static str {
         match self {
             Self::None => "-",
@@ -137,24 +97,23 @@ impl EpochBy {
     }
 }
 
-/// One epoch (see the module note).
+/// Single alternate-screen resize epoch record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Epoch {
     pub(crate) id: u64,
-    /// The first resize's time, on the timeline clock.
+    /// Timestamp of the first resize in the epoch (timeline ms).
     pub(crate) t_ms: u64,
-    /// The last resize's time.
+    /// Timestamp of the most recent resize in the epoch.
     pub(crate) last_resize_ms: u64,
     /// `(rows, cols)` before the first resize of the epoch.
     pub(crate) start: (u16, u16),
-    /// `(rows, cols)` as last read.
+    /// Most recently observed `(rows, cols)`.
     pub(crate) now: (u16, u16),
-    /// The engine's debt as last read: rows moved, rows pushed off, drawn columns
-    /// cut.
+    /// Most recently observed engine render debt (`shift`, `pushed`, `cut`).
     pub(crate) shift: i32,
     pub(crate) pushed: i32,
     pub(crate) cut: u16,
-    /// The program drew (the content moved other than by a resize) since.
+    /// Whether the program drew content since the resize.
     pub(crate) drew: bool,
     /// The content sequence the screen shows while the program has drawn
     /// nothing since: the last resize's.
@@ -168,7 +127,7 @@ pub(crate) struct Epoch {
     pub(crate) class: ProgramClass,
     pub(crate) verdict: EpochVerdict,
     pub(crate) by: EpochBy,
-    /// A repair was attempted (the repaint nudge held the PTY for this epoch).
+    /// Whether a repaint nudge was attempted for this epoch.
     pub(crate) tried: bool,
     /// That repair ended superseded by a real resize (the program was given a
     /// size of its own): its end is this judge's if the epoch comes back to
@@ -210,25 +169,22 @@ impl Epoch {
         full_clears > self.full_clears || screen_replaced > self.screen_replaced
     }
 
-    /// Worth a line in `resizes`: something was owed at some reading.
+    /// Returns whether this epoch owed render debt and should appear in `resizes`.
     pub(crate) fn listed(&self) -> bool {
         self.had_debt
     }
 }
 
 /// The soonest instant any ledger wants an epoch look (timeline ms), `u64::MAX` for
-/// none. A process-wide minimum: a ledger only ever lowers it ([`note_look`]); the
-/// event loop's look ([`take_looks`]) resets it and every ledger re-registers what it
-/// still owes. A stale early value costs one walk that finds nothing due; it can never
-/// be later than a registered look.
+/// none.
 static NEXT_LOOK_MS: AtomicU64 = AtomicU64::new(u64::MAX);
 
-/// A ledger owes a look at `at_ms`.
+/// Records that a ledger needs an epoch look at `at_ms`.
 pub(crate) fn note_look(at_ms: u64) {
     NEXT_LOOK_MS.fetch_min(at_ms, Ordering::AcqRel);
 }
 
-/// The soonest look owed (timeline ms), `None` when nothing is.
+/// Returns the soonest scheduled epoch look timestamp (timeline ms).
 pub(crate) fn next_look_ms() -> Option<u64> {
     match NEXT_LOOK_MS.load(Ordering::Acquire) {
         u64::MAX => None,
@@ -236,9 +192,7 @@ pub(crate) fn next_look_ms() -> Option<u64> {
     }
 }
 
-/// Reset the minimum before the event loop walks the sessions: each due ledger
-/// re-registers what it still owes as it is looked at, and a registration that
-/// races the walk survives (`fetch_min`).
+/// Resets the global next-look timestamp before the event loop walks sessions.
 pub(crate) fn take_looks() {
     NEXT_LOOK_MS.store(u64::MAX, Ordering::Release);
 }
@@ -246,37 +200,35 @@ pub(crate) fn take_looks() {
 /// Bumped whenever an epoch of the agent class is at `desync-risk` and untried, or a
 /// superseded repair's epoch is back at risk ([`returned_at_risk`]): the event loop's
 /// cue to walk the sessions, arm the repaint nudge (`crate::app_nudge`) and raise
-/// what is owed. Noted by whichever path judged the epoch (the loop's own look, a
-/// `status` read, a `subscribe` tick). A generation, not a flag: every `App` compares
-/// it with the one it last scanned, so no reader consumes another's cue.
+/// what is owed.
 static NUDGE_DUE: AtomicU64 = AtomicU64::new(0);
 
-/// An agent-class epoch at `desync-risk` is owed the loop's walk: tell it.
+/// Signals that an agent-class epoch is due for a repaint nudge check.
 pub(crate) fn note_nudge_due() {
     NUDGE_DUE.fetch_add(1, Ordering::AcqRel);
 }
 
-/// The cue's generation now.
+/// Returns the current nudge-due generation counter.
 pub(crate) fn nudge_due_generation() -> u64 {
     NUDGE_DUE.load(Ordering::Acquire)
 }
 
-/// What the repaint nudge needs to know of a session's open epoch.
+/// Snapshot of an open at-risk epoch for the repaint nudge controller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NudgeView {
-    /// The epoch's id.
+    /// Epoch identifier.
     pub(crate) epoch: u64,
-    /// The engine's debt as last read.
+    /// Vertical row shift owed.
     pub(crate) shift: i32,
-    /// Rows pushed off the bottom, likewise.
+    /// Rows pushed off the bottom.
     pub(crate) pushed: i32,
-    /// Drawn columns cut, likewise.
+    /// Drawn columns cut.
     pub(crate) cut: u16,
-    /// The program drew since.
+    /// Whether the program drew since the resize.
     pub(crate) drew: bool,
 }
 
-/// The ledger's epochs.
+/// Per-session book of open and recent resize epochs.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EpochBook {
     current: Option<Epoch>,
@@ -301,19 +253,17 @@ pub(crate) struct EpochBook {
 }
 
 impl EpochBook {
-    /// The presence classifier's reading of this session's program.
+    /// Updates whether the presence classifier identifies Claude Code.
     pub(crate) fn set_agent(&mut self, agent: bool) {
         self.agent = agent;
     }
 
-    /// This session has shown it clears its screen when resized.
+    /// Records that this session cleared its screen on resize.
     pub(crate) fn learn(&mut self) {
         self.learned = true;
     }
 
-    /// The class now. `ATERM_NUDGE_CLASS=agent` is a development seam (compiled
-    /// only into dev-seams and debug builds) that lets the lane's stand-in be the
-    /// agent class; it is honoured here and nowhere else.
+    /// Returns the session's current [`ProgramClass`].
     pub(crate) fn class(&self) -> ProgramClass {
         static SEAM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let seam = *SEAM.get_or_init(|| {
@@ -328,10 +278,7 @@ impl EpochBook {
         }
     }
 
-    /// The open epoch when it is at `desync-risk` for the agent class and no
-    /// repair was tried for it: what the repaint nudge acts on. `learned` is not
-    /// the agent class - only the program whose repaint contract was measured is
-    /// ever actuated.
+    /// Returns [`NudgeView`] when the open epoch is untried `desync-risk` for an agent.
     pub(crate) fn nudge_view(&self) -> Option<NudgeView> {
         let epoch = self.current.as_ref()?;
         (epoch.verdict == EpochVerdict::DesyncRisk
@@ -346,9 +293,7 @@ impl EpochBook {
             })
     }
 
-    /// Whether epoch `id` is still the open one and the screen may still be
-    /// drawn off (`open`, `desync-risk` or `unjudged`): the question the
-    /// digest's `render.<tab>.unrepaired` line ends on.
+    /// Returns whether epoch `id` is still open and potentially desynced.
     pub(crate) fn still_at_risk(&self, id: u64) -> bool {
         self.current.as_ref().is_some_and(|epoch| {
             epoch.id == id
@@ -360,35 +305,32 @@ impl EpochBook {
         })
     }
 
-    /// A repair was attempted for epoch `id`: it is tried for good (one try per
-    /// epoch), and if the screen is then repainted the epoch closes `by=nudge`.
+    /// Marks epoch `id` as having had a repaint nudge attempted.
     pub(crate) fn note_tried(&mut self, id: u64) {
         if let Some(epoch) = self.current.as_mut().filter(|e| e.id == id) {
             epoch.tried = true;
         }
     }
 
-    /// The repair tried for epoch `id` ended superseded by a real resize: if
-    /// the resize does not last, its end is this judge's ([`Self::judge`]).
+    /// Marks epoch `id`'s repair attempt as superseded by a real resize.
     pub(crate) fn note_superseded(&mut self, id: u64) {
         if let Some(epoch) = self.current.as_mut().filter(|e| e.id == id) {
             epoch.superseded = true;
         }
     }
 
-    /// The epoch whose superseded repair this judge found back at risk where
-    /// the hold found it, once: the window raises the give-up.
+    /// Takes the epoch ID whose superseded repair returned to `desync-risk`.
     pub(crate) fn take_returned(&mut self) -> Option<u64> {
         self.returned.take()
     }
 
-    /// The nudge's phase word and attempt count for the `resizes` header.
+    /// Updates the repaint nudge phase and attempt count for the `resizes` header.
     pub(crate) fn set_nudge(&mut self, phase: &'static str, nudged: u32) {
         self.nudge_phase = phase;
         self.nudged = nudged;
     }
 
-    /// `nudge=<phase> nudged=<n>`.
+    /// Formats `nudge=<phase> nudged=<n>`.
     pub(crate) fn nudge_wire(&self) -> String {
         let phase = if self.nudge_phase.is_empty() {
             "idle"
@@ -398,14 +340,13 @@ impl EpochBook {
         format!("nudge={phase} nudged={}", self.nudged)
     }
 
-    /// The open epoch, when there is one.
+    /// Returns the currently open epoch, if any.
     #[cfg(test)]
     pub(crate) fn current(&self) -> Option<&Epoch> {
         self.current.as_ref()
     }
 
-    /// The epochs `resizes` lists, oldest first: the closed ones that owed
-    /// something, then the open one when it does.
+    /// Iterates over closed and open epochs that owed render debt, oldest first.
     pub(crate) fn listed(&self) -> impl Iterator<Item = &Epoch> {
         self.closed
             .iter()
@@ -413,27 +354,23 @@ impl EpochBook {
             .filter(|e| e.listed())
     }
 
-    /// The instant the next look is owed (timeline ms).
+    /// Returns when the next epoch look is due (timeline ms).
     pub(crate) fn look_at_ms(&self) -> Option<u64> {
         self.look_at_ms
     }
 
-    /// Drain the log lines a judgement owes.
+    /// Drains pending `aterm.log` lines emitted by epoch judgements.
     pub(crate) fn take_logs(&mut self) -> Vec<String> {
         std::mem::take(&mut self.logs)
     }
 
-    /// A resize was booked (`report`, at `now_ms`). Only the alternate screen's
-    /// non-reflowed resizes are an epoch's: the primary screen is
-    /// history-backed and a rewrap renumbers rows on its own.
+    /// Records a resize event at `now_ms`.
     pub(crate) fn note_resize(&mut self, report: &ResizeReport, now_ms: u64) {
         if !report.alt || report.reflowed {
             return;
         }
         if let Some(epoch) = self.current.as_mut() {
             if epoch.healed_by(report.full_clears, report.screen_replaced) {
-                // The screen was repainted from scratch before this resize and
-                // no reading saw it: that epoch ended, this one is new.
                 let closed = self.current.take();
                 self.close(closed, EpochVerdict::Healed, EpochBy::App);
             } else {
@@ -452,11 +389,7 @@ impl EpochBook {
         self.look_tries = 0;
     }
 
-    /// Judge the epoch against one engine reading. `last_ordinal` is the
-    /// newest resize the ledger has booked: a reading taken with another count
-    /// says nothing about the content sequence. `run_risk` is true while a run
-    /// already stands at `desync-risk` (its event is the announcement).
-    /// `healed_run` is true when this same look already pushed a run's `healed`.
+    /// Judges the current epoch against a terminal render-debt reading.
     pub(crate) fn judge(
         &mut self,
         probe: &EngineProbe,
@@ -469,9 +402,6 @@ impl EpochBook {
         let class = self.class();
         let debt = probe.debt;
         if self.current.is_none() && debt.owed() && probe.geom.0 > 0 {
-            // Debt is owed and no resize of this ledger explains it: a restored
-            // engine seeded with its predecessor's debt (the handoff). The
-            // geometry is taken to be the one the program painted.
             self.high = self.high.saturating_add(1);
             let synthetic = ResizeReport {
                 from: probe.geom,
@@ -493,8 +423,6 @@ impl EpochBook {
         epoch.now = probe.geom;
         epoch.class = class;
         if !debt.owed() {
-            // The engine owes nothing: a quiet flap (nothing to record), or a
-            // heal / an undo that ended a debt.
             let owed = epoch.had_debt;
             let tried = epoch.tried;
             let healed = epoch.healed_by(probe.full_clears, probe.screen_replaced);
@@ -577,12 +505,9 @@ impl EpochBook {
                     at_ms: epoch.t_ms,
                 });
             }
-            // Judged: no further look is owed until it changes.
             self.look_at_ms = None;
         } else {
             epoch.verdict = EpochVerdict::Open;
-            // The next look: when the risk wait ends, or, with the geometry not
-            // back, at the next resize (which re-registers it).
             self.look_at_ms = back.then_some(epoch.last_resize_ms.saturating_add(RISK_AFTER_MS));
         }
         if let Some(at) = self.look_at_ms {
@@ -590,8 +515,7 @@ impl EpochBook {
         }
     }
 
-    /// A look found the terminal locked: ask again soon (bounded), then at the
-    /// next risk wait.
+    /// Schedules a bounded retry when an epoch look finds the terminal locked.
     pub(crate) fn defer_look(&mut self, now_ms: u64) {
         self.look_tries = self.look_tries.saturating_add(1);
         let after = if self.look_tries <= LOOK_RETRIES {
@@ -604,13 +528,12 @@ impl EpochBook {
         note_look(at);
     }
 
-    /// The instant a look is owed and past `now_ms`.
+    /// Returns whether an epoch look is due at `now_ms`.
     pub(crate) fn look_due(&self, now_ms: u64) -> bool {
         self.look_at_ms.is_some_and(|at| at <= now_ms)
     }
 
-    /// The state `status render=` reads from this book: `None` when nothing is
-    /// owed.
+    /// Returns the current [`EpochVerdict`] for `status render=`.
     pub(crate) fn state(&self) -> Option<EpochVerdict> {
         self.current
             .as_ref()
@@ -618,8 +541,7 @@ impl EpochBook {
             .map(|e| e.verdict)
     }
 
-    /// Forget an epoch whose engine was replaced (a restored engine restarts its
-    /// counters); the successor's seeded debt re-opens one.
+    /// Clears the open epoch after the terminal engine is replaced.
     pub(crate) fn rebase(&mut self) {
         self.current = None;
         self.look_at_ms = None;
@@ -640,13 +562,7 @@ impl EpochBook {
 }
 
 /// The end of a superseded repair, the epoch judge's half of the repaint nudge
-/// (`RepaintNudge`'s `Report`). A real resize that left the engine elsewhere ended
-/// the attempt `superseded` (the program was given a size of its own). If that
-/// resize does not last, the epoch comes back to `desync-risk` (debt still owed, the
-/// geometry back at its start, the risk wait spent) with its one try spent: the same
-/// give-up as a resize that comes back inside its wait. `Some(id)` once; the window
-/// raises the digest line (`App::arm_nudges`). A repaint by the program closes the
-/// epoch first and nothing is said.
+/// (`RepaintNudge`'s `Report`).
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -660,9 +576,7 @@ fn returned_at_risk(epoch: &mut Epoch) -> Option<u64> {
         .then_some(epoch.id)
 }
 
-/// `epoch <e> t=<ms> geom=<start>><now> shift=<+-k> pushed=<k> cut=<k> drew=<0|1>
-/// class=<agent|learned|unknown> verdict=<open|desync-risk|unjudged|healed|
-/// restored> by=<app|undo|nudge|-> tried=<0|1>`
+/// Appends the wire representation of `epoch` to `out`.
 pub(crate) fn wire_epoch(out: &mut String, epoch: &Epoch) {
     use std::fmt::Write as _;
     let geom = |(rows, cols): (u16, u16)| format!("{cols}x{rows}");

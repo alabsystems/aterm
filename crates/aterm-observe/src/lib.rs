@@ -1,36 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **aterm-observe** — layer L0.5 of the RFC "The Reactive Surface": the
-//! *semantic* surface predicates, built on the core
-//! [Observation Kernel](aterm_core::terminal::WatcherSet).
-//!
-//! The point of this crate is a dependency boundary. The kernel in `aterm-core`
-//! exposes a primitive that latches when a *content_seq* advances, a quiescence
-//! deadline elapses, or an opaque [`RowMatch`](aterm_core::terminal::RowMatch)
-//! fires — but it carries **no vocabulary**: it cannot turn a pattern string into
-//! a matcher. That vocabulary (`aterm-regex`, the first-party bounded Pike VM)
-//! lives **here**, so `aterm-core` takes no **direct** regex-engine dependency
-//! (RFC requirement R2; the engine does still appear in the workspace's
-//! transitive closure via `aterm-search`'s `regex` feature). The agent layer
-//! (`aterm-agent`, L2) composes these predicates into turn-completion; it never
-//! reaches into the core enum directly.
+//! **aterm-observe** — layer L0.5 of the RFC "The Reactive Surface": the *semantic* surface predicates, built on the core [Observation Kernel](aterm_core::terminal::WatcherSet).
 
 use std::sync::Arc;
 
 use aterm_core::terminal::{RowMatch, RowVerdict};
 
-/// Re-export the regex compile error so dependents (e.g. `aterm-agent`) can name
-/// it without taking a direct `aterm-regex` dependency — the regex boundary stays
-/// at this crate. The path is unchanged across the engine swap; only the type it
-/// names moved from `regex::Error` to [`aterm_regex::Error`].
+/// Re-export the regex compile error so dependents (e.g. `aterm-agent`) can name it without taking a direct `aterm-regex` dependency — the regex boundary stays at this crate.
 pub mod regex_compile_error {
     pub use aterm_regex::Error;
 }
 
-/// A pre-compiled regular-expression row matcher — the one place the regex engine
-/// is used in the watcher stack. The core stores it behind `dyn RowMatch` and
-/// can only *evaluate* it, never construct it.
+/// A pre-compiled regular-expression row matcher — the one place the regex engine is used in the watcher stack.
 #[derive(Debug)]
 pub struct RegexRowMatch {
     re: aterm_regex::Regex,
@@ -39,9 +21,6 @@ pub struct RegexRowMatch {
 impl RowMatch for RegexRowMatch {
     #[inline]
     fn verdict(&self, row: &str) -> RowVerdict {
-        // A scan that exhausts its step budget is `Undecided`, keeping both
-        // `await match` and `await gone` pending rather than falsely latching
-        // the inverse predicate while the row is still on screen.
         match self.re.try_is_match(row) {
             Ok(matched) => matched.into(),
             Err(_) => RowVerdict::Undecided,
@@ -49,50 +28,24 @@ impl RowMatch for RegexRowMatch {
     }
 }
 
-/// Maximum regex pattern length (bytes). Watcher patterns are untrusted control
-/// input and are rejected before compilation to bound parse/compile cost,
-/// matching `aterm-search`'s `MAX_REGEX_PATTERN_LEN`.
+/// Maximum regex pattern length (bytes).
 const MAX_REGEX_PATTERN_LEN: usize = 1024;
 
 /// Compiled-regex size limit (bytes) for
-/// [`aterm_regex::RegexBuilder::size_limit`]. Caps the NFA at 128 KiB (2,048
-/// instructions at 64 bytes/instruction), matching `aterm-search`.
-///
-/// Because a Pike VM's scan cost is linear in the haystack with program size as
-/// the constant factor, bounding compiled size also bounds per-row scan cost:
-/// on a 4,096-column row, `(?:x?){2000}z` (4,002 instructions, 37 ms) is
-/// refused, and the largest admitted program takes ~18 ms. 1,024 literal bytes
-/// compile to 1,025 instructions (65,600 bytes), so 128 KiB is the smallest
-/// power-of-two ceiling that admits a max-length literal; the largest built-in
-/// selection rule (IPv6) is 407 instructions.
-const REGEX_SIZE_LIMIT: usize = 128 * 1024; // 128 KiB
+/// [`aterm_regex::RegexBuilder::size_limit`].
+const REGEX_SIZE_LIMIT: usize = 128 * 1024;
 
 /// Lazy-DFA cache limit (bytes) for
-/// [`aterm_regex::RegexBuilder::dfa_size_limit`]. Passed for builder
-/// compatibility (`aterm-regex` is a pure Pike VM whose per-match thread set is
-/// bounded by [`REGEX_SIZE_LIMIT`]).
-const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20; // 1 MiB
+/// [`aterm_regex::RegexBuilder::dfa_size_limit`].
+const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20;
 
 /// Scan budget (work units) for one row, passed to
 /// [`aterm_regex::RegexBuilder::step_limit`] (~4.8 ms per row in release).
-///
-/// The heaviest program admitted by [`REGEX_SIZE_LIMIT`] can still spend ~16.7M
-/// units (19 ms) on a 4,096-column row; this ceiling cuts it off at ~4.2M units
-/// while leaving three orders of magnitude of headroom over the most expensive
-/// built-in rule (IPv6 selection, ~3,100 units).
 const REGEX_STEP_LIMIT: u64 = 1 << 22;
 
-/// Compile a bounded regex row matcher for
-/// [`Terminal::watch_rows`](aterm_core::terminal::Terminal::watch_rows) and
-/// [`Terminal::watch_rows_gone`](aterm_core::terminal::Terminal::watch_rows_gone).
-///
-/// Enforces [`MAX_REGEX_PATTERN_LEN`], [`REGEX_SIZE_LIMIT`],
-/// [`REGEX_DFA_SIZE_LIMIT`], and [`REGEX_STEP_LIMIT`]. A row scan that exhausts
-/// the step budget returns [`RowVerdict::Undecided`].
-///
+/// Compile a bounded regex row matcher for [`Terminal::watch_rows`](aterm_core::terminal::Terminal::watch_rows) and [`Terminal::watch_rows_gone`](aterm_core::terminal::Terminal::watch_rows_gone).
 /// # Errors
-/// Returns an [`aterm_regex::Error`] if `pattern` exceeds the length or
-/// compiled-size limits or is not a valid regular expression.
+/// Returns an [`aterm_regex::Error`] if `pattern` exceeds the length or compiled-size limits or is not a valid regular expression.
 pub fn row_matcher(pattern: &str) -> Result<Arc<dyn RowMatch>, aterm_regex::Error> {
     Ok(Arc::new(RegexRowMatch {
         re: bounded_regex(pattern)?,
@@ -155,11 +108,7 @@ pub const fn encode_watcher_budget_wire(
     ]
 }
 
-/// Decode a 20-byte watcher regex budget wire frame produced by
-/// [`encode_watcher_budget_wire`].
-///
-/// Rejects frames whose `max_pattern_len`, `size_limit`, or `step_limit` is
-/// zero or exceeds the hard ceilings enforced by [`row_matcher`].
+/// Decode a 20-byte watcher regex budget wire frame produced by [`encode_watcher_budget_wire`].
 #[inline]
 #[must_use]
 pub const fn decode_watcher_budget_wire(bytes: &[u8]) -> Option<(u32, u32, u64)> {
@@ -222,8 +171,7 @@ pub const fn encode_row_verdict_wire(
     ]
 }
 
-/// Decode a 16-byte row-matcher verdict wire frame produced by
-/// [`encode_row_verdict_wire`].
+/// Decode a 16-byte row-matcher verdict wire frame produced by [`encode_row_verdict_wire`].
 #[inline]
 #[must_use]
 pub const fn decode_row_verdict_wire(bytes: &[u8]) -> Option<(RowVerdict, u16, u8, u64)> {
@@ -262,8 +210,6 @@ mod tests {
 
     #[test]
     fn row_matcher_latches_on_real_engine_output() {
-        // Bind aterm-observe -> aterm-core -> real engine: arm a regex row
-        // matcher, paint a matching row through the real pipeline, assert latch.
         let base = Instant::now();
         let mut t = Terminal::new(24, 80);
         let m = row_matcher(r"PROMPT-READY").expect("compile");
@@ -285,8 +231,6 @@ mod tests {
 
     #[test]
     fn row_matcher_latches_immediately_if_already_matching() {
-        // Arm against a surface that ALREADY shows the row — must latch at arm
-        // (the `watch_rows` immediate eval), not wait for the next change.
         let base = Instant::now();
         let mut t = Terminal::new(24, 80);
         t.process_at(b"ALREADY-HERE\r\n", clock_at(base, 5));
@@ -301,9 +245,7 @@ mod tests {
     /// The inverse predicate, level-triggered: a surface with no matching row,
     /// unchanged for `GONE_SETTLE`, latches AT ARM (the `watch_rows_gone`
     /// immediate eval), so an agent asking "is the busy footer gone?" of an
-    /// already-finished turn is told yes now. Drawn more recently, with no closed
-    /// DEC 2026 frame to vouch for it, it settles to `GONE_SETTLE` past its last
-    /// change.
+    /// already-finished turn is told yes now.
     #[test]
     fn row_gone_latches_immediately_if_nothing_matches() {
         let base = Instant::now();
@@ -342,15 +284,12 @@ mod tests {
             "the footer is on screen => pending"
         );
 
-        // More output that leaves the footer in place: still pending.
         t.process_at(b"still thinking\r\n", clock_at(base, 10));
         assert!(
             t.watch_poll(id).is_none(),
             "content advanced but the row is still visible => still pending"
         );
 
-        // Clear the screen (home + ED 2): the footer leaves => latched once the
-        // range has read clear for `GONE_SETTLE` (no closed frame vouches for it).
         t.process_at(b"\x1b[H\x1b[2JDone.\r\n", clock_at(base, 20));
         assert!(t.watch_poll(id).is_none(), "settling");
         assert!(t.watch_expire(base + Duration::from_millis(20) + GONE_SETTLE));
@@ -383,15 +322,12 @@ mod tests {
             "a row the budget refused is not gone: it is still on screen"
         );
 
-        // More output with the heavy row still visible: still pending.
         t.process_at(b"still working\r\n", clock_at(base, 10));
         assert!(
             t.watch_poll(gone).is_none(),
             "still unread => still pending"
         );
 
-        // The screen is redrawn with a readable match: `await match` latches,
-        // `gone` holds.
         t.process_at(b"\x1b[H\x1b[2Jxxxz\r\n", clock_at(base, 20));
         assert!(t.watch_poll(shown).is_some(), "a readable match latches");
         assert!(
@@ -399,8 +335,6 @@ mod tests {
             "a readable match holds `gone`"
         );
 
-        // The match leaves: every row is read and clear, so `gone` latches once
-        // it has stayed so for `GONE_SETTLE`.
         t.process_at(b"\x1b[H\x1b[2JDone.\r\n", clock_at(base, 30));
         assert!(t.watch_expire(base + Duration::from_millis(30) + GONE_SETTLE));
         assert!(t.watch_poll(gone).is_some(), "the row left => `gone`");
@@ -408,10 +342,6 @@ mod tests {
 
     #[test]
     fn row_matcher_rejects_overlong_pattern() {
-        // A pattern at the ceiling still compiles (it is a valid regex — 1024
-        // literal 'a's); one byte over is rejected before compilation so an
-        // untrusted `await`/agent pattern cannot force an arbitrarily large
-        // parse/compile. Mirrors the search verb's MAX_REGEX_PATTERN_LEN gate.
         let at_cap = "a".repeat(MAX_REGEX_PATTERN_LEN);
         assert_eq!(at_cap.len(), MAX_REGEX_PATTERN_LEN);
         assert!(
@@ -428,11 +358,6 @@ mod tests {
 
     #[test]
     fn row_matcher_bounds_compiled_size() {
-        // `(a{200}){200}` is a short (13-byte) pattern that compiles happily
-        // under a 10 MiB limit but blows past our 128 KiB REGEX_SIZE_LIMIT —
-        // the classic "small pattern, huge NFA" amplifier.
-        // row_matcher must reject it, proving the size caps are wired (not just
-        // the length gate). If this ever compiles, the size_limit call is gone.
         let amplifier = "(a{200}){200}";
         assert!(
             amplifier.len() <= MAX_REGEX_PATTERN_LEN,

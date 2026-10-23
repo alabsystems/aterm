@@ -507,6 +507,11 @@ impl World {
     }
 
     /// THE SIBLING ATTACHES ([`Opts::sibling`]), at its step of the fault
+    /// phase, at the incarnation above every one the node put anything on the
+    /// bus under, as its bridge takes it: its node row `live` and its session's
+    /// row, under the node's own producer id — a copy of the state dir's — at
+    /// sequences of that incarnation, flushed (as a broker's flush lands what
+    /// it holds) so no restart of the log takes them.
     fn sibling_attaches(&mut self) {
         if self.sibling_inc.is_some() {
             return;
@@ -557,6 +562,11 @@ impl World {
     }
 
     /// THE SIBLING DIES ([`Opts::sibling`]): its connection ends, and its will
+    /// — `away` at its incarnation, at that incarnation's will sequence — fires
+    /// as the broker fires one: unless the node has put anything on the log
+    /// under a higher incarnation since, whose higher sequences FENCE it, and
+    /// then the sibling is gone with its rows still `live` and nobody to say
+    /// so.
     fn sibling_dies(&mut self) {
         if self.sibling_dead {
             return;
@@ -647,6 +657,7 @@ impl World {
     }
 
     /// A session's log grows: a bus-class record (three in four) or a local
+    /// one, and the push lane's line that accompanies a timeline record.
     fn log_record(&mut self) {
         let locals = self.ep.locals();
         let Some(local) = self.rng.pick(&locals).copied() else {
@@ -755,6 +766,7 @@ impl World {
     }
 
     /// A step unwound: a simulated kill (the process is dead and its bridge
+    /// is dropped by the caller), or a real panic, which is a violation.
     fn absorb(&mut self, payload: Box<dyn std::any::Any + Send>, process: &Arc<Process>) {
         if payload.is::<SimKill>() {
             self.stats.kills += 1;
@@ -844,6 +856,7 @@ impl World {
     }
 
     /// A session posts: to the other session (a note or an ask), or to the
+    /// person.
     fn post(&mut self) {
         let sessions = self.sessions();
         if sessions.len() < 2 {
@@ -945,6 +958,8 @@ impl World {
     }
 
     /// A POWER CUT of the whole machine: the bridge dies, the broker loses
+    /// what the law lets it, the state dir keeps what the device lets it,
+    /// aterm and its sessions are gone, and the next boot begins.
     fn power_cut(&mut self) {
         self.stats.power_cuts += 1;
         self.note("power cut");
@@ -968,6 +983,13 @@ impl World {
     }
 
     /// ATERM QUITS AND COMES BACK, in the same boot ([`Opts::quits`]): its
+    /// last word on the push lane — `EVENT * bye quit`, latched as the event
+    /// reader latches it — and the bridge's loop until it acknowledged it
+    /// (`link bye quit`, which the quitting instance waits for), or a few
+    /// passes; then the lanes close, and the bridge withdraws the sessions it
+    /// carries and stops its run cleanly ([`crate::state::StateDir::end_run_clean`])
+    /// — unless a kill armed earlier lands inside it, or the disk refuses one
+    /// of its writes, and `run` stays open.
     fn quit(&mut self) {
         let Some(live) = &self.live else {
             return;
@@ -1201,6 +1223,7 @@ impl World {
     }
 
     /// The text markers of the bus's records on this node's and the person's
+    /// lanes: `marker -> [(offset, subject, body)]`.
     fn bus_markers(&self) -> BTreeMap<String, Vec<(u64, String, Body)>> {
         let mut out: BTreeMap<String, Vec<(u64, String, Body)>> = BTreeMap::new();
         for (off, subject, body, _) in self.core.broker.records() {
@@ -1269,6 +1292,8 @@ impl World {
     }
 
     /// The last presence row of every session face under this node, `sid ->
+    /// (state=, inc=, statedir=)`: the face is a last-value one, so the row at the
+    /// highest offset is what every reader takes for the session.
     fn presence_rows(&self) -> BTreeMap<String, (String, Option<u64>, Option<String>)> {
         let prefix = format!("/f/{FLEET}/pub/{NODE}/");
         let mut out = BTreeMap::new();
@@ -1290,6 +1315,13 @@ impl World {
     }
 
     /// THE RUNNING BRIDGE, AS THE BUS SHOWS IT, and what it must be able to
+    /// retire, by the contract (`adoptable`'s doc) and read off the BUS, never
+    /// asked of the bridge, so a bridge that narrows its own rule or loses its
+    /// bookkeeping is judged by the rule it was meant to keep: `(me,
+    /// witnessed)`, its own incarnation — this state dir's newest node row,
+    /// `live`, since every attach takes a fresh one — and the incarnation whose
+    /// WILL was the newest node row when that attach read the face, the row
+    /// just before its first.
     fn running_bridge(&self) -> Option<(u64, Option<(u64, u64)>)> {
         self.live.as_ref()?;
         let rows = self.node_rows();
@@ -1307,6 +1339,7 @@ impl World {
     }
 
     /// THE SIBLING'S INCARNATION, once it attached: the scheduled one's
+    /// ([`Opts::sibling`]) or the racing one's ([`Opts::race`]).
     fn sibling(&self) -> Option<u64> {
         self.sibling_inc.or_else(|| {
             lock(&self.core.broker.state)
@@ -1317,6 +1350,7 @@ impl World {
     }
 
     /// Every row of this node's own presence face, in log order: `(state=,
+    /// inc=)`.
     fn node_rows(&self) -> Vec<(String, Option<u64>, Option<u64>)> {
         let face = crate::subject::node_face(FLEET, NODE, "presence");
         self.core
@@ -1338,6 +1372,7 @@ impl World {
     }
 
     /// PRESENCE, once settled: every hosted session's row says `live`, and no
+    /// departed session's row the running bridge can prove its own still does.
     fn presence_gaps(&self) -> (Vec<String>, Vec<String>) {
         let rows = self.presence_rows();
         let running = self.running_bridge();
@@ -1418,6 +1453,8 @@ impl World {
     }
 
     /// THE READER'S VIEW of every session's `ev` face, decoded and deduped by
+    /// `(ep, seq)` as every reader does: per `ms`, the distinct records that
+    /// hold it, and the covers.
     fn mirror_faces(&self) -> BTreeMap<String, Face> {
         let prefix = format!("/f/{FLEET}/pub/{NODE}/");
         let mut out: BTreeMap<String, Face> = BTreeMap::new();
@@ -1446,6 +1483,8 @@ impl World {
     }
 
     /// THE MIRROR'S AT-MOST-ONCE, at every step (`LogMirror`'s
+    /// `ReaderViewAtMostOnce`): no `ms` of a session's log is two records in
+    /// the reader's view.
     fn mirror_twice(&self) -> Vec<String> {
         let mut bad = Vec::new();
         for (sid, face) in self.mirror_faces() {
@@ -1461,13 +1500,17 @@ impl World {
         bad
     }
 
-    /// THE MIRROR NEVER STOPS FOR ITS PIN. Every atomic batch pin or send
+    /// THE MIRROR NEVER STOPS FOR ITS PIN.
     fn mirror_stopped_for_its_pin(&self) -> Option<String> {
         let n = lock(&self.ep.state).pin_stops;
         (n > 0).then(|| format!("mirror: stopped for its pin {n} times"))
     }
 
     /// Across every boot, at every step: the node's takes
+    /// named ONE alias key over its whole life, so an edge has one alias on
+    /// the bus; and an engaged mirror's total is never below the highest
+    /// total any pin of the node was written with ([`Device::pin_total`]) —
+    /// whatever a power cut tore or rolled back.
     fn mirror_key_and_total(&self) -> Vec<String> {
         let mut bad = Vec::new();
         let keys = lock(&self.ep.state).take_keys.clone();
@@ -1494,6 +1537,10 @@ impl World {
     }
 
     /// THE MIRROR, once settled (`LogMirror`'s `QuiescentMirrorComplete`):
+    /// every hosted session's log landed through its `ms` head, and every
+    /// `ms` up to it is a record in the reader's view or covered by a gap —
+    /// across every move of the log, whose cuts the mirror must say again,
+    /// and across every power cut, a torn pin's included.
     fn mirror_gaps(&mut self) -> Vec<String> {
         let faces = self.mirror_faces();
         let s = lock(&self.ep.state);
@@ -1532,6 +1579,8 @@ impl World {
     }
 
     /// THE MIRROR'S PIN, once settled, in a world whose log never moved: no
+    /// record of a session log is on its `ev` face twice before the reader's
+    /// dedup.
     fn mirror_twice_raw(&self) -> Vec<String> {
         let mut bad = Vec::new();
         for (sid, face) in self.mirror_faces() {
@@ -1546,6 +1595,7 @@ impl World {
     }
 
     /// Whether what settles slowly has: presence (a ghost waits out the
+    /// bridge's patience) and the mirror.
     fn converged(&mut self) -> bool {
         let (bad, left) = self.presence_gaps();
         bad.is_empty() && left.is_empty() && self.mirror_gaps().is_empty()
@@ -1878,6 +1928,8 @@ impl World {
 }
 
 /// The name a quarantined file's copies share: the one its source's path
+/// gives it (`StateDir::move_into_quarantine`: `/` as `.`, a `retired.`
+/// prefix), without the `.<n>` a name already taken adds.
 fn quarantine_base(name: &str) -> &str {
     let parts = match name.split('.').next() {
         Some("logpin") => 1,
@@ -1891,6 +1943,8 @@ fn quarantine_base(name: &str) -> &str {
 }
 
 /// THE QUARANTINE'S SECOND COPIES ([`World::copies_since_launch`]): each pair of
+/// regular files under one source's name ([`quarantine_base`]) that hold the
+/// same bytes.
 fn quarantine_copies(dir: &std::path::Path, names: &[String]) -> Vec<String> {
     let mut by_base: BTreeMap<&str, Vec<(&str, Vec<u8>)>> = BTreeMap::new();
     for name in names {
@@ -2004,6 +2058,8 @@ fn is_marker(text: &str) -> bool {
 }
 
 /// The incarnation and writer mark whose WILL was the newest node row when `inc`'s attach read
+/// the face — the row just before `inc`'s first in `rows` (a node face's rows
+/// in log order, [`World::node_rows`]) — if that row is a will.
 fn witnessed_by(rows: &[(String, Option<u64>, Option<u64>)], inc: u64) -> Option<(u64, u64)> {
     let first = rows.iter().position(|(_, i, _)| *i == Some(inc))?;
     let (state, dead, mark) = rows.get(first.checked_sub(1)?)?;

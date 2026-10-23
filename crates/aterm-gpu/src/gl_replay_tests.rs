@@ -1,28 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The GL arm against wgpu on the same driver: a frame rendered by the wgpu
-//! path records its plan (draw items, load, scissor, instance bytes, atlases,
-//! uniforms, band shift, apron), and [`GpuRenderer::gl_replay_recorded_plan_for_test`]
-//! replays it through the GL arm via the shared `run_frame_plan`. Pipelines,
-//! bindings, the sRGB view selection, clears, scissors, copies, sampling and
-//! the GLSL twins are the GL arm's own; only the plan and its inputs are
-//! shared. The frames must be byte-identical.
-//!
-//! Two oracles, one driver (Mesa: llvmpipe for GL, lavapipe for Vulkan, both
-//! gallivm; or NVIDIA's for both, whose EGL gives wgpu's GL backend a desktop
-//! OpenGL 3.3 context):
-//!
-//! * wgpu's GL backend (`Backends::GL`), the downlevel format plan
-//!   (`srgb_offscreen` false): the GL arm runs the same plan. wgpu's GL backend
-//!   cannot build the glow row at all (naga refuses `@interpolate(linear)` for
-//!   every GLES target), so these fixtures leave the `GlowAdd` streams out; on
-//!   NVIDIA's 3.3 context it cannot build the fx rows either (no storage
-//!   buffer below GLSL 4.00), so the fx fixture is left out there.
-//! * wgpu's Vulkan backend (`Backends::VULKAN`), Linux's production renderer
-//!   before the GL flip, on the native plan: the GL arm emulates the
-//!   Unorm/sRGB view pair with `EXT_sRGB_write_control` and
-//!   `EXT_texture_sRGB_decode`. Every row, `GlowAdd` included.
+//! The GL arm against wgpu on the same driver: a frame rendered by the wgpu path records its plan (draw items, load, scissor, instance bytes, atlases, uniforms, band shift, apron), and [`GpuRenderer::gl_replay_recorded_plan_for_test`] replays it through the GL arm via the shared `run_frame_plan`.
 
 use super::*;
 use crate::device_layer::{
@@ -32,16 +11,7 @@ use crate::device_layer::{
 use crate::gl::device::GlDevice;
 
 impl GpuRenderer {
-    /// The GL half of the differential: replay the last recorded frame plan
-    /// (`frame_plan`, `last_frame_load`/`last_frame_scissor`, the staged
-    /// instance bytes and atlases) on `dev` and read the result back.
-    ///
-    /// The GL rig follows the oracle's format plan: the native plan
-    /// (`srgb_offscreen`) gets one `SRGB8_ALPHA8` texture drawn through both
-    /// views, the downlevel plan an sRGB texture that always encodes.
-    ///
-    /// `opts.seed` supplies the prior frame's texels for a recorded `Load`
-    /// plan; `opts.corrupt` and `opts.downlevel` are the negative controls.
+    /// The GL half of the differential: replay the last recorded frame plan (`frame_plan`, `last_frame_load`/`last_frame_scissor`, the staged instance bytes and atlases) on `dev` and read the result back.
     pub(crate) fn gl_replay_recorded_plan_for_test(
         &mut self,
         dev: &GlDevice,
@@ -93,7 +63,6 @@ impl GpuRenderer {
             unreachable!("the GL handle mints GL textures")
         };
 
-        // Programs for exactly the rows the plan draws; one uniform binding.
         let mut pipelines: [Option<crate::gl::pipelines::GlPipeline>;
             pipeline_table::PIPELINE_COUNT] = std::array::from_fn(|_| None);
         let mut uniform_binding: Option<u32> = None;
@@ -130,8 +99,7 @@ impl GpuRenderer {
             "gl replay uniforms",
             std::mem::size_of::<Uniforms>() as u64,
         )?;
-        // SAFETY: the GL arm's write has no GPU-exclusivity precondition (GL
-        // orders it after every issued read).
+        // SAFETY: the GL arm's write has no GPU-exclusivity precondition (GL orders it after every issued read).
         unsafe {
             handle.write_buffer_from_zero(
                 &ubuf,
@@ -146,7 +114,6 @@ impl GpuRenderer {
             unreachable!("the GL handle mints GL buffers")
         };
 
-        // The instance streams: the SAME bytes the wgpu arm uploaded.
         let mut streams: [Option<crate::gl::resources::GlBuffer>; STREAM_COUNT] =
             std::array::from_fn(|_| None);
         let mut corrupted = !corrupt;
@@ -159,9 +126,6 @@ impl GpuRenderer {
             assert!(!bytes.is_empty(), "a planned stream has bytes");
             let mut bytes = bytes.to_vec();
             if !corrupted {
-                // A colour byte of the first instance (every layout keeps a
-                // colour at offset 8 or later, and bytes 8..12 are colour or
-                // geometry in each).
                 bytes[8] ^= 0x5a;
                 corrupted = true;
             }
@@ -174,7 +138,6 @@ impl GpuRenderer {
             streams[idx] = Some(b);
         }
 
-        // The atlases the plan samples, from the resident CPU-side texels.
         let mut atlases: [Option<(
             crate::gl::resources::GlTexture,
             crate::gl::resources::GlSampler,
@@ -221,7 +184,6 @@ impl GpuRenderer {
                         &src.rgba[..(src.width * src.height * 4) as usize],
                     )
                 }
-                // Replayed fresh below, with the palette.
                 DrawAtlas::Fx => continue,
                 DrawAtlas::Deco | DrawAtlas::Image => {
                     return Err(format!(
@@ -256,8 +218,6 @@ impl GpuRenderer {
             atlases[a as usize] = Some((tex, sampler));
         }
 
-        // The fx bind, fresh: both atlases replayed from the append log, the
-        // palette in one texture.
         let mut fx_tex: [Option<fx_gpu::FxArmTex>; 2] = [None, None];
         let mut fx_palette: Option<crate::gl::resources::GlTexture> = None;
         let fx_sampler = if plan.iter().any(|i| i.atlas == Some(DrawAtlas::Fx)) {
@@ -296,7 +256,6 @@ impl GpuRenderer {
             }),
         };
 
-        // --- the replay: ONE walker, the GL arm --------------------------
         let mut enc = FrameEncoder::gl(dev)?;
         let res = FrameRes::Gl(&rig);
         let passes = run_frame_plan(&mut enc, &res, &plan, load0, scissor)?;
@@ -310,7 +269,6 @@ impl GpuRenderer {
             _ => unreachable!("a GL encoder commits a GL frame"),
         }
 
-        // --- the scroll shift's GL twin ----------------------------------
         if input.scroll_frac_px != 0 {
             let (y0, y1) = aterm_render::scroll_translate::grid_band_px(
                 self.cpu.grid_top(),
@@ -352,7 +310,6 @@ impl GpuRenderer {
                 }
             }
         }
-        // --- the incoming-row apron's GL twin (after the scroll twin) -----
         if let Some(strip) = apron_plan {
             let tex = handle.try_create_texture_2d(
                 "gl replay apron row",
@@ -395,8 +352,7 @@ pub(crate) struct ReplayOpts<'a> {
     pub(crate) seed: Option<&'a Frame>,
     /// Flip one byte of the first planned stream (a negative control).
     pub(crate) corrupt: bool,
-    /// Run the downlevel plan whatever the oracle's (a negative control for
-    /// the view emulation: additive rows then blend in linear light).
+    /// Run the downlevel plan whatever the oracle's (a negative control for the view emulation: additive rows then blend in linear light).
     pub(crate) downlevel: bool,
 }
 
@@ -416,8 +372,6 @@ fn arms_on(backends: wgpu::Backends) -> (GpuRenderer, GlDevice) {
         .unwrap_or_else(|| aterm_spec::host::could_not_run("no system monospace font"));
     let mut gpu = GpuRenderer::from_parts(ctx, cpu, None, Theme::default())
         .expect("the GPU renderer assembles on an acquired device");
-    // The oracle draws on wgpu; a test that wants the production arm re-arms
-    // it (`arm_gl`).
     gpu.disarm_gl_for_oracle();
     gpu.set_bloom(false);
     gpu.set_shimmer(false);
@@ -428,8 +382,6 @@ const ROWS: usize = 6;
 const COLS: usize = 24;
 
 /// The differential's fixtures, each with the streams it claims to drive.
-/// `glow_add` includes the `GlowAdd` streams (cursor aurora, supernova, the
-/// under-glyph light), which wgpu's GL backend cannot draw.
 fn fixtures(gpu: &GpuRenderer, glow_add: bool) -> Vec<(&'static str, RenderInput, Vec<StreamId>)> {
     use StreamId as S;
     use aterm_core::render::{
@@ -483,20 +435,12 @@ fn fixtures(gpu: &GpuRenderer, glow_add: bool) -> Vec<(&'static str, RenderInput
         mode,
     };
 
-    // The emoji draws through the colour row where the host has a colour face,
-    // so this fixture claims only what every host draws; `colour_emoji` below
-    // claims the colour row.
     let mut out: Vec<(&'static str, RenderInput, Vec<StreamId>)> = vec![(
         "text_cursor",
         base_input(),
         vec![S::Bg, S::Glyph, S::Deco, S::CursorBlock],
     )];
 
-    // Colour emoji through the colour atlas: a face, a skin-tone sequence, a
-    // ZWJ family, a flag and a keycap, beside plain text. Only where the host
-    // has a colour face (the Linux lane provisions Noto Color Emoji); a test
-    // that would otherwise pass without it ends COULD NOT RUN
-    // (`end_unless_the_colour_row_ran`).
     if colour_face_installed() {
         let mut term = Terminal::new(ROWS as u16, COLS as u16);
         term.process("\u{1F642} \u{1F680} \u{1F44D}\u{1F3FD} ok\r\n".as_bytes());
@@ -511,8 +455,6 @@ fn fixtures(gpu: &GpuRenderer, glow_add: bool) -> Vec<(&'static str, RenderInput
         ));
     }
 
-    // The wallpaper: a host-prepared RGBA8 image at the frame's pixel size,
-    // under the text, through the wallpaper row and its upload.
     {
         let mut input = base_input();
         let (fw, fh) = gpu.frame_size(ROWS, COLS);
@@ -535,7 +477,6 @@ fn fixtures(gpu: &GpuRenderer, glow_add: bool) -> Vec<(&'static str, RenderInput
         out.push(("wallpaper", input, vec![S::Wallpaper, S::Glyph]));
     }
 
-    // Halos in both modes (and the LUMEN aurora when the oracle can draw it).
     {
         let mut input = base_input();
         input.glow_halo.push(halo(
@@ -570,7 +511,6 @@ fn fixtures(gpu: &GpuRenderer, glow_add: bool) -> Vec<(&'static str, RenderInput
         out.push(("glow_halo", input, drive));
     }
 
-    // Rain: bright-head halos in both modes and sprites through the rain atlas.
     {
         let mut input = base_input();
         input.rain_atlas = Some(scene_atlas(5));
@@ -613,7 +553,6 @@ fn fixtures(gpu: &GpuRenderer, glow_add: bool) -> Vec<(&'static str, RenderInput
         ));
     }
 
-    // Fire: Add and Over patches, two instances per mode, the contrast halo.
     {
         let mut input = base_input();
         for (i, mode) in [FireMode::Add, FireMode::Over].into_iter().enumerate() {
@@ -670,7 +609,6 @@ fn fixtures(gpu: &GpuRenderer, glow_add: bool) -> Vec<(&'static str, RenderInput
         out.push(("fire", input, drive));
     }
 
-    // Sprites: free sprites under and over the text, and a cat quad.
     {
         let mut input = base_input();
         input.free_atlas = Some(scene_atlas(11));
@@ -713,7 +651,6 @@ fn fixtures(gpu: &GpuRenderer, glow_add: bool) -> Vec<(&'static str, RenderInput
         ));
     }
 
-    // Scroll glides both ways: the band shift and the incoming-row apron.
     for (name, frac) in [("scroll", 1i32), ("scroll_down", -1)] {
         let mut input = base_input();
         input.scroll_frac_px = frac * (ch as i32 / 2).max(1);
@@ -749,7 +686,7 @@ fn end_unless_the_colour_row_ran() {
 /// The image plane, which the replay does not reach (it keeps to the glyph
 /// and sprite atlases): a placement over the text and one under it, for the
 /// armed differentials, whose renderers upload the plane through their own
-/// residency. Its claims are the plane's streams.
+/// residency.
 fn image_fixture(gpu: &GpuRenderer) -> (&'static str, RenderInput, Vec<StreamId>) {
     use aterm_core::grid::extra::{ImageData, ImageFormat, ImageRef, ImageScaling};
     use aterm_core::terminal::Terminal;
@@ -758,8 +695,6 @@ fn image_fixture(gpu: &GpuRenderer) -> (&'static str, RenderInput, Vec<StreamId>
     term.set_cell_pixel_size(cw as u16, ch as u16);
     term.process(b"$ images over and under >_\r\nunder the picture 0123456789\r\n");
     let mut input = term.cell_frame(ROWS, COLS);
-    // (z, first row, first col, seed): a raster with translucent texels, so
-    // the plane's blend is in the comparison, not only its copy.
     for (z, row0, col0, seed) in [(0, 0usize, 2usize, 7usize), (-1, 1, 12, 41)] {
         let (w, h) = (17u16, 11u16);
         let image = Arc::new(ImageData {
@@ -804,9 +739,7 @@ fn image_fixture(gpu: &GpuRenderer) -> (&'static str, RenderInput, Vec<StreamId>
 /// Glow (an Index8 sprite, flipped, at an odd scale, over additive and
 /// source-over entries) and Over (a translucent rect and a Premul sprite with
 /// additive, clear, translucent and opaque texels), and Linear layers at Under
-/// and Over (a tinted Straight sprite, one flipped). Each arm uploads both
-/// atlases and the frame palette through its own residency; the replay
-/// rebuilds them from the atlas log.
+/// and Over (a tinted Straight sprite, one flipped).
 fn fx_fixture(gpu: &GpuRenderer) -> (&'static str, RenderInput, Vec<StreamId>) {
     use aterm_core::render::{
         FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRamps, FxRect, FxSlot, FxSpace,
@@ -997,18 +930,10 @@ fn assert_frames_identical(name: &str, expected: &Frame, actual: &Frame) {
 }
 
 /// Render every fixture on the oracle, replay it on the GL arm, compare.
-/// Returns one summary line per fixture.
 fn run_differential(backends: wgpu::Backends, glow_add: bool) -> Vec<String> {
     let (mut gpu, dev) = arms_on(backends);
     let mut win = WindowGpu::new();
     let mut fixtures = fixtures(&gpu, glow_add);
-    // wgpu reads the fx palette from a fragment storage buffer; a device that
-    // cannot build the fx rows stages no fx stream (`EffectPipelines::ensure`),
-    // so its plan has none to replay and the fixture's claims would fail on
-    // the oracle, not GL. Its limits cannot say so: NVIDIA's EGL gives wgpu's
-    // GL backend a desktop GL 3.3 context whose limits count
-    // `ARB_shader_storage_buffer_object`'s blocks, but naga writes GLSL 3.30
-    // and a storage buffer only from 4.00. The device's own answer decides.
     let device = gpu.ctx.device.clone();
     gpu.effects.ensure(&device, EffectPipeline::Fx);
     gpu.effects.ensure(&device, EffectPipeline::FxLinear);
@@ -1044,7 +969,6 @@ fn run_differential(backends: wgpu::Backends, glow_add: bool) -> Vec<String> {
     for (name, input, drive) in fixtures.drain(..) {
         run(&mut gpu, &mut win, name, &input, &drive);
     }
-    // The translucent cursor fill, through the CursorBlend row.
     gpu.set_cursor_opacity(0.5);
     let input = fixtures_base_for_cursor();
     run(
@@ -1124,10 +1048,7 @@ fn a_flipped_instance_byte_breaks_the_gl_replay() {
 }
 
 /// The negative control for the view emulation: on the native plan, the
-/// additive rows draw through the raw (Unorm) view. Replaying the same glow
-/// frame on the downlevel plan (every pass encoded and blended in linear)
-/// must differ, so the Vulkan differential's agreement means the sRGB write
-/// control was honoured, not ignored.
+/// additive rows draw through the raw (Unorm) view.
 #[test]
 fn the_raw_view_is_what_makes_the_native_plan_match() {
     let (mut gpu, dev) = arms_on(wgpu::Backends::VULKAN);
@@ -1215,8 +1136,7 @@ fn armed_gl_readbacks_match_the_wgpu_arm_byte_for_byte() {
 /// extract into a half-resolution target and the screen composite), heat
 /// shimmer (stage copy and refract, phase pinned) and the tray card, each in
 /// the shared order, against an unarmed renderer's wgpu Vulkan frame byte for
-/// byte. The plain frame is the control: without the layers the two arms'
-/// frames differ from the layered ones.
+/// byte.
 #[test]
 fn armed_gl_effect_layers_match_the_wgpu_arm_byte_for_byte() {
     use aterm_core::render::{FireMode, FirePatch};
@@ -1318,8 +1238,6 @@ fn presented(
     tray: Option<TrayQuad<'_>>,
     crop: Option<(PresentCrop, (u32, u32))>,
 ) -> Frame {
-    // The SDR crown eases on the wall clock; each present starts its envelope
-    // fresh so both arms draw the same crown level.
     gpu.reset_glow_ease_for_test(win);
     let ok = match crop {
         None => gpu.present_virtual(win, input, invert, overlay, tray),
@@ -1331,8 +1249,6 @@ fn presented(
     let raw = gpu
         .virtual_presented_snapshot_current(win, win.resident_input_epoch(), 1)
         .expect("the presented destination reads back");
-    // What a capture's admission reserves for it, on either arm: the GL arm's
-    // tightly packed rows, wgpu's padded ones.
     assert_eq!(win.virtual_snapshot_bytes(), Some(raw.allocation()));
     let shot = raw.convert().expect("the presented destination converts");
     Frame {
@@ -1391,8 +1307,6 @@ fn armed_gl_presents_match_the_wgpu_arm_byte_for_byte() {
     fixtures.push(image_fixture(&oracle));
     fixtures.push(fx_fixture(&oracle));
     fixtures.push(("heat", heat_input(&oracle), Vec::new()));
-    // The layers the fixtures drive: the bloom halo and the SDR crown (cursor
-    // glow), the shimmer (an additive fire patch), the sub-row glide (scroll).
     assert!(
         fixtures
             .iter()
@@ -1431,9 +1345,6 @@ fn armed_gl_presents_match_the_wgpu_arm_byte_for_byte() {
             );
             assert_frames_identical(&format!("present {name} (pass {pass})"), &expected, &actual);
         }
-        // A changed row over the resident frame (the scissored repaint).
-        // A host write after the fill: the row stamps are not trusted, so the
-        // diff compares content.
         let mut changed = input.clone();
         changed.row_rev_lane = 0;
         if let Some(cell) = changed.cells.get_mut(1).and_then(|r| r.get_mut(2)) {
@@ -1442,7 +1353,6 @@ fn armed_gl_presents_match_the_wgpu_arm_byte_for_byte() {
         let expected = presented(&mut oracle, &mut win_o, &changed, false, None, None, None);
         let actual = presented(&mut armed, &mut win_a, &changed, false, None, None, None);
         assert_frames_identical(&format!("present {name} (changed row)"), &expected, &actual);
-        // A cropped source letterboxed into a larger destination.
         let (fw, fh) = oracle.frame_size(changed.rows, changed.cols);
         let crop = PresentCrop {
             source_y: (fh / 4) as u32,
@@ -1508,8 +1418,7 @@ fn a_changed_present_changes_the_gl_destination() {
 /// first armed present, the next frame's first `eglMakeCurrent` reports
 /// `EGL_CONTEXT_LOST`, that present drops, and the renderer reports the device
 /// lost with its cause, which is what sends the frontend to the CPU renderer
-/// (`recover_from_gpu_loss`). The negative control: the same presents on an
-/// undrilled renderer stay on GL and the device stays live.
+/// (`recover_from_gpu_loss`).
 #[test]
 fn a_lost_gl_context_reaches_device_lost() {
     let input = fixtures_base_for_cursor();
@@ -1531,8 +1440,6 @@ fn a_lost_gl_context_reaches_device_lost() {
     drilled.arm_gl();
     drilled.gl_inject_loss_after_for_test(1);
     let mut win = WindowGpu::new();
-    // `present_virtual`, not `presented`: the drill arms the device's next
-    // bind, which the helper's snapshot readback would take.
     assert!(
         drilled.present_virtual(&mut win, &input, false, None, None),
         "the first present draws"
@@ -1542,9 +1449,6 @@ fn a_lost_gl_context_reaches_device_lost() {
         !drilled.device_lost(),
         "the drill fires after the present, not during it"
     );
-    // A second window, so the lost frame's scope is Full: this build falls a
-    // failed GL frame through to the wgpu tail, which repaints a Dirty scope
-    // only over a wgpu offscreen of its own, and the first window has none.
     let mut win2 = WindowGpu::new();
     assert!(
         !drilled.present_virtual(&mut win2, &changed, false, None, None),

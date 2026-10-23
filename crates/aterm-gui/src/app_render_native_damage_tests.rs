@@ -32,8 +32,6 @@ fn native_leaf_cache_releases_hidden_tab_rasters_without_repainting_visible_leaf
         .clone();
     let mut views = vec![first];
 
-    // Paint through the plan entry alone, skipping the plan-binding
-    // retirement: every visited live tab keeps its raster.
     for visit in 0..6 {
         if visit != 0 {
             let (_, view) = app
@@ -58,8 +56,6 @@ fn native_leaf_cache_releases_hidden_tab_rasters_without_repainting_visible_leaf
     let compilations = crate::app_native::native_ui_compile_count();
     assert!(before >= current_bytes * 6 && current_bytes > 0);
 
-    // The shipping capture/paint entry prunes that history immediately and
-    // preserves the current allocation and compiled scene byte for byte.
     assert!(app.prepare_native_input_scratch(wid));
     assert_eq!(app.windows[&wid].leaf_render_cache.len(), 1);
     assert_eq!(retained_native_raster_bytes(&app, wid), current_bytes);
@@ -75,8 +71,6 @@ fn native_leaf_cache_releases_hidden_tab_rasters_without_repainting_visible_leaf
         "native leaf cache: six visited tabs retained {before} RGBA bytes before, {current_bytes} after"
     );
 
-    // Further ordinary visits remain bounded; tabs and semantic view state
-    // stay live and can repaint on return. A terminal capture releases all.
     for index in 1..=views.len() {
         app.switch_tab_in(wid, index);
         assert!(app.prepare_native_input_scratch(wid));
@@ -416,8 +410,6 @@ fn desktop_settings_route_repaint_keeps_full_damage_authoritative() {
         "Top -> Packages at the shipped desktop viewport must repaint the retained page, including its sidebar"
     );
 
-    // The same through the real Settings reducer and retained raster: the
-    // route action asks for a full repaint and the next preparation does one.
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
@@ -635,8 +627,6 @@ fn native_chrome_redraw_reuses_compiled_tree_but_real_damage_rebuilds() {
         );
     }
 
-    // A modal changes the presented composite, while the page underneath
-    // remains the same retained paint/hit-test/accessibility authority.
     app.palette_enter();
     assert!(app.prepare_native_input_scratch(wid));
     assert_eq!(crate::app_native::native_ui_compile_count(), compiled_count);
@@ -651,8 +641,6 @@ fn native_chrome_redraw_reuses_compiled_tree_but_real_damage_rebuilds() {
         pixels
     );
 
-    // Negative controls: explicit preview damage and semantic route edits
-    // must still enter the genuine compiler and replace retained semantics.
     app.invalidate_native_view_cache(wid, view, crate::native_app::DamageRegion::All);
     assert!(app.prepare_native_input_scratch(wid));
     assert_eq!(
@@ -720,12 +708,9 @@ fn settings_preview_tick_patches_only_the_retained_preview_band() {
 /// specimen's frame columns, never the static colour sample beside it, the
 /// cards, their headers or the gutter between them (each tick used to
 /// re-raster the union of every preview's whole card, 2.6x to 3.3x the moving
-/// area on a wide Home page). Negative control: a page whose previews are all
-/// still (the default Text & Fonts) arms no tick at all.
+/// area on a wide Home page).
 #[test]
 fn a_top_settings_tick_repaints_only_the_moving_specimen() {
-    // A settled face, so no font convergence widens the tick to every
-    // preview that shares it.
     let mut renderer = aterm_render::Renderer::from_bytes(
         aterm_render::embedded_font(),
         14.0,
@@ -744,7 +729,6 @@ fn a_top_settings_tick_repaints_only_the_moving_specimen() {
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
     let (_, view) = app.active_native_view(wid).expect("native Settings view");
     assert!(app.prepare_native_input_scratch(wid));
-    // Two ticks first: the first frames settle what the page draws.
     for phase in [33, 66] {
         app.invalidate_active_native_settings_preview(wid, phase);
         assert!(app.prepare_native_input_scratch(wid));
@@ -805,7 +789,6 @@ fn a_top_settings_tick_repaints_only_the_moving_specimen() {
         && device(still_rect.y) < (rect.y + rect.height) as f32;
     assert!(!overlaps, "the tick repainted the still colour sample");
 
-    // Negative control: the still Text & Fonts page arms no tick.
     let mut app = App::headless_for_test();
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::TextFonts));
     assert!(app.prepare_native_input_scratch(wid));
@@ -822,10 +805,7 @@ fn a_top_settings_tick_repaints_only_the_moving_specimen() {
 /// Every screen of Top Settings paints its previews in the prepared font,
 /// through the real host seam (the font is prepared before the render seats
 /// the scroll, and each screen is compiled exactly once): the shipped 102x29,
-/// a short wide 167x36 and a tall 120x70, scrolled a Page Down at a time. And
-/// a screen that draws the cursor preview schedules its motion, its link row
-/// cut off below it or not. (The font was prepared only at the paged list's
-/// old offsets, so a scrolled Top Settings painted its previews blank.)
+/// a short wide 167x36 and a tall 120x70, scrolled a Page Down at a time.
 #[test]
 fn every_top_settings_screen_paints_ready_previews_and_moves_the_cursor_it_draws() {
     let mut renderer = aterm_render::Renderer::from_bytes(
@@ -915,10 +895,6 @@ fn ineligible_native_preview_skips_font_polling_then_recording_converges() {
     assert!(before.pending);
     font_job.complete();
 
-    // A queued completion makes polling observable: a sampler that ran here
-    // would install it though this park cannot use the result. Focused and
-    // unfocused unrecorded headless views skip the sampler, as does an
-    // overlay-covered recording.
     for focused in [true, false] {
         app.windows.get_mut(&wid).unwrap().focused = focused;
         for phase_ms in [33, 66, 99] {
@@ -941,8 +917,6 @@ fn ineligible_native_preview_skips_font_polling_then_recording_converges() {
     );
     app.windows.get_mut(&wid).unwrap().overlay = None;
 
-    // The recording exception still observes completion on an unfocused
-    // headless window and keeps its final ready repaint alive.
     assert_eq!(
         app.native_settings_preview_for_tick(wid, 165, true),
         Some((view, crate::settings_preview::PreviewAnimation::Continuous))
@@ -976,8 +950,6 @@ fn project_native_preview_font_convergence(
             _ => None,
         })
         .expect("retained Typography preview");
-    // Observe one candidate's completion cycle without polling its worker.
-    // Superseded results belong to the separate prewarm handshake model.
     let current = crate::tray_raster::semantic_font_snapshot_for_test(&retained.font_candidate);
     observed.insert("pending", i64::from(current.pending));
     observed.insert("ready", i64::from(current.ready_epoch != initial_epoch));
@@ -993,8 +965,6 @@ fn project_native_preview_font_convergence(
 }
 
 /// Run `drive` and assert it entered `action`'s shipping refinement anchor.
-/// Entry alone does not tell a transition from a no-op; the caller validates
-/// the state change.
 fn drive_native_preview_action<T>(action: &str, drive: impl FnOnce() -> T) -> T {
     use aterm_spec::xref;
 
@@ -1032,8 +1002,6 @@ fn static_native_preview_paints_the_completed_font_before_disarming() {
             })
             .expect("visible Typography preview")
     };
-    // Completion may first be observed while arming the next wake, or by
-    // the already-due deadline itself. Both must retain the final repaint.
     for (poll_before_due, serious) in [(true, false), (false, false), (true, true), (false, true)] {
         let mut app = App::headless_for_test();
         app.set_serious_mode(serious);
@@ -1086,8 +1054,6 @@ fn static_native_preview_paints_the_completed_font_before_disarming() {
                 "real Settings font request, completion and retained repaint",
             );
             assert!(ok, "font convergence {action}: {why}");
-            // Entry alone is insufficient: omitting each real state
-            // change must fail the same transition validation.
             let missing_fields: &[&str] = match action {
                 "Finish" => &["pending", "ready"],
                 "Invalidate" => &["dirty"],
@@ -1114,8 +1080,6 @@ fn static_native_preview_paints_the_completed_font_before_disarming() {
         let requested = bind("Decide", &model.init_state(), &app, Some(initial_decision));
         font_job.complete();
 
-        // A queued worker result is not installed yet. Projection must
-        // remain observational and cannot supply the missing Finish step.
         assert_eq!(
             project_native_preview_font_convergence(
                 &app,
@@ -1128,8 +1092,6 @@ fn static_native_preview_paints_the_completed_font_before_disarming() {
             requested
         );
 
-        // Isolate the shipping request/poll seam before the arm predicate
-        // so completion and cadence each have their own observed transition.
         if poll_before_due {
             drive_native_preview_action("Finish", || {
                 app.prepare_native_semantic_font(wid, view, 33).unwrap()
@@ -1229,9 +1191,6 @@ fn appearance_paint_identity_forces_full_native_raster() {
     let full_rasters = retained.full_rasters;
     let regional_rasters = retained.regional_rasters;
     let appearance_stamp = crate::app_native::NativeUiCompileStamp {
-        // Native appearance preferences are folded into paint_revision.
-        // Vary that identity directly so this test remains isolated from the
-        // process-global platform preference observer used by parallel tests.
         paint_revision: previous_stamp.paint_revision.wrapping_add(1),
         ..previous_stamp
     };
@@ -1376,8 +1335,6 @@ fn heterogeneous_bail_after_a_leaf_rasters_drops_the_reusable_card() {
         .as_ref()
         .expect("mixed native tray");
     let (fp, geom) = (resident.fp, resident.geom);
-    // Stand-in for the pre-patch pixels: bytes no rebuilt composite contains,
-    // so a reused card shows.
     app.windows
         .get_mut(&wid)
         .unwrap()
@@ -1387,10 +1344,6 @@ fn heterogeneous_bail_after_a_leaf_rasters_drops_the_reusable_card() {
         .rgba
         .fill(0xFF);
 
-    // A regional patch of an otherwise identical stamp — the one shape whose
-    // new pixels `fp` cannot see — followed by a sibling that transiently
-    // disappears from the pool. Its view still resolves, so the route stays
-    // heterogeneous and the loop reaches (and bails on) the missing session.
     app.invalidate_native_view_cache(
         wid,
         native_view,
@@ -1441,10 +1394,7 @@ fn heterogeneous_bail_after_a_leaf_rasters_drops_the_reusable_card() {
     );
 }
 
-/// A mixed native/terminal split has one focused metadata authority. OSC 12
-/// and absolute-row anchors follow a focused terminal's exact extracted
-/// snapshot, while focusing the native sibling returns those terminal-only
-/// fields to neutral instead of retaining a stale prior frame.
+/// A mixed native/terminal split has one focused metadata authority.
 #[test]
 fn heterogeneous_focus_projects_terminal_cursor_color_and_row_metadata() {
     let mut app = App::headless_for_test();
@@ -1478,10 +1428,6 @@ fn heterogeneous_focus_projects_terminal_cursor_color_and_row_metadata() {
         window.input_scratch.absolute_row_revision,
         pane.absolute_row_revision
     );
-    // Both row-identity stamps travel together: a width reflow renumbers
-    // history without touching the footer revision, so a projection that
-    // carried only the revision would hand the find overlay a fresh-looking
-    // key for a frame whose rows moved.
     assert_eq!(
         window.input_scratch.history_renumber_epoch,
         pane.history_renumber_epoch
@@ -1537,8 +1483,7 @@ fn heterogeneous_focus_projects_terminal_cursor_color_and_row_metadata() {
 /// arrows and page keys reach the page without entering the semantic
 /// compiler (they used to compile the whole page, every result row, per key,
 /// just to ask whether a text field had the keyboard); the next redraw
-/// compiles once. Return on a focused control after a warm redraw reads the
-/// retained tree and fires its action with no compile of its own.
+/// compiles once.
 #[test]
 fn keys_reuse_the_retained_compile_instead_of_compiling_the_page() {
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
@@ -1614,7 +1559,6 @@ fn keys_reuse_the_retained_compile_instead_of_compiling_the_page() {
         warm + 1,
         "the redraw compiles once"
     );
-    // Return on the focused control reads the retained tree.
     let Some(crate::native_app::AppViewState::Settings(state)) =
         app.native_runtime.view_state(view)
     else {
@@ -1640,7 +1584,6 @@ fn keys_reuse_the_retained_compile_instead_of_compiling_the_page() {
 /// more motion, so the poll that sees it rest still asks for one last edge
 /// while the retained raster shows a playing frame, and that repaint draws
 /// the settled frame, whatever phase the last input left the tape at.
-/// Negative control: once the settled frame is drawn the poll goes idle.
 #[test]
 fn a_resting_theme_demo_draws_its_settled_frame_once() {
     use crate::settings_theme_demo::{DEMO_LOOP_MS, frame_key};
@@ -1652,7 +1595,6 @@ fn a_resting_theme_demo_draws_its_settled_frame_once() {
         window.rows = 50;
         window.focused = true;
     }
-    // The page has been open ten minutes, its tape touched mid-loop.
     let open_for = std::time::Duration::from_secs(600);
     app.lat_epoch = std::time::Instant::now()
         .checked_sub(open_for)
@@ -1667,7 +1609,6 @@ fn a_resting_theme_demo_draws_its_settled_frame_once() {
         };
         state.showcase.input_pending.set(false);
         state.showcase.last_input_phase_ms.set(at);
-        // The tape is mid-loop, away from the frame it opens on.
         state
             .showcase
             .demo_epoch_ms
@@ -1697,7 +1638,6 @@ fn a_resting_theme_demo_draws_its_settled_frame_once() {
         "the control: a playing frame is drawn"
     );
 
-    // Three loops pass with nothing touched.
     set_last_input(&mut app, 0);
     let phase = now + 7;
     assert_eq!(
@@ -1715,8 +1655,7 @@ fn a_resting_theme_demo_draws_its_settled_frame_once() {
 
 /// A Themes demo tick repaints its terminal grid, never its window: the
 /// regional raster a tick asks for covers the grid alone, a fraction of the
-/// demo's node. Negative control: any other scene's tick covers its whole
-/// node.
+/// demo's node.
 #[test]
 fn a_theme_demo_tick_repaints_only_its_grid() {
     let mut app = App::headless_for_test();
@@ -1745,11 +1684,6 @@ fn a_theme_demo_tick_repaints_only_its_grid() {
         })
         .expect("the demo is drawn");
     let grid = spec.tick_rect(node);
-    // The grid is the frame's inside, under its tab strip: a tick never
-    // repaints the strip, the frame's hairline or the shadow around it. No
-    // share of the node says this, as the strip and the frame are a fixed
-    // band and the grid grows with the window: at 160×50 cells the grid is
-    // 93% of the demo in Windows' 9×23 cell.
     assert!(
         grid.y >= node.y + crate::settings_preview::DEMO_STRIP_HEIGHT
             && grid.x > node.x
@@ -1777,21 +1711,12 @@ fn a_theme_demo_tick_repaints_only_its_grid() {
         "{pixels} > {grid_pixels}: {rect:?} grid {grid:?} node {node:?} scale {scale}"
     );
 
-    // Any other scene's tick repaints its terminal body at most, never its
-    // card or header.
     let mut typography = spec.clone();
     typography.scene = crate::settings_preview::PreviewScene::Typography;
     assert_eq!(typography.tick_rect(node), typography.terminal_rect(node));
 }
 
-/// A KEY A NATIVE PAGE TAKES IS TIMED TO THE PRESENT OF ITS ANSWER. The
-/// input→present ledger (`input_*`) closed a window's keystrokes only at a
-/// present with PTY output pending, and a native page answers a key with
-/// pixels, so typing into Settings search booked nothing, on glass or in a
-/// headless present-real take, and its latency could not be quoted. A key the
-/// page takes now arms the window's native ring; a present of pixels already
-/// shown leaves it armed; the present that puts the page's answer on glass
-/// closes it. A modifier alone arms nothing.
+/// A KEY A NATIVE PAGE TAKES IS TIMED TO THE PRESENT OF ITS ANSWER.
 #[test]
 fn a_key_typed_into_a_native_page_is_timed_to_the_present_of_its_answer() {
     use crate::input::InputEvent;
@@ -1815,7 +1740,6 @@ fn a_key_typed_into_a_native_page_is_timed_to_the_present_of_its_answer() {
     )
     .unwrap();
     let (instance, first_view) = app.active_native_view(wid).unwrap();
-    // One present of the page as it stands: `raster` re-rasters it first.
     let present = |app: &mut App, raster: bool| {
         let (_, view) = app.active_native_view(wid).unwrap();
         if raster {
@@ -1891,8 +1815,6 @@ fn a_key_typed_into_a_native_page_is_timed_to_the_present_of_its_answer() {
     );
     app.switch_tab_in(wid, 1);
     assert_eq!(app.active_native_view(wid).unwrap().1, first_view);
-    // Switching back can publish unrelated service revisions. A fresh input
-    // binds the answer the returned view now owes, never the other view's.
     type_key(&mut app, key(Key::Character('r')));
     present(&mut app, true);
     assert!(!pending(&app), "the returned view's new input presented");

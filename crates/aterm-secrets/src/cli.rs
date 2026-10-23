@@ -184,6 +184,7 @@ struct Fill {
     /// `--no-with`: drop the anchor a re-set would otherwise keep.
     no_with: bool,
     /// `--fleet-reads-anchors`: every machine and admin runs an aterm that reads anchors, so
+    /// the vault's first anchored entry may be published.
     fleet_reads_anchors: bool,
 }
 
@@ -253,6 +254,7 @@ const SERVE_SWITCHES: &[&str] = &["--no-keep-awake", "--no-advertise"];
 const MAX_HOLD_SECS: u64 = 60;
 
 /// What `serve` was asked for, checked when the command line is parsed, so `server on`
+/// installs only a command line `serve` accepts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ServeSettings {
     listen: std::net::SocketAddr,
@@ -624,6 +626,7 @@ mod unix {
     const OPEN_VAULT: &str = "this vault is open: every machine that reaches its server and asks to join is let in within seconds, with no password and no code, and reads [everyone]'s entries, except a machine you let go (aterm secrets password set closes it)";
 
     /// What a vault at a path says where one served at a URL says whom its `[join]` lets in: a
+    /// path has no join queue, so nothing lets a machine in by itself there.
     const PATH_JOINS: &str = "a vault at a path has no join queue: a machine joins it only when an admin approves its key: aterm secrets approve <age1…> --name <host>";
 
     /// What a publish that let a machine go from an open vault says.
@@ -784,6 +787,9 @@ mod unix {
     }
 
     /// Say what a publish did: the version, a key rotation (for the ALab vault, what the next
+    /// release must carry; for any vault, that its second key change leaves out the builds
+    /// before handoff chains), and this machine's own sync failing (the publish stands either
+    /// way).
     fn published(what: &str, done: &Published) -> ExitCode {
         let rotated = if done.rotated {
             ", signed by a new vault key the old one endorsed"
@@ -838,6 +844,8 @@ mod unix {
     }
 
     /// What a vault's first version with two handoff pairs costs: an aterm built before
+    /// chains parses at most one pair, so it fails every sync of this vault (`expected
+    /// locker: or signature:`) and, serving it, refuses the version (400), until it updates.
     const LONG_CHAIN_NOTE: &str = "this version carries a second key handoff: an aterm built before handoff chains reads at most one, so every Mac running one fails each sync of this vault, and a server running one refuses it, until it is updated\n";
 
     fn yes(answer: Option<String>) -> bool {
@@ -882,6 +890,7 @@ mod unix {
     }
 
     /// The terminal while a password is typed: no echo, no line editing, and no signals, so
+    /// Ctrl-C arrives as a byte and the settings are put back before the process ends.
     struct Quiet {
         tty: std::fs::File,
         saved: String,
@@ -911,7 +920,7 @@ mod unix {
     /// The longest line a hidden prompt keeps (its buffer never grows, so no copy is left).
     const HIDDEN_MAX: usize = 1024;
 
-    /// One line typed at the terminal without echo. `None` with no terminal; Ctrl-C ends
+    /// One line typed at the terminal without echo.
     fn ask_hidden(prompt: &str) -> Option<SecretBytes> {
         let mut tty = std::fs::OpenOptions::new()
             .read(true)
@@ -954,6 +963,7 @@ mod unix {
     }
 
     /// A password piped in for `--password-stdin` or `password set`: one line, blanks
+    /// around it dropped.
     fn piped_password(what: &str) -> crate::Result<SecretBytes> {
         if std::io::stdin().is_terminal() {
             return Err(Error::new(format!("{what} reads the password from a pipe")));
@@ -1683,6 +1693,7 @@ mod unix {
     }
 
     /// Why the vault's first anchored entry waits for the fleet: no machine tells the vault
+    /// which aterm it runs, so the admin says it.
     const FIRST_ANCHOR: &str = "this is the vault's first anchored entry (if-absent=<anchor>), and an aterm older than anchors refuses every version that holds one: a machine on it applies nothing until it updates, and an admin on it cannot open the vault. Update every machine and admin first (there `aterm secrets --help` names --with)";
 
     /// `doc` with entry `name` set for `audience` as `set` sets it, and the anchor the entry got.
@@ -2404,6 +2415,7 @@ mod tests {
     const PROFILE: &str = "~/.aterm/release-credentials.toml";
 
     /// A vault of one machine holding the release key and profile as if-absent entries, with
+    /// no anchor yet, as the live one does.
     #[cfg(unix)]
     fn unanchored_vault() -> crate::text::Document {
         let recipient = crate::age::Identity::generate()
@@ -2580,6 +2592,7 @@ mod tests {
     }
 
     /// Anyone on the LAN can read a waiting machine's key from the listing and queue it from
+    /// its own address under a name of its choosing, beside the machine's line.
     #[cfg(unix)]
     #[test]
     fn approve_takes_no_key_listed_under_two_names() {
@@ -2731,6 +2744,7 @@ mod tests {
     }
 
     /// A relative `--store` is under the home directory whether launchd (from `/`), systemd
+    /// (from the home directory) or a person in another directory runs the server.
     #[cfg(unix)]
     #[test]
     fn a_relative_store_is_under_the_home_directory() {
@@ -2745,6 +2759,8 @@ mod tests {
     }
 
     /// A server set up with no flags answers the default vault's URL: on macOS it advertises
+    /// that name unless told another, or none, and only on every address at the URL's port,
+    /// so a server hand-run on loopback or another port takes no Mac's name.
     #[test]
     fn serve_advertises_the_default_vaults_name_unless_told() {
         let advertised = |line: &str| {
@@ -2836,6 +2852,7 @@ mod tests {
     }
 
     /// `join`'s last line and `status`'s membership line for a waiting Mac say how a
+    /// mistyped join password is fixed, beside what an admin runs.
     #[cfg(unix)]
     #[test]
     fn a_waiting_machine_is_told_how_a_mistyped_join_password_is_fixed() {
@@ -2946,6 +2963,8 @@ mod tests {
     }
 
     /// An edit on a new vault at a path under `root`: the person adds `note` while another
+    /// admin lets `mb` in and sets `other`, so the save is refused; reopened, the person quits
+    /// without saving and answers `publish` when asked to publish the draft as it is.
     #[cfg(unix)]
     fn edit_reopened_unchanged(
         root: &std::path::Path,
@@ -3019,6 +3038,7 @@ mod tests {
     }
 
     /// A key approved with `--name` gets that name or none: a name that is not a machine name
+    /// is a usage error, never a generic `machine` in its place.
     #[test]
     fn a_key_is_never_approved_under_a_name_it_was_not_given() {
         for refused in [
@@ -3042,6 +3062,7 @@ mod tests {
     }
 
     /// A value piped to `set` loses its line end only when it is one line of text; a binary
+    /// value that happens to end in LF (or CR LF) keeps every byte, as `--file` keeps it.
     #[cfg(unix)]
     #[test]
     fn a_piped_value_loses_its_line_end_only_when_it_is_one_line_of_text() {
@@ -3067,6 +3088,9 @@ mod tests {
     }
 
     /// `revoke` and `admins remove` name everything the machine could read: an admin read the
+    /// whole text in the admin locker, every host section's entries too; any machine read
+    /// `[everyone]`'s locker beside its own sections', so an `[everyone]` value its section
+    /// overrides is named as well.
     #[cfg(unix)]
     #[test]
     fn letting_a_machine_go_names_everything_it_could_read() {
@@ -3115,6 +3139,9 @@ mod tests {
     }
 
     /// A JOIN CODE TYPED FOR A MACHINE (`revoke`, `set|unset --for`, as `admins`) reaches the
+    /// machine whose key has it, never one an older approver let in under that code as its
+    /// name; a name passes as typed, and a code no key has is refused, even when a machine is
+    /// so named.
     #[cfg(unix)]
     #[test]
     fn a_code_typed_for_a_machine_reaches_the_key_that_has_it() {
@@ -3156,6 +3183,7 @@ mod tests {
     }
 
     /// `status` of a machine of a signed vault names it by its code: the name it asked for
+    /// may be another machine's in the vault.
     #[cfg(unix)]
     #[test]
     fn status_names_a_machine_of_a_signed_vault_by_its_code() {
@@ -3182,6 +3210,7 @@ mod tests {
     }
 
     /// A subscriber played with an inert arm: `state` says its state and `install` stands in
+    /// for an install (each test counts them), never a launchd job or a systemd unit.
     #[cfg(unix)]
     fn played<'a>(
         state: &'a dyn Fn() -> crate::Result<crate::service::State>,
@@ -3199,6 +3228,8 @@ mod tests {
     }
 
     /// The approver goes in where it does not run: a subscriber that is not installed, or one
+    /// installed with no process, is installed; a running one is left be; a state that cannot
+    /// be read installs nothing (an install asks the same service manager).
     #[cfg(unix)]
     #[test]
     fn the_approver_is_put_in_only_where_it_does_not_run() {
@@ -3264,6 +3295,8 @@ mod tests {
     }
 
     /// Where no approver runs on this Mac, a command that needs one says so, and that `aterm
+    /// secrets agent on` starts one; one it installed shows its install line; one that ran
+    /// already says nothing.
     #[cfg(unix)]
     #[test]
     fn a_command_whose_approver_does_not_run_says_what_starts_one() {
@@ -3308,6 +3341,9 @@ mod tests {
     }
 
     /// A vault at a path has no join queue, so nothing lets a machine in there by itself:
+    /// where `password` would say an open vault lets in every machine that asks, or a join
+    /// password lets in whoever types it, it says a machine joins only by an admin's approval
+    /// of its key.
     #[cfg(unix)]
     #[test]
     fn a_vault_at_a_path_says_a_machine_joins_it_by_key() {
@@ -3338,6 +3374,9 @@ mod tests {
     }
 
     /// `create` puts this Mac's approver in, as `join` puts the subscriber in, so a machine
+    /// that types the new vault's join password is let in; `--no-agent` installs nothing, but
+    /// reads the subscriber, which, already running, approves for the new vault too; a failed
+    /// install leaves the vault made (exit 0) with a warning.
     #[cfg(unix)]
     #[test]
     fn create_puts_in_the_approver_unless_told_not_to() {
@@ -3406,6 +3445,8 @@ mod tests {
     }
 
     /// A vault server that takes a vault's first version and then fails every read, as one that
+    /// goes away between `create`'s publish and its own sync: a GET before the PUT is 404, the
+    /// PUT 204, a GET after it 503.
     #[cfg(unix)]
     struct LostAfterThePut {
         url: String,
@@ -3486,6 +3527,8 @@ mod tests {
     }
 
     /// A create whose own sync fails once the vault is published (its server gone between the
+    /// two) is no failure: the vault is out and source.toml names it, and a create run again
+    /// would be refused ("already exists there").
     #[cfg(unix)]
     #[test]
     fn a_create_whose_own_sync_fails_still_puts_the_approver_in() {
@@ -3536,6 +3579,8 @@ mod tests {
     }
 
     /// What leaves a vault letting machines in by itself (`password open`, as `set` and `new`)
+    /// puts this Mac's approver in where none runs, so what it prints holds; closing it
+    /// (`off`) reads no subscriber.
     #[cfg(unix)]
     #[test]
     fn a_vault_that_lets_machines_in_gets_an_approver_and_status_says_whether_it_runs() {

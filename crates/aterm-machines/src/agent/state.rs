@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The agent's root-owned state (design §3.3, §4.4): the serial floor per signing
-//! principal, the run lock, the newest finished run, and the newest request refused `busy`.
-//! Each file is 0644 so `hello`, running as the admin, can report them; only root writes them.
+//! Root-owned machine agent state (`floors.toml`, run lock, and latest run records).
 
 use super::Layout;
 use crate::model::Read;
@@ -20,9 +18,7 @@ struct FloorsFile {
     floor: Vec<Floor>,
 }
 
-/// The floors. A missing file is a fresh install (every floor 0). A file that exists and
-/// does not parse is `Unusable`: the caller refuses every envelope rather than read it as
-/// zero, which would let any old envelope replay.
+/// The floors.
 #[must_use]
 pub fn floors(sys: &dyn System, layout: &Layout) -> Read<Vec<Floor>> {
     match sys.read_file(&layout.floors()) {
@@ -90,14 +86,10 @@ pub fn raise_floor(
         .map_err(|e| format!("{}: {e}", layout.floors().display()))
 }
 
-/// Raise each of `principals` (the ones a new `allowed_signers` names) to at least the
-/// highest floor any principal has. Floors are kept per principal name, so without this a
-/// key listed again under a NEW name (a rekey or a re-enrollment that renames it) would
-/// start at floor 0, and every unexpired envelope that key ever signed would replay.
+/// Raise each of `principals` to at least the highest floor any principal has.
 ///
 /// # Errors
-/// One line when the floors cannot be read or written; the caller must not go on as if
-/// they had been raised.
+/// One line when `floors.toml` cannot be read or written.
 pub fn inherit_floors(
     sys: &dyn System,
     layout: &Layout,
@@ -123,9 +115,7 @@ pub struct Holder {
     pub pid: u32,
     /// Its run.
     pub run: String,
-    /// When the holding process started, as [`started`] read it (`None` when it could not
-    /// be read). A pid the kernel reuses (after the reboot that follows a power cut mid-run)
-    /// names a process with another start, so the lock is not read as live forever.
+    /// When the holding process started, as [`started`] read it (`None` when it could not be read).
     pub start: Option<String>,
 }
 
@@ -158,13 +148,7 @@ impl Holder {
     }
 }
 
-/// When `pid` started, as one word: `ps -o lstart= -p <pid>` (`Fri Oct 16 22:36:10 2026`,
-/// measured in the macOS 27 VM, readable by the admin for root's processes too) with its
-/// spaces made `_`. `None` when `ps` does not answer (the process is gone, or `ps` failed).
-///
-/// `lstart` is printed in the local time zone, and a run's own `time` family may change
-/// the zone while the job holds the lock, so `ps` runs with `TZ=UTC0`: the same process
-/// always reads the same (measured: `TZ=Asia/Tokyo` moves the VM's pid 1 by nine hours).
+/// When `pid` started, as one word.
 #[must_use]
 pub fn started(sys: &dyn System, pid: u32) -> Option<String> {
     let ran = sys
@@ -181,9 +165,7 @@ pub fn started(sys: &dyn System, pid: u32) -> Option<String> {
     (!word.is_empty()).then_some(word)
 }
 
-/// Whether `h`'s process is still the one that took the lock: alive, and (when the lock
-/// recorded it and `ps` answers now) started when the lock says. An unanswered start is
-/// not evidence of a reused pid, so it leaves the holder live.
+/// Whether `h`'s process is still the one that took the lock.
 #[must_use]
 pub fn holder_live(sys: &dyn System, h: &Holder) -> bool {
     if !sys.pid_alive(h.pid) {
@@ -216,8 +198,7 @@ pub fn running(sys: &dyn System, layout: &Layout, run: &str) -> bool {
     holder(sys, layout).is_some_and(|h| h.run == run && holder_live(sys, &h))
 }
 
-/// How long a change of the run lock waits for another one to finish (each holds the
-/// guard for a few file operations; this catches a holder that hung).
+/// How long a change of the run lock waits for another one to finish.
 const GUARD_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Hold `state/run.lock.guard` for one change of the run lock.
@@ -238,13 +219,7 @@ pub enum Lock {
     },
 }
 
-/// Take `state/run.lock` for `run`, held by `pid`: an exclusive create. A lock whose
-/// holder is not live (a crashed run, or a pid reused since) is removed and taken over; a
-/// lock that names nothing readable is treated the same way.
-///
-/// Every take, hand and release runs under `state/run.lock.guard`'s `flock`, so a taker
-/// never reads a lock another taker is still writing, and two takers of one stale lock
-/// cannot both remove it and both create their own.
+/// Take `state/run.lock` for `run`, held by `pid`: an exclusive create.
 ///
 /// # Errors
 /// One line when the guard or the lock file cannot be had.
@@ -270,8 +245,7 @@ pub fn take_lock(sys: &dyn System, layout: &Layout, run: &str, pid: u32) -> Resu
     Ok(Lock::Taken)
 }
 
-/// Hand the lock for `run` to `pid` (the detached job). Refuses when the lock names
-/// another run, or none (the job may have finished and released it already).
+/// Hand the lock for `run` to `pid` (the detached job).
 ///
 /// # Errors
 /// One line.
@@ -297,7 +271,6 @@ pub fn hand_lock(sys: &dyn System, layout: &Layout, run: &str, pid: u32) -> Resu
 }
 
 /// Hand only the exact observed holder to a known, still-uncommitted child.
-/// Both comparison and replacement use the existing run-lock guard.
 ///
 /// # Errors
 /// The holder changed, the child lacks a start identity, or the atomic write failed.
@@ -336,8 +309,6 @@ pub(super) fn release_holder(
 }
 
 /// Join an internal gated job to its current PID and known recorded start identity.
-/// This is not envelope authority; it prevents a different run-lock holder authorizing
-/// this process merely because it names the same run.
 ///
 /// # Errors
 /// Missing/changed holder, another PID, or an unmeasured/mismatched start identity.
@@ -391,9 +362,7 @@ pub fn last_busy(sys: &dyn System, layout: &Layout) -> Option<String> {
     super::is_run_id(&run).then_some(run)
 }
 
-/// Record `run` as the newest signed request refused `busy`: the requests of a `screen` walk
-/// are refused for as long as another command's run holds the host, and the screen watch
-/// counts each one as the walk still there (`super::watch`).
+/// Record `run` as the newest signed request refused `busy`.
 pub fn set_last_busy(sys: &dyn System, layout: &Layout, run: &str) {
     let _ = sys.write_file(&layout.last_busy(), format!("{run}\n").as_bytes(), 0o644);
 }
@@ -404,8 +373,7 @@ pub fn set_last_busy(sys: &dyn System, layout: &Layout, run: &str) {
 pub struct Managed {
     /// [`crate::SCHEMA`].
     pub schema: u32,
-    /// The admin account the fleet key is authorized for (its inbox is the one `apply`
-    /// copies artifacts from).
+    /// Admin account the fleet key is authorized for.
     pub admin: String,
     /// SHA-256 of the agent archive enrollment installed.
     pub payload_sha256: String,
@@ -492,12 +460,10 @@ mod tests {
             Lock::Busy { run: "1-1".into() }
         );
         assert_eq!(busy(&fake, &layout()).as_deref(), Some("1-1"));
-        // The holder hands it to its job, which then dies.
         hand_lock(&fake, &layout(), "1-1", 12).unwrap();
         assert_eq!(busy(&fake, &layout()), None);
         assert_eq!(take_lock(&fake, &layout(), "3-3", 13).unwrap(), Lock::Taken);
         assert_eq!(holder(&fake, &layout()).unwrap().run, "3-3");
-        // Release only frees the lock for the run that holds it.
         release_lock(&fake, &layout(), "1-1");
         assert!(holder(&fake, &layout()).is_some());
         release_lock(&fake, &layout(), "3-3");
@@ -506,8 +472,6 @@ mod tests {
 
     #[test]
     fn a_reused_pid_does_not_keep_a_crashed_runs_lock() {
-        // Run 1-1's job held the lock when the Mac lost power; after the reboot pid 10 is
-        // some other process, started later.
         let stale = b"pid=10 run=1-1 start=Fri_Oct_16_22:36:10_2026\n";
         let fake = Fake::root();
         fake.file("/A/state/run.lock", stale);
@@ -527,7 +491,6 @@ mod tests {
             holder(&fake, &layout()).unwrap().start.as_deref(),
             Some("Sat_Oct_17_08:05:00_2026")
         );
-        // The very process that took it, still running: busy.
         let fake = Fake::root();
         fake.file("/A/state/run.lock", stale);
         fake.alive(10);
@@ -540,7 +503,6 @@ mod tests {
             take_lock(&fake, &layout(), "2-2", 11).unwrap(),
             Lock::Busy { run: "1-1".into() }
         );
-        // `ps` not answering is no evidence of reuse: the live pid keeps the lock.
         let fake = Fake::root();
         fake.file("/A/state/run.lock", stale);
         fake.alive(10);
@@ -622,7 +584,6 @@ mod tests {
             take_lock(&live, &layout, "2-2", me).unwrap(),
             Lock::Busy { run: "1-1".into() }
         );
-        // A lock left by a pid that cannot be alive is taken over.
         std::fs::write(layout.lock(), "pid=2147483647 run=1-1\n").unwrap();
         assert_eq!(take_lock(&live, &layout, "2-2", me).unwrap(), Lock::Taken);
     }

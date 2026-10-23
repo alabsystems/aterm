@@ -15,12 +15,17 @@ pub(crate) static STARTUP: Startup = Startup::new();
 /// Write-once boot timestamps, first-present sample, and derived startup facts.
 pub(crate) struct Startup {
     /// GUI entry ([`mark_process_start`]), and the anchor of the process clock
+    /// (`metrics::now_ns`): a clock read before the entry is stamped anchors it
+    /// at that read instead ([`Self::clock_anchor`]).
     gui_entry: OnceLock<Instant>,
-    /// Rust `main` ([`mark_rust_main_start`]). The thin dev GUI binary never
+    /// Rust `main` ([`mark_rust_main_start`]).
     rust_main: OnceLock<Instant>,
     /// Rust `main` on the kernel's boot clock (mach ticks on Apple), the clock
+    /// `ri_proc_start_abstime` records a birth on: it never steps, so the two
+    /// subtract to the pre-main time whatever NTP did between them.
     rust_main_boot: OnceLock<Option<BootClock>>,
     /// Rust `main` on the wall clock, the fallback where `rust_main_boot` is
+    /// `None`: the kernel's other birth record (`pbi_start`) is on that clock.
     rust_main_wall: OnceLock<SystemTime>,
     /// Ready for winit ([`mark_gui_ready_for_winit`]).
     gui_ready: OnceLock<Instant>,
@@ -31,8 +36,11 @@ pub(crate) struct Startup {
     /// That attach's internal boundaries ([`record_initial_attach_milestones`]).
     attach: OnceLock<StartupAttachMilestones>,
     /// L1 (early reveal): the instant the FIRST OS window actually became
+    /// visible — a `set_visible(true)` on the first window's reveal path, or
+    /// (for a window created visible) the moment right after its creation.
     first_visible: OnceLock<Instant>,
     /// The backend-build worker's spawn, finish and legs (the BACKEND-BUILD
+    /// WORKER section below).
     worker_spawn: OnceLock<Instant>,
     worker_done: OnceLock<Instant>,
     worker_legs: OnceLock<StartupWorkerLegs>,
@@ -41,12 +49,15 @@ pub(crate) struct Startup {
     /// When this successor dialled the rendezvous (before the grant hold).
     claim_dialled_at: OnceLock<Instant>,
     /// How long this successor spent warming BEFORE its dial (the design's P2):
+    /// recorded beside the claim; zero on a launch whose warm prologue ran after
+    /// its intake.
     claim_warm_pre_dial: OnceLock<Duration>,
     /// Elapsed parent park→sample time, sampled before encoding and sending
+    /// the grant.
     claim_parked_before: OnceLock<Duration>,
     /// The boot's own boundaries ([`stamp_claim`]).
     claim_stamps: [OnceLock<Instant>; ClaimStamp::COUNT],
-    /// One coherent, immutable startup fact. `OnceLock` publishes both clock
+    /// One coherent, immutable startup fact.
     present: OnceLock<StartupPresentSample>,
     /// The facts kept once every input exists ([`Self::facts`]).
     birth_to_main: OnceLock<u64>,
@@ -92,6 +103,7 @@ impl Startup {
     }
 
     /// [`Self::facts`], given the two readings from outside the ledger: the
+    /// kernel's start record of this process and the GPU probe.
     fn facts_from(
         &self,
         read_birth: impl FnOnce() -> Option<ProcessStart>,
@@ -124,6 +136,9 @@ impl Startup {
     }
 
     /// The kernel's birth of this process → Rust `main`, in ns: everything
+    /// before the first Rust instruction — the launcher's spawn (LaunchServices'
+    /// `xpcproxy`, a shell's fork), a Gatekeeper hold on the exec (a quarantine
+    /// prompt waits here for the person's click), dyld and page-in.
     fn birth_to_main(&self, read_birth: impl FnOnce() -> Option<ProcessStart>) -> Option<u64> {
         kept(&self.birth_to_main, || {
             let main_wall = *self.rust_main_wall.get()?;
@@ -132,7 +147,7 @@ impl Startup {
         })
     }
 
-    /// The backend worker's partition, kept once its five stamps exist. Each
+    /// The backend worker's partition, kept once its five stamps exist.
     fn worker(&self) -> StartupWorkerSample {
         kept(&self.worker, || {
             let (join_entry, join_exit) = self.attach.get()?.backend_finalize_bounds();
@@ -154,7 +169,7 @@ impl Startup {
     }
 }
 
-/// `cell`'s fact, else `derive`'s, kept when it is `Some`. Every input of a
+/// `cell`'s fact, else `derive`'s, kept when it is `Some`.
 fn kept<T: Copy>(cell: &OnceLock<T>, derive: impl FnOnce() -> Option<T>) -> Option<T> {
     if let Some(fact) = cell.get() {
         return Some(*fact);
@@ -183,6 +198,9 @@ pub(crate) fn mark_rust_main_start() {
 }
 
 /// The birth → Rust `main` subtraction ([`Startup::facts`]), on given
+/// readings: the boot clock's ticks through `timebase` (`numer`, `denom`:
+/// ticks × numer / denom = ns) when both `main_boot` and the timebase exist,
+/// else the wall clock.
 fn birth_to_main_ns(
     start: ProcessStart,
     main_boot: Option<BootClock>,
@@ -202,6 +220,7 @@ fn birth_to_main_ns(
 }
 
 /// The mach timebase (`numer`, `denom`), which turns the boot clock's ticks
+/// into nanoseconds; `None` where there is none (off Apple) or the call fails.
 #[cfg(target_vendor = "apple")]
 fn mach_timebase() -> Option<(u32, u32)> {
     let mut base = libc::mach_timebase_info { numer: 0, denom: 0 };
@@ -240,6 +259,7 @@ pub(crate) fn mark_first_window_visible() {
 const STARTUP_PHASE_SCHEMA: u64 = 1;
 
 /// Wire schema for the exclusive first-resume → initial-surface-ready attach
+/// partition nested inside [`STARTUP_PHASE_SCHEMA`]'s surface-attach phase.
 const STARTUP_ATTACH_SCHEMA: u64 = 1;
 
 /// Ordered internal timestamps for the initial window surface attach.
@@ -254,6 +274,7 @@ impl StartupAttachMilestones {
     }
 
     /// The two stamps that bracket `backend_finalize_ns` — the join entry and
+    /// the join exit.
     fn backend_finalize_bounds(self) -> (Instant, Instant) {
         let [
             _,
@@ -528,9 +549,11 @@ fn derive_startup_attach(
 }
 
 /// Wire schema for the backend-build worker partition — the exclusive
+/// drill-down of `startup_attach_backend_finalize_ns`.
 const STARTUP_WORKER_SCHEMA: u64 = 1;
 
 /// Wire schema for the renderer-side sub-split of the worker's GPU build,
+/// sourced from `aterm_gpu::startup_probe`.
 const STARTUP_GPU_SCHEMA: u64 = 1;
 
 /// Background backend-build worker leg durations in nanoseconds.
@@ -607,6 +630,8 @@ label_enum! {
 
 impl Startup {
     /// The earliest in-process instant this process stamped: the shipped
+    /// binary's Rust `main` ([`mark_rust_main_start`]), else the GUI entry (the
+    /// thin dev binary).
     fn main_start(&self) -> Option<Instant> {
         self.rust_main
             .get()
@@ -645,15 +670,18 @@ pub(crate) fn stamp_claim(stamp: ClaimStamp) {
 }
 
 /// Everything the claim timeline is derived from, gathered so the derivation is
+/// a pure function a test can drive with invented instants.
 #[derive(Clone, Copy, Debug)]
 struct ClaimTimelineInputs {
     claim: Instant,
     /// [`Startup::main_start`].
     exec: Option<Instant>,
     /// Where the warm prologue started, on a launch that warmed before its
+    /// dial (P2): the dial minus its warm stage.
     warm: Option<Instant>,
     dial: Option<Instant>,
     /// A projected park point: this claim minus the parent's sampled park
+    /// duration.
     park: Option<Instant>,
     own: [Option<Instant>; ClaimStamp::COUNT],
     worker_spawn: Option<Instant>,
@@ -666,6 +694,7 @@ struct ClaimTimelineInputs {
 }
 
 /// One labelled boundary, in signed microseconds after the claim (the Rust
+/// main and the dial precede it, so they read negative).
 type ClaimPoint = (&'static str, i64);
 
 fn signed_us(zero: Instant, at: Instant) -> i64 {
@@ -678,6 +707,7 @@ fn signed_us(zero: Instant, at: Instant) -> i64 {
 }
 
 /// The claim timeline in its NOMINAL boot order (the order the code runs them;
+/// the values say what really happened).
 fn claim_timeline_points(inputs: &ClaimTimelineInputs) -> Vec<ClaimPoint> {
     let own = |stamp: ClaimStamp| (stamp.as_str(), inputs.own[stamp.index()]);
     let attach = inputs.attach.map(|milestones| milestones.points);
@@ -722,6 +752,8 @@ fn claim_timeline_points(inputs: &ClaimTimelineInputs) -> Vec<ClaimPoint> {
 }
 
 /// The backend worker against the join that waits for it: how long the join
+/// blocked, and how far the worker's `done` sat before (positive) or after
+/// (negative) the join's entry.
 #[cfg_attr(not(unix), allow(dead_code))]
 fn claim_worker_vs_join(inputs: &ClaimTimelineInputs) -> Option<(i64, i64)> {
     let (join_entry, join_exit) = inputs.attach?.backend_finalize_bounds();
@@ -765,12 +797,16 @@ impl Startup {
     }
 
     /// The warm stage's cost before the dial, as `metrics` says it: `None`
+    /// on a launch that did not claim.
     fn claim_warm_pre_dial(&self) -> Option<Duration> {
         self.claim_at.get()?;
         self.claim_warm_pre_dial.get().copied()
     }
 
     /// The `metrics` summary's claim fields: `handoff_claim_stamps`, the
+    /// timeline's `label:ms` pairs (an object in JSON; `none`/`null` on a
+    /// launch that claimed no handoff), and `handoff_warm_pre_dial_ms`
+    /// (`none`/`null` without one).
     fn emit_handoff_claim(&self, s: &mut dyn FieldSink) {
         match self.claim_timeline_inputs() {
             Some(inputs) => {
@@ -860,6 +896,9 @@ const STARTUP_PREPARE_CUTS: [ClaimStamp; PREPARE_PHASES - 1] = [
 ];
 
 /// The cuts of a launch that builds its event loop before session 0 (a
+/// free-unix window, whose build opens a display no server has answered yet, or any
+/// launch under the `ATERM_DEBUG_LOOP_FIRST` seam: `main_entry`'s
+/// `loop_before_session0`).
 const LOOP_FIRST_CUTS: [ClaimStamp; PREPARE_PHASES - 1] = [
     ClaimStamp::Intake,
     ClaimStamp::Warmed,
@@ -873,6 +912,8 @@ const LOOP_FIRST_CUTS: [ClaimStamp; PREPARE_PHASES - 1] = [
 ];
 
 /// The split of whichever boot order `stamp` was taken in
+/// ([`STARTUP_PREPARE_CUTS`], else [`LOOP_FIRST_CUTS`]), its phases in
+/// [`STARTUP_PREPARE_PHASES`]' order.
 fn derive_startup_prepare_of(
     entry: Option<Instant>,
     stamp: impl Fn(ClaimStamp) -> Option<Instant>,
@@ -885,6 +926,7 @@ fn derive_startup_prepare_of(
 }
 
 /// The phases between `entry`, the `cuts` and `ready`, in ns, or `None`
+/// unless every boundary exists in that order.
 fn derive_startup_prepare(
     entry: Option<Instant>,
     cuts: [Option<Instant>; PREPARE_PHASES - 1],
@@ -919,6 +961,11 @@ impl Startup {
     }
 
     /// The `metrics` summary's fields for everything before winit runs, after
+    /// the claim timeline: `process_birth_to_rust_main_ms` (`none`/`null` where
+    /// the platform cannot read the birth), `startup_prepare_schema`,
+    /// `startup_prepare_valid` and one `startup_prepare_<phase>_ms` per phase,
+    /// every phase 0 while the split is invalid (as the other startup
+    /// partitions publish).
     fn emit_startup_prepare(&self, facts: &StartupFacts, s: &mut dyn FieldSink) {
         s.opt_decimal(
             "process_birth_to_rust_main_ms",
@@ -953,7 +1000,7 @@ struct StartupWorkerSample {
 }
 
 impl StartupWorkerSample {
-    /// The measured legs, in worker order. `epilogue_ns` closes them against
+    /// The measured legs, in worker order.
     fn measured_leg_total_ns(self) -> Option<u64> {
         [
             self.prelude_ns,
@@ -968,6 +1015,7 @@ impl StartupWorkerSample {
 }
 
 /// Derive the worker partition from the four `Instant`s that bound it plus the
+/// worker's own legs.
 fn derive_startup_worker(
     spawn: Option<Instant>,
     done: Option<Instant>,
@@ -1033,6 +1081,8 @@ fn derive_startup_worker(
 }
 
 /// The renderer-side split of the worker's GPU build, read back from
+/// `aterm_gpu::startup_probe` — the crate where the work happens and which
+/// cannot see this ledger.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct StartupGpuSample {
     valid: bool,
@@ -1056,6 +1106,7 @@ struct StartupGpuSample {
 }
 
 /// Read the process-global probe slots into an unclosed sample (`tail_ns` still
+/// 0, `valid` still provisional).
 fn read_gpu_probe() -> StartupGpuSample {
     use aterm_gpu::startup_probe::{Leg, cell_pipeline_ns, leg_ns};
     let pipelines_ns = leg_ns(Leg::PipeTotal);
@@ -1082,6 +1133,7 @@ fn read_gpu_probe() -> StartupGpuSample {
 }
 
 /// Fold a probe read into a sample, closed against the worker's own
+/// measurement of the same call (`gpu_build_ns`).
 fn close_startup_gpu(sample: StartupGpuSample, gpu_build_ns: u64) -> StartupGpuSample {
     // A zero slot is the probe's UNSET sentinel (a recorded leg floors at 1 ns),
     if [
@@ -1160,8 +1212,12 @@ impl Startup {
 #[derive(Clone, Copy, Default)]
 pub(crate) struct StartupFacts {
     /// The present-anchored sample [`Startup::publish_first_present`]
+    /// published at the first present (`Default` until then; `rust_main_ns`
+    /// stays 0 for the thin dev GUI binary).
     present: StartupPresentSample,
     /// The backend worker's partition, kept rather than baked into the
+    /// present sample: every stamp it needs is set long before the first
+    /// present (the join precedes the first frame by construction).
     worker: StartupWorkerSample,
     gpu: StartupGpuSample,
     /// GUI entry → the first window's reveal ([`Startup::first_visible_since`]).
@@ -1169,10 +1225,12 @@ pub(crate) struct StartupFacts {
     /// Rust `main` → the same reveal.
     rust_main_to_first_visible_ns: u64,
     /// GUI entry → ready for winit, read live from its immutable stamps even
+    /// before a first present.
     gui_prepare_ns: u64,
     /// The kernel's birth → Rust `main` ([`Startup::birth_to_main`]).
     birth_to_main_ns: Option<u64>,
     /// The effect pipelines built on demand: count, wall time and the built
+    /// slots' mask (`aterm_gpu::startup_probe::effect_build_ledger`).
     effect_builds: u64,
     effect_build_ns: u64,
     effect_built_mask: u64,
@@ -1293,6 +1351,9 @@ impl StartupFacts {
 }
 
 /// Name the EFFECT pipelines an `effect_pipeline_built_mask` says were
+/// compiled, comma-joined, or `none` — a self-labelling field, so a reader
+/// never has to know the slot order and a new `EffectPipeline` cannot silently
+/// shift someone else's bit.
 fn effect_pipeline_names(mask: u64) -> String {
     let built = aterm_gpu::EFFECT_PIPELINE_NAMES
         .iter()
@@ -1320,6 +1381,7 @@ mod claim_timeline_tests {
     }
 
     /// The shape of a real handoff boot (the 24802 run's segments), with the
+    /// worker finishing before the join.
     fn a_boot() -> ClaimTimelineInputs {
         let exec = Instant::now();
         let dial = exec + ms(31);
@@ -1496,6 +1558,7 @@ mod startup_prepare_tests {
     }
 
     /// The stamps of a boot that offered `order`'s cuts at [`cuts`]' instants, in
+    /// that order, and no other stamp.
     fn stamped(entry: Instant, order: [ClaimStamp; 9]) -> impl Fn(ClaimStamp) -> Option<Instant> {
         let at: Vec<(ClaimStamp, Option<Instant>)> = order.into_iter().zip(cuts(entry)).collect();
         move |stamp| {
@@ -1506,6 +1569,7 @@ mod startup_prepare_tests {
     }
 
     /// LAG-11: session 0 is spawned before the event loop is built, except where the
+    /// build opens a display no server has answered yet and goes first.
     #[test]
     fn either_boot_order_is_split_under_the_same_names() {
         let entry = Instant::now();
@@ -1541,6 +1605,8 @@ mod startup_prepare_tests {
     const APPLE_SILICON: Option<(u32, u32)> = Some((125, 3));
 
     /// THE BOOT CLOCK, NOT THE WALL (sweep item 36): the subtraction is on
+    /// the kernel's mach ticks through the timebase, so a wall clock NTP
+    /// stepped an hour ahead between birth and `main` reads the same 5 ms.
     #[test]
     fn birth_to_main_is_read_on_the_boot_clock_through_a_wall_step() {
         let born = start(1 << 30);
@@ -1562,6 +1628,7 @@ mod startup_prepare_tests {
     }
 
     /// The wall-clock fallback (a translated process; no timebase) is the
+    /// kernel birth to the microsecond.
     #[test]
     fn birth_to_main_falls_back_to_the_kernel_birth_to_the_microsecond() {
         let main = UNIX_EPOCH + Duration::from_secs(1_792_118_936) + Duration::from_micros(857_000);
@@ -1583,6 +1650,8 @@ mod startup_prepare_tests {
     }
 
     /// On this machine: the kernel's start record of this very process orders
+    /// before a boot-clock reading taken now, and the timebase turns ticks
+    /// into the nanoseconds `Instant` counts.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn the_boot_clock_reads_in_nanoseconds_through_this_machines_timebase() {
@@ -1807,6 +1876,8 @@ mod facts_tests {
     use std::time::{Duration, Instant, UNIX_EPOCH};
 
     /// Each kept fact of a local ledger is read live while one of its inputs
+    /// is missing, and kept once every input exists, equal to a fresh
+    /// derivation.
     #[test]
     fn facts_publish_once_every_input_exists() {
         let ledger = Startup::new();

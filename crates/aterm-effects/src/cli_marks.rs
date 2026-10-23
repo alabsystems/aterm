@@ -220,7 +220,7 @@ pub const fn brand(mark: CliMark) -> &'static Brand {
     }
 }
 
-/// Claude Code. MEASURED: the mascot's `38;2;215;119;87` and the eyes'
+/// Claude Code.
 const CLAUDE: Brand = Brand {
     word: "claude",
     alab_word: None,
@@ -232,7 +232,7 @@ const CLAUDE: Brand = Brand {
     hd: Some(CLAUDE_HD),
 };
 
-/// Codex: the owner's "OpenAI blue". Codex itself draws no brand colour
+/// Codex: the owner's "OpenAI blue".
 const CODEX: Brand = Brand {
     word: "codex",
     alab_word: Some("codex-alab"),
@@ -244,7 +244,7 @@ const CODEX: Brand = Brand {
     hd: Some(CODEX_HD),
 };
 
-/// agy. MEASURED on screen (1.4.4 in the real-agy lab, 2026-10-21, `ctl
+/// agy.
 const AGY: Brand = Brand {
     word: "agy",
     alab_word: None,
@@ -279,6 +279,10 @@ const AGY_TEXELS: [Texel; 49] = {
 };
 
 /// Muse Code: the name and the diamond's outline in Meta blue `#0082fb`,
+/// the brand main's footer gave Muse on 2026-10-21 (its blue diamond, "the
+/// whole brand is Meta blue, not purple"), which replaced the violet
+/// `#a882ff` this mark first kept; the core is Muse's own lighter blue,
+/// MEASURED from 1.4.10's caret `❯` and its bold argv rows.
 const MUSE: Brand = Brand {
     word: "muse",
     alab_word: None,
@@ -290,7 +294,7 @@ const MUSE: Brand = Brand {
     hd: Some(MUSE_HD),
 };
 
-/// Gemini CLI. MEASURED: 0.46.0's `GradientColors: ["#4796E4", "#847ACE",
+/// Gemini CLI.
 const GEMINI: Brand = Brand {
     word: "gemini",
     alab_word: None,
@@ -323,7 +327,7 @@ const GEMINI: Brand = Brand {
     hd: Some(GEMINI_HD),
 };
 
-/// Grok: xAI's monochrome, flipped with the ground. Ready as data; a take of
+/// Grok: xAI's monochrome, flipped with the ground.
 const GROK: Brand = Brand {
     word: "grok",
     alab_word: None,
@@ -536,6 +540,8 @@ pub fn layer(id: u64, content: Arc<FxContent>, offset: (i32, i32), clip: PxRect)
 }
 
 /// Claude Code's whole mascot, SD 14×10: its five equal bands (head, eyes,
+/// arms, body, legs) at two pixels each, decoded from 2.1.30x's quadrant
+/// rows ` ▐▛███▛█` / `▝▜██████▀` / ` ▝▝   ▝▝`.
 const CLAUDE_SD: &[&str] = &[
     "..CCCCCCCCCC..",
     "..CCCCCCCCCC..",
@@ -550,6 +556,7 @@ const CLAUDE_SD: &[&str] = &[
 ];
 
 /// Claude Code's whole mascot, HD 28×16 (aspect 1.75 against the true 1.7):
+/// head 3, eyes 3 (each 2×3), arms 4, body 3, legs 3 (each 2 wide).
 const CLAUDE_HD: &[&str] = &[
     "...CCCCCCCCCCCCCCCCCCCCCC...",
     "...CCCCCCCCCCCCCCCCCCCCCC...",
@@ -570,6 +577,7 @@ const CLAUDE_HD: &[&str] = &[
 ];
 
 /// The OpenAI knot, SD 12×12: six blades round a hexagonal hole, 180°
+/// symmetric, hand-cleaned so each blade's gap reads at one pixel.
 const CODEX_SD: &[&str] = &[
     "....O.OO....",
     "..OOO.OOOo..",
@@ -586,6 +594,7 @@ const CODEX_SD: &[&str] = &[
 ];
 
 /// The OpenAI knot, HD 24×24: supersampled 8×8 (hole 0.31, gap 0.12,
+/// twist 60°, rotation 30°).
 const CODEX_HD: &[&str] = &[
     ".........OO.OOO.........",
     ".......oOOo.OOOOo.......",
@@ -614,6 +623,10 @@ const CODEX_HD: &[&str] = &[
 ];
 
 /// agy's own launch banner (` ▄▀▀▄` / `▀▀▀▀▀▀` / `▀▀▀▀▀▀▀▀` /
+/// `▄▀▀    ▀▀▄` / `▄▀▀      ▀▀▄`, 1.4.0 to 1.4.4), one banner half-cell a
+/// pixel in the colour 1.4.4 paints it: a `▀` is its foreground over its
+/// background, so the apex and the bar are solid and only the two cells
+/// under the bar's middle are the ground.
 const AGY_SD: &[&str] = &[
     ".....AB.....",
     "....CDEF....",
@@ -672,6 +685,7 @@ const MUSE_HD: &[&str] = &[
 ];
 
 /// Gemini CLI's four-point sparkle, SD 12×12: two-pixel arms tapering to
+/// half-tone tips, column `k` in gradient stop `1 + round(k·7/11)`.
 const GEMINI_SD: &[&str] = &[
     ".....de.....",
     ".....45.....",
@@ -688,6 +702,7 @@ const GEMINI_SD: &[&str] = &[
 ];
 
 /// Gemini CLI's four-point sparkle, HD 24×24: an astroid (pinch 0.70),
+/// column `k` in gradient stop `1 + round(k·7/23)`.
 const GEMINI_HD: &[&str] = &[
     "........................",
     "...........de...........",
@@ -768,6 +783,7 @@ mod tests {
     use aterm_types::scheme::{builtin, builtin_names};
 
     /// Codex's slab: the tinted pad row its composer is erased with
+    /// (`48;2;45;47;51`, 0.154), a ground of its own.
     const CODEX_SLAB: u32 = 0x2D_2F33;
 
     /// A built-in theme's background as `0x00RRGGBB`.
@@ -795,6 +811,10 @@ mod tests {
     }
 
     /// ICONS READ AT 3:1 ON EVERY GROUND (spec §3.3, WCAG 1.4.11): on every
+    /// built-in theme's ground and on Codex's slab, each full icon ink is
+    /// floored to 3:1 or better with its hue held, a half-tone is its full
+    /// ink's floored value at half alpha, a hole is its exact bytes, and on
+    /// Default every ink is the brand's exact bytes.
     #[test]
     fn icon_inks_read_at_3_on_every_ground() {
         let default = ground("Default");
@@ -862,6 +882,11 @@ mod tests {
     }
 
     /// NAMES READ AT 4.5:1 ON EVERY GROUND (spec §3.2, WCAG 1.4.3): every
+    /// letter of every name a lockup prints — each mark's word, and
+    /// codex-alab's longer name — on every built-in theme's ground and on
+    /// Codex's slab, is drawn in an ink that reads at 4.5:1 or better, its
+    /// HSV hue within 2° of the brand's own; on Default each is the brand's
+    /// exact bytes wherever those already read.
     #[test]
     fn names_read_at_4_5_on_every_ground() {
         let default = ground("Default");
@@ -925,6 +950,9 @@ mod tests {
     }
 
     /// EVERY BUILD'S NAME IS ITS OWN (the owner calls aterm's Codex build
+    /// "codex-alab"): codex-alab's lockup prints `codex-alab`, five cells
+    /// wider than vendor `codex`'s, and every other mark prints its word for
+    /// either build — none names an ALab build apart.
     #[test]
     fn every_build_prints_its_own_name() {
         for mark in CliMark::ALL {
@@ -984,6 +1012,7 @@ mod tests {
     }
 
     /// What is wrong with a master: no rows, a ragged row, or a byte neither
+    /// `'.'` nor one of `chars`.
     fn master_faults(rows: &[&str], chars: &[u8]) -> Vec<String> {
         let mut faults = Vec::new();
         let w = rows.first().map_or(0, |r| r.len());
@@ -1002,6 +1031,11 @@ mod tests {
     }
 
     /// EVERY MARK IS CRISP AND CENTRED (spec §2.2–§2.4): every master is
+    /// rectangular, holds only its chars, builds as an art of its size, and
+    /// keeps its symmetry (Claude, agy, Muse and Gemini mirror; Codex, Muse
+    /// and Gemini turn half round); and the fit at each measured cell is
+    /// §2.2's: the master, an integer scale, whole texel blocks inside the
+    /// box with a pixel of air above and below, centred.
     #[test]
     fn every_mark_is_crisp_and_centred() {
         use CliMark::{Agy, Claude, Codex, Gemini, Grok, Muse};
@@ -1129,6 +1163,10 @@ mod tests {
     }
 
     /// agy 1.4.4's launch banner as the real-agy lab read it (`aterm ctl cell`
+    /// of every cell, 2026-10-21; the same on Default and Default Light and
+    /// at a second launch): each cell's column and row from the banner's
+    /// top left, its glyph, its foreground, and its background (`None`: the
+    /// pane's own ground).
     #[rustfmt::skip]
     const AGY_BANNER_1_4_4: &[(usize, usize, char, u32, Option<u32>)] = &[
         (4, 0, '▄', 0xDB_B131, None), (5, 0, '▀', 0xF2_922E, Some(0xF6_912E)),
@@ -1149,6 +1187,8 @@ mod tests {
     ];
 
     /// A half-block banner as pixels, one half-cell each (`None`: the
+    /// ground): a `▀` is its foreground over its background, a `▄` the
+    /// ground over its foreground.
     fn banner_pixels(
         cells: &[(usize, usize, char, u32, Option<u32>)],
         (w, h): (usize, usize),
@@ -1169,6 +1209,8 @@ mod tests {
     }
 
     /// AGY'S MARK IS ITS BANNER (spec §2.4 and §10.2.3: the lab's cell read
+    /// decides): agy's master, each texel in its raw ink, on either
+    /// polarity, is the banner 1.4.4 paints, one half-cell a pixel.
     #[test]
     fn agys_mark_is_its_banner() {
         let b = brand(CliMark::Agy);
@@ -1209,6 +1251,9 @@ mod tests {
     }
 
     /// What `mark`'s map shows on `ground` in a `w × h` buffer when its box
+    /// sits at pixel `at`: each texel of the fitted master a whole
+    /// `scale × scale` block, an ink opaque, a half-tone blended over the
+    /// ground by the byte law, a hole exact, the rest the ground.
     fn map_pixels(
         mark: CliMark,
         f: Fit,
@@ -1246,6 +1291,7 @@ mod tests {
     }
 
     /// `mark`'s layer for `f` on `ground`, its first cell at `offset`, painted
+    /// over the ground by the renderers' CPU path, every band open.
     fn painted(
         mark: CliMark,
         f: Fit,
@@ -1272,6 +1318,9 @@ mod tests {
     }
 
     /// THE MARKS ARE THEIR MAPS ON THE CPU (spec §2.3, §6.4): each mark's
+    /// layer at 7×14 and 15×28, laid at a cell of a pane on Default, Default
+    /// Light and Codex's slab, paints exactly its map, texel for texel,
+    /// half-tones blended exactly, and nothing outside its box.
     #[test]
     fn the_marks_are_their_maps_on_the_cpu() {
         for (cw, ch) in [(7u16, 14u16), (15, 28)] {

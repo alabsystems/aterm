@@ -1,24 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Discover the next published index without spending a Releases API request.
-//!
-//! The shipped index is a prerelease in the app's repository, so `/releases/latest` names
-//! an app release. Index builds are contiguous (`atpkg-publish index` refuses an
-//! `index_build` that is not its baseline's plus one), so one HEAD each of `floor + 1` and
-//! `floor + 2` every thirty seconds finds the next; the second steps over one missing
-//! number, as the signed pass's walk does (`net::newest_index`). A hit only wakes the
-//! ordinary update pass ([`successor_reporting_near_with`] reports the first hit before
-//! the second HEAD returns), which verifies everything and walks to the newest index
-//! itself. The six-hour full pass (`aterm_update_core::pkg_check::FULL_PASS_INTERVAL_SECS`)
-//! remains the fallback.
-//!
-//! Every request is a HEAD of a download URL on the release host, which is unmetered: the
-//! API grants one IP sixty anonymous requests an hour, shared with the signed pass and the
-//! release cut. Only GitHub's own answer for a published asset ([`is_release_asset_host`])
-//! reads as published ([`classify`]), so an intermediary can never wake a full pass at
-//! every cooldown. A store whose `update` would answer "nothing to update"
-//! (`cli::update_pass_has_work`) is not probed.
+//! Lightweight HEAD probe for the next published index ([`successor_reporting_near_with`],
+//! [`is_release_asset_host`], [`classify`]).
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek as _, Write as _};
@@ -29,12 +13,8 @@ use aterm_update_core::{HeadAnswer, HttpError};
 
 use crate::store::Layout;
 
-/// The per-process check cadence, enforced across processes by a shared stamp: the cooldown
-/// after a probe found the next tags missing, and after one found one published, so an
-/// index a pass has not landed yet is offered again promptly.
+/// The per-process check cadence, enforced across processes by a shared stamp.
 pub const INTERVAL: Duration = Duration::from_secs(30);
-// After an inconclusive answer: short, so it cannot hide a new index for long, yet a
-// persistent error still spends fewer HEADs than the healthy cadence.
 const RETRY_AFTER_ERROR: Duration = Duration::from_secs(60);
 const MAX_STAMP_BYTES: u64 = 64;
 /// The store-scoped lock and stamp file every probing process shares.
@@ -42,35 +22,24 @@ pub(crate) const NEAR_LOCK: &str = "index-probe.lock";
 /// The tags past the floor the probe asks for: the next, and the one after it.
 const OFFSETS: [u64; 2] = [1, 2];
 
-/// Whether `host` is where the release host redirects a published asset: a host under
-/// `githubusercontent.com` (`release-assets.` today, `objects.` before it).
-///
-/// The domain, not a list of hosts: GitHub has moved the asset host before, and a fixed
-/// list would read every tag as unpublished when it moves again. The domain still refuses
-/// a captive portal's or proxy's login redirect, and it is no trust boundary: every byte
-/// fetched must verify. The release cutter's readability check
-/// (`aterm_release::publish::classify_asset_head`) uses the same rule.
+/// Whether `host` is where the release host redirects a published asset.
 #[must_use]
 pub fn is_release_asset_host(host: &str) -> bool {
     host.strip_suffix(".githubusercontent.com")
         .is_some_and(|sub| sub.split('.').all(|label| !label.is_empty()))
 }
 
-/// The probe's only actionable answer. `Published` is an untrusted wake hint, not
-/// an index verdict; the usual signed update pass decides what may be installed.
+/// The probe's only actionable answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Probe {
     Published(u64),
     Missing,
-    /// Another process already asked this range. The shared stamp's remaining
-    /// cooldown is the next local deadline; no HEAD ran on this attempt.
+    /// Another process already asked this range.
     Suppressed(Duration),
     Deferred,
 }
 
-/// Probe for the store's next index build, calling `on_near` on the probe worker as soon
-/// as a HEAD finds one, so the caller can wake its parked package lane while the second
-/// HEAD runs.
+/// Probe for the store's next index build.
 pub fn successor_reporting_near_with(layout: &Layout, on_near: &mut dyn FnMut(u64)) -> Probe {
     successor_with_near_hint(layout, on_near)
 }
@@ -91,8 +60,7 @@ fn successor_with_near_hint(layout: &Layout, on_near: &mut dyn FnMut(u64)) -> Pr
     )
 }
 
-/// The highest index build this store has verified: the durable rollback floor the probe
-/// looks past, and what the window reads to know whether a published index landed.
+/// The highest index build this store has verified.
 #[must_use]
 pub fn verified_floor(layout: &Layout) -> u64 {
     crate::sig::Floor::new(layout.floor()).current()
@@ -102,9 +70,7 @@ fn standard_public_source(owner: &str, repo: &str) -> bool {
     owner == aterm_update_core::ATPKG_INDEX_OWNER && repo == aterm_update_core::DEFAULT_REPO
 }
 
-/// Whether [`successor_reporting_near_with`] probes this store's index source at all —
-/// the manager armed, no registry seam, the shipped public source. For any other source
-/// there is no probe and so nothing cached to report.
+/// Whether [`successor_reporting_near_with`] probes this store's index source at all.
 #[must_use]
 pub fn probes_this_source() -> bool {
     if !crate::enabled() || crate::cli::registry_seam().is_some() {
@@ -114,9 +80,7 @@ pub fn probes_this_source() -> bool {
     standard_public_source(&source.owner, &crate::discovery::index_repo())
 }
 
-/// One store-scoped probe. The HEAD closure is injectable so the URL, response
-/// classification and cross-process request bound are tested without network. It is the
-/// probe's only transport.
+/// One store-scoped probe.
 #[cfg(test)]
 pub(crate) fn successor_with(
     layout: &Layout,
@@ -137,8 +101,6 @@ fn successor_notifying_with(
     on_published: &mut dyn FnMut(u64),
 ) -> Probe {
     let floor = verified_floor(layout);
-    // The prefix was created by the launch seed. A missing or linked prefix is
-    // not made writable by a read-side hint; the full update owns that repair.
     if !std::fs::symlink_metadata(&layout.prefix)
         .is_ok_and(|m| m.file_type().is_dir() && !crate::platform::is_reparse(&m))
     {
@@ -147,9 +109,7 @@ fn successor_notifying_with(
     probe_next(layout, owner, repo, floor, now, head, on_published)
 }
 
-/// One locked attempt: HEAD `atpkg-index-<floor+1>` and `<floor+2>`'s `index.toml` unless
-/// the shared stamp says a sibling asked within its cooldown, then stamp the answer for the
-/// next reader. `on_published` hears a published build the moment its HEAD answers.
+/// One locked attempt.
 fn probe_next(
     layout: &Layout,
     owner: &str,
@@ -174,14 +134,11 @@ fn probe_next(
         });
         let next = next.unwrap_or(Probe::Deferred);
         if let Probe::Published(build) = next {
-            // The release is only a wake hint. Report it before the next HEAD waits; the
             // signed pass resolves authority.
             on_published(build);
         }
         answer = highest_or_deferred(answer, next);
     }
-    // A crash or write failure merely makes the next process retry. The lock
-    // remains held until this function returns, including across the HEADs.
     let marker = match answer {
         Probe::Published(_) => 'P',
         Probe::Missing => 'M',
@@ -191,8 +148,7 @@ fn probe_next(
     answer
 }
 
-/// Two HEADs' answers as one: the higher published build wins, `Missing` only when both
-/// said missing, and anything else is no answer.
+/// Two HEADs' answers as one.
 fn highest_or_deferred(a: Probe, b: Probe) -> Probe {
     match (a, b) {
         (Probe::Published(a), Probe::Published(b)) => Probe::Published(a.max(b)),
@@ -202,20 +158,12 @@ fn highest_or_deferred(a: Probe, b: Probe) -> Probe {
     }
 }
 
-/// Take the probe's lock without waiting. `None` when the file cannot be opened as a
-/// regular file or another probe holds it.
-///
-/// A [`crate::lock::Flock`], never a bare `File`: it releases by `LOCK_UN` on every return.
-/// Released by the close alone, a child another thread is mid-spawning would keep the
-/// descriptor until its exec, and the next probe would read the lock as a sibling's.
+/// Take the probe's lock without waiting ([`crate::lock::Flock`]).
 fn take_probe_lock(path: &Path) -> Option<crate::lock::Flock> {
     crate::lock::Flock::try_lock(open_private(path, true)?).ok()
 }
 
-/// Open one of the store's private rendezvous files — this probe's lock and stamps, the
-/// vendor-head watch's shared file and seat — without following a link and without
-/// blocking on a planted FIFO: read-write and created (0600) when `create`, read-only and
-/// never created otherwise. `None`: not openable, or not a plain file.
+/// Open one of the store's private rendezvous files.
 pub(crate) fn open_private(path: &Path, create: bool) -> Option<File> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -252,8 +200,6 @@ fn stamp_remaining(file: &mut File, floor: u64, now: SystemTime) -> Option<Durat
     };
     match now.duration_since(modified) {
         Ok(age) => (age < lifetime).then(|| lifetime - age),
-        // A small clock correction still honours the stamp. A far-future mtime
-        // is treated as damaged state so it cannot suppress the probe forever.
         Err(_) => modified
             .duration_since(now)
             .ok()
@@ -262,10 +208,7 @@ fn stamp_remaining(file: &mut File, floor: u64, now: SystemTime) -> Option<Durat
     }
 }
 
-/// The one parser of the probe's stamp (`"{floor} {marker}\n"` plus the file's mtime, when
-/// the answer was written), shared by the cooldown ([`stamp_remaining`]) and the report
-/// ([`cached_answer`]), so the doctor shows exactly what the probe reads. Anything else
-/// (oversized, a third field, an unknown marker, a non-number) is `None`.
+/// Parse the probe stamp (`"{floor} {marker}\n"`, [`stamp_remaining`], [`cached_answer`]).
 fn read_stamp(file: &mut File) -> Option<(u64, char, SystemTime)> {
     let metadata = file.metadata().ok()?;
     if metadata.len() > MAX_STAMP_BYTES {
@@ -294,24 +237,18 @@ pub enum RangeAnswer {
     Published,
     /// Nothing newer at the next two tags.
     Missing,
-    /// No usable answer: a failed request, or one that says nothing ([`classify`] — a 200,
-    /// a permanent redirect, a redirect off the release-asset hosts, the host's 429). Every
-    /// one is stamped `E`; none is "nothing newer".
+    /// No usable answer: a failed request, or one that says nothing ([`classify`]).
     Failed,
 }
 
-/// The probe's last answer for the store's current floor, read back without a request, a
-/// lock or a write. `near` is `(answer, when it was written)` for the next two tags; `None`
-/// when no stamp exists for this floor (never probed, or probed before the floor moved).
+/// The probe's last answer for the store's current floor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CachedProbe {
     pub floor: u64,
     pub near: Option<(RangeAnswer, SystemTime)>,
 }
 
-/// Read the probe's stamp back (see [`CachedProbe`]). Offline and side-effect free: the
-/// lock file is opened read-only, never created, never locked — a stamp being rewritten at
-/// this instant reads as torn, and a torn stamp is simply absent.
+/// Read the probe's stamp back (see [`CachedProbe`]).
 #[must_use]
 pub fn cached_answer(layout: &Layout) -> CachedProbe {
     let floor = verified_floor(layout);
@@ -332,11 +269,7 @@ pub fn cached_answer(layout: &Layout) -> CachedProbe {
     }
 }
 
-/// The index builds of the signed candidates the last pass that reached the channel
-/// downloaded for the probed source: the labels of `<prefix>/index-cache.toml`
-/// ([`crate::cache::IndexCache::labels`]), newest first. A build above the floor was
-/// downloaded and not landed. `None` with no readable cache for this source. Diagnostics
-/// only, never a trust input.
+/// Index builds cached for the probed source ([`crate::cache::IndexCache::labels`]).
 #[must_use]
 pub fn held_index_builds(layout: &Layout) -> Option<Vec<u64>> {
     cached_index_builds(
@@ -369,12 +302,7 @@ fn stamp(file: &mut File, floor: u64, marker: char) -> std::io::Result<()> {
     writeln!(file, "{floor} {marker}")
 }
 
-/// One redirect-refusing HEAD's answer for index `next`: a 302 or 307 to an https URL on
-/// GitHub's user-content storage ([`is_release_asset_host`]) is the asset, a 404 its
-/// absence, and anything else (a 200, which GitHub never serves for an asset, a permanent
-/// redirect, a redirect elsewhere, a transport failure) says nothing, so a captive portal
-/// or filtering proxy cannot wake a signed pass at every cooldown. The signed pass's index
-/// discovery (`net::GithubFetcher::walk_candidates`) reads its HEADs by the same rule.
+/// Classify a redirect-refusing HEAD response ([`is_release_asset_host`]).
 pub(crate) fn classify(next: u64, answer: Result<HeadAnswer, HttpError>) -> Probe {
     match answer {
         Ok(HeadAnswer {
@@ -397,9 +325,6 @@ mod tests {
     use aterm_spec::derive::Model;
     use std::cell::Cell;
     use std::collections::BTreeMap;
-
-    // Each probe here gets one attempt, never a retry: the lock releases by `LOCK_UN`
-    // ([`take_probe_lock`]), so a deferral is a finding.
 
     struct ModeledCase {
         label: &'static str,
@@ -424,7 +349,6 @@ mod tests {
         let admitted = model.action_enabled(case.action, state);
         assert_eq!(admitted, should_request, "{} model guard", case.label);
         if !admitted {
-            // The model's buggy variant (no stamp check) would spend another request here.
             let buggy = aterm_spec::interp::with_buggy(model, 1);
             assert!(buggy.action_enabled(case.action, state));
         }
@@ -443,7 +367,6 @@ mod tests {
                 location: case.location.map(str::to_string),
             })
         };
-        // One locked attempt is the pair of HEADs, floor+1 and floor+2.
         let budget = if admitted { OFFSETS.len() } else { 0 };
         let observed = probe_next(
             layout,
@@ -487,8 +410,7 @@ mod tests {
     }
 
     /// A second host takes the shared stamp's remaining wait, not another
-    /// complete local interval. Missing/published and error stamps keep their
-    /// different limits, including a small clock correction into the future.
+    /// complete local interval.
     #[test]
     fn a_suppressed_probe_reports_the_exact_shared_cooldown_without_a_head() {
         for (marker, lifetime) in [('M', INTERVAL), ('P', INTERVAL), ('E', RETRY_AFTER_ERROR)] {
@@ -568,7 +490,6 @@ mod tests {
                 cooldown_ticks: 2,
                 answer: Probe::Deferred,
             },
-            // The download host's rate limit is an ordinary inconclusive HEAD.
             ModeledCase {
                 label: "rate-limited",
                 action: "ProbeError",
@@ -578,7 +499,6 @@ mod tests {
                 cooldown_ticks: 2,
                 answer: Probe::Deferred,
             },
-            // Both tags answer as published here; the higher is the answer.
             ModeledCase {
                 label: "published",
                 action: "ProbePublished",
@@ -675,7 +595,6 @@ mod tests {
 
     /// The probe lock is free the moment its probe releases it, whatever copies of its
     /// descriptor live on (`copy` stands in for a child mid-spawn on another thread).
-    /// Negative control first: a held lock defers the probe.
     #[test]
     fn the_probe_lock_is_free_the_moment_its_probe_releases_it() {
         let layout = layout("released");
@@ -711,7 +630,6 @@ mod tests {
         assert_eq!(requests.get(), 0, "a held lock spends no request");
 
         let copy = holder.try_clone().expect("a copy of the descriptor");
-        // Released by `LOCK_UN` (the guard's drop) while the copy is still open.
         drop(holder);
         assert!(
             take_probe_lock(&path).is_some(),
@@ -730,7 +648,7 @@ mod tests {
     /// The pair's answer refines `AtpkgIndexSuccessorSelection`: for every pair of HEAD
     /// answers (missing, a 503, published) the probe answers what the model chooses — the
     /// higher published build over a lower one and over uncertainty, `Missing` only when
-    /// both missed. The model's `Buggy=1` disagrees somewhere, so agreement is not vacuous.
+    /// both missed.
     #[test]
     fn the_real_head_pair_selection_refines_the_derived_model() {
         #[derive(Clone, Copy)]

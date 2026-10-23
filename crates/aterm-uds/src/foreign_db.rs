@@ -1,41 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! ANOTHER PROGRAM'S LIVE SQLITE DATABASE, READ WITH NO LOCK ON IT.
-//!
-//! A reader that opens a live database through SQLite joins its locking, and a
-//! lock a writer meets fails that writer AT ONCE unless the writer set a busy
-//! timeout: its write is then lost. Measured on Darwin 27.0.0 with Apple's
-//! `libsqlite3` 3.54.0 (`docs/measured/real-claude-lab-2026-10-15.md`, the
-//! 2026-10-20 section), in both journal modes:
-//!
-//! * A ROLLBACK JOURNAL (the system `TCC.db`, whose writer, `tccd`, sets no busy
-//!   timeout and writes `BEGIN`/`COMMIT`): every reader holds `SHARED` while it
-//!   reads, and a writer's `COMMIT` needs `EXCLUSIVE`. A reader's lock held as a
-//!   writer shaped as `tccd` commits failed that `COMMIT` `database is locked`
-//!   every time, and a loop of the Developer Tools read (`sqlite3 -readonly`)
-//!   lost 323 of 5 000 such writes.
-//! * WAL (agy's `conversation_summaries.db`): a reader that finds the WAL index
-//!   unbuilt (its `-shm` just made by an opening writer, or left by one that
-//!   died) takes the index's write lock to build it, which a writer with no busy
-//!   timeout meets as `database is locked`. agy sets `_busy_timeout=5000` and
-//!   waits; past 5 s it logs `summary store: sync upsert failed: ... database is
-//!   locked` and drops that write for good.
-//!
-//! So aterm never opens another program's live database through SQLite. [`read`]
-//! hands the reader bytes taken with plain reads: with no `-wal` beside the file,
-//! the file itself as an IMMUTABLE URI ([`immutable_uri`]: SQLite reads it with no
-//! lock and opens no `-wal`, `-shm` or journal); with one, a PRIVATE COPY of the
-//! file and its `-wal` (never the `-shm`) in a directory of this process's own,
-//! where the reader builds an index of its own from the copied `-wal` — SQLite's
-//! own recovery, which keeps only committed frames. The answer is kept only when
-//! every one of those files is the same after the read as before (device, inode,
-//! length, modified and changed times) and no rollback journal with anything in it
-//! stood beside them at either look: a write that landed meanwhile could have
-//! mixed two states into what was read, and a journal is a write under way (or one
-//! that died mid-way and is not rolled back yet). Otherwise the read is no answer
-//! ([`Unread`]) and the caller reads again at its next look; nothing is ever
-//! written beside the live file.
+//! Lock-free reads of another program's live SQLite database ([`read`], [`immutable_uri`],
+//! [`Unread`]).
 
 use std::path::{Path, PathBuf};
 
@@ -44,20 +11,15 @@ use std::path::{Path, PathBuf};
 pub enum Unread {
     /// No database there: nothing, or no regular file (a link is never followed).
     Missing,
-    /// A rollback journal with something in it stands beside the database: a
-    /// write is under way, or one died mid-way and is not rolled back yet, so its
-    /// bytes are no committed state.
+    /// A rollback journal with something in it stands beside the database.
     Writing,
-    /// One of its files changed while it was read: what was read could mix two
-    /// states.
+    /// One of its files changed while it was read: what was read could mix two states.
     Changed,
-    /// The copy could not be made, a file could not be looked at, or the reader
-    /// gave no answer.
+    /// The copy could not be made, a file could not be looked at, or the reader gave no answer.
     Failed,
 }
 
-/// What identifies one file's content: its device, inode, length, modified and
-/// changed times (seconds and nanoseconds), and whether it is a regular file.
+/// What identifies one file's content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Identity {
     dev: u64,
@@ -103,8 +65,7 @@ fn identity_of(m: &std::fs::Metadata) -> Identity {
     }
 }
 
-/// The identity of whatever is at `p` itself (a link's own, never its target's):
-/// `None` when nothing is there.
+/// The identity of whatever is at `p` itself: `None` when nothing is there.
 fn identity(p: &Path) -> Result<Option<Identity>, Unread> {
     match std::fs::symlink_metadata(p) {
         Ok(m) => Ok(Some(identity_of(&m))),
@@ -128,8 +89,7 @@ struct Files {
     journal: Option<Identity>,
 }
 
-/// One look at `db`, its `-wal` and its `-journal` (the `-shm` is never looked
-/// at: no reader of ours opens it).
+/// One look at `db`, its `-wal` and its `-journal`.
 fn look(db: &Path) -> Result<Files, Unread> {
     let Some(main) = identity(db)?.filter(|id| id.regular) else {
         return Err(Unread::Missing);
@@ -146,9 +106,7 @@ fn look(db: &Path) -> Result<Files, Unread> {
     })
 }
 
-/// `db` as an IMMUTABLE file URI (`file:<path>?immutable=1`), every byte but the
-/// path's plain ones percent-encoded: SQLite reads it with no lock, opens no
-/// `-wal`, `-shm` or journal, and writes nothing.
+/// `db` as an IMMUTABLE file URI (`file:<path>?immutable=1`).
 #[must_use]
 pub fn immutable_uri(db: &Path) -> String {
     #[cfg(unix)]
@@ -182,8 +140,7 @@ fn open_no_link(p: &Path) -> std::io::Result<std::fs::File> {
     options.open(p)
 }
 
-/// Copy `from` to the new file `to` with plain reads (no lock of any kind),
-/// refusing a file that is not the one looked at (`was`).
+/// Copy `from` to the new file `to` with plain reads (no lock of any kind).
 fn copy_unlocked(from: &Path, to: &Path, was: &Identity) -> Result<(), Unread> {
     let mut src = open_no_link(from).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -205,11 +162,7 @@ fn copy_unlocked(from: &Path, to: &Path, was: &Identity) -> Result<(), Unread> {
     Ok(())
 }
 
-/// A directory of this process's own for one copy: mode 0700 on Unix, an
-/// unpredictable name under the temporary directory, named with no symbolic link
-/// in its path (a reader may open with `-nofollow`, which refuses any: macOS's
-/// temporary directory is under the link `/var`), removed with everything in it
-/// when dropped.
+/// A directory of this process's own for one copy.
 struct Private(PathBuf);
 
 impl Private {
@@ -242,17 +195,10 @@ impl Drop for Private {
     }
 }
 
-/// READ `db`, ANOTHER PROGRAM'S LIVE SQLITE DATABASE, WITH NO LOCK ON IT (the
-/// module's rule): `reader` gets the SQLite filename to open — the file itself as
-/// an immutable URI while no `-wal` stands beside it, else the path of a private
-/// copy of the file and its `-wal`, opened by `reader` as it likes (it may build
-/// its own index there; the directory is gone once `reader` returns). Its answer
-/// is kept only when the files are the same after it as before and no rollback
-/// journal stood beside them.
+/// READ `db`, ANOTHER PROGRAM'S LIVE SQLITE DATABASE, WITH NO LOCK ON IT (the module's rule).
 ///
 /// # Errors
-/// [`Unread`]: no database file, a write under way, a change during the read, or
-/// a copy or reader that failed.
+/// [`Unread`]: missing database, active write, concurrent change, or reader failure.
 pub fn read<T>(db: &Path, reader: impl FnOnce(&str) -> Option<T>) -> Result<T, Unread> {
     let before = look(db)?;
     let answer = if let Some(wal) = &before.wal {
@@ -273,31 +219,26 @@ pub fn read<T>(db: &Path, reader: impl FnOnce(&str) -> Option<T>) -> Result<T, U
     answer.ok_or(Unread::Failed)
 }
 
-/// THE LOCK WITNESS, a test seam (test and debug builds, Unix): whether a read
-/// held a lock a writer would meet, and what a writer met then.
+/// THE LOCK WITNESS, a test seam (test and debug builds, Unix).
 #[cfg(all(unix, any(test, debug_assertions)))]
 pub mod witness {
     use std::path::Path;
 
-    /// The pid of a process other than this one holding a lock on `file`'s bytes
-    /// `[start, start + len)` that a writer's exclusive lock there would meet
-    /// (`F_GETLK`, which takes nothing), if one does now.
+    /// The pid of a process other than this one holding a lock on `file`'s bytes `[start.
     fn holder(file: &std::fs::File, start: u64, len: u64) -> Option<i32> {
         use std::os::fd::AsRawFd as _;
-        // SAFETY: a zeroed `flock` is a valid value of the plain C struct.
+        // SAFETY: A zeroed `flock` is a valid value of the plain C struct.
         let mut fl: libc::flock = unsafe { std::mem::zeroed() };
         fl.l_type = libc::F_WRLCK as _;
         fl.l_whence = libc::SEEK_SET as _;
         fl.l_start = i64::try_from(start).ok()?;
         fl.l_len = i64::try_from(len).ok()?;
-        // SAFETY: `fl` is a valid, writable `flock` for the call's duration, and
-        // the descriptor is open.
+        // SAFETY: `fl` is a valid, writable `flock` for the call's duration.
         let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &raw mut fl) };
         (rc == 0 && fl.l_type != libc::F_UNLCK as _).then_some(fl.l_pid)
     }
 
-    /// Sends `SIGCONT` to the stopped process when dropped, so a panicking
-    /// `write` never leaves it frozen.
+    /// Sends `SIGCONT` to the stopped process when dropped.
     struct Thaw(i32);
 
     impl Drop for Thaw {
@@ -307,17 +248,7 @@ pub mod witness {
         }
     }
 
-    /// RUN `read` ON ITS OWN THREAD AND WATCH ITS LOCKS: while it runs, ask the
-    /// kernel again and again whether a process other than this one holds a lock
-    /// on `file`'s bytes `[start, start + len)` that a writer's exclusive lock
-    /// there would meet. The first time one does, that process is stopped
-    /// (`SIGSTOP`); if the lock is still its own, `write` runs while it stands
-    /// frozen, holding it; then it runs on (`SIGCONT`). Returns `read`'s answer
-    /// and, when a holder was caught, its pid and `write`'s answer. `file` is a
-    /// scratch file of the test's own, so only a process the test started can
-    /// hold a lock on it (a lock this process takes is never reported to it).
-    /// `file` is opened read-write once it exists, and closed at the end: this
-    /// process holds no lock on it to lose.
+    /// RUN `read` ON ITS OWN THREAD AND WATCH ITS LOCKS.
     ///
     /// # Panics
     /// When `read` panicked.

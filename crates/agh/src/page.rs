@@ -119,11 +119,7 @@ pub enum End {
     },
 }
 
-/// The `--limit` cut, the one rule every caller applies to items already in their final
-/// order: `items` cut to `limit`, and `end` `Limited { at: limit }` only when it was Complete
-/// and something was cut. A walk that stopped at a cap (`Capped`, under `partial`) stays
-/// `Capped`: the first `limit` of what it read need not be the collection's first `limit`
-/// once the listing is re-sorted (design §3.7).
+/// The `--limit` cut, the one rule every caller applies to items already in their final order: `items` cut to `limit`, and `end` `Limited { at: limit }` only when it was Complete and something was cut.
 pub(crate) fn cut<T>(end: End, items: &mut Vec<T>, limit: Option<usize>) -> End {
     match limit {
         Some(limit) if items.len() > limit => {
@@ -155,8 +151,7 @@ pub struct Listing<T> {
     pub as_: IdentityRef,
 }
 
-/// Why a walk stopped at its page cap: `the listing stopped at the {pages}-page cap`. The
-/// Incomplete error's why, and a `--partial` answer's.
+/// Why a walk stopped at its page cap: `the listing stopped at the {pages}-page cap`.
 pub(crate) fn capped_why(pages: u32) -> String {
     format!("the listing stopped at the {pages}-page cap")
 }
@@ -205,12 +200,8 @@ fn result_cap_error(error: Error, pages: u32) -> Error {
 }
 
 impl<T> Listing<T> {
-    /// Capped → Incomplete, `Sub::Capped { pages }`, why `the listing stopped at the
-    /// {pages}-page cap`, next `--max-pages N, or --partial`; Complete and Limited →
-    /// `Ok(self)`.
-    ///
+    /// Capped → Incomplete, `Sub::Capped { pages }`, why `the listing stopped at the {pages}-page cap`, next `--max-pages N, or --partial`; Complete and Limited → `Ok(self)`.
     /// # Errors
-    ///
     /// As above.
     pub fn complete(self) -> Result<Listing<T>> {
         match self.end {
@@ -227,9 +218,7 @@ impl<T> Listing<T> {
     }
 
     /// Each item through `f`.
-    ///
     /// # Errors
-    ///
     /// The first error `f` returns.
     pub fn map<U>(self, f: impl FnMut(T) -> Result<U>) -> Result<Listing<U>> {
         let items = self.items.into_iter().map(f).collect::<Result<Vec<U>>>()?;
@@ -256,11 +245,9 @@ pub struct NextPage {
 /// Which next links a listing accepts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LinkScope {
-    /// `/repos/{o}/{r}<suffix>` (case-insensitive), or `/repositories/{id}<suffix>` with the
-    /// repository's id.
+    /// `/repos/{o}/{r}<suffix>` (case-insensitive), or `/repositories/{id}<suffix>` with the repository's id.
     Repo(Slug),
-    /// The first path, or `/organizations/{id}<rest>` or `/user/{id}<rest>`, where `rest` is
-    /// the first path without its first two segments.
+    /// The first path, or `/organizations/{id}<rest>` or `/user/{id}<rest>`, where `rest` is the first path without its first two segments.
     Owner {
         /// The owner's id.
         id: u64,
@@ -283,9 +270,7 @@ fn link_params(text: &str) -> (&str, &str) {
     (text, "")
 }
 
-/// The `rel="next"` URL of a `Link` header. The header is scanned entry by entry: each URL
-/// runs from `<` to `>`, so a `,` inside it (`?path=a,b`) does not split the entry, and the
-/// params run to the next `,` outside quotes.
+/// The `rel="next"` URL of a `Link` header.
 #[must_use]
 pub fn link_next(link: &str) -> Option<String> {
     let mut rest = link;
@@ -321,10 +306,7 @@ fn refused_link(url: &str, reason: &str) -> Error {
 /// `before`).
 const CURSORS: [&str; 4] = ["since", "cursor", "after", "before"];
 
-/// The refusal of a next link with no usable `page`. A link that carries a cursor (a listing
-/// GitHub pages by one, which the walker does not follow in M1) is refused naming that cursor,
-/// with a next that says to read one page at a time; any other such link is merely malformed,
-/// and keeps the kind's own next.
+/// The refusal of a next link with no usable `page`.
 fn unnumbered_link(url: &str, query: &str) -> Error {
     match CURSORS
         .iter()
@@ -411,16 +393,8 @@ fn owner_link(path: &str, first: &str, id: u64) -> Result<(), String> {
     }
 }
 
-/// Validate a next link (design §13.1): the api origin; a path `scope` accepts (`repo_id` for
-/// a numeric repository link, `None` there → Protocol); `page` strictly above `last_page`;
-/// `per_page` at most 100. Anything else → CouldNotRun, `Sub::Protocol`, why `GitHub's next
-/// link {url} is refused: {reason}`. A link with no usable `page` (none, or not a number) that
-/// carries `since`, `cursor`, `after` or `before` is refused naming that cursor, with a next
-/// that says to read one page at a time; any other link with no usable `page` is refused with
-/// the reason `it names no page` and keeps the kind's own next.
-///
+/// Validate a next link (design §13.1): the api origin; a path `scope` accepts (`repo_id` for a numeric repository link, `None` there → Protocol); `page` strictly above `last_page`; `per_page` at most 100.
 /// # Errors
-///
 /// As above.
 pub fn next_link(
     next_url: &str,
@@ -489,7 +463,6 @@ enum Shape {
 
 /// One page as a pass read it: the call that read it, its validator and, for a Snapshot walk
 /// (the one walk `changed` revalidates), its body's stable form, computed once as it is read.
-/// The body itself moves into the pass's items.
 struct PageRead {
     call: Call,
     etag: Option<String>,
@@ -543,8 +516,7 @@ const REPOSITORY_VOLATILE: [&str; 10] = [
 /// of each item (or of the body, when it is an object), `download_count` from every
 /// `assets[]` item, and, from an item that is a repository object (it carries `full_name` and
 /// `stargazers_count`), its counters and timestamps (`REPOSITORY_VOLATILE`); rendered by
-/// aterm-json. Anything else, ids and order included, is compared as read, so a listing's
-/// membership is still one state.
+/// aterm-json.
 fn stable(mut value: Value) -> String {
     let strip = |item: &mut Value| {
         let Some(object) = item.as_object_mut() else {
@@ -582,12 +554,7 @@ impl Walk<'_> {
     }
 
     /// A page followed a 301 from `old` to `new` (plan §8 step 5): the rest of the walk is the new
-    /// name's. The first call, the current page's call and every page already read are
-    /// re-targeted (their `/repos/{old}` prefix and their route), so a later page and the
-    /// revalidation are sent to the new name and routed for its owner (design §7.2, the
-    /// release token never presented for a repository that left its tier); a `Repo(old)`
-    /// scope becomes `Repo(new)`, so the new name's next links are its listing; and the
-    /// numeric links' id is taken again for `new` (the move's lookup memoized it).
+    /// name's.
     fn moved(&mut self, old: &Slug, new: &Slug, call: &mut Call, pages: &mut [PageRead]) {
         crate::client::retarget(&mut self.first, old, new);
         crate::client::retarget(call, old, new);
@@ -622,8 +589,6 @@ impl Walk<'_> {
         loop {
             let answered = match self.call(&call) {
                 Ok(answered) => answered,
-                // A page GitHub's own next link named, refused because the listing is past
-                // its result cap: the input was fine, and what was read is a capped walk.
                 Err(error) if !pages.is_empty() && is_result_cap(&error) => {
                     let read = u32::try_from(pages.len()).unwrap_or(u32::MAX);
                     if self.opts.partial {
@@ -737,9 +702,7 @@ impl Walk<'_> {
     }
 
     /// The walk: one pass, then, for a Snapshot of more than one page, the revalidation, one
-    /// rescan on a change, and Torn on a second. Every error of a repository's listing names
-    /// that repository (plan §8 step 8): a page that is not JSON, a refused next link, the cap and a
-    /// tear alike; after a followed move, the repository's new name.
+    /// rescan on a change, and Torn on a second.
     fn run(mut self) -> Result<Listing<Value>> {
         let read = self.read();
         let repo = self.repo().cloned();
@@ -789,8 +752,6 @@ fn walk_as(
     if u64::from(opts.per_page) > MAX_PER_PAGE {
         return Err(too_many());
     }
-    // A per_page the caller named, in `first.query` or in the query `first.path` carries, is
-    // held to the same bound before anything is sent (plan §8 walker step 1).
     let path_query = first.path.split_once('?').map_or("", |(_, query)| query);
     let named = first
         .query
@@ -820,31 +781,8 @@ fn walk_as(
     .run()
 }
 
-/// Walk an array listing to its end (design §13.1):
-/// 1. the first call gets `per_page` (`opts.per_page`, unless its query names one; over 100 →
-///    Usage `per_page is at most 100`);
-/// 2. each page is a `gh.call`, whose body must be a JSON array (else CouldNotRun `Protocol`,
-///    why `page {n} is not a JSON array`), and whose `Link` next goes through `next_link`: a
-///    numeric `/repositories/{id}` link asks `gh.repo_id` once, through the memo;
-/// 3. at `max_pages` with a next link: `partial` → `End::Capped { pages }`; otherwise
-///    Incomplete `Capped { pages }`, next `--max-pages N, or --partial`;
-///    a page reached by a next link that GitHub answers 422 `Only the first N results are
-///    available.` (its result cap, which the releases listing has at 1000) ends the walk the
-///    same way: `partial` → `End::Capped { pages }` (the pages read); otherwise Incomplete
-///    `Capped { pages }`, the exchange kept, next `--partial`;
-/// 4. a limit stops once `limit` items are held and more remain: `End::Limited`;
-/// 5. Snapshot with more than one page: every page is requested again with its ETag; a 304
-///    is unchanged, a 200 is compared on its stable form (`download_count` and the
-///    `reactions` rollup removed, and a repository object's counters and timestamps); a
-///    change → one full rescan, and a change in the rescan → Incomplete `Torn { page }`;
-/// 6. AsRead: no revalidation, items kept by first sight of their `id`.
-///
-/// A page that follows a moved repository's 301 (plan §8 step 5) moves the rest of the walk to the
-/// new name: later pages, the scope's next links and the revalidation are the new name's,
-/// routed for its owner.
-///
+/// Walk an array listing to its end (design §13.1): 1. the first call gets `per_page` (`opts.per_page`, unless its query names one; over 100 → Usage `per_page is at most 100`); 2. each page is a `gh.call`, whose body must be a JSON array (else CouldNotRun `Protocol`, why `page {n} is not a JSON array`), and whose `Link` next goes through `next_link`: a numeric `/repositories/{id}` link asks `gh.repo_id` once, through the memo; 3. at `max_pages` with a next link: `partial` → `End::Capped { pages }`; otherwise Incomplete `Capped { pages }`, next `--max-pages N, or --partial`; a page reached by a next link that GitHub answers 422 `Only the first N results are available.` (its result cap, which the releases listing has at 1000) ends the walk the same way: `partial` → `End::Capped { pages }` (the pages read); otherwise Incomplete `Capped { pages }`, the exchange kept, next `--partial`; 4. a limit stops once `limit` items are held and more remain: `End::Limited`; 5.
 /// # Errors
-///
 /// The first page's error; Incomplete (cap, torn); Protocol (a refused link).
 pub fn walk(
     gh: &Github,
@@ -856,9 +794,7 @@ pub fn walk(
 }
 
 /// Walk any listing, returning each page's body whole (`api --all`): AsRead, no merging.
-///
 /// # Errors
-///
 /// As `walk`.
 pub fn walk_pages(
     gh: &Github,

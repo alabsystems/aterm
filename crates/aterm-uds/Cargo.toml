@@ -14,7 +14,8 @@ description = "aterm — the portable control-socket stream: pure type aliases t
 # declaration crate on Unix, aterm-vitals' pure types, and aterm-sysprobe's
 # readers: `KERN_PROCARGS2`'s (`procargs`, re-exported) on Unix and Windows,
 # and its path rule and process reader on Windows; and on Unix astream-sys
-# (zero dependencies), whose owner-only rule `private_file` admits by.
+# (zero dependencies), whose owner-only rule `private_file` admits by and whose
+# boot reader names this boot.
 [dependencies]
 # aterm-vitals: the program check's reading and verdict types
 # (`program_check`), which this crate's reader fills. A pure model crate with
@@ -44,7 +45,9 @@ libc = { workspace = true }
 # astream-sys: astream's OS cordon, zero dependencies. `private_file` holds every
 # file and directory it admits to astream's one owner-only rule
 # (`open_nonblocking`, `owner_private`, `owner_private_dir`: the kind, the owner,
-# the macOS access list, the mode), so the ACL FFI it needs lives there, not here.
+# the macOS access list, the mode), so the ACL FFI it needs lives there, not here;
+# and this boot's id (`process::kin::boot_id`, which a verify run's record names)
+# is its one reader's (`boot_session`: the all-zero id refused).
 astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
 
 [dev-dependencies]

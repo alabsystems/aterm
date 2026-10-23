@@ -418,7 +418,8 @@ fn branched(rows: &[String], head: usize) -> bool {
 
 fn is_own_row_head(row: &str) -> bool {
     row.strip_prefix("◆ ").is_some_and(|r| {
-        r.starts_with(const { anchor_text("muse.recap") })
+        crate::text::trim_end(r) == const { anchor_text("muse.queued") }
+            || r.starts_with(const { anchor_text("muse.recap") })
             || r.starts_with(const { anchor_text("muse.notice.message") })
             || r.strip_prefix(const { anchor_text("muse.worked") })
                 .and_then(|t| t.split_once(" · "))
@@ -469,11 +470,40 @@ fn notice(rows: &[String]) -> Option<(usize, String)> {
 }
 
 fn interrupting(rows: &[String], f: Frame) -> bool {
+    footer_says(rows, f, const { anchor_text("muse.footer.interrupting") })
+}
+
+/// The footer says the run goes on with the next prompt queued under it (`◆ Queued input`),
+/// though the reply is drawn whole and the status row is gone (I4 of
+/// `docs/measured/idle-no-evidence-2026-10-22.md`).
+fn steering(rows: &[String], f: Frame) -> bool {
+    [
+        anchor_text("muse.footer.steering"),
+        anchor_text("muse.footer.queued"),
+        anchor_text("muse.footer.replacing"),
+    ]
+    .iter()
+    .any(|said| footer_says(rows, f, said))
+}
+
+fn footer_says(rows: &[String], f: Frame, said: &str) -> bool {
     rows.get(f.footer).is_some_and(|r| {
         crate::text::trim_end(r)
-            .strip_suffix(const { anchor_text("muse.footer.interrupting") })
+            .strip_suffix(said)
             .is_some_and(|left| left.ends_with("  "))
     })
+}
+
+/// The window title says a run is active: a frame of the spinner (`muse.title.spinner`), a
+/// blank, then the title (`⠙ proj`); at rest the title alone. It turns through the end-of-turn
+/// review, which the screen does not show (`docs/measured/idle-no-evidence-2026-10-22.md` I2).
+#[must_use]
+pub fn title_runs(title: &str) -> bool {
+    let mut chars = title.chars();
+    chars
+        .next()
+        .is_some_and(|c| const { anchor_text("muse.title.spinner") }.contains(c))
+        && chars.next() == Some(' ')
 }
 
 const WORK_RUNNING: &str = "background work running";
@@ -562,7 +592,7 @@ fn turn_phase(rows: &[String]) -> (Phase, bool) {
         Turn::Fresh => (Phase::Idle, true),
         Turn::Unknown => (Phase::Idle, false),
         Turn::Ended(..) | Turn::Tail(..) | Turn::Tool(..) | Turn::Carded(_)
-            if interrupting(rows, f) =>
+            if interrupting(rows, f) || steering(rows, f) =>
         {
             (Phase::Busy, false)
         }
@@ -635,16 +665,56 @@ fn tool_row(head: &str) -> bool {
                 .and_then(|rest| rest.strip_prefix(' '))
                 .is_some_and(names_a_path)
         })
+        || bare_tool_row(head)
+}
+
+/// Muse Code's tool rows that draw no outcome branch, measured on 1.4.10 (`◆ Fetched <url> —
+/// denied`, `◆ Fetched <url> — 404`, `◆ Invalid work ID — rejected · ctrl+o`): `Fetched`, a
+/// blank, a URL, then only the row's own tail (whose outcome may be a three-digit HTTP status);
+/// or `Invalid work ID` and only its own tail. Each is one row ([`tool_block`]).
+fn bare_tool_row(head: &str) -> bool {
+    head.strip_prefix(const { anchor_text("muse.tool.fetched") })
+        .and_then(|rest| rest.strip_prefix(' '))
+        .is_some_and(|rest| {
+            let token = rest.split(' ').next().unwrap_or_default();
+            is_url(token) && own_tail(&rest[token.len()..], true)
+        })
+        || head
+            .strip_prefix(const { anchor_text("muse.tool.invalid_work") })
+            .is_some_and(|tail| own_tail(tail, false))
+}
+
+/// `<scheme>://<more>`: every URL a measured `Fetched` row names.
+fn is_url(token: &str) -> bool {
+    token.split_once("://").is_some_and(|(scheme, rest)| {
+        !rest.is_empty()
+            && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    })
+}
+
+/// A block whose first line `lines[0]` is a tool row of Muse Code's, not the agent's words. A
+/// row of [`bare_tool_row`]'s stands alone: with lines under it, the block is a reply.
+fn tool_block(lines: &[&str]) -> bool {
+    lines
+        .first()
+        .is_some_and(|&head| tool_row(head) && (lines.len() == 1 || !bare_tool_row(head)))
 }
 
 const TOOL_OUTCOMES: [&str; 4] = ["failed", "denied", "rejected", "no effect"];
 
 fn names_a_path(rest: &str) -> bool {
     let token = rest.split(' ').next().unwrap_or_default();
-    if token.is_empty() {
-        return false;
-    }
-    let mut tail = &rest[token.len()..];
+    !token.is_empty() && own_tail(&rest[token.len()..], false)
+}
+
+/// A tool row's own tail after its name, each part optional and in order: the diff's count
+/// (` (+1 −1)`), an outcome after ` — ` ([`TOOL_OUTCOMES`]; with `status`, also a three-digit
+/// HTTP status), the expander (` · ctrl+o`); nothing else.
+fn own_tail(tail: &str, status: bool) -> bool {
+    let mut tail = tail;
     if let Some(r) = tail.strip_prefix(" (") {
         let Some((count, after)) = r.split_once(')') else {
             return false;
@@ -663,7 +733,17 @@ fn names_a_path(rest: &str) -> bool {
         tail = after;
     }
     if let Some(r) = tail.strip_prefix(" — ") {
-        let Some(after) = TOOL_OUTCOMES.iter().find_map(|o| r.strip_prefix(o)) else {
+        let http = || {
+            let code = r
+                .get(..3)
+                .filter(|c| c.bytes().all(|b| b.is_ascii_digit()))?;
+            r.strip_prefix(code)
+        };
+        let Some(after) = TOOL_OUTCOMES
+            .iter()
+            .find_map(|o| r.strip_prefix(o))
+            .or_else(|| http().filter(|_| status))
+        else {
             return false;
         };
         tail = after;
@@ -678,7 +758,7 @@ pub fn said_tail(rows: &[String]) -> Option<String> {
     let head = *lines.first()?;
     let (_, message) = notice(rows)?;
     if head == const { anchor_text("muse.turn.interrupted") }
-        || tool_row(head)
+        || tool_block(&lines)
         || branched(rows, at)
         || wall_of(&message).is_some()
         || is_fault(&message)
@@ -763,7 +843,7 @@ fn turn_before(rows: &[String]) -> Option<(bool, Vec<String>)> {
         };
         let message = lines.join(" ");
         if top == const { anchor_text("muse.turn.interrupted") }
-            || tool_row(top)
+            || tool_block(&lines)
             || wall_of(&message).is_some()
             || is_fault(&message)
         {
@@ -2065,6 +2145,10 @@ pub mod fixtures {
     pub const BUSY_1_4_10: &str = include_str!("fixtures/muse-1.4.10-R6427.1-busy-thinking.txt");
     pub const BUSY_FIRST_FRAME: &str =
         include_str!("fixtures/muse-1.4.10-R6427.1-lab-busy-first-frame.txt");
+    pub const BUSY_FIRST_FRAME_CYCLED: &str =
+        include_str!("fixtures/muse-1.4.10-R6427.1-lab-busy-first-frame-cycled.txt");
+    pub const QUEUED_INPUT: &str =
+        include_str!("fixtures/muse-1.4.10-R6427.1-lab-queued-input.txt");
     pub const INTERRUPTING: &str = include_str!("fixtures/muse-1.4.10-R6427.1-interrupted.txt");
     pub const INTERRUPTED_1_4_10: &str =
         include_str!("fixtures/muse-1.4.10-R6427.1-interrupted-settled.txt");

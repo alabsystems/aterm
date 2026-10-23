@@ -83,6 +83,7 @@ pub(crate) fn serialize_pages(lines: &[Line], max_page_bytes: usize) -> Vec<(usi
 }
 
 /// Write a [`serialize_pages`] page's `[count:4]` header (saturating at
+/// `u32::MAX`, as [`serialize_lines`] does).
 fn seal_page(mut page: Vec<u8>, count: usize) -> (usize, Vec<u8>) {
     if let Some(header) = page.get_mut(..4) {
         header.copy_from_slice(&u32::try_from(count).unwrap_or(u32::MAX).to_le_bytes());
@@ -110,6 +111,8 @@ const fn line_size_v0(data: &[u8]) -> Option<usize> {
 }
 
 /// Compute the byte size of a v1/v2/v3/v4 line record:
+/// `[version:1][flags:1][len:4][content:len][has_attrs:1][attrs...][hyperlinks]`
+/// then, in v4, the underline colours.
 fn line_size_v1v2(data: &[u8], version: u8) -> Option<usize> {
     if data.len() < 7 {
         return None;
@@ -153,6 +156,7 @@ fn line_size_v1v2(data: &[u8], version: u8) -> Option<usize> {
 }
 
 /// Compute the byte size of the v4 underline-colour section: `[count:2]` then
+/// `count` fixed 8-byte records, so `2 + count * 8`.
 fn underline_colors_size_v4(data: &[u8], base_size: usize) -> Option<usize> {
     let hdr_end = base_size.checked_add(2)?;
     let count_bytes = data.get(base_size..hdr_end)?;
@@ -190,6 +194,7 @@ fn hyperlinks_size_v2(data: &[u8], base_size: usize) -> Option<usize> {
 }
 
 /// Compute the byte size of the v3 hyperlinks section (with IDs), with the
+/// sub-slice reads of [`hyperlinks_size_v2`].
 fn hyperlinks_size_v3(data: &[u8], base_size: usize) -> Option<usize> {
     let hdr_end = base_size.checked_add(2)?;
     let count_bytes = data.get(base_size..hdr_end)?;
@@ -244,6 +249,7 @@ pub(crate) fn take_records_walked() -> usize {
 }
 
 /// Walk the framed records of a serialized block, offering each complete
+/// record's bytes to `accept`.
 #[cfg_attr(trust_verify, trust::skip)]
 fn walk_records(
     data: &[u8],
@@ -289,6 +295,7 @@ fn walk_records(
 }
 
 /// Read a block's declared line count (the 4-byte header), or `None` when the
+/// buffer is too short to hold one.
 fn declared_count(data: &[u8]) -> Option<usize> {
     let header = data.get(..4)?;
     if header.len() < 4 {

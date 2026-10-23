@@ -8,14 +8,14 @@ use alloc::boxed::Box;
 
 /// Hashes 4 bytes to 16 bits, so a table smaller than 2^16 entries indexes it by right shift.
 #[inline]
-fn hash(sequence: u32) -> u32 {
+const fn hash(sequence: u32) -> u32 {
     (sequence.wrapping_mul(2654435761_u32)) >> 16
 }
 
 /// Hashes the low 5 bytes of `sequence` to 16 bits.
 #[cfg(target_pointer_width = "64")]
 #[inline]
-fn hash5(sequence: usize) -> u32 {
+const fn hash5(sequence: usize) -> u32 {
     let primebytes = if cfg!(target_endian = "little") {
         889523592379_usize
     } else {

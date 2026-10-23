@@ -37,7 +37,7 @@ pub struct BoxCall {
     pub id: String,
 }
 
-/// THE MAIN CHAIN'S CALLS WITH NO RESULT, in a transcript tail, IN THE CONVERSATION'S ORDER (the one reader of both box lanes: this module's and [`super::box_command::pending_bash`]).
+/// THE MAIN CHAIN'S CALLS WITH NO RESULT, in a transcript tail, IN THE CONVERSATION'S ORDER.
 #[must_use]
 pub fn pending_calls(jsonl: &str) -> Vec<PendingCall> {
     let mut parent: HashMap<String, String> = HashMap::new();
@@ -120,6 +120,8 @@ pub fn pending_calls(jsonl: &str) -> Vec<PendingCall> {
 }
 
 /// Whether `who` is on the `parentUuid` chain above the row `of`, followed
+/// through `parent` (each row's `uuid` to its parent's) for at most as many
+/// steps as it has rows: a chain that leaves the tail, or loops, is no proof.
 fn ancestor(parent: &HashMap<String, String>, of: &str, who: &str) -> bool {
     let mut at = of;
     for _ in 0..parent.len() {
@@ -230,6 +232,7 @@ pub fn reads_the_screen_above(p: &PromptV2) -> bool {
 }
 
 /// The file `row` names where it is an Edit call's own row, `⏺ Update(<file>)`
+/// (or the same with its dot blinked off).
 fn update_of(row: &str) -> Option<&str> {
     row.strip_prefix("⏺ ")
         .or_else(|| row.strip_prefix("  "))?
@@ -238,6 +241,8 @@ fn update_of(row: &str) -> Option<&str> {
 }
 
 /// Whether `row` is a row of the agent's own text: its first (`⏺ ` and no
+/// call's row) or one carried on under it (two columns in, no `⎿`), with no
+/// `…` in it (a call's progress row, `  Reading 1 file…`, is never text).
 fn text_row(row: &str) -> bool {
     if row.contains('…') || call_row(row) {
         return false;
@@ -250,6 +255,8 @@ fn text_row(row: &str) -> bool {
 }
 
 /// Whether `row` is the row Claude Code ends a finished call's cut output
+/// with, `… +<n> line(s)` (`     … +5 lines`, `… +1 line (ctrl+o to expand)`):
+/// no call in progress, though it carries a `…`.
 fn cut_output(row: &str) -> bool {
     row.trim_start().strip_prefix("… +").is_some_and(|r| {
         let digits = r.chars().take_while(char::is_ascii_digit).count();
@@ -258,6 +265,8 @@ fn cut_output(row: &str) -> bool {
 }
 
 /// Whether `row` is a tool call's own row: `⏺ ` (or its blinked-off dot) and
+/// a name of one word opening a `(`, as `⏺ Bash(ls)` and `⏺ Update(x)` are and
+/// `⏺ Read 1 file` and an assistant's sentence are not.
 fn call_row(row: &str) -> bool {
     let Some(rest) = row.strip_prefix("⏺ ").or_else(|| row.strip_prefix("  ")) else {
         return false;
@@ -274,6 +283,8 @@ fn call_row(row: &str) -> bool {
 }
 
 /// Whether `row` is the child row a Bash call draws before it has run:
+/// `⎿  Waiting…` (waiting on its box, or queued), `⎿  Running…`, or a
+/// 2.1.280-style `⎿  $ <command>`.
 fn bash_unrun(row: &str) -> bool {
     row.trim_start()
         .strip_prefix('⎿')
@@ -292,6 +303,8 @@ fn live<'a>(
 }
 
 /// Whether the call's `file` is the path a box shows (`shown`): `shown`'s
+/// components, a leading `./` dropped and `~/` the `home` it names, are the
+/// call's last ones; an absolute `shown` must be the call's whole path.
 fn names(shown: &str, file: &str, home: Option<&Path>) -> bool {
     let shown = shown.trim();
     let shown: PathBuf = match shown.strip_prefix("~/") {
@@ -317,6 +330,7 @@ fn names(shown: &str, file: &str, home: Option<&Path>) -> bool {
 }
 
 /// A path's named components and whether it is absolute; `None` for one
+/// with `..` or a prefix in it.
 fn components(path: &Path) -> Option<(Vec<&std::ffi::OsStr>, bool)> {
     let mut named = Vec::new();
     let mut rooted = false;

@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Unit tests for the alt-screen archive: the pure differ over `&[&str]`-style
-//! frames, the streaming DECRST matcher, and the `Terminal` hook.
+//! Unit tests for the alt-screen archive.
 
 use super::*;
 use crate::terminal::ClockReading;
@@ -47,16 +46,12 @@ fn gap_kinds(a: &AltArchive) -> Vec<(u64, AltArchiveGapKind)> {
     a.gaps().map(|g| (g.after, g.kind)).collect()
 }
 
-// ------------------------------------------------------------------ differ
-
 #[test]
 fn pageup_one_screen_then_forward_line_by_line_has_no_duplicates() {
     let mut a = AltArchive::new();
     for s in 0..=60 {
         commit(&mut a, &frame(s, 20));
     }
-    // PageUp by a whole screen: no overlap, so it reads as a jump. The screen
-    // that was showing is flushed; the reanchor finds the new top inside it.
     commit(&mut a, &frame(40, 20));
     assert_eq!(a.texts(), range(tx, 0..80));
     assert_eq!(a.back(), 20);
@@ -78,9 +73,6 @@ fn two_page_ups_then_forward_has_no_duplicates() {
     for s in 0..=60 {
         commit(&mut a, &frame(s, 20));
     }
-    // Back by 10 twice (overlapping moves): the second exceeds what is on screen
-    // relative to the archive's end, which a debt capped at the screen height
-    // would forget.
     commit(&mut a, &frame(50, 20));
     commit(&mut a, &frame(40, 20));
     assert_eq!(a.back(), 20);
@@ -108,12 +100,10 @@ fn spinner_only_edits_archive_nothing() {
         commit(&mut a, &with_spinner(0, n));
     }
     assert!(a.is_empty(), "a ticking spinner is an in-place edit");
-    // A tool row finishing in place is an edit too.
     let mut f = with_spinner(0, 10);
     f[5] = "⏺ Bash(cargo test) done".to_string();
     commit(&mut a, &f);
     assert!(a.is_empty());
-    // Shifts with the spinner still ticking archive the transcript only.
     for (n, s) in (1..=5).enumerate() {
         commit(&mut a, &with_spinner(s, 11 + n));
     }
@@ -128,7 +118,6 @@ fn blank_area_shrinking_mid_archive_archives_nothing() {
         commit(&mut a, &frame(s, 18));
     }
     assert_eq!(a.texts(), range(tx, 0..4));
-    // The app clears (a jump, flushed) and then grows from the bottom again.
     let grow = |n: usize| {
         let mut f = vec![String::new(); 18 - n];
         f.extend((100..100 + n).map(tx));
@@ -149,13 +138,10 @@ fn wholesale_redraw_and_back_reanchors_without_duplicates() {
     for s in 0..=30 {
         commit(&mut a, &frame(s, 20));
     }
-    // Toggle to a different view: a jump; the old screen is flushed.
     commit(&mut a, &frame_with(view, 0, 20, &CHROME));
     assert_eq!(a.texts(), range(tx, 0..50));
     assert_eq!(gap_kinds(&a), vec![(50, AltArchiveGapKind::Jump)]);
     assert_eq!(a.back(), 0);
-    // And back: the other view is flushed, and the reanchor finds the screen's
-    // top in the archive.
     commit(&mut a, &frame(30, 20));
     assert_eq!(a.len(), 70);
     assert_eq!(
@@ -197,8 +183,6 @@ fn all_rule_rows_make_no_false_shift() {
     assert_eq!(a.gaps().count(), 0);
 }
 
-// The retained-row charge computed independently of the production helper and
-// of ALT_ARCHIVE_ROW_OVERHEAD.
 fn expected_retained_row_charge(len: usize) -> usize {
     let padded_text = std::alloc::Layout::from_size_align(len, 16)
         .unwrap()
@@ -212,8 +196,6 @@ fn independently_priced_archive_eviction_conforms_to_ring() {
     use aterm_models_core::ring_model;
     use aterm_spec::interp;
 
-    // Four characters are sufficient anchors. A flat len + 32 charge would
-    // admit at least a fourth row into this independently priced budget.
     fn short_row(i: usize) -> String {
         format!("{i:04}")
     }
@@ -226,9 +208,6 @@ fn independently_priced_archive_eviction_conforms_to_ring() {
     let mut a = AltArchive::with_limits(budget, ALT_ARCHIVE_MAX_ROWS);
     commit(&mut a, &frame_with(short_row, 0, 20, &CHROME));
 
-    // Reuse Ring's existing Tier-0 obligation for this equal-cost projection:
-    // seq is the newest archived index, lo is the oldest retained index.
-    // This bind does not model mixed row costs, differ heuristics or RSS.
     let model = ring_model();
     let project = |archive: &AltArchive| -> interp::State {
         [
@@ -249,8 +228,6 @@ fn independently_priced_archive_eviction_conforms_to_ring() {
         assert_eq!(a.texts(), range(short_row, seq.saturating_sub(KEPT)..seq));
 
         if seq == 4 {
-            // Negative control: keeping the fourth row under a flat charge
-            // preserves lo instead of evicting. The same model must reject it.
             let mut undercharged = observed.clone();
             undercharged.insert("lo", previous["lo"]);
             assert_eq!(interp::admits(&model, &previous, &undercharged), None);
@@ -285,8 +262,6 @@ fn the_row_cap_evicts_and_gaps_leave_with_their_rows() {
     assert_eq!(c.gaps().count(), 0);
 }
 
-// ----------------------------------------------------------- shared budget
-
 /// One session's archive with its own budget, shaped like the live one the GUI
 /// spawns but counted in rows rather than megabytes.
 fn session(budget: usize) -> AltArchive {
@@ -315,8 +290,6 @@ fn a_crowded_pool_floors_the_share_instead_of_starving_a_session() {
     let mut tabs: Vec<AltArchive> = (0..N).map(|_| session(total)).collect();
     for a in &mut tabs {
         a.share_budget(Some(Arc::clone(&pool)));
-        // Every one of the sixteen is really running a full-screen app: this
-        // is the crowd, not sixteen idle tabs (those cost the pool nothing).
         scroll(a, 40);
     }
     assert_eq!(pool.live(), N);
@@ -332,8 +305,6 @@ fn a_crowded_pool_floors_the_share_instead_of_starving_a_session() {
         assert!(a.enabled(), "a crowded pool never turns a session off");
         assert_eq!(a.texts(), range(tx, 40..41), "the newest row, not none");
     }
-    // The floor overshoots on purpose: past `total / min_share` sessions the
-    // process total grows again rather than starving every archive.
     assert_eq!(tabs.iter().map(AltArchive::bytes).sum::<usize>(), N * cost);
 }
 
@@ -352,7 +323,6 @@ fn a_share_is_a_ceiling_and_not_an_allowance() {
     scroll(&mut small, 40);
     assert_eq!(small.len(), 3);
 
-    // And a session cannot buy itself out of the pool with a bigger number.
     small.set_budget(usize::MAX);
     assert_eq!(small.effective_budget(), total);
     assert_eq!(small.budget(), usize::MAX, "its own budget is what was set");
@@ -369,14 +339,10 @@ fn a_share_that_moves_mid_stream_never_leaves_more_than_it_allows() {
     drawing.share_budget(Some(Arc::clone(&pool)));
     let mut crowd: Vec<AltArchive> = Vec::new();
     for s in 0..=60 {
-        // Tabs open (the share falls) and close (it rises again) under a
-        // session that is drawing the whole time.
         match s {
             10 | 20 | 30 => {
                 let mut tab = session(total);
                 tab.share_budget(Some(Arc::clone(&pool)));
-                // A tab that draws: an open one holding nothing takes no
-                // share, so it would not move the line under `drawing` at all.
                 scroll(&mut tab, 4);
                 crowd.push(tab);
             }
@@ -392,9 +358,6 @@ fn a_share_that_moves_mid_stream_never_leaves_more_than_it_allows() {
             "step {s}: {} retained over {allowed}",
             drawing.bytes()
         );
-        // Whatever the share did, what is left is the newest unbroken run: a
-        // shrinking share drops the oldest rows, a growing one resumes at the
-        // scroll without re-opening a hole.
         let kept = drawing.len();
         assert_eq!(drawing.texts(), range(tx, s - kept..s), "step {s}");
         assert_eq!(drawing.gaps().count(), 0, "step {s}: a scroll has no gap");
@@ -418,8 +381,6 @@ fn an_archive_that_is_off_takes_no_share() {
     off.set_enabled(false);
     assert_eq!(pool.live(), 1, "an archive that is off retains nothing");
     assert_eq!(on.effective_budget(), total);
-    // Turning it back on is not filling it: `set_enabled(true)` starts from a
-    // fresh baseline holding nothing, so it takes no share until it draws.
     off.set_enabled(true);
     assert_eq!(pool.live(), 1, "on, and holding nothing");
     assert_eq!(on.effective_budget(), total);
@@ -427,7 +388,6 @@ fn an_archive_that_is_off_takes_no_share() {
     assert_eq!(pool.live(), 2);
     assert_eq!(on.effective_budget(), total / 2);
 
-    // `set_budget(0)` says the same thing by the other route.
     off.set_budget(0);
     assert_eq!(pool.live(), 1);
     off.set_budget(total);
@@ -435,8 +395,6 @@ fn an_archive_that_is_off_takes_no_share() {
     assert_eq!(pool.live(), 2);
     assert_eq!(on.effective_budget(), total / 2);
 
-    // Leaving the pool is not the same as being off: it takes its own budget
-    // back with it.
     off.share_budget(None);
     assert_eq!(pool.live(), 1);
     assert!(off.bytes() > 0, "leaving the pool keeps the rows");
@@ -447,17 +405,6 @@ fn an_archive_that_is_off_takes_no_share() {
 /// Conformance binding for `AltArchivePool`: the real archives driven beside
 /// `aterm-spec`'s `alt_archive_pool_model` (discharged by
 /// `scope_aggregate_models_prove_catch_and_multiply`), step for step.
-///
-/// The projection is exact: the model counts rows with `Total = 4` and
-/// `Half = 2`, so the pool is `4 * row_cost()` with `min_share = row_cost()`
-/// (below `Half`, so it never raises the share). Each `CommitA` is one
-/// committed frame, and `a.len()` must equal the model's `a` after every step,
-/// including:
-///
-///   * B joins and draws while A is full: A is over its new share and keeps
-///     its rows (an archive lowers only its own retention); the model calls A
-///     unsettled and `PoolBounded` holds vacuously.
-///   * A commits once more and comes within the share: the bound converges.
 #[test]
 fn alt_archive_pool_conformance_real_archives_project_onto_model() {
     let m = aterm_models_core::alt_archive_pool_model();
@@ -474,9 +421,6 @@ fn alt_archive_pool_conformance_real_archives_project_onto_model() {
         *st.get(v).expect("the model declares this variable")
     };
 
-    // Baseline first, not a model step: the first committed frame archives no
-    // row. The model's `CommitA` is a row leaving the viewport, i.e. every
-    // frame after this one.
     commit(&mut real_a, &frame(fa, 20));
     fa += 1;
     commit(&mut real_b, &frame(fb, 20));
@@ -484,8 +428,6 @@ fn alt_archive_pool_conformance_real_archives_project_onto_model() {
     assert_eq!(real_a.len(), 0, "the baseline frame archives nothing");
     assert_eq!(real_b.len(), 0);
 
-    // Five frames into A while it is alone in the pool: it may fill the whole
-    // Total, and the fifth changes nothing because it is already there.
     for step in 1..=5 {
         assert!(
             m.fire("CommitA", &mut st),
@@ -504,11 +446,7 @@ fn alt_archive_pool_conformance_real_archives_project_onto_model() {
     assert_eq!(real_a.len(), 4, "alone in the pool: the whole total");
     assert_eq!(pool.live(), 1, "and B, holding nothing, is not counted");
 
-    // B starts drawing. A is over its halved share and keeps its rows until
-    // its own next frame (the model's `unsettled`).
     assert!(m.fire("CommitB", &mut st));
-    // B's last frame: the rest of the test is A converging while B is settled,
-    // so `fb` is not advanced past it (as `fa` is not past A's last frame).
     commit(&mut real_b, &frame(fb, 20));
     assert_eq!(real_b.len() as i64, model(&st, "b"));
     assert_eq!(real_a.len() as i64, model(&st, "a"), "A did not shed a row");
@@ -521,7 +459,6 @@ fn alt_archive_pool_conformance_real_archives_project_onto_model() {
     );
     assert!(m.check_invariant("PoolBounded", &st));
 
-    // A commits again: the bound converges, on this frame.
     assert!(m.fire("CommitA", &mut st));
     commit(&mut real_a, &frame(fa, 20));
     assert_eq!(
@@ -556,7 +493,6 @@ fn a_live_session_joins_the_process_budget_and_leaves_when_it_closes() {
          it does not need is a share taken from the tab that does"
     );
 
-    // It runs a full-screen app: now it is drawing on the pool.
     t.process(b"\x1b[?1049h");
     for s in 0..=40 {
         t.process(&sync_frame(&frame(s, 20)));
@@ -582,15 +518,11 @@ fn a_live_session_joins_the_process_budget_and_leaves_when_it_closes() {
         ALT_ARCHIVE_DEFAULT_BUDGET
     );
 
-    // Re-joining counts it again straight away — it is still holding the rows,
-    // so there is nothing to wait for.
     t.set_alt_archive_shared(true);
     assert_eq!(pool.live(), base + 1);
     drop(t); // the tab closes: nothing else has to say so
     assert_eq!(pool.live(), base);
 }
-
-// ------------------------------------------------------------------ differ
 
 #[test]
 fn resize_flushes_the_old_screen_and_records_a_gap() {
@@ -609,7 +541,6 @@ fn resize_flushes_the_old_screen_and_records_a_gap() {
     assert_eq!(a.epoch(), epoch + 1);
     a.commit_rows(&frame(31, 20), COLS - 10);
     assert_eq!(a.texts(), range(tx, 0..31));
-    // A rows-only change rebaselines too.
     a.commit_rows(&frame(31, 22), COLS - 10);
     assert_eq!(a.texts(), range(tx, 0..51));
     assert_eq!(a.gaps().count(), 2);
@@ -707,8 +638,6 @@ fn a_budget_of_zero_turns_it_off_and_wipes() {
     commit(&mut a, &frame(10, 20));
     assert_eq!(a.texts(), vec![tx(9)]);
 }
-
-// ----------------------------------------------------------------- matcher
 
 fn hits_on(m: &mut DecModeMatcher, mut bytes: &[u8], on_alt: bool) -> Vec<(usize, HitKind)> {
     let mut out = Vec::new();
@@ -813,7 +742,6 @@ fn matcher_survives_a_split_at_every_byte() {
         );
         assert_eq!(found, vec![(9, false)], "cut at {cut}");
     }
-    // The main screen's `?`-to-`?` scan: `ESC [` carried across the cut.
     let enter = b"x?\x1b[?1049hyy";
     for cut in 0..=enter.len() {
         let mut m = DecModeMatcher::default();
@@ -826,8 +754,6 @@ fn matcher_survives_a_split_at_every_byte() {
         assert_eq!(found, vec![(9, HitKind::Enter)], "cut at {cut}");
     }
 }
-
-// --------------------------------------------------------- terminal hook
 
 /// A Claude-shaped frame: sync open, cursor hidden, every row painted with CUP +
 /// text + EL, cursor shown, sync closed.
@@ -890,7 +816,6 @@ fn an_xtrestore_that_stays_on_the_alt_screen_commits_nothing_early() {
     torn.splice(half..half, b"\x1b[?1049r".iter().copied());
     t.process(&torn);
     assert!(t.modes().alternate_screen);
-    // Frame 9 shifts frame 3 up by 6, judged at its close only.
     assert_eq!(t.alt_archive().texts(), range(tx, 0..9));
     assert_eq!(t.alt_archive().gaps().count(), 0);
 }
@@ -909,8 +834,6 @@ fn alt_exit_commits_what_was_drawn_after_the_last_esu() {
         for s in 0..=5 {
             t.process(&sync_frame(&frame(s, 20)));
         }
-        // Two more rows scroll by with no closing ESU, then the app exits in
-        // the same read.
         let mut tail = plain_frame(&frame(7, 20));
         tail.extend_from_slice(exit);
         t.process(&tail);
@@ -927,8 +850,6 @@ fn alt_exit_commits_what_was_drawn_after_the_last_esu() {
     }
 }
 
-// ------------------------------------------------ orphaned screens (no rmcup)
-
 /// The host forces the primary screen (`mainscreen`) after a shell with no
 /// integration marks typed onto a dead pager's screen: every row that screen
 /// showed is readable afterwards, once, in order, behind one `leave` gap.
@@ -940,17 +861,12 @@ fn host_leave_archives_the_rows_typed_onto_the_stuck_screen() {
         t.process(&sync_frame(&frame(s, 20)));
     }
     assert_eq!(t.alt_archive().texts(), range(tx, 0..3));
-    // The app is dead; the shell's prompt and a command scroll the alt grid by
-    // three rows (the grid has no scrollback to catch them).
     t.process(b"\x1b[25;1H\r\nPS> echo one\r\none\r\nPS> ");
     assert!(t.modes().alternate_screen);
     assert!(t.leave_alternate_screen());
     assert!(!t.modes().alternate_screen);
-    // 3..6 scrolled off at the final commit; the rest is the final screen, whole.
     let mut want = range(tx, 0..23);
     want.extend(CHROME.iter().map(|c| (*c).to_string()));
-    // Archived rows are trimmed like `text` shows them: the prompt's trailing
-    // space is not kept.
     want.extend(["PS> echo one", "one", "PS>"].map(str::to_string));
     assert_eq!(t.alt_archive().texts(), want);
     let gaps: Vec<_> = t.alt_archive().gaps().collect();
@@ -960,7 +876,6 @@ fn host_leave_archives_the_rows_typed_onto_the_stuck_screen() {
         "the handler's leave; the epilogue must not add one"
     );
     assert_eq!(gaps[0].kind, AltArchiveGapKind::Leave);
-    // The main screen is back and later output archives nothing.
     t.process(b"PS> \r\n");
     assert_eq!(t.alt_archive().texts(), want);
     assert_eq!(t.alt_archive().gaps().count(), 1);
@@ -1042,7 +957,6 @@ fn decstr_commits_without_rebaselining() {
     t.process(b"\x1b[?1049h");
     t.process(&sync_frame(&frame(0, 20)));
     let epoch = t.alt_archive().epoch();
-    // An open window closed by DECSTR (a soft reset) instead of an ESU.
     let mut f = sync_frame(&frame(3, 20));
     f.truncate(f.len() - b"\x1b[?25h\x1b[?2026l".len());
     f.extend_from_slice(b"\x1b[!p");
@@ -1071,10 +985,8 @@ fn apps_without_2026_are_committed_at_the_epilogue_rate_limited() {
     t.process_at(&plain_frame(&frame(0, 20)), at(20));
     t.process_at(&plain_frame(&frame(1, 20)), at(40));
     assert_eq!(t.alt_archive().texts(), vec![tx(0)]);
-    // Within 16 ms of the last commit: not committed yet…
     t.process_at(&plain_frame(&frame(2, 20)), at(45));
     assert_eq!(t.alt_archive().texts(), vec![tx(0)]);
-    // …and the next commit sees the whole move.
     t.process_at(&plain_frame(&frame(3, 20)), at(80));
     assert_eq!(t.alt_archive().texts(), range(tx, 0..3));
 }
@@ -1094,11 +1006,7 @@ fn restore_checkpoint_rebaselines() {
         t.alt_archive().gaps().last().map(|g| g.kind),
         Some(AltArchiveGapKind::Restore)
     );
-    // The replaced screen was flushed, never its chrome…
     assert_eq!(t.alt_archive().texts(), range(tx, 0..23));
-    // …and the restored screen is the new baseline: the first frame after it
-    // is diffed against it, so the rows it scrolled off are archived (here they
-    // repeat after the gap, since the restore put back the flushed screen).
     t.process(&sync_frame(&frame(10, 20)));
     t.process(&sync_frame(&frame(11, 20)));
     let mut want = range(tx, 0..23);
@@ -1106,9 +1014,6 @@ fn restore_checkpoint_rebaselines() {
     assert_eq!(t.alt_archive().texts(), want);
 }
 
-// ======================================================= adversarial cases
-// Each case targets a way the differ could lose rows, archive chrome, or
-// depend on read boundaries.
 mod adversarial {
     use super::*;
 
@@ -1144,7 +1049,6 @@ mod adversarial {
             commit(&mut a, &mk(0, &status));
             commit(&mut a, &mk(1, &status)); // shift by 1: chrome measured = 6
             assert_eq!(a.texts(), range(tx, 0..1));
-            // The status block is replaced in place (the transcript does not move).
             commit(&mut a, &mk(1, &answer));
             if how == "leave" {
                 a.leave();
@@ -1270,7 +1174,6 @@ mod adversarial {
         }
         assert_eq!(a.texts(), range(tx, 0..40), "gaps={:?}", gap_kinds(&a));
         assert_eq!(a.gaps().count(), 0);
-        // Back 5, then leave: the five rows below are flushed after the screen.
         commit(&mut a, &frame(35, 20));
         a.leave();
         assert_eq!(a.texts(), range(tx, 0..60));
@@ -1290,9 +1193,6 @@ mod adversarial {
         assert_eq!(a.texts(), want);
         assert_eq!(a.gaps().count(), 0);
     }
-
-    // A7 (an XTRESTORE exit) is a case of
-    // `alt_exit_commits_what_was_drawn_after_the_last_esu`.
 
     /// Parser and archive equivalence under slicing for a 2026 stream that also
     /// exits (1049l / 1047l / 47l), re-enters, RIS-es mid-read, soft-resets and
@@ -1454,8 +1354,6 @@ mod property_walk {
                     _ => {}
                 }
                 commit(&mut a, &mk(v, tick, edit));
-                // Only steps where rows left the top look anything up, over
-                // the live archive's rows, borrowed.
                 let left_top = prev_v..(prev_v + T).min(v);
                 let have: HashSet<&str> = if left_top.is_empty() {
                     HashSet::new()
@@ -1499,8 +1397,6 @@ mod adversarial_boundaries {
             s1.extend_from_slice(&sync_frame(&frame(st, 20)));
         }
         s1.extend_from_slice(b"\x1b[?1049l");
-        // The app relaunched (e.g. `claude --continue`): its first screen re-shows
-        // rows the previous run archived.
         let mut s2 = Vec::new();
         for st in 10..=13 {
             s2.extend_from_slice(&sync_frame(&frame(st, 20)));
@@ -1565,11 +1461,6 @@ mod adversarial_boundaries {
     }
 }
 
-// ================================================ chrome after adoption
-// After a self-update handoff the restored screen is the baseline, and a
-// resize before any chrome was measured leaves out the rows the new frame
-// still shows at the bottom, so the composer's rule and footer are not
-// archived.
 mod chrome_after_adoption {
     use super::*;
     use crate::terminal::TerminalCheckpoint;
@@ -1658,7 +1549,6 @@ mod chrome_after_adoption {
     #[test]
     fn a_restore_inside_an_open_2026_window_is_not_the_baseline() {
         let mut old = worker_at(3);
-        // A full redraw, cut after its first three rows.
         let redraw = frame(50, 20);
         let mut half = b"\x1b[?2026h\x1b[?25l\x1b[H\x1b[2J".to_vec();
         for (r, text) in redraw.iter().take(3).enumerate() {
@@ -1668,7 +1558,6 @@ mod chrome_after_adoption {
         assert!(old.modes().synchronized_output);
         let mut t = adopted(&old.checkpoint());
         assert!(t.modes().synchronized_output);
-        // The app finishes the frame and closes the window.
         let mut rest = Vec::new();
         for (r, text) in redraw.iter().enumerate().skip(3) {
             rest.extend_from_slice(format!("\x1b[{};1H{text}\x1b[K", r + 1).as_bytes());
@@ -1688,23 +1577,17 @@ mod chrome_after_adoption {
     /// screen no longer shows are.
     #[test]
     fn one_installed_frame_then_a_one_row_resize_archives_no_chrome() {
-        // (installed frame, frame at the new size, rows expected in the archive)
         let cases: [(Vec<String>, Vec<String>, Vec<String>); 3] = [
-            // One row shorter: the top row is gone, and only it is archived.
             (
                 claude_frame(0, 20, 100),
                 claude_frame(1, 19, 100),
                 vec![tx(0)],
             ),
-            // One row taller, an older row shown on top: every row is still shown.
             (
                 claude_frame(1, 20, 100),
                 claude_frame(0, 21, 100),
                 Vec::new(),
             ),
-            // One row taller, a blank opened above the composer: the transcript
-            // moved up one row, so all of it is flushed (a duplicate later, never
-            // a loss) and none of the composer is.
             (
                 claude_frame(0, 20, 100),
                 (0..20)
@@ -1738,13 +1621,11 @@ mod chrome_after_adoption {
     #[test]
     fn chrome_redrawn_at_a_new_width_is_still_chrome() {
         let cases = [
-            // Narrower: the transcript re-wrapped and moved up two.
             (
                 (claude_frame(0, 20, 100), 100),
                 (claude_frame(2, 20, 90), 90),
                 20,
             ),
-            // Wider and one row taller.
             (
                 (claude_frame(0, 20, 90), 90),
                 (claude_frame(5, 21, 120), 120),
@@ -1755,7 +1636,6 @@ mod chrome_after_adoption {
                 (boxed_frame(2, 20, 50), 90),
                 20,
             ),
-            // Same width, one row shorter: only the row that left.
             (
                 (boxed_frame(0, 20, 60), 100),
                 (boxed_frame(1, 19, 60), 100),
@@ -1785,12 +1665,6 @@ mod chrome_after_adoption {
     }
 }
 
-// ------------------------------------------------------- handoff carry
-//
-// A self-update handoff carries the archive to the adopting process. A whole
-// carry is exact (the adopted archive diffs later frames as the old one
-// would), a tail keeps the indices going, and no carry, however corrupt, may
-// panic the adopting process.
 mod handoff_carry {
     use super::*;
 
@@ -1940,8 +1814,6 @@ mod handoff_carry {
     #[test]
     fn a_whole_carry_continues_exactly_where_the_old_archive_would() {
         let mut exact_steps = 0usize;
-        // How often each part of the differ state was live at the handoff, so
-        // the property is known to have carried re-shown runs and `below` rows.
         let (mut with_prev, mut with_debt, mut with_below, mut with_chrome) = (0, 0, 0, 0);
         for seed in 1..=120u64 {
             let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
@@ -1988,8 +1860,6 @@ mod handoff_carry {
     #[test]
     fn a_tail_carry_counts_what_it_leaves_out() {
         let mut a = AltArchive::new();
-        // Longer than the differ's reach (8 screens of 25 rows), so `from`
-        // is what bounds the tail.
         for s in 0..=260 {
             commit(&mut a, &frame(s, 20));
         }
@@ -2009,7 +1879,6 @@ mod handoff_carry {
         );
         assert_eq!(r.rows[0].as_ref(), a.row(31).unwrap());
 
-        // The byte cap: only the newest rows that fit.
         let (fence, mut c) = a.carry_head(true);
         let per_row = super::alt_archive_row_charge(a.row(last).unwrap().len());
         assert!(a.carry_rows(&mut c, fence, 0, per_row * 5 + per_row / 2));
@@ -2035,7 +1904,6 @@ mod handoff_carry {
         assert!(a.carry_rows(&mut c, fence, last - 5, usize::MAX));
         assert_eq!(c.first, last + 1 - (REANCHOR_SCREENS * screen) as u64);
         let mut b = adopted(c);
-        // Back 60 rows, three a frame, forward again, then three new rows.
         let mut views: Vec<usize> = (1..=20).map(|k| 260 - 3 * k).collect();
         views.extend((0..20).rev().map(|k| 260 - 3 * k));
         views.push(263);
@@ -2053,9 +1921,6 @@ mod handoff_carry {
         assert_eq!(rows, range(tx, 260..263), "only the new rows");
         assert_eq!(b.gaps().count(), 0);
 
-        // The re-shown run reaches further back than the screens: it is
-        // carried whole. Back 210 rows: the screen shows archived rows from
-        // index 51 (tx(50)) on.
         for k in 1..=70 {
             commit(&mut a, &frame(263 - 3 * k, 20));
         }
@@ -2065,7 +1930,6 @@ mod handoff_carry {
         assert_eq!(c.first, a.back_at());
         assert!(a.back_at() < a.last() + 1 - (REANCHOR_SCREENS * screen) as u64);
 
-        // Never into an earlier app run: the reach stops at the floor.
         let mut a = AltArchive::new();
         for s in 0..=30 {
             commit(&mut a, &frame(s, 20));
@@ -2234,7 +2098,6 @@ mod handoff_carry {
             assert_eq!(b.import(c), AltArchiveImport::NoBaseline, "case {i}");
             assert_eq!(b.last(), a.last(), "case {i}: the rows still land");
             assert_eq!(b.back(), 0, "case {i}");
-            // The next frame is a new baseline, and nothing panics after.
             for s in 31..40 {
                 commit(&mut b, &frame(s, 20));
                 back_in_range(&b, &format!("case {i}"));

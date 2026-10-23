@@ -45,10 +45,13 @@ pub(crate) struct WriteErrors {
 }
 
 /// THE DEVICE'S WRITE ERRORS (sim item S7): `EIO` and `ENOSPC` on a write, a
+/// rename, a flush or an unlink, drawn from a stream of their own at a rate
+/// the seed chose, and a full disk while the scheduler says so.
 #[derive(Debug)]
 struct Faults {
     rng: Rng,
     /// One write in `per` fails before its effect, and one in `per` of the
+    /// writes that can fail after it does, each by its own draw.
     per: u64,
     /// The disk is full: every write that takes space fails `ENOSPC`.
     full: bool,
@@ -58,6 +61,7 @@ struct Faults {
 }
 
 /// How a write's last step failed after its effect was made
+/// ([`Device::made`]).
 #[derive(Clone, Copy, Debug)]
 enum After {
     /// A durable replace's rename was made and its directory flush failed.
@@ -82,12 +86,16 @@ enum Op {
 }
 
 /// One write since the file was last on the media, and where it stands
+/// against the device's flush points ([`Journal::points`]).
 #[derive(Clone, Debug)]
 struct Pending {
     op: Op,
     /// The flush points issued before it: it can be on the media only if the
+    /// writes flushed before the last of them are.
     epoch: u64,
     /// The flush point that flushed its bytes, for an ordered replace: they
+    /// are on the media whole once that point is, whether or not its rename
+    /// (issued after it) is.
     data_at: Option<u64>,
 }
 
@@ -99,6 +107,8 @@ struct File {
     /// Every write since, oldest first.
     pending: Vec<Pending>,
     /// How many of `pending`'s versions a flushed directory entry rules out:
+    /// an image may hold version `k` only for `k + 1 >= floor` (`durable` is
+    /// version `-1`).
     floor: usize,
 }
 
@@ -113,6 +123,11 @@ impl File {
     }
 
     /// The versions an image may hold, oldest first, of the first `keep`
+    /// writes with `floor` ruled out, each with how it may be torn:
+    /// `(version, torn_from, torn_whole)` — a torn image of a replace is cut
+    /// anywhere short of its last byte (`torn_whole`: one whose bytes no
+    /// flush point at or below `cut` put on the media), of an append any
+    /// prefix at or above `torn_from` bytes.
     fn versions(&self, keep: usize, floor: usize, cut: u64) -> Vec<(Version, Option<usize>, bool)> {
         let mut out = Vec::new();
         if floor == 0 {
@@ -146,6 +161,8 @@ impl File {
 }
 
 /// The newest ENTRY change among `pending` (a rename's version, an unlink,
+/// the file an append created), over a file whose media holds `durable`:
+/// what a flush of its directory puts on the media.
 fn newest_entry(durable: &Version, pending: &[Pending]) -> Option<usize> {
     let mut absent = *durable == Version::Absent;
     let mut entry = None;
@@ -163,15 +180,20 @@ fn newest_entry(durable: &Version, pending: &[Pending]) -> Option<usize> {
 struct Journal {
     files: BTreeMap<PathBuf, File>,
     /// FLUSH POINTS issued since the last power cut: every ordered write and
+    /// every full flush is one, numbered from 0 in the order issued.
     points: u64,
     /// How many of them are on the media for sure: every one up to the newest
+    /// full flush.
     persisted: u64,
     /// Each ordered directory flush: its flush point, the directory, and how
+    /// many of each of its files' pending writes it covers.
     dir_points: Vec<(u64, PathBuf, BTreeMap<PathBuf, usize>)>,
 }
 
 impl Journal {
     /// A FULL FLUSH OF DIRECTORY `dir` (the module doc): each file in it keeps
+    /// its newest ENTRY change, and the versions before it can no longer come
+    /// back; the appends after it are data, and still may be lost.
     fn flush_dir(&mut self, dir: &Path) {
         let mut cleared = Vec::new();
         for (p, f) in &mut self.files {
@@ -196,6 +218,7 @@ impl Journal {
     }
 
     /// `path`'s pending writes were settled on the media: no ordered
+    /// directory flush covers any of them any more.
     fn forget(&mut self, path: &Path) {
         for (_, _, lens) in &mut self.dir_points {
             lens.remove(path);
@@ -203,6 +226,7 @@ impl Journal {
     }
 
     /// A full flush was issued: it is a flush point, and every one before it
+    /// is on the media.
     fn full_flush(&mut self) {
         self.points += 1;
         self.persisted = self.points;
@@ -219,10 +243,13 @@ pub(crate) struct Device {
     /// POSIX's worst case.
     pub(crate) tears: bool,
     /// THE HIGHEST TOTAL any write of `logpin` named, in any boot: what the
+    /// node's mirror had counted, which no later bridge's total
+    /// may fall below, whatever a power cut did to the pin.
     pin_total: Mutex<u64>,
     /// WRITE ERRORS (sim item S7), once armed ([`Device::arm_write_errors`]).
     faults: Mutex<Option<Faults>>,
     /// The path whose next durable replace fails after its rename, once
+    /// ([`Device::fail_after_its_rename`]): a test's exact fault.
     after_once: Mutex<Option<PathBuf>>,
 }
 
@@ -352,6 +379,8 @@ impl Device {
     }
 
     /// Whether `w`, made, fails its last step after its effect: one in `per`
+    /// of the durable replaces (its rename made, its directory flush `EIO`)
+    /// and of the appends (part of its line written, `ENOSPC`).
     fn fails_after(&self, w: Write<'_>) -> Option<After> {
         if let Write::Replace {
             path,
@@ -448,6 +477,7 @@ impl Device {
     }
 
     /// A replace of `path` by `bytes` was made: where it is the mirror's pin,
+    /// the highest total any pin was written with ([`Device::pin_total`]).
     fn note_pin(&self, path: &Path, bytes: &[u8]) {
         if path == self.root.join(crate::state::LOGPIN) {
             if let Some(pin) = std::str::from_utf8(bytes)
@@ -597,6 +627,7 @@ impl Device {
     }
 
     /// The image of every file once `cut` flush points are on the media
+    /// ([`Device::power_cut`]).
     fn cut_files(&self, j: &mut Journal, rng: &mut Rng, cut: u64) -> Vec<String> {
         let dir_points = std::mem::take(&mut j.dir_points);
         let mut notes = Vec::new();

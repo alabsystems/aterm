@@ -64,6 +64,7 @@ pub fn describe(name: &str) -> Option<&'static str> {
 }
 
 /// Every name a compiled roster covers before the first signed index resolves: the
+/// default-set members, then the agent programs.
 fn compiled_names() -> impl Iterator<Item = &'static str> {
     DEFAULT_SET_STUB_NAMES
         .iter()
@@ -72,6 +73,8 @@ fn compiled_names() -> impl Iterator<Item = &'static str> {
 }
 
 /// The commands a pending program answers for beside its own name: the branded names
+/// people and agents type (`targo`, `trustc`, `tippy`, `trustfmt`, `trustdoc` for `trust`),
+/// from the table that maps each to its program ([`crate::reroute::TABLE`]).
 fn commands_of(program: &str) -> impl Iterator<Item = &'static str> + '_ {
     crate::reroute::TABLE
         .iter()
@@ -105,6 +108,7 @@ pub fn program_of_in(layout: &Layout, name: &str) -> String {
 }
 
 /// The program the pending stub at `path` names on its [`COMES_WITH`] line, if it is a
+/// pending stub that names one (and the name is one a stub could carry).
 fn stub_comes_with(path: &Path) -> Option<String> {
     let text = crate::metadata_io::read_bounded_regular_utf8(path, 64 * 1024).ok()?;
     if !text.lines().any(|l| is_marker_line(l, STUB_MARKER)) {
@@ -122,6 +126,10 @@ fn stub_comes_with(path: &Path) -> Option<String> {
 }
 
 /// The stubs for `program`'s commands in `bin/` — the branded ones ([`commands_of`]) and the
+/// ones its signed manifest exposes (`exposed`, the index-resolve reconcile's) — rendered,
+/// each naming `program` ([`COMES_WITH`]) and each only where [`pending_stub_executable`]
+/// would lay one; `keep` gains every command name whose slot is the program's to answer
+/// for — laid now, or already standing.
 fn command_stub_executables<'a>(
     layout: &Layout,
     program: &str,
@@ -153,9 +161,12 @@ fn command_stub_executables<'a>(
 }
 
 /// The marker line that identifies a pending stub — the recognition gate for every
+/// rewrite/removal below.
 const STUB_MARKER: &str = "# atpkg pending-program stub v1";
 
 /// What a command's stub says of the program that brings it, on a comment line of its own
+/// (`# comes with: trust`, or behind a batch `rem`): `__pending` reads it to wait for that
+/// program ([`program_of_in`]).
 const COMES_WITH: &str = "comes with: ";
 
 /// The static last-resort message (fallback 3) — the one line the stub can always say without an atpkg to ask.
@@ -177,6 +188,8 @@ pub(crate) fn sh_single_quote(s: &str) -> String {
 }
 
 /// The inverse of [`sh_single_quote`]:
+/// the text a word made of `'…'` runs and `\'` escapes stands for, or `None` for any other
+/// spelling — a value this crate did not quote is never guessed at.
 fn sh_single_unquote(word: &str) -> Option<String> {
     let mut out = String::new();
     let mut rest = word;
@@ -206,6 +219,7 @@ pub(crate) fn sh_named_atpkg(body: &str, var: &str) -> Option<PathBuf> {
 }
 
 /// The atpkg a laid batch stub ([`stub_content_cmd`]) names on its `if exist "…" (` line, or
+/// `None` when it names none.
 #[must_use]
 fn cmd_named_atpkg(body: &str) -> Option<PathBuf> {
     body.lines()
@@ -225,6 +239,7 @@ fn stub_named_atpkg(body: &str) -> Option<PathBuf> {
 }
 
 /// The stub script body for `tool`, naming `atpkg` as the fallback-1 path, or none
+/// ([`Embedder::embed`] decides).
 #[must_use]
 fn stub_content(tool: &ToolName, comes_with: Option<&str>, atpkg: Option<&Path>) -> String {
     let atpkg = named(atpkg);
@@ -242,6 +257,7 @@ pub(crate) fn named(atpkg: Option<&Path>) -> &Path {
 }
 
 /// The POSIX `/bin/sh` stub body (macOS/Linux — the shim there is a plain
+/// executable file).
 #[must_use]
 fn stub_content_sh(tool: &ToolName, comes_with: Option<&str>, atpkg: &Path) -> String {
     let name = sh_single_quote(tool.as_str());
@@ -268,12 +284,13 @@ fn stub_content_sh(tool: &ToolName, comes_with: Option<&str>, atpkg: &Path) -> S
     s
 }
 
-/// The first line of the batch stub's body, `@echo off` and its CRLF: 11 bytes. `cmd`
+/// The first line of the batch stub's body, `@echo off` and its CRLF: 11 bytes.
 const CMD_STUB_FIRST_LINE: &str = "@echo off\r\n";
 
 const _: () = assert!(CMD_STUB_FIRST_LINE.len() >= crate::platform::CMD_FRAME_HEAD.len() - 2);
 
 /// The batch twin: on Windows the shim slot is `bin/<tool>.cmd`
+/// ([`crate::store::ToolName::shim_file`]), where cmd.exe would misread a `#!/bin/sh` body.
 #[must_use]
 fn stub_content_cmd(tool: &ToolName, comes_with: Option<&str>, atpkg: &Path) -> String {
     let name = tool.as_str();
@@ -300,6 +317,8 @@ fn stub_content_cmd(tool: &ToolName, comes_with: Option<&str>, atpkg: &Path) -> 
 }
 
 /// Whether `name` can ride a batch script without becoming syntax:
+/// [`crate::store::shim_allowed`] admits quotes, `%`, carets and ampersands, and cmd.exe
+/// has no robust quoting (`%VAR%` expands even inside double quotes).
 #[must_use]
 fn cmd_stub_name_safe(name: &str) -> bool {
     !name.chars().any(|c| {
@@ -326,6 +345,7 @@ pub(crate) fn co_located_atpkg_path() -> PathBuf {
 }
 
 /// The path this process runs from (`current_exe`), which [`co_located_atpkg_path`] reads —
+/// or, inside a test, the one [`with_current_exe`] stood this thread at.
 fn running_exe() -> io::Result<PathBuf> {
     #[cfg(all(test, unix))]
     {
@@ -385,6 +405,7 @@ pub(crate) enum Durability {
 }
 
 /// The first bytes of every `CACHEDIR.TAG` (the Cache Directory Tagging Specification), the
+/// file cargo writes at the root of every target directory.
 const CACHEDIR_TAG_SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc55";
 
 /// Whether `dir` carries a cache-directory tag.
@@ -434,6 +455,8 @@ pub fn lasting(path: &Path) -> bool {
 }
 
 /// This machine's temporary directories, each as spelled and as it resolves (`/tmp` is
+/// `/private/tmp` on macOS, and `$TMPDIR` sits under `/private/var/folders`): the system
+/// temp dir, `/tmp` and `/var/tmp`.
 fn temp_roots() -> Vec<PathBuf> {
     temp_roots_from(std::env::temp_dir())
 }
@@ -456,6 +479,7 @@ fn temp_roots_from(temp_dir: PathBuf) -> Vec<PathBuf> {
 #[derive(Debug, Clone)]
 pub(crate) struct Embedder {
     /// The atpkg this process offers ([`co_located_atpkg_path`]); [`Self::embed`] takes it
+    /// only when it is live.
     offered: PathBuf,
     /// The machine's temporary directories ([`temp_roots`]).
     temp_roots: Vec<PathBuf>,
@@ -502,6 +526,7 @@ impl Embedder {
 }
 
 /// Whether `line` is `marker` bare (the sh body) or behind a batch `rem` (the `.cmd`
+/// body).
 fn is_marker_line(line: &str, marker: &str) -> bool {
     let l = line.trim();
     l == marker
@@ -540,6 +565,7 @@ pub(crate) fn pending_stub_executable(
 }
 
 /// [`pending_stub_executable`] for a command `program` brings ([`command_stub_executables`]):
+/// its body names `program` ([`COMES_WITH`]).
 fn pending_command_stub_executable(
     layout: &Layout,
     tool: &ToolName,
@@ -609,6 +635,7 @@ fn pending_stub_at(
 }
 
 /// Whether the pending stub at `shim` is current: exactly the bytes this pass would
+/// render (`body`).
 fn stub_is_current(shim: &Path, body: &str) -> bool {
     std::fs::read(shim).is_ok_and(|have| have == body.as_bytes())
 }
@@ -765,6 +792,8 @@ mod tests {
     }
 
     /// An agent program's pending stub stands in `agents/` too, carries the caller's
+    /// arguments through, and leaves once the program installs or is de-listed; a
+    /// non-agent program gets no twin.
     #[test]
     fn an_agent_programs_pending_stub_stands_in_agents_too_and_passes_arguments() {
         let l = layout("agents-stub");
@@ -802,6 +831,10 @@ mod tests {
     }
 
     /// A command only a program's signed manifest exposes stands with it like a branded one:
+    /// the reconcile lays it naming its program — which `program_of_in` answers and the table
+    /// alone (`program_of`) cannot — keeps it while the program is wanted and absent, also
+    /// through a pass that read no manifest of it, sweeps it once the manifest read no longer
+    /// exposes it or the program is installed, and `remove_stub` takes it with the program.
     #[test]
     fn a_command_only_the_manifest_exposes_is_stubbed_naming_its_program() {
         let l = layout("exposed");
@@ -867,6 +900,8 @@ mod tests {
     }
 
     /// A command's stub names its program on a comment line of the script, so a program name
+    /// that would end that line early lays no stub for its commands: the rest of the name
+    /// would be a line of the stub's shell script.
     #[test]
     fn a_program_name_that_would_break_the_comes_with_line_lays_no_command_stub() {
         let l = layout("comes-with-line");
@@ -882,6 +917,10 @@ mod tests {
     }
 
     /// A program's commands stand with it: `targo`, `trustc`, `tippy`, `trustfmt` and
+    /// `trustdoc` answer from the adoption lay on, each naming itself to `__pending` (which
+    /// reports `trust`'s state); the index reconcile keeps them while `trust` is wanted and
+    /// absent and sweeps them once it is installed or no longer wanted; `remove_stub` takes
+    /// them with the program.
     #[test]
     fn a_programs_commands_are_stubbed_while_it_is_wanted_and_absent() {
         let l = layout("commands");
@@ -939,6 +978,7 @@ mod tests {
     }
 
     /// A command stub is the lowest-precedence occupant like every stub: a file it did not
+    /// lay under the name is never overwritten, and never swept.
     #[test]
     fn a_command_stub_never_takes_a_file_it_did_not_lay() {
         let l = layout("command-foreign");
@@ -961,6 +1001,7 @@ mod tests {
     }
 
     /// A stub lost in a crash (gone, or cut short with its marker still on top) is laid whole
+    /// again by the next lay.
     #[test]
     fn a_lost_or_cut_short_stub_is_laid_again() {
         let l = layout("relay");
@@ -984,6 +1025,7 @@ mod tests {
     }
 
     /// An alias is never a stub: the reconcile lays plain names only, and the writer is a
+    /// no-op for an `alab-` name even when asked directly.
     #[test]
     fn an_alias_is_never_a_stub() {
         let l = layout("alias-stub");
@@ -1007,6 +1049,8 @@ mod tests {
     }
 
     /// The stub body: marker present, the tool name and embedded path quote-safe, and it
+    /// parses as no shim target, so `which`/`active_builds`/`prune_stale_shims` never take a
+    /// stub for an installed tool.
     #[test]
     fn stub_content_shape_and_shim_invisibility() {
         let body = stub_content_sh(
@@ -1026,7 +1070,7 @@ mod tests {
         assert!(body.contains("ATPKG='/x'\\''y/atpkg'"));
     }
 
-    /// The batch twin's shape, what cmd.exe runs in the `<tool>.cmd` slot. Pinned from
+    /// The batch twin's shape, what cmd.exe runs in the `<tool>.cmd` slot.
     #[test]
     fn cmd_stub_shape_marker_and_safety() {
         let body = stub_content_cmd(
@@ -1057,6 +1101,7 @@ mod tests {
     }
 
     /// The batch stub gives a private stand-in atpkg the caller's arguments,
+    /// checked by real cmd.exe when this test runs on Windows.
     #[cfg(windows)]
     #[test]
     fn the_batch_stub_hands_atpkg_the_callers_arguments() {
@@ -1083,6 +1128,10 @@ mod tests {
     }
 
     /// A pre-frame stub (the body alone) re-laid to its framed successor while it runs: at
+    /// every line end of the old file (the only offsets `cmd` resumes at) and every offset
+    /// up to its end, the new file reads a colon label, an empty line or `@exit /b`, even
+    /// for the longest stub the writer lays (a `MAX_PATH` atpkg path at three UTF-8 bytes a
+    /// unit, embedded twice).
     #[test]
     fn a_pre_frame_cmd_stub_re_laid_while_executing_resumes_into_the_frame() {
         use crate::platform::{
@@ -1203,6 +1252,7 @@ mod tests {
     }
 
     /// A laid stub is recognized, the real shim lands over it via temp+rename with the name
+    /// always resolving, and afterwards the stub is gone.
     #[cfg(unix)]
     #[test]
     fn install_over_a_stub_never_leaves_a_window() {
@@ -1234,6 +1284,8 @@ mod tests {
     }
 
     /// The stub is the lowest-precedence occupant: it never overwrites a real shim,
+    /// a tombstone, or a hand-made file — and removal is recognition-gated the same
+    /// way.
     #[cfg(unix)]
     #[test]
     fn stub_never_clobbers_and_removal_is_gated() {
@@ -1261,6 +1313,7 @@ mod tests {
     }
 
     /// Adoption lays the whole roster minus removed/excluded/installed;
+    /// `remove_all_stubs` clears exactly the stubs.
     #[cfg(unix)]
     #[test]
     fn adoption_lays_the_roster_and_remove_all_clears_it() {
@@ -1303,6 +1356,8 @@ mod tests {
     }
 
     /// A stub already on disk with the exact bytes the pass would render is never re-laid
+    /// (no new inode); a stub whose body changed (an older client's extra line, a moved
+    /// atpkg) is rewritten.
     #[cfg(unix)]
     #[test]
     fn an_identical_stub_is_left_alone_and_a_changed_one_is_rewritten() {
@@ -1360,6 +1415,7 @@ mod tests {
     }
 
     /// The index reconcile: newly listed names gain stubs, de-listed ones lose
+    /// them, sensitive names are refused, and installed programs need no stub.
     #[cfg(unix)]
     #[test]
     fn reconcile_tracks_the_signed_set_and_refuses_sensitive_names() {
@@ -1395,6 +1451,8 @@ mod tests {
     }
 
     /// The fallback chain through a real `/bin/sh`: a live embedded atpkg wins; a dangling
+    /// one falls back to the first absolute-entry atpkg on PATH (never a relative or empty
+    /// entry's); with neither, the static message lands on stderr with exit 127.
     #[cfg(unix)]
     #[test]
     fn fallback_chain_runs_in_a_real_shell() {
@@ -1469,6 +1527,8 @@ mod tests {
     }
 
     /// The classes the rule ranks, each from its own path: an app bundle, a plain binary, and
+    /// the four transient shapes — a temp dir, a cargo target dir, a translocated copy, a
+    /// mounted image.
     #[cfg(unix)]
     #[test]
     fn durability_ranks_a_bundle_over_a_plain_binary_over_a_transient_copy() {
@@ -1582,6 +1642,8 @@ mod tests {
     }
 
     /// [`Embedder::embed`], case by case: a missing atpkg is never named on either side; a
+    /// live one stays unless the offered one lasts at least as long; a gone one yields to
+    /// anything live.
     #[cfg(unix)]
     #[test]
     fn the_embedder_names_no_missing_atpkg_and_never_trades_down() {
@@ -1649,6 +1711,8 @@ mod tests {
     }
 
     /// What a laid file names reads back exactly as written: every quoting the renderers
+    /// produce, the empty value as none, nothing from a line this crate did not quote; the
+    /// batch stub leaves its `if exist` block out when it names none.
     #[test]
     fn the_named_atpkg_reads_back_as_written() {
         let t = tool("trust");
@@ -1699,6 +1763,10 @@ mod tests {
     }
 
     /// Make the three lays that run at every launch, session spawn and pass (the reroute
+    /// stubs, the pending stubs, the `agents/` twins) over `l` as a process running from
+    /// `exe` makes them ([`with_current_exe`]), with a stand-in placed at `exe` (and the
+    /// `atpkg` alias beside it when `alias`, as every bundle and install.sh's store carry)
+    /// if none is there yet.
     #[cfg(unix)]
     fn lay_as_run_from(exe: &Path, alias: bool, l: &Layout) {
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
@@ -1724,6 +1792,8 @@ mod tests {
     }
 
     /// Every `(file, atpkg it names)` under `prefix`'s three laid directories: the value of
+    /// each file's `ATPKG=` line (a reroute or pending stub) or `__atpkg=` line (an agents
+    /// twin), as written.
     #[cfg(unix)]
     fn atpkg_named_under(prefix: &Path) -> Vec<(std::path::PathBuf, String)> {
         let l = Layout {
@@ -1754,6 +1824,7 @@ mod tests {
     }
 
     /// Rewrite every atpkg a laid file under `prefix` names to `atpkg`: the state a launch
+    /// of the installed app leaves behind.
     #[cfg(unix)]
     fn name_atpkg_everywhere(prefix: &Path, atpkg: &Path) {
         let quoted = sh_single_quote(&atpkg.to_string_lossy());
@@ -1781,6 +1852,8 @@ mod tests {
     }
 
     /// The three real lays, made as a copy of aterm run from a scratch `bin/` with no
+    /// `atpkg` beside it makes them ([`lay_as_run_from`]), over a prefix whose every file
+    /// names the installed app's live atpkg: nothing is re-pointed at the scratch directory.
     #[cfg(unix)]
     #[test]
     fn a_copy_run_from_a_scratch_dir_never_re_points_a_laid_file_at_a_missing_atpkg() {

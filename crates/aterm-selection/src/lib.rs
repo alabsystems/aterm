@@ -2,68 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-// The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro
-// under them (crates/aterm-spec-anchor/anchor_rules.rs).
 #![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 
-//! Selection system for terminal text.
-//!
-//! This crate provides two selection systems:
-//!
-//! ## Smart Selection (Pattern-based)
-//!
-//! Intelligent selection rules that recognize and select semantic text units
-//! like URLs, file paths, email addresses, IP addresses, git hashes, and
-//! quoted strings.
-//!
-//! - **Pattern-based rules**: Use regex patterns to identify semantic text units
-//! - **Built-in rules**: Pre-configured rules for common patterns (URLs, paths, etc.)
-//! - **Priority-based**: Rules are matched in priority order
-//!
-//! ### Example
-//!
-//! ```
-//! use aterm_selection::SmartSelection;
-//!
-//! let smart = SmartSelection::with_builtin_rules();
-//!
-//! // Given a line of text and a cursor column
-//! let line = "Check out https://example.com for more info";
-//! let bounds = smart.word_boundaries_at(line, 15); // cursor is on the URL
-//!
-//! if let Some((start, end)) = bounds {
-//!     assert_eq!(&line[start..end], "https://example.com");
-//! }
-//! ```
-//!
-//! ## Text Selection (Mouse-based)
-//!
-//! State machine for mouse-based text selection. Supports:
-//!
-//! - **Simple selection**: Character-by-character (single click + drag)
-//! - **Block selection**: Rectangular selection (Alt + click + drag)
-//! - **Semantic selection**: Word/URL selection (double-click)
-//! - **Line selection**: Full line selection (triple-click)
-//!
-//! ### Example
-//!
-//! ```
-//! use aterm_selection::{SelectionSide, SelectionType, TextSelection};
-//!
-//! let mut sel = TextSelection::new();
-//!
-//! // Start selection on mouse down
-//! sel.start_selection(0, 5, SelectionSide::Left, SelectionType::Simple);
-//!
-//! // Update on mouse drag
-//! sel.update_selection(0, 15, SelectionSide::Right);
-//!
-//! // Complete on mouse up
-//! sel.complete_selection();
-//!
-//! // Check if a cell is selected
-//! assert!(sel.contains(0, 10));
-//! ```
+//! Pattern-based smart selection and mouse-driven text selection for terminal cells.
 
 #![warn(missing_docs)]
 

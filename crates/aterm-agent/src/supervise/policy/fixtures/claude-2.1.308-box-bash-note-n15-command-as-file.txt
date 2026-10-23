@@ -1,0 +1,50 @@
+# claude-code 2.1.308 · MEASURED 2026-10-22, `aterm ctl text` of a private headless aterm (144x50, aterm 0.115.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the Bash box over `Probe n15`: a process substitution (one tool call scripted into the lab's stub, manual mode)
+
+⏺ Bash(for f in /etc/hosts; do cat "$f"; done)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Baked for 0s · done 3:30 PM
+
+❯ toolstart
+
+  Read 1 file (ctrl+o to expand)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Cogitated for 0s · done 3:30 PM
+
+❯ toolstart
+
+⏺ Bash(echo "$HOME")
+  ⎿  /private/tmp/at.lab-501/aterm-box-notes-86d7cd13/runs/bn1/scratch/home
+
+⏺ Tool call done.
+
+✻ Brewed for 0s · done 3:30 PM
+
+❯ toolstart
+
+  Searched for 1 pattern (ctrl+o to expand)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Cooked for 0s · done 3:30 PM
+
+❯ toolstart
+
+⏺ Bash(diff <(cat README.md) README.md)
+  ⎿  Waiting…
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Tip: auto mode handles these prompts for you — choose "switch to auto mode" below
+ Probe n15
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ diff <(cat README.md) README.md
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ A command used as a file in this command can't be checked before it runs
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and switch to auto mode · auto mode handles these prompts for you
+   3. No
+
+ Esc to cancel · Tab to amend

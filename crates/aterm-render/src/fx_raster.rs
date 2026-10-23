@@ -214,6 +214,7 @@ pub struct FxSlicer {
 }
 
 /// Whether the engine draws `layer` at all: its blend accepts its content,
+/// and it is not a Linear layer at Glow (§4.5 has no Linear Glow group).
 #[inline]
 fn layer_draws(layer: &FxLayer) -> bool {
     layer.content.accepts(layer.blend)
@@ -238,6 +239,7 @@ pub fn for_each_drawn_sprite<'a>(layers: &'a [FxLayer], mut f: impl FnMut(&'a Fx
 }
 
 /// The frame art budget's two widths: the one-byte arts (Index8) and the
+/// four-byte ones (Rgba8Premul and Rgba8Straight), one GPU atlas each.
 #[inline]
 const fn budget_width(t: FxTexels) -> usize {
     match t {
@@ -253,6 +255,8 @@ pub struct FxBudget {
     refused: FxHashSet<u128>,
     refused_items: u64,
     /// The layers the ruling is for: each one's content, slot and blend, all
+    /// that a ruling reads (the walk filters on them, and a content is
+    /// immutable).
     ruled: Vec<(Arc<FxContent>, FxSlot, FxBlend)>,
 }
 
@@ -521,6 +525,8 @@ pub(crate) fn draw_layers_on<C: FxCanvas>(
 }
 
 /// Where `layer` lands in the frame: the window-pixel shift of its content
+/// origin (offset plus the Grid origin) and its clip in window pixels within
+/// the frame, or `None` when that clip is empty.
 #[inline]
 const fn layer_place(f: &FxFrame, layer: &FxLayer) -> Option<((i64, i64), Area)> {
     let (gx, gy) = space_origin(f, layer);
@@ -536,6 +542,7 @@ const fn layer_place(f: &FxFrame, layer: &FxLayer) -> Option<((i64, i64), Area)>
 }
 
 /// The window pixel of `layer`'s space origin: `(0, 0)`, or the Grid origin
+/// `(pad, grid_top)`.
 #[inline]
 const fn space_origin(f: &FxFrame, layer: &FxLayer) -> (i64, i64) {
     match layer.space {
@@ -556,6 +563,10 @@ const fn frame_area(f: &FxFrame) -> Area {
 }
 
 /// Whether any band `band_open` admits meets `layer`'s extent in the frame
+/// ([`FxLayer::extent`] at its space origin): every pixel the layer draws lies
+/// there (`fx_placement_is_the_spec`), so a layer for which this is `false`
+/// hands over no slice, and the slicer passes it over without reading its
+/// items (a card whose rows the frame keeps costs nothing).
 #[inline(never)]
 fn reaches_an_open_band(f: &FxFrame, layer: &FxLayer, band_open: &dyn Fn(usize) -> bool) -> bool {
     let (gx, gy) = space_origin(f, layer);
@@ -565,6 +576,7 @@ fn reaches_an_open_band(f: &FxFrame, layer: &FxLayer, band_open: &dyn Fn(usize) 
 }
 
 /// An item's window-pixel origin `O` under the layer shift `(lx, ly)`, and its
+/// box at `O` within its own clip (a sprite's), before the layer clip.
 #[inline]
 const fn item_place(item: &FxItem, (lx, ly): (i64, i64)) -> ((i64, i64), Area) {
     match item {
@@ -630,6 +642,7 @@ fn subtract_occluders(draw: Area, occluders: &[PxRect], scratch: &mut FxSlicer) 
 }
 
 /// Cut `piece` (inside the frame) at the band edges and hand each slice whose
+/// band is open, with its band, to `stamp`.
 fn for_each_slice(
     f: &FxFrame,
     piece: Area,
@@ -726,6 +739,7 @@ fn stamp_ramps<C: FxCanvas>(
 }
 
 /// The linear-light paint of a straight texel `A<<24 | RGB` under `tint`:
+/// FreeSprite's law, `(mul8(rgb, tint.rgb), mul8(A, tint.alpha))`.
 #[inline]
 const fn straight_paint(texel: u32, tint: FxInk) -> (u32, u8) {
     #[inline]
@@ -745,6 +759,7 @@ const fn straight_paint(texel: u32, tint: FxInk) -> (u32, u8) {
 }
 
 /// The Linear tint a sprite draws with, or `None` when it draws nothing
+/// (an Exact art needs none: `Some(FxInk::default())`).
 #[inline]
 fn sprite_tint(art: &FxArt, sp: &FxSprite, palette: &[FxInk]) -> Option<FxInk> {
     match art.texels() {
@@ -754,6 +769,7 @@ fn sprite_tint(art: &FxArt, sp: &FxSprite, palette: &[FxInk]) -> Option<FxInk> {
 }
 
 /// The paint of one sprite span: an Exact `(c, a)` (`over_premul`), or a
+/// Linear straight paint `(c, a)` (`blend`, never `a == 0`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SpanPaint {
     Exact(u32, u8),
@@ -761,6 +777,7 @@ enum SpanPaint {
 }
 
 /// Walk one sprite slice as flat spans: every `(x0, x1, y0, y1, paint)` the
+/// slice paints, from the art's run lists.
 fn sprite_spans(
     s: FxSlice,
     o: (i64, i64),
@@ -864,6 +881,7 @@ pub fn fx_bloom_quads(
     }
     impl Bloom<'_, '_> {
         /// A Rect-law ramp over `[x0, x1) × [y0, y1)`, its item `qw` wide
+        /// from `ox`, between `c0` and `c1`.
         #[allow(clippy::too_many_arguments)]
         fn ramp(
             &mut self,

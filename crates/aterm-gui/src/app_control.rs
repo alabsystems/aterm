@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Versioned semantic control for first-party native tab applications.
-//!
-//! Requests target stable `ViewId`s, never the control thread's view of focus.
-//! Resolution, semantic-key validation, reducer dispatch, effects, presentation
-//! refresh and repaint scheduling all run in one main-loop turn through [`App`].
+//! Versioned semantic control for first-party native tab applications ([`App`]).
 
 use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
@@ -27,8 +23,7 @@ pub(crate) enum InspectRequest {
         view: ViewId,
         projection: InspectionProjection,
     },
-    /// A `doc` read (`control_doc`), which rides this hop and is answered on
-    /// its own channel ([`App::answer_doc`]); the hop's reply is empty.
+    /// A `doc` read (`control_doc`) ([`App::answer_doc`]).
     Doc(crate::app_doc::DocCall),
 }
 
@@ -223,13 +218,8 @@ impl App {
     pub(crate) fn act_app(&mut self, request: ActRequest) -> Result<String, String> {
         let (wid, _) = self.locate_native_view(request.view)?;
 
-        // Compile and validate in this same main-loop turn. A focus change between
-        // socket parse and delivery cannot redirect the action to another view.
         let mut inspected = self.compile_view(request.view)?;
         let key = UiKey::new(request.ui_key.clone());
-        // A native list draws one screen of its rows; a row it holds off
-        // screen (absent, or in the tree off the screen) is scrolled into
-        // view first, as a hand would, so `act` reaches every listed control.
         if inspected
             .compiled
             .semantic(&key)
@@ -265,11 +255,6 @@ impl App {
         if node.state.is_some_and(|state| !state.enabled) {
             return Err("semantic action is disabled".to_string());
         }
-        // The Security panel's buttons open System Settings, raise consent dialogs,
-        // clear saved answers and trash app copies; `act` never presses them. `key`
-        // still drives the page like a hand, so persistent Security changes require
-        // their alert (default Cancel, unanswerable by any control verb), and
-        // the two Open buttons never replace the owner's answer to the access card.
         if node_action
             .as_str()
             .starts_with(crate::native_settings::MACOS_ACCESS_GESTURE_PREFIX)
@@ -281,8 +266,6 @@ impl App {
             );
         }
         let value = semantic_input(&node.role, &node.value, request.value.as_deref())?;
-        // `act` is a control client's gesture: an editor command it names
-        // runs only within that grant (`command_registry::editor_grant`).
         let result = self.with_gesture_source(true, |app| {
             app.dispatch_native_view_event(
                 wid,
@@ -304,22 +287,12 @@ impl App {
         ))
     }
 
-    /// Refuse control-surface opens inside file provider domains, the document class a held
-    /// Full Disk Access grant does not cover (`NEVER_COVERED`): an open there raises
-    /// `"aterm" wants to access files managed by "iCloud Drive"` in aterm's name. `open_app` is
-    /// reachable from inside a session, so the URI can come from a program's output, and a
-    /// dialog a program can raise is a consent surface an agent controls. The owner's own
-    /// gesture is not guarded.
-    ///
-    /// Fails open (a non-`file://` URI, no `HOME`, anything unparseable): this fences one named
-    /// class and is not an admission check. Only `canonicalize` touches the disk, and it raises
-    /// no prompt.
+    /// Refuse control-surface opens inside file-provider domains (`NEVER_COVERED`).
     pub(crate) fn refuse_file_provider_open(uri: &str) -> Result<(), String> {
         Self::refuse_file_provider_open_in(uri, std::env::var_os("HOME").map(Into::into))
     }
 
-    /// [`Self::refuse_file_provider_open`] for the home `home`, which a test names so
-    /// it never resolves a path in the person's own folders.
+    /// [`Self::refuse_file_provider_open`] for the home `home`.
     fn refuse_file_provider_open_in(
         uri: &str,
         home: Option<std::path::PathBuf>,
@@ -330,8 +303,6 @@ impl App {
         let Some(home) = home else {
             return Ok(());
         };
-        // Resolve where possible so a symlink into a synced folder is caught; fall
-        // back to the spelling when it does not resolve.
         let resolved = std::fs::canonicalize(&path).unwrap_or(path);
         let home = std::fs::canonicalize(&home).unwrap_or(home);
         if atpkg::protected::under_file_provider_domain(&home, &resolved) {
@@ -400,9 +371,6 @@ impl App {
             .windows
             .get(&wid)
             .map_or(1.0, |window| window.scale.max(f64::EPSILON) as f32);
-        // The active view must be the same compilation used by paint, hit testing,
-        // accessibility and capture, which resolves the window's scale and content
-        // padding; rebuilding from physical split bounds gives a different layout.
         if self
             .active_native_view(wid)
             .is_some_and(|(_, active_view)| active_view == view)
@@ -451,11 +419,6 @@ impl App {
                 capture_serial,
             });
         }
-        // A visible split sibling that is not focused still has a retained
-        // semantic/raster artifact; use it while its view identity and device geometry
-        // match the visible plan. Its model stamp may be stale (after a reducer mutation,
-        // before present). The generic inactive layout path would describe neither its
-        // retained bounds nor the font/theme inputs behind its pixels.
         if let Some((compiled, stamp, model_current)) = self.retained_visible_native_ui(wid, view) {
             return Ok(InspectedView {
                 compiled,
@@ -593,10 +556,6 @@ impl App {
             .iter()
             .find(|tab| tab.root.contains(view))
             .ok_or_else(|| "view is not attached to the window".to_string())?;
-        // The canonical plan places the view where it is drawn, below its pane's
-        // subtab title row (`reserve_pane_headers`), which the tree layout does not
-        // know. The plan is in cells, the viewport in pixels. A view the plan hides
-        // (a sibling hidden by zoom) keeps the tree layout's rect.
         let (cw, ch) = self.win_cell_size(wid);
         let (cw, ch) = (cw as f32, ch as f32);
         if let Some(leaf) = self
@@ -633,11 +592,6 @@ impl App {
             let bounds = self.content_bounds(*wid).unwrap_or_default();
             for (index, tab) in ws.tab_set.tabs().iter().enumerate() {
                 let leaves = tab.root.layout(bounds, 1.0, 1.0);
-                // Presentation titles are stable model metadata; a terminal tab's label
-                // is its identity title (operator pin, OSC title, cwd). The refresh path
-                // caches the exact toolbar string per tab (headless too), so inspection
-                // reads that cache, and before the first refresh mirrors `tab_titles`'
-                // stable fallback.
                 let stable_fallback = if tab.presentation.title.is_empty() {
                     "aterm"
                 } else {
@@ -647,8 +601,6 @@ impl App {
                     .tab_chrome_titles_by_tab
                     .get(&tab.id)
                     .map_or(stable_fallback, |(_, title)| title.as_str());
-                // `index=` is 0-based, the number `tab <N>` / `tab close <N>` take; the
-                // strip's 1-based ordinals are paint only.
                 lines.push(format!(
                     "  tab id={} index={} kind={} title={:?} state={} active={}",
                     tab.id.get(),
@@ -768,9 +720,7 @@ pub(crate) fn semantic_text_lines(compiled: &CompiledUi) -> Vec<String> {
     lines
 }
 
-/// Canonical semantic controls plus the visible, source-addressed editor projection
-/// from its `TextViewport`. Generic controls are unchanged; editors add the
-/// modeline/minibuffer and the rows that drive paint, pointer mapping and accessibility.
+/// Canonical semantic controls and visible editor projection from `TextViewport`.
 fn semantic_controls_lines(compiled: &CompiledUi) -> Vec<String> {
     let mut lines = compiled.controls_lines();
     lines.extend(editor_viewport_inspection_lines(compiled));
@@ -791,9 +741,6 @@ fn semantic_tree_lines(compiled: &CompiledUi) -> Vec<String> {
         .map(|node| {
             let parent = node.parent.as_ref().map_or("-", UiKey::as_str);
             let action = node.action.as_ref().map_or("-", ActionId::as_str);
-            // The tree is the accessibility dump every platform's reader is built
-            // from: the description follows the name and a disclosure's state, each
-            // only where the control has one.
             let mut line = format!(
                 "node key={:?} parent={:?} role={:?} label={:?} value={} action={} state={} rect={:.1},{:.1},{:.1},{:.1}",
                 node.key.as_str(),
@@ -814,7 +761,6 @@ fn semantic_tree_lines(compiled: &CompiledUi) -> Vec<String> {
             if let Some(description) = &node.description {
                 line.push_str(&format!(" description={description:?}"));
             }
-            // What a reader says for a value, where it is not the bare number.
             if let Some(words) = &node.value_text {
                 line.push_str(&format!(" value-text={words:?}"));
             }
@@ -842,8 +788,6 @@ fn editor_viewport_inspection_lines(compiled: &CompiledUi) -> Vec<String> {
             .or(spec.status.as_deref())
             .unwrap_or("Ready");
         let minibuffer = spec.minibuffer.as_deref();
-        // What the footer really draws: an open minibuffer takes the place
-        // of the status, which is then not painted at all.
         let painted_status = minibuffer.unwrap_or(spec.status.as_deref().unwrap_or("Ready"));
         let footer = painted_status;
         let modeline = format!("EDIT · {} · {cursor} | EMACS · {footer}", spec.label);
@@ -1090,7 +1034,6 @@ fn indicator_state(tab: &Tab) -> String {
     if indicators.busy {
         states.push("busy");
     }
-    // One `attention` token on the wire, folded from both owners.
     if indicators.wants_attention() {
         states.push("attention");
     }
@@ -1213,9 +1156,6 @@ fn rect_text(rect: LogicalRect) -> String {
 
 fn inspection_revision(fingerprint: u64) -> u64 {
     static CLOCK: OnceLock<Mutex<(u64, u64)>> = OnceLock::new();
-    // Bind the mutex to a named receiver before `.lock()` so the lock-order census
-    // can resolve its identity (a lock on an anonymous `get_or_init(..)` is an
-    // unknown-identity site, which the census rejects).
     let clock_mutex = CLOCK.get_or_init(|| Mutex::new((0, 0)));
     let mut clock = clock_mutex
         .lock()
@@ -1237,9 +1177,6 @@ mod tests {
     fn act_scrolls_a_listed_row_into_view_before_pressing_it() {
         let mut app = App::headless_for_test();
         let wid = *app.windows.keys().next().expect("a window");
-        // A 1,120×700pt window, sized in the cell the platform's default face
-        // draws: 160×50 cells is 1,440×1,150pt in Windows' 9×23 cell, tall
-        // enough for the whole list and the disclosure under it.
         let (cell_width, cell_height) = app.win_cell_size(wid);
         let pad = app.win_pad(wid);
         {
@@ -1442,9 +1379,6 @@ mod tests {
         let path = dir.join("aterm.toml");
         std::fs::write(&path, "bidi = \"sideways\"\n").unwrap();
 
-        // Measure in production typography: a font-cold harness charges the
-        // proportional Ui face the monospace fallback's ~0.6 em, which is the
-        // confusion under test.
         crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
 
         let mut app = App::headless_for_test();
@@ -1478,7 +1412,6 @@ mod tests {
             "the remedy fits the default footer and must be painted whole: {painted}"
         );
 
-        // The painter's own measure agrees: what is painted fits the slot.
         let audit = lines
             .iter()
             .find(|line| line.starts_with("paint-editor "))
@@ -1522,8 +1455,6 @@ mod tests {
             })
             .collect();
         assert_eq!(indexes, [0, 1, 2], "0-based, in tab order: {lines:?}");
-        // Every printed index is accepted by the verb; the one past the end
-        // is refused, and the refusal spells the printed range.
         for index in &indexes {
             assert_eq!(
                 app.apply_tab_cmd_in(wid, crate::TabAction::Select(*index)),
@@ -1542,8 +1473,6 @@ mod tests {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
 
-        // A cache miss mirrors `tab_titles`' stable fallback, including its
-        // empty-title normalization, rather than reading terminal state.
         let tab_id = {
             let window = app.windows.get_mut(&wid).expect("headless window");
             window.tab_chrome_titles_by_tab.clear();
@@ -1575,9 +1504,6 @@ mod tests {
             .expect("terminal tab inspection");
         assert!(fallback_line.contains("title=\"stable-terminal\""));
 
-        // Drive the real refresh: an authored Title is the label, an authored
-        // Description stays in the tooltip and menu and is never joined into it,
-        // and the headless cache holds the label a windowed toolbar would receive.
         {
             let session = app.pool.get(0).expect("session 0");
             let mut meta = session
@@ -1613,8 +1539,6 @@ mod tests {
         let source = WindowId(0);
         let original_id = app.windows[&source].tab_set.active_id().unwrap();
 
-        // Exercise the supported Cmd-Shift-O then Cmd-Shift-M topology: two
-        // stable tabs in one window now view the same pooled terminal session.
         let shared_window = app
             .open_active_session_in_new_window_logical()
             .expect("share the active session into another window");
@@ -1639,8 +1563,6 @@ mod tests {
             }
         }
 
-        // Make both title reads take their tab-specific fallback; a session-keyed
-        // shadow would report the last tab's title twice.
         let term = app.pool.get(0).unwrap().term.clone();
         let parser_guard = term.lock().unwrap();
         app.refresh_window_tabs(source);
@@ -1672,9 +1594,6 @@ mod tests {
     #[test]
     fn document_open_uses_host_grant_and_native_tab_path() {
         let mut app = App::headless_for_test();
-        // Pin the window short so the layout decision is this test's, not the default
-        // font's: the mode control goes compact below 440 logical px of height, and the
-        // headless height is rows times the default face's cell height.
         if let Some(window) = app.windows.get_mut(&WindowId(0)) {
             window.rows = 12;
         }
@@ -1684,8 +1603,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("README.md");
         std::fs::write(&path, "# Native app\n").unwrap();
-        // The shipping encoder, not a hand-rolled `file://{}`, which on Windows puts
-        // `C:\…` in the authority (`app_tabs::mixed_tab_tests::file_uri`).
         let request = format!(
             "app markdown {}",
             crate::native_document_host::path_to_file_uri(&path).expect("a file uri")
@@ -1733,8 +1650,6 @@ mod tests {
         let mut app = App::headless_for_test();
         if let Some(window) = app.windows.get_mut(&WindowId(0)) {
             window.cols = 140;
-            // The Settings destinations need room for the labeled medium rail; stay above
-            // the compact-category breakpoint so this tests width.
             window.rows = 100;
         }
         assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
@@ -1764,8 +1679,6 @@ mod tests {
                 .any(|line| line.contains("key=\"about/wordmark\""))
         );
 
-        // Navigate through the exact semantic key/action pair. A mismatched
-        // action is rejected before reducer dispatch.
         assert!(
             app.act_app(ActRequest {
                 view,
@@ -1799,9 +1712,6 @@ mod tests {
         use aterm_containment::consent::{
             DebuggerChange, DebuggerMember, DebuggerMode, DebuggerProbe, DebuggerProbeLabel,
         };
-        // Every owner gesture on the block sits under the prefix `act` refuses,
-        // the debugger-access change's two directions and the DEVELOPER TOOLS
-        // card's Open among them.
         for action in [
             MACOS_ACCESS_ASK_AGAIN,
             MACOS_ACCESS_TRASH,
@@ -1844,8 +1754,6 @@ mod tests {
                 enumeration: Enumeration::Complete,
             }),
             trash_tool: true,
-            // A row that draws a live *Allow Debugger Access…*: the rule read
-            // off, an admin account, nothing under way.
             debugger: crate::debugger_access::DebuggerFacts {
                 enabled: true,
                 probe: DebuggerProbe {
@@ -1860,8 +1768,6 @@ mod tests {
             ..MacosAccess::default()
         };
         let mut app = App::headless_for_test();
-        // Tall enough that the whole block, its facts wrapped to the card's
-        // measure, and the debugger row's button are on the first screen.
         if let Some(window) = app.windows.get_mut(&WindowId(0)) {
             window.cols = 140;
             window.rows = 160;
@@ -1923,7 +1829,6 @@ mod tests {
             "the refused Open Developer Tools asked the host for nothing"
         );
 
-        // The owner's press, confirmed, reaches the same reducer.
         state(&mut app, view)
             .arm_consent_gestures(crate::native_settings::ConsentGestures::confirming());
         for action in [
@@ -2040,8 +1945,6 @@ mod tests {
         let wid = WindowId(0);
         let (cell_width, cell_height) = app.win_cell_size(wid);
         let pad = app.win_pad(wid);
-        // A Retina window just inside the wide layout, then resized below its
-        // 1,040-logical-pixel breakpoint with room for the navigation rail.
         let wide_columns = (2_100usize.saturating_sub(pad * 2) / cell_width.max(1)).max(1);
         let medium_columns = (2_000usize.saturating_sub(pad * 2) / cell_width.max(1)).max(1);
         let rows = (1_200usize.saturating_sub(pad * 2) / cell_height.max(1)).max(1);
@@ -2053,9 +1956,6 @@ mod tests {
         assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Appearance));
         let (_, view) = app.active_native_view(wid).unwrap();
 
-        // Stage the artifact paint/capture will lower, navigate by semantic key,
-        // resize across a breakpoint and stage again; inspection must borrow that
-        // second artifact verbatim.
         assert!(app.prepare_native_input_scratch(wid));
         let wide = app.cached_native_ui(wid).unwrap().compiled.clone();
         assert!(
@@ -2113,8 +2013,6 @@ mod tests {
             "control geometry and semantics are the staged app-render compilation"
         );
 
-        // Background views cannot claim retained-artifact parity. Their deterministic
-        // fallback is deliberately labeled in the wire projection.
         assert!(
             app.windows
                 .get_mut(&wid)
@@ -2171,8 +2069,6 @@ mod tests {
             retained.fingerprint()
         )));
 
-        // Advance the reducer without presenting: the retained raster is still the
-        // app-present artifact, so Audit describes it and reports the model moved on.
         let outcome = app
             .native_runtime
             .dispatch(
@@ -2225,8 +2121,6 @@ mod tests {
                 })
                 .expect("Typography specimen")
         };
-        // The native painter converts this logical size back to physical pixels, so a
-        // physical input would paint scaled twice (72 px instead of 36 at 2x).
         for scale in [1.0, 1.25, 2.0, 3.0] {
             let window = app.windows.get_mut(&second).unwrap();
             window.scale = scale;
@@ -2239,8 +2133,6 @@ mod tests {
         app.windows.get_mut(&second).unwrap().scale = 2.0;
         app.windows.get_mut(&second).unwrap().metrics.font_px = 36.0;
 
-        // Force Settings down compile_view's inactive fallback; the observer must
-        // still resolve the owning window, not the process-global renderer activation.
         assert!(
             app.windows
                 .get_mut(&second)
@@ -2265,9 +2157,6 @@ mod tests {
         let SemanticValue::Text(value) = &preview.value else {
             panic!("Typography preview has a text semantic value");
         };
-        // Spoken in the one font-size unit, px at 1× (the slider's): the
-        // owning 2× window's 36 device px is 18, where the process-global
-        // renderer (12 at 1×) would say 12.
         assert!(
             value.contains("at 18 pixels"),
             "inactive inspection must report the owning window's font size: {value}"
@@ -2301,7 +2190,6 @@ mod tests {
         let path = dir.join("notes.md");
         let original = "alpha needle\nbeta line\n";
         std::fs::write(&path, original).unwrap();
-        // The shipping encoder (see `document_open_uses_host_grant_and_native_tab_path`).
         let uri = crate::native_document_host::path_to_file_uri(&path).expect("a file uri");
         app.open_app(parse_open(&format!("app editor {uri}")).unwrap())
             .unwrap();
@@ -2472,16 +2360,6 @@ mod tests {
     }
 
     /// The control surface may not raise the file-provider dialog no grant silences.
-    ///
-    /// `open_app` takes a URI that can come from a program's output, and file-provider
-    /// domains are `NEVER_COVERED`. Everything else stays openable, since a held Full
-    /// Disk Access grant reaches it.
-    ///
-    /// Unix-only: the domains are macOS's (`Library/Mobile Documents`,
-    /// `Library/CloudStorage`), and on Windows the canonical `$HOME` is the `\\?\C:\…`
-    /// spelling the fence does not compare against. The home is a scratch one: the
-    /// fence resolves each path it is asked about, and a test asks about paths in the
-    /// person's protected folders only there.
     #[cfg(unix)]
     #[test]
     fn the_control_surface_refuses_only_cloud_storage_opens() {
@@ -2497,7 +2375,6 @@ mod tests {
             assert!(refuse(&uri(&path)).is_err(), "{}", path.display());
         }
 
-        // Protected but covered classes stay openable.
         for ordinary in [
             "Documents/notes.md",
             "Desktop/notes.md",
@@ -2507,7 +2384,6 @@ mod tests {
             assert!(refuse(&uri(&path)).is_ok(), "{}", path.display());
         }
 
-        // Fails OPEN on anything it cannot classify, and with no home.
         for opaque in ["https://example.invalid/x", "not-a-uri", ""] {
             assert!(refuse(opaque).is_ok(), "{opaque}");
         }

@@ -144,6 +144,7 @@ impl PxRect {
 }
 
 /// One edge moved by `d`: an unbounded edge (`i32::MIN`/`i32::MAX`) stays put,
+/// a bounded one saturates short of them.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "the cast arm is reached only with v strictly inside i32's range"
@@ -326,6 +327,7 @@ pub struct FxArt {
     texels: FxTexels,
     data: Box<[u8]>,
     /// The largest Index8 texel (0 for an RGBA art): the palette reach
+    /// `FxContent`'s seal checks.
     max_index: u8,
     /// CPU run lists, built once on first use.
     runs: OnceLock<FxRowRuns>,
@@ -556,6 +558,7 @@ enum FxClass {
     /// Only items one blend draws.
     Only(FxBlend),
     /// Items of both blends: refused at seal in a debug build, drawn by
+    /// neither in release.
     Mixed,
 }
 
@@ -971,6 +974,8 @@ mod tests {
     }
 
     /// The run lists, expanded, are exactly the drawing texels: every
+    /// non-clear texel lies in one run of its own value, no clear texel lies
+    /// in any, runs are maximal and ordered.
     #[test]
     fn run_lists_expand_to_exactly_the_drawing_texels() {
         let empty = FxArt::new(0, 0, FxTexels::Index8, Vec::new()).unwrap();
@@ -1297,6 +1302,7 @@ mod tests {
     }
 
     /// The unchecked seam seals the hull and the class but refuses nothing,
+    /// so the renderers' fail-closed law can be tested.
     #[test]
     fn the_unchecked_seam_seals_without_refusing() {
         let content = FxContent::new_unchecked(

@@ -185,6 +185,7 @@ impl Grid {
     }
 
     /// Build a single scrollback [`Row`](crate::Row) plus its preserved extras
+    /// from a [`Line`] at the new width, reusing the unscroll fill path.
     fn build_scrollback_row(
         &mut self,
         line: &Line,
@@ -209,6 +210,7 @@ pub(super) fn history_row_len(row: &crate::Row, successor: Option<&crate::Row>) 
 }
 
 /// Maximum display columns a logical line may span before accumulation stops,
+/// guarding against pathological inputs.
 const MAX_LOGICAL_WIDTH: usize = crate::MAX_GRID_COLS as usize * crate::MAX_GRID_ROWS as usize;
 
 /// One display-cell's worth of content extracted from a source [`Line`].
@@ -332,6 +334,7 @@ pub(super) fn reflow_newest_rows(lines: &[Line], new_cols: u16, rows: usize) -> 
 }
 
 /// The full-decomposition rewrap with passthrough disabled: the reference for
+/// the passthrough differential tests.
 #[cfg(test)]
 #[must_use]
 pub(super) fn reflow_scrollback_lines_reference(lines: &[Line], new_cols: u16) -> Vec<Line> {
@@ -375,6 +378,8 @@ fn rewrap_passthrough_eligible(line: &Line, new_cols: u16) -> bool {
 }
 
 /// Flatten a logical-line run into display-cell units (accumulated in the
+/// caller-owned `units` scratch buffer), then re-split to `new_cols`-wide
+/// output [`Line`]s (first not wrapped, rest wrapped).
 fn emit_logical_line<'a>(
     run: &'a [Line],
     new_cols: u16,
@@ -417,6 +422,7 @@ fn emit_logical_line<'a>(
 }
 
 /// Re-attach a logical line's inline-image spans to the rewrapped output,
+/// clipped to the new width.
 fn carry_image_spans(run: &[Line], new_cols: u16, out: &mut [Line], first_out: usize) {
     let [line] = run else {
         return;
@@ -573,6 +579,8 @@ mod tests {
     }
 
     /// A rewrap joins each soft-wrapped run into its logical line and splits
+    /// it at the new width (first row unwrapped, the rest continuations), never
+    /// across a hard newline or through a wide char, and keeps a blank line.
     #[test]
     fn rewrap_resplits_each_logical_line_at_the_new_width() {
         type Rows<'a> = &'a [(&'a str, bool)];
@@ -620,6 +628,7 @@ mod tests {
     }
 
     /// Hyperlink and underline-colour spans follow their cells across a split,
+    /// and a cell in the gap between two spans carries neither.
     #[test]
     fn rewrap_keeps_spans_on_their_cells_across_a_split() {
         use std::sync::Arc;
@@ -703,6 +712,7 @@ mod tests {
     }
 
     /// Cell-for-cell semantic equality: text, wrap flag, per-char attrs, and
+    /// per-column hyperlink / underline-colour answers.
     fn assert_semantically_equal(fast: &[Line], reference: &[Line]) {
         assert_eq!(fast.len(), reference.len(), "line counts diverge");
         for (idx, (a, b)) in fast.iter().zip(reference).enumerate() {
@@ -738,6 +748,9 @@ mod tests {
     }
 
     /// Over a corpus mixing every gate dimension (eligible short ASCII, blanks,
+    /// soft-wrapped runs, CJK, VS15, hyperlinks, underline colours, stored
+    /// WIDE attrs, wrap-changing long lines), the passthrough path is
+    /// cell-for-cell identical to the full reference, and the fast path fires.
     #[test]
     fn reflow_passthrough_matches_full_path_on_mixed_corpus() {
         use std::sync::Arc;
@@ -798,6 +811,7 @@ mod tests {
     }
 
     /// Passthrough reach, other side: inputs whose wrap points can change, or
+    /// whose width the byte length cannot prove, never take the passthrough.
     #[test]
     fn reflow_passthrough_never_fires_on_wrap_changing_input() {
         let _ = crate::test_counters::take_reflow_passthrough_lines();
@@ -828,6 +842,8 @@ mod tests {
     }
 
     /// `reflow_newest_rows` is the tail of the whole rewrap, for every row
+    /// count up to past the whole output: over runs that narrow and widen, an
+    /// orphaned continuation at the front, wide cells and blank rows.
     #[test]
     fn reflow_newest_rows_is_the_tail_of_the_whole_rewrap() {
         let mut corpus = vec![styled("orphan tail", true)];

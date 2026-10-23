@@ -62,7 +62,7 @@ impl<T> MainThreadBound<T> {
 }
 
 impl<T> Drop for MainThreadBound<T> {
-    /// Obligation 3. A `T` with no destructor is dropped in place, so it never
+    /// Obligation 3.
     fn drop(&mut self) {
         if !std::mem::needs_drop::<T>() {
             return;
@@ -77,6 +77,7 @@ impl<T> Drop for MainThreadBound<T> {
 
 impl<T> std::fmt::Debug for MainThreadBound<T> {
     /// Opaque: printing the value needs a witness `Debug` cannot have, and
+    /// `Debug` must not block on the main queue.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MainThreadBound").finish_non_exhaustive()
     }

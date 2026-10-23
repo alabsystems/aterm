@@ -33,6 +33,8 @@ pub(crate) fn set_send_event_panic_info(mtm: MainThread, panic_info: Weak<PanicI
 
 /// The `sendEvent:` override AppKit calls for every event.
 /// # Safety
+/// `app` must be the live `NSApplication` and `event` the live `NSEvent` the
+/// runtime dispatched with.
 ///
 /// This is an IMP: it is entered by the Objective-C runtime with the receiver
 /// in the first argument position and the selector in the second, which is what
@@ -56,6 +58,8 @@ unsafe extern "C-unwind" fn send_event(app: Id, cmd: Sel, event: Id) {
 }
 
 /// # Safety
+/// `app` must be the live `NSApplication` and `event` the live `NSEvent` the
+/// runtime dispatched with.
 unsafe fn send_event_body(app: Id, cmd: Sel, event: Id) {
     let mtm = MainThread::new()
         .expect("-[NSApplication sendEvent:] ran off the main thread; AppKit delivers on it");

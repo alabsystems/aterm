@@ -68,15 +68,15 @@ pub(crate) struct Digest {
 }
 
 impl Digest {
-    pub(crate) fn revision(&self) -> u64 {
+    pub(crate) const fn revision(&self) -> u64 {
         self.revision
     }
 
-    pub(crate) fn bump(&mut self) {
+    pub(crate) const fn bump(&mut self) {
         self.revision += 1;
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub(crate) const fn len(&self) -> usize {
         self.items.len()
     }
 
@@ -181,13 +181,13 @@ pub struct DigestView {
 impl DigestView {
     /// Entries in the digest.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// `true` with nothing to review.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 

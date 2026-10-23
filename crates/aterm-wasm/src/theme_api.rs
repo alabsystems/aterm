@@ -1,28 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 Andrew Yates
 
-//! Named themes for both web terminals: the built-in catalog, `dark:A,light:B`
-//! splits that follow `set_color_scheme`, and themes a host registers from the
-//! same `.conf` text a native themes folder holds.
-//!
-//! What a selector draws is [`ThemeSelector::draw_builtin`], the one draw
-//! aterm-gui resolves through too, so native and web cannot disagree about it.
-//! Registered text is admitted the way a native theme file is
-//! ([`parse_theme_str`] under [`MAX_USER_THEME_FILE_BYTES`], then
-//! [`ThemeMeta::admit`] with the renderer's own dark/light classifier), and an
-//! install moves the engine's colour baseline with
-//! [`Terminal::rebase_colors`](aterm_core::terminal::Terminal::rebase_colors),
-//! so a program's OSC 4/10/11/12/17/19 colours survive a theme switch exactly
-//! as they do natively. Unlike the native config path, which falls back to
-//! Default with a notice, an API call that names something it cannot draw
-//! fails loudly and changes nothing.
-//!
-//! Shared with `aterm-gpu-web`, which mounts this file by `#[path]`; names
-//! resolve against the crate root of whichever crate compiles it. Each crate
-//! supplies `render_face`, `install_renderer_theme` and
-//! `install_renderer_selection_fg` in its `lib.rs`.
+//! Web terminal named themes ([`ThemeSelector::draw_builtin`], [`parse_theme_str`],
+//! [`MAX_USER_THEME_FILE_BYTES`], [`ThemeMeta::admit`],
+//! [`Terminal::rebase_colors`](aterm_core::terminal::Terminal::rebase_colors)).
 
-// The methods read the crate root's items, which differ per crate.
 use super::*;
 
 use aterm_types::scheme::{
@@ -32,8 +14,7 @@ use aterm_types::scheme::{
 };
 use aterm_types::Appearance;
 
-/// How many themes a host may register: the native catalog's
-/// `MAX_USER_THEME_FILES`.
+/// How many themes a host may register: the native catalog's `MAX_USER_THEME_FILES`.
 pub(crate) const MAX_REGISTERED_THEMES: usize = MAX_USER_THEME_FILES;
 
 /// Where an installed theme came from.
@@ -58,12 +39,10 @@ pub(crate) struct WebDraw {
     pub(crate) scheme: ColorScheme,
 }
 
-/// The web terminal's theme state. Holds no font or terminal, so its rules are
-/// unit-testable on their own.
+/// The web terminal's theme state.
 #[derive(Debug)]
 pub(crate) struct WebThemeState {
-    /// The selector `set_theme_by_name` last installed; `None` while the host
-    /// drives the colours (`set_theme`) or nothing was installed.
+    /// The selector `set_theme_by_name` last installed.
     pub(crate) selector: Option<String>,
     /// The host's last `set_color_scheme` appearance.
     pub(crate) appearance: Appearance,
@@ -138,9 +117,6 @@ impl WebThemeState {
     }
 
     /// Resolve the side of `raw` that `appearance` draws, without mutating.
-    /// `Err` (nothing changes) when the selector has any issue (blank, `dark:`,
-    /// an unknown mode, a junk segment, a repeated side), or when any name it
-    /// writes is neither a built-in nor registered.
     pub(crate) fn resolve(&self, raw: &str, appearance: Appearance) -> Result<WebDraw, String> {
         let (selector, issues) = ThemeSelector::parse(raw);
         if !issues.is_empty() {
@@ -153,8 +129,6 @@ impl WebThemeState {
             }
         }
         match selector.draw_builtin(appearance) {
-            // Blank is an issue above, so `Unset` cannot reach here; drawing
-            // the unset default would still be the right answer.
             SelectorDraw::Builtin(scheme) | SelectorDraw::Unset(scheme) => Ok(WebDraw {
                 id: scheme.name.clone(),
                 side: appearance,
@@ -176,8 +150,6 @@ impl WebThemeState {
     }
 
     /// Admit `text` (a theme file) as a registered theme under its `name =`.
-    /// A theme already registered under that name (case-insensitively) is
-    /// replaced in place.
     pub(crate) fn register(&mut self, text: &str) -> Result<&CatalogTheme, String> {
         if text.len() > MAX_USER_THEME_FILE_BYTES {
             return Err(format!(
@@ -240,7 +212,7 @@ impl WebThemeState {
         })
     }
 
-    /// Drop a registered theme. Refused while the installed selector names it.
+    /// Drop a registered theme.
     pub(crate) fn unregister(&mut self, id: &str) -> Result<(), String> {
         if self.selector_names(id) {
             let selector = self.selector.as_deref().unwrap_or_default();
@@ -257,8 +229,7 @@ impl WebThemeState {
         Ok(())
     }
 
-    /// `{"unset", "themes": [...]}`: built-ins in catalog order, then the
-    /// registered themes in insertion order.
+    /// `{"unset", "themes".
     pub(crate) fn catalog_json(&self) -> String {
         let builtins = builtin_theme_list().into_iter().filter_map(|identity| {
             let theme = CatalogTheme::builtin(identity.name)?;
@@ -292,8 +263,7 @@ impl WebThemeState {
         )
     }
 
-    /// `{"selector", "appearance", "id", "side", "reported", "source"}`, with
-    /// `reported` the scheme DSR 996 answers now.
+    /// JSON snapshot `{"selector", "appearance", "id", "side", "reported", "source"}`.
     pub(crate) fn state_json(&self, reported: Appearance) -> String {
         let (id, side, source) = match (&self.installed, self.host_set) {
             (Some(d), _) => (
@@ -320,10 +290,7 @@ impl WebThemeState {
 }
 
 impl WebTerminal {
-    /// Put `draw` on screen: the engine baseline moves (program colours ride
-    /// on top), the band and renderer take the theme, and the reported scheme
-    /// becomes the drawn theme's appearance, reconciled once after the colours
-    /// (a `CSI ? 997` push only when it moved under DEC 2031).
+    /// Put `draw` on screen.
     pub(crate) fn install_draw(&mut self, draw: WebDraw) {
         let scheme = &draw.scheme;
         let parts = scheme.to_theme_parts();
@@ -336,7 +303,6 @@ impl WebTerminal {
         base.palette = Some(scheme.to_color_palette());
         base.color_scheme = Some(scheme.appearance);
         self.term.rebase_colors(&base);
-        // The band borrows slots 1, 3, 4 and 6 (its error, warn and meter hues).
         for (i, c) in (0u8..).zip(scheme.ansi.iter()) {
             self.band.set_palette_color(i, [c.r, c.g, c.b]);
         }
@@ -346,12 +312,7 @@ impl WebTerminal {
         self.web_theme.host_set = false;
     }
 
-    /// The host's own colours (`set_theme`, 0x00RRGGBB): the engine baseline
-    /// moves (a program's OSC 10/11/12/17 colours survive), the renderer
-    /// takes them, and the host owns the theme again. The reported scheme's
-    /// baseline returns to the host's last declared appearance
-    /// (`set_color_scheme`), not a named theme's it replaces, in the same
-    /// rebase, so DSR 996 and a DEC 2031 push describe the host's theme.
+    /// The host's own colours (`set_theme`, 0x00RRGGBB).
     pub(crate) fn install_host_colors(&mut self, parts: aterm_types::scheme::ThemeParts) {
         let mut base = self.term.color_baseline();
         base.foreground = unpack(parts.fg);
@@ -366,8 +327,7 @@ impl WebTerminal {
         self.web_theme.host_set = true;
     }
 
-    /// Resolve `raw` for the current appearance and install it. On `Err`
-    /// nothing changes.
+    /// Resolve `raw` for the current appearance and install it.
     pub(crate) fn install_selector(&mut self, raw: String) -> Result<(), String> {
         let draw = self.web_theme.resolve(&raw, self.web_theme.appearance)?;
         self.install_draw(draw);
@@ -375,13 +335,10 @@ impl WebTerminal {
         Ok(())
     }
 
-    /// The host's appearance changed: a selector picks its side, else the
-    /// legacy behaviour (the host owns the colours, only the report moves).
+    /// The host's appearance changed: a selector picks its side, else the legacy behaviour.
     pub(crate) fn follow_appearance(&mut self, scheme: Appearance) {
         self.web_theme.appearance = scheme;
         match self.web_theme.selector.clone() {
-            // The selector resolved when it was installed and every name it
-            // writes is still known (unregister refuses them), so this succeeds.
             Some(raw) => {
                 let _ = self.install_selector(raw);
             }
@@ -390,35 +347,22 @@ impl WebTerminal {
     }
 }
 
-/// The JS-visible theme surface. Each crate expands it onto its own terminal
-/// type with `web_terminal_impl!`, as `facade_api` does.
+/// The JS-visible theme surface.
 macro_rules! bind {
     ($terminal:ident, $export:ident) => {
         #[cfg_attr(target_arch = "wasm32", $export)]
         impl $terminal {
-            /// The themes `set_theme_by_name` can draw, as JSON:
-            /// `{"unset": "Default", "themes": [{"id",
-            /// "display_name", "appearance": "dark"|"light", "appearance_source":
-            /// "declared"|"measured", "pair", "description", "signature", "source":
-            /// "builtin"|"registered", "warnings": [..]}]}`, built-ins first.
+            /// The themes `set_theme_by_name` can draw, as JSON.
             pub fn theme_catalog(&self) -> String {
                 self.web_theme.catalog_json()
             }
 
-            /// What is on screen, as JSON: `{"selector", "appearance", "id",
-            /// "side", "reported", "source": "builtin"|"registered"|"host"|null}`.
-            /// `reported` is the scheme DSR 996 answers (a program's own OSC 11
-            /// background reports its own polarity).
+            /// What is on screen, as JSON.
             pub fn theme_state(&self) -> String {
                 self.web_theme.state_json(self.term.color_scheme())
             }
 
-            /// Register a theme from `.conf` text (the format of a native themes
-            /// folder; `contrib/themes/TEMPLATE.conf`), under its `name =`. At most
-            /// 256 KiB and 128 themes; a built-in's name is refused (built-ins
-            /// always win); registering a name again replaces it, and re-installs
-            /// it when the current theme draws it. Returns `{"id", "appearance",
-            /// "appearance_source", "warnings"}`.
+            /// Register a theme from `.conf` text.
             pub fn register_theme(&mut self, text: &str) -> Result<String, String> {
                 let theme = self.web_theme.register(text)?;
                 let out = format!(
@@ -438,28 +382,18 @@ macro_rules! bind {
                 Ok(out)
             }
 
-            /// Drop a registered theme. Refused while the installed theme names it.
+            /// Drop a registered theme.
             pub fn unregister_theme(&mut self, id: &str) -> Result<(), String> {
                 self.web_theme.unregister(id)
             }
 
-            /// Install a theme by name: a built-in (case-insensitive), a registered
-            /// theme, or `dark:A,light:B`, whose side follows `set_color_scheme`. An
-            /// omitted side draws the named side's built-in pair (`dark:Gruvbox
-            /// Dark` is Gruvbox Light in light mode), else the named side. On error
-            /// nothing changes. Program-set colours (OSC 4/10/11/12/17/19) survive,
-            /// as on native. Host `set_palette_color` overrides are replaced by the
-            /// theme's slots 0-15 (re-apply them after); slots 16-255 return to the
-            /// xterm table. Returns `theme_state()`.
+            /// Install a theme by name.
             pub fn set_theme_by_name(&mut self, selector: &str) -> Result<String, String> {
                 self.install_selector(selector.to_string())?;
                 Ok(self.theme_state())
             }
 
-            /// The per-cell minimum contrast the renderer actually floors glyphs
-            /// to: the configured ratio, raised to WCAG AA (4.5:1) while
-            /// `set_background_opacity` is below 1, so a host can show what glass
-            /// forces.
+            /// The per-cell minimum contrast the renderer actually floors glyphs to.
             pub fn effective_minimum_contrast(&self) -> f32 {
                 self.render_face().effective_minimum_contrast()
             }
@@ -510,8 +444,6 @@ mod tests {
         ] {
             assert!(state.resolve(bad, Appearance::Dark).is_err(), "{bad:?}");
         }
-        // Negative control: the permissive native reading draws something for
-        // the half-bad split, where the API refuses it.
         let (native, _) = ThemeSelector::parse("dark:Nord,light:Nope");
         assert_eq!(native.name_for(Appearance::Dark), Some("Nord"));
     }
@@ -541,11 +473,9 @@ mod tests {
             .register("background = #000000\nforeground = #ffffff\n")
             .expect_err("no name");
         assert!(err.contains("name"), "{err}");
-        // Non-vacuity: the same text with a free name registers.
         state
             .register(&conf("Mine Too", "#000000"))
             .expect("a free name");
-        // Over the cap is refused before parsing (the text is not a theme).
         let huge = "x".repeat(MAX_USER_THEME_FILE_BYTES + 1);
         let err = state.register(&huge).expect_err("too large");
         assert!(err.contains("256 KiB"), "{err}");
@@ -650,8 +580,6 @@ mod tests {
                 "{at} slot {i}"
             );
         }
-        // Slots 16-255: xterm's table, or what the theme derives from its own
-        // colours (`palette_generate`), as native draws them.
         let palette = scheme.to_color_palette();
         for i in [16u8, 100, 231, 255] {
             assert_eq!(t.term.palette_color(i), palette.get(i), "{at} slot {i}");
@@ -670,8 +598,6 @@ mod tests {
                 assert_draws(&t, &scheme, &format!("{name} dark={dark}"));
             }
         }
-        // Both kinds are drawn above: a derived extended palette (Aterm Night)
-        // and xterm's table (Default), so the slot checks compare each.
         let derived = aterm_types::scheme::builtin("Aterm Night").expect("a built-in");
         assert!(derived.palette_generate);
         assert_ne!(
@@ -709,7 +635,6 @@ mod tests {
         let state = t.theme_state();
         assert!(state.contains("\"id\":\"Aterm Day\",\"side\":\"light\",\"reported\":\"light\",\"source\":\"builtin\""), "{state}");
 
-        // A plain theme draws itself on both sides and its report never moves.
         t.set_theme_by_name("Nord").expect("plain");
         while t.term.take_response().is_some() {}
         let nord = aterm_types::scheme::builtin("Nord").expect("built-in");
@@ -723,8 +648,6 @@ mod tests {
             );
         }
 
-        // Negative control: after the host's raw set_theme, an appearance flip
-        // leaves the renderer theme alone.
         t.set_theme(0x0011_2233, 0x00ee_eeee, 0x0000_0000, 0x0080_8080);
         let host = t.render_face().theme();
         t.set_color_scheme(true);
@@ -752,7 +675,6 @@ mod tests {
             "OSC 111 → Linen"
         );
 
-        // Negative control: the pre-rebase path (live = baseline) loses it.
         let mut legacy = terminal();
         legacy.process(b"\x1b]11;rgb:10/11/12\x07");
         legacy.term.set_default_background(linen.background);
@@ -761,7 +683,6 @@ mod tests {
 
     /// After a named light theme, the host's raw dark `set_theme` hands the
     /// report back to the host's declared appearance: DSR 996 answers dark.
-    /// Negative control: under the named theme it answered light.
     #[test]
     fn set_theme_after_a_named_theme_reports_the_host_appearance() {
         let mut t = terminal();
@@ -868,7 +789,6 @@ mod tests {
         t.register_theme(&conf("Mine", "#304050"))
             .expect("re-registers");
         assert!(t.needs_frame(), "re-registering the drawn theme repaints");
-        // Negative control: registering a theme nothing draws does not.
         t.settle_frame();
         t.register_theme(&conf("Other", "#000000"))
             .expect("registers");

@@ -51,6 +51,7 @@ pub fn exe_admissible(exe: &Path) -> bool {
 }
 
 /// How `exe` is spelled in the status-line command, or `None` where it is not
+/// [`exe_admissible`].
 fn command_spelling(exe: &Path) -> Option<String> {
     let text = exe.to_str()?;
     let inert = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'+');
@@ -238,6 +239,7 @@ impl TapVars {
 }
 
 /// A percent from the vendor, an integer or a finite number in `0..=100`,
+/// as the whole percent it rounds to and in tenths, rounded.
 fn pct_of(value: &Value) -> Option<(u32, u32)> {
     if let Some(n) = value.as_u64() {
         let pct = u32::try_from(n).ok().filter(|p| *p <= 100)?;
@@ -459,6 +461,7 @@ pub fn line_of(five_hour: Option<Window>, seven_day: Option<Window>) -> String {
 }
 
 /// The modification time of the regular file at `path` (Unix seconds), not
+/// following a symlink; `None` for anything else.
 fn file_mtime(path: &Path) -> Option<i64> {
     let meta = std::fs::symlink_metadata(path).ok()?;
     if !meta.file_type().is_file() {
@@ -473,6 +476,7 @@ fn file_mtime(path: &Path) -> Option<i64> {
 }
 
 /// The text of the regular file at `path`, opened without following a
+/// symlink, at most [`FILE_MAX`] bytes.
 fn read_regular(path: &Path) -> Option<String> {
     let mut open = std::fs::OpenOptions::new();
     open.read(true);
@@ -491,6 +495,7 @@ fn read_regular(path: &Path) -> Option<String> {
 }
 
 /// Write `text` to `dir/name`: the directory made 0700, a temp file of mode
+/// 0600 (never through a link) renamed over it.
 fn write_reading(dir: &Path, name: &str, text: &str) -> io::Result<()> {
     aterm_types::fs_restricted::ensure_private_dir(dir)?;
     let path = dir.join(name);
@@ -515,6 +520,10 @@ fn write_reading(dir: &Path, name: &str, text: &str) -> io::Result<()> {
 }
 
 /// WHEN `reading`'S FIGURES WERE FIRST REPORTED since its process was last
+/// served: the `at` of the reading already at `path` where that names the
+/// same tab and process with the same `api_ms` and the same figures — a
+/// re-report, which Claude Code makes every [`TAP_REFRESH_S`] seconds while
+/// idle — else the reading's own.
 fn first_reported(path: &Path, reading: &Reading) -> i64 {
     let figure = |w: Option<Window>| w.map(|w| (w.x10(), w.resets_at));
     read_regular(path)
@@ -538,6 +547,7 @@ fn first_reported(path: &Path, reading: &Reading) -> i64 {
 }
 
 /// Read stdin as the verb takes it: at most [`STDIN_MAX`] bytes of UTF-8,
+/// the rest drained.
 fn read_payload(stdin: &mut dyn Read) -> Option<String> {
     let mut bytes = Vec::new();
     let read = stdin

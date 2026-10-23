@@ -630,6 +630,7 @@ impl EventProcessor {
     }
 
     /// The drag's data came to `window`, whole: hover its local files, or deliver and finish
+    /// the drop that came first; a drag whose data names none is refused.
     fn dnd_data_came<T: 'static, F>(&mut self, window: xproto::Window, data: &[u8], mut callback: F)
     where
         F: FnMut(&RootAEL, Event<T>),
@@ -830,6 +831,8 @@ impl EventProcessor {
     }
 
     /// This is generally a reliable way to detect when the window manager's been
+    /// replaced, though this event is only fired by reparenting window managers
+    /// (which is almost all of them).
     fn reparent_notify(&self, xev: &XReparentEvent) {
         let wt = Self::window_target(&self.target);
 
@@ -856,6 +859,7 @@ impl EventProcessor {
     }
 
     /// The window was unmapped: the window manager iconified it or moved it off the current
+    /// workspace (mutter unmaps both), or the application hid it.
     fn unmap_notify<T: 'static, F>(&self, xev: &ffi::XUnmapEvent, callback: F)
     where
         F: FnMut(&RootAEL, Event<T>),
@@ -865,6 +869,7 @@ impl EventProcessor {
     }
 
     /// Applies `change` to what hides `window` (`window::Occlusion`), and reports
+    /// `WindowEvent::Occluded` when that changes what the window last reported.
     fn change_occlusion<T: 'static, F>(
         &self,
         window: xproto::Window,
@@ -1426,7 +1431,7 @@ impl EventProcessor {
         }
     }
 
-    /// A device came or went: its scroll axes are read, or forgotten. (WC.8: the
+    /// A device came or went: its scroll axes are read, or forgotten.
     fn xinput2_hierarchy_changed(&mut self, xev: &XIHierarchyEvent) {
         let infos = unsafe { slice::from_raw_parts(xev.info, xev.num_info as usize) };
         for info in infos {
@@ -1779,6 +1784,7 @@ fn client_long(xev: &XClientMessageEvent, i: usize) -> c_long {
 }
 
 /// Whether an XI2 focus event's `mode` is a keyboard grab's start or end (`XINotifyGrab`,
+/// `XINotifyUngrab`, `XINotifyPassiveGrab`, `XINotifyPassiveUngrab`).
 fn is_grab_focus_change(mode: c_int) -> bool {
     /// XI2 focus modes (XI2.h).
     const GRAB: c_int = 1;

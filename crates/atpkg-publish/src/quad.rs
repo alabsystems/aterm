@@ -1,13 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The signed quad (`index.toml`, its `.sig`, and the master-signed roster pair that
-//! authorized it), verified by the client's own chain in-process.
-//!
-//! The lanes' baseline head, an index about to be published and the quad handed to the
-//! mirror are all checked the same way: `atpkg::sig::admit_roster` (under the compiled-in
-//! paper master), then `authorize_index` (the roster's live machines, with the
-//! `machine_id`/`roster_seq` bind), then the index's own `valid_until` (gate 2).
+//! Signed quad (`index.toml`, `.sig`, and master-signed roster pair) verification.
 
 use std::path::{Path, PathBuf};
 
@@ -35,16 +29,14 @@ pub fn index_tag(n: u64) -> String {
 pub struct VerifiedQuad {
     /// The directory holding the four files.
     pub dir: PathBuf,
-    /// The verified index (derefs to `atpkg::Index`), with the roster generation that
-    /// authorized it — the authority every `pkg-*.toml` under it is verified against.
+    /// The verified index and the roster generation that authorized it.
     pub index: TrustedIndex,
     /// The verified roster.
     pub roster: aterm_update_core::Roster,
 }
 
 impl VerifiedQuad {
-    /// Whether every client refuses this index as stale at `now_unix`: its horizon has
-    /// passed, or does not read as UTC RFC3339 (which a client counts as lapsed).
+    /// Whether every client refuses this index as stale at `now_unix`.
     #[must_use]
     pub fn lapsed(&self, now_unix: i64) -> bool {
         aterm_types::rfc3339::parse_utc(&self.index.valid_until)
@@ -57,9 +49,7 @@ impl VerifiedQuad {
         self.dir.join(name)
     }
 
-    /// Verify a `pkg-<program>-<build>.toml` under the roster generation that authorized
-    /// this index, and parse it — the client's rule (`TrustedIndex::verify_pkg`).
-    ///
+    /// Verify and parse a `pkg-<program>-<build>.toml` (`TrustedIndex::verify_pkg`).
     /// # Errors
     ///
     /// A refusal when no live machine of that roster signed these bytes, or the manifest
@@ -81,17 +71,13 @@ impl VerifiedQuad {
 /// Whether a verification holds the index to its own `valid_until` (gate 2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Freshness {
-    /// The client's rule: a lapsed or unreadable horizon is refused. For what is about
-    /// to be published, mirrored or self-checked.
+    /// The client's rule: a lapsed or unreadable horizon is refused.
     Enforce,
-    /// The signature, the roster (with its own horizon) and the attribution only: for the
-    /// head a publish is built over and the floor a group is judged against. Re-signing a
-    /// lapsed head with a new horizon is how a channel every client refuses recovers.
+    /// The signature, the roster (with its own horizon) and the attribution only.
     Ignore,
 }
 
 /// Verify the quad in `dir` under `ctx.anchor` at `ctx.now_unix`, freshness enforced.
-///
 /// # Errors
 ///
 /// A refusal naming a missing file, an empty anchor, the client's verdict, or a lapsed
@@ -100,8 +86,7 @@ pub fn verify_dir(ctx: &Ctx, dir: &Path) -> Result<VerifiedQuad> {
     verify_dir_with(ctx, dir, Freshness::Enforce)
 }
 
-/// [`verify_dir`], with the index's own horizon checked or not.
-///
+/// [`verify_dir`], with the index's own horizon checked or not ([`Freshness::Ignore`]).
 /// # Errors
 ///
 /// As [`verify_dir`]; under [`Freshness::Ignore`] never for the index's horizon.
@@ -167,8 +152,7 @@ pub fn verify_dir_with(ctx: &Ctx, dir: &Path, freshness: Freshness) -> Result<Ve
     })
 }
 
-/// The newest published index number among `releases`. Drafts are skipped: the download
-/// host answers 404 for one, so N+1 above it is a hole in the tag run every client walks.
+/// The newest published index number among `releases`.
 #[must_use]
 pub fn head_number(releases: &[crate::host::Release]) -> Option<u64> {
     releases
@@ -178,11 +162,7 @@ pub fn head_number(releases: &[crate::host::Release]) -> Option<u64> {
         .max()
 }
 
-/// The channel head's number, `Ok(None)` when `slug` serves no published index. Listed
-/// through the host when this identity reads with a token; with none (a keyless builder,
-/// [`crate::host::ReleaseHost::reads_anonymously`]) walked on the anonymous download host
-/// with the client's own walk (`atpkg::net::newest_index`), as every client finds it.
-///
+/// The channel head's number, `Ok(None)` when `slug` serves no published index.
 /// # Errors
 ///
 /// Why the channel could not be read: a listing that failed ([`HostError::NotFound`] for no
@@ -214,10 +194,7 @@ pub fn head_build(ctx: &Ctx, slug: &Slug) -> std::result::Result<Option<u64>, Ho
     }
 }
 
-/// Download `names` (of [`QUAD_FILES`]) of index release `tag` into `dir`: through the
-/// host's API with a token, else from the anonymous download host under the client's caps
-/// ([`head_build`]).
-///
+/// Download `names` (of [`QUAD_FILES`]) of index release `tag` into `dir`.
 /// # Errors
 ///
 /// [`HostError::NotFound`] for an absent asset; otherwise why the download failed.
@@ -248,7 +225,6 @@ pub fn download_quad_files(
 }
 
 /// Download the channel's head quad into `dest` and verify it, freshness enforced.
-///
 /// # Errors
 ///
 /// A could-not-run when the channel cannot be read; a refusal when it serves no index or
@@ -257,10 +233,7 @@ pub fn fetch_head(ctx: &Ctx, slug: &Slug, dest: &Path) -> Result<(u64, VerifiedQ
     fetch_head_with(ctx, slug, dest, Freshness::Enforce)
 }
 
-/// [`fetch_head`], with the head's own horizon checked or not ([`Freshness`]). A download
-/// the host does not answer is tried three times, [`crate::host::ReleaseHost::retry_pause`]
-/// apart.
-///
+/// [`fetch_head`], with the head's own horizon checked or not ([`Freshness`]).
 /// # Errors
 ///
 /// As [`fetch_head`].

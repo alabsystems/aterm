@@ -61,6 +61,7 @@ fn short_sid(sid: &str) -> String {
 
 impl App {
     /// One session's line: its need, else what it is doing; its task; who
+    /// drives it.
     fn overview_chip(
         &self,
         h: &crate::session_store::SessionHandle,
@@ -215,6 +216,9 @@ impl App {
     }
 
     /// Snapshot the card: sessions grouped by window (tab order, pane leaves
+    /// included), a trailing `elsewhere` group for registered sessions no
+    /// window shows, and one manages line per manager a task's `from=` names
+    /// (a manager not on this aterm is named by its sid, `(not here)`).
     fn overview_parts(&self) -> (Vec<OverviewGroup>, Vec<Manages>) {
         let hosting = self.harness_hosting();
         let handles: Vec<crate::session_store::SessionHandle> = {
@@ -367,7 +371,7 @@ impl App {
         Ok(())
     }
 
-    /// [`Self::open_overview`] on `wid`, which comes forward with it. Where
+    /// [`Self::open_overview`] on `wid`, which comes forward with it.
     fn open_overview_on(&mut self, wid: WindowId) -> Result<(), String> {
         let (groups, manages) = self.overview_parts();
         self.agents.overview_read_at = Some(std::time::Instant::now());
@@ -455,6 +459,8 @@ impl App {
     }
 
     /// How many sessions the other aterms on this Mac hold, as the last
+    /// sibling scan counted them: the figure ❯'s This Mac line names
+    /// (`status_item::Here::elsewhere`), so the Overview's title says the same.
     fn sessions_elsewhere(&self) -> usize {
         self.siblings.iter().map(|s| s.sessions).sum()
     }
@@ -547,7 +553,7 @@ impl App {
         }
     }
 
-    /// One key's act on the open card: `t`, `r` or ⌫. A ⌫ carries whose
+    /// One key's act on the open card: `t`, `r` or ⌫.
     fn overview_key(&mut self, wid: WindowId, key: OverviewKey) {
         let controller = self.person_gesture_refused();
         let act = self
@@ -762,6 +768,7 @@ impl App {
     }
 
     /// The item index under a window-space point, through the same zoom-aware
+    /// transform the card was composited with.
     fn overview_item_at_pointer(&self, wid: WindowId, x: f64, y: f64) -> Option<usize> {
         let card = self.windows.get(&wid)?.overview()?;
         let (transform, x, y) = self.overlay_card_point(wid, x, y)?;
@@ -895,6 +902,7 @@ mod tests {
     }
 
     /// Three registered stub sessions in one window; returns their sids in
+    /// registration order (tab 0 is the harness session).
     fn app_with_three() -> (App, WindowId, Vec<aterm_session::SessionId>) {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -950,6 +958,9 @@ mod tests {
     }
 
     /// WHO TYPED (S9), named on the main thread where the person and a
+    /// poller look: a client types into a worker over an edge minted for
+    /// another tab, and the worker's `status`, its hover's last line and its
+    /// Overview line name the client on that tab's edge, the tab by its role.
     #[test]
     fn status_the_hover_and_the_card_name_who_typed() {
         use crate::typed_by::{Caller, Who};
@@ -987,6 +998,8 @@ mod tests {
     }
 
     /// A TAB NAMES WHO TYPED FROM IT BY WHAT SOMEONE SET ON IT (S9): its
+    /// role, else the person's name for it, else its session id; the
+    /// survey's facts get the role or the id, never the person's name.
     #[test]
     fn a_typist_tab_is_named_by_its_role_its_pin_or_its_id() {
         let (app, _wid, sids) = app_with_three();
@@ -1036,6 +1049,9 @@ mod tests {
     }
 
     /// `open overview`: the card opens on the front window, lists every
+    /// session under its window, counts the workers a task's `from=` names
+    /// and lists the manager with them; `controls overview` mirrors it, and
+    /// the map's old `connections` keyword still reaches it.
     #[test]
     fn open_lists_sessions_workers_and_who_manages_them() {
         let (mut app, wid, sids) = app_with_three();
@@ -1085,6 +1101,9 @@ mod tests {
     }
 
     /// THE CARD NAMES A BACKGROUND WORKER AS THE STRIP DOES: its chip, its
+    /// manager's word on its line and the manages line all read the tabs'
+    /// OSC titles (no role, pin or registry title stands for either), and an
+    /// untitled tab reads its position.
     #[test]
     fn the_card_names_background_tabs_by_their_osc_titles() {
         use crate::overview::Driver;
@@ -1139,6 +1158,7 @@ mod tests {
     }
 
     /// `t` takes the selected tab over and, pressed again, hands it back —
+    /// the person's key; the chip says `yours`.
     #[test]
     fn t_takes_the_selected_tab_over_and_a_controllers_t_does_not() {
         use crate::input::Source;
@@ -1168,6 +1188,7 @@ mod tests {
     }
 
     /// ⌫ arms the inline confirm on a worker and only the second press stops
+    /// it; esc cancels first.
     #[test]
     fn delete_confirms_inline_before_it_stops_a_worker() {
         let (mut app, wid, sids) = app_with_three();
@@ -1219,6 +1240,8 @@ mod tests {
     }
 
     /// Arm ⌫ on `sid`'s chip and confirm it with a second ⌫, both from `src`
+    /// (`Source::Controller` is the `key` verb's road through the overlay
+    /// gate).
     fn stop_twice(
         app: &mut App,
         wid: WindowId,
@@ -1245,6 +1268,8 @@ mod tests {
     }
 
     /// STOP WORKER READS THE TASK AGAIN WHEN IT ACTS: armed on a working
+    /// worker whose task then ends, the confirming ⌫ stops nothing and says
+    /// it is not running — no signal is sent.
     #[test]
     fn stop_worker_reads_the_task_again_when_it_acts() {
         use crate::app_overview::StopRefused;
@@ -1292,7 +1317,7 @@ mod tests {
         }
     }
 
-    /// A WORKER WITH ONLY ITS SHELL IN FRONT IS NOT "STOPPED". Its SIGTERM
+    /// A WORKER WITH ONLY ITS SHELL IN FRONT IS NOT "STOPPED".
     #[test]
     fn a_worker_with_only_its_shell_in_front_is_refused() {
         use crate::app_overview::StopRefused;
@@ -1361,6 +1386,7 @@ mod tests {
     }
 
     /// A CONTROL CLIENT CANNOT STOP A HELD WORKER THROUGH THE OVERVIEW OR THE
+    /// TAB MENU, AND ITS REFUSAL IS NOT THE PERSON'S NEWS.
     #[test]
     fn a_controller_cannot_stop_a_held_worker_and_the_person_can() {
         use crate::app_overview::StopRefused;
@@ -1433,6 +1459,7 @@ mod tests {
     }
 
     /// A session close while the card is open re-snapshots it: the closed
+    /// session's line leaves now.
     #[test]
     fn session_close_retargets_the_open_card() {
         let (mut app, _wid, sids) = app_with_three();
@@ -1446,6 +1473,9 @@ mod tests {
     }
 
     /// THE TITLE COUNTS THE OTHER ATERMS' SESSIONS APART (§6; ❯'s This Mac
+    /// line says the same figure): a sibling scan that finds another aterm
+    /// with three sessions reaches an open card's title as "(+3 in another
+    /// aterm)" beside this aterm's own count.
     #[test]
     fn the_title_counts_another_aterms_sessions_apart() {
         let (mut app, wid, _sids) = app_with_three();
@@ -1476,6 +1506,10 @@ mod tests {
     }
 
     /// THE OVERVIEW NAMES WHO DRIVES AS THE HOVER DOES (§12.4.1; one helper,
+    /// `app_presence::driven_words`): a Claude Code under Land this host
+    /// supervises reads `driven by aterm (land)`, then `(land, landed)` once
+    /// its loop tells the landing; a worker Land landed reads `task landed
+    /// …`, never `task done … (landed)` nor `task landed … (landed)`.
     #[test]
     fn the_overview_names_the_chips_face_and_a_landed_task() {
         use crate::overview::Driver;
@@ -1549,6 +1583,14 @@ mod tests {
     }
 
     /// THE OVERVIEW SAYS WHY A LANDING HOLDS, ON A LINE OF ITS OWN (Autopilot
+    /// v5 §12.3.1): a Claude Code under Land this
+    /// host supervises reads `driven by aterm (land)` on its chip's line
+    /// throughout — the hover's long words there pushed `typed by` past the
+    /// card's width — and, once its loop tells a hold whose yield was read,
+    /// the hold's words with no clock on the chip's held line (`not landed
+    /// yet: 2 unpushed commits; open work in its report: follow-up · 3
+    /// nudges`, the menu's tip form); none before a yield is read, none under
+    /// Cruise, none once the hold is taken down.
     #[test]
     fn the_overview_says_why_a_landing_holds() {
         use aterm_agent::harness::acts::{HoldLeg, LandHeld, OpenWord, TaskFace};
@@ -1644,6 +1686,10 @@ mod tests {
     }
 
     /// A HARNESS'S NEED SAYS IT IS ONE ON THE OVERVIEW (Autopilot v5
+    /// §12.2.9): no header above an Overview line says "needs you", and a
+    /// harness's `what` now carries the need without aterm's frame, so the
+    /// chip's doing (painted and spoken alike) leads with `needs you: ` and
+    /// keeps ` (+1 more)` whole within main's 72 bytes.
     #[test]
     fn a_harness_need_says_needs_you_on_the_overview() {
         let (mut app, _wid, sids) = app_with_three();
@@ -1692,6 +1738,7 @@ mod tests {
     }
 
     /// The words are coarse, so a card left open does not repaint each
+    /// second, and a result's size reads in units.
     #[test]
     fn ages_and_sizes_read_in_coarse_units() {
         assert_eq!(super::coarse_age(59_000), "just now");

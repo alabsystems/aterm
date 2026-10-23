@@ -1,26 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The unattended lanes: `atpkg-publish lane run|install|disarm <alab|linux>`.
-//!
-//! | module | does |
-//! |---|---|
-//! | [`alab`] | Apple: newest signed source release → new pins |
-//! | [`linux`] | Linux: rows for the pinned builds |
-//! | [`resolve`] | the Linux lane's build-number → commit binary search |
-//! | [`gap`] | the Apple lane's gap to trust main |
-//! | [`state`] | both lanes' state files, latches and single-instance lock |
-//! | [`hold`] | both lanes' coherence hold, per group and target |
-//! | [`rows`] | a pack manifest's rows, read by the client's own verifier and type |
-//! | [`report`] | the transcript, the table, the once-a-day notice |
-//! | [`install`] | the snapshot install and its armed units ([`units`]: launchd, systemd) |
-//!
-//! Both lanes run a snapshotted binary, never a checkout: `lane install` builds
-//! `atpkg-publish` from a clean tree into `<state>/lane.<stamp>/`, records what it was
-//! built from, and writes a launchd agent or systemd user unit whose command carries the
-//! binary's sha256; `lane run` refuses to start unless its own executable is that
-//! snapshot ([`self_check`]). New lane code reaches a signing machine only when a person
-//! re-runs `lane install`.
+//! Unattended publication lanes (`atpkg-publish lane run|install|disarm <alab|linux>`,
+//! [`alab`], [`linux`], [`resolve`], [`gap`], [`state`], [`hold`], [`rows`], [`report`],
+//! [`install`], [`units`], [`self_check`]).
 
 pub mod alab;
 pub mod gap;
@@ -50,7 +33,6 @@ pub enum LaneKind {
 
 impl LaneKind {
     /// `alab` | `linux`.
-    ///
     /// # Errors
     ///
     /// A usage error for anything else.
@@ -89,7 +71,6 @@ pub struct RunFlags {
 
 impl RunFlags {
     /// Parse `lane run <lane>`'s flags.
-    ///
     /// # Errors
     ///
     /// A usage error naming the flag.
@@ -136,7 +117,6 @@ impl RunFlags {
 }
 
 /// `atpkg-publish lane <run|install|disarm> <alab|linux> …`.
-///
 /// # Errors
 ///
 /// A usage error for an unknown subcommand or lane; otherwise what the subcommand
@@ -164,8 +144,7 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     }
 }
 
-/// The production `lane run`: the snapshot self-check, then the lane with the real packer,
-/// indexer and notifier.
+/// The production `lane run`.
 fn run_lane(ctx: &Ctx, kind: LaneKind, flags: &RunFlags) -> Result<()> {
     let exe = std::env::current_exe().map_err(|e| Error::io("find this binary's own path", &e))?;
     let pinned = self_check(&exe, flags.sha256.as_deref(), flags.dry_run, &ctx.state_dir)?;
@@ -188,7 +167,6 @@ fn run_lane(ctx: &Ctx, kind: LaneKind, flags: &RunFlags) -> Result<()> {
         ),
     });
     let result = run_with_production_deps(ctx, kind, flags, &tx);
-    // The refusal belongs in the lane's own log too, not only in the unit's capture.
     if let Err(e) = &result {
         tx.say(format!("{e}"));
     }
@@ -238,14 +216,7 @@ fn run_with_production_deps(
     }
 }
 
-/// The snapshot self-check: a run is pinned to the bytes its unit names, and those are a
-/// snapshot `lane install` laid down. `expected` is the unit's `--sha256`; `exe` must live
-/// in `<state_dir>/lane.<stamp>/` beside an `INSTALLED-FROM` recording the same hash, so a
-/// build of one's own, run with its own hash, is still not a signing run. A run with no
-/// `--sha256` may only be a dry run.
-///
-/// Answers the verified hash, or `None` for an unpinned dry run.
-///
+/// The snapshot self-check.
 /// # Errors
 ///
 /// A refusal when the executable does not hash to what the unit names, is not in a

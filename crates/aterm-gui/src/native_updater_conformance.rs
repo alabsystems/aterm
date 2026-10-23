@@ -352,6 +352,7 @@ fn healthy_no_update_completion_returns_to_idle_through_the_derived_action() {
 }
 
 /// Bind the real event-loop dispatch predicate to the disk transaction's
+/// first-present boundary.
 #[test]
 fn real_gui_boot_health_dispatch_requires_first_present_before_model_disarm() {
     let model = native_update_disk_transaction_model();
@@ -476,6 +477,7 @@ fn admission_action(decision: AdmissionDecision) -> &'static str {
 }
 
 /// Exhaust the bounded admission fact matrix against the genuine shipping
+/// classifier.
 #[test]
 fn real_update_admission_classifier_conforms_for_every_bounded_fact_combination() {
     let model = native_update_admission_model();
@@ -902,6 +904,8 @@ fn real_lapse_keeps_the_anchor_and_a_park_miss_stays_in_the_activity_lane() {
 }
 
 /// The `BundleSwap` model step: when the failed candidate had already boot-applied the
+/// bundle, the next reconcile retires the download for the installed-bundle activation of the
+/// same update and keeps the latch and its deadline.
 #[test]
 fn real_bundle_swap_keeps_the_latch_as_the_model_s_bundle_swap() {
     use crate::app_native::{
@@ -989,6 +993,7 @@ fn real_bundle_swap_keeps_the_latch_as_the_model_s_bundle_swap() {
 }
 
 /// A capture failure is sorted into a miss or a refusal by its type, and a refusal never
+/// reaches the activity lane.
 #[cfg(unix)]
 #[test]
 fn real_capture_refusal_is_never_a_park_miss_and_never_activity() {
@@ -1110,6 +1115,8 @@ fn real_capture_refusal_is_never_a_park_miss_and_never_activity() {
 }
 
 /// Real refused desks through the shipping park capture: a NUL in a reported
+/// cwd, a 5K fullscreen grid (99x338), a styled full-width row ending in a
+/// combining mark, and a parser left inside an unterminated OSC.
 #[cfg(unix)]
 #[test]
 fn real_refused_desks_park_degraded_or_refused_and_never_missed() {
@@ -1161,6 +1168,7 @@ fn real_refused_desks_park_degraded_or_refused_and_never_missed() {
 }
 
 /// Bind the hidden-output model to the genuine monotonic admission predicate,
+/// future-deadline constructor and auto-intent reducer.
 #[test]
 fn real_hidden_output_quiet_clock_ages_without_present_ack() {
     let model = native_update_hidden_output_quiet_model();
@@ -1331,6 +1339,7 @@ fn installed_bundle(
 }
 
 /// One facts-worker observation: the installed bundle (`None`: not found, or
+/// found but not `proven`) and a verified download of `newer`, if any.
 fn observation(
     sequence: u64,
     installed: Option<crate::native_updater_service::InstalledUpdate>,
@@ -1352,6 +1361,7 @@ fn observation(
 }
 
 /// A structural failure of build 11's installed activation: an overlap
+/// handoff that failed safely, returned through the completion lane.
 fn fail_activation_11(app: &mut crate::App) {
     use crate::app_native::{HandoffFailureLane, PhysicalFailureShape};
     let activation = crate::native_updater_service::installed_activation_digest(11, COMMIT);
@@ -1366,6 +1376,7 @@ fn fail_activation_11(app: &mut crate::App) {
 }
 
 /// A headless App running build 10 whose lane converged on the installed
+/// activation of build 11 (`installed`): two structural failures.
 fn converged_on_11(installed: crate::native_updater_service::InstalledUpdate) -> crate::App {
     let mut app = crate::App::headless_for_test();
     app.native_updater_service = NativeUpdaterService::new(10, "1.0.10", true);
@@ -1376,6 +1387,7 @@ fn converged_on_11(installed: crate::native_updater_service::InstalledUpdate) ->
 }
 
 /// The real lane on build 11's latch with room in the trial and nothing
+/// newer, projected onto the model.
 fn observe_latch(model: &Model, app: &crate::App, day: bool, pending: bool) -> State {
     let verdict = app.auto_apply_structural_verdict.expect("the verdict");
     project_structural_latch(
@@ -1421,6 +1433,9 @@ fn due_look(app: &mut crate::App) -> bool {
 }
 
 /// The decision, exhaustively: for every reachable model state in which `Decide` is enabled,
+/// the shipping `structural_latch` is fed the facts that state names (the day's re-sample due,
+/// an unspent newer download, the trial's room), and its answer, applied as
+/// `App::look_at_structural_latch` applies it, must be exactly the model's `Decide` successor.
 #[test]
 fn real_structural_latch_decision_is_exactly_the_model_s_decide() {
     use crate::native_update_auto_intent::{
@@ -1600,6 +1615,8 @@ fn real_structural_latch_decision_is_exactly_the_model_s_decide() {
 }
 
 /// The shipping arc, projected step by step: the real `App` converges on build 11's installed
+/// activation through the completion lane, and every later step, read off the real latch,
+/// verdict, retire and notice, is checked against the model's own step:
 #[test]
 fn real_structural_latch_arc_is_the_model_s_arc() {
     use crate::app_native::ActivationSupersedeCompletion;
@@ -1923,6 +1940,7 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
 }
 
 /// A latch whose activation leaves the installed facts is decided within a bound, projected
+/// step by step onto the model.
 #[test]
 fn a_latch_whose_activation_leaves_the_installed_facts_is_decided_within_a_bound() {
     use crate::app_native::STRUCTURAL_TRIAL_UNMEASURED_LOOKS;
@@ -2044,6 +2062,7 @@ fn a_latch_whose_activation_leaves_the_installed_facts_is_decided_within_a_bound
 }
 
 /// A count that could not be checked is not a count that is gone, projected step by step onto
+/// the model.
 #[test]
 fn a_latch_whose_count_could_not_be_checked_keeps_its_re_sample() {
     use crate::app_native::STRUCTURAL_TRIAL_UNPROVEN_LOOKS;

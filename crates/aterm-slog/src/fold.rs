@@ -71,6 +71,7 @@ impl NodeFields {
     }
 
     /// Hold `val` for `key` at `conf` from record `seq` whatever is held:
+    /// in the held one's place, so the fields keep their order.
     fn put(&mut self, key: Key, val: Val, conf: Conf, seq: u64) {
         let held = Held {
             key,
@@ -254,6 +255,8 @@ pub struct Claim {
 
 impl Claim {
     /// The claim a `verdict` or `label` mark makes: its word or text and
+    /// `ttl=`, `as=` and `re=` (`None` for a mark that carries neither a word
+    /// nor a text).
     fn of(r: &Rec, label: bool) -> Option<Claim> {
         let (word, text, until) = if label {
             let text = r.f.get_str(Key::Text)?.to_string();
@@ -477,6 +480,8 @@ impl std::fmt::Debug for Words {
 }
 
 /// Whether `c` extends the character before it (a combining mark, a joiner,
+/// a variation selector, an emoji modifier): a cut is never placed before
+/// one.
 const fn is_extend(c: char) -> bool {
     matches!(c,
         '\u{0300}'..='\u{036f}'
@@ -613,10 +618,15 @@ pub struct Fold {
     /// The shell phase, kept apart from the agent word.
     shell_phase: Option<Phase>,
     /// The delivered `kind=task` mails no turn has taken, oldest first
+    /// (phase 5, [`mail`]), at most [`MAX_MAIL_WAITING`]: carried in the
+    /// local carry since Phase 6.
     mail: Vec<MailWaiting>,
     /// THE MAIL LATCH (phase 5's T39):
+    /// a `mail dir=in` record since the last `human` mark of an
+    /// input that reached the program (one without `reached=0`).
     in_since_human: bool,
     /// The heuristic mail links of the open turns and the newest closed
+    /// one ([`Fold::mail_link`]).
     links: Vec<(Node, MailLink)>,
 }
 
@@ -732,6 +742,8 @@ impl Fold {
     }
 
     /// A turn opened: link it to the one mail waiting in its window, or
+    /// count it ambiguous, and take what it weighed off the waiting list
+    /// ([`mail::mail_link_of`], [`mail::after_turn`]).
     fn link_turn(&mut self, r: &Rec) {
         let decided = mail_link_of(&self.mail, r);
         match decided {
@@ -1296,6 +1308,7 @@ impl Fold {
     }
 
     /// Add a need in precedence order; when full, the least urgent (newest
+    /// among equals) gives way to a more urgent one.
     fn raise(&mut self, need: Need) {
         let mut all: Vec<Need> = self.st.needs.iter_mut().filter_map(Option::take).collect();
         all.retain(|n| !(n.node == need.node && n.word == need.word && n.by == need.by));

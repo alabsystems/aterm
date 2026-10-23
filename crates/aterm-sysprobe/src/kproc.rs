@@ -1,35 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE KERNEL'S PROCESS RECORDS, READ AS `ps` AND `lsof` READ THEM, WITHOUT
-//! RUNNING EITHER.
-//!
-//! A `ps` is a child process: on a loaded Mac each costs 0.02-0.4 s of wall
-//! (its `tty` column alone scans `/dev` once per process), and a harness that
-//! reads a tab's job a few times a second paid seconds of every attach to
-//! them. These readers answer in microseconds from the same kernel records:
-//!
-//! * [`record`], [`records`] — `sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PID |
-//!   KERN_PROC_ALL)`'s `struct kinfo_proc`, the table `ps` itself reads: pid,
-//!   parent, process group, controlling terminal and its foreground group,
-//!   effective uid, `p_comm`, start time, zombie or not. Every user's process
-//!   answers (libproc's `PROC_PIDTBSDINFO` refuses another user's: `EPERM`).
-//! * [`argv`] — `KERN_PROCARGS2`'s argument words, for a process of this uid
-//!   (any, as root), read and parsed by `crate::procargs`, the workspace's
-//!   one reader of that record. `ps` is setuid root and reads every process's, so
-//!   [`ps_comm`] and [`ps_args`], `ps`'s `comm` and `args` columns, name
-//!   another user's process by its image's path (`proc_pidpath`, which
-//!   answers for every user's): the one way the two can differ.
-//! * [`image_inode`] — `proc_pidinfo(PROC_PIDREGIONPATHINFO)`'s first
-//!   vnode-backed region: the inode of the executable the process mapped,
-//!   kept after a new file is renamed over its path (`lsof -d txt`'s first
-//!   entry). This uid's processes only, as `lsof` run by this uid.
-//!
-//! Every other platform answers `None`: their callers keep their own readers
-//! (`/proc`, or `ps`).
-//!
-//! A process can exit, exec or be reparented between two reads: each reader
-//! answers for the moment it read, as `ps` does.
+//! Kernel process records and arguments ([`record`], [`records`], [`argv`], [`ps_comm`],
+//! [`ps_args`], [`image_inode`]).
 
 /// One process's kernel record (`struct kinfo_proc`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,16 +13,13 @@ pub struct Record {
     pub ppid: u32,
     /// Its process group (`e_pgid`).
     pub pgid: i32,
-    /// Its controlling terminal's foreground process group (`e_tpgid`); 0
-    /// with no terminal.
+    /// Its controlling terminal's foreground process group (`e_tpgid`); 0 with no terminal.
     pub tpgid: i32,
-    /// Its controlling terminal's device (`e_tdev`), `None` with none
-    /// (`NODEV`, which `ps` prints `??`).
+    /// Controlling terminal device (`e_tdev`), or `None` (`NODEV`).
     pub tty: Option<i32>,
     /// Its effective uid (`e_ucred.cr_uid`).
     pub uid: u32,
-    /// The kernel's short name for it (`p_comm`: its image's basename, at
-    /// most 16 bytes).
+    /// The kernel's short name for it (`p_comm`: its image's basename, at most 16 bytes).
     pub comm: String,
     /// When it started: unix seconds (`p_starttime.tv_sec`).
     pub start_s: u64,
@@ -62,8 +32,7 @@ pub struct Record {
 /// What `ps` prints for a zombie's `comm` and `args`.
 pub const DEFUNCT: &str = "<defunct>";
 
-/// `pid`'s record; `None` when no process has that pid (or the platform has
-/// no reader here).
+/// `pid`'s record; `None` when no process has that pid (or the platform has no reader here).
 #[must_use]
 pub fn record(pid: u32) -> Option<Record> {
     imp::record(pid)
@@ -75,12 +44,7 @@ pub fn records() -> Option<Vec<Record>> {
     imp::records()
 }
 
-/// `pid`'s argument words (`argv`, `argv[0]` first, never its environment),
-/// as `ps` reads them: every word the kernel's answer holds
-/// ([`crate::procargs::parse`]). `None` when they cannot be read: the
-/// process is gone, another user's, a zombie, or its argc is 0, or its record
-/// is past what the kernel hands over (`ps` prints that record's tail as
-/// words; [`crate::procargs::read`]); and off macOS.
+/// `pid`'s argument words (`argv`, `argv[0]` first, never its environment), as `ps` reads them.
 #[must_use]
 pub fn argv(pid: u32) -> Option<Vec<Vec<u8>>> {
     let buf = crate::procargs::read(pid)?;
@@ -88,16 +52,13 @@ pub fn argv(pid: u32) -> Option<Vec<Vec<u8>>> {
     (!words.is_empty()).then(|| words.into_iter().map(<[u8]>::to_vec).collect())
 }
 
-/// The inode of the executable image `pid` runs: its lowest vnode-backed
-/// mapping, which keeps the file the process mapped whatever has happened to
-/// its path since. `None` when unreadable (gone, another user's).
+/// The inode of the executable image `pid` runs.
 #[must_use]
 pub fn image_inode(pid: u32) -> Option<u64> {
     imp::image_inode(pid)
 }
 
-/// `ps -o comm=` for `r` in `locale`: `<defunct>` for a zombie, else
-/// `argv[0]` escaped as `ps` escapes it ([`vis`]), else [`unread`].
+/// `ps -o comm=` for `r` in `locale` ([`vis`], [`unread`]).
 #[must_use]
 pub fn ps_comm(r: &Record, locale: Locale) -> String {
     if r.zombie {
@@ -109,9 +70,7 @@ pub fn ps_comm(r: &Record, locale: Locale) -> String {
         .unwrap_or_else(|| unread(r, locale))
 }
 
-/// `ps -ww -o args=` (`command=`) for `r` in `locale`: `<defunct>` for a
-/// zombie, else its argument words joined by spaces and escaped as one
-/// string, as `ps` escapes it ([`vis`]), else [`unread`].
+/// `ps -ww -o args=` (`command=`) for `r` in `locale` ([`vis`], [`unread`]).
 #[must_use]
 pub fn ps_args(r: &Record, locale: Locale) -> String {
     if r.zombie {
@@ -122,22 +81,12 @@ pub fn ps_args(r: &Record, locale: Locale) -> String {
         .unwrap_or_else(|| unread(r, locale))
 }
 
-/// [`argv`] of `r` where the kernel answers it: never another user's
-/// process unless this one is root (`KERN_PROCARGS2` refuses across
-/// effective uids), which is not asked.
+/// [`argv`] of `r` where the kernel answers it.
 fn readable_argv(r: &Record) -> Option<Vec<Vec<u8>>> {
     imp::reads_args_of(r.uid).then(|| argv(r.pid)).flatten()
 }
 
-/// What names a process whose arguments are not read: `ps`'s own fallback,
-/// `(p_comm)`, where `ps` could not read them either (a process of this
-/// uid, or any as root: the kernel refuses `KERN_PROCARGS2` only across
-/// effective uids). Another user's process, whose `argv[0]` `ps` (setuid
-/// root) reads, is named by its image's path, escaped as `argv[0]` would
-/// be: `argv[0]` is that path for nearly every daemon, where `p_comm` is
-/// its name cut to 16 bytes (measured 2026-10-20: the path's basename was
-/// `ps`'s `comm` basename for 327 of 327 other users' processes, `p_comm`
-/// for 217); `p_comm` where the path is unread too.
+/// What names a process whose arguments are not read.
 fn unread(r: &Record, locale: Locale) -> String {
     if imp::reads_args_of(r.uid) {
         let comm = format!("({})", r.comm);
@@ -152,30 +101,19 @@ fn unread(r: &Record, locale: Locale) -> String {
 /// The character classes `ps` escapes in: its `LC_CTYPE`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Locale {
-    /// A UTF-8 locale (macOS's default; every macOS UTF-8 locale shares one
-    /// `LC_CTYPE`): a printable character is kept.
+    /// A UTF-8 locale (macOS's default).
     Utf8,
     /// The C locale (`LC_ALL=C`): a byte at or above 0x80 is escaped.
     C,
 }
 
-/// `text` as `ps` prints it: the C library's `strnvis(…, VIS_TAB | VIS_NL |
-/// VIS_NOSLASH)`, the call `ps` makes, in `locale`'s character classes (this
-/// thread's locale is switched for the call and put back). A newline is
-/// `\012`, a tab `\011`, another control character `^A`, a high byte in the
-/// C locale `M-C` or `M^@`; a UTF-8 locale keeps what prints, and a string
-/// holding a byte that is no UTF-8 is written out byte by byte, up to the
-/// first NUL that writes. `None` off macOS or when the locale cannot be
-/// loaded.
+/// `text` as `ps` prints it.
 #[must_use]
 pub fn vis(text: &[u8], locale: Locale) -> Option<String> {
     imp::vis(text, locale)
 }
 
-/// Every constant the macOS arm reads the kernel and the C library by that
-/// the job probe's table ([`crate::jobs::darwin::SDK_ROWS`]) does not
-/// already hold, as the C expression the SDK must agree with:
-/// `tests/proc_info_sdk.rs` asserts each on `arm64` and `x86_64`.
+/// macOS kernel and libc constants ([`crate::jobs::darwin::SDK_ROWS`]).
 #[cfg(target_os = "macos")]
 pub const SDK_ROWS: &[(&str, i64)] = &[
     ("KERN_PROC_ALL", imp::KERN_PROC_ALL as i64),
@@ -215,9 +153,6 @@ mod imp {
     use std::ffi::{CString, c_char, c_int, c_void};
     use std::sync::OnceLock;
 
-    // `struct kinfo_proc`'s size and offsets are the job probe's, held to the
-    // SDK there; every other constant this arm reads by is a row of
-    // [`super::SDK_ROWS`].
     use crate::jobs::darwin::{
         KERN_PROC, KERN_PROC_PID, KINFO_COMM_AT, KINFO_PGID_AT, KINFO_PID_AT, KINFO_PPID_AT,
         KINFO_SIZE, KINFO_START_SEC_AT, KINFO_START_USEC_AT, KINFO_STAT_AT, KINFO_TDEV_AT,
@@ -226,8 +161,6 @@ mod imp {
 
     use super::{Locale, Record};
 
-    // `<vis.h>` and `<xlocale.h>`'s calls, which the first-party `libc` does
-    // not declare: `ps`'s own escaper and the per-thread locale it runs under.
     unsafe extern "C" {
         fn strnvis(dst: *mut c_char, dlen: usize, src: *const c_char, flag: c_int) -> c_int;
         fn newlocale(mask: c_int, locale: *const c_char, base: *mut c_void) -> *mut c_void;
@@ -240,13 +173,11 @@ mod imp {
     /// `<xlocale.h>`.
     pub(super) const LC_CTYPE_MASK: c_int = 1 << 1;
 
-    /// A `locale_t` from `newlocale`, never freed or changed: macOS's libc
-    /// lets any thread install one with `uselocale`.
+    /// A `locale_t` from `newlocale`, never freed or changed.
     struct Ctype(*mut c_void);
-    // SAFETY: the locale object is immutable once made and libc reads it
-    // from whichever thread installs it.
+    // SAFETY: The locale object is immutable once made and only read by libc.
     unsafe impl Send for Ctype {}
-    // SAFETY: as for `Send`: shared reads of an immutable object.
+    // SAFETY: As for `Send`: shared reads of an immutable object.
     unsafe impl Sync for Ctype {}
 
     fn ctype(locale: Locale) -> Option<*mut c_void> {
@@ -257,8 +188,7 @@ mod imp {
             Locale::Utf8 => (&UTF8, c"UTF-8"),
         };
         let made = cell.get_or_init(|| {
-            // SAFETY: a NUL-terminated name and no base locale; a null
-            // answer (no such locale) is kept and read as none.
+            // SAFETY: A NUL-terminated name and no base locale.
             Ctype(unsafe { newlocale(LC_CTYPE_MASK, name.as_ptr(), std::ptr::null_mut()) })
         });
         (!made.0.is_null()).then_some(made.0)
@@ -279,14 +209,10 @@ mod imp {
     pub(super) fn vis(text: &[u8], locale: Locale) -> Option<String> {
         let src = CString::new(text).ok()?;
         let loc = ctype(locale)?;
-        // Four bytes per input byte is `strvis`'s own bound (`ps` allocates
-        // it); twice that leaves room for a UTF-8 locale's re-encoding.
         let mut dst = vec![0u8; text.len() * 8 + 1];
-        // SAFETY: `loc` is a live locale object; the previous one is put back
-        // below, on this thread, before anything else runs on it.
+        // SAFETY: `loc` is a live locale object.
         let previous = unsafe { uselocale(loc) };
-        // SAFETY: `dst` is writable for `dst.len()` bytes, the length passed,
-        // and `src` is NUL-terminated.
+        // SAFETY: `dst` is writable for `dst.len()` bytes, the length passed.
         let n = unsafe {
             strnvis(
                 dst.as_mut_ptr().cast::<c_char>(),
@@ -298,8 +224,6 @@ mod imp {
         // SAFETY: `previous` is what `uselocale` answered for this thread.
         unsafe { uselocale(previous) };
         dst.truncate(usize::try_from(n).ok()?);
-        // `ps` prints a C string: a NUL its escaper wrote (a code point's
-        // zero byte, written out after a byte that is no UTF-8) ends it.
         if let Some(nul) = dst.iter().position(|b| *b == 0) {
             dst.truncate(nul);
         }
@@ -315,16 +239,13 @@ mod imp {
     /// `SZOMB` (`sys/proc.h`): `p_stat` of an exited, unreaped process.
     pub(super) const SZOMB: u8 = 5;
 
-    /// `PROC_PIDREGIONPATHINFO` (`sys/proc_info.h`) and its answer, `struct
-    /// proc_regionwithpathinfo`: the region's address and size, and the
-    /// backing vnode's inode.
+    /// `PROC_PIDREGIONPATHINFO` (`sys/proc_info.h`).
     pub(super) const PROC_PIDREGIONPATHINFO: c_int = 8;
     pub(super) const REGION_SIZE: usize = 1272;
     pub(super) const REGION_ADDRESS: usize = 80;
     pub(super) const REGION_LEN: usize = 88;
     pub(super) const REGION_INODE: usize = 104;
-    /// The regions walked before the image's: none precede it in a Mach-O
-    /// process (`__PAGEZERO` maps no region), so a handful is generous.
+    /// The regions walked before the image's.
     const REGIONS: usize = 64;
 
     fn u32_at(b: &[u8], at: usize) -> Option<u32> {
@@ -361,8 +282,7 @@ mod imp {
     fn sysctl_into(mib: &mut [c_int], buf: &mut [u8]) -> std::io::Result<usize> {
         let mut len: libc::size_t = buf.len();
         let n = libc::c_uint::try_from(mib.len()).map_err(|_| std::io::ErrorKind::InvalidInput)?;
-        // SAFETY: `mib` holds `n` ints; `buf` is writable for `len` bytes and
-        // the kernel writes at most `len`, reporting how many in `len`.
+        // SAFETY: `mib` holds `n` ints.
         let rc = unsafe {
             libc::sysctl(
                 mib.as_mut_ptr(),
@@ -384,7 +304,7 @@ mod imp {
     fn sysctl_len(mib: &mut [c_int]) -> Option<usize> {
         let mut len: libc::size_t = 0;
         let n = libc::c_uint::try_from(mib.len()).ok()?;
-        // SAFETY: a null `oldp` asks only for the size, written to `len`.
+        // SAFETY: A null `oldp` asks only for the size, written to `len`.
         let rc = unsafe {
             libc::sysctl(
                 mib.as_mut_ptr(),
@@ -402,15 +322,12 @@ mod imp {
         let pid = c_int::try_from(pid).ok()?;
         let mut mib = [libc::CTL_KERN, KERN_PROC, KERN_PROC_PID, pid];
         let mut buf = [0u8; KINFO_SIZE];
-        // An absent pid answers 0 bytes, not an error.
         let n = sysctl_into(&mut mib, &mut buf).ok()?;
         (n == KINFO_SIZE).then(|| parse(&buf)).flatten()
     }
 
     pub(super) fn records() -> Option<Vec<Record>> {
         let mut mib = [libc::CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0];
-        // The table grows between the size and the read: room for an eighth
-        // more, and a few tries before it is called unreadable.
         for _ in 0..4 {
             let len = sysctl_len(&mut mib[..3])?;
             let mut buf = vec![0u8; len + len / 8 + KINFO_SIZE * 16];
@@ -432,8 +349,7 @@ mod imp {
         let mut at = 0u64;
         for _ in 0..REGIONS {
             let mut buf = [0u8; REGION_SIZE];
-            // SAFETY: `buf` is writable for `REGION_SIZE` bytes, the size
-            // passed; libproc returns how many it wrote.
+            // SAFETY: `buf` is writable for `REGION_SIZE` bytes, the size passed.
             let n = unsafe {
                 libc::proc_pidinfo(
                     pid,

@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! agh.toml (design §6.2–§6.3): its rows, the validation L1–L10, the release floor, and where
-//! agh's files live.
+//! agh.toml: its rows, the validation L1–L10, the release floor, and where agh's files live.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -14,7 +13,7 @@ use crate::policy::{ChainStep, Tier};
 use crate::redact::Redactor;
 use crate::slug::Slug;
 
-/// Owners held at release tier whatever agh.toml says. Only ever raises a tier.
+/// Owners held at release tier whatever agh.toml says.
 pub const RELEASE_FLOOR_OWNERS: [&str; 1] = [aterm_types::channel::PUBLIC_OWNER];
 /// The longest agh.toml read.
 pub const CONFIG_MAX: usize = 64 * 1024;
@@ -35,8 +34,7 @@ pub struct Dirs {
 }
 
 impl Dirs {
-    /// `aterm_types::dirs::aterm_config_dir()/agh`, `state_dir()/agh` and `home_dir()`; `None`
-    /// when any of them is, or is relative.
+    /// `aterm_types::dirs::aterm_config_dir()/agh`, `state_dir()/agh` and `home_dir()`.
     #[must_use]
     pub fn from_env() -> Option<Dirs> {
         Dirs::of(
@@ -46,9 +44,7 @@ impl Dirs {
         )
     }
 
-    /// `from_env`'s rule over the three roots. A relative root (a relative `XDG_CONFIG_HOME`,
-    /// which the XDG spec says to ignore) would put the credential store under the current
-    /// directory, which is no root at all: `None`, so agh runs with no config, anonymous.
+    /// `from_env`'s rule over the three roots.
     fn of(config: Option<PathBuf>, state: Option<PathBuf>, home: Option<PathBuf>) -> Option<Dirs> {
         let absolute = |path: Option<PathBuf>| path.filter(|path| path.is_absolute());
         Some(Dirs {
@@ -90,8 +86,7 @@ impl Dirs {
     }
 }
 
-/// agh.toml as written. `#[non_exhaustive]`: M2 adds `writers` (`[[writers]]`, design §6.2),
-/// which M1's `deny_unknown_fields` refuses as an unknown key.
+/// agh.toml as written.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
@@ -106,8 +101,7 @@ pub struct AghConfig {
     pub targets: BTreeMap<String, String>,
 }
 
-/// One `[profiles.NAME]` row. `#[non_exhaustive]`: M2 adds `legacy_loose`, which only
-/// AghHost's loader honours (design §6.2), and which M1 refuses as an unknown key.
+/// One `[profiles.NAME]` row.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
@@ -137,7 +131,7 @@ pub struct OwnerRow {
     /// The read chain: profile names and `anonymous`.
     #[serde(default)]
     pub read: Vec<String>,
-    /// One profile, or `"none"` (the default). A list is read so that L4 can name it.
+    /// One profile, or `"none"` (the default).
     #[serde(default = "write_none")]
     pub write: WriteField,
 }
@@ -196,9 +190,7 @@ pub struct OwnerRule {
     pub write: Option<String>,
 }
 
-/// agh.toml after L1–L10. Opaque: its fields are crate-private and it has no `Default`, so
-/// outside agh a `Validated` comes only from `validate` or `load`, and no Router is built over
-/// rows the rules did not check (design §6.3). M2 keeps `[[writers]]` inside it.
+/// agh.toml after L1–L10.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Validated {
     pub(crate) profiles: BTreeMap<String, Profile>,
@@ -239,15 +231,7 @@ impl Validated {
 }
 
 /// L1: the TOML and its schema.
-///
-/// The fault names the line and the parser's message, never the offending source line:
-/// `aterm_toml`'s `Display` quotes that line, and a token pasted into agh.toml (an unknown
-/// `token = "…"` key) would then reach `agh policy check`'s stdout. The message itself
-/// passes `unquoted`, because it quotes the value it refused, and an unprefixed token (a
-/// legacy classic one) has no shape `Redactor::shapes` knows.
-///
 /// # Errors
-///
 /// The L1 fault.
 pub fn parse(text: &str) -> Result<AghConfig, ConfigFault> {
     aterm_toml::from_str::<AghConfig>(text).map_err(|e| {
@@ -264,8 +248,7 @@ pub fn parse(text: &str) -> Result<AghConfig, ConfigFault> {
     })
 }
 
-/// The 1-based line that byte `offset` of `text` is on. End of input is on the last line,
-/// as `aterm_toml`'s own locator puts it, never on the empty line after a final newline.
+/// The 1-based line that byte `offset` of `text` is on.
 pub(crate) fn line_of(text: &str, offset: usize) -> usize {
     let at = offset.min(text.len());
     let at = if at == text.len() && at > 0 {
@@ -273,7 +256,6 @@ pub(crate) fn line_of(text: &str, offset: usize) -> usize {
     } else {
         at
     };
-    // `\n` is ASCII, so counting bytes up to any index counts lines.
     1 + text.as_bytes()[..at]
         .iter()
         .filter(|b| **b == b'\n')
@@ -284,11 +266,7 @@ pub(crate) fn line_of(text: &str, offset: usize) -> usize {
 /// Malformed), so a run this short is never a whole token.
 const TOKEN_FLOOR: usize = 20;
 
-/// A parser message with every value it quotes taken out. A double-quoted run (serde's
-/// `string "…"`) becomes `"…"`; a backticked run becomes `` `…` `` unless it is a short key
-/// (dot-separated identifier segments) or short punctuation (`` `]` ``, `` `=` ``), so
-/// `unknown field `legacy_loose`` still names its key; and any remaining run of
-/// `[A-Za-z0-9_]` of `TOKEN_FLOOR` bytes or more becomes `…`.
+/// A parser message with every value it quotes taken out.
 fn unquoted(message: &str) -> String {
     let mut out = String::with_capacity(message.len());
     let mut rest = message;
@@ -308,7 +286,7 @@ fn unquoted(message: &str) -> String {
 }
 
 /// `body` split at its closing `quote` (a `\` escapes the next character inside a double-
-/// quoted run): the quoted text and what follows the quote. No closing quote takes it all.
+/// quoted run): the quoted text and what follows the quote.
 fn closing(body: &str, quote: char) -> (&str, &str) {
     let mut escaped = false;
     for (i, c) in body.char_indices() {
@@ -391,9 +369,7 @@ pub(crate) fn is_row_name(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
 }
 
-/// L10's fault for a profile name, or `None` when it is one: `anonymous` and `none` are
-/// reserved, and any other name must pass [`is_row_name`]. The one text that `validate` and
-/// `auth add` both give.
+/// L10's fault for a profile name, or `None` when it is one.
 pub(crate) fn profile_name_fault(name: &str) -> Option<String> {
     if name == ANONYMOUS || name == NONE {
         Some(format!(
@@ -409,8 +385,7 @@ pub(crate) fn profile_name_fault(name: &str) -> Option<String> {
     }
 }
 
-/// The usage error for a profile agh.toml does not name: `no profile named {name}`, with
-/// `next` (the verb that lists the profiles there are).
+/// The usage error for a profile agh.toml does not name: `no profile named {name}`, with `next`.
 pub(crate) fn no_profile(name: &str, next: &str) -> crate::error::Error {
     crate::error::Error::usage(format!("no profile named {name}")).with_next(next)
 }
@@ -453,21 +428,7 @@ impl Faults {
     }
 }
 
-/// One agh.toml value as a fault shows it. The values come from agh.toml (owner, profile
-/// and target names, chain steps, writers, tiers, logins, target values), and a token
-/// pasted into one of them would otherwise be printed verbatim: on `agh policy check`'s
-/// stdout and in every verb's refusal of the file. When agh.toml fails nothing has been
-/// loaded, so the Redactor has learned no token, and its shapes know only the prefixed
-/// forms, while an unprefixed token (a legacy classic one, a GHES one) is still a working
-/// credential.
-///
-/// So a value is shown verbatim when it passes its own name rule (`is_owner_name` for an
-/// owner or a login, `is_row_name` for a profile, step, writer or target name) and holds no
-/// all-hex run of `TOKEN_FLOOR` bytes or more; every other value has each run of
-/// `[A-Za-z0-9_]` of `TOKEN_FLOOR` bytes or more shown as `…`, as on the parse path. No
-/// GitHub token passes: a prefixed one holds `_`, which neither rule allows, and a legacy
-/// one is 40 hex digits. This masking is beside plan §4.6.12's fault texts, which carry
-/// `{o}`, `{p}` and `{t}` verbatim.
+/// One agh.toml value as a fault shows it.
 struct Shown<'a> {
     value: &'a str,
     rule: Option<fn(&str) -> bool>,
@@ -491,10 +452,7 @@ fn has_hex_run(text: &str) -> bool {
         .any(|run| run.len() >= TOKEN_FLOOR && run.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-/// An agh.toml value as a valid profile's row prints it (`agh whoami`, `agh auth status`):
-/// verbatim, unless it holds an all-hex run of `TOKEN_FLOOR` bytes or more, which a pasted
-/// unprefixed token would, and which the Redactor's shapes do not know; then each long run
-/// is `…`, as a fault shows it.
+/// An agh.toml value as a valid profile's row prints it (`agh whoami`, `agh auth status`).
 pub(crate) fn masked(text: &str) -> String {
     if has_hex_run(text) {
         mask_long_words(text)
@@ -504,7 +462,7 @@ pub(crate) fn masked(text: &str) -> String {
 }
 
 /// `[A-Za-z_][A-Za-z0-9_]{0,63}` with no all-hex run of `TOKEN_FLOOR` bytes or more: what a
-/// profile's `env` may name (L1). A pasted token is no variable's name.
+/// profile's `env` may name (L1).
 fn is_env_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     (1..=64).contains(&bytes.len())
@@ -583,7 +541,6 @@ impl Rows<'_> {
                     "L1",
                     format!("profile {name}: token_file must be absolute or start with ~/"),
                 ),
-                // The value is never quoted: a token pasted here is what the rule catches.
                 (None, Some(var)) if !is_env_name(var) => faults.push(
                     "L1",
                     format!("profile {name}: env must name an environment variable"),
@@ -946,9 +903,7 @@ impl Rows<'_> {
 }
 
 /// L1 (references and values) to L10, every fault at once, in rule order.
-///
 /// # Errors
-///
 /// The faults.
 pub fn validate(
     config: &AghConfig,
@@ -1003,14 +958,9 @@ pub fn expand(path: &str, home: &Path) -> Option<PathBuf> {
     path.is_absolute().then(|| path.to_path_buf())
 }
 
-/// Read and validate `<dirs.config>/agh.toml`. No file → `Ok(None)`. Off unix → `Ok(None)`.
-///
+/// Read and validate `<dirs.config>/agh.toml`.
 /// # Errors
-///
-/// Refused, `Sub::Policy(RefusalCode::ConfigInvalid)`: for a file `read_private` refuses (why
-/// `agh.toml: {error}`, next the chmod remedy in `LoadError::remedy`'s form); for non-UTF-8
-/// (why `agh.toml is not UTF-8`); for faults (why `agh.toml breaks {n} rule(s): {rule}:
-/// {what}; …`, next `agh policy check`).
+/// Refused, `Sub::Policy(RefusalCode::ConfigInvalid)`.
 pub fn load(dirs: &Dirs) -> Result<Option<Validated>> {
     #[cfg(unix)]
     {
@@ -1018,7 +968,6 @@ pub fn load(dirs: &Dirs) -> Result<Option<Validated>> {
     }
     #[cfg(not(unix))]
     {
-        // No permission check off unix: agh.toml is ignored and every read is anonymous.
         let _ = dirs;
         Ok(None)
     }
@@ -1057,8 +1006,7 @@ fn load_private(dirs: &Dirs) -> Result<Option<Validated>> {
 /// The verb that prints every fault of agh.toml: the next of each refusal of the file.
 pub(crate) const POLICY_CHECK: &str = "agh policy check";
 
-/// Refused, `Sub::Policy(RefusalCode::ConfigInvalid)`, with `why` and `next`: how the client,
-/// `auth add`/`remove` and `auth status` refuse an agh.toml.
+/// Refused, `Sub::Policy(RefusalCode::ConfigInvalid)`, with `why` and `next`.
 pub(crate) fn invalid(why: String, next: impl Into<String>) -> crate::error::Error {
     crate::policy::Refusal {
         code: crate::policy::RefusalCode::ConfigInvalid,
@@ -1069,23 +1017,19 @@ pub(crate) fn invalid(why: String, next: impl Into<String>) -> crate::error::Err
     .into_error(None)
 }
 
-/// What reading an agh.toml found. `load` and `agh policy check` share it. Unix only: off
-/// unix there is no permission check, so agh never reads agh.toml there (design §6.6: every
-/// read is anonymous).
+/// What reading an agh.toml found.
 #[cfg(unix)]
 pub(crate) enum ConfigText {
     /// No such file.
     Missing,
-    /// `read_private` refused the file: its error, and the remedy when there is one (the
-    /// chmods that make it private, or the link to replace).
+    /// `read_private` refused the file: its error, and the remedy when there is one.
     Refused {
         /// `PrivateFileError`'s text.
         error: String,
         /// What a person runs.
         remedy: Option<String>,
     },
-    /// The file could not be read (`PrivateFileError::Io`): its text. No refusal of the file,
-    /// so provisioning answers it as CouldNotRun; load and the checks report it as a refusal.
+    /// The file could not be read (`PrivateFileError::Io`): its text.
     Io(String),
     /// The bytes are not UTF-8.
     NotUtf8,
@@ -1140,9 +1084,7 @@ pub(crate) fn judge(text: &str, home: &Path) -> Judgement {
     }
 }
 
-/// What a read of agh.toml found, as the checks report it (`policy check`, `auth status`):
-/// `None` for no file; else [`judge`]'s answer, where a file `read_private` refuses or cannot
-/// read is one fault, rule `file` (`{error}; remedy: {remedy}`), and non-UTF-8 bytes are L1.
+/// What a read of agh.toml found, as the checks report it (`policy check`, `auth status`).
 #[cfg(unix)]
 pub(crate) fn faults_of(read: ConfigText, home: &Path) -> Option<Judgement> {
     let fault = |rule, what| Some(Judgement::faults(vec![ConfigFault { rule, what }]));
@@ -1174,19 +1116,13 @@ impl ConfigFault {
     }
 }
 
-/// `name` in the agh directory `dir` (`Dirs::config`), by [`read_config_in`]'s rules: the
-/// crate-private contract `auth status` calls (plan §16.5).
+/// `name` in the agh directory `dir` (`Dirs::config`), by [`read_config_in`]'s rules.
 #[cfg(unix)]
 pub(crate) fn read_config(dir: &Path, name: &str, home: &Path) -> ConfigText {
     read_config_in(dir, name, home, Some(dir))
 }
 
-/// `name` in `dir`, read with `read_private` (at most `CONFIG_MAX` bytes); remedies write
-/// paths under `home` as `~/…`. `agh_dir` is `Dirs::config` when the caller has one: the
-/// remedy never narrows its parent or grandparent (design §6.2). When `dir` is `agh_dir`,
-/// the one place agh reads agh.toml from, a remedy never names `--config`; else (`policy
-/// check --config PATH`) it names `agh_dir` as the place to keep the file when no chmod of
-/// this user's lifts the refusal.
+/// `name` in `dir`, read with `read_private`; remedies write paths under `home` as `~/…`.
 #[cfg(unix)]
 pub(crate) fn read_config_in(
     dir: &Path,
@@ -1224,11 +1160,7 @@ pub(crate) fn read_config_in(
 }
 
 /// The agh.toml remedy when no chmod of this user's lifts the refusal (the directory is
-/// another user's, or one agh never narrows). In the agh directory itself, which agh reads
-/// agh.toml from and nowhere else, the way out is that directory made the person's own and
-/// private: its owner gives it back, or the aterm config directory moves (XDG_CONFIG_HOME).
-/// For any other file (`policy check --config PATH`), keep it in a private directory of the
-/// person's own, the agh directory when the caller has one.
+/// another user's, or one agh never narrows).
 #[cfg(unix)]
 fn keep_elsewhere(dir: &Path, name: &str, home: &Path, held: crate::identity::Held<'_>) -> String {
     use crate::identity::{Held, tilde};
@@ -1267,7 +1199,7 @@ fn keep_elsewhere(dir: &Path, name: &str, home: &Path, held: crate::identity::He
 }
 
 /// Tests of the crate-private readers: `Dirs::of`'s roots and `read_config_in`'s remedies for
-/// a directory no chmod of this user's changes. In the crate, because the readers are private.
+/// a directory no chmod of this user's changes.
 #[cfg(all(test, unix))]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -1291,8 +1223,7 @@ mod tests {
 
     /// A system directory that is root's (`/private/etc` on macOS, where `/etc` is root's link
     /// to it; `/etc` elsewhere), read as the agh directory itself: the remedy names no
-    /// `--config`, which no routed verb takes and which changes no file that routes. Skipped
-    /// under uid 0, which owns them.
+    /// `--config`, which no routed verb takes and which changes no file that routes.
     #[test]
     fn another_users_agh_directory_names_no_config_flag() {
         if aterm_uds::peer::our_uid() == 0 {

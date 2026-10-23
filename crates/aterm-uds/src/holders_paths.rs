@@ -2001,6 +2001,31 @@ mod tests {
         (master, PathBuf::from(slave))
     }
 
+    /// A PTY's master is named from its slave's number ([`super::super::pty_master_rdev`],
+    /// what a process's `e_tdev` gives), and a scan of that number finds this process, which
+    /// holds the master. NEGATIVE CONTROL: the slave's own number is another device, so a
+    /// mapping that handed it back unchanged (a scan of the slave) fails the first assertion.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_ptys_master_is_named_from_its_slave() {
+        use std::os::unix::fs::MetadataExt as _;
+        const DEV: u64 = 0xffff_ffff;
+        let me = std::process::id();
+        let (master, slave) = a_pty();
+        let slave_rdev = std::fs::metadata(&slave).expect("stat the slave").rdev() & DEV;
+        let master_rdev = std::fs::File::from(master.try_clone().expect("dup"))
+            .metadata()
+            .expect("fstat the master")
+            .rdev()
+            & DEV;
+        let named = super::super::pty_master_rdev(slave_rdev).expect("/dev/ptmx reads");
+        let held = super::super::scan_rdev_holders(named, &[]).expect("scan");
+        drop(master);
+        assert_eq!(named, master_rdev, "the master's number, from the slave's");
+        assert_ne!(slave_rdev, master_rdev, "the slave is another device");
+        assert!(held.holds(me), "this process holds the master: {held:?}");
+    }
+
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_descriptor_on_a_revoked_terminal_holds_nothing() {

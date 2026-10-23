@@ -1,61 +1,14 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! WHICH BUILD A RUNNING IMAGE IS (`docs/DESIGN-card-engine-2026-10-19.md` §3.2), from
-//! the executable the kernel mapped for it (`proc_pidpath` on macOS, `/proc/<pid>/exe` on
-//! Linux, both canonical) and, for a script shell only, its first argument. Never from a
-//! file the program writes about itself at its own pace: the terminal names a Claude Code
-//! build at its exec, at least 225 ms before the program draws, where the vendor's
-//! registry row lands 15-30 ms after its first frame on the inline renderer (measured
-//! 2026-10-19).
-//!
-//! The answer ([`ImageBuild`]) is one of five sources ([`ImageSource`]):
-//!
-//! * **Store** — a vendor build in the managed store: `<prefix>/store/<program>/<id>/…`
-//!   with `<id>` a vendor build id, which IS its version ([`Version::from_build_id`]).
-//!   The match is anchored at `<prefix>/store` ([`crate::ops::store_build_of`]) with the
-//!   prefix canonicalized once per [`ImageRoots`], and every component past the anchor
-//!   must be a plain name: `/x/src/store/claude/<id>/bin/claude` (a dev checkout) and a
-//!   `..` escape are not the store, where the unanchored
-//!   [`crate::ops::program_build_of_target`] would say they are.
-//! * **StoreRecord** — an ALab index build in the managed store (an id below
-//!   [`crate::vendor_direct::VENDOR_BUILD_BASE`]): its version is what aterm's own record
-//!   says, read once per image. The record is the program's stamp
-//!   ([`crate::vendor_direct::ProgramStamp::legacy_version_of`], read from the build's
-//!   signed manifest by the vendor lane); a build with no record is Unknown.
-//! * **Native** — the vendor's own installer's `…/<tool>/versions/<x.y.z>`, the file named
-//!   by its version ([`Version::parse`]). Linux's ` (deleted)` suffix (an image unlinked
-//!   while it runs, which a self-updater does) is stripped first.
-//! * **Launcher** — atpkg's own shim before its `exec`: an interpreter in
-//!   [`SCRIPT_SHELLS`] whose first argument is a script directly in the managed prefix's
-//!   `agents/`, `bin/` or `reroute/`. A user's `sh ~/bin/claude` is not one: it stays
-//!   the shell it is, as `aterm-gui`'s program naming rules.
-//! * **Unknown** — everything else: an npm or bun `node`, a brew cask, an `aterm pkg link`
-//!   checkout, an image that could not be read. Its program is the executable's name,
-//!   and it names no build.
-//!
-//! [`image_build`] does the one read a StoreRecord needs; [`image_build_with`] takes it as
-//! a parameter. [`ImageRoots`] caches the prefix and known shim-directory spellings. A
-//! script spelled through another path to a shim directory (a symlinked prefix) is
-//! resolved only for an absolute first argument whose name is an entry of one of those
-//! directories. This skips parent resolution for names absent there. A matching name
-//! still canonicalizes the supplied parent, including a network path; these filesystem
-//! reads can block and describe the paths only when read. Injecting the StoreRecord reader
-//! does not replace them.
-//!
-//! A Store build needs no record cross-check: [`crate::vendor_direct::read_record`] already
-//! refuses a record whose version's build id is not its directory's, and the directory's
-//! id IS the version here.
+//! Process executable image classification (`Store`, `StoreRecord`, `Native`, `Launcher`, `Unknown`).
 
 use std::path::{Component, Path, PathBuf};
 
 use crate::store::Layout;
 use crate::vendor_direct::{VENDOR_BUILD_BASE, Version};
 
-/// The interpreters an agent's shim script runs under (`#!/bin/sh`), whose first argument
-/// then names the script: a process whose executable is one of these and whose first
-/// argument is atpkg's own shim is that shim, before its `exec` ([`ImageSource::Launcher`];
-/// `aterm-gui`'s `session_program::program_from_argv` names it as its agent).
+/// Shell interpreter basenames under which an agent shim script's `argv[1]` names the script.
 pub const SCRIPT_SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "ksh"];
 
 /// The longest program name an [`ImageBuild`] keeps, in bytes.
@@ -65,23 +18,23 @@ const PROGRAM_MAX: usize = 64;
 const DELETED_SUFFIX: &str = " (deleted)";
 
 /// Where an image's build came from: what a reader of [`ImageBuild::build`] may trust it
-/// for. Module docs: one rule per source.
+/// for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ImageSource {
-    /// A vendor build in the managed store; its directory names its version.
+    /// Vendor build in the managed store (`<prefix>/store/<program>/<id>/…`).
     Store,
-    /// An ALab index build in the managed store, its version from aterm's own record.
+    /// ALab index build in the managed store resolved from aterm's vendor stamp.
     StoreRecord,
-    /// The vendor installer's `…/<tool>/versions/<x.y.z>`.
+    /// Vendor installer build (`…/<tool>/versions/<x.y.z>`).
     Native,
-    /// atpkg's own shim script before its `exec`; no build.
+    /// atpkg shim script prior to `exec` (no resolved build).
     Launcher,
-    /// Anything else; no build.
+    /// Unrecognized executable path (no resolved build).
     Unknown,
 }
 
 impl ImageSource {
-    /// The word a log or timeline row prints.
+    /// Wire and log token for this source.
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
@@ -94,14 +47,12 @@ impl ImageSource {
     }
 }
 
-/// A program's name as an image spells it: a store directory, a native installer's tool
-/// directory, a shim's file name or an executable's: `[A-Za-z0-9._+-]`, at most
-/// [`PROGRAM_MAX`] bytes, never empty.
+/// Validated ASCII lowercase/digit/`-`/`_` program identifier.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ProgramTag(Box<str>);
 
 impl ProgramTag {
-    /// `name` as a tag, or `None` when it is empty, too long or holds anything else.
+    /// Validate `name` as a [`ProgramTag`].
     #[must_use]
     pub fn new(name: &str) -> Option<Self> {
         let ok = !name.is_empty()
@@ -112,33 +63,32 @@ impl ProgramTag {
         ok.then(|| Self(name.into()))
     }
 
-    /// The name.
+    /// Program name as a string slice.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-/// Which program and build an image is ([`image_build`]).
+/// Classified program tag, vendor build ID, and provenance of a process image.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ImageBuild {
-    /// The program, where the image names one.
+    /// Program tag, if identified.
     pub program: Option<ProgramTag>,
-    /// The vendor build id of its version ([`Version::build_id`]); `0` names none.
+    /// Vendor build ID (`0` when unknown).
     pub build: u64,
-    /// Where `build` came from.
+    /// Provenance of `build`.
     pub source: ImageSource,
 }
 
 impl ImageBuild {
-    /// The version `build` names, or `None` when it names none.
+    /// Decoded [`Version`] for `build`, or `None` when `build == 0`.
     #[must_use]
     pub const fn version(&self) -> Option<Version> {
         Version::from_build_id(self.build)
     }
 
-    /// An Unknown image: `program` (or nothing, for an image that could not be read) and
-    /// no build.
+    /// Construct an [`ImageSource::Unknown`] classification with `build = 0`.
     #[must_use]
     pub fn unknown(program: Option<ProgramTag>) -> Self {
         Self {
@@ -149,10 +99,7 @@ impl ImageBuild {
     }
 }
 
-/// The managed prefix's directories an image is classified against, each spelled as the
-/// layout names it and as the file system resolves it, canonicalized ONCE here: a process
-/// that reads many images (the terminal's PTY readers, one per foreground edge) keeps one
-/// of these per layout instead of resolving the prefix per image.
+/// Canonicalized and literal managed-prefix and shim directories for image classification.
 #[derive(Clone, Debug)]
 pub struct ImageRoots {
     layout: Layout,
@@ -163,8 +110,7 @@ pub struct ImageRoots {
 }
 
 impl ImageRoots {
-    /// The roots of `layout`. A prefix that does not resolve (not laid yet) is kept as
-    /// spelled, and only an image under that spelling can be its store's.
+    /// Resolve and cache the store prefix and shim directories from `layout`.
     #[must_use]
     pub fn new(layout: &Layout) -> Self {
         let prefix =
@@ -190,21 +136,14 @@ impl ImageRoots {
         }
     }
 
-    /// The layout these roots were made of.
+    /// Underlying package manager [`Layout`].
     #[must_use]
     pub fn layout(&self) -> &Layout {
         &self.layout
     }
 
     /// Whether `script` is a file DIRECTLY in `agents/`, `bin/` or `reroute/`, its
-    /// directory as spelled or as resolved. A deeper directory or a sibling never counts.
-    ///
-    /// Only an absolute path names the file the shell ran: a relative one would resolve
-    /// against this process's directory, not the shell's. A parent spelled as none of the
-    /// roots is resolved only when a shim directory holds an entry of the script's name
-    /// (one `lstat` inside the prefix per directory). An absent name skips resolution;
-    /// a matching name still canonicalizes that parent, including a network path. This
-    /// prefilter does not bound the filesystem calls or guard concurrent path changes.
+    /// directory as spelled or as resolved.
     fn holds_shim(&self, script: &Path) -> bool {
         if !script.is_absolute() {
             return false;
@@ -223,11 +162,7 @@ impl ImageRoots {
     }
 }
 
-/// THE CLASSIFIER, with the one file it may read for a StoreRecord: `program`'s stamp in
-/// `roots`' layout ([`crate::vendor_direct::ProgramStamp::legacy_version_of`]). `exe` is
-/// the image the kernel mapped (canonical), `argv1` the first argument, read only for a
-/// script shell (`None` otherwise). `roots` is `None` where no managed prefix resolves:
-/// then nothing is Store, StoreRecord or Launcher.
+/// Classify `exe` (and `argv1` for a script shell) against `roots` and the layout's vendor stamps.
 #[must_use]
 pub fn image_build(roots: Option<&ImageRoots>, exe: &Path, argv1: Option<&Path>) -> ImageBuild {
     image_build_with(roots, exe, argv1, &|program, build| {
@@ -236,10 +171,7 @@ pub fn image_build(roots: Option<&ImageRoots>, exe: &Path, argv1: Option<&Path>)
     })
 }
 
-/// [`image_build`] with the StoreRecord read as a parameter: `record(program, build)` is
-/// the version aterm's record gives index build `build` of `program`, asked at most once.
-/// This replaces the stamp read, not the shim-parent resolution described in the module
-/// documentation.
+/// Classify `exe` using `record` to resolve `StoreRecord` versions.
 #[must_use]
 pub fn image_build_with(
     roots: Option<&ImageRoots>,
@@ -251,8 +183,7 @@ pub fn image_build_with(
 }
 
 /// What decides that a path is a managed store's build: `(prefix, exe)` to
-/// `(program, build)`. [`anchored_store_build`] in the product; the tests' control
-/// swaps in the unanchored parser to show the anchor is load-bearing.
+/// `(program, build)`.
 type StoreMatch = fn(&Path, &Path) -> Option<(String, u64)>;
 
 fn classify(
@@ -264,7 +195,6 @@ fn classify(
 ) -> ImageBuild {
     let exe = strip_deleted(exe);
     let name = exe.file_name().and_then(|n| n.to_str());
-    // A script shell: atpkg's own shim, or the shell it is.
     if let Some(shell) = name.filter(|n| SCRIPT_SHELLS.contains(n)) {
         let shim = roots.zip(argv1).and_then(|(roots, script)| {
             let text = script.to_str()?;
@@ -313,8 +243,7 @@ fn classify(
     ImageBuild::unknown(name.and_then(ProgramTag::new))
 }
 
-/// `exe` without Linux's ` (deleted)` suffix: the image the process runs, which a
-/// self-updater unlinking it does not change.
+/// Strip Linux's `" (deleted)"` suffix from `/proc/<pid>/exe` paths.
 #[must_use]
 pub fn strip_deleted(exe: &Path) -> &Path {
     exe.to_str()
@@ -526,9 +455,7 @@ mod tests {
             .collect()
     }
 
-    /// THE TABLE (§7). NEGATIVE CONTROL: the same table through the UNANCHORED store
-    /// parser ([`crate::ops::program_build_of_target`], the mutant the anchor exists to
-    /// refuse) misclassifies the dev checkout's path and the `..` escape as store builds.
+    /// THE TABLE (§7).
     #[test]
     fn the_image_table_names_each_build_by_its_source() {
         let l = crate::testdir::layout("atpkg-image-table-");
@@ -565,8 +492,7 @@ mod tests {
 
     /// A shim directory reached through a symlinked prefix (macOS's `/tmp` →
     /// `/private/tmp`) is the same directory: the script is spelled through the link,
-    /// the roots resolve it. NEGATIVE CONTROLS: a name no shim directory holds is never
-    /// resolved, however its parent resolves, and a relative script names no file.
+    /// the roots resolve it.
     #[cfg(unix)]
     #[test]
     fn a_shim_spelled_through_a_link_is_a_launcher() {
@@ -592,8 +518,6 @@ mod tests {
             unknown("sh"),
             "no shim of that name: the parent is never resolved"
         );
-        // A relative script names no file the shell ran, even spelled as a
-        // (relative) layout's shim directory is.
         let relative = ImageRoots::new(&Layout {
             prefix: PathBuf::from("rel/pkg"),
         });

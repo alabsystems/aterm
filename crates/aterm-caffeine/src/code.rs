@@ -1,46 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The bundle copy the mug runs from (see the crate docs, "Where it runs"): `serve` started
-//! from `X.app/Contents/MacOS/aterm` copies `X.app` whole into
-//! [`crate::paths::Paths::code_dir`] and re-executes from the copy with [`ORIGIN_ENV`] naming
-//! where it started, so LaunchServices never takes the mug for the app an open of `X.app`
-//! names. The model is `aterm_keeper::code` (the keeper runs from its own copy for another
-//! reason); this one is simpler, as one mug runs at a time.
-//!
-//! The copy is `<code dir>/<label>/<id>/X.app`, its `<id>` the serve's pid and the time it
-//! was made, made as `<id>.partial` and renamed whole, so a half-made copy is never run. Only
-//! the holder of the one-mug lock ([`crate::instance`]) makes one, so it removes everything
-//! else in the directory first: an earlier copy, a half made one, another build's. Files are
-//! copied with `std::fs::copy` (an APFS clone, the mode kept), symbolic links recreated as
-//! they read, and anything else refused, so the bundle's signature still seals the copy.
-//!
-//! A copy goes only once it RAN. The re-exec is the copy's first exec, which macOS assesses
-//! after the exec while the process waits at `_dyld_start`; killing the process (`quit`'s
-//! bootout) does not end the assessment, and on macOS 27.0.1 `syspolicyd` crashes when the file
-//! is removed before it ends, stranding every exec on the host. So a mug running from its copy
-//! writes [`RAN`] into it first thing ([`mark_ran`]), and a copy without it stays until the
-//! first-exec hang has passed since its exec, on the awake clock (the re-exec stamps it,
-//! [`aterm_uds::deadline::stamp_exec`]; [`sweep`]); each copy has an `<id>` of its own so a
-//! kept one never stands in the next one's way.
+//! The bundle copy the mug runs from (see the crate docs, "Where it runs").
 
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// The variable naming the executable the mug was started as, set when it re-executes from
-/// its copy: the job, its label and the update watch are that executable's.
+/// The variable naming the executable the mug was started as, set when it re-executes from its copy.
 pub const ORIGIN_ENV: &str = "ATERM_CAFFEINE_ORIGIN";
 
-/// The largest `Info.plist` read: aterm's is a few KiB.
 const PLIST_CAP: u64 = 1 << 20;
 
-/// The file a mug running from its copy writes into the copy's directory first thing
-/// ([`mark_ran`]): the copy's exec is over, so it may go ([`sweep`]).
+/// The file a mug running from its copy writes into the copy's directory first thing ([`mark_ran`]).
 pub const RAN: &str = aterm_uds::deadline::RAN;
 
-/// Say, in the directory of the copy under `code_dir` this process runs from
-/// (`<code dir>/<label>/<id>`), that it runs from it. Best effort: a copy without it is kept
-/// for the first-exec hang, never removed early.
+/// Say, in the directory of the copy under `code_dir` this process runs from (`<code dir>/<label>/<id>`), that it runs from it.
 pub fn mark_ran(code_dir: &Path) {
     let (Some(exe), Ok(dir)) = (own_exe(), code_dir.canonicalize()) else {
         return;
@@ -61,8 +35,7 @@ pub fn mark_ran(code_dir: &Path) {
     }
 }
 
-/// The `.app` bundle `exe` is the main executable of (`X.app/Contents/MacOS/<exe>`), if it is
-/// one.
+/// The `.app` bundle `exe` is the main executable of (`X.app/Contents/MacOS/<exe>`), if it is one.
 #[must_use]
 pub fn own_bundle(exe: &Path) -> Option<PathBuf> {
     let macos = exe.parent()?;
@@ -74,15 +47,11 @@ pub fn own_bundle(exe: &Path) -> Option<PathBuf> {
     is_bundle.then(|| bundle.to_path_buf())
 }
 
-/// This process's executable, canonical.
 fn own_exe() -> Option<PathBuf> {
     std::env::current_exe().ok()?.canonicalize().ok()
 }
 
-/// The executable the mug was started as: [`ORIGIN_ENV`] when this process runs from a copy
-/// under `code_dir`, else this process's own (canonical). `None` when it runs from a copy and
-/// [`ORIGIN_ENV`] names no absolute path (nothing says whose job it is), or this process's
-/// path cannot be read.
+/// The executable the mug was started as.
 #[must_use]
 pub fn origin_exe(code_dir: &Path) -> Option<PathBuf> {
     if runs_from_copy(code_dir) {
@@ -103,26 +72,15 @@ pub fn runs_from_copy(code_dir: &Path) -> bool {
     }
 }
 
-/// Whether `exe` is inside `dir` (both canonical), not `dir` itself.
 fn is_under(exe: &Path, dir: &Path) -> bool {
     exe.strip_prefix(dir)
         .is_ok_and(|rest| rest.components().next().is_some())
 }
 
-/// Copy the bundle `origin` belongs to into `code_dir` (replacing an earlier copy for
-/// `label`) and return the copy's executable; `Ok(None)` when `origin` is not in a bundle
-/// (a build tree's executable runs where it is).
-///
-/// Only the holder of the one-mug lock calls this: it removes everything else in `code_dir`
-/// first, and makes `code_dir` (`0700`) when it is missing. A bare `origin` sweeps it as well
-/// ([`discard_copies`]: a copy an earlier mug left, kept while macOS may still be assessing it,
-/// goes once it may), said on stderr when that fails, and makes nothing.
+/// Copy the bundle `origin` belongs to into `code_dir` (replacing an earlier copy for `label`) and return the copy's executable.
 ///
 /// # Errors
-///
-/// The copy cannot be made: `label` is not a plain name, `code_dir` is not a directory of
-/// this user's, an entry in it cannot be removed, or the bundle holds something other than
-/// files, directories and links, or cannot be read.
+/// The copy cannot be made.
 pub fn prepare_copy(origin: &Path, code_dir: &Path, label: &str) -> io::Result<Option<PathBuf>> {
     let Some(bundle) = own_bundle(origin) else {
         #[cfg(unix)]
@@ -145,7 +103,6 @@ pub fn prepare_copy(origin: &Path, code_dir: &Path, label: &str) -> io::Result<O
     }
 }
 
-/// Whether `label` can name an entry of the code directory: one plain path component.
 #[cfg(unix)]
 fn plain_name(label: &str) -> bool {
     !label.is_empty()
@@ -198,7 +155,6 @@ fn copy_bundle(origin: &Path, bundle: &Path, code_dir: &Path, label: &str) -> io
         .and_then(|()| std::fs::rename(&partial, &home));
     if let Err(e) = made {
         let _ = std::fs::remove_dir_all(&partial);
-        // The label's directory goes with it when it holds nothing else (a kept copy stays).
         let _ = std::fs::remove_dir(&slot);
         return Err(io::Error::new(
             e.kind(),
@@ -212,8 +168,6 @@ fn copy_bundle(origin: &Path, bundle: &Path, code_dir: &Path, label: &str) -> io
     Ok(home.join(inner))
 }
 
-/// Make `dir` (and its parents) when missing, and hold it to `0700`; refuse a link, a
-/// non-directory or another user's directory at its name, before anything in it is swept.
 #[cfg(unix)]
 fn private_dir(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
@@ -242,31 +196,21 @@ fn private_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// The attribute Time Machine (and every backup tool that keeps the convention) reads to
-/// leave an item out.
 #[cfg(target_os = "macos")]
 const BACKUP_EXCLUDE: &std::ffi::CStr = c"com.apple.metadata:com_apple_backup_excludeItem";
 
-/// Its value: `true` as a binary plist (header, the `true` marker, the offset table and the
-/// trailer), atpkg's bytes for its store.
 #[cfg(target_os = "macos")]
 const TRUE_BPLIST: &[u8] = &[
-    0x62, 0x70, 0x6c, 0x69, 0x73, 0x74, 0x30, 0x30, // "bplist00"
-    0x09, // kCFBinaryPlistMarkerTrue
-    0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x09,
+    0x62, 0x70, 0x6c, 0x69, 0x73, 0x74, 0x30, 0x30, 0x09, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09,
 ];
 
-/// Whether `dir` carries [`BACKUP_EXCLUDE`] set to [`TRUE_BPLIST`].
 #[cfg(target_os = "macos")]
-// Skip: bottoms out at the `getxattr` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
 fn backup_excluded(dir: &std::ffi::CStr) -> bool {
     let mut have = [0u8; 64];
-    // SAFETY: `dir` and the name are NUL-terminated strings live for the call, and `have` is
-    // a writable buffer of the length passed; `getxattr` writes at most that many bytes and
-    // answers how many, or -1.
+    // SAFETY: `dir` and the name are NUL-terminated strings live for the call, and `have` is a writable buffer of the length passed.
     let n = unsafe {
         libc::getxattr(
             dir.as_ptr(),
@@ -280,13 +224,7 @@ fn backup_excluded(dir: &std::ffi::CStr) -> bool {
     usize::try_from(n).is_ok_and(|n| have.get(..n) == Some(TRUE_BPLIST))
 }
 
-/// Keep the code directory out of backups: every serve from a bundle makes its copy afresh,
-/// new files that a backup would copy again each time, of code rebuilt on demand (`.noindex`
-/// keeps Spotlight out, not Time Machine). Read before written, as atpkg does: writing the
-/// same value again still moves the directory's ctime. Best effort: a volume without
-/// extended attributes costs backup space and nothing else.
 #[cfg(target_os = "macos")]
-// Skip: bottoms out at the `setxattr` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
 fn exclude_from_backup(dir: &Path) {
     use std::os::unix::ffi::OsStrExt as _;
@@ -296,8 +234,7 @@ fn exclude_from_backup(dir: &Path) {
     if backup_excluded(&name) {
         return;
     }
-    // SAFETY: both strings are NUL-terminated and live for the call, and the value is a
-    // `'static` slice of the length passed; the answer is ignored (best effort, above).
+    // SAFETY: both strings are NUL-terminated and live for the call, and the value is a `'static` slice of the length passed.
     unsafe {
         libc::setxattr(
             name.as_ptr(),
@@ -310,15 +247,9 @@ fn exclude_from_backup(dir: &Path) {
     }
 }
 
-/// Remove `code_dir` and every copy in it that may go ([`sweep`]): a mug that ends takes its
-/// copy with it, since once an update retires the bundle it was cloned from, the copy's
-/// blocks are its own (about the app's size). Only the holder of the one-mug lock calls this.
-/// A missing `code_dir` is nothing to remove; a link, a non-directory or another user's
-/// directory at its name is refused and left as it is; a copy the sweep keeps keeps
-/// `code_dir` too.
+/// Remove `code_dir` and every copy in it that may go ([`sweep`]).
 ///
 /// # Errors
-///
 /// `code_dir` is not this user's directory, or an entry in it cannot be removed.
 #[cfg(unix)]
 pub fn discard_copies(code_dir: &Path) -> io::Result<()> {
@@ -341,27 +272,18 @@ pub fn discard_copies(code_dir: &Path) -> io::Result<()> {
     std::fs::remove_dir(code_dir)
 }
 
-/// How long [`serves_caffeine`] waits for `help caffeine`. The answer comes from a table, so
-/// the time is the exec of a new build (slowest on its first run, while macOS assesses it);
-/// the mug's menu waits meanwhile, and not knowing in time restarts as before.
 #[cfg(unix)]
 const PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Whether the executable `origin` still has the `caffeine` verb: `<origin> help caffeine`
-/// exits 0. `None` when that is unknown (it could not run, or did not answer in
-/// [`PROBE_WAIT`]); `Some(false)` when it ran and refused, as a build from before the verb
-/// does (it exits 2 on an unknown help topic).
+/// Whether the executable `origin` still has the `caffeine` verb.
 #[cfg(unix)]
 #[must_use]
-// Skip: spawns a child and waits on the wall clock.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn serves_caffeine(origin: &Path) -> Option<bool> {
     serves_caffeine_within(origin, PROBE_WAIT)
 }
 
-/// [`serves_caffeine`] waiting `wait` for the answer.
 #[cfg(unix)]
-// Skip: spawns a child and waits on the wall clock.
 #[cfg_attr(trust_verify, trust::skip)]
 fn serves_caffeine_within(origin: &Path, wait: std::time::Duration) -> Option<bool> {
     let out = aterm_uds::deadline::output_until(
@@ -369,14 +291,9 @@ fn serves_caffeine_within(origin: &Path, wait: std::time::Duration) -> Option<bo
         std::time::Instant::now() + wait,
     )
     .ok()?;
-    // A signal (no code) says nothing about the verb.
     out.status.code().map(|code| code == 0)
 }
 
-/// Remove every entry of the code directory `dir` at `now` but a copy that may still be under
-/// its first exec's assessment: a link or a file as itself, a label's directory once it holds
-/// nothing else, and in it every copy that may go ([`may_go`]) and every other entry. A copy
-/// kept is said on stderr.
 #[cfg(unix)]
 fn sweep(dir: &Path, now: std::time::SystemTime) -> io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
@@ -415,16 +332,11 @@ fn sweep(dir: &Path, now: std::time::SystemTime) -> io::Result<()> {
     Ok(())
 }
 
-/// Whether the copy at `home` (a label directory's entry) may go at `now`: it was never run
-/// (a half-made copy, `<id>.partial`, is renamed whole before its exec), a mug said it ran
-/// from it ([`RAN`]), or the first-exec hang has passed since its exec
-/// ([`aterm_uds::deadline::copy_may_go`]).
 #[cfg(unix)]
 fn may_go(home: &Path, now: std::time::SystemTime) -> bool {
     home.extension().is_some_and(|e| e == "partial") || aterm_uds::deadline::copy_may_go(home, now)
 }
 
-/// Remove `path`: a directory with all it holds, anything else as itself.
 #[cfg(unix)]
 fn remove_entry(path: &Path, dir: bool) -> io::Result<()> {
     let removed = if dir {
@@ -435,9 +347,6 @@ fn remove_entry(path: &Path, dir: bool) -> io::Result<()> {
     removed.map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))
 }
 
-/// Copy `src` to `dst`: directories recreated (their mode set once filled), symbolic links
-/// recreated as they read, files copied (a clone on APFS) with their mode; anything else is
-/// refused.
 #[cfg(unix)]
 fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
     let meta = std::fs::symlink_metadata(src)?;
@@ -461,17 +370,13 @@ fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
     }
 }
 
-/// The bundle identifier `bundle`'s `Contents/Info.plist` declares (`CFBundleIdentifier`, a
-/// `<string>`, its XML entities read); `None` when the file is missing, not an XML plist, or
-/// declares none.
+/// The bundle identifier `bundle`'s `Contents/Info.plist` declares (`CFBundleIdentifier`, a `<string>`, its XML entities read).
 #[must_use]
 pub fn bundle_identifier(bundle: &Path) -> Option<String> {
     let bytes = read_capped(&bundle.join("Contents").join("Info.plist"))?;
     plist_string(std::str::from_utf8(&bytes).ok()?, "CFBundleIdentifier")
 }
 
-/// The `<string>` value of `key` in a plist's text: the first `<key>` of that name, then (past
-/// whitespace) a `<string>` element. `None` for another kind of value or an empty one.
 fn plist_string(text: &str, key: &str) -> Option<String> {
     let tag = format!("<key>{key}</key>");
     let at = text.find(&tag)? + tag.len();
@@ -484,9 +389,7 @@ fn plist_string(text: &str, key: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-/// The `<string>` values of the `<array>` that is `key`'s value in a plist's text: the first
-/// `<key>` of that name, then (past whitespace) an array of strings only. `None` for another
-/// kind of value, or an array holding anything but strings.
+/// The `<string>` values of the `<array>` that is `key`'s value in a plist's text.
 #[must_use]
 pub(crate) fn plist_strings(text: &str, key: &str) -> Option<Vec<String>> {
     let tag = format!("<key>{key}</key>");
@@ -515,7 +418,6 @@ pub(crate) fn read_plist(path: &Path) -> Option<String> {
     String::from_utf8(read_capped(path)?).ok()
 }
 
-/// The five predefined XML entities, read; `&amp;` last, so `&amp;lt;` reads as `&lt;`.
 fn xml_unescape(text: &str) -> String {
     text.replace("&lt;", "<")
         .replace("&gt;", ">")
@@ -524,7 +426,6 @@ fn xml_unescape(text: &str) -> String {
         .replace("&amp;", "&")
 }
 
-/// The whole file at `path`, when it is at most [`PLIST_CAP`] bytes.
 fn read_capped(path: &Path) -> Option<Vec<u8>> {
     use std::io::Read as _;
     let mut bytes = Vec::new();
@@ -536,11 +437,7 @@ fn read_capped(path: &Path) -> Option<Vec<u8>> {
     (bytes.len() as u64 <= PLIST_CAP).then_some(bytes)
 }
 
-/// What the update watch compares to tell that the code the mug was started from changed: the
-/// origin bundle's `Contents/Info.plist` bytes (an update replaces the bundle, and its version
-/// with it), or for a bare executable its length and modification time in nanoseconds.
-/// `None` when it cannot be read (in the middle of an update's swap, say, or something other
-/// than a file is at a bare executable's path): no reading, no verdict.
+/// What the update watch compares to tell that the code the mug was started from changed.
 #[must_use]
 pub fn code_fingerprint(origin_exe: &Path) -> Option<Vec<u8>> {
     if let Some(bundle) = own_bundle(origin_exe) {
@@ -560,13 +457,8 @@ pub fn code_fingerprint(origin_exe: &Path) -> Option<Vec<u8>> {
     Some(print)
 }
 
-/// The command that becomes `copy` with this process's arguments (its `argv[0]` too) and
-/// [`ORIGIN_ENV`] naming `origin`, the copy's directory stamped for its exec
-/// ([`aterm_uds::deadline::stamp_exec`]).
 #[cfg(unix)]
 fn reexec_command(copy: &Path, origin: &Path) -> aterm_uds::spawnfd::Command {
-    // The copy's age, which a sweep reads when its mug ends before it says it ran, counts from
-    // this exec on the awake clock, not from the copy ([`sweep`]).
     if let Some(home) = own_bundle(copy).as_deref().and_then(Path::parent) {
         aterm_uds::deadline::stamp_exec(home);
     }
@@ -579,11 +471,7 @@ fn reexec_command(copy: &Path, origin: &Path) -> aterm_uds::spawnfd::Command {
     cmd
 }
 
-/// Become `copy` with this process's arguments and [`ORIGIN_ENV`] naming `origin`. Returns
-/// only the error of a failed `exec`, which leaves this process as it was.
-///
-/// The new image keeps the pid and the stdio (launchd's log) and nothing else: no lock goes
-/// with it, so it takes the one-mug lock afresh. [`reexec_holding`] hands the lock over.
+/// Become `copy` with this process's arguments and [`ORIGIN_ENV`] naming `origin`.
 #[must_use]
 pub fn reexec(copy: &Path, origin: &Path) -> io::Error {
     #[cfg(unix)]
@@ -597,10 +485,7 @@ pub fn reexec(copy: &Path, origin: &Path) -> io::Error {
     }
 }
 
-/// [`reexec`], handing `instance`'s lock to the new image on its stdin
-/// ([`crate::instance::Instance::handover`]) so no moment passes without it held; the copy
-/// takes it back with [`crate::instance::Instance::adopt`]. Returns only the error of a failed
-/// `exec` (this process then still holds the lock as it did).
+/// [`reexec`], handing `instance`'s lock to the new image on its stdin ([`crate::instance::Instance::handover`]) so no moment passes without it held.
 #[must_use]
 pub fn reexec_holding(
     copy: &Path,
@@ -680,8 +565,6 @@ mod tests {
         }
     }
 
-    /// A stand-in bundle: nested directories, an executable (0755), a read-only file (0444),
-    /// a relative symbolic link and an absolute one, and an `Info.plist`.
     #[cfg(unix)]
     fn stand_in_bundle(root: &Path, id: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
@@ -714,8 +597,6 @@ mod tests {
         app
     }
 
-    /// `a` and `b` hold the same tree: the same names, kinds, file bytes and modes, and link
-    /// targets.
     #[cfg(unix)]
     fn assert_same_tree(a: &Path, b: &Path) {
         use std::os::unix::fs::PermissionsExt as _;
@@ -754,7 +635,6 @@ mod tests {
         }
     }
 
-    /// The copy's home (`<code>/<label>/<id>`) of the executable `copy` names.
     #[cfg(unix)]
     fn home_of(code: &Path, copy: &Path) -> PathBuf {
         let rest = copy.strip_prefix(code).expect("under the code directory");
@@ -775,12 +655,8 @@ mod tests {
         let app = stand_in_bundle(root.path(), "com.example.fake");
         let origin = app.join("Contents").join("MacOS").join("aterm");
         let code = root.path().join("state").join("caffeine-code.noindex");
-        // A directory that exists with a looser mode is held to 0700.
         std::fs::create_dir_all(&code).expect("code");
         std::fs::set_permissions(&code, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        // Leftovers: earlier copies of this label and another build's (each run from), an
-        // older layout's half-made one, a stray file and a link (removed as itself, its target
-        // kept).
         let target = root.path().join("kept");
         std::fs::create_dir_all(&target).expect("target");
         for dir in ["lbl/1-1", "lbl/1-2.partial", "lbl.partial", "com.other/2-1"] {
@@ -810,7 +686,6 @@ mod tests {
         assert!(target.is_dir(), "a link's target is not swept");
         let mode = std::fs::metadata(&code).expect("meta").permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
-        // Kept out of backups: a copy made afresh at every serve is no backup's business.
         #[cfg(target_os = "macos")]
         {
             use std::os::unix::ffi::OsStrExt as _;
@@ -818,9 +693,6 @@ mod tests {
             assert!(backup_excluded(&name), "{}", code.display());
         }
 
-        // A COPY NO MUG SAID IT RAN FROM IS KEPT (r4g-4): its mug may have been killed in its
-        // first exec, which macOS may still be assessing. The next prepare makes its copy
-        // beside it, at an id of its own.
         std::fs::write(app.join("Contents").join("new.txt"), "new").expect("new");
         let again = prepare_copy(&origin, &code, "lbl")
             .expect("copy")
@@ -832,8 +704,6 @@ mod tests {
             "the unproven copy is kept"
         );
         assert_same_tree(&app, &next.join("Fake (dev).app"));
-        // NEGATIVE CONTROLS: once its mug said it ran, the next prepare replaces it; so it does
-        // a copy the first-exec hang has passed since.
         std::fs::write(home.join(RAN), "").expect("ran");
         let third = prepare_copy(&origin, &code, "lbl")
             .expect("copy")
@@ -870,8 +740,6 @@ mod tests {
         assert!(entries.is_empty(), "{entries:?}");
     }
 
-    /// A link at the code directory's name is refused before the sweep: what it points at
-    /// keeps every entry, and nothing is copied through it.
     #[cfg(unix)]
     #[test]
     fn a_link_at_the_code_directory_is_refused_before_anything_is_swept() {
@@ -895,19 +763,15 @@ mod tests {
             [std::ffi::OsString::from("file"), "keep".into()],
             "nothing swept"
         );
-        // A plain file at the name is refused the same way.
         let file = root.path().join("code-file");
         std::fs::write(&file, "x").expect("file");
         assert!(prepare_copy(&origin, &file, "lbl").is_err());
         assert_eq!(std::fs::read_to_string(&file).expect("read"), "x");
     }
 
-    /// The probe's answer is the exit status: 0 serves, any other code does not, and a program
-    /// that cannot run says nothing.
     #[cfg(unix)]
     #[test]
     fn the_probe_reads_the_verb_from_the_exit_status() {
-        // Each answers at once: the wait is only the hang detector.
         let hang = std::time::Duration::from_secs(60);
         assert_eq!(
             serves_caffeine_within(Path::new("/usr/bin/true"), hang),
@@ -924,10 +788,6 @@ mod tests {
         );
     }
 
-    /// An ended mug's copy goes whole once it said it ran from it, the directory with it;
-    /// nothing there is nothing to do, and a link at the name is refused with what it points at
-    /// untouched. NEGATIVE CONTROL: a copy no mug said it ran from stays, and the directory
-    /// with it, without an error.
     #[cfg(unix)]
     #[test]
     fn discarding_removes_the_copies_and_never_follows_a_link() {
@@ -965,10 +825,6 @@ mod tests {
         assert!(!code.exists(), "nothing is made for a bare executable");
     }
 
-    /// A bare executable's start still sweeps what an earlier mug left: a copy that ran goes
-    /// (another build's too), so the next start does remove a copy kept for its first exec once
-    /// it may go. NEGATIVE CONTROL: one no mug said it ran from, inside the first-exec hang,
-    /// stays, and its directory with it.
     #[cfg(unix)]
     #[test]
     fn a_bare_executables_start_sweeps_what_an_earlier_mug_left() {
@@ -1046,7 +902,6 @@ mod tests {
                 .as_deref(),
             Some("a<b>\"c'&lt;")
         );
-        // The first key of the name wins; another key's string is not it.
         assert_eq!(
             id("<key>CFBundleName</key><string>aterm</string>\
                 <key>CFBundleIdentifier</key><string>x.y</string>")
@@ -1105,7 +960,6 @@ mod tests {
         let origin = app.join("Contents").join("MacOS").join("aterm");
         let before = code_fingerprint(&origin).expect("print");
         assert_eq!(code_fingerprint(&origin), Some(before.clone()), "stable");
-        // A change elsewhere in the bundle, its executable's included, is not an update.
         std::fs::write(app.join("Contents").join("other"), "x").expect("other");
         std::fs::write(&origin, "#!/bin/sh\nexit 1\n").expect("exe");
         assert_eq!(code_fingerprint(&origin), Some(before.clone()));
@@ -1115,7 +969,6 @@ mod tests {
         std::fs::write(&plist, text).expect("plist");
         let after = code_fingerprint(&origin).expect("print");
         assert_ne!(after, before);
-        // Too long to be an Info.plist.
         std::fs::write(
             &plist,
             vec![b'x'; usize::try_from(PLIST_CAP).expect("cap") + 1],
@@ -1133,7 +986,6 @@ mod tests {
         std::fs::write(&bare, "three").expect("bare");
         let three = code_fingerprint(&bare).expect("print");
         assert_ne!(three, one, "the length changed");
-        // The same length written at another time is a rebuild too.
         let later = std::fs::metadata(&bare)
             .and_then(|m| m.modified())
             .expect("mtime")
@@ -1148,7 +1000,6 @@ mod tests {
             three,
             "the time changed"
         );
-        // A directory where the executable was is not one.
         std::fs::remove_file(&bare).expect("rm");
         std::fs::create_dir(&bare).expect("mkdir");
         assert_eq!(code_fingerprint(&bare), None);
@@ -1162,11 +1013,6 @@ mod tests {
         assert_eq!(origin_exe(root.path()), own_exe());
     }
 
-    /// The one-mug lock crosses the re-exec into the bundle copy: a process started from a
-    /// stand-in bundle (this test binary as its executable) takes the lock, copies the bundle,
-    /// and becomes the copy with the lock handed over on its stdin; the copy adopts it. The
-    /// same pid on both sides, the lock held by it after the exec, the variable consumed and
-    /// stdin back on `/dev/null`. No AppKit, no launchd.
     #[cfg(target_os = "macos")]
     mod handover {
         use std::path::{Path, PathBuf};
@@ -1175,12 +1021,8 @@ mod tests {
         use crate::code;
         use crate::instance::{self, Instance};
 
-        /// Set only in the child this module starts: the scratch directory it works in.
         const DIR_ENV: &str = "ATERM_CAFFEINE_TEST_HANDOVER_DIR";
 
-        /// The child's two halves, one test: inert in a normal run (no [`DIR_ENV`]). Started
-        /// from the stand-in bundle it takes the lock and re-executes from its copy with the
-        /// same arguments, so the copy runs this test again and adopts the lock.
         #[test]
         fn handover_child() {
             let Some(dir) = std::env::var_os(DIR_ENV).map(PathBuf::from) else {
@@ -1189,7 +1031,6 @@ mod tests {
             let lock = dir.join("caffeine.lock");
             let code_dir = dir.join("code");
             if code::runs_from_copy(&code_dir) {
-                // What `serve` does first from its copy.
                 code::mark_ran(&code_dir);
                 let origin = code::origin_exe(&code_dir);
                 let adopted = Instance::adopt(&lock);
@@ -1221,7 +1062,6 @@ mod tests {
                 let copy = code::prepare_copy(&me, &code_dir, "lbl")
                     .expect("copy")
                     .expect("a bundle");
-                // The negative control re-executes without handing the lock over.
                 let plain = std::fs::read_to_string(dir.join("mode")).is_ok_and(|m| m == "plain");
                 let failed = if plain {
                     code::reexec(&copy, &me)
@@ -1232,7 +1072,6 @@ mod tests {
             }
         }
 
-        /// A stand-in bundle whose executable is this test binary.
         fn stand_in(root: &Path) -> PathBuf {
             let macos = root.join("T.app").join("Contents").join("MacOS");
             std::fs::create_dir_all(&macos).expect("bundle");
@@ -1248,13 +1087,6 @@ mod tests {
             exe
         }
 
-        /// Run the child from a fresh stand-in bundle, in `mode`: its pid before the exec, the
-        /// copy's report, the stand-in's executable (canonical) and the scratch directory.
-        ///
-        /// Both executables the child runs are new copies of this test binary (the stand-in,
-        /// then the bundle copy it re-executes from), which macOS assesses at their first exec:
-        /// the scratch directory goes only once each wrote its file (`first`, `report`), and a
-        /// child killed before that leaves it in place ([`aterm_uds::deadline::KeptUntilRan`]).
         fn run_child(mode: &str) -> (String, String, PathBuf, aterm_uds::deadline::KeptUntilRan) {
             let mut root = aterm_uds::deadline::KeptUntilRan::new(
                 aterm_tempfile::tempdir().expect("tempdir").keep(),
@@ -1263,7 +1095,6 @@ mod tests {
             let work = root.path().join("work");
             std::fs::create_dir_all(&work).expect("work");
             std::fs::write(work.join("mode"), mode).expect("mode");
-            // A hang detector: the system's first-exec wait, once for each of the two copies.
             let out = aterm_uds::deadline::output_until(
                 aterm_uds::spawnfd::command(&exe)
                     .args([
@@ -1311,8 +1142,6 @@ mod tests {
                 )
             );
             let work = root.path().join("work");
-            // The copy is where prepare_copy put it, it said it ran from it (`code::mark_ran`
-            // found its own copy's home), and the lock went with the process.
             let copies: Vec<_> = std::fs::read_dir(work.join("code").join("lbl"))
                 .expect("the label's copies")
                 .map(|e| e.expect("entry").path())
@@ -1332,8 +1161,6 @@ mod tests {
             drop(root);
         }
 
-        /// Negative control: a re-exec that does not hand the lock over leaves the copy nothing to
-        /// adopt, and the lock free (the old image's descriptor closed at the exec).
         #[test]
         fn a_plain_reexec_carries_no_lock() {
             let (first, report, origin, root) = run_child("plain");

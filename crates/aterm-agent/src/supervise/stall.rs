@@ -2,44 +2,13 @@
 // Copyright 2026 Andrew Yates
 
 //! The supervisor's hold on a worker that has stopped reading its input.
-//!
-//! A frozen worker's screen keeps showing what it last drew and any key sent queues behind unread
-//! input, so waiting for a box to go would wait forever. The server dates every input byte;
-//! `status` reports `input=clear|pending|typeahead|stalled|stopped input_bytes=<n>
-//! input_wait_ms=<ms> fg_rss_mb=<n>` and, past its threshold, publishes `agent=wall:unresponsive`
-//! and an attention entry of its own. A key behind input unread for a second is still written
-//! (`OK … warn=input-unread`); only one behind a published stall or a stopped job is refused
-//! `ERR busy input-unread`.
-//!
-//! On `input=stalled|stopped` ([`Session::hold_for_stall`]) the loop unsets its
-//! own badge ([`Session::unset_if_ours`]), forgets the escalated box and the
-//! turn-end decision, presses nothing and journals `FROZEN …`. Any other word
-//! ([`Session::thaw`]) journals `THAWED …` and the point is decided afresh.
-//!
-//! The remedy ([`Session::stall_remedy`]): once `input=stalled` has stood `[harness]
-//! stall_term_after_s` (`0` never), with no person's input within `human_grace_s`, no other hand,
-//! and a host that relaunches the agent, the loop warns once per episode (`STALL-WARNED …`), or
-//! under `stall_term = true` sends `restart pid=<leader> if-stalled quiet=<grace>`. The server
-//! stamps the agent before it signals (so its exit reads as the restart), ends a program that
-//! survives `SIGTERM`, and applies its own fences; a server without the verb gets the bare
-//! `signal term`.
-//!
-//! [`Session::stall_step`] runs after every unlatched wait step
-//! ([`Session::wait_for_next`]); [`Session::stall_look`] runs while a stall is
-//! held or suspected ([`Session::stall_suspect`], set by a refused or warned
-//! key). Every `status` the loop reads is checked ([`Session::note_status`]);
-//! while a stall is in hand ([`Session::stall_in_hand`]) nothing is pressed,
-//! typed or badged ([`Session::withhold_badge`], [`WITHHELD`]).
-//! A host that does not measure input ([`Caps::input`]) costs at most one extra
-//! `status` per connection.
 
 use super::super::journal::{ATTENTION_SKIPPED, ESCALATED_BEHIND, FROZEN};
 use super::escalate::status_field;
 use super::*;
 use crate::harness::resume::{AfterRestart, RELAUNCH_WORDS, restart_command};
 
-/// A worker the server says is not reading its input: `status input=stalled|stopped` and the
-/// numbers beside it (`-` or absent is `None`).
+/// A worker the server says is not reading its input (`status input=stalled|stopped`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct WorkerStall {
     /// `stalled` (frozen) or `stopped` (a stopped job with input queued).
@@ -52,9 +21,7 @@ pub(super) struct WorkerStall {
     pub(super) rss_mb: Option<u64>,
 }
 
-/// What one `status` read said of the worker's input: its `input=` word,
-/// the stall when that word is one, and the fields the hold's remedy needs
-/// from the same read (`program=`, `human_ms=`, `hand=`).
+/// What one `status` read said of the worker's input and session state.
 pub(super) struct StallRead {
     word: String,
     stall: Option<WorkerStall>,
@@ -66,21 +33,15 @@ pub(super) struct StallRead {
     hand: Option<String>,
 }
 
-/// Why an ask is withheld while a stall is in hand: the attention word of an
-/// ask whose badge a stall in hand kept down ([`Session::withhold_badge`],
-/// [`ATTENTION_SKIPPED`] then this: no badge, so no person's wait) — a badge
-/// asking to answer a point no answer can reach is not raised; the server's
-/// own "frozen" entry stands instead.
+/// Attention reason when an ask's badge is withheld during a worker stall.
 pub(super) const WITHHELD: &str = "the same status says the worker is not reading its input";
 
-/// Whether a `status` reply carries a measured `input=` word. An absent field
-/// (an older aterm) and `input=-` (not macOS, not a tty) are both no.
+/// Whether a `status` reply carries a measured `input=` word.
 pub(super) fn publishes_input(status_stdout: &str) -> bool {
     status_field(status_stdout, "input").is_some()
 }
 
-/// The stall a `status` reply reports: `Some` for `input=stalled` and
-/// `input=stopped`, `None` for every other word and for a reply with none.
+/// Parses `WorkerStall` from a `status` reply for `input=stalled|stopped`.
 pub(super) fn worker_stall(status_stdout: &str) -> Option<WorkerStall> {
     let word = match status_field(status_stdout, "input")? {
         "stalled" => "stalled",
@@ -120,21 +81,14 @@ fn rss_text(mb: u64) -> String {
     format!("rss {}.{} GB", tenths / 10, tenths % 10)
 }
 
-/// THE EXPLICIT RESTART REFUSED FOR ANOTHER HAND ON THE SESSION, which the
-/// next read may lift: `restart unavailable: halted` (a hold),
-/// `driver-lease` or `driver-turn` (a driver's) — the server's
-/// `input_stall::host_hand_refusal`. Uncounted, as `busy` and `ERR halted`
-/// are: a short manager turn never ends a remedy for good (the review of
-/// 2026-10-16). Every other `restart unavailable` (not the host's
-/// agent, not relaunchable, not supervised) is the act's for good.
+/// Whether `restart unavailable` is a transient hand refusal (`halted`, `driver-lease`, `driver-turn`).
 pub(super) fn refusal_lifts(r: &CtlReply) -> bool {
     ["halted", "driver-lease", "driver-turn"]
         .iter()
         .any(|why| r.is_err(&format!("restart unavailable: {why}")))
 }
 
-/// A reply's one line for the journal: an `OK`'s first line, else its error
-/// (the server's `ERR …`, without the client's prefix).
+/// Formats a `CtlReply` as a single journal line.
 pub(super) fn reply_line(r: &CtlReply) -> String {
     if r.ok() {
         return r.stdout.lines().next().unwrap_or("OK").trim().to_string();
@@ -168,20 +122,7 @@ fn stall_facts(stall: &WorkerStall) -> String {
     }
 }
 
-/// The warning the remedy's bound gives by default, for the person ([`super::IdleHost::inform`]):
-/// the state on its first line (the record's title), what to do on the second:
-///
-/// ```text
-/// claude frozen: not reading input for 11m00s (1 B queued, rss 38.8 GB)
-/// aterm leaves it running — `aterm ctl @s-1 restart pid=4242 if-stalled` ends it, and aterm relaunches it on its conversation
-/// ```
-///
-/// `after` is decided by [`Session::after_restart`]: where
-/// the host carries the act, the explicit restart of the leader `pid`
-/// ([`crate::harness::resume::restart_command`]), with the host's relaunch
-/// ([`RELAUNCH_WORDS`]) only where that is promised; else `signal term` and
-/// the resume line, else `signal term` alone. `sid` is the session's own id
-/// where known.
+/// Builds the two-line frozen-worker warning text for the host.
 pub(super) fn frozen_warning_text(
     stall: &WorkerStall,
     program: &str,
@@ -208,7 +149,6 @@ pub(super) fn frozen_warning_text(
         }
         AfterRestart::Unknown | AfterRestart::Command(_) => {}
     }
-    // The loop's selector (`@s-1`) or a bare id: either names it once.
     let sid = sid.map_or("<sid>", |s| s.trim_start_matches('@'));
     let end = format!(
         "aterm leaves it running \u{2014} `aterm ctl @{sid} signal term` ends it (`signal kill` \
@@ -216,8 +156,6 @@ pub(super) fn frozen_warning_text(
     );
     let then = match after {
         AfterRestart::Unknown => String::new(),
-        // Whole or not at all (`crate::harness::resume::never_cut`): the line, else a shorter
-        // form, else none; a cut id names no conversation, or another's.
         AfterRestart::Command(line) => std::iter::once(line.clone())
             .chain(crate::harness::resume::shorter(line))
             .map(|l| format!(", then `{l}` resumes it"))
@@ -233,9 +171,7 @@ pub(super) fn frozen_warning_text(
 const NOTE_LINE_CHARS: usize = 240;
 
 impl<C: Ctl> Session<'_, C> {
-    /// Learns from every `status` reply the loop reads whether the host measures the worker's
-    /// input ([`publishes_input`]), and suspects a stall it reports that is not held yet
-    /// ([`Self::stall_suspect`]), so nothing acts on the screen that came with it.
+    /// Records input capability and stall suspicion from a `status` reply.
     pub(super) fn note_status(&mut self, args: &[&str], r: &CtlReply) {
         if args.first() == Some(&"status") && r.ok() {
             self.caps.input = Some(publishes_input(&r.stdout));
@@ -245,17 +181,12 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// Whether a `status` read since the look began reported a stall this watch does not hold
-    /// yet; if so the point on screen is not pressed, typed at, badged or asked about, since
-    /// nothing reaches a program that is not reading.
+    /// Whether a suspected stall is in hand while unattended and not yet held.
     pub(super) fn stall_in_hand(&self, review: &dyn Review) -> bool {
         review.unattended() && self.stall_suspect && self.stalled.is_none()
     }
 
-    /// Before the first step of [`Self::wait_for_next`]: a stall a `status`
-    /// read since the look reported — the read that kept an ask's badge down
-    /// ([`Self::withhold_badge`]) — is held now, a badge withdrawn before the
-    /// wait, never a step into it.
+    /// Holds a suspected stall before entering `wait_for_next`.
     pub(super) fn stall_before_wait(
         &mut self,
         seq: u64,
@@ -267,10 +198,7 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// Before an ask's badge goes up ([`Self::escalate`]): `true` when a stall
-    /// is in hand ([`Self::stall_in_hand`]), so no badge is raised; journaled
-    /// with [`WITHHELD`]. Reads `status` here for this alone, unless the host
-    /// measures nothing ([`Caps::input`]) or a stall is already suspected.
+    /// Withholds an ask badge when a worker stall is in hand.
     pub(super) fn withhold_badge(
         &mut self,
         seq: u64,
@@ -319,8 +247,7 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// One `status` read of the worker's input; `None` when the host does not
-    /// measure it (no reply it could give, no field, `input=-`).
+    /// Reads `status` once to inspect the worker's input state.
     pub(super) fn stall_probe(&mut self) -> Result<Option<StallRead>, Fail> {
         let r = self.call(&["status"])?;
         if self.unserved(&r) {
@@ -339,15 +266,7 @@ impl<C: Ctl> Session<'_, C> {
         }))
     }
 
-    /// A stall seen: hold. The loop's own point badge is unset (the server's
-    /// `aterm` entry says "frozen" over it, and would leave ours standing as
-    /// "answer this box" the moment it cleared), the escalated box and the
-    /// policy's due decision are forgotten, and the episode is journaled
-    /// `FROZEN …` ([`FROZEN`]). Nothing is pressed or typed here or while it
-    /// stands. The badge's end is that line's: its `attention=<reply>` is the
-    /// unset's, read back by the harness's stats as the end of the person's
-    /// wait the badge opened (no `CLEARED` line follows); behind another
-    /// supervisor it is [`ATTENTION_SKIPPED`]'s, nothing touched.
+    /// Enters the stall hold, unsetting our point badge and journaling `FROZEN`.
     pub(super) fn hold_for_stall(
         &mut self,
         read: StallRead,
@@ -389,8 +308,7 @@ impl<C: Ctl> Session<'_, C> {
         self.stall_remedy(&read_rest, seq, review)
     }
 
-    /// The stall is over (`status` reads another word, or no longer measures the input): journaled
-    /// `THAWED seq=<n> input=<w>`, and the handed point forgotten so the look decides it again.
+    /// Exits the stall hold, journaling `THAWED` and clearing the handed point.
     pub(super) fn thaw(
         &mut self,
         seq: u64,
@@ -408,18 +326,7 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// The stall's remedy (module header): once the held stall has stood
-    /// `[harness] stall_term_after_s` (`0` never), a warning by default
-    /// ([`frozen_warning_text`] to [`super::IdleHost::inform`]) or the
-    /// explicit restart under `stall_term = true` (`restart pid=<leader>
-    /// if-stalled quiet=<grace>`; an older server, `signal term`). Once per
-    /// episode, only where the host relaunches the agent, never under a
-    /// person's or another driver's hand, never for a stopped job — beside a
-    /// proven self-claim too, on the stall alone (no record's idle point:
-    /// a frozen TUI's record never rests). A refusal
-    /// the next read may lift (`not-stalled`, `busy`, `halted`) is not
-    /// counted, so the next read tries again; one it cannot (`restart
-    /// unavailable`) is, the warning said instead.
+    /// Applies the stall remedy (warning or `restart if-stalled`) once past `stall_term_after_s`.
     pub(super) fn stall_remedy(
         &mut self,
         read: &StallRead,
@@ -448,14 +355,7 @@ impl<C: Ctl> Session<'_, C> {
         if self.stall_termed || bound_ms == 0 || !stall.wait_ms.is_some_and(|ms| ms >= bound_ms) {
             return Ok(());
         }
-        // BESIDE A PROVEN SELF-CLAIM the stall alone decides, as it does for
-        // every agent (contract §4: the watch-only worker keeps aterm's stall
-        // remedy). The agent's record is NOT read for an idle point here: a
-        // TUI that stopped reading its input mid-turn keeps a record that
-        // says `busy` for ever, and gated on its rest it was never restarted
-        // and nobody was warned (the review of 2026-10-16).
         if !self.stall_term {
-            // The default: a warning where the restart would be, once per episode.
             self.stall_termed = true;
             let after = self.after_restart();
             return self.warn_stall(
@@ -467,7 +367,6 @@ impl<C: Ctl> Session<'_, C> {
                 "(`[harness] stall_term = true` ends it)",
             );
         }
-        // The explicit restart; the server's own fences decide under the same read.
         let leader = self.stall_host.as_ref().and_then(|h| h.agent_pid());
         let pid = leader.map(|p| format!("pid={p}"));
         let quiet = format!("quiet={}", self.stall_grace_s);
@@ -485,7 +384,6 @@ impl<C: Ctl> Session<'_, C> {
         }
         let reply = reply_line(&r);
         if r.is_err("restart unavailable") && !refusal_lifts(&r) {
-            // The server cannot carry the restart here: counted, the warning said instead.
             self.stall_termed = true;
             let after = self.stall_host.as_ref().map_or(AfterRestart::Unknown, |h| {
                 h.resume_command()
@@ -493,9 +391,6 @@ impl<C: Ctl> Session<'_, C> {
             });
             return self.warn_stall(read, &stall, &after, seq, review, &format!("({reply})"));
         }
-        // `ERR not-stalled`, `busy`, `halted`, another hand's `restart
-        // unavailable` ([`refusal_lifts`]): not counted, the next read
-        // decides.
         if r.ok() {
             self.stall_termed = true;
         }
@@ -575,10 +470,7 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// After a wait step that did not latch: a probe, unless the host is known not to measure
-    /// input ([`Caps::input`]) and no stall is held or suspected. A new stall is held
-    /// ([`Self::hold_for_stall`]) and the wait goes on; `true` when a held stall has lifted, so
-    /// the wait ends and the next look thaws it ([`Self::stall_look`]).
+    /// Probes input stall state after an unlatched wait step.
     pub(super) fn stall_step(&mut self, seq: u64, review: &mut dyn Review) -> Result<bool, Fail> {
         if !review.unattended()
             || (self.caps.input == Some(false) && self.stalled.is_none() && !self.stall_suspect)
@@ -586,7 +478,6 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(false);
         }
         let read = self.stall_probe()?;
-        // This read decides whatever an earlier one suspected.
         self.stall_suspect = false;
         let Some(read) = read else {
             return Ok(self.stalled.is_some());
@@ -595,7 +486,6 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(self.stalled.is_some());
         }
         if self.stalled.is_some() {
-            // Held already: the numbers move, the episode does not; the remedy is looked at again.
             self.stalled.clone_from(&read.stall);
             self.stall_remedy(&read, seq, review)?;
         } else {
@@ -604,9 +494,7 @@ impl<C: Ctl> Session<'_, C> {
         Ok(false)
     }
 
-    /// The top of a look while a stall is held or suspected: `status` is read before anything is
-    /// pressed. `true` holds the look (the caller waits); `false` goes on, after [`Self::thaw`]
-    /// when a held stall has lifted.
+    /// Checks held or suspected stall state at the start of a look.
     pub(super) fn stall_look(
         &mut self,
         seq: u64,
@@ -660,8 +548,6 @@ mod tests {
         let stopped = "OK input=stopped input_bytes=3 input_wait_ms=41000 fg_rss_mb=-\n";
         let s = worker_stall(stopped).expect("stopped is a stall");
         assert_eq!((s.word, s.bytes, s.rss_mb), ("stopped", Some(3), None));
-        // Negative controls: a measured word that is no stall, the unmeasured
-        // `-`, a host with no field, an ERR.
         for line in [
             "OK input=clear input_bytes=0 input_wait_ms=0 fg_rss_mb=-\n",
             "OK input=pending input_bytes=1 input_wait_ms=1500 fg_rss_mb=-\n",
@@ -679,9 +565,7 @@ mod tests {
     }
 
     /// What a stall's warning says after its word: the wait, the backlog
-    /// and the size, each only where the server measured it. A small
-    /// program reads MB, never `0.0 GB`; unknown numbers are left out,
-    /// never printed as `-`.
+    /// and the size, each only where the server measured it.
     #[test]
     fn the_stall_facts_name_the_wait_the_backlog_and_the_size() {
         let s = worker_stall(STALLED).expect("stall");

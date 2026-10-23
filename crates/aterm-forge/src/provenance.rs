@@ -2,39 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Who wrote this code: the provenance classifier.
-//!
-//! Path packages in this workspace are one of three shapes:
-//!
-//!   * `crates/<name>`: code aterm owns, billed to the workspace and never to the third-party
-//!     surface. Includes the first-party `[patch.crates-io]` replacements, members patched in by
-//!     package name, and the absorbed crates (`crates/aterm-window`, from winit 0.30.13):
-//!     upstream source aterm took over as members, which still owe attest's license obligations
-//!     (`[OB-5]`/`[OB-6]`/`[OB-7]`/`[OB-9]`).
-//!   * `vendor/<name>`: upstream source aterm forked and keeps reviewing. Third-party; owes
-//!     every obligation, and `[OB-1]` holds the patch table and the directory listing in
-//!     agreement. None since indexmap, the last, went back to the registry (2026-10-16).
-//!   * a first-party path dependency vendored in-tree: `vendor/astream`, the same owner's
-//!     astream repository as a git submodule (`vendor/README-astream.md`), path-depended on by
-//!     `crates/aterm-link`. It is in `vendor/` so a clean clone builds; it has no crates.io
-//!     package, so no patch entry can name it.
-//!
-//! A `vendor/<dir>` on [`FIRST_PARTY_VENDORED`] is aterm's own code; everything
-//! else under `vendor/` is a third-party fork. The roster is fail-closed both
-//! ways: a row whose directory is gone is a stale-review error, and a directory
-//! on neither the roster nor the patch table fails `[OB-1]`.
-//!
-//! The claim lives in aterm's own source rather than in a file or manifest key
-//! inside the vendored tree, which the next submodule bump could rewrite. It is
-//! the first-party twin of `vendor/forge.toml`'s `[[fork]]` blocks (the
-//! third-party forks the census reviews), and the two must never name the
-//! same directory ([`crate::attest`] checks that).
-//!
-//! # What this does not relax
-//!
-//! Being first-party exempts only the redistribution obligations. A roster
-//! directory must still be reached by some member's `path = …`
-//! ([`path_dependants`]), and the packages it pulls in stay third-party and on
-//! the ratchet.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -47,8 +14,8 @@ pub struct FirstPartyVendored {
     /// never a commit; any pin is read from the tree (`[OB-1]` prints a
     /// submodule's gitlink).
     pub upstream: &'static str,
-    /// Why it is aterm's own code rather than a redistribution, and why it is
-    /// under `vendor/` at all. Printed by `[OB-1]` on every run.
+    /// Why it is aterm's own code rather than a redistribution, and why it is under `vendor/` at
+    /// all.
     pub why: &'static str,
 }
 
@@ -72,8 +39,7 @@ pub const FIRST_PARTY_VENDORED: &[FirstPartyVendored] = &[FirstPartyVendored {
           the ratchet.",
 }];
 
-/// The roster row whose directory contains `rel`, if any. `rel` is
-/// repo-relative and may be the root itself or anything beneath it.
+/// The roster row whose directory contains `rel`, if any.
 #[must_use]
 pub fn roster_row(rel: &str) -> Option<&'static FirstPartyVendored> {
     FIRST_PARTY_VENDORED
@@ -89,27 +55,19 @@ pub fn is_first_party_vendored(root: &Path, dir: &Path) -> bool {
         .any(|r| dir.starts_with(root.join(r.dir)))
 }
 
-/// Is this absolute package directory aterm's own code: a workspace member
-/// under `crates/`, or a first-party vendored root? `loc::measure` inverts
-/// this to decide `PkgFacts::is_third_party`.
+/// Is this absolute package directory aterm's own code.
 #[must_use]
 pub fn is_first_party(root: &Path, dir: &Path) -> bool {
     dir.starts_with(root.join("crates")) || is_first_party_vendored(root, dir)
 }
 
 /// Does the roster describe this root?
-///
-/// [`FIRST_PARTY_VENDORED`] is a statement about the aterm workspace; applied
-/// to another root
-/// (attest's temp-dir fixtures) it would invent findings. Probed on the file
-/// the constant lives in.
 #[must_use]
 pub fn applies_to(root: &Path) -> bool {
     root.join("crates/aterm-forge/src/provenance.rs").is_file()
 }
 
-/// How many roster rows apply to this root (zero where the roster does not
-/// describe it), so a log line cannot claim an exemption not in force.
+/// How many roster rows apply to this root, so a log line cannot claim an exemption not in force.
 #[must_use]
 pub fn roster_len(root: &Path) -> usize {
     if applies_to(root) {
@@ -119,8 +77,7 @@ pub fn roster_len(root: &Path) -> usize {
     }
 }
 
-/// Roster rows whose directory does not exist: a hard error, since a stale row
-/// would exempt an invisible directory. Callers gate this on [`applies_to`].
+/// Roster rows whose directory does not exist.
 #[must_use]
 pub fn stale_rows(root: &Path) -> Vec<&'static FirstPartyVendored> {
     FIRST_PARTY_VENDORED
@@ -129,11 +86,8 @@ pub fn stale_rows(root: &Path) -> Vec<&'static FirstPartyVendored> {
         .collect()
 }
 
-/// Workspace members under `crates/` whose manifest carries a `path = …`
-/// dependency resolving inside `rel_root`, sorted and deduplicated.
-///
-/// The liveness half of `[OB-1]` for a roster directory, which has no patch
-/// entry to prove it is reached. Empty means dead weight.
+/// Workspace members under `crates/` whose manifest carries a `path = …` dependency resolving
+/// inside `rel_root`, sorted and deduplicated.
 #[must_use]
 pub fn path_dependants(root: &Path, rel_root: &str) -> Vec<String> {
     let target = root.join(rel_root);

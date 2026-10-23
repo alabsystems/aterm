@@ -111,7 +111,7 @@ impl Redial {
     }
 
     /// Why this policy follows no successor, when it follows none.
-    pub(crate) fn unfollowed(&self) -> Option<&Unfollowed> {
+    pub(crate) const fn unfollowed(&self) -> Option<&Unfollowed> {
         match &self.follow {
             Follow::Nothing(why) => Some(why),
             _ => None,
@@ -162,6 +162,7 @@ impl Redial {
     }
 
     /// Stamp the exit of the live server `pid` when the kernel reports it
+    /// ([`ExitMoment`]).
     fn watch_exit(&self, pid: Option<u32>) -> Option<ExitMoment<Stamp>> {
         let pid = pid?;
         let watch = ExitMoment::watch(pid, self.clock)?;
@@ -183,6 +184,7 @@ impl Redial {
     }
 
     /// Every path a successor of the server reached at `dialed` may answer on,
+    /// in order, resolved now.
     fn candidates(&self, dialed: &str) -> Vec<String> {
         match &self.follow {
             Follow::Path(path) => vec![dialed.to_string(), path.clone()],
@@ -236,6 +238,8 @@ impl Redial {
     }
 
     /// The successor wait of [`Redial::after_hangup`] and
+    /// [`Redial::after_host_gone`]: a live server answering where this policy
+    /// follows — never `old` through `listener` again, when `exclude_old`.
     fn successor(
         &self,
         dialed: &str,
@@ -288,6 +292,7 @@ impl Redial {
 }
 
 /// One wait for a successor: from when it began, to the bound or the caller's
+/// explicit deadline, whichever comes first (the rule on this module).
 struct Wait {
     started: Instant,
     deadline: Instant,
@@ -307,6 +312,7 @@ impl Wait {
     }
 
     /// The pid answering at `path`, waiting no longer than the wait has left
+    /// (never less than [`PROBE_FLOOR`], never more than [`PROBE_TIMEOUT`]).
     fn probe(&self, path: &str) -> Option<u32> {
         let left = self.deadline.saturating_duration_since(Instant::now());
         serving_pid_within(path, left.clamp(PROBE_FLOOR, PROBE_TIMEOUT))
@@ -314,6 +320,7 @@ impl Wait {
 }
 
 /// How long a probe waits for `OK` to its `version` — less when the caller's
+/// deadline has less left, never less than [`PROBE_FLOOR`].
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The shortest probe: a live aterm answers `version` in well under this.
@@ -326,12 +333,16 @@ pub(crate) fn serving_pid(path: &str) -> Option<u32> {
 }
 
 /// The pid of the process answering at `path` right now (it accepted a
+/// connection and answered `version` with `OK` within `wait`), or `None`
+/// (nothing answers, or the platform cannot read a peer pid).
 fn serving_pid_within(path: &str, wait: Duration) -> Option<u32> {
     let (pid, line) = version_at(path, wait)?;
     super::is_ok_reply(&line).then_some(pid?)
 }
 
 /// What answered `version` at `path` within `wait`: the peer's pid, where it
+/// could be read, and its status line, including one a listener left when it
+/// closed before the request was written ([`ask_once`]).
 fn version_at(path: &str, wait: Duration) -> Option<(Option<u32>, String)> {
     let (stream, token) = super::connect_then_read(path, super::read_token_for).ok()?;
     let pid = server_pid(&stream);
@@ -345,6 +356,8 @@ fn version_at(path: &str, wait: Duration) -> Option<(Option<u32>, String)> {
 }
 
 /// Whether the server `pid` still answers at `path` through `listener`, with
+/// any answer to `version`: `OK`, or the busy refusal of a listener with every
+/// lane at work.
 fn answers_at(path: &str, pid: u32, listener: Option<ListenerId>) -> bool {
     let Some((answered, line)) = version_at(path, PROBE_TIMEOUT) else {
         return false;
@@ -365,6 +378,8 @@ pub(crate) fn server_pid(stream: &CtlStream) -> Option<u32> {
 pub(crate) use aterm_uds::listener::{ListenerId, listener_at};
 
 /// Whether `pid`, answering at `path`, is the server `old` a stream reached
+/// through `listener`: the same process and, where both were read, the same
+/// listening socket ([`ListenerId`]).
 fn is_the_same_server(pid: u32, path: &str, old: u32, listener: Option<ListenerId>) -> bool {
     pid == old && aterm_uds::listener::still_names(path, listener)
 }
@@ -432,6 +447,7 @@ pub(crate) fn process_started(pid: u32) -> Option<Stamp> {
 }
 
 /// Whether the socket at `path` is one only a relaunch of the instance
+/// configured on it can bind: a fixed `--control-sock` path.
 fn only_a_relaunch_binds(path: &str) -> bool {
     let path = std::path::Path::new(path);
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -479,6 +495,9 @@ pub(crate) fn retries_across_replacement(request_parts: &[String]) -> bool {
 }
 
 /// Whether an `await log` (its arguments, `log` first) names where it reads
+/// from on its own: a `since=` cursor, which means the same on a successor
+/// (the log's seq space continues across an update), or the `need` form,
+/// which latches on the needs the carried fold holds open.
 fn log_wait_resumes(args: &[&str]) -> bool {
     args.iter()
         .skip(1)
@@ -486,6 +505,8 @@ fn log_wait_resumes(args: &[&str]) -> bool {
 }
 
 /// Whether an `inbox` request is a plain read of what is queued now: a
+/// count, `--peek` and `--meta` name nothing in the old process, unlike
+/// `get <id>`, `since=<id>` or a write such as `seen <id>`.
 fn inbox_plain_read(args: &[&str]) -> bool {
     args.iter()
         .all(|a| matches!(*a, "--peek" | "--meta") || a.parse::<u64>().is_ok())
@@ -520,6 +541,7 @@ pub(crate) fn old_process_anchor(request_parts: &[String]) -> Option<String> {
 }
 
 /// The first `subscribe` target named by local number (`@<n>`) that the
+/// stream never tied to a session id, which [`resume_request`] cannot follow.
 fn untied_local_target(request: &str, sids: &[(String, String)]) -> Option<String> {
     request
         .split_whitespace()
@@ -544,6 +566,9 @@ fn verb_and_args<S: AsRef<str>>(request_parts: &[S]) -> (Option<&str>, Vec<&str>
 }
 
 /// The wait a request is when it waits for a change after the moment it was
+/// armed, past a leading `@<selector>`: `await block`, `await consent`, or a
+/// bare `await seq` (no counter after `seq`; a `key=value` such as
+/// `timeout=0` is not one).
 fn armed_wait<S: AsRef<str>>(request_parts: &[S]) -> Option<&'static str> {
     let (Some("await"), args) = verb_and_args(request_parts) else {
         return None;
@@ -743,6 +768,8 @@ fn resume_request_with(
 }
 
 /// Rewrite a self target in `out` to `@<sid>` of the session the stream was
+/// tied to ([`self_sid`]), replacing `@.`/`@` or inserted after `subscribe`
+/// when no selector was named.
 fn pin_self(out: &mut Vec<String>, sids: &[(String, String)]) -> bool {
     let Some(sid) = self_sid(sids) else {
         return false;
@@ -762,11 +789,13 @@ fn pin_self(out: &mut Vec<String>, sids: &[(String, String)]) -> bool {
 }
 
 /// Whether a selector token names the connection's own session (`@.`), which
+/// the server resolves afresh on every request.
 fn is_self_selector(token: &str) -> bool {
     token == "@."
 }
 
 /// The one session a single-target stream's `sub` lines tied it to, or `None`
+/// when they named none or more than one.
 fn self_sid(sids: &[(String, String)]) -> Option<&str> {
     let (_, first) = sids.first()?;
     sids.iter()
@@ -786,11 +815,13 @@ pub(crate) struct EventAnchors {
 }
 
 /// Whether the subscription's target set is the live `@*` roster, which never
+/// ends by its sessions exiting.
 fn targets_everything(request: &str) -> bool {
     request.split_whitespace().any(|t| t == "@*")
 }
 
 /// Whether `request` names every session it follows by id, as a pinned resume
+/// does ([`resume_request`]), rather than `@*` or a self target.
 fn names_its_sessions(request: &str) -> bool {
     let mut pieces = request
         .split_whitespace()
@@ -819,6 +850,7 @@ pub(crate) struct FrameTracker {
 }
 
 /// The longest header line the tracker keeps; a longer one is not a frame
+/// header this client knows.
 const MAX_HEADER: usize = 4096;
 
 impl FrameTracker {
@@ -845,12 +877,12 @@ impl FrameTracker {
     }
 
     /// The newest `block-complete` and `turn` ids relayed so far, every leg.
-    pub(crate) fn anchors(&self) -> EventAnchors {
+    pub(crate) const fn anchors(&self) -> EventAnchors {
         self.anchors
     }
 
     /// Whether the instance said on this leg that it is quitting.
-    pub(crate) fn said_quit(&self) -> bool {
+    pub(crate) const fn said_quit(&self) -> bool {
         self.quit && !self.lost
     }
 
@@ -925,7 +957,7 @@ impl FrameTracker {
     }
 
     /// The host a forward said went away under this leg.
-    pub(crate) fn take_host_gone(&mut self) -> Option<(u32, String)> {
+    pub(crate) const fn take_host_gone(&mut self) -> Option<(u32, String)> {
         self.gone.take()
     }
 
@@ -994,6 +1026,7 @@ impl FrameTracker {
 }
 
 /// The one refusal a pinned self stream is asked again after: the successor
+/// does not hold the session the pin names.
 const NO_SUCH_SESSION: &str = "ERR no such session";
 
 /// Which session a redialled leg relays, against the one the stream followed.
@@ -1058,6 +1091,8 @@ pub(crate) fn earliest(seen: Stamp, exited: Option<Stamp>) -> Stamp {
 }
 
 /// Whether a status line is the control socket's busy refusal
+/// ([`aterm_types::control_verbs::CONTROL_BUSY_REPLY`]): nothing was served,
+/// and the request may be sent again.
 fn is_busy(status: &str) -> bool {
     status.starts_with("ERR control server busy")
 }
@@ -1105,6 +1140,7 @@ pub(crate) fn after_refusal(
 }
 
 /// The self target of `request` as the caller wrote it, resolved on a fresh
+/// successor — never `@.` for a request that named none.
 fn self_resolved(request: &str) -> &'static str {
     match request.split_whitespace().find(|t| t.starts_with('@')) {
         Some("@.") => "`@.` resolved there",
@@ -1181,6 +1217,10 @@ pub(crate) fn resumed_note(
 }
 
 /// What a resumed leg's block and turn events go on from: after the last ones
+/// relayed where `request` — the resumed one — carries that anchor
+/// ([`resume_request`]); else from the successor's newest, so any that
+/// completed between the legs are not pushed (a multi-target stream carries
+/// none).
 fn events_after(request: &str) -> &'static str {
     let carries = |key: &str| request.split_whitespace().any(|t| t.starts_with(key));
     match (carries("since-block="), carries("since-turn=")) {
@@ -1239,6 +1279,7 @@ enum Leg {
 }
 
 /// Relay one connection's frames to `out` until the server hangs up or the
+/// `watch` wall clock (an explicit `--timeout`) runs out.
 fn pump(
     stream: &CtlStream,
     reader: &mut BufReader<&CtlStream>,
@@ -1493,6 +1534,7 @@ pub(crate) fn gone_note(
 }
 
 /// The note for a stream whose instance said `bye quit` and hung up
+/// ([`FrameTracker::said_quit`]).
 fn quit_note(server: Option<u32>) -> String {
     let pid = server.map_or_else(|| "?".to_owned(), |pid| pid.to_string());
     format!(

@@ -74,7 +74,7 @@ const FIT_TOKEN_MASK_MATCH: u8 = 0b11110000;
 /// True when both token nibbles (literal length high, match length low) are below 15, so no
 /// extension bytes follow.
 #[inline]
-fn does_token_fit(token: u8) -> bool {
+const fn does_token_fit(token: u8) -> bool {
     !((token & FIT_TOKEN_MASK_LITERAL) == FIT_TOKEN_MASK_LITERAL
         || (token & FIT_TOKEN_MASK_MATCH) == FIT_TOKEN_MASK_MATCH)
 }

@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Identities (design §6.1, §6.6): token kinds, sources, profiles, credentials, the strict
-//! load, presence, fingerprints and the report of ambient tokens.
+//! Identity token kinds, sources, profiles, credentials, and ambient-token inspection.
 
 pub mod provision;
 
@@ -17,7 +16,7 @@ use aterm_uds::secret::Secret;
 
 use crate::policy::{Presence, Tier};
 
-/// A token's kind, by its prefix.
+/// GitHub token kind classified by prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TokenKind {
     /// `ghp_`.
@@ -35,12 +34,10 @@ pub enum TokenKind {
 }
 
 impl TokenKind {
-    /// `ghp_` classic, `github_pat_` fine-grained, `gho_` OAuth, `ghu_` user-to-server, `ghs_`
-    /// installation, anything else unknown.
+    /// Classifies `token` by prefix.
     ///
     /// # Errors
-    ///
-    /// `ghr_` → `LoadError::Unsupported("a refresh token cannot authenticate API calls")`.
+    /// Returns `LoadError::Unsupported` for refresh tokens (`ghr_`).
     pub fn of(token: &[u8]) -> Result<TokenKind, LoadError> {
         let kind = if token.starts_with(b"ghr_") {
             return Err(LoadError::Unsupported(
@@ -62,7 +59,7 @@ impl TokenKind {
         Ok(kind)
     }
 
-    /// `classic`, `fine_grained`, `oauth`, `user_to_server`, `installation`, `unknown`.
+    /// `classic`, `fine_grained`, `oauth`, `user_to_server`, `installation`, or `unknown`.
     #[must_use]
     pub const fn slug(self) -> &'static str {
         match self {
@@ -76,8 +73,7 @@ impl TokenKind {
     }
 }
 
-/// Where a profile's token is. `#[non_exhaustive]`: M2 adds `Inline(InlineToken)`, a token a
-/// library caller holds in memory, which agh.toml cannot spell (design §6.1).
+/// Token storage location for a [`Profile`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Source {
@@ -87,8 +83,7 @@ pub enum Source {
     Env(String),
 }
 
-/// A named identity from agh.toml. `#[non_exhaustive]`: outside agh it is built with
-/// `Profile::new` and the builders, so M2's fields arrive additively.
+/// Named identity profile from `agh.toml`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Profile {
@@ -102,13 +97,12 @@ pub struct Profile {
     pub login: Option<String>,
     /// Whether it covers every repository of its owners.
     pub covers_all_repos: bool,
-    /// The token fingerprint a person vouched for with `auth add --drafts`. A fine-grained
-    /// writer may make a WriterRead only when its token has this fingerprint (design §6.4).
+    /// Token fingerprint vouched for via `auth add --drafts`.
     pub drafts_fp: Option<String>,
 }
 
 impl Profile {
-    /// `login: None`, `covers_all_repos: false`, `drafts_fp: None`.
+    /// Creates a profile with `login: None`, `covers_all_repos: false`, and `drafts_fp: None`.
     pub fn new(name: impl Into<String>, source: Source, tier: Tier) -> Profile {
         Profile {
             name: name.into(),
@@ -141,9 +135,7 @@ impl Profile {
         self
     }
 
-    /// Whether `cred`, this profile's credential, may make a WriterRead: true unless its kind
-    /// is `FineGrained` and `drafts_fp` is not `Some(cred.fingerprint())`. A rotated token
-    /// therefore lapses the vouch.
+    /// Returns whether `cred` is permitted to perform a `WriterRead`.
     #[must_use]
     pub fn drafts_vouched(&self, cred: &Credential) -> bool {
         cred.kind() != TokenKind::FineGrained
@@ -151,7 +143,7 @@ impl Profile {
     }
 }
 
-/// A loaded profile. The token is a `Secret`; no `Clone`.
+/// Loaded profile credential holding a `Secret` token.
 pub struct Credential {
     profile: String,
     tier: Tier,
@@ -192,7 +184,7 @@ impl Credential {
         self.file_id
     }
 
-    /// The token, for `door::AuthHeader` and the Redactor alone.
+    /// Returns the raw token bytes for `door::AuthHeader` and the redactor.
     pub(crate) fn expose(&self) -> &[u8] {
         self.secret.expose()
     }
@@ -245,7 +237,7 @@ pub enum LoadError {
 }
 
 impl LoadError {
-    /// Missing and Unavailable → `Presence::Absent`; every other → `Presence::Unusable(self.slug())`.
+    /// Maps `Missing` and `Unavailable` to `Presence::Absent` and others to `Presence::Unusable`.
     #[must_use]
     pub fn presence(&self) -> Presence {
         match self {
@@ -268,12 +260,7 @@ impl LoadError {
         }
     }
 
-    /// The remedy `auth status` and `whoami` print, or `None`. Reads modes with
-    /// `symlink_metadata` and changes nothing. Paths under `home` are written `~/…`.
-    ///
-    /// The remedy fixes the rule that was broken, which the variant alone does not name:
-    /// a Symlink is the file's link or its directory's, and a Malformed is a token's shape
-    /// or a path that names no regular file (the texts beside plan §4.6.10's).
+    /// Returns the actionable remedy string printed by `auth status` and `whoami`, if any.
     #[must_use]
     pub fn remedy(&self, profile: &Profile, home: &Path) -> Option<String> {
         match self {
@@ -317,23 +304,19 @@ fn token_link_remedy(file: &Path, home: &Path) -> String {
 /// The Malformed remedy for a token_file that names no regular file.
 const TOKEN_NOT_A_FILE: &str = "token_file must name a regular file";
 
-/// Which file `read_private` refused, for the way out a remedy names beside a chmod.
+/// Which file `read_private` refused, for remedy formatting.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Held<'a> {
-    /// A profile's token_file.
+    /// A profile's `token_file`.
     Token,
-    /// agh.toml (or a `--config` file), with `Dirs::config` (`<aterm config dir>/agh`) when
-    /// the caller has one: its parent and grandparent are the XDG-relocated
-    /// `~/.config/aterm` and `~/.config`.
+    /// `agh.toml` (or `--config` file), with `Dirs::config` when available.
     Config(Option<&'a Path>),
 }
 
 #[cfg(unix)]
 impl Held<'_> {
-    /// Whether `dir` is the agh directory itself (`Dirs::config`, by path or identity), the
-    /// one place agh reads agh.toml from: a remedy there never names `--config`, which no
-    /// routed verb takes and which changes no file that routes.
+    /// Returns whether `dir` is the default `agh` config directory.
     pub(crate) fn is_agh_dir(self, dir: &Path) -> bool {
         use std::os::unix::fs::MetadataExt;
         let Held::Config(Some(agh_dir)) = self else {
@@ -350,8 +333,7 @@ impl Held<'_> {
 
 /// Whether `dir` is one of the directories agh never asks a person to narrow (design §6.2:
 /// `$HOME`, `~/.config` and `~/.config/aterm`, and for agh.toml the relocated aterm config
-/// directory and its parent). Judged by identity (`dev`, `ino`, following links), so a
-/// relative or `..` spelling of one is still that directory.
+/// directory and its parent).
 #[cfg(unix)]
 fn never_narrowed(dir: &Path, home: &Path, held: Held<'_>) -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -374,13 +356,7 @@ fn never_narrowed(dir: &Path, home: &Path, held: Held<'_>) -> bool {
     kept.iter().any(|path| id(path) == Some(dir_id))
 }
 
-/// The Symlink remedy for the file `name` in `dir`. `read_private` gives Symlink both for a
-/// file that is a link and for a directory that is one, so this looks: when `dir` is a link,
-/// the fix names it; else the file is the link. A link of this user's can be made a real
-/// directory; one of another user's (root's `/tmp` on macOS) cannot, so the remedy then names
-/// only the real path, when that directory is this user's, or a directory of this user's.
-/// Reads with `symlink_metadata` and changes nothing. The token files' remedy and agh.toml's
-/// share it.
+/// Formats the `Symlink` remedy for `name` inside `dir`.
 #[cfg(unix)]
 pub(crate) fn symlink_remedy(dir: &Path, name: &str, home: &Path, held: Held<'_>) -> String {
     use std::os::unix::fs::MetadataExt;
@@ -409,8 +385,6 @@ pub(crate) fn symlink_remedy(dir: &Path, name: &str, home: &Path, held: Held<'_>
         };
     }
     if held.is_agh_dir(dir) {
-        // agh reads agh.toml only here, so the way out is a real directory at this path:
-        // the person replaces the link when its parent is theirs, else its owner must.
         let parent_ours = dir
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -470,7 +444,7 @@ fn malformed_remedy(why: &str, source: &Source) -> String {
     }
 }
 
-/// `path`, written `~/…` when it is under `home`, and `~` when it is `home`.
+/// Formats `path` relative to `home` using `~`.
 pub(crate) fn tilde(path: &Path, home: &Path) -> String {
     match path.strip_prefix(home) {
         Ok(rest) if !home.as_os_str().is_empty() && rest.as_os_str().is_empty() => "~".into(),
@@ -481,7 +455,7 @@ pub(crate) fn tilde(path: &Path, home: &Path) -> String {
 
 /// `text` as one word of a shell command a person pastes: `~` and a word whose every byte is
 /// one of `[A-Za-z0-9_./+-]` (after a leading `~/`) unchanged, else single-quoted with each
-/// `'` written `'\''`. A leading `~/` stays outside the quotes, so the shell still expands it.
+/// `'` written `'\''`.
 #[cfg(unix)]
 fn shell_word(text: &str) -> String {
     if text == "~" {
@@ -523,26 +497,21 @@ fn loose_remedy(profile: &Profile, home: &Path) -> Option<String> {
     }
 }
 
-/// What a person can do about a file `read_private` refused as not private.
+/// Remedy classification for a file refused by `read_private` as not private.
 #[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PrivateFix {
-    /// The commands that make it private: the chmods, the link to replace, or the private
-    /// copy to put in its place.
+    /// Shell commands that make the path private.
     Fix(String),
-    /// The path is a directory or another non-file, which no chmod makes a regular file.
+    /// Path is not a regular file.
     NotAFile,
-    /// No command of this user's lifts the refusal: the directory is another user's, or it
-    /// is loose and one agh never asks a person to narrow (design §6.2).
+    /// Refusal cannot be lifted by a user `chmod`.
     NoChmod,
-    /// Nothing loose was seen (an ACL, or a file gone since): no command to name.
+    /// No loose mode bit observed (e.g. ACL or vanished file).
     Unseen,
 }
 
-/// plan §4.6.10's crate-private contract, which provisioning and `auth status` call:
-/// [`private_fix`] for a file with no agh directory in hand, as an `Option`. `Fix` is the
-/// remedy, `NotAFile` names the regular file the path must be, and a refusal no command of
-/// this user's lifts (`NoChmod`, `Unseen`) is `None`.
+/// Returns the `chmod` remedy string for `file` in `dir`, if any.
 #[cfg(unix)]
 pub(crate) fn chmod_remedy(dir: &Path, file: &Path, home: &Path) -> Option<String> {
     match private_fix(dir, file, home, Held::Config(None)) {
@@ -555,24 +524,7 @@ pub(crate) fn chmod_remedy(dir: &Path, file: &Path, home: &Path) -> Option<Strin
     }
 }
 
-/// `chmod 700 {dir} && chmod 600 {file} (inverse: chmod {dir_mode:o} {dir} && chmod
-/// {file_mode:o} {file})`, with only the loose parts (a group or other bit) in each list.
-/// Reads modes with `symlink_metadata` and changes nothing. Paths under `home` are written
-/// `~/…`. The token files' remedy and agh.toml's share it.
-///
-/// Cases beside plan §4.6.10's text, each because `read_private` judges the directory
-/// before the file, so a chmod of the file alone lifts nothing while the directory stands:
-///
-/// - A directory that is another user's: refused for its owner, which no chmod of its mode
-///   changes and this user cannot run. `NoChmod`.
-/// - A loose directory agh never narrows (design §6.2: `$HOME`, `~/.config`,
-///   `~/.config/aterm`, judged by identity). `NoChmod`.
-/// - A file that is a link: `chmod` follows it, and the link's own mode is no inverse of
-///   the target's, so the fix names the link to replace after the directory's chmod.
-/// - A regular file that is another user's, or has another (hard) link: no chmod lifts
-///   either, so the fix is a private copy of the person's own put in its place
-///   (`cp F F.new && chmod 600 F.new && mv F.new F`), which the person's directory allows.
-/// - A directory or other non-file: `NotAFile`.
+/// Computes the [`PrivateFix`] for `file` in `dir`.
 #[cfg(unix)]
 pub(crate) fn private_fix(dir: &Path, file: &Path, home: &Path, held: Held<'_>) -> PrivateFix {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -654,14 +606,10 @@ impl std::fmt::Display for LoadError {
     }
 }
 
-/// Load `profile`'s token under the strict rules. Crate-private (plan §1, rule 9): every caller is
-/// in the crate (`presence`, the client's credential cache, provisioning, `auth status` and
-/// `rate` among them), so a token agh loads reaches the wire only in a header the pipeline
-/// built once `Router::decide` answered `Send` (design §10.1).
+/// Loads `profile`'s token under strict permission and shape rules.
 ///
 /// # Errors
-///
-/// Why it gave no credential.
+/// Returns why the profile gave no credential.
 pub(crate) fn load(profile: &Profile, env: &dyn EnvSource) -> Result<Credential, LoadError> {
     match &profile.source {
         Source::File(path) => load_file(profile, path),
@@ -730,19 +678,17 @@ fn load_env(profile: &Profile, env: &dyn EnvSource, var: &str) -> Result<Credent
     loaded
 }
 
-/// `raw` without one trailing `\r\n` or `\n`.
+/// Strips at most one trailing `\r\n` or `\n` from `raw`.
 pub(crate) fn trim_newline(raw: &[u8]) -> &[u8] {
     raw.strip_suffix(b"\r\n")
         .or_else(|| raw.strip_suffix(b"\n"))
         .unwrap_or(raw)
 }
 
-/// The token `raw` holds, by the one token-shape rule every source shares: one trailing
-/// newline trimmed, then 20-255 bytes, each printable ASCII (0x21-0x7e).
+/// Trims one trailing newline from `raw` and validates the 20–255 printable-ASCII token shape.
 ///
 /// # Errors
-///
-/// `LoadError::Malformed` with the shape's text.
+/// Returns `LoadError::Malformed` if the token fails the shape check.
 pub(crate) fn token_bytes(raw: &[u8]) -> Result<&[u8], LoadError> {
     let token = trim_newline(raw);
     let printable = token.iter().all(|b| (0x21..=0x7e).contains(b));
@@ -752,8 +698,7 @@ pub(crate) fn token_bytes(raw: &[u8]) -> Result<&[u8], LoadError> {
     Ok(token)
 }
 
-/// One token read whole: `token_bytes`, then the kind and the fingerprint. The caller scrubs
-/// `raw`.
+/// One token read whole: `token_bytes`, then the kind and the fingerprint.
 fn credential_from(
     profile: &Profile,
     raw: &[u8],
@@ -771,17 +716,16 @@ fn credential_from(
     })
 }
 
-/// `load`, for the integration tests (plan §1, rule 9): its body is that one call.
+/// Exposes [`load`] for integration tests.
 ///
 /// # Errors
-///
-/// As `load`.
+/// Returns why the profile gave no credential.
 #[cfg(any(test, debug_assertions))]
 pub fn load_for_tests(profile: &Profile, env: &dyn EnvSource) -> Result<Credential, LoadError> {
     load(profile, env)
 }
 
-/// `load`, reduced to presence (the credential is dropped and scrubbed).
+/// Evaluates [`load`] and returns only its [`Presence`].
 #[must_use]
 pub fn presence(profile: &Profile, env: &dyn EnvSource) -> Presence {
     match load(profile, env) {
@@ -790,14 +734,13 @@ pub fn presence(profile: &Profile, env: &dyn EnvSource) -> Presence {
     }
 }
 
-/// The first 12 hex characters of sha256(`agh/fp/v1\0` ‖ token).
+/// Returns the first 12 hex characters of `sha256("agh/fp/v1\0" || token)`.
 #[must_use]
 pub fn fingerprint(token: &[u8]) -> String {
     let mut hasher = aterm_digest::Sha256::new();
     hasher.update(b"agh/fp/v1\0");
     hasher.update(token);
     let digest = hasher.finalize();
-    // Six bytes are the 12 hex characters kept.
     aterm_codec::hex::encode_lower(&digest[..6])
 }
 
@@ -815,8 +758,7 @@ pub struct Ambient {
 /// The variables an ambient token is read from, in order.
 const AMBIENT_VARS: [&str; 2] = ["GH_TOKEN", "GITHUB_TOKEN"];
 
-/// `GH_TOKEN`, then `GITHUB_TOKEN`, each when set and non-empty. The copy read from the
-/// environment is scrubbed, as `load_env`'s is.
+/// Inspects `GH_TOKEN` and `GITHUB_TOKEN` when set and non-empty.
 #[must_use]
 pub fn ambient(env: &dyn EnvSource) -> Vec<Ambient> {
     AMBIENT_VARS
@@ -835,7 +777,7 @@ pub fn ambient(env: &dyn EnvSource) -> Vec<Ambient> {
         .collect()
 }
 
-/// An environment from a map: what tests and the conformance inject.
+/// In-memory environment map for tests.
 #[derive(Clone, Debug, Default)]
 pub struct MapEnv {
     vars: BTreeMap<String, OsString>,

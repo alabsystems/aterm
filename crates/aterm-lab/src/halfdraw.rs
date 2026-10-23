@@ -42,18 +42,18 @@ use crate::{Fail, LAB, Res};
 const GAP_WINDOW_S: f64 = 2.0;
 
 /// One output event of a cast.
-struct Event {
-    at: f64,
-    data: String,
+pub(crate) struct Event {
+    pub(crate) at: f64,
+    pub(crate) data: String,
 }
 
-struct Cast {
-    cols: u16,
-    rows: u16,
-    events: Vec<Event>,
+pub(crate) struct Cast {
+    pub(crate) cols: u16,
+    pub(crate) rows: u16,
+    pub(crate) events: Vec<Event>,
 }
 
-fn parse_cast(text: &str) -> Result<Cast, String> {
+pub(crate) fn parse_cast(text: &str) -> Result<Cast, String> {
     let mut lines = text.lines();
     let head: aterm_json::Value = aterm_json::from_str(lines.next().ok_or("empty cast")?)
         .map_err(|e| format!("cast header: {e}"))?;
@@ -103,7 +103,7 @@ struct State {
     composer: bool,
 }
 
-fn screen(t: &Terminal) -> Vec<String> {
+pub(crate) fn screen(t: &Terminal) -> Vec<String> {
     (0..SurfaceSource::rows(t))
         .map(|i| {
             let mut r = SurfaceSource::row_text(t, i).unwrap_or_default();
@@ -163,7 +163,7 @@ pub fn cmd_halfdraw(args: &[String]) -> Res {
 
 /// The replay's base instant: every event's clock is this plus its cast time, so the replay
 /// reads no wall clock after it.
-fn base_instant() -> std::time::Instant {
+pub(crate) fn base_instant() -> std::time::Instant {
     std::time::Instant::now()
 }
 

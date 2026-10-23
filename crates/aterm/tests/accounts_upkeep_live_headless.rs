@@ -1,50 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FLEET ACCOUNTS' UPKEEP OF A REAL INSTANCE, UNDER A NETWORK WITNESS.
-//!
-//! 0.112.0 to 0.115.0 had every window with a control socket fetch a
-//! spreadsheet link built into the source with curl (then an rclone remote)
-//! about two seconds after its launch and again every ten minutes, on any
-//! machine with no `accounts.toml`: every new install and every test world.
-//! The upkeep is now live only in an instance that runs as its account's own
-//! (`harness_host::accounts_upkeep_arm`), and there does anything only where
-//! this machine's person configured a fleet accounts source (`[fleet]
-//! accounts_source`, or the `fleet-accounts.toml` a sync handed its source
-//! leaves): `aterm_agent::harness::accounts_sync::upkeep_live`.
-//!
-//! THE WITNESS. The instance runs in a Seatbelt jail that kills a process at
-//! its first IP connection to anything but 127.0.0.1 and at its first name
-//! lookup ([`NETWORK_JAIL`]), so nothing it starts reaches a resolver or a
-//! remote address and a process that tries dies of it; and a sampler reads
-//! this test process's whole tree every millisecond from before the launch,
-//! keeping what each process under the instance ran ([`Execs`]), so a curl or
-//! an rclone the instance starts is seen while it runs.
-//!
-//! THREE WORLDS, each `launch_isolation`'s (a scratch HOME, a private state
-//! root):
-//!
-//! 1. AS EVERY TEST INSTANCE IS, with `[fleet] accounts_source` naming a
-//!    loopback recorder all the same: the instance is not its account's own,
-//!    so its upkeep is the inert one by construction and says so
-//!    (`accounts-upkeep=inert`); once its activation wake is armed, nothing
-//!    asked the recorder and nothing under it ran curl or rclone (FAILS with
-//!    the live upkeep in every instance, as the first fix had it: the log says
-//!    `configured`, and the recorder is asked).
-//! 2. A FRESH HOME ON THE REAL CODE PATH: the live upkeep let in by the
-//!    development seam (`accounts_sync::UPKEEP_SEAM`) and no source
-//!    configured says `accounts-upkeep=unconfigured`, and by then nothing
-//!    under the instance ran curl or rclone, the instance is alive and no
-//!    roster or fleet file was written (FAILS with any default source
-//!    restored: the upkeep says it is configured, and runs curl).
-//! 3. NEGATIVE CONTROL of both: the seam and a configured loopback recorder.
-//!    The recorder is asked for that path by a curl the sampler sees (it
-//!    holds its answer until then, so the curl lives for the whole of its own
-//!    `--max-time` while the 1 ms sampler looks), and the roster it answers
-//!    lands.
-//!
-//! Every wait for something that must happen is a one-minute hang detector,
-//! never a latency budget; no check retries.
+//! Headless integration tests for fleet accounts upkeep under a Seatbelt network witness.
 
 #![cfg(target_os = "macos")]
 
@@ -59,10 +16,6 @@ use aterm_spec::wait::MUST_HAPPEN;
 
 use crate::headless_boot::{self, Instance};
 
-/// The network witness's jail (SBPL, the last rule that matches wins): a name
-/// lookup (the resolver's socket), or an IP connection to anything but IPv4
-/// loopback, kills the process that asked, at once. The resolver's rule comes
-/// first: after the loopback allowance it killed an established loopback
 /// connection too (macOS 27, measured 2026-10-22).
 const NETWORK_JAIL: &str = concat!(
     "(version 1)(allow default)",
@@ -75,11 +28,9 @@ const NETWORK_JAIL: &str = concat!(
 /// The programs the upkeep fetches a source with.
 const FETCHERS: [&str; 2] = ["curl", "rclone"];
 
-/// Each pid seen under this test process: its parent, and every program path
 /// it was seen running.
 type Seen = BTreeMap<i32, (i32, BTreeSet<PathBuf>)>;
 
-/// What every process under this test process ran, read every millisecond
 /// from [`Execs::watch`] until dropped ([`Seen`]).
 struct Execs {
     seen: Arc<Mutex<Seen>>,
@@ -118,7 +69,6 @@ impl Execs {
         }
     }
 
-    /// Every program path a process under `root` (the instance) was seen
     /// running whose file name is one of `names`.
     fn under(&self, root: u32, names: &[&str]) -> Vec<PathBuf> {
         let seen = self.seen.lock().unwrap();
@@ -157,11 +107,9 @@ impl Drop for Execs {
     }
 }
 
-/// The private state root the seam's admission asks for (`ATERM_STATE_HOME`),
 /// under an instance's scratch root.
 const PRIVATE_STATE: &str = "state-aterm";
 
-/// The instance's own log (`aterm.log` where its scratch home keeps logs, or
 /// its private state root where it was given one).
 fn instance_log(inst: &Instance) -> String {
     [None, Some(inst.tmp.join(PRIVATE_STATE))]
@@ -187,7 +135,6 @@ fn log_tail(inst: &Instance) -> String {
     lines[lines.len().saturating_sub(25)..].join("\n")
 }
 
-/// The upkeep's first word in the instance's log (`accounts-upkeep=…`),
 /// waited for under the hang detector.
 #[track_caller]
 fn upkeep_word(inst: &mut Instance) -> String {
@@ -219,8 +166,6 @@ fn alive(inst: &mut Instance) {
     );
 }
 
-/// Boot a jailed instance whose aterm.toml gets `extra` appended, with the
-/// live upkeep let in by its development seam where `live` says so (under the
 /// private state root the seam's admission asks for).
 #[track_caller]
 fn boot(prefix: &str, extra: String, live: bool) -> Instance {
@@ -246,7 +191,6 @@ fn loopback_config(port: u16) -> String {
     format!("[fleet]\naccounts_source = \"http://127.0.0.1:{port}/fleet.csv\"\nmachine = \"m1\"\n")
 }
 
-/// Wait, under the hang detector, for the instance's log to say its
 /// activation wake is armed: the upkeep's first kick is behind it.
 #[track_caller]
 fn wake_armed(inst: &mut Instance) {
@@ -262,7 +206,6 @@ fn wake_armed(inst: &mut Instance) {
     }
 }
 
-/// A loopback source that answers one GET: what it was asked, sent on the
 /// first channel, and its answer, `body`, written once the second says so.
 fn loopback_source(
     body: &'static str,
@@ -328,7 +271,6 @@ fn a_test_instance_and_a_fresh_home_fetch_no_accounts_and_a_configured_one_fetch
         }
     };
 
-    // 1. As every test instance is: inert by construction, a source or not.
     let (port, asked, _release) = loopback_source("email,computer,claude\nm1@example.test,m1,1\n");
     let mut inst = boot("acct-upkeep-inert", loopback_config(port), false);
     let word = upkeep_word(&mut inst);
@@ -344,7 +286,6 @@ fn a_test_instance_and_a_fresh_home_fetch_no_accounts_and_a_configured_one_fetch
     no_files(&inst);
     drop(inst);
 
-    // 2. A fresh home, the live upkeep on the real code path.
     let mut inst = boot("acct-upkeep-fresh", String::new(), true);
     let word = upkeep_word(&mut inst);
     assert!(word.contains("accounts-upkeep=unconfigured"), "{word}");
@@ -354,7 +295,6 @@ fn a_test_instance_and_a_fresh_home_fetch_no_accounts_and_a_configured_one_fetch
     no_files(&inst);
     drop(inst);
 
-    // 3. NEGATIVE CONTROL: the live upkeep and a configured loopback source.
     let (port, asked, release) = loopback_source("email,computer,claude\nm1@example.test,m1,1\n");
     let mut inst = boot("acct-upkeep-conf", loopback_config(port), true);
     let line = asked.recv_timeout(MUST_HAPPEN).unwrap_or_else(|_| {

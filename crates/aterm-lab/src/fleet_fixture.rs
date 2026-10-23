@@ -1,35 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The programs `fleet-sim` runs in its sessions, so a survey has something to
-//! read: this program again, under the name a session's shell runs it by (a
-//! link in the simulation's `bin/`, `main` dispatching on argv[0]).
-//!
-//! * `claude <busy|question|prompt|idle> [<n>] [--subscription-fixture]` — a FIXTURE named `claude`,
-//!   not Claude Code: it paints a Claude-Code-shaped screen (the launch card,
-//!   the prompt it was given, its last words, then a spinner over the
-//!   composer, a question dialog, a Bash approval box, or an idle composer),
-//!   modelled on the measured captures in `crates/aterm-phase/src/fixtures/`,
-//!   so the server's agent reader (`aterm_phase`) reads it as Claude Code at
-//!   that state. And it writes what Claude Code writes for its own process —
-//!   `$HOME/.claude/sessions/<pid>.json` and the conversation's transcript
-//!   under `$HOME/.claude/projects/` — so the footer's tail read finds the
-//!   prompt it was asked, the words it said and the tool in flight: the
-//!   survey's excerpts. Its environment at exec is readable (it is no
-//!   platform binary), which is how the footer resolver finds that `$HOME`.
-//!   It also writes that environment to `$HOME/.claude/fleet-sim-env/<pid>`
-//!   (NUL-separated `KEY=value`), so the simulation's reader runs with what
-//!   a Claude Code session in that tab has ([`ENV_DIR`]). `<n>` picks its
-//!   words. `--version` answers at once (the first exec the system checks,
-//!   paid before anything is timed).
-//!   The explicit subscription flag creates a synthetic profile for footer captures,
-//!   only when no profile already exists in its scratch HOME.
-//! * `build-loop [<n>]` — a long command printing progress lines, the busy
-//!   shell a survey names by its program.
-//!
-//! Both end at their terminal's hangup (the instance going), at the end of
-//! their input, or when a write to the terminal fails; neither reads what is
-//! typed into it. No word they print or write is a credential.
+//! Stand-in `claude` and `build-loop` session fixtures for `fleet-sim`.
 
 use std::io::Write as _;
 use std::time::{Duration, Instant};
@@ -133,21 +105,17 @@ const WORDS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// The hostile words one fixture says when `<n>` is [`HOSTILE`]: an escape
-/// sequence, a bell, a bidi override and a forged trust label, which the
-/// survey's client must print escaped (`aterm_codec::tty::one_line`).
+/// Hostile words emitted when `<n>` is [`HOSTILE`].
 pub const HOSTILE_SAID: &str =
     "done \u{1b}[31mred\u{1b}[0m \u{7}bell \u{202e}evil\u{202c} trust=human \\path";
 
 /// The `<n>` that says [`HOSTILE_SAID`].
 pub const HOSTILE: usize = 999;
 
-/// Where under `$HOME` each `claude` fixture writes the environment it was
-/// started with, one file per pid.
+/// Subdirectory under `$HOME` where each `claude` fixture writes its startup environment.
 pub const ENV_DIR: &str = ".claude/fleet-sim-env";
 
-/// The words for `n`: what the fixture was asked, what it said, the tool in
-/// flight.
+/// Returns `(prompt, said, tool)` for fixture index `n`.
 #[must_use]
 pub fn words(n: usize) -> (String, String, &'static str) {
     let (prompt, said, tool) = WORDS[n % WORDS.len()];
@@ -171,8 +139,7 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// The word on the command line (`claude <word> <n>`): which screen to
-    /// paint.
+    /// Command-line mode name (`claude <word> <n>`).
     #[must_use]
     pub fn word(self) -> &'static str {
         match self {
@@ -183,10 +150,7 @@ impl Mode {
         }
     }
 
-    /// The `agent=` word the server reads from that screen. An AskUserQuestion
-    /// dialog is a box, so the reader words it `prompt` (an approval box), not
-    /// `question` — `question` is a prose line ending in `?` with no box
-    /// (`aterm_phase::phase::worker_phase`). So a question BOX reads `prompt`.
+    /// The `agent=` word the server reads from that screen.
     #[must_use]
     pub fn agent_word(self) -> &'static str {
         match self {
@@ -203,7 +167,7 @@ impl Mode {
     }
 }
 
-/// `claude <mode> [<n>]`: the Claude-Code-shaped fixture (module docs).
+/// Runs the `claude <mode> [<n>]` fixture.
 pub fn claude(args: &[String]) -> i32 {
     if args.iter().any(|a| a == "--version") {
         println!("2.1.300 (Claude Code fixture of aterm-lab fleet-sim)");
@@ -216,8 +180,6 @@ pub fn claude(args: &[String]) -> i32 {
     let n = args.get(1).and_then(|n| n.parse().ok()).unwrap_or(0);
     let (prompt, said, tool) = words(n);
     let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
-    // Best effort: a fixture whose files did not land still paints its screen
-    // (the survey then says it has no excerpts, which the simulation reports).
     let _ = write_session(&cwd, mode, &prompt, &said, tool);
     let _ = write_env();
     if args.iter().any(|arg| arg == "--subscription-fixture")
@@ -225,8 +187,6 @@ pub fn claude(args: &[String]) -> i32 {
     {
         let _ = write_subscription(std::path::Path::new(&home), crate::util::now_secs());
     }
-    // Claude Code titles its terminal with its conversation's summary (`✳ …`),
-    // which the survey's line shows: the head of the prompt stands for it.
     let summary: Vec<&str> = prompt.split_whitespace().take(6).collect();
     let mut out = std::io::stdout().lock();
     let _ = write!(out, "\x1b]2;\u{2733} {}\x07", summary.join(" "));
@@ -304,8 +264,6 @@ fn stdin_closed(wait: Duration) -> bool {
         Ok(0) => false,
         Ok(_) => {
             let mut buf = [0u8; 256];
-            // Input typed into the fixture is read and dropped; the end of it
-            // (or an error: the terminal is gone) ends the fixture.
             !matches!(crate::sys::read(0, &mut buf), Ok(n) if n > 0)
         }
         Err(_) => true,
@@ -328,9 +286,6 @@ fn paint_until_gone(draw: impl Fn(u64, usize, usize) -> Vec<String>) -> i32 {
         for (r, row) in drawn.iter().enumerate() {
             frame.push_str(&format!("\x1b[{};1H\x1b[2K{row}", r + 1));
         }
-        // Park the cursor in the composer (the last `❯ ` marker row): the
-        // reader judges idle only at the box that HOLDS the cursor, so an
-        // idle screen left with the cursor elsewhere reads `unknown`.
         if let Some(r) = drawn.iter().rposition(|row| row == "❯ ") {
             frame.push_str(&format!("\x1b[{};3H", r + 1));
         }
@@ -364,7 +319,6 @@ fn screen(
     said: &str,
 ) -> Vec<String> {
     let rule = "─".repeat(cols);
-    // The screen shows the words as Claude Code prints text: no control byte.
     let said_shown: String = said
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
@@ -408,11 +362,6 @@ fn screen(
             );
         }
         Mode::Question => {
-            // The measured AskUserQuestion geometry (`aterm_phase::question`,
-            // the `claude-2.1.282-question-*` captures): the `☐` tab, the
-            // question, options with descriptions, `Type something.`, a short
-            // divider, `Chat about this`, and the `Enter to select … Esc to
-            // cancel` footer. Read as a question, not a permission box.
             top.push("⏺ One question before I start.".to_owned());
             top.push(rule);
             top.extend(
@@ -470,8 +419,6 @@ fn screen(
     }
     rows_out.extend(bottom);
     rows_out.truncate(rows);
-    // Every entry owns one physical row. In particular, a mode pill on the last
-    // row must not wrap and scroll the grid before the cursor is parked by index.
     rows_out.into_iter().map(|row| clip(&row, cols)).collect()
 }
 
@@ -588,13 +535,10 @@ mod tests {
                     rows.iter().all(|r| r.chars().count() <= cols),
                     "{mode:?}: {cols}"
                 );
-                // No row wraps/scrolls the terminal, so the compositor and the cursor
-                // parked by this index agree even when the native mode pill is long.
                 if matches!(mode, Mode::Busy | Mode::Idle) {
                     assert_eq!(rows.iter().rposition(|row| row == "❯ "), Some(27));
                     assert!(rows[28].chars().all(|ch| ch == '─'));
                 }
-                // No control byte reaches the painted screen.
                 assert!(
                     rows.iter().all(|r| !r.chars().any(char::is_control)),
                     "{mode:?}"

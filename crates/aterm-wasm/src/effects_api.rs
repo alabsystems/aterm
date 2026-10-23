@@ -428,6 +428,8 @@ mod tests {
     use super::streak_is_dark;
 
     /// With no override the streak takes the native classifier's side, mid-greys
+    /// included: `#A0A0A0` is light to the chrome, so the streak must not paint
+    /// additive light on it.
     #[test]
     fn streak_polarity_follows_the_theme_background_by_default() {
         for v in 0..=255u32 {

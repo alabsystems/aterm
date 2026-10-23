@@ -1,46 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The REAL Gemini CLI and the REAL Antigravity CLI (`agy`) in the lab's
-//! tab, each launched by path against the stub's Gemini API
-//! ([`crate::stub::gemini`]): `GEMINI_API_KEY` is the lab's fake key
-//! ([`LAB_GEMINI_KEY`]) and `GOOGLE_GEMINI_BASE_URL` the stub. Neither may
-//! use a Google account or reach Google: each gets a scratch `HOME` of its
-//! own (`gemini-home/`, `agy-home/`) seeded before every launch so that it
-//! shows no sign-in, auth or onboarding screen and opens no browser, and the
-//! jail keeps every connection on loopback (the owner's `~/.gemini` is on the
-//! protected list).
-//!
-//! * Gemini CLI (Homebrew's `gemini-cli`, `$LAB_GEMINI`): `.gemini/settings.json`
-//!   selects the `gemini-api-key` auth (without it the CLI infers its
-//!   `gateway` auth from the base URL, refuses it, and opens its auth dialog),
-//!   turns the folder trust off (`--untrusted`: on, with no trusted folder, so
-//!   its trust dialog draws), the usage statistics (Clearcut), the telemetry,
-//!   the update check and the IDE nudge off, and names a theme (no theme
-//!   picker). No proxy: Gemini CLI routes even the loopback base URL through
-//!   one, so the jail alone refuses what else it reaches for. `NO_BROWSER`
-//!   is set and `BROWSER` is the open recorder; `TMPDIR` is the scratch's
-//!   `tmp/`, where it writes its client error reports. It relaunches itself
-//!   as a parent node and a child, and the parent ignores SIGTERM: `down`
-//!   ends it with SIGKILL after its 4 s (`ignored TERM -> KILL`).
-//! * agy (the managed store's, `$LAB_AGY`): `.gemini/antigravity-cli/settings.json`
-//!   holds `"modelProvider": "gemini"` (without it agy signs in with a Google
-//!   account in a browser: never launched without it) and the project in
-//!   `trustedWorkspaces` (`--untrusted`: none, so its trust prompt draws);
-//!   `cache/onboarding.json` marks the onboarding done (`--onboarding`: no
-//!   onboarding and no trust seed, so its first-run screens draw; the
-//!   provider stays). Its feature-flag and telemetry hosts
-//!   (`antigravity-unleash.goog`, `play.googleapis.com`, which it asks for
-//!   even on the API key) go to the black-hole proxy, which logs them; its
-//!   auto-update is off as the managed launcher turns it off.
-//!
-//! A login (`login`, `logout`, `auth`) is refused in either's arguments, and
-//! a Gemini CLI sandbox (profiles do not nest). The version of each is read
-//! at `up` from its package (Gemini CLI's `package.json`, agy's atpkg build
-//! record), else from its `--version` in the jail once its home is seeded,
-//! never by running it unjailed or unseeded. The seeds are written and taken
-//! out through no link ([`put`], [`scratch_remove`]): the agent writes the
-//! directories they sit in.
+//! Isolated lab harness for launching real Gemini CLI and Antigravity CLI (`agy`) against the loopback Gemini stub.
 
 use std::path::Path;
 
@@ -51,20 +12,20 @@ use crate::sys::{PutSrc, put, scratch_remove};
 use crate::util::shell_quote;
 use crate::{Fail, LAB, Res};
 
-/// The fake key both CLIs send as `x-goog-api-key` (the stub logs `auth=gemini-key`).
+/// Fake API key sent by both CLIs as `x-goog-api-key`.
 pub use crate::stub::gemini::LAB_GEMINI_KEY;
 
-/// The two agents of this module.
+/// Gemini-family CLI agent under test.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Agent {
     /// Gemini CLI.
     Gemini,
-    /// The Antigravity CLI.
+    /// Antigravity CLI (`agy`).
     Agy,
 }
 
 impl Agent {
-    /// The verb, the `env.sh` agent and the fixtures' prefix.
+    /// Short CLI verb and fixture prefix (`"gemini"` or `"agy"`).
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
@@ -73,7 +34,7 @@ impl Agent {
         }
     }
 
-    /// The binary the lab runs, as `up` recorded it (empty: none).
+    /// Executable path recorded by `up` (empty if absent).
     #[must_use]
     pub fn bin(self, run: &Run) -> &str {
         match self {
@@ -82,7 +43,7 @@ impl Agent {
         }
     }
 
-    /// Its version, as `up` read it.
+    /// Version string recorded by `up`.
     #[must_use]
     pub fn ver(self, run: &Run) -> &str {
         match self {
@@ -91,7 +52,7 @@ impl Agent {
         }
     }
 
-    /// Its scratch `HOME`, under the lab's scratch.
+    /// Scratch `HOME` subdirectory name under the lab root.
     #[must_use]
     pub fn home(self) -> &'static str {
         match self {
@@ -100,7 +61,7 @@ impl Agent {
         }
     }
 
-    /// The rows that show its TUI is drawing (a trust, onboarding or idle screen).
+    /// Screen regex matching the agent's initial TUI frame.
     #[must_use]
     pub fn drawn(self) -> &'static str {
         match self {
@@ -110,16 +71,14 @@ impl Agent {
     }
 }
 
-/// The lab has this agent to run.
+/// Verify that `run` has a binary configured for `agent`.
 ///
 /// # Errors
-/// None was found at `up`.
+/// Returns a [`Fail`] when no binary was found at `up`.
 pub fn need(run: &Run, agent: Agent) -> Result<(), Fail> {
     let bin = agent.bin(run);
     if bin.is_empty() || !crate::sys::executable(bin) {
         let how = match agent {
-            // No provider: aterm installs no Gemini CLI, so the lab runs only the one it is
-            // named (docs/DESIGN-init-system-2026-10-20.md §6.1 row 32).
             Agent::Gemini => "LAB_GEMINI=/path/to/gemini at up names one; aterm installs none",
             Agent::Agy => "aterm pkg install agy, or LAB_AGY=/path/to/agy at up",
         };
@@ -138,9 +97,7 @@ const PRETTY: Style = Style {
     ascii: true,
 };
 
-/// Gemini CLI's `.gemini/settings.json`: the API-key auth, no statistics,
-/// telemetry, update check or IDE nudge, a theme, and the folder trust off
-/// unless `untrusted` (then on, so the trust dialog draws for the project).
+/// Build `.gemini/settings.json` with API-key auth and telemetry disabled.
 #[must_use]
 pub fn gemini_settings(untrusted: bool) -> String {
     J::obj([
@@ -172,18 +129,13 @@ pub fn gemini_settings(untrusted: bool) -> String {
     .dump(PRETTY)
 }
 
-/// agy's `.gemini/antigravity-cli/settings.json`: the Gemini API provider
-/// (never left out: without it agy signs in with a Google account), and the
-/// trusted workspaces (none: its trust prompt draws).
+/// Build `.gemini/antigravity-cli/settings.json` trusting `trusted` directories.
 #[must_use]
 pub fn agy_settings(trusted: &[String]) -> String {
     agy_settings_with(trusted, &[])
 }
 
-/// [`agy_settings`] with `extra` keys set after (`--setting KEY=VALUE`): one
-/// of agy's own settings a measurement turns, e.g. `hideActiveItems`, the key
-/// of `Show active subagents and background tasks below the input box`. The
-/// provider is never one of them: a sign-in never runs here.
+/// Build `agy` `settings.json` with `extra` key-value overrides.
 #[must_use]
 pub fn agy_settings_with(trusted: &[String], extra: &[(String, J)]) -> String {
     let mut j = J::obj([("modelProvider", J::s("gemini"))]);
@@ -201,8 +153,7 @@ pub fn agy_settings_with(trusted: &[String], extra: &[(String, J)]) -> String {
     j.dump(PRETTY)
 }
 
-/// One `--setting KEY=VALUE`: the value read as JSON (`true`, `3`, `"x"`),
-/// else as a string; `None` for no `=`, an empty key, or the provider's key.
+/// Parse a `KEY=VALUE` override, interpreting `VALUE` as JSON when valid.
 #[must_use]
 pub fn setting_of(kv: &str) -> Option<(String, J)> {
     let (key, value) = kv.split_once('=')?;
@@ -213,7 +164,7 @@ pub fn setting_of(kv: &str) -> Option<(String, J)> {
     Some((key.to_string(), value))
 }
 
-/// agy's `.gemini/antigravity-cli/cache/onboarding.json`: the onboarding done.
+/// Build `.gemini/antigravity-cli/cache/onboarding.json` marking onboarding complete.
 #[must_use]
 pub fn agy_onboarded() -> String {
     J::obj([
@@ -224,11 +175,10 @@ pub fn agy_onboarded() -> String {
     .dump(PRETTY)
 }
 
-/// Refuse what would start a login (a Google sign-in) or a sandbox inside the
-/// jail, anywhere in `args`.
+/// Reject CLI arguments that would initiate login or enable an inner sandbox.
 ///
 /// # Errors
-/// What was refused.
+/// Returns a refusal message naming the forbidden flag.
 pub fn safe_args(agent: Agent, args: &[String]) -> Result<(), String> {
     for a in args {
         match (agent, a.as_str()) {
@@ -250,7 +200,7 @@ pub fn safe_args(agent: Agent, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// How `gemini` and `agy` launch.
+/// Parsed launch options for `gemini` or `agy`.
 #[derive(Debug, Default)]
 pub struct Launch {
     /// `-e K=V`.
@@ -268,10 +218,10 @@ pub struct Launch {
     pub args: Vec<String>,
 }
 
-/// Parse `gemini`'s or `agy`'s options.
+/// Parse CLI launch flags for `agent`.
 ///
 /// # Errors
-/// An unknown option, or `-e` with no value.
+/// Returns an error on unknown options or missing flag values.
 pub fn parse_launch(agent: Agent, args: &[String]) -> Result<Launch, String> {
     let name = agent.name();
     let mut l = Launch::default();
@@ -311,9 +261,7 @@ pub fn parse_launch(agent: Agent, args: &[String]) -> Result<Launch, String> {
     Ok(l)
 }
 
-/// The launcher the tab types (`clear`, then `exec`, so the tab's process IS
-/// the agent): the scratch `HOME`, the fake key, the stub's base URL, the open
-/// recorder and the keychain tripwire's log, and for agy the black-hole proxy.
+/// Build the shell command line that `exec`s `agent` in its isolated scratch environment.
 #[must_use]
 pub fn launcher(run: &Run, agent: Agent, envs: &[String], args: &[String]) -> String {
     let w = run.w.to_string_lossy();
@@ -324,7 +272,6 @@ pub fn launcher(run: &Run, agent: Agent, envs: &[String], args: &[String]) -> St
         "exec env -u GOOGLE_API_KEY -u GOOGLE_GENAI_USE_VERTEXAI -u GOOGLE_CLOUD_PROJECT -u GOOGLE_APPLICATION_CREDENTIALS \\\n",
     );
     if agent == Agent::Gemini {
-        // Gemini CLI routes even the loopback base URL through a proxy it is handed: none, the jail alone
         s.push_str(
             "  -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \\\n",
         );
@@ -378,12 +325,10 @@ fn unseed(path: &Path) -> Result<(), Fail> {
     scratch_remove(path).map_err(|e| Fail::die(format!("cannot remove {}: {e}", path.display())))
 }
 
-/// Seed the agent's scratch home for this launch (through no link): the
-/// files that keep its sign-in, auth and onboarding screens away, and the
-/// trust seed unless `untrusted`.
+/// Write or remove scratch-home config files for `agent` prior to launch.
 ///
 /// # Errors
-/// A write was refused.
+/// Returns a [`Fail`] on symlink or I/O errors.
 pub fn seed(run: &Run, agent: Agent, l: &Launch) -> Result<(), Fail> {
     let home = run.w.join(agent.home());
     match agent {
@@ -421,10 +366,10 @@ pub fn seed(run: &Run, agent: Agent, l: &Launch) -> Result<(), Fail> {
     Ok(())
 }
 
-/// Launch the agent in the lab's first tab; the `launched: …` line.
+/// Seed the scratch home and launch `agent` in the lab's first tab.
 ///
 /// # Errors
-/// No such agent, no witness, a refused argument, or the launch line could not be typed.
+/// Returns a [`Fail`] if the binary or witness is missing, arguments are refused, or the TUI fails to draw.
 pub fn launch(run: &Run, agent: Agent, l: &Launch) -> Result<String, Fail> {
     need(run, agent)?;
     crate::procs::need_witness(run)?;
@@ -480,12 +425,12 @@ fn cmd(agent: Agent, args: &[String]) -> Res {
     Ok(0)
 }
 
-/// `gemini [tag] [-e K=V]... [--no-wait] [--untrusted] [-- gemini args]`.
+/// Run the `gemini` lab subcommand.
 pub fn cmd_gemini(args: &[String]) -> Res {
     cmd(Agent::Gemini, args)
 }
 
-/// `agy [tag] [-e K=V]... [--no-wait] [--untrusted] [--onboarding] [-- agy args]`.
+/// Run the `agy` lab subcommand.
 pub fn cmd_agy(args: &[String]) -> Res {
     cmd(Agent::Agy, args)
 }
@@ -516,9 +461,7 @@ mod tests {
     }
 
     /// `--setting KEY=VALUE` sets one of agy's own keys beside the seed's, the
-    /// value read as JSON where it is JSON. NEGATIVE CONTROLS: the provider is
-    /// never one (a sign-in never runs here), a word with no `=` is refused,
-    /// and Gemini CLI takes no `--setting`.
+    /// value read as JSON where it is JSON.
     #[test]
     fn an_agy_setting_is_seeded_beside_the_provider() {
         let l = parse_launch(Agent::Agy, &v(&["--setting", "hideActiveItems=true"])).unwrap();
@@ -572,8 +515,7 @@ mod tests {
 
     /// The seeds keep every sign-in away: Gemini CLI's auth is the API key in
     /// both variants, agy's provider is the Gemini API in both; only the trust
-    /// seed moves. NEGATIVE CONTROL: the trusted variant names the project and
-    /// turns the folder trust off; the untrusted one does neither.
+    /// seed moves.
     #[test]
     fn the_seeds_keep_the_auth_and_move_only_the_trust() {
         for untrusted in [false, true] {

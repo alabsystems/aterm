@@ -32,6 +32,7 @@ pub(crate) const RAINBOW_SPARKLE_LIGHT_SHARE: f32 = 0.9;
 pub(super) const RAINBOW_SPARKLE_COV_MAX: f32 = 61.0;
 
 /// The sparkle ceiling must be the tighter of the two bounds; a ceiling above
+/// what the emitter can already ask for would be dead code.
 const _: () = assert!(
     RAINBOW_SPARKLE_COV_MAX < OVER_INK_COV_CAP * 1.5,
     "the sparkle ceiling must bind before the legibility clamp"
@@ -330,18 +331,24 @@ pub(super) const RAINBOW_LAID_END_REACH: f32 =
 pub(super) const RAINBOW_LAID_HUE_SWEEP: f32 = 2.0;
 
 /// The adjacency bound: no retune of step, gain, clamp or dwell may push
+/// neighbouring cells further apart than [`RAINBOW_UNDERLINE_SWEEP_MAX`] (red
+/// beside violet), taken at the fastest lay.
 const _: () = assert!(
     RAINBOW_LAID_SWEEP_MAX_PER_CELL + RAINBOW_LAID_END_PULL <= RAINBOW_UNDERLINE_SWEEP_MAX,
     "one typed cell must step at most RAINBOW_UNDERLINE_SWEEP_MAX of the spectrum"
 );
 
 /// The end-pull's landing is narrower than the slowest lay
+/// ([`RAINBOW_LAID_SWEEP_MIN_PER_CELL`]), or two consecutive keystrokes could
+/// lay the same field.
 const _: () = assert!(
     RAINBOW_LAID_END_PULL < RAINBOW_LAID_SWEEP_MIN_PER_CELL,
     "the end-pull's landing must be narrower than one lay at the slowest rate"
 );
 
 /// The reference pace [`RAINBOW_LAID_SWEEP_PER_CELL`] must be a pace the rate
+/// rule can resolve to for some mark length, and the landing error plus one
+/// fastest lay must stay inside the adjacency ceiling.
 const _: () = assert!(
     RAINBOW_LAID_SWEEP_MIN_PER_CELL <= RAINBOW_LAID_SWEEP_PER_CELL
         && RAINBOW_LAID_SWEEP_PER_CELL <= RAINBOW_LAID_SWEEP_MAX_PER_CELL
@@ -744,6 +751,7 @@ pub(super) fn push_velocity_dash_over(
 }
 
 /// The dash's two vertices: the tail `trail_s` seconds back along the live
+/// velocity at a quarter of `cov`, the head at `(x, y)` at full.
 #[inline]
 #[allow(
     clippy::too_many_arguments,

@@ -2,11 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The decoder: a [`Read`] adapter over a stream of Zstandard frames.
-//!
-//! The block-level code is carved from ruzstd 0.8.3's decode core: each file
-//! under this module that derives from it names its upstream file. The frame
-//! loop ([`Decoder`]), the window (`window.rs`) and the limits are aterm's;
-//! [`Decoder`]'s docs are the contract.
 
 mod bits;
 mod block;
@@ -44,72 +39,9 @@ enum State {
     Failed,
 }
 
-/// Decodes a stream of Zstandard frames read from `R`: the shape of
-/// `zstd::Decoder` (a [`Read`] adapter), for what atpkg's installer reads.
-///
-/// It accepts what libzstd 1.5.7 without legacy support accepts from real
-/// producers:
-///
-/// * any number of frames back to back, skippable frames among them, and at
-///   least one frame (an empty stream is an early end, as in libzstd);
-/// * windows up to [`WINDOW_MAX`], so `--long=27` and `--ultra` archives
-///   decode;
-/// * every block, literals and sequence-table type of RFC 8878.
-///
-/// It refuses dictionaries (a frame naming one), windows past
-/// [`WINDOW_MAX`], and anything breaking a rule of the format. It holds a
-/// frame's `Frame_Content_Size`, when present, exactly, and verifies the
-/// content checksum, when the frame carries one, before any of the frame's
-/// last block is read. A frame without one is accepted unless the reader
-/// asked for [`Decoder::require_checksum`].
-///
-/// The checksum is checked only if the frame's last block is read: a
-/// caller that stops reading at a format boundary of its own (the end of a
-/// tar archive) reads on to the end of the stream for it to be checked.
-///
-/// It is stricter than libzstd's streaming decoder on input no real producer
-/// writes, each a rule of RFC 8878 that libzstd does not hold. It refuses:
-///
-/// * a damaged Huffman stream, which libzstd's double-symbol decoder can
-///   accept (it clamps an over-read at a stream's end) and decode wrongly;
-/// * a `Frame_Content_Size` the frame does not decode to when its last block
-///   is empty (libzstd skips that check on an empty last block);
-/// * a match offset past the declared `Window_Size` (libzstd reaches as far
-///   as its buffer, the window plus two blocks);
-/// * a compressed block of size zero;
-/// * a single-segment frame of exactly `WINDOW_MAX + 1` bytes (libzstd's
-///   default cap is one byte higher than [`WINDOW_MAX`]).
-///
-/// # Memory
-///
-/// Bounded by the input's declarations, never by its decoded size: the
-/// window (at most [`WINDOW_MAX`], allocated only as output arrives), three
-/// block-sized buffers (at most [`BLOCK_MAX`] each) and fixed-size entropy
-/// tables. Total output has no cap here: a caller that must bound it (atpkg
-/// holds an archive to its signed content and structure allowances) counts
-/// what it reads.
-///
+/// Decodes a stream of Zstandard frames read from `R`: the shape of `zstd::Decoder` (a [`Read`] adapter), for what atpkg's installer reads.
 /// # Errors
-///
-/// Nothing in the input panics the decoder. A frame breaking a rule is an
-/// [`io::ErrorKind::InvalidData`] error carrying a [`DecodeError`]; input
-/// ending inside a frame is [`io::ErrorKind::UnexpectedEof`]; errors from
-/// `R` pass through. After any error every later read fails.
-///
-/// [`WINDOW_MAX`]: crate::frame::WINDOW_MAX
-/// [`BLOCK_MAX`]: crate::frame::BLOCK_MAX
-///
-/// ```
-/// use std::io::Read;
-/// use aterm_zstd::Decoder;
-/// use aterm_zstd::frame::{self, Checksum};
-///
-/// let mut zst = Vec::new();
-/// frame::write_raw(&mut zst, b"hello", Checksum::Xxh64).unwrap();
-/// let mut out = Vec::new();
-/// Decoder::new(&zst[..]).read_to_end(&mut out).unwrap();
-/// assert_eq!(out, b"hello");
-/// ```
+/// Nothing in the input panics the decoder.
 pub struct Decoder<R> {
     input: R,
     state: State,
@@ -152,22 +84,14 @@ impl<R: BufRead> Decoder<R> {
         }
     }
 
-    /// Refuses every frame that carries no content checksum
-    /// ([`DecodeError::NoChecksum`]) at its header, before any of its content
-    /// is read. Skippable frames carry no content and are skipped as before.
-    ///
-    /// For a reader with no other check on what decodes: atpkg requires it
-    /// of a release bundle whose signed row carries no `tree_root`, so that a
-    /// decoding defect is caught by either the signed root or the producer's
-    /// checksum.
+    /// Refuses every frame that carries no content checksum ([`DecodeError::NoChecksum`]) at its header, before any of its content is read.
     #[must_use]
     pub fn require_checksum(mut self) -> Self {
         self.require_checksum = true;
         self
     }
 
-    /// Advances one frame header or block. `Ok(false)` once the stream has
-    /// ended cleanly.
+    /// Advances one frame header or block.
     fn step(&mut self) -> io::Result<bool> {
         match self.state {
             State::FrameStart => self.start_frame(),
@@ -183,8 +107,6 @@ impl<R: BufRead> Decoder<R> {
     /// Reads a frame's magic and header, or skips a skippable frame; at the
     /// end of the input, ends the stream.
     fn start_frame(&mut self) -> io::Result<bool> {
-        // Nothing is consumed yet, so an interrupted read is simply retried
-        // (as `read_exact` and `io::copy` do below).
         let at_end = loop {
             match self.input.fill_buf() {
                 Ok(buf) => break buf.is_empty(),
@@ -271,7 +193,6 @@ impl<R: BufRead> Decoder<R> {
             let mut stored = [0u8; 4];
             self.input.read_exact(&mut stored).map_err(inside_frame)?;
             let stored = u32::from_le_bytes(stored);
-            // The checksum is the low 32 bits of XXH64, by definition.
             let computed = self.hash.digest() as u32;
             if stored != computed {
                 return Err(DecodeError::Checksum { stored, computed }.into());
@@ -361,13 +282,10 @@ mod tests {
     #[test]
     fn require_checksum_refuses_at_the_first_frame_without_one() {
         let zst = stream();
-        // The negative control: without the requirement, all of it reads.
         let mut all = Vec::new();
         Decoder::new(&zst[..]).read_to_end(&mut all).unwrap();
         assert_eq!(all, b"checkedunchecked");
 
-        // With it, the checksummed frame and the skippable frame read, and
-        // the refusal comes at the next header, before its content.
         let mut decoder = Decoder::new(&zst[..]).require_checksum();
         let mut buf = [0u8; 64];
         let n = decoder.read(&mut buf).unwrap();

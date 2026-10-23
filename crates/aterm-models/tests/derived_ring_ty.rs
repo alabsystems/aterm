@@ -19,6 +19,8 @@ use aterm_spec::derive::Model;
 use aterm_spec::verify;
 
 /// NO WEDGE: deadlock-free at `Buggy = 0` and a DEADLOCK (not an invariant
+/// violation) at `Buggy = 1`, on both tiers — the blocking-call class (the
+/// `drain_buffered` `fill_buf` hang) no reachable-bad-STATE invariant can see.
 #[test]
 fn designs_that_must_not_wedge_are_deadlock_free_and_catch_the_wedge() {
     type Final = fn(&aterm_spec::interp::State) -> bool;
@@ -55,6 +57,10 @@ fn derived_flash_limiter_proves_and_catches_overlap_blindness() {
 }
 
 /// Scope-aggregate models: a budget charged against EVERY live instance at
+/// once — the window's WCAG flash budget (`FlashLimiterWindow`, the
+/// machine-checked form of the scope-cardinality census's `flash-limiter`
+/// claim), the process's alt-screen archive pool (`AltArchivePool`), one live
+/// holder per session id (`SessionIdClaim`).
 #[test]
 fn scope_aggregate_models_prove_catch_and_multiply() {
     type Corner = &'static [(&'static str, i64)];
@@ -77,11 +83,17 @@ fn scope_aggregate_models_prove_catch_and_multiply() {
 }
 
 /// A model using the `Buggy` convention: the invariant must be PROVEN at the
+/// committed `Buggy=0`, and a COUNTEREXAMPLE found at `Buggy=1` — so the
+/// invariant is non-trivial AND genuinely catches the bug
+/// ([`verify::prove_and_catch_scalar`]; a function-valued model is
+/// `spec-check models`'s, under `ty`).
 fn assert_proves_and_catches(m: &Model) {
     verify::prove_and_catch_scalar(m, m.name);
 }
 
 /// Every design invariant must be the ONLY law some `Buggy = 1` step breaks — a
+/// transition out of a reachable state where every invariant still holds, into
+/// one where that law, and no other, fails.
 fn assert_every_invariant_breaks_first(m: &Model) {
     let mut alone: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for dial in m.mutant_dials() {
@@ -137,6 +149,9 @@ fn assert_every_invariant_breaks_first(m: &Model) {
 }
 
 /// The committed-dead actions of `m` are exactly `expected`, pinned where the
+/// mutants are written, so a mutant folded back into a live action — which masks
+/// its neighbours and removes a healthy path from the `Buggy=1` world — fails
+/// here by name.
 fn assert_committed_dead_actions(m: &Model, expected: &[&str]) {
     let healthy_fired = aterm_spec::interp::fired_actions(&aterm_spec::interp::with_buggy(m, 0));
     let dead: Vec<_> = m
@@ -283,6 +298,13 @@ fn derived_erased_key_echo_order_keeps_the_next_key_lit() {
 }
 
 /// The session log's ring (`docs/DESIGN-session-log-2026-10-15.md` §5.1,
+/// §9; phase 2A): each law is the only one some single
+/// `Buggy = 1` step breaks, every mutant is a dead action at the committed
+/// config that is caught on its own, and the paths the laws are about are
+/// reachable: a batch takes a closed turn's detail before its open and keeps
+/// its close, the open path alone may overfill the ring by the one record just
+/// appended, an orphan step outlives a turn beside it, and a run closed
+/// mid-turn cascades over its turn and step.
 #[test]
 fn derived_session_log_ring_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_ring_model();
@@ -465,6 +487,12 @@ fn derived_session_log_ring_proves_and_catches_each_law() {
 }
 
 /// THE BUS MIRROR (design §5.5, phase 4): each of the reader's-view laws is
+/// the only one some single `Buggy = 1` step breaks, every mutant is dead at
+/// the committed config and caught on its own, and the paths are reachable:
+/// a hole said by one cover; a slot pinned under the update's fence that no
+/// landing passes, landed by the successor only after it adopted the session,
+/// its carried cursor moved past the pin; another writer's record
+/// at the pinned seq re-pinned, never landed.
 #[test]
 fn derived_log_mirror_proves_and_catches_each_law() {
     let model = aterm_models_session::log_mirror_model();
@@ -598,6 +626,10 @@ fn derived_log_mirror_proves_and_catches_each_law() {
 }
 
 /// The session log's reader (§5.1, phase 2A): each law is the
+/// only one some single `Buggy = 1` step breaks, every mutant is dead at the
+/// committed config and caught on its own, and the paths are reachable: a
+/// read across a hole is told so and counts it as no loss, and a read cut at
+/// a live record past an eviction in the middle counts the eviction once.
 #[test]
 fn derived_session_log_cursor_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_cursor_model();
@@ -647,6 +679,13 @@ fn derived_session_log_cursor_proves_and_catches_each_law() {
 }
 
 /// The journal reader's view: each of its five laws
+/// is the only one some single `Buggy = 1` step breaks, every mutant is dead
+/// at the committed config and caught on its own, and the paths: a line
+/// journaled twice reads once, a dead chain reads its crash closes innermost
+/// first (turn, run, session) after a crash gap at the journal's head, a lost
+/// run's turn closes before the session, a loss is said, a crash with a
+/// backlog and a snap written behind says `after=` the writer's cursor, a
+/// `#handed` chain reads open and a rolled-back one closed.
 #[test]
 fn derived_session_log_journal_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_journal_model();
@@ -719,6 +758,10 @@ fn derived_session_log_journal_proves_and_catches_each_law() {
 }
 
 /// The mark quota (§7.4): each of its four laws is the
+/// only one some single `Buggy = 1` step breaks, every mutant is dead at the
+/// committed config and caught on its own, and the paths: a third mark takes
+/// the first, a fence keeps its marks past the quota (only the newest beside
+/// them), lifting it trims them, and a lowered budget lowers the share.
 #[test]
 fn derived_session_log_mark_quota_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_mark_quota_model();
@@ -761,6 +804,12 @@ fn derived_session_log_mark_quota_proves_and_catches_each_law() {
 }
 
 /// The program share: each of its four laws
+/// is the only one some single `Buggy = 1` step breaks, every mutant is dead
+/// at the committed config and caught on its own, and the paths: a third
+/// program mark of a node takes its first and nothing beside it, another
+/// node's marks are its own share, a fence keeps its marks past the share
+/// (only the newest beside them), and lifting it trims each node to its
+/// share.
 #[test]
 fn derived_session_log_program_share_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_program_share_model();
@@ -806,6 +855,12 @@ fn derived_session_log_program_share_proves_and_catches_each_law() {
 }
 
 /// The rows: each of its three laws is the
+/// only one some single `Buggy = 1` step breaks, every mutant is dead at
+/// the committed config and caught on its own, and the paths: the floor's
+/// rows outlive every other record a batch may take, a third row moves the
+/// oldest out of the floor and that one goes first, each row takes the next
+/// id, a carried update's ids continue past the predecessor's ceiling,
+/// and a crash adoption's start at 1 in its own epoch.
 #[test]
 fn derived_session_log_rows_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_rows_model();
@@ -876,6 +931,14 @@ fn derived_session_log_rows_proves_and_catches_each_law() {
 }
 
 /// The claims (§3.7, §7.3):
+/// each of its seven laws is the only one some single `Buggy = 1` step
+/// breaks, every mutant is dead at the committed config and caught on its
+/// own, and the paths: a claim's clear leaves an observed need standing, a
+/// claim ranks below it, another author's label is stored but never shown,
+/// another author's verdict leaves the trusted one held, a `ctl` verdict and
+/// label leave the harness's held and shown, a `ctl` clear and an edge's
+/// raise of the same word leave the harness's need standing, and the owner's
+/// non-claim clear lifts every need but the harness's.
 #[test]
 fn derived_session_log_claims_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_claims_model();
@@ -943,6 +1006,8 @@ fn derived_session_log_claims_proves_and_catches_each_law() {
 }
 
 /// The turn tracker (§2.4): each of its six laws is the only one some
+/// single `Buggy = 1` step breaks, and every mutant is dead at the
+/// committed config and caught on its own.
 #[test]
 fn derived_transcript_join_proves_and_catches_each_law() {
     let model = aterm_models_session::transcript_join_model();
@@ -1238,6 +1303,9 @@ fn derived_turn_tracker_proves_and_catches_each_law() {
 }
 
 /// The session log fold (phase 3B, plan §4.2 as amended by A31 and S13):
+/// each of its seven laws is the only one some single `Buggy = 1` step
+/// breaks, and every mutant is dead at the committed config and caught on
+/// its own.
 #[test]
 fn derived_session_log_fold_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_fold_model();
@@ -1316,6 +1384,8 @@ fn derived_session_log_fold_proves_and_catches_each_law() {
 }
 
 /// The heuristic mail → turn link (phase 5, plan 5D-5; T10, T39): each of
+/// its seven laws is the only one some single `Buggy = 1` step breaks, and
+/// every mutant is dead at the committed config and caught on its own.
 #[test]
 fn derived_session_log_mail_link_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_mail_link_model();

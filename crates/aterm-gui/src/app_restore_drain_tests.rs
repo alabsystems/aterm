@@ -1,10 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE COLD DRAIN ([`super::RestoreDrain`]): a cold launch's layout rebuild,
-//! a slice per park. Every test drives the real slice driver with a zero
-//! budget, so each slice lands exactly one window or tab: the order and the
-//! interleaving with what a person does are the code's, never the clock's.
+//! THE COLD DRAIN ([`super::RestoreDrain`]): a cold launch's layout rebuild, a slice per park.
 
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
@@ -214,7 +211,6 @@ fn a_person_s_tabs_outlive_the_drain_and_a_closed_tab_stays_closed() {
     assert!(!slice(&mut app));
     assert_eq!(titles(&app, wid), ["A", "D"]);
 
-    // The person closes D (not the window's last tab, so the window stays).
     assert!(!app.close_tab_at(wid, 1));
     assert_eq!(titles(&app, wid), ["A"]);
     let mine = open_tab(&mut app, wid);
@@ -459,16 +455,7 @@ fn carried(wl: &restore::WindowLayout) -> Vec<Carried> {
 }
 
 /// A TAB THE DRAIN STILL OWES KEEPS ITS OWN AGENT AND THE OWNER'S HOLD
-/// THROUGH A RESTART'S QUIT, AND TAKES NO LIVE TAB'S (RV-SURV-1). Its leaf
-/// names the previous launch's pool id, which this launch mints again from
-/// 0, so the fills that read a leaf's session by its id
-/// (`RestoreManifest::fill_agents`, `fill_holds`) took the owed tab's own
-/// agent and hold off it — and where that id named a live tab of this
-/// launch, put that tab's on it: two leaves naming one conversation, the
-/// wrong tab reopened held. So did every leaf of a window not begun. The
-/// owed leaves name no id of this launch's, and keep what they carry.
-/// NEGATIVE CONTROLS: the live tab keeps its own hold and agent, read off
-/// its session as before.
+/// THROUGH A RESTART'S QUIT, AND TAKES NO LIVE TAB'S (RV-SURV-1).
 #[test]
 fn a_system_quit_inside_the_drain_keeps_each_owed_tabs_own_agent_and_hold() {
     const C_AGENT: &str = "0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c";
@@ -486,9 +473,7 @@ fn a_system_quit_inside_the_drain_keeps_each_owed_tabs_own_agent_and_hold() {
         Some("local pause"),
         Some(carried_agent(C_AGENT)),
     );
-    // D's old id is the one B's live shell gets in this launch.
     written_as(&mut first, 3, 1, None, None);
-    // A window not begun, its old id A's live bootstrap's.
     let mut second = window(&["X"], 0);
     written_as(
         &mut second,
@@ -502,8 +487,6 @@ fn a_system_quit_inside_the_drain_keeps_each_owed_tabs_own_agent_and_hold() {
     assert!(!slice(&mut app));
     assert_eq!(titles(&app, wid), ["A", "B"]);
     assert_eq!(app.windows.len(), 1, "X is not begun");
-    // B's live shell: the owner's hold on it, and the agent its host
-    // publishes.
     let b = app
         .view_store
         .get(app.windows[&wid].tab_set.tabs()[1].focus)
@@ -571,7 +554,7 @@ fn a_system_quit_inside_the_drain_keeps_each_owed_tabs_own_agent_and_hold() {
 /// (RV-SURV-1): an owed tab carried the agent and the owner's hold its
 /// earlier layout — a crash's, a restart's — named, and the quit wrote them
 /// on, so the next launch relaunched an agent the person's own quit had
-/// ended. Both fields' rule: a person's own quit writes neither.
+/// ended.
 #[test]
 fn a_persons_own_quit_inside_the_drain_keeps_no_agent_and_no_hold() {
     const C_AGENT: &str = "0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c";
@@ -594,7 +577,6 @@ fn a_persons_own_quit_inside_the_drain_keeps_no_agent_and_no_hold() {
     for (title, _, hold, agent) in carried(&layout.windows[0]) {
         assert_eq!((hold, agent), (None, None), "{title}");
     }
-    // The next launch relaunches nothing from it.
     let wire = layout.to_toml().expect("the layout writes");
     let back = restore::RestoreManifest::from_toml(&wire).expect("the layout parses back");
     let mut next = App::headless_for_test();
@@ -615,32 +597,7 @@ fn a_persons_own_quit_inside_the_drain_keeps_no_agent_and_no_hold() {
 
 /// A LANDED HELD TAB KEEPS ITS AGENT DOWN THROUGH A RESTART INSIDE THE
 /// DRAIN, WHATEVER PUT ITS HOLD BACK (the merge review's GUI-M7-1; ruling 23
-/// (ii)). The drain holds a landed held tab's agent (`App::restored_held`)
-/// until its last slice, and a restart's quit names it on the tab's leaf
-/// (`App::unhanded_restored_agent`). The hold that kept it down is often not
-/// on the session: a FLEET row is never put back on a fresh or bootstrap
-/// shell, and the owner's is refused while an update commits the session.
-/// Read off the session alone, the leaf named the agent with no hold, and
-/// the next launch relaunched it into the tab. The leaf now carries the rows
-/// the restore could not put back (`App::unhanded_restored_holds`), and the
-/// next launch keeps the agent the holder's. NEGATIVE CONTROLS: the owner's
-/// hold put back rides the session's own rows; the unheld tab's agent is owed
-/// its relaunch throughout.
-///
-/// PUT BACK AND THEN LIFTED BY THE OWNER, the hold stays lifted (theirs to
-/// lift) and the agent stays down (ruling 23 (ii): a held tab's agent is not
-/// relaunched when the hold lifts LC-8): the leaf names no
-/// agent, and the next launch neither holds the tab nor relaunches into it,
-/// as after the drain's last slice. It named the agent with no hold, and the
-/// next launch relaunched it and typed its carry-on into the tab. AND THE
-/// RECORD THAT NAMES THE AGENT AND THE LINE THAT RESUMES IT is said once, as
-/// the lift's wake is read (`App::let_go_lifted_held`; the review's KR-J-5),
-/// or, lifted on the last turn with its wake unread, as the exit closes the
-/// message log before the quit writes its layout
-/// (`App::close_messages_at_exit`): said only at the pass's end, which the
-/// restart came before, it was said nowhere, the next launch having no held
-/// tab to say. A tab whose hold still stands says nothing before the pass's
-/// end: the next launch says it.
+/// (ii)).
 #[test]
 fn a_restart_inside_the_drain_keeps_a_landed_held_tabs_agent_down() {
     use crate::fabric::apply_hold_for_test;
@@ -672,8 +629,6 @@ fn a_restart_inside_the_drain_keeps_a_landed_held_tabs_agent_down() {
         ),
     ] {
         let mut app = App::headless_for_test();
-        // A host that relaunches restored agents: the hold is what keeps a
-        // held tab's down, and its record names the line that resumes it.
         let host = crate::harness_host::HostHandle::for_restored_test(std::sync::Arc::new(
             |_, _, _, _| "wait:shell-prompt".to_string(),
         ));
@@ -689,15 +644,12 @@ fn a_restart_inside_the_drain_keeps_a_landed_held_tabs_agent_down() {
                 .count()
         };
         let wid = WindowId(0);
-        // The window's bootstrap shell is the first tab's (session 0).
         let bootstrap = std::sync::Arc::clone(&app.pool.get(0).expect("the bootstrap").ctx);
         if then == Then::Fenced {
             let _ = bootstrap.fabric.fence_hold(true);
         }
         let mut wl = window(&["A", "B"], 0);
         written_as(&mut wl, 0, 0, Some(row), Some(carried_agent(X)));
-        // Another process than X's: one agent two leaves name is relaunched
-        // once.
         let mut y = carried_agent(Y);
         y.pid = 4343;
         written_as(&mut wl, 1, 1, None, Some(y));
@@ -719,7 +671,6 @@ fn a_restart_inside_the_drain_keeps_a_landed_held_tabs_agent_down() {
             assert!(apply_hold_for_test(&bootstrap, None), "{case}: lifted");
         }
         if then == Then::Lifted {
-            // The lift's wake, as the loop reads it.
             app.on_fabric_changed(&bootstrap.self_id);
             assert_eq!(
                 naming_x(&app, records),
@@ -727,8 +678,6 @@ fn a_restart_inside_the_drain_keeps_a_landed_held_tabs_agent_down() {
                 "{case}: the record naming X and its resume line, said at the lift's wake"
             );
         }
-        // The exit's order (`main_entry`): the message log closes, then the
-        // quit writes its layout.
         let _ = app.close_messages_at_exit();
         assert_eq!(
             naming_x(&app, records),
@@ -742,7 +691,6 @@ fn a_restart_inside_the_drain_keeps_a_landed_held_tabs_agent_down() {
             usize::from(!held_next),
             "{case}: the quit says nothing more"
         );
-        // Lifted, nothing stands to lift: the record names no lift.
         let lift = format!("hold {} off", bootstrap.self_id);
         assert!(
             !app.messages
@@ -769,7 +717,6 @@ fn a_restart_inside_the_drain_keeps_a_landed_held_tabs_agent_down() {
             ("B".into(), None, None, mine(Y)),
             "{case}: the owed tab keeps its own"
         );
-        // The next launch: the held tab's agent is said again, never handed.
         let wire = layout.to_toml().expect("the layout writes");
         let back = restore::RestoreManifest::from_toml(&wire).expect("the layout parses back");
         let mut next = App::headless_for_test();
@@ -798,7 +745,6 @@ fn a_restart_inside_the_drain_keeps_a_landed_held_tabs_agent_down() {
             vec![mine(Y)],
             "{case}: X is not handed, held or lifted"
         );
-        // Said again by the next launch only while held: once in all.
         let next_records = next.messages.log().records().count();
         next.say_restored_held();
         assert_eq!(
@@ -816,10 +762,7 @@ fn a_restart_inside_the_drain_keeps_a_landed_held_tabs_agent_down() {
 /// host, so neither the host's queue nor an agent it publishes names it
 /// yet, and the quit's fill (`App::fill_desk_agents`) wrote no agent on
 /// any landed tab — a restart in a cold drain's first instants relaunched
-/// none of the desk's agents at the next launch. The owner's hold on a
-/// landed tab is read off its session, where the restore put it back.
-/// NEGATIVE CONTROLS: the owed tabs keep their own (RV-SURV-1), and no
-/// leaf names another's agent.
+/// none of the desk's agents at the next launch.
 #[test]
 fn a_system_quit_inside_the_drain_keeps_the_landed_tabs_agents_not_yet_handed() {
     let agents = [
@@ -832,11 +775,9 @@ fn a_system_quit_inside_the_drain_keeps_the_landed_tabs_agents_not_yet_handed() 
     let wid = WindowId(0);
     let mut wl = window(&["A", "B", "C", "D"], 2);
     for (at, agent) in agents.iter().enumerate() {
-        // The earlier launch's pool ids: 0 to 3, this launch's own.
         let hold = matches!(at, 0 | 1).then_some("local -");
         let id = u64::try_from(at).expect("a small index");
         let mut agent = carried_agent(agent);
-        // A cause no durable layout should carry: never written on.
         agent.cause = (at == 0).then(|| "asked".to_string());
         written_as(&mut wl, at, id, hold, Some(agent));
     }
@@ -862,7 +803,6 @@ fn a_system_quit_inside_the_drain_keeps_the_landed_tabs_agents_not_yet_handed() 
             ("D".into(), None, mine(agents[3])),
         ]
     );
-    // An explicit restart's cause rides a handoff's layout alone.
     for window in &layout.windows {
         for tab in &window.restored_tabs {
             if let restore::RestoredSplitTree::Leaf {

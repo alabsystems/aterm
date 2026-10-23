@@ -1,32 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Raw mode on a terminal, put back however the program leaves it
-//! (docs/DESIGN-amacs-2026-10-19.md §5.1).
-//!
-//! [`RawGuard::enter`] saves the terminal's settings and sets the cfmakeraw
-//! equivalent: ICANON, ECHO, ISIG, IEXTEN, ICRNL, OPOST and IXON cleared (so C-c, C-z,
-//! C-s and C-q reach the program as keys), `VMIN = 1`, `VTIME = 0`. It tracks the
-//! private modes the program sets through it ([`Mode`]) and puts everything back:
-//!
-//! - when it is dropped;
-//! - from a panic hook chained before the one already installed, so the panic message
-//!   lands on the shell's screen, not the alternate one. That is a panic on the thread
-//!   that made the guard, where the program draws, or on any thread when panics abort.
-//!   A panic on another thread is a worker's, which the program may survive: the
-//!   terminal stays as it is, and is put back when the guard is dropped or its own
-//!   thread panics. A panic the guard's own thread catches leaves the terminal put
-//!   back for good: the program should end;
-//! - from a SIGINT, SIGTERM or SIGHUP handler, which then ends the process as that
-//!   signal ends it (the `restore_and_end` pattern of aterm-agent's `fleet_member.rs`).
-//!   A signal that was ignored when the guard was made stays ignored.
-//!
-//! Every path runs the same restore, which reads only atomics, writes static bytes
-//! and calls `tcsetattr` and `tcflush`: async-signal-safe, allocation-free and never
-//! waiting on the terminal. Each part is marked done only once it is done, so a signal
-//! that lands while another path is restoring finishes what that path had not yet
-//! written (writing a part twice at worst) before the process ends. That state is
-//! process-wide, so one guard is alive at a time.
+//! Raw mode on a terminal, put back however the program leaves it.
 
 use std::io;
 use std::os::fd::RawFd;
@@ -69,8 +44,7 @@ impl Termios {
     /// These settings made raw.
     fn raw(self) -> Self {
         let mut raw = self;
-        // SAFETY: the buffer is an aligned termios every bit pattern of which is valid
-        // (integers and arrays of them); cfmakeraw edits it in place.
+        // SAFETY: the buffer is an aligned termios every bit pattern of which is valid.
         unsafe {
             libc::cfmakeraw(raw.as_mut_ptr());
             let t = &mut *raw.as_mut_ptr();
@@ -140,12 +114,7 @@ fn write_raw(fd: RawFd, mut bytes: &[u8]) {
 
 /// Put the terminal back: leave every mode set, then restore the saved settings and
 /// drop the input the program never read, so replies and keys meant for it are not
-/// typed into the shell. Nothing waits for the terminal to read what was written
-/// (TCSANOW, not TCSAFLUSH): output was processed when it was written, and a terminal
-/// that stopped reading must not hang the exit. Each part is marked done once it is
-/// written, so a path that interrupts another (a signal during a drop) finishes it.
-/// Async-signal-safe: atomics, `write(2)`, `tcsetattr` and `tcflush`, and no
-/// allocation.
+/// typed into the shell.
 fn restore() {
     let fd = FD.load(Ordering::Acquire);
     if fd < 0 {
@@ -159,8 +128,7 @@ fn restore() {
     }
     if ARMED.load(Ordering::Acquire) {
         let saved = saved();
-        // SAFETY: `saved` holds the settings `tcgetattr` gave when the guard was made;
-        // the flush names the open terminal.
+        // SAFETY: `saved` holds the settings `tcgetattr` gave when the guard was made; the flush.
         unsafe {
             libc::tcsetattr(fd, libc::TCSANOW, saved.as_ptr());
             libc::tcflush(fd, libc::TCIFLUSH);
@@ -174,8 +142,7 @@ fn restore() {
 /// signal raised, which is held until this handler returns.
 extern "C" fn restore_and_end(signal: libc::c_int) {
     restore();
-    // SAFETY: `sigaction` is plain data for which all-zero is a valid value (an empty
-    // mask, no flags).
+    // SAFETY: `sigaction` is plain data for which all-zero is a valid value.
     let mut default: libc::sigaction = unsafe { std::mem::zeroed() };
     default.sa_sigaction = libc::SIG_DFL;
     // SAFETY: the default disposition, for the signal this handler took.
@@ -210,10 +177,7 @@ fn catch_fatal(sig: libc::c_int) -> Option<(libc::c_int, libc::sigaction)> {
     Some((sig, was))
 }
 
-/// Chain [`restore`] before the panic hook already installed, once per process. It
-/// puts the terminal back, before the message is printed, on a panic on the thread that
-/// made the live guard, or on any thread when a panic ends the process (see the module
-/// docs).
+/// Chain [`restore`] before the panic hook already installed, once per process.
 fn chain_panic_hook() {
     static HOOK: Once = Once::new();
     HOOK.call_once(|| {
@@ -233,9 +197,7 @@ fn on_guard_thread() -> bool {
     owner == Some(std::thread::current().id())
 }
 
-/// The terminal on a descriptor in raw mode, and the private modes set on it, put back
-/// however the program leaves (see the module docs). One is alive per process at a
-/// time; the descriptor must stay open for the guard's life.
+/// The terminal on a descriptor in raw mode.
 #[derive(Debug)]
 pub struct RawGuard {
     fd: RawFd,
@@ -247,10 +209,8 @@ pub struct RawGuard {
 
 impl RawGuard {
     /// Save the settings of the terminal on `fd` and set it raw.
-    ///
     /// # Errors
-    /// `fd` is not a terminal, its settings cannot be read or set, or another guard is
-    /// alive in this process (`ResourceBusy`).
+    /// `fd` is not a terminal.
     pub fn enter(fd: RawFd) -> io::Result<Self> {
         if CLAIMED.swap(true, Ordering::AcqRel) {
             return Err(io::Error::new(
@@ -280,8 +240,6 @@ impl RawGuard {
             kitty: 0,
             replaced,
         };
-        // Armed first, so a signal the moment the terminal is raw still puts it back.
-        // Input is kept: keys typed ahead of the program are its own.
         saved.raw().apply(fd, libc::TCSANOW)?;
         Ok(guard)
     }
@@ -292,15 +250,11 @@ impl RawGuard {
         Modes::from_bits(MODES.load(Ordering::Acquire))
     }
 
-    /// Set `mode`, to be put back however the program leaves. A mode already set writes
-    /// nothing. Entering the alternate screen with a kitty entry set carries the entry
-    /// onto it (the order modes are set in does not matter; see [`crate::tty`]).
-    ///
+    /// Set `mode`, to be put back however the program leaves.
     /// # Errors
     /// The write's OS error.
     pub fn enable(&mut self, mode: Mode) -> io::Result<()> {
         let bit = mode.bit().bits();
-        // Recorded first: a mode half-written is still put back.
         let before = MODES.fetch_or(bit, Ordering::AcqRel);
         if before & bit != 0 {
             return Ok(());
@@ -311,9 +265,7 @@ impl RawGuard {
         self.write(&enable_bytes(mode, Modes::from_bits(before), self.kitty))
     }
 
-    /// Put `mode` back now. Leaving the alternate screen with a kitty entry set carries
-    /// the entry back to the main screen.
-    ///
+    /// Put `mode` back now.
     /// # Errors
     /// The write's OS error.
     pub fn disable(&mut self, mode: Mode) -> io::Result<()> {
@@ -321,18 +273,12 @@ impl RawGuard {
         if !set.contains(mode.bit()) {
             return Ok(());
         }
-        // Marked put back once written, as the restore marks a mode: a signal meanwhile
-        // finishes the reset.
         let written = self.write(&disable_bytes(mode, set, self.kitty));
         MODES.fetch_and(!mode.bit().bits(), Ordering::AcqRel);
         written
     }
 
-    /// Set the terminal raw again, with every mode set, after the process was stopped
-    /// and continued: the shell may have reset the terminal meanwhile. Kitty's flags are
-    /// set in place, so no second entry is stacked. Nothing happens while the terminal
-    /// is put back (suspended, or after a panic on the guard's thread).
-    ///
+    /// Set the terminal raw again.
     /// # Errors
     /// The settings or the write failed.
     pub fn reassert(&mut self) -> io::Result<()> {
@@ -353,9 +299,7 @@ impl RawGuard {
         modes
     }
 
-    /// Back from a suspension: the settings the terminal has now become the ones to put
-    /// back (the person may have changed them meanwhile), it is set raw, and `modes` set
-    /// again.
+    /// Back from a suspension.
     pub(crate) fn reenter(&mut self, modes: Modes) -> io::Result<()> {
         let saved = Termios::read(self.fd)?;
         save(&saved);

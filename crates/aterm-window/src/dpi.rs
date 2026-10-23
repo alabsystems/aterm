@@ -89,7 +89,7 @@ impl Pixel for f64 {
 /// scale factors from anywhere other than winit, it's recommended to validate them using this
 /// function before passing them to winit; otherwise, you risk panics.
 #[inline]
-pub fn validate_scale_factor(scale_factor: f64) -> bool {
+pub const fn validate_scale_factor(scale_factor: f64) -> bool {
     scale_factor.is_sign_positive() && scale_factor.is_normal()
 }
 

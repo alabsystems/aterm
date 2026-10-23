@@ -1,5 +1,4 @@
 // Copyright 2026 Andrew Yates
-// Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
 #![warn(missing_docs)]
@@ -10,33 +9,6 @@
 )]
 
 //! Run-Length Encoding (RLE) for cell attributes.
-//!
-//! This crate provides RLE compression for terminal cell attributes based on
-//! Windows Terminal's `til/rle.h` pattern. Attributes are compressed into runs
-//! of consecutive cells with identical style.
-//!
-//! ## Design
-//!
-//! Terminal output often has runs of cells with identical attributes (e.g., a
-//! prompt in one color, then text in another). RLE compression exploits this
-//! by storing `(style, count)` pairs instead of per-cell styles.
-//!
-//! ## Architecture
-//!
-//! ```text
-//! Row Storage (before RLE):
-//! [Cell0][Cell1][Cell2][Cell3][Cell4][Cell5][Cell6][Cell7]
-//!  Bold   Bold   Bold   Bold  Normal Normal Normal Normal
-//!
-//! Row Storage (with RLE attributes):
-//! Characters: [C0][C1][C2][C3][C4][C5][C6][C7]
-//! Attributes: [(Bold, 4), (Normal, 4)]
-//! ```
-//!
-//! ## References
-//!
-//! - Windows Terminal: `src/inc/til/rle.h`
-//! - Ghostty: Style ID indirection in `page.zig`
 
 use std::fmt;
 use std::ops::Index;
@@ -71,7 +43,7 @@ use iteration_counter::{count_run_iteration, reset_run_iterations, take_run_iter
 
 #[cfg(not(test))]
 #[inline]
-fn count_run_iteration() {}
+const fn count_run_iteration() {}
 
 /// A run of cells with identical attributes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,8 +65,6 @@ pub struct RleCapacityError {
 
 impl fmt::Display for RleCapacityError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Avoid `write!`/`format_args!`, which expands an unsafe `fmt::Arguments`
-        // call in this body that the Trust verifier rejects.
         f.write_str("RLE capacity exceeded: requested ")?;
         fmt::Display::fmt(&self.requested, f)?;
         f.write_str(" but only ")?;
@@ -160,7 +130,6 @@ pub const fn clamp_rle_extend_count(total_length: u32, count: u32) -> u32 {
 /// Checked total length after extending `total_length` by `count` elements.
 ///
 /// # Errors
-///
 /// Returns [`RleCapacityError`] if `count > u32::MAX - total_length`.
 #[inline]
 pub const fn checked_rle_extend_total(
@@ -193,10 +162,7 @@ pub const fn clamp_rle_range(start: u32, end: u32, total_length: u32) -> Option<
     Some((start, clamped_end))
 }
 
-/// Compute `(prefix_len, mid_len, suffix_len)` when splitting a single run of length `run_len`
-/// across `[start_offset, end_offset_exclusive)`.
-///
-/// Returns `None` if `start_offset >= end_offset_exclusive` or `end_offset_exclusive > run_len`.
+/// Compute `(prefix_len, mid_len, suffix_len)` when splitting a single run of length `run_len` across `[start_offset, end_offset_exclusive)`.
 #[must_use]
 #[inline]
 pub const fn single_run_split_lengths(
@@ -225,8 +191,7 @@ pub const fn point_split_lengths(run_len: u32, offset_in_run: u32) -> Option<(u3
     Some((prefix, 1, suffix))
 }
 
-/// Compute `(prefix_keep_in_start, suffix_keep_in_end)` when a range spans from `start_offset`
-/// in a run of length `start_run_len` through `end_offset_exclusive` in a run of length `end_run_len`.
+/// Compute `(prefix_keep_in_start, suffix_keep_in_end)` across a start run (`start_run_len`) and end run (`end_run_len`).
 #[must_use]
 #[inline]
 pub const fn multi_run_edge_lengths(
@@ -327,20 +292,6 @@ impl<T: Default> Default for Run<T> {
 }
 
 /// Run-Length Encoded sequence of attributes.
-///
-/// Stores a sequence of attributes as runs of consecutive identical values.
-/// Provides O(runs) random access by a linear walk of the run lengths, and
-/// efficient range operations.
-///
-/// # Why no prefix-sum index
-///
-/// Lookups walk `runs` linearly. A cached start-offset index would cost an
-/// allocation per constructed `Rle` (scrollback builds one per line), and
-/// lines hold 1-6 runs, where the walk is also faster.
-///
-/// # Type Parameters
-///
-/// - `T`: The attribute type (must be `Copy + PartialEq + Default`)
 #[derive(Debug, Clone)]
 pub struct Rle<T> {
     /// The runs in order.
@@ -402,7 +353,6 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
 
     #[inline]
     const fn checked_run_length_sum(lhs: u32, rhs: u32) -> u32 {
-        // `saturating_add` discharges the overflow obligation for the verifier;
         // `total_length <= u32::MAX` guarantees it never saturates.
         lhs.saturating_add(rhs)
     }
@@ -443,42 +393,25 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
     }
 
     /// Push a single value onto the end.
-    ///
-    /// If the sequence is already at `u32::MAX` capacity, this is a silent
-    /// no-op. Use [`try_push`](Self::try_push) to detect overflow.
     #[inline]
     pub fn push(&mut self, value: T) {
         self.extend_with(value, 1);
     }
 
     /// Push a single value, returning an error if at capacity.
-    ///
-    /// Unlike [`push`](Self::push), this rejects the operation instead of
-    /// silently dropping the element.
     #[inline]
     pub fn try_push(&mut self, value: T) -> Result<(), RleCapacityError> {
         self.try_extend_with(value, 1)
     }
 
     /// Extend with multiple copies of the same value.
-    ///
-    /// If `count` exceeds [`remaining_capacity`](Self::remaining_capacity),
-    /// the count is silently clamped to the available space. The invariant
-    /// `total_length == sum(run.length)` is always preserved.
-    ///
-    /// Use [`try_extend_with`](Self::try_extend_with) to reject partial
-    /// insertions.
     #[inline]
     pub fn extend_with(&mut self, value: T, count: u32) {
         let count = count.min(self.remaining_capacity());
         self.extend_with_unclamped(value, count);
     }
 
-    /// Extend with multiple copies, returning an error if the full count
-    /// cannot fit.
-    ///
-    /// Unlike [`extend_with`](Self::extend_with), this rejects the entire
-    /// operation rather than silently clamping.
+    /// Extend with multiple copies, returning an error if the full count cannot fit.
     #[inline]
     pub fn try_extend_with(&mut self, value: T, count: u32) -> Result<(), RleCapacityError> {
         let available = self.remaining_capacity();
@@ -512,8 +445,7 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
         self.total_length = Self::checked_run_length_sum(self.total_length, count);
     }
 
-    /// Get the value at `index`, or `None` if out of bounds (the
-    /// non-panicking form of `Index`).
+    /// Get the value at `index`, or `None` if out of bounds (the non-panicking form of `Index`).
     #[must_use]
     #[inline]
     pub fn get(&self, index: u32) -> Option<T> {
@@ -525,8 +457,6 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
     }
 
     /// Set the value at a specific index.
-    ///
-    /// Returns `false` if index is out of bounds.
     pub fn set(&mut self, index: u32, value: T) -> bool {
         if index >= self.total_length {
             return false;
@@ -550,7 +480,6 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
         }
         let end = end.min(self.total_length);
 
-        // Fast path: entire sequence
         if start == 0 && end == self.total_length {
             self.runs.clear();
             self.runs.push(Run {
@@ -564,8 +493,6 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
             return;
         };
 
-        // `end >= 1` because `total_length > start >= 0` and `end > start`;
-        // `saturating_sub` discharges the verifier's underflow obligation.
         let Some((end_run_idx, end_offset)) = self.find_run(end.saturating_sub(1)) else {
             return;
         };
@@ -641,7 +568,6 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
 }
 
 /// Index trait implementation for `Rle<T>`.
-///
 /// # Panics
 ///
 /// Panics if `index` is out of bounds. For a non-panicking alternative,
@@ -651,9 +577,6 @@ impl<T: Copy + PartialEq + Default> Index<u32> for Rle<T> {
 
     #[inline]
     fn index(&self, index: u32) -> &Self::Output {
-        // An out-of-range `index` maps to `runs.len()`, so the slice bounds
-        // check panics; an explicit `expect` is one the verifier cannot
-        // discharge.
         let (run_idx, _) = self.find_run(index).unwrap_or((self.runs.len(), 0));
         &self.runs[run_idx].value
     }

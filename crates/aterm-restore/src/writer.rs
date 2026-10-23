@@ -164,10 +164,12 @@ pub struct HistoryWriter {
     /// `(start, seq, first_row)` of each chunk in `[lo, hi)`, oldest first.
     chunks: VecDeque<(u64, u64, u64)>,
     /// The absolute row one past the newest exported line (`hist_end_row`): the reset's
+    /// `oldest` until a chunk lands.
     end_row: u64,
     /// One past the highest ring offset ever written, under any modulus: what a clear zeroes.
     pub(crate) touched: usize,
     /// Encoded bytes of the chunks in `[lo, hi)` and the lines they hold, for the adaptive
+    /// cap's bytes-per-line ([`Self::bytes_per_line`]).
     run_bytes: u64,
     run_lines: u64,
 }
@@ -207,6 +209,7 @@ pub struct JournalWriter<S: RegionStore> {
     /// The record length each slot holds.
     slot_len: [usize; 2],
     /// One past the highest byte ever written in each slot: what
+    /// [`Self::settle_clear`] zeroes.
     slot_high: [usize; 2],
     /// The newest committed keyframe's tail position.
     keyframe_tail_from: u64,
@@ -214,11 +217,13 @@ pub struct JournalWriter<S: RegionStore> {
     tail_floor: u64,
     stream_processed: u64,
     /// Start positions of the records in `[tail_floor, tail_commit)`, oldest first: the
+    /// boundaries a floor may land on.
     tail_starts: VecDeque<u64>,
     tail_marks: u64,
     /// The ring's writer, for a single-threaded writer of the whole region ([`HistoryWriter`]: a window's worker keeps its own).
     pub(crate) history: HistoryWriter,
     /// The tail record being encoded, kept between appends so the tap allocates nothing
+    /// per slice.
     scratch: Vec<u8>,
     #[cfg(test)]
     fault: Option<WriterFault>,
@@ -307,6 +312,8 @@ fn ring_offset(pos: u64, cap: usize) -> usize {
 }
 
 /// Zero `len` bytes of `store` at `at`, a page of zeros at a time: one primitive store
+/// (and one hold of a shared store's lock) per 4 KiB, so zeroing the whole history ring
+/// never holds the region from the parse thread for more than a page's copy.
 fn zero<S: RegionStore + ?Sized>(store: &S, at: usize, len: usize) -> Result<(), StoreError> {
     let mut done = 0;
     while done < len {
@@ -399,42 +406,42 @@ impl<S: RegionStore> JournalWriter<S> {
     }
 
     /// The region's store.
-    pub fn store(&self) -> &S {
+    pub const fn store(&self) -> &S {
         &self.store
     }
 
     /// The region's layout.
-    pub fn geometry(&self) -> &Geometry {
+    pub const fn geometry(&self) -> &Geometry {
         &self.geometry
     }
 
     /// The tail position one past the last complete record.
-    pub fn tail_commit(&self) -> u64 {
+    pub const fn tail_commit(&self) -> u64 {
         self.tail_commit
     }
 
     /// The tail position below which bytes may be overwritten.
-    pub fn tail_floor(&self) -> u64 {
+    pub const fn tail_floor(&self) -> u64 {
         self.tail_floor
     }
 
     /// PTY bytes processed, as of the tail's commit.
-    pub fn stream_processed(&self) -> u64 {
+    pub const fn stream_processed(&self) -> u64 {
         self.stream_processed
     }
 
     /// Tail bytes written since the newest committed keyframe: what the policy's K3 (tail pressure) weighs against the ring.
-    pub fn tail_since_keyframe(&self) -> u64 {
+    pub const fn tail_since_keyframe(&self) -> u64 {
         self.tail_commit.saturating_sub(self.keyframe_tail_from)
     }
 
     /// The next keyframe's sequence number.
-    pub fn next_keyframe_seq(&self) -> u64 {
+    pub const fn next_keyframe_seq(&self) -> u64 {
         self.next_seq
     }
 
     /// Whether a keyframe was begun and not finished.
-    pub fn keyframe_in_progress(&self) -> bool {
+    pub const fn keyframe_in_progress(&self) -> bool {
         self.pending.is_some()
     }
 
@@ -444,6 +451,7 @@ impl<S: RegionStore> JournalWriter<S> {
     }
 
     /// The most payload one BYTES record carries in this ring: [`MAX_BYTES_PAYLOAD`],
+    /// or what fits beside a header in a small test ring.
     fn max_payload(&self) -> usize {
         let room = self.geometry.tail_cap.saturating_sub(TAIL_RECORD_HEADER) / 8 * 8;
         MAX_BYTES_PAYLOAD.min(room).max(1)
@@ -663,6 +671,7 @@ impl<S: RegionStore> JournalWriter<S> {
     }
 
     /// Move the floor onto the first record boundary at or past `need` (or onto `start`,
+    /// the record being written, when the window holds none) and store it.
     fn move_floor(&mut self, need: u64, start: u64) -> Result<(), StoreError> {
         while self.tail_starts.front().is_some_and(|&s| s < need) {
             self.tail_starts.pop_front();
@@ -911,13 +920,13 @@ impl HistoryWriter {
 
     /// The identity the ring's chunks are exported under (the default, whose width is 0, before the first reset: no engine's).
     #[must_use]
-    pub fn identity(&self) -> HistoryIdentity {
+    pub const fn identity(&self) -> HistoryIdentity {
         self.identity
     }
 
     /// The absolute row one past the newest exported line: where the next chunk starts.
     #[must_use]
-    pub fn end_row(&self) -> u64 {
+    pub const fn end_row(&self) -> u64 {
         self.end_row
     }
 
@@ -929,13 +938,13 @@ impl HistoryWriter {
 
     /// The ring's logical cap (its modulus).
     #[must_use]
-    pub fn cap(&self) -> usize {
+    pub const fn cap(&self) -> usize {
         self.cap
     }
 
     /// One past the highest ring offset ever written: the ring bytes this region has touched, and so keeps resident.
     #[must_use]
-    pub fn touched(&self) -> usize {
+    pub const fn touched(&self) -> usize {
         self.touched
     }
 
@@ -1071,6 +1080,7 @@ pub struct ControlWriter {
     /// The sequence number of the record the slot holds; 0 before the first write.
     seq: u64,
     /// One past the highest slot byte written in the current region: what a shorter
+    /// record leaves behind to be zeroed.
     high: usize,
     #[cfg(test)]
     fault: Option<WriterFault>,
@@ -1104,7 +1114,7 @@ impl ControlWriter {
 
     /// The sequence number of the record the slot holds (0: none written).
     #[must_use]
-    pub fn seq(&self) -> u64 {
+    pub const fn seq(&self) -> u64 {
         self.seq
     }
 
@@ -1153,6 +1163,7 @@ impl ControlWriter {
     }
 
     /// The slot's write protocol (module doc): commit word 0, copy, length, commit word,
+    /// then the stale bytes past a shorter record zeroed.
     fn write_record<S: RegionStore + ?Sized>(
         &mut self,
         store: &S,

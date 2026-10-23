@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! One editor view's own state (its selections, viewport, minibuffer and
-//! pending keys) and where its carets move: grapheme, word and line motion
-//! over the document's text.
+//! One editor view's own state (its selections, viewport, minibuffer and pending keys) and where its carets move: grapheme, word and line motion over the document's text.
 
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -71,29 +69,22 @@ pub struct EditorBufferView {
     pub primary: usize,
     pub viewport_anchor: usize,
     /// Renderer-derived body capacity installed by the host for this exact
-    /// view/window. Caret reveal never guesses a desktop-sized row count.
+    /// view/window.
     viewport_lines: usize,
     pub folds: Vec<Range<usize>>,
     pub minibuffer: Minibuffer,
-    /// The last accepted query belongs to this view, never to a terminal or
-    /// another editor view. Explicit next/previous can resume it after Enter.
+    /// The last accepted query belongs to this view, never to a terminal or another editor view.
     pub(super) last_search_query: String,
-    /// `set-mark-command` activates a persistent region anchor. Ordinary motion
-    /// advances only `head` while this bit is set; document mutations and abort
-    /// deactivate it. A non-empty pointer/Shift selection does not need this bit
-    /// for `kill-region`, but subsequent unshifted motion may collapse it.
+    /// `set-mark-command` activates a persistent region anchor.
     pub mark_active: bool,
     pub prefix_hud: Option<String>,
     pub(super) desired_column: Option<usize>,
     pub(super) chord_prefix: Vec<KeyChord>,
     pub(super) prefix_argument: Option<PrefixArgument>,
     pub(super) anchor_seq: Seq,
-    /// The command this view ran last (Emacs's `last-command`): a kill after
-    /// a kill joins it, and `C-l` after `C-l` moves on to the next place.
-    /// Typed text and a pointer press clear it.
+    /// The command this view ran last (Emacs's `last-command`): a kill after a kill joins it, and `C-l` after `C-l` moves on to the next place.
     pub(super) last_command: Option<EditorCommand>,
-    /// Where `C-l` last put the caret's line: the middle, the top, then the
-    /// bottom.
+    /// Where `C-l` last put the caret's line: the middle, the top, then the bottom.
     pub(super) recenter_phase: u8,
 }
 
@@ -120,9 +111,7 @@ impl EditorBufferView {
         }
     }
 
-    /// The primary selection: the one `primary` names, the last when `primary`
-    /// is past the end, and a caret at the start when a host left the view
-    /// with none (`selections` is public), rather than a panic.
+    /// The primary selection: the one `primary` names, the last when `primary` is past the end, and a caret at the start when a host left the view with none (`selections` is public), rather than a panic.
     pub fn primary_selection(&self) -> &Selection {
         const NO_SELECTION: Selection = Selection::caret(0);
         self.selections
@@ -160,12 +149,6 @@ impl EditorBufferView {
 
     pub fn scroll_lines_with(&mut self, lines: &EditorLines<'_>, delta: i32) {
         let total_lines = lines.total();
-        // Store the same stable anchor the renderer can actually present.  A
-        // wheel fling used to retain an EOF line here while paint clamped only
-        // its temporary clone to the last full viewport.  Reverse scrolling
-        // then appeared inert until that invisible debt had been repaid.
-        // `viewport_lines()` also gives a not-yet-reconciled zero-capacity view
-        // the only useful interpretation: one visible line.
         let last_full_viewport_anchor = total_lines.saturating_sub(self.viewport_lines());
         let current = lines
             .number_at(self.viewport_anchor)
@@ -187,13 +170,7 @@ impl EditorBufferView {
         self.reconcile_viewport_with(&EditorLines::scanning(text), visible_lines)
     }
 
-    /// Install the renderer's capacity. A changed capacity reveals the caret
-    /// (a resize must not leave it off screen); an unchanged one only clamps
-    /// the anchor to the last full viewport, so a view scrolled away from the
-    /// caret (the wheel, accessibility) paints where it was scrolled to — the
-    /// painted first line is the stored anchor, never a copy pulled back to
-    /// the caret with the stored one left behind. The reducer reveals the
-    /// caret after every event that moves it.
+    /// Install the renderer's capacity.
     pub fn reconcile_viewport_with(
         &mut self,
         lines: &EditorLines<'_>,
@@ -232,18 +209,11 @@ impl EditorBufferView {
         } else if caret_line >= anchor_line.saturating_add(visible_lines) {
             anchor_line = caret_line.saturating_sub(visible_lines.saturating_sub(3));
         }
-        // A document replacement can map both the caret and the old anchor to
-        // EOF. Clamp after caret reveal as well: a short document must start at
-        // line zero when the viewport can show it in full, rather than leaving
-        // authored diagnostics above a synthetic trailing blank line.
         anchor_line = anchor_line.min(last_full_viewport_anchor);
         self.viewport_anchor = lines.byte_of(anchor_line);
     }
 
-    /// Place or extend the primary selection from a pointer hit expressed as a
-    /// canonical document byte offset. The UI hit mapper already emits UTF-8
-    /// boundaries, but clamping here keeps the editor safe when this seam is
-    /// driven by accessibility or a future platform adapter.
+    /// Place or extend the primary selection from a pointer hit expressed as a canonical document byte offset.
     pub fn pointer_select(
         &mut self,
         text: &str,
@@ -305,12 +275,7 @@ impl EditorBufferView {
         )
     }
 
-    /// `recenter-top-bottom` (C-l): scroll so the primary caret's line sits
-    /// at the middle of the view, then, as the key repeats (`again`), at the
-    /// top, then at the bottom. `C-u N C-l` puts it at row `N` from the top
-    /// (a negative `N` counts up from the bottom), and a bare `C-u` at the
-    /// middle. The view never scrolls past its last full screen, so near the
-    /// end of a document the line sits as low as that allows.
+    /// `recenter-top-bottom` (C-l): scroll so the primary caret's line sits at the middle of the view, then, as the key repeats (`again`), at the top, then at the bottom.
     pub(super) fn recenter_top_bottom(
         &mut self,
         lines: &EditorLines<'_>,
@@ -354,15 +319,12 @@ impl EditorBufferView {
         !self.chord_prefix.is_empty()
     }
 
-    /// Whether ESC alone is pending, Meta for the next key the keymap can
-    /// spell.
+    /// Whether ESC alone is pending, Meta for the next key the keymap can spell.
     pub(crate) fn escape_pending(&self) -> bool {
         matches!(self.chord_prefix.as_slice(), [chord] if chord.is_escape())
     }
 
-    /// End a pending ESC that no key took. A `C-u` argument typed before it
-    /// stays, with its own HUD back; any other pending sequence is left
-    /// alone. Answers whether an ESC was pending.
+    /// End a pending ESC that no key took.
     pub(crate) fn end_escape_prefix(&mut self) -> bool {
         if !self.escape_pending() {
             return false;
@@ -372,10 +334,7 @@ impl EditorBufferView {
         true
     }
 
-    /// Open `minibuffer`, ending any key sequence still pending. The
-    /// minibuffer owns the keys from here and refuses every chord but `C-g`,
-    /// so a sequence begun before it opened (ESC, then the Find button) could
-    /// never complete, and would hold every key until `C-g`.
+    /// Open `minibuffer`, ending any key sequence still pending.
     pub(super) fn open_minibuffer(&mut self, minibuffer: Minibuffer) {
         self.chord_prefix.clear();
         self.prefix_hud = None;
@@ -408,8 +367,7 @@ impl EditorBufferView {
         self.mark_active = false;
     }
 
-    /// Take the pending `C-u` argument for the one command being dispatched,
-    /// clearing its HUD in the same step, so it can never reach a later one.
+    /// Take the pending `C-u` argument for the one command being dispatched, clearing its HUD in the same step, so it can never reach a later one.
     pub(super) fn take_prefix_argument(&mut self) -> Option<PrefixArgument> {
         let argument = self.prefix_argument.take();
         if argument.is_some() {
@@ -419,9 +377,6 @@ impl EditorBufferView {
     }
 
     /// Fold one decimal digit into a pending `C-u` argument (`C-u 2 C-k`).
-    /// Answers false, changing nothing, when no argument is pending, its
-    /// number is closed, or `key` is not one ASCII digit: the key is then
-    /// ordinary input.
     pub(super) fn accept_argument_digit(&mut self, key: &str) -> bool {
         let mut chars = key.chars();
         let (Some(digit), None) = (chars.next().and_then(|c| c.to_digit(10)), chars.next()) else {
@@ -458,11 +413,6 @@ pub(super) fn next_boundary(text: &str, position: usize) -> usize {
 
 /// The words of `text` from byte `from` on (0, or a place no word spans), each
 /// widened to the grapheme clusters it touches so the caret never lands inside one.
-///
-/// The words are [`aterm_grapheme::words`] of alphanumerics plus `_`: the rule a
-/// double-click and the find field follow, so M-f and M-b stop where they do. A
-/// ZWJ or ZWNJ joins the cluster before it, so a word that ends at one it does not
-/// share with the next word (`foo`, ZWJ, `bar`) ends after it.
 fn editor_words(text: &str, from: usize) -> impl Iterator<Item = Range<usize>> + '_ {
     let tail = text.get(from..).unwrap_or_default();
     let mut clusters = tail
@@ -513,9 +463,7 @@ pub(super) fn previous_word_boundary(text: &str, position: usize, count: usize) 
     }
 }
 
-/// The end of the `count`-th word that ends after `position` (or the end of the
-/// text), read in one pass from the last word break before the caret, so M-f costs
-/// the distance it moves, whatever its count.
+/// The end of the `count`-th word that ends after `position` (or the end of the text), read in one pass from the last word break before the caret, so M-f costs the distance it moves, whatever its count.
 pub(super) fn next_word_boundary(text: &str, position: usize, count: usize) -> usize {
     let position = clamp_to_char_boundary(text, position.min(text.len()));
     let from = aterm_grapheme::word_break_before(text, position, aterm_grapheme::is_word_char);
@@ -552,9 +500,7 @@ pub(super) fn next_line_position(text: &str, position: usize, desired_column: us
     byte_at_editor_display_column(text, next_start, next_end, desired_column)
 }
 
-/// Apply a one-line motion `count` times. It stops once a step no longer
-/// moves (the first or last line), so a large count costs only the lines it
-/// crosses.
+/// Apply a one-line motion `count` times.
 pub(super) fn repeat_line_motion(
     position: usize,
     count: usize,
@@ -593,10 +539,6 @@ trust_contract_fn! {
     }
 }
 
-// Specs `viewport-capacity-bounds` and `viewport-capacity-identity`
-// (SPECS.md), kernel-checked against the compiled body. On this target Trust
-// reads a `usize` as a `UInt64`; the proofs are the two case splits the body
-// makes.
 verify_island! {
     clean {
         theorem visible_line_capacity_one_le_cap : Nat.le (UInt64.toNat 1) (UInt64.toNat 256) := by
@@ -638,10 +580,7 @@ verify_island! {
     }
 }
 
-/// Clamp an externally supplied editor position to the preceding user-visible
-/// character boundary. Pointer mapping already emits these boundaries; keeping
-/// the reducer seam defensive prevents accessibility or a future adapter from
-/// installing a caret between a base, combining mark, emoji joiner, or flag RI.
+/// Clamp an externally supplied editor position to the preceding user-visible character boundary.
 pub(super) fn clamp_to_grapheme_boundary(text: &str, position: usize) -> usize {
     let position = clamp_to_char_boundary(text, position);
     if position == 0 || position == text.len() {
@@ -649,10 +588,6 @@ pub(super) fn clamp_to_grapheme_boundary(text: &str, position: usize) -> usize {
     }
     let start = line_start(text, position);
     let end = line_end(text, position);
-    // Include the line-feed in segmentation when one exists. Its grapheme
-    // start proves an ordinary LF line-end is addressable, while UAX #29 keeps
-    // CRLF together and therefore retreats a position between CR and LF to the
-    // start of that pair.
     let scan_end = end.saturating_add(usize::from(end < text.len()));
     text[start..scan_end]
         .grapheme_indices()
@@ -718,7 +653,6 @@ mod tests {
             2,
             "one line back paints"
         );
-        // Negative control: a resize reveals the caret.
         let mut resized = view.clone();
         view.scroll_lines(&text, 100);
         resized.viewport_anchor = view.viewport_anchor;
@@ -733,12 +667,10 @@ mod tests {
         workspace
             .execute(&mut store, &mut view, EditorCommand::MoveLineDown)
             .unwrap();
-        // The shorter UTF-8 line clamps to its final boundary, never into β.
         assert_eq!(view.primary_selection().head, "alpha\nβ".len());
         workspace
             .execute(&mut store, &mut view, EditorCommand::MoveLineDown)
             .unwrap();
-        // The original desired column survives the short middle line.
         assert_eq!(view.primary_selection().head, "alpha\nβ\ngamm".len());
         workspace
             .execute(&mut store, &mut view, EditorCommand::MoveLineUp)
@@ -806,7 +738,6 @@ mod tests {
         assert_eq!(line_number(&text, view.viewport_anchor), 8);
         assert!(view.viewport_anchor < bottom, "one reverse step moves now");
 
-        // Short and empty documents have no scrollable full-viewport anchor.
         for short in ["", "one", "one\ntwo"] {
             let (_, _, mut short_view, _) = editor(short);
             short_view.reconcile_viewport(short, 40);
@@ -816,8 +747,6 @@ mod tests {
             assert_eq!(short_view.viewport_anchor, 0);
         }
 
-        // A view may receive wheel input before its first geometry reconcile.
-        // Zero renderer capacity is normalized to one row, never underflowed.
         let (_, _, mut zero_view, _) = editor(&text);
         zero_view.viewport_lines = 0;
         zero_view.scroll_lines(&text, i32::MAX);
@@ -858,8 +787,6 @@ mod tests {
         assert!(model.check_invariant("CaretVisibleAfterResize", &after));
         assert!(model.check_invariant("ShortDocumentFullyVisible", &after));
 
-        // The shipping scroll transition stores the same bottom anchor paint
-        // presents, then makes immediate progress on one reverse input.
         let scroll_text = (0..12)
             .map(|line| format!("line {line}\n"))
             .collect::<String>();
@@ -891,16 +818,12 @@ mod tests {
         );
         assert!(model.check_invariant("FirstReverseStepMoves", &one_line_up));
 
-        // Negative control: retaining the old desktop anchor after installing
-        // the compact row count hides the caret and is not a real transition.
         let mut fixed_desktop = before.clone();
         fixed_desktop.insert("visible_lines", 8);
         fixed_desktop.insert("resized", 1);
         assert_eq!(admits(&model, &before, &fixed_desktop), None);
         assert!(!model.check_invariant("CaretVisibleAfterResize", &fixed_desktop));
 
-        // Negative control: leaving a short replacement anchored at its EOF is
-        // not the shipping transition and violates full-document visibility.
         let mut stranded_short = after;
         stranded_short.insert("short_anchor_line", 2);
         assert_eq!(admits(&model, &before, &stranded_short), None);
@@ -1010,22 +933,16 @@ mod tests {
         words
     }
 
-    /// M-f / M-b find the words a double-click selects. They used to call a word
-    /// any run of grapheme clusters that START with a letter, so a cluster led by
-    /// a prepended number sign (`۝١`) was no word, and a ZWJ or ZWNJ, which joins
-    /// the cluster before it, welded `foo` and `bar` into one word where a
-    /// double-click (and the find field) see two: an invisible character must not
-    /// weld two words together. A joiner that spells a word (Persian, Sinhala,
-    /// Bengali) still belongs to it.
+    /// M-f / M-b find the words a double-click selects.
     #[test]
     fn word_motion_finds_the_words_a_double_click_selects() {
         for word in [
-            "\u{06DD}\u{0661}\u{0662}\u{0663}", // ۝١٢٣
-            "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}", // می‌خواهم
-            "\u{0DC1}\u{0DCA}\u{200D}\u{0DBB}\u{0DD3}", // ශ්‍රී
-            "\u{09B0}\u{200D}\u{09CD}\u{09AF}\u{09BE}\u{09AC}", // র‍্যাব
-            "\u{0928}\u{092E}\u{0938}\u{094D}\u{0924}\u{0947}", // नमस्ते
-            "\u{182C}\u{1820}\u{1837}\u{180E}\u{1820}", // ᠬᠠᠷ᠎ᠠ
+            "\u{06DD}\u{0661}\u{0662}\u{0663}",
+            "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}",
+            "\u{0DC1}\u{0DCA}\u{200D}\u{0DBB}\u{0DD3}",
+            "\u{09B0}\u{200D}\u{09CD}\u{09AF}\u{09BE}\u{09AC}",
+            "\u{0928}\u{092E}\u{0938}\u{094D}\u{0924}\u{0947}",
+            "\u{182C}\u{1820}\u{1837}\u{180E}\u{1820}",
         ] {
             let text = format!("x {word} y");
             let end = 2 + word.len();
@@ -1051,9 +968,6 @@ mod tests {
 
     /// M-f with a count reads the line once, from the last word break before the
     /// caret: its cost is the distance it moves, pinned here by the words it reads.
-    /// It used to run one motion per count, each reading from the last whitespace
-    /// before the caret, so C-u 1000 M-f on a line with no whitespace read half a
-    /// million words, and every plain M-f read the line up to the caret.
     #[test]
     fn forward_word_applies_a_count_in_one_pass_from_the_last_break() {
         let text = "ab.".repeat(64 * 1024);
@@ -1071,7 +985,6 @@ mod tests {
         let read = EDITOR_WORDS_READ.with(std::cell::Cell::get);
         assert!(read <= 1001, "C-u 1000 M-f read {read} words");
 
-        // A thousand plain M-f deep in the line, each reading a word or two.
         view.selections = vec![Selection::caret(30_000 * 3)];
         EDITOR_WORDS_READ.with(|n| n.set(0));
         for _ in 0..1000 {

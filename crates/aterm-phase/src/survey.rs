@@ -64,9 +64,12 @@ impl SurveyBlock {
 }
 
 /// How far above the options row the question row may sit: the memory card is the
+/// tallest (`●` row, a blank, up to four rows of the cited sentence, a blank, the
+/// recollection row), and its sentence runs on when Claude is verbose.
 const MAX_ABOVE_OPTIONS: usize = 10;
 
 /// The options row: two columns in, `1: <label>` first, `0: Dismiss` on it (a banner
+/// may share the row, as it may in any other).
 fn is_options_row(row: &str) -> bool {
     let Some(rest) = row.strip_prefix("  1: ") else {
         return false;
@@ -75,9 +78,14 @@ fn is_options_row(row: &str) -> bool {
 }
 
 /// The most rows the options' boxes are read across: two measured, from 26 to 40
+/// columns, with room for a narrower pane's third and fourth.
 const OPTION_ROWS: usize = 4;
 
 /// The cells the options' keys start at on the options' first row — `1:` at column 2
+/// first, then each `<digit>:` after it, whatever ran into it (`  1: Bad2:    3:` at 26
+/// columns, `  1:   2:    3:   0: Di` at 23, where the first box is too narrow for `1:
+/// Bad`): the columns of the boxes Ink lays the options out in. `None` when the row
+/// does not open `  1:` two columns in.
 fn option_keys(row: &str) -> Option<Vec<usize>> {
     row.strip_prefix("  1:")?;
     let chars: Vec<char> = row.chars().collect();
@@ -96,6 +104,10 @@ fn option_keys(row: &str) -> Option<Vec<usize>> {
 }
 
 /// The last row of the options that start at row `first` (`until` excluded) in a pane
+/// `width` cells wide: `first` itself when it is an options row ([`is_options_row`]);
+/// else the row of boxes a narrow pane wraps, read across the rows under it
+/// ([`crate::wrap::rejoined_cells`]) and whole only when its first box is `1: <label>`
+/// and its last exactly `0: Dismiss`, the most such rows up to [`OPTION_ROWS`].
 fn options_line(rows: &[String], first: usize, until: usize, width: usize) -> Option<usize> {
     if is_options_row(&rows[first]) {
         return Some(first);
@@ -114,6 +126,7 @@ fn options_line(rows: &[String], first: usize, until: usize, width: usize) -> Op
 }
 
 /// A row Claude Code parks between the transcript and an idle composer that is not
+/// part of the card: blank, a hint or banner against the right edge, a `⎿  Tip:` row.
 fn is_parked(row: &str, width: usize) -> bool {
     let t = crate::text::trim_start(row);
     t.is_empty()
@@ -193,7 +206,7 @@ fn kind_of(question: &str) -> SurveyKind {
     }
 }
 
-/// `^●.` and the first four words of `question`, as a `key if=` token. Each word must
+/// `^●.` and the first four words of `question`, as a `key if=` token.
 fn guard_of(question: &str) -> String {
     let words: Vec<&str> = question
         .split_whitespace()
@@ -244,9 +257,11 @@ pub fn drafts_card(rows: &[String]) -> Option<(usize, usize)> {
 }
 
 /// How far above the drafts card's hint its head may sit: the head, up to six preview
+/// rows (`maxRows`), and blank rows the preview may hold.
 const MAX_DRAFTS_ROWS: usize = 12;
 
 /// The hint row, at column 0 (trailing space aside): `1 to review · 2 to send · 0 to
+/// dismiss`, then ` · +N more queued` when more are queued.
 fn is_drafts_hint(row: &str) -> bool {
     crate::text::trim_end(row)
         .strip_prefix(const { crate::anchors::anchor_text("card.drafts_hint") })
@@ -296,6 +311,7 @@ pub fn ask_card(rows: &[String]) -> Option<(usize, usize)> {
 }
 
 /// How far above the ask's options row its head may sit: a docs-URL row and the rows a
+/// long question wraps to.
 const MAX_ASK_ROWS: usize = 6;
 
 /// `  <key>: <label> …` two columns in, with the `Don't ask again` choice on it.
@@ -311,9 +327,11 @@ fn is_ask_options_row(row: &str) -> bool {
 }
 
 /// The labels a rating names itself by: the card's buttons, and the word the pending
+/// step echoes.
 const RATING_LABELS: [&str; 4] = ["Bad", "Fine", "Good", "Unsure"];
 
 /// `Feedback: <label> · Esc to undo`, in column 0: the rating's pending step, drawn for
+/// 3 s after a person's `1`/`2`/`3` (the key word is their `escape` binding).
 fn is_pending_row(row: &str) -> bool {
     let Some(rest) = row.strip_prefix(const { crate::anchors::anchor_text("survey.pending") })
     else {
@@ -333,6 +351,7 @@ fn is_thanks_row(row: &str) -> bool {
 }
 
 /// The row under the thanks: `(Optional) Press [1] to tell us what went wrong · /feedback`,
+/// or, where the follow-up is off, `Use /feedback to share detailed feedback anytime.`
 fn is_thanks_second_row(row: &str) -> bool {
     let row = crate::text::trim_end(row);
     (row.starts_with(const { crate::anchors::anchor_text("survey.optional_press") })
@@ -503,6 +522,7 @@ mod tests {
     }
 
     /// The hand-built 2.1.284 screens, one per kind, are read whole: the card's kind and
+    /// guard, the worker's phase under it, what it last said, where the transcript ends.
     #[test]
     fn every_kind_of_fixture_is_read_whole() {
         use crate::prompt::fixtures::screen;
@@ -599,6 +619,7 @@ mod tests {
     }
 
     /// A person's `1`/`2`/`3` replaces the card with its aftermath, parked like the card and
+    /// never what the worker last said, also under the `Interrupted` notice an Esc leaves.
     #[test]
     fn the_ratings_aftermath_is_parked_and_never_what_the_worker_said() {
         use crate::prompt::fixtures::screen;
@@ -745,6 +766,7 @@ mod tests {
     }
 
     /// A CARD INK WRAPPED IS STILL THE CARD (module header, "IN A NARROW PANE"; KI
+    /// S2R-F2).
     #[test]
     fn a_card_ink_wrapped_is_still_the_card() {
         let narrow = |above: &[&str], width: usize, footer: &str| {
@@ -862,6 +884,7 @@ mod tests {
     }
 
     /// A worker quoting the drafts card (or an ask) in its message, its rows at column 2, is
+    /// not the card: the worker's last words are not parked away.
     #[test]
     fn a_quote_of_the_drafts_or_an_ask_card_in_a_message_is_not_the_card() {
         let quoted_drafts = with(
@@ -920,6 +943,7 @@ mod tests {
     }
 
     /// An ask card is its options row (`<key>: …` two columns in, `Don't ask again` on it)
+    /// under a `⏺` head in column 0, and nothing else.
     #[test]
     fn an_ask_card_needs_its_options_and_its_head() {
         assert!(ask_card(&with(&DONE, &ASK)).is_some());
@@ -972,6 +996,7 @@ mod tests {
     }
 
     /// Below 41 columns (2.1.300 at 26, 34 and 40) the Ink-wrapped card is one session
+    /// card: guarded, dismissable, and not the worker's last words.
     #[test]
     fn a_survey_card_ink_wrapped_into_columns_is_one_card() {
         use crate::prompt::fixtures::{
@@ -1024,6 +1049,7 @@ mod tests {
         assert!(survey_block(&off).is_none(), "{off:#?}");
     }
     /// Claude Code's rating card as Ink lays it out `width` columns wide (2.1.300's
+    /// `PD`).
     fn rating_card(question: &str, extra: &[&str], labels: &[&str], width: usize) -> Vec<String> {
         fn wrap(text: &str, cols: usize) -> Vec<String> {
             let mut rows = vec![String::new()];
@@ -1101,6 +1127,7 @@ mod tests {
     const PLUGIN_LABELS: [&str; 5] = ["1: Bad", "2: Fine", "3: Good", "4: Unsure", "0: Dismiss"];
 
     /// [`rating_card`] draws the session card's question and options exactly as Claude
+    /// Code 2.1.300 drew them at 26, 34 and 40 columns.
     #[test]
     fn the_rating_card_layout_is_the_measured_one() {
         use crate::prompt::fixtures::{
@@ -1124,6 +1151,10 @@ mod tests {
     }
 
     /// , "Dialogs in narrow panes": where Ink shrinks the card's FIRST box
+    /// under its label (`1:` over `Bad`: the session card under 24 columns, the plugin
+    /// and memory cards' five boxes under 30), the options' first row opens `  1:` and
+    /// spaces, and the row under it opens at column two (`  Bad  Fine  Good smiss`) —
+    /// neither parked nor an options row.
     #[test]
     fn a_rating_card_whose_first_box_wraps_is_the_card() {
         for width in 16..=60 {

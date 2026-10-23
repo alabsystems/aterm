@@ -1,26 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The band's one driver: the per-frame sequencing every host shares. Retire what
-//! expired, commit the row count, drain the log, take the wire's paced paint, lay the
-//! band out, read one motion frame, key and paint the rows, and fold the deadlines the
-//! host's timer arms.
-//!
-//! Nothing here reads a clock, owns a timer or knows a window system: every instant is
-//! the host's `now`, every input a plain value (the grids' heights for [`afford`], the
-//! freeze in [`Commit::frozen`], [`LookIn`], [`Lay`], and the hover, geometry and inks
-//! of [`View::paint`]). The host keeps the re-grid a committed count asks for
-//! ([`Committed::regrid`]), the log file, the timer, the compose onto its frame, and
-//! what a repaint request means there.
-//!
-//! No wake is added: every instant a fold returns comes from the center's deadlines
-//! ([`MessageCenter::deadline`], [`MessageCenter::motion_deadline`]) and the wire's
-//! paced paint ([`WireGate::due`]); an idle band returns `None` from each.
-//!
-//! A [`View`] is one surface's band state: the layout (keyed by the center's fingerprint
-//! and the width), the motion frame the next present reads, the memoised next change
-//! from that frame, and the paint key. The macOS host keeps one per window, the web
-//! module one per terminal.
+//! Per-frame message-band driver shared across native and web hosts.
 
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -33,27 +14,18 @@ use crate::paint::{self, BandKey, Geometry, Hover};
 use crate::wire::WireGate;
 use crate::{Instant, MAX_ROWS, MessageCenter};
 
-// ---- the center-wide step ---------------------------------------------------
-
-/// What one step of the band commits against: the instant, the handoff
-/// freeze, the rows the grids can spare, and the windows' chrome regrow
-/// floor.
+/// Inputs for one step of message-band row-count commitment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Commit {
     /// The step's instant (the host's clock, read once).
     pub now: Instant,
-    /// A seamless handoff freezes the band: holds are suspended and the row
-    /// count stays where it is until the handoff finishes.
+    /// Whether a seamless handoff currently freezes the band.
     pub frozen: bool,
     /// The most rows the band may take ([`afford`]).
     pub afford: u16,
     /// The row count the host's geometry reserves now.
     pub reserved: u16,
-    /// The windows' chrome regrow floor: the latest
-    /// [`crate::chrome::RegrowFloor::floor`] of every window the band's re-grid resizes
-    /// ([`crate::chrome::latest`]). A quiet shrink waits for it, so the band never undoes
-    /// another source's rise (a presence row's birth) inside the settle. A host with one
-    /// surface and no other chrome source (the web) hands `None`.
+    /// Latest chrome regrow floor across windows resized by the band.
     pub floor: Option<Instant>,
 }
 
@@ -62,21 +34,12 @@ pub struct Commit {
 pub struct Committed {
     /// Something painted changed ([`crate::Settled::glass_changed`]).
     pub glass_changed: bool,
-    /// The row count the host re-grids to: `Some` when the center's count
-    /// moved, or when it disagrees with the host's reserved count (a
-    /// handoff's successor converging once its freeze lifts); `None` under a
-    /// freeze.
+    /// Row count the host should re-grid to, or `None` when unchanged or frozen.
     pub regrid: Option<u16>,
 }
 
-/// Commit the row count (never under a freeze): the center's hysteresis over what the
-/// grids afford, its quiet shrink held to [`Commit::floor`], and the count the host
-/// re-grids to (`Some` when it moved or disagrees with [`Commit::reserved`]). A count
-/// above [`Commit::reserved`] is a rise the host notes on every window it re-grids
-/// ([`crate::chrome::is_rise`]).
+/// Commits the row count and returns `Some(rows)` when the host must re-grid.
 pub fn commit(center: &mut MessageCenter, c: Commit) -> Option<u16> {
-    // Handed in first, frozen or not, so the state deadline reads the floor
-    // of the latest step.
     center.set_regrow_floor(c.floor);
     if c.frozen {
         return None;
@@ -86,9 +49,7 @@ pub fn commit(center: &mut MessageCenter, c: Commit) -> Option<u16> {
     (moved.is_some() || rows != c.reserved).then_some(rows)
 }
 
-/// The step's first half: retire what expired (holds suspended under a
-/// freeze), then [`commit`]. The host re-grids between this and
-/// [`drain_and_pace`], so a row is reserved in the same step as its resize.
+/// Retires expired entries and commits the row count for `c`.
 pub fn settle_and_commit(center: &mut MessageCenter, c: Commit) -> Committed {
     let settled = center.settle(c.now, !c.frozen);
     Committed {
@@ -97,9 +58,7 @@ pub fn settle_and_commit(center: &mut MessageCenter, c: Commit) -> Committed {
     }
 }
 
-/// The step's second half: the log lines the center shelved (only when `persist`; a
-/// handoff's successor writes nothing before its commit), and whether the wire's one
-/// paced paint fell due.
+/// Drains shelved log lines when `persist` is set and checks whether a paced paint is due.
 pub fn drain_and_pace(
     center: &mut MessageCenter,
     gate: &mut WireGate,
@@ -114,9 +73,7 @@ pub fn drain_and_pace(
     (lines, gate.take_due(now))
 }
 
-/// The most rows the band may take: every grid keeps its last terminal row
-/// — each grid's rows plus the band rows already `reserved`, less one; the
-/// smallest decides. [`MAX_ROWS`] with no grid to spare a row from.
+/// Returns the maximum rows the band may take given `grids` and `reserved`.
 #[must_use]
 pub fn afford(grids: impl IntoIterator<Item = u16>, reserved: u16) -> u16 {
     grids
@@ -126,9 +83,7 @@ pub fn afford(grids: impl IntoIterator<Item = u16>, reserved: u16) -> u16 {
         .unwrap_or(MAX_ROWS)
 }
 
-/// The next instant the band's state needs the host back: a hold's expiry, an echo's
-/// end, a queued row's patience (holds suspended under a freeze), the wire's paced
-/// paint. `None` when idle.
+/// Returns the next instant the band's state or wire gate needs a wake.
 #[must_use]
 pub fn state_deadline(center: &MessageCenter, gate: &WireGate, frozen: bool) -> Option<Instant> {
     [center.deadline(!frozen), gate.due()]
@@ -137,8 +92,6 @@ pub fn state_deadline(center: &MessageCenter, gate: &WireGate, frozen: bool) -> 
         .min()
 }
 
-// ---- the look ----------------------------------------------------------------
-
 /// What decides a view's look, each a host's own reading.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(
@@ -146,8 +99,7 @@ pub fn state_deadline(center: &MessageCenter, gate: &WireGate, frozen: bool) -> 
     reason = "four independent host readings, each a yes or no"
 )]
 pub struct LookIn {
-    /// The host's motion gates allow the band to move (its effect policy,
-    /// reduced motion, a serious mode — the page's `set_band_motion`).
+    /// Whether the host's motion gates allow the band to animate.
     pub motion_allowed: bool,
     /// The view is on screen (not occluded, minimized or headless).
     pub on_screen: bool,
@@ -157,10 +109,9 @@ pub struct LookIn {
     pub forced: bool,
 }
 
-/// The look a view draws in: moving only on screen, unfrozen and allowed; graded unless
-/// a forced palette owns the chrome.
+/// Computes the [`Look`] for a view from `i`.
 #[must_use]
-pub fn look(i: LookIn) -> Look {
+pub const fn look(i: LookIn) -> Look {
     Look {
         pace: if i.on_screen && !i.frozen && i.motion_allowed {
             Pace::Moving
@@ -171,10 +122,7 @@ pub fn look(i: LookIn) -> Look {
     }
 }
 
-// ---- one view ------------------------------------------------------------------
-
-/// How a view lays the band out: its width, whether each row ends in its
-/// link, and where `$HOME` is (read only when a layout is built).
+/// Layout parameters for a view.
 #[derive(Clone, Copy, Debug)]
 pub struct Lay {
     /// The view's column count.
@@ -186,9 +134,7 @@ pub struct Lay {
 }
 
 impl Lay {
-    /// A web page's layout: no `$HOME` to abbreviate, and the links withheld until the
-    /// page has a Details view. The native window's is `aterm-gui`'s
-    /// `message_band::band_lay`.
+    /// Returns the layout configuration for a web terminal view.
     #[must_use]
     pub fn web(cols: usize, details: bool) -> Self {
         Self {
@@ -226,8 +172,7 @@ struct Memo {
     next: Option<Instant>,
 }
 
-/// One surface's band: its layout, its motion frame, the memoised next
-/// change from that frame, and its paint key (module doc).
+/// Per-surface band layout, motion frame, memo, and paint key.
 #[derive(Debug, Default)]
 pub struct View {
     /// `(center fingerprint, cols, layout)`; `None` with no committed row.
@@ -253,11 +198,7 @@ pub struct View {
 }
 
 impl View {
-    /// Prepare the frame a present at `now` reads, in `look`: the layout
-    /// (re-laid only when the center's fingerprint or the width moved) and
-    /// one motion frame. Returns the frame's fingerprint — a repaint key's
-    /// motion term — `0` when nothing moves. With no committed row the view
-    /// forgets its layout, frame, look and memo.
+    /// Prepares the layout and motion frame at `now` in `look`, returning the motion fingerprint.
     pub fn prepare(&mut self, center: &MessageCenter, lay: &Lay, now: Instant, look: Look) -> u64 {
         let cols = lay.cols;
         let fp = center.fingerprint(cols);
@@ -280,13 +221,10 @@ impl View {
         self.motion = Some(motion);
         self.motion_fp = mfp;
         self.look = Some(look);
-        // The memo stays: its key keeps it valid when a content-only present prepares
-        // the same frame again, and a new frame misses the key on the next query.
         mfp
     }
 
-    /// Whether a frame is prepared for the band at `cols` (nothing to
-    /// prepare with no committed row).
+    /// Returns whether a frame is prepared for `center` at `cols`.
     #[must_use]
     pub fn is_prepared(&self, center: &MessageCenter, cols: usize) -> bool {
         let fp = center.fingerprint(cols);
@@ -321,11 +259,7 @@ impl View {
         center.motion_deadline(p, from, look)
     }
 
-    /// The next visible change from the frame on glass: its origin is the
-    /// prepared frame's instant when that frame was drawn in `look` at the
-    /// current layout, else `now` (a newly posted row, a frame in another
-    /// look); the answer is memoised only for a prepared frame. `None` with
-    /// no committed row or nothing that will change.
+    /// Returns the next visible change instant from the prepared frame or `now`.
     #[must_use]
     pub(crate) fn next_frame(
         &self,
@@ -373,9 +307,7 @@ impl View {
         next
     }
 
-    /// [`Self::next_frame`], never in the past: a due frame may still be
-    /// queued in the host, so a past answer is re-read from `now` — the next
-    /// grid instant is the safe deadline until that frame is prepared.
+    /// Returns the next motion deadline at or after `now`.
     #[must_use]
     pub(crate) fn motion_deadline(
         &self,
@@ -392,10 +324,7 @@ impl View {
         self.scan(center, &p, now, look)
     }
 
-    /// Whether the view is due a new frame at `now`: the frame on glass was
-    /// drawn in another look (focus, reduced motion, a forced palette moved
-    /// it), or its next change has come, or nothing is prepared yet while
-    /// something will change.
+    /// Returns whether the view is due a new frame at `now`.
     #[must_use]
     pub(crate) fn due(&self, center: &MessageCenter, lay: &Lay, now: Instant, look: Look) -> bool {
         if self.motion.is_some() && self.look != Some(look) {
@@ -405,9 +334,7 @@ impl View {
             .is_some_and(|d| d <= now || self.motion.is_none())
     }
 
-    /// The band's repaint term for this view ([`paint::band_fp`]): the
-    /// center at `cols`, the hover, the geometry and this view's motion
-    /// frame; `0` with no committed row.
+    /// Returns the band repaint fingerprint for this view.
     #[must_use]
     pub fn band_fp(
         &self,
@@ -419,13 +346,7 @@ impl View {
         paint::band_fp(center.fingerprint(cols), hover, geom, self.motion_fp)
     }
 
-    /// Paint the view's rows when what they are built from moved — the
-    /// center at `cols`, the inks and the forced palette, the hover, the
-    /// geometry, the motion frame — and `None` when the rows already painted
-    /// are still these. `inks` runs only with a committed row, so an idle
-    /// frame derives nothing; with none, the rows are empty (`Some` of
-    /// nothing once, when rows were painted before or the view was
-    /// [invalidated](Self::invalidate)).
+    /// Paints the view's rows when their inputs changed, or returns `None` if unchanged.
     pub fn paint(
         &mut self,
         center: &MessageCenter,
@@ -463,9 +384,8 @@ impl View {
         })
     }
 
-    /// Forget the paint key, so the next [`Self::paint`] paints — the empty
-    /// band too (a capture that repaints every frame it shoots).
-    pub fn invalidate(&mut self) {
+    /// Clears the paint key so the next [`Self::paint`] repaints.
+    pub const fn invalidate(&mut self) {
         self.key = None;
         self.stale = true;
     }
@@ -478,7 +398,7 @@ impl View {
 
     /// The prepared motion frame, if any.
     #[must_use]
-    pub fn motion(&self) -> Option<&BandMotion> {
+    pub const fn motion(&self) -> Option<&BandMotion> {
         self.motion.as_ref()
     }
 
@@ -491,28 +411,24 @@ impl View {
 
     /// The prepared frame's fingerprint (0 when nothing moves).
     #[must_use]
-    pub fn motion_fp(&self) -> u64 {
+    pub const fn motion_fp(&self) -> u64 {
         self.motion_fp
     }
 
     /// How many next-change scans this view has run.
     #[must_use]
-    pub fn deadline_computations(&self) -> u64 {
+    pub const fn deadline_computations(&self) -> u64 {
         self.computations.get()
     }
 
     /// The origin the last scan read from.
     #[must_use]
-    pub fn last_from(&self) -> Option<Instant> {
+    pub const fn last_from(&self) -> Option<Instant> {
         self.last_from.get()
     }
 }
 
-// ---- many views -----------------------------------------------------------------
-
-/// The next instant any of `views` (the on-screen ones, each with its lay and look)
-/// needs a motion frame or a time word's tick (`View::motion_deadline`). `None` with no
-/// row reserved or under a freeze (the frame on glass stays where it is).
+/// Returns the earliest motion deadline across on-screen `views`.
 pub fn motion_deadline_over<'a>(
     center: &MessageCenter,
     reserved: u16,
@@ -529,8 +445,7 @@ pub fn motion_deadline_over<'a>(
         .min()
 }
 
-/// Which of `views` (the on-screen ones, each named by `K`) are due a new frame at
-/// `now` (`View::due`). Nothing with no row reserved or under a freeze.
+/// Returns the keys of on-screen `views` that are due a new frame at `now`.
 pub fn due_views<'a, K>(
     center: &MessageCenter,
     reserved: u16,

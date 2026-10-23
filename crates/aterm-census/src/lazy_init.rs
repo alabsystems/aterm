@@ -2,52 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Lazy-init reentrancy census (OB-19..OB-21): the L0 deadlock class in its
-//! reentrancy sense, as a fail-closed obligation.
-//!
-//! The shape it guards against:
-//!
-//! ```text
-//! pub(crate) fn debug_seamless_reexec_armed() -> bool {
-//!     static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-//!     *ARMED.get_or_init(|| {
-//!         let on = crate::app_update_screen::debug_seamless_reexec_armed();
-//!         //       ^^^^ the initializer calls the accessor it is running under
-//!         …
-//!     })
-//! }
-//! ```
-//!
-//! `Once::call` marks the cell running before invoking the initializer, so the
-//! nested call parks the thread on its own `Once` forever; on the winit main
-//! thread that freezes the whole terminal. It is neither a lock-order cycle
-//! (OB-7) nor an unbounded sink (OB-1..OB-6), and clippy has no lint for it.
-//! This census derives every lazy cell in `crates/*/src` and the fns that block
-//! on each, and fails if an initializer can reach a blocking touch of its own
-//! cell, directly or around a cycle.
-//!
-//! Obligations (`[OB-n]` tags in the diagnostics; none has a waiver):
-//!
-//! * OB-19 self-reentrancy: no initializer reaches a blocking touch of its own
-//!   cell (always a deadlock).
-//! * OB-20 mutual reentrancy: the lazy-init graph (`S -> T` when `S`'s
-//!   initializer can reach a blocking touch of `T`) is acyclic.
-//! * OB-21 liveness: fires only when the tree-wide count of files, cells,
-//!   initializers or blocking touches is zero; per-site coverage rests on the
-//!   vocabulary below.
-//!
-//! Blocking touches are [`BLOCKING_METHODS`] on a `OnceLock`/`OnceCell`/`Once`
-//! and any use of a `LazyLock`/`Lazy` cell. `OnceLock::get`, `::set`,
-//! `::get_mut` and `Once::is_completed` are ignored: re-entering through
-//! `get()` is the supported escape.
+//! Lazy-init reentrancy census (OB-19..OB-21, [`BLOCKING_METHODS`]).
 
 use crate::{CensusOutcome, Floor};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-/// This walker's limits, printed after every red verdict. A plain multi-line
-/// literal: `\` continuations would strip the indentation it relies on.
+/// This walker's limits, printed after every red verdict.
 pub const LAZY_INIT_PRECISION_NOTE: &str =
     "    PRECISION / SCOPE (the honest limits of this census):
       - LEXICAL, name-based: cells are found at their `static NAME: <Lazy…>`
@@ -90,17 +52,13 @@ pub const LAZY_INIT_PRECISION_NOTE: &str =
         supported escape from this hazard, not an instance of it.
 ";
 
-// Vocabulary.
-
-/// Type tokens that mark a `static` as a lazily-initialised cell whose every
-/// use derefs it — so every mention is a blocking touch.
+/// Type tokens that mark a `static` as a lazily-initialised cell whose every use derefs it.
 const DEREF_LAZY_TYPES: &[&str] = &["LazyLock", "Lazy<", "SyncLazy"];
 
 /// Type tokens whose blocking surface is exactly [`BLOCKING_METHODS`].
 const METHOD_LAZY_TYPES: &[&str] = &["OnceLock", "OnceCell", "SyncOnceCell", "Once"];
 
-/// The methods that can park the calling thread inside a lazy cell: each one
-/// claims the cell and then runs (or waits for) the initializer.
+/// The methods that can park the calling thread inside a lazy cell.
 const BLOCKING_METHODS: &[&str] = &[
     "get_or_init",
     "get_or_try_init",
@@ -109,27 +67,19 @@ const BLOCKING_METHODS: &[&str] = &[
     "call_once_force",
 ];
 
-/// The constructors of a deref-lazy cell — the argument of one of these, in a
-/// `static` declaration, is that cell's initializer.
+/// The constructors of a deref-lazy cell.
 const LAZY_CTORS: &[&str] = &["LazyLock::new", "Lazy::new", "SyncLazy::new"];
 
-/// How far the walk follows same-file callees out of an initializer: enough for
-/// helper-calls-helper-calls-accessor while keeping the graph sparse (see
-/// [`LAZY_INIT_PRECISION_NOTE`]).
+/// Max same-file callee depth from an initializer ([`LAZY_INIT_PRECISION_NOTE`]).
 const MAX_LOCAL_DEPTH: usize = 4;
 
-/// A callee name with more than this many definitions across the scan set
-/// (`new`, `default`, `len`, …) is too merged to follow; otherwise the merged
-/// `new` node would make `TABLES.get_or_init(TransferTables::new)` look
-/// self-reentrant. Stated in the precision note.
+/// Max definitions across the scan set before a callee name is treated as ambiguous.
 const AMBIGUOUS_DEFS: usize = 3;
-
-// Derived facts.
 
 /// A lazily-initialised cell found at its `static` declaration.
 #[derive(Debug, Clone)]
 struct Cell {
-    /// The static's identifier, e.g. `ARMED`.
+    /// The static's identifier.
     name: String,
     /// `LazyLock`/`OnceLock`/… — the spelling found, for the diagnostic.
     kind: String,
@@ -145,8 +95,7 @@ struct Cell {
 #[derive(Debug, Clone)]
 struct Touch {
     cell: String,
-    /// The enclosing fn, if the touch is inside one. A touch at item scope
-    /// cannot be reached by a call, so it never becomes a graph edge.
+    /// The enclosing fn, if the touch is inside one.
     in_fn: Option<String>,
     span: String,
     /// How it blocks — `get_or_init` / `deref` — for the diagnostic.
@@ -160,8 +109,7 @@ struct Initializer {
     span: String,
     /// Repo-relative file the initializer is written in (the same-file walk).
     file: String,
-    /// Every `<ident>(` called directly in the initializer's text, plus an
-    /// unqualified function path passed instead of a closure.
+    /// Every `<ident>(` called directly in the initializer's text.
     callees: BTreeSet<String>,
     /// Cells this initializer blockingly touches in its own text (depth 0).
     direct_touches: BTreeSet<String>,
@@ -175,8 +123,6 @@ struct Edge {
     /// The rendered witness: where the initializer is and how it gets back.
     path: String,
 }
-
-// Entry point.
 
 /// Run the lazy-init reentrancy census over an aterm checkout at `root`.
 #[must_use]
@@ -205,7 +151,6 @@ fn report(root: &str, file_count: usize, d: &Derived) -> CensusOutcome {
 
     let mut failures = 0usize;
 
-    // ---- OB-21: the walk must still see the idiom. ----
     if file_count == 0 || d.cells.is_empty() || d.inits.is_empty() || d.touches.is_empty() {
         failures += 1;
         let _ = writeln!(
@@ -223,7 +168,6 @@ fn report(root: &str, file_count: usize, d: &Derived) -> CensusOutcome {
         );
     }
 
-    // ---- OB-19 / OB-20: the lazy-init graph must be acyclic. ----
     let edges = derive_edges(d);
     let (self_loops, components) = find_cycles(&edges);
 
@@ -320,8 +264,6 @@ fn report(root: &str, file_count: usize, d: &Derived) -> CensusOutcome {
 /// The lazy-init census's verdict title.
 const LAZY_INIT: &str = "lazy-init census";
 
-// Derivation.
-
 /// Everything the walk derived from one tree.
 struct Derived {
     cells: Vec<Cell>,
@@ -360,10 +302,6 @@ fn scan_files(root: &Path) -> Vec<PathBuf> {
         let _ = crate::collect_rs_files(&dir, &mut files);
     }
     files.retain(|p| !crate::is_test_file(p));
-    // Skip this census's own sources, like `scope_census::SELF_EXCLUDED_DIR`:
-    // the red fixtures embed whole Rust programs in raw strings at column 0,
-    // which a lexical walker cannot tell from real declarations (and which can
-    // end the file's `#[cfg(test)]` mask early).
     files.retain(|p| {
         !p.to_string_lossy()
             .replace('\\', "/")
@@ -376,8 +314,7 @@ fn scan_files(root: &Path) -> Vec<PathBuf> {
 /// This crate's own sources — excluded from the scan; see [`scan_files`].
 const SELF_EXCLUDED_DIR: &str = "crates/aterm-census/src";
 
-/// Read each source once, as written. Masking happens in
-/// [`derive_from_sources`], so synthetic fixtures go through the same masking.
+/// Read each source once, as written ([`derive_from_sources`]).
 fn read_sources(root: &Path, files: &[PathBuf]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for path in files {
@@ -394,10 +331,8 @@ fn read_sources(root: &Path, files: &[PathBuf]) -> Vec<(String, String)> {
     out
 }
 
-/// The derivation proper, over `(repo-relative path, raw text)` pairs — the
-/// seam the unit tests drive with synthetic sources.
+/// The derivation proper, over `(repo-relative path, raw text)` pairs.
 fn derive_from_sources(raw_sources: &[(String, String)]) -> Derived {
-    // Test-only items never ship; a deadlock there stops a suite, not a terminal.
     let sources: Vec<(String, String)> = raw_sources
         .iter()
         .map(|(rel, raw)| (rel.clone(), crate::lock_order::mask_cfg_test_items(raw)))
@@ -407,13 +342,7 @@ fn derive_from_sources(raw_sources: &[(String, String)]) -> Derived {
     let mut defs: BTreeMap<String, usize> = BTreeMap::new();
     let mut local: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
 
-    // Pass 1: every cell and the per-file call graph. All cells must be known
-    // before touches are collected, since a deref-lazy cell may be touched in a
-    // file read before its declaration.
     for (rel, text) in sources {
-        // Attribute calls line by line through `enclosing_fns`, which skips a
-        // body-less declaration as `parse_source_fns` does: an `extern "C"`
-        // block's `fn foo(..) -> T;` read as a body would absorb the next fn's.
         let lines: Vec<&str> = text.lines().collect();
         let enclosing = enclosing_fns(&lines);
         let per_file = local.entry(rel.clone()).or_default();
@@ -434,7 +363,6 @@ fn derive_from_sources(raw_sources: &[(String, String)]) -> Derived {
         collect_cells(text, rel, &mut cells);
     }
 
-    // Pass 2: blocking touches and initializers, now that every cell is known.
     let mut touches: Vec<Touch> = Vec::new();
     let mut inits: Vec<Initializer> = Vec::new();
     for (rel, text) in sources {
@@ -465,16 +393,13 @@ fn derive_from_sources(raw_sources: &[(String, String)]) -> Derived {
     }
 }
 
-/// `static [mut] NAME: …<lazy type>… = …;` declarations, wherever they sit —
-/// item scope or inside a fn body.
+/// Collect `static [mut] NAME: ...` lazy-cell declarations.
 fn collect_cells(text: &str, rel: &str, out: &mut Vec<Cell>) {
     for (i, line) in text.lines().enumerate() {
         let code = crate::strip_line_comment(line);
         let Some(name) = static_name(code) else {
             continue;
         };
-        // The declaration may wrap; read forward to the terminating `;` so the
-        // type is visible however it is formatted.
         let decl = declaration_text(text, i);
         let deref_lazy = DEREF_LAZY_TYPES.iter().any(|t| decl.contains(t));
         let method_lazy = METHOD_LAZY_TYPES.iter().any(|t| decl.contains(t));
@@ -482,11 +407,7 @@ fn collect_cells(text: &str, rel: &str, out: &mut Vec<Cell>) {
             continue;
         }
         if let Some(existing) = out.iter_mut().find(|c| c.name == name) {
-            // Same-named cells merge into one node (the documented
-            // over-approximation), toward the wider hazard: if either spelling
-            // derefs, the merged node derefs.
             existing.deref_lazy |= deref_lazy;
-            // A `static` won this merge, so the node is no longer field-shaped.
             existing.field = false;
             continue;
         }
@@ -507,10 +428,7 @@ fn collect_cells(text: &str, rel: &str, out: &mut Vec<Cell>) {
     collect_field_cells(text, rel, out);
 }
 
-/// Cells that are a struct field rather than a `static`, e.g.
-/// `*self.cache.get_or_init(|| self.armed())`, which parks just like a
-/// `static`. Touches are found by the identifier before the blocking method,
-/// which for `self.cache.get_or_init(..)` is `cache`.
+/// Collect lazy cells declared as struct fields.
 fn collect_field_cells(text: &str, rel: &str, out: &mut Vec<Cell>) {
     for (i, line) in text.lines().enumerate() {
         let code = crate::strip_line_comment(line);
@@ -530,16 +448,13 @@ fn collect_field_cells(text: &str, rel: &str, out: &mut Vec<Cell>) {
             name,
             kind,
             span: format!("{rel}:{}", i + 1),
-            // Touched through blocking methods only: a bare mention of a common
-            // name like `cache` is no touch (see the precision note).
             deref_lazy: false,
             field: true,
         });
     }
 }
 
-/// `<name>: <LazyType><..>,` as a struct field — not a `let`, not a `static`,
-/// not a by-reference fn parameter.
+/// `<name>: <LazyType><..>,` as a struct field.
 fn field_cell_name(code: &str) -> Option<String> {
     let t = code.trim();
     if !t.ends_with(',') || t.contains('=') {
@@ -550,7 +465,6 @@ fn field_cell_name(code: &str) -> Option<String> {
             return None;
         }
     }
-    // Strip a visibility prefix: `pub `, or `pub(crate) ` / `pub(super) ` etc.
     let body = if let Some(rest) = t.strip_prefix("pub(") {
         match rest.split_once(") ") {
             Some((_, after)) => after.trim_start(),
@@ -565,7 +479,6 @@ fn field_cell_name(code: &str) -> Option<String> {
         return None;
     }
     let ty = ty.trim();
-    // A borrowed cell is someone else's, passed in; its owner declares it.
     if ty.starts_with('&') {
         return None;
     }
@@ -579,8 +492,7 @@ fn field_cell_name(code: &str) -> Option<String> {
     Some(name.to_string())
 }
 
-/// The identifier a `[pub[(..)]] static [mut] NAME…` line declares; the
-/// visibility prefix is stripped first.
+/// The identifier a `[pub[(..)]] static [mut] NAME…` line declares.
 fn static_name(code: &str) -> Option<String> {
     let t = code.trim_start();
     let t = if let Some(rest) = t.strip_prefix("pub(") {
@@ -597,12 +509,8 @@ fn static_name(code: &str) -> Option<String> {
     if name.is_empty() { None } else { Some(name) }
 }
 
-/// The `static` declaration starting at `line_idx`, up to and including its
-/// terminating `;` (bounded, so a parse slip cannot run away).
+/// The `static` declaration starting at `line_idx`, up to and including its terminating `;`.
 fn declaration_text(text: &str, line_idx: usize) -> String {
-    // The terminator is a `;` at bracket depth 0: a type like
-    // `LazyLock<[f32; 256]>` contains one, and the initializer follows on the
-    // next line.
     let mut out = String::new();
     let mut depth = 0i32;
     for line in text.lines().skip(line_idx).take(40) {
@@ -626,14 +534,6 @@ fn declaration_text(text: &str, line_idx: usize) -> String {
 }
 
 /// Blocking touches and initializers in one file.
-///
-/// The scan is over the whole file, not line by line: rustfmt can put the
-/// receiver and the blocking method on different lines, e.g.
-///
-/// ```text
-///     *ARMED_SEAMLESS_REEXEC_FLAG
-///         .get_or_init(|| debug_seamless_reexec_armed())
-/// ```
 fn collect_touches_and_inits(
     text: &str,
     rel: &str,
@@ -647,8 +547,6 @@ fn collect_touches_and_inits(
         .map(|l| crate::strip_line_comment(l).to_string())
         .collect();
     let enclosing = enclosing_fns(&lines);
-    // One comment-masked buffer with the newlines kept, so byte offsets map
-    // back to line numbers exactly.
     let joined = masked.join("\n");
     let line_starts = line_start_index(&joined);
     let line_of = |at: usize| match line_starts.binary_search(&at) {
@@ -656,7 +554,6 @@ fn collect_touches_and_inits(
         Err(i) => i.saturating_sub(1),
     };
 
-    // --- method form: `CELL.get_or_init(` and friends, however it is wrapped.
     for method in BLOCKING_METHODS {
         let mut from = 0usize;
         while let Some((at, open)) = find_method_call(&joined, method, from) {
@@ -674,7 +571,6 @@ fn collect_touches_and_inits(
                 span: format!("{rel}:{}", ln + 1),
                 how: (*method).to_string(),
             });
-            // The argument of a blocking method IS the initializer.
             let body = balanced(&joined, open);
             inits.push(Initializer {
                 cell: cell.name.clone(),
@@ -686,7 +582,6 @@ fn collect_touches_and_inits(
         }
     }
 
-    // --- deref form: any mention of a `LazyLock`/`Lazy` cell. ---
     let deref = DerefNames::of(cells);
     for (i, code) in masked.iter().enumerate() {
         if !deref.may_mention(code) {
@@ -698,7 +593,6 @@ fn collect_touches_and_inits(
                 continue;
             }
             if declares.as_deref() == Some(cell.name.as_str()) {
-                // The declaration is where the initializer lives, not a touch.
                 let decl = declaration_text(text, i);
                 for ctor in LAZY_CTORS {
                     let needle = format!("{ctor}(");
@@ -741,10 +635,7 @@ fn line_start_index(joined: &str) -> Vec<usize> {
     out
 }
 
-/// Find the next `.<method>(` after `from`, tolerating a turbofish between the
-/// name and the parenthesis (`CELL.get_or_init::<_>(|| ..)`).
-///
-/// Returns `(dot_index, open_paren_index)`.
+/// Find the next `.<method>(` after `from`.
 fn find_method_call(hay: &str, method: &str, from: usize) -> Option<(usize, usize)> {
     let needle = format!(".{method}");
     let bytes = hay.as_bytes();
@@ -752,7 +643,6 @@ fn find_method_call(hay: &str, method: &str, from: usize) -> Option<(usize, usiz
     while let Some(rel) = hay[cur..].find(&needle) {
         let at = cur + rel;
         cur = at + needle.len();
-        // The name must END here: `.get_or_init_with` must not match `get_or_init`.
         if bytes.get(cur).copied().is_some_and(is_ident_byte) {
             continue;
         }
@@ -764,7 +654,6 @@ fn find_method_call(hay: &str, method: &str, from: usize) -> Option<(usize, usiz
         {
             p += 1;
         }
-        // Optional `::< … >`, angle-balanced so a nested generic is skipped whole.
         if hay[p..].starts_with("::<") {
             let mut depth = 0i32;
             let mut q = p + 2;
@@ -798,8 +687,7 @@ fn find_method_call(hay: &str, method: &str, from: usize) -> Option<(usize, usiz
     None
 }
 
-/// The receiver identifier before the `.` at `at`, skipping any whitespace and
-/// newlines the formatter put between them.
+/// The receiver identifier before the `.` at `at`.
 fn receiver_before(joined: &str, at: usize) -> Option<&str> {
     let bytes = joined.as_bytes();
     let mut end = at;
@@ -809,11 +697,9 @@ fn receiver_before(joined: &str, at: usize) -> Option<&str> {
     crate::ident_ending_at(joined, end)
 }
 
-/// The deref-lazy cells' names, read once per line instead of once per cell
-/// per line (the walk's whole cost when it searched every line for every name).
+/// The deref-lazy cells' names, read once per line instead of once per cell per line.
 struct DerefNames<'a> {
-    /// The names made of `[A-Za-z0-9_]` alone: [`mentions_ident`] finds one in
-    /// a line exactly when one of the line's maximal ident-byte runs is it.
+    /// Pure `[A-Za-z0-9_]` names matched by [`mentions_ident`].
     words: std::collections::HashSet<&'a str>,
     /// Any other name, which only [`mentions_ident`] itself can judge.
     other: Vec<&'a str>,
@@ -835,8 +721,7 @@ impl<'a> DerefNames<'a> {
         names
     }
 
-    /// Can `code` mention a deref-lazy cell? `false` only when no cell's
-    /// [`mentions_ident`] would hold, so a line it rejects has no touch.
+    /// Whether `code` can mention any deref-lazy cell ([`mentions_ident`]).
     fn may_mention(&self, code: &str) -> bool {
         code.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
             .any(|w| self.words.contains(w))
@@ -865,9 +750,7 @@ const fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// For every line, the fn whose body it sits in (rustfmt's
-/// closing-brace-at-fn-indent invariant, as in the main-loop census). Nested
-/// fns and closures resolve to the outermost fn.
+/// For every line, the fn whose body it sits in.
 fn enclosing_fns(lines: &[&str]) -> Vec<Option<String>> {
     let mut out = vec![None; lines.len()];
     let mut i = 0usize;
@@ -876,9 +759,6 @@ fn enclosing_fns(lines: &[&str]) -> Vec<Option<String>> {
             i += 1;
             continue;
         };
-        // A fn declaration has no body (`extern "C" { fn f(..) -> T; }`, trait
-        // signatures); treating one as a body would swallow lines down to the
-        // next same-indent `}` and invent callers.
         if crate::is_bodyless_declaration(lines, i) {
             i += 1;
             continue;
@@ -906,8 +786,7 @@ fn enclosing_fns(lines: &[&str]) -> Vec<Option<String>> {
     out
 }
 
-/// The text between the `(` at byte offset `at` and its matching `)`, as lines,
-/// capped at 40 000 bytes.
+/// The text between the `(` at byte offset `at` and its matching `)`.
 fn balanced(joined: &str, at: usize) -> Vec<String> {
     let bytes = joined.as_bytes();
     let mut depth = 0i32;
@@ -927,8 +806,7 @@ fn balanced(joined: &str, at: usize) -> Vec<String> {
     joined[at..end].lines().map(str::to_string).collect()
 }
 
-/// Every `<ident>(` in the initializer, plus a function path passed instead of
-/// a closure (`CELL.get_or_init(build_it)`).
+/// Every `<ident>(` in the initializer.
 fn initializer_callees(body: &[String]) -> BTreeSet<String> {
     let mut out = crate::callee_names(body);
     let joined = body.join(" ");
@@ -938,9 +816,6 @@ fn initializer_callees(body: &[String]) -> BTreeSet<String> {
         .trim_end_matches(')')
         .trim();
     if !inner.contains('|') && !inner.contains('(') && !inner.is_empty() {
-        // A qualified path's last segment is followed too: `reachable` stops at
-        // over-merged names like `new`, while a unique name such as
-        // `Type::with_builtin_rules` is worth following.
         let last = inner.rsplit("::").next().unwrap_or(inner);
         let ident: String = last
             .chars()
@@ -977,14 +852,11 @@ fn direct_touches(body: &[String], cells: &[Cell]) -> BTreeSet<String> {
     out
 }
 
-// The lazy-init graph.
-
 /// `S -> T` whenever `S`'s initializer can reach a blocking touch of `T`.
 fn derive_edges(d: &Derived) -> Vec<Edge> {
     let mut edges: Vec<Edge> = Vec::new();
     let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
     for init in &d.inits {
-        // Depth 0: written right there in the initializer.
         for target in &init.direct_touches {
             if seen.insert((init.cell.clone(), target.clone())) {
                 edges.push(Edge {
@@ -994,7 +866,6 @@ fn derive_edges(d: &Derived) -> Vec<Edge> {
                 });
             }
         }
-        // Depth 1 (workspace-wide) and deeper (same file only).
         let reach = reachable(d, init);
         for (target, trigger_fns) in &d.triggers {
             let Some(hit) = trigger_fns.iter().find(|f| reach.contains_key(f.as_str())) else {
@@ -1022,10 +893,7 @@ fn derive_edges(d: &Derived) -> Vec<Edge> {
     edges
 }
 
-/// Fn names reachable from `init`, mapped to the caller each was first reached
-/// from. Direct callees are taken as written; deeper calls are followed only
-/// within `init.file` and never through an over-merged name (see
-/// [`LAZY_INIT_PRECISION_NOTE`]).
+/// Fn names reachable from `init` ([`LAZY_INIT_PRECISION_NOTE`]).
 fn reachable(d: &Derived, init: &Initializer) -> BTreeMap<String, Option<String>> {
     let empty = BTreeMap::new();
     let local = d.local.get(&init.file).unwrap_or(&empty);
@@ -1074,10 +942,6 @@ fn render_path(reach: &BTreeMap<String, Option<String>>, target: &str) -> String
 }
 
 /// Split the graph's cycles into self-loops (OB-19) and mutual cycles (OB-20).
-///
-/// Mutual cycles are reported as strongly connected components: enumerating
-/// elementary cycles is exponential on an over-approximated graph, while SCCs
-/// are linear and are the unit of repair.
 fn find_cycles(edges: &[Edge]) -> (Vec<Edge>, Vec<Vec<Edge>>) {
     let mut self_loops: Vec<Edge> = Vec::new();
     let mut nodes: BTreeSet<&str> = BTreeSet::new();
@@ -1097,8 +961,6 @@ fn find_cycles(edges: &[Edge]) -> (Vec<Edge>, Vec<Vec<Edge>>) {
         }
     }
 
-    // Iterative Tarjan: the graph is derived, so its depth is not something a
-    // census gets to assume.
     let n = order.len();
     let mut index = vec![usize::MAX; n];
     let mut low = vec![0usize; n];
@@ -1149,7 +1011,6 @@ fn find_cycles(edges: &[Edge]) -> (Vec<Edge>, Vec<Vec<Edge>>) {
         }
     }
 
-    // Render each component as the edges inside it, sorted for determinism.
     let mut out: Vec<Vec<Edge>> = Vec::new();
     for component in components {
         let members: BTreeSet<&str> = component.iter().map(|i| order[*i]).collect();
@@ -1562,10 +1423,8 @@ pub fn armed() -> bool {
         let hay = "CELL.get_or_init_with(|| 1)";
         assert!(find_method_call(hay, "get_or_init", 0).is_none());
         assert!(find_method_call(hay, "get_or_init_with", 0).is_some());
-        // Turbofish and whitespace both tolerated, on the right name.
         assert!(find_method_call("C.call_once::<F>(f)", "call_once", 0).is_some());
         assert!(find_method_call("C.get_or_init ( f )", "get_or_init", 0).is_some());
-        // A mention that is not a call is not a call.
         assert!(find_method_call("// see .get_or_init above", "get_or_init", 0).is_none());
     }
 }

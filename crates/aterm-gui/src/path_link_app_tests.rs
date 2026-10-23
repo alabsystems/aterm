@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A file citation end to end through the real pointer handlers: the hover
-//! hand and its caption, then the Cmd-click that opens aterm's own editor at
-//! the cited line (`crate::path_link`).
+//! A file citation end to end through the real pointer handlers.
 
 use std::time::Instant;
 
@@ -22,9 +20,7 @@ pub(super) fn link_modifier() -> aterm_window::keyboard::ModifiersState {
     }
 }
 
-/// The group the fixture's shell leads in front of its PTY. No process leads
-/// it, so no OS cwd stands in front of the OSC 7; it is also never a real fd
-/// (the fixture's master carries it, below).
+/// The group the fixture's shell leads in front of its PTY.
 const SHELL: i32 = i32::MAX - 1;
 
 /// Put `program` in front of `wid`'s front session as group `pgid`: the PTY's
@@ -41,8 +37,6 @@ fn in_front(app: &mut App, wid: WindowId, pgid: i32, program: &str) {
 fn named_front(app: &mut App, wid: WindowId, fresh: i32, named: i32, program: &str) {
     let session = app.front_terminal(wid).expect("terminal").session;
     app.session_factory.fg_probe = |master| master;
-    // The fixture's groups lead no process: the kernel's reading of a shell in
-    // front is put in, a shell alone in its group by default.
     app.session_factory.lone_leader = |_| Some("zsh".to_string());
     app.pool.sessions.get_mut(&session).unwrap().session.master = fresh;
     let ctx = app.pool.get(session).unwrap().ctx.clone();
@@ -112,8 +106,7 @@ pub(super) fn hover(app: &mut App, wid: WindowId, row: u16, col: u16) -> bool {
 }
 
 /// Compose the fill, strip, and caption, then model an accepted present for
-/// these App routing fixtures. No real display or present is exercised; the
-/// separate local-data aggregate checks the actual receipt commit policy.
+/// these App routing fixtures.
 fn band(app: &mut App, wid: WindowId) -> String {
     assert!(
         app.prepare_terminal_capture_grid_with_cursor_fx(
@@ -146,7 +139,6 @@ fn cmd_click_on_a_citation_opens_aterms_editor_at_its_line() {
         app.active_native_view(wid).is_none(),
         "precondition: a terminal tab"
     );
-    // Every cell of the citation offers the click; the words around it do not.
     for col in 7..20 {
         assert!(hover(&mut app, wid, 0, col), "col {col}");
     }
@@ -217,8 +209,6 @@ fn cmd_click_on_a_citation_opens_aterms_editor_at_its_line() {
 #[test]
 fn a_citation_on_a_double_width_line_opens_from_where_it_is_painted() {
     let (mut app, wid, _dir, root) = app_with("\x1b#6src/foo.rs:3 x");
-    // `src/foo.rs:3` is grid columns 0..=11, painted 0..=23; cell 16 shows
-    // the `r` of `rs` (grid 8), and grid column 16 is past the text.
     assert!(
         hover(&mut app, wid, 0, 16),
         "the hand over the painted citation"
@@ -248,13 +238,7 @@ fn feed(app: &App, wid: WindowId, bytes: &[u8]) {
     term_lock(&term).process(bytes);
 }
 
-/// The press opens only what the DRAWN caption named. The session's
-/// directory moves under a still pointer (an OSC 7, no output, no frame): the
-/// caption drawn still names the first project's `src/foo.rs`, a fresh
-/// resolution names the second's, and that press opens nothing; the caption
-/// is asked again. A press before that new caption is drawn still opens
-/// nothing (the memo already names the second file, the screen does not).
-/// NEGATIVE CONTROL: once drawn, the press opens the file it names.
+/// The press opens only what the DRAWN caption named.
 #[test]
 fn a_press_opens_only_the_file_the_drawn_caption_named() {
     let (mut app, wid, _dir, root) = app_with("error: src/foo.rs:3:2 here");
@@ -317,7 +301,7 @@ fn a_press_opens_only_the_file_the_drawn_caption_named() {
 
 /// A citation never opens unseen: a press with no caption drawn for the cell
 /// (the look came back after the frame, no frame yet) opens nothing and asks
-/// the caption. NEGATIVE CONTROL: drawn, the same press opens it.
+/// the caption.
 #[test]
 fn a_citation_never_opens_before_its_caption_is_drawn() {
     let (mut app, wid, _dir, _root) = app_with("error: src/foo.rs:3:2 here");
@@ -332,10 +316,7 @@ fn a_citation_never_opens_before_its_caption_is_drawn() {
 /// The rule the press is held to, arm by arm ([`crate::app_mouse::caption_admits`]):
 /// a citation only under a caption that named its file, line and column; a
 /// URL under a caption only when it is the URL the caption named, and under
-/// no caption only a plain-text one. NEGATIVE CONTROLS: the same file at
-/// another line or column, another file, a URL caption over a citation press,
-/// a citation caption over a URL press, a URL the caption did not name, and
-/// an OSC 8 link with no caption drawn.
+/// no caption only a plain-text one.
 #[test]
 fn a_press_opens_only_what_the_caption_named() {
     use crate::app_mouse::{CaptionNames, PressedUrl, caption_admits};
@@ -412,9 +393,7 @@ fn a_press_opens_only_what_the_caption_named() {
 
 /// A URL press under a drawn caption opens only the URL the caption named:
 /// the program re-points the cell's OSC 8 link between the frame and the
-/// press, and the press opens nothing. NEGATIVE CONTROL: once the new
-/// caption is drawn, the press reaches the URL (here a scheme the click
-/// refuses, so nothing launches either way; the refusal is the open path's).
+/// press, and the press opens nothing.
 #[test]
 fn a_url_press_opens_only_the_url_the_drawn_caption_named() {
     let (mut app, wid, _dir, _root) =
@@ -452,30 +431,12 @@ fn a_url_press_opens_only_the_url_the_drawn_caption_named() {
 }
 
 /// A citation resolves only while the session is known to run here, read
-/// when it is asked. Refused: an OSC 7 naming another host; any program in
-/// front aterm does not know runs here (remote shells, a multiplexer,
-/// wrappers with their own terminal, an editor); a group in front the sweep
-/// has not named yet; a remote shell as the shell's running command; a cwd a
-/// checkpoint carried, which is no base. NEGATIVE CONTROLS: the same session
-/// reporting `localhost` or this machine's own name; a shell, an agent by
-/// name and Claude Code under `node` by its screen in front; a local
-/// command; the remote report once its ssh has left the front; the shell's
-/// next report after the carry. Refused too: a shell that shares its group
-/// with what it runs, one an `exec` replaced, and the root shell in front
-/// while its integration runs a command; NEGATIVE CONTROLS: a shell alone,
-/// the root shell at its prompt. An unidentified runtime remains refused
-/// even while a Codex report is shown: the report names no current writer.
-///
-/// Unix only: it reads the PTY's foreground process group and a process's OS
-/// cwd, which a ConPTY has neither of; Windows reads the shell's own
-/// integration instead (`with_no_foreground_group_the_shells_own_reading_stands_in`).
+/// when it is asked.
 #[cfg(unix)]
 #[test]
 fn a_citation_resolves_only_while_the_session_runs_here() {
     let (mut app, wid, _dir, root) = app_with("error: src/foo.rs:3:2 here");
     let local = root.join("src/foo.rs");
-    // The press path reads fresh; the hover is re-asked from scratch where the
-    // pointer stands (a still pointer moves nothing, so no motion would ask).
     let press = |app: &App| app.path_link_under_pointer(wid).map(|target| target.path);
     let rehover = |app: &mut App| {
         app.windows.get_mut(&wid).unwrap().hover_memo = None;
@@ -486,7 +447,6 @@ fn a_citation_resolves_only_while_the_session_runs_here() {
     assert!(rehover(&mut app));
     assert_eq!(press(&app), Some(local.clone()), "control: a local session");
 
-    // OSC 7 naming another machine: the same directory, on that machine.
     let osc7 = |host: &str| format!("\x1b]7;file://{host}{}\x07", root.display());
     feed(&app, wid, osc7("build-box.example.invalid").as_bytes());
     assert_eq!(press(&app), None, "an OSC 7 host that is not this machine");
@@ -494,12 +454,8 @@ fn a_citation_resolves_only_while_the_session_runs_here() {
     band(&mut app, wid);
     assert!(!app.open_link_under_pointer(wid));
     assert!(app.active_native_view(wid).is_none());
-    // Seen by the sweep under the shell itself: it still stands.
     sweep_sees_cwd(&app, wid, SHELL);
     assert_eq!(press(&app), None, "reported under the shell in front");
-    // Only a name an OSC string can carry: the parser acts on a control
-    // inside one (a machine whose kernel name holds a backspace), so no
-    // shell's report could name it.
     let me = crate::tab_label::this_machine_name();
     if !me.is_empty() && !me.chars().any(char::is_control) {
         feed(&app, wid, osc7(me).as_bytes());
@@ -508,10 +464,6 @@ fn a_citation_resolves_only_while_the_session_runs_here() {
     feed(&app, wid, osc7("localhost").as_bytes());
     assert_eq!(press(&app), Some(local.clone()), "localhost");
 
-    // An ssh's remote shell reports its directory, and the ssh exits back to
-    // a shell that really runs here, in the project (its OS cwd is a base).
-    // A shell integration that sends no OSC 7 of its own leaves the remote
-    // report standing in the engine.
     let mut shell = aterm_uds::spawnfd::command("/bin/sleep")
         .arg("120")
         .current_dir(&root)
@@ -529,8 +481,6 @@ fn a_citation_resolves_only_while_the_session_runs_here() {
         Some(local.clone()),
         "the ssh's report left the front with it; the shell's own cwd answers"
     );
-    // The negative control of the witness: the same remote report NOT seen
-    // under the ssh (newer than the sweep's look) stands, and refuses.
     in_front(&mut app, wid, ssh, "ssh");
     feed(&app, wid, osc7("build-box.example.invalid").as_bytes());
     in_front(&mut app, wid, here, "zsh");
@@ -540,7 +490,6 @@ fn a_citation_resolves_only_while_the_session_runs_here() {
     in_front(&mut app, wid, SHELL, "zsh");
     feed(&app, wid, osc7("localhost").as_bytes());
 
-    // Only a program known to run here offers a citation.
     let other = SHELL - 2;
     for program in [
         "ssh",
@@ -581,13 +530,11 @@ fn a_citation_resolves_only_while_the_session_runs_here() {
         );
     }
     assert_eq!(press(&app), Some(local.clone()), "Claude Code under node");
-    // A group in front the sweep has not named yet: its old name is not it.
     named_front(&mut app, wid, other - 1, other, "zsh");
     assert_eq!(press(&app), None, "a group not named yet");
     in_front(&mut app, wid, SHELL, "zsh");
     assert_eq!(press(&app), Some(local.clone()), "named");
 
-    // The shell's running command (OSC 133 C, its 633 E line): `ssh` runs.
     feed(
         &app,
         wid,
@@ -602,7 +549,6 @@ fn a_citation_resolves_only_while_the_session_runs_here() {
         "precondition: detail=ssh"
     );
     assert_eq!(press(&app), None, "a remote shell as the running command");
-    // It ends; a local command runs.
     feed(
         &app,
         wid,
@@ -610,8 +556,6 @@ fn a_citation_resolves_only_while_the_session_runs_here() {
     );
     assert_eq!(press(&app), Some(local.clone()), "a local command");
 
-    // A seamless update carried the cwd: no report this engine saw stands
-    // behind it, so it is no base.
     {
         let term = app.front_terminal(wid).unwrap().term.clone();
         let mut term = term_lock(&term);
@@ -623,21 +567,14 @@ fn a_citation_resolves_only_while_the_session_runs_here() {
     feed(&app, wid, osc7("localhost").as_bytes());
     assert_eq!(press(&app), Some(local.clone()), "the shell's next report");
 
-    // A shell that shares its group with what it runs (a script whose body is
-    // `ssh prod`, `sh -c 'ssh h; echo done'`, a `#!/bin/sh` wrapper around
-    // `ssh box -t claude`): its name says nothing of where the output comes
-    // from.
     app.session_factory.lone_leader = |_| None;
     assert_eq!(press(&app), None, "a shell sharing its group");
     assert!(!rehover(&mut app), "and no hand offers it");
-    // A shell an `exec` replaced (`exec tmux`) before the sweep names it anew.
     app.session_factory.lone_leader = |_| Some("tmux".to_string());
     assert_eq!(press(&app), None, "exec'd into tmux, still named zsh");
     app.session_factory.lone_leader = |_| Some("bash".to_string());
     assert_eq!(press(&app), Some(local.clone()), "control: a shell alone");
 
-    // The session's own root shell in front while its integration says a
-    // command runs (an `exec`, which no prompt follows).
     let root = SHELL - 7;
     let session = app.front_terminal(wid).unwrap().session;
     app.pool.sessions.get_mut(&session).unwrap().session.pid = root;
@@ -652,9 +589,6 @@ fn a_citation_resolves_only_while_the_session_runs_here() {
     assert_eq!(press(&app), Some(local.clone()), "control: at its prompt");
     app.pool.sessions.get_mut(&session).unwrap().session.pid = -1;
 
-    // An OSC 7501 report is a display claim, not the current writer's identity.
-    // An old unseen report can cross a foreground move, so a shown claim
-    // cannot turn an unidentified runtime into a known-local citation source.
     let npm = SHELL - 9;
     in_front(&mut app, wid, npm, "node");
     assert_eq!(press(&app), None, "node with no report");
@@ -673,15 +607,12 @@ fn a_citation_resolves_only_while_the_session_runs_here() {
         None,
         "a displayed Codex report grants no local citation"
     );
-    // The fixture's master was a group's number, never an fd; give it back.
     app.pool.sessions.get_mut(&session).unwrap().session.master = -1;
 }
 
 /// Where no foreground group can be read (a ConPTY), the shell's own
 /// integration is the reading: at its prompt, or running a bare shell or an
-/// agent by its command's word. NEGATIVE CONTROLS: no integration at all, an
-/// integration that marks only its prompts, a shell given a command, and any
-/// other command (a remote shell, an editor).
+/// agent by its command's word.
 #[test]
 fn with_no_foreground_group_the_shells_own_reading_stands_in() {
     use crate::app_mouse::shell_reads_local;
@@ -707,9 +638,6 @@ fn with_no_foreground_group_the_shells_own_reading_stands_in() {
     ] {
         assert!(!shell_reads_local(true, Some(command)), "{command}");
     }
-    // An integration that marks only its prompts (pwsh without PSReadLine)
-    // never says a command runs: its `integrated` reading is false
-    // (`CitationProbe::new` asks `quit_safety::shell_reports_commands` too).
     let mut term = aterm_core::terminal::Terminal::new(24, 80);
     term.process(b"\x1b]133;A\x07PS> \x1b]133;B\x07");
     assert!(
@@ -737,9 +665,6 @@ fn a_citation_of_a_directory_or_a_missing_file_offers_nothing() {
 
 #[test]
 fn a_url_over_a_citation_still_wins_and_a_refused_scheme_opens_nothing() {
-    // An OSC 8 link the engine admits (`sftp:`) but the click refuses, drawn
-    // over a real citation: the click is the link's, and a refused link opens
-    // nothing, the file beneath it included.
     let (mut app, wid, _dir, _root) =
         app_with("\x1b]8;;sftp://host.example/x\x1b\\src/foo.rs:2\x1b]8;;\x1b\\");
     assert!(hover(&mut app, wid, 0, 3));
@@ -765,7 +690,6 @@ fn a_scripted_modifier_ends_at_the_persons_next_input() {
     app.pointer_cmd(PointerAction::Mods(link_modifier()))
         .expect("mods");
     assert_eq!(app.windows[&wid].mods, link_modifier());
-    // A second scripted set still keeps the person's own aside, not the first script's.
     app.pointer_cmd(PointerAction::Mods(M::CONTROL))
         .expect("mods");
     assert_eq!(app.windows[&wid].mods, M::CONTROL);
@@ -775,15 +699,12 @@ fn a_scripted_modifier_ends_at_the_persons_next_input() {
         M::SHIFT,
         "the person's Shift is back"
     );
-    // Negative control: with no script in force the person's input changes nothing.
     app.on_modifiers_changed(wid, M::ALT);
     app.release_scripted_mods(wid);
     assert_eq!(app.windows[&wid].mods, M::ALT);
 }
 
-/// A composed or captured caption is not a present receipt. The helper is
-/// the one the shipping present wrapper uses; these are captured outcomes,
-/// with no App, render target, capture, or display involved.
+/// A composed or captured caption is not a present receipt.
 #[test]
 fn only_an_accepted_present_changes_the_caption_a_press_may_open() {
     use crate::app_mouse::{CaptionNames, ShownCaption, commit_presented_caption};
@@ -800,7 +721,6 @@ fn only_an_accepted_present_changes_the_caption_a_press_may_open() {
     let a = caption("/p/a.rs", Some(3), Some(2));
     let b = caption("/q/b.rs", Some(9), None);
     let mut shown = None;
-    // Ordinary accepted frames install, replace, and clear their caption.
     commit_presented_caption(&mut shown, Some(a.clone()), &Ok(Some(0)));
     assert_eq!(shown, Some(a.clone()));
     commit_presented_caption(&mut shown, Some(b.clone()), &Ok(Some(1)));
@@ -815,8 +735,6 @@ fn only_an_accepted_present_changes_the_caption_a_press_may_open() {
     commit_presented_caption(&mut shown, Some(url.clone()), &Ok(Some(3)));
     assert_eq!(shown, Some(url));
 
-    // Model two failed attempts after A was accepted. Evaluate every case
-    // before the named final assertion, so one failure cannot hide another.
     let mut pending = Some(a.clone());
     commit_presented_caption(&mut pending, Some(b.clone()), &Ok(None));
     let mut refused = Some(a.clone());
@@ -832,8 +750,6 @@ fn only_an_accepted_present_changes_the_caption_a_press_may_open() {
         &Err(PresentDropReason::TargetMismatch),
     );
     let held = pending == Some(a.clone()) && refused == Some(a.clone()) && refused_clear == Some(a);
-    // A later accepted retry publishes B, and an accepted uncaptioned frame
-    // clears it, even after those earlier pending/refused attempts.
     commit_presented_caption(&mut pending, Some(b.clone()), &Ok(Some(4)));
     assert_eq!(pending, Some(b));
     commit_presented_caption(&mut pending, None, &Ok(Some(5)));
@@ -844,8 +760,7 @@ fn only_an_accepted_present_changes_the_caption_a_press_may_open() {
 /// A citation's hover refused while a build held the front comes back under a
 /// still pointer once the sweep names the shell again
 /// (`App::reask_renamed_hovers`, which the status sweep calls), with no output
-/// and no motion, and the first press under the caption opens. NEGATIVE
-/// CONTROL: a re-ask with the naming unchanged keeps the memo it has.
+/// and no motion, and the first press under the caption opens.
 #[test]
 fn a_citation_refused_under_a_build_comes_back_when_the_shell_is_named() {
     let (mut app, wid, _dir, _root) = app_with("error: src/foo.rs:3:2 here");
@@ -862,7 +777,6 @@ fn a_citation_refused_under_a_build_comes_back_when_the_shell_is_named() {
         "control: the naming did not move, the memo stands"
     );
     assert!(!app.windows[&wid].hover_pointer);
-    // The build exits and the sweep names the shell: nothing on screen moves.
     in_front(&mut app, wid, SHELL, "zsh");
     app.reask_renamed_hovers(session);
     assert!(app.windows[&wid].hover_pointer, "the hand is back");

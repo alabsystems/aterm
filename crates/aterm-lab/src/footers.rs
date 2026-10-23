@@ -1,55 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `footers [--out DIR] [--subscriber] [--settings '<json>'] [--no-turn]
-//! [--no-bypass] [--columns N] [--lines N]`: record the Claude Code footer
-//! screens aterm's readers are judged against (`claude-<version>-footer-*.txt`,
-//! the shape of aterm-phase's fixture corpus), on a lab of its own: the jailed
-//! real Claude Code against the stub, so it needs no login and spends nothing.
-//!
-//! Run it when a new Claude Code is installed (`aterm pkg list` names it),
-//! copy what it wrote into `crates/aterm-phase/src/fixtures/` (or pass `--out`
-//! there), then `targo --unverified test -p aterm-agent --lib harness::`: the
-//! drift canary (`every_captured_footer_screen_of_every_build_is_read`) reads
-//! the whole corpus, so a mode row this aterm cannot read fails there, by file
-//! and build, before a session runs on it. It records:
-//!
-//! * `footer-<mode>-idle` the launch mode, idle, empty composer;
-//! * `footer-<mode>-draft` the same with a draft typed (then cleared);
-//! * `footer-<mode>` each further mode shift+tab reaches, once round;
-//! * `footer-busy` / `footer-after-turn` one slow stub turn (`--no-turn` skips it);
-//! * `footer-bypass-idle` a second launch with `--dangerously-skip-permissions`
-//!   (`--no-bypass` skips it).
-//!
-//! A mode row it cannot name is saved as `footer-unread-<n>`, which the canary
-//! then fails on: that IS the finding. Every step waits on the screen (`await
-//! match`/`gone`, then `await idle` for the footer to settle), never on a clock.
-//!
-//! # Which footer
-//!
-//! The footer differs by account and settings: an API-key account at medium
-//! effort draws no effort tag on the rule, a subscriber at the top effort
-//! does, and the mode the cycle starts in is `permissions.defaultMode`. A
-//! default run records the lab's own Claude Code: a fake `apiKeyHelper` key
-//! and the scratch home's default settings. The 2.1.283 corpus the canary was
-//! built on was recorded under a subscriber login (Opus at the top effort
-//! level, auto mode by default); record that variant too:
-//!
-//! ```sh
-//! targo --unverified lab footers --subscriber \
-//!   --settings '{"model":"opus","env":{"CLAUDE_CODE_EFFORT_LEVEL":"xhigh"}}'
-//! ```
-//!
-//! `--subscriber` launches with the fake claude.ai OAuth token, as `claude TAG
-//! --subscriber` does; `--settings` deep-merges into the scratch
-//! `settings.json` before the first launch. The effort is the environment
-//! variable: measured on 2.1.301, `effortLevel` in the settings left the tag
-//! at `◐ medium` on either login, and `CLAUDE_CODE_EFFORT_LEVEL=xhigh` in the
-//! settings' `env` drew `◉ xhigh`. Each fixture's header names the login and
-//! its `what` the settings. The stub serves no account profile, so the
-//! account line and any tier-only row (a `✦ … · xhigh + workflows` footer)
-//! are what Claude Code draws without one; the mode row is what the canary
-//! reads.
+//! Records Claude Code footer screens across modes and settings for fixture verification.
 
 use std::path::PathBuf;
 
@@ -59,15 +11,13 @@ use crate::pyjson::{COMPACT, J};
 use crate::run::Run;
 use crate::{Fail, Res};
 
-/// The mode the row under the composer names, as a file-name word; `None`
-/// when it names none this verb knows (saved as unread: the finding).
+/// Returns the mode word named by the row under the composer, if recognized.
 #[must_use]
 pub fn mode_word(screen: &str) -> Option<&'static str> {
     let row = screen
         .lines()
         .rev()
         .find(|l| l.contains("⏵⏵ ") || l.contains("⏸ "))?;
-    // each mode's pill: its glyph, then its words (`aterm_phase::anchors`, joined at run time as Claude Code draws them)
     [
         ("⏵⏵", "mode.bypass", "bypass"),
         ("⏵⏵", "mode.auto", "auto"),
@@ -81,8 +31,7 @@ pub fn mode_word(screen: &str) -> Option<&'static str> {
     .map(|(_, _, w)| w)
 }
 
-/// The footer's last row (the mode row on every build recorded so far), as a
-/// pattern `await gone` can hold: a shift+tab has landed once it is gone.
+/// Returns the footer's last row as a pattern for `await gone`.
 #[must_use]
 pub fn footer_row_pattern(screen: &str) -> Option<String> {
     screen
@@ -96,7 +45,6 @@ pub fn footer_row_pattern(screen: &str) -> Option<String> {
 /// `✻ <Verb> for <N>…`: a turn's done row (`screen::is_done_row`), as a pattern.
 const DONE_ROW: &str = "✻.\\S+.for.[0-9]";
 
-/// How long the footer must stay unchanged to count as settled: its
 /// first-render hints give way to the mode row within this.
 const SETTLE_MS: u64 = 2000;
 
@@ -234,8 +182,6 @@ fn launch(run: &Run, door: &Door<'_>, subscriber: bool, args: &[&str]) -> Result
         ..Launch::default()
     };
     crate::lab::launch_claude(run, &l)?;
-    // A fresh home meets the bypass mode's acceptance dialog first: accepted as a person
-    // accepts it (the lab's scratch home is the only one that records it).
     if door.await_match("shift.tab|for.agents|shortcuts|Yes,.I.accept", 60)?
         && door.out(&["text"]).contains("Yes, I accept")
     {
@@ -248,13 +194,11 @@ fn launch(run: &Run, door: &Door<'_>, subscriber: bool, args: &[&str]) -> Result
             "footers: Claude Code drew no footer within 60 s",
         ));
     }
-    // the first-render hints give way to the mode pill; a launch mode with no pill is read as it settles
     door.await_match("⏵⏵.|⏸.", 15)?;
     door.await_idle(SETTLE_MS, 30)?;
     Ok(())
 }
 
-/// End the Claude Code in the tab (ctrl+c twice, a person's half second
 /// apart) and wait for the shell.
 fn quit(door: &Door<'_>) -> Result<(), Fail> {
     for _ in 0..2 {
@@ -313,7 +257,6 @@ fn record(run: &Run, o: &Opts, out: PathBuf) -> Res {
         seen.push(m);
     }
     if o.turn {
-        // back to the launch mode before the turn
         for _ in 0..6 {
             if mode_word(&rec.text()).map(str::to_string).as_ref() == Some(&start) {
                 break;
@@ -372,7 +315,7 @@ fn record(run: &Run, o: &Opts, out: PathBuf) -> Res {
     Ok(0)
 }
 
-/// `footers [--out DIR] [--subscriber] [--settings '<json>'] [--no-turn] [--no-bypass] [--columns N] [--lines N]`.
+/// Runs `lab footers` to record Claude Code footer screens.
 pub fn cmd_footers(args: &[String]) -> Res {
     let o = Opts::parse(args)?;
     crate::stop::install();

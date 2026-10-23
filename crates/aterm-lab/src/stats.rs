@@ -30,6 +30,7 @@ pub fn scrub(run: &Run, text: &str) -> String {
 }
 
 /// [`scrub`] with the homes of the lab's facts `p` (the seam a test hands a
+/// fake account home: [`crate::paths::Paths::resolve_with`]).
 fn scrub_in(p: &crate::paths::Paths, run: &Run, text: &str) -> String {
     let mut out = text.to_string();
     let w = run.w.to_string_lossy().into_owned();
@@ -89,6 +90,7 @@ pub fn cmd_account(args: &[String]) -> Res {
 }
 
 /// The scratch `.claude.json` (`CLAUDE_CONFIG_DIR` is the scratch
+/// `home/.claude`), parsed.
 fn claude_json(run: &Run) -> Result<J, Fail> {
     let p = run.w.join("home/.claude/.claude.json");
     let text = crate::verbs::read_scratch(&p)?;
@@ -366,6 +368,10 @@ mod tests {
     use super::*;
 
     /// A STATS PRINT NAMES EVERY HOME THE LAB GUARDS, NEVER SPELLS IT: under
+    /// a scratch `HOME` (a fake account home handed in through
+    /// [`crate::paths::Paths::resolve_with`]) the account's home and the
+    /// scratch one both become `<home>`, the run's scratch (inside the
+    /// scratch home here, so the deeper path wins) `<scratch>`.
     #[test]
     fn the_stats_scrub_names_the_account_home_and_a_scratch_home_both() {
         let top = aterm_tempfile::Builder::new()
@@ -418,6 +424,7 @@ mod tests {
     }
 
     /// Lines of 2.1.301's debug log (labs `uc0` to `uc3`, 2026-10-16; the
+    /// juniper one as fact (4) quotes it).
     #[test]
     fn the_default_debug_lines_are_those_that_name_a_request() {
         let re = aterm_regex::Regex::new(DEBUG_DEFAULT).unwrap();

@@ -1,55 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The launch-fatal alert ([`crate::fatal_launch_error`]): what a launch that
-//! cannot start shows before it exits, and the order it asks AppKit for it in.
-//!
-//! Every fatal a macOS window launch meets on its main thread comes before the
-//! event loop builds `NSApplication`: session 0's spawn (LAG-11 starts the shell
-//! ahead of the loop), the containment refusal and the backend worker's early
-//! death. The alert there was a bare `NSAlert` `-runModal`. AppKit made the
-//! application object behind it and never activated it, so the alert came up
-//! behind the window the person launched from, with the app not frontmost.
-//! Measured 2026-10-20 on 0.107.0 (WIN-2: its bundle executed directly, a
-//! `shell` whose `#!` interpreter is missing, stderr not a tty): a 260x234
-//! layer-0 window under another app's window, never frontmost in 6 s. An
-//! unbundled binary was worse: its policy read Prohibited, which AppKit never
-//! activates.
-//!
-//! So [`raise`] makes the application object first, under the policy the event
-//! loop would give it; puts the alert's panel on screen; asks to be the active
-//! app when the launch's posture would at `applicationDidFinishLaunching:`
-//! (`launch_posture`); and only then runs the alert. The panel comes before the
-//! ask because WindowServer refuses to activate an app that presents no window
-//! (its own words in `launch_posture`'s record: "presents 0 windows ... Denying
-//! the request"). Measured the same day in a bare AppKit program: the ask with
-//! no window up was refused every way it was made (before or after
-//! `-finishLaunching`, from `applicationDidFinishLaunching:`, `-activate` as
-//! well as `-activateIgnoringOtherApps:`); made once the panel was in, the app
-//! was frontmost within 137-244 ms and the alert a layer-8 panel in front.
-//!
-//! An update's handoff candidate never asks to activate at launch, and its alert
-//! does not either. A headless launch never gets here (`launch_alert_wanted`,
-//! `menu::os_ui_refused`), so it never reaches WindowServer. The backend
-//! worker's own fatal (no system monospace font) runs off the main thread and
-//! keeps `fatal_launch_error`'s `osascript` leg, a process of its own that comes
-//! to the front by itself (measured the same day: frontmost, a layer-8 panel).
+//! Launch-fatal alert presentation and AppKit activation sequencing.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{AppActivation, LaunchPosture};
 
-/// The steps [`raise`] takes, injected so a unit test watches their order with
-/// no WindowServer (AGENTS.md: a platform probe goes through an injected field
-/// with an inert test arm).
+/// Platform interface for presenting and running a launch-fatal alert.
 pub(crate) trait AlertHost {
-    /// Make the application object, under `policy` (`None`: what winit gives
-    /// it, Regular when unbundled and the bundle's `LSUIElement` otherwise).
-    /// `false` when it is not made here: off the main thread, without the
-    /// windowed launch's proof, or off macOS.
+    /// Ensures the application object exists under `policy`.
     fn make_app(&mut self, policy: Option<AppActivation>) -> bool;
-    /// Build the alert and put its panel on screen, not yet run. `false` when
-    /// nothing is on screen (off macOS, where [`AlertHost::run`] shows it).
+    /// Builds the alert and places its panel on screen.
     fn present(&mut self, title: &str, body: &str) -> bool;
     /// Ask to be the active app.
     fn activate(&mut self);
@@ -57,9 +19,7 @@ pub(crate) trait AlertHost {
     fn run(&mut self);
 }
 
-/// Show the launch-fatal alert through `host` under the launch's `posture`: the
-/// application object, the alert's panel, the activation the posture asks for,
-/// then the alert's run.
+/// Presents and runs the launch-fatal alert through `host` under `posture`.
 pub(crate) fn raise(host: &mut impl AlertHost, posture: LaunchPosture, title: &str, body: &str) {
     let made = host.make_app(posture.policy);
     if host.present(title, body) && made && posture.activate_on_launch {
@@ -69,9 +29,7 @@ pub(crate) fn raise(host: &mut impl AlertHost, posture: LaunchPosture, title: &s
 }
 
 /// Whether this launch is an update's handoff candidate: it names a rendezvous to
-/// dial or the overlap pipes. Marked once by `main_entry`, before any launch
-/// fatal can run (some run before the handoff is claimed or refused, so this
-/// reads the launch's names, not the claim).
+/// dial or the overlap pipes.
 static HANDOFF_CANDIDATE: AtomicBool = AtomicBool::new(false);
 
 /// Record that this launch is an update's handoff candidate.
@@ -79,8 +37,7 @@ pub(crate) fn mark_handoff_candidate() {
     HANDOFF_CANDIDATE.store(true, Ordering::Relaxed);
 }
 
-/// Show the launch-fatal alert of a launch that is `headless` or not, under its
-/// own posture, through the live platform.
+/// Shows the launch-fatal alert through the live platform host.
 pub(crate) fn show(headless: bool, title: &str, body: &str) {
     let posture = crate::launch_posture(headless, HANDOFF_CANDIDATE.load(Ordering::Relaxed));
     #[cfg(target_os = "macos")]
@@ -108,35 +65,23 @@ impl AlertHost for Live {
     fn make_app(&mut self, policy: Option<AppActivation>) -> bool {
         use crate::appkit::{self, MainThread};
         use aterm_objc::{class, sel};
-        // The send below creates the application object, and with it the
-        // process's WindowServer connection: only a windowed launch makes it.
         let Some(_windowed) = crate::platform::Windowed::get() else {
             return false;
         };
         if MainThread::new().is_none() {
             return false;
         }
-        // `NSRunningApplication.h`: `NSApplicationActivationPolicyRegular` = 0,
-        // `…Accessory` = 1, `…Prohibited` = 2 (`NSInteger`).
         let code = |p: AppActivation| match p {
             AppActivation::Regular => 0,
             AppActivation::Accessory => 1,
             AppActivation::Prohibited => 2,
         };
-        // SAFETY: main thread (checked above). `+sharedApplication` is
-        // `@16#0:8` on `NSApplication`, +0 and process-lifetime;
-        // `+currentApplication` is `@16#0:8` on `NSRunningApplication` and
-        // `-bundleIdentifier` is `@16@0:8`, nil for an unbundled binary;
-        // `-setActivationPolicy:` is `B24@0:8q16`, whose answer winit ignores
-        // too.
+        // SAFETY: main thread checked above; Objective-C selectors match NSApplication signatures.
         unsafe {
             let app = appkit::send_id(class(c"NSApplication").as_id(), sel!(sharedApplication));
             if app.is_null() {
                 return false;
             }
-            // winit's own rule at `applicationDidFinishLaunching:`
-            // (`aterm-window` `app_state.rs`): an explicit policy, else Regular
-            // for an unbundled binary, else the bundle's manifest.
             let policy = policy.map(code).or_else(|| {
                 let running = appkit::send_id(
                     class(c"NSRunningApplication").as_id(),
@@ -162,10 +107,7 @@ impl AlertHost for Live {
         let Some(alert) = crate::menu::ok_alert(title, body) else {
             return false;
         };
-        // SAFETY: main thread (checked above), the live alert `ok_alert` built.
-        // `-layout` is `v16@0:8`; `-window` is `@16@0:8`, the alert's own +0
-        // panel; `-makeKeyAndOrderFront:` is `v24@0:8@16`, sent with a nil
-        // sender. `-runModal` later shows this same panel.
+        // SAFETY: main thread checked above; selectors match NSAlert/NSWindow signatures.
         let shown = unsafe {
             appkit::send_v(alert.id(), sel!(layout));
             let panel = appkit::send_id(alert.id(), sel!(window));
@@ -182,9 +124,7 @@ impl AlertHost for Live {
         let Some(app) = self.app else {
             return;
         };
-        // SAFETY: `app` is the live shared application [`Self::make_app`] got on
-        // this main thread; `-activateIgnoringOtherApps:` is `v20@0:8B16`, the
-        // send winit makes at launch.
+        // SAFETY: `app` is the live shared application on the main thread.
         unsafe {
             crate::appkit::send_v_bool(app, aterm_objc::sel!(activateIgnoringOtherApps:), true);
         }
@@ -194,11 +134,8 @@ impl AlertHost for Live {
         let Some(alert) = self.alert.take() else {
             return;
         };
-        // `-runModal` spins a nested run loop until the alert is dismissed;
-        // park the main-thread watchdog for exactly that long.
         let _park = crate::watchdog::park_modal();
-        // SAFETY: main thread ([`Self::present`] checked it and built the alert
-        // on it); `-runModal` is `-(NSModalResponse)` on the live alert.
+        // SAFETY: `alert` was created on this main thread in `Self::present`.
         let _ = unsafe { crate::appkit::send_isize(alert.id(), aterm_objc::sel!(runModal)) };
     }
 }
@@ -293,8 +230,7 @@ mod tests {
 
     /// An update's candidate never asks to activate at launch, its fatal alert
     /// included; nor does a launch whose application object or panel is not
-    /// there (no windowed proof, off the main thread, off macOS). The alert is
-    /// still run in every case.
+    /// there (no windowed proof, off the main thread, off macOS).
     #[test]
     fn a_candidate_or_a_missing_app_or_panel_is_never_activated_and_still_runs() {
         for (makes, shows, candidate) in [

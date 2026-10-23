@@ -58,6 +58,7 @@ pub(crate) enum Cap {
 }
 
 /// The end a budget too long for an [`Instant`] gets instead: `u32::MAX`
+/// seconds, about 136 years, which every platform's clock can hold.
 const FAR_FUTURE: Duration = Duration::from_secs(4_294_967_295);
 
 /// `now + budget`, or `now + FAR_FUTURE` when that sum overflows the clock.
@@ -192,6 +193,7 @@ impl Connect for TcpConnector {
 }
 
 /// Resolve `host:port` through `resolver` on a helper thread, waiting at most
+/// `within` for its answer.
 fn resolve_within<F, I>(
     host: &str,
     port: u16,
@@ -211,6 +213,7 @@ where
 }
 
 /// The resolver path with helper creation injected, so a refused spawn can be
+/// checked without exhausting the process's threads or calling the system resolver.
 fn resolve_within_using<F, I>(
     host: &str,
     port: u16,
@@ -257,6 +260,7 @@ where
 }
 
 /// A socket carrying the request's deadline and authority, re-checked before
+/// every call made on it.
 struct Bounded {
     sock: TcpStream,
     guard: Arc<dyn Guard>,
@@ -273,6 +277,7 @@ impl Bounded {
     }
 
     /// [`Self::admit`], then that timeout on the one socket direction the
+    /// coming call uses.
     fn admit_read(&self) -> io::Result<Cap> {
         let (budget, cap) = self.admit()?;
         self.timeout_set(self.sock.set_read_timeout(Some(budget)))?;
@@ -331,7 +336,7 @@ impl Write for Bounded {
 /// Plaintext or TLS TCP stream enforcing a [`Deadline`] and [`Guard`].
 pub struct Stream {
     inner: Inner,
-    /// A write failed on the socket. From then on a TLS read takes only what
+    /// A write failed on the socket.
     write_failed: bool,
 }
 
@@ -437,6 +442,9 @@ impl Read for Stream {
 }
 
 /// Plaintext the TLS peer sent, read without first finishing a write rustls
+/// holds back ([`Stream::write_failed`]): records off the socket, through
+/// [`Bounded`] as every other socket call, until plaintext, the peer's
+/// close, or an error.
 fn read_received(
     tls: &mut rustls::StreamOwned<rustls::ClientConnection, Bounded>,
     buf: &mut [u8],
@@ -458,7 +466,7 @@ fn read_received(
 }
 
 impl Stream {
-    /// Note a socket write's failure (see [`Self::write_failed`]). A signal's
+    /// Note a socket write's failure (see [`Self::write_failed`]).
     fn wrote<T>(&mut self, wrote: io::Result<T>) -> io::Result<T> {
         if let Err(error) = &wrote
             && error.kind() != io::ErrorKind::Interrupted
@@ -568,6 +576,9 @@ mod tests {
     }
 
     /// Apple platforms refuse every `setsockopt` (EINVAL) on a socket a peer
+    /// reset, yet the bytes the peer sent before the reset stay readable: an
+    /// early answer (a 401 before the request was read) is read whole, and
+    /// only then the reset, never an invalid argument.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn an_answer_sent_before_a_reset_is_read_and_then_the_reset() {

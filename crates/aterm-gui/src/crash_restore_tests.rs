@@ -13,6 +13,9 @@ use aterm_keeper::wire::COMPANION_JOURNAL;
 use super::*;
 
 /// One live session and its journal, as the reader holds them, the journal on a held clock
+/// (`SessionJournal::create_held`): only `pass_ms` moves it, so what the keyframe policy
+/// decides and what the ring's ticks stamp never depend on how long a loaded machine took
+/// between two of a test's steps.
 struct Rig {
     term: Arc<Mutex<Terminal>>,
     journal: Arc<SessionJournal>,
@@ -72,6 +75,8 @@ impl Rig {
     }
 
     /// One read through the reader's stages: the gather's count, then one hold that
+    /// processes it, its reply drained as the reader drains it (to the PTY, never the
+    /// journal's business), its record and decision, and the keyframe written after.
     fn slice(&self, bytes: &[u8]) {
         self.journal.gathered(bytes.len());
         let captured = {
@@ -88,6 +93,7 @@ impl Rig {
     }
 
     /// The region as a recovering window is offered it: a read-only duplicate of the
+    /// custody descriptor.
     fn offered(&self) -> OfferedCompanion {
         OfferedCompanion {
             region: self.custody.try_clone().expect("dup"),
@@ -131,6 +137,8 @@ impl Rig {
 }
 
 /// [`restore_offered`] for these tests: every region restored here is written only by this
+/// test's thread, and only between restores, so its writer is inert for each call (the
+/// function's contract).
 fn offered_restore(
     companion: Option<OfferedCompanion>,
     attempts: u8,
@@ -166,6 +174,10 @@ fn adopted(cp: &TerminalCheckpoint) -> Terminal {
 }
 
 /// A session journaled as the reader journals it restores exactly: its screen, modes
+/// and pen as the live engine has them, with no repaint, so a main-screen session gets
+/// no size pulse (`adoption_needs_size_pulse` with `repaint = !exact`); an exact
+/// alternate-screen restore gets the pulse every adoption onto it gets, and a restore
+/// with a loss counted is repainted and pulsed.
 #[test]
 fn a_session_restores_exactly_and_only_an_inexact_or_alternate_screen_is_pulsed() {
     let rig = Rig::new(8, 40);
@@ -215,6 +227,8 @@ fn a_session_restores_exactly_and_only_an_inexact_or_alternate_screen_is_pulsed(
 }
 
 /// A DA and a DSR query, an OSC 7 and an OSC 52 and a bell in the tail: the restore
+/// replays them into its scratch engine, which nothing else holds, and hands on only a
+/// checkpoint, which carries no response buffer, OSC event queue or bell.
 #[test]
 fn a_reply_an_osc_event_and_a_bell_from_the_replay_never_reach_the_adopted_engine() {
     let rig = Rig::new(6, 40);
@@ -256,6 +270,8 @@ fn a_reply_an_osc_event_and_a_bell_from_the_replay_never_reach_the_adopted_engin
 }
 
 /// K1: a burst keeps the session dirty (the parse loop then waits with a timeout), the
+/// quiet keyframes it once, and the session is clean again (the loop blocks): an idle
+/// session's restore replays nothing.
 #[test]
 fn a_quiet_burst_is_keyframed_once_and_its_restore_replays_nothing() {
     let rig = Rig::new(6, 40);
@@ -289,6 +305,8 @@ fn a_quiet_burst_is_keyframed_once_and_its_restore_replays_nothing() {
 }
 
 /// A host resize with no output: its word is stored in the resize's hold, so a crash
+/// before the parse thread records it counts it (`resizes_unjournaled`); the nudge
+/// records it with no output, and the restore is exact at the new geometry.
 #[test]
 fn a_resize_with_no_output_is_counted_until_the_nudge_records_it() {
     let rig = Rig::new(8, 40);
@@ -313,6 +331,9 @@ fn a_resize_with_no_output_is_counted_until_the_nudge_records_it() {
 }
 
 /// A host settings change (a font zoom's cell size): its fingerprint is stored in the
+/// setter's hold, so the tail past the keyframe is not called exact (`config-moved`)
+/// until the keyframe the nudge forces (K4); a restorer running another config never
+/// calls the screen exact.
 #[test]
 fn a_settings_change_is_counted_until_its_forced_keyframe() {
     let rig = Rig::new(6, 40);
@@ -351,6 +372,8 @@ fn a_settings_change_is_counted_until_its_forced_keyframe() {
 }
 
 /// The config half of the fingerprint, between two real configs (a tab with a theme of
+/// its own, `session_theme`'s `host_settings(.., Some(&own))`): another config, another
+/// fingerprint.
 #[test]
 fn a_tail_recorded_under_one_config_is_exact_only_under_that_config() {
     let instance = aterm_core::config::TerminalConfig::default();
@@ -409,6 +432,7 @@ fn a_tail_recorded_under_one_config_is_exact_only_under_that_config() {
 }
 
 /// A line of history that only the scrollback held: a token no other bytes repeat, so the
+/// raw tail holds it verbatim.
 fn secret(i: usize) -> String {
     format!(
         "secret-{:016x}",
@@ -417,6 +441,8 @@ fn secret(i: usize) -> String {
 }
 
 /// Every [`secret`]-shaped run of bytes anywhere in the region (`secret-` and the 16
+/// bytes after it, whatever they are): a token is in the region's bytes exactly when it
+/// is in this set.
 fn region_secrets(journal: &SessionJournal) -> std::collections::BTreeSet<Vec<u8>> {
     use aterm_restore::RegionView as _;
     let region = journal.snapshot();
@@ -433,6 +459,8 @@ fn region_secrets(journal: &SessionJournal) -> std::collections::BTreeSet<Vec<u8
 }
 
 /// An ED3 forces a keyframe at the hold's end, after which the clear is settled out of
+/// the region (the privacy claim: a line a person cleared survives in no byte the keeper
+/// holds), and the restore after it is exact.
 #[test]
 fn a_clear_forces_a_keyframe_and_restores_exactly_after_it() {
     let rig = Rig::new(4, 30);
@@ -491,6 +519,9 @@ fn a_clear_forces_a_keyframe_and_restores_exactly_after_it() {
 }
 
 /// The keeper's poison brake and the offers no restore can use: a restorer that died
+/// once gets the keyframe alone (never exact), twice none; no region, a region of
+/// another kind, and a descriptor that is not read-only (or not the offered size) take
+/// the META rung.
 #[test]
 fn the_brake_and_unusable_offers_fall_to_the_rungs_below() {
     let rig = Rig::new(6, 40);
@@ -549,6 +580,9 @@ fn the_brake_and_unusable_offers_fall_to_the_rungs_below() {
 }
 
 /// A restored checkpoint's history is the keyframe's bridge plus what the tail's replay
+/// pushed, not the handoff wire's 256 lines: a session that printed 2,000 lines past its
+/// keyframe restores exactly with all of them, and once a quiet keyframe has caught it up
+/// it restores with the bridge's 512.
 #[test]
 fn a_deep_history_restores_past_the_handoff_s_256_lines() {
     let rig = Rig::new(8, 40);
@@ -600,6 +634,10 @@ fn a_deep_history_restores_past_the_handoff_s_256_lines() {
 }
 
 /// K5 PARKS: output that stops inside a sequence no keyframe carries (an XTGETTCAP
+/// query with no ST, as from `cat` of a binary or a program that died mid-query) defers
+/// the quiet keyframe, and the session then reads clean to the parse loop's wait, so an
+/// idle session inside the query wakes zero times rather than retry five times a
+/// second under the term lock.
 #[test]
 fn a_deferred_keyframe_parks_the_session_until_its_next_slice() {
     let rig = Rig::new(6, 40);
@@ -633,6 +671,10 @@ fn a_deferred_keyframe_parks_the_session_until_its_next_slice() {
 }
 
 /// A panic inside the restore costs that one session its screen (the META rung,
+/// `restore_why=panic`), and it is raised INSIDE the screen reader's panic fence
+/// (`reader_guard`): the window's panic hook files no `crash-<pid>.log` for it, which
+/// this launch's crash scan would otherwise show as the dead window's crash, hiding the
+/// dead window's own report.
 #[test]
 fn a_panic_inside_the_restore_is_fenced_from_the_crash_report() {
     let rig = Rig::new(6, 40);
@@ -686,6 +728,10 @@ pub(super) mod seam {
 }
 
 /// An alternate-screen session's history rides the saved primary (`alt_grid`), whose
+/// lines `history_lines` (the alternate grid's, always 0) does not count: the restore
+/// prices every one of them against the recovery's aggregate cell budget, as it prices a
+/// main-screen session's, so a recovery of many `vim` or `less` sessions over deep
+/// primaries cannot pass the aggregate the cap holds.
 #[test]
 fn an_alternate_screen_session_s_history_is_priced_against_the_budget() {
     for alternate in [false, true] {
@@ -723,6 +769,9 @@ fn an_alternate_screen_session_s_history_is_priced_against_the_budget() {
 }
 
 /// THE READER'S OWN JOURNAL WIRING, on a real pseudo-terminal (raw slave, so byte
+/// counts are exact) with the real reader attached (`spawn::attach_reader_with_post`,
+/// the gather and parse stages every session runs), where the tests above drive the
+/// journal by hand:
 #[test]
 fn the_real_reader_journals_what_it_gathers_and_a_nudged_resize() {
     use aterm_restore::RegionView as _;
@@ -886,6 +935,7 @@ fn the_real_reader_journals_what_it_gathers_and_a_nudged_resize() {
 }
 
 /// A restored screen is priced against the recovery's aggregate cell budget, as a
+/// handoff's is: a recovery whose budget is spent takes the META rung.
 #[test]
 fn a_restore_over_the_cell_budget_takes_the_meta_rung() {
     let rig = Rig::new(6, 40);
@@ -924,6 +974,7 @@ fn a_restore_over_the_cell_budget_takes_the_meta_rung() {
 }
 
 /// `status` says whether a session journals and why not, and what a keeper recovery
+/// restored for it.
 #[test]
 fn the_status_words_say_the_journal_and_the_restore() {
     let slot = JournalSlot::default();
@@ -976,6 +1027,7 @@ fn the_status_words_say_the_journal_and_the_restore() {
 }
 
 /// The fingerprint: one config and cell size, one value (never 0); another config or
+/// another cell size, another value.
 #[test]
 fn the_fingerprint_follows_the_config_and_the_cell_size() {
     let base = config_hash(Some(&aterm_core::config::TerminalConfig::default()));
@@ -993,6 +1045,9 @@ fn the_fingerprint_follows_the_config_and_the_cell_size() {
 }
 
 /// The recovery's tally: the rungs for the band row, and every field `status` reports
+/// per session summed, with how many sessions each `restore_why` word named, for the
+/// recovery census's ledger row (`restored=`, `restore_lost=`, `restore_why=`), so the
+/// ledger shows which loss real crashes hit.
 #[test]
 fn the_recovery_tally_carries_the_losses_to_the_ledger() {
     let screen = |why, in_flight_lost, tail_overflow, marks_lost| RestoreReport {
@@ -1052,6 +1107,7 @@ fn the_recovery_tally_carries_the_losses_to_the_ledger() {
 
 impl Rig {
     /// The journal worker's ticks, run here until the ring has caught the history up (or
+    /// stops moving: a settle, a reflow in flight).
     fn export(&self) {
         let mut last = u64::MAX;
         for _ in 0..64 {
@@ -1071,6 +1127,10 @@ impl Rig {
     }
 
     /// The region restored as a recovering window restores it, adopted as the spawn
+    /// adopts it (`spawn::hydrate_adopted_engine`: the checkpoint, the import's keys
+    /// reserved) and its history imported as the import worker imports it
+    /// (`handoff_history::run_imports`): the restore, the adopted engine and the import's
+    /// report.
     fn restore_and_import(&self) -> (RestoreReport, Arc<Mutex<Terminal>>, ImportReport) {
         let restore = self.restore(0).expect("a screen");
         let (term, report) =
@@ -1079,6 +1139,9 @@ impl Rig {
     }
 
     /// [`Self::restore_and_import`], held to the accounting every restore owes: the
+    /// restored history is the live one's newest lines at the same rows, and every live
+    /// line it lacks is either counted by the join (`history_lost`) or one of the carry's
+    /// lines the adopted pane's own retention evicted at the attach (`take - imported`).
     fn restore_and_import_accounted(&self) -> (RestoreReport, ImportReport, u64) {
         let restore = self.restore(0).expect("a screen");
         let take = restore
@@ -1151,6 +1214,7 @@ fn adopt_and_import(
 }
 
 /// An engine's history as `(absolute row, text)`, oldest first: the rows say the
+/// numbering, the text the lines.
 fn history_rows(term: &Mutex<Terminal>) -> Vec<(u64, String)> {
     let t = crate::term_lock(term);
     let fence = t.history_fence();
@@ -1167,6 +1231,9 @@ fn history_rows(term: &Mutex<Terminal>) -> Vec<(u64, String)> {
 }
 
 /// THE WHOLE SCROLLBACK COMES BACK (the plan's increment 5): a session whose history ring
+/// the journal worker has caught up restores its screen exactly with no bridge in its
+/// keyframe at all, and the import puts every line of its history back below the screen,
+/// at the same absolute rows, with nothing counted lost.
 #[test]
 fn a_crash_brings_the_whole_scrollback_back_below_the_exact_screen() {
     let rig = Rig::new(8, 40);
@@ -1230,6 +1297,11 @@ fn a_crash_brings_the_whole_scrollback_back_below_the_exact_screen() {
 }
 
 /// THE PROMPTS ABOVE THE SCREEN COME BACK WITH ITS SCROLLBACK: a shell whose history ring
+/// has caught up keyframes with no bridge, and its keyframe still carries the shell marks
+/// and output blocks whose prompts scrolled off within the bridge cap, so the restored
+/// engine, with the ring's lines imported below it at their own rows, holds the live
+/// engine's marks and blocks: prompt navigation reaches the same earlier prompt, and the
+/// block history holds the same completed commands.
 #[test]
 fn a_caught_up_ring_keeps_the_prompts_above_the_screen() {
     let rig = Rig::new(8, 40);
@@ -1291,6 +1363,10 @@ fn a_caught_up_ring_keeps_the_prompts_above_the_screen() {
 }
 
 /// A RING HOLDING MORE LINES THAN A SIDECAR MAY (`handoff_history::MAX_EXPORT_LINES`), as
+/// an unlimited scrollback of compressible lines makes it (here two thousand, blank but
+/// for a numbered marker every 997th, in well under the ring's 6.9 MiB): the restore
+/// imports the newest `MAX_EXPORT_LINES` lines at their own rows, as an update's export
+/// would carry, and counts every older one.
 #[test]
 fn a_ring_past_the_export_bound_imports_its_newest_lines() {
     use crate::handoff_history::MAX_EXPORT_LINES;
@@ -1371,6 +1447,9 @@ fn ring_state(journal: &SessionJournal) -> (Option<u64>, u64, usize) {
 }
 
 /// THE NORMAL STATE OF A LONG-LIVED SHELL: past its scrollback line limit, the engine
+/// evicts its oldest lines while the ring, sized at least 1.25 times the limit, still
+/// holds them, so every restore joins with the ring's run starting below the engine's
+/// oldest row and skips those lines (`skip > 0`, whole chunks of them never decoded).
 #[test]
 fn a_shell_past_its_line_limit_restores_its_history_line_for_line() {
     let rig = Rig::with_config(6, 60, Some(limited(2_000)));
@@ -1460,6 +1539,9 @@ fn a_shell_past_its_line_limit_restores_its_history_line_for_line() {
 }
 
 /// THE ADAPTIVE CAP GROWS: a corpus that encodes at more bytes per line than the cap was
+/// first sized for (32) fills the ring before the line limit does, so the ring evicts
+/// lines the engine still holds, and a restore then counts the lines below the ring's
+/// run.
 #[test]
 fn the_ring_s_cap_grows_to_the_corpus_and_the_history_comes_back_whole() {
     let rig = Rig::with_config(6, 100, Some(limited(20_000)));
@@ -1503,6 +1585,8 @@ fn the_ring_s_cap_grows_to_the_corpus_and_the_history_comes_back_whole() {
 }
 
 /// A chunk larger than the ring is appended as halves (and halves of halves), oldest
+/// first, rows dense: what the ring then holds is the newest of them, every line in
+/// order, the older ones evicted as the newer wrap over them (the join counts those).
 #[test]
 fn a_chunk_larger_than_the_ring_is_split_and_a_line_larger_restarts_it() {
     let rig = Rig::new(6, 200);
@@ -1599,6 +1683,10 @@ fn a_chunk_larger_than_the_ring_is_split_and_a_line_larger_restarts_it() {
 }
 
 /// At every boundary of a session's life — slices with the ring caught up, behind, and
+/// far behind the bridge cap; keyframes and none — the restore's history is the live
+/// history's newest lines, line for line at the same rows, and every older line it lacks
+/// is counted (`history_lost`): imported lines plus carried lines are the live history,
+/// or a suffix of it with the gap counted, never other lines.
 #[test]
 fn at_every_boundary_the_restored_history_is_the_live_one_or_a_counted_suffix() {
     let rig = Rig::new(6, 50);
@@ -1659,6 +1747,7 @@ fn at_every_boundary_the_restored_history_is_the_live_one_or_a_counted_suffix() 
 }
 
 /// NEGATIVE CONTROL: a chunk the ring lost (a damaged frame in the middle of its run)
+/// costs a counted gap, never different lines.
 #[test]
 fn a_lost_chunk_is_a_counted_gap_never_other_lines() {
     use aterm_restore::{RegionStore as _, RegionView as _};
@@ -1730,6 +1819,9 @@ fn a_lost_chunk_is_a_counted_gap_never_other_lines() {
 }
 
 /// A history line no other bytes repeat: 16 characters of 62, drawn from a seeded stream,
+/// with no prefix in common with another (`secret`'s shared `secret-` prefix becomes an
+/// LZ4 back-reference after its first line, so a byte search of a compressed chunk finds
+/// only the first).
 fn entropic(i: usize) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     let mut rng = aterm_spec::rng::XorShift::new(0xE7_0000 ^ (i as u64).wrapping_mul(0x9E37));
@@ -1738,12 +1830,14 @@ fn entropic(i: usize) -> String {
         .collect()
 }
 
-/// What a byte search looks for of an [`entropic`] token: its middle ten characters. An
+/// What a byte search looks for of an [`entropic`] token: its middle ten characters.
 fn needle(token: &str) -> &[u8] {
     &token.as_bytes()[3..13]
 }
 
 /// Every ten-byte window of `bytes` that is ASCII letters and digits alone, for [`needle`]
+/// lookups: a needle is nothing else, so it occurs in `bytes` exactly when it is one of
+/// these, and one pass over the bytes replaces a scan per token.
 fn windows_of(bytes: &[u8]) -> std::collections::HashSet<&[u8]> {
     const BLOCK: usize = 4096;
     const ZEROS: [u8; BLOCK] = [0; BLOCK];
@@ -1788,6 +1882,8 @@ fn region_bytes(journal: &SessionJournal) -> Vec<u8> {
 }
 
 /// `n` lines of [`entropic`] tokens journaled into `rig` and exported; returns the tokens
+/// whose [`needle`] the ring holds, after requiring nearly all of them, the oldest and the
+/// newest among them, and a ring past one 16 KiB page.
 fn exported_tokens(rig: &Rig, n: usize) -> Vec<String> {
     for batch in 0..n / 100 {
         let mut bytes = String::new();
@@ -1827,6 +1923,8 @@ fn exported_tokens(rig: &Rig, n: usize) -> Vec<String> {
 }
 
 /// An ED3 empties and zeroes the history ring as soon as the worker sees it (the parse
+/// thread wakes it), and with the clear's keyframe settled no byte of the region holds a
+/// line the person cleared; the restore after it imports none of them and counts nothing.
 #[test]
 fn a_clear_zeroes_the_ring_and_no_cleared_line_comes_back() {
     let rig = Rig::new(4, 30);
@@ -1863,6 +1961,9 @@ fn a_clear_zeroes_the_ring_and_no_cleared_line_comes_back() {
 }
 
 /// A clear made while an off-thread reflow holds the store (a window drag) still zeroes
+/// the ring at the worker's next tick: the clear generation moves even while the store is
+/// out, and the tick that cannot read a line still empties the ring, rather than wait for
+/// a store a drag can keep out for as long as it lasts.
 #[test]
 fn a_clear_during_an_offloaded_reflow_still_zeroes_the_ring() {
     let rig = Rig::new(6, 40);
@@ -1906,6 +2007,9 @@ fn a_clear_during_an_offloaded_reflow_still_zeroes_the_ring() {
 }
 
 /// A reflow renumbers the history: the ring waits two seconds of an unchanged fence before
+/// it starts over (a window drag reflows sixty times a second), and a restore inside that
+/// window counts the history it cannot join; after it, the ring is re-exported and the
+/// history comes back whole.
 #[test]
 fn a_reflow_inside_the_settle_is_counted_then_the_ring_starts_over() {
     let rig = Rig::new(6, 40);
@@ -1956,6 +2060,7 @@ fn a_reflow_inside_the_settle_is_counted_then_the_ring_starts_over() {
 }
 
 /// While the alternate screen is up the history lives on the saved primary: the ring
+/// exports it from there, and the restore joins and imports it there.
 #[test]
 fn an_alternate_screen_session_s_history_joins_on_its_primary() {
     let rig = Rig::new(6, 40);
@@ -1987,6 +2092,9 @@ fn an_alternate_screen_session_s_history_joins_on_its_primary() {
 }
 
 /// The worker on its own thread: it wakes on a session's growth and exports until the ring
+/// has caught up, with no tick asked for, a tick after its last (the journal's held clock
+/// moved on here, never slept; each wait a one-minute hang detector, never a latency
+/// budget).
 #[test]
 fn the_worker_exports_on_growth_and_a_held_export_on_its_import() {
     const HANG: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
@@ -2040,6 +2148,8 @@ fn the_worker_exports_on_growth_and_a_held_export_on_its_import() {
 }
 
 /// `status journal_ring_lag=` counts history lines, never rows: before the ring's first
+/// export (and while an export waits for an import or a settle, when nothing is
+/// published) a shell past its line limit lags by the lines it holds, not by its end row.
 #[test]
 fn the_ring_lag_counts_history_lines_never_rows() {
     let cfg = aterm_core::config::TerminalConfig {
@@ -2069,6 +2179,7 @@ fn the_ring_lag_counts_history_lines_never_rows() {
 }
 
 /// When the worker next ticks a session: now for a nudge, a second after the last tick for
+/// a growth, five while the history floods, and never for an idle one.
 #[test]
 fn the_ring_is_due_on_a_nudge_a_growth_and_less_often_in_a_flood() {
     let rig = Rig::new(4, 40);
@@ -2140,6 +2251,7 @@ fn restore_custody(
 }
 
 /// A session with a deep history of lines LZ4 barely compresses, its ring caught up and
+/// its quiet keyframe written: a ring of a few hundred KiB, the shed's subject.
 fn deep_rig() -> Rig {
     let rig = Rig::new(8, 80);
     for batch in 0..40 {
@@ -2157,6 +2269,10 @@ fn deep_rig() -> Rig {
 }
 
 /// THE MEMORY SHED, ONE SESSION (the plan's increment 6): a session whose history ring
+/// memory pressure took away journals into a fresh region whose ring is never written, so
+/// the pages the ring touched leave this window; its screen still restores exactly, and the
+/// restore counts every history line above the keyframe's bridge lost, line for line (the
+/// restored history is the live one's newest lines at the same rows).
 #[test]
 fn a_shed_session_restores_its_screen_exactly_and_counts_its_history_lost() {
     let rig = deep_rig();
@@ -2251,6 +2367,7 @@ fn a_shed_session_restores_its_screen_exactly_and_counts_its_history_lost() {
 }
 
 /// A ring that never touched a page (an idle shell's) is shed in place: there is nothing
+/// to free, so the region stays, and so does its custody.
 #[test]
 fn an_untouched_ring_is_shed_in_place() {
     let rig = Rig::new(6, 40);
@@ -2269,6 +2386,11 @@ fn an_untouched_ring_is_shed_in_place() {
 }
 
 /// A shed replacement the parser defers (K5: it holds a sequence no keyframe carries whole)
+/// changes nothing, and waits for the program's next bytes as the parse loop does: never
+/// due until the parse thread records them (an idle session parked mid-sequence costs the
+/// worker nothing, where it used to cost a fresh region and a term-lock hold five times a
+/// second), then tried no sooner than K1's quiet after its last try, with the region the
+/// first try created (no second `shm_open`).
 #[test]
 fn a_replacement_the_parser_defers_waits_for_the_programs_next_bytes() {
     let rig = deep_rig();
@@ -2333,6 +2455,8 @@ fn a_replacement_the_parser_defers_waits_for_the_programs_next_bytes() {
 }
 
 /// The bytes of the region `custody` names, as the keeper holds it: read while nothing
+/// writes it (every region here is written only by this test's thread, and only between
+/// reads, the contract [`offered_restore`] states too).
 fn custody_bytes(custody: &OwnedFd, len: u64) -> Vec<u8> {
     use std::os::fd::AsFd as _;
     let len = usize::try_from(len).expect("a region's length");
@@ -2385,6 +2509,10 @@ fn a_clear_while_the_replacement_is_owed_zeroes_the_ring_at_once() {
 }
 
 /// THE SHED POLICY: under WARN the largest rings go, largest first, until those left hold
+/// at most half; under CRITICAL every ring, and every ring a session opens while it holds;
+/// after the pressure has stayed eased a minute the rings come back one a second, oldest
+/// session first; a report of pressure meanwhile cancels the wait, and a repeated NORMAL
+/// keeps the first one's.
 #[test]
 fn the_shed_policy_sheds_the_largest_and_brings_rings_back_one_at_a_time() {
     const MIB: usize = 1 << 20;
@@ -2500,6 +2628,8 @@ fn the_shed_policy_sheds_the_largest_and_brings_rings_back_one_at_a_time() {
 }
 
 /// The worker on its own thread sheds on a reported level and answers once the regions it
+/// shed were replaced; after a NORMAL it brings the ring back when the hold has passed, and
+/// the ring catches the history up again.
 #[test]
 fn the_worker_sheds_on_pressure_and_brings_the_ring_back_after_the_hold() {
     const HANG: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
@@ -2561,6 +2691,8 @@ fn the_worker_sheds_on_pressure_and_brings_the_ring_back_after_the_hold() {
 }
 
 /// A keyframe the parse thread captured for the region the shed then replaced is never
+/// written into the fresh one: the shed's own keyframe, taken later, already holds the
+/// engine that capture saw, and the fresh region's first keyframe stays its newest.
 #[test]
 fn a_keyframe_captured_before_a_shed_is_never_written_after_it() {
     let rig = deep_rig();
@@ -2599,7 +2731,7 @@ fn a_keyframe_captured_before_a_shed_is_never_written_after_it() {
     assert!(restored.exact, "{:?}", restored.losses);
 }
 
-/// The gather count is read under the actual shared swap lock. `swap_in` asks the
+/// The gather count is read under the actual shared swap lock.
 #[test]
 fn a_region_swap_keeps_a_gather_completed_before_its_lock() {
     use aterm_restore::layout::{OFF_STREAM_GATHERED, PAGE};
@@ -2698,6 +2830,7 @@ fn a_region_swap_keeps_a_gather_completed_before_its_lock() {
 }
 
 /// A privacy clear zeroes the history's bytes, but the pages it wrote remain the
+/// region's until it is unmapped.
 #[test]
 fn a_privacy_cleared_history_ring_still_releases_its_pages_when_shed() {
     let untouched = Rig::new(6, 40);
@@ -2760,7 +2893,7 @@ fn a_privacy_cleared_history_ring_still_releases_its_pages_when_shed() {
     );
 }
 
-/// A REPLACED REGION'S CUSTODY OUTLASTS A FULL LINK QUEUE (R6). The shed hands the keeper
+/// A REPLACED REGION'S CUSTODY OUTLASTS A FULL LINK QUEUE (R6).
 #[test]
 fn a_full_link_queue_keeps_the_fresh_regions_custody_and_offers_it_again() {
     use aterm_keeper::client::LinkOp;
@@ -2837,6 +2970,7 @@ fn a_full_link_queue_keeps_the_fresh_regions_custody_and_offers_it_again() {
 }
 
 /// A CLEAR WHILE A REPLACED REGION'S CUSTODY IS OWED ERASES THE REGION THE KEEPER STILL
+/// HOLDS (R6 review; plan §5 claim 4).
 #[test]
 fn a_clear_while_the_custody_is_owed_erases_the_region_the_keeper_holds() {
     use aterm_keeper::client::LinkOp;
@@ -2950,6 +3084,7 @@ fn a_clear_while_the_custody_is_owed_erases_the_region_the_keeper_holds() {
 }
 
 /// A SECOND SHED WHILE A CUSTODY IS STILL OWED KEEPS THE REGION THE KEEPER HOLDS (R6
+/// review).
 #[test]
 fn a_second_shed_while_the_custody_is_owed_keeps_the_region_the_keeper_holds() {
     use aterm_keeper::client::LinkOp;
@@ -3036,6 +3171,7 @@ fn tokens_in(custody: &OwnedFd, len: u64, tokens: &[String]) -> usize {
 }
 
 /// A CLEAR MADE AFTER THE COMPANION IS QUEUED BUT BEFORE THE KEEPER READS IT ERASES THE
+/// REGION THE KEEPER STILL HOLDS (R9 (b)).
 #[test]
 fn a_clear_after_the_companion_is_queued_but_unread_erases_the_region_the_keeper_holds() {
     use aterm_keeper::client::LinkOp;
@@ -3136,6 +3272,7 @@ fn a_clear_after_the_companion_is_queued_but_unread_erases_the_region_the_keeper
 }
 
 /// A CLEAR WHOSE KEYFRAME A REPLACEMENT SKIPPED LEAVES NOTHING IN THE REGION THE KEEPER
+/// HOLDS (R9 (c)).
 #[test]
 fn a_clear_whose_keyframe_a_replacement_skipped_leaves_nothing_in_the_region_the_keeper_holds() {
     use aterm_keeper::client::LinkOp;
@@ -3231,7 +3368,7 @@ fn a_clear_whose_keyframe_a_replacement_skipped_leaves_nothing_in_the_region_the
     );
 }
 
-/// A LEVEL REPORTED BEFORE THE JOURNAL WORKER STARTS IS WHERE IT BEGINS (R6 review). The
+/// A LEVEL REPORTED BEFORE THE JOURNAL WORKER STARTS IS WHERE IT BEGINS (R6 review).
 #[test]
 fn a_pressure_level_reported_before_the_worker_starts_is_where_it_begins() {
     const HANG: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
@@ -3330,6 +3467,7 @@ fn ledger_of(
 
 impl Rig {
     /// The region restored as a recovering window restores it, the control slot's carry
+    /// beside the screen.
     fn restoration(&self) -> Restoration {
         let mut used = 0u64;
         offered_restoration(Some(self.offered()), 0, self.cfg.as_ref(), &mut used)
@@ -3355,6 +3493,7 @@ fn carried_ids(restoration: &Restoration) -> Vec<u64> {
 }
 
 /// THE TURN LEDGER ACROSS A CRASH (the plan's increment 7): a session's ledger rides its
+/// region's control slot.
 #[test]
 fn a_turn_ledger_rides_the_control_slot_across_a_crash() {
     let rig = Rig::new(6, 40);
@@ -3415,6 +3554,9 @@ fn a_turn_ledger_rides_the_control_slot_across_a_crash() {
 }
 
 /// A TORN SLOT YIELDS NO CARRY, NEVER A WRONG ONE (the plan's increment 7 test), in the
+/// window's restore: a slot whose commit word is 0 (a death inside the slot's write) or
+/// names a record the slot does not hold is no ledger, and the screen restores exactly all
+/// the same.
 #[test]
 fn a_torn_control_slot_carries_no_ledger_and_the_meta_rung_carries_a_whole_one() {
     use aterm_restore::layout::{OFF_CTL_COMMIT, kf_commit_word};
@@ -3464,6 +3606,8 @@ fn a_torn_control_slot_carries_no_ledger_and_the_meta_rung_carries_a_whole_one()
 }
 
 /// An ADOPTED session's ledger (an update's carry, a crash's) is written into its fresh
+/// region at the spawn, before anything is told the region exists: a crash right after
+/// the adoption still carries it, with its floor.
 #[test]
 fn an_adopted_ledger_is_carried_from_the_spawn() {
     let rig = Rig::new(6, 40);
@@ -3488,6 +3632,8 @@ fn an_adopted_ledger_is_carried_from_the_spawn() {
 }
 
 /// The memory shed's fresh region is given the control slot's record and the turn-id count
+/// before its custody goes anywhere: a crash restored from either region carries the same
+/// ledger and a count as high, and the next mint's count lands in the fresh one.
 #[test]
 fn a_shed_region_s_replacement_carries_the_ledger() {
     let rig = deep_rig();
@@ -3540,6 +3686,7 @@ fn a_shed_region_s_replacement_carries_the_ledger() {
 }
 
 /// The worker on its own thread carries a record with no tick asked for: the ledger's
+/// watch wakes it (each wait a one-minute hang detector, never a latency budget).
 #[test]
 fn the_worker_carries_a_record_the_ledger_takes() {
     const HANG: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
@@ -3568,6 +3715,8 @@ fn the_worker_carries_a_record_the_ledger_takes() {
 }
 
 /// TURN IDS GO ON ABOVE EVERY CARRY: the count continues past the highest carried count or
+/// record plus the update's reserve, and every carried ledger stops vouching for the ids
+/// below where it goes on (a floor above it stands).
 #[test]
 fn a_recovery_continues_turn_ids_above_every_carry() {
     let carry =
@@ -3600,6 +3749,10 @@ fn a_recovery_continues_turn_ids_above_every_carry() {
 }
 
 /// THE TURN-ID COUNT RIDES EVERY REGION: a turn id minted anywhere in the process (a turn
+/// begun in another session, one whose journal stopped, one since closed: none of them
+/// moves this session's ledger, so no carry follows) is in this session's region before
+/// the mint returns it, the control slot untouched; a restore reads it, and the recovery
+/// goes on past it, the carried ledger vouching for no id up to there.
 #[test]
 fn every_minted_turn_id_is_in_every_live_region_before_it_is_anyone_s() {
     let rig = Rig::new(6, 40);
@@ -3626,6 +3779,9 @@ fn every_minted_turn_id_is_in_every_live_region_before_it_is_anyone_s() {
 }
 
 /// THE REVIEW'S SCENARIO (a crash restore named an id again): a session's ledger carried
+/// when the count was `c`; the window then minted ids up to `c + 5_000` in sessions whose
+/// ledgers carried nothing and began a turn here under the last of them, which moves no
+/// ledger, and died.
 #[test]
 fn a_crash_restore_continues_past_ids_no_carry_named() {
     let accepted = Arc::new(AtomicBool::new(false));
@@ -3794,6 +3950,7 @@ fn a_crash_restore_continues_past_ids_no_carry_named() {
 }
 
 /// A stored count only rises, whatever order the minting threads store in; a count read
+/// before a higher one was stored is no lowering.
 #[test]
 fn the_region_s_turn_id_count_only_rises() {
     let rig = Rig::new(6, 40);
@@ -3806,6 +3963,8 @@ fn the_region_s_turn_id_count_only_rises() {
 }
 
 /// A recovered session's carry is the slot's, its count raised to the region's; a region
+/// with a count and no carry (a torn slot, a session that never took a turn) is adopted
+/// with the count alone; neither: none.
 #[test]
 fn a_recovered_carry_takes_the_region_s_count() {
     let reserve = crate::control::TURN_ID_RESERVE;
@@ -3841,6 +4000,9 @@ fn a_recovered_carry_takes_the_region_s_count() {
 }
 
 /// A LEDGER TOO LONG FOR THE SLOT IS SAID: a full ledger of long, varied prompts does not
+/// fit the 64 KiB slot, so its carry sheds the oldest records, and `journal_ledger_lag=`
+/// counts them: the slot does not hold them, and 0 would promise a crash restores every
+/// turn the ledger holds.
 #[test]
 fn a_ledger_the_slot_cannot_hold_whole_is_counted_in_its_lag() {
     use crate::turn_ledger::LEDGER_CAP;

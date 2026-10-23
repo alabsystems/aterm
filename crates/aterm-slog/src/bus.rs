@@ -1,47 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE READER'S VIEW OF THE BUS (design §5.5): what a
-//! consumer of a session's mirrored records holds, and the one place its
-//! laws are stated. The bus itself may hold a body twice (a republish at a
-//! new producer seq after a crash, an update or a collision): the view never
-//! shows one twice.
-//!
-//! - **Records** are keyed by `(ep, seq)` within a session (the caller keys
-//!   sessions by `(node, sid)`, and a space by its `ep`): a second body of a
-//!   key is counted `dup` and dropped (ReaderViewAtMostOnce).
-//! - **Covers** (`op=gap … n=<k>`) are coverage: the `ms` they cover are said
-//!   lost, and two covers of one hole are one statement, so they are unioned,
-//!   never deduped by key.
-//! - **Snapshots** are seeds: the newest one is kept, and a fold starts from
-//!   it when the view does not hold its space's first record, or holds a
-//!   cover (records it will never see), so long as every cover lies at or
-//!   below the snapshot's `upto=` ([`BusSpace::fold_seeded`]). A view that
-//!   lost records no snapshot folds past is [`Seed::Lost`], never whole.
-//! - **`ms` dense** (MsDense): every `ms` from 1 to the highest the view holds
-//!   is a record's or inside a cover; [`BusSpace::holes`] lists any that is
-//!   neither, which is loss nobody said (the broker's clamp, a retention).
-//! - **Order** is `(ep, seq)`, never the bus's offsets: a slot re-pinned after
-//!   a collision lands after later ones of its session, and the
-//!   fold applies it in its place. A body that arrived after a later seq of
-//!   its space is counted `reordered`.
-//! - **A body is the bus's, not the mirror's** until it reads as one: a
-//!   record outside THIS BUILD'S bus class ([`Rec::is_bus_class`]: a label,
-//!   a bell, a kind it does not know) is counted `foreign` and never folded,
-//!   a key above the bus's tier (`text=`, `cwd=`, `title=`) is stripped, and
-//!   a cover or an `ms` past any seq a log numbers ([`crate::SEQ_LIMIT`]) is
-//!   foreign and dropped whole. Whoever can write a session's `ev` face can
-//!   say what the bus class says, and no more.
-//! - **Unknown is not hostile.** A fleet runs mixed builds, and a newer
-//!   writer's bus class may be wider than this reader's (a carry is judged
-//!   the same way, fixer F9), and its words newer (§3.4: a new word never
-//!   changes `v`). A well-formed record this build calls local with an `ms`
-//!   in range keeps that `ms` HELD — the view stays dense, so
-//!   [`BusSpace::holes`] names only an `ms` nobody said — while nothing of it
-//!   is folded. That holds for a kind, an operation or a node level this
-//!   build does not know: [`crate::decode_bus`] reads such a body as a record
-//!   it cannot place, which no bus class holds. Holding an `ms` says no more
-//!   than a cover would, which any writer of the face can publish.
+//! THE READER'S VIEW OF THE BUS (design §5.5).
 
 use std::collections::BTreeMap;
 
@@ -58,13 +18,11 @@ pub enum Seed {
     Start,
     /// From the newest snapshot, every cover at or below its `upto=`.
     Snap,
-    /// Seeded from a snapshot whose original need count is absent or
-    /// differs from the needs restored; the bounded summary is incomplete.
+    /// Seeded from a snapshot whose original need count is absent or differs from the needs.
     SnapPartial,
     /// Partial: the view holds neither its start nor a snapshot.
     NoStart,
-    /// Partial: the view lost records (a cover) that no snapshot it holds
-    /// folds past.
+    /// Partial: the view lost records (a cover) that no snapshot it holds folds past.
     Lost,
 }
 
@@ -100,10 +58,7 @@ pub enum Offered {
     Snap,
     /// A body of another space: the caller's to route.
     OtherSpace,
-    /// Not what this build's mirror publishes: a record outside its bus
-    /// class (its `ms` held when in range, nothing of it folded: the module
-    /// doc), or an `ms` or a cover past any seq a log numbers (dropped
-    /// whole). Counted.
+    /// Not what this build's mirror publishes.
     Foreign,
 }
 
@@ -112,7 +67,6 @@ pub enum Offered {
 pub struct BusSpace {
     ep: u32,
     records: BTreeMap<u64, (u64, Rec)>,
-    /// Records outside this build's bus class, by seq: each one's `ms`, held
     /// and never folded (the module doc: unknown is not hostile).
     unknown: BTreeMap<u64, u64>,
     covers: Vec<(u64, u64, &'static str)>,
@@ -148,15 +102,12 @@ impl BusSpace {
             return Offered::OtherSpace;
         }
         let mut r = b.rec;
-        // What a mirror publishes, and no more (the module doc).
         let ms = b.ms.unwrap_or(0);
         if ms > crate::SEQ_LIMIT || r.seq > crate::SEQ_LIMIT {
             self.foreign += 1;
             return Offered::Foreign;
         }
         if !r.is_bus_class() {
-            // A newer writer's bus class, or a forger's: its `ms` held (no
-            // false hole), nothing of it folded.
             if ms == 0 {
                 self.foreign += 1;
                 return Offered::Foreign;
@@ -207,13 +158,11 @@ impl BusSpace {
         Offered::Record
     }
 
-    /// Whether a body of key `seq` is held (a record, or one outside this
     /// build's bus class).
     fn holds_seq(&self, seq: u64) -> bool {
         self.records.contains_key(&seq) || self.unknown.contains_key(&seq)
     }
 
-    /// Every `ms` a body holds: the records' and those outside this build's
     /// bus class (never folded, still said).
     fn held_ms(&self) -> impl Iterator<Item = u64> + '_ {
         self.records
@@ -257,7 +206,6 @@ impl BusSpace {
         self.snap.as_ref()
     }
 
-    /// Each cover's `[lo, hi]` (an offered cover's `hi` is within
     /// [`crate::SEQ_LIMIT`]; saturating all the same).
     fn spans(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         self.covers
@@ -273,8 +221,7 @@ impl BusSpace {
         rec.max(cov)
     }
 
-    /// The lowest `ms` a body or a cover of the view holds (0: none): where
-    /// a view that does not hold its space's start begins.
+    /// The lowest `ms` a body or a cover of the view holds (0.
     #[must_use]
     pub fn min_ms(&self) -> u64 {
         let rec = self.held_ms().min();
@@ -305,9 +252,7 @@ impl BusSpace {
         total
     }
 
-    /// THE HOLES (MsDense): the `ms` ranges from `from` up to [`Self::max_ms`]
-    /// that neither a body nor a cover holds — loss nobody said. Empty for a
-    /// view that holds its space whole from `from`.
+    /// THE HOLES (MsDense).
     #[must_use]
     pub fn holes_from(&self, from: u64) -> Vec<(u64, u64)> {
         let mut held: Vec<(u64, u64)> = self
@@ -335,8 +280,7 @@ impl BusSpace {
         self.holes_from(1)
     }
 
-    /// Whether the view holds its space's first bus-class record (or a cover
-    /// of it): a fold of it starts where the space did.
+    /// Whether the view holds its space's first bus-class record (or a cover of it).
     #[must_use]
     pub fn holds_start(&self) -> bool {
         self.held_ms().any(|ms| ms == 1) || self.covers.iter().any(|(lo, ..)| *lo == 1)
@@ -349,18 +293,7 @@ impl BusSpace {
         (fold, seed.partial())
     }
 
-    /// THE FOLD a reader shows, and where it started. A view that lost
-    /// nothing (no cover) folds from the space's first record when it holds
-    /// it, else from the newest snapshot (applying only the records after
-    /// it). A view that lost records — a cover: a claim or a failed run's
-    /// close among them perhaps — is whole only past a snapshot whose
-    /// `upto=` reaches every cover: the snapshot's open needs stand for what
-    /// the lost records raised and lifted ([`Fold::reseed_needs`], over the
-    /// held records' totals and close when the view holds its start). Short
-    /// of one it folds what it holds, which the fold tolerates as a late
-    /// join, and is partial: [`Seed::Lost`]; [`Seed::NoStart`] for a view
-    /// that merely began late. A chosen snapshot without a matching original
-    /// need count is [`Seed::SnapPartial`]. Records apply in seq order.
+    /// THE FOLD a reader shows, and where it started.
     #[must_use]
     pub fn fold_seeded(&self) -> (Fold, Seed) {
         let mut fold = Fold::new(self.ep);
@@ -373,8 +306,6 @@ impl BusSpace {
                 fold.apply(r);
             }
         };
-        // Check immediately after seeding, before later records can raise
-        // or clear needs. A missing legacy count establishes no completeness.
         let snap_seed = |fold: &Fold, snap: &Rec| {
             let held = fold.state().needs.iter().flatten().count() as u64;
             if snap.f.get_u(Key::N) == Some(held) {

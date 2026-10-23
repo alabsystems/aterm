@@ -413,6 +413,7 @@ pub struct Model {
 
 impl Model {
     /// All state-variable names, scalar then function-valued (the order used in
+    /// `VARIABLES`, `vars`, and `UNCHANGED`).
     #[cfg_attr(trust_verify, trust::skip)]
     fn all_var_names(&self) -> Vec<&'static str> {
         let mut v: Vec<&'static str> = self.vars.iter().map(|x| x.name).collect();
@@ -452,6 +453,7 @@ impl Model {
     }
 
     /// Emit the module from the CONSTANT names and the `Init` body; the rest is shared by the
+    /// concrete and open-`Init` forms.
     #[cfg_attr(trust_verify, trust::skip)]
     fn render(&self, const_names: &[String], init_line: &str) -> String {
         let vars = self.all_var_names();
@@ -755,6 +757,7 @@ impl Model {
 }
 
 /// The value of `e` under `consts`, or `None` when it mentions a state
+/// variable.
 fn constant_value(e: &Expr, consts: &[(&str, i64)]) -> Option<i64> {
     match e {
         Expr::Int(n) => Some(*n),
@@ -768,6 +771,7 @@ fn constant_value(e: &Expr, consts: &[(&str, i64)]) -> Option<i64> {
 }
 
 /// A range atom: ONE state variable compared with a constant expression,
+/// either way round, as `(variable, lowest allowed, highest allowed)`.
 fn range_atom(
     e: &Expr,
     consts: &[(&str, i64)],
@@ -789,6 +793,7 @@ fn range_atom(
 }
 
 /// Why `e` is not a range bound: each conjunct that is not a range atom, and
+/// each variable its atoms pin to one value or none.
 #[cfg_attr(trust_verify, trust::skip)]
 fn not_range_bounds(e: &Expr, consts: &[(&str, i64)]) -> Vec<String> {
     fn conjuncts<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
@@ -1558,6 +1563,7 @@ mod tests {
     use crate::test_models::{evict_full_model, ring_model, subscribe_model};
 
     /// A pin and a bound over the `Buggy` dial are refused as bounds, while an
+    /// ordinary one- or two-sided range passes.
     #[test]
     fn a_bound_must_be_a_range() {
         let var = || Box::new(Expr::Var("x"));
@@ -1613,6 +1619,7 @@ mod tests {
     }
 
     /// An ill-typed Expr panics, as `eval`'s unbound-identifier arm does, never evaluating to a
+    /// default.
     #[test]
     #[should_panic(expected = "expected Int, got Bool")]
     fn ill_typed_int_position_fails_closed() {

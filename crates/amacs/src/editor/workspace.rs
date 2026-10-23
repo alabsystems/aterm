@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The workspace: the state every editor view shares (kill ring, marks,
-//! command history, keymap, undo history, the keyboard macro), and the
-//! reducer's entry points, which turn typed text, a key chord or a command
-//! into document transactions and host effects.
+//! The workspace.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -33,8 +30,7 @@ pub struct GlobalMark {
 /// Why a command asks the host to close its view ([`EditorEffect::CloseView`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloseWhy {
-    /// The person is done with the view: `kill-buffer` of this buffer,
-    /// `save-buffers-kill-terminal`.
+    /// The person is done with the view.
     Plain,
     /// `finish-edit`: the edit a waiting client asked for is done.
     Finish,
@@ -48,8 +44,7 @@ pub enum EditorEffect {
         document: DocumentId,
         seq: Seq,
     },
-    /// Resolve an exact, already-open editor buffer at the host boundary. The
-    /// workspace never fabricates a document or retargets an app instance.
+    /// Resolve an exact, already-open editor buffer at the host boundary.
     SwitchBuffer {
         query: String,
     },
@@ -57,23 +52,15 @@ pub enum EditorEffect {
     RevertDocument {
         document: DocumentId,
     },
-    /// Close the view the command ran in, as the host closes any view (a
-    /// changed draft is saved first), or answer the client waiting on its
-    /// edit (`why`).
+    /// Close the view the command ran in.
     CloseView {
         why: CloseWhy,
     },
-    /// `kill-buffer` of another open buffer, named as `switch-to-buffer`
-    /// names one; the host resolves the name and closes that buffer's view.
+    /// `kill-buffer` of another open buffer, named as `switch-to-buffer` names one.
     KillBuffer {
         query: String,
     },
-    /// The kill ring's newest entry, which a kill or `kill-ring-save` just
-    /// made (or joined), for the face to put on the system clipboard: the
-    /// platform clipboard in the GUI, an OSC 52 write in a terminal (design
-    /// §2.1). Emitted only for an input granted
-    /// [`CommandAuthority::Clipboard`], so a control client's kill stays in
-    /// the ring and never reaches the person's clipboard.
+    /// The kill ring's newest entry.
     KillToClipboard {
         text: String,
     },
@@ -81,8 +68,7 @@ pub enum EditorEffect {
     Bell,
 }
 
-/// Whether [`EditorWorkspace::execute_with`] runs a command whose macro
-/// step is already recorded: one a prompt's answers complete.
+/// Whether [`EditorWorkspace::execute_with`] runs a command whose macro step is already recorded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Recorded {
     No,
@@ -103,9 +89,7 @@ pub enum EditorError {
     MacroRecursion,
 }
 
-/// The editing options the workspace's commands read. Config slice C1 fills
-/// them from `[amacs]` (design §9); until then they are Emacs's defaults,
-/// with aterm's four-column tab stop.
+/// The editing options the workspace's commands read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EditorOptions {
     /// The display column `fill-paragraph` (M-q) fills lines to.
@@ -126,9 +110,7 @@ impl Default for EditorOptions {
     }
 }
 
-/// What a command left behind it: the view it ran in, the document's
-/// sequence and that view's selections. The command before is Emacs's
-/// `last-command` only while all three still hold.
+/// What a command left behind it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct LeftBy {
     view: DocumentViewId,
@@ -154,10 +136,7 @@ pub struct EditorWorkspace {
     pub command_history: VecDeque<String>,
     pub keymap: Keymap,
     pub options: EditorOptions,
-    /// The authority classes the input being reduced carries. A command
-    /// that needs one it lacks ([`Self::authorities`]) runs nothing and says
-    /// why. Every class unless the host narrows it around a control
-    /// client's input, and restores it after.
+    /// The authority classes the input being reduced carries.
     pub granted: Vec<CommandAuthority>,
     pub(super) histories: BTreeMap<DocumentId, DocumentHistory>,
     pub(super) recording: Option<Vec<MacroStep>>,
@@ -165,20 +144,12 @@ pub struct EditorWorkspace {
     pub(super) playing_macro: bool,
     pub(super) last_yank: Option<YankRecord>,
     pub(super) last_commit: Option<(DocumentId, Seq, Vec<EditDelta>)>,
-    /// What the last command left ([`LeftBy`]). A view's `last_command`
-    /// counts only while it does, so a kill joins the kill ring's newest
-    /// entry only straight after a kill that made it: never after a kill in
-    /// another view, an edit from elsewhere, or a selection the host set (⌘A,
-    /// accessibility), all of which the kill ring, shared by every view,
-    /// would otherwise run together.
+    /// What the last command left ([`LeftBy`]).
     pub(super) last_left: Option<LeftBy>,
-    /// Whether the kill ring's newest entry changed since the face was last
-    /// handed it ([`EditorEffect::KillToClipboard`]).
+    /// Whether the kill ring's newest entry changed since the face was last handed it.
     pub(super) kill_ring_changed: bool,
 }
 
-/// The workspace aterm's native Editor view uses: the GUI keymap of the host
-/// platform. The terminal face builds its own with
 /// [`EditorWorkspace::with_keymap`] and [`Profile::Terminal`].
 impl Default for EditorWorkspace {
     fn default() -> Self {
@@ -212,10 +183,7 @@ impl EditorWorkspace {
         Self::default()
     }
 
-    /// Every authority running `command` here needs: its own
-    /// ([`EditorCommand::authority`]) and, for `call-last-kbd-macro`, those
-    /// of every command the macro replays, so a macro can never carry a
-    /// command past a check its own name would fail.
+    /// Every authority running `command` here needs.
     pub fn authorities(&self, command: EditorCommand) -> Vec<CommandAuthority> {
         let mut needed = vec![command.authority()];
         if command == EditorCommand::PlayMacro {
@@ -229,9 +197,7 @@ impl EditorWorkspace {
         needed
     }
 
-    /// Why `command` may not run under `granted`: the first class it needs
-    /// ([`Self::authorities`]) that `granted` lacks, as the status that says
-    /// so. `None` when it may run.
+    /// Why `command` may not run under `granted`.
     #[must_use]
     pub fn refusal(&self, command: EditorCommand, granted: &[CommandAuthority]) -> Option<String> {
         self.authorities(command)
@@ -246,10 +212,7 @@ impl EditorWorkspace {
             })
     }
 
-    /// Drop everything this workspace keeps for `document`, which the store
-    /// has released: its buffer entry, undo and redo history, the global marks
-    /// into it, and a yank or commit record naming it. Reopening the file is a
-    /// new document with a history of its own.
+    /// Drop everything this workspace keeps for `document`, which the store has released.
     pub fn forget(&mut self, document: DocumentId) {
         self.buffers.retain(|buffer| *buffer != document);
         self.histories.remove(&document);
@@ -299,9 +262,6 @@ impl EditorWorkspace {
         if view.minibuffer_active() {
             return self.insert_minibuffer_text(store, view, text);
         }
-        // After C-u a digit is part of the argument, never text. The host
-        // routes a plain key as text once the C-u chord has resolved. A macro
-        // records the argument with the command that takes it, not the digit.
         if view.accept_argument_digit(text) {
             return Ok(Vec::new());
         }
@@ -310,8 +270,6 @@ impl EditorWorkspace {
         {
             steps.push(MacroStep::Text(text.to_owned()));
         }
-        // Text insertion takes no count: a pending C-u stops here. Typing
-        // also ends a run of kills, so the next kill starts a new entry.
         view.take_prefix_argument();
         view.last_command = None;
         let edits = edits_for_selections(&view.selections, text)?;
@@ -320,10 +278,7 @@ impl EditorWorkspace {
         Ok(Vec::new())
     }
 
-    /// Insert a paste: one transaction, never read as keys. Even a one-digit
-    /// paste after `C-u` is text, never part of the argument, which (as for
-    /// any insertion) ends with it. A paste into an open minibuffer goes to
-    /// its query, and the argument waits on for the command it runs.
+    /// Insert a paste: one transaction, never read as keys.
     pub(crate) fn insert_paste(
         &mut self,
         store: &mut DocumentStore,
@@ -359,10 +314,6 @@ impl EditorWorkspace {
                 "Minibuffer active — Enter accepts; C-g cancels".to_string(),
             )]);
         }
-        // In the terminal face ESC is Meta for the key after it, as in Emacs
-        // (`ESC x` is `M-x`), so every M- binding has a spelling on a
-        // terminal whose Alt key types characters instead; ESC ESC quits. A
-        // GUI's Escape is its own key, which quits (`Profile::escape_is_meta`).
         let mut chord = chord;
         if view.escape_pending() {
             view.chord_prefix.clear();
@@ -391,8 +342,6 @@ impl EditorWorkspace {
         }
         view.chord_prefix.push(chord);
         let resolution = self.keymap.resolve(&view.chord_prefix);
-        // `M-<digit>` names its digit in the key itself, which the command
-        // reads here; run any other way it has no digit to read.
         if resolution == KeyResolution::Command(EditorCommand::DigitArgument)
             && let Some(digit) = view
                 .chord_prefix
@@ -414,7 +363,6 @@ impl EditorWorkspace {
             }
             KeyResolution::Prefix { display, reachable } => {
                 // A pending C-u stays on screen while the sequence it waits
-                // for is typed (`C-u 4 C-x — …`).
                 let argument = view
                     .prefix_argument
                     .map(|argument| format!("{} ", argument.label()))
@@ -431,16 +379,13 @@ impl EditorWorkspace {
                     .join(" ");
                 view.chord_prefix.clear();
                 view.prefix_hud = None;
-                // An undefined key ends a pending C-u too, as in Emacs: no
-                // command took it, and its hint is gone with the HUD.
                 view.prefix_argument = None;
                 Ok(vec![EditorEffect::Status(format!("{keys} is not bound"))])
             }
         }
     }
 
-    /// Run `command` as a key, a button or M-x runs it: with the pending
-    /// `C-u` argument, and asking for its arguments in the minibuffer.
+    /// Run `command` as a key, a button or M-x runs it.
     pub fn execute(
         &mut self,
         store: &mut DocumentStore,
@@ -450,10 +395,7 @@ impl EditorWorkspace {
         self.execute_with(store, view, command, Vec::new(), Recorded::No)
     }
 
-    /// Run a whole [`Invocation`], as a machine does: its count replaces any
-    /// pending argument, and its `args` answer the command's prompts in one
-    /// call. With no `args` a prompting command asks for them in the
-    /// minibuffer, as from a key; with the wrong number it runs nothing.
+    /// Run a whole [`Invocation`], as a machine does.
     pub fn invoke(
         &mut self,
         store: &mut DocumentStore,
@@ -482,9 +424,7 @@ impl EditorWorkspace {
         self.execute_with(store, view, command, args, Recorded::No)
     }
 
-    /// Run the command a prompt has collected every answer for. Its key
-    /// recorded the command, before the prompt opened, so a macro being
-    /// defined takes the answers into that step, to replay without asking.
+    /// Run the command a prompt has collected every answer for.
     pub(super) fn answer_prompt(
         &mut self,
         store: &mut DocumentStore,
@@ -502,9 +442,7 @@ impl EditorWorkspace {
         self.execute_with(store, view, command, args, Recorded::AsItsKey)
     }
 
-    /// Give the macro step that opened `command`'s minibuffer the answers it
-    /// collected. The step is the newest one: while a minibuffer is open no
-    /// other command runs, and its text is the query's, not the macro's.
+    /// Give the macro step that opened `command`'s minibuffer the answers it collected.
     pub(super) fn record_answers(&mut self, command: EditorCommand, answers: &[String]) {
         if self.playing_macro {
             return;
@@ -518,10 +456,7 @@ impl EditorWorkspace {
         }
     }
 
-    /// Run one command: its authority checked, its argument taken, recorded
-    /// into a macro being defined (unless `recorded` says its key already
-    /// was), and the kill ring's newest entry handed to the face when it
-    /// changed.
+    /// Run one command.
     pub(super) fn execute_with(
         &mut self,
         store: &mut DocumentStore,
@@ -550,17 +485,11 @@ impl EditorWorkspace {
                 "Minibuffer active — Enter accepts; C-g cancels".to_string(),
             )]);
         }
-        // A command the input may not run runs nothing, and the argument
-        // meant for it goes with it, as an unbound key's does.
         if let Some(refusal) = self.refusal(command, &self.granted) {
             view.prefix_argument = None;
             view.prefix_hud = None;
             return Ok(vec![EditorEffect::Status(refusal)]);
         }
-        // C-u and M-<digit> build the argument and M-x forwards it to the
-        // command chosen in the minibuffer. Every other command takes it
-        // here, once: a command with no use for it drops it rather than
-        // leaving it for a later one.
         let argument_command = matches!(
             command,
             EditorCommand::UniversalArgument
@@ -572,9 +501,6 @@ impl EditorWorkspace {
         } else {
             view.take_prefix_argument()
         };
-        // A step carries the command's argument and its answers. M-x is no
-        // step: the command it runs records itself, with the argument M-x
-        // forwarded to it.
         if let Some(steps) = &mut self.recording
             && !self.playing_macro
             && recorded == Recorded::No
@@ -591,10 +517,6 @@ impl EditorWorkspace {
             steps.push(MacroStep::Command(command, argument, args.clone()));
         }
         self.remember_command(command.name());
-        // What ran before this command decides whether a kill joins the last
-        // one and where C-l puts the line, while the view is as that command
-        // left it ([`LeftBy`]). The argument commands are not "before"
-        // anything: `C-k C-u C-k` still appends.
         let previous = view
             .last_command
             .filter(|_| self.last_left.as_ref() == Some(&LeftBy::now(store, view)));
@@ -605,7 +527,6 @@ impl EditorWorkspace {
             Some(command)
         };
         self.last_left = Some(LeftBy::now(store, view));
-        // A macro's kills reach the face once, when the macro is done.
         if !self.playing_macro
             && let Ok(effects) = &mut result
             && std::mem::take(&mut self.kill_ring_changed)
@@ -701,10 +622,6 @@ impl EditorWorkspace {
             }
             EditorCommand::ScrollPageDown | EditorCommand::ScrollPageUp => {
                 // A page is the view's height less two lines of context. The
-                // view and the carets move by the same lines, so the caret
-                // keeps its row on screen; at either end the view stops and
-                // the carets go on to the first or last line, so no press is
-                // a no-op before the caret reaches the end of the document.
                 let snapshot = snapshot_for_view(store, view)?;
                 let lines = EditorLines::scanning(&snapshot.text);
                 let page = view.viewport_lines().saturating_sub(2).max(1);
@@ -812,7 +729,6 @@ impl EditorWorkspace {
                 return self.transpose_chars(store, view, argument, count);
             }
             EditorCommand::FillParagraph => return self.fill_paragraph(store, view),
-            // `C-u C-SPC` pops the mark instead of setting it, as in Emacs.
             EditorCommand::SetMark if argument.is_some() => return self.pop_mark(store, view),
             EditorCommand::SetMark => return Ok(self.set_mark(view)),
             EditorCommand::PopMark => return self.pop_mark(store, view),
@@ -855,7 +771,6 @@ impl EditorWorkspace {
                     });
                     return Ok(Vec::new());
                 };
-                // An empty answer is this buffer, as `C-x k RET` is in Emacs.
                 return Ok(vec![if query.trim().is_empty() {
                     EditorEffect::CloseView {
                         why: CloseWhy::Plain,
@@ -890,7 +805,6 @@ impl EditorWorkspace {
             }
             EditorCommand::DigitArgument => {
                 // Reached only without a digit key (M-x, a button): there is
-                // no digit to take.
                 return Ok(vec![EditorEffect::Status(
                     "digit-argument is typed as M-0 … M-9".to_string(),
                 )]);
@@ -1066,7 +980,6 @@ mod tests {
             matches!(effects.as_slice(), [EditorEffect::Status(message)] if message.contains("not bound")),
             "{effects:?}"
         );
-        // C-w IS bound: with no region it must not claim the key is unbound.
         let effects = workspace
             .handle_chord(&mut store, &mut view, KeyChord::parse("C-w").unwrap())
             .unwrap();

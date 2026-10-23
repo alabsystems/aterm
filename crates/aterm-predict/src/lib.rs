@@ -886,7 +886,7 @@ impl Predictor {
     /// Disables `rule` as a negative control for safety-theorem verification.
     #[cfg(any(test, debug_assertions))]
     #[inline]
-    pub fn disable_rule_for_test(&mut self, rule: Rule) {
+    pub const fn disable_rule_for_test(&mut self, rule: Rule) {
         self.disabled |= rule.bit();
     }
 
@@ -905,7 +905,7 @@ impl Predictor {
     }
 
     #[inline]
-    fn count(&mut self, event: Event) {
+    const fn count(&mut self, event: Event) {
         #[cfg(any(test, debug_assertions))]
         {
             let n = match event {
@@ -1008,7 +1008,7 @@ impl Predictor {
     }
 
     #[inline]
-    fn cells_of(&self, ch: char) -> usize {
+    const fn cells_of(&self, ch: char) -> usize {
         if self.ambiguous_width_double {
             aterm_grapheme::char_width_cjk(ch)
         } else {
@@ -2654,7 +2654,7 @@ impl Predictor {
         self.cancelled_pair = None;
     }
 
-    fn confirm(&mut self, p: Prediction) {
+    const fn confirm(&mut self, p: Prediction) {
         if p.epoch != self.epoch {
             return;
         }
@@ -2711,7 +2711,7 @@ impl Predictor {
     }
 
     #[inline]
-    fn parked(&self, flag: Option<bool>) -> bool {
+    const fn parked(&self, flag: Option<bool>) -> bool {
         match flag {
             Some(pending) if self.rule(Rule::EngineWrapFlag) => pending,
             _ => self.deferred_wrap,

@@ -38,6 +38,8 @@ pub const FILL_ALPHA_GAIN: f32 = 0.55;
 /// The hollow's fill, in cell widths from the bullet's centre: inside the `◯`'s ring, which runs about 0.36 to 0.5 cell widths out in the bundled faces (JetBrains Mono with Noto Sans Symbols 2, measured in the preview).
 pub const FILL_RADIUS: f32 = 0.42;
 /// A veil's ceiling under this (of 255) is not drawn: a ceiling of `0` reads
+/// as none at all (`aterm_render::halo_over_cap`), and so faint a veil shows
+/// nothing.
 const VEIL_ALPHA_FLOOR: u8 = 4;
 /// A dot waiting on its own tool call wears this share of a running dot's light at the same work (its strength, and on paper its hollow's fill): a vivid ring that waits, dimmer than any running dot and, unlike a stuck one, in its full hue and still.
 pub const TOOL_GLOW: f32 = 0.5;
@@ -225,6 +227,7 @@ pub fn crest(d_cells: f32, ms: u64) -> f32 {
 }
 
 /// `0x00RRGGBB` channel `sh` in linear light (the WCAG transfer the crate's
+/// [`relative_luminance`] uses).
 #[inline]
 fn lin(rgb: u32, sh: u32) -> f32 {
     let n = ((rgb >> sh) & 0xff) as f32 / 255.0;
@@ -325,6 +328,11 @@ fn contrast(a: u32, b: u32) -> f32 {
 }
 
 /// A light-ground dot's ring: `fresh` (the dot's hue, darkened by
+/// [`at_luminance`]'s scaling, so hue-true) at the palest luminance up to
+/// `top` whose contrast with `ground` holds [`PRINT_RING_CONTRAST`] with both
+/// under the dot's own tint at its ceiling `veil` (`over_rgb`, the renderer's
+/// source-over: the ring lies inside the tint's plateau, never under more of
+/// it).
 #[inline]
 fn print_ring(fresh: u32, ground: u32, veil: u8, top: f32) -> u32 {
     let ring = |l: f32| at_luminance(fresh, l);
@@ -594,6 +602,8 @@ pub fn dot_light_quads(light: &DotLight, dark: bool, place: DotPlace, halos: &mu
 }
 
 /// One radial light of `color` (the stream's word for `mode`) about the
+/// bullet at `place`, `(rx, ry)` pixels, as one quad per row band it reaches
+/// inside the clip.
 #[inline]
 fn push_radial(
     halos: &mut Vec<RainHalo>,

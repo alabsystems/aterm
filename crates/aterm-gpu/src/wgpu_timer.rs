@@ -1,50 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The wgpu arm's GPU clock for `crate::gpu_time`: per-pass timestamp queries.
-//!
-//! wgpu has no command-buffer clock, so a timed present asks each of its render
-//! passes for a beginning and an end timestamp (`RenderPassTimestampWrites`,
-//! which needs only `Features::TIMESTAMP_QUERY`; writes between passes would
-//! need `TIMESTAMP_QUERY_INSIDE_ENCODERS`, which fewer adapters carry). Copies
-//! between passes (the present copy, the band shift) carry no timestamp and are
-//! not counted.
-//!
-//! # The readback waits for the frame
-//!
-//! When the present returns, its frame is sealed and the ring asks the queue to
-//! report when the work submitted so far has completed
-//! (`Queue::on_submitted_work_done`). Only then are the used queries resolved,
-//! copied to a mappable buffer and mapped asynchronously; a later present (or
-//! [`TimestampRing::harvest`]) finds the map complete and settles the frame.
-//! Resolving right behind the frame's submit raced the device: on Metal the
-//! resolve is a blit in a later command buffer, a counter sample buffer is not a
-//! tracked resource, and the last pass's end-of-fragment sample read 0 in 5 of
-//! 15 presents (a healthy frame dropped as a failed one).
-//!
-//! # One part per pass, the union of their intervals
-//!
-//! A readback reports its frame's passes as one held part that counts one part
-//! per timed pass ([`crate::gpu_time::FrameToken::complete_parts`]), so a
-//! frame's part count is the number of passes it timed. Its span is the UNION
-//! of the pass intervals in ticks times `Queue::get_timestamp_period`: a tiled
-//! GPU starts a pass's vertex work under the previous pass's fragment work
-//! (measured on this desk's wgpu-on-Metal: 12.9-17.3 µs of overlap between
-//! consecutive passes), so a sum of spans would count the overlap twice.
-//!
-//! # Fail closed
-//!
-//! Nothing here runs unless a `gpu_time` sink is installed and the device was
-//! granted `TIMESTAMP_QUERY` (`terminal_device_features`): the renderer builds
-//! the timer lazily, and a pass asks [`WgpuGpuTimer::pass_writes`] only while a
-//! frame is open. A frame that runs out of query pairs, whose readback map
-//! fails, whose timer is dropped before it settled, or whose readback holds a
-//! zero (unsampled) or reversed pair is dropped (`gpu_time::dropped`), never
-//! reported as the passes it could time.
-//!
-//! The ring's states are driven through [`Clock`], the device side, so each of
-//! those failures is tested on a fake device as well as the healthy path on
-//! the wgpu oracle (`tests/frame_instrumentation.rs`).
+//! Per-pass GPU timestamp queries for the wgpu backend ([`TimestampRing::harvest`],
+//! [`crate::gpu_time::FrameToken::complete_parts`], [`WgpuGpuTimer::pass_writes`],
+//! [`Clock`]).
 
 use std::cell::Cell;
 use std::sync::Arc;
@@ -52,13 +11,9 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::gpu_time::{FrameRing, FrameToken};
 
-/// Timed passes per frame: the offscreen plan's passes, the effect passes
-/// (bloom extract and composite, shimmer, card) and the blit, with headroom.
+/// Timed passes per frame.
 const PASS_PAIRS: u32 = 32;
-/// Frames whose readback may be in flight at once; a present that finds every
-/// slot busy goes untimed (`gpu_time::skipped`). A frame holds its slot for
-/// about three presents (its work completes, its resolve maps, a harvest
-/// reads it), so eight keep a device a frame or two behind timed.
+/// Frames whose readback may be in flight at once.
 const SLOTS: usize = 8;
 
 /// The map callback's report.
@@ -66,15 +21,13 @@ const MAP_PENDING: u8 = 0;
 const MAP_OK: u8 = 1;
 const MAP_FAILED: u8 = 2;
 
-/// The bytes a readback of `pairs` passes resolves: a begin and an end tick
-/// (`u64`, little-endian) per pass.
+/// The bytes a readback of `pairs` passes resolves.
 #[inline]
 const fn readback_bytes(pairs: u32) -> u64 {
     (pairs * 2 * wgpu::QUERY_SIZE) as u64
 }
 
-/// The device side of the ring: everything [`TimestampRing`] asks of wgpu,
-/// so its states, and every way a frame fails, are driven without a GPU.
+/// The device side of the ring: everything [`TimestampRing`] asks of wgpu.
 pub(crate) trait Clock {
     /// One slot's device resources: its query set and readback buffers.
     type Slot;
@@ -82,9 +35,7 @@ pub(crate) trait Clock {
     fn poll(&self);
     /// Raise `done` once every piece of work submitted so far has completed.
     fn on_done(&self, done: Arc<AtomicBool>);
-    /// Resolve `slot`'s first `pairs` query pairs into its readback, submit
-    /// that, and start the map; the map's callback stores [`MAP_OK`] or
-    /// [`MAP_FAILED`] in `report`.
+    /// Resolve `pairs` query pairs from `slot`, storing [`MAP_OK`] or [`MAP_FAILED`] in `report`.
     fn resolve(&self, slot: &Self::Slot, pairs: u32, report: Arc<AtomicU8>);
     /// Hand the mapped `pairs` pairs to `read`, then unmap.
     fn read(&self, slot: &Self::Slot, pairs: u32, read: &mut dyn FnMut(&[u8]));
@@ -160,16 +111,13 @@ enum SlotState<'r> {
     Free,
     /// Timing the open frame: passes take pairs from `next_pair`.
     Writing(FrameToken<'r>),
-    /// Sealed with `pairs` passes timed; `done` rises when the device has
-    /// finished the frame's work, before which a resolve could read a sample
-    /// the device has not written.
+    /// Sealed with `pairs` passes timed.
     Running {
         token: FrameToken<'r>,
         pairs: u32,
         done: Arc<AtomicBool>,
     },
-    /// The readback of `pairs` pass pairs is mapping; `map` is the callback's
-    /// report.
+    /// The readback of `pairs` pass pairs is mapping; `map` is the callback's report.
     Mapping {
         token: FrameToken<'r>,
         pairs: u32,
@@ -182,8 +130,7 @@ struct Slot<'r, S> {
     state: SlotState<'r>,
 }
 
-/// The per-renderer timestamp ring (see the module header), reporting into
-/// `frames` through slots whose device resources are `S`.
+/// The per-renderer timestamp ring (see the module header).
 pub(crate) struct TimestampRing<'r, S> {
     frames: &'r FrameRing,
     slots: Vec<Slot<'r, S>>,
@@ -201,8 +148,7 @@ pub(crate) struct TimestampRing<'r, S> {
 pub(crate) type WgpuGpuTimer = TimestampRing<'static, WgpuSlot>;
 
 impl WgpuGpuTimer {
-    /// The timer for `device`, or `None` when the device was not granted
-    /// timestamp queries.
+    /// The timer for `device`, or `None` when the device was not granted timestamp queries.
     pub(crate) fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Self> {
         if !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
             return None;
@@ -236,8 +182,7 @@ impl WgpuGpuTimer {
         ))
     }
 
-    /// The timestamp writes for the next pass of the open frame, or `None`
-    /// when no frame is open or the frame is out of pairs.
+    /// The timestamp writes for the next pass of the open frame.
     #[inline]
     pub(crate) fn pass_writes(&self) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
         let (slot, pair) = self.next_pass()?;
@@ -268,9 +213,7 @@ impl<'r, S> TimestampRing<'r, S> {
         }
     }
 
-    /// Open a timed frame for the present about to encode: harvest finished
-    /// readbacks, then take a free slot. Returns the `gpu_time` serial, or
-    /// `None` when no sink listens or every slot is still in flight.
+    /// Open a timed frame for the present about to encode.
     pub(crate) fn begin<C: Clock<Slot = S>>(&mut self, clock: &C) -> Option<u64> {
         self.abandon_open();
         self.harvest(clock);
@@ -290,9 +233,7 @@ impl<'r, S> TimestampRing<'r, S> {
         Some(token.serial())
     }
 
-    /// The open frame's slot and the pair index for its next pass, or `None`
-    /// when no frame is open. A pass past the per-frame budget gets none and
-    /// marks the frame overflowed (it will be dropped, not under-reported).
+    /// The open frame's slot and the pair index for its next pass, or `None` when no frame is open.
     fn next_pass(&self) -> Option<(&S, u32)> {
         let slot = &self.slots[self.writing?];
         let pair = self.next_pair.get();
@@ -304,9 +245,7 @@ impl<'r, S> TimestampRing<'r, S> {
         Some((&slot.res, pair))
     }
 
-    /// The present returned (its work submitted): seal the open frame and ask
-    /// to hear when the device has run it. The readback waits for that
-    /// ([`Self::harvest`]).
+    /// Seal the open frame and register for completion ([`Self::harvest`]).
     pub(crate) fn finish<C: Clock<Slot = S>>(&mut self, clock: &C) {
         let Some(index) = self.writing.take() else {
             return;
@@ -333,10 +272,7 @@ impl<'r, S> TimestampRing<'r, S> {
         };
     }
 
-    /// Move each frame along without blocking (a device poll first): one the
-    /// device has finished starts its readback, and one whose readback has
-    /// mapped settles. Called at each timed present's start; a reader that
-    /// needs a result without presenting again calls it directly.
+    /// Move each frame along without blocking (a device poll first).
     pub(crate) fn harvest<C: Clock<Slot = S>>(&mut self, clock: &C) {
         clock.poll();
         let period_ns = self.period_ns;
@@ -367,8 +303,7 @@ impl<'r, S> TimestampRing<'r, S> {
         }
     }
 
-    /// Seal a frame a present opened but never finished (it panicked or
-    /// returned early), as untimed.
+    /// Seal a frame a present opened but never finished, as untimed.
     fn abandon_open(&mut self) {
         if let Some(index) = self.writing.take() {
             if let SlotState::Writing(token) = self.slots[index].state {
@@ -380,8 +315,7 @@ impl<'r, S> TimestampRing<'r, S> {
 }
 
 impl<S> Drop for TimestampRing<'_, S> {
-    /// A frame still open is sealed untimed; one sealed but not yet read
-    /// back fails, never left outstanding in the ring.
+    /// A frame still open is sealed untimed.
     fn drop(&mut self) {
         for slot in &mut self.slots {
             match std::mem::replace(&mut slot.state, SlotState::Free) {
@@ -396,12 +330,7 @@ impl<S> Drop for TimestampRing<'_, S> {
     }
 }
 
-/// The device busy time of the passes resolved in `bytes` (little-endian
-/// `u64` ticks, begin then end per pass), in nanoseconds: the union of their
-/// intervals, so overlapping passes count once. `None` (the frame is dropped)
-/// for no pass, a pair with a zero tick (a sample the device never wrote), a
-/// pair that runs backwards (a reset or garbage clock), or a tick period or
-/// total outside the nanosecond domain.
+/// Device busy time of the passes resolved in `bytes` (little-endian `u64` ticks).
 pub(crate) fn busy_ns(bytes: &[u8], period_ns: f64) -> Option<u64> {
     let mut spans = [(0_u64, 0_u64); PASS_PAIRS as usize];
     let mut n = 0;
@@ -428,7 +357,6 @@ pub(crate) fn busy_ns(bytes: &[u8], period_ns: f64) -> Option<u64> {
     }
     ticks += u128::from(open.1 - open.0);
     let ns = (ticks as f64 * period_ns).round();
-    // u64::MAX rounds up to 2^64 as f64; keep that boundary exclusive.
     (period_ns.is_finite() && period_ns > 0.0 && ns.is_finite() && ns < u64::MAX as f64)
         .then_some(ns as u64)
 }
@@ -449,8 +377,6 @@ mod tests {
             .collect()
     }
 
-    /// A device the tests run by hand: its work completes when a test says
-    /// (`finish_work`), each readback map settles when a test says, and a read
     /// returns the ticks a test planted.
     #[derive(Default)]
     struct FakeDevice {
@@ -516,8 +442,6 @@ mod tests {
         serial
     }
 
-    /// A healthy frame settles only after its work ran, its readback was
-    /// resolved after that, and the map landed: one part per timed pass, its
     /// time the union of their intervals.
     #[test]
     fn a_healthy_frame_is_timed_once_its_work_has_run() {
@@ -550,7 +474,6 @@ mod tests {
         );
     }
 
-    /// A frame whose passes outnumber the query pairs is dropped, not reported
     /// as the passes it could time.
     #[test]
     fn a_frame_out_of_query_pairs_is_dropped() {
@@ -578,7 +501,6 @@ mod tests {
         assert_eq!(frames.settled(serial), Some(Settled::Failed));
     }
 
-    /// A readback holding an unsampled (zero) or reversed pair drops its
     /// frame.
     #[test]
     fn a_readback_with_an_unwritten_sample_drops_the_frame() {
@@ -596,7 +518,6 @@ mod tests {
         }
     }
 
-    /// A timer dropped with a frame still running on the device, or still
     /// mapping, fails it rather than leaving it outstanding.
     #[test]
     fn a_timer_dropped_with_a_frame_outstanding_drops_it() {
@@ -616,7 +537,6 @@ mod tests {
         assert_eq!(frames.settled(mapping), Some(Settled::Failed));
     }
 
-    /// A present with no timed pass is untimed, and one that finds every slot
     /// in flight goes untimed without disturbing them.
     #[test]
     fn an_untimed_present_and_a_full_ring_report_no_time() {
@@ -642,8 +562,6 @@ mod tests {
         }
     }
 
-    /// Overlapping passes count once; disjoint ones add; a zero or reversed
-    /// pair, no pair at all, or a period or total outside the nanosecond
     /// domain is no time.
     #[test]
     fn busy_time_is_the_union_of_the_pass_intervals() {

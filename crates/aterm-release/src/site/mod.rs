@@ -1,29 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `ship site`: alab.systems follows each release. The `/terminal` engine is rebuilt
-//! from the public commit, the download buttons name the elected downloads (a
-//! Linux pick: the install command, [`pages::linux_install_command`]),
-//! `/install.sh` is the public commit's `tools/install.sh`, and `/releases` carries
-//! the notes — and the owner is never blocked by it: no site checkout, no Firebase
-//! login, or `--skip-site` leave the release untouched.
-//!
-//! Who runs it: `ship release`'s after-cut step, as `--latest`, once the release's
-//! shape as GitHub serves it passed — and the publication engine's post-promote hook
-//! (`ship hook post-promote`), whose promote-time run does nothing: before the cut
-//! there is no release to link.
-//!
-//! What it touches: in the site checkout only the files it owns ([`OWNED_FILES`],
-//! [`OWNED_GLOB`]), one scratch clone, and two markers in the site repo's git
-//! directory ([`OWED_MARK`]: a sync commit no deploy has shipped yet;
-//! [`IN_FLIGHT_MARK`]: a sync that began writing and has not committed). It reads
-//! GitHub through the authenticated `gh` only, and writes no release.
-//!
-//! Order: clone, elect the downloads, render the pages, `/install.sh` and `/releases`
-//! aside — every refusal happens there, before the engine rebuild makes the first
-//! write into the checkout — then the engine ([`engine`]: built here, from the clone,
-//! never by a script of the site's), the sitemap, commit, pull, push, deploy, verify.
-
+//! `ship site`: synchronizes alab.systems (`/terminal`, [`pages::linux_install_command`], `/install.sh`, `/releases`) with each release.
 mod diff;
 pub mod engine;
 pub mod linux;
@@ -44,7 +22,7 @@ use serde::Deserialize;
 
 pub use world::Real;
 
-/// What `ship site` takes on its command line (the post-promote hook takes the same).
+/// Command-line usage string for `ship site`.
 pub const USAGE: &str = "usage: targo --unverified ship site [--latest] [--dry-run] [--no-deploy] \
      [--skip-site] [--site-dir DIR] [--releases FILE]
   --latest       sync to the public repo's main tip; PUB_PUBLIC_COMMIT, when set, names
@@ -58,10 +36,10 @@ pub const USAGE: &str = "usage: targo --unverified ship site [--latest] [--dry-r
 exit: 0 synced (or synced and the live site unreadable, said), deferred or planned · 1 failed · 2 usage or an unreadable publish/site.toml · \
      3 no usable site checkout · 4 the live site does not show the committed site";
 
-/// A release asset's bytes at a URL, at most the given count of them.
+/// Closure fetching up to the given byte count from a release asset URL.
 pub type Fetch<'f> = dyn FnMut(&str, u64) -> Result<Vec<u8>, String> + 'f;
 
-/// Escape `s` for HTML text and attribute values.
+/// Escapes `s` for HTML text and attribute values.
 #[must_use]
 pub fn html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -78,9 +56,7 @@ pub fn html_escape(s: &str) -> String {
     out
 }
 
-/// Every file the sync writes, relative to the site directory. Nothing else in the
-/// checkout is ever staged, and a pre-existing edit to any of these is a refusal —
-/// unless an interrupted sync wrote it ([`IN_FLIGHT_MARK`]), when it is restored.
+/// Site-relative paths written by the sync.
 pub const OWNED_FILES: [&str; 9] = [
     "public/index.html",
     "public/aterm.html",
@@ -93,15 +69,13 @@ pub const OWNED_FILES: [&str; 9] = [
     "public/assets/term/ENGINE_SOURCE",
 ];
 
-/// The installer `/install.sh` serves, as the public commit carries it.
+/// Repository-relative path of the installer served at `/install.sh`.
 pub const INSTALLER_SOURCE: &str = "tools/install.sh";
 
-/// The public commit's installer, to be served as `/install.sh`: present, and piped
-/// with no checkout (as `curl … | bash` runs it) installing from `slug`, the channel
-/// whose releases the site links.
+/// Reads and validates the public commit's installer for `/install.sh`.
 ///
 /// # Errors
-/// No installer in the tree, or one whose public default is another repository.
+/// Returns an error if the installer is missing or targets another repository.
 pub fn installer(clone: &Path, slug: &str) -> Result<String, String> {
     let text = std::fs::read_to_string(clone.join(INSTALLER_SOURCE)).map_err(|e| {
         format!(
@@ -118,16 +92,13 @@ pub fn installer(clone: &Path, slug: &str) -> Result<String, String> {
     Ok(text)
 }
 
-/// The engine's hash-named wasm pair, as a git pathspec.
+/// Git pathspec for the engine's hash-named wasm pair.
 pub const OWNED_GLOB: &str = "public/assets/term/aterm_wasm.*";
 
-/// The marker of a sync commit no deploy has shipped, in the site repo's git
-/// directory (never the working tree, never committed).
+/// Git-dir marker for a sync commit not yet deployed.
 pub const OWED_MARK: &str = "aterm-post-promote-undeployed";
 
-/// The marker of a sync that began writing into the checkout and has not committed,
-/// in the site repo's git directory: what proves an owned file's edit is a sync's own,
-/// left by an interrupt, and not a person's.
+/// Git-dir marker for an in-flight sync that has not yet committed.
 pub const IN_FLIGHT_MARK: &str = "aterm-site-sync-in-flight";
 
 /// Firebase's ways of saying its login is missing or expired (lowercase).
@@ -142,7 +113,7 @@ const AUTH_PATTERNS: [&str; 8] = [
     "credentials are no longer valid",
 ];
 
-/// Whether `log` says the Firebase login is missing or expired.
+/// Returns whether `log` indicates a missing or expired Firebase login.
 #[must_use]
 pub fn auth_failure(log: &str) -> bool {
     let low = log.to_lowercase();
@@ -153,7 +124,7 @@ pub fn auth_failure(log: &str) -> bool {
     cli_list || AUTH_PATTERNS.iter().any(|p| low.contains(p))
 }
 
-/// The command line.
+/// Parsed command-line options for `ship site`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Options {
     pub latest: bool,
@@ -164,10 +135,10 @@ pub struct Options {
     pub releases: Option<PathBuf>,
 }
 
-/// Parse the command line (`Ok(None)` is `--help`).
+/// Parses command-line arguments (`Ok(None)` on `--help`).
 ///
 /// # Errors
-/// An unknown argument, or a flag without its value.
+/// Returns an error on an unknown argument or missing flag value.
 pub fn parse_args<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<Option<Options>, String> {
     let mut o = Options::default();
     let mut it = args.into_iter();
@@ -193,7 +164,6 @@ pub fn parse_args<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<Option<
             other => return Err(format!("unknown argument: {other}")),
         }
     }
-    // a local list may be stale or hand-made: it plans, it is never committed or deployed
     if o.releases.is_some() && !o.dry_run {
         return Err("--releases plans offline from a local list: it needs --dry-run".into());
     }
@@ -215,54 +185,49 @@ struct Settings {
     subject_prefix: Option<String>,
 }
 
-/// Everything the sync reads besides its command line: the engine's facts
-/// (`PUB_*`), the operator's knobs (`SITE_*`, `FIREBASE_*`, `GIT_AUTHOR_*`),
-/// `publish/site.toml`, the wasm32 pin, `HOME`, and the trust root.
+/// Environment and settings inputs for a site sync.
 #[derive(Debug, Clone)]
 pub struct Env {
     pub slug: String,
-    /// `PUB_PUBLIC_COMMIT`: the public commit to sync to.
+    /// `PUB_PUBLIC_COMMIT`: public commit to sync to.
     pub commit: Option<String>,
-    /// `PUB_VERSION`: the released version, named in the site commit.
+    /// `PUB_VERSION`: released version named in the site commit.
     pub version: Option<String>,
-    /// `PUB_STAGING_COMMIT`: set only by the engine's promote, which marks the
-    /// promote-time run.
+    /// `PUB_STAGING_COMMIT`: set during the publication engine's promote run.
     pub staging_commit: Option<String>,
     pub dry_run: bool,
-    /// `PUB_CLONE_URL`: where the public repo is cloned from.
+    /// `PUB_CLONE_URL`: clone URL for the public repository.
     pub clone_url: String,
     pub site_dir: Option<PathBuf>,
     pub no_deploy: bool,
-    /// The live origin the verify step reads.
+    /// Live site origin read by the verification step.
     pub site_url: String,
-    /// The release download host the toolchain facts are read from.
+    /// Release download base URL for toolchain facts.
     pub download_base: String,
     pub verify_retries: u32,
     pub verify_sleep: u64,
-    /// `YYYY-MM-DD` for the sitemap's `lastmod`.
+    /// `YYYY-MM-DD` date for sitemap `lastmod`.
     pub today: String,
     pub firebase_account: Option<String>,
-    /// `FIREBASE_SA_KEY`: the deployer's service-account key.
+    /// `FIREBASE_SA_KEY`: deployer service-account key path.
     pub firebase_sa_key: Option<PathBuf>,
-    /// `publish/site.toml`'s key, relative to the site directory the sync uses.
+    /// Service-account key path from `publish/site.toml`, relative to the site directory.
     pub firebase_sa_key_in_site: Option<String>,
-    /// The site commit's identity; `None` leaves git's own.
+    /// Site commit author identity, or `None` to use git's default.
     pub author: Option<(String, String)>,
     pub subject_prefix: String,
-    /// The stock channel `publish/config.sh`'s wasm32 clause names.
+    /// Stock toolchain channel named by `publish/config.sh`'s wasm32 clause.
     pub wasm_pin: Option<String>,
-    /// `HOME`: remapped out of the `/terminal` engine, and refused if it survives there.
+    /// `HOME` path remapped out of the `/terminal` engine.
     pub home: Option<PathBuf>,
-    /// The paper master keyset the Linux chain is verified under.
+    /// Paper master public keys used to verify the Linux chain.
     pub masters: Vec<String>,
     pub now_unix: i64,
-    /// Environment for every git child (a test isolates git from this machine's).
+    /// Environment variables passed to git child processes.
     pub git_env: Vec<(String, String)>,
 }
 
 /// `publish/site.toml` under `repo`: none is no settings; one that does not parse (a
-/// typo'd key among them) is an error naming the file, never silently no settings.
-///
 /// # Errors
 /// The file exists and cannot be read or parsed.
 fn settings(repo: &Path) -> Result<Settings, String> {
@@ -275,11 +240,10 @@ fn settings(repo: &Path) -> Result<Settings, String> {
 }
 
 impl Env {
-    /// The environment of this process, for the repository at `repo`; `slug` names the
-    /// public repository instead of `PUB_REPO_SLUG`.
+    /// Reads [`Env`] from the current process and `repo`.
     ///
     /// # Errors
-    /// A `publish/site.toml` that exists and does not parse.
+    /// Returns an error if `publish/site.toml` fails to parse.
     pub fn from_process(repo: &Path, slug: Option<&str>) -> Result<Self, String> {
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         let flag = |k: &str| var(k).is_some_and(|v| v != "0");
@@ -349,33 +313,28 @@ impl Env {
     }
 }
 
-/// A child's end: its exit code and its output.
+/// Exit code and combined output of a finished child process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ran {
     pub code: i32,
     pub log: String,
 }
 
-/// What a started child holds while it runs; dropped once it has ended.
+/// Guard held while a spawned child process runs.
 pub type Guard = Box<dyn std::any::Any>;
 
-/// How the sync starts every child it waits on — git and the world's alike. Under
-/// `ship release` they keep the release's child rules (`release_steps`: none once
-/// interrupted, each in a session of its own with git's prompt off, the interrupt
-/// handed to it, the running child noted); `ship site` from a shell starts them as
-/// they are ([`Plain`]).
+/// Process launcher used by the site sync.
 pub trait Launch {
-    /// The signal that interrupted the run, if one did: the sync starts nothing after it.
+    /// Returns the signal that interrupted the run, if any.
     fn interrupted(&self) -> Option<i32>;
-    /// Start `cmd`, its stdio already set: the child, and what lives while it runs.
+    /// Spawns `cmd` with its configured stdio and returns its [`Guard`].
     ///
     /// # Errors
-    /// The spawn's own, or `ErrorKind::Interrupted` once [`Launch::interrupted`] answers.
+    /// Returns an error if spawning fails or the run was interrupted.
     fn spawn(&self, cmd: &mut Command) -> std::io::Result<(Child, Guard)>;
 }
 
-/// `ship site` from a shell: children start as they are, and a Ctrl-C reaches them
-/// through the terminal's process group.
+/// Direct process launcher for `ship site` from a shell.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Plain;
 
@@ -389,10 +348,10 @@ impl Launch for Plain {
     }
 }
 
-/// `cmd` through `launch` as `Command::output` has it: stdin empty, both streams read.
+/// Runs `cmd` through `launch` and collects its output.
 ///
 /// # Errors
-/// As [`Launch::spawn`], or a failed wait.
+/// Returns an error if [`Launch::spawn`] or reading output fails.
 pub fn output(launch: &dyn Launch, cmd: &mut Command) -> std::io::Result<std::process::Output> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -403,35 +362,29 @@ pub fn output(launch: &dyn Launch, cmd: &mut Command) -> std::io::Result<std::pr
     out
 }
 
-/// Everything the sync asks of the world besides git: GitHub (through `gh`), the
-/// release download host, the live site, the engine's stock wasm32 build and its
-/// `wasm-opt` pass, the site's deploy script, and the clock. [`Real`] is the
-/// machine's; a test serves a fixture world.
+/// External operations required by the site sync besides git.
 pub trait World {
-    /// How every child of this sync starts, git's included.
+    /// Returns the [`Launch`] implementation for child processes.
     fn launch(&self) -> Rc<dyn Launch>;
-    /// `gh api PATH` (`--paginate` when asked): GitHub through the authenticated gh only.
+    /// Queries `gh api PATH` (with `--paginate` when requested).
     ///
     /// # Errors
-    /// gh's own words when it cannot answer.
+    /// Returns `gh`'s error message on failure.
     fn gh_api(&mut self, path: &str, paginate: bool) -> Result<String, String>;
-    /// A release asset (`https://` or `file://`), at most `limit` bytes.
+    /// Downloads up to `limit` bytes from a release asset URL.
     ///
     /// # Errors
-    /// A failed read.
+    /// Returns an error if the read fails.
     fn download(&mut self, url: &str, limit: u64) -> Result<Vec<u8>, String>;
-    /// The live site's copy at `url`, past every cache.
+    /// Fetches `url` from the live site bypassing caches.
     ///
     /// # Errors
-    /// A failed fetch.
+    /// Returns an error if the fetch fails.
     fn live(&mut self, url: &str) -> Result<Vec<u8>, String>;
-    /// The CPU module (`aterm_wasm.wasm`): `aterm-wasm` built in `clone` for wasm32,
-    /// release profile, by `pin`'s stock cargo (a STOCK EXCEPTION: Trust ships only its
-    /// host std), with `rustflags` on the wasm32 target alone. Its bytes.
+    /// Builds `aterm_wasm.wasm` in `clone` for wasm32 with `pin`'s stock cargo (a STOCK EXCEPTION: Trust ships only its host std).
     ///
     /// # Errors
-    /// A missing tool (`wasm-opt` is asked before the build), or a build that did not
-    /// finish.
+    /// Returns an error if the build fails or outputs no module.
     fn build_module(
         &mut self,
         clone: &Path,
@@ -439,17 +392,14 @@ pub trait World {
         rustflags: &[String],
         out: &mut dyn Write,
     ) -> Result<Vec<u8>, String>;
-    /// The shipping `wasm-opt` pass (`aterm_verify::wasm_glue::WASM_OPT_FLAGS`) over the
-    /// bound module at `wasm`, in place.
+    /// Runs the shipping `wasm-opt` pass (`aterm_verify::wasm_glue::WASM_OPT_FLAGS`) on `wasm` in place.
     ///
     /// # Errors
-    /// A pass that did not finish.
+    /// Returns an error if `wasm-opt` fails.
     fn optimise(&mut self, wasm: &Path, out: &mut dyn Write) -> Result<(), String>;
-    /// The site's `deploy.sh`, run in `site`.
+    /// Runs `deploy.sh` in `site`.
     fn deploy(&mut self, site: &Path, out: &mut dyn Write) -> Ran;
-    /// When `firebase projects:list` cannot authenticate with the credential
-    /// deploy.sh would use (the service-account key when it exists, else the
-    /// account), what it said; `None` when it can.
+    /// Returns `firebase projects:list` output when Firebase authentication fails.
     fn firebase_refuses(
         &mut self,
         site: &Path,
@@ -459,13 +409,12 @@ pub trait World {
     fn sleep(&mut self, secs: u64);
 }
 
-/// One way the live site does not show the committed site.
+/// Mismatch between the live site and the committed site.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Disagreement {
-    /// A page, the engine pair or `/releases` differs from the checkout.
+    /// A page, engine asset, or `/releases` differs from the checkout.
     Page(pages::Difference),
-    /// The live `/terminal` engine was built from `served`, the site repo committed
-    /// `committed`: the deployed engine is not in git.
+    /// The live `/terminal` engine commit differs from the site repo's committed engine.
     EngineNotCommitted { served: String, committed: String },
 }
 
@@ -482,32 +431,26 @@ impl std::fmt::Display for Disagreement {
     }
 }
 
-/// How a sync ended, short of a failure.
+/// Non-failing outcome of a site sync.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// `--skip-site`.
+    /// Skipped via `--skip-site`.
     Skipped,
-    /// The promote-time run: the site follows the cut.
+    /// Deferred during the promote-time hook.
     Deferred,
-    /// A dry run: what a real run would rewrite (site-relative), and whether it would
-    /// rebuild the engine. Nothing was changed.
+    /// Dry-run plan of site-relative files and whether the engine would rebuild.
     Planned { files: Vec<String>, engine: bool },
-    /// Synced (or already current) and the live site shows it; deployed by this run or
-    /// not.
+    /// Synced and verified against the live site.
     Synced { deployed: bool },
-    /// Synced (or already current), but the live site could not be fetched, so nothing
-    /// says it shows the release: deployed by this run or not.
+    /// Synced, but the live site could not be fetched for verification.
     LiveUnchecked { deployed: bool },
-    /// Committed and pushed as asked, the deploy and the live check left out
-    /// (`--no-deploy`, `SITE_NO_DEPLOY`): the commit stays owed and the next plain run
-    /// deploys it.
+    /// Committed and pushed without deploying (`--no-deploy` / `SITE_NO_DEPLOY`).
     NoDeploy,
-    /// Committed and pushed, but Firebase's login is missing or expired: the commit
-    /// stays owed and the next run deploys it.
+    /// Committed and pushed, but Firebase authentication was unavailable.
     NotDeployed,
-    /// No usable site checkout here; nothing was touched.
+    /// No usable site checkout was found.
     NoCheckout(String),
-    /// The live site does not show the committed site after the settle loop.
+    /// The live site still disagrees with the committed site after settling.
     LiveDisagrees {
         deployed: bool,
         why: Vec<Disagreement>,
@@ -515,7 +458,7 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// The CLI's exit code.
+    /// Returns the CLI exit code for this outcome.
     #[must_use]
     pub const fn exit_code(&self) -> i32 {
         match self {
@@ -526,62 +469,54 @@ impl Outcome {
     }
 }
 
-/// Where an interrupt stopped the sync.
+/// Point at which an interrupt stopped the sync.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stop {
-    /// Before this step started.
+    /// Interrupted before this step started.
     Before(&'static str),
-    /// While a step ran: how that step ended.
+    /// Interrupted while a step was running.
     During(Box<Failure>),
 }
 
-/// What a refused sync would not act on: each refusal is one of these, so a caller (and
-/// a test) tells one from another by kind, never by its words.
+/// Reason a site sync refused to proceed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// The site directory is no git checkout, or its git directory cannot be found.
+    /// The site directory is not a usable git checkout.
     NotACheckout,
-    /// Files this sync owns are dirty and no interrupted sync of ours left them: a
-    /// person's edits.
+    /// Owned files have uncommitted edits not left by an interrupted sync.
     DirtyOwned,
-    /// An interrupted sync left them, but a site commit of ours is still owed.
+    /// Owned files are dirty from an interrupted sync while an undeployed commit is owed.
     DirtyOwed,
-    /// An interrupted sync left them, and a dry run changes nothing, so it cannot put
-    /// them back.
+    /// Owned files are dirty from an interrupted sync during a dry run.
     DirtyDryRun,
-    /// An interrupted sync's files could not all be put back from HEAD.
+    /// Dirty files from an interrupted sync could not be restored from `HEAD`.
     NotPutBack,
-    /// The site repo has staged changes this sync does not own.
+    /// Unrelated changes are staged in the site repository.
     StagedUnrelated,
-    /// No promoted commit was named, it is not a full sha, or the clone of it is not
-    /// exactly it.
+    /// The target commit is missing, not a full SHA, or mismatched in the clone.
     Commit,
-    /// The release stream does not read, or names nothing the buttons may link.
+    /// The release stream could not be read or has no eligible downloads.
     Release,
-    /// A page or the sitemap is missing or out of the shape its rules rewrite.
+    /// A site page or sitemap is missing or malformed.
     Page,
-    /// The public commit has no installer to serve as `/install.sh`, or one whose piped
-    /// run would install from another repository than the one the site links
-    /// ([`installer`]).
+    /// The public commit's installer is missing or invalid.
     Installer,
-    /// The sync commit did not capture everything this sync owns.
+    /// The sync commit did not capture all owned files.
     Uncaptured,
-    /// The engine on disk is not the one the site repo committed.
+    /// The engine on disk does not match the committed engine.
     EngineNotInGit,
-    /// A file or directory it cannot read, make or write.
+    /// File or directory I/O failed.
     Io,
 }
 
-/// A sync that stopped: what happened, and the way on.
+/// Terminal failure of a site sync.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Failure {
-    /// Interrupted by `signal`: nothing further was started.
+    /// Interrupted by `signal` at `step`.
     Interrupted { signal: i32, step: Stop },
-    /// What the sync found, or was handed, and will not act on (`kind`); `why` carries
-    /// the way on.
+    /// Refused with `kind` and explanation `why`.
     Refused { kind: Refusal, why: String },
-    /// A child it ran failed: `child` names it (`git push`, `deploy.sh` …), `said` is
-    /// the account, the way on included.
+    /// Child process `child` failed with output `said`.
     Child { child: &'static str, said: String },
 }
 
@@ -684,12 +619,10 @@ fn halt(launch: &dyn Launch, step: &'static str) -> Result<(), Failure> {
     }
 }
 
-/// A new private (0700) directory `<temp>/<prefix>-<pid>-<n>` this process alone holds:
-/// `create` refuses an existing entry, so a planted path is stepped over, never written
-/// through, and the process-wide counter keeps concurrent callers apart.
+/// Creates a new `0700` temporary directory with `prefix`.
 ///
 /// # Errors
-/// No directory could be made.
+/// Returns an error if the directory cannot be created or secured.
 pub(crate) fn private_dir(prefix: &str) -> Result<PathBuf, String> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let base = std::env::temp_dir();
@@ -752,14 +685,10 @@ fn read_text(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-/// Bring the site at `opts.site_dir` (or the environment's) to the public commit and
-/// the elected downloads; see the module docs.
+/// Synchronizes the site checkout to the public commit and elected release downloads.
 ///
 /// # Errors
-/// [`Failure`] — exit 1: a refusal before anything was written, a pull or push of the
-/// site repo that failed (the sync commit stays on this machine and nothing is
-/// deployed; a re-run pushes and deploys it), a failed deploy that is not a login, an
-/// interrupt (said as one, whatever the step it stopped said).
+/// Returns [`Failure`] on refusal, child failure, or interruption.
 pub fn sync(
     opts: &Options,
     env: &Env,
@@ -780,7 +709,7 @@ pub fn sync(
 }
 
 /// [`sync`]'s steps, in order.
-#[allow(clippy::too_many_lines)] // one ordered procedure, its steps commented in place
+#[allow(clippy::too_many_lines)]
 fn steps(
     opts: &Options,
     env: &Env,
@@ -795,9 +724,6 @@ fn steps(
         );
         return Ok(Outcome::Skipped);
     }
-    // The engine runs the hook at promote time with PUB_STAGING_COMMIT and no
-    // --latest; the promoted version has no release yet, so that run could only
-    // re-link the previous DMG. The release's after-cut step syncs.
     if !opts.latest && env.staging_commit.is_some() {
         let v = env
             .version
@@ -829,7 +755,6 @@ fn steps(
     };
     halt(launch, "the site checkout was read")?;
 
-    // 0. preconditions: a usable site checkout, nothing of ours dirty or staged
     let Some(site_dir) = opts.site_dir.clone().or_else(|| env.site_dir.clone()) else {
         return Ok(Outcome::NoCheckout(
             "no site checkout is configured — set SITE_DIR (or publish/site.toml's dir) or skip \
@@ -877,7 +802,6 @@ fn steps(
     let branch = git
         .line(&site_root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .unwrap_or_else(|| "main".into());
-    // Our commits origin does not have yet (none when origin's branch is unknown).
     let unpushed_owned = || -> String {
         let upstream = format!("refs/remotes/origin/{branch}");
         if !git.ok(
@@ -908,8 +832,6 @@ fn steps(
         .out(&site_dir, &owned)
         .map_err(|e| child_failed("git status", e))?;
     if !dirty.trim().is_empty() {
-        // An interrupted sync's own writes, with no commit of ours owed, are put back:
-        // this run writes them again. Anything else is a person's, and refused.
         let owed = read_text(&owed_mark).is_some_and(|m| !m.trim().is_empty())
             || !unpushed_owned().is_empty();
         if !in_flight.is_file() || owed || dry {
@@ -939,7 +861,6 @@ fn steps(
         }
         halt(launch, "the interrupted sync's files were put back")?;
         let put_back = || -> Result<String, String> {
-            // what differs from HEAD in the index or the tree, tracked, then the untracked
             let mut diff: Vec<&str> = vec!["diff", "--name-only", "--relative", "HEAD", "--"];
             diff.extend(OWNED_FILES);
             diff.push(OWNED_GLOB);
@@ -988,7 +909,6 @@ fn steps(
         );
     }
 
-    // 1. the public commit, and a fresh clone at exactly it
     let commit = match (&env.commit, opts.latest) {
         (Some(c), _) => c.clone(),
         (None, true) => {
@@ -1099,8 +1019,6 @@ fn steps(
     }
     say(out, &format!("clone is at {commit}"));
 
-    // 2. the downloads the buttons name — read, never written: every refusal here
-    //    happens before the checkout is touched
     halt(launch, "the release list was read")?;
     let list = match &opts.releases {
         Some(path) => std::fs::read_to_string(path)
@@ -1263,7 +1181,6 @@ fn steps(
         }
     };
 
-    // 3. the pages and the release notes, rendered aside
     let mut planned: BTreeMap<&str, String> = BTreeMap::new();
     for page in pages::PAGES {
         let text = read_text(&public.join(page)).ok_or_else(|| {
@@ -1285,7 +1202,6 @@ fn steps(
     }
     let (mut sections, source) = match read_text(&clone.join("CHANGELOG.md")) {
         Some(log) => (notes::from_changelog(&log), "CHANGELOG.md"),
-        // the public snapshot exports no changelog: its notes are the release bodies
         None => (notes::from_releases(&catalog), "release bodies"),
     };
     sections.truncate(notes::LIMIT);
@@ -1315,10 +1231,7 @@ fn steps(
     );
     planned.insert("public/install.sh", served);
 
-    // 4. the /terminal engine — the first write into the checkout, so a real run marks
-    //    itself in flight first (until its commit) — built here (engine.rs) on the wasm32
     //    pin publish/config.sh names (a STOCK EXCEPTION: Trust ships only its host std),
-    //    else rustup's stable, as the site's script did
     if !dry {
         std::fs::write(&in_flight, format!("{commit}\n")).map_err(|e| {
             refusal(
@@ -1386,7 +1299,6 @@ fn steps(
         true
     };
 
-    // 5. what changed, and the sitemap
     let differs = |rel: &str, new: &str| {
         std::fs::read(site_dir.join(rel)).map_or(true, |old| old != new.as_bytes())
     };
@@ -1480,8 +1392,6 @@ fn steps(
         say(out, &format!("updated: {}", changed.join(" ")));
     }
 
-    // 6. commit — only what exists or is tracked: `git add` refuses a pathspec that
-    //    matches nothing
     halt(launch, "the site commit")?;
     let mut stage: Vec<&str> = vec!["add", "-A", "--"];
     for f in OWNED_FILES {
@@ -1553,19 +1463,12 @@ fn steps(
         git.out(&site_dir, &refs)
             .map_err(|e| child_failed("git commit", format!("the site commit failed: {e}")))?;
         say(out, &format!("committed: {subject}"));
-        // owed until a deploy ships it, whatever happens to the commit in between
         if let Some(head) = git.line(&site_dir, &["rev-parse", "HEAD"]) {
             let _ = std::fs::write(&owed_mark, format!("{head}\n"));
         }
     }
-    // what this run wrote is committed (or was already): nothing of it is in flight
     let _ = std::fs::remove_file(&in_flight);
 
-    // 6a. origin has it before anything is deployed: deploy.sh publishes the WORKING
-    //     TREE, so an unpushed commit deployed is bytes no remote has. A pull or push
-    //     that fails stops here; a re-run finishes the job — an unpushed commit of
-    //     ours, or one pushed but never deployed (the owed marker), is pushed and
-    //     deployed. Local commits touching nothing of ours are the site repo's own.
     let unpushed = unpushed_owned();
     let owed = read_text(&owed_mark)
         .map(|s| s.trim().to_string())
@@ -1654,9 +1557,6 @@ fn steps(
         }
     }
 
-    // 6b. what gets deployed must be what got committed: `status` cannot see an
-    //     ignored or assume-unchanged file, so the committed engine marker is compared
-    //     with the one on disk too
     halt(launch, "the deploy")?;
     let leftover = git.out(&site_dir, &owned).unwrap_or_default();
     if !leftover.trim().is_empty() {
@@ -1693,7 +1593,6 @@ fn steps(
         );
     }
 
-    // 7. deploy — a missing or expired Firebase login is not a failure of the release
     let deploy_later = format!("(cd {} && ./deploy.sh)", site_dir.display());
     let not_deployed = |out: &mut dyn Write| {
         let _ = writeln!(
@@ -1754,7 +1653,6 @@ fn steps(
         }
     }
 
-    // 8. the live site, against the checkout
     let (mut live_checked, mut live_read) = (false, true);
     if no_deploy {
         say(out, "live check skipped (--no-deploy)");
@@ -1781,7 +1679,6 @@ fn steps(
                 );
                 said = differences.into_iter().map(Disagreement::Page).collect();
                 if said.is_empty() {
-                    // the engine the LIVE site serves must be the one the repo COMMITTED
                     let committed = committed_engine();
                     let served = live
                         .get("ENGINE_SOURCE")
@@ -1880,8 +1777,6 @@ fn steps(
 }
 
 /// The live copies the comparison reads, or `None` when one could not be fetched.
-/// `/install.sh` is read too, and left out when the live site does not serve it: the
-/// comparison names a checkout installer the live site lacks.
 fn fetch_live(world: &mut dyn World, url: &str) -> Option<BTreeMap<&'static str, String>> {
     let mut live = BTreeMap::new();
     for (path, name) in [
@@ -1901,8 +1796,7 @@ fn fetch_live(world: &mut dyn World, url: &str) -> Option<BTreeMap<&'static str,
     Some(live)
 }
 
-/// `ship site` and the engine's post-promote hook: parse, sync, print, exit
-/// ([`USAGE`] names the codes).
+/// CLI entry point for `ship site` and the post-promote hook ([`USAGE`]).
 #[must_use]
 pub fn run_cli(args: &[String], repo: &Path) -> i32 {
     let opts = match parse_args(args.iter().map(String::as_str)) {
@@ -1923,7 +1817,6 @@ pub fn run_cli(args: &[String], repo: &Path) -> i32 {
             return 2;
         }
     };
-    // `targo ... ship` hands this process cargo's own variables; no child inherits them
     let mut world = Real {
         unset: std::env::vars_os()
             .filter_map(|(k, _)| k.into_string().ok())
@@ -1937,7 +1830,7 @@ pub fn run_cli(args: &[String], repo: &Path) -> i32 {
     report(&ended)
 }
 
-/// The line a sync that did not finish its job ends with (stderr), and its exit code.
+/// Prints any error or warning for `ended` to stderr and returns its exit code.
 #[must_use]
 pub fn report(ended: &Result<Outcome, Failure>) -> i32 {
     match ended {

@@ -41,11 +41,12 @@ impl Decision {
 #[derive(Debug, Clone)]
 pub struct PolicyEngine {
     policy: Policy,
-    /// One slot per rule. `None` means the selector string failed to parse
+    /// One slot per rule.
     compiled: Vec<Option<SequenceSelector>>,
-    /// Buckets keyed by `(function, major)`. Wildcard selectors are stored
+    /// Buckets keyed by `(function, major)`.
     buckets: BucketMap<BucketKey, Vec<usize>>,
     /// Indices of rules whose bucket is the universal matcher
+    /// (`FunctionKind::Wildcard`).
     wildcard_bucket: Vec<usize>,
     /// One slot per rule: its rate-limit id, shared into every [`Decision`].
     rate_limit_ids: Vec<Option<Arc<str>>>,
@@ -129,6 +130,7 @@ impl PolicyEngine {
     }
 
     /// Walk a slice of rule indices in declared order, returning the first
+    /// full match (selector + origin gate).
     fn walk_bucket(
         &self,
         indices: &[usize],
@@ -209,6 +211,7 @@ mod tests {
     }
 
     /// One sequence from one origin under one built-in profile:
+    /// `(what, profile, sequence, origin, response, rate-limit id)`.
     type ProfileRow = (
         &'static str,
         fn() -> crate::Policy,

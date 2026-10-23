@@ -1,44 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The window's own frame where the window system draws none
-//! (docs/AUDIT-third-party-2026-10-15.md, LW.5).
-//!
-//! On Wayland a compositor that does not grant server-side decorations (GNOME's
-//! Mutter, weston: no xdg-decoration, or client mode chosen) leaves the frame to
-//! the client. The winit fork used to draw sctk-adwaita's (a headerbar above the
-//! surface and resize borders around it, as subsurfaces, with four subprocess
-//! spawns at window creation); it draws none now, and the chrome band is the
-//! header instead:
-//!
-//! - its ends carry the window buttons ([`CaptionButton`], laid out as
-//!   [`crate::tab_bar::TabHit::Caption`] segments of a [`CaptionSlot`]) where
-//!   GNOME's `button-layout` puts them ([`ButtonLayout`], read from the
-//!   Settings portal as sctk-adwaita read it; minimize, maximize and close on
-//!   the right when the desktop has no answer);
-//! - its bare band drags the window, double-clicks to maximize and restore, and
-//!   right-clicks to the compositor's window menu (`handle_tab_strip_click` and
-//!   the right-press arm of `on_mouse_input`);
-//! - the window's own edges resize it ([`edge_at`]): a press there calls
-//!   `drag_resize_window`, and the pointer shows the edge's resize cursor. The
-//!   handles stay in the padding around the terminal grid ([`FrameMargins`]), so
-//!   no cell's pixel is ever one.
-//!
-//! The band is there whatever `tab_strip_rows` says: a window that draws its own
-//! frame needs a header, so the strip keeps one row while one does
-//! ([`strip_rows_with_header`]). A one-tab strip paints the window's title, so
-//! that row is the title, the buttons and the caption sctk-adwaita drew. In
-//! fullscreen there is no header ([`ClientFrame::header`]), as there was none
-//! under sctk-adwaita.
-//!
-//! [`ClientFrame`] is what the fork reports (`client_decorations`), read on every
-//! `Resized`; `None` everywhere the window system decorates (X11, server-side
-//! Wayland, macOS, Windows), where none of this runs.
+//! The window's own frame where the window system draws none (docs/AUDIT-third-party-2026-10-15.md, LW.5).
 
 use aterm_window::window::CursorIcon;
 
-/// One of the header's window buttons, laid out left to right as
-/// [`ClientFrame::buttons`] lists them.
+/// One of the header's window buttons, laid out left to right as [`ClientFrame::buttons`] lists them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum CaptionButton {
     /// Minimize the window.
@@ -66,11 +33,7 @@ pub(crate) enum Side {
     Right,
 }
 
-/// Where the header's buttons go, each end's left to right: GNOME's
-/// `org.gnome.desktop.wm.preferences button-layout` (`appmenu:close`,
-/// `close,minimize,maximize:`) as sctk-adwaita 0.10.1 read it before LW.5
-/// (tests/recorded/sctk-adwaita-0.10.1-frame.tsv is its answer for each
-/// value, and [`Self::parse`] is held to it).
+/// Where the header's buttons go, each end's left to right: GNOME's `org.gnome.desktop.wm.preferences button-layout` (`appmenu:close`, `close,minimize,maximize:`) as sctk-adwaita 0.10.1 read it before LW.5 (tests/recorded/sctk-adwaita-0.10.1-frame.tsv is its answer for each value, and [`Self::parse`] is held to it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ButtonLayout {
     left: [Option<LayoutButton>; 3],
@@ -78,8 +41,7 @@ pub(crate) struct ButtonLayout {
 }
 
 impl ButtonLayout {
-    /// The desktop has no answer, or one that names no button: minimize,
-    /// maximize and close on the right, sctk-adwaita's default.
+    /// The desktop has no answer, or one that names no button: minimize, maximize and close on the right, sctk-adwaita's default.
     pub(crate) const FALLBACK: Self = Self {
         left: [None; 3],
         right: [
@@ -89,21 +51,14 @@ impl ButtonLayout {
         ],
     };
 
-    /// The two ends `value` names, as sctk-adwaita split it: the text after
-    /// the value's last space (it read `dbus-send`'s line, whose last word is
-    /// the value, so a value with spaces was read from its last one), then
-    /// the first two of its `:`-separated sides. `None` without a `:`.
+    /// The two ends `value` names, as sctk-adwaita split it: the text after the value's last space (it read `dbus-send`'s line, whose last word is the value, so a value with spaces was read from its last one), then the first two of its `:`-separated sides.
     pub(crate) fn sides_of(value: &str) -> Option<(&str, &str)> {
         let word = value.rsplit(' ').next().unwrap_or(value);
         let mut sides = word.split(':');
         Some((sides.next()?, sides.next()?))
     }
 
-    /// `value` as sctk-adwaita read it ([`Self::sides_of`]): on each end the
-    /// first three comma-separated names, of which `close`, `maximize` and
-    /// `minimize` (exactly; `appmenu`, `spacer` and any other name are
-    /// skipped) are buttons, in the order written. `None` where neither end
-    /// names one: [`Self::FALLBACK`] then.
+    /// `value` as sctk-adwaita read it ([`Self::sides_of`]): on each end the first three comma-separated names, of which `close`, `maximize` and `minimize` (exactly; `appmenu`, `spacer` and any other name are skipped) are buttons, in the order written.
     pub(crate) fn parse(value: &str) -> Option<Self> {
         let (left, right) = Self::sides_of(value)?;
         let side = |names: &str| {
@@ -136,10 +91,7 @@ impl ButtonLayout {
         .flatten()
     }
 
-    /// The desktop's layout: the Settings portal's `button-layout`, read
-    /// once a process (sctk-adwaita read it once a frame) and kept;
-    /// [`Self::FALLBACK`] without a running portal, an answer that is not a
-    /// string, or one that names no button.
+    /// The desktop's layout: the Settings portal's `button-layout`, read once a process (sctk-adwaita read it once a frame) and kept; [`Self::FALLBACK`] without a running portal, an answer that is not a string, or one that names no button.
     #[cfg(target_os = "linux")]
     pub(crate) fn desktop() -> Self {
         static READ: std::sync::OnceLock<ButtonLayout> = std::sync::OnceLock::new();
@@ -158,13 +110,11 @@ impl ButtonLayout {
 /// How long the `button-layout` read may take, the bus's handshake included:
 /// it runs once, on the main thread, at the first client-decorated window's
 /// first `Resized`; past it the desktop has no answer
-/// ([`ButtonLayout::FALLBACK`]). The motion read's bound.
+/// ([`ButtonLayout::FALLBACK`]).
 #[cfg(target_os = "linux")]
 const LAYOUT_READ_BOUND: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// What a window's own frame offers, from the fork's
-/// `WindowExtWayland::client_decorations`: present only while the window must
-/// draw its decorations itself.
+/// What a window's own frame offers, from the fork's `WindowExtWayland::client_decorations`: present only while the window must draw its decorations itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ClientFrame {
     /// The compositor can minimize the window.
@@ -175,21 +125,16 @@ pub(crate) struct ClientFrame {
     pub(crate) window_menu: bool,
     /// The window is maximized (the middle button restores).
     pub(crate) maximized: bool,
-    /// The edges resize the window: it is resizable and neither maximized,
-    /// fullscreen nor tiled.
+    /// The edges resize the window: it is resizable and neither maximized, fullscreen nor tiled.
     pub(crate) edges: bool,
-    /// The band is the window's header: in every state but fullscreen. A
-    /// fullscreen window shows no window buttons and its bare band is no
-    /// caption (no move, no maximize, no window menu), as sctk-adwaita hid its
-    /// header there.
+    /// The band is the window's header: in every state but fullscreen.
     pub(crate) header: bool,
     /// Where the desktop puts the buttons ([`ButtonLayout::desktop`]).
     pub(crate) layout: ButtonLayout,
 }
 
 impl ClientFrame {
-    /// The frame window `window` must draw itself, or `None` where the window
-    /// system decorates it.
+    /// The frame window `window` must draw itself, or `None` where the window system decorates it.
     #[cfg(target_os = "linux")]
     pub(crate) fn of_window(window: &aterm_window::window::Window) -> Option<Self> {
         use aterm_window::platform::wayland::WindowExtWayland as _;
@@ -204,17 +149,12 @@ impl ClientFrame {
         })
     }
 
-    /// Whether the band is this frame's header ([`Self::header`]); a `fn` for
-    /// `Option::is_some_and`.
+    /// Whether the band is this frame's header ([`Self::header`]); a `fn` for `Option::is_some_and`.
     pub(crate) fn has_header(self) -> bool {
         self.header
     }
 
-    /// The header's buttons at its `side`, left to right: the ones the
-    /// layout names there that the compositor offers (minimize and maximize
-    /// only where it can; close always), maximize as restore while the window
-    /// is maximized. None in fullscreen. sctk-adwaita filtered its layout by
-    /// the compositor's capabilities the same way.
+    /// The header's buttons at its `side`, left to right: the ones the layout names there that the compositor offers (minimize and maximize only where it can; close always), maximize as restore while the window is maximized.
     pub(crate) fn buttons_on(self, side: Side) -> impl Iterator<Item = CaptionButton> {
         self.layout
             .on(side)
@@ -229,8 +169,7 @@ impl ClientFrame {
             .filter(move |_| self.header)
     }
 
-    /// Every button, the left end's then the right end's (the tests' view;
-    /// drawing and hit-testing go end by end).
+    /// Every button, the left end's then the right end's (the tests' view; drawing and hit-testing go end by end).
     #[cfg(test)]
     pub(crate) fn buttons(self) -> impl Iterator<Item = CaptionButton> {
         self.buttons_on(Side::Left)
@@ -238,11 +177,7 @@ impl ClientFrame {
     }
 }
 
-/// The strip rows the windows get for the `configured` `tab_strip_rows`: one at
-/// least while a window draws its own frame and needs its header (`header`, any
-/// window's [`ClientFrame::has_header`]), since the strip is that header; exactly
-/// `configured` everywhere else. The strip is global, and every window of one
-/// compositor is decorated the same way.
+/// The strip rows the windows get for the `configured` `tab_strip_rows`: one at least while a window draws its own frame and needs its header (`header`, any window's [`ClientFrame::has_header`]), since the strip is that header; exactly `configured` everywhere else.
 #[must_use]
 pub(crate) fn strip_rows_with_header(configured: u16, header: bool) -> u16 {
     if header {
@@ -259,10 +194,7 @@ const BUTTON_SLOT_LOGICAL_PX: f32 = 34.0;
 /// The round button's diameter in logical px (Adwaita's, and sctk-adwaita's).
 pub(crate) const BUTTON_LOGICAL_PX: f32 = 24.0;
 
-/// The header's buttons as the strip lays them out at its two ends: which
-/// buttons, each end's left to right, and the whole cells each one's slot
-/// takes. A strip cache-key term, so a change of buttons, of the maximized
-/// state or of the slot width repaints the band.
+/// The header's buttons as the strip lays them out at its two ends: which buttons, each end's left to right, and the whole cells each one's slot takes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct CaptionSlot {
     left: [Option<CaptionButton>; 3],
@@ -278,9 +210,7 @@ impl CaptionSlot {
         button_cols: 0,
     };
 
-    /// The slot for `frame` on a strip of `cell_w`-px cells at `scale`: each
-    /// button takes [`BUTTON_SLOT_LOGICAL_PX`] rounded up to whole cells.
-    /// [`Self::NONE`] without a frame, a header or a cell width.
+    /// The slot for `frame` on a strip of `cell_w`-px cells at `scale`: each button takes [`BUTTON_SLOT_LOGICAL_PX`] rounded up to whole cells.
     pub(crate) fn measure(frame: Option<ClientFrame>, cell_w: usize, scale: f32) -> Self {
         let Some(frame) = frame.filter(|frame| frame.header && cell_w > 0) else {
             return Self::NONE;
@@ -320,8 +250,7 @@ impl CaptionSlot {
         .flatten()
     }
 
-    /// Every button, the left end's then the right end's (the tests' view;
-    /// drawing and hit-testing go end by end).
+    /// Every button, the left end's then the right end's (the tests' view; drawing and hit-testing go end by end).
     #[cfg(test)]
     pub(crate) fn buttons(self) -> impl Iterator<Item = CaptionButton> {
         self.on(Side::Left).chain(self.on(Side::Right))
@@ -344,11 +273,7 @@ impl CaptionSlot {
             .saturating_add(self.side_cols(Side::Right))
     }
 
-    /// The slot on a `cols`-wide strip that must keep `floor` cells between
-    /// its ends for the tabs and the `+`: minimize goes first, then maximize,
-    /// from both ends; close stays while it fits at all, and on a strip too
-    /// narrow even for it there are no buttons (the window's edges and the
-    /// compositor's own keys still work).
+    /// The slot on a `cols`-wide strip that must keep `floor` cells between its ends for the tabs and the `+`: minimize goes first, then maximize, from both ends; close stays while it fits at all, and on a strip too narrow even for it there are no buttons (the window's edges and the compositor's own keys still work).
     #[must_use]
     pub(crate) fn fit(self, cols: u16, floor: u16) -> Self {
         let mut slot = self;
@@ -365,7 +290,6 @@ impl CaptionSlot {
                     *b = None;
                 }
             }
-            // Keep each end's buttons packed from its first slot.
             for end in [&mut slot.left, &mut slot.right] {
                 let kept: Vec<CaptionButton> = end.iter().flatten().copied().collect();
                 *end = [None; 3];
@@ -378,9 +302,7 @@ impl CaptionSlot {
     }
 }
 
-/// One of the frame's eight resize handles: an edge or a corner. Its own type, not
-/// winit's `ResizeDirection`, which the macOS backend does not have; the frame's
-/// geometry is tested on every host.
+/// One of the frame's eight resize handles: an edge or a corner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum FrameEdge {
     North,
@@ -410,8 +332,7 @@ impl FrameEdge {
         }
     }
 
-    /// The cursor the handle shows: GTK's (and sctk-adwaita's) directional resize
-    /// icons.
+    /// The cursor the handle shows: GTK's (and sctk-adwaita's) directional resize icons.
     pub(crate) fn cursor(self) -> CursorIcon {
         match self {
             Self::North => CursorIcon::NResize,
@@ -427,8 +348,7 @@ impl FrameEdge {
 }
 
 /// How deep the left, right and bottom resize handles reach into the window at
-/// most, in logical px: half the 12 px default padding. Never past the padding
-/// ([`FrameMargins`]).
+/// most, in logical px: half the 12 px default padding.
 const SIDE_EDGE_LOGICAL_PX: f64 = 6.0;
 
 /// How deep the top resize handle reaches at most: above the tab cards (which
@@ -438,15 +358,7 @@ const TOP_EDGE_LOGICAL_PX: f64 = 3.0;
 /// How far a corner's handle runs along each of its two edges, in logical px.
 const CORNER_LOGICAL_PX: f64 = 16.0;
 
-/// How much of the window lies outside the terminal grid along each edge, in
-/// window px: the padding (and on the right and bottom the residue of a size
-/// that is not whole cells), and at the top the band and the strip above the
-/// grid. Each edge's handle takes at most this much ([`edge_at`]), so a press on
-/// a cell, even in the first or last column or the last row at
-/// `window_padding = 0`, is the grid's (a selection, a program's mouse report)
-/// and never a resize. The handles sit inside the surface (the frame has no
-/// shadow margin of its own), so at no padding a side has no handle; the
-/// compositor's own resize (a modifier drag, the window menu) still works.
+/// How much of the window lies outside the terminal grid along each edge, in window px: the padding (and on the right and bottom the residue of a size that is not whole cells), and at the top the band and the strip above the grid.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct FrameMargins {
     pub(crate) left: f64,
@@ -456,9 +368,7 @@ pub(crate) struct FrameMargins {
 }
 
 impl FrameMargins {
-    /// The margins of a `width`×`height` window whose terminal grid covers
-    /// `grid_x0..grid_x1` × `grid_y0..grid_y1`, all in window px. A grid that
-    /// overflows the window (a transient crop) leaves that side none.
+    /// The margins of a `width`×`height` window whose terminal grid covers `grid_x0..grid_x1` × `grid_y0..grid_y1`, all in window px.
     #[must_use]
     pub(crate) fn around_grid(
         width: f64,
@@ -478,11 +388,7 @@ impl FrameMargins {
     }
 }
 
-/// The resize handle under window pixel `(x, y)` of a `width`×`height` window at
-/// `scale`, or `None` inside the frame's interior. The handles sit inside the
-/// surface (the frame has no shadow margin of its own): a strip along each edge,
-/// and an L along each pair of edges for each corner, each no deeper than that
-/// edge's `margins` (so never over the grid).
+/// The resize handle under window pixel `(x, y)` of a `width`×`height` window at `scale`, or `None` inside the frame's interior.
 #[must_use]
 pub(crate) fn edge_at(
     x: f64,
@@ -508,9 +414,6 @@ pub(crate) fn edge_at(
     let bottom = depth(SIDE_EDGE_LOGICAL_PX * scale, margins.bottom);
     let corner = CORNER_LOGICAL_PX * scale;
     let (from_right, from_bottom) = (width - x, height - y);
-    // The grid's first cell starts at `left` (`top`) and its last ends `right`
-    // (`bottom`) before the far edge, as the pointer's cell mapping floors it, so
-    // these hold only off the grid, and a zero-deep edge takes nothing.
     let on_left = x < left;
     let on_right = from_right <= right;
     let on_top = y < top;
@@ -541,10 +444,7 @@ pub(crate) fn edge_at(
     Some(edge)
 }
 
-/// How far the pointer must travel from a bare-band press before it becomes a
-/// window move, in logical px. A press that only clicks (or double-clicks)
-/// starts no compositor grab, so the second press of a double-click reaches the
-/// window; sctk-adwaita likewise moved only on the first motion.
+/// How far the pointer must travel from a bare-band press before it becomes a window move, in logical px.
 pub(crate) const MOVE_THRESHOLD_LOGICAL_PX: f64 = 3.0;
 
 #[cfg(test)]
@@ -587,7 +487,6 @@ mod tests {
             ..FRAME
         };
         assert_eq!(bare.buttons().collect::<Vec<_>>(), [CaptionButton::Close]);
-        // Fullscreen: no header, so not even close.
         let fullscreen = ClientFrame {
             edges: false,
             header: false,
@@ -672,8 +571,6 @@ mod tests {
 
     #[test]
     fn the_fallback_is_minimize_maximize_close_on_the_right() {
-        // NEGATIVE CONTROL for the oracle: LW.5's fixed buttons answer GNOME's
-        // default differently from sctk-adwaita (close alone).
         let gnome = ButtonLayout::parse("appmenu:close").expect("a layout");
         assert_ne!(gnome, ButtonLayout::FALLBACK);
         let frame = ClientFrame {
@@ -707,14 +604,12 @@ mod tests {
         assert_eq!(slot.side_cols(Side::Left), 8);
         assert_eq!(slot.side_cols(Side::Right), 4);
         assert_eq!(slot.cols(), 12);
-        // Narrower: minimize goes, then maximize; close stays.
         let fit = slot.fit(14, 6);
         assert_eq!(names(fit.buttons()), "close,maximize");
         assert_eq!(fit.side_cols(Side::Left), 4);
         let fit = slot.fit(10, 6);
         assert_eq!(names(fit.buttons()), "close");
         assert_eq!(slot.fit(4, 6), CaptionSlot::NONE);
-        // A maximized window's maximize restores, at whichever end it is.
         let maximized = ClientFrame {
             maximized: true,
             ..frame
@@ -727,21 +622,15 @@ mod tests {
 
     #[test]
     fn a_window_that_draws_its_own_frame_keeps_a_header_row() {
-        // `tab_strip_rows = 0` still gets the header's row…
         assert_eq!(strip_rows_with_header(0, true), 1);
-        // …and a strip that has one is left as it is.
         assert_eq!(strip_rows_with_header(1, true), 1);
         assert_eq!(strip_rows_with_header(3, true), 3);
-        // NEGATIVE CONTROL: where the window system decorates (or in fullscreen),
-        // the configured rows, none included.
         assert_eq!(strip_rows_with_header(0, false), 0);
         assert_eq!(strip_rows_with_header(2, false), 2);
     }
 
     #[test]
     fn a_slot_takes_whole_cells_at_every_scale() {
-        // 34 logical px: 4 cells of 9 px at scale 1, 4 of 14 px at 1.5 (51 px), 4 of
-        // 18 px at 2 (68 px), 2 of 20 px.
         for (cell_w, scale, cols) in [(9, 1.0, 4), (14, 1.5, 4), (18, 2.0, 4), (20, 1.0, 2)] {
             let slot = CaptionSlot::measure(Some(FRAME), cell_w, scale);
             assert_eq!(slot.button_cols(), cols, "cell {cell_w} px at {scale}");
@@ -768,12 +657,10 @@ mod tests {
         );
         let fit = slot.fit(10, 6);
         assert_eq!(fit.buttons().collect::<Vec<_>>(), [CaptionButton::Close]);
-        // Close alone, even past the floor, while it fits at all…
         assert_eq!(
             slot.fit(5, 6).buttons().collect::<Vec<_>>(),
             [CaptionButton::Close]
         );
-        // …and nothing on a strip it would fill.
         assert_eq!(slot.fit(4, 6), CaptionSlot::NONE);
     }
 
@@ -795,17 +682,14 @@ mod tests {
         assert_eq!(at(300.0, 0.0), Some(FrameEdge::North));
         assert_eq!(at(300.0, 527.0), Some(FrameEdge::South));
         assert_eq!(at(1.0, 1.0), Some(FrameEdge::NorthWest));
-        // A corner runs along both of its edges.
         assert_eq!(at(12.0, 1.0), Some(FrameEdge::NorthWest));
         assert_eq!(at(1.0, 12.0), Some(FrameEdge::NorthWest));
         assert_eq!(at(740.0, 520.0), Some(FrameEdge::SouthEast));
         assert_eq!(at(735.0, 2.0), Some(FrameEdge::NorthEast));
         assert_eq!(at(3.0, 520.0), Some(FrameEdge::SouthWest));
-        // The interior, the first grid column (12 px in) and a tab card's top.
         assert_eq!(at(300.0, 300.0), None);
         assert_eq!(at(12.0, 300.0), None);
         assert_eq!(at(300.0, 4.0), None);
-        // Outside the window, and nonsense, is nothing.
         assert_eq!(at(-1.0, 300.0), None);
         assert_eq!(at(744.0, 300.0), None);
         assert_eq!(at(f64::NAN, 300.0), None);
@@ -813,8 +697,6 @@ mod tests {
 
     #[test]
     fn no_handle_reaches_past_the_padding_into_the_grid() {
-        // `window_padding = 0`: a 720×504 grid fills the window's sides and
-        // bottom exactly, and the strip still sits above it.
         let (w, h) = (720.0, 525.0);
         let flush = FrameMargins::around_grid(w, h, 0.0, 21.0, 720.0, 525.0);
         assert_eq!(
@@ -827,15 +709,12 @@ mod tests {
             }
         );
         let at = |x, y| edge_at(x, y, w, h, 1.0, flush);
-        // Column 0, the last column and the last row are the grid's.
         assert_eq!(at(0.0, 300.0), None);
         assert_eq!(at(719.5, 300.0), None);
         assert_eq!(at(300.0, 524.5), None);
         assert_eq!(at(0.0, 524.0), None, "the bottom-left cell");
-        // The top still resizes: above the strip, not over the grid.
         assert_eq!(at(300.0, 1.0), Some(FrameEdge::North));
         assert_eq!(at(0.0, 1.0), Some(FrameEdge::NorthWest));
-        // A 2 px pad gives a 2 px handle, never the nominal 6.
         let thin = FrameMargins::around_grid(724.0, 527.0, 2.0, 21.0, 722.0, 525.0);
         let at = |x, y| edge_at(x, y, 724.0, 527.0, 1.0, thin);
         assert_eq!(at(1.5, 300.0), Some(FrameEdge::West));
@@ -844,12 +723,10 @@ mod tests {
         assert_eq!(at(721.5, 300.0), None);
         assert_eq!(at(300.0, 525.0), Some(FrameEdge::South));
         assert_eq!(at(300.0, 524.5), None);
-        // NEGATIVE CONTROL: the default padding keeps its full handles.
         assert_eq!(
             edge_at(5.5, 300.0, 744.0, 528.0, 1.0, PADDED),
             Some(FrameEdge::West)
         );
-        // A grid that overflows the window (a transient crop) leaves no margin.
         assert_eq!(
             FrameMargins::around_grid(700.0, 500.0, -10.0, 21.0, 710.0, f64::NAN),
             FrameMargins {
@@ -863,7 +740,6 @@ mod tests {
 
     #[test]
     fn the_handles_scale_with_the_window() {
-        // At 2x a 6 logical px side handle is 12 device px deep.
         let wide = FrameMargins {
             left: 24.0,
             top: 46.0,

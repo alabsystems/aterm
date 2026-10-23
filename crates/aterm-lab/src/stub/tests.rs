@@ -3,7 +3,6 @@
 
 //! The stub on typed request bodies, and served for real on loopback to the
 //! workspace's HTTP client (an independent parser of its framing).
-
 use super::*;
 
 fn body(v: &str) -> Vec<u8> {
@@ -75,12 +74,10 @@ fn a_calls_step_makes_its_calls_in_one_message_and_counts_as_one_step() {
         }
         other => panic!("{other:?}"),
     }
-    // Both results ride in one user message: the next step is the Read.
     let both = body(
         r#"{"messages":[{"role":"user","content":"toolstart"},{"role":"assistant","content":[{"type":"tool_use","name":"Bash"},{"type":"tool_use","name":"Bash"}]},{"role":"user","content":[{"type":"tool_result","content":"a"},{"type":"tool_result","content":"b"}]}]}"#,
     );
     assert!(matches!(tool_turn(&both, &script), Some(ToolTurn::Call(n, _, 1)) if n == "Read"));
-    // NEGATIVE CONTROL: a `calls` list of no named call is no step.
     let empty = J::parse(r#"[{"calls":[{"input":{}}]},{"name":"Read","input":{}}]"#).unwrap();
     assert!(matches!(tool_turn(&start, &empty), Some(ToolTurn::Call(n, _, 0)) if n == "Read"));
 }
@@ -88,9 +85,6 @@ fn a_calls_step_makes_its_calls_in_one_message_and_counts_as_one_step() {
 /// Each input of a `calls` step has its `@SID:<k>@` filled from the `k`th
 /// tool result, as a single call's is ([`fill_sids`]): every call in the
 /// message, not the first alone.
-///
-/// NEGATIVE CONTROL: with no result yet, the same step's inputs keep the
-/// placeholder as written.
 #[test]
 fn a_calls_steps_inputs_have_their_sids_filled() {
     let script = J::parse(
@@ -109,7 +103,6 @@ fn a_calls_steps_inputs_have_their_sids_filled() {
         r#"{"messages":[{"role":"user","content":"toolstart"},{"role":"assistant","content":[{"type":"tool_use","name":"Bash"}]},{"role":"user","content":[{"type":"tool_result","content":"spawned s-1a2b"}]}]}"#,
     );
     assert_eq!(commands(&after), ["result s-1a2b", "await s-1a2b"]);
-    // NEGATIVE CONTROL: the calls step first, no result to fill from.
     let first =
         J::parse(r#"[{"calls":[{"name":"Bash","input":{"command":"result @SID:1@"}}]}]"#).unwrap();
     let start = body(r#"{"messages":[{"role":"user","content":"toolstart"}]}"#);
@@ -128,8 +121,6 @@ fn a_calls_steps_inputs_have_their_sids_filled() {
 /// (what Claude Code answered with two boxes in the breaker-4 lab), each
 /// block with an id of its own (Claude Code pairs each result with its call
 /// by that id).
-///
-/// NEGATIVE CONTROL: a script of one named call streams one block, index 0.
 #[test]
 fn served_a_calls_step_streams_every_call_in_one_message() {
     let scratch = aterm_tempfile::Builder::new()
@@ -152,8 +143,6 @@ fn served_a_calls_step_streams_every_call_in_one_message() {
         Duration::from_secs(60),
     );
     let turn = r#"{"model":"claude-x","stream":true,"max_tokens":32000,"tools":[{}],"messages":[{"role":"user","content":"toolstart"}]}"#;
-    // Each tool_use block's name and its input, by index, its id, and the stop
-    // reason.
     let streamed = || -> (Vec<(String, J)>, Vec<String>, Option<String>) {
         let r = client
             .post(&format!("http://127.0.0.1:{port}/v1/messages"))
@@ -224,7 +213,6 @@ fn served_a_calls_step_streams_every_call_in_one_message() {
         [("Bash", Some("echo a")), ("Bash", Some("echo b"))]
     );
     assert_eq!(stop.as_deref(), Some("tool_use"));
-    // NEGATIVE CONTROL
     std::fs::write(
         &tool_file,
         r#"[{"name":"Bash","input":{"command":"echo c"}}]"#,
@@ -272,13 +260,10 @@ fn a_text_step_ends_the_turn_and_the_script_goes_on_at_the_next_user_row() {
     assert!(
         matches!(tool_turn(&req(&[start]), &script), Some(ToolTurn::Call(n, _, 0)) if n == "Bash")
     );
-    // the call's result in: the text step, which ends the turn
     assert_eq!(
         tool_turn(&req(&[start, used, result]), &script),
         Some(ToolTurn::Say("Waiting.".into(), 1))
     );
-    // the wake, a user row of its own: the next call, with the first result's sid filled in; a result
-    // that is not there (`@SID:2@`) is left as written
     match tool_turn(&req(&[start, used, result, said, wake]), &script) {
         Some(ToolTurn::Call(_, input, 2)) => {
             assert_eq!(
@@ -305,7 +290,6 @@ fn a_text_step_ends_the_turn_and_the_script_goes_on_at_the_next_user_row() {
         ),
         Some(ToolTurn::Done)
     );
-    // the control: without the text step the script never waits for a wake
     let calls_only = J::parse(
         r#"[{"when":"MGR","name":"Bash","input":{}},{"when":"MGR","name":"Read","input":{}}]"#,
     )
@@ -313,7 +297,6 @@ fn a_text_step_ends_the_turn_and_the_script_goes_on_at_the_next_user_row() {
     assert!(
         matches!(tool_turn(&req(&[start, used, result]), &calls_only), Some(ToolTurn::Call(n, _, 1)) if n == "Read")
     );
-    // the toolstart script reads text steps the same way
     let main =
         J::parse(r#"[{"name":"Read","input":{}},{"text":"mid"},{"name":"Edit","input":{}}]"#)
             .unwrap();
@@ -431,7 +414,6 @@ fn each_headers_verb_keeps_the_others_entries() {
         r#"{"on429": {}}"#,
         "a file that reads as no object keeps nothing"
     );
-    // A writer's entries of the other shape are never its to write.
     assert_eq!(
         headers_file_with("{}", J::parse(r#"{"on200":{},"x":"1"}"#).unwrap(), false).py(),
         r#"{"x": "1"}"#
@@ -493,9 +475,6 @@ fn served_on_loopback_it_answers_as_the_modes_say_and_logs_each_request() {
     assert_eq!(text, "Hi! I am the local lab stub, not a model. (reply 1)");
     assert!(sse.starts_with("event: message_start\n") && sse.contains("event: message_stop\n"));
 
-    // the headers file is re-read per request; a figure starts at its BASE on
-    // the first answer that carries it (the 200 served before it named
-    // nothing) and rises per 200 that carried it
     std::fs::write(
         &headers_file,
         r#"{"on200":{"anthropic-ratelimit-unified-5h-utilization":"@SEQ:0.40:0.02@"},"on429":{"anthropic-ratelimit-unified-7d-utilization":"0.99"}}"#,
@@ -547,7 +526,6 @@ fn served_on_loopback_it_answers_as_the_modes_say_and_logs_each_request() {
         "a limit whose reset passed answers ok"
     );
 
-    // a custom mode's headers go out on its streamed answer too
     std::fs::create_dir_all(dir.join("modes")).unwrap();
     std::fs::write(
         dir.join("modes/streamed.json"),
@@ -565,7 +543,6 @@ fn served_on_loopback_it_answers_as_the_modes_say_and_logs_each_request() {
         (200, Some("text/event-stream; charset=utf-8"), Some("on"))
     );
 
-    // the mode file wins when it changes
     std::fs::write(&mode_file, "too-long\n").unwrap();
     assert_eq!(post("/v1/messages", turn).status(), 400);
 
@@ -602,8 +579,6 @@ fn served_on_loopback_it_answers_as_the_modes_say_and_logs_each_request() {
         assert!(logged.contains(w), "{w:?} is not in the log:\n{logged}");
     }
     assert!(dir.join("dump/req-00001.json").is_file());
-    // a side call (no tools: Claude Code's `aux`) is dumped apart from the
-    // turns, under the same count (the mode file back at `ok`)
     std::fs::write(&mode_file, "ok\n").unwrap();
     let n = std::fs::read_dir(dir.join("dump")).unwrap().count() as u64;
     let aux =
@@ -630,8 +605,7 @@ fn served_on_loopback_it_answers_as_the_modes_say_and_logs_each_request() {
 /// A SIDE CALL IS DUMPED APART FROM THE TURNS (`side-<n>.json`, `req-<n>.json`
 /// for a turn, one count over both), and the turns' reader reads `req-`
 /// alone, newest first: every kind the stub logs is a turn or a side call by
-/// [`is_side`]. NEGATIVE CONTROLS: each API's turn (`main`, `codex`, `muse`,
-/// `gemini`) and an unreadable body (`opaque`) stay turns.
+/// [`is_side`].
 #[test]
 fn a_side_call_is_dumped_apart_from_the_turns() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -689,8 +663,7 @@ fn a_side_call_is_dumped_apart_from_the_turns() {
 
 /// ONLY THE NEWEST [`DUMPS_KEPT`] DUMPS STAY, turns and side calls alike:
 /// once the one count passes an old dump's index by [`DUMPS_KEPT`], that
-/// dump goes, whichever it was. NEGATIVE CONTROLS: a dump the count has not
-/// passed by that much stays, and so does each newer one.
+/// dump goes, whichever it was.
 #[test]
 fn the_oldest_dumps_go_turns_and_side_calls_alike() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -714,7 +687,6 @@ fn the_oldest_dumps_go_turns_and_side_calls_alike() {
         names(),
         ["req-00002.json", "side-00001.json", "side-00003.json"]
     );
-    // the count as if DUMPS_KEPT - 3 more had come between
     stub.dumped.store(DUMPS_KEPT, Ordering::Relaxed);
     stub.dump(b"a turn", "main");
     let newest = format!("req-{:05}.json", DUMPS_KEPT + 1);
@@ -857,7 +829,6 @@ fn served_on_loopback_it_answers_codex_as_the_modes_say() {
         .unwrap();
     assert!(usage.get("total_tokens").and_then(J::as_i64).unwrap() > 0);
 
-    // the account usage a ChatGPT login polls, the plan its token names
     let jwt = {
         let j = J::parse(&crate::codex::auth_json("A", "acct-9", "pro", 0)).unwrap();
         j.get("tokens")
@@ -904,7 +875,6 @@ fn served_on_loopback_it_answers_codex_as_the_modes_say() {
         Some("acct-9")
     );
 
-    // the walls, in Codex's shapes
     let future = crate::util::now_secs() + 600;
     control(&port, &format!("/__mode?m=limit:seven_day:{future}:team")).unwrap();
     let r = post("/v1/responses", turn, &format!("Bearer {jwt}"));
@@ -927,7 +897,6 @@ fn served_on_loopback_it_answers_codex_as_the_modes_say() {
     let r = post("/v1/responses", turn, "");
     assert!(String::from_utf8_lossy(r.body()).contains("context_length_exceeded"));
 
-    // a custom mode with "auth" answers only the credential it names; the others get ok
     std::fs::write(
         dir.join("modes/a401.json"),
         r#"{"status": 401, "auth": "jwt:A", "json": {"error": {"code": "token_expired"}}}"#,
@@ -943,7 +912,6 @@ fn served_on_loopback_it_answers_codex_as_the_modes_say() {
         401
     );
 
-    // the refresh: refresh.json when there is one, else refresh_token_expired
     let r = post("/oauth/token", r#"{"refresh_token":"lab-refresh-A"}"#, "");
     assert_eq!(r.status(), 401);
     assert!(String::from_utf8_lossy(r.body()).contains("refresh_token_expired"));
@@ -956,7 +924,6 @@ fn served_on_loopback_it_answers_codex_as_the_modes_say() {
         String::from_utf8_lossy(post("/oauth/token", "{}", "").body())
             .contains("refresh_token_reused")
     );
-    // refresh.json and a file named for a built-in mode are never served as a mode
     control(&port, "/__mode?m=refresh").unwrap();
     assert_eq!(post("/v1/responses", turn, "").status(), 200);
     std::fs::write(dir.join("modes/ok.json"), r#"{"status": 429}"#).unwrap();
@@ -1045,8 +1012,6 @@ fn served_on_loopback_the_account_routes_answer_from_the_account_file() {
 
 /// A mode name is judged without case, as the case-insensitive scratch volume
 /// names its file: `Refresh` is Codex's `refresh.json`, `SLOW` the built-in.
-/// NEGATIVE CONTROL beside them: a name of no built-in, in any case, is a
-/// custom mode.
 #[test]
 fn a_mode_name_is_judged_as_the_volume_names_its_file() {
     for name in [
@@ -1067,8 +1032,6 @@ fn a_mode_name_is_judged_as_the_volume_names_its_file() {
 /// A Gemini API request's credentials are labelled, never logged: the lab's
 /// key alone is `gemini-key`, nothing is `none`, a bearer token alone is its
 /// own label, and a bearer token beside the key is both labels joined.
-/// NEGATIVE CONTROL: a Google login sent with the lab's key is never the
-/// key's label alone, and its value is in no label.
 #[test]
 fn a_gemini_requests_credentials_are_labelled_both_when_two_ride() {
     let key = Some(gemini::LAB_GEMINI_KEY);
@@ -1132,7 +1095,6 @@ fn a_gemini_request_is_classed_and_its_tool_script_stepped() {
     let start = body(r#"{"contents":[{"role":"user","parts":[{"text":"toolstart"}]}]}"#);
     assert!(matches!(gemini::tool_turn(&start, &script),
         Some(ToolTurn::Call(n, _, 0)) if n == "run_shell_command"));
-    // agy hands a result back in a model content, Gemini CLI in a user one
     for role in ["model", "user"] {
         let one = body(&format!(
             r#"{{"contents":[{{"role":"user","parts":[{{"text":"<USER_REQUEST>toolstart</USER_REQUEST>"}}]}},{{"role":"model","parts":[{{"functionCall":{{"name":"run_shell_command"}}}}]}},{{"role":"{role}","parts":[{{"functionResponse":{{"name":"run_shell_command","response":{{"output":""}}}}}}]}}]}}"#
@@ -1147,7 +1109,6 @@ fn a_gemini_request_is_classed_and_its_tool_script_stepped() {
         r#"{"contents":[{"role":"user","parts":[{"text":"toolstart"}]},{"role":"user","parts":[{"functionResponse":{}}]},{"role":"user","parts":[{"functionResponse":{}}]}]}"#,
     );
     assert_eq!(gemini::tool_turn(&two, &script), Some(ToolTurn::Done));
-    // NEGATIVE CONTROL: no toolstart in the conversation, no call
     assert_eq!(
         gemini::tool_turn(
             &body(r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#),
@@ -1155,11 +1116,6 @@ fn a_gemini_request_is_classed_and_its_tool_script_stepped() {
         ),
         None
     );
-    // A HELD REPLY: an agy subagent's conversation, whose first user content
-    // is the prompt the main conversation's call wrote, is answered with the
-    // step's text after its delay; the main conversation (another first
-    // prompt, the marker only in its call's arguments) is not, and a step
-    // with a name is a call, never a held reply.
     let held = J::parse(
         r#"[{"name":"invoke_subagent","input":{"Subagents":"[{\"Prompt\":\"LABSUB-HOLD reply DONE\"}]"}},{"when":"LABSUB-HOLD","text":"DONE","delay_ms":150000}]"#,
     )
@@ -1255,10 +1211,7 @@ fn a_gemini_wall_is_googles_error_body() {
 /// `classifyGoogleError` takes as its terminal quota error WITH a delay —
 /// an `ErrorInfo` whose reason is `QUOTA_EXHAUSTED` in a Code Assist domain,
 /// and a `RetryInfo` — so its usage-limit dialog names the reset; the reset
-/// is in the message and the metadata too. NEGATIVE CONTROL: an API key's
-/// per-day quota (`quota_error`) carries a `QuotaFailure` naming `PerDay`
-/// (terminal before any delay is read: the dialog names no reset) and no
-/// `QUOTA_EXHAUSTED`.
+/// is in the message and the metadata too.
 #[test]
 fn a_google_accounts_spent_limit_is_code_assists_quota_exhausted() {
     let reset = 1_792_584_000;
@@ -1303,10 +1256,8 @@ fn a_google_accounts_spent_limit_is_code_assists_quota_exhausted() {
         })
         .unwrap();
     assert_eq!(retry.get("retryDelay").and_then(J::as_str), Some("3725s"));
-    // under an hour the span names no hours, as Code Assist writes it
     let short = gemini::exhausted_error("m", 240, reset).py();
     assert!(short.contains("reset after 4m0s."), "{short}");
-    // the control: the key's spent day
     let day = gemini::quota_error("gemini-3.5-flash", 3725).py();
     assert!(
         day.contains("PerDay") && !day.contains("QUOTA_EXHAUSTED"),
@@ -1319,8 +1270,7 @@ fn a_google_accounts_spent_limit_is_code_assists_quota_exhausted() {
 /// each a custom mode's spec (`status` and `json`) whose body is Google's
 /// error with that code, under a name the stub serves as a custom mode and
 /// no built-in mode has; the per-minute and per-day 429s name their quota and
-/// carry their RetryInfo, the 403 its SERVICE_DISABLED reason. NEGATIVE
-/// CONTROL: a built-in mode's name is refused as a custom mode's.
+/// carry their RetryInfo, the 403 its SERVICE_DISABLED reason.
 #[test]
 fn the_measured_refusals_are_custom_modes_in_googles_shape() {
     let refusals = gemini::measured_refusals();
@@ -1432,7 +1382,6 @@ fn served_on_loopback_it_answers_gemini_as_the_modes_say() {
     assert!(last.get("usageMetadata").is_some());
     assert!(cs[0].get("usageMetadata").is_none() || cs.len() == 1);
 
-    // a wall: the turn gets it, the router's side request is answered all the same
     control(&port, "/__mode?m=rate-limit").unwrap();
     let router = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"responseJsonSchema":{"type":"object","properties":{"complexity_score":{"type":"integer"}}}}}"#;
     let side = post(
@@ -1450,8 +1399,6 @@ fn served_on_loopback_it_answers_gemini_as_the_modes_say() {
     let walled = post(stream, turn);
     assert_eq!(walled.status(), 429);
     assert!(String::from_utf8_lossy(walled.body()).contains("PerDay"));
-    // a usage limit: a Google account's (`code_assist`) is Code Assist's
-    // QUOTA_EXHAUSTED with its reset; any other claim the key's spent day
     let future = crate::util::now_secs() + 600;
     control(&port, &format!("/__mode?m=limit:code_assist:{future}")).unwrap();
     let account = post(stream, turn);
@@ -1467,7 +1414,6 @@ fn served_on_loopback_it_answers_gemini_as_the_modes_say() {
         "the control: {key}"
     );
 
-    // the tool mode: a call with its signature, then done once its result is in
     std::fs::write(
         &tool_file,
         r#"{"name":"run_shell_command","input":{"command":"touch x"}}"#,
@@ -1488,7 +1434,6 @@ fn served_on_loopback_it_answers_gemini_as_the_modes_say() {
     let reply = chunks(&post(stream, done));
     assert!(parts(&reply[0])[0].py().contains("Tool call done."));
 
-    // slow: thoughts first, then text
     control(&port, "/__mode?m=slow").unwrap();
     let slow = chunks(&post(stream, turn));
     assert_eq!(slow.len(), 2);
@@ -1498,7 +1443,6 @@ fn served_on_loopback_it_answers_gemini_as_the_modes_say() {
         Some("tick 2 ")
     );
 
-    // a custom mode for this key's label alone, and the count of tokens
     std::fs::write(
         dir.join("modes/g401.json"),
         r#"{"status": 401, "auth": "gemini-key", "json": {"error": {"code": 401, "status": "UNAUTHENTICATED"}}}"#,
@@ -1509,8 +1453,6 @@ fn served_on_loopback_it_answers_gemini_as_the_modes_say() {
     let counted = post("/v1beta/models/m:countTokens", turn);
     assert!(String::from_utf8_lossy(counted.body()).contains("totalTokens"));
 
-    // every Gemini API request logs the credentials it carried — the catalog's GET too — and a
-    // bearer token sent beside the key is never logged as the key alone
     control(&port, "/__mode?m=ok").unwrap();
     let catalog = format!("/v1beta/models?key={}", gemini::LAB_GEMINI_KEY);
     assert_eq!(get(&port, &catalog, None).0, 200);
@@ -1608,8 +1550,7 @@ fn the_shared_wall_modes_answer_each_api_in_its_shape() {
 /// reply's delay and pace are over — sixteen bodies dumped at once from
 /// sixteen threads are sixteen files, each its own body (measured
 /// 2026-10-20: a lab whose replies overlapped kept 27 dumps of 32
-/// requests). NEGATIVE CONTROL: none was recorded, so the count stands at
-/// zero throughout.
+/// requests).
 #[test]
 fn requests_in_flight_together_are_each_dumped() {
     let dir = std::env::temp_dir().join(format!("lab-stub-dumps-{}", std::process::id()));

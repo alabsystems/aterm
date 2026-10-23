@@ -794,21 +794,25 @@ pub const fn sub_nudged(key: GlyphKey, script: aterm_core::terminal::Script) -> 
     }
 }
 
-/// Whether a band icon in cell `c` of a frame row (`cells`) spills into its neighbours:
-/// both are blank (a space drawing no glyph, as the band's ` G TITLE` leaves them) and
-/// the cell is not the row's first. The one rule [`Renderer::chrome_icon_key`] draws by
-/// and a host that cuts icons off part of a row (a menu card's scrub) reads.
+/// Whether band icon `icon` in cell `c` of a frame row (`cells`) spills into its
+/// neighbours: a band's badge whose neighbours are both blank (a space drawing no glyph,
+/// as the band's ` G TITLE` leaves them) in a cell that is not the row's first. A glass
+/// mark ([`BandIcon::is_glass_mark`]) never spills: it is fitted to its own cell, so it
+/// keeps one size and one baseline whatever its neighbours hold. The one rule
+/// [`Renderer::chrome_icon_key`] draws by and a host that cuts icons off part of a row
+/// (a menu card's scrub) reads.
 #[inline]
 #[must_use]
-pub fn chrome_icon_spills(cells: &[RenderCell], c: usize) -> bool {
+pub fn chrome_icon_spills(icon: BandIcon, cells: &[RenderCell], c: usize) -> bool {
     let blank = |n: Option<&RenderCell>| n.is_some_and(|n| n.ch == ' ' && !n.wide);
-    c > 0 && blank(cells.get(c - 1)) && blank(cells.get(c + 1))
+    !icon.is_glass_mark() && c > 0 && blank(cells.get(c - 1)) && blank(cells.get(c + 1))
 }
 
-/// The glyph key of `icon` at size `px_q` in a cell of weight `style` (only [`StyleBits::BOLD`] is read), spilling into its blank neighbours when `spill`.
+/// The glyph key of `icon` at size `px_q` in a cell of weight `style` (only [`StyleBits::BOLD`] is read), spilling into its blank neighbours when `spill` and `icon` is a badge: a glass mark's key is its cell's own whatever `spill` says ([`chrome_icon_spills`]).
 #[inline]
 #[must_use]
 pub const fn band_icon_key(icon: BandIcon, style: StyleBits, spill: bool, px_q: u32) -> GlyphKey {
+    let spill = spill && !icon.is_glass_mark();
     GlyphKey {
         source: FaceId::Procedural,
         glyph_class: GlyphClass::Mono,
@@ -10240,7 +10244,7 @@ impl Renderer {
         Some(band_icon_key(
             icon,
             style,
-            chrome_icon_spills(cells, c),
+            chrome_icon_spills(icon, cells, c),
             self.px_q,
         ))
     }
@@ -26613,8 +26617,8 @@ mod tests {
             (&parted_own, "in its own cell")
         };
         for icon in BandIcon::ALL {
-            // A filled star or disc has no stroke for a bold cell to weigh.
-            if !matches!(icon, BandIcon::Sparkle | BandIcon::Disc) {
+            // A filled star, disc or diamond has no stroke for a bold cell to weigh.
+            if !matches!(icon, BandIcon::Sparkle | BandIcon::Disc | BandIcon::Diamond) {
                 assert!(
                     parted.contains(&format!("{icon:?}")),
                     "{icon:?}: a bold cell drew it at the regular stem at every size, {layout}"
@@ -26730,7 +26734,11 @@ mod tests {
                     else {
                         panic!("{icon:?}: a Mono raster");
                     };
-                    assert_eq!((*width, *height), (3 * cw, ch));
+                    // A glass mark's key is its own cell's even between blanks.
+                    assert_eq!(
+                        (*width, *height),
+                        (procedural::band_icon_width(cw, !icon.is_glass_mark()), ch)
+                    );
                     let rows: Vec<usize> = (0..*height)
                         .filter(|&y| bytes[y * width..(y + 1) * width].iter().any(|&c| c > 0))
                         .collect();
@@ -26748,6 +26756,7 @@ mod tests {
 
     #[test]
     fn the_glass_marks_read_as_one_set_at_1x_and_2x() {
+        // `(x0, x1, y0, y1)`, inclusive, of a raster `w` wide.
         let ink_box = |w: usize, bytes: &[u8]| {
             let h = bytes.len() / w;
             let inked = |x: usize, y: usize| bytes[y * w + x] > 0;
@@ -26757,7 +26766,7 @@ mod tests {
         };
         let size = |(x0, x1, y0, y1): (usize, usize, usize, usize)| (x1 - x0 + 1, y1 - y0 + 1);
         let near = |a: usize, b: usize| a.abs_diff(b) <= 1;
-        const FAMILY: [BandIcon; 8] = [
+        const FAMILY: [BandIcon; 9] = [
             BandIcon::Disc,
             BandIcon::Ring,
             BandIcon::HalfDisc,
@@ -26766,11 +26775,13 @@ mod tests {
             BandIcon::Fisheye,
             BandIcon::InsetDiamond,
             BandIcon::House,
+            BandIcon::Diamond,
         ];
         for px in [12.0f32, 24.0] {
             let mut r = Renderer::from_system(px, Theme::default()).expect(NO_FONT);
             r.debug_block_on_lazy_fallbacks();
             let (cw, ch) = r.cell_size();
+            let baseline = r.baseline();
             for (style, bold) in [(StyleBits::REGULAR, false), (StyleBits::BOLD, true)] {
                 // The face's own marks, where it has them: what the drawn ones stand beside.
                 let own = |r: &mut Renderer, c: char| {
@@ -26785,94 +26796,215 @@ mod tests {
                 };
                 let dot = own(&mut r, '\u{25cf}');
                 let arrow = own(&mut r, '\u{2193}');
-                for spill in [true, false] {
-                    let at = format!("{px} px ({cw}x{ch}) {style:?} spill {spill}");
-                    let drawn = |r: &mut Renderer, icon| {
-                        let key = band_icon_key(icon, style, spill, r.px_q);
-                        let GlyphImage::Mono { width, bytes, .. } = r.glyph_image(key) else {
-                            panic!("{at}: {icon:?} is a Mono raster");
-                        };
-                        ink_box(*width, bytes)
+                let at = format!("{px} px ({cw}x{ch}) {style:?}");
+                // A mark's key is its own cell's between blanks too: one raster.
+                let drawn = |r: &mut Renderer, icon| {
+                    let key = band_icon_key(icon, style, true, r.px_q);
+                    assert_eq!(
+                        key,
+                        band_icon_key(icon, style, false, r.px_q),
+                        "{at}: {icon:?} never spills"
+                    );
+                    let GlyphImage::Mono { width, bytes, .. } = r.glyph_image(key) else {
+                        panic!("{at}: {icon:?} is a Mono raster");
                     };
-                    let boxes: Vec<_> = FAMILY.into_iter().map(|i| drawn(&mut r, i)).collect();
+                    assert_eq!(*width, cw, "{at}: {icon:?} is drawn in its own cell");
+                    ink_box(*width, bytes)
+                };
+                let boxes: Vec<_> = FAMILY.into_iter().map(|i| drawn(&mut r, i)).collect();
+                assert!(
+                    boxes.iter().all(|b| *b == boxes[0]),
+                    "{at}: ● ○ ◐ ◌ ⊘ ◉ ◈ ⌂ ◆ measure {boxes:?}"
+                );
+                let (w, h) = size(boxes[0]);
+                // The face's own `●`, no wider than the cell that face's `●` fills.
+                if let Some((dw, dh)) = dot {
                     assert!(
-                        boxes.iter().all(|b| *b == boxes[0]),
-                        "{at}: ● ○ ◐ ◌ ⊘ ◉ ◈ ⌂ measure {boxes:?}"
+                        near(w, dw.min(cw)) && near(h, dh.min(cw)),
+                        "{at}: the family {w}x{h}, the face's ● {dw}x{dh} in a {cw} px cell"
                     );
-                    let (w, h) = size(boxes[0]);
-                    if spill && let Some((dw, dh)) = dot {
-                        assert!(
-                            near(w, dw) && near(h, dh),
-                            "{at}: the family {w}x{h}, the face's ● {dw}x{dh}"
-                        );
-                    }
-                    if spill && let Some((_, ah)) = arrow {
-                        let (_, th) = size(drawn(&mut r, BandIcon::ToBar));
-                        assert!(near(th, ah), "{at}: ⤓ {th} rows, the face's ↓ {ah}");
-                    }
-                    let m = r.icon_metrics(bold);
-                    let raster_w = procedural::band_icon_width(cw, spill);
-                    let control = |m: procedural::IconMetrics| {
-                        ink_box(
-                            raster_w,
-                            &procedural::band_icon_coverage(BandIcon::Disc, cw, ch, m, spill),
-                        )
-                    };
-                    // In a cell of its own the room, not the face, sizes the family.
-                    if !spill {
-                        continue;
-                    }
-                    let shorter = procedural::IconMetrics {
-                        disc: m.disc - 3.0,
-                        ..m
-                    };
-                    assert_ne!(
-                        control(shorter),
-                        boxes[0],
-                        "{at}: control, a disc off another face's ●"
-                    );
-                    if m.disc + 2.0 <= m.cap {
-                        let capitals = procedural::IconMetrics { disc: m.cap, ..m };
-                        assert_ne!(
-                            control(capitals),
-                            boxes[0],
-                            "{at}: control, a disc off the capitals"
-                        );
-                    }
                 }
-                // CONTROL: the fonts' own glyphs for the drawn marks, measured the same way,
-                // are not the set (SF Mono has none of them; the fallbacks' are off-size).
+                if let Some((_, ah)) = arrow {
+                    let (_, th) = size(drawn(&mut r, BandIcon::ToBar));
+                    assert!(near(th, ah), "{at}: ⤓ {th} rows, the face's ↓ {ah}");
+                }
+                let m = r.icon_metrics(bold);
+                let control = |m: procedural::IconMetrics| {
+                    ink_box(
+                        cw,
+                        &procedural::band_icon_coverage(BandIcon::Disc, cw, ch, m, false),
+                    )
+                };
+                let shorter = procedural::IconMetrics {
+                    disc: m.disc - 3.0,
+                    ..m
+                };
+                assert_ne!(
+                    control(shorter),
+                    boxes[0],
+                    "{at}: control, a disc off another face's ●"
+                );
+                // CONTROL: the fonts' own glyphs for the drawn marks, measured the same way
+                // (size and lowest row from the baseline), are not the set (SF Mono has none
+                // of them; the fallbacks' are off-size or off its baseline).
                 #[cfg(target_os = "macos")]
-                if let (Some((dw, dh)), Some((_, ah))) = (dot, arrow) {
+                if let (Some(_), Some((_, ah))) = (dot, arrow) {
+                    let family = {
+                        let (_, _, _, y1) = boxes[0];
+                        (w, h, y1 as i32 - baseline)
+                    };
                     let font = |r: &mut Renderer, c: char| {
                         let key = r.glyph_key_styled(c, style);
                         assert!(
                             !matches!(key.source, FaceId::Primary | FaceId::BoldPrimary),
                             "{px} px: the default face has {c}: the control no longer holds"
                         );
-                        let GlyphImage::Mono { width, bytes, .. } = r.glyph_image(key) else {
+                        let GlyphImage::Mono {
+                            width,
+                            height,
+                            ymin,
+                            bytes,
+                            ..
+                        } = r.glyph_image(key)
+                        else {
                             panic!("{px} px: {c} is a Mono glyph");
                         };
-                        size(ink_box(*width, bytes))
+                        let b = ink_box(*width, bytes);
+                        let (gw, gh) = size(b);
+                        (gw, gh, b.3 as i32 - *height as i32 - *ymin)
                     };
                     // `⌂` only at the weight its card prints it in: bold, it is 14 × 14 at 24 px.
                     let marks: &[char] = if bold {
-                        &['\u{25d0}', '\u{25cc}', '\u{25c9}', '\u{25c8}']
+                        &['\u{25d0}', '\u{25cc}', '\u{25c9}', '\u{25c8}', '\u{25c6}']
                     } else {
-                        &['\u{25d0}', '\u{25cc}', '\u{25c9}', '\u{25c8}', '\u{2302}']
+                        &[
+                            '\u{25d0}', '\u{25cc}', '\u{25c9}', '\u{25c8}', '\u{2302}', '\u{25c6}',
+                        ]
                     };
                     for &c in marks {
-                        let (w, h) = font(&mut r, c);
-                        assert!(
-                            !(near(w, dw) && near(h, dh)),
-                            "{px} px {style:?}: control, the font's {c} {w}x{h} beside ● {dw}x{dh}"
+                        let glyph = font(&mut r, c);
+                        assert_ne!(
+                            glyph, family,
+                            "{px} px {style:?}: control, the font's {c} (w, h, lowest row) beside the family's"
                         );
                     }
-                    let (_, th) = font(&mut r, '\u{2913}');
+                    let (_, th, _) = font(&mut r, '\u{2913}');
                     assert!(
                         !near(th, ah),
                         "{px} px {style:?}: control, the font's ⤓ {th} rows beside ↓ {ah}"
                     );
+                }
+            }
+        }
+    }
+
+    /// A GLASS MARK KEEPS ONE INK BOX WHATEVER ITS NEIGHBOURS HOLD: every mark
+    /// ([`BandIcon::glass_mark`]), regular and bold, at 1x and 2x (12 and 24 px) on the
+    /// system face (SF Mono on macOS) and on Menlo, measured in the rendered frame as the
+    /// pixels that differ from the same row with the mark's cell blank, inks the same box
+    /// from its cell's corner between blanks (` ● `), beside a card's border (`│●│`), after
+    /// the Autopilot card's `∞` (`∞⤓`) and between letters (`H●H`), and no pixel outside its
+    /// own cell. NEGATIVE CONTROL: a band's badge (`ℹ`), measured the same way, spills
+    /// between blanks and keeps to its cell beside letters, so the measure tells two sizes
+    /// of one icon apart.
+    #[test]
+    fn a_glass_mark_keeps_one_ink_box_whatever_its_neighbours_hold() {
+        const P: usize = 8;
+        const COLS: usize = 5;
+        let faces: &[Option<&str>] = if cfg!(target_os = "macos") {
+            &[None, Some("Menlo")]
+        } else {
+            &[None]
+        };
+        let rows: [[char; 2]; 4] = [
+            [' ', ' '],
+            ['\u{2502}', '\u{2502}'],
+            ['\u{221e}', ' '],
+            ['H', 'H'],
+        ];
+        for &face in faces {
+            for px in [12.0f32, 24.0] {
+                let mut r =
+                    Renderer::from_system_with_family(face, px, Theme::default()).expect(NO_FONT);
+                if let Some(name) = face {
+                    assert!(
+                        r.primary_source_path().is_some_and(|p| p.contains(name)),
+                        "{name} is the primary face"
+                    );
+                }
+                r.debug_block_on_lazy_fallbacks();
+                r.set_pad(P);
+                let (cw, ch) = r.cell_size();
+                let top = r.grid_top();
+                // The icon at column 2 between `around`: the box `(x0, x1, y0, y1)`,
+                // half-open, from its cell's top left corner, of the pixels that differ
+                // from the row with that cell blank, and whether any lies outside its cell.
+                let ink = |r: &mut Renderer, around: [char; 2], icon: BandIcon, bold: bool| {
+                    let frame = |r: &mut Renderer, drawn: bool| {
+                        let mut input = Terminal::new(1, COLS as u16).cell_frame(1, COLS);
+                        input.cells[0].resize(COLS, RenderCell::default());
+                        input.cells[0][1].ch = around[0];
+                        input.cells[0][2].ch = if drawn { icon.ch() } else { ' ' };
+                        input.cells[0][3].ch = around[1];
+                        for cell in &mut input.cells[0] {
+                            cell.fg = [0x20, 0x20, 0x20];
+                            cell.bg = [0xf0, 0xf0, 0xf0];
+                            cell.bold = bold;
+                        }
+                        if drawn {
+                            input.chrome_rasters.push(ChromeRaster {
+                                row: 0,
+                                ground: std::sync::Arc::from(Vec::new()),
+                                rail: std::sync::Arc::from(Vec::new()),
+                                rail_h: 0,
+                                clear_rail: false,
+                                own: Vec::new(),
+                                split: None,
+                                rings: Vec::new(),
+                                icons: vec![ChromeIcon { col: 2, icon }],
+                            });
+                        }
+                        r.render_input(&input)
+                    };
+                    let (blank, drawn) = (frame(r, false), frame(r, true));
+                    let (x_cell, w) = ((P + 2 * cw) as i32, drawn.width);
+                    let (mut b, mut outside) = ((i32::MAX, i32::MIN, i32::MAX, i32::MIN), false);
+                    for (i, (&a, &d)) in blank.pixels.iter().zip(&drawn.pixels).enumerate() {
+                        if a & 0x00ff_ffff == d & 0x00ff_ffff {
+                            continue;
+                        }
+                        let (x, y) = ((i % w) as i32 - x_cell, (i / w) as i32 - top as i32);
+                        outside |= !(0..cw as i32).contains(&x) || !(0..ch as i32).contains(&y);
+                        b = (b.0.min(x), b.1.max(x + 1), b.2.min(y), b.3.max(y + 1));
+                    }
+                    assert!(b.0 < b.1, "{icon:?} draws");
+                    (b, outside)
+                };
+                for bold in [false, true] {
+                    for icon in BandIcon::ALL.into_iter().filter(|i| i.is_glass_mark()) {
+                        let at = format!("{face:?} {px} px ({cw}x{ch}) bold {bold} {icon:?}");
+                        let (alone, out) = ink(&mut r, rows[0], icon, bold);
+                        assert!(
+                            !out,
+                            "{at}: between blanks it inks outside its cell {alone:?}"
+                        );
+                        for around in &rows[1..] {
+                            let (beside, out) = ink(&mut r, *around, icon, bold);
+                            assert!(!out, "{at}: beside {around:?} it inks outside its cell");
+                            assert_eq!(
+                                beside, alone,
+                                "{at}: beside {around:?} its ink box moved from the one between blanks"
+                            );
+                        }
+                    }
+                    // NEGATIVE CONTROL: the badge's two sizes, told apart by the same measure.
+                    let (alone, spilled) = ink(&mut r, rows[0], BandIcon::Info, bold);
+                    let (beside, kept) = ink(&mut r, rows[3], BandIcon::Info, bold);
+                    assert!(
+                        spilled && !kept,
+                        "{face:?} {px} px: control, ℹ spills only between blanks"
+                    );
+                    assert_ne!(alone, beside, "{face:?} {px} px: control, ℹ's two sizes");
                 }
             }
         }
@@ -27368,8 +27500,8 @@ mod tests {
                     .expect("an icon cell");
                 assert_eq!(
                     key.ch_or_id & CHROME_ICON_SPILL_BIT != 0,
-                    c == 1,
-                    "{icon:?}: spilled only between blanks"
+                    c == 1 && !icon.is_glass_mark(),
+                    "{icon:?}: a badge spilled only between blanks, a mark never"
                 );
                 let img = r.glyph_image(key);
                 let (gw, gh, ymin) = (img.width(), img.height(), img.ymin());

@@ -2,8 +2,7 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! C1 controls: 8-bit introducers and ST, off by default, and 0x9C in string
-//! payloads.
+//! C1 control tests: 8-bit introducers, ST, and `0x9C` in string payloads.
 
 use super::super::*;
 use super::RecordingSink;
@@ -59,7 +58,6 @@ fn osc_string_c1_st_byte_is_data_not_terminator() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // With C1 controls off, 0x9C in an OSC is data (a UTF-8 continuation byte).
     parser.advance_fast(b"\x1b]0;Title\x9cX\x07", &mut sink);
 
     assert_eq!(sink.osc_dispatches.len(), 1);
@@ -74,7 +72,6 @@ fn osc_string_c1_st_byte_is_data_not_terminator() {
 
 #[test]
 fn c1_disabled_by_default() {
-    // C1 controls are off by default: 0x9B is U+FFFD, then "31m" prints.
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
@@ -93,7 +90,6 @@ fn dcs_passthrough_preserves_non_st_high_bytes() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // Every high byte but 0x9C (ST).
     let payload: Vec<u8> = (0x80..=0x9Bu8).chain(0x9D..=0xFFu8).collect();
     let mut input = vec![0x1B, b'P', b'@']; // DCS hook
     input.extend_from_slice(&payload);
@@ -115,7 +111,6 @@ fn dcs_passthrough_st_c1_byte_terminates_sequence() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // 0x9C ends a DCS as ST.
     let mut input = vec![0x1B, b'P', b'@']; // DCS hook
     input.extend_from_slice(b"data");
     input.push(0x9C); // ST via C1
@@ -153,7 +148,6 @@ fn apc_payload_preserves_non_st_c1_bytes() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // Every high byte but 0x9C (ST).
     let payload: Vec<u8> = (0x80..=0x9Bu8).chain(0x9D..=0xFFu8).collect();
     let mut input = vec![0x1B, b'_']; // APC start
     input.extend_from_slice(&payload);
@@ -175,7 +169,6 @@ fn apc_st_c1_byte_terminates_sequence() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // 0x9C ends an APC as ST.
     let mut input = vec![0x1B, b'_']; // APC start
     input.extend_from_slice(b"data");
     input.push(0x9C); // ST via C1
@@ -191,7 +184,6 @@ fn apc_st_c1_byte_terminates_sequence() {
 
 #[test]
 fn parse_c1_osc_with_c1_st() {
-    // With C1 controls on, 0x9C ends an OSC as ST.
     let mut parser = Parser::with_c1_controls();
     let mut sink = RecordingSink::default();
 
@@ -213,7 +205,6 @@ fn c1_disabled_blocks_injection_in_csi_param_state() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // 0x9B is dropped, so "31m" continues the first CSI: `CSI 131 m`.
     parser.advance_fast(b"\x1b[1\x9b31m", &mut sink);
 
     assert_eq!(
@@ -267,11 +258,6 @@ fn c1_disabled_blocks_dcs_osc_injection_mid_sequence() {
 /// their GL equivalents. A UTF-8 byte in the payload must not leave the string
 /// (`ESC P 1 : h é llo ❯ ls ESC \ after` must print only `after`), and with C1
 /// controls off `0x9C` must still end it as it ends a hooked DCS.
-///
-/// The table, entry by entry: the ignored string stays in itself exactly where
-/// the hooked one does, and where either leaves, both go to the same state.
-/// Then the parsers, fed every one- and two-byte tail, C1 off and on, agree on
-/// everything outside the hook.
 #[test]
 fn an_ignored_dcs_reads_every_byte_as_a_hooked_one() {
     for byte in 0..=u8::MAX {
@@ -340,7 +326,6 @@ fn an_ignored_dcs_reads_every_byte_as_a_hooked_one() {
         }
     }
 
-    // End to end: a UTF-8 payload, then an 8-bit ST.
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
     parser.advance_fast(
@@ -363,12 +348,8 @@ fn an_ignored_dcs_reads_every_byte_as_a_hooked_one() {
 /// character's byte; anywhere else it is ST — after ASCII, after a whole
 /// character, after a lead it cannot follow (`E0`, `F4`), after a broken
 /// prefix. With C1 controls on, a raw `0x9C` is the 8-bit ST wherever it falls.
-///
-/// Every string state, whole and one byte per read.
 #[test]
 fn a_0x9c_inside_a_utf8_character_does_not_end_the_string() {
-    // 0x9C as the second, third and fourth byte, after the leads whose second
-    // byte may be 0x9C (`DC`, `E6`, `ED`, `F0`).
     let payload = "\u{71c}\u{672c}\u{d71c}\u{1f71c}\u{1c71c} x \u{672c}\u{672c}";
     assert_eq!(payload.bytes().filter(|&b| b == 0x9C).count(), 11);
     let heads: [(&[u8], &str); 5] = [
@@ -412,9 +393,6 @@ fn a_0x9c_inside_a_utf8_character_does_not_end_the_string() {
             }
         }
 
-        // Every other 0x9C is ST: after ASCII, after a whole character, after
-        // a lead it cannot follow, after a broken prefix, after a byte that
-        // begins no sequence.
         for before in [
             &b"x"[..],
             "\u{672c}".as_bytes(),
@@ -438,7 +416,6 @@ fn a_0x9c_inside_a_utf8_character_does_not_end_the_string() {
             }
         }
 
-        // With C1 controls on, the raw 0x9C is the 8-bit ST even inside one.
         let mut parser = Parser::with_c1_controls();
         let mut sink = RecordingSink::default();
         parser.advance_fast(&[head, "\u{672c}after".as_bytes()].concat(), &mut sink);
@@ -455,15 +432,6 @@ fn a_0x9c_inside_a_utf8_character_does_not_end_the_string() {
 /// sent the parser to Ground, so the string after it printed and ran as
 /// terminal input: `ESC P 1 é q #0;2;0;0;0#0~~~~ ESC \ after` printed
 /// `\u{fffd}q#0;2;0;0;0#0~~~~after`. The header now ignores it, as vte's does.
-///
-/// The table, entry by entry: every GR byte stays in each header state and
-/// does nothing, and `0x80..=0x9F` keep the C1 entries every other sequence
-/// state has. Then a string with GR bytes in each header state, fed whole,
-/// one byte per read and split in two at every byte, C1 controls off and on:
-/// each hooks its string, delivers
-/// the payload and prints only `after`. With C1 controls off a character
-/// holding `0x9C` (本, `E6 9C AC`) in the header keeps the string too: the C1
-/// guard drops its `0x9C`.
 #[test]
 fn a_gr_byte_in_a_dcs_header_keeps_the_string() {
     for state in [State::DcsEntry, State::DcsParam, State::DcsIntermediate] {
@@ -483,7 +451,6 @@ fn a_gr_byte_in_a_dcs_header_keeps_the_string() {
         }
     }
 
-    // (stream, the hook, the payload, C1 controls off only)
     let strings: [(&[u8], (Vec<u16>, Vec<u8>, u8), &[u8], bool); 6] = [
         (
             "\x1bP\u{e9}q#0~\x1b\\after".as_bytes(),

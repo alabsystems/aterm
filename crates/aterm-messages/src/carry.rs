@@ -82,7 +82,7 @@ pub struct Carry {
 impl Carry {
     /// `true` when nothing is carried.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.live.is_empty()
     }
 }

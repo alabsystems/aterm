@@ -42,19 +42,27 @@ use aterm_effects::pipeline::EffectsPipeline;
 use aterm_render::{RenderInput, Renderer, SpillBand, Theme, WindowCpu};
 
 /// Histories up to this many lines are rewrapped inline by `resize`, matching
+/// aterm-gui's `INLINE_REFLOW_MAX_LINES`.
 const INLINE_REFLOW_MAX_LINES: usize = 20_000;
 
 /// Never-pumped-host safety net #1: `render()` calls after a rewrap is stashed before
+/// `render` pumps it itself (~2 s at 60 fps): long enough for a host's idle-scheduled
+/// `pump_reflow()` to win, short enough to restore deep history promptly otherwise.
 const REFLOW_PUMP_GRACE_RENDERS: u32 = 120;
 
 /// Never-pumped-host safety net #2: while a rewrap is stashed, output that scrolls off
+/// stages in the grid's lazy buffer.
 const REFLOW_BACKLOG_MAX_LINES: usize = 20_000;
 
 /// Default per-pump rewrap budget in input history lines for
+/// [`AtermTerminal::pump_reflow`] (tunable via [`AtermTerminal::pump_reflow_budget`]).
 const REFLOW_STEP_BUDGET_LINES: usize = 2_000;
 
 std::thread_local! {
     /// Host-registered font blobs, marshaled across the JS/wasm boundary once per
+    /// module and referenced by `u32` handle, so the ~100–400MB faces (Apple Color
+    /// Emoji, Noto CJK) are never re-copied per pane; per-call copies would ratchet the
+    /// linear memory, which never shrinks.
     static REGISTERED_FONTS: std::cell::RefCell<Vec<std::sync::Arc<Vec<u8>>>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -125,6 +133,7 @@ pub struct AtermTerminal {
 }
 
 /// The frame-gate key: every input of a rendered frame that can change between two
+/// `render()` calls at stable dims and config.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct FrameGateKey {
     damage_epoch: u64,
@@ -136,12 +145,14 @@ struct FrameGateKey {
 #[derive(Default)]
 struct DisplayRowCache {
     /// `(alt_screen, content_gen, display_offset, row)` the cached cells were
+    /// resolved at.
     key: Option<(bool, u64, usize, u16)>,
     /// `(grapheme, is_wide)` per display column of `key.row`.
     cells: Vec<(String, bool)>,
 }
 
 /// Keep the engine's implicit cells and OSC 110/111/112/117 reset baselines
+/// aligned with the renderer theme.
 #[inline]
 fn apply_terminal_theme_colors(term: &mut Terminal, fg: u32, bg: u32, cursor: u32, selection: u32) {
     let mut base = term.color_baseline();
@@ -154,6 +165,8 @@ fn apply_terminal_theme_colors(term: &mut Terminal, fg: u32, bg: u32, cursor: u3
 
 impl AtermTerminal {
     /// Refill every engine-owned frame channel and consume the frame's damage session
+    /// through the engine's one damage consumer,
+    /// [`Terminal::cell_frame_damage_scoped_into`], as the native GUI does.
     #[inline]
     fn refill_frame_scratch(&mut self) {
         let refill =
@@ -168,6 +181,9 @@ impl AtermTerminal {
     }
 
     /// Read one `(grapheme, is_wide)` display cell through the single-slot row
+    /// cache, refreshing it from [`Terminal::display_row_grapheme_cells`] only when
+    /// its key changes, so a host's per-cell walk of a scrolled-back row costs
+    /// O(cols), not O(cols²).
     fn with_display_row_cell<T>(
         &self,
         row: u16,
@@ -199,6 +215,7 @@ impl AtermTerminal {
 }
 
 /// The renderer half of a theme install, which `theme_api` (shared with
+/// aterm-gpu-web) calls on whichever crate compiles it.
 impl AtermTerminal {
     /// Borrow the underlying CPU [`Renderer`].
     #[inline]
@@ -569,7 +586,7 @@ impl AtermTerminal {
         Ok(())
     }
 
-    /// Safety net #1 (see `REFLOW_PUMP_GRACE_RENDERS`): called by `render`. After the
+    /// Safety net #1 (see `REFLOW_PUMP_GRACE_RENDERS`): called by `render`.
     #[inline]
     fn pump_reflow_on_render_tick(&mut self) {
         if self.pending_reflow.is_none() {
@@ -583,6 +600,8 @@ impl AtermTerminal {
     }
 
     /// Safety net #2 (see `REFLOW_BACKLOG_MAX_LINES`): called by `process`/
+    /// `process_str` after feeding; one budgeted step per call while the staged
+    /// output is past the cap.
     #[inline]
     fn pump_reflow_on_output(&mut self) {
         if self.pending_reflow.is_some() && self.term.lazy_backlog_len() > REFLOW_BACKLOG_MAX_LINES
@@ -837,6 +856,7 @@ impl BudgetedSearchResult {
 
 impl AtermTerminal {
     /// Expand an OSC-8 hyperlink to the span of contiguous cells sharing its
+    /// link.
     fn osc8_span(&self, row: u16, col: u16) -> (u16, u16) {
         let same = |c: u16| -> bool {
             let id_here = self.term.hyperlink_id_at(row, col);
@@ -969,7 +989,7 @@ pub(crate) fn json_string(s: &str) -> String {
     out
 }
 
-/// Classify a matched span: 1=url (scheme or www. host), 2=file_path (absolute,
+/// Classify a matched span: 1=url (scheme or www.
 fn classify(s: &str) -> u8 {
     let lower = s.to_ascii_lowercase();
     if lower.starts_with("http://")
@@ -1061,10 +1081,14 @@ pub(crate) fn system_font_terminal(rows: u16, cols: u16, px: f32) -> AtermTermin
 mod tests {
     use super::*;
 
-    /// The bundled face, injected the way a JS host injects a fetched one. A
+    /// The bundled face, injected the way a JS host injects a fetched one.
     const BUNDLED_FACE: &[u8] = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
 
     /// The theme the host hands the constructor seeds the engine's implicit
+    /// colours (`apply_terminal_theme_colors`), so every frame channel the
+    /// renderer takes from the engine (default fg and bg, cursor, selection
+    /// pair) is the host's, and an OSC 110/111/112/117/119 reset returns to
+    /// it rather than to the engine's built-ins.
     #[test]
     fn the_host_theme_is_the_frames_colour_baseline() {
         let (fg, bg, cursor, selection) = (0x0011_2233, 0x0044_5566, 0x0077_8899, 0x000A_0B0C);
@@ -1103,6 +1127,9 @@ mod tests {
     }
 
     /// `search_meta` and `search_summary` describe exactly the result set the
+    /// legacy `search` export returns, plus what it drops: the engine's
+    /// match-cap truncation (E9a) and, for the summary, line snippets and a
+    /// `total` the `max_matches` cap leaves alone.
     #[test]
     fn search_meta_and_summary_carry_what_the_legacy_export_drops() {
         let mut t = crate::system_font_terminal(24, 80, 16.0);
@@ -1162,6 +1189,8 @@ mod tests {
     }
 
     /// The P7 grid-mirror batch export: one `{text, wrapped, len, widths?}`
+    /// record per display row, `widths` only on a row holding a wide cell,
+    /// and `undefined` for a range past the live grid (resize skew).
     #[test]
     fn row_range_json_batches_rows_matching_the_per_row_exports() {
         let mut t = crate::system_font_terminal(6, 20, 16.0);
@@ -1186,6 +1215,8 @@ mod tests {
     }
 
     /// The host's input-intent words (the JS-to-wasm contract) each note one
+    /// console input of their kind and buy one frame; an unknown word is
+    /// refused without scheduling one.
     #[test]
     fn console_input_words_note_one_input_each_and_refuse_unknowns() {
         use aterm_effects::kitty_pet::PetInputKind;
@@ -1213,6 +1244,10 @@ mod tests {
     }
 
     /// The paste export is the engine's formatter on THIS instance's mode, so
+    /// a JS host cannot get the order wrong: a planted `ESC[201~` (or its
+    /// 8-bit `0x9B 2 0 1 ~` spelling) is inert text before the one closing
+    /// guard is appended, so it can never end its own bracket and let the
+    /// tail run as keystrokes.
     #[test]
     fn paste_export_wraps_only_sanitized_text_so_a_planted_terminator_stays_inert() {
         let mut t = AtermTerminal::new(24, 80, BUNDLED_FACE, 16.0, 0, 0, 0, 0)
@@ -1235,6 +1270,8 @@ mod tests {
     }
 
     /// Font handles: identical bytes share one handle and distinct bytes get
+    /// their own, a handle builds an engine and installs the shared emoji
+    /// copy, and an unknown handle is a catchable error, never a panic.
     #[test]
     fn registered_font_handles_dedupe_build_and_refuse_unknowns() {
         let handle = register_font(BUNDLED_FACE);
@@ -1257,6 +1294,7 @@ mod tests {
     }
 
     /// Drive one OSC 133 command block (prompt, command, output, done), then the next
+    /// prompt's A so the block is sealed: the state `last_command_output` reads.
     fn run_osc133_block(t: &mut AtermTerminal, cmd: &str, output_lines: &[&str], exit: i32) {
         t.process(b"\x1b]133;A\x07");
         t.process(format!("$ {cmd}").as_bytes());
@@ -1271,6 +1309,9 @@ mod tests {
     }
 
     /// `last_command_output`'s three answers (the host's "Copy Last Command
+    /// Output" JSON): `undefined` without shell integration, the LATEST
+    /// block's whole output with its exit code, and an honest `evicted`
+    /// marker once the block's rows scroll past the cap, never shifted text.
     #[test]
     fn last_command_output_is_none_then_the_latest_block_then_evicted() {
         let mut t = crate::system_font_terminal(10, 40, 16.0);
@@ -1300,6 +1341,7 @@ mod tests {
     }
 
     /// A host-minted scheme lets its OSC 8 link through to `link_at` as an
+    /// OSC-8 hit spanning exactly its cells; revoking it shuts the door.
     #[test]
     fn a_minted_scheme_links_through_osc8_until_revoked() {
         let mut t = crate::system_font_terminal(24, 80, 16.0);
@@ -1322,6 +1364,8 @@ mod tests {
     }
 
     /// `serialize` is replayable ANSI: replayed into a fresh engine it
+    /// reproduces the viewport AND lands the source's history in the target's
+    /// scrollback.
     #[test]
     fn serialize_replay_lands_history_in_scrollback_not_under_the_viewport_paint() {
         let mut a = crate::system_font_terminal(6, 40, 16.0);
@@ -1352,7 +1396,7 @@ mod tests {
         );
     }
 
-    /// Reject an oversized frame before constructing or changing a grid. Existing
+    /// Reject an oversized frame before constructing or changing a grid.
     #[test]
     fn oversized_frames_are_refused_before_state_changes() {
         let new = |rows, cols| {
@@ -1462,6 +1506,7 @@ mod tests {
     }
 
     /// The persistent WindowCpu reuses unchanged rows across frames and the
+    /// WF-1 gate skips settled ones; neither may change the picture.
     #[test]
     fn incremental_and_gated_renders_equal_a_single_full_render() {
         let mut warm = crate::system_font_terminal(24, 80, 16.0);
@@ -1520,6 +1565,7 @@ mod tests {
     }
 
     /// `set_scrollback_limit(0)` is unlimited, never a zero-line cap, and a
+    /// later shrink re-clamps a scrolled-back viewport to the new limit.
     #[test]
     fn scrollback_limit_zero_is_unlimited_and_a_shrink_reclamps_the_viewport() {
         let mut t = crate::system_font_terminal(5, 40, 16.0);
@@ -1539,6 +1585,8 @@ mod tests {
     }
 
     /// A host that rebuilds a row PER-CELL (a buffer facade that walks any
+    /// non-ASCII row through `cell_text` + `cell_is_wide`) must see the same
+    /// display-relative rows `row_text` serves.
     #[test]
     fn scrolled_cell_reads_are_display_relative_like_row_text() {
         let mut t = crate::system_font_terminal(5, 20, 16.0);
@@ -1634,6 +1682,8 @@ mod tests {
     }
 
     /// `search` hands out `[abs_line, col, len]` triplets in absolute rows,
+    /// and `scroll_search_line_into_view` lands a scrollback match on a
+    /// visible row.
     #[test]
     fn search_finds_a_token_in_scrollback_and_scrolls_it_into_view() {
         let mut t = crate::system_font_terminal(24, 80, 16.0);
@@ -1661,6 +1711,8 @@ mod tests {
     }
 
     /// The mode getters the host reads follow the program: each DECSET mode
+    /// defaults off and follows its set and reset, and DECSCUSR surfaces as
+    /// its `CursorStyle` discriminant.
     #[test]
     fn host_mode_getters_follow_the_program() {
         let mut t = crate::system_font_terminal(24, 80, 16.0);
@@ -1684,6 +1736,9 @@ mod tests {
     }
 
     /// `encode_key` speaks the LIVE keyboard mode the program negotiated, and
+    /// the worker path's stateless `encode_key_with_mode`, fed the mirrored
+    /// `keyboard_mode_bits`, is byte-identical at every step, including
+    /// win32-input-mode, which only a host-declared ConPTY can turn on.
     #[test]
     fn encode_key_follows_the_live_mode_and_its_mirrored_bits() {
         let mut t = crate::system_font_terminal(24, 80, 16.0);
@@ -1742,6 +1797,8 @@ mod tests {
     }
 
     /// The host word-separator setting reshapes double-click words end-to-end
+    /// (xterm.js `wordSeparators` semantics), and clearing it restores the
+    /// engine's default class-based word logic exactly.
     #[test]
     fn set_word_separators_reshapes_double_click_words() {
         let mut t = crate::system_font_terminal(24, 80, 16.0);
@@ -1754,6 +1811,8 @@ mod tests {
     }
 
     /// The mouse surface the host drives: the motion getters follow
+    /// 1000/1002/1003, and the encoders take the host's 0-based
+    /// `(col, row, button, mods)` and wheel direction.
     #[test]
     fn mouse_getters_follow_the_mode_and_encoders_take_host_cells() {
         let mut t = crate::system_font_terminal(24, 80, 16.0);
@@ -1779,6 +1838,8 @@ mod tests {
     }
 
     /// A link under the pointer is read from the cells it is drawn in (r16
+    /// selection-stride): after two ideographs the URL's columns are its own
+    /// and its text is the URL.
     #[test]
     fn a_link_after_wide_characters_is_read_from_its_cells() {
         let mut t = AtermTerminal::new(4, 60, BUNDLED_FACE, 16.0, 0, 0, 0, 0)
@@ -1797,6 +1858,8 @@ mod tests {
     }
 
     /// The link `link_at` names is the one painted under the cell the host
+    /// passes: a BiDi row is painted in visual order, and a DEC double-width
+    /// line paints grid column `c` at cells `2c` and `2c + 1`.
     #[test]
     fn a_link_is_named_by_the_cell_it_is_painted_in() {
         let osc8 = |url: &str, text: &str| format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\");
@@ -1882,6 +1945,7 @@ mod tests {
     }
 
     /// An instance that never touches the effects API and one that toggles every
+    /// effect on and back off render the same pixels.
     #[test]
     fn effects_off_is_byte_identical() {
         let mut plain = crate::system_font_terminal(24, 80, 16.0);
@@ -1941,6 +2005,7 @@ mod tests {
     }
 
     /// `set_chrome` grows the frame by the pad/head chrome, and 0/0 restores the
+    /// exact-fit frame byte for byte.
     #[test]
     fn set_chrome_pads_the_frame_and_zero_restores_identity() {
         let mut plain = crate::system_font_terminal(24, 80, 16.0);
@@ -1971,6 +2036,11 @@ mod tests {
     }
 
     /// SPILL BAND through the REAL pipeline: an EMBERFORGE burn on the top
+    /// row (the flame field rises above the grid: the effects box relaxes
+    /// upward by exactly `head` under chrome) must light the TOP strip, and
+    /// the band bytes `render` exports, packed as the four strips, must
+    /// composite source-over onto the theme bg into exactly the rendered
+    /// frame's band region (the seam-continuity law).
     #[test]
     fn spill_exports_track_band_content_through_the_real_pipeline() {
         let mut t = crate::system_font_terminal(12, 40, 16.0);
@@ -2060,6 +2130,7 @@ mod tests {
     }
 
     /// Drive the pet onto the glass through the binding alone (the naming glow style,
+    /// the seed, witnessed keystrokes at 33 ms) until `cursor_pet_alpha` goes positive.
     fn wake_the_pet(t: &mut AtermTerminal, seed: u64) -> Option<u32> {
         t.set_cursor_glow(true, "rainbow kitty", None, None, 260, 24, 0.7, 0.6, true);
         t.set_cursor_pet(true, seed);
@@ -2080,6 +2151,8 @@ mod tests {
     }
 
     /// Advance 100 ms frames with no input until the binding reports idle (or the
+    /// budget runs out), then render once more: the active→idle edge changes the gate
+    /// key on that render, the one settle frame.
     fn settle(t: &mut AtermTerminal, budget_frames: u32) -> bool {
         for _ in 0..budget_frames {
             t.advance_effects(100.0);
@@ -2093,6 +2166,7 @@ mod tests {
     }
 
     /// The seed is the only entropy: same seed, bytes and `dt` stream give identical
+    /// pixels at every step, and a different seed dresses a visibly different cat.
     #[test]
     fn cursor_pet_is_deterministic_for_one_seed() {
         let mut a = crate::system_font_terminal(24, 80, 16.0);
@@ -2141,7 +2215,7 @@ mod tests {
         );
     }
 
-    /// The pet defaults OFF. The pointer and the press are value-shadowed
+    /// The pet defaults OFF.
     #[test]
     fn pointer_and_pet_press_reopen_the_frame_gate() {
         let mut t = crate::system_font_terminal(24, 80, 16.0);
@@ -2207,6 +2281,10 @@ mod tests {
     }
 
     /// A walking pet is free sprites over the grid, so its motion presents
+    /// as SUB-FRAME bands (the rows the sprite vacated and entered), never
+    /// a full-frame band, and the partially-updated persistent buffer stays
+    /// byte-exact against a from-scratch expansion of the same frame — the
+    /// dirty-band oracle of `dirty_band_present_api`.
     #[test]
     fn walking_pet_presents_sub_frame_bands() {
         let mut t = crate::system_font_terminal(8, 40, 14.0);
@@ -2268,6 +2346,7 @@ mod tests {
     }
 
     /// Swap in an engine whose history lives in the tiered store (tiny ring) and feed
+    /// `lines` numbered lines short enough not to wrap at the test widths.
     fn install_tiered_history(t: &mut AtermTerminal, rows: u16, cols: u16, lines: usize) {
         let sb = aterm_core::scrollback::Scrollback::new(64, 512, 64_000_000);
         t.term = Terminal::with_scrollback(rows, cols, 8, sb);
@@ -2281,6 +2360,11 @@ mod tests {
     }
 
     /// The inline bound splits the two resize paths: a history at or under
+    /// `INLINE_REFLOW_MAX_LINES` rewraps inline, mirroring the native bound;
+    /// a deeper one detaches, and any schedule of small bounded pumps
+    /// re-attaches it with its content intact (aterm-grid's
+    /// schedule-independence property, asserted here as the JS-visible
+    /// outcome: counts + oldest line).
     #[test]
     fn small_history_rewraps_inline_and_a_deep_one_defers_to_stepped_pumps() {
         let mut t = crate::system_font_terminal(24, 80, 16.0);
@@ -2342,6 +2426,11 @@ mod tests {
     }
 
     /// A second width change during the detach window, whether the job is
+    /// still stashed or already half-stepped, supersedes without losing
+    /// history: the store is out, so nothing re-detaches; the job keeps its
+    /// progress and re-attaches (content valid, wrapping stale for the newest
+    /// width), and the NEXT width change re-detaches and re-wraps it (the
+    /// self-heal, the native supersede semantics).
     #[test]
     fn a_resize_during_the_window_supersedes_without_losing_history() {
         for half_stepped in [false, true] {
@@ -2448,6 +2537,9 @@ mod tests {
     }
 
     /// Driving the budgeted export to completion yields exactly the legacy
+    /// one-shot triplets, cursor discipline included (Some while incomplete,
+    /// None at completion); an empty query or a bad regex answers at once,
+    /// empty and complete, like the legacy export's silence.
     #[test]
     fn search_budgeted_resumes_to_the_one_shot_result() {
         let mut t = crate::system_font_terminal(6, 40, 16.0);
@@ -2487,6 +2579,10 @@ mod tests {
     }
 
     /// DMG-1 ON THE WEB PATH: across a mutation stream (typing, wraps and
+    /// scrolls, erases, SGR, an OSC 11 recolour, the alt screen, a history
+    /// viewport and a resize) with the damage-reading effects on, every
+    /// rendered frame's engine channels equal a FULL extraction of the same
+    /// terminal, and an echo re-resolves ONE row.
     #[test]
     fn web_path_scoped_refill_matches_a_full_extraction_over_a_mutation_stream() {
         use aterm_core::render::FrameRefill;
@@ -2553,7 +2649,7 @@ mod tests {
         assert!(full >= 2, "the full arm must be reached ({full})");
     }
 
-    /// WF-1 frame gate, two-sided. Side 1 (skip): a second `render()` with
+    /// WF-1 frame gate, two-sided.
     #[test]
     fn frame_gate_skips_settled_frames_and_reopens_on_every_change_class() {
         let mut t = crate::system_font_terminal(8, 40, 14.0);
@@ -2605,6 +2701,7 @@ mod tests {
     }
 
     /// The drag half of the WF-1 gate: `selection_extend` bumps ONLY when the
+    /// resolved selection actually moved in cell coordinates.
     #[test]
     fn redundant_selection_extend_gates_but_every_real_move_still_draws() {
         let mut t = crate::system_font_terminal(8, 40, 14.0);
@@ -2684,6 +2781,8 @@ mod tests {
     }
 
     /// Glass floors glyphs on the web too: a low-contrast SGR fg (#2A2D35 on
+    /// the #111318 default) gets an opaque glyph pixel at >= 4.5:1 under 0.6
+    /// opacity with no `set_minimum_contrast` call.
     #[test]
     fn web_translucency_floors_the_rendered_glyphs() {
         let face = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");

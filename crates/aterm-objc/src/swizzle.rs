@@ -283,6 +283,7 @@ struct Claim {
     /// The implementation the row held before this site replaced it.
     original: Imp,
     /// The class the row actually lives on — see the module docs on blast
+    /// radius.
     owner: ClassPtr,
     /// The selector.
     sel: Sel,
@@ -297,7 +298,7 @@ unsafe impl Sync for Claim {}
 pub struct SwizzleSite<F: MethodFn> {
     /// The [`Claim`] this site published, or null when nothing is installed.
     claim: AtomicPtr<Claim>,
-    /// The prototype the install verified. Zero-sized; a function pointer type
+    /// The prototype the install verified.
     _proto: PhantomData<F>,
 }
 
@@ -340,7 +341,7 @@ impl<F: MethodFn> SwizzleSite<F> {
         self.claim().map(|c| (c.owner, c.sel))
     }
 
-    /// The published claim, if any. `'static` because a claim is leaked on
+    /// The published claim, if any.
     fn claim(&self) -> Option<&'static Claim> {
         let raw = self.claim.load(Ordering::Acquire);
         if raw.is_null() {

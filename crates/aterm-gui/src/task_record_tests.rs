@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The task record's grammar, its idempotent mark, its handoff row and the
-//! `await task` argument parse. The waits themselves are driven in
-//! `control_session`'s tests, where `await_task` lives.
+//! The task record's grammar, its idempotent mark, its handoff row and the `await task` argument parse.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -66,12 +64,6 @@ fn states_and_origins_are_closed_words() {
 }
 
 /// THE LOG'S TASK WORDS MIRROR THE TASK RECORD'S (a mirror of an aterm-gui vocabulary lives in aterm-gui).
-/// Every task state
-/// is a `state=` word of the session log and every `why=` word a `why=`
-/// word, so a `task` mark ([`crate::session_timeline::SessionTimeline::mark_task`])
-/// never writes one as `unknown`. The match is exhaustive: a fifth state is a
-/// compile error here until the log knows its word. NEGATIVE CONTROL: a word
-/// the log's lists do not hold is refused by the same lookup.
 #[test]
 fn the_logs_task_words_mirror_the_task_record() {
     use aterm_slog::vocab::{STATE_WORDS, WHY_WORDS, lookup};
@@ -112,8 +104,6 @@ fn a_mark_parses_every_fact_and_names_what_it_refuses() {
         }
     );
     assert_eq!(parse("stalled").unwrap(), TaskMark::new(TaskState::Stalled));
-    // An older build's done words still parse (a record a seamless update or
-    // a rollback carried); no harness of this build writes them.
     for old in ["marker", "done-check"] {
         assert_eq!(
             parse(&format!("done why={old}")).unwrap().why,
@@ -121,7 +111,6 @@ fn a_mark_parses_every_fact_and_names_what_it_refuses() {
             "{old}"
         );
     }
-    // A path with a space travels pct-encoded.
     let spaced = tasks().join("a b.txt");
     assert_eq!(
         parse(&format!(
@@ -154,8 +143,6 @@ fn a_mark_parses_every_fact_and_names_what_it_refuses() {
             .unwrap_err()
             .contains("why= is one of landed|marker|done-check|exit|shell|startup|held|turn")
     );
-    // NEGATIVE CONTROLS for the path: outside the dir, the dir itself, a
-    // climb out, a relative path, a control character, no state dir at all.
     let mut outsides: Vec<String> = [
         "/etc/passwd",
         "/state/aterm/tasks",
@@ -168,8 +155,6 @@ fn a_mark_parses_every_fact_and_names_what_it_refuses() {
     ]
     .map(native)
     .into();
-    // Windows: rooted on no drive, on another drive, the verbatim spelling,
-    // and the same second spellings with `/` for a separator.
     if cfg!(windows) {
         outsides.extend(
             [
@@ -198,7 +183,6 @@ fn a_mark_parses_every_fact_and_names_what_it_refuses() {
         )
         .is_err()
     );
-    // At most `RESULT_PATH_MAX` bytes decoded: macOS's PATH_MAX.
     let dir = native("/state/aterm/tasks/");
     let longest = format!("{dir}{}", "a".repeat(RESULT_PATH_MAX - dir.len()));
     assert!(parse(&format!("done result_path={longest}")).is_ok());
@@ -219,11 +203,9 @@ fn the_same_mark_twice_moves_nothing_and_a_change_bumps_the_rev() {
     );
     assert_eq!(first.since_unix_ms, 1_000);
 
-    // IDEMPOTENT: the same state with the same facts is no change.
     let (again, moved) = working.apply(Some(&first), false, t0 + Duration::from_secs(1), 2_000);
     assert!(!moved);
     assert_eq!(again, first, "no rev, no since moved");
-    // `from` is kept when a mark names none.
     let (kept, moved) = TaskMark::new(TaskState::Working).apply(Some(&first), false, t0, 2_000);
     assert!(!moved && kept.from == SID);
 
@@ -241,8 +223,6 @@ fn the_same_mark_twice_moves_nothing_and_a_change_bumps_the_rev() {
         "a harness marking done again wakes no one"
     );
 
-    // A fact that changes within the state bumps the rev, not the since; a
-    // fact left out is cleared.
     let (resized, moved) = TaskMark::new(TaskState::Done).apply(
         Some(&finished),
         false,
@@ -252,7 +232,6 @@ fn the_same_mark_twice_moves_nothing_and_a_change_bumps_the_rev() {
     assert!(moved);
     assert_eq!((resized.rev, resized.since_unix_ms), (3, 3_000));
     assert_eq!((resized.why, resized.result_bytes), (None, 0));
-    // The attention flag is part of the record.
     let (raised, moved) = TaskMark::new(TaskState::Done).apply(
         Some(&resized),
         true,
@@ -281,7 +260,6 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
         trusted_cwd: Some(folder("w/my proj")),
     };
     let row = record.carry_row();
-    // The paths ride in this platform's own spelling, pct-encoded.
     let (wire, trusted) = if cfg!(windows) {
         (r"C:\state\aterm\tasks\r%201.txt", r"C:\w\my%20proj")
     } else {
@@ -294,8 +272,6 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
              exit=-2 result_path={wire} agent=agy trusted_cwd={trusted}"
         )
     );
-    // Read back five seconds of wall clock later: the same record, and its
-    // `since_ms=` keeps counting from when the state was entered.
     let later = t0 + Duration::from_secs(60);
     let back = TaskRecord::from_carry_row(&row, Some(&tasks()), later, 15_000).expect("reads");
     assert_eq!(back.since, later - Duration::from_secs(5));
@@ -312,7 +288,6 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
     };
     let back = TaskRecord::from_carry_row(&bare.carry_row(), Some(&tasks()), t0, 10_000).unwrap();
     assert_eq!(back, bare);
-    // The held deadline's stall crosses a seamless update as it stands.
     let held = TaskRecord {
         state: TaskState::Stalled,
         why: Some("held"),
@@ -322,16 +297,11 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
         TaskRecord::from_carry_row(&held.carry_row(), Some(&tasks()), t0, 10_000),
         Some(held)
     );
-    // A NEWER BUILD'S ROW still reads after a rollback: a key this build does
-    // not know, or a bare word, is skipped, never the record.
     let newer = format!("{} model=opus pinned", bare.carry_row());
     assert_eq!(
         TaskRecord::from_carry_row(&newer, Some(&tasks()), t0, 10_000),
         Some(bare.clone())
     );
-    // THE WORKER'S AGENT CROSSES (each one a spawn starts), and one this
-    // build does not know (a newer build's agent, or no worker's: `codex`)
-    // costs the agent alone, never the record.
     for agent in aterm_phase::Program::ALL {
         let with = TaskRecord {
             agent: Some(agent),
@@ -350,9 +320,6 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
             "{agent:?}"
         );
     }
-    // THE FOLDER ITS SPAWN TRUSTED CROSSES, and one this build cannot vouch
-    // for (relative, climbing, a second spelling, a control character) costs
-    // the folder alone, never the record: no folder is trusted on it.
     let with = TaskRecord {
         trusted_cwd: Some(folder("w/proj")),
         ..bare.clone()
@@ -464,8 +431,6 @@ fn await_task_takes_its_list_combine_since_and_timeout() {
             timeout_ms: Some(1500),
         }
     );
-    // The single form: no list, `any` the default, `timeout <ms>` spelled
-    // either way, and the server's 600 s clamp.
     let single = parse_await_task(&words("timeout 999999999"), false).unwrap();
     assert_eq!(single.combine, Combine::Any);
     assert_eq!(single.timeout_ms, Some(aterm_control::wire::WAIT_MAX_MS));
@@ -476,7 +441,7 @@ fn await_task_takes_its_list_combine_since_and_timeout() {
     );
 
     for usage in [
-        "@s-a", // a list where the selector already named one
+        "@s-a",
         "since=x",
         "since=1 since=2",
         "any all",
@@ -497,8 +462,6 @@ fn await_task_takes_its_list_combine_since_and_timeout() {
             "{usage:?}"
         );
     }
-    // An element naming nothing (`@$W` with `$W` empty) is the empty-selector
-    // refusal, never the front session; `@.` written out is a target.
     for empty in ["@", "@s-a,@", "@,@s-b", "@:3", "@s-a,@:2"] {
         assert_eq!(
             parse_await_task(&words(empty), true),
@@ -533,7 +496,6 @@ fn a_mark_records_its_row_and_the_supervisors_attention_moves_the_rev() {
 
     let handle = crate::session_store::test_handle(4);
     let owner = crate::harness_host::ATTENTION_OWNER;
-    // No task: the supervisor's attention gives the session no record.
     write_attention_owned(
         &handle.ctx,
         owner,
@@ -581,7 +543,6 @@ fn a_mark_records_its_row_and_the_supervisors_attention_moves_the_rev() {
         )
         .unwrap()
     );
-    // Another owner's entry is not the supervisor's news.
     write_attention_owned(
         &handle.ctx,
         "human",
@@ -606,8 +567,6 @@ fn a_mark_records_its_row_and_the_supervisors_attention_moves_the_rev() {
             "rev=3 state=working attention=0",
         ]
     );
-    // A mark reads the flag under the meta guard: raised before the mark, the
-    // record it makes says so.
     write_attention_owned(
         &handle.ctx,
         owner,
@@ -621,10 +580,7 @@ fn a_mark_records_its_row_and_the_supervisors_attention_moves_the_rev() {
 }
 
 /// A WORKER'S NEEDS YOU ENTRY IS ITS TASK RECORD'S NEWS (Autopilot Land: "be
-/// LOUDER ABOUT IT ... but NEVER let that block you"): an `owner=needs` entry
-/// raises a tasked session's attention and moves its rev as the supervisor's
-/// own does, its clear lowers it, and the flag stands while either entry
-/// does. NEGATIVE CONTROL: a person's own entry moves nothing.
+/// LOUDER ABOUT IT ...
 #[test]
 fn a_workers_needs_you_entry_raises_the_task_records_attention() {
     use crate::session_timeline::{MetaEdit, write_attention_kind};
@@ -657,7 +613,6 @@ fn a_workers_needs_you_entry_raises_the_task_records_attention() {
     assert!(flag().1, "the supervisor's entry still stands");
     write(supervisor, MetaEdit::Clear);
     assert!(!flag().1, "both cleared");
-    // NEGATIVE CONTROL: a person's own entry.
     let before = flag();
     write_attention_kind(
         ctx,
@@ -722,9 +677,6 @@ fn the_task_verb_reads_marks_and_refuses_an_edge_the_mark() {
 /// gets one rev that carries the done and `attention=-`, and the host's
 /// backstop (`StartupMark::Over`'s take-down) finds nothing left to move, so
 /// a manager re-armed past that rev is not woken again with no news.
-/// NEGATIVE CONTROLS: a mark to the deadline's own stall keeps its text, and
-/// another text of the supervisor's (a wall it escalated) stays through a
-/// done.
 #[test]
 fn a_done_over_a_deadline_stall_takes_its_attention_down_in_the_same_rev() {
     let handle = crate::session_store::test_handle(6);
@@ -778,7 +730,6 @@ fn a_done_over_a_deadline_stall_takes_its_attention_down_in_the_same_rev() {
     .expect("applied");
     assert!(!over.moved && !over.attention_moved, "{over:?}");
 
-    // NEGATIVE CONTROL: the deadline's own stall, marked over the wire.
     let stall = raise(&held);
     let again = cmd_task(ctx, 6, Scope::Owner, "mark stalled why=held");
     assert!(
@@ -789,7 +740,6 @@ fn a_done_over_a_deadline_stall_takes_its_attention_down_in_the_same_rev() {
         ctx.timeline.lock().unwrap().task().map(|r| r.rev),
         Some(stall.rev)
     );
-    // NEGATIVE CONTROL: another text of the supervisor's stays.
     raise("a usage limit until 5pm");
     let done = cmd_task(ctx, 6, Scope::Owner, "mark done why=landed");
     assert!(done.contains(" attention=a%20usage%20limit"), "{done}");
@@ -808,8 +758,7 @@ fn a_result_path_is_judged_lexically() {
 /// A WINDOWS STATE DIR: a result under `%LOCALAPPDATA%\aterm\tasks` is
 /// judged under it, a space travelling pct-encoded, and kept as spelled; so
 /// is one under a state root spelled with `/` (`ATERM_STATE_HOME=C:/…`),
-/// which `tasks\<file>` joins with `\`. NEGATIVE CONTROLS: the drive's
-/// relative spelling, another drive, a prefix of the dir's last name.
+/// which `tasks\<file>` joins with `\`.
 #[cfg(windows)]
 #[test]
 fn a_windows_result_path_is_judged_under_its_state_dir() {
@@ -856,8 +805,7 @@ fn a_windows_result_path_is_judged_under_its_state_dir() {
 /// answered with its stamp and its text; `ERR no task` with no record, and a
 /// record with no result says why in its own state's word — `exited` with
 /// none, but an `exited` worker the harness had marked done keeps its
-/// result. A `done` with no file named is `no-snapshot`. A stray word is the
-/// usage line.
+/// result.
 #[test]
 fn the_result_verb_answers_the_snapshot_the_record_names() {
     let handle = crate::session_store::test_handle(6);
@@ -909,7 +857,6 @@ fn the_result_verb_answers_the_snapshot_the_record_names() {
     mark(done.clone());
     let answer = "OK 1 source=transcript session=0b22 uuid=a-1 bytes=17\nFixed the parser.\n";
     assert_eq!(cmd_result(ctx, 6, ""), answer);
-    // The agent gone, its result kept.
     mark(TaskMark {
         state: TaskState::Exited,
         why: Some("exit"),
@@ -929,8 +876,7 @@ fn the_result_verb_answers_the_snapshot_the_record_names() {
 /// before Claude Code wrote the reply) answers the miss while the reply is
 /// not there; once it is, `result` answers it, the record says its size
 /// under a new rev, and the snapshot holds it — a second `result` reads
-/// nothing again and moves nothing. NEGATIVE CONTROL: a reply that only a
-/// later turn holds is never the task's.
+/// nothing again and moves nothing.
 #[test]
 fn result_reads_a_missed_reply_of_its_turn_again_and_keeps_it() {
     let handle = crate::session_store::test_handle(6);
@@ -983,7 +929,6 @@ fn result_reads_a_missed_reply_of_its_turn_again_and_keeps_it() {
     );
     assert_eq!(cmd_result(ctx, 6, ""), answer);
     assert_eq!(rev_and_bytes(), (rev + 1, 17), "read again no more");
-    // NEGATIVE CONTROL: only a later turn has a reply.
     let (path, rev) = run(
         "s-6-2",
         &format!("{prompt}\n{later}\n{}\n", reply.replace("a-1", "a-2")),
@@ -999,13 +944,7 @@ fn result_reads_a_missed_reply_of_its_turn_again_and_keeps_it() {
 /// A TURN INTO A FINISHED WORKER opens its task again at once
 /// ([`reopen_at_turn`]): typed by `aterm ctl`, a peer or the bridge, the
 /// `done` record its Enter found moves to `working why=turn` with the next
-/// rev, and a second such turn changes nothing more. NEGATIVE CONTROLS: the
-/// window harness's own turn (the live upgrade's READY notice) leaves `done`
-/// as it stands; a record in any other state, and a session with no task,
-/// are left alone; and so is a `done` the Enter did not find — the harness's
-/// `working` and `done` for this very turn landing before its submit was
-/// verified — which this turn's own reopen would otherwise hide from every
-/// `await task` past the rev it found.
+/// rev, and a second such turn changes nothing more.
 #[test]
 fn a_turn_into_a_done_worker_opens_it_again_unless_the_harness_typed_it() {
     let handle = crate::session_store::test_handle(7);
@@ -1017,7 +956,6 @@ fn a_turn_into_a_done_worker_opens_it_again_unless_the_harness_typed_it() {
             .task()
             .map(|r| (r.rev, r.state, r.why))
     };
-    // What an Enter finds: the entry into the state the record stands in.
     let found = || ctx.timeline.lock().unwrap().task().map(|r| r.entered);
     reopen_at_turn(ctx, 7, &TurnBy::Ctl, found());
     assert_eq!(state(), None, "no task: none made");
@@ -1041,8 +979,6 @@ fn a_turn_into_a_done_worker_opens_it_again_unless_the_harness_typed_it() {
         reopen_at_turn(ctx, 7, &by, found());
         assert_eq!(state().map(|s| s.1), Some(TaskState::Working), "{by:?}");
     }
-    // The Enter found a done; the harness's working and done for the turn
-    // land before its submit is verified: that done stands.
     mark_session_task(ctx, 7, &done("landed")).expect("unfenced");
     let entered = found();
     let mut turn = TaskMark::new(TaskState::Working);
@@ -1052,7 +988,6 @@ fn a_turn_into_a_done_worker_opens_it_again_unless_the_harness_typed_it() {
     let published = state();
     reopen_at_turn(ctx, 7, &TurnBy::Ctl, entered);
     assert_eq!(state(), published, "the done the Enter did not find stands");
-    // NEGATIVE CONTROL: the done it found opens.
     reopen_at_turn(ctx, 7, &TurnBy::Ctl, found());
     assert_eq!(state().map(|s| s.1), Some(TaskState::Working));
     mark_session_task(ctx, 7, &TaskMark::new(TaskState::Stalled)).expect("unfenced");
@@ -1065,13 +1000,7 @@ fn a_turn_into_a_done_worker_opens_it_again_unless_the_harness_typed_it() {
 /// race): a follow-up's Enter finds `done` at rev n, and before its submit is
 /// verified a `result` that read the turn again keeps the reply it found
 /// ([`repair_result`]: the same done, `result_bytes=` moved, rev n+1) — or
-/// the supervisor's attention is raised on it (n+2). The verified submit
-/// opens THAT done all the same, so the record reads `working why=turn` past
-/// the rev the turn's verdict names, and an `await task @w:<n>` armed on it
-/// waits for the follow-up's own done instead of answering at once with the
-/// re-mark (keyed on the rev alone, as the reopen first was, it missed: the
-/// record's rev is not n any more). NEGATIVE CONTROL: an entry the Enter did
-/// not find — the `working` before that done — opens nothing.
+/// the supervisor's attention is raised on it (n+2).
 #[test]
 fn a_done_marked_again_between_the_enter_and_the_submit_still_opens() {
     let handle = crate::session_store::test_handle(7);
@@ -1090,10 +1019,8 @@ fn a_done_marked_again_between_the_enter_and_the_submit_still_opens() {
     };
     mark_session_task(ctx, 7, &TaskMark::new(TaskState::Working)).expect("unfenced");
     mark_session_task(ctx, 7, &done).expect("unfenced");
-    // The Enter: its verdict will name rev n.
     let at_enter = record();
     let n = at_enter.rev;
-    // The lag repair, conditional on the record it read (`repair_result`).
     let repaired = TaskMark {
         result_bytes: 42,
         ..done.clone()
@@ -1114,25 +1041,19 @@ fn a_done_marked_again_between_the_enter_and_the_submit_still_opens() {
         (n + 2, TaskState::Done, at_enter.entered),
         "the same done, two revs on"
     );
-    // A waiter past n would answer at once on this: news.
     assert!(remarked.rev > n && remarked.has_news());
-    // NEGATIVE CONTROL: another entry than the one the Enter found.
     reopen_at_turn(ctx, 7, &TurnBy::Ctl, Some(at_enter.entered - 1));
     assert_eq!(
         record(),
         remarked,
         "an entry the Enter did not find opens nothing"
     );
-    // The verified submit opens the done its Enter found.
     reopen_at_turn(ctx, 7, &TurnBy::Ctl, Some(at_enter.entered));
     let opened = record();
     assert_eq!(
         (opened.rev, opened.state, opened.why),
         (n + 3, TaskState::Working, Some("turn"))
     );
-    // Past n the record is working with the attention a person must see —
-    // news only for that — and with it taken down nothing answers until the
-    // follow-up's own done.
     crate::session_timeline::write_attention_owned(
         ctx,
         crate::harness_host::ATTENTION_OWNER,
@@ -1152,8 +1073,7 @@ fn a_done_marked_again_between_the_enter_and_the_submit_still_opens() {
 /// THE REOPEN IS CONDITIONAL UNDER THE MARK'S OWN LOCKS
 /// ([`mark_session_task_if`]): the move to `working` applies only to the
 /// record as it stands when the mark lands, so an `exited` the host marked
-/// after the turn's first look stands. NEGATIVE CONTROL: the same mark over
-/// a record that still reads `done` moves it.
+/// after the turn's first look stands.
 #[test]
 fn a_conditional_mark_never_overwrites_a_state_that_landed_first() {
     let handle = crate::session_store::test_handle(7);
@@ -1178,7 +1098,6 @@ fn a_conditional_mark_never_overwrites_a_state_that_landed_first() {
             .map(|r| (r.rev, r.state))
     };
     assert_eq!(state(), Some((1, TaskState::Exited)), "the exit stands");
-    // NEGATIVE CONTROL: still `done`.
     mark_session_task(ctx, 7, &TaskMark::new(TaskState::Done)).expect("unfenced");
     let landed = mark_session_task_if(ctx, 7, &working, Duration::ZERO, is_done).expect("unfenced");
     assert_eq!(
@@ -1192,9 +1111,7 @@ fn a_conditional_mark_never_overwrites_a_state_that_landed_first() {
 /// worker by its record's state): the `working why=turn` a follow-up's
 /// verified submit opens lands after the ring of the screen it drew, and the
 /// held deadline's look must come for it — the live run of the held worker
-/// waited out its hang detector without it. NEGATIVE CONTROLS: the same
-/// state marked again (a lag repair's `result_bytes=`), a mark that changes
-/// nothing, and a conditional mark that does not land ring nothing.
+/// waited out its hang detector without it.
 #[test]
 fn a_record_entering_a_state_rings_the_host_and_a_re_mark_does_not() {
     let handle = crate::session_store::test_handle(7);
@@ -1211,7 +1128,6 @@ fn a_record_entering_a_state_rings_the_host_and_a_re_mark_does_not() {
     };
     assert_eq!(rung(&TaskMark::new(TaskState::Working)), 1, "a new record");
     assert_eq!(rung(&done), 1, "done entered");
-    // NEGATIVE CONTROLS.
     let repaired = TaskMark {
         result_bytes: 42,
         ..done.clone()
@@ -1231,7 +1147,6 @@ fn a_record_entering_a_state_rings_the_host_and_a_re_mark_does_not() {
         (None, 0),
         "a mark that did not land"
     );
-    // The follow-up's reopen enters `working` again: rung.
     reopen_at_turn(ctx, 7, &TurnBy::Ctl, Some(2));
     assert_eq!(
         rings() - before,
@@ -1244,9 +1159,7 @@ fn a_record_entering_a_state_rings_the_host_and_a_re_mark_does_not() {
 /// THE TASK WAKE (`docs/DESIGN-owner-surfaces-2026-10-16.md` §9 S3): exactly
 /// one `Wake::TaskChanged` per mark that moves the record or the supervisor's
 /// attention it carries, so the need verdict — a `stalled` task is a need —
-/// is published again on the main thread. NEGATIVE CONTROLS: a mark that
-/// changes nothing, a conditional mark that does not land, and a mark a
-/// committing update's fence holds back post none.
+/// is published again on the main thread.
 #[test]
 fn a_moving_mark_posts_one_task_wake_and_a_still_or_fenced_one_none() {
     let handle = crate::session_store::test_handle(9);
@@ -1267,10 +1180,6 @@ fn a_moving_mark_posts_one_task_wake_and_a_still_or_fenced_one_none() {
     );
     assert_eq!(mark(&stalled), [9], "a stall");
     assert_eq!(mark(&stalled), Vec::<u64>::new(), "the same mark again");
-    // A log wake another writer left owed (one that does not take its own,
-    // as a `human` after-mail mark written on a try-lock does), taken by the
-    // same mark again: the session's waiters wake for it, but the record did
-    // not move, so no need verdict is posted.
     let waiter = crate::session_watch::Subscription::single(&ctx.watchers);
     {
         let mut g = ctx.timeline.lock().unwrap();
@@ -1288,7 +1197,6 @@ fn a_moving_mark_posts_one_task_wake_and_a_still_or_fenced_one_none() {
         "the log's wake woke the session's waiters"
     );
     drop(waiter);
-    // The supervisor's attention carried by a mark, alone, moves the record.
     let raised = mark_session_task_with(
         ctx,
         9,
@@ -1301,7 +1209,6 @@ fn a_moving_mark_posts_one_task_wake_and_a_still_or_fenced_one_none() {
     .expect("it held");
     assert!(raised.attention_moved);
     assert_eq!(crate::presence::take_task_wakes(), [9]);
-    // A conditional mark that does not land.
     let landed = mark_session_task_if(
         ctx,
         9,
@@ -1312,7 +1219,6 @@ fn a_moving_mark_posts_one_task_wake_and_a_still_or_fenced_one_none() {
     .expect("unfenced");
     assert_eq!(landed, None);
     assert_eq!(crate::presence::take_task_wakes(), Vec::<u64>::new());
-    // A committing update's fence: the mark is refused, nothing moves.
     let fenced = crate::session_store::test_handle(10);
     let _ = fenced.ctx.fabric.fence_hold(false);
     assert!(

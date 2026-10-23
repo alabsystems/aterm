@@ -350,7 +350,7 @@ pub fn survey_rank<'a>(fields: impl IntoIterator<Item = (&'a str, &'a str)>) -> 
 
 /// True when `rank` is urgent (`Asking` or `Stalled`), keeping excerpts ahead of round-robin.
 #[must_use]
-pub fn survey_urgent(rank: u8) -> bool {
+pub const fn survey_urgent(rank: u8) -> bool {
     rank <= Class::Stalled as u8
 }
 
@@ -795,7 +795,7 @@ const EVERY_EXCERPT: u8 = 0b111;
 impl Shown {
     /// Show all session lines and excerpts for classes up to `upto` at `width`.
     fn all(blocks: &Blocks, upto: Class, width: usize) -> Shown {
-        fn entries(block: &Result<Block, String>) -> &[Entry] {
+        const fn entries(block: &Result<Block, String>) -> &[Entry] {
             match block {
                 Ok(block) => block.entries.as_slice(),
                 Err(_) => &[],
@@ -963,7 +963,7 @@ struct Fitted {
 }
 
 /// CLI flags suggested in the truncation footer.
-fn remedies(fleet: bool) -> &'static str {
+const fn remedies(fleet: bool) -> &'static str {
     if fleet {
         "--fleet with --budget, --sid <s> or --json"
     } else {

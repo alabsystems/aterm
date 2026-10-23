@@ -334,6 +334,8 @@ fn to_write(
 }
 
 /// What the vault wrote under a name of `held` that is none of `names` now, by the file it
+/// wrote: an entry respelled by case lands on that file on a case-insensitive volume, and
+/// keeps its history there.
 fn history<'m>(
     home: &Path,
     names: &BTreeSet<&str>,
@@ -359,10 +361,14 @@ struct Places<'a> {
     home: &'a Path,
     secrets: &'a Path,
     /// `~/.secrets` made private, or why it was refused (a symlink, not a directory, another
+    /// user's): the reason every entry that lands there, and every move aside, fails with.
     secrets_ok: Result<(), String>,
     /// What moved-aside copies are named by ([`aside_name`]).
     now: u64,
     /// aterm's own key and state directory (`~/.config/aterm/secrets`, links followed) by
+    /// (device, inode): a home path that reaches it by another spelling (through the real
+    /// directory a symlinked `~/.config` names) is refused as a symlinked directory is, so no
+    /// entry lands on the machine key or the manifest.
     own: Option<(u64, u64)>,
 }
 
@@ -381,6 +387,7 @@ impl<'a> Places<'a> {
     }
 
     /// Make entry `name`'s directory ready to write in: `~/.secrets` for a file name, the
+    /// directories between home and the file for a home path ([`make_parents`]).
     fn prepare(&self, name: &str) -> Result<(), String> {
         match name.strip_prefix("~/") {
             Some(rel) => make_parents(self.home, rel, self.own),
@@ -389,6 +396,7 @@ impl<'a> Places<'a> {
     }
 
     /// Whether entry `name`'s file is reached without a symlinked directory, aterm's own, or
+    /// a refused `~/.secrets` on the way.
     fn reachable(&self, name: &str) -> bool {
         match name.strip_prefix("~/") {
             Some(rel) => refused_dir(self.home, rel, self.own).is_none(),
@@ -402,23 +410,29 @@ enum Placed {
     Written,
     Unchanged,
     /// A plain entry whose target, a file the vault never wrote, already held its value:
+    /// narrowed and kept, and still the machine's own (out of the manifest), so dropping the
+    /// entry leaves it and a new value moves it aside first.
     Adopted,
     /// An ` if-absent` entry whose target, or anchor, is the machine's own.
     Left,
     /// An anchored ` if-absent` entry whose file the vault wrote and whose anchor is the
+    /// machine's own: taken back, as a dropped entry is.
     Withdrawn,
     /// An anchored ` if-absent` entry whose file the vault wrote and whose anchor could not
+    /// be looked at: left as it is, and still the vault's.
     Held,
 }
 
 /// How an ` if-absent` entry's file stands, with whatever it is anchored to ([`standings`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Standing {
-    /// The vault's: a gap, or a file still holding what the vault wrote. As an anchor, it
+    /// The vault's: a gap, or a file still holding what the vault wrote.
     Vaults,
     /// The machine's own: a file the vault never wrote or that changed since, a link, a
+    /// directory.
     Own,
     /// Not looked at (seen only through a symlinked or refused directory, or an error):
+    /// as an anchor, it lets nothing be written and takes nothing back.
     Unseen,
 }
 
@@ -433,6 +447,7 @@ enum Judged {
 }
 
 /// Place one entry at `target`, whose directory [`Places::prepare`] made ready; `Err` is
+/// the reason it was not written (a path and an OS error at most, never a value).
 fn place(
     places: &Places<'_>,
     entry: &Entry,
@@ -477,6 +492,7 @@ fn place(
 }
 
 /// Place an ` if-absent` entry at `target`, which holds `kind`, given how it stands
+/// ([`standings`]: its own file, then its anchors).
 fn fill(
     target: &Path,
     kind: Kind,
@@ -519,6 +535,7 @@ fn fill(
 }
 
 /// How each ` if-absent` entry of `entries` stands, its anchors counted: an anchored entry
+/// goes by its anchor's standing ([`apply`]).
 fn standings<'a>(
     places: &Places<'_>,
     entries: &'a [Entry],
@@ -575,6 +592,7 @@ fn standings<'a>(
 }
 
 /// Whether a plain entry's target is a regular file the vault never wrote (`wrote` is
+/// `None`) that already holds the entry's value: adopted, never written.
 fn adoptable(target: &Path, entry: &Entry, wrote: Option<&String>) -> bool {
     !entry.if_absent
         && wrote.is_none()
@@ -614,6 +632,7 @@ fn judge(target: &Path, value: &[u8], held: Option<&String>) -> Judged {
 }
 
 /// The digest of the regular file at `target`, if it can be read and is not larger than a
+/// value.
 fn file_digest(target: &Path) -> Option<String> {
     let bytes = fsx::read_public(target, text::MAX_VALUE).ok()??;
     let bytes = SecretBytes::new(bytes);
@@ -621,6 +640,8 @@ fn file_digest(target: &Path) -> Option<String> {
 }
 
 /// Narrow an adopted file this user owns to 0600 when group or other bits are set, through a
+/// descriptor opened without following a link: a link swapped in since the look is refused,
+/// and what it names keeps its mode.
 fn narrow(target: &Path) -> Result<(), String> {
     let at = |error: std::io::Error| format!("{}: {error}", target.display());
     let file = std::fs::OpenOptions::new()
@@ -649,7 +670,7 @@ fn parents(home: &Path, rel: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Create the missing directories between home and home path `rel`'s file at 0700. An
+/// Create the missing directories between home and home path `rel`'s file at 0700.
 fn make_parents(home: &Path, rel: &str, own: Option<(u64, u64)>) -> Result<(), String> {
     for dir in parents(home, rel) {
         match fsx::kind(&dir).map_err(|error| error.0)? {
@@ -682,6 +703,7 @@ fn make_parents(home: &Path, rel: &str, own: Option<(u64, u64)>) -> Result<(), S
 }
 
 /// The first directory between home and home path `rel`'s file that is a symlink, or aterm's
+/// own directory (`own`, [`Places`]), if any.
 fn refused_dir(home: &Path, rel: &str, own: Option<(u64, u64)>) -> Option<PathBuf> {
     for dir in parents(home, rel) {
         match fsx::kind(&dir) {
@@ -694,6 +716,7 @@ fn refused_dir(home: &Path, rel: &str, own: Option<(u64, u64)>) -> Option<PathBu
 }
 
 /// Whether a directory between home and home path `name`'s file is a file (or another
+/// non-directory), so nothing can be at that path.
 fn under_a_file(home: &Path, name: &str) -> bool {
     name.strip_prefix("~/").is_some_and(|rel| {
         parents(home, rel)
@@ -703,6 +726,8 @@ fn under_a_file(home: &Path, name: &str) -> bool {
 }
 
 /// Wipe what a pass cut short while writing `digest` left beside `target`: a temp, named as
+/// `aterm_uds::atomic_file` names one (`.<file>.tmp.<pid>.<hex>`), that holds that value, so
+/// another writer's temp is never touched.
 fn sweep_temps(target: &Path, digest: &str) {
     let (Some(dir), Some(file)) = (target.parent(), target.file_name()) else {
         return;
@@ -727,6 +752,7 @@ fn sweep_temps(target: &Path, digest: &str) {
 }
 
 /// Move `target` to `~/.secrets/.replaced/<`[`aside_name`]`>` (or that with `.1`, `.2`, …
+/// when taken), never replacing anything there.
 fn move_aside(places: &Places<'_>, name: &str, target: &Path) -> Result<PathBuf, String> {
     places.secrets_ok.clone()?;
     let dir = places.secrets.join(REPLACED_DIR);
@@ -1505,6 +1531,8 @@ mod tests {
     const PROFILE: &str = "~/.aterm/release-credentials.toml";
 
     /// The release identity as the vault carries it, sorted by name as a merge leaves it:
+    /// a ring, the key anchored to machine.toml, machine.toml to the profile and the profile
+    /// to the key, so any one of them the machine's own keeps the other two away.
     fn identity(value: &[u8]) -> [Entry; 3] {
         [
             anchored(KEY, value, TOML),

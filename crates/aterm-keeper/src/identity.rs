@@ -17,6 +17,8 @@ pub const CODE_CHECK_HANG: Duration = Duration::from_secs(60);
 pub const PEER_CHECK_HANG: Duration = Duration::from_secs(10);
 
 /// The words for a check `trustd` did not answer — at its deadline, or at once
+/// because an earlier check (of any kind, sharing the gate) is overdue — so
+/// they claim no wait.
 fn unanswered(what: &str) -> String {
     format!("macOS's code-signing service (trustd) is not answering; {what} was not checked")
 }
@@ -28,6 +30,7 @@ const THE_PEERS_CODE: &str = "the peer's code";
 #[cfg(target_vendor = "apple")]
 enum GateRefusal {
     /// `trustd` did not answer: at the deadline, or at once because an earlier
+    /// check sharing the gate is overdue.
     Unanswered(String),
     /// The check could not run at all (no thread, or it panicked).
     Failed(String),
@@ -43,6 +46,7 @@ impl From<GateRefusal> for String {
 }
 
 /// `work`, a code check that waits on `trustd`, through the process's one
+/// `trustd` gate: suspect after `suspect`, abandoned at `deadline`.
 #[cfg(target_vendor = "apple")]
 fn through_trust_gate<T: Send + 'static>(
     suspect: Duration,
@@ -83,6 +87,7 @@ pub struct PeerCheck(PeerCheckState);
 #[derive(Debug)]
 enum PeerCheckState {
     /// Settled without waiting on `trustd`: the uid floor, a peer the kernel did not name, a
+    /// gate that refused at once, or no code requirement in force.
     Settled(Result<(), CheckError>),
     /// Waiting on `trustd`.
     #[cfg(target_vendor = "apple")]
@@ -90,7 +95,7 @@ enum PeerCheckState {
 }
 
 impl PeerCheck {
-    fn settled(answer: Result<(), CheckError>) -> Self {
+    const fn settled(answer: Result<(), CheckError>) -> Self {
         Self(PeerCheckState::Settled(answer))
     }
 
@@ -250,7 +255,7 @@ impl Identity {
 
     /// The policy in force.
     #[must_use]
-    pub fn policy(&self) -> IdentityPolicy {
+    pub const fn policy(&self) -> IdentityPolicy {
         self.policy
     }
 
@@ -314,6 +319,7 @@ impl Identity {
     }
 
     /// The peer check, its code check (if one is in force) started through the process's
+    /// `trustd` gate with `suspect` as its suspect age.
     fn begin_check(
         &self,
         stream: &CtlStream,
@@ -514,6 +520,7 @@ mod sec {
     }
 
     /// The designated requirement of `code` (a static or a running code
+    /// object), and its text.
     #[cfg_attr(trust_verify, trust::skip)]
     fn designated_requirement_of(code: &Owned) -> Result<(Owned, String), String> {
         let mut req: CFTypeRef = std::ptr::null();
@@ -653,6 +660,8 @@ mod tests {
     const WITHIN: Duration = Duration::from_secs(60);
 
     /// `trustd` going silent after the one probe above refuses every later
+    /// check through the gate: the machine's moment, never the code's verdict,
+    /// so it is neither a pass nor a refusal a negative control may count.
     const TRUSTD_SILENT: &str =
         "COULD NOT RUN: the process trustd gate was silent — the machine's, not the code's";
 
@@ -665,6 +674,7 @@ mod tests {
     }
 
     /// [`Identity::admits_code_at`]'s `r`, unless the gate refused it
+    /// unanswered (its words are [`unanswered`]'s).
     fn answered(r: Result<(), String>) -> Result<(), String> {
         if let Err(why) = &r
             && why.starts_with("macOS's code-signing service (trustd) is not answering")
@@ -675,6 +685,7 @@ mod tests {
     }
 
     /// This process satisfies its own requirement: a socketpair's peer is
+    /// ourselves, and the designated check passes.
     #[test]
     fn a_process_satisfies_its_own_requirement() {
         aterm_uds::deadline::require_trust_service();
@@ -693,6 +704,7 @@ mod tests {
     }
 
     /// A held token is judged as the process it names: the token read from the connection
+    /// passes.
     #[test]
     fn a_held_token_is_checked_as_the_process_it_named() {
         aterm_uds::deadline::require_trust_service();
@@ -720,6 +732,7 @@ mod tests {
     }
 
     /// The code a keeper re-runs from is checked as a peer would check it: this test binary's
+    /// file and a byte-for-byte copy pass.
     #[test]
     fn code_on_disk_is_checked_against_the_requirement() {
         aterm_uds::deadline::require_trust_service();
@@ -746,6 +759,8 @@ mod tests {
     }
 
     /// A stated requirement for another build's code (the Developer ID requirement pinned to a
+    /// team, as an update candidate meets it): this ad-hoc test binary is refused, never
+    /// unchecked, and text that is no requirement is refused when compiled.
     #[test]
     fn a_stated_requirement_refuses_code_that_does_not_meet_it() {
         aterm_uds::deadline::require_trust_service();
@@ -772,6 +787,7 @@ mod tests {
     }
 
     /// The code at a path, as its own designated requirement: this test binary passes, and the
+    /// same process against `/usr/bin/true`'s code is refused.
     #[test]
     fn the_code_at_a_path_admits_exactly_its_own_processes() {
         aterm_uds::deadline::require_trust_service();
@@ -802,6 +818,7 @@ mod tests {
     }
 
     /// `nc -U` dials a listener here: its audit token names `nc`, which fails the designated
+    /// check and passes the floor.
     #[test]
     fn another_program_fails_the_designated_check() {
         aterm_uds::deadline::require_trust_service();

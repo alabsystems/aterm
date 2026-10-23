@@ -1,22 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! EVERY NEED WHOLE (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.1,
-//! §12.2.3 item 4, §12.2.6): the window reads the worker's NEEDS
-//! YOU set its loop told it wherever that set was told
-//! with the needs entry that stands, and says every need whole where there is
-//! room — the menu bar's Needs you section, a row one level in for each
-//! further need, the tab's hover, a line each — through the one published
-//! verdict (`needs::attention_outcome`, `App::need_facts_with`).
-//!
-//! A real headless App's session 0 stands as a Claude Code; the loop's tell
-//! is the live hook (`store_needs`) over the App's store, and its request is
-//! the entry written as `meta set attention owner=needs kind=ask` writes it.
-//! The menu is read as `chrome` prints it (`App::status_item_chrome_lines`),
-//! the hover as the strip is stamped with it (`App::presence_hover`). Each
-//! test names its NEGATIVE CONTROL: the mutant it was run against, and what
-//! failed.
-
+//! Tests for rendering full `NEEDS YOU` sets in the status menu, tab hover, and session rows (`needs::attention_outcome`).
 use aterm_types::needs::AttentionKind;
 
 use super::*;
@@ -129,11 +114,7 @@ fn hover(app: &App) -> Vec<String> {
 /// THE HOVER LISTS EVERY NEED WHOLE (§12.2.1, §12.2.6): with (a) and (b)
 /// told and their entry up, the tab's hover says `Needs you: <need>` for
 /// each, whole — (a) at its 144 characters, past the entry's 64 cells — then
-/// `Claude Code carries on meanwhile`, and never `Needs attention:`. Where
-/// the window holds only the entry's parse (no set told with it), it says
-/// the one need it has, cut, with ` (+1 more)`. NEGATIVE
-/// CONTROL (run as a mutant for the landing): `harness_need_hover` saying
-/// the first need alone (2a's one line) drops (b)'s line.
+/// `Claude Code carries on meanwhile`, and never `Needs attention:`.
 #[test]
 fn the_hover_lists_every_need_whole() {
     let (mut app, sid, ctx) = desk();
@@ -156,8 +137,6 @@ fn the_hover_lists_every_need_whole() {
         !lines.iter().any(|l| l.starts_with("Needs attention")),
         "{lines:#?}"
     );
-    // An entry no set was told with (a loop before this build's, a
-    // successor's carried entry): the parse's one line.
     let (mut app, _, ctx) = desk();
     land(&mut app, &ctx, Some(ENTRY_AB));
     let lines = hover(&app);
@@ -177,9 +156,7 @@ fn the_hover_lists_every_need_whole() {
 /// THE ROW'S STATE LINE SAYS THE FIRST NEED WHOLE (§12.2.1's SESSIONS row):
 /// with (a) and (b) told and their entry up, session 0's state line on
 /// Settings ▸ Harness leads with `needs you: <(a) whole> (+1 more); carrying
-/// on` — the page draws no row for (b), so it counts it. NEGATIVE CONTROL
-/// (run as a mutant for the landing): `harness_ask` ignoring the told set
-/// leaves (a) at the entry's 64 cells.
+/// on` — the page draws no row for (b), so it counts it.
 #[test]
 fn the_rows_state_line_says_the_first_need_whole() {
     let (mut app, sid, ctx) = desk();
@@ -203,11 +180,7 @@ fn the_rows_state_line_says_the_first_need_whole() {
 /// `[a, b]` up, then `[a, c]` told under the very same entry text — which
 /// no server write announces — moves the published verdict (its key
 /// unchanged: one need, one age, one notice), the menu's row one level in
-/// from (b) to (c), and the hover; `status needs_n=` counts the set. The
-/// session's own row reads (a) clipped with its age, and no ` (+N more)`,
-/// since its other need has a row. NEGATIVE CONTROL (run as a mutant for
-/// the landing): `harness_ask` ignoring the told set leaves the menu with
-/// no row one level in and the session's row `(+1 more)`.
+/// from (b) to (c), and the hover; `status needs_n=` counts the set.
 #[test]
 fn a_set_that_moves_under_the_same_entry_moves_what_is_drawn() {
     let (mut app, sid, ctx) = desk();
@@ -260,9 +233,7 @@ fn a_set_that_moves_under_the_same_entry_moves_what_is_drawn() {
 /// still the old set's, and every surface keeps saying the old set whole —
 /// at a change of the set (`[a, b]` to `[b]`) and at the take-down — then
 /// the new one whole the moment its request lands, never the old entry's
-/// 64 cells in between. NEGATIVE CONTROL (run as a mutant for the landing):
-/// `NeedFacts::told_needs` reading the set told last alone (no outgoing
-/// set) draws (a) cut, with ` (+1 more)` and no row for (b), in the gap.
+/// 64 cells in between.
 #[test]
 fn the_outgoing_set_is_never_drawn_cut() {
     let (mut app, sid, ctx) = desk();
@@ -270,8 +241,6 @@ fn the_outgoing_set_is_never_drawn_cut() {
     tell(&mut app, &sid, &[NEED_A, NEED_B], ENTRY_AB);
     land(&mut app, &ctx, Some(ENTRY_AB));
     let whole = needs_lines(&app);
-    // The next report names (b) alone: told, its `meta set` not landed. A
-    // publication in the gap (any fact, here the session's own refresh).
     tell(&mut app, &sid, &[NEED_B], ENTRY_B);
     app.refresh_presence_session(0);
     assert_eq!(
@@ -291,7 +260,6 @@ fn the_outgoing_set_is_never_drawn_cut() {
         first_line(&app).contains(&format!(" \u{2014} {NEED_B} \u{b7} ")),
         "{lines:#?}"
     );
-    // The take-down: told, its `unset` not yet landed.
     tell(&mut app, &sid, &[], "");
     app.refresh_presence_session(0);
     assert!(
@@ -308,8 +276,6 @@ fn the_outgoing_set_is_never_drawn_cut() {
 /// stand-in for the person presses the row one level in by the path
 /// `chrome` prints for it (`person menubar press <at>`); the click it posts
 /// brings that session's tab in front, as a click on its own row does.
-/// NEGATIVE CONTROL (run as a mutant for the landing): rows one level in
-/// built as information lines answer `not an action`, and nothing moves.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_press_on_a_further_needs_row_brings_its_tab_in_front() {
@@ -396,14 +362,7 @@ fn live_desk() -> (App, String, Arc<crate::SessionCtx>) {
 
 /// THE STAMPED HOVER FOLLOWS A SET THAT MOVES UNDER ONE ENTRY (§12.2.1; the
 /// review of 2d): the tab's hover is composed only where a strip is
-/// stamped, and a refresh stamps only where the pill's words moved. `[a,
-/// b]` to `[a, c]` under the same entry leaves the pill (still (a) and one
-/// more), so the Needs fact stamps the strip ONCE itself, and the stamped
-/// hover says (c), never (b); a tell that moves the pill too (`[a, b, c]`:
-/// two more) is stamped once, by the refresh alone. NEGATIVE CONTROLS (run
-/// as mutants for the landing): the Needs arm refreshing alone (2c's)
-/// stamps nothing, and the hover keeps (b); the arm stamping whatever the
-/// refresh did stamps the pill's move twice.
+/// stamped, and a refresh stamps only where the pill's words moved.
 #[test]
 fn the_stamped_hover_follows_a_set_under_one_entry() {
     let (mut app, sid, ctx) = live_desk();
@@ -423,8 +382,6 @@ fn the_stamped_hover_follows_a_set_under_one_entry() {
         "stamps={stamps}; the stamped hover: {now}"
     );
     assert_eq!(stamps, 1, "one stamp for the set's move: {now}");
-    // A third need: the pill's words move (`2 more needs`), so the
-    // refresh stamps, and the Needs arm adds none.
     tell(&mut app, &sid, &[NEED_A, NEED_B, NEED_C], ENTRY_AB);
     let stamps = crate::work_counts::take_tooltip_pushes();
     let now = stamped_hover();
@@ -441,8 +398,7 @@ fn the_stamped_hover_follows_a_set_under_one_entry() {
 /// it carried, which no server write announces, and the pill reads the same
 /// (the first need and one more); the Needs fact stamps the strip once, and
 /// the stamped hover moves from the parse's one line (`(+1 more)`) to a line
-/// each. NEGATIVE CONTROL (run as a mutant for the landing): the Needs arm
-/// refreshing alone (2c's) stamps nothing, and the hover keeps `(+1 more)`.
+/// each.
 #[test]
 fn the_stamped_hover_follows_a_first_tell_beside_a_standing_entry() {
     const SHORT_A: &str = "sign the release";
@@ -469,12 +425,7 @@ fn the_stamped_hover_follows_a_first_tell_beside_a_standing_entry() {
 /// item 5; the W4 title slice): the title says the first need whole and how
 /// many more (`harness_glass::need_title`), so the session's trail
 /// generation — which rebuilds a title being read — moves where those move:
-/// the need's first tell, a new first need, the take-down. A set that moves
-/// under the same entry with its first need and its count kept moves the
-/// published verdict (CONTROL) but not the title's words, and a publish
-/// with nothing moved moves nothing; at rest the footer's term keys none of
-/// it. NEGATIVE CONTROL (as run): the bump on every verdict move
-/// (`set_need`'s `moved`) moves the generation at the kept set.
+/// the need's first tell, a new first need, the take-down.
 #[test]
 fn the_title_follows_the_needs_words_and_nothing_else() {
     use crate::claude_lights::glass_bits;
@@ -519,10 +470,7 @@ fn the_title_follows_the_needs_words_and_nothing_else() {
 /// each present, and the Autopilot chip's description with it
 /// (`App::autopilot_spoken`), so the need it reads is lent under the
 /// session's lock, never copied: nine needs told cost the description what
-/// two do, though it reads the nine (CONTROL: `And 8 more`). NEGATIVE
-/// CONTROL (as run): `autopilot_spoken` reading `title_words_of`'s copy
-/// costs one allocation more for each further need (25 for nine against
-/// 18 for two).
+/// two do, though it reads the nine (CONTROL: `And 8 more`).
 #[test]
 fn the_chips_description_costs_no_more_for_nine_needs_than_for_two() {
     use crate::autopilot::AutopilotView;

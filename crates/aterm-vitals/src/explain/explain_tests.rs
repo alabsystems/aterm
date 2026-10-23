@@ -85,10 +85,6 @@ const STARTUP: CauseId = CauseId::Context(Context::Startup);
 /// RD's 10:32 moment: Spotlight covers `mds` and `mds_stores`, 1420 of 3300
 /// (over the floor's 500 and 330), 722 ‰ deferred, and runs after start-up:
 /// all its CPU is from leads born within a minute of userspace's start.
-/// Nothing else holds: `siriactionsd` (0.66, the user's) is not the busiest
-/// coalition outside aterm's, tab 1's 0.20 and aterm's own 0.20 are under the
-/// floor, and no part holds a core no cause covers (services 0.75, others
-/// 0.73, aterm 0.40): nothing is unexplained.
 #[test]
 fn spotlight_holds_on_its_vouched_members_after_start_up() {
     let s = snap(&spotlight_1032());
@@ -129,9 +125,7 @@ fn spotlight_holds_on_its_vouched_members_after_start_up() {
 }
 
 /// The liar: `mds` and `mds_stores` under ad-hoc signatures with Apple's
-/// signing ids. NEGATIVE: no Spotlight; with no cause holding, services'
-/// 2.17 busy cores are unexplained, after start-up by CPU. A lead with no
-/// identity read (no voucher) matches nothing either.
+/// signing ids.
 #[test]
 fn a_claimed_signing_id_never_names_an_activity() {
     let s = snap(&liar_1032());
@@ -153,11 +147,6 @@ fn a_claimed_signing_id_never_names_an_activity() {
         "unknown is not Apple"
     );
 
-    // The liar as `probes/liar` ran it, as the user, but leading its own
-    // coalition (a launch agent's) at 2.00 cores beside the real Spotlight:
-    // the busiest coalition outside aterm's, the user's work, never
-    // Spotlight's. Two covering causes rank by what they cover, and the
-    // larger is the headline.
     let mut own = spotlight_1032();
     own.busy_mc += 2000;
     own.coalitions.push(Coal {
@@ -197,13 +186,7 @@ fn a_claimed_signing_id_never_names_an_activity() {
 /// Tab 2's build 20 minutes after start-up, the boot daemons idle-busy:
 /// tab 2's work is the cause and never "after start-up", though userspace
 /// is young and every daemon was born with it; `mds` at 0.30 and 80 %
-/// deferred holds Spotlight's terms but not the floor. Services' 1.70 cores
-/// are unexplained, and not start-up's by CPU though four of their five
-/// coalitions are by count; aterm's 0.50 the build leaves is under a core.
-/// Neither cause is a named activity, so aterm offers no step. NEGATIVE:
-/// tab 1's 0.20 opens nothing, nor does tab 1 at the 10:32 moment; nor tab 1
-/// at 0.60, or `mds` at 0.60, each over 500 mc but under a tenth of the busy
-/// figure.
+/// deferred holds Spotlight's terms but not the floor.
 #[test]
 fn a_tabs_work_is_its_cause_and_never_after_start_up() {
     let s = snap(&tab2_build_1048());
@@ -221,8 +204,6 @@ fn a_tabs_work_is_its_cause_and_never_after_start_up() {
             part: Part::Services
         }
     );
-    // A tab's or aterm's work holds no coalition for start-up to weigh; the
-    // gate keeps it out should it ever carry one.
     assert!(!CauseId::TabWork(2).takes_start() && !CauseId::AtermWork.takes_start());
     let a = account(WhySubject::Cpu, Some(2), &s);
     assert_eq!(a.headline, Some((CauseId::TabWork(2), None)));
@@ -241,11 +222,7 @@ fn a_tabs_work_is_its_cause_and_never_after_start_up() {
 
 /// A tab's work above the floor beside a larger load no cause names:
 /// services' uncovered 3.79 cores are unexplained and the headline, never
-/// the tab's 0.72, which is minor (RD §5.3). So beside a named activity:
-/// 3.40 cores of aterm's that no cause covers (3.00 of work that finished
-/// between sweeps, and tab 1's and aterm's own live 0.20 each, under the
-/// floor, as a small coalition's work stays in its part's) outrank
-/// Spotlight's 1.42, and, aterm's, are never start-up's.
+/// the tab's 0.72, which is minor (RD §5.3).
 #[test]
 fn a_small_cause_never_stands_for_a_large_uncovered_load() {
     let s = snap(&busier(busier(calm_1510(), 1210, 600), 430, 3600));
@@ -270,8 +247,7 @@ fn a_small_cause_never_stands_for_a_large_uncovered_load() {
     );
 }
 
-/// aterm itself as the largest part above the floor. NEGATIVE: at 10:32,
-/// aterm's own 0.20.
+/// aterm itself as the largest part above the floor.
 #[test]
 fn aterm_work_holds_when_aterm_itself_is_the_largest_part() {
     let mut scene = calm_1510();
@@ -290,14 +266,12 @@ fn aterm_work_holds_when_aterm_itself_is_the_largest_part() {
     assert_eq!(causes(&s), [CauseId::AtermWork]);
     assert_eq!(cause(&s, CauseId::AtermWork).covers_mc, 1500);
     assert!(!causes(&snap(&spotlight_1032())).contains(&CauseId::AtermWork));
-    // Over the floor but under services' 2.10: unexplained, not aterm's.
     let under = snap(&busier(scene, 430, 1910));
     assert_eq!(causes(&under), [CauseId::Unexplained]);
 }
 
 /// The busiest coalition outside aterm's, led by the user's app: app-work,
-/// since its lead's birth. NEGATIVE: at 10:32 `siriactionsd` (the user's,
-/// 0.66, over the floor) is not the busiest: `mds` is.
+/// since its lead's birth.
 #[test]
 fn app_work_is_the_busiest_coalition_outside_aterm_led_by_the_user() {
     let mut scene = calm_1510();
@@ -333,8 +307,6 @@ fn app_work_is_the_busiest_coalition_outside_aterm_led_by_the_user() {
             .iter()
             .all(|c| !matches!(c, CauseId::AppWork(_)))
     );
-    // 10 minutes after start-up, Caffeine born in its first minute: an
-    // app's work is never "after start-up".
     scene.at_ms = Some(USERSPACE_MS + 600_000);
     let young = snap(&scene);
     assert_eq!(causes(&young), [CauseId::AppWork(896)]);
@@ -358,9 +330,7 @@ fn a_calm_mac_holds_no_cause() {
 }
 
 /// `wake`: 2 minutes after a wake that restarted nothing, with a core of
-/// Spotlight's work deferred (931 + 94 mc). NEGATIVE: 110 minutes after
-/// (the wrapped moment as read), and at 10:32, where `startup` holds and
-/// carries the wake.
+/// Spotlight's work deferred (931 + 94 mc).
 #[test]
 fn wake_holds_after_a_wake_when_start_up_does_not() {
     let mut scene = wrapped_1218();
@@ -385,7 +355,6 @@ fn wake_holds_after_a_wake_when_start_up_does_not() {
     let old = snap(&wrapped_1218());
     assert_eq!(causes(&old), [SPOTLIGHT], "neither start-up nor a wake");
     assert!(!causes(&snap(&spotlight_1032())).contains(&CauseId::Context(Context::Wake)));
-    // Under a core deferred (880 + 94 mc, still 686 ‰): no wake.
     for c in scene.coalitions.iter_mut().filter(|c| c.id == 307) {
         c.deferred_mc = 880;
     }
@@ -395,8 +364,7 @@ fn wake_holds_after_a_wake_when_start_up_does_not() {
 /// `startup` is weighed by CPU, never by count: Spotlight with
 /// `corespotlightd` restarted after start-up's first minute covers three
 /// coalitions, two of them start-up's, but only 1.42 of its 3.42 cores, so
-/// it runs since the wake instead. `corespotlightd`, the user's and the
-/// busiest coalition outside aterm's, is Spotlight's, never an app's.
+/// it runs since the wake instead.
 #[test]
 fn start_up_is_weighed_by_cpu_never_by_count() {
     let s = snap(&spotlight_late_1032());
@@ -425,8 +393,7 @@ fn a_wrapped_pid_space_moves_neither_the_start_nor_a_name() {
 }
 
 /// The machine's contexts hold for every covering cause, and alone: memory
-/// pressure at warn, and a thermal throttle or Low Power Mode. Memory's only
-/// cause is the pressure. NEGATIVE: normal pressure, no throttle.
+/// pressure at warn, and a thermal throttle or Low Power Mode.
 #[test]
 fn pressure_and_throttle_are_contexts_of_the_machine() {
     let mut scene = spotlight_1032();
@@ -487,9 +454,7 @@ fn pressure_and_throttle_are_contexts_of_the_machine() {
 /// With the lane off no coalition is read: the facts are by subtraction, no
 /// covering cause can hold, and the reply says why, on macOS and on an OS
 /// with no coalitions alike; the machine's contexts still hold, and the
-/// first is the headline. NEGATIVE: with memory's pressure unread (Linux
-/// with no PSI) or the thermal state (no thermal zone), `pressure` or
-/// `throttled` may hold unseen, so the CPU's reply knows nothing needless.
+/// first is the headline.
 #[test]
 fn with_the_lane_off_only_the_machines_contexts_hold() {
     for lane in [CoalLane::Off, CoalLane::Unsupported] {
@@ -552,8 +517,7 @@ fn with_the_lane_off_only_the_machines_contexts_hold() {
 /// process's owner, so no split is ever made, by coalition or by
 /// subtraction, and no facts are; memory pressure at warn and a light
 /// throttle are the CPU's causes all the same, nothing is known needless,
-/// and the lane is said. Memory reads its pressure off the snapshot. With
-/// nothing read at all, nothing is offered as needless either.
+/// and the lane is said.
 #[test]
 fn with_no_split_the_machines_contexts_still_hold() {
     let scene = Scene {
@@ -693,7 +657,6 @@ fn a_deferred_share_is_of_the_qos_buckets_and_never_past_one() {
 
 /// An episode opens on its second consecutive split tick, `since` from its
 /// evidence; a cold pull's first window prints its cause with no `opened=`.
-/// The clause shows 10 s after the episode opened.
 #[test]
 fn spotlight_opens_on_its_second_tick_and_the_clause_ten_seconds_on() {
     let snaps = ticks(&spotlight_1032(), 5, None);
@@ -813,7 +776,6 @@ fn a_cut_sweep_neither_opens_nor_closes_a_tabs_work() {
     assert!(e.step(55_000, 0, &[], false).iter().any(|o| o.id == tab));
     assert_eq!(e.step(85_000, 0, &[], false), [], "30 s failing, whole");
 
-    // Through the model: tab 2's build swept whole, then cut, then whole.
     let mut v = Vitals::new();
     let mut series = tab2_build_1048().series(3);
     series[4].procs_truncated = true;
@@ -832,7 +794,6 @@ fn after_a_gap_the_clause_waits_for_a_new_episode_and_its_hold() {
     let kept = [&all[..=10], &all[251..]].concat();
     let mut v = Vitals::new();
     let snaps: Vec<Snapshot> = kept.iter().map(|s| v.absorb(s)).collect();
-    // The split ticks at windows 1–5, then 126–130.
     let tick = |k: usize| &snaps[if k <= 5 { 2 * k } else { 2 * (k - 120) }];
     assert!(deck_cause(tick(5)).is_some());
     let base = tick(126).why.as_ref().expect("the last facts");
@@ -894,7 +855,6 @@ fn the_clause_shows_after_ten_seconds_and_goes_after_thirty() {
     }
     assert_eq!(h.step(45_000, &[], &split), None, "30 s failing");
 
-    // Its words change only once the new words have held 10 s.
     let mut h = ClauseHold::default();
     for at in [0, 5_000, 10_000] {
         h.step(at, &o, &split);
@@ -905,7 +865,6 @@ fn the_clause_shows_after_ten_seconds_and_goes_after_thirty() {
     let now = h.step(25_000, &plain, &split).expect("the new words");
     assert_eq!(now.context, None);
 
-    // Facts older than 15 s: it goes, and must hold 10 s again.
     let mut h = ClauseHold::default();
     for at in [0, 5_000, 10_000] {
         h.step(at, &o, &split);
@@ -913,9 +872,7 @@ fn the_clause_shows_after_ten_seconds_and_goes_after_thirty() {
     assert_eq!(h.step(26_000, &o, &split), None);
 }
 
-/// The clause's floor: a core and 40 % of the busy CPU outside aterm. 39 %,
-/// or 0.9 core, gives none; Spotlight at 42 % beside an app's work at 45 %
-/// gives none, and at 45 % beside 42 % the clause.
+/// The clause's floor: a core and 40 % of the busy CPU outside aterm.
 #[test]
 fn the_clause_needs_a_core_and_two_fifths_and_names_one_cause() {
     let shown = |o: &[OpenCause], split: &CoalSplit| {
@@ -951,9 +908,6 @@ fn the_clause_needs_a_core_and_two_fifths_and_names_one_cause() {
             "Spotlight is the largest"
         );
     }
-    // A positive residual counts outside aterm, a negative one does not:
-    // 1100 is 42 % of 2600, 38 % of 2600 + 300, and 38 % of 2900 less 300
-    // (42 % were it taken off).
     let residual = |services_mc: i64, unaccounted_mc: i64| CoalSplit {
         others_mc: 730,
         services_mc,
@@ -1070,8 +1024,6 @@ fn the_you_role_needs_a_whole_sweep_and_its_bound() {
         account(WhySubject::Mem, Some(1), &s).you.role,
         Role::Unavailable("truncated")
     );
-    // A whole sweep after a cut split tick: the CPU's role is still the
-    // tick's, whose tab figures the cut left short.
     let mut series = spotlight_1032().series(2);
     series[2].procs_truncated = true;
     let s = last(&series[..4]);
@@ -1098,8 +1050,6 @@ fn the_you_role_needs_a_whole_sweep_and_its_bound() {
     );
     assert!(f.cannot.contains(&("finished_tab_work", "not_sampled")));
     assert!(!a.cannot.contains(&("finished_tab_work", "not_sampled")));
-    // Tab 2's build with 1.00 core finished: main with it or without, so the
-    // role prints, its figure a bound.
     let mut build = tab2_build_1048();
     build.busy_mc += 1000;
     for c in build.coalitions.iter_mut().filter(|c| c.id == 1342) {
@@ -1140,9 +1090,6 @@ fn the_memory_account_reads_the_tabs_footprint() {
         ]
     );
 
-    // Tab 1's `claude` holding `fp` bytes and aterm itself `own`, of
-    // `used_gib` GiB used: the tab's role by its share, its rank and the
-    // floor (1 GiB and a tenth of used).
     let role = |fp: u64, own: u64, used_gib: u64| {
         let mut scene = spotlight_1032();
         for p in &mut scene.procs {
@@ -1189,9 +1136,6 @@ fn the_memory_account_reads_the_tabs_footprint() {
         "not the largest"
     );
 
-    // Beside `siriactionsd`'s and Finder's coalitions at `fp` bytes each:
-    // the tab is weighed against each coalition, never their sum (RD §3.2),
-    // and never as the largest beside one whose footprint is unread.
     let beside = |fp: Option<u64>| {
         let mut scene = spotlight_1032();
         for p in scene.procs.iter_mut().filter(|p| p.pid == 1210) {
@@ -1236,10 +1180,6 @@ fn a_bare_why_answers_for_what_deviates_most() {
         Bare::Subject(WhySubject::Cpu),
         "unread is never calm"
     );
-    // NEGATIVE: an unread deviation is never calm (memory unread; its
-    // pressure unknown, as on Linux with no PSI; its swap traffic unread;
-    // the thermal state unread): the larger share answers, memory's 13 %
-    // of 128 GiB over the cores' 2 %, or the cores' with memory unread.
     let unread = |edit: fn(&mut Scene)| {
         let mut scene = calm_1510();
         edit(&mut scene);
@@ -1272,7 +1212,6 @@ fn a_bare_why_answers_for_what_deviates_most() {
         ..Thermal::default()
     });
     assert_eq!(bare_subject(&snap(&hot)), Bare::Subject(WhySubject::Cpu));
-    // One core, 0.40 busy: no cause, not calm; the larger share answers.
     let mut small = calm_1510();
     small.cores = 1;
     let used = |app: u64| MemSample {
@@ -1286,7 +1225,6 @@ fn a_bare_why_answers_for_what_deviates_most() {
     small.mem = Some(used(10));
     assert_eq!(bare_subject(&snap(&small)), Bare::Subject(WhySubject::Cpu));
 
-    // Swap moving at normal pressure.
     let mut swapping = snap(&calm_1510());
     swapping.mem = Some(MemView {
         sample: used(10),
@@ -1297,22 +1235,16 @@ fn a_bare_why_answers_for_what_deviates_most() {
         ..MemView::default()
     });
     assert_eq!(bare_subject(&swapping), Bare::Subject(WhySubject::Mem));
-    // Low Power Mode is a throttle, as `throttled` reads it.
     let mut lpm = calm_1510();
     lpm.thermal = Some(Thermal {
         low_power: Some(true),
         ..Thermal::default()
     });
     assert_eq!(bare_subject(&snap(&lpm)), Bare::Subject(WhySubject::Cpu));
-    // Tab 1's 0.72 of 1.00 busy holds, under a core and a quarter of the
-    // cores: not calm, and memory's 13 % is the larger share.
     let held = snap(&busier(calm_1510(), 1210, 600));
     assert_eq!(causes(&held), [CauseId::TabWork(1)]);
     assert_eq!(bare_subject(&held), Bare::Subject(WhySubject::Mem));
 
-    // Spotlight's episode open while its cause fails (for 30 s, while the
-    // Deck still names it) on a calm-read machine 0.18 busy: not calm; once
-    // it closes, calm.
     let mut scene = spotlight_1032();
     let calm = calm_1510();
     (scene.mem, scene.thermal) = (calm.mem, calm.thermal);
@@ -1335,10 +1267,7 @@ fn a_bare_why_answers_for_what_deviates_most() {
 }
 
 /// A bare `sys why` with the lane on and no window read yet is never calm:
-/// the coalitions are unread, so no cause is known not to hold. At 10:32 on a
-/// calm-read machine, 18 % busy, a pull that answers before the lane's first
-/// window (its base tick, then a sweep) answers for the CPU, the larger
-/// share (RD §3.6).
+/// the coalitions are unread, so no cause is known not to hold.
 #[test]
 fn a_bare_why_before_the_lanes_first_window_is_never_calm() {
     let [base, sweep, _] = read_calm(spotlight_1032()).samples();
@@ -1389,8 +1318,7 @@ fn the_machines_contexts_are_the_snapshots_not_the_windows() {
 /// subtraction: a whole reading that makes none (an owner outside aterm
 /// unread, as on Linux) carries none, so the split and the tab's share read
 /// `not_sampled`, never the last reading's figures as if they were now (RD
-/// §3.2). No covering cause holds with the lane off, split or none, so the
-/// CPU's reply knows nothing needless as the bare `sys why` answers calm.
+/// §3.2).
 #[test]
 fn with_the_lane_off_a_reading_with_no_split_carries_no_facts() {
     let mut series = read_calm(Scene {
@@ -1418,8 +1346,7 @@ fn with_the_lane_off_a_reading_with_no_split_carries_no_facts() {
 }
 
 /// A tab the readings never read has no figure yet: on the CPU one opened
-/// after the last split tick, in memory one no sweep holds. Its role is
-/// `unavailable(warming)`, never `none` at 0, and its parts are not given.
+/// after the last split tick, in memory one no sweep holds.
 #[test]
 fn a_tab_no_reading_read_is_unread_never_none() {
     let mut series = read_calm(spotlight_1032()).series(2);
@@ -1436,7 +1363,6 @@ fn a_tab_no_reading_read_is_unread_never_none() {
         (m.you.role, m.you.figure, m.you.share_pm),
         (Role::Unavailable("warming"), None, None)
     );
-    // On a cut sweep `truncated` is judged first, the CPU's as memory's.
     series[3].procs_truncated = true;
     let s = last(&series[..4]);
     let a = account(WhySubject::Cpu, Some(2), &s);

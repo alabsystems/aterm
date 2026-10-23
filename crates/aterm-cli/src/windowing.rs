@@ -1,17 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The front door's windowing grammar and routing policy: `aterm new-tab`, `aterm new-window`,
-//! `aterm split-pane`, and whether a request starts a process or is handed to a running aterm
-//! over the control socket's `spawn` verb, in the style of Windows Terminal's `wt`.
-//!
-//! A policy, not a single-instance mutex: several instances may co-exist (an agent may run its
-//! own on its own `--control-sock`). Everything here is pure, testable without a socket, window
-//! or config file.
+//! The front door's windowing grammar and routing policy.
 
 /// Where a windowing request should be served; the result of [`route_launch`].
-/// "Forward, else start one" is a fallback the caller applies after a forward
-/// errors, not a route, so a real failure is not hidden.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum WindowRoute {
     /// Start a new aterm window in this process.
@@ -20,22 +12,18 @@ pub enum WindowRoute {
     Forward,
 }
 
-/// The `windowing_behavior` config key: what a plain launch (and an explicit
-/// `new-tab` / `split-pane`) should do when an aterm is already running.
+/// The `windowing_behavior` config key.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub enum WindowingBehavior {
-    /// Every launch is its own window and process. The default.
+    /// Every launch is its own window and process.
     #[default]
     NewWindow,
-    /// A launch joins the running instance (a new tab there) and exits; with no
-    /// instance reachable it starts one, so the first launch still works.
+    /// A launch joins the running instance (a new tab there) and exits.
     Attach,
 }
 
 impl WindowingBehavior {
-    /// Parse one config value, case-insensitively and trimmed. `None` for an
-    /// unrecognized spelling so the caller can report it. Windows Terminal's
-    /// `useNew` / `useExisting` are accepted as aliases.
+    /// Parse one config value, case-insensitively and trimmed.
     #[must_use]
     pub fn parse(raw: &str) -> Option<WindowingBehavior> {
         match raw.trim().to_ascii_lowercase().as_str() {
@@ -50,34 +38,20 @@ impl WindowingBehavior {
     }
 }
 
-/// What kind of terminal the invocation asked for: three explicit verbs, or a
-/// plain `aterm` launch.
+/// What kind of terminal the invocation asked for: three explicit verbs, or a plain `aterm` launch.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum LaunchIntent {
     /// `aterm new-tab` — a tab, wherever the policy says tabs go.
     NewTab,
-    /// `aterm new-window`: a window, unconditionally, so `attach` always has an
-    /// escape (the same word Windows Terminal uses).
+    /// `aterm new-window`: a window, unconditionally, so `attach` always has an escape.
     NewWindow,
     /// `aterm split-pane` — a pane beside the focused one.
     SplitPane,
-    /// A bare window launch with nothing else asked of it (no `-e`,
-    /// `--headless`, diagnostics). The only policy-eligible plain shape; see
-    /// [`plain_launch_is_policy_eligible`].
+    /// A bare window launch with nothing else asked of it (no `-e`, `--headless`, diagnostics).
     Plain,
 }
 
-/// The routing decision. Pure: policy + what was asked + whether an instance
-/// is reachable.
-///
-/// * `NewWindow` is never forwarded: a verb naming the outcome outranks the
-///   preference.
-/// * `NewTab` / `SplitPane` / `Plain` forward only under `attach` and only when
-///   an instance answered; under `new_window` they spawn.
-/// * Nothing reachable always means spawn.
-///
-/// A `SplitPane` that spawns has nothing to split (as `wt split-pane` under
-/// `useNew`); the caller says so on stderr.
+/// The routing decision.
 #[must_use]
 pub fn route_launch(
     intent: LaunchIntent,
@@ -99,8 +73,7 @@ pub fn route_launch(
 /// Which way a `split-pane` divides the focused pane.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub enum SplitOrientation {
-    /// Side by side — the new pane takes the right half. The default, matching
-    /// the shape a terminal window usually has (wider than tall).
+    /// Side by side — the new pane takes the right half.
     #[default]
     Vertical,
     /// Stacked — the new pane takes the bottom half.
@@ -123,24 +96,14 @@ impl SplitOrientation {
 pub struct WindowRequest {
     /// What was asked for.
     pub intent: LaunchIntent,
-    /// The `-d <dir>` starting directory, already made absolute, since the
-    /// serving process may have a different working directory.
+    /// The `-d <dir>` starting directory.
     pub dir: Option<String>,
     /// `split-pane`'s orientation; ignored (not rejected) for other verbs.
     pub split: SplitOrientation,
 }
 
 impl WindowRequest {
-    /// The control-socket request line asking a running instance to serve
-    /// this: `spawn` opens a tab in the frontmost window (`spawn split=<v|h>`
-    /// splits the focused pane).
-    ///
-    /// The cwd is quoted (`cwd="…"`) only when it contains whitespace, since the
-    /// protocol is whitespace-split; the unquoted form also reaches older
-    /// servers, which take the value verbatim, quotes included.
-    ///
-    /// Returns `Err` for a directory that cannot be framed: a `"` would close
-    /// the quoted value and a newline would inject a second authenticated verb.
+    /// The control-socket request line asking a running instance to serve this.
     pub fn control_request(&self) -> Result<String, String> {
         let mut line = String::from("spawn");
         if self.intent == LaunchIntent::SplitPane {
@@ -168,8 +131,7 @@ impl WindowRequest {
         Ok(line)
     }
 
-    /// The argument list for the spawn route: only the window's own
-    /// `-d/--working-directory`, so it matches `aterm --window [-d <dir>]`.
+    /// The argument list for the spawn route.
     #[must_use]
     pub fn window_args(&self) -> Vec<std::ffi::OsString> {
         match &self.dir {
@@ -182,8 +144,7 @@ impl WindowRequest {
     }
 }
 
-/// The usage line for one windowing verb: `--help` starts with it and an option error ends
-/// with it.
+/// The usage line for one windowing verb: `--help` starts with it and an option error ends with it.
 #[must_use]
 pub fn window_verb_usage(verb: &str) -> String {
     let mut s = String::from("usage: aterm ");
@@ -196,17 +157,6 @@ pub fn window_verb_usage(verb: &str) -> String {
 }
 
 /// Parse `aterm <verb> [args…]`, the wt-shaped grammar.
-///
-/// `-d <dir>` / `-d=<dir>` / `--directory` / `--working-directory` /
-/// `--startingDirectory` all name the starting directory (aterm's window flag
-/// plus Windows Terminal's spelling).
-///
-/// `resolve_dir` turns the raw argument into the absolute path the request
-/// carries (injected so the parse stays pure); it returns `Err(message)` for a
-/// value that is not a usable directory.
-///
-/// Unknown options are refused, not ignored: a dropped `-d` would open in the
-/// wrong directory.
 pub fn parse_window_request<F>(
     verb: &str,
     args: &[std::ffi::OsString],
@@ -275,37 +225,18 @@ where
     Ok(WindowRequest { intent, dir, split })
 }
 
-/// The ambient facts the plain-launch gate consults, gathered by the caller so
-/// [`plain_launch_is_policy_eligible`] stays pure.
+/// The ambient facts the plain-launch gate consults.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub struct LaunchEnv {
-    /// `$ATERM_UPDATED_FROM` is set — this process is an update successor,
-    /// re-spawned by the outgoing one with its argv verbatim to finish an apply.
+    /// `$ATERM_UPDATED_FROM` is set.
     pub updated_from: bool,
 }
 
 /// The `-d <dir>` spellings a plain launch may carry and stay policy-eligible:
-/// only the two the window's parser accepts (`crates/aterm-gui/src/cli.rs`). A
-/// plain launch is passed through verbatim on the spawn route, so a spelling
-/// the window rejects must not be forwardable under `attach` either.
+/// only the two the window's parser accepts (`crates/aterm-gui/src/cli.rs`).
 const PLAIN_LAUNCH_DIR_FLAGS: &[&str] = &["-d", "--working-directory"];
 
 /// Whether a plain (verb-less) window launch may be routed by policy.
-///
-/// Excluded, each for a concrete reason:
-///
-/// * `-e` / `--command` / `--` carry a child command line `spawn` cannot.
-/// * `--headless` wants an engine + socket with no window; forwarding would
-///   open a tab somewhere and leave CI waiting.
-/// * `--diagnose` is the release gates' probe and must measure this process.
-/// * `$ATERM_UPDATED_FROM` marks an update successor re-spawning with its own
-///   argv; forwarding it would stop the update from landing.
-/// * Anything else unrecognized fails closed to spawning.
-///
-/// `--window` is eligible (it names the mode, not the destination), as is
-/// `-d <dir>` in `PLAIN_LAUNCH_DIR_FLAGS` spellings. Windows'
-/// `RegisterApplicationRestart` relaunch registers the `new-window` verb, which
-/// is never forwarded, so it never reaches this gate.
 #[must_use]
 pub fn plain_launch_is_policy_eligible(scan: &[std::ffi::OsString], env: LaunchEnv) -> bool {
     if env.updated_from {
@@ -329,7 +260,6 @@ pub fn plain_launch_is_policy_eligible(scan: &[std::ffi::OsString], env: LaunchE
 }
 
 /// The raw `-d <dir>` operand of a plain launch, for the caller to resolve.
-/// Shares `PLAIN_LAUNCH_DIR_FLAGS` with the gate so the two agree.
 #[must_use]
 pub fn plain_launch_dir_operand(scan: &[std::ffi::OsString]) -> Option<String> {
     let mut it = scan.iter();
@@ -360,8 +290,6 @@ mod tests {
     #[test]
     fn the_default_policy_is_new_window() {
         assert_eq!(WindowingBehavior::default(), WindowingBehavior::NewWindow);
-        // An unrecognized value must not silently become `attach`: a typo in
-        // aterm.toml may not change where terminals open.
         assert_eq!(WindowingBehavior::parse("join-please"), None);
     }
 
@@ -396,7 +324,6 @@ mod tests {
         use WindowRoute::{Forward, Spawn};
         use WindowingBehavior::{Attach, NewWindow as PolicyNewWindow};
         let cases = [
-            // (intent, policy, reachable, expected)
             (NewTab, PolicyNewWindow, true, Spawn),
             (NewTab, PolicyNewWindow, false, Spawn),
             (NewTab, Attach, true, Forward),
@@ -409,7 +336,6 @@ mod tests {
             (Plain, PolicyNewWindow, false, Spawn),
             (Plain, Attach, true, Forward),
             (Plain, Attach, false, Spawn),
-            // The escape hatch: never forwarded, under either policy.
             (NewWindow, Attach, true, Spawn),
             (NewWindow, Attach, false, Spawn),
             (NewWindow, PolicyNewWindow, true, Spawn),
@@ -464,10 +390,8 @@ mod tests {
         assert_eq!(v.split, SplitOrientation::Vertical);
         let h = parse_window_request("split-pane", &args(&["-H"]), echo_dir).unwrap();
         assert_eq!(h.split, SplitOrientation::Horizontal);
-        // Default is side-by-side, the shape a wide terminal window wants.
         let d = parse_window_request("split-pane", &[], echo_dir).unwrap();
         assert_eq!(d.split, SplitOrientation::Vertical);
-        // `-H` on `new-tab` is a typo, not a silent no-op.
         assert!(parse_window_request("new-tab", &args(&["-H"]), echo_dir).is_err());
     }
 
@@ -475,7 +399,6 @@ mod tests {
     fn a_missing_or_unknown_option_is_a_loud_error() {
         assert!(parse_window_request("new-tab", &args(&["-d"]), echo_dir).is_err());
         assert!(parse_window_request("new-tab", &args(&["--profile", "x"]), echo_dir).is_err());
-        // A resolver rejection (not a directory) surfaces verbatim.
         let bad = parse_window_request("new-tab", &args(&["-d", "nope"]), |_| {
             Err("not a directory: nope".to_string())
         })
@@ -492,8 +415,6 @@ mod tests {
         };
         assert_eq!(plain.control_request().unwrap(), "spawn\n");
 
-        // A space-free path uses the unquoted form, which older instances
-        // also serve.
         let simple = WindowRequest {
             intent: LaunchIntent::NewTab,
             dir: Some(r"C:\Windows".to_string()),
@@ -501,8 +422,6 @@ mod tests {
         };
         assert_eq!(simple.control_request().unwrap(), "spawn cwd=C:\\Windows\n");
 
-        // An ordinary Windows path with spaces: unquoted, whitespace-splitting would tear it
-        // into three tokens.
         let spaced = WindowRequest {
             intent: LaunchIntent::NewTab,
             dir: Some(r"C:\Program Files\Git".to_string()),
@@ -557,8 +476,7 @@ mod tests {
         assert_eq!(some.window_args(), args(&["-d", "/tmp/x"]));
     }
 
-    /// The narrow gate. Everything that is not a bare window launch spawns,
-    /// under either policy — these are the invocations a forward would corrupt.
+    /// The narrow gate.
     #[test]
     fn only_a_bare_window_launch_is_policy_eligible() {
         let plain = LaunchEnv::default();
@@ -580,15 +498,13 @@ mod tests {
             &["--window", "-d", "/tmp", "--headless"][..],
             &["--diagnose"][..],
             &["--containment", "user"][..],
-            &["-d"][..], // a dangling flag: refuse rather than guess
+            &["-d"][..],
         ] {
             assert!(
                 !plain_launch_is_policy_eligible(&args(hazard), plain),
                 "{hazard:?} must never be forwarded"
             );
         }
-        // An update successor re-runs its own argv; it is a relaunch, never a
-        // request for another terminal.
         let updated = LaunchEnv { updated_from: true };
         assert!(!plain_launch_is_policy_eligible(&[], updated));
         assert!(!plain_launch_is_policy_eligible(
@@ -599,7 +515,6 @@ mod tests {
 
     /// A plain launch is eligible only with the window parser's own directory
     /// flags (`-d`, `--working-directory`), so one argv never gets two outcomes.
-    /// The explicit verbs still take the wider grammar.
     #[test]
     fn the_plain_gate_only_knows_the_directory_flags_the_window_parses() {
         let plain = LaunchEnv::default();
@@ -627,7 +542,6 @@ mod tests {
                 "{verb_only_spelling:?} is not a spelling the window understands, so a plain \
                  launch carrying it must take the SAME route under both policies"
             );
-            // …and the verb grammar still accepts every one of them.
             assert!(
                 parse_window_request("new-tab", &args(verb_only_spelling), echo_dir).is_ok(),
                 "{verb_only_spelling:?} must stay legal on the explicit verbs"

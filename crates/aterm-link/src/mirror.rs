@@ -152,6 +152,7 @@ pub fn mint_alias_key() -> Option<[u8; 16]> {
 pub const PIN_HEADER: &str = "logpin v=2";
 
 /// The head of a pin a build before the durable copies wrote: it reads
+/// nothing else ([`Pin`]'s `v=2`).
 const OLDER_PIN_HEADER: &str = "logpin v=1";
 
 impl Pin {

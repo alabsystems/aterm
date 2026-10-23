@@ -1,27 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE LIVE PROBE: the approval policy's looks at this machine, as the policy
-//! always made them ([`super::probe`]'s module docs say why they are behind a
-//! probe at all).
-//!
-//! The bodies here are the ones that were inline in the policy — the Read
-//! rule's hidden-twin walk and its resolver (`policy/approval.rs`), the rm
-//! rule's walk of a path's links (`policy/rm_breaker.rs`), the worker's
-//! process read through the kernel and bound to its session
-//! (`approval_loop.rs`) — moved here unchanged. The looks whose readers the
-//! window's host shares (Claude Code's settings, the shell's startup files,
-//! git's configuration as the worker loads it, the Bash tool's directories)
-//! are called from here and stay where their other callers find them.
-//!
-//! This file is where the approval policy touches the filesystem, a process
-//! or the kernel: the `supervise-fx` source guard (`aterm-census`, phase 3)
-//! names a direct look anywhere else in the supervisor, so a new one goes
-//! through a probe — and onto a harness tape — or is a finding. It names, as
-//! well, a call from anywhere above the door of a reader this arm calls
-//! (`shell_startup::read`, `claude_settings::owner_asks`,
-//! `WorkerEnv::raw_git_view`, …: the guard finds them as the `fn`s of their
-//! files that reach a look's home) and the [`LiveProbe`] itself.
+//! THE LIVE PROBE.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -99,13 +79,7 @@ impl PolicyProbe for LiveProbe {
     }
 }
 
-/// `worker`, the process leading `group`, taken for session `sid`'s worker
-/// only when its `ATERM_PARENT_SESSION_ID` names `sid`.
-///
-/// A refusal says THAT the variable names another session, never which: the
-/// reason is the probe's answer, a harness tape holds it, and what crosses a
-/// probe of the worker is its digest and pid ([`super::probe`]), never a
-/// variable's value.
+/// `worker`, the process leading `group`, taken for session `sid`'s worker only when its `ATERM_PARENT_SESSION_ID` names `sid`.
 pub(crate) fn bound_to(worker: WorkerEnv, group: u32, sid: &str) -> Result<WorkerEnv, String> {
     match worker.var(ENV_PARENT_SESSION_ID) {
         Some(tab) if tab == sid => Ok(worker),
@@ -120,9 +94,7 @@ pub(crate) fn bound_to(worker: WorkerEnv, group: u32, sid: &str) -> Result<Worke
     }
 }
 
-/// How many entries of one folder [`hidden_twin_within`] lists before it holds the press
-/// for a person (a build folder of hundreds of thousands costs a decision a
-/// third of a second, and the loop looks again until the box leaves).
+/// Maximum directory entries [`hidden_twin_within`] lists before deferring to the user.
 pub(crate) const HIDDEN_TWIN_ENTRIES: usize = 20_000;
 
 /// One folder's entry names, as [`hidden_twin_within`] reads them.
@@ -139,13 +111,6 @@ pub(crate) fn folder_names(dir: &Path) -> std::io::Result<Box<FolderNames>> {
 /// the responsible process exits (`~/Library/Containers`,
 /// `~/Library/Group Containers`, `~/Library/CloudStorage`,
 /// `~/Library/Mobile Documents`), as spelled or after resolving symlinks.
-///
-/// The per-folder `$HOME` roots (`~/Documents`, `~/Desktop`, …) are NOT refused
-/// here: when the owner has added one as a trust root and granted access, the
-/// twin scan must still prove no hidden twin sits beside the shown file there.
-/// App Data and file-provider domains are the two classes where an ambient
-/// `read_dir` from the supervisor raises a modal dialog on every launch without
-/// FDA (App Data, design §1.6a) or even under FDA (file-provider domains, §3.4).
 fn never_listed(dir: &Path, home: Option<&Path>, real_home: Option<&Path>) -> bool {
     let Some(home) = home else {
         return false;
@@ -162,23 +127,7 @@ fn never_listed(dir: &Path, home: Option<&Path>, real_home: Option<&Path>) -> bo
     under(home, &real_dir) || real_home.is_some_and(|rh| under(rh, &real_dir))
 }
 
-/// An entry of a folder on `comps`' way whose name differs from the one the box
-/// draws only by characters the box may not have drawn. Claude Code's Read
-/// opens the REAL name, and this screen draws some characters as nothing at all
-/// (a zero-width space or joiner, a soft hyphen, a byte-order mark, a tag
-/// character: elided, not substituted, so the plain-ASCII rule cannot see
-/// them): `x<ZWSP>y`, a link to a secret, is drawn `xy`, a name that does not
-/// exist, or a decoy that does. Such an entry beside the shown name means the
-/// shown name is not proven to be the one read: the press waits for a person.
-/// Only ASCII reaches here, so what an entry shows is its name less every
-/// character outside it, compared as the default volume compares names (APFS
-/// ignores case: `Q<ZWSP>R` is what a Read of `qr` opens). The twin's full
-/// path (it may be a folder on the way), or `Err` for a folder that cannot be
-/// listed, for one inside another app's data or a file-provider domain
-/// ([`never_listed`], checked before `names` is called), and for one too big to
-/// list in a decision ([`HIDDEN_TWIN_ENTRIES`]: about a microsecond an entry,
-/// measured). At most `max_entries` of one folder are listed (a test's small
-/// bound).
+/// An entry of a folder on `comps`' way whose name differs from the one the box draws only by characters the box may not have drawn.
 pub(crate) fn hidden_twin_within(
     comps: &[String],
     max_entries: usize,
@@ -221,7 +170,6 @@ pub(crate) fn hidden_twin_within(
                 "a Read whose folder is under another app's data or a file-provider domain and is never listed: {dir:?}"
             ));
         }
-        // Nothing below a name that is no folder, or is not there.
         match std::fs::metadata(&dir) {
             Ok(m) if m.is_dir() => {}
             _ => return Ok(None),
@@ -231,8 +179,7 @@ pub(crate) fn hidden_twin_within(
 }
 
 /// `comps` with every symlink resolved: the deepest existing ancestor
-/// canonicalized, plus the not-yet-existing components as written. `None` for
-/// a dangling link or a refused look.
+/// canonicalized, plus the not-yet-existing components as written.
 fn real_components(comps: &[String]) -> Option<Vec<String>> {
     let mut k = comps.len();
     loop {
@@ -263,17 +210,7 @@ const MAX_LINK_HOPS: usize = 32;
 /// (an absolute target from `/`, a relative one from the link's directory, a
 /// `..` in it the physical parent) until one does not exist, and from there
 /// the rest as written, since nothing below a missing directory can be a
-/// link yet. `Err` when a link's target climbs out of a missing directory
-/// with `..`, when the links do not end ([`MAX_LINK_HOPS`]), or when the
-/// disk refuses the look (a permission, a file where a directory should be).
-///
-/// Not [`real_components`] (the Read rule's resolver):
-/// that one asks `canonicalize`, which does not say whose links led where,
-/// and a root reached through a link the worker could re-point is no root
-/// here ([`OnDisk::foreign_link`], `ScratchRoot::on_disk`); it follows the
-/// last component too, where rm removes a link itself and follows only the
-/// directories above it; and it gives up on a dangling link, where this walks
-/// on as written to where a directory made there later would put the rm.
+/// link yet.
 fn physical(comps: &[String]) -> Result<OnDisk, String> {
     let mut todo: VecDeque<OsString> = comps.iter().map(OsString::from).collect();
     let mut real = PathBuf::from("/");

@@ -1,62 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aos-step-clock: the Aos step code reads no clock and draws no randomness
-//! (requirement M0-14; docs/DESIGN-aos-hosted-execution-2026-10-21.md §2 and §4.3).
-//!
-//! An Aos task is replayed. The substrate (`crates/aterm-aos/src/`) and the task it hosts
-//! (`aterm_effects::aos_momentum`, over the engine in `cursor_momentum` and its `snapshot` and
-//! `admission` modules, and the aterm-effects helpers that engine's step calls: see
-//! [`AOS_STEP`]) run the same step from a checkpoint over the recorded inputs, and must
-//! land on the same state and observation digests. Time enters only as a recorded input (a
-//! signed offset from the epoch the host declared at attach), and the task draws no
-//! randomness. A clock read, a sleep or a random draw in that code is therefore an input no
-//! log holds: the replay answers it from the real clock or a fresh seed, the same trace stops
-//! reproducing its digests, and nothing else says so (the step still compiles and the live
-//! path still works). aterm-aos's own `clippy.toml` bans the std clock methods by path;
-//! aterm-effects has no such file, and no lint sees a clock imported under another name, a
-//! sleep imported bare or a randomness crate named by its module.
-//!
-//! What it names, on the CODE view of shipped lines (so a comment, a string or a test-only
-//! item naming one is no finding), in [`ClockShape`]s:
-//! * the clocks: `Instant::now`, `SystemTime::now`, an `.elapsed()` (which reads
-//!   `Instant::now` itself), and the wall readers `aterm_time::{since_epoch, unix_secs,
-//!   unix_millis}` and `aterm_types::shell_types::current_time_ms`;
-//! * the sleeps: `thread::sleep`, `sleep_until`, `sleep_ms`, `park_timeout`;
-//! * the randomness: `getrandom` (the crate `crates/aterm-getrandom` builds), a `rand` module
-//!   named as a path's head (`rand::random()`, `aterm_uds::rand::fill(..)`), `thread_rng`,
-//!   `OsRng`, `fastrand`, and a per-process random hash key — `RandomState`,
-//!   `aterm_hash::{KeyedHashMap, KeyedState}`, and std's `HashMap`/`HashSet` built by `new` or
-//!   `with_capacity` (which hash under `RandomState`, so their iteration order differs between
-//!   the live run and its replay).
-//!
-//! Each import is read as the names it binds ([`use_leaves`]), as supervise-fx and agh-fx read
-//! one: a clock or sleep imported whole (`use std::thread::sleep;`, then `sleep(d)`), a head of
-//! one renamed (`Instant as Mono`, `std::thread as t`, `HashMap as Map`), its module globbed in
-//! (`std::thread::*`, `aterm_time::*`), a wall reader imported to be passed bare
-//! (`use aterm_time::unix_millis;`), or any path through a randomness crate or module
-//! (`use rand::Rng;`, `use aterm_uds::rand;`) is named at the import. So is a `type` alias of
-//! one ([`type_alias`]). An import of a clock's type under its own name
-//! (`use aterm_time::Instant;`) is no finding: the lines then name `Instant::now` by its path.
-//!
-//! Test code is not read: a file whose path names a test ([`test_path`]: `host_tests.rs`,
-//! `test_fixtures.rs`) and a file its parent declares under a test `cfg`
-//! ([`super::Corpus::test_only`]). A `#[cfg(any(test, debug_assertions))]` seam is read: it
-//! ships in every debug build.
-//!
-//! LEXICAL, like every census rule, and scoped by file, not by call graph. It reads every
-//! shipped line of the module trees in [`AOS_STEP`] (so it also forbids a clock in code of
-//! those modules the step never reaches), and nothing outside them. So it does not see:
-//! * a clock read inside a helper of another crate that the step calls: `aterm_render`
-//!   (`premul_rgb`, `over_premul`, `ribbon_beam`), `aterm_time` (`Instant`'s arithmetic),
-//!   `aterm_digest` (`Sha256`) and `astream_wire` (the frame and step codec); the engine is
-//!   handed `now` by its host for that reason;
-//! * a helper in another module of aterm-effects that the step comes to call after the list
-//!   in [`AOS_STEP`] was derived (it is derived by hand from the step's imports and calls, not
-//!   computed), until that module is added there;
-//! * a macro that expands to a read, a qualified path (`<Instant>::now()`), a `HashMap` built
-//!   by `default()` or `from_iter`, or a randomness crate reached under a name its manifest
-//!   renamed.
+//! aos-step-clock: the Aos step code reads no clock and draws no randomness (requirement M0-14; docs/DESIGN-aos-hosted-execution-2026-10-21.md §2 and §4.3).
 
 use super::rules::{
     ClockShape, UseLeaf, first_hit, test_path, type_alias, use_leaves, use_statements,
@@ -219,8 +164,6 @@ fn aos_step_clock(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         .flat_map(|root| tree.corpus.test_only(root))
         .collect();
     let mut needles: Vec<&str> = AOS_READS.iter().map(|r| r.0).collect();
-    // Each segment too: an import that binds a clock under a name the line view cannot see
-    // names a segment of it (`use std::thread::{self, sleep};` names `thread`).
     needles.extend(AOS_READS.iter().flat_map(|r| r.0.split("::")));
     needles.extend(RANDOM_MODULES);
     needles.extend(["type ", WALL_READER_MODULE]);
@@ -228,8 +171,6 @@ fn aos_step_clock(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         if test_path(&file.rel) || test_only.contains(&file.rel) || !file.mentions(&needles) {
             continue;
         }
-        // Imports are read whole, as the names they bind; only their spans are blanked in the
-        // view the lines are read on, so an import is named once, at its first line.
         let uses = use_statements(file);
         for line in file.shipped_lines() {
             let code = uses
@@ -272,8 +213,7 @@ fn random_path(code: &str) -> Option<String> {
 }
 
 /// The finding for one imported name (or `type` alias) that binds a clock read, a sleep or a
-/// random draw where the lines cannot see it, if any. `as _` binds nothing to call, and a head
-/// imported under its own name (`use std::time::Instant;`) keeps the path a line is read for.
+/// random draw where the lines cannot see it, if any.
 fn imported(leaf: &UseLeaf<'_>) -> Option<String> {
     if leaf.alias == Some("_") {
         return None;
@@ -298,11 +238,9 @@ fn imported(leaf: &UseLeaf<'_>) -> Option<String> {
         let bound = if leaf.glob {
             parts.len() > 1 && ends(parts.len() - 1)
         } else if ends(parts.len()) {
-            // The whole of it: a path read bare from here on (`sleep(d)`), a one-word name
             // that is itself the door (`RandomState`), or a wall reader passed as a fn item.
             true
         } else {
-            // A head of it renamed: `Instant as Mono`, then `Mono::now()`.
             leaf.alias.is_some()
                 && (1..parts.len()).any(|k| ends(k) && leaf.alias != Some(parts[k - 1]))
         };
@@ -354,7 +292,6 @@ mod tests {
                 "crates/aterm-effects/src/cursor_momentum/snapshot.rs",
                 planted,
             ),
-            // Test code, by name and by its parent's declaration.
             (
                 "crates/aterm-effects/src/aos_momentum/host_tests.rs",
                 planted,
@@ -366,7 +303,6 @@ mod tests {
             ("crates/aterm-aos/src/lib.rs", lib),
             ("crates/aterm-aos/src/rig.rs", planted),
             ("crates/aterm-aos/tests/toy.rs", planted),
-            // Outside the step code: the host reads the clock and hands `now` in.
             ("crates/aterm-effects/src/cursor_fx.rs", planted),
             ("crates/aterm-gui/src/aos_verb.rs", planted),
         ]);
@@ -384,9 +320,7 @@ mod tests {
 
     /// The aterm-effects helpers the momentum step calls are step code too: a clock read in a
     /// shipped line of each (the light body's ink solve and ellipse, the aurora's `Geom` and
-    /// raster, the effects quads, the colour math, the ribbon's `seen`) is found. The aurora's
-    /// own tests, which `cursor_glow.rs` declares under `#[cfg(test)]`, are not read, and
-    /// neither is a module of the crate the step does not call.
+    /// raster, the effects quads, the colour math, the ribbon's `seen`) is found.
     #[test]
     fn a_clock_read_in_a_same_crate_helper_the_momentum_step_calls_is_found() {
         let planted = "fn ink(now: Instant) -> u32 { light(now) }\n\
@@ -404,7 +338,6 @@ mod tests {
             ("crates/aterm-effects/src/effect_util.rs", planted),
             ("crates/aterm-effects/src/color_math.rs", planted),
             ("crates/aterm-effects/src/rainbow_kitty/ribbon.rs", planted),
-            // The aurora's tests, test-only by the parent's declaration.
             (
                 "crates/aterm-effects/src/cursor_glow/tests/mod.rs",
                 tests_mod,
@@ -413,7 +346,6 @@ mod tests {
                 "crates/aterm-effects/src/cursor_glow/tests/tint.rs",
                 planted,
             ),
-            // Modules of the same crate the momentum step does not call.
             ("crates/aterm-effects/src/rainbow_kitty/meteor.rs", planted),
             ("crates/aterm-effects/src/cursor_comet.rs", planted),
         ]);

@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Finite composer laws and committed replay through the production cursor
-//! family (`EffectsPipeline::cursor_step`). The fixture supplies terminal
-//! snapshots, pane bounds, repaint epochs, scroll state and recorded key facts.
-//! It applies the native present's hold and probe gates. Recordings do not
-//! contain delivery receipts, so replay never invents sink acceptance.
+//! Composer laws and committed `ptyrec` replay through `EffectsPipeline::cursor_step`.
 
 use super::*;
 use crate::common::{
@@ -24,8 +20,6 @@ use std::ops::{Deref, DerefMut};
 const LABEL: &str = "workspace";
 /// The text after the hand's insert in the mid-line probes.
 const TAIL: &str = " carefully and ultrathink design this.";
-
-// ---- The present -------------------------------------------------------
 
 /// The engine side of one present: what the frame reads into and ticks.
 struct Glass<'a> {
@@ -134,12 +128,7 @@ fn present(term: &Terminal, now: Instant, gl: Glass<'_>) {
     );
 }
 
-// ---- The composer, hosted ----------------------------------------------
-
-/// The parent's composer model presented by the shipping single-pane present.
-/// [`Sim::new`] and [`Sim::preload`] still show their frames through
-/// `Sim::frame`; every frame of [`Hosted::run`] and [`Hosted::advance`] goes
-/// through the hold, and a frame inside a starved window is skipped.
+/// Single-pane shipping present harness wrapping [`Sim`].
 pub(crate) struct Hosted {
     s: Sim,
     hold: FrameHold,
@@ -163,8 +152,7 @@ impl DerefMut for Hosted {
     }
 }
 
-/// What a tear does to a render: it lands the bytes before the cut and the
-/// rest later, and the frames between present the half-written screen.
+/// Cut point for splitting a synthetic render across frames.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum TearAt {
     /// Before the park (the parent's own tear).
@@ -174,7 +162,7 @@ pub(crate) enum TearAt {
 }
 
 impl Hosted {
-    /// The composer under a top rule labelled `label`, drawn and shown once.
+    /// Create a composer harness under a top rule labelled `label`.
     pub(crate) fn new(label: &'static str) -> Self {
         Self {
             s: Sim::new(label),
@@ -216,8 +204,7 @@ impl Hosted {
         self.s.term.process_at(bytes, at);
     }
 
-    /// The frame train to `t` ms, `obs` after each frame. A starved frame is
-    /// neither presented nor observed; one the hold withholds is observed.
+    /// Advance the frame train to `t` ms, invoking `obs` after each presented frame.
     pub(crate) fn advance(&mut self, t: u64, obs: &mut dyn FnMut(&Sim)) {
         let target = self.s.t0 + Duration::from_millis(t);
         while self.s.next_frame <= target {
@@ -232,9 +219,7 @@ impl Hosted {
         self.s.now = self.s.now.max(target);
     }
 
-    /// [`Sim::run`] through the present, `obs` after each frame. `tear`
-    /// `(render, at, ms)` lands that render's bytes before the cut `at`
-    /// chooses and the rest `ms` later; a render due meanwhile waits for it.
+    /// Run a scripted key/echo sequence with an optional torn render.
     pub(crate) fn run(
         &mut self,
         keys: &[(u64, char)],
@@ -408,8 +393,6 @@ fn declines(s: &Sim) -> Vec<String> {
         .collect()
 }
 
-// ---- F1 and F3: the box growth's relay -----------------------------------
-
 /// The glued word F1 and F3 type.
 const GLUED: &str = "versussystemwidediskspaces";
 
@@ -463,10 +446,7 @@ fn boxgrow_take(
     let keys = keys_of(b.word, s.ms() + 100, b.gap);
     let renders = renders_for(&keys, delay);
     let mut c = Census::default();
-    // the key whose word no longer fits
     let wrap_press = keys[TW - b.pad].0;
-    // A render drains all pending keys. Later scheduled callbacks can have
-    // nothing left to echo, so their deadlines do not date the final echo.
     let last_press = keys.last().expect("a typed word").0;
     let mut echoed_at = None;
     let mut lit_blank_since: Option<u64> = None;
@@ -487,7 +467,6 @@ fn boxgrow_take(
             let dark: Vec<u16> = (2..cc).filter(|c| !live.contains(c)).collect();
             c.dark_at_settle = format!("settle dark[{}]={dark:?}", dark.len());
         }
-        // the hand's word on the hand's row: cols 2..cc
         if let Some(fl) = (2..cc).find(|c| live.contains(c))
             && fl > 2
             && cc < 40
@@ -530,11 +509,7 @@ fn boxgrow_take(
     (s, c, row0)
 }
 
-/// F1: light follows its text through a box growth's same-row re-anchor. A
-/// glued word typed into the last columns of the composer's last line wraps
-/// whole to the next row's indent and the box grows a row (the caret keeps
-/// its screen row): the relaid word is lit there, and no light stays on the
-/// blanks it left. F1's live takes stay open in [`probe_live_families`].
+/// F1: light follows its text through a box growth's same-row re-anchor.
 #[test]
 fn a_glued_word_a_box_growth_relays_is_lit_where_it_lands() {
     let mut fails = Vec::new();
@@ -586,8 +561,7 @@ fn a_glued_word_a_box_growth_relays_is_lit_where_it_lands() {
 }
 
 /// F1's control: the same relay of a word typed after a Space, which measures
-/// the word (`Ribbon::moved_word_len`): lit whole once it settles. It tells a
-/// relay that cannot measure the word from one that refuses it.
+/// the word (`Ribbon::moved_word_len`): lit whole once it settles.
 #[test]
 fn a_spaced_word_a_box_growth_relays_is_lit_whole() {
     let mut fails = Vec::new();
@@ -629,9 +603,7 @@ fn a_spaced_word_a_box_growth_relays_is_lit_whole() {
 type Lag = (String, Box<dyn Fn(usize) -> u64>);
 
 /// F3: presses in flight license their echo however late it lands within
-/// their patience, whatever shape the composer gives it. F1's relay with the
-/// echo lagging or stalled: every key typed is lit where it stands once it
-/// settles, with no interior hole on any frame.
+/// their patience, whatever shape the composer gives it.
 #[test]
 fn probe_f3_lagged_catchup_across_boxgrow() {
     let mut fails = Vec::new();
@@ -690,8 +662,7 @@ fn probe_f3_lagged_catchup_across_boxgrow() {
 }
 
 /// F3's control: the lagged relay of a word typed after a Space, so the
-/// word's measure is not in question: lit whole once it settles. It tells the
-/// lag's own law from F1's measure.
+/// word's measure is not in question: lit whole once it settles.
 #[test]
 fn probe_f3_control_typed_space() {
     let mut fails = Vec::new();
@@ -739,13 +710,7 @@ fn probe_f3_control_typed_space() {
     );
 }
 
-// ---- F2 and F4: a mid-line word wrapped to the next row ------------------
-
-/// F2: light stands only over its own text, also while it leaves. A mid-line
-/// insert whose word crosses the right edge relays to the next row's indent
-/// with no box growth (the tail already stands there): the cells it vacated
-/// at the old row's end are blank and keep no light past 200 ms, and the
-/// relaid word is lit.
+/// F2: light stands only over its own text, also while it leaves.
 #[test]
 fn probe_f2_midline_wrap_vacated_light() {
     let mut fails = Vec::new();
@@ -784,8 +749,6 @@ fn probe_f2_midline_wrap_vacated_light() {
                         return;
                     }
                     let Some(old) = hand_row else { return };
-                    // the old row's cells past the break Space after its last
-                    // glyph, by the light drawn there
                     let last = last_glyph(s, old).unwrap_or(0);
                     let past: Vec<u16> = ((last + 2)..=(TW as u16 + 1))
                         .filter(|&c| light(s, old, c) > 40)
@@ -830,18 +793,10 @@ fn probe_f2_midline_wrap_vacated_light() {
     );
 }
 
-/// F4a: the band rides with its text through a hidden repaint. The owner's
-/// long mid-line insert with the app silent for seconds, its catch-up
-/// relaying the tail and growing the box, drawn whole, torn at the hand's row
-/// or torn before the park: the band is not retired, no reappearance is
-/// declined as a hidden relocation, and the hand's text is lit. This shape
-/// reproduces only the decline, in its 1.9 s tears; the live whole-band
-/// retire is s3-long2-m's row in [`probe_live_families`].
+/// F4a: the band rides with its text through a hidden repaint.
 #[test]
 fn probe_f4a_synthetic_torn_catchup() {
     let insert = "(versus system wide) is running and what disk space is being used and especially all the subtrees and such. so that every processtree of the system stays visible at a glance";
-    // silent from key `k0` for `stall` ms, the catch-up then drawn as one
-    // repaint; after it every key lags `lag` ms
     let mut takes = Vec::new();
     for (k0, stall, lag) in [
         (45usize, 4000u64, 2u64),
@@ -858,7 +813,6 @@ fn probe_f4a_synthetic_torn_catchup() {
             }
         }
     }
-    // Each take is its own host and clock: they replay side by side.
     let fails: Vec<String> = par_map(&takes, |&(k0, stall, lag, tear, tear_ms)| {
         let mut s = Hosted::new(LABEL);
         s.verbose = true;
@@ -877,7 +831,6 @@ fn probe_f4a_synthetic_torn_catchup() {
                 lag
             }
         });
-        // the catch-up is the render that lands at stall_end
         let catch = renders
             .iter()
             .position(|&r| r >= stall_end)
@@ -895,8 +848,6 @@ fn probe_f4a_synthetic_torn_catchup() {
         let mut obs = |s: &Sim| {
             let t = s.ms();
             if t > stall_end + tear_ms + 1500 {
-                // well after the catch-up the hand's row is lit from
-                // where the band last began up to the caret
                 let (cr, cc) = s.caret();
                 let live = s.live(cr);
                 let lo = live.first().copied().unwrap_or(cc);
@@ -952,11 +903,7 @@ fn probe_f4a_synthetic_torn_catchup() {
     );
 }
 
-/// F4b: a held park never swallows later moves. F2's word crossing the right
-/// edge with the app silent from the key that fills the row while the hand
-/// types on; the catch-up relays the word to the next row (a cross-row move,
-/// every stamp stale, the presses unpaid) and later keys echo at once: every
-/// later move is judged, and the keys typed after the catch-up are lit.
+/// F4b: a held park never swallows later moves.
 #[test]
 fn probe_f4b_park_custody() {
     let mut fails = Vec::new();
@@ -1012,8 +959,6 @@ fn probe_f4b_park_custody() {
     );
 }
 
-// ---- F5: a Backspace held after a box flap -------------------------------
-
 /// F5's control: a Backspace held (33 ms repeat) mid-line right after a box
 /// flap, the last typed key wrapping the tail and growing the box and the
 /// second Backspace shrinking it, with no twin glyph sliding into an erased
@@ -1026,8 +971,6 @@ fn probe_f5_backspace_hold_retract_linger() {
         for (held, over) in [(6usize, 1usize), (6, 2), (12, 2)] {
             let mut s = Hosted::new(LABEL);
             s.verbose = true;
-            // typing `typed` makes the line one longer than the row holds,
-            // so its last word wraps
             let typed = "lorem ipsum dolor sit amet";
             let head = words_to(TW - TAIL.len() - typed.len() + over);
             s.preload(&format!("{head}{TAIL}"), head.chars().count());
@@ -1045,7 +988,6 @@ fn probe_f5_backspace_hold_retract_linger() {
                 if t < bs0 + 34 {
                     return;
                 }
-                // the cells right of the caret the hand retreated from, lit
                 let (cr, cc) = s.caret();
                 let lit: Vec<(u16, u8)> = (cc..cc + held as u16)
                     .filter(|&c| s.live(cr).contains(&c))
@@ -1081,13 +1023,7 @@ fn probe_f5_backspace_hold_retract_linger() {
     );
 }
 
-/// F5: an erased cell's light goes with its text, not its glyph. `…all the
-/// subtr` typed mid-line before the tail, the box growing at `t` and
-/// shrinking at the second Backspace, then Backspace held: a twin glyph of
-/// the tail that slides into an erased column neither keeps nor restores that
-/// cell's light, so no live cell stands right of the caret beside retracting
-/// ones. Starved, aterm presents one frame in three for 800 ms from the first
-/// Backspace.
+/// F5: an erased cell's light goes with its text, not its glyph.
 #[test]
 fn probe_f5_twin_slides_into_an_erased_cell() {
     let mut fails = Vec::new();
@@ -1166,14 +1102,12 @@ fn probe_f5_twin_slides_into_an_erased_cell() {
     );
 }
 
-// ---- Live takes ----------------------------------------------------------
-
-/// The takes' grid: rows.
+/// Grid row count for recorded `ptyrec` takes.
 pub(crate) const LIVE_ROWS: usize = 60;
-/// The takes' grid: columns.
+/// Grid column count for recorded `ptyrec` takes.
 pub(crate) const LIVE_COLS: usize = 146;
 
-/// A recorded take replayed through the shipping single-pane present.
+/// Replay state for a recorded `ptyrec` take through the shipping single-pane present.
 pub(crate) struct Live {
     pub(crate) term: Terminal,
     pub(crate) glow: PresentedGlow,
@@ -1225,7 +1159,7 @@ impl Live {
         }
     }
 
-    /// ms since the take's first record.
+    /// Milliseconds elapsed since the take's first record.
     pub(crate) fn ms(&self) -> u64 {
         self.now.saturating_duration_since(self.t0).as_millis() as u64
     }
@@ -1313,9 +1247,7 @@ impl Live {
     }
 }
 
-/// The frame train of a replay, in µs: its phase against the bytes and its
-/// period. A recorded event lands at its own instant and the next frame is a
-/// period after the later of it and the last frame.
+/// Frame train phase and period (in microseconds) for a replay.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Train {
     pub(crate) phase_us: u64,
@@ -1331,7 +1263,7 @@ impl Default for Train {
     }
 }
 
-/// What a replay hands its observer, once it has happened.
+/// Replay event passed to the observer callback.
 pub(crate) enum Step {
     /// A frame presented.
     Frame,
@@ -1343,12 +1275,10 @@ pub(crate) enum Step {
 
 /// How long a replay runs past its last record, in ms: the in-flight patience
 /// (the engine's `IN_FLIGHT_PATIENCE_S`, 10 s), past which no press licenses
-/// anything, and half a second. Whatever the engine still holds when the
-/// bytes end, a held park or a press in flight, is judged inside the replay.
+/// anything, and half a second.
 const REPLAY_TAIL_MS: u64 = 10_500;
 
-/// Replays `src`, a `lab ptyrec` take, through a fresh [`Live`] on `train` to
-/// [`REPLAY_TAIL_MS`] past its last record; `obs` sees each step with its ms.
+/// Replay a `lab ptyrec` recording `src` on `train` through [`REPLAY_TAIL_MS`] past its last event.
 pub(crate) fn replay(src: &str, train: Train, obs: &mut dyn FnMut(&Live, u64, Step)) -> Live {
     assert!(
         train.period_us > 0,
@@ -1389,7 +1319,7 @@ pub(crate) fn replay(src: &str, train: Train, obs: &mut dyn FnMut(&Live, u64, St
     h
 }
 
-/// What a replay measured.
+/// Summary metrics collected over a [`replay`] run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ReplaySummary {
     /// `ribbon_retired=` at the end.
@@ -1430,7 +1360,6 @@ impl ReplayCensus {
     }
 
     fn frame(&mut self, h: &Live, ms: u64) {
-        // a verdict on row 3 is the banner's, not the hand's
         let verdict = h.ring[self.ring_seen..]
             .iter()
             .any(|l| !l.contains("(3, ") && !l.contains("SCROLL"));
@@ -1490,8 +1419,7 @@ impl ReplayCensus {
     }
 }
 
-/// `src` replayed on the default train: what it measured, and the host as
-/// the replay left it.
+/// Replay `src` on the default 120 Hz train and return its summary and final [`Live`] state.
 pub(crate) fn replay_take(src: &str) -> (ReplaySummary, Live) {
     let mut census = ReplayCensus::default();
     let h = replay(src, Train::default(), &mut |h, ms, step| {
@@ -1500,31 +1428,13 @@ pub(crate) fn replay_take(src: &str) -> (ReplaySummary, Live) {
     (census.summary(&h), h)
 }
 
-/// A committed take: its name in the round that recorded it, and its bytes.
+/// Committed `ptyrec` take metadata and payload.
 pub(crate) struct Take {
     pub(crate) id: &'static str,
     pub(crate) src: &'static str,
 }
 
-/// The committed takes, recorded 2026-10-17 with `lab ptyrec` from Claude
-/// Code 2.1.302's fullscreen composer in a headless aterm at 60×146, nothing
-/// submitted. The `boxgrow` takes type a glued word into the last columns of
-/// the seeded text's last row, so the box grows a row mid-word; the
-/// `long-insert` takes type the owner's 175-key insert mid-line. A `starved`
-/// take (`s2`…`s4`) ran CPU hogs over Claude Code during the insert, 20 for
-/// `-h` and 8 for `-m`.
-///
-/// Each file is its take cut at the first half-second step past its last key
-/// after which its [`ReplaySummary`] counts nothing more than half a second
-/// on (the late echo, a held park's flush): replayed, the file measures the
-/// whole take's summary, and every ring verdict up to the cut is the whole
-/// take's. Nothing before the first key is cut: the later bytes draw on the
-/// terminal modes, the alternate screen and the banner the first records set
-/// up. Text of the same width replaces the banner's model-and-plan line, the
-/// working directory, and a word the publication guard forbids, which Claude
-/// Code drew as the composer's label and in its effort chip and the long
-/// takes' seeded text carried (`carefully` in its place); every replayed
-/// number is unchanged.
+/// Committed fullscreen composer `ptyrec` takes.
 pub(crate) const TAKES: &[Take] = &[
     Take {
         id: "g-boxgrow",
@@ -1568,7 +1478,7 @@ pub(crate) const TAKES: &[Take] = &[
     },
 ];
 
-/// The committed take `id`'s bytes.
+/// Look up a committed take's payload by `id`.
 pub(crate) fn take(id: &str) -> &'static str {
     TAKES
         .iter()
@@ -1577,8 +1487,7 @@ pub(crate) fn take(id: &str) -> &'static str {
         .unwrap_or_else(|| panic!("no committed take {id}"))
 }
 
-/// The live families on their own takes' bytes. Each row is a take and the
-/// law it pins.
+/// The live families on their own takes' bytes.
 #[test]
 fn probe_live_families() {
     type Law = fn(&ReplaySummary) -> bool;

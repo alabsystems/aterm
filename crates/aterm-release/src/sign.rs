@@ -242,7 +242,7 @@ pub(crate) fn credentials_value<'a>(text: &'a str, want: &str) -> Result<Option<
     Ok(None)
 }
 
-/// The one key of record. Absent is an error here (unlike the optional Apple keys):
+/// The one key of record.
 fn credentials_signing_key(text: &str) -> Result<&str, String> {
     credentials_value(text, "signing_key")?
         .ok_or_else(|| "no `signing_key` in the credentials profile".to_string())
@@ -334,7 +334,7 @@ impl DevIdIdentity {
     }
 }
 
-/// The prefix of every Developer-ID code-signing certificate's common name. Matching on it,
+/// The prefix of every Developer-ID code-signing certificate's common name.
 const DEVID_APP_PREFIX: &str = "Developer ID Application: ";
 
 /// Choose the signing certificate from `security find-identity -v -p codesigning` output.
@@ -396,7 +396,7 @@ fn describe_candidates(candidates: &[DevIdIdentity]) -> String {
         .join("; ")
 }
 
-/// Parse one `  1) <40-hex> "<common name>"` listing line. Anything else —
+/// Parse one `  1) <40-hex> "<common name>"` listing line.
 fn parse_find_identity_line(line: &str) -> Option<DevIdIdentity> {
     let (_, rest) = line.trim().split_once(") ")?;
     let (sha1, rest) = rest.split_once(' ')?;
@@ -569,6 +569,7 @@ pub enum NotaryAuth {
 
 impl std::fmt::Debug for NotaryAuth {
     /// Hand-written so the `AppleId` password never reaches a transcript, journal or panic
+    /// message.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NotaryAuth::KeychainProfile(name) => {
@@ -846,8 +847,10 @@ pub trait AppleTools {
     fn check_devid_signed(&self, target: &Path) -> Result<(), String>;
     fn notarize(&self, artifact: &Path, auth: &NotaryAuth) -> Result<(), String>;
     /// `codesign --verify --deep --strict`: the cut's hard signature gate, on every tier
+    /// including ad-hoc.
     fn codesign_verify_strict(&self, target: &Path) -> Result<(), String>;
     /// `codesign -dv --verbose=2`, stderr and stdout concatenated, so the parse does not
+    /// depend on which stream a macOS release prints the report to.
     fn codesign_dv(&self, target: &Path) -> Result<String, String>;
     /// `xcrun stapler validate`: is the notarization ticket embedded in the artifact.
     fn stapler_validate(&self, target: &Path) -> Result<bool, String>;
@@ -883,7 +886,7 @@ pub fn spctl_argv(kind: GatekeeperKind) -> Vec<&'static str> {
 /// The real tools.
 pub struct RealAppleTools;
 
-/// Run a verification tool over `target` and report only whether it passed. A spawn failure
+/// Run a verification tool over `target` and report only whether it passed.
 fn tool_ok(argv: &[&str], target: &Path) -> Result<bool, String> {
     let (program, args) = argv
         .split_first()
@@ -1033,6 +1036,8 @@ fn run_checked(cmd: &mut Command, what: &str) -> Result<(), String> {
 }
 
 /// Run `cmd` with inherited stdio (notarytool's progress streams to the transcript) under a
+/// hard deadline: the cut holds a release lease, a publisher fence and a burned build number,
+/// and `Command::status()` would wait forever on an Apple stall.
 fn run_streamed(cmd: &mut Command, what: &str, timeout: Duration) -> Result<(), String> {
     let mut child = cmd
         .stdin(std::process::Stdio::null())
@@ -1069,6 +1074,7 @@ mod dr_tests {
     use super::{DrClass, classify_dr, devid_preflight};
 
     /// A Developer-ID app's DR (macOS 26.6.2): an identifier clause plus an anchor and
+    /// no cdhash, the shape a shipped aterm.app must have.
     const DEVID_DR: &str = "Executable=/Applications/Ghostty.app/Contents/MacOS/ghostty\n\
          designated => identifier \"com.mitchellh.ghostty\" and anchor apple generic and \
          certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and \
@@ -1084,11 +1090,13 @@ mod dr_tests {
          certificate leaf[subject.OU] = H7V7XYVQ7D)\n";
 
     /// `codesign --force --sign - <binary>` (`ship dev-app` without the "aterm dev"
+    /// identity): a derived (`# `) requirement with no identifier clause.
     const ADHOC_DR: &str = "Executable=/tmp/adhoc-probe\n\
          # designated => cdhash H\"240c6c45749cff92effe2dbe2782cd3ac8bee253\" or \
          cdhash H\"458a3ae87054006e9463429282897dfafa67e862\"\n";
 
     /// Same, signed with `--identifier com.aterm.aterm.dev`: the identifier does not
+    /// reach the requirement, so a dev bundle id alone buys no durable grant.
     const ADHOC_DR_WITH_IDENTIFIER: &str = "Executable=/tmp/adhoc-probe2\n\
          # designated => cdhash H\"291d5a2ba2302d7e67699538f48684c2a1e3babf\" or \
          cdhash H\"bcbfaab1440e2f97f26f0d7b31b9e4710f647918\"\n";
@@ -1111,6 +1119,8 @@ mod dr_tests {
     }
 
     /// A self-signed identity's requirement (`certificate leaf` for `ship dev-app`'s
+    /// "aterm dev", `certificate root` for a certificate with an Organization) pins the
+    /// certificate, not the code's bytes, so a grant against it survives a rebuild.
     #[test]
     fn a_self_signed_identity_requirement_is_identity() {
         for requirement in [

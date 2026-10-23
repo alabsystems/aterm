@@ -1,82 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The anchor attributes as `macro_rules!` attributes (the crate docs say where).
-//!
-//! An attribute expands to the annotated fn as written, with its body prefixed by the
-//! record (a load-time `registry::submit!`, on the targets that have a constructor
-//! section) and, for `refines` on a fn that is not `const`, the `xref::note_entered`
-//! probe carrying the record's `entry_id`. The record is an item inside the body, so it
-//! needs no name: an anchored method sits in an `impl` as a free fn sits in a module.
-//!
-//! Expansions of stacked attributes nest, and one carrier fn holds 31 waivers, so the
-//! common shape (the keys in their documented order, on a fn with no generics, `where`
-//! clause or qualifier but `const`) expands in one step. Every other shape goes through
-//! `__aterm_spec_anchor!`, which reads the keys in any order and walks the item's tokens
-//! to its body, sixteen at a time.
-//!
-//! ```
-//! #![cfg_attr(anchor_rules, feature(macro_attr))]
-//! #[aterm_spec_anchor::refines(machine = "Twin", action = "Up", project = "twin::project")]
-//! fn up(n: u32) -> u32 {
-//!     n + 1
-//! }
-//! #[aterm_spec_anchor::spec_unmodeled(reason = "a platform fast path", machine = "Twin")]
-//! fn fast() {}
-//! # fn main() { assert_eq!(up(1), 2); fast(); }
-//! ```
-//!
-//! A key the attribute does not take:
-//!
-//! ```compile_fail
-//! #![cfg_attr(anchor_rules, feature(macro_attr))]
-//! #[aterm_spec_anchor::refines(machine = "Twin", action = "Up", project = "twin::project", tla = "x")]
-//! fn up(n: u32) -> u32 {
-//!     n + 1
-//! }
-//! # fn main() { assert_eq!(up(1), 2); }
-//! ```
-//!
-//! A value that is not a string literal:
-//!
-//! ```compile_fail
-//! #![cfg_attr(anchor_rules, feature(macro_attr))]
-//! #[aterm_spec_anchor::refines(machine = "Twin", action = Up, project = "twin::project")]
-//! fn up(n: u32) -> u32 {
-//!     n + 1
-//! }
-//! # fn main() { assert_eq!(up(1), 2); }
-//! ```
-//!
-//! A `refines` with an empty `project`, and a waiver with no `reason`:
-//!
-//! ```compile_fail
-//! #![cfg_attr(anchor_rules, feature(macro_attr))]
-//! #[aterm_spec_anchor::refines(machine = "Twin", action = "Up", project = "")]
-//! fn up(n: u32) -> u32 {
-//!     n + 1
-//! }
-//! # fn main() { assert_eq!(up(1), 2); }
-//! ```
-//!
-//! ```compile_fail
-//! #![cfg_attr(anchor_rules, feature(macro_attr))]
-//! #[aterm_spec_anchor::spec_unmodeled(machine = "Twin")]
-//! fn fast() {}
-//! # fn main() { fast(); }
-//! ```
-//!
-//! An item that is not a fn with a body:
-//!
-//! ```compile_fail
-//! #![cfg_attr(anchor_rules, feature(macro_attr))]
-//! #[aterm_spec_anchor::spec_unmodeled(reason = "a struct")]
-//! struct S;
-//! # fn main() {}
-//! ```
+//! The anchor attributes (`refines`, `spec_unmodeled`) as `macro_rules!` attributes.
 
-/// Bind a fn to the model action it performs: `machine`, `action` and `project` (the fn
-/// Tier-1 reads the real state through), all required.
+/// Bind a fn to the model action it performs: `machine`, `action` and `project`, all required.
 #[macro_export]
 macro_rules! refines {
     attr(machine = $m:literal, action = $a:literal, project = "" $(,)?) ($($item:tt)*) => {
@@ -86,8 +13,6 @@ macro_rules! refines {
         }
         $($item)*
     };
-    // A body that opens with an inner attribute takes the general path, which puts the
-    // record after it.
     attr($($args:tt)*) ($(# $at:tt)* $vis:vis fn $n:ident ($($ps:tt)*) $(-> $r:ty)? { # ! $($b:tt)* }) => {
         $crate::__aterm_spec_anchor! { @keys refines [] [] [] [] ($($args)*)
             ($(# $at)* $vis fn $n ($($ps)*) $(-> $r)? { # ! $($b)* }) }
@@ -106,8 +31,6 @@ macro_rules! refines {
             $($b)*
         }
     };
-    // A `const fn` body may not call `note_entered`: the record says so with an empty
-    // `entry_id`, which a gate demanding execution evidence fails on.
     attr(machine = $m:literal, action = $a:literal, project = $p:literal $(,)?)
         ($(# $at:tt)* $vis:vis const fn $n:ident ($($ps:tt)*) $(-> $r:ty)? { $($b:tt)* }) => {
         $(# $at)* $vis const fn $n ($($ps)*) $(-> $r)? {
@@ -120,8 +43,7 @@ macro_rules! refines {
     };
 }
 
-/// Waive a fn the model does not describe: `reason` required, and `machine`/`action`
-/// when the waiver discharges that action.
+/// Waive a fn the model does not describe.
 #[macro_export]
 macro_rules! spec_unmodeled {
     attr($($args:tt)*) ($(# $at:tt)* $vis:vis fn $n:ident ($($ps:tt)*) $(-> $r:ty)? { # ! $($b:tt)* }) => {
@@ -147,13 +69,10 @@ macro_rules! spec_unmodeled {
     };
 }
 
-/// The anchor attributes' general path: the keys in any order, any fn shape. Not an
-/// interface; the attributes above are.
+/// The anchor attributes' general path: the keys in any order, any fn shape.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __aterm_spec_anchor {
-    // ---- The keys, in any order, into four slots: machine action project reason.
-    // A key written twice keeps its last value.
     (@keys $k:ident [$($m:tt)?] [$($a:tt)?] [$($p:tt)?] [$($r:tt)?]
         (machine = $v:literal $(, $($rest:tt)*)?) $item:tt) => {
         $crate::__aterm_spec_anchor! { @keys $k [$v] [$($a)?] [$($p)?] [$($r)?]
@@ -191,8 +110,6 @@ macro_rules! __aterm_spec_anchor {
         $($item)*
     };
 
-    // ---- Each attribute's keys. An optional key's slot becomes `[value ""]` or `[""]`,
-    // so the first literal is its value.
     (@check refines [$m:literal] [$a:literal] [""] [] ($($item:tt)*)) => {
         ::core::compile_error! {
             "missing `project` key: name the fn that projects the real state onto the model's \
@@ -234,7 +151,6 @@ macro_rules! __aterm_spec_anchor {
         $($item)*
     };
 
-    // ---- The fn's name, and whether its body may hold the probe (not a `const fn`).
     (@head $ctx:tt $item:tt ($(# $at:tt)* $vis:vis fn $n:ident $($rest:tt)*)) => {
         $crate::__aterm_spec_anchor! { @split [$ctx $n probe] [] $item }
     };
@@ -261,8 +177,6 @@ macro_rules! __aterm_spec_anchor {
         $($item)*
     };
 
-    // ---- The body: the item's last token tree. Every step leaves at least one behind,
-    // so no step can take the body; the long steps keep the nesting shallow.
     (@split $ctx:tt [$($h:tt)*] ({ $($b:tt)* })) => {
         $crate::__aterm_spec_anchor! { @emit $ctx [$($h)*] { $($b)* } }
     };
@@ -286,8 +200,6 @@ macro_rules! __aterm_spec_anchor {
         $($h)* $last
     };
 
-    // ---- The fn as written, its body prefixed by the record and, where it may hold
-    // one, the probe; after the body's inner attribute when it opens with one.
     (@emit $ctx:tt $head:tt { # ! [$($ia:tt)*] $($b:tt)* }) => {
         $crate::__aterm_spec_anchor! { @inner $ctx $head [#![$($ia)*]] { $($b)* } }
     };
@@ -321,9 +233,6 @@ macro_rules! __aterm_spec_anchor {
         $crate::__aterm_spec_anchor! { @record unmodeled $m $a $r $n }
     };
 
-    // ---- The records, collected at load time where the target has a constructor
-    // section (the list `registry::submit!` names). Elsewhere, wasm32 in practice,
-    // nothing could collect one, so a dev build for that target leaves it out.
     (@record refines $m:literal $a:literal $p:literal $n:ident ($($id:tt)*)) => {
         #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
         $crate::registry::submit! {

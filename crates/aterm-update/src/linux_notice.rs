@@ -7,15 +7,20 @@
 const CLASS: &str = "manifest";
 
 /// How many passes in a row may find another aterm holding the copy's update lock
+/// before it is announced ([`Record::Busy`]): two hours at the loop's one-minute
+/// pass, longer than any bounded download of a release holds it.
 const BUSY_ANNOUNCED_AFTER: u32 = 120;
 
 /// The loop's pause between passes, in seconds (`crate::linux`'s loop sleeps it).
 pub(crate) const PASS_SECS: u64 = 60;
 
 /// How many passes in a row an installed build may wait for its first start before the
+/// wait is said ([`InstallWatch`]): the hour after which the macOS lane says a newer build
+/// that is not running ([`crate::PENDING_UPDATE_OVERDUE_SECS`]), at one pass a minute.
 const START_WAIT_ANNOUNCED_AFTER: u64 = crate::PENDING_UPDATE_OVERDUE_SECS / PASS_SECS;
 
 /// The install half's class, which its recovery names: the window says a crash loop's end
+/// under its title, "Couldn't install updates" ([`crate::INSTALL_CRASH_LOOP_TITLE`]).
 const INSTALL_CLASS: &str = "apply";
 
 /// What one pass of the Linux check loop saw ([`Announcer::tick`]).
@@ -102,12 +107,16 @@ pub(crate) enum Record {
 #[derive(Debug)]
 pub(crate) struct Announcer {
     /// The clock at the loop's start (RFC 3339): a streak last recorded before it
+    /// is not announced.
     started: String,
     /// The body the window shows, said last; `None` = nothing, or a recovery
+    /// answered it.
     shown: Option<String>,
     /// The check half's failure announced and not yet answered, kept while the
+    /// lock's notice is shown over it ([`BUSY_BODY`]).
     failure: Option<Failure>,
     /// The lock's notice is what the window shows: the lock coming free answers it,
+    /// and only it.
     busy_shown: bool,
     /// Consecutive passes whose failure the record did not take.
     unrecorded: u32,
@@ -121,6 +130,7 @@ struct Failure {
     /// The body said for it, last.
     body: String,
     /// The record's last check (`updated_at`) when it was said: only a check recorded
+    /// since then can say the checks work again.
     at: String,
 }
 
@@ -201,6 +211,7 @@ impl Announcer {
     }
 
     /// Show `body` (`news`: a first announcement is owed), or restate it when it
+    /// differs from what the window shows; `None` when it is shown already.
     fn show(&mut self, body: String, news: bool) -> Option<(String, String)> {
         let title = match &self.shown {
             None if news => crate::health_failing_title(CLASS).to_string(),
@@ -220,6 +231,7 @@ pub(crate) struct InstallWatch {
     /// The wait was said ([`crate::INSTALL_AWAITS_START_TITLE`]) and is not yet over.
     wait_said: bool,
     /// A crash loop's end (a rollback, or a build kept) was said, and no started newer
+    /// build has answered it yet.
     failure_said: bool,
 }
 
@@ -272,6 +284,7 @@ impl InstallWatch {
 }
 
 /// What an install waiting past [`START_WAIT_ANNOUNCED_AFTER`] passes says: what waits,
+/// how many of its starts began, what ends it, and what waits with it.
 fn start_wait_body(version: &str, starts: u32) -> String {
     let begun = match starts {
         0 => "has not started yet".to_string(),
@@ -361,6 +374,7 @@ impl Reporter {
 }
 
 /// The body of a failing or restated announcement: the count and the reason, in the
+/// macOS notice's shape.
 fn failing_body(failing_checks: Option<u32>, outcome: &str) -> String {
     let reason = outcome.trim_end_matches('.');
     match failing_checks {
@@ -375,6 +389,7 @@ mod tests {
     use std::slice::from_ref;
 
     /// A healthy pass that changes the outcome owes no notice but still cues the window,
+    /// through the loop's own step ([`Reporter::report`]); the same outcome again does not.
     #[test]
     fn a_changed_outcome_cues_the_window_with_no_notice_owed() {
         use std::sync::Arc;
@@ -435,6 +450,8 @@ mod tests {
     }
 
     /// A pass over a copy whose installed `version` waits for a start (`awaiting`), was
+    /// started (`started`), or refuses a newer build it rolled back (`rolled_back`), with
+    /// no start counted.
     fn over<'a>(
         outcome: &'a str,
         version: &'a str,
@@ -475,6 +492,7 @@ mod tests {
     const NOTHING: (bool, bool, bool) = (false, false, false);
 
     /// THE WAIT IS SAID ONCE, AT ITS DEADLINE, AS NO FAILURE, AND ITS END IS SAID (U21 and
+    /// its review).
     #[test]
     fn an_install_waiting_for_a_start_is_said_at_its_deadline_and_the_start_answers_it() {
         let waiting = "aterm 0.11.0 is installed";
@@ -522,6 +540,7 @@ mod tests {
     }
 
     /// A CRASH LOOP'S END IS SAID FROM THE RECORD, AND A NEWER STARTED INSTALL ANSWERS IT
+    /// (U21 and its reviews).
     #[test]
     fn a_crash_loops_end_is_said_from_the_record_and_a_newer_started_install_answers_it() {
         let rolled = "aterm 0.11.0 didn\u{2019}t start properly in 3 launches, so aterm 0.10.0 \
@@ -632,6 +651,7 @@ mod tests {
     }
 
     /// A failed pass the record did not take, under the lock (a save the full or
+    /// read-only folder refused): its count is the one from before.
     fn unrecorded<'a>(outcome: &'a str, failing_checks: u32, updated_at: &'a str) -> Pass<'a> {
         Pass {
             record: Record::Lost,
@@ -640,6 +660,7 @@ mod tests {
     }
 
     /// A failed pass that never reached the lock: the settings or the record would
+    /// not read, so the record did not take it either.
     fn before_the_lock<'a>(outcome: &'a str, failing_checks: u32, updated_at: &'a str) -> Pass<'a> {
         Pass {
             took_lock: false,
@@ -657,6 +678,7 @@ mod tests {
     }
 
     /// A pass that failed before reaching the lock neither answers the lock's notice nor
+    /// restarts its count; the first pass that takes the lock answers it.
     #[test]
     fn a_pass_that_failed_before_the_lock_neither_answers_nor_restarts_its_notice() {
         let held = "Another aterm is updating this copy right now; try again when it finishes";
@@ -723,6 +745,7 @@ mod tests {
     }
 
     /// A lock held past [`BUSY_ANNOUNCED_AFTER`] passes (e.g. `aterm update check` stopped
+    /// with Ctrl-Z) is announced once, and its release is the recovery.
     #[test]
     fn a_lock_held_past_its_bound_is_said_once_and_its_release_recovers() {
         let mut notice = Announcer::new(START.into());
@@ -761,6 +784,7 @@ mod tests {
     }
 
     /// An install zeroes the failure count with no check run: the recovery waits for a
+    /// check recorded after the announcement.
     #[test]
     fn a_zeroed_count_with_no_check_since_is_no_recovery() {
         let mut notice = Announcer::new(START.into());
@@ -794,6 +818,7 @@ mod tests {
     }
 
     /// The lock coming free does not answer a failure said under its notice: the failure
+    /// is said again, and only a check recorded since answers it.
     #[test]
     fn the_lock_coming_free_does_not_answer_a_failure_under_its_notice() {
         let mut notice = Announcer::new(START.into());
@@ -851,6 +876,7 @@ mod tests {
     }
 
     /// Once the record stops taking failures (the folder turns read-only), the body names
+    /// no stale count.
     #[test]
     fn a_streak_the_record_stopped_taking_names_no_stale_count() {
         let mut notice = Announcer::new(START.into());
@@ -875,6 +901,7 @@ mod tests {
     }
 
     /// The loop counts failures the record cannot hold (a full disk): the third in a row is
+    /// announced, and any pass the record took restarts the count.
     #[test]
     fn a_failure_the_record_cannot_hold_is_counted_by_the_loop() {
         let mut notice = Announcer::new(START.into());
@@ -907,6 +934,7 @@ mod tests {
     }
 
     /// Only a persistent failure is announced: three in a row under the failing title, a
+    /// changed reason or count restated quietly, then the recovery naming its class.
     #[test]
     fn only_a_persistent_failure_is_announced_and_its_recovery_follows() {
         let mut notice = Announcer::new(START.into());
@@ -997,6 +1025,7 @@ mod tests {
     }
 
     /// THE INSTALL HALF'S RECOVERY WAITS FOR THE CHECK HALF (the review of
+    /// , U21).
     #[test]
     fn the_install_halfs_recovery_waits_for_the_check_half() {
         let rolled = "aterm 0.11.0 didn\u{2019}t start properly in 3 launches, so aterm 0.10.0 \
@@ -1053,7 +1082,7 @@ mod tests {
         );
     }
 
-    /// A WAIT THAT ENDS WITH NO START IS ANSWERED (the reviews of U21). A wait said, and
+    /// A WAIT THAT ENDS WITH NO START IS ANSWERED (the reviews of U21).
     #[test]
     fn a_wait_that_ends_with_no_start_is_answered() {
         let waiting = "aterm 0.11.0 is installed";

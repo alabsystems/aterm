@@ -308,6 +308,7 @@ fn stall_exception() -> Exception {
 }
 
 /// EVERY ENTRY THE HOST CAN WRITE passes the door as a `Later` ask (an entry the
+/// door refuses is never shown).
 #[test]
 fn every_host_entry_passes_the_door_and_the_caps() {
     let record_keys: Vec<String> = HealthKind::ALL
@@ -341,6 +342,11 @@ fn every_host_entry_passes_the_door_and_the_caps() {
 }
 
 /// A REMOVED FEATURE'S SETTINGS ARE ONE ENTRY UNTIL THEY GO (design §7): an
+/// `aterm.toml` that still configures the network drive, in any spelling —
+/// a `[net]` header, a `[[net.connections]]` array with no header, an inline
+/// table, a dotted key — is told once, naming what replaced it, and every load
+/// that still finds it says the same entry again rather than a second one; the
+/// load that no longer finds it ends it.
 #[test]
 fn a_removed_features_settings_are_one_entry_until_they_go() {
     let net = &mr::REMOVED_FEATURES[0];
@@ -389,12 +395,16 @@ fn a_removed_features_settings_are_one_entry_until_they_go() {
 }
 
 /// A `[net]` table that names every credential the network drive kept: the
+/// TLS key (whose folder held its persistent drive token), the certificate,
+/// and two saved connections, one with a `token_file` and one without.
 const NET_WITH_CREDENTIALS: &str = "[net]\nlisten = \"0.0.0.0:7100\"\ncert = \
      \"/keys/net-cert.der\"\nkey = \"/keys/net-key.der\"\n\n[[net.connections]]\nname = \
      \"box\"\nhost = \"box:7100\"\ntoken_file = \"/keys/box.token\"\n\n[[net.connections]]\n\
      name = \"lab\"\nhost = \"lab:7100\"\n";
 
 /// The same at a real home's length: the key and certificate in the config
+/// folder, and four connections, two with a `token_file` (one beside the key,
+/// one in another folder) and two without.
 const NET_AT_HOME: &str = "[net]\nlisten = \"0.0.0.0:7100\"\n\
      cert = \"/home/alexandra/.config/aterm/net/drive-cert.der\"\n\
      key = \"/home/alexandra/.config/aterm/net/drive-key.der\"\n\
@@ -406,6 +416,8 @@ const NET_AT_HOME: &str = "[net]\nlisten = \"0.0.0.0:7100\"\n\
      [[net.connections]]\nname = \"office-mini\"\nhost = \"office-mini:7100\"\n";
 
 /// Whether a line of `detail` names the file `name` in `folder`: its whole
+/// path, ended by the line or a list's `,` or `;`, or `name` in the list after
+/// `in <folder>: `.
 fn names_file(detail: &[String], folder: &str, name: &str) -> bool {
     let whole = std::path::Path::new(folder)
         .join(name)
@@ -431,6 +443,12 @@ fn names_file(detail: &[String], folder: &str, name: &str) -> bool {
 }
 
 /// THE NETWORK DRIVE'S CREDENTIALS ARE NAMED WHILE ITS TABLE STILL SAYS WHERE
+/// THEY ARE (design §7): an `aterm.toml` whose `[net]` names a TLS key, a
+/// certificate and saved connections gets Details naming each file — the
+/// drive token in the key's folder, a connection's `token_file`, the key, the
+/// certificate — and, on macOS, the Keychain service and every connection's
+/// name; elsewhere every connection's conventional file, which `dial-token`
+/// wrote whatever its `token_file` said.
 #[test]
 fn the_network_drives_left_credentials_are_named_from_its_table() {
     let home = "/home/alexandra/.config/aterm/net";
@@ -512,6 +530,11 @@ fn the_network_drives_left_credentials_are_named_from_its_table() {
 }
 
 /// A TABLE A REMOVED FEATURE LEFT BEHIND (`[operator]`, 2026-10-15) is one
+/// line of the digest while `aterm.toml` still writes it — said again at a
+/// reload, still one line — its one step the deletion that ends it, its
+/// navigation opening the file at the table's line, and its reason and
+/// Details naming the manager session that replaced it on every platform;
+/// the reload that drops the table ends it.
 #[test]
 fn a_removed_table_is_one_line_while_the_file_writes_it() {
     let operator = mr::REMOVED_FEATURES
@@ -565,6 +588,7 @@ fn a_removed_table_is_one_line_while_the_file_writes_it() {
 }
 
 /// A self-mending fact is an entry only once it outlasts its horizon (`except_after`), and an
+/// end before then withdraws it unseen.
 #[test]
 fn a_claim_ripens_at_its_horizon_and_an_end_withdraws_it() {
     let mut app = App::headless_for_test();
@@ -602,6 +626,7 @@ fn a_claim_ripens_at_its_horizon_and_an_end_withdraws_it() {
 }
 
 /// A failing update kind is a record now and one `update.review.<kind>` line once its streak is
+/// a day old (dated from the body, so a process starting on day six says it at once).
 #[test]
 fn updates_failing_for_a_day_are_one_line_and_the_healing_ends_it() {
     let stamp = |ago: u64| {
@@ -668,6 +693,7 @@ fn updates_failing_for_a_day_are_one_line_and_the_healing_ends_it() {
 }
 
 /// `health_entry_delay` is the day less what the streak has spent, clamped to `0..=1 day`; a
+/// body with no readable start counts from now.
 #[test]
 fn the_entry_delay_is_the_day_less_the_streak_so_far() {
     let now = 1_790_640_000_i64;
@@ -691,6 +717,7 @@ fn the_entry_delay_is_the_day_less_the_streak_so_far() {
 }
 
 /// A warning an older parent carried across an update crosses as its excerpt alone
+/// (`since Sep 28`), dated to the end of that day in the latest year whose day has begun.
 #[test]
 fn a_carried_excerpt_dates_the_day_from_the_end_of_its_day() {
     let now = 1_790_640_000_i64;
@@ -711,6 +738,7 @@ fn a_carried_excerpt_dates_the_day_from_the_end_of_its_day() {
 }
 
 /// A failing supervisor is one record per episode and a `harness.supervisor.<tab>.failing` line
+/// after an hour of failures; steady again ends it.
 #[test]
 fn a_supervisor_that_keeps_failing_is_a_record_then_a_line_after_an_hour() {
     let mut app = App::headless_for_test();
@@ -774,6 +802,7 @@ fn a_supervisor_that_keeps_failing_is_a_record_then_a_line_after_an_hour() {
 }
 
 /// A rating card the harness will not press: a record now, "press 0 in that tab" an hour on,
+/// gone with the card.
 #[test]
 fn a_card_the_harness_will_not_press_is_a_record_then_a_line_after_an_hour() {
     let mut app = App::headless_for_test();
@@ -820,6 +849,7 @@ fn a_card_the_harness_will_not_press_is_a_record_then_a_line_after_an_hour() {
 }
 
 /// Two 6 h passes that freed nothing are one `disk.low` line; the record names the figures and
+/// where the space is, and space coming back ends it.
 #[test]
 fn a_volume_aterm_could_not_help_is_one_line_and_space_ends_it() {
     let mut app = App::headless_for_test();
@@ -878,6 +908,10 @@ fn a_volume_aterm_could_not_help_is_one_line_and_space_ends_it() {
 }
 
 /// THE FULL DISK, ON THE GLASS ONLY WHILE THE OWNER IS NEEDED: what a pass
+/// freed is a fact for later (one `disk.freed` line of the digest, nothing
+/// standing); a volume the look left at its emergency is the one standing
+/// alert (`system.disk.full`), restated in place, and the volume out of its
+/// emergency ends it.
 #[test]
 fn a_full_disk_is_one_standing_alert_and_what_was_freed_is_a_fact() {
     let mut app = App::headless_for_test();
@@ -924,6 +958,10 @@ fn a_full_disk_is_one_standing_alert_and_what_was_freed_is_a_fact() {
 }
 
 /// THE DEVELOPER TOOLS LIST is one line however often a
+/// reading says `not_granted`, whose one press opens the Developer Tools pane and whose
+/// second capsule opens aterm's own Settings ▸ Security, in `atpkg::devtools`' words (owner
+/// ask 2026-10-15: one spelling on every surface); a reading that finds aterm on the list
+/// ends it; `unknown` leaves it as it was.
 #[test]
 fn the_developer_tools_list_is_one_line_and_a_reading_decides_it() {
     use crate::devtools_watch::Step;
@@ -1038,6 +1076,7 @@ fn the_developer_tools_list_is_one_line_and_a_reading_decides_it() {
 }
 
 /// An unreadable `[disk]` setting that turned cleanup off is one `disk.settings` line until a
+/// look reads the settings; a short volume meanwhile is its own `disk.low-cleanup-off` line.
 #[test]
 fn a_disk_setting_that_turns_cleanup_off_is_one_line_until_it_reads_again() {
     let mut app = App::headless_for_test();
@@ -1124,6 +1163,7 @@ fn a_disk_setting_that_turns_cleanup_off_is_one_line_until_it_reads_again() {
 }
 
 /// A short volume is one low-disk line in the form last told (cleanup-off or the passes'), each
+/// form recorded once; a change of form keeps what the owner filed until space is back.
 #[test]
 fn a_short_volume_is_one_low_disk_line_in_the_form_last_told() {
     let mut app = App::headless_for_test();
@@ -1180,6 +1220,7 @@ fn a_short_volume_is_one_low_disk_line_in_the_form_last_told() {
 }
 
 /// An upgrade that cannot run is one `harness.upgrade-host.cannot-run` line, ended when the last
+/// such tab runs again (or its worker ends), never by a pass over the rows.
 #[test]
 fn an_upgrade_that_cannot_run_is_one_line_until_the_last_tab_runs_again() {
     let mut app = App::headless_for_test();
@@ -1213,6 +1254,9 @@ fn an_upgrade_that_cannot_run_is_one_line_until_the_last_tab_runs_again() {
 }
 
 /// THE RECORDS' FOLDER THE UPGRADES' VIEW CANNOT LIST is
+/// the host's fact, `harness.upgrade-host.records-unlisted`, in the
+/// classifier's words with the folder under Details: until it, the upgrades
+/// shown stood at the last whole look with nothing said.
 #[test]
 fn a_records_folder_the_view_cannot_list_is_one_line_until_it_is_listed() {
     let mut app = App::headless_for_test();
@@ -1249,6 +1293,10 @@ fn a_records_folder_the_view_cannot_list_is_one_line_until_it_is_listed() {
 }
 
 /// THE RECORDS THE UPGRADES' VIEW CANNOT READ (host-8) are
+/// the host's fact, `harness.upgrade-host.records-unreadable`, in the
+/// classifier's words with each file under Details: until it, a record that
+/// could not be read froze its tab's upgrade row and mark with nothing
+/// said.
 #[test]
 fn records_the_view_cannot_read_are_one_line_until_they_read() {
     let mut app = App::headless_for_test();
@@ -1305,6 +1353,8 @@ fn records_the_view_cannot_read_are_one_line_until_they_read() {
 }
 
 /// What a note of the accounts may never move: the band's rows, a tab's
+/// attention (its strip's bit, its session's badge), and the band's re-grid
+/// count (presence owns no row to re-grid).
 fn glass(app: &App) -> (usize, usize, usize, u64) {
     let marked = app
         .windows
@@ -1329,6 +1379,8 @@ fn glass(app: &App) -> (usize, usize, usize, u64) {
 }
 
 /// THE CLAUDE ACCOUNTS' TWO LINES (`HostNote::Accounts`), walked: an account
+/// signed out is ONE line, `harness.accounts.signed-out`, whose key and action
+/// hold while its first label does; none signed out ends it.
 #[test]
 fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
     use crate::messages_host::wall_stamp_now;
@@ -1527,6 +1579,14 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
 }
 
 /// THE ACCOUNT'S USAGE LINES (`HostNote::Accounts`, accounts v2 S5): usage
+/// credits carrying an account's sessions are ONE line,
+/// `harness.accounts.credits`, raised once — the same note again moves
+/// nothing — and ended when nothing names it (credits over); the week nearly
+/// used with credits off is ONE line, `harness.accounts.window-full`, whose
+/// action is to turn credits on, or to raise their cap where the vendor said
+/// they ran out — under `[harness] usage_credits = false`, the default, with
+/// that key set too, since the harness keeps the session on the plan until
+/// the reset whatever the account allows.
 #[test]
 fn the_accounts_usage_lines_follow_what_the_host_says_and_mark_nothing() {
     let mut app = App::headless_for_test();
@@ -1633,6 +1693,8 @@ fn the_accounts_usage_lines_follow_what_the_host_says_and_mark_nothing() {
 }
 
 /// A `Later` point only a person can answer is one `harness.resume.<kind>` line naming its tabs,
+/// a stall one `harness.resume.<tab>.stalled` line per tab; each ends ten minutes after the last
+/// look that named it.
 #[test]
 fn a_resume_exception_is_one_line_per_kind_and_a_stall_one_per_tab_and_each_ends_with_its_fact() {
     let mut app = App::headless_for_test();
@@ -1714,6 +1776,8 @@ fn a_resume_exception_is_one_line_per_kind_and_a_stall_one_per_tab_and_each_ends
 }
 
 /// A failing relaunch is a record, and a line only after an hour for a cause a person clears;
+/// `relaunch = false` is a record; an agent that cannot come back is the tab's mark when its
+/// command is known, else one line; the agent running again ends every line.
 #[test]
 fn a_relaunch_is_a_record_and_only_what_a_person_alone_can_mend_is_a_line() {
     let mut app = App::headless_for_test();
@@ -1875,6 +1939,8 @@ fn a_relaunch_is_a_record_and_only_what_a_person_alone_can_mend_is_a_line() {
 }
 
 /// The sid of a headless App's front tab, registered in the store at real length (22
+/// characters, as `aterm ctl ls` prints): its digest keys are shortened to the key cap, the
+/// shape the closed-tab and adoption decisions work on.
 fn front_tab_sid(app: &mut App) -> String {
     let local = app
         .focused_session_id(crate::WindowId(0))
@@ -1894,6 +1960,11 @@ const REAL_SID: &str = "s-3e79b5bde172ad0088ad";
 const CLOSED_SID: &str = "s-9f8e7d6c5b4a39281706";
 
 /// A RELAUNCH LINE ENDS WITH ITS TAB (review of 2026-09-29): the worker of a
+/// closed tab has no later word, so a claim that is still ripening, and a line
+/// already standing, end when no tab shows the session — the line of what a
+/// restart did not bring back too (`not-restored`, the decision review's
+/// RR-LC-2: it has no ending word at all, and stood with a Show-tab link to a
+/// tab that was gone).
 #[test]
 fn a_relaunch_claim_and_line_end_when_their_tab_is_gone() {
     let mut app = App::headless_for_test();
@@ -1961,6 +2032,9 @@ fn a_relaunch_claim_and_line_end_when_their_tab_is_gone() {
 }
 
 /// A RESUME THAT WOULD LOSE TURNS IS NEVER TOLD TO BE RESUMED (the Gemini
+/// CLI lane's pre-check, `refused:history-unsafe`): its Messages line's step
+/// is its own, with its conversation known and without; so is a session that
+/// took no turn.
 #[test]
 fn a_resume_that_would_lose_turns_is_never_told_to_be_resumed() {
     use crate::harness_host::cannot_then;
@@ -2003,6 +2077,10 @@ fn a_resume_that_would_lose_turns_is_never_told_to_be_resumed() {
 }
 
 /// A `lost` LINE ENDS WITH ITS TAB TOO (the review of LC-4):
+/// it says "run the command below in that tab" and shows that tab, and its
+/// host forgets the tab's word with it, so nothing would end it once the
+/// tab is gone — a Warn that resurfaces for the rest of the process, its
+/// action pointing at a tab that is gone or another tab now.
 #[test]
 fn a_lost_line_ends_when_its_tab_is_gone() {
     let mut app = App::headless_for_test();
@@ -2033,6 +2111,10 @@ fn a_lost_line_ends_when_its_tab_is_gone() {
 }
 
 /// TWO LOSSES OF ONE TAB, EACH ENDED BY ITS OWN END (the merge of LC-4 into
+/// XREV-LC-2): what a restart did not bring back (`not-restored`, a monitor
+/// the resumed build said is gone) and an agent that cannot come back on a
+/// known conversation (`lost`) stand side by side, neither writing over the
+/// other's words.
 #[test]
 fn a_lost_word_and_what_a_restart_did_not_bring_back_end_each_on_its_own() {
     let mut app = App::headless_for_test();
@@ -2129,6 +2211,8 @@ fn a_lost_word_and_what_a_restart_did_not_bring_back_end_each_on_its_own() {
 }
 
 /// The closed-tab sweep runs on every loop turn and judges only what is
+/// there to judge: with no relaunch line or claim open, a told mark alone
+/// still ends with its tab, and every other fact the host holds stands.
 #[test]
 fn a_told_relaunch_mark_alone_ends_with_its_tab_and_nothing_else_moves() {
     let mut app = App::headless_for_test();
@@ -2153,6 +2237,7 @@ fn a_told_relaunch_mark_alone_ends_with_its_tab_and_nothing_else_moves() {
 }
 
 /// A relaunch line an earlier process left is ended by the adoption sweep unless this process's
+/// worker told of it, for short and real-length ids (whose keys carry a shortened subject).
 #[test]
 fn the_adoption_sweep_ends_relaunch_lines_this_process_did_not_tell() {
     for (old, told) in [("s-old", "s-told"), ("s-1a2b3c4d5e6f708192a3", REAL_SID)] {
@@ -2194,11 +2279,19 @@ fn the_adoption_sweep_ends_relaunch_lines_this_process_did_not_tell() {
 }
 
 /// The loop's notice for Claude Code's lost login carried to the browser
+/// sign-in (`policy/exception.rs`): `Now`, and no escalation of the loop's
+/// carries it.
 fn stuck_login_exception() -> Exception {
     Exception::of_notice(&notice::LOGIN_SIGN_IN, None, None, "the agent working")
 }
 
 /// A NOW NO ESCALATION OF THE LOOP'S CARRIES IS THE OWNER'S ASK ON THE GLASS
+/// (the alert rule: the owner is needed now, aterm cannot settle it, and one
+/// step changes it): a tab's lost login carried to the owner's sign-in is ONE
+/// standing row, `harness.resume-ask.<tab>.<code>`, `Now`-class, in the
+/// owner's four parts — the one step first, then what happened, what aterm
+/// did and what follows — and NO line of the digest beside it: Settings > Messages lists
+/// the ask once (the review's messages-double).
 #[test]
 fn a_now_no_escalation_carries_is_a_standing_ask_until_its_point_moves_on() {
     use aterm_messages::need::Need;
@@ -2305,6 +2398,8 @@ fn a_now_no_escalation_carries_is_a_standing_ask_until_its_point_moves_on() {
 }
 
 /// ONE LOSS, ONE ROW IN SETTINGS ▸ MESSAGES (the owner's capture, 2026-10-19:
+/// "Claude's login expired in tab 1" listed three times, beside "Claude
+/// sign-in cancelled"): a tab's login notices are one story.
 #[test]
 fn a_lost_logins_notices_are_one_row_in_their_latest_words_closed_fixed_once_it_is_back() {
     use aterm_messages::need::Need;
@@ -2478,6 +2573,11 @@ fn notice_rows(app: &App, sid: &str) -> Vec<aterm_messages::MessageId> {
 }
 
 /// A NOTICE THE OWNER READ STAYS QUIET WHILE ITS LOSS STANDS — the commit's
+/// own rule for the per-notice keys — even after the loss's next notice told
+/// its story on (the read row replaced, so the page lists the loss once): the
+/// sign-in read, then cancelled, then the sign-in again is no news, and the
+/// cancelled ask leaves the band as the sign-in's quiet return withdraws it,
+/// as on a tab whose read row was never replaced.
 #[test]
 fn a_read_notice_stays_quiet_after_the_next_notice_tells_its_story_on() {
     let mut app = App::headless_for_test();
@@ -2515,6 +2615,10 @@ fn a_read_notice_stays_quiet_after_the_next_notice_tells_its_story_on() {
 }
 
 /// A LOSS WHOSE END NO LOOP TOLD IS NEVER SWALLOWED BY THE NEXT: a renewed
+/// login's held move (`renewed-draft`) that then landed under a loop that
+/// ended, say, tells no login back, and the tab's next loss a day later is a
+/// loss of its own — its own row beside the earlier one, which keeps its
+/// words, and the login back closes the new one alone.
 #[test]
 fn a_loss_with_no_word_for_its_span_is_not_swallowed_by_the_next() {
     use crate::exceptions_host::NOTICE_STORY_SPAN;
@@ -2567,6 +2671,9 @@ fn a_loss_with_no_word_for_its_span_is_not_swallowed_by_the_next() {
 }
 
 /// ANOTHER EXCEPTION OF THE TAB'S IS NO WORD OF ITS LOSS: a stall told a day
+/// after a loss whose end no loop told (its ask long withdrawn) does not keep
+/// that loss's story open, so the tab's next loss is a row of its own beside
+/// it, as with no tell at all.
 #[test]
 fn another_exception_of_the_tab_keeps_no_loss_open() {
     use crate::exceptions_host::NOTICE_STORY_SPAN;
@@ -2595,6 +2702,10 @@ fn another_exception_of_the_tab_keeps_no_loss_open() {
 }
 
 /// A LOSS AN EARLIER PROCESS CARRIED HERE CLOSES FIXED WHEN THIS ONE SEES THE
+/// LOGIN BACK: a seamless update carries a tab's standing notice, and the
+/// successor's own loop tells the same notice in the same words (a duplicate
+/// of the carried row, so the story is told in it), then its end, then the
+/// login back: the carried row's record reads `✓` in the notice's fix words.
 #[test]
 fn a_carried_notice_told_again_closes_fixed_when_the_login_is_back() {
     for back in [true, false] {
@@ -2648,6 +2759,11 @@ fn a_carried_notice_told_again_closes_fixed_when_the_login_is_back() {
 }
 
 /// A USAGE LIMIT'S RECORD CLOSES AS THE SWITCH IT WAS, NEVER AS A LOGIN BACK
+/// (the review of the login carry, r8c-7: once a move onto another account
+/// landed, every usage limit's record in Settings ▸ Messages read `Claude's
+/// login is back`, though no login was lost): the host's login-back note
+/// closes the story in its notice's own fix words, its row still standing or
+/// already withdrawn.
 #[test]
 fn a_usage_limits_record_closes_as_a_switch_never_as_a_login_back() {
     for (text, words) in [
@@ -2693,6 +2809,10 @@ fn a_usage_limits_record_closes_as_a_switch_never_as_a_login_back() {
 }
 
 /// A USAGE LIMIT THAT ENDED BY ITSELF CLOSES AS NO SWITCH (the review of
+/// the login carry, r9h-3): the row withdrawn and the story kept whatever
+/// ended the ask, a login back told later — a lost login's, an account move
+/// days on — closed the limit's record `Claude switched accounts`, though
+/// its reset had ended it.
 #[test]
 fn a_usage_limit_that_ended_by_itself_closes_as_no_switch() {
     use crate::exceptions_host::NOTICE_STORY_SPAN;
@@ -2738,6 +2858,7 @@ fn a_usage_limit_that_ended_by_itself_closes_as_no_switch() {
 }
 
 /// A resume line an earlier process left open, which no loop here tells of, ends with the first
+/// whole answer after the settle.
 #[test]
 fn a_resume_line_an_earlier_process_left_open_ends_after_the_settle() {
     let mut app = App::headless_for_test();
@@ -2769,6 +2890,8 @@ fn a_resume_line_an_earlier_process_left_open_ends_after_the_settle() {
 }
 
 /// The pure half: the same kind in two tabs is one entry whose title counts the tabs and whose
+/// detail names them, one tab keeps its own place and its `Show tab` button, and a lost login
+/// (`Now`) is no entry at all.
 #[test]
 fn a_kind_in_two_tabs_is_one_entry_that_names_them() {
     let spot = |n: u16| mr::UpgradeSpot {
@@ -2841,6 +2964,8 @@ fn a_kind_in_two_tabs_is_one_entry_that_names_them() {
 }
 
 /// The stall canary's 90-minute rung is one record and one `aterm.log` error per episode, never
+/// a digest line or a tab mark (the digest waits for the third hour,
+/// [`ExceptionKind::Stalled`]); its end lets the next episode be told.
 #[test]
 fn a_stall_at_ninety_minutes_is_a_record_once_and_no_line() {
     let mut app = App::headless_for_test();
@@ -2870,6 +2995,10 @@ fn a_stall_at_ninety_minutes_is_a_record_once_and_no_line() {
 }
 
 /// A STALL ON THE AGENT'S OWN BACKGROUND WORK SPEAKS OF THAT AGENT AND ITS
+/// WORK (agy's and Muse Code's ladder told the
+/// window "Claude has stalled" over "Claude's own title has said idle … over
+/// a screen this build does not recognise", where no title was read, the
+/// screen was read, and the agent was not Claude).
 #[test]
 fn a_stall_on_an_agents_own_work_names_that_agent_and_reads_no_title() {
     let record = |agent: Program, stall: StallSeen| {
@@ -2949,6 +3078,8 @@ fn a_stall_on_an_agents_own_work_names_that_agent_and_reads_no_title() {
 }
 
 /// A STALL ON A BACKGROUND CALL THAT MADE NO PROGRESS speaks of that call (the
+/// hung-call design's R1: the canary said "a screen this build does not
+/// recognise" over a test asleep on its own mutex for 26 h).
 #[test]
 fn a_stall_on_a_call_that_made_no_progress_names_its_pid_and_passes_the_door() {
     use aterm_agent::supervise::BackgroundCall;
@@ -2998,6 +3129,8 @@ fn a_stall_on_a_call_that_made_no_progress_names_its_pid_and_passes_the_door() {
 }
 
 /// A PALETTE SET THE OWNER'S CONFIG REFUSED is one digest line for every tab,
+/// naming the setting: never a band row, and a session's later refusals (or
+/// another session's first) add nothing.
 #[test]
 fn a_refused_palette_set_is_one_line_naming_the_setting() {
     let mut app = App::headless_for_test();
@@ -3024,6 +3157,7 @@ fn a_refused_palette_set_is_one_line_naming_the_setting() {
 }
 
 /// TURNING PALETTE SETS BACK ON ends the refusal line: its one action is
+/// done.
 #[test]
 fn turning_palette_sets_on_clears_the_refusal_line() {
     fn apply(app: &mut App, dir: &std::path::Path, text: &str) {
@@ -3082,6 +3216,8 @@ fn turning_palette_sets_on_clears_the_refusal_line() {
 }
 
 /// A repaint that gave up is one `render.<tab>.unrepaired` line ("Tab N may be one row off"),
+/// with no tab mark, band row or re-grid, and only while its epoch is the tab's open, at-risk
+/// one: a give-up for a healed epoch, or a session the store does not know, raises nothing.
 #[test]
 fn a_repaint_that_gave_up_is_one_line_and_none_for_a_healed_epoch() {
     let mut app = App::headless_for_test();
@@ -3100,6 +3236,7 @@ fn a_repaint_that_gave_up_is_one_line_and_none_for_a_healed_epoch() {
 }
 
 /// A pool session the store knows (so `render.<sid>.unrepaired` can name it) whose timeline
+/// holds an open, at-risk render epoch (a restored engine's synthetic epoch), and its sid.
 fn session_with_open_epoch(app: &mut App, local: u64) -> (u64, String) {
     use crate::resize_ledger::EngineProbe;
     let session = crate::stub_session(local);
@@ -3173,6 +3310,7 @@ fn a_render_line_stands_while_its_epoch_is_at_risk_and_ends_when_it_heals() {
 }
 
 /// An adoption nudge (a blank agent tab) names no epoch of the ledger, so it is a log line,
+/// never a digest line that would flash for one loop turn.
 #[test]
 fn an_adoption_nudge_that_gave_up_raises_no_digest_line() {
     let mut app = App::headless_for_test();
@@ -3185,6 +3323,7 @@ fn an_adoption_nudge_that_gave_up_raises_no_digest_line() {
 }
 
 /// Every event family's end ends a line an earlier process raised, adopted from the log with
+/// none of the in-memory facts (`supervisor_failing`, `host_noted`, `render_unrepaired`).
 #[test]
 fn the_ends_of_the_event_families_end_lines_an_earlier_process_raised() {
     let mut app = App::headless_for_test();
@@ -3223,6 +3362,7 @@ fn the_ends_of_the_event_families_end_lines_an_earlier_process_raised() {
 }
 
 /// A render line whose epoch this process holds at risk is not an orphan: the adoption sweep of
+/// `check_render_repairs` leaves it to its epoch.
 #[test]
 fn an_adopted_render_line_ends_but_a_held_one_stands() {
     let mut app = App::headless_for_test();
@@ -3240,6 +3380,7 @@ fn an_adopted_render_line_ends_but_a_held_one_stands() {
 }
 
 /// The supervisor lines an earlier process left that this one has heard nothing of for its
+/// steady time end; the ones it holds stand.
 #[test]
 fn the_adoption_sweep_ends_supervisor_lines_nothing_has_told_of() {
     for (old, held) in [("s-old", "s-held"), ("s-1a2b3c4d5e6f708192a3", REAL_SID)] {
@@ -3277,6 +3418,8 @@ fn the_adoption_sweep_ends_supervisor_lines_nothing_has_told_of() {
 }
 
 /// The Full Disk Access card, in the order it is used: the owner presses the button
+/// (`Answered`), the probe then reads the grant, and the regression after the next update is
+/// news again.
 #[test]
 fn a_verified_grant_after_the_owners_answer_makes_the_next_regression_news() {
     use aterm_messages::ActionIndex;
@@ -3310,6 +3453,8 @@ fn a_verified_grant_after_the_owners_answer_makes_the_next_regression_news() {
 }
 
 /// atpkg's `foreign:` lines (a foreign rustup `trust` link, a managed tool shadowed on PATH) are
+/// one entry per look carrying atpkg's fix, re-said as the same entry and ended by that look's
+/// first report that sees nothing.
 #[test]
 fn foreign_tools_are_one_entry_per_look_with_atpkgs_fix_ended_when_it_sees_none() {
     use atpkg::cli::{FOREIGN_MARKER, FOREIGN_NONE, FOREIGN_PATH, FOREIGN_SEAM};
@@ -3383,6 +3528,10 @@ fn foreign_tools_are_one_entry_per_look_with_atpkgs_fix_ended_when_it_sees_none(
 }
 
 /// A pass that laid programs down on a machine without a C toolchain says
+/// `c-toolchain: missing`: ONE entry naming atpkg's fix (on macOS `aterm init --only
+/// base.clt`), a fact for later that is never on screen, filed once however many passes say
+/// it, and ended by a pass that finds one that builds (docs/DESIGN-init-system-2026-10-20.md
+/// §4.2 `base.clt`).
 #[test]
 fn a_missing_c_toolchain_is_one_entry_naming_atpkgs_fix_ended_when_one_builds() {
     use crate::toolchain_words::{CToolchain, c_toolchain_entry};
@@ -3423,6 +3572,8 @@ fn a_missing_c_toolchain_is_one_entry_naming_atpkgs_fix_ended_when_one_builds() 
 }
 
 /// `c-toolchain: broken` (off macOS, a compiler without the headers an install supplies)
+/// is its own entry, worded as a compiler that cannot build, never "no compiler is
+/// installed"; one cause's verdict ends the other's, and `ready` ends whichever is open.
 #[test]
 fn a_broken_c_toolchain_is_its_own_entry_and_each_verdict_ends_the_other() {
     use crate::toolchain_words::{CToolchain, c_toolchain_entry};
@@ -3458,6 +3609,10 @@ fn a_broken_c_toolchain_is_its_own_entry_and_each_verdict_ends_the_other() {
 }
 
 /// A RELAUNCH THAT KEEPS FAILING WITH NO COMMAND THE TAB'S MARK COULD NAME
+/// (a Codex, a launch no resume repeats) is the digest's line AT ONCE (LC-5 of
+/// at attention, where it was a record only): the agent is
+/// down and only the owner can start it sooner; an agent running again ends
+/// it.
 #[test]
 fn a_failing_relaunch_with_no_command_is_the_digests_line_at_once() {
     let mut app = App::headless_for_test();
@@ -3524,6 +3679,9 @@ fn a_failing_relaunch_with_no_command_is_the_digests_line_at_once() {
 }
 
 /// A LOST LOGIN IS ITS TAB'S NOTICE, NEVER A MACHINE'S RENEW ASK: an earlier
+/// build's machine ask (`harness.accounts.renew-ask`) an earlier process left
+/// is withdrawn at the resume family's settle, whatever its tabs tell, and a
+/// tab's lost login carried to the owner's sign-in is its own ask.
 #[test]
 fn a_lost_login_is_its_tabs_ask_and_the_accounts_say_lines() {
     use aterm_messages::need::Need;
@@ -3612,6 +3770,7 @@ fn a_lost_login_is_its_tabs_ask_and_the_accounts_say_lines() {
 }
 
 /// A silent usage tap is one `harness.accounts.no-tap` line for the machine, held while any tab
+/// is silent and raised at most once a day; never a band row or a tab mark.
 #[test]
 fn a_silent_usage_tap_is_one_line_once_a_day_and_ends_with_the_last_tab() {
     let mut app = App::headless_for_test();

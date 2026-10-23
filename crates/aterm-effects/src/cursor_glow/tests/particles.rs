@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The particle law: round grains, one accent, off the letters, ink on white.
+//! Cursor-glow particle tests across styles and dark/light backgrounds.
 
 use super::*;
 
@@ -62,9 +62,7 @@ fn covered(quads: &[GlowQuad]) -> std::collections::BTreeSet<(i32, i32)> {
 /// limb is lit to the lower left, its centre and east are dark (not a plain
 /// disc), its horns reach up and round to the right, and its western edge
 /// curves (the limb's middle row starts further west than the rows above and
-/// below it), which a `[` (a straight bar with two serifs) does not. Laid one
-/// pixel row at a time, additive on dark and source-over on light, with one
-/// footprint.
+/// below it), which a `[` (a straight bar with two serifs) does not.
 #[test]
 fn the_moon_is_a_crescent() {
     let g = retina_geom();
@@ -118,8 +116,7 @@ fn the_moon_is_a_crescent() {
 /// The stardust rule on a dark ground, Sparkle and Comet: a grain's body is
 /// a round radial mote (halos, no quads), plain glitter is one soft round
 /// grain, the moon is the crescent (one-pixel rows, no halo), and only the
-/// dealt plus (and Sparkle's mini-comet dash) lays quads. Nothing draws the
-/// old hard square or the comet's white core square.
+/// dealt plus (and Sparkle's mini-comet dash) lays quads.
 #[test]
 fn stardust_is_the_body_the_plus_is_the_accent() {
     let g = geom();
@@ -128,7 +125,6 @@ fn stardust_is_the_body_the_plus_is_the_accent() {
     let c = cfg(GlowStyle::Sparkle, true);
     for seed in [1u32, 2, 3, 8, 4, 5, 6, 7, 16] {
         let hue = seed_hue(seed);
-        // In flight, so the mini-comet has a streak to draw.
         let p = Particle {
             vx: 30.0,
             vy: -20.0,
@@ -191,18 +187,7 @@ fn probed_glow(c: &GlowConfig, g: Geom, at: Instant) -> CursorGlow {
     glow
 }
 
-/// The particle law, every lawful arm (Sparkle, Comet, Water, Laser). On a
-/// light ground a grain is source-over ink, never additive light (the comet's
-/// debris settles as motes under the letters, in the under-ink stream), and a
-/// grain over a probed line of text (a letter, or the gap between two words,
-/// on the cursor's row or a probed row beside it) is not drawn at all, while
-/// its twin past the end of the line is. On a dark ground a grain over the
-/// text dims to the embers' share instead (water's droplets excepted;
-/// Sparkle's is not drawn there at all, measured as none; the comet's
-/// keeps to the row's leading). Beam's
-/// stardust has no light form, so on a light ground a Beam grain draws
-/// nothing at all; the control is the same grain on a dark ground, which
-/// draws.
+/// The particle law, every lawful arm (Sparkle, Comet, Water, Laser).
 #[test]
 fn light_grains_are_ink_and_keep_off_the_letters() {
     let g = geom();
@@ -254,8 +239,6 @@ fn light_grains_are_ink_and_keep_off_the_letters() {
             }
         }
     }
-    // Beam: its additive stardust has no light twin, so a light grain draws
-    // nothing anywhere; the same grain on a dark ground draws.
     for dark in [false, true] {
         let mut c = cfg(GlowStyle::Beam, true);
         c.dark_theme = dark;
@@ -276,9 +259,6 @@ fn light_grains_are_ink_and_keep_off_the_letters() {
             );
         }
     }
-    // Dark: a comet grain over the text keeps to the row's leading: it is
-    // not drawn at the letters' x-height (it hangs above or under them, or
-    // waits off the row).
     {
         let c = cfg(GlowStyle::Comet, true);
         for seed in [1u32, 4, 6, 7, 16, 23] {
@@ -299,8 +279,6 @@ fn light_grains_are_ink_and_keep_off_the_letters() {
             }
         }
     }
-    // Dark: a sparkle grain over the text dims to the embers' share (it is
-    // not drawn there at all).
     for style in [GlowStyle::Sparkle] {
         let c = cfg(style, true);
         let hue = seed_hue(5);
@@ -353,8 +331,6 @@ fn a_full_pool_sheds_the_oldest_grains_never_the_head() {
         !head.is_empty(),
         "fixture: the jump lands a crown and a ring"
     );
-    // The pool, oldest first, every grain round dust (seed 1 mod 8), each at
-    // its own spot, so the newest grain's halo is identifiable.
     for i in 0..CursorGlow::MAX_PARTICLES {
         let (x, y) = (8.0 + (i % 36) as f32 * 8.0, 6.0 + (i / 36) as f32 * 6.0);
         glow.particles
@@ -390,12 +366,7 @@ fn a_full_pool_sheds_the_oldest_grains_never_the_head() {
 /// A dealt comet grain's glint is a highlight laid over its round body, never
 /// a swap for it: through its twinkle peak the grain keeps its body (so it
 /// never changes shape mid-flight) and lays more light than just past the
-/// peak, and its centre is never fainter there. A glint drawn in the body's
-/// place would dip at the very instant it should flare (the half-strength
-/// plus carries less than the mote it replaced). On a light ground the
-/// debris is a round mote of ink under the letters with no glint (dust over
-/// the letters is noise there): the same grain lays its one mote in the
-/// under-ink stream at the peak and nothing over the text.
+/// peak, and its centre is never fainter there.
 #[test]
 fn a_dealt_comet_grain_glints_over_its_body() {
     let g = geom();
@@ -403,10 +374,8 @@ fn a_dealt_comet_grain_glints_over_its_body() {
     let (x, y) = (100.0, 40.0);
     let dealt = seed_hue(16);
     let peak = peak_age(dealt);
-    // Just past the peak, where |sin| is 0.88, under the glint gate.
     let past = peak + 0.88f32.acos() / crate::effect_util::TWINKLE_OMEGA;
     let c = cfg(GlowStyle::Comet, true);
-    // The grain's total departure from the ground, and its centre's.
     let ink = |age: f32| {
         let (out, halos) = emit_one(&c, g, grain(x, y, dealt, born), age);
         let mut glass = Glass::new(g, c.theme_bg);
@@ -430,7 +399,6 @@ fn a_dealt_comet_grain_glints_over_its_body() {
         body(&peak_halos),
         "the grain keeps its round body at its peak"
     );
-    // The plus is additive quads.
     assert!(
         !peak_out.is_empty() && past_out.is_empty(),
         "the glint fires at the peak only"
@@ -440,7 +408,6 @@ fn a_dealt_comet_grain_glints_over_its_body() {
         "the glint flares, never dips: {at_peak} (centre {peak_centre}) at the peak vs \
          {just_past} (centre {past_centre}) just past it"
     );
-    // Light: one round mote of ink under the letters, nothing over them.
     let mut light = cfg(GlowStyle::Comet, true);
     light.dark_theme = false;
     light.theme_fg = 0x001F_2328;
@@ -471,8 +438,7 @@ fn a_dealt_comet_grain_glints_over_its_body() {
 /// half of it and left a sliver of light standing on its edge) is not drawn
 /// on a dark ground, every bucket of the shower, while the same grain two
 /// cells clear of the caret is; and the crescent moon is a warm gold, not a
-/// grey silver. Negative control: Lumen's grain at that spot still draws on
-/// dark, so the rule is Sparkle's (and the light ground's) alone.
+/// grey silver.
 #[test]
 fn the_dark_sparkle_shower_keeps_off_the_caret_and_its_moon_is_gold() {
     let g = geom();
@@ -530,9 +496,7 @@ fn the_dark_sparkle_shower_keeps_off_the_caret_and_its_moon_is_gold() {
 /// whose ink is a saturated gold (HSV saturation 0.6 or more) and whose
 /// deepest pixel stands out of the white page (3:1 or more), where the
 /// wheel's white-cored pastels inked to grey specks and a may-touch-text
-/// gold to khaki dust. Negative control: the wheel's pastel for the same
-/// seeds, inked the same way, is grey (low saturation) or off the gold
-/// family for some seed.
+/// gold to khaki dust.
 #[test]
 fn the_light_sparkle_shower_is_gold_and_registers_on_white() {
     use crate::color_math::{contrast_ratio, rgb2hsv};
@@ -608,12 +572,7 @@ fn the_light_sparkle_shower_is_gold_and_registers_on_white() {
 /// THE SHOWER AND THE STARDUST KEEP OFF THE LINES AN ENTER PRINTED: at the
 /// bottom of a full screen an Enter leaves two fresh lines above the caret,
 /// and the row probe (the caret's row and the row above it) reads only one
-/// of them; the frame's own cells read both. A Sparkle grain (every bucket,
-/// on dark and on paper) or a Beam speck (dark) over a letter or the gap
-/// between two words of the line two rows up is not drawn, and the same
-/// grain over a blank row draws. Negative control: the Comet's debris there
-/// still draws on dark (dimmed, the particle law's glint), so keeping off
-/// the line whole is the shower's and the stardust's rule.
+/// of them; the frame's own cells read both.
 #[test]
 fn the_shower_and_the_stardust_keep_off_the_lines_an_enter_printed() {
     use aterm_core::terminal::RenderCell;
@@ -664,7 +623,6 @@ fn the_shower_and_the_stardust_keep_off_the_lines_an_enter_printed() {
         glow.emit_particles(at, &c, g, &mut out, &mut halos, &mut under);
         !out.is_empty() || !halos.is_empty() || !under.is_empty()
     };
-    // Row 3's 'q', the gap between "quick" and "brown", and row 1 (blank).
     let (letter, gap, air) = (
         g.cell_center(3, 4),
         g.cell_center(3, 9),
@@ -703,8 +661,7 @@ fn the_shower_and_the_stardust_keep_off_the_lines_an_enter_printed() {
 /// A WATER DROPLET ON A DARK GROUND IS A SOFT ROUND BEAD: every seed of the
 /// shower, at rest or falling, lays radial light (a halo, which falls off to
 /// nothing at its rim) and no flat quad, and a falling drop is drawn out
-/// along its fall, never wider than tall. Negative control: a Laser spark
-/// at the same spot lays its streak as quads, so the probe sees a quad.
+/// along its fall, never wider than tall.
 #[test]
 fn a_dark_water_droplet_is_a_soft_round_bead() {
     let g = geom();

@@ -1,68 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The programs a tab started that its job does not hold, ended when the tab
-//! closes, as the job ends the rest.
-//!
-//! WHY THERE ARE ANY. A spawned tab's first process runs in a Job Object with
-//! `KILL_ON_JOB_CLOSE` (`spawn_on_host`), and what it starts inherits the job,
-//! so closing the tab ends every program the tab started, a window-less one
-//! too. pwsh from the Microsoft Store (the `WindowsApps` alias a default pwsh
-//! tab runs) is a packaged app, and the programs a packaged app starts leave
-//! its jobs: Windows keeps the package's processes in a job of the package's
-//! own, the tab's job nests below that one, and by default a packaged app's
-//! child is created outside the package's runtime
-//! (`PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY`'s breakaway), which takes it out
-//! of both. It lands in the jobs above the package's. Measured 2026-10-18 on
-//! pwsh 7.6.7 from the Store (the mclose job probes): pwsh was in the fresh
-//! job its spawner made; a window-less `cmd.exe` and a console-sharing one it
-//! started were not, nor the `ping`s and the `conhost.exe` below them, and
-//! `TerminateJobObject` left all five running. One such child reported the
-//! desktop session's 69-process job as its own, the user's aterm window among
-//! them. Windows PowerShell 5.1 started the same two into the job. Giving the
-//! job at creation (`PROC_THREAD_ATTRIBUTE_JOB_LIST`) changed nothing. Asking
-//! pwsh's children to stay in the package
-//! (`PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE`) kept them in
-//! the job, but each then ran with PowerShell's package identity, as part of a
-//! package a Store update ends, so the spawn does not ask for it. The tests
-//! make such a program with no Store app: a tab whose job lets its processes'
-//! children go (`JOB_LETS_GO`), and a window-less `cmd.exe` started below the
-//! shell (`PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`).
-//!
-//! WHAT IS ENDED, and when: at a close ([`super::hangup`],
-//! [`super::close_master`]), when the tab's first process exits by itself (the
-//! waiter, before the pseudoconsole closes, so a program sharing the tab's
-//! console still links the chain), and at a quit
-//! ([`super::end_programs_outside_jobs`]), once per session: every process
-//! below the tab's first process that the job does not hold. A close and a
-//! quit do it on the caller's thread before they return, because a quit can
-//! follow a tab's close by milliseconds and exit before any other thread runs;
-//! it costs one process snapshot (`hangup` took 3.5 to 4.9 ms with 220
-//! processes running, measured 2026-10-18 in a test build). "Below" is one
-//! Toolhelp snapshot walked top-down by `console_guard::below` with
-//! `Unread::LeftOut`, and each step is vouched for through a handle opened once
-//! and held until the end: the parent the kernel keeps for the process
-//! (`NtQueryInformationProcess`) is the snapshot's, which is the process the
-//! walk came from, and the process started no earlier than that parent. Every
-//! parent is held open from before its children are looked at (the first
-//! process by its session), so its pid still names it; a process that names
-//! that pid as its parent but started before it is an orphan of an earlier
-//! holder of the pid (a start in the parent's own clock tick counts as after
-//! it: that holder would have had to start it, exit and free the pid within
-//! the tick). A process that cannot be opened to end it, or whose
-//! start or parent cannot be read, is left out with everything below it. So
-//! nothing older than the tab and nothing outside its tree is touched. A sweep
-//! by parent pid alone once ended the user's own window through a reused pid
-//! (2026-09-27); that is what the start times and the held handles rule out.
-//!
-//! WHAT IS NOT: a program whose chain to the tab is broken at the close. One
-//! whose launcher already exited (a detached daemon) names a dead parent the
-//! walk cannot reach, so it keeps running, as every program a Windows Terminal
-//! tab started does (its close is `ClosePseudoConsole`, which ends only the
-//! console's own clients); the job reaches such a program in a cmd or Windows
-//! PowerShell tab. Nor one the user cannot open to end (an elevated program),
-//! nor anything an adopted session runs (DefTerm, no job): that console is
-//! somebody else's.
+//! The programs a tab started that its job does not hold, ended when the tab closes, as the job ends the rest.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -79,23 +18,15 @@ const ENDED: u32 = 1;
 
 #[cfg(test)]
 thread_local! {
-    /// While set, a tab spawned on this thread gets a job its programs leave
-    /// (`JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`), as a packaged shell's leave
-    /// it: this module's tests make a program outside the job with no Store
-    /// app installed.
+    /// While set, a tab spawned on this thread gets a job its programs leave (`JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`), as a packaged shell's leave it.
     pub(super) static JOB_LETS_GO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`: a process the job's processes
-/// start is not in the job ([`JOB_LETS_GO`]).
+/// `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`.
 #[cfg(test)]
 pub(super) const JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK: u32 = 0x1000;
 
-/// [`end`] the first time it is asked of session `s`, nothing after: a close
-/// asks from [`super::hangup`], then [`super::close_master`] and the waiter.
-/// One asking while another runs it waits until it is done (a few
-/// milliseconds), so a quit that asks never exits in the middle of the
-/// waiter's.
+/// [`end`] the first time it is asked of session `s`, nothing after.
 pub(super) fn end_once(s: &WinSession) {
     let mut ended = s.outside_job_ended.lock_or_recover();
     if !*ended {
@@ -105,8 +36,7 @@ pub(super) fn end_once(s: &WinSession) {
 }
 
 /// End the programs below session `s`'s first process that its job does not
-/// hold (the [module docs](self)). Nothing for an adopted session, which has
-/// no job.
+/// hold (the [module docs](self)).
 fn end(s: &WinSession) {
     if s.job == 0 {
         return;
@@ -119,9 +49,7 @@ fn end(s: &WinSession) {
         held_by(h.raw(), s.job)
     });
     for (_, process) in &taken {
-        // SAFETY: a process handle the walk opened with PROCESS_TERMINATE and
-        // holds; it names the process the walk vouched for. A failure (it has
-        // just exited) leaves nothing to do.
+        // SAFETY: a process handle the walk opened with PROCESS_TERMINATE and holds.
         unsafe { ffi::TerminateProcess(process.raw(), ENDED) };
     }
 }
@@ -138,10 +66,7 @@ struct Opened<H> {
 /// (started at `root_born`) in `tree` ((pid, parent) pairs from one snapshot)
 /// that `console_guard::below` reaches with `Unread::LeftOut` when every step
 /// is vouched for, and that the tab's job does not hold (`held` false), each
-/// with the handle `open` gave. `open` gives a process's handle, start and
-/// kernel-kept parent, or `None` when it cannot be opened or read; a step is
-/// vouched for when that parent is the snapshot's and the start is no earlier
-/// than the parent's (`below` checks the start). Never `root` itself.
+/// with the handle `open` gave.
 fn select<H>(
     root: u32,
     root_born: u64,
@@ -176,7 +101,7 @@ fn select<H>(
 /// read.
 fn open(pid: u32) -> Option<Opened<Handle>> {
     let access = ffi::PROCESS_QUERY_LIMITED_INFORMATION | ffi::PROCESS_TERMINATE;
-    // SAFETY: plain OpenProcess; the handle is owned by the guard.
+    // SAFETY: plain OpenProcess.
     let handle = Handle::new(unsafe { ffi::OpenProcess(access, 0, pid) });
     if handle.raw() == 0 {
         return None;
@@ -195,8 +120,7 @@ fn open(pid: u32) -> Option<Opened<Handle>> {
 /// when it cannot be read.
 fn parent_of(process: HANDLE) -> Option<u32> {
     let mut info = ffi::PROCESS_BASIC_INFORMATION::default();
-    // SAFETY: a process handle the caller holds and an out-buffer of the
-    // stated size; no return length is asked for.
+    // SAFETY: a process handle the caller holds and an out-buffer of the stated size.
     let status = unsafe {
         ffi::NtQueryInformationProcess(
             process,
@@ -212,12 +136,10 @@ fn parent_of(process: HANDLE) -> Option<u32> {
     u32::try_from(info.InheritedFromUniqueProcessId).ok()
 }
 
-/// Whether `job` holds the process behind `process`, so the job ends it. A
-/// query that fails answers yes: the narrower act, leaving it to the job.
+/// Whether `job` holds the process behind `process`, so the job ends it.
 fn held_by(process: HANDLE, job: HANDLE) -> bool {
     let mut held = 0i32;
-    // SAFETY: a process handle the caller holds, the session's live job, an
-    // out-param.
+    // SAFETY: a process handle the caller holds, the session's live job, an out-param.
     let ok = unsafe { ffi::IsProcessInJob(process, job, &mut held) };
     ok == 0 || held != 0
 }
@@ -227,7 +149,7 @@ mod tests {
     use super::*;
 
     /// A stand-in for [`open`]: each process's start and kernel-kept parent
-    /// (absent: it cannot be opened). The "handle" is the pid.
+    /// (absent: it cannot be opened).
     fn opener(table: &[(u32, u64, u32)]) -> impl Fn(u32) -> Option<Opened<u32>> + '_ {
         |pid| {
             table
@@ -246,11 +168,6 @@ mod tests {
         taken.into_iter().map(|(pid, _)| pid).collect()
     }
 
-    // The tab's first process 10 (started at 100) runs 11 in its job and 12
-    // outside it, under which 13 and 14 run (a window-less cmd, its ping and
-    // its conhost); 11 started 15, outside too. The walk ends 12, 13, 14 and
-    // 15, leaves 11 to the job, and never touches the first process, its
-    // parent or a sibling tree.
     #[test]
     fn the_programs_below_the_shell_outside_its_job_are_taken() {
         let tree = [
@@ -283,10 +200,6 @@ mod tests {
         assert_eq!(pids(all_held), Vec::<u32>::new());
     }
 
-    // A pid the snapshot recorded under the shell can name another process by
-    // the time it is opened: 12 exited after the snapshot and its pid went to
-    // a process 30 started (the kernel's parent is 30). Neither it nor what
-    // the snapshot recorded below 12 is taken.
     #[test]
     fn a_pid_reused_after_the_snapshot_is_left_with_its_tree() {
         let tree = [(10, 4), (12, 10), (13, 12), (11, 10)];
@@ -295,9 +208,6 @@ mod tests {
         assert_eq!(pids(taken), [11]);
     }
 
-    // A process that started before the shell yet names the shell's pid as its
-    // parent is an orphan of the pid's earlier holder (the ssh-agent a closed
-    // Git Bash left): it, and what runs below it, are not the tab's.
     #[test]
     fn an_orphan_of_an_earlier_holder_of_the_shells_pid_is_left() {
         let tree = [(10, 4), (30, 10), (31, 30), (11, 10)];
@@ -306,9 +216,6 @@ mod tests {
         assert_eq!(pids(taken), [11]);
     }
 
-    // A process the walk cannot open to end (elevated, another user's, gone)
-    // is left out, and so is everything below it: no step past it can be
-    // vouched for.
     #[test]
     fn a_process_that_cannot_be_opened_is_left_with_its_tree() {
         let tree = [(10, 4), (12, 10), (13, 12), (11, 10)];
@@ -316,8 +223,6 @@ mod tests {
         let taken = select(10, 100, &tree, opener(&table), |_: &u32| false);
         assert_eq!(pids(taken), [11]);
     }
-
-    // ---- end to end: a real tab, a program outside its job, the three ends ----
 
     use super::super::{
         AttrList, close_master, end_programs_outside_jobs, read, session, spawn_shell_with_pid,
@@ -359,15 +264,14 @@ mod tests {
             let line = format!(r#""{system}\System32\cmd.exe" /d /c ping -n 600 127.0.0.1 >nul"#);
             let mut line: Vec<u16> = line.encode_utf16().chain([0]).collect();
             let mut attr = AttrList::new(1).expect("an attribute list");
-            // SAFETY: plain OpenProcess; the handle is owned by the guard.
+            // SAFETY: plain OpenProcess.
             let parent = parent.map(|pid| {
                 Handle::new(unsafe { ffi::OpenProcess(PROCESS_CREATE_PROCESS, 0, pid) })
             });
             let mut parent_raw = parent.as_ref().map_or(0, Handle::raw);
             if parent.is_some() {
                 assert_ne!(parent_raw, 0, "the parent opens to start a child under it");
-                // SAFETY: an initialized list; the value points at a live
-                // handle that outlives the CreateProcessW below.
+                // SAFETY: an initialized list.
                 let ok = unsafe {
                     ffi::UpdateProcThreadAttribute(
                         attr.ptr(),
@@ -381,15 +285,14 @@ mod tests {
                 };
                 assert_ne!(ok, 0, "the parent attribute is set");
             }
-            // SAFETY: zeroed STARTUPINFOEXW is valid; cb and the list are set.
+            // SAFETY: zeroed STARTUPINFOEXW is valid.
             let mut si: ffi::STARTUPINFOEXW = unsafe { std::mem::zeroed() };
             si.StartupInfo.cb = std::mem::size_of::<ffi::STARTUPINFOEXW>() as u32;
             si.StartupInfo.dwFlags = ffi::STARTF_USESTDHANDLES;
             si.lpAttributeList = attr.ptr();
             // SAFETY: PROCESS_INFORMATION is POD out-memory.
             let mut pi: ffi::PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-            // SAFETY: a NUL-terminated, writable command line; the list and
-            // the parent handle live across the call.
+            // SAFETY: a NUL-terminated, writable command line.
             let created = unsafe {
                 ffi::CreateProcessW(
                     std::ptr::null(),
@@ -425,7 +328,7 @@ mod tests {
                     let access = SYNCHRONIZE
                         | ffi::PROCESS_QUERY_LIMITED_INFORMATION
                         | ffi::PROCESS_TERMINATE;
-                    // SAFETY: plain OpenProcess; the handle is owned by the guard.
+                    // SAFETY: plain OpenProcess.
                     let process = Handle::new(unsafe { ffi::OpenProcess(access, 0, pid) });
                     let ours = process.raw() != 0
                         && parent_of(process.raw()) == Some(self.pid)
@@ -482,7 +385,7 @@ mod tests {
     /// A tab running an interactive `cmd.exe`, its output read to the end on a
     /// thread of its own; the receiver hears when the end comes.
     fn tab() -> (crate::SpawnedShell, mpsc::Receiver<()>) {
-        // SAFETY: test-process mint; the trusted-launcher contract trivially holds.
+        // SAFETY: test-process mint.
         let authority = unsafe { aterm_cap::Authority::root_authority() };
         let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
         let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
@@ -557,10 +460,6 @@ mod tests {
         }
     }
 
-    // A close ends the programs below the shell that its job does not hold
-    // (what a Store pwsh starts), the window-less `cmd.exe` and the `ping`
-    // below it, on `hangup`'s own thread, and touches nothing outside the
-    // tab's tree. Without it they ran on after the tab was gone.
     #[test]
     fn a_close_ends_the_programs_the_shell_runs_outside_its_job() {
         let _one = ONE_AT_A_TIME
@@ -581,8 +480,6 @@ mod tests {
         close_master(shell.master);
     }
 
-    // A shell that exits by itself takes its programs outside the job along,
-    // as the job's close takes the rest.
     #[test]
     fn a_shell_that_exits_ends_the_programs_it_runs_outside_its_job() {
         let _one = ONE_AT_A_TIME
@@ -597,8 +494,6 @@ mod tests {
         close_master(shell.master);
     }
 
-    // A quit, which closes no session one by one, ends every open tab's
-    // programs outside its job; the tab itself is left to the quit.
     #[test]
     fn a_quit_ends_the_programs_every_shell_runs_outside_its_job() {
         let _one = ONE_AT_A_TIME

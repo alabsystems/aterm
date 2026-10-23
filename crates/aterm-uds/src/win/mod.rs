@@ -23,11 +23,14 @@ fn init() {
 }
 
 /// The current thread's last winsock error as an [`io::Error`] (std maps the
+/// `WSAE*` codes onto the portable [`io::ErrorKind`]s, e.g.
+/// `WSAECONNREFUSED` → `ConnectionRefused`).
 fn last_wsa_error() -> io::Error {
     io::Error::from_raw_os_error(unsafe { ffi::WSAGetLastError() })
 }
 
 /// Encode `path` into a `sockaddr_un`, stripping a canonicalize-style verbatim
+/// prefix (`\\?\` / `\\?\UNC\`) first.
 fn encode_sun_path(path: &Path) -> io::Result<(ffi::SockaddrUn, i32)> {
     if let Some(s) = path.to_str()
         && let Some(addr) = try_encode(s)
@@ -53,6 +56,7 @@ fn encode_sun_path(path: &Path) -> io::Result<(ffi::SockaddrUn, i32)> {
 }
 
 /// One encode attempt: strip the verbatim prefix, then require UTF-8 ≤ 107
+/// bytes (NUL-terminated in a 108-byte `sun_path`).
 fn try_encode(s: &str) -> Option<(ffi::SockaddrUn, i32)> {
     let stripped = strip_verbatim(s);
     let bytes = stripped.as_bytes();
@@ -68,6 +72,7 @@ fn try_encode(s: &str) -> Option<(ffi::SockaddrUn, i32)> {
 }
 
 /// Strip `std::fs::canonicalize`'s verbatim prefixes: `\\?\C:\x` → `C:\x`,
+/// `\\?\UNC\server\share` → `\\server\share`.
 fn strip_verbatim(s: &str) -> String {
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{rest}")
@@ -79,6 +84,7 @@ fn strip_verbatim(s: &str) -> String {
 }
 
 /// The 8.3 short form of an existing path via `GetShortPathNameW`, or `None`
+/// if unavailable (volume with 8.3 generation disabled, path missing).
 fn short_path(p: &Path) -> Option<String> {
     use std::os::windows::ffi::OsStrExt;
     let wide: Vec<u16> = p
@@ -97,6 +103,7 @@ fn short_path(p: &Path) -> Option<String> {
 }
 
 /// Park until the socket is readable/writable, locally shut down, or the
+/// deadline passes.
 fn wait_interruptible(
     raw: RawSocket,
     net_ev: ffi::WsaEvent,
@@ -175,6 +182,7 @@ pub struct CtlStream(Arc<Inner>);
 
 impl CtlStream {
     /// Wrap an already-connected socket: create its three events and arm
+    /// `WSAEventSelect(FD_READ|FD_WRITE|FD_CLOSE)` on `net_ev`.
     fn from_raw(raw: RawSocket) -> io::Result<Self> {
         let net_ev = unsafe { ffi::WSACreateEvent() };
         let recv_shutdown_ev = unsafe { ffi::WSACreateEvent() };
@@ -357,6 +365,7 @@ impl CtlStream {
 }
 
 /// std-compatible timeout validation: `Some(0)` is an error, sub-millisecond
+/// values round up to 1ms (never to "no timeout").
 fn timeout_to_ms(t: Option<Duration>) -> io::Result<u64> {
     match t {
         None => Ok(0),
@@ -401,10 +410,13 @@ impl io::Read for &CtlStream {
 }
 
 /// The most slices one [`io::Write::write_vectored`] hands `WSASend`, the
+/// same bound as `IOV_MAX` on Unix; the rest is a short write.
 const MAX_SEND_BUFS: usize = 1024;
 
 impl CtlStream {
     /// Run `attempt`, one non-blocking `send`/`WSASend` answering the bytes it
+    /// sent or `None` on `SOCKET_ERROR`, until it sends: parked on the
+    /// readiness event while the socket has no room, under the write timeout.
     fn send_with(&self, mut attempt: impl FnMut() -> Option<usize>) -> io::Result<usize> {
         let inner = &self.0;
         let timeout = inner.write_timeout_ms.load(Ordering::Relaxed);
@@ -453,6 +465,7 @@ impl io::Write for &CtlStream {
     }
 
     /// One `WSASend` of up to [`MAX_SEND_BUFS`] slices, where std's default
+    /// would make one `send` per slice.
     fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
         let bufs = &bufs[..bufs.len().min(MAX_SEND_BUFS)];
         if bufs.is_empty() {
@@ -571,9 +584,12 @@ mod tests {
     use super::*;
 
     /// A hang detector, never a latency budget: a wake that must come ends the
+    /// wait the moment it lands.
     const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
     /// Non-ASCII (but valid-UTF-8) paths encode directly — the default socket
+    /// dir under a Cyrillic/CJK `%LOCALAPPDATA%` must not need any fallback —
+    /// while the 107-byte sun_path budget stays enforced on the UTF-8 length.
     #[test]
     fn utf8_non_ascii_paths_encode_directly() {
         let s = "C:\\Users\\Владимир\\AppData\\Local\\aterm\\aterm-1234.sock";
@@ -589,6 +605,7 @@ mod tests {
     }
 
     /// afunix.sys reads `sun_path` as UTF-8: a full bind/connect/accept round
+    /// trip through a non-ASCII directory.
     #[test]
     fn non_ascii_dir_binds_and_connects() {
         use std::io::{Read, Write};
@@ -618,6 +635,7 @@ mod tests {
     }
 
     /// A no-timeout read parks on the readiness/shutdown events and wakes
+    /// with EOF when a clone is shut down.
     #[test]
     fn idle_parked_read_wakes_on_shutdown() {
         use std::io::Read;
@@ -640,6 +658,7 @@ mod tests {
     }
 
     /// A no-timeout read parked with no data wakes on the peer's write via the
+    /// `FD_READ` readiness event and returns the bytes.
     #[test]
     fn parked_read_wakes_on_peer_write() {
         use std::io::{Read, Write};

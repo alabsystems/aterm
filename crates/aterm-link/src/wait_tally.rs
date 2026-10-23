@@ -355,6 +355,7 @@ fn put_hex(out: &mut [u8], mut v: u64) {
 }
 
 /// The text of one row: ` <name>=<count>,<total>,<max>,<band>.<band>…`, every
+/// number fixed-width hex (16 digits, 8 for a band).
 fn row_text(row: Row, h: &Hist) -> Vec<u8> {
     let mut out = vec![b'0'; row_len(row)];
     put_row(&mut out, row, h);
@@ -367,6 +368,7 @@ fn row_len(row: Row) -> usize {
 }
 
 /// [`row_text`] written into `out`, which is exactly [`row_len`] long: the
+/// in-place rewrite of one row's place in the line ([`Recorder::idle`]).
 fn put_row(out: &mut [u8], row: Row, h: &Hist) {
     let name = row.name().as_bytes();
     out[0] = b' ';
@@ -396,6 +398,7 @@ fn put_row(out: &mut [u8], row: Row, h: &Hist) {
 }
 
 /// The head: the format, the pid, the cursor, the clock and the dir flag,
+/// zero-padded decimal so its length is fixed.
 fn head_text(t: &Tally) -> String {
     format!(
         "{HEAD} pid={:010} committed={:020} at={:020} dir={}",
@@ -412,6 +415,8 @@ fn sum_text(body: &[u8]) -> String {
 }
 
 /// Every line's length ([`Tally::render`]): the head's ([`head_text`]: the
+/// format, ten digits of pid, twenty of cursor, twenty of clock, one of dir
+/// flag), each row's ([`row_len`]) and the checksum's ([`sum_text`]).
 fn line_len() -> usize {
     let head = HEAD.len()
         + " pid=".len()
@@ -426,7 +431,7 @@ fn line_len() -> usize {
     head + rows + " sum=".len() + 16 + "\n".len()
 }
 
-/// THE LINE'S CHECKSUM: aterm-hash's word-at-a-time Fx hash, not FNV-1a. It
+/// THE LINE'S CHECKSUM: aterm-hash's word-at-a-time Fx hash, not FNV-1a.
 fn checksum(body: &[u8]) -> u64 {
     aterm_hash::fx_hash_bytes(body)
 }
@@ -607,6 +612,7 @@ impl Tally {
     }
 
     /// Whether anything but the clock and the tally's own writes differs from
+    /// `other`: what makes an idle moment write.
     fn moved_from(&self, other: &Tally) -> bool {
         self.committed != other.committed
             || Row::ALL
@@ -898,6 +904,8 @@ mod tests {
     }
 
     /// THE BANDS ARE LOG2, and the edges are where the unit says: under a
+    /// microsecond-ish 1024 ns is band 0, 1024 opens band 1, 2^26 ns (67.1 ms)
+    /// and anything past it is the last; a count's band 0 is 0 alone.
     #[test]
     fn a_value_falls_in_its_log2_band_and_each_band_starts_at_its_floor() {
         assert_eq!(Hist::band(0, Unit::Ns), 0);
@@ -939,6 +947,8 @@ mod tests {
     }
 
     /// THE V=2 LINE READS BACK AS WRITTEN, AND EVERY LINE IS ONE LENGTH, so a
+    /// write at offset 0 always replaces the line whole: the smallest tally
+    /// and the largest render to the same width.
     #[test]
     fn a_tally_line_reads_back_as_written_and_every_line_is_one_length() {
         let t = sample();
@@ -975,6 +985,8 @@ mod tests {
     }
 
     /// NEGATIVE CONTROL: a line whose checksum was corrupted is refused, and so
+    /// is every mix of two lines a read racing the write could see — never
+    /// read as a count that is half old and half new.
     #[test]
     fn a_line_that_raced_its_write_or_lost_its_checksum_is_refused_never_read_as_a_count() {
         let old = sample().render();
@@ -1077,6 +1089,8 @@ mod tests {
     }
 
     /// THE PARTITION: the rows the loop is in one at a time, and only those,
+    /// sum to its accounted time; a commit (an ack), a call row (a replace), a
+    /// wake (inside a park) and a post's path are left out of it.
     #[test]
     fn only_the_disjoint_rows_partition_the_loops_time() {
         let t = sample();
@@ -1202,6 +1216,7 @@ mod tests {
     }
 
     /// Occupied diagnostic names never authorize truncating their bytes or a
+    /// link target.
     #[cfg(unix)]
     #[test]
     fn a_wait_tally_never_truncates_an_occupied_name_or_its_link_target() {

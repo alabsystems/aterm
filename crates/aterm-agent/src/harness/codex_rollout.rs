@@ -137,7 +137,7 @@ pub struct TurnTokens {
 }
 
 impl TurnTokens {
-    /// The counts of a usage object; a missing class reads 0. `None` for
+    /// The counts of a usage object; a missing class reads 0.
     fn of(v: Option<&Value>) -> Option<Self> {
         let o = v?.as_object()?;
         let n = |key: &str| o.get(key).and_then(Value::as_u64);
@@ -778,9 +778,11 @@ mod tests {
     use super::fixtures::{context, copied, count, limits_only, message, meta, meta_as, rate};
 
     /// The lab's composed login (Codex 0.163.0 wrote it into its
+    /// `session_meta`s, 2026-10-16): stand-in ids, no real account's.
     const LOGIN_A: (&str, &str) = ("acct-lab-1", "user-lab");
 
     /// Thread ids in UUIDv7 form, made in 2024: every file a test writes
+    /// now is written since they began.
     const ROOT: &str = "01900000-0000-7000-8000-000000000001";
 
     const SUB: &str = "01900000-0000-7000-8000-000000000002";
@@ -804,6 +806,8 @@ mod tests {
     }
 
     /// EACH SERVED TURN ONCE: a `token_count` whose running total grew is
+    /// one turn, its `last_token_usage` on the latest `turn_context`'s
+    /// model, stamped with its own second.
     #[test]
     fn each_served_turn_counts_once_on_its_turns_model() {
         let untimed = count(T0 + 20_000, (5000, 4000, 300), (2000, 1400, 150))
@@ -856,6 +860,9 @@ mod tests {
     }
 
     /// THE FORK RULE (the design's §3.5, §8.4): a fork opens with its
+    /// parent's lines rewritten in one burst; that copied prefix counts
+    /// nothing, and the fork's own turn — its total continuing from the
+    /// copy's — counts once.
     #[test]
     fn a_forks_copied_prefix_counts_nothing() {
         let parent = [
@@ -899,6 +906,8 @@ mod tests {
     }
 
     /// The burst's edge: a line stamped [`FORK_BURST_MS`] after the newest
+    /// before it is still the copy; one a millisecond later is the fork's
+    /// own.
     #[test]
     fn the_copy_ends_at_the_first_gap_past_the_burst() {
         let fork = |gap: i64| {
@@ -920,6 +929,10 @@ mod tests {
     }
 
     /// A FORK'S OWN TOTALS GO ON FROM ITS COPY'S (module header): a
+    /// `token_count` its own lines write again with the copy's last total —
+    /// as Codex writes one at a turn's start once the thread has a total —
+    /// is a repeat, never its parent's last turn counted again; its own turn
+    /// after it counts once.
     #[test]
     fn a_count_repeating_the_copys_total_is_no_turn() {
         let parent = [
@@ -962,6 +975,8 @@ mod tests {
     }
 
     /// A rollout whose first line names no session (cut, or of a shape this
+    /// reader does not know) may be a fork: its first burst counts nothing,
+    /// and turns after it count.
     #[test]
     fn a_rollout_whose_first_line_names_no_session_is_read_as_a_fork() {
         let body = [
@@ -982,6 +997,8 @@ mod tests {
     }
 
     /// A turn whose `turn_context` named a service tier other than the
+    /// standard one says so; one naming none or `standard` does not, and a
+    /// model that is no model id is none.
     #[test]
     fn a_service_tier_and_a_bad_model_are_read_as_they_are() {
         let text = |tier: Option<&str>, model: &str| {
@@ -1005,6 +1022,8 @@ mod tests {
     }
 
     /// A whole read streams the rollout's complete lines through the reader:
+    /// a torn last line (one still being written) is not read, and a cap
+    /// stops the read short and says so.
     #[test]
     fn a_whole_read_takes_complete_lines_within_its_cap() {
         let dir = aterm_tempfile::Builder::new()
@@ -1052,6 +1071,10 @@ mod tests {
     }
 
     /// A CONVERSATION's rollouts: the TUI's own thread — the `session_id`
+    /// the named thread's rollout gives — first, then every subagent whose
+    /// `session_meta` names it, oldest write first, named by a subagent or
+    /// by the root alike; a rollout whose first line cannot be read is
+    /// counted unread.
     #[test]
     fn a_conversation_is_its_tuis_thread_and_the_subagents_it_spawned() {
         let home = aterm_tempfile::Builder::new()
@@ -1112,6 +1135,7 @@ mod tests {
     }
 
     /// A rollout stamp to the millisecond: the fraction's first three
+    /// digits, padded.
     #[test]
     fn a_stamp_reads_to_the_millisecond() {
         let s = unix("2026-08-01T17:36:47Z");
@@ -1127,6 +1151,11 @@ mod tests {
     }
 
     /// A PAGINATED THREAD'S FORK COPIES NO COUNT (module header, measured on
+    /// 0.163.0 in the lab): a subagent spawned with its parent's turns opens
+    /// with its own `session_meta`, its parent's, and the parent's turns —
+    /// messages and `turn_context`s, no `token_count` — in one millisecond;
+    /// its own `turn_context` follows within 10 ms and, on the stub's instant
+    /// answer, its first count within 25 ms, its total from zero.
     #[test]
     fn a_paginated_forks_own_first_turn_counts_on_its_model() {
         let spawn = |history: &str| {
@@ -1165,6 +1194,11 @@ mod tests {
     }
 
     /// A LEGACY FORK'S OWN SETTINGS LINE ENDS ITS COPY (module header,
+    /// measured on 0.163.0): `codex fork <legacy thread> <prompt>` copies its
+    /// parent's lines under one stamp, writes its own
+    /// `thread_settings_applied` in the same millisecond, and runs the
+    /// prompt's turn at once: its next line 14 ms on, its count 37 ms on,
+    /// inside any burst.
     #[test]
     fn a_legacy_forks_own_settings_line_ends_its_copy() {
         use super::fixtures::settings;
@@ -1227,6 +1261,8 @@ mod tests {
     }
 
     /// The home Codex's records are read under: `CODEX_HOME`, else
+    /// `~/.codex`; a relative one is the TUI's directory's, as Codex resolves
+    /// it.
     #[test]
     fn codex_home_is_codex_home_else_the_users() {
         use crate::harness::host_path::abs;

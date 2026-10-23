@@ -24,6 +24,7 @@ pub const FIRST_POLICY_FOLLOWING_BUILD: u64 = 1_790_585_188;
 const RANGES_KEY: &str = "ranges";
 
 /// `[[retired]]`: the cutter's record of the rescues retired ([`Retired`]); a
+/// producer ignores it like any key it does not know.
 const RETIRED_KEY: &str = "retired";
 
 /// Every top-level key schema v1 defines.
@@ -46,6 +47,7 @@ const RETIRED_KEYS: [&str; 3] = ["producers", "reason", "date"];
 const RESERVED_KEYS: [&str; 1] = ["seamless"];
 
 /// The `retire = { producers, reason }` spelling `[[retired]]` replaced, refused by
+/// the cutter with the spelling that replaced it.
 const RETIRE_KEY: &str = "retire";
 
 /// Maximum screen-carry fidelity rung allowed for a producer (`Full < Visible < Repaint`).
@@ -144,6 +146,7 @@ impl HandoffPolicy {
     }
 
     /// The top-level keys of `table`; `strict` is the cutter's read, which also
+    /// refuses a reserved key and any key schema v1 does not define.
     fn of_table(table: &aterm_toml::Table, strict: bool) -> Result<Self, String> {
         if strict {
             if let Some(key) = table
@@ -216,6 +219,8 @@ impl HandoffPolicy {
     }
 
     /// What a producer follows when several policies name it, over `range`: the
+    /// most conservative of each knob — the highest carry ceiling, the `Land` gate
+    /// relaxed when any relaxes it.
     fn combined<'a>(policies: impl IntoIterator<Item = &'a Self>, range: ProducerRange) -> Self {
         let mut out = Self {
             applies_to_producers: Some(range),
@@ -277,6 +282,7 @@ impl HandoffPolicy {
     }
 
     /// This policy as the top-level lines a file writes for it, for a refusal that
+    /// says what to write: the range, and each knob that asks anything.
     fn as_lines(&self) -> String {
         let mut lines = Vec::new();
         if let Some(range) = self.applies_to_producers {
@@ -328,7 +334,7 @@ pub struct Rescue {
 }
 
 impl Rescue {
-    /// The `ranges` key's value read as a list of rescues. `strict` is the
+    /// The `ranges` key's value read as a list of rescues.
     fn list_of(value: &aterm_toml::Value, strict: bool) -> Result<Vec<Self>, String> {
         let tables = value
             .as_array()
@@ -725,6 +731,7 @@ impl Retired {
 }
 
 /// Whether `text` is a `YYYY-MM-DD` date with a month from 1 to 12 and a day
+/// from 1 to 31.
 fn is_calendar_date(text: &str) -> bool {
     let bytes = text.as_bytes();
     let digits = |range: std::ops::Range<usize>| {
@@ -836,12 +843,16 @@ fn judge(path: &Path, read: Result<Option<String>, ReadFailure>) -> PolicyRead {
 /// Why [`read_bounded`] could not hand back the file's text.
 enum ReadFailure {
     /// A fact about the file: not a regular file, too large, not UTF-8, or an error the same
+    /// file would give again.
     File(String),
     /// A fact about this moment ([`is_momentary`]): the bytes were never reached.
     Moment(String),
 }
 
 /// Whether an I/O error says the system could not serve the read just then, not
+/// that the file is unreadable: out of descriptors (`EMFILE`, `ENFILE`), out of
+/// memory or buffers (`ENOMEM`, `ENOBUFS`), a device error (`EIO`), an interrupted
+/// or would-block call (`EINTR`, `EAGAIN`).
 fn is_momentary(error: &std::io::Error) -> bool {
     use std::io::ErrorKind;
     if matches!(
@@ -880,6 +891,7 @@ fn unreadable(error: &std::io::Error) -> ReadFailure {
 }
 
 /// `Ok(None)` when there is no file at all; `Err` for one that cannot be read as a small
+/// regular UTF-8 file.
 fn read_bounded(path: &Path) -> Result<Option<String>, ReadFailure> {
     use std::io::Read as _;
     let mut options = std::fs::OpenOptions::new();
@@ -955,7 +967,7 @@ impl Adoption {
 
     /// Return the active [`HandoffPolicy`] to follow, if any.
     #[must_use]
-    pub fn policy(&self) -> Option<HandoffPolicy> {
+    pub const fn policy(&self) -> Option<HandoffPolicy> {
         match self {
             Self::Follow(policy) => Some(*policy),
             Self::None | Self::NotForThisBuild(_) | Self::Ignored(_) => None,
@@ -1056,6 +1068,7 @@ mod tests {
     }
 
     /// A producer ignores unknown keys (a reserved `seamless`, an unknown key in a
+    /// `[[ranges]]` table); the cutter refuses all of them.
     #[test]
     fn unknown_keys_are_ignored_by_a_producer_and_refused_by_the_cutter() {
         let text = "schema = 1\ncarry = \"visible\"\nsome_future_knob = 3\n[future]\nx = 1\n";
@@ -1089,6 +1102,7 @@ mod tests {
     }
 
     /// The cutter refuses a knob outside `[[ranges]]` and a table with no range, no reason or
+    /// nothing asked; a producer still reads an unranged top-level knob as every build.
     #[test]
     fn the_cutter_refuses_a_knob_that_is_not_a_rescue_with_its_builds_and_reason() {
         for loose in [
@@ -1147,6 +1161,7 @@ mod tests {
     }
 
     /// Builds 100-199 panic in their capture (repaint), builds 250-299 never open their `Land`
+    /// gate (relaxed): two rescues under their hull.
     const RESCUE_A: &str =
         "[[ranges]]\nproducers = [100, 199]\ncarry = \"repaint\"\nreason = \"capture panics\"\n";
     const RESCUE_B: &str = "[[ranges]]\nproducers = [250, 299]\npark_quiet_gate_at_land = \
@@ -1163,6 +1178,7 @@ mod tests {
     }
 
     /// The hull: lowest `min` to highest `max`, highest ceiling, the gate relaxed if any
+    /// rescue relaxes it.
     #[test]
     fn the_top_level_keys_beside_ranges_are_the_hull_of_the_rescues() {
         let Ranges::Listed(rescues) = file(&two_rescues()).ranges else {
@@ -1209,6 +1225,8 @@ mod tests {
     }
 
     /// A `[[ranges]]` reader follows only the rescues naming its build: one range's knobs
+    /// alone, the more conservative of each knob under an overlap, and nothing in a gap or
+    /// outside them all.
     #[test]
     fn a_producer_that_reads_ranges_follows_only_the_rescues_naming_its_build() {
         let overlap = "[[ranges]]\nproducers = [180, 260]\ncarry = \"visible\"\nreason = \"x\"\n";
@@ -1256,6 +1274,8 @@ mod tests {
     }
 
     /// Producers from v0.97.0 to v0.100.0 read the file with [`HandoffPolicy::parse`] (this
+    /// code) and ignore `ranges` and `retired`, so each in a rescued range carries at least
+    /// what its rescue asks, and one in a gap carries less: a degrade, never a refusal.
     #[test]
     fn a_producer_before_ranges_reads_the_hull_and_is_never_refused() {
         let text = format!(
@@ -1314,6 +1334,7 @@ mod tests {
     }
 
     /// The cutter reads `[[retired]]` strictly (a range, a reason and a date, nothing else); a
+    /// producer ignores it.
     #[test]
     fn a_retirement_is_read_strictly_by_the_cutter_and_ignored_by_a_producer() {
         let entry = "[[retired]]\nproducers = [10, 20]\nreason = \"all past EOL\"\ndate = \
@@ -1416,6 +1437,8 @@ mod tests {
     }
 
     /// A later policy keeps what an earlier one sealed (the same or a wider range, a ceiling
+    /// no less conservative, the gate still relaxed); each drop is refused by name, and a
+    /// sealed policy that asks nothing binds nothing.
     #[test]
     fn a_later_policy_keeps_every_knob_an_earlier_one_sealed() {
         let sealed = policy("schema = 1\napplies_to_producers = [10, 20]\ncarry = \"visible\"\n");
@@ -1474,6 +1497,7 @@ mod tests {
     }
 
     /// A sealed rescue is kept build by build by the ranges a producer reads: split, inside a
+    /// wider one, or under an overlap asking more.
     #[test]
     fn a_sealed_rescue_is_kept_build_by_build_through_any_ranges_that_cover_it() {
         let sealed = policy(
@@ -1687,6 +1711,7 @@ mod tests {
     }
 
     /// A read the system refused for now (out of descriptors or memory, an I/O error) is
+    /// `Unread`, not `Ignored`: nothing is known about what the file asks.
     #[cfg(unix)]
     #[test]
     fn a_read_the_system_refused_for_now_is_unread_and_a_file_error_is_ignored() {
@@ -1731,6 +1756,7 @@ mod tests {
     }
 
     /// A FIFO where the policy should be is refused at once, never waited on (the open a FIFO
+    /// renamed onto the path would meet).
     #[cfg(unix)]
     #[test]
     fn a_fifo_in_place_of_the_policy_is_refused_without_waiting_for_a_writer() {

@@ -2,29 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Howard Hinnant's civil-calendar conversions and the RFC 3339 UTC stamp
-//! (`YYYY-MM-DDTHH:MM:SSZ`) built on them: the workspace's one home for this math. Pure
-//! functions; callers keep their own clock reads. Crates that do not depend on this one keep
-//! their own date formatter: `aterm-messages` (dependency-free by design), `aterm-spec`'s
-//! report date and `verify perf`'s date.
-//!
-//! PARSING has one home too. [`parse_utc`] inverts [`format_rfc3339`] through
-//! year 9999 and is the default for every reader; [`parse_utc_fractional`]
-//! additionally admits a fractional-seconds field, for the records whose
-//! writer stamps one (the package pass end, `….000000000Z`; Claude Code's
-//! transcript stamps, `….796Z`). Neither reads a zone offset: `…+05:30` names a
-//! DIFFERENT instant than its digits, and reading it as UTC moves a deadline
-//! the wrong way by up to 14 h. The one reader with a different grammar is the supervisor ledger's
-//! (`aterm-agent`'s `supervise/ledger.rs`): it reads local times and zone
-//! offsets ON PURPOSE, applying them, over this module's calendar.
+//! Howard Hinnant's civil-calendar conversions and the RFC 3339 UTC stamp (`YYYY-MM-DDTHH:MM:SSZ`)
+//! built on them: the workspace's one home for this math.
 
-/// Days since 1970-01-01 → proleptic-Gregorian `(year, month, day)` —
-/// Howard Hinnant's `civil_from_days`. Pure and total for every `i64` day.
+/// Days since 1970-01-01 → proleptic-Gregorian `` — Howard Hinnant's `civil_from_days`.
 #[inline]
 #[must_use]
 pub const fn civil_from_days(days: i64) -> (i64, i64, i64) {
-    // Shift the epoch from 1970-01-01 to 0000-03-01 so leap days land at the
-    // end of each 400-year era.
     let z = days as i128 + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097; // day-of-era      [0, 146096]
@@ -34,16 +18,10 @@ pub const fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let d = doy - (153 * mp + 2) / 5 + 1; // day-of-month  [1, 31]
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // month  [1, 12]
     let y = yoe + era * 400 + (m <= 2) as i128; // Jan/Feb belong to the next year
-    // An i64 day spans fewer than 2^55 years; the canonical month and day
-    // are bounded above. All three values therefore fit i64 exactly.
     (y as i64, m as i64, d as i64)
 }
 
-/// Civil `(year, month, day)` → days since 1970-01-01 — Howard Hinnant's
-/// `days_from_civil`. Inverts [`civil_from_days`] over every `i64` day.
-/// Field validation is the caller's policy: out-of-range months/days
-/// extrapolate arithmetically instead of erroring. Results beyond the `i64`
-/// day range saturate, so arbitrary `i64` fields remain total.
+/// Civil `(year, month, day)` → days since 1970-01-01 — Howard Hinnant's `days_from_civil`.
 #[inline]
 #[must_use]
 pub const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
@@ -64,15 +42,7 @@ pub const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     }
 }
 
-/// Format seconds-since-Unix-epoch as an RFC3339 UTC instant
-/// (`YYYY-MM-DDTHH:MM:SSZ` through year 9999). Larger years are written in
-/// full, extending that shape beyond the parsers' four-digit year. The calendar date comes from
-/// [`civil_from_days`]; time-of-day is a plain `secs % 86400` split. Pure and
-/// total for all `u64` inputs.
-///
-/// Emitted via `ToString` + manual zero-padding, not `format!` — a
-/// runtime-argument `format_args!` in this crate is a hard Trust-gate error
-/// (see `trust_fmt`); the output is byte-identical.
+/// Format seconds-since-Unix-epoch as an RFC3339 UTC instant.
 #[must_use]
 pub fn format_rfc3339(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
@@ -80,8 +50,6 @@ pub fn format_rfc3339(secs: u64) -> String {
     let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
     let (y, m, d) = civil_from_days(days);
     let mut out = String::with_capacity(20);
-    // `days >= 0`, so the date is at/after 1970-01-01: every component is
-    // nonnegative and the casts below are lossless.
     push_padded(&mut out, y as u64, 4);
     out.push('-');
     push_padded(&mut out, m as u64, 2);
@@ -97,14 +65,7 @@ pub fn format_rfc3339(secs: u64) -> String {
     out
 }
 
-/// `YYYY-MM-DDTHH:MM:SSZ` → seconds since the Unix epoch (negative before
-/// it), or `None` for anything else. Exactly 20 bytes: a zone offset, a bare
-/// stamp with no `Z`, a fractional-seconds field, a space for the `T` and any
-/// trailing byte are all refused, as is a field out of range (month 1-12, day
-/// 1-31, hour 0-23, minute 0-59, second 0-60). Days and leap seconds are
-/// normalized arithmetically, without validating a month's length or the
-/// leap-second schedule. Inverts [`format_rfc3339`] from the epoch through
-/// `9999-12-31T23:59:59Z`; larger formatted years are refused.
+/// `YYYY-MM-DDTHH:MM:SSZ` → seconds since the Unix epoch, or `None` for anything else.
 #[inline]
 #[must_use]
 pub fn parse_utc(s: &str) -> Option<i64> {
@@ -115,11 +76,7 @@ pub fn parse_utc(s: &str) -> Option<i64> {
     parse_fields(b)
 }
 
-/// [`parse_utc`] plus an optional fractional-seconds field — `.` and one to
-/// nine digits between the seconds and the `Z` — which is truncated to the
-/// whole second. Offsets, a missing `Z` and trailing bytes are refused exactly
-/// as [`parse_utc`] refuses them. Only for a record whose writer stamps a
-/// fraction; every other reader wants [`parse_utc`].
+/// [`parse_utc`] plus an optional fractional-seconds field.
 #[inline]
 #[must_use]
 pub fn parse_utc_fractional(s: &str) -> Option<i64> {

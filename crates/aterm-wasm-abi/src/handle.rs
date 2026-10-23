@@ -1,35 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Opaque handles: how an exported class's value lives on the Rust side
-//! while a JS object holds its pointer.
-//!
-//! [`into_raw`] boxes the value in a [`Cell`] and gives JS the box's address.
-//! Every method call borrows it through [`borrow`] or [`borrow_mut`], which
-//! check, in order, what wasm-bindgen's `WasmRefCell` checks, with its
-//! messages:
-//!
-//! * a null pointer (JS zeroes its copy on `free()`):
-//!   `null pointer passed to rust`;
-//! * a pointer of another class: refused too, where wasm-bindgen would read
-//!   it as the wrong type (the common Rust type identity below);
-//! * a value already borrowed exclusively, or borrowed at all for
-//!   `&mut self`: `recursive use of an object detected which would lead to
-//!   unsafe aliasing in rust`.
-//!
-//! POST-TRAP POISON. On `wasm32-unknown-unknown` a panic aborts as a trap:
-//! nothing unwinds, so a guard taken by the trapping call is never dropped
-//! and the borrow stays taken. Every later call on that object then throws
-//! the aliasing error instead of running on a value a panic interrupted
-//! mid-change, exactly as a wasm-bindgen object behaves, and `free()` throws
-//! `attempted to take ownership of Rust value while it was borrowed` and
-//! leaves the value leaked. A finalizer that reaches a poisoned object leaks
-//! it silently. Other objects are untouched.
-//!
-//! Every [`Cell`] starts with the same `Header`, whatever `T` is. The
-//! Rust type identity is checked there before making any `Cell<T>` reference.
-//! The public name hash is metadata, not proof of a Rust type: hashes can
-//! collide, and a hand-written [`Class`] implementation can override it.
+//! Opaque handles.
 
 use std::any::TypeId;
 use std::cell::{Cell as StdCell, UnsafeCell};
@@ -44,12 +16,11 @@ const ALIASED: &str =
 const BORROWED: &str = "attempted to take ownership of Rust value while it was borrowed";
 const WRONG_CLASS: &str = "an object of another class was passed to rust";
 
-/// An exported class. `#[export] struct` implements it.
+/// An exported class.
 pub trait Class: Sized + 'static {
     /// The JS class name.
     const NAME: &'static str;
     /// The name tag every handle of this class carries ([`class_tag`]).
-    /// This metadata does not establish the handle's Rust type identity.
     const TAG: u32 = class_tag(Self::NAME);
 }
 
@@ -62,7 +33,7 @@ struct Header {
     borrow: StdCell<isize>,
 }
 
-/// A handle's allocation. `repr(C)` puts `header` first for every `T`.
+/// A handle's allocation.
 #[repr(C)]
 pub struct Cell<T> {
     header: Header,
@@ -94,7 +65,6 @@ pub fn into_raw<T: Class>(value: T) -> usize {
 }
 
 /// The cell behind `ptr`, checked for null and for its class.
-///
 /// # Safety
 /// `ptr` is 0 or a handle [`into_raw`] returned, for any class, not yet
 /// freed by [`free`].
@@ -103,24 +73,18 @@ unsafe fn cell<'a, T: Class>(ptr: usize) -> Result<&'a Cell<T>, Thrown> {
     if ptr == 0 {
         return Err(Thrown::Error(NULL.to_string()));
     }
-    // SAFETY: a live handle of any class is a `Cell<_>` whose first field,
-    // at offset 0 (`repr(C)`), is exactly this Header, at its own alignment.
+    // SAFETY: a live handle of any class is a `Cell<_>` whose first field, at offset 0.
     let header = unsafe { &*(ptr as *const Header) };
     if header.type_id != TypeId::of::<T>() || header.tag.get() != T::TAG {
         return Err(Thrown::Error(WRONG_CLASS.to_string()));
     }
-    // SAFETY: the Rust type identity proves this handle was made by
-    // `into_raw::<T>`, and the caller guarantees it is still live.
+    // SAFETY: the Rust type identity proves this handle was made by `into_raw::<T>`.
     Ok(unsafe { &*(ptr as *const Cell<T>) })
 }
 
 /// Borrow the value behind `ptr` for a `&self` call.
-///
 /// # Safety
-/// As [`cell`]: `ptr` is 0 or a live handle of any class. The handle cannot
-/// be freed while the guard lives ([`free`] refuses a borrowed value), so
-/// any `'a` the call needs is sound.
-///
+/// As [`cell`]: `ptr` is 0 or a live handle of any class.
 /// # Errors
 /// [`Thrown::Error`]: null, another class, or borrowed exclusively.
 #[inline]
@@ -136,10 +100,8 @@ pub unsafe fn borrow<'a, T: Class>(ptr: usize) -> Result<Ref<'a, T>, Thrown> {
 }
 
 /// Borrow the value behind `ptr` for a `&mut self` call.
-///
 /// # Safety
 /// As [`borrow`].
-///
 /// # Errors
 /// [`Thrown::Error`]: null, another class, or borrowed at all.
 #[inline]
@@ -153,17 +115,11 @@ pub unsafe fn borrow_mut<'a, T: Class>(ptr: usize) -> Result<RefMut<'a, T>, Thro
     Ok(RefMut { cell })
 }
 
-/// Free the handle `ptr`: drop its value and its box. `from_finalizer` is the
-/// FinalizationRegistry's call, the other is `free()`.
-///
+/// Free the handle `ptr`: drop its value and its box.
 /// # Safety
-/// As [`borrow`]; after an `Ok` the handle is gone and `ptr` must not be
-/// used again (the glue zeroes its copy first).
-///
+/// As [`borrow`]; after an `Ok` the handle is gone and `ptr` must not be used again.
 /// # Errors
-/// [`Thrown::Error`]: null, another class, or (from `free()`) a borrowed or
-/// poisoned value, which is left leaked. From the finalizer a borrowed value
-/// is leaked without an error: nothing is left to report it to.
+/// [`Thrown::Error`].
 pub unsafe fn free<T: Class>(ptr: usize, from_finalizer: bool) -> Result<(), Thrown> {
     // SAFETY: the caller's contract.
     let cell = unsafe { cell::<T>(ptr) }?;
@@ -175,9 +131,7 @@ pub unsafe fn free<T: Class>(ptr: usize, from_finalizer: bool) -> Result<(), Thr
         };
     }
     cell.header.tag.set(0);
-    // SAFETY: `ptr` came from `Box::into_raw` in `into_raw::<T>` (Rust type
-    // identity checked), nothing borrows it (flag checked), and it is not
-    // used again.
+    // SAFETY: `ptr` came from `Box::into_raw` in `into_raw::<T>` (Rust type identity checked).
     drop(unsafe { Box::from_raw(ptr as *mut Cell<T>) });
     Ok(())
 }
@@ -213,8 +167,7 @@ impl<T> Deref for RefMut<'_, T> {
 impl<T> DerefMut for RefMut<'_, T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut T {
-        // SAFETY: this guard holds the only borrow, and `&mut self` makes
-        // this reference unique for its lifetime.
+        // SAFETY: this guard holds the only borrow, and `&mut self` makes this reference unique.
         unsafe { &mut *self.cell.value.get() }
     }
 }
@@ -263,7 +216,6 @@ mod tests {
     fn calls_see_the_value_and_free_drops_it_once() {
         let (h, drops) = probe();
         assert_ne!(h, 0);
-        // SAFETY (this test): `h` is live until the `free` that returns Ok.
         unsafe {
             assert_eq!(borrow::<Probe>(h).unwrap().1, 7);
             borrow_mut::<Probe>(h).unwrap().1 = 8;
@@ -292,8 +244,6 @@ mod tests {
     }
 
     /// Distinct, valid struct names whose default FNV-1a/32 tags collide.
-    /// Their representations match so the old erroneous admission can be
-    /// observed without reading an invalid value or dropping the wrong type.
     #[test]
     fn matching_class_hashes_do_not_authorize_another_rust_type() {
         #[repr(transparent)]
@@ -308,8 +258,7 @@ mod tests {
         }
         assert_eq!(CUzpSYPuOo::TAG, CPmqmZnSBt::TAG, "a genuine collision");
         let ptr = into_raw(CUzpSYPuOo(7));
-        // SAFETY: ptr stays a live handle, both types have the same valid
-        // representation, and no wrongly admitted value is dereferenced.
+        // SAFETY: ptr stays a live handle, both types have the same valid representation, and no.
         let (shared, exclusive) = unsafe {
             let shared = borrow::<CPmqmZnSBt>(ptr).err();
             let exclusive = borrow_mut::<CPmqmZnSBt>(ptr).err();

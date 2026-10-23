@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 pub const RESERVE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The reserve's folder under aterm's cache folder (`.noindex`: Spotlight
+/// skips it) and its file name.
 const FOLDER: &str = "disk-reserve.noindex";
 const FILE: &str = "reserve";
 
@@ -33,6 +34,7 @@ pub fn path_for(home: &Path) -> PathBuf {
 }
 
 /// Whether `meta` (read without following) is a link: a symlink, and on
+/// Windows any reparse point.
 fn is_link(meta: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
     {
@@ -124,6 +126,8 @@ pub fn state(path: &Path) -> Result<State, ReserveError> {
 }
 
 /// Open the regular file at `path` AS ITSELF (never through a reparse point)
+/// with `access`, sharing everything, and judge it again through that handle:
+/// a reparse point or anything not a regular file is [`ReserveError::NotOurs`].
 #[cfg(windows)]
 fn open_judged(path: &Path, access: u32) -> Result<std::fs::File, ReserveError> {
     use std::os::windows::fs::OpenOptionsExt as _;
@@ -151,6 +155,7 @@ fn open_judged(path: &Path, access: u32) -> Result<std::fs::File, ReserveError> 
 /// # Errors
 ///
 /// [`ReserveError::Thin`] for a thin file; [`ReserveError::NotOurs`] for a
+/// reparse point or a non-file; the open or the query failing.
 #[cfg(windows)]
 fn holds_its_blocks(path: &Path) -> Result<(), ReserveError> {
     use std::os::windows::fs::MetadataExt as _;
@@ -225,6 +230,8 @@ pub fn ensure(path: &Path, bytes: u64) -> Result<bool, ReserveError> {
 }
 
 /// Write `bytes` of a non-zero pattern to a NEW file at `path` (never
+/// through a link: `create_new`), mode `0600`, and order it ahead of its
+/// rename.
 fn write_blocks(path: &Path, bytes: u64) -> std::io::Result<()> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);

@@ -20,9 +20,13 @@ use super::*;
 use aterm_phase::{QuestionDialog, QuestionFocus, QuestionForm};
 
 /// The most keystrokes a decline takes: the focus moves across a permission
+/// box's options to its refusal (three at most; the Bash box's `Yes` to `No`
+/// is one), then Tab, the text and Enter.
 const MAX_DECLINE_STEPS: u32 = 3 + 3;
 
 /// How many fresh reads after a decline keystroke may still show the box as keyed before it is
+/// handed over ([`Session::press_decline`]): each waits for a change (at most [`STRAY_SETTLE`])
+/// and a settle, about 12 s in all on a box that holds still.
 const MAX_DECLINE_UNSEEN_READS: u32 = 5;
 
 /// Why a decline is not carried out on a host that stamps no person's input.
@@ -30,6 +34,9 @@ const UNSTAMPED: &str = "this host does not stamp a person's input, and a declin
                          could cross a person's";
 
 /// The most keystrokes a note takes ([`Session::press_codex_note`]): the
+/// focus moved across a question's answers onto `None of the above` (as far
+/// as a question's focus is ever moved, [`MAX_QUESTION_FOCUS_STEPS`]), then
+/// Tab, the text and Enter.
 const MAX_NOTE_STEPS: u32 = MAX_QUESTION_FOCUS_STEPS + 3;
 
 /// Why a note is not written on a host that stamps no person's input.
@@ -37,11 +44,15 @@ const UNSTAMPED_NOTE: &str = "this host does not stamp a person's input, and a n
                               could cross a person's";
 
 /// Why a note whose notes field draws only its tail ([`NoteRead::Tail`]) is
+/// not entered: the read's person count is not the one the text was written
+/// on (a person keyed since, or the read carries none), and the head the
+/// field does not draw may hold their keys.
 const TAIL_KEYED: &str = "the notes field draws only the tail of the policy text, and the read \
                           does not show that no person keyed since it was written: the head it \
                           does not draw may be theirs";
 
 /// What a note's keystroke is judged landed by: the focused answer's index
+/// and the notes field's text (`None` while it is closed).
 type NoteState = (Option<usize>, Option<String>);
 
 /// The state of the question `q` read from `rows` ([`NoteState`]).
@@ -74,6 +85,7 @@ fn keystroke_name(step: &DeclineStep) -> &'static str {
 }
 
 /// Whether a read's person stamp lets a question key go: no person ever keyed the session, or
+/// they have been quiet at least `grace`.
 fn person_quiet(human: HumanInput, grace: Duration) -> bool {
     match human {
         HumanInput::Ago(ms) => u128::from(ms) >= grace.as_millis(),
@@ -106,6 +118,7 @@ fn dialog_of(rows: &[String]) -> Option<QuestionDialog> {
 }
 
 /// A question tab's free-text row as the reader joins it: its text, whether
+/// it is pristine (the placeholder), and its checkbox (multi-select).
 fn field_of(dialog: &QuestionDialog) -> Option<(String, bool, Option<bool>)> {
     match &dialog.form {
         QuestionForm::Single { free_text, .. } | QuestionForm::Multi { free_text, .. } => Some((
@@ -131,6 +144,7 @@ enum Back {
 }
 
 /// The free-text row of the question `first` asked, on `rows` read after
+/// `text` was written into it.
 fn read_back(rows: &[String], first: &QuestionDialog, text: &str) -> Back {
     let Some(dialog) = dialog_of(rows).filter(|d| d.same_question(first)) else {
         return Back::Other("the dialog is no longer the question it was written into");
@@ -158,6 +172,8 @@ fn read_back(rows: &[String], first: &QuestionDialog, text: &str) -> Back {
 }
 
 /// How long the screen had held still when an `await idle <ms>` answered `waited`: `ms` when
+/// it latched (the server measures from the wait's arming), `None` when it ran out or the host
+/// has no such wait.
 fn latched_for(waited: Wait, ms: &str) -> Option<Duration> {
     matches!(waited, Wait::Latched)
         .then(|| ms.parse().ok().map(Duration::from_millis))
@@ -218,10 +234,14 @@ impl<C: Ctl> Session<'_, C> {
                 return unconfirmed(&why);
             }
         }
-        if let Some(stop) = self.first_key_wait(&first, seen, grace)? {
-            return Ok(stop);
-        }
-        let (now, dialog) = match self.move_focus(steps, &first, seen, grace)? {
+        // The person count every key of the answer names (`if-human=`), on
+        // the read decided on.
+        let person = self.person_fence(seen);
+        let seen = match self.first_key_wait(&first, seen, grace)? {
+            Ok(now) => now,
+            Err(stop) => return Ok(stop),
+        };
+        let (now, dialog) = match self.move_focus(steps, &first, &seen, grace, person)? {
             Moved::Landed { now, dialog } => (*now, *dialog),
             Moved::Stopped(pressing) => return Ok(pressing),
         };
@@ -238,13 +258,13 @@ impl<C: Ctl> Session<'_, C> {
         let Some(row) = focus_row(&dialog, want).filter(|&r| r < now.rows.len()) else {
             return unconfirmed("the focused row is not on the rows read");
         };
-        if submits_text && now.human_seq.is_none() {
+        if submits_text && person.is_none() {
             return unconfirmed(
                 "the read carried no person count to fence the Enter on a typed answer",
             );
         }
         let guard = super::super::policy::row_guard(&now.rows[row]);
-        let at = match self.question_key(&guard, "enter", &now, Some(KeyAct::Answer))? {
+        let at = match self.question_key(&guard, "enter", &now, person, Some(KeyAct::Answer))? {
             Keyed::Written(at) => at,
             Keyed::Not(p) => return Ok(p),
         };
@@ -253,11 +273,18 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// The text word the dialog in hand is answered under: the decision's
+    /// ([`approval_loop::QuestionMemory::deciding`]) when it is `long-term` or
+    /// `short-term`, its tabs that fall back included; `None` under
+    /// `recommended` and for a controller's answer (`aterm drive answer`).
     fn text_word(&self) -> Option<QuestionPriority> {
         self.question.deciding.filter(|w| w.text().is_some())
     }
 
     /// The ownership rule (`policy/question.rs`): why the text in `dialog`'s free-text row is
+    /// not the loop's own for priority `own`, or `None` when it is: the loop remembers writing
+    /// exactly that text into this question ([`approval_loop::QuestionMemory::typed`]), `own` is
+    /// both the latched and the deciding word, the field reads it back byte for byte, and a
+    /// multi-select's row reads ticked.
     fn not_own(
         &self,
         dialog: &QuestionDialog,
@@ -290,31 +317,44 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// A tab's first key waits for it to have held still about a second
+    /// ([`QUESTION_FIRST_KEY_IDLE`], once per question): Claude Code refuses keys inside a
+    /// typeahead window after a dialog mounts.
     fn first_key_wait(
         &mut self,
         first: &QuestionDialog,
         seen: &Screen,
         grace: Duration,
-    ) -> Result<Option<Pressing>, Fail> {
+    ) -> Result<Result<Screen, Pressing>, Fail> {
         let key_of = approval_loop::question_key(first, &seen.rows);
         if self.question.keyed.as_deref() == Some(key_of.as_str()) {
-            return Ok(None);
+            return Ok(Ok(seen.clone()));
         }
         self.question.keyed = Some(key_of);
         self.wait(&["idle", QUESTION_FIRST_KEY_IDLE], QUESTION_FIRST_KEY_CAP)?;
-        Ok(self
-            .person_stamp_now()?
-            .is_some_and(|ms| !person_quiet(HumanInput::Ago(ms), grace))
-            .then_some(Pressing::Done(Press::Yielded { seq: seen.seq })))
+        let (stamp, generation) = self.status_now()?;
+        if self.driver || stamp.is_some_and(|ms| !person_quiet(HumanInput::Ago(ms), grace)) {
+            return Ok(Err(Pressing::Done(Press::Yielded { seq: seen.seq })));
+        }
+        if generation.is_none_or(|g| seen.generation.as_deref() == Some(g.as_str())) {
+            return Ok(Ok(seen.clone()));
+        }
+        let now = self.screen()?;
+        if now.generation.is_none() || dialog_of(&now.rows).as_ref() != Some(first) {
+            return Ok(Err(Pressing::Done(Press::Changed { seq: now.seq })));
+        }
+        Ok(Ok(now))
     }
 
     /// Move the focus `steps` rows in `first`'s focus order (down when positive), one key in
+    /// flight: each move fenced on the read before it, guarded on the focused row, and seen
+    /// landing on a settled read before the next ([`Moved::Landed`]; `steps` 0 lands on `seen`).
     fn move_focus(
         &mut self,
         steps: i32,
         first: &QuestionDialog,
         seen: &Screen,
         grace: Duration,
+        person: Option<u64>,
     ) -> Result<Moved, Fail> {
         let unconfirmed = |why: &str| {
             Ok(Moved::Stopped(Pressing::Unconfirmed {
@@ -335,7 +375,7 @@ impl<C: Ctl> Session<'_, C> {
                 return unconfirmed("the dialog shows no focus to move");
             };
             let guard = super::super::policy::row_guard(&now.rows[row]);
-            let at = match self.question_key(&guard, arrow, &now, None)? {
+            let at = match self.question_key(&guard, arrow, &now, person, None)? {
                 Keyed::Written(at) => at,
                 Keyed::Not(p) => return Ok(Moved::Stopped(p)),
             };
@@ -349,7 +389,8 @@ impl<C: Ctl> Session<'_, C> {
             let mut read = dialog_of(&now.rows);
             let mut settled = false;
             if unmoved(&read) {
-                settled = matches!(self.wait(&["idle", IDLE_MS], WAIT_STEP)?, Wait::Latched);
+                let (quiet, step) = self.still_wait(&now);
+                settled = matches!(self.wait(&["idle", quiet], step)?, Wait::Latched);
                 now = self.screen()?;
                 read = dialog_of(&now.rows);
             }
@@ -403,7 +444,9 @@ impl<C: Ctl> Session<'_, C> {
         if !self.gen_fence_known()? || seen.generation.is_none() {
             return unconfirmed("this host cannot fence a question's key on the screen generation");
         }
-        if !self.send_fence_known()? || seen.human_seq.is_none() {
+        // The person count every key of the answer names (`if-human=`).
+        let person = self.person_fence(seen);
+        if !self.send_fence_known()? || person.is_none() {
             return unconfirmed(
                 "this host cannot fence a typed answer (send if-gen=, the person count)",
             );
@@ -415,10 +458,11 @@ impl<C: Ctl> Session<'_, C> {
         if self.question.typed.contains_key(&key) {
             return unconfirmed("the supervisor wrote a policy text into this question already");
         }
-        if let Some(stop) = self.first_key_wait(&first, seen, grace)? {
-            return Ok(stop);
-        }
-        let (now, dialog) = match self.move_focus(steps, &first, seen, grace)? {
+        let seen = match self.first_key_wait(&first, seen, grace)? {
+            Ok(now) => now,
+            Err(stop) => return Ok(stop),
+        };
+        let (now, dialog) = match self.move_focus(steps, &first, &seen, grace, person)? {
             Moved::Landed { now, dialog } => (*now, *dialog),
             Moved::Stopped(pressing) => return Ok(pressing),
         };
@@ -436,7 +480,7 @@ impl<C: Ctl> Session<'_, C> {
             return unconfirmed("the free-text row is not on the rows read");
         };
         let guard = super::super::policy::row_guard(&now.rows[row]);
-        let at = match self.question_text(&guard, text, &now, &key, priority)? {
+        let at = match self.question_text(&guard, text, &now, &key, priority, person)? {
             Keyed::Written(at) => at,
             Keyed::Not(p) => {
                 // read unchanged after the reconnect is the text not taken, never re-sent.
@@ -488,22 +532,30 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// The person stamp the server reports now (`status`'s `human_ms=`):
-    fn person_stamp_now(&mut self) -> Result<Option<u64>, Fail> {
+    /// The person stamp (`human_ms=`) and screen generation (`gen=`) `status` reports now; another
+    /// driver's hand it shows is noted ([`Session::note_hand`]).
+    fn status_now(&mut self) -> Result<(Option<u64>, Option<String>), Fail> {
         let r = self.call(&["status"])?;
-        Ok(if r.ok() {
-            super::escalate::status_field(&r.stdout, "human_ms").and_then(|v| v.parse().ok())
-        } else {
-            None
-        })
+        if !r.ok() {
+            return Ok((None, None));
+        }
+        self.note_hand(&r.stdout);
+        let field = |name| super::escalate::status_field(&r.stdout, name);
+        Ok((
+            field("human_ms").and_then(|v| v.parse().ok()),
+            field("gen").map(str::to_string),
+        ))
     }
 
     /// One question key, `key [if-human=<count>] if-gen=<generation> if=<guard> <key>`:
+    /// [`Keyed::Written`] with the server's seq, or a skip ([`Self::written_or_not`]) or refusal
+    /// ([`Self::refused_press`]).
     fn question_key(
         &mut self,
         guard: &str,
         key: &str,
         now: &Screen,
+        person: Option<u64>,
         act: Option<KeyAct>,
     ) -> Result<Keyed, Fail> {
         debug_assert!(
@@ -517,7 +569,7 @@ impl<C: Ctl> Session<'_, C> {
             }));
         };
         let args = super::super::policy::key_args(guard, key, Some(generation));
-        let args = match now.human_seq {
+        let args = match person {
             Some(n) => format!("if-human={n} {args}"),
             None => args,
         };
@@ -536,6 +588,9 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// Write `priority`'s policy text into the free-text row `guard` names on `now`, in one
+    /// `send if-human=<person> if-gen=<generation> if=<guard> -- <text>` (`person` the answer's
+    /// one count, as for [`Self::question_key`]; the text carries no digit and no newline,
+    /// `policy/question.rs`).
     fn question_text(
         &mut self,
         guard: &str,
@@ -543,6 +598,7 @@ impl<C: Ctl> Session<'_, C> {
         now: &Screen,
         key: &str,
         priority: QuestionPriority,
+        person: Option<u64>,
     ) -> Result<Keyed, Fail> {
         let Some(generation) = now.generation.as_deref() else {
             return Ok(Keyed::Not(Pressing::Unconfirmed {
@@ -550,7 +606,7 @@ impl<C: Ctl> Session<'_, C> {
                 retry: false,
             }));
         };
-        let Some(count) = now.human_seq else {
+        let Some(count) = person else {
             return Ok(Keyed::Not(Pressing::Unconfirmed {
                 why: "the read carried no person count to fence the policy text on".to_string(),
                 retry: false,
@@ -585,6 +641,8 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// A fenced write the server answered `OK …`: [`Keyed::Written`] (the dialog's word
+    /// latched), or a skip: `reason=person` ([`Press::Yielded`]), `reason=changed`
+    /// ([`Press::Changed`]), no row matched ([`Press::Skipped`]).
     fn written_or_not(&mut self, r: &CtlReply, seen: u64) -> Keyed {
         let at = r.seq().unwrap_or(seen);
         if r.skipped_person() {
@@ -600,6 +658,7 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// The latch ([`approval_loop::QuestionMemory::mode`]): the word of the
+    /// decision in hand becomes the dialog's at the loop's first write on it.
     fn latch_question_word(&mut self) {
         if self.question.mode.is_none() {
             self.question.mode = self.question.deciding;
@@ -607,6 +666,8 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// Remember the question write just made on `now` with the focus at `focus`
+    /// ([`approval_loop::QuestionPending`]); `waited` when the screen already held still after
+    /// it.
     fn question_pending(
         &mut self,
         now: &Screen,
@@ -654,6 +715,7 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// `args` with the dismissing key's `act=` in front, where the host
+    /// takes it ([`Self::act_option`]).
     fn acting(&self, act: Option<KeyAct>, args: String) -> String {
         match self.act_option(act) {
             Some(option) => format!("{option} {args}"),
@@ -871,6 +933,10 @@ impl<C: Ctl> Session<'_, C> {
         let Some((_, key)) = box_on(&seen.rows) else {
             return Ok(Pressing::Done(Press::Skipped { seq: seen.seq }));
         };
+        // The person fence (R3b), one count for every keystroke
+        // (`Session::person_fence`): a person who keyed since it skips the
+        // keystroke, `OK skipped reason=person`.
+        let person = self.person_fence(seen).map(|n| format!("if-human={n}"));
         let mut now = seen.clone();
         let mut written = 0;
         loop {
@@ -921,7 +987,6 @@ impl<C: Ctl> Session<'_, C> {
                 step: step.clone(),
                 unseen: 0,
             });
-            let person = now.human_seq.map(|n| format!("if-human={n}"));
             let (r, sent) = match &step {
                 DeclineStep::Type { guard } => {
                     let fence = format!("if-gen={generation}");
@@ -1079,7 +1144,7 @@ impl<C: Ctl> Session<'_, C> {
             };
             let keyed = match &step {
                 NoteStep::Type { guard } => {
-                    self.question_text(guard, text, &now, &key, priority)?
+                    self.question_text(guard, text, &now, &key, priority, now.human_seq)?
                 }
                 NoteStep::Move { down, guard } => {
                     let arrow = if *down { "down" } else { "up" };
@@ -1126,6 +1191,8 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// A note's fenced key ([`Self::press_codex_note`]) as [`Keyed`]: refused
+    /// ([`Self::refused_press`]; one whose answer never came latches the
+    /// dialog's word, as it may have been written), skipped, or written.
     fn note_keyed(&mut self, r: &CtlReply, args: &str, seen: u64) -> Result<Keyed, Fail> {
         if let Some(p) = self.refused_press(r, args)? {
             if matches!(p, Pressing::Lost { .. }) {

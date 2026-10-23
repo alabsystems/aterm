@@ -1,42 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm drive ledger`: how the manager loop ran, replayed as one timeline
-//! joining four sources:
-//!
-//! 1. the worker's turn ledger (`history`): every turn the manager typed, when
-//!    it started, how long it took, how it settled — the window harness's own
-//!    turns (`by=harness`: its `keep going`, its done check, its `/usage`)
-//!    are not the manager's, and are counted in SOURCES and left out, so a
-//!    reply runs on through the continuations the harness typed into it;
-//! 2. the watcher's journal (`watch --journal`, [`super::journal`]), when
-//!    given, with the Unix time each line was printed;
-//! 3. the manager's fabric mail with that worker (`inbox --peek --meta` and
-//!    `timeline` rows, read without handling anything);
-//! 4. each turn's reply size in rows, from one `offscreen tail=… screen=1`
-//!    read joined the way `report` joins it.
-//!
-//! The ledger, inbox and timeline are stamped by the aterm process's own clock
-//! (milliseconds since it started its clock); the journal by the wall clock.
-//! They share an axis through the process's clock anchor
-//! ([`LedgerHost::anchor`]; the CLI uses the control socket's birth time). A
-//! turn carried from an earlier process by a self-update (`carried=1`) has no
-//! time here. A source that cannot be read is named in SOURCES and the rest is
-//! printed.
-//!
-//! `--source log` ([`LedgerSource::Log`], beside the
-//! anchor path, which stays the default until P6 is ruled) reads no
-//! anchor: each turn's time is its own session log record's wall `t=`,
-//! joined to `history` by `ledger=` alone (`@<worker> log class=turn`: the
-//! turn's open, or its close less `dur_ms` once the open was evicted — the
-//! close restates `ledger=`, 5F-4a), and each message's is its `mail` mark's
-//! (`@self log kinds=mail`, joined to the inbox rows by `inbox=`; the inbox
-//! read stays, for `len=` and `trust=`). Nothing is ever joined by time:
-//! a turn whose `ledger=` is gone stays unplaced, and SOURCES
-//! counts it. A turn's time there is when the worker's screen saw it begin,
-//! after the press, so its row reads `turn <id> began`, where the anchor
-//! path's `turn <id> sent` is the exchange's start: the two agree to the
-//! second only when the press was immediate.
+//! `aterm drive ledger`: multi-source timeline joining worker turn history, watcher journal, fabric mail, and reply row counts.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -65,18 +30,6 @@ fn bare_sid(s: &str) -> &str {
 /// Whether `from`, a row's attested sender, is the session `worker` names
 /// (`@s-…`/`s-…`, or `@s-…@n-…` for a session on another node) — the WHOLE
 /// principal, never the sid alone.
-///
-/// A session speaks on the bus as `<sid>@<node>`, and only the node half is
-/// attested: the broker forces it from the sending node's cap, while the sid is
-/// that node's own word about which of its sessions spoke. So `s-w@n-evil` is
-/// any node calling one of its posts `s-w`, and matching the sid alone handed it
-/// the worker's report and the worker's answer to a task. A worker named with
-/// its node must match that node. A worker named bare leaves the node to the
-/// bridge, which renders no other node's claim to it: a remote node's claim to
-/// speak for a session hosted here, or pinned to another node, is attributed
-/// to that node itself (`aterm-link`'s `render_from`), and its reply to a task
-/// that went elsewhere arrives demoted. A bare principal (`h-…`, `n-…`) is a
-/// human or a node speaking as itself, never a session.
 fn is_from_session(from: &str, worker: &str) -> bool {
     let worker = worker.strip_prefix('@').unwrap_or(worker);
     let Some((sid, node)) = from.split_once('@') else {
@@ -91,14 +44,14 @@ fn is_from_session(from: &str, worker: &str) -> bool {
     }
 }
 
-/// The most archived rows the reply-size read asks for (the archive is 4 MiB).
+/// Maximum archived rows requested when measuring turn reply sizes.
 pub const LEDGER_MAX_ROWS: usize = 20_000;
 /// How many characters of a turn's text the timeline shows.
 const TURN_CHARS: usize = 100;
 /// How wide the text timeline's WHAT column is.
 const WHAT_CHARS: usize = 96;
 
-/// `--format`.
+/// Output format for `aterm drive ledger`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Format {
     /// Aligned columns for a terminal (the default).
@@ -121,7 +74,7 @@ impl Format {
     }
 }
 
-/// What to put in the ledger.
+/// Options for [`gather`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LedgerOpts {
     /// The worker, as `@s-…`.
@@ -134,20 +87,18 @@ pub struct LedgerOpts {
     pub source: LedgerSource,
 }
 
-/// `--source`: what places the turns and the mail on the wall clock.
+/// Clock source used to place turns and mail on the wall clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LedgerSource {
-    /// The process clock's stamps, placed by the instance's [`ClockAnchor`]
-    /// (the default).
+    /// Process-clock timestamps anchored via [`ClockAnchor`].
     #[default]
     Anchor,
-    /// The session log's own wall times, joined by `ledger=` and `inbox=`
-    /// (plan 5F-4; the module doc).
+    /// Session-log wall-clock timestamps joined by `ledger=` and `inbox=`.
     Log,
 }
 
 impl LedgerSource {
-    /// `anchor` or `log`.
+    /// Parse `"anchor"` or `"log"`.
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         match s {
@@ -158,8 +109,7 @@ impl LedgerSource {
     }
 }
 
-/// Where a session's aterm process started the clock its `history`,
-/// `inbox` and `timeline` stamps count from.
+/// Wall-clock anchor for an aterm instance's monotonic process clock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClockAnchor {
     /// The instance's pid.
@@ -170,7 +120,7 @@ pub struct ClockAnchor {
     pub how: String,
 }
 
-/// What the ledger needs from the machine besides the control socket.
+/// Host clock and process-anchor callback for [`gather`].
 pub struct LedgerHost<'a> {
     /// The time now, Unix ms.
     pub now_ms: i64,
@@ -181,7 +131,7 @@ pub struct LedgerHost<'a> {
     pub anchor: &'a mut dyn FnMut(&str) -> Result<ClockAnchor, String>,
 }
 
-/// One source, read or not.
+/// Diagnostic status of one ledger data source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Source {
     pub name: &'static str,
@@ -189,7 +139,7 @@ pub struct Source {
     pub detail: String,
 }
 
-/// One `history` record.
+/// Parsed record from a session `history` reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistTurn {
     pub id: u64,
@@ -205,10 +155,7 @@ pub struct HistTurn {
     pub text: String,
 }
 
-/// The floor a `history` header names (` unheld_below=<id>`: an aterm update
-/// could not carry the ledger whole, so records of turn ids below it may be
-/// gone). `aterm ctl` prints that header on stderr; a raw reply carries it on
-/// its first line.
+/// Extract `unheld_below=<id>` from a `history` reply header, if present.
 pub(crate) fn history_floor(reply: &CtlReply) -> Option<u64> {
     let header = reply.stdout.lines().next().filter(|l| l.starts_with("OK "));
     header
@@ -218,10 +165,7 @@ pub(crate) fn history_floor(reply: &CtlReply) -> Option<u64> {
         .find_map(|word| word.strip_prefix("unheld_below=")?.parse().ok())
 }
 
-/// The records of a `history` reply (`turn <id> submitted=… status=…
-/// started_ms=… dur_ms=… … by=<who> arch=<o>:<l> [carried=1] text=<pct>`); any other
-/// line is skipped. `text=` is the free-text tail, so the line is cut there
-/// first.
+/// Parse `turn` records from a `history` reply body.
 pub fn parse_history_records(body: &str) -> Vec<HistTurn> {
     body.lines()
         .filter_map(|line| {
@@ -256,7 +200,7 @@ pub fn parse_history_records(body: &str) -> Vec<HistTurn> {
         .collect()
 }
 
-/// Which way a message went.
+/// Direction of a fabric message relative to the manager session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dir {
     /// From the worker to this session.
@@ -265,7 +209,7 @@ pub enum Dir {
     Out,
 }
 
-/// One message between the manager and the worker.
+/// Fabric message exchanged between the manager and the worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mail {
     /// Aligned Unix ms (`None` without a clock).
@@ -338,8 +282,7 @@ fn timeline_posts(body: &str, worker: &str) -> Vec<(u64, u64, String)> {
 }
 
 /// One record line of a `log` reply (`<seq> <op> <node> <kind> [par=…]
-/// <key>=<value>… t=<ms>`): its op, node and kind words, and its `t=`. The
-/// header and a `gap` line are no record.
+/// <key>=<value>… t=<ms>`): its op, node and kind words, and its `t=`.
 fn log_record(line: &str) -> Option<(&str, &str, &str, Option<i64>)> {
     let mut w = line.split(' ');
     decimal(w.next()?)?;
@@ -361,11 +304,6 @@ struct LogTurns {
     /// Of `start`, the turns placed by their close: the open was evicted.
     by_close: usize,
     /// Turns only a close shows (the open evicted) that name no `ledger=`.
-    /// A close restates its open's `ledger=` (5F-4a), so on this build such
-    /// a turn never had one: no `turn` exchange opened it (a person's, or
-    /// input sent with `send` or `key`). Only an older aterm's close may
-    /// have lost one. Either way it joins nothing, and it is no lost join:
-    /// the history turns the log no longer places are counted apart.
     unledgered: usize,
     /// The records the ring evicted before this read (its `gap` line).
     lost: u64,
@@ -448,7 +386,7 @@ fn log_mail(body: &str, worker: &str) -> (BTreeMap<u64, i64>, Vec<LogPost>) {
     (ins, outs)
 }
 
-/// One turn, placed on the wall clock.
+/// Manager turn aligned onto the wall clock with its reply row count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnRow {
     pub id: u64,
@@ -474,7 +412,7 @@ pub struct TurnRow {
     pub stopped: Option<i64>,
 }
 
-/// Everything read, placed on one clock.
+/// Assembled multi-source timeline for a supervised worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ledger {
     /// The worker's sid (no `@`).
@@ -532,14 +470,12 @@ fn cut(s: &str, n: usize) -> String {
     }
 }
 
-/// Read every source (see the module doc). Never fails: a source that
-/// cannot be read is a [`Source`] with `ok: false`.
+/// Gather turn history, mail, reply sizes, and optional journal records into a [`Ledger`].
 pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>) -> Ledger {
     let worker = bare_sid(&opts.worker).to_string();
     let at = format!("@{worker}");
     let mut sources = Vec::new();
 
-    // Whose clock: the worker's instance, and this session's.
     let manager = ask(ctl, &["whoami"])
         .ok()
         .and_then(|r| r.stdout.split_whitespace().nth(1).map(str::to_string));
@@ -577,10 +513,7 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
         },
     });
 
-    // 1. The turn ledger.
     let mut hist: Vec<HistTurn> = Vec::new();
-    // The newest stamp read, the harness's turns among them (the clock's
-    // fallback below).
     let mut newest = None;
     match ask(ctl, &[&at, "history"]) {
         Ok(r) => {
@@ -600,8 +533,6 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
                 ),
             };
             let carried = hist.iter().filter(|t| t.carried).count();
-            // An update that could not carry the ledger whole says so (`unheld_below=`): then
-            // an empty ledger is not a session nobody drove.
             let lost = history_floor(&r).map(|floor| {
                 format!(
                     "an aterm update could not carry its ledger whole: turns before id {floor} \
@@ -638,7 +569,6 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
         }),
     }
 
-    // `--source log`: the turns' times from the worker's log, by `ledger=` alone.
     let log_starts = from_log.then(|| match ask(ctl, &[&at, "log", "class=turn"]) {
         Ok(r) => {
             let lt = log_turns(&r.stdout);
@@ -694,8 +624,6 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
         }
     });
 
-    // The process clock onto the wall clock. Without an anchor the newest stamp (read with the
-    // ledger, above) is taken as now, so the order still reads.
     let fallback = host.now_ms - i64::try_from(newest.unwrap_or(0)).unwrap_or(0);
     let worker_epoch = worker_anchor.as_ref().map_or(fallback, |a| a.epoch_ms);
     let manager_epoch = match &manager_anchor {
@@ -704,7 +632,6 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
     };
     let place = |epoch: i64, ms: u64| epoch.saturating_add(i64::try_from(ms).unwrap_or(i64::MAX));
 
-    // 4. The reply sizes.
     let sizes = reply_sizes(ctl, &at, &hist, &mut sources);
 
     let mut turns: Vec<TurnRow> = hist
@@ -728,8 +655,6 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
         })
         .collect();
 
-    // 2. The journal. `journaled` is whether one was read, not given: an unreadable
-    // `--journal` must not count as zero approvals and an idle watcher.
     let mut journal = Vec::new();
     let mut journaled = false;
     let mut journal_unreadable = false;
@@ -775,7 +700,6 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
         },
     }
 
-    // 3. The mail.
     let mut mail = Vec::new();
     let mut mail_notes = Vec::new();
     let mut mail_ok = false;
@@ -822,7 +746,6 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
         ),
     });
 
-    // --since.
     if let Some(since) = opts.since_ms {
         turns.retain(|t| t.t.is_some_and(|t| t >= since));
         journal.retain(|r| r.t >= since);
@@ -830,9 +753,6 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
     }
     mail.sort_by_key(|m| m.t);
 
-    // When the worker stopped: the first EVENT that ended on words after each turn began,
-    // before the next one did. Only with a clock: without an anchor `turn.t` sits on a fallback
-    // epoch, so `stopped - t` against the journal's wall clock is no duration.
     let starts: Vec<Option<i64>> = turns.iter().map(|t| t.t).collect();
     for (i, turn) in turns.iter_mut().enumerate().filter(|_| aligned) {
         let Some(start) = turn.t else { continue };
@@ -911,9 +831,6 @@ fn ended_on_words(phase: &str) -> bool {
 }
 
 /// A turn's reply in rows (or why it is not known), and the turns inside that count.
-/// [`reply_sizes`] reads them from one `offscreen tail=<n> max=<n> screen=1` read joined as
-/// `report` joins it: each turn's `❯` row found in order ([`find_turn_row`]), a reply its rows
-/// down to the next turn's row found (the transcript's end for the last), trailing blanks aside.
 type ReplySize = (Result<usize, String>, Vec<u64>);
 
 fn reply_sizes<C: Ctl>(
@@ -959,7 +876,6 @@ fn reply_sizes<C: Ctl>(
             return unknown("no archive read");
         }
     };
-    // Claude Code's grammar: the turns are found by their `❯` rows.
     let joined = join(&off, &aterm_phase::ClaudeReader);
     let rows = &joined.rows;
     let mut from = 0usize;
@@ -1000,14 +916,11 @@ fn reply_sizes<C: Ctl>(
                 };
                 return (Err(why.to_string()), Vec::new());
             };
-            // The reply runs to the next turn's row that was found: a turn whose row is
-            // nowhere (queued, or a restart took it) is inside this count, and is named.
             let next = found[i + 1..].iter().position(Option::is_some);
             let end = match next {
                 Some(k) => found[i + 1 + k].unwrap_or(rows.len()),
                 None => rows.len(),
             };
-            // With no later row found, every later turn is inside this count.
             let swallowed = hist[i + 1..][..next.unwrap_or(hist.len() - i - 1)]
                 .iter()
                 .map(|t| t.id)
@@ -1062,9 +975,7 @@ fn find_turn_row(rows: &[String], from: usize, text: &str) -> Option<usize> {
     })
 }
 
-// ------------------------------------------------------------------ the summary
-
-/// The numbers on top.
+/// Aggregate turn, working-time, mail, and latency statistics for a [`Ledger`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Summary {
     pub turns: usize,
@@ -1115,8 +1026,7 @@ fn next_turn(turns: &[TurnRow], t: i64) -> Option<i64> {
 }
 
 impl Ledger {
-    /// The numbers (see [`Summary`]). Latency needs the clock: without it,
-    /// none is measured.
+    /// Compute aggregate summary statistics for this ledger.
     pub fn summary(&self) -> Summary {
         let mut s = Summary {
             turns: self.turns.len(),
@@ -1164,13 +1074,10 @@ impl Ledger {
         s
     }
 
-    /// The timeline, in time order (a carried turn, with no time, first).
+    /// Build the time-ordered timeline items for this ledger.
     pub fn items(&self) -> Vec<Item> {
         let mut items = Vec::new();
         for t in &self.turns {
-            // `--source log` places a turn where its session log saw it begin
-            // (after the press, by however long the press took), so its row
-            // says so; the anchor path places the exchange's start.
             let sent = if t.began { "began" } else { "sent" };
             let settle = if !t.submitted {
                 format!("not submitted ({})", ms(t.dur_ms))
@@ -1290,7 +1197,7 @@ impl Ledger {
     }
 }
 
-/// A timeline row's lane.
+/// Swimlane classification for a timeline item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Lane {
     Manager = 0,
@@ -1310,7 +1217,7 @@ impl Lane {
     }
 }
 
-/// What a timeline row is, for the HTML's marks.
+/// Event kind used for HTML timeline markers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkKind {
     Turn,
@@ -1367,7 +1274,7 @@ impl MarkKind {
     }
 }
 
-/// One timeline row.
+/// Single formatted timeline row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
     pub t: Option<i64>,
@@ -1385,8 +1292,6 @@ pub struct Item {
     pub long_end: Option<i64>,
 }
 
-// ------------------------------------------------------------------ time words
-
 /// `1.8s`, `950ms`.
 fn ms(n: u64) -> String {
     if n < 1000 {
@@ -1396,7 +1301,7 @@ fn ms(n: u64) -> String {
     }
 }
 
-/// `42s`, `3m10s`, `2h05m`.
+/// Format a duration in milliseconds as `42s`, `3m10s`, or `2h05m`.
 pub fn span(ms: i64) -> String {
     let s = ms.max(0) / 1000;
     if s < 60 {
@@ -1408,8 +1313,7 @@ pub fn span(ms: i64) -> String {
     }
 }
 
-/// A Unix ms time in local time: `HH:MM:SS`, or `YYYY-MM-DD HH:MM:SS` with
-/// `date`.
+/// Format a Unix millisecond timestamp in local time (`HH:MM:SS` or `YYYY-MM-DD HH:MM:SS`).
 pub fn stamp(ms: i64, offset_s: i64, date: bool) -> String {
     let secs = ms.div_euclid(1000) + offset_s;
     let (y, mo, d) = civil(secs.div_euclid(86_400));
@@ -1422,16 +1326,14 @@ pub fn stamp(ms: i64, offset_s: i64, date: bool) -> String {
     }
 }
 
-/// `UTC-07:00` for an offset in seconds.
+/// Format a UTC offset in seconds as `UTC±HH:MM`.
 pub fn zone(offset_s: i64) -> String {
     let sign = if offset_s < 0 { '-' } else { '+' };
     let a = offset_s.abs();
     format!("UTC{sign}{:02}:{:02}", a / 3600, (a % 3600) / 60)
 }
 
-/// `--since`: Unix milliseconds, or an ISO date or date-time —
-/// `2026-09-14` (local midnight), `2026-09-14T10:30[:05]` or with a space
-/// for the `T` (local), with `Z` or `±HH:MM` (that zone).
+/// Parse a `--since` argument (Unix ms, `YYYY-MM-DD`, or ISO-8601 timestamp).
 pub fn parse_since(s: &str, local_offset_s: i64) -> Option<i64> {
     let s = s.trim();
     if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
@@ -1462,7 +1364,6 @@ pub fn parse_since(s: &str, local_offset_s: i64) -> Option<i64> {
             let (sign, z) = z.split_at(1);
             let (zh, zm) = match z.split_once(':') {
                 Some(pair) => pair,
-                // Byte 2 must be a char boundary: `split_at` panics inside a 4-byte `1é1`.
                 None if z.len() == 4 && z.is_char_boundary(2) => z.split_at(2),
                 None => (z, "0"),
             };
@@ -1483,15 +1384,12 @@ pub fn parse_since(s: &str, local_offset_s: i64) -> Option<i64> {
             offset = z;
         }
     }
-    // Checked: a ten-digit year in milliseconds overflows an `i64`; refused, not wrapped.
     days_from_civil(y, mo, d)
         .checked_mul(86_400)?
         .checked_add(secs)?
         .checked_sub(offset)?
         .checked_mul(1000)
 }
-
-// ------------------------------------------------------------------ text and md
 
 /// The time column: `HH:MM:SS`, with the date when the rows span more than
 /// one local day; `-` for none; `~` before a time the clock could not place.
@@ -1514,7 +1412,7 @@ fn spans_days(items: &[Item], offset_s: i64) -> bool {
     days.iter().min() != days.iter().max()
 }
 
-/// The SUMMARY rows, as (label, value) pairs.
+/// Format [`Summary`] metrics as `(label, value)` rows.
 pub fn summary_rows(l: &Ledger, s: &Summary) -> Vec<(&'static str, String)> {
     let nj = if l.journal_unreadable {
         "- (the journal could not be read)".to_string()
@@ -1601,7 +1499,7 @@ fn pad(s: &str, w: usize) -> String {
     }
 }
 
-/// The text form: aligned columns.
+/// Render the ledger as aligned plain-text tables.
 pub fn render_text(l: &Ledger) -> String {
     let s = l.summary();
     let items = l.items();
@@ -1652,7 +1550,7 @@ fn md_cell(s: &str) -> String {
     one_line(s).replace('\\', "\\\\").replace('|', "\\|")
 }
 
-/// The markdown form: a heading, then tables.
+/// Render the ledger as Markdown tables.
 pub fn render_md(l: &Ledger) -> String {
     let s = l.summary();
     let items = l.items();
@@ -1691,9 +1589,7 @@ pub fn render_md(l: &Ledger) -> String {
     out
 }
 
-/// A string for a JSON document embedded in HTML: [`json_str`] (which already escapes U+2028
-/// and U+2029, which a script chokes on), with `<`, `>` and `&` as `\u` escapes too, so no
-/// `</script>` survives.
+/// Encode `s` as an HTML-safe JSON string literal.
 pub(super) fn html_json_str(s: &str) -> String {
     json_str(s)
         .replace('<', "\\u003c")
@@ -1701,7 +1597,7 @@ pub(super) fn html_json_str(s: &str) -> String {
         .replace('&', "\\u0026")
 }
 
-/// Text for HTML: `&`, `<`, `>`, `"` and `'` escaped.
+/// Escape `&`, `<`, `>`, `"`, and `'` for HTML text content.
 pub(super) fn html_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -1717,7 +1613,7 @@ pub(super) fn html_text(s: &str) -> String {
     out
 }
 
-/// Render `l` as `format`.
+/// Render `l` in the requested [`Format`].
 pub fn render(l: &Ledger, format: Format) -> String {
     match format {
         Format::Text => render_text(l),

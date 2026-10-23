@@ -1,36 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `muse-captures [--only <regex of names>]` (about ten minutes): Muse Code's
-//! screens on THIS build, each group on a lab of its own (the harness off),
-//! into `$LAB_STATE/captures/muse-<version>-<name>.txt` (+ png), in the repo's
-//! fixture shape; beside a box's capture the stub's log of its turn
-//! (`<name>.stub.log`: the scripted call and the result that came back), and
-//! `muse --help` run in the jail (`cli-help.txt`). Run it on a new Muse Code
-//! build before anything presses a key on it.
-//!
-//! The groups: the workspace-trust box (a fresh scratch HOME, no
-//! `--trust-workspace`); idle and a draft; the slash menu; a turn's end, a
-//! turn running and an interrupt; the exit (one ctrl+c, then the second); the
-//! shell box (`bash` with `sandbox_permissions: require_escalated`, the one
-//! shell call that asks) approved and denied; the file-write box (a protected
-//! path, `.agents/`) approved; the edit box on the same file denied; the
-//! question (`request_user_input`), then Down and Enter, and Down twice onto
-//! `None of the above` and Enter; a turn ended on each tool's own rows with
-//! no words after them ([`TOOL_ROWS`]: a read, a search, a write, an edit,
-//! a shell call, the memory, the todos, the goal and the work list); the
-//! 429 with its retry row and its final
-//! error (`provider_retry.max_attempts=3`, the stub's `retry-after: 5`); the
-//! 401; the 500 with its retry row and its final error; the usage wall (a
-//! 429 `usage_limit_reached` with `resets_at`, the stub's `limit:` mode: Muse
-//! Code draws `Usage limit reached · /upgrade (<url>) …` from it); `/usage`
-//! and `/status` after one turn.
-//!
-//! Nothing is typed into a box but the key its capture names, and `/usage`
-//! and `/status` are entered only on positive evidence that the menu offers
-//! that very command on its first row (Enter runs the row the menu marks).
-//! Every step a capture's header names must have happened: a turn not taken,
-//! a box not drawn ends the run with no capture written on it.
+//! `muse-captures [--only <regex of names>]`: captures Muse Code fixture screens in isolated labs.
 
 use std::fs;
 use std::path::PathBuf;
@@ -69,12 +40,7 @@ const EDIT: &str = r#"{"name":"edit_file","input":{"path":".agents/probe-write.m
 /// One single-select question with two options (Muse Code adds `None of the above`).
 const QUESTION: &str = r#"{"name":"request_user_input","input":{"questions":[{"id":"color","header":"Color","question":"Which color should the probe use?","options":[{"label":"Red (Recommended)","description":"Warm and loud."},{"label":"Blue","description":"Cool and calm."}]}]}}"#;
 
-/// THE TOOL ROWS (`tool-row-<name>`): each call Muse Code's tool script can
-/// make in the lab without a box or the network, answered once, its result
-/// answered with a reply holding NO WORDS, so the turn ends on the call's own
-/// rows above the composer (as `forever --mode resid`'s `tool-end` chain ends
-/// on `  Read README.md`). `(capture name, tool, its input)`; `@` in the
-/// input is the project's `README.md` text the lab put there first.
+/// Tool calls (`(capture name, tool, input)`) captured with an empty follow-up reply.
 pub const TOOL_ROWS: [(&str, &str, &str); 12] = [
     ("read", "read_file", r#"{"path":"README.md"}"#),
     (
@@ -280,7 +246,7 @@ impl Cap {
     }
 }
 
-/// `muse-captures [--only <regex of names>]`.
+/// Runs `muse-captures [--only <regex of names>]`.
 pub fn cmd_muse_captures(args: &[String]) -> Res {
     let only = match args.first().map(String::as_str) {
         Some("--only") => args
@@ -323,9 +289,7 @@ pub fn cmd_muse_captures(args: &[String]) -> Res {
     Ok(0)
 }
 
-/// Whether the screen offers `cmd` on the slash menu's first row with the
-/// composer reading exactly `cmd`: the evidence Enter needs to run that
-/// command and no other.
+/// Returns whether `screen` offers `cmd` on the slash menu's first row with the composer reading `cmd`.
 #[must_use]
 pub fn menu_offers_first(screen: &str, cmd: &str) -> bool {
     let rows: Vec<String> = screen.lines().map(str::to_string).collect();
@@ -376,7 +340,6 @@ fn captures(c: &mut Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
         .map_err(|e| Fail::die(e.to_string()))?;
         println!("{}", f.display());
     }
-    // ---- the workspace-trust box: a fresh scratch HOME has trusted no folder
     if want("box-trust") {
         let run = c.muse(&run, &[], "Do you trust this workspace")?;
         stop::sleep(Duration::from_millis(800))?;
@@ -386,7 +349,6 @@ fn captures(c: &mut Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
             "launched in the lab's project dir with a fresh scratch HOME and no --trust-workspace: the workspace-trust box, before any key",
         )?;
     }
-    // ---- idle, a draft
     if any(&["idle", "draft"]) {
         let run = c.fresh_muse(&[])?;
         stop::sleep(Duration::from_secs(1))?;
@@ -409,7 +371,6 @@ fn captures(c: &mut Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
             "`/` typed into the composer: the command menu",
         )?;
     }
-    // ---- a turn's end, a turn running, an interrupt
     if any(&[
         "end-of-turn",
         "busy-thinking",
@@ -450,7 +411,6 @@ fn captures(c: &mut Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
             "the same interrupted turn once its footer no longer says `interrupting run`",
         )?;
     }
-    // ---- the exit
     if any(&["exit-confirm", "exited-resume"]) {
         let run = c.fresh_muse(&[])?;
         c.turn(&run, PROMPT)?;
@@ -472,7 +432,6 @@ fn captures(c: &mut Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
             "the second ctrl+c: Muse Code has exited to the shell",
         )?;
     }
-    // ---- the shell box
     for (name, key, what) in [
         (
             "box-shell-approved",
@@ -502,7 +461,6 @@ fn captures(c: &mut Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
         )?;
         c.stub_log(&run, name);
     }
-    // ---- the file-write box (a protected path), approved
     if any(&["box-write", "box-write-approved"]) {
         let run = c.fresh_muse(&[])?;
         c.tool(&run, WRITE)?;
@@ -520,7 +478,6 @@ fn captures(c: &mut Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
         )?;
         c.stub_log(&run, "box-write-approved");
     }
-    // ---- the edit box on the same file, denied
     if any(&["box-edit", "box-edit-denied"]) {
         let run = c.fresh()?;
         c.project_file(&run, ".agents/probe-write.md", "written by the lab")?;
@@ -540,7 +497,6 @@ fn captures(c: &mut Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
         )?;
         c.stub_log(&run, "box-edit-denied");
     }
-    // ---- the question: Down and Enter
     if any(&["question", "question-down", "question-answered"]) {
         let run = c.fresh_muse(&[])?;
         c.tool(&run, QUESTION)?;
@@ -557,7 +513,6 @@ fn captures(c: &mut Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
         c.cap(&run, "question-answered", "the question box after one Down and Enter: the stub's answer quotes the answer Muse Code sent back")?;
         c.stub_log(&run, "question-answered");
     }
-    // ---- the question: `None of the above` and Enter
     if any(&["question-none", "question-none-enter"]) {
         let run = c.fresh_muse(&[])?;
         c.tool(&run, QUESTION)?;
@@ -582,7 +537,6 @@ fn captures(c: &mut Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
         )?;
         c.stub_log(&run, "question-none-enter");
     }
-    // ---- a turn ended on each tool's own rows, no words after them
     for (name, tool, input) in TOOL_ROWS {
         let cap = format!("tool-row-{name}");
         if !any(&["tool-row", &cap]) {
@@ -590,7 +544,6 @@ fn captures(c: &mut Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
         }
         tool_row(c, &cap, tool, input)?;
     }
-    // ---- the walls
     if any(&["rate-limit-retry", "rate-limit-final"]) {
         let run = c.fresh_muse(&["-c", "provider_retry.max_attempts=3"])?;
         c.mode(&run, "rate-limit")?;
@@ -639,7 +592,6 @@ fn captures(c: &mut Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
         stop::sleep(Duration::from_secs(1))?;
         c.cap(&run, "limit-429", "launched with -c provider_retry.max_attempts=1; the stub's `limit:five_hour` mode answers the turn 429 {error: {type: usage_limit_reached, message, resets_at: 10 min from now, limit_window_minutes: 300}}: the usage wall")?;
     }
-    // ---- /usage and /status, after one turn
     if any(&["usage", "status"]) {
         let run = c.fresh_muse(&[])?;
         c.turn(&run, PROMPT)?;
@@ -728,9 +680,7 @@ fn tool_row(c: &Cap, name: &str, tool: &str, input: &str) -> Result<(), Fail> {
     Ok(())
 }
 
-/// Whether the stub's log `text` shows a turn's call (`called`, the log's `
-/// custom tool:<name>`) made, and then a reply to a later request of the turn
-/// with the custom mode's own text (` custom`, no call): its result answered.
+/// Returns whether the stub log `text` records `called` followed by a custom reply.
 #[must_use]
 pub fn tool_answered(text: &str, called: &str) -> bool {
     let turns = || {

@@ -121,6 +121,8 @@ pub fn valid_mark(mark: &str) -> bool {
 }
 
 /// `path` as a literal in the profile's regular expressions: each character
+/// the expression syntax gives a meaning is escaped (a path the profile can
+/// quote holds no quote and no backslash: [`profile_safe`]).
 fn regex_literal(path: &str) -> String {
     let mut out = String::with_capacity(path.len() + 8);
     for c in path.chars() {
@@ -450,6 +452,7 @@ mod tests {
     use super::*;
 
     /// A run, a socket dir, a state dir and a user temp dir under one scratch
+    /// tree, removed when it drops.
     struct Dirs {
         top: std::path::PathBuf,
         run: String,
@@ -649,6 +652,9 @@ mod tests {
     }
 
     /// THE OWNER'S MUSE CODE AND ANTIGRAVITY DATA ARE DENIED, READS AND ALL:
+    /// Muse Code 1.4.10 opened the account's `session-names.db` under
+    /// `~/Library/Application Support/Muse` with HOME and XDG pointed at the
+    /// scratch, and its sessions live in `~/.local/share/muse`.
     #[test]
     #[expect(
         clippy::too_many_lines,
@@ -886,6 +892,7 @@ mod tests {
     }
 
     /// The profile of a lab whose facts are `p`, on the test's run, socket,
+    /// state and temp dirs.
     fn profile_of(d: &Dirs, p: &crate::paths::Paths, claude: &str) -> Result<String, String> {
         let mut s = Spec::for_lab_in(
             p,
@@ -904,6 +911,9 @@ mod tests {
     }
 
     /// The rules a profile makes of the owner's data in `home`, as the
+    /// protected list words them (`.ssh`, `.claude.json`, `.gemini`,
+    /// `.codex`, Muse Code's and Antigravity's data, a browser profile), and
+    /// its bans on reading and writing the rest of it.
     fn home_rules(home: &str) -> Vec<String> {
         let mut rules: Vec<String> = [
             ("subpath", ".ssh"),
@@ -925,6 +935,13 @@ mod tests {
     }
 
     /// THE JAIL A LAB'S OWN FACTS MAKE GUARDS THE ACCOUNT'S HOME UNDER A
+    /// SCRATCH `HOME`: [`Spec::for_lab_in`] on facts resolved with a fake
+    /// account home (the account database's, through
+    /// [`crate::paths::Paths::resolve_with`]) and a scratch `HOME` (every agent
+    /// run's rule) renders every entry of the protected list in both, reads
+    /// and writes banned in both, each shared rule once; an agent in the
+    /// account's package store keeps its build; and a run directory inside the
+    /// account's data is refused.
     #[test]
     fn the_jail_of_the_lab_s_facts_guards_the_account_home_and_a_scratch_home_both() {
         use crate::paths::Paths;
@@ -984,6 +1001,8 @@ mod tests {
     }
 
     /// THE HARNESS'S TAPE STORE WALKS TO A RUN OUTSIDE EVERY HOME, AND THE
+    /// HOME FENCE STAYS WHOLE: the tape store opens every directory from `/`
+    /// down to `<run>/scratch/state` (no-follow, one at a time).
     #[test]
     fn the_tape_store_walks_to_a_run_outside_every_home_and_the_fence_stays_whole() {
         let d = dirs();
@@ -1074,6 +1093,9 @@ mod tests {
     }
 
     /// ANOTHER CHECKOUT'S LAB STATE IS FENCED, AND THE WALK TO THIS LAB'S RUN
+    /// STAYS OPEN: every checkout's default state dir sits under one root
+    /// outside the homes (`/private/tmp/at.lab-<uid>`), which the homes'
+    /// fence does not cover.
     #[test]
     fn another_checkouts_lab_state_is_fenced_and_the_walk_to_this_run_stays_open() {
         let d = dirs();

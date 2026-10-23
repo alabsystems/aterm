@@ -207,3 +207,46 @@ fn an_access_list_that_allows_others_is_refused() {
         NotPrivate::Acl
     );
 }
+
+/// On macOS the access list is judged BEFORE the mode: a 0755 directory and a 0644 file,
+/// each open by its mode bits as well, that carry an `everyone allow read` entry are `Acl`,
+/// never `Mode`. A caller that narrows the mode it is told of (aterm-uds's
+/// `ensure_private_dir`) relies on it: a `Mode` answer must mean every other clause held,
+/// or narrowing the mode would leave the allow entry in place and call the directory
+/// private. Control: once `chmod -N` clears the entry, the same directory and file are
+/// `Mode`, naming their bits.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn the_access_list_is_judged_before_the_mode() {
+    let acl = |args: &[&str], path: &Path| {
+        let ran = std::process::Command::new("/bin/chmod")
+            .args(args)
+            .arg(path)
+            .status()
+            .expect("run chmod");
+        assert!(ran.success(), "chmod {args:?}");
+    };
+    let scratch = Scratch::new("order");
+    let path = scratch.file("k", 0o644);
+    let sub = scratch.0.join("sub");
+    std::fs::DirBuilder::new().mode(0o700).create(&sub).unwrap();
+    chmod(&sub, 0o755);
+    for at in [&path, &sub] {
+        acl(&["+a", "everyone allow read"], at);
+    }
+    assert_eq!(judge(&path).unwrap_err(), NotPrivate::Acl);
+    let opened = open_nonblocking(&sub, Links::Refuse).unwrap();
+    assert_eq!(
+        owner_private_dir(&opened).unwrap().unwrap_err(),
+        NotPrivate::Acl
+    );
+    for at in [&path, &sub] {
+        acl(&["-N"], at);
+    }
+    assert_eq!(judge(&path).unwrap_err(), NotPrivate::Mode(0o644));
+    let opened = open_nonblocking(&sub, Links::Refuse).unwrap();
+    assert_eq!(
+        owner_private_dir(&opened).unwrap().unwrap_err(),
+        NotPrivate::Mode(0o755)
+    );
+}

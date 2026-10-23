@@ -47,6 +47,8 @@ pub(crate) fn resolve_program_windows(name: &str) -> OsString {
 const PATHEXT_DEFAULT: &str = ".COM;.EXE;.BAT;.CMD";
 
 /// Parse a `%PATHEXT%`-shaped list into its `.<ext>` entries; entries without a
+/// leading dot (or a bare `.`) are dropped, unset/empty falls back to the OS
+/// default.
 fn parse_pathext(raw: Option<&str>) -> Vec<String> {
     let raw = match raw {
         Some(s) if !s.trim().is_empty() => s,
@@ -144,7 +146,7 @@ pub(crate) fn discover_shell(name: &str) -> Option<OsString> {
     }
 }
 
-/// Locate Git for Windows' `bash.exe`. First beside a PATH-resolved `git.exe`
+/// Locate Git for Windows' `bash.exe`.
 fn discover_git_bash() -> Option<OsString> {
     // Beside git.exe: cmd\git.exe → ..\bin\bash.exe.
     if let Some(git) = search_path("git") {
@@ -268,6 +270,8 @@ mod tests {
     use super::*;
 
     /// Ask `CreateProcessW` what it makes of `program` as `lpApplicationName` —
+    /// the exact parameter [`super::super::spawn_shell_with_pid`] passes the
+    /// resolved shell in.
     fn create_process_verdict(program: &str) -> Result<(), u32> {
         let app_w = wide_nul(OsStr::new(program));
         // SAFETY: Zeroed startupinfow is valid once `cb` is set.
@@ -298,6 +302,9 @@ mod tests {
     }
 
     /// MEASURED, not assumed: what `lpApplicationName` accepts is the entire
+    /// justification for what `--validate-config` accepts and rejects, and a
+    /// validator that models it from POSIX habit is how a Windows user came to
+    /// be told to write `/bin/zsh`.
     #[test]
     fn create_process_application_name_contract() {
         /// `ERROR_FILE_NOT_FOUND`.
@@ -562,7 +569,7 @@ mod tests {
         assert!(!is_wsl_shell(OsStr::new("bash.exe")));
     }
 
-    /// The verdict config validation reads. A bare name that RESOLVES is the
+    /// The verdict config validation reads.
     #[test]
     fn classify_shell_name_is_the_resolution_the_spawn_performs() {
         let cmd = classify_shell_name(OsStr::new("cmd"));
@@ -620,6 +627,9 @@ mod tests {
     }
 
     /// `select_shell_with_origin` IS `select_shell` with the deciding arm named:
+    /// the program never differs, an override is always `Override`, and with
+    /// nothing named the origin is one of the platform-default arms — `Pwsh`
+    /// whenever pwsh is on PATH, as it is on the owner's box.
     #[test]
     fn select_shell_with_origin_names_the_arm_select_shell_took() {
         let (program, origin) = select_shell_with_origin(Some(OsStr::new("cmd")));

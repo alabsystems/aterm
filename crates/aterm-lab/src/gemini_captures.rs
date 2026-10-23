@@ -1,77 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `gemini-captures [--only <regex>]` and `agy-captures [--only <regex>]`
-//! (a few minutes each): every screen a harness needs of the REAL Gemini CLI
-//! and the REAL agy ([`crate::gemini`]), drawn against the stub's Gemini API
-//! and captured into `$LAB_STATE/captures/<agent>-<version>-<name>.txt` (+
-//! png), the repo's fixture shape, on labs of their own (the harness off): the
-//! main session's screens share one, every first run and every wall has a
-//! fresh one. Run it on a new build of either before anything
-//! presses a key on it. A step a capture's header names must have happened
-//! ([`Cap::must`]): a turn the composer did not take, a screen that never
-//! drew, a stub that did not take a mode ends the run, with nothing captured
-//! on it.
-//!
-//! The names, the same for both agents where the screen is:
-//!
-//! * `first-run-trust` — launched `--untrusted`: the folder-trust dialog (the
-//!   one seed a variant leaves out; the auth seed never is). agy also
-//!   `first-run-color-scheme` and `first-run-terms`, launched `--onboarding`:
-//!   its colour-scheme picker, then (one Enter, which keeps the default
-//!   scheme) its Terms of Service, on which no key is pressed;
-//! * the main session: `idle`, `draft` (typed, never sent), `busy-thinking`
-//!   (the `slow` mode's thoughts), `busy-streaming` (its text), `end-of-turn`,
-//!   `interrupted` (Esc while busy), `slash-menu` (`/` typed), `box-shell`,
-//!   `box-write` (a new file), `box-edit` (that file), `question` and
-//!   `question-answered` (the scripted calls of the `tool` mode, each box
-//!   answered with Enter: its first option), agy's `survey` (its feedback
-//!   survey, which it draws unasked, not every time, under an error turn of a
-//!   session some turns old: eight ordinary turns after the boxes, then up to
-//!   three 401 turns; skipped with `0` wherever it draws), and `exit`
-//!   (`/quit`, with the resume hint each prints);
-//! * the walls: Gemini CLI's `wall-429-per-day` (its usage-limit dialog on the
-//!   per-day quota) and `wall-429-stopped` (after its Stop), agy's
-//!   `error-429-per-day` (inline); `error-401`, `error-400-key`; `retry-503`
-//!   and `retry-500` (the screen while the CLI retries the 503 or the 500),
-//!   then Gemini CLI's `retry-503-recovered` / `retry-500-recovered` (the
-//!   mode back to `ok`: it never stops retrying on its own) and agy's
-//!   `error-503` / `error-500` (its retries run out: launched with
-//!   `AGY_CLI_MODEL_API_MAX_RETRIES=2`, which the header says; agy does not
-//!   retry a 500, so it has no `retry-500` and its `error-500` comes at once,
-//!   which the run says).
-//!
-//! * Gemini CLI's modes, each on a lab of its own: `shell-mode-idle`,
-//!   `-draft`, `-ran`, `-left` (`!`, a command typed, run with Enter, shell
-//!   mode left with Esc); `yolo-idle`, `-draft`, `-busy`, `-end-of-turn`,
-//!   `-tool-ran` (ctrl+y; a shell call run with no box); `details-hidden-idle`,
-//!   `-draft`, `-busy`, `-end-of-turn`, `-box-shell`, `-yolo-idle`,
-//!   `-yolo-draft` (Tab twice; the box refused with Esc); and, launched with
-//!   `ui.showShortcutsHint` false in the project's `.gemini/settings.json`,
-//!   `hint-off-idle`, `-busy`, `-end-of-turn`, `-details-hidden-idle`;
-//! * launched with `ui.collapseDrawerDuringApproval` false, one lab:
-//!   `drawer-kept-box-shell`, `-draft`, `-queued` (the shell box kept over
-//!   the composer; `hello` typed into it; Enter, which queues it under the
-//!   box), then, the box cancelled with Esc and the details hidden,
-//!   `drawer-kept-details-hidden-box-shell`;
-//! * Gemini CLI's other boxes, one lab: `question-multi`, `-second`,
-//!   `-review`, `-answered` (a call asking two questions, each answered `1`,
-//!   the review submitted with Enter), `box-sandbox-expansion` (a shell call
-//!   naming `additional_permissions`), `box-web-fetch`, `box-mcp` (the lab's
-//!   own stdio MCP server, `aterm-lab mcp-standin echo`, named in the
-//!   project's settings), each refused with Esc;
-//! * Gemini CLI in a pane of 72 columns: `narrow-error-401`, then with a
-//!   `GEMINI.md` in the project `narrow-error-403`, `narrow-404-access-dialog`
-//!   and `narrow-404-stopped` (its `2. Stop`);
-//! * the Gemini API's other refusals ([`crate::stub::gemini::measured_refusals`],
-//!   custom modes): agy's `error-<name>` each on a lab of its own (its
-//!   fixtures carry `lab-` as its other lab captures do).
-//!
-//! What does not draw, measured on Gemini CLI 0.46.0 and agy 1.4.0: neither
-//! draws a retry row (each holds its busy spinner while it retries a 503 or a
-//! 500); Gemini CLI's 401 and 400 are inline `✕ [API Error: …]` rows, and
-//! agy's every error an inline `⚠ agent executor error: …` block whose prompt
-//! stays usable.
+//! `gemini-captures [--only <regex>]` and `agy-captures [--only <regex>]` (a few minutes each).
 
 use std::cell::Cell;
 use std::time::Duration;
@@ -397,7 +327,6 @@ fn cmd(agent: Agent, args: &[String]) -> Res {
 /// Every capture `want` names; the fixtures' prefix (`gemini-0.46.0-`).
 fn captures(c: &Cap, want: &dyn Fn(&str) -> bool) -> Result<String, Fail> {
     let s = c.screens();
-    // the version the fixtures are named after, as `up` reads it
     let prefix = {
         let run = c.fresh()?;
         crate::gemini::need(&run, c.agent)?;
@@ -408,7 +337,6 @@ fn captures(c: &Cap, want: &dyn Fn(&str) -> bool) -> Result<String, Fail> {
         c.name(),
         prefix.trim_end_matches('-')
     );
-    // ---- first runs: the seed a variant leaves out is the trust (and agy's onboarding), never the auth
     if c.agent == Agent::Agy && (want("first-run-color-scheme") || want("first-run-terms")) {
         let l = Launch {
             onboarding: true,
@@ -436,7 +364,6 @@ fn captures(c: &Cap, want: &dyn Fn(&str) -> bool) -> Result<String, Fail> {
         c.settle(&run, 10)?;
         c.cap(&run, "first-run-trust", "launched with no trust seed (the auth seeded: no sign-in), in the project dir: the folder-trust dialog, before any key")?;
     }
-    // ---- the main session, one lab
     let main = [
         "idle",
         "draft",
@@ -456,7 +383,6 @@ fn captures(c: &Cap, want: &dyn Fn(&str) -> bool) -> Result<String, Fail> {
     if main.iter().any(|n| want(n)) {
         main_session(c, s, want)?;
     }
-    // ---- the walls, each on a fresh lab
     walls(c, want)?;
     refusals(c, want)?;
     if c.agent == Agent::Gemini {
@@ -618,7 +544,6 @@ fn gemini_modes(c: &Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
         let run = c.fresh_agent(&Launch::default())?;
         c.wait(&run, s.idle, 30)?;
         c.settle(&run, 10)?;
-        // two Tabs at rest, one right after the other: the details hidden
         c.key(&run, "tab")?;
         c.key(&run, "tab")?;
         c.wait(&run, "press tab twice for more", 10)?;
@@ -797,7 +722,6 @@ fn gemini_boxes(c: &Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
         return Ok(());
     }
     let s = c.screens();
-    // the server is this program, from the copy the jail runs (its run's bin/)
     let lab_bin = crate::paths::paths().run_dir(&c.tag).join("bin/aterm-lab");
     let mcp = crate::pyjson::J::obj([(
         "mcpServers",
@@ -983,7 +907,6 @@ fn main_session(c: &Cap, s: &Screens, want: &dyn Fn(&str) -> bool) -> Result<(),
             "draft",
             &format!("idle with a draft typed into the composer, never sent: '{draft}'"),
         )?;
-        // ctrl+u takes the line; a composer that keeps it loses it a character at a time
         c.ctl(&run, &["key", "ctrl+u"])?;
         stop::sleep(Duration::from_millis(500))?;
         if c.composer(&run)?.as_deref() == Some(draft) {
@@ -1074,7 +997,6 @@ fn main_session(c: &Cap, s: &Screens, want: &dyn Fn(&str) -> bool) -> Result<(),
             "the `tool` mode's call of the question tool (one choice: Red, then the others): the question dialog",
         ),
     ];
-    // a box needs the ones before it (the edit needs the written file), so the sequence runs up to the last one wanted
     let last = boxes
         .iter()
         .rposition(|(name, ..)| want(name) || (*name == "question" && want("question-answered")));
@@ -1087,7 +1009,6 @@ fn main_session(c: &Cap, s: &Screens, want: &dyn Fn(&str) -> bool) -> Result<(),
             if want(name) {
                 c.cap(&run, name, what)?;
             }
-            // its first option (allow once, allow the creation, accept the edit, Red)
             c.ctl(&run, &["key", "enter"])?;
             let gone = Door::new(&run)?.await_gone(re, 15)?;
             c.must(gone, &format!("the {name} answered with Enter"))?;
@@ -1104,9 +1025,6 @@ fn main_session(c: &Cap, s: &Screens, want: &dyn Fn(&str) -> bool) -> Result<(),
         c.mode(&run, "ok")?;
     }
     if c.agent == Agent::Agy && want("survey") && !c.survey.get() {
-        // agy asks for feedback unasked, not every time, under an error turn of a session some turns old (never
-        // under a first turn's; it drew under one after nine turns, and under none after three): eight ordinary
-        // turns, then up to three error turns
         for i in 1..=8 {
             c.turn(&run, &format!("an ordinary turn {i}"))?;
             c.settle(&run, 30)?;
@@ -1168,7 +1086,6 @@ fn walls(c: &Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
             )?;
         }
         if want("wall-429-stopped") {
-            // its second option, Stop (the first, Keep trying, sends the turn again)
             c.ctl(&run, &["key", "down"])?;
             stop::sleep(Duration::from_millis(500))?;
             c.ctl(&run, &["key", "enter"])?;
@@ -1225,7 +1142,6 @@ fn walls(c: &Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
         if !want(&retry) && !want(&after) {
             continue;
         }
-        // agy gives up after its retries: two of them, so it does within seconds (eight by default, ~150 s)
         let l = match c.agent {
             Agent::Gemini => Launch::default(),
             Agent::Agy => Launch {
@@ -1241,7 +1157,6 @@ fn walls(c: &Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
         c.wait(&run, s.idle, 30)?;
         c.mode(&run, mode)?;
         c.turn(&run, "carry on with the task")?;
-        // the second attempt, or (agy, which does not retry every status) the error at once
         let error = format!("Error {status}");
         let (mut attempts, mut failed) = (0, false);
         for _ in 0..40 {
@@ -1304,8 +1219,7 @@ mod tests {
 
     /// Each box's script is one call of the tool that draws it, in the shape
     /// the stub serves (`name`, `input`), the file the write makes the one
-    /// the edit changes. NEGATIVE CONTROL: neither agent's script names a
-    /// tool of the other's.
+    /// the edit changes.
     #[test]
     fn each_box_is_one_call_of_the_agents_own_tool() {
         let gemini = ["run_shell_command", "write_file", "replace", "ask_user"];
@@ -1386,7 +1300,6 @@ mod tests {
             SURVEY,
             " How's the CLI experience so far? Help us improve:"
         ));
-        // the new steps' waits, on the rows they were measured on
         assert!(m("YOLO Ctrl\\+Y", " YOLO Ctrl+Y"));
         assert!(!m("YOLO Ctrl\\+Y", " Shift+Tab to accept edits"));
         assert!(m(

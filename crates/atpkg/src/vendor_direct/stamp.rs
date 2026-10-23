@@ -1,13 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `<prefix>/vendor/<program>.toml`: what the vendor lane remembers about one program
-//! ([`ProgramStamp`]).
-//!
-//! The head watch and the lane run in different processes and own different fields, so
-//! every write is a read-modify-write of its own fields under the file's lock: a writer
-//! holding a stale copy can never lower the high-water. Losing the file costs one full
-//! fetch, never safety: the installed build is its own floor.
+//! `<prefix>/vendor/<program>.toml`: persistent vendor-lane state ([`ProgramStamp`]).
 
 use std::collections::BTreeMap;
 use std::io;
@@ -33,13 +27,10 @@ const MAX_ETAG_BYTES: usize = 256;
 /// The longest verdict kept, in characters.
 const MAX_VERDICT_CHARS: usize = 300;
 
-/// How long a successful head check vouches for "the vendor's latest" (seconds): past it,
-/// no surface calls the build the vendor's latest until a check reaches the vendor again.
+/// Duration (in seconds) that a successful head check vouches for the vendor's latest build.
 pub(crate) const CHECK_VOUCHES_FOR_SECS: i64 = 24 * 60 * 60;
 
-/// How far ahead of the clock a check may be stamped and still vouch (seconds): a clock
-/// set back a little is still the same day's check; one stamped further ahead is a clock
-/// that was wrong when it was written, and vouches for nothing.
+/// Maximum future clock skew (in seconds) tolerated on a recorded head check.
 pub(crate) const CHECK_CLOCK_SLACK_SECS: i64 = 60 * 60;
 
 /// One program's stamp, as read.
@@ -55,15 +46,11 @@ pub struct ProgramStamp {
     pub high_water: Option<Version>,
     /// The lane's last verdict: one line, no control or bidi characters.
     pub verdict: String,
-    /// The last stage refusal, `(version, payload digest)`: that pair is not downloaded
-    /// again.
+    /// Last stage refusal `(version, payload digest)` to avoid re-downloading.
     pub(crate) refused: Option<(Version, AuthenticatedDigest)>,
-    /// `(legacy index build, the version its signed manifest names)`, read once so no later
-    /// pass needs an index to know it.
+    /// Cached `(legacy index build, version)` read from its signed manifest.
     pub(crate) legacy: Option<(u64, Version)>,
-    /// `(legacy index build, its signed tree_root)`: the recorded row's root, kept when a
-    /// vendor build replaced that row, or the root its signed manifest names. What attests
-    /// the build after a rollback to it, with no index asked.
+    /// Cached `(legacy index build, signed tree_root)` for rollback attestation.
     pub(crate) legacy_root: Option<(u64, String)>,
 }
 
@@ -114,8 +101,7 @@ pub(super) fn vendor_dir(layout: &Layout) -> PathBuf {
 }
 
 impl ProgramStamp {
-    /// `program`'s stamp; `None` when absent, unreadable or malformed (treated as never
-    /// checked).
+    /// Reads `program`'s stamp, returning `None` if absent, unreadable, or malformed.
     #[must_use]
     pub fn read(layout: &Layout, program: &str) -> Option<Self> {
         read_file(layout, program).map(|file| Self::from_file(file).0)
@@ -127,7 +113,6 @@ impl ProgramStamp {
             file.refused_sha256.as_deref().unwrap_or_default(),
             file.refused_sha512.as_deref().unwrap_or_default(),
         ));
-        // A vendor build id names its own version; only an index build number is legacy.
         let legacy = match (file.legacy_build, file.legacy_version) {
             (Some(b), Some(v)) if !super::is_vendor_build(b) => Some((b, v)),
             _ => None,
@@ -151,10 +136,7 @@ impl ProgramStamp {
         (stamp, file.extra)
     }
 
-    /// Whether a head check reached the vendor within [`CHECK_VOUCHES_FOR_SECS`] before
-    /// `now`, or at most [`CHECK_CLOCK_SLACK_SECS`] after it: only then may a surface call
-    /// the build it left the vendor's latest. Never checked is not recent, and neither is
-    /// a check stamped further in the future.
+    /// Returns whether a head check succeeded within the validity window around `now`.
     #[must_use]
     pub(crate) fn checked_recently(&self, now: i64) -> bool {
         let age = now.saturating_sub(self.last_checked_at);
@@ -168,12 +150,10 @@ impl ProgramStamp {
         self.legacy.filter(|(b, _)| *b == build).map(|(_, v)| v)
     }
 
-    /// Record that legacy index build `build` carries `version` (read from its signed
-    /// manifest), replacing the one an older legacy build was recorded with.
+    /// Records that legacy index build `build` carries `version`.
     ///
     /// # Errors
-    /// `build` is a vendor build id, `program` is not vendor-direct, or the stamp could not
-    /// be locked or written.
+    /// Returns an error if `build` is a vendor build id or the stamp cannot be written.
     pub(crate) fn record_legacy_version(
         layout: &Layout,
         program: &str,
@@ -198,12 +178,10 @@ impl ProgramStamp {
             .map(|(_, root)| root.as_str())
     }
 
-    /// Keep legacy index build `build`'s signed `root` — a recorded row's, or its signed
-    /// manifest's — replacing the one an older legacy build was kept with.
+    /// Records the signed `root` for legacy index build `build`.
     ///
     /// # Errors
-    /// `build` is a vendor build id, `root` is not 64 hex digits, `program` is not
-    /// vendor-direct, or the stamp could not be locked or written.
+    /// Returns an error if `build` or `root` is invalid or the stamp cannot be written.
     pub(crate) fn record_legacy_root(
         layout: &Layout,
         program: &str,
@@ -220,11 +198,10 @@ impl ProgramStamp {
         update(layout, program, |s| s.legacy_root = Some((build, root)))
     }
 
-    /// Record one head check — when, the head seen, and its `ETag` (one that is not short
-    /// printable ASCII is dropped) — keeping every other field as the file holds it.
+    /// Records a head check timestamp, head version, and `ETag`.
     ///
     /// # Errors
-    /// `program` is not vendor-direct, or the stamp could not be locked or written.
+    /// Returns an error if `program` is not vendor-direct or the stamp cannot be written.
     pub fn record_check(
         layout: &Layout,
         program: &str,
@@ -239,11 +216,10 @@ impl ProgramStamp {
         })
     }
 
-    /// Record the lane's verdict for a pass that left `active` as the active version, and
-    /// raise the high-water to it.
+    /// Records the lane's `verdict` and raises `high_water` to `active`.
     ///
     /// # Errors
-    /// `program` is not vendor-direct, or the stamp could not be locked or written.
+    /// Returns an error if `program` is not vendor-direct or the stamp cannot be written.
     pub(crate) fn record_outcome(
         layout: &Layout,
         program: &str,
@@ -258,13 +234,10 @@ impl ProgramStamp {
         })
     }
 
-    /// Record a signed-yank move (a replacement or rollback off a yanked build) to
-    /// `active`. The high-water becomes `active` even when that lowers it: a signature
-    /// moved the machine there, and a mark left on the yanked version would refuse every
-    /// later head between the two.
+    /// Records a signed-yank move to `active`, setting `high_water` to `active`.
     ///
     /// # Errors
-    /// `program` is not vendor-direct, or the stamp could not be locked or written.
+    /// Returns an error if `program` is not vendor-direct or the stamp cannot be written.
     pub(crate) fn record_yank_move(
         layout: &Layout,
         program: &str,
@@ -277,12 +250,10 @@ impl ProgramStamp {
         })
     }
 
-    /// Record a stage refusal (a digest mismatch or a failed codesign check) of `version`
-    /// with `digest`, so the lane does not download that pair again; a new head or a new
-    /// digest is a new pair.
+    /// Records a stage refusal of `version` with `digest`.
     ///
     /// # Errors
-    /// `program` is not vendor-direct, or the stamp could not be locked or written.
+    /// Returns an error if `program` is not vendor-direct or the stamp cannot be written.
     pub(crate) fn record_refusal(
         layout: &Layout,
         program: &str,
@@ -296,11 +267,10 @@ impl ProgramStamp {
         })
     }
 
-    /// Forget the stage refusal: the explicit door (a person asking again) re-fetches
-    /// what an unattended pass would not.
+    /// Clears any recorded stage refusal for `program`.
     ///
     /// # Errors
-    /// `program` is not vendor-direct, or the stamp could not be locked or written.
+    /// Returns an error if `program` is not vendor-direct or the stamp cannot be written.
     pub(crate) fn clear_refusal(layout: &Layout, program: &str) -> io::Result<()> {
         if Self::read(layout, program).is_none_or(|s| s.refused.is_none()) {
             return Ok(());
@@ -370,13 +340,9 @@ fn update(
         extra,
     };
     let text = durable::to_toml(&file, MAX_STAMP_BYTES)?;
-    // An idle pass re-records the verdict it recorded last time: identical bytes are not
-    // written again.
     if std::fs::read(&path).is_ok_and(|have| have == text) {
         return Ok(());
     }
-    // Ordered: a lost stamp costs one GET; `high_water` binds only above the installed
-    // version, and `decide` refuses heads older than the installed build.
     durable::write_ordered(&path, &text)
 }
 
@@ -443,8 +409,6 @@ mod tests {
     fn each_writer_changes_only_its_own_fields() {
         let l = layout("fields");
         assert_eq!(ProgramStamp::read(&l, "claude"), None);
-        // aterm-durable's counting seam: the stamp is only ordered, its temporary and
-        // its directory entry (a lost stamp costs one GET).
         let recording = aterm_durable::seam::Recording::start();
         ProgramStamp::record_check(
             &l,
@@ -484,7 +448,6 @@ mod tests {
             legacy_root: None,
         };
         assert_eq!(ProgramStamp::read(&l, "claude"), Some(expected.clone()));
-        // A later check replaces only the check's fields.
         ProgramStamp::record_check(&l, "claude", 1_790_000_300, Some(v("2.1.282")), None).unwrap();
         let got = ProgramStamp::read(&l, "claude").unwrap();
         assert_eq!(
@@ -587,7 +550,6 @@ mod tests {
         );
         assert_eq!(got.high_water, Some(v("0.156.0")));
         assert_eq!(got.verdict, "digest mismatch");
-        // A torn pair on disk is no refusal.
         let path = stamp_path(&l, "codex").unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
@@ -678,7 +640,6 @@ mod tests {
             one_line("claude 2.1.281 — Anthropic latest"),
             "claude 2.1.281 — Anthropic latest"
         );
-        // A hand-edited file is cleaned on read as well.
         let l = layout("controls");
         ProgramStamp::record_outcome(&l, "claude", "ok", None).unwrap();
         let path = stamp_path(&l, "claude").unwrap();

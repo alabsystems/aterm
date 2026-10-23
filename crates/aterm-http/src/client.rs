@@ -109,6 +109,7 @@ impl Method {
     }
 
     /// Whether a request with this method sends `Content-Length` even when
+    /// its body is empty.
     #[inline]
     const fn always_sends_length(self) -> bool {
         matches!(self, Self::Post | Self::Patch | Self::Put)
@@ -184,6 +185,7 @@ impl std::error::Error for SendError {
 }
 
 /// A `usize` as a `u64`: lossless on every target this crate builds for, and
+/// saturating rather than wrapping anywhere it would not be.
 fn wide(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
@@ -326,6 +328,7 @@ pub struct RequestBuilder<'a> {
 }
 
 /// Names, never values: a header set through [`RequestBuilder::header`] can
+/// carry a credential too, and the endpoint can carry one in its query.
 impl std::fmt::Debug for RequestBuilder<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let headers: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
@@ -557,6 +560,7 @@ impl RequestBuilder<'_> {
 }
 
 /// Write all of `bytes`, moving `phase` to [`Phase::Sent`] at the first byte
+/// the stream accepts.
 fn write_tracked(stream: &mut Stream, mut bytes: &[u8], phase: &mut Phase) -> io::Result<()> {
     while !bytes.is_empty() {
         match stream.write(bytes) {
@@ -585,7 +589,7 @@ enum Upload {
     Wire(io::Error),
 }
 
-/// Write the body after its head. A [`Body::Reader`] must yield exactly its
+/// Write the body after its head.
 fn send_body(stream: &mut Stream, body: Body<'_>) -> Result<(), Upload> {
     match body {
         Body::Empty => Ok(()),
@@ -619,6 +623,8 @@ fn send_body(stream: &mut Stream, body: Body<'_>) -> Result<(), Upload> {
 }
 
 /// The answer a server sent before it read the whole request, read after the
+/// write it made fail (RFC 9112 §9.5: a client sending a body watches for an
+/// error response).
 fn early_answer<R: BufRead>(reader: &mut R, failed: &io::Error) -> Option<Head> {
     if matches!(
         failed.kind(),
@@ -631,6 +637,7 @@ fn early_answer<R: BufRead>(reader: &mut R, failed: &io::Error) -> Option<Head> 
 
 impl Client {
     /// Establish the byte stream for `target`, tunnelling through `via` when a
+    /// proxy applies.
     fn open(
         &self,
         target: &Uri,
@@ -679,6 +686,7 @@ impl Client {
 }
 
 /// Issue `CONNECT host:port`, with the proxy's Basic credential when it has
+/// one, and require a 2xx before handing the socket to TLS.
 fn connect_tunnel(
     stream: &mut Stream,
     target: &Uri,
@@ -704,7 +712,7 @@ fn connect_tunnel(
     Ok(())
 }
 
-/// Render the request head. The target is origin-form normally, absolute-form
+/// Render the request head.
 #[cfg(test)]
 fn render_request(
     method: Method,
@@ -719,6 +727,9 @@ fn render_request(
 }
 
 /// The head [`render_fields`] renders, then each secret header after the
+/// caller's headers, then the blank line, into a buffer sized up front so it
+/// never reallocates: no copy of a secret is left behind in a freed
+/// allocation.
 fn render_head(
     method: Method,
     target: &Uri,
@@ -754,6 +765,7 @@ fn is_reserved(name: &str) -> bool {
 }
 
 /// The request line and every header line, without the blank line that ends
+/// the head.
 fn render_fields(
     method: Method,
     target: &Uri,
@@ -798,7 +810,7 @@ fn render_fields(
     head
 }
 
-/// Headers whose wire meaning [`render_fields`] owns. The body always uses
+/// Headers whose wire meaning [`render_fields`] owns.
 const RESERVED_HEADERS: &[&str] = &[
     "host",
     "content-length",
@@ -808,6 +820,7 @@ const RESERVED_HEADERS: &[&str] = &[
 ];
 
 /// HTTP field names are nonempty tokens, shared by request validation and
+/// response parsing so neither accepts separators the other rejects.
 fn valid_header_name(name: &str) -> bool {
     !name.is_empty()
         && name.bytes().all(|b| {
@@ -912,6 +925,7 @@ fn header_pairs(headers: &[(String, String)]) -> impl Iterator<Item = (&str, &st
 }
 
 /// EVERY value under `name` (ASCII case-insensitive), not just the first, in
+/// order: duplicates are the point.
 fn header_values<'h, 'n>(
     headers: &'h [(String, String)],
     name: &'n str,
@@ -965,6 +979,7 @@ impl Exchange {
 }
 
 /// Header names, never values: a response header can carry a bearer
+/// credential too (a signed `Location`, a token in a `Set-Cookie`).
 impl std::fmt::Debug for Exchange {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let names: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
@@ -1027,6 +1042,8 @@ enum Chunk {
 }
 
 /// The framing decoder over any buffered reader: the live socket under a
+/// [`BodyReader`], or the in-memory bytes the unit tests feed it, so both run
+/// ONE framing path.
 struct Framed<R> {
     reader: R,
     framing: Framing,
@@ -1168,11 +1185,14 @@ fn cut_short(message: String) -> io::Error {
 }
 
 /// Bad body framing: `InvalidData`, carrying the [`Error::Protocol`] that
+/// [`RequestBuilder::send`] reports.
 fn bad_framing(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, Error::Protocol(message))
 }
 
 /// One line of chunked framing (a chunk-size line, a chunk's closing CRLF, a
+/// trailer field), at most [`MAX_HEADER_LINE`] bytes, with the bytes counted
+/// against `budget` up to [`MAX_HEADER_BYTES`].
 fn chunk_line<R: Read>(reader: &mut R, budget: &mut usize) -> io::Result<String> {
     let mut raw = Vec::new();
     loop {
@@ -1201,6 +1221,7 @@ fn chunk_line<R: Read>(reader: &mut R, budget: &mut usize) -> io::Result<String>
 }
 
 /// The [`Error`] a body read failed with: the one a [`Framed`] error carries
+/// inside it (`TooLarge`, `Protocol`), else the I/O error itself.
 fn body_error(error: io::Error) -> Error {
     let ours = error.get_ref().is_some_and(|inner| inner.is::<Error>());
     if !ours {
@@ -1231,6 +1252,7 @@ struct Head {
 }
 
 /// Read the final response head off `reader`: everything between a written
+/// request and the framing its headers declare.
 fn read_final_head<R: BufRead>(reader: &mut R) -> Result<Head, Error> {
     let closed = loop {
         match reader.fill_buf() {
@@ -1248,7 +1270,7 @@ fn read_final_head<R: BufRead>(reader: &mut R) -> Result<Head, Error> {
     read_head(reader)
 }
 
-/// One byte of a head, or `0` at its end. An `UnexpectedEof` read error is
+/// One byte of a head, or `0` at its end.
 fn read_head_byte<R: Read>(reader: &mut R, byte: &mut [u8; 1]) -> io::Result<usize> {
     match read_uninterrupted(reader, byte) {
         Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(0),
@@ -1257,6 +1279,7 @@ fn read_head_byte<R: Read>(reader: &mut R, byte: &mut [u8; 1]) -> io::Result<usi
 }
 
 /// `reader.read(buf)`, retrying every `Interrupted` (the `Read` contract's
+/// "this operation can be retried"), so no other error and no byte is lost.
 fn read_uninterrupted<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
     loop {
         match reader.read(buf) {
@@ -1304,7 +1327,7 @@ fn parse_http_number(text: &str, radix: u32) -> Option<usize> {
     usize::from_str_radix(text, radix).ok()
 }
 
-/// The status code of one status line. RFC 9112 §4 makes it exactly `3DIGIT`
+/// The status code of one status line.
 fn read_status_line<R: Read>(reader: &mut R, consumed: &mut usize) -> Result<u16, Error> {
     let line = read_line(reader, consumed)?;
     let mut parts = line.splitn(3, ' ');
@@ -1368,6 +1391,8 @@ fn read_head<R: Read>(reader: &mut R) -> Result<Head, Error> {
 }
 
 /// The whole response parser over any buffered reader: the in-memory bytes
+/// the unit tests feed it, through the same [`read_final_head`],
+/// [`decide_framing`] and [`Framed`] a live exchange runs.
 #[cfg(test)]
 fn read_response_from<R: BufRead>(
     mut reader: R,
@@ -1383,7 +1408,7 @@ fn read_response_from<R: BufRead>(
     })
 }
 
-/// How the response body is delimited. One function decides this, because a
+/// How the response body is delimited.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Framing {
     /// No content: the response ends at its header block (HEAD, 1xx, 204, 304).
@@ -1397,6 +1422,7 @@ enum Framing {
 }
 
 /// Resolve the response framing (RFC 9112 §6.3), refusing every ambiguous
+/// combination.
 fn decide_framing(
     method: Method,
     status: u16,
@@ -1472,7 +1498,7 @@ mod tests {
         proxy::parse_proxy("HTTPS_PROXY", text).unwrap()
     }
 
-    /// TCP reads may stop anywhere in the head or body. Drain the declared
+    /// TCP reads may stop anywhere in the head or body.
     fn read_plain_request(reader: &mut impl Read) -> Vec<u8> {
         const LIMIT: usize = 1024;
         let mut head = Vec::new();
@@ -2051,6 +2077,7 @@ HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
     }
 
     /// A reader that yields `bytes`, then fails as rustls does when its peer
+    /// closes TCP without `close_notify`.
     struct UncleanClose<'a>(&'a [u8]);
 
     impl Read for UncleanClose<'_> {
@@ -2100,6 +2127,8 @@ HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
     }
 
     /// A reader that hands out `parts` one per read and fails every other
+    /// read `Interrupted`, as a socket read does when a signal lands (on
+    /// Linux, any caught signal, once `SO_RCVTIMEO` is set).
     struct Interrupting(std::collections::VecDeque<&'static [u8]>, bool);
 
     impl Read for Interrupting {

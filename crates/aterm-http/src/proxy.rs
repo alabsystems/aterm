@@ -1,31 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` discovery. The
-//! `CONNECT` tunnel itself is [`crate::client`]'s.
-//!
-//! The caller decides WHETHER a proxy may be consulted at all
-//! ([`ProxyMode`]); this module only answers "given that it may, which one".
-//! That split matters: a caller forces
-//! [`ProxyMode::Direct`] for a loopback endpoint so that a stray `HTTPS_PROXY`
-//! in the environment can never turn a local-only trust decision into
-//! request-body or bearer-token egress to an unrelated host.
-//!
-//! The variable for the target's scheme is read first (`HTTPS_PROXY`, else
-//! `https_proxy`; `HTTP_PROXY`, else `http_proxy`), then `ALL_PROXY`, else
-//! `all_proxy`. The first one set (non-empty after trimming) decides, and it
-//! FAILS CLOSED: a value this client cannot use (no `http://` scheme, a SOCKS
-//! or `https://` proxy, a malformed authority, a value that is not valid
-//! Unicode) is an [`Error::Invalid`] naming the variable. It is never guessed
-//! at and never becomes a direct connection, which would carry the request
-//! body and a bearer token around a proxy the network or its policy requires.
-//! The error never echoes the value: a proxy URL can carry a password.
-//!
-//! Percent-encoded `user:password@` becomes `Proxy-Authorization: Basic` on the
-//! `CONNECT` (`https` target) or the absolute-form request (`http` target),
-//! never inside a tunnel, where the origin would read it. Escapes that decode
-//! to non-UTF-8 are refused. An `https://` proxy is refused: a
-//! [`crate::stream::Stream`] carries one TLS layer, the origin's.
+//! `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` discovery.
 
 use std::ffi::OsString;
 use std::net::{IpAddr, Ipv6Addr};
@@ -43,12 +19,9 @@ pub enum ProxyMode {
     Direct,
 }
 
-/// Reads process environment variables. Injected so the resolution rules can be
-/// tested without mutating the process environment, which is shared state in a
-/// threaded test binary.
+/// Reads process environment variables.
 pub trait EnvSource {
-    /// The raw value of `name`, if set. [`resolve`] trims it, reads an empty
-    /// value as unset, and reads a value that is not valid Unicode as set.
+    /// The raw value of `name`, if set.
     fn var_os(&self, name: &str) -> Option<OsString>;
 }
 
@@ -62,11 +35,6 @@ impl EnvSource for ProcessEnv {
     }
 }
 
-/// The value of `name` as text, trimmed; `None` when unset or empty.
-///
-/// A value that is not valid Unicode converts lossily (U+FFFD) rather than
-/// reading as unset, which would hand the decision to the next variable and
-/// possibly a direct connection. [`parse_proxy`] refuses U+FFFD; in `NO_PROXY`
 /// that entry matches no host and the others still apply.
 fn env_text<E: EnvSource>(env: &E, name: &str) -> Option<String> {
     let value = env.var_os(name)?;
@@ -75,8 +43,7 @@ fn env_text<E: EnvSource>(env: &E, name: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
-/// A proxy this client speaks through: always a plain `http://` proxy, plus
-/// the `Proxy-Authorization: Basic` credential its URL carried, if any.
+/// A proxy this client speaks through.
 #[derive(Clone)]
 pub struct ProxyTarget {
     uri: Uri,
@@ -84,16 +51,14 @@ pub struct ProxyTarget {
 }
 
 impl ProxyTarget {
-    /// The proxy's `http://` URL without its userinfo; only its host and port
-    /// are used.
+    /// The proxy's `http://` URL without its userinfo; only its host and port are used.
     #[inline]
     #[must_use]
     pub const fn uri(&self) -> &Uri {
         &self.uri
     }
 
-    /// The base64 of `user:password` for `Proxy-Authorization: Basic`, when
-    /// the proxy URL named a user.
+    /// The base64 of `user:password` for `Proxy-Authorization: Basic`.
     #[inline]
     #[must_use]
     pub fn basic_auth(&self) -> Option<&str> {
@@ -103,7 +68,6 @@ impl ProxyTarget {
 
 impl std::fmt::Debug for ProxyTarget {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The credential is never formatted: a Debug print reaches logs.
         formatter
             .debug_struct("ProxyTarget")
             .field("uri", &self.uri)
@@ -116,11 +80,8 @@ impl std::fmt::Debug for ProxyTarget {
 }
 
 /// Resolve the proxy to use for `target`: `Ok(None)` for a direct connection.
-///
 /// # Errors
-///
-/// [`Error::Invalid`], naming the variable and never its value, when the
-/// variable that decides is set to something this client cannot use.
+/// [`Error::Invalid`].
 pub fn resolve<E: EnvSource>(
     mode: ProxyMode,
     target: &Uri,
@@ -147,17 +108,13 @@ pub fn resolve<E: EnvSource>(
     parse_proxy(name, &raw).map(Some)
 }
 
-/// Parse the value of the proxy variable `name`. Every refusal names `name`
-/// and never quotes `raw`.
+/// Parse the value of the proxy variable `name`.
 pub(crate) fn parse_proxy(name: &str, raw: &str) -> Result<ProxyTarget, Error> {
     let unusable = || {
         Error::Invalid(format!(
             "{name} is set but is not a usable http:// proxy URL"
         ))
     };
-    // Userinfo never reaches `Uri::parse`, so its screen runs here too. U+FFFD
-    // is how a value that was not valid Unicode reads (`env_text`); a URL is
-    // ASCII.
     if raw.len() > 8192
         || raw
             .chars()
@@ -174,9 +131,6 @@ pub(crate) fn parse_proxy(name: &str, raw: &str) -> Result<ProxyTarget, Error> {
             unusable()
         });
     };
-    // The authority ends where `Uri::parse` ends it. Userinfo is split off at
-    // its last `@`, so a password holding an unencoded `@` leaves the host
-    // intact.
     let (authority, tail) = rest
         .find(['/', '?', '#'])
         .and_then(|end| rest.split_at_checked(end))
@@ -187,10 +141,6 @@ pub(crate) fn parse_proxy(name: &str, raw: &str) -> Result<ProxyTarget, Error> {
             let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
             let user = aterm_codec::pct::decode(user);
             let password = aterm_codec::pct::decode(password);
-            // An empty userinfo names no credential, and a colon in the user-id
-            // makes `user:password` ambiguous (RFC 7617 §2). The raw value holds
-            // no U+FFFD (screened above), so one here is an escape that is not
-            // UTF-8; an escaped U+FFFD itself is refused with it.
             if userinfo.is_empty()
                 || user.contains(':')
                 || user.contains(char::REPLACEMENT_CHARACTER)
@@ -207,11 +157,6 @@ pub(crate) fn parse_proxy(name: &str, raw: &str) -> Result<ProxyTarget, Error> {
     Ok(ProxyTarget { uri, basic_auth })
 }
 
-/// Whether `NO_PROXY` exempts `target`.
-///
-/// Forms: `*`, a bare host, a `.suffix`, and a port-restricted `host:port`.
-/// Matching is case-insensitive and a suffix matches only on a label boundary
-/// (`example.test` never exempts `notexample.test`). An IP literal (IPv4, bare
 /// or bracketed IPv6) matches the same address and nothing else.
 fn no_proxy_matches(target: &Uri, value: Option<String>) -> bool {
     let Some(value) = value else {
@@ -228,7 +173,6 @@ fn no_proxy_matches(target: &Uri, value: Option<String>) -> bool {
             return true;
         }
         let (entry_host, entry_port) = split_no_proxy_entry(&entry);
-        // `host:port` entries only exempt that exact port.
         if entry_port.is_some_and(|port| port != target.port()) {
             continue;
         }
@@ -253,10 +197,6 @@ fn no_proxy_matches(target: &Uri, value: Option<String>) -> bool {
     false
 }
 
-/// Split one `NO_PROXY` entry into its host and optional port.
-///
-/// The port follows the last colon only when that colon is not the address's
-/// own: a bare IPv6 literal (`2001:db8::5`) has no port, and a bracketed one
 /// (`[2001:db8::5]:8443`) ends at its bracket.
 fn split_no_proxy_entry(entry: &str) -> (&str, Option<u16>) {
     let (host, port) = if let Some((host, tail)) = entry
@@ -307,7 +247,6 @@ mod tests {
         }
     }
 
-    /// `before` and `after` around one sequence that is not valid Unicode: the
     /// byte 0xFF on Unix, an unpaired surrogate on Windows.
     #[cfg(unix)]
     fn not_unicode(before: &str, after: &str) -> OsString {
@@ -331,7 +270,6 @@ mod tests {
         Uri::parse(text).unwrap()
     }
 
-    /// The host of the proxy `env` resolves for `target` under
     /// [`ProxyMode::Environment`]; `None` for a direct connection.
     fn proxy_host(env: &FakeEnv, target: &str) -> Option<String> {
         resolve(ProxyMode::Environment, &uri(target), env)
@@ -349,9 +287,6 @@ mod tests {
 
     #[test]
     fn direct_mode_ignores_every_proxy_variable() {
-        // THE loopback guarantee: a stray HTTPS_PROXY must never redirect
-        // a request body or a bearer token off this machine. An unusable
-        // value is ignored too: Direct never reads it.
         let env = FakeEnv::with(&[
             ("HTTPS_PROXY", "http://evil.test:8080"),
             ("HTTP_PROXY", "socks5://evil.test:1080"),
@@ -401,8 +336,6 @@ mod tests {
 
     #[test]
     fn all_proxy_is_the_fallback_after_the_schemes_own_variable() {
-        // ALL_PROXY alone is a proxy for every scheme; ignoring it would send
-        // requests direct.
         for name in ["ALL_PROXY", "all_proxy"] {
             let env = FakeEnv::with(&[(name, "http://all.test:3128")]);
             for target in ["https://a.test/", "http://a.test/"] {
@@ -426,7 +359,6 @@ mod tests {
             proxy_host(&env, "http://a.test/").as_deref(),
             Some("all.test")
         );
-        // NO_PROXY exempts from ALL_PROXY as from the others.
         let env = FakeEnv::with(&[
             ("ALL_PROXY", "http://all.test:3128"),
             ("NO_PROXY", "a.test"),
@@ -437,13 +369,9 @@ mod tests {
     #[test]
     fn userinfo_becomes_a_basic_credential_and_leaves_the_proxy_uri() {
         for (raw, credential) in [
-            // base64("alice:s3cret")
             ("http://alice:s3cret@p.test:3128", "YWxpY2U6czNjcmV0"),
-            // Percent-encoding is decoded, and an unencoded `@` in a password
-            // is split at the last `@`: both are base64("alice:p@ss").
             ("http://alice:p%40ss@p.test:3128", "YWxpY2U6cEBzcw=="),
             ("http://alice:p@ss@p.test:3128/", "YWxpY2U6cEBzcw=="),
-            // A user with no password: base64("alice:").
             ("http://alice@p.test:3128", "YWxpY2U6"),
         ] {
             let env = FakeEnv::with(&[("HTTPS_PROXY", raw)]);
@@ -483,7 +411,6 @@ mod tests {
                 assert!(message.contains(name), "{name}={bad}: {message}");
             }
         }
-        // The uppercase spelling decides even when the lowercase one is fine.
         let env = FakeEnv::with(&[
             ("HTTPS_PROXY", "proxy.test:3128"),
             ("https_proxy", "http://proxy.test:3128"),
@@ -494,7 +421,6 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn a_value_that_is_not_valid_unicode_fails_closed_naming_its_variable() {
-        // Read as unset, the value would fall through to the valid `all_proxy`.
         for name in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY"] {
             for value in [
                 not_unicode("http://p.test", ":3128"),
@@ -508,8 +434,6 @@ mod tests {
                 assert!(message.contains(name), "{name}={value:?}: {message}");
             }
         }
-        // In NO_PROXY the entry that is not valid Unicode matches nothing, and
-        // the valid entries still exempt their hosts.
         let env = FakeEnv::with(&[("HTTPS_PROXY", "http://p.test:3128")])
             .and_raw("NO_PROXY", not_unicode("a.test,", ".b.test"));
         assert_eq!(proxy_host(&env, "https://a.test/"), None);
@@ -521,7 +445,6 @@ mod tests {
 
     #[test]
     fn a_credential_escape_that_is_not_utf8_is_refused_not_altered() {
-        // A lossy decode would send a password other than the configured one.
         for bad in [
             "http://alice:%FF@p.test:3128",
             "http://alice:pw%C3@p.test:3128",
@@ -532,7 +455,6 @@ mod tests {
             let message = refusal(&env, "https://a.test/");
             assert!(message.contains("HTTPS_PROXY"), "{bad}: {message}");
         }
-        // Escaped UTF-8 is a credential like any other: base64("alice:é").
         let env = FakeEnv::with(&[("HTTPS_PROXY", "http://alice:%C3%A9@p.test:3128")]);
         let proxy = resolve(ProxyMode::Environment, &uri("https://a.test/"), &env)
             .unwrap()
@@ -555,7 +477,6 @@ mod tests {
 
     #[test]
     fn a_refusal_never_echoes_the_value() {
-        // A proxy URL can carry a password, and the error reaches stderr.
         for bad in [
             "socks5://alice:s3cret@p.test:1080",
             "https://alice:s3cret@p.test:443",
@@ -581,10 +502,8 @@ mod tests {
             ("HTTPS_PROXY", "http://p.test:1"),
             ("NO_PROXY", "example.test"),
         ]);
-        // Exact host and a true subdomain are exempt...
         assert_eq!(proxy_host(&env, "https://example.test/"), None);
         assert_eq!(proxy_host(&env, "https://api.example.test/"), None);
-        // ...but a host that merely ends with the string is not.
         assert!(proxy_host(&env, "https://notexample.test/").is_some());
     }
 
@@ -595,7 +514,6 @@ mod tests {
             ("NO_PROXY", ".example.test, other.test:8443"),
         ]);
         assert_eq!(proxy_host(&env, "https://a.example.test/"), None);
-        // Port-restricted entry matches only that port.
         assert_eq!(proxy_host(&env, "https://other.test:8443/"), None);
         assert!(proxy_host(&env, "https://other.test/").is_some());
     }
@@ -611,12 +529,10 @@ mod tests {
 
     #[test]
     fn no_proxy_matches_ip_literals_as_addresses() {
-        // An IPv6 entry's last colon is not a port separator.
         for (entry, target) in [
             ("2001:db8::5", "https://[2001:db8::5]/v1"),
             ("[2001:db8::5]", "https://[2001:db8::5]/v1"),
             ("[2001:db8::5]:8443", "https://[2001:db8::5]:8443/v1"),
-            // The same address in another spelling is the same address.
             ("2001:DB8:0:0:0:0:0:5", "https://[2001:db8::5]/v1"),
             ("10.0.0.7", "https://10.0.0.7/v1"),
             ("10.0.0.7:8443", "https://10.0.0.7:8443/v1"),
@@ -629,9 +545,7 @@ mod tests {
             );
         }
         for (entry, target) in [
-            // A port restriction on an IPv6 entry still restricts.
             ("[2001:db8::5]:8443", "https://[2001:db8::5]/v1"),
-            // An address is not a domain: no suffix matching between IPs.
             ("0.0.7", "https://10.0.0.7/v1"),
             ("::5", "https://[2001:db8::5]/v1"),
         ] {

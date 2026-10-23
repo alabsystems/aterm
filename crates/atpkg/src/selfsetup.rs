@@ -549,6 +549,7 @@ fn sweep_caffeine(s: &mut Sweep<'_>, p: &Places, app_dirs: &[PathBuf]) -> Vec<Pa
     if files.is_empty() && !login_plist {
         return Vec::new();
     }
+    let account = caffeine_account(aterm_uds::peer::our_uid(), &p.home);
     let own_quit: &[&str] = &["caffeine", "quit", "own"];
     let steps: &[&[&str]] = if s.outsider.is_some() {
         &[&["caffeine", "startup", "off"], own_quit]
@@ -570,24 +571,45 @@ fn sweep_caffeine(s: &mut Sweep<'_>, p: &Places, app_dirs: &[PathBuf]) -> Vec<Pa
     }
     let mut supported = false;
     let mut failed = Vec::new();
+    // A root sweep asks through sudo. One sudo refuses (a sudoers without root's runas rule,
+    // `Defaults !root_sudo`) is no answer from the helper: each is kept for its steps, as
+    // when a step fails, where reading the refusal as an older build's would remove them.
+    if let Some((uid, _)) = account
+        && !s.dry
+        && !helpers.is_empty()
+    {
+        let rc = run_quietly(Path::new(SUDO), &as_account_argv(uid, Path::new(TRUE), &[]));
+        if rc != 0 {
+            for (app, aterm) in std::mem::take(&mut helpers) {
+                s.skip(
+                    &helper_line(&aterm, &["help", "caffeine"], account),
+                    &format!(
+                        "sudo could not run it as uid {uid} (exit {rc}); {} is kept for it",
+                        app.display()
+                    ),
+                );
+                failed.push(app);
+            }
+        }
+    }
     for (app, aterm) in helpers {
         if s.dry {
             s.say(&format!(
-                "would ask {} help caffeine, then if supported:",
-                aterm.display()
+                "would ask {}, then if supported:",
+                helper_line(&aterm, &["help", "caffeine"], account)
             ));
             for args in steps {
-                s.say(&format!("would run {} {}", aterm.display(), args.join(" ")));
+                s.say(&format!("would run {}", helper_line(&aterm, args, account)));
             }
             continue;
         }
-        if run_quietly(&aterm, &["help", "caffeine"]) != 0 {
+        if run_helper(&aterm, &["help", "caffeine"], account) != 0 {
             continue;
         }
         supported = true;
         for args in steps {
-            let line = format!("{} {}", aterm.display(), args.join(" "));
-            match run_quietly(&aterm, args) {
+            let line = helper_line(&aterm, args, account);
+            match run_helper(&aterm, args, account) {
                 0 => s.say(&format!("ran {line}")),
                 2 if *args == own_quit => s.say(&format!(
                     "{line}: this build cannot quit only its own mug; one it runs keeps running"
@@ -632,7 +654,7 @@ fn sweep_caffeine(s: &mut Sweep<'_>, p: &Places, app_dirs: &[PathBuf]) -> Vec<Pa
         return failed;
     }
     let lock = support.join("caffeine.lock");
-    let Some(_hold) = caffeine_cleanup_hold(&lock) else {
+    let Some(_hold) = caffeine_cleanup_hold(&lock, account, make_as_account) else {
         s.skip(
             &lock.display().to_string(),
             "Caffeine lock is busy or could not be acquired; its files are kept",
@@ -800,19 +822,41 @@ fn sweep_caffeine_code_with(
 /// Hold the physical, owned regular rendezvous without waiting, made (`0600`) when no mug
 /// ever made it: a `serve` starting meanwhile opens the same file and finds it held. An
 /// error is unknown; a temporary probe would not preserve custody through the removals.
-fn caffeine_cleanup_hold(path: &Path) -> Option<crate::lock::Flock> {
-    use std::os::unix::fs::OpenOptionsExt as _;
+///
+/// The rendezvous is the account's: this process's, or for a root sweep the `account` it
+/// is for, which then makes a missing one itself (`make`, through sudo). Root never creates
+/// or chowns at that name: the account controls it and every directory above it, so a hard
+/// link to a root file there, or a directory leading into a root one, would have root hand
+/// that file, or a new one in that directory, to the account. Root only opens what the
+/// account made: its own regular file with one name.
+fn caffeine_cleanup_hold(
+    path: &Path,
+    account: Option<(u32, u32)>,
+    make: fn(&Path, u32) -> bool,
+) -> Option<crate::lock::Flock> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let owner = account.map_or_else(aterm_uds::peer::our_uid, |(uid, _)| uid);
+    let made = account.is_some()
+        && std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+    if made && !make(path, owner) {
+        return None;
+    }
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .create(true)
+        .create(account.is_none())
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .ok()?;
     let opened = file.metadata().ok()?;
-    if !opened.is_file() || opened.uid() != aterm_uds::peer::our_uid() || opened.nlink() != 1 {
+    if !opened.is_file() || opened.uid() != owner || opened.nlink() != 1 {
         return None;
+    }
+    // `make` leaves the account's umask on it; the descriptor names the file checked above.
+    if made && opened.mode() & 0o077 != 0 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .ok()?;
     }
     let held = crate::lock::Flock::try_lock(file).ok()?;
     let named = std::fs::symlink_metadata(path).ok()?;
@@ -822,9 +866,69 @@ fn caffeine_cleanup_hold(path: &Path) -> Option<crate::lock::Flock> {
     Some(held)
 }
 
+/// The account a sweep of `home` asks the Caffeine helpers as, with its group: the home's
+/// owner when this process is root (`our_uid` 0) and `home` is that owner's own home (the
+/// account database's), as under sudo, which keeps the person's HOME. `aterm caffeine`
+/// refuses a HOME that is not its own account's, so as root every step would fail and keep
+/// its bundle for a step no root run can take. The helpers run with the owner's own HOME
+/// (`sudo -H`), so a home that is not it (a moved or restored one) is not theirs to sweep:
+/// `None` there, and for any sweep not run as root, asks as this process.
+fn caffeine_account(our_uid: u32, home: &Path) -> Option<(u32, u32)> {
+    if our_uid != 0 {
+        return None;
+    }
+    let owner = std::fs::metadata(home).ok()?;
+    let own = aterm_uds::account::home_of(owner.uid())?;
+    (owner.uid() != 0 && same_file(&own, home)).then(|| (owner.uid(), owner.gid()))
+}
+
+/// What runs a Caffeine helper step as `uid`: root's `sudo`, which asks root for no
+/// password, with HOME set to that account's own.
+const SUDO: &str = "/usr/bin/sudo";
+/// What a root sweep asks sudo to run first, to tell sudo's refusal from a helper's.
+const TRUE: &str = "/usr/bin/true";
+/// What makes a missing Caffeine lock as its account ([`make_as_account`]).
+const TOUCH: &str = "/usr/bin/touch";
+
+/// Make the empty file `path` as `uid`, through [`SUDO`]: a root sweep's rendezvous is made
+/// by the account it is for, with that account's rights ([`caffeine_cleanup_hold`]).
+fn make_as_account(path: &Path, uid: u32) -> bool {
+    let mut argv = as_account_argv(uid, Path::new(TOUCH), &[]);
+    argv.push(path.into());
+    run_quietly(Path::new(SUDO), &argv) == 0
+}
+
+/// `sudo`'s arguments for `aterm args` as `uid` ([`SUDO`]).
+fn as_account_argv(uid: u32, aterm: &Path, args: &[&str]) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = ["-n", "-H", "-u"].into_iter().map(OsString::from).collect();
+    argv.push(format!("#{uid}").into());
+    argv.push("--".into());
+    argv.push(aterm.into());
+    argv.extend(args.iter().map(OsString::from));
+    argv
+}
+
+/// Run the Caffeine helper `aterm args` quietly, as `account` when one is named
+/// ([`caffeine_account`]).
+fn run_helper(aterm: &Path, args: &[&str], account: Option<(u32, u32)>) -> i32 {
+    match account {
+        None => run_quietly(aterm, args),
+        Some((uid, _)) => run_quietly(Path::new(SUDO), &as_account_argv(uid, aterm, args)),
+    }
+}
+
+/// How the sweep names the helper step [`run_helper`] runs.
+fn helper_line(aterm: &Path, args: &[&str], account: Option<(u32, u32)>) -> String {
+    let step = format!("{} {}", aterm.display(), args.join(" "));
+    match account {
+        None => step,
+        Some((uid, _)) => format!("{SUDO} -n -H -u #{uid} -- {step}"),
+    }
+}
+
 /// Run `program args`, its stdio `/dev/null`: its exit status, 127 when it could not run
 /// and 128 when a signal ended it.
-fn run_quietly(program: &Path, args: &[&str]) -> i32 {
+fn run_quietly(program: &Path, args: &[impl AsRef<OsStr>]) -> i32 {
     aterm_uds::spawnfd::command(program)
         .args(args)
         .stdin(aterm_uds::spawnfd::Stdio::null())

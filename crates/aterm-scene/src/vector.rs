@@ -1,38 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **Bake-time vector rasterizer** for the cat-art v4 glyph pipeline: fill absolute
-//! cubic-Bézier/line paths into a [`Tile`] with scanline even-odd coverage.
-//!
-//! The v4 cat glyphs are exactly-traced SVG paths (vtracer cutout output) codegen'd
-//! into const drawlists; at bake time each layer's paths are rasterized here into the
-//! same straight-alpha RGBA8 [`Tile`] the procedural cat baker draws on. The AA idiom
-//! matches [`Tile::fill`]: 4×4 subsamples per pixel, coverage → `alpha·hit/16` through
-//! [`Tile::over`].
-//!
-//! Semantics (normative for the glyph asset format):
-//! - Each element of `paths` is ONE path (possibly several subpaths via `Move`), filled
-//!   with the **even-odd** rule — subpath holes (donuts, eye cutouts) work regardless
-//!   of winding direction.
-//! - A layer's coverage is the **union** across its paths (a subsample is covered if it
-//!   is inside *any* path). vtracer cutout clusters are disjoint-to-adjacent, so
-//!   merging a dozen same-colour fragments into one layer never self-cancels and never
-//!   double-blends the layer's alpha.
-//! - Unclosed subpaths are implicitly closed (standard fill semantics).
-//! - Coordinates are sanitized: non-finite → 0, magnitude clamped to [`COORD_LIMIT`].
-//!   The scanline itself only ever visits tile-bounded rows/columns, so hostile
-//!   coordinates cannot blow up time or memory.
-//!
-//! This is bake-time-only code: floats appear in parameters and scratch buffers, never
-//! in any `Eq`/hashed key type (the `BakeKey` discipline of the cat baker).
+//! **Bake-time vector rasterizer** for the cat-art v4 glyph pipeline: fill absolute cubic-Bézier/line paths into a [`Tile`] with scanline even-odd coverage.
 
 use crate::atlas::Tile;
 use crate::clampf;
 
-/// One absolute path command in the glyph's own normalized frame (0..1, y down),
-/// scaled into device space by the [`PathTransform`] at fill time.
-///
-/// Deliberately `PartialEq` only (floats) — never put this in an `Eq`'d key.
+/// One absolute path command in the glyph's own normalized frame (0..1, y down), scaled into device space by the [`PathTransform`] at fill time.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PathCmd {
     /// Start a new subpath at `(x, y)` (implicitly closing any open one at fill time).
@@ -45,18 +19,10 @@ pub enum PathCmd {
     Close,
 }
 
-/// The side length of a glyph's own fixed-point frame: quantized path coordinates
-/// live in the integer grid `0..=FIXED_ONE` (`x = round(px/viewbox * FIXED_ONE)`), so
-/// the whole const drawlist is integer — `Eq`-safe and byte-deterministic (the codegen
-/// contract, docs/cat-art-v4-design.md §1).
+/// The side length of a glyph's own fixed-point frame: quantized path coordinates live in the integer grid `0..=FIXED_ONE` (`x = round(px/viewbox * FIXED_ONE)`), so the whole const drawlist is integer — `Eq`-safe and byte-deterministic (the codegen contract, docs/cat-art-v4-design.md §1).
 pub const FIXED_ONE: u16 = 4096;
 
-/// One absolute path command in a glyph's **fixed-point** `0..=FIXED_ONE` frame — the
-/// integer counterpart of [`PathCmd`] that the codegen'd cat drawlists store.
-///
-/// Being all-integer, this is fully `Eq`/`Hash`-safe (unlike [`PathCmd`]), so it may
-/// appear in `const` data and hashed keys. [`fill_path_fixed`] maps it into device
-/// space at bake time.
+/// One absolute path command in a glyph's **fixed-point** `0..=FIXED_ONE` frame — the integer counterpart of [`PathCmd`] that the codegen'd cat drawlists store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PathSeg {
     /// Start a new subpath at `(x, y)` (implicitly closing any open one at fill time).
@@ -69,8 +35,7 @@ pub enum PathSeg {
     Close,
 }
 
-/// Affine scale+offset mapping glyph coordinates into device (tile) pixels:
-/// `device = (x·scale_x + dx, y·scale_y + dy)`.
+/// Affine scale+offset mapping glyph coordinates into device (tile) pixels: `device = (x·scale_x + dx, y·scale_y + dy)`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PathTransform {
     pub scale_x: f32,
@@ -93,8 +58,7 @@ impl PathTransform {
     }
 }
 
-/// Device-space coordinate bound: anything larger (or non-finite) is clamped/zeroed
-/// before rasterization, so degenerate assets stay safe and fast.
+/// Device-space coordinate bound: anything larger (or non-finite) is clamped/zeroed before rasterization, so degenerate assets stay safe and fast.
 pub(crate) const COORD_LIMIT: f32 = 1.0e6;
 
 /// Cubic flattening tolerance in device pixels (~0.15 px at target scale keeps the
@@ -114,13 +78,6 @@ struct Edge {
 
 /// Reusable working memory for [`fill_path`]'s scanline core — one set per
 /// thread, length-reset per call, never returned to the allocator.
-///
-/// Per-frame callers (pet motes, sing-along notes) fill ~11–20 px tiles every
-/// frame, where per-call malloc/free costs as much as the scanline work.
-/// Thread-local rather than caller-passed, so no public signature changes and
-/// every caller gets the reuse.
-/// Retained footprint: a few hundred `Edge`s plus two `i32` rows at the widest
-/// tile filled on the thread.
 struct FillScratch {
     edges: Vec<Edge>,
     active: Vec<Edge>,
@@ -143,15 +100,7 @@ thread_local! {
     };
 }
 
-/// Fill `paths` (even-odd per path, union across paths) into `tile` with `rgb` at
-/// `alpha`, 4×4-supersampled, blended through [`Tile::over`]/[`Tile::over_run`].
-/// Degenerate input (empty paths, zero-area geometry, off-tile geometry) is a no-op.
-///
-/// The scanline core is built for the perf gate (30-layer glyph at 160×100 well under
-/// 1 ms): an active-edge list amortizes edge lookups across the monotonically
-/// increasing sub-scanlines, union spans land in a difference-array coverage
-/// accumulator (O(1) per span interior), and full-coverage pixel runs blend as one
-/// [`Tile::over_run`] (a 4-byte pattern fill when opaque).
+/// Fill `paths` (even-odd per path, union across paths) into `tile` with `rgb` at `alpha`, 4×4-supersampled, blended through [`Tile::over`]/[`Tile::over_run`].
 pub fn fill_path(
     tile: &mut Tile,
     paths: &[&[PathCmd]],
@@ -162,19 +111,10 @@ pub fn fill_path(
     if alpha <= 0.0 || tile.width() == 0 || tile.height() == 0 || paths.is_empty() {
         return;
     }
-    // The scratch borrow spans exactly one core run. Nothing under
-    // `fill_scanline` can re-enter `fill_path` (it calls only `Tile` blends and
-    // local helpers), so the RefCell can never observe a nested borrow; and if
-    // a fill ever unwinds mid-row, the next call re-establishes every invariant
-    // below by length-resetting each buffer before use.
     FILL_SCRATCH.with_borrow_mut(|scratch| fill_scanline(tile, paths, rgb, alpha, t, scratch));
 }
 
 /// The scanline core of [`fill_path`], with its working memory handed in.
-///
-/// Reuse changes capacity only: every buffer is length-reset before use, and
-/// the coverage accumulators are rebuilt zeroed at exact lengths (`add_span`
-/// reads `extra.len()` as the row width, so those lengths are load-bearing).
 fn fill_scanline(
     tile: &mut Tile,
     paths: &[&[PathCmd]],
@@ -191,11 +131,7 @@ fn fill_scanline(
         diff,
         extra,
     } = scratch;
-    // Flatten every path to device-space edges; track the union bbox.
     let mut bbox = BBox::empty();
-    // Allocation hint only. Each command yields at most one edge except `Cubic`
-    // (`flatten_cubic` emits 1..=64, single digits at glyph curvature), so
-    // 4-per-cubic costs at most one growth on a big layer.
     let est = paths.iter().fold(0usize, |n, p| {
         p.iter().fold(n, |n, cmd| {
             let e = match *cmd {
@@ -217,26 +153,16 @@ fn fill_scanline(
     edges.sort_unstable_by(|a, b| a.ytop.total_cmp(&b.ytop));
     active.clear();
     let mut next = 0usize;
-    // `xs` and `spans` are cleared at each use inside the loop.
-    // Row coverage accumulators (reset in the flush pass, so rows cost O(touched)):
-    // `diff` takes ±4 at full-pixel span boundaries (prefix sum = interior coverage),
-    // `extra` takes the per-subsample counts of the few partial boundary pixels.
-    // clear+resize re-zeroes unconditionally, so the flush-pass invariant holds
-    // even after an unwound fill.
     diff.clear();
     diff.resize(width + 1, 0);
     extra.clear();
     extra.resize(width, 0);
     const INV16: f32 = 1.0 / 16.0;
     for py in y0..y1 {
-        // Touched pixel range of this row (union over its 4 sub-scanlines).
         let mut lo_t = width;
         let mut hi_t = 0usize;
         for sub in 0..4u32 {
-            // ×0.25 is bit-identical to /4 (power of two) — same sample lattice as
-            // `Tile::fill`.
             let sy = py as f32 + (sub as f32 + 0.5) * 0.25;
-            // Activate edges whose top has been reached; retire the expired.
             while let Some(e) = edges.get(next)
                 && e.ytop <= sy
             {
@@ -249,7 +175,6 @@ fn fill_scanline(
             if active.is_empty() {
                 continue;
             }
-            // Crossings, grouped by path for even-odd pairing.
             xs.clear();
             for e in active.iter() {
                 xs.push((e.path, e.xtop + (sy - e.ytop) * e.dxdy));
@@ -262,11 +187,10 @@ fn fill_scanline(
                     spans.push((a.1, b.1));
                     i += 2;
                 } else {
-                    i += 1; // unpaired trailing crossing of a path: drop it
+                    // unpaired trailing crossing of a path: drop it
+                    i += 1;
                 }
             }
-            // Union-merge the spans (already sorted per path; re-sort across paths),
-            // then accumulate each disjoint span into the row.
             spans.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
             let mut cur: Option<(f32, f32)> = None;
             for &(a, b) in spans.iter() {
@@ -289,9 +213,6 @@ fn fill_scanline(
         if lo_t >= hi_t {
             continue;
         }
-        // Flush the row: prefix-sum `diff` into coverage, fold in `extra`, reset both
-        // (so the next row starts clean without a full-width memset), and blend —
-        // full-coverage runs go through `over_run`, partial pixels through `over`.
         if let (Some(ds), Some(es)) = (diff.get_mut(lo_t..hi_t), extra.get_mut(lo_t..hi_t)) {
             let mut run = 0i32;
             for (d, e) in ds.iter_mut().zip(es.iter_mut()) {
@@ -326,11 +247,7 @@ fn fill_scanline(
     }
 }
 
-/// Fill fixed-point [`PathSeg`] drawlists (the codegen'd cat glyph layers) into `tile`
-/// — the u16 counterpart of [`fill_path`]. Each coordinate in the glyph's `0..=FIXED_ONE`
-/// frame is mapped to its `0..1` normalized position (`v / FIXED_ONE`) and then through
-/// the same [`PathTransform`]/scanline core, so the raster is byte-identical to filling
-/// the equivalent [`PathCmd`] paths (docs/cat-art-v4-design.md §1).
+/// Fill fixed-point [`PathSeg`] drawlists (the codegen'd cat glyph layers) into `tile` — the u16 counterpart of [`fill_path`].
 pub fn fill_path_fixed(
     tile: &mut Tile,
     paths: &[&[PathSeg]],
@@ -343,10 +260,6 @@ pub fn fill_path_fixed(
     }
     const INV_FIXED: f32 = 1.0 / FIXED_ONE as f32;
     let c = |v: u16| f32::from(v) * INV_FIXED;
-    // Lower 1:1 into one flat buffer, then cut per-path slices back out by offset.
-    // The per-path grouping is load-bearing: `fill_path` fills even-odd PER PATH and
-    // unions ACROSS paths, so one merged slice would turn overlapping subpaths into
-    // holes.
     let total = paths.iter().fold(0usize, |n, p| n.saturating_add(p.len()));
     let mut flat: Vec<PathCmd> = Vec::with_capacity(total);
     for p in paths {
@@ -363,7 +276,6 @@ pub fn fill_path_fixed(
     let mut off = 0usize;
     for p in paths {
         let end = off.saturating_add(p.len());
-        // Always in range — `flat` was built from exactly these lengths, in order.
         refs.push(flat.get(off..end).unwrap_or(&[]));
         off = end;
     }
@@ -372,7 +284,7 @@ pub fn fill_path_fixed(
 
 /// Accumulate one disjoint span `[a, b)` (device x) into the row: ±4 into `diff` for
 /// the fully-covered pixel range, exact subsample counts into `extra` for the (at most
-/// a few) partial boundary pixels. Grows the row's touched range.
+/// a few) partial boundary pixels.
 #[inline]
 fn add_span(
     diff: &mut [i32],
@@ -388,7 +300,6 @@ fn add_span(
         // Bounded float → index: sanitized coords keep `v` finite and small.
         clampf(v - x0 as f32, 0.0, width as f32) as usize
     };
-    // Pixels whose subsample lattice (px + (i+0.5)/4) intersects [a, b) at all.
     let p_lo = clamp_px((a - 0.875).ceil());
     let p_hi = clamp_px((b - 0.125).ceil());
     if p_lo >= p_hi {
@@ -396,7 +307,6 @@ fn add_span(
     }
     *lo_t = (*lo_t).min(p_lo);
     *hi_t = (*hi_t).max(p_hi);
-    // Fully-covered pixels: px + 0.125 >= a && px + 0.875 < b.
     let f0 = clamp_px((a - 0.125).ceil()).max(p_lo);
     let f1 = clamp_px((b - 0.875).ceil()).min(p_hi);
     let bits = |px: usize| -> i32 {
@@ -428,7 +338,6 @@ fn add_span(
             }
         }
     } else {
-        // Span too narrow for any fully-covered pixel: everything is boundary.
         for px in p_lo..p_hi {
             if let Some(e) = extra.get_mut(px) {
                 *e += bits(px);
@@ -514,7 +423,8 @@ fn flatten_path(
         bbox.add(p0.0, p0.1);
         bbox.add(p1.0, p1.1);
         if p0.1 == p1.1 {
-            return; // horizontal edges never cross a sub-scanline
+            // horizontal edges never cross a sub-scanline
+            return;
         }
         let (top, bot) = if p0.1 < p1.1 { (p0, p1) } else { (p1, p0) };
         edges.push(Edge {
@@ -543,7 +453,8 @@ fn flatten_path(
                 if let Some(c) = cur {
                     push(edges, c, p);
                 } else {
-                    start = Some(p); // tolerate a missing Move: begin here
+                    // tolerate a missing Move: begin here
+                    start = Some(p);
                 }
                 cur = Some(p);
             }
@@ -575,11 +486,7 @@ fn flatten_path(
     }
 }
 
-/// Uniform-parameter cubic flattening. The segment count comes from the classic
-/// control-polygon deviation bound: the curve is within `¾·max(|P1−L(⅓)|, |P2−L(⅔)|)`
-/// of its chord (L = chord lerp), and uniform n-splitting shrinks the residual as
-/// `1/n²`, so `n = ceil(sqrt(err/tol))` meets [`FLATTEN_TOL`]. Bounded n keeps hostile
-/// curves cheap.
+/// Uniform-parameter cubic flattening.
 fn flatten_cubic(
     p0: (f32, f32),
     p1: (f32, f32),
@@ -616,10 +523,7 @@ fn flatten_cubic(
     }
 }
 
-/// Parse one glyph-asset path string — absolute `M`/`L`/`C`/`Z` with implicit command
-/// repetition (SVG semantics: numbers after a completed `M` continue as `L`) — into
-/// [`PathCmd`]s. `None` on any other command letter, malformed number, or a dangling
-/// argument count. Separators are whitespace and commas.
+/// Parse one glyph-asset path string — absolute `M`/`L`/`C`/`Z` with implicit command repetition (SVG semantics: numbers after a completed `M` continue as `L`) — into [`PathCmd`]s.
 #[must_use]
 pub fn parse_path(d: &str) -> Option<Vec<PathCmd>> {
     let mut out = Vec::new();
@@ -680,7 +584,6 @@ pub fn parse_path(d: &str) -> Option<Vec<PathCmd>> {
             }
             i += 1;
         } else {
-            // A number: [-]digits[.digits][e[-]digits]
             let s = i;
             if c == '-' || c == '+' {
                 i += 1;
@@ -698,7 +601,8 @@ pub fn parse_path(d: &str) -> Option<Vec<PathCmd>> {
             let tok = d.get(s..i)?;
             let v: f32 = tok.parse().ok()?;
             if cmd.is_none() || cmd == Some('Z') {
-                return None; // numbers before any command / after Z with no command
+                // numbers before any command / after Z with no command
+                return None;
             }
             nums.push(v);
         }
@@ -724,8 +628,6 @@ mod tests {
 
     #[test]
     fn even_odd_holes_work() {
-        // Outer square with an inner square subpath in the SAME path: even-odd must
-        // leave the inner region transparent regardless of winding.
         let donut = [
             PathCmd::Move(0.1, 0.1),
             PathCmd::Line(0.9, 0.1),
@@ -748,8 +650,6 @@ mod tests {
         );
         assert_eq!(alpha_at(&t, 40, 40), 0, "hole is transparent");
         assert!(alpha_at(&t, 40, 16) > 200, "ring is painted");
-        // Union across separate paths must NOT cancel: two overlapping squares as two
-        // paths of one layer cover their intersection.
         let sq1 = [
             PathCmd::Move(0.1, 0.1),
             PathCmd::Line(0.6, 0.1),
@@ -780,9 +680,6 @@ mod tests {
 
     #[test]
     fn fill_path_fixed_matches_float_frame() {
-        // A fixed-point drawlist rasterizes byte-identically to the equivalent 0..1
-        // `PathCmd` paths: the u16 endpoints are exact multiples of FIXED_ONE/8, so
-        // `v / FIXED_ONE` reproduces the float coordinates with no rounding drift.
         let q = |f: f32| (f * FIXED_ONE as f32) as u16;
         let seg = [
             PathSeg::Move(q(0.125), q(0.75)),
@@ -818,7 +715,6 @@ mod tests {
             "fixed-point frame == float frame raster"
         );
         assert!(a.pixels().iter().any(|&x| x != 0), "actually painted");
-        // Degenerate fixed input is a no-op (mirrors the float path's safety).
         let mut t = Tile::new(16, 16);
         let before = t.pixels().to_vec();
         fill_path_fixed(
@@ -846,7 +742,6 @@ mod tests {
     fn degenerate_paths_are_safe() {
         let mut t = Tile::new(16, 16);
         let before = t.pixels().to_vec();
-        // Empty layer, Move-only path, zero-area line, Close with no Move.
         fill_path(
             &mut t,
             &[],
@@ -874,8 +769,6 @@ mod tests {
     #[test]
     fn out_of_range_coords_clamp() {
         let mut t = Tile::new(32, 32);
-        // A triangle with far-out-of-range and non-finite coordinates must neither
-        // panic nor hang; painting stays inside the tile by construction.
         let wild = [
             PathCmd::Move(-1.0e9, -1.0e9),
             PathCmd::Line(1.0e9, 0.5),
@@ -889,7 +782,6 @@ mod tests {
             1.0,
             PathTransform::fit(32, 32),
         );
-        // A sane path partially off-tile clips to the tile edge.
         let half_off = [
             PathCmd::Move(-0.5, 0.25),
             PathCmd::Line(0.5, 0.25),
@@ -921,7 +813,6 @@ mod tests {
                 PathCmd::Close,
             ]
         );
-        // Implicit repetition: M pair, then implicit L; C repeats as C.
         let imp = parse_path("M0 0 1 0 C1 0 1 1 0 1 0 1 0 0 0 0Z").unwrap();
         assert_eq!(
             imp,
@@ -933,7 +824,6 @@ mod tests {
                 PathCmd::Close,
             ]
         );
-        // Malformed input is refused, never panics.
         assert!(parse_path("M 0.1").is_none(), "dangling args");
         assert!(parse_path("Q 1 2 3 4").is_none(), "unsupported command");
         assert!(parse_path("M x y").is_none(), "non-numeric");

@@ -46,6 +46,8 @@ pub fn create(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// The one way this module takes a lock: [`held::HeldTape`]'s fields are
+/// private to `held`, so its `hold` is the module's only `try_lock` and the
+/// only way to hold what it takes.
 mod held {
     use super::super::frame::FrameSink;
 
@@ -94,6 +96,8 @@ mod held {
 }
 
 /// Whether `other` names `file`, the tape just made at `path`: the same
+/// device and inode where there are such (unix), else the same resolved
+/// path.
 fn is_file(file: &std::fs::File, path: &Path, other: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -317,6 +321,9 @@ pub fn forget(store: &Path, paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
 }
 
 /// The door a hosted run reads its world through, recording to a new tape
+/// in the store beside its approval ledger ([module docs](self)) — after the
+/// store's retention has run — or the shipped live door, said to `warn`,
+/// when the run keeps no ledger or its tape cannot be made.
 fn hosted_fx(
     setup: &SessionSetup,
     opts: &SuperviseOpts,
@@ -463,6 +470,7 @@ mod tests {
     }
 
     /// A hosted tape's name is the run's start in UTC and its tape's first
+    /// eight digits, so names sort as the runs began.
     #[test]
     fn a_hosted_tapes_name_sorts_as_the_runs_began() {
         let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_789_660_500);
@@ -487,6 +495,10 @@ mod tests {
     }
 
     /// THE STORE'S RETENTION: the sessions' tapes, newest first, are kept
+    /// within the bytes and the age, and every other is removed — by size
+    /// (the oldest that no longer fits, with every older one) and by age (a
+    /// tape past it, however small); a kept tape is neither removed nor
+    /// counted, and a file that is no tape is left alone.
     #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
     #[test]
     fn the_store_keeps_the_newest_within_its_bytes_and_age() {
@@ -531,6 +543,10 @@ mod tests {
     }
 
     /// A TAPE ITS WRITER STILL HOLDS IS NEVER SWEPT, and its bytes count: a
+    /// running loop's tape past the store's bytes — the newer tape before it
+    /// in the walk already near the bound — and another past its age (a
+    /// capped tape whose loop runs on writes no more) both stay, while the
+    /// closed tape the held one's bytes push past the bound goes.
     #[test]
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     fn a_tape_its_writer_still_holds_is_never_swept() {
@@ -570,6 +586,7 @@ mod tests {
     }
 
     /// Forgetting removes tapes in the store and nothing else: a file outside
+    /// it, or one in it that is no tape, is refused before anything goes.
     #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
     #[test]
     fn forgetting_removes_only_tapes_in_the_store() {

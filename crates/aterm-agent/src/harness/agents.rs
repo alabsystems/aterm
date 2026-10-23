@@ -1,86 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE AGENTS PANEL'S DOTS — what each background agent and workflow in
-//! Claude Code's agents panel is doing, folded over successive readings of the
-//! panel: running, quiet, in a tool call of its own, stuck, halted, waiting,
-//! settled, and how much work it is doing, as numbers a renderer turns into brightness, glow and
-//! saturation.
-//!
-//! One reading says only what Claude drew (`aterm_phase::agents_panel`); a
-//! row's STATE needs time. A [`PanelTrack`] per session keeps one
-//! [`RowTrack`] per agent row it has seen (at most [`TRACKS_MAX`], least
-//! recently seen evicted first, dropped [`ABSENT_MS`] after it last showed),
-//! and each [`PanelTrack::fold`] matches the new reading's rows to them.
-//! Pure: no clock is read here; the host passes `now_ms` (any monotonic
-//! millisecond count) to [`PanelTrack::fold`] when it reads the panel and to
-//! [`PanelTrack::retime`] at [`PanelTrack::due`], when nothing on the screen
-//! moved but a dot's state would.
-//!
-//! MATCHING. A row is matched to a track by its kind and name hash, and among
-//! the tracks of that name by its CLOCK: the start the row implies (`now −
-//! elapsed`) within the drawn clock's resolution plus [`MATCH_SLACK_MS`] of
-//! the track's, or a clock that did not move, or one that moved forward by no
-//! more than the wall time since (a workflow paused on a limit and resumed).
-//! Its place among the rows of that name (its ordinal) decides alone only for
-//! a row whose status is a word, or none. Rows of one name are many (`◯
-//! general-purpose` five times) and the window scrolls (`↓ N more`): by
-//! ordinal alone, an agent that left the window hands its history to the
-//! next of its name. Among the tracks a clock fits, the same activity text,
-//! a token count that did not fall and the same ordinal come before the
-//! start's error: agents of one name launched together imply starts within
-//! one clock step of each other, and by the error alone they trade
-//! histories from one repaint to the next.
-//!
-//! EVIDENCE OF WORK is a change in the row's tokens, its activity text or its
-//! workflow progress, or its status turning (`waiting` to a clock, a count
-//! that shows again); the elapsed clock is not (Claude ticks it while the
-//! agent waits on a tool). From the time since the last evidence:
-//! [`DotState::Running`] under [`QUIET_MS`], [`DotState::Quiet`] under
-//! [`STUCK_MS`], [`DotState::Stuck`] at or past it. 150 s is Bash's default
-//! two-minute timeout plus 30 s: a tool call inside its own timeout is not
-//! yet stuck; Claude's own stall watchdog fires only at 600 s, and that is
-//! too late for a person watching. A row whose tokens step by more than
-//! [`BLIND_QUANTUM`] (`1.2m tokens` moves in 100 000s) cannot show quiet by
-//! its tokens alone, so it is never Stuck: its dot says it is blind
-//! ([`Dot::blind`]).
-//!
-//! ITS OWN CALLS. The screen cannot tell a subagent waiting on one long tool
-//! call (a 300 s Bash `sleep` holds its tokens still for five minutes,
-//! measured on 2.1.304) from one that hangs. Its transcript can
-//! ([`super::flight`]): where the host maps a row to exactly one agent's file
-//! ([`super::flight::place`]) and passes what it says
-//! ([`PanelTrack::fold_flown`], [`PanelTrack::fly`] when only the files
-//! moved), a row quiet for [`QUIET_MS`] whose call is in flight is
-//! [`DotState::Tool`] — fresh, its light its rate's ([`Dot::waits`] names the
-//! tool and how long) — until that call outlives its own budget (its
-//! declared timeout plus 30 s; 150 s without one), and only then quiet or
-//! stuck by the time since the last evidence. A call answered, or a new one
-//! written, is evidence. A row no file is certainly its, or whose file is
-//! unknown, keeps the rules above exactly.
-//!
-//! THE OTHER STATES come from Claude's own words and colours, first match
-//! wins: [`DotState::Settled`] when the host saw the bullet in one of
-//! Claude's status colours ([`Tint::Marked`]: success, error, warning — the
-//! text does not carry it); [`DotState::Awaiting`], [`DotState::Waiting`],
-//! [`DotState::Idle`] from the elapsed slot's words; [`DotState::Paused`] for
-//! a workflow's `⏸`; [`DotState::Halted`] when a clock did not move for twice
-//! its resolution plus [`HALT_SLACK_MS`] (Claude repaints it every second
-//! while the agent runs).
-//!
-//! HOW MUCH WORK: [`Dot::rate`], tokens per second over the last
-//! [`WINDOW_MS`] (from the change point at or before its start), from up to
-//! [`SAMPLES`] change points per row, kept [`SAMPLE_GAP_MS`] apart so 16 span
-//! the window; it decays to zero as the window slides past the last change. A fall in the count (compaction) restarts the samples and counts
-//! as evidence. [`Dot::level`] is `ln(1 + rate/2) / ln(501)`, clamped to
-//! `0..=1` (1000 tok/s is full; the wait_bg captures' 116 tok/s is 0.66).
-//! [`Dot::sat`] is 1 until [`QUIET_MS`] of quiet (and while
-//! [`DotState::Tool`]), then falls linearly to [`SAT_QUIET_FLOOR`] at
-//! [`STUCK_MS`], and is [`SAT_STUCK`] once stuck.
-//!
-//! The host repaints when [`PanelTrack::fingerprint`] changes: it hashes each
-//! dot's place, state and looks quantised to 1/32, so a level that drifts
-//! inside one step costs no frame.
+//! THE AGENTS PANEL'S DOTS — what each background agent and workflow in Claude Code's agents panel is doing, folded over successive readings of the panel: running, quiet, in a tool call of its own, stuck, halted, waiting, settled, and how much work it is doing, as numbers a renderer turns into brightness, glow and saturation.
 
 use aterm_phase::agents_panel::{
     AgentsPanel, Bullet, Elapsed, PANEL_ROWS_MAX, PanelRow, RowKind, Span,
@@ -94,8 +15,7 @@ pub const QUIET_MS: u64 = 20_000;
 pub const STUCK_MS: u64 = 150_000;
 /// A clock still for `2 × resolution` plus this is [`DotState::Halted`].
 pub const HALT_SLACK_MS: u64 = 1_000;
-/// The slack, past the clock's resolution, a row's implied start may differ
-/// from its track's and still be that track.
+/// The slack, past the clock's resolution, a row's implied start may differ from its track's and still be that track.
 pub const MATCH_SLACK_MS: u64 = 1_500;
 /// Tokens that step by more than this cannot show quiet by themselves.
 pub const BLIND_QUANTUM: u64 = 200;
@@ -107,9 +27,7 @@ pub const ABSENT_MS: u64 = 600_000;
 pub const TRACKS_MAX: usize = 16;
 /// The token samples a track keeps.
 pub const SAMPLES: usize = 16;
-/// The spacing the kept samples keep: while the newest is younger than this
-/// past the one before it, a change replaces it, so [`SAMPLES`] span more
-/// than the window (15 gaps of 5 s).
+/// The spacing the kept samples keep: while the newest is younger than this past the one before it, a change replaces it, so [`SAMPLES`] span more than the window (15 gaps of 5 s).
 pub const SAMPLE_GAP_MS: u64 = 5_000;
 /// [`Dot::sat`] at [`STUCK_MS`] of quiet.
 pub const SAT_QUIET_FLOOR: f32 = 0.15;
@@ -121,8 +39,7 @@ pub const LOOK_TICK_MS: u64 = 1_000;
 /// The looks [`PanelTrack::fingerprint`] tells apart, per unit.
 const LOOK_STEPS: f32 = 32.0;
 
-/// What the host saw of a bullet's colour: Claude's default or dim ink, or
-/// one of its status colours (success, error, warning).
+/// What the host saw of a bullet's colour: Claude's default or dim ink, or one of its status colours (success, error, warning).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Tint {
     #[default]
@@ -137,9 +54,7 @@ pub enum DotState {
     Running,
     /// No evidence for [`QUIET_MS`], not yet [`STUCK_MS`].
     Quiet,
-    /// No evidence for [`QUIET_MS`] or more, but its own file says it waits
-    /// on a call of its own inside that call's budget
-    /// ([`super::flight`]): working, not stuck.
+    /// No evidence for [`QUIET_MS`] or more, but its own file says it waits on a call of its own inside that call's budget ([`super::flight`]): working, not stuck.
     Tool,
     /// No evidence for [`STUCK_MS`] or more.
     Stuck,
@@ -180,8 +95,7 @@ pub struct Dot {
     pub waits: Option<Waits>,
 }
 
-/// What a [`DotState::Tool`] dot waits on: what its title says (`in Bash
-/// 4m12s`).
+/// What a [`DotState::Tool`] dot waits on: what its title says (`in Bash 4m12s`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Waits {
     pub tool: ToolName,
@@ -296,13 +210,7 @@ impl RowTrack {
 
     /// How well `row` (drawn at `now`, with `ordinal` among its name) fits
     /// this track: `None` when it cannot be this track, else a cost, lower
-    /// is better. First by the clock's class (a start within tolerance, then
-    /// a clock that went on after a pause, then — no clock to compare — the
-    /// ordinal alone); within a class the same activity text, a count that
-    /// did not fall and the same ordinal each beat the start's error, which
-    /// alone cannot tell apart agents of one name launched together (their
-    /// implied starts lie within one clock step of each other, and Claude's
-    /// repaints between its one-second ticks move them by up to a step).
+    /// is better.
     fn fit(&self, row: &PanelRow, ordinal: u8, now: u64) -> Option<u64> {
         if self.kind != row.kind || self.name_hash != row.name_hash {
             return None;
@@ -314,8 +222,6 @@ impl RowTrack {
                 let start = i128::from(now) - i128::from(ms);
                 let err = (start - self.start()?).unsigned_abs();
                 let err = u64::try_from(err).unwrap_or(u64::MAX);
-                // Forward by no more than the wall time since: a clock that
-                // paused and went on.
                 let wall = now.saturating_sub(self.seen_ms);
                 if ms == was {
                     (0, 0)
@@ -348,7 +254,6 @@ impl RowTrack {
 
     /// Take `row`'s reading at `now`.
     fn observe(&mut self, row: &PanelRow, ordinal: u8, tint: Tint, now: u64) {
-        // What the elapsed slot holds: a clock, a word or nothing.
         let slot = |t: &RowTrack| (t.clock.is_some(), t.word.is_some());
         let slot_before = slot(self);
         self.ordinal = ordinal;
@@ -392,8 +297,6 @@ impl RowTrack {
                     evidence = true;
                 }
                 Some(_) => {}
-                // A count that shows again (or first shows) is a status
-                // that turned: evidence.
                 None => {
                     self.push_sample(now, t.count);
                     evidence = true;
@@ -412,11 +315,6 @@ impl RowTrack {
             evidence |= self.progress.is_some();
             self.progress = progress;
         }
-        // A status that turned (`waiting` to a clock, a cut status back) is
-        // evidence, and a worded one keeps it fresh (its state is the word's,
-        // and the agent resuming is not quiet from before); a row with no
-        // status at all (decorated, or cut by a narrow pane) shows work only
-        // by its text, so it goes quiet like any other — never stuck, blind.
         if evidence || slot(self) != slot_before || self.word.is_some() {
             self.evidence_ms = now;
         }
@@ -477,8 +375,7 @@ impl RowTrack {
 
     /// Tokens per second from the base sample to `now`: the base is the
     /// last sample at or before `now −` [`WINDOW_MS`] (the count stood there
-    /// until the next change), else the oldest. Once the window has slid
-    /// past the newest change the base is that change, and the rate is 0.
+    /// until the next change), else the oldest.
     fn rate(&self, now: u64) -> f32 {
         let samples = &self.samples[..usize::from(self.n_samples)];
         let (Some(&(_, newest)), Some(&oldest)) = (samples.last(), samples.first()) else {
@@ -574,8 +471,6 @@ impl RowTrack {
         if let Some(at) = self.halt_at() {
             take(at);
         }
-        // Inside its call's budget its look holds still (fresh, the light its
-        // rate gives): only the budget's end is due.
         let in_tool = self.in_tool(now);
         if let Some(t) = in_tool {
             take(t.until);
@@ -612,8 +507,7 @@ pub fn sat(state: DotState, quiet_ms: u64) -> f32 {
     1.0 - t * (1.0 - SAT_QUIET_FLOOR)
 }
 
-/// One session's panel history: its row tracks and its dots as of the last
-/// fold or retime. Fixed arrays, nothing allocated.
+/// One session's panel history: its row tracks and its dots as of the last fold or retime.
 #[derive(Debug, Clone)]
 pub struct PanelTrack {
     tracks: [Option<RowTrack>; TRACKS_MAX],
@@ -640,16 +534,12 @@ impl Default for PanelTrack {
 }
 
 impl PanelTrack {
-    /// Fold the panel as read at `now_ms`: `tints[i]` is what the host saw
-    /// of `panel.rows()[i]`'s bullet colour (missing: [`Tint::Plain`]). An
-    /// empty panel marks every track absent. No row's own calls are known
-    /// ([`Self::fold_flown`]).
+    /// Fold the panel as read at `now_ms`: `tints[i]` is what the host saw of `panel.rows()[i]`'s bullet colour (missing: [`Tint::Plain`]).
     pub fn fold(&mut self, panel: &AgentsPanel, tints: &[Tint], now_ms: u64) {
         self.fold_flown(panel, tints, &[], now_ms);
     }
 
-    /// [`Self::fold`], `flights[i]` what the host knows of `panel.rows()[i]`'s
-    /// own calls ([`super::flight::place`]; missing: [`Flight::Unknown`]).
+    /// [`Self::fold`], `flights[i]` what the host knows of `panel.rows()[i]`'s own calls ([`super::flight::place`]; missing: [`Flight::Unknown`]).
     pub fn fold_flown(
         &mut self,
         panel: &AgentsPanel,
@@ -659,9 +549,6 @@ impl PanelTrack {
     ) {
         let now = now_ms.max(self.now_ms);
         self.now_ms = now;
-        // The long absent go BEFORE the rows are matched: a track matched
-        // and then dropped would free its slot under a row placed later,
-        // and two rows would share one track.
         for track in &mut self.tracks {
             if track.is_some_and(|t| now.saturating_sub(t.seen_ms) >= ABSENT_MS) {
                 *track = None;
@@ -670,7 +557,6 @@ impl PanelTrack {
         for track in self.tracks.iter_mut().flatten() {
             track.present = false;
         }
-        // The task rows, with each one's ordinal among its name.
         let mut tasks: [(usize, u8); PANEL_ROWS_MAX] = [(0, 0); PANEL_ROWS_MAX];
         let mut n_tasks = 0;
         for (i, row) in panel.rows().iter().enumerate() {
@@ -684,7 +570,6 @@ impl PanelTrack {
             tasks[n_tasks] = (i, u8::try_from(ordinal).unwrap_or(u8::MAX));
             n_tasks += 1;
         }
-        // Match by the cheapest fit first, each row and track once.
         let mut matched: [Option<usize>; PANEL_ROWS_MAX] = [None; PANEL_ROWS_MAX];
         let mut claimed = [false; TRACKS_MAX];
         loop {
@@ -709,7 +594,6 @@ impl PanelTrack {
             matched[k] = Some(t);
             claimed[t] = true;
         }
-        // Place the rows: on their tracks, or on new ones.
         self.n_dots = 0;
         for (k, &(i, ordinal)) in tasks[..n_tasks].iter().enumerate() {
             let row = &panel.rows()[i];
@@ -739,10 +623,7 @@ impl PanelTrack {
         self.redot();
     }
 
-    /// Take what the host now knows of the last reading's rows' own calls
-    /// (`flights[i]` of `panel.rows()[i]`, as [`Self::fold_flown`] takes
-    /// them) at `now_ms`, with no new reading: the session's files moved
-    /// while the screen did not.
+    /// Take what the host now knows of the last reading's rows' own calls (`flights[i]` of `panel.rows()[i]`, as [`Self::fold_flown`] takes them) at `now_ms`, with no new reading: the session's files moved while the screen did not.
     pub fn fly(&mut self, flights: &[Flight], now_ms: u64) {
         let now = now_ms.max(self.now_ms);
         self.now_ms = now;
@@ -770,9 +651,7 @@ impl PanelTrack {
         &self.dots[..usize::from(self.n_dots)]
     }
 
-    /// When a dot next changes with nothing new on the screen: its state's
-    /// next turn, or [`LOOK_TICK_MS`] on while a look still fades. `None`
-    /// when nothing moves until the screen does.
+    /// When a dot next changes with nothing new on the screen: its state's next turn, or [`LOOK_TICK_MS`] on while a look still fades.
     #[must_use]
     pub fn due(&self) -> Option<u64> {
         self.shown()
@@ -780,8 +659,7 @@ impl PanelTrack {
             .min()
     }
 
-    /// A hash of what the dots look like: place, state, blindness, and level
-    /// and saturation in steps of 1/32. The host repaints when it changes.
+    /// A hash of what the dots look like: place, state, blindness, and level and saturation in steps of 1/32.
     #[must_use]
     pub fn fingerprint(&self) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;

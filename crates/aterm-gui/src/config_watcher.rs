@@ -24,10 +24,11 @@ mod protocol_island;
 #[path = "config_watcher_binding_island.rs"]
 mod binding_island;
 
-/// How often the watcher observes the config file. 500 ms is imperceptible for
+/// How often the watcher observes the config file.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// A stable theme directory needs a bounded rescan, but not four directory
+/// walks per two seconds.
 const THEME_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The independently recoverable host inputs watched by this worker.
@@ -73,6 +74,7 @@ pub(crate) struct WatchStatusState {
     config: Option<WatchFailureKind>,
     themes: Option<WatchFailureKind>,
     /// Latest exact readable generation handed to the asynchronous config
+    /// preparation/admission lane.
     config_candidate: Option<crate::native_document_host::AtomicFileBaseline>,
 }
 
@@ -202,11 +204,13 @@ fn failure_message(kind: WatchFailureKind) -> &'static str {
     }
 }
 
-/// Worker-side failure latch. `transition` is the sole constructor of status
+/// Worker-side failure latch.
 #[derive(Default)]
 struct FailureLatch {
     kind: Option<WatchFailureKind>,
     /// The window's view of this status is unknown (its wakes were dropped
+    /// before a seamless successor's Commit): the next transition posts its
+    /// edge whatever it is.
     unknown: bool,
 }
 
@@ -235,6 +239,7 @@ impl FailureLatch {
     }
 
     /// Forget what the window was told: its status wakes were dropped before
+    /// Commit, so the next outcome — failure or recovery — is posted.
     fn forget(&mut self) {
         self.kind = None;
         self.unknown = true;
@@ -263,7 +268,7 @@ pub(crate) fn spawn(
     });
 }
 
-/// The config-watcher thread [`spawn`] starts. A fn, not the closure, because it makes the
+/// The config-watcher thread [`spawn`] starts.
 fn watch(
     path: Option<std::path::PathBuf>,
     startup_config_baseline: Option<crate::native_document_host::AtomicFileBaseline>,
@@ -466,6 +471,7 @@ fn watch(
 const MAX_REJECTED_HARNESS_READ: u64 = 8 << 20;
 
 /// The `[harness]` policy of one watcher read: this thread is the one writer of the policy the
+/// window runs (`App::adopt_harness_policy` handles only its wake).
 fn observed_harness(
     path: Option<&std::path::Path>,
     observation: &Result<
@@ -498,6 +504,8 @@ fn observed_harness(
 }
 
 /// Post `policy` as the one the window runs when it differs from the one last
+/// posted (`last`), recording it only once `send` queued the wake
+/// (`Wake::HarnessPolicyObserved`).
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -534,6 +542,7 @@ fn send_harness(
 }
 
 /// Set at a seamless successor's Commit ([`repost_after_commit`]); the
+/// watcher's next poll re-posts the config file as it stands.
 static REPOST_AFTER_COMMIT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -558,6 +567,7 @@ fn post_status(
 struct ConfigPathStamp(u64);
 
 /// The path feeds a config text names (`Config::path_feed_paths`), or `None`
+/// when the text does not parse.
 fn feed_paths_of(text: &str) -> Option<Vec<std::path::PathBuf>> {
     crate::app_config::Config::parse(text)
         .ok()
@@ -570,6 +580,7 @@ pub(crate) fn path_feed_stamp(paths: &[std::path::PathBuf]) -> u64 {
 }
 
 /// [`path_feed_stamp`] with the following `stat` injected, so a test counts
+/// the calls.
 fn path_feed_stamp_with(
     paths: &[std::path::PathBuf],
     mut stat: impl FnMut(&std::path::Path) -> std::io::Result<std::fs::Metadata>,
@@ -599,6 +610,7 @@ fn path_feed_stamp_with(
 }
 
 /// Run the exact content observation only for a metadata edge or a prior
+/// observation failure.
 fn prepare_config_edge_with<T>(
     previous: Option<&ConfigPathStamp>,
     current: ConfigPathStamp,
@@ -618,7 +630,7 @@ fn initial_config_observation_changed(
     startup != Some(&observed.baseline)
 }
 
-/// Cheap identity/metadata stamp for the config's logical path. No config byte
+/// Cheap identity/metadata stamp for the config's logical path.
 fn config_path_stamp(path: &std::path::Path) -> Result<ConfigPathStamp, WatchFailureKind> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     "aterm-config-metadata-v1".hash(&mut hasher);
@@ -654,6 +666,8 @@ fn config_path_stamp(path: &std::path::Path) -> Result<ConfigPathStamp, WatchFai
 }
 
 /// One safe, bounded generation observation of the config's logical path, through the
+/// config/Manual file-capability reader: its baseline includes a content fingerprint,
+/// regular-file identity, metadata token and the complete admitted symlink binding.
 #[cfg(test)]
 fn config_file_stamp(
     path: &std::path::Path,
@@ -748,6 +762,7 @@ struct ThemeDirectoryStamp {
 }
 
 /// Keep the 500 ms startup reconciliation and one fast follow-up after an
+/// observed theme change or failure transition.
 struct ThemePollSchedule {
     next_poll: Instant,
     last_sample: Option<Result<ThemeDirectoryStamp, WatchFailureKind>>,
@@ -777,12 +792,14 @@ impl ThemePollSchedule {
     }
 }
 
-/// Cheap bounded identity/metadata stamp for the theme directory. No theme file
+/// Cheap bounded identity/metadata stamp for the theme directory.
 fn theme_directory_stamp(path: &std::path::Path) -> Result<ThemeDirectoryStamp, WatchFailureKind> {
     theme_directory_stamp_capped(path, crate::app_config::ThemeScanCaps::PRODUCTION)
 }
 
 /// [`theme_directory_stamp`] reading at most `caps.entries` entries (`truncated`
+/// past it) and keeping the metadata of at most `caps.candidates` candidates —
+/// discovery's own bounds ([`crate::app_config::ThemeScanCaps`]).
 fn theme_directory_stamp_capped(
     path: &std::path::Path,
     caps: crate::app_config::ThemeScanCaps,
@@ -969,6 +986,10 @@ pub(crate) mod tests {
     };
 
     /// ONE `stat` PER PATH THAT IS NOT A SYMLINK (unix): a regular file, a
+    /// folder and an absent path are hashed from their `lstat` alone, a
+    /// symlink and a dangling one are followed, and the stamp is the value the
+    /// two calls per path gave before, so the warm spare's learned gate, keyed
+    /// by a generation stamped with it and persisted, survives the update.
     #[cfg(unix)]
     #[test]
     fn the_feed_stamp_follows_only_symlinks_and_keeps_its_value() {
@@ -1017,6 +1038,7 @@ pub(crate) mod tests {
     }
 
     /// Return once the clock the filesystem stamps a ctime from has moved past
+    /// `path`'s ctime, so a rewrite now carries a ctime of its own.
     #[cfg(unix)]
     fn after_ctime_tick(path: &std::path::Path) {
         use std::os::unix::fs::MetadataExt;
@@ -1046,6 +1068,8 @@ pub(crate) mod tests {
     }
 
     /// Editing only the lexicon hot-reloads it: the feeds the config names are stamped beside it,
+    /// so a same-length, mtime-restored lexicon rewrite under an unchanged `aterm.toml` moves the
+    /// feed stamp and re-posts the observation.
     #[cfg(unix)]
     #[test]
     fn a_lexicon_edit_under_an_unchanged_config_is_a_reload_edge() {
@@ -1103,6 +1127,7 @@ pub(crate) mod tests {
     }
 
     /// A disabled Sparkle table names no feed (it has no consumer), and the
+    /// lists are capped exactly as their loaders cap them.
     #[test]
     fn path_feed_paths_follow_their_consumers() {
         let off = crate::app_config::Config::parse(
@@ -1259,6 +1284,9 @@ pub(crate) mod tests {
     }
 
     /// Tier-1 projection for `HarnessPolicyOneWriter`: the file on disk, the
+    /// watcher's dedupe (`post_harness`'s `last`), its post in flight, the
+    /// policy the window runs (`App::config.harness`), whether the window runs
+    /// what it handles yet, and the Commit's pending forget.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn project_harness_writer(
         model: &aterm_spec::derive::Model,
@@ -1316,6 +1344,7 @@ pub(crate) mod tests {
         }
 
         /// Run `act` and validate the real transition against `action` (both
+        /// tiers); a transition that moves nothing is a stutter.
         fn step(&mut self, action: &str, act: impl FnOnce(&mut Self)) {
             let before = self.state();
             act(self);
@@ -1342,6 +1371,7 @@ pub(crate) mod tests {
         }
 
         /// The file changes on disk: the kill switch goes in refused (a stray
+        /// non-UTF-8 byte), approvals go in readable.
         fn write(&mut self, approve: bool) {
             let action = if approve { "WriteOn" } else { "WriteOff" };
             self.step(action, |d| {
@@ -1357,6 +1387,7 @@ pub(crate) mod tests {
         }
 
         /// One watcher read of the file and its post: the real
+        /// `observed_harness` and `post_harness`, whose send queues the wake.
         fn poll(&mut self) {
             if self.queued.is_some() {
                 // the model holds one post in flight
@@ -1379,6 +1410,8 @@ pub(crate) mod tests {
         }
 
         /// The window handles the queued post: the real handler
+        /// (`adopt_harness_policy`) once it runs what it handles; dropped
+        /// before a seamless successor's Commit.
         fn deliver(&mut self) {
             self.step("Deliver", |d| {
                 if let Some(policy) = d.queued.take()
@@ -1390,6 +1423,7 @@ pub(crate) mod tests {
         }
 
         /// The config lane admits a generation carrying its own parse — the
+        /// real `apply_prepared_config_generation`, fed a stale file.
         fn admit(&mut self, approve: bool) {
             let action = if approve { "AdmitOn" } else { "AdmitOff" };
             self.step(action, |d| {
@@ -1432,6 +1466,7 @@ pub(crate) mod tests {
         }
 
         /// A seamless successor's Commit: the window runs what it handles from
+        /// here on, and the handler raises `REPOST_AFTER_COMMIT`.
         fn commit(&mut self) {
             self.step("Commit", |d| {
                 d.committed = true;
@@ -1440,6 +1475,7 @@ pub(crate) mod tests {
         }
 
         /// The watcher's next loop consumes the flag and forgets what it posted
+        /// (the `REPOST_AFTER_COMMIT` block's `last_harness = None`).
         fn forget(&mut self) {
             self.step("Forget", |d| {
                 if std::mem::take(&mut d.forget_pending) {
@@ -1450,6 +1486,10 @@ pub(crate) mod tests {
     }
 
     /// Tier-1 for `HarnessPolicyOneWriter`: drives the real read (`observed_harness`), post and
+    /// dedupe (`post_harness`), the window's handler and the admission path through writes of a
+    /// refused kill switch and a readable approval, polls around a seamless Commit, and stale
+    /// admissions of both policies at the worst moments, validating every transition and
+    /// invariant against the derived model.
     #[test]
     fn the_watcher_is_the_policys_one_writer() {
         let dir =
@@ -1541,6 +1581,9 @@ pub(crate) mod tests {
     }
 
     /// Every watcher read carries its `[harness]` policy, a refused one too: a readable file's
+    /// is what `Config::parse` reads; a file refused for a stray non-UTF-8 byte or its size
+    /// still has its `[harness]` lines read lossily, so a kill switch saved beside the byte holds
+    /// at once.
     #[test]
     fn every_watcher_read_carries_its_harness_policy() {
         use crate::native_document_host::DocumentHostError;
@@ -2122,6 +2165,7 @@ pub(crate) mod tests {
 }
 
 /// `HarnessPolicyOneWriter` actions no shipping function performs, each waived where
+/// its Tier-1 (`tests`) binds it.
 #[cfg(any(test, debug_assertions))]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "HarnessPolicyOneWriter",

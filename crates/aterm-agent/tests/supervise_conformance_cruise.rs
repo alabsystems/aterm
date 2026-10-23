@@ -1,45 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 for `SupervisorCruise` (aterm-models-harness
-//! `supervisor_cruise_model`): the real turn-end decider (`decide_turn_end`,
-//! with its `TurnEndState`) driven under Autopilot Cruise along every
-//! reachable state of the model — Autopilot Cruise: nothing the worker says
-//! ends the task.
-//!
-//! Someone else's turn is a point observed with real work (its last words
-//! progress, a done claim, a retired `ATERM-TASK-DONE` report that names open
-//! work, one over a repository the host's probe finds work no remote main
-//! has in, or a `529 Overloaded` wall); the policy's `Continue`, `Check` (the
-//! defend-and-find-more prompt), `Answer` and `WallAct` are the decider's own
-//! acts on the real ladder's clock, recorded with `acted`; a yield is the
-//! next point observed — a short one where it asks — after a live turn read
-//! with a message on it (`took`). The defend prompt's own yield is a
-//! `Nothing left:` defense: a claim like any. `Tasked` is the loop's read of
-//! the task record (`set_managed`), `BackoffDue` the clock moved past the
-//! back-off the decider waits on. A turn that claims done over a shell it
-//! left running is the busy screen the loop reads (no point), and the shell's
-//! end the idle screen it leaves, the busy reads' measure of its work: the
-//! claim's point. At every state the decider types the continuation, the
-//! defend prompt (its suffixes naming the open work or the repository's work
-//! exactly where the model's `open` says so), the answer and the wall's act
-//! exactly where the model enables them, waits exactly where the model's
-//! `BackoffDue` is the only way on, and does nothing at the busy screen; its
-//! task is never done and a recorded done is never taken on; its done claim,
-//! its short streak, its worker flag and the work its claim left are the
-//! model's (`claim`, `short`, `managed`, `open`).
-//!
-//! Negative controls: the `Buggy = 1` model continues at a claim where the
-//! real decider types the defend prompt, holds a worker's defend prompt for
-//! the back-off where the real decider types it, answers a worker at once
-//! past its bound where the real decider waits, ends the task at the defend
-//! prompt's own defense (the policy before Autopilot Cruise) where the real
-//! decider defends again past the back-off — with or without work in the
-//! repository — takes an old journal's or record's done on where the real
-//! decider refuses it, ends the task at the busy screen over a running shell
-//! where the real decider types nothing there and the defend prompt at the
-//! shell's end, and types the defend prompt into that busy screen where the
-//! real decider types nothing.
+//! Tier-1 for `SupervisorCruise` (aterm-models-harness `supervisor_cruise_model`).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -338,8 +300,6 @@ fn mirror(action: &str, before: &State, real: &mut Real) {
             real.st.acted(&a, &r, real.now);
         }
         "BackoffDue" => real.now += real.st.short_wait().expect("a back-off runs"),
-        // The defend prompt's own yield is the defense it asks for; any
-        // other act's, a done report.
         "YieldClaim" => real.turn(
             if before["pending"] == 2 {
                 DEFENSE
@@ -397,8 +357,6 @@ fn tier1_the_real_decider_defends_every_claim_and_never_rests() {
         for inv in &m.invariants {
             assert!(m.check_invariant(inv.name, &st), "{} at {st:?}", inv.name);
         }
-        // Autopilot Cruise: never done, at any state, and no record's done
-        // taken on.
         assert!(!real.st.task_done(), "the task ended at {st:?}");
         assert!(
             !real.st.clone().seed_task_done(),
@@ -452,10 +410,6 @@ fn tier1_the_real_decider_defends_every_claim_and_never_rests() {
             queue.push_back((next, r));
         }
     }
-    // Every free point the model has — a claim, one naming open work, one
-    // over a repository with work no remote main has, a wall, a question,
-    // the streak and its back-off running or over, a worker or not, the busy
-    // screen over a shell — gives every word; Nothing only at the busy screen.
     for word in ["Continue", "Check", "Answer", "WallAct", "Wait", "Nothing"] {
         assert!(
             verdicts.contains_key(word),
@@ -472,17 +426,10 @@ fn tier1_the_buggy_model_is_refuted_by_the_real_decider() {
     let buggy = aterm_spec::interp::with_buggy(&m, 1);
     let base = Instant::now() + Duration::from_secs(3600);
 
-    // At a claim the Buggy model continues; the real decider types the
-    // defend prompt.
     let (st, real) = walk(&m, &["OtherTurnClaim"], base);
     assert!(buggy.action_enabled("Continue", &st), "{st:?}");
     assert_eq!(verdict(&real.clone().decide()), Verdict::Check);
 
-    // THE DEFEND PROMPT'S OWN DEFENSE: the Buggy model ends the task there
-    // (the done reply to the check ended the job before Autopilot Cruise) —
-    // with or without work in the repository; the real decider waits the
-    // back-off the claim earned, then defends again, and its task is never
-    // done.
     for claim in [
         "OtherTurnClaim",
         "OtherTurnDirtyClaim",
@@ -508,19 +455,12 @@ fn tier1_the_buggy_model_is_refuted_by_the_real_decider() {
         assert!(m.action_enabled("Check", &st2));
     }
 
-    // A WORKER'S defend prompt after a continuation's short claim: the Buggy
-    // model holds it for the back-off (only the wait is on), the real
-    // decider types it at once — and waits only where nobody manages it.
     let path = ["Tasked", "Continue", "YieldClaim"];
     let (st, real) = walk(&m, &path, base);
     assert!(!buggy.action_enabled("Check", &st) && buggy.action_enabled("BackoffDue", &st));
     assert_eq!(verdict(&real.clone().decide()), Verdict::Check);
     let (_, real) = walk(&m, &path[1..], base);
     assert_eq!(verdict(&real.clone().decide()), Verdict::Wait);
-    // …and its question after a short yield is answered at once — but a
-    // worker that keeps asking is answered past its bound at the back-off's
-    // pace: the Buggy model answers its fourth short turn in a row at once,
-    // the real decider waits.
     let (_, real) = walk(&m, &["Tasked", "Continue", "YieldAsk"], base);
     assert_eq!(verdict(&real.clone().decide()), Verdict::Answer);
     let asks = [
@@ -532,9 +472,6 @@ fn tier1_the_buggy_model_is_refuted_by_the_real_decider() {
     assert!(buggy.action_enabled("Answer", &st) && !m.action_enabled("Answer", &st));
     assert_eq!(verdict(&real.clone().decide()), Verdict::Wait);
 
-    // AN OLD DONE (a journal's `DONE … rule=finished@v1`, a record's `done
-    // why=marker`): the Buggy model takes it on and rests; the real decider
-    // refuses it and defends the claim.
     let (st, mut real) = walk(&m, &["OtherTurnClaim"], base);
     let mut b = st.clone();
     assert!(buggy.fire("SeedOldDone", &mut b), "{st:?}");
@@ -543,10 +480,6 @@ fn tier1_the_buggy_model_is_refuted_by_the_real_decider() {
     assert!(!real.st.task_done());
     assert_eq!(verdict(&real.clone().decide()), Verdict::Check);
 
-    // THE TOKEN OVER A RUNNING SHELL: the Buggy model ends the task at the
-    // busy screen (the retired `finished_over_background`), or types the
-    // defend prompt into it; the real decider types nothing there, and the
-    // defend prompt at the idle screen the shell leaves.
     let (st, real) = walk(&m, &["OtherTurnClaimBg"], base);
     let mut b = st.clone();
     assert!(buggy.fire("FinishOverBackground", &mut b));

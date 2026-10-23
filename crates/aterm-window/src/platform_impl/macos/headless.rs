@@ -74,7 +74,7 @@ impl LoopState {
         self.control_flow.set(control_flow);
     }
 
-    pub(super) fn control_flow(&self) -> ControlFlow {
+    pub(super) const fn control_flow(&self) -> ControlFlow {
         self.control_flow.get()
     }
 
@@ -82,11 +82,11 @@ impl LoopState {
         self.exit.set(Some(0));
     }
 
-    pub(super) fn exiting(&self) -> bool {
+    pub(super) const fn exiting(&self) -> bool {
         self.exit.get().is_some()
     }
 
-    fn exit_code(&self) -> Option<i32> {
+    const fn exit_code(&self) -> Option<i32> {
         self.exit.get()
     }
 }
@@ -104,7 +104,7 @@ struct WakeSource {
 
 impl WakeSource {
     fn new() -> Self {
-        extern "C" fn perform(_: *mut c_void) {}
+        const extern "C" fn perform(_: *mut c_void) {}
         let identity = Box::new(0u8);
         let info = (&*identity as *const u8).cast_mut().cast::<c_void>();
         // SAFETY: a version-0 context whose `info` CoreFoundation only compares
@@ -169,11 +169,11 @@ impl<T: 'static> EventLoop<T> {
         })
     }
 
-    fn state(&self) -> &LoopState {
+    const fn state(&self) -> &LoopState {
         self.window_target.p.headless_state().expect("a headless EventLoop holds a headless target")
     }
 
-    pub(super) fn window_target(&self) -> &RootWindowTarget {
+    pub(super) const fn window_target(&self) -> &RootWindowTarget {
         &self.window_target
     }
 

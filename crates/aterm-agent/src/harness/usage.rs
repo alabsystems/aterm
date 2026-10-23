@@ -157,6 +157,7 @@ impl ModelSpend {
     }
 
     /// Add a message's token counts without counting another message — the
+    /// growth a streamed repeat of one id brings.
     fn add_tokens(&mut self, t: TokenUsage) {
         let sum = self.tokens().plus(&t);
         self.input = sum.input;
@@ -275,6 +276,7 @@ pub struct TranscriptUsage {
     /// Assistant rows with `isSidechain: true`; summed like any other.
     pub sidechain_rows: u64,
     /// The newest limit notice Claude Code wrote into the transcript, per
+    /// window it names ([`LimitNoticeRow`]).
     limit_notices: BTreeMap<String, LimitNoticeRow>,
     /// Unix seconds of the newest row the API served ([`Self::served_at`]).
     served_at: Option<i64>,
@@ -285,10 +287,14 @@ pub struct TranscriptUsage {
     /// Summed rows with no `timestamp`: in the totals, not in the series.
     unstamped: u64,
     /// Moves whenever the series or the working time does
+    /// ([`Self::generation`]).
     generation: u64,
 }
 
 /// The time Claude was working in one transcript: the union of its main
+/// chain's turns, each `[timestamp − durationMs, timestamp]` of the
+/// `{"type":"system","subtype":"turn_duration"}` row Claude Code writes at
+/// every turn's end.
 #[derive(Debug, Clone, Default)]
 struct BusySpans {
     /// Disjoint `[start, end)` spans in unix milliseconds, in time order.
@@ -379,6 +385,7 @@ impl TokenSeries {
     }
 
     /// Double the width, merging each aligned pair: bucket `i` goes to
+    /// `⌊i/2⌋`.
     fn coarsen(&mut self) {
         let Some(width) = self.width_s.checked_mul(2) else {
             return;
@@ -405,6 +412,7 @@ impl TokenSeries {
     }
 
     /// Widen the buckets to cover `lo..hi` (indices at the width), zeros in
+    /// the new ones.
     fn cover(&mut self, lo: i64, hi: i64) {
         while self.first > lo {
             self.buckets.push_front((0, 0));
@@ -559,6 +567,7 @@ pub(crate) fn row_time(obj: &Map) -> Option<i64> {
 }
 
 /// Unix milliseconds of a transcript row's own `timestamp`: [`row_time`]
+/// plus its fraction's first three digits (`YYYY-MM-DDTHH:MM:SS.sssZ`).
 fn row_time_ms(obj: &Map) -> Option<i64> {
     let stamp = obj.get("timestamp").and_then(Value::as_str)?;
     let secs = row_time(obj)?;
@@ -766,6 +775,7 @@ impl TranscriptUsage {
     }
 
     /// Put a summed row's `usage` (a new message's, or a repeat's growth) in
+    /// the series at its `timestamp`, else count it unplaced.
     fn note_series(&mut self, obj: &Map, usage: TokenUsage) {
         if usage.is_zero() {
             return;
@@ -778,6 +788,7 @@ impl TranscriptUsage {
     }
 
     /// Fold a `turn_duration` row: the turn `[timestamp − durationMs,
+    /// timestamp]`.
     fn note_turn(&mut self, obj: &Map) {
         if obj.get("isSidechain").and_then(Value::as_bool) == Some(true) {
             return;
@@ -897,6 +908,7 @@ impl TranscriptUsage {
     }
 
     /// The key `model`'s spend is filed under: its own id while fewer than
+    /// [`MAX_MODELS`] are held (or it is one of them), else [`OTHER_MODEL`].
     fn model_key<'a>(&self, model: &'a str) -> &'a str {
         if self.per_model.contains_key(model) || self.per_model.len() < MAX_MODELS {
             model
@@ -905,7 +917,7 @@ impl TranscriptUsage {
         }
     }
 
-    /// Sum one row's usage under `model`. A main-chain row naming a model id
+    /// Sum one row's usage under `model`.
     fn add(&mut self, model: &str, usage: TokenUsage, sidechain: bool) {
         if !sidechain && model != UNKNOWN_MODEL && super::upgrade::is_model_id(model) {
             self.last_model = Some(model.to_owned());
@@ -925,6 +937,9 @@ pub(crate) fn cannot_be_assistant(line: &str) -> bool {
 }
 
 /// The subtype of the row Claude Code writes at every turn's end: it is let
+/// past [`cannot_be_assistant`]'s cut the same way, by its literal bytes (a
+/// `\u`-escaped spelling is parsed anyway), and folded into
+/// [`TranscriptUsage::busy_ms`].
 const TURN_DURATION: &str = "turn_duration";
 
 /// Spend on one model, as the view shows it.
@@ -1062,6 +1077,7 @@ const PANEL_TITLES: [(&str, &str); 5] = [
 const PANEL_BLOCK_ROWS: usize = 7;
 
 /// The longest window key this reader will mint for an unmeasured display
+/// name, so a hostile or absurd title cannot grow the view's key space.
 const PANEL_KEY_CAP: usize = 40;
 
 /// A block-element glyph, the run the vendor draws its meter with.
@@ -1081,6 +1097,7 @@ fn pct_used(s: &str) -> Option<u32> {
 }
 
 /// The reset text after `Resets `, cut before the meter or the figure that
+/// can follow it on a wrapped row.
 fn reset_after(s: &str) -> Option<String> {
     let lower = s.to_ascii_lowercase();
     let at = lower.find("resets ")? + "resets ".len();
@@ -1103,6 +1120,7 @@ fn reset_after(s: &str) -> Option<String> {
 }
 
 /// Lowercase, non-alphanumeric runs folded to `_`, bounded: the key half of
+/// an unknown `Current week (<display name>)` title.
 fn panel_key_slug(display: &str) -> Option<String> {
     let mut out = String::new();
     for c in display.chars() {
@@ -1120,6 +1138,8 @@ fn panel_key_slug(display: &str) -> Option<String> {
 }
 
 /// The window key a panel title names, and what the title row carries after
+/// it (the narrow layout's ` · Resets …`, or the text form's
+/// `: 62% used · resets …`).
 fn panel_title(row: &str) -> Option<(String, &str)> {
     let t = row.trim();
     for (title, key) in PANEL_TITLES {
@@ -1235,6 +1255,7 @@ pub fn usage_panel_read(rows: &[String], header: usize) -> PanelRead {
 }
 
 /// The window keys a sample is made of ([`PANEL_TITLES`]: `Current session`
+/// and `Current week (all models)`).
 const SESSION_WINDOW: &str = "five_hour";
 const WEEK_WINDOW: &str = "seven_day";
 
@@ -1306,6 +1327,7 @@ pub fn model_short(id: &str) -> String {
 }
 
 /// Line-breaking characters become spaces: the HUD is one line of a status
+/// field.
 fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -1319,6 +1341,7 @@ fn sanitize(s: &str) -> String {
 }
 
 /// Cut a string to at most `max` bytes on a char boundary
+/// (`super::truncate_bytes`).
 fn truncate_to(mut s: String, max: usize) -> String {
     if s.len() <= max {
         return s;
@@ -1451,6 +1474,7 @@ mod tests {
     use super::*;
 
     /// The `/usage` panel as Claude Code 2.1.278 painted it in a 120-column
+    /// session.
     const PANEL_WIDE: &str = "   Settings  Status   Config   Usage   Stats
 
    Session
@@ -1476,6 +1500,8 @@ mod tests {
 ";
 
     /// The same panel at 56 columns (same session, resized): the reset wraps
+    /// onto the row under the title, and the meter, a blank and the figure
+    /// follow it.
     const PANEL_NARROW: &str = "   Current session · Resets 1:20pm
    (America/Los_Angeles)
    ███▊
@@ -1711,6 +1737,7 @@ mod tests {
     }
 
     /// A differing repeat raises each count to the largest seen for its id
+    /// and sums only the growth; the message counts once.
     #[test]
     fn transcript_differing_repeat_raises_to_the_largest_and_counts_once() {
         let mut t = TranscriptUsage::new();
@@ -1729,6 +1756,7 @@ mod tests {
     }
 
     /// An assistant row stamped `at` (RFC 3339) with `input` prompt tokens
+    /// (no cache) and `output`.
     fn stamped_row(id: &str, input: u64, output: u64, at: &str) -> String {
         format!(
             r#"{{"type":"assistant","timestamp":"{at}","isSidechain":false,"message":{{"id":"{id}","model":"m","usage":{{"input_tokens":{input},"output_tokens":{output}}}}}}}"#
@@ -1749,6 +1777,9 @@ mod tests {
     }
 
     /// EACH ROW IN THE MINUTE OF ITS OWN STAMP: buckets are a minute wide and
+    /// aligned to the epoch (the first starts on the minute, not at the
+    /// first row), rows of one minute share a bucket, a quiet minute is an
+    /// empty bucket, and the prompt counts its cache writes and reads.
     #[test]
     fn the_series_buckets_tokens_by_row_minute() {
         let mut t = TranscriptUsage::new();
@@ -1778,6 +1809,9 @@ mod tests {
     }
 
     /// A ROW PAST THE SPAN COARSENS, NEVER DROPS: the width doubles until
+    /// the span fits [`SERIES_BUCKETS`] (the bucket edges still on the
+    /// epoch's grid), whichever end the row lands past, and the buckets sum
+    /// to every row noted, out to the widest stamps an `i64` holds.
     #[test]
     fn the_series_coarsens_and_keeps_the_sum() {
         let base = unix("2026-10-19T00:00:00Z");
@@ -1806,6 +1840,9 @@ mod tests {
     }
 
     /// TWO WIDTHS MERGE EXACTLY: the finer series is coarsened to the wider
+    /// one's width (and both further while the union passes
+    /// [`SERIES_BUCKETS`]), so absorbing either into the other is the series
+    /// one fold of every row would hold.
     #[test]
     fn absorb_aligns_two_widths() {
         let base = unix("2026-10-19T09:00:00Z");
@@ -1850,6 +1887,7 @@ mod tests {
     }
 
     /// A REPEAT THAT GREW ADDS ITS GROWTH ALONE, in the bucket of the row
+    /// that carried it: the series sums as the totals do.
     #[test]
     fn a_grown_repeat_adds_only_its_growth() {
         let mut t = TranscriptUsage::new();
@@ -1870,6 +1908,8 @@ mod tests {
     }
 
     /// A ROW WITH NO STAMP is summed in the totals and counted, never placed
+    /// in the series; every summed row moves the generation, and a row that
+    /// sums nothing moves nothing.
     #[test]
     fn a_row_without_a_timestamp_counts_in_the_totals_not_the_series() {
         let mut t = TranscriptUsage::new();
@@ -1898,6 +1938,10 @@ mod tests {
     }
 
     /// COLUMNS SPREAD A BUCKET OVER THE CELLS ITS SPAN COVERS, in proportion
+    /// and rounded so every token lands in one column: a minute over three
+    /// columns is a third each, a window that ends inside a bucket (now,
+    /// mid-minute) holds that bucket's every token, and every width sums to
+    /// the series.
     #[test]
     fn columns_spread_and_keep_the_sum() {
         let start = unix("2026-10-19T12:00:00Z");
@@ -1949,6 +1993,9 @@ mod tests {
     }
 
     /// Working time is the union of the main chain's `turn_duration` turns: a
+    /// turn written late over the turns after it (a workflow's) counts once, a
+    /// sidechain's row not at all, and a row past the raw-byte cut is still
+    /// parsed.
     #[test]
     fn working_time_is_the_union_of_the_main_chains_turns() {
         let turn = |at: &str, ms: u64, side: bool| {
@@ -1972,6 +2019,8 @@ mod tests {
     }
 
     /// A subagent message streamed over three rows (`stop_reason` null with
+    /// the message_start output twice, then the final row) counts its final
+    /// output, 349, once.
     #[test]
     fn a_streamed_subagent_message_counts_its_final_output_once() {
         let row = |stop: &str, output: u64, block: &str| {
@@ -1995,6 +2044,8 @@ mod tests {
     }
 
     /// A limit notice written into the transcript (`model: <synthetic>`,
+    /// `isApiErrorMessage: true`, the notice as text, its own `timestamp`) is
+    /// kept per window it names, the newest one, with the reset its text names.
     #[test]
     fn a_limit_notice_row_is_kept_with_its_time() {
         let notice = |text: &str, ts: &str, api_error: bool| {
@@ -2058,6 +2109,7 @@ mod tests {
     }
 
     /// The selective parser still feeds the live footer wall, including when
+    /// flags and timestamps follow content or use escaped, duplicate keys.
     #[test]
     fn projected_usage_preserves_the_live_limit_wall_and_its_lift() {
         let at = |minute: u32| format!("2026-09-28T12:{minute:02}:00Z");
@@ -2113,6 +2165,7 @@ mod tests {
     }
 
     /// The served time is the newest response the API served: a row with usage
+    /// whose message is new or grew, or has no id.
     #[test]
     fn the_served_time_is_the_newest_served_response() {
         let at = |minute: u32| format!("2026-09-24T21:{minute:02}:00.000Z");
@@ -2161,6 +2214,7 @@ mod tests {
     }
 
     /// Which window a notice names: the screen's wall classes, narrowed to a
+    /// notice that says its window.
     #[test]
     fn a_notice_names_its_window_or_none() {
         for (text, want) in [
@@ -2255,6 +2309,8 @@ mod tests {
     }
 
     /// The one-hour writes are kept apart: 800 of the row's 1000 cache writes
+    /// are one-hour ones (`cache_creation.ephemeral_1h_input_tokens`, on Claude
+    /// Code 2.1.30x transcripts), which list higher than five-minute ones.
     #[test]
     fn one_hour_cache_writes_are_kept_apart() {
         let split = r#"{"type":"assistant","message":{"id":"msg_s","model":"m","usage":{"input_tokens":10,"cache_creation_input_tokens":1000,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":200,"ephemeral_1h_input_tokens":800},"output_tokens":0}}}"#;
@@ -2278,6 +2334,8 @@ mod tests {
     }
 
     /// The account's model is the one the newest main-chain row names: a
+    /// `/model` switch shows from the next answer, and a sidechain row on
+    /// another model does not move it.
     #[test]
     fn the_account_model_is_the_newest_main_chain_row_of_its_transcript() {
         let mut t = TranscriptUsage::new();
@@ -2307,6 +2365,7 @@ mod tests {
     }
 
     /// The session sum (`SessionUsage::total_fold`) names the main transcript's
+    /// model; a subagent's sidechain rows on another model do not move it.
     #[test]
     fn the_session_sum_names_the_main_transcripts_model() {
         let mut main = TranscriptUsage::new();
@@ -2334,6 +2393,8 @@ mod tests {
     }
 
     /// Claude Code's `<synthetic>` rows (an API error, the usage-limit notice,
+    /// `No response requested.`) carry usage and an id on the main chain but
+    /// leave the session's model as it was.
     #[test]
     fn a_synthetic_row_never_names_the_sessions_model() {
         let synthetic = r#"{"type":"assistant","isSidechain":false,"message":{"id":"msg_x","model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"You've hit your limit"}],"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#;
@@ -2369,6 +2430,7 @@ mod tests {
     }
 
     /// A usage tap reading fills the JSON's `windows` (schema 1) by the
+    /// vendor's name, with the reading's age.
     #[test]
     fn a_tap_reading_fills_the_windows_of_the_json() {
         let reading = crate::harness::tap::Reading {
@@ -2588,20 +2650,29 @@ mod tests {
     use aterm_phase::prompt::fixtures as fx;
 
     /// The one whole-screen capture of the panel on Claude Code 2.1.278 (the
+    /// vendor corpus's manifest records its digest): 46 rows at 56 columns,
+    /// the `▔` rule on row 3, the header on row 4, three windows in the narrow
+    /// layout, and the vendor's `↓` ending row 46 — the tail is under the fold.
     const SCREEN_2_1_278: &str =
         include_str!("../../tests/testdata/vendor/2.1.278/screen/usage.txt");
 
     /// The cancel hint as the panel draws it (three columns in), from the
+    /// anchor table.
     fn hint() -> String {
         format!("   {}", aterm_phase::anchor("prompt.cancel"))
     }
 
     /// The retry hint beside the cancel hint, as the 2.1.287 bundle composes
+    /// the row beside an enrich error or a failed load (read from the bundle,
+    /// not measured: the `settings:retry` key and word, the byline's ` · `).
     fn retry_hints() -> String {
         format!("   r to retry · {}", aterm_phase::anchor("prompt.cancel"))
     }
 
     /// Measured on 2.1.287 (`aterm_phase::prompt::fixtures::USAGE_SETTLED`,
+    /// 150x50, half a second after the Enter): the Usage tab settled and whole
+    /// on the grid — the session at 1 %, the week at 10 %, the Fable window at
+    /// 0 %, the cancel hint last.
     fn settled() -> Vec<String> {
         fx::screen(fx::USAGE_SETTLED)
     }
@@ -2614,6 +2685,9 @@ mod tests {
     }
 
     /// Composed, for the states no capture holds: the measured settled screen
+    /// ([`settled`]) with `between` drawn right above its hint row (each with
+    /// the blank row the tab's `gap` puts under it) and the hint row replaced
+    /// by `tail`.
     fn composed(between: &[&str], tail: &str) -> Vec<String> {
         let mut out = settled();
         let at = last_row(&out);
@@ -2655,6 +2729,9 @@ mod tests {
     }
 
     /// The measured screens whose tail is under the fold (2.1.278's capture;
+    /// 2.1.287 at 150x50 once the contributing block filled in, and at 110x32)
+    /// are the fullscreen Settings panel with the header on row 4, and read
+    /// `Fold` although the windows are on the grid.
     #[test]
     fn the_measured_screens_with_the_tail_under_the_fold_are_no_sample() {
         let screen = rows(SCREEN_2_1_278);
@@ -2706,6 +2783,8 @@ mod tests {
     }
 
     /// The header guard, compiled by the server's own row matcher
+    /// (`aterm_observe::row_matcher`, as `key if=` and `await gone` use it),
+    /// matches each measured screen's header row and no other.
     #[test]
     fn the_header_guard_matches_the_measured_header_and_no_copy_of_it() {
         for (what, screen) in [
@@ -2744,6 +2823,8 @@ mod tests {
     }
 
     /// Measured on 2.1.287: the whole tab on the grid, nothing unsettled, the
+    /// hint row last is `Settled` (150x50 while scanning, 150x80, and 60x50
+    /// narrow).
     #[test]
     fn a_whole_panel_with_nothing_unsettled_on_it_is_settled() {
         assert_eq!(figures(&read(&settled())), three(1, 10, 0));
@@ -2787,6 +2868,8 @@ mod tests {
     }
 
     /// Composed ([`composed`]): each enrich-error line the 2.1.287 bundle
+    /// draws is `Unsettled`, with the retry hint beside the cancel hint or
+    /// without.
     #[test]
     fn an_enrich_error_under_the_windows_is_unsettled() {
         let hints = retry_hints();
@@ -2812,6 +2895,9 @@ mod tests {
     }
 
     /// Composed: the measured head of the tab with the bundle's no-figures
+    /// state (`Loading usage data…`) or a failed load (`Error: <why>` over a
+    /// retry hint) in the plan-limits component's place is the Usage tab and
+    /// `Unsettled`.
     #[test]
     fn a_loading_or_failed_panel_is_unsettled() {
         let measured = settled();
@@ -2854,6 +2940,7 @@ mod tests {
     }
 
     /// The settled screen with a `↓` ending its hint row (composed), or cut
+    /// anywhere above its hint row, is `Fold`.
     #[test]
     fn a_panel_whose_tail_is_under_the_fold_is_no_sample() {
         let whole = settled();
@@ -2876,6 +2963,8 @@ mod tests {
     }
 
     /// Composed from the settled screen: the session alone, the session and
+    /// Fable without the week, and the week without the session are each
+    /// `Unsettled` under the hint row.
     #[test]
     fn a_whole_panel_missing_the_session_or_the_week_is_unsettled() {
         let whole = settled();
@@ -2913,6 +3002,8 @@ mod tests {
     }
 
     /// Composed: the measured rule and header over another tab's rows
+    /// (invented: the Status tab names the login, so no capture is committed)
+    /// is `NotUsage`, hint row or none.
     #[test]
     fn a_settings_panel_on_another_tab_is_not_the_usage_tab() {
         let measured = settled();
@@ -2947,6 +3038,9 @@ mod tests {
     }
 
     /// Measured on 2.1.287 under the inline renderer: the panel under its `─`
+    /// rule reads `Inline` (which the probe refuses to type under) with the
+    /// same figures, and once the main screen scrolled its rule and header
+    /// away there is no panel.
     #[test]
     fn the_inline_renderers_panel_is_told_from_the_fullscreen_one() {
         let inline = fx::screen(fx::USAGE_INLINE);
@@ -2967,9 +3061,12 @@ mod tests {
     }
 
     /// 9:20 PM on Oct 1 in the panel's zone (04:20 UTC on Oct 2): the
+    /// minute the measured 150x50 screens were read (their done row says
+    /// `done 9:20 PM`).
     const READ_AT: i64 = 1_790_914_800;
 
     /// The zone table of the tests: the measured panels' zone, on daylight
+    /// time that week; nothing else is known.
     fn zones(zone: &str, _at: i64) -> Option<i64> {
         (zone == "America/Los_Angeles").then_some(-7 * 3600)
     }
@@ -2983,6 +3080,8 @@ mod tests {
     }
 
     /// The settled panel's sample places each reset in the zone the panel
+    /// names, a bare clock time (`2am`) and a dated one (`Oct 8 at 9am`), not
+    /// at the machine's offset (here nine hours east).
     #[test]
     fn a_settled_panels_sample_places_each_reset_in_the_panels_zone() {
         let PanelRead::Settled(windows) = read(&settled()) else {
@@ -3018,6 +3117,8 @@ mod tests {
     }
 
     /// A reset further ahead than its window can be (the session's five hours
+    /// plus the stamp's skew, the week's eight days), one the grammar cannot
+    /// read, and none at all are `None`, the figure kept.
     #[test]
     fn a_reset_beyond_its_windows_bound_is_dropped_and_its_figure_kept() {
         let sample = |session: Option<&str>, week: Option<&str>| {
@@ -3061,6 +3162,8 @@ mod tests {
     }
 
     /// A figure nobody read is `None`, never `0`: a lone window gives only its
+    /// own figure, and windows that are neither (the Fable bucket, the spend
+    /// limit), or none, give no sample.
     #[test]
     fn a_window_that_was_not_read_gives_no_figure_and_none_gives_no_sample() {
         let week = window("seven_day", 10, Some("Oct 8 at 9am (America/Los_Angeles)"));

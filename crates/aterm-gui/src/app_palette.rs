@@ -10,6 +10,8 @@ use crate::palette::{
 };
 
 /// The `[keybindings]` action behind a menu action, if any: off macOS,
+/// [`App::palette_live`] shows each menu row's chord from the effective binding table (seeds
+/// plus the user's rebinds).
 #[cfg(not(target_os = "macos"))]
 fn menu_binding(action: crate::menu::MenuAction) -> Option<crate::keybinding::Action> {
     use crate::keybinding::Action as K;
@@ -46,7 +48,7 @@ fn menu_binding(action: crate::menu::MenuAction) -> Option<crate::keybinding::Ac
 }
 
 impl App {
-    /// Snapshot command metadata for exactly the active native view in `wid`. A terminal
+    /// Snapshot command metadata for exactly the active native view in `wid`.
     fn native_palette_scope(&self, wid: crate::WindowId) -> Option<NativeCommandScope> {
         let (instance, view) = self.active_native_view(wid)?;
         let generation = self.native_runtime.view_generation(view)?;
@@ -76,6 +78,7 @@ impl App {
     }
 
     /// The theme the configuration draws: what a standing preview will restore,
+    /// else what is installed.
     fn configured_theme_id(&self) -> &str {
         self.theme_preview
             .as_ref()
@@ -178,6 +181,9 @@ impl App {
     }
 
     /// The Tab-scoped palette's turn: a highlight that moved in the trial's
+    /// own window draws its theme on the trial's session only; with that
+    /// window's palette closed the trial ends and the session's prior theme
+    /// comes back.
     fn sync_tab_theme_trial(&mut self, trial_open: bool, change: Option<Option<String>>) {
         let Some(trial) = self.palette_tab_theme.clone() else {
             return;
@@ -254,6 +260,8 @@ impl App {
     }
 
     /// The name the configuration draws on the side the OS appearance picks
+    /// now: a plain name, the side of a `dark:…,light:…` pair, or Default
+    /// when it names none.
     fn configured_side_name(&self) -> String {
         crate::app_config::resolve_theme_name_value(
             self.config.theme.as_deref(),
@@ -307,7 +315,7 @@ impl App {
         self.palette_live_for_window(self.frontmost_window)
     }
 
-    /// Resolve content and window facts for the palette's own window. Update,
+    /// Resolve content and window facts for the palette's own window.
     fn palette_live_for_window(&self, wid: Option<crate::WindowId>) -> PaletteLive {
         let window = wid.and_then(|wid| self.windows.get(&wid));
         let has_selection = wid.is_some_and(|wid| {
@@ -415,6 +423,7 @@ impl App {
     }
 
     /// Whether the front window's active tab is split, so ⌘W closes a pane
+    /// rather than the tab (`close_active_tab`).
     #[cfg(any(target_os = "macos", test))]
     fn front_tab_split(&self) -> bool {
         self.front()
@@ -1218,6 +1227,7 @@ mod tests {
     }
 
     /// Find availability follows the focused content and its own query through
+    /// editing, acceptance and tab switches.
     #[test]
     fn find_availability_tracks_content_and_query_without_changing_documents() {
         use crate::app_search::SearchEdit;
@@ -1312,6 +1322,8 @@ mod tests {
     }
 
     /// `publish_menu_live` (what `validateMenuItem:` reads) derives each bit from the same fact
+    /// as `palette_live`: one tab greys the tab cycle, no selection greys Copy, serious mode
+    /// checks its row, and a split front tab titles ⌘W's row Close Pane.
     #[test]
     fn the_menu_bar_publishes_what_the_palette_resolves() {
         use crate::menu::{MenuAction, menu_live, native_live_title, set_menu_live};
@@ -1381,6 +1393,8 @@ mod tests {
     }
 
     /// A ⌘ chord is a command, never text: the key equivalents of rows the bar greys (⌘C with
+    /// no selection, ⇧⌘] with one tab, ⇧⌘T with nothing to reopen) reach `on_key` and type
+    /// nothing into an open palette's search.
     #[test]
     fn a_command_chord_never_types_into_the_palette_search() {
         use aterm_window::event::{ElementState, KeyEvent};
@@ -1431,6 +1445,7 @@ mod tests {
     }
 
     /// `find_next`/`find_prev` ship unseeded (F3 belongs to the program behind the PTY), so
+    /// their rows are blank until a user binds them, then show the chord.
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn find_again_rows_show_a_user_bound_chord() {
@@ -1806,6 +1821,9 @@ mod tests {
     }
 
     /// The palette's scrim rides beside a card-sized raster as a colour, never
+    /// baked into a window-sized one, so a keystroke rasterizes, compares and
+    /// uploads the card alone; and the theme picker's card carries none, so its
+    /// preview is seen undimmed (Windows; no scrim elsewhere).
     #[test]
     fn the_palette_scrim_is_a_layer_and_the_theme_picker_has_none() {
         let mut app = App::headless_for_test();
@@ -1846,6 +1864,8 @@ mod tests {
     }
 
     /// A theme change that is not an OS appearance flip (a colour-only reload, a program's
+    /// OSC 11 background) repaints an open card: its cache keys on the theme it paints with,
+    /// since the palette model and geometry do not change.
     #[test]
     fn open_palette_card_re_rasterizes_on_a_live_theme_swap() {
         let mut app = App::headless_for_test();
@@ -1899,6 +1919,7 @@ mod tests {
     }
 
     /// The durable side of a theme: the config lane's text and revision, the
+    /// requests queued for it, and the in-memory `theme`.
     fn durable(app: &App) -> (String, u64, usize, Option<String>) {
         let snapshot = app.native_config_service.snapshot();
         (
@@ -1921,6 +1942,7 @@ mod tests {
     }
 
     /// [`highlight`] in window `wid`'s palette, with `wid` brought to the
+    /// front (the palette keys act on the front window).
     fn highlight_in(app: &mut App, wid: WindowId, id: &str) {
         app.frontmost_window = Some(wid);
         fn front_palette(app: &App, wid: WindowId) -> &crate::palette::PaletteState {
@@ -1948,6 +1970,7 @@ mod tests {
     }
 
     /// `gruv` in the palette lists exactly the two Gruvbox themes among its
+    /// Theme rows, labelled by their names, their appearance the hint.
     #[test]
     fn palette_theme_filter_lists_both_gruvbox_rows() {
         let mut app = themed_app("theme = \"Dracula\"\n");
@@ -1984,6 +2007,7 @@ mod tests {
     }
 
     /// Highlighting a theme draws it everywhere once the turn's sync runs, and
+    /// writes nothing; Esc puts back exactly what was drawn, config untouched.
     #[test]
     fn palette_theme_highlight_previews_and_esc_reverts() {
         let mut app = themed_app("theme = \"Dracula\"\n");
@@ -2033,6 +2057,9 @@ mod tests {
     }
 
     /// Spec `session-theme-install`: Choose Tab Theme… draws the highlighted
+    /// theme on the front session only — no instance preview, nothing written
+    /// — Esc puts the tab's previous theme back, and Enter keeps the row as
+    /// the tab's own theme.
     #[test]
     fn choose_tab_theme_draws_on_the_tab_and_esc_or_enter_settle_it() {
         let mut app = themed_app("theme = \"Dracula\"\n");
@@ -2085,6 +2112,8 @@ mod tests {
     }
 
     /// Spec `session-theme-carry`: a layout captured while Choose Tab Theme…
+    /// is open writes the tab's theme from before the trial, not the
+    /// tentative highlight; once Enter keeps the row, the row is written.
     #[test]
     fn a_layout_captured_mid_trial_keeps_the_prior_tab_theme() {
         let mut app = themed_app("theme = \"Dracula\"\n");
@@ -2118,6 +2147,7 @@ mod tests {
     }
 
     /// Spec `session-theme-install`: a Choose Tab Theme… trial belongs to the
+    /// window whose palette opened it.
     #[test]
     fn a_tab_theme_trial_answers_only_to_its_own_window() {
         let mut app = themed_app("theme = \"Dracula\"\n");
@@ -2184,6 +2214,7 @@ mod tests {
     }
 
     /// Opening a second Tab-theme trial must retire the first trial rather
+    /// than make its highlight permanent.
     #[test]
     fn a_second_tab_theme_trial_reverts_the_first_windows_unkept_highlight() {
         let setup = || {
@@ -2252,6 +2283,7 @@ mod tests {
     }
 
     /// A highlight that leaves the Theme section, or a palette closed some other way (another
+    /// overlay took the slot), reverts at the next turn's sync.
     #[test]
     fn palette_theme_preview_ends_when_the_highlight_or_the_palette_goes() {
         let mut app = themed_app("theme = \"Dracula\"\n");
@@ -2291,6 +2323,8 @@ mod tests {
     }
 
     /// Negative control: moving over rows that are not themes never touches the
+    /// preview lane, and a `theme preview` from the socket survives a palette
+    /// whose highlight did not move.
     #[test]
     fn palette_non_theme_rows_leave_the_preview_lane_alone() {
         let mut app = themed_app("theme = \"Dracula\"\n");
@@ -2329,6 +2363,8 @@ mod tests {
     }
 
     /// Enter on a Theme row attempts exactly one write and keeps nothing it
+    /// could not save: headless has no event-loop proxy, so the one attempt is
+    /// refused, said once, and the screen returns to the configured theme.
     #[test]
     fn palette_theme_enter_attempts_one_write_and_reverts_when_refused() {
         let mut app = themed_app("theme = \"Dracula\"\n");
@@ -2350,6 +2386,7 @@ mod tests {
     }
 
     /// View ▸ Choose Theme… (and the `choose_theme` key) opens the palette scoped to its Theme
+    /// section, the cursor on the configured theme, which is not re-installed.
     #[test]
     fn choose_theme_opens_the_scoped_palette_on_the_configured_theme() {
         let mut app = themed_app("theme = \"Nord\"\n");
@@ -2385,7 +2422,7 @@ mod tests {
         assert!(crate::keybinding::ACTION_NAMES.contains(&"choose_theme"));
     }
 
-    /// A press shaped like the platform's, through the shipping `on_key`. `text` is
+    /// A press shaped like the platform's, through the shipping `on_key`.
     fn press_key(
         app: &mut App,
         mods: aterm_window::keyboard::ModifiersState,
@@ -2444,6 +2481,7 @@ mod tests {
     }
 
     /// THE PALETTE FILTER HONOURS READLINE EDITING, like the find bar and the inline
+    /// rename (one keymap, `app_input::field_edit_action`).
     #[test]
     fn the_filter_takes_the_readline_chords_instead_of_typing_their_letters() {
         let mut app = App::headless_for_test();
@@ -2474,6 +2512,8 @@ mod tests {
     }
 
     /// Typing, Backspace, the word kills, Up/Down, Enter and Escape keep their
+    /// meaning, and Ctrl WITH Alt still types what it composes (Windows'
+    /// LeftCtrl+LeftAlt spelling of AltGr: de-DE `@`).
     #[test]
     fn typing_navigation_and_the_named_keys_still_drive_the_palette() {
         use aterm_window::keyboard::{Key, KeyCode, ModifiersState, NamedKey, SmolStr};
@@ -2570,7 +2610,7 @@ mod tests {
         );
     }
 
-    /// A held chord repeats what its press did: a held `^W` keeps deleting words. Its
+    /// A held chord repeats what its press did: a held `^W` keeps deleting words.
     #[test]
     fn a_held_readline_chord_repeats_its_edit_not_its_letter() {
         use aterm_window::keyboard::{Key, KeyCode, ModifiersState, SmolStr};
@@ -2610,7 +2650,7 @@ mod tests {
         assert_eq!(query(&app), "");
     }
 
-    /// A DRIVEN PALETTE EDITS ITS FILTER AS A TYPED ONE DOES. Each chord starts from
+    /// A DRIVEN PALETTE EDITS ITS FILTER AS A TYPED ONE DOES.
     #[test]
     fn a_driven_palette_edits_its_filter_as_a_typed_one_does() {
         use aterm_window::keyboard::{Key, KeyCode, ModifiersState as M, NamedKey, SmolStr};
@@ -2730,6 +2770,9 @@ mod tests {
     }
 
     /// The engine projection of the field keymap reads the arms a caret-less filter
+    /// cannot show (the motions, ⌘⌫) as the winit projection does: a sample of each
+    /// arm, and Ctrl+Alt (Windows' AltGr) composing its layout glyph in the palette
+    /// rather than reading as a readline chord.
     #[test]
     fn the_engine_key_projection_reads_the_field_keymap() {
         use crate::app_input::field_edit_action_engine;

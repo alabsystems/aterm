@@ -2,33 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Releasing an input writer blocked inside a synchronous write.
-//!
-//! ConPTY's input is an anonymous pipe, so a write to a program that has
-//! stopped reading blocks inside `WriteFile` until the console host reads
-//! again, and nothing the writer's own loop checks between calls reaches it
-//! there. So every input write is made through [`Registry::write`]: the writer
-//! is registered for the length of the write, tagged with its session and with
-//! the stop flag of the frame it writes (a metered paste's), and a sever of the
-//! session ([`Registry::sever`]) or a stop of the frame ([`Registry::stopped`])
-//! cancels it ([`Blocked::cancel`]: `CancelSynchronousIo` on Windows). The
-//! write then answers what it wrote, and the writer's own loop ends the frame.
-//!
-//! Two races, both closed here:
-//! - A cancel can come after the writer last looked at its flags and before
-//!   its write has reached the kernel, and then finds nothing to cancel. So a
-//!   writer registers BEFORE it reads its flags, a canceller sets its flag
-//!   BEFORE it looks at the registry, and a cancel that finds its writer
-//!   registered but not yet blocked tries again ([`Registry::release`]) until
-//!   the write was cancelled or the writer has left. The registry's mutex
-//!   orders the writer's entry against the canceller's look, so one of the two
-//!   always sees the other.
-//! - A cancel must never land on a later write. It is issued only under the
-//!   registry's lock, to a writer still registered, and a registered writer
-//!   does nothing between its entry and its leave but read its flags and make
-//!   the one write.
-//!
-//! Platform-free over [`Blocked`], so the unix suite runs it against a
-//! stand-in thread; only the Windows backend uses it.
 
 use std::io;
 use std::sync::Mutex;
@@ -39,8 +12,7 @@ use aterm_types::MutexExt;
 
 /// A registered writer's thread, which a cancel can release from its write.
 pub(crate) trait Blocked {
-    /// Cancel the synchronous write this thread is blocked in: `true` when one
-    /// was cancelled, `false` when it is not inside one (not yet, or no longer).
+    /// Cancels the synchronous write this thread is blocked in.
     fn cancel(&self) -> bool;
 }
 
@@ -59,7 +31,7 @@ struct Writers<T> {
     entries: Vec<Entry<T>>,
 }
 
-/// The writers inside a synchronous input write now.
+/// Registry of writers currently inside a synchronous input write.
 pub(crate) struct Registry<T> {
     writers: Mutex<Writers<T>>,
 }
@@ -84,7 +56,7 @@ fn stop_tag(stop: &AtomicBool) -> usize {
 }
 
 impl<T: Blocked> Registry<T> {
-    /// An empty registry.
+    /// Creates an empty registry.
     pub(crate) const fn new() -> Self {
         Self {
             writers: Mutex::new(Writers {
@@ -94,13 +66,7 @@ impl<T: Blocked> Registry<T> {
         }
     }
 
-    /// Make one write on `session` where a sever or a stop can release it:
-    /// register `thread`, then read the flags, and run `write` only when
-    /// neither `severed` nor `stop` is set. A barred write answers `Ok(0)`
-    /// without writing; a released one answers what `write` answers for a
-    /// cancelled call. `thread` is `None` when the writer has no handle a
-    /// cancel can use: its write is barred by the flags all the same, but a
-    /// write already blocked runs to its end.
+    /// Registers `thread` before checking `severed`/`stop`, then runs `write` if neither is set.
     pub(crate) fn write(
         &self,
         session: usize,
@@ -138,16 +104,13 @@ impl<T: Blocked> Registry<T> {
             .retain(|e| e.id != id);
     }
 
-    /// Bar every later write on `session` and answer the writes in flight
-    /// there, for [`Self::release`]: the session's input is severed for good.
+    /// Bars later writes on `session` and returns in-flight write IDs for [`Self::release`].
     pub(crate) fn sever(&self, session: usize, severed: &AtomicBool) -> Vec<u64> {
         severed.store(true, Ordering::Release);
         self.pick(|e| e.session == session)
     }
 
-    /// The writes in flight of the frame whose stop flag is `stop`, for
-    /// [`Self::release`]. The caller has set the flag, so a write of the frame
-    /// that registers after this look writes nothing.
+    /// Returns in-flight write IDs tagged with `stop` for [`Self::release`].
     pub(crate) fn stopped(&self, stop: &AtomicBool) -> Vec<u64> {
         let tag = stop_tag(stop);
         self.pick(|e| e.stop == tag)
@@ -162,9 +125,7 @@ impl<T: Blocked> Registry<T> {
             .collect()
     }
 
-    /// One pass over `ids`, under the lock: each still registered is
-    /// cancelled, and kept when it is not blocked yet (the cancel found
-    /// nothing). A writer that left, or whose write was cancelled, is dropped.
+    /// Cancels each still-registered writer in `ids`, retaining those not yet blocked.
     pub(crate) fn cancel_round(&self, ids: &mut Vec<u64>) {
         let w = self.writers.lock_or_recover();
         ids.retain(|id| {
@@ -175,11 +136,7 @@ impl<T: Blocked> Registry<T> {
         });
     }
 
-    /// Cancel each of `ids` until its write was cancelled or it has left,
-    /// trying again every `step`, for at most `bound`: a writer registered
-    /// but not yet blocked enters its write within a scheduling quantum, and
-    /// one that will not write (its flag was set) leaves as soon. `true` when
-    /// every one was released.
+    /// Repeatedly cancels `ids` every `step` up to `bound` until all are cancelled or have left.
     pub(crate) fn release(&self, mut ids: Vec<u64>, step: Duration, bound: Duration) -> bool {
         let start = Instant::now();
         loop {
@@ -403,7 +360,6 @@ mod tests {
             );
             thread::spawn(move || {
                 r.write(1, &sv, Some(&st), Some(me.clone()), || {
-                    // Past the flag check, not yet blocked.
                     *at_gate.0.lock_or_recover() = true;
                     at_gate.1.notify_all();
                     let open = gate.0.lock_or_recover();
@@ -434,7 +390,6 @@ mod tests {
             let r = Arc::clone(&registry);
             thread::spawn(move || r.release(ids, Duration::from_millis(1), HANG))
         };
-        // Let the writer block only once a cancel has missed it.
         let missed = {
             let p = stand.0.phase.lock_or_recover();
             let (p, _) = stand
@@ -471,7 +426,6 @@ mod tests {
         assert_eq!(wrote.expect("barred"), 0);
         assert!(!called);
 
-        // Negative control: with neither flag set the write is made.
         let clear = AtomicBool::new(false);
         let wrote = registry.write(1, &severed, Some(&clear), Some(Stand::new()), || Ok(3));
         assert_eq!(wrote.expect("write"), 3);

@@ -29,6 +29,8 @@ const CARET: usize = 21;
 const TOP: usize = 20;
 
 /// The session runs Claude Code 2.1.304 (process [`PGID`]): its facts
+/// published, its reader Claude's — the key's rows need a build newer than
+/// 2.1.303.
 fn claude(app: &App, session: u64) {
     claude_on(app, session, "Opus 5.5");
 }
@@ -54,6 +56,8 @@ fn claude_on(app: &App, session: u64, model: &str) {
 }
 
 /// The gesture rig's App ([`app`]) running Claude Code ([`claude`]), its
+/// PTY master non-blocking as every production session's is: the fenced
+/// write takes a frame whole or not at all, and only on such a master.
 fn rig() -> (App, WindowId, u64, std::os::unix::net::UnixStream) {
     let (app, wid, session, reader) = app();
     let sink = &app.pool.get(session).expect("session").ctx.sink;
@@ -71,6 +75,7 @@ fn idle() -> (App, WindowId, u64, std::os::unix::net::UnixStream) {
 }
 
 /// Claude's composer echoes `text` at the caret row `caret`, the cursor
+/// after it.
 fn echo(app: &App, session: u64, caret: usize, text: &str) {
     let col = 3 + text.chars().count();
     feed(
@@ -85,6 +90,7 @@ fn echo(app: &App, session: u64, caret: usize, text: &str) {
 }
 
 /// Claude ran the command: its top rule at row `top` with the key's tag
+/// (`tag`) or without, the composer empty under it, the cursor at the caret.
 fn answered(app: &App, session: u64, top: usize, tag: bool) {
     let w = cols(app, session);
     let rule = if tag {
@@ -108,6 +114,8 @@ fn answered(app: &App, session: u64, top: usize, tag: bool) {
 }
 
 /// A MEASURED 2.1.304 screen (`aterm-phase`'s fixtures) on the engine,
+/// resized to its 120x40, the stand-in `workspace` replaced by the key and
+/// the cursor at its caret (column 2) — `edit` changing its rows first.
 fn draw_measured(
     app: &mut App,
     wid: WindowId,
@@ -206,6 +214,7 @@ fn menu_offers(app: &App, part: &str) -> bool {
 }
 
 /// A press of `slash` through to its Enter on the hand-drawn composer:
+/// the probe, its echo, the rest, its echo, the quiet window.
 fn through_enter(
     app: &mut App,
     wid: WindowId,
@@ -228,6 +237,11 @@ fn through_enter(
 }
 
 /// THE MENU ROW'S PRESS, WRITE BY WRITE: `Turn <key> on for this session`
+/// writes the probe `/` alone as the PERSON's (the person clock moves by
+/// one), then — once the composer reads it back — the rest of the command
+/// as aterm's own, then nothing until the whole command has read back and
+/// held still for the quiet window, then aterm's Enter; Claude's tag on the
+/// top rule ends it with its notice, and the footer is read at once.
 #[test]
 fn a_menu_row_types_the_command_as_the_persons_and_enters_after_the_echo() {
     let (mut app, wid, session, mut reader) = idle();
@@ -278,9 +292,15 @@ fn a_menu_row_types_the_command_as_the_persons_and_enters_after_the_echo() {
 }
 
 /// One guard's case: a name, what makes the idle session refuse, and the
+/// refusal it names.
 type Case = (&'static str, fn(&mut App, WindowId, u64), SlashRefusal);
 
 /// EVERY GUARD TYPES NOTHING AND SAYS WHY: a draft, a turn in flight, a
+/// permission box, Claude's model picker and effort slider, the `!` shell box, a survey, a
+/// view scrolled into history, a halted session, a parked one, another
+/// driver's lease, vim INSERT's prefix before the pill, a pane no Claude
+/// Code runs in — each writes no byte and moves no person clock, and says
+/// its refusal in the title slot.
 #[test]
 fn each_guard_types_nothing_and_names_why() {
     let cases: [Case; 13] = [
@@ -446,6 +466,8 @@ fn each_guard_types_nothing_and_names_why() {
 }
 
 /// THE PERSON'S KEY STOPS IT, AND NOTHING IS ERASED: the person types after
+/// the command read back — no Enter goes, nothing is written to take the
+/// text back, and the title says so.
 #[test]
 fn no_enter_after_the_person_types() {
     for person in [true, false] {
@@ -485,6 +507,9 @@ fn no_enter_after_the_person_types() {
 }
 
 /// A GESTURE THAT REACHES NO PROGRAM LEAVES THE PRESS RUNNING: a click on
+/// the transcript while the press runs is the person's — counted — but
+/// with Claude's mouse tracking off it is a selection's, which Claude's
+/// composer never sees, so it stops nothing and aterm's Enter still goes.
 #[test]
 fn a_gesture_that_reaches_no_program_leaves_the_press_running() {
     for tracked in [false, true] {
@@ -530,6 +555,11 @@ fn a_gesture_that_reaches_no_program_leaves_the_press_running() {
 }
 
 /// A DOUBLE-CLICK ON A TYPED MENU ROW TYPES THE COMMAND THROUGH: the first
+/// press chooses `Turn <key> on for this session` and closes the menu; the
+/// second, on the card it closed and within the system's double-click
+/// interval, is the same gesture's — spent there, never a press on
+/// Claude's grid, which is tracked here (SGR 1000/1006), so it would be
+/// reported to Claude as the person's hand and stop the press.
 #[test]
 fn a_double_click_on_a_typed_menu_row_types_through_to_the_enter() {
     let slash = Slash::TopEffort(true);
@@ -595,6 +625,10 @@ fn a_double_click_on_a_typed_menu_row_types_through_to_the_enter() {
 }
 
 /// THE ENTER IS FENCED AT THE CURSOR'S ROW: where the composer wraps the
+/// command onto a second row (`❯ /effort <key>`, then `  on`, the cursor
+/// after it, as a narrow pane draws it), the whole command reads back and
+/// aterm's Enter goes — its guard the row the cursor stands on, which the
+/// fence matches at the cursor.
 #[test]
 fn a_command_the_composer_wraps_gets_its_enter() {
     let slash = Slash::TopEffort(true);
@@ -630,6 +664,9 @@ fn a_command_the_composer_wraps_gets_its_enter() {
 }
 
 /// A STOP AFTER THE PROBE NAMES THE `/` IT LEFT: a survey drawn, or a box
+/// over the composer, after the probe read back holds the rest and, past
+/// the probe's deadline, stops the press — saying the `/` aterm typed is
+/// left in the composer, never "nothing typed".
 #[test]
 fn a_stop_after_the_probe_names_the_slash_it_left() {
     let survey = "\x1b[18;1H\u{25CF} How is Claude doing this session? (optional)\
@@ -675,6 +712,9 @@ fn a_stop_after_the_probe_names_the_slash_it_left() {
 }
 
 /// THE SESSION'S HOLDS ARE ASKED BEFORE EVERY WRITE, not at the click
+/// alone: another driver's lease, a halt or a park taken after the rest
+/// went stops the press before its Enter — named, the command left where
+/// it is.
 #[test]
 fn a_hold_taken_mid_press_stops_it_before_the_enter() {
     type Hold = fn(&mut App, u64);
@@ -931,6 +971,9 @@ fn a_hold_taken_mid_press_stops_it_before_the_enter() {
 }
 
 /// A PRESS ARMS ONE WAKE AT A TIME: the click arms its poll alone — its
+/// pending words ride the press's own wakes, and its end replaces them —
+/// and Claude's answer ends it with one wake, for its notice's end (no
+/// second one for the same instant).
 #[test]
 fn a_press_arms_one_wake_at_a_time() {
     let (mut app, wid, session, mut reader) = idle();
@@ -992,6 +1035,8 @@ fn a_press_arms_one_wake_at_a_time() {
 }
 
 /// A SCREEN THAT MOVES BETWEEN THE CLICK'S READ AND ITS WRITE: the fenced
+/// write is refused (the generation moved), the engine is read once more,
+/// and the box that drew meanwhile refuses the press — no byte written.
 #[test]
 fn a_screen_that_moves_between_read_and_write_writes_nothing() {
     for (bytes, typed) in [
@@ -1049,6 +1094,8 @@ fn a_screen_that_moves_between_read_and_write_writes_nothing() {
 }
 
 /// ONE ATERM INPUT PER SESSION: a mode return in flight refuses the press,
+/// and a press in flight refuses the mode light's click, each typing
+/// nothing.
 #[test]
 fn one_aterm_input_per_session() {
     let (mut app, wid, session, mut reader) = idle();
@@ -1096,6 +1143,9 @@ fn one_aterm_input_per_session() {
 }
 
 /// AN ECHO THAT DIFFERS GETS NO ENTER AND IS LEFT: a probe that reads back
+/// as other text stops the press before the rest; a command that reads
+/// back as other text stops it before the Enter, naming what the composer
+/// holds.
 #[test]
 fn an_echo_that_differs_gets_no_enter_and_is_left() {
     let slash = Slash::TopEffort(false);
@@ -1132,6 +1182,9 @@ fn an_echo_that_differs_gets_no_enter_and_is_left() {
 }
 
 /// THE PICKER IS THE PERSON'S: `Change model…  /model` types `/model`, its
+/// Enter waits for Claude's slash menu to point at `/model` itself (the
+/// measured menu over the top rule, whose `❯` is no caret), and the picker
+/// that replaces the composer ends the press — aterm presses nothing in it.
 #[test]
 fn an_open_picker_ends_the_press_and_aterm_presses_nothing_more() {
     for pointed in ["/model", "/code-review"] {
@@ -1189,6 +1242,9 @@ fn an_open_picker_ends_the_press_and_aterm_presses_nothing_more() {
 }
 
 /// A BACKGROUND AGENT'S WAIT IS NO LIVE TURN (MEASURED on 2.1.304): with one
+/// agent backgrounded the turn has ended, though the screen reads busy for
+/// the agent's whole life (`✻ Waiting for 1 background agent to finish`) —
+/// the press types.
 #[test]
 fn a_background_agents_wait_is_no_live_turn() {
     const PANEL: &str =
@@ -1219,6 +1275,7 @@ fn a_background_agents_wait_is_no_live_turn() {
 }
 
 /// Claude Code's mode row, `mode`, drawn anew with the cursor put back
+/// after the probe's echo (`❯ /`).
 fn mode_row_after_probe(app: &App, session: u64, mode: &str) {
     feed(
         app,
@@ -1228,6 +1285,10 @@ fn mode_row_after_probe(app: &App, session: u64, mode: &str) {
 }
 
 /// A TURN THAT GOES LIVE AFTER THE PROBE HOLDS THE REST (a background
+/// agent's end starts one with no key of the person's): the probe read
+/// back, nothing more is written while the turn runs — the rest follows
+/// once it ends, and a turn that outlasts the probe's deadline stops the
+/// press, named, the `/` left as it is.
 #[test]
 fn a_turn_that_goes_live_after_the_probe_holds_the_rest() {
     let slash = Slash::TopEffort(true);
@@ -1267,6 +1328,9 @@ fn a_turn_that_goes_live_after_the_probe_holds_the_rest() {
 }
 
 /// THE SLASH MENU IS READ ON EITHER SIDE OF THE COMPOSER: the inline
+/// renderer draws it UNDER the bottom rule in the mode row's place
+/// (MEASURED on 2.1.304, `/model` typed: the command pointed), the
+/// fullscreen one OVER the top rule.
 #[test]
 fn the_slash_menu_is_read_on_either_side_of_the_composer() {
     use crate::claude_slash::slash_menu;
@@ -1311,6 +1375,9 @@ fn the_slash_menu_is_read_on_either_side_of_the_composer() {
 }
 
 /// A BARE COMMAND'S ENTER WAITS FOR THE MENU UNDER THE COMPOSER TO POINT
+/// AT IT: on the inline renderer the slash menu takes the mode row's place
+/// (MEASURED on 2.1.304), and Enter runs its pointed entry — so `/model`
+/// gets aterm's Enter only while `/model` itself is pointed there.
 #[test]
 fn a_bare_commands_enter_waits_for_the_menu_under_the_composer() {
     for pointed in ["/model", "/code-review"] {
@@ -1345,6 +1412,8 @@ fn a_bare_commands_enter_waits_for_the_menu_under_the_composer() {
 }
 
 /// VIM NORMAL MODE DRAWS NOTHING (MEASURED on 2.1.304) and runs keys as
+/// motions — there the whole command once left `rt <key> on` on a new
+/// line.
 #[test]
 fn vim_normal_takes_the_probe_as_nothing_and_the_press_stops_untouched() {
     const NORMAL: &str =
@@ -1380,6 +1449,11 @@ fn vim_normal_takes_the_probe_as_nothing_and_the_press_stops_untouched() {
 }
 
 /// VIM INSERT IS REFUSED BY ITS OWN CHECK (MEASURED on 2.1.304: `  --
+/// INSERT -- ⏵⏵ auto mode on (shift+tab to cycle)`): on each of the three
+/// measured INSERT screens — at launch, after NORMAL's motions left `rt <key>
+/// on` and INSERT on, and under Claude's `needs dynamic workflows` answer —
+/// the lights read the pill as auto mode, yet the press types nothing, moves
+/// no person clock and names `NotReady`.
 #[test]
 fn vim_insert_is_refused_by_its_own_check_and_normal_is_not() {
     for (name, text) in [
@@ -1428,6 +1502,9 @@ fn vim_insert_is_refused_by_its_own_check_and_normal_is_not() {
 }
 
 /// CLAUDE'S REFUSAL LATCHES THE KEY OFF FOR THE MODEL: the measured
+/// `isn't available on <model>` answer stops the press naming the model's
+/// ID, and the effort menu offers the key no more; the measured `needs
+/// dynamic workflows` answer the same.
 #[test]
 fn claudes_refusal_latches_the_key_row_for_that_model() {
     for (answer, why, says) in [
@@ -1472,6 +1549,7 @@ fn claudes_refusal_latches_the_key_row_for_that_model() {
 }
 
 /// A REFUSED MENU ROW KEEPS ITS MENU: the press refused (a draft) leaves
+/// the menu open, rebuilt under a note naming why, its typed rows off.
 #[test]
 fn a_refused_menu_row_keeps_its_menu_under_a_note() {
     let (mut app, wid, session, mut reader) = idle();
@@ -1584,6 +1662,8 @@ fn drive_slash_action<T>(action: &str, drive: impl FnOnce() -> T) -> T {
 }
 
 /// Fire `action` on the model, then check the App's projected state is a
+/// transition the model allows — and that `historical` (the retired
+/// behaviour's post-state, where given) is one it does NOT.
 fn check_slash_transition(
     app: &App,
     wid: WindowId,
@@ -1625,7 +1705,7 @@ fn check_slash_transition(
     }
 }
 
-/// TIER-1: the genuine press against `claude_slash_press_model`. The happy
+/// TIER-1: the genuine press against `claude_slash_press_model`.
 #[test]
 fn the_slash_press_conforms_to_its_model() {
     let model = aterm_models_gui::claude_slash_press_model();

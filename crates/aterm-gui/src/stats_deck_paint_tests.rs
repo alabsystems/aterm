@@ -749,11 +749,11 @@ fn no_text_overlaps_and_none_leaves_the_card() {
         let (w, h) = (d.w, deck_pt(d.form, d.s));
         let mut why = Vec::new();
         let boxes = &d.laid.boxes;
-        let names = Resource::ALL
+        let names = DECK_RESOURCES
             .iter()
             .filter(|&&r| boxes.iter().any(|b| b.text == words::resource_name(r)))
             .count();
-        if d.laid.head.is_some() && names < Resource::ALL.len() {
+        if d.laid.head.is_some() && names < DECK_RESOURCES.len() {
             why.push(format!("CONTROL: {names} rows named"));
         }
         for b in boxes {
@@ -976,7 +976,7 @@ fn strips(w: f64, form: DeckForm, m: &FaceMetrics) -> Vec<StripRows> {
     match form {
         DeckForm::Full => {
             let p = plan::plan_full(w, m);
-            let rows = Resource::ALL
+            let rows = DECK_RESOURCES
                 .iter()
                 .copied()
                 .zip(0_u32..)
@@ -989,7 +989,7 @@ fn strips(w: f64, form: DeckForm, m: &FaceMetrics) -> Vec<StripRows> {
                 .iter()
                 .enumerate()
                 .map(|(bi, b)| {
-                    let rows = Resource::ALL
+                    let rows = DECK_RESOURCES
                         .iter()
                         .copied()
                         .skip(bi * 4)
@@ -1184,7 +1184,7 @@ fn rule_s(
 fn state_is_said_in_words_without_details() {
     let m = FaceMetrics::helvetica_neue();
     let snap = scene(Scene::Trouble);
-    let states: Vec<Resource> = Resource::ALL
+    let states: Vec<Resource> = DECK_RESOURCES
         .iter()
         .copied()
         .filter(|&r| words::state(r, &snap, &MAC).is_some())
@@ -1200,7 +1200,7 @@ fn state_is_said_in_words_without_details() {
             continue;
         }
         let col = p.amount.unwrap_or_else(|| panic!("{at}: an amount column"));
-        for (i, &res) in Resource::ALL.iter().enumerate() {
+        for (i, &res) in DECK_RESOURCES.iter().enumerate() {
             if states.contains(&res) {
                 rule_s(&laid, &m, &snap, res, col, p.rows, i as u32, &at);
                 said += 1;
@@ -1217,7 +1217,7 @@ fn state_is_said_in_words_without_details() {
             .as_ref()
             .unwrap_or_else(|| panic!("{at}: a header"));
         for (bi, b) in p.blocks.iter().enumerate() {
-            let ours: Vec<(u32, Resource)> = Resource::ALL
+            let ours: Vec<(u32, Resource)> = DECK_RESOURCES
                 .iter()
                 .copied()
                 .skip(bi * 4)
@@ -1375,7 +1375,7 @@ fn hit_map() {
         let mut cols = vec![p.name, strip_col(p.strip)];
         cols.extend([p.pct, p.bar, p.amount, p.details].into_iter().flatten());
         let scopes = p.aterm.zip(p.tab);
-        for (i, &res) in Resource::ALL.iter().enumerate() {
+        for (i, &res) in DECK_RESOURCES.iter().enumerate() {
             check_row(hits, s, res, p.rows, i as u32, &cols, scopes, &at);
         }
         let header = hit_at(hits, p.strip.x + 20.0, 6.0, s);
@@ -1383,7 +1383,7 @@ fn hit_map() {
         let cores = match p.cores {
             CoresAt::Block { at, .. } => hit_at(hits, at.x + 2.0, 40.0, s),
             CoresAt::Row(room) => {
-                let y = p.rows.top(7) + p.rows.cell / 2.0;
+                let y = p.rows.top(DECK_RESOURCES.len() as u32) + p.rows.cell / 2.0;
                 hit_at(hits, room.x + 2.0, y, s)
             }
         };
@@ -1404,7 +1404,7 @@ fn hit_map() {
             let mut cols = vec![b.name, strip_col(b.strip)];
             cols.extend([b.pct, b.bar, b.amount, b.details].into_iter().flatten());
             let scopes = b.aterm.zip(b.tab);
-            for (res, r) in Resource::ALL
+            for (res, r) in DECK_RESOURCES
                 .iter()
                 .copied()
                 .skip(bi * 4)
@@ -1445,7 +1445,7 @@ fn hit_map() {
         "CONTROL: fslim at {w} pt has a state label"
     );
     for label in labels {
-        let res = Resource::ALL
+        let res = DECK_RESOURCES
             .iter()
             .copied()
             .find(|&r| {

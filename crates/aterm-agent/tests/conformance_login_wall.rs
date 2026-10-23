@@ -45,6 +45,7 @@ fn to() -> Version {
 }
 
 /// Every state `m` reaches by [`Model::fire`] (each action's first successor),
+/// invariants unchecked, in breadth-first order.
 fn reachable(m: &Model) -> Vec<S> {
     let r = Resolved::new(m).expect("the login wall model resolves");
     let mut seen = BTreeSet::new();
@@ -81,6 +82,10 @@ const WALL_ROW: &str = "⏺ Login expired · Please run /login";
 const LEFT: [&str; 4] = [WALL_ROW, "", "❯ /login", "  ⎿  Login interrupted"];
 
 /// The recorded screen with the dialog of the `/login` aterm typed at the wall
+/// standing under its row, in the composer's place: the measured 2.1.303
+/// method picker while `picker` is 1 (the picker of the `/login` aterm typed,
+/// unanswered), else its browser hand-off — each as the measured screen draws
+/// it under its own prompt's.
 fn with_dialog(picker: bool) -> Vec<String> {
     let dialog = screen(if picker { LOGIN_PICKER } else { LOGIN_HANDOFF });
     let typed = dialog
@@ -99,6 +104,7 @@ fn with_dialog(picker: bool) -> Vec<String> {
 }
 
 /// Whether the screen of state `s` is the dialog of aterm's `/login`, standing
+/// under the wall's row ([`with_dialog`]).
 fn dialog_up(s: &S) -> bool {
     s["wall"] == 1 && s["track"] == 1 && !(s["left"] == 1 && s["back"] == 0)
 }
@@ -131,6 +137,7 @@ fn screen_of(s: &S) -> Vec<String> {
 }
 
 /// A transcript row as Claude Code 2.1.281 writes one, in the fields the readers
+/// take (the shape of `upgrade_login_wall_tests.rs`'s recorded rows).
 fn row(kind: &str, at: u64, body: &str) -> String {
     let stamp = aterm_agent::harness::usage::rfc3339_utc(i64::try_from(at).expect("at"));
     format!(
@@ -159,6 +166,7 @@ fn agent(at: u64, text: &str) -> String {
 }
 
 /// The login wall's row: `<synthetic>`, `isApiErrorMessage`,
+/// `authentication_failed`.
 fn wall(at: u64) -> String {
     row(
         "assistant",
@@ -193,6 +201,7 @@ fn notice(at: u64, k: u32) -> String {
 }
 
 /// The real ask of the model's `asks` (the bound scaled: the model's
+/// `MaxAsks` is the real `MAX_ASKS`, the ask before it the one before).
 fn real_asks(m: &Model, asks: i64) -> u32 {
     let bound = m
         .consts
@@ -208,6 +217,7 @@ fn real_asks(m: &Model, asks: i64) -> u32 {
 }
 
 /// When the lift the state knows of was: long past where the window has run
+/// out since, else a moment ago.
 fn lifted_at(s: &S) -> u64 {
     if s["window"] == 1 {
         NOW - REASK_S - 30
@@ -304,6 +314,7 @@ fn phase_of(m: &Model, s: &S) -> Phase {
 }
 
 /// What the real upgrade decides at a look at state `s` — the driver's
+/// fold, step by step — and the real facts it read.
 struct Upgrade {
     step: Step,
     /// The ask the notice goes as ([`upgrade::announce_asks`]).
@@ -315,10 +326,12 @@ struct Upgrade {
     stands: bool,
     undelivered: bool,
     /// Where an announced upgrade's window has not run out (`phase` 1,
+    /// `window` 0): whether the real clock lets it run out ([`window_runs`]).
     runs: Option<bool>,
 }
 
 /// The variables [`upgrade_at`] reads (through the screen, the transcript and
+/// the phase); the others are the model's own records or the supervisor's.
 const UPGRADE_VARS: [&str; 11] = [
     "asks", "back", "left", "phase", "picker", "ready", "stood", "track", "unread", "wall",
     "window",
@@ -389,6 +402,8 @@ fn upgrade_action(step: &Step) -> Option<&'static str> {
 }
 
 /// Whether the real clock lets an announced upgrade's window run out at the
+/// look `s` stands for: a look a full window on still finds the notice where
+/// it was typed.
 fn window_runs(m: &Model, s: &S) -> bool {
     let rows = screen_of(s);
     let (tail, marker) = transcript_of(m, s);
@@ -415,6 +430,8 @@ fn reading(rows: &[String], worked: Option<Duration>) -> TurnEndReading {
 }
 
 /// The wall's first read in state `s`: over a finished task (`done`), the turn
+/// the owner's prompt began, read never busy — no work, the person's key a
+/// moment before it.
 fn first_wall(s: &S, st: &mut TurnEndState) -> TurnEndReading {
     if s["done"] == 1 {
         assert!(st.seed_task_done(), "a task done at {s:?}");
@@ -434,6 +451,7 @@ const LABEL: &str = "m7-a";
 const PEER: &str = "@2";
 
 /// `r` as the window's host hands it over for state `s`, the loop's books `st`
+/// as they stood before it.
 fn hosted(s: &S, st: &TurnEndState, renewed: bool, r: TurnEndReading) -> TurnEndReading {
     let by = PEER.to_string();
     let asked = r.wall == Some(aterm_phase::WallKind::Auth)
@@ -457,6 +475,10 @@ fn hosted(s: &S, st: &TurnEndState, renewed: bool, r: TurnEndReading) -> TurnEnd
 }
 
 /// `r` with the host's advice, as the loop hands it to the decider: asked
+/// once the point is folded into `st`, and only where the loop asks
+/// ([`TurnEndState::account_point`]) — once renewed, the move onto the
+/// renewed login (what `accounts::advise` gives at a lost login or a turn
+/// end); else nothing.
 fn advised(st: &TurnEndState, renewed: bool, r: TurnEndReading) -> TurnEndReading {
     let asked = st.account_point(&r, &SupervisorConfig::default()).is_some();
     TurnEndReading {
@@ -468,6 +490,8 @@ fn advised(st: &TurnEndState, renewed: bool, r: TurnEndReading) -> TurnEndReadin
 }
 
 /// The approval loop's picker gate at `r` ([`picker_gate`]): behind the
+/// `/login` the books `st` typed, the host's word on that login's sign-in,
+/// and a renewal the tab follows ([`renewal_followed`]).
 fn gate_at(st: &TurnEndState, r: &TurnEndReading) -> PickerGate {
     picker_gate(
         st.login_typed_at().is_some(),
@@ -481,6 +505,9 @@ fn gate_at(st: &TurnEndState, r: &TurnEndReading) -> PickerGate {
 }
 
 /// State `s` as it stood at the loss's earlier reads ([`supervisor_at`]): the
+/// login back in another tab came after them — after this tab's `/login`
+/// (`BackElsewhere`), or after the person's own was left under the other
+/// tab's sign-in (`OtherBack`).
 fn earlier(s: &S) -> S {
     let mut then = s.clone();
     if then["elsewhere"] == 2 {
@@ -490,6 +517,9 @@ fn earlier(s: &S) -> S {
 }
 
 /// What the real supervisor decides at the point state `s` stands for, the
+/// exception it raises there, and whose a picker read there is (the approval
+/// loop's gate, [`picker_gate`]: behind the `/login` it typed, by
+/// `login_typed_at`, and the host's word on that login's sign-in).
 fn supervisor_at(s: &S) -> (TurnEndAction, Option<Exception>, PickerGate) {
     let cfg = SupervisorConfig::default();
     let t0 = Instant::now() + Duration::from_secs(10 * 3600);
@@ -542,6 +572,8 @@ fn supervisor_at(s: &S) -> (TurnEndAction, Option<Exception>, PickerGate) {
 }
 
 /// What the real decider does at `r` once a wait it decides there ends: the
+/// point decided again at the wait's end, nothing more read (a person's key
+/// that holds an act ages as the wait does).
 fn settled(
     st: &TurnEndState,
     r: &TurnEndReading,
@@ -592,6 +624,9 @@ fn supervisor_action(a: &TurnEndAction) -> Option<&'static str> {
 }
 
 /// The owner told now: the login exception, not escalated (the host's ask on
+/// the glass), with the owner's four-part notice — the notice to close a
+/// dialog whose login came back elsewhere ([`LOGIN_BACK_DIALOG`]) or was
+/// renewed ([`LOGIN_RENEWED_DIALOG`]): `TellClose`; or any other (`TellNow`).
 fn tells_now(e: Option<&Exception>) -> Option<&'static str> {
     e.filter(|e| e.kind == ExceptionKind::Login && e.when == Urgency::Now && !e.escalated)
         .and_then(|e| e.notice.as_ref())
@@ -605,6 +640,7 @@ fn tells_now(e: Option<&Exception>) -> Option<&'static str> {
 }
 
 /// Whether the real picker policy chooses at the measured picker for a state
+/// whose method is `known` (or not).
 fn picks(known: bool) -> bool {
     let rows = screen(LOGIN_PICKER);
     let read = aterm_phase::read(Some("claude"), &rows, Some(2));
@@ -620,6 +656,7 @@ fn picks(known: bool) -> bool {
 }
 
 /// The variables [`supervisor_at`] reads (through the screen and the host's
+/// readings); the others are the model's own records or the upgrade's.
 const SUPERVISOR_VARS: [&str; 9] = [
     "back",
     "done",
@@ -633,6 +670,9 @@ const SUPERVISOR_VARS: [&str; 9] = [
 ];
 
 /// What the real supervisor decides at the look a state stands for: its
+/// decision (`sup`: the model's action it is, or a rest), its exception (`ask`:
+/// the owner told now, `TellNow` or `TellClose`), and the picker gate (`carry`:
+/// the picker is aterm's to answer).
 struct Supervised {
     decided: TurnEndAction,
     exception: Option<Exception>,
@@ -663,6 +703,8 @@ impl Supervised {
 }
 
 /// The real code's decisions, kept by the variables each side reads
+/// ([`UPGRADE_VARS`], [`SUPERVISOR_VARS`]) and handed only those, so a read of
+/// any other panics rather than going unkeyed.
 #[derive(Default)]
 struct Looks {
     upgrades: BTreeMap<S, Upgrade>,
@@ -685,6 +727,11 @@ impl Looks {
 }
 
 /// Whether the model `m` agrees at `s` with what the real code decided: the
+/// upgrade and its clock, the supervisor, its exception, the picker gate
+/// (`carry`) and policy (`picked`, by whether the method is known), and, where
+/// the model's renewal is enabled, what the real renewal touched
+/// (`renew_clean`: no check under any login but its new one, the live login
+/// left as it was).
 fn agrees(
     m: &Model,
     s: &S,
@@ -730,6 +777,10 @@ fn agrees(
 }
 
 /// A host for the real renewal that records what it runs: its sign-in writes
+/// into the staging home the address it was hinted with (the row's: the browser
+/// held that account), its check answers that home's record, and an
+/// `auth status` under any other login is counted as a check under an idle
+/// login.
 #[derive(Default)]
 struct Recording {
     flows: RefCell<Vec<String>>,
@@ -774,6 +825,10 @@ impl AccountsHost for Recording {
 }
 
 /// Runs the real `aterm harness accounts renew m7-a` once, over a temp machine
+/// whose roster lists that login with an email, and returns whether it was
+/// clean: one sign-in and one check, both in one new staging home under the
+/// logins directory, no `auth status` under any other login, and the row bound
+/// to that home.
 fn real_renewal_is_clean() -> bool {
     let tmp = aterm_tempfile::Builder::new()
         .prefix("aterm-conf-login-wall-renew-")

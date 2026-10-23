@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The producer side of the paper-master machine roster: the two-state signing gate, the
-//! attribution stamp inside the signed bytes, the roster assets a rostered release carries,
-//! and the resume rule that stops one machine finishing another's cut.
-//!
-//! No network, Apple account, real key or real master: every master, machine key and signature
-//! is generated in-process from an obviously synthetic seed.
-//!
-//! The armed tests drive the path every cut from this tree takes (`pins::PAPER_MASTER_PUBKEYS`
-//! pins the real master, whose secret half is on paper) with a synthetic master. The
-//! empty-anchor tests pin a fork's path: per-machine opt-in signing, no attribution, no roster
-//! assets. Each test that kills a specific mutation names it.
+//! Producer-side tests for the paper-master machine roster and signing gate.
 
 use crate::{channel, machines, manifest_out, publish, sign};
 
@@ -26,8 +16,6 @@ fn b64(raw: &[u8]) -> String {
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
 use publish::{RosterEvidence, SignaturePolicy};
-
-// --- synthetic material: generated here, stored nowhere --------------------
 
 /// Seeds. Repeated bytes so no reader could mistake one for a real key.
 const MASTER: [u8; 32] = [0x71; 32];
@@ -127,8 +115,6 @@ fn inert<'a>() -> RosterEvidence<'a> {
     }
 }
 
-// --- the armed anchor -------------------------------------------------------
-
 /// The shipped anchor is armed, and never with an empty member, which would read as armed
 /// and authorize nobody.
 #[test]
@@ -141,23 +127,11 @@ fn the_shipped_paper_master_is_armed_and_has_no_empty_member() {
     );
 }
 
-// --- the roster ratchet: the producer's floor against the channel's --------
-
 /// A cut may not publish a roster generation the channel has moved past.
-///
-/// The client ratchets `roster_seq` on observation and refuses anything below its floor
-/// (`RosterReject::Rollback`), and `fetch_authoritative_release` has no fallback to an older
-/// release, so a rolled-back head stops those clients updating. `machines::authorize_cut`
-/// cannot see that channel floor and passes 0; `publish::roster_floor_covered` owns it,
-/// checked here against the client's own `admit` on the same numbers.
-///
-/// Kills "return Ok unconditionally" and "refuse only when strictly greater" (a second machine
-/// holding the same roster republishes at the head's generation).
 #[test]
 fn a_cut_may_not_publish_an_older_roster_generation_than_the_channel_head() {
     let master = pk(&MASTER);
     let m3 = pk(&M3);
-    // The producer's verdict must agree with the client's, generation for generation.
     for (carried, head) in [(4u64, 5u64), (5, 5), (6, 5), (0, 1)] {
         let document = roster_naming_at(&[("m3", &m3)], &[], &MASTER, carried);
         let verified = aterm_update_core::roster::verify_roster(
@@ -178,22 +152,15 @@ fn a_cut_may_not_publish_an_older_roster_generation_than_the_channel_head() {
         );
     }
 
-    // An unrostered channel (the fork state) admits everything: no head generation, no floor.
     publish::roster_floor_covered(None, None).expect("an unrostered channel head");
     publish::roster_floor_covered(Some(4), None).expect("the first rostered release");
-    // ...but dropping the tier against a rostered head is refused: an armed client refuses
-    // an unattributed release.
     publish::roster_floor_covered(None, Some(5)).expect_err("a downgrade is not a floor pass");
 }
-
-// --- duty: what a re-entry has any business re-proving ---------------------
 
 /// An entry that will still sign proves the whole roster chain; one finishing already-signed
 /// bytes proves the key and stops. The roster such an entry would read is not the one it
 /// publishes (that is frozen in `dist/` under a signature), so a verdict on it could only fail
 /// spuriously and strand a cut one upload from done.
-///
-/// Kills "run the roster chain regardless of duty".
 #[test]
 fn a_finish_only_entry_proves_the_key_and_not_the_roster() {
     let master = pk(&MASTER);
@@ -202,8 +169,6 @@ fn a_finish_only_entry_proves_the_key_and_not_the_roster() {
     let fresh = roster_doc(&[], &MASTER);
     let revoking = roster_doc(&["m3"], &MASTER);
 
-    // Every arrangement a finish entry can meet, including those that refuse a sign entry:
-    // all return the key verdict and no attribution.
     let arrangements: Vec<(&str, Option<&machines::RosterDocument>, i64)> = vec![
         ("a healthy roster", Some(&fresh), NOW),
         ("a LAPSED roster", Some(&fresh), LONG_AFTER),
@@ -228,7 +193,6 @@ fn a_finish_only_entry_proves_the_key_and_not_the_roster() {
              is the only true answer, and comparing a fresh local claim against it is the \
              bug this closes"
         );
-        // Precondition: a sign entry with the same evidence refuses the unhealthy cases.
         let mut signing = RosterEvidence {
             master_pubkeys: &masters,
             roster: document,
@@ -247,8 +211,6 @@ fn a_finish_only_entry_proves_the_key_and_not_the_roster() {
         }
     }
 
-    // A finish entry does not re-ask whether the roster names the key: pre-claim answered it
-    // about a key this entry may not change.
     let stranger = pk(&STRANGER);
     let finishing = RosterEvidence {
         master_pubkeys: &masters,
@@ -262,7 +224,6 @@ fn a_finish_only_entry_proves_the_key_and_not_the_roster() {
     assert!(policy.required);
     assert_eq!(policy.pubkey.as_deref(), Some(stranger.as_str()));
     assert_eq!(attribution, None);
-    // Precondition: the same key, at the entry that chooses it, is refused.
     let starting = RosterEvidence {
         master_pubkeys: &masters,
         roster: Some(&fresh),
@@ -274,14 +235,11 @@ fn a_finish_only_entry_proves_the_key_and_not_the_roster() {
         publish::channel_signature_policy(Some(&stranger), &starting).is_err(),
         "the roster must bite where the key is chosen"
     );
-    // ...and a keyless machine still may not cut for a rostered channel.
     assert!(publish::channel_signature_policy(None, &finishing).is_err());
 }
 
 /// With no attribution to stamp, the staged manifest is byte-identical to what `manifest_out`
 /// alone produces and carries neither key.
-///
-/// Kills "stamp a placeholder attribution when none is given".
 #[test]
 fn an_unattributed_cut_stages_byte_identical_manifest_bytes() {
     let dir = tempdir("unattributed");
@@ -296,7 +254,6 @@ fn an_unattributed_cut_stages_byte_identical_manifest_bytes() {
     );
     assert!(!expected.contains("machine_id"), "{expected}");
     assert!(!expected.contains("roster_seq"), "{expected}");
-    // And nothing is staged beside it.
     publish::stage_roster_assets(&dir, None).expect("no document, no assets");
     assert!(!dir.join("aterm-machines.toml").exists());
     assert!(!dir.join("aterm-machines.toml.sig").exists());
@@ -316,13 +273,10 @@ fn a_manifest_naming_the_retired_intel_dmg_is_refused_and_a_smuggled_one_too() {
     named.dmg_x86_64_sha256 = Some("ab".repeat(32));
     publish::refuse_retired_intel_dmg(&named)
         .expect_err("a manifest naming the retired pair is refused by name");
-    // A digest without a name is the same retired shape.
     let mut half = manifest_out::build(&inputs("0.5.0", 500));
     half.dmg_x86_64_sha256 = Some("ab".repeat(32));
     assert!(publish::refuse_retired_intel_dmg(&half).is_err());
 }
-
-// --- the armed anchor: the roster governs, and refuses ---------------------
 
 /// A listed machine cuts, and the verdict carries the policy and who it is.
 #[test]
@@ -352,7 +306,6 @@ fn an_armed_anchor_refuses_every_machine_the_roster_does_not_authorize() {
     let master = pk(&MASTER);
     let masters = [master.as_str()];
 
-    // (1) A key on no roster.
     let document = roster_doc(&[], &MASTER);
     assert!(
         !document_lists(&document, &pk(&STRANGER)),
@@ -362,7 +315,6 @@ fn an_armed_anchor_refuses_every_machine_the_roster_does_not_authorize() {
     publish::channel_signature_policy(Some(&pk(&STRANGER)), &unlisted)
         .expect_err("an unlisted key may not cut");
 
-    // (2) A revoked machine, holding its own key and its own copy of the roster.
     let revoked = roster_doc(&["m11"], &MASTER);
     assert!(
         document_lists(&revoked, &pk(&M11)),
@@ -370,24 +322,19 @@ fn an_armed_anchor_refuses_every_machine_the_roster_does_not_authorize() {
     );
     publish::channel_signature_policy(Some(&pk(&M11)), &armed(&masters, &revoked))
         .expect_err("a revoked machine may not cut");
-    // The refusal is targeted: m3 still cuts under the same document.
     publish::channel_signature_policy(Some(&pk(&M3)), &armed(&masters, &revoked))
         .expect("revoking m11 must not revoke m3");
 
-    // (3) A lapsed roster: every client would refuse the release.
     let mut lapsed = armed(&masters, &document);
     lapsed.now_unix = LONG_AFTER;
     publish::channel_signature_policy(Some(&pk(&M3)), &lapsed)
         .expect_err("a lapsed roster may not authorize a cut");
 
-    // (3b) A roster valid now but not for long enough: every client checks it at a later
-    // clock, so the producer judges it at `now + MIN_REMAINING_WINDOW_SECS`.
     let mut about_to_lapse = armed(&masters, &document);
     about_to_lapse.now_unix = FIXTURE_VALID_UNTIL - 60;
     publish::channel_signature_policy(Some(&pk(&M3)), &about_to_lapse)
         .expect_err("a roster with a minute left may not start a ~20 minute cut");
 
-    // (4) The wrong master: a roster signed by a key that is not the pinned anchor.
     let foreign = roster_doc(&[], &OTHER_MASTER);
     assert_eq!(
         foreign.bytes, document.bytes,
@@ -396,19 +343,16 @@ fn an_armed_anchor_refuses_every_machine_the_roster_does_not_authorize() {
     publish::channel_signature_policy(Some(&pk(&M3)), &armed(&masters, &foreign))
         .expect_err("a roster under another master authorizes nothing");
 
-    // (5) A corrupted signature over the right body under the right master.
     let mut torn = roster_doc(&[], &MASTER);
     torn.signature[0] ^= 0xff;
     publish::channel_signature_policy(Some(&pk(&M3)), &armed(&masters, &torn))
         .expect_err("a torn master signature authorizes nothing");
 
-    // (6) No roster at all: an armed anchor never degrades to an unrostered cut.
     let mut absent = armed(&masters, &document);
     absent.roster = None;
     publish::channel_signature_policy(Some(&pk(&M3)), &absent)
         .expect_err("an armed anchor with no roster must refuse, never fall through");
 
-    // (7) A keyless machine is told so pre-claim, not at signing.
     publish::channel_signature_policy(None, &armed(&masters, &document))
         .expect_err("a keyless machine may not cut for a rostered channel");
 }
@@ -425,13 +369,10 @@ fn a_machine_that_declares_the_wrong_id_may_not_cut() {
     evidence.declared_machine_id = Some("m11");
     publish::channel_signature_policy(Some(&pk(&M3)), &evidence)
         .expect_err("m3's key declared as m11 must refuse");
-    // The truthful declaration passes, so the refusal above is about the mismatch.
     evidence.declared_machine_id = Some("m3");
     publish::channel_signature_policy(Some(&pk(&M3)), &evidence)
         .expect("a truthful declaration is not an obstacle");
 }
-
-// --- the unpinned master: a fork's tier ------------------------------------
 
 /// An unpinned master (a fork) is per-machine opt-in and attributes nothing, even with valid
 /// roster evidence, at either duty.
@@ -465,14 +406,8 @@ fn an_unpinned_master_is_per_machine_opt_in_and_attributes_nothing() {
     }
 }
 
-// --- attribution inside the signed bytes -----------------------------------
-
 /// The stamp lands inside what the signature covers, shown by signing the staged file and
 /// verifying against it.
-///
-/// Kills "drop the `machines::attribute` call from `publish::stage_manifest`" (no
-/// `machine_id`) and "stamp after signing" (the signature no longer covers the bytes, which
-/// `sign_manifest_with_policy`'s read-back check catches in production).
 #[test]
 fn attribution_is_inside_the_bytes_the_signature_covers() {
     let dir = tempdir("attributed");
@@ -488,16 +423,13 @@ fn attribution_is_inside_the_bytes_the_signature_covers() {
     assert!(text.contains("machine_id = \"m3\""), "{text}");
     assert!(text.contains("roster_seq = 4"), "{text}");
 
-    // Sign exactly what is on disk, as the pipeline does.
     let signature = kp(&M3).sign(&signed_bytes).as_ref().to_vec();
     publish::verify_detached_manifest_signature(&pk(&M3), &signed_bytes, &signature)
         .expect("the signature covers the staged bytes");
-    // And the client reads the attribution back out of those very bytes.
     let parsed = Manifest::parse(&text).expect("client parses");
     assert_eq!(parsed.machine_id.as_deref(), Some("m3"));
     assert_eq!(parsed.roster_seq, Some(4));
 
-    // Negative control: stamping after signing, done deliberately.
     let unattributed = publish::stage_manifest(&dir, &inputs, None, None).expect("stages");
     let early_bytes = std::fs::read(&unattributed).expect("unattributed bytes");
     let early_signature = kp(&M3).sign(&early_bytes).as_ref().to_vec();
@@ -513,12 +445,8 @@ fn attribution_is_inside_the_bytes_the_signature_covers() {
     clean(&dir);
 }
 
-// --- the roster assets -----------------------------------------------------
-
 /// An armed cut publishes the roster it was authorized by, byte for byte from the bytes the
 /// gate held, and the asset rules demand both halves.
-///
-/// Kills "stage the roster from its path instead of from the authorized document".
 #[test]
 fn an_armed_cut_stages_and_requires_both_roster_assets() {
     let dir = tempdir("roster-assets");
@@ -534,7 +462,6 @@ fn an_armed_cut_stages_and_requires_both_roster_assets() {
         document.signature
     );
 
-    // The published set the client elects grows by exactly those two names.
     let names = channel::required_asset_names("0.5.0", true, true);
     assert!(
         names.contains(&"aterm-machines.toml".to_string()),
@@ -545,22 +472,17 @@ fn an_armed_cut_stages_and_requires_both_roster_assets() {
         "{names:?}"
     );
     channel::validate_channel_asset_set(&names, "0.5.0", true, true, &[]).expect("the exact set");
-    // ...and a release that forgets the roster is refused: an armed client refuses such a
-    // head structurally.
     let forgotten = channel::required_asset_names("0.5.0", true, false);
     channel::validate_channel_asset_set(&forgotten, "0.5.0", true, true, &[])
         .expect_err("a rostered channel head without its roster is unelectable");
     clean(&dir);
 }
 
-// --- resume: one cut, one machine ------------------------------------------
-
 /// A resume that re-authorizes as a different machine aborts: the manifest it would finish is
 /// signed over the first machine's attribution. The asymmetric cases refuse too: an anchor
 /// armed or unarmed mid-cut leaves a journal and a live verdict that disagree.
 #[test]
 fn a_resume_may_not_change_which_machine_cut_the_release() {
-    // The fork case: nameless journal, nameless verdict.
     publish::resume_attribution_agrees(None, None).expect("an unattributed cut resumes");
     publish::resume_attribution_agrees(Some("m3"), Some("m3")).expect("same machine resumes");
 
@@ -572,8 +494,6 @@ fn a_resume_may_not_change_which_machine_cut_the_release() {
     publish::resume_attribution_agrees(None, Some("m3"))
         .expect_err("a roster armed mid-cut may not attribute bytes that carry no attribution");
 }
-
-// --- where the roster bytes come from --------------------------------------
 
 /// The credentials profile names the roster and the signature is its sibling: one name, so a
 /// profile cannot pair a roster with a signature over another.
@@ -603,16 +523,12 @@ fn the_credentials_profile_names_the_roster_and_the_signature_is_its_sibling() {
     let read = machines::RosterDocument::read(creds.machine_roster().unwrap()).expect("reads");
     assert_eq!(read, document, "the document is read whole, both halves");
 
-    // A named-but-missing roster is a hard error at the pre-claim gate, never a fall-through
-    // to an unrostered cut.
     machines::RosterDocument::read(&dir.join("nope.toml"))
         .expect_err("a named roster that is not there must refuse");
-    // ...and so is a roster whose master signature is missing.
     std::fs::write(dir.join("lonely.toml"), &document.bytes).unwrap();
     machines::RosterDocument::read(&dir.join("lonely.toml"))
         .expect_err("a roster with no master signature proves nothing");
 
-    // Nothing secret renders: the debug line carries the public identity and machine id only.
     let rendered = format!("{creds:?}");
     assert!(rendered.contains("m3"), "{rendered}");
     assert!(rendered.contains("redacted"), "{rendered}");
@@ -626,14 +542,9 @@ fn the_credentials_profile_names_the_roster_and_the_signature_is_its_sibling() {
 /// End to end: a real credentials profile and roster file on disk, a synthetic master, and the
 /// verdict a cut would carry, through the lines between profile and gate (reading the named
 /// roster, resolving the declared id, folding both into the evidence).
-///
-/// Kills "ignore `machine_roster` and pass `roster: None`" (the armed call refuses) and "pass
-/// `declared_machine_id: None` always" (the mismatch case succeeds).
 #[test]
 fn a_real_profile_plus_a_real_roster_file_produce_the_cut_s_verdict() {
     let dir = tempdir("verdict");
-    // A genuine keypair, and a roster naming its public key as m3: profile and roster are
-    // bound by the key.
     let (pkcs8, pubkey) = fresh_keypair();
     let document = roster_naming(&[("m3", &pubkey)], &[], &MASTER);
     let roster_path = dir.join("aterm-machines.toml");
@@ -663,19 +574,14 @@ fn a_real_profile_plus_a_real_roster_file_produce_the_cut_s_verdict() {
         "the verdict must carry the exact document it verified, not the path"
     );
 
-    // The conventional record is consulted when the profile declares no id, and a stale one
-    // refuses the cut.
     let identity = dir.join("machine.toml");
     std::fs::write(&identity, "id = \"m11\"\npubkey = \"unused\"\n").unwrap();
     publish::signing_verdict(Some(&creds), &anchors(&masters, Some(&identity)))
         .expect_err("a mint record naming another machine must refuse");
-    // ...and a truthful one does not get in the way.
     std::fs::write(&identity, "id = \"m3\"\npubkey = \"unused\"\n").unwrap();
     publish::signing_verdict(Some(&creds), &anchors(&masters, Some(&identity)))
         .expect("a truthful mint record is not an obstacle");
 
-    // A profile naming a roster that is not there fails pre-claim, naming the file, and never
-    // degrades to an unrostered cut.
     let orphan = write_profile2(
         &dir,
         "orphan.toml",
@@ -701,29 +607,23 @@ fn the_declared_machine_id_prefers_the_profile_and_falls_back_to_the_mint_record
     )
     .unwrap();
 
-    // The profile wins outright; the conventional file is not consulted.
     assert_eq!(
         machines::declared_machine_id(Some("m3"), Some(&identity)).unwrap(),
         Some("m3".to_string())
     );
-    // With no profile key, the mint record answers.
     assert_eq!(
         machines::declared_machine_id(None, Some(&identity)).unwrap(),
         Some("m11".to_string())
     );
-    // A machine never minted declares nothing, which is not an error.
     assert_eq!(
         machines::declared_machine_id(None, Some(&dir.join("absent.toml"))).unwrap(),
         None
     );
     assert_eq!(machines::declared_machine_id(None, None).unwrap(), None);
-    // A present but broken record is an error: a guessed identity is a wrong attribution.
     std::fs::write(&identity, "id = = =").unwrap();
     assert!(machines::declared_machine_id(None, Some(&identity)).is_err());
     clean(&dir);
 }
-
-// --- helpers ---------------------------------------------------------------
 
 fn tempdir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -763,7 +663,6 @@ fn fresh_keypair() -> (String, String) {
 
 /// A base64 PKCS#8 Ed25519 key generated here, signing nothing that leaves this process.
 fn pkcs8_b64() -> String {
-    // ring cannot encode a seed as PKCS#8, so one generated document is cached per process.
     use std::sync::OnceLock;
     static KEY: OnceLock<String> = OnceLock::new();
     KEY.get_or_init(|| {
@@ -793,7 +692,6 @@ fn inputs(version: &'static str, build: u64) -> manifest_out::ManifestInputs<'st
         zip_sha256: ZIP_SHA,
         repo_slug: "owner/repo",
         min_os: "11.0",
-        // This fixture claims no team and invents no Apple identity.
         team_id: "",
         pub_date: "2026-08-11T00:00:00Z",
         min_build: None,

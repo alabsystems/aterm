@@ -2,7 +2,7 @@
 name: system-state
 description: Read what this machine, every aterm process and this tab are doing now (CPU per core, GPU, memory and swap, disk space, which processes use them, and which commands stopped making progress). Use for "slow", "hung", "stuck", "frozen", "out of memory", "swap", "disk full", "which process", "load", "is my command still working", "wait for a quiet machine", or "benchmark".
 ---
-<!-- aterm skill v4 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v5 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # System state in aterm
 
@@ -81,6 +81,25 @@ aterm ctl subscribe @self events             # EVENT <n> job <verdict> job=<id> 
 `job=` is the worst live verdict (`stuck` > `quiet` > `fine`), `none` with no live job, or `-`
 when no recent reading speaks for now. `EVENT … job` fires only on verdict transitions (`task=`
 names your tool call, `code=` its exit code).
+
+## When new programs do not start
+
+macOS's program check (`syspolicyd`) can hold a program before it starts, even one it let run
+before. A held program has not reached its own code: its job reads `quiet` with almost no CPU,
+and nothing it would print appears. A busy check drains by itself. `aterm doctor`'s `devtools:`
+row says whether aterm is listed in System Settings ▸ Privacy & Security ▸ Developer Tools,
+which spares the programs its tabs start most of those checks.
+
+`aterm ctl @self status` carries `syspolicyd=<-|ok|full|stuck>` and `syspolicyd_workers=`.
+`full` is the check at macOS's thread limit now. `stuck` means it has stood there five minutes:
+it and the privacy check (`tccd`) each hold what the other needs, and only a restart of the Mac
+ends it. Until then most new programs cannot start (macOS's own, such as `ps`, still do), and
+a retry only adds another that waits in the same line. Stop starting programs, keep what is in
+hand, and report `NEEDS YOU: restart the Mac (macOS's program check is stuck)`.
+
+A tab kept across an aterm update makes macOS check aterm's earlier copy at every program it
+starts, listed or not: run builds and tests from a new tab. Such a tab reads
+`attribution=adopted` in `status`, as does every tab a new aterm process took over.
 
 ## Acting on what you read
 

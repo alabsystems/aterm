@@ -1,52 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE PERSON'S `shell_args` UNDER INTEGRATION.
-//!
-//! bash and PowerShell are integrated through their argv (`bash --rcfile …`,
-//! `pwsh … -NoExit -Command …`), and an argv override used to REPLACE the whole
-//! argv, so `shell_args = ["-o", "vi"]` silently did nothing for bash — the
-//! default shell on Linux — while integration was on, which it is by default.
-//! [`merge_shell_args`] puts the person's arguments into the integration's argv
-//! where the shell accepts them, or, for arguments no integrated start can honour,
-//! says why integration stands aside so the caller runs them as given.
+//! Merging user `shell_args` into shell-integration startup argv ([`merge_shell_args`]).
 
 use crate::{BASH_LOADER_FILE, InjectionEnv, ShellType};
 
 /// What becomes of `shell_args` for an integrated shell ([`merge_shell_args`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArgsMerge {
-    /// The integration stays; its argv (and, for a login bash, its env) now
-    /// carries the person's arguments.
+    /// The integration stays.
     Integrated,
-    /// The arguments ask for a start no integration can stand in for — a command
-    /// or a script instead of an interactive shell, POSIX mode, a restricted
-    /// shell. The caller runs the shell with them as given, WITHOUT integration,
-    /// and says this sentence (it completes "shell integration is off: …").
+    /// The arguments request a startup mode that bypasses shell integration.
     Bypass(String),
 }
 
-/// Merge the person's `shell_args` into `injection`, the integration [`crate::prepare`]
-/// built for `shell`.
-///
-/// **bash:** long options go before the loader's `--rcfile` and short ones after
-/// it, the only order bash accepts (`bash -i --posix` is "invalid option"). On
-/// every Unix but macOS, a login shell (`-l`, `--login`) or `--norc` is started the
-/// way kitty and Ghostty start it — `--posix` with `ENV` naming the loader, which
-/// then reads exactly what bash would have (see the loader's own comment,
-/// `BASH_LOADER`) — and a `--rcfile`/`--init-file` file is read in place of
-/// `~/.bashrc`. On macOS and under Git Bash the loader already does a login
-/// shell's reading, so `-l`/`--login` is left to it, and `--norc`, `--noprofile`
-/// and `--rcfile` stand integration aside.
-///
-/// **PowerShell:** the arguments go before `-ExecutionPolicy … -NoExit -Command …`
-/// (pwsh's `-Login` must be first), except a `-NoExit` of the person's own, which
-/// the integration already passes.
-///
-/// Every other shell is integrated without touching argv (zsh, fish, cmd: the
-/// spawn hands them `shell_args` itself; WSL: the Windows seam splices them in as
-/// `wsl.exe` options), and so is any shell when `args` is empty: [`ArgsMerge::Integrated`],
-/// `injection` untouched.
+/// Merge `shell_args` into `injection`, the integration [`crate::prepare`] built for `shell`.
 #[inline]
 pub fn merge_shell_args(
     shell: ShellType,
@@ -56,9 +24,7 @@ pub fn merge_shell_args(
     merge_shell_args_in(shell, injection, args, &|key| std::env::var(key).ok())
 }
 
-/// Why `args` would stand integration aside for `shell` ([`ArgsMerge::Bypass`]),
-/// decided without preparing anything: a config check's answer. `None` when the
-/// shell is integrated with them.
+/// Return the [`ArgsMerge::Bypass`] reason if `args` would bypass integration for `shell`.
 #[must_use]
 #[inline]
 pub fn shell_args_bypass(shell: ShellType, args: &[String]) -> Option<String> {
@@ -69,8 +35,7 @@ pub fn shell_args_bypass(shell: ShellType, args: &[String]) -> Option<String> {
     }
 }
 
-/// [`merge_shell_args`] over the environment it reads (`ENV`, `HISTFILE`, `HOME`,
-/// for a bash started in POSIX mode).
+/// [`merge_shell_args`] parameterized over the environment (`ENV`, `HISTFILE`, `HOME`).
 pub(crate) fn merge_shell_args_in(
     shell: ShellType,
     injection: &mut InjectionEnv,
@@ -87,10 +52,7 @@ pub(crate) fn merge_shell_args_in(
     }
 }
 
-/// Whether this platform's integrated bash reads a login shell's files whatever
-/// its arguments (macOS's `bash/rcfile`, Git Bash's login start,
-/// [`crate::BASH_LOGIN_START`]) rather than starting bash as bash starts
-/// (`bash/bashrc` on the other Unixes).
+/// Whether integrated bash reads login startup files ([`crate::BASH_LOGIN_START`]).
 const LOGIN_STYLE_LOADER: bool = !cfg!(all(unix, not(target_os = "macos")));
 
 /// One argument of a bash argv, after the long options.
@@ -115,8 +77,7 @@ struct BashArgs {
     rcfile: Option<String>,
 }
 
-/// bash's long options (`shell.c`'s `long_args`), which it also takes with one
-/// dash while only long options came before (`-login`, `-posix`, `-rcfile f`).
+/// bash's long options (`shell.c`'s `long_args`).
 const BASH_LONG_OPTIONS: [&str; 18] = [
     "debug",
     "debugger",
@@ -138,11 +99,9 @@ const BASH_LONG_OPTIONS: [&str; 18] = [
     "wordexp",
 ];
 
-/// Sort `args` as bash parses them, or say why no integrated interactive bash can
-/// run them. A long option is kept as `--name`, however it was spelled.
+/// Sort `args` as bash parses them, or say why no integrated interactive bash can run them.
 fn parse_bash_args(args: &[String]) -> Result<BashArgs, String> {
     let mut out = BashArgs::default();
-    // Only long options so far: bash reads `-name` as `--name` here.
     let mut leading = true;
     let mut i = 0;
     while i < args.len() {
@@ -194,7 +153,6 @@ fn parse_bash_args(args: &[String]) -> Result<BashArgs, String> {
                 "`{arg}` in shell_args names a script for bash to run, not an interactive shell"
             ));
         };
-        // The `-o`/`-O` in the cluster, in order: each takes the next argument.
         let mut values = Vec::new();
         for flag in flags.chars() {
             match flag {
@@ -241,9 +199,7 @@ fn parse_bash_args(args: &[String]) -> Result<BashArgs, String> {
     Ok(out)
 }
 
-/// [`merge_shell_args`] for bash: `injection.argv_override` is `[bash, --rcfile,
-/// <loader>]`, or under Git Bash `[bash, --login, --posix]` ([`crate::prepare`]):
-/// the program, then the start's own long options.
+/// [`merge_shell_args`] for bash ([`crate::prepare`]).
 fn merge_bash(
     injection: &mut InjectionEnv,
     args: &[String],
@@ -266,8 +222,6 @@ fn merge_bash(
                     .to_string(),
             );
         }
-        // The start reads the login files itself: macOS's `--rcfile`, which a
-        // login bash would ignore, and Git Bash's, which is a login start already.
         parsed.longs.retain(|long| long != "--login");
         parsed.shorts.retain_mut(|short| {
             if short.value || !short.text.starts_with('-') {
@@ -279,9 +233,6 @@ fn merge_bash(
         argv.extend(parsed.longs);
         argv.extend(start);
     } else if parsed.login || parsed.norc {
-        // No `--rcfile` can run under these: a login bash ignores it, and nothing
-        // keeps a non-login bash from its system bashrc. In POSIX mode bash reads
-        // only `$ENV`, the loader, which reads what bash would have.
         argv.extend(parsed.longs);
         argv.push("--posix".to_string());
         posix_start_env(&mut injection.env_add, parsed.noprofile, env);
@@ -299,16 +250,7 @@ fn merge_bash(
     ArgsMerge::Integrated
 }
 
-/// The env of a bash started `--posix` with `$ENV` naming the loader, which reads
-/// each of these and unsets it: `ENV` itself (spelled through
-/// `$ATERM_SHELL_INTEGRATION_DIR`, because bash expands `$ENV`'s value and a path
-/// is not to be expanded twice), the caller's own `ENV` to put back, and — when
-/// aterm's environment names no `HISTFILE` — `~/.bash_history`, which POSIX mode
-/// would otherwise have replaced with `~/.sh_history`, exported for the start only.
-/// Under Git Bash the loader sets it from the shell's own `$HOME`
-/// (`ATERM_BASH_HISTFILE=home`): MSYS2 makes that `/c/Users/…` from the Windows
-/// profile when aterm's environment has no `HOME`, and a Windows `HOME` is no
-/// POSIX path, so the history file reads as it does in a login Git Bash.
+/// The env of a bash started `--posix` with `$ENV` naming the loader.
 pub(crate) fn posix_start_env(
     env_add: &mut Vec<(String, String)>,
     noprofile: bool,
@@ -336,8 +278,7 @@ pub(crate) fn posix_start_env(
     }
 }
 
-/// [`merge_shell_args`] for PowerShell: `injection.argv_override` is `[pwsh,
-/// -ExecutionPolicy, Bypass, -NoExit, -Command, <dot-source>]`.
+/// [`merge_shell_args`] for PowerShell.
 fn merge_powershell(injection: &mut InjectionEnv, args: &[String]) -> ArgsMerge {
     let Some(ours) = injection.argv_override.as_deref() else {
         return ArgsMerge::Integrated;
@@ -367,13 +308,11 @@ fn merge_powershell(injection: &mut InjectionEnv, args: &[String]) -> ArgsMerge 
 enum PwshParameter {
     /// `-NoExit`: the integration passes it already.
     Ours,
-    /// A command, a file, an encoded command, help or the version, non-interactive
-    /// mode, or the execution policy the integration sets.
+    /// A parameter that runs a command/file, exits, or overrides the integration policy.
     Foreign,
 }
 
-/// Which [`PwshParameter`] `arg` is. PowerShell takes any unambiguous prefix of a
-/// parameter's name, in any case, with `:value` attached or not.
+/// Classify `arg` as a [`PwshParameter`].
 fn pwsh_parameter(arg: &str) -> Option<PwshParameter> {
     let name = arg.strip_prefix('-')?;
     let name = name.strip_prefix('-').unwrap_or(name);
@@ -462,9 +401,6 @@ mod tests {
         assert_eq!(injection.env_add.len(), 1, "no env of its own");
         let (_, empty) = merged(&[], &no_env);
         assert_eq!(argv(&empty), ["bash", "--rcfile", "/si/bash/x"], "no args");
-        // A long option with one dash, while only long options came before it,
-        // as bash reads it; after a short option it is a cluster again. `+o
-        // posix` turns POSIX mode off.
         let (merge, injection) = merged(&["-noediting", "-i", "+o", "posix"], &no_env);
         assert_eq!(merge, ArgsMerge::Integrated);
         assert_eq!(
@@ -510,9 +446,7 @@ mod tests {
         }
     }
 
-    /// Off macOS a login bash, or `--norc`, starts in POSIX mode on the loader:
-    /// `--posix` after the person's long options, `ENV` through the integration
-    /// dir, `~/.bash_history` kept, their own `ENV` handed back.
+    /// Off macOS a login bash, or `--norc`, starts in POSIX mode on the loader.
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn a_login_bash_starts_in_posix_mode_on_the_loader() {
@@ -552,7 +486,6 @@ mod tests {
         assert_eq!(argv(&rc), ["bash", "--rcfile", "/si/bash/x", "-x"]);
         assert_eq!(added(&rc, "ATERM_BASH_RCFILE"), Some("/home/u/.myrc"));
 
-        // One dash, as bash takes it: `-login` is a login shell, `-rcfile` a file.
         let (_, login) = merged(&["-login", "-i"], &no_env);
         assert_eq!(argv(&login), ["bash", "--login", "--posix", "-i"]);
         let (_, rc) = merged(&["-rcfile", "~/.myrc"], &no_env);
@@ -560,9 +493,7 @@ mod tests {
         assert_eq!(added(&rc, "ATERM_BASH_RCFILE"), Some("~/.myrc"));
     }
 
-    /// On macOS (and under Git Bash) the loader reads the login files itself:
-    /// `-l`/`--login` is left to it, and a choice of startup files stands
-    /// integration aside.
+    /// On macOS (and under Git Bash) the loader reads the login files itself.
     #[cfg(not(all(unix, not(target_os = "macos"))))]
     #[test]
     fn the_login_style_loader_stands_in_for_login() {
@@ -580,11 +511,7 @@ mod tests {
         }
     }
 
-    /// Git Bash is started as a login shell in POSIX mode on the loader
-    /// (`crate::BASH_LOGIN_START`): `ENV` names `bash/bashrc` through the integration
-    /// dir, the history file is left to the loader (the shell's own `$HOME`), and the
-    /// person's options go around that start as bash takes them, a `-l` of theirs
-    /// being the start's own.
+    /// Build a Git Bash login-start [`ShellInjection`] (`crate::BASH_LOGIN_START`).
     #[cfg(windows)]
     #[test]
     fn git_bash_starts_as_a_login_shell_on_the_loader() {

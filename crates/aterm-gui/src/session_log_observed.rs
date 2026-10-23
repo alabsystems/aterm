@@ -42,6 +42,8 @@ impl MarkBucket {
     }
 
     /// Refill to `now` (monotonic ms; a clock read behind the last is the
+    /// last), then spend a whole token, or spend one anyway (`force`: a
+    /// close or a carry, which never loses the newest value).
     fn spend(&mut self, now: u64, force: bool) -> bool {
         let now = now.max(self.at);
         let earned = (now - self.at).saturating_mul(1_000) / PROGRAM_REFILL_MS;
@@ -119,6 +121,7 @@ impl ShownTuple {
     }
 
     /// The tuple a carry's token names, each word one its list holds (`-`:
+    /// none); `None` for a token that does not read.
     fn read(token: &str) -> Option<Self> {
         let mut it = token.split('.');
         let word = |raw: Option<&str>, words: &[&'static str]| match raw? {
@@ -197,6 +200,7 @@ pub(crate) struct Observed {
     ctx: Option<u8>,
     goal: Option<bool>,
     /// The notify and bell totals last counted from (this process's engine:
+    /// neither crosses an update, so the first read is a baseline).
     notify: Option<u64>,
     bell: Option<u64>,
     /// When a bell was last said (monotonic ms).
@@ -204,22 +208,33 @@ pub(crate) struct Observed {
     /// The progress state and its tenth.
     progress: Option<(&'static str, Option<u8>)>,
     /// The cwd and the informative title last said, as fingerprints
+    /// ([`name_fp`]; 0: cleared): the carry holds no text.
     cwd: Option<u64>,
     title: Option<u64>,
     /// Whether the effective attention owner was the supervisor's when a
+    /// meta write last said (the `escalated` need's standing).
     escalated: Option<bool>,
     /// Each meta field's value as the log last said it, a fingerprint
+    /// ([`name_fp`]; 0: unset), at most [`META_FIELDS_MAX`] fields.
     meta: Vec<(String, u64)>,
     /// The program marks' bucket (this process's: a successor starts a full
+    /// one, and the carry writes any pending state first).
     program: ProgramMarks,
     /// The shown marks' tuple and bucket (6F-9): the tuple crosses an
+    /// update (`obs_shown=`), the bucket is this process's.
     shown: ShownMarks,
 }
 
 /// The most meta fields [`Observed`] remembers: every user field and the
+/// supervisor's claim (`SUPERVISOR_FIELD`).
 const META_FIELDS_MAX: usize = crate::session_timeline::MetaField::ALL.len() + 1;
 
 /// A meta field whose value is free text that can hold what must never
+/// leave RAM (a box's command, a question's words, the screen's last line:
+/// the supervisor's escalation): its mark says a fingerprint below the
+/// content tier, and the text only at it (`attn_text=`;
+/// "never stored" became "never leaves RAM", the ring's own
+/// exposure).
 const FINGERPRINTED_META: &[&str] = &["attention"];
 
 /// A title's fingerprint, its leading busy-spinner frame left out ([`crate::toolbar::busy_spinner_title_parts`]).
@@ -355,6 +370,7 @@ impl Observed {
     }
 
     /// Note that the log says meta field `field` holds the value of
+    /// fingerprint `fp`: whether that moved it from what the log last said.
     fn meta_moved(&mut self, field: &str, fp: u64) -> bool {
         match self.meta.iter_mut().find(|(f, _)| f == field) {
             Some((_, held)) if *held == fp => false,
@@ -374,6 +390,7 @@ impl Observed {
 
 impl SessionLog {
     /// The run in front: the agent's, else the program's, else the
+    /// command's; the session when none is open.
     fn front_run(&self) -> Node {
         let open = |n: Node| self.log.is_open(n).then_some(n);
         self.agent
@@ -385,6 +402,7 @@ impl SessionLog {
     }
 
     /// The open agent run of Claude Code, the one reader whose screen facts
+    /// the log keeps (plan §3.2; Codex is Phase 5).
     fn claude_run(&self) -> Option<Node> {
         self.agent
             .as_ref()
@@ -508,6 +526,10 @@ impl SessionLog {
     }
 
     /// Refill the bucket to `at`, and write the pending state with a token
+    /// (or without one, `force`), on the bucket's run while it is open and
+    /// on the session (`-`) once it is not: never on whatever node is
+    /// deepest open ([`aterm_slog::Log::mark`]'s rule for a mark that names
+    /// none).
     fn write_program(&mut self, at: Stamp, force: bool) {
         let open = self.observed.program.run.filter(|n| self.log.is_open(*n));
         let p = &mut self.observed.program;
@@ -554,6 +576,7 @@ impl SessionLog {
     }
 
     /// Refill the bucket to `at`, and write the pending tuple with a token
+    /// (or without one, `force`), on the session, by aterm.
     fn write_shown(&mut self, at: Stamp, force: bool) {
         let s = &mut self.observed.shown;
         let Some((tuple, replaced)) = s.pending else {
@@ -952,6 +975,10 @@ impl SessionLog {
     }
 
     /// `mark(f)` appended; when its record would pass
+    /// [`aterm_slog::MAX_RECORD_BYTES`], the free-text key `elastic` is cut
+    /// by the excess ([`aterm_slog::field::clamp_encoded`], never inside a
+    /// character) and the mark appended once more, so a record its writer
+    /// owes is never refused for one long field.
     fn mark_within_record(
         &mut self,
         mark: impl Fn(Fields) -> Mark,
@@ -1149,6 +1176,49 @@ impl SessionLog {
             BoundedText::new(Key::Reply, reply).map(Val::Text),
         );
         self.put(Kind::InDoubt, Src::Aterm, Conf::Exact, Node::SESSION, f, at);
+    }
+
+    /// `mark - row row=<kind> row_text=<payload>`: a timeline row the log
+    /// holds as its row alone, from its one writer
+    /// ([`crate::session_timeline::SessionTimeline::record_row`]) in the
+    /// row's hold: the ring's kind as a token
+    /// ([`crate::session_timeline_view::row_token`]) and its payload whole,
+    /// at the content tier (RAM only, as the ring row was), so the
+    /// timeline's view prints the row the ring does. Every row-only payload
+    /// is a few closed words and numbers, far under the key's cap (360
+    /// encoded bytes, a space or an escape three); one past it would be cut
+    /// to fit the record's bound, and the timeline's debug cross-check
+    /// would name the row the view then prints short.
+    pub(crate) fn observe_row(&mut self, kind: &str, payload: &str, at: Stamp) {
+        let f = with(
+            Fields::new(),
+            Key::RowKind,
+            tok(Key::RowKind, &crate::session_timeline_view::row_token(kind)),
+        );
+        let f = with(
+            f,
+            Key::RowText,
+            BoundedText::new(Key::RowText, payload).map(Val::Text),
+        );
+        let _ = self.mark_within_record(
+            |f| {
+                Mark::new(Kind::Row, Src::Aterm, Conf::Exact)
+                    .at(Node::SESSION)
+                    .fields(f)
+            },
+            f,
+            Some(Key::RowText),
+            at,
+        );
+    }
+
+    /// Whether a program state is pending in its run's bucket, written
+    /// later: until it is, the ring's newest `program-state` row is
+    /// newer than the log's newest `program` mark (the timeline's debug
+    /// cross-check reads the retention rule by it).
+    #[cfg(debug_assertions)]
+    pub(crate) fn program_pending(&self) -> bool {
+        self.observed.program.pending.is_some()
     }
 }
 

@@ -609,6 +609,10 @@ pub fn ratelimit_headers(args: &[String]) -> Result<J, String> {
 }
 
 /// `ratelimits [tag] off | PRIMARY SECONDARY [credits=yes|no|unlimited]
+/// [balance=N] [reached=TYPE] [promo=TEXT] [active=ID]`: the `x-codex-*`
+/// headers every stub answer carries, and the account usage a `--chatgpt` Codex
+/// polls; the `on200`/`on429` blocks `headers` wrote stay
+/// ([`crate::verbs::write_headers`]).
 pub fn cmd_ratelimits(args: &[String]) -> Res {
     let (run, a) = lab(args)?;
     let h = ratelimit_headers(&a).map_err(Fail::die)?;
@@ -778,12 +782,16 @@ mod tests {
     }
 
     /// The bytes of a stand-in codex-alab binary: clap's literal for the
+    /// flag among other text, as the store's build holds it.
     const NAMES_IT: &[u8] = b"\x00\xcf\xfa\xed\xfeno-daemon cannot be used with --remote\x00";
 
     /// The bytes of a stand-in binary that takes no `--no-daemon`: the
+    /// literal's pieces, never the literal (vendor 0.151.0's case).
     const NAMES_NONE: &[u8] = b"\x00\xcf\xfa\xed\xfeno-daemo\x00n-daemon\x00no-daemoN\x00";
 
     /// A Codex package at `root` (layout 1, `bin/codex` its entrypoint,
+    /// holding `exe`), its manifest's version `version`, ALab's when `alab`
+    /// (its `alab-build.json` beside the manifest): the binary's path.
     fn package_at(root: &Path, version: &str, alab: bool, exe: &[u8]) -> String {
         fs::create_dir_all(root.join("bin")).unwrap();
         fs::write(root.join("bin/codex"), exe).unwrap();
@@ -802,6 +810,9 @@ mod tests {
     }
 
     /// THE LAUNCHER EXECS CODEX BY PATH, `--no-daemon` ONLY WHERE IT IS
+    /// TAKEN: codex-alab's package (its ALab build mark beside the manifest)
+    /// is launched with `--no-daemon` before the caller's arguments, in the
+    /// tab and in `codex-run`, its bytes unread.
     #[test]
     fn the_launcher_execs_codex_by_path_with_no_daemon_where_it_is_taken() {
         let scratch = aterm_tempfile::tempdir().expect("exclusive package fixture");
@@ -903,6 +914,10 @@ mod tests {
     }
 
     /// The literal is found wherever it lies, across the seam of two read
+    /// blocks too, and nowhere it is not: a file whose only `no-daemon`
+    /// straddles the first 4 MiB block's end is read as naming it, the same
+    /// file with one byte of it changed is not, and a directory is never
+    /// opened.
     #[test]
     fn a_binary_names_the_flag_across_a_block_seam() {
         let scratch = aterm_tempfile::tempdir().expect("exclusive binary fixture");

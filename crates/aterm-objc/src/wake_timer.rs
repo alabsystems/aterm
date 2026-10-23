@@ -1,32 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The run-loop wake timer — the one `CFRunLoopTimer` aterm arms, and why its
-//! repeat interval is a year.
-//!
-//! After a repeating timer's callout, CoreFoundation advances its fire date
-//! one interval at a time until it passes the current time:
-//!
-//! ```text
-//! nextFireTSR = oldFireTSR;
-//! while (nextFireTSR <= mach_absolute_time_at_entry) nextFireTSR += intervalTSR;
-//! ```
-//!
-//! That is one iteration per interval of lateness, with the run-loop lock held,
-//! so every thread touching the main run loop (`CFRunLoopWakeUp`,
-//! `CFRunLoopPerformBlock`) parks behind it. At a 0.1 µs interval (2 ticks of
-//! the 24 MHz timebase), a process not scheduled for a day spins for minutes in
-//! `__CFRunLoopDoTimer`.
-//!
-//! So the waker polls by re-arming, and its repeat interval is
-//! [`WAKE_TIMER_REPEAT_SECS`], a year: any survivable lateness costs one step.
-//! After firing, the timer is spent (next date a year out) until re-armed; the
-//! callout records that, so [`WakePlan`] never trusts a stale "already armed
-//! for now" (model: `aterm_models_core::run_loop_waker_model`).
-//!
-//! This is the only place that creates a run-loop timer: the `runloop-timer`
-//! guard of `aterm-census --guards` fences `CFRunLoopTimerCreate` and the
-//! `NSTimer` constructors to it.
+//! CoreFoundation run-loop wake timer ([`WAKE_TIMER_REPEAT_SECS`], [`WakePlan`]).
 
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -40,11 +15,6 @@ use crate::cf::{
 use crate::declare::MainThread;
 
 /// The repeat interval handed to CoreFoundation, in seconds: one Julian year.
-///
-/// Not a cadence: it bounds CoreFoundation's catch-up walk (the loop in the
-/// module docs), so shorter lateness costs one step however long the process
-/// was stopped. CoreFoundation clamps intervals above ~16 years, so
-/// this is honoured as written.
 pub const WAKE_TIMER_REPEAT_SECS: f64 = 31_557_600.0;
 
 /// How the waker was last armed, as the event loop asked for it.
@@ -69,13 +39,7 @@ pub enum WakeArm {
     Disarm,
 }
 
-/// The waker's decision state, with no CoreFoundation in it — the part the
-/// derived model binds to.
-///
-/// `armed` is what the event loop last asked for; `spent` is whether the timer
-/// has fired since. A spent timer is parked a year out, so `armed == Some(Now)`
-/// with `spent` set is not "already armed"; treating it as one loses every
-/// wake after the first.
+/// CoreFoundation-independent decision state bound to the derived model.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WakePlan {
     armed: Option<WakeTarget>,
@@ -98,8 +62,7 @@ impl WakePlan {
         self.armed
     }
 
-    /// Whether the timer fired since it was last armed, i.e. is parked a year
-    /// out until the next arm.
+    /// Whether the timer fired since it was last armed, i.e.
     #[must_use]
     pub const fn spent(&self) -> bool {
         self.spent
@@ -149,8 +112,6 @@ impl WakePlan {
     }
 }
 
-// The timer's half of CoreFoundation stays here (the `runloop-timer` guard);
-// the run loop's shared half is `crate::cf`'s.
 type CFRunLoopTimerRef = *mut c_void;
 
 #[repr(C)]
@@ -181,24 +142,15 @@ unsafe extern "C" {
     fn CFRunLoopTimerInvalidate(timer: CFRunLoopTimerRef);
 }
 
-/// The callout. `info` is the timer's [`Cell`] flag, kept alive by the
-/// [`WakeTimer`] that owns the timer; the timer is invalidated before the flag
-/// is dropped. `extern "C"` and panic-free (one `Cell::set`).
+/// The callout ([`Cell`], [`WakeTimer`]).
 extern "C" fn wake_timer_fired(_timer: CFRunLoopTimerRef, info: *mut c_void) {
     if !info.is_null() {
-        // SAFETY: `info` is `Rc::as_ptr` of the owning `WakeTimer`'s flag,
-        // which outlives the timer (see `Drop`); a `Cell` is written through a
-        // shared reference on the one thread the timer's run loop runs on.
+        // SAFETY: `info` is `Rc::as_ptr` of the owning `WakeTimer`'s flag.
         unsafe { (*info.cast::<Cell<bool>>()).set(true) };
     }
 }
 
-/// A run-loop wake timer that cannot make CoreFoundation spin: repeat interval
-/// [`WAKE_TIMER_REPEAT_SECS`], re-armed by [`WakePlan`] on every request the
-/// timer has not already got pending.
-///
-/// `!Send`: the callout writes the fired flag on the run loop's own thread, so
-/// the timer and its owner stay there.
+/// A run-loop wake timer that cannot make CoreFoundation spin.
 pub struct WakeTimer {
     timer: CFRunLoopTimerRef,
     fired: Rc<Cell<bool>>,
@@ -220,20 +172,19 @@ impl WakeTimer {
     /// The event loop's waker: the main run loop, in every common mode.
     #[must_use]
     pub fn main(_mtm: MainThread) -> Self {
-        // SAFETY: plain CoreFoundation getters; the common-modes constant is
-        // a static CFString CoreFoundation owns.
+        // SAFETY: Plain CoreFoundation getters.
         unsafe { Self::on(CFRunLoopGetMain(), kCFRunLoopCommonModes) }
     }
 
-    /// A waker on the calling thread's run loop, default mode — for a thread
-    /// running its own loop, or a test driving the real timer off the main run
-    /// loop.
+    /// A waker on the calling thread's run loop, default mode.
     #[must_use]
     pub fn current_thread() -> Self {
-        // SAFETY: as in `main`.
+        // SAFETY: As in `main`.
         unsafe { Self::on(CFRunLoopGetCurrent(), kCFRunLoopDefaultMode) }
     }
 
+    /// `run_loop` and `mode` are a live run loop and run-loop mode name.
+    ///
     /// # Safety
     /// `run_loop` and `mode` are a live run loop and run-loop mode name.
     unsafe fn on(run_loop: CFRunLoopRef, mode: CFStringRef) -> Self {
@@ -245,10 +196,7 @@ impl WakeTimer {
             release: None,
             copy_description: None,
         };
-        // SAFETY: CoreFoundation copies `context`; the flag it points at lives
-        // as long as `Self` (the timer is invalidated in `Drop` first). The
-        // first fire date is beyond CoreFoundation's limit, so the timer starts
-        // disarmed, matching `WakePlan::new`.
+        // SAFETY: CoreFoundation copies `context`.
         let timer = unsafe {
             CFRunLoopTimerCreate(
                 std::ptr::null(),
@@ -278,7 +226,7 @@ impl WakeTimer {
         }
     }
 
-    /// The plan, with any fire since the last call folded in.
+    /// Return the plan after folding in any fire since the last call.
     pub fn plan(&mut self) -> WakePlan {
         self.sync();
         self.plan
@@ -306,25 +254,20 @@ impl WakeTimer {
     }
 
     fn apply(&mut self, now: Instant, arm: WakeArm) {
-        // SAFETY: a plain getter.
+        // SAFETY: A plain getter.
         let current = unsafe { CFAbsoluteTimeGetCurrent() };
         let date = match arm {
             WakeArm::Keep => return,
-            // CoreFoundation turns any past date into "now", so the current
-            // time is "now", and the date the catch-up bound is measured from.
             WakeArm::Now => current,
             WakeArm::At(at) => current + at.saturating_duration_since(now).as_secs_f64(),
             WakeArm::Disarm => f64::MAX,
         };
         self.armed_date = (arm != WakeArm::Disarm).then_some(date);
-        // SAFETY: `self.timer` is live until `Drop`; a finite or MAX date is
-        // accepted (CoreFoundation clamps the latter to its own limit).
+        // SAFETY: `self.timer` is live until `Drop`.
         unsafe { CFRunLoopTimerSetNextFireDate(self.timer, date) };
     }
 
-    /// CoreFoundation's next fire date for this timer (absolute time, seconds
-    /// since 2001) — what the timer will actually do, as opposed to what the
-    /// plan asked for.
+    /// CoreFoundation's next fire date for this timer (absolute time, seconds since 2001).
     #[must_use]
     pub fn next_fire_date(&self) -> f64 {
         // SAFETY: `self.timer` is live until `Drop`.
@@ -337,11 +280,10 @@ impl WakeTimer {
         self.armed_date
     }
 
-    /// Whether the timer will fire within `horizon` — i.e. is armed and not
-    /// spent, as CoreFoundation itself reports it.
+    /// Whether the timer will fire within `horizon` — i.e.
     #[must_use]
     pub fn fires_within(&self, horizon: Duration) -> bool {
-        // SAFETY: a plain getter.
+        // SAFETY: A plain getter.
         let now = unsafe { CFAbsoluteTimeGetCurrent() };
         self.next_fire_date() <= now + horizon.as_secs_f64()
     }
@@ -349,9 +291,7 @@ impl WakeTimer {
 
 impl Drop for WakeTimer {
     fn drop(&mut self) {
-        // SAFETY: the timer is live; invalidating removes it from every run
-        // loop, so the callout can no longer reach `self.fired`, which drops
-        // after this body.
+        // SAFETY: The timer is live.
         unsafe {
             CFRunLoopTimerInvalidate(self.timer);
             CFRelease(self.timer.cast_const());

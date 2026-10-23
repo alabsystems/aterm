@@ -1,24 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Windows lane's desk, as data: what a windowed run in the guest's
-//! desktop session ([`crate::windows_window`]) reads and sends.
-//!
-//! - [`HELPER`], the PowerShell the run copies to [`HELPER_PATH`] and runs in
-//!   the runner's desktop session (a windowless Task Scheduler task,
-//!   [`crate::windows_guest::Desktop::Hidden`]): it reads a process's
-//!   top-level windows (class, rectangle, client size, DPI, foreground,
-//!   per-monitor awareness, the window's thread's keyboard layout and whether
-//!   its IME is open), the monitors (name, rectangle, DPI, primary, display
-//!   scaling, adapter), makes a monitor primary, sets a monitor's display
-//!   scaling, and starts `aterm-gui` with its pid and exit status written down.
-//!   Each answer is one line of `key=value` words.
-//! - The QMP commands that type on the VM's USB keyboard and move and press
-//!   its USB tablet: input as a person's hardware sends it, through Windows'
-//!   own input stack (focus, IME, window manager), which no control verb of
-//!   aterm's can stand in for.
-//!
-//! Everything here is text, so all of it is tested without a VM.
+//! The Windows lane's desk, as data.
 
 use std::fmt::Write as _;
 
@@ -30,31 +13,8 @@ pub const DESK: &str = r"C:\lane\desk";
 /// Where [`HELPER`] is copied.
 pub const HELPER_PATH: &str = r"C:\lane\desk\desk.ps1";
 
-/// The desk helper (`desk.ps1 <verb> ...`), Windows PowerShell 5.1 with C#
-/// compiled by `Add-Type`, per-monitor-v2 aware so every rectangle is in
-/// physical pixels:
-///
-/// - `windows <pid>`: a `window ...` line per visible top-level window of
-///   `pid`;
-/// - `monitors`: a `monitor ...` line per monitor;
-/// - `primary <name>`: that monitor primary at (0,0), every other to its
-///   right, saved; then `monitors`;
-/// - `scale <name> <steps>`: that monitor's display scaling set to `steps`
-///   above its recommended one (Settings' list, 25 % apart from 100 %); then
-///   `monitors`;
-/// - `launch <bin-dir> <dir> <config-base64> [word]...`: `aterm-gui
-///   --control-sock <dir>\aterm.sock [word]... -e powershell.exe -NoLogo
-///   -NoProfile` with `XDG_CONFIG_HOME` and `ATERM_STATE_HOME` in `<dir>`,
-///   its stdout and stderr kept there; its pid written to `<dir>\pid`, then
-///   its exit status to `<dir>\exit` when it ends;
-/// - `readback <pid> <class> <ppm>`: the client area of `pid`'s window of
-///   `class` as its DC holds it (`BitBlt` into a bitmap, then `GetDIBits`),
-///   written as a binary PPM: the pixels a CPU present put on the window.
-///
-/// The display scaling is read and set through `DisplayConfigGetDeviceInfo`
-/// and `DisplayConfigSetDeviceInfo` with the packet types Settings uses (-3
-/// reads the steps a source offers and where it is, -4 sets it), which
-/// Windows does not document.
+/// The desk helper (`desk.ps1 <verb> ...`), Windows PowerShell 5.1 with C# compiled by `Add-Type`,
+/// per-monitor-v2 aware so every rectangle is in physical pixels:
 pub const HELPER: &str = r##"$ErrorActionPreference = 'Stop'
 $verb = $args[0]
 if ($verb -eq 'launch') {
@@ -476,16 +436,13 @@ pub struct Window {
     pub foreground: bool,
     /// `DPI_AWARENESS`: 2 is per-monitor aware.
     pub awareness: i32,
-    /// The window's thread's keyboard layout's language (`0409` English,
-    /// `0411` Japanese).
+    /// The window's thread's keyboard layout's language (`0409` English, `0411` Japanese).
     pub layout: String,
     /// Whether its IME is open; `None` when the IME window did not answer.
     pub ime_open: Option<bool>,
-    /// The machine its process's code is for (`IMAGE_FILE_MACHINE_*` in
-    /// hex: `aa64`, or `8664` for x64 under Prism); `-` when unread.
+    /// The machine its process's code is for; `-` when unread.
     pub machine: String,
-    /// Its IME's conversion mode (`IME_CMODE_*`); `None` when the IME window
-    /// did not answer.
+    /// Its IME's conversion mode (`IME_CMODE_*`); `None` when the IME window did not answer.
     pub conversion: Option<u32>,
 }
 
@@ -519,16 +476,14 @@ pub fn parse_windows(text: &str) -> Vec<Window> {
         .collect()
 }
 
-/// Where a window's client area is, as a `readback`, `place` or `move` line
-/// says it: `client=<w>x<h> at=<x>,<y> screen=<l>,<t>,<r>,<b>`.
+/// Where a window's client area is, as a `readback`, `place` or `move` line says it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Place {
     /// The client area's size.
     pub client: (usize, usize),
     /// Its top-left on the virtual screen.
     pub at: (i32, i32),
-    /// The virtual screen: the rectangle every monitor lies in. Windows
-    /// draws no window pixel outside it.
+    /// The virtual screen: the rectangle every monitor lies in.
     pub screen: Rect,
 }
 
@@ -578,8 +533,7 @@ pub struct Monitor {
     pub rect: Rect,
     pub dpi: u32,
     pub primary: bool,
-    /// Its display scaling steps: the lowest, where it is, the highest (0
-    /// is the recommended one); `None` when it offers none.
+    /// Its display scaling steps: the lowest, where it is, the highest; `None` when it offers none.
     pub scale: Option<(i32, i32, i32)>,
     /// Its adapter's name (`Red Hat VirtIO GPU DOD controller`).
     pub adapter: String,
@@ -610,12 +564,10 @@ pub fn parse_monitors(text: &str) -> Vec<Monitor> {
         .collect()
 }
 
-/// What the virtio-gpu's adapter is called once virtio-win's display driver
-/// drives it.
+/// What the virtio-gpu's adapter is called once virtio-win's display driver drives it.
 pub const VIRTIO_ADAPTER: &str = "VirtIO GPU";
 
-/// The USB keyboard's keys (QEMU qcodes) that type `c` on a US layout, the
-/// modifier first; `None` for a character it has no key for.
+/// The USB keyboard's keys (QEMU qcodes) that type `c` on a US layout, the modifier first.
 #[must_use]
 pub fn qcodes(c: char) -> Option<Vec<&'static str>> {
     const LETTERS: [&str; 26] = [
@@ -670,8 +622,7 @@ pub fn qcodes(c: char) -> Option<Vec<&'static str>> {
     }
 }
 
-/// QMP's `send-key` for the chord `keys` (qcodes, pressed in order, released
-/// together after `hold_ms`).
+/// QMP's `send-key` for the chord `keys`.
 #[must_use]
 pub fn key_command(keys: &[&str], hold_ms: u32) -> String {
     let mut s = String::from("{\"execute\":\"send-key\",\"arguments\":{\"keys\":[");
@@ -685,12 +636,11 @@ pub fn key_command(keys: &[&str], hold_ms: u32) -> String {
     s
 }
 
-/// The USB tablet's range on each axis: QEMU scales it to Windows' primary
-/// monitor.
+/// The USB tablet's range on each axis: QEMU scales it to Windows' primary monitor.
 pub const TABLET_MAX: i64 = 32767;
 
-/// QMP's `input-send-event` that moves the tablet to `(x, y)` on a primary
-/// monitor `width` x `height` pixels (clamped to it).
+/// QMP's `input-send-event` that moves the tablet to `(x, y)` on a primary monitor `width` x
+/// `height` pixels (clamped to it).
 #[must_use]
 pub fn tablet_move(x: i32, y: i32, width: i32, height: i32) -> String {
     let axis = |v: i32, extent: i32| {
@@ -784,8 +734,6 @@ mod tests {
         assert_eq!(m[1].adapter, "Microsoft Basic Display Adapter");
 
         assert_eq!(parse_place("error=no-window\r\n"), None);
-        // The launch at 150 %'s window as the lane found it: 12 client rows past
-        // the virtual screen's bottom edge.
         let cut = parse_place("readback client=1076x939 at=239,273 screen=0,0,2720,1200\r\n")
             .expect("a place");
         assert_eq!(cut.client, (1076, 939));
@@ -861,7 +809,6 @@ mod tests {
         ] {
             assert!(aterm_json::from_str::<aterm_json::Value>(&c).is_ok(), "{c}");
         }
-        // The tablet spans the primary monitor: its last pixel is the range's end.
         assert!(tablet_move(0, 0, 1920, 1200).contains("\"value\":0}"));
         assert!(tablet_move(1919, 1199, 1920, 1200).contains(&format!("\"value\":{TABLET_MAX}}}")));
         assert!(
@@ -880,7 +827,6 @@ mod tests {
             instance_dir(guest::Arch::X86_64, 2),
             "C:\\lane\\desk\\x86_64-2"
         );
-        // Every verb the run sends is one the helper answers.
         for verb in [
             "'windows'",
             "'monitors'",

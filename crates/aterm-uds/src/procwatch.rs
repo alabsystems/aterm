@@ -1,43 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A kernel witness of a session's `exec`s (card engine §3.3): the order in which the image that
-//! writes to a terminal changes, so the PTY reader can cut its byte stream there.
-//!
-//! Darwin's `kqueue` `EVFILT_PROC` reports `NOTE_FORK`, `NOTE_EXEC` and `NOTE_EXIT` for any
-//! process this user may signal. One kqueue per session watches:
-//! * the shell, `EV_CLEAR` with `NOTE_FORK|NOTE_EXEC|NOTE_EXIT` (the knote outlives an `exec`, so
-//!   `exec claude` at the prompt is the shell's own `NOTE_EXEC`);
-//! * each of its children, at most [`MAX_CHILDREN`], `NOTE_EXEC|NOTE_EXIT`, registered at the
-//!   shell's `NOTE_FORK` **before** its current image is read, so an `exec` that already
-//!   happened is still seen ([`ProcEvent::Exec`] with `late`);
-//! * the terminal's holder when it is none of those ([`ProcWatch::follow`]): an adopted or
-//!   restored session's job, or a child past the cap.
-//!
-//! A child cannot write before its `exec` returns, and XNU activates the `NOTE_EXEC` knote
-//! inside the `exec`, before the new image runs. So a `poll(2)` that finds the kqueue quiet
-//! proves that no watched process had replaced its image when the poll began: every byte read
-//! before then was written by an image the reader already knows. That is what lets the reader
-//! cut at the last quiet poll rather than at the one that saw the event (`aterm-gui`'s
-//! `FgCutter::proc_seen`).
-//!
-//! The descriptor joins the reader's own polls ([`ProcWatch::fd`]); [`ProcWatch::drain`] runs
-//! only after one said it is readable, so a batch with no process event costs no system call.
-//!
-//! [`ProcWatch::new`] answers `None` off Darwin (Linux has no unprivileged exec event: the proc
-//! connector needs `CAP_NET_ADMIN`, and a pidfd reports no exec) and when the kqueue cannot be
-//! made (`EMFILE`) or the shell is already gone; [`ProcWatch::open`] says which ([`NoWatch`]).
-//! The reader then runs its byte-driven arm.
-//!
-//! A reader's test drives a scripted watch instead ([`ProcWatch::scripted`]): a pipe whose read
-//! end is the descriptor and a queue of events a [`ProcScript`] posts.
+//! Session `exec` process watcher ([`ProcWatch::new`], [`ProcWatch::open`],
+//! [`ProcWatch::fd`], [`ProcWatch::drain`], [`ProcWatch::follow`],
+//! [`ProcWatch::scripted`], [`ProcScript`], [`ProcEvent::Exec`], [`MAX_CHILDREN`],
+//! [`NoWatch`]).
 
 #[cfg(target_vendor = "apple")]
 use crate::exitwatch::kq;
 
-/// How many of the shell's children one watch registers. Past this, a child's `exec` is seen
-/// only by the reader's foreground sampling (and by [`ProcWatch::follow`] once it holds the
-/// terminal), and [`ProcWatch::overflow`] counts it.
+/// How many of the shell's children one watch registers.
 pub const MAX_CHILDREN: usize = 16;
 
 /// What the kernel reported, in the order the reader should hear it.
@@ -54,12 +26,7 @@ pub enum ProcEvent {
         pid: i32,
         /// Its process group, read as the event was drained (`0`: already gone or unreadable).
         pgid: i32,
-        /// The `exec` may already be known: it was found done when the process was first
-        /// registered (`posix_spawn`, an `exec` that beat the reader to the fork, an adopted or
-        /// followed process), or this is the first event after such a find, which can report
-        /// that same `exec` (XNU marks the process exec'd before it posts `NOTE_EXEC`). A reader
-        /// makes an edge of a late one only where the image it reads differs from the one it
-        /// holds.
+        /// The `exec` may already be known.
         late: bool,
     },
     /// A watched process ended (its knote went with it).
@@ -76,8 +43,7 @@ pub enum NoWatch {
     Unsupported,
     /// The shell is no process anyone watches (`<= 1`), or it is already gone.
     NoShell,
-    /// No kqueue could be made (`EMFILE`, `ENFILE`, `ENOMEM`): the reader's byte-driven arm
-    /// covers the session in full.
+    /// No kqueue could be made (`EMFILE`, `ENFILE`, `ENOMEM`).
     NoQueue,
 }
 
@@ -90,12 +56,10 @@ struct Child {
     late: bool,
 }
 
-/// The kernel calls the watch's bookkeeping makes ([`Tracked`]): the kqueue on Darwin, a
-/// scripted kernel in its tests.
+/// The kernel calls the watch's bookkeeping makes ([`Tracked`]).
 #[cfg(any(target_vendor = "apple", test))]
 trait Kernel {
-    /// Register `pids` for `NOTE_EXEC|NOTE_EXIT`, one call: whether each is now watched (a
-    /// gone or exiting process is not).
+    /// Register `pids` for `NOTE_EXEC|NOTE_EXIT`, one call.
     fn register(&mut self, pids: &[i32]) -> Vec<bool>;
     /// Drop `pid`'s knote.
     fn delete(&mut self, pid: i32);
@@ -103,11 +67,7 @@ trait Kernel {
     fn info(&mut self, pid: i32) -> Option<ProcShort>;
 }
 
-/// The watch's bookkeeping: which of the shell's children are registered, which the cap left
-/// out, and the followed holder. Its laws hold whatever the kernel answers, so its tests drive
-/// it with a scripted [`Kernel`]: a process is registered BEFORE its image is read (an `exec`
-/// after the read is then an event), each child past [`MAX_CHILDREN`] counts once, and a
-/// process found exec'd at registration is `late` until its first kernel `exec`.
+/// The watch's bookkeeping ([`Kernel`], [`MAX_CHILDREN`]).
 #[cfg(any(target_vendor = "apple", test))]
 #[derive(Debug, Default)]
 struct Tracked {
@@ -120,9 +80,7 @@ struct Tracked {
 
 #[cfg(any(target_vendor = "apple", test))]
 impl Tracked {
-    /// Track the existing child `pid` (a new watch's, with no event for its past). One found
-    /// exec'd is `late`: it may be inside that `exec`, whose `NOTE_EXEC` the new knote can still
-    /// receive.
+    /// Track the existing child `pid` (a new watch's, with no event for its past).
     fn adopt(&mut self, pid: i32, kernel: &mut impl Kernel) {
         if self.children.len() >= MAX_CHILDREN {
             self.overflow = self.overflow.saturating_add(1);
@@ -135,8 +93,7 @@ impl Tracked {
         }
     }
 
-    /// The shell forked and has the children `now`: watch each new one (register first, then
-    /// read its image), up to the cap.
+    /// The shell forked and has the children `now`.
     fn forked(&mut self, now: &[i32], kernel: &mut impl Kernel, out: &mut Vec<ProcEvent>) {
         self.unwatched.retain(|pid| now.contains(pid));
         let followed = self.followed.map(|f| f.pid);
@@ -175,9 +132,7 @@ impl Tracked {
         }
     }
 
-    /// Watch `leader`, the terminal's holder, unless something already does; the previous
-    /// followed process is dropped. Registered before its image is read, and `late` when found
-    /// exec'd, as an adopted child.
+    /// Watch `leader`, the terminal's holder, unless something already does.
     fn follow(&mut self, leader: i32, shell: i32, kernel: &mut impl Kernel) {
         if leader <= 1
             || leader == shell
@@ -217,7 +172,7 @@ impl Tracked {
     }
 }
 
-/// One session's process watch. See the module docs.
+/// One session's process watch.
 #[derive(Debug)]
 pub struct ProcWatch {
     /// The kqueue, or a scripted watch's pipe read end.
@@ -238,8 +193,7 @@ struct Script {
     drains: std::sync::atomic::AtomicUsize,
 }
 
-/// The test side of a [`ProcWatch::scripted`] watch: posts events and reads back what the
-/// reader did with the watch.
+/// The test side of a [`ProcWatch::scripted`] watch.
 #[cfg(any(test, debug_assertions))]
 #[derive(Debug, Clone)]
 pub struct ProcScript {
@@ -307,16 +261,13 @@ impl Kernel for Kqueue<'_> {
 }
 
 impl ProcWatch {
-    /// Watch the shell `shell_pid` and the children it has now (an adopted or restored session's
-    /// running job among them, with no event for their past). `None` where [`ProcWatch::open`]
-    /// says why not.
+    /// Watch `shell_pid` and its current children.
     #[must_use]
     pub fn new(shell_pid: i32) -> Option<Self> {
         Self::open(shell_pid).ok()
     }
 
-    /// [`ProcWatch::new`], saying why there is no watch: off Darwin, when the shell is not a
-    /// process anyone watches (`<= 1`) or is gone, and when no kqueue can be made.
+    /// [`ProcWatch::new`], saying why there is no watch.
     #[cfg(target_vendor = "apple")]
     // Skip: bottoms out at the `kqueue`/`kevent`/`fcntl` FFI calls.
     #[cfg_attr(trust_verify, trust::skip)]
@@ -332,8 +283,7 @@ impl ProcWatch {
         }
         // SAFETY: `raw` is a fresh descriptor this process exclusively owns.
         let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-        // Close-on-exec by house rule (Darwin does not inherit a kqueue across fork anyway).
-        // SAFETY: F_SETFD takes an int and touches only this descriptor's flags.
+        // SAFETY: Set close-on-exec on the kqueue descriptor.
         unsafe { kq::fcntl(fd.as_raw_fd(), kq::F_SETFD, kq::FD_CLOEXEC) };
         let shell_notes = libc::NOTE_FORK | libc::NOTE_EXEC | kq::NOTE_EXIT;
         if register(&fd, &[shell_pid], shell_notes) != [true] {
@@ -359,7 +309,6 @@ impl ProcWatch {
     }
 
     /// A watch that reports only what its [`ProcScript`] posts, for a reader under test.
-    /// `None` when no pipe can be made.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn scripted(shell_pid: i32) -> Option<(Self, ProcScript)> {
@@ -397,7 +346,7 @@ impl ProcWatch {
         self.fd.as_raw_fd()
     }
 
-    /// The shell this watch was made for.
+    /// Return the watched shell's PID.
     #[must_use]
     pub fn shell(&self) -> i32 {
         self.shell
@@ -417,14 +366,12 @@ impl ProcWatch {
         0
     }
 
-    /// Take every queued event into `out`, oldest first. A shell's fork registers its new
-    /// children first and reads each one's image after ([`ProcEvent::Fork`], then a `late`
-    /// [`ProcEvent::Exec`] for one that has already `exec`ed). Never blocks.
+    /// Take every queued event into `out`, oldest first ([`ProcEvent::Fork`], [`ProcEvent::Exec`]).
     pub fn drain(&mut self, out: &mut Vec<ProcEvent>) {
         #[cfg(any(test, debug_assertions))]
         if let Some(script) = &self.script {
             let mut sink = [0u8; 64];
-            // SAFETY: reading into `sink`'s 64 bytes from this watch's own non-blocking pipe.
+            // SAFETY: Reading into `sink`'s 64 bytes from this watch's own non-blocking pipe.
             while unsafe { libc::read(self.fd(), sink.as_mut_ptr().cast(), sink.len()) } > 0 {}
             script
                 .drains
@@ -444,10 +391,7 @@ impl ProcWatch {
         let _ = out;
     }
 
-    /// Keep `NOTE_EXEC|NOTE_EXIT` on `leader`, the terminal's holder, when nothing else watches
-    /// it (an adopted job, a child past the cap). The previous followed process is dropped.
-    /// Registered before the caller reads `leader`'s image, so an `exec` after that read is an
-    /// event; one found exec'd is `late` until its first kernel `exec`.
+    /// Watch `NOTE_EXEC|NOTE_EXIT` on the terminal's foreground `leader` if not already watched.
     pub fn follow(&mut self, leader: i32) {
         #[cfg(any(test, debug_assertions))]
         if let Some(script) = &self.script {
@@ -540,8 +484,7 @@ impl ProcWatch {
     }
 }
 
-/// Register `pids` with `fflags`, `EV_CLEAR`, one call, each answering in its own receipt:
-/// whether it is now watched (a gone or exiting process is not).
+/// Register `pids` with `fflags`, `EV_CLEAR`, one call, each answering in its own receipt.
 #[cfg(target_vendor = "apple")]
 // Skip: bottoms out at the `kevent` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -566,8 +509,7 @@ fn register(fd: &std::os::fd::OwnedFd, pids: &[i32], fflags: u32) -> Vec<bool> {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    // SAFETY: `n` change entries and `n` receipt slots, live for the call; EV_RECEIPT
-    // answers every change in its own slot (never a pending event: the slots are full).
+    // SAFETY: `n` change entries and `n` receipt slots, live for the call.
     let got = unsafe {
         kq::kevent(
             fd.as_raw_fd(),
@@ -602,7 +544,7 @@ fn delete(fd: &std::os::fd::OwnedFd, pid: i32) {
         data: 0,
         udata: std::ptr::null_mut(),
     };
-    // SAFETY: one change entry, live for the call; no event list requested.
+    // SAFETY: One change entry, live for the call; no event list requested.
     unsafe {
         kq::kevent(
             fd.as_raw_fd(),
@@ -637,9 +579,7 @@ pub struct ProcShort {
     pub execed: bool,
 }
 
-/// `pid`'s group and whether it has `exec`ed, from its short BSD record
-/// ([`crate::process::read_short_info`]), which answers for another user's process too. `None`
-/// for a gone, zombie or unreadable process.
+/// Read `pid`'s process group and `exec` flag via [`crate::process::read_short_info`].
 #[cfg(target_vendor = "apple")]
 #[must_use]
 pub fn short_info(pid: i32) -> Option<ProcShort> {

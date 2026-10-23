@@ -10,6 +10,8 @@ use crate::harness;
 use harness::{FLEET, World, kv, until};
 
 /// The first cross-aterm message: `post to=@s-B kind=ask --wait` answers `OK <id>
+/// off=<R>`, the record lands in B's inbox as `from=<A sid>@<node> trust=agent
+/// off=<R>`, B answers `re=R`, and A's drain shows it with `re-id=<the post id>`.
 #[test]
 fn a_post_lands_in_a_peers_inbox_and_its_answer_comes_back() {
     let w = World::boot("ask", &[]);
@@ -56,6 +58,7 @@ fn a_post_lands_in_a_peers_inbox_and_its_answer_comes_back() {
 }
 
 /// A `task` from an unlisted principal arrives `demoted=task`: delivered, but never as
+/// an instruction.
 #[test]
 fn a_task_from_an_unlisted_principal_arrives_demoted() {
     let w = World::boot("demote", &["a-orchestrator"]);
@@ -162,6 +165,8 @@ fn a_forged_subject_never_reaches_an_inbox_and_is_recorded() {
 }
 
 /// The fleet halt: a human's `halt state=on` holds every session the node hosts (a
+/// `send` answers `ERR halted`), and the node acks the halt at its offset with
+/// `state=held`, so `Last{…/node/ack}` with `re=<halt-offset>` counts who obeyed.
 #[test]
 fn a_fleet_halt_holds_every_session_and_is_acked_at_its_offset() {
     let w = World::boot("halt", &[]);
@@ -265,6 +270,8 @@ fn a_dead_broker_keeps_the_hold_and_queues_the_posts_until_it_returns() {
 }
 
 /// No bus record moves a PTY byte: an `answer`, `task`, `control`, `note` and `ack`
+/// from every principal class, each carrying the `re=` and `gen=` a drive record
+/// would, leave the terminal untouched.
 #[test]
 fn no_bus_record_ever_reaches_a_pty() {
     let w = World::boot("pty", &["h-andrew", "s-1"]);
@@ -307,6 +314,8 @@ fn no_bus_record_ever_reaches_a_pty() {
 }
 
 /// Every connection carries its own will: a broker restart fires the will of the
+/// connection it cut and the reconnect registers a new one, a `SIGKILL` of the
+/// bridge then fires exactly that one, and the relaunch publishes `live` above it.
 #[test]
 fn every_connection_carries_its_own_will_across_a_broker_restart_and_a_kill() {
     let mut w = World::boot("will", &[]);
@@ -408,6 +417,8 @@ fn bodies_under(w: &World, filter: &str) -> Vec<String> {
 }
 
 /// **A BRIDGE THROUGH AN UPDATE'S ORDERING: the predecessor's aterm goes while
+/// its bridge is mid-drain, and the successor's starts at once on the same
+/// state dir.**
 #[test]
 fn an_orphaned_bridge_mid_drain_neither_publishes_more_nor_shares_the_node() {
     #[derive(Debug, PartialEq, Eq)]

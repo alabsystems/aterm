@@ -1,31 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The pipeline table: the single declaration of every render pipeline, read
-//! by both backends.
-//!
-//! Each row holds entry points, blend, write mask, colour-target role, vertex
-//! layout and topology. The wgpu backend builds every pipeline through
-//! [`build_wgpu`], this module's one constructor, whose descriptor parts are
-//! private here, and `metal/pipelines.rs` builds `MTLRenderPipelineState`s from
-//! the same rows. No other construction site can spell this state, so the
-//! backends cannot drift: the workspace `clippy.toml` refuses
-//! `wgpu::Device::create_render_pipeline` outside [`build_wgpu`],
-//! `metal::pipelines::tests` fails a row Metal cannot express, and the
-//! Metal-vs-wgpu byte differentials in `metal::tests` fail a row the two
-//! backends draw differently.
-//!
-//! There is one row per pipeline. `build_glow_boost_pipeline` is one
-//! construction site for two rows (the HDR crown, `fs_hdr_glow` on
-//! `Rgba16Float` One/One, and the SDR crown, `fs_sdr_glow` on the swapchain
-//! format with `Screen`).
-//!
-//! Not held here: bind-group layouts, buffers, samplers and pipeline layouts
-//! (per-backend objects). Where those bind on the explicit-slot backends is the
-//! [`BindSpec`] column.
-
-/// Which shader module a pipeline's entry points live in: one WGSL const in
-/// `renderer.rs` and its `.metal` twin beside `crate::metal::shaders`.
+//! Shared render pipeline specification table ([`PIPELINES`], [`build_wgpu`]) for the wgpu and Metal backends.
+/// Shader module containing a pipeline's entry points.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum ShaderLibrary {
     /// `renderer.rs::SHADER` / `shaders/cell.metal`.
@@ -43,7 +20,7 @@ pub(crate) enum ShaderLibrary {
 }
 
 impl ShaderLibrary {
-    /// The library's short name — the `.metal` file stem.
+    /// Returns the `.metal` file stem for this shader library.
     #[inline]
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) const fn name(self) -> &'static str {
@@ -57,7 +34,7 @@ impl ShaderLibrary {
         }
     }
 
-    /// Every library, in declaration order.
+    /// All shader libraries in declaration order.
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) const ALL: [Self; 6] = [
         Self::Cell,
@@ -69,9 +46,7 @@ impl ShaderLibrary {
     ];
 }
 
-/// A blend factor: a closed set mapped exhaustively onto
-/// `crate::metal::ffi::BlendFactor` by `metal::pipelines`, so a new factor
-/// cannot land on one backend only.
+/// Blend factor shared by wgpu and Metal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Factor {
     /// `wgpu::BlendFactor::Zero` / `MTLBlendFactorZero`.
@@ -82,13 +57,12 @@ pub(crate) enum Factor {
     SrcAlpha,
     /// `wgpu::BlendFactor::OneMinusSrcAlpha` / `MTLBlendFactorOneMinusSourceAlpha`.
     OneMinusSrcAlpha,
-    /// `wgpu::BlendFactor::OneMinusSrc` / `MTLBlendFactorOneMinusSourceColor`,
-    /// the screen operator's destination factor.
+    /// `wgpu::BlendFactor::OneMinusSrc` / `MTLBlendFactorOneMinusSourceColor`.
     OneMinusSrc,
 }
 
 impl Factor {
-    /// The `wgpu` spelling.
+    /// Converts to `wgpu::BlendFactor`.
     #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) const fn wgpu(self) -> wgpu::BlendFactor {
@@ -102,8 +76,7 @@ impl Factor {
     }
 }
 
-/// The blend equation. Every aterm pipeline adds; `Subtract`/`Min`/`Max` are
-/// deliberately absent so a new one has to be declared on both backends.
+/// Blend operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BlendOp {
     /// `src * src_factor + dst * dst_factor`.
@@ -111,7 +84,7 @@ pub(crate) enum BlendOp {
 }
 
 impl BlendOp {
-    /// The `wgpu` spelling.
+    /// Converts to `wgpu::BlendOperation`.
     #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) const fn wgpu(self) -> wgpu::BlendOperation {
@@ -121,14 +94,14 @@ impl BlendOp {
     }
 }
 
-/// One channel group's blend equation — the RGB half or the alpha half.
+/// Blend equation for one channel group (RGB or alpha).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BlendComponent {
-    /// Factor applied to the fragment's own output.
+    /// Source blend factor.
     pub(crate) src: Factor,
-    /// Factor applied to what the attachment already holds.
+    /// Destination blend factor.
     pub(crate) dst: Factor,
-    /// How the two products combine.
+    /// Blend operation.
     pub(crate) op: BlendOp,
 }
 
@@ -168,7 +141,7 @@ impl BlendComponent {
         op: BlendOp::Add,
     };
 
-    /// The `wgpu` spelling.
+    /// Converts to `wgpu::BlendComponent`.
     #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) const fn wgpu(self) -> wgpu::BlendComponent {
@@ -180,13 +153,12 @@ impl BlendComponent {
     }
 }
 
-/// A pipeline's full blend state, RGB half and alpha half.
+/// Full color and alpha blend state for a pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Blend {
-    /// The RGB channels' equation.
+    /// RGB blend equation.
     pub(crate) color: BlendComponent,
-    /// The alpha channel's equation, stated even under [`WriteMask::Color`],
-    /// where its result is discarded.
+    /// Alpha blend equation.
     pub(crate) alpha: BlendComponent,
 }
 
@@ -198,8 +170,6 @@ impl Blend {
         alpha: BlendComponent::OVER,
     };
     /// `wgpu::BlendState::REPLACE`, kept explicit where the renderer spells it.
-    /// Metal expresses it as blending disabled; [`Self::is_replace`] makes that
-    /// swap deliberate.
     const REPLACE: Self = Self {
         color: BlendComponent::REPLACE,
         alpha: BlendComponent::REPLACE,
@@ -221,8 +191,7 @@ impl Blend {
         alpha: BlendComponent::OVER,
     };
 
-    /// Whether this state is fixed-function REPLACE — i.e. `src*1 + dst*0` on
-    /// both halves, which is arithmetically identical to no blending at all.
+    /// Returns whether both channels perform fixed-function replacement (`src * 1 + dst * 0`).
     #[inline]
     #[cfg(any(target_os = "macos", gl_arm))]
     pub(crate) const fn is_replace(self) -> bool {
@@ -246,7 +215,7 @@ impl Blend {
         )
     }
 
-    /// The `wgpu` spelling.
+    /// Converts to `wgpu::BlendState`.
     #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) const fn wgpu(self) -> wgpu::BlendState {
@@ -257,19 +226,17 @@ impl Blend {
     }
 }
 
-/// Which channels a pipeline's colour attachment may write. Both backends
-/// default to all channels, so a forgotten [`Self::Color`] would turn a
-/// translucent window opaque; the field has no default.
+/// Color attachment channel write mask.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WriteMask {
-    /// `wgpu::ColorWrites::COLOR` — RGB only, alpha left exactly as loaded.
+    /// RGB channels only (`wgpu::ColorWrites::COLOR`).
     Color,
-    /// `wgpu::ColorWrites::ALL`.
+    /// All RGBA channels (`wgpu::ColorWrites::ALL`).
     All,
 }
 
 impl WriteMask {
-    /// The `wgpu` spelling.
+    /// Converts to `wgpu::ColorWrites`.
     #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) const fn wgpu(self) -> wgpu::ColorWrites {
@@ -280,45 +247,34 @@ impl WriteMask {
     }
 }
 
-/// Which attachment a pipeline draws into: a role, since the format depends on
-/// the adapter (`srgb_offscreen`) and the live swapchain.
-/// [`TargetFormats::resolve`] maps a role to its format.
-///
-/// Base OVER/REPLACE passes attach the sRGB view so blending runs in linear
-/// light; additive passes attach the Unorm view of the same texture so One/One
-/// stays byte-exact with the CPU `add_sat`. A wrong choice shows only as a
-/// gamma shift, which is why it is a table column.
+/// Logical color attachment target role for a pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TargetRole {
-    /// The sRGB-typed view of the offscreen — `GpuContext::offscreen_srgb_view_format`.
+    /// sRGB view of the offscreen target.
     OffscreenSrgb,
-    /// The plain-Unorm view of the offscreen — `GpuContext::offscreen_format`.
+    /// Unorm view of the offscreen target.
     OffscreenUnorm,
-    /// The destination the call site was handed: the live swapchain format for
-    /// the blit / tray / SDR crown.
+    /// Live swapchain present target.
     Present,
-    /// Pinned `Rgba16Float` — the EDR crown, the only format
-    /// `format_plan::hdr_present_plan` enables that pass for.
+    /// `Rgba16Float` EDR target.
     Edr,
 }
 
-/// The formats a construction site can offer a [`TargetRole`], built once from
-/// `GpuContext::pipeline_targets`.
+/// Concrete texture formats available to resolve a [`TargetRole`].
 #[derive(Clone, Copy, Debug)]
 #[cfg(wgpu_arm)]
 pub(crate) struct TargetFormats {
-    /// `GpuContext::offscreen_srgb_view_format()`.
+    /// Offscreen sRGB view format.
     pub(crate) offscreen_srgb: wgpu::TextureFormat,
-    /// `GpuContext::offscreen_format()`.
+    /// Offscreen Unorm format.
     pub(crate) offscreen_unorm: wgpu::TextureFormat,
-    /// The destination format this build is for, when the site has one (the
-    /// swapchain). `None` at the sites that only ever build offscreen passes.
+    /// Optional swapchain present format.
     pub(crate) present: Option<wgpu::TextureFormat>,
 }
 
 #[cfg(wgpu_arm)]
 impl TargetFormats {
-    /// The same formats, now also able to satisfy [`TargetRole::Present`].
+    /// Returns a copy with `present` set to `format`.
     #[inline]
     pub(crate) const fn with_present(self, format: wgpu::TextureFormat) -> Self {
         Self {
@@ -327,11 +283,10 @@ impl TargetFormats {
         }
     }
 
-    /// The concrete colour-attachment format for `role`.
+    /// Resolves the concrete `wgpu::TextureFormat` for `role`.
     ///
     /// # Panics
-    /// If `role` is [`TargetRole::Present`] and no destination format was
-    /// supplied (a construction-time programming error).
+    /// Panics if `role` is [`TargetRole::Present`] and `present` is `None`.
     #[inline]
     pub(crate) fn resolve(self, role: TargetRole) -> wgpu::TextureFormat {
         match role {
@@ -345,20 +300,19 @@ impl TargetFormats {
     }
 }
 
-/// The primitive topology. Every aterm draw is a triangle list except the
-/// four-vertex tray strip.
+/// Primitive topology.
 #[cfg(any(wgpu_arm, gl_arm, test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Topology {
-    /// `wgpu::PrimitiveTopology::TriangleList` — `wgpu`'s default.
+    /// `wgpu::PrimitiveTopology::TriangleList`.
     TriangleList,
-    /// `wgpu::PrimitiveTopology::TriangleStrip` — the tray's 4-vertex quad.
+    /// `wgpu::PrimitiveTopology::TriangleStrip`.
     TriangleStrip,
 }
 
 #[cfg(any(wgpu_arm, gl_arm, test))]
 impl Topology {
-    /// The `wgpu` spelling.
+    /// Converts to `wgpu::PrimitiveTopology`.
     #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) const fn wgpu(self) -> wgpu::PrimitiveTopology {
@@ -369,47 +323,38 @@ impl Topology {
     }
 }
 
-/// One vertex attribute, backend-neutral.
+/// Backend-neutral vertex attribute descriptor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct VertexAttr {
-    /// `@location(n)` in WGSL, `[[attribute(n)]]` in MSL.
+    /// Shader attribute location index.
     pub(crate) location: u32,
-    /// The element type.
+    /// Attribute element format.
     pub(crate) format: AttrFormat,
     /// Byte offset within the instance struct.
     pub(crate) offset: u64,
 }
 
-/// A vertex attribute's element type. Exactly the seven `renderer.rs` uses;
-/// the Metal twin is `crate::metal::ffi::VertexFormat`.
+/// Vertex attribute element format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AttrFormat {
-    /// `wgpu::VertexFormat::Uint16x4` / `MTLVertexFormatUShort4` — pixel rects,
-    /// rain falloff, fire geometry.
+    /// `wgpu::VertexFormat::Uint16x4` / `MTLVertexFormatUShort4`.
     Uint16x4,
-    /// `wgpu::VertexFormat::Unorm8x4` / `MTLVertexFormatUChar4Normalized` —
-    /// every packed RGBA colour.
+    /// `wgpu::VertexFormat::Unorm8x4` / `MTLVertexFormatUChar4Normalized`.
     Unorm8x4,
-    /// `wgpu::VertexFormat::Uint8x4` / `MTLVertexFormatUChar4`: the fire `tsl`
-    /// bytes and the glow colour pair, read as raw integers for the integer
-    /// per-column ramp.
+    /// `wgpu::VertexFormat::Uint8x4` / `MTLVertexFormatUChar4`.
     Uint8x4,
-    /// `wgpu::VertexFormat::Float32x4` / `MTLVertexFormatFloat4` — glyph rect
-    /// and UV.
+    /// `wgpu::VertexFormat::Float32x4` / `MTLVertexFormatFloat4`.
     Float32x4,
-    /// `wgpu::VertexFormat::Uint32` / `MTLVertexFormatUInt` — the fire churn
-    /// phase, and the fx palette base and flags.
+    /// `wgpu::VertexFormat::Uint32` / `MTLVertexFormatUInt`.
     Uint32,
-    /// `wgpu::VertexFormat::Sint16x2` / `MTLVertexFormatShort2` — the fx
-    /// item origin (`FxInstance::origin`, stored mod 2¹⁶).
+    /// `wgpu::VertexFormat::Sint16x2` / `MTLVertexFormatShort2`.
     Sint16x2,
-    /// `wgpu::VertexFormat::Uint16x2` / `MTLVertexFormatUShort2` — the fx
-    /// sprite's destination size.
+    /// `wgpu::VertexFormat::Uint16x2` / `MTLVertexFormatUShort2`.
     Uint16x2,
 }
 
 impl AttrFormat {
-    /// The `wgpu` spelling.
+    /// Converts to `wgpu::VertexFormat`.
     #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) const fn wgpu(self) -> wgpu::VertexFormat {
@@ -425,40 +370,35 @@ impl AttrFormat {
     }
 }
 
-/// A per-instance vertex buffer layout: stride and attributes. Every quad is
-/// one instance, so the step mode is always per-instance.
+/// Per-instance vertex buffer layout specification.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct VertexLayoutSpec {
-    /// `size_of` the instance struct, pinned to the Rust type by a `const`
-    /// assert in `renderer.rs`.
+    /// Instance stride in bytes.
     pub(crate) stride: u64,
-    /// The attributes, in `location` order.
+    /// Vertex attributes in location order.
     pub(crate) attrs: &'static [VertexAttr],
 }
 
-/// Which instance stream a pipeline reads.
+/// Instance stream layout kind for a pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VertexLayout {
-    /// No vertex buffer: the fullscreen-triangle and tray passes derive
-    /// positions from `[[vertex_id]]`.
+    /// No vertex buffer (`[[vertex_id]]` only).
     None,
-    /// `renderer.rs::BgInstance` — 12 bytes.
+    /// `BgInstance` (12 bytes).
     Bg,
-    /// `renderer.rs::GlowInstance`, 16 bytes: the rect plus a left/right colour
-    /// pair ([`aterm_render::GlowQuad::color2`]). Used by the glow pipeline and
-    /// both crowns.
+    /// `GlowInstance` (16 bytes, [`aterm_render::GlowQuad::color2`]).
     Glow,
-    /// `renderer.rs::GlyphInstance` — 40 bytes.
+    /// `GlyphInstance` (40 bytes).
     Glyph,
-    /// `renderer.rs::RainGlowInstance` — 20 bytes.
+    /// `RainGlowInstance` (20 bytes).
     RainGlow,
-    /// `renderer.rs::FireInstance` — 24 bytes.
+    /// `FireInstance` (24 bytes).
     Fire,
-    /// `fx_gpu::FxInstance` — 32 bytes: one band slice of one fx item.
+    /// `FxInstance` (32 bytes).
     Fx,
 }
 
-/// `BgInstance`: `[u16;4]` rect + `[u8;4]` colour.
+/// Layout specification for `BgInstance`.
 pub(crate) const BG_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
     stride: 12,
     attrs: &[
@@ -475,10 +415,7 @@ pub(crate) const BG_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
     ],
 };
 
-/// `GlowInstance`: `[u16;4]` rect, `[u8;4]` left colour, `[u8;4]` right colour.
-/// Both colours are `Uint8x4` because the fragment applies
-/// `aterm_render::glow_lerp`'s integer law per column and divides by 255
-/// itself, byte-exact with the CPU.
+/// Layout specification for `GlowInstance`.
 pub(crate) const GLOW_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
     stride: 16,
     attrs: &[
@@ -500,7 +437,7 @@ pub(crate) const GLOW_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
     ],
 };
 
-/// `GlyphInstance`: `f32x4` rect + `f32x4` uv + `[u8;4]` colour + `[u8;4]` aux.
+/// Layout specification for `GlyphInstance`.
 pub(crate) const GLYPH_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
     stride: 40,
     attrs: &[
@@ -527,7 +464,7 @@ pub(crate) const GLYPH_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
     ],
 };
 
-/// `RainGlowInstance`: the bg pair plus the elliptical falloff basis.
+/// Layout specification for `RainGlowInstance`.
 pub(crate) const RAIN_GLOW_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
     stride: 20,
     attrs: &[
@@ -549,8 +486,7 @@ pub(crate) const RAIN_GLOW_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
     ],
 };
 
-/// `FireInstance`: rect + geometry + churn phase + the four packed field bytes.
-/// The widest layout: four attributes over three distinct integer formats.
+/// Layout specification for `FireInstance`.
 pub(crate) const FIRE_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
     stride: 24,
     attrs: &[
@@ -577,10 +513,7 @@ pub(crate) const FIRE_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
     ],
 };
 
-/// `FxInstance`: the slice rect, the item origin (mod 2¹⁶), the sprite's
-/// destination size, the atlas region, the absolute palette base and the
-/// flags (kind, flip, texel kind, Index8 reach). Every field is an integer the
-/// fragment reads flat: pixel law F has no interpolant.
+/// Layout specification for `FxInstance`.
 pub(crate) const FX_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
     stride: 32,
     attrs: &[
@@ -618,7 +551,7 @@ pub(crate) const FX_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
 };
 
 impl VertexLayout {
-    /// The layout's stride + attributes, or `None` for a vertex-id-only pass.
+    /// Returns the [`VertexLayoutSpec`] for this layout, or `None` for [`Self::None`].
     #[inline]
     #[cfg(any(target_os = "macos", gl_arm))]
     pub(crate) const fn spec(self) -> Option<VertexLayoutSpec> {
@@ -735,41 +668,19 @@ static FX_BUFFERS: [wgpu::VertexBufferLayout<'static>; 1] = [wgpu::VertexBufferL
     attributes: &FX_ATTRS,
 }];
 
-/// Where one row's resources bind on the explicit-slot backends (Metal today;
-/// D3D11's per-stage registers take the same numbers, and GL's units and block
-/// bindings the buffer and texture ones). `metal/blit.rs` and the encoder call
-/// sites take their `set*:atIndex:` indices from here.
-///
-/// The instance stream is not here; it always binds at
-/// `metal::ffi::INSTANCE_STREAM_SLOT`.
-///
-/// Relation to the WGSL twins:
-///
-/// * Uniform buffers keep their binding number as the `[[buffer]]` index (cell
-///   and hdr_glow at 0; blit, bloom, shimmer, tray at 2).
-/// * Textures and samplers take per-type sequential slots in `(group, binding)`
-///   order (the blit sampler at `@binding(1)` is `[[sampler(0)]]`).
-/// * wgpu's own internal MSL slots are not described here.
+/// Resource binding slot specification for explicit-slot backends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg(any(target_os = "macos", gl_arm))]
 pub(crate) struct BindSpec {
-    /// The vertex-stage uniform `[[buffer(n)]]` index, or `None` for a
-    /// `[[vertex_id]]`-only function (`vs_fs`, `vs_blit`). Cell and crown
-    /// vertex functions use 0 (safe because the stream binds at
-    /// `INSTANCE_STREAM_SLOT`); `vs_tray` uses 2.
+    /// Vertex uniform buffer slot, or `None` for vertex-id-only passes.
     pub(crate) vertex_uniform: Option<u32>,
-    /// The fragment-stage `[[texture(n)]]` slots, in slot order.
+    /// Fragment texture slots in order.
     pub(crate) fragment_textures: &'static [u32],
-    /// The fragment-stage `[[sampler(n)]]` slots, in slot order.
+    /// Fragment sampler slots in order.
     pub(crate) fragment_samplers: &'static [u32],
-    /// Fragment-stage `[[buffer(n)]]` slots in order. `fs_glyph` re-binds the
-    /// vertex stage's `Uniforms` (argument tables are per stage); post passes
-    /// read their uniform at 2.
+    /// Fragment uniform buffer slots in order.
     pub(crate) fragment_buffers: &'static [u32],
-    /// The fx frame palette's slot, or `None`: Metal binds the per-frame
-    /// palette stream as fragment `[[buffer(n)]]` (`device const uint*`); GL,
-    /// whose GLSL ES 3.00 has no storage buffer, binds the frame slot's
-    /// palette texture as sampler `aterm_t<n>` on texture unit `n`.
+    /// Optional fragment storage buffer slot for the fx palette.
     pub(crate) fragment_palette: Option<u32>,
 }
 
@@ -824,9 +735,7 @@ impl BindSpec {
     /// The fx rows: `Uniforms` at vertex `[[buffer(0)]]`; the R8 (Index8) and
     /// RGBA8 atlases at fragment textures 0 and 1, read by integer texel
     /// address (`read`, `texelFetch`, `textureLoad`), so no sampler; and the
-    /// frame palette at slot 2 ([`Self::fragment_palette`]). GL pairs each
-    /// texture unit with the nearest sampler object regardless, so a texture
-    /// is complete without mipmaps.
+    /// frame palette at slot 2 ([`Self::fragment_palette`]).
     const FX: Self = Self {
         vertex_uniform: Some(0),
         fragment_textures: &[0, 1],
@@ -845,19 +754,18 @@ impl BindSpec {
     };
 }
 
-/// One pipeline, completely. Every field is stated: nothing here is defaulted,
-/// because every default on both backends is the permissive one.
+/// Complete specification of a render pipeline.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PipelineSpec {
-    /// The `wgpu` debug label, and the Metal pipeline's name in diagnostics.
+    /// Pipeline debug label.
     pub(crate) label: &'static str,
-    /// Which shader module both entry points live in.
+    /// Shader module containing `vs` and `fs`.
     pub(crate) library: ShaderLibrary,
-    /// The vertex entry point, identical in the WGSL and the MSL twin.
+    /// Vertex entry point name.
     pub(crate) vs: &'static str,
-    /// The fragment entry point, identical in the WGSL and the MSL twin.
+    /// Fragment entry point name.
     pub(crate) fs: &'static str,
-    /// Which attachment this pipeline draws into.
+    /// Target attachment role.
     #[cfg_attr(
         all(gl_arm, not(wgpu_arm)),
         expect(
@@ -866,18 +774,16 @@ pub(crate) struct PipelineSpec {
         )
     )]
     pub(crate) target: TargetRole,
-    /// The blend state, or `None` for a pipeline `renderer.rs` builds with
-    /// `blend: None` (the shimmer's REPLACE-by-omission).
+    /// Blend state, or `None` for unblended replacement.
     pub(crate) blend: Option<Blend>,
-    /// Which channels may be written.
+    /// Channel write mask.
     pub(crate) write_mask: WriteMask,
-    /// Which instance stream feeds the vertex stage.
+    /// Per-instance vertex layout.
     pub(crate) vertex: VertexLayout,
-    /// The primitive topology. wgpu builds the pipeline with it; Metal names the
-    /// primitive at each draw, so only the tests check this column there.
+    /// Primitive topology.
     #[cfg(any(wgpu_arm, gl_arm, test))]
     pub(crate) topology: Topology,
-    /// Where the row's resources bind on the Metal side — see [`BindSpec`].
+    /// Explicit resource binding slots (see [`BindSpec`]).
     #[cfg(any(target_os = "macos", gl_arm))]
     pub(crate) binds: BindSpec,
 }
@@ -922,16 +828,7 @@ impl PipelineSpec {
     }
 }
 
-/// THE ONE `wgpu` RENDER PIPELINE CONSTRUCTOR: build `spec`'s pipeline entirely
-/// from its pipeline-table row. Entry points, blend, write mask, vertex format
-/// and topology all come from `spec`, which the Metal backend also consumes; the
-/// caller supplies only the per-backend plumbing (the compiled module and the
-/// layout), and `targets` only resolves the row's [`TargetRole`] to a format.
-///
-/// The descriptor's parts are private to this module, and the workspace
-/// `clippy.toml` refuses `wgpu::Device::create_render_pipeline` everywhere but
-/// here, so a second spelling of a blend factor or write mask beside the table
-/// does not lint.
+/// Constructs a `wgpu::RenderPipeline` from `spec`.
 #[cfg(wgpu_arm)]
 pub(crate) fn build_wgpu(
     spec: &PipelineSpec,
@@ -968,12 +865,8 @@ pub(crate) fn build_wgpu(
     pipeline
 }
 
-/// Every render pipeline aterm builds, in [`Pipeline`] order.
-///
-/// Index it through [`Pipeline`] rather than by number:
-/// `PIPELINES[Pipeline::FireAdd as usize]`, or [`Pipeline::spec`].
+/// Table of all render pipelines in [`Pipeline`] discriminant order.
 pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
-    // --- the three pipelines every frame draws -----------------------------
     PipelineSpec {
         label: "aterm-gpu bg pipeline",
         library: ShaderLibrary::Cell,
@@ -994,7 +887,6 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         vs: "vs_glyph",
         fs: "fs_glyph",
         target: TargetRole::OffscreenSrgb,
-        // out = fg*cov + dst*(1-cov) in linear light (sRGB target).
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::All,
         vertex: VertexLayout::Glyph,
@@ -1009,7 +901,6 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         vs: "vs_glyph",
         fs: "fs_glyph_color",
         target: TargetRole::OffscreenSrgb,
-        // out = rgb*a + dst*(1-a) in linear light (sRGB target).
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::All,
         vertex: VertexLayout::Glyph,
@@ -1018,7 +909,6 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::CELL_ATLAS,
     },
-    // --- the nine demand-built effect pipelines ----------------------------
     PipelineSpec {
         label: "aterm-gpu cursor blend pipeline",
         library: ShaderLibrary::Cell,
@@ -1036,11 +926,7 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
     PipelineSpec {
         label: "aterm-gpu glow additive pipeline",
         library: ShaderLibrary::Cell,
-        // `vs_glow` carries the instance's colour pair and rect span flat to
-        // the fragment, which ramps them per column (`GlowInstance`).
         vs: "vs_glow",
-        // Glow is raw (no sRGB decode): the Unorm view keeps One/One byte-exact
-        // against the CPU `add_sat`.
         fs: "fs_glow",
         target: TargetRole::OffscreenUnorm,
         blend: Some(Blend::GLOW_OVER),
@@ -1149,14 +1035,12 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::CELL_ATLAS,
     },
-    // --- the two lazily-built post passes over the offscreen ---------------
     PipelineSpec {
         label: "aterm-gpu bloom composite pipeline",
         library: ShaderLibrary::Bloom,
         vs: "vs_fs",
         fs: "fs_bloom",
         target: TargetRole::OffscreenUnorm,
-        // `Screen` spends only the destination's remaining headroom.
         blend: Some(Blend::SCREEN),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::None,
@@ -1171,10 +1055,7 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         vs: "vs_fs",
         fs: "fs_shimmer",
         target: TargetRole::OffscreenUnorm,
-        // REPLACE by omission: the fragment is the refracted frame.
         blend: None,
-        // All channels: the refraction displaces the whole sample, so alpha
-        // stays consistent with the rgb on a translucent present.
         write_mask: WriteMask::All,
         vertex: VertexLayout::None,
         #[cfg(any(wgpu_arm, gl_arm, test))]
@@ -1182,19 +1063,14 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::POST_FS,
     },
-    // --- the glow-boost pair: one construction site, two pipelines ---------
     PipelineSpec {
         label: "aterm-gpu hdr-glow pipeline",
         library: ShaderLibrary::HdrGlow,
         vs: "vs_hdr_glow",
         fs: "fs_hdr_glow",
         target: TargetRole::Edr,
-        // EDR stays additive: the f16 target's whole point is emission above
-        // 1.0, so there is no `1 - dst` headroom to divide up.
         blend: Some(Blend::ADDITIVE),
         write_mask: WriteMask::Color,
-        // The crown reads the same `GlowInstance` stream the bloom extract
-        // does, so a gradient quad ramps in the crown as it does on the glass.
         vertex: VertexLayout::Glow,
         #[cfg(any(wgpu_arm, gl_arm, test))]
         topology: Topology::TriangleList,
@@ -1207,7 +1083,6 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         vs: "vs_hdr_glow",
         fs: "fs_sdr_glow",
         target: TargetRole::Present,
-        // `Screen`: the crown brightens without saturating.
         blend: Some(Blend::SCREEN),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::Glow,
@@ -1216,7 +1091,6 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::CROWN,
     },
-    // --- the two swapchain passes ------------------------------------------
     PipelineSpec {
         label: "aterm-gpu blit pipeline",
         library: ShaderLibrary::Blit,
@@ -1224,8 +1098,6 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         fs: "fs_blit",
         target: TargetRole::Present,
         blend: Some(Blend::REPLACE),
-        // The blit publishes the alpha the RGB-only effect rows leave
-        // untouched.
         write_mask: WriteMask::All,
         vertex: VertexLayout::None,
         #[cfg(any(wgpu_arm, gl_arm, test))]
@@ -1239,7 +1111,6 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         vs: "vs_tray",
         fs: "fs_tray",
         target: TargetRole::Present,
-        // Straight-alpha src-over == CPU `composite_tray`.
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::All,
         vertex: VertexLayout::None,
@@ -1248,18 +1119,11 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::TRAY,
     },
-    // --- the fx engine's two rows (design §4.5-§4.6) -----------------------
     PipelineSpec {
         label: "aterm-gpu fx pipeline",
         library: ShaderLibrary::Cell,
-        // Pixel law F over flat integer varyings: the fragment addresses its
-        // texel and its ramp column from the absolute pixel and the item's
-        // unclamped origin, never a sampler or a float UV.
         vs: "vs_fx",
         fs: "fs_fx",
-        // `fs_glow`'s state: `(c, a) / 255` raw into `src + dst·(1 − a)` on
-        // the Unorm view rounds once on store, byte-exact with the CPU
-        // `over_premul` (`add_sat` at `a = 0`).
         target: TargetRole::OffscreenUnorm,
         blend: Some(Blend::GLOW_OVER),
         write_mask: WriteMask::Color,
@@ -1273,9 +1137,6 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         label: "aterm-gpu fx linear pipeline",
         library: ShaderLibrary::Cell,
         vs: "vs_fx",
-        // A Linear layer's straight texels under their tint, decoded and
-        // blended in linear light: the scene-over row's target and blend
-        // (FreeSprite's law and tolerance).
         fs: "fs_fx_linear",
         target: TargetRole::OffscreenSrgb,
         blend: Some(Blend::ALPHA_BLENDING),
@@ -1288,61 +1149,60 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
     },
 ];
 
-/// How many rows [`PIPELINES`] has. A `const` so the array length is visible at
-/// its definition, exactly like `EFFECT_PIPELINE_COUNT`.
+/// Total number of entries in [`PIPELINES`].
 pub(crate) const PIPELINE_COUNT: usize = 20;
 
-/// A row of [`PIPELINES`], by name. The discriminants are the indices.
+/// Identifier and index into [`PIPELINES`] for each render pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(usize)]
 pub(crate) enum Pipeline {
     /// Per-cell background fill.
     Bg = 0,
-    /// Coverage-blended mono glyphs.
+    /// Coverage-blended monochrome glyphs.
     Glyph = 1,
-    /// Straight-RGBA colour emoji.
+    /// Straight-RGBA color glyphs.
     ColorGlyph = 2,
     /// Translucent cursor fill.
     CursorBlend = 3,
-    /// LUMEN cursor aurora / supernova / EMBERFORGE under-glyph light.
+    /// Additive glow pass.
     GlowAdd = 4,
-    /// PHOSPHOR rain bright-head halos.
+    /// Additive rain bright-head halos.
     RainGlow = 5,
-    /// `HaloMode::Over` radial veils.
+    /// Source-over radial rain veils.
     RainGlowOver = 6,
-    /// EMBERFORGE FirePatch, One/One half.
+    /// Additive half of `FirePatch`.
     FireAdd = 7,
-    /// EMBERFORGE FirePatch, source-over half.
+    /// Source-over half of `FirePatch`.
     FireOver = 8,
-    /// Sparkle-word paw, undercurl, glyph contrast-halo.
+    /// Source-over decorations (paw, undercurl, contrast halo).
     DecoOver = 9,
-    /// Sparkle-word sparkle.
+    /// Additive sparkle decorations.
     DecoAdd = 10,
-    /// Wallpaper, rain, cats, free sprites.
+    /// Source-over sprites (wallpaper, rain, cats).
     SpriteOver = 11,
-    /// The bounded bloom composite.
+    /// Bounded bloom composite.
     Bloom = 12,
-    /// The EMBERFORGE heat-haze displacement.
+    /// Heat-haze shimmer displacement.
     Shimmer = 13,
-    /// The EDR aurora crown.
+    /// EDR aurora crown.
     #[cfg_attr(
         all(gl_arm, not(wgpu_arm), not(test)),
         expect(dead_code, reason = "no f16 destination exists on GL")
     )]
     HdrGlow = 14,
-    /// The SDR aurora crown.
+    /// SDR aurora crown.
     SdrGlow = 15,
-    /// The offscreen -> swapchain present blit.
+    /// Offscreen-to-swapchain present blit.
     Blit = 16,
-    /// The tray/overlay card blit.
+    /// Tray and overlay card blit.
     Tray = 17,
-    /// The fx engine's Exact layers (pixel law F on the Unorm view).
+    /// Exact fx layers on the Unorm view.
     Fx = 18,
-    /// The fx engine's Linear layers (straight texels, linear-light blend).
+    /// Linear-light fx layers.
     FxLinear = 19,
 }
 
-/// Every [`Pipeline`], in row order — the single enumeration a sweep walks.
+/// All [`Pipeline`] variants in row order.
 #[cfg(all(test, any(target_os = "macos", gl_arm)))]
 pub(crate) const ALL_PIPELINES: [Pipeline; PIPELINE_COUNT] = [
     Pipeline::Bg,
@@ -1368,15 +1228,13 @@ pub(crate) const ALL_PIPELINES: [Pipeline; PIPELINE_COUNT] = [
 ];
 
 impl Pipeline {
-    /// This pipeline's row. [`PIPELINES`] is a `static`, so every lookup returns
-    /// the same object.
+    /// Returns this pipeline's [`PipelineSpec`] in [`PIPELINES`].
     #[inline]
     pub(crate) const fn spec(self) -> &'static PipelineSpec {
         &PIPELINES[self as usize]
     }
 
-    /// The row's stable name — the enum variant, snake-cased, for test
-    /// failure messages.
+    /// Returns the snake_case name of this pipeline.
     #[inline]
     #[cfg(all(test, any(target_os = "macos", gl_arm)))]
     pub(crate) const fn name(self) -> &'static str {

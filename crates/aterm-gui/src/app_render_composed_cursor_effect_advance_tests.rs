@@ -68,8 +68,6 @@ fn an_unfocused_window_streaks_only_while_typed_into_or_recorded() {
         Recorded,
     }
     let streaked = |arm: Arm| -> bool {
-        // The recording arm's video root; bound before the App, so it
-        // outlives the recording and is removed after it.
         let video_root = aterm_tempfile::Builder::new()
             .prefix("aterm-streak-focus-video-")
             .tempdir()
@@ -182,8 +180,6 @@ fn mixed_output_streak_uses_content_clock_not_damage_epoch() {
     );
     assert!(app.windows[&wid].input_scratch.nova_add.is_empty());
 
-    // DECSCNM changes the rendered frame and damage epoch, but it writes no
-    // terminal content. The exact content clock must keep this a repaint.
     term_lock(&term).process(b"\x1b[?5h");
     assert!(
         app.prepare_heterogeneous_input_scratch_with_cursor_fx(
@@ -576,8 +572,6 @@ fn bind_extracted_cat_pulse_route(
     replay_changed_cat: bool,
 ) {
     let model = aterm_models_effects::cursor_cat_motion_pulse_routing_model();
-    // Provenance: the pulse exists because a licensed spawn classified this move as a typed
-    // advance or fold (`licensed` is read off the engine's own admission ring).
     let licensed_state = model.successors("LicenseMove", &model.init_state())[0].clone();
     let classified_state = model.successors("ClassifyPulse", &licensed_state)[0].clone();
     assert_eq!(
@@ -602,9 +596,6 @@ fn bind_extracted_cat_pulse_route(
     );
     assert!(ok, "{label}: runtime pulse route rejected: {why}");
 
-    // A route that ran but left the pulse pending and delivered nothing must
-    // not satisfy the healthy transition, even with all other bookkeeping
-    // agreeing.
     let mut forged_strand = observed.clone();
     forged_strand.insert("pending", 1);
     forged_strand.insert("consumes", 0);
@@ -650,7 +641,6 @@ fn bind_ordinary_cat_pulse_route(
     replay_changed_cat: bool,
 ) {
     let model = aterm_models_effects::cursor_cat_motion_pulse_routing_model();
-    // Same provenance chain as the extracted route: licence, then classify.
     let licensed_state = model.successors("LicenseMove", &model.init_state())[0].clone();
     let classified_state = model.successors("ClassifyPulse", &licensed_state)[0].clone();
     assert_eq!(
@@ -680,8 +670,6 @@ fn bind_ordinary_cat_pulse_route(
     );
     assert!(ok, "ordinary runtime pulse route rejected: {why}");
 
-    // Negative control: only the delivery count differs. A take without its same-frame cat
-    // delivery must not satisfy the healthy action.
     let mut forged_undelivered = observed.clone();
     forged_undelivered.insert("deliveries", 0);
     let (ok, _) = aterm_spec::verify::validate_transition_tiered(
@@ -720,8 +708,6 @@ fn ordinary_single_pane_forwards_and_drains_licensed_cat_pulse() {
     let wid = WindowId(0);
     let t0 = Instant::now();
 
-    // Seed both the engine cursor and production generation fence on the
-    // exact ordinary/single-pane host path.
     {
         let window = app.windows.get_mut(&wid).expect("ordinary window");
         window.focused = true;
@@ -822,8 +808,6 @@ fn a_history_retain_keeps_the_band_and_arms_no_hide_the_next_live_frame_would_ta
             .is_some()
         );
     };
-    // Scrollback is written before the band is laid: forty lines written after it would scroll
-    // the band's rows off the grid, and a missing band would then be correct.
     {
         let mut terminal = term_lock(&term);
         terminal.process(&b"history\r\n".repeat(40));
@@ -848,7 +832,6 @@ fn a_history_retain_keeps_the_band_and_arms_no_hide_the_next_live_frame_would_ta
         "fixture: a rainbow kitty band is on the live frame"
     );
 
-    // Into history: the Retain arm reaches the Keep law and ticks nothing.
     {
         let mut terminal = term_lock(&term);
         terminal.scroll_display(1);
@@ -883,7 +866,6 @@ fn a_history_retain_keeps_the_band_and_arms_no_hide_the_next_live_frame_would_ta
         );
     }
 
-    // Back to the live viewport: the very next tick draws the band.
     {
         let mut terminal = term_lock(&term);
         terminal.scroll_to_bottom();
@@ -923,8 +905,6 @@ fn mixed_retain_cannot_project_a_live_cursor_frame_over_new_history() {
     );
     {
         let window = app.windows.get(&wid).expect("test window");
-        // The comet's tail is its streak's bed under the swept cells (the
-        // cadence comet's cell tint is retired beside it).
         assert!(
             !window.fx.cursor().glow_scratch.is_empty()
                 && !window.fx.cursor().glow.under_quads().is_empty(),
@@ -1011,9 +991,6 @@ fn run_alt_reanchor(with_repaint_blink: bool) -> (usize, Option<Instant>) {
     let t0 = Instant::now();
     term_lock(&term).process(b"\x1b[?1049h\x1b[6;3H");
     assert!(app.composed_cursor_frame(wid, ComposedCursorFxClock::Advance(t0)));
-    // A real press licenses the relocation. The repaint blink then decides the morphology: a
-    // hide-inside-sync redraw (Claude Code's) re-anchors with no comet, while an unblinked alt
-    // move (vim's one-row motions) keeps its comet.
     {
         let window = app.windows.get_mut(&wid).expect("test window");
         window
@@ -1047,9 +1024,6 @@ fn mixed_advance_feeds_alt_repaint_blink_to_both_cursor_engines() {
     );
     let (vim_like, blink_at) = run_alt_reanchor(false);
     assert_eq!(blink_at, None);
-    // The same licensed 17-column move: without the blink the comet sweeps
-    // the cells it crossed; with it, it re-anchors and lights none of them
-    // (both runs share the earlier frames' light).
     assert!(
         vim_like >= claude_like + 10,
         "alt + synchronized repaint blink re-anchors instead of sweeping a fake comet, \
@@ -1081,9 +1055,6 @@ fn mixed_advance_translates_scroll_anchors() {
         ComposedCursorFxClock::Advance(t0 + Duration::from_millis(16))
     ));
     let window = app.windows.get(&wid).expect("test window");
-    // The subject is the scroll anchor: the host's cumulative scroll clock
-    // has advanced to the terminal's, so the next move classifies against
-    // where the caret now sits.
     assert_eq!(
         window.fx.scroll_baseline(),
         Some(term_lock(&term).content_scroll_state())
@@ -1147,12 +1118,6 @@ fn exact_composed_sample_distinguishes_grid_edges_from_blank_neighbors() {
     assert!(!bottom.row_below_present, "bottom edge has no row below");
     assert!(bottom.row_below_probe.is_empty());
 }
-
-// The content witness on a composed frame (`ribbon_rows` →
-// `observe_ribbon_row`/`capture_ribbon_row` → `Engine::witness_rows`) runs
-// for split panes, zoomed panes and `aterm ctl image`/`video` captures, not
-// only the single-pane path. In a split the caret rarely leaves its row, so
-// only the witness can retire a stale band.
 
 /// The focused terminal leaf's pane origin in the composed window.
 fn focused_pane_origin(app: &mut App, wid: WindowId) -> (usize, usize) {
@@ -1305,8 +1270,6 @@ fn composed_hello(
     };
     let term = app.pool.get(session).expect("terminal leaf").term.clone();
     let (row_off, col_off) = focused_pane_origin(&mut app, wid);
-    // The shape is what it claims: a three-pane focused leaf is offset on both axes, and a
-    // zoomed tab plans as zoomed.
     match shape {
         ComposedShape::ThreePane => assert!(
             row_off > 0 && col_off > 0,
@@ -1320,7 +1283,6 @@ fn composed_hello(
         ComposedShape::Split(_) => {}
     }
     let t0 = Instant::now();
-    // Park the caret on the pane's own row 5 and seed the engine.
     term_lock(&term).process(b"\x1b[6;1H");
     assert!(app.composed_cursor_frame(wid, ComposedCursorFxClock::Advance(t0)));
     let t = composed_type(&mut app, wid, &term, t0, "hello world");
@@ -1395,7 +1357,6 @@ fn a_box_redrawn_in_place_under_a_scroll_keeps_its_band_on_the_scroll_s_own_fram
         let (mut app, wid, term, t, win_row, win_col) = composed_hello(shape);
         let t = composed_idle(&mut app, wid, t, 160);
         let last = term_lock(&term).grid().rows();
-        // Pane row 5 is 1-based row 6; the scroll carries it to pane row 2.
         term_lock(&term).process(
             format!(
                 "\x1b[?2026h\x1b[{last};1H\r\n\r\n\r\n\x1b[3;1H\x1b[2Kother text\
@@ -1437,8 +1398,6 @@ fn the_composed_witness_reads_the_focused_pane_s_own_rows_and_columns() {
         ComposedShape::Zoomed,
     ] {
         let (mut app, wid, term, t, win_row, win_col) = composed_hello(axis);
-        // A redraw that puts the same text back under the caret is the
-        // same text — the caret's row rides this frame's own probe.
         term_lock(&term).process(b"\x1b[6;1Hhello world");
         let t = composed_idle(&mut app, wid, t, 32);
         assert_eq!(
@@ -1447,8 +1406,6 @@ fn the_composed_witness_reads_the_focused_pane_s_own_rows_and_columns() {
             "{axis:?}: a redraw of the same text retired the caret's row"
         );
 
-        // Return: the caret leaves the band's row on a licensed move, so the band stays where
-        // it was typed and row `win_row` is read from its pane-local resident witness slot.
         let t = t + Duration::from_millis(90);
         app.windows
             .get_mut(&wid)
@@ -1474,9 +1431,6 @@ fn the_composed_witness_reads_the_focused_pane_s_own_rows_and_columns() {
              retired light the owner earned"
         );
 
-        // The shape law through the composed path (`Witness::shape_verdicts`):
-        // one glyph changed strictly inside the run (the fifth cell, `o` →
-        // `X`) is not evidence; the band stays whole and the counter at zero.
         term_lock(&term).process(b"\x1b7\x1b[6;5HX\x1b8");
         let t = composed_idle(&mut app, wid, t, 32);
         assert_eq!(
@@ -1491,8 +1445,6 @@ fn the_composed_witness_reads_the_focused_pane_s_own_rows_and_columns() {
             "{axis:?}: a lone interior glyph change retired a standing run"
         );
 
-        // The same change at the run's last cell is a suffix and retires (the non-vacuity arm).
-        // Exactly one cell retires: the interior record already took the glyph standing there.
         term_lock(&term).process(b"\x1b7\x1b[6;11HX\x1b8");
         let _ = composed_idle(&mut app, wid, t, 32);
         assert_eq!(
@@ -1528,8 +1480,6 @@ fn composed_far_witness_never_reads_rows_changed_after_cell_extraction() {
             .note_return(t);
         term_lock(&term).process(b"\r\n");
         assert!(app.composed_cursor_frame(wid, ComposedCursorFxClock::Advance(t)));
-        // The retained band is on local row 5; park the caret on row 7,
-        // outside its already-captured caret/neighbor trio.
         term_lock(&term).process(b"\x1b[8;1H");
         let plan = app.active_visible_leaf_plan(wid).unwrap();
         let session = app.windows[&wid].composed_cursor_effect_session.unwrap();
@@ -1595,7 +1545,6 @@ fn composed_far_witness_never_reads_rows_changed_after_cell_extraction() {
                 "{shape:?}: every in-pane row is already captured; projection owes no second lock"
             );
         }
-        // The live PTY changes *after* the extracted frame.
         term_lock(&term).process(b"\x1b7\x1b[6;11HX\x1b8");
         assert!(!sample.witness_stamp.matches(&term_lock(&term)));
         assert!(app.composed_cursor_frame_sampled(
@@ -1637,7 +1586,6 @@ fn composed_neighbor_witness_uses_its_captured_change_after_later_pty_output() {
         assert!(app.composed_cursor_frame(wid, ComposedCursorFxClock::Advance(t)));
         let plan = app.active_visible_leaf_plan(wid).unwrap();
         let session = app.windows[&wid].composed_cursor_effect_session.unwrap();
-        // The changed last glyph is in the extracted neighbor row itself.
         term_lock(&term).process(b"\x1b7\x1b[6;11HX\x1b8");
         let sample = focused_composed_cursor_fx_sample(
             session,
@@ -1654,8 +1602,6 @@ fn composed_neighbor_witness_uses_its_captured_change_after_later_pty_output() {
             Vec::new(),
         );
         assert!(sample.row_above_present);
-        // A later, unrelated PTY write invalidates any second grid read.
-        // It cannot invalidate the neighbor the sample already owns.
         term_lock(&term).process(b"\x1b7\x1b[1;1HZ\x1b8");
         assert!(!sample.witness_stamp.matches(&term_lock(&term)));
         assert!(app.composed_cursor_frame_sampled(
@@ -1728,7 +1674,6 @@ fn composed_witness_generation_model_matches_real_terminal_mutations() {
             captured.is_some(),
             model.action_enabled("ReadCaptured", &state)
         );
-        // Identity and display offset are unchanged: only the generation fences these writes.
         assert_eq!(stamp.terminal_id, term_lock(&term).render_identity());
         assert_eq!(term_lock(&term).grid().display_offset(), 0);
     }
@@ -1753,8 +1698,6 @@ fn set_coherence_state(
     color: &str,
     style: &str,
 ) {
-    // Not ED2: erase-display invalidates content coordinates and resets both cursor engines.
-    // This fixture is an ordinary authored move, so it overwrites the marker in place.
     let sequence = format!(
         "\x1b[H{marker}\x1b[{};{}H\x1b]12;#{color}\x07{style}",
         cursor.0 + 1,
@@ -1829,11 +1772,6 @@ fn visible_terminal_handles(
 
 /// DEC 2026 close/reopen on every present route, one row per (route, script): each step is
 /// written to every visible terminal, then presented; the `(ms, present?)` sequence is the law.
-///
-/// * Clean close+reopen: the completed bracket keeps exactly one present license, and the newly
-///   armed episode holds on the following frame.
-/// * Dirty reopen: writes in the reopened episode replace the close boundary, so the partial
-///   frame stays off glass until that episode closes.
 #[test]
 fn close_reopen_presents_once_and_a_dirty_reopen_never_presents_partial() {
     #[derive(Clone, Copy, Debug)]
@@ -1842,7 +1780,6 @@ fn close_reopen_presents_once_and_a_dirty_reopen_never_presents_partial() {
         Mixed,
         HeadlessSingleCapture,
     }
-    // (bytes — `{i}` is the pane index — or "" for none, ms, presents?, why)
     type Step = (&'static str, u64, bool, &'static str);
     const HOLD: &str = "\x1b[?2026hheld";
     let rows: [(Route, [Step; 3]); 5] = [
@@ -2231,8 +2168,6 @@ fn primed_pure_capture_fixture(
 fn extracted_mixed_live_and_split_capture_forward_and_drain_licensed_cat_pulses() {
     let t0 = Instant::now();
 
-    // Heterogeneous composition is the extracted live route: native cells
-    // and the focused terminal sample are committed together.
     let (mut mixed, mixed_wid, mixed_session) = mixed_fixture("rainbow kitty");
     let mixed_term = mixed
         .pool
@@ -2267,8 +2202,6 @@ fn extracted_mixed_live_and_split_capture_forward_and_drain_licensed_cat_pulses(
         observe_cat_pulse_route(&mut mixed, mixed_wid, mixed_tick, "mixed live");
     bind_extracted_cat_pulse_route("mixed live", classified, pending, delivered, replay_changed);
 
-    // Pure terminal splits take the same extracted seam for headless image
-    // capture.
     let (mut split, split_wid, split_term) = pure_fixture("rainbow kitty");
     assert!(
         split
@@ -2524,8 +2457,6 @@ fn only_the_composed_route_keeps_the_unfocused_pane_snapshots() {
             .entry(0)
             .or_default();
     };
-    // Control: the composed route keeps them (it prunes to the live pane set), so clearing
-    // unconditionally fails here.
     park(&mut app);
     App::retire_unfocused_pane_snapshots(
         app.windows.get_mut(&wid).expect("test window"),
@@ -2535,8 +2466,6 @@ fn only_the_composed_route_keeps_the_unfocused_pane_snapshots() {
         !app.windows[&wid].unfocused_pane_scratch.is_empty(),
         "the composed route prunes its own map and must keep it here"
     );
-    // Every other route retires them: none shows an unfocused terminal pane
-    // this frame and none prunes.
     for route in [
         crate::VisibleContentRoute::Terminal { composed: false },
         crate::VisibleContentRoute::Heterogeneous,

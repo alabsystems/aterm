@@ -1,20 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! macOS system probes:
-//!
-//! * **Per-process / group**: `PROC_PIDVNODEPATHINFO` (cwd), `proc_pidpath`
-//!   (executable), `PROC_PIDT_SHORTBSDINFO` (pgid), `proc_listpids(PROC_PGRP_ONLY)`
-//!   with `proc_pid_rusage(RUSAGE_INFO_V4)` (`ri_phys_footprint`), and
-//!   `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)` on fd 0 (`stdin_sharers`).
-//! * **Memory**: `kern.memorystatus_vm_pressure_level`,
-//!   `host_statistics64(HOST_VM_INFO64)`, `vm.pagesize`, `vm.swapusage`,
-//!   and `hw.memsize`.
-//! * **Machine**: `host_processor_info(PROCESSOR_CPU_LOAD_INFO)`,
-//!   `hw.perflevelN.*` + `IODeviceTree:/cpus`, `IOAccelerator`
-//!   `PerformanceStatistics`, `statfs`, `NET_RT_IFLIST2` + `SIOCGIFFUNCTIONALTYPE`,
-//!   `kern.maxproc` / `kern.maxprocperuid` / `RLIMIT_NPROC`, and the process
-//!   counts by `proc_listallpids` and `proc_listpids(PROC_RUID_ONLY)`.
+//! macOS process, memory, and machine system probes.
 
 use std::ffi::{CStr, c_int, c_void};
 use std::sync::OnceLock;
@@ -29,8 +16,7 @@ use crate::{
     VolumeReading, pressure_of,
 };
 
-/// `PROC_PIDT_SHORTBSDINFO` (`sys/proc_info.h`, 64-byte `proc_bsdshortinfo`),
-/// declared locally because `libc` 0.2.186 does not export it.
+/// `PROC_PIDT_SHORTBSDINFO` (`sys/proc_info.h`, 64-byte `proc_bsdshortinfo`).
 const PROC_PIDT_SHORTBSDINFO: c_int = 13;
 
 /// `struct proc_bsdshortinfo`.
@@ -52,12 +38,10 @@ struct ProcBsdShortInfo {
     pbsi_rfu: u32,
 }
 
-/// `PROC_PIDVNODEPATHINFO` (`sys/proc_info.h`, 2352-byte `proc_vnodepathinfo`),
-/// declared locally for the same reason as [`PROC_PIDT_SHORTBSDINFO`].
+/// `PROC_PIDVNODEPATHINFO` (`sys/proc_info.h`, [`PROC_PIDT_SHORTBSDINFO`]).
 const PROC_PIDVNODEPATHINFO: c_int = 9;
 
-/// `struct vnode_info_path`: the vnode's `vnode_info` (read as opaque bytes
-/// — only the path is used) and its `MAXPATHLEN` path.
+/// `struct vnode_info_path`: the vnode's `vnode_info` and its `MAXPATHLEN` path.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct VnodeInfoPath {
@@ -81,12 +65,10 @@ const _: () = assert!(std::mem::size_of::<ProcBsdShortInfo>() == SHORT_INFO_SIZE
 const _: () = assert!(std::mem::size_of::<libc::rusage_info_v4>() == 296);
 const _: () = assert!(PATH_CAP == libc::PROC_PIDPATHINFO_MAXSIZE as usize);
 
-/// The host port, taken once per process: every `mach_host_self()` adds a
-/// user reference to the send right, so a probe rebuilt on each switch-on
-/// must not take another.
+/// The host port, taken once per process.
 fn host_port() -> libc::mach_port_t {
     static PORT: OnceLock<libc::mach_port_t> = OnceLock::new();
-    // SAFETY: no arguments; returns the task's send right to the host port.
+    // SAFETY: No arguments; returns the task's send right to the host port.
     *PORT.get_or_init(|| unsafe { libc::mach_host_self() })
 }
 
@@ -94,8 +76,7 @@ fn host_port() -> libc::mach_port_t {
 pub(crate) fn sysctl_int(name: &CStr) -> Option<i64> {
     let mut buf = [0u8; 8];
     let mut len: libc::size_t = buf.len();
-    // SAFETY: `name` is NUL-terminated; `buf` is writable for `len` bytes and
-    // the kernel writes at most `len`, reporting how many in `len`.
+    // SAFETY: `name` is NUL-terminated.
     let rc = unsafe {
         libc::sysctlbyname(
             name.as_ptr(),
@@ -117,17 +98,14 @@ pub(crate) fn sysctl_int(name: &CStr) -> Option<i64> {
     }
 }
 
-/// One `struct timeval` sysctl by name (`kern.boottime`, `kern.waketime`),
-/// unix milliseconds; `None` if the kernel refuses it or answers another
-/// width.
+/// One `struct timeval` sysctl by name (`kern.boottime`, `kern.waketime`), unix milliseconds.
 pub(crate) fn sysctl_timeval_ms(name: &CStr) -> Option<i64> {
     let mut tv = libc::timeval {
         tv_sec: 0,
         tv_usec: 0,
     };
     let mut len: libc::size_t = std::mem::size_of::<libc::timeval>();
-    // SAFETY: `name` is NUL-terminated; `tv` is writable for `len` bytes and
-    // the kernel writes at most `len`, reporting how many in `len`.
+    // SAFETY: `name` is NUL-terminated.
     let rc = unsafe {
         libc::sysctlbyname(
             name.as_ptr(),
@@ -145,14 +123,11 @@ pub(crate) fn sysctl_timeval_ms(name: &CStr) -> Option<i64> {
         .checked_add(i64::from(tv.tv_usec) / 1000)
 }
 
-/// One process's physical footprint, KiB (`proc_pid_rusage(RUSAGE_INFO_V4)`'s
-/// `ri_phys_footprint`); `None` when the process is gone or not ours.
+/// One process's physical footprint, KiB (`proc_pid_rusage(RUSAGE_INFO_V4)`'s `ri_phys_footprint`).
 fn footprint_kib(pid: i32) -> Option<u64> {
     // SAFETY: `rusage_info_v4` is plain integers; all-zero is a valid value.
     let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
-    // SAFETY: `info` is a writable `rusage_info_v4` and the flavor names
-    // exactly that layout (asserted 296 bytes above); libproc's prototype
-    // types the buffer as `rusage_info_t *`, which is this pointer.
+    // SAFETY: `info` is a writable `rusage_info_v4` matching the flavor layout.
     let rc = unsafe {
         libc::proc_pid_rusage(
             pid,
@@ -163,15 +138,13 @@ fn footprint_kib(pid: i32) -> Option<u64> {
     (rc == 0).then_some(info.ri_phys_footprint / 1024)
 }
 
-/// One process's working directory (`PROC_PIDVNODEPATHINFO`'s current
-/// directory vnode path); `None` when the call is refused or short.
+/// One process's working directory (`PROC_PIDVNODEPATHINFO`'s current directory vnode path).
 pub(crate) fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
     use std::os::unix::ffi::OsStrExt as _;
     let pid = i32::try_from(pid).ok().filter(|p| *p > 0)?;
-    // SAFETY: plain byte arrays; all-zero is valid.
+    // SAFETY: Plain byte arrays; all-zero is valid.
     let mut info: ProcVnodePathInfo = unsafe { std::mem::zeroed() };
-    // SAFETY: `info` is writable for `VNODE_PATH_INFO_SIZE` bytes, the size
-    // passed.
+    // SAFETY: `info` is writable for `VNODE_PATH_INFO_SIZE` bytes, the size passed.
     let n = unsafe {
         libc::proc_pidinfo(
             pid,
@@ -190,9 +163,7 @@ pub(crate) fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
     path.is_absolute().then(|| path.to_path_buf())
 }
 
-/// One process's executable path as the kernel holds it (`proc_pidpath`),
-/// bytes intact; `None` when the call is refused (the process is gone or not
-/// ours) or answers no absolute path.
+/// One process's executable path as the kernel holds it (`proc_pidpath`), bytes intact.
 pub(crate) fn process_path(pid: u32) -> Option<std::path::PathBuf> {
     use std::os::unix::ffi::OsStrExt as _;
     let pid = i32::try_from(pid).ok().filter(|p| *p > 0)?;
@@ -212,24 +183,19 @@ fn path_into(pid: i32, buf: &mut [u8; PATH_CAP]) -> Option<usize> {
         .map(|n| n.min(PATH_CAP))
 }
 
-/// `PROC_PGRP_ONLY` (`sys/proc_info.h`): `proc_listpids`' filter for the
-/// members of one process group.
+/// `PROC_PGRP_ONLY` (`sys/proc_info.h`).
 const PROC_PGRP_ONLY: u32 = 2;
-/// `PROC_RUID_ONLY` (`sys/proc_info.h`): `proc_listpids`' filter for the
-/// processes whose real user is one uid.
+/// `PROC_RUID_ONLY` (`sys/proc_info.h`).
 const PROC_RUID_ONLY: u32 = 5;
 
 unsafe extern "C" {
-    /// libproc's `proc_listpids` (`libproc.h`): the pids `kind`/`typeinfo`
-    /// select, written into `buffer`; returns the number of BYTES written
-    /// (`proc_listallpids`, which the first-party `libc` declares, returns a
-    /// count). Declared here because the first-party `libc` does not.
+    /// libproc's `proc_listpids` (`libproc.h`).
     fn proc_listpids(kind: u32, typeinfo: u32, buffer: *mut c_void, buffersize: c_int) -> c_int;
 }
 
 /// One process's short BSD info, whole or `None`.
 fn short_info(pid: i32) -> Option<ProcBsdShortInfo> {
-    // SAFETY: plain integers and bytes; all-zero is valid.
+    // SAFETY: Plain integers and bytes; all-zero is valid.
     let mut info: ProcBsdShortInfo = unsafe { std::mem::zeroed() };
     // SAFETY: `info` is writable for `SHORT_INFO_SIZE` bytes, the size passed.
     let n = unsafe {
@@ -245,11 +211,7 @@ fn short_info(pid: i32) -> Option<ProcBsdShortInfo> {
         .then_some(info)
 }
 
-/// [`crate::group_memory`] on macOS: `pid`'s group from its short info, the
-/// group's members from `proc_listpids(PROC_PGRP_ONLY)` (at most
-/// [`crate::MAX_GROUP_PIDS`]), each one's footprint from `proc_pid_rusage`.
-/// A member gone or refused meanwhile is skipped; a group none of whose
-/// members could be measured is `None`.
+/// [`crate::group_memory`] on macOS (at most [`crate::MAX_GROUP_PIDS`] members).
 pub(crate) fn group_memory(pid: u32) -> Option<crate::GroupMemory> {
     let pid = i32::try_from(pid).ok().filter(|p| *p > 0)?;
     let pgid = short_info(pid)?.pbsi_pgid;
@@ -258,8 +220,7 @@ pub(crate) fn group_memory(pid: u32) -> Option<crate::GroupMemory> {
     }
     let mut pids = [0 as c_int; crate::MAX_GROUP_PIDS];
     let bytes = c_int::try_from(std::mem::size_of_val(&pids)).ok()?;
-    // SAFETY: `pids` is writable for `bytes` bytes, the size passed; the call
-    // returns how many bytes it wrote.
+    // SAFETY: `pids` is writable for `bytes` bytes, the size passed.
     let n = unsafe { proc_listpids(PROC_PGRP_ONLY, pgid, pids.as_mut_ptr().cast(), bytes) };
     let n = usize::try_from(n).ok()? / std::mem::size_of::<c_int>();
     let (mut kib, mut measured) = (0u64, 0u32);
@@ -279,9 +240,7 @@ pub(crate) fn group_memory(pid: u32) -> Option<crate::GroupMemory> {
     })
 }
 
-/// [`crate::lone_group_leader`] on macOS: `pid` leads its group (its short
-/// info's `pbsi_pgid` is its own pid) and `proc_listpids(PROC_PGRP_ONLY)`
-/// names no other member; then its `pbsi_comm`.
+/// [`crate::lone_group_leader`] on macOS.
 pub(crate) fn lone_group_leader(pid: u32) -> Option<String> {
     let pid = i32::try_from(pid).ok().filter(|p| *p > 0)?;
     let info = short_info(pid)?;
@@ -290,8 +249,7 @@ pub(crate) fn lone_group_leader(pid: u32) -> Option<String> {
     }
     let mut pids = [0 as c_int; crate::MAX_GROUP_PIDS];
     let bytes = c_int::try_from(std::mem::size_of_val(&pids)).ok()?;
-    // SAFETY: `pids` is writable for `bytes` bytes, the size passed; the call
-    // returns how many bytes it wrote.
+    // SAFETY: `pids` is writable for `bytes` bytes, the size passed.
     let n = unsafe {
         proc_listpids(
             PROC_PGRP_ONLY,
@@ -313,7 +271,6 @@ pub(crate) fn lone_group_leader(pid: u32) -> Option<String> {
 }
 
 /// Admit only a complete byte count with exactly the requested positive pid.
-/// A full buffer may have omitted members; zero bytes prove no membership.
 pub(crate) fn complete_lone_group(pid: c_int, bytes: c_int, pids: &[c_int]) -> bool {
     let Ok(bytes) = usize::try_from(bytes) else {
         return false;
@@ -330,11 +287,7 @@ pub(crate) fn complete_lone_group(pid: c_int, bytes: c_int, pids: &[c_int]) -> b
     members.next() == Some(pid) && members.next().is_none()
 }
 
-/// `pid`'s descriptor 0 when it is a device (a terminal, `/dev/null`): its
-/// `vst_dev` and `vst_ino`, from `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)`
-/// decoded by [`crate::jobs::darwin::vnode`] (whose offsets
-/// `tests/proc_info_sdk.rs` holds to the SDK). `None` for a pipe, a socket, a
-/// file, no descriptor 0, or a process gone or not ours.
+/// Device `(vst_dev, vst_ino)` for `pid`'s fd 0 ([`crate::jobs::darwin::vnode`]).
 fn stdin_device(pid: c_int) -> Option<(u32, u64)> {
     use crate::jobs::darwin;
     let mut buf = [0u8; darwin::VNODE_PATH_SIZE];
@@ -357,10 +310,7 @@ fn stdin_device(pid: c_int) -> Option<(u32, u64)> {
         .map(|v| (v.dev, v.ino))
 }
 
-/// [`crate::stdin_sharers`] on macOS: `leader` leads its group (its short
-/// info's `pbsi_pgid` is its own pid) and reads a device on descriptor 0;
-/// then every other member `proc_listpids(PROC_PGRP_ONLY)` names whose
-/// descriptor 0 is that device.
+/// [`crate::stdin_sharers`] on macOS.
 pub(crate) fn stdin_sharers(leader: u32) -> Option<Vec<u32>> {
     let pid = i32::try_from(leader).ok().filter(|p| *p > 0)?;
     if short_info(pid)?.pbsi_pgid != leader {
@@ -369,8 +319,7 @@ pub(crate) fn stdin_sharers(leader: u32) -> Option<Vec<u32>> {
     let device = stdin_device(pid)?;
     let mut pids = [0 as c_int; crate::MAX_GROUP_PIDS];
     let bytes = c_int::try_from(std::mem::size_of_val(&pids)).ok()?;
-    // SAFETY: `pids` is writable for `bytes` bytes, the size passed; the call
-    // returns how many bytes it wrote.
+    // SAFETY: `pids` is writable for `bytes` bytes, the size passed.
     let n = unsafe { proc_listpids(PROC_PGRP_ONLY, leader, pids.as_mut_ptr().cast(), bytes) };
     let n = usize::try_from(n).ok().filter(|n| *n > 0)? / std::mem::size_of::<c_int>();
     Some(
@@ -403,13 +352,10 @@ pub(crate) fn memory_pressure() -> Option<crate::MemoryLevel> {
     sysctl_int(c"kern.memorystatus_vm_pressure_level").and_then(pressure_of)
 }
 
-/// One `host_statistics64(HOST_VM_INFO64)` of the host; `None` where the
-/// kernel refused it.
+/// One `host_statistics64(HOST_VM_INFO64)` of the host; `None` where the kernel refused it.
 fn vm_statistics() -> Option<libc::vm_statistics64> {
-    // SAFETY: all-integer struct; all-zero is valid.
+    // SAFETY: All-integer struct; all-zero is valid.
     let mut vm: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
-    // Upstream's count IS this layout's size in words (38, rev1), so the
-    // kernel writes nothing past it (see the struct's note in `libc`).
     let mut count = libc::HOST_VM_INFO64_COUNT;
     // SAFETY: `vm` is writable for `count` words, the count passed in.
     let kr = unsafe {
@@ -423,8 +369,7 @@ fn vm_statistics() -> Option<libc::vm_statistics64> {
     (kr == 0).then_some(vm)
 }
 
-/// [`crate::machine_memory`] on macOS: one `HOST_VM_INFO64` read, sized by
-/// `vm.pagesize`.
+/// [`crate::machine_memory`] on macOS: one `HOST_VM_INFO64` read, sized by `vm.pagesize`.
 pub(crate) fn machine_memory() -> Option<crate::MachineMemory> {
     let page_bytes = vm_pagesize()?;
     let vm = vm_statistics()?;
@@ -448,8 +393,7 @@ pub(crate) fn machine_memory() -> Option<crate::MachineMemory> {
     })
 }
 
-/// [`crate::swapped_kib`] on macOS: `HOST_VM_INFO64`'s swapins plus
-/// swapouts, in `vm.pagesize` pages, as KiB.
+/// [`crate::swapped_kib`] on macOS.
 pub(crate) fn swapped_kib() -> Option<u64> {
     let page_kib = vm_pagesize().map(|b| b / 1024).filter(|k| *k > 0)?;
     let vm = vm_statistics()?;
@@ -461,15 +405,11 @@ pub(crate) fn swapped_kib() -> Option<u64> {
 }
 
 unsafe extern "C" {
-    /// libSystem's cached send right to this task (`mach_task_self()`), declared
-    /// locally as an immutable extern.
+    /// libSystem's cached send right to this task (`mach_task_self()`).
     static mach_task_self_: libc::mach_port_t;
 }
 
-/// The cores in `words`, `host_processor_info(PROCESSOR_CPU_LOAD_INFO)`'s
-/// array: `count` runs of `CPU_STATE_MAX` 32-bit counters, indexed by
-/// `CPU_STATE_USER`, `CPU_STATE_SYSTEM`, `CPU_STATE_IDLE`, `CPU_STATE_NICE`.
-/// `None` when the array is shorter than `count` runs. PURE.
+/// The cores in `words`, `host_processor_info(PROCESSOR_CPU_LOAD_INFO)`'s array.
 pub(crate) fn cores_of(words: &[libc::integer_t], count: usize) -> Option<Vec<CoreTicks>> {
     const RUN: usize = libc::CPU_STATE_MAX as usize;
     let words = words.get(..count.checked_mul(RUN)?)?;
@@ -487,16 +427,12 @@ pub(crate) fn cores_of(words: &[libc::integer_t], count: usize) -> Option<Vec<Co
     )
 }
 
-/// [`crate::Probe::core_ticks`] on macOS: one
-/// `host_processor_info(PROCESSOR_CPU_LOAD_INFO)`, then the `vm_deallocate`
-/// of the array the kernel mapped into this task for the answer.
+/// [`crate::Probe::core_ticks`] on macOS.
 pub(crate) fn core_ticks() -> Option<Vec<CoreTicks>> {
     let mut count: libc::natural_t = 0;
     let mut info: libc::processor_info_array_t = std::ptr::null_mut();
     let mut words: libc::mach_msg_type_number_t = 0;
-    // SAFETY: the three out-parameters are writable; on success the kernel
-    // maps `words` 32-bit words at `info` into this task, which this
-    // function owns and deallocates below.
+    // SAFETY: The three out-parameters are writable.
     let kr = unsafe {
         libc::host_processor_info(
             host_port(),
@@ -510,15 +446,12 @@ pub(crate) fn core_ticks() -> Option<Vec<CoreTicks>> {
         return None;
     }
     let len = usize::try_from(words).unwrap_or(0);
-    // SAFETY: on success `info` points at `words` initialised 32-bit words
-    // that stay mapped until the `vm_deallocate` below.
+    // SAFETY: `info` points at `words` initialized 32-bit words until `vm_deallocate`.
     let cores = cores_of(
         unsafe { std::slice::from_raw_parts(info, len) },
         count as usize,
     );
-    // SAFETY: `info` and its size are exactly what the kernel mapped for this
-    // call (MIG out-of-line memory), released once; `mach_task_self_` is
-    // this task's own port.
+    // SAFETY: `info` and its size are the kernel's MIG out-of-line mapping, released once.
     unsafe {
         libc::vm_deallocate(
             mach_task_self_,
@@ -529,8 +462,7 @@ pub(crate) fn core_ticks() -> Option<Vec<CoreTicks>> {
     cores
 }
 
-/// [`crate::machine_words`] on macOS: `machdep.cpu.brand_string` and
-/// `kern.osproductversion`.
+/// [`crate::machine_words`] on macOS: `machdep.cpu.brand_string` and `kern.osproductversion`.
 pub(crate) fn machine_words() -> crate::MachineWords {
     crate::MachineWords {
         cpu: sysctl_text(c"machdep.cpu.brand_string"),
@@ -538,19 +470,16 @@ pub(crate) fn machine_words() -> crate::MachineWords {
     }
 }
 
-/// A string sysctl (at most 63 bytes), NUL-trimmed; `None` where unreadable
-/// or empty.
+/// A string sysctl (at most 63 bytes), NUL-trimmed; `None` where unreadable or empty.
 fn sysctl_text(name: &CStr) -> Option<String> {
     sysctl_text_in::<64>(name)
 }
 
-/// A string sysctl read into `N` bytes (at most `N - 1` of text: the kernel
-/// refuses a longer one), NUL-trimmed; `None` where unreadable or empty.
+/// Read a string sysctl into at most `N` bytes.
 pub(crate) fn sysctl_text_in<const N: usize>(name: &CStr) -> Option<String> {
     let mut buf = [0u8; N];
     let mut len: libc::size_t = buf.len();
-    // SAFETY: `name` is NUL-terminated; `buf` is writable for `len` bytes and
-    // the kernel writes at most `len`, reporting how many in `len`.
+    // SAFETY: `name` is NUL-terminated.
     let rc = unsafe {
         libc::sysctlbyname(
             name.as_ptr(),
@@ -569,9 +498,7 @@ pub(crate) fn sysctl_text_in<const N: usize>(name: &CStr) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// `hw.perflevelN.{name,logicalcpu,l2cachesize}` for each of
-/// `hw.nperflevels` levels, fastest first; empty when any level's name or
-/// core count is unreadable (an Intel Mac has no levels).
+/// `hw.perflevelN.{name,logicalcpu,l2cachesize}` for each of `hw.nperflevels` levels.
 fn perf_levels() -> Vec<Level> {
     let n = sysctl_int(c"hw.nperflevels").unwrap_or(0).clamp(0, 16);
     let mut levels = Vec::new();
@@ -600,8 +527,6 @@ struct Cf(CFTypeRef);
 impl Cf {
     /// Adopt a +1 reference; `None` for NULL.
     fn adopt(object: CFTypeRef) -> Option<Self> {
-        // Lazy, never `then_some`: its argument is built before the test, so
-        // a NULL would become a `Cf(NULL)` dropped on the spot, and
         // `CFRelease(NULL)` traps (an absent registry property is NULL).
         (!object.is_null()).then(|| Self(object))
     }
@@ -623,8 +548,7 @@ impl Cf {
 
     /// `entry`'s registry property `key`.
     fn property(entry: io_registry_entry_t, key: CFTypeRef) -> Option<Self> {
-        // SAFETY: `entry` is a live registry entry and `key` a live CFString;
-        // the result is +1 (the Create rule) or NULL.
+        // SAFETY: `entry` is a live registry entry and `key` a live CFString.
         Self::adopt(unsafe {
             iokit::IORegistryEntryCreateCFProperty(entry, key.cast(), std::ptr::null(), 0)
         })
@@ -633,19 +557,17 @@ impl Cf {
 
 impl Drop for Cf {
     fn drop(&mut self) {
-        // SAFETY: the +1 this owner holds, released once.
+        // SAFETY: The +1 this owner holds, released once.
         unsafe { iokit::CFRelease(self.0) };
     }
 }
 
-/// A borrowed CF value read as an integer: a CFNumber's value, or a
-/// CFData's 1–8 little-endian bytes (the device tree's encoding).
+/// A borrowed CF value read as an integer.
 fn cf_u64(value: CFTypeRef) -> Option<u64> {
     if value.is_null() {
         return None;
     }
-    // SAFETY: `value` is a live CF object (borrowed for this call); each type
-    // is checked before the reader for that type touches it.
+    // SAFETY: `value` is a live CF object (borrowed for this call).
     unsafe {
         let ty = iokit::CFGetTypeID(value);
         if ty == iokit::CFNumberGetTypeID() {
@@ -669,8 +591,7 @@ fn cf_u64(value: CFTypeRef) -> Option<u64> {
 /// # Safety
 /// `value` is a live CF object that outlives the returned slice.
 unsafe fn cf_bytes<'a>(value: CFTypeRef) -> Option<&'a [u8]> {
-    // SAFETY: the caller's; the type is checked before the data is read, and
-    // CFData's byte pointer is valid for its length while it lives.
+    // SAFETY: The caller's; the type is checked before the data is read.
     unsafe {
         if iokit::CFGetTypeID(value) != iokit::CFDataGetTypeID() {
             return None;
@@ -684,7 +605,7 @@ unsafe fn cf_bytes<'a>(value: CFTypeRef) -> Option<&'a [u8]> {
     }
 }
 
-/// 1–8 little-endian bytes as an integer. PURE.
+/// 1–8 little-endian bytes as an integer.
 pub(crate) fn le_u64(bytes: &[u8]) -> Option<u64> {
     if bytes.is_empty() || bytes.len() > 8 {
         return None;
@@ -694,21 +615,18 @@ pub(crate) fn le_u64(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(word))
 }
 
-/// A device-tree `cluster-type`'s letter: the first byte when it is an
-/// ASCII capital (`b"E\0"` is `E`). PURE.
+/// A device-tree `cluster-type`'s letter.
 pub(crate) fn cluster_kind(bytes: &[u8]) -> Option<u8> {
     bytes.first().copied().filter(u8::is_ascii_uppercase)
 }
 
-/// A borrowed CF value as text: a CFString, or a CFData's bytes up to the
-/// first NUL. At most 127 bytes.
+/// A borrowed CF value as text: a CFString, or a CFData's bytes up to the first NUL.
 fn cf_text(value: CFTypeRef) -> Option<String> {
     if value.is_null() {
         return None;
     }
     let mut buf = [0 as libc::c_char; 128];
-    // SAFETY: `value` is live (borrowed); its type is checked before each
-    // reader; `buf` is writable for the length passed.
+    // SAFETY: `value` is live (borrowed).
     let bytes: Vec<u8> = unsafe {
         if iokit::CFGetTypeID(value) == iokit::CFStringGetTypeID() {
             if iokit::CFStringGetCString(
@@ -736,14 +654,12 @@ struct Io(io_object_t);
 
 impl Drop for Io {
     fn drop(&mut self) {
-        // SAFETY: the reference this owner holds, released once.
+        // SAFETY: The reference this owner holds, released once.
         unsafe { iokit::IOObjectRelease(self.0) };
     }
 }
 
-/// Every node under `IODeviceTree:/cpus` with its `logical-cpu-id`,
-/// `cluster-type` and `l2-cache-size` (at most 1024 nodes); a node with no
-/// readable id is left out. Empty where the device tree cannot be read.
+/// Every node under `IODeviceTree:/cpus` with its `logical-cpu-id`.
 fn dt_cpus() -> Vec<DtCpu> {
     let (Some(id_key), Some(kind_key), Some(l2_key)) = (
         Cf::string(c"logical-cpu-id"),
@@ -752,7 +668,7 @@ fn dt_cpus() -> Vec<DtCpu> {
     ) else {
         return Vec::new();
     };
-    // SAFETY: a NUL-terminated registry path; the entry is +1 or 0.
+    // SAFETY: A NUL-terminated registry path; the entry is +1 or 0.
     let cpus = unsafe {
         iokit::IORegistryEntryFromPath(MAIN_PORT_DEFAULT, c"IODeviceTree:/cpus".as_ptr())
     };
@@ -761,8 +677,7 @@ fn dt_cpus() -> Vec<DtCpu> {
     }
     let cpus = Io(cpus);
     let mut iter: io_object_t = 0;
-    // SAFETY: `cpus` is a live entry, the plane name NUL-terminated, `iter`
-    // writable; on success the iterator is +1.
+    // SAFETY: `cpus` is a live entry, the plane name NUL-terminated, `iter` writable.
     let kr = unsafe {
         iokit::IORegistryEntryGetChildIterator(cpus.0, c"IODeviceTree".as_ptr(), &raw mut iter)
     };
@@ -794,8 +709,7 @@ fn dt_cpus() -> Vec<DtCpu> {
     out
 }
 
-/// [`crate::cpu_layout`] on macOS: the perflevels, the device tree's nodes
-/// (read only where there are levels to tell apart), and `hw.logicalcpu`.
+/// [`crate::cpu_layout`] on macOS: the perflevels, the device tree's nodes, and `hw.logicalcpu`.
 pub(crate) fn cpu_layout() -> CpuLayout {
     let logical = sysctl_int(c"hw.logicalcpu")
         .and_then(|n| u16::try_from(n).ok())
@@ -821,11 +735,10 @@ pub(crate) fn layout_inputs() -> (Vec<Level>, Vec<DtCpu>, u16) {
 
 /// `vm.swapusage`: swap `(used, total)` bytes; `None` where unreadable.
 fn swap_usage() -> Option<(u64, u64)> {
-    // SAFETY: integers only; all-zero is a value.
+    // SAFETY: Integers only; all-zero is a value.
     let mut xsw: libc::xsw_usage = unsafe { std::mem::zeroed() };
     let mut len: libc::size_t = std::mem::size_of::<libc::xsw_usage>();
-    // SAFETY: `xsw` is writable for `len` bytes and the kernel writes at
-    // most that, reporting how many in `len`.
+    // SAFETY: `xsw` is writable for `len` bytes and the kernel writes at most that.
     let rc = unsafe {
         libc::sysctlbyname(
             c"vm.swapusage".as_ptr(),
@@ -839,8 +752,7 @@ fn swap_usage() -> Option<(u64, u64)> {
         .then_some((xsw.xsu_used, xsw.xsu_total))
 }
 
-/// [`crate::memory_detail`] on macOS: one `HOST_VM_INFO64` read by page
-/// class, `vm.swapusage` and the pressure level.
+/// [`crate::memory_detail`] on macOS.
 pub(crate) fn memory_detail() -> Option<MemoryDetail> {
     let page_bytes = vm_pagesize()?;
     let total = hw_memsize()?;
@@ -886,8 +798,7 @@ struct GpuKeys {
     recoveries: CFTypeRef,
 }
 
-/// The first `IOAccelerator`, matched once per process, with what never
-/// changes about it.
+/// The first `IOAccelerator`, matched once per process, with what never changes about it.
 struct Accel {
     service: io_service_t,
     keys: GpuKeys,
@@ -895,11 +806,9 @@ struct Accel {
     cores: Option<u16>,
 }
 
-// SAFETY: the service is a Mach port name and the keys immutable CFStrings,
-// all kept for the process (never released) and usable from any thread;
-// Rust dereferences none of them.
+// SAFETY: The service is a Mach port name and the keys immutable CFStrings.
 unsafe impl Send for Accel {}
-// SAFETY: as for `Send`.
+// SAFETY: As for `Send`.
 unsafe impl Sync for Accel {}
 
 /// A process-lifetime CFString: the +1 is deliberately kept.
@@ -915,9 +824,7 @@ fn accel() -> Option<&'static Accel> {
     static ACCEL: OnceLock<Option<Accel>> = OnceLock::new();
     ACCEL
         .get_or_init(|| {
-            // SAFETY: a NUL-terminated class name; the dictionary is +1 and
-            // consumed by `IOServiceGetMatchingService`, whose service is
-            // kept for the process.
+            // SAFETY: A NUL-terminated class name.
             let service = unsafe {
                 let matching = iokit::IOServiceMatching(c"IOAccelerator".as_ptr());
                 if matching.is_null() {
@@ -942,10 +849,9 @@ fn accel() -> Option<&'static Accel> {
                 .and_then(|v| cf_text(v.0))
                 .or_else(|| {
                     let mut class = [0 as libc::c_char; 128];
-                    // SAFETY: `service` is live and `class` is an `io_name_t`
-                    // (128 bytes) the call fills NUL-terminated.
+                    // SAFETY: `service` is live and `class` is a 128-byte `io_name_t`.
                     let kr = unsafe { iokit::IOObjectGetClass(service, class.as_mut_ptr()) };
-                    // SAFETY: on success `class` holds a NUL-terminated name.
+                    // SAFETY: On success `class` holds a NUL-terminated name.
                     let text = (kr == 0)
                         .then(|| unsafe { CStr::from_ptr(class.as_ptr()) }.to_string_lossy());
                     text.map(|t| t.into_owned()).filter(|t| !t.is_empty())
@@ -964,8 +870,7 @@ fn accel() -> Option<&'static Accel> {
         .as_ref()
 }
 
-/// [`crate::gpu`] on macOS: the cached accelerator's `PerformanceStatistics`,
-/// copied once per call.
+/// [`crate::gpu`] on macOS: the cached accelerator's `PerformanceStatistics`, copied once per call.
 pub(crate) fn gpu() -> Option<GpuReading> {
     let a = accel()?;
     let mut reading = GpuReading {
@@ -976,8 +881,7 @@ pub(crate) fn gpu() -> Option<GpuReading> {
     let Some(stats) = Cf::property(a.service, a.keys.stats) else {
         return Some(reading);
     };
-    // SAFETY: `stats` is live; its type is checked before it is read as a
-    // dictionary, and each value is borrowed (the Get rule) while it lives.
+    // SAFETY: `stats` is live.
     let value = |key: CFTypeRef| unsafe {
         cf_u64(iokit::CFDictionaryGetValue(stats.0.cast(), key)).and_then(|v| i64::try_from(v).ok())
     };
@@ -1023,23 +927,18 @@ pub(crate) fn volume(path: &std::path::Path) -> Option<VolumeReading> {
     ))
 }
 
-/// Initial `NET_RT_IFLIST2` buffer size (64 KiB, ~140 interfaces); the
-/// caller's scratch keeps it between reads.
+/// Initial `NET_RT_IFLIST2` buffer size; the caller's scratch keeps it between reads.
 const IFLIST_FIRST: usize = 64 * 1024;
 /// The most it grows to.
 const IFLIST_CAP: usize = 4 * 1024 * 1024;
 
-/// The routing socket's `NET_RT_IFLIST2` answer, read into `scratch`: into
-/// all of it, at least [`IFLIST_FIRST`] bytes, and where the kernel says
-/// that is too small (`ENOMEM`), grown as [`iflist::read_growing`] says,
-/// never past [`IFLIST_CAP`].
+/// Read `NET_RT_IFLIST2` into `scratch` ([`iflist::read_growing`], [`IFLIST_CAP`]).
 fn iflist_bytes(scratch: &mut Vec<u8>) -> Option<&[u8]> {
     let n = iflist::read_growing(IFLIST_FIRST, IFLIST_CAP, scratch, iflist_sysctl)?;
     Some(&scratch[..n])
 }
 
-/// One `sysctl` of the interface list into `buf`, or, with no buffer, of
-/// the size it needs now.
+/// One `sysctl` of the interface list into `buf`, or, with no buffer, of the size it needs now.
 fn iflist_sysctl(buf: Option<&mut [u8]>) -> iflist::Asked {
     let mut mib = [
         iflist::CTL_NET,
@@ -1053,9 +952,7 @@ fn iflist_sysctl(buf: Option<&mut [u8]>) -> iflist::Asked {
         Some(b) => (b.as_mut_ptr().cast::<c_void>(), b.len()),
         None => (std::ptr::null_mut(), 0),
     };
-    // SAFETY: `mib` names its length in integers; `ptr` is writable for
-    // `len` bytes and the kernel writes at most that, reporting how many,
-    // or it is null, which asks only for the size, written to `len`.
+    // SAFETY: `mib` names its length in integers.
     let rc = unsafe {
         libc::sysctl(
             mib.as_mut_ptr(),
@@ -1080,58 +977,48 @@ struct Fd(c_int);
 
 impl Drop for Fd {
     fn drop(&mut self) {
-        // SAFETY: the descriptor this owner opened, closed once.
+        // SAFETY: The descriptor this owner opened, closed once.
         unsafe { libc::close(self.0) };
     }
 }
 
-/// A datagram socket to ask interface ioctls on, close-on-exec; `None`
-/// where it cannot be opened (a sandbox that denies sockets).
+/// A datagram socket to ask interface ioctls on, close-on-exec; `None` where it cannot be opened.
 fn ioctl_socket() -> Option<Fd> {
-    // SAFETY: plain integers; the descriptor is owned by the `Fd` below.
+    // SAFETY: Plain integers; the descriptor is owned by the `Fd` below.
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
     if fd < 0 {
         return None;
     }
     let fd = Fd(fd);
-    // SAFETY: `fd` is a descriptor this process holds; Darwin's `socket`
-    // takes no `SOCK_CLOEXEC`, so the flag is set before anything else.
+    // SAFETY: `fd` is a descriptor this process holds.
     unsafe { libc::fcntl(fd.0, libc::F_SETFD, libc::FD_CLOEXEC) };
     Some(fd)
 }
 
-/// `name`'s functional type (`SIOCGIFFUNCTIONALTYPE`); `None` where the
-/// ask fails or the name does not fit `ifr_name` with its terminator.
+/// `name`'s functional type (`SIOCGIFFUNCTIONALTYPE`).
 fn functional_type(sock: &Fd, name: &str) -> Option<u32> {
-    // SAFETY: integers and bytes; all-zero is a value.
+    // SAFETY: Integers and bytes; all-zero is a value.
     let mut req: IfReqFunctional = unsafe { std::mem::zeroed() };
     let bytes = name.as_bytes();
     if bytes.is_empty() || bytes.len() >= req.ifr_name.len() || bytes.contains(&0) {
         return None;
     }
     req.ifr_name[..bytes.len()].copy_from_slice(bytes);
-    // SAFETY: `req` is a writable 32-byte `struct ifreq`, the size the
-    // request encodes, with a NUL-terminated name.
+    // SAFETY: `req` is a writable 32-byte `struct ifreq`.
     let rc = unsafe { libc::ioctl(sock.0, iflist::SIOCGIFFUNCTIONALTYPE, &raw mut req) };
     (rc == 0).then_some(req.ifru_functional_type)
 }
 
-/// `index`'s name by `if_indextoname`, for an interface whose message
-/// carried none.
+/// `index`'s name by `if_indextoname`, for an interface whose message carried none.
 fn index_name(index: u32) -> Option<String> {
     let mut buf = [0 as libc::c_char; libc::IFNAMSIZ];
-    // SAFETY: `buf` is `IFNAMSIZ` writable bytes, which the call fills
-    // NUL-terminated, or it returns NULL.
+    // SAFETY: `buf` is `IFNAMSIZ` writable bytes.
     let named = unsafe { libc::if_indextoname(index, buf.as_mut_ptr()) };
     let name = (!named.is_null()).then(|| c_text(&buf))?;
     (!name.is_empty()).then_some(name)
 }
 
-/// [`crate::net_links_into`] on macOS: the interface list read into
-/// `scratch` and decoded, a missing name asked of `if_indextoname`, and
-/// each interface's kind by [`iflist::link_kind`]: other for a name the
-/// machine filter refuses, else its functional type asked on one socket
-/// (the name's kind where that fails).
+/// [`crate::net_links_into`] on macOS ([`iflist::link_kind`]).
 pub(crate) fn net_links_into(scratch: &mut Vec<u8>) -> Option<Vec<LinkReading>> {
     let mut links = iflist::links_of(iflist_bytes(scratch)?);
     let sock = ioctl_socket();
@@ -1148,8 +1035,7 @@ pub(crate) fn net_links_into(scratch: &mut Vec<u8>) -> Option<Vec<LinkReading>> 
     Some(links)
 }
 
-/// [`crate::workqueue_limits`] on macOS: `kern.wq_max_constrained_threads`
-/// and `kern.wq_max_threads`.
+/// [`crate::workqueue_limits`] on macOS.
 pub(crate) fn workqueue_limits() -> crate::machine::WorkqueueLimits {
     let int = |name: &CStr| {
         sysctl_int(name)
@@ -1162,8 +1048,7 @@ pub(crate) fn workqueue_limits() -> crate::machine::WorkqueueLimits {
     }
 }
 
-/// [`crate::process_limits`] on macOS: `kern.maxproc`, and the smaller of
-/// `kern.maxprocperuid` and the soft `RLIMIT_NPROC`.
+/// [`crate::process_limits`] on macOS.
 pub(crate) fn process_limits() -> ProcessLimits {
     let int = |name: &CStr| {
         sysctl_int(name)
@@ -1179,15 +1064,9 @@ pub(crate) fn process_limits() -> ProcessLimits {
     }
 }
 
-/// [`crate::pid_counts`] on macOS: the room a size ask of
-/// `proc_listallpids` names ([`crate::machine::pid_room`]), then into one
-/// buffer of that room every pid (`proc_listallpids`, which answers a
-/// count) and the pids whose real user is `uid`
-/// (`proc_listpids(PROC_RUID_ONLY)`, which answers bytes), counted by
-/// [`crate::machine::listed_count`] and [`crate::machine::owned_count`]
-/// (which reads the `errno` this clears before the call).
+/// [`crate::pid_counts`] on macOS ([`crate::machine::pid_room`], [`crate::machine::owned_count`]).
 pub(crate) fn pid_counts(uid: u32) -> (Option<u64>, Option<u64>) {
-    // SAFETY: a null buffer asks for the room only.
+    // SAFETY: A null buffer asks for the room only.
     let estimate = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
     let Some(room) = crate::machine::pid_room(i64::from(estimate)) else {
         return (None, None);
@@ -1196,13 +1075,9 @@ pub(crate) fn pid_counts(uid: u32) -> (Option<u64>, Option<u64>) {
     let Ok(bytes) = c_int::try_from(std::mem::size_of_val(pids.as_slice())) else {
         return (None, None);
     };
-    // SAFETY: `pids` is writable for `bytes` bytes, the size passed; the
-    // call returns how many pids it wrote.
+    // SAFETY: `pids` is writable for `bytes` bytes, the size passed.
     let all = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
-    // SAFETY: as above; this call returns how many bytes it wrote.
-    // `errno` is this thread's, cleared first: libproc answers zero for a
-    // uid that owns no process and for a failure, and only a failure sets
-    // it.
+    // SAFETY: As above; this call returns how many bytes it wrote.
     let (own, errno) = unsafe {
         *libc::__error() = 0;
         let own = proc_listpids(PROC_RUID_ONLY, uid, pids.as_mut_ptr().cast(), bytes);
@@ -1215,12 +1090,7 @@ pub(crate) fn pid_counts(uid: u32) -> (Option<u64>, Option<u64>) {
     )
 }
 
-/// [`crate::caps`] on macOS: the public baseline of design §5.2 as this
-/// build reads it. Other users' processes answer no CPU time or footprint
-/// unprivileged (`proc_pid_rusage` is same-uid); the thermal notify level,
-/// `kern.sched_recommended_cores` and the per-process GPU lane are not read
-/// by this build. The coalitions are `yes` when this process passes their
-/// self-check, and unsupported by this OS build when it does not.
+/// [`crate::caps`] on macOS: the public baseline of design §5.2 as this build reads it.
 pub(crate) fn caps() -> crate::Caps {
     use crate::{Cap, Why};
     crate::Caps {
@@ -1257,8 +1127,7 @@ mod tests {
     #[test]
     fn an_absent_property_adopts_as_none_without_a_release() {
         assert!(Cf::adopt(std::ptr::null()).is_none());
-        // SAFETY: a NUL-terminated registry path (the platform expert
-        // device, on every Mac and VM); the entry is +1 or 0.
+        // SAFETY: A NUL-terminated registry path (the platform expert device, on every Mac and VM).
         let device =
             unsafe { iokit::IORegistryEntryFromPath(MAIN_PORT_DEFAULT, c"IOService:/".as_ptr()) };
         assert_ne!(device, 0, "the platform expert device");

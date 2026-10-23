@@ -4,9 +4,12 @@
 use super::*;
 
 /// A hang detector, never a latency budget: every wait on it ends the
+/// moment the thing it waits for happens.
 const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The wake pipe: both ends close-on-exec (they must not survive a seamless
+/// re-exec) and non-blocking, so a redundant [`wake`] against a FULL pipe
+/// returns instead of parking the event loop.
 #[test]
 fn a_wake_pipe_is_cloexec_and_a_wake_into_a_full_one_never_blocks() {
     let (rd, wr) = make_wake_pipe().expect("wake pipe");
@@ -31,6 +34,9 @@ fn a_wake_pipe_is_cloexec_and_a_wake_into_a_full_one_never_blocks() {
 }
 
 /// The session ends with its shell: with the slave held by a leftover job, so the
+/// master never reads data or EOF, the exit watch answers `Exited` once the shell
+/// exits, with or without a wake pipe; while it lives the reader parks, and a wake
+/// still wins.
 #[test]
 fn read_or_wake_answers_exited_when_the_shell_exits_while_the_slave_is_held() {
     use std::os::fd::AsRawFd as _;
@@ -100,6 +106,8 @@ fn read_or_wake_answers_exited_when_the_shell_exits_while_the_slave_is_held() {
 }
 
 /// An interactive-sized burst (under one outq) is delivered on the first quiet read,
+/// with no park (`at_gap` never fires, no bridge poll is counted), and gathers exactly
+/// the bytes written.
 #[test]
 fn drain_more_nonblocking_delivers_interactive_burst_on_first_quiet_read() {
     let mut m = [0i32; 2];
@@ -142,6 +150,8 @@ fn always_hot() -> bool {
 }
 
 /// P05 — a CONTINUOUS stream (a refill waiting at every dry gap, for longer
+/// than any budget) is cut by the SHORTER hot budget while a keystroke is
+/// pending, and by the flood budget otherwise.
 #[test]
 fn drain_more_nonblocking_hot_caps_a_continuous_stream_at_the_hot_budget() {
     use std::sync::atomic::AtomicUsize;
@@ -210,6 +220,7 @@ fn drain_more_nonblocking_hot_caps_a_continuous_stream_at_the_hot_budget() {
 }
 
 /// A saturated burst (at least one outq) is gathered into one batch, and EOF mid-drain
+/// just ends the top-up.
 #[test]
 fn drain_more_nonblocking_gathers_saturated_burst_and_survives_eof() {
     let mut m = [0i32; 2];
@@ -247,6 +258,8 @@ fn drain_more_nonblocking_gathers_saturated_burst_and_survives_eof() {
 }
 
 /// Both parks a dry gap can take (the busy-parser bridge poll and the idle-parser µs
+/// wait): a wake byte pending when the gather parks delivers what it has without
+/// consuming the byte ([`read_or_wake`] owns the wake protocol).
 #[test]
 fn drain_more_nonblocking_parks_yield_to_wake_and_leave_the_byte() {
     use std::sync::atomic::AtomicUsize;
@@ -306,6 +319,8 @@ fn drain_more_nonblocking_parks_yield_to_wake_and_leave_the_byte() {
 }
 
 /// The host fence: `at_gap` returning `true` delivers the batch without parking, and a
+/// refill queued at that gap stays for the next read (aterm-gui cuts at a foreground
+/// group change, and the refill belongs to the new group).
 #[test]
 fn drain_more_nonblocking_fence_delivers_before_a_park() {
     use std::sync::atomic::AtomicUsize;
@@ -380,6 +395,8 @@ fn drain_more_nonblocking_fence_delivers_before_a_park() {
 }
 
 /// The process watch (card engine §3.3) is the fourth descriptor of the reader's poll and
+/// joins both parks: readable, it is heard BEFORE the master, so the host drains it before
+/// any byte read after it.
 #[test]
 fn the_process_watch_is_heard_before_the_master_in_every_poll() {
     use std::sync::atomic::AtomicUsize;
@@ -605,6 +622,8 @@ fn no_batch_ends_past_an_exec_the_watch_could_hear() {
 }
 
 /// The blocking fallback ([`drain_more_watched`]) hears the watch in each per-chunk poll,
+/// at that chunk's offset and before its bytes; a batch that ends with no poll after its
+/// last bytes (here, handed in full) asks the watch once more and hears it at its end.
 #[test]
 fn the_blocking_fallback_hears_the_watch_at_each_chunk() {
     let pipe = || {
@@ -653,6 +672,8 @@ fn the_blocking_fallback_hears_the_watch_at_each_chunk() {
 }
 
 /// Parser-idle hysteresis: an armed idle wait parks an idle parser's dry gap (the µs
+/// idle wait, never the 1 ms bridge poll) until the writer's refill, written from
+/// another thread while the gather is parked, which joins the same batch.
 #[test]
 fn drain_more_nonblocking_idle_wait_bridges_refill_into_same_batch() {
     use std::sync::atomic::AtomicUsize;
@@ -716,6 +737,8 @@ fn drain_more_nonblocking_idle_wait_bridges_refill_into_same_batch() {
 }
 
 /// A signal handler that runs during the armed idle wait does not end it: the park
+/// resumes for the time it has left, and the refill still joins the batch (Rosetta runs
+/// one on every thread it translates, `idle_refill_wait`).
 #[test]
 fn a_signal_does_not_end_an_armed_idle_wait() {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -881,6 +904,8 @@ fn carried_errno(err: &io::Error) -> Option<libc::c_int> {
 }
 
 /// The master open, against a scripted `posix_openpt` that fails as the kernel
+/// does (`-1`, `errno` set — libsyscall's `cerror`) and then opens descriptor
+/// 1000.
 #[cfg(target_os = "macos")]
 #[test]
 fn master_open_redrives_a_lost_race_and_reports_a_real_failure_at_once() {
@@ -924,6 +949,7 @@ fn master_open_redrives_a_lost_race_and_reports_a_real_failure_at_once() {
 }
 
 /// `ptsname_r`'s error comes from its return value, never a stale `errno` (musl does
+/// not set it); a -1 still reads `errno`.
 #[test]
 fn ptsname_r_errors_come_from_its_return_value() {
     let after_stale = |rc| {
@@ -980,7 +1006,7 @@ fn fd_flags(fd: libc::c_int, what: &str) -> libc::c_int {
     flags
 }
 
-/// `poll(fd, POLLIN)` for at most `budget`: the revents once any arrive, else 0. The
+/// `poll(fd, POLLIN)` for at most `budget`: the revents once any arrive, else 0.
 fn poll_revents(fd: libc::c_int, budget: std::time::Duration) -> libc::c_short {
     let deadline = std::time::Instant::now() + budget;
     loop {
@@ -1001,6 +1027,8 @@ fn poll_revents(fd: libc::c_int, budget: std::time::Duration) -> libc::c_short {
 }
 
 /// The pixel arithmetic's edges: half a geometry is not a geometry (a zero
+/// axis zeroes BOTH fields, so no consumer can divide by it), and the
+/// kernel's `u16` fields report the cap, never a wrapped small number.
 #[test]
 fn winsize_pixels_zeroes_half_a_geometry_and_saturates() {
     assert_eq!(winsize_pixels(24, 80, Some((0, 17))), (0, 0));
@@ -1012,6 +1040,10 @@ fn winsize_pixels_zeroes_half_a_geometry_and_saturates() {
 }
 
 /// THE DEFECT, as a deterministic regression: while a session's pty pair and
+/// an exec-status channel are open in this (multi-threaded) parent, an
+/// UNRELATED spawn that hands its child every descriptor without
+/// `FD_CLOEXEC` ([`aterm_uds::spawnfd::transparent`]; a std `Command` child
+/// gets fds 0-2 alone under Trust's SP-1 std) inherits NO end of either.
 #[test]
 fn an_unrelated_exec_inherits_no_end_of_a_live_pty_or_status_channel() {
     use std::time::Duration;
@@ -1091,6 +1123,7 @@ fn an_unrelated_exec_inherits_no_end_of_a_live_pty_or_status_channel() {
 }
 
 /// Build the racy carrier (`pipe(2)` + two `fcntl(F_SETFD)`) by hand: the real seam
+/// cannot reach the leak, and the bound test must re-create it.
 fn racy_status_pipe() -> (libc::c_int, libc::c_int) {
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `pipe` fills exactly the two-element array it is given.
@@ -1108,6 +1141,8 @@ fn racy_status_pipe() -> (libc::c_int, libc::c_int) {
 }
 
 /// THE HANG, bounded: with a stranger holding a duplicate of the write end,
+/// the status wait ENDS on its budget as `NoVerdict` (which the seam turns
+/// into a fail-closed error) instead of parking for the stranger's life.
 #[test]
 fn a_stranger_holding_the_write_end_cannot_block_the_status_wait_forever() {
     const BUDGET: std::time::Duration = std::time::Duration::from_millis(400);
@@ -1132,7 +1167,7 @@ fn a_stranger_holding_the_write_end_cannot_block_the_status_wait_forever() {
     );
 }
 
-/// [`wait_readable_briefly`] WAKES when a fifo's last writer closes. On macOS
+/// [`wait_readable_briefly`] WAKES when a fifo's last writer closes.
 #[cfg(target_os = "macos")]
 #[test]
 fn wait_readable_briefly_wakes_when_a_fifos_last_writer_closes() {
@@ -1159,6 +1194,8 @@ fn wait_readable_briefly_wakes_when_a_fifos_last_writer_closes() {
 }
 
 /// With `$TMPDIR` unset the status FIFO goes in `/tmp`, not where `std::env::temp_dir`
+/// would put it (std asks `confstr`, which [`exec_status_fifo_dir`] avoids); a set one
+/// is used as given, ending in one `/`.
 #[cfg(target_os = "macos")]
 #[test]
 fn an_unset_tmpdir_puts_the_status_fifo_in_tmp() {
@@ -1171,13 +1208,17 @@ fn an_unset_tmpdir_puts_the_status_fifo_in_tmp() {
     assert_eq!(dir(Some("")), "/");
 }
 
-/// One real spawn through the seam, checked from both sides. The child is a
+/// One real spawn through the seam, checked from both sides.
 #[test]
 fn a_spawned_child_gets_its_own_ctty_our_winsize_and_no_other_descriptor() {
     spawn_probe_checks_the_child(None);
 }
 
 /// The same child, from a kit the pool opened ahead ([`fill_kits`]): the spawn
+/// takes it and gives it this spawn's winsize, pixels included, before the
+/// fork; the termios is the spawn's; the kit still waiting in the pool reaches
+/// the child as no descriptor; and the spent channel end waits in the pool for
+/// the next fill, which closes it and opens the replacement.
 #[test]
 fn a_spawn_takes_a_ready_kit_and_gives_it_its_winsize() {
     let pool: &'static std::sync::Mutex<KitPool> =
@@ -1209,6 +1250,7 @@ fn a_spawn_takes_a_ready_kit_and_gives_it_its_winsize() {
 }
 
 /// The spent-end hold is bounded: past [`SPENT_MAX`], and with the pool off,
+/// the caller closes its own.
 #[test]
 fn a_full_or_off_pool_hands_a_spent_end_back() {
     let mut pool = KitPool::new();
@@ -1227,6 +1269,8 @@ fn a_full_or_off_pool_hands_a_spent_end_back() {
 }
 
 /// [`a_spawned_child_gets_its_own_ctty_our_winsize_and_no_other_descriptor`]'s
+/// spawn and checks, with `absent` naming descriptors the child must not hold
+/// besides the parked pipe copy.
 fn spawn_probe_checks_the_child(absent: Option<&[libc::c_int]>) {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -1410,6 +1454,7 @@ fn spawn_termios_deltas_are_exactly_iutf8_and_speed() {
 }
 
 /// The kernel's default signal characters — `^C`, `^\`, `^Z` — which a
+/// fresh pty's slave carries (the spawn seam copies the kernel defaults).
 #[cfg(target_os = "macos")]
 const DEFAULT_SIGNALS: crate::TtySignals = crate::TtySignals {
     intr: Some(0x03),
@@ -1430,6 +1475,7 @@ fn edit_termios(slave: i32, edit: impl FnOnce(&mut libc::termios)) {
 }
 
 /// A pty pair whose slave the test itself makes raw (`cfmakeraw`, `VMIN = 1`,
+/// `VTIME = 0`): no child, no race.
 #[cfg(target_os = "macos")]
 fn raw_pair() -> (i32, i32) {
     let (master, slave) = open_pty_pair().expect("pty pair");
@@ -1455,6 +1501,7 @@ fn type_into(master: i32, bytes: &[u8]) {
 }
 
 /// Read exactly `n` bytes from `fd` (the program reading its input, or aterm
+/// reading the program's output), returning them.
 #[cfg(target_os = "macos")]
 fn read_exactly(fd: i32, n: usize) -> Vec<u8> {
     let mut out = vec![0u8; n];
@@ -1478,6 +1525,9 @@ fn close_pair(master: i32, slave: i32) {
 }
 
 /// THE FLUSH ON THE MASTER: `flush_input_queue(master)` discards exactly the
+/// slave's unread INPUT and reports its count — a `\r` and the `\x1b[B`
+/// behind it, 4 bytes — and leaves the program's unread OUTPUT alone (a
+/// `TCIOFLUSH` would drop what the program drew).
 #[test]
 #[cfg(target_os = "macos")]
 fn flush_input_queue_discards_the_unread_input_and_nothing_else() {
@@ -1495,6 +1545,10 @@ fn flush_input_queue_discards_the_unread_input_and_nothing_else() {
 }
 
 /// The signal characters [`tty_echo`] reports are the ones the line
+/// discipline acts on: none without ISIG (raw), the kernel defaults with it
+/// (cbreak: readline between keys, `watch`, `htop`), a remapped `VINTR` as
+/// remapped, and a disabled one (`_POSIX_VDISABLE`, 0xff) as `None` — never
+/// as a byte the unread-input gate would let through as a signal.
 #[test]
 #[cfg(target_os = "macos")]
 fn tty_echo_reads_the_signal_characters_isig_acts_on() {
@@ -1516,6 +1570,9 @@ fn tty_echo_reads_the_signal_characters_isig_acts_on() {
 }
 
 /// [`tty_passes_every_byte`] answers `true` only with ICANON, ISIG, IEXTEN,
+/// IXON and IGNCR all clear (`cfmakeraw`): each one lets the line discipline
+/// consume a written byte with nothing reading the slave (`^C`, `^S`, `^O`,
+/// `\r`, a partial line), so a shrinking queue there is no read.
 #[test]
 #[cfg(target_os = "macos")]
 fn tty_passes_every_byte_only_in_raw_mode() {
@@ -1540,6 +1597,10 @@ fn tty_passes_every_byte_only_in_raw_mode() {
 }
 
 /// A [`dup_fd`] copy is close-on-exec, though POSIX `dup(2)` clears the flag
+/// on every copy it makes: the spill drainer holds its duplicate of a master
+/// for as long as a wedged shell keeps the queue spilling, and an inheritable
+/// copy would hand every process that execs meanwhile a writable descriptor
+/// onto that session's terminal.
 #[test]
 fn a_dup_fd_copy_is_close_on_exec() {
     let (rd, wr) = make_wake_pipe().expect("a pipe");
@@ -1579,6 +1640,8 @@ fn is_utf8_locale_classifies_codeset() {
 }
 
 /// Every inherited-locale shape, through `resolve_spawn_locale` and `build_child_env`,
+/// gives the child a UTF-8 `LC_CTYPE`, judged by an oracle independent of
+/// `is_utf8_locale`.
 #[test]
 fn spawn_locale_conformance_child_always_utf8_ctype() {
     use std::ffi::OsString;
@@ -1723,6 +1786,8 @@ fn bogus_exec_command_takes_child_exec_failure_path() {
 }
 
 /// A session's shell with no argv of its own is a login shell (`-zsh`) on macOS
+/// and an interactive non-login one (`zsh`) on every other Unix: each platform's
+/// terminal convention.
 #[test]
 fn the_default_shell_argv0_is_login_on_macos_only() {
     let argv0 = default_shell_argv0(std::ffi::OsStr::new("zsh"));
@@ -1838,10 +1903,12 @@ fn wrapped_spawn_enforces_network_deny_via_seatbelt() {
 }
 
 /// The probe a `-e` command's arguments are read back with: each positional
+/// argument's bytes in hex, one `[..]` line per argument, then `END`.
 const ARGV_HEX: &str = "for a; do printf '['; printf %s \"$a\" | od -An -tx1 | tr -d ' \\n'; \
                         printf ']\\n'; done; echo END";
 
 /// Run `exec` as a `-e` command through the real spawn seam and return what the
+/// program saw of each positional argument, in hex ([`ARGV_HEX`]).
 fn argv_bytes_seen(exec: &[std::ffi::OsString]) -> Vec<String> {
     // SAFETY: a test process; the trusted-launcher contract trivially holds.
     let authority = unsafe { aterm_cap::Authority::root_authority() };
@@ -1887,6 +1954,7 @@ fn argv_bytes_seen(exec: &[std::ffi::OsString]) -> Vec<String> {
 }
 
 /// A `-e` argument reaches the program byte for byte: non-UTF-8 is not turned into
+/// U+FFFD, and the argument after it stays in place.
 #[test]
 fn a_command_argument_reaches_the_program_byte_for_byte() {
     use std::os::unix::ffi::OsStringExt as _;
@@ -1903,6 +1971,11 @@ fn a_command_argument_reaches_the_program_byte_for_byte() {
 }
 
 /// A NUL byte in any argv source refuses the spawn (`InvalidInput`) instead
+/// of running something else: `execve` reads a C string only up to its NUL,
+/// so an argument holding one would be cut and every argument after it
+/// shifted, and a configured shell holding one once ran another program
+/// (`shell = "/bin/zsh\u0000x"` with `shell_args = ["-c", "echo $0"]` printed
+/// `/bin/sh`).
 #[test]
 fn a_nul_in_an_argument_or_the_shell_refuses_the_spawn() {
     use std::ffi::OsString;
@@ -1974,7 +2047,7 @@ fn a_nul_in_an_argument_or_the_shell_refuses_the_spawn() {
         .expect("an -e command does not run the shell, so it is not refused for it"));
 }
 
-/// THE SHELL'S BAND ([`SHELL_ROLE`], macOS). A spawned shell holds the UI darwin
+/// THE SHELL'S BAND ([`SHELL_ROLE`], macOS).
 #[cfg(target_os = "macos")]
 #[test]
 fn a_spawned_shell_runs_in_the_ui_tier_and_nothing_it_starts_does() {

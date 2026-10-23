@@ -150,6 +150,7 @@ struct Live<'a> {
 }
 
 /// Every live 2.1.282 capture reads whole as its form (focus, `(Recommended)`,
+/// checkboxes, free-text row, tabs): prompt phase, authoritative, every role `Other`.
 #[test]
 fn every_live_question_capture_reads_as_its_form() {
     use QuestionFocus as F;
@@ -457,6 +458,7 @@ fn every_live_question_capture_reads_as_its_form() {
 }
 
 /// A bare question at column 0 (S6-02) is inside the box, not a shell line ending it;
+/// the chat row's `❯` at column 0 is the dialog's focus, not a user's row.
 #[test]
 fn the_question_zone_is_not_a_shell_line_nor_the_option_cursor_the_users_row() {
     let (r, p, d) = read(QUESTION_TABS_SECOND);
@@ -483,7 +485,7 @@ fn the_question_zone_is_not_a_shell_line_nor_the_option_cursor_the_users_row() {
     }
 }
 
-/// The Submit (review) tab, which draws no footer, is the question dialog. Negative
+/// The Submit (review) tab, which draws no footer, is the question dialog.
 #[test]
 fn the_review_tab_is_a_question() {
     for (text, unanswered) in [(QUESTION_REVIEW, false), (QUESTION_REVIEW_UNANSWERED, true)] {
@@ -534,7 +536,96 @@ fn the_review_tab_is_a_question() {
     }
 }
 
+/// THE REVIEW TAB WITH AN AUTO-DENY COUNTDOWN — HAND-BUILT where 2.1.301's
+/// code draws it (its permission reason block, between the answers and
+/// `Ready to submit your answers?`; not measured): the countdown row, and
+/// the same wrapped onto a second row as a narrow pane draws it, and through
+/// its very words onto three in a pane narrower than them, each over its own
+/// blank row, is passed over — the review is read whole, its four answers
+/// and its focus as before — and the box's countdown reads its time.
+/// NEGATIVE CONTROLS: any other row at column 0 there (another `⚠` warning,
+/// one or wrapped, a countdown with no blank row under it) is no review: its
+/// head off the screen, form unknown, escalated.
+#[test]
+fn the_review_tab_is_read_whole_over_its_countdown() {
+    let r = screen(QUESTION_REVIEW);
+    let ready = row_of(&r, "Ready to submit your answers?");
+    let with = |block: &[&str], blank_under: bool| {
+        let mut t = r.clone();
+        let mut add: Vec<String> = block.iter().map(|s| (*s).to_string()).collect();
+        if blank_under {
+            add.push(String::new());
+        }
+        t.splice(ready..ready, add);
+        t
+    };
+    let one = "⚠ Claude Code will automatically deny this request in 0:14, to avoid blocking \
+               progress on an unattended session";
+    for block in [
+        vec![one],
+        vec![
+            "⚠ Claude Code will automatically deny this request in 0:14, to avoid",
+            "blocking progress on an unattended session",
+        ],
+        // A pane narrower than its words: `deny
+        // this request in` wrapped too.
+        vec![
+            "⚠ Claude Code will automatically deny this",
+            "request in 0:14, to avoid blocking progress on",
+            "an unattended session",
+        ],
+    ] {
+        let t = with(&block, true);
+        let p = parse_prompt_v2(&t).expect("the review");
+        let d = p.question_dialog.clone().expect("the dialog");
+        assert!(
+            matches!(
+                d.form,
+                QuestionForm::Review {
+                    unanswered: false,
+                    ..
+                }
+            ),
+            "{block:?}: {:?}",
+            d.form
+        );
+        assert_eq!(d.tabs.len(), 4, "{block:?}");
+        assert_eq!(d.focus(), QuestionFocus::ReviewSubmit, "{block:?}");
+        assert!(!p.head_off_screen, "{block:?}");
+        assert_eq!(
+            p.auto_deny_left(),
+            Some(std::time::Duration::from_secs(14)),
+            "{block:?}: {p:?}"
+        );
+    }
+    for (why, t) in [
+        (
+            "another warning",
+            with(&["⚠ Something else the vendor warns about"], true),
+        ),
+        (
+            "another warning, wrapped",
+            with(
+                &["⚠ Something else the vendor warns", "about, at some length"],
+                true,
+            ),
+        ),
+        ("no blank row under it", with(&[one], false)),
+    ] {
+        let p = parse_prompt_v2(&t).expect("still a box");
+        assert!(p.head_off_screen, "{why}");
+        let d = p.question_dialog.expect("the dialog");
+        assert!(
+            matches!(d.form, QuestionForm::Unknown { .. }),
+            "{why}: {:?}",
+            d.form
+        );
+    }
+}
+
 /// The preview form's options are read left of the pane (`┌` at column 34), labels
+/// wrapping inside the option column, a trailing ` ✔` the selection tick; the chat row
+/// has no number, and a digit only moves the focus.
 #[test]
 fn the_preview_form_reads_its_options_left_of_the_pane() {
     let (r, p, d) = read(QUESTION_PREVIEW);
@@ -592,6 +683,7 @@ fn options_of_preview(d: &QuestionDialog) -> &[QuestionOption] {
 }
 
 /// Multi-select reads each checkbox, the free-text row and the button row by position;
+/// one multi-select question draws the `✔ Submit` chip, and its button reads `Submit`.
 #[test]
 fn multiselect_reads_checkboxes_the_free_text_and_the_button() {
     let (_, _, d) = read(QUESTION_MULTISELECT);
@@ -645,6 +737,7 @@ fn multiselect_reads_checkboxes_the_free_text_and_the_button() {
 }
 
 /// The free-text row is read by its position: a person's `2` in it is no pristine
+/// placeholder, focused or not; the pristine row with the focus on it reads as focused.
 #[test]
 fn the_free_text_row_is_read_by_its_position() {
     for text in [QUESTION_FREE_TEXT_TYPED, QUESTION_FREE_TEXT_TYPED_AWAY] {
@@ -667,6 +760,7 @@ fn the_free_text_row_is_read_by_its_position() {
 }
 
 /// `(Recommended)` is read from the label only: the 80-column capture's wrapped label is
+/// [`Recommended::Wrapped`], the 180-column one [`Recommended::Label`].
 #[test]
 fn recommended_is_read_from_the_label_only() {
     let (r, _, d) = read(QUESTION_LONG_LABEL_80COL);
@@ -704,6 +798,8 @@ fn recommended_is_read_from_the_label_only() {
 }
 
 /// A question whose tab bar, question or first options the pane cut (or a review tab
+/// cut the same way, or a dialog at the top of a 49-row grid read by a 40-row tail) has
+/// its head off the screen, form unknown, never idle.
 #[test]
 fn a_cut_question_is_head_off_screen_never_idle() {
     let r = screen(QUESTION_TABS_INCIDENT);
@@ -764,6 +860,8 @@ fn a_cut_question_is_head_off_screen_never_idle() {
 }
 
 /// F2, measured on Claude Code 2.1.302: a multi-select
+/// whose policy text wraps over more rows than a read's top leaves of the
+/// dialog.
 #[test]
 fn a_multi_select_cut_inside_its_free_text_row_is_head_off_screen() {
     let grid = screen(QUESTION_MULTI_TYPED_41X60_2_1_302);
@@ -813,6 +911,11 @@ fn a_multi_select_cut_inside_its_free_text_row_is_head_off_screen() {
 }
 
 /// A multi-select cut at ANY row from its first option down to its divider
+/// is the dialog with its head off the screen, wherever the focus is: on an
+/// option (the pristine dialog at 37, 41 and 80 columns), in the typed text
+/// (41x60), or on `Submit` after `down` (the nine widths of
+/// `QUESTION_MULTI_REFLOW_LONG_KEPT_2_1_302`), all measured on Claude Code
+/// 2.1.302, and the 2.1.283 captures at 120 columns.
 #[test]
 fn a_multi_select_cut_at_any_row_under_its_head_is_head_off_screen() {
     let mut frames: Vec<(String, &str)> = vec![
@@ -869,6 +972,8 @@ fn a_multi_select_cut_at_any_row_under_its_head_is_head_off_screen() {
 }
 
 /// Each cut of a multi-select's whole dialog `r` from its option 1 down to
+/// its divider, read: where it was cut (for `what`), whether its head is off
+/// the screen, and its form.
 fn cuts_under_the_head(r: &[String], what: &str) -> Vec<(String, bool, QuestionForm)> {
     let first = r
         .iter()
@@ -890,6 +995,14 @@ fn cuts_under_the_head(r: &[String], what: &str) -> Vec<(String, bool, QuestionF
 }
 
 /// , on Claude Code 2.1.302: every frame of
+/// the four reflow sweeps from 33 columns (under it option 1 wraps), both
+/// policy texts typed and `down` to `Submit`, rebuilt whole
+/// ([`reflow_dialog`], first held to the nine measured dialogs it redraws
+/// row for row), is the dialog with its head off the screen when cut at
+/// any row from option 1 down to the divider, wherever the whole reads as
+/// the multi-select — every frame the text kept its rows in (the widths
+/// the harness types at, column 8 and column 9) and the frames `Submit`
+/// was drawn over that still read.
 #[test]
 fn a_multi_select_cut_under_its_head_is_head_off_screen_at_every_swept_width() {
     let template = QUESTION_MULTI_REFLOW_LONG_KEPT_2_1_302[1].1;
@@ -974,6 +1087,7 @@ fn a_multi_select_cut_under_its_head_is_head_off_screen_at_every_swept_width() {
 }
 
 /// The hand-built column-one dialogs (a shape 2.1.282 does not draw) are questions but
+/// not read whole, so nothing answers them.
 #[test]
 fn a_column_one_question_is_still_a_question_not_read_whole() {
     for text in [QUESTION_YES_NO, QUESTION_DO_YOU_WANT] {
@@ -996,6 +1110,8 @@ fn a_column_one_question_is_still_a_question_not_read_whole() {
 }
 
 /// A hand transcription of the incident screen (`›` for the cursor, `□` chips, `✓
+/// Submit`, a leading space on the tab row) is a question by its footer, not read whole:
+/// the `›` row is no option, so nothing answers it.
 #[test]
 fn the_transcribed_incident_is_escalated_not_answered() {
     let mut r = screen(QUESTION_TABS_INCIDENT);
@@ -1021,6 +1137,7 @@ fn the_transcribed_incident_is_escalated_not_answered() {
 }
 
 /// Measured on 2.1.282: a draft typed while the turn ran does not withhold the dialog;
+/// it is drawn over the composer, the draft hidden under it, and reads whole.
 #[test]
 fn a_dialog_drawn_over_a_draft_reads_whole_and_the_draft_is_left() {
     let (r, p, d) = read(QUESTION_OVER_DRAFT);
@@ -1054,6 +1171,7 @@ fn a_dialog_drawn_over_a_draft_reads_whole_and_the_draft_is_left() {
 }
 
 /// The dim notice Claude Code draws in place of a dialog it withholds behind a draft is a
+/// question, form unknown, prompt phase.
 #[test]
 fn a_question_withheld_behind_a_draft_is_a_question_never_idle() {
     let (r, p, d) = read(QUESTION_DEFERRED);
@@ -1094,6 +1212,8 @@ fn a_question_withheld_behind_a_draft_is_a_question_never_idle() {
 }
 
 /// What the dialog's host draws under it (the AFK countdown, one right-aligned plugin
+/// notice, the panel-waiting row) keeps the dialog read whole; the AFK row is read as
+/// `auto_continue`.
 #[test]
 fn the_rows_under_a_dialog_keep_it_read_whole() {
     for text in [QUESTION_AFK, QUESTION_PLUGIN_NOTICE, QUESTION_PANEL_WAITING] {
@@ -1130,6 +1250,7 @@ fn the_rows_under_a_dialog_keep_it_read_whole() {
 }
 
 /// A live question footer over rows of no shape read is still a question: head off the
+/// screen, form unknown, never idle.
 #[test]
 fn a_live_question_footer_is_never_no_box_and_a_quoted_one_is() {
     let mut r = screen(QUESTION_CHAT_FOCUSED);
@@ -1170,6 +1291,7 @@ fn a_live_question_footer_is_never_no_box_and_a_quoted_one_is() {
 }
 
 /// A scrolled option list (`↓`/`↑` in the pointer column), a numbering gap, a chat row
+/// that is not `N+2`, and no focused row are each unknown, and still a question.
 #[test]
 fn an_unsound_option_list_is_never_read_whole() {
     let (r, p, d) = read(QUESTION_SCROLLED);
@@ -1216,6 +1338,7 @@ fn an_unsound_option_list_is_never_read_whole() {
 }
 
 /// The tab bar's grammar: one chip at column 1, or `←` … `✔ Submit` … `→` at column 0
+/// (which one multi-select question draws too).
 #[test]
 fn the_tab_bar_is_read_by_its_chips() {
     let names = |row: &str| {
@@ -1257,6 +1380,7 @@ fn the_tab_bar_is_read_by_its_chips() {
 }
 
 /// The accessors a decider reads: the guard row, the focus, one tab
+/// against the next.
 #[test]
 fn the_dialogs_accessors_name_its_rows() {
     let (_, _, first) = read(QUESTION_TABS_INCIDENT);
@@ -1279,10 +1403,13 @@ fn the_dialogs_accessors_name_its_rows() {
 }
 
 /// Copies of `aterm-agent`'s `LONG_TERM_TEXT` and `SHORT_TERM_TEXT` (no commas,
+/// semicolons, hyphens or `then`, so a multi-select answer is not delivered CSV-quoted),
+/// pinning the reader's side: each, wrapped as 2.1.283 wraps the field, reads back whole.
 const REWORDED_LONG_TERM: &str = "Decide yourself: choose the option that best serves long term correctness and total value even at the cost of short term deliverables. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)";
 const REWORDED_SHORT_TERM: &str = "Decide yourself: choose the option that gets the current deliverable done soonest at acceptable risk. Say which you chose and why in one line and continue without asking again. (Answered by the aterm harness by policy. The user was not asked.)";
 
 /// The captures whose free-text row holds a measured policy text, with it: the focused
+/// field, and the field the focus left for the button (c3-06, c4-10).
 const TYPED_2_1_283: [(&str, &str, &str); 7] = [
     (
         "c1-04",
@@ -1322,6 +1449,7 @@ const TYPED_2_1_283: [(&str, &str, &str); 7] = [
 ];
 
 /// The rows the free-text row's text is drawn on: from its numbered row to
+/// the multi-select button or the divider.
 fn field_rows(d: &QuestionDialog) -> std::ops::Range<usize> {
     match &d.form {
         QuestionForm::Single {
@@ -1347,6 +1475,7 @@ struct Live283 {
 }
 
 /// Every 2.1.283 capture of the dialog (c1…c11) reads as its form, or unknown where it
+/// must: a question, its head on the screen, prompt phase, authoritative.
 #[test]
 fn every_2_1_283_question_capture_reads_as_its_form() {
     use QuestionFocus as F;
@@ -1649,6 +1778,8 @@ fn every_2_1_283_question_capture_reads_as_its_form() {
 }
 
 /// 2.1.283: the policy text typed into the free-text row (three rows at the label
+/// column) reads back as the rows joined with one space, exactly the text typed: the
+/// read-back the harness compares before any Enter.
 #[test]
 fn the_typed_policy_text_reads_back_exactly_as_typed() {
     for (name, text, measured) in TYPED_2_1_283 {
@@ -1699,6 +1830,8 @@ fn the_typed_policy_text_reads_back_exactly_as_typed() {
 }
 
 /// 2.1.283: the preview form reads whole on its first screen (c11-01); two `down`s past
+/// its last option draw `❯` on the chat row and leave it on option 2 (c5-03), and `n`
+/// opens the notes (c5-06): each unknown, still a question, never answered.
 #[test]
 fn the_2_1_283_preview_is_unknown_on_its_chat_row_and_with_its_notes_open() {
     let (_, _, d) = read(QUESTION_283_PREVIEW);
@@ -1741,6 +1874,9 @@ fn the_2_1_283_preview_is_unknown_on_its_chat_row_and_with_its_notes_open() {
 }
 
 /// The policy texts, typed into each 2.1.283 select tab (single and multi-select, alone
+/// and one of two, focused and left for the button) and wrapped as 2.1.283 wraps them,
+/// read back whole and exactly at every width from the narrowest the tab's other rows
+/// fit in to 220.
 #[test]
 fn the_reworded_policy_texts_read_whole_at_80_and_200_columns() {
     let check = |capture: &str, text: &str, width: usize| {
@@ -1798,6 +1934,8 @@ fn the_reworded_policy_texts_read_whole_at_80_and_200_columns() {
 }
 
 /// A free-text row whose wrapped rows are not at its label column (one cell either side,
+/// or a multi-select row's at column 5) is a question never read whole: a vendor that
+/// moves the wrap stalls the harness rather than have it read the text short.
 #[test]
 fn a_free_text_row_wrapped_at_another_column_is_never_read_whole() {
     for (capture, cols) in [
@@ -1834,6 +1972,8 @@ fn a_free_text_row_wrapped_at_another_column_is_never_read_whole() {
 }
 
 /// The 2.1.281 captures read whole too: the tab bar (`☐ Tea` alone for one question),
+/// each description off its label, `(Recommended)`, the multi-select checkboxes and
+/// button, and the review tab.
 #[test]
 fn the_2_1_281_captures_read_whole() {
     let (r, p, d) = read(ASK_TWO_FIRST);
@@ -1910,6 +2050,9 @@ fn the_2_1_281_captures_read_whole() {
 }
 
 /// In a pane narrower than the footer (48 columns or fewer for one question, 59 for tabs)
+/// Ink wraps `Enter to select · … · Esc to cancel` onto the row under it; each measured
+/// 2.1.295 screen reads whole, the recommended option focused, the box running to the
+/// footer's last row.
 #[test]
 fn a_question_whose_footer_wraps_is_read_whole() {
     let last = |r: &[String]| r.iter().rposition(|x| !x.trim().is_empty()).expect("a row");
@@ -1951,15 +2094,26 @@ fn a_question_whose_footer_wraps_is_read_whole() {
 }
 
 /// Claude Code 2.1.300 MEASURED (2026-10-15, the
+/// real-Claude lab): a multi-select whose free-text row holds the long-term
+/// text, typed by hand, after `down` to `Submit` — at 47 columns every row
+/// kept, the text drawn one cell left of its label column (`[✔]Decide`); at
+/// 39 the same, `Submit` drawn over the text's last row.
 const REFLOW_39_2_1_300: &str =
     include_str!("fixtures/claude-2.1.300-question-multi-reflow-39col.txt");
 const REFLOW_47_2_1_300: &str =
     include_str!("fixtures/claude-2.1.300-question-multi-reflow-47col.txt");
 /// At 57 columns `Submit` is drawn over the text's last row and the residue
+/// of that row is glued to it, one word: `❯    Submitked.)`.
 const REFLOW_57_2_1_300: &str =
     include_str!("fixtures/claude-2.1.300-question-multi-reflow-57col.txt");
 
 /// `text` in rows `width` cells wide as 2.1.300 draws a multi-select's
+/// unfocused free-text row (Ink's `wrap-ansi` with `trim: false`, MEASURED
+/// with the long-term text at 43 widths from 38 to 150 columns,
+/// `aterm-agent`'s `question::drawn_rows`): greedy at
+/// single spaces, save that a row filled to its last cell leaves the next
+/// one starting with the space between, which takes a cell and is not
+/// drawn.
 fn drawn_wrap(text: &str, width: usize) -> Vec<String> {
     let mut rows = vec![String::new()];
     let mut line = 0usize;
@@ -2000,6 +2154,9 @@ fn word_wrap(text: &str, width: usize) -> Vec<String> {
 }
 
 /// A 2.1.300 multi-select `cols` wide, the focus on `Submit`, with `text` in
+/// its free-text row drawn from column `col` — 9, its label column, behind
+/// `[✔] `, or 8, behind `[✔]` with no space — on the rows [`drawn_wrap`]
+/// gives at `cols - col`, and `Submit` on its own row under them.
 fn reflowed(text: &str, cols: usize, col: usize) -> Vec<String> {
     let rows = screen(REFLOW_47_2_1_300);
     let free = rows
@@ -2044,7 +2201,7 @@ fn reflowed(text: &str, cols: usize, col: usize) -> Vec<String> {
     out
 }
 
-/// THE CHECKBOX DRAWN WITHOUT ITS SPACE (F2). 2.1.300 draws
+/// THE CHECKBOX DRAWN WITHOUT ITS SPACE (F2).
 #[test]
 fn a_free_text_drawn_against_its_checkbox_reads_whole() {
     let (r, p, d) = read(REFLOW_47_2_1_300);
@@ -2131,7 +2288,7 @@ fn a_free_text_drawn_against_its_checkbox_reads_whole() {
     assert_eq!(worker_phase(&r), Phase::Prompt);
 }
 
-/// 2.1.300 at 50 columns draws a ticked multi-select free-text row as `4. [✔]Decide
+/// 2.1.300 at 50 columns draws a ticked multi-select free-text row as `4.
 #[test]
 fn a_ticked_free_text_row_drawn_without_a_space_is_read_whole() {
     let (_, p, d) = read(QUESTION_MULTI_TYPED_50_2_1_300);
@@ -2167,6 +2324,11 @@ fn a_ticked_free_text_row_drawn_without_a_space_is_read_whole() {
 }
 
 /// 's F2 residual: only a person's keys put the focus on a
+/// dialog's `Chat about this` row (the loop never moves it there), and a
+/// tail cut AT that row is the dialog with its head off the screen, focused
+/// or not: the walk up from the footer finds no divider over the chat row,
+/// so it is the fallback ([`QShape::fallback`]) or the footer alone, both
+/// with the head off.
 #[test]
 fn a_cut_at_the_chat_row_a_person_focused_is_the_dialog_with_its_head_off() {
     let mut frames: Vec<(String, &str)> = vec![
@@ -2253,6 +2415,7 @@ fn a_cut_at_the_chat_row_a_person_focused_is_the_dialog_with_its_head_off() {
 }
 
 /// (Questions): `Submit` drawn over the text's last row
+/// leaves the rest of that row on the button row.
 #[test]
 fn a_button_row_a_residue_is_glued_to_is_never_read_whole() {
     let (r, p, d) = read(REFLOW_57_2_1_300);

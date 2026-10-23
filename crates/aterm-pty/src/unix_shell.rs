@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHICH PROGRAM a Unix session's shell is: [`select_shell_with_origin`], the one
-//! resolution the spawn seam runs and every caller that names or detects the shell
-//! asks (aterm-gui's integration and its `[zsh ended at start]` line, `aterm
-//! doctor`), so none of them can name a shell the spawn would not run.
-//!
-//! The order is the override (`--shell` / `shell` in aterm.toml), then a non-empty
-//! `$SHELL`, then the account's login shell in the password database, then
-//! `/bin/sh` — the order login(1), tmux, xterm, VTE, kitty and foot use. A name with
-//! no `/` is looked up on `PATH` as a shell looks up a command, so `shell = "bash"`
-//! runs `/usr/bin/bash`.
-//!
-//! Everything here runs in the PARENT, before the fork: it allocates, stats and
-//! reads the environment, none of which the child may do.
+//! WHICH PROGRAM a Unix session's shell is.
 
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::os::unix::ffi::OsStrExt as _;
@@ -26,18 +14,14 @@ pub enum ShellOrigin {
     Override,
     /// `$SHELL`.
     Env,
-    /// The account's login shell in the password database: `$SHELL` is unset or
-    /// empty.
+    /// The account's login shell in the password database: `$SHELL` is unset or empty.
     Passwd,
-    /// `/bin/sh`: `$SHELL` names nothing, and the password database names no
-    /// shell this user can run.
+    /// `/bin/sh`: `$SHELL` names nothing.
     Default,
 }
 
 impl ShellOrigin {
-    /// Where a shell that cannot start was set, as the end of the sentence that
-    /// says so: `` `fish` is not on PATH (from $SHELL)``. Empty for `/bin/sh`,
-    /// which nothing set.
+    /// Where a shell that cannot start was set, as the end of the sentence that says so.
     #[must_use]
     pub const fn suffix(self) -> &'static str {
         match self {
@@ -48,9 +32,7 @@ impl ShellOrigin {
         }
     }
 
-    /// The one word a report prints for this arm (`shell_origin: default:<word>`): the
-    /// variable or file that chose the shell. `override` for [`Self::Override`], which a
-    /// caller names by its own input (`--shell`, `aterm.toml`).
+    /// The one word a report prints for this arm: the variable or file that chose the shell.
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
@@ -62,16 +44,7 @@ impl ShellOrigin {
     }
 }
 
-/// The program a Unix session's interactive shell runs, and where it came from:
-/// `override_shell` when it names one, else a non-empty `$SHELL`, else
-/// [`login_shell`].
-///
-/// A name with no `/` is looked up on `PATH`; one found nowhere is kept as typed,
-/// and the spawn then says it `is not on PATH`. A name holding a NUL byte is kept
-/// as typed too, for the spawn to refuse ([`crate::program_nul_refusal`]): looking
-/// it up would name some other program. An empty `$SHELL` names nothing, as an
-/// unset one does — login(1) and tmux read it that way, and `execve("")` can only
-/// fail.
+/// The program a Unix session's interactive shell runs, and where it came from.
 #[must_use]
 pub fn select_shell_with_origin(override_shell: Option<&OsStr>) -> (OsString, ShellOrigin) {
     select_shell_in(
@@ -82,20 +55,13 @@ pub fn select_shell_with_origin(override_shell: Option<&OsStr>) -> (OsString, Sh
     )
 }
 
-/// The shell the account logs in with, for a session whose `$SHELL` names none:
-/// the password database's entry when it is a program this user can run (`pw_shell`
-/// of `getpwuid_r(getuid())`), else `/bin/sh`. A launcher that scrubs the
-/// environment (`env -i`, a container, cron, some window managers) leaves `$SHELL`
-/// unset; `/bin/sh` there is dash on Debian and Ubuntu, with no line editing.
+/// The shell the account logs in with, for a session whose `$SHELL` names none.
 #[must_use]
 pub fn login_shell() -> (OsString, ShellOrigin) {
     login_shell_from(account_shell)
 }
 
-/// The `SHELL` a child is handed when aterm's own environment names none (unset or
-/// empty): [`login_shell`], so a program that reads it (`vim`'s `:shell`, `make`,
-/// a `ssh` `LocalCommand`) finds the account's shell instead of nothing. `None`
-/// when `$SHELL` is set: the child inherits it.
+/// The `SHELL` a child is handed when aterm's own environment names none (unset or empty).
 #[must_use]
 pub fn shell_env_for_child() -> Option<OsString> {
     names_a_shell(std::env::var_os("SHELL"))
@@ -103,10 +69,7 @@ pub fn shell_env_for_child() -> Option<OsString> {
         .then(|| login_shell().0)
 }
 
-/// Why `program` cannot be a session's shell, in the words a failed spawn uses
-/// (`` `/usr/bin/zshh` does not exist (from $SHELL)``), or `None` when it is a
-/// file this user can run. Checked before the spawn, so a caller can start another
-/// shell in its place and say why ([`fallback_shell`]).
+/// Why `program` cannot be a session's shell.
 #[must_use]
 pub fn shell_cannot_start(program: &OsStr, origin: ShellOrigin) -> Option<String> {
     let Ok(target) = CString::new(program.as_bytes()) else {
@@ -126,10 +89,7 @@ pub fn shell_cannot_start(program: &OsStr, origin: ShellOrigin) -> Option<String
     ))
 }
 
-/// The shell to start in place of `failed`, which cannot start
-/// ([`shell_cannot_start`]): the account's login shell, else `/bin/sh` — whichever
-/// is first a program this user can run and is not `failed` itself. `None` when
-/// neither is.
+/// The shell to start in place of `failed`, which cannot start ([`shell_cannot_start`]).
 #[must_use]
 pub fn fallback_shell(failed: &OsStr) -> Option<(OsString, ShellOrigin)> {
     fallback_shell_from(failed, account_shell)
@@ -188,18 +148,11 @@ fn on_path(name: &OsStr, path_var: Option<&OsStr>) -> OsString {
     find_on_path(name, path_var).map_or_else(|| name.to_owned(), PathBuf::into_os_string)
 }
 
-/// The first `PATH` entry holding a program named `name` this user can run, or
-/// `None` (also for a name holding a `/`, which is a path and not looked up, and
-/// for an empty name). Only absolute entries are searched: an empty one, `.` or
-/// `bin` names a folder relative to aterm's own current folder — not the one the
-/// pane starts in — and a terminal's shell or `-e` program must not be taken from
-/// whatever folder aterm happened to be started in.
+/// The first `PATH` entry holding a program named `name` this user can run, or `None`.
 pub(crate) fn find_on_path(name: &OsStr, path_var: Option<&OsStr>) -> Option<PathBuf> {
     if name.is_empty() || name.as_bytes().contains(&b'/') {
         return None;
     }
-    // A plain loop, no closures: a closure body is an absent callee to the Trust
-    // panic-freedom verifier.
     for dir in std::env::split_paths(path_var?) {
         if !dir.is_absolute() {
             continue;
@@ -212,14 +165,12 @@ pub(crate) fn find_on_path(name: &OsStr, path_var: Option<&OsStr>) -> Option<Pat
     None
 }
 
-/// A regular file this user may execute (`access(X_OK)` and a regular file:
-/// something `execve` can run).
+/// A regular file this user may execute (`access` and a regular file: something `execve` can run).
 pub(crate) fn runnable(path: &Path) -> bool {
     let Ok(c) = CString::new(path.as_os_str().as_bytes()) else {
         return false;
     };
-    // SAFETY: `c` is a valid NUL-terminated path string that outlives the call;
-    // `access` only reads it.
+    // SAFETY: `c` is a valid NUL-terminated path string that outlives the call; `access` only.
     let executable = unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0;
     executable && path.is_file()
 }
@@ -229,26 +180,15 @@ pub(crate) fn runnable(path: &Path) -> bool {
 /// run; `None` when the lookup fails, the entry is empty (which passwd(5) reads as
 /// `/bin/sh`, the caller's own fallback) or names nothing runnable (`nologin` is
 /// runnable and is returned: an account that may not log in gets what it asked for).
-// Skip: one libc call through raw out-pointers; every failure is `None`, and the
-// caller then runs `/bin/sh`.
 #[cfg_attr(trust_verify, trust::skip)]
 fn account_shell() -> Option<OsString> {
-    // SAFETY: `passwd` is plain integers and pointers, for which all-zero is a
-    // valid value; it is only an out-param here.
+    // SAFETY: `passwd` is plain integers and pointers, for which all-zero is a valid value; it is.
     let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
     let mut out: *mut libc::passwd = std::ptr::null_mut();
-    // An entry that does not fit (a large LDAP or SSSD record) is ERANGE: the
-    // buffer doubles, to 1 MiB, rather than the account reading as having no
-    // shell.
     let mut len = 4096;
     let shell = loop {
         let mut buf = vec![0u8; len];
-        // SAFETY: `pw` is a valid, writable passwd out-param; `buf` is a valid
-        // writable buffer of the stated length that outlives every read of `pw`'s
-        // string fields, which point INTO it on success; `out` is a valid
-        // out-pointer. getpwuid_r writes nothing past buflen. `pw_shell` is read
-        // only when `out` is non-null (success), and is then a NUL-terminated C
-        // string inside `buf`, copied out before `buf` goes out of scope.
+        // SAFETY: `pw` is a valid, writable passwd out-param; `buf` is a valid writable buffer.
         unsafe {
             let rc = libc::getpwuid_r(
                 libc::getuid(),
@@ -375,7 +315,7 @@ mod tests {
     }
 
     /// A relative `PATH` entry is never searched: it names a folder under aterm's
-    /// own current folder, not the pane's. The same folder, spelled absolute, is.
+    /// own current folder, not the pane's.
     #[test]
     fn a_relative_path_entry_is_not_searched() {
         let bed = Bed::new("relative");

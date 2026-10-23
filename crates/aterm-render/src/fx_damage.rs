@@ -1,46 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The fx layers' damage (`docs/DESIGN-card-engine-2026-10-19.md` §4.4): which
-//! cell-row bands a change of the layers or of the occluders between two frames
-//! can repaint, for the shared dirty-row seam ([`crate::compute_dirty_rows`]) and
-//! the scroll planner ([`crate::scroll_shift_plan`]).
-//!
-//! Layers compare by IDENTITY ([`FxLayer`]'s `PartialEq`: the content `Arc`,
-//! never its bytes), so a settled layer costs a pointer compare and marks
-//! nothing. Every pixel a layer writes lies in [`FxLayer::extent`] at its
-//! space's origin (`fx_raster`'s `fx_placement_is_the_spec`), so marking the
-//! bands of the previous and the current extent repaints every pixel the
-//! change can touch: the vacated light is rebuilt away, the new light lands on
-//! a freshly rebuilt band and never re-accumulates. No fingerprint is taken and
-//! no payload is cloned.
-//!
-//! The band rule is the renderer's ([`crate::fx_raster::band_px`]): row `r`
-//! spans window pixels `[grid_top + r·cell_h, grid_top + (r + 1)·cell_h)`, with
-//! row 0 open to the frame's top and the last row to its bottom, so light in the
-//! padding repaints with the edge row whose band holds it (the free-sprite
-//! edge-row rule).
+//! Cell-row band damage tracking for `FxLayer`s and occluders across frames and scroll blits.
 
 use std::ops::Range;
 use std::sync::Arc;
 
 use aterm_core::render::{FxLayer, FxSpace, PxRect};
 
-/// Where a frame's cell-row bands lie in window pixels: the grid's top edge
-/// and the band pitch. The damage seam needs it to map a window-space fx
-/// layer, or an occluder, to the rows it repaints; both renderers hand the
-/// seam their own (`Renderer::row_bands`), and a cache keyed on `grid_top`
-/// guarantees the two frames compared share it.
+/// Window-pixel geometry of a frame's cell-row bands (`grid_top` and `cell_h`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RowBands {
-    /// The grid's top edge in window pixels (`pad_top + head`).
+    /// Top edge of the cell grid in window pixels.
     pub grid_top: usize,
-    /// The cell height: the band pitch.
+    /// Cell height in window pixels.
     pub cell_h: usize,
 }
 
 impl RowBands {
-    /// The bands of a grid whose top edge is `grid_top` with `cell_h`-tall rows.
+    /// Construct [`RowBands`] for a grid starting at `grid_top` with `cell_h`-pixel rows.
     #[inline]
     #[must_use]
     pub const fn new(grid_top: usize, cell_h: usize) -> Self {
@@ -52,13 +30,10 @@ impl RowBands {
     /// below it.
     #[inline]
     const fn band_of(self, y: i128, rows: usize) -> usize {
-        // Widen before subtracting: RowBands is public and usize origins
-        // can exceed the positive i64 range even when dirty holds five rows.
         let top = self.grid_top as i128;
         if y < top {
             return 0;
         }
-        // `y - top` is non-negative; past `usize` it is past every band.
         let pitch = if self.cell_h > 1 { self.cell_h } else { 1 } as i128;
         let q = (y - top) / pitch;
         let r = if q > usize::MAX as i128 {
@@ -69,7 +44,7 @@ impl RowBands {
         if r < rows - 1 { r } else { rows - 1 }
     }
 
-    /// Mark every band the window pixel rows `[y0, y1)` reach.
+    /// Mark every band in `dirty` overlapped by window pixel rows `[y0, y1)`.
     #[inline]
     pub(crate) fn mark_span(self, dirty: &mut [bool], y0: i128, y1: i128) {
         let rows = dirty.len();
@@ -82,13 +57,7 @@ impl RowBands {
         }
     }
 
-    /// The window pixel rows `[y0, y1)` the CELLS of `rows` cover:
-    /// `[grid_top + start·cell_h, grid_top + end·cell_h)`, bounded (past
-    /// `i32` it stops short of the unbounded sentinel). The vertical extent
-    /// of a chrome occluder over those rows: chrome paints its rows' cells
-    /// (and their full width), never the head or the padding above or below
-    /// them, so light there keeps drawing. An empty `rows` gives an empty
-    /// span.
+    /// Window pixel row range `(y0, y1)` covered by grid cell `rows`.
     #[inline]
     #[must_use]
     pub fn rows_px(self, rows: Range<usize>) -> (i32, i32) {
@@ -105,8 +74,7 @@ impl RowBands {
 }
 
 /// The window pixel rows `[y0, y1)` `layer` may write: its extent, moved to
-/// window space (`grid_top` down for a Grid layer). `None` when it writes
-/// nothing.
+/// window space (`grid_top` down for a Grid layer).
 #[inline]
 fn window_rows(layer: &FxLayer, bands: RowBands) -> Option<(i128, i128)> {
     let e = layer.extent();
@@ -129,8 +97,7 @@ fn mark_layer(dirty: &mut [bool], bands: RowBands, layer: &FxLayer) {
 }
 
 /// The index in `other` of `list[i]`'s counterpart: the k-th layer of its id
-/// in `other`, when `list[i]` is the k-th of that id in `list`. Ids are the
-/// host's stable names; a repeated id pairs in order. O(n), allocation-free.
+/// in `other`, when `list[i]` is the k-th of that id in `list`.
 #[inline]
 fn counterpart(list: &[FxLayer], i: usize, other: &[FxLayer]) -> Option<usize> {
     let id = list[i].id;
@@ -144,12 +111,6 @@ fn counterpart(list: &[FxLayer], i: usize, other: &[FxLayer]) -> Option<usize> {
 }
 
 /// Mark what the change from `prev`'s layers to `cur`'s repaints.
-///
-/// Layers are matched by id. A matched pair whose tuple differs marks both
-/// extents; a layer with no counterpart (appeared or vanished) marks its own;
-/// an equal pair marks nothing, unless the equal pairs changed their relative
-/// order, which can change their overlap's pixels (layers draw in list
-/// order), and then every equal pair marks its extent.
 fn mark_layer_changes(dirty: &mut [bool], bands: RowBands, prev: &[FxLayer], cur: &[FxLayer]) {
     let mut last_kept: Option<usize> = None;
     let mut reordered = false;
@@ -206,12 +167,7 @@ fn mark_occluder_changes(
     }
 }
 
-/// THE FX ARM of [`crate::compute_dirty_rows`]: mark the bands the change of
-/// the fx layers and occluders from `prev` to `cur` repaints, and say whether
-/// they differ in a way that can change a pixel (the frame must not gate-hit).
-///
-/// Occluders only subtract from layers, so with no layer in either frame
-/// their change paints nothing and is not damage.
+/// Mark cell-row bands dirtied by fx-layer or occluder changes between `prev` and `cur`.
 pub(crate) fn mark_fx_changes(
     dirty: &mut [bool],
     bands: RowBands,
@@ -236,10 +192,7 @@ pub(crate) fn mark_fx_changes(
 /// its light cut by its clip in neither frame, inside the grid band in both
 /// (the blit moves the band's pixels and keeps the padding), and no occluder of
 /// either frame on its rows (an occluder cuts light; rows only, so an occluder
-/// beside it disqualifies it too). A layer's pixels are its content's at the
-/// pixel less its offset, whatever band slices them, so the slid light is the
-/// light a full render draws there. The caller pairs layers by INDEX: two such
-/// layers that overlap keep their order.
+/// beside it disqualifies it too).
 fn rides_the_blit(
     prev: &FxLayer,
     cur: &FxLayer,
@@ -281,21 +234,7 @@ fn rides_the_blit(
     })
 }
 
-/// THE FX ARM of [`crate::scroll_shift_plan`]: the layers never refuse a
-/// scroll blit; their light is rebuilt over the slid pixels instead.
-///
-/// The blit moved every pixel of the grid band (`[grid_top, grid_top +
-/// rows·cell_h)`, full width) by `da` rows, light included, and kept the
-/// padding above and below it in place. So `prev`'s light now lies at its
-/// grid-band rows shifted by `−da` and in the edge rows whose bands hold its
-/// padding part; both are marked, and so is every band of `cur`'s layers,
-/// whose light the damaged tail stamps over the rebuilt bands. Occluders need
-/// no term of their own: they only cut light inside the extents marked here.
-///
-/// Except a layer that RIDES THE BLIT ([`rides_the_blit`], paired with the
-/// layer at its index in the other frame): an inline card riding its stream,
-/// moved by exactly the scroll, whose light the blit carried to its new
-/// place. Neither of its extents is marked, so its rows are slid, not rebuilt.
+/// Mark cell-row bands dirtied by fx layers and occluders across a viewport scroll blit.
 pub(crate) fn mark_fx_scroll(
     dirty: &mut [bool],
     bands: RowBands,
@@ -314,8 +253,6 @@ pub(crate) fn mark_fx_scroll(
             .is_some_and(|(p, c)| rides_the_blit(p, c, bands, rows, da, [prev_occ, cur_occ]))
     };
     let top = bands.grid_top as i128;
-    // Public band geometry need not fit a framebuffer. Saturation places a
-    // still-higher bottom beyond every possible i32 layer extent plus usize top.
     let bottom = top.saturating_add((rows as i128).saturating_mul(bands.cell_h as i128));
     for (i, layer) in prev_layers.iter().enumerate() {
         let Some((y0, y1)) = window_rows(layer, bands) else {
@@ -334,8 +271,6 @@ pub(crate) fn mark_fx_scroll(
         if g0 < g1 {
             let (lo, hi) = (bands.band_of(g0, rows), bands.band_of(g1 - 1, rows));
             for b in lo..=hi {
-                // Row `b`'s pixels now show at row `b − da`; off the grid they
-                // fell out of the frame.
                 let r = b as i128 - i128::from(da);
                 if (0..rows as i128).contains(&r) {
                     dirty[r as usize] = true;
@@ -386,8 +321,7 @@ mod tests {
     }
 
     /// The band rule: row 0 opens to the top, the last row to the bottom, and
-    /// `grid_top` moves every band; a Grid layer is offset by it. A chrome
-    /// span is its rows' cells.
+    /// `grid_top` moves every band; a Grid layer is offset by it.
     #[test]
     fn bands_follow_the_renderer_band_rule() {
         let bands = RowBands::new(7, 10);
@@ -428,8 +362,6 @@ mod tests {
         assert_eq!(bands.rows_px(3..3), (0, 0));
         assert_eq!(RowBands::new(7, usize::MAX).rows_px(0..2).1, i32::MAX - 1);
 
-        // Large public geometry still maps tiny layers; it never wraps through
-        // the signed origin or multiplies in usize before the scroll decision.
         for top in [1usize << (usize::BITS - 1), usize::MAX] {
             let bands = RowBands::new(top, 10);
             dirty.fill(false);
@@ -504,7 +436,6 @@ mod tests {
         );
         assert_eq!(marked(&dirty), vec![0, 3], "a swap marks both");
 
-        // Two layers share id 9: the second one moves.
         let (c, d) = (
             layer(9, FxSpace::Window, 10, 5),
             layer(9, FxSpace::Window, 40, 5),

@@ -52,6 +52,10 @@ pub const VIRTIO: (&str, &str) = (
 pub const NETKVM_DIR: &str = "NetKVM/w11/ARM64";
 
 /// Hang detectors, never budgets: Windows installed and first logged on (881 s
+/// measured here, 2026-10-20), a provisioned disk booted to its SSH (about
+/// 20 s), Windows shut down (about 10 s), a restarting Windows gone from SSH
+/// (seconds), the runner's desktop session up (0.7-13.6 s after SSH in three
+/// boots, 2026-10-20).
 const INSTALL_WITHIN: Duration = Duration::from_secs(2 * 3600);
 const BOOT_WITHIN: Duration = Duration::from_secs(15 * 60);
 const STOP_WITHIN: Duration = Duration::from_secs(5 * 60);
@@ -59,6 +63,8 @@ const GONE_WITHIN: Duration = Duration::from_secs(5 * 60);
 const DESKTOP_WITHIN: Duration = Duration::from_secs(guest::DESKTOP_WITHIN_SECS);
 
 /// How long after QEMU starts the lane presses Enter: the ISO's boot loader
+/// asks for a key ("Press any key to boot from CD or DVD") a few seconds in,
+/// and boots the disk when none comes.
 const BOOT_KEYS_FOR: Duration = Duration::from_secs(12);
 
 /// The verbs, as `windows help` prints them.
@@ -348,10 +354,12 @@ fn lossy(p: &Path) -> String {
 }
 
 /// A browser's user agent: Microsoft's download service answers a client
+/// that names one.
 const USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:133.0) Gecko/20100101 Firefox/133.0";
 
 /// The download service's profile and the fingerprint service's customer id,
+/// as Microsoft's own page script (`sdsbase`) passes them.
 const SDS_PROFILE: &str = "606624d44113";
 const OV_DF_INSTANCE: &str = "560dc9f3-1aa5-4a2f-b63c-9e18f8d0e175";
 
@@ -371,6 +379,8 @@ fn curl_text(url: &str, referer: Option<&str>) -> Result<String, String> {
 }
 
 /// Download `url` to `dest` (through `dest.part`, renamed when whole), making
+/// `dest`'s folder first: on a Mac's first `up` the image cache is not there,
+/// and curl answered "(23) Failure writing output to destination" (2026-10-21).
 fn curl_file(url: &str, dest: &Path, browser: bool) -> Result<(), String> {
     if let Some(dir) = dest.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -530,6 +540,7 @@ fn uuid4() -> Result<String, String> {
 }
 
 /// The record of the cached ISO: its file name and the digest Microsoft
+/// published for it, which it was held to.
 fn iso_record(l: &Layout) -> PathBuf {
     l.cache.join("windows-iso")
 }
@@ -545,6 +556,9 @@ pub fn cached_iso(l: &Layout) -> Option<(PathBuf, String)> {
 }
 
 /// Windows 11's arm64 ISO from Microsoft, the way its download page gets one:
+/// the edition from the page, a session the fingerprint service has seen,
+/// the language's SKU, the per-session link; then the file, held to the
+/// digest the page publishes.
 fn fetch_windows_iso(l: &Layout) -> Result<(PathBuf, String), String> {
     let page = curl_text(ISO_PAGE, None)?;
     let edition = edition_id(&page).ok_or("the download page names no edition")?;
@@ -608,6 +622,7 @@ fn fetch_windows_iso(l: &Layout) -> Result<(PathBuf, String), String> {
 }
 
 /// The cached virtio-win ISO, downloaded and held to [`VIRTIO`]'s digest
+/// when it is not there.
 fn virtio_iso(l: &Layout) -> Result<PathBuf, String> {
     let (version, want) = VIRTIO;
     let dest = l.cache.join(format!("virtio-win-{version}.iso"));
@@ -763,7 +778,7 @@ pub fn swtpm_args(l: &Layout) -> Vec<String> {
     ]
 }
 
-/// Which daemon belongs to this layout. Argument words bind the pid file to
+/// Which daemon belongs to this layout.
 #[derive(Clone, Copy, Debug)]
 enum Daemon {
     Qemu,
@@ -892,7 +907,7 @@ impl DaemonProcess {
         Ok(observe_daemon(l, kind, self.pid)? == Some(self))
     }
 
-    /// Recheck immediately before signalling. This narrows the stale-pid
+    /// Recheck immediately before signalling.
     fn signal(self, l: &Layout, kind: Daemon, sig: i32) -> Result<(), String> {
         if self.still_here(l, kind)? {
             crate::sys::kill(self.pid, sig)
@@ -1024,6 +1039,7 @@ fn screendump(l: &Layout) {
 }
 
 /// Press Enter every quarter second for [`BOOT_KEYS_FOR`]: the ISO's boot
+/// loader boots the CD only on a key.
 fn press_through_boot_prompt(l: &Layout) {
     let key = "{\"execute\":\"send-key\",\"arguments\":{\"keys\":[{\"type\":\"qcode\",\"data\":\"ret\"}]}}";
     let t0 = Instant::now();
@@ -1209,6 +1225,7 @@ fn answers(ssh: &Ssh) -> bool {
 }
 
 /// Wait until the guest answers on SSH, QEMU alive, within `limit` (a hang
+/// detector), the screen taken each minute; `what` names the wait.
 fn wait_ssh(l: &Layout, ssh: &Ssh, limit: Duration, what: &str) -> Result<f64, String> {
     let t0 = Instant::now();
     let mut said = Duration::ZERO;
@@ -1242,6 +1259,8 @@ fn wait_ssh(l: &Layout, ssh: &Ssh, limit: Duration, what: &str) -> Result<f64, S
 }
 
 /// Shut Windows down (from inside, else ACPI's power button), within
+/// [`STOP_WITHIN`] (a hang detector), then QEMU's `quit`, then SIGKILL; swtpm
+/// ends with QEMU's connection.
 fn stop(l: &Layout, ssh: Option<&Ssh>) -> Result<(), String> {
     let Some(process) = daemon(l, Daemon::Qemu)? else {
         return stop_swtpm(l);
@@ -1284,6 +1303,7 @@ fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
 }
 
 /// Snapshot the stopped VM: the disk ([`SNAPSHOT`], replacing an older one),
+/// the firmware variables and the TPM's state, which `down` restores together.
 fn snapshot(l: &Layout, t: &Tools, fingerprint: &str) -> Result<(), String> {
     let disk = lossy(&l.disk());
     let _ = run(
@@ -1334,6 +1354,7 @@ fn secret_file(path: &Path, text: &str) -> Result<(), String> {
 }
 
 /// The lane's SSH key, made once (`ssh-keygen`, ed25519, no passphrase: it
+/// opens only this VM, on 127.0.0.1): its public half.
 fn lane_key(l: &Layout) -> Result<String, String> {
     if !l.key().is_file() {
         let out = run(
@@ -1376,6 +1397,8 @@ fn lane_password(l: &Layout) -> Result<String, String> {
 }
 
 /// Write the answer media: `autounattend.xml`, the first-logon script, the
+/// lane's public key and NetKVM's arm64 driver from `virtio`, as an ISO
+/// (`hdiutil makehybrid`, ISO 9660 with Joliet) named [`guest::MEDIA_LABEL`].
 fn write_media(l: &Layout, virtio: &Path, public_key: &str, password: &str) -> Result<(), String> {
     let dir = l.media_dir();
     let _ = std::fs::remove_dir_all(&dir);
@@ -1467,6 +1490,7 @@ pub fn link_target(listing: &str) -> Option<&str> {
 }
 
 /// The bytes of `member` of the ISO `iso` (bsdtar reads ISO 9660), through a
+/// hard link to the copy that holds them.
 fn iso_member(iso: &Path, member: &str) -> Result<Vec<u8>, String> {
     let listed = run(
         Path::new("/usr/bin/tar"),
@@ -1532,6 +1556,7 @@ fn new_machine(l: &Layout, t: &Tools) -> Result<(), String> {
 }
 
 /// Install Windows: boot the ISO with the answer media and wait for the
+/// first logon's SSH; the guest is left running.
 fn install(l: &Layout, t: &Tools, timings: &mut Vec<(String, f64)>) -> Result<Ssh, Fail> {
     let (iso, _) = match cached_iso(l) {
         Some(found) => found,
@@ -1586,6 +1611,7 @@ fn install(l: &Layout, t: &Tools, timings: &mut Vec<(String, f64)>) -> Result<Ss
 }
 
 /// Restart Windows and wait for its SSH and then the runner's desktop
+/// session (each within its hang detector).
 fn reboot(l: &Layout, ssh: &Ssh) -> Result<(), String> {
     if !ssh.run("shutdown /r /t 0 /f").ok() {
         return Err("`shutdown /r` failed".into());
@@ -1627,6 +1653,8 @@ fn wait_desktop(ssh: &Ssh) -> Result<(), String> {
 }
 
 /// Copy virtio-win's display driver ([`guest::VIOGPUDO_FILES`]) off the
+/// cached virtio-win ISO, each file held to its digest here (and again in the
+/// guest), to [`guest::VIOGPUDO_GUEST`] for [`guest::display_step`].
 fn stage_display_driver(l: &Layout, ssh: &Ssh) -> Result<(), String> {
     let iso = virtio_iso(l)?;
     let made = ssh.run(&format!(
@@ -1661,6 +1689,7 @@ fn stage_display_driver(l: &Layout, ssh: &Ssh) -> Result<(), String> {
 }
 
 /// Provision the guest when its stamp is not the plan's fingerprint: the
+/// seconds it took, or `None` when it was current.
 fn provision(l: &Layout, ssh: &Ssh) -> Result<Option<f64>, Fail> {
     let steps = guest::provision_steps();
     let want = guest::fingerprint(&steps);
@@ -1770,6 +1799,9 @@ fn boot(l: &Layout, t: &Tools, vnc: bool, timings: &mut Vec<(String, f64)>) -> R
 }
 
 /// End what an earlier run left running in a VM that `up` holds
+/// ([`guest::end_leftovers`]): a `lab windows exec` stopped on this Mac while
+/// its test hung left that test and its cargo running in the guest
+/// (2026-10-21).
 fn end_leftovers(admin: &Ssh) {
     let out = admin.ps(&guest::end_leftovers());
     let ended = out

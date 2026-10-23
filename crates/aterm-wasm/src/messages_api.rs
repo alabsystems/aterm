@@ -23,15 +23,19 @@ use aterm_time::Instant;
 use crate::WebTerminal;
 
 /// How many drained prepend buffers the band keeps for the next frame (the
+/// band's most rows).
 const POOL_CAP: usize = MAX_ROWS as usize;
 
 /// How many drained log lines the page can still take
+/// ([`WebTerminal::messages_log_since`]): the ring's record count.
 const JOURNAL_CAP: usize = LOG_CAP;
 
 /// How many of the page's kept lines a restore reads — the newest: twice the
+/// ring, room for a full ring of records each posted and retired.
 const RESTORE_CAP: usize = 2 * LOG_CAP;
 
 /// Percent-encode a string into one space-free reply token: every byte that is not
+/// ASCII-graphic, and `%`, becomes `%XX`.
 pub(crate) fn pct_encode(s: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(s.len());
@@ -54,6 +58,8 @@ const fn rgb(c: u32) -> [u8; 3] {
 }
 
 /// A page's number (a message id or a log cursor, which JS holds as a
+/// `number`) as a whole count: negative, fractional-below-one or not a
+/// number is 0.
 #[inline]
 fn whole(n: f64) -> u64 {
     if n.is_finite() && n >= 1.0 {
@@ -64,6 +70,7 @@ fn whole(n: f64) -> u64 {
 }
 
 /// The band row that frame pixel row `y` falls in: rows of `cell_h` px (zero reads as
+/// one) stack from `grid_top`; `None` above them.
 #[inline]
 const fn band_row(y: usize, grid_top: usize, cell_h: usize) -> Option<usize> {
     if y < grid_top {
@@ -74,12 +81,15 @@ const fn band_row(y: usize, grid_top: usize, cell_h: usize) -> Option<usize> {
 }
 
 /// The tick's reply ([`WebTerminal::messages_tick`]): bit 0, the band
+/// changed; bit 1, its row count did.
 #[inline]
 fn tick_bits(changed: bool, rows_moved: bool) -> u32 {
     u32::from(changed || rows_moved) | (u32::from(rows_moved) << 1)
 }
 
 /// The band's host metrics a lib hands this module: one cell's width and
+/// height, the frame's pad, and the grid's first pixel row before the band
+/// (the chrome's top pad and head) — all device px.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BandMetrics {
     pub(crate) cell_w: usize,
@@ -89,6 +99,7 @@ pub(crate) struct BandMetrics {
 }
 
 /// The band's state on one terminal: the engine's center and wire gate, the inks the
+/// page's theme derives, and the painted rows the next frame composes.
 pub(crate) struct WebBand {
     /// The engine: rows, holds, the log ring, the motion grid.
     pub(crate) center: MessageCenter,
@@ -99,34 +110,46 @@ pub(crate) struct WebBand {
     /// The page is visible: a hidden page's band draws the still look and arms no timer.
     visible: bool,
     /// The page has a Details view: every row ends in its link, and a press
+    /// on a row opens it ([`aterm_messages::Links::Painted`]).
     details: bool,
     /// The chip the pointer lights, `None` off the band.
     hover: Option<Hover>,
     /// The frame pixel the pointer was last on ([`WebTerminal::band_hover`]), from
+    /// which the lit chip is resolved again when the layout changes under it.
     pointer: Option<(f64, f64)>,
     /// CSS `forced-colors`' five system colours while the page is forced.
     forced: Option<ForcedPalette>,
     /// The page theme's background, foreground and cursor.
     theme: ThemeInks,
     /// The configured palette's blue and cyan (slots 4 and 6), which a near-grey
+    /// cursor's meter borrows, and its red and yellow (slots 1 and 3), the error and warn
+    /// inks' seeds: the configured palette, never the live OSC 4 one.
     ansi: AnsiHues,
     /// The inks the rows are painted with: the forced palette's
+    /// (`BandInks::forced`) while forced, else `BandInks::derive(theme, ansi,
+    /// Blend)` — re-derived on a theme, palette or forced-colours change.
     pub(crate) inks: BandInks,
     /// The band's one view (`aterm_messages::drive::View`): the width law's
+    /// layout, the motion frame the painted rows were drawn at, and the key
+    /// they were painted for.
     view: View,
     /// The painted rows, their gutter edges and their pixel rasters.
     rows: Vec<Vec<RenderCell>>,
     edges: Vec<Option<([u8; 3], [u8; 3])>>,
     rasters: Vec<Option<RowRaster>>,
     /// The instant of the last tick, notice or motion change: a frame
+    /// re-prepares at it, so a resize or a theme change paints the frame the
+    /// clock last asked for.
     now: Instant,
     /// Reclaimed prepend buffers ([`RenderInput::undo_host_row_prepend`]).
     pub(crate) pool: Vec<Vec<RenderCell>>,
     /// The drained log lines (`m1` codec), oldest first, at most
+    /// [`JOURNAL_CAP`].
     journal: VecDeque<String>,
     /// The cursor of `journal[0]`: how many lines left the journal before it.
     journal_first: u64,
     /// The page's kept log was loaded ([`WebTerminal::messages_restore`]):
+    /// a second restore would load it twice.
     restored: bool,
 }
 
@@ -175,6 +198,7 @@ impl WebBand {
     }
 
     /// The look the band draws in: moving only while the page is visible and
+    /// allows motion, graded unless forced colours own it.
     #[inline]
     fn look(&self) -> Look {
         drive::look(LookIn {
@@ -186,6 +210,7 @@ impl WebBand {
     }
 
     /// How a `cols`-wide page lays the band out ([`Lay::web`]): links withheld
+    /// until the page has a Details view, and no `$HOME` to abbreviate.
     #[inline]
     fn lay(&self, cols: usize) -> Lay {
         Lay::web(cols, self.details)
@@ -212,6 +237,7 @@ impl WebBand {
     }
 
     /// A configured palette slot changed: slots 4 and 6 are the meter's
+    /// borrowed hues, slots 1 and 3 the seeds of the error and warn inks.
     #[inline]
     pub(crate) fn set_palette_color(&mut self, index: u8, c: [u8; 3]) {
         match index {
@@ -231,6 +257,7 @@ impl WebBand {
     }
 
     /// The geometry a `cols`-wide band is painted onto: the frame, its cells
+    /// `pad` px in.
     #[inline]
     fn geometry(cols: usize, cell_w: usize, pad: usize) -> Geometry {
         Geometry {
@@ -241,6 +268,8 @@ impl WebBand {
     }
 
     /// Prepare the band's rows for a frame at `self.now` on a `cols`-wide grid of
+    /// `cell_w`-px cells `pad` px in: the layout (re-laid only when the center or the
+    /// width moved), one motion frame, and the paint only when its inputs moved.
     pub(crate) fn prepare(&mut self, cols: usize, cell_w: usize, pad: usize) -> bool {
         let geom = Self::geometry(cols, cell_w, pad);
         let look = self.look();
@@ -263,6 +292,7 @@ impl WebBand {
     }
 
     /// The instant the band next needs the page back: a hold's expiry, an echo's end, a
+    /// queued row's patience, the wire's paced paint or the next motion frame.
     pub(crate) fn next_wake(&self, now: Instant, cols: usize) -> Option<Instant> {
         if !self.visible {
             return None;
@@ -285,6 +315,9 @@ impl WebBand {
     }
 
     /// Compose the painted rows above the grid of `dst`, the frame `at`: padded or
+    /// trimmed to the committed count, each raster placed, every window-space effect
+    /// stream translated down with the grid (the pipeline's chrome origin excludes the
+    /// band).
     pub(crate) fn compose(&mut self, dst: &mut RenderInput, at: BandFrame) -> usize {
         band_frame::compose_band(
             dst,
@@ -300,6 +333,7 @@ impl WebBand {
     }
 
     /// The chrome bleed for `n` composed rows: the gutters reach the frame's
+    /// edges in the band's tone, each metered row's in its own edge cells'.
     pub(crate) fn bleed(&self, n: usize) -> Option<ChromeBleed> {
         (n > 0).then(|| {
             band_frame::band_bleed(
@@ -312,6 +346,7 @@ impl WebBand {
     }
 
     /// A fresh engine whose motion grid starts at `t0` (the tests' injected clock; the
+    /// native golden anchors its center the same way).
     #[cfg(test)]
     pub(crate) fn reset_at(&mut self, t0: Instant) {
         self.center = MessageCenter::new(MessageLog::default(), t0);
@@ -321,6 +356,7 @@ impl WebBand {
     }
 
     /// Whether the page's kept log may still be loaded: nothing restored, minted, queued
+    /// or drained yet.
     fn restorable(&self) -> bool {
         let log = self.center.log();
         !self.restored
@@ -332,12 +368,14 @@ impl WebBand {
     }
 
     /// Hand a drained prepend back to the pool, undoing the last frame's prepend on the
+    /// kept scratch so an echo frame under a band keeps the damage-scoped refill.
     #[inline]
     pub(crate) fn undo(&mut self, dst: &mut RenderInput, engine_rows: usize) -> bool {
         dst.undo_host_row_prepend(engine_rows, &mut self.pool, POOL_CAP)
     }
 
     /// The band row and column under frame pixel `(x, y)`: the band's rows stack from
+    /// `m.grid_top`, and the column is `Geometry::cell_at`.
     #[inline]
     fn cell_under(&self, x: f64, y: f64, cols: usize, m: BandMetrics) -> Option<(usize, usize)> {
         if !(x >= 0.0 && y >= 0.0) {
@@ -353,6 +391,7 @@ impl WebBand {
     }
 
     /// What a press at band `(row, col)` lands on, through the layout the
+    /// painter drew (the kept one while the view is prepared at `cols`).
     #[inline]
     fn hit(&self, row: usize, col: usize, cols: usize) -> Hit {
         match self.view.layout() {
@@ -362,6 +401,8 @@ impl WebBand {
     }
 
     /// The chip a pointer on `hit` lights: a capsule (the `Details ›`
+    /// included); on the row body and the overflow row, with a Details view,
+    /// the link a press there follows.
     #[inline]
     const fn hover_target(&self, hit: Hit) -> Option<HoverTarget> {
         match hit {
@@ -373,6 +414,7 @@ impl WebBand {
     }
 
     /// Move the drained lines into the journal, evicting the oldest past
+    /// [`JOURNAL_CAP`].
     fn journal_push(&mut self, lines: Vec<(LogLine, Shelf)>) {
         for (line, _) in lines {
             self.journal.push_back(line.encode());
@@ -384,6 +426,7 @@ impl WebBand {
     }
 
     /// `OK <next> <n>` then the journal's lines from `cursor` on, a `dropped`
+    /// line first when lines the page never took were evicted.
     fn log_since(&self, cursor: u64) -> String {
         let end = self.journal_first + self.journal.len() as u64;
         let from = cursor.min(end);
@@ -406,16 +449,20 @@ impl WebBand {
 /// What a restore read from the page's kept lines.
 struct Kept {
     /// The decoded lines, ordered by id as the native loader orders its two
+    /// files (a stable sort: a record's own lines keep their order).
     lines: Vec<LogLine>,
     /// Lines the codec refused (torn, foreign, over its size cap).
     skipped: usize,
     /// Lines the input repeated byte for byte (a page that kept a line
+    /// twice): read once, or the replay would load a retired record twice.
     dup: usize,
     /// Lines older than the newest [`RESTORE_CAP`], never decoded.
     over: usize,
 }
 
 /// Read the page's kept lines (`\n`-separated, oldest first): the newest
+/// [`RESTORE_CAP`] non-empty ones, each exact repeat once, through the
+/// engine's codec (`LogLine::decode`, the native loader's).
 fn read_kept(text: &str) -> Kept {
     let mut newest = Vec::new();
     let mut over = 0;
@@ -450,6 +497,8 @@ fn read_kept(text: &str) -> Kept {
 }
 
 /// The page's host for [`WebTerminal::messages_page`] (`page::Host`): the wall clock
+/// at the export and the page's UTC offset, and none of the facts only a native host
+/// has.
 struct WebDesk {
     /// The wall clock at the export.
     now_unix_ms: u64,
@@ -463,11 +512,13 @@ impl page::Host for WebDesk {
     }
 
     /// No log folder: the web writes no `messages.log`; the page keeps the
+    /// lines [`WebTerminal::messages_log_since`] hands it.
     fn log_folder(&self) -> Option<String> {
         None
     }
 
     /// Saved: the page keeps its log itself, and the engine's not-saved note speaks of a
+    /// log file the web never has.
     fn saved(&self) -> bool {
         true
     }
@@ -482,6 +533,7 @@ impl page::Host for WebDesk {
     }
 
     /// No filesystem, so `Open log` is never pressable: a page cannot see a file, and a
+    /// press on an authored intent is only logged (`performed=0`).
     fn is_regular_file(&self, _path: &str) -> bool {
         false
     }
@@ -497,17 +549,21 @@ impl page::Host for WebDesk {
     }
 
     /// No navigation: the web performs no authored intent, and every capsule a page
+    /// lists is a record's, which neither press route reaches (`notice act` and a band
+    /// press take only live rows).
     fn performs_navigation(&self) -> bool {
         false
     }
 
     /// One: the native reporters give every record a one-line sentence except agent
+    /// upgrade rows, which only the native harness writes.
     fn sentence_lines(&self, _key: Option<&str>, _detail: &[String]) -> usize {
         1
     }
 }
 
 /// A page's `Date.prototype.getTimezoneOffset()` (minutes, positive west of UTC) as
+/// the engine's offset in seconds east of UTC.
 #[inline]
 fn utc_offset_s(timezone_offset_min: f64) -> i64 {
     if timezone_offset_min.is_finite() && timezone_offset_min.abs() < 1440.0 {
@@ -558,6 +614,8 @@ impl WebTerminal {
     }
 
     /// A press on capsule `index` of row `id` — native's `notice act` after
+    /// its target is named: the engine's `act` logs the press (`Acted`) and
+    /// hands back the intent, and the band settles.
     pub(crate) fn band_act_at(
         &mut self,
         id: MessageId,
@@ -619,6 +677,9 @@ impl WebTerminal {
     }
 
     /// [`Self::messages_page`] at wall time `wall_ms`, on a clock `offset_s`
+    /// seconds east of UTC: the engine's projection of this band's log
+    /// ([`MessagesState::of`], the native page's builder) through the page's
+    /// host, as the engine's lines (`page::wire_lines`).
     pub(crate) fn messages_page_at(
         &self,
         tag: &str,
@@ -680,6 +741,8 @@ impl WebTerminal {
     }
 
     /// Re-prepare the band at `now` after a change of how it is drawn (the
+    /// look, the links, the hover, the inks): a band change reopens the frame
+    /// gate.
     fn band_redraw_at(&mut self, now: Instant) {
         self.band.now = now;
         let m = self.band_metrics();
@@ -766,6 +829,7 @@ impl WebTerminal {
     }
 
     /// The chip a pointer at frame pixel `(x, y)` lights, through the layout
+    /// the painter drew; `None` off the band and where a press does nothing.
     fn band_hover_under(&self, x: f64, y: f64) -> Option<Hover> {
         let m = self.band_metrics();
         self.band
@@ -780,6 +844,8 @@ impl WebTerminal {
     }
 
     /// Resolve the hover again from the pointer's last pixel: a press, a hold's fold, a
+    /// `done` or a new row moves the chips under a still pointer, and the page resolves
+    /// hover only on `pointermove`.
     fn settle_band_hover(&mut self) -> bool {
         let hover = self
             .band
@@ -836,6 +902,7 @@ impl WebTerminal {
     }
 
     /// [`Self::messages_log_since`]: the center's shelved lines join the
+    /// journal first, so a record posted since the last tick is in it.
     pub(crate) fn messages_log_since_at(&mut self, cursor: f64) -> String {
         let lines = self.band.center.drain_shelved_for_persist();
         self.band.journal_push(lines);
@@ -857,6 +924,7 @@ impl WebTerminal {
     }
 
     /// [`Self::messages_restore`] at `now`: the kept lines replayed as the native launch
+    /// replays its file (`MessageLog::replay_all`), then a fresh center over that log.
     pub(crate) fn messages_restore_at(&mut self, lines: &str, now: Instant) -> String {
         if !self.band.restorable() {
             return "ERR restore: only once, before the first notice".to_string();
@@ -879,6 +947,9 @@ impl WebTerminal {
     }
 
     /// Compose the band onto the frame scratch (the render hook after the effects and
+    /// the scroll stamp): re-prepare (a resize, cell size, pad or theme change lands
+    /// here), prepend the rows with every window-space stream translated, move the grid
+    /// band below them and hand the renderer the bleed.
     pub(crate) fn compose_band_into_frame(&mut self) {
         let m = self.band_metrics();
         let _ = self.band.prepare(self.cols, m.cell_w, m.pad);
@@ -904,6 +975,8 @@ impl WebTerminal {
 }
 
 /// The JS-visible surface, which each crate's `web_terminal_impl!` expands onto its
+/// own terminal type under its own export attribute: the attribute names the JS class
+/// after the impl's type, which this shared file cannot spell.
 macro_rules! bind {
     ($terminal:ident, $export:ident) => {
         #[cfg_attr(target_arch = "wasm32", $export)]
@@ -1045,6 +1118,7 @@ macro_rules! bind {
 web_terminal_impl!(bind);
 
 /// Each crate's own tests of this surface (`src/messages_api_tests.rs` of the crate
+/// compiling this file): the CPU and GPU hosts draw differently.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     include!(concat!(
@@ -1084,6 +1158,10 @@ mod tests {
     }
 
     /// The pet's drawn body in FRAME px `(x0, x1, y0, y1)`, read off the frame
+    /// the renderer drew: the free sprite whose atlas tile is the body's
+    /// natural size (`ART_ROWS` cells tall at `ART_ASPECT` — motes and
+    /// word-cats bake at other sizes), placed where the rasterizer stamps it,
+    /// `pad` in and `grid_top` down (any band rows are already in its `y`).
     fn drawn_pet_body(frame: &RenderInput, m: BandMetrics) -> Option<(f32, f32, f32, f32)> {
         use aterm_effects::kitty_pet::{ART_ASPECT, ART_ROWS};
         let nat_h = (ART_ROWS * m.cell_h as f32).round();
@@ -1095,6 +1173,8 @@ mod tests {
     }
 
     /// Drive the pet onto the glass through the binding alone — the glow
+    /// style that names it, the seed door, then witnessed keystrokes at 33 ms
+    /// — until `cursor_pet_alpha` goes positive.
     fn wake_the_pet(t: &mut Host) -> bool {
         t.set_cursor_glow(true, "rainbow kitty", None, None, 260, 24, 0.7, 0.6, true);
         t.set_cursor_pet(true, 7);
@@ -1115,6 +1195,9 @@ mod tests {
     }
 
     /// The pet under a band is pressed where it is drawn: the page presses in
+    /// canvas pixels, band included, so with a row committed a press on the drawn
+    /// body's centre or feet pets the cat and a press on the text half a row
+    /// above passes to the terminal.
     #[test]
     fn the_pet_is_pressed_where_the_band_draws_it() {
         let (mut t, t0) = clocked(12, 60);
@@ -1157,6 +1240,8 @@ mod tests {
     }
 
     /// A still pointer's lit chip follows the layout: when the progress row under
+    /// the pointer ends `done … ok`, its echo is `Hit::Nothing`, so the band draws
+    /// as a twin's that took the same lines with no pointer.
     #[test]
     fn a_still_pointers_chip_never_lights_the_echo() {
         let (mut t, t0) = clocked(12, 60);
@@ -1207,6 +1292,7 @@ mod tests {
     }
 
     /// A restore moves the page's `rev=`, as any observable log change does; a
+    /// post after it moves it again (control).
     #[test]
     fn the_restore_moves_the_pages_rev() {
         let (mut prev, p0) = clocked(20, 80);

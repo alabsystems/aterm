@@ -225,7 +225,7 @@ impl Parser<'_> {
         format!("byte {}: expected {want}", self.at)
     }
 
-    fn ws(&mut self) {
+    const fn ws(&mut self) {
         while self.at < self.src.len() && matches!(self.src[self.at], b' ' | b'\t' | b'\n' | b'\r')
         {
             self.at += 1;

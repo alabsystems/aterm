@@ -1,30 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! One mug per user: a running mug holds `LOCK_EX` on [`crate::paths::Paths::lock_file`] for
-//! its whole life with its pid and its job's label written inside, so a second `serve` sees it
-//! and leaves, and `status`/`quit` find it and its job ([`running_mug`] checks that the pid
-//! still names that mug). Also the boot the state file is stamped with ([`boot_id`]).
-//!
-//! The lock lives on the open file description, not the descriptor, so it survives the
-//! re-exec into the bundle copy (`crate::code`) when the new image is handed a descriptor of
-//! the same description: [`Instance::handover`] makes one, the re-exec places it on the new
-//! image's stdin (the exec hands the new image its stdio and nothing else) with
-//! [`LOCK_FD_ENV`] naming that slot, and [`Instance::adopt`] takes it back, moves it off
-//! stdin, and puts `/dev/null` there. No moment passes in which no process holds the lock,
-//! so no second `serve` can take it between the two images.
+//! One mug per user: a running mug holds `LOCK_EX` on [`crate::paths::Paths::lock_file`] for its whole life with its pid and its job's label written inside, so a second `serve` sees it and leaves, and `status`/`quit` find it and its job ([`running_mug`] checks that the pid still names that mug).
 
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::Path;
 
-/// The variable naming the descriptor a re-exec handed its new image the lock on
-/// ([`Instance::handover`], [`Instance::adopt`]). [`Instance::adopt`] removes it from the
-/// environment, so nothing the mug starts inherits it.
+/// The variable naming the descriptor a re-exec handed its new image the lock on ([`Instance::handover`], [`Instance::adopt`]).
 pub const LOCK_FD_ENV: &str = "ATERM_CAFFEINE_LOCK_FD";
 
-/// The descriptor a re-exec hands the lock on: the new image's stdin, the one slot of the
-/// three it inherits that a launchd job does not read (it is `/dev/null` there).
+/// The descriptor a re-exec hands the lock on: the new image's stdin, the one slot of the three it inherits that a launchd job does not read (it is `/dev/null` there).
 pub const HANDOVER_FD: i32 = 0;
 
 /// The longest lock file read: a pid, a label and their newlines.
@@ -42,20 +28,16 @@ pub struct Instance {
 
 impl Drop for Instance {
     fn drop(&mut self) {
-        // Emptied first while this description still holds it, so a lock nobody holds names
-        // no pid: a probe holding it for an instant must not make this exited mug's pid read
         // as a running one. (A mug killed outright leaves its pid; `running_mug` checks it.)
         if !self.leave_named && matches!(take(&self.file), Ok(true)) {
             let _ = self.file.set_len(0);
         }
-        // The release the flock rule asks for: `LOCK_UN` on the description before the close,
-        // so a copy of the descriptor some child still holds does not keep the lock.
         let _ = self.file.unlock();
     }
 }
 
-/// `flock(LOCK_EX|LOCK_NB)` on `file`'s description: `Ok(true)` when it is ours now (it was
-/// free, or this description already held it), `Ok(false)` when another description holds it.
+/// `flock(LOCK_EX|LOCK_NB)` on `file`'s description: `Ok(true)` when it is ours now (it was free,
+/// or this description already held it), `Ok(false)` when another description holds it.
 fn take(file: &std::fs::File) -> io::Result<bool> {
     #[expect(
         clippy::disallowed_methods,
@@ -71,13 +53,7 @@ fn take(file: &std::fs::File) -> io::Result<bool> {
 
 impl Instance {
     /// Take the lock at `path` without waiting and write this process's pid into it.
-    /// `Ok(None)` when another live process holds it.
-    ///
-    /// The file is created `0600`. A symbolic link, hard link or foreign-owned file at
-    /// `path` is refused before its contents are changed.
-    ///
     /// # Errors
-    ///
     /// The file cannot be created or locked, or is not a private, singly linked regular file.
     pub fn try_hold(path: &Path) -> io::Result<Option<Self>> {
         if let Some(parent) = path.parent() {
@@ -88,7 +64,6 @@ impl Instance {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            // std adds O_CLOEXEC. O_NONBLOCK: a FIFO planted at the name is not waited on.
             options
                 .mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
@@ -106,7 +81,6 @@ impl Instance {
         if !take(&file)? {
             return Ok(None);
         }
-        // From here the guard owns the lock, so an error below lets it go.
         let held = Self {
             file,
             label: None,
@@ -116,11 +90,8 @@ impl Instance {
         Ok(Some(held))
     }
 
-    /// Name the launchd job this mug is (`label`), written beside its pid: `quit` boots out
-    /// that job, and `status` reports it, whichever build asks.
-    ///
+    /// Name the launchd job this mug is (`label`), written beside its pid: `quit` boots out that job, and `status` reports it, whichever build asks.
     /// # Errors
-    ///
     /// The file cannot be rewritten.
     pub fn set_label(&mut self, label: &str) -> io::Result<()> {
         self.label = Some(label.to_string());
@@ -141,32 +112,19 @@ impl Instance {
         file.write_all(text.as_bytes())
     }
 
-    /// Let go of the lock with this mug's pid and label left in the file, as a mug that ends
-    /// for an update restart does: launchd is about to start its job again, and until the new
-    /// mug holds the lock, a `quit` from any build still finds that job in it
-    /// ([`last_holder`]) and boots it out. The pid left is checked as a killed mug's is
-    /// ([`running_mug`]).
+    /// Let go of the lock with this mug's pid and label left in the file, as a mug that ends for an update restart does: launchd is about to start its job again, and until the new mug holds the lock, a `quit` from any build still finds that job in it ([`last_holder`]) and boots it out.
     pub fn release_named(mut self) {
         self.leave_named = true;
     }
 
-    /// A second descriptor on this hold's open file description, for a re-exec to place at
-    /// [`HANDOVER_FD`] in the new image (with [`LOCK_FD_ENV`] naming it), which takes it back
-    /// with [`Instance::adopt`]. It is close-on-exec here; the exec places it.
-    ///
+    /// A second descriptor on this hold's open file description, for a re-exec to place at [`HANDOVER_FD`] in the new image (with [`LOCK_FD_ENV`] naming it), which takes it back with [`Instance::adopt`].
     /// # Errors
-    ///
     /// The descriptor cannot be duplicated.
     pub fn handover(&self) -> io::Result<std::fs::File> {
         self.file.try_clone()
     }
 
-    /// The hold a re-exec handed this image ([`Instance::handover`]): the descriptor
-    /// [`LOCK_FD_ENV`] names, when it is open on the very file at `path` and its lock is this
-    /// description's. The variable is removed from the environment either way (nothing the mug
-    /// starts sees it), and the descriptor is moved to a close-on-exec number of its own, with
-    /// `/dev/null` left in a stdio slot. `None` when no variable is set, or it names anything
-    /// else; the caller then takes the lock afresh ([`Instance::try_hold`]).
+    /// The hold a re-exec handed this image ([`Instance::handover`]): the descriptor [`LOCK_FD_ENV`] names, when it is open on the very file at `path` and its lock is this description's.
     #[must_use]
     pub fn adopt(path: &Path) -> Option<Self> {
         let named = aterm_log::env::take(LOCK_FD_ENV)?;
@@ -176,7 +134,6 @@ impl Instance {
 }
 
 /// A lock may be rewritten only through an owned regular inode with no second name.
-/// The opened descriptor is checked before either acquisition or handover rewrites it.
 fn private_lock_file(meta: &std::fs::Metadata) -> bool {
     if !meta.is_file() {
         return false;
@@ -192,12 +149,8 @@ fn private_lock_file(meta: &std::fs::Metadata) -> bool {
     }
 }
 
-/// [`Instance::adopt`] of descriptor `fd`. On success `fd` itself is retired (closed, or
-/// `/dev/null` placed on it when it is a stdio slot) and the hold lives on a copy; otherwise
-/// `fd` is left as it was, unless it was open on the lock file (then it is retired too: a
-/// stdin on the lock file is never wanted).
+/// [`Instance::adopt`] of descriptor `fd`.
 #[cfg(unix)]
-// Skip: bottoms out at the `fcntl` and `dup2` FFI calls.
 #[cfg_attr(trust_verify, trust::skip)]
 fn adopt_fd(fd: i32, path: &Path) -> Option<Instance> {
     use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
@@ -205,15 +158,12 @@ fn adopt_fd(fd: i32, path: &Path) -> Option<Instance> {
     if fd < 0 {
         return None;
     }
-    // SAFETY: `F_GETFD` reads one descriptor's flags and touches no memory; a number that is
-    // not open answers -1.
+    // SAFETY: `F_GETFD` reads one descriptor's flags and touches no memory; a number that is not open answers -1.
     if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
         return None;
     }
-    // SAFETY: `fd` is open (just checked) and stays open for this borrow: nothing closes it
-    // before the copy below is made.
+    // SAFETY: `fd` is open (just checked) and stays open for this borrow: nothing closes it before the copy below is made.
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    // `F_DUPFD_CLOEXEC` at 3 or above: the copy is close-on-exec and never a stdio slot.
     let file = std::fs::File::from(borrowed.try_clone_to_owned().ok()?);
     let opened = file.metadata().ok()?;
     let named = std::fs::symlink_metadata(path).ok()?;
@@ -223,7 +173,6 @@ fn adopt_fd(fd: i32, path: &Path) -> Option<Instance> {
     {
         return None;
     }
-    // The copy shares the description, so retiring `fd` leaves the lock where it is.
     if fd <= 2 {
         let null = std::fs::OpenOptions::new()
             .read(true)
@@ -235,8 +184,7 @@ fn adopt_fd(fd: i32, path: &Path) -> Option<Instance> {
             return None;
         }
     } else {
-        // SAFETY: the caller handed `fd` over (the re-exec placed it for this image alone),
-        // and nothing else in this process uses the number.
+        // SAFETY: the caller handed `fd` over (the re-exec placed it for this image alone), and nothing else in this process uses the number.
         drop(unsafe { OwnedFd::from_raw_fd(fd) });
     }
     if !take(&file).ok()? {
@@ -267,11 +215,7 @@ pub struct Holder {
 }
 
 impl Holder {
-    /// Whether a process running `exe` (canonical) with the arguments `argv` is this holder's
-    /// mug: it runs `… caffeine serve`, from where this holder's job runs it: its copy under
-    /// `code_dir` (canonical; `None` when there is none) in the label's directory, or else an
-    /// executable whose own label ([`crate::launchd::label_for`]) is the label. A holder that
-    /// has not named its job yet is any mug.
+    /// Whether a process running `exe` (canonical) with the arguments `argv` is this holder's mug: it runs `… caffeine serve`, from where this holder's job runs it: its copy under `code_dir` (canonical; `None` when there is none) in the label's directory, or else an executable whose own label ([`crate::launchd::label_for`]) is the label.
     #[must_use]
     pub fn is_run_by(&self, exe: &Path, argv: &[OsString], code_dir: Option<&Path>) -> bool {
         let serve = crate::launchd::SERVE_ARGS;
@@ -297,9 +241,7 @@ impl Holder {
     }
 }
 
-/// Who holds the lock at `path`, if anyone does, as its file says (the pid unchecked: a mug
-/// killed outright leaves its pid behind, which a probe holding the lock for an instant then
-/// reads as live; [`running_mug`] checks it).
+/// Who holds the lock at `path`, if anyone does, as its file says (the pid unchecked: a mug killed outright leaves its pid behind, which a probe holding the lock for an instant then reads as live; [`running_mug`] checks it).
 #[must_use]
 pub fn running_holder(path: &Path) -> Option<Holder> {
     if aterm_uds::ownerlock::probe(path) != aterm_uds::ownerlock::Owner::Live {
@@ -308,9 +250,7 @@ pub fn running_holder(path: &Path) -> Option<Holder> {
     last_holder(path)
 }
 
-/// Who the lock file at `path` names, held or not: the running mug, or one that died without
-/// letting go (a crash, a signal), whose pid and label stay in the file. The text is read
-/// never through a link, never waiting on a FIFO, and only from a regular file.
+/// Who the lock file at `path` names, held or not: the running mug, or one that died without letting go (a crash, a signal), whose pid and label stay in the file.
 #[must_use]
 pub fn last_holder(path: &Path) -> Option<Holder> {
     use std::io::Read as _;
@@ -339,14 +279,9 @@ pub fn running_pid(path: &Path) -> Option<u32> {
     running_holder(path).map(|holder| holder.pid)
 }
 
-/// Wait, up to `within`, until no pid of `pids` holds the lock at `path` ([`running_holder`]):
-/// a holder's flock goes with its process, so this is the moment a signalled mug has ended,
-/// not the moment it was told to. `Err` is the pid still holding it.
-///
+/// Wait, up to `within`, until no pid of `pids` holds the lock at `path` ([`running_holder`]): a holder's flock goes with its process, so this is the moment a signalled mug has ended, not the moment it was told to.
 /// # Errors
-///
 /// The holder's pid, when one of `pids` still holds the lock after `within`.
-// Skip: a polling loop over the wall clock and `running_holder`'s FFI probe.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn await_released(path: &Path, pids: &[u32], within: std::time::Duration) -> Result<(), u32> {
     let start = std::time::Instant::now();
@@ -361,9 +296,7 @@ pub fn await_released(path: &Path, pids: &[u32], within: std::time::Duration) ->
     }
 }
 
-/// The mug holding the lock at `lock`: [`running_holder`], when the process its pid names is
-/// that mug ([`Holder::is_run_by`], read off the live process), so a stale pid now another
-/// process's is never taken for a mug. `code_dir` is [`crate::paths::Paths::code_dir`].
+/// The mug holding the lock at `lock`: [`running_holder`], when the process its pid names is that mug ([`Holder::is_run_by`], read off the live process), so a stale pid now another process's is never taken for a mug.
 #[must_use]
 pub fn running_mug(lock: &Path, code_dir: &Path) -> Option<Holder> {
     let holder = running_holder(lock)?;
@@ -377,9 +310,9 @@ pub fn running_mug(lock: &Path, code_dir: &Path) -> Option<Holder> {
         .then_some(holder)
 }
 
-/// Who a lock file's text names: `<pid>`, then the label on a second line once named; the
-/// pid one positive decimal number, the label one [`crate::launchd::is_label`] accepts, the
-/// last newline optional.
+/// Who a lock file's text names: `<pid>`, then the label on a second line once named; the pid one
+/// positive decimal number, the label one [`crate::launchd::is_label`] accepts, the last newline
+/// optional.
 fn parse_holder(text: &str) -> Option<Holder> {
     let text = text.strip_suffix('\n').unwrap_or(text);
     let (digits, label) = match text.split_once('\n') {
@@ -399,14 +332,7 @@ fn parse_holder(text: &str) -> Option<Holder> {
     })
 }
 
-/// This boot of the Mac (`kern.bootsessionuuid`, as 128 bits, big-endian); `None` where it
-/// cannot be read, or reads as the all-zero id a damaged answer would, which must never pass
-/// as a boot (two equal damaged answers would read as one boot, and a mode saved before a
-/// restart would come back). Unlike `kern.boottime`, which macOS moves whenever the wall
-/// clock is stepped, it holds for the whole boot and only for it.
-///
-/// Read through `astream_sys::boot_session`, the reading aterm-link's broker opens its log in,
-/// so this crate keeps no `sysctlbyname` of its own.
+/// This boot of the Mac (`kern.bootsessionuuid`, as 128 bits, big-endian); `None` where it cannot be read, or reads as the all-zero id a damaged answer would, which must never pass as a boot (two equal damaged answers would read as one boot, and a mode saved before a restart would come back).
 #[must_use]
 #[cfg(target_os = "macos")]
 pub fn boot_id() -> Option<u128> {
@@ -429,8 +355,6 @@ mod tests {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("state").join("caffeine.lock");
         let first = Instance::try_hold(&path).expect("hold").expect("free");
-        // flock binds to the open file description, so a second open in this process is a
-        // second contender.
         assert!(Instance::try_hold(&path).expect("hold").is_none());
         drop(first);
         let again = Instance::try_hold(&path).expect("hold");
@@ -515,8 +439,6 @@ mod tests {
         assert_eq!(running_holder(&path), None);
         assert_eq!(last_holder(&path), None, "a mug that lets go names nothing");
 
-        // NEGATIVE CONTROL of the drop above: one let go for an update restart leaves its job
-        // named, for a `quit` meanwhile to boot out.
         let mut held = Instance::try_hold(&path).expect("hold").expect("free");
         held.set_label(label).expect("label");
         held.release_named();
@@ -549,7 +471,6 @@ mod tests {
         let path = dir.path().join("caffeine.lock");
         std::fs::write(&path, "4242\n").expect("write");
         assert_eq!(running_pid(&path), None);
-        // Taking it rewrites it with this pid, whatever it held.
         std::fs::write(&path, "123456789\n").expect("write");
         let held = Instance::try_hold(&path).expect("hold").expect("free");
         assert_eq!(running_pid(&path), Some(std::process::id()));
@@ -597,7 +518,6 @@ mod tests {
                 exe.display()
             );
         }
-        // Another build's copy or executable is another job's mug.
         let other = code
             .join("com.aterm.aterm.caffeine.dev.0123abcd")
             .join("aterm.app/Contents/MacOS/aterm");
@@ -615,7 +535,6 @@ mod tests {
             label: Some(crate::launchd::label_for(bare)),
         };
         assert!(dev.is_run_by(bare, &serve("aterm"), None));
-        // Not serving: any other command line of the same executable.
         for argv in [
             vec![OsString::from("aterm")],
             ["aterm", "caffeine", "status"].map(OsString::from).to_vec(),
@@ -624,7 +543,6 @@ mod tests {
         ] {
             assert!(!dev.is_run_by(bare, &argv, None), "{argv:?}");
         }
-        // A holder that has not named its job yet is any mug.
         let unnamed = Holder {
             pid: 7,
             label: None,
@@ -645,8 +563,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&victim).expect("read"), "keep me\n");
         assert_eq!(running_pid(&path), None);
 
-        // A second name for another file is no lock rendezvous: neither a fresh take nor
-        // a handed-over descriptor may truncate it with the holder record.
         use std::os::fd::{FromRawFd as _, IntoRawFd as _};
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::remove_file(&path).expect("unlink");
@@ -661,8 +577,7 @@ mod tests {
             .into_raw_fd();
         let adopted = adopt_fd(raw, &path);
         if adopted.is_none() {
-            // SAFETY: refused adoption leaves this handed-over descriptor open and owned
-            // by this test; it is closed exactly once here.
+            // SAFETY: refused adoption leaves this handed-over descriptor open and owned by this test; it is closed exactly once here.
             drop(unsafe { std::fs::File::from_raw_fd(raw) });
         }
         assert!(adopted.is_none(), "a hard-linked inode is not adopted");
@@ -696,7 +611,6 @@ mod tests {
 
     #[test]
     fn adopt_without_the_variable_is_none() {
-        // No test sets the variable, so it is unset here.
         assert!(std::env::var_os(LOCK_FD_ENV).is_none());
         let dir = aterm_tempfile::tempdir().expect("tempdir");
         assert!(Instance::adopt(&dir.path().join("caffeine.lock")).is_none());
@@ -798,7 +712,6 @@ mod tests {
         let boot = boot_id().expect("kern.bootsessionuuid");
         assert_ne!(boot, 0);
         assert_eq!(boot_id(), Some(boot));
-        // The stamp the state file gets reads back as this boot.
         assert_eq!(
             crate::state::parse_boot(&crate::state::boot_text(boot)),
             Some(boot)

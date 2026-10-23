@@ -49,18 +49,22 @@ pub(crate) const TOP_DIRS: usize = 8;
 /// Folders inside a root that were not measured, named per root at most.
 const NOT_MEASURED_ROWS: usize = 16;
 /// A walk in progress publishes its partial figure at most this often, and
+/// reads its inbox between.
 const PUBLISH_EVERY: Duration = Duration::from_millis(500);
 /// The most descendants of one shell whose cwd is read in one discovery.
 const MAX_DESCENDANTS: usize = 256;
 /// The most write-open files of one process anchored in one discovery (a
+/// database or a build holds dozens; the anchors repeat).
 const MAX_WRITES_PER_PROCESS: usize = 64;
 /// How often the slow tier counts the entries of the build profiles outside every root (design §10.8): one `ATTR_DIR_ENTRYCOUNT` read each.
 pub(crate) const PROFILES_EVERY: Duration = Duration::from_secs(600);
 /// The home folder's children the slow tier looks in for a build folder.
 const MAX_CHECKOUTS: usize = 512;
 /// A profile's `deps/` at the note line is walked this long at most, to learn
+/// whether it holds executables (the tccd hazard's sentence)…
 const PROFILE_WALK_BUDGET: Duration = Duration::from_secs(5);
 /// …and a known answer is kept this long (a walk the budget cut before it met
+/// one knows nothing, so it is asked again at the next tier).
 const EXEC_KNOWN_FOR: Duration = Duration::from_secs(3600);
 /// How often the loop looks at the panes' facts while a scope is demanded…
 pub(crate) const FACTS_EVERY: Duration = Duration::from_secs(1);
@@ -429,6 +433,7 @@ pub(crate) struct Shared {
     /// The newest publication: the loop stores it, readers clone it. A leaf.
     board: Mutex<Option<Arc<Published>>>,
     /// When each scope was last asked (readers only): a scope asked anew
+    /// makes the loop send fresh facts.
     asked: Mutex<BTreeMap<DiskScope, Instant>>,
     /// [`ANCHOR`]-relative ms until which some scope is demanded.
     demanded_until_ms: AtomicU64,
@@ -525,6 +530,7 @@ pub(crate) fn disk_report(scope: DiskScope, detail: Detail, now: Instant) -> Dis
 }
 
 /// Start the walker thread for `shared`: the receiver is the loop's end of
+/// its publications, and `proxy` wakes the loop after each.
 fn spawn_walker(
     shared: &'static Shared,
     proxy: Option<Proxy>,
@@ -551,6 +557,7 @@ fn spawn_walker(
 }
 
 /// The bytes of `path` (a claimed folder) that two or more panes claim, given
+/// `above`, the panes that claim it whole (it or a folder above it).
 fn shared_in(
     path: &Path,
     above: &BTreeSet<u64>,
@@ -806,6 +813,7 @@ fn claim(out: &mut Vec<Claim>, path: &Path, kind: RootKind, linked: bool) {
 }
 
 /// The processes below `root`, breadth first: `(pid, ppid)`, at most
+/// [`MAX_DESCENDANTS`].
 fn descendants(procs: &[(u32, u32)], root: u32) -> Vec<(u32, u32)> {
     let mut out = Vec::new();
     let mut frontier = VecDeque::from([root]);
@@ -824,6 +832,7 @@ fn descendants(procs: &[(u32, u32)], root: u32) -> Vec<(u32, u32)> {
 }
 
 /// The agent session folder a cwd under `base` (`/private/tmp/claude-<uid>`)
+/// sits in: `base/<project>/<session>`.
 fn scratch_anchor(cwd: &Path, base: &Path) -> Option<PathBuf> {
     let rest = cwd.strip_prefix(base).ok()?;
     let mut parts = rest.components();
@@ -862,6 +871,8 @@ pub(crate) struct ProcReads<'a> {
 }
 
 /// The firmlinked spelling of a kernel path on macOS's data volume
+/// (`/System/Volumes/Data/Users//a/x` is `/Users//a/x`), so one folder is one
+/// root whichever spelling the kernel gave; any other path as it is.
 fn firmlinked(path: &Path) -> PathBuf {
     const FIRMLINKED: [&str; 8] = [
         "Users",
@@ -880,6 +891,8 @@ fn firmlinked(path: &Path) -> PathBuf {
 }
 
 /// Where a write lands, as a root (design §10.4 `writes`): the build folder
+/// above the written file, else its git worktree, else its agent session
+/// temp folder, else its folder.
 fn write_anchor(
     file: &Path,
     policy: &Policy,
@@ -899,6 +912,7 @@ fn write_anchor(
 }
 
 /// A `CARGO_TARGET_DIR` as an absolute folder: a relative one is cargo's
+/// reading of it, against the process's cwd.
 fn target_dir_path(dir: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
     if dir.is_absolute() {
         canonical(dir)
@@ -908,6 +922,7 @@ fn target_dir_path(dir: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
 }
 
 /// Claim `path` as `kind` when it is a directory, or the directory a link
+/// there names (read, never followed); nothing when it is absent or refused.
 fn claim_dir(out: &mut Vec<Claim>, path: &Path, kind: RootKind, policy: &Policy) {
     let (Some(parent), Some(leaf)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
     else {
@@ -925,6 +940,8 @@ fn claim_dir(out: &mut Vec<Claim>, path: &Path, kind: RootKind, policy: &Policy)
 }
 
 /// One pane's roots (design §10.4): its cwd, its processes' cwds, where they
+/// write, the git worktree above each cwd, the worktree's build output and
+/// the processes' `CARGO_TARGET_DIR`, and agent session temp folders.
 fn discover_tab(
     tab: &TabFacts,
     procs: &[(u32, u32)],
@@ -991,6 +1008,8 @@ fn discover_tab(
 }
 
 /// A worktree's build output: `W/target` (a `target → target.noindex` link
+/// resolved by reading it, since the walker follows no link) and atpkg's
+/// build cache for `W`.
 fn build_roots(out: &mut Vec<Claim>, w: &Path, policy: &Policy, home: Option<&Path>) {
     claim_dir(out, &w.join("target"), RootKind::Build, policy);
     let Some(home) = home else {
@@ -1005,6 +1024,7 @@ fn build_roots(out: &mut Vec<Claim>, w: &Path, policy: &Policy, home: Option<&Pa
 }
 
 /// aterm's own folders and the `[sys] disk_roots` opt-ins, claimed for the
+/// aterm scope.
 fn own_claims(own: &[PathBuf], opt_in: &[PathBuf]) -> Vec<Claim> {
     let mut out = Vec::new();
     for p in own.iter().chain(opt_in) {
@@ -1058,6 +1078,7 @@ pub(crate) fn age_roots(
 }
 
 /// What the thread keeps between walks: each root's last complete tree (a
+/// nested root reads from it) and its walk history (growth).
 #[derive(Default)]
 struct Kept {
     trees: BTreeMap<PathBuf, Arc<Tree>>,
@@ -1249,6 +1270,7 @@ impl Engine {
     }
 
     /// The paths a live scope asked [`Detail::Frees`] for, with every promoted
+    /// root above each (a nested root's figures are its parent's walk's).
     fn frees_wanted(&self, now: Instant) -> BTreeSet<PathBuf> {
         let mut out = BTreeSet::new();
         for (scope, ask) in &self.demand {
@@ -1432,6 +1454,7 @@ impl Engine {
     }
 
     /// Read every promoted root inside another walked root from that root's
+    /// tree; drop a derived record whose parent's tree no longer holds it.
     fn rederive_nested(&mut self) {
         let plan = self.plan();
         let derived: Vec<(PathBuf, Option<RootRecord>)> = plan
@@ -1463,6 +1486,9 @@ impl Engine {
     }
 
     /// The next root owed a walk (design §10.4, §10.6): one never walked,
+    /// those holding a `writes` root first, then outermost first; else the
+    /// stalest walk past its [`Complete::rewalk_at`], or one a live scope
+    /// wants [`Detail::Frees`] for that has only sizes.
     fn next_root(&self, now: Instant) -> Option<PathBuf> {
         if self.live(now).is_empty() || self.policy.is_none() {
             return None;
@@ -1560,6 +1586,8 @@ impl Engine {
     }
 
     /// Slices of the walk in flight for up to [`PUBLISH_EVERY`], then its
+    /// partial figure; a walk no live scope's plan holds any more is
+    /// cancelled.
     fn step_walk(&mut self) {
         let Some(ticket) = self.active.as_ref().map(|a| a.ticket) else {
             return;
@@ -1600,6 +1628,7 @@ impl Engine {
     }
 
     /// A walk that stopped before its end leaves what was there before it:
+    /// the last complete figures, or nothing (the root is queued again).
     fn abandon_walk(&mut self) {
         let Some(a) = self.active.take() else {
             return;
@@ -1617,6 +1646,7 @@ impl Engine {
     }
 
     /// A walk reached its end: its record, its tree for the roots inside it,
+    /// its history for growth, and its §10.8 rows folded into the raised set.
     fn finish_walk(&mut self) {
         let Some(a) = self.active.take() else {
             return;
@@ -1684,6 +1714,8 @@ impl Engine {
     }
 
     /// The slow tier (§10.8), with no demand: every [`PROFILES_EVERY`], one
+    /// entry count per build profile of the home folder's checkouts outside
+    /// every walked root, folded into the raised set.
     fn slow_tier_if_due(&mut self, now: Instant) {
         let (Some(policy), Some(home)) = (self.policy.clone(), self.facts.home.clone()) else {
             return;
@@ -1721,6 +1753,7 @@ impl Engine {
     }
 
     /// Whether a profile's `deps/` holds executables: a bounded walk of it,
+    /// kept [`EXEC_KNOWN_FOR`] when it knows.
     fn executables_of(&mut self, deps: &Path, policy: &Policy, now: Instant) -> bool {
         if let Some(&(at, known)) = self.exec_known.get(deps)
             && now.saturating_duration_since(at) < EXEC_KNOWN_FOR
@@ -1823,6 +1856,7 @@ pub(crate) fn pick_root(
 }
 
 /// The record of `path` read from the walk of a promoted root it lies
+/// inside, when that walk holds it.
 fn derive_nested(path: &Path, paths: &[PathBuf], kept: &Kept) -> Option<RootRecord> {
     let parent = paths
         .iter()
@@ -1917,6 +1951,7 @@ fn complete_of(
 }
 
 /// The allocation's move over [`GROWTH_WINDOW`]: against the newest walk at
+/// least a window old, else the oldest walk kept (a shorter span, said).
 fn growth_of(history: &VecDeque<(Instant, u64)>, now: Instant) -> Option<Growth> {
     let &(_, latest) = history.back()?;
     let base = history
@@ -1934,6 +1969,8 @@ fn growth_of(history: &VecDeque<(Instant, u64)>, now: Instant) -> Option<Growth>
 }
 
 /// The build folders of the home folder's checkouts (its direct children):
+/// `C/target` (a link to `target.noindex` read, never followed) and atpkg's
+/// build cache for `C`, each looked for with the path test first.
 fn outside_build_dirs(home: &Path, policy: &Policy) -> Vec<PathBuf> {
     let Ok(rows) = list_one_level(&RootSpec::new(home), policy) else {
         return Vec::new();
@@ -1953,6 +1990,9 @@ fn outside_build_dirs(home: &Path, policy: &Policy) -> Vec<PathBuf> {
 }
 
 /// Each build profile's `deps/` in the build folder `target` and its direct
+/// entry count: `target/<profile>/deps`, or for a cross build
+/// `target/<triple>/<profile>/deps` (a triple's name has a `-`; `doc`,
+/// `tmp` and `package` are not looked into).
 fn profile_deps(target: &Path, policy: &Policy) -> Vec<(PathBuf, u32)> {
     let dirs_of = |dir: &Path| -> Vec<PathBuf> {
         list_one_level(&RootSpec::new(dir), policy)
@@ -1989,6 +2029,9 @@ fn profile_deps(target: &Path, policy: &Policy) -> Vec<(PathBuf, u32)> {
 }
 
 /// Whether a profile's `deps/` holds executables, from a walk of it bounded by
+/// `budget`: yes at the first one met (the walk stops there), no once the
+/// whole folder was listed without one, and `None` (not known) when the
+/// budget ran out first or the path test refused the folder.
 fn profile_executables(deps: &Path, policy: &Policy, budget: Duration) -> Option<bool> {
     let mut walker = Walker::new();
     let ticket = walker.start(&RootSpec::new(deps), policy).ok()?;
@@ -2054,6 +2097,10 @@ pub(crate) fn huge_entry(h: &HugeDir) -> aterm_messages::exceptions::Entry {
 }
 
 /// The slow tier's hysteresis, pure: each counted profile is raised at
+/// [`HUGE_WARN`], kept at or above [`HUGE_NOTE`] and lowered under it, as a
+/// walk's are; one the slow tier raised and no longer counts is lowered (its
+/// checkout gone), unless a walked root now holds it (that walk's fold owns it
+/// from now on).
 fn fold_outside(
     raised: &BTreeMap<PathBuf, HugeDir>,
     outside: &BTreeSet<PathBuf>,
@@ -2080,6 +2127,7 @@ fn fold_outside(
 }
 
 /// The hysteresis, pure: `raised` after a complete walk of `root` found
+/// `found` (its folders at [`HUGE_NOTE`] or more).
 fn fold_raised(
     raised: &BTreeMap<PathBuf, HugeDir>,
     root: &Path,
@@ -2231,6 +2279,7 @@ impl crate::App {
 }
 
 /// Unix only: the tests build scratch trees with links and modes, and on any
+/// other platform every walk is `Refusal::Unsupported`.
 #[cfg(all(test, unix))]
 #[path = "diskwalk_host_tests.rs"]
 mod tests;

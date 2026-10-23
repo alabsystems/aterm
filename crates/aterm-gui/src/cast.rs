@@ -17,23 +17,27 @@ use aterm_core::terminal::Terminal;
 pub(crate) const DEFAULT_BUDGET_BYTES: usize = 4 * 1024 * 1024;
 
 /// Cap on retained events as well as bytes: a long interactive session can emit
+/// millions of one-byte bursts within 4 MiB, which a payload-only budget (a byte
+/// subscriber's) would keep.
 const MAX_RETAINED_EVENTS: usize = 65_536;
 
 /// One event's slot in a recording's event list ([`EventLog`]).
 const EVENT_SLOT_BYTES: usize = std::mem::size_of::<Event>();
 
 /// What a retained output burst of `len` bytes costs a recording's budget: its slot,
+/// the payload, and the payload allocation's strong and weak counts.
 const fn output_cost(len: usize) -> usize {
     EVENT_SLOT_BYTES + 2 * std::mem::size_of::<usize>() + len
 }
 
-/// Events per sealed chunk of a recording's event list ([`EventLog`]). A snapshot
+/// Events per sealed chunk of a recording's event list ([`EventLog`]).
 const CHUNK_EVENTS: usize = 256;
 
 /// One recorded asciicast v2 event: program output (`"o"`) or a resize (`"r"`).
 #[derive(Clone)]
 enum Event {
     /// `[t, "o", "<json-escaped(bytes)>"]`: a coalesced output burst stored as raw
+    /// bytes and escaped only at render time.
     Output {
         t: Duration,
         data: Arc<[u8]>,
@@ -49,6 +53,9 @@ enum Event {
 }
 
 /// An event's place in the engine's order: the engine's lifetime token, then a rank on
+/// its resize ordinal (`2k` for resize `k`, `2o + 1` for a burst processed with `o`
+/// resizes applied), so a burst sorts after every resize it followed and before the
+/// next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct OrderKey {
     lifetime: u64,
@@ -83,6 +90,7 @@ pub(crate) struct CastStamp {
 pub(crate) struct CastCuts {
     first: Option<CastStamp>,
     /// `(offset into the burst, stamp)` of each later piece, ascending; empty until a
+    /// resize cuts the burst.
     rest: Vec<(usize, CastStamp)>,
     /// The count of the burst's last hold on the recorder's [`CastWatermark`].
     hold: u64,
@@ -137,7 +145,7 @@ pub(crate) struct CastWatermark {
 }
 
 impl CastWatermark {
-    /// Count one reader hold and return its count. The caller holds the engine's lock,
+    /// Count one reader hold and return its count.
     fn note(&self) -> u64 {
         self.holds.fetch_add(1, Ordering::Relaxed) + 1
     }
@@ -218,6 +226,7 @@ impl Event {
     }
 
     /// The bytes charged against the budget: what holding the event costs, its slot,
+    /// plus for output the payload and its allocation's counts ([`output_cost`]).
     fn cost(&self) -> usize {
         match self {
             Event::Output { data, .. } => output_cost(data.len()),
@@ -227,6 +236,7 @@ impl Event {
 }
 
 /// What an evicted slot of a sealed chunk holds once its payload is released: no
+/// reader visits it (it is before [`EventLog::head`]).
 const RELEASED: Event = Event::Resize {
     t: Duration::ZERO,
     cols: 0,
@@ -234,7 +244,7 @@ const RELEASED: Event = Event::Resize {
     key: None,
 };
 
-/// A recording's events, oldest first, kept so a snapshot shares most of them. The
+/// A recording's events, oldest first, kept so a snapshot shares most of them.
 #[derive(Default)]
 struct EventLog {
     /// Sealed chunks, oldest first.
@@ -304,6 +314,7 @@ impl EventLog {
     }
 
     /// Move the newest sealed chunk's live events back to the front of `open`: the
+    /// chunk itself when no snapshot shares it, else a clone of its events.
     #[cold]
     fn unseal_newest(&mut self) {
         let Some(chunk) = self.sealed.pop_back() else {
@@ -320,6 +331,7 @@ impl EventLog {
     }
 
     /// Evict the oldest live event and hand it back (its payload freed when the caller
+    /// drops it, unless a snapshot still shares its chunk).
     fn pop_front(&mut self) -> Option<Event> {
         let Some(chunk) = self.sealed.front_mut() else {
             let ev = self.open.pop_front()?;
@@ -346,6 +358,7 @@ impl EventLog {
     }
 
     /// Move every live event `by` earlier, floored at zero (a warm spare's adoption,
+    /// [`CastRecorder::adopt_spare`]).
     fn shift_back(&mut self, by: Duration) {
         let head = self.head;
         for (i, chunk) in self.sealed.iter_mut().enumerate() {
@@ -386,6 +399,7 @@ fn live_sealed<'a>(
 }
 
 /// A recording's events as a snapshot holds them ([`EventLog::share`]): the sealed
+/// chunks it shares with the recorder, and its own copy of the open events.
 struct SharedEvents {
     sealed: Vec<Arc<Vec<Event>>>,
     head: usize,
@@ -412,24 +426,34 @@ pub(crate) struct CastRecorder {
     /// The byte budget over [`Event::cost`]; drop-oldest when `used` would exceed it.
     budget: usize,
     /// Drop-oldest evictions, disclosed in the asciicast header
+    /// ([`CastSnapshot::into_cast`]) because a truncated recording's leading
+    /// ANSI state is incomplete.
     evicted: u64,
     /// The last emitted timestamp; an unstamped event's `t` is clamped up to it.
     last_t: Duration,
-    /// Monotonic epoch of this recorder's timeline, captured at construction. Reader
+    /// Monotonic epoch of this recorder's timeline, captured at construction.
     epoch: Instant,
     /// Trailing incomplete UTF-8 lead bytes (at most 3) carried from the previous burst
+    /// and prepended to the next, so a character split across reads is reassembled
+    /// instead of emitted as U+FFFD.
     pending: Vec<u8>,
     /// Shared with the session's readers and `cast drift` ([`CastWatermark`]).
     watermark: Arc<CastWatermark>,
-    /// The hold count of the newest burst recorded. Bursts arrive in hold order: one
+    /// The hold count of the newest burst recorded.
     recorded: u64,
     /// The resizes recorded from the newest engine lifetime seen: its token, how many,
+    /// and the newest ordinal.
     resizes: (u64, u64, u64),
     /// Callers waiting in [`snapshot_at`](Self::snapshot_at), so a record signals the
+    /// condvar only when someone waits.
     waiters: usize,
     /// Set on an adopted session's recorder: the recording starts at a seamless update
+    /// and lacks what the session showed before.
     handoff: Option<crate::session_timeline::HandoffGap>,
     /// How far an adopted warm spare's timeline was rebased
+    /// ([`adopt_spare`](Self::adopt_spare)): subtracted from every event's time,
+    /// so the recording starts at the adoption, the moment the person asked
+    /// for the tab.
     shift: Duration,
 }
 
@@ -496,6 +520,7 @@ impl CastRecorder {
     }
 
     /// Push `ev` at its place, evicting oldest events first so the list never exceeds
+    /// [`MAX_RETAINED_EVENTS`] or its byte budget.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -663,6 +688,7 @@ impl CastRecorder {
     }
 
     /// How this recording stands against `cut`: bursts by the hold count of the
+    /// newest recorded one, resizes by how many of the cut's engine lifetime are in.
     fn holding(&self, cut: &CastCut) -> Holding {
         use std::cmp::Ordering::{Equal, Greater, Less};
         let bursts = self.recorded.cmp(&cut.holds);
@@ -747,6 +773,7 @@ pub(crate) struct CastSnapshot {
     /// Recorded events, oldest first, sharing the recorder's sealed chunks.
     events: SharedEvents,
     /// Head events evicted before this snapshot, so the `cast frames` flipbook discloses
+    /// truncation as the asciicast header's `aterm_truncated` does.
     evicted: u64,
     /// The recorder's handoff gap, when it starts at a seamless update.
     handoff: Option<crate::session_timeline::HandoffGap>,
@@ -844,6 +871,7 @@ impl CastSnapshot {
 }
 
 /// Number of trailing bytes of `bytes` that form an incomplete but so-far valid UTF-8
+/// lead the next read could complete.
 fn incomplete_tail_len(bytes: &[u8]) -> usize {
     let n = bytes.len();
     let max_back = 3.min(n);
@@ -868,6 +896,7 @@ fn incomplete_tail_len(bytes: &[u8]) -> usize {
 }
 
 /// Test-only hook [`CastSnapshot::into_cast`] calls first, so a test can probe the
+/// recorder lock from inside the off-lock path `cast` serializes on.
 #[cfg(test)]
 mod serialize_hook {
     use std::cell::RefCell;
@@ -1016,6 +1045,8 @@ pub(crate) struct ByteFanout {
     slots: Mutex<Vec<Arc<ByteSlot>>>,
     next_id: AtomicU64,
     /// Lock-free mirror of `slots.len()`, incremented before a slot is pushed and
+    /// decremented after it is removed, so it is nonzero whenever a registered slot
+    /// exists (a positive count with no slot yet is a harmless no-op pass).
     live: AtomicUsize,
     /// Per-subscriber retained-byte budget; drop-oldest beyond it.
     budget: usize,
@@ -1144,6 +1175,8 @@ mod tests {
     use super::*;
 
     /// Drives both shipping queues through the real entry ceiling, projecting every
+    /// one-byte append onto the derived model; a payload-only rule is the negative
+    /// control at the first count eviction.
     #[test]
     fn tiny_output_retention_conforms() {
         use aterm_models_gui::output_retention_model;
@@ -1248,6 +1281,7 @@ mod tests {
     }
 
     /// The single forward fold reproduces, frame for frame, a per-frame re-fold (each
+    /// frame = the screen after every event with `t <= frame_target`).
     #[test]
     fn fold_frames_single_pass_matches_per_frame_refold() {
         let mut rec = CastRecorder::new(40, 6);
@@ -1285,6 +1319,7 @@ mod tests {
     }
 
     /// `fold_frames` rebases to the first retained event, so survivors far past t0
+    /// spread frames over the surviving span rather than a blank leading gap.
     #[test]
     fn fold_frames_rebases_to_first_event() {
         let mut rec = CastRecorder::new(40, 6);
@@ -1300,6 +1335,7 @@ mod tests {
     }
 
     /// `cast frames` replays a session under its seam policy, as `cast drift` does
+    /// (`aterm_control::replay::ReplayEngine`).
     #[test]
     fn fold_frames_replays_under_the_sessions_seam_policy() {
         use aterm_control::cast_drift::{DriftArgs, LiveScreen, analyze};
@@ -1369,6 +1405,7 @@ mod tests {
     }
 
     /// Each event line is a `[f64, "o"|"r", string]` JSON array, output-only for
+    /// `record_output`, with a correctly JSON-escaped payload.
     #[test]
     fn events_are_well_formed_arrays() {
         let mut rec = CastRecorder::new(80, 24);
@@ -1425,6 +1462,7 @@ mod tests {
     }
 
     /// Control bytes below 0x20 (other than \n\r\t) use the \u00XX form, so the
+    /// payload is a legal JSON string body.
     #[test]
     fn control_bytes_use_unicode_escape() {
         let mut rec = CastRecorder::new(80, 24);
@@ -1438,6 +1476,7 @@ mod tests {
     }
 
     /// After drop-oldest eviction the asciicast discloses the truncation in the header
+    /// and rebases survivor timestamps to the first retained event.
     #[test]
     fn eviction_is_disclosed_and_timestamps_rebased() {
         let mut rec = CastRecorder::with_budget(80, 24, 10);
@@ -1473,7 +1512,7 @@ mod tests {
         assert_eq!(parse_event(cast.lines().nth(2).unwrap()).0, 0.400);
     }
 
-    /// The header names the geometry in force at the first retained event. While the
+    /// The header names the geometry in force at the first retained event.
     #[test]
     fn evicted_resize_moves_the_header_geometry() {
         let line: Vec<u8> = [&b"\r\n"[..], &[b'X'; 100]].concat();
@@ -1519,6 +1558,9 @@ mod tests {
     }
 
     /// A seeded recording: random bursts and pieces from every escape class (quotes,
+    /// backslashes, C0, DEL, C1, bidi controls, multibyte text, invalid bytes and a
+    /// lead completed by the next burst) and resizes, with timestamps that sometimes
+    /// go backwards, under `budget`.
     fn seeded_recording(seed: u64, budget: usize, events: usize) -> CastRecorder {
         const PIECES: [&[u8]; 9] = [
             b"plain text ",
@@ -1559,6 +1601,8 @@ mod tests {
     }
 
     /// The asciicast text as the recorder serialized it under its own lock, before
+    /// `cast` moved serialization onto the snapshot: the reference the off-lock
+    /// writer must match byte for byte.
     fn locked_reference(rec: &CastRecorder) -> String {
         fn fmt_t(t: Duration) -> String {
             format!("{:.6}", t.as_secs_f64())
@@ -1640,6 +1684,9 @@ mod tests {
     }
 
     /// The `cast` reply, serialized off the recorder lock into one buffer, is byte for
+    /// byte `OK <n>\n` and the text the recorder serialized under its lock: for an
+    /// empty recording, an untruncated one, truncated ones with each handoff form, and
+    /// one whose body length needs six digits.
     #[test]
     fn cast_reply_is_byte_identical_to_the_locked_serializer() {
         use crate::session_timeline::HandoffGap;
@@ -1682,6 +1729,7 @@ mod tests {
     }
 
     /// `cast` lifts the snapshot under the recorder lock and serializes after
+    /// releasing it: a probe from the off-lock path it serializes on takes the lock.
     #[test]
     fn cmd_cast_releases_the_recorder_before_serializing() {
         use std::cell::Cell;
@@ -1715,6 +1763,7 @@ mod tests {
     }
 
     /// A trailing incomplete lead is carried, not replaced: the burst that completes it
+    /// emits the whole character.
     #[test]
     fn trailing_incomplete_lead_is_carried_not_replaced() {
         let mut rec = CastRecorder::new(80, 24);
@@ -1728,6 +1777,7 @@ mod tests {
     }
 
     /// A complete shared burst is retained zero-copy: the stored event holds the
+    /// caller's allocation.
     #[test]
     fn shared_complete_burst_is_stored_without_copy() {
         let mut rec = CastRecorder::new(80, 24);
@@ -1743,6 +1793,7 @@ mod tests {
     }
 
     /// The zero-copy path is not taken when a carry is pending or the tail is
+    /// incomplete; the shared-Arc entry point reassembles like the borrowing one.
     #[test]
     fn shared_burst_with_split_multibyte_still_reassembles() {
         let mut rec = CastRecorder::new(80, 24);
@@ -1773,6 +1824,8 @@ mod tests {
     }
 
     /// A snapshot shares the sealed chunks and clones only the open events: after
+    /// eight chunks of bursts, lifting one moves the refcounts of fewer than two
+    /// chunks of payloads, and it reads the recording's events in order.
     #[test]
     fn a_snapshot_shares_the_sealed_chunks() {
         let mut rec = CastRecorder::new(80, 24);
@@ -1810,6 +1863,9 @@ mod tests {
     }
 
     /// A resize recorded after the bursts the engine processed after it goes before
+    /// them even where that is inside sealed chunks: the chunks are unsealed, a snapshot
+    /// lifted before keeps the list it lifted, the resealed list gives back the slots
+    /// the unsealing took, and eviction then yields the events in the recorded order.
     #[test]
     fn a_late_resize_lands_inside_a_sealed_chunk() {
         let mut rec = CastRecorder::new(20, 8);
@@ -1849,6 +1905,7 @@ mod tests {
     }
 
     /// An evicted event's payload is freed at its eviction when no snapshot shares its
+    /// chunk.
     #[test]
     fn eviction_releases_what_a_snapshot_pinned() {
         let mut log = EventLog::default();
@@ -1881,6 +1938,7 @@ mod tests {
     }
 
     /// `tee` delivers every burst (non-UTF-8 included) to every subscriber, byte-exact
+    /// and uncoalesced.
     #[test]
     fn byte_fanout_tees_every_burst_to_all_subscribers() {
         let fan = Arc::new(ByteFanout::new());
@@ -1905,6 +1963,7 @@ mod tests {
     }
 
     /// A full queue drops oldest and counts the dropped bytes; the newest burst
+    /// survives.
     #[test]
     fn byte_fanout_full_queue_drops_oldest_and_counts() {
         let fan = Arc::new(ByteFanout::with_budget(10));
@@ -1935,6 +1994,7 @@ mod tests {
     }
 
     /// The zero-subscriber early-out re-arms at each subscribe/drop edge: a subscriber
+    /// gets every burst teed after `subscribe` returns and none before.
     #[test]
     fn byte_fanout_zero_subscriber_fast_path_rearms_across_lifecycle() {
         let fan = Arc::new(ByteFanout::new());
@@ -1959,6 +2019,7 @@ mod tests {
     }
 
     /// The event kinds and payloads as written, oldest first: `o:<text>` and
+    /// `r:<cols>x<rows>`.
     fn kinds(rec: &CastRecorder) -> Vec<String> {
         listed(rec.events.iter())
     }
@@ -1974,6 +2035,7 @@ mod tests {
     }
 
     /// One reader hold: stamp the burst the way the reader does (inside the
+    /// hold, before its bytes), then process them.
     fn hold(term: &mut Terminal, cuts: &mut CastCuts, at: usize, bytes: &[u8]) {
         cuts.observe(at, term, &CastWatermark::default());
         term.process(bytes);
@@ -1985,6 +2047,7 @@ mod tests {
     }
 
     /// Burst A, a resize, then burst B in the engine: in every order the two threads
+    /// can reach the recorder's lock, it writes `A, r, B` with non-decreasing times.
     #[test]
     fn a_resize_processed_between_two_bursts_serializes_between_them() {
         let arrivals: [[u8; 3]; 3] = [[0, 1, 2], [1, 0, 2], [0, 2, 1]];
@@ -2020,6 +2083,7 @@ mod tests {
     }
 
     /// A burst split by a resize between the reader's slices is cut there: head
+    /// before the resize, tail after, in either arrival order.
     #[test]
     fn a_burst_straddling_a_resize_is_cut_at_the_slice() {
         for resize_first in [false, true] {
@@ -2085,6 +2149,8 @@ mod tests {
     }
 
     /// On the alternate screen a shrink demotes the top row, so order matters: the
+    /// engine-ordered recording replays to the live screen, while writing the resize
+    /// after a burst the engine processed first replays to a screen never shown.
     #[test]
     fn the_engine_ordered_recording_replays_to_the_live_screen() {
         const ROWS: u16 = 6;
@@ -2150,6 +2216,7 @@ mod tests {
     }
 
     /// Two engines in one session (a restored engine, new lifetime token): the newer
+    /// engine's events sort after the older's, and each engine's ordinals order its own.
     #[test]
     fn a_newer_engine_sorts_after_the_older_one() {
         let mut rec = CastRecorder::new(20, 8);
@@ -2167,6 +2234,8 @@ mod tests {
     }
 
     /// A recording stands against a cut as the engine and the recorder say: a hold or
+    /// a resize the screen shows that is not recorded leaves it behind, its record
+    /// makes it exact, and anything recorded after the cut puts it past.
     #[test]
     fn a_recording_holds_a_cut_behind_exactly_or_past() {
         let term = Mutex::new(Terminal::new(8, 20));
@@ -2220,6 +2289,7 @@ mod tests {
     }
 
     /// Parse one event line `[<f64>, "<code>", "<json-string>"]` into
+    /// `(t, code, unescaped_payload)`, as strictly as an asciinema-style reader.
     fn parse_event(line: &str) -> (f64, String, String) {
         let inner = line
             .strip_prefix('[')

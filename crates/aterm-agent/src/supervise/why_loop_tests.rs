@@ -1,12 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// `aterm drive replay --why` OVER A RECORDED LOOP (`run_tests.rs`'s
-// `why_loop` module): a run of the hosted loop's engine recorded over the
-// scripted worker — a read box approved by a safe rule, a question and an
-// idle point handed over — explained at each kind of point. Every assertion
-// is on the structured `Why` (`tape::explain`), never its rendering.
-
 use astream_effects::EffectRecord;
 
 use crate::supervise::policy::approval::{RULE_ALLOW_ONCE, RULE_READ_ONLY};
@@ -64,13 +58,7 @@ fn crosses(item: &Item, door: &str) -> bool {
     matches!(item.record(), Some(EffectRecord::Exchange { door: d, .. }) if d == door)
 }
 
-/// WHY DID IT PRESS 1? — the recorded approval explained from the tape
-/// alone: the judged screen and the box this build reads on it, the facts it
-/// was decided on with the door each came through, the act, its reply, the
-/// journal line; and the decision made again by this build's policy on
-/// those facts agrees with the recorded one, its trace naming the rule that
-/// decided — the very rule the recorded mark names — with nothing needed
-/// that the tape did not hold.
+/// WHY DID IT PRESS 1?
 #[test]
 fn why_explains_a_recorded_approval() {
     let (header, items) = recorded();
@@ -124,7 +112,6 @@ fn why_explains_a_recorded_approval() {
         w.facts
     );
     assert_eq!(w.recorded_by.as_deref(), Some(w.explained_by.as_str()));
-    // Rendered every way, and every way names the rule.
     for format in [Format::Text, Format::Md, Format::Html] {
         assert!(render(&w, format).contains(RULE_READ_ONLY), "{format:?}");
     }
@@ -179,11 +166,7 @@ fn a_fact_the_recording_build_did_not_write_is_named_in_needs() {
 /// A LOOK THE TAPE DOES NOT HOLD: the approval's git read (`probe.git_view`)
 /// taken off the tape, the re-decision asks the tape for it, finds nothing
 /// before the mark, decides the cautious way an unreadable look goes — and
-/// says the look among what it needed, so it does not agree in silence. Nor
-/// does it differ: a cautious answer to a look the tape lacks is no evidence
-/// of what the policy decides, so whether it agrees stays unknown (since
-/// d8e9fb9e1b, which made a missing look an unknown point of the shadow).
-/// The negative control of the keyed probe: with the record, it agrees.
+/// says the look among what it needed, so it does not agree in silence.
 #[test]
 fn a_look_the_tape_does_not_hold_is_named_and_decided_cautiously() {
     let (header, items) = recorded();
@@ -223,7 +206,7 @@ fn decided_cautiously_without_the_look(w: &Why) {
 /// it: the keyed probe stands where the recorded loop had read the records
 /// before the mark (astream's keyed view, bounded by that count), so the
 /// re-decision names the look it needed and decides cautiously, exactly as
-/// with the look gone. (The record left in its place is the control above.)
+/// with the look gone.
 #[test]
 fn a_look_recorded_after_the_point_is_not_an_answer() {
     let (header, mut items) = recorded();
@@ -249,8 +232,7 @@ fn a_look_recorded_after_the_point_is_not_an_answer() {
 /// that recorded it: the question handed over at its turn end is explained
 /// with the fold and reading the recorder noted, and a trace computed by
 /// replaying the tape to the mark, ending on the step that decided, each
-/// pass of the point named. On another build there is no trace, and the
-/// explanation says why.
+/// pass of the point named.
 #[test]
 fn a_turn_ends_trace_is_computed_in_a_replay_on_the_recording_build() {
     let (header, items) = recorded();
@@ -267,9 +249,6 @@ fn a_turn_ends_trace_is_computed_in_a_replay_on_the_recording_build() {
         steps.iter().any(|s| s.check.starts_with("pass:")),
         "each pass of the point named: {steps:#?}"
     );
-    // The trace is the replay's only where asked, and keeping it changes
-    // nothing the replay does: the same replay to the mark, asked for none,
-    // reports the same and keeps none.
     let bytes = written(&header, &items);
     let to_mark = Options {
         until: Some(w.mark),
@@ -319,8 +298,7 @@ fn a_turn_ends_trace_is_computed_in_a_replay_on_the_recording_build() {
 /// far as the tape alone goes: its screen, its act, its journal line and
 /// the build that recorded it, as the header writes it; there is no
 /// re-decision (no policy reads), and the explanation says why rather than
-/// refusing the tape. The control: under its own header the same point is
-/// decided again.
+/// refusing the tape.
 #[test]
 fn a_header_this_build_cannot_read_still_explains_what_the_tape_holds() {
     let (header, items) = recorded();
@@ -364,7 +342,7 @@ fn marked(items: &[Item], door: &str) -> Vec<u64> {
 /// build's value, and the explanation NAMES it among what the re-decision
 /// needed (`supplied by this build: [policy] approve`), its note saying the
 /// policy is the header's WITH what this build supplied, never the header's
-/// alone. The control: under the whole header nothing is supplied.
+/// alone.
 #[test]
 fn a_policy_key_the_header_lacks_is_named_as_supplied_by_this_build() {
     let (header, items) = recorded();
@@ -402,8 +380,6 @@ fn a_policy_key_the_header_lacks_is_named_as_supplied_by_this_build() {
 #[test]
 fn a_turn_end_cut_short_leaves_no_steps_in_the_next_ones_trace() {
     let mut m = script();
-    // The bare `meta` of the turn end at 104, after its read of the
-    // turn's history (`modes`, `offscreen`).
     m.by_index.insert(15, closed());
     let run = record_watch(&mut m, &auto(30), |_| {});
     let header = run.header.encode();
@@ -492,15 +468,7 @@ const LATE: i64 = 1_792_454_100_000;
 const EARLY: i64 = LATE + 600_000;
 
 /// `--at HH:MM` ACROSS MIDNIGHT: a tape whose approval was decided at 23:55
-/// and whose later decisions were made at 00:05 the next day. `--at 23:58`
-/// is the approval (the 00:05 decisions came after 23:58), and so is `--at
-/// 00:01` (the last decision at or before it is 23:55's) — a time is an
-/// instant on the tape's days, never a time of day compared alone; the
-/// explanation says when the decision was made, by the local clock. A time
-/// inside the run on neither day (noon, or 00:06 just after its end) is
-/// refused, asking for the day, and named with its day it is answered: the
-/// second day's is after every decision, the first day's noon before every
-/// one.
+/// and whose later decisions were made at 00:05 the next day.
 #[test]
 fn a_local_time_names_an_instant_on_a_tape_that_runs_past_midnight() {
     let (header, mut items) = recorded();
@@ -539,16 +507,12 @@ fn a_local_time_names_an_instant_on_a_tape_that_runs_past_midnight() {
 
 /// EACH DECISION'S LOCAL TIME IS READ BY THE OFFSET ITS OWN INSTANT HAD: a
 /// zone that left daylight saving between the approval (04:00Z, 00:00 at
-/// UTC−4) and the later decisions (06:30Z, 01:30 at UTC−5). `--at 01:45`
-/// is a later decision: read by the approval's offset (or today's, in
-/// summer) 06:30Z would be 02:30, after the time named, and the approval
-/// would be explained in its place. The zone is asked of the tape's
-/// instants only.
+/// UTC−4) and the later decisions (06:30Z, 01:30 at UTC−5).
 #[test]
 fn a_decisions_local_time_is_read_by_its_own_instants_offset() {
-    const BEFORE: i64 = 1_793_505_600_000; // 2026-11-01T04:00:00Z
-    const AFTER: i64 = BEFORE + 9_000_000; // 06:30:00Z
-    const CHANGE: i64 = 1_793_512_800; // 06:00:00Z
+    const BEFORE: i64 = 1_793_505_600_000;
+    const AFTER: i64 = BEFORE + 9_000_000;
+    const CHANGE: i64 = 1_793_512_800;
     let (header, mut items) = recorded();
     let split = approval_mark(&items);
     walls(&mut items, split, BEFORE, AFTER);
@@ -603,16 +567,7 @@ fn breaker_recorded(off: usize, spoil: impl FnOnce(&mut Mock)) -> (String, Vec<I
 /// A BOX WHOSE HEAD THE LOOP READ FROM THE HISTORY IS DECIDED AGAIN WHOLE:
 /// the rm breaker cut eight rows under its rule, joined by the loop with its
 /// head (`search`, a `line` read a row, the screen read again unmoved) and
-/// pressed `1` at full power. The explanation rebuilds the same join from
-/// the replies the tape holds — the same reader of them the loop has — and
-/// decides the box whole as the loop did: it agrees, needs nothing, and
-/// names the head's rows and the records they came through. The tape
-/// short of one of those reads: the join is not rebuilt, and the
-/// explanation names it among what it needed. NEGATIVE CONTROLS, where
-/// the loop searched but did not join (a transcript row under the rule,
-/// the screen's generation moving under the reads): the
-/// loop decided the cut, and so does the explanation — it agrees, and names
-/// no head among what it needed, where the loop read none.
+/// pressed `1` at full power.
 #[test]
 fn a_box_head_read_from_the_history_is_rebuilt_from_the_tape() {
     let (header, items) = breaker_recorded(8, |_| {});
@@ -636,9 +591,6 @@ fn a_box_head_read_from_the_history_is_rebuilt_from_the_tape() {
         "{:#?}",
         w.facts
     );
-    // The tape short of a read the join was made on (the head's first
-    // row's `line`): the join is not rebuilt, the explanation says so among
-    // what it needed, and decides the cut — not as the loop decided.
     let first_line = items
         .iter()
         .position(|i| match i.record() {
@@ -661,19 +613,45 @@ fn a_box_head_read_from_the_history_is_rebuilt_from_the_tape() {
     );
     assert_eq!(w.agrees, Some(false), "{:?}", w.decided);
     type Spoil = fn(&mut Mock);
-    let controls: [(&str, Spoil); 2] = [
-        ("a transcript row under the rule", |m| {
-            if let Some(h) = m.scrollback.as_mut() {
-                let at = h.len() - 2;
-                h.insert(at, "⏺ Bash(rm -rf /)".to_string());
-            }
-        }),
-        ("the generation moving", |m| {
-            m.key_releases = None;
-            m.screens.truncate(1);
-        }),
+    let controls: [(&str, Spoil, bool); 3] = [
+        (
+            "a transcript row under the rule",
+            |m| {
+                if let Some(h) = m.scrollback.as_mut() {
+                    let at = h.len() - 2;
+                    h.insert(at, "⏺ Bash(rm -rf /)".to_string());
+                }
+            },
+            false,
+        ),
+        (
+            "the box changed under the reads",
+            |m| {
+                m.key_releases = None;
+                let other = m.screens[0]
+                    .iter()
+                    .map(|r| {
+                        if r == "   2. No" {
+                            "   2. No, and tell Claude what to do differently".to_string()
+                        } else {
+                            r.clone()
+                        }
+                    })
+                    .collect();
+                m.screens.insert(1, other);
+            },
+            false,
+        ),
+        (
+            "the generation moving",
+            |m| {
+                m.key_releases = None;
+                m.screens.truncate(1);
+            },
+            true,
+        ),
     ];
-    for (what, spoil) in controls {
+    for (what, spoil, joined) in controls {
         let (header, items) = breaker_recorded(8, spoil);
         let seq = *marked(&items, doors::DECIDE_APPROVAL)
             .first()
@@ -694,8 +672,9 @@ fn a_box_head_read_from_the_history_is_rebuilt_from_the_tape() {
             w.decided,
             w.recorded_outcome
         );
-        assert!(
-            !w.facts.iter().any(|f| f.name == "box_head"),
+        assert_eq!(
+            w.facts.iter().any(|f| f.name == "box_head"),
+            joined,
             "{what}: {:#?}",
             w.facts
         );
@@ -706,9 +685,7 @@ fn a_box_head_read_from_the_history_is_rebuilt_from_the_tape() {
 /// `python3 tools/report.py` as a read by its own `--allow-python` glob
 /// approves the box by the read-only rule, and the explanation — deciding
 /// it again under the globs the header carries, as the loop decides with
-/// them (`SuperviseOpts::allow`: the run's, else the defaults) — agrees. The
-/// control: the same tape under a header that carries no glob decides
-/// otherwise, so the globs are what the agreement stands on.
+/// them (`SuperviseOpts::allow`: the run's, else the defaults) — agrees.
 #[test]
 fn the_runs_python_globs_reach_the_decision_made_again() {
     let mut m = fenced(vec![

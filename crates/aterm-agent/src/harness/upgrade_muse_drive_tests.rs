@@ -53,6 +53,7 @@ fn fixture_rows(text: &str) -> Vec<String> {
 }
 
 /// The relaunched Muse Code at rest on its replayed turn: 1.4.10's end of a
+/// turn, the cursor on its empty caret row.
 fn muse_idle() -> String {
     let rows = fixture_rows(aterm_phase::muse::fixtures::END_OF_TURN_1_4_10);
     let caret = rows
@@ -72,6 +73,9 @@ fn shell_after() -> String {
 }
 
 /// The shell integration's last two blocks: the command that ran the Muse
+/// (block 7) finished with `exit`, then the prompt entering — `word` false:
+/// the prompt not back yet; `later`: another command's block (9, a failure)
+/// the newest since.
 fn blocks(exit: i64, word: bool, later: bool) -> String {
     let entering = r#"{"id":8,"state":"entering","exit":null,"prompt":4,"cmd":4,"cmdcol":2,"out":null,"end":null,"cmdline":""}"#;
     if !word {
@@ -86,6 +90,8 @@ fn blocks(exit: i64, word: bool, later: bool) -> String {
 }
 
 /// The shell's blocks once the relaunch line ran in block 8 (the prompt
+/// block [`blocks`] names newest): `exit` `None` while its Muse runs, else
+/// that line's status and the prompt after it.
 fn line_blocks(exit: Option<i64>) -> String {
     let line = r#""cmdline":" ( cd -- '/w/proj' && XDG_DATA_HOME=/h exec '/p/agents/muse' 'resume' 's1' )""#;
     match exit {
@@ -99,6 +105,8 @@ fn line_blocks(exit: Option<i64>) -> String {
 }
 
 /// What the stand-in serves once the relaunch line is typed, which a test
+/// may change between attempts: `None` serves as before the line (the
+/// screen: 1.4.10 idle at the end of a turn).
 #[derive(Default)]
 struct After {
     /// The relaunched Muse's screen.
@@ -120,6 +128,7 @@ struct World {
 }
 
 /// A control socket at `<dir>/t.sock` standing in for the aterm instance of
+/// [`TAB`], and the requests it was asked, in order.
 fn instance(dir: &Path, w: World) -> (String, crate::harness::FakeInstanceLog) {
     crate::harness::fake_instance(&dir.join("t.sock"), TOKEN, move |line| {
         let verb = line
@@ -164,6 +173,8 @@ fn instance(dir: &Path, w: World) -> (String, crate::harness::FakeInstanceLog) {
 }
 
 /// The scripted kernel: [`TUI`] was [`SHELL`]'s foreground job and has
+/// exited; its relaunch [`NEW`] appears under the shell when its line is
+/// typed, holding the session's lock.
 struct Script {
     exited: Arc<AtomicBool>,
     relaunched: Arc<AtomicBool>,
@@ -177,11 +188,13 @@ struct Script {
 }
 
 /// What a test varies about the relaunch, each `false`/`None` as the plain
+/// relaunch goes.
 #[derive(Clone, Debug, Default)]
 struct Knobs {
     /// The host's roster never shows [`NEW`] leading the tab.
     out_of_tab: bool,
     /// [`NEW`] is listed under the shell but gone at once (a resume Muse
+    /// refused, a crash at its start).
     new_dies: bool,
     /// No `muse` ever comes up under the shell.
     noappear: bool,
@@ -194,6 +207,7 @@ struct Knobs {
     /// Who holds the session's lock cannot be read.
     holders_unreadable: bool,
     /// Another live process ([`OTHER`]) holds the lock from this read of
+    /// it on (1 the first).
     holder_from_read: Option<usize>,
 }
 
@@ -312,6 +326,8 @@ impl MuseKernel for Script {
 }
 
 /// The session's log as 1.4.10 writes its lifecycle: its start (naming the
+/// workspace), then a clean end (`clean`), or none (`crash`), or nothing at
+/// all (`none`: no log).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Log {
     Clean,
@@ -333,6 +349,8 @@ fn log_text(log: Log) -> Option<String> {
 }
 
 /// One scripted rig: a data home with the session's lock and log, a managed
+/// store build and its twin, the state directory, the stand-in instance and
+/// the kernel.
 struct Rig {
     dir: ScratchDir,
     opts: Opts,
@@ -344,11 +362,14 @@ struct Rig {
     twin: PathBuf,
     after: Arc<Mutex<After>>,
     /// The harness's waits on the test's thread run on their own steps
+    /// ([`crate::harness::relaunch::virtual_waits`]): every stand-in here answers at once.
     _waits: crate::harness::relaunch::VirtualWaits,
 }
 
 impl Rig {
     /// `status`: the exit status the shell's block names; `word`, `later` as
+    /// [`blocks`]; `lock_names`: the lock still names the Muse's pid (a
+    /// clean `/exit` truncates it).
     fn new(name: &str, status: i64, word: bool, later: bool, log: Log, lock_names: bool) -> Rig {
         let dir = scratch(name);
         let base = std::fs::canonicalize(&*dir).expect("canonical scratch");
@@ -442,6 +463,9 @@ impl Rig {
     }
 
     /// The snapshot the host took of the Muse while it ran: launched by its
+    /// store path with the stub's `--base-url`, `--yolo` and a Session Name,
+    /// its session `session` (`None`: no witness), its workspace read off the
+    /// log, the block it ran in.
     fn snap(&self, session: Option<&str>) -> Snapshot {
         Snapshot {
             stored_login: false,
@@ -510,6 +534,12 @@ impl Drop for Rig {
 }
 
 /// A CRASH (SIGKILL, 137) IS RELAUNCHED ON ITS SESSION, IN ITS WORKSPACE, ON
+/// THE MANAGED TWIN: the line `cd`s to the session's workspace and types the
+/// twin `resume <uuid>` with the launch's `--base-url` carried, behind the
+/// data home the process ran under — never the store path argv[0] named, its
+/// `--yolo` or its Session Name — and once the relaunched Muse holds the
+/// session and reads idle, the continuation is typed and submitted
+/// (`continued`).
 #[test]
 fn a_crashed_muse_is_relaunched_on_its_session_in_its_workspace() {
     let rig = Rig::new("crash", 137, true, false, Log::Crash, true);
@@ -568,6 +598,8 @@ fn a_crashed_muse_is_relaunched_on_its_session_in_its_workspace() {
 }
 
 /// The exit's word is the shell's: the finished block that ends where the
+/// entering prompt begins, its `exit` — of the block the Muse ran in where
+/// the snapshot named it.
 #[test]
 fn the_muse_exit_is_read_off_its_command_block() {
     assert_eq!(
@@ -601,6 +633,7 @@ fn the_muse_exit_is_read_off_its_command_block() {
 }
 
 /// ITS OWN EXIT AND SOMEONE'S SIGINT OR SIGTERM ARE LEFT, and so is a start
+/// Muse REFUSED (1, 2): never retried as a crash (critic X4).
 #[test]
 fn an_own_exit_a_signal_and_a_refused_start_are_never_relaunched() {
     for (status, want) in [
@@ -644,6 +677,8 @@ fn an_own_exit_a_signal_and_a_refused_start_are_never_relaunched() {
 }
 
 /// NO SHELL WORD: the witnessed session's own log decides at the attempt —
+/// its clean end left, its start with no end relaunched — and with no
+/// witness, or no log either, nothing is relaunched.
 #[test]
 fn with_no_shell_word_the_sessions_log_decides() {
     for (log, witnessed, want) in [
@@ -665,6 +700,8 @@ fn with_no_shell_word_the_sessions_log_decides() {
 }
 
 /// A crash whose process held no proven session is relaunched by nothing
+/// (a fresh `muse` would start another session), and neither is one whose
+/// session's directory is gone.
 #[test]
 fn no_witness_no_relaunch() {
     let rig = Rig::new("unwitnessed", 137, true, false, Log::Crash, true);
@@ -685,6 +722,9 @@ fn no_witness_no_relaunch() {
 }
 
 /// A TAB'S OWN MUSE CODE (`aterm -e muse`, `exec muse`: shell
+/// [`crate::harness::relaunch::NO_SHELL`]) that crashed is relaunched by
+/// nothing: no shell is left in its tab to type the line into, and its plan
+/// is refused for good, never waited on.
 #[test]
 fn a_tabs_own_muse_is_relaunched_by_nothing() {
     use crate::harness::relaunch::NO_SHELL;
@@ -715,6 +755,7 @@ fn a_tabs_own_muse_is_relaunched_by_nothing() {
 }
 
 /// A SESSION ANOTHER LIVE PROCESS HOLDS opens Muse Code's picker, never a
+/// resume: the relaunch waits, nothing typed.
 #[test]
 fn a_held_session_is_never_typed_at() {
     let mut rig = Rig::new("held", 137, true, false, Log::Crash, true);
@@ -728,6 +769,8 @@ fn a_held_session_is_never_typed_at() {
 }
 
 /// A launch whose flags a relaunch cannot carry is refused with its word,
+/// nothing typed; a store build with no twin to type is relaunched by
+/// nothing.
 #[test]
 fn an_uncarryable_launch_and_a_missing_twin_are_refused() {
     let rig = Rig::new("worktree", 137, true, false, Log::Crash, true);
@@ -769,6 +812,7 @@ fn an_uncarryable_launch_and_a_missing_twin_are_refused() {
 }
 
 /// THE WITNESS: the one session-depth lock the process holds open whose body
+/// names its pid; a subagent's lock and a truncated one name nothing.
 #[test]
 fn the_witness_is_the_held_lock_naming_the_pid() {
     let rig = Rig::new("witness", 0, true, false, Log::Crash, true);
@@ -880,6 +924,8 @@ fn rig_kernel(rig: &Rig) -> Script {
 }
 
 /// THE FOLLOW: `/new` truncates the lock it leaves and writes the pid into
+/// the new session's, which the follow takes (no `lsof`), with that
+/// session's workspace; an unmoved lock costs one read.
 #[test]
 fn the_follow_moves_with_new() {
     let rig = Rig::new("follow", 0, true, false, Log::Crash, true);
@@ -909,6 +955,8 @@ fn the_follow_moves_with_new() {
 }
 
 /// A RESTORED LAYOUT'S RELAUNCH (aterm's own end): no shell word is asked,
+/// the session is found again by its id wherever its date shard is, and the
+/// relaunch says aterm ended.
 #[test]
 fn aterm_ending_relaunches_the_restored_session() {
     let rig = Rig::new("host", 0, true, false, Log::Clean, false);
@@ -930,6 +978,8 @@ fn aterm_ending_relaunches_the_restored_session() {
 }
 
 /// The records are the lane's: keyed `muse-<tab>`, read back by their tab,
+/// never a Claude Code conversation's key; a settled record of a tab proven
+/// gone, unwritten a week, is pruned.
 #[test]
 fn records_are_keyed_by_tab_and_pruned_once_gone() {
     assert_eq!(key(TAB), format!("muse-{TAB}"));
@@ -991,6 +1041,8 @@ fn records_are_keyed_by_tab_and_pruned_once_gone() {
 }
 
 /// A rig for the relaunch's own end: the crash relaunched (`hand_back` as
+/// the host types it), its waits short — every one here ends on its bound
+/// only where nothing is ever coming.
 fn relaunch_rig(name: &str, hand_back: bool, knobs: Knobs) -> Rig {
     let mut rig = Rig::new(name, 137, true, false, Log::Crash, true);
     rig.opts.hand_back = hand_back;
@@ -1037,6 +1089,11 @@ impl Rig {
 }
 
 /// A RESUME MUSE REFUSED IS NEVER TYPED AGAIN (critic X4, the review's
+/// first finding): the relaunched Muse came up under the shell and was gone
+/// before it led the tab — its line's own block then said `1` (`retained
+/// session not found`, `has no saved log`) — and the exit's next attempt,
+/// closing that record as gone before its continuation, reads that line's
+/// word: `refused:resume-refused`, the line typed once.
 #[test]
 fn a_relaunch_muse_refused_is_never_typed_again() {
     for (exit, want, lines) in [
@@ -1081,6 +1138,11 @@ fn a_relaunch_muse_refused_is_never_typed_again() {
 }
 
 /// A RELAUNCH THAT NEVER COMES UP is decided by its line's own end AT ONCE
+/// — Muse refused it (`1`): `refused:resume-refused`, never waited out to
+/// the stale bound and typed again — and one whose line still runs past
+/// that bound with no Muse found relaunches nothing more
+/// (`refused:relaunch-unwitnessed`: a Muse it started may run there unseen,
+/// and a second line would open its picker).
 #[test]
 fn a_relaunch_that_never_comes_up_is_never_typed_again_but_on_a_crash() {
     let knobs = Knobs {
@@ -1126,6 +1188,9 @@ fn a_relaunch_that_never_comes_up_is_never_typed_again_but_on_a_crash() {
 }
 
 /// THE TYPING FENCE NAMES WHAT IT REFUSES, each arm on its own (the review of
+/// the rehome: Muse's reader draws no composer under a box, so the box case
+/// above was refused as a draft whatever the box arm said): a box `box`, a
+/// turn running or stopping `busy`, a draft `draft`.
 #[test]
 fn the_typing_fence_names_what_it_refuses() {
     use aterm_phase::muse::fixtures as fx;
@@ -1156,6 +1221,11 @@ fn the_typing_fence_names_what_it_refuses() {
 }
 
 /// NOTHING IS TYPED INTO A RELAUNCHED MUSE THAT IS NOT IDLE, EMPTY AND
+/// UNHELD: a turn running (1.4.10's status row), a draft in its composer, a
+/// box over it, its run still stopping (`interrupting run`), an idle read
+/// with no evidence, a person's hand within the grace, a process the
+/// host's roster does not show leading the tab, or one that does not hold
+/// the session's lock — each leaves the continuation untyped.
 #[test]
 fn no_continuation_into_a_busy_drafted_or_held_muse() {
     use aterm_phase::muse::fixtures as fx;
@@ -1246,6 +1316,9 @@ fn no_continuation_into_a_busy_drafted_or_held_muse() {
 }
 
 /// ONLY OUR OWN RELAUNCH IS ADOPTED: a `muse` under the shell resuming
+/// another session, or one resuming this session that is no child of the
+/// shell the line was typed at, is never taken for the relaunch — nothing
+/// adopted, nothing typed into it.
 #[test]
 fn only_the_lines_own_muse_is_adopted() {
     let other_session = Knobs {
@@ -1281,6 +1354,9 @@ fn only_the_lines_own_muse_is_adopted() {
 }
 
 /// WHO HOLDS THE SESSION IS READ RIGHT BEFORE THE LINE TOO: a holder that
+/// appears after the relaunch's first look (a person's own `muse resume`
+/// elsewhere) leaves the line untyped, and so does a lock whose holders
+/// cannot be read (read as held, never as free).
 #[test]
 fn the_sessions_holders_are_read_again_right_before_the_line() {
     for (name, knobs, want) in [
@@ -1317,6 +1393,9 @@ fn the_sessions_holders_are_read_again_right_before_the_line() {
 }
 
 /// THE EXPLICIT RESTART IS NOT CARRIED FOR A MUSE CODE (the review of the
+/// lane): what a SIGTERM does to one mid-turn — the stall's case — is
+/// unmeasured, so the act answers `restart unavailable` and the stall's
+/// remedy warns instead of ending it.
 #[test]
 fn the_explicit_restart_is_not_carried_for_a_muse() {
     let rig = Rig::new("restart", 137, true, false, Log::Crash, true);
@@ -1330,6 +1409,9 @@ fn the_explicit_restart_is_not_carried_for_a_muse() {
 }
 
 /// Each agent's foreground process goes to its own lane's reader: agy to the
+/// agy lane's and an image itself named `gemini` to none ([`NO_LANE`]: Gemini
+/// CLI runs as `node`, read by its argv) — never to the Muse Code lane's, nor
+/// read as Claude Code.
 #[test]
 fn each_image_goes_to_its_own_lanes_reader() {
     use crate::harness::relaunch::{SnapshotLane, snapshot_lane};
@@ -1350,6 +1432,14 @@ fn each_image_goes_to_its_own_lanes_reader() {
 }
 
 /// Tier-1 of `HarnessMuseExitWitness` (aterm-models-harness
+/// `harness_muse_exit_witness_model`): every look of the model — a crash
+/// (`137`), its own exit (`0`, its lock truncated), someone's signal
+/// (`143`), a refused start's status (`1`); witnessed or not; the shell's
+/// word drawn, not yet, or another command's block newest since — is
+/// replayed through the real `look_at_exit` and `exit_record` over a
+/// stand-in tab, and keeps what the model's does; every attempt goes through
+/// the real `after_exit`, the session's log on disk as the exit writes it,
+/// and relaunches exactly where the model's `Decide` does.
 #[test]
 fn tier1_the_real_muse_exit_read_conforms_to_the_model() {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};

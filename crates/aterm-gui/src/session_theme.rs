@@ -2,28 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Per-session themes: one tab (or pane) drawn in a theme of its own.
-//!
-//! A session draws, in precedence order ([`App::session_draw`]):
-//!
-//! 1. its own theme ([`SessionTheme`], on the pool entry): `theme session set`
-//!    on the control socket, `spawn theme=`, a split from a pane that has one,
-//!    the command palette's Choose Tab Theme, or what a seamless update or a
-//!    restore carried;
-//! 2. else the instance's theme (and its preview).
-//!
-//! A session theme resolves through the same [`Config::resolved_colors`] the
-//! instance does, with its selector as the candidate, so the config's colour
-//! keys still apply over it. One that does not draw (a deleted theme file)
-//! draws the instance's and says why (`miss=`), keeping its selector so it
-//! comes back with the file.
-//!
-//! What a session theme recolours is what its ENGINE holds: the cells, the
-//! pane's background and padding, the cursor, the selection, the 256-colour
-//! palette, and what DSR 996 / mode 2031 report to its program. The window
-//! chrome — tab strip, band, dividers, sparkle, rain — follows the instance
-//! theme.
-//!
-//! [`Config::resolved_colors`]: crate::app_config::Config::resolved_colors
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -114,9 +92,7 @@ impl SessionDraw {
     }
 }
 
-/// The palette's Choose Tab Theme… while it is open: the window whose
-/// palette drives it, the session it draws on, and the theme it had before,
-/// which any close but Enter puts back.
+/// The palette's Choose Tab Theme… while it is open: the window whose palette drives it, the session it draws on, and the theme it had before, which any close but Enter puts back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TabThemeTrial {
     pub(crate) window: crate::WindowId,
@@ -135,11 +111,7 @@ struct SessionApply {
 }
 
 impl App {
-    /// Session `sid`'s own theme as it would be kept: under an open Choose
-    /// Tab Theme… trial on it, the theme it had before the trial (the
-    /// highlight is tentative until Enter), else the pool's. What a layout
-    /// capture writes, so an autosave, a seamless update or a crash-restore
-    /// taken while the palette is open never makes a highlight permanent.
+    /// Session `sid`'s own theme as it would be kept: under an open Choose Tab Theme… trial on it, the theme it had before the trial (the highlight is tentative until Enter), else the pool's.
     pub(crate) fn kept_session_theme(&self, sid: u64) -> Option<&SessionTheme> {
         match &self.palette_tab_theme {
             Some(trial) if trial.session == sid => trial.prior.as_ref(),
@@ -156,8 +128,7 @@ impl App {
         })
     }
 
-    /// Resolve `selector` as a session theme for the live appearance: the
-    /// colours, or why it does not draw.
+    /// Resolve `selector` as a session theme for the live appearance: the colours, or why it does not draw.
     pub(crate) fn resolve_session_selector(
         &self,
         selector: &str,
@@ -172,19 +143,11 @@ impl App {
         );
         match &colors.source {
             ThemeSource::DefaultFallback { reason } => Err(reason.clone()),
-            // A session selector never resolves through the pack; the arm
-            // is the preview's.
             ThemeSource::Builtin | ThemeSource::File(_) | ThemeSource::Pack(_) => Ok(colors),
         }
     }
 
-    /// The light/dark side a new session's shell is told it runs on (its
-    /// `COLORFGBG`, Windows): that of the theme the session will draw, by
-    /// [`Self::session_draw`]'s precedence, its own `theme` (asked, inherited
-    /// by a split, restored).
-    /// `None` when it will draw the instance's, whose side the factory already
-    /// carries. Decided at booking, since the session's theme lands only after
-    /// its shell has started.
+    /// The light/dark side a new session's shell is told it runs on (its `COLORFGBG`, Windows): that of the theme the session will draw, by [`Self::session_draw`]'s precedence, its own `theme` (asked, inherited by a split, restored).
     #[cfg(any(windows, test))]
     pub(crate) fn spawn_shell_appearance(
         &self,
@@ -196,10 +159,7 @@ impl App {
             .map(|colors| colors.reported)
     }
 
-    /// The instance's session factory for a fresh shell whose session will
-    /// draw `theme`: told that theme's side
-    /// ([`Self::spawn_shell_appearance`]). A spawn that books off the loop sets
-    /// the same field on its own copy (`tab_spawn`).
+    /// The instance's session factory for a fresh shell whose session will draw `theme`: told that theme's side ([`Self::spawn_shell_appearance`]).
     #[cfg(windows)]
     pub(crate) fn shell_factory(&self, theme: Option<&str>) -> crate::spawn::SessionFactory {
         crate::spawn::SessionFactory {
@@ -208,8 +168,7 @@ impl App {
         }
     }
 
-    /// What session `sid` draws: precedence own > instance; a
-    /// choice that does not draw falls back to the instance.
+    /// What session `sid` draws: precedence own > instance; a choice that does not draw falls back to the instance.
     pub(crate) fn session_draw(&self, sid: u64) -> SessionDraw {
         let Some(choice) = self.session_choice(sid) else {
             return SessionDraw::Instance;
@@ -231,10 +190,7 @@ impl App {
         }
     }
 
-    /// How many live sessions draw a theme of their own: what an instance
-    /// preview does not reach (`pinned=`). Read off what the last install put
-    /// on each engine (`own_colors`), so the polled status line resolves
-    /// nothing.
+    /// How many live sessions draw a theme of their own: what an instance preview does not reach (`pinned=`).
     pub(crate) fn pinned_session_count(&self) -> usize {
         self.pool
             .ids()
@@ -247,8 +203,7 @@ impl App {
     /// session drawing its own theme applies it when it differs from the one
     /// it last applied; one drawing the instance's applies `instance` when
     /// that moved (`instance_changed`) or when it has just left a theme of
-    /// its own. Selectors resolve once per install, however many sessions
-    /// share one.
+    /// its own.
     fn session_color_plan(
         &self,
         sids: &[u64],
@@ -287,9 +242,7 @@ impl App {
 
     /// Carry out a plan: each session's `apply_config` and, in the SAME
     /// critical section, the `CSI ? 997 ; Ps n` push it queued when the
-    /// session's reported scheme moved and its program set mode 2031. Returns
-    /// how many sessions applied a theme of their own, and how many applied
-    /// anything.
+    /// session's reported scheme moved and its program set mode 2031.
     fn apply_session_colors(&mut self, plan: Vec<SessionApply>) -> (u64, u64) {
         let (mut own_applies, mut applies) = (0u64, 0u64);
         for SessionApply { sid, apply, own } in plan {
@@ -299,27 +252,13 @@ impl App {
                 let push = {
                     let mut term = crate::term_lock(&session.term);
                     let changes = term.apply_config(&tc);
-                    // The crash-restore journal's fingerprint, in this hold: a
-                    // restore under another config is not called exact.
                     session.ctx.crash_journal.host_settings(&term, Some(&tc));
-                    // The unsolicited `CSI ? 997 ; Ps n` is queued only when the
-                    // reported scheme moved AND the program enabled mode 2031;
-                    // take nothing otherwise, so a pending reply the reader owns
-                    // stays put.
                     (changes.contains(&aterm_core::config::ConfigChange::ColorScheme)
                         && term.report_color_scheme_enabled())
                     .then(|| term.take_response())
                     .flatten()
                 };
                 if let Some(push) = push {
-                    // The route every report takes (`write_ui_report`): the UI
-                    // thread only enqueues it behind earlier input, or writes it
-                    // through the egress that never parks — never the blocking
-                    // write, which would park this thread (and every window) on a
-                    // program that has stopped reading, at the spill cap or on a
-                    // parked paste's fd lock (2026-09-26). A refusal (a full
-                    // queue) or a closed PTY just drops the report: it is
-                    // advisory.
                     crate::app_input::write_ui_report(
                         &session.term,
                         &session.ctx.modes,
@@ -338,10 +277,7 @@ impl App {
         (own_applies, applies)
     }
 
-    /// Install every session's colours for an install whose instance
-    /// projection is `instance` (`instance_changed`: it differs from the one
-    /// installed before). Returns how many sessions applied a theme of their
-    /// own.
+    /// Install every session's colours for an install whose instance projection is `instance` (`instance_changed`: it differs from the one installed before).
     pub(crate) fn install_session_fanout(
         &mut self,
         instance: &Arc<TerminalConfig>,
@@ -351,10 +287,7 @@ impl App {
         self.apply_session_colors(plan).0
     }
 
-    /// Bring ONE session up to what it draws now: after its own theme was set
-    /// or cleared, and when it joins the pool (a spawn, a split, an adoption,
-    /// a restore). A session that draws the instance's theme and never drew
-    /// its own changes nothing.
+    /// Bring ONE session up to what it draws now: after its own theme was set or cleared, and when it joins the pool (a spawn, a split, an adoption, a restore).
     pub(crate) fn install_session_colors(&mut self, sid: u64) {
         let instance = Arc::new(
             self.config
@@ -363,8 +296,6 @@ impl App {
         let plan = self.session_color_plan(&[sid], &instance, false);
         let (own_applies, applies) = self.apply_session_colors(plan);
         if applies > 0 {
-            // The cells re-coloured under an unchanged chrome. Sparkle and rain
-            // read the palette.
             self.sparkle_dirty = true;
             self.rain_dirty = true;
             self.request_redraw_all_windows();
@@ -372,10 +303,7 @@ impl App {
         aterm_log::debug!("session theme install: session={sid} own_applies={own_applies}");
     }
 
-    /// Take a session into the pool and bring it up to the theme it draws
-    /// ([`Self::install_session_colors`]): every production insertion goes
-    /// through here, so a carried theme is on the engine
-    /// before its reader runs.
+    /// Take a session into the pool and bring it up to the theme it draws ([`Self::install_session_colors`]): every production insertion goes through here, so a carried theme is on the engine before its reader runs.
     pub(crate) fn pool_insert(&mut self, session: crate::Session) -> u64 {
         let sid = self.pool.insert(session);
         self.install_session_colors(sid);
@@ -388,12 +316,7 @@ impl App {
         self.install_session_colors(sid);
     }
 
-    /// `session_theme=<selector>|- theme_origin=<word>|instance`: the session
-    /// `status` fields, the selector percent-encoded, so a
-    /// name with spaces stays one field.
-    ///
-    /// Polled, so it resolves nothing: whether the session draws its choice is
-    /// read off what the last install put on its engine (`own_colors`).
+    /// `session_theme=<selector>|- theme_origin=<word>|instance`: the session `status` fields, the selector percent-encoded, so a name with spaces stays one field.
     pub(crate) fn session_theme_fields(&self, sid: u64) -> String {
         let choice = self.session_choice(sid);
         let theme = choice.as_ref().map_or_else(

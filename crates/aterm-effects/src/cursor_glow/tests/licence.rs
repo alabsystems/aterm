@@ -17,9 +17,6 @@ fn rainbow_ribbon_survives_word_boundaries_and_keeps_its_head() {
     glow.note_context(true);
     let t0 = Instant::now();
     glow.tick(Some((2, 0)), t0, &c, g, &mut scratch);
-    // The grid's stored row (what the trimmed probe capture shows): a glyph
-    // echo stores its cell; a space echoed over an implicit blank leaves the
-    // trimmed capture unchanged.
     let mut stored: Vec<char> = Vec::new();
     let mut segments_after_space = 0usize;
     for (i, ch) in ['a', 'b', ' ', 'c', 'd'].into_iter().enumerate() {
@@ -60,8 +57,7 @@ fn rainbow_ribbon_survives_word_boundaries_and_keeps_its_head() {
 /// Mash typing keeps the ribbon: several presses inside one frame slip stamp as
 /// many cell credits, and the coalesced multi-cell echo is priced against that
 /// budget, so it classifies as continued typing (`rainbow_coalesce`) and lays
-/// every swept cell. Drives 12 presses at 3 per frame and asserts the band grows
-/// every frame, ends long, and records no decline.
+/// every swept cell.
 #[test]
 fn rainbow_ribbon_survives_a_three_per_frame_mash() {
     use std::fmt::Write as _;
@@ -80,13 +76,9 @@ fn rainbow_ribbon_survives_a_three_per_frame_mash() {
     for frame in 0..4usize {
         let base_col = (frame * 3) as u16;
         let frame_t = t0 + Duration::from_millis(frame as u64 * 16 + 1);
-        // Three presses inside one frame slip, each banking its own cell
-        // credit at the input boundary.
         for k in 0..3usize {
             glow.note_typed_cells(frame_t + Duration::from_millis(k as u64 * 3), 1);
         }
-        // One coalesced echo batch materializes all three glyphs and one
-        // rendered frame observes it.
         stored.extend_from_slice(&glyphs[frame * 3..frame * 3 + 3]);
         let probe_at = frame_t + Duration::from_millis(12);
         glow.observe_row_with_trust(2, base_col + 3, &stored, probe_at, ProbeTrust::ContentOnly);
@@ -109,8 +101,6 @@ fn rainbow_ribbon_survives_a_three_per_frame_mash() {
         tally.licensed, 4,
         "each frame's coalesced echo is one licensed move. Observed: [{observed}]"
     );
-    // The ribbon climbs across the mash: every frame ends with more live
-    // typing sparks than the one before, and 12 presses leave a long band.
     for pair in segments_by_frame.windows(2) {
         assert!(
             pair[1] > pair[0],
@@ -127,21 +117,13 @@ fn rainbow_ribbon_survives_a_three_per_frame_mash() {
 
 /// Tier 1 for the licence: the real `CursorGlow` driven through the model's four
 /// states (press, echo, cold echo, expiry), with every observed step validated
-/// as a transition of `CursorHintLicense`. Every projected term is read from the
-/// engine (the seam `move_licensed` plus a stamp outliving its window, the
-/// diagnosis ring, whether light is on glass), so a seam, ring or denial path
-/// that drifted from the law fails here.
+/// as a transition of `CursorHintLicense`.
 #[test]
 fn the_real_glow_engine_conforms_to_the_licence_model() {
     let model = aterm_models_effects::cursor_hint_license_model();
     let g = geom();
     let c = cfg(GlowStyle::RainbowKitty, true);
 
-    // The engine → model projection. `arms`/`consumed` are the presses this
-    // test made and the echoes it saw paired with stamps; `forfeited` the
-    // credits it saw an edge forget; every other term, including the in-flight
-    // pool (`typed_credits_within`), is read off the engine, so the decline
-    // guards bind to the real ring.
     let project = |glow: &CursorGlow, now: Instant, arms: i64, consumed: i64, forfeited: i64| {
         let tally = glow.admission_tally();
         let live = glow.move_licensed(now);
@@ -162,13 +144,9 @@ fn the_real_glow_engine_conforms_to_the_licence_model() {
         st.insert("consumed", consumed);
         st.insert("forfeited", forfeited);
         st.insert("spent", arms - pool - forfeited);
-        // Conservation: an arm this test made, not paired with an echo, whose
-        // stamp is no longer live, expired.
         st.insert("expired", arms - consumed - i64::from(live));
         let licensed = i64::try_from(tally.licensed).expect("bounded tally");
         let declined = i64::try_from(tally.declined).expect("bounded tally");
-        // Every licensed row in this drive passed the licence seam
-        // (no starved coalesce is driven here).
         st.insert("admissions", licensed);
         st.insert("spawns", licensed + declined);
         st.insert("licensed_tally", licensed);
@@ -206,7 +184,6 @@ fn the_real_glow_engine_conforms_to_the_licence_model() {
         assert!(!ok, "{label}: the model must refuse this step");
     };
 
-    // ---- Press, echo, cold echo on one engine ----
     let t0 = Instant::now();
     let mut out = Vec::new();
     let mut glow = CursorGlow::default();
@@ -217,8 +194,6 @@ fn the_real_glow_engine_conforms_to_the_licence_model() {
     assert_eq!(seeded["resident"], 0, "and no light");
     assert_eq!(seeded["spawns"], 0, "a seed tick is not a move");
 
-    // Press: the host prices the keystroke at the input boundary; the stamp
-    // it writes is the licence.
     let press_at = t0 + Duration::from_millis(4);
     glow.note_typed_cells(press_at, 1);
     let armed = project(&glow, press_at, 1, 0, 0);
@@ -226,8 +201,6 @@ fn the_real_glow_engine_conforms_to_the_licence_model() {
     assert_eq!(armed["spent"], 0, "the press's credit is in flight");
     bind(&seeded, &armed, "PressArmsLicense", "CursorGlow press");
 
-    // Echo: the child echoes the glyph, the caret advances, and the move is
-    // licensed; light is born and the stamp is spent (one hint, one echo).
     let echo_at = press_at + Duration::from_millis(8);
     glow.tick(Some((2, 1)), echo_at, &c, g, &mut out);
     let echoed = project(&glow, echo_at, 1, 1, 0);
@@ -257,8 +230,6 @@ fn the_real_glow_engine_conforms_to_the_licence_model() {
         "CursorGlow one-hint-one-echo control",
     );
 
-    // Cold echo: the same caret advance with no finger behind it. The ring
-    // names the licence seam, nothing is born, and the pressed ribbon stays.
     let cold_at = echo_at + Duration::from_millis(8);
     glow.tick(Some((2, 2)), cold_at, &c, g, &mut out);
     let cold = project(&glow, cold_at, 1, 1, 0);
@@ -286,10 +257,6 @@ fn the_real_glow_engine_conforms_to_the_licence_model() {
         "CursorGlow retention control",
     );
 
-    // ---- Expiry on a fresh engine: the press in flight ----
-    // A late echo: the stamp is set but stale, and the press is still in
-    // flight, so its own +1 echo is licensed by the pool
-    // (`InFlightPressEchoMintsLight`) and the press is spent.
     let u0 = Instant::now();
     let mut idle = CursorGlow::default();
     idle.tick(Some((2, 0)), u0, &c, g, &mut out);
@@ -372,12 +339,6 @@ fn the_real_glow_engine_conforms_to_the_licence_model() {
         "InFlightPressEchoMintsLight",
         "CursorGlow non-spending control",
     );
-    // ---- One press in flight against a hop wider than one cell ----
-    // The same stale stamp and one press, and a keyless +2: refused (one press
-    // cannot buy two cells) with the credit kept for the insert receipt and
-    // the next key's bridge (`StaleStampMoveDeclines` at a pool of one,
-    // forfeiting nothing). The model has no hop width, so both this and the
-    // one-press echo are enabled at one press; the engine picks by width.
     let w0 = Instant::now();
     let mut wide = CursorGlow::default();
     wide.tick(Some((2, 0)), w0, &c, g, &mut out);
@@ -407,10 +368,6 @@ fn the_real_glow_engine_conforms_to_the_licence_model() {
         "CursorGlow one press, a wider hop: refused and kept",
     );
 
-    // ---- A stale stamp with no press in flight on a fresh engine ----
-    // One press, then a keyless backward hop the echo shape refuses (judged past
-    // the park window): the pool is forgotten, and the following +1 finds a stale
-    // stamp over an empty pool (`StaleStampMoveDeclines`).
     let s0 = Instant::now();
     let mut stale = CursorGlow::default();
     stale.tick(Some((2, 5)), s0, &c, g, &mut out);
@@ -473,12 +430,6 @@ fn the_real_glow_engine_conforms_to_the_licence_model() {
         "CursorGlow expiry control",
     );
 
-    // ---- The forget on a fresh engine (the in-flight law) ----
-    // Two presses in flight, both stamps stale, then a keyless backward hop the
-    // echo shape refuses: the ring forgets the pool with the refusal
-    // (`UnexplainedHopForgetsCredits`). The pool is read off the engine, so a
-    // ring that kept its credits (the model's `Buggy=1`) would project
-    // `forfeited = 0` and be refused.
     let f0 = Instant::now();
     let mut hop = CursorGlow::default();
     hop.tick(Some((2, 9)), f0, &c, g, &mut out);
@@ -490,8 +441,6 @@ fn the_real_glow_engine_conforms_to_the_licence_model() {
         i64::try_from(glow.typed_credits_within(now)).expect("bounded ring")
     };
     assert_eq!(pool(&hop, hop_at), 2, "two presses in flight");
-    // The model's state for two stale stamps in flight: the one-slot
-    // stamp superseded once, expired once, nothing consumed.
     let mut in_flight = model.init_state();
     in_flight.insert("hint", 2);
     in_flight.insert("arms", 2);
@@ -499,7 +448,6 @@ fn the_real_glow_engine_conforms_to_the_licence_model() {
     in_flight.insert("superseded", 1);
     in_flight.insert("expired", 1);
     hop.tick(Some((2, 2)), hop_at, &c, g, &mut out);
-    // Held as a park candidate first: judged past the park window.
     let hop_at = hop_at + past_park_window();
     hop.tick(Some((2, 2)), hop_at, &c, g, &mut out);
     assert_eq!(
@@ -531,17 +479,13 @@ fn the_real_glow_engine_conforms_to_the_licence_model() {
 
 /// Typing while a program streams: a `less`/`vi`/ESC 7-ESC 8 streamer saves,
 /// parks, writes a status line elsewhere and restores inside one parser batch,
-/// several times a second, while the user types. A batch moving no caret runs
-/// no spawn, so each press's stamp survives to its echo and the ribbon grows; a
-/// cold streamer caret walk between keys is declined and destroys nothing.
+/// several times a second, while the user types.
 #[test]
 fn typing_paints_through_the_esc7_esc8_streamer_cadence() {
     let g = geom();
     let c = cfg(GlowStyle::RainbowKitty, true);
     let mut scratch = typed_scratch();
     let mut glow = CursorGlow::default();
-    // The alt screen with no repaint blink — the probe class this lane
-    // actually presents.
     glow.note_context(true);
     let t0 = Instant::now();
     let row = 3u16;
@@ -555,28 +499,18 @@ fn typing_paints_through_the_esc7_esc8_streamer_cadence() {
         let col = i as u16;
         let at = t0 + Duration::from_millis(i as u64 * 120 + 1);
 
-        // The press.
         glow.note_typed_cells(at, 1);
 
-        // Before its echo, a whole streamer batch (ESC 7, park, status write,
-        // ESC 8): the caret is back where it was, so the frame presents no
-        // delta but does present a probe of the row the streamer touched.
         let streamed = at + Duration::from_millis(20);
         glow.observe_row_with_trust(0, 12, &status, streamed, ProbeTrust::ContentOnly);
         glow.tick(Some((row, col)), streamed, &c, g, &mut scratch);
 
-        // The echo, on the row the user is typing into.
         typed.push(ch);
         let echo = at + Duration::from_millis(40);
         glow.observe_row_with_trust(row, col + 1, &typed, echo, ProbeTrust::ContentOnly);
         glow.tick(Some((row, col + 1)), echo, &c, g, &mut scratch);
         segments.push(glow.ribbon_segments());
 
-        // A cold streamer caret walk after the press's window closed: declined,
-        // and the resident band (`Status::cells`) stays exactly as the keys
-        // left it. (The band's attach under the caret follows the caret mirror,
-        // which follows a declined row change at the end of its tick, so the
-        // lit-boundary count lags a frame; resident cells are untouched.)
         let cold = at + Duration::from_millis(100);
         let resident = |glow: &CursorGlow| glow.v2_status().map_or(0, |s| s.cells);
         let before = resident(&glow);
@@ -623,15 +557,7 @@ fn typing_paints_through_the_esc7_esc8_streamer_cadence() {
     assert!(glow.is_active(), "live ribbon ⇒ live engine");
 }
 
-/// The licence, denial side (`docs/design/EFFECTS-LICENSE-REDESIGN.md`). An
-/// unlicensed move is a cursor delta with no fresh key hint behind it. Both
-/// clauses hold:
-///
-/// 1. It mints nothing (no quad, spark, thermal, momentum, glide sample, sound
-///    cue or crown) in every shape a cold program can present and every
-///    selectable style, including the one-cell advance a token streamer walks.
-/// 2. It retires nothing: earned light leaves only by decay, `note_scroll`
-///    translation or reset, never because another program moved its caret.
+/// The licence, denial side (`docs/design/EFFECTS-LICENSE-REDESIGN.md`).
 #[test]
 fn an_unlicensed_move_mints_nothing_and_retires_nothing_in_every_style() {
     let g = geom();
@@ -647,9 +573,6 @@ fn an_unlicensed_move_mints_nothing_and_retires_nothing_in_every_style() {
         GlowStyle::Water,
         GlowStyle::Comet,
     ];
-    // Every shape a cold program presents: the one-cell advance a token
-    // streamer walks, a coalesced hop, a line wrap, a one-column retreat (a
-    // spinner rewinding), a row change, and a full-screen warp.
     let shapes: [((u16, u16), (u16, u16)); 6] = [
         ((2, 4), (2, 5)),
         ((2, 4), (2, 7)),
@@ -667,7 +590,6 @@ fn an_unlicensed_move_mints_nothing_and_retires_nothing_in_every_style() {
         warmth: 0.0,
     };
 
-    // Clause 1: a cold engine stays cold, whatever the shape or style.
     for style in styles {
         let c = cfg(style, true);
         for (from, to) in shapes {
@@ -675,7 +597,6 @@ fn an_unlicensed_move_mints_nothing_and_retires_nothing_in_every_style() {
             let mut out = Vec::new();
             let mut trail = CursorTrail::default();
             let mut trail_out = Vec::new();
-            // Seed the anchor, then present the cold delta 16 ms later.
             glow.tick(Some(from), t0, &c, g, &mut out);
             trail.tick(Some(from), t0, &trail_cfg, &mut trail_out);
             let cold = t0 + Duration::from_millis(16);
@@ -714,8 +635,6 @@ fn an_unlicensed_move_mints_nothing_and_retires_nothing_in_every_style() {
         }
     }
 
-    // Clause 2: earned light survives someone else's output. One licensed typed
-    // move lays light; each cold shape must then leave it exactly as it was.
     for style in styles {
         let c = cfg(style, true);
         for (_, to) in shapes {
@@ -740,8 +659,6 @@ fn an_unlicensed_move_mints_nothing_and_retires_nothing_in_every_style() {
                 earned_births > 0,
                 "{shape}: the licensed typed move must earn light to begin with"
             );
-            // The cold delta rides the same instant, so nothing may change by
-            // decay; any difference is the denial path destroying earned light.
             glow.tick(Some(to), typed, &c, g, &mut out);
             trail.tick(Some(to), typed, &trail_cfg, &mut trail_out);
             assert_eq!(
@@ -772,10 +689,7 @@ fn an_unlicensed_move_mints_nothing_and_retires_nothing_in_every_style() {
 }
 
 /// The phantom-poof fence: a ContentOnly probe (plain alt screen) never licenses
-/// the kill/poof detector. Ctrl-U in `less`/`vi` is a page scroll that shrinks
-/// the probed row without erasing anything; the probe flows for the confirm
-/// proof but the poof branches refuse it (same kill hint and shrink, zero
-/// vapor). The Full-trust twin (a real shell kill) still poofs.
+/// the kill/poof detector.
 #[test]
 fn content_only_probes_never_license_a_kill_poof() {
     let g = geom();
@@ -787,8 +701,6 @@ fn content_only_probes_never_license_a_kill_poof() {
         v.resize(40, ' ');
         v
     };
-    // Plain-alt shape: ContentOnly probes, a fresh kill hint, and a
-    // page-scroll shrink of the cursor row.
     let mut glow = CursorGlow::default();
     glow.note_context(true);
     glow.observe_row_with_trust(2, 7, &row("$ hello world"), t0, ProbeTrust::ContentOnly);
@@ -801,7 +713,6 @@ fn content_only_probes_never_license_a_kill_poof() {
         glow.vapor.is_empty(),
         "a ContentOnly shrink must not poof — Ctrl-U paged, it did not kill"
     );
-    // …and waiting out the caret fallback's grace buys the hint nothing.
     let t2 = t0 + Duration::from_millis(180);
     glow.observe_row_with_trust(2, 7, &row("$ h"), t2, ProbeTrust::ContentOnly);
     glow.tick(Some((2, 7)), t2, &c, g, &mut out);
@@ -809,8 +720,6 @@ fn content_only_probes_never_license_a_kill_poof() {
         glow.vapor.is_empty(),
         "the caret fallback must refuse a ContentOnly probe too"
     );
-    // Non-vacuity: the identical gesture over full-trust probes (primary
-    // screen / blinking TUI) still answers with smoke.
     let mut glow = CursorGlow::default();
     glow.observe_row(2, 7, &row("$ hello world"), t0);
     glow.tick(Some((2, 7)), t0, &c, g, &mut out);

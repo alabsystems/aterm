@@ -246,7 +246,7 @@ pub(crate) fn builtin_shadow_label(chord_str: &str) -> Option<&'static str> {
     )
 }
 
-/// The testable core of [`builtin_shadow_label`] with both gates explicit. With
+/// The testable core of [`builtin_shadow_label`] with both gates explicit.
 fn builtin_shadow_label_when(
     chord_str: &str,
     suite_live: bool,
@@ -350,6 +350,7 @@ pub(crate) fn is_unbind_action(name: &str) -> bool {
 }
 
 /// Map a config modifier word, aliases included (`win`/`meta` are Cmd/Super,
+/// `opt` is Alt), to its mask bit.
 fn modifier_bit(word: &str) -> Option<u8> {
     Some(match word {
         "cmd" | "command" | "super" | "win" | "meta" => MOD_CMD,
@@ -361,6 +362,8 @@ fn modifier_bit(word: &str) -> Option<u8> {
 }
 
 /// Map a config key word (the final `+`-segment) to a [`KeyToken`]: a single
+/// character is a `Char`, `plus`/`minus`/`equal` spell characters, and any other
+/// word is looked up as a named key.
 fn key_token(word: &str) -> Option<KeyToken> {
     let mut chars = word.chars();
     let first = chars.next()?;
@@ -408,6 +411,7 @@ fn key_token(word: &str) -> Option<KeyToken> {
 }
 
 /// The ASCII punctuation a US/UK layout composes with Shift, and which therefore
+/// never appears as a chord's key.
 const SHIFT_COMPOSED_ASCII: &[char] = &[
     '~', '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '{', '}', '|', ':', '"', '<', '>',
     '?',
@@ -567,6 +571,7 @@ impl Chord {
 }
 
 /// Display name of a parseable [`NamedKey`]: the reverse of [`key_token`]'s named
+/// table, in the spelling that re-parses.
 #[cfg(any(test, not(target_os = "macos")))]
 fn named_key_display(named: NamedKey) -> &'static str {
     match named {
@@ -622,6 +627,7 @@ pub(crate) struct Keybindings {
 
 impl Keybindings {
     /// Collect the parsed map, the unbind chords ([`is_unbind_action`]) and an
+    /// unprefixed warning per skipped entry.
     fn collect(
         table: Option<&std::collections::BTreeMap<String, String>>,
     ) -> (HashMap<Chord, Action>, Vec<Chord>, Vec<String>) {
@@ -950,6 +956,7 @@ pub(crate) fn resolve_chord(
 }
 
 /// Whether a `focus_pane_*` binding on `base` may give its press to the program when
+/// no pane lies that way ([`resolve_chord`]): only on an arrow key.
 #[must_use]
 fn pane_focus_passes_through(base: &WinitKey) -> bool {
     matches!(
@@ -1045,6 +1052,7 @@ mod tests {
     }
 
     /// Modifier order does not matter, case is folded, and the modifier
+    /// aliases (super → cmd, option → alt, control → ctrl) name the same chord.
     #[test]
     fn chord_order_case_and_aliases_parse_equal() {
         for (a, b) in [
@@ -1129,6 +1137,7 @@ mod tests {
     }
 
     /// A live event builds the chord its config string parses to (case-folded, base
+    /// logical key).
     #[test]
     fn event_chord_matches_parsed() {
         let parsed = Chord::parse("cmd+t").unwrap();
@@ -1149,6 +1158,7 @@ mod tests {
     }
 
     /// A populated table resolves a configured chord to its action and still
+    /// misses on unbound chords.
     #[test]
     fn config_table_resolves_and_misses() {
         let mut table = std::collections::BTreeMap::new();
@@ -1184,6 +1194,7 @@ mod tests {
     }
 
     /// With no config, off macOS the standard terminal chords are seeded (no Super
+    /// key needed) and a user entry overlays and wins; macOS keeps an empty table.
     #[test]
     fn platform_defaults_seed_terminal_chords() {
         let kb = Keybindings::resolved(None);
@@ -1252,6 +1263,8 @@ mod tests {
     }
 
     /// `plus` binds the `+` key (`ctrl++` cannot be written), and Ctrl+Plus is
+    /// seeded for zoom-in: the de-DE/Nordic main-row `+` and the numpad `+` arrive
+    /// unshifted.
     #[test]
     fn plus_is_bindable_and_seeded_for_zoom_in() {
         assert_eq!(
@@ -1282,6 +1295,7 @@ mod tests {
     }
 
     /// WINDOWS LEAVES PSREADLINE ITS KEYS (the 2026-10-17 audit's
+    /// `gui-chords-shadow-psreadline`).
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn windows_defaults_leave_psreadline_its_selection_and_edit_chords() {
@@ -1381,6 +1395,7 @@ mod tests {
     }
 
     /// Full screen is a bindable action under both spellings (off macOS no menu
+    /// bar reaches it).
     #[test]
     fn fullscreen_is_a_bindable_action() {
         assert_eq!(Action::parse("fullscreen"), Some(Action::ToggleFullscreen));
@@ -1431,6 +1446,7 @@ mod tests {
     }
 
     /// `"none"` / `"unbind"` masks a platform seed without a warning; unbinding a
+    /// never-bound chord is a no-op, and the other seeds survive.
     #[test]
     fn unbind_value_masks_platform_seed() {
         let mut table = std::collections::BTreeMap::new();
@@ -1465,6 +1481,7 @@ mod tests {
     }
 
     /// Hints follow presentation order, honor a user rebind or unbind, are `None`
+    /// for an unbound action, and round-trip through `Chord::parse`.
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn display_chord_for_resolves_effective_hints() {
@@ -1518,6 +1535,7 @@ mod tests {
     }
 
     /// Display uppercases ASCII only, matching `parse`'s fold, so non-ASCII keys
+    /// (`ß`, `é`) display verbatim and round-trip.
     #[test]
     fn display_round_trips_non_ascii_chord_keys() {
         for spelling in ["ctrl+ß", "ctrl+é", "ctrl+shift+a", "alt+µ"] {
@@ -1533,6 +1551,8 @@ mod tests {
     }
 
     /// Backslash escapes expand to bytes (TOML literal-string style), and any
+    /// other char — including a control char a TOML basic string already expanded —
+    /// passes through as its UTF-8 bytes.
     #[test]
     fn key_sequence_parses_escapes() {
         assert_eq!(parse_byte_sequence("\\n").unwrap(), vec![0x0a]);
@@ -1560,6 +1580,7 @@ mod tests {
     }
 
     /// A `[key_sequences]` table parses to chord -> bytes, looks up by live event,
+    /// misses on unbound chords, and skips a malformed line (fail-open).
     #[test]
     fn key_sequences_from_config_and_lookup() {
         let mut table = std::collections::BTreeMap::new();
@@ -1598,6 +1619,7 @@ mod tests {
     }
 
     /// A bad `\u{HEX}` scalar is an `Err`, never a panic; a valid astral scalar
+    /// expands to its UTF-8 bytes.
     #[test]
     fn key_sequence_unicode_brace_edge_cases() {
         assert!(parse_byte_sequence("\\u{}").is_err());
@@ -1610,6 +1632,7 @@ mod tests {
     }
 
     /// Keybindings beat key_sequences; a key_sequences chord on a hardcoded Cmd
+    /// shortcut still resolves to `Sequence`; an unbound chord falls through.
     #[test]
     fn resolve_chord_precedence() {
         use std::collections::BTreeMap;
@@ -1659,6 +1682,7 @@ mod tests {
     }
 
     /// A chord on a non-Latin layout matches its US key's binding — the key
+    /// the PTY encoder would otherwise have sent the control byte of.
     #[test]
     fn a_layout_letter_matches_its_us_keys_binding_only_in_a_chord() {
         use aterm_window::keyboard::KeyCode;
@@ -1737,6 +1761,8 @@ mod tests {
     }
 
     /// Shift+Insert pastes PRIMARY on Linux (xterm, VTE, kitty, foot) and
+    /// Ctrl+Shift+Insert the clipboard (VTE); elsewhere, with no PRIMARY,
+    /// Shift+Insert is the clipboard paste (Windows Terminal).
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn shift_insert_pastes_the_platforms_selection() {
@@ -1756,6 +1782,7 @@ mod tests {
     }
 
     /// A `focus_pane_*` binding claims its chord only when focus can move that
+    /// way.
     #[test]
     fn a_pane_focus_binding_claims_its_chord_only_when_focus_can_move() {
         use crate::pane::FocusDir;
@@ -1799,6 +1826,8 @@ mod tests {
     }
 
     /// Off the arrows a `focus_pane_*` binding claims its chord whatever the
+    /// geometry, and the geometry is not even asked: `ctrl+j` falling through would
+    /// write LF, which bash runs as accept-line.
     #[test]
     fn a_pane_focus_binding_off_the_arrows_always_claims_its_chord() {
         use std::collections::BTreeMap;
@@ -1865,6 +1894,7 @@ mod tests {
     }
 
     /// `builtin_shadow_label` maps known built-ins (normalizing spelling), asserted
+    /// through the gate-explicit core with the suite live, so on every platform.
     #[test]
     fn builtin_shadow_label_maps_known_and_normalizes() {
         let known = |chord: &str, menu_bar: bool| builtin_shadow_label_when(chord, true, menu_bar);
@@ -1890,6 +1920,7 @@ mod tests {
     }
 
     /// With the Cmd/Super suite compiled off (Linux) nothing can shadow it, so a
+    /// `super+t` rebind never warns of a built-in.
     #[test]
     fn builtin_shadow_label_is_silent_when_the_suite_is_gated_off() {
         assert_eq!(builtin_shadow_label_when("cmd+c", false, true), None);
@@ -1926,6 +1957,7 @@ mod tests {
     }
 
     /// Keybindings::from_config_warn reports a bad chord + unknown action; resolved_warn
+    /// surfaces the same user warnings atop the platform defaults.
     #[test]
     fn keybindings_from_config_warn_reports_unknown_action_and_bad_chord() {
         use std::collections::BTreeMap;

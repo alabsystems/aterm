@@ -22,6 +22,11 @@
 //!     "font_px = 12.0 # cozy\n".parse().unwrap();
 //! document["font_px"] = aterm_toml::edit::Item::Value(18.0.into());
 //! ```
+//! # use serde::Deserialize;
+//! #[derive(Deserialize)]
+//! struct Config {
+//!     font_px: f64,
+//! }
 //!
 //! Duplicate keys and every other redefinition rule in the spec are errors,
 //! not last-write-wins. Nesting depth is bounded, so hostile input is an error

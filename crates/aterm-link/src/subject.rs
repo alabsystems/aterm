@@ -1,23 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The subject taxonomy (§3.3): every subject the bridge publishes is built here,
-//! and every subject it receives is parsed here.
-//!
-//! The parse is the load-bearing half: on the `in` face a stranger's bytes choose
-//! part of the address. `>` matches one or more segments, so an 8-segment subject's
-//! last two would read as a forged `<src>/<kind>`; an `in` subject is therefore
-//! exactly seven segments, parsed by position from the left. A record of another
-//! shape, a `<src>` without an `s-|n-|h-|a-` prefix, or a `<sid>` this node does not
-//! host is refused, never delivered. The broker's cap check (the `in` grant ends in
-//! `*`) refuses the 8-segment publish too (R4); this is the receiver's own wall.
+//! The subject taxonomy (§3.3).
 
-// The segment word grammar (§3.2) lives in `aterm-types`: the endpoint holds lines
-// to it too and does not depend on this crate.
 pub use aterm_types::fabric_grammar::{is_principal, is_topic, PRINCIPAL_MAX};
 
-/// A fleet name segment: the same bounded lowercase grammar, without a class
-/// prefix (it is not a principal).
+/// A fleet name segment: the same bounded lowercase grammar, without a class prefix.
 #[must_use]
 pub fn is_fleet(f: &str) -> bool {
     (1..=32).contains(&f.len())
@@ -25,21 +13,16 @@ pub fn is_fleet(f: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// Why a record on an `in` lane was refused. Each variant becomes an `ev
-/// undeliverable … reason=<token>` record on the bus and nothing else: a refused
-/// record is never delivered.
+/// Why a record on an `in` lane was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reject {
-    /// Not seven segments, not under this fleet, or a segment that is not the
-    /// shape its position demands.
+    /// Not seven segments, not under this fleet, or a segment that is not the shape its position
+    /// demands.
     Malformed,
-    /// A `<sid>` this node does not host. Nothing binds a sid to a node on the
-    /// bus, so a sender can address one that moved; the receiver is the only
-    /// place that knows.
+    /// A `<sid>` this node does not host.
     NotHosted,
-    /// A record on this node's own lane, under this node's `<src>`, at an offset the
-    /// bridge never got a `PublishAck` for: a forgery by a co-holder of the node cap
-    /// (§6.2). Recorded and escalated, never delivered.
+    /// A record on this node's own lane, under this node's `<src>`, at an offset the bridge never
+    /// got a `PublishAck` for: a forgery by a co-holder of the node cap (§6.2).
     ForgedSelf,
 }
 
@@ -58,28 +41,21 @@ impl Reject {
 /// A parsed `/f/<F>/in/<node>/<sid>/<src>/<kind>` address.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InAddr {
-    /// The owning node — always this bridge's own, or the record would not have
-    /// been delivered by the group filter.
+    /// The owning node.
     pub node: String,
     /// The session the message is addressed to.
     pub sid: String,
-    /// The sender, cap-forced at the broker: the one segment a sender cannot choose,
-    /// so provenance is read straight off it (§4.3).
+    /// The sender, cap-forced at the broker.
     pub src: String,
     /// The message kind.
     pub kind: String,
 }
 
-/// Parse an `in` subject by position from the left, against the fleet and node this
-/// bridge serves: exactly `f`, `<F>`, `in`, `<node>`, `<sid>`, `<src>`, `<kind>`. A
-/// right-anchored parse is what an 8-segment subject exploits.
-///
+/// Parse an `in` subject by position from the left, against the fleet and node this bridge serves.
 /// # Errors
-///
 /// [`Reject::Malformed`] for anything that is not that shape.
 pub fn parse_in(fleet: &str, node: &str, subject: &str) -> Result<InAddr, Reject> {
     let segs: Vec<&str> = subject.split('/').collect();
-    // A leading '/' yields an empty first segment: `["", "f", "<F>", "in", …]`.
     if segs.len() != 8 || !segs[0].is_empty() {
         return Err(Reject::Malformed);
     }
@@ -113,21 +89,13 @@ pub fn session_face(fleet: &str, node: &str, sid: &str, leaf: &str) -> String {
     format!("/f/{fleet}/pub/{node}/{sid}/{leaf}")
 }
 
-/// `/f/<F>/in/<node>/<sid>/<src>/<kind>` — a post onto one hosted session's
-/// inbox lane, from `src` (a session, a node, or a person posting as
-/// themself).
+/// `/f/<F>/in/<node>/<sid>/<src>/<kind>` — a post onto one hosted session's inbox lane, from `src`.
 #[must_use]
 pub fn post_lane(fleet: &str, node: &str, sid: &str, src: &str, kind: &str) -> String {
     format!("/f/{fleet}/in/{node}/{sid}/{src}/{kind}")
 }
 
-/// `/f/<F>/in/p/<person>/<node>` — the route onto a person's (or a
-/// service's) own lane from `node`'s bridge; a record on it is
-/// `<route>/<kind>`: a session's `post to=<person>`, the receipt of a
-/// person's post, an `undeliverable`/`expired`/`refused` notice. What `inbox`
-/// reads and `notify --on ask:<person>` pages, and so a record the broker's
-/// escalation table flushes in full before its ack
-/// ([`crate::durability::escalation`]).
+/// `/f/<F>/in/p/<person>/<node>`.
 #[must_use]
 pub fn person_lane(fleet: &str, person: &str, node: &str) -> String {
     format!("/f/{fleet}/in/p/{person}/{node}")
@@ -145,30 +113,25 @@ pub fn person_halt(fleet: &str, person: &str) -> String {
     format!("/f/{fleet}/fleet/{person}/halt")
 }
 
-/// The durable group a person's `inbox` commits under: their read mark, the
-/// one hidden record the escalation table's group rule exists for.
+/// The durable group a person's `inbox` commits under.
 #[must_use]
 pub fn person_inbox_group(fleet: &str, person: &str) -> String {
     format!("/f/{fleet}/cur/p/{person}/inbox")
 }
 
-/// The durable group name the node's inbox drain commits under. `cur` is a name
-/// face, never published to or delivered, but the cap must grant it (the broker's
-/// `SubscribeGroup`/`Commit` arms), so it is built here beside the subjects.
+/// The durable group name the node's inbox drain commits under.
 #[must_use]
 pub fn inbox_group(fleet: &str, node: &str) -> String {
     format!("/f/{fleet}/cur/{node}/node/inbox")
 }
 
-/// Every `in` lane this node owns, as one filter (§6.1: "the owner's bridge
-/// reads all lanes with one filter").
+/// Every `in` lane this node owns, as one filter.
 #[must_use]
 pub fn inbox_filter(fleet: &str, node: &str) -> String {
     format!("/f/{fleet}/in/{node}/>")
 }
 
-/// The fleet broadcast face: halts and barriers, drained ahead of the inbox group on
-/// every scheduling round (§11.2).
+/// The fleet broadcast face.
 #[must_use]
 pub fn fleet_filter(fleet: &str) -> String {
     format!("/f/{fleet}/fleet/>")
@@ -185,17 +148,8 @@ pub struct HaltRow<'a> {
     pub reason: Option<String>,
 }
 
-/// Parse a fleet halt row, `/f/<F>/fleet/<h-name>/halt`, by the rule every bridge
-/// applies a halt under (§5.3), or `None` for a record that halts nothing.
-///
-/// Five segments by position from the left, `halt` as the leaf, and an `h-`
-/// principal: a halt is a human's word, so a row under any other principal (an
-/// `a-` service's, a node's) halts nothing. The body is read by the bridge's own
-/// decoder ([`crate::body::Body`]): the first line only, space-separated, and a
-/// repeated `state=` takes its last value.
-///
-/// The bridge, `aterm fabric`'s status and `link notify --on halt` all read the
-/// face by this, so no reader reports a halt that no bridge applies.
+/// Parse a fleet halt row, `/f/<F>/fleet/<h-name>/halt`, by the rule every bridge applies a halt
+/// under (§5.3), or `None` for a record that halts nothing.
 #[must_use]
 pub fn parse_halt<'a>(fleet: &str, subject: &'a str, body: &[u8]) -> Option<HaltRow<'a>> {
     let segs: Vec<&'a str> = subject.split('/').collect();
@@ -217,20 +171,13 @@ pub fn parse_halt<'a>(fleet: &str, subject: &'a str, body: &[u8]) -> Option<Halt
     })
 }
 
-/// Every broadcast face in the fleet, as one filter. One subscription, not one per
-/// topic: opt-in (`topic add`) is local, and per-topic subscriptions would put every
-/// session's topic set on the bus as churn.
+/// Every broadcast face in the fleet, as one filter.
 #[must_use]
 pub fn say_filter(fleet: &str) -> String {
     format!("/f/{fleet}/pub/*/*/say/>")
 }
 
-/// One topic's broadcasts fleet-wide, `/f/<F>/pub/*/*/say/<topic>`: a read filter,
-/// never a subscription, so it brings none of the churn [`say_filter`] avoids. A
-/// backlog `Fetch` over it has the broker skip other topics' records within its
-/// bounded scan instead of filling the page with them. `topic` must be an
-/// [`is_topic`] name, one literal segment with no `*`, `>` or `/`; the bridge checks
-/// every topic that enters its cursor set.
+/// One topic's broadcasts fleet-wide, `/f/<F>/pub/*/*/say/<topic>`.
 #[must_use]
 pub fn say_topic_filter(fleet: &str, topic: &str) -> String {
     format!("/f/{fleet}/pub/*/*/say/{topic}")
@@ -248,9 +195,8 @@ pub struct SayAddr {
 }
 
 /// Parse a broadcast subject left-anchored and by position, seven segments
-/// (`f`/`<F>`/`pub`/`<node>`/`<sid>`/`say`/`<topic>`), like [`parse_in`]: the filter's `>`
-/// matches one or more segments, so only a counting parse refuses a longer subject.
-/// `None` for anything else.
+/// (`f`/`<F>`/`pub`/`<node>`/`<sid>`/`say`/`<topic>`), like [`parse_in`]: the filter's `>` matches
+/// one or more segments, so only a counting parse refuses a longer subject.
 #[must_use]
 pub fn parse_say(fleet: &str, subject: &str) -> Option<SayAddr> {
     let segs: Vec<&str> = subject.split('/').collect();
@@ -281,7 +227,6 @@ mod tests {
     fn an_eight_segment_subject_is_malformed_however_its_tail_reads() {
         let forged = "/f/f1/in/n-a/s-b/s-1/h-andrew/answer";
         assert_eq!(parse_in("f1", "n-a", forged), Err(Reject::Malformed));
-        // The seven-segment form parses, and its sender is the sixth segment.
         let honest = "/f/f1/in/n-a/s-b/s-1/answer";
         assert_eq!(
             parse_in("f1", "n-a", honest),

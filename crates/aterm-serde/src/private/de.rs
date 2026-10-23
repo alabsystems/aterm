@@ -17,8 +17,7 @@ use self::content::{key_deserializer, key_ref_deserializer};
 
 pub use crate::private::InPlaceSeed;
 
-/// If the missing field is of type `Option<T>` then treat is as `None`,
-/// otherwise it is an error.
+/// If the missing field is of type `Option<T>` then treat is as `None`, otherwise it is an error.
 pub fn missing_field<'de, V, E>(field: &'static str) -> Result<V, E>
 where
     V: Deserialize<'de>,
@@ -59,16 +58,6 @@ where
 }
 
 mod content {
-    // This module is private and nothing here should be used outside of
-    // generated code.
-    //
-    // We will iterate on the implementation for a few releases and only have to
-    // worry about backward compatibility for the `untagged` and `tag` attributes
-    // rather than for this entire mechanism.
-    //
-    // This issue is tracking making some of this stuff public:
-    // https://github.com/serde-rs/serde/issues/741
-
     use crate::lib::*;
 
     use crate::de::{
@@ -377,15 +366,12 @@ mod content {
     }
 
     /// This is the type of the map keys in an internally tagged enum.
-    ///
-    /// Not public API.
     pub enum TagOrContent<'de> {
         Tag,
         Content(Content<'de>),
     }
 
     /// Serves as a seed for deserializing a key of internally tagged enum.
-    /// Cannot capture externally tagged enums, `i128` and `u128`.
     struct TagOrContentVisitor<'de> {
         name: &'static str,
         value: PhantomData<TagOrContent<'de>>,
@@ -408,7 +394,6 @@ mod content {
         where
             D: Deserializer<'de>,
         {
-            // Internally tagged enums are only supported in self-describing
             // formats.
             deserializer.deserialize_any(self)
         }
@@ -673,11 +658,6 @@ mod content {
     }
 
     /// Used by generated code to deserialize an internally tagged enum.
-    ///
-    /// Captures map or sequence from the original deserializer and searches
-    /// a tag in it (in case of sequence, tag is the first element of sequence).
-    ///
-    /// Not public API.
     pub struct TaggedContentVisitor<T> {
         tag_name: &'static str,
         expecting: &'static str,
@@ -685,8 +665,7 @@ mod content {
     }
 
     impl<T> TaggedContentVisitor<T> {
-        /// Visitor for the content of an internally tagged enum with the given
-        /// tag name.
+        /// Visitor for the content of an internally tagged enum with the given tag name.
         pub fn new(name: &'static str, expecting: &'static str) -> Self {
             TaggedContentVisitor {
                 tag_name: name,
@@ -751,7 +730,7 @@ mod content {
         }
     }
 
-    /// Not public API
+    /// Not public API.
     pub struct ContentDeserializer<'de, E> {
         content: Content<'de>,
         err: PhantomData<E>,
@@ -828,8 +807,7 @@ mod content {
         Ok(value)
     }
 
-    /// Used when deserializing an internally tagged enum because the content
-    /// will be used exactly once.
+    /// Deserializer for internally tagged enum content used once.
     #[diagnostic::do_not_recommend]
     impl<'de, E> Deserializer<'de> for ContentDeserializer<'de, E>
     where
@@ -1019,15 +997,6 @@ mod content {
             match self.content {
                 Content::Unit => visitor.visit_unit(),
 
-                // Allow deserializing newtype variant containing unit.
-                //
-                //     #[derive(Deserialize)]
-                //     #[serde(tag = "result")]
-                //     enum Response<T> {
-                //         Success(T),
-                //     }
-                //
-                // We want {"result":"Success"} to deserialize into Response<()>.
                 Content::Map(ref v) if v.is_empty() => visitor.visit_unit(),
                 _ => Err(self.invalid_type(&visitor)),
             }
@@ -1042,20 +1011,6 @@ mod content {
             V: Visitor<'de>,
         {
             match self.content {
-                // As a special case, allow deserializing untagged newtype
-                // variant containing unit struct.
-                //
-                //     #[derive(Deserialize)]
-                //     struct Info;
-                //
-                //     #[derive(Deserialize)]
-                //     #[serde(tag = "topic")]
-                //     enum Message {
-                //         Info(Info),
-                //     }
-                //
-                // We want {"topic":"Info"} to deserialize even though
-                // ordinarily unit structs do not deserialize from empty map/seq.
                 Content::Map(ref v) if v.is_empty() => visitor.visit_unit(),
                 Content::Seq(ref v) if v.is_empty() => visitor.visit_unit(),
                 _ => self.deserialize_any(visitor),
@@ -1152,7 +1107,6 @@ mod content {
                             ));
                         }
                     };
-                    // enums are encoded in json as maps with a single key:value pair
                     if iter.next().is_some() {
                         return Err(de::Error::invalid_value(
                             de::Unexpected::Map,
@@ -1206,7 +1160,7 @@ mod content {
     }
 
     impl<'de, E> ContentDeserializer<'de, E> {
-        /// private API, don't use
+        /// private API, don't use.
         pub fn new(content: Content<'de>) -> Self {
             ContentDeserializer {
                 content,
@@ -1240,8 +1194,6 @@ mod content {
             if remaining == 0 {
                 Ok(())
             } else {
-                // First argument is the number of elements in the data, second
-                // argument is the number of elements expected by the Deserialize.
                 Err(de::Error::invalid_length(
                     self.count + remaining,
                     &ExpectedInSeq(self.count),
@@ -1338,8 +1290,6 @@ mod content {
             if remaining == 0 {
                 Ok(())
             } else {
-                // First argument is the number of elements in the data, second
-                // argument is the number of elements expected by the Deserialize.
                 Err(de::Error::invalid_length(
                     self.count + remaining,
                     &ExpectedInMap(self.count),
@@ -1425,8 +1375,6 @@ mod content {
             T: DeserializeSeed<'de>,
         {
             let value = self.value.take();
-            // Panic because this indicates a bug in the program rather than an
-            // expected failure.
             let value = value.expect("MapAccess::next_value called before next_key");
             seed.deserialize(ContentDeserializer::new(value))
         }
@@ -1512,8 +1460,6 @@ mod content {
                 Ok(pair)
             } else {
                 let remaining = pair_visitor.size_hint().unwrap();
-                // First argument is the number of elements in the data, second
-                // argument is the number of elements expected by the Deserialize.
                 Err(de::Error::invalid_length(2, &ExpectedInSeq(2 - remaining)))
             }
         }
@@ -1525,7 +1471,6 @@ mod content {
             if len == 2 {
                 self.deserialize_seq(visitor)
             } else {
-                // First argument is the number of elements in the data, second
                 // argument is the number of elements expected by the Deserialize.
                 Err(de::Error::invalid_length(2, &ExpectedInSeq(len)))
             }
@@ -1782,8 +1727,7 @@ mod content {
         Ok(value)
     }
 
-    /// Used when deserializing an untagged enum because the content may need
-    /// to be used more than once.
+    /// Deserializer for borrowed untagged enum content.
     #[diagnostic::do_not_recommend]
     impl<'de, 'a, E> Deserializer<'de> for ContentRefDeserializer<'a, 'de, E>
     where
@@ -1960,19 +1904,10 @@ mod content {
         where
             V: Visitor<'de>,
         {
-            // Covered by tests/test_enum_untagged.rs
-            //      with_optional_field::*
             match *self.content {
                 Content::None => visitor.visit_none(),
                 Content::Some(ref v) => visitor.visit_some(ContentRefDeserializer::new(v)),
                 Content::Unit => visitor.visit_unit(),
-                // This case is to support data formats which do not encode an
-                // indication whether a value is optional. An example of such a
-                // format is JSON, and a counterexample is RON. When requesting
-                // `deserialize_any` in JSON, the data format never performs
-                // `Visitor::visit_some` but we still must be able to
-                // deserialize the resulting Content into data structures with
-                // optional fields.
                 _ => visitor.visit_some(self),
             }
         }
@@ -2002,21 +1937,10 @@ mod content {
         where
             V: Visitor<'de>,
         {
-            // Covered by tests/test_enum_untagged.rs
-            //      newtype_struct
             match *self.content {
                 Content::Newtype(ref v) => {
                     visitor.visit_newtype_struct(ContentRefDeserializer::new(v))
                 }
-                // This case is to support data formats that encode newtype
-                // structs and their underlying data the same, with no
-                // indication whether a newtype wrapper was present. For example
-                // JSON does this, while RON does not. In RON a newtype's name
-                // is included in the serialized representation and it knows to
-                // call `Visitor::visit_newtype_struct` from `deserialize_any`.
-                // JSON's `deserialize_any` never calls `visit_newtype_struct`
-                // but in this code we still must be able to deserialize the
-                // resulting Content into newtypes.
                 _ => visitor.visit_newtype_struct(self),
             }
         }
@@ -2097,7 +2021,6 @@ mod content {
                             ));
                         }
                     };
-                    // enums are encoded in json as maps with a single key:value pair
                     if iter.next().is_some() {
                         return Err(de::Error::invalid_value(
                             de::Unexpected::Map,
@@ -2154,7 +2077,7 @@ mod content {
     }
 
     impl<'a, 'de, E> ContentRefDeserializer<'a, 'de, E> {
-        /// private API, don't use
+        /// private API, don't use.
         pub fn new(content: &'a Content<'de>) -> Self {
             ContentRefDeserializer {
                 content,
@@ -2198,8 +2121,6 @@ mod content {
             if remaining == 0 {
                 Ok(())
             } else {
-                // First argument is the number of elements in the data, second
-                // argument is the number of elements expected by the Deserialize.
                 Err(de::Error::invalid_length(
                     self.count + remaining,
                     &ExpectedInSeq(self.count),
@@ -2284,8 +2205,6 @@ mod content {
             if remaining == 0 {
                 Ok(())
             } else {
-                // First argument is the number of elements in the data, second
-                // argument is the number of elements expected by the Deserialize.
                 Err(de::Error::invalid_length(
                     self.count + remaining,
                     &ExpectedInMap(self.count),
@@ -2371,8 +2290,6 @@ mod content {
             T: DeserializeSeed<'de>,
         {
             let value = self.value.take();
-            // Panic because this indicates a bug in the program rather than an
-            // expected failure.
             let value = value.expect("MapAccess::next_value called before next_key");
             seed.deserialize(ContentRefDeserializer::new(value))
         }
@@ -2458,8 +2375,6 @@ mod content {
                 Ok(pair)
             } else {
                 let remaining = pair_visitor.size_hint().unwrap();
-                // First argument is the number of elements in the data, second
-                // argument is the number of elements expected by the Deserialize.
                 Err(de::Error::invalid_length(2, &ExpectedInSeq(2 - remaining)))
             }
         }
@@ -2471,7 +2386,6 @@ mod content {
             if len == 2 {
                 self.deserialize_seq(visitor)
             } else {
-                // First argument is the number of elements in the data, second
                 // argument is the number of elements expected by the Deserialize.
                 Err(de::Error::invalid_length(2, &ExpectedInSeq(len)))
             }
@@ -2563,10 +2477,6 @@ mod content {
         fn unit_variant(self) -> Result<(), E> {
             match self.value {
                 Some(value) => de::Deserialize::deserialize(ContentRefDeserializer::new(value)),
-                // Covered by tests/test_annotations.rs
-                //      test_partially_untagged_adjacently_tagged_enum
-                // Covered by tests/test_enum_untagged.rs
-                //      newtype_enum::unit
                 None => Ok(()),
             }
         }
@@ -2576,11 +2486,6 @@ mod content {
             T: de::DeserializeSeed<'de>,
         {
             match self.value {
-                // Covered by tests/test_annotations.rs
-                //      test_partially_untagged_enum_desugared
-                //      test_partially_untagged_enum_generic
-                // Covered by tests/test_enum_untagged.rs
-                //      newtype_enum::newtype
                 Some(value) => seed.deserialize(ContentRefDeserializer::new(value)),
                 None => Err(de::Error::invalid_type(
                     de::Unexpected::UnitVariant,
@@ -2594,12 +2499,6 @@ mod content {
             V: de::Visitor<'de>,
         {
             match self.value {
-                // Covered by tests/test_annotations.rs
-                //      test_partially_untagged_enum
-                //      test_partially_untagged_enum_desugared
-                // Covered by tests/test_enum_untagged.rs
-                //      newtype_enum::tuple0
-                //      newtype_enum::tuple2
                 Some(Content::Seq(v)) => visit_content_seq_ref(v, visitor),
                 Some(other) => Err(de::Error::invalid_type(
                     content_unexpected(other),
@@ -2621,12 +2520,7 @@ mod content {
             V: de::Visitor<'de>,
         {
             match self.value {
-                // Covered by tests/test_enum_untagged.rs
-                //      newtype_enum::struct_from_map
                 Some(Content::Map(v)) => visit_content_map_ref(v, visitor),
-                // Covered by tests/test_enum_untagged.rs
-                //      newtype_enum::struct_from_seq
-                //      newtype_enum::empty_struct_from_seq
                 Some(Content::Seq(v)) => visit_content_seq_ref(v, visitor),
                 Some(other) => Err(de::Error::invalid_type(
                     content_unexpected(other),
@@ -2664,10 +2558,7 @@ mod content {
         }
     }
 
-    // aterm's own from here to the end of `key_ref_deserializer`.
-
-    /// A buffered key is text when the format handed it over as a string,
-    /// which is how JSON and TOML hand over every key.
+    /// A buffered key is text when the format handed it over as a string.
     fn content_text<'a>(content: &'a Content<'_>) -> Option<&'a str> {
         match *content {
             Content::Str(text) => Some(text),
@@ -2688,11 +2579,7 @@ mod content {
         }
     }
 
-    /// The deserializer for a buffered map key. A `#[serde(flatten)]` map, an
-    /// untagged or internally tagged enum, and a struct with a flattened field
-    /// read their keys back from this buffer, not from the format, so the
-    /// buffer reads a key a text format wrote as a string the way the format
-    /// does: `7` back into a `u32` key, `true` into a `bool` one.
+    /// The deserializer for a buffered map key.
     pub(super) fn key_deserializer<'de, E>(
         key: Content<'de>,
     ) -> de::value::TextKeyDeserializer<ContentDeserializer<'de, E>> {
@@ -2707,8 +2594,6 @@ mod content {
     }
 
     /// Visitor for deserializing an internally tagged unit variant.
-    ///
-    /// Not public API.
     pub struct InternallyTaggedUnitVisitor<'a> {
         type_name: &'a str,
         variant_name: &'a str,
@@ -2753,8 +2638,6 @@ mod content {
     }
 
     /// Visitor for deserializing an untagged unit variant.
-    ///
-    /// Not public API.
     pub struct UntaggedUnitVisitor<'a> {
         type_name: &'a str,
         variant_name: &'a str,
@@ -2974,10 +2857,6 @@ where
         for item in &mut self.iter {
             // Items in the vector are nulled out when used by a struct.
             if let Some((ref key, ref content)) = *item {
-                // Do not take(), instead borrow this entry. The internally tagged
-                // enum does its own buffering so we can't tell whether this entry
-                // is going to be consumed. Borrowing here leaves the entry
-                // available for later flattened fields.
                 self.pending_content = Some(content);
                 return seed.deserialize(key_ref_deserializer(key)).map(Some);
             }
@@ -3034,15 +2913,11 @@ where
     }
 }
 
-/// Claims one key-value pair from a FlatMapDeserializer's field buffer if the
-/// field name matches any of the recognized ones.
+/// Claim one matching key-value pair from a `FlatMapDeserializer` field buffer.
 fn flat_map_take_entry<'de>(
     entry: &mut Option<(Content<'de>, Content<'de>)>,
     recognized: &[&str],
 ) -> Option<(Content<'de>, Content<'de>)> {
-    // Entries in the FlatMapDeserializer buffer are nulled out as they get
-    // claimed for deserialization. We only use an entry if it is still present
-    // and if the field is one recognized by the current data structure.
     let is_recognized = match entry {
         None => false,
         Some((k, _v)) => content_as_str(k).is_some_and(|name| recognized.contains(&name)),

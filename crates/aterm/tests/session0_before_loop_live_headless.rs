@@ -1,35 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! LIVE: session 0's shell is forked before the event loop is built, and what it
-//! writes before the loop exists reaches its screen whole (r5 sweep #4, LAG-11).
-//!
-//! The boot used to fork session 0 after the event loop's build, which on a macOS
-//! window is `NSApplication` and its WindowServer connection (28.6 and 60.2 ms in
-//! the owner's two logged launches). Now its shell starts first, and its reader
-//! runs at once, posting into a sink that holds every wake until the loop exists
-//! (`aterm-gui`'s `LaneSink`). On Linux the same holds where the build opens a
-//! display that answered (LINUX-6): a headless boot with `DISPLAY` naming a private
-//! Xvfb.
-//!
-//! Driven through the real binary with the build held by the dev seam
-//! `ATERM_DEBUG_LOOP_BUILD_HOLD=<path>` (`main_entry` creates `<path>.held`, waits
-//! for `<path>`, then creates `<path>.passed`). The boot shell is a stub that
-//! writes its pid beside the scratch home, then a line naming that pid, then
-//! becomes `/bin/sh`:
-//!
-//! * while the build is held, the stub has run: its pid file is there, the build
-//!   has not passed, and the process is alive;
-//! * once released, the boot session's screen shows the stub's line, once and
-//!   whole, and the boot session's shell answers `$$` with that same pid.
-//!
-//! NEGATIVE CONTROL: with session 0 spawned after the build (the order before
-//! LAG-11, `loop_before_session0` answering `true`), the stub cannot run while the
-//! build is held: the wait for its pid file gives up ("no pid file from the boot
-//! shell"), or the file appears only after `<path>.passed`, and the test fails
-//! either way.
-//!
-//! Every wait is a one-minute hang detector, never a latency budget.
+//! Headless boot tests verifying session 0 forks before the event loop is built.
 
 #![cfg(unix)]
 
@@ -82,7 +54,7 @@ fn watch_held_build(root: &Path) -> Result<Held, String> {
     };
     let alive = |pid: u32| {
         i32::try_from(pid)
-            // SAFETY: signal 0 delivers nothing; it only asks whether `pid` exists.
+            // SAFETY: signal 0 delivers nothing; it only checks whether `pid` exists.
             .is_ok_and(|pid| unsafe { libc::kill(pid, 0) } == 0)
     };
     let held_view = seen.and_then(|(text, passed_first)| {
@@ -123,8 +95,6 @@ fn screen_with(inst: &headless_boot::Instance, sid: &str, needle: &str) -> Strin
 /// the boot session's shell.
 fn forks_before_the_held_build(prefix: &str, display: Option<&str>) {
     let mut watcher = None;
-    // The watcher's verdict is said before the boot's own: a boot that never forks
-    // its shell under the hold reaches its control socket only once the hold ends.
     let booted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         boot_with(
             prefix,
@@ -136,10 +106,6 @@ fn forks_before_the_held_build(prefix: &str, display: Option<&str>) {
                     .env("ATERM_DEBUG_LOOP_BUILD_HOLD", root.join("hold"))
                     .env_remove("WAYLAND_DISPLAY")
                     .env_remove("WAYLAND_SOCKET");
-                // A headless instance with no display variable builds the
-                // display-free loop, which cannot fail, so session 0 goes first
-                // on every unix; with one, a free-unix build opens the display,
-                // and goes first unless the display answered (`loop_before_session0`).
                 match display {
                     Some(display) => cmd.env("DISPLAY", display),
                     None => cmd.env_remove("DISPLAY"),
@@ -171,7 +137,6 @@ fn forks_before_the_held_build(prefix: &str, display: Option<&str>) {
         "the line the shell wrote before the loop existed, once and whole: {screen}"
     );
 
-    // The pid that ran while the build was held is the boot session's shell.
     type_line(&inst, &sid, "echo s0-pid-$$");
     screen_with(&inst, &sid, &format!("s0-pid-{}", held.pid));
 }
@@ -182,7 +147,7 @@ fn session_zero_forks_before_the_event_loop_is_built_and_its_first_bytes_arrive_
 }
 
 /// A private Xvfb, killed when dropped: it picks a free display and prints its number
-/// (`-displayfd`). A Linux host with no `Xvfb` on PATH ends the test COULD NOT RUN.
+/// (`-displayfd`).
 #[cfg(target_os = "linux")]
 struct Xvfb {
     child: aterm_uds::spawnfd::Child,
@@ -244,14 +209,7 @@ impl Drop for Xvfb {
 }
 
 /// LINUX-6: where the event loop's build opens a display, session 0 forks first once a
-/// display server has answered where winit will connect. Here a headless instance with
-/// `DISPLAY` naming a private Xvfb, whose build opens it (a headless run with a display
-/// keeps winit's real backend), forks its boot shell while the build is held, as a
-/// launch with no display does.
-///
-/// NEGATIVE CONTROL: with the loop first wherever its build opens a display (the rule
-/// before LINUX-6), the shell cannot start while the build is held: "no pid file from
-/// the boot shell (build held: true, passed: false)".
+/// display server has answered where winit will connect.
 #[cfg(target_os = "linux")]
 #[test]
 fn with_a_display_that_answers_session_zero_forks_before_the_event_loop_is_built() {
@@ -261,19 +219,7 @@ fn with_a_display_that_answers_session_zero_forks_before_the_event_loop_is_built
 
 /// The dev seam `ATERM_DEBUG_LOOP_FIRST` (WIN-1's windowed A/B of LAG-11): with it set,
 /// the event loop is built first on every launch, the order before LAG-11, so session 0's
-/// shell is forked only after the held build has passed. Read from the kernel, not from
-/// what the shell wrote: the boot shell's start time (`aterm_pty::process_birth`, µs since
-/// the epoch on macOS) is no earlier than `<hold>.passed`'s mtime.
-///
-/// The watcher releases the hold as soon as the build reaches it, waiting for no shell,
-/// because with the seam none can start while the build is held.
-///
-/// NEGATIVE CONTROL: without the seam (or with `loop_before_session0` ignoring it), session
-/// 0 is forked before the build begins, so its start time precedes `<hold>.held` and with it
-/// `<hold>.passed`: the assertion fails, whatever the shell's own scheduling.
-///
-/// macOS only: Linux's start time counts clock ticks since boot, too coarse to order
-/// against a file's mtime.
+/// shell is forked only after the held build has passed.
 #[cfg(target_os = "macos")]
 #[test]
 fn with_the_loop_first_seam_session_zero_forks_only_after_the_event_loop_is_built() {

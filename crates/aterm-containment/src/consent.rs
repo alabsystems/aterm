@@ -2164,7 +2164,7 @@ pub struct ResetOfferInputs<'a> {
 
 /// Decide whether the denied-state repair may be offered.
 #[must_use]
-pub fn reset_offer(inputs: ResetOfferInputs<'_>) -> ResetOffer {
+pub const fn reset_offer(inputs: ResetOfferInputs<'_>) -> ResetOffer {
     match inputs.dr {
         DrClass::Cdhash | DrClass::Unsigned => ResetOffer::ExplainRebuild,
         DrClass::Identity | DrClass::Unknown => {
@@ -4843,10 +4843,12 @@ mod imp {
 /// Explicit mounted-volume acceptance for the census boundary.
 ///
 /// # Errors
+/// Returns the setup failure when a disk image cannot be created or attached.
 ///
 /// Returns the setup failure when a disk image cannot be created or attached.
 ///
 /// # Panics
+/// If detaching fails or the mounted/detached policy judgments are incorrect.
 ///
 /// Panics if detaching fails or the mounted/detached policy judgments are incorrect.
 #[cfg(all(debug_assertions, target_os = "macos"))]

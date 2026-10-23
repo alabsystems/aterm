@@ -80,7 +80,7 @@ fn look(mood: DotMood, level: f32, sat: f32, k: usize, dark: bool) -> DotLook {
 /// yellow, blue, violet (its red and green, Claude's failed and done, left
 /// out) and wrap; the main row keeps the first stripe; each dot is nearest
 /// its own row's hue; adjacent task rows never share one, on any palette or
-/// ground. NEGATIVE CONTROL: read bottom up, the hues do not climb.
+/// ground.
 #[test]
 fn the_rows_take_the_dot_hues_top_down() {
     let hue = |k: usize, dark: bool| {
@@ -103,7 +103,6 @@ fn the_rows_take_the_dot_hues_top_down() {
             hues.windows(2).all(|w| w[1] > w[0]),
             "dark={dark}: the hues follow the palette {hues:?}"
         );
-        // Each dot is nearest its own row's hue.
         let rows: Vec<f32> = (1..=4)
             .map(|k| {
                 let art = CardPalette::Cruise.art(row_hue(CardPalette::Cruise, k, dark), dark);
@@ -116,7 +115,6 @@ fn the_rows_take_the_dot_hues_top_down() {
                 .unwrap();
             assert_eq!(nearest, i, "dark={dark} row {}: {h} vs {rows:?}", i + 1);
         }
-        // The fifth task row wraps to the first's hue; main keeps stripe 0.
         assert_eq!(
             look(DotMood::Running, 0.5, 1.0, 5, dark),
             look(DotMood::Running, 0.5, 1.0, 1, dark)
@@ -125,7 +123,6 @@ fn the_rows_take_the_dot_hues_top_down() {
             row_hue(CardPalette::Cruise, 0, dark),
             CardPalette::Cruise.stripe_t(0)
         );
-        // NEGATIVE CONTROL: bottom up, the hues fall.
         let reversed: Vec<f32> = hues.iter().rev().copied().collect();
         assert!(!reversed.windows(2).all(|w| w[1] > w[0]));
     }
@@ -149,9 +146,7 @@ fn the_rows_take_the_dot_hues_top_down() {
 /// for every task row, every ink and every light a running, quiet or stuck
 /// dot wears — at every work level, freshness and step of its breath — lies
 /// [`STATUS_HUE_GUARD_DEG`] or more from the hue of Claude's success green
-/// and of its error red, or has no hue at all. NEGATIVE CONTROL: the
-/// palettes' own stripes, as the rows took them before, come within it:
-/// Cruise's red and green on both grounds.
+/// and of its error red, or has no hue at all.
 #[test]
 fn no_live_dot_wears_claudes_status_hues() {
     let mut worst = f32::MAX;
@@ -201,7 +196,6 @@ fn no_live_dot_wears_claudes_status_hues() {
         worst < 40.0,
         "CONTROL: the guard is what binds ({worst:.1}°)"
     );
-    // NEGATIVE CONTROL: the raw stripes.
     for dark in [true, false] {
         let near: Vec<usize> = (0..6)
             .filter(|&k| {
@@ -218,10 +212,7 @@ fn no_live_dot_wears_claudes_status_hues() {
 /// over it for the bytes' rounding) and under a third of it 90 s in, its ring (lifted or solved to the same work's
 /// luminance, which moves chroma a little) at most 0.7 and 0.4 of it — on
 /// Cruise and Land, either ground, every task row and work level — so a
-/// quiet row never reads as Claude's done or failed by its colour. NEGATIVE
-/// CONTROL: the old fade (a mix toward Claude's grey by `1 − freshness`) left
-/// a quiet dot at its first second as vivid as a running one, and 90 s in
-/// over half as vivid.
+/// quiet row never reads as Claude's done or failed by its colour.
 #[test]
 fn quiet_is_paler_than_running() {
     for palette in [CardPalette::Cruise, CardPalette::Land] {
@@ -255,7 +246,6 @@ fn quiet_is_paler_than_running() {
             }
         }
     }
-    // NEGATIVE CONTROL: the old fade, at the first second and 90 s in.
     let hue = CardPalette::Cruise.art(row_hue(CardPalette::Cruise, 1, true), true);
     let old = |sat: f32| chroma(mix_rgb(hue, GREY_DARK, 1.0 - sat)) / chroma(hue);
     assert!(
@@ -304,7 +294,6 @@ fn more_work_is_brighter_and_wider_light() {
             );
         }
     }
-    // The paper's tint grows as the dark halo does: one radius at one level.
     for level in [0.0, 0.4, 1.0] {
         assert_eq!(
             look(DotMood::Running, level, 1.0, 3, true)
@@ -317,7 +306,6 @@ fn more_work_is_brighter_and_wider_light() {
                 .radius
         );
     }
-    // Negative control: a dot Claude marked done carries no light at any level.
     for l in [0.0, 1.0] {
         assert_eq!(
             look(DotMood::Still, l, 1.0, 2, true),
@@ -340,21 +328,17 @@ fn freshness_is_saturation() {
             c.windows(2).all(|w| w[1] < w[0]),
             "a staler dot is greyer ({dark}): {c:?}"
         );
-        // A quiet dot's light fades with its freshness too, its fill as well.
         let l1 = look(DotMood::Quiet, 0.2, 1.0, 1, dark).light.unwrap();
         let l3 = look(DotMood::Quiet, 0.2, 0.3, 1, dark).light.unwrap();
         assert!(l3.strength < l1.strength);
         assert!(dark || l3.fill < l1.fill);
     }
-    // Negative control: a running dot at full freshness is far from grey.
     assert!(chroma(look(DotMood::Running, 0.2, 1.0, 1, true).ink.unwrap()) > 0.1);
 }
 
 /// THE FADE AND THE LIFT KEEP THE HUE: [`fade_chroma`] and
 /// [`at_luminance_hue`] turn a dot hue by no more than
-/// [`STATUS_HUE_DRIFT_DEG`], the lift landing on its luminance. NEGATIVE
-/// CONTROL: [`at_luminance`]'s linear-light lift turns Cruise's orange by
-/// more than 10° at luminance 0.65.
+/// [`STATUS_HUE_DRIFT_DEG`], the lift landing on its luminance.
 #[test]
 fn the_fade_and_the_lift_keep_the_hue() {
     for palette in PALETTES {
@@ -394,7 +378,6 @@ fn the_fade_and_the_lift_keep_the_hue() {
             }
         }
     }
-    // NEGATIVE CONTROL: the linear-light lift.
     let orange = CardPalette::Cruise.art(CardPalette::Cruise.stripe_t(1), true);
     let (_, h0) = chroma_hue(orange);
     let (_, h1) = chroma_hue(at_luminance(orange, 0.65));
@@ -419,15 +402,12 @@ fn a_stuck_dot_is_grey_and_breathes_under_the_flash_bound() {
         };
         let (lo, hi) = (at(breath(Some(0))), at(breath(Some(BREATH_PERIOD_MS / 2))));
         assert!(chroma(hi.ink.unwrap()) < 0.06, "stuck reads grey");
-        // The breath swings the ring itself, not only its light.
         let swing = contrast(lo.ink.unwrap(), hi.ink.unwrap());
         assert!(swing > 1.5, "dark={dark}: the ring breathes ({swing:.2}:1)");
         let (llo, lhi) = (lo.light.unwrap(), hi.light.unwrap());
         assert!(lhi.strength > llo.strength, "it swells");
         assert_eq!(llo.radius, STUCK_RADIUS);
         assert_eq!(lhi.fill, 0.0, "a stuck dot is hollow");
-        // A stuck dot's light is that of no work, whatever level it last had:
-        // at its swell's peak no brighter than the idlest running dot's.
         let running = look(DotMood::Running, 0.9, 1.0, 1, dark).light.unwrap();
         assert!(lhi.strength < running.strength && lhi.radius < running.radius);
         let idlest = look(DotMood::Running, 0.0, 1.0, 1, dark).light.unwrap();
@@ -437,7 +417,6 @@ fn a_stuck_dot_is_grey_and_breathes_under_the_flash_bound() {
             lhi.strength,
             idlest.strength
         );
-        // Serious mode keeps the grey and drops the light.
         let serious = dot_look(
             DotMood::Stuck,
             0.9,
@@ -451,8 +430,6 @@ fn a_stuck_dot_is_grey_and_breathes_under_the_flash_bound() {
         );
         assert!(serious.ink.is_some() && serious.light.is_none());
     }
-    // The breath: floor at its start, full at half a period, one swell per
-    // period, stepped, resting after BREATH_FOR_MS and with no clock.
     assert!((breath(Some(0)) - BREATH_FLOOR).abs() < 1e-6);
     assert!((breath(Some(BREATH_PERIOD_MS / 2)) - 1.0).abs() < 1e-6);
     assert_eq!(
@@ -462,7 +439,6 @@ fn a_stuck_dot_is_grey_and_breathes_under_the_flash_bound() {
     assert_eq!(breath(Some(BREATH_PERIOD_MS + 500)), breath(Some(500)));
     assert_eq!(breath(None), BREATH_REST);
     assert_eq!(breath(Some(BREATH_FOR_MS)), BREATH_REST);
-    // Swells counted over ten seconds stay under the photosensitivity bound.
     let samples: Vec<f32> = (0..10_000 / BREATH_STEP_MS)
         .map(|i| breath(Some(i * BREATH_STEP_MS)))
         .collect();
@@ -472,7 +448,6 @@ fn a_stuck_dot_is_grey_and_breathes_under_the_flash_bound() {
         .count();
     assert!((peaks as f32) / 10.0 <= TWINKLE_FLASH_BOUND_HZ);
     assert!(peaks >= 4, "and it does breathe: {peaks} swells in 10 s");
-    // Negative control: a running dot does not breathe.
     let r = |b| {
         dot_look(
             DotMood::Running,
@@ -494,11 +469,7 @@ fn a_stuck_dot_is_grey_and_breathes_under_the_flash_bound() {
 /// while every running dot — every palette, ground, task row and work level
 /// — is lit (on paper its hollow filled too), and so is every tool dot, its
 /// light inside its ring (on paper its hollow lit), so they differ by form
-/// whatever their hues. NEGATIVE CONTROL: lit as it once was (the level-0.3
-/// light, in the amber), it was Land's gold row running at 0.3 on dark —
-/// the same light, its hue within 6° — Cruise's gold on paper lies within 1°
-/// of the amber, and Cruise's gold tool ring on paper lies within 0.06 of
-/// the awaiting print in OKLab: the ring alone does not tell them apart.
+/// whatever their hues.
 #[test]
 fn an_awaiting_dot_is_a_still_amber_ring() {
     for palette in PALETTES {
@@ -534,7 +505,6 @@ fn an_awaiting_dot_is_a_still_amber_ring() {
             }
         }
     }
-    // NEGATIVE CONTROL: the old lit awaiting dot against Land's gold row.
     let gold = look_on(CardPalette::Land, DotMood::Running, 0.3, 1.0, 3, true)
         .light
         .unwrap();
@@ -598,7 +568,6 @@ fn text_keeps_claudes_lightness_on_every_ground() {
             }
         }
     }
-    // Negative control: the palette's raw letter ink does not hold it.
     let (_, bg, fg, _) = grounds()[0];
     let off = (0..=20).any(|i| {
         let raw = CardPalette::Cruise.letter(i as f32 / 20.0, true);
@@ -648,7 +617,6 @@ fn off_reads_near_neutral() {
             assert!(chroma(l.light.unwrap().color) < 0.06, "and its light");
         }
     }
-    // Negative control: Cruise's bar is vivid.
     assert!(
         chroma(panel_ink(
             CardPalette::Cruise,
@@ -701,7 +669,6 @@ fn only_the_bars_fill_crests() {
             );
         }
     }
-    // The crest is the ripple's: zero away from every ring, positive on one.
     let field: Vec<f32> = (0..24).map(|d| crest(d as f32, 1000)).collect();
     assert!(field.iter().any(|&v| v > 0.0) && field.contains(&0.0));
 }
@@ -718,7 +685,6 @@ fn the_names_and_the_bar_walk_the_palette() {
     assert_eq!(bar_x(0, 10), 0.0);
     assert_eq!(bar_x(9, 10), 1.0);
     assert_eq!(bar_x(0, 1), 0.0);
-    // A fuller bar shows more of the rainbow: its fill reaches further along.
     let reach = |filled: usize| bar_x(filled - 1, 10);
     assert!(reach(8) > reach(3));
 }
@@ -728,8 +694,7 @@ fn the_names_and_the_bar_walk_the_palette() {
 /// the cap nor past the pane's clip — on dark an additive halo, on paper a
 /// round source-over tint as wide as the dark halo and the hollow's round
 /// fill inside the ring, each its ceiling in its colour's high byte, and no
-/// square slab. NEGATIVE CONTROL: a light of no strength and no fill draws
-/// nothing.
+/// square slab.
 #[test]
 fn a_dots_light_stays_on_its_bullet() {
     let place = DotPlace {
@@ -743,17 +708,13 @@ fn a_dots_light_stays_on_its_bullet() {
     let check = |halos: &[RainHalo], mode: HaloMode| {
         for h in halos {
             assert_eq!((h.cx, h.cy, h.mode), (105, 409, mode));
-            // One row band per quad, the band about the bullet's and its
-            // neighbours.
             let band_top = i32::from(place.cy) - 9 + (i32::from(h.row) - 22) * 18;
             assert!(i32::from(h.y) >= band_top && i32::from(h.y + h.h) <= band_top + 18);
             assert!((21..=23).contains(&h.row));
-            // Never wider than the cap, never past the pane's clip.
             assert!(f32::from(h.rx) <= DOT_RADIUS_MAX * 10.0 + 0.5);
             assert!(h.y >= 40 && h.y + h.h <= 418);
             assert!(f32::from(h.ry) <= DOT_RISE_MAX * 18.0 + 0.5);
         }
-        // The clip cuts the band under the pane's bottom.
         assert!(halos.iter().all(|h| h.row != 23), "clipped: {halos:?}");
     };
     let full = look(DotMood::Running, 1.0, 1.0, 1, true).light.unwrap();
@@ -763,7 +724,6 @@ fn a_dots_light_stays_on_its_bullet() {
     check(&halos, HaloMode::Add);
     let dark_rx = halos[0].rx;
 
-    // Paper: the tint, then the fill, both round veils over the glyph.
     let paper = look(DotMood::Running, 1.0, 1.0, 1, false).light.unwrap();
     let mut halos = Vec::new();
     dot_light_quads(&paper, false, place, &mut halos);
@@ -786,13 +746,11 @@ fn a_dots_light_stays_on_its_bullet() {
         halos.iter().position(|h| h.rx != dark_rx) > halos.iter().position(|h| h.rx == dark_rx),
         "the fill over the tint"
     );
-    // A dim light keeps a small tint: work reads by the tint's size on paper.
     let dim = look(DotMood::Running, 0.0, 1.0, 1, false).light.unwrap();
     let mut small = Vec::new();
     dot_light_quads(&dim, false, place, &mut small);
     let widest = |h: &[RainHalo]| h.iter().map(|q| q.rx).max().unwrap();
     assert!(widest(&small) < widest(&halos));
-    // Negative control: a light of no strength and no fill draws nothing.
     for dark in [true, false] {
         let mut halos = Vec::new();
         let none = DotLight {
@@ -809,8 +767,7 @@ fn a_dots_light_stays_on_its_bullet() {
 /// or tint and fill (light) is its fresh hue, at least as vivid as its ink
 /// (on paper the ring is the hue as a print ink, at most
 /// [`PRINT_RING_LUMA`]), so a running dot's light reads in its agent's
-/// colour; an awaiting dot is unlit. NEGATIVE CONTROL: a
-/// stuck dot's light is near grey.
+/// colour; an awaiting dot is unlit.
 #[test]
 fn the_light_is_the_agents_hue_and_a_stuck_dots_is_grey() {
     for dark in [true, false] {
@@ -850,10 +807,7 @@ fn the_light_is_the_agents_hue_and_a_stuck_dots_is_grey() {
 /// every ring — running and quiet at every work level and freshness, a stuck
 /// one at every step of its breath, an awaiting one — holds it against the
 /// paper with both under the dot's own tint at its ceiling (the ring lies in
-/// the tint's plateau), the running ones [`PRINT_RING_CONTRAST`]. NEGATIVE
-/// CONTROLS: a stuck ring paled 45 % toward white at its breath's floor, as
-/// it once was, falls under 3:1 on Linen; and Cruise's gold ring at its print
-/// luminance, unsolved, falls under it there beneath a full-work tint.
+/// the tint's plateau), the running ones [`PRINT_RING_CONTRAST`].
 #[test]
 fn every_dot_holds_three_to_one_on_its_ground() {
     let mut cases: Vec<(&str, u32, bool)> = grounds()
@@ -910,7 +864,6 @@ fn every_dot_holds_three_to_one_on_its_ground() {
             }
         }
     }
-    // NEGATIVE CONTROL: the old trough on paper.
     let (_, linen) = papers()[1];
     let swell = dot_look(
         DotMood::Stuck,
@@ -927,7 +880,6 @@ fn every_dot_holds_three_to_one_on_its_ground() {
     .unwrap();
     let old = mix_rgb(swell, 0x00FF_FFFF, 1.0 - BREATH_FLOOR);
     assert!(contrast(old, linen) < 3.0, "{:.2}:1", contrast(old, linen));
-    // NEGATIVE CONTROL: the gold ring unsolved, under its full-work tint.
     let gold = CardPalette::Cruise.art(CardPalette::Cruise.stripe_t(2), false);
     let top = at_luminance(gold, PRINT_RING_LUMA * (1.0 - DOT_DEEPEN_LIGHT));
     let veil = alpha_byte(TINT_ALPHA_MIN + TINT_ALPHA_GAIN);
@@ -944,8 +896,7 @@ fn every_dot_holds_three_to_one_on_its_ground() {
 /// at a waiting dot's levels; Off's moonbow has no chroma to keep), its light is
 /// [`TOOL_GLOW`] of a running dot's (on paper its hollow's fill too), held
 /// inside its ring ([`TOOL_RADIUS`], where every running dot's light spreads
-/// past it), and never breathes. NEGATIVE CONTROL: the stuck look fails the
-/// freshness test, and a running one the dimness test.
+/// past it), and never breathes.
 #[test]
 fn a_tool_dot_is_fresh_still_and_dim() {
     let fresh_and_dim = |look: DotLook, running: DotLook, dark: bool| {
@@ -970,9 +921,6 @@ fn a_tool_dot_is_fresh_still_and_dim() {
                             "{palette:?} dark={dark} k={k} level={level}"
                         );
                         let stuck = at(DotMood::Stuck, level, SAT_STUCK_TEST, 1.0);
-                        // Never the stuck dot's grey: three times its chroma
-                        // at any level, and 0.1 more (OKLab) at a waiting
-                        // dot's own levels (its tokens still: little rate).
                         let (ct, cs) = (chroma(tool.ink.unwrap()), chroma(stuck.ink.unwrap()));
                         assert!(
                             ct >= 3.0 * cs,
@@ -984,7 +932,6 @@ fn a_tool_dot_is_fresh_still_and_dim() {
                                 "{palette:?} dark={dark} k={k}: {ct:.3} vs {cs:.3}"
                             );
                         }
-                        // Controls.
                         assert!(!fresh_and_dim(stuck, running, dark));
                         assert!(!fresh_and_dim(running, running, dark));
                     }
@@ -999,7 +946,6 @@ fn a_tool_dot_is_fresh_still_and_dim() {
             }
         }
     }
-    // Serious mode keeps its ink and drops its light.
     let serious = dot_look(
         DotMood::Tool,
         0.0,

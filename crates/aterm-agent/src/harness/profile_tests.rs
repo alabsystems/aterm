@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the allowlist reader of Claude Code's `.claude.json`
-//! ([`super::parse`], [`super::read`]), the account key, the plan words and
-//! the Fable plan answer. Every file here is composed: invented example.com
-//! names, invented ids, and a sentinel wherever the real file can hold a
-//! credential or a person's name. The allocation-size control for large escaped
-//! unknown values is `tests/profile_sentinels.rs`; it never reads allocator
-//! payloads or uninitialized spare capacity.
+//! Tests for the `.claude.json` allowlist reader ([`super::parse`], [`super::read`]).
 
 use aterm_json::{Value, json};
 use aterm_tempfile::TempDir as Tmp;
@@ -157,7 +151,6 @@ fn subscription_shared_profile_is_bound_to_the_captured_secure_storage_login() {
     assert_eq!(first.weekly.as_deref(), Some("weekly 29% left"));
     assert!(read(&second_env, Some(&roster)).is_none());
 
-    // Starting the other login overwrites the same home profile, not either env.
     write("second@example.com");
     assert!(read(&first_env, Some(&roster)).is_none());
     assert_eq!(
@@ -172,7 +165,6 @@ fn subscription_shared_profile_is_bound_to_the_captured_secure_storage_login() {
     let mut missing_email = roster.clone();
     missing_email.rows[1].email = None;
     assert!(read(&second_env, Some(&missing_email)).is_none());
-    // The same binding works when a renewal moved the login to another item.
     let mut renewed = roster.clone();
     let previous = renewed.rows[1].dir.take();
     renewed.rows[1].was.push(previous);
@@ -192,9 +184,7 @@ fn parse_subscription(bytes: &[u8], now: i64) -> Result<SubscriptionDisplay, NoP
 /// The plan usage is read by the footer's own selection and currency rule (Stats Deck v2
 /// T-A1): a reading fetched over fifteen minutes ago or in the future, windows that reset
 /// at or before now, another account's cache, a shared default home whose roster lists
-/// several logins, and an address the roster does not bind each give none. The binding
-/// window is the most used of the five-hour, the seven-day and the model's own, and none
-/// is named while one of them has a share that did not read.
+/// several logins, and an address the roster does not bind each give none.
 #[test]
 fn plan_usage_selection() {
     use super::super::accounts::{Roster, Row};
@@ -204,7 +194,6 @@ fn plan_usage_selection() {
     std::fs::create_dir(&records).unwrap();
     let profile = root.path().join(".claude.json");
     let env = vec![format!("HOME={}", root.path().display())];
-    // 2026-10-15T07:40:00Z.
     let now = 1_792_050_000;
     let weekly_reset = instant("2026-10-18T20:50:00Z").unwrap();
     let row = |email: Option<&str>| Row {
@@ -246,7 +235,6 @@ fn plan_usage_selection() {
             "five_hour": five_hour,
             "seven_day": window(71.0, "2026-10-18T20:50:00Z"),
             "seven_day_opus": window(80.0, "2026-10-18T20:50:00Z"),
-            // No reset: it cannot say what remains, so it never binds.
             "seven_day_sonnet": {"utilization": 99, "resets_at": null},
             "limits": [scoped("Fable 5.1", 90.0), scoped("Haiku", 99.0)]
         })
@@ -264,7 +252,6 @@ fn plan_usage_selection() {
             read_at: now,
         })
     );
-    // The model's own weekly bucket gates it; another model's does not.
     for (model, expected) in [
         ("claude-opus-5-5", (Bucket::SevenDayOpus, 800)),
         ("Opus 5.5", (Bucket::SevenDayOpus, 800)),
@@ -275,9 +262,7 @@ fn plan_usage_selection() {
     ] {
         assert_eq!(binding(now, Some(model)), Some(expected), "{model}");
     }
-    // The fifteen minutes include their last second.
     assert_eq!(binding(now + 15 * 60, None), Some((Bucket::SevenDay, 710)));
-    // A reading kept past its read goes stale by the same rule.
     let kept = read(Some(&owner), now, None).expect("a current reading");
     assert!(kept.current_at(now + 15 * 60));
     assert!(!kept.current_at(now + 15 * 60 + 1));
@@ -294,7 +279,6 @@ fn plan_usage_selection() {
         !ending.current_at(now + 60),
         "a window that resets at now is over"
     );
-    // The footer's one read answers both as the two readers do.
     assert_eq!(
         subscription_and_plan_for(&env, root.path(), &records, Some(&owner), now, Some("opus")),
         subscription_for(&env, root.path(), &records, Some(&owner), now).zip(Some(read(
@@ -313,7 +297,6 @@ fn plan_usage_selection() {
         binding(now, Some("claude-fable-5-1")),
         Some((Bucket::FiveHour, 950))
     );
-    // A window that resets at now is over: the next most used binds.
     write(&reading(
         now,
         UUID,
@@ -335,7 +318,6 @@ fn plan_usage_selection() {
         "every window reset at or before now"
     );
 
-    // Sonnet's own bucket binds a Sonnet model, by id, display name or alias.
     write(&reading(
         now,
         UUID,
@@ -352,8 +334,6 @@ fn plan_usage_selection() {
     }
     assert_eq!(binding(now, Some("opus")), Some((Bucket::SevenDay, 710)));
 
-    // Of Fable's per-version rows, the one named for the model is its own; a model
-    // named by no row's version (the bare alias) is gated by every Fable row.
     write(&reading(
         now,
         UUID,
@@ -374,8 +354,6 @@ fn plan_usage_selection() {
         );
     }
 
-    // A window that gates the model but whose share did not read could be the one that
-    // binds, so none is named; a model it does not gate still reads.
     for share in [json!(null), json!("high")] {
         write(&reading(
             now,
@@ -392,7 +370,6 @@ fn plan_usage_selection() {
         );
     }
 
-    // The currency rule: stale or future readings say nothing.
     write(&reading(now, UUID, calm.clone()));
     assert_eq!(
         binding(now + 15 * 60 + 1, None),
@@ -403,7 +380,6 @@ fn plan_usage_selection() {
     write(&reading(now, "another-account", calm.clone()));
     assert_eq!(binding(now, None), None, "another account's cache");
 
-    // The selection is the footer's: where it refuses the profile, both say nothing.
     write(&reading(now, UUID, calm));
     let several = Roster {
         rows: vec![
@@ -512,7 +488,6 @@ fn composed() -> Value {
             "tengu_calm_seal": ["Nimbus", format!("{SENTINEL}-seal")],
             "tengu_other_flag": {"token": format!("{SENTINEL}-flag")}
         },
-        // The consents, keyed by an organization's or an account's id.
         "fableOverageConsentV2": keyed(&[
             (&format!("{SENTINEL}-consent-org"), json!(false)),
             (&format!("acct:{UUID}"), json!(true)),
@@ -573,8 +548,6 @@ fn word(text: &str) -> Option<Word> {
     Word::new(text)
 }
 
-// The allowlist
-
 /// Every allowlisted field of a whole composed profile reads, in aterm's
 /// words.
 #[test]
@@ -596,7 +569,6 @@ fn a_composed_profile_reads_every_allowlisted_field() {
     );
     assert_eq!(p.credits, Credits::On);
     assert_eq!(p.fable, FablePlan::Included);
-    // A consent `true` under any id; a family's name, never an id.
     assert_eq!(p.consented, ["fable", "nimbus"]);
     assert_eq!(p.credits_only, Some(vec!["nimbus".to_string()]));
     let usage = p.usage.expect("the cached body names this account");
@@ -675,9 +647,7 @@ fn a_composed_profile_reads_every_allowlisted_field() {
 }
 
 /// THE SENTINEL TEST (design §8.4, A0): nothing the reader answers holds any
-/// part of a credential, an identity field or the account id. NEGATIVE
-/// CONTROL: a reader of the whole file (the precedent's `Value`) holds
-/// every one of them, so the sentinels are where a reader could reach them.
+/// part of a credential, an identity field or the account id.
 #[test]
 fn no_credential_identity_or_id_reaches_what_is_answered() {
     let text = aterm_json::to_string(&composed()).expect("compose");
@@ -723,8 +693,7 @@ fn no_credential_identity_or_id_reaches_what_is_answered() {
 }
 
 /// A KEY READS BACK FROM ITS TEXT ([`AccountKey::parse`]), as the accounts
-/// state keeps it, Claude's and Codex's alike. NEGATIVE CONTROLS: another
-/// prefix, another length, an uppercase digit and a non-hex digit are no key.
+/// state keeps it, Claude's and Codex's alike.
 #[test]
 fn a_key_reads_back_from_its_text_and_nothing_else_does() {
     let claude = AccountKey::claude(UUID).expect("a key");
@@ -766,8 +735,7 @@ fn a_file_that_is_not_json_is_one_word() {
 }
 
 /// A kept field of another type reads as absent; the rest of the file
-/// still reads. A vendor build that changes one field's shape costs that
-/// field, never the profile.
+/// still reads.
 #[test]
 fn a_field_of_another_shape_reads_absent_and_the_rest_still_reads() {
     let v = with(composed(), &["oauthAccount", "organizationType"], json!(5));
@@ -917,11 +885,7 @@ fn the_credits_word_follows_the_cached_reason() {
 }
 
 /// The cached body is kept only where it names the profile's own account,
-/// as Claude Code itself drops it; and only with its fetch time. One that
-/// names ANOTHER account keeps only when it was fetched: that account was
-/// signed in to the home then (`usage_of_another_at`, the stats'
-/// attribution). NEGATIVE CONTROLS: the body of the profile's own account,
-/// or one that names no account, says no other was seen.
+/// as Claude Code itself drops it; and only with its fetch time.
 #[test]
 fn a_cached_body_of_another_account_is_dropped() {
     let other = with(
@@ -942,8 +906,6 @@ fn a_cached_body_of_another_account_is_dropped() {
     );
     assert_eq!(parsed(&composed()).usage_of_another_at, None);
 }
-
-// The Fable plan answer
 
 fn fable_of(plan: &str, seat: &str, features: Value) -> FablePlan {
     fable_at(plan, seat, "default_claude_max_5x", features)
@@ -1172,8 +1134,6 @@ fn the_fable_plan_answer_is_decided_in_claude_codes_order() {
     }
 }
 
-// The key
-
 /// The key is design §3.1's hash, computed here independently: one id gives
 /// one key wherever it is read, the agent is in the hash, and the id is in
 /// no part of what a key prints.
@@ -1218,8 +1178,6 @@ fn the_key_is_the_designs_hash_of_the_id() {
     assert_eq!(AccountKey::claude(&"a".repeat(129)), None);
 }
 
-// Instants
-
 /// Every instant shape the vendor writes: UTC with and without a fraction,
 /// an offset applied, a bare date at midnight UTC; anything else none.
 #[test]
@@ -1242,8 +1200,6 @@ fn instants_read_in_every_shape_the_vendor_writes() {
         assert_eq!(instant(text), want, "{text}");
     }
 }
-
-// Where, and the read
 
 /// The profile's path is aterm's home rule: beside the user's own
 /// `~/.claude` with no `CLAUDE_CONFIG_DIR`, inside any set one — the user's
@@ -1319,9 +1275,7 @@ fn the_profile_path_follows_the_home_rule() {
 /// for the plain profile, present or not, a link to one too; an empty one
 /// does only while it has a write bit and no plain file is there; and a
 /// custom OAuth URL renames the plain file, whose absence is then the
-/// renamed one's. CONTROL: no `.config.json`, an empty read-only one, an
-/// empty writable one beside a plain file, a directory by that name, and an
-/// unknown records directory each leave the plain file.
+/// renamed one's.
 #[cfg(unix)]
 #[test]
 fn the_file_read_is_the_one_claude_code_picks() {
@@ -1338,12 +1292,10 @@ fn the_file_read_is_the_one_claude_code_picks() {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits)).expect("chmod");
     };
 
-    // CONTROL: no `.config.json`, the plain file, there or not.
     assert_eq!(pick(false), plain);
     std::fs::write(&plain, "{}").expect("plain");
     assert_eq!(pick(false), plain);
 
-    // One that holds a byte wins, whatever its mode and the plain file's.
     std::fs::write(&legacy, "{}").expect("legacy");
     assert_eq!(pick(false), legacy);
     mode(&legacy, 0o444);
@@ -1351,7 +1303,6 @@ fn the_file_read_is_the_one_claude_code_picks() {
     std::fs::remove_file(&plain).expect("rm");
     assert_eq!(pick(false), legacy);
 
-    // An empty one: only with a write bit, and no plain file.
     std::fs::remove_file(&legacy).expect("rm");
     std::fs::write(&legacy, "").expect("legacy");
     mode(&legacy, 0o444);
@@ -1361,14 +1312,12 @@ fn the_file_read_is_the_one_claude_code_picks() {
     std::fs::write(&plain, "{}").expect("plain");
     assert_eq!(pick(false), plain, "CONTROL: empty, beside a plain file");
 
-    // A custom OAuth URL: the renamed file, whose absence counts.
     assert_eq!(pick(true), legacy, "no .claude-custom-oauth.json");
     std::fs::write(&custom, "{}").expect("custom");
     assert_eq!(pick(true), custom);
     std::fs::remove_file(&legacy).expect("rm");
     assert_eq!(pick(true), custom);
 
-    // A link to one that holds a byte is followed; a directory is not one.
     let elsewhere = tmp.path().join("kept.json");
     std::fs::write(&elsewhere, "{}").expect("kept");
     std::os::unix::fs::symlink(&elsewhere, &legacy).expect("link");
@@ -1378,15 +1327,10 @@ fn the_file_read_is_the_one_claude_code_picks() {
     assert_eq!(pick(false), plain, "CONTROL: a directory");
     std::fs::remove_dir(&legacy).expect("rm");
 
-    // CONTROL: records unknown, no `.config.json` looked for.
     std::fs::write(&legacy, "{}").expect("legacy");
     assert_eq!(effective(&plain, None, false), plain);
     assert_eq!(effective(&plain, None, true), custom);
 
-    // Billing is more conservative than this informational reader. A usable
-    // legacy file leaves normal versus diskless selection unknown; no legacy
-    // candidate allows the actual captured filename. Selection I/O errors
-    // remain errors instead of taking the informational fallback.
     assert!(effective_for_billing(&plain, Some(&records), Selection::Standard).is_err());
     std::fs::remove_file(&legacy).expect("remove billing legacy");
     assert_eq!(
@@ -1404,8 +1348,6 @@ fn the_file_read_is_the_one_claude_code_picks() {
     std::fs::remove_file(&legacy).expect("remove selector cycle");
     std::fs::write(&legacy, "{}").expect("restore legacy control");
 
-    // The picker must read that effective profile too, never the stale plain
-    // file beside it. These profiles and the process HOME are all owned here.
     let subscription = r#"{"oauthAccount":{"organizationType":"claude_max"}}"#;
     let console = r#"{"oauthAccount":{"organizationType":"api_console"}}"#;
     let env = vec![format!("HOME={}", home.display())];
@@ -1456,7 +1398,7 @@ fn the_file_read_is_the_one_claude_code_picks() {
 }
 
 /// A custom OAuth URL renames the profile when it is set and not empty, as
-/// Claude Code's JavaScript tests it. CONTROL: unset, and set empty.
+/// Claude Code's JavaScript tests it.
 #[test]
 fn a_custom_oauth_url_counts_when_it_is_not_empty() {
     use std::ffi::OsStr;
@@ -1491,9 +1433,7 @@ fn read_answers_the_profile_or_why_not() {
 }
 
 /// A FIFO planted where the profile should be is not a file, answered at
-/// once: the open does not wait for a writer. The wait is a one-minute hang
-/// detector; past it the test opens the FIFO's other end itself, so a
-/// reader stuck in its open is let go before the test fails.
+/// once: the open does not wait for a writer.
 #[cfg(unix)]
 #[test]
 fn a_fifo_is_not_a_profile_and_does_not_block() {
@@ -1523,10 +1463,7 @@ fn a_fifo_is_not_a_profile_and_does_not_block() {
 
 /// [`answers_to`]: the effective profile's `oauthAccount.emailAddress`
 /// compared with a row's address, case aside, in a home the process's
-/// environment names — `CLAUDE_CONFIG_DIR`'s profile inside it. NEGATIVE
-/// CONTROLS: another address, an address that is no string, a profile with
-/// none, one that is not JSON and none at all say no or nothing; the plain
-/// profile beside a set `CLAUDE_CONFIG_DIR` is not that home's.
+/// environment names — `CLAUDE_CONFIG_DIR`'s profile inside it.
 #[test]
 fn a_login_answers_to_its_rows_address_alone() {
     let tmp = tmp_dir("answers");
@@ -1541,7 +1478,6 @@ fn a_login_answers_to_its_rows_address_alone() {
     )
     .expect("profile");
     assert_eq!(answers_to(&env, &home, row), Some(true));
-    // NEGATIVE CONTROLS.
     assert_eq!(answers_to(&env, &home, "other@example.com"), Some(false));
     for (text, want) in [
         (r#"{"oauthAccount":{"emailAddress":7}}"#, None),
@@ -1557,7 +1493,6 @@ fn a_login_answers_to_its_rows_address_alone() {
     }
     std::fs::remove_file(&plain).expect("gone");
     assert_eq!(answers_to(&env, &home, row), None);
-    // A home of its own: its own profile, never the plain one.
     let own = tmp.path().join("own");
     std::fs::create_dir_all(&own).expect("own home");
     std::fs::write(
@@ -1579,11 +1514,7 @@ fn a_login_answers_to_its_rows_address_alone() {
 /// [`muse_subscription_for`]: Muse Code's login store under the config
 /// home its environment names, the `meta` provider's `user_email` alone
 /// (MEASURED on 1.4.11-R6667.1), and only for a process on that
-/// provider. NEGATIVE CONTROLS: another provider named on its command
-/// line or in its settings, an API key in the environment, a store with
-/// no address, a non-oauth mechanism and no store at all name no
-/// account; a prompt's `--provider` after `--` names none; a key
-/// another mechanism keeps in the store is never read out as one.
+/// provider.
 #[test]
 fn a_muse_login_store_names_its_account_alone() {
     let tmp = tmp_dir("muse-auth");
@@ -1606,8 +1537,6 @@ fn a_muse_login_store_names_its_account_alone() {
     let shown = muse_subscription_for(&args(&["muse"]), &env, &home).expect("the account");
     assert_eq!(shown.email.as_deref(), Some("owner@example.com"));
     assert_eq!((shown.plan, shown.weekly), (None, None));
-    // NEGATIVE CONTROLS: a process on another provider is not this
-    // login's, however its command line spells the choice.
     for words in [
         vec!["muse", "--provider", "echo"],
         vec!["muse", "--provider=local"],
@@ -1663,7 +1592,6 @@ fn a_muse_login_store_names_its_account_alone() {
     }
     std::fs::remove_file(&auth).expect("gone");
     assert_eq!(muse_subscription_for(&args(&["muse"]), &env, &home), None);
-    // An XDG config home of its own: its own store, never the home's.
     let xdg = tmp.path().join("xdg");
     std::fs::create_dir_all(xdg.join("muse")).expect("xdg store");
     std::fs::write(

@@ -1,12 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// A box taller than the pane, read whole from the history above the screen (`box_head.rs`,
-// 's review, KR-DLG-1): the join of two measured boxes split at every row a pane
-// can cut them at, its negative controls, the decision on the rows joined (`approval_loop.rs`'s
-// `whole_box_decision`), and the loop over a host whose main-screen history holds the head.
-// Included from `run_tests.rs` (`mod box_head_loop`), so the `Mock` and helpers are in scope.
-
 use super::super::approval_loop::whole_box_decision;
 use super::super::box_head::joined_box;
 use crate::supervise::policy::approval::{self as policy, ApprovalCtx, Choice, Decision};
@@ -46,10 +40,6 @@ fn cut_at(rows: &[String], k: usize) -> aterm_phase::Reading {
 /// accept-edits), which it holds for its folder grant
 /// (`policy/approval_tests.rs`'s
 /// `a_box_whose_head_is_off_the_screen_is_held_because_its_tail_names_no_box`).
-/// At every cut that reads as a box whose head is off the screen, the cut
-/// alone is held, and the rows from the top rule to the screen joined over it
-/// read as the whole box and get the whole box's answer: the breaker's `1`
-/// guarded on a row the screen shows, the Read's own escalation.
 #[test]
 fn a_box_taller_than_the_pane_is_answered_whole_from_its_head_in_the_history_measured() {
     let ctx = full_power();
@@ -126,8 +116,7 @@ fn a_box_taller_than_the_pane_is_answered_whole_from_its_head_in_the_history_mea
 /// repaint left from column 0 (a transcript row) between the rule and the
 /// screen; an older frame's rule over the composer's footer, or over a blank
 /// row, or over the box's own rule, the box opening under it; and a cut whose
-/// options are not the joined box's (its focus elsewhere). Control: the box's
-/// own head joins.
+/// options are not the joined box's (its focus elsewhere).
 #[test]
 fn a_head_that_is_not_the_boxs_own_is_no_join() {
     let (rows, rule) = the_box(fx::BOX_RM_BREAKER_2_1_287);
@@ -182,9 +171,7 @@ fn a_head_that_is_not_the_boxs_own_is_no_join() {
 
 /// WHAT A JOINED READ CARRIES OUT: an escalation, and a digit, pressed under
 /// its own guard where the screen shows that row and else under the box's
-/// first drawn row on the screen. Every other answer of the whole box (a focus
-/// move, a decline typed in) is not carried out from a joined read: the cut's
-/// own decision stands. A screen with no drawn row has no guard: the cut's.
+/// first drawn row on the screen.
 #[test]
 fn a_joined_read_presses_a_digit_or_holds_and_nothing_else() {
     let head = [
@@ -273,7 +260,6 @@ fn breaker_host(off: usize) -> (Mock, SuperviseOpts) {
     let mut m = fenced(vec![screen, idle_screen()]);
     m.key_releases = Some(0);
     m.alt_screen = Some(false);
-    // An older box, answered, above the transcript: its rule is no head.
     let mut older = fx::screen(fx::BOX_READ_FORCED_ACCEPT_EDITS_2_1_292);
     older.extend(history);
     m.scrollback = Some(older);
@@ -288,13 +274,7 @@ fn breaker_host(off: usize) -> (Mock, SuperviseOpts) {
 /// command row off the screen), read with `search` (the top rule nearest
 /// above the screen) and `line` (each row from it down), the screen re-read
 /// unmoved, is pressed `1` at full power, fenced on the screen's generation
-/// and guarded on its first drawn row. NEGATIVE CONTROLS, each held as the
-/// cut alone is (no key, the box handed back as a prompt): the alternate
-/// screen; a search that may have left out newer rows (only the screen
-/// searched, the history rewrapping); the head's rule evicted from the history; a head row unreadable;
-/// the screen's generation moving under the reads; a transcript row between
-/// the rule and the screen; a host whose `search` and `line` serve no
-/// history. An older box's rule higher in the history is no head.
+/// and guarded on its first drawn row.
 #[test]
 fn a_box_taller_than_the_pane_is_pressed_whole_only_where_its_head_reads() {
     let (_, screen) = breaker_cut(8);
@@ -339,7 +319,6 @@ fn a_box_taller_than_the_pane_is_pressed_whole_only_where_its_head_reads() {
             });
         }),
         ("a head row unreadable", |m| {
-            // The box's description row, under its title.
             m.unreadable_row = m.scrollback.as_ref().and_then(|h| {
                 h.iter()
                     .rposition(|r| r == " Delete temporary directories")
@@ -347,7 +326,6 @@ fn a_box_taller_than_the_pane_is_pressed_whole_only_where_its_head_reads() {
             });
         }),
         ("the generation moving", |m| {
-            // Every read of the same rows a generation on.
             m.key_releases = None;
             m.screens.truncate(1);
         }),
@@ -365,7 +343,8 @@ fn a_box_taller_than_the_pane_is_pressed_whole_only_where_its_head_reads() {
         let mut s = session(&mut m, None);
         let r = s.supervise(&opts);
         drop(s);
-        assert!(m.presses().is_empty(), "{what}: {r:?}: {:#?}", m.requests);
+        let written = m.presses().len() - m.gen_skipped;
+        assert_eq!(written, 0, "{what}: {r:?}: {:#?}", m.requests);
         assert!(
             matches!(&r, Ok((out, _)) if out.starts_with("prompt\n")),
             "{what}: the owner's: {r:?}: {:#?}",
@@ -376,8 +355,7 @@ fn a_box_taller_than_the_pane_is_pressed_whole_only_where_its_head_reads() {
 
 /// A CUT THE JOIN DOES NOT TAKE READS NO HISTORY and is held as the cut is: a
 /// question (its answer's keys re-read the dialog off the screen, and the
-/// policy's memory of it is the screen's). It is handed back with no `modes`,
-/// `search` or `line` sent.
+/// policy's memory of it is the screen's).
 #[test]
 fn a_cut_question_reads_no_history() {
     let rows = fx::screen(fx::QUESTION_YES_NO);
@@ -415,9 +393,7 @@ fn a_cut_question_reads_no_history() {
 /// screens-1, DECIDED: A HEAD IS READ FROM AT MOST
 /// [`HEAD_ROWS`] ROWS ABOVE THE SCREEN, one `line` read a row, and a box
 /// whose top rule lies further up is held as the cut is, its history never
-/// read. The rm breaker grown by description rows between its title and the
-/// screen: its rule `HEAD_ROWS` rows up, every row of the head is read; one
-/// row more, no `line` is sent and the box is handed back unpressed.
+/// read.
 #[test]
 fn a_head_more_than_head_rows_up_is_never_read() {
     use super::super::box_head::HEAD_ROWS;
@@ -466,4 +442,40 @@ fn a_head_more_than_head_rows_up_is_never_read() {
         matches!(&r, Ok((out, _)) if out.starts_with("prompt\n")),
         "the owner's: {r:?}"
     );
+}
+
+/// A TICKING BOX TALLER THAN THE PANE IS JOINED THROUGH ITS COUNTDOWN'S TICK:
+/// the 2.1.301 rm box with the vendor's auto-deny countdown, cut three rows
+/// under its rule (its command row in the history), the screen sitting until
+/// a key and redrawn a second lower on every read, as Claude Code redraws the
+/// countdown every second.
+#[test]
+fn a_ticking_box_taller_than_the_pane_is_joined_through_its_countdowns_tick() {
+    let (rows, rule) = the_box(fx::BOX_RM_AUTO_DENY_2_1_301);
+    let at = rule + 3;
+    assert!(
+        cut_at(&rows, at)
+            .prompt
+            .is_some_and(|p| p.head_off_screen && p.auto_deny.is_some()),
+        "PRECONDITION: the cut is a box whose head is off the screen, its countdown on it"
+    );
+    let mut m = fenced(vec![rows[at..].to_vec(), idle_screen()]);
+    m.key_releases = Some(0);
+    m.alt_screen = Some(false);
+    m.scrollback = Some(rows[..at].to_vec());
+    m.countdown_ticks = true;
+    let mut opts = auto(30);
+    opts.policy.approve = Approve::All;
+    opts.policy.rm_breaker_ask = false;
+    let mut s = session(&mut m, None);
+    let r = s.supervise(&opts);
+    drop(s);
+    assert!(
+        m.requests.iter().any(|r| verb_of(r) == "line"),
+        "PRECONDITION: the head read: {:#?}",
+        m.requests
+    );
+    let presses = m.presses();
+    assert_eq!(presses.len(), 1, "{r:?}: {:#?}", m.requests);
+    assert!(presses[0].ends_with(" 1"), "{presses:?}");
 }

@@ -23,6 +23,7 @@ pub enum ResetSpec {
 }
 
 /// A clock time with no date that passed less than this long ago is today's, passed (the
+/// notice sat unread across it); older, it is tomorrow's.
 const SAME_DAY: i64 = 19 * 3600;
 
 /// Maximum forward offset in seconds for a bare session-limit clock time.
@@ -472,6 +473,7 @@ enum DateZone<'a> {
 }
 
 /// `date +%z` at the instant `unix` in `zone`: the one subprocess behind
+/// [`offset_at`].
 fn date_offset(zone: DateZone<'_>, unix: i64) -> Option<i64> {
     if !cfg!(unix) {
         return None;
@@ -556,6 +558,7 @@ mod tests {
     use super::*;
 
     /// The test's zone table: what `date` answers on a machine that knows
+    /// these two zones, in mid-September (daylight time).
     fn zones(zone: &str) -> Option<i64> {
         match zone {
             "America/Los_Angeles" => Some(-7 * 3600),
@@ -573,6 +576,8 @@ mod tests {
     }
 
     /// A RESET READS AS ITS NOTICE SAID IT, less the zone: the date and the
+    /// clock where the notice names both, the clock alone where it names no
+    /// date, midnight and noon on the twelve.
     #[test]
     fn a_reset_clock_reads_as_its_notice_said_it() {
         let words = |text: &str| ResetClock::of(Some(text)).map(|c| c.words());
@@ -589,6 +594,8 @@ mod tests {
     }
 
     /// A reset in the next calendar year names the year (2.1.283's formatter
+    /// adds it when the year differs): read as the date and clock, the year
+    /// left to `reset_at`, which places the date in the year nearest now.
     #[test]
     fn a_reset_that_names_its_year_parses() {
         for text in [
@@ -680,6 +687,7 @@ mod tests {
     }
 
     /// The auto-continue notice: its time (handed over as `1:50pm`, or the phrase) is a bare
+    /// clock time, and `continuing shortly` (or `shortly`) a minute from now.
     #[test]
     fn the_auto_continue_shapes_are_a_time_today_or_tomorrow_or_a_minute() {
         let one_fifty = ResetSpec::At {
@@ -755,6 +763,8 @@ mod tests {
     }
 
     /// A `/goal` echo that says Claude Code continues by itself is the
+    /// vendor's countdown, armed: the worker busy after it is the
+    /// continuation.
     #[test]
     fn a_goal_echo_that_continues_by_itself_is_resumes_by_itself() {
         assert!(resumes_by_itself(
@@ -777,6 +787,8 @@ mod tests {
     }
 
     /// Past and future: a date behind now is behind (the limit reset while
+    /// the notice sat), and the year the notice leaves out is the one that
+    /// puts the date nearest now — across New Year either way.
     #[test]
     fn a_passed_date_is_passed_and_the_year_left_out_is_the_nearest() {
         let sep_15 = at("Sep 15 at 4pm (America/Los_Angeles)");
@@ -798,6 +810,7 @@ mod tests {
     }
 
     /// A clock time with no date: today's when ahead or passed at most 19 hours ago
+    /// ([`SAME_DAY`]), else tomorrow's; midnight is `12am`.
     #[test]
     fn a_bare_time_is_todays_or_tomorrows_and_midnight_is_12am() {
         let t = at("7:30pm (America/Los_Angeles)");
@@ -824,6 +837,7 @@ mod tests {
     }
 
     /// America/Los_Angeles around its 2026 switches: PST until 2026-03-08
+    /// 10:00Z, PDT until 2026-11-01 09:00Z, PST after.
     fn la_at(t: i64) -> Option<i64> {
         Some(if (1_772_964_000..1_793_523_600).contains(&t) {
             -7 * 3600
@@ -833,6 +847,7 @@ mod tests {
     }
 
     /// Across a daylight-saving jump a bare clock time lands where the zone's
+    /// clock shows it then, and the five-hour rule counts real hours.
     #[test]
     fn a_reset_across_a_dst_jump_is_placed_in_real_time() {
         let four = parse_reset("4am (America/Los_Angeles)").unwrap();
@@ -867,6 +882,7 @@ mod tests {
     }
 
     /// `date` answers a zone's offset at an instant, where the machine has
+    /// the zone; a name no zone has, or a path, is asked nothing.
     #[cfg(unix)]
     #[test]
     fn a_zones_offset_is_read_at_the_instant() {
@@ -888,6 +904,8 @@ mod tests {
     }
 
     /// A dated reset is placed with the offset its zone has where it falls: read on 2026-10-30
+    /// 12:00 PDT, `Nov 2 at 9am` is PST, 17:00Z, not 16:00Z; read on 2026-03-06 12:00 PST,
+    /// `Mar 9 at 9am` is PDT, 16:00Z, not 17:00Z.
     #[test]
     fn a_dated_reset_across_a_dst_change_is_placed_with_the_offset_there() {
         let la = |text: &str, now: i64| {
@@ -908,6 +926,7 @@ mod tests {
     }
 
     /// The zone `date +%z` prints, in both spellings, as seconds; anything
+    /// else is no zone (and the times that read it fall back to UTC).
     #[test]
     fn the_local_zone_is_read_from_date() {
         for (text, want) in [
@@ -934,6 +953,9 @@ mod tests {
         }
     }
     /// With the print known, a wall's bare clock time is the first occurrence of that clock
+    /// strictly after it, checked against a brute-force scan for every print over two days and
+    /// every clock on the hour and half hour; a session window's is too while within
+    /// [`SESSION_AHEAD_MAX`] of the print, else [`reset_at`]'s.
     #[test]
     fn a_walls_bare_clock_is_the_first_occurrence_after_its_print() {
         fn zone(_: &str) -> Option<i64> {

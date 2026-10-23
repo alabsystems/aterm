@@ -1,55 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE DIFFERENTIAL VT ORACLE: aterm's engine against astream-term, an
-//! independently written VT fold, on the same bytes.
-//!
-//! astream-term (`vendor/astream/crates/astream-term`) is a pure,
-//! zero-dependency fold over a deliberately bounded VT subset (its
-//! `src/screen.rs` header names it: one codepoint per cell, the 16/256-colour
-//! palette, no scrollback, no reflow, no charsets). Inside that
-//! subset the two engines must agree on the visible text, every cell's
-//! palette colours and bold/underline/reverse, the cursor with its pending
-//! wrap, cursor visibility and which buffer is up (`engines.rs`). Two
-//! independent readings of xterm that agree are evidence for both; where
-//! they disagree one of them is wrong, and xterm's source says which.
-//!
-//! WHAT RUNS:
-//! - `the_corpus_agrees_or_is_excluded`: the hand-written edge cases
-//!   (`corpus.rs`), each compared after every byte, against the explicit,
-//!   triaged exclusion list (`exclusions.rs`), which it also holds to
-//!   account: a stale exclusion fails as loudly as a new divergence. An
-//!   excluded case is not a case skipped: aterm's final screen must be the
-//!   entry's written answer (xterm's), so a category the pinned fold
-//!   cannot judge yet still checks aterm, and a regression there is
-//!   reported as one. At this pin the fold judges every category the
-//!   corpus covers (ICH/DCH/ECH/IL/DL, IND/NEL/RI, a background scrolled
-//!   in, ... came with astream 4e91e82), and only deliberate differences
-//!   are excluded.
-//! - `random_subset_programs_agree`: seeded random programs drawn only from
-//!   the subset (`generator.rs`), compared after every chunk; a failure is
-//!   shrunk (inside the subset) and printed with its seed, where the
-//!   generated program first diverged, a byte-literal repro and both screens.
-//!   `ATERM_VT_ORACLE_SEED` (decimal or `0x` hex) and `ATERM_VT_ORACLE_CASES`
-//!   override the fixed default stream for a deep run. The random side
-//!   covers only what the pinned fold models; a category joins it when a pin
-//!   bump brings it (its [`caps::Caps`] probe flips).
-//!
-//! THE LANE. The previous oracle (the `astream-oracle` side workspace) was
-//! cut in fd3700d10 because no lane built it. This one is a module of
-//! aterm-conformance's `vt` test binary, with astream-term as a dev
-//! dependency, so `targo --unverified test --workspace` builds and runs it,
-//! and so does a bare `targo --unverified verify`: its change cone is closed
-//! over `targo tree --invert`, dev edges included, so a change to aterm-core,
-//! aterm-parser (through aterm-core), aterm-conformance, or a file of
-//! astream-term or the `vendor/astream` gitlink above it selects this crate's
-//! tests. Run it alone with
-//! `targo --unverified test -p aterm-conformance --test vt -- vt_oracle::`.
-//!
-//! The subset moves with the pin: [`caps::Caps`] reads what the pinned fold
-//! models off the fold itself, the generator widens when a bump brings more,
-//! and the corpus's astream exclusions then go stale and must be deleted in
-//! the bump's commit (`vendor/README-astream.md` says so in its recipe).
+//! Differential VT oracle tests against `astream-term` ([`caps::Caps`]).
 
 mod caps;
 mod corpus;
@@ -126,8 +78,6 @@ fn the_corpus_agrees_or_is_excluded() {
             }
             continue;
         };
-        // An excluded case still checks aterm: against the written answer
-        // (xterm's), where the fold cannot give it.
         let end = aterm_after(case);
         if let Some(missed) = e.want.missed_by(&end) {
             failures.push(format!(
@@ -142,9 +92,6 @@ fn the_corpus_agrees_or_is_excluded() {
             ));
         }
         match (&e.triage, divergence) {
-            // The fold still lacks the fix (its probe has not moved), so the
-            // only engine that can have moved is aterm, onto the fold's known
-            // wrong answer. Never a stale entry: that is the probe's call.
             (Triage::Astream { branch, fixed }, None) if !fixed(&caps) => failures.push(format!(
                 "{}: the engines agree, but the pinned astream-term still lacks the \
                  fix from {branch} (its Caps probe has not moved), so aterm \
@@ -219,8 +166,6 @@ fn env_u64(name: &str) -> Option<u64> {
 #[test]
 fn random_subset_programs_agree() {
     let caps = Caps::probe();
-    // A fixed stream by default, so the check is deterministic: the same
-    // programs on every run and every machine, and a red is a red.
     let base = env_u64("ATERM_VT_ORACLE_SEED").unwrap_or(0);
     let cases = env_u64("ATERM_VT_ORACLE_CASES").unwrap_or(DEFAULT_CASES);
     for i in 0..cases {
@@ -341,8 +286,6 @@ fn the_subset_check_sees_what_a_dropped_token_rebuilds() {
         bad.remove(dropped);
         assert!(!program(&bad).in_subset(narrow), "{bad:?} is not");
     }
-    // A fold that keeps the alternate slot and clears on every entry admits
-    // the restore and the second entry; the stray `?1049l` stays out.
     let wide = Caps {
         alt_persists: true,
         alt_clears: true,
@@ -351,10 +294,6 @@ fn the_subset_check_sees_what_a_dropped_token_rebuilds() {
     assert!(program(&[enter, Kind::Restore]).in_subset(wide));
     assert!(program(&[enter, enter]).in_subset(wide));
     assert!(!program(&[leave]).in_subset(wide));
-    // A fold whose RIS keeps the buffer and its slot, as xterm's does, where
-    // aterm's drops both: after a RIS the next entry is a `?1049h` (its clear
-    // makes the buffers agree), and an alternate-screen restore waits for a
-    // save there.
     let ris = Caps {
         ris_keeps_alt: true,
         ..wide

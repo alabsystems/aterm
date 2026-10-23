@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! FONT-DISPLAY conformance: every bundled display face is a real, parseable
-//! font; a display face is a LAYER over the person's font, never the font
-//! itself, so it never changes the grid; and every glyph it draws is whole
-//! inside the primary's cell.
+//! Conformance tests for bundled display font faces, cell fitting, and layer mixing.
 
 use aterm_render::{
     DISPLAY_FACE_MIX_MAX, DISPLAY_FACE_SCHEME, DISPLAY_FACES, FaceId, Renderer, Theme,
@@ -30,11 +27,7 @@ fn every_layer() -> Vec<Vec<&'static str>> {
 }
 
 /// Every SET of faces a person can switch on — each single face and each 2-
-/// and 3-face mix once, in registry order. The layer is a function of the
-/// set: [`Renderer::set_display_faces`] keeps only [`display_layer_ids`] of
-/// what it is given, which sorts into registry order, so another order of the
-/// same faces is the same renderer, not another case
-/// (`the_order_faces_were_switched_on_in_changes_nothing` holds the order).
+/// and 3-face mix once, in registry order.
 fn every_set() -> Vec<Vec<&'static str>> {
     let rank = |id: &&str| DISPLAY_FACES.iter().position(|face| face.id == *id);
     every_layer()
@@ -68,16 +61,7 @@ fn layered(primary: &[u8], ids: &[&str], px: f32) -> Renderer {
     renderer
 }
 
-/// THE GRID IS THE PERSON'S FONT'S. A display face is a layer over the
-/// primary, so turning one on — or mixing two or three, in either order —
-/// leaves the cell and baseline exactly the bare primary's: no column and no
-/// row is ever lost to a face. The layer replaced a design that made the
-/// first face of a mix the primary, which gave each face its own `M` cell
-/// (Engraved 11 px wide against SF Mono's 7, a third of the columns gone) and
-/// made "engraved+pixel" and "pixel+engraved" two different grids.
-///
-/// Every set, over both primaries and three sizes; the order a set was
-/// switched on in is held by `the_order_faces_were_switched_on_in_changes_nothing`.
+/// THE GRID IS THE PERSON'S FONT'S.
 #[test]
 fn a_display_face_never_changes_the_grid() {
     for (name, primary) in primaries() {
@@ -131,17 +115,9 @@ fn the_order_faces_were_switched_on_in_changes_nothing() {
 /// neighbour: "minecraft" drew as "m ncraft"), never above the cell's top
 /// (the first row's ink was cut at the window edge and under a pane header)
 /// and never below its floor — and never cut to get there: its ink is as tall
-/// as the face draws it at the fitted size. The mix used to run its extra
-/// faces through the fallback pipeline, which scaled them by x-height and then
-/// deleted the rows past the cell, so chunky+pixel+engraved read "CARGO.IOmL"
-/// (the T's crossbar gone) and "BULD".
-///
-/// Every set of faces, over two primaries, across sizes and two line heights,
-/// for printable ASCII and accented capitals the ASCII measure does not cover.
+/// as the face draws it at the fitted size.
 #[test]
 fn every_display_glyph_is_drawn_whole_inside_its_cell() {
-    // Each face's fit, once: a pure function of the registry's bytes (it
-    // parses the whole face, so asking it per glyph was most of this test).
     let fits: std::collections::HashMap<&str, _> = DISPLAY_FACES
         .iter()
         .map(|face| {
@@ -152,8 +128,6 @@ fn every_display_glyph_is_drawn_whole_inside_its_cell() {
     let mut owners = std::collections::HashMap::new();
     let mut own_rows = std::collections::HashMap::new();
     for (name, primary) in primaries() {
-        // Live for the loop, so every renderer below shares its parsed face
-        // (the store is weak), as the panes of one window do.
         let _shared = Renderer::from_bytes(primary, 16.0, Theme::default()).unwrap();
         for line_height in [1.0_f32, 0.8] {
             for px in [12.0_f32, 14.0, 20.0, 48.0] {
@@ -189,8 +163,6 @@ fn every_display_glyph_is_drawn_whole_inside_its_cell() {
                         if !ch.is_ascii() {
                             continue;
                         }
-                        // Whole: as tall as the face draws it at its fitted
-                        // size (one pixel of rasterizer rounding either way).
                         let id = ids
                             .iter()
                             .copied()
@@ -198,8 +170,6 @@ fn every_display_glyph_is_drawn_whole_inside_its_cell() {
                             .expect("the drawing face is in the layer");
                         let (bytes, fit) = fits[id];
                         let scale = display_face_scale(&fit, px, cell_w, cell_h);
-                        // The face's own raster at that size, by the same
-                        // rasterizer: the face drawn as a primary.
                         let authored = *own_rows
                             .entry((id, (px * scale).to_bits(), ch))
                             .or_insert_with(|| {
@@ -265,9 +235,7 @@ fn renderer_face_of(renderer: &Renderer, ch: char) -> &'static str {
 /// set by a typical letter (the median advance) and the ink band, never by
 /// the widest glyph (Cinzel's `Q` tail at 1.27 em would have drawn every
 /// letter at half size), so over either primary — Iosevka Term's cell is a
-/// narrow 0.5 em — a face keeps at least 0.7 of the size asked for. Taller
-/// marks move rather than shrink the face, and deep descenders raise the
-/// layer's line instead (`a_deep_descender_raises_the_line_instead_of_shrinking_the_face`).
+/// narrow 0.5 em — a face keeps at least 0.7 of the size asked for.
 #[test]
 fn a_display_face_keeps_most_of_its_size() {
     for (name, primary) in primaries() {
@@ -301,9 +269,7 @@ fn the_display_scale_is_monotone_and_bounded() {
 
 /// A DEEP DESCENDER RAISES THE LINE INSTEAD OF SHRINKING THE FACE: Chewy's
 /// `g` sinks 0.30 em, past DejaVu Sans Mono's 0.24 em descent, while the cell
-/// has room to spare above. The layer stands on a line raised just enough —
-/// the primary's own baseline when the face fits there — so Bubble keeps its
-/// full size, and every face of a mix stands on that one line.
+/// has room to spare above.
 #[cfg(feature = "embedded-font")]
 #[test]
 fn a_deep_descender_raises_the_line_instead_of_shrinking_the_face() {
@@ -344,15 +310,11 @@ fn a_deep_descender_raises_the_line_instead_of_shrinking_the_face() {
         bare.baseline(),
     );
     assert_eq!(mixed, line, "a mix stands on one line");
-    // And the drawn letters agree: every face's `n` stands on that line.
     let mut renderer = layered(primary, &["bubble", "chunky"], 48.0);
     let mut floors = std::collections::BTreeSet::new();
     for ch in ('a'..='z').filter(|ch| "acemnorsuvwxz".contains(*ch)) {
         let key = renderer.glyph_key(ch);
         let img = renderer.glyph_image(key);
-        // A letter without a descender sits on the line (`ymin` is its
-        // bottom; a round letter's overshoot and rounding within two pixels,
-        // where a face on its own line would be four off).
         floors.insert(img.ymin() - (bare.baseline() - line));
     }
     assert!(
@@ -364,8 +326,7 @@ fn a_deep_descender_raises_the_line_instead_of_shrinking_the_face() {
 /// A FIRST ROW DRAWN UNDER ANYTHING KEEPS ITS INK: Luckiest Guy's backtick
 /// rises 0.93 em over its 0.70 em ascent, so drawn as the primary it inked
 /// above its own cell — into the 2 px window padding, cut at the frame edge,
-/// and under a split pane's header. In the layer the same face's ink stays in
-/// the row: every row of a frame draws identically, the first one included.
+/// and under a split pane's header.
 #[cfg(feature = "embedded-font")]
 #[test]
 fn a_first_row_draws_exactly_like_the_rows_below_it() {
@@ -390,9 +351,7 @@ fn a_first_row_draws_exactly_like_the_rows_below_it() {
 
 /// THE CHROME IS THE PERSON'S FONT: Settings' code text, the palette and the
 /// Manual editor take their face from the terminal's primary
-/// (`chrome_primary_face`). With the display face as the primary that face was
-/// Cinzel, which the chrome refused, so it fell back to the embedded DejaVu —
-/// a face nobody chose. As a layer the face never reaches the primary.
+/// (`chrome_primary_face`).
 #[test]
 fn the_chrome_face_is_the_primary_under_a_display_layer() {
     let plain = Renderer::from_system(16.0, Theme::default()).expect("a system font");
@@ -556,7 +515,6 @@ fn display_mix_family_parsing_is_exact() {
     for bad in [
         "display:pixel+doom",
         "display:pixel+pixel",
-        // One face under two spellings is still one face twice.
         "display:pixel+Pixel",
         "display:chunky+pixel+engraved+bubble",
         "display:",
@@ -632,7 +590,6 @@ fn display_face_operators_never_shape_to_notdef() {
                 operators.as_bytes()[col] as char
             );
         }
-        // The per-cell glyph of every operator character is a real one.
         for ch in ['=', '>', '-', '!', '<'] {
             let key = renderer.glyph_key(ch);
             assert!(
@@ -719,14 +676,7 @@ fn the_layer_follows_the_primary_into_a_new_cell() {
 }
 
 /// A `display_font` VALUE IS A HUMAN-TYPED CONFIG STRING, so it folds case like
-/// every other one. The comparison used to be exact, and the failure was silent
-/// in the worst way: an unrecognised id is not an error — it falls through to
-/// ordinary `font_family` resolution — so `display_font = "Pixel"` did not warn,
-/// did not fail, and did not apply. The setting simply had no effect, which is
-/// indistinguishable from never having written it.
-///
-/// The negative control is in the same test: folding must not start ACCEPTING
-/// things, only spelling the same id differently.
+/// every other one.
 #[test]
 fn a_display_face_id_folds_ascii_case_like_every_other_config_value() {
     for (typed, want) in [
@@ -742,7 +692,6 @@ fn a_display_face_id_folds_ascii_case_like_every_other_config_value() {
         );
     }
 
-    // Negative control: folding must not widen what is accepted.
     for nonsense in ["pixelated", "pix el", ""] {
         assert_eq!(
             display_face_canonical_id(nonsense),

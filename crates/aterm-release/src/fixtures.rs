@@ -1,33 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The release's own handoff fixtures: what this release's producer writes, recorded by its
-//! own cut and landed on main for the next release's handoff fixture gate
-//! ([`crate::gates::handoff_fixture_gate_at`]). Only release N's producer can write the
-//! bytes that check N+1's consumer (`crates/aterm-gui/tests/fixtures/handoff/README.md`),
-//! so N's cut writes them in two halves:
-//!
-//! * [`stage`], before the claim (beside the `ship release` build): the in-tree
-//!   generator ([`GENERATOR_SOURCE`], two isolated libtests) runs in the clone under
-//!   the reserved identity's pins (release commit C and build n, and the prover's
-//!   `TRUST_STAGE2_BIN`) into the release cache, self-checking every desk against the
-//!   release's own consumer. A refusal, or a missing required desk, refuses the release
-//!   with nothing claimed. It compiles in a target directory of its own, made afresh
-//!   and removed after: `-p aterm-gui` resolves its dependencies' features apart from
-//!   `verify release`'s `--workspace` compile, so the two never share a unit, and a
-//!   whole-workspace compile beside the build is not short work.
-//!   The same run holds the desks to what the tree's handoff guard asks once they are
-//!   checked in, and writes the serde corpus's shipped-state answers file as it reads with
-//!   them ([`STAGED_ANSWERS`]).
-//! * [`land`], after the cut: one commit on origin/main's tip adding `vX.Y.0/`, its
-//!   `PINNED_DESKS` rows and its cases in the shipped-state corpus ([`SHIPPED_STATE_CORPUS`],
-//!   [`with_release_answers`]), so the commit that adds the desks leaves main's sweep of them
-//!   green, pushed as a compare-and-swap like the claim's ([`crate::ledger::claim`]). A tip
-//!   that already holds them is a no-op, so a re-run resumes.
-//!
-//! A staging is keyed by the reserved identity
-//! (`<cache>/handoff-fixtures/v<version>-<n>-<C12>/`) and its mark ([`STAGED_MARK`]) is
-//! written last, so a re-reserved identity or a half-written staging is written afresh.
+//! Handoff fixture staging and landing for release cuts.
 
 use aterm_uds::spawnfd::Command;
 use std::fs;
@@ -40,36 +14,33 @@ use crate::gates::{
 };
 use crate::ledger::{Error, GitRunner, Result, git_ok, rev_parse};
 
-/// The generator, compiled into every `aterm-gui` library test build.
+/// In-tree handoff fixture generator test module path.
 pub const GENERATOR_SOURCE: &str = "crates/aterm-gui/src/seamless_fixture_generator_tests.rs";
 
-/// Its two entry tests: the desks, and the rendezvous record (macOS only).
+/// Entry test names for the handoff and rendezvous fixture generators.
 pub const GENERATOR_TESTS: [&str; 2] = ["generate_handoff_fixtures", "generate_rendezvous_fixture"];
 
-/// The mark a complete staging carries, written last: the identity it was written as.
+/// Marker file written when a staging completes.
 pub const STAGED_MARK: &str = "staged";
 
-/// The serde corpus's answers for every checked-in fixture
-/// (`serde_corpus_tests::state_written_by_shipped_producers_answers_as_recorded`): a release's
-/// desks are new cases in it, which its landing records.
+/// Checked-in serde corpus shipped-state answers path.
 pub const SHIPPED_STATE_CORPUS: &str =
     "crates/aterm-gui/tests/fixtures/serde-corpus/shipped-state.txt";
 
-/// The generator's copy of that file in a staging, beside `v<version>/`: the answers as the
-/// release's own models read the tree's fixtures with its desks checked in.
+/// Staged shipped-state answers filename.
 pub const STAGED_ANSWERS: &str = "shipped-state.txt";
 
-/// The variable that names where the generator writes [`STAGED_ANSWERS`].
+/// Environment variable naming where the generator writes [`STAGED_ANSWERS`].
 pub const ANSWERS_OUT: &str = "ATERM_SHIPPED_STATE_OUT";
 
-/// The identity the fixtures are written as: what the shipped binary stamps.
+/// Release identity pins stamped into generated fixtures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pins {
-    /// `X.Y.0`.
+    /// Release version (`X.Y.0`).
     pub version: String,
-    /// The reserved build number n.
+    /// Reserved build number.
     pub build: u64,
-    /// The release commit C (full): the commit the tag names and the binary stamps.
+    /// Full release commit SHA.
     pub commit: String,
 }
 
@@ -98,14 +69,14 @@ impl Pins {
     }
 }
 
-/// A complete staging.
+/// A complete handoff fixture staging.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Staged {
-    /// `<staging>/v<version>`: what lands as `crates/aterm-gui/tests/fixtures/handoff/v<version>`.
+    /// `<staging>/v<version>` fixture directory.
     pub dir: PathBuf,
-    /// Its desks (each a directory holding a `parent.toml`), sorted.
+    /// Sorted desk directory names holding `parent.toml`.
     pub desks: Vec<String>,
-    /// It holds `rendezvous.toml`.
+    /// Whether `rendezvous.toml` is present.
     pub rendezvous: bool,
     /// `<staging>/shipped-state.txt` ([`STAGED_ANSWERS`]).
     pub answers: PathBuf,
@@ -114,7 +85,7 @@ pub struct Staged {
 }
 
 impl Staged {
-    /// The transcript's words for it.
+    /// Formats a transcript summary of this staging.
     #[must_use]
     pub fn words(&self, pins: &Pins) -> String {
         format!(
@@ -138,7 +109,7 @@ impl Staged {
     }
 }
 
-/// The staging of `pins` under `root`, when it is complete.
+/// Returns the complete staging of `pins` under `root`, if present.
 #[must_use]
 pub fn staged(root: &Path, pins: &Pins) -> Option<Staged> {
     let at = pins.staged_in(root);
@@ -170,8 +141,7 @@ fn desks_in(dir: &Path) -> std::io::Result<Vec<String>> {
     Ok(desks)
 }
 
-/// The libtest arguments the generator runs with: its two tests by name, one at
-/// a time. Each isolates its installed build stamp in its own child process.
+/// Returns the single-threaded libtest arguments for the fixture generator.
 #[must_use]
 pub fn generator_args() -> Vec<&'static str> {
     let mut args = GENERATOR_TESTS.to_vec();
@@ -179,19 +149,10 @@ pub fn generator_args() -> Vec<&'static str> {
     args
 }
 
-/// Stage the release's fixtures: run the in-tree generator in `tree` (the cut tree) with
-/// `targo`, under `pins`, into `root` ([`crate::snapshot::CacheRoot::handoff_fixtures`]),
-/// unless that identity is staged already. `run` is the process runner, so a test can
-/// hand it any outcome.
-///
-/// Refuses when the generator does not pass both its tests (one off macOS, which has no
-/// rendezvous; a desk the tree's guard cannot adopt as written fails the first), when a desk
-/// `REQUIRED_DESKS` asks of this release is missing, when a desk's `parent.toml` was not
-/// written as `pins`, and when it wrote no shipped-state answers for the release's desks
-/// ([`STAGED_ANSWERS`], at `$ATERM_SHIPPED_STATE_OUT`).
+/// Runs the in-tree fixture generator under `pins` into `root`, unless already staged.
 ///
 /// # Errors
-/// Each refusal above, and a staging directory that cannot be written.
+/// Returns an error if the generator fails, omits required desks or answers, or cannot write the staging directory.
 pub fn stage(
     targo: &Path,
     tree: &Path,
@@ -205,7 +166,6 @@ pub fn stage(
     let io = |what: &str, path: &Path, e: std::io::Error| {
         Error::new(format!("handoff fixtures: {what} {}: {e}", path.display()))
     };
-    // A new identity: every older staging of this version is a reservation passed.
     if let Ok(entries) = fs::read_dir(root) {
         let prefix = format!("{}-", pins.tag());
         for entry in entries.flatten() {
@@ -341,12 +301,10 @@ pub fn stage(
     })
 }
 
-/// What `commit` holds of release `version`'s fixtures: `None` without a `v<version>/`
-/// directory, else what the next cut's gate finds there. A directory the gate refuses is
-/// an error: it is someone else's, never this release's to overwrite.
+/// Inspects release `version`'s handoff fixtures at `commit`, if present.
 ///
 /// # Errors
-/// Such a directory, and a git failure.
+/// Returns an error if the fixture directory exists but fails validation, or on git failure.
 pub fn on_commit(
     git: &dyn GitRunner,
     commit: &str,
@@ -369,12 +327,10 @@ pub fn on_commit(
         })
 }
 
-/// `guard` (the source of [`HANDOFF_FIXTURE_GUARD`]) with one `PINNED_DESKS` row per desk
-/// of `v<version>` appended. Refuses a table that pins the release already or that does
-/// not read back.
+/// Appends one `PINNED_DESKS` row per desk of `v<version>` to `guard`.
 ///
 /// # Errors
-/// As above.
+/// Returns an error if `v<version>` is already pinned or `PINNED_DESKS` cannot be updated.
 pub fn with_pinned_rows(guard: &str, version: &str, desks: &[String]) -> Result<String> {
     let tag = format!("v{version}");
     let unreadable = |why: &str| {
@@ -416,15 +372,10 @@ pub fn with_pinned_rows(guard: &str, version: &str, desks: &[String]) -> Result<
     Ok(out)
 }
 
-/// The shipped-state corpus `corpus` (as main holds it) with release `tag`'s cases recorded:
-/// the block of lines in `staged` (the generator's [`STAGED_ANSWERS`]) whose case ids name
-/// `tag`'s directory, put after the line `staged` puts them after, matched by case id (a
-/// comment line by its text), so an answer main re-recorded since the cut stays as main holds
-/// it. Beside it, how many cases it adds.
+/// Splices release `tag`'s cases from `staged` into `corpus` and returns the updated text and case count.
 ///
 /// # Errors
-/// `staged` holds no case of `tag`, or holds them apart, or first; `corpus` records `tag`
-/// already, or holds no line, or more than one, with the case id they go after.
+/// Returns an error if `staged` lacks a contiguous block for `tag` or `corpus` cannot anchor it uniquely.
 pub fn with_release_answers(corpus: &str, staged: &str, tag: &str) -> Result<(String, usize)> {
     let prefix = format!("{tag}/");
     let refuse = |why: String| Error::new(format!("{tag}'s shipped-state answers: {why}"));
@@ -479,11 +430,10 @@ pub fn with_release_answers(corpus: &str, staged: &str, tag: &str) -> Result<(St
     Ok((text, count))
 }
 
-/// `base`'s tree (none: empty) with each `(path, blob)` of `files` set, at any depth, made
-/// from git objects alone, with no worktree or index.
+/// Builds a git tree object from `base` with each `(path, blob)` in `files` replaced.
 ///
 /// # Errors
-/// A path through a file, and any git failure.
+/// Returns an error if a path traverses a file or git fails.
 pub fn tree_with(
     git: &dyn GitRunner,
     base: Option<&str>,
@@ -584,13 +534,12 @@ fn files_under(dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
     Ok(out)
 }
 
-/// What a landing did with the release's shipped-state answers ([`with_release_answers`]).
+/// Disposition of shipped-state answers during a fixture landing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Answers {
-    /// Its this many cases recorded in [`SHIPPED_STATE_CORPUS`], in the commit with the desks.
+    /// Number of cases recorded in [`SHIPPED_STATE_CORPUS`].
     Recorded(usize),
-    /// Left out, and why: the commit adds the desks alone, and main's sweep of the shipped
-    /// fixtures reads them as new cases until they are recorded by hand.
+    /// Answers omitted from the commit with the reason why.
     Unrecorded(String),
 }
 
@@ -702,13 +651,12 @@ fn fixture_commit(
     Ok((commit, answers))
 }
 
-/// How [`land`] ended.
+/// Outcome of [`land`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Landed {
-    /// origin/main held them already (at this tip): nothing was pushed.
+    /// `origin/main` already held the release's fixtures at `tip`.
     Already { tip: String, desks: Vec<String> },
-    /// This commit is origin/main now, pushed on the `attempt`th try, with what it did with
-    /// the release's shipped-state answers.
+    /// Fixtures were committed and pushed to `origin/main`.
     Pushed {
         commit: String,
         attempt: u32,
@@ -717,7 +665,7 @@ pub enum Landed {
 }
 
 impl Landed {
-    /// The transcript's words for it.
+    /// Formats a transcript summary of the landing.
     #[must_use]
     pub fn words(&self, pins: &Pins) -> String {
         match self {
@@ -746,16 +694,10 @@ impl Landed {
     }
 }
 
-/// Land a staging on origin/main: fetch; when the tip already holds the release's fixtures
-/// ([`on_commit`]) do nothing; else commit `staged`, its `PINNED_DESKS` rows and its
-/// shipped-state answers (where the tip's corpus takes them, [`with_release_answers`]) on the tip
-/// and push it as a fast-forward of main. A non-fast-forward rejection is a lost race:
-/// rebuild on the winner's tip, up to `max_attempts` tries; any other push failure stops at
-/// once. A push is verified as the claim's is: origin/main is the commit, or has it.
+/// Commits and pushes `staged` fixtures onto `origin/main` with compare-and-swap retry.
 ///
 /// # Errors
-/// Each stop above, a tip whose fixture directory for the release is someone else's
-/// ([`on_commit`]), and any git failure.
+/// Returns an error if pushing fails, retries are exhausted, or `origin/main` holds conflicting fixtures.
 pub fn land(
     git: &dyn GitRunner,
     staged: &Staged,

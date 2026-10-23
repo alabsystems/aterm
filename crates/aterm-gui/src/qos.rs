@@ -87,6 +87,7 @@ mod fork_at_default {
 
     thread_local! {
         /// The class and relative priority [`lift`] raised this thread from, for
+        /// the fork in flight on it; `None` when it raised nothing.
         static LIFTED_FROM: Cell<Option<(libc::qos_class_t, libc::c_int)>> =
             const { Cell::new(None) };
     }
@@ -180,6 +181,7 @@ const SYS_SCHED_GETATTR: libc::c_long = 275;
 const SCHED_FLAG_RESET_ON_FORK: u64 = 0x01;
 
 /// The fair-class policies (`SCHED_OTHER`, `SCHED_BATCH`, `SCHED_IDLE`) — the
+/// only ones whose `sched_runtime` is an EEVDF slice request.
 #[cfg(any(
     all(
         target_os = "linux",
@@ -190,6 +192,7 @@ const SCHED_FLAG_RESET_ON_FORK: u64 = 0x01;
 const FAIR_POLICIES: [u32; 3] = [0, 3, 5];
 
 /// The `sched_attr` that asks for `slice_ns` while changing nothing else about
+/// `current`: its policy, nice and priority are carried over.
 #[cfg(any(
     all(
         target_os = "linux",
@@ -210,6 +213,7 @@ fn slice_request(current: &SchedAttr, slice_ns: u64) -> Option<SchedAttr> {
 }
 
 /// Request `slice_ns` for the calling thread (tid 0): read its attributes, change
+/// only the slice ([`slice_request`]), write them back.
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -275,6 +279,7 @@ pub(crate) fn slice_of_self() -> Option<(u64, u64)> {
 const TASKPOLICY: &str = "/usr/sbin/taskpolicy";
 
 /// The `taskpolicy -c` clamp for a child spawned on behalf of `role`, or `None`
+/// when the child keeps the tier it inherits.
 const fn child_clamp(role: Role) -> Option<&'static str> {
     match role {
         Role::Interactive | Role::Responsive => None,
@@ -312,6 +317,7 @@ pub(crate) fn atpkg_pass_command(
 }
 
 /// [`command`] over an explicit launcher, so the wrapping decision is testable on
+/// every Unix against a stand-in.
 fn command_with(
     role: Role,
     program: &std::path::Path,
@@ -421,6 +427,8 @@ unsafe extern "C" {
 }
 
 /// The class and relative priority the calling thread has requested (its own word,
+/// which no override another thread pushes onto it changes), or `None` if the
+/// platform declined to answer.
 #[cfg(target_os = "macos")]
 fn requested_class_of_self() -> Option<(libc::c_uint, libc::c_int)> {
     let mut class: libc::c_uint = 0;
@@ -492,6 +500,8 @@ mod tests {
     use super::*;
 
     /// [`sleep_until`] takes a long wait as one timer that ends a
+    /// [`COALESCE_MARGIN`] early and the rest in [`PRECISE_SLICE`]s, and returns
+    /// once the deadline has passed, never before.
     #[test]
     fn a_precise_sleep_asks_for_no_long_timer_near_its_deadline() {
         use std::cell::Cell;
@@ -524,6 +534,8 @@ mod tests {
     }
 
     /// A [`Boost`] raises the worker's base priority while it stands and puts
+    /// it back when it drops, read off the kernel's own record of the thread
+    /// (an override is invisible to the class a thread reads of itself).
     #[cfg(target_os = "macos")]
     #[test]
     fn a_boost_raises_the_worker_while_it_stands_and_no_longer() {
@@ -533,6 +545,7 @@ mod tests {
         /// `<sys/proc_info.h>`'s by-thread-id flavor of `PROC_PIDTHREADINFO`.
         const PROC_PIDTHREADID64INFO: libc::c_int = 15;
         /// `struct proc_threadinfo` (`<sys/proc_info.h>`, not in the generated
+        /// `libc`): 112 bytes, the base priority `pth_priority` at offset 40.
         #[repr(C)]
         struct ProcThreadInfo {
             _user_and_system_time: [u64; 2],
@@ -584,6 +597,7 @@ mod tests {
     }
 
     /// Each role, declared on a real thread, is the class the kernel reports that
+    /// thread running at.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_declared_role_really_lands_on_the_running_thread() {
@@ -608,6 +622,8 @@ mod tests {
     }
 
     /// The class a fork from the calling thread ran at, as the forked child reads it
+    /// before its exec: its copy of this thread's QoS word, taken when `fork(2)` copied
+    /// the address space ([`fork_at_default`]).
     #[cfg(target_os = "macos")]
     fn class_a_fork_ran_at() -> u32 {
         use std::io::Read as _;
@@ -638,6 +654,7 @@ mod tests {
     }
 
     /// A fork from a demoted thread runs at the default class, and the thread has its
+    /// own class back once `spawn` returns ([`fork_at_default`]).
     #[cfg(target_os = "macos")]
     #[test]
     fn a_fork_runs_at_the_default_class_or_above_and_the_role_comes_back() {
@@ -670,6 +687,7 @@ mod tests {
     }
 
     /// The order is the contract: cosmetic work never outranks work a human is
+    /// waiting on.
     #[cfg(target_os = "macos")]
     #[test]
     fn roles_rank_interactive_above_cosmetic_work() {
@@ -689,6 +707,8 @@ mod tests {
     }
 
     /// The Linux slice map keeps the enum's order: the keystroke path asks for
+    /// the shortest slice, the PTY drain a longer one, and nothing below the
+    /// PTY drain asks at all (a Linux nice would be inherited by children).
     #[test]
     fn only_the_keystroke_path_roles_request_a_linux_slice() {
         let interactive = linux_slice_ns(Role::Interactive).expect("interactive slice");
@@ -702,6 +722,8 @@ mod tests {
     }
 
     /// The slice request changes the slice and nothing else: a `nice`d aterm keeps its
+    /// nice (writing 0 back would be an unprivileged nice decrease, `EPERM`), a
+    /// `SCHED_BATCH` thread stays batch, and a real-time thread is not touched.
     #[test]
     fn a_slice_request_carries_policy_and_nice_over() {
         let niced = SchedAttr {
@@ -750,6 +772,7 @@ mod tests {
     }
 
     /// The same, against the real kernel: a thread `nice`d to +5 (an unprivileged
+    /// increase) still has its slice request accepted, and keeps nice +5.
     #[cfg(target_os = "linux")]
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
@@ -771,6 +794,7 @@ mod tests {
     }
 
     /// The slice, read off a running thread, and the reset-on-fork that keeps it from
+    /// leaking into a thread (or shell) the declaring thread creates.
     #[cfg(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
@@ -817,6 +841,9 @@ mod tests {
     }
 
     /// The wrapping decision, against a stand-in launcher so it runs the same on
+    /// every Unix: work below the inherited default runs behind its clamp when both
+    /// ends are real; everything else is the program alone, so a missing tool still
+    /// fails at `spawn`.
     #[cfg(unix)]
     #[test]
     fn only_below_default_work_with_both_ends_real_is_spawned_behind_a_clamp() {

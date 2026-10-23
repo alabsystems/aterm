@@ -2,28 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! The signed envelope: the only authority the root agent acts on (design §3.3).
-//!
-//! Wire form: an SSHSIG armored signature (`ssh-keygen -Y sign -n aterm-machines`) followed
-//! by the TOML body it signs. The controller signs with `/usr/bin/ssh-keygen`; the agent
-//! verifies with Apple's `/usr/bin/ssh-keygen -Y find-principals` and `-Y verify` against its
-//! root-owned `allowed_signers`. No signing or verifying cryptography lives in this crate.
-//!
-//! What OpenSSH 10.3 (this Mac's and the macOS 27 VM's `/usr/bin/ssh-keygen`) answers, as
-//! measured with throwaway keys:
-//!
-//! * `-Y sign -f <key> -n aterm-machines <file>…` signs every file it is given with ONE load
-//!   of the key, writing `<file>.sig` beside each and `Signing file <f>` / `Write signature
-//!   to <f>.sig` on standard error. A passphrase is therefore asked once per batch. A
-//!   `<file>.sig` that already exists makes it ask `Overwrite (y/n)?`, so it is removed
-//!   first.
-//! * `-Y find-principals -s <sig> -f <allowed_signers>` prints the matching principal on
-//!   standard output and exits 0, or prints `No principal matched.` and exits 255. It does
-//!   not look at `namespaces=`; `-Y verify` does.
-//! * `-Y verify -f <allowed_signers> -I <principal> -n aterm-machines -s <sig>` reads the
-//!   message on standard input. It prints `Good "aterm-machines" signature for <principal>
-//!   with ED25519 key SHA256:<fp>` on standard output and exits 0, or prints `Could not
-//!   verify signature.` (the reason, e.g. `Signature verification failed: incorrect
-//!   signature`, on standard error) and exits 255.
 
 use crate::model::{Mode, Read};
 use crate::port::{Cmd, Scratch, System};
@@ -118,8 +96,7 @@ pub struct Exec {
 pub struct Upgrade {
     /// The archive's SHA-256 (it is in the inbox).
     pub sha256: String,
-    /// `app-zip` (a zipped aterm.app, Developer ID checked) or `dev-zip` (a zipped dev
-    /// bundle or binary, trusted on this signed hash alone).
+    /// `app-zip` (a zipped aterm.app, Developer ID checked) or `dev-zip` (a zipped dev bundle or binary, trusted on this signed hash alone).
     pub kind: String,
     /// The version it carries.
     pub version: String,
@@ -237,14 +214,11 @@ pub struct Opened {
     pub envelope: Envelope,
     /// The `allowed_signers` principal that signed it.
     pub principal: String,
-    /// The signing key's fingerprint (`SHA256:…`), as `ssh-keygen -Y verify` names it;
-    /// empty when it printed none.
+    /// The signing key's fingerprint (`SHA256:…`), as `ssh-keygen -Y verify` names it; empty when it printed none.
     pub key_id: String,
 }
 
-/// Split wire bytes into the armored signature (its `BEGIN` line through its `END` line and
-/// newline, exactly what `ssh-keygen -Y sign` wrote) and the body after it.
-///
+/// Split wire bytes into the armored signature (its `BEGIN` line through its `END` line and newline, exactly what `ssh-keygen -Y sign` wrote) and the body after it.
 /// # Errors
 /// [`Refusal::Malformed`] when there is no complete signature block.
 pub fn split(wire: &[u8]) -> Result<(&[u8], &[u8]), Refusal> {
@@ -260,8 +234,6 @@ pub fn split(wire: &[u8]) -> Result<(&[u8], &[u8]), Refusal> {
         .ok_or_else(|| Refusal::Malformed("the SSH signature has no end line".into()))?;
     let cut = at + end.len();
     let (sig, body) = wire.split_at(cut);
-    // The armor between the lines is base64 and newlines only; anything else is not a
-    // signature ssh-keygen wrote.
     let inner = &sig[BEGIN.len()..at];
     if inner.is_empty()
         || !inner
@@ -281,15 +253,13 @@ pub fn split(wire: &[u8]) -> Result<(&[u8], &[u8]), Refusal> {
 }
 
 /// The body text `seal` signs: the envelope as one TOML document.
-///
 /// # Errors
 /// The serializer's message.
 pub fn body_text(envelope: &Envelope) -> Result<String, String> {
     aterm_toml::to_string(envelope).map_err(|e| format!("envelope: {e}"))
 }
 
-/// Parse a body. Only ever called on bytes a signature has been verified over.
-///
+/// Parse a body.
 /// # Errors
 /// [`Refusal::Malformed`] for anything but a schema-1 envelope with no unknown key.
 pub fn parse_body(body: &[u8]) -> Result<Envelope, Refusal> {
@@ -307,26 +277,18 @@ pub fn parse_body(body: &[u8]) -> Result<Envelope, Refusal> {
     Ok(envelope)
 }
 
-/// How `ssh-keygen -Y sign` reaches the signing key, and so how many times the owner is
-/// asked for something per batch of N envelopes (one `ssh-keygen` signs the whole batch).
+/// How `ssh-keygen -Y sign` reaches the signing key, and so how many times the owner is asked for something per batch of N envelopes (one `ssh-keygen` signs the whole batch).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signing {
-    /// A bounded run with no terminal ([`System::run`]): for a key with no passphrase,
-    /// so automation on the controller can apply. No prompt. A FIDO key's touch is still
-    /// asked for once per envelope, on the key itself.
+    /// A bounded run with no terminal ([`System::run`]): for a key with no passphrase, so automation on the controller can apply.
     Unattended,
-    /// On this process's terminal ([`System::run_tty`]): `ssh-keygen` asks the passphrase
-    /// once for the whole batch. A FIDO key: one touch per envelope.
+    /// On this process's terminal ([`System::run_tty`]): `ssh-keygen` asks the passphrase once for the whole batch.
     Terminal,
-    /// The key is loaded in ssh-agent (`-U`, naming the `.pub`): a bounded run handed this
-    /// process's `SSH_AUTH_SOCK`, with no terminal and no passphrase prompt (the owner ran
-    /// `ssh-add` once). A FIDO key: one touch per envelope.
+    /// The key is loaded in ssh-agent (`-U`, naming the `.pub`): a bounded run handed this process's `SSH_AUTH_SOCK`, with no terminal and no passphrase prompt (the owner ran `ssh-add` once).
     Agent,
 }
 
-/// Whether the private key at `key` is protected by a passphrase: `ssh-keygen -y -P ''`
-/// prints the public key of an unprotected key, and `incorrect passphrase supplied` for a
-/// protected one.
+/// Whether the private key at `key` is protected by a passphrase: `ssh-keygen -y -P ''` prints the public key of an unprotected key, and `incorrect passphrase supplied` for a protected one.
 #[must_use]
 pub fn needs_passphrase(sys: &dyn System, key: &Path) -> Read<bool> {
     let ran = sys.run(
@@ -343,9 +305,6 @@ pub fn needs_passphrase(sys: &dyn System, key: &Path) -> Read<bool> {
 }
 
 /// Sign `body` with the controller key at `key_path` (`ssh-keygen -Y sign`): the wire bytes.
-/// Unattended when the key has no passphrase, on the terminal otherwise; the scratch files
-/// live in a fresh 0700 directory under this user's temporary directory.
-///
 /// # Errors
 /// One line when `ssh-keygen` does not sign.
 pub fn seal(
@@ -353,7 +312,6 @@ pub fn seal(
     body: &Envelope,
     key_path: &std::path::Path,
 ) -> Result<Vec<u8>, String> {
-    // Tri-state: a probe that did not answer is not "no passphrase".
     let how = match needs_passphrase(sys, key_path) {
         Read::Value(false) => Signing::Unattended,
         Read::Value(true) => Signing::Terminal,
@@ -374,17 +332,13 @@ pub fn seal(
 }
 
 /// Allocate owned scratch without adopting or removing any preexisting path.
-///
 /// # Errors
 /// One line when the backend cannot exclusively allocate a directory.
 pub fn fresh_scratch<'s>(sys: &'s dyn System, what: &str) -> Result<Scratch<'s>, String> {
     Scratch::new(sys, what).map_err(|e| format!("envelope scratch: {e}"))
 }
 
-/// Sign every body in `bodies` with ONE `ssh-keygen -Y sign` run, writing the scratch
-/// bodies and signatures in `scratch` (a directory only this user may write). Returns the
-/// wire bytes in input order.
-///
+/// Sign every body in `bodies` with ONE `ssh-keygen -Y sign` run, writing the scratch bodies and signatures in `scratch` (a directory only this user may write).
 /// # Errors
 /// One line when the scratch directory is not private or `ssh-keygen` does not sign.
 pub fn seal_batch(
@@ -519,10 +473,7 @@ fn private_dir(sys: &dyn System, dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Verify `wire` against `allowed_signers`, this host's `uuid`, the clock and the floors,
-/// with the scratch files in a fresh 0700 directory under this user's temporary directory. Does not raise any floor:
-/// the caller does, before it acts.
-///
+/// Verify `wire` against `allowed_signers`, this host's `uuid`, the clock and the floors, with the scratch files in a fresh 0700 directory under this user's temporary directory.
 /// # Errors
 /// The [`Refusal`].
 pub fn open(
@@ -536,12 +487,7 @@ pub fn open(
     open_in(sys, wire, allowed_signers, uuid, floor_of, scratch.path())
 }
 
-/// [`open`], with the signature and body written to `scratch` for `ssh-keygen` (the agent
-/// passes its root-owned stage directory).
-///
-/// Nothing in the body is read before `ssh-keygen -Y verify` has accepted the signature
-/// over it (design §3.2).
-///
+/// [`open`], with the signature and body written to `scratch` for `ssh-keygen` (the agent passes its root-owned stage directory).
 /// # Errors
 /// The [`Refusal`].
 pub fn open_in(
@@ -692,9 +638,7 @@ pub fn key_id(verify_out: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Whether `p` is a principal this crate writes and reads back: no space, quote, comma or
-/// control character, so it is one word in `allowed_signers`, in an argv and in
-/// `floors.toml`.
+/// Whether `p` is a principal this crate writes and reads back: no space, quote, comma or control character, so it is one word in `allowed_signers`, in an argv and in `floors.toml`.
 #[must_use]
 pub fn principal_ok(p: &str) -> bool {
     !p.is_empty()
@@ -714,9 +658,7 @@ const KEY_TYPES: &[&str] = &[
     "ssh-rsa",
 ];
 
-/// One `allowed_signers` line for `principal`, from a public key line (`<type> <base64>
-/// [comment]`, as a `.pub` file holds it).
-///
+/// One `allowed_signers` line for `principal`, from a public key line (`<type> <base64> [comment]`, as a `.pub` file holds it).
 /// # Errors
 /// One line when the principal or the key is not one this crate accepts.
 pub fn signers_line(principal: &str, public_key: &str) -> Result<String, String> {
@@ -731,7 +673,6 @@ pub fn signers_line(principal: &str, public_key: &str) -> Result<String, String>
 }
 
 /// The type and base64 blob of a public key line.
-///
 /// # Errors
 /// One line when it is not `<known type> <base64>`.
 pub fn public_key_parts(line: &str) -> Result<(&str, &str), String> {
@@ -754,11 +695,7 @@ pub fn public_key_parts(line: &str) -> Result<(&str, &str), String> {
     Ok((kind, blob))
 }
 
-/// Check an `allowed_signers` document the way the agent writes it: every line
-/// `<principal> namespaces="aterm-machines" <type> <base64>`, each key once, at least one
-/// line. Returns the principals in order. Rekey and install refuse anything else, so a
-/// typo can never lock the fleet out or widen who may sign.
-///
+/// Check an `allowed_signers` document the way the agent writes it: every line `<principal> namespaces="aterm-machines" <type> <base64>`, each key once, at least one line.
 /// # Errors
 /// One line naming the first bad line.
 pub fn check_signers(text: &str) -> Result<Vec<String>, String> {
@@ -976,7 +913,6 @@ h+C/7UIZ5kDs26vTm+z6W30uFz3DtGTzPRBw==\n\
         let calls = fake.calls();
         assert!(calls[2].contains("find-principals"), "{calls:?}");
         assert!(calls[3].contains("-Y verify"), "{calls:?}");
-        // The scratch copies are gone.
         let pid = std::process::id();
         assert!(fake.written(&format!("/s/aterm-open-{pid}.sig")).is_none());
         assert!(fake.written(&format!("/s/aterm-open-{pid}.body")).is_none());
@@ -1064,7 +1000,6 @@ h+C/7UIZ5kDs26vTm+z6W30uFz3DtGTzPRBw==\n\
             .filter(|c| c.contains("-Y sign"))
             .count();
         assert_eq!(signs, 1);
-        // The scratch bodies are removed on failure too.
         assert!(
             fake.written(&format!("/s/aterm-envelope-{pid}-0.toml"))
                 .is_none()
@@ -1077,8 +1012,6 @@ h+C/7UIZ5kDs26vTm+z6W30uFz3DtGTzPRBw==\n\
 
     #[test]
     fn seal_refuses_a_key_whose_passphrase_probe_does_not_answer() {
-        // Nothing scripted: `ssh-keygen -y` does not run, so whether the key is protected
-        // is unknown, and it is not guessed "unprotected".
         let fake = Fake::root();
         let err = seal(&fake, &envelope("U", 1, 10), Path::new("/k/signing")).unwrap_err();
         assert!(err.contains("ssh-keygen -y"), "{err}");
@@ -1108,7 +1041,6 @@ h+C/7UIZ5kDs26vTm+z6W30uFz3DtGTzPRBw==\n\
             Path::new("/s"),
         )
         .unwrap_err();
-        // This process's own SSH_AUTH_SOCK decides which refusal: none means no agent to ask.
         if std::env::var_os("SSH_AUTH_SOCK").is_some() {
             assert!(err.contains("did not sign: exit 1"), "{err}");
         } else {
@@ -1116,8 +1048,6 @@ h+C/7UIZ5kDs26vTm+z6W30uFz3DtGTzPRBw==\n\
         }
         assert!(!fake.calls().iter().any(|c| c.starts_with("tty ")));
     }
-
-    // ── real cryptography: throwaway keys in a temporary directory ─────────────────────
 
     /// A throwaway controller: signing and recovery keys (recovery with a passphrase), an
     /// outsider's key, and the `allowed_signers` naming the first two.
@@ -1155,9 +1085,6 @@ h+C/7UIZ5kDs26vTm+z6W30uFz3DtGTzPRBw==\n\
             }
             check_signers(&signers).unwrap();
             std::fs::write(dir.path().join("allowed_signers"), signers).unwrap();
-            // Owner-only whatever the umask, as the agent makes its stage: a plain
-            // `create_dir` is 0775 under a user-private-group login's umask 002, and
-            // `private_dir` rightly refuses a group-writable scratch directory.
             live.create_dir_all(&dir.path().join("scratch"), 0o700)
                 .unwrap();
             Self { dir }
@@ -1209,10 +1136,8 @@ h+C/7UIZ5kDs26vTm+z6W30uFz3DtGTzPRBw==\n\
         assert_eq!(opened.envelope, e);
         assert_eq!(opened.principal, "signing@test");
         assert!(opened.key_id.starts_with("SHA256:"), "{}", opened.key_id);
-        // Nothing is left in the scratch directory.
         assert_eq!(std::fs::read_dir(keys.scratch()).unwrap().count(), 0);
 
-        // One byte of the body changed: the signature no longer covers it.
         let mut tampered = wire.clone();
         let at = tampered.len() - 3;
         tampered[at] ^= 1;
@@ -1223,7 +1148,6 @@ h+C/7UIZ5kDs26vTm+z6W30uFz3DtGTzPRBw==\n\
             ),
             "tampered"
         );
-        // A body swapped under a good signature.
         let (sig, _) = split(&wire).unwrap();
         let mut swapped = sig.to_vec();
         swapped.extend_from_slice(body_text(&envelope("UUID-1", 99, now)).unwrap().as_bytes());
@@ -1231,14 +1155,12 @@ h+C/7UIZ5kDs26vTm+z6W30uFz3DtGTzPRBw==\n\
             keys.open(&swapped, "UUID-1", 0),
             Err(Refusal::BadSignature(_))
         ));
-        // Another host's envelope.
         assert_eq!(
             keys.open(&wire, "UUID-2", 0),
             Err(Refusal::WrongHost {
                 named: "UUID-1".into()
             })
         );
-        // A replay: the floor is at the serial already.
         assert_eq!(
             keys.open(&wire, "UUID-1", 7),
             Err(Refusal::Replay {
@@ -1247,7 +1169,6 @@ h+C/7UIZ5kDs26vTm+z6W30uFz3DtGTzPRBw==\n\
                 floor: 7
             })
         );
-        // Expired, and issued too far in the future.
         let mut old = envelope("UUID-1", 8, now - 100_000);
         old.expires = now - 10;
         let err = keys
@@ -1260,7 +1181,6 @@ h+C/7UIZ5kDs26vTm+z6W30uFz3DtGTzPRBw==\n\
             keys.open(&keys.seal(&ahead, "signing"), "UUID-1", 0),
             Err(Refusal::Expired { .. })
         ));
-        // A key allowed_signers does not name.
         let err = keys
             .open(&keys.seal(&e, "outsider"), "UUID-1", 0)
             .unwrap_err();

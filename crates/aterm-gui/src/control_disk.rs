@@ -1,48 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `await sys` (design `docs/DESIGN-disk-awareness-2026-10-17.md` §3.3): an
-//! agent waits for free space without polling.
-//!
-//! ```text
-//! aterm ctl [@<sid>|@self] await sys <term> [and <term>] [vol=<path>] [timeout=<ms>]
-//! <term>  := free(>=|>)<size>|room | disk=<word>[,<word>…]
-//! <size>  := <n>(B|KB|MB|GB|TB|KiB|MiB|GiB|TiB)     a bare number is ERR usage
-//! <word>  := ok | low | short | emergency
-//! ```
-//!
-//! The grammar is `await sys`'s one (`aterm_vitals::sys::predicate`, design
-//! `DESIGN-harness-occupancy-2026-10-20.md` §3.1): it parses these terms, and
-//! this module runs the wait it hands over ([`wait_of`]).
-//!
-//! LEVEL-TRIGGERED AND LATCHED: at arm time the wait reads a reading at most
-//! [`ARM_FRESH`] old, and a condition already true answers at once. Otherwise it
-//! parks on the disk board (`crate::disk_board`), which the watch notifies
-//! after every look and every pass, and refreshes its volume's reading itself
-//! once it is [`FRESH`] old. Each publishes its reading for other waits to
-//! reuse; concurrent readers can overlap while the board lock is released
-//! for the volume read.
-//!
-//! THE DEMAND: a `free` wait armed while free space is below the need, by an
-//! owner-class caller (an in-tab `aterm ctl` is one), registers `(session,
-//! volume, need)` on the board and pokes the watch, whose next pass runs tiers
-//! 1-3 until free space is the need plus the floor — never tier 4, never the
-//! reserve. The demand is safe because of what it can reach, not because of who
-//! asks. An edge-scoped caller gets the plain wait, no demand. A need more
-//! than [`DEMAND_CAP_PCT`] of the volume beyond what is free is refused at arm
-//! time (`too-large`: a unit typo must not sweep the machine).
-//!
-//! No disk watch in this process (`[harness]` off): a wait that would register
-//! a demand answers `ERR unavailable free why=no-watch`. A `room` on a volume
-//! whose room is not known answers `ERR unavailable free why=room-unknown`.
-//!
-//! THE HANG DETECTOR: a wait that holds a demand answers
-//! `ERR unavailable free why=watch-stalled` when the watch runs and its beat
-//! (`aterm_agent::harness::disk::beat`) is [`STALL`] old — never while the host
-//! is suspended. The beat ticks through discovery, sizing and deletion, so a
-//! pass that takes many minutes never trips it; `timeout=` is the caller's
-//! patience and aterm reads no time limit into it. The decision is the pure
-//! [`decide`], bound to `DiskAwait` (`disk_await_conformance`).
+//! Disk-space `await sys` wait runner ([`wait_of`], [`decide`], [`ARM_FRESH`], [`FRESH`]).
+//! Bounds demand against [`DEMAND_CAP_PCT`] and watch stalls against [`STALL`].
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -56,10 +16,7 @@ use crate::disk_board::{Board, PassSummary, Shelf, VolumeRow, Watch};
 /// A `vol=` this wait cannot read: not an absolute path once decoded.
 pub(crate) const USAGE: &str = aterm_vitals::sys::predicate::USAGE;
 
-/// A beat this old, while the watch runs, is a stalled watch: two of the
-/// watch's look periods (`harness_host::DISK_TICK`), so the gap between two
-/// healthy looks with no pass — a minute, plus the host timer's lateness —
-/// never reads as a stall.
+/// A beat this old, while the watch runs, is a stalled watch.
 pub(crate) const STALL: Duration =
     Duration::from_secs(crate::harness_host::DISK_TICK.as_secs().saturating_mul(2));
 
@@ -69,12 +26,10 @@ pub(crate) const FRESH: Duration = Duration::from_secs(10);
 /// At arm time a reading at most this old is used.
 pub(crate) const ARM_FRESH: Duration = Duration::from_secs(1);
 
-/// A pass that spent everything it may for a demand this recently answers a
-/// new wait at arm time (`why=spent`), while free space has not risen since.
+/// Window in which a spent pass answers a new wait at arm time (`why=spent`).
 pub(crate) const SPENT_RECENT: Duration = Duration::from_secs(60);
 
-/// A need more than this percent of the volume beyond what is free now is
-/// refused (`why=too-large`).
+/// Max demand percent of the volume beyond current free space (`why=too-large`).
 pub(crate) const DEMAND_CAP_PCT: u64 = 25;
 
 pub(crate) use aterm_vitals::sys::predicate::Need;
@@ -109,13 +64,9 @@ fn level(word: DiskWord) -> Level {
     }
 }
 
-/// The wait `await sys`'s one grammar parsed (`aterm_vitals::sys::predicate`,
-/// [`Parsed::Volume`](aterm_vitals::sys::predicate::Parsed::Volume)), its
-/// `vol=` decoded; a `vol=` that is not absolute is refused with the usage
-/// line.
+/// Build a [`Wait`] from a [`Parsed::Volume`](aterm_vitals::sys::predicate::Parsed::Volume).
 ///
 /// # Errors
-///
 /// The reply that refuses it: [`USAGE`].
 pub(crate) fn wait_of(parsed: VolumeWait) -> Result<SysWait, &'static str> {
     let vol = match parsed.vol {
@@ -154,8 +105,7 @@ pub(crate) struct Facts {
     pub(crate) running: bool,
     /// Its beat is [`STALL`] old.
     pub(crate) beat_old: bool,
-    /// A pass adopted this wait's need, ran every tier it may and left free
-    /// space below it.
+    /// A pass adopted this wait's need, ran every tier it may and left free space below it.
     pub(crate) spent: bool,
 }
 
@@ -172,9 +122,7 @@ pub(crate) enum Decision {
     Park,
 }
 
-/// THE DECISION, pure: met on a reading that holds; unmet only once a pass
-/// for this wait's demand spent what it may; stalled only for a demand, while
-/// the watch runs and its beat is old; else park.
+/// THE DECISION, pure: met on a reading that holds.
 pub(crate) fn decide(f: &Facts) -> Decision {
     if f.met {
         Decision::Met
@@ -187,8 +135,7 @@ pub(crate) fn decide(f: &Facts) -> Decision {
     }
 }
 
-/// Does every term of `wait` hold on `row`? `needs` are the terms' needs in
-/// bytes (a `room` resolved).
+/// Whether every term of `wait` holds on `row` for resolved `needs`.
 fn holds(wait: &SysWait, row: &VolumeRow) -> bool {
     wait.terms.iter().all(|t| match t {
         Term::Free { strict, need } => {
@@ -203,8 +150,7 @@ fn holds(wait: &SysWait, row: &VolumeRow) -> bool {
     })
 }
 
-/// A need in bytes on `row`'s volume; a `room` on a volume whose room is not
-/// known needs everything (it never holds: [`room_unknown`] answers first).
+/// A need in bytes on `row`'s volume ([`room_unknown`] answers when room is unknown).
 fn need_bytes(need: Need, row: &VolumeRow) -> u64 {
     match need {
         Need::Bytes(n) => n,
@@ -212,10 +158,7 @@ fn need_bytes(need: Need, row: &VolumeRow) -> u64 {
     }
 }
 
-/// Does `wait` name `room` on a volume whose room is not known (no meter
-/// reads it: the watch never measured it, or the harness state was missing)?
-/// Such a wait is `ERR unavailable free why=room-unknown`, never a need of 0
-/// met at once.
+/// Whether `wait` names `room` on a volume whose room is not known.
 fn room_unknown(wait: &SysWait, row: &VolumeRow) -> bool {
     row.room.is_none()
         && wait.terms.iter().any(|t| {
@@ -232,8 +175,7 @@ fn room_unknown(wait: &SysWait, row: &VolumeRow) -> bool {
 /// The reply to a wait on a volume whose room is not known.
 const ROOM_UNKNOWN: &str = "ERR unavailable free why=room-unknown\n";
 
-/// The reply to a demand where no disk watch runs (`[harness]` off): no pass
-/// would ever adopt it.
+/// The reply to a demand where no disk watch runs (`[harness]` off): no pass would ever adopt it.
 const NO_WATCH: &str = "ERR unavailable free why=no-watch\n";
 
 /// The largest free need of `wait` on `row`, if it has a `free` term.
@@ -249,18 +191,15 @@ fn largest_need(wait: &SysWait, row: &VolumeRow) -> Option<u64> {
         .max()
 }
 
-/// What the wait reads beyond the board, injected (the product's is
-/// [`Env::live`], a test's scripts each).
+/// External readers injected into the wait ([`Env::live`] in production).
 pub(crate) struct Env<'a> {
     /// A fresh reading of the volume holding a path (one `statfs`).
     pub(crate) read: &'a dyn Fn(&Path) -> Result<Reading, Unread>,
     /// Ask the watch to look now for a demand of so many bytes.
     pub(crate) poke: &'a dyn Fn(u64),
-    /// The removal settings: `(cleanup off by the owner's auto_free_gib = 0,
-    /// off by a [disk] value aterm cannot read, tier 3 off)`.
+    /// The removal settings.
     pub(crate) settings: &'a dyn Fn() -> (bool, bool, bool),
-    /// The lines in force on a volume the watch has not measured, from the
-    /// owner's `[disk]` settings (a wait's own reading of it).
+    /// The lines in force on a volume the watch has not measured.
     pub(crate) lines: &'a dyn Fn(&Reading) -> aterm_agent::harness::disk::Thresholds,
     /// The caller hung up.
     pub(crate) hung_up: &'a dyn Fn() -> bool,
@@ -268,8 +207,7 @@ pub(crate) struct Env<'a> {
     pub(crate) exited: &'a dyn Fn() -> bool,
 }
 
-/// Who waits: the session (its local id and working directory) and whether
-/// the caller may register a demand.
+/// Who waits: the session and whether the caller may register a demand.
 #[derive(Debug, Clone)]
 pub(crate) struct Who {
     pub(crate) session: u64,
@@ -317,9 +255,7 @@ fn unmet_reply(
     )
 }
 
-/// A row for `reading` keeping `old`'s lines and room (a wait's own reading
-/// of a volume the watch measured), or the owner's lines for it (`lines`)
-/// with its room unknown.
+/// Build a row for `reading`, preserving `old`'s lines and room when present.
 fn row_of(
     reading: Reading,
     old: Option<&VolumeRow>,
@@ -339,13 +275,7 @@ fn row_of(
     }
 }
 
-/// Whether a wait from session `session`, whose tab reports `cwd` with 8.3
-/// short names, spells it long before it asks the board
-/// (`cmd_await_sys`): only where board `b` places the session nowhere — no
-/// look mapped it ([`Board::row_of`]'s sessions) and no long spelling of
-/// that very spelling is kept for it ([`Board::spelled`], which may place
-/// on no row yet). A tab the board places costs its wait no file-system
-/// call (rev6-l-2). Pure.
+/// Whether 8.3 `cwd` must be spelled long on `b` ([`Board::row_of`], [`Board::spelled`]).
 fn spell_owed(b: &Board, session: u64, cwd: &Path) -> bool {
     b.row_of(session, cwd.to_str()).is_none()
         && b.spelled
@@ -358,13 +288,10 @@ fn unix_now() -> i64 {
     aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX))
 }
 
-/// THE WAIT over `shelf`: arm, latch or register a demand, park until it
-/// answers. See the module docs.
+/// THE WAIT over `shelf`: arm, latch or register a demand, park until it answers.
 pub(crate) fn run(shelf: &Shelf, wait: &SysWait, who: &Who, env: &Env<'_>) -> String {
     let armed = Instant::now();
     let deadline = armed + Duration::from_millis(wait.timeout_ms);
-    // The volume: `vol=`, else the session's row, else its working
-    // directory's spelling — placed on the board's table, or read.
     let (key, path) = {
         let b = shelf.board_lock();
         let row = match &wait.vol {
@@ -381,15 +308,6 @@ pub(crate) fn run(shelf: &Shelf, wait: &SysWait, who: &Who, env: &Env<'_>) -> St
     let Some(path) = path else {
         return "ERR unavailable free why=unreadable\n".to_owned();
     };
-    // A reading at most ARM_FRESH old, carried on from the row the board
-    // holds for the volume it READ — its room, its lines and whether a pass
-    // removes there. A spelling the board could not place (an 8.3 `vol=`,
-    // or an 8.3 tab not spelled long yet) gave no key, and the reader places
-    // it where the board's table cannot (it spells short names long): a row
-    // built from nothing there answered `free>=room` `why=room-unknown` and
-    // a demand `why=not-reclaimed` on a volume the watch measured (live5
-    // F1). A path that now names another volume carries on that volume's
-    // row, if any — never the one its spelling named before.
     let fresh = |key: Option<&VolumeKey>| -> Result<VolumeRow, String> {
         let old = key.and_then(|k| shelf.board_lock().row_keyed(k).cloned());
         if let Some(o) = old.as_ref().filter(|o| o.as_of.elapsed() <= ARM_FRESH) {
@@ -415,9 +333,6 @@ pub(crate) fn run(shelf: &Shelf, wait: &SysWait, who: &Who, env: &Env<'_>) -> St
         return ROOM_UNKNOWN.to_owned();
     }
     let need = largest_need(wait, &row);
-    // A need more than a quarter of the volume beyond what is free now is a
-    // unit typo (TB for GB), never a build: it must not sweep the machine.
-    // `cap_bytes=` is the largest need taken now.
     if let Some(n) = need {
         let cap = row.reading.total / 100 * DEMAND_CAP_PCT;
         if n.saturating_sub(row.reading.free) > cap {
@@ -430,16 +345,11 @@ pub(crate) fn run(shelf: &Shelf, wait: &SysWait, who: &Who, env: &Env<'_>) -> St
     if holds(wait, &row) {
         return met_reply(&row, 0);
     }
-    // The last pass the wait has already seen: one published after this
-    // instant, the demand's own included, is counted (read before the demand
-    // lands, so a pass that adopts it at once cannot be taken for an old one).
     let seen = shelf.board_lock().last_pass.as_ref().map(|p| p.ended_at);
-    // THE DEMAND, for a `free` term not met, from an owner-class caller.
     let mut demand: Option<u64> = None;
     if let (Some(need), true) = (need, who.owner_class)
         && row.reading.free < need
     {
-        // No disk watch runs in this process (`[harness]` off): no pass would
         // ever adopt the demand, and none runs for one here.
         if !shelf.board_lock().watched {
             return NO_WATCH.to_owned();
@@ -488,8 +398,7 @@ pub(crate) fn run(shelf: &Shelf, wait: &SysWait, who: &Who, env: &Env<'_>) -> St
     answer
 }
 
-/// The parked half of [`run`]: until [`decide`] answers, the deadline passes,
-/// the caller hangs up or the session exits.
+/// The parked half of [`run`]: until [`decide`] answers.
 #[allow(
     clippy::too_many_arguments,
     reason = "the arm's facts, handed on whole"
@@ -508,8 +417,6 @@ fn park(
     let mut adopted: Option<PassSummary> = None;
     let mut poked_at = Instant::now();
     loop {
-        // The facts are read under the guard the wait then parks with: a
-        // publish between the two cannot be missed.
         let g = shelf.board_lock();
         if let Some(p) = g.last_pass.as_ref()
             && &p.key == key
@@ -521,8 +428,6 @@ fn park(
             adopted = Some(p.clone());
         }
         let Some(row) = g.row_keyed(key).cloned() else {
-            // The watch's look left its row out (no session works there
-            // now): the wait reads the volume itself and goes on.
             drop(g);
             match (env.read)(path) {
                 Ok(reading) if &reading.key == key => {
@@ -590,8 +495,6 @@ fn park(
             return "OK timeout\n".to_owned();
         }
         if row.as_of.elapsed() >= FRESH {
-            // Share this reading with the other parked waits. Another reader
-            // may already be in flight while the board lock is released.
             match (env.read)(path) {
                 Ok(reading) if &reading.key == key => {
                     let fresh = row_of(reading, Some(&row), unix_now(), env.lines);
@@ -601,8 +504,6 @@ fn park(
                 Err(u) => return format!("ERR unavailable free why={}\n", u.word()),
             }
         }
-        // A demand no pass has adopted yet: the watch is asked again (a look
-        // already in flight when it was armed did not see it).
         if let Some(n) = need.filter(|_| demand.is_some() && adopted.is_none())
             && poked_at.elapsed() >= FRESH
         {
@@ -612,9 +513,7 @@ fn park(
     }
 }
 
-/// `await sys` on the control socket: the session's working directory read
-/// from its terminal (a guard taken and dropped at once), the product's
-/// readers, and [`run`] over the process's board.
+/// Handle `await sys` on the control socket via [`run`].
 pub(crate) fn cmd_await_sys(
     term: &std::sync::Arc<std::sync::Mutex<aterm_core::terminal::Terminal>>,
     store: &crate::session_store::Store,
@@ -626,8 +525,6 @@ pub(crate) fn cmd_await_sys(
         Ok(w) => w,
         Err(reply) => return reply.to_owned(),
     };
-    // Every platform with a volume reader waits (macOS, Linux, Windows); one
-    // without answers `why=unsupported` from its reader's refusal.
     let cwd = {
         use crate::cwd_native::ReportedCwd as _;
         term.try_lock()
@@ -639,16 +536,6 @@ pub(crate) fn cmd_await_sys(
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
     };
-    // A directory reported with 8.3 short names, which the board places
-    // nowhere for this session — no look mapped the tab, and it is not
-    // spelled long yet — is spelled long here, on the wait's own thread,
-    // before the board is asked where it is (`harness_host::disk_spell_now`):
-    // the wait then carries on its volume's row, and `status disk=` places
-    // the tab too (live5 F2). A tab the board places already is not asked
-    // about (rev6-l-2): its wait reads its row's mount, as it did before
-    // spellings were kept. The spelling's one file-system call waits at
-    // most `harness_host::DISK_SPELL_DEADLINE`, outside this wait's own
-    // `timeout=` and hang-up checks, and once stuck answers at once.
     if let Some(c) = cwd.as_deref().filter(|c| {
         crate::harness_host::disk_short_spelled(c)
             && spell_owed(&crate::disk_board::SHELF.board_lock(), session, c)

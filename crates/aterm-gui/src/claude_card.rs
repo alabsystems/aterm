@@ -1287,25 +1287,42 @@ fn make_line_texts_for(agent: Option<&str>, view: AutopilotView, end: LineEnd) -
     use crate::menu::{VersionFacts, VersionRung, version_signature};
     let facts = VersionFacts::this_build();
     let mut texts = Vec::with_capacity(7);
-    let tag = agent.map_or_else(String::new, |a| format!(" \u{b7} {a}"));
+    let tag = agent.map_or_else(String::new, |a| {
+        if a == "agy" {
+            let v = aterm_phase::Program::Agy.harness_version().unwrap_or("0.1");
+            format!(" \u{b7} {a} v{v}")
+        } else {
+            format!(" \u{b7} {a}")
+        }
+    });
     if let Some(full) = version_signature(facts, VersionRung::Full) {
         let head = format!("enhanced by {HERO_WORD} harness {full}{tag}");
         let (glyph, word) = end.words(view);
-        let mode = format!("{head} \u{b7} autopilot {glyph} {word}");
+        let mode = if agent == Some("agy") {
+            head.clone()
+        } else {
+            format!("{head} \u{b7} autopilot {glyph} {word}")
+        };
         if let LineEnd::CruiseUntil(at) = end {
             let mark = ChipFace::CruiseUntil
                 .word()
                 .unwrap_or(AutopilotView::Land.glyph());
             texts.push(format!("{mode} {mark}{}", crate::autopilot_menu::when(at)));
         }
-        texts.push(mode);
+        if mode != head {
+            texts.push(mode);
+        }
         texts.push(head);
     }
     if let Some(short) = version_signature(facts, VersionRung::Short) {
         texts.push(format!("enhanced by {HERO_WORD} harness {short}{tag}"));
     }
     let (glyph, word) = end.words(view);
-    texts.push(format!("{HERO_WORD} harness{tag} \u{b7} {glyph} {word}"));
+    if agent == Some("agy") {
+        texts.push(format!("{HERO_WORD} harness{tag}"));
+    } else {
+        texts.push(format!("{HERO_WORD} harness{tag} \u{b7} {glyph} {word}"));
+    }
     texts.push(format!("{HERO_WORD} \u{b7} {glyph} {word}"));
     texts.push(format!("{HERO_WORD} {glyph}"));
     texts

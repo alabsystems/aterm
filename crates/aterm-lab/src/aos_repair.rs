@@ -55,6 +55,7 @@ pub const CONFIG: &[&str] = &[
 ];
 
 /// The instance's aterm.toml: [`CONFIG`], [`instance::CONFIG_OFF`]'s tables, then the
+/// stats Deck held off.
 fn world_config() -> String {
     let top: Vec<String> = CONFIG.iter().map(|l| (*l).to_string()).collect();
     format!(
@@ -65,6 +66,7 @@ fn world_config() -> String {
 }
 
 /// The tab's program: one line, then nothing ever draws again but the line discipline's
+/// echo of the typed keys.
 const PROGRAM: &str =
     "printf 'aos-repair: the typed keys echo below; nothing else draws\\n'; exec /bin/sleep 3600";
 
@@ -967,6 +969,7 @@ impl Drive<'_> {
     }
 
     /// The keys of `word`, unguarded `key <c>` to the front tab [`KEY_GAP`] apart on the
+    /// held connection.
     fn type_keys(&mut self, word: &str) -> Result<Instant, Halt> {
         let start = Instant::now();
         let mut last = start;
@@ -994,6 +997,7 @@ impl Drive<'_> {
     }
 
     /// An upper bound of `t`'s offset from the attach epoch, in ns (the epoch is no
+    /// earlier than the attach request).
     fn offset_upper(&self, t: Instant) -> i128 {
         i128::try_from(t.saturating_duration_since(self.attach_sent).as_nanos())
             .unwrap_or(i128::MAX)
@@ -1027,6 +1031,7 @@ impl Drive<'_> {
     }
 
     /// A kept frame of the cold glass, its clean twin and sidecars, measured by
+    /// `trail-contrast`: its `outside_caret_px`.
     fn capture(&mut self, frame: &str) -> Result<Option<i64>, Halt> {
         let png = self.out.join(format!("{}.{frame}.png", self.stem));
         let clean = self.out.join(format!("{}.{frame}.clean.png", self.stem));
@@ -1157,6 +1162,7 @@ fn read_trace(d: &mut Drive<'_>) -> Result<TraceLine, Halt> {
 }
 
 /// A glow typed hot, left to cool by itself: hot, settling (a query made after the last
+/// key, whose offset is at most `after_keys`), cold, then the cold glass photographed.
 fn cool(d: &mut Drive<'_>, after_keys: i128, frame: &str) -> Result<Cooled, Halt> {
     let hot = d.wait_for("the keys heat the glow", |s| s.hot)?;
     let settling = d.wait_for("the glow settles, asked after the last key", |s| {
@@ -1229,6 +1235,7 @@ fn story(d: &mut Drive<'_>, control: bool) -> Result<Vec<Gate>, Halt> {
 }
 
 /// The aterm processes of a windowed instance: the keeper's descendants whose command
+/// line names the instance's own socket.
 fn aterm_pids(inst: &Instance) -> Vec<i32> {
     let mark = format!("--control-sock {}", inst.sock.display());
     crate::procs::descendants(inst.pid)
@@ -1428,6 +1435,7 @@ mod tests {
     use super::*;
 
     /// An attached status line as a debug build's `aos status` answers it (taken from a
+    /// headless instance with six keys typed under the demonstration fault).
     const HOT: &str = "OK window=0 attached=true code=demo-stranded-settle hot=true active=true \
         settling=false build=0.110.0+geee60c4e22d2 code_digest=f337aa19938f rev=0 branch=0 \
         paused=false queued=0/1024 log=8 log_epoch=1 cursor=8 broken=false \
@@ -1647,6 +1655,7 @@ mod tests {
     }
 
     /// An `aos trace` line of the agreed shape: the summary, then the seal and the
+    /// per-kind counts at its end.
     const TRACE: &str = "OK window=0 log=8 log_epoch=1 first=0 end=8 \
         trace=0356c26b403b57eb92e88d0323cc7c2d3e3de743dcb3e6a7f203383fd6a79c30 \
         checkpoint=31ecd090f577e87f65549fe2b74ac40c921a79cc8a5795079008b9194ddea798 \
@@ -1677,6 +1686,7 @@ mod tests {
     }
 
     /// The trace line the host printed before the seal and the counts existed is not a
+    /// trace the drive can judge: each missing word is named.
     #[test]
     fn a_trace_line_without_its_seal_or_a_count_is_an_error_naming_it() {
         let unsealed = TRACE.replace(" sealed=true keys=6 resets=0 ticks=1 queries=1", "");

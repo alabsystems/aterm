@@ -10,9 +10,6 @@ use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 
 /// A vector that stores up to `N` elements inline before spilling to the heap.
-///
-/// This avoids heap allocation for the common case where collections are small.
-/// When the inline capacity is exceeded, all elements move to a heap-allocated `Vec<T>`.
 pub struct SmallVec<T, const N: usize> {
     data: SmallVecData<T, N>,
 }
@@ -32,8 +29,6 @@ impl<T, const N: usize> SmallVec<T, N> {
     pub const fn new() -> Self {
         Self {
             data: SmallVecData::Inline {
-                // Array of `MaybeUninit` needs no init; inline-const avoids the
-                // `assume_init` obligation entirely (see ArrayVec::new).
                 buf: [const { MaybeUninit::uninit() }; N],
                 len: 0,
             },
@@ -41,20 +36,12 @@ impl<T, const N: usize> SmallVec<T, N> {
     }
 
     /// Create a `SmallVec` with the given capacity pre-allocated.
-    ///
-    /// If `capacity <= N`, uses inline storage. Otherwise, allocates on the heap.
     #[must_use]
-    // `#[inline]` so callers' Trust gates (aterm-scrollback) verify this body
-    // rather than assuming an absent callee.
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
         if capacity <= N {
             Self::new()
         } else {
-            // Clamp the advisory allocation hint so the reservation has a
-            // provable upper bound for the L0 unbounded-allocation gate. A
-            // literal, not a named const: the verifier havocs named-const
-            // operands.
             Self {
                 data: SmallVecData::Heap(Vec::with_capacity(capacity.min(16_777_216))),
             }
@@ -95,23 +82,18 @@ impl<T, const N: usize> SmallVec<T, N> {
         matches!(&self.data, SmallVecData::Inline { .. })
     }
 
-    /// Whether the data has spilled to the heap.
-    ///
-    /// This is the inverse of [`is_inline`](Self::is_inline).
-    /// Provided for API compatibility with `smallvec::SmallVec::spilled()`.
+    /// Whether the data has spilled to the heap ([`is_inline`](Self::is_inline)).
     #[inline]
     #[must_use]
     pub const fn spilled(&self) -> bool {
         !self.is_inline()
     }
 
-    /// Push an element. Spills to heap if inline capacity is exceeded.
+    /// Push an element.
     #[inline]
     pub fn push(&mut self, value: T) {
         match &mut self.data {
             SmallVecData::Inline { buf, len } => {
-                // Local copy of `len` (the ArrayVec::push idiom), so the `< N`
-                // fact reaches the index and the increment.
                 let cur = *len;
                 if cur < N {
                     buf[cur] = MaybeUninit::new(value);
@@ -128,8 +110,6 @@ impl<T, const N: usize> SmallVec<T, N> {
     }
 
     /// Pop the last element.
-    // Skip: the inline arm's `assume_init_read` is in ArrayVec::pop's
-    // init-tracking class; `len` counts exactly the initialized prefix.
     #[inline]
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn pop(&mut self) -> Option<T> {
@@ -139,7 +119,7 @@ impl<T, const N: usize> SmallVec<T, N> {
                     None
                 } else {
                     *len -= 1;
-                    // SAFETY: buf[*len] was initialized when it was pushed
+                    // SAFETY: Buf[*len] was initialized when it was pushed.
                     Some(unsafe { buf[*len].assume_init_read() })
                 }
             }
@@ -148,26 +128,13 @@ impl<T, const N: usize> SmallVec<T, N> {
     }
 
     /// Clear all elements.
-    ///
-    /// If an element's destructor panics, every other element is still
-    /// dropped and the vec is left empty, inline or spilled alike (the heap
-    /// arm is std `Vec::clear`).
-    // Skip: the inline arm drops each initialized slot (ArrayVec::truncate's
-    // init-tracking class).
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn clear(&mut self) {
         match &mut self.data {
             SmallVecData::Inline { buf, len } => {
-                // Clamp to a provably in-bounds count (identical when `len <= N`)
-                // so the subslice carries the bound.
                 let n = if *len < N { *len } else { N };
-                // Zero `len` before any destructor runs, as `ArrayVec::truncate`
-                // does: a panicking element `Drop` unwinds into
-                // `Drop for SmallVec`, which calls this again.
                 *len = 0;
-                // SAFETY: elements `0..n` were initialized when pushed and
-                // `n <= len` as it was on entry; `len` is already 0, so no
-                // other path reaches them again.
+                // SAFETY: Elements `0..n` were initialized when pushed, and `len` is already 0.
                 unsafe { crate::drop_initialized(&mut buf[..n]) }
             }
             SmallVecData::Heap(vec) => vec.clear(),
@@ -176,13 +143,8 @@ impl<T, const N: usize> SmallVec<T, N> {
 
     /// Remove the element at `index` by swapping it with the last element.
     ///
-    /// This is O(1) but does not preserve ordering.
-    ///
     /// # Panics
-    ///
     /// Panics if `index >= len`.
-    // Skip: the raw slot read/move joins ArrayVec's init/provenance class
-    // (per-slot memory-model producer lane). Same audited len-invariant.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn swap_remove(&mut self, index: usize) -> T {
         let len = self.len();
@@ -193,8 +155,6 @@ impl<T, const N: usize> SmallVec<T, N> {
     }
 
     /// Extend from a slice (requires `T: Clone`).
-    // Skip: the bulk copy joins the raw-shift init/provenance family
-    // (per-slot memory-model producer lane). Same audited len-invariant.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn extend_from_slice(&mut self, slice: &[T])
     where
@@ -208,21 +168,13 @@ impl<T, const N: usize> SmallVec<T, N> {
     /// View as a slice.
     #[inline]
     #[must_use]
-    // Skip: the raw-parts reconstruction joins ArrayVec::as_slice's
-    // init/provenance classification (memory-model producer lane).
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn as_slice(&self) -> &[T] {
         match &self.data {
             SmallVecData::Inline { buf, len } => {
-                // Clamp to a provably in-bounds length and take the initialized
-                // subslice; the raw-parts reconstruction reuses its pointer and
-                // length.
                 let n = if *len < N { *len } else { N };
                 let init: &[MaybeUninit<T>] = &buf[..n];
-                // SAFETY: `MaybeUninit<T>` has the same layout as `T`; the
-                // pointer and length come from the same in-bounds subslice
-                // `init`, and elements `0..len` are initialized (`n <= len`),
-                // so reading them as `T` is sound.
+                // SAFETY: `MaybeUninit<T>` has the same layout as `T`.
                 unsafe { core::slice::from_raw_parts(init.as_ptr().cast::<T>(), init.len()) }
             }
             SmallVecData::Heap(vec) => vec.as_slice(),
@@ -230,22 +182,14 @@ impl<T, const N: usize> SmallVec<T, N> {
     }
 
     /// View as a mutable slice.
-    // Skip: the raw-parts reconstruction joins ArrayVec::as_slice's
-    // init/provenance classification (memory-model producer lane).
     #[inline]
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         match &mut self.data {
             SmallVecData::Inline { buf, len } => {
-                // Clamp to a provably in-bounds length and take the initialized
-                // subslice; the raw-parts reconstruction reuses its pointer and
-                // length.
                 let n = if *len < N { *len } else { N };
                 let init: &mut [MaybeUninit<T>] = &mut buf[..n];
-                // SAFETY: `MaybeUninit<T>` has the same layout as `T`; the
-                // pointer and length come from the same in-bounds subslice
-                // `init`, and elements `0..len` are initialized (`n <= len`),
-                // so reading them as `T` is sound.
+                // SAFETY: `MaybeUninit<T>` has the same layout as `T`.
                 unsafe {
                     core::slice::from_raw_parts_mut(init.as_mut_ptr().cast::<T>(), init.len())
                 }
@@ -256,7 +200,6 @@ impl<T, const N: usize> SmallVec<T, N> {
 
     /// Create a `SmallVec` from a slice (requires `T: Clone`).
     #[must_use]
-    // Skip: the bulk copy joins the raw-shift init/provenance family.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn from_slice(slice: &[T]) -> Self
     where
@@ -269,8 +212,6 @@ impl<T, const N: usize> SmallVec<T, N> {
 
     /// Create from a `Vec<T>`.
     #[must_use]
-    // Skip: the residual obligation is drop glue over the consumed `Vec`; the
-    // conversion itself is a move.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn from_vec(vec: Vec<T>) -> Self {
         if vec.len() <= N {
@@ -287,8 +228,6 @@ impl<T, const N: usize> SmallVec<T, N> {
     }
 
     /// Create from a single element repeated `n` times.
-    // Skip: the repeat-fill joins the raw-shift init/provenance family; `T: Clone`
-    // is caller-chosen code besides (user-T dispatch).
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn from_elem(value: T, n: usize) -> Self
     where
@@ -304,8 +243,6 @@ impl<T, const N: usize> SmallVec<T, N> {
         sv
     }
 
-    // ── Internal helpers ────────────────────────────────────────────────
-
     fn spill_and_push(&mut self, value: T) {
         self.ensure_heap();
         if let SmallVecData::Heap(vec) = &mut self.data {
@@ -313,28 +250,20 @@ impl<T, const N: usize> SmallVec<T, N> {
         }
     }
 
-    // Skip: the inline-to-heap spill reads each initialized slot via
-    // `assume_init_read` (ArrayVec's init-tracking class). `*len = 0` before
-    // the heap swap prevents any double drop.
     #[cfg_attr(trust_verify, trust::skip)]
     fn ensure_heap(&mut self) {
         if let SmallVecData::Inline { buf, len } = &mut self.data {
-            // Clamp to a provably in-bounds count so the `buf[..current_len]`
-            // read carries a `<= N` proof.
             let current_len = if *len < N { *len } else { N };
             let mut vec = Vec::with_capacity(current_len.max(N) * 2);
-            // SAFETY: elements 0..current_len are initialized
+            // SAFETY: Elements 0..current_len are initialized.
             for elem in &buf[..current_len] {
                 vec.push(unsafe { elem.assume_init_read() });
             }
-            // Prevent double-drop of inline elements
             *len = 0;
             self.data = SmallVecData::Heap(vec);
         }
     }
 }
-
-// ── Trait impls ─────────────────────────────────────────────────────────────
 
 impl<T, const N: usize> Default for SmallVec<T, N> {
     #[inline]
@@ -360,8 +289,6 @@ impl<T, const N: usize> DerefMut for SmallVec<T, N> {
 }
 
 impl<T: Clone, const N: usize> Clone for SmallVec<T, N> {
-    // Skip: clones each element through the INSTANTIATING type's `Clone`
-    // (open-trait user code, may panic by design) — the user-T dispatch class.
     #[cfg_attr(trust_verify, trust::skip)]
     fn clone(&self) -> Self {
         let mut new = Self::with_capacity(self.len());
@@ -388,15 +315,12 @@ impl<T: Eq, const N: usize> Eq for SmallVec<T, N> {}
 
 impl<T, const N: usize> Drop for SmallVec<T, N> {
     fn drop(&mut self) {
-        // Reuse the (bounds-clamped) clear — drops the inline elements without a
         // separate out-of-bounds obligation; the heap Vec drops itself.
         self.clear();
     }
 }
 
 impl<T, const N: usize> FromIterator<T> for SmallVec<T, N> {
-    // Skip: `I: IntoIterator` is caller-chosen code; push's capacity contract
-    // is the documented panic.
     #[cfg_attr(trust_verify, trust::skip)]
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let iter = iter.into_iter();
@@ -410,8 +334,6 @@ impl<T, const N: usize> FromIterator<T> for SmallVec<T, N> {
 }
 
 impl<T, const N: usize> Extend<T> for SmallVec<T, N> {
-    // Skip: `I: IntoIterator` is caller-chosen code; push's capacity contract
-    // is the documented panic.
     #[cfg_attr(trust_verify, trust::skip)]
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
         for item in iter {
@@ -420,40 +342,7 @@ impl<T, const N: usize> Extend<T> for SmallVec<T, N> {
     }
 }
 
-/// Owned, by-value iterator over a [`SmallVec`].
-///
-/// Inline storage drains the `MaybeUninit` buffer in place without allocating;
-/// heap storage delegates to [`alloc::vec::IntoIter`]. The live range is
-/// `start..end`; `next` advances `start`, `next_back` retreats `end`, and
-/// [`Drop`] disposes of the remainder exactly once.
-///
-/// The representation is private, as upstream `smallvec`'s is. `next`,
-/// `next_back` and `Drop` read `buf[start..end]` as initialized, so safe code
-/// that could name the fields could forge an iterator over an uninitialized
-/// buffer or rewind the cursor and move one element out twice. Neither form
-/// compiles:
-///
-/// ```compile_fail,E0223
-/// use aterm_alloc::{IntoIter, SmallVec};
-/// let mut sv: SmallVec<String, 4> = SmallVec::new();
-/// sv.push(String::from("moved out twice if the cursor rewinds"));
-/// let mut it = sv.into_iter();
-/// let first = it.next();
-/// if let IntoIter::Inline { start, .. } = &mut it {
-///     *start = 0;
-/// }
-/// ```
-///
-/// ```compile_fail,E0223
-/// use aterm_alloc::IntoIter;
-/// use core::mem::MaybeUninit;
-/// let mut forged: IntoIter<Box<u64>, 2> = IntoIter::Inline {
-///     buf: [const { MaybeUninit::uninit() }; 2],
-///     start: 0,
-///     end: 2,
-/// };
-/// let uninit_box = forged.next();
-/// ```
+/// Owned, by-value iterator over a [`SmallVec`] ([`alloc::vec::IntoIter`], [`Drop`]).
 pub struct IntoIter<T, const N: usize> {
     repr: IntoIterRepr<T, N>,
 }
@@ -470,8 +359,7 @@ enum IntoIterRepr<T, const N: usize> {
 }
 
 impl<T, const N: usize> IntoIter<T, N> {
-    /// Whether the iterator drains an inline buffer (so consuming an inline
-    /// `SmallVec` did not allocate).
+    /// Whether the iterator drains an inline buffer.
     #[cfg(test)]
     const fn is_inline(&self) -> bool {
         matches!(self.repr, IntoIterRepr::Inline { .. })
@@ -481,20 +369,13 @@ impl<T, const N: usize> IntoIter<T, N> {
 impl<T, const N: usize> Iterator for IntoIter<T, N> {
     type Item = T;
 
-    // Skip: the drain reads each initialized slot — the crate-local init-tracking
-    // class (per-slot memory-model producer lane). Same audited len-invariant.
     #[cfg_attr(trust_verify, trust::skip)]
     fn next(&mut self) -> Option<T> {
         match &mut self.repr {
             IntoIterRepr::Inline { buf, start, end } => {
-                // Clamp to a provably in-bounds bound (`*end <= N` by
-                // construction) so the indexed read carries a `< N` proof.
                 let bound = if *end < N { *end } else { N };
                 if *start < bound {
-                    // SAFETY: element at `*start` was initialized at construction
-                    // (`*start < bound <= N`) and has not yet been yielded;
-                    // advancing `start` afterward guarantees it is never read or
-                    // dropped again.
+                    // SAFETY: `*start < bound <= N` was initialized and not yet yielded.
                     let value = unsafe { buf[*start].assume_init_read() };
                     *start += 1;
                     Some(value)
@@ -506,8 +387,6 @@ impl<T, const N: usize> Iterator for IntoIter<T, N> {
         }
     }
 
-    // Skip: reads the drain cursor against `len` — the same init/provenance
-    // class as its `next` (per-slot memory-model producer lane).
     #[cfg_attr(trust_verify, trust::skip)]
     fn size_hint(&self) -> (usize, Option<usize>) {
         match &self.repr {
@@ -521,22 +400,15 @@ impl<T, const N: usize> Iterator for IntoIter<T, N> {
 }
 
 impl<T, const N: usize> DoubleEndedIterator for IntoIter<T, N> {
-    // Skip: the back-drain reads each initialized slot — the same
-    // init/provenance class as `next`/`size_hint`.
     #[cfg_attr(trust_verify, trust::skip)]
     fn next_back(&mut self) -> Option<T> {
         match &mut self.repr {
             IntoIterRepr::Inline { buf, start, end } => {
-                // Clamp to a provably in-bounds bound so the indexed read
-                // carries a `< N` proof.
                 let bound = if *end < N { *end } else { N };
                 *end = bound;
                 if *start < *end {
                     *end -= 1;
-                    // SAFETY: element at `*end` was initialized at construction
-                    // (`*end < bound <= N`) and has not yet been yielded;
-                    // retreating `end` first guarantees it is never read or
-                    // dropped again.
+                    // SAFETY: Element at `*end` is initialized (`*end < bound <= N`) and unyielded.
                     let value = unsafe { buf[*end].assume_init_read() };
                     Some(value)
                 } else {
@@ -553,24 +425,14 @@ impl<T, const N: usize> ExactSizeIterator for IntoIter<T, N> {}
 impl<T, const N: usize> FusedIterator for IntoIter<T, N> {}
 
 impl<T, const N: usize> Drop for IntoIter<T, N> {
-    // Skip: drops the un-yielded initialized slots (the init-tracking class of
-    // `next`/`next_back`); start..end bounds the live range.
     #[cfg_attr(trust_verify, trust::skip)]
     fn drop(&mut self) {
         if let IntoIterRepr::Inline { buf, start, end } = &mut self.repr {
-            // Clamp both bounds (`*start <= *end <= N` by construction) so the
-            // subslice carries the proof.
             let bound = if *end < N { *end } else { N };
             let s = if *start < bound { *start } else { bound };
-            // SAFETY: the elements `s..bound` were initialized and have not
-            // been yielded, and this `Drop` runs once, so nothing reads or
-            // drops them again. A panicking destructor still lets the rest
-            // drop, as the heap arm's `vec::IntoIter` does (upstream
-            // smallvec's `for _ in self {}` leaks the rest; whether the vec
-            // had spilled must not change that).
+            // SAFETY: The elements `s..bound` were initialized and have not been yielded.
             unsafe { crate::drop_initialized(&mut buf[s..bound]) }
         }
-        // Heap variant: `alloc::vec::IntoIter` drops its own remaining elements.
     }
 }
 
@@ -578,12 +440,8 @@ impl<T, const N: usize> IntoIterator for SmallVec<T, N> {
     type Item = T;
     type IntoIter = IntoIter<T, N>;
 
-    // Skip: hands the inline buffer to `IntoIter` — the same crate-local
-    // init-tracking class as the iterator it constructs.
     #[cfg_attr(trust_verify, trust::skip)]
     fn into_iter(mut self) -> Self::IntoIter {
-        // Move the storage out, leaving an empty inline buffer so the source's
-        // Drop is a no-op, without allocating for the inline case.
         let data = core::mem::replace(
             &mut self.data,
             SmallVecData::Inline {
@@ -593,8 +451,6 @@ impl<T, const N: usize> IntoIterator for SmallVec<T, N> {
         );
         let repr = match data {
             SmallVecData::Inline { buf, len } => {
-                // Clamp to a provably in-bounds end so the range the
-                // iterator/Drop walks carries a `<= N` proof.
                 let end = if len < N { len } else { N };
                 IntoIterRepr::Inline { buf, start: 0, end }
             }
@@ -622,8 +478,6 @@ impl<'a, T, const N: usize> IntoIterator for &'a mut SmallVec<T, N> {
     }
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,9 +485,6 @@ mod tests {
     use std::string::{String, ToString};
     use std::vec::Vec;
 
-    // Drop-counting element for `IntoIter` drop-once checks under partial,
-    // full and no consumption, inline and heap. The `Rc` counter and `String`
-    // payload give Miri real allocations, so a double drop or leak is caught.
     struct DropCounter {
         counter: std::rc::Rc<std::cell::Cell<usize>>,
         payload: String,
@@ -650,8 +501,6 @@ mod tests {
 
     impl Drop for DropCounter {
         fn drop(&mut self) {
-            // The payload is intact at drop time: a double drop or a drop of
-            // freed storage reads garbage here (and Miri flags the read).
             assert_eq!(self.payload, "into-iter drop payload");
             self.counter.set(self.counter.get() + 1);
         }

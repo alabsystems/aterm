@@ -139,8 +139,32 @@ pub struct ExecEnv<'a> {
     pub child_ceiling: Option<Duration>,
     /// Variables removed from every child's inherited environment before its own [`Cmd::envs`] are applied, so a stage that names a variable still wins ([`crate::CHILD_ENV_REMOVED`]).
     pub remove_env: &'a [&'a str],
-    /// Variables added to every child, after [`Self::remove_env`] and before the stage's own [`Cmd::envs`], so a stage that names a variable still wins: facts the whole run must agree on, resolved once on the main thread (`CARGO_TARGET_DIR`, `TRUST_STAGE2_BIN`, `RUST_TEST_THREADS`).
+    /// Variables added to every child, after [`Self::remove_env`] and before the stage's own [`Cmd::envs`], so a stage that names a variable still wins: facts the whole run must agree on, resolved once on the main thread (`CARGO_TARGET_DIR`, `TRUST_STAGE2_BIN`, `RUST_TEST_THREADS`, `ATERM_VERIFY_RUN`).
     pub add_env: &'a [(OsString, OsString)],
+    /// The run's record of its stage groups, when it keeps one ([`crate::runs`]):
+    /// told as each stage group is made and, on a stage's normal end, asked to
+    /// sweep that group's survivors while this run still holds the leader
+    /// unreaped (`docs/DESIGN-leftover-processes-2026-10-16.md` §8.1). `None`
+    /// off the shipped run (every test that constructs an [`ExecEnv`] of its
+    /// own) and on a ceiling kill, which signals the whole group instead.
+    pub stage_groups: Option<&'a dyn StageGroupEnd>,
+}
+
+/// What a run does with a stage child's process group, at the two moments the
+/// group custody ([`group::Live`]) makes safe: when it is made (the leader is
+/// alive and leads it), and when the leader has exited but is not yet reaped,
+/// so the group id cannot be reused. The run's record implements it
+/// ([`crate::runs::Runs`]); a ceiling kill never calls it (it SIGKILLs the
+/// group). `Sync`: stages run concurrently, each on its own thread. `Debug`:
+/// [`ExecEnv`] holds one behind a reference and derives `Debug`.
+pub trait StageGroupEnd: Sync + std::fmt::Debug {
+    /// A stage group was made: `pgid` leads it (its leader's pid, since every
+    /// stage child is `process_group(0)`), running `label`.
+    fn group_made(&self, pgid: u32, label: &str);
+    /// The leader of `pgid` has exited and is still held unreaped: list the
+    /// group's survivors, end those that run this run's own build by pid, name
+    /// the rest, and record it ([`crate::runs::Runs::group_ended`]).
+    fn group_ended(&self, pgid: u32, label: &str);
 }
 
 /// What a child did.
@@ -221,6 +245,7 @@ pub fn bounded<T: Send + 'static>(
 }
 
 /// [`bounded`] with the wait injected, so a test times out only once its child
+/// is running instead of racing a short timer.
 fn bounded_wait<T: Send + 'static>(
     walk: impl FnOnce() -> T + Send + 'static,
     wait: impl FnOnce(std::sync::mpsc::Receiver<T>) -> Result<T, Unfinished>,
@@ -255,6 +280,7 @@ fn bounded_wait<T: Send + 'static>(
 mod output;
 
 /// Anything past a century is not a number of seconds anyone meant, and
+/// `Duration::from_secs_f64` panics outright on a value it cannot hold.
 const MAX_CEILING_SECS: f64 = 3_153_600_000.0;
 
 /// Parse a `--timeout` value: `Some(Some(d))` moves [`DEFAULT_CHILD_CEILING`] to `d` (seconds, fractional accepted), `Some(None)` removes it (`0`, `off`, `none`, `never`), and `None` is a usage error.
@@ -313,10 +339,12 @@ pub fn run(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
         c.env(k, v);
     }
 
+    // The run's record names a stage group by its argv, as the ladder does.
+    let label = cmd.argv().join(" ");
     match &cmd.capture {
         Capture::Silent => {
             c.stdout(Stdio::null()).stderr(Stdio::null());
-            finish(c, cmd, env.child_ceiling, None).0
+            finish(c, cmd, env.child_ceiling, None, env.stage_groups, &label).0
         }
         Capture::Emit => {
             let seq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -337,7 +365,14 @@ pub fn run(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
                 Err(e) => return spawn_failure(cmd, &e.to_string()),
             };
             c.stdout(file).stderr(file2);
-            let (mut r, logged) = finish(c, cmd, env.child_ceiling, Some(&log));
+            let (mut r, logged) = finish(
+                c,
+                cmd,
+                env.child_ceiling,
+                Some(&log),
+                env.stage_groups,
+                &label,
+            );
             r.output
                 .insert_str(0, logged.as_deref().unwrap_or_default());
             std::fs::remove_file(&log).ok();
@@ -347,6 +382,8 @@ pub fn run(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
 }
 
 /// The `Command` for `cmd` before its cwd and environment are applied: the
+/// program itself or, for a [`Cmd::demoted`] child, the program behind
+/// `taskpolicy -c utility`.
 fn spawn_command(cmd: &Cmd, env: ExecEnv<'_>, taskpolicy: &Path) -> Command {
     let mut c = if cmd.demoted && crate::is_executable_file(taskpolicy) && resolves(cmd, env) {
         let mut c = Command::new(taskpolicy);
@@ -373,9 +410,11 @@ fn spawn_command(cmd: &Cmd, env: ExecEnv<'_>, taskpolicy: &Path) -> Command {
 }
 
 /// The program [`spawn_command`] puts between `taskpolicy` and a demoted child
+/// that carries `DYLD_*` variables.
 const ENV: &str = "/usr/bin/env";
 
 /// `K=V` for each `DYLD_*` variable in `envs`, in order (a later one wins, in
+/// `env` as in the `Command`).
 fn dyld_assignments(envs: &[(OsString, OsString)]) -> Vec<OsString> {
     envs.iter()
         .filter(|(k, _)| k.to_string_lossy().starts_with("DYLD_"))
@@ -389,6 +428,7 @@ fn dyld_assignments(envs: &[(OsString, OsString)]) -> Vec<OsString> {
 }
 
 /// Whether `execvp` would find `cmd.program` from the child's cwd, on the PATH
+/// the child is actually given (its own [`Cmd::envs`] override included).
 fn resolves(cmd: &Cmd, env: ExecEnv<'_>) -> bool {
     let program = cmd.program.as_path();
     let cwd = cmd.cwd.as_deref().unwrap_or(env.cwd);
@@ -404,16 +444,29 @@ fn resolves(cmd: &Cmd, env: ExecEnv<'_>) -> bool {
     std::env::split_paths(path).any(|d| crate::is_executable_file(&cwd.join(d).join(program)))
 }
 
-/// Spawn and wait, under `ceiling`. Returns a [`Run`] whose `output` is empty
+/// Spawn and wait, under `ceiling`.
 fn finish(
     mut c: Command,
     cmd: &Cmd,
     ceiling: Option<Duration>,
     log: Option<&Path>,
+    stage_groups: Option<&dyn StageGroupEnd>,
+    label: &str,
 ) -> (Run, Option<String>) {
     let read_log = |log: Option<&Path>| {
         log.map(|p| String::from_utf8_lossy(&std::fs::read(p).unwrap_or_default()).into_owned())
     };
+    // The sweep the run's record runs when a stage leader exits but is not yet
+    // reaped (the group id cannot be reused then); a ceiling kill never reaches
+    // it. Off unix, and with no record, it is a no-op.
+    #[cfg(unix)]
+    let sweep = |pgid: u32| {
+        if let Some(groups) = stage_groups {
+            groups.group_ended(pgid, label);
+        }
+    };
+    #[cfg(not(unix))]
+    let _ = (stage_groups, label);
     #[cfg(unix)]
     if group::stopping() {
         return (
@@ -436,12 +489,17 @@ fn finish(
     };
     #[cfg(unix)]
     let mut live = group::Live::enter(child.id());
+    // The group is made and alive: record it before the child can exit.
+    #[cfg(unix)]
+    if let Some(groups) = stage_groups {
+        groups.group_made(child.id(), label);
+    }
     #[cfg(unix)]
     drop(spawning);
     let Some(limit) = ceiling else {
         #[cfg(unix)]
         let status = live
-            .reap_stage(&mut child, true)
+            .reap_stage_sweeping(&mut child, true, sweep)
             .and_then(|s| s.ok_or_else(|| io::Error::other("blocking wait returned no status")));
         #[cfg(not(unix))]
         let status = child.wait();
@@ -452,7 +510,7 @@ fn finish(
     let mut nap = Duration::from_millis(1);
     loop {
         #[cfg(unix)]
-        let status = live.reap_stage(&mut child, false);
+        let status = live.reap_stage_sweeping(&mut child, false, sweep);
         #[cfg(not(unix))]
         let status = child.try_wait();
         match status {
@@ -476,6 +534,7 @@ fn finish(
 }
 
 /// End the group while its leader remains our unreaped child, then reap through
+/// the same live-list/interrupt handshake as an ordinary exit.
 fn kill_and_reap(
     child: &mut std::process::Child,
     #[cfg(unix)] live: &mut group::Live,
@@ -525,6 +584,8 @@ fn kill_and_reap(
 }
 
 /// The ceiling fired: a failure that says so ([`crate::findings::CEILING_KILL`]),
+/// never a skip or a pass, and never mistakable for a child that merely exited
+/// nonzero.
 fn over_ceiling(cmd: &Cmd, elapsed: Duration, limit: Duration, kill: &str) -> Run {
     let argv = cmd.argv().join(" ");
     Run {
@@ -559,13 +620,18 @@ pub mod group {
     const SIG_DFL: libc::sighandler_t = libc::SIG_DFL;
 
     /// How long an interrupted run gives its groups to exit after `SIGTERM`
+    /// (EXIT traps, the trust lane's own teardown) before it `SIGKILL`s what is
+    /// left: rounds of [`NAP_MS`], ended early once every listed child has
+    /// exited and left the list and no spawn is in flight.
     const GRACE_ROUNDS: u32 = 200;
     const NAP_MS: c_long = 10;
 
     /// The process groups of the stage children running now, `0` for a free
+    /// slot.
     static LIVE: [AtomicI32; 256] = [const { AtomicI32::new(0) }; 256];
 
     /// Set by the first interrupt, before it signals anything, so no stage
+    /// starts a child the run is about to leave behind.
     static STOPPING: AtomicBool = AtomicBool::new(false);
     static SPAWNING: AtomicUsize = AtomicUsize::new(0);
 
@@ -675,16 +741,37 @@ pub mod group {
             child: &mut std::process::Child,
             block: bool,
         ) -> std::io::Result<Option<std::process::ExitStatus>> {
+            self.reap_stage_sweeping(child, block, |_| {})
+        }
+
+        /// [`Self::reap_stage`], running `sweep` once the leader has exited and
+        /// before it is reaped — the one window in which its group id cannot be
+        /// reused, so the run's record may list the group's survivors safely
+        /// (`docs/DESIGN-leftover-processes-2026-10-16.md` §8.1). `sweep` gets
+        /// the leader's pgid. It runs only when the leader actually exited (the
+        /// return is `Ok(Some)`), so in the polling loop it fires once. Where
+        /// there is no `WNOWAIT` custody (other Unix hosts), no sweep runs: the
+        /// survivor step is macOS and Linux only (slice 7 adds the Linux list).
+        pub(super) fn reap_stage_sweeping(
+            &mut self,
+            child: &mut std::process::Child,
+            block: bool,
+            sweep: impl FnOnce(u32),
+        ) -> std::io::Result<Option<std::process::ExitStatus>> {
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             {
                 if !self.exited(child, block)? {
                     return Ok(None);
+                }
+                if let Some(pgid) = self.group {
+                    sweep(pgid);
                 }
                 self.release_for_reap(child.id())?;
                 child.wait().map(Some)
             }
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             {
+                let _ = sweep;
                 self.exited(child, block)?;
                 child.try_wait()
             }
@@ -846,7 +933,7 @@ pub mod group {
         STOPPING.load(Ordering::SeqCst)
     }
 
-    /// Send `sig` to every listed group. Async-signal-safe: atomic loads and
+    /// Send `sig` to every listed group.
     fn sweep(sig: i32) {
         for slot in &LIVE {
             let g = slot.load(Ordering::SeqCst);
@@ -860,6 +947,12 @@ pub mod group {
     }
 
     /// The handler: `SIGTERM` every live group, wait up to [`GRACE_ROUNDS`]
+    /// for the stage threads to reap them, `SIGKILL` whatever is still listed,
+    /// then die of the signal. Only the first interrupt does this; a later one
+    /// returns at once. The run's record ([`crate::runs`]) is left as it is:
+    /// what left the listed groups is the next run's start pass's to judge
+    /// from it. Async-signal-safe throughout: atomics, `killpg`, `nanosleep`,
+    /// `signal` and `raise`.
     extern "C" fn on_signal(sig: i32) {
         if STOPPING.swap(true, Ordering::SeqCst) {
             return;
@@ -939,6 +1032,7 @@ fn reaped(st: io::Result<std::process::ExitStatus>) -> Run {
 }
 
 /// The child could not be spawned, or could not be waited on — an environment
+/// failure, not a finding about the tree, and fail-closed either way.
 fn failed_to_wait(why: &str) -> Run {
     Run {
         ok: false,
@@ -969,6 +1063,7 @@ mod tests {
     use super::*;
 
     /// The default the run itself runs under, so every test that does not say
+    /// otherwise exercises the polling wait.
     fn env_in(dir: &Path) -> ExecEnv<'_> {
         ceiled(dir, Some(DEFAULT_CHILD_CEILING))
     }
@@ -981,10 +1076,13 @@ mod tests {
             child_ceiling,
             remove_env: &[],
             add_env: &[],
+            stage_groups: None,
         }
     }
 
     /// A removal ending in `*` takes every inherited variable it begins: what
+    /// `cargo run` told this process about itself (`CARGO_PKG_*`) never reaches
+    /// a child, while a plain name is removed exactly.
     #[cfg(unix)]
     #[test]
     fn a_starred_removal_takes_every_inherited_variable_it_begins() {
@@ -1014,6 +1112,8 @@ mod tests {
     }
 
     /// The child runs in the repo root with the run's PATH; the run's own
+    /// setting reaches it over whatever the caller's shell exported, and a
+    /// stage that names the variable itself still wins.
     #[test]
     fn a_child_runs_in_the_root_with_the_runs_variables_and_its_own_win() {
         let tmp = crate::mktemp_dir("atv-setenv").expect("mktemp");
@@ -1038,6 +1138,8 @@ mod tests {
     }
 
     /// A missing tool, demoted or not, is a spawn failure: never a panic, and
+    /// never a pass (a demoted one is not handed to `taskpolicy`, whose own exit
+    /// would hide it).
     #[test]
     fn a_missing_tool_is_a_failed_run_not_a_panic_and_never_a_pass() {
         let tmp = crate::mktemp_dir("atv-exec3").expect("mktemp");
@@ -1053,6 +1155,7 @@ mod tests {
     }
 
     /// stdout and stderr land in one capture in write order, and a nonzero
+    /// exit keeps both its output and its code.
     #[test]
     fn output_is_captured_with_stderr_merged_and_a_nonzero_exit_keeps_its_code() {
         let tmp = crate::mktemp_dir("atv-exec").expect("mktemp");
@@ -1073,6 +1176,8 @@ mod tests {
     }
 
     /// A replayed child is the process cargo would have started: its own
+    /// directory, exactly the recorded environment (none of the run's PATH or
+    /// additions), and a preamble at the head of its log, above its own bytes.
     #[test]
     fn a_replayed_child_starts_where_and_as_it_was_recorded() {
         let tmp = crate::mktemp_dir("atv-replay").expect("mktemp");
@@ -1135,14 +1240,17 @@ mod tests {
     }
 
     /// How long a grandchild that must be gone gets to go: a hang detector (a
+    /// killed grandchild is reaped by launchd, and a loaded machine takes its
+    /// time).
     #[cfg(unix)]
     const GONE: Duration = Duration::from_secs(60);
 
     /// A wait for something else that must happen is a hang detector too,
+    /// never a latency budget.
     #[cfg(unix)]
     const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
-    /// Is `pid` gone (or a zombie) within `window`? Polls, because a killed
+    /// Is `pid` gone (or a zombie) within `window`?
     #[cfg(unix)]
     fn gone_within(pid: &str, window: Duration) -> bool {
         let deadline = Instant::now() + window;
@@ -1170,6 +1278,7 @@ mod tests {
     }
 
     /// [`written_pid`], waited for: a loaded machine can take seconds to start a
+    /// shell, so the bound is liveness, not latency.
     #[cfg(unix)]
     fn read_pid(file: &Path) -> String {
         let deadline = Instant::now() + HANG_DETECTOR;
@@ -1183,6 +1292,8 @@ mod tests {
     }
 
     /// A shell that backgrounds a long `sleep` — the grandchild — writes its
+    /// pid to `file`, and waits on it: the shape of a `targo test` that has
+    /// launched a daemon, one level down.
     #[cfg(unix)]
     fn with_grandchild(file: &Path) -> Cmd {
         Cmd::new("/bin/sh").args([
@@ -1192,6 +1303,8 @@ mod tests {
     }
 
     /// The ceiling ends the whole group: a grandchild the stage child started is
+    /// gone once it fires (a `Child::kill` of the direct child alone would leave
+    /// it running).
     #[cfg(unix)]
     #[test]
     fn a_ceiling_kill_takes_the_childs_whole_process_group() {
@@ -1222,6 +1335,8 @@ mod tests {
     }
 
     /// A shell that traps its exit into `marker` (and, `ignore`, ignores
+    /// `SIGTERM`), backgrounds a long `sleep` whose pid it writes to `pidfile`,
+    /// and waits on it.
     #[cfg(unix)]
     fn suite_with_trap(marker: &Path, pidfile: &Path, ignore: bool) -> Cmd {
         Cmd::new("/bin/bash").args([
@@ -1236,6 +1351,8 @@ mod tests {
     }
 
     /// A child with a grace ([`Cmd::term_grace`]) is sent `SIGTERM` at its
+    /// ceiling, so its EXIT trap runs, and the run moves on once it has exited
+    /// rather than waiting out the grace.
     #[cfg(unix)]
     #[test]
     fn a_graceful_child_runs_its_exit_trap_and_its_grace_is_a_bound() {
@@ -1292,6 +1409,15 @@ mod tests {
     }
 
     /// An interrupted run takes its stage children with it. The test re-executes
+    /// itself as a stand-in run that installs [`group::kill_on_interrupt`], opens
+    /// its run record ([`crate::runs::Runs::open`]), runs a stage child with a
+    /// grandchild, and is sent `SIGINT` as a terminal's Ctrl-C would once the
+    /// child is listed and the grandchild's pid written: the grandchild is gone
+    /// (its own group never heard the Ctrl-C), the stand-in died of `SIGINT`,
+    /// and its record is KEPT. The handler can end only the groups it lists, so
+    /// what left them (a W-run escapee, a survivor a stage's sweep named) is the
+    /// next run's start pass's to judge, from that record. NEGATIVE CONTROL: have
+    /// the handler unlink the record after its kills, and it is gone.
     #[cfg(unix)]
     #[test]
     fn an_interrupted_gate_kills_every_live_stage_group() {
@@ -1301,6 +1427,22 @@ mod tests {
             group::kill_on_interrupt();
             let pidfile = PathBuf::from(pidfile);
             let armed = pidfile.with_extension("armed");
+            let ctx = crate::Ctx::new(
+                PathBuf::from("/wt-a"),
+                crate::Scope::workspace(),
+                crate::EnvSnapshot::default(),
+                PathBuf::from("/tmp/atv-s"),
+            );
+            let records = pidfile.with_extension("records");
+            let record = crate::runs::Runs::open(&ctx, &records, |_, _| Run {
+                ok: false,
+                output: String::new(),
+                code: None,
+                spawn_error: None,
+            });
+            if cfg!(target_vendor = "apple") {
+                assert!(record.is_some(), "the stand-in keeps a record");
+            }
             std::thread::scope(|scope| {
                 let stage = scope.spawn(|| {
                     run(
@@ -1367,10 +1509,18 @@ mod tests {
             gone_within(&grandchild, GONE),
             "the grandchild {grandchild} outlived the interrupted run"
         );
+        // Where a record is kept (macOS; Linux reads no birth for it until slice 7).
+        if cfg!(target_vendor = "apple") {
+            let kept = std::fs::read_dir(tmp.join("handled.records"))
+                .map(|d| d.flatten().count())
+                .unwrap_or(0);
+            assert_eq!(kept, 1, "the interrupted run kept its record");
+        }
         std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// A walk answers, panics or outlives its ceiling; only the first is an
+    /// answer, and a hung one never holds the caller past the ceiling.
     #[test]
     fn an_in_process_walk_answers_or_is_named_unfinished() {
         assert_eq!(bounded(Some(DEFAULT_CHILD_CEILING), || 7), Ok(7));
@@ -1383,7 +1533,7 @@ mod tests {
         assert_eq!(hung, Err(Unfinished::TimedOut(ceiling)));
     }
 
-    /// The bounded walks' child: this test binary, no shell or real tools. Unless
+    /// The bounded walks' child: this test binary, no shell or real tools.
     #[cfg(unix)]
     #[test]
     fn bounded_output_stand_in() {
@@ -1420,6 +1570,7 @@ mod tests {
     }
 
     /// The deadline is injected once the real child is live, and the timeout is
+    /// not reported while that child runs.
     #[cfg(unix)]
     #[test]
     fn a_bounded_walk_reaps_its_output_child_before_reporting_timeout() {
@@ -1487,6 +1638,8 @@ mod tests {
     }
 
     /// A walk stuck outside a command when its row times out cannot start a
+    /// child once it resumes; a new walk still can
+    /// ([`a_bounded_walk_keeps_normal_child_output`]).
     #[cfg(unix)]
     #[test]
     fn a_timed_out_walk_cannot_launch_a_child_later() {
@@ -1526,6 +1679,7 @@ mod tests {
     }
 
     /// Nor can the value a timed-out walk returns: it is dropped under the
+    /// walk's closed scope, and its destructor's command is refused.
     #[cfg(unix)]
     #[test]
     fn a_timed_out_walk_cannot_launch_from_its_returned_value_drop() {

@@ -1,20 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The GUI connection core: the process-local record of every connection this instance minted,
-//! the connect/disconnect acts over it, the per-session role predicate the connection mark
-//! renders, and the close-time source sweep.
-//!
-//! The per-session [`EdgeTable`]s are the authority record, but their bearer tokens are
-//! deliberately non-enumerable and never written to token files or env vars. So the tokens a
-//! connection minted live only here, in the [`ConnectionRecord`] store, for two purposes:
-//! dissolution (disconnect revokes exactly the rows it minted) and the seamless-update handoff
-//! re-mint. Nothing here is an authority gate: `decide_edge` over the destination's table stays
-//! the one enforcement point, and dropping a record without revoking (or the reverse) can only
-//! lose authority, never widen it.
-//!
-//! Ownership mirrors [`crate::proxy`]'s `PROXIES`: one process-wide table behind a `OnceLock`,
-//! with the mutating helpers taking `&ConnectionStore` so tests run against a private store.
+//! Process-local connection records, connect/disconnect acts, and close-time source sweep
+//! ([`EdgeTable`], [`ConnectionRecord`], [`crate::proxy`]).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,20 +13,14 @@ use aterm_session::{ConnectionKind, EdgeTable, EdgeToken, LaunchNonce, Op, Sessi
 use crate::session_edge_audit::{self, EdgeAction};
 use crate::session_store::Store;
 
-/// One live connection `src → dst` (the pair is the record's key in the store) and the exact
-/// edge rows it minted into the destination's table. The tokens are bearer secrets (redacted
-/// `Debug`), held solely so disconnect/handoff can act on precisely these rows; they are never
-/// enumerated, logged, or written out.
+/// One live connection `src → dst` and the edge rows it minted into the destination's table.
 #[derive(Clone, Debug)]
 pub(crate) struct ConnectionRecord {
     pub tokens: Vec<(Op, EdgeToken)>,
 }
 
 impl ConnectionRecord {
-    /// The [`ConnectionKind`] this record's op set spells, derived rather than
-    /// stored so the record cannot drift from the rows it minted. `None` for an
-    /// op set outside the closed kind vocabulary (unreachable through
-    /// [`connect_in`], which mints solely from [`ConnectionKind::ops`]).
+    /// The [`ConnectionKind`] this record's op set spells.
     #[must_use]
     pub(crate) fn kind(&self) -> Option<ConnectionKind> {
         let ops: Vec<Op> = self.tokens.iter().map(|(op, _)| *op).collect();
@@ -56,33 +38,23 @@ impl ConnectionRecord {
     }
 }
 
-/// The process's record of live connections: the `(src, dst)`-keyed map (one record per
-/// direction; a peer pair `A⇆B` is two records) plus the freshness epoch. Shared by the UI thread
-/// (menu/drag acts), the control thread (the connection verbs) and the close-time sweep.
+/// The process's record of live connections.
 #[derive(Default)]
 pub(crate) struct ConnectionTable {
     records: Mutex<HashMap<(SessionId, SessionId), ConnectionRecord>>,
-    /// Monotonic revision, bumped by every connection-authority change this table can observe
-    /// (mint, revoke, close sweep, and for the process singleton the wire `grant`/`revoke` verbs
-    /// via their repaint poke, which bypass the record store). The tab chrome joins it to its
-    /// cache-epoch tuple so a menu/tooltip recomposes right after an authority act instead of
-    /// serving revoked state until the 30 s backstop ([`crate::session_chrome::CACHE_MAX_AGE_MS`]).
+    /// Monotonic revision, bumped by every connection-authority change this table can observe.
     revision: AtomicU64,
 }
 
 impl ConnectionTable {
-    /// The record map, poison-recovered (the store holds no invariants a
-    /// panicked holder could break — every entry is independently valid).
+    /// The record map, poison-recovered.
     pub(crate) fn records(
         &self,
     ) -> MutexGuard<'_, HashMap<(SessionId, SessionId), ConnectionRecord>> {
         self.records.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// The current freshness epoch. `Relaxed` on both sides: the value is a staleness hint (a
-    /// reader that misses a just-landed bump recomposes one refresh later at worst), and the
-    /// refresh funnel that follows every bump (the `ConnectionsChanged` poke) provides the
-    /// happens-before for the facts themselves.
+    /// The current freshness epoch.
     pub(crate) fn revision(&self) -> u64 {
         self.revision.load(Ordering::Relaxed)
     }
@@ -96,33 +68,21 @@ impl ConnectionTable {
 /// The shared handle to one [`ConnectionTable`].
 pub(crate) type ConnectionStore = Arc<ConnectionTable>;
 
-/// What a connected spawn's newborn is to its origin session (the spawn presets / `spawn
-/// connected=`). Direction only; the minted connection is always [`ConnectionKind::Both`]:
-///
-/// * `Controlled`: the origin holds `both` over the newborn (origin drives).
-/// * `Controller`: the newborn holds `both` over the origin (newborn supervises; its shell also
-///   receives `ATERM_OBSERVE_SESSION_ID`, identity-only; `aterm_types::env_sanitize`).
+/// What a connected spawn's newborn is to its origin session.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ConnectedSpawnKind {
     Controlled,
     Controller,
 }
 
-/// Where a connected spawn places the newborn: a fresh window, or a tab beside the origin.
-/// `Window` demands a GUI (`ERR headless`); `Tab` is headless-legal (tabs are logical).
+/// Where a connected spawn places the newborn.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ConnectedSpawnPlace {
     Window,
     Tab,
 }
 
-/// The [`ConnectionKind`] a carried seamless-handoff op set spells, plus the ops the re-mint
-/// must drop. Never widen: `pull` needs `read-screen`; `push` needs both `write-input` and
-/// `signal` (a lone half, e.g. a wire-`grant`ed `write-input` row, must not round up to the full
-/// human seat, which would mint a `signal` row the outgoing process never held). Everything the
-/// chosen kind does not cover is returned for the drop audit: lone push halves, ops a connection
-/// cannot spell (`config-write` / `clipboard-write` / `derive-loop`), and op strings this build
-/// cannot parse.
+/// The [`ConnectionKind`] a carried seamless-handoff op set spells.
 pub(crate) fn carried_kind(ops: &[String]) -> (Option<ConnectionKind>, Vec<String>) {
     let has = |op: Op| ops.iter().any(|s| s == op.as_str());
     let pull = has(Op::ReadScreen);
@@ -159,15 +119,7 @@ pub(crate) fn connections() -> ConnectionStore {
     CONNECTIONS.get_or_init(new_connection_store).clone()
 }
 
-/// Establish the connection `src → dst` of `kind`: mint through the one mint path
-/// ([`EdgeTable::grant_connection`]), record the minted rows, and audit each (`session_edge`).
-/// Returns `false` (nothing minted or recorded) for a self-loop.
-///
-/// Declarative set semantics: the call means "the connection is `kind`", not "add edges". A
-/// same-kind re-connect is a no-op success (no token churn, no audit noise); a different kind
-/// revokes the old rows and mints the new ones under one hold of the destination's table lock,
-/// so an interleaved `decide_edge` sees the old kind or the new, never both and never neither.
-/// Wire callers and the UI sheet therefore make identical transitions.
+/// Establish the connection `src → dst` of `kind`.
 pub(crate) fn connect_in(
     conn: &ConnectionStore,
     src: &SessionId,
@@ -178,7 +130,6 @@ pub(crate) fn connect_in(
     origin: &str,
 ) -> bool {
     if src == dst {
-        // Refused before any state is touched — `grant_connection` would also
         // refuse, but a self-loop must not even churn the record store.
         return false;
     }
@@ -189,7 +140,6 @@ pub(crate) fn connect_in(
         return true;
     }
     let old = records.remove(&key);
-    // Revoke + mint under one table lock hold (the atomic transition).
     let (revoked, minted) = {
         let mut edges = dst_edges.lock().unwrap_or_else(|p| p.into_inner());
         let mut revoked = Vec::new();
@@ -200,8 +150,6 @@ pub(crate) fn connect_in(
                 }
             }
         }
-        // Non-empty: `kind.ops()` slices are non-empty and src != dst was
-        // checked above (the only refusal `grant_connection` has).
         let minted = edges.grant_connection(src, dst, kind, dst_nonce);
         (revoked, minted)
     };
@@ -211,8 +159,6 @@ pub(crate) fn connect_in(
             tokens: minted.clone(),
         },
     );
-    // Audit off both locks (the `cmd_grant` discipline: the logger sink has its
-    // own mutex and must never nest inside the table lock).
     drop(records);
     conn.bump_revision();
     for op in revoked {
@@ -224,20 +170,7 @@ pub(crate) fn connect_in(
     true
 }
 
-/// Dissolve the connection `src → dst`, filtered to `kind` (`None` = the whole connection; the
-/// `disconnect … kind=` verb). Returns `Some(revoked-count)` when the pair was known (a record,
-/// or unrecorded rows actually swept), and `None` (nothing touched) otherwise.
-///
-/// * A recorded connection is dissolved per held token, pair-precise (per-token
-///   [`EdgeTable::revoke`], so a second `src → dst'` connection from the same source is
-///   untouched), restricted to the filtered kind's ops; the record keeps its surviving ops (a
-///   `Both` record minus `kind=pull` stays a live `Push` record) or drops when none survive.
-/// * Wire-granted rows with no record (a `grant` mints no [`ConnectionRecord`]) fall back to the
-///   op-filtered source sweep ([`EdgeTable::revoke_src_ops`]): token hexes are non-enumerable,
-///   so the sweep is their only dissolution path.
-///
-/// The record guard is held across the table op (the [`connect_in`] lock order: the records
-/// mutex nests outside the one dst table mutex); audit runs off both locks.
+/// Dissolve the connection `src → dst`, filtered to `kind`.
 pub(crate) fn disconnect_kind_in(
     conn: &ConnectionStore,
     src: &SessionId,
@@ -250,7 +183,6 @@ pub(crate) fn disconnect_kind_in(
     let filter = kind.map(|k| k.ops());
     let mut records = conn.records();
     if let Some(rec) = records.remove(&key) {
-        // Pair-precise: revoke exactly the recorded tokens matching the filter.
         let (revoke_toks, keep_toks): (Vec<_>, Vec<_>) = rec
             .tokens
             .into_iter()
@@ -267,8 +199,6 @@ pub(crate) fn disconnect_kind_in(
             records.insert(key, ConnectionRecord { tokens: keep_toks });
         }
         drop(records);
-        // The record changed shape (removed or shrunk) even when zero rows
-        // were live to revoke — the menu's facts may have, too.
         conn.bump_revision();
         let n = revoked.len();
         for op in revoked {
@@ -276,9 +206,6 @@ pub(crate) fn disconnect_kind_in(
         }
         return Some(n);
     }
-    // No record: the op-filtered sweep fallback. One sweep (and one audit
-    // event) per filtered op so the audit names what was actually removed;
-    // the unfiltered form is one `op=*` event (the `revoke src=` convention).
     let removed: Vec<(&'static str, usize)> = match filter {
         None => {
             let n = {
@@ -308,10 +235,7 @@ pub(crate) fn disconnect_kind_in(
     Some(total)
 }
 
-/// Every live edge row across every registered session's table: the `flows` aggregation
-/// (Owner-gated at the dispatch; this is a pure collector). Takes the already-released registry
-/// snapshot, then locks each table briefly (no store lock held across a table lock). A row lives
-/// only in its destination's table, so there are no duplicates; sorted by `(src, dst, op)`.
+/// Every live edge row across every registered session's table.
 pub(crate) fn all_edges(sessions: &Store) -> Vec<aterm_session::Edge> {
     let handles = sessions
         .read()
@@ -335,26 +259,14 @@ pub(crate) fn all_edges(sessions: &Store) -> Vec<aterm_session::Edge> {
     out
 }
 
-/// One session's connection roles, for the mark: `outbound` ▲ = it holds authority into some
-/// other session, `inbound` ▽ = some other session holds authority over it, both = ⧗.
+/// One session's connection roles, for the mark.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub(crate) struct SessionRoles {
     pub inbound: bool,
     pub outbound: bool,
 }
 
-/// The role predicate over the live edge tables, and only the tables (never lineage or the
-/// record store: the tables are the authority record, so a wire `grant` with no
-/// `ConnectionRecord` still marks). Per non-self-loop row `(src, dst, op)`: `dst` is inbound and
-/// `src` outbound (a row lives in its destination's table, so a non-self-loop src's appearance
-/// is "src in another session's table"). Self-loop rows spell no role. No liveness qualifier: a
-/// row whose src is closed but unswept still marks (the mark reports recorded authority, not
-/// traffic), which keeps recompute to one pass over the rows.
-///
-/// Every table owner gets an entry (so callers can render "no mark" without a missing-key
-/// case); row endpoints outside the owner set are added as found.
-// The shipping recompute reads the same fold through [`roles_by_local`]; this
-// entry exists so tests can drive it on synthetic tables.
+/// The role predicate over the live edge tables, and only the tables.
 #[cfg(test)]
 pub(crate) fn roles<'a>(
     tables: impl IntoIterator<Item = (&'a SessionId, &'a EdgeTable)>,
@@ -380,8 +292,6 @@ fn fold_roles(out: &mut HashMap<SessionId, SessionRoles>, rows: Vec<aterm_sessio
 }
 
 /// The role fold over a registry snapshot: every owner an entry, every table's rows folded.
-/// Takes the already-released snapshot, so no store lock is held while the per-session table
-/// locks are taken briefly (the registry's clone-then-release discipline).
 fn fold_registry(
     handles: &[crate::session_store::SessionHandle],
 ) -> HashMap<SessionId, SessionRoles> {
@@ -397,10 +307,7 @@ fn fold_registry(
     out
 }
 
-/// The role fold over every registered session's table, keyed by the registry's local id (the
-/// id the tab model addresses sessions by), from one snapshot: the refresh-funnel entry point.
-/// Foreign sids (a wire-granted src no local session owns) mark no tab and drop out of the
-/// re-key; the tables they appear in still spell their owners' inbound role.
+/// The role fold over every registered session's table.
 pub(crate) fn roles_by_local(sessions: &Store) -> HashMap<u64, SessionRoles> {
     let handles = sessions
         .read()
@@ -413,18 +320,7 @@ pub(crate) fn roles_by_local(sessions: &Store) -> HashMap<u64, SessionRoles> {
         .collect()
 }
 
-/// The close-time sweep, a security obligation rather than bookkeeping: each edge row's nonce is
-/// the destination's, so a source's death does not fail closed by nonce, and token hexes are
-/// non-enumerable, so this sweep is the only dissolution path for the dead source's authority.
-/// Drops every [`ConnectionRecord`] touching the closed session (either endpoint; rows toward it
-/// died with its own table), then `revoke_src(closing)` across every surviving session's table,
-/// auditing one `revoke_src` event per table actually swept (origin `close`).
-///
-/// Called from `App::retire_session_registration` (every mid-run close path funnels there); app
-/// exit needs no sweep. Call after `deregister_local`, with no store lock held: this re-reads the
-/// registry for the survivors' tables (snapshot, then lock each table with the store guard
-/// dropped). Idempotent: a second sweep finds nothing and emits nothing (though it still bumps
-/// the freshness epoch).
+/// The close-time sweep, a security obligation rather than bookkeeping.
 pub(crate) fn sweep_session_closed_in(
     conn: &ConnectionStore,
     closing: &SessionId,
@@ -432,9 +328,6 @@ pub(crate) fn sweep_session_closed_in(
 ) {
     conn.records()
         .retain(|(src, dst), _| src != closing && dst != closing);
-    // Bump unconditionally: the closing session's own table, and every row toward it, died
-    // with its deregistration with no `revoke` call to observe, and the peers' menus listing
-    // those rows must still recompose.
     conn.bump_revision();
     let survivors: Vec<(SessionId, Arc<crate::SessionCtx>)> = sessions
         .read()
@@ -445,7 +338,6 @@ pub(crate) fn sweep_session_closed_in(
         .collect();
     for (sid, ctx) in survivors {
         if sid == *closing {
-            // A caller that swept before deregistering (or a duplicate-close
             // race) must not "sweep" the dying session's own table.
             continue;
         }
@@ -454,15 +346,10 @@ pub(crate) fn sweep_session_closed_in(
             edges.revoke_src(closing)
         };
         if removed > 0 {
-            // Audit off the table lock; `op=*`, since the sweep removes every op
             // the source held (the `revoke src=` wire-form convention).
             session_edge_audit::emit(EdgeAction::RevokeSrc, "close", closing, &sid, "*");
         }
     }
-    // The read grants closed sessions keep in the closed-session index are
-    // tables too: revoke the closing source even in its own retained table.
-    // A live source's rows remain. Taken out
-    // under the store's read lock, each locked after it, one at a time.
     let closed: Vec<(SessionId, Arc<Mutex<EdgeTable>>)> = sessions
         .read()
         .unwrap_or_else(|p| p.into_inner())
@@ -546,12 +433,10 @@ mod tests {
     }
 
     /// Fail-soft grouping: a carried op set re-mints the largest kind it fully proves and drops
-    /// the rest, never widening. Every transition the vocabulary allows, plus the halves and
-    /// strangers it must refuse.
+    /// the rest, never widening.
     #[test]
     fn carried_kind_never_widens_and_drops_the_rest() {
         let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        // The three whole kinds map back exactly, nothing dropped.
         assert_eq!(
             carried_kind(&s(&["read-screen"])),
             (Some(ConnectionKind::Pull), vec![])
@@ -564,7 +449,6 @@ mod tests {
             carried_kind(&s(&["read-screen", "signal", "write-input"])),
             (Some(ConnectionKind::Both), vec![])
         );
-        // A lone push half is never rounded up to the full human seat.
         assert_eq!(
             carried_kind(&s(&["write-input"])),
             (None, s(&["write-input"]))
@@ -573,7 +457,6 @@ mod tests {
             carried_kind(&s(&["read-screen", "signal"])),
             (Some(ConnectionKind::Pull), s(&["signal"]))
         );
-        // Ops a connection cannot spell and unknown strings drop.
         assert_eq!(
             carried_kind(&s(&["config-write", "read-screen", "not-an-op"])),
             (
@@ -607,13 +490,11 @@ mod tests {
             assert_eq!(rec.kind(), Some(ConnectionKind::Push));
             rec.tokens.clone()
         };
-        // Push minted exactly the human seat: input + signal, both live.
         assert_eq!(minted.len(), 2);
         for (op, tok) in &minted {
             assert!(decide_edge(&dst_edges.lock().unwrap(), tok, &b, *op, &nonce).is_permitted());
         }
 
-        // Disconnect revokes exactly those rows and drops the record.
         assert!(disconnect_kind_in(&conn, &a, &b, &dst_edges, None, "test").is_some());
         assert!(conn.records().is_empty(), "record gone");
         assert!(dst_edges.lock().unwrap().is_empty(), "rows gone");
@@ -623,7 +504,6 @@ mod tests {
                 EdgeDecision::Deny
             );
         }
-        // A second disconnect of the now-unknown pair fails closed.
         assert!(disconnect_kind_in(&conn, &a, &b, &dst_edges, None, "test").is_none());
     }
 
@@ -666,8 +546,6 @@ mod tests {
         ));
         let (pull_op, pull_tok) = conn.records()[&(a.clone(), b.clone())].tokens[0];
 
-        // Same kind again: success with no token churn (set semantics: the
-        // state already holds, so the original token stays live).
         assert!(connect_in(
             &conn,
             &a,
@@ -683,8 +561,6 @@ mod tests {
             "idempotent re-connect must not rotate the token"
         );
 
-        // A different kind is one atomic transition: the old rows are gone, the
-        // new kind's rows (and only those) are live, one record remains.
         assert!(connect_in(
             &conn,
             &a,
@@ -724,7 +600,6 @@ mod tests {
             "test"
         ));
 
-        // kind=pull revokes only the read row; the record survives as Push.
         assert_eq!(
             disconnect_kind_in(
                 &conn,
@@ -752,7 +627,6 @@ mod tests {
             "the record keeps its surviving ops"
         );
 
-        // Filtering the already-gone half is a known-pair no-op (Some(0)).
         assert_eq!(
             disconnect_kind_in(
                 &conn,
@@ -765,14 +639,12 @@ mod tests {
             Some(0)
         );
 
-        // The unfiltered form dissolves the remainder and drops the record.
         assert_eq!(
             disconnect_kind_in(&conn, &a, &b, &dst_edges, None, "test"),
             Some(2)
         );
         assert!(conn.records().is_empty());
         assert!(dst_edges.lock().unwrap().is_empty());
-        // An unknown pair now fails closed.
         assert_eq!(
             disconnect_kind_in(&conn, &a, &b, &dst_edges, None, "test"),
             None
@@ -784,7 +656,6 @@ mod tests {
         let conn = new_connection_store();
         let (a, b, nonce) = ids();
         let dst_edges = Mutex::new(EdgeTable::new());
-        // Wire `grant` rows: minted straight into the table, no record.
         {
             let mut edges = dst_edges.lock().unwrap();
             let _ = edges.grant(a.clone(), b.clone(), Op::ReadScreen, nonce);
@@ -792,7 +663,6 @@ mod tests {
             let _ = edges.grant(a.clone(), b.clone(), Op::Signal, nonce);
         }
 
-        // The push half sweeps by (src, op); pull survives.
         assert_eq!(
             disconnect_kind_in(
                 &conn,
@@ -813,7 +683,6 @@ mod tests {
             .collect();
         assert_eq!(ops, vec![Op::ReadScreen], "only pull remains: {ops:?}");
 
-        // Unfiltered sweeps the rest; a second call fails closed (None).
         assert_eq!(
             disconnect_kind_in(&conn, &a, &b, &dst_edges, None, "test"),
             Some(1)
@@ -828,14 +697,12 @@ mod tests {
     fn roles_computes_the_mark_predicate_per_scenario() {
         let (a, b, nonce) = ids();
 
-        // No connections: every owner present, no roles.
         let (ta, tb) = (EdgeTable::new(), EdgeTable::new());
         let r = roles([(&a, &ta), (&b, &tb)]);
         assert_eq!(r.len(), 2);
         assert_eq!(r[&a], SessionRoles::default());
         assert_eq!(r[&b], SessionRoles::default());
 
-        // One-way A → B (rows live in B's — the destination's — table).
         let ta = EdgeTable::new();
         let mut tb = EdgeTable::new();
         let _ = tb.grant_connection(&a, &b, ConnectionKind::Pull, &nonce);
@@ -855,7 +722,6 @@ mod tests {
             }
         );
 
-        // Peer pair A ⇆ B: two independent rows, both sessions both roles.
         let mut ta = EdgeTable::new();
         let mut tb = EdgeTable::new();
         let _ = tb.grant_connection(&a, &b, ConnectionKind::Push, &nonce);
@@ -871,15 +737,11 @@ mod tests {
             );
         }
 
-        // Self-loop-only: the row (A, A, op) spells no role.
         let mut ta = EdgeTable::new();
         let _ = ta.grant(a.clone(), a.clone(), Op::WriteInput, nonce);
         let r = roles([(&a, &ta)]);
         assert_eq!(r[&a], SessionRoles::default());
 
-        // Foreign src (a wire-granted src that is no registered table owner):
-        // the owner marks inbound only, and the foreign src still reports
-        // outbound (no liveness qualifier).
         let x = SessionId::new("s-foreign");
         let mut tb = EdgeTable::new();
         let _ = tb.grant(x.clone(), b.clone(), Op::WriteInput, nonce);
@@ -913,8 +775,6 @@ mod tests {
             s.register(hb);
         }
 
-        // A pushes into B (rows in B's table) and B pulls A (rows in A's
-        // table), so closing A exercises both record directions at once.
         assert!(connect_in(
             &conn,
             &a,
@@ -935,14 +795,10 @@ mod tests {
         ));
         let push_tokens = conn.records()[&(a.clone(), b.clone())].tokens.clone();
 
-        // Close A: deregister first, then sweep (the `retire_session_registration`
-        // order: the sweep re-reads the registry and must see only the survivors).
         assert_eq!(store.write().unwrap().deregister_local(1), Some(a.clone()));
         sweep_session_closed_in(&conn, &a, &store);
 
-        // Every record touching A is gone, A as src and A as dst.
         assert!(conn.records().is_empty());
-        // The surviving table holds none of A's rows; the minted tokens deny.
         assert!(bctx.edges.lock().unwrap().is_empty());
         for (op, tok) in &push_tokens {
             assert_eq!(
@@ -950,11 +806,9 @@ mod tests {
                 EdgeDecision::Deny
             );
         }
-        // The survivor's mark clears with the sweep; the closed sid is gone.
         let r = roles_by_local(&store);
         assert_eq!(r[&2], SessionRoles::default());
         assert!(!r.contains_key(&1));
-        // Idempotent: a duplicate-close sweep finds nothing to do.
         sweep_session_closed_in(&conn, &a, &store);
         assert!(conn.records().is_empty());
     }

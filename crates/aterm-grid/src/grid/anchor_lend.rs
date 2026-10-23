@@ -2,46 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The anchors' lend through a width change: taken out of the grid before
-//! the resize (or the offloaded re-attach) and put back after it, each at
-//! the row its text landed on.
-//!
-//! A rewrap renumbers every row but keeps the sequence of logical lines (a
-//! head row and the rows that continue it, `is_mergeable_continuation`). So
-//! an anchor is written down relative to the one point the rewrap carries
-//! exactly, the grid's own cursor: how many lines above the cursor's line it
-//! sits, and whether it sits on a line's head or inside the line. On the way
-//! back the same count is walked up from where the cursor landed.
-//!
-//! The walk is checked, not trusted. Each line's glyphs are hashed on the
-//! way out and again on the way back, as one rolling digest from the
-//! cursor's line up, and the drawn lines below the cursor's line (anything
-//! an erased cell does not show: a glyph, a background, a reversed or
-//! underlined blank, an image, a double-size row) must come back as a
-//! prefix of what they were. A mismatch (a row the resize rotated across the
-//! cursor, a fragment severed from its head, glyphs a DECDWL row truncated)
-//! marks every anchor lost, so the fence taints: the lend never places an
-//! anchor on text it cannot show is the same, nor on a line it cannot read
-//! from its head.
-//!
-//! A bottom-push's owed rows are refused outright. They sit in history as
-//! its newest lines and come back under the screen at a resize: a rotation
-//! across the cursor's line that the line count does not describe, and one
-//! the glyph trail cannot see when the rotated row holds no glyph (another
-//! writer's background, landing on the cursor's own line). A lend with rows
-//! owed places nothing.
-//!
-//! What it cannot reach it clamps (the design's "clamp before detach"): a
-//! line beyond the walk's reach (an offloaded detach hands older history to
-//! a job; the tiered store is never read) clamps a Start down to the oldest
-//! line the walk verified, and a span wholly beyond is left empty.
-//!
-//! Inside a line the rewrap moves the row boundary, so a point there
-//! excludes the line it shares: a Start goes to the next line's head, an End
-//! to its own line's head. Below the cursor's line an End goes to the row
-//! after that line, and a Start too when nothing was drawn between that line
-//! and it (else one past the screen). The cost is O(lines between the cursor
-//! and the oldest anchor), within the reach, once per width change.
+//! The anchors' lend through a width change.
 
 use aterm_hash::FxHasher;
 use std::hash::Hasher;
@@ -57,29 +18,24 @@ use crate::{AnchorRole, AnchorSet, FenceKnob, Row, knob};
 pub enum LendReach {
     /// Everything the ring holds (a synchronous width change rewraps it all).
     Ring,
-    /// At most this many rows above the screen's top (an offloaded width
-    /// change: only the held-back history is rewrapped synchronously).
+    /// At most this many rows above the screen's top.
     Rows(u64),
 }
 
 /// Where a lent anchor sits, relative to the cursor's logical line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Lent {
-    /// On the head row of the line `k` lines above the cursor's (0 is the
     /// cursor's own line).
     Head(usize),
     /// On a continuation row of that line.
     Mid(usize),
-    /// Below the cursor's line; `true` when nothing was drawn (nothing an
-    /// erased cell does not show) on any row between that line and the
     /// anchor.
     Below(bool),
     /// Not placeable (the cursor's own line could not be read).
     Unknown,
 }
 
-/// Anchors lent out of a grid for a width change ([`Grid::lend_anchors`]);
-/// give them back with [`Grid::take_back_anchors`].
+/// Anchors lent out of a grid for a width change; give them back with [`Grid::take_back_anchors`].
 #[derive(Debug)]
 #[must_use = "lent anchors must be taken back, or the fence loses every span"]
 pub struct AnchorLend {
@@ -99,8 +55,6 @@ struct LogicalLine {
     digest: u64,
 }
 
-/// Add resolved glyphs, independent of the live/ring representation a
-/// rewrap uses. Spaces, colours and widths are excluded from the glyph digest.
 /// Unknown complex text refuses the lend rather than becoming a shared token.
 fn hash_glyphs(h: &mut FxHasher, grid: &Grid, absolute: u64, row: &Row) -> Option<()> {
     let base = grid.visible_to_absolute(0);
@@ -165,9 +119,7 @@ fn hash_glyphs(h: &mut FxHasher, grid: &Grid, absolute: u64, row: &Row) -> Optio
 }
 
 impl Grid {
-    /// The reach of an offloaded width change to `new_rows` × `new_cols`:
-    /// the screen's held-back history, as the detach sizes it
-    /// (`HOLD_BACK_SCREENS` screens of cells at the larger of each size).
+    /// The reach of an offloaded width change to `new_rows` × `new_cols`.
     #[must_use]
     pub fn anchor_reach_for_offload(&self, new_rows: u16, new_cols: u16) -> LendReach {
         let cells = usize::from(self.storage.visible_rows.max(new_rows))
@@ -177,8 +129,6 @@ impl Grid {
     }
 
     /// Whether a lend can read the cursor's logical line down from its head.
-    /// When it cannot (the head is past the ring), a width change's lend
-    /// places nothing and marks the set lost. A seam for the fence's tests.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn lend_reads_cursor_line(&self) -> bool {
@@ -201,8 +151,6 @@ impl Grid {
         Some((line.head, line.last))
     }
 
-    /// The logical line whose last row is `last`, read no lower than
-    /// `floor`. `None` when its head cannot be read (outside the ring, or
     /// below the floor): an incomplete line is never vouched for.
     fn line_ending_at(&self, last: u64, floor: u64) -> Option<LogicalLine> {
         let mut head = last;
@@ -227,8 +175,6 @@ impl Grid {
         })
     }
 
-    /// The logical lines from the one ending at `last` upward, newest first,
-    /// read no lower than `floor`, ending at the first line that cannot be
     /// read whole.
     fn lines_up(&self, last: u64, floor: u64) -> impl Iterator<Item = LogicalLine> + '_ {
         let mut next = Some(last);
@@ -239,10 +185,6 @@ impl Grid {
         })
     }
 
-    /// The glyph digests of drawn logical lines below the line ending at
-    /// `last`. A line drawn with no glyph (a background, a reversed or
-    /// underlined blank, an image, a double size) counts though its glyph
-    /// digest is blank, so a rewrap cannot silently bring another writer's
     /// ink into an open span. Unreadable payloads still refuse the lend.
     fn below_digests(&self, last: u64) -> Option<Vec<u64>> {
         let end = self.visible_to_absolute(0) + u64::from(self.storage.visible_rows);
@@ -268,15 +210,12 @@ impl Grid {
         Some(out)
     }
 
-    /// Lend this grid's anchors out for a width change (see the module doc):
-    /// the set leaves the grid, so the hooks the resize runs touch nothing.
-    /// `None`, at no cost, when no anchor lives.
+    /// Lend this grid's anchors out for a width change (see the module doc).
     pub fn lend_anchors(&mut self, reach: LendReach) -> Option<AnchorLend> {
         if self.anchors().is_empty() {
             return None;
         }
         let set = self.storage.presentation.anchors.take_for_lend();
-        // Rows a bottom-push owes come back by rotation (see the module doc).
         let owed = self.pushed_rows() > 0;
         let floor = match reach {
             LendReach::Ring => 0,
@@ -313,12 +252,6 @@ impl Grid {
             else {
                 return Lent::Unknown;
             };
-            // A point past the screen is a real one up to the rows a shrink
-            // trimmed off the bottom (a rows-only resize leaves anchors where
-            // they were); no row is drawn there, so only the screen's rows
-            // make its gap (a bottom-push's owed rows refused the lend
-            // above). A point further out than any screen reaches names no
-            // row.
             if row > past_screen.saturating_add(u64::from(crate::MAX_GRID_ROWS)) {
                 return Lent::Unknown;
             }
@@ -333,7 +266,6 @@ impl Grid {
                 return Lent::Below(gap_blank);
             }
             if row < oldest.head {
-                // Beyond the reach: clamped to the oldest line read.
                 return Lent::Head(lines.len() - 1);
             }
             let k = lines
@@ -363,7 +295,6 @@ impl Grid {
     }
 
     /// Put lent anchors back where their text landed (see the module doc).
-    /// A walk that does not verify marks them lost.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -400,9 +331,6 @@ impl Grid {
                 }
                 lines.push(line);
             }
-            // The drawn lines below the cursor's line come back as a
-            // prefix of what they were: a rewrap may push the last off the
-            // bottom, never bring one in.
             match (below, self.below_digests(last0)) {
                 (Some(below), Some(now)) if below.starts_with(&now) => {}
                 _ => verified = false,
@@ -428,9 +356,6 @@ impl Grid {
                 (Lent::Head(k), _) | (Lent::Mid(k), AnchorRole::End) => head(k),
                 (Lent::Mid(0), AnchorRole::Start) => after_cursor_line,
                 (Lent::Mid(k), AnchorRole::Start) => head(k - 1),
-                // Below the cursor's line only blank lines and the order of
-                // the drawn ones are verified: a Start keeps the rows
-                // after the line only if none between was drawn on.
                 (Lent::Below(true), AnchorRole::Start) => after_cursor_line,
                 (Lent::Below(false), AnchorRole::Start) => past_screen,
                 (Lent::Below(_), AnchorRole::End) => after_cursor_line,
@@ -447,7 +372,6 @@ mod tests {
     use super::LendReach;
     use crate::{AnchorRole, Grid};
 
-    /// A grid holding `lines` (each its own logical line, `\n`-separated as a
     /// shell prints them), the cursor left on the row after the last.
     fn grid_printing(rows: u16, cols: u16, lines: &[&str]) -> Grid {
         let mut g = Grid::with_scrollback(rows, cols, 1000);
@@ -474,7 +398,6 @@ mod tests {
     #[test]
     fn a_widening_rewrap_lands_each_head_anchor_on_its_line() {
         let mut g = grid_printing(6, 8, &["one", "abcdefghij", "card", "tail"]);
-        // "abcdefghij" wraps at 8 columns: rows "abcdefgh" + "ij".
         let base = g.visible_to_absolute(0);
         let card = (0..6)
             .map(|r| base + r)
@@ -494,7 +417,6 @@ mod tests {
         assert_eq!(row_text(&g, s), "card");
         assert_eq!(g.anchors().row(end), Some(s + 1));
 
-        // A fast-path ring glyph must still match after reflow migrates it.
         let mut g = grid_printing(6, 8, &["one", "abcdefghij", "card", "tail"]);
         let cursor = g.cursor();
         g.set_cursor(0, 0);
@@ -539,9 +461,6 @@ mod tests {
             }
         }
 
-        // A rows-only shrink trims blank rows off the bottom and leaves an
-        // open span's Start where it was, past the new screen: still a
-        // point below the cursor's line, with nothing drawn between.
         let mut g = Grid::with_scrollback(8, 10, 100);
         let start = g.anchors_mut().place(8, AnchorRole::Start).unwrap();
         g.resize(4, 10);
@@ -572,7 +491,6 @@ mod tests {
             "protected ink is not a blank gap"
         );
 
-        // A paired ring-history payload is read without materializing tiers.
         let mut g = Grid::with_scrollback(4, 8, 1000);
         g.write_emoji_autowrap_fast(
             '😀',
@@ -603,8 +521,6 @@ mod tests {
 
     #[test]
     fn a_reflow_landing_inside_a_row_excludes_the_shared_row_for_start_and_end() {
-        // "abcdefghij" wraps into two rows at width 8; anchors on its
-        // continuation row "ij" sit inside the line.
         let mut g = grid_printing(6, 8, &["one", "abcdefghij", "two"]);
         let base = g.visible_to_absolute(0);
         let ij = (0..6)
@@ -636,7 +552,6 @@ mod tests {
         let mut g = grid_printing(4, 10, &["h0", "h1", "h2", "h3", "h4", "h5", "s0", "s1"]);
         let oldest = g.oldest_absolute_row();
         let start = g.anchors_mut().place(oldest, AnchorRole::Start).unwrap();
-        // Two rows of reach above the screen.
         let lend = g.lend_anchors(LendReach::Rows(2)).unwrap();
         g.resize(4, 12);
         g.take_back_anchors(lend);
@@ -656,7 +571,6 @@ mod tests {
         let base = g.visible_to_absolute(0);
         g.anchors_mut().place(base, AnchorRole::Start).unwrap();
         let lend = g.lend_anchors(LendReach::Ring).unwrap();
-        // Not a rewrap: rewrite a line the walk verifies.
         g.set_cursor(0, 0);
         g.write_char('X');
         g.set_cursor(2, 0);

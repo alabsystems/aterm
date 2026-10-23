@@ -1,18 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Windows backend of [`crate::platform`] (its module docs list the analogues):
-//! junctions for activation, `.cmd` shims, per-user profile-ACL privacy,
-//! `GetDiskFreeSpaceExW` for free space, and `spawn().wait()` + `exit` for exec, with Ctrl-C
-//! left to the child ([`add_ctrl_handler`]).
-//!
-//! This backend has not been exercised on a real Windows host. `mod windows` is
-//! `#[cfg(windows)]`, so every line below is type-checked on all three Windows cells
-//! `crates/aterm-libc` admits, and the pure `.cmd` formatting/parsing is unit-tested on Unix in
-//! [`crate::platform`] — but no shim, junction or `GetDiskFreeSpaceExW` call here has ever run.
-//!
-//! A Windows triple absent from `aterm-libc`'s cell list stops the build rather than falling
-//! back to an empty cell.
+//! The Windows backend of [`crate::platform`] (its module docs list the analogues): junctions for activation, `.cmd` shims, per-user profile-ACL privacy, `GetDiskFreeSpaceExW` for free space, and `spawn().wait()` + `exit` for exec, with Ctrl-C left to the child ([`add_ctrl_handler`]).
 
 use std::ffi::OsStr;
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -20,25 +9,18 @@ use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-/// Whether the calling user can write into `dir`: best-effort `true`, since writability
-/// rests on the per-user ACL, which this layer does not evaluate.
+/// Whether the calling user can write into `dir`: best-effort `true`, since writability rests on the per-user ACL, which this layer does not evaluate.
 #[must_use]
 pub fn dir_writable_by_caller(_dir: &Path) -> bool {
     true
 }
 
-/// Appended to a tool name to form its executable name, only by
-/// [`crate::store::ToolName::exe_file`]: the shim and the executable are different files
-/// here (`bin/ay.cmd` vs `bin\ay.exe`).
+/// Appended to a tool name to form its executable name, only by [`crate::store::ToolName::exe_file`]: the shim and the executable are different files here (`bin/ay.cmd` vs `bin\ay.exe`).
 pub const EXE_SUFFIX: &str = ".exe";
-/// Appended to a tool name to form its `bin/` shim name (a batch wrapper), only by
-/// [`crate::store::ToolName::shim_file`]; stripped only by
-/// [`crate::store::ToolName::from_shim_file`].
+/// Appended to a tool name to form its `bin/` shim name (a batch wrapper), only by [`crate::store::ToolName::shim_file`]; stripped only by [`crate::store::ToolName::from_shim_file`].
 pub const SHIM_SUFFIX: &str = ".cmd";
 
-/// The default install prefix: `%LOCALAPPDATA%\aterm\pkg` (per-user, ACL-private by
-/// default), falling back to `%USERPROFILE%\AppData\Local\aterm\pkg` via `home` when
-/// `%LOCALAPPDATA%` is unset.
+/// The default install prefix: `%LOCALAPPDATA%\aterm\pkg` (per-user, ACL-private by default), falling back to `%USERPROFILE%\AppData\Local\aterm\pkg` via `home` when `%LOCALAPPDATA%` is unset.
 #[must_use]
 pub fn default_prefix(home: &Path) -> PathBuf {
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
@@ -48,10 +30,6 @@ pub fn default_prefix(home: &Path) -> PathBuf {
     }
 }
 
-// The account-home reader's calls, declared dependency-free like every Win32 call in this
-// file: `OpenProcessToken` is advapi32's and `GetUserProfileDirectoryW` userenv's, so each
-// names its import library; `GetCurrentProcess` is kernel32's (std links it), and the
-// token is closed with the `CloseHandle` declared below.
 unsafe extern "system" {
     fn GetCurrentProcess() -> *mut core::ffi::c_void;
 }
@@ -72,17 +50,7 @@ unsafe extern "system" {
     ) -> i32;
 }
 
-/// This ACCOUNT's home directory, as the OS knows it — the profile directory of this
-/// process's token (`GetUserProfileDirectoryW`, which reads the account's
-/// `ProfileList\<SID>\ProfileImagePath`) — which is NOT `%USERPROFILE%`, exactly as the
-/// Unix twin's `getpwuid` home is not `$HOME`: a process given a scratch `USERPROFILE`
-/// (a lab instance, a test) still answers the real profile, so the callers that ask
-/// "is this the account's own home?" (the disk watch's owner rule, the headless package
-/// lane's scratch-home gate) can tell the two apart.
-///
-/// `None` when the token or its profile cannot be read; the caller treats that as
-/// "cannot prove this is the real home". The `[machine]` settings are macOS-only and
-/// answer not-applicable before this is asked.
+/// This ACCOUNT's home directory, as the OS knows it — the profile directory of this process's token (`GetUserProfileDirectoryW`, which reads the account's `ProfileList\<SID>\ProfileImagePath`) — which is NOT `%USERPROFILE%`, exactly as the Unix twin's `getpwuid` home is not `$HOME`: a process given a scratch `USERPROFILE` (a lab instance, a test) still answers the real profile, so the callers that ask "is this the account's own home?" (the disk watch's owner rule, the headless package lane's scratch-home gate) can tell the two apart.
 #[must_use]
 pub fn account_home() -> Option<PathBuf> {
     use std::os::windows::ffi::OsStringExt as _;
@@ -90,24 +58,18 @@ pub fn account_home() -> Option<PathBuf> {
     /// A profile path longer than the wide APIs' own bound is not a profile.
     const MAX_UNITS: u32 = 32_768;
     let mut token: *mut core::ffi::c_void = std::ptr::null_mut();
-    // SAFETY: `GetCurrentProcess` takes nothing and returns this process's pseudo-handle,
-    // which needs no closing; `&mut token` is a valid out-param the call fills with a
-    // token handle on success.
+    // SAFETY: `GetCurrentProcess` takes nothing and returns this process's pseudo-handle, which needs no closing; `&mut token` is a valid out-param the call fills with a token handle on success.
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0
         || token.is_null()
     {
         return None;
     }
-    // Asked once with no buffer for the length (in UTF-16 units, the NUL included), then
-    // once more into a buffer of that length.
     let mut units: u32 = 0;
-    // SAFETY: `token` is the live token opened above; a NULL buffer with a zero size is
-    // the documented way to ask for the size, which is written into `units`.
+    // SAFETY: `token` is the live token opened above; a NULL buffer with a zero size is the documented way to ask for the size, which is written into `units`.
     unsafe { GetUserProfileDirectoryW(token, std::ptr::null_mut(), &mut units) };
     let read = (1..=MAX_UNITS).contains(&units).then(|| {
         let mut buf = vec![0u16; units as usize];
-        // SAFETY: `buf` holds `units` writable UTF-16 units and outlives the call, which
-        // writes at most that many (the NUL included) and updates `units`.
+        // SAFETY: `buf` holds `units` writable UTF-16 units and outlives the call, which writes at most that many (the NUL included) and updates `units`.
         let ok = unsafe { GetUserProfileDirectoryW(token, buf.as_mut_ptr(), &mut units) };
         (ok != 0).then_some(buf)
     });
@@ -119,8 +81,7 @@ pub fn account_home() -> Option<PathBuf> {
     home.is_absolute().then_some(home)
 }
 
-/// No effective uid on Windows (privacy is the profile ACL): the `0` sentinel, used only in
-/// a diagnostic that [`dir_meta_is_private`] (always `true`) never reaches.
+/// No effective uid on Windows (privacy is the profile ACL): the `0` sentinel, used only in a diagnostic that [`dir_meta_is_private`] (always `true`) never reaches.
 #[must_use]
 pub fn our_uid() -> u32 {
     0
@@ -129,9 +90,6 @@ pub fn our_uid() -> u32 {
 /// No process groups on Windows: the caller's `Child::kill` is the whole of it.
 pub fn kill_process_group(_leader: u32) {}
 
-// The start-time reader's calls, declared dependency-free like the file queries below (std
-// links `kernel32`); the handle is closed with their `CloseHandle`. A `FILETIME` is two
-// `u32`s, low half first, as in [`ByHandleFileInformation`].
 unsafe extern "system" {
     fn OpenProcess(
         dw_desired_access: u32,
@@ -148,17 +106,7 @@ unsafe extern "system" {
     ) -> i32;
 }
 
-/// The kernel's start-time stamp for `pid` ([`crate::platform::Birth`]), used with the pid
-/// to detect reuse, as the Unix twin's is: `GetProcessTimes`'s creation time, in
-/// 100-nanosecond ticks since 1601, read through a `PROCESS_QUERY_LIMITED_INFORMATION`
-/// handle (the least access that reads it, which Windows grants on most other accounts'
-/// processes too). [`Birth::Gone`](crate::platform::Birth::Gone) for pid 0, for a pid
-/// `OpenProcess` names nothing under (`ERROR_INVALID_PARAMETER`), and for a process that
-/// has exited but whose object a handle still keeps — the zombie's analogue
-/// (`GetExitCodeProcess` no longer `STILL_ACTIVE`; one that exited with code 259 reads as
-/// running, and is still the process born then);
-/// [`Birth::Unreadable`](crate::platform::Birth::Unreadable) when the kernel would not say
-/// (`ERROR_ACCESS_DENIED`: a protected or system process) or a query failed.
+/// The kernel's start-time stamp for `pid` ([`crate::platform::Birth`]), used with the pid to detect reuse, as the Unix twin's is: `GetProcessTimes`'s creation time, in 100-nanosecond ticks since 1601, read through a `PROCESS_QUERY_LIMITED_INFORMATION` handle (the least access that reads it, which Windows grants on most other accounts' processes too).
 #[must_use]
 pub fn process_birth(pid: u32) -> crate::platform::Birth {
     use crate::platform::Birth;
@@ -168,11 +116,9 @@ pub fn process_birth(pid: u32) -> crate::platform::Birth {
     if pid == 0 {
         return Birth::Gone;
     }
-    // SAFETY: three integers in; a process handle, or NULL with the reason in the thread's
-    // last error, out.
+    // SAFETY: three integers in; a process handle, or NULL with the reason in the thread's last error, out.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {
-        // Read at once, before anything else can move the last error.
         return if io::Error::last_os_error().raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
             Birth::Gone
         } else {
@@ -182,8 +128,7 @@ pub fn process_birth(pid: u32) -> crate::platform::Birth {
     let mut code: u32 = 0;
     let (mut created, mut exited, mut kernel, mut user) =
         ([0u32; 2], [0u32; 2], [0u32; 2], [0u32; 2]);
-    // SAFETY: `handle` is the live handle opened above, with the access both queries need;
-    // every out-param is a valid, writable value of the type the API fills.
+    // SAFETY: `handle` is the live handle opened above, with the access both queries need; every out-param is a valid, writable value of the type the API fills.
     let (coded, timed) = unsafe {
         (
             GetExitCodeProcess(handle, &mut code) != 0,
@@ -199,8 +144,7 @@ pub fn process_birth(pid: u32) -> crate::platform::Birth {
     }
 }
 
-/// Best-effort private-dir predicate: `true`. POSIX owner/mode bits do not apply;
-/// confidentiality rests on the per-user `%LOCALAPPDATA%` profile ACL.
+/// Best-effort private-dir predicate: `true`.
 #[must_use]
 pub fn dir_meta_is_private(_meta: &Metadata) -> bool {
     true
@@ -221,8 +165,7 @@ pub fn universal_control_disable() -> bool {
     false
 }
 
-/// Rosetta 2 is a macOS install: Windows has no runtime to find
-/// ([`crate::machine::ROSETTA_APPLIES`] keeps this from being asked).
+/// Rosetta 2 is a macOS install: Windows has no runtime to find ([`crate::machine::ROSETTA_APPLIES`] keeps this from being asked).
 pub fn rosetta_present(_runtime: &Path) -> Result<bool, String> {
     Ok(false)
 }
@@ -232,24 +175,18 @@ pub fn rosetta_install(_within: std::time::Duration) -> Result<(), String> {
     Err("Rosetta 2 is a macOS install".to_string())
 }
 
-/// Shared-directory creation: `create_dir_all`, since POSIX modes do not apply and the ACL
-/// governs access.
+/// Shared-directory creation: `create_dir_all`, since POSIX modes do not apply and the ACL governs access.
 pub fn ensure_shared_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
-/// System-owned predicate: always `false`. The Unix analogue proves a root-owned chain from
-/// owner/mode bits, which mean nothing here, and a best-effort `true` would defeat a
-/// fail-closed check: a configured system prefix falls back to the trusted default.
+/// System-owned predicate: always `false`.
 #[must_use]
 pub fn dir_meta_is_system(_meta: &Metadata) -> bool {
     false
 }
 
-/// Whether `meta` (from `symlink_metadata`) is a link-like indirection the fail-closed prefix
-/// chain check must not trust as a directory: any reparse point, including a junction
-/// (`mklink /J`, no admin), which `is_symlink()` reports `false` (it is
-/// `IO_REPARSE_TAG_MOUNT_POINT`). The `FILE_ATTRIBUTE_REPARSE_POINT` bit catches both.
+/// Whether `meta` (from `symlink_metadata`) is a link-like indirection the fail-closed prefix chain check must not trust as a directory: any reparse point, including a junction (`mklink /J`, no admin), which `is_symlink()` reports `false` (it is `IO_REPARSE_TAG_MOUNT_POINT`).
 #[must_use]
 pub fn is_reparse(meta: &Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
@@ -272,7 +209,7 @@ pub fn set_mode_on(_f: &File, _mode: u32) -> io::Result<()> {
     Ok(())
 }
 
-/// Open `path` for a fresh (create+truncate) write. `mode` is ignored (no POSIX bits).
+/// Open `path` for a fresh (create+truncate) write.
 pub fn open_create_write(path: &Path, _mode: u32) -> io::Result<File> {
     OpenOptions::new()
         .write(true)
@@ -281,45 +218,31 @@ pub fn open_create_write(path: &Path, _mode: u32) -> io::Result<File> {
         .open(path)
 }
 
-/// Create `path` for writing, failing [`io::ErrorKind::AlreadyExists`] when the name already
-/// resolves to anything (`CREATE_NEW`, under NTFS's case-insensitive name equality). `mode`
-/// is ignored.
+/// Create `path` for writing, failing [`io::ErrorKind::AlreadyExists`] when the name already resolves to anything (`CREATE_NEW`, under NTFS's case-insensitive name equality).
 pub fn open_create_new_write(path: &Path, _mode: u32) -> io::Result<File> {
     OpenOptions::new().write(true).create_new(true).open(path)
 }
 
-/// Open `path` with write access, as [`sync_file_contents`] needs: `FlushFileBuffers`
-/// requires `GENERIC_WRITE` and refuses a read-only handle with `ERROR_ACCESS_DENIED`.
-/// Nothing is created or truncated.
+/// Open `path` with write access, as [`sync_file_contents`] needs: `FlushFileBuffers` requires `GENERIC_WRITE` and refuses a read-only handle with `ERROR_ACCESS_DENIED`.
 pub fn open_for_sync(path: &Path) -> io::Result<File> {
     OpenOptions::new().write(true).open(path)
 }
 
-/// Push one open file's contents to the filesystem: `FlushFileBuffers` (std's `sync_data`
-/// here), the analogue of `fsync(2)`. Used by [`crate::store::sync_tree`] before the renames
-/// that publish a staged tree, and by the readiness marker's write. The handle needs write
-/// access ([`open_for_sync`]).
+/// Push one open file's contents to the filesystem: `FlushFileBuffers` (std's `sync_data` here), the analogue of `fsync(2)`.
 pub fn sync_file_contents(f: &File) -> io::Result<()> {
     aterm_durable::durable_data(f)
 }
 
-/// No permission bits: reports `0`. The tree-root hash does not fold this; see
-/// [`folded_mode`] and [`HAS_POSIX_MODES`].
+/// No permission bits: reports `0`.
 #[must_use]
 pub fn permission_mode(_meta: &Metadata) -> u32 {
     0
 }
 
-/// Whether this platform's filesystems store POSIX permission bits an `fstat` reads
-/// back. Windows stores none, so the tree-root walk folds the stage's declared-mode
-/// record ([`crate::tree::tree_root_declared`]) and the extraction-time fold records
-/// the mode it was asked to apply ([`folded_mode`]).
+/// Whether this platform's filesystems store POSIX permission bits an `fstat` reads back.
 pub const HAS_POSIX_MODES: bool = false;
 
-/// The mode the extraction-time fold records for a file just written with `requested` bits:
-/// the request, masked to `0o7777`. Nothing stored can be read back here, and the signed
-/// root was folded by a producer that applied exactly these bits, so only the request
-/// reproduces it. The digest and relpath still describe the bytes laid down.
+/// The mode the extraction-time fold records for a file just written with `requested` bits: the request, masked to `0o7777`.
 #[must_use]
 pub fn folded_mode(meta: &Metadata, requested: u32) -> u32 {
     let _ = meta;
@@ -332,8 +255,6 @@ pub fn os_str_bytes(s: &OsStr) -> &[u8] {
     s.as_encoded_bytes()
 }
 
-// Declared dependency-free (std links `kernel32`). `lpFreeBytesAvailableToCaller` is the
-// analogue of `statvfs`'s `f_bavail`.
 unsafe extern "system" {
     fn GetDiskFreeSpaceExW(
         lp_directory_name: *const u16,
@@ -343,15 +264,13 @@ unsafe extern "system" {
     ) -> i32;
 }
 
-/// Free bytes on the volume holding `dir` (which must exist), or `None` on any error: fails
-/// open, like the Unix `statvfs` path.
+/// Free bytes on the volume holding `dir` (which must exist), or `None` on any error: fails open, like the Unix `statvfs` path.
 #[must_use]
 pub fn volume_free_bytes(dir: &Path) -> Option<u64> {
     let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
     wide.push(0);
     let mut free_to_caller: u64 = 0;
-    // SAFETY: `wide` is a NUL-terminated UTF-16 buffer that outlives the call,
-    // `free_to_caller` is a valid out-param, and the two optional totals are NULL.
+    // SAFETY: `wide` is a NUL-terminated UTF-16 buffer that outlives the call, `free_to_caller` is a valid out-param, and the two optional totals are NULL.
     let rc = unsafe {
         GetDiskFreeSpaceExW(
             wide.as_ptr(),
@@ -363,8 +282,7 @@ pub fn volume_free_bytes(dir: &Path) -> Option<u64> {
     if rc == 0 { None } else { Some(free_to_caller) }
 }
 
-/// `BY_HANDLE_FILE_INFORMATION`. Only the volume serial and the two file-index halves
-/// are read; the rest is declared to get the layout right. `FILETIME` is two `u32`s.
+/// `BY_HANDLE_FILE_INFORMATION`.
 #[repr(C)]
 #[derive(Default)]
 struct ByHandleFileInformation {
@@ -380,8 +298,6 @@ struct ByHandleFileInformation {
     file_index_low: u32,
 }
 
-// Declared dependency-free like `GetDiskFreeSpaceExW`: std's `MetadataExt` exposes these
-// fields only behind the unstable `windows_by_handle` feature.
 unsafe extern "system" {
     fn CreateFileW(
         lp_file_name: *const u16,
@@ -399,24 +315,18 @@ unsafe extern "system" {
     fn CloseHandle(h_object: *mut core::ffi::c_void) -> i32;
 }
 
-/// The OS identity of the directory at `dir`: `(volume serial, 64-bit file index)`, the NTFS
-/// analogue of `(dev, ino)`, which must not change across a trustworthy enumeration. Opened
-/// with `FILE_FLAG_OPEN_REPARSE_POINT`, so it is a link's own identity, never its target's
-/// (matching `symlink_metadata`). Fails closed: `None` is "identity unknown", never
-/// "unchanged".
+/// The OS identity of the directory at `dir`: `(volume serial, 64-bit file index)`, the NTFS analogue of `(dev, ino)`, which must not change across a trustworthy enumeration.
 #[must_use]
 pub fn directory_identity(dir: &Path) -> Option<(u32, u64)> {
-    const FILE_SHARE_ALL: u32 = 0x0000_0007; // READ | WRITE | DELETE
+    const FILE_SHARE_ALL: u32 = 0x0000_0007;
     const OPEN_EXISTING: u32 = 3;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000; // required to open a DIRECTORY
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const INVALID_HANDLE_VALUE: isize = -1;
 
     let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
     wide.push(0);
-    // SAFETY: `wide` is a NUL-terminated UTF-16 buffer that outlives the call; the optional
-    // security-attributes and template params are NULL. Desired access 0 implies
-    // `FILE_READ_ATTRIBUTES`, all the identity query needs.
+    // SAFETY: `wide` is a NUL-terminated UTF-16 buffer that outlives the call; the optional security-attributes and template params are NULL.
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
@@ -432,8 +342,7 @@ pub fn directory_identity(dir: &Path) -> Option<(u32, u64)> {
         return None;
     }
     let mut info = ByHandleFileInformation::default();
-    // SAFETY: `handle` is live from the successful `CreateFileW`, and `info` is a correctly
-    // laid-out writable out-param.
+    // SAFETY: `handle` is live from the successful `CreateFileW`, and `info` is a correctly laid-out writable out-param.
     let rc = unsafe { GetFileInformationByHandle(handle, &mut info) };
     // SAFETY: `handle` is live and not closed anywhere else; closed exactly once.
     unsafe { CloseHandle(handle) };
@@ -446,17 +355,13 @@ pub fn directory_identity(dir: &Path) -> Option<(u32, u64)> {
     ))
 }
 
-/// Remove whatever indirection sits at `link`, best-effort: `remove_dir` unlinks a junction
-/// (not its target's contents), `remove_file` a stale plain file. `remove_file` alone fails
-/// on a junction (`ERROR_ACCESS_DENIED`).
+/// Remove whatever indirection sits at `link`, best-effort: `remove_dir` unlinks a junction (not its target's contents), `remove_file` a stale plain file.
 pub fn remove_link(link: &Path) {
     let _ = fs::remove_dir(link);
     let _ = fs::remove_file(link);
 }
 
-/// `p` with every `/` rewritten to `\`, wide-char-wise (lossless). `cmd` built-ins read `/x`
-/// anywhere on a line as a switch, so an `mklink` argument like `store/trust/671` (which
-/// `Path::join` of a multi-component `&str` produces) fails as `Invalid switch - "trust"`.
+/// `p` with every `/` rewritten to `\`, wide-char-wise (lossless).
 fn backslashed(p: &Path) -> std::ffi::OsString {
     use std::os::windows::ffi::OsStringExt;
     let wide: Vec<u16> = p
@@ -473,11 +378,7 @@ fn backslashed(p: &Path) -> std::ffi::OsString {
     std::ffi::OsString::from_wide(&wide)
 }
 
-/// Point `link` at directory `target` via a junction (`mklink /J`, no admin). Not atomic:
-/// any existing link is removed first, leaving a brief window with no `link` (activation runs
-/// under the apply lock). Both paths go through `backslashed` first. `cmd.exe` is built
-/// with `aterm_uds::spawnfd::command`, so it shares this process's console or gets a
-/// windowless one, never a visible console window per link.
+/// Point `link` at directory `target` via a junction (`mklink /J`, no admin).
 pub fn atomic_symlink(target: &Path, link: &Path) -> io::Result<()> {
     remove_link(link);
     let out = aterm_uds::spawnfd::command("cmd")
@@ -497,8 +398,7 @@ pub fn atomic_symlink(target: &Path, link: &Path) -> io::Result<()> {
 }
 
 /// Best-effort atomic write of `bytes` to `dest`: sibling temp, remove `dest` (Windows
-/// `rename` does not replace a file), rename. A `.cmd` shim replaced while it executes is
-/// safe by its format ([`super::CMD_FORWARD_TAIL`], [`super::CMD_FRAME_HEAD`]).
+/// `rename` does not replace a file), rename.
 fn atomic_write(dest: &Path, bytes: &[u8]) -> io::Result<()> {
     crate::lay::write_in_process(&crate::lay::Executable::new(dest, bytes))
 }
@@ -525,9 +425,7 @@ fn refuse_injectable(target: &Path, env: &crate::shim_env::ShimEnv) -> io::Resul
     Ok(())
 }
 
-/// Install a `.cmd` bin shim at `shim` that sets `env` (empty: the plain shim), then forwards
-/// to `target` (`…\<tool>.exe`): [`shim_executable_to_env`]'s body, written through
-/// [`atomic_write`].
+/// Install a `.cmd` bin shim at `shim` that sets `env` (empty: the plain shim), then forwards to `target` (`…\<tool>.exe`): [`shim_executable_to_env`]'s body, written through [`atomic_write`].
 pub fn install_shim_to_env(
     shim: &Path,
     target: &Path,
@@ -537,8 +435,7 @@ pub fn install_shim_to_env(
     atomic_write(shim, &body)
 }
 
-/// The shim [`install_shim_to_env`] lays, rendered but not written, for callers that render a
-/// whole pass of shims first ([`crate::lay::write_in_process`]).
+/// The shim [`install_shim_to_env`] lays, rendered but not written, for callers that render a whole pass of shims first ([`crate::lay::write_in_process`]).
 pub fn shim_executable_to_env(
     shim: &Path,
     target: &Path,
@@ -551,9 +448,7 @@ pub fn shim_executable_to_env(
     ))
 }
 
-/// The `agents/` twin: the `.cmd` shim with `prelude` ([`super::twin_prelude`], empty on
-/// Windows) ahead of its `@set` and forward lines ([`super::cmd_shim_content_twin`]), with
-/// the same refusals as [`shim_executable_to_env`]. Rendered, not written.
+/// The `agents/` twin: the `.cmd` shim with `prelude` ([`super::twin_prelude`], empty on Windows) ahead of its `@set` and forward lines ([`super::cmd_shim_content_twin`]), with the same refusals as [`shim_executable_to_env`].
 pub fn twin_executable_to_env(
     shim: &Path,
     target: &Path,
@@ -578,31 +473,19 @@ pub fn install_twin_to_env(
     atomic_write(shim, &body)
 }
 
-/// Install a failing tombstone shim at `shim` (a `.cmd`) that prints `message` to stderr
-/// and exits 70: the Windows analogue of the Unix `sh` tombstone.
+/// Install a failing tombstone shim at `shim` (a `.cmd`) that prints `message` to stderr and exits 70: the Windows analogue of the Unix `sh` tombstone.
 pub fn install_tombstone_shim(shim: &Path, message: &str) -> io::Result<()> {
     atomic_write(shim, super::cmd_tombstone_content(message).as_bytes())
 }
 
 /// Resolve the store/checkout target a `bin/<tool>.cmd` shim forwards to, or `None`.
-/// Parses the batch wrapper's `@"<target>" %* & @exit /b` line (or a legacy shim's
-/// `@"<target>" %*` line). A tombstone `.cmd` (no forward target) yields `None`.
 #[must_use]
 pub fn resolve_shim(shim: &Path) -> Option<PathBuf> {
     super::read_cmd_shim_target(shim)
 }
 
-/// [`resolve_shim`] for a reader that must tell "no shim" from "could not read": the
-/// program the `.cmd` at `shim` forwards to (`Ok(Some)`), `Ok(None)` for a file that is
-/// gone or holds no forward line (a tombstone, a stub, any other batch file, bytes that
-/// are not UTF-8), and `Err` when it is there but could not be read through the same
-/// bounded, reparse-refusing handle (over [`super::MAX_SHIM_BYTES`], a reparse point, a
-/// sharing refusal, changed mid-read). The disk watch counts a shim naming a program
-/// inside a build directory as an installed link into it, and one it could not read
-/// keeps every candidate.
-///
+/// [`resolve_shim`] for a reader that must tell "no shim" from "could not read": the program the `.cmd` at `shim` forwards to (`Ok(Some)`), `Ok(None)` for a file that is gone or holds no forward line (a tombstone, a stub, any other batch file, bytes that are not UTF-8), and `Err` when it is there but could not be read through the same bounded, reparse-refusing handle (over [`super::MAX_SHIM_BYTES`], a reparse point, a sharing refusal, changed mid-read).
 /// # Errors
-///
 /// The read's, but `NotFound`.
 pub fn read_shim_target(shim: &Path) -> io::Result<Option<PathBuf>> {
     match crate::metadata_io::read_bounded_regular(shim, super::MAX_SHIM_BYTES) {
@@ -614,16 +497,13 @@ pub fn read_shim_target(shim: &Path) -> io::Result<Option<PathBuf>> {
     }
 }
 
-/// The environment the `.cmd` shim at `shim` sets before it forwards — its `@set` lines
-/// ([`super::read_cmd_shim_env`]; NONE for a tombstone, a stub, or anything unreadable).
+/// The environment the `.cmd` shim at `shim` sets before it forwards — its `@set` lines ([`super::read_cmd_shim_env`]; NONE for a tombstone, a stub, or anything unreadable).
 #[must_use]
 pub fn shim_env_of(shim: &Path) -> crate::shim_env::ShimEnv {
     super::read_cmd_shim_env(shim)
 }
 
-/// A console control handler: `ctrl_type` is one of the `CTRL_*_EVENT` values; `TRUE`
-/// (non-zero) means "handled, call no further handler", `FALSE` passes the event on to
-/// the next handler and finally to the default one, which ends the process.
+/// A console control handler: `ctrl_type` is one of the `CTRL_*_EVENT` values; `TRUE` (non-zero) means "handled, call no further handler", `FALSE` passes the event on to the next handler and finally to the default one, which ends the process.
 pub type CtrlHandler = unsafe extern "system" fn(ctrl_type: u32) -> i32;
 
 /// `CTRL_C_EVENT`: the user pressed Ctrl-C in the console (or `GenerateConsoleCtrlEvent`).
@@ -631,19 +511,13 @@ pub const CTRL_C_EVENT: u32 = 0;
 /// `CTRL_BREAK_EVENT`: Ctrl-Break, delivered to every process of the console's group.
 pub const CTRL_BREAK_EVENT: u32 = 1;
 
-// Declared dependency-free (std links `kernel32`). A `NULL` routine with `add = TRUE` sets
-// the ignore-Ctrl-C flag, which children inherit (a spawned `claude` would never see its own
-// Ctrl-C), so callers install a real routine: routines are per-process, not inherited.
 unsafe extern "system" {
     fn SetConsoleCtrlHandler(handler_routine: Option<CtrlHandler>, add: i32) -> i32;
 }
 
-/// Install `handler` at the front of this process's console control handler list (called on
-/// its own thread for each Ctrl-C, Ctrl-Break or close event). `false` when the call failed,
-/// leaving the default: the process ends on Ctrl-C. The analogue of `signal(SIGINT, …)`.
+/// Install `handler` at the front of this process's console control handler list (called on its own thread for each Ctrl-C, Ctrl-Break or close event).
 pub fn add_ctrl_handler(handler: CtrlHandler) -> bool {
-    // SAFETY: `handler` is a plain `extern "system"` function that lives for the whole
-    // program; kernel32 keeps only its address. No memory of ours is handed over.
+    // SAFETY: `handler` is a plain `extern "system"` function that lives for the whole program; kernel32 keeps only its address.
     unsafe { SetConsoleCtrlHandler(Some(handler), 1) != 0 }
 }
 
@@ -654,25 +528,8 @@ unsafe extern "system" fn swallow_ctrl_c(ctrl_type: u32) -> i32 {
     i32::from(matches!(ctrl_type, CTRL_C_EVENT | CTRL_BREAK_EVENT))
 }
 
-/// Run `command` to completion, then `exit` with its code (no `execve` on Windows). Returns
-/// the error only if spawn or wait failed. Stdio is inherited, so the child owns the terminal
-/// as an exec'd image would; the code is the child's own (`exit /b <n>` from a `.cmd`
-/// included), `1` when it has none.
-///
-/// Ctrl-C belongs to the child: the console delivers `CTRL_C_EVENT` to every attached
-/// process, and one with no handler ends. [`swallow_ctrl_c`] is installed first (as rustup's
-/// proxies and cargo's runners do), so a Ctrl-C inside an agent does not kill the wrapper,
-/// lose the exit code and orphan the agent. Not the `NULL`-routine ignore flag, which
-/// children inherit.
-///
-/// A `.cmd` program (the `bin/<program>.cmd` shim `cli::cmd_landing` runs) goes through std's
-/// `cmd.exe /d /c` lane with batch-safe quoting; std may refuse arguments it cannot quote.
-/// `cmd.exe` may ask `Terminate batch job (Y/N)?` after a Ctrl-C, once per batch level.
-/// Callers build `command` with `aterm_uds::spawnfd::command` or `aterm_uds::spawn::set_flags`
-/// (`Console::Quiet`), which adds nothing from a console: the tool shares it, its Ctrl-C and
-/// its code page.
+/// Run `command` to completion, then `exit` with its code (no `execve` on Windows).
 pub fn exec_or_run(command: &mut aterm_uds::spawnfd::StdCommand) -> io::Error {
-    // Best effort: if the install fails the wrapper ends on Ctrl-C; the child still runs.
     let _ = add_ctrl_handler(swallow_ctrl_c);
     match command.spawn() {
         Ok(mut child) => match child.wait() {
@@ -683,9 +540,7 @@ pub fn exec_or_run(command: &mut aterm_uds::spawnfd::StdCommand) -> io::Error {
     }
 }
 
-/// [`exec_or_run`]'s Ctrl-C rule for a holder that waits on its child (`aterm pkg lease`):
-/// [`swallow_ctrl_c`], installed after the spawn, leaves the console's Ctrl-C to the child.
-///
+/// [`exec_or_run`]'s Ctrl-C rule for a holder that waits on its child (`aterm pkg lease`): [`swallow_ctrl_c`], installed after the spawn, leaves the console's Ctrl-C to the child.
 /// # Errors
 /// The wait's.
 pub fn wait_standing_aside(
@@ -713,8 +568,6 @@ mod tests {
     /// THE ACCOUNT'S PROFILE, MEASURED ON THE MACHINE RUNNING THE TEST: the token's
     /// profile directory resolves, is absolute and exists, and is a loaded profile (its
     /// `NTUSER.DAT` hive is there: a scratch `USERPROFILE` has none), the same twice.
-    /// A `None` here makes every Windows window's disk watch measure-only and the
-    /// headless package lane never run, with no other test failing.
     #[test]
     fn the_account_home_resolves_on_the_machine_running_this_test() {
         let account =
@@ -742,9 +595,7 @@ mod tests {
 
     /// THE ACCOUNT'S PROFILE IS NOT `%USERPROFILE%`: a process whose `USERPROFILE` and
     /// `HOME` name a scratch folder (a lab instance, a worker) still answers the token's
-    /// own profile, with its hive. NEGATIVE CONTROL: an `account_home` that read
-    /// `USERPROFILE` would answer the scratch folder here, which holds no `NTUSER.DAT`.
-    /// The environment is process-wide, so the probe runs in a child of this test binary.
+    /// own profile, with its hive.
     #[test]
     fn the_account_home_is_not_the_userprofile_a_process_is_given() {
         let scratch = crate::testdir::dir("atpkg-scratch-profile-");
@@ -767,7 +618,7 @@ mod tests {
 
     /// [`the_account_home_is_not_the_userprofile_a_process_is_given`]'s child: under the
     /// scratch profile its parent named, the account's home is another folder, and a
-    /// loaded profile. Passes vacuously in any other run.
+    /// loaded profile.
     #[test]
     fn probe_the_account_home_under_a_scratch_profile() {
         let Some(scratch) = std::env::var_os(SCRATCH_PROFILE_ENV) else {

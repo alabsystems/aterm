@@ -52,6 +52,7 @@ pub(crate) fn program_from_argv(
 }
 
 /// Whether `script`'s directory is one of `dirs`, as spelled or resolved
+/// (a prefix reached through a symlink, a PATH entry spelled another way).
 fn script_in(script: &str, dirs: &[std::path::PathBuf]) -> bool {
     let Some(parent) = std::path::Path::new(script).parent() else {
         return false;
@@ -131,6 +132,7 @@ fn platform_argv_head(_pid: i32) -> Option<(String, Option<String>)> {
 }
 
 /// argv[0] and (when `argc > 1`) argv[1] out of a `KERN_PROCARGS2` buffer
+/// ([`aterm_uds::procargs::parse`]), each where it is not empty.
 #[cfg(any(target_os = "macos", test))]
 fn argv_head_from_procargs2(buf: &[u8]) -> Option<(String, Option<String>)> {
     let args = aterm_uds::procargs::parse(buf)?;
@@ -218,6 +220,9 @@ pub(crate) struct LeaderFacts {
     pub(crate) copy: Option<&'static str>,
     /// [`path_verdict`] of the leader's PATH at exec.
     pub(crate) path: Option<PathVerdict>,
+    /// Whether the leader was started with `--no-harness` / `--no-alab-harness`
+    /// or `ATERM_NO_HARNESS=1` (`atpkg::yolo::NO_HARNESS_ENV`).
+    pub(crate) no_harness: bool,
 }
 
 /// [`LeaderFacts`] from one parsed `KERN_PROCARGS2` read (`args`), the leader's parent (`ppid`) and the session's shell (`shell`).
@@ -277,14 +282,26 @@ pub(crate) fn facts_from(
                 holds_agent,
             )
         });
+    let no_harness = args
+        .env_var(atpkg::yolo::NO_HARNESS_ENV)
+        .is_some_and(|v| !v.is_empty() && v != "0")
+        || args
+            .argv
+            .iter()
+            .skip(1)
+            .take_while(|a| a.as_str() != "--")
+            .any(|a| matches!(a.as_str(), "--no-harness" | "--no-alab-harness"));
     LeaderFacts {
         program,
         copy,
         path,
+        no_harness,
     }
 }
 
 /// Whether `dir` holds one of `laid`, the agent programs whose managed twin is laid
+/// (`atpkg::reroute::agents_routes`): only those can be shadowed by a directory ahead of
+/// `agents/`.
 fn holds_agent(dir: &str, laid: &[&str]) -> bool {
     let dir = std::path::Path::new(dir);
     laid.iter().any(|name| dir.join(name).is_file())
@@ -344,6 +361,7 @@ pub(crate) fn leader_facts(pgid: i32, shell: i32) -> LeaderFacts {
 }
 
 /// One resolution request: the session, its timeline, the group to name and
+/// the session's shell (the only parent whose child's PATH is the shell's).
 #[derive(Clone)]
 struct Job {
     session: u64,
@@ -351,10 +369,12 @@ struct Job {
     pgid: i32,
     shell: i32,
     /// What the footer read this job starts wakes when it moves the
+    /// session's log (`claude_footer::LogWake`).
     wake: crate::claude_footer::LogWake,
 }
 
 /// The leader read a job runs: `(pgid, shell)` to [`LeaderFacts`] ([`leader_facts`] in
+/// production).
 type Lookup = Arc<dyn Fn(i32, i32) -> LeaderFacts + Send + Sync>;
 type Completion = Arc<dyn Fn(u64) + Send + Sync>;
 
@@ -366,9 +386,10 @@ enum JobPhase {
 
 struct PendingJob {
     /// A retired or disabled session keeps its token until the worker drains
+    /// it, so a rapid re-enable cannot put a second token behind a slow read.
     latest: Option<Job>,
     revision: u64,
-    /// Changes on cancellation or a new group, but not an ordinary retry. A
+    /// Changes on cancellation or a new group, but not an ordinary retry.
     incarnation: u64,
     phase: JobPhase,
 }
@@ -389,7 +410,7 @@ impl PendingJobs {
         })
     }
 
-    /// Replace a session's latest request. Only a new session needs a channel
+    /// Replace a session's latest request.
     fn offer(&mut self, job: Job) -> bool {
         self.revision = self.revision.wrapping_add(1);
         if let Some(pending) = self.by_session.get_mut(&job.session) {
@@ -414,7 +435,7 @@ impl PendingJobs {
         true
     }
 
-    /// A crashed worker lost its local queue and channel. Every retained slot
+    /// A crashed worker lost its local queue and channel.
     fn restart_ids(&mut self) -> Vec<u64> {
         self.by_session
             .iter_mut()
@@ -437,7 +458,7 @@ impl PendingJobs {
         }
     }
 
-    /// A changed in-flight slot needs one more pass over its latest job. The
+    /// A changed in-flight slot needs one more pass over its latest job.
     fn finish(&mut self, session: u64, revision: u64) -> bool {
         match self.by_session.get_mut(&session) {
             Some(slot) if slot.revision != revision && slot.latest.is_some() => {
@@ -452,7 +473,7 @@ impl PendingJobs {
         }
     }
 
-    /// Leave a tombstone for its one queued token or running read. Dropping
+    /// Leave a tombstone for its one queued token or running read.
     fn cancel(&mut self, session: u64) {
         if let Some(slot) = self.by_session.get_mut(&session) {
             self.revision = self.revision.wrapping_add(1);
@@ -480,6 +501,7 @@ pub(crate) struct ProgramResolver {
     lookup: Lookup,
     completion: Option<Completion>,
     /// The log's wake the footer reads this resolver starts carry
+    /// ([`Self::set_log_wake`]).
     log_wake: crate::claude_footer::LogWake,
 }
 
@@ -563,6 +585,7 @@ impl ProgramResolver {
     }
 
     /// A panicked worker loses its queued ids and in-flight job; the map keeps every latest
+    /// request, so the next request starts a worker that requeues each session once.
     fn recover_finished_worker(&mut self) {
         if self
             .worker
@@ -575,6 +598,7 @@ impl ProgramResolver {
     }
 
     /// `Some(true)` means a new channel was populated from the retained map;
+    /// the caller must not send a second token for its freshly offered job.
     fn ensure_worker(&mut self) -> Option<bool> {
         self.recover_finished_worker();
         if self.tx.is_some() {
@@ -644,6 +668,7 @@ impl ProgramResolver {
 }
 
 /// Process one id at a time, draining distinct queued sessions before requeueing a hot
+/// session's updated in-flight lookup.
 fn run_worker(
     rx: Receiver<u64>,
     pending: Arc<Mutex<PendingJobs>>,
@@ -712,6 +737,7 @@ fn publish_if_current(
     let was_claude = crate::claude_footer::drawn_for(timeline.agent().program.as_deref());
     let changed = timeline.set_program(job.pgid, facts.program);
     timeline.set_leader(job.pgid, facts.copy, facts.path);
+    timeline.set_leader_no_harness(job.pgid, facts.no_harness);
     let became_claude =
         changed && crate::claude_footer::drawn_for(timeline.agent().program.as_deref());
     (changed, became_claude, changed && was_claude)
@@ -732,6 +758,7 @@ mod tests {
     }
 
     /// [`argv_head_of`] a just-spawned child once it reads exactly the head `expected` accepts,
+    /// polled to a bounded deadline; at the deadline, the last read.
     #[cfg(unix)]
     fn settled_argv_head(
         pid: i32,
@@ -751,6 +778,8 @@ mod tests {
     }
 
     /// A test child that can neither outlive nor stall its test: null stdio (a leftover holding
+    /// an inherited stdout stalls a runner that pipes test output), and its own process group
+    /// so [`kill_group`] reaches its descendants.
     #[cfg(unix)]
     fn quiet_child(cmd: &mut aterm_uds::spawnfd::Command) -> &mut aterm_uds::spawnfd::Command {
         cmd.stdin(aterm_uds::spawnfd::Stdio::null())
@@ -773,6 +802,7 @@ mod tests {
     }
 
     /// Conformance with the `ProgramResolverQueue` model: the slot transitions agree with it
+    /// through a superseding group and a worker restart.
     #[test]
     fn pending_job_transitions_keep_the_latest_group_and_one_token() {
         let model = aterm_models_harness::program_resolver_queue_model();
@@ -832,6 +862,7 @@ mod tests {
     }
 
     /// Cancelling an in-flight lookup keeps its channel token; a re-enable replaces the answer,
+    /// and the old lookup cannot publish even when the new request has the same PGID.
     #[test]
     fn cancelled_inflight_job_reenables_without_a_second_token() {
         let model = aterm_models_harness::program_resolver_queue_model();
@@ -895,6 +926,9 @@ mod tests {
     }
 
     /// The resolver's two footer transitions, for each name the host
+    /// supervises as Claude Code: a `claude-code` argv0 entering the front
+    /// asks for the footer's facts and leaving it stops the watch, as
+    /// `claude` does.
     #[test]
     fn a_claude_code_argv0_starts_and_stops_the_footer_watch_like_claude() {
         let named = |p: &str| LeaderFacts {
@@ -928,6 +962,7 @@ mod tests {
     }
 
     /// A blocked old-group lookup cannot create an unbounded queue of retries
+    /// or delay the replacement behind them.
     #[test]
     fn slow_lookup_coalesces_retries_and_serves_a_new_group_promptly() {
         use std::time::Duration;
@@ -1224,6 +1259,7 @@ mod tests {
     }
 
     /// A real child is named by its argv[0] from the process table, a renamed one
+    /// (`exec -a claude`) included.
     #[cfg(unix)]
     #[test]
     fn a_live_process_is_named_by_its_argv0() {
@@ -1268,6 +1304,7 @@ mod tests {
     }
 
     /// An interpreter running atpkg's shim named after an agent is that agent, and the store
+    /// path names its tool.
     #[test]
     fn a_shim_script_named_after_an_agent_is_that_agent() {
         let atpkg = |script: &str| script.contains("/pkg/agents/");
@@ -1304,6 +1341,7 @@ mod tests {
     }
 
     /// [`script_in`]: the script's own directory, as spelled or resolved —
+    /// never a deeper one or a sibling.
     #[cfg(unix)]
     #[test]
     fn a_shim_is_a_file_directly_in_a_managed_dir() {
@@ -1325,6 +1363,7 @@ mod tests {
     }
 
     /// The head is argv[0], never the exec path, and argv[1] where argc says
+    /// there is one; a process with no argv[0] has no head.
     #[test]
     fn procargs2_layout_yields_argv1_after_argv0() {
         let mut two = 2i32.to_ne_bytes().to_vec();
@@ -1360,6 +1399,7 @@ mod tests {
     }
 
     /// A `KERN_PROCARGS2` buffer as the kernel lays one out: argc, the exec
+    /// path, NUL padding, argv, then the environment.
     #[cfg(target_os = "macos")]
     fn procargs2(exec: &str, argv: &[&str], env: &[&str]) -> Vec<u8> {
         let mut buf = i32::try_from(argv.len()).unwrap().to_ne_bytes().to_vec();
@@ -1383,6 +1423,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     /// The `KERN_PROCARGS2` read of a foreign native claude exec'd with `PATH=<path>`; the
+    /// tests name its shell pid 1916.
     fn measured_4205(path: &str) -> atpkg::caller_shell::ProcArgs {
         let exec = "/Users//o/.local/share/claude/versions/2.1.281";
         atpkg::caller_shell::parse_procargs2(&procargs2(
@@ -1395,11 +1436,14 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     /// Which directory holds a `claude`: `~/.local/bin` (the native installer's
+    /// link) and brew's, never the managed ones (they are asked first).
     fn holds(dir: &str) -> bool {
         dir == "/Users//o/.local/bin" || dir == "/opt/homebrew/bin"
     }
 
     /// The PATH verdict from synthetic `KERN_PROCARGS2` buffers: `agents/` first is live, the
+    /// reroute stubs first (with `ATERM_CHILD`) reroute-only, a foreign copy first frozen; a
+    /// leader that is not the shell's direct child measures nothing.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_shells_path_is_measured_only_from_its_direct_child() {
@@ -1471,6 +1515,7 @@ mod tests {
     }
 
     /// `copy=`: the store's executable and atpkg's own shim are managed, anything else an agent
+    /// runs is foreign, and a program that is no agent has no copy.
     #[test]
     fn an_agents_copy_is_managed_only_from_the_store() {
         let store = std::path::PathBuf::from(format!("{PREFIX}/store"));
@@ -1511,6 +1556,9 @@ mod tests {
     }
 
     /// REROUTE NAMING (card engine §3.5): the session-scoped reroute stub, a
+    /// `#!/bin/sh` script directly in `reroute/`, is named its agent at its
+    /// exec, with no copy: it is never proof of an install, and the store
+    /// image it `exec`s sets the copy when it is read.
     #[test]
     fn a_reroute_stub_is_named_its_agent_with_no_copy() {
         let layout = atpkg::store::Layout {
@@ -1567,6 +1615,9 @@ mod tests {
     }
 
     /// AN NPM CLAUDE IS A FOREIGN COPY: `node /usr/local/bin/claude` keeps
+    /// the runtime's name (`program=node`), and its copy was asked of that
+    /// name, which is no agent, so `copy=-` hid exactly the build `copy=`
+    /// exists to show.
     #[test]
     fn a_runtime_running_an_agents_script_runs_a_foreign_copy() {
         let layout = atpkg::store::Layout {
@@ -1610,6 +1661,7 @@ mod tests {
     const PARK: &str = "ATERM_PROGRAM_TEST_PARK";
 
     /// A live child of this process, read by the resolver itself: its PATH is measured when
+    /// this process is named its shell, and not otherwise.
     #[cfg(unix)]
     #[test]
     fn a_live_child_is_measured_against_its_real_parent() {
@@ -1650,6 +1702,7 @@ mod tests {
     }
 
     /// The stand-in [`a_live_child_is_measured_against_its_real_parent`] runs: inert unless
+    /// [`PARK`] is set, then parked until that file exists, for at most a hang detector's minute.
     #[test]
     fn park_for_a_read() {
         let Some(release) = std::env::var_os(PARK) else {
@@ -1683,5 +1736,23 @@ mod tests {
             None,
             "late answer dropped"
         );
+    }
+
+    #[test]
+    fn no_harness_flag_or_env_is_detected_on_leader() {
+        let make = |argv: &[&str], env: &[&str]| {
+            let args = atpkg::caller_shell::ProcArgs {
+                exec_path: "/opt/agy".to_string(),
+                argv: argv.iter().map(|s| (*s).to_string()).collect(),
+                env: env.iter().map(|s| (*s).to_string()).collect(),
+            };
+            facts_from(&args, None, 0, None, &|_| None, &|_| false).no_harness
+        };
+        assert!(make(&["agy", "--no-harness"], &[]));
+        assert!(make(&["agy", "--no-alab-harness"], &[]));
+        assert!(make(&["agy"], &["ATERM_NO_HARNESS=1"]));
+        assert!(!make(&["agy", "--", "--no-harness"], &[]));
+        assert!(!make(&["agy"], &["ATERM_NO_HARNESS=0"]));
+        assert!(!make(&["agy"], &[]));
     }
 }

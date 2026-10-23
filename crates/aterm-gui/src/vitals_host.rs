@@ -39,6 +39,7 @@ const PEAKS_FILE: &str = "vitals-peaks.json";
 /// The peaks file's layout; a file of another is read as no peaks.
 const PEAKS_SCHEMA: u32 = 1;
 /// The largest peaks file read: three peaks of seven days are well under a
+/// KiB, so a larger file is damaged and read as no peaks.
 const PEAKS_MAX_BYTES: u64 = 16 * 1024;
 /// How long the quit waits for the probe thread to end and write the peaks.
 pub(crate) const STOP_BOUND: Duration = Duration::from_millis(500);
@@ -58,6 +59,11 @@ pub(crate) const LAYOUT_EVERY: Duration = Duration::from_millis(250);
 const JOB_EVENTS_CAP: usize = 256;
 
 /// HOW SOON A WHOLE READING IS DUE AGAIN with no window showing the bars,
+/// after one that gave `view` (design §6.1, kind 3): the engine's cadence
+/// ([`aterm_vitals::jobs::Demand::every_ms`], never under [`JOBS_FLOOR`])
+/// while a job is live and the engine is not idle; `None` when every live
+/// job waits only for the person, or none is live (an exited row, kept a
+/// minute for its event, arms nothing).
 fn job_demand_after(view: &aterm_vitals::jobs::JobsView) -> Option<Duration> {
     let live = view
         .rows
@@ -139,6 +145,7 @@ pub(crate) struct Handover {
     /// The newest snapshot (taken by [`VitalsHost::adopt`]).
     snap: Option<Arc<Snapshot>>,
     /// The terminal words of the request that snapshot was read with
+    /// ([`TtyWord::seen`]): what its jobs view named each park from.
     words: Vec<WordSeen>,
     /// Job verdicts that moved, oldest first, at most [`JOB_EVENTS_CAP`].
     job_events: Vec<aterm_vitals::events::Event>,
@@ -159,6 +166,8 @@ pub(crate) enum Audience {
 
 impl Audience {
     /// From what the windows show: `in_view`, a window in view draws the bars
+    /// or the Monitor tab; `drawn`, some window draws the bars, in view or not;
+    /// `focused`, one of aterm's windows has the focus.
     fn of(in_view: bool, drawn: bool, focused: bool) -> Self {
         match (in_view, drawn) {
             (true, _) if focused => Self::Shown,
@@ -186,6 +195,7 @@ impl Audience {
 }
 
 /// When the next reading is due: one `period` after the last was asked
+/// (`asked`), or at `armed` where that is sooner (a lens asked for one now).
 fn due_at(
     asked: Option<Instant>,
     armed: Option<Instant>,
@@ -240,10 +250,12 @@ pub(crate) struct TtyWord {
     /// The session's output stamp just before the word was read.
     output_seen: u64,
     /// The session's output stamp (`Session::latest_output_activity_ns`),
+    /// which its PTY reader moves on every burst.
     output: Arc<AtomicU64>,
     /// The sink's driven input just before the word was read.
     input_seen: aterm_session::sink::DrivenInput,
     /// The sink's driven-input count, which every key, paste, report and
+    /// control verb's bytes move (no descriptor: [`aterm_session::sink::DrivenInputWatch`]).
     input: aterm_session::sink::DrivenInputWatch,
 }
 
@@ -258,6 +270,7 @@ impl TtyWord {
     }
 
     /// [`Self::read`], running `between` after the stamps are loaded and
+    /// before the terminal is read (a test moves them there).
     fn read_seamed(
         key: u64,
         sink: &aterm_session::sink::SinkWriter,
@@ -413,16 +426,19 @@ pub(crate) enum Msg {
 /// The loop's side of the probe thread.
 pub(crate) struct VitalsHost {
     /// The request channel; `None` until the thread starts (on the loop's
+    /// first wake) or when it could not start.
     tx: Option<SyncSender<Msg>>,
     /// The layout last sent to the thread ([`crate::App::layout_fingerprint`]).
     sent_layout: Option<u64>,
     /// When the loop last looked at the layout ([`LAYOUT_EVERY`]).
     layout_looked: Option<Instant>,
     /// The workers' copy the thread handed its sender to: the quit takes it
+    /// back ([`Self::stop_at_exit`]).
     sys: Option<&'static crate::sys_host::Shared>,
-    /// The quit can precede construction of the thread's readers. A sender
+    /// The quit can precede construction of the thread's readers.
     stopping: Arc<AtomicBool>,
     /// The running thread and the channel that hangs up when it ends: the
+    /// quit's bounded wait for its last write ([`Self::stop_at_exit`]).
     thread: Option<(std::thread::JoinHandle<()>, Receiver<()>)>,
     /// Set once a start was tried, so a failed start is not retried every tick.
     tried: bool,
@@ -437,36 +453,54 @@ pub(crate) struct VitalsHost {
     /// When the next reading is due: the bars' cadence while a window in view shows them.
     pub(crate) next_due: Option<Instant>,
     /// When the last reading was asked for: the next is due one period of
+    /// the cadence in force after it ([`due_at`]).
     asked_at: Option<Instant>,
     /// With no window in view showing the bars, when the jobs engine's next
+    /// whole reading is due ([`Self::windowless_due`]); `None` while one is
+    /// read (it is named again when it lands) or none is due.
     jobs_due: Option<Instant>,
     /// A delegated full sweep's next deadline; absent while a sweep is pending.
     delegated_due: Option<Instant>,
     /// Whether the last judgement found a window in view showing the bars:
+    /// the hand-over between the two cadences happens where it turns.
     windowed: bool,
     /// The disk watch looked while no window in view showed the bars, and its
+    /// one reading is not asked yet ([`crate::App::vitals_disk_looked`]).
     disk_pull: bool,
     /// Output came, or a process event, with no window showing the bars
+    /// ([`Self::note_edge`]): a reading is owed while the held view is
+    /// parked.
     edge: bool,
     /// When the loop last asked an edge's reading ([`JOBS_FLOOR`]).
     last_edge_read: Option<Instant>,
     /// Each session's screen generation at its last output wake with no
+    /// window showing the bars: a write that leaves it where it was moved no
+    /// cell, and is no edge ([`crate::App::vitals_output_kind`]).
     screens: std::collections::HashMap<u64, crate::control::ScreenGen>,
     /// The sessions the held jobs view parks on the person's read
+    /// ([`Parked::of`], named again with each new view): their redraws are
+    /// no edge while the park holds ([`Parked::holds`]).
     parked: std::collections::HashMap<u64, Parked>,
     /// Job events taken from the hand-over, for the timelines.
     job_events: Vec<aterm_vitals::events::Event>,
     /// Each session's count of job events recorded (`EVENT … job rev=`).
     job_revs: std::collections::HashMap<u64, u64>,
     /// Last hidden-read judgement, so the first delegated registration asks
+    /// once even with no prior snapshot, without accumulating pending reads.
     delegated_active: bool,
     /// Whether the chips' load meters were last handed over with the stats
+    /// bars shown ([`crate::App::push_chip_loads`]): turning the bars off
+    /// clears the native strips' meters on the next wake.
     chips_shown: bool,
     /// The "where" survey's slot (`crate::disk_where`): the loop starts a
+    /// survey, the thread copies its rows into each reading.
     survey: Arc<Where>,
     /// Where each adopted jobs view is posted
+    /// ([`crate::App::post_jobs_reading`]): the process's
+    /// [`crate::vitals_jobs::BOARD`]; a test's own in a test.
     board: &'static crate::vitals_jobs::JobsBoard,
     /// The kernel edge the sessions' gathers tell: the process's
+    /// [`PROC_EDGE`]; each test App its own, which no gather tells.
     proc_edge: &'static ProcEdge,
 }
 
@@ -558,6 +592,9 @@ impl VitalsHost {
     }
 
     /// When a reading no window shows is due again: the engine's own cadence
+    /// from when the held jobs view was adopted, while that view holds a
+    /// suspect agent call ([`crate::vitals_jobs::windowless_after`]); `None`
+    /// otherwise, and the disk watch's next look asks.
     fn windowless_due(&self) -> Option<Instant> {
         let view = self.snapshot.as_ref()?.jobs.as_deref()?;
         let after =
@@ -566,6 +603,8 @@ impl VitalsHost {
     }
 
     /// The loop's deadline with no window in view showing the bars: the
+    /// engine's next whole reading ([`Self::jobs_due`]), or a hidden deck's
+    /// next machine reading (`hidden`, its period) where that is sooner.
     fn windowless_deadline(&self, hidden: Option<Duration>, now: Instant) -> Option<Instant> {
         let paced = hidden.map(|period| due_at(self.asked_at, None, period, now));
         let full = match (self.jobs_due, self.delegated_due) {
@@ -593,6 +632,7 @@ impl VitalsHost {
     }
 
     /// Arm the kernel edge while an edge would be new: no window shows the
+    /// bars, the thread runs, and none is owed.
     fn arm_proc_edge(&self) {
         self.proc_edge
             .arm(!self.windowed && self.tx.is_some() && !self.edge);
@@ -604,6 +644,7 @@ impl VitalsHost {
     }
 
     /// When the edge's reading is due: at once, or [`JOBS_FLOOR`] after the
+    /// last one; `None` with no edge or a window showing the bars.
     fn edge_at(&self, now: Instant) -> Option<Instant> {
         if !self.edge || self.windowed {
             return None;
@@ -626,7 +667,7 @@ impl VitalsHost {
         *rev
     }
 
-    /// Start the probe thread once, on the loop's first wake. It waits on
+    /// Start the probe thread once, on the loop's first wake.
     fn ensure_thread(&mut self, proxy: &aterm_window::event_loop::EventLoopProxy<crate::Wake>) {
         if self.tx.is_some() || self.tried {
             return;
@@ -646,6 +687,9 @@ impl VitalsHost {
     }
 
     /// Start the probe thread, once: `source` makes its readers on the
+    /// thread, `post` tells the loop a snapshot waits (false once the loop is
+    /// gone), the peaks live at `peaks`, and `sys` is the workers' copy the
+    /// thread publishes to and hands a sender (none for a test's thread).
     fn start<S: Source>(
         &mut self,
         source: impl FnOnce() -> S + Send + 'static,
@@ -702,7 +746,7 @@ impl VitalsHost {
         }
     }
 
-    /// Offer one message without waiting for the platform probe. A full queue
+    /// Offer one message without waiting for the platform probe.
     fn offer(&mut self, msg: Msg) -> bool {
         let Some(tx) = self.tx.as_ref() else {
             return false;
@@ -719,6 +763,7 @@ impl VitalsHost {
 }
 
 /// What the probe thread reads with: the platform readers and the model
+/// ([`Reader`]), or a test's stand-in.
 trait Source {
     /// The reading `req` asks for, folded into the trends.
     fn reading(&mut self, req: &Request) -> Snapshot;
@@ -777,6 +822,7 @@ impl Asked {
 }
 
 /// The thread: one [`Source`], a reading per loop request or pull, the
+/// newest layout always.
 fn run(
     rx: &Receiver<Msg>,
     latest: &Mutex<Handover>,
@@ -866,6 +912,10 @@ fn duration_ms(d: Duration) -> u32 {
 }
 
 /// A cold pull's first reading is never published, but what it saw happen
+/// (a job's verdict that moved, a tab that closed) happened: the detectors
+/// moved on with it, so its events ride the reading that is published,
+/// first, or they are lost to `sys since=`, `subscribe … events` and
+/// `await sys`.
 fn keep_warm_events(warm: Snapshot, snap: &mut Snapshot) {
     let mut events = warm.events;
     events.append(&mut snap.events);
@@ -873,6 +923,7 @@ fn keep_warm_events(warm: Snapshot, snap: &mut Snapshot) {
 }
 
 /// Leave `snap` for the loop, with its job events and the terminal `words`
+/// of the request it was read with.
 fn hand_over(latest: &Mutex<Handover>, snap: &Arc<Snapshot>, words: Vec<WordSeen>) -> bool {
     let events: Vec<_> = snap
         .events
@@ -936,9 +987,14 @@ pub(crate) fn thermal_of(raw: isize, low_power: Option<bool>) -> Thermal {
 }
 
 /// How often the counter reader's throttle level is read: its doc asks no
+/// caller to poll it every second (up to 1,600 sysfs reads on the largest
+/// machine), and a level does not move faster than a thermal zone warms.
 const COUNTER_THROTTLE_EVERY: Duration = Duration::from_secs(10);
 
 /// The counter reader's level ([`aterm_sysprobe::Probe::throttle`]: Linux's
+/// heuristic from thermal zones and throttle counters) as the model's
+/// thermal state; `None` where it gives none (macOS and Windows, which say
+/// why).
 fn counter_thermal(t: Result<aterm_sysprobe::Throttle, aterm_sysprobe::Why>) -> Option<Thermal> {
     let t = t.ok()?;
     let (level, raw) = match t.level {
@@ -980,17 +1036,22 @@ pub(crate) struct Reader {
     /// `net_links_into`'s buffer, kept from one reading to the next.
     scratch: Vec<u8>,
     /// This process's user (unix): the per-user process count's and the
+    /// writers'.
     uid: Option<u32>,
     /// The "where" survey's slot.
     survey: Arc<Where>,
     /// The `job` events: a verdict that moved between two of its views.
     job_watch: aterm_vitals::events::JobWatch,
     /// The view the watch last stepped (the same one rides each snapshot
+    /// until the engine is due again).
     watched: Option<Arc<aterm_vitals::jobs::JobsView>>,
     thermal: ThermalProbe,
     /// The counter reader's last level and when it was read, where the
+    /// platform probe gives none.
     counter_throttle: Option<(Instant, Option<Thermal>)>,
     /// The build slots' reader (`aterm_sysprobe::slots`, without a lock):
+    /// this thread's one, so `await sys slots>=…` and the occupancy board read
+    /// one proof ([`Self::set_occupancy_facts`]).
     slots: aterm_sysprobe::slots::SlotReader,
     /// The machine's words, read once.
     pub(crate) machine: Machine,
@@ -1058,6 +1119,7 @@ impl Reader {
     }
 
     /// The counter reader's throttle level, read at most every
+    /// [`COUNTER_THROTTLE_EVERY`] (between reads, the last one).
     fn counter_throttle(&mut self) -> Option<Thermal> {
         if let Some((at, last)) = self.counter_throttle
             && at.elapsed() < COUNTER_THROTTLE_EVERY
@@ -1070,6 +1132,7 @@ impl Reader {
     }
 
     /// Step the job watch over the snapshot's jobs view when it is a new
+    /// one: its `job` events join the snapshot's.
     fn watch_jobs(&mut self, snap: &mut Snapshot) {
         if let Some(view) = snap.jobs.as_ref()
             && !self.watched.as_ref().is_some_and(|w| Arc::ptr_eq(w, view))
@@ -1081,6 +1144,11 @@ impl Reader {
     }
 
     /// THE OCCUPANCY FACTS a snapshot carries beside the model's
+    /// (`docs/DESIGN-harness-occupancy-2026-10-20.md` §2, §4.2), set after
+    /// [`aterm_vitals::Vitals::absorb`], which leaves them unread: the memory
+    /// the machine can hand out without paging (`build-slot`'s admission
+    /// figure, [`aterm_sysprobe::machine_memory`]) and the build slots as this
+    /// thread's reader proved them.
     fn set_occupancy_facts(&mut self, snap: &mut Snapshot) -> aterm_sysprobe::slots::SlotsRead {
         snap.avail =
             aterm_sysprobe::machine_memory().map(|m| m.available_mib.saturating_mul(1 << 20));
@@ -1165,6 +1233,9 @@ impl Reader {
     }
 
     /// Everything but the process sweep: core ticks, memory and swap, the
+    /// GPU, the home volume and the disk facts, the links, the load average,
+    /// the process counts and limits, and what the loop copied (tokens, the
+    /// plan), with the clocks the gap rule reads.
     fn machine_sample(&mut self, req: &Request) -> Sample {
         let since = self.epoch.elapsed();
         let shelf = &crate::disk_board::SHELF;
@@ -1235,6 +1306,7 @@ impl Reader {
 }
 
 /// `at` on the model's monotonic clock, whose origin is `epoch`: ms since
+/// it, negative for an instant before it.
 fn mono_ms_of(at: Instant, epoch: Instant) -> i64 {
     match at.checked_duration_since(epoch) {
         Some(after) => i64::try_from(after.as_millis()).unwrap_or(i64::MAX),
@@ -1272,7 +1344,7 @@ pub(crate) fn proc_sample(p: &aterm_sysprobe::ProcessReading, epoch: Instant) ->
     }
 }
 
-/// The machine's memory as the model takes it. A class this OS does not
+/// The machine's memory as the model takes it.
 fn mem_sample(m: aterm_sysprobe::MemoryDetail) -> MemSample {
     MemSample {
         total: m.total,
@@ -1305,7 +1377,7 @@ fn mem_sample(m: aterm_sysprobe::MemoryDetail) -> MemSample {
     }
 }
 
-/// The GPU as the model takes it. A card the OS put to sleep (Linux runtime
+/// The GPU as the model takes it.
 fn gpu_sample(g: aterm_sysprobe::GpuReading) -> GpuSample {
     let asleep = g.unread == Some(aterm_sysprobe::Why::Asleep);
     GpuSample {
@@ -1321,6 +1393,8 @@ fn gpu_sample(g: aterm_sysprobe::GpuReading) -> GpuSample {
 }
 
 /// One network link as the model takes it: its counters, its rate, whether
+/// its bytes are the machine's own (`aterm_sysprobe::counts_toward_machine`),
+/// and its kind in the model's words.
 fn link_sample(l: &aterm_sysprobe::LinkReading) -> LinkSample {
     let named = |prefixes: &[&str]| prefixes.iter().any(|p| l.name.starts_with(p));
     LinkSample {
@@ -1369,6 +1443,10 @@ pub(crate) fn tab_volume(path: &Path) -> Option<aterm_sysprobe::VolumeReading> {
 }
 
 /// The home volume, the disk row's (v2 §6.4: it never follows the focused
+/// tab), and its key on the disk board when `keyed` (a disk watch runs): the
+/// key of the reading the disk watch takes of it
+/// (`aterm_agent::harness::disk::volume_of`), so the deck asks the board for
+/// the row the watch wrote.
 fn home_volume(
     home: &Path,
     keyed: bool,
@@ -1407,6 +1485,9 @@ fn local_volume(
 }
 
 /// The deck's disk facts (v2 §7.1): the board's for the home volume (its
+/// key `home_key`, the clocks read by `now` only when they are asked) while
+/// a disk watch runs ([`Shelf::watched`]: the harness is on), mapped onto the
+/// model's own types, and the "where" survey's rows and whether one runs.
 fn disk_facts(
     shelf: &Shelf,
     home_key: Option<&VolumeKey>,
@@ -1423,6 +1504,9 @@ fn disk_facts(
 }
 
 /// The board's facts `raw` in the model's types, with the "where" survey's
+/// rows `found` in place of the last pass's where the pass named none, or
+/// where the survey is newer and whole (it sized something, and neither its
+/// search nor its sizing ran out of time), and `sizing` while a survey runs.
 fn deck_disk(
     raw: DiskFactsRaw,
     found: Option<crate::disk_where::Found>,
@@ -1471,6 +1555,7 @@ fn deck_disk(
 }
 
 /// The watch's level in the model's words; an emergency the inode line made
+/// (`files`) is its own.
 fn disk_level(level: aterm_agent::harness::disk::Level, files: bool) -> Option<DiskLevel> {
     use aterm_agent::harness::disk::Level;
     match level {
@@ -1484,6 +1569,9 @@ fn disk_level(level: aterm_agent::harness::disk::Level, files: bool) -> Option<D
 }
 
 /// One pane's token row from its Claude Code footer's `facts` (v2 §8.3),
+/// keyed to the tab `key` that holds the pane: the session's cumulative
+/// totals, what its fold left unread, and when the footer read them
+/// (`read_at`).
 fn tab_tokens(key: u64, facts: &FooterFacts, read_at: Option<Instant>) -> Option<TokenRow> {
     let usage = facts.usage.as_ref()?;
     let owner = facts.owner.as_ref()?;
@@ -1503,6 +1591,7 @@ fn tab_tokens(key: u64, facts: &FooterFacts, read_at: Option<Instant>) -> Option
 }
 
 /// Each session once: a session two panes show (a resumed conversation, a
+/// pane moved) is counted by the first that shows it.
 fn each_session_once(mut rows: Vec<TokenRow>) -> Vec<TokenRow> {
     let mut seen = std::collections::HashSet::with_capacity(rows.len());
     rows.retain(|t| seen.insert(t.totals.session.clone()));
@@ -1510,6 +1599,9 @@ fn each_session_once(mut rows: Vec<TokenRow>) -> Vec<TokenRow> {
 }
 
 /// The front tab's plan usage as the deck's dated fact (v2 §8.4), while it
+/// is current at `now` (unix seconds): its binding window in words, its
+/// share, when it was read, and its account's number among `accounts` (every
+/// tab's, in tab order).
 fn plan_fact(plan: &PlanUsage, accounts: &[AccountKey], now: i64) -> Option<PlanFact> {
     if !plan.current_at(now) {
         return None;
@@ -1549,6 +1641,8 @@ struct PeakFile {
 
 impl PeakFile {
     /// The file at `path`, read at `now`, and the peaks it holds: none where
+    /// it is missing, damaged, larger than [`PEAKS_MAX_BYTES`] or of another
+    /// layout.
     fn open(path: Option<PathBuf>, now: Instant) -> (Self, Peaks) {
         let held = path
             .as_deref()
@@ -1564,6 +1658,7 @@ impl PeakFile {
     }
 
     /// Write `peaks` where they differ from what the file holds: at most once
+    /// every [`PEAKS_EVERY`], or now when the thread is `stopping`.
     fn keep(&mut self, peaks: &Peaks, now: Instant, stopping: bool) {
         if *peaks == self.held
             || (!stopping && now.saturating_duration_since(self.at) < PEAKS_EVERY)
@@ -1585,6 +1680,7 @@ impl PeakFile {
 }
 
 /// The text of the file at `path` when it holds at most [`PEAKS_MAX_BYTES`];
+/// a larger file is not read past that.
 fn read_small(path: &Path) -> Option<String> {
     let mut text = String::new();
     std::fs::File::open(path)
@@ -1603,6 +1699,7 @@ struct PeaksDoc {
 }
 
 /// One peak in the file: its name, the seconds it has read, and its days as
+/// `[unix day, maximum]`.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct PeakDoc {
     name: String,
@@ -1628,6 +1725,7 @@ fn peaks_json(peaks: &Peaks) -> Option<String> {
 }
 
 /// The peaks the file's `text` holds; `None` for text of another layout or
+/// none at all.
 fn peaks_of(text: &str) -> Option<Peaks> {
     let doc: PeaksDoc = aterm_json::from_str(text).ok()?;
     (doc.schema == PEAKS_SCHEMA).then(|| {
@@ -1641,6 +1739,9 @@ fn peaks_of(text: &str) -> Option<Peaks> {
 
 impl crate::App {
     /// Who would see a reading now: whether a window in view shows the stats
+    /// bars (the Deck or the sill) or the Live Fleet System Monitor tab
+    /// (`/tabs` / `/monitor`), whether a window draws the bars at all, and
+    /// whether aterm is in front ([`Audience::of`]).
     fn vitals_audience(&self) -> Audience {
         if self.proxy.is_none() && self.vitals.tx.is_none() {
             return Audience::None;
@@ -1714,6 +1815,8 @@ impl crate::App {
     }
 
     /// Ask the thread for a reading at `period` (`machine_only` while
+    /// hidden) with the layout now, the stuck engine made to look at it when
+    /// `jobs_now` ([`Request::jobs_now`]).
     fn ask_reading(&mut self, now: Instant, period: Duration, machine_only: bool, jobs_now: bool) {
         let mut req = self.vitals_request(period, machine_only);
         req.jobs_now = jobs_now;
@@ -1725,6 +1828,7 @@ impl crate::App {
     }
 
     /// Send the thread the layout alone when it changed since it was last
+    /// sent (for `sys`); no reading.
     fn send_layout(&mut self, now: Instant, period: Duration, machine_only: bool) {
         if self.vitals.tx.is_none()
             || self
@@ -1746,6 +1850,8 @@ impl crate::App {
     }
 
     /// NO WINDOW IN VIEW SHOWS THE BARS (module docs, the hung-call design's
+    /// D1): ask for one whole reading when the disk watch looked or the held
+    /// view's engine demand is due.
     fn serve_windowless_vitals(&mut self, audience: Audience, now: Instant, delegated: bool) {
         let was_delegated = std::mem::replace(&mut self.vitals.delegated_active, delegated);
         let was_windowed = std::mem::replace(&mut self.vitals.windowed, false);
@@ -1879,6 +1985,9 @@ impl crate::App {
     }
 
     /// Record each job event the thread handed over on its session's
+    /// timeline: `EVENT <local> job <verdict> job=<id> class=<class> rev=<n>`
+    /// on `subscribe … events` (the timeline's `job-change` row), with
+    /// `task=<id>` for an agent's call and `code=<n>` once it exited.
     fn record_job_events(&mut self) {
         let events = self.vitals.take_job_events();
         for e in events {
@@ -1903,7 +2012,7 @@ impl crate::App {
             timeline
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .record(crate::sys_host::JOB_CHANGE, payload);
+                .record_row(crate::sys_host::JOB_CHANGE, payload);
         }
     }
 
@@ -1921,6 +2030,9 @@ impl crate::App {
     }
 
     /// Adopt a snapshot the thread left, at `now`, record the job events it
+    /// raised, and post its jobs view to the board; with no window in view
+    /// showing the bars (`audience`), name the next reading from that view
+    /// ([`VitalsHost::windowless_due`]).
     fn adopt_vitals(&mut self, audience: Audience, now: Instant, delegated: bool) -> bool {
         let adopted = self.vitals.adopt(now);
         self.record_job_events();
@@ -1950,6 +2062,7 @@ impl crate::App {
     }
 
     /// A new reading for whatever shows one: every Deck asked for a frame,
+    /// the strips' meters, the Fleet Monitor tab.
     fn show_vitals_reading(&mut self) {
         self.redraw_stats_decks();
         self.push_chip_loads();
@@ -1959,6 +2072,9 @@ impl crate::App {
     }
 
     /// Post the adopted snapshot's jobs view to the harness workers' board
+    /// (`VitalsHost`'s: [`crate::vitals_jobs::BOARD`] live), each row's tab
+    /// (the pool session's local id, [`Self::vitals_request`]'s
+    /// `TabRoot::key`) mapped to its session id under one read of the store.
     fn post_jobs_reading(&self) {
         let Some(view) = self
             .vitals
@@ -2069,6 +2185,7 @@ impl crate::App {
     }
 
     /// Ask each window showing the Deck for a frame; the Deck's fingerprint
+    /// decides whether one presents.
     fn redraw_stats_decks(&self) {
         for ws in self.windows.values() {
             if let Some(window) = ws.os_window.as_ref() {
@@ -2078,6 +2195,8 @@ impl crate::App {
     }
 
     /// Every terminal pane the windows hold, in window then tab order:
+    /// `(window id, tab index, the pane's session, its shell's pid, whether
+    /// it is the front tab's focused pane)`.
     fn for_each_pane(&self, mut f: impl FnMut(u64, usize, u64, u32, bool)) {
         let front = self.front_window();
         for (wid, ws) in &self.windows {
@@ -2108,6 +2227,7 @@ impl crate::App {
     }
 
     /// The front window: the frontmost one, which stays put while aterm is in
+    /// the background, else the first.
     fn front_window(&self) -> Option<crate::WindowId> {
         self.frontmost_window
             .filter(|wid| self.windows.contains_key(wid))
@@ -2115,6 +2235,7 @@ impl crate::App {
     }
 
     /// A fingerprint of [`Self::for_each_pane`]'s rows: the layout the thread
+    /// holds changes exactly when this does.
     fn layout_fingerprint(&self) -> u64 {
         use std::hash::{Hash as _, Hasher as _};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -2125,6 +2246,14 @@ impl crate::App {
     }
 
     /// The thread's request at `period` (`machine_only` while hidden): every
+    /// pane's shell and the program in front of it, each its own root (a
+    /// split pane's processes count in that pane), and where each sits (for
+    /// `sys`); each
+    /// agent session's token totals from the Claude Code footer of every pane
+    /// of every tab (v2 §8.1: aterm's rate is over every agent session, split
+    /// or not) keyed to the tab that holds it, and the front tab's plan usage
+    /// (its focused pane's, else its first pane's that has one), all copied
+    /// under each pane's timeline lock.
     fn vitals_request(&self, period: Duration, machine_only: bool) -> Request {
         let mut tabs = Vec::new();
         let mut layout = Vec::new();

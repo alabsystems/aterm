@@ -1,27 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The settings witness: whether a running Claude Code has re-read its
-//! settings since the lab wrote them. Every lab's scratch `settings.json`
-//! carries a `ConfigChange` hook ([`hooks`]), `runs/<tag>/config-change.sh`
-//! ([`script`], written from outside the jail like `apikey.sh`), which appends
-//! the hook's input, one JSON object naming the file, as a line of
-//! `<scratch>/config-change.log`. Claude Code (2.1.306, read from its bundle)
-//! runs the hook when its watcher detects a change to a settings file, and
-//! applies that file's settings, its `env` among them, once the hook returns.
-//! So a line appended after a write shows that the settings Claude Code applies
-//! next are that write's or a later one's.
-//!
-//! A write is no proof of a re-read. Claude Code's watcher sees a change only
-//! when the file event reaches it, and on a loaded machine an event can arrive
-//! late or not at all. On 2026-10-21 the selftest's forced survey card did not
-//! show in 3 runs out of 3. The flag was written 3 s before the turn, and the
-//! lab assumed Claude Code had read it. A fresh lab that wrote the flag 2.5 s
-//! after the composer drew saw no re-read in 60 s, while another that wrote it
-//! 15 s after the composer drew saw it re-read in 1.9 s (`docs/measured/
-//! forever-lab-2026-10-20.md`, H2). So
-//! [`until_reread`] writes, writes again every [`REWRITE_EVERY`] while
-//! nothing answers, and stops at a one-minute hang detector.
+//! The settings witness.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -42,9 +22,7 @@ pub const REWRITE_EVERY: Duration = Duration::from_secs(3);
 /// The hang detector: no re-read this long after the first write ends the wait.
 pub const HANG: Duration = Duration::from_secs(60);
 
-/// The hook's script: the hook's input and a newline appended to `log`, and
-/// exit 0 whatever happened. A hook that fails would draw an error in the tab,
-/// and exit 2 would block the change.
+/// The hook's script.
 #[must_use]
 pub fn script(log: &Path) -> String {
     format!(
@@ -73,9 +51,7 @@ pub fn hooks(script: &Path) -> J {
     )])
 }
 
-/// How many re-reads of `settings` the log records: its lines that hold a
-/// JSON object whose `hook_event_name` is `ConfigChange` and whose
-/// `file_path` is `settings`.
+/// How many re-reads of `settings` the log records.
 #[must_use]
 pub fn rereads(log: &str, settings: &str) -> usize {
     log.lines()
@@ -91,8 +67,7 @@ pub fn rereads(log: &str, settings: &str) -> usize {
 /// A write Claude Code re-read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reread {
-    /// The writes made by the time a line answered (every one the same
-    /// write, so the line may be an earlier one's).
+    /// The writes made by the time a line answered.
     pub writes: u32,
     /// From the first write to the line that answered.
     pub after: Duration,
@@ -122,8 +97,7 @@ impl Wait for WallWait {
     }
 }
 
-/// Advance only when the loop pauses; a delayed test thread changes no
-/// simulated deadline. Real time remains a one-minute hang detector.
+/// Advance only when the loop pauses; a delayed test thread changes no simulated deadline.
 #[cfg(test)]
 pub(crate) struct SteppedWait<F> {
     elapsed: std::cell::Cell<Duration>,
@@ -158,18 +132,7 @@ impl<F: Fn()> Wait for SteppedWait<F> {
     }
 }
 
-/// Run `write` until the witness counts a line it did not count when the
-/// first write was made: `seen` is read once, just after that write, so a line
-/// that lands during it (an older change's) is never the answer. Claude Code
-/// applies the file after the hook that wrote the line returns, so once a
-/// later line comes it applies the first write or a later one. Every write is
-/// the same write, so a line that comes after a rewrite answers too, even one
-/// that lands while the rewrite is being made. While no line comes, the write
-/// is made again every `every`. The wait gives up `hang` after the first
-/// write. `wait` is the clock and the pause between reads; each round reads
-/// the clock once, after the log, so no write follows a reading at or past
-/// `hang`.
-///
+/// Run `write` until the witness counts a line it did not count when the first write was made.
 /// # Errors
 /// `write` failed, the run was interrupted, or nothing answered within `hang`.
 pub(crate) fn until_reread(
@@ -210,14 +173,9 @@ pub(crate) fn until_reread(
     }
 }
 
-/// Set (or, with no value, remove) `key` in the scratch settings' env block
-/// of a lab whose Claude Code is running, and return once Claude Code
-/// re-read the file ([`until_reread`] on the witness's log), written again
-/// every [`REWRITE_EVERY`] and given up [`HANG`] after the first write.
-///
+/// Set (or, with no value, remove) `key` in the scratch settings' env block of a lab whose Claude.
 /// # Errors
-/// The settings could not be written, the run was interrupted, or Claude Code
-/// reported no re-read within [`HANG`].
+/// The settings could not be written.
 pub fn set_env_reread(run: &Run, key: &str, value: Option<&str>) -> Result<Reread, Fail> {
     set_env_reread_with_wait(run, key, value, &WallWait::new())
 }
@@ -255,8 +213,7 @@ mod tests {
     }
 
     /// A line counts when it is a `ConfigChange` naming the lab's settings
-    /// file. NEGATIVE CONTROLS: another file's change, another hook event, a
-    /// line that is not JSON, and an object with no `file_path` count nothing.
+    /// file.
     #[test]
     fn a_reread_is_a_config_change_line_naming_the_settings_file() {
         let ok = line("ConfigChange", SETTINGS);
@@ -322,9 +279,7 @@ mod tests {
 
     /// NEGATIVE CONTROLS: a line that lands during the first write, an older
     /// change's, is no answer when no later line comes, and neither is a log
-    /// that never grows. Both end at the hang detector, at the first step at
-    /// or past `hang`, after a write at every step a multiple of `every`
-    /// before it: `hang / every` writes.
+    /// that never grows.
     #[test]
     fn a_line_from_before_the_write_ends_or_none_at_all_is_no_reread() {
         let made = u32::try_from(HANG.as_millis() / REWRITE_EVERY.as_millis()).unwrap();
@@ -374,9 +329,7 @@ mod tests {
 
     /// No write follows a reading at or past `hang`, even on a clock that
     /// moves between reads: a round reads the clock once, and that reading
-    /// decides both the hang detector and the rewrite. NEGATIVE CONTROL: a
-    /// round that read the clock again for the rewrite wrote after its hang
-    /// check had passed and the clock had reached `hang`.
+    /// decides both the hang detector and the rewrite.
     #[test]
     fn no_write_follows_a_reading_at_or_past_hang() {
         let late: Vec<_> = [1, 1000, 7000]
@@ -410,9 +363,7 @@ mod tests {
 
     /// The hook as the scratch settings carry it: `ConfigChange` runs the
     /// script by its quoted path; the script appends its input and a newline to
-    /// the log and exits 0. NEGATIVE CONTROL: with the log's directory gone it
-    /// still exits 0 (a failing hook would draw an error in the tab) and
-    /// writes nothing.
+    /// the log and exits 0.
     #[test]
     fn the_hook_runs_the_script_which_appends_its_input_and_never_fails() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -432,9 +383,6 @@ mod tests {
             .unwrap()
             .to_string();
         assert_eq!(cmd, format!("'{}'", sh.display()));
-        // The input is a file, not a pipe: the negative control's script exits
-        // without reading it (its redirection fails first), so a write into a
-        // pipe would break whenever the script had already gone.
         let fed = root.path().join("input");
         let run = |log: &Path, input: &str| {
             std::fs::write(&sh, script(log)).unwrap();

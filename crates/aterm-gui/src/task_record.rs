@@ -268,6 +268,9 @@ impl TaskRecord {
 }
 
 /// The folder a carried `trusted_cwd=` names: pct-decoded, absolute, spelled
+/// as its own parts ([`spelled_as_its_parts`]: no `.`, `..`, doubled or
+/// trailing separator), no control character, at most [`RESULT_PATH_MAX`]
+/// bytes — the canonical form the spawn stored.
 fn trusted_folder(value: &str) -> Option<String> {
     let decoded = aterm_codec::pct::decode(value);
     let path = Path::new(&decoded);
@@ -282,6 +285,7 @@ fn trusted_folder(value: &str) -> Option<String> {
 }
 
 /// The agent a worker's `agent=` word names: one a spawn can start
+/// (`aterm_agent::harness::worker::worker_cli`), else none.
 fn worker_agent(word: &str) -> Option<aterm_phase::Program> {
     aterm_phase::Program::ALL
         .into_iter()
@@ -430,6 +434,10 @@ impl TaskMark {
 pub(crate) const RESULT_PATH_MAX: usize = 1024;
 
 /// A `result_path=` value as a path: pct-decoded, at most
+/// [`RESULT_PATH_MAX`] bytes, absolute, spelled the one way its components
+/// spell it (no `.`, no `//`, no trailing `/`; [`spelled_as_its_parts`]), and
+/// naming a file strictly inside `tasks` with no `..` or control character on
+/// the way.
 fn result_path(value: &str, tasks: Option<&Path>) -> Option<PathBuf> {
     let tasks = tasks?;
     let decoded = aterm_codec::pct::decode(value);
@@ -449,6 +457,8 @@ fn result_path(value: &str, tasks: Option<&Path>) -> Option<PathBuf> {
 }
 
 /// Whether `path` is spelled as the path its own components rebuild: byte for
+/// byte off Windows, so a `.`, a `//` or a trailing `/` is a second spelling
+/// of one file.
 fn spelled_as_its_parts(path: &Path) -> bool {
     let rebuilt: PathBuf = path.components().collect();
     #[cfg(windows)]
@@ -674,6 +684,10 @@ pub(crate) fn cmd_result(ctx: &SessionCtx, local_id: u64, rest: &str) -> String 
 }
 
 /// THE MISSED RESULT, KEPT: the record `record` (as `result` read it) marked
+/// again with `found`'s size as its `result_bytes=` — every other fact as it
+/// stands, a new rev, its waiters woken — then the snapshot at `path` and its
+/// sidecar written over with it, so `task`, `await task` and every later
+/// `result` agree.
 fn repair_result(
     ctx: &SessionCtx,
     local_id: u64,
@@ -747,6 +761,7 @@ pub(crate) fn agent_and_attention(ctx: &SessionCtx) -> (&'static str, String) {
 }
 
 /// The `task` reply line for `record`, unterminated: `OK task -` with none,
+/// else `OK task <fields> agent= attention=`.
 fn task_reply(ctx: &SessionCtx, record: Option<&TaskRecord>) -> String {
     let Some(record) = record else {
         return "OK task -".to_string();

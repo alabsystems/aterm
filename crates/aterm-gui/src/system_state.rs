@@ -348,6 +348,8 @@ pub(crate) struct SystemStateApp {
     actions: VecDeque<SystemStateAction>,
     clock: Clock,
     clock_repaint: bool,
+    /// The vault lines' press came before setup's first read: that read takes the preset.
+    vault_sync_on_read: bool,
 }
 
 impl SystemStateApp {
@@ -374,6 +376,7 @@ impl SystemStateApp {
             actions: VecDeque::new(),
             clock: Clock::default(),
             clock_repaint: false,
+            vault_sync_on_read: false,
         }
     }
 
@@ -394,6 +397,7 @@ impl SystemStateApp {
         self.password = Password::default();
         self.clock = Clock::default();
         self.clock_repaint = false;
+        self.vault_sync_on_read = false;
         self.status = SetupStatus::default();
         self.request = Some(request);
         true
@@ -414,6 +418,10 @@ impl SystemStateApp {
             changed = true;
         }
         self.status = status;
+        if self.vault_sync_on_read && self.status.plan.is_some() {
+            self.vault_sync_on_read = false;
+            changed |= self.preset_vault_sync();
+        }
         changed
     }
 
@@ -507,6 +515,39 @@ impl SystemStateApp {
 
     pub(crate) fn needs_attention(&self) -> bool {
         self.status.needs_attention(Some(&self.reviewed_plan()))
+    }
+
+    /// No status has reached this review yet: a tab opened just now.
+    pub(crate) fn unread(&self) -> bool {
+        self.status == SetupStatus::default()
+    }
+
+    /// The vault lines' remedy: the vault row on and every Mac settings row off, the other
+    /// rows and the vault field as they are. Only over setup's own plan, with no edit, offer
+    /// or run in flight, and before a plan is read, on that read; `true` when a row changed.
+    pub(crate) fn preset_vault_sync(&mut self) -> bool {
+        if self.status.busy || self.request.is_some() || self.has_unsubmitted_changes() {
+            return false;
+        }
+        if self.status.plan.is_none() {
+            self.vault_sync_on_read = true;
+            return false;
+        }
+        let before = self.plan.selection;
+        self.plan.selection.set(Setting::Secrets, true);
+        for setting in Setting::ALL.into_iter().filter(|s| s.is_workstation()) {
+            self.plan.selection.set(setting, false);
+        }
+        self.plan.selection != before
+    }
+
+    /// The review's rows are the vault sync's: the vault row on, every Mac settings row off.
+    pub(crate) fn shows_vault_sync(&self) -> bool {
+        let on = |setting| self.plan.selection.contains(setting);
+        on(Setting::Secrets)
+            && !Setting::ALL
+                .into_iter()
+                .any(|s| s.is_workstation() && on(s))
     }
 
     fn apply(&mut self) {
@@ -1811,6 +1852,113 @@ mod tests {
         assert_eq!(app.url.value(), "http://draft.local:7484/v1/team");
         assert_eq!(app.password.projection().text, "•".repeat(13));
         assert!(!app.pending());
+    }
+
+    /// The vault lines' preset turns the vault row on and the Mac settings rows off over
+    /// setup's own plan, keeps every other row and the vault field, queues nothing, waits
+    /// for the first read when none came yet, and moves nothing over an edit, under an offer
+    /// or while a run holds it.
+    #[test]
+    fn the_vault_sync_preset_moves_only_its_rows_and_never_over_an_edit_an_offer_or_a_run() {
+        let mut read = Plan::default();
+        read.selection.set(Setting::Secrets, false);
+        read.selection.set(Setting::Repositories, false);
+        read.vault_url = "https://vault.example/v1/team".into();
+        let fresh = || {
+            let mut app = SystemStateApp::new(Plan::default());
+            app.publish(SetupStatus {
+                plan: Some(read.clone()),
+                ..SetupStatus::default()
+            });
+            app
+        };
+
+        let read_now = |busy| SetupStatus {
+            plan: Some(read.clone()),
+            busy,
+            ..SetupStatus::default()
+        };
+        let mut unread = SystemStateApp::new(Plan::default());
+        assert!(!unread.preset_vault_sync(), "no plan read yet");
+        assert_eq!(unread.reviewed_plan(), Plan::default());
+        assert!(unread.publish(read_now(false)));
+        assert!(unread.shows_vault_sync(), "the first read takes the preset");
+        assert_eq!(unread.reviewed_plan().vault_url, read.vault_url);
+        let mut held = SystemStateApp::new(Plan::default());
+        assert!(!held.preset_vault_sync());
+        held.publish(read_now(true));
+        held.publish(read_now(false));
+        held.publish(read_now(false));
+        assert_eq!(
+            held.reviewed_plan(),
+            read,
+            "a read a run holds ends the wait"
+        );
+        let (send, _receive) = mpsc::channel();
+        let mut left = SystemStateApp::new(Plan::default());
+        assert!(!left.preset_vault_sync());
+        let request = Request::new(read.clone(), send);
+        assert!(left.offer(request.clone()));
+        request.finish(WorkstationSetupDecision::Cancel);
+        left.tick(Instant::now(), false);
+        left.publish(read_now(false));
+        assert_eq!(
+            left.reviewed_plan(),
+            read,
+            "an offer in between ends the wait"
+        );
+
+        let mut app = fresh();
+        assert!(!app.shows_vault_sync());
+        assert!(app.preset_vault_sync());
+        assert!(app.shows_vault_sync());
+        for setting in Setting::ALL {
+            let on = !setting.is_workstation() && setting != Setting::Repositories;
+            assert_eq!(app.plan.selection.contains(setting), on, "{setting:?}");
+        }
+        assert_eq!(app.reviewed_plan().vault_url, read.vault_url);
+        assert!(app.actions.is_empty() && !app.status.busy, "never an Apply");
+
+        type Edit = fn(&mut SystemStateApp);
+        let edits: [(&str, Edit); 3] = [
+            ("row", |app| {
+                app.plan.selection.set(Setting::Spotlight, false)
+            }),
+            ("vault", |app| {
+                app.url.select_all();
+                app.url.insert("http://draft.local/v1");
+            }),
+            ("password", |app| {
+                app.password
+                    .input(TextInputEvent::Commit("inert".to_owned()));
+            }),
+        ];
+        for (edit, apply) in edits {
+            let mut app = fresh();
+            apply(&mut app);
+            let edited = app.reviewed_plan();
+            assert!(!app.preset_vault_sync(), "{edit}");
+            assert_eq!(app.reviewed_plan(), edited, "{edit}");
+        }
+
+        let mut busy = fresh();
+        busy.publish(SetupStatus {
+            plan: Some(read.clone()),
+            busy: true,
+            ..SetupStatus::default()
+        });
+        assert!(!busy.preset_vault_sync());
+        assert_eq!(busy.reviewed_plan(), read);
+
+        let (send, _receive) = mpsc::channel();
+        let mut offered = SystemStateApp::new(Plan::default());
+        assert!(offered.offer(Request::new(read.clone(), send)));
+        offered.publish(SetupStatus {
+            plan: Some(read.clone()),
+            ..SetupStatus::default()
+        });
+        assert!(!offered.preset_vault_sync());
+        assert_eq!(offered.reviewed_plan(), read);
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub const NAMED_PATHS: usize = 3;
 pub const STATE_FILES: usize = 4096;
 
 /// The longest path, in characters, a finding names whole: a longer one
+/// keeps its last characters after `…`.
 const PATH_CHARS: usize = 72;
 
 /// WHAT ONE REPOSITORY HOLDS THAT NO REMOTE MAIN HAS ([`probe`]).
@@ -157,6 +158,241 @@ impl RepoWork {
     }
 }
 
+/// REPOSITORY HYGIENE & DRIFT FROM `origin/main` ([`probe_hygiene`]): how far
+/// `HEAD` has drifted from the target main branch (`ahead` / `behind`), local
+/// unsynced work (`changed`, `untracked`, `stashes`, `unpushed`), how many
+/// worktrees are attached, which local branches are diverging
+/// (`unmerged_branches`) or already merged and stale (`stale_branches`), and
+/// disk space accumulated in worktrees, temp/build directories, and drive free space.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoHygiene {
+    /// Target main branch (`origin/main`, `origin/master`, or local `main`),
+    /// empty where none is known.
+    pub main_ref: String,
+    /// Commits on `HEAD` not in `main_ref`.
+    pub ahead: usize,
+    /// Commits on `main_ref` not in `HEAD`.
+    pub behind: usize,
+    /// Tracked paths with uncommitted changes.
+    pub changed: usize,
+    /// Untracked paths git does not ignore.
+    pub untracked: usize,
+    /// Stash entries on the current branch.
+    pub stashes: usize,
+    /// Commits on `HEAD` no remote-tracking ref contains.
+    pub unpushed: usize,
+    /// Total worktrees attached to this repository.
+    pub worktrees: usize,
+    /// Local branches with commits not yet merged into `main_ref`.
+    pub unmerged_branches: Vec<String>,
+    /// Local branches already merged into `main_ref` (besides `main`/`master`
+    /// and the current branch) that can be cleaned up.
+    pub stale_branches: Vec<String>,
+    /// Bytes held across linked worktrees of this repository.
+    pub worktree_bytes: u64,
+    /// Bytes held in temp / build directories (`target*`, `*.noindex`) of this repo.
+    pub temp_bytes: u64,
+    /// Free bytes available on the drive holding this repository.
+    pub drive_free_bytes: Option<u64>,
+}
+
+fn join_named(names: &[String], cap: usize) -> String {
+    let shown: Vec<&str> = names.iter().take(cap).map(String::as_str).collect();
+    if names.len() > cap {
+        format!("{}, \u{2026}", shown.join(", "))
+    } else {
+        shown.join(", ")
+    }
+}
+
+impl RepoHygiene {
+    /// Parse `git` outputs into [`RepoHygiene`]:
+    /// - `ahead_behind`: `git rev-list --left-right --count <main_ref>...HEAD`
+    ///   (`"<behind>\t<ahead>"`)
+    /// - `worktree_list`: `git worktree list --porcelain`
+    /// - `unmerged`: `git for-each-ref --no-merged=<main_ref> --format=%(refname:short) refs/heads`
+    /// - `merged`: `git for-each-ref --merged=<main_ref> --format=%(refname:short) refs/heads`
+    #[must_use]
+    pub fn of_git(
+        main_ref: &str,
+        branch: Option<&str>,
+        ahead_behind: &str,
+        worktree_list: &str,
+        unmerged: &str,
+        merged: &str,
+    ) -> Self {
+        let mut parts = ahead_behind.split_whitespace();
+        let behind = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let ahead = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let worktrees = worktree_list
+            .lines()
+            .filter(|l| l.starts_with("worktree "))
+            .count()
+            .max(usize::from(!worktree_list.trim().is_empty()));
+        let is_trunk = |b: &str| matches!(b, "main" | "master");
+        let unmerged_branches = unmerged
+            .lines()
+            .map(str::trim)
+            .filter(|b| !b.is_empty() && !is_trunk(b))
+            .map(printable)
+            .collect();
+        let stale_branches = merged
+            .lines()
+            .map(str::trim)
+            .filter(|b| !b.is_empty() && !is_trunk(b) && Some(*b) != branch)
+            .map(printable)
+            .collect();
+        Self {
+            main_ref: printable(main_ref.trim()),
+            ahead,
+            behind,
+            changed: 0,
+            untracked: 0,
+            stashes: 0,
+            unpushed: 0,
+            worktrees,
+            unmerged_branches,
+            stale_branches,
+            worktree_bytes: 0,
+            temp_bytes: 0,
+            drive_free_bytes: None,
+        }
+    }
+
+    /// Attach local unsynced counts (`status`, `stash`, `unpushed`) and disk usage figures.
+    #[must_use]
+    pub fn with_local_and_disk(
+        mut self,
+        status: &str,
+        stash: &str,
+        unpushed: usize,
+        worktree_bytes: u64,
+        temp_bytes: u64,
+        drive_free_bytes: Option<u64>,
+    ) -> Self {
+        if let Some(work) = RepoWork::of_git("/r", status, stash, unpushed, 0, "") {
+            self.changed = work.changed;
+            self.untracked = work.untracked;
+            self.stashes = work.stashes;
+            self.unpushed = work.unpushed;
+        }
+        self.worktree_bytes = worktree_bytes;
+        self.temp_bytes = temp_bytes;
+        self.drive_free_bytes = drive_free_bytes;
+        self
+    }
+
+    fn unsynced_parts(&self) -> Vec<String> {
+        let mut parts = Vec::new();
+        if self.changed > 0 {
+            parts.push(format!("{} changed", self.changed));
+        }
+        if self.untracked > 0 {
+            parts.push(format!("{} untracked", self.untracked));
+        }
+        if self.unpushed > 0 {
+            parts.push(format!("{} unpushed", self.unpushed));
+        }
+        if self.stashes > 0 {
+            parts.push(format!(
+                "{} stash{}",
+                self.stashes,
+                if self.stashes == 1 { "" } else { "es" }
+            ));
+        }
+        parts
+    }
+
+    fn disk_parts(&self) -> Vec<String> {
+        let mut parts = Vec::new();
+        if self.worktree_bytes > 0 {
+            parts.push(format!(
+                "worktrees {}",
+                super::disk::human_bytes(self.worktree_bytes)
+            ));
+        }
+        if self.temp_bytes > 0 {
+            parts.push(format!(
+                "build/temp {}",
+                super::disk::human_bytes(self.temp_bytes)
+            ));
+        }
+        if let Some(free) = self.drive_free_bytes {
+            parts.push(format!("{} free", super::disk::human_bytes(free)));
+        }
+        parts
+    }
+
+    /// Compact note rows for the Branch & Hygiene menu (`crate::fact_menu`):
+    /// drift against `origin/main` + unsynced local work first, then worktree and
+    /// branch accumulation, then disk & drive space when present.
+    #[must_use]
+    pub fn notes(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let unsynced = self.unsynced_parts();
+        if !self.main_ref.is_empty() {
+            let mut drift = match (self.ahead, self.behind) {
+                (0, 0) if unsynced.is_empty() => {
+                    format!("\u{2713}  in sync with {}", self.main_ref)
+                }
+                (0, 0) => format!("on {}", self.main_ref),
+                (a, 0) => format!("\u{2191}{a} ahead of {}", self.main_ref),
+                (0, b) => format!("\u{2193}{b} behind {}", self.main_ref),
+                (a, b) => format!(
+                    "\u{2191}{a} ahead \u{b7} \u{2193}{b} behind {}",
+                    self.main_ref
+                ),
+            };
+            if !unsynced.is_empty() {
+                drift = format!("{drift} \u{b7} {}", unsynced.join(", "));
+            }
+            out.push(drift);
+        } else if !unsynced.is_empty() {
+            out.push(unsynced.join(" \u{b7} "));
+        }
+        let wt = self.worktrees.max(1);
+        let mut hygiene = vec![format!("{wt} worktree{}", if wt == 1 { "" } else { "s" })];
+        if !self.unmerged_branches.is_empty() {
+            hygiene.push(format!(
+                "{} unmerged ({})",
+                self.unmerged_branches.len(),
+                join_named(&self.unmerged_branches, 2)
+            ));
+        }
+        if !self.stale_branches.is_empty() {
+            hygiene.push(format!(
+                "{} stale ({})",
+                self.stale_branches.len(),
+                join_named(&self.stale_branches, 2)
+            ));
+        } else if self.unmerged_branches.is_empty() {
+            hygiene.push("no stale branches".to_string());
+        }
+        out.push(format!("\u{2387}  {}", hygiene.join(" \u{b7} ")));
+        let disk = self.disk_parts();
+        if !disk.is_empty() {
+            out.push(format!("\u{26c1}  {}", disk.join(" \u{b7} ")));
+        }
+        out
+    }
+
+    /// Compact note rows for the Folder (`Fact::Path`) menu: worktrees, temp/build
+    /// disk space, drive free space, and unsynced local file counts.
+    #[must_use]
+    pub fn folder_notes(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let wt = self.worktrees.max(1);
+        let mut disk = vec![format!("{wt} worktree{}", if wt == 1 { "" } else { "s" })];
+        disk.extend(self.disk_parts());
+        out.push(format!("\u{26c1}  {}", disk.join(" \u{b7} ")));
+        let unsynced = self.unsynced_parts();
+        if !unsynced.is_empty() {
+            out.push(format!("\u{2387}  {}", unsynced.join(" \u{b7} ")));
+        }
+        out
+    }
+}
+
 /// THE DIRECTORY THE SESSION WORKS IN, for [`probe`]: the last `cwd` the conversation's transcript tail `tail` records (Claude Code writes the shell's working directory on each row, so a `cd` into a worktree moves it), else the directory the agent was started in (`started`, the process's own).
 #[must_use]
 pub fn session_dir(started: &str, tail: Option<&str>) -> Option<std::path::PathBuf> {
@@ -293,6 +529,267 @@ pub fn probe_with(
     Some(work)
 }
 
+/// Probe repository hygiene and drift from `origin/main` (or local `main`) at
+/// `dir`, within `limit`: unattended and bounded by the same rules as [`probe`].
+#[must_use]
+pub fn probe_hygiene(dir: &Path, home: Option<&Path>, limit: Duration) -> Option<RepoHygiene> {
+    let home = home?;
+    if atpkg::protected::under_protected_root(home, dir) {
+        return None;
+    }
+    let reads = Reads {
+        deadline: Instant::now().checked_add(limit)?,
+        home,
+        xdg: None,
+    };
+    let reads = &reads;
+    let table = aterm_sysprobe::volumes::table();
+    let dir = unattended_dir(dir, Some(home), &table)?;
+    let top = git(&dir, &["rev-parse", "--show-toplevel"], reads)?;
+    let top = top.trim_end_matches(['\n', '\r']);
+    if top.is_empty() {
+        return None;
+    }
+    let root = unattended_dir(Path::new(top), Some(home), &table)?;
+    let branch = git(
+        &root,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        reads,
+    )
+    .map(|b| b.trim().to_string())
+    .filter(|b| !b.is_empty());
+    let target_full = main_ref(&root, reads).or_else(|| {
+        ["refs/heads/main", "refs/heads/master"]
+            .into_iter()
+            .map(str::to_string)
+            .find(|full| {
+                git(
+                    &root,
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        &format!("{full}^{{commit}}"),
+                    ],
+                    reads,
+                )
+                .is_some()
+            })
+    });
+    let target_short = target_full
+        .as_deref()
+        .map(|f| {
+            f.strip_prefix("refs/remotes/")
+                .or_else(|| f.strip_prefix("refs/heads/"))
+                .unwrap_or(f)
+        })
+        .unwrap_or_default();
+    let ahead_behind = target_full
+        .as_deref()
+        .and_then(|full| {
+            git(
+                &root,
+                &[
+                    "rev-list",
+                    "--left-right",
+                    "--count",
+                    &format!("{full}...HEAD"),
+                ],
+                reads,
+            )
+        })
+        .unwrap_or_default();
+    let worktree_list = git(&root, &["worktree", "list", "--porcelain"], reads).unwrap_or_default();
+    let (unmerged, merged) = match target_full.as_deref() {
+        Some(full) => (
+            git(
+                &root,
+                &[
+                    "for-each-ref",
+                    &format!("--no-merged={full}"),
+                    "--format=%(refname:short)",
+                    "refs/heads",
+                ],
+                reads,
+            )
+            .unwrap_or_default(),
+            git(
+                &root,
+                &[
+                    "for-each-ref",
+                    &format!("--merged={full}"),
+                    "--format=%(refname:short)",
+                    "refs/heads",
+                ],
+                reads,
+            )
+            .unwrap_or_default(),
+        ),
+        None => (String::new(), String::new()),
+    };
+    let status = git(
+        &root,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
+        reads,
+    )
+    .unwrap_or_default();
+    let stash = git(&root, &["stash", "list", "--format=%gs"], reads).unwrap_or_default();
+    let stash = stashes_on(&stash, branch.as_deref());
+    let remotes = git(
+        &root,
+        &[
+            "for-each-ref",
+            "--count=1",
+            "--format=%(refname)",
+            "refs/remotes",
+        ],
+        reads,
+    )
+    .unwrap_or_default();
+    let unpushed = if remotes.trim().is_empty() {
+        0
+    } else {
+        git(
+            &root,
+            &["rev-list", "--count", "HEAD", "--not", "--remotes"],
+            reads,
+        )
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or(0)
+    };
+    let (worktree_bytes, temp_bytes) = probe_hygiene_disk(&root, &worktree_list, &table, reads);
+    let drive_free_bytes = super::disk::volume_of(&root, &table).ok().map(|r| r.free);
+    Some(
+        RepoHygiene::of_git(
+            target_short,
+            branch.as_deref(),
+            &ahead_behind,
+            &worktree_list,
+            &unmerged,
+            &merged,
+        )
+        .with_local_and_disk(
+            &status,
+            &stash,
+            unpushed,
+            worktree_bytes,
+            temp_bytes,
+            drive_free_bytes,
+        ),
+    )
+}
+
+const HYGIENE_WALK_CAP: usize = 8_000;
+
+fn is_temp_or_build_dir_name(name: &str) -> bool {
+    name == "target"
+        || name.starts_with("target-")
+        || name.starts_with("target.")
+        || name.ends_with(".noindex")
+        || name.starts_with(".tmp")
+}
+
+fn probe_hygiene_disk(
+    root: &Path,
+    worktree_list: &str,
+    table: &aterm_sysprobe::volumes::Table,
+    reads: &Reads<'_>,
+) -> (u64, u64) {
+    let mut budget = HYGIENE_WALK_CAP;
+    let mut wt_total = 0u64;
+    let mut temp_total = 0u64;
+
+    if let Ok(rd) = std::fs::read_dir(root) {
+        for entry in rd.flatten() {
+            if Instant::now() >= reads.deadline || budget == 0 {
+                break;
+            }
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if is_temp_or_build_dir_name(name)
+                && let Some(safe) = unattended_dir(&path, Some(reads.home), table)
+            {
+                temp_total = temp_total.saturating_add(bounded_dir_bytes(
+                    &safe,
+                    reads.deadline,
+                    &mut budget,
+                    false,
+                    &mut 0,
+                ));
+            }
+        }
+    }
+
+    for wt_path in worktree_list
+        .lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .skip(1)
+    {
+        if Instant::now() >= reads.deadline || budget == 0 {
+            break;
+        }
+        let Some(safe) = unattended_dir(Path::new(wt_path.trim()), Some(reads.home), table) else {
+            continue;
+        };
+        let mut wt_temp = 0u64;
+        let bytes = bounded_dir_bytes(&safe, reads.deadline, &mut budget, true, &mut wt_temp);
+        wt_total = wt_total.saturating_add(bytes);
+        if wt_temp > 0 {
+            temp_total = temp_total.saturating_add(wt_temp);
+        }
+    }
+
+    (wt_total, temp_total)
+}
+
+fn bounded_dir_bytes(
+    dir: &Path,
+    deadline: Instant,
+    budget: &mut usize,
+    split_temp: bool,
+    temp_out: &mut u64,
+) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![(dir.to_path_buf(), false)];
+    while let Some((d, in_temp)) = stack.pop() {
+        if Instant::now() >= deadline || *budget == 0 {
+            break;
+        }
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            if *budget == 0 || Instant::now() >= deadline {
+                break;
+            }
+            *budget -= 1;
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                let path = entry.path();
+                let child_temp = in_temp
+                    || (split_temp
+                        && path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(is_temp_or_build_dir_name));
+                stack.push((path, child_temp));
+            } else if in_temp {
+                *temp_out = temp_out.saturating_add(meta.len());
+            } else {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    total
+}
+
 /// THE WORK'S STATE ([`RepoWork::state`]) of the repository at `root`: `head` its `HEAD` commit (empty where it has none), `stash` its branch's stash entries ([`stashes_on`]), `listed` the NUL-separated `git status --porcelain -z --untracked-files=all`, each entry hashed with its status code and the file's size and modification time (`-` for a path with no file, a deletion).
 #[must_use]
 pub fn state_of(root: &Path, head: &str, stash: &str, listed: &str) -> Option<u64> {
@@ -338,6 +835,9 @@ pub fn stashes_on(list: &str, branch: Option<&str>) -> String {
 }
 
 /// WHETHER THE REPOSITORY AT `root` SETS ITS OWN `core.excludesFile`: its
+/// own configuration (`git config --includes --get`, the system and global
+/// files shut out as for every read here, so the local file, a worktree's and
+/// what they include answer).
 fn own_excludes(root: &Path, reads: &Reads<'_>) -> bool {
     git(
         root,
@@ -348,6 +848,11 @@ fn own_excludes(root: &Path, reads: &Reads<'_>) -> bool {
 }
 
 /// THE PERSON'S GLOBAL EXCLUDES FILE, which the probe's `git` — run with no
+/// global configuration (the module's rules) — would not read:
+/// `core.excludesFile` as their global configuration sets it, the files it
+/// includes followed (`git config --global --includes --path --get`, with
+/// their home and `XDG_CONFIG_HOME` and nothing else), else Git's default,
+/// `<xdg>/git/ignore` (`<home>/.config/git/ignore` where `xdg` is unset).
 fn global_excludes(
     root: &Path,
     table: &aterm_sysprobe::volumes::Table,
@@ -383,6 +888,9 @@ fn global_excludes(
 }
 
 /// THE REMOTE'S DEFAULT BRANCH in the repository at `root`, as a full ref,
+/// for [`RepoWork::unlanded`]: `refs/remotes/origin/HEAD`'s target, else
+/// `refs/remotes/origin/main`, else `refs/remotes/origin/master` — the first
+/// that names a commit.
 fn main_ref(root: &Path, reads: &Reads<'_>) -> Option<String> {
     let head = git(
         root,
@@ -409,6 +917,7 @@ fn main_ref(root: &Path, reads: &Reads<'_>) -> Option<String> {
 }
 
 /// Resolve the home and path before applying the lexical protected-root
+/// predicate.
 fn unattended_dir(
     dir: &Path,
     home: Option<&Path>,
@@ -436,16 +945,23 @@ fn git(dir: &Path, args: &[&str], reads: &Reads<'_>) -> Option<String> {
 }
 
 /// What every read of one probe shares ([`git`]): its deadline, and the
+/// person's home and `XDG_CONFIG_HOME`.
 struct Reads<'a> {
     /// Every child shares it; expired calls do not start.
     deadline: Instant,
     /// The person's home: every read's `HOME`, so a `~/` in a path the
+    /// repository's own configuration names expands as in their own `git`
+    /// (with none, Git dies on it at the first read: `fatal: failed to
+    /// expand user dir`, and the probe found nothing).
     home: &'a Path,
     /// The person's `XDG_CONFIG_HOME` (absolute), for [`global_excludes`]'s
+    /// read alone.
     xdg: Option<&'a Path>,
 }
 
 /// [`git`], or with `global` the one read of the person's global
+/// configuration [`global_excludes`] makes: their `XDG_CONFIG_HOME` set, the
+/// global configuration not shut out.
 fn git_as(dir: &Path, args: &[&str], reads: &Reads<'_>, global: bool) -> Option<String> {
     let deadline = reads.deadline;
     if Instant::now() >= deadline {

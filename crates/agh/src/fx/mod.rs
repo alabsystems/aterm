@@ -55,6 +55,7 @@ enum Seam {
     #[cfg(any(test, debug_assertions))]
     Simulated(sim::SimClock),
     /// The OS, every door taped through `sink`; the Fx keeps its own clone of the sink to
+    /// finish the file.
     Recording {
         /// The recording seam, which owns one clone of the sink.
         seam: Mutex<RecordingSeam<OsEffects, tape::TapeSink>>,
@@ -71,6 +72,7 @@ enum Seam {
         live: String,
     },
     /// A tape's exchanges and clocks, answered in order and taped again into `to`, with this
+    /// run's own emits.
     Rerecording {
         /// The replay seam over the old tape's records, less its emits.
         from: Mutex<ReplaySeam>,
@@ -78,7 +80,7 @@ enum Seam {
         len: usize,
         /// The new tape.
         to: tape::TapeSink,
-        /// The `next` of a divergence: `record it live: agh --record NEW {argv}`. Rerecording
+        /// The `next` of a divergence: `record it live: agh --record NEW {argv}`.
         live: String,
     },
 }
@@ -91,6 +93,7 @@ pub struct Fx {
 }
 
 /// A lock, through a poisoned one: a panicking door leaves no state half-made that the next
+/// door could misread, because each door's record is written in one call.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -104,6 +107,7 @@ fn infallible<T>(read: std::result::Result<T, std::convert::Infallible>) -> T {
 }
 
 /// One round trip whose body is read whole under `req.limit`: the status, the headers cut by
+/// `cut`, and the body.
 fn read_whole(
     transport: &dyn Transport,
     mut req: WireRequest<'_>,
@@ -121,6 +125,8 @@ fn read_whole(
 }
 
 /// A taped answer as the pipeline reads it, its headers `canon::keep`'s as in every mode: a
+/// tape this build did not write (edited by hand, or from a build that keeps more) delivers
+/// no header a live run would have dropped.
 fn kept_response(endpoints: &Endpoints, reply: canon::Reply) -> WireResponse {
     canon::Reply {
         headers: canon::keep(endpoints, reply.headers),
@@ -135,6 +141,7 @@ fn sleep_request(d: Duration) -> Vec<u8> {
 }
 
 /// A replay seam's divergence as agh's error: `Replay::of`, the text through
+/// `Redactor::shapes`.
 fn diverged(d: &ReplayDivergence) -> Error {
     Error::replay(Replay::of(d), Redactor::shapes(&d.to_string()))
 }
@@ -149,6 +156,8 @@ fn stream_not_taped() -> Error {
 }
 
 /// `ReplaySeam::finish`'s refusal of a tape of `len` records: its `Unreached { position, .. }`
+/// through `Replay::of` (→ `Unconsumed`), why `the tape holds {n} more records after the run's
+/// exit`.
 fn ended(d: &ReplayDivergence, len: usize) -> Error {
     match d {
         ReplayDivergence::Unreached { position, .. } => Error::replay(
@@ -163,6 +172,7 @@ fn ended(d: &ReplayDivergence, len: usize) -> Error {
 }
 
 /// `Replay::StreamNotTaped` for a recorded request the shapes would change: its tape would
+/// hold another question than the one a replay asks.
 fn shaped_request() -> Error {
     Error::replay(
         Replay::StreamNotTaped,
@@ -172,6 +182,7 @@ fn shaped_request() -> Error {
 }
 
 /// `Replay::BodyNotTaped` for an answer the shapes would change: its replay would answer the
+/// redacted bytes, and render other stdout than this run.
 fn shaped_reply() -> Error {
     Error::replay(
         Replay::BodyNotTaped,
@@ -182,6 +193,7 @@ fn shaped_reply() -> Error {
 }
 
 /// `arg` as one POSIX shell word: as it is when every byte is in `[A-Za-z0-9_./:=@%+,-]` and
+/// it is not empty, else in single quotes, each `'` written `'\''`.
 fn shell_word(arg: &str) -> String {
     let plain = |b: u8| b.is_ascii_alphanumeric() || b"_./:=@%+,-".contains(&b);
     if !arg.is_empty() && arg.bytes().all(plain) {
@@ -191,6 +203,7 @@ fn shell_word(arg: &str) -> String {
 }
 
 /// The `next` of a seam divergence under a tape: `record it live: agh --record NEW {argv}`,
+/// each argument of `header.argv` one POSIX shell word.
 fn live_next(header: &tape::TapeHeader) -> String {
     let mut live = String::from("record it live: agh --record NEW");
     for arg in &header.argv {
@@ -378,6 +391,7 @@ impl Fx {
     }
 
     /// Keep `e` as the latch's error when it is a replay's (`Sub::Replay`) and the latch is
+    /// empty; hand back the latch's error, so every door after the first answers that one.
     fn latch(&self, e: Error) -> Error {
         if !matches!(e.sub, Sub::Replay(_)) {
             return e;

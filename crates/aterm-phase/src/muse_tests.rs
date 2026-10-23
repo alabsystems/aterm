@@ -3413,3 +3413,209 @@ fn the_message_that_opened_the_turn_is_read_off_its_row() {
     assert!(said_tail(&cut).is_some(), "{cut:#?}");
     assert_eq!(turn_opened_by(&cut), None);
 }
+
+/// Muse Code's `◆` tool rows that draw no outcome branch are no words of the agent's (I3 of
+/// `docs/measured/idle-no-evidence-2026-10-22.md`): every `◆ Fetched <url> — denied`, `◆
+/// Fetched <url> — 404` and `◆ Invalid work ID — rejected · ctrl+o` the captures measured is a
+/// tool row, and a turn ended on one said no words. NEGATIVE CONTROLS, the agent's words: a reply
+/// that opens with either head and goes on; `Fetched` and a word, not a URL (`Fetched both.`,
+/// a regression of the first grammar, which took any token); a `Fetched <url>` row with lines
+/// under it, its `NEEDS YOU:` and `Nothing left:` read; three characters not digits as a status;
+/// a status after `Invalid work ID` or `Wrote`. MUTANTS: without [`bare_tool_row`] the measured
+/// rows are words; any token for the URL, or a bare row with lines under it, drops the words;
+/// any three characters as a status; a status on `Invalid work ID` or on every head.
+#[test]
+fn muse_codes_unbranched_tool_rows_are_no_words_of_the_agents() {
+    let rows = screen(END_OF_TURN_1_4_10);
+    let reply = "◆ Hi! I am the local lab stub";
+    let mut measured = Vec::new();
+    for (name, text) in captures() {
+        for row in screen(&text) {
+            let Some(head) = row.strip_prefix("◆ ") else {
+                continue;
+            };
+            if head.starts_with("Fetched ") || head.starts_with("Invalid work ID") {
+                assert!(tool_row(head), "{name}: {head}");
+                let ended = edited(&rows, reply, &row);
+                assert_eq!(phase(&ended), (Phase::Idle, true), "{name}: {head}");
+                assert_eq!(said_tail(&ended), None, "{name}: {head}");
+                measured.push(head.to_string());
+            }
+        }
+    }
+    for head in [
+        "Fetched http://127.0.0.1:50581/lab-probe — denied",
+        "Fetched http://127.0.0.1:50581/lab-probe-approved — 404",
+        "Invalid work ID — rejected · ctrl+o",
+    ] {
+        assert!(
+            measured.iter().any(|m| m == head),
+            "measured: {measured:#?}"
+        );
+    }
+    // NEGATIVE CONTROLS: the agent's words.
+    for said in [
+        "Fetched the page; the parser is done.",
+        "Fetched http://127.0.0.1:50581/lab-probe — denied, so I stopped there.",
+        "Fetched http://127.0.0.1:50581/lab-probe — 4044",
+        "Invalid work ID was the bug, and it is fixed.",
+        "Invalid work ID — rejected because the id was stale. Shall I retry?",
+        "Wrote notes.md — 404",
+        "Fetched http://127.0.0.1:50581/lab-probe — maybe",
+        "Fetched both.",
+        "Fetched origin — denied",
+        "Fetched http://127.0.0.1:50581/lab-probe — ok.",
+        "Invalid work ID — 404",
+    ] {
+        assert!(!tool_row(said), "{said}");
+        let ended = edited(&rows, reply, &format!("◆ {said}"));
+        assert_eq!(said_tail(&ended).as_deref(), Some(said), "{said}");
+        assert!(
+            matches!(phase(&ended), (Phase::Idle | Phase::Question, true)),
+            "{said}"
+        );
+    }
+    // A reply whose first line reads like the row, with its words under it (the review's live
+    // screen, `rv`: `◆ Fetched both.` over `NEEDS YOU:` and `Nothing left:`).
+    for first in ["Fetched both.", "Fetched https://example.com/spec."] {
+        let mut ended = edited(&rows, reply, &format!("◆ {first}"));
+        let at = ended
+            .iter()
+            .position(|r| r == &format!("◆ {first}"))
+            .expect("the reply");
+        for (k, row) in [
+            "",
+            "  NEEDS YOU: the deploy key for prod, which only you hold.",
+            "",
+            "  Nothing left: the parser is committed and pushed to origin/main.",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ended.insert(at + 1 + k, row.to_string());
+        }
+        assert_eq!(
+            said_tail(&ended).as_deref(),
+            Some(
+                format!(
+                    "{first}\nNEEDS YOU: the deploy key for prod, which only you hold.\n\
+                     Nothing left: the parser is committed and pushed to origin/main."
+                )
+                .as_str()
+            ),
+            "{ended:#?}"
+        );
+    }
+}
+
+/// THE NEXT PROMPT QUEUED UNDER A REPLY IS NO PART OF THE TURN, AND THE RUN IT STEERS GOES ON
+/// (`docs/measured/idle-no-evidence-2026-10-22.md` I4). Measured live
+/// ([`fixtures::QUEUED_INPUT`]): the reply drawn whole, `◆ Queued input · ↑ to edit` over the
+/// prompt's branch under it, and the footer's right `steering the running turn`. The run has
+/// not ended (Muse Code drains the queue when it does), so the screen reads busy; and the reply
+/// is the turn's end once the footer rests, its last line named. Before, the queued block was
+/// the turn's last (a branched `◆` row: Muse Code's own) and the screen idle as evidence with
+/// no words: 26 of 33 harness points at such ends said `-`. NEGATIVE CONTROLS: the footer at
+/// rest, its words mid-row, or `no active run` is no run going on; a reply that opens `Queued
+/// input` and goes on is the agent's words. MUTANTS: without the queued literal in
+/// [`is_own_row_head`] the end names no words; without [`steering`] the screen reads idle.
+#[test]
+fn a_queued_prompt_is_no_part_of_the_turn_and_its_run_goes_on() {
+    let rows = screen(QUEUED_INPUT);
+    assert!(
+        rows.iter().any(|r| r == "◆ Queued input · ↑ to edit"),
+        "measured"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r == "└ write the landing report round 2")
+    );
+    let footer = rows
+        .iter()
+        .rposition(|r| r.contains("· Auto-review"))
+        .expect("the footer");
+    assert!(rows[footer].ends_with("  steering the running turn"));
+    assert_eq!(phase(&rows), (Phase::Busy, false), "the run goes on");
+    assert_eq!(muse(QUEUED_INPUT).phase, Phase::Busy);
+    let at_rest = |words: &str| {
+        let mut r = rows.clone();
+        r[footer] = format!("  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review{words}");
+        r
+    };
+    let words = "Here is the report.\n• check 1 passed\n• check 2 passed\n\
+                 Nothing left: the parser is committed and pushed to origin/main.";
+    for rest in ["", "    no active run", " steering the running turn"] {
+        let ended = at_rest(rest);
+        assert_eq!(phase(&ended), (Phase::Idle, true), "{rest:?}");
+        assert_eq!(said_tail(&ended).as_deref(), Some(words), "{rest:?}");
+    }
+    for (said, runs) in [
+        ("    queued for the next turn", true),
+        ("    replacing the running turn", true),
+        ("    interrupting run", true),
+    ] {
+        assert_eq!(phase(&at_rest(said)).0 == Phase::Busy, runs, "{said}");
+    }
+    // NEGATIVE CONTROL: a reply that opens like the row is the agent's words.
+    let mut reply = at_rest("");
+    let q = reply
+        .iter()
+        .position(|r| r == "◆ Queued input · ↑ to edit")
+        .expect("the row");
+    reply[q] = "◆ Queued input · ↑ to edit is how to change it; nothing else is left.".to_string();
+    reply.remove(q + 1);
+    assert_eq!(
+        said_tail(&reply).as_deref(),
+        Some("Queued input · ↑ to edit is how to change it; nothing else is left.")
+    );
+}
+
+/// MUSE CODE'S TITLE SAYS WHETHER A RUN IS ACTIVE (`docs/measured/idle-no-evidence-2026-10-22.md`
+/// I2). MEASURED (the casts of that note: the lab's `ie-m1` and the half-drawn-frame lab's
+/// `mu3-*`): `⠙ proj` and the spinner's other frames every 0.1 s from the status row's first
+/// frame to the run's `terminal`, through its end-of-turn review; `proj` at rest. NEGATIVE
+/// CONTROLS: another braille glyph, the glyph with no blank, the glyph after the words, Claude
+/// Code's resting `✳`, an empty title. MUTANT: a spinner of any braille glyph reads `⠿ proj`
+/// as running.
+#[test]
+fn muse_codes_title_says_whether_its_run_is_active() {
+    let spinner = anchor_text("muse.title.spinner");
+    assert_eq!(spinner.chars().count(), 10);
+    for frame in spinner.chars() {
+        assert!(title_runs(&format!("{frame} proj")), "{frame}");
+    }
+    for title in [
+        "proj",
+        "⠿ proj",
+        "⠙proj",
+        "proj ⠙",
+        "✳ Claude Code",
+        "",
+        "⠙",
+    ] {
+        assert!(!title_runs(title), "{title:?}");
+    }
+    assert_eq!(MuseReader.title_runs("⠙ proj"), Some(true));
+    assert_eq!(MuseReader.title_runs("proj"), Some(false));
+    // No other reader has a measured reading of its program's title.
+    for p in Program::ALL {
+        if p != Program::Muse {
+            assert_eq!(p.reader().title_runs("⠙ proj"), None, "{}", p.name());
+        }
+    }
+}
+
+/// THE STATUS ROW STILL BARE AFTER ITS GLYPH CYCLED reads idle with NO evidence (measured under
+/// three tabs, [`fixtures::BUSY_FIRST_FRAME_CYCLED`], 0.022 s): the supervisor's general guard
+/// (`docs/measured/idle-no-evidence-2026-10-22.md` I1) holds such a read until the screen holds
+/// still, and this fixture is its measured case. NEGATIVE CONTROL: the same frame with the
+/// cycle's first glyph is the first frame's anchor, busy as evidence.
+#[test]
+fn the_bare_status_row_after_its_glyph_cycled_is_idle_with_no_evidence() {
+    let rows = screen(BUSY_FIRST_FRAME_CYCLED);
+    assert!(rows.iter().any(|r| r == "◈ Thinking"), "measured");
+    assert!(composer(&rows).is_some());
+    assert_eq!(phase(&rows), (Phase::Idle, false));
+    let first = edited(&rows, "◈ Thinking", "◇ Thinking");
+    assert_eq!(phase(&first), (Phase::Busy, true));
+}

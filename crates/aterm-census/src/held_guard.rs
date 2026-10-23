@@ -2,37 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! No unbounded work under a held `term` guard in the GUI's shipped source:
-//! the per-site half of the L0 freeze class, beside the main-loop census's
-//! per-path half.
-//!
-//! For every shipped line of `crates/aterm-gui/src` and
-//! `crates/aterm-control/src`, this flags blocklisted O(history) work
-//! (`.resize(` `.reflow(` `.rewrap(` `.take_scrollback(` `.decompress(`
-//! `.hydrate(` `.rebuild_index(`, or a call into the cold tier's LZ4 codec) run
-//! while a guard is held. Tokens are method-call anchored, so the safe offload
-//! (`resize_offloading_scrollback` under the lock, `pending.reflow()` off it,
-//! `finish_resize_offload` under a second brief lock) stays green.
-//!
-//! What counts as held (each shape pinned by a `MUST_FIRE` case below):
-//!
-//! * an acquiring call (`term_lock(`, `term_lock_ui(`, aterm-control's
-//!   `with_terminal(` / `with_terminal_mut(`) holds the guard while its parens
-//!   stay open, across a multi-line closure body;
-//! * a `let` whose right-hand side is the guard (only `&`/`mut`/`*`/`(` ahead,
-//!   nothing chained after) binds every identifier in its pattern until its
-//!   block closes, it is `drop`ped, or it is shadowed;
-//! * an explicit reborrow (`&mut *t`, `t.deref_mut()`) is the guard too; a
-//!   plain accessor (`let alt = t.is_alternate_screen()`) reads a value out;
-//! * the receiver may be paren-dereffed, reached through zero-arg accessor hops,
-//!   or split across lines by rustfmt.
-//!
-//! Not detected: an acquire inside a macro, a `let`-bound acquire whose call
-//! spans lines, and a deferred `let t; t = …`.
-//!
-//! Source is lexed with comments and literals blanked in place, then the
-//! unshipped-item mask (`#[cfg(test)]` and kin) is applied; see
-//! [`crate::lex::blank_non_code`] for why that order matters.
+//! Census check disallowing unbounded O(history) work under a held `term` guard.
 
 use std::path::Path;
 
@@ -124,14 +94,11 @@ pub(crate) fn scan_tree(root: &Path) -> Result<HeldGuardScan, String> {
 /// The 1-based lines of one file's shipped code that do blocklisted work under
 /// a held guard, and how many lines acquire one.
 pub(crate) fn scan_source(text: &str) -> (Vec<usize>, usize) {
-    // Lex first, then mask: see `blank_non_code` for why the order is load-bearing.
     let code = crate::mask_unshipped_items(&crate::lex::blank_non_code(text));
     let mut walk = Walk::default();
     let mut hits = Vec::new();
     let mut acquires = 0;
     for (i, line) in code.lines().enumerate() {
-        // A line with no code carries no token; skipping it keeps a comment
-        // inside a wrapped chain from ending the chain.
         if line.trim().is_empty() {
             continue;
         }
@@ -152,8 +119,6 @@ fn is_ident_start(c: char) -> bool {
 fn is_ident(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
-
-// The walk: which lines do blocklisted work while a guard is held.
 
 /// A guard bound by a `let`: the name, the brace depth it was bound at, and
 /// the line that bound it.
@@ -182,7 +147,6 @@ impl Walk {
     /// Advance over one line of code; `true` when it is a finding.
     fn step(&mut self, bal: &str, line: usize) -> bool {
         let mut hit = false;
-        // Bind before the hit test so a same-line alias-then-call still counts.
         if let Some((lhs, rhs)) = split_let(bal) {
             let ids = bind_guard(lhs, rhs).or_else(|| self.bind_alias(lhs, rhs));
             for name in ids.unwrap_or_default() {
@@ -200,8 +164,6 @@ impl Walk {
         if live && touches_cold_codec(bal) {
             hit = true;
         }
-        // A chain rustfmt broke across lines puts the receiver and the work on
-        // separate lines — the one bypass the formatter introduces on its own.
         if self.pending.is_some() {
             let t = bal.trim_start();
             if t.starts_with('.') && method_call_at(t, 0).is_some() {
@@ -352,7 +314,6 @@ fn receives_work(bal: &str, id: &str) -> bool {
             return true;
         }
     }
-    // `(<anything>*<ws>id)` — a paren-deref.
     for (at, _) in bal.match_indices('(') {
         if !boundary(at) {
             continue;
@@ -461,7 +422,6 @@ fn bind_guard(lhs: &str, rhs: &str) -> Option<Vec<String>> {
             _ => {}
         }
     }
-    // A call spanning lines is the region walk's.
     let tail = rest[close? + 1..].trim_start();
     if tail.starts_with(['.', '?']) {
         return None;

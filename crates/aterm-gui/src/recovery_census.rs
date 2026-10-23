@@ -25,6 +25,7 @@ const SHED_LINE_CRITICAL: &str = "memory pressure (critical)";
 const SHED_LINE_WARN: &str = "memory pressure (warn)";
 
 /// The most bytes of the logs one census reads: both rotation halves are about
+/// 4 MiB each (`logging::RotationBudget::ATERM_LOG`), with slack.
 const MAX_LOG_BYTES: u64 = 12 * 1024 * 1024;
 
 /// This launch, as its row records it.
@@ -149,6 +150,7 @@ pub(crate) fn record_cold(
 }
 
 /// [`record_cold`] with the node log and the log directory given: `census` says
+/// which ledger, if any, takes the row.
 fn record_cold_into(
     node: &'static crate::session_log_node::NodeLogHost,
     own_dir: impl FnOnce() -> Option<PathBuf> + Send + 'static,
@@ -167,6 +169,9 @@ fn record_cold_into(
 }
 
 /// [`record`], reading the ledger in the directory `dir` names (on the
+/// census thread) and telling `node`, when given, how the previous run ended:
+/// the node log's `start prev_end=`, amended as soon as the
+/// class is known, whether or not the row then appends.
 fn record_into(
     node: Option<&'static crate::session_log_node::NodeLogHost>,
     dir: impl FnOnce() -> Option<PathBuf> + Send + 'static,
@@ -241,6 +246,7 @@ pub(crate) fn census_row(
 }
 
 /// The run that handed off to this launch: the parent of a successor at its Commit,
+/// or the image a cold-lane update exec replaced.
 fn handoff_prev(dir: &Path, last: Option<&Row>, now: u64, probe: &dyn Probe) -> PrevRun {
     let Some(last) = last else {
         return PrevRun {
@@ -315,6 +321,7 @@ fn first_row_prev(dir: &Path) -> PrevRun {
 }
 
 /// The end class and, when it can be told, the end time (with `true` when it is only
+/// a lower bound).
 fn classify(evidence: &Evidence, facts: &LogFacts) -> (EndClass, Option<(u64, bool)>) {
     if let Some(at) = evidence.panic_at {
         return (EndClass::Panic, at.map(|at| (at, false)));
@@ -369,6 +376,7 @@ fn panic_report_pid(name: &str) -> Option<u32> {
 }
 
 /// A marker's pid and birth second: `crash-marker-<pid>-<nanos>-<owner>.log`, or the
+/// legacy `crash-signal-<pid>-<nanos>.log`.
 fn marker_pid_birth(name: &str) -> Option<(u32, u64)> {
     let body = unconsumed(name).strip_suffix(".log")?;
     let rest = body
@@ -405,6 +413,7 @@ fn marker_signal(path: &Path) -> Option<u8> {
 }
 
 /// What `dir` holds for the run `pid` born at `birth` (artifacts older than the birth
+/// belong to an earlier owner of the pid, and are ignored).
 fn find_evidence(dir: &Path, pid: u32, birth: u64) -> Evidence {
     let mut evidence = Evidence::default();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -443,6 +452,7 @@ fn find_evidence(dir: &Path, pid: u32, birth: u64) -> Evidence {
 }
 
 /// For a ledger's first row: the pid and birth of the newest crash artifact a
+/// previous run left (the crash scans have just renamed it `.seen`).
 fn newest_artifact_owner(dir: &Path) -> Option<(u32, u64)> {
     use crate::crash_signal::{MarkerOwner, markers};
     let mut newest: Option<(u64, u32, u64)> = None;
@@ -685,6 +695,8 @@ mod tests {
     }
 
     /// THE CENSUS PRODUCER of the node log:
+    /// the census thread tells the node log how the run before this launch
+    /// ended, read under the one-minute hang detector.
     #[test]
     fn the_census_thread_amends_the_node_logs_start() {
         let s = Scratch::new("node-log");
@@ -723,6 +735,9 @@ mod tests {
     }
 
     /// A dead, empty marker of `owner` for the run the ledger names (pid 4242, born at
+    /// [`BORN`], whose lines say it started and never that it quit), swept by a launch
+    /// whose own marker is `scan`'s and, for a lab desk, consumed by its kill scan, as
+    /// the launch runs both before its census.
     fn swept_then_counted(
         owner: crate::crash_signal::MarkerOwner,
         scan: crate::crash_signal::MarkerOwner,
@@ -761,6 +776,12 @@ mod tests {
     }
 
     /// THE LAB DESK'S CENSUS, in process
+    /// over an injected marker directory: a dead `lab` marker under a lab desk's sweep
+    /// is left for the census, and the run reads `killed`; the same marker under the
+    /// installed app's sweep, or a plain start's, is not news and goes, as a dead
+    /// `other` marker under a lab desk's sweep does (the control: a test's start does
+    /// not fool the census), and each of those runs reads `clean`, bounded by its last
+    /// line.
     #[test]
     fn a_lab_desks_census_reads_its_killed_run_and_no_other_start_fools_it() {
         use crate::crash_signal::MarkerOwner::{App, Lab, Other};
@@ -781,6 +802,10 @@ mod tests {
     }
 
     /// THE CENSUS GATE (6C-4): on for the installed app and for a lab desk, which read
+    /// and append their own log directory's ledger and tell the node log; off for a
+    /// plain headless start (its log directory is the daily driver's), whose node log
+    /// keeps `prev_end=-`; the seam's folder alone for a dev start under the ledger
+    /// seam.
     #[test]
     fn the_census_gate_is_on_for_a_lab_desk_and_off_for_a_plain_headless_one() {
         use crate::crash_signal::{Arming, MarkerOwner, markers};
@@ -897,6 +922,7 @@ mod tests {
     }
 
     /// No marker left and no quit line (an exit path of an older build, an update
+    /// parent's `_exit`): clean, bounded below by the run's last line.
     #[test]
     fn a_run_with_its_own_lines_and_no_marker_ended_clean_bounded_by_its_last_line() {
         let s = Scratch::new("clean-bound");
@@ -1003,6 +1029,7 @@ mod tests {
     }
 
     /// A marker written before the banner lost its ` — crash marker written` tail
+    /// still names its signal.
     #[test]
     fn a_marker_in_the_older_banner_form_still_names_its_signal() {
         let s = Scratch::new("signal-old");
@@ -1106,7 +1133,7 @@ mod tests {
         );
     }
 
-    /// THE ROW NAMES ITS PROCESS TO THE MICROSECOND. A launch records the kernel's
+    /// THE ROW NAMES ITS PROCESS TO THE MICROSECOND.
     #[test]
     fn a_pid_reused_within_the_same_second_is_not_the_previous_run() {
         struct Exact(u32, Birth);
@@ -1181,6 +1208,9 @@ mod tests {
     }
 
     /// The first row's artifact is never one whose marker names another kind of launch
+    /// (`MarkerOwner::Other`: a test, dev or headless start, or a candidate its parent
+    /// could still reject): those share the log directory, and one's crash is not the
+    /// run before an installed launch.
     #[test]
     fn the_first_row_never_takes_a_marker_owned_by_another_kind_of_launch() {
         let s = Scratch::new("first-other");
@@ -1241,6 +1271,9 @@ mod tests {
     }
 
     /// An update applied with no session open exec's the new image in place
+    /// (`ApplyLane::Cold`), keeping the pid and kernel birth: its previous run is the
+    /// image it replaced, handed off, never the run the old image's own row already
+    /// classified (which would count that end twice).
     #[test]
     fn a_cold_lane_update_exec_is_a_handoff_from_the_image_it_replaced() {
         let s = Scratch::new("self");

@@ -291,10 +291,11 @@ mod tests {
     use imp::{RlimitResource, set_limit};
 
     /// `RLIMIT_*` is process-wide and the tests run concurrently in one process,
+    /// so tests that mutate NOFILE would see each other's read-backs.
     #[cfg(unix)]
     static NOFILE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Serialize a NOFILE-mutating test. Poison is ignored deliberately: one test
+    /// Serialize a NOFILE-mutating test.
     #[cfg(unix)]
     fn nofile_guard() -> std::sync::MutexGuard<'static, ()> {
         NOFILE_TESTS.lock().unwrap_or_else(|e| e.into_inner())
@@ -458,6 +459,8 @@ mod tests {
     }
 
     /// Run `probe` in a forked child, as the spawn seam's child runs
+    /// [`Limits::apply`] after `fork` and before `exec`, and return its exit
+    /// code.
     #[cfg(unix)]
     fn in_forked_child(probe: impl FnOnce() -> i32) -> i32 {
         // SAFETY: The child runs only `probe` (getrlimit/setrlimit, no allocation) and `_exit`.
@@ -476,6 +479,8 @@ mod tests {
     }
 
     /// A child that installed [`Limits::contained`] cannot raise its descriptor
+    /// limit back (`ulimit -n`), while one that installed [`Limits::shell_default`]
+    /// can.
     #[cfg(unix)]
     #[test]
     fn a_contained_limit_cannot_be_raised_back() {
@@ -524,6 +529,9 @@ mod tests {
     }
 
     /// Each limit lands on its own resource, and one above the hard ceiling is clamped under
+    /// it rather than refused (a refusal fails the child closed: no shell where the host's
+    /// hard `RLIMIT_NOFILE` is below the Safety set's), a binding one too, whose hard limit
+    /// is the clamped value and never the asked one (raising a hard limit is refused).
     #[cfg(unix)]
     #[test]
     fn each_limit_lands_on_its_resource_clamped_under_the_hard_ceiling() {

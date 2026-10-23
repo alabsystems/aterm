@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The card's fx layers held to the quad oracle and to the card's laws
-//! (`docs/DESIGN-card-engine-2026-10-19.md` §7, "B, the card").
-//!
-//! The keystone is [`the_card_layers_equal_the_legacy_quads`]: the layers,
-//! painted by the renderers' own CPU slicer and stamp, put on the glass
-//! exactly the pixels the quad oracle ([`super::oracle`]) put there, so
-//! every law the oracle's tests prove of the quads holds of the layers. The
-//! rest hold the arts to the art strings and the rim's strips, bound the
-//! frame without its art, and re-state the card's own laws on the layers.
+//! The card's fx layers held to the quad oracle and to the card's laws (`docs/DESIGN-card-engine-2026-10-19.md` §7, "B, the card").
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -40,7 +32,7 @@ fn rng(seed: u64) -> impl FnMut() -> u64 {
 
 /// The card's fx frame of `s` at `clock` for `seed`, filled in `frames` as
 /// [`HarnessCard::draw`] fills it: its shape's card-local frame, laid at the
-/// scene's origin. `None` with nothing to draw.
+/// scene's origin.
 fn fx_frame(frames: &mut CardFrames, s: &CardScene, clock: Clock, seed: u64) -> Option<CardFrame> {
     let (shape, origin) = CardShape::of(s);
     let local = shape.scene();
@@ -89,8 +81,7 @@ struct Patch {
 
 impl Patch {
     /// The hull of everything either side could paint: the quads, and the
-    /// frame's two contents at its origin within the pane. `None` when
-    /// neither paints anything.
+    /// frame's two contents at its origin within the pane.
     fn around(quads: &[&[GlowQuad]], frame: Option<&CardFrame>, pane: PxRect) -> Option<Self> {
         let mut hull = quads
             .iter()
@@ -258,7 +249,6 @@ fn assert_same_pixels(
             frame.over.items().len()
         );
     }
-    // Inside the box and the pane.
     let ground = patch.ground(s.dark);
     let (shape, origin) = CardShape::of(s);
     let outer = Geo::new(shape.scene()).expect("a frame was drawn").outer;
@@ -288,7 +278,6 @@ fn assert_same_pixels(
     seen.most_items = seen.most_items.max(items);
     assert!(items <= CARD_ITEMS_MAX, "{what}: {items} items");
     seen.row0_air += usize::from(s.top == 0 && s.pad_above > 0);
-    // The rim cut round the hole, and the stars' two forms.
     let m = marks(frames, &frame, s, clock, seed);
     seen.rim_cut += usize::from(m.rims.len() > 1);
     if s.dark {
@@ -434,8 +423,6 @@ fn random_frame(seed: u64) -> (CardScene, Clock) {
         1 => CardPalette::Land,
         _ => CardPalette::Off,
     };
-    // The ripple from the mascot's wand, a cell into the box, or the box's
-    // corner.
     let wand = (pick(3) != 0).then_some((pick(3) as u16, top));
     let s = CardScene {
         origin_x,
@@ -480,12 +467,7 @@ fn random_frame(seed: u64) -> (CardScene, Clock) {
 /// cover every cell height from 8 to 96 (the card at the pane's first row
 /// with air under it among them): the border's re-ramped edges and per-band
 /// sides, the stepping trail, the kitty, its rim cut round the trail, the
-/// stars folded on dark and peeled in two tones on light. Every pixel lies
-/// in the box and the pane, and no frame holds more than
-/// [`CARD_ITEMS_MAX`] items. CONTROL: the comparison sees a wrong pixel —
-/// one palette entry of a frame off by one — and the frames exercise the
-/// rim's cut, the light stars' two tones, both star forms and the first
-/// row's air.
+/// stars folded on dark and peeled in two tones on light.
 #[test]
 fn the_card_layers_equal_the_legacy_quads() {
     let mut frames = CardFrames::default();
@@ -508,9 +490,6 @@ fn the_card_layers_equal_the_legacy_quads() {
         let what = format!("random frame {seed}: {s:?} at {clock:?}");
         assert_same_pixels(&mut frames, &s, clock, seed, &mut seen, &what);
     }
-    // This public seed sends the stripe mixer to usize::MAX. An ordinary
-    // long trail still admits all three glints, and both real CPU layer
-    // painting and the independent quad paint agree on the resulting pixels.
     let long = CardScene {
         trail: Some((32, 52)),
         kitty_col: Some(52),
@@ -545,8 +524,6 @@ fn the_card_layers_equal_the_legacy_quads() {
             && seen.row0_air > 0,
         "CONTROL: the frames exercise every path: {seen:?}"
     );
-    // CONTROL: one palette entry off by one is a wrong pixel the comparison
-    // sees.
     let s = scene();
     let frame = fx_frame(&mut frames, &s, Clock::SETTLED, 7).expect("a frame");
     let (under, over) = oracle_quads(&s, Clock::SETTLED, 7);
@@ -597,8 +574,7 @@ const POSES: [KittyPose; 3] = [KittyPose::Open, KittyPose::Blink, KittyPose::Fli
 /// every other character its place in the palette — the same at every cell
 /// height; and drawn as one sprite at its square pixel, its seven colours
 /// opaque, it paints exactly the pixels its quads painted, at every cell
-/// height from 8 to 96, both heights, both themes and every pose. CONTROL:
-/// the poses' arts differ, so a frame drawn in another pose's art is seen.
+/// height from 8 to 96, both heights, both themes and every pose.
 #[test]
 fn the_kitty_is_todays_art() {
     for ch in [8u16, 18, 35, 96] {
@@ -702,7 +678,7 @@ fn strip_picture(frame: &[&str], p: i64, rim: i64) -> (Vec<u8>, usize) {
 /// kitty's, at most 59 strips (palette entries) a frame; and drawn — one
 /// sprite, cut round the trail's hole — it paints exactly the pixels its
 /// quads painted, through the ride and the seated blink and flick of every
-/// law scene. CONTROL: a strip dropped from the art is seen.
+/// law scene.
 #[test]
 fn the_rim_is_todays_rim() {
     let mut most = 0;
@@ -725,7 +701,6 @@ fn the_rim_is_todays_rim() {
         }
     }
     assert!(most <= 59, "at most 59 strips a frame: {most}");
-    // CONTROL: one strip short is another picture.
     let (mut short, _) = strip_picture(KITTY_SHORT.frame(KittyPose::Open), 3, 1);
     let last = *short.iter().max().expect("strips");
     short
@@ -739,7 +714,6 @@ fn the_rim_is_todays_rim() {
     {
         assert_ne!(fx.data(), &short[..], "CONTROL: a strip short");
     }
-    // Drawn, through the ride.
     let mut frames = CardFrames::default();
     let mut cut = 0;
     for s in scenes() {
@@ -760,7 +734,6 @@ fn the_rim_is_todays_rim() {
                 .cloned()
                 .map(FxItem::Sprite)
                 .collect();
-            // Its items lay its outline, not its box.
             let laid: i64 = sprites_of(&frame.over, &art)
                 .map(|sp| i64::from(sp.clip.x1 - sp.clip.x0) * i64::from(sp.clip.y1 - sp.clip.y0))
                 .sum();
@@ -800,8 +773,7 @@ fn the_rim_is_todays_rim() {
 /// arts and every pose, the rim is laid in at most [`RIM_COVER_MAX`]
 /// pairwise-disjoint rectangles that hold every texel of its strips and at
 /// most a fifth of its box (the shipped rims: 15-19 %, their strips 7-13 %),
-/// so the kitty it rings and the air round it run no rim fragment. CONTROL:
-/// the one rectangle round the strips is the whole box.
+/// so the kitty it rings and the air round it run no rim fragment.
 #[test]
 fn the_rim_covers_its_outline_not_its_box() {
     let (mut laid, mut boxed, mut lit) = (0i64, 0i64, 0i64);
@@ -888,9 +860,7 @@ fn sprite_pixels(
 /// THE RIM NEVER LIES ON THE TRAIL, on the layers: in every law scene,
 /// through the ride, the seated blink and flick and the episode's end, no
 /// pixel the rim's sprites paint lies on a segment of the trail as it is
-/// drawn that frame. CONTROL: the rim's sprite clipped to the box alone,
-/// uncut by the trail's hole, lies on the trail in some frame — the cut is
-/// what keeps it off.
+/// drawn that frame.
 #[test]
 fn the_rim_never_lies_on_the_trail() {
     let mut frames = CardFrames::default();
@@ -921,7 +891,6 @@ fn the_rim_never_lies_on_the_trail() {
             let what = format!("{}x{}, dark {}, {clock:?}", s.cw, s.ch, s.dark);
             assert!(!lit.iter().any(on_trail), "{what}: the rim on the trail");
             checked += 1;
-            // CONTROL: uncut.
             let first = sprites_of(&frame.over, &art)
                 .next()
                 .cloned()
@@ -968,9 +937,7 @@ fn family_geom(ch: u16) -> Geom {
 /// light — paints exactly what the crate's one star (`push_twinkle_star`)
 /// paints, for every arm from 1 to 32, plain and gold, at four coverages;
 /// on light, its peeled sprites in tone rectangles paint what the oracle's
-/// star paints, a trail's two-segment edge crossing it. CONTROL: a fold of
-/// the pieces in source-over ink — what the peel replaces on light — is
-/// not the laying.
+/// star paints, a trail's two-segment edge crossing it.
 #[test]
 fn the_star_is_the_family_star() {
     let (w, h) = (160usize, 160usize);
@@ -996,7 +963,6 @@ fn the_star_is_the_family_star() {
                     gold,
                     color: 0x00FF_C878,
                 };
-                // Dark: the family star.
                 let mut family = Vec::new();
                 assert!(push_twinkle_star(
                     &mut family,
@@ -1014,8 +980,6 @@ fn the_star_is_the_family_star() {
                 let a = patch.paint_quads(&[], &family, true);
                 let b = patch.paint_content(FxContent::new(items, palette), (0, 0), pane, 18, true);
                 assert_eq!(patch.first_difference(&a, &b), None, "{what}: dark");
-                // Light, a trail's edge crossing it in two segments a pixel
-                // apart.
                 let edge = [
                     Rect {
                         x0: 0,
@@ -1066,8 +1030,6 @@ fn the_star_is_the_family_star() {
                     peeled <= STAR_DEPTH_MAX * TONE_RECTS_MAX,
                     "{what}: {peeled} items"
                 );
-                // CONTROL: the light star folded, each class its last
-                // piece's ink, is not the laying.
                 if let Some(art) = fx_pieces(arm, gold) {
                     let (ox, oy) = art.origin();
                     let FxItem::Sprite(first) = &items[0] else {
@@ -1121,9 +1083,7 @@ fn fx_pieces(arm: i64, gold: bool) -> Option<aterm_render::fx::PieceArt> {
 /// A STAR'S PIECES STACK AT MOST FOUR DEEP: for every arm from 1 to 32,
 /// plain and gold, no pixel lies under more than [`STAR_DEPTH_MAX`] of its
 /// pieces, so a light star is at most that many peeled sprites a tone
-/// rectangle. Today's stars stack three deep at the nucleus (the two
-/// needles and the core); the bound keeps one in hand for the family's
-/// geometry. CONTROL: a bound one short of the deepest star is broken.
+/// rectangle.
 #[test]
 fn a_stars_pieces_stack_at_most_four_deep() {
     let mut deepest = 0;
@@ -1185,8 +1145,7 @@ fn dithered() -> KittyArt {
 /// dithered all over (every run a pixel), the card's frame holds exactly as
 /// many items as with the real kitty — the art is a picture, not a count —
 /// at every law scene with the tall kitty, settled and through the ride,
-/// and never more than [`CARD_ITEMS_MAX`]. CONTROL: the quad oracle's frame
-/// rises with the dithered art.
+/// and never more than [`CARD_ITEMS_MAX`].
 #[test]
 fn the_card_is_bounded_without_its_art() {
     let tall: Vec<CardScene> = scenes().into_iter().filter(|s| s.kitty_rows == 3).collect();
@@ -1224,7 +1183,6 @@ fn the_card_is_bounded_without_its_art() {
         d > r,
         "CONTROL: the oracle's quads rise with the art ({r} -> {d})"
     );
-    // The kitty's own quads, settled, at the law scene's cell.
     let kitty_alone = || {
         let s = CardScene {
             kitty_rows: 3,
@@ -1260,8 +1218,7 @@ fn the_card_is_bounded_without_its_art() {
 /// stripes: the border alone holds `2 · MAX_EDGE_SEGMENTS + 2` items and
 /// border and trail exactly [`CARD_UNDER_ITEMS_MAX`], on both grounds,
 /// seated and at the episode's end, and the layers still put the quad
-/// oracle's pixels on the glass. CONTROL: the same trail at rest is one
-/// segment.
+/// oracle's pixels on the glass.
 #[test]
 fn the_under_content_reaches_its_bound_and_stops_there() {
     let wide = widest();
@@ -1313,8 +1270,7 @@ fn the_under_content_reaches_its_bound_and_stops_there() {
 
 /// A THEME SWITCH REBAKES NO ART: a card's frames drawn once at a cell
 /// height, every later frame — dark to light and back, the other palette,
-/// another coat and eye, serious mode, the ride — builds no art. CONTROL: a
-/// cell height no card has drawn at builds its arts.
+/// another coat and eye, serious mode, the ride — builds no art.
 #[test]
 fn a_theme_switch_rebakes_no_art() {
     let mut frames = CardFrames::default();
@@ -1343,7 +1299,6 @@ fn a_theme_switch_rebakes_no_art() {
         }
     }
     assert_eq!(take_art_builds(), 0, "a theme switch builds no art");
-    // CONTROL: a height of its own (no other test draws a 211 px cell).
     fx_frame(
         &mut frames,
         &CardScene {
@@ -1355,8 +1310,6 @@ fn a_theme_switch_rebakes_no_art() {
         7,
     );
     assert!(take_art_builds() > 0, "CONTROL: a new cell height builds");
-    // Invalid public dimensions must be refused before constructing a rim
-    // or eagerly constructing the height's entire star cache.
     for ch in [0, 14_000, u16::MAX] {
         assert!(CardArts::for_cell(ch).is_none(), "height {ch}");
         assert_eq!(take_art_builds(), 0, "height {ch}: no partial art cache");
@@ -1365,7 +1318,7 @@ fn a_theme_switch_rebakes_no_art() {
 
 /// THE KITTY CLEARS THE BORDER AT EVERY CELL HEIGHT, on the layers: its
 /// sprite lies inside the border's stroke at every height from 8 to 96,
-/// both kitties, with air and without. CONTROL: it is drawn at each.
+/// both kitties, with air and without.
 #[test]
 fn the_kitty_clears_the_border_at_every_cell_height() {
     let mut frames = CardFrames::default();
@@ -1405,7 +1358,7 @@ fn the_kitty_clears_the_border_at_every_cell_height() {
 /// added light (opacity 0), so a mark only brightens the ground; on a
 /// light one every entry of both contents is source-over ink (opacity
 /// above 0), so nothing doubles to white — at every law scene through the
-/// episode. CONTROL: both kinds occur.
+/// episode.
 #[test]
 fn dark_marks_are_light_and_light_marks_are_ink() {
     let mut frames = CardFrames::default();
@@ -1473,8 +1426,7 @@ fn the_layers_are_deterministic() {
 /// AN INLINE SCROLL IS THE SAME FRAME, MOVED: a scene moved down the
 /// window by whole rows (the pane's text scrolling under a settled card),
 /// its pane moved with it, has the kept frame's shape, and the frame drawn
-/// at the new place is the kept one's contents at the new origin. CONTROL:
-/// a pane that newly cuts the box is another shape.
+/// at the new place is the kept one's contents at the new origin.
 #[test]
 fn an_inline_scroll_is_the_same_frame_moved() {
     let empty = Arc::new(FxContent::default());

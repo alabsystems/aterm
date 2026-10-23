@@ -1,8 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Mach-O files of a staged tree, found by magic rather than by name, so a platform
-//! signature check reaches every binary the tree carries, whatever it is called.
+//! Mach-O header detection, dylib load-command inspection, and staged-tree executable checks.
 
 use std::path::{Path, PathBuf};
 
@@ -14,11 +13,7 @@ const THIN_MAGICS: [u32; 4] = [0xFEED_FACE, 0xFEED_FACF, 0xCEFA_EDFE, 0xCFFA_EDF
 /// Universal (fat) headers, 32- and 64-bit arch tables, in either byte order.
 const FAT_MAGICS: [u32; 4] = [0xCAFE_BABE, 0xCAFE_BABF, 0xBEBA_FECA, 0xBFBA_FECA];
 
-/// Whether `head` (a file's first bytes) opens a Mach-O: a thin magic, or a universal
-/// magic followed by a nonzero arch count. Fail closed: the kernel executes universal
-/// files whose arch count overlaps a Java class file's version word, so a class file is
-/// taken for a Mach-O too (and refused as unsigned); only a count of zero, which names no
-/// slice to run, is not one.
+/// Returns whether `head` starts with a thin Mach-O or non-empty universal header magic.
 #[must_use]
 pub fn is_macho_header(head: &[u8]) -> bool {
     let Some(word) = head.get(..4) else {
@@ -31,12 +26,9 @@ pub fn is_macho_header(head: &[u8]) -> bool {
     FAT_MAGICS.contains(&magic) && head.get(4..8).is_some_and(|n| n != [0; 4])
 }
 
-/// The load commands that name a dylib the loader maps (`<mach-o/loader.h>`):
-/// `LC_LOAD_DYLIB`, `LC_LOAD_WEAK_DYLIB`, `LC_REEXPORT_DYLIB`, `LC_LAZY_LOAD_DYLIB` and
 /// `LC_LOAD_UPWARD_DYLIB`. `LC_ID_DYLIB` is a library's own name and loads nothing.
 const DYLIB_LOADS: [u32; 5] = [0xC, 0x8000_0018, 0x8000_001F, 0x20, 0x8000_0023];
 
-/// The most slices a universal file may name before the reader refuses it: a real one
 /// carries two or three.
 const MAX_SLICES: u32 = 16;
 
@@ -46,12 +38,10 @@ const MAX_MACHO_BYTES: usize = 1 << 30;
 /// A 64-bit Mach-O header's size, which its load commands follow.
 const HEADER_64: usize = 32;
 
-/// The fixed part of a `dylib_command`: cmd, cmdsize, then the `dylib` struct (name
 /// offset, timestamp, current and compatibility versions).
 const DYLIB_COMMAND: usize = 24;
 
-/// Why a Mach-O's load commands were not read. The reader refuses what it cannot read
-/// exactly rather than guess, so a check built on it fails closed.
+/// Error returned when reading a Mach-O's load commands.
 #[derive(Debug)]
 pub enum LoadError {
     /// The file could not be read (not a regular file, too large, or I/O).
@@ -96,18 +86,10 @@ fn wide(bytes: &[u8], at: usize, what: &str) -> Result<u64, LoadError> {
     Ok((u64::from(hi) << 32) | u64::from(lo))
 }
 
-/// Every dylib the Mach-O `bytes` loads, in load-command order, slice after slice for a
-/// universal file (a name both slices load appears once per slice).
-///
-/// Reads thin 64-bit Mach-Os in either byte order and universal files with 32- or 64-bit
-/// arch tables. Refuses ([`LoadError::Malformed`]) a 32-bit slice, a byte-swapped or
-/// nested universal header, an empty or oversized arch table, a slice outside the file,
-/// load commands that overrun `sizeofcmds` or the file, a `cmdsize` under 8 or not a
-/// multiple of 8, and a dylib command whose name offset falls outside it or whose name is
-/// empty, unterminated or not UTF-8.
+/// Returns every dylib path loaded by the Mach-O `bytes` in load-command order.
 ///
 /// # Errors
-/// [`LoadError::Malformed`] as above.
+/// [`LoadError::Malformed`] if `bytes` is not a well-formed 64-bit or universal Mach-O.
 pub fn load_dylibs(bytes: &[u8]) -> Result<Vec<String>, LoadError> {
     let magic = word(bytes, 0, false, "the header")?;
     let mut out = Vec::new();
@@ -250,30 +232,24 @@ fn thin_loads(slice: &[u8], what: &str, out: &mut Vec<String>) -> Result<(), Loa
     Ok(())
 }
 
-/// Every dylib the Mach-O at `path` loads ([`load_dylibs`]), read whole through a
-/// no-follow open of a regular file.
+/// Reads the regular file at `path` (no-follow) and returns its loaded dylib paths.
 ///
 /// # Errors
-/// [`LoadError::Io`] when it is not a regular file, is over 1 GiB or cannot be read;
-/// [`LoadError::Malformed`] as [`load_dylibs`] refuses.
+/// [`LoadError::Io`] on I/O failure or non-regular file; [`LoadError::Malformed`] if malformed.
 pub fn load_dylibs_at(path: &Path) -> Result<Vec<String>, LoadError> {
     let bytes =
         crate::metadata_io::read_bounded_regular(path, MAX_MACHO_BYTES).map_err(LoadError::Io)?;
     load_dylibs(&bytes)
 }
 
-/// Whether `name`, a dylib a load command names, is the operating system's own: an
-/// absolute path under `/usr/lib/` or `/System/` with no `.` or `..` component. A
-/// Homebrew prefix, `@rpath`, `@loader_path` and `@executable_path` are not.
+/// Returns whether `name` is an absolute path under `/usr/lib/` or `/System/` without `.` or `..`.
 #[must_use]
 pub fn is_system_dylib(name: &str) -> bool {
     (name.starts_with("/usr/lib/") || name.starts_with("/System/"))
         && !name.split('/').any(|part| part == "." || part == "..")
 }
 
-/// The dylibs the Mach-O at `path` loads from outside the operating system
-/// ([`is_system_dylib`]), sorted and deduplicated: empty for a binary that runs on any Mac
-/// of its architecture with nothing else installed.
+/// Returns sorted, deduplicated non-system dylibs loaded by the Mach-O at `path`.
 ///
 /// # Errors
 /// As [`load_dylibs_at`].
@@ -287,13 +263,11 @@ pub fn foreign_dylibs(path: &Path) -> Result<Vec<String>, LoadError> {
     Ok(foreign)
 }
 
-/// Whether `head` opens an interpreter script (`#!`), which the kernel runs without any
 /// code signature.
 fn is_script_header(head: &[u8]) -> bool {
     head.starts_with(b"#!")
 }
 
-/// What the regular file at `path` opens as. Opened no-follow and proven regular on the
 /// handle, so a FIFO or a link swapped in cannot block or redirect the read.
 fn sniff(path: &Path) -> std::io::Result<Sniffed> {
     let head = crate::metadata_io::read_head(path, 8)?;
@@ -320,18 +294,11 @@ fn shown(root: &Path, path: &Path) -> String {
         .into_owned()
 }
 
-/// Every regular Mach-O file under `root`, sorted, walking without following a symlink.
-///
-/// Only a regular file is checked in place, so the shapes that would let code escape the
-/// check are refused ([`StageError::SignerRefused`]): an interpreter script (`#!`), which
-/// runs unsigned; a symlink that resolves to a Mach-O — the check would verify its target,
-/// not whatever the link names when it runs; and any entry that is neither a directory, a
-/// regular file nor a symlink, which no staging lane lays and whose contents cannot be
-/// read without the risk of blocking.
+/// Returns all regular Mach-O files under `root`, sorted, without following symlinks.
 ///
 /// # Errors
-/// [`StageError::SignerRefused`] for any of those shapes; [`StageError::Io`] when the tree
-/// cannot be read.
+/// [`StageError::SignerRefused`] on scripts, symlinked Mach-Os, or special files;
+/// [`StageError::Io`] on I/O failure.
 pub fn find_macho(root: &Path) -> Result<Vec<PathBuf>, StageError> {
     let mut found = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -377,16 +344,13 @@ pub fn find_macho(root: &Path) -> Result<Vec<PathBuf>, StageError> {
     Ok(found)
 }
 
-/// Whether the regular file at `path` is a native object, Mach-O or ELF whatever this
-/// platform is: the only files a dynamic-loader resolve check is meaningful for (a script
-/// or a data file has no libraries to resolve). Read no-follow, as [`sniff`] reads.
+/// Returns whether the regular file at `path` is a Mach-O or ELF object.
 #[must_use]
 pub(crate) fn is_native_object(path: &Path) -> bool {
     crate::metadata_io::read_head(path, 8)
         .is_ok_and(|head| is_macho_header(&head) || head.starts_with(b"\x7fELF"))
 }
 
-/// Whether `head` opens this platform's native executable format: Mach-O on macOS, ELF
 /// on every other unix. Elsewhere no file carries an execute bit to keep.
 fn is_native_executable(head: &[u8]) -> bool {
     if cfg!(target_os = "macos") {
@@ -396,8 +360,7 @@ fn is_native_executable(head: &[u8]) -> bool {
     }
 }
 
-/// Every regular file under `root` whose mode carries an execute bit, sorted, walking
-/// without following a symlink.
+/// Returns all regular files with an execute bit under `root`, sorted.
 ///
 /// # Errors
 /// [`StageError::Io`] when the tree cannot be read.
@@ -422,9 +385,7 @@ pub(crate) fn executable_files(root: &Path) -> Result<Vec<PathBuf>, StageError> 
     Ok(found)
 }
 
-/// Clear every execute bit on a regular file under `root` that is not this platform's
-/// native executable ([`is_native_executable`]), so vendor data shipped at 0755 is not
-/// runnable through `/bin/sh`. Returns whether any mode changed.
+/// Clears execute bits on non-native regular files under `root`.
 ///
 /// # Errors
 /// [`StageError::Io`] when the tree cannot be read or a mode cannot be set.
@@ -468,7 +429,6 @@ mod tests {
         h
     }
 
-    /// Every thin magic in either byte order is a Mach-O, and so is a universal header of
     /// either width and order with any nonzero arch count, a Java class file's included.
     #[test]
     fn thin_and_fat_headers_are_recognised_at_any_arch_count() {
@@ -492,7 +452,6 @@ mod tests {
         );
     }
 
-    /// A universal header counting no arch (it names no slice to run), a truncated
     /// header, and ordinary files are not Mach-O.
     #[test]
     fn empty_fat_headers_and_other_files_are_not() {
@@ -507,7 +466,6 @@ mod tests {
         assert!(!is_macho_header(b""));
     }
 
-    /// The walk finds thin and fat Mach-Os at any depth by content, whatever their names or
     /// arch counts, skips everything else, and sorts the list.
     #[test]
     fn the_walk_finds_thin_and_fat_files_by_content() {
@@ -537,7 +495,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// An interpreter script anywhere in the tree is refused by name: the kernel runs it
     /// with no signature to check, beside Mach-Os that all verify.
     #[test]
     fn an_interpreter_script_is_refused() {
@@ -560,7 +517,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// A symlink resolving to a Mach-O is refused by name — inside the tree or out of it —
     /// while a symlink to anything else, or to nothing, is left alone.
     #[cfg(unix)]
     #[test]
@@ -657,7 +613,6 @@ mod tests {
         c
     }
 
-    /// The fish row's shape: libSystem, an `LC_LOAD_DYLINKER` and an `LC_UUID` beside the
     /// dylib a Homebrew-linked build loads.
     fn homebrew_pcre2_fish(little: bool) -> Vec<u8> {
         thin(
@@ -699,8 +654,6 @@ mod tests {
         f
     }
 
-    /// A build that links Homebrew's PCRE2 is refused by name, in either byte order and
-    /// inside either universal table; the libSystem-only build is self-contained. The
     /// fish row's self-containment check (§6.2) is exactly [`foreign_dylibs`].
     #[test]
     fn a_homebrew_pcre2_link_is_foreign_and_libsystem_alone_is_not() {
@@ -872,7 +825,6 @@ mod tests {
         assert!(load_dylibs(&good).is_ok(), "the unmutated fixture reads");
     }
 
-    /// A real binary reads: the test binary itself and Apple's universal `/bin/ls` each
     /// load libSystem and nothing outside the OS.
     #[cfg(target_os = "macos")]
     #[test]

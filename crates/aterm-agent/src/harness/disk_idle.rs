@@ -176,7 +176,7 @@ pub fn under(path: &Path, dir: &Path, table: Option<&Table>) -> Option<bool> {
     }
 }
 
-/// Are `a` and `b` one path, by [`under`] both ways? `None`: either way
+/// Are `a` and `b` one path, by [`under`] both ways?
 fn same_path(a: &Path, b: &Path, table: Option<&Table>) -> Option<bool> {
     Some(under(a, b, table)? && under(b, a, table)?)
 }
@@ -543,6 +543,9 @@ pub fn tree_quiet(
 }
 
 /// The device the entry at `path` (read as `meta`, a link not followed) is
+/// on: `st_dev`; on Windows the volume serial of the one identity export
+/// ([`aterm_sysprobe::volumes::file_id`], read through a handle, the width
+/// every device fence compares).
 fn device(path: &Path, meta: &std::fs::Metadata) -> Option<u64> {
     #[cfg(unix)]
     {
@@ -558,6 +561,7 @@ fn device(path: &Path, meta: &std::fs::Metadata) -> Option<u64> {
 }
 
 /// Does the folder at `dir` carry a build tool's marker (it is a build
+/// directory, whose writes are a build's, not an edit)?
 fn build_marked(dir: &Path) -> bool {
     cachedir_tag_signed(&dir.join("CACHEDIR.TAG"))
         || std::fs::symlink_metadata(dir.join(RUSTC_INFO)).is_ok_and(|m| m.is_file())
@@ -573,6 +577,7 @@ pub fn resolve_local(path: &Path, table: &Table) -> Option<PathBuf> {
 }
 
 /// A local resolution, a positively remote/automounted path (`Ok(None)`),
+/// or an unknown reading.
 fn resolve_local_reading(path: &Path, table: &Table) -> std::io::Result<Option<PathBuf>> {
     use std::collections::VecDeque;
     use std::path::Component;
@@ -651,7 +656,7 @@ fn resolve_local_reading(path: &Path, table: &Table) -> std::io::Result<Option<P
     Ok(local_at(&at, table)?.then_some(at))
 }
 
-/// Does `table` place `path` on a local, non-automounted mount? An error when
+/// Does `table` place `path` on a local, non-automounted mount?
 fn local_at(path: &Path, table: &Table) -> std::io::Result<bool> {
     let m = aterm_sysprobe::volumes::mount_of(path, table).ok_or_else(|| {
         std::io::Error::other(format!("{} could not be placed on a mount", path.display()))

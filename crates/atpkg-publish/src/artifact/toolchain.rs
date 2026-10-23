@@ -1,15 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Trust toolchain a pack builds with: resolved once to a physical, build-numbered
-//! directory, held by an `atpkg` lease for the whole run, and admitted by content and
-//! lineage before anything is built.
-//!
-//! An explicit bin dir (`--toolchain`, which must hold `targo` and `trustc`, refused rather
-//! than set aside) wins; else the store's `<prefix>/store/trust/current/bin`, resolved
-//! physically. There is no PATH rung and no stock fallback. The lease is
-//! `atpkg::lease::hold_for`; the admission is `atpkg::lineage::check_compiler_with` under
-//! the policy [`super::lineage_switch`] reads.
+//! The Trust toolchain a pack builds with: resolved once to a physical, build-numbered directory,
+//! held by an `atpkg` lease for the whole run, and admitted by content and lineage before anything
+//! is built.
 
 use std::path::{Path, PathBuf};
 
@@ -28,9 +22,7 @@ pub enum Source {
     Store,
 }
 
-/// A resolved toolchain: its physical bin directory. `store/trust/current` is a link
-/// `aterm pkg install trust` repoints, so a pack holds the build-numbered directory behind
-/// it, which cannot move under a running pack.
+/// A resolved toolchain: its physical bin directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Toolchain {
     /// The physical `bin/`.
@@ -58,11 +50,9 @@ fn executable(p: &Path) -> bool {
 }
 
 /// Resolve the toolchain a pack builds with.
-///
 /// # Errors
-///
-/// A refusal when an explicit bin dir lacks `targo` or `trustc` (never set aside for the
-/// store), or when there is no store toolchain — naming `aterm pkg install trust` first.
+/// A refusal when an explicit bin dir lacks `targo` or `trustc` (never set aside for the store), or
+/// when there is no store toolchain — naming `aterm pkg install trust` first.
 pub fn resolve(ctx: &Ctx, explicit: Option<&Path>) -> Result<Toolchain> {
     let (dir, source) = match explicit {
         Some(d) => (d.to_path_buf(), Source::Explicit),
@@ -104,20 +94,15 @@ pub fn resolve(ctx: &Ctx, explicit: Option<&Path>) -> Result<Toolchain> {
 pub enum Held {
     /// The lease on a store build.
     Lease(atpkg::lease::Lease),
-    /// Nothing to hold: the directory is none of atpkg's, or the lease could not be
-    /// taken (said once; the run is exactly as exposed as it would be without one).
+    /// Nothing to hold: the directory is none of atpkg's, or the lease could not be taken.
     Nothing,
 }
 
-/// Lease the build `dir` belongs to (a toolchain's `bin/`, or a sysroot under the store)
-/// while the returned [`Held`] lives: gc never reclaims a leased build and an unattended
-/// trust update waits for it. Between a pack's steps no process runs from it, so only the
-/// lease says it is in use.
-///
+/// Lease the build `dir` belongs to (a toolchain's `bin/`, or a sysroot under the store) while the
+/// returned [`Held`] lives: gc never reclaims a leased build and an unattended trust update waits
+/// for it.
 /// # Errors
-///
-/// A refusal when the directory is gone once the lease is laid: the pack would run on a
-/// toolchain that was reclaimed.
+/// A refusal when the directory is gone once the lease is laid.
 pub fn lease(ctx: &Ctx, dir: &Path, who: &str) -> Result<Held> {
     match atpkg::lease::hold_for(&ctx.pkg_prefix, dir, who, atpkg::lease::DEFAULT_WAIT) {
         Ok(atpkg::lease::Hold::Held(l)) => Ok(Held::Lease(l)),
@@ -138,12 +123,8 @@ pub fn lease(ctx: &Ctx, dir: &Path, who: &str) -> Result<Held> {
     }
 }
 
-/// [`lease`], failing closed: a build under the store whose lease cannot be laid is refused
-/// rather than run on unleased. For a toolchain a gate RUNS (the bundle's hello sysroot),
-/// whose reclaim mid-run would leave the gate proving nothing.
-///
+/// [`lease`], failing closed.
 /// # Errors
-///
 /// [`lease`]'s, and a refusal when the store build's lease could not be taken.
 pub fn lease_required(ctx: &Ctx, dir: &Path, who: &str) -> Result<Held> {
     match atpkg::lease::hold_for(&ctx.pkg_prefix, dir, who, atpkg::lease::DEFAULT_WAIT) {
@@ -162,14 +143,10 @@ pub fn lease_required(ctx: &Ctx, dir: &Path, who: &str) -> Result<Held> {
     }
 }
 
-/// Admit the compiler in `bin` by content and lineage under `switch`'s policy, through
-/// the client's own checker; its record is the pack's provenance.
-///
+/// Admit the compiler in `bin` by content and lineage under `switch`'s policy, through the client's
+/// own checker; its record is the pack's provenance.
 /// # Errors
-///
-/// A refusal carrying every reason the checker gave — and, when the receipt was required
-/// only because nothing could read the switch, why (the remedy may be a fetch, not
-/// another compiler).
+/// A refusal carrying every reason the checker gave.
 pub fn admit(tools: &dyn Tools, bin: &Path, switch: &Switch) -> Result<atpkg::lineage::Compiler> {
     let probe = |p: &Path| tools::version(tools, p);
     atpkg::lineage::check_compiler_with(bin, switch.policy(), &probe).map_err(|lines| {
@@ -189,11 +166,8 @@ pub fn admit(tools: &dyn Tools, bin: &Path, switch: &Switch) -> Result<atpkg::li
 }
 
 /// The target a compiler names as its host (`-vV`'s `host:`).
-///
 /// # Errors
-///
-/// A refusal when it does not answer, names no host, or names one the client does not
-/// ship on.
+/// A refusal when it does not answer, names no host, or names one the client does not ship on.
 pub fn host_of(tools: &dyn Tools, compiler: &Path) -> Result<Triple> {
     let text = tools::version(tools, compiler).map_err(Error::refused)?;
     let host = text

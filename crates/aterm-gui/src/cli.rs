@@ -1,41 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! CLI argument parsing for `aterm-gui`, with no `App` coupling. A launch flag is recorded — the
-//! render/font flags (`--cpu`/`--gpu`, `--font`, `--font-px`, `--scale`) in [`crate::launch`],
-//! the rest in [`LaunchFlags`] — and never exported: no environment variable changes what a
-//! shipped aterm does, so a child process inherits nothing from a flag.
+//! CLI argument parsing for `aterm-gui`, with no `App` coupling.
 
 use std::sync::RwLock;
 
-/// Parsed CLI: the `-e` command to run instead of `$SHELL` (if any), the
-/// `--working-directory` to start it in (if any), whether to `--hold` the
-/// window open after the command exits, and whether `--headless` was passed.
+/// Parsed CLI: the `-e` command to run instead of `$SHELL` (if any), the `--working-directory` to start it in (if any), whether to `--hold` the window open after the command exits, and whether `--headless` was passed.
 pub(crate) struct Cli {
-    /// The `-e` payload as the OS gave it: a program's arguments are bytes, not
-    /// text, so they are never re-encoded on the way to the spawn.
+    /// The `-e` payload as the OS gave it: a program's arguments are bytes, not text, so they are never re-encoded on the way to the spawn.
     pub(crate) exec_command: Option<Vec<std::ffi::OsString>>,
     pub(crate) cwd: Option<String>,
     pub(crate) hold: bool,
-    /// `--headless`: no window — engine + PTY + control socket only — and on macOS no
-    /// application object either (no Dock tile, never the front app, no WindowServer connection;
-    /// `main_entry` in `lib.rs`), so a harness may boot one beside a person who is typing. An
-    /// update successor inherits it with the rest of argv.
+    /// `--headless`: no window — engine + PTY + control socket only — and on macOS no application object either (no Dock tile, never the front app, no WindowServer connection; `main_entry` in `lib.rs`), so a harness may boot one beside a person who is typing.
     pub(crate) headless: bool,
-    /// `--lifeline-fd <n>` (headless only): the descriptor whose end-of-file means the process
-    /// that started this instance is gone, so it shuts down ([`crate::lifeline`]).
+    /// `--lifeline-fd <n>` (headless only): the descriptor whose end-of-file means the process that started this instance is gone, so it shuts down ([`crate::lifeline`]).
     pub(crate) lifeline_fd: Option<i32>,
-    /// `--ready-fd <n>` (headless only): the pipe's write end this instance writes one byte to,
-    /// then closes, once its control socket listens ([`crate::lifeline`]'s ready signal). `None`
-    /// on an update's relaunch of a running instance, whose first image already said it.
+    /// `--ready-fd <n>` (headless only): the pipe's write end this instance writes one byte to, then closes, once its control socket listens ([`crate::lifeline`]'s ready signal).
     pub(crate) ready_fd: Option<i32>,
     /// The render/font flags, for `main` to [`crate::launch::install`].
     pub(crate) launch: crate::launch::Launch,
 }
 
-/// The launch flags: what this process's command line asked of it, recorded by [`parse_cli`]
-/// before any thread exists and read wherever the window needs it (the socket plan, the initial
-/// grid, the shell, the containment funnel).
+/// The launch flags: what this process's command line asked of it, recorded by [`parse_cli`] before any thread exists and read wherever the window needs it (the socket plan, the initial grid, the shell, the containment funnel).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LaunchFlags {
     /// `--columns <n>` (20..=500, validated on the way in).
@@ -44,11 +30,9 @@ pub(crate) struct LaunchFlags {
     pub(crate) lines: Option<u16>,
     /// `--shell <name|path>`: outranks the config `shell` for every new tab.
     pub(crate) shell: Option<String>,
-    /// `--containment <mode>` / `--sandbox` / `--no-sandbox`, as typed: the parse,
-    /// and its fail-closed fallback, are the launch funnel's in `main`.
+    /// `--containment <mode>` / `--sandbox` / `--no-sandbox`, as typed: the parse, and its fail-closed fallback, are the launch funnel's in `main`.
     pub(crate) containment: Option<String>,
-    /// `--control-sock <path|0|off>` / `--no-control-sock`: the socket
-    /// directive's two inputs ([`aterm_types::control_socket::socket_directive`]).
+    /// `--control-sock <path|0|off>` / `--no-control-sock`: the socket directive's two inputs ([`aterm_types::control_socket::socket_directive`]).
     pub(crate) control_sock: Option<String>,
     /// `--no-control-sock`.
     pub(crate) no_control_sock: bool,
@@ -71,8 +55,7 @@ impl LaunchFlags {
         verbose: false,
     };
 
-    /// The control-socket directive these flags ask for: the same decision a client makes about a
-    /// socket path ([`aterm_types::control_socket::socket_directive`]).
+    /// The control-socket directive these flags ask for: the same decision a client makes about a socket path ([`aterm_types::control_socket::socket_directive`]).
     pub(crate) fn socket_directive(&self) -> aterm_types::control_socket::SocketDirective {
         aterm_types::control_socket::socket_directive(
             self.control_sock.as_deref(),
@@ -81,9 +64,7 @@ impl LaunchFlags {
     }
 }
 
-/// The process's launch flags. Written only by [`parse_cli`] (single-threaded
-/// startup, so a diagnostic verb later on the same command line — `--columns 120
-/// --show-config` — reports what the flags before it asked for).
+/// The process's launch flags.
 static LAUNCH_FLAGS: RwLock<LaunchFlags> = RwLock::new(LaunchFlags::NONE);
 
 /// This process's launch flags (a copy; a poisoned lock still yields its value).
@@ -102,8 +83,7 @@ fn set_launch_flag(set: impl FnOnce(&mut LaunchFlags)) {
     set(&mut flags);
 }
 
-/// The `--shell` lines of [`HELP_HEAD`], as this platform resolves a shell: Windows discovers
-/// a name (Git Bash off PATH, the `wsl`/`cmd` aliases); Unix looks it up on PATH.
+/// The `--shell` lines of [`HELP_HEAD`], as this platform resolves a shell: Windows discovers a name (Git Bash off PATH, the `wsl`/`cmd` aliases); Unix looks it up on PATH.
 #[cfg(windows)]
 macro_rules! shell_flag_help {
     () => {
@@ -130,8 +110,7 @@ macro_rules! shell_flag_help {
 }
 
 /// The `--help` text: every user-facing flag with its argument, a one-line description and its
-/// `[config: key]` where it has one. No environment variable changes what a shipped aterm does,
-/// so precedence is flag > config > default.
+/// `[config: key]` where it has one.
 const HELP_TITLE: &str = "aterm-gui — a fast, hardened terminal\n";
 const HELP_HEAD: &str = concat!(
     "\n",
@@ -191,9 +170,7 @@ const HELP_HEAD: &str = concat!(
     "    -V, --version                  Print the version and exit.\n\n",
 );
 
-/// The macOS keyboard-shortcut help: the common Cmd-* chords. Other platforms list the
-/// Ctrl+Shift defaults seeded by [`crate::keybinding::Keybindings::platform_defaults`] (no Cmd
-/// key there, and the desktop grabs Super).
+/// The macOS keyboard-shortcut help: the common Cmd-* chords.
 #[cfg(target_os = "macos")]
 const KEYS_HELP: &str = concat!(
     "KEYS (in the window):\n",
@@ -215,8 +192,7 @@ const KEYS_HELP: &str = concat!(
 
 /// The non-macOS KEYS section, generated from
 /// [`crate::keybinding::Keybindings::PLATFORM_DEFAULT_PAIRS`] (the table `platform_defaults()`
-/// seeds) so it cannot drift from the window. Chords are grouped per action in table order and
-/// printed verbatim: they are exactly what a `[keybindings]` override key says.
+/// seeds) so it cannot drift from the window.
 #[cfg(not(target_os = "macos"))]
 fn keys_help() -> String {
     let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
@@ -242,7 +218,6 @@ fn keys_help() -> String {
     for (chords, action) in rows {
         s.push_str(&format!("    {chords:<width$}  {action}\n"));
     }
-    // Not a chord, so not in the table: the pointer half of the keymap.
     s.push_str("    ctrl+click  Open hyperlink, URL (http/https/mailto) or file:line citation;\n");
     s.push_str("                ctrl+alt+click where the program tracks the mouse.\n");
     s.push_str(
@@ -329,10 +304,6 @@ fn starter_config_for(path: &std::path::Path) -> String {
 }
 
 /// Windows-only verbs, appended to `--help` on Windows alone.
-///
-/// `--unset-default-terminal` is the escape hatch from an `HKCU\Console\%%Startup` delegation to
-/// a class nothing can create (no console opens), so it must be findable from the binary.
-/// `--set-default-terminal` is not listed: it refuses in every build (no COM handoff server).
 #[cfg(windows)]
 const WINDOWS_HELP_TAIL: &str = concat!(
     "\nWINDOWS:\n",
@@ -342,8 +313,7 @@ const WINDOWS_HELP_TAIL: &str = concat!(
     "                               terminal's registration is left alone.\n",
 );
 
-/// The shell block of [`STARTER_CONFIG`], as this platform resolves a shell (see
-/// `shell_flag_help!`).
+/// The shell block of [`STARTER_CONFIG`], as this platform resolves a shell (see `shell_flag_help!`).
 #[cfg(windows)]
 macro_rules! starter_shell_block {
     () => {
@@ -376,8 +346,7 @@ macro_rules! starter_shell_block {
 }
 
 /// The documented starter config `--write-config` writes: Linux-tuned, every line commented so
-/// writing it changes nothing. The header's [`CONFIG_PATH_SLOT`] is filled with the path it is
-/// written to ([`starter_config_for`]).
+/// writing it changes nothing.
 const STARTER_CONFIG: &str = concat!(
     "\
 # aterm — <aterm.toml>
@@ -617,7 +586,7 @@ const STARTER_CONFIG: &str = concat!(
 );
 
 /// Pull the next argument as the value for `flag`, exiting 2 with a hint if it is
-/// missing. Used by the value-taking flags so they share one error shape.
+/// missing.
 fn flag_value(flag: &str, args: &mut impl Iterator<Item = std::ffi::OsString>) -> String {
     match args.next() {
         Some(v) => v.to_string_lossy().into_owned(),
@@ -644,11 +613,6 @@ fn initial_dimension_flag(value: &str, min: u16, max: u16) -> Option<u16> {
 
 /// Write a print-and-exit flag's answer to stdout and end the process with the flag's `code`, or
 /// 1 when the answer could not be written.
-///
-/// Never `print!`: it panics when the pipe's reader has gone, an ordinary shape on Windows, where
-/// pwsh does not wait for a GUI-subsystem child (`aterm-gui --version 1>$null`, os error 232) and
-/// a reader may stop early (`| findstr …`, os error 109). One `write_all` also hands the console
-/// the answer in as few writes as the stream allows.
 fn answer_and_exit(argv: &[String], text: &str, code: i32) -> ! {
     use std::io::Write as _;
     let written = aterm_uds::stdout::write_all(text.as_bytes());
@@ -674,19 +638,14 @@ fn answer_status(written: std::io::Result<()>, code: i32) -> Result<i32, String>
 
 /// Whether this answer went straight onto a console this process attached to: the windowed
 /// image (GUI subsystem) typed at a shell prompt with its output not redirected, the one shape
-/// whose answer can land after the prompt. The console image, a redirected or piped answer, and
-/// a launch with no console behind it (Explorer, the console image's own handoff, whose stdio is
-/// NUL) never are.
+/// whose answer can land after the prompt.
 #[cfg(windows)]
 fn answered_onto_an_unwaited_console() -> bool {
     use std::io::IsTerminal as _;
     crate::win32::attached_a_console() && std::io::stdout().is_terminal()
 }
 
-/// The one stderr line under such an answer. Nothing can make the prompt wait (it would not wait
-/// for a child of this process either), so the line names the spelling a prompt does wait for:
-/// `aterm --window` with the same flags, whose answer is this parser's byte for byte. `cmd /c`
-/// and a pwsh pipeline do wait, hence "can", not "did".
+/// The one stderr line under such an answer.
 #[cfg(any(windows, test))]
 fn unwaited_answer_line(argv: &[String]) -> String {
     let flags: Vec<String> = argv
@@ -707,7 +666,6 @@ fn unwaited_answer_line(argv: &[String]) -> String {
 }
 
 /// Ordinary window options shared by parsing and first-launch classification.
-/// Scope controls, commands and utility verbs have their own parser branches.
 #[derive(Clone, Copy)]
 enum OrdinaryWindowOption {
     WorkingDirectory,
@@ -759,10 +717,7 @@ impl OrdinaryWindowOption {
     }
 }
 
-/// Whether a command line contains only ordinary window options. The front
-/// door removes its own mode switches before calling this pure classifier.
-/// Numeric values and paths are validated by the real parser before setup can
-/// start; values that resemble other options still belong to their option.
+/// Whether a command line contains only ordinary window options.
 #[must_use]
 pub fn initial_setup_window_args(args: &[std::ffi::OsString]) -> bool {
     let mut args = args.iter();
@@ -778,22 +733,12 @@ pub fn initial_setup_window_args(args: &[std::ffi::OsString]) -> bool {
 }
 
 /// CLI: `aterm-gui [OPTIONS] [-e CMD ARGS… | --help | --version]`.
-/// `--help`/`--version` print and exit; an unknown option, a bad `-d`, `-e` without a command,
-/// or a value flag missing its argument prints a hint and exits 2. With no args (a Finder/.app
-/// launch) a normal shell starts in the inherited directory. Numeric flags are validated here,
-/// containment by its own fail-closed funnel in `main`. Every print-and-exit flag answers
-/// through [`answer_and_exit`].
 pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
-    // Flags and values are read lossily (a non-UTF-8 flag is a usage error); argv is also kept
-    // whole for `unwaited_answer_line`. The walk is over the OS strings, so the `-e` payload
-    // reaches the program byte for byte.
     let argv: Vec<String> = os_argv
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
     let mut args = os_argv.into_iter();
-    // An update's relaunch of a window that is already running (`ATERM_UPDATED_FROM`,
-    // set by every update lane on the image it starts): see `start_dir_refusal`.
     let update_successor = std::env::var_os("ATERM_UPDATED_FROM").is_some();
     let mut cwd: Option<String> = None;
     let mut hold = false;
@@ -843,7 +788,6 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                         }
                     }
                 }
-                // The last renderer option wins, and either outranks config.
                 OrdinaryWindowOption::Gpu => {
                     launch.renderer = Some(crate::launch::RendererFlag::Gpu);
                 }
@@ -876,7 +820,6 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                         std::process::exit(2);
                     }
                 }
-                // Accepted and ignored: shell integration is on by default.
                 OrdinaryWindowOption::ShellIntegration => {}
                 OrdinaryWindowOption::NoShellIntegration => {
                     set_launch_flag(|f| f.no_shell_integration = true);
@@ -896,18 +839,14 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                     keys_help(),
                     help_tail()
                 );
-                // Windows-only verbs stay out of HELP_TAIL so no Unix build advertises a flag
-                // it lacks.
                 #[cfg(windows)]
                 let help = help + WINDOWS_HELP_TAIL;
                 answer_and_exit(&argv, &help, 0);
             }
             "-V" | "--version" => {
-                // The workspace version as written, with no build-provenance suffix.
                 let version = format!("aterm-gui {}\n", crate::build_info::version_display());
                 answer_and_exit(&argv, &version, 0);
             }
-            // Flags before it count: `--gpu --diagnose` reports the GPU renderer.
             "--diagnose" => {
                 crate::launch::install(launch.clone());
                 answer_and_exit(&argv, &crate::diagnostics::collect().render(), 0);
@@ -962,8 +901,6 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                 answer_and_exit(&argv, &crate::diagnostics::list_keybinds(), 0);
             }
             "--show-face" => {
-                // Optional family argument; empty falls back to the effective
-                // font_family (--font > config). Exits non-zero if it does not resolve.
                 crate::launch::install(launch.clone());
                 let family = args
                     .next()
@@ -979,8 +916,6 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                 );
                 answer_and_exit(&argv, &report, 0);
             }
-            // Windows: install/remove the "Open aterm here" Explorer context menu
-            // (per-user HKCU verb on directories/backgrounds/drives → `aterm-gui -d <path>`).
             #[cfg(windows)]
             "--install-context-menu" => {
                 if let Err(e) = crate::explorer_win::install() {
@@ -1004,9 +939,6 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                     0,
                 );
             }
-            // Windows 11 default-terminal (DefTerm) handoff: refused in every build
-            // (`defterm_win::handoff_server_available`), loudly, since a silent no-op would look
-            // like a registration that took.
             #[cfg(windows)]
             "--set-default-terminal" => match crate::defterm_win::set_default_terminal() {
                 Ok(()) => answer_and_exit(
@@ -1039,10 +971,6 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                     std::process::exit(1);
                 }
             },
-            // Never gated on the handoff server: removal is the escape hatch from a broken
-            // delegation and works in every build. It is guarded on ownership: the
-            // `HKCU\Console\%%Startup` setting is shared, so a registration aterm did not write is
-            // left alone and said so.
             #[cfg(windows)]
             "--unset-default-terminal" => {
                 use crate::defterm_win::UnsetOutcome;
@@ -1072,8 +1000,6 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                 };
                 answer_and_exit(&argv, &said, 0);
             }
-            // Containment: the last of these wins (`--sandbox --containment
-            // user` is user); the fail-closed parse is the launch funnel's.
             "--containment" => {
                 let mode = flag_value("--containment", &mut args);
                 set_launch_flag(|f| f.containment = Some(mode));
@@ -1086,10 +1012,7 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
             }
             "--no-control-sock" => set_launch_flag(|f| f.no_control_sock = true),
             "--headless" => headless = true,
-            // Validated once the whole command line is read: it needs `--headless`,
-            // which may come after it.
             "--lifeline-fd" => lifeline_fd = Some(flag_value("--lifeline-fd", &mut args)),
-            // As `--lifeline-fd`: validated once the whole command line is read.
             "--ready-fd" => ready_fd = Some(flag_value("--ready-fd", &mut args)),
             "-e" | "--command" => {
                 let cmd: Vec<std::ffi::OsString> = args.by_ref().collect();
@@ -1100,13 +1023,7 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                 exec_command = Some(cmd);
                 break;
             }
-            // Verbs are not parsed here: this parser runs only after the mode fork chose the
-            // window, so a verb wired here is invisible at a terminal. The front door
-            // (`crates/aterm/src/main.rs`) owns every `aterm_cli::Verb`.
             other => {
-                // A bare word is a command the front door did not resolve, not an
-                // option — the session parser's same split, so one mistake reads
-                // one way at a terminal and through a pipe.
                 let noun = if other.starts_with('-') {
                     "option"
                 } else {
@@ -1139,21 +1056,13 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
 }
 
 /// The usage error `-d <dir>` stops a launch with, or `None` to take the folder.
-///
-/// A missing folder stops a person's launch (a window elsewhere is not what they asked for),
-/// never an update's relaunch of a running window (`update_successor`): the folder existed when
-/// the window opened, and refusing there would stop that window ever updating. The folder stays
-/// the default for new tabs; a shell that cannot start there starts in the home folder and says
-/// so (`spawn_folder::start_folder`).
 fn start_dir_refusal(dir: &str, update_successor: bool) -> Option<String> {
     (!update_successor && !std::path::Path::new(dir).is_dir())
         .then(|| format!("not a directory: {dir}"))
 }
 
 /// The `--lifeline-fd` decision, pure: `Ok(None)` when the flag is absent, the descriptor number
-/// when it is well-formed on a headless launch, and the usage error otherwise. A window is
-/// refused rather than armed: it is a person's to close, and the quit path a cut lifeline takes
-/// would ask them first.
+/// when it is well-formed on a headless launch, and the usage error otherwise.
 fn lifeline_request(value: Option<&str>, headless: bool) -> Result<Option<i32>, String> {
     let Some(value) = value else {
         return Ok(None);
@@ -1174,10 +1083,7 @@ fn lifeline_request(value: Option<&str>, headless: bool) -> Result<Option<i32>, 
 
 /// The `--ready-fd` decision, pure: `Ok(None)` when the flag is absent, the descriptor number
 /// when it is well-formed on a headless launch, and the usage error otherwise — refused for a
-/// window (a person sees it come up) and for 0-2 (the instance's own stdio). On an update's
-/// relaunch of a running instance (`relaunch_of_running`, `aterm_update::RELAUNCH_OF_RUNNING_ENV`)
-/// the flag is the first image's argv carried over: that image signalled and closed its
-/// descriptor long ago, and the number may name another descriptor now, so it is dropped unread.
+/// window (a person sees it come up) and for 0-2 (the instance's own stdio).
 fn ready_request(
     value: Option<&str>,
     headless: bool,
@@ -1308,7 +1214,6 @@ mod tests {
     fn the_headless_flag_is_recorded_and_exports_nothing() {
         let cli = super::parse_cli(vec![std::ffi::OsString::from("--headless")]);
         assert!(cli.headless);
-        // No lifeline unless one is asked for, and no ready signal.
         assert_eq!(cli.lifeline_fd, None);
         assert_eq!(cli.ready_fd, None);
     }
@@ -1472,9 +1377,7 @@ mod tests {
     }
 
     /// Unset is never gated on the handoff server: clearing `HKCU\Console\%%Startup` is the
-    /// escape hatch from a delegation to a class nothing can create. Behavioural: `set` refuses
-    /// with `Unsupported` while the gate is false, and `unset` returns an outcome on the live
-    /// machine without writing anything.
+    /// escape hatch from a delegation to a class nothing can create.
     #[cfg(windows)]
     #[test]
     fn unset_default_terminal_is_never_gated_while_set_refuses() {
@@ -1490,8 +1393,6 @@ mod tests {
         crate::defterm_win::unset_default_terminal()
             .expect("unset must not fail on the live machine, gated or not");
         let after = crate::defterm_win::current_delegation().expect("read");
-        // aterm is never the default (set refuses), so unset is inert here; `defterm_win`'s
-        // scratch-key test drives the foreign-registration case.
         assert_eq!(
             before, after,
             "unset must not touch a delegation aterm does not own"
@@ -1538,9 +1439,6 @@ mod tests {
 
     #[test]
     fn starter_config_keys_all_deserialize() {
-        // Every commented top-level `key = value` line in the starter must deserialize into
-        // `Config` when uncommented: one type-mismatched example fails the whole parse, and
-        // `load_config` then ignores the user's entire file.
         use crate::app_config::Config;
         let mut in_table = false;
         let mut checked: Vec<String> = Vec::new();
@@ -1553,13 +1451,10 @@ mod tests {
                 continue;
             };
             let rest = rest.trim_start();
-            // A commented table header ([keybindings]): keys below it are table-scoped
-            // and not valid as a standalone top-level document, so stop checking.
             if rest.starts_with('[') {
                 in_table = true;
                 continue;
             }
-            // Only top-level `ident = …` lines (skip prose comments / section rules).
             let key = rest.split('=').next().map(str::trim).filter(|k| {
                 !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             });
@@ -1575,9 +1470,6 @@ mod tests {
                 checked.push(key.to_string());
             }
         }
-        // Every number the starter shows, in any table, is spelled as aterm writes one
-        // (`prefs::written_number`: `window_padding = 12`, never `12.0`), so a file that
-        // mixes uncommented starter lines with Settings' own writes has one spelling.
         let mut numbers = 0;
         for raw in super::STARTER_CONFIG.lines() {
             let Some(rest) = raw.trim_start().strip_prefix('#') else {
@@ -1607,8 +1499,6 @@ mod tests {
             numbers += 1;
         }
         assert!(numbers > 30, "only {numbers} numbers checked");
-        // Bare top-level keys must sit above `[keybindings]` (the last section), or the
-        // table-scope skip never checks them: assert each security opt-in was reached.
         for must in [
             "allow_window_ops",
             "allow_notifications",
@@ -1626,10 +1516,7 @@ mod tests {
     }
 
     /// The `[matrix_rain]` starter block is table-scoped, so the line-by-line check above skips
-    /// it: uncomment the whole block and parse it as one document. Every line must deserialize
-    /// into [`Config`], and every documented key must land in
-    /// [`crate::app_config::MatrixRainConfig`] (serde ignores unknown keys, so a typo would be
-    /// dead documentation).
+    /// it: uncomment the whole block and parse it as one document.
     #[test]
     fn starter_config_matrix_rain_block_deserializes() {
         use crate::app_config::Config;
@@ -1647,7 +1534,6 @@ mod tests {
                 }
                 continue;
             }
-            // Only `ident = …` lines (prose comment lines have no bare key).
             let key_ok = rest.split('=').next().map(str::trim).is_some_and(|k| {
                 !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             });
@@ -1682,7 +1568,6 @@ mod tests {
         assert!(mr.turn_wave.is_some(), "starter documents `turn_wave`");
         assert!(mr.bell_alert.is_some(), "starter documents `bell_alert`");
         assert!(mr.seed.is_some(), "starter documents `seed`");
-        // The starter documents the default-off posture (costume mode is opt-in).
         assert_eq!(mr.enabled, Some(false), "the starter example ships OFF");
     }
 }

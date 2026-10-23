@@ -1,34 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 for `DiskReclaimPass` (`aterm_models_harness::disk_reclaim_pass_model`):
-//! the real tier planner (`disk::pass_plan`) and the real pass
-//! (`disk::apply_auto`), driven with scripted re-measures and removals on
-//! synthetic reports at every measured level, with and without an adopted
-//! demand. Every step the real pass takes — the tier it enters, each re-measure
-//! against its tier's target, each intent row, each lock and removal, each stop
-//! — is projected onto the model and must be an ENABLED action there, every
-//! invariant holding after it. And the planner is held to the model's
-//! admission both ways: a tier has rows in the plan exactly when the model
-//! admits it at that level.
-//!
-//! The reserve is bound too: the real `disk_reserve_look` releases it exactly
-//! when the model lets `ReleaseReserve` fire.
-//!
-//! The report holds rows of every tier at every level (the planner's own
-//! admission is what is held), tier 3's among them. A WHOLE unit (tiers 1 and
-//! 3) is removed by the REAL primitive (`target::reclaim_whole_with`,
-//! `target::reclaim_profiles_with`) on a cargo build directory laid for it,
-//! and its locks are projected from the primitive's own `Stage::Locked`
-//! (`LockHeld`) and its delete from `Stage::Deleting` (`Remove`): the model's
-//! `WholeOnlyHeld` is held to what the real removal does, never inserted by
-//! the test.
-//!
-//! Negative controls: a planner that admits tier 4 for a demand at a measured
-//! `low` (the defect `AdmitRecentOnDemand` stands for), and a whole removal
-//! that deletes before it locks (`RemoveUnheld`), are projected the same way,
-//! and the checker must reject each — so a checker that accepts everything
-//! fails this test.
+//! Tier-1 conformance tests for `DiskReclaimPass` against `disk::pass_plan` and `disk::apply_auto`.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -254,8 +227,6 @@ fn project(m: &Model, s: &mut S, plan: &[Planned], events: &[Event]) -> Result<(
         Ok(())
     };
     let mut pending: Option<u64> = None;
-    // The unit in flight: its locks seen held, its removal begun, and each
-    // profile whose locks the primitive took.
     let mut locked = false;
     let mut removed = false;
     let mut held: Vec<&PathBuf> = Vec::new();
@@ -282,7 +253,6 @@ fn project(m: &Model, s: &mut S, plan: &[Planned], events: &[Event]) -> Result<(
                 }
             }
             Event::Deleting(_, profile) => {
-                // Each profile is deleted under its own locks, the first one
                 // the unit's removal.
                 if !held.contains(&profile) {
                     return Err(format!(
@@ -319,9 +289,7 @@ fn project(m: &Model, s: &mut S, plan: &[Planned], events: &[Event]) -> Result<(
 /// A cargo build directory at `dir`, as cargo lays one: a signed
 /// `CACHEDIR.TAG`, `.rustc_info.json`, and two profiles (`debug/`,
 /// `release/`), each with every build lock, `.fingerprint/`, `deps/` (an
-/// rlib), `build/` and `incremental/`. Answered canonical (macOS's temp dir
-/// sits behind the `/var` link, and the primitives reach nothing through a
-/// link).
+/// rlib), `build/` and `incremental/`.
 fn lay(dir: &Path) -> PathBuf {
     for profile in ["debug", "release"] {
         let p = dir.join(profile);
@@ -399,8 +367,6 @@ fn run_with(rep: &Report, script: &[u64], whole: Whole) -> (Option<Applied>, Vec
     let reads = RefCell::new(0usize);
     let scratch = Scratch::new("whole");
     let laid = RefCell::new(0usize);
-    // Eight days after the fixtures are written: every profile idle, past
-    // tier 3's seven-day window and tier 1's quiet one.
     let now =
         aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX)) + 8 * 86_400;
     let judge = disk::Judge {
@@ -511,7 +477,6 @@ fn the_real_pass_takes_only_the_models_steps_at_every_level() {
         for demand in [None, Some(need)] {
             let rep = report_at(free, demand);
             let start = looked(&m, measure, demand.is_some()).expect("the look");
-            // Admission, both ways.
             let plan = disk::pass_plan(&rep).unwrap_or_default();
             for tier in [
                 Tier::EndedOwners,
@@ -556,9 +521,7 @@ fn the_real_pass_takes_only_the_models_steps_at_every_level() {
 }
 
 /// THE RESERVE: the real look releases it at a measured emergency and at no
-/// other level, exactly where the model lets `ReleaseReserve` fire. (Levels at
-/// or above the floor would write the reserve, which needs room this test does
-/// not take; below it nothing is written.)
+/// other level, exactly where the model lets `ReleaseReserve` fire.
 #[test]
 fn the_reserve_is_released_exactly_where_the_model_lets_it_go() {
     use aterm_agent::harness::cli::{ReserveMove, disk_reserve_look};
@@ -596,8 +559,7 @@ fn the_reserve_is_released_exactly_where_the_model_lets_it_go() {
 
 /// NEGATIVE CONTROL: a planner that admits tier 4 for a demand at a measured
 /// `low` — recent caches taken for an agent's wait — is caught: projected the
-/// same way, its first recent row's tier is one the model does not admit. And
-/// the same projection of the real planner's plan at that level passes.
+/// same way, its first recent row's tier is one the model does not admit.
 #[test]
 fn a_planner_that_takes_recent_caches_for_a_demand_is_rejected() {
     let m = disk_reclaim_pass_model();
@@ -623,8 +585,6 @@ fn a_planner_that_takes_recent_caches_for_a_demand_is_rejected() {
                     e.push(Event::Read(free));
                 }
                 e.push(Event::Removing(p.row.path.clone(), p.row.tier()));
-                // A whole unit's locks, as its primitive tells them (this
-                // control is about the planner).
                 if matches!(p.row.tier(), Some(Tier::EndedOwners | Tier::IdleWhole)) {
                     e.push(Event::Locked(p.row.path.clone(), p.row.path.clone()));
                     e.push(Event::Deleting(p.row.path.clone(), p.row.path.clone()));
@@ -644,9 +604,7 @@ fn a_planner_that_takes_recent_caches_for_a_demand_is_rejected() {
 /// NEGATIVE CONTROL for the locks: a whole removal that deletes a profile's
 /// contents BEFORE the real primitive takes its locks (the defect
 /// `RemoveUnheld` stands for) is caught — its first delete projects onto
-/// `Remove` with no `LockHeld` before it. And the same report through the
-/// real primitive alone conforms, every whole unit's `LockHeld` read from its
-/// own `Stage::Locked`.
+/// `Remove` with no `LockHeld` before it.
 #[test]
 fn a_whole_removal_that_deletes_before_it_locks_is_rejected() {
     let m = disk_reclaim_pass_model();

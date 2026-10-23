@@ -462,6 +462,7 @@ impl Checks {
 pub const WORKER_TEXTS: &str = "workers-text.txt";
 
 /// A FAILED RUN KEEPS WHAT EACH WORKER'S TAB SHOWS: its `status` line and its `text`, printed and
+/// in the run's [`WORKER_TEXTS`].
 fn keep_worker_texts(run: &Run, door: &Door, sids: &[String]) {
     let mut all = String::new();
     for sid in sids {
@@ -511,6 +512,7 @@ fn transcript_of<'a>(all: &'a [(PathBuf, Vec<Row>)], token: &str) -> Option<&'a 
 }
 
 /// Whether the manager's transcript holds its summary: the last row its
+/// scripted turns write, which may land a moment after the screen draws it.
 fn summary_written(run: &Run, plan: &Plan) -> bool {
     transcript_of(&transcripts(run), &plan.mgr).is_some_and(|rows| {
         rows.iter()
@@ -564,6 +566,7 @@ enum Verdict {
 }
 
 /// The text a task notification holds between `<name>` and `</name>`
+/// (`task-id`, `output-file`, `status`).
 fn notification_field<'a>(text: &'a str, name: &str) -> Option<&'a str> {
     let (_, rest) = text.split_once(&format!("<{name}>"))?;
     rest.split_once(&format!("</{name}>"))
@@ -571,6 +574,9 @@ fn notification_field<'a>(text: &'a str, name: &str) -> Option<&'a str> {
 }
 
 /// Where Claude Code, run with `CLAUDE_CODE_TMPDIR=<tmp_root>`, writes the
+/// output of the background command `task_id` that the conversation of
+/// `transcript` (`<home>/projects/<project>/<session>.jsonl`) started:
+/// `<tmp_root>/claude-<uid>/<project>/<session>/tasks/<task_id>.output`.
 fn task_output_path(tmp_root: &Path, transcript: &Path, task_id: &str) -> Option<PathBuf> {
     let word = !task_id.is_empty()
         && task_id.len() <= 64
@@ -598,9 +604,12 @@ fn task_output_path(tmp_root: &Path, transcript: &Path, task_id: &str) -> Option
 }
 
 /// The most of the await's output the lab reads: its three rows and the exit
+/// line Claude Code adds are well under one KiB.
 const AWAIT_OUTPUT_MAX: u64 = 64 * 1024;
 
 /// The text at `path` through the scratch reader (no link anywhere on its
+/// path, the lab user's regular file with one name), read only while it is
+/// at most `max` bytes; why it was not read otherwise.
 fn read_bounded(path: &Path, max: u64) -> Result<String, String> {
     let file = crate::sys::scratch_file(path)
         .map_err(|e| e.to_string())?
@@ -639,6 +648,7 @@ pub fn upgrade_of(ls: &str, sid: &str) -> String {
 }
 
 /// What a worker's record and result say, for the drill's before and after:
+/// the record's `rev= state= why= result_bytes=`, and the result as printed.
 fn held(door: &Door<'_>, sid: &str) -> Result<(String, String), Fail> {
     let at = format!("@{sid}");
     let task = door.out(&[at.as_str(), "task"]);
@@ -651,6 +661,11 @@ fn held(door: &Door<'_>, sid: &str) -> Result<(String, String), Fail> {
 }
 
 /// THE LIVE UPGRADE OF DONE WORKERS (`--upgrade <newer-claude-bin>`, on a lab
+/// that runs an older build: `LAB_CLAUDE`): `twin` presents `bin` as a newer
+/// managed Claude Code, the instance's live upgrade moves every session onto
+/// it, and each done worker must come back with its record and its result as
+/// they were (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §2.3: the
+/// result is a snapshot, never read again).
 fn upgrade_drill(
     run: &Run,
     door: &Door<'_>,
@@ -714,6 +729,7 @@ fn upgrade_drill(
 }
 
 /// One proof on the lab `tag`, which [`cmd_workers`] brought up; with
+/// `upgrade`, the live-upgrade drill after it ([`upgrade_drill`]).
 #[allow(clippy::too_many_lines)]
 fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict, Fail> {
     let could_not = |m: &str| Fail::exit(3, format!("workers: COULD NOT RUN: {m}"));
@@ -1545,6 +1561,9 @@ mod tests {
     }
 
     /// The await's output is read only where Claude Code writes the task's
+    /// output for the manager's own conversation under the temp root the lab
+    /// gave it, a path the lab builds: never wherever the notification's text
+    /// points.
     #[test]
     fn the_await_output_is_read_where_the_managers_conversation_writes_it() {
         let root = Path::new("/s/runs/t/scratch/tmp.Ab12Cd");

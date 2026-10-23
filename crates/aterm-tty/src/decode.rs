@@ -1,87 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The input decoder: the bytes a terminal writes to the program on it, read back
-//! into keys, mouse reports, pastes, focus changes, resizes and probe replies
-//! (docs/DESIGN-amacs-2026-10-19.md §5.3).
-//!
-//! It is pure. [`Decoder::feed`] takes what one read returned and when it was read;
-//! [`Decoder::flush`] resolves what the reads left unfinished once its deadline has
-//! passed with nothing more read. Nothing sleeps and nothing reads a clock, and how the
-//! bytes were split into reads never changes the events: only a `flush` can, and only
-//! past the deadline.
-//!
-//! # What it reads
-//!
-//! - Legacy keys: C0 controls, ESC-prefixed Alt, UTF-8 assembled across reads
-//!   (malformed bytes become U+FFFD exactly where [`String::from_utf8_lossy`] puts
-//!   one).
-//! - `CSI … ~` keys and the `CSI 1 ; m X` letter keys with xterm's `m`, SS3 keys
-//!   (F1-F4, application-mode cursor keys, the application keypad), `CSI Z`, and
-//!   xterm's `CSI 27 ; m ; code ~`.
-//! - Kitty's `CSI code[:shifted[:base]] [; mods[:event]] [; text] u`, every
-//!   [`NamedKey`] by its kitty code. amacs pushes flags 1 and 4 (disambiguate, and the
-//!   shifted key of a Shift chord); neither touches text, so IME composition stays
-//!   safe. The base-layout key is read past and dropped.
-//! - SGR 1006 mouse reports, and X10 ones (`CSI M` and three raw bytes) so a terminal
-//!   that ignores 1006 never types its reports into a document.
-//! - Bracketed paste (`CSI 200 ~` … `CSI 201 ~`) read raw, with no key decoding
-//!   inside, and capped at [`MAX_PASTE_BYTES`]; focus (`CSI I`, `CSI O`); DEC 2048's
-//!   in-band size report (`CSI 48 ; rows ; cols ; … t`).
-//! - Probe replies ([`Reply`]): XTVERSION, kitty's flags, DECRPM and DA1.
-//!
-//! # Canonical readings
-//!
-//! Legacy bytes lose information, so the decoder picks one reading of each; kitty
-//! flag 1 spells every one of these chords as `CSI … u`, which reads back exactly.
-//!
-//! - TAB is Tab (Ctrl+I), CR is Enter (Ctrl+M), and a lone ESC is Escape (Ctrl+[).
-//! - BS and DEL are both Backspace: aterm's Backspace is DEL and its Ctrl+H and
-//!   Ctrl+Backspace are BS, but a terminal whose Backspace key sends BS (DECBKM) must
-//!   still delete.
-//! - LF is Ctrl+J, aterm's legacy Shift+Enter included. NUL is Ctrl+Space, and FS,
-//!   GS, RS and US are Ctrl+\, Ctrl+], Ctrl+^ and Ctrl+_.
-//! - An ASCII capital is its letter with Shift (`A` is Shift+a, text `A`), as the GUI
-//!   names the key; every other glyph is itself with no Shift (`!`, not Shift+1),
-//!   since the layout that typed it is unknown. A space is [`NamedKey::Space`].
-//! - A kitty Shift chord with its shifted key (flag 4) reads as that glyph, as legacy
-//!   bytes spell it: `CSI 44:60 ; 4 u` is Alt+`<`, as `ESC <` is. Without the shifted
-//!   key it stays the base key with Shift (Alt+Shift+`,`): the decoder does not guess
-//!   a layout.
-//! - A keypad key is its main-block twin ([`Key::main_block_twin`]), as legacy bytes
-//!   and the GUI's native pages read it: keypad 5 is `5` and types `5` when no chord
-//!   modifier is held (Shift picks a keypad level, never a glyph), keypad Enter is
-//!   Enter. Keypad Begin has no twin and stays itself.
-//! - Caps Lock and Num Lock are locks, not modifiers: kitty reports them on chords,
-//!   and they are dropped, so Ctrl+a reads the same with Caps Lock on.
-//! - `ESC [` and `ESC O` begin sequences, so legacy Alt+[ and Alt+Shift+O are read as
-//!   such only when nothing follows before a flush, or when what follows makes no
-//!   sequence (`ESC [` and a final byte no terminal sends bare). `ESC P` begins a
-//!   reply only when the next byte could start one, and `ESC ]` only when a number and
-//!   `;` follow (amacs asks no OSC question, so Alt+] 1 C-g stays three keys);
-//!   otherwise they are Alt+Shift+P and Alt+]. A reply interrupted by a control byte
-//!   was typed keys.
-//! - `CSI 1 ; m R` is Shift/Ctrl/Alt+F3, never a cursor position report: amacs does
-//!   not ask for one. Typeahead of Alt+[, digits and a final byte no key uses
-//!   (`ESC [ 1 a`) is a well-formed CSI and is delivered [`Event::Unknown`]: reading
-//!   unknown sequences as typing would put a terminal's unsolicited reports into the
-//!   document instead.
-//!
-//! # Time
-//!
-//! A read that ends inside a sequence (a lone ESC included) arms a deadline
-//! [`ESC_TIMEOUT`] after it, and one that ends inside a bracketed paste
-//! [`PASTE_TIMEOUT`] after it. Bytes read later always continue what is held, however
-//! late they are read: they may have arrived long before, while the caller was busy.
-//! The caller waits for input until [`Decoder::deadline`] and calls [`Decoder::flush`]
-//! when that wait found nothing to read, as vim's `ttimeout` measures from when the
-//! editor is idle. The flush delivers a held sequence as the keys its bytes spell: a
-//! lone ESC is [`NamedKey::Escape`], which amacs's keymap reads as the Meta prefix, so
-//! the split never changes meaning. It delivers a stalled paste as far as it got and
-//! goes back to reading keys, so an end marker that never comes (a lost write, or an
-//! `ESC [ 200 ~` that was typed) cannot hold the keyboard. A caller waiting on a
-//! probe's replies does not flush before its own cap, so a reply split across slow
-//! reads is not read as typing.
+//! Pure terminal input decoder for keys, mouse reports, pastes, focus, resizes, and probe replies
+//! ([`Decoder::feed`], [`Decoder::flush`], [`Decoder::deadline`], [`String::from_utf8_lossy`],
+//! [`NamedKey`], [`NamedKey::Space`], [`NamedKey::Escape`], [`Key::main_block_twin`],
+//! [`Event::Unknown`], [`MAX_PASTE_BYTES`], [`Reply`], [`ESC_TIMEOUT`], [`PASTE_TIMEOUT`]).
 
 use std::time::{Duration, Instant};
 
@@ -91,17 +14,13 @@ use aterm_types::mouse::{ALT_MASK, CTRL_MASK, MouseButton, SHIFT_MASK, WheelDir}
 /// How long a read that ended inside a sequence waits for the rest of it.
 pub const ESC_TIMEOUT: Duration = Duration::from_millis(25);
 
-/// How long a bracketed paste may stall, with nothing read, before what came of it is
-/// delivered. Long enough for a congested ssh link to resume; short enough that a
-/// person who stops typing gets the keyboard back.
+/// How long a bracketed paste may stall, with nothing read, before what came of it is delivered.
 pub const PASTE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The most of one bracketed paste kept; the rest of it is read and dropped. It is
-/// amacs's document size limit, so no paste can make a document it could not open.
+/// The most of one bracketed paste kept.
 pub const MAX_PASTE_BYTES: usize = 32 * 1024 * 1024;
 
-/// The most of one control sequence or string kept. A reply is far shorter; one that
-/// is not is read to its end and reported [`Event::Unknown`] with this much of it.
+/// The most of one control sequence or string kept.
 const MAX_SEQUENCE_BYTES: usize = 4096;
 
 const ESC: u8 = 0x1b;
@@ -116,8 +35,7 @@ const LOCKS: Modifiers = Modifiers::CAPS_LOCK.union(Modifiers::NUM_LOCK);
 /// One thing the terminal said.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// A key press. `text` is the character it types: set for a printable key with no
-    /// chord modifier (Shift aside), `None` for a chord or a key that types nothing.
+    /// A key press.
     Key {
         key: Key,
         mods: Modifiers,
@@ -126,15 +44,13 @@ pub enum Event {
     /// A mouse report, at a 0-based cell.
     Mouse {
         kind: MouseKind,
-        /// The button pressed, released or held. `None` for a wheel notch, a motion
-        /// with no button held, and an X10 release, which does not say which.
+        /// The button pressed, released or held.
         button: Option<MouseButton>,
         col: u16,
         row: u16,
         mods: Modifiers,
     },
-    /// A bracketed paste's body, exactly as the terminal sent it (line breaks are
-    /// usually CR, as aterm and xterm send them), cut at [`MAX_PASTE_BYTES`].
+    /// A bracketed paste's body.
     Paste(String),
     /// Focus gained (`true`) or lost.
     Focus(bool),
@@ -142,12 +58,11 @@ pub enum Event {
     Resize { cols: u16, rows: u16 },
     /// A reply to a probe.
     Reply(Reply),
-    /// A complete sequence this decoder does not read, as it arrived (at most
-    /// `MAX_SEQUENCE_BYTES` of it).
+    /// A complete sequence this decoder does not read, as it arrived.
     Unknown(Vec<u8>),
 }
 
-/// What a mouse report did.
+/// Kind of mouse event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseKind {
     Press,
@@ -157,10 +72,10 @@ pub enum MouseKind {
     Wheel(WheelDir),
 }
 
-/// A probe reply (docs/DESIGN-amacs-2026-10-19.md §5.2).
+/// A probe reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reply {
-    /// XTVERSION, `DCS > | name ST`: aterm says `aterm(<version>)`.
+    /// XTVERSION, `DCS > | name ST`.
     Version(String),
     /// Kitty's keyboard flags, `CSI ? flags u`.
     KittyFlags(u32),
@@ -196,14 +111,13 @@ impl ModeState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Ground,
-    /// Inside a UTF-8 character, after its lead: `need` more bytes, the next one in
-    /// `lo..=hi` (the lead's second-byte range).
+    /// Inside a UTF-8 character, after its lead.
     Utf8 {
         need: u8,
         lo: u8,
         hi: u8,
     },
-    /// Inside a UTF-8 character, past its second byte: `need` more trailing bytes.
+    /// Inside a UTF-8 character, past its second byte.
     Utf8Tail {
         need: u8,
     },
@@ -211,15 +125,15 @@ enum State {
     EscEsc,
     Csi,
     Ss3,
-    /// `ESC P` with nothing after it yet.
+    /// `ESC P` with nothing after it.
     DcsStart,
     Dcs,
-    /// `ESC ]` with nothing after it yet.
+    /// `ESC ]` with nothing after it.
     OscStart,
     /// `ESC ]` and the digits of an OSC number, before its `;`.
     OscNumber,
     Osc,
-    /// An ESC inside a DCS or OSC string: `\` ends the string.
+    /// An ESC inside a DCS or OSC string.
     StringEsc {
         osc: bool,
     },
@@ -233,15 +147,15 @@ enum State {
     },
 }
 
-/// The input decoder. See the module docs.
+/// The input decoder.
 #[derive(Debug)]
 pub struct Decoder {
     state: State,
     /// The raw bytes of the unit being read, from its first byte.
     seq: Vec<u8>,
-    /// The unit is ESC-prefixed: `ESC ESC [`, `ESC ESC O`, or ESC and a UTF-8 lead.
+    /// The unit is ESC-prefixed.
     alt: bool,
-    /// The unit outgrew `MAX_SEQUENCE_BYTES`; the rest of it is read, not kept.
+    /// The unit outgrew `MAX_SEQUENCE_BYTES`.
     overflow: bool,
     paste: Vec<u8>,
     paste_overflow: bool,
@@ -268,15 +182,13 @@ impl Decoder {
         }
     }
 
-    /// Decode `bytes`, read at `now`. They continue whatever an earlier read left
-    /// unfinished, however late they are read; `now` only arms the next deadline.
+    /// Decode `bytes`, read at `now`.
     #[must_use]
     pub fn feed(&mut self, bytes: &[u8], now: Instant) -> Vec<Event> {
         let mut out = Vec::new();
         let mut rest = bytes;
         while !rest.is_empty() {
             if self.state == (State::Paste { matched: 0 }) {
-                // The body runs to the next ESC: take it whole.
                 let run = rest.iter().position(|&b| b == ESC).unwrap_or(rest.len());
                 let (body, after) = rest.split_at_checked(run).unwrap_or((rest, &[]));
                 self.paste_extend(body);
@@ -298,11 +210,6 @@ impl Decoder {
     }
 
     /// Resolve what the reads left unfinished, if its deadline has passed by `now`.
-    /// The caller calls it when a wait until [`Self::deadline`] found nothing to read.
-    /// A held sequence is delivered as the keys its bytes spell (a lone ESC is Escape,
-    /// a broken character U+FFFD), or as [`Event::Unknown`] when it was too long to
-    /// keep or was a mouse report cut short; a stalled paste is delivered as far as it
-    /// got, and the bytes after it are read as keys.
     #[must_use]
     pub fn flush(&mut self, now: Instant) -> Vec<Event> {
         let mut out = Vec::new();
@@ -318,8 +225,7 @@ impl Decoder {
         out
     }
 
-    /// When [`Self::flush`] next has something to resolve: `None` while nothing is
-    /// held.
+    /// When [`Self::flush`] next has something to resolve.
     #[must_use]
     pub fn deadline(&self) -> Option<Instant> {
         self.deadline
@@ -392,7 +298,6 @@ impl Decoder {
                         self.alt = true;
                         self.enter(State::Utf8 { need, lo, hi }, b);
                     }
-                    // Escape, then U+FFFD for the stray byte.
                     None => {
                         self.abort(out);
                         self.ground(b, out);
@@ -408,7 +313,6 @@ impl Decoder {
                     self.alt = true;
                     self.enter(State::Ss3, b);
                 }
-                // Alt+Escape, then `b` afresh.
                 _ => {
                     self.abort(out);
                     self.ground(b, out);
@@ -422,8 +326,6 @@ impl Decoder {
                 self.abort(out);
                 self.ground(b, out);
             }
-            // A DCS reply opens with a parameter or intermediate byte (`>|`, `!|`,
-            // `1$r`), an OSC reply with its number; anything else was typed.
             State::DcsStart if is_csi_body(b) => {
                 self.keep(b);
                 self.state = State::Dcs;
@@ -506,7 +408,7 @@ impl Decoder {
     }
 
     /// Take `b`, which fits, into the UTF-8 character being read: `need` bytes were
-    /// still to come. Every byte after the second is one of Table 3-7's trailing bytes.
+    /// still to come.
     fn utf8_byte(&mut self, need: u8, b: u8, out: &mut Vec<Event>) {
         self.seq.push(b);
         if need > 1 {
@@ -592,7 +494,6 @@ impl Decoder {
                 let (key, mods, text) = reading(Key::Named(named), mods, None, None);
                 out.push(self.key(key, mods, text));
             }
-            // No terminal sends any other SS3: it was Alt+Shift+O and typed keys.
             _ => {
                 self.keep(b);
                 if self.overflow {
@@ -607,7 +508,6 @@ impl Decoder {
 
     fn finish_string(&mut self, osc: bool, out: &mut Vec<Event>) {
         let seq = std::mem::take(&mut self.seq);
-        // `ESC P > | name ESC \`.
         let version = (!osc && !self.overflow)
             .then(|| seq.strip_prefix(b"\x1bP>|")?.strip_suffix(b"\x1b\\"))
             .flatten();
@@ -641,7 +541,6 @@ impl Decoder {
             }
             return self.finish_paste(out);
         }
-        // What matched was body after all; only an ESC can start the end again.
         self.paste_extend(PASTE_END.get(..matched).unwrap_or_default());
         if b == ESC {
             self.state = State::Paste { matched: 1 };
@@ -709,7 +608,6 @@ fn plain(c: char) -> (Key, Modifiers, Option<char>) {
         '\x1d' => ctrl(']'),
         '\x1e' => ctrl('^'),
         '\x1f' => ctrl('_'),
-        // The rest of C0, LF included: Ctrl and the letter.
         '\x01'..='\x1a' => ctrl(char::from(c as u8 + b'`')),
         ' ' => (Key::Named(NamedKey::Space), none, Some(' ')),
         'A'..='Z' => (
@@ -786,11 +684,6 @@ fn first_char(bytes: &[u8]) -> Option<(char, usize)> {
         .next()?;
     Some((c, len))
 }
-
-// The byte classes below are the decoder's reading of two standards, each a Trust
-// contract whose cited theorem is about the compiled fn (SPECS.md): the UTF-8 rows of
-// Unicode Table 3-7 ("Well-Formed UTF-8 Byte Sequences") and the control-sequence
-// byte classes of ECMA-48 §5.4.
 
 trust_contract_fn! {
     /// The length of the UTF-8 character a byte leads (1 for a byte that leads none):
@@ -933,8 +826,6 @@ spec_island! {
     }
 }
 
-// The theorems tie each contract to its spec, one island each, so a refusal names its
-// own theorem.
 verify_island! {
     clean {
         theorem utf8_len_is_table_3_7 :
@@ -1059,7 +950,7 @@ enum Csi {
     /// A non-key event, or `None` for a malformed one (delivered `Unknown`).
     Event(Option<Event>),
     PasteStart,
-    /// No terminal sends this bare: `ESC [` was Alt+[ and the final a typed key.
+    /// No terminal sends this bare.
     Typed,
     Unknown,
 }
@@ -1079,7 +970,6 @@ fn csi(body: &[u8], fin: u8) -> Csi {
             },
         };
     }
-    // A private marker, then parameters, then intermediates.
     let (marker, rest) = match body.split_first() {
         Some((&m, rest)) if is_csi_private_marker(m) => (Some(m), rest),
         _ => (None, body),
@@ -1156,8 +1046,7 @@ fn value(field: &Field) -> Option<u32> {
 
 /// The modifiers of a `1 + bits` parameter, which xterm and kitty agree on (Shift 1,
 /// Alt 2, Ctrl 4, Super 8; kitty adds Hyper and Meta above, and the Caps Lock and
-/// Num Lock bits, which are dropped). `None` for a kitty release (`:3`), which a
-/// flag-1 terminal never sends.
+/// Num Lock bits, which are dropped).
 fn modifiers(field: &Field) -> Option<Modifiers> {
     if !matches!(field.get(1).copied().flatten(), None | Some(1 | 2)) {
         return None;
@@ -1187,7 +1076,6 @@ fn tilde(fields: &[Field]) -> Csi {
         [n] if n.len() == 1 && value(n) == Some(200) => Csi::PasteStart,
         [n] => key(n, Some(Modifiers::empty())),
         [n, mods] => key(n, modifiers(mods)),
-        // xterm's modifyOtherKeys: `CSI 27 ; m ; code ~`.
         [lead, mods, code] if value(lead) == Some(27) => {
             match (value(code).and_then(code_key), modifiers(mods)) {
                 (Some(key), Some(mods)) => {
@@ -1213,10 +1101,7 @@ fn kitty_key(fields: &[Field]) -> Csi {
         None => Some(Modifiers::empty()),
     };
     let glyph = |n: Option<u32>| n.and_then(char::from_u32).filter(|c| !c.is_control());
-    // `code:shifted:base`: the shifted key (flag 4) while Shift is held; the base-layout
-    // key is not read.
     let shifted = glyph(code.get(1).copied().flatten());
-    // Associated text (flag 16) is the third parameter; flags 1 and 4 send none.
     let text = glyph(rest.get(1).and_then(value));
     match (value(code).and_then(code_key), mods) {
         (Some(key), Some(mods)) => {
@@ -1267,8 +1152,7 @@ fn resize(fields: &[Field]) -> Option<Event> {
     }
 }
 
-/// A mouse report's event from xterm's `Cb` and 1-based cell. `legacy` reads `Cb` 3
-/// as a release of an unnamed button, as X10 sends one.
+/// A mouse report's event from xterm's `Cb` and 1-based cell.
 fn mouse(cb: u32, col: u32, row: u32, release: bool, legacy: bool) -> Option<Event> {
     let cb = u8::try_from(cb).ok()?;
     let mut mods = Modifiers::empty();

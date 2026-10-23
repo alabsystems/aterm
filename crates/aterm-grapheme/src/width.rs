@@ -25,6 +25,7 @@ use crate::types::{Grapheme, GraphemeInfo};
 /// assert_eq!(info.grapheme_count, 9);
 /// assert_eq!(info.display_width, 11); // 7 ASCII + 2 wide chars
 /// ```
+/// use aterm_grapheme::grapheme_width;
 #[inline]
 pub fn grapheme_width(s: &str) -> GraphemeInfo {
     grapheme_width_inner(s, false)
@@ -149,6 +150,8 @@ fn grapheme_display_width_inner(grapheme: &str, cjk: bool) -> usize {
 /// let info = grapheme_width_with_config("\u{00B0}test", &cjk);
 /// assert_eq!(info.display_width, 6); // degree(2) + t(1) + e(1) + s(1) + t(1)
 /// ```
+/// use aterm_grapheme::grapheme_width_with_config;
+/// use aterm_types::text_shaping::{AmbiguousWidth, TextShapingConfig};
 #[inline]
 pub fn grapheme_width_with_config(s: &str, config: &TextShapingConfig) -> GraphemeInfo {
     grapheme_width_inner(s, is_cjk(config))

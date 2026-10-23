@@ -9,26 +9,7 @@ use std::ops::Range;
 
 use crate::grapheme::ColumnMap;
 
-/// The grid cells one line of text was read from: where each cell's text lies in
-/// the line, the column it is drawn at and how many columns it covers.
-///
-/// A row reader builds it beside the row's text and hands both to the index
-/// ([`TerminalSearch::index_numbered_cells_owned`]), which then reports a match in
-/// the cells that hold it. Re-measuring the text would assume it was written left to
-/// right in one go, which the grid does not promise: it folds a character into the
-/// previous cell only when that cell is just before the cursor. So two regional
-/// indicators written out of order (or brought together by a delete-character) stay
-/// two cells, and a VS16 base in a row's last column stays one cell wide.
-///
-/// Stored as runs of cells of one shape (same bytes and width, consecutive columns),
-/// so a row of ASCII or of ideographs is one inline run and costs no allocation.
-///
-/// A reader that stops at a byte bound before the line ends says so
-/// ([`mark_truncated`](Self::mark_truncated)): the index then counts the line as one
-/// it did not search to its end ([`SearchResults::cut_short_lines`]).
-///
-/// [`TerminalSearch::index_numbered_cells_owned`]: crate::TerminalSearch::index_numbered_cells_owned
-/// [`SearchResults::cut_short_lines`]: crate::SearchResults::cut_short_lines
+/// The grid cells one line of text was read from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LineCells {
     /// The first run.
@@ -39,8 +20,6 @@ pub struct LineCells {
     truncated: bool,
 }
 
-/// `count` cells of one shape: cell `i` holds bytes
-/// `byte + i·bytes .. byte + (i+1)·bytes` and is drawn from column
 /// `col + i·width`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CellRun {
@@ -75,7 +54,6 @@ impl CellRun {
         self.cell(self.count).byte
     }
 
-    /// Whether `next` continues this run: the same shape, starting where the
     /// run ends in both bytes and columns.
     #[inline]
     const fn continued_by(self, next: Self) -> bool {
@@ -113,39 +91,26 @@ impl LineCells {
         }
     }
 
-    /// Record that the text read with these cells stops short of the line's end:
-    /// its reader stopped at a byte bound (aterm-core reads the first MiB of a
-    /// stored history line), so the rest of the line is unread.
+    /// Record that the text read with these cells stops short of the line's end.
     #[inline]
     pub const fn mark_truncated(&mut self) {
         self.truncated = true;
     }
 
-    /// Whether the text read with these cells stops short of the line's end
-    /// ([`mark_truncated`](Self::mark_truncated)). A joined line stops short when
-    /// any row joined into it does.
+    /// Whether the text read with these cells stops short of the line's end ([`mark_truncated`]).
     #[inline]
     #[must_use]
     pub const fn is_truncated(&self) -> bool {
         self.truncated
     }
 
-    /// Record that the line's bytes `text` are drawn in the cell at column
-    /// `col`, `width` columns wide.
-    ///
-    /// Cells are pushed in line order. A cell with no text (a wide glyph's
-    /// right half holds none), or one whose text starts before the previous
-    /// cell's ends, is not recorded: its bytes could not be told apart from
-    /// that cell's.
+    /// Record that the line's bytes `text` are drawn in the cell at column `col`.
     #[inline]
     pub fn push(&mut self, text: Range<usize>, col: usize, width: usize) {
         self.push_repeated(text, col, width, 1);
     }
 
-    /// [`push`](Self::push) `count` cells shaped like the first: each holds
-    /// as many bytes as `first`, starting where the one before ends, and is
-    /// drawn `width` columns after it (a run of printable ASCII, read in one
-    /// step).
+    /// [`push`](Self::push) `count` cells shaped like the first.
     pub fn push_repeated(&mut self, first: Range<usize>, col: usize, width: usize, count: usize) {
         let Some(bytes) = first
             .end
@@ -170,11 +135,7 @@ impl LineCells {
         });
     }
 
-    /// Append `other`'s cells, `bytes` further into the line and `cols`
-    /// further along it: the cells of a row whose text was appended to a
-    /// line `bytes` long, drawn from column `cols` on (a soft-wrapped row
-    /// joined to the rows before it). The line stops short of its end if
-    /// `other`'s row did.
+    /// Append `other`'s cells, `bytes` further into the line and `cols` further along it.
     pub fn append_shifted(&mut self, other: &Self, bytes: usize, cols: usize) {
         self.truncated |= other.truncated;
         for run in other.runs() {
@@ -193,18 +154,7 @@ impl LineCells {
         }
     }
 
-    /// Append `text`, a row read with the cells it is drawn in (`cells`), to `line`
-    /// (whose cells these are) as the row of a soft-wrapped run drawn from column
-    /// `row_start` of the joined line: `k * cols` for row `k`.
-    ///
-    /// The stride is built in, never counted. The columns from where the cells so far
-    /// end up to `row_start` (cells never written or erased, the cell a wide glyph left
-    /// when it wrapped early, a whole blank row) are padded with one-column spaces,
-    /// which read as a break, and the row's cells follow at `row_start` plus their grid
-    /// columns. Re-measuring the text would break the stride wherever it measures wider
-    /// than the row (a VS16 base kept one cell wide in the last column). Find's
-    /// soft-wrap fold and a double-click's word window both join this way, so a column
-    /// of a run names the same cell to both.
+    /// Append `text`.
     pub fn append_wrapped_row(
         &mut self,
         line: &mut String,
@@ -251,16 +201,14 @@ impl LineCells {
         self.head.iter().chain(&self.tail)
     }
 
-    /// The byte after the last cell's text: where the text the cells draw
-    /// ends in the line, `0` with none.
+    /// The byte after the last cell's text.
     #[inline]
     #[must_use]
     pub fn end_byte(&self) -> usize {
         self.last().map_or(0, |run| run.end_byte())
     }
 
-    /// The column after the last cell: how many columns the cells reach,
-    /// `0` with none.
+    /// The column after the last cell: how many columns the cells reach, `0` with none.
     #[inline]
     #[must_use]
     pub fn end_col(&self) -> usize {
@@ -268,8 +216,7 @@ impl LineCells {
             .map_or(0, |run| run.cell(run.count.saturating_sub(1)).end_col)
     }
 
-    /// Whether the cells are `len` one-byte, one-column cells from column 0:
-    /// a line of printable ASCII read one cell per character.
+    /// Whether the cells are `len` one-byte, one-column cells from column 0.
     #[inline]
     #[must_use]
     pub(crate) fn is_identity(&self, len: usize) -> bool {
@@ -286,9 +233,7 @@ impl LineCells {
         }
     }
 
-    /// `len` one-byte, one-column cells from column 0 (see
-    /// [`Self::is_identity`]): the cells of a line of printable ASCII, for a
-    /// reader that knows its line is one.
+    /// `len` one-byte, one-column cells from column 0 (see [`Self::is_identity`]).
     #[must_use]
     pub fn identity(len: usize) -> Self {
         let mut cells = Self::new();
@@ -303,9 +248,7 @@ impl LineCells {
         self.head.is_none()
     }
 
-    /// Where the text of the cell drawn over column `col` starts in the line, read by
-    /// the cell's column, never by a walk of the text. `None` where no recorded cell
-    /// covers `col`.
+    /// Where the text of the cell drawn over column `col` starts in the line.
     #[must_use]
     pub fn byte_at_column(&self, col: usize) -> Option<usize> {
         self.runs().find_map(|run| {
@@ -318,11 +261,7 @@ impl LineCells {
         })
     }
 
-    /// The bytes of the cells drawn over any of columns `start_col..end_col`, from the
-    /// first such cell's start to the last one's end; a cell the range covers only
-    /// part of (a wide glyph's half) is taken whole, as a copy of those columns takes
-    /// it. Read by the cells' columns, never by a walk of the text. `None` when no
-    /// cell is drawn there.
+    /// The bytes of the cells drawn over any of columns `start_col..end_col`.
     #[must_use]
     pub fn bytes_in_columns(&self, start_col: usize, end_col: usize) -> Option<Range<usize>> {
         let mut found: Option<Range<usize>> = None;
@@ -330,9 +269,6 @@ impl LineCells {
             let Some(width) = NonZeroUsize::new(usize::from(run.width)) else {
                 continue;
             };
-            // Cell `i` covers `col + i·width .. col + (i+1)·width`: the cells
-            // from the one holding `start_col` up to the last that starts
-            // before `end_col`.
             let first = start_col.saturating_sub(run.col) / width;
             let Some(last) = end_col
                 .checked_sub(run.col)
@@ -352,10 +288,7 @@ impl LineCells {
         found
     }
 
-    /// The columns `(start, end)`, `end` exclusive, that bytes
-    /// `start_byte..end_byte` of `text`, the line these cells were read
-    /// for, are drawn in: where find reports a match over those bytes
-    /// ([`ColumnMap::with_cells`]).
+    /// The columns (start, end), end exclusive, that bytes start_byte..end_byte of text.
     #[must_use]
     pub fn columns_of(&self, text: &str, start_byte: usize, end_byte: usize) -> (usize, usize) {
         ColumnMap::with_cells(text, self).span(start_byte, end_byte)
@@ -386,8 +319,6 @@ mod tests {
             .collect()
     }
 
-    /// A row of one shape is one run; a change of shape, a gap in the
-    /// columns or a gap in the bytes starts another, and every cell reads
     /// back as pushed.
     #[test]
     fn cells_read_back_as_pushed_in_runs_of_one_shape() {
@@ -416,7 +347,6 @@ mod tests {
         assert_eq!(cells.end_col(), 12);
     }
 
-    /// A cell with no text, or one that would overlap the previous cell's
     /// text, is not recorded.
     #[test]
     fn empty_and_overlapping_cells_are_not_recorded() {
@@ -427,7 +357,6 @@ mod tests {
         assert_eq!(spans(&cells), vec![(0, 3, 0, 2)]);
     }
 
-    /// Joining shifts a row's cells by the bytes and columns before it, and
     /// a run that continues across the join stays one run.
     #[test]
     fn appended_cells_are_shifted_and_merged() {
@@ -451,7 +380,6 @@ mod tests {
         );
     }
 
-    /// A joined line stops short of its end when any row joined into it does, its
     /// head or a continuation, wherever the joins pad or shift its cells.
     #[test]
     fn a_joined_line_stops_short_when_a_row_does() {
@@ -459,7 +387,6 @@ mod tests {
         row.push(0..1, 0, 1);
         let mut cut = row.clone();
         cut.mark_truncated();
-        // NEGATIVE CONTROL: rows read whole join into a line read whole.
         let mut whole = row.clone();
         whole.append_wrapped_row(&mut "x".to_string(), "y", &row, 4);
         assert!(!whole.is_truncated());
@@ -472,8 +399,6 @@ mod tests {
         }
     }
 
-    /// A soft-wrapped row joins at its stride, whatever its text measures: after a
-    /// three-column row ending in a one-cell VS16 base the next row starts at column 3,
     /// not 4, and a short or empty row is padded out with one-column spaces.
     #[test]
     fn a_wrapped_row_joins_at_its_stride() {
@@ -506,11 +431,9 @@ mod tests {
         );
     }
 
-    /// A column names the cell drawn over it (either column of a wide cell),
     /// and a column no cell covers names none.
     #[test]
     fn a_column_names_the_cell_drawn_over_it() {
-        // Two flag halves drawn as two wide cells, a gap, then `x`.
         let mut cells = LineCells::new();
         cells.push(0..4, 0, 2);
         cells.push(4..8, 2, 2);
@@ -520,20 +443,14 @@ mod tests {
             found,
             [Some(0), Some(0), Some(4), Some(4), None, Some(8), None]
         );
-        // The pair is one grapheme of the text, over both cells; `x` is
-        // where the cells put it, not where a walk of the text would.
         let text = "\u{1f1e6}\u{1f1e7}x";
         assert_eq!(cells.columns_of(text, 0, 8), (0, 4));
         assert_eq!(cells.columns_of(text, 8, 9), (5, 6));
     }
 
-    /// A column range takes the bytes of every cell drawn over any of its
-    /// columns, a wide cell either edge cuts whole, and names none where no
     /// cell is drawn.
     #[test]
     fn a_column_range_takes_the_cells_drawn_over_it() {
-        // Two flag halves drawn as two wide cells, a gap, `xy`, then a run
-        // of three ideographs.
         let mut cells = LineCells::new();
         cells.push(0..4, 0, 2);
         cells.push(4..8, 2, 2);

@@ -276,7 +276,7 @@ pub(super) fn changed_rows(shown: &[Row], now: &[Row]) -> Option<Vec<usize>> {
 
 /// What the mug says it is, lit or not: its image's description and the button's
 /// accessibility label once it shows one ([`StatusUi::show`]).
-pub(super) fn state_text(lit: bool) -> &'static str {
+pub(super) const fn state_text(lit: bool) -> &'static str {
     if lit { "Caffeine on" } else { "Caffeine off" }
 }
 
@@ -406,7 +406,7 @@ fn add_rows(menu: Id, target: Id, choose: Sel, rows: &[Row]) -> Vec<Option<Obj>>
 }
 
 /// A row's title, and an action row's tag and checkmark; `None` for a separator.
-fn parts(row: &Row) -> Option<(&str, Option<(isize, bool)>)> {
+const fn parts(row: &Row) -> Option<(&str, Option<(isize, bool)>)> {
     match row {
         Row::Info(text) => Some((text.as_str(), None)),
         Row::Action {
@@ -487,6 +487,7 @@ mod tests {
     use aterm_objc::Encode;
 
     use super::*;
+    use crate::launchd::Startup;
     use crate::menu::{self, MenuAction};
     use crate::model::{Choice, Mode};
 
@@ -546,10 +547,10 @@ mod tests {
     #[test]
     fn a_menu_of_the_same_shape_is_retitled_in_place() {
         const NOW: u64 = 1_790_000_000;
-        let off = menu::compose(Mode::Off, NOW, false, "1");
+        let off = menu::compose(Mode::Off, NOW, Startup::Off, "1");
         assert_eq!(changed_rows(&off, &off), Some(vec![]));
         // Turning on forever moves the checkmark: only that row changes.
-        let forever = menu::compose(Mode::Forever, NOW, false, "1");
+        let forever = menu::compose(Mode::Forever, NOW, Startup::Off, "1");
         let forever_row = off
             .iter()
             .position(|r| {
@@ -565,8 +566,8 @@ mod tests {
         assert_eq!(changed_rows(&off, &forever), Some(vec![forever_row]));
         // A timed mode's time left retitles its row a minute later.
         let timed = Mode::chosen(Choice::Hours1, NOW);
-        let a = menu::compose(timed, NOW, true, "1");
-        let b = menu::compose(timed, NOW + 60, true, "1");
+        let a = menu::compose(timed, NOW, Startup::On, "1");
+        let b = menu::compose(timed, NOW + 60, Startup::On, "1");
         assert_eq!(changed_rows(&a, &b).map(|c| c.len()), Some(1));
         // Another shape is built again.
         assert_eq!(changed_rows(&off, &off[1..]), None);

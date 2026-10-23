@@ -30,6 +30,8 @@ pub enum Program {
 }
 
 /// Each program's successor in declaration order, `None` after the last: an
+/// exhaustive match, so a variant added to [`Program`] does not compile until
+/// it is placed here, and the walk below holds [`Program::ALL`] to this chain.
 #[inline]
 const fn next_program(p: Program) -> Option<Program> {
     match p {
@@ -55,6 +57,8 @@ const _: () = {
 
 impl Program {
     /// Every program, in declaration order: what must cover each one (the
+    /// panic sweeps, the host's admission, a settings row per supervisable
+    /// agent) iterates this, never a list of its own.
     pub const ALL: [Program; 6] = [
         Program::Claude,
         Program::Codex,
@@ -114,6 +118,20 @@ impl Program {
         }
     }
 
+    /// Incremental version of this program's aterm/alab harness, starting at `"0.1"` per harness.
+    #[inline]
+    #[must_use]
+    pub const fn harness_version(self) -> Option<&'static str> {
+        match self {
+            Program::Claude => Some("0.1"),
+            Program::Codex => Some("0.1"),
+            Program::Agy => Some("0.1"),
+            Program::Muse => Some("0.1"),
+            Program::Gemini => Some("0.1"),
+            Program::Generic => None,
+        }
+    }
+
     /// Screen reader for this program.
     #[inline]
     #[must_use]
@@ -135,8 +153,17 @@ pub struct Reading {
     pub program: Program,
     pub phase: Phase,
     /// Whether [`Self::phase`] is the reader's evidence rather than its
+    /// default: `false` for the generic reader and the Codex reader always, for
+    /// agy's and Muse Code's off their measured shapes ([`crate::agy::phase`],
+    /// [`crate::muse::phase`]), and for
+    /// Claude Code's `idle` with no composer frame drawn (its launch, before
+    /// the REPL is up) — each says `idle` there because it cannot tell
+    /// working from waiting, not because it saw either — and, read with the
+    /// cursor ([`ScreenReader::read_at`]), for Claude Code's `idle` at a
+    /// prompt box that does not hold the cursor (an earlier run's).
     pub phase_authoritative: bool,
     /// The wall the last turn ended on: `None` under a box, and while a turn runs only a
+    /// health wall ([`ScreenReader::health_wall`]).
     pub wall: Option<Wall>,
     /// The box, when [`Self::phase`] is [`Phase::Prompt`].
     pub prompt: Option<PromptV2>,
@@ -144,19 +171,32 @@ pub struct Reading {
     /// The context left as the screen shows it ([`ScreenReader::context_shown`]).
     pub context_left: Option<u8>,
     /// The program's own suggestion for the next message (needs the
+    /// cursor's column; `None` without it).
     pub suggestion: Option<String>,
     pub goal_active: bool,
     /// The worker's last words ([`crate::turn::said_tail`]).
     pub said_tail: Option<String>,
     /// A person stopped the last turn: the next message is theirs
+    /// ([`crate::turn::interrupted`]).
     pub interrupted: bool,
     /// No turn yet ([`ScreenReader::fresh`]: [`crate::turn::fresh`]): an idle point here ended nothing — a
+    /// session nobody has asked anything is not a worker stopped short.
     pub fresh: bool,
     /// The composer as `(caret row, lines)`, the caret row's text first —
+    /// typed text or the dim placeholder, which only the cursor tells apart
+    /// (at column 2 of the caret row: the placeholder, for Claude Code,
+    /// and Muse Code's prompt hint, by its colour; agy draws none but
+    /// its permission mode's hint, which its reader reads as no text, and its
+    /// empty composer's text is empty: [`ScreenReader::placeholder`]; Gemini
+    /// CLI's reader takes its placeholder out by its text, so its empty
+    /// composer's is empty too); `None` with no composer on the screen (a
+    /// box, a shell).
     pub composer: Option<(usize, Vec<String>)>,
     /// Usage credits carry the session, by the program's own notice
+    /// ([`ScreenReader::credits`]).
     pub credits: Option<crate::credits::Credits>,
     /// The program's own warning that a usage window is filling
+    /// ([`ScreenReader::usage_warning`]), for the record.
     pub warning: Option<crate::credits::Warning>,
 }
 
@@ -327,6 +367,11 @@ pub trait ScreenReader: Sync {
     fn phase_authoritative(&self, _rows: &[String], _phase: &Phase) -> bool {
         false
     }
+    /// What the program's own window title says of its run: `Some(true)` running, `Some(false)`
+    /// at rest, `None` where the reader has no reading of the program's titles (the default).
+    fn title_runs(&self, _title: &str) -> Option<bool> {
+        None
+    }
     /// Whether cursor position `cursor_row` vouches for `reading`.
     fn cursor_vouches(
         &self,
@@ -399,6 +444,9 @@ impl ScreenReader for ClaudeReader {
         parse_prompt_v2(rows)
     }
     /// Esc leaves every box Claude Code draws: a footed one names what it
+    /// does in its `Esc to …` footer (the trust dialog's quits the program,
+    /// [`CancelEffect::Exit`]), a footerless one marks its refusal ` (esc)`
+    /// or answers Esc with its select's cancel.
     fn esc(&self, prompt: &PromptV2) -> Option<CancelEffect> {
         Some(
             prompt
@@ -459,6 +507,7 @@ impl ScreenReader for ClaudeReader {
         crate::turn::message_drawn(rows)
     }
     /// Inside its frame only: a `❯` row with no frame around it is a user's message, and
+    /// a box replaces the frame.
     fn composer(&self, rows: &[String]) -> Option<(usize, Vec<String>)> {
         has_composer_frame(rows)
             .then(|| composer_draft(rows))
@@ -492,6 +541,9 @@ impl ScreenReader for ClaudeReader {
         crate::phase::busy_zone_start(rows)
     }
     /// Every reading but one: Claude Code's `idle` ("no box, no spinner, no question") is
+    /// evidence only at its composer (the frame drawn, or shell mode's `!`) or on a wall,
+    /// since a screen with no REPL on it says the same: the shell's rows between launch and
+    /// REPL, and the alternate screen's first half-drawn frame.
     fn phase_authoritative(&self, rows: &[String], phase: &Phase) -> bool {
         *phase != Phase::Idle
             || has_composer_frame(rows)
@@ -499,6 +551,8 @@ impl ScreenReader for ClaudeReader {
             || wall(rows).is_some()
     }
     /// Claude Code's `idle` at a prompt box is evidence only where that box holds the
+    /// cursor ([`crate::phase::prompt_box_holds`]); a wall and every other phase stand as
+    /// read.
     fn cursor_vouches(
         &self,
         rows: &[String],
@@ -520,6 +574,9 @@ impl ScreenReader for CodexReader {
         Program::Codex
     }
     /// No evidence: every reading is `idle` NOT authoritatively (the trait's
+    /// default [`ScreenReader::phase_authoritative`]), so the server
+    /// publishes `agent=unknown`, and `aterm drive phase` and `answer` read
+    /// nothing on a Codex.
     fn phase(&self, _rows: &[String]) -> Phase {
         Phase::Idle
     }
@@ -546,6 +603,7 @@ impl ScreenReader for AgyReader {
         agy::wall(rows)
     }
     /// agy's feedback survey, drawn in its composer's place
+    /// ([`crate::agy::survey`]).
     fn survey_block(&self, rows: &[String]) -> Option<crate::survey::SurveyBlock> {
         agy::survey(rows)
     }
@@ -571,6 +629,9 @@ impl ScreenReader for AgyReader {
         agy::turn_opened_by(rows)
     }
     /// agy draws a message's blank line as a blank row, the rows under it
+    /// two columns in as a reply's, and every row of a message past its
+    /// first two columns in: nothing in its text tells them from a reply's
+    /// ([`crate::agy`]'s A MESSAGE'S BLANK LINE); its cells do.
     fn bounds_messages(&self) -> bool {
         false
     }
@@ -585,6 +646,7 @@ impl ScreenReader for AgyReader {
         agy::interrupted(rows)
     }
     /// A task, a timer or a subagent running in the panel under the
+    /// composer, the turn over it ended ([`agy::background_wait`]).
     fn background_wait(&self, rows: &[String]) -> Option<&'static str> {
         agy::background_wait(rows)
     }
@@ -601,14 +663,19 @@ impl ScreenReader for AgyReader {
         Some('>')
     }
     /// None: agy's empty composer draws nothing after its caret (measured)
+    /// but, while a permission mode is on, the mode's hint — whole or cut
+    /// with `...` — which [`agy::composer_draft`] reads as the empty draft
+    /// itself, so no text it reads is ever typed over.
     fn placeholder(&self) -> bool {
         false
     }
     /// An Enter sent in the same burst as the text submits it (measured on
+    /// 1.4.0): no paste guard.
     fn paste_guard(&self) -> bool {
         false
     }
     /// The spinner row over the composer: the footer's `esc to cancel` is
+    /// drawn under a menu and a box too, and must not read as a turn running.
     fn busy_guard(&self) -> Option<String> {
         Some(agy::busy_guard())
     }
@@ -659,10 +726,12 @@ impl ScreenReader for MuseReader {
         muse::interrupted(rows)
     }
     /// A backgrounded shell or a monitor running in the panel under the
+    /// composer, the turn over it ended ([`muse::background_wait`]).
     fn background_wait(&self, rows: &[String]) -> Option<&'static str> {
         muse::background_wait(rows)
     }
     /// Cards alone over the composer whose newest `/status` card says the
+    /// run `FAILED`, or a `/usage` card naming no state ([`muse::end_hidden`]).
     fn end_hidden(&self, rows: &[String]) -> bool {
         muse::end_hidden(rows)
     }
@@ -679,6 +748,9 @@ impl ScreenReader for MuseReader {
         Some('❯')
     }
     /// Its prompt hint (one contextual tip in the idle composer, measured on
+    /// 1.4.10: `❯ /export saves the conversation to a text file`, the cursor
+    /// at column 2, drawn in its dim grey with no `dim` attribute) is no
+    /// draft: the cursor's column and the cell's colour tell it from one.
     fn placeholder(&self) -> bool {
         true
     }
@@ -686,10 +758,12 @@ impl ScreenReader for MuseReader {
         Some("676c74")
     }
     /// An Enter in the same burst as the text is taken as a newline (measured
+    /// on 1.4.9-R6297.1 and 1.4.10-R6427.1, [`crate::muse`]).
     fn paste_guard(&self) -> bool {
         true
     }
     /// The status row's tail, `esc to interrupt)` (`◆ Thinking (2s · esc to
+    /// interrupt)`).
     fn busy_guard(&self) -> Option<String> {
         Some(format!(
             "{}\\)",
@@ -697,6 +771,7 @@ impl ScreenReader for MuseReader {
         ))
     }
     /// `◆ Calling tools (2s · esc to interrupt)` stays above an approval box's
+    /// frame (measured on 1.4.10, [`crate::muse::fixtures::BOX_SHELL`]).
     fn busy_row_outlives_boxes(&self) -> bool {
         true
     }
@@ -705,6 +780,9 @@ impl ScreenReader for MuseReader {
     }
     fn phase_authoritative(&self, rows: &[String], _: &Phase) -> bool {
         muse::phase(rows).1
+    }
+    fn title_runs(&self, title: &str) -> Option<bool> {
+        Some(muse::title_runs(title))
     }
 }
 
@@ -770,6 +848,7 @@ impl ScreenReader for GeminiReader {
         1
     }
     /// An Enter within 30 ms of a typed key is a newline (READ in the
+    /// 0.46.0 bundle, [`crate::gemini`]).
     fn paste_guard(&self) -> bool {
         true
     }
@@ -777,6 +856,7 @@ impl ScreenReader for GeminiReader {
         gemini::folded_paste(text)
     }
     /// The spinner on the status row: `esc to cancel` is drawn there only
+    /// beside it, and the row's `? for shortcuts` stays while a turn runs.
     fn busy_guard(&self) -> Option<String> {
         Some(gemini::busy_guard())
     }
@@ -799,6 +879,7 @@ impl ScreenReader for GenericReader {
 }
 
 /// Shells, pagers, viewers and editors: a session whose foreground program is one of
+/// these runs no agent, whatever its screen shows (a `cat` of a saved Claude screen).
 const NOT_AGENTS: &[&str] = &[
     "zsh", "bash", "sh", "fish", "dash", "ksh", "tcsh", "csh", "nu", "pwsh", "login", "less",
     "more", "most", "man", "vim", "nvim", "vi", "view", "emacs", "nano", "tail", "head", "cat",
@@ -835,6 +916,9 @@ pub fn identify(program: Option<&str>, rows: &[String]) -> &'static dyn ScreenRe
 }
 
 /// Claude Code's `/login` dialog in one of the states its own words name
+/// ([`crate::login::login_screen`]: the method picker, Console's menu, the
+/// browser hand-off, the success) — drawn in the composer's place, so no frame
+/// names the program while it stands.
 fn names_login(rows: &[String]) -> bool {
     crate::login::login_screen(rows).is_some_and(|s| !matches!(s, LoginScreen::Failed))
 }
@@ -876,6 +960,7 @@ pub fn live_zone_reaches_above(tail: &[String], n: usize) -> bool {
 }
 
 /// [`live_zone_start`]'s walk: where it stops, and the budget it has left
+/// (rows of `n` unspent when it ran out of rows).
 fn zone_walk(rows: &[String], n: usize) -> (usize, usize) {
     let drawn = rows
         .iter()
@@ -923,6 +1008,7 @@ pub fn program_of(program: &str) -> Option<Program> {
 }
 
 /// `muse-bin-1.4.10-R6427.1`: the build Meta's installer's launcher execs
+/// (`muse-bin-` and a version that opens on a digit), case aside.
 fn is_muse_build(word: &str) -> bool {
     word.get(..9)
         .is_some_and(|p| p.eq_ignore_ascii_case("muse-bin-"))
@@ -930,6 +1016,10 @@ fn is_muse_build(word: &str) -> bool {
 }
 
 /// The script runtimes an agent runs AS without renaming itself — an
+/// npm/bun install of Claude Code starts under `node` or `bun`: a program so
+/// named may be identified as an agent by its SCREEN (Claude Code's frame, a
+/// Codex, agy, Muse Code or Gemini CLI box or composer: [`identify`]); Gemini
+/// CLI always runs so.
 pub const AGENT_RUNTIMES: &[&str] = &["node", "bun", "deno"];
 
 /// Whether `program` is a generic runtime (`node`, `python`, etc.) that may host an agent.
@@ -942,6 +1032,11 @@ pub fn may_host_agent(program: &str) -> bool {
 }
 
 /// The program word of a `program=` / `detail=` value: the basename of its
+/// first word, a login shell's `-` dropped — borrowed, and matched against
+/// the tables without regard to case ([`program_of`], [`may_host_agent`],
+/// [`NOT_AGENTS`]; every name in them is ASCII), never lowercased into a new
+/// string: the GUI asks it of every pane's program on every frame
+/// (`harness_host::agent_of`), so it allocates nothing.
 fn program_word(program: &str) -> &str {
     let head = program.split_whitespace().next().unwrap_or(program);
     let base = head.rsplit('/').next().unwrap_or(head);
@@ -963,6 +1058,9 @@ mod tests {
     use crate::wall::WallKind;
 
     /// A MESSAGE ON THE SCREEN IS DRAWN, answered or not, with words under
+    /// it or none ([`ScreenReader::message_drawn`]; the review of
+    /// `b9/forever-gaps`, RV-2: a turn ended on a tool's box read as no
+    /// conversation where only the words were asked).
     #[test]
     fn a_message_on_the_screen_is_drawn_and_a_launch_holds_none() {
         use crate::prompt::fixtures::{first_turn_under_a_table, launch_under_a_table};
@@ -1018,6 +1116,8 @@ mod tests {
     }
 
     /// A program word is matched without regard to case, from its path and
+    /// past a login shell's `-` — and borrowed, never rebuilt: the GUI asks
+    /// it of every pane on every frame.
     #[test]
     fn program_words_match_without_case_from_a_path_and_a_login_dash() {
         for (program, want) in [
@@ -1064,6 +1164,8 @@ mod tests {
     }
 
     /// [`Program::ALL`] is every variant by construction (`next_program` and
+    /// the compile-time walk beside it); each name is its own and
+    /// [`program_of`] reads it back.
     #[test]
     fn every_programs_name_reads_back() {
         for p in Program::ALL {
@@ -1077,6 +1179,8 @@ mod tests {
     }
 
     /// The program name decides first; with none (or one that names no
+    /// agent), the screen does — Claude Code's frame or one of its boxes,
+    /// else the generic reader.
     #[test]
     fn identify_takes_the_program_name_then_the_screen() {
         let framed = {
@@ -1142,6 +1246,11 @@ mod tests {
     }
 
     /// THE SNIFF'S ORDER, PROVED OVER EVERY CAPTURE: read with no program
+    /// name, no capture of one agent is ever named another's — Claude Code's
+    /// (its own named `claude-…`, and the unprefixed and hand-built ones),
+    /// agy's, Muse Code's and Gemini CLI's each read as their own program or
+    /// as none, and each is named at least once; Codex never is (the screen
+    /// names no Codex).
     #[test]
     fn every_capture_is_identified_as_its_own_program_or_as_none() {
         let mut named = [0usize; 6];
@@ -1175,6 +1284,10 @@ mod tests {
     }
 
     /// A reader's default is not evidence: the generic reader's `idle` and
+    /// the Codex reader's every `idle` (it reads no Codex screen: a running
+    /// turn's status row and its trust gate alike) are not authoritative;
+    /// Claude Code's idle at its composer is (its idle with no composer:
+    /// [`claude_codes_idle_is_read_at_its_composer`]).
     #[test]
     fn a_default_idle_is_not_authoritative() {
         let working = codex_working();
@@ -1209,6 +1322,10 @@ mod tests {
     }
 
     /// THE CODEX READER READS NOTHING (aterm's Codex screen lane, retired on
+    /// 2026-10-16): on its trust gate and on a running turn it names no box,
+    /// wall, composer, question or busy row, and has no caret or paste
+    /// guard, so nothing acts on a Codex's screen and `aterm drive` waits on
+    /// nothing there.
     #[test]
     fn the_codex_reader_reads_nothing() {
         let working = codex_working();
@@ -1240,6 +1357,9 @@ mod tests {
     }
 
     /// What a supervisor TYPING into a program needs of its reader: the
+    /// composer on the screen (Claude Code's only inside its frame — a `❯`
+    /// row under a box is the transcript's) and the row whose leaving ends a
+    /// turn.
     #[test]
     fn each_reader_says_how_to_type_into_its_program() {
         let claude = Program::Claude.reader();
@@ -1268,6 +1388,8 @@ mod tests {
     }
 
     /// One read, whole: the 529 end of turn is idle WITH its wall; the
+    /// measured `/goal` screen is busy (a workflow runs), carries the armed
+    /// goal and Claude Code's suggestion, and no wall.
     #[test]
     fn a_reading_carries_the_wall_and_the_turn_end_facts() {
         let r = read(None, &screen(END_529), Some(2));
@@ -1334,6 +1456,10 @@ mod tests {
     }
 
     /// The reading's context is the one the screen SHOWS ([`ScreenReader::context_shown`]):
+    /// Claude Code 2.1.305's indicator at the end of its mode row reaches the tab's hover,
+    /// `ctl survey` and the session log as aterm's footer reads it, while the supervisor's
+    /// watch ([`ScreenReader::context`]) keeps the zone above the composer, where that build
+    /// draws none.
     #[test]
     fn a_reading_carries_the_context_the_screen_shows() {
         let mut on_mode_row = rows(&["⏺ Done.", ""]);
@@ -1357,6 +1483,13 @@ mod tests {
     }
 
     /// CLAUDE CODE'S OWN RETRY OF A USAGE LIMIT IS A TURN IN PROGRESS (accounts
+    /// v2 S5): the watchdog's ticking row, measured on 2.1.300 and 2.1.301 —
+    /// the inline renderer with and without a statusLine (with one, the
+    /// footer draws no `esc to interrupt`), the fullscreen renderer, 110, 80
+    /// and 50 columns (Ink's two columns under the glyph alone on its row),
+    /// the five-hour and the weekly limit, a turn's first request and its
+    /// second — reads busy on its status row and no wall, and so does the
+    /// same row a second later, its span ticked.
     #[test]
     fn the_watchdogs_retry_row_is_a_turn_in_progress() {
         use crate::phase::{Zone, background_only, transcript_end};
@@ -1472,6 +1605,8 @@ mod tests {
     }
 
     /// Claude Code's critical-memory banner under a running spinner: busy, with the banner
+    /// as a memory wall, the one wall a hard busy keeps ([`ScreenReader::health_wall`]); idle
+    /// it is the same wall.
     #[test]
     fn the_memory_banner_is_a_wall_even_under_a_busy_spinner() {
         let busy = screen(MEMORY_BANNER_BUSY);
@@ -1518,6 +1653,9 @@ mod tests {
     }
 
     /// Claude Code is idle at its composer, not before it: the 2.1.283 launch frames before
+    /// the REPL or with it half drawn, and a dialog with no reading (2.1.292's
+    /// classifier-billing notice), read `idle` not authoritatively, with no composer; the
+    /// REPL drawn whole is authoritative.
     #[test]
     fn claude_codes_idle_is_read_at_its_composer() {
         use crate::prompt::fixtures::{
@@ -1564,6 +1702,8 @@ mod tests {
     }
 
     /// The tall pane (2.1.284 at 144x50, `API_ERROR_TALL_PANE_MEASURED`): a short
+    /// transcript with the composer pinned at the foot leaves 35 blank rows above it and
+    /// the error 41 rows above the last drawn row, outside the grid's last 40.
     #[test]
     fn a_long_blank_gap_does_not_cut_the_last_thing_said_out_of_the_zone() {
         use crate::prompt::fixtures::API_ERROR_TALL_PANE_MEASURED;
@@ -1634,6 +1774,8 @@ mod tests {
     }
 
     /// [`live_zone_reaches_above`]: the measured tall pane's last 40 rows hold the 35-row
+    /// gap and say so; a full transcript, one-to-three-row separators and a tail that ends
+    /// on a blank row do not.
     #[test]
     fn a_tail_that_holds_a_gap_says_the_zone_reaches_above_it() {
         use crate::prompt::fixtures::API_ERROR_TALL_PANE_MEASURED;
@@ -1696,6 +1838,7 @@ mod tests {
     }
 
     /// The inline renderer's REPL sits above the grid's last 40 rows (2.1.283 at 150x50,
+    /// the `INLINE_*` fixtures: the box on rows 8-11, 38 blank rows under it).
     #[test]
     fn an_inline_repl_above_the_last_40_rows_is_read_in_the_live_zone() {
         use crate::prompt::fixtures::{
@@ -1746,6 +1889,8 @@ mod tests {
     }
 
     /// [`live_zone_start`]'s arithmetic: the last `n` rows counted up from
+    /// the last row that is not blank (spaces and no-break spaces are blank),
+    /// never below 0; a screen with nothing drawn starts at 0.
     #[test]
     fn the_live_zone_counts_drawn_rows() {
         let grid = |drawn: usize, blank: usize| {
@@ -1772,6 +1917,7 @@ mod tests {
     }
 
     /// Claude Code's shell mode (`!` as the caret, the `SHELL_MODE*` fixtures) is its prompt
+    /// box: authoritative idle, though no `❯` composer or frame.
     #[test]
     fn claude_codes_shell_mode_is_its_prompt_box() {
         use crate::prompt::fixtures::{SHELL_MODE, SHELL_MODE_DRAFT};
@@ -1824,6 +1970,8 @@ mod tests {
     }
 
     /// Claude Code's idle is the prompt box that holds the cursor: an inline relaunch leaves
+    /// the previous run's box whole above the new launch line, authoritative idle by the
+    /// frame alone but no evidence with the cursor under the launch line.
     #[test]
     fn claude_codes_idle_is_the_prompt_box_that_holds_the_cursor() {
         use crate::prompt::fixtures::{
@@ -1962,6 +2110,8 @@ mod tests {
     }
 
     /// [`crate::phase::prompt_box_holds`]: a box holds its rows from its top rule to its
+    /// bottom rule, for the `❯` composer and shell mode's `!` alike; nothing else holds,
+    /// and a whole box does not stretch down to a half-drawn one under it (the relaunch).
     #[test]
     fn a_prompt_box_holds_its_rows_and_nothing_else() {
         use crate::phase::prompt_box_holds as holds;
@@ -1999,6 +2149,8 @@ mod tests {
     }
 
     /// The banner's vendor remedy (`— restart and resume with claude --continue`) is cut by
+    /// [`crate::wall::memory_banner_head`]: `--continue` resumes the directory's newest
+    /// conversation, which may be a sibling tab's.
     #[test]
     fn the_memory_banner_head_leaves_the_vendors_continue_out() {
         let banner = memory_wall(&screen(MEMORY_BANNER_BUSY)).expect("the banner");
@@ -2012,6 +2164,10 @@ mod tests {
     }
 
     /// agy ALONE CANNOT BOUND A MESSAGE THAT HOLDS A BLANK LINE
+    /// ([`ScreenReader::bounds_messages`]): on the L15 worker's measured
+    /// screen the first prompt's blank line, drawn as a blank row, ends the
+    /// message as agy's reader reads it — the task alone — and the fact line
+    /// under it, two columns in, reads as agy's reply.
     #[test]
     fn agy_alone_cannot_bound_a_message_that_holds_a_blank_line() {
         let rows = crate::prompt::fixtures::screen(crate::agy::fixtures::lab::WORKER_FIRST_PROMPT);
@@ -2042,6 +2198,14 @@ mod tests {
     }
 
     /// ONLY AGY READS A MESSAGE'S ROWS AS ITS REPLY, which is what
+    /// [`ScreenReader::bounds_messages`] says of each worker's reader: on
+    /// each one's measured end of a turn (Claude Code's drawn in its frame),
+    /// rows put in the message under its first row — a blank row, then a row
+    /// at the message's own indent saying `NEEDS YOU: y` (two columns in,
+    /// Gemini CLI's three inside its band), agy's drawing of a message's
+    /// blank line and the worst case for every reader — change the reply
+    /// agy's reader reads and no other's: Claude Code's, Gemini CLI's and
+    /// Muse Code's take the reply from its head's mark.
     #[test]
     fn only_agy_reads_a_messages_rows_as_its_reply() {
         use crate::prompt::fixtures::screen;

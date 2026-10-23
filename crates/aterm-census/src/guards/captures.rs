@@ -2,39 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! capture-privacy: an encoded test capture carries nothing the export forbids.
-//!
-//! The export's content guard greps the exported text against the rows of
-//! `publish/forbidden-extra.txt` and of the publication engine's
-//! `baseline/forbidden-content.txt`, after the export's transforms have
-//! rewritten developer homes in text (aterm-release `transforms.rs`). Neither
-//! reads inside an encoded capture: a pty log is `<stamp> <I|O> <hex>` per
-//! record and a `.reads` file escapes its control bytes, so the terminal
-//! stream a test replays (a shell prompt, Claude Code's banner, a cwd) ships
-//! as hex digits and escapes that no grep decodes. The law: whatever the export
-//! forbids in text, a capture's decoded bytes may not carry either.
-//!
-//! Every capture of the checkout ([`FORMATS`], by extension) is decoded, each
-//! direction one stream, and read in four views, each split into lines as
-//! grep splits a file:
-//! * raw: the bytes as recorded, split at LF (an OSC title or cwd report reads
-//!   here with its escape around it);
-//! * joined: escape sequences deleted, each string sequence's payload (OSC,
-//!   DCS, APC, PM, SOS) on a line of its own, every other control byte a line
-//!   break, so a word an SGR or a cursor move splits reads whole;
-//! * spaced: as joined, but a CSI breaks the line, so a word a cursor move
-//!   ends reads ended;
-//! * edited: as joined, but a Backspace or a DEL takes back the byte before it
-//!   on its line, as a shell's echo of an erase (`\b \b`) and a typed DEL do,
-//!   so a word fixed while it was typed reads as the screen shows it.
-//!
-//! Each line is held to the patterns: every row of `publish/forbidden-extra.txt`
-//! (always), every row of the engine's baseline when this host has it
-//! (`$PUBLICATION_ENGINE`, else `~/publication`; elsewhere the census says it
-//! judged without it), and [`CAPTURE_ROWS`], what only a capture shows. A
-//! finding names the capture's record and the row it matched, never the text.
-//! The fix is the SOURCE: scrub the capture with neutral text of the same
-//! display width, so every replay a test reads keeps its rows and columns.
+//! `capture-privacy`: checks that decoded test captures contain no forbidden export patterns.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -59,14 +27,7 @@ pub(super) const EXTRA: &str = "publish/forbidden-extra.txt";
 /// The engine's baseline, relative to the engine's checkout.
 const BASELINE: &str = "baseline/forbidden-content.txt";
 
-/// What only a decoded capture shows, beyond the export's rows: (what, pattern).
-/// In text the export rewrites a home and the baseline names the toolchain
-/// checkouts exactly; a capture is published as recorded, so these hold every
-/// spelling. A scrubbed home keeps the export's doubled separator
-/// (`/Users//owner`, `/home//owner`), and a scrubbed session id is a
-/// zero-padded placeholder (`00000001-0000-4000-8000-000000000001`). Those
-/// are the one capture spelling of each: the home row refuses the plain-text
-/// fixtures' `/Users/_owner` inside a capture.
+/// Capture-specific forbidden `(description, pattern)` pairs beyond the export's rows.
 pub(super) const CAPTURE_ROWS: &[(&str, &str)] = &[
     (
         "a home path that names an account",
@@ -95,13 +56,10 @@ struct Format {
 /// Every encoded capture format the checkout holds. A test that records a new
 /// encoding adds its decoder here.
 const FORMATS: &[Format] = &[
-    // `<stamp> <I|O> <hex>` per record (aterm-effects' pty logs).
     Format {
         ext: "ptylog",
         decode: ptylog,
     },
-    // One PTY read per line, `\e \a \b \r \n \\` escaped, `#` comment lines
-    // (aterm-core's ConPTY replays).
     Format {
         ext: "reads",
         decode: reads,
@@ -380,10 +338,7 @@ impl Row {
     }
 }
 
-/// The rows of a pattern file (grep -E, one per line, `#` lines and blanks
-/// skipped after trimming, as the engine reads them), named `<label>:<line>`.
-/// A row that does not compile here is a finding of `rule` at `finding_path`:
-/// nothing would be held to it.
+/// Compiles the non-comment pattern rows of `text`, recording compile errors into `out`.
 pub(super) fn file_rows(
     text: &str,
     label: &str,
@@ -441,11 +396,7 @@ pub(super) fn baseline() -> Result<(String, String), String> {
         .map_err(|e| format!("{shown}: {e}"))
 }
 
-/// The census's notes on what this rule and `export-content` judged without:
-/// the engine's baseline when this host does not have it, and the export's own
-/// rows when the checkout has none (a public snapshot withholds `publish/`, and
-/// the engine reads an absent extras file as no rows). [`CAPTURE_ROWS`] always
-/// hold.
+/// Returns census notes listing any absent baseline or extras files.
 pub(super) fn notes(root: &Path) -> Vec<String> {
     let mut without = Vec::new();
     if let Err(why) = baseline() {
@@ -522,8 +473,7 @@ fn format_of(rel: &str) -> Option<&'static Format> {
     FORMATS.iter().find(|f| f.ext == ext)
 }
 
-/// One capture (`rel`, its text) held to `rows`: one finding per stream and
-/// row it matches, at the first record matching.
+/// Checks one capture (`rel`, `text`) against `rows` and appends any findings to `out`.
 pub(super) fn judge(rel: &str, text: &str, rows: &[Row], out: &mut Vec<Finding>) {
     let Some(format) = format_of(rel) else {
         return;
@@ -547,7 +497,6 @@ pub(super) fn judge(rel: &str, text: &str, rows: &[Row], out: &mut Vec<Finding>)
             View::printable(&stream.bytes, Read::Spaced),
             View::printable(&stream.bytes, Read::Edited),
         ];
-        // (row index) -> the records whose bytes match it
         let mut hits: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
         let mut exhausted: BTreeSet<usize> = BTreeSet::new();
         for view in &views {
@@ -560,7 +509,6 @@ pub(super) fn judge(rel: &str, text: &str, rows: &[Row], out: &mut Vec<Finding>)
                     let text = String::from_utf8_lossy(line);
                     match row.line.try_find(&text) {
                         Ok(Some(m)) => {
-                            // a lossy line's offsets are not the view's
                             let at = match text {
                                 Cow::Borrowed(_) => start + m.start(),
                                 Cow::Owned(_) => start,
@@ -606,8 +554,7 @@ pub(super) fn judge(rel: &str, text: &str, rows: &[Row], out: &mut Vec<Finding>)
     }
 }
 
-/// The ptylog format's records as text, for tests: each `(kind, bytes)` one
-/// record, lowercase hex.
+/// Encodes `(kind, bytes)` records into `ptylog` text for tests.
 #[cfg(test)]
 pub(super) fn ptylog_text(records: &[(&str, &[u8])]) -> String {
     use std::fmt::Write as _;

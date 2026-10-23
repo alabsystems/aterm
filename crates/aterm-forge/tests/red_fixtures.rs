@@ -1,42 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Non-vacuity proofs for `targo --unverified forge check`: each test plants a
-//! violation and asserts the gate goes red.
-//!
-//! Each drives the verb, not a helper: [`aterm_forge::check::run`] with
-//! `--cell mac-arm` (`check_one_cell`). The review-registration, NOTICE, carve
-//! and fork-ledger obligations are judged once, whatever the cells, and the
-//! liveness one per cell, so one cell red is the verb red. One baseline, the
-//! carve fixture's, runs the whole default matrix instead (`check_every_cell`),
-//! so every cell must resolve this aterm-shaped tree and judge it green.
-//!
-//! # How each fixture is built
-//!
-//! Each test builds a miniature aterm workspace in its own directory under the
-//! cargo target tmpdir (never in the repository or `/tmp`): a `crates/aterm`
-//! root plus the web modules `crates/aterm-wasm` and `crates/aterm-gpu-web` (so
-//! every cell has a root to resolve; the wasm cells are rooted at the web
-//! modules), a fork of a real upstream crate ([`FORK`], copied from this
-//! checkout's registry with its provenance files, the `[workspace]` stub and one
-//! marked local change), the repository's `deny.toml`, a `NOTICE` naming exactly
-//! the forks present, a `vendor/forge.toml` fork ledger, and a generated
-//! `Cargo.lock`. All roots carry the [`FORK`] edge, so the patch is
-//! live in every cell.
-//!
-//! Two details matter:
-//!
-//!   * `git init`: otherwise the fixture inherits this repository's
-//!     `.gitignore`, whose `target` rule makes `[OB-10]` report every vendored
-//!     path as ignored.
-//!   * `exclude = ["vendor", "other"]`: the vendored crates carry the
-//!     `[workspace]` stub `[OB-3]` requires, and reaching one as a path
-//!     dependency inside the workspace directory is "multiple workspace roots
-//!     found". The real repository reaches forks through `[patch.crates-io]`
-//!     only.
-//!
-//! Every test asserts green first, so a red can only come from the plant; the
-//! verb is a function of the tree, so a tree put back as it was is that green.
+//! Non-vacuity red-fixture tests for `targo --unverified forge check`
+//! ([`aterm_forge::check::run`], [`FORK`]).
+
 #![allow(
     clippy::disallowed_types,
     reason = "never linked into the shipped binary: the third-party survey behind targo --unverified forge"
@@ -46,8 +13,6 @@ use aterm_forge::model::PkgId;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The specimen fork: zeroize is in rustls's closure, which aterm keeps in every native
-/// cell, so the repository's lock always carries it and a fetched checkout has it
 /// unpacked. Its license, `Apache-2.0 OR MIT`, elects the MIT arm ([OB-7]).
 const FORK: &str = "zeroize";
 const FORK_LICENSE: &str = "Apache-2.0 OR MIT";
@@ -79,8 +44,6 @@ fn workspace_manifest(members_extra: &str, patch_extra: &str) -> String {
     )
 }
 
-/// The forge verb over one cell (`targo --unverified forge check --cell
-/// mac-arm`, i.e. [`aterm_forge::check::run`]), folded to `(green, transcript)`:
 /// could-not-run is red, with the reason and the transcript so far.
 fn check_one_cell(root: &Path) -> (bool, String) {
     match aterm_forge::check::run(
@@ -93,9 +56,6 @@ fn check_one_cell(root: &Path) -> (bool, String) {
     }
 }
 
-/// The forge verb over every default cell (`targo --unverified forge check`
-/// with no `--cell`, as `verify forge` runs it), folded as [`check_one_cell`]
-/// folds it. A cell rooted at a package aterm does not ship, or at a triple
 /// cargo cannot resolve, is could-not-run, so red.
 fn check_every_cell(root: &Path) -> (bool, String) {
     match aterm_forge::check::run(&aterm_forge::resolve::Cargo::from_env(), root, &[]) {
@@ -104,10 +64,6 @@ fn check_every_cell(root: &Path) -> (bool, String) {
     }
 }
 
-// The fixture workspace
-
-/// A miniature aterm workspace, rebuilt from scratch for each test in a directory of its own
-/// under the cargo target tmpdir, removed with it: two runs of this binary at once (a check
 /// beside a hand run) never build in, or remove, one another's.
 struct Fixture {
     root: PathBuf,
@@ -115,8 +71,6 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// The green baseline: one reviewed, fully-provenanced fork ([`FORK`]),
-    /// live in every cell, named in NOTICE and in the fork ledger, with no
     /// carve rows and no ratchet file.
     fn baseline(name: &str) -> Self {
         let tmp = env!("CARGO_TARGET_TMPDIR");
@@ -126,11 +80,6 @@ impl Fixture {
             .tempdir_in(tmp)
             .expect("fixture root");
         let root = dir.path().to_path_buf();
-        // `target/` exists so nested `targo tree` runs keep cargo's rustc info
-        // cache (`target/.rustc_info.json`, written only into an EXISTING
-        // target dir): 0.75 s per `tree` cold against 0.01 s warm. The real
-        // checkout has a `target/` too, and forge never reads the root
-        // listing, so no obligation sees it.
         std::fs::create_dir_all(root.join("target")).expect("fixture root");
         let fx = Self { root, _dir: dir };
 
@@ -139,11 +88,8 @@ impl Fixture {
                 .unwrap_or_else(|| panic!("{FORK} is unpacked in this checkout's registry"));
         let fork = fx.path(&format!("vendor/{FORK}"));
         copy_tree(&upstream, &fork);
-        // Cargo's unpack marker and the package's own lockfile are no part of a vendored copy.
         fx.remove(&format!("vendor/{FORK}/.cargo-ok"));
         fx.remove(&format!("vendor/{FORK}/Cargo.lock"));
-        // What makes the copy a fork: [OB-3]'s `[workspace]` stub and [OB-8]'s marked
-        // local change.
         let manifest = std::fs::read_to_string(fork.join("Cargo.toml")).expect("fork manifest");
         fx.write(
             &format!("vendor/{FORK}/Cargo.toml"),
@@ -163,7 +109,6 @@ impl Fixture {
             "crates/aterm/src/lib.rs",
             "// SPDX-License-Identifier: Apache-2.0\n",
         );
-        // The two wasm cells are rooted at the web modules, not at `aterm`.
         for web in ["aterm-wasm", "aterm-gpu-web"] {
             fx.write(
                 &format!("crates/{web}/Cargo.toml"),
@@ -189,8 +134,6 @@ impl Fixture {
         fx.write_notice(&[(FORK, &fork_version(), FORK_LICENSE)]);
         fx.write_ledger("");
 
-        // Own repository, so the parent checkout's `target/` ignore rule does
-        // not apply (see the module docs).
         let _ = Command::new("git")
             .args(["init", "-q"])
             .current_dir(&fx.root)
@@ -242,7 +185,6 @@ impl Fixture {
         self.write("NOTICE", &text);
     }
 
-    /// The fork ledger `[OB-17]` holds to the tree: the method header, one
     /// block for [`FORK`], then `extra` (more blocks, or carve rows).
     fn write_ledger(&self, extra: &str) {
         let mut text = format!(
@@ -268,11 +210,8 @@ impl Fixture {
         self.write("vendor/forge.toml", &text);
     }
 
-    /// Re-resolve after a manifest edit. `check` resolves with `--locked`, so a
     /// stale lockfile would fail the cell rather than the obligation under test.
     fn regen_lock(&self) {
-        // `$CARGO` (targo under `targo --unverified test`), else Trust's `targo`;
-        // `generate-lockfile` takes no lane flag.
         let exe = std::env::var_os("CARGO").unwrap_or_else(|| "targo".into());
         let out = Command::new(exe)
             .args(["generate-lockfile", "--offline", "--manifest-path"])
@@ -288,7 +227,6 @@ impl Fixture {
         );
     }
 
-    /// A complete, well-formed fork kit, so a planted fork is wrong only in
     /// the way the test is about.
     fn add_wellformed_fork(&self, name: &str, version: &str) {
         let dir = format!("vendor/{name}");
@@ -361,12 +299,6 @@ fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
-// The proofs
-
-/// `[OB-13]` the carve ledger: a path recorded as deleted is present again.
-/// Green before in every default cell, red after.
-///
-/// The carved path is the fork's `src/x86.rs`, a real module of zeroize compiled
 /// only for x86 targets; the fixture deletes it.
 #[test]
 fn a_reinstated_carved_module_reds_the_forge_verb() {
@@ -388,7 +320,6 @@ fn a_reinstated_carved_module_reds_the_forge_verb() {
          resolves what aterm ships (and this test proves nothing):\n{log}"
     );
 
-    // Plant the violation: the carved module is back.
     fx.write(&carved, "// reinstated by hand\n");
 
     let (ok, log) = check_one_cell(fx.root());
@@ -402,9 +333,6 @@ fn a_reinstated_carved_module_reds_the_forge_verb() {
     );
 }
 
-/// `[OB-11]` the census review: a `[patch.crates-io]` entry with no `[[fork]]`
-/// block in `vendor/forge.toml`, the ledger the census reads its review from.
-/// The planted fork is otherwise complete, so the red can only come from the
 /// missing review.
 #[test]
 fn an_unreviewed_patch_entry_reds_the_forge_verb() {
@@ -416,8 +344,6 @@ fn an_unreviewed_patch_entry_reds_the_forge_verb() {
         "the baseline fixture must be GREEN or this test proves nothing:\n{log}"
     );
 
-    // Plant the violation: a second fork, complete in every respect except
-    // that no ledger block reviews it.
     fx.add_wellformed_fork("forge_fixture_fork", "0.1.0");
     fx.write_notice(&[
         (FORK, &fork_version(), FORK_LICENSE),
@@ -458,8 +384,6 @@ fn a_notice_that_omits_a_registered_fork_reds_the_forge_verb() {
         "the baseline fixture must be GREEN or this test proves nothing:\n{log}"
     );
 
-    // Plant the violation: the fork is still vendored, patched and live — it
-    // has simply been dropped from NOTICE.
     fx.write_notice(&[]);
 
     let (ok, log) = check_one_cell(fx.root());
@@ -473,7 +397,6 @@ fn a_notice_that_omits_a_registered_fork_reds_the_forge_verb() {
     );
 }
 
-/// `[OB-17]` the fork ledger: a `[[fork]]` block describing another copy turns
 /// the verb red.
 #[test]
 fn a_ledger_that_disagrees_with_the_tree_reds_the_forge_verb() {
@@ -485,7 +408,6 @@ fn a_ledger_that_disagrees_with_the_tree_reds_the_forge_verb() {
         "the baseline fixture must be GREEN or this test proves nothing:\n{log}"
     );
 
-    // Plant the violation: a fork block recording a version the tree does not carry.
     let good = std::fs::read_to_string(fx.path("vendor/forge.toml")).expect("ledger");
     let recorded = format!("version = \"{}\"", fork_version());
     assert!(
@@ -506,9 +428,6 @@ fn a_ledger_that_disagrees_with_the_tree_reds_the_forge_verb() {
         "the RED must be [OB-17]:\n{log}"
     );
 
-    // And the field the manifest does not carry: a §4(b) flag the license
-    // does not owe (the fork is `Apache-2.0 OR MIT`). The census class is the
-    // census's own input, read from this same block, so no plant can misstate it.
     let planted = good.replace(
         "license = \"Apache-2.0 OR MIT\"\n",
         "license = \"Apache-2.0 OR MIT\"\napache_notice = true\n",
@@ -519,9 +438,6 @@ fn a_ledger_that_disagrees_with_the_tree_reds_the_forge_verb() {
     assert!(!ok && log.contains("FAIL [OB-17]"), "{planted}\n{log}");
 }
 
-/// `[OB-12]` patch liveness: a second, unpatched copy of a patched crate
-/// resolving beside the fork. Cargo reports nothing (the build is green and
-/// `cargo metadata` says the patch is in force), so it is synthesized here as
 /// two path packages.
 #[test]
 fn an_unpatched_sibling_version_reds_the_forge_verb() {
@@ -533,8 +449,6 @@ fn an_unpatched_sibling_version_reds_the_forge_verb() {
         "the baseline fixture must be GREEN or this test proves nothing:\n{log}"
     );
 
-    // Plant the violation: an intermediate dependency drags in a second
-    // copy of the fork at another major, exactly as toml_edit 0.25 did for winnow.
     fx.write(
         &format!("other/{FORK}/Cargo.toml"),
         &format!(

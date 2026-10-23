@@ -9,12 +9,14 @@
 )]
 
 /// Ordinal of both the icon and the manifest; resources are keyed by (type, id), so they do not
+/// collide.
 const RESOURCE_ID: u16 = 1;
 
 /// `RT_MANIFEST` as its raw type number: the macro needs `#include <winuser.h>`, and a box with
+/// `rc.exe` but no SDK headers on its include path would then fail to compile the resource.
 const RT_MANIFEST: u16 = 24;
 
-/// `VS_VERSION_INFO` as its raw id. Without `#include <winver.h>` rc.exe takes the bare macro
+/// `VS_VERSION_INFO` as its raw id.
 const VS_VERSION_INFO_ID: u16 = 1;
 
 fn main() {
@@ -60,6 +62,9 @@ fn main() {
 }
 
 /// Apple-silicon macOS bins link with chained fixups (`ld -fixup_chains`), which the linker
+/// emits only from a macOS 12 deployment target on its own; Rust's for `aarch64-apple-darwin`
+/// is 11.0, so without this the shipped executable carries the older rebase/bind opcodes and
+/// dyld rebases every pointer in `__DATA_CONST` (about 46,800 of them) before `main`.
 fn chained_fixups() {
     let target = |key: &str| std::env::var(key).unwrap_or_default();
     if target("CARGO_CFG_TARGET_OS") == "macos" && target("CARGO_CFG_TARGET_ARCH") == "aarch64" {
@@ -95,7 +100,7 @@ fn report(why: &str) {
     }
 }
 
-/// Build the resource script text. Generated, not checked in: `VS_VERSION_INFO` carries the
+/// Build the resource script text.
 fn resource_script(icon: &std::path::Path, app_manifest: &std::path::Path) -> String {
     let major = env_num("CARGO_PKG_VERSION_MAJOR");
     let minor = env_num("CARGO_PKG_VERSION_MINOR");
@@ -172,12 +177,13 @@ END
     )
 }
 
-/// A path as it may appear inside an `.rc` string literal. Backslash is the .rc escape
+/// A path as it may appear inside an `.rc` string literal.
 fn rc_path_literal(p: &std::path::Path) -> String {
     p.display().to_string().replace('\\', "/")
 }
 
 /// A `CARGO_PKG_VERSION_*` component, clamped into the u16 a version-quad field
+/// actually is.
 fn env_num(key: &str) -> u16 {
     std::env::var(key)
         .ok()
@@ -200,7 +206,7 @@ mod build_stamp {
     use super::run;
     use std::path::PathBuf;
 
-    /// A build fact supplied by the caller instead of probed from git. Empty is
+    /// A build fact supplied by the caller instead of probed from git.
     fn pinned(key: &str) -> Option<String> {
         println!("cargo:rerun-if-env-changed={key}");
         std::env::var(key).ok().filter(|v| !v.trim().is_empty())
@@ -281,7 +287,7 @@ mod build_stamp {
         println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
     }
 
-    /// A path git prints, made absolute. `--path-format=absolute` arrived after
+    /// A path git prints, made absolute.
     fn git_abs_path(args: &[&str]) -> Option<PathBuf> {
         let mut with_format = vec!["rev-parse", "--path-format=absolute"];
         with_format.extend_from_slice(args);
@@ -299,6 +305,7 @@ mod build_stamp {
     }
 
     /// The git files whose change may stale the commit stamp, resolved through git so a linked
+    /// worktree (whose `.git` is a file) and the main checkout both work.
     fn git_watch_paths() -> Vec<PathBuf> {
         let mut paths = Vec::new();
         let Some(git_dir) = run("git", &["rev-parse", "--absolute-git-dir"]).map(PathBuf::from)

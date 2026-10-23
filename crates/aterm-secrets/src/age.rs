@@ -1,49 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! age v1 (C2SP age.md) with X25519 recipients: the file format every locker of a vault is.
-//!
-//! [`encrypt`] makes a binary age file; [`armor`] wraps it in the ASCII armor the envelope
-//! carries; [`decrypt`] reads either. Only `X25519` stanzas are understood: a stanza of
-//! another type is skipped, as the spec requires, and an `scrypt` stanza next to another is
-//! a header failure. Decryption releases no plaintext unless every chunk authenticated.
-//!
-//! The errors are the C2SP CCTV vector classes, so the vectors are held to them exactly
-//! (`tests/cctv.rs`, 102 vectors). The reader follows the reference implementation
-//! (filippo.io/age) wherever the spec leaves a choice: the header grammar of its
-//! `internal/format`, the stanza rules of its `x25519.go`, the STREAM reader of its
-//! `internal/stream` and the armor reader of its `armor.go`, in the same order, so a file
-//! that fails two ways fails with the class the reference reports first:
-//!
-//! 1. Armor ([`AgeError::Armor`]): a file that does not begin `age-encryption.org/` is read
-//!    as armor, and the whole armor is checked before anything inside it is parsed.
-//! 2. Header grammar ([`AgeError::Header`]), including an empty file and one over
-//!    [`MAX_FILE`] or with a header over [`MAX_HEADER`].
-//! 3. An `scrypt` stanza beside any other ([`AgeError::Header`]).
-//! 4. The identities, each against every stanza in order: a malformed `X25519` stanza (not
-//!    exactly one argument, a share that is not canonical base64 of 32 bytes, a body that is
-//!    not 32 bytes) or an all-zero shared secret is [`AgeError::Header`]; no stanza opening
-//!    is [`AgeError::NoMatch`]. A stanza whose type is not exactly `X25519` (`x25519`
-//!    included) is skipped, which is why CCTV's `x25519_lowercase` is "no match".
-//! 5. The header MAC ([`AgeError::Hmac`]).
-//! 6. A payload nonce shorter than 16 bytes ([`AgeError::Header`], as CCTV classes it).
-//! 7. The STREAM payload ([`AgeError::Payload`]): a chunk that does not authenticate, no
-//!    final chunk, an empty final chunk after a full one, or bytes after the final chunk.
-//!
-//! CCTV's `payload failure` vectors also give the hash of what a streaming reader released
-//! before the failure; this reader releases nothing then, so only `success` hashes apply.
+//! age v1 (C2SP age.md) encryption and decryption with X25519 recipients ([`encrypt`],
+//! [`armor`], [`decrypt`], [`AgeError::Armor`], [`AgeError::Header`], [`MAX_FILE`],
+//! [`MAX_HEADER`], [`AgeError::NoMatch`], [`AgeError::Hmac`], [`AgeError::Payload`]).
 
 use crate::{SecretBytes, b64, bech32, x25519};
 use ring::{aead, hkdf, hmac};
 use zeroize::Zeroize;
 
-/// Why an age operation failed. Deliberately coarse: it never says which byte or which key.
+/// Why an age operation failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgeError {
     /// No stanza opened with the identities given.
     NoMatch,
-    /// The header is malformed (grammar, base64, a bad X25519 stanza, an all-zero shared
-    /// secret, a missing or short payload nonce).
+    /// The header is malformed.
     Header,
     /// The header MAC does not verify.
     Hmac,
@@ -70,16 +41,13 @@ impl std::fmt::Display for AgeError {
 
 impl std::error::Error for AgeError {}
 
-/// The largest binary age file [`decrypt`] reads, and [`encrypt`] makes: 64 MiB. A vault
-/// envelope is at most 16 MiB, and CCTV's largest vector (258 chunks) is 16.1 MiB.
+/// The largest binary age file [`decrypt`] reads, and [`encrypt`] makes: 64 MiB.
 pub const MAX_FILE: usize = 64 << 20;
 
-/// The largest header [`decrypt`] reads, and [`encrypt`] makes: 1 MiB (about 9,000 X25519
-/// recipients).
+/// The largest header [`decrypt`] reads, and [`encrypt`] makes: 1 MiB.
 pub const MAX_HEADER: usize = 1 << 20;
 
-/// The largest armored file [`dearmor`] reads: [`MAX_FILE`] at 48 bytes per 64-column line
-/// with CRLF ends, plus the BEGIN and END lines and the whitespace allowed around them.
+/// Largest armored file [`dearmor`] reads ([`MAX_FILE`]).
 pub const MAX_ARMORED: usize = MAX_FILE.div_ceil(BYTES_PER_LINE) * (COLUMNS + 2) + 4096;
 
 /// What every binary age file starts with (the version line's fixed part).
@@ -104,7 +72,7 @@ const PAYLOAD_NONCE: usize = 16;
 /// The file key.
 const FILE_KEY: usize = 16;
 
-/// An age X25519 identity: a machine key. Wiped on drop; `Debug` shows only its recipient.
+/// An age X25519 identity: a machine key.
 pub struct Identity {
     secret: [u8; 32],
     /// X25519(secret, 9), computed once: every unwrap salts with it.
@@ -185,8 +153,7 @@ impl std::fmt::Debug for Identity {
 pub struct Recipient(pub [u8; 32]);
 
 impl Recipient {
-    /// Parse `age1…` (all-lowercase, HRP exactly `age`, 32 bytes, not a low-order point:
-    /// [`encrypt`] could never wrap a file key to one, so a vault never names one).
+    /// Parse an `age1…` X25519 recipient ([`encrypt`]).
     pub fn parse(text: &str) -> Result<Recipient, AgeError> {
         let decoded = bech32::decode(text).ok_or(AgeError::Key)?;
         if decoded.uppercase || decoded.hrp != "age" {
@@ -205,23 +172,12 @@ impl Recipient {
     }
 }
 
-/// True when `point` is a low-order u-coordinate, one whose X25519 with every scalar is all
-/// zero: a point of order dividing 8 on the curve or 4 on its twist, in any of its spellings
-/// (the top bit set, or u ≥ p). One scalar decides for all: a clamped scalar is 8 times a
-/// number below both large prime orders, so it sends every other point to a point of large
-/// odd order, never to the identity or the point of order 2 (the two the ladder spells as
-/// zero). The point is public, so the probe need not be constant time.
+/// True when `point` is a low-order u-coordinate, one whose X25519 with every scalar is all zero.
 fn low_order(point: &[u8; 32]) -> bool {
     x25519::x25519(&[0x55; 32], point) == [0u8; 32]
 }
 
-/// Encrypt `plaintext` to every recipient (at least one): a fresh 16-byte file key, one
-/// X25519 stanza per recipient with a fresh ephemeral key each, the header MAC, a fresh
-/// 16-byte payload nonce and the STREAM payload. Binary age file.
-///
-/// Refused (`InvalidInput`): no recipients, a recipient that is a low-order point (the
-/// shared secret would be all zero, which every reader refuses), and a file or header over
-/// [`MAX_FILE`] or [`MAX_HEADER`], which [`decrypt`] would refuse.
+/// Encrypt `plaintext` to every recipient ([`MAX_FILE`], [`MAX_HEADER`], [`decrypt`]).
 pub fn encrypt(recipients: &[Recipient], plaintext: &[u8]) -> std::io::Result<Vec<u8>> {
     if recipients.is_empty() {
         return Err(invalid_input("age: no recipients"));
@@ -280,7 +236,6 @@ fn encrypt_with_file_key(
         let start = index * CHUNK;
         let end = plaintext.len().min(start + CHUNK);
         let at = out.len();
-        // The chunk is sealed in place, so `out` never holds it in the clear past this call.
         out.extend_from_slice(&plaintext[start..end]);
         let tag = key
             .seal_in_place_separate_tag(
@@ -324,8 +279,7 @@ fn wrap(
     }
 }
 
-/// A stanza body wrapped at 64 columns; a body whose encoding fills its last line (or is
-/// empty) ends with an empty line, so the stanza always ends with a short one.
+/// A stanza body wrapped at 64 columns.
 fn push_wrapped(header: &mut Vec<u8>, encoded: &str) {
     let bytes = encoded.as_bytes();
     for line in bytes.chunks(COLUMNS) {
@@ -382,12 +336,7 @@ fn stream_nonce(counter: u64, last: bool) -> aead::Nonce {
     aead::Nonce::assume_unique_for_key(nonce)
 }
 
-/// Decrypt an age file, binary or armored, with the first identity that opens a stanza.
-/// All-or-nothing: no plaintext unless the whole payload authenticated. A file that does
-/// not begin with age's version line (`age-encryption.org/`) is read as armor (whitespace
-/// around an armor is allowed as [`dearmor`] says), so anything before a binary file's
-/// version line is an armor failure; an empty file is a header failure. The order of the
-/// checks, and so which class a file that fails twice gets, is the module's.
+/// Decrypt a binary or armored age file ([`dearmor`]).
 pub fn decrypt(identities: &[Identity], file: &[u8]) -> Result<SecretBytes, AgeError> {
     if file.is_empty() || file.starts_with(INTRO) {
         decrypt_binary(identities, file)
@@ -434,7 +383,6 @@ impl<'a> Lines<'a> {
     }
 
     /// The next line without its LF and one CR before it; the last line may lack its LF.
-    /// `None` at the end of the data (the armor reader's `getLine`).
     fn next_armor_line(&mut self) -> Option<&'a [u8]> {
         let rest = self.rest();
         if rest.is_empty() {
@@ -552,8 +500,7 @@ fn open_after_header(
     open_stream(&payload_key(file_key, nonce), chunks)
 }
 
-/// Every identity against every stanza, in that order (the reference's `decryptHdr` and
-/// `multiUnwrap`): the first stanza that opens gives the file key.
+/// Every identity against every stanza.
 fn unwrap_file_key(
     identities: &[Identity],
     stanzas: &[Stanza<'_>],
@@ -584,7 +531,6 @@ fn unwrap_x25519(
     let share: [u8; 32] = b64::decode_nopad(share)
         .and_then(|share| share.try_into().ok())
         .ok_or(AgeError::Header)?;
-    // Checked before any decryption, against partitioning oracles (age.md).
     if stanza.body.len() != FILE_KEY + TAG {
         return Err(AgeError::Header);
     }
@@ -608,14 +554,8 @@ fn unwrap_x25519(
     Ok(opened)
 }
 
-/// The STREAM payload after its nonce, all or nothing. A chunk's place decides its flag: a
-/// full chunk with more bytes after it is not final, the chunk that ends the input is. A
-/// reader that tried both flags (the reference does) refuses the same files with the same
-/// class: a final chunk with bytes after it is a trailing-data failure there and an
-/// authentication failure here.
+/// The STREAM payload after its nonce, all or nothing.
 fn open_stream(key: &aead::LessSafeKey, mut rest: &[u8]) -> Result<SecretBytes, AgeError> {
-    // Plaintext is never longer than its ciphertext, so this never reallocates and leaves
-    // no unwiped copy behind.
     let mut out: Vec<u8> = Vec::with_capacity(rest.len());
     let mut counter: u64 = 0;
     let result = loop {
@@ -657,14 +597,12 @@ fn open_stream(key: &aead::LessSafeKey, mut rest: &[u8]) -> Result<SecretBytes, 
     }
 }
 
-/// The ASCII armor of a binary age file (RFC 7468 strict: padded base64, 64 columns,
-/// `-----BEGIN AGE ENCRYPTED FILE-----` / `-----END AGE ENCRYPTED FILE-----`, LF, a final LF).
+/// Wrap a binary age file in RFC 7468 strict ASCII armor.
 pub fn armor(binary: &[u8]) -> String {
     let lines = binary.len().div_ceil(BYTES_PER_LINE);
     let mut text =
         String::with_capacity(ARMOR_BEGIN.len() + ARMOR_END.len() + 2 + lines * (COLUMNS + 1));
     text.push_str("-----BEGIN AGE ENCRYPTED FILE-----\n");
-    // Whole lines per block, so only the last block can carry padding.
     for block in binary.chunks(BYTES_PER_LINE * 1024) {
         let encoded = b64::encode_padded(block);
         let mut at = 0;
@@ -684,16 +622,7 @@ fn is_space(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
 }
 
-/// The binary age file inside an armor, by the reference reader's rules (age.md and
-/// `armor.go`): at most 1024 bytes of surrounding whitespace, CR stripped from line ends, no
-/// empty line, no line over 64 columns, every line but the last exactly 64, each line
-/// canonical padded base64 on its own.
-///
-/// Precisely: whitespace-only lines before the BEGIN line (at most 1024 bytes of them,
-/// counting each line's LF); the BEGIN line exactly; lines of padded base64, each at most
-/// 64 columns and decoding on its own, every one but the last decoding to exactly 48 bytes;
-/// the END line exactly; then fewer than 1024 bytes, all whitespace. Each line may end in
-/// CRLF; the END line may end the input without one. No armor over [`MAX_ARMORED`] bytes.
+/// Decode the binary age file inside an ASCII armor ([`MAX_ARMORED`]).
 pub fn dearmor(text: &[u8]) -> Result<Vec<u8>, AgeError> {
     if text.len() > MAX_ARMORED {
         return Err(AgeError::Armor);
@@ -745,7 +674,6 @@ mod tests {
     use super::*;
 
     fn identity(seed: u8) -> Identity {
-        // A synthetic key from a fixed seed, derived at run time.
         let mut secret = [0u8; 32];
         for (i, byte) in secret.iter_mut().enumerate() {
             *byte = seed.wrapping_mul(31).wrapping_add(i as u8 * 7);
@@ -831,7 +759,6 @@ mod tests {
             "{text}"
         );
         assert!(text.lines().all(|line| line.len() <= 64), "{text}");
-        // Fresh ephemeral shares and file keys: two encryptions share nothing.
         let again = encrypt(&recipients, b"x").expect("encrypt");
         let again = parse_header(&again).expect("header");
         assert_ne!(header.stanzas[0].args, again.stanzas[0].args);
@@ -846,7 +773,6 @@ mod tests {
             Some(AgeError::NoMatch)
         );
         assert_eq!(decrypt(&[], &file).err(), Some(AgeError::NoMatch));
-        // The first identity that opens a stanza wins; others are tried in order.
         let opened = decrypt(&[identity(2), identity(1)], &file).expect("second identity");
         assert_eq!(opened.as_slice(), b"secret");
     }
@@ -867,7 +793,6 @@ mod tests {
             assert_eq!(dearmor(armored.as_bytes()).expect("dearmor"), file, "{len}");
             let opened = decrypt(&[identity(3)], armored.as_bytes()).expect("decrypt armor");
             assert_eq!(opened.as_slice(), plaintext(len).as_slice());
-            // CRLF line ends and surrounding whitespace are accepted.
             let crlf = format!("\n \t\r\n{}\n\n", armored.replace('\n', "\r\n"));
             assert_eq!(dearmor(crlf.as_bytes()).expect("crlf"), file, "{len}");
         }
@@ -921,7 +846,6 @@ mod tests {
         assert_eq!(text, text.to_ascii_uppercase());
         let parsed = Identity::parse(text).expect("parse");
         assert_eq!(parsed.secret_bytes(), id.secret_bytes());
-        // Lowercase (the checksum is still valid) is not an identity.
         assert_eq!(
             Identity::parse(&text.to_ascii_lowercase()).err(),
             Some(AgeError::Key)
@@ -935,13 +859,11 @@ mod tests {
             Recipient::parse(&spelled.to_ascii_uppercase()),
             Err(AgeError::Key)
         );
-        // Wrong HRPs: an identity as a recipient, a recipient as an identity.
         assert_eq!(Recipient::parse(text).err(), Some(AgeError::Key));
         assert_eq!(
             Identity::parse(&spelled.to_ascii_uppercase()).err(),
             Some(AgeError::Key)
         );
-        // Wrong lengths.
         assert_eq!(
             Recipient::parse(&bech32::encode("age", &[1u8; 31])),
             Err(AgeError::Key)
@@ -995,7 +917,6 @@ mod tests {
     /// (0 and 1 again, unreduced); each also with the top bit set, which X25519 ignores.
     fn low_order_points() -> Vec<[u8; 32]> {
         let unreduced = |low: u8| {
-            // p = 2^255 - 19 is ed ff … ff 7f little-endian.
             let mut u = [0xffu8; 32];
             u[0] = low;
             u[31] = 0x7f;
@@ -1042,7 +963,6 @@ mod tests {
             assert!(encrypt(&[Recipient(*point)], b"x").is_err());
             assert!(encrypt(&[identity(1).recipient(), Recipient(*point)], b"x").is_err());
         }
-        // Real keys, and small coordinates that are not of low order, still parse.
         for seed in 1..=8 {
             let recipient = identity(seed).recipient();
             assert_eq!(Recipient::parse(&recipient.to_bech32()), Ok(recipient));
@@ -1070,8 +990,6 @@ mod tests {
             assert_eq!(forged.len(), share.len());
             let mut file = file.clone();
             file[at..at + share.len()].copy_from_slice(forged.as_bytes());
-            // The all-zero shared secret is refused before the header MAC is looked at, for
-            // the recipient and for anyone else alike.
             for id in [identity(1), identity(2)] {
                 assert_eq!(
                     decrypt(std::slice::from_ref(&id), &file).err(),
@@ -1106,7 +1024,6 @@ mod tests {
             decrypt(&[identity(1)], &mixed).err(),
             Some(AgeError::Header)
         );
-        // An unknown stanza is skipped (the MAC then fails, as the header changed).
         let grease = with_stanza_first(&file, "-> grease x y\n\n");
         assert_eq!(decrypt(&[identity(1)], &grease).err(), Some(AgeError::Hmac));
     }
@@ -1122,7 +1039,6 @@ mod tests {
             decrypt(&[identity(1)], no_stanza.as_bytes()).err(),
             Some(AgeError::Header)
         );
-        // A stanza body of full lines that never ends runs past the header bound.
         let mut huge = b"age-encryption.org/v1\n-> grease\n".to_vec();
         while huge.len() <= MAX_HEADER {
             huge.extend_from_slice(&[b'A'; 64]);
@@ -1141,16 +1057,12 @@ mod tests {
             encrypt(&[identity(4).recipient(), identity(5).recipient()], &data).expect("encrypt");
         let ids = [identity(4)];
         let header_len = parse_header(&file).expect("header").len;
-        // Every cut inside the header, the nonce and the first chunk's start; a stride
-        // through the payload; every cut near the end.
         let mut cuts: Vec<usize> = (0..header_len + 64).collect();
         cuts.extend((header_len + 64..file.len()).step_by(997));
         cuts.extend(file.len() - 40..file.len());
         for cut in cuts {
             assert!(decrypt(&ids, &file[..cut]).is_err(), "cut at {cut}");
         }
-        // The armor of a smaller file (each decrypt that reaches a stanza costs an X25519,
-        // milliseconds unoptimized).
         let small = plaintext(1000);
         let small_file =
             encrypt(&[identity(4).recipient(), identity(5).recipient()], &small).expect("encrypt");
@@ -1161,8 +1073,6 @@ mod tests {
                 "armor cut at {cut}"
             );
         }
-        // One bit of every header and nonce byte (the bit cycling with the offset), then a
-        // stride through the chunks and their tags.
         let mut flips: Vec<usize> = (0..header_len + 16).map(|at| at * 8 + at % 8).collect();
         flips.extend(((header_len + 16) * 8..file.len() * 8).step_by(4099));
         flips.push(file.len() * 8 - 1);
@@ -1179,14 +1089,12 @@ mod tests {
                 assert_eq!(opened.as_slice(), small.as_slice(), "armor bit {bit}");
             }
         }
-        // Arbitrary bytes before and after are refused too.
         let mut prefixed = b"x".to_vec();
         prefixed.extend_from_slice(&file);
         assert_eq!(decrypt(&ids, &prefixed).err(), Some(AgeError::Armor));
         let mut suffixed = file.clone();
         suffixed.push(0);
         assert_eq!(decrypt(&ids, &suffixed).err(), Some(AgeError::Payload));
-        // And the untouched file still opens.
         assert_eq!(
             decrypt(&ids, &file).expect("decrypt").as_slice(),
             data.as_slice()

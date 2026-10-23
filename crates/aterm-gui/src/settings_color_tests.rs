@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The colour picker: one wheel, Brightness and hex row for every colour key,
-//! on the picker's own hue, saturation and brightness; the automatic
-//! selected-tab colour as a colour; and the Window page's way to Tab Color.
+//! The colour picker: one wheel, Brightness and hex row for every colour key, on the picker's own hue, saturation and brightness; the automatic selected-tab colour as a colour; and the Window page's way to Tab Color.
 
 use super::modified::{Lab, rect_of};
 use super::*;
@@ -44,9 +42,7 @@ fn wheel_of(
 
 /// ONE PICKER FOR EVERY COLOUR KEY: each colour row offers Choose…, and
 /// Choose… opens the wheel (its own pick action), Brightness and Done under
-/// the row, with the row's hex field, all on one screen and fitted. On
-/// Appearance's five colour rows at the shipped sizes, and every colour key
-/// in Search, the selected tab colour and the trail colours among them.
+/// the row, with the row's hex field, all on one screen and fitted.
 #[test]
 fn every_colour_row_opens_the_one_picker() {
     let mut cases: Vec<(&'static str, Option<SettingsRoute>)> = [
@@ -121,7 +117,6 @@ fn every_colour_row_opens_the_one_picker() {
                 .filter(|line| line.contains(&format!("settings/color/{key}/")))
                 .collect();
             assert!(failures.is_empty(), "{at}: {failures:?}");
-            // Choose… again closes it.
             lab.dispatch(action(&opener, None));
             assert!(
                 lab.compile(width, height)
@@ -134,8 +129,7 @@ fn every_colour_row_opens_the_one_picker() {
 }
 
 /// A pick on Foreground's wheel writes Foreground, at the brightness the
-/// picker keeps; Brightness keeps the hue. The selected tab colour, whose
-/// page the wheel was lifted from, is untouched.
+/// picker keeps; Brightness keeps the hue.
 #[test]
 fn the_foreground_wheel_and_brightness_write_foreground() {
     let mut lab = Lab::new("foreground = \"#FFAA00\"\n");
@@ -162,8 +156,6 @@ fn the_foreground_wheel_and_brightness_write_foreground() {
         Some(SemanticInput::Number(0.5)),
     );
     assert_eq!(darker.edits[0].value.as_deref(), Some("#805500"));
-    // Unset, Brightness starts from the theme's own foreground: half of
-    // Default's #D0D0D0 is #686868.
     let mut lab = Lab::new("");
     let half = lab.commit(
         "settings/color-brightness/foreground",
@@ -216,10 +208,7 @@ fn escape_and_done_close_the_picker_back_on_choose() {
 
 /// BLACK KEEPS ITS HUE: brightness 0 writes black, and raising it again
 /// gives the hue it had, not a grey; the wheel marks that hue on its black
-/// disk. A round trip through a dim brightness gives the colour back exactly,
-/// and a colour the picker made keeps its hue when it comes back (as an Undo
-/// brings it). Negative control: a black the picker never made raises to
-/// grey.
+/// disk.
 #[test]
 fn brightness_zero_keeps_the_picked_hue() {
     let set = |lab: &mut Lab, brightness: f64| {
@@ -240,11 +229,9 @@ fn brightness_zero_keeps_the_picked_hue() {
     assert!((hue - 0.0889).abs() < 1e-3, "the kept hue: {hue}");
     assert_eq!((saturation, value), (1.0, 0.0));
     assert_eq!(set(&mut lab, 0.6), "#995200", "the hue comes back");
-    // Exact round trip through 5%.
     let mut lab = Lab::new("active_tab_color = \"#FFCC99\"\n");
     let _ = set(&mut lab, 0.05);
     assert_eq!(set(&mut lab, 1.0), "#FFCC99");
-    // Black the picker made, brought back another way, keeps its hue.
     let mut lab = Lab::new("active_tab_color = \"#FF8800\"\n");
     let _ = set(&mut lab, 0.0);
     let _ = set(&mut lab, 1.0);
@@ -253,10 +240,8 @@ fn brightness_zero_keeps_the_picked_hue() {
         Some(SemanticInput::Text("#000000".to_string())),
     );
     assert_eq!(set(&mut lab, 1.0), "#FF8800");
-    // Negative control: a black the picker never made has no hue to keep.
     let mut lab = Lab::new("active_tab_color = \"#000000\"\n");
     assert_eq!(set(&mut lab, 0.6), "#999999");
-    // A pick on a black wheel keeps its hue for the next brightness.
     let mut lab = Lab::new("active_tab_color = \"#000000\"\n");
     assert!(
         lab.invoke(
@@ -274,8 +259,7 @@ fn brightness_zero_keeps_the_picked_hue() {
 
 /// A PICK KEEPS THE WHEEL IN VIEW: on a short stacked Tab Color page the
 /// wheel and the hex row are different stops, and a pick used to reveal the
-/// hex row and scroll the wheel out from under the pointer. Negative
-/// control: the hex row's own set still brings the hex row into view.
+/// hex row and scroll the wheel out from under the pointer.
 #[test]
 fn a_wheel_pick_keeps_the_wheel_in_view_on_a_stacked_page() {
     let wheel_key = "settings/color/active_tab_color/wheel";
@@ -307,7 +291,6 @@ fn a_wheel_pick_keeps_the_wheel_in_view_on_a_stacked_page() {
             lab.state().common.last_focus.as_ref().map(UiKey::as_str),
             Some(wheel_key)
         );
-        // Negative control: the hex row's own action reveals the hex row.
         lab.commit(
             "settings/set/active_tab_color",
             Some(SemanticInput::Text("#CC6633".to_string())),
@@ -461,7 +444,6 @@ fn the_arrow_keys_turn_the_wheel() {
     lab.state_mut().navigate(SettingsRoute::Appearance);
     lab.dispatch(action("settings/color-open/foreground", None));
     let right = lab.commit_event(AppEvent::TextInput(TextInputEvent::Right { extend: true }));
-    // A twelfth of a turn from red is orange.
     assert_eq!(right.edits[0].value.as_deref(), Some("#FF8000"));
     let down = lab.commit_event(AppEvent::StepFocus(1));
     assert_eq!(down.edits[0].value.as_deref(), Some("#FF860D"));
@@ -481,8 +463,7 @@ fn hex_of_hsv([hue, saturation, value]: [f32; 3]) -> String {
 /// THEMES' CUSTOMIZE SHEET OPENS THE SAME PICKER: each colour row wears the
 /// colour in force on a well beside its field, and the well opens the wheel
 /// and Brightness under the row (Done while open), fitted in the sheet's
-/// column; a pick writes that key and no other. Negative control: before
-/// the well is pressed no wheel is drawn.
+/// column; a pick writes that key and no other.
 #[test]
 fn the_customize_sheet_opens_the_one_picker() {
     for (width, height) in [
@@ -496,9 +477,6 @@ fn the_customize_sheet_opens_the_one_picker() {
         lab.state_mut().navigate(SettingsRoute::Themes);
         lab.dispatch(action("settings/showcase/customize", None));
         let compiled = lab.compile(width, height);
-        // Each field is wide enough for what it holds beside its well (an
-        // upper-case hex, "Automatic"); a row the list's edge cuts is the
-        // list's to scroll.
         let cut: Vec<_> = compiled
             .fit_failures()
             .into_iter()
@@ -515,8 +493,6 @@ fn the_customize_sheet_opens_the_one_picker() {
                     .is_some(),
                 "{at}: {key}'s row has its well"
             );
-            // The well is the chip at the field's end, laid over it: it costs
-            // the row's name no width.
             let field = rect_of(&compiled, &format!("settings/control/{key}"));
             let well = rect_of(&compiled, &format!("settings/color-open/{key}"));
             assert!(
@@ -526,8 +502,6 @@ fn the_customize_sheet_opens_the_one_picker() {
                     && well.bottom() <= field.bottom(),
                 "{at}: {key}'s well {well:?} lies over its field {field:?}"
             );
-            // Wherever it is drawn it shows: the colour's chip, or, with no
-            // colour to show, the colours mark.
             let blank = compiled.paint.iter().any(|node| {
                 node.key.as_str() == format!("settings/color-open/{key}")
                     && matches!(&node.content, UiContent::Button(button)
@@ -535,13 +509,6 @@ fn the_customize_sheet_opens_the_one_picker() {
             });
             assert!(!blank, "{at}: {key}'s well paints nothing");
         }
-        // So the names keep their room: where the sheet's column holds a
-        // name beside a hex-wide field and Reset, Background and Selection
-        // paint whole, never "Select…" twice (as they did beside a well that
-        // took a field's room of its own). Those widths were measured in
-        // macOS's UI face; a wider one (Noto Sans) needs a wider sheet, and
-        // short of it the one-line row elides its name as every one does
-        // (`colour_rows_are_one_line_with_one_field_column`).
         if width >= 1_074.0 && cfg!(target_os = "macos") {
             for (key, name) in [
                 (prefs::EDIT_BACKGROUND, "Background"),
@@ -612,10 +579,6 @@ fn the_customize_sheet_opens_the_one_picker() {
             "{at}"
         );
     }
-    // A colour row with no colour to show (the default theme leaves the
-    // selected text automatic): its well wears the colours mark and no chip,
-    // and the field keeps no chip either. Negative control: a row with a
-    // colour wears its chip and no mark.
     let mut lab = Lab::new("");
     lab.state_mut().navigate(SettingsRoute::Themes);
     lab.dispatch(action("settings/showcase/customize", None));
@@ -646,8 +609,7 @@ fn the_customize_sheet_opens_the_one_picker() {
 /// row of Themes' Customize sheet, its wheel and Brightness are drawn whole
 /// (no edge of the list cuts them) on the screen the list shows, and the
 /// wheel takes a pick, from 80x24 (where COLOURS repeated over the picker
-/// would leave it a sliver the list's edge cuts) to a wide window. Negative
-/// control: before the well is pressed neither is drawn.
+/// would leave it a sliver the list's edge cuts) to a wide window.
 #[test]
 fn an_open_customize_picker_is_whole_on_its_screen() {
     let open_at = |key: &str, width: f32, height: f32| {
@@ -658,7 +620,6 @@ fn an_open_customize_picker_is_whole_on_its_screen() {
         lab.dispatch(action(&format!("settings/color-open/{key}"), None));
         (closed, lab.compile(width, height))
     };
-    // Whether `key` paints, and every paint of it lies inside its clip.
     let whole = |compiled: &crate::native_ui::CompiledUi, key: &str| {
         let mut painted = compiled
             .paint
@@ -696,12 +657,9 @@ fn an_open_customize_picker_is_whole_on_its_screen() {
 /// THE CUSTOMIZE SHEET KEEPS ITS LEAST under the demo: in the chooser's
 /// place, its list holds COLOURS over one whole colour row, on a window whose
 /// compact toolbar names the page (no heading over the demo) as on any
-/// other. The demo gives up whole rows for it as it does for the chooser.
-/// (Sized by the chooser's least, the demo kept rows that left the sheet a
-/// caption over a row the list's edge cut, 20 of its 32pt at 80x24.)
+/// other.
 #[test]
 fn the_customize_sheet_keeps_its_caption_over_a_whole_row() {
-    // Every paint of `key` lies inside its clip, and it paints.
     let whole = |compiled: &crate::native_ui::CompiledUi, key: &str| {
         let mut painted = compiled
             .paint
@@ -742,7 +700,7 @@ fn the_customize_sheet_keeps_its_caption_over_a_whole_row() {
 /// THE PALETTE SLOT'S EDITOR CARRIES THE PICKER: the open slot's wheel and
 /// Brightness set its draft (the demo draws it), on the picker's own model
 /// (brightness 0 and back keeps the hue), and closing the editor saves the
-/// slot. Negative control: no slot open, no slot picker.
+/// slot.
 #[test]
 fn the_palette_slot_editor_carries_the_picker() {
     let mut lab = Lab::new("theme = \"Dracula\"\n");
@@ -848,10 +806,7 @@ fn the_cursor_styles_trail_colour_opens_the_picker() {
 
 /// THE ADJUST CARD'S PICKER FITS ITS LIST: the trail colour's row and its
 /// open picker are one stop of the Adjust card, under the card's caption and
-/// padding, so the picker is sized against the list less that chrome. At the
-/// shipped default (102x29) and at 80x24 nothing on the page is cut or
-/// overflows. Negative control: with the picker closed the page fits too, and
-/// with it open the wheel is on screen.
+/// padding, so the picker is sized against the list less that chrome.
 #[test]
 fn the_adjust_cards_picker_fits_its_list() {
     let key = prefs::EDIT_CURSOR_TRAIL_COLOR;
@@ -882,10 +837,7 @@ fn the_adjust_cards_picker_fits_its_list() {
 /// THE OPEN PICKER FITS AT EVERY WIDTH AND TEXT SIZE: a colour row's open
 /// picker (the wheel, Brightness and its label, Done) and the Tab Color page
 /// are never cut and never overflow, from a phone's width to a window's, at
-/// 1× and 2× text. Brightness beside its label takes only what the label
-/// leaves it (it kept 375pt at 2× in a 268pt column), the picker's rows are
-/// measured inside its card's padding, and Done on a line of its own is never
-/// wider than the column (141pt in 136 at 2× on a phone).
+/// 1× and 2× text.
 #[test]
 fn the_open_picker_fits_at_every_width_and_text_size() {
     at_each_text_scale(&[1.0, 2.0], "colour picker fit", |scale| {
@@ -933,8 +885,7 @@ fn the_open_picker_fits_at_every_width_and_text_size() {
 /// MODIFIED NAMES A COLOUR ROW'S DEFAULT WITH ITS COLOUR: "Default:
 /// Automatic" wears the automatic selected-tab colour the window paints,
 /// right after the words, and the row's name says it in words; a theme
-/// colour's default wears the theme's. Negative control: another automatic
-/// colour moves the chip; a row that is not a colour wears none.
+/// colour's default wears the theme's.
 #[test]
 fn modified_names_a_colour_default_with_its_colour() {
     let chip_of = |compiled: &crate::native_ui::CompiledUi, key: &str| {
@@ -977,7 +928,6 @@ fn modified_names_a_colour_default_with_its_colour() {
                 .map(|node| node.rect)
                 .unwrap_or_else(|| panic!("{key} is painted"))
         };
-        // The label's (last) painted line: the words the chip follows.
         let words = painted("settings/label/active_tab_color/visual/line-0");
         let chip = painted("settings/label/active_tab_color/chip");
         assert!(
@@ -992,8 +942,6 @@ fn modified_names_a_colour_default_with_its_colour() {
             Some(format!("#{:02X}{:02X}{:02X}", theme[0], theme[1], theme[2]))
         );
         assert_eq!(chip_of(&compiled, "font_size"), None, "not a colour");
-        // Compact, where the name cannot hold the default: the chip follows
-        // the words on the row's second line.
         let mut lab = Lab::new("foreground = \"#FFAA00\"\n");
         lab.state_mut().navigate(SettingsRoute::Modified);
         let compiled = lab.compile_in(&cx_with_tab_color(584.0, 348.0, automatic));
@@ -1067,23 +1015,12 @@ fn modifieds_colour_rows_open_the_picker() {
     }
 }
 
-/// THE TRAIL COLOUR'S PICKER CHOOSES THE CURSOR'S COLOUR. Trail color takes
-/// one value beside a colour, `cursor` (what the old `classic mono` style
-/// says, and what the writer keeps for it), so its picker holds Cursor color,
-/// at the end of Brightness's row and after it in the keyboard order: chosen,
-/// it writes the word; pressed again, the colour the cursor has now, so the
-/// trail looks the same and the wheel starts from it; a pick on the wheel is
-/// a colour of the trail's own. The picker is no taller for it, so it is
-/// whole where Brightness alone was (80x24's Adjust card), at 1× and 2×.
-/// Negative control: no other colour's picker holds it, and its action writes
-/// nothing for one (the accent takes no word). Before it the word could only
-/// be typed into the hex field.
+/// THE TRAIL COLOUR'S PICKER CHOOSES THE CURSOR'S COLOUR.
 #[test]
 fn the_trail_colour_picker_chooses_the_cursor_colour() {
     let key = prefs::EDIT_CURSOR_TRAIL_COLOR;
     let button = format!("settings/color/{key}/cursor");
     let toggle = format!("settings/color-cursor/{key}");
-    // The saved style's Adjust card on Cursor Styles lists Trail color.
     let open = |source: &str| {
         let mut lab = Lab::new(source);
         lab.state_mut().navigate(SettingsRoute::CursorStyles);
@@ -1118,8 +1055,6 @@ fn the_trail_colour_picker_chooses_the_cursor_colour() {
         .controls()
         .map(|(_, key)| key.as_str().to_string())
         .collect();
-    // After the wheel (Brightness has no colour to brighten while Classic
-    // shifts through the spectrum, so it takes no keyboard).
     let wheel = format!("settings/color/{key}/wheel");
     let after = order
         .iter()
@@ -1182,7 +1117,6 @@ fn the_trail_colour_picker_chooses_the_cursor_colour() {
         "a pick on the wheel is a colour of the trail's own"
     );
 
-    // No other colour's picker holds it.
     for other in [prefs::EDIT_CURSOR_TRAIL_ACCENT, prefs::EDIT_FOREGROUND] {
         let mut lab = Lab::new("");
         let label = lab.state().field_by_key(other).unwrap().label;
@@ -1211,7 +1145,6 @@ fn the_trail_colour_picker_chooses_the_cursor_colour() {
         );
     }
 
-    // Whole at every width and text size.
     at_each_text_scale(&[1.0, 2.0], "trail colour picker fit", |scale| {
         for (width, height) in [(584.0_f32, 348.0_f32), (738.0, 418.0), (1_074.0, 684.0)] {
             let at = format!("{width}×{height} at {scale}×");
@@ -1226,9 +1159,6 @@ fn the_trail_colour_picker_chooses_the_cursor_colour() {
                 assert!(failures.is_empty(), "{at}: {failures:?}");
             };
             fitted(&lab.compile(width, height));
-            // The keyboard on it brings it into view: at 1× whole, and at
-            // every size wherever Brightness is (2× text at 80x24 leaves the
-            // Adjust card no room for the picker under its row at all).
             lab.state_mut().reveal_control(UiKey::new(button.as_str()));
             let compiled = lab.compile(width, height);
             let shows = |key: &str| compiled.semantic(&UiKey::new(key)).is_some();

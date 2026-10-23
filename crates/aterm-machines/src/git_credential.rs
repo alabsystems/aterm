@@ -1,28 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! GitHub credentials through git's own credential protocol, so neither `aterm init` nor the
-//! machines controller needs gh (docs/DESIGN-init-system-2026-10-20.md §1.18, §6.1 row 22, S14).
-//!
-//! - [`Git::store`] hands a token to `git credential approve` and reads it back with
-//!   `git credential fill` ([`Git::fill`]). Both run Apple's Command Line Tools git, pinned to
-//!   one helper (`-c credential.helper= -c credential.helper=osxkeychain`): the empty entry
-//!   resets every helper the person's configuration names, so no other helper runs or sees the
-//!   token. CLT git ships `git-credential-osxkeychain` (§1.18).
-//! - The token travels on the child's standard input alone, never an argument or a variable,
-//!   and every buffer that held it, input or output, is scrubbed.
-//! - `GIT_TERMINAL_PROMPT=0` and an empty `GIT_ASKPASS` keep a missing credential from becoming
-//!   a prompt. Measured with CLT git 2.54.0 (Apple Git-157): a configured `core.askPass` answers
-//!   a `fill` whose helper holds nothing unless `GIT_ASKPASS` is set, and set empty it is
-//!   skipped, so the fill fails (exit 128, "terminal prompts disabled").
-//! - [`Git::configure`] points git's own github.com lookups (clones, fetches) at the helper, as
-//!   the account, host-wide. [`Git::configured`] reads every `credential.*` setting back from
-//!   the files git reads, in git's order, and applies them as git does: matched to github.com by
-//!   their URL the way git matches one (host case, a partial URL, a `*` host label, the default
-//!   port, a user, a path; [`scope`]), an empty helper entry resetting the list, the last
-//!   account and `useHttpPath` winning. The files conditional includes name, which git reads
-//!   only inside some repositories, are read as well, and every github.com setting in them must
-//!   agree.
+//! GitHub credentials through git's own credential protocol, so neither `aterm init` nor the machines controller needs gh (docs/DESIGN-init-system-2026-10-20.md §1.18, §6.1 row 22, S14).
 
 use crate::model::User;
 use crate::port::{Cmd, Secret, System};
@@ -56,8 +35,7 @@ const INCLUDE_DEPTH: usize = 10;
 pub(crate) enum Lookups {
     /// git's own github.com lookups go to the helper alone, as the account, host-wide.
     Ready,
-    /// They do not: why, naming a setting's key and the file it is in, never its value (a
-    /// helper's command can carry a credential).
+    /// They do not: why, naming a setting's key and the file it is in, never its value (a helper's command can carry a credential).
     Not(String),
 }
 
@@ -68,8 +46,7 @@ impl Lookups {
     }
 }
 
-/// How a credential reaches git: the program, the one helper every request names, and the
-/// variables a test adds.
+/// How a credential reaches git: the program, the one helper every request names, and the variables a test adds.
 pub(crate) struct Git {
     program: PathBuf,
     helper: String,
@@ -86,9 +63,7 @@ impl Git {
         }
     }
 
-    /// For a test against a real git: `helper` (git's own `store --file=<scratch>`, which
-    /// keeps the credential in a file the test reads), and no system configuration read
-    /// (`GIT_CONFIG_NOSYSTEM=1`), so no keychain helper is configured anywhere the run looks.
+    /// For a test against a real git: `helper` (git's own `store --file=<scratch>`, which keeps the credential in a file the test reads), and no system configuration read (`GIT_CONFIG_NOSYSTEM=1`), so no keychain helper is configured anywhere the run looks.
     #[cfg(test)]
     pub(crate) fn isolated(helper: &str) -> Self {
         Self {
@@ -130,12 +105,9 @@ impl Git {
         ])
     }
 
-    /// Store `token` for `account` at `host` (`git credential approve`), then read it back
-    /// ([`Self::fill`]): git reports no helper's failure to store, so the read is the proof.
-    ///
+    /// Store `token` for `account` at `host` (`git credential approve`), then read it back ([`Self::fill`]): git reports no helper's failure to store, so the read is the proof.
     /// # Errors
-    /// The account or host cannot be a credential field, git could not run whole, or the
-    /// helper does not hand back exactly this token. No error carries credential bytes.
+    /// The account or host cannot be a credential field, git could not run whole, or the helper does not hand back exactly this token.
     pub(crate) fn store(
         &self,
         sys: &dyn System,
@@ -168,12 +140,9 @@ impl Git {
         }
     }
 
-    /// The token the helper holds for `account` at `host` (`git credential fill`), or `None`
-    /// when it holds none: git then ends at its disabled prompt (exit 128) without asking.
-    ///
+    /// The token the helper holds for `account` at `host` (`git credential fill`), or `None` when it holds none: git then ends at its disabled prompt (exit 128) without asking.
     /// # Errors
-    /// The account or host cannot be a credential field, git could not run whole, or its
-    /// answer is not one password. No error carries credential bytes.
+    /// The account or host cannot be a credential field, git could not run whole, or its answer is not one password.
     pub(crate) fn fill(
         &self,
         sys: &dyn System,
@@ -208,16 +177,7 @@ impl Git {
         answer
     }
 
-    /// Whether git's own github.com lookups go to this one's helper alone, as `account`,
-    /// host-wide (`useHttpPath` false, so a clone never asks for a per-repository entry the
-    /// host-wide token is not filed under), or the setting that keeps them from it.
-    ///
-    /// Every `credential.*` setting is read from the files git reads (system, global and what
-    /// they include; `/` is the working directory, so no repository's), in git's order, and
-    /// matched to github.com as git matches a setting's URL ([`scope`]). The files a
-    /// conditional include names (`includeIf`, which git reads only inside some
-    /// repositories) are read too, and there every github.com setting must agree.
-    ///
+    /// Whether git's own github.com lookups go to this one's helper alone, as `account`, host-wide (`useHttpPath` false, so a clone never asks for a per-repository entry the host-wide token is not filed under), or the setting that keeps them from it.
     /// # Errors
     /// git could not run whole or its answer is not configuration.
     pub(crate) fn configured(
@@ -254,8 +214,6 @@ impl Git {
         let ran = sys
             .run_complete_stdout(&self.read(user, file))
             .map_err(|_| "cannot completely read git's credential settings")?;
-        // Exit 1 with nothing printed: no such setting, or (with `--file`) no such file,
-        // which git skips as an include too.
         if ran.status == Some(1) && ran.stdout.is_empty() {
             return Ok(Vec::new());
         }
@@ -278,10 +236,7 @@ impl Git {
         cmd.args(["--get-regexp", SETTINGS])
     }
 
-    /// Point git's github.com lookups at this one's helper alone, as `account`, host-wide, in
-    /// the account's global configuration: the empty entry first resets the helpers earlier
-    /// files name (CLT's own `osxkeychain` among them).
-    ///
+    /// Point git's github.com lookups at this one's helper alone, as `account`, host-wide, in the account's global configuration: the empty entry first resets the helpers earlier files name (CLT's own `osxkeychain` among them).
     /// # Errors
     /// A `git config` run failed (output withheld).
     pub(crate) fn configure(
@@ -321,7 +276,7 @@ struct Setting {
 
 impl Setting {
     /// Its key, a URL's user and password withheld, and the file it is in: what a reason
-    /// names. Never its value.
+    /// names.
     fn named(&self) -> String {
         let file = self.origin.strip_prefix("file:").unwrap_or(&self.origin);
         let key = match (self.key.strip_prefix("credential."), self.key.rfind('@')) {
@@ -340,8 +295,7 @@ impl Setting {
 }
 
 /// The settings of `git config --null --show-origin --get-regexp` output (`origin\0key\nvalue\0`
-/// per entry, `origin\0key\0` for a key with no value), in git's reading order. `None` for
-/// output that is not that shape.
+/// per entry, `origin\0key\0` for a key with no value), in git's reading order.
 fn parse(text: &str) -> Option<Vec<Setting>> {
     let mut fields = text.split_terminator('\0');
     let mut out = Vec::new();
@@ -360,9 +314,6 @@ fn parse(text: &str) -> Option<Vec<Setting>> {
 }
 
 /// Queue, once each, the files the conditional includes among `settings` name, resolved as
-/// git resolves an include's path: `~/` from the account's home, a relative path from the
-/// directory of the file that names it.
-///
 /// # Errors
 /// An include this cannot resolve, or one nested deeper than git reads: why, as a reason.
 fn includes(
@@ -423,11 +374,7 @@ enum Scope {
 }
 
 /// How the setting whose key holds `url` (`None` for the generic `credential.<name>`)
-/// applies to git's lookups for `https://[<user>@]github.com[/<path>]`. git matches a URL that
-/// normalizes by its parts (the scheme and host caseless, `*` for any one host label, the
-/// default port, a user that must be the lookup's, a path prefix) and any other spelling as a
-/// partial URL (`github.com`, `bot@github.com`, `/owner`: what it names must match, what it
-/// leaves out matches anything). Both forms are read alike here, erring toward applying.
+/// applies to git's lookups for `https://[<user>@]github.com[/<path>]`.
 fn scope(url: Option<&str>) -> Scope {
     let Some(url) = url else {
         return Scope::Every;
@@ -513,11 +460,7 @@ fn relevant(setting: &Setting) -> Option<(Scope, &str)> {
     matches!(name, "helper" | "username" | "usehttppath").then(|| (scope(url), name))
 }
 
-/// Judge what git's github.com lookups resolve to. `every` holds the settings of every file git
-/// reads, in its order: those that apply to every lookup are applied as git applies them (an
-/// empty helper resets the list; the last account and `useHttpPath` win). Those that apply to
-/// some lookups, and every github.com setting in `conditional` (the files conditional includes
-/// name), must each agree: the helper, the account, `useHttpPath` false.
+/// Judge what git's github.com lookups resolve to.
 fn judge(helper: &str, account: &str, every: &[Setting], conditional: &[Setting]) -> Lookups {
     let agrees = |name: &str, value: Option<&str>| match (name, value) {
         ("helper", Some(value)) => value == helper,
@@ -589,8 +532,7 @@ fn judge(helper: &str, account: &str, every: &[Setting], conditional: &[Setting]
     Lookups::Ready
 }
 
-/// The fields a credential request names. An account or host that could add a field (a
-/// newline, `=`) is refused before git runs.
+/// The fields a credential request names.
 fn request(host: &str, account: &str) -> Result<Vec<u8>, String> {
     let field = |value: &str| {
         !value.is_empty()
@@ -608,8 +550,7 @@ fn scrub(bytes: &mut [u8]) {
     aterm_uds::secret::scrub(bytes);
 }
 
-/// The git runs above as the test arm keys them, for the tests of `aterm init`'s and the
-/// controller's GitHub steps: each scripts a [`crate::port::Fake`] answer for one of them.
+/// The git runs above as the test arm keys them, for the tests of `aterm init`'s and the controller's GitHub steps: each scripts a [`crate::port::Fake`] answer for one of them.
 #[cfg(test)]
 pub(crate) mod script {
     use super::{Git, HELPER, USE_PATH, USERNAME};
@@ -744,8 +685,7 @@ mod tests {
         user("alice", 501)
     }
 
-    /// git's URL matching as [`scope`] reads it. The real-git test below holds the spellings
-    /// the review found to what git itself hands a github.com credential to.
+    /// git's URL matching as [`scope`] reads it.
     #[test]
     fn a_setting_applies_to_github_as_git_matches_its_url() {
         for (url, want) in [
@@ -807,8 +747,7 @@ mod tests {
     ];
 
     /// Settings applied as git applies them, each reason naming the setting and never its
-    /// value. Negative controls: another host's settings, agreeing ones scoped to a user or a
-    /// path, and ones a later setting overrides each leave it ready.
+    /// value.
     #[test]
     fn settings_apply_as_git_applies_them_and_a_reason_names_the_setting() {
         let with = |extra: &[(&str, Option<&str>)], conditional: &[(&str, Option<&str>)]| {
@@ -834,7 +773,6 @@ mod tests {
         ] {
             assert_eq!(with(&[extra], &[]), Lookups::Ready, "{extra:?}");
         }
-        // Earlier settings a later one overrides, or an empty helper resets, are not applied.
         let mut overridden = listed(&[
             ("credential.helper", Some("!other")),
             ("credential.username", Some("other")),
@@ -912,7 +850,6 @@ mod tests {
             judge(OSXKEYCHAIN, "bot", &[], &[]),
             Lookups::Not("no credential.helper names osxkeychain for github.com".into())
         );
-        // A file a conditional include names: every github.com setting must agree there.
         for agreeing in [
             ("credential.helper", Some(OSXKEYCHAIN)),
             ("credential.https://example.invalid.helper", Some("!other")),
@@ -958,8 +895,7 @@ mod tests {
         assert!(parse("file:/a").is_none());
     }
 
-    /// A conditional include's file resolves as git resolves it, each once. Negative control:
-    /// one this cannot resolve, and one nested past git's bound, are reasons, not skipped.
+    /// A conditional include's file resolves as git resolves it, each once.
     #[test]
     fn a_conditional_include_resolves_as_git_resolves_it() {
         let who = alice();
@@ -1010,8 +946,7 @@ mod tests {
     }
 
     /// The reads [`Git::configured`] makes through the test arm: every file git reads, then each
-    /// file a conditional include names. Negative control: the same include whose file holds a
-    /// foreign helper is not ready, and a read git could not finish is an error.
+    /// file a conditional include names.
     #[test]
     fn configured_reads_every_file_then_each_conditional_include() {
         let who = alice();
@@ -1144,9 +1079,7 @@ mod tests {
     }
 
     /// Where `secret` shows in what `live` spawned for the runs of `record`: the program,
-    /// argument or variable that holds it, or `None`. Standard input is not counted: unlike an
-    /// argument or a variable, no other process can read it (`ps`, `KERN_PROCARGS2`, a crash
-    /// report's environment).
+    /// argument or variable that holds it, or `None`.
     fn exposed(record: &[(Cmd, Option<Vec<u8>>)], live: &Live, secret: &str) -> Option<String> {
         for (cmd, _) in record {
             let (program, args, env) = live.spawned(cmd).unwrap();
@@ -1165,8 +1098,7 @@ mod tests {
 
     /// The real CLT git stores and reads back a token through git's own `store` helper in a
     /// scratch HOME (no keychain is configured: `GIT_CONFIG_NOSYSTEM=1`), and the spawn record
-    /// shows the token on standard input alone. Negative control: the same record check, run
-    /// over a run that carries the token in a variable as a CLI child once did, finds it.
+    /// shows the token on standard input alone.
     #[test]
     fn the_token_reaches_git_on_stdin_alone_and_is_read_back() {
         crate::items::github::need_clt_git();
@@ -1196,7 +1128,6 @@ mod tests {
                 .bytes(),
             TOKEN.as_bytes()
         );
-        // Another account's entry is not this one's.
         assert!(
             git.fill(&sys, Some(&who), GITHUB, "other")
                 .unwrap()
@@ -1232,16 +1163,7 @@ mod tests {
     }
 
     /// The read-back of a real git agrees with what that git does with a github.com
-    /// credential. In a scratch HOME (`GIT_CONFIG_NOSYSTEM=1`, git's `store` helper standing
-    /// in for the keychain), each setting below is added after what `configure` wrote, and
-    /// git itself is asked, unpinned and inside a clone of a github.com repository, to `fill`
-    /// the account's credential and to `approve` one. git serves the account alone when the
-    /// fill answers from this helper and the approve reaches no other helper; the read-back
-    /// must be ready exactly then. The settings that make git hand the credential to another
-    /// helper are the review's (another host case, a partial URL, a `*` label, the default
-    /// port, a user, a path, a conditional include) and a later account; the negative
-    /// controls (another scheme, port or host, an include holding no credential setting) are
-    /// ones git keeps the credential from, and the read-back stays ready.
+    /// credential.
     #[test]
     fn the_read_back_agrees_with_what_git_does_with_a_github_credential() {
         crate::items::github::need_clt_git();
@@ -1264,7 +1186,6 @@ mod tests {
             "logins compare caseless"
         );
         assert!(!git.configured(&live, &who, "other").unwrap().ready());
-        // Another helper (the keychain's, here) is not this one.
         assert!(
             !Git::isolated(OSXKEYCHAIN)
                 .configured(&live, &who, "bot")
@@ -1290,8 +1211,6 @@ mod tests {
             ]))
             .unwrap();
         assert!(remote.success(), "{remote:?}");
-        // What git does inside the clone: (the fill answered from this helper, the approve
-        // reached another helper).
         let unpinned = |verb: &str, input: &str| {
             let ran = live
                 .run_complete_stdout_input(
@@ -1383,7 +1302,6 @@ mod tests {
                 "{label}: {read:?}"
             );
         }
-        // git's own reading of useHttpPath: the last one wins.
         let mut path_scoped = configured.clone();
         path_scoped.extend_from_slice(b"[credential]\n\tuseHttpPath = true\n");
         live.write_file(&config, &path_scoped, 0o600).unwrap();

@@ -2,66 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The source guards: rules a type, a visibility or a clippy lint cannot
-//! express, each a small function over one shared, lexed corpus.
-//!
-//! The corpus is every `.rs` under `crates/` and `apps/` (the absorbed winit,
-//! `crates/aterm-window`, among them), read once and lexed on demand
-//! ([`crate::lex`]): rules read the CODE view (comments and literal contents
-//! blanked) or the TEXT view (comments blanked, literals kept), never prose. A
-//! rule about shipped code also drops every item whose `cfg` proves it
-//! test-only (the mask the censuses use). Beside it, from one walk of the
-//! checkout ([`walk`]: `.git`, build output and what `.gitignore` keeps out
-//! by directory aside): every file's path, dot directories included
-//! (`key-material`'s key file names: `.cargo/machine.key` is one), and every
-//! shell, Python and JavaScript script outside `vendor/` and the dot
-//! directories, read as plain lines ([`Script`]) for the rules whose shapes
-//! live in scripts too.
-//!
-//! | rule                | keeps out |
-//! |---------------------|-----------|
-//! | `engine-platform`   | a platform API, a thread or a native link in an engine crate's shipped code (grouped `std::{…}` imports too) |
-//! | `renderer-terminal` | `aterm_core::Terminal` in the renderers (they read `RenderInput`) |
-//! | `dev-read`          | `fs::read*` of a `/dev/…` literal (a device never EOFs) |
-//! | `input-probe`       | the WindowServer-backed input-probe APIs |
-//! | `test-appkit-door`  | a `#[test]` reaching an AppKit call that opens WindowServer |
-//! | `shared-application`| `+[NSApplication sharedApplication]` in a fn that neither takes nor first fetches the `Windowed` proof |
-//! | `protected-folder`  | a TCC-protected folder path in aterm-gui or aterm-cli |
-//! | `runloop-timer`     | a run-loop timer outside `aterm_objc::wake_timer` |
-//! | `keeper-gui`        | a GUI framework, an ObjC send or winit in the PTY keeper's source |
-//! | `keeper-gui-deps`   | a GUI crate in the PTY keeper's process closure, `Cargo.lock` walked transitively |
-//! | `keeper-no-mmap`    | a mapping call named in the PTY keeper's own source (a local `mmap` declaration; the region API is its clippy.toml's): it holds crash-restore regions unmapped |
-//! | `restore-stays-local` | aterm-restore in the closure of a crate that carries bytes off the host (aterm-link, aterm-net, aterm-http, aterm-gui-fabric), or a socket named in aterm-restore's source: a crash-restore region never leaves the host |
-//! | `headless-lifeline` | a `--headless` launch in tests, tools or scripts that holds no lifeline |
-//! | `std-command`       | the `StdCommand` alias built, renamed or re-aliased outside aterm-uds |
-//! | `flock-door`        | an `flock` the clippy lint cannot name |
-//! | `supervise-fx`      | a clock read, a sleep, the pid, a delivery, the goal record or the ledger by path that skips the supervisor's `Fx` door; a look at the filesystem, a process, the kernel, the zone or the environment that skips a derived door (the policy probe or `Fx`'s) |
-//! | `bridge-fx`         | a clock read in the fabric bridge (`Instant::now`, `SystemTime::now`, `.elapsed()`) that skips its `Fx` door, the deterministic simulation's |
-//! | `aos-step-clock`    | a clock read, a sleep or a random draw (`getrandom`, `rand`, a `RandomState`-keyed map) in the Aos step code (aterm-aos, aterm-effects' `aos_momentum` and `cursor_momentum`, and the `cursor_glow`, `effect_util`, `color_math` and `rainbow_kitty/ribbon` helpers their step calls), which a replay of the recorded inputs could not reproduce |
-//! | `store-current`     | a store `current` path run unresolved |
-//! | `key-material`      | a master phrase on the key surface, a key file in the checkout |
-//! | `capture-privacy`   | in an encoded test capture's decoded bytes (a pty log's hex, a `.reads` file's escapes), what the export forbids in text, a home path, a banner's plan or a session id |
-//! | `export-content`    | in a file the export publishes, as its transforms leave it, a line, a binary file's bytes or a path the publication engine's content guard refuses |
-//! | `devtools-door`     | a developer-mode change outside the owner's gesture; an admin-rights API |
-//! | `machines-root-door`| a root tool (`installer`, `pmset`, `/etc/sudoers.d`, …) or the machines agent outside aterm-machines |
-//! | `ffi-door`          | a WindowServer or process-creation `extern` declared outside its one file |
-//! | `boot-id-door`      | a `sysctlbyname` of `kern.bootsessionuuid` outside astream (`astream_sys::boot_session` is the one reader) |
-//! | `handoff-name`      | a live-upgrade handoff variable spelled outside `HandoffName::new` |
-//! | `core-signal`       | a kill, abort or crash helper that ends a process by a core-dump signal |
-//! | `launcher-mint`     | the root-authority mint reached or enabled outside the launchers |
-//! | `checked-mktemp`    | a scratch directory from an unchecked `$(cd "$(mktemp …)")` |
-//! | `installer-network` | a fetch in `tools/install.sh` outside `web_curl`, the GitHub API, `gh` |
-//! | `agent-gate`        | an agent tested by `==`, `matches!` or `if let` instead of an exhaustive `match` |
-//! | `term-write`        | a session's terminal written through a raw guard, which rings no screen reader |
-//! | `slog-inert`        | a PTY write path or an input-verb request in the session log's code; `dispatch_mark` past its calls |
-//! | `eager-drop`        | `then_some` building a value whose type has a `Drop` (built and dropped on false) |
-//! | `github-auth-door`  | the credential header spelled outside agh's door (`crates/agh/`), or a Bearer header beside a GitHub API origin elsewhere |
-//! | `gh-spawn`          | a `gh` child process outside the caps the agh migration lowers |
-//! | `agh-fx`            | a clock, a sleep, a socket or a GitHub round trip in agh outside its effect seam (`crates/agh/src/fx/`), or aterm-http's client outside `wire/http.rs` |
-//! | `licence-header`    | a `.rs` without its SPDX and copyright lines |
-//!
-//! [`run_guards`] returns typed [`Finding`]s; `aterm-census --guards` (and
-//! bare `aterm-census`, which runs every census) prints them.
+//! The source guards: rules a type, a visibility or a clippy lint cannot express, each a small function over one shared, lexed corpus.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -75,6 +16,7 @@ mod agent_gate;
 mod aos_step;
 mod bridge_fx;
 mod captures;
+mod doc_sentence;
 mod doors;
 mod eager_drop;
 mod export_content;
@@ -109,8 +51,7 @@ pub struct Rule {
     pub id: &'static str,
     /// The defect, and why it matters, in one line.
     pub why: &'static str,
-    /// The path prefixes the rule reads by name. Each must hold a file of the
-    /// corpus, or a renamed crate would leave the rule reading nothing there.
+    /// The path prefixes the rule reads by name.
     scope: &'static [&'static str],
     check: fn(&Tree<'_>, &mut Vec<Finding>),
 }
@@ -152,6 +93,7 @@ pub const GUARDS: &[Rule] = &[
     term_write::TERM_WRITE,
     slog_inert::SLOG_INERT,
     eager_drop::EAGER_DROP,
+    doc_sentence::DOC_SENTENCE,
     github::GITHUB_AUTH_DOOR,
     github::GH_SPAWN,
     github::AGH_FX,
@@ -168,8 +110,7 @@ pub struct GuardReport {
     pub findings: Vec<Finding>,
 }
 
-/// Run every guard over the checkout at `root`. `Err` is a tree that could not
-/// be read.
+/// Run every guard over the checkout at `root`.
 pub fn run_guards(root: &Path) -> Result<GuardReport, String> {
     let corpus = Corpus::read(root)?;
     let tree = Tree {
@@ -206,8 +147,7 @@ fn scope_findings(corpus: &Corpus, rules: &[Rule]) -> Vec<Finding> {
 }
 
 /// `rules` over `tree`, each on its own thread (they share only the corpus,
-/// whose lexing is computed once per file whichever rule asks first). A rule
-/// that panics comes back as one finding.
+/// whose lexing is computed once per file whichever rule asks first).
 fn run_rules(tree: &Tree<'_>, rules: &[Rule]) -> Vec<Finding> {
     std::thread::scope(|scope| {
         let running: Vec<_> = rules
@@ -281,17 +221,13 @@ pub(crate) fn run_guard_census(root: &Path) -> CensusOutcome {
         let _ = writeln!(log, "      why: {}", GUARDS[*at].why);
     }
     if report.findings.is_empty() {
-        let floors = vec![
-            Floor::at_least(
-                "Rust files the guards read",
-                report.files,
-                1500,
-                "the walk lost most of the tree (a wrong root or a moved crates/), so every \
+        let floors = vec![Floor::at_least(
+            "Rust files the guards read",
+            report.files,
+            1500,
+            "the walk lost most of the tree (a wrong root or a moved crates/), so every \
                  guard held vacuously",
-            ),
-            // The scripts carry no count: installer-network's anchor
-            // (`tools/install.sh`) fails a walk that lost them.
-        ];
+        )];
         CensusOutcome::green(
             TITLE,
             log,
@@ -336,9 +272,7 @@ pub(crate) struct Corpus {
 const CORPUS_DIRS: &[&str] = &["crates", "apps"];
 
 impl Corpus {
-    /// Every `.rs` under [`CORPUS_DIRS`] at `root` (`target/` and dot
-    /// directories skipped), in path order; then every file of the checkout and
-    /// every script among them.
+    /// Every `.rs` under [`CORPUS_DIRS`] at `root` (`target/` and dot directories skipped), in path order; then every file of the checkout and every script among them.
     pub(crate) fn read(root: &Path) -> Result<Self, String> {
         let mut paths = Vec::new();
         for dir in CORPUS_DIRS {
@@ -373,8 +307,7 @@ impl Corpus {
         })
     }
 
-    /// A corpus of the given `(path, contents)` files, for tests: the `.rs`
-    /// ones as source, the rest as scripts.
+    /// A corpus of the given `(path, contents)` files, for tests: the `.rs` ones as source, the rest as scripts.
     #[cfg(test)]
     pub(crate) fn of(files: &[(&str, &str)]) -> Self {
         let (rs, other): (Vec<_>, Vec<_>) = files.iter().partition(|(rel, _)| rel.ends_with(".rs"));
@@ -409,11 +342,7 @@ impl Corpus {
         self.files.iter().find(|f| f.rel == rel)
     }
 
-    /// The files under `prefix` that compile only under `test`: each file a
-    /// test-gated `mod` declaration names (`#[cfg(all(test, unix))]
-    /// #[path = "x.rs"] mod x;`), and every module such a file declares. The
-    /// in-file mask ([`SourceFile::shipped_lines`]) cannot see these, because
-    /// the gate sits in the parent.
+    /// The files under `prefix` that compile only under `test`: each file a test-gated `mod` declaration names (`#[cfg(all(test, unix))] #[path = "x.rs"] mod x;`), and every module such a file declares.
     pub(crate) fn test_only(&self, prefix: &str) -> BTreeSet<String> {
         let prefixes = [prefix];
         let declared: Vec<(&str, Vec<(String, bool)>)> = self
@@ -440,8 +369,6 @@ impl Corpus {
 
 /// A directory no walk enters: `.git`, build output (`target`, `target-*`,
 /// `target.*`: what `.gitignore` keeps out by pattern) and `node_modules`.
-/// Other dot directories are walked: a key file is as public in `.cargo/` as
-/// anywhere.
 fn skipped_dir(name: &str) -> bool {
     name == ".git"
         || name == "target"
@@ -450,18 +377,13 @@ fn skipped_dir(name: &str) -> bool {
         || name == "node_modules"
 }
 
-/// Is `rel` under a dot directory (`.cargo/…`, `crates/x/.scratch/…`)? Its
-/// files are paths to the walk, never scripts: tool state, not the tree's code.
+/// Is `rel` under a dot directory (`.cargo/…`, `crates/x/.scratch/…`)?
 fn in_dot_dir(rel: &str) -> bool {
     rel.rsplit_once('/')
         .is_some_and(|(dirs, _)| dirs.split('/').any(|d| d.starts_with('.')))
 }
 
-/// The directories the root `.gitignore` keeps out by a plain directory row
-/// (`name/` at any depth, `/path/` or `a/b/` from the root; no glob, no
-/// negation): tool state and caches (`.claude/`, `/.trust-cache/`), whose
-/// files no commit takes without `-f`, so no walk needs them. An absent or
-/// unreadable `.gitignore` keeps nothing out, which walks more, never less.
+/// The directories the root `.gitignore` keeps out by a plain directory row (`name/` at any depth, `/path/` or `a/b/` from the root; no glob, no negation): tool state and caches (`.claude/`, `/.trust-cache/`), whose files no commit takes without `-f`, so no walk needs them.
 #[derive(Default)]
 pub(crate) struct Ignored {
     /// Rows without a `/` but their last: a directory of that name anywhere.
@@ -500,8 +422,7 @@ impl Ignored {
     }
 }
 
-/// Every file under `root/rel` ([`skipped_dir`]s and `ignored` directories
-/// aside) as a root-relative, `/`-separated path. A missing `rel` adds nothing.
+/// Every file under `root/rel` ([`skipped_dir`]s and `ignored` directories aside) as a root-relative, `/`-separated path.
 pub(crate) fn walk(
     root: &Path,
     rel: &str,
@@ -534,8 +455,7 @@ pub(crate) fn walk(
     Ok(())
 }
 
-/// A script the guards read as plain lines (comments included: a rule says
-/// when it skips them).
+/// A script the guards read as plain lines (comments included: a rule says when it skips them).
 pub(crate) struct Script {
     pub(crate) rel: String,
     pub(crate) raw: String,
@@ -546,7 +466,7 @@ const SCRIPT_EXTENSIONS: &[&str] = &["sh", "bash", "zsh", "py", "js", "mjs", "cj
 
 impl Script {
     /// Is the file at `rel` a script by its name: outside `vendor/` and with a
-    /// script extension? (An extensionless file is one when it starts `#!`.)
+    /// script extension?
     fn is_script(rel: &str) -> Option<bool> {
         if rel.starts_with("vendor/") {
             return Some(false);
@@ -669,9 +589,7 @@ impl SourceFile {
             .filter(move |l| shipped.get(l.no - 1).copied().unwrap_or(true))
     }
 
-    /// The CODE view with every test-only line blanked, so an offset in it
-    /// reads one line of the file and a rule can read a statement rustfmt
-    /// wrapped as one.
+    /// The CODE view with every test-only line blanked, so an offset in it reads one line of the file and a rule can read a statement rustfmt wrapped as one.
     pub(crate) fn shipped_code(&self) -> String {
         let mut shipped = self.shipped_lines().map(|l| l.no).peekable();
         let mut code = String::with_capacity(self.raw.len());
@@ -771,8 +689,6 @@ fn joined(dir: &str, path: &str) -> String {
     parts.join("/")
 }
 
-// Token helpers over one line of a view.
-
 pub(crate) fn is_word(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
@@ -812,8 +728,7 @@ pub(crate) fn after_ws<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     s.trim_start_matches([' ', '\t']).strip_prefix(prefix)
 }
 
-/// Every name a line calls: the identifier before each `(` (spaces between
-/// allowed), whether it is a free call, a path's last segment or a method.
+/// Every name a line calls: the identifier before each `(` (spaces between allowed), whether it is a free call, a path's last segment or a method.
 pub(crate) fn calls(code: &str) -> Vec<&str> {
     let b = code.as_bytes();
     let mut out = Vec::new();
@@ -903,8 +818,7 @@ pub(crate) mod tests {
 
     /// A file is test-only when its parent declares it under a test `cfg`,
     /// by its own name, its `mod.rs` or a `#[path]`, or when a test-only file
-    /// declares it. Negative controls: a `cfg(not(test))` declaration and a
-    /// plain one leave their files shipped.
+    /// declares it.
     #[test]
     fn a_module_its_parent_gates_on_test_is_test_only() {
         let corpus = Corpus::of(&[
@@ -937,10 +851,7 @@ pub(crate) mod tests {
     }
 
     /// The corpus fails closed: a source directory its `.rs` walk may not list
-    /// refuses the read, never a corpus of what it could read. The tree is
-    /// held in memory, which only that walk sees (the walk of paths reads the
-    /// disk, where nothing is), and no `.rs` lies in it, so read whole it is
-    /// an empty corpus: the negative control.
+    /// refuses the read, never a corpus of what it could read.
     #[test]
     fn a_source_directory_it_cannot_list_refuses_the_corpus() {
         let read = |fault: fn(&crate::tree::memory::Tree)| {

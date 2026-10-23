@@ -2,10 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! agh's tapes (design §21.3): a strict subset of atape-text 1, the text form of aterm-agent's
-//! harness tape (`crates/aterm-agent/src/supervise/tape/text.rs`), written as the run goes
-//! through a redacting sink. aterm-agent's `text::parse` reads every agh tape back to the same
-//! records; agh does not link aterm-agent.
+//! agh's tapes (design §21.3): a strict subset of atape-text 1, the text form of aterm-agent's harness tape (`crates/aterm-agent/src/supervise/tape/text.rs`), written as the run goes through a redacting sink. aterm-agent's `text::parse` reads every agh tape back to the same records; agh does not link aterm-agent.
 
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
@@ -31,7 +28,7 @@ const CONTROL_DOORS: [&str; 2] = ["ctl", "teller"];
 const BODY_PREFIXES: [char; 5] = ['|', '>', '<', '=', '!'];
 /// The most arguments a header's `argv` holds: no exec takes more (each argument costs at
 /// least a byte of `ARG_MAX`, 1 MiB on macOS, and Linux's is a few MiB of strings and
-/// pointers). A parse refuses a longer one before it holds a `String` for each token.
+/// pointers).
 const ARGV_MAX: usize = 1 << 20;
 /// The header item's line count: `agh`, `api`, `argv`, `mode`, `endpoints`.
 const HEADER_LINES: usize = 5;
@@ -39,7 +36,7 @@ const HEADER_LINES: usize = 5;
 /// What a tape says about its run: the header item's five lines.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TapeHeader {
-    /// `agh {version}`: the build that recorded it. A replay reads it and ignores it.
+    /// `agh {version}`: the build that recorded it.
     pub agh_version: String,
     /// `api {version}`: must be `crate::API_VERSION` for a replay.
     pub api_version: String,
@@ -51,7 +48,7 @@ pub struct TapeHeader {
     pub endpoints: TapeEndpoints,
 }
 
-/// How a taped run spoke to GitHub. `#[non_exhaustive]`: M2 adds credentialed tapes.
+/// How a taped run spoke to GitHub.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TapeMode {
@@ -68,8 +65,7 @@ pub enum TapeEndpoints {
     Loopback,
 }
 
-/// The next of a tape a replay cannot read: every replay of it would be refused the same, so
-/// the remedy is a new tape, never `Error::replay`'s CouldNotRun default (`retry later`).
+/// The next of a tape a replay cannot read: every replay of it would be refused the same, so the remedy is a new tape, never `Error::replay`'s CouldNotRun default (`retry later`).
 pub(crate) const RECORD_AGAIN: &str =
     "record a new tape: agh --record NEW followed by the command line, then replay that one";
 
@@ -104,8 +100,7 @@ fn escape(bytes: &[u8]) -> String {
     out
 }
 
-/// `escape`'s inverse. A `\` followed by anything but `\`, `n`, `r`, `t` or `x` and two hex
-/// digits is refused, its text the reason.
+/// `escape`'s inverse.
 fn unescape(text: &str) -> std::result::Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(text.len());
     let mut bytes = text.bytes();
@@ -121,7 +116,6 @@ fn unescape(text: &str) -> std::result::Result<Vec<u8>, String> {
             Some(b't') => out.push(b'\t'),
             Some(b'x') => {
                 let hex = [bytes.next(), bytes.next()];
-                // Two hex digits exactly: `from_str_radix` alone would take a sign (`\x+a`).
                 let byte = match hex {
                     [Some(h), Some(l)] if h.is_ascii_hexdigit() && l.is_ascii_hexdigit() => {
                         std::str::from_utf8(&[h, l])
@@ -165,8 +159,7 @@ fn pieces(out: &mut String, prefix: char, body: &[u8]) {
 }
 
 impl TapeHeader {
-    /// This build's `VERSION`, `API_VERSION`, `argv`, Anonymous, and GithubCom when `endpoints`
-    /// equals `Endpoints::github_com()`, else Loopback.
+    /// This build's `VERSION`, `API_VERSION`, `argv`, Anonymous, and GithubCom when `endpoints` equals `Endpoints::github_com()`, else Loopback.
     #[must_use]
     pub fn for_run(argv: &[String], endpoints: &Endpoints) -> TapeHeader {
         TapeHeader {
@@ -182,10 +175,7 @@ impl TapeHeader {
         }
     }
 
-    /// The five lines, in field order, joined by `\n`, with no final newline. `argv` is each
-    /// argument as a token, joined by one space: escaped as a tape line is (`render_record`),
-    /// with a space written `\x20` and `=` written `\x3d`. Each token follows `argv` after one
-    /// space, so an empty command line is the word alone and an empty argument still counts.
+    /// The five lines, in field order, joined by `\n`, with no final newline.
     #[must_use]
     pub fn render(&self) -> String {
         let mut argv = String::from("argv");
@@ -207,11 +197,8 @@ impl TapeHeader {
     }
 
     /// The header `render` wrote.
-    ///
     /// # Errors
-    ///
-    /// `Replay::Format`: a line missing, out of order or unknown; an `api` other than
-    /// `API_VERSION`; a `mode` other than `anonymous`; an endpoints value that is neither.
+    /// `Replay::Format`: a line missing, out of order or unknown; an `api` other than `API_VERSION`; a `mode` other than `anonymous`; an endpoints value that is neither.
     pub fn parse(text: &str) -> Result<TapeHeader> {
         TapeHeader::parse_lines(&header_lines(text), 1)
     }
@@ -300,7 +287,6 @@ fn header_lines(text: &str) -> Vec<&str> {
 }
 
 /// A whole tape: `MAGIC`, `header` and the header's lines as `|` pieces, then each record.
-/// A record outside the subset (`render_record`'s `None`) is left out.
 #[must_use]
 pub fn render(header: &TapeHeader, records: &[EffectRecord]) -> String {
     let mut out = head_text(header);
@@ -319,18 +305,7 @@ fn head_text(header: &TapeHeader) -> String {
     out
 }
 
-/// One record's lines, each ending `\n`, or `None` for a kind outside the subset (`Rand`,
-/// `File`, `FileErr`, `Raised`, which no agh door makes):
-/// - `Clock(ns)` → `clock {ns}`; `Mono(ns)` → `mono {ns}`;
-/// - `Exchange { door, request, reply }` → `exchange {token(door)}`, the request's pieces as
-///   `>` lines, then the reply's as `<` lines;
-/// - `Emit { door, bytes }` → `emit {token(door)}`, then the bytes' pieces as `|` lines.
-///
-/// A body's pieces are the body split at every `\n`, so n newlines give n+1 lines. A line is
-/// the prefix, one space and the escaped piece, or the prefix alone for an empty piece. The
-/// escape is aterm-agent's (`tape/header.rs`): `\\`, `\n`, `\r`, `\t`, and `\xHH` (two
-/// lowercase hex digits) for each byte of a character `aterm_codec::tty::is_active` flags and
-/// for each byte that is not UTF-8.
+/// One record's lines, each ending `\n`, or `None` for a kind outside the subset (`Rand`, `File`, `FileErr`, `Raised`, which no agh door makes):
 #[must_use]
 pub fn render_record(record: &EffectRecord) -> Option<String> {
     let mut out = String::new();
@@ -367,8 +342,7 @@ struct Lines<'a> {
 }
 
 impl<'a> Lines<'a> {
-    /// `text`'s lines. Every line ends with a newline, so the empty text after the last one is
-    /// no line.
+    /// `text`'s lines.
     fn of(text: &'a str) -> Lines<'a> {
         let mut lines = text.strip_suffix('\n').unwrap_or(text).split('\n');
         if text.is_empty() {
@@ -392,8 +366,7 @@ impl<'a> Lines<'a> {
         self.lines.peek().copied()
     }
 
-    /// The next line's piece, when it is a body line behind `prefix`. A glue (`=`) line is
-    /// refused: atape-text 1 writes one only for a control door's screen, outside the subset.
+    /// The next line's piece, when it is a body line behind `prefix`.
     fn piece(&mut self, prefix: char) -> Result<Option<Vec<u8>>> {
         let Some(line) = self.peek() else {
             return Ok(None);
@@ -457,7 +430,6 @@ fn item(head: &str, lines: &mut Lines<'_>, at: usize) -> Result<EffectRecord> {
     if head.split(' ').skip(1).any(|w| w.starts_with("stamp=")) {
         return Err(format_at(at, "a stamp, which agh's tapes do not hold"));
     }
-    // A control door is refused on an exchange and on an emit alike.
     let door = |word: &str| -> Result<String> {
         let door = name(word).map_err(|e| format_at(at, e))?;
         if CONTROL_DOORS.contains(&door.as_str()) {
@@ -468,8 +440,6 @@ fn item(head: &str, lines: &mut Lines<'_>, at: usize) -> Result<EffectRecord> {
         }
         Ok(door)
     };
-    // The subset's longest head is three words (`exchange DOOR raw`, refused below), so a
-    // fourth piece, whatever it holds, is a head outside it: no slice is held per word.
     let words: Vec<&str> = head.splitn(4, ' ').collect();
     let record = match words.as_slice() {
         ["clock", ns] => EffectRecord::Clock(number(ns, at)?),
@@ -490,7 +460,6 @@ fn item(head: &str, lines: &mut Lines<'_>, at: usize) -> Result<EffectRecord> {
             bytes: lines.bytes('|')?,
         },
         _ => {
-            // The head is not empty (refused above), so its first word is not either.
             let kind = words.first().copied().unwrap_or_default();
             return Err(format_at(
                 at,
@@ -502,15 +471,9 @@ fn item(head: &str, lines: &mut Lines<'_>, at: usize) -> Result<EffectRecord> {
 }
 
 /// A tape read back.
-///
 /// # Errors
-///
-/// `Replay::Format`, naming the line number: no `MAGIC` first line; no header item, or one
-/// `TapeHeader::parse` refuses; anything outside the subset (a stamp, `note`, `mark`, `end`, a
-/// `=` line, `rand`, `file`, `file-err`, `raised`, `exchange … raw`, the doors `ctl` and
-/// `teller`); a body line with the wrong prefix; an escape that does not decode.
+/// `Replay::Format`, naming the line number: no `MAGIC` first line; no header item, or one `TapeHeader::parse` refuses; anything outside the subset (a stamp, `note`, `mark`, `end`, a `=` line, `rand`, `file`, `file-err`, `raised`, `exchange … raw`, the doors `ctl` and `teller`); a body line with the wrong prefix; an escape that does not decode.
 pub fn parse(text: &str) -> Result<(TapeHeader, Vec<EffectRecord>)> {
-    // The first line is judged before any other is split off.
     let mut lines = Lines::of(text);
     if lines.next() != Some(MAGIC) {
         return Err(format_at(
@@ -539,9 +502,7 @@ struct SinkState {
     file: std::fs::File,
     path: PathBuf,
     failed: Option<String>,
-    /// The remedy `finish` names for `failed`. A refusal that every run of this command line
-    /// would meet again (a record outside the subset, a rendering the shapes would change, a
-    /// tape over `TAPE_MAX`) is `Refused`: its file can never replay, so `finish` removes it.
+    /// The remedy `finish` names for `failed`.
     remedy: Remedy,
     /// The bytes written so far, header included: never more than `max`.
     written: u64,
@@ -580,25 +541,7 @@ enum Remedy {
     Unflushed,
 }
 
-/// What a recording Fx writes through: a cheap handle on one open file. The recording seam
-/// consumes one clone and gives no access back to it (astream's `RecordingSeam::with_sink`;
-/// aterm-agent's `tape/core.rs` shares its sink's state the same way), so the Fx keeps
-/// another clone to finish the file. Each record's bytes pass `Redactor::shapes` (raw, before
-/// the escape) and its text is appended at once, so a run that dies leaves a tape that reaches
-/// the door it died at. The first write error is latched for `Fx::finish`. A record outside
-/// the subset latches the why `the seam made a {kind} record, which agh's tapes do not hold`,
-/// a record whose rendered lines the shapes would still change (the escape lengthens a run:
-/// a CR written `\r`, a control byte `\xHH`) latches `a record whose tape line the shapes
-/// would change`, a record that would take the file over `TAPE_MAX` latches `the tape would
-/// be over {TAPE_MAX} bytes, the most a replay reads`, and a record after a successful
-/// `finish` latches `a record came after the tape's exit`; none of them is written. So every
-/// line on disk is one `Redactor::shapes` leaves as it is. The first three would recur on every
-/// run of the command line, so `finish` removes their file, which holds no exit and could never
-/// replay, and the next `--record` to the path is not refused for a file that exists; a write
-/// error keeps the partial file, and a record after the exit, or a directory that `finish`
-/// cannot flush, keeps the whole one.
-/// `Clone` shares the one state (an `Arc<Mutex<..>>`), and `TapeSink: Send + Sync`, so `Fx`
-/// stays `Send + Sync` with a clone inside the seam and one beside it.
+/// What a recording Fx writes through: a cheap handle on one open file.
 #[derive(Clone)]
 pub struct TapeSink {
     state: Arc<Mutex<SinkState>>,
@@ -620,10 +563,7 @@ fn path_word(path: &Path) -> String {
 
 /// The next for a `--record` path that exists: `--record` never wrote it, so removing it is
 /// named only when it is a tape (a regular file whose first bytes are `MAGIC` and a newline):
-/// `record to a new path, or remove the tape {path} first`, `{path}` one shell word. Anything
-/// else (a directory, a source file, a FIFO, a device node) is `record to a new path: what is
-/// there is not a tape`, the path left to the why. Only a regular file is opened: opening a
-/// FIFO waits for a writer, and reading a terminal waits for a typed line.
+/// `record to a new path, or remove the tape {path} first`, `{path}` one shell word.
 fn in_the_way(path: &Path) -> String {
     let magic = format!("{MAGIC}\n");
     let mut head = Vec::new();
@@ -646,8 +586,7 @@ fn in_the_way(path: &Path) -> String {
 }
 
 /// `not_written` for a sink's latched `why`, with the next its `remedy` names; each path in a
-/// next is one shell word. `Unflushed` has its own why: the file is whole, only its directory
-/// entry was not flushed.
+/// next is one shell word.
 fn latched_error(path: &Path, why: &str, remedy: Remedy) -> Error {
     let replay_it = || format!("replay it: agh --replay {}", path_word(path));
     match remedy {
@@ -669,26 +608,15 @@ fn latched_error(path: &Path, why: &str, remedy: Remedy) -> Error {
 }
 
 impl TapeSink {
-    /// Create `path` (`create_new`; mode 0600 on unix) and write `MAGIC` and the header item,
-    /// each argument of its `argv` through `Redactor::shapes`.
-    ///
+    /// Create `path` (`create_new`; mode 0600 on unix) and write `MAGIC` and the header item, each argument of its `argv` through `Redactor::shapes`.
     /// # Errors
-    ///
-    /// As `Fx::record`. A header whose rendered lines the shapes would still change (two
-    /// arguments that read as one shape once joined, `Bearer` then a long word) is CouldNotRun,
-    /// `Sub::Local`, before any file is made. A header that cannot be written removes the file
-    /// it was written to. A header over the tape's size bound is refused before any file is
-    /// made.
+    /// As `Fx::record`.
     pub fn create(path: &Path, header: &TapeHeader) -> Result<TapeSink> {
         Self::open_within(path, header, TAPE_MAX)
     }
 
-    /// `create` with the file held to `max` bytes in place of `TAPE_MAX`, so a test reaches the
-    /// bound with kilobytes, not the 64 MiB the shapes and the rendering would walk in a debug
-    /// build (2 s). The size check is the same code.
-    ///
+    /// `create` with the file held to `max` bytes in place of `TAPE_MAX`, so a test reaches the bound with kilobytes, not the 64 MiB the shapes and the rendering would walk in a debug build (2 s).
     /// # Errors
-    ///
     /// As `create`.
     #[cfg(any(test, debug_assertions))]
     pub fn create_within(path: &Path, header: &TapeHeader, max: u64) -> Result<TapeSink> {
@@ -738,8 +666,6 @@ impl TapeSink {
             }
         })?;
         if let Err(e) = file.write_all(head.as_bytes()) {
-            // This call made the file (`create_new`), so removing it loses nothing, and the
-            // next `--record` to this path is not refused for a file holding half a header.
             drop(file);
             let _ = std::fs::remove_file(path);
             return Err(not_written(path, &e.to_string()));
@@ -768,27 +694,13 @@ impl TapeSink {
             .clone()
     }
 
-    /// Flush the file, then make it durable (`aterm_durable::durable`). On unix, then also the
-    /// directory entry this sink's `create` made (`aterm_durable::durable_dir` of its parent);
-    /// Windows opens no directory as a file, so there the file's own flush is the whole step.
-    /// A successful `finish` closes the tape to records: a later `append` writes nothing and
-    /// latches its why, which the next `finish` answers.
-    ///
+    /// Flush the file, then make it durable (`aterm_durable::durable`).
     /// # Errors
-    ///
-    /// CouldNotRun, `Sub::Local`, why `the tape {path} could not be written: {e}`: the latched
-    /// error, or the flush's own. A refusal every run would meet again (see `TapeSink`) first
-    /// removes the file, and its next is `run it without --record: a tape cannot hold this
-    /// run`; a write error keeps the partial file, next `remove {path}, then record again`. A
-    /// directory that cannot be flushed after the file was made durable is why `the tape {path}
-    /// is whole, but its directory could not be flushed: {e}`, next `replay it: agh --replay
-    /// {path}`: the file is kept. In each next, `{path}` is one POSIX shell word.
+    /// CouldNotRun, `Sub::Local`, why `the tape {path} could not be written: {e}`: the latched error, or the flush's own.
     pub fn finish(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(e) = &state.failed {
             if state.remedy == Remedy::Refused {
-                // `create_new` made this file and the refusal recurs on every run, so removing
-                // it loses nothing; a removal that fails leaves it, and says so.
                 return match std::fs::remove_file(&state.path) {
                     Ok(()) => {
                         let e = e.clone();
@@ -809,8 +721,6 @@ impl TapeSink {
             state.failed = Some(e.clone());
             return Err(latched_error(&state.path, &e, Remedy::Kept));
         }
-        // The file is whole and durable from here: a directory that cannot be flushed (a parent
-        // that cannot be opened for reading) keeps it, and its next replays it.
         #[cfg(unix)]
         {
             let dir = state
@@ -829,9 +739,7 @@ impl TapeSink {
         Ok(())
     }
 
-    /// Remove the file this sink's `create` made, for a run whose tape can never replay (a
-    /// rerecording that diverged): nobody's work is lost, because the old tape still holds
-    /// it. Every later `append` writes nothing. A removal that fails leaves the file.
+    /// Remove the file this sink's `create` made, for a run whose tape can never replay (a rerecording that diverged): nobody's work is lost, because the old tape still holds it.
     pub(crate) fn discard(&self) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.failed = Some("the tape was discarded".to_string());
@@ -848,10 +756,7 @@ impl TapeSink {
             .discarded
     }
 
-    /// Append one record as `render_record` writes it, its bytes through `Redactor::shapes`
-    /// first (`shaped_record`), so the tape decodes to exactly the redacted bytes; a rendering
-    /// the shapes would still change is latched, not written. The rerecording Fx calls it
-    /// directly; the recording seam calls it through `RecordSink`.
+    /// Append one record as `render_record` writes it, its bytes through `Redactor::shapes` first (`shaped_record`), so the tape decodes to exactly the redacted bytes; a rendering the shapes would still change is latched, not written.
     pub fn append(&self, record: &EffectRecord) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if state.failed.is_some() {
@@ -870,7 +775,6 @@ impl TapeSink {
             state.remedy = Remedy::Refused;
             return;
         };
-        // The size first: a line no tape can hold is refused without the shapes reading it.
         let size = u64::try_from(text.len()).unwrap_or(u64::MAX);
         if state.written.saturating_add(size) > state.max {
             state.failed = Some(format!(
@@ -895,10 +799,7 @@ impl TapeSink {
     }
 }
 
-/// `bytes` through `Redactor::shapes`: each valid UTF-8 run shaped, each invalid byte kept as
-/// it is. The shapes read raw text, never the tape's escaped rendering: there a JSON `\"`
-/// reads `\\"` and a tab reads `\t`, which the shapes would miss, or cut one backslash short.
-/// A replay compares the run's stdout through it, as the sink wrote the recording's.
+/// `bytes` through `Redactor::shapes`: each valid UTF-8 run shaped, each invalid byte kept as it is.
 pub(crate) fn shaped(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     for chunk in bytes.utf8_chunks() {
@@ -921,17 +822,13 @@ fn shaped_header(header: &TapeHeader) -> TapeHeader {
     }
 }
 
-/// Whether the header item a sink would write for `header` holds a line the shapes would
-/// change: two arguments that read as one shape once joined (`Bearer` then a long word).
-/// `TapeSink::create` refuses such a header; `cli::taping::begin_with` asks first, so the
-/// refusal is a usage error before any file is made.
+/// Whether the header item a sink would write for `header` holds a line the shapes would change: two arguments that read as one shape once joined (`Bearer` then a long word).
 pub(crate) fn head_redacts(header: &TapeHeader) -> bool {
     let head = head_text(&shaped_header(header));
     Redactor::shapes(&head) != head
 }
 
 /// `record` with every byte field `shaped`: an exchange's request and reply, an emit's bytes.
-/// A door is agh's own constant, and every other kind is left out of the subset anyway.
 fn shaped_record(record: &EffectRecord) -> EffectRecord {
     match record {
         EffectRecord::Exchange {
@@ -951,17 +848,12 @@ fn shaped_record(record: &EffectRecord) -> EffectRecord {
     }
 }
 
-/// Whether the shapes would change `bytes` on the tape (`shaped`): a canonical request a tape
-/// of which could not replay, because the replay asks the unredacted question.
+/// Whether the shapes would change `bytes` on the tape (`shaped`): a canonical request a tape of which could not replay, because the replay asks the unredacted question.
 pub(crate) fn redacts(bytes: &[u8]) -> bool {
     shaped(bytes) != bytes
 }
 
-/// Whether the shapes would change the canonical reply `reply` (`canon::reply`'s bytes), or
-/// any string of the JSON text its body holds, read decoded. A replay answers the redacted
-/// bytes, so a run over the live ones would render other stdout than its replay; and in a
-/// JSON string an escape (`\t`, ` `) can stand where the shapes look for a blank, so a
-/// credential they would miss in the raw text is caught in the decoded one.
+/// Whether the shapes would change the canonical reply `reply` (`canon::reply`'s bytes), or any string of the JSON text its body holds, read decoded.
 pub(crate) fn redacts_a_reply(reply: &[u8]) -> bool {
     if redacts(reply) {
         return true;

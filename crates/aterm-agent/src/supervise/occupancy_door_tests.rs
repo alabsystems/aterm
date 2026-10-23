@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE OCCUPANCY DOOR IN THE LOOP (`run/occupancy_loop.rs`'s `occupancy_break`):
-//! what `wait-nudge@v1` and `hold-room@v1` would do at the breaks of a held
-//! session, booked as `fact-would@v1` rows and said once a change — on hosted, unattended loops
-//! under a policy whose occupancy is not `off` alone (F2), with guards judged from the loop's own
-//! state and no read made for them (F1), the board asked at most once a look (F9), and nothing
-//! ever typed. Mounted from `occupancy_loop_tests.rs`, so its sessions, hosts and readers are in
-//! scope. Asserts on ledger rows and on the `OCCUPANCY` records' structure (kind, phase, the
-//! verdict's word), never on prose (F17); a day is scripted reads that jump the clock (F18).
+//! THE OCCUPANCY DOOR IN THE LOOP (`run/occupancy_loop.rs`'s `occupancy_break`).
 
 use std::sync::atomic::AtomicUsize;
 
@@ -206,15 +199,12 @@ fn day_on(
             if ahead > 0 {
                 skip(&clock, &mut at_ms, ahead);
             }
-            // These constant machine facts are sampled each virtual board look.
-            // The stopped-board controls below deliberately do not refresh them.
             if has_board {
                 let looked_at = T0 + (at_ms - T0).div_euclid(LOOK_EVERY_MS) * LOOK_EVERY_MS;
                 let mut reading = host.reading.lock().expect("the board");
                 reading.taken_ms = looked_at;
                 reading.held_slot_last_ms = held_ago.map(|ago| looked_at.saturating_sub(ago));
             }
-            // A real screen request installs this pair in Session::call.
             s.clock_marks = Some((s.fx.mono(), at_ms));
             before(&mut s, seq);
             s.host_steps_in_background(&screen_at(seq, drawn(seq)), &mut since, cfg, review);
@@ -244,10 +234,7 @@ fn every(from_s: i64, to_s: i64, step_s: usize) -> Vec<i64> {
 fn nothing_before(_: &mut Session<'_, Mock>, _: u64) {}
 
 /// T-OBS, THE F1 DAY UNDER OBSERVE: a session held six hours on its own background work, read
-/// every five minutes, on a board with room from the start. `wait-nudge` would go at 30 min,
-/// `hold-room` at 2 h and every two hours after — booked as `fact-would@v1` rows that type
-/// nothing — and the session made exactly the requests it makes under `off`: no `turn`, `send`
-/// or key, no `status`. The board was asked only where `hold-room` could be due (F9).
+/// every five minutes, on a board with room from the start.
 #[test]
 fn the_f1_day_under_observe_books_what_would_go_and_types_nothing() {
     let reads = every(0, 6 * 3600, 300);
@@ -317,7 +304,7 @@ fn the_f1_day_under_observe_books_what_would_go_and_types_nothing() {
 
 /// THE DOOR RUNS ON HOSTED, UNATTENDED LOOPS UNDER A POLICY WHOSE OCCUPANCY IS NOT OFF ALONE (F2):
 /// the same 40 minutes that would nudge under observe book and say nothing with no host, with a
-/// person attending, with no policy, or under `off`. `prompt` is `observe` until 1d's write path.
+/// person attending, with no policy, or under `off`.
 #[test]
 fn the_door_is_open_on_hosted_unattended_loops_only() {
     let reads = every(0, 40 * 60, 300);
@@ -363,8 +350,7 @@ fn the_door_is_open_on_hosted_unattended_loops_only() {
 
 /// THE BOARD IS ASKED AT MOST ONCE A LOOK (F9): a break read every ten seconds for ten minutes
 /// from two hours in, on a board whose machine terms never hold (so `hold-room` stays wanting),
-/// asks it once a minute. NEGATIVE CONTROL: the two hours before, read every minute, ask it
-/// nothing: `hold-room` could not be due.
+/// asks it once a minute.
 #[test]
 fn the_board_is_asked_at_most_once_a_look() {
     let no_room = OccupancyReading {
@@ -399,9 +385,6 @@ fn the_board_is_asked_at_most_once_a_look() {
         "no room, no ask past"
     );
 
-    // Query a stopped board once while a guard holds the room line, then
-    // remove that guard 59 seconds later, still inside the query cache.
-    // The already sampled clock pair must age the owned reading too.
     let cached_room = |tag: &str, age_ms, producer_stale, missing_clock, mark_ahead| {
         let (dir, path) = ledger_at(tag);
         let queried_at = T0 + 120 * MIN;
@@ -439,8 +422,6 @@ fn the_board_is_asked_at_most_once_a_look() {
                     // A newer mark must not subtract time or panic.
                     s.clock_marks = Some((s.fx.mono() + Duration::from_millis(1), at_ms + 1));
                 }
-                // Otherwise retain the query's pair, exercising extrapolation
-                // to the break's existing Instant without another clock effect.
                 s.driver = seq == 3;
                 s.host_steps_in_background(
                     &screen_at(seq, break_screen()),
@@ -475,8 +456,7 @@ fn the_board_is_asked_at_most_once_a_look() {
 
 /// EACH GUARD THE LOOP HOLDS HOLDS THE DUE LINE, said once, from the loop's own state (F1): a
 /// person who typed within their grace, another driver's hand, the halt, the memory wall, the
-/// API's route down, an autopilot the rule is not for. The line would go at the first read the
-/// guard no longer holds. NEGATIVE CONTROL: the same reads with nothing set would at 31 min.
+/// API's route down, an autopilot the rule is not for.
 #[test]
 fn each_guard_in_hand_holds_the_due_line_once() {
     let reads = [0, 31 * 60, 32 * 60, 33 * 60, 34 * 60];
@@ -498,8 +478,6 @@ fn each_guard_in_hand_holds_the_due_line_once() {
         verdicts(&control.noted),
         [(2, NUDGE.to_string(), "would".to_string())]
     );
-    // A person typed at the read at 31 min: held through their grace (`human_grace_s`, 120 s:
-    // the read at 32 min too, said once), then would at 33 min, the grace spent.
     assert_eq!(policy.human_grace_s, 120);
     let person = run("door-guard-person", policy.clone(), &|s, seq| {
         if seq == 2 {
@@ -514,10 +492,6 @@ fn each_guard_in_hand_holds_the_due_line_once() {
         ]
     );
     assert_eq!(person.would, [(NUDGE.to_string(), 33 * MIN)]);
-    // Each flag the loop keeps, set until the read at 33 min: its tag, the guard's word, and
-    // the flag. Every brake, the person's exchange, both memory readings and the draft each
-    // read was clocked with (the reviews of 1b: a brake dropped from the door's table went
-    // unseen).
     assert!(!policy.usage_credits, "credits carry no session's turns");
     type Set = fn(&mut Session<'_, Mock>, bool);
     let flags: [(&str, &str, Set); 12] = [
@@ -595,7 +569,6 @@ fn each_guard_in_hand_holds_the_due_line_once() {
             if !on {
                 s.turn_end = TurnEndState::default();
             } else if !s.turn_end.left_to_person() {
-                // A point an earlier loop left to the person (its row read back).
                 let mut reading =
                     s.turn_end_reading(&screen_at(90, ended(SAID)), None, &hosted(30));
                 reading.left_record = true;
@@ -626,8 +599,6 @@ fn each_guard_in_hand_holds_the_due_line_once() {
         );
         assert_eq!(d.would, [(NUDGE.to_string(), 33 * MIN)], "{tag}");
     }
-    // What the break's own screen says, until the read at 33 min: a credits notice drawn
-    // beside the composer, and a launch card with nothing asked under it.
     type Drawn = fn() -> Vec<String>;
     let drawn: [(&str, &str, Drawn); 2] = [
         ("credits", "credits", credits_break),
@@ -659,7 +630,6 @@ fn each_guard_in_hand_holds_the_due_line_once() {
         );
         assert_eq!(d.would, [(NUDGE.to_string(), 33 * MIN)], "{tag}");
     }
-    // Land: the nudge is Cruise's.
     let land = SupervisorConfig {
         autopilot: Autopilot::Land,
         ..policy
@@ -674,7 +644,7 @@ fn each_guard_in_hand_holds_the_due_line_once() {
 
 /// A CARRIED BREAK IS NO DOOR (F10): a read the session's transcript carried as a break
 /// (BG-1, `transcript_wait_seq`), which skips the screen's own break test, judges nothing; the
-/// next drawn read would. NEGATIVE CONTROL: the same read drawn would at once.
+/// next drawn read would.
 #[test]
 fn a_carried_break_judges_nothing() {
     let reads = [0, 31 * 60, 32 * 60];
@@ -717,7 +687,7 @@ fn would_row(rule: RuleId, ts: i64, held_ms: i64) -> String {
 }
 
 /// What a successor makes of the ledger text `body`, started with its wall clock at `now_ms`:
-/// it reads a break at once and again `later_ms` on. Its would-be rows and its rules' verdicts.
+/// it reads a break at once and again `later_ms` on.
 fn successor_door(body: &str, now_ms: i64, later_ms: i64) -> (Vec<(String, i64)>, Vec<String>) {
     let s = successor_run(body, now_ms, later_ms, Duration::ZERO);
     let words = s.verdicts.into_iter().map(|(_, _, w)| w).collect();
@@ -797,8 +767,7 @@ fn hold_row(row_ms: i64, held_ms: i64) -> String {
 
 /// A HOLD CARRIED PAST A DAY KEEPS ITS ONE NUDGE (the review of 1b's F1): a successor carries a
 /// hold that has stood 30 h, nudged 29.5 h ago by the loop that watched it then; that nudge is
-/// this hold's, not the day's, and none would go again. NEGATIVE CONTROL: the same hold with no
-/// nudge booked would be nudged at once.
+/// this hold's, not the day's, and none would go again.
 #[test]
 fn a_hold_carried_past_a_day_keeps_its_nudge() {
     let held = 30 * 60 * MIN;
@@ -821,7 +790,7 @@ fn a_hold_carried_past_a_day_keeps_its_nudge() {
 
 /// THE DOOR WAITS FOR THE BREAK'S SETTLE (the review of 1b's F5): a successor carries a hold
 /// that is due its nudge at once, but its first read is the break's first, inside the settle;
-/// the read past it would. NEGATIVE CONTROL: with no settle the first read would.
+/// the read past it would.
 #[test]
 fn the_door_waits_for_the_breaks_settle() {
     let held = 40 * MIN;
@@ -848,8 +817,7 @@ fn the_door_waits_for_the_breaks_settle() {
 /// all along holds the nudge in one hold, said once; the agent's own wake ends it, and the next
 /// hold, held the same way, says it again, though the door's first break in it is already past
 /// the nudge's half hour (the hold opened at a break the transcript carried, which the door
-/// skips, F10), so its verdict there is the last hold's last. NEGATIVE CONTROL: within one hold
-/// the same verdict is said once however often it is read.
+/// skips, F10), so its verdict there is the last hold's last.
 #[test]
 fn each_hold_says_its_own_verdicts() {
     let (dir, path) = ledger_at("door-two-holds");
@@ -868,7 +836,6 @@ fn each_hold_says_its_own_verdicts() {
         let mut heard = Heard::default();
         let mut at_ms = T0;
         let mut since = None;
-        // The first hold: read at 0, 31, 32 and 33 min.
         for (seq, at) in [(1, 0), (2, 31 * MIN), (3, 32 * MIN), (4, 33 * MIN)] {
             let ahead = T0 + at - at_ms;
             skip(&clock, &mut at_ms, ahead);
@@ -879,8 +846,6 @@ fn each_hold_says_its_own_verdicts() {
                 &mut heard,
             );
         }
-        // The agent's own wake ends it; a break the transcript carries opens the second at 34
-        // min, first drawn at 65, held 31 min.
         s.took(5, cfg, &mut heard);
         since = None;
         s.transcript_wait_seq = Some(6);
@@ -909,8 +874,7 @@ fn each_hold_says_its_own_verdicts() {
 /// A CARRIED HOLD'S EPISODES ARE KEYED BY ITS START ON THE WALL, as the predecessor's row puts
 /// it (its stamp less how long the hold had stood), never by this loop's own clock: two
 /// successors that carry the same row at different times name the same episode, the one
-/// `rules::episode` makes of that start. NEGATIVE CONTROL: a hold that began a minute later
-/// names another.
+/// `rules::episode` makes of that start.
 #[test]
 fn a_carried_holds_episode_is_keyed_by_its_start_on_the_wall() {
     let held = 40 * MIN;
@@ -932,15 +896,13 @@ fn a_carried_holds_episode_is_keyed_by_its_start_on_the_wall() {
 
 /// A SUCCESSOR SEEDS THE DOOR'S BOOKS FROM THE WOULD-BE ROWS: a carried hold whose nudge a loop
 /// before booked gets none again, and three nudges booked within the day spend the cap on a new
-/// hold. NEGATIVE CONTROLS: the carried hold with no such row is nudged; nudges a day old leave
-/// the cap free.
+/// hold.
 #[test]
 fn a_successor_seeds_the_books_from_the_would_rows() {
     let body = predecessor("door-seed", false, false);
     let row = crate::supervise::occupancy::hold::seed_row_in(&body, Some("@s-1"))
         .expect("the booked hold is open");
     let soon = row.row_ms + 4 * MIN;
-    // Carried: held 15 min at the first read, 35 at the second.
     let (rows, _) = successor_door(&body, soon, 20 * MIN);
     assert_eq!(rows, [(NUDGE.to_string(), 35 * MIN)], "the control");
     let nudged = format!(
@@ -950,7 +912,6 @@ fn a_successor_seeds_the_books_from_the_would_rows() {
     let (rows, words) = successor_door(&nudged, soon, 20 * MIN);
     assert!(rows.is_empty(), "nudged in this hold already: {rows:?}");
     assert!(words.is_empty(), "{words:?}");
-    // A new hold (no hold row to carry), three nudges booked in the last day.
     let now = row.row_ms + 4 * MIN;
     let three: String = (1..=3)
         .map(|k| {
@@ -976,15 +937,7 @@ fn a_successor_seeds_the_books_from_the_would_rows() {
 }
 
 /// A TAPE FROM A BUILD WITH NO OCCUPANCY DOOR REPLAYS WITHOUT IT (the red-team's F8, through
-/// the replay's own entry: the review of 1b's F4). A hosted watch held on a break past two
-/// hours, on an empty board, still books its machine-independent nudge at 30 min and asks
-/// the board once a look from 2 h: its current tape replays strictly and in acts mode.
-/// A pre-door fixture keeps the old hold effects and every unrelated record, removing
-/// only the positively identified new rule outputs with their own immediately preceding
-/// stamps, and the board exchanges. Without `host_doors` it replays REPRODUCED; the whole
-/// new rule observer must be absent, not only the board's answer. NEGATIVE CONTROLS: the
-/// current header with either just the board exchanges or all new rule effects missing
-/// DIVERGES, so a current build never silently loses records.
+/// the replay's own entry: the review of 1b's F4).
 #[test]
 fn a_tape_from_a_build_with_no_occupancy_door_replays_without_it() {
     use crate::supervise::tape::codec::Item;
@@ -1005,7 +958,6 @@ fn a_tape_from_a_build_with_no_occupancy_door_replays_without_it() {
         ..hosted(2 * 3600 + 5 * 60)
     };
     assert_eq!(opts.policy.occupancy, Occupancy::Observe);
-    // Each wait on the sitting break is skipped whole on the run's clock, up to a minute.
     let mut m = Mock::new(vec![break_screen()]);
     m.stall_sleep = Some(Duration::from_secs(60));
     let run = record_watch(&mut m, &opts, |s| {
@@ -1034,11 +986,6 @@ fn a_tape_from_a_build_with_no_occupancy_door_replays_without_it() {
         report.render()
     );
 
-    // These two output paths each read their own stamp immediately before
-    // emitting: Lines::note -> Sink::record, and Session::ledger_row. By
-    // supplying both private files above, neither stamp can be an unlabelled
-    // clock read. Only a positively identified 1b row and that exact stamp
-    // are removed; 1a hold rows, other clocks, notes and marks stay verbatim.
     let new_rule_output = |item: &Item| -> Option<&'static str> {
         let Some(EffectRecord::Emit { door, bytes }) = item.record() else {
             return None;

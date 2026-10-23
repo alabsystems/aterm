@@ -16,11 +16,14 @@ use aterm_uds::spawnfd::Command;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// Where a test plants `session`'s record by hand: the record module keeps its
+/// own path private, so the one writer is the only shipped way to it.
 fn state_path(opts: &Opts, session: &str) -> std::path::PathBuf {
     state_dir(opts).join(format!("{session}.json"))
 }
 
 /// A `text --json trim tail=3` reply from a busy Claude Code tab: the cursor
+/// row is absolute (57) and `first` is where the reply's rows start, so the
+/// caret sits on reply row 0, column 2.
 const SCREEN: &str = r#"{"rows":["❯","────────","  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents"],"cursor":{"row":57,"col":2,"visible":true,"style":"blinking_block"},"dims":{"rows":60,"cols":144},"seq":232803,"trimmed":0,"first":57}"#;
 
 /// The same tab's `status`, read the same minute.
@@ -457,6 +460,7 @@ fn who_roster_exposes_a_unique_foreground_group_without_a_window_hop() {
 }
 
 /// The lanes past Claude Code's, as [`due_after_lanes`] asks them: Codex's answers `codex`,
+/// every other lane none (the tab is not its).
 fn codex_answers(codex: Option<Due>) -> impl Fn(upgrade::Agent) -> Option<Due> {
     move |agent| match agent {
         upgrade::Agent::Codex => codex,
@@ -1818,12 +1822,15 @@ fn a_drain_a_person_holds_past_its_bound_voids_the_answer_and_asks_again() {
 }
 
 /// The tab every stand-in agent names: no instance has it, and every test here
+/// points its sweep at a socket that does not exist, so nothing can be typed.
 const TAB: &str = "s-feedfacefeedfacefeed";
 
 /// A conversation id the stand-in agents hold.
 const SESSION: &str = "0badf00d-1111-2222-3333-444455556666";
 
 /// A person's prompt: what makes the conversation a transcript below stands
+/// for one with a task (a record of the harness's own turns alone is
+/// restarted afresh, never announced to, and is carried on with nothing).
 const ASKED: &str = r#"{"type":"user","message":{"role":"user","content":"fix the bug"}}"#;
 
 /// The stand-in agent's argv: this test binary, running only [`park_when_asked`].
@@ -1852,7 +1859,7 @@ fn park_when_asked() {
     std::thread::sleep(until.saturating_duration_since(std::time::Instant::now()));
 }
 
-/// A stand-in agent in [`TAB`]: this test binary, parked. Not `/bin/sleep`: a
+/// A stand-in agent in [`TAB`]: this test binary, parked.
 fn parked() -> Command {
     let mut c = parked_bare();
     c.arg(PARK[1]);
@@ -1860,6 +1867,7 @@ fn parked() -> Command {
 }
 
 /// [`parked`] without `--exact`, which no Claude Code launch carries: an argv
+/// the relaunch plan can carry into a resume.
 fn parked_bare() -> Command {
     let mut c = Command::new(std::env::current_exe().expect("exe"));
     c.arg(PARK[0])
@@ -1874,6 +1882,7 @@ fn parked_bare() -> Command {
 }
 
 /// Wait until `pid` runs this test binary (a fork not yet exec'd still reads
+/// as its parent).
 fn wait_exec(pid: u32) {
     let me = std::env::current_exe().expect("exe");
     for _ in 0..3_000 {
@@ -1893,11 +1902,13 @@ fn register(home: &Path, pid: u32, session: &str) -> SessionFile {
 }
 
 /// [`register`] in the Claude Code directory `claude_dir` itself — where a
+/// Claude Code started with `CLAUDE_CONFIG_DIR=<claude_dir>` files it.
 fn register_in(claude_dir: &Path, pid: u32, session: &str) -> SessionFile {
     register_as(claude_dir, pid, session, "1.0.0")
 }
 
 /// [`register_in`], the process running build `version` (`unknown`: one
+/// nobody can compare, which the host looks at as it does a behind one).
 fn register_as(claude_dir: &Path, pid: u32, session: &str, version: &str) -> SessionFile {
     let start = kernel_start(pid).expect("lstart");
     std::fs::create_dir_all(claude_dir.join("sessions")).expect("sessions");
@@ -2549,6 +2560,7 @@ fn newer() -> Targets {
 }
 
 /// A real sweep's options over `dir`, dialling a socket that does not exist:
+/// a sweep that got past every proof reports `wait:no-socket`.
 fn drive(dir: &Path) -> Opts {
     build_start::PROBE.with(|named| {
         named
@@ -2577,6 +2589,9 @@ fn drive(dir: &Path) -> Opts {
 }
 
 /// What every start probe on this thread finds from now on
+/// ([`build_start::PROBE`]; [`drive`] names `Starts`): a test of a build
+/// that does not start names what its probe finds, and the probes it runs
+/// are counted in the returned cell.
 fn probe_finds(found: build_start::Probe) -> std::rc::Rc<std::cell::Cell<usize>> {
     let ran = std::rc::Rc::new(std::cell::Cell::new(0));
     let count = std::rc::Rc::clone(&ran);
@@ -2590,6 +2605,9 @@ fn probe_finds(found: build_start::Probe) -> std::rc::Rc<std::cell::Cell<usize>>
 }
 
 /// Seeds `opts`'s state with the baked-catalog cache ([`catalog::baked_cached`], keyed by the
+/// binary's path, size and mtime) for the machine's managed Claude Code build, scanned once per
+/// process: a scan reads the whole build (230 MB, 0.7 s of CPU in a debug build), and every
+/// test's fresh state would scan it anew.
 fn seed_builds(opts: &Opts) {
     type Key = (PathBuf, u64, Option<SystemTime>);
     type Files = Vec<(std::ffi::OsString, Vec<u8>)>;
@@ -2646,6 +2664,7 @@ thread_local! {
 }
 
 /// `f` with [`drive`]'s options under the default `[harness] upgrade_ask =
+/// false`: the quiet upgrade ([`upgrade::Facts::quiet`]).
 fn quietly<T>(f: impl FnOnce() -> T) -> T {
     QUIET.with(|q| q.set(true));
     let out = f();
@@ -2666,6 +2685,7 @@ pub(super) fn sh_script(exe: &Path, body: &str) {
     }
     unsafe extern "C" {
         /// `stdlib.h`, declared inline as `aterm-gui`'s `test_scratch` declares
+        /// it (the workspace's `libc` is `aterm-libc`, which does not carry it).
         fn atexit(cb: extern "C" fn()) -> std::ffi::c_int;
     }
     let mut beside = exe.as_os_str().to_owned();
@@ -2816,6 +2836,7 @@ fn a_cell_reply_is_dim_only_by_its_attrs() {
 }
 
 /// A control connection whose server answers each request with the next of
+/// `replies`, and hands back every request it read once the client is gone.
 #[cfg(unix)]
 fn fake_tab(replies: Vec<&'static str>) -> (Client, std::thread::JoinHandle<Vec<String>>) {
     use std::io::BufRead as _;
@@ -3495,6 +3516,8 @@ impl Kernel for ParkedProcess<'_> {
 }
 
 /// The screen [`instance`] shows: an idle Claude's empty composer, the caret at
+/// column 2 of its row, and no person's input to the session (`"human_ms":null`,
+/// so the tab is not attended: `upgrade::attended_by`).
 #[cfg(unix)]
 fn idle_screen() -> String {
     let rule = "─".repeat(20);
@@ -3526,20 +3549,31 @@ struct Answers {
     /// The `line <n>` reply.
     line: &'static str,
     /// The `send` reply (bash's relaunch line is typed with `send`, then
+    /// `key enter`).
     send: &'static str,
     /// The `rekey shell=<pid>` reply (a `rekey withdraw` is answered
+    /// `OK rekey withdrawn`).
     rekey: &'static str,
     /// The `lease acquire …` reply; a `lease release` is answered `OK lease
+    /// released` after an acquire this granted, `OK lease none` otherwise.
     lease: &'static str,
     /// The `status` reply from the second read after a `lease acquire` on:
+    /// what a person's keystroke, or a prompt someone sent, makes it between a
+    /// restart's first look (under the hand) and its last.
     after_first_look: Option<&'static str>,
     /// The `signal` reply, sending nothing (empty: the stand-in agent named
+    /// by `pid=` is sent SIGTERM, then `OK`).
     signal: &'static str,
     /// The `cell <r> <c>` reply (default: a plain blank, not dim).
     cell: &'static str,
     /// The `who` reply: the host's roster, whose `fgpgid=` proves the shell a
+    /// relaunch line is typed at holds the tab (`None`: unscripted, so no
+    /// relaunch line is ever typed).
     who: Option<String>,
     /// A Claude Code prompt the stand-in draws itself ([`Prompt`]) in place of `screen`:
+    /// what a `turn` answered with a skip that typed part of its text (`typed=<k>`) or all
+    /// of it (`reason=guard`) left there, and a person's key after it where `person_key`
+    /// says; `key … ctrl+u` kills the line when its `if-gen=` names the screen drawn.
     prompt: Option<Prompt>,
 }
 
@@ -3556,6 +3590,8 @@ struct Prompt {
 #[cfg(unix)]
 impl Prompt {
     /// The prompt as Claude Code draws it, 40 columns wide: its rules, the
+    /// caret row, the draft's continuation rows indented two, the cursor
+    /// behind the text; screen generation `4.<generation>`.
     fn screen(&self, generation: u64) -> String {
         const WIDTH: usize = 40;
         let rule = "─".repeat(WIDTH);
@@ -3605,6 +3641,9 @@ impl Default for Answers {
 }
 
 /// A control socket at `<dir>/t.sock` (its token beside it) standing in for [`TAB`]'s aterm with
+/// an idle Claude: `text --json` is [`idle_screen`], `blocks` unscripted, `status` holding
+/// nothing, each overridden by `<dir>/t.screen`, `t.blocks` or `t.status`; a `turn` is answered
+/// OK and recorded.
 #[cfg(unix)]
 fn instance(dir: &Path) -> (String, crate::harness::FakeInstanceLog) {
     instance_of(dir, TAB)
@@ -5267,6 +5306,8 @@ fn a_build_that_failed_to_start_is_not_retried_for_the_conversations_hand_resume
 }
 
 /// A conversation's relaunch onto `to` (managed) that stopped `no-resume`
+/// `ago` seconds ago, as the relaunch saves it ([`save`], the one writer):
+/// the round of the process the upgrade ended, in another tab.
 #[cfg(unix)]
 fn failed_start_saved(opts: &Opts, session: &str, to: &str, ago: u64) {
     let at = now_s() - ago;
@@ -5915,6 +5956,7 @@ fn a_round_onto_a_build_that_fails_to_start_releases_its_agent_once() {
 }
 
 /// The conversation whose relaunch onto a build found it failing to start,
+/// in another tab ([`failed_start_saved`]).
 #[cfg(unix)]
 const ANOTHER_CONVERSATION: &str = "0badf00d-9999-2222-3333-444455556666";
 
@@ -5923,6 +5965,10 @@ const ANOTHER_CONVERSATION: &str = "0badf00d-9999-2222-3333-444455556666";
 const ASKED_MARKER: &str = "ATERM-UPGRADE-READY-0badf00d";
 
 /// `h`'s agent, its round as the test left it, visited three times after
+/// [`ANOTHER_CONVERSATION`]'s relaunch onto 9.9.9 failed to start (34 s
+/// ago; no probe can run `/nonexistent/claude`, named so: [`probe_finds`]):
+/// each visit's step, how many release lines were typed into the tab, and
+/// the record after.
 #[cfg(unix)]
 fn onto_a_failing_build(h: &Parked) -> (Vec<String>, usize, St) {
     let _ = probe_finds(build_start::Probe::NoExec);
@@ -6599,6 +6645,7 @@ fn a_restart_whose_agent_the_orphan_pass_sees_gone_says_when() {
 }
 
 /// The ledger rows of `opts` whose step is `step`, by the conversation each
+/// names.
 fn noted_for(opts: &Opts, step: &str, session: &str) -> usize {
     std::fs::read_to_string(ledger_path(opts))
         .unwrap_or_default()
@@ -6805,6 +6852,8 @@ fn a_restart_whose_agent_is_not_reaped_yet_says_when_it_ended() {
 }
 
 /// One [`relaunch`] of a restart whose signalled agent is `pid`, at a shell
+/// that never takes its terminal back: `wait:shell-prompt`, still in flight,
+/// nothing typed; the record after it.
 #[cfg(unix)]
 fn relaunched_over(name: &str, pid: u32) -> St {
     let dir = scratch(name);
@@ -7956,6 +8005,8 @@ fn a_conversation_resumed_in_another_tab_is_retabbed_at_the_attach() {
 }
 
 /// A bash, a dialect the relaunch line is written for, alive until the test lets it go: it
+/// blocks in its own `read` of a pipe the handle holds, so it never ends on a clock a slow
+/// test outlives (a gone bash is a `<defunct>` zombie, a shell with no dialect).
 fn stand_in_shell() -> aterm_uds::spawnfd::Child {
     Command::new("/bin/bash")
         .args(["-c", "read -r _"])
@@ -8770,6 +8821,8 @@ impl DeadAgent {
     }
 
     /// [`DeadAgent::write_record`] holding conversation `session`, filed in
+    /// the Claude Code directory `claude_dir` itself — where an agent started
+    /// with `CLAUDE_CONFIG_DIR=<claude_dir>` files it.
     fn write_record_in(&self, claude_dir: &Path, session: &str) {
         let sessions = claude_dir.join("sessions");
         std::fs::create_dir_all(&sessions).expect("sessions");
@@ -8794,6 +8847,7 @@ impl DeadAgent {
     }
 
     /// The host's look at the exit, live, its waits simulated (`wait` sees
+    /// each look's number before the next).
     fn look(&self, mut wait: impl FnMut(usize)) -> ExitRecord {
         let looks = std::cell::Cell::new(0);
         exit_record(
@@ -9770,6 +9824,7 @@ fn a_restart_in_place_is_planned_on_the_same_program_and_carried_on_once() {
 }
 
 /// A main-chain answer by `model` stamped `at` (RFC 3339): what the live
+/// model is read from past a process's start ([`models::live_model_at`]).
 #[cfg(unix)]
 fn answer_at(model: &str, at: &str) -> String {
     format!(
@@ -9778,6 +9833,8 @@ fn answer_at(model: &str, at: &str) -> String {
 }
 
 /// The relaunch snapshot of an agent under the user's own Claude home
+/// holding conversation `session`: what the window host hands the readers of
+/// its limit and its wall ([`named_standing_wall`]).
 #[cfg(unix)]
 fn users_agent(session: &str) -> Snapshot {
     Snapshot {
@@ -9813,6 +9870,7 @@ fn write_transcript(home: &Path, rows: &[String]) {
 }
 
 /// The model a person chose for `SESSION` with `/model`, as the harness's
+/// record remembers it past the answers that follow ([`ModelRecord::human`]).
 #[cfg(unix)]
 fn chose_by_hand(opts: &Opts, model: &str) {
     let dir = state_dir(opts).join("models");
@@ -10176,6 +10234,10 @@ fn an_upgrade_record_keeps_the_fallbacks_origin() {
 }
 
 /// THE PROFILE CONTEXT A LIVE SNAPSHOT CAPTURES of an agent started under the
+/// test's own home, read as `relaunch::snapshot_with` reads it off the
+/// process's exec environment ([`Records::billing_context`]): `HOME` names
+/// that home, no `CLAUDE_CONFIG_DIR`, no custom OAuth URL, and the login
+/// variable as `login` names it.
 #[cfg(unix)]
 fn live_profile(opts: &Opts, login: Option<&str>) -> super::super::profile::Context {
     let env: Vec<String> = std::iter::once(format!("HOME={}", opts.home.display()))
@@ -10197,6 +10259,9 @@ fn live_profile(opts: &Opts, login: Option<&str>) -> super::super::profile::Cont
 }
 
 /// A restart in place of a stand-in agent launched `--model <launch>`,
+/// driven for real ([`restart_with`], its job and terminal scripted): the
+/// conversation's last record `prior`, a `/model` of `hand` answered since
+/// the agent started — and what it says, and the record it saved.
 #[cfg(unix)]
 fn restart_saved(
     name: &str,
@@ -10217,6 +10282,8 @@ fn restart_saved(
 }
 
 /// [`restart_saved`] of an agent whose own exec environment named `login`
+/// ([`Snapshot::login`]), by a host that keeps `roster`
+/// ([`crate::harness::relaunch::restart_as`]).
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn restart_saved_as(
@@ -10687,6 +10754,7 @@ fn a_move_outlives_the_relaunch_records_written_over_it() {
 }
 
 /// A transcript of [`SESSION`] with one prompt, filed under `claude_dir`'s project
+/// `project` as Claude Code files one with its first message.
 #[cfg(unix)]
 fn file_transcript_in(claude_dir: &Path, project: &str) {
     let dir = claude_dir.join("projects").join(project);
@@ -10858,6 +10926,8 @@ fn the_hosts_looks_read_the_record_under_the_agents_own_claude_home() {
 }
 
 /// Claude's record of `pid` (started `start`, idle) holding [`SESSION`],
+/// running in `cwd`, filed in the Claude Code directory `claude_dir`: where a
+/// Claude Code whose home resolves there files it.
 fn register_running_in(claude_dir: &Path, pid: u32, start: &str, cwd: &Path) {
     std::fs::create_dir_all(claude_dir.join("sessions")).expect("sessions");
     std::fs::write(
@@ -12583,6 +12653,7 @@ fn land_row() -> String {
 }
 
 /// A clean defense, escaped for [`turn_by`]: what lands a task answering
+/// Land's instruction ([`land_row`]; Autopilot Land).
 #[cfg(unix)]
 const LANDED_JSON: &str =
     "Landed and verified.\\nNothing left: it is merged into the remote main branch.";
@@ -12725,6 +12796,8 @@ struct Carried {
 }
 
 /// A restart carried on end to end ([`Rig`]): its transcript is `before` when
+/// the restart records what the agent ran, and gains `after` since, and the
+/// resumed answer is waited for at most `wait`.
 #[cfg(unix)]
 fn carried_on(name: &str, before: &[String], after: &[String], wait: Duration) -> Carried {
     let rig = Rig::new(name, before);
@@ -12841,10 +12914,12 @@ impl Kernel for ShellHolds {
 }
 
 /// The shell held its terminal at every look: what it does before the line's
+/// command starts (its hooks), or a command that came and went between looks.
 #[cfg(unix)]
 const HELD: &[Option<bool>] = &[Some(true)];
 
 /// The line's command held the terminal at the first look (the agent ran),
+/// and the shell has it back at every look since.
 #[cfg(unix)]
 const RAN: &[Option<bool>] = &[Some(false), Some(true)];
 
@@ -12865,6 +12940,7 @@ impl Looks {
 }
 
 /// The line was typed into block 3, which is still the prompt it was typed
+/// at: the shell has not run the line's command yet (its hooks).
 #[cfg(unix)]
 const BLOCK_NOT_RUN: &str = r#"OK {"blocks":[{"id":3,"state":"entering","exit":null,"prompt":10,"cmd":10,"cmdcol":5,"out":null,"end":null,"cwd":"","cmdline":""}]}"#;
 
@@ -12881,6 +12957,9 @@ const BLOCK_ENDED: &str = r#"OK {"blocks":[{"id":3,"state":"complete","exit":1,"
 const BLOCK_NEXT: &str = r#"OK {"blocks":[{"id":4,"state":"entering","exit":null,"prompt":12,"cmd":12,"cmdcol":5,"out":null,"end":null,"cwd":"","cmdline":""}]}"#;
 
 /// One [`await_new`] step over a relaunch of `cause` in flight since just
+/// now, its looks reading `looks` ([`Looks`]), and the wait for the
+/// relaunched process cut to `wait` (a step that must not end early is
+/// waited out): the step, the record after it, its ledger rows.
 #[cfg(unix)]
 fn held_step(name: &str, cause: &str, looks: Looks, wait: Duration) -> (Report, St, usize) {
     let (r, st, rows, _) = held_step_shown(name, cause, looks, wait);
@@ -12888,6 +12967,7 @@ fn held_step(name: &str, cause: &str, looks: Looks, wait: Duration) -> (Report, 
 }
 
 /// [`held_step`], and the owner's rows of the records after it ([`rows`]),
+/// the step's record saved as its callers save it.
 #[cfg(unix)]
 fn held_step_shown(
     name: &str,
@@ -12953,6 +13033,8 @@ fn held_step_shown(
 }
 
 /// A wait long enough that a shell read as holding the tab throughout would
+/// have been read as ENDED (`Timings::FAST.ended_at_once` and several looks more): the
+/// negative controls wait it out.
 #[cfg(unix)]
 const PAST_ENDED: Duration = Duration::from_millis(1_500);
 
@@ -13050,6 +13132,7 @@ fn the_shells_own_block_says_whether_the_line_ran() {
 }
 
 /// The tab's newest block is the prompt the shell waits at (block 3), its
+/// input start not marked yet (`133;B`): what a relaunch line is typed into.
 #[cfg(unix)]
 const BLOCK_AT_PROMPT: &str = r#"OK {"blocks":[{"id":3,"state":"prompt","exit":null,"prompt":10,"cmd":null,"cmdcol":null,"out":null,"end":null,"cwd":"","cmdline":""}]}"#;
 
@@ -14338,6 +14421,7 @@ fn an_ask_that_ran_is_never_recorded_failed_when_a_person_moves_off_it() {
 }
 
 /// The transcript of a conversation whose last answer, on `model`, came
+/// `ago_s` seconds ago.
 fn answered_on(opts: &Opts, model: &str, ago_s: i64) {
     let at = i64::try_from(now_s()).expect("now") - ago_s;
     let proj = opts.home.join(".claude/projects/-work");
@@ -14839,6 +14923,7 @@ fn the_clis_sweep_finds_an_agent_under_another_claude_home_no_visit_recorded() {
 }
 
 /// Claude's session file for `pid` as [`register`] writes it, its status
+/// changed `ago_s` seconds before now: a turn that just ended is `0`.
 fn register_idle_since(home: &Path, pid: u32, session: &str, ago_s: u64) -> SessionFile {
     let sf = register(home, pid, session);
     let at_ms = (now_s() - ago_s) * 1000;
@@ -14864,6 +14949,7 @@ struct Parked {
     dir: ScratchDir,
     opts: Opts,
     /// The stand-in agent, until a test takes it to reap it itself
+    /// ([`Parked::reaped`]).
     agent: Option<aterm_uds::spawnfd::Child>,
     sf: SessionFile,
     asked: crate::harness::FakeInstanceLog,
@@ -14916,6 +15002,8 @@ impl Parked {
     }
 
     /// The stand-in agent handed to a thread that reaps it the moment it ends
+    /// and removes its session file, as Claude's own exit does, so a restart's
+    /// wait for it to be gone ends on the event; says how it ended.
     fn reaped(&mut self) -> std::sync::mpsc::Receiver<std::process::ExitStatus> {
         let mut agent = self.agent.take().expect("the agent");
         let file = self
@@ -14968,6 +15056,9 @@ fn ledger_details(opts: &Opts, step: &str) -> Vec<String> {
 }
 
 /// `/bin/zsh`, or where none is installed (stock Debian and Ubuntu ship none) a
+/// copy of `/bin/sh` named `zsh`: [`tty_zsh`] needs a shell that leads its
+/// terminal and whose executable reads as zsh (`process_args(..).exec_path`,
+/// `Dialect::from_exe_name`), and only the file's name decides that.
 #[cfg(unix)]
 fn zsh_executable() -> &'static Path {
     static ZSH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -15002,6 +15093,8 @@ fn zsh_executable() -> &'static Path {
 }
 
 /// A zsh ([`zsh_executable`]) that is the session leader of a pseudo-terminal
+/// of its own and its foreground process group (`pgid == tpgid`): the shell a
+/// relaunch waits to hold its terminal again.
 #[cfg(unix)]
 fn tty_zsh() -> std::process::Child {
     use aterm_uds::spawnfd::InheritNothing as _;
@@ -15045,6 +15138,10 @@ fn tty_zsh() -> std::process::Child {
 }
 
 /// A STAND-IN AGENT ([`parked`]) THAT LEADS A TERMINAL OF ITS OWN, as a
+/// Claude Code leads its aterm tab: a new session on a pty, that pty its
+/// controlling terminal, so its group is the terminal's foreground (`ids`:
+/// `pgid == tpgid == pid`) and a roster naming that group (`who …
+/// fgpgid=<pid>`) claims it ([`host_candidates`]).
 #[cfg(unix)]
 fn tty_agent(env: &[(&str, &Path)], cwd: Option<&Path>) -> std::process::Child {
     use aterm_uds::spawnfd::InheritNothing as _;
@@ -15101,6 +15198,7 @@ fn tty_agent(env: &[(&str, &Path)], cwd: Option<&Path>) -> std::process::Child {
 }
 
 /// A pending state for [`SESSION`] whose screen ([`idle_screen`], seq 77) has
+/// just been seen to move.
 fn unsettled() -> St {
     St {
         phase: Phase::Pending,
@@ -15116,6 +15214,7 @@ fn unsettled() -> St {
 }
 
 /// [`unsettled`], its screen (seq 77) unchanged for an hour, in [`TAB`]: a
+/// settled idle point the notice may be typed at.
 fn settled() -> St {
     St {
         last_seq: 77,
@@ -15126,6 +15225,7 @@ fn settled() -> St {
 }
 
 /// The screen [`idle_screen`] shows, with the server's person stamp `human`
+/// (`"human_ms"`'s value; `None`: a host that sends none).
 #[cfg(unix)]
 fn stamped_screen(human: Option<&str>) -> String {
     let rule = "─".repeat(20);
@@ -15521,6 +15621,8 @@ fn a_labelled_top_rule_is_the_input_box_the_notice_fences_on() {
 }
 
 /// A host's `help` that names every option these rigs send: the guarded
+/// submit, the key-by-key `cap=`, the generation fence — and a `key` entry
+/// naming its fences, as the take-back asks.
 #[cfg(unix)]
 const PRESS_HELP: &str = "OK 3\nturn [option=value ...] <text>: ... [submit=<key|none|guarded:<re>>] \
                           [cadence=<ms>] [cap=<n>] [yield=<floor>] [if-gen=<epoch>.<seq>] ...\n\
@@ -15653,12 +15755,15 @@ enum Kill {
     /// The whole line.
     Line,
     /// The row the cursor is on, as a composer that kills a wrapped row at a
+    /// time would.
     Row,
     /// Nothing.
     Nothing,
 }
 
 /// A Claude Code prompt for [`left_standing`] alone, 40 columns wide, holding `draft`
+/// ([`Prompt::screen`]): `text --json` draws it, a `cell` reads plain, `help` answers `help`, and
+/// `key … ctrl+u` (only while its `if-gen=` names the screen drawn) takes back what `kill` says.
 #[cfg(unix)]
 fn prompt_tab(
     draft: &str,
@@ -16017,6 +16122,9 @@ fn the_notice_is_fenced_on_the_generation_it_was_judged_on() {
 }
 
 /// A tab with an idle Claude Code for [`type_fenced`] alone: `text --json` draws an empty
+/// composer at one generation, a `cell` reads plain, `help` takes `if-gen=`, the `lease
+/// acquire` is answered `lease` (a `lease release` is `OK lease released` after an acquire it
+/// granted, `OK lease none` otherwise), and each `turn` the next of `turns`, the last repeating.
 #[cfg(unix)]
 fn hand_tab(
     lease: &'static str,
@@ -16383,6 +16491,7 @@ fn a_draft_begun_before_the_signal_vetoes_it() {
 }
 
 /// An idle Claude's screen as a host with the generation fence sends it (a
+/// `gen` beside the `seq`), and that host's `help turn` naming the fence.
 fn fenced_answers(turn: Vec<&'static str>) -> Answers {
     let rule = "─".repeat(20);
     Answers {
@@ -16396,6 +16505,7 @@ fn fenced_answers(turn: Vec<&'static str>) -> Answers {
 }
 
 /// An announced state for [`SESSION`] in [`TAB`] whose notice the parked
+/// agent of `h` holds, `marker` out, its screen just seen to move.
 #[cfg(unix)]
 fn announced_to(h: &Parked, marker: &str) -> St {
     St {
@@ -16412,6 +16522,7 @@ fn announced_to(h: &Parked, marker: &str) -> St {
 }
 
 /// The transcript of [`SESSION`] under `h`'s home, its last assistant row
+/// saying `text`.
 #[cfg(unix)]
 fn transcript_says(h: &Parked, text: &str) {
     let project = h.opts.home.join(".claude/projects/p");
@@ -16902,6 +17013,7 @@ fn typing_that_wraps_at_the_bottom_of_the_screen_is_still_typing() {
 }
 
 /// A shell prompt's one-row `text --json`: `text`, the cursor at `col`, the
+/// content sequence (and generation `4.<seq>`) `seq`.
 #[cfg(unix)]
 fn prompt_screen(text: &str, col: usize, seq: u64) -> String {
     format!(
@@ -16910,6 +17022,8 @@ fn prompt_screen(text: &str, col: usize, seq: u64) -> String {
 }
 
 /// One relaunch attempt ([`type_relaunch_line`]) against a stand-in instance
+/// answering `answers`, the shell's tab claim read by `probe`: what it
+/// returned, and every `turn` it sent.
 #[cfg(unix)]
 fn relaunch_attempt(
     name: &str,
@@ -16921,6 +17035,7 @@ fn relaunch_attempt(
 }
 
 /// [`relaunch_attempt`] for an agent whose end was asked at `ended_at_s`
+/// (Unix seconds, [`PromptLook::ended_at_s`]).
 #[cfg(unix)]
 fn relaunch_attempt_ended(
     name: &str,
@@ -16933,6 +17048,7 @@ fn relaunch_attempt_ended(
 }
 
 /// [`relaunch_attempt_ended`] for a line a hand held since `held_since_s`
+/// (Unix seconds, [`PromptLook::held_since_s`]; `0`, none).
 #[cfg(unix)]
 fn relaunch_attempt_held(
     name: &str,
@@ -19453,6 +19569,8 @@ fn set_status(h: &mut Parked, status: &str) {
 }
 
 /// Stamps `h`'s record with its agent's process start ([`St::proc_start`]), as this build
+/// writes it: a record naming none is an older build's, whose age is repaired to the
+/// process's start at the next look.
 #[cfg(unix)]
 fn own_record(h: &Parked) {
     let mut st = load(&h.opts, SESSION).expect("state");
@@ -19461,6 +19579,7 @@ fn own_record(h: &Parked) {
 }
 
 /// The process table's rows for two shells under `h`'s agent that never end
+/// (a widowed `tail -f … | grep -m1 …`, its `grep` long gone).
 #[cfg(unix)]
 fn shells_under(h: &Parked) -> Vec<ProcRow> {
     vec![
@@ -19470,6 +19589,7 @@ fn shells_under(h: &Parked) -> Vec<ProcRow> {
 }
 
 /// [`SESSION`]'s transcript under `h`'s home: a person's task, the notice
+/// whose marker is `marker`, and the agent's last answer `text`.
 #[cfg(unix)]
 fn asked_then_answered(h: &Parked, marker: &str, text: &str) {
     let notice = upgrade::prepare_prompt(
@@ -19905,6 +20025,7 @@ fn what_holds_the_move_is_kept_by_its_start() {
 }
 
 /// A Claude Code whose turn is over, a dynamic workflow it started still
+/// running: the wait drawn over the composer (`wait_bg.out`'s shape).
 #[cfg(unix)]
 fn waiting_screen() -> String {
     let rule = "─".repeat(20);
@@ -19914,6 +20035,7 @@ fn waiting_screen() -> String {
 }
 
 /// A Claude Code mid-turn, a Bash call running in the foreground: the
+/// spinner over the composer, the busy footer under it.
 #[cfg(unix)]
 fn mid_turn_screen() -> String {
     let rule = "─".repeat(20);
@@ -20084,6 +20206,8 @@ fn whether_a_conversation_has_a_task_is_read_on_from_where_the_last_read_ended()
 }
 
 /// A stand-in agent in [`TAB`] whose conversation holds `rows` (Pending on the newer build,
+/// its screen quiet an hour): the visit's report under `kernel`, the state it left, and how
+/// many turns it typed.
 #[cfg(unix)]
 fn visit_holding(
     name: &str,
@@ -20095,6 +20219,8 @@ fn visit_holding(
 }
 
 /// [`visit_holding`] with the last look an hour ago at `last_seq` (the screen now at `seq` 77),
+/// the tab's `status` reading `status` (`None`: nothing held, no agent verdict), and the tab's
+/// supervisor having ledgered `ledger` as typed ([`Opts::aterm_state`]; `None`: no ledger).
 #[cfg(unix)]
 fn visit_seen(
     name: &str,
@@ -20119,6 +20245,7 @@ fn visit_seen(
 }
 
 /// [`visit_seen`] on a stand-in answering as `answers` says: every request
+/// the visit made, in order, instead of the count of its turns.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn visit_answered(
@@ -20146,6 +20273,9 @@ fn visit_answered(
 }
 
 /// [`visit_answered`], the agent's argv carrying `launch` after its own
+/// words — the flags a person launched it with, which the relaunch carries —
+/// and `seed` run over the sweep's options before the visit (the harness's
+/// own records a test lays down: a `/model` choice remembered).
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn visit_launched(
@@ -20176,6 +20306,9 @@ fn visit_launched(
 }
 
 /// [`visit_launched`], the agent's exec environment as the visit reads it
+/// carrying `env` (`NAME=VALUE` each) beside its own — what a process
+/// relaunched under a login of the harness's choosing has, which the
+/// stand-in's real environment cannot be given after its start.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn visit_launched_env(
@@ -20213,6 +20346,7 @@ fn visit_launched_env(
 }
 
 /// The same visit with its last-look process reads injected (`make_kernel`), so the parked
+/// fixture and the last-look controls drive one real visit.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn visit_launched_probed<K: Kernel>(
@@ -20617,6 +20751,8 @@ fn a_quiet_restart_is_carried_on_with_nothing() {
 }
 
 /// The resumed build's own warning that something did not come back, as
+/// 2.1.300 wrote it (2026-10-15, transcript `71159b44`), by build `version`
+/// at `at` (unix seconds), at `level`.
 #[cfg(unix)]
 fn resumed_warning(version: &str, at: u64, level: &str) -> String {
     format!(
@@ -20626,6 +20762,7 @@ fn resumed_warning(version: &str, at: u64, level: &str) -> String {
 }
 
 /// A quiet restart carried on as [`a_quiet_restart_is_carried_on_with_nothing`]
+/// does, over `rows`: the rig and the record as the carry-on left it.
 #[cfg(unix)]
 fn quietly_resumed(name: &str, rows: &[String]) -> (Rig, St) {
     let rig = Rig::new(name, rows);
@@ -20638,6 +20775,8 @@ fn quietly_resumed(name: &str, rows: &[String]) -> (Rig, St) {
 }
 
 /// The quiet restart's look at the tab's idle point
+/// ([`super::super::relaunch::restore_look`]), at `now`, the tab's claim on
+/// the stand-in's process granted.
 #[cfg(unix)]
 fn restore_look_at(rig: &Rig, st: &mut St, now: u64) -> Option<Report> {
     super::super::relaunch::restore_look(
@@ -21935,6 +22074,8 @@ fn a_relaunchs_lost_monitor_is_looked_at_and_recorded() {
 }
 
 /// A main-chain user row Claude Code asked itself (`origin.kind` `kind`), as
+/// 2.1.300 records one: a background task's notification, its usage-limit
+/// continuation (`isMeta`), a peer session's message (`isMeta`).
 #[cfg(unix)]
 fn own_row(kind: &str, meta: bool, text: &str) -> String {
     format!(
@@ -21943,6 +22084,8 @@ fn own_row(kind: &str, meta: bool, text: &str) -> String {
 }
 
 /// A conversation its worker ended with the token, then woken by Claude Code
+/// itself: a background task's notification and the usage-limit
+/// continuation, and the agent's answer.
 #[cfg(unix)]
 const OLD_TAB: &str = "s-00000000000000000001";
 
@@ -21953,6 +22096,7 @@ fn ledger_typed(root: &Path, tab: &str, text: &str, ts_ms: i64) {
 }
 
 /// [`ledger_typed`] under the rule `rule_id` (a wall's retry is ledgered under
+/// its own rule, which the record reads: `upgrade::FinishedScan`).
 fn ledger_typed_as(root: &Path, tab: &str, text: &str, ts_ms: i64, rule_id: &str) {
     use crate::supervise::approvals;
     let path = approvals::path_under(root, Some(tab)).expect("ledger dir");
@@ -22805,6 +22949,11 @@ fn a_relaunch_into_a_done_report_in_words_asks_the_done_check() {
 }
 
 /// A RELAUNCH INTO A TASK LAND'S ACT OR A WALL-CUT CHECK'S RETRY ENDED TYPES
+/// NOTHING (the merge review's M5-R1 and XM-LAND-RECORD): the turn-end
+/// policy ends the task on a done reply to [`LAND`] (Autopilot Land's
+/// instruction, its done check) and on the done reply to the retry of a wall
+/// that cut the done check's turn; the record (`FinishedScan`) reads both
+/// the same, so the carry-on is `done:finished`, nothing typed.
 #[cfg(unix)]
 /// A relaunch into a task land's act landed types nothing.
 #[cfg(unix)]
@@ -24348,6 +24497,7 @@ fn an_unnamed_process_falls_back_to_the_build_test() {
 }
 
 /// An idle, settled agent at an idle point: the facts of a look that saw nothing
+/// under it (the simulation adds what the adversary runs).
 fn cadence_facts() -> Facts {
     Facts {
         status: "idle".to_string(),
@@ -24466,6 +24616,8 @@ fn the_end_of_the_work_asks_no_sooner_than_its_floor_and_no_more_than_its_budget
 }
 
 /// The seconds at which an agent that declines every notice is asked over `hours`, by the
+/// real reducer and record transitions: after each notice a job runs under it for `job_s`
+/// seconds, then ends.
 fn declined_notices(hours: u64, job_s: u64) -> Vec<u64> {
     let t0 = 1_790_000_000;
     let to = Version::parse("2.1.284").expect("v");
@@ -24593,6 +24745,8 @@ fn tab_ones_recorded_shape_is_not_asked_until_nothing_runs_and_claude_idles() {
 }
 
 /// An idle Claude Code screen whose last answer is `said`, one row a line
+/// (the first under `⏺`, the rest at the message's column), its empty
+/// composer holding the caret, read at `seq`.
 #[cfg(unix)]
 fn said_screen(said: &[&str], seq: u64) -> String {
     let rule = "─".repeat(40);

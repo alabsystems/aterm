@@ -1,28 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHO TYPED (`docs/DESIGN-owner-surfaces-2026-10-16.md` §5, S9): the last
-//! control client to type into a session, and when. A record, never a mark:
-//! the tab's hover says `last typed into by lab-sweep at 14:02`, the Overview's
-//! line `typed by lab-sweep 4m ago`, `status` and the survey's row
-//! `typed_by=<pct|-> typed_ms=<ms|->`.
-//!
-//! The control server credits each connection once, at its first typing verb
-//! ([`Who`], `control.rs`'s `serving_caller`): an owner-token client by the
-//! kernel's peer pid of its connection, whose process name and line of
-//! parents are read THEN, while it waits for its reply (a CLI that exits after
-//! its reply leaves nothing to read later); an edge by the client that
-//! presented its token, read the same way, on the session the edge was
-//! minted for; the bridge and aterm's own harness by a word. An `OK` from a
-//! typing verb is no byte evidence: only its nonempty accepted completion
-//! stamps the target's [`TypedStamp`] after the halt gate; the
-//! person's own keys never reach it. The main thread names the caller
-//! ([`name`]): the tab whose shell is an ancestor of the process, by the words
-//! someone set on it, its role or the person's name for it, else its session
-//! id — never the title or cwd its program reports, which any program in the
-//! tab can make say `aterm` ([`crate::App::typist_tab`]) — else the process by
-//! its name. The name is kept with the caller ([`Caller`]), so a connection is
-//! named once however many sessions it types into.
+//! WHO TYPED: the last control client to type into a session, and when.
 
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -42,9 +21,7 @@ const CREDIT_WORDS: &[&str] = &["the message bus", "a script"];
 /// `<that Mac> over the fleet` ([`fleet_credit`]).
 const FLEET_CREDIT: &str = "over the fleet";
 
-/// The credit of what another Mac did here over the fleet's drive, `who`
-/// as this Mac names its node (`fabric::Driver::host`): its typing's
-/// ([`Who::Word`]), its hold's and its records'.
+/// The credit of what another Mac did here over the fleet's drive.
 pub(crate) fn fleet_credit(who: &str) -> String {
     format!("{who} {FLEET_CREDIT}")
 }
@@ -53,7 +30,7 @@ pub(crate) fn fleet_credit(who: &str) -> String {
 /// log's actors (`aterm`, `human`, `harness`, …), or a name that ends as a
 /// drive's credit does ([`fleet_credit`]): a tab named one of those would
 /// read as aterm's own credit, or as another Mac's drive, so no tab is
-/// named by it. Its whitespace is read as one space, as a person reads it.
+/// named by it.
 fn is_credit_word(name: &str) -> bool {
     let name = name
         .split_whitespace()
@@ -68,8 +45,7 @@ fn is_credit_word(name: &str) -> bool {
 /// Who a control connection is, as the typing it sends is credited.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Who {
-    /// aterm itself: the in-process harness's token, or a peer pid that is
-    /// this process.
+    /// aterm itself: the in-process harness's token, or a peer pid that is this process.
     Aterm,
     /// The fabric bridge's connection.
     #[cfg_attr(
@@ -80,27 +56,20 @@ pub(crate) enum Who {
         )
     )]
     Bridge,
-    /// An edge-scoped connection: the session its token was minted for (its
-    /// `src`, which whoever granted it declared, so it proves nothing of who
-    /// holds the token) and the client that presented the token, read as an
-    /// owner-token client is ([`Self::client`]).
+    /// An edge-scoped connection.
     Edge { src: SessionId, client: Box<Who> },
-    /// An owner-token client: its peer pid, its process name, and each
-    /// process from it up to (not including) pid 1 with its process group,
-    /// all read while it was connected.
+    /// An owner-token client.
     Process {
         pid: u32,
         comm: Option<String>,
         lineage: Vec<(i32, Option<i32>)>,
     },
-    /// A caller its own lane names in words, shown as given (an owner-token
-    /// connection with no peer pid to read is `a script`).
+    /// A caller its own lane names in words, shown as given.
     Word(String),
 }
 
 impl Who {
-    /// An owner-token client whose connection's peer pid is `pid`, read with
-    /// the live process table ([`Self::client_with`]).
+    /// An owner-token client whose connection's peer pid is `pid`.
     pub(crate) fn client(pid: Option<u32>) -> Self {
         Self::client_with(
             pid,
@@ -205,17 +174,13 @@ impl Who {
 pub(crate) struct Named {
     /// Every reader's: the hover, the Overview, `status`, the survey's content.
     pub(crate) words: String,
-    /// For the survey's facts, which carry no text a person or a program wrote:
-    /// the typist tab's role or session id, or a word aterm gave. `None` for
-    /// a process named by itself and a client on another tab's edge.
+    /// For the survey's facts, which carry no text a person or a program wrote.
     pub(crate) facts: Option<String>,
-    /// A parent's tab named it, so another process of its name under that
-    /// parent ([`Who::sibling_of`]) is named the same.
+    /// A parent's tab named it, so another process of its name under that parent is named the same.
     pub(crate) by_parent: bool,
 }
 
-/// One connection's caller and, once the main thread named it, its name: the
-/// per-connection memo every stamp of the connection shares.
+/// One connection's caller and, once the main thread named it, its name.
 #[derive(Debug)]
 pub(crate) struct Caller {
     pub(crate) who: Who,
@@ -270,16 +235,12 @@ pub(crate) struct Typed {
     pub(crate) at_unix_ms: u64,
 }
 
-/// `SessionCtx.typed`: the session's last [`Typed`]. A leaf lock.
+/// `SessionCtx.typed`: the session's last [`Typed`].
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TypedStamp(Arc<Mutex<Option<Typed>>>);
 
 impl TypedStamp {
-    /// Credit typing at `at_unix_ms` to `by`. `true` when what the hover
-    /// says may have moved, a new typist or a new minute, so the tab's chrome
-    /// is owed a refresh; a typist who keeps typing keeps its name, whether
-    /// on one connection or from one shell's `aterm ctl` run per verb
-    /// ([`Caller::covers`]).
+    /// Credit typing at `at_unix_ms` to `by`.
     pub(crate) fn stamp(&self, by: Arc<Caller>, at_unix_ms: u64) -> bool {
         let mut slot = self.0.lock().unwrap_or_else(|p| p.into_inner());
         let (by, moved) = match slot.take() {
@@ -296,8 +257,7 @@ impl TypedStamp {
         self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
-    /// Credit the accepted event to the captured session after all timeline
-    /// locks are released. Shared clones keep only this leaf, not a session alive.
+    /// Credit the accepted event to the captured session after all timeline locks are released.
     pub(crate) fn record(&self, session: &SessionId, by: Arc<Caller>) {
         let now = aterm_time::unix_millis().unwrap_or(0);
         if self.stamp(by, now) {
@@ -306,10 +266,7 @@ impl TypedStamp {
     }
 }
 
-/// THE STAMP an in-process paste makes on its target: the
-/// seam for any lane that types, a later one that is no local pid included
-/// (`Who::Word("<host> over the fleet")`). The tab's chrome follows when the
-/// hover's words moved (`Wake::Typed`).
+/// THE STAMP an in-process paste makes on its target.
 pub(crate) fn stamp(ctx: &SessionCtx, by: Arc<Caller>) {
     ctx.typed.record(&ctx.self_id, by);
 }
@@ -335,12 +292,7 @@ fn shell_tab(lineage: &[(i32, Option<i32>)], shells: &[(u64, i32)]) -> Option<(u
     })
 }
 
-/// THE NAME of `who` (main thread): a process is the tab whose shell is it,
-/// its process group or an ancestor ([`shell_tab`]), as `tab_of` names a
-/// typist tab, else itself by name; an edge is the client that presented its
-/// token on the edge's session (its tab where it is one of this aterm's,
-/// `local_of`), or that tab alone when the client is its shell's; every
-/// other caller is its own words.
+/// THE NAME of `who` (main thread).
 pub(crate) fn name(
     who: &Who,
     shells: &[(u64, i32)],
@@ -382,8 +334,7 @@ pub(crate) fn name(
 }
 
 impl crate::App {
-    /// Who last typed into `ctx`'s session and when, its caller named here
-    /// once ([`name`]).
+    /// Who last typed into `ctx`'s session and when, its caller named here once ([`name`]).
     pub(crate) fn typed_by(&self, ctx: &SessionCtx) -> Option<Typed> {
         let typed = ctx.typed.last()?;
         typed.by.named.get_or_init(|| {
@@ -398,15 +349,7 @@ impl crate::App {
         Some(typed)
     }
 
-    /// A tab as it names who typed from it ([`name`]): its role, else the
-    /// tab name a person set (`meta set title`), each whole as
-    /// `tab_label_of_session` reads them, else its short session id. Never
-    /// the title or cwd its program reports, which any program in the tab
-    /// sets with an escape, nor a word aterm credits typing by
-    /// ([`is_credit_word`]): a tab whose role is `aterm` would read as aterm's
-    /// own harness. The survey's facts get the role or the session id, never
-    /// the person's name for the tab, which is content. `None` for a session
-    /// not in the pool.
+    /// A tab as it names who typed from it ([`name`]).
     pub(crate) fn typist_tab(&self, local: u64) -> Option<Named> {
         let s = self.pool.get(local)?;
         let set = |t: &str| {
@@ -461,10 +404,7 @@ impl crate::App {
         self.refresh_meta_dependent_chrome(local);
     }
 
-    /// The `Wake::Driven` arm: another Mac's act on the tab over the fleet
-    /// is a record in the Messages log, naming the host, the act and the tab
-    /// ([`crate::message_reporters::driven_over_fleet`]). A tab gone since is
-    /// named by its sid.
+    /// The `Wake::Driven` arm.
     pub(crate) fn on_driven(&mut self, sid: &SessionId, host: &str, act: &str) {
         let tab = self.local_session_of(sid).map_or_else(
             || sid.as_str().to_owned(),
@@ -552,8 +492,7 @@ mod tests {
     }
 
     /// An edge names who presented its token, on the edge's tab, and that
-    /// tab alone only when its own shell is the client. NEGATIVE CONTROL: a
-    /// client outside the tab never reads as the tab.
+    /// tab alone only when its own shell is the client.
     #[test]
     fn an_edge_is_who_presented_it_on_its_tab() {
         let edge = |sid: &str, client: Who| Who::Edge {
@@ -595,7 +534,6 @@ mod tests {
             "a script",
             "human",
             "harness",
-            // Another Mac's drive (the step-in), however cased or spaced.
             "mac-03 over the fleet",
             "MAC-03  Over the\tFLEET ",
             fleet_credit("mac-03.local (node 1a2b3c4d)").as_str(),
@@ -614,9 +552,7 @@ mod tests {
     }
 
     /// AN `invoke Paste` TYPES FOR ITS CALLER where its paste lands while the
-    /// invoke runs (`App::invoke_typist`). NEGATIVE CONTROL: the same paste
-    /// with no invoke running (the person's ⌘V, or a paste their confirm let
-    /// through later) credits nobody.
+    /// invoke runs (`App::invoke_typist`).
     #[test]
     #[cfg(unix)]
     fn an_invoked_paste_is_its_callers_typing() {
@@ -679,8 +615,6 @@ mod tests {
             "typed_by=the%20message%20bus typed_ms=0"
         );
 
-        // NEGATIVE CONTROL: a process named by itself names its pid, so a
-        // sibling is someone else; so is one not named yet.
         let alone = TypedStamp::default();
         let by_pid = Caller::named(client(900), named(&client(900), &[]));
         assert!(alone.stamp(by_pid, 120_000));

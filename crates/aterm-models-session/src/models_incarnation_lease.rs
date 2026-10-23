@@ -1,62 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE INCARNATION LEASE (`aterm-link`'s `state.rs`, "The incarnation lease";
-//! `StateDir::take_incarnation`): how an attach takes the incarnation its will and
-//! every sequence of it run under, with the durable write of `inc` done once per
-//! lease of `Span` incarnations instead of once per attach, and the fence still
-//! holding across a `kill -9` at every step and a power loss at every step.
-//!
-//! Three files, each with a PAGE-CACHE value (`c_`, what any reader in this boot
-//! reads) and a MEDIA value (`m_`, what a power loss leaves). `inc` (`c_inc`,
-//! `m_inc`): the lease's top. `inc-lease` (`c_used`, `c_top`, `c_lb`): the
-//! incarnation the last attach took, the top it took it under, and the boot that
-//! wrote it (`c_lb = 0`: no lease file). `seq` (`c_seq`): the incarnation of the
-//! newest reserved sequence. The OS writes any file back at any moment
-//! (`WritebackInc`, `WritebackLease`, `WritebackSeq`), so after `PowerLoss` each
-//! file holds some version it had — the newest one written back — and the boot
-//! moves on. A flushed write moves `inc`'s media value itself.
-//!
-//! One take is `Plan` (read the three files, decide: `tr` whether the lease is
-//! trusted, `pn` the incarnation taken), then exactly one of `Take` (no flush: a
-//! trusted lease with room), `TakeFlushed` (lease afresh: `inc` flushed, then
-//! `inc-lease` written), `KillRenamed` (killed after the flush's rename, before its
-//! directory flush: the new top in the page cache only) or `KillFlushed` (killed
-//! after the flush returned, before `inc-lease`), then `Present` (the will goes out:
-//! `hi`, the highest incarnation ever presented, moves) or `Kill` (the process dies
-//! between the take and the will). `OldAttach` is an older build's attach on the
-//! same dir: `inc + 1`, flushed, presented.
-//!
-//! Invariants. `LeaseDurable`: a lease this boot wrote names a top the media holds.
-//! `Durable`: every presented incarnation is at or below the media's `inc`.
-//! `Fence`: no attach ever presents an incarnation that was presented before
-//! (`dup`), the property the will fence and the sequence space rest on.
-//!
-//! `Buggy`, one defect each, each the real code's mutant of the same number
-//! (`IncSeam::mutant`) except 4: 1 a lease trusted across boots · 2 a lease trusted
-//! whose top is not `inc`'s · 3 `inc-lease` written before its top is flushed ·
-//! 4 the will sent while the flush is in flight (the overlap the cost study proposed:
-//! `inc`'s media value does not move with the take).
-//!
-//! The lease also names the `inc` FILE its top was flushed into (`IncFile`), so a
-//! copy of the state dir, whose `inc` nobody flushed, trusts no lease. This model is
-//! one dir, whose `inc` is always the file every lease was flushed into, so it leaves
-//! the file out; the copy is `state.rs`'s own test
-//! (`a_copied_state_dir_flushes_its_own_inc_before_trusting_a_lease`), as is the
-//! doctor's incarnation, which takes none and never names a lease's top
-//! (`the_doctor_never_answers_a_lost_leases_unused_top`).
-//!
-//! Tier-0 is `tests/derived_incarnation_lease.rs`; Tier-1
-//! (`aterm-link/src/state.rs`, `the_incarnation_lease_refines_its_model`) runs the
-//! real `take_incarnation` from every planned state this model reaches, killed at
-//! each step, and requires the files it leaves to be the model's successor.
+//! Incarnation lease model across kills, power losses, and write-backs.
 
 use aterm_spec::derive::Model;
 
-/// The incarnation lease across kills, power losses, write-backs and an older
-/// build's attach (module doc). `Span` is the lease a flush covers (`INC_LEASE` is
-/// 64; 2 runs a lease out inside the bound), `MaxTop` bounds the incarnations,
-/// `MaxBoot` the power losses.
+/// Build the incarnation lease model across kills, power losses, and write-backs.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn incarnation_lease_model() -> Model {

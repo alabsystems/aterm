@@ -2,60 +2,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The ring's out-of-line extras, and the byte budget on the OSC 8 payload that
-//! uncompressed history holds.
-//!
-//! A row scrolling off the screen takes its extras with it
-//! (`Grid::extract_row_extras_into`), and every OSC 8 span carries a URL of up
-//! to 8 KiB. The live extras map caps links at `MAX_HYPERLINK_ENTRIES` and the
-//! tiered store weighs them against its memory budget, but the ring and the
-//! lazy buffer's staged rows hold rows uncompressed and are sized in lines: a
-//! distinct 8 KiB link per cell costs 0.63 MiB a row.
-//!
-//! So both holders keep running sums of what their extras retain (reported by
-//! `Grid::memory_used`), and the OSC 8 share is held to
-//! [`Grid::history_link_budget`]: past it the oldest rows lose their links and
-//! keep their text, as `CellExtras::enforce_hyperlink_limit` does for the live
-//! map. The sums live in the containers ([`RingExtras`] here, `LazyBuffer` for
-//! the staged rows) so no push or pop site can forget them.
+//! Ring-history out-of-line row extras and uncompressed OSC 8 hyperlink byte budget.
 
 use std::collections::VecDeque;
 
 use super::{Grid, ScrolledRowExtras};
 
-/// One ring slot: `None` for a row with no extras (the common plain-text row),
-/// never `Some` of an empty box.
+/// Ring history slot (`None` for rows without out-of-line extras).
 pub(crate) type RingSlot = Option<Box<ScrolledRowExtras>>;
 
 /// The fraction of the scrollback memory budget that OSC 8 payload in
 /// uncompressed history (ring + staged rows) may use: a quarter.
-///
-/// It follows the memory budget (what the GUI's pressure shed and aggregate cap
-/// lower) because these rows are headed for the store it governs. A quarter
-/// keeps the total within 1.25 × the budget plus the ring's fixed cells, and at
-/// the 100 MB default still keeps a 2 KiB link on every row of the GUI's
-/// largest ring (10,000 lines). Not the store's headroom: a store at its budget
-/// would then strip the newest history's links while older compressed rows
-/// kept theirs.
 const HISTORY_LINK_BUDGET_DIVISOR: usize = 4;
 
 /// [`RingSlot`]'s out-of-line bytes: `(retained, links)`, as
 /// [`ScrolledRowExtras::retained_memory_used`] and
-/// [`ScrolledRowExtras::link_bytes`] count them. Fixed while the slot sits in
-/// the ring: nothing mutates a held box except [`RingExtras::strip_oldest_links`].
+/// [`ScrolledRowExtras::link_bytes`] count them.
 #[inline]
 fn slot_bytes(slot: &RingSlot) -> (usize, usize) {
     slot.as_deref()
         .map_or((0, 0), |e| (e.retained_memory_used(), e.link_bytes()))
 }
 
-/// The ring's per-row extras (index 0 = oldest ring history row), with running
-/// sums of what they retain.
-///
-/// A `VecDeque<RingSlot>` whose every mutation goes through a method that keeps
-/// [`retained_bytes`](Self::retained_bytes) and
-/// [`link_bytes`](Self::link_bytes) exact, so the accounting cannot drift from
-/// the rows at any of the scroll, reflow, unscroll or erase sites.
+/// Per-row out-of-line extras for the scrollback ring with running byte totals.
 #[derive(Debug, Default)]
 pub(crate) struct RingExtras {
     slots: VecDeque<RingSlot>,
@@ -65,50 +34,48 @@ pub(crate) struct RingExtras {
     links: usize,
     /// `slots[..linkless_front]` hold no link bytes: where the next
     /// [`strip_oldest_links`](Self::strip_oldest_links) resumes, so a flood
-    /// visits each row once. Every removal from the front shifts it down with
-    /// the rows; an insertion at or before it pulls it back to the insertion.
+    /// visits each row once.
     linkless_front: usize,
 }
 
 impl RingExtras {
-    /// An empty ring.
+    /// Creates an empty [`RingExtras`].
     #[inline]
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    /// Number of slots.
+    /// Returns the number of slots.
     #[inline]
     pub(crate) fn len(&self) -> usize {
         self.slots.len()
     }
 
-    /// Whether no slot is held.
+    /// Returns whether the ring holds no slots.
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
 
-    /// The slot deque's capacity, in slots (its spine is heap too).
+    /// Returns the underlying deque capacity in slots.
     #[inline]
     pub(crate) fn capacity(&self) -> usize {
         self.slots.capacity()
     }
 
-    /// The extras of ring history row `idx`, `None` for a row without any.
+    /// Returns the extras for ring history row `idx`, if any.
     #[inline]
     pub(crate) fn get(&self, idx: usize) -> Option<&ScrolledRowExtras> {
         self.slots.get(idx).and_then(|slot| slot.as_deref())
     }
 
-    /// Out-of-line bytes the slots retain (boxes, vectors, strings, image
-    /// shares), O(1).
+    /// Returns total out-of-line bytes retained by all slots.
     #[inline]
     pub(crate) const fn retained_bytes(&self) -> usize {
         self.retained
     }
 
-    /// The OSC 8 share of [`retained_bytes`](Self::retained_bytes), O(1).
+    /// Returns total OSC 8 hyperlink bytes retained by all slots.
     #[inline]
     pub(crate) const fn link_bytes(&self) -> usize {
         self.links
@@ -128,8 +95,7 @@ impl RingExtras {
         self.links -= links;
     }
 
-    /// Append the newest ring row's slot. A `Some` box must not be empty (the
-    /// `None ⟺ empty` encoding the materializers rely on).
+    /// Appends the newest ring row's slot.
     #[inline]
     pub(crate) fn push_back(&mut self, slot: RingSlot) {
         debug_assert!(
@@ -140,13 +106,13 @@ impl RingExtras {
         self.slots.push_back(slot);
     }
 
-    /// Append freshly extracted extras, boxing them only when non-empty.
+    /// Appends freshly extracted row extras, boxing only when non-empty.
     #[inline]
     pub(crate) fn push_extracted(&mut self, extracted: ScrolledRowExtras) {
         self.push_back((!extracted.is_empty()).then(|| Box::new(extracted)));
     }
 
-    /// Remove the oldest slot; `None` when the ring is empty.
+    /// Removes and returns the oldest slot.
     #[inline]
     pub(crate) fn pop_front(&mut self) -> Option<RingSlot> {
         let slot = self.slots.pop_front()?;
@@ -155,7 +121,7 @@ impl RingExtras {
         Some(slot)
     }
 
-    /// Remove the newest slot; `None` when the ring is empty.
+    /// Removes and returns the newest slot.
     #[inline]
     pub(crate) fn pop_back(&mut self) -> Option<RingSlot> {
         let slot = self.slots.pop_back()?;
@@ -164,21 +130,21 @@ impl RingExtras {
         Some(slot)
     }
 
-    /// Insert `slot` at `idx` (0 = oldest).
+    /// Inserts `slot` at `idx` (`0` = oldest).
     pub(crate) fn insert(&mut self, idx: usize, slot: RingSlot) {
         self.charge(&slot);
         self.slots.insert(idx, slot);
         self.linkless_front = self.linkless_front.min(idx);
     }
 
-    /// Append `slots` in order, newest last.
+    /// Appends `slots` in order, newest last.
     pub(crate) fn extend(&mut self, slots: impl IntoIterator<Item = RingSlot>) {
         for slot in slots {
             self.push_back(slot);
         }
     }
 
-    /// Drop every slot.
+    /// Removes all slots and resets byte counters.
     #[inline]
     pub(crate) fn clear(&mut self) {
         self.slots.clear();
@@ -187,9 +153,7 @@ impl RingExtras {
         self.linkless_front = 0;
     }
 
-    /// Strip the links of the oldest rows that hold any until at least `want`
-    /// link bytes are freed or none are left; returns the bytes freed. Text,
-    /// colours and images stay. A slot left empty becomes `None`.
+    /// Strips hyperlinks from the oldest rows until at least `want` link bytes are freed.
     pub(crate) fn strip_oldest_links(&mut self, want: usize) -> usize {
         let mut freed = 0;
         while freed < want && self.linkless_front < self.slots.len() {
@@ -218,8 +182,7 @@ impl RingExtras {
         freed
     }
 
-    /// Test-only: the running sums equal a fresh walk of the slots, and the
-    /// strip cursor's prefix holds no link.
+    /// Asserts that running byte sums match a fresh scan of all slots.
     #[cfg(test)]
     pub(crate) fn assert_running_sums(&self) {
         let (retained, links) = self
@@ -245,14 +208,7 @@ impl RingExtras {
 }
 
 impl Grid {
-    /// OSC 8 payload held in uncompressed history: the ring's rows plus the
-    /// lazy buffer's staged rows, as [`ScrolledRowExtras::link_bytes`] counts
-    /// it (each span's URL and id, an upper bound for a link that covers
-    /// several rows). O(1). Bounded by
-    /// [`history_link_budget`](Self::history_link_budget) after every scroll.
-    ///
-    /// The tiered store's own rows are not included: it weighs their links in
-    /// its budgeted bytes.
+    /// Returns total OSC 8 hyperlink bytes held in uncompressed history (ring + staged rows).
     #[must_use]
     #[inline]
     pub const fn history_link_bytes(&self) -> usize {
@@ -262,10 +218,7 @@ impl Grid {
             .saturating_add(self.storage.lazy_buffer.link_bytes())
     }
 
-    /// The byte allowance for [`history_link_bytes`](Self::history_link_bytes):
-    /// a quarter of the effective scrollback memory budget (a deferred one
-    /// while the store is detached for a reflow), or of the default store's
-    /// budget on a ring-only grid. See [`HISTORY_LINK_BUDGET_DIVISOR`].
+    /// Returns the byte budget for [`Self::history_link_bytes`].
     #[must_use]
     #[inline]
     pub fn history_link_budget(&self) -> usize {
@@ -275,11 +228,7 @@ impl Grid {
             / HISTORY_LINK_BUDGET_DIVISOR
     }
 
-    /// Hold [`history_link_bytes`](Self::history_link_bytes) to its budget:
-    /// O(1) while under it. Called after every scroll into history (the only
-    /// unbounded growth path; every other entry re-homes rows already counted,
-    /// or at most a screen the live map's cap bounds) and whenever the budget
-    /// is set, which is how the pressure shed reaches it.
+    /// Strips oldest history hyperlinks when [`Self::history_link_bytes`] exceeds its budget.
     #[inline]
     pub(crate) fn enforce_history_link_budget(&mut self) {
         let used = self.history_link_bytes();
@@ -295,11 +244,6 @@ impl Grid {
     /// The over-budget path: strip links oldest row first (staged rows are
     /// older than ring rows) down to three quarters of the budget, so a flood
     /// re-enters this once per quarter-budget of new links, not on every row.
-    ///
-    /// `content_gen` moves so the viewport memo cannot serve a row with the
-    /// links it lost. The screen is damaged only while scrolled back: at the
-    /// live bottom no history shows, and the calling scroll paths mark their
-    /// own rows (the top-anchored one must not mark its protected footer).
     #[cold]
     #[inline(never)]
     fn strip_history_links(&mut self, used: usize, budget: usize) {

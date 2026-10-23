@@ -2,29 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! The warm-up: a deliberate pre-prompt at a moment a human is at the screen.
-//!
-//! Two callers start a pass: the owner's *Ask for folder access now* on the Security panel and
-//! the window's launch pass (`crate::consent_launch`, `[privacy] warmup = "automatic"`), which
-//! walks at a quiet moment while Full Disk Access reads off once the launch hand-over was left
-//! without action. Either way a detached worker lists each configured folder in sequence (because
-//! simultaneous system modals stack badly) and records what the filesystem said: `Ok`, `EPERM(1)`
-//! or another errno. aterm renders, asks and answers nothing: it makes an ordinary file access at
-//! a moment a human is at the screen, so macOS asks its question then rather than inside an
-//! agent's blocked syscall.
-//!
-//! `tccd` holds the calling syscall until a human answers the dialog, with no timeout, `EINTR` or
-//! cancel, so a worker in [`std::fs::read_dir`] can stay parked for the life of the process. The
-//! worker is therefore spawned detached and its `JoinHandle` dropped on the spot, making an
-//! event-loop join structurally impossible. Results return over a bounded channel the producer
-//! `try_send`s into and drops on `Full`, plus a payload-free event-loop poke; the channel's
-//! `Disconnected` edge is the authoritative end-of-pass signal.
-//!
-//! The folders arrive resolved from `aterm_containment::consent::folder_paths`; this file writes
-//! no protected-folder path literal (the aterm-census guard `protected-folder`).
-//!
-//! Default `warmup = "automatic"` (`"on-request"` keeps only the Security panel's gesture,
-//! `"never"` neither); there is no environment variable, no `VERBS` row and no dispatch arm, so
-//! no session can trigger a consent-raising pass.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
@@ -34,17 +11,10 @@ use std::time::{Duration, Instant};
 use aterm_containment::consent;
 use aterm_containment::consent::Folder;
 
-/// Bound on the warm-up result queue. A pass posts at most `2n + 1` messages for its `n`
-/// de-duplicated folders (`n <= Folder::ALL.len()`), so the bound is never reached; it exists
-/// because the worker must not block on its output. Overflow drops, never coalesces: the
-/// pass's final message repairs a dropped one, and the channel's `Disconnected` edge a
-/// dropped final message.
+/// Bound on the warm-up result queue.
 const RESULT_QUEUE_CAP: usize = 16;
 
-// The pure fold: what one directory listing means
-
-/// What one folder's listing attempt returned. `Failed` carries the raw errno: only
-/// [`fold_read_dir`] decides what it means.
+/// What one folder's listing attempt returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReadDirOutcome {
     /// The directory listed (an entry read, or empty): the access was permitted.
@@ -53,35 +23,30 @@ pub(crate) enum ReadDirOutcome {
     /// The listing failed with this raw errno.
     #[cfg(any(target_os = "macos", test))]
     Failed(i32),
-    /// The probe was not performed: a headless instance, a unit test, an executable outside a
-    /// `.app`, or off macOS. Never rendered as a denial.
+    /// The probe was not performed: a headless instance, a unit test, an executable outside a `.app`, or off macOS.
     Refused,
 }
 
-/// One folder's state on the Security panel. `Unknown` is what a folder reads before
-/// anything asked, and again in a successor process.
+/// One folder's state on the Security panel.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum WarmupRow {
     /// Nothing has been asked about this folder in this process.
     #[default]
     Unknown,
-    /// The worker is inside this folder's listing syscall, perhaps parked behind a system
-    /// dialog with no timeout, so the row can stay here indefinitely.
+    /// The worker is inside this folder's listing syscall, perhaps parked behind a system dialog with no timeout, so the row can stay here indefinitely.
     Asking,
     /// The listing succeeded from this process.
     #[cfg(any(target_os = "macos", test))]
     Allowed,
     /// `EPERM(1)` — the TCC refusal. macOS is not asking again for this folder.
     Denied,
-    /// Some other errno. Not a consent verdict; the folder may not exist, or
-    /// the volume may be gone.
+    /// Some other errno.
     #[cfg(any(target_os = "macos", test))]
     Error,
 }
 
 impl WarmupRow {
-    /// The report spelling, which is also the panel spelling: the `privacy`
-    /// verb's folder rows read it.
+    /// The report spelling, which is also the panel spelling: the `privacy` verb's folder rows read it.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Unknown => "unknown",
@@ -95,16 +60,8 @@ impl WarmupRow {
     }
 }
 
-/// What one listing means for a folder's row: the one place the mapping lives, so a test
-/// can drive it.
-///
-/// A TCC refusal is `EPERM`; `EACCES` is an ordinary Unix permission problem and reads as
-/// `Error`, so a `chmod` is never reported as a privacy denial (design §1.5). `ENOENT`
-/// depends on the item ([`Folder::absent_means_allowed`]): a missing home folder is `Error`,
-/// but being told the app-data item's container is absent proves the look was permitted,
-/// since `tccd` decides before the lookup can report a missing name.
+/// What one listing means for a folder's row: the one place the mapping lives, so a test can drive it.
 pub(crate) const fn fold_read_dir(folder: Folder, outcome: ReadDirOutcome) -> WarmupRow {
-    // Off macOS every answer is `Refused`, whichever folder asked.
     #[cfg(not(any(target_os = "macos", test)))]
     let _ = folder;
     match outcome {
@@ -122,18 +79,7 @@ pub(crate) const fn fold_read_dir(folder: Folder, outcome: ReadDirOutcome) -> Wa
     }
 }
 
-// The injected listing probe
-
-/// The one OS question this module asks, injected like every consent probe
-/// (`control_privacy::ConsentProbes`).
-///
-/// * [`WarmupProbe::live`]: a windowed instance; a real directory listing.
-/// * [`WarmupProbe::inert`]: a headless instance and every unit test; answers
-///   [`ReadDirOutcome::Refused`] without a syscall.
-///
-/// The live arm also re-checks the in-bundle guard on every call, a deliberate second gate
-/// as in `aterm_containment::consent`: a test binary that touches `WindowServer` can make
-/// `tccd` read its whole `target/debug/deps`.
+/// The one OS question this module asks, injected like every consent probe (`control_privacy::ConsentProbes`).
 #[derive(Clone, Copy)]
 pub(crate) struct WarmupProbe {
     /// Lists one already-resolved directory. May park indefinitely.
@@ -181,11 +127,6 @@ fn inert_read_dir(_path: &Path) -> ReadDirOutcome {
 }
 
 /// The live arm: one listing of an already-resolved path.
-///
-/// It re-applies the in-bundle guard first (design §3.3 guardrail 1), so a test binary that
-/// acquired the live arm still cannot park a system modal. It reads the first entry because
-/// the refusal surfaces at the first `readdir`, not at `opendir`; an empty directory reads
-/// as `Listed`.
 #[cfg(target_os = "macos")]
 fn live_read_dir(path: &Path) -> ReadDirOutcome {
     let Ok(exe) = std::env::current_exe() else {
@@ -209,16 +150,10 @@ fn live_read_dir(_path: &Path) -> ReadDirOutcome {
     ReadDirOutcome::Refused
 }
 
-// Worker → main-thread messages
-
 /// One message from a warm-up worker.
-///
-/// Every variant carries the pass `generation` so a message from a worker this
-/// instance has already retired cannot rewrite a newer pass's rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum WarmupProgress {
-    /// The worker is about to enter the listing syscall for this folder. Posted before the
-    /// call, which may never return.
+    /// The worker is about to enter the listing syscall for this folder.
     Asking { generation: u64, folder: Folder },
     /// One folder answered.
     Answered {
@@ -226,9 +161,7 @@ pub(crate) enum WarmupProgress {
         folder: Folder,
         outcome: ReadDirOutcome,
     },
-    /// The pass walked every folder and the worker is exiting. Carries the
-    /// whole pass's answers, so one dropped [`Self::Answered`] cannot leave a
-    /// row stuck at [`WarmupRow::Asking`].
+    /// The pass walked every folder and the worker is exiting.
     Finished {
         generation: u64,
         elapsed_ms: u128,
@@ -241,22 +174,18 @@ pub(crate) enum WarmupProgress {
 pub(crate) enum StartOutcome {
     /// A worker was spawned and the apply hold is armed.
     Started,
-    /// A worker is already walking. A deliberate no-op: a second worker would stack a second
-    /// system modal behind the first.
+    /// A worker is already walking.
     AlreadyLive,
-    /// `[privacy] enabled = false`, `warmup = "never"`, or a headless instance. Nothing was
-    /// asked.
+    /// `[privacy] enabled = false`, `warmup = "never"`, or a headless instance.
     Refused,
-    /// No configured folder name resolved to a path — every name was unknown,
-    /// or `$HOME` is unset.
+    /// No configured folder name resolved to a path — every name was unknown, or `$HOME` is unset.
     NoFolders,
-    /// The OS refused the thread. Nothing was started.
+    /// The OS refused the thread.
     SpawnFailed,
 }
 
 impl StartOutcome {
-    /// Why a confirmed press started nothing, in the owner's words — `None`
-    /// when a worker is walking, this press's or one already out.
+    /// Why a confirmed press started nothing, in the owner's words — `None` when a worker is walking, this press's or one already out.
     pub(crate) const fn refusal(self) -> Option<&'static str> {
         match self {
             Self::Started | Self::AlreadyLive => None,
@@ -273,8 +202,6 @@ impl StartOutcome {
     }
 }
 
-// The instance's warm-up state
-
 /// The live pass's bookkeeping.
 #[derive(Clone, Copy, Debug)]
 struct LivePass {
@@ -287,12 +214,6 @@ struct LivePass {
 }
 
 /// The instance's warm-up state: the rows, the live pass and the result queue's receiving end.
-///
-/// Instance-owned, with NO process-global anywhere in this module. That is
-/// what makes §3.5's successor rule structural rather than a cleanup step: an
-/// in-place apply builds a fresh `App`, which builds a fresh `WarmupState`, so
-/// every row is `unknown` again and nothing claims anything about a modal that
-/// may still be on the screen.
 pub(crate) struct WarmupState {
     /// This instance's listing arm.
     probe: WarmupProbe,
@@ -326,8 +247,7 @@ impl WarmupState {
         Self::new(true)
     }
 
-    /// An instance whose worker answers every folder with `read_dir`: a stand-in that
-    /// reaches no filesystem, for the window's tests.
+    /// An instance whose worker answers every folder with `read_dir`: a stand-in that reaches no filesystem, for the window's tests.
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn with_read_dir_for_test(read_dir: fn(&Path) -> ReadDirOutcome) -> Self {
         let mut state = Self::inert();
@@ -344,10 +264,7 @@ impl WarmupState {
         self.probe.is_live()
     }
 
-    /// Start one pass over `folders`, already-resolved paths. `hold_cap` is
-    /// `[privacy] warmup_hold_ms`, already clamped; `poke`, the event-loop wake, runs after every
-    /// queued message. A second call while a pass is live returns [`StartOutcome::AlreadyLive`]
-    /// and changes nothing.
+    /// Start one pass over `folders`, already-resolved paths.
     pub(crate) fn start<P>(
         &mut self,
         folders: &[(Folder, PathBuf)],
@@ -357,8 +274,6 @@ impl WarmupState {
     where
         P: Fn() + Send + 'static,
     {
-        // Drain first: a pass that finished while nothing was looking must not
-        // make the next gesture a no-op.
         self.drain();
         if self.live.is_some() {
             return StartOutcome::AlreadyLive;
@@ -373,8 +288,6 @@ impl WarmupState {
         let spawned = std::thread::Builder::new()
             .name("consent-warmup".into())
             .spawn(move || run_pass(generation, &walk, probe, &tx, &poke));
-        // Detached on purpose: the handle is never stored, so nothing can join a thread that may
-        // be parked in `tccd` with no timeout.
         match spawned {
             Ok(_handle) => {}
             Err(err) => {
@@ -393,9 +306,7 @@ impl WarmupState {
         StartOutcome::Started
     }
 
-    /// Fold every queued message into the rows; returns how many were applied. `Disconnected`
-    /// (the worker exited, dropping its sender) ends the pass, and a full queue cannot drop it,
-    /// so a pass ends even if every message it sent was lost.
+    /// Fold every queued message into the rows; returns how many were applied.
     pub(crate) fn drain(&mut self) -> usize {
         let mut applied = 0usize;
         loop {
@@ -447,8 +358,7 @@ impl WarmupState {
         true
     }
 
-    /// Retire the live pass. A row still `asking` becomes `unknown`: nobody learned the answer,
-    /// which is not a denial.
+    /// Retire the live pass.
     fn end_pass(&mut self) {
         self.live = None;
         self.rx = None;
@@ -474,8 +384,7 @@ impl WarmupState {
         self.generation
     }
 
-    /// Whether a pass is walking right now. Not drained — call [`Self::drain`]
-    /// first when the answer must be fresh.
+    /// Whether a pass is walking right now.
     pub(crate) const fn is_live(&self) -> bool {
         self.live.is_some()
     }
@@ -485,14 +394,12 @@ impl WarmupState {
         &self.rows
     }
 
-    /// Wall time of the last completed pass, for the `privacy` verb's
-    /// `warmup_last_ms=`.
+    /// Wall time of the last completed pass, for the `privacy` verb's `warmup_last_ms=`.
     pub(crate) const fn last_pass_ms(&self) -> Option<u128> {
         self.last_pass_ms
     }
 
-    /// Arm a hold with no worker behind it, so a unit test can drive the automatic-apply gate
-    /// without spawning anything.
+    /// Arm a hold with no worker behind it, so a unit test can drive the automatic-apply gate without spawning anything.
     #[cfg(all(test, unix))]
     pub(crate) fn arm_hold_for_test(&mut self, started_at: Instant, hold_cap: Duration) {
         self.generation = self.generation.wrapping_add(1);
@@ -503,14 +410,7 @@ impl WarmupState {
         });
     }
 
-    /// The in-place-apply hold (design §3.5): true while a warm-up worker is live and the hold has
-    /// not reached its cap. Read only on the automatic lanes, as its own ladder fact
-    /// (`App::update_apply_warmup_holds`) that no phase relaxes, so the last phase cannot land on
-    /// top of the dialog; a manual `aterm ctl update apply` is never held.
-    ///
-    /// It is not "defer while agents are live" (design §3.9 refuses that: one long-lived session
-    /// would pin an old build). The cap also makes a missed drain harmless: a pass whose messages
-    /// were never folded still stops holding at the cap.
+    /// The in-place-apply hold (design §3.5): true while a warm-up worker is live and the hold has not reached its cap.
     pub(crate) fn holds_automatic_apply(&self, now: Instant) -> bool {
         self.live
             .is_some_and(|live| hold_active(live.started_at, live.hold_cap, now))
@@ -535,17 +435,13 @@ impl std::fmt::Debug for WarmupState {
     }
 }
 
-// Pure helpers
-
-/// Whether a hold armed at `started_at` with cap `hold_cap` is still active at
-/// `now`. Saturating, so a clock that went backwards holds rather than panics,
-/// and a zero cap never holds at all.
+/// Whether a hold armed at `started_at` with cap `hold_cap` is still active at `now`.
 pub(crate) fn hold_active(started_at: Instant, hold_cap: Duration, now: Instant) -> bool {
     now.saturating_duration_since(started_at) < hold_cap
 }
 
 /// The walk list: the configured pairs with repeats removed (a repeat would raise the same
-/// dialog twice), order preserved. This is what bounds a pass under [`RESULT_QUEUE_CAP`].
+/// dialog twice), order preserved.
 fn dedup_folders(folders: &[(Folder, PathBuf)]) -> Vec<(Folder, PathBuf)> {
     let mut seen: Vec<Folder> = Vec::new();
     let mut walk: Vec<(Folder, PathBuf)> = Vec::new();
@@ -567,8 +463,6 @@ fn folders_to_unknown_rows(folders: &[(Folder, PathBuf)]) -> Vec<(Folder, Warmup
         .collect()
 }
 
-// The worker
-
 /// Queue one message, dropped when the queue is full (never block, never coalesce), and poke
 /// the event loop either way: the drain discovers the messages and, at the end, the disconnect.
 fn post(tx: &SyncSender<WarmupProgress>, poke: &(impl Fn() + ?Sized), message: WarmupProgress) {
@@ -581,8 +475,7 @@ fn post(tx: &SyncSender<WarmupProgress>, poke: &(impl Fn() + ?Sized), message: W
     poke();
 }
 
-/// Walk the folders in sequence. Each listing may park indefinitely behind a system dialog,
-/// so this runs on a detached thread nothing joins.
+/// Walk the folders in sequence.
 fn run_pass(
     generation: u64,
     walk: &[(Folder, PathBuf)],
@@ -601,7 +494,6 @@ fn run_pass(
                 folder: *folder,
             },
         );
-        // `tccd` holds this call until a person answers; no timeout is possible.
         let outcome = (probe.read_dir)(path);
         answers.push((*folder, outcome));
         post(
@@ -733,7 +625,6 @@ mod tests {
                 (Folder::Documents, WarmupRow::Unknown)
             ]
         );
-        // A pass's `2n + 1` messages fit the queue.
         assert!(2 * Folder::ALL.len() < RESULT_QUEUE_CAP);
     }
 
@@ -802,7 +693,6 @@ mod tests {
             generation: 3,
             folder: Folder::Documents,
         });
-        // Its `Answered` was dropped; `Finished` carries the whole pass.
         assert!(state.apply(WarmupProgress::Finished {
             generation: 3,
             elapsed_ms: 42,
@@ -839,7 +729,6 @@ mod tests {
             !hold_active(started, Duration::ZERO, started),
             "a zero cap never holds"
         );
-        // A clock that went backwards holds rather than panics.
         assert!(hold_active(started, cap, started - Duration::from_secs(5)));
     }
 
@@ -851,18 +740,12 @@ mod tests {
         assert!(state.holds_automatic_apply(started));
         assert!(!state.holds_automatic_apply(started + cap));
         assert!(!state.holds_automatic_apply(started + cap + Duration::from_secs(600)));
-        // A pass that ended holds nothing.
         state.end_pass();
         assert!(!state.holds_automatic_apply(started));
     }
 
     #[test]
     fn a_successor_starts_with_no_rows_no_hold_and_no_claim() {
-        // An in-place apply builds a fresh process, a fresh `App` and so a fresh
-        // `WarmupState`. Nothing is carried over — including any claim about a
-        // modal that may still be on the screen (§3.5, §7 S12). The other half
-        // of the successor rule, the empty Full Disk Access probe cache, is
-        // `consent_state::ConsentState`'s and is asserted there.
         let successor = WarmupState::default();
         assert!(!successor.is_live());
         assert!(successor.rows().is_empty());
@@ -959,7 +842,6 @@ mod tests {
             pokes.load(Ordering::Acquire) >= 1,
             "the worker must poke the event loop"
         );
-        // The next gesture is free again.
         assert_eq!(
             state.start(&folders, Duration::from_millis(120_000), || {}),
             StartOutcome::Started

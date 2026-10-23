@@ -84,15 +84,20 @@ pub(crate) fn checksum(kind: Kind, lengths: &[u8], payload: &[u8]) -> u64 {
 pub(crate) const PLACES: u64 = RUN_CAP / HEAD as u64;
 
 /// What every place is mixed with before it is folded into a sum: the
+/// format-2 magic's own word, so no place's word is 0 (the word a format-1
+/// sum would carry).
 const PLACE_SALT: u64 = u64::from_le_bytes(Format::Two.magic());
 
 /// MurmurHash3's 64-bit finalizer's two multipliers, and their inverses
+/// modulo 2^64.
 const FMIX_1: u64 = 0xff51_afd7_ed55_8ccd;
 const FMIX_2: u64 = 0xc4ce_b9fe_1a85_ec53;
 const FMIX_1_INV: u64 = inverse(FMIX_1);
 const FMIX_2_INV: u64 = inverse(FMIX_2);
 
 /// The inverse of an odd `k` modulo 2^64, by Newton's iteration: each step
+/// doubles the low bits that are right, from the three `k` itself gets right
+/// (an odd square is 1 modulo 8), so five steps make 96 of them.
 const fn inverse(k: u64) -> u64 {
     let mut x = k;
     let mut step = 0;
@@ -147,7 +152,7 @@ pub(crate) fn framed(format: Format, kind: Kind, place: u64, raw: &[u8]) -> Vec<
     out
 }
 
-/// A length as a frame's head holds it. Every frame's raw is at most
+/// A length as a frame's head holds it.
 fn u32_of(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
@@ -329,6 +334,7 @@ impl TapeWriter {
     }
 
     /// Write the open frame, if it holds anything — or, past the cap, the
+    /// truncation mark in its place.
     fn close(&mut self) {
         if self.open.is_empty() || self.stopped.is_some() {
             return;
@@ -344,6 +350,7 @@ impl TapeWriter {
     }
 
     /// The cap: write [`Mark::Truncated`] at `door`, the first effect not
+    /// kept, alone in its frame, and stop.
     fn truncate(&mut self, door: u64) {
         self.open.clear();
         let mut raw = Vec::new();
@@ -373,7 +380,7 @@ impl TapeWriter {
         }
     }
 
-    /// A write that failed: said once, and the writer stops. A disk out of
+    /// A write that failed: said once, and the writer stops.
     fn fail(&mut self, e: &std::io::Error, what: &str) {
         self.stopped = Some(Stopped::Failed);
         if crate::harness::disk::poke::is_out_of_space(e) {
@@ -393,6 +400,8 @@ impl TapeWriter {
 
 impl Drop for TapeWriter {
     /// What was appended reaches the file even when its owner never wrote
+    /// the end: the tape then ends without an `End`, which a replay reads as
+    /// a run that stopped there.
     fn drop(&mut self) {
         self.close();
     }

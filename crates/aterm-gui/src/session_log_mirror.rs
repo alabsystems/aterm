@@ -24,16 +24,23 @@ pub(crate) const TOMBSTONES_MAX: usize = 4096;
 pub(crate) const LANDED_PAIRS_MAX: usize = aterm_slog::TAKE_MAX;
 
 /// What either verb answers a bridge whose recorded `hello` did not ask for
+/// the mirror: a definite refusal (the bridge stops its mirror, said in
+/// `fabric status`), never a take or a landing.
 const MIRROR_OFF: &str = "ERR mirror off: the bridge's recorded hello did not say log=turns\n";
 
 /// THE MIRROR'S STATE EVERY SESSION LOG OF THE STORE READS, under its own timeline lock ([`sync`]): whether the node mirrors, and the bus log's generation.
 #[derive(Debug, Default)]
 pub(crate) struct Shared {
     /// The node mirrors: a recorded `hello … log=turns` set it (sticky across
+    /// the bridge's restarts), a recorded hello without `log=` or an `auto`
+    /// bridge's `link mirror unretained` cleared it
+    /// (`fabric::bridge_mirror_word`).
     served: AtomicBool,
     /// Bumped each time the bus log is replaced (`link log` `forgot=1`).
     generation: AtomicU64,
     /// Some log of the store has held a mirror cursor in this process (seen
+    /// at its [`sync`], or at its [`StoreMirror::retire`]), or a
+    /// predecessor's tombstone was adopted: sticky.
     cursors: AtomicBool,
 }
 
@@ -134,12 +141,15 @@ struct Retired {
     bytes: usize,
     tombstones: VecDeque<Tombstone>,
     /// What the last handoff manifest drew: each sid and its landed `ms`
+    /// ([`StoreMirror::past_draw`]).
     #[cfg(any(unix, test))]
     drawn: Vec<(String, u64)>,
 }
 
 impl Retired {
     /// A tail as a tombstone: its cursor and its LIVE `ms` head (a closed
+    /// session's records past a fence are owed too, and no successor numbers
+    /// them again).
     fn tomb_of(tail: &Tail) -> Option<Tombstone> {
         let landed = tail.log.mirror_landed()?;
         let ms_head = tail.log.ms_head();
@@ -194,13 +204,20 @@ pub(crate) enum Broken {
 #[derive(Default)]
 pub(crate) struct StoreMirror {
     /// Whether the node mirrors, and the bus log's generation: every session
+    /// log of the store holds it ([`crate::session_log::SessionLog::bind_mirror`]).
     shared: Arc<Shared>,
     retired: Mutex<Retired>,
     /// A seamless successor has not yet registered every handed-off session:
+    /// a sid this store does not hold may still arrive.
     adopting: AtomicBool,
     /// An update's Commit is reading the draw ([`Self::past_draw`]): no
+    /// closed session's tail lands from then on, as no live one does under
+    /// the readers' fence; lifted when the update stands down.
     committing: AtomicBool,
     /// One past the bus log's generation the last handoff manifest drew
+    /// under ([`Self::draw_tombstones`]), 0 before any draw: an atomic, so a
+    /// draw on a store that never mirrored takes no lock, and a cursor its
+    /// export meets after it is still judged against it.
     #[cfg(any(unix, test))]
     drawn_gen: AtomicU64,
     /// The local id the last take started after.
@@ -209,6 +226,7 @@ pub(crate) struct StoreMirror {
     #[cfg(test)]
     broken: Mutex<Broken>,
     /// What a test runs inside `log-landed`, between the store's read guard
+    /// and the tails' lock (a Commit's reading that races the landing).
     #[cfg(test)]
     before_landing: Mutex<Option<LandingHook>>,
     /// One interleaving before ownership is acquired, after initial admission.

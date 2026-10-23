@@ -153,6 +153,7 @@ fn is_snooze_names_exactly_the_snoozes() {
             word: UpgradeWord::Now,
         },
         Intent::EndRecovered,
+        Intent::ReviewVaultSync,
     ];
     for a in &actions {
         assert!(!a.is_snooze(), "{a:?}");

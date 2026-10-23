@@ -2,36 +2,14 @@
 // Copyright 2026 Andrew Yates
 
 //! EDR ("HDR glow") present math.
-//!
-//! With `hdr_glow` on and an `Rgba16Float` extended-linear-sRGB swapchain, the GPU present
-//! blit decodes the offscreen's sRGB bytes to linear light (the grid stays reference-white
-//! SDR), and a second additive pass re-emits the cursor-aurora quads above 1.0, bounded by the
-//! screen's EDR headroom (`NSScreen.maximumExtendedDynamicRangeColorComponentValue`). This
-//! module is the pure half: every clamp and encode the shader performs has its float twin
-//! here, so both laws are checkable without a GPU.
-//!
-//! * **Grid clamp law**: the non-additive (blit) stream never exceeds 1.0; [`hdr_grid_encode`]
-//!   maps every byte into `[0, 1]`.
-//! * **Additive clamp law**: [`clamp_add`] lands in `[0, max(headroom, 0)]` for every `f32`,
-//!   NaN and ∞ included, and [`sanitize_edr_max`] keeps `headroom = edr_max − 1 ≥ 0`. With
-//!   the grid law, the presented pixel is `≤ 1.0 + headroom = edr_max` under the One/One
-//!   blend.
-//!
-//! The gate deciding when any of this runs is `aterm-gpu::format_plan` (`hdr_present_plan`),
-//! enumerated in aterm-gpu `tests/hdr_gate.rs`.
 
-/// Upper cap for a sanitized EDR maximum. Real panels report ≤ 16 (Pro Display
-/// XDR); the cap only bounds a corrupt query so the headroom stays finite.
+/// Upper cap for a sanitized EDR maximum.
 pub const EDR_MAX_CAP: f32 = 100.0;
 
-/// Linear-light boost on the aurora's premultiplied colour in the EDR additive pass: `1.0`
-/// re-adds the glow's own energy (up to a doubling where the panel has headroom), bright
-/// enough to read as light and never clipped-looking.
+/// Linear-light boost on the aurora's premultiplied colour in the EDR additive pass: `1.0` re-adds the glow's own energy (up to a doubling where the panel has headroom), bright enough to read as light and never clipped-looking.
 pub const HDR_GLOW_BOOST: f32 = 1.0;
 
-/// sRGB-encoded channel (0..=1) → linear light: the standard piecewise decode, with the same
-/// constants as the WGSL `s2l` (aterm-gpu `renderer.rs`) and the CPU blend helpers, so CPU and
-/// shader agree float-for-float. Input is clamped to `[0, 1]` first (NaN clamps to 0).
+/// sRGB-encoded channel (0..=1) → linear light: the standard piecewise decode, with the same constants as the WGSL `s2l` (aterm-gpu `renderer.rs`) and the CPU blend helpers, so CPU and shader agree float-for-float.
 #[must_use]
 #[inline]
 pub fn srgb_channel_to_linear(c: f32) -> f32 {
@@ -43,54 +21,28 @@ pub fn srgb_channel_to_linear(c: f32) -> f32 {
     }
 }
 
-/// Grid (non-additive) HDR encode: what the present blit writes for one stored offscreen byte
-/// on the `Rgba16Float` extended-linear swapchain.
-///
-/// # Invariant (checked)
-/// `0.0 <= hdr_grid_encode(b) <= 1.0` for every byte, and `hdr_grid_encode(255) == 1.0`: SDR
-/// reference white maps exactly to EDR reference white, so the grid renders as on the SDR path
-/// and only the additive pass may exceed it. The WGSL twin (`fs_blit`'s `b.hdr` arm) applies
-/// the same decode and clamp.
+/// Grid (non-additive) HDR encode: what the present blit writes for one stored offscreen byte on the `Rgba16Float` extended-linear swapchain.
 #[must_use]
 #[inline]
 pub fn hdr_grid_encode(b: u8) -> f32 {
     srgb_channel_to_linear(f32::from(b) / 255.0).clamp(0.0, 1.0)
 }
 
-/// Sanitize a queried Windows SDR-white scale (`SDR-white nits / 80`, the scRGB reference):
-/// non-finite or `< 1.0` (the unset per-window default `0.0`, macOS, an SDR desktop) means no
-/// scaling → `1.0`, the same rule as `WindowGpu::sdr_white_scale`.
+/// Sanitize a queried Windows SDR-white scale (`SDR-white nits / 80`, the scRGB reference): non-finite or `< 1.0` (the unset per-window default `0.0`, macOS, an SDR desktop) means no scaling → `1.0`, the same rule as `WindowGpu::sdr_white_scale`.
 #[must_use]
 #[inline]
 pub const fn sanitize_sdr_white_scale(v: f32) -> f32 {
     if v.is_finite() && v >= 1.0 { v } else { 1.0 }
 }
 
-/// scRGB present of one stored byte, grid and remainder band alike, on the Windows
-/// `Rgba16Float` swapchain: [`hdr_grid_encode`] scaled to the desktop's SDR white. The float
-/// twin of both `fs_blit` `hdr` arms.
-///
-/// # Invariant (measured on glass, pinned below)
-/// On a Windows HDR desktop DWM composes every SDR-drawn pixel as
-/// `srgb_piecewise_to_linear(byte) * SDR-white/80` (exactly `3.0 ×` at 240-nit SDR white; the
-/// piecewise curve, not a 2.2 power), so this value makes an aterm byte compose identically to
-/// the same byte drawn by DWM. Scale 1.0 is exactly [`hdr_grid_encode`]; byte 255 maps to
-/// `scale`; every byte lands in `[0, scale]`. A GDI screen grab (`BitBlt`/`CopyFromScreen`)
-/// reads an f16 swapchain at 80 nits = white with no `/scale`, so it shows this present lifted
-/// `scale×`; verify the EDR present with an FP16 capture instead.
+/// scRGB present of one stored byte, grid and remainder band alike, on the Windows `Rgba16Float` swapchain: [`hdr_grid_encode`] scaled to the desktop's SDR white.
 #[must_use]
 #[inline]
 pub fn scrgb_present_channel(b: u8, sdr_white_scale: f32) -> f32 {
     hdr_grid_encode(b) * sanitize_sdr_white_scale(sdr_white_scale)
 }
 
-/// Sanitize a queried `NSScreen.maximumExtendedDynamicRangeColorComponentValue`: non-finite or
-/// `< 1.0` (including the unset per-window default `0.0`) means no headroom → `1.0`; a corrupt
-/// huge value is capped at [`EDR_MAX_CAP`].
-///
-/// # Invariant (checked)
-/// `1.0 <= sanitize_edr_max(v) <= EDR_MAX_CAP` for every `f32`
-/// (`sanitize_edr_boundaries`: NaN, ±∞, ±0, subnormal, the extremes).
+/// Sanitize a queried `NSScreen.maximumExtendedDynamicRangeColorComponentValue`: non-finite or `< 1.0` (including the unset per-window default `0.0`) means no headroom → `1.0`; a corrupt huge value is capped at [`EDR_MAX_CAP`].
 #[must_use]
 #[inline]
 pub const fn sanitize_edr_max(v: f32) -> f32 {
@@ -102,91 +54,44 @@ pub const fn sanitize_edr_max(v: f32) -> f32 {
 }
 
 /// The additive headroom above SDR reference white: `sanitize(edr_max) - 1.0`.
-/// `0.0` on an SDR panel (the boost pass then adds nothing and is skipped).
-///
-/// # Invariant (checked)
-/// `0.0 <= additive_headroom(v) <= EDR_MAX_CAP - 1.0` for every `f32`.
 #[must_use]
 #[inline]
 pub const fn additive_headroom(edr_max: f32) -> f32 {
     sanitize_edr_max(edr_max) - 1.0
 }
 
-/// The additive clamp core: bound a boosted linear emission `x` to `[0, max(headroom, 0)]`,
-/// the op the EDR glow fragment performs after `s2l(colour) * boost`. Transcendental-free, so
-/// the bound holds whatever the decode produced: `f32::min`/`max` return the other operand for
-/// NaN, so a NaN emission lands on the headroom and a NaN headroom degrades to 0.
-///
-/// # Invariant (checked)
-/// `0.0 <= clamp_add(x, h) <= max(h, 0)` for every pair of the values that decide
-/// `f32::min`/`max` (`clamp_add_bounded_over_the_special_value_lattice`) and through the
-/// encode for every channel byte (`additive_encode_bounded_by_edr_lattice`); hence, under the
-/// One/One blend, a presented pixel is `<= 1.0 + headroom = edr_max`.
+/// The additive clamp core: bound a boosted linear emission `x` to `[0, max(headroom, 0)]`, the op the EDR glow fragment performs after `s2l(colour) * boost`.
 #[must_use]
 #[inline]
 pub const fn clamp_add(x: f32, headroom: f32) -> f32 {
     x.min(headroom.max(0.0)).max(0.0)
 }
 
-/// One channel of the EDR glow pass's fragment output: decode the premultiplied sRGB-space
-/// aurora colour to linear, boost it, and clamp to the headroom. The float twin of the WGSL
-/// `fs_hdr_glow`; the bound holds whatever the decode and boost produce (see [`clamp_add`]).
+/// One channel of the EDR glow pass's fragment output: decode the premultiplied sRGB-space aurora colour to linear, boost it, and clamp to the headroom.
 #[must_use]
 #[cfg(test)]
 pub fn hdr_additive_encode(chan: f32, boost: f32, headroom: f32) -> f32 {
     clamp_add(srgb_channel_to_linear(chan) * boost, headroom)
 }
 
-/// Ceiling of the SDR glow-boost budget (raw swapchain code-value units, `0..=1`): the most
-/// the additive crown on an SDR (non-f16) present adds per channel, at full strength on black.
-/// 0.35 ≈ +89/255 peak: reads as light, far below washout.
+/// Ceiling of the SDR glow-boost budget (raw swapchain code-value units, `0..=1`): the most the additive crown on an SDR (non-f16) present adds per channel, at full strength on black. 0.35 ≈ +89/255 peak: reads as light, far below washout.
 pub const SDR_GLOW_BUDGET_BASE: f32 = 0.35;
 
-/// The SDR glow-boost budget for a theme background: how much additive light (raw code-value
-/// units) the swapchain-side SDR crown may add per channel. `bg_luma` is the background's
-/// Rec.601 luma over the raw sRGB bytes (`0..=1`); `strength` is `cursor_glow_sdr_boost`.
-///
-/// The `(1 - luma)^2` rolloff makes a light theme's budget sub-visible (luma 0.9 → under
-/// 1/255), since additive light over a bright background reads as washout, while a dark
-/// terminal (luma ≤ 0.1) keeps ~81% of base.
-///
-/// # Invariant
-/// `0.0 <= sdr_glow_budget(l, s) <= SDR_GLOW_BUDGET_BASE` for all `f32` pairs, NaN and ±∞
-/// included: both inputs clamp through `min`/`max` chains whose NaN semantics land on the
-/// finite bound, and three `0..=1` factors times the base cannot exceed the base.
+/// The SDR glow-boost budget for a theme background: how much additive light (raw code-value units) the swapchain-side SDR crown may add per channel.
 #[must_use]
-// Not `.clamp()`: `f32::clamp` propagates NaN, and the min/max order below relies on
-// `f32::min`/`max` returning the other operand for NaN.
 #[allow(clippy::manual_clamp)]
 #[inline]
 pub const fn sdr_glow_budget(bg_luma: f32, strength: f32) -> f32 {
-    // NaN directions are deliberate: luma clamps min-first so NaN lands on 1.0 (rolloff 0,
-    // budget 0); strength clamps max-first so NaN lands on 0.0. Either way a poisoned input
-    // disables the boost.
     let l = bg_luma.min(1.0).max(0.0);
     let s = strength.max(0.0).min(1.0);
     let rolloff = (1.0 - l) * (1.0 - l);
     clamp_add(SDR_GLOW_BUDGET_BASE * s * rolloff, SDR_GLOW_BUDGET_BASE)
 }
 
-/// WCAG 2 relative luminance where the one dark/light classifier
-/// ([`crate::theme_is_dark`], the inverse of `aterm_messages::ink::bg_is_light`)
-/// turns a page light: the pole where black and white ink tie,
-/// `√0.0525 − 0.05 ≈ 0.1791`.
+/// WCAG 2 relative luminance where the one dark/light classifier ([`crate::theme_is_dark`], the inverse of `aterm_messages::ink::bg_is_light`) turns a page light: the pole where black and white ink tie, `√0.0525 − 0.05 ≈ 0.1791`.
 pub const LIGHT_PAGE_LUMINANCE: f64 = 0.179_128_784_747_792;
 
-/// The share of the cursor-trail bloom's configured strength a page `bg`
-/// (`0x00RRGGBB`) keeps (`0..=1`).
-///
-/// Exactly `1.0` on every page the classifier calls dark
-/// ([`crate::theme_is_dark`]), so every dark theme's bloom is the configured
-/// one, bit for bit, and the knee is the classifier itself, not a second
-/// threshold beside it. On the light side a `(1 − L)²` rolloff on the page's
-/// WCAG relative luminance `L`, rescaled to meet `1.0` at the pole
-/// ([`LIGHT_PAGE_LUMINANCE`]), takes it to `0` on white: the bloom composites
-/// additive light over the finished frame, caret included, and on a light
-/// page that only whitens the caret and the glyphs beside it into the ground
-/// ("additive light cannot brighten a white ground").
+/// The share of the cursor-trail bloom's configured strength a page `bg` (`0x00RRGGBB`) keeps (`0..=1`).
 #[must_use]
 #[allow(
     clippy::cast_possible_truncation,
@@ -198,15 +103,12 @@ pub fn light_page_bloom_share(bg: u32) -> f32 {
         return 1.0;
     }
     let [_, r, g, b] = bg.to_be_bytes();
-    // `contrast(black, bg)` is `(L + 0.05) / 0.05`: the classifier's own
-    // luminance, in its own unfused arithmetic.
     let l = aterm_messages::ink::contrast([0, 0, 0], [r, g, b]).mul_add(0.05, -0.05);
     let k = ((1.0 - l) / (1.0 - LIGHT_PAGE_LUMINANCE)).clamp(0.0, 1.0);
     (k * k) as f32
 }
 
-/// Relative luma (`0..=1`, Rec.601 on the raw sRGB bytes) of a packed
-/// `0x00RRGGBB` colour — the SDR glow budget's background-darkness input.
+/// Relative luma (`0..=1`, Rec.601 on the raw sRGB bytes) of a packed `0x00RRGGBB` colour — the SDR glow budget's background-darkness input.
 #[must_use]
 #[inline]
 pub const fn packed_luma(bg: u32) -> f32 {
@@ -237,8 +139,6 @@ mod tests {
             1.0,
             "SDR white anchors EXACTLY at 1.0"
         );
-        // Non-vacuity: a boosted additive emission from the same byte does exceed 1.0 given
-        // headroom, so the grid/additive split is what holds the grid at reference white.
         assert!(
             hdr_grid_encode(255) + hdr_additive_encode(1.0, HDR_GLOW_BOOST, 1.0) > 1.0,
             "an EDR emission over white must exceed 1.0 (else the feature is vacuous)"
@@ -246,8 +146,7 @@ mod tests {
     }
 
     /// scRGB present: scale 1.0 is the grid encode exactly, white maps to the scale, every byte
-    /// lands in [0, scale], and a poisoned scale degrades to 1.0. Byte `0x11` at 240-nit
-    /// SDR white composes at linear 0.01682, the value DWM itself draws for that byte.
+    /// lands in [0, scale], and a poisoned scale degrades to 1.0.
     #[test]
     fn scrgb_present_scales_reference_white_exactly() {
         for b in 0u16..=255 {
@@ -319,7 +218,6 @@ mod tests {
                         v >= 0.0 && v <= h,
                         "encode(chan={chan}, boost={boost}, edr={edr}) = {v} > headroom {h}"
                     );
-                    // The composed present bound: grid + additive <= edr_max.
                     assert!(
                         hdr_grid_encode(b as u8) + v <= sanitize_edr_max(edr) + f32::EPSILON,
                         "presented pixel would exceed the panel's EDR max"
@@ -354,8 +252,6 @@ mod tests {
         for x in lattice {
             for h in lattice {
                 let v = clamp_add(x, h);
-                // `f32::max` returns the other operand for NaN: a NaN
-                // headroom's bound is 0.
                 let bound = h.max(0.0);
                 assert!(
                     v >= 0.0 && v <= bound,
@@ -363,7 +259,6 @@ mod tests {
                 );
             }
         }
-        // The NaN-headroom clause by name: whatever the emission, nothing.
         for x in lattice {
             assert_eq!(clamp_add(x, f32::NAN), 0.0, "clamp_add({x:e}, NaN)");
         }
@@ -373,17 +268,14 @@ mod tests {
     /// headroom: the bound is load-bearing, not slack.
     #[test]
     fn additive_clamp_is_load_bearing() {
-        // A bright aurora channel on a 2.0x panel: emits real light...
         let lit = hdr_additive_encode(1.0, HDR_GLOW_BOOST, additive_headroom(2.0));
         assert!(
             lit > 0.9,
             "full-coverage glow must emit near its boost ({lit})"
         );
-        // ...and an oversized boost IS clamped at the headroom exactly.
         let clamped = hdr_additive_encode(1.0, 50.0, additive_headroom(1.6));
         let h = additive_headroom(1.6);
         assert_eq!(clamped, h, "over-boost must clamp AT the headroom");
-        // SDR panel (headroom 0): the pass provably adds nothing.
         assert_eq!(hdr_additive_encode(1.0, 50.0, additive_headroom(1.0)), 0.0);
     }
 
@@ -403,8 +295,6 @@ mod tests {
             EDR_MAX_CAP,
             "corrupt huge → capped"
         );
-        // The values a float's min/max/is_finite decide on: signed zeros, the
-        // smallest normal, a subnormal, the extremes, and both infinities.
         for v in [
             -0.0f32,
             f32::MIN_POSITIVE,
@@ -438,13 +328,9 @@ mod tests {
         }
         assert_eq!(light_page_bloom_share(0x00FF_FFFF), 0.0);
         assert!(light_page_bloom_share(0x00FD_F6E3) < 0.05);
-        // The greys on either side of the pole: #757575 is dark and keeps the
-        // bloom whole, #767676 is light and has barely started to lose it.
         assert_eq!(light_page_bloom_share(0x0075_7575), 1.0);
         let first_light = light_page_bloom_share(0x0076_7676);
         assert!((0.99..1.0).contains(&first_light), "{first_light}");
-        // Every grey the classifier calls dark keeps the bloom whole, and the
-        // light ones fall monotonically to nothing.
         let mut last = 1.0f32;
         for v in 0..=255u32 {
             let grey = v * 0x0001_0101;
@@ -484,7 +370,6 @@ mod tests {
                 );
             }
         }
-        // Shape: dark keeps most of the base; light degrades to sub-visible.
         assert!(
             sdr_glow_budget(0.05, 1.0) > 0.3,
             "near-black keeps ~90% of base"
@@ -500,13 +385,11 @@ mod tests {
             0.0,
             "NaN strength fails OFF"
         );
-        // Default ship point: dark theme, strength 0.35 — subtle but present.
         let ship = sdr_glow_budget(0.05, 0.35);
         assert!(
             (0.05..=0.20).contains(&ship),
             "ship point is subtle: {ship}"
         );
-        // packed_luma anchors.
         assert_eq!(packed_luma(0x000000), 0.0);
         assert_eq!(packed_luma(0xFFFFFF), 1.0);
         assert!(packed_luma(0x1e1e1e) < 0.2, "dark editor bg reads dark");

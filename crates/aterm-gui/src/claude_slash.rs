@@ -38,6 +38,8 @@ pub(crate) enum Slash {
     ModelPicker,
     /// `/effort`: Claude's EffortSlider.
     EffortPicker,
+    /// `/compact`: compact the conversation context.
+    Compact,
 }
 
 impl Slash {
@@ -51,10 +53,12 @@ impl Slash {
             ),
             Slash::ModelPicker => "/model".to_owned(),
             Slash::EffortPicker => "/effort".to_owned(),
+            Slash::Compact => "/compact".to_owned(),
         }
     }
 
     /// Whether it is a bare command, whose own entry Claude points in the
+    /// slash menu it draws over the top rule as it is typed.
     const fn bare(self) -> bool {
         !matches!(self, Slash::TopEffort(_))
     }
@@ -67,6 +71,7 @@ impl Slash {
             Slash::TopEffort(false) => "key-off",
             Slash::ModelPicker => "model",
             Slash::EffortPicker => "effort",
+            Slash::Compact => "compact",
         }
     }
 
@@ -80,6 +85,7 @@ impl Slash {
             ),
             Slash::ModelPicker => "opening /model\u{2026}".to_owned(),
             Slash::EffortPicker => "opening /effort\u{2026}".to_owned(),
+            Slash::Compact => "running /compact\u{2026}".to_owned(),
         }
     }
 
@@ -92,6 +98,7 @@ impl Slash {
                 if on { "on" } else { "off" }
             )),
             Slash::ModelPicker | Slash::EffortPicker => None,
+            Slash::Compact => Some("\u{2713} /compact sent".to_owned()),
         }
     }
 }
@@ -335,6 +342,8 @@ pub(crate) fn slash_menu(rows: &[String], top: usize, bottom: usize) -> Option<O
 }
 
 /// A slash menu's entries in `rows`, read away from the composer (up from
+/// its top rule, or down from its bottom rule) to the first blank row or
+/// row at column zero: `None` with none ([`slash_menu`]).
 fn menu_block<'a>(rows: impl Iterator<Item = &'a String>) -> Option<Option<String>> {
     let mut entries = false;
     let mut pointers = 0;
@@ -360,6 +369,7 @@ fn menu_block<'a>(rows: impl Iterator<Item = &'a String>) -> Option<Option<Strin
 }
 
 /// The composer's view a quiet window watches: its rows, the rows a slash
+/// menu takes over it, the menu's reading on either side, and the cursor.
 fn view_of(read: &EngineRead, c: &Composer) -> u64 {
     use std::hash::{Hash as _, Hasher as _};
     let mut h = std::hash::DefaultHasher::new();
@@ -370,6 +380,9 @@ fn view_of(read: &EngineRead, c: &Composer) -> u64 {
 }
 
 /// Whether `rows` show a LIVE turn (`screen` their reading): busy, and not
+/// the wait on a background agent's or a workflow's work alone, which
+/// reads busy for the work's whole life after the turn ended (MEASURED on
+/// 2.1.304).
 fn live_turn(screen: Option<&lights::Screen>, rows: &[String]) -> bool {
     screen.is_some_and(|s| s.busy && !aterm_phase::phase::background_only(rows))
 }
@@ -530,6 +543,7 @@ pub(crate) fn decide(press: &SlashPress, read: Option<&EngineRead>, now: Instant
                     }
                 }),
                 Slash::ModelPicker | Slash::EffortPicker if screen.is_none() => Some(Step::Done),
+                Slash::Compact if !held => Some(Step::Done),
                 _ => None,
             };
             match answered {
@@ -543,6 +557,8 @@ pub(crate) fn decide(press: &SlashPress, read: Option<&EngineRead>, now: Instant
 }
 
 /// THE SESSION'S OWN HOLDS (G3), asked at the click and again before each
+/// later write of a press: halted (`fabric`), parked for an update, or
+/// another driver's lease on it.
 fn slash_holds(ctx: &crate::SessionCtx) -> Option<SlashRefusal> {
     if crate::fabric::halt_refusal(ctx, "send").is_some() {
         return Some(SlashRefusal::Halted);
@@ -611,6 +627,9 @@ impl App {
     }
 
     /// Write `bytes` into `session` fenced against `read` at row `row`, the
+    /// one its cursor stands on: the screen generation it read, the
+    /// person's count `human`, and that row as it read, at the cursor
+    /// (`InputFence::guard_at_cursor` matches the cursor's row alone).
     fn slash_write(
         &self,
         session: u64,
@@ -996,6 +1015,7 @@ impl App {
     }
 
     /// END `session`'s press: done or stopped, `left` what the composer
+    /// holds of it, `latch` a refusal Claude answered.
     fn end_slash(
         &mut self,
         session: u64,
@@ -1052,6 +1072,7 @@ impl App {
     }
 
     /// Ask the footer's resolver to read `session`'s facts now (an Enter
+    /// went, a press is done): Claude's answer lands in its transcript.
     fn request_footer_now(&self, session: u64, pgid: i32) {
         #[cfg(test)]
         {
@@ -1071,6 +1092,7 @@ impl App {
 }
 
 /// `claude_slash_press` environment actions, each waived where the Tier-1
+/// test (`claude_lights::slash_tests`) drives it on the real engine.
 #[cfg(all(any(test, debug_assertions), unix))]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "claude_slash_press",

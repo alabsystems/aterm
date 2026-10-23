@@ -24,6 +24,7 @@ type Switch = (&'static str, fn(&mut App, bool));
 const CHIPS: &str = "\u{221e}";
 
 /// `app` hosted, its session drawing Claude Code in bypass under the
+/// owner's whole facts, `cols` wide, one frame painted.
 fn ticker_app(cols: u16) -> (App, WindowId, u64, (Hosted, UnixStream)) {
     let (mut app, wid, session, reader) = app();
     let hosted = host(&mut app);
@@ -49,6 +50,8 @@ fn arrival(t0: Instant, ms: u64) -> Arrival {
 }
 
 /// An act's arrival `ms` after `t0` on the wall clock as it reads now, in
+/// the zone's time — for a title built at the wall's now, whose trail
+/// leaves out an act older than a day — and the clock text it carries.
 fn arrival_now(t0: Instant, ms: u64) -> (Arrival, String) {
     let unix = i64::try_from(
         std::time::SystemTime::now()
@@ -79,6 +82,12 @@ fn reset_counts() {
 }
 
 /// AN ACT'S LABEL LIGHTS BESIDE THE WHOLE FACTS FOR ITS DWELL, THEN GOES
+/// (§9.2.1): told as the host tells it, `✓ approved` stands right of the
+/// chips in Cruise's ink, the chips and the facts where they were; frame
+/// after frame during the dwell it costs no clock read beyond the act's
+/// receipt and no composition beyond the label's own; at its end the rule is
+/// the rest rule again, the repaint key its rest value, nothing armed and
+/// the lights' key 0 — two compositions for the whole label.
 #[test]
 fn an_acts_label_lights_beside_the_whole_facts_for_its_dwell_then_goes() {
     let (mut app, wid, session, _host) = ticker_app(120);
@@ -135,6 +144,10 @@ fn an_acts_label_lights_beside_the_whole_facts_for_its_dwell_then_goes() {
 }
 
 /// THE LABEL NEVER TAKES A FACT'S ROOM (§9.2.1): walked from a wide pane
+/// down to a narrow one with a label lit, over the owner's typical facts
+/// (whose rungs differ by less than the label), the rule draws it only
+/// beside the WHOLE facts — the label never cuts the path or drops the
+/// branch to make room — and the chips never move for it.
 #[test]
 fn the_acts_label_is_drawn_beside_the_whole_facts_or_not_at_all() {
     let t0 = Instant::now();
@@ -181,10 +194,15 @@ fn the_acts_label_is_drawn_beside_the_whole_facts_or_not_at_all() {
 }
 
 /// The Together run's Claude Code working directory (2026-10-16): outside
+/// HOME, so the footer carries it whole, and a 120-column pane cuts it.
 const SPLIT_PATH: &str = "/private/tmp/claude-502/-Users-person-aterm/\
     dd11ed0c-05cd-46e8-bf09-5b2786e48b6a/scratchpad/together/run-dir/proj-claude";
 
 /// A SPLIT PANE'S CUT PATH LEAVES THE LABEL AND THE HOVERED TITLE ROOM
+/// (§9.2.7; the Together run's D2, on glass): Claude Code's pane 120
+/// columns wide in a vertical split, its working directory too long for the
+/// rule, so the facts stand with the path cut to `…/proj-claude` and ninety
+/// cells of `─` free.
 #[test]
 fn a_split_panes_cut_path_leaves_the_label_and_the_hovered_title_room() {
     let t0 = Instant::now();
@@ -250,6 +268,9 @@ fn a_split_panes_cut_path_leaves_the_label_and_the_hovered_title_room() {
 }
 
 /// `[claude_footer] acts = false` AND SERIOUS MODE WITHHOLD THE LABEL
+/// (§9.2.1) on the very next frame — the switch moves the footer's repaint
+/// key, as `usage` does — and keep the trail: the hovered title still
+/// lists the act.
 #[test]
 fn acts_off_and_serious_mode_withhold_the_label_and_move_the_key() {
     let t0 = Instant::now();
@@ -288,6 +309,9 @@ fn acts_off_and_serious_mode_withhold_the_label_and_move_the_key() {
 }
 
 /// A HOVERED AUTOPILOT CHIP LISTS THE TRAIL, BUILT ONCE PER READING
+/// (§9.2.1): its whole title — which outranks the label — names the mode,
+/// says what it does, then `last:` and the acts with their clock times,
+/// then the click.
 #[test]
 fn a_hovered_autopilot_chip_lists_the_trail_built_once_per_reading() {
     let t0 = Instant::now();
@@ -360,6 +384,10 @@ fn a_hovered_autopilot_chip_lists_the_trail_built_once_per_reading() {
 }
 
 /// A HOVERED CHIP NAMES ITS FACE CLOCK'S DAY WHERE IT IS NOT TODAY (§10.2.3,
+/// item 3) on a real frame: a session under Land with no trail whose work
+/// landed two days back reads, hovered, `landed <weekday> HH:MM` — the
+/// hover's start reads today's day for the face clock alone, since the title
+/// names one.
 #[test]
 fn a_hovered_chip_names_its_face_clocks_day_where_it_is_not_today() {
     use crate::harness_glass::{Stamp, local_day_at};
@@ -419,6 +447,12 @@ fn a_hovered_chip_names_its_face_clocks_day_where_it_is_not_today() {
 }
 
 /// A PAUSE TOLD UNDER A HOVER IS IN THE TITLE ON THE NEXT FRAME
+/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §10.5.7, 4a): a session
+/// with no trail and no face clock, its Autopilot chip hovered and its
+/// title drawn; the loop's pause told through the window's one door for
+/// harness facts asks the window reading that title for a frame, and that
+/// frame's title names the pause's end with its weekday — the pause is the
+/// title's only stamp, so the build reads today's date for it alone.
 #[test]
 fn a_pause_told_under_a_hover_is_in_the_title_on_the_next_frame() {
     use crate::harness_glass::Stamp;
@@ -491,6 +525,11 @@ fn a_pause_told_under_a_hover_is_in_the_title_on_the_next_frame() {
 }
 
 /// THE CHIPS ARE BUTTONS A SCREEN READER CAN PRESS (§9.2.1): the tree's
+/// chips are the frame's — Autopilot (then the facts), over the cells the
+/// painter recorded, named in words (`Autopilot: cruise.`), the newest act
+/// its description (none once it is a day old, as the title leaves it out)
+/// — and a reader's click on Autopilot steps its word, as a click on its
+/// cells does.
 #[cfg(a11y_tree)]
 #[test]
 fn the_chips_are_buttons_a_screen_reader_can_press() {
@@ -606,6 +645,8 @@ fn a_reader_cannot_press_a_chip_under_painted_chrome() {
 }
 
 /// EVERYTHING ATERM DRAWS IN THE RULES IS IN THE TREE (review G1): the
+/// grid's text there is Claude's own `─`, so the permission-mode light, the
+/// top rule's harness switch and the title slot are nodes of their own.
 #[cfg(a11y_tree)]
 #[test]
 fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
@@ -768,6 +809,14 @@ fn a_reader_chip_click_commits_an_open_in_grid_rename() {
 }
 
 /// A HOVERED TITLE WITH A TRAIL GIVES ITS PARTS UP IN ORDER (§9.2.1)
+/// :
+/// walked from 240 columns down to 60 with
+/// one act taken, the hovered Autopilot title beside the whole facts is the
+/// WHOLE (the trail and the menu's line), then the whole WITHOUT ITS TRAIL
+/// (the menu still offered), then V1'S WORDS (the menu's line given up
+/// too), then the phrase WITH BOTH CLICKS (the explanation given up), then
+/// the phrase WITH THE CLICK, then the SHORT form, then none — in that
+/// order as the pane narrows, never back; the facts stay whole beside each.
 #[test]
 fn a_hovered_title_gives_up_its_trail_then_its_menu_line_then_its_words() {
     let t0 = Instant::now();

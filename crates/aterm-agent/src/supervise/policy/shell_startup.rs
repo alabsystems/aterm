@@ -26,6 +26,7 @@ impl Kind {
     }
 
     /// The kind Claude Code names a snapshot of `shell` by: `zsh` when the
+    /// path says so, else `bash` when it says that (2.1.284's `srt`).
     fn of(shell: &str) -> Option<Self> {
         if shell.contains("zsh") {
             Some(Self::Zsh)
@@ -45,6 +46,7 @@ pub struct ShellStartup {
 }
 
 /// Words that make the shell parse text of the line as a command again, so
+/// that any word of it may be one an alias is expanded at.
 const REPARSE: &[&str] = &["eval", "trap", "emulate", "sched", "fc"];
 
 impl ShellStartup {
@@ -100,6 +102,7 @@ const MAX_FILE_BYTES: u64 = 8 << 20;
 const MAX_SESSION_ENV_DIRS: usize = 4096;
 
 /// The line Claude Code writes before its own additions to a snapshot (the
+/// `rg` fallback, its `find`/`grep`/`pkill` shadows, `PATH`).
 const CLAUDE_PART: &str = "# Check for rg availability";
 
 /// zsh options (`setopt`) that do not affect non-interactive `zsh -c` command resolution or paths.
@@ -314,6 +317,9 @@ pub const BASH_SHOPTS: &[(&str, Option<bool>)] = &[
 ];
 
 /// Function names the shell runs whatever the line says: the zsh hooks a
+/// `zsh -c` runs (`chpwd`, `zshexit`; `precmd`, `preexec`, `periodic` and
+/// `zshaddhistory` never fire there), the handlers, and the words of the Bash
+/// tool's own chain around the command (`eval` runs it).
 const ALWAYS_RUN: &[&str] = &[
     "chpwd",
     "zshexit",
@@ -332,6 +338,7 @@ const ALWAYS_RUN: &[&str] = &[
 ];
 
 /// The variables Claude Code's settings may give the Bash tool that change
+/// which shell runs a command, what it reads first or its options.
 fn shell_relevant(key: &str) -> bool {
     matches!(
         key,
@@ -404,6 +411,7 @@ pub fn read(worker: &WorkerEnv, launch: &Path) -> Result<ShellStartup, String> {
 }
 
 /// Every snapshot of a shell in `kinds` under `claude`'s `shell-snapshots/`;
+/// `Err` when there is none, or more than [`MAX_SNAPSHOTS`].
 fn snapshots(claude: &Path, kinds: &[Kind]) -> Result<Vec<(Kind, PathBuf)>, String> {
     let dir = claude.join("shell-snapshots");
     let names: Vec<&str> = kinds.iter().map(|k| k.name()).collect();
@@ -450,6 +458,8 @@ fn snapshots(claude: &Path, kinds: &[Kind]) -> Result<Vec<(Kind, PathBuf)>, Stri
 }
 
 /// `Err` naming a non-empty SessionStart (or `Setup`, `CwdChanged`,
+/// `FileChanged`) hook env script under `claude`'s `session-env/<session>/`,
+/// which Claude Code prepends to every command of that session's Bash tool.
 fn hook_env_scripts(claude: &Path) -> Result<(), String> {
     let root = claude.join("session-env");
     let Ok(sessions) = std::fs::read_dir(&root) else {
@@ -577,6 +587,8 @@ pub fn parse_snapshot(
 }
 
 /// Record `name` (`what` it is, and whether an `alias`), or `Err` for one the
+/// shell runs whatever the line says ([`ALWAYS_RUN`], zsh's `TRAP…`
+/// functions); an alias of such a name is refused the same way.
 fn define(state: &mut ShellStartup, name: String, what: String, alias: bool) -> Result<(), String> {
     if ALWAYS_RUN.contains(&name.as_str()) || name.starts_with("TRAP") {
         return Err(format!(
@@ -622,6 +634,7 @@ pub fn names_word(line: &str, name: &str) -> bool {
 }
 
 /// The most times [`dequotings`] removes a level of quoting (an `eval` of
+/// an `eval` …) before it gives up on the line.
 const MAX_QUOTE_LEVELS: usize = 8;
 
 /// `line` across quote-removal levels, plus variants with `\`, `'`, and `"` stripped.
@@ -644,6 +657,9 @@ pub fn dequotings(line: &str) -> Result<Vec<String>, String> {
 }
 
 /// One level of the shell's quote removal: `\c` is `c` (a backslash-newline
+/// is nothing), `'…'` its text, `$'…'` its text with the escapes decoded
+/// ([`ansi_c`]), `"…"` (and bash's `$"…"`) its text with `\$`, `` \` ``,
+/// `\"`, `\\` and a backslash-newline undone.
 fn unquote_once(s: &str) -> String {
     let cs: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
@@ -696,6 +712,9 @@ fn unquote_once(s: &str) -> String {
 }
 
 /// The text of a `$'…'` from `cs[*i]` (just past its `$'`) to its closing
+/// quote, which `*i` is left past, with zsh's and bash's escapes decoded: the
+/// letters (`\n`, `\t`, `\e`, …), `\NNN` octal, `\xHH`, `\uHHHH`,
+/// `\UHHHHHHHH` and `\cX`.
 fn ansi_c(cs: &[char], i: &mut usize, out: &mut String) {
     let digits = |i: &mut usize, radix: u32, max: usize| {
         let mut v = 0u32;
@@ -820,6 +839,7 @@ pub fn command_heads(line: &str) -> Vec<&str> {
 }
 
 /// Reserved words and precommand modifiers after which zsh or bash reads the
+/// next word in command position.
 const KEEPS_COMMAND: &[&str] = &[
     "if",
     "then",
@@ -841,6 +861,9 @@ const KEEPS_COMMAND: &[&str] = &[
 ];
 
 /// `Err` naming a `.zshenv` zsh reads before every Bash tool command (the
+/// worker's `$ZDOTDIR`'s, else `$HOME`'s; `/etc/zshenv`; a Debian-built zsh's
+/// `/etc/zsh/zshenv`) that holds what the snapshot would not show
+/// ([`zshenv_hazard`]), or that cannot be read.
 fn zshenv(worker: &WorkerEnv) -> Result<(), String> {
     let dot = worker
         .var("ZDOTDIR")
@@ -891,12 +914,15 @@ pub fn zshenv_hazard(text: &str) -> Option<String> {
 }
 
 /// The words of a `.zshenv` line that may set what the snapshot's listing
+/// would not show, or run code this check does not read ([`zshenv_hazard`],
+/// whose verdict quotes one of these and nothing else of the line).
 const ZSHENV_WORDS: &[&str] = &[
     "emulate", "setopt", "unsetopt", "options", "set", "source", ".", "eval", "alias", "function",
     "autoload", "zmodload", "builtin", "exec", "trap",
 ];
 
 /// `Err` naming a variable of the worker's that makes bash read a file before
+/// a command or sets its options.
 fn bash_env(worker: &WorkerEnv) -> Result<(), String> {
     for key in [
         "BASH_ENV",

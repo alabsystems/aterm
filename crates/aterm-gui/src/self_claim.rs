@@ -116,12 +116,19 @@ pub(crate) fn wall_answer(
 }
 
 /// The copy each session's proven claim was last read into, by tab
+/// ([`refresh`]): the record read ONLY while the claim's identity was live —
+/// at the proven claim and at each `meta-change` of the session — so the
+/// exit is decided and relaunched from what the agent itself left
+/// ([`aterm_agent::harness::self_claimed`]), never from the file as anyone
+/// rewrote it after the agent died.
 static COPIES: Mutex<Copies> = Mutex::new(Copies::new());
 
 /// The copies by tab (a `BTreeMap`, so the static needs no lazy init).
 type Copies = std::collections::BTreeMap<String, Copy>;
 
 /// The line the crash rule last typed in each tab ([`typed`]): what a
+/// codex-alab it started, read before its record's first write, relaunches
+/// on ([`self_claimed::inherited`]: only a process that runs exactly it).
 static TYPED: Mutex<std::collections::BTreeMap<String, self_claimed::Resume>> =
     Mutex::new(std::collections::BTreeMap::new());
 
@@ -142,6 +149,8 @@ fn typed_for(sid: &str) -> Option<self_claimed::Resume> {
 }
 
 /// Read the proven claim's record now, while its identity is live
+/// ([`self_claimed::read_copy`]: looked at before and after the read), and
+/// keep it as aterm's copy.
 fn refresh(ctx: &crate::SessionCtx, proven: &Proven, revision: u64) -> bool {
     let typed = typed_for(ctx.self_id.as_str());
     refresh_by(ctx, proven, revision, || {
@@ -189,6 +198,7 @@ fn refresh_by(
 }
 
 /// Tab `sid`'s live proven claim, read under its meta guard (a clone; the
+/// guard let go before anything is read from disk).
 fn standing(ctx: &crate::SessionCtx) -> Option<(Proven, u64)> {
     let meta = ctx.meta.lock().unwrap_or_else(PoisonError::into_inner);
     meta.live_claim(crate::metrics::now_us())
@@ -376,7 +386,7 @@ fn released_by(
     finish_release(ctx, proven, revision, alive, copy).then_some(alive)
 }
 
-/// Commit the final live read only at the release that admitted it. The meta
+/// Commit the final live read only at the release that admitted it.
 fn finish_release(
     ctx: &crate::SessionCtx,
     proven: &Proven,
@@ -417,6 +427,7 @@ pub(crate) mod stand_in {
     const STAND_IN_ENV: &str = "ATERM_SELF_CLAIM_TEST_STAND_IN";
 
     /// THE STAND-IN'S BODY: this test binary, which waits for its parent's
+    /// end of the pipe to close.
     #[test]
     fn a_stand_in_agent_when_asked() {
         use std::io::Read as _;
@@ -494,6 +505,9 @@ mod tests {
     }
 
     /// THE ROLLOUT TAP'S CLAIM GATE: only a
+    /// proven claim's own copy, standing and naming a thread id, names a
+    /// rollout to tap — its thread, under the home the record was read
+    /// under.
     #[test]
     fn only_a_proven_claims_own_copy_names_a_rollout_target() {
         const THREAD: &str = "0199f2a4-6c1e-7a52-9d3b-2f6c8e1a4b77";
@@ -532,6 +546,7 @@ mod tests {
     }
 
     /// Only a usage wall, only with the policy in effect and `resume_limits`
+    /// on, is the self-claim's own to wait out; everything else stays a stop.
     #[test]
     fn a_self_claim_answers_only_a_usage_wall_under_resume_limits() {
         use aterm_agent::supervise::SupervisorConfig;
@@ -565,6 +580,7 @@ mod tests {
     }
 
     /// A self-claim speaks for a Codex in front, by either name it runs
+    /// under.
     #[test]
     fn a_self_claim_speaks_only_for_a_codex_in_front() {
         for claimant in [
@@ -797,6 +813,10 @@ mod tests {
     }
 
     /// THE WATCH-ONLY WORKER'S IDLE POINT, live ([`idle_now`]): a real
+    /// stand-in process (the kept signed `sleep`, its `CODEX_HOME` the
+    /// test's directory) holding the session's PROVEN claim, with a PLANTED
+    /// record saying `idle` and `draftEmpty: true`, is at its idle point; the
+    /// record saying `busy` is not.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn the_idle_point_is_the_proven_processs_own_record_read_live() {

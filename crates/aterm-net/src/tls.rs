@@ -108,6 +108,7 @@ impl ServerCertVerifier for PinnedServerVerifier {
 }
 
 /// A certificate whose SHA-256 is not the pinned one: what the remote presented
+/// and what the connection pins.
 #[derive(Debug)]
 struct PinMismatch {
     presented: [u8; 32],
@@ -294,6 +295,9 @@ where
 }
 
 /// End `transport` once its owner has answered, never waiting on the peer,
+/// as [`relay_answers`] ends: when the answer went `clean`ly, a
+/// `close_notify` written only as far as the socket takes it at once; then
+/// the FIN.
 fn end_without_waiting<C, S>(transport: TlsTransport<C>, clean: bool)
 where
     C: std::ops::DerefMut + std::ops::Deref<Target = rustls::ConnectionCommon<S>>,
@@ -315,18 +319,24 @@ where
 }
 
 /// Upper bound on the uploader's final draining wait, so a stuck (TCP-connected
+/// but non-reading) peer cannot hang relay teardown — far longer than any healthy
+/// peer needs to drain a queued tail, short enough to bound the join.
 const RELAY_DRAIN_MAX: Duration = Duration::from_secs(5);
 
 /// The rustls connection plus relay coordination flags, guarded by one mutex and
+/// signaled through one [`Condvar`] (see [`RelayShared`]).
 struct RelayState<C> {
     conn: C,
     /// Teardown: the answer is over, or a fatal error on either side.
     done: bool,
     /// The writer thread holds TLS bytes it extracted from `conn` but has not yet
+    /// pushed to the socket — the uploader's final drain must wait for them too.
     inflight: bool,
     /// The first UNEXPECTED error from any direction (a normal peer close is not
+    /// recorded — it is the expected end of the relay).
     err: Option<io::Error>,
     /// The relay's guard ([`relay_answers`]), taken out by the uploader when
+    /// the answer is over and dropped there in its order.
     guard: Option<Box<dyn Send>>,
 }
 
@@ -342,6 +352,7 @@ impl<C> RelayState<C> {
 struct RelayShared<C> {
     state: Mutex<RelayState<C>>,
     /// Signals every relay condition: plaintext-buffer space freed, TLS output
+    /// queued, in-flight write completed, teardown.
     cv: Condvar,
 }
 
@@ -691,6 +702,8 @@ where
 }
 
 /// Write `bytes` to `tcp` as far as its send buffer takes them NOW, never
+/// waiting on the peer ([`relay_answers`]' last word): a peer that has stopped
+/// reading misses the rest, and nothing is reported, since the relay is over.
 #[cfg(unix)]
 fn send_without_waiting(tcp: &TcpStream, mut bytes: &[u8]) {
     use std::os::fd::AsRawFd as _;
@@ -745,6 +758,7 @@ mod tests {
     const TEST_KEY_DER: &[u8] = include_bytes!("testdata/key.pkcs8.der");
 
     /// The tests' own exporter label: what the relay carries does not depend
+    /// on it, only the exporters' agreement does.
     const EXPORTER_LABEL: &[u8] = b"EXPORTER-aterm-net-test";
 
     fn io_err(e: impl std::fmt::Display) -> io::Error {
@@ -763,6 +777,7 @@ mod tests {
     }
 
     /// A TLS 1.3 dialer configuration pinning `fingerprint` through the
+    /// production [`PinnedServerVerifier`].
     fn client_config(fingerprint: [u8; 32]) -> Arc<ClientConfig> {
         init_crypto();
         let cfg = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
@@ -773,6 +788,7 @@ mod tests {
     }
 
     /// The listener's handshake on an accepted `tcp`, exporting under
+    /// [`EXPORTER_LABEL`].
     fn accept(
         tcp: TcpStream,
         config: Arc<ServerConfig>,
@@ -792,6 +808,7 @@ mod tests {
     }
 
     /// The dialer's handshake on a connected `tcp`, exporting under
+    /// [`EXPORTER_LABEL`].
     fn connect(
         tcp: TcpStream,
         server_name: ServerName<'static>,
@@ -965,6 +982,7 @@ mod tests {
     }
 
     /// Whether a relay could write to its local end `side` now: `false` once
+    /// the downloader has filled the local socket and is blocked on it.
     #[cfg(unix)]
     fn writable(side: &CtlStream) -> bool {
         use std::os::fd::AsRawFd as _;
@@ -979,6 +997,7 @@ mod tests {
     }
 
     /// A guard whose drop says it has begun, then holds until the gate opens
+    /// (its sender dropped): the hang detector, never a latency budget.
     struct HeldGuard {
         entered: std::sync::mpsc::Sender<()>,
         gate: std::sync::mpsc::Receiver<()>,
@@ -992,6 +1011,8 @@ mod tests {
     }
 
     /// [`answer`]'S ORDER, pinned as [`relay_answers`]' is: the answer is
+    /// written and flushed, and nothing of the connection's end reaches the
+    /// wire while the guard is held.
     #[test]
     fn an_answer_says_nothing_of_the_end_while_its_guard_is_held() {
         use std::sync::mpsc;
@@ -1049,6 +1070,7 @@ mod tests {
     }
 
     /// [`relay_answers`] ordering: nothing of the connection's end reaches the
+    /// wire while the guard is held.
     #[test]
     fn an_answering_relay_says_nothing_of_the_end_while_its_guard_is_held() {
         use std::sync::mpsc;
@@ -1115,6 +1137,8 @@ mod tests {
     }
 
     /// [`relay_answers`] lets its guard go only once neither end can hold it:
+    /// when a connection with blocked downloader and uploader is cut, the relay
+    /// returns with its guard dropped and the local end's write fails.
     #[cfg(unix)]
     #[test]
     fn a_cut_answering_relay_ends_though_neither_end_reads() {
@@ -1180,6 +1204,9 @@ mod tests {
     }
 
     /// [`relay_answers`] hangs its local end up one half at a time: when the
+    /// local end answers and hangs up while a cloned descriptor of it remains
+    /// open and the downloader is blocked writing to it, the hang-up wakes the
+    /// downloader and the relay returns with its guard dropped.
     #[cfg(unix)]
     #[test]
     fn an_answering_relay_ends_though_a_copy_of_its_hung_up_local_end_lives_on() {
@@ -1251,6 +1278,9 @@ mod tests {
     }
 
     /// [`relay_answers`] holds its guard through the line its local end serves
+    /// even when the peer sends an undecryptable record after the request: the
+    /// local end reads EOF after its line and only its answer releases the
+    /// guard.
     #[cfg(unix)]
     #[test]
     fn an_answering_relay_whose_peer_fails_holds_its_guard_through_the_line() {
@@ -1583,6 +1613,8 @@ mod tests {
     const NET_TEST_LIVENESS_BOUND: Duration = Duration::from_secs(60);
 
     /// The download direction drains rustls' 16 KiB plaintext buffer after each
+    /// packet batch so a socket read carrying a full record's tail followed by
+    /// small records never overflows the buffer mid-feed.
     #[test]
     fn relay_ingests_a_full_record_followed_by_small_ones_without_tearing_down() {
         let _serial = serialize_loopback();

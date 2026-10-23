@@ -2,32 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `atpkg-publish pack <program>`: one plain program build, for one target.
-//!
-//! The pipeline, each step a gate that refuses before anything later runs:
-//!
-//! 1. the Trust toolchain: resolved once to a physical build dir, leased for the whole
-//!    pack, and admitted by content and lineage ([`super::toolchain`]) before anything is
-//!    built;
-//! 2. `targo metadata` → the program's `[workspace.metadata.atpkg]` `expose` / `bundle`
-//!    / `build-args`; a `bundle-only` program is refused (that lane is
-//!    [`super::bundle`]); no declaration → the loud name-token fallback;
-//! 3. `targo --unverified build --release --target <triple>` with the distribution
-//!    CPU floor (`x86-64-v2` / `apple-m1`, never `target-cpu=native`) and the seal's own
-//!    `trustc`, set after a caller's cross linker, with every inherited variable that
-//!    outranks them removed; every declared bin must have built;
-//! 4. the arch gate over every binary ([`super::arch`]);
-//! 5. stage `bin/` (stripped);
-//! 6. the payload lineage scan ([`super::lineage::scan_tree`]), whose record is the row's
-//!    `[artifact.provenance]`;
-//! 7. tar in-process, zstd by the CLI, read back through the client decoder
-//!    ([`super::tarwrite`]), `disk_installed`;
-//! 8. the manifest ([`super::pkgdoc`]): fresh, or this target's row appended to
-//!    `merge_from`'s bytes verbatim; signed with the machine key unless staged unsigned (an
-//!    `unproven` row is signed or staged only while the receipt switch reads dormant), the
-//!    pair verified with the client's rule and parsed back against what was packed before
-//!    either file is written;
-//! 9. upload to the staging owner (refused when the public owner already serves this tag
-//!    with different bytes: a public pack is immutable).
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -63,12 +37,8 @@ impl Packer for Pack {
 /// How long a pack waits for another publish of the same program to finish.
 pub const LOCK_WAIT: Duration = Duration::from_secs(300);
 
-/// The lock every pack of `program` holds for its whole run: its stage is rebuilt from
-/// scratch and its release tag mutated, and two runs of one program often use different
-/// `out` dirs, so the lock is keyed on the program.
-///
+/// The lock every pack of `program` holds for its whole run: its stage is rebuilt from scratch and its release tag mutated, and two runs of one program often use different `out` dirs, so the lock is keyed on the program.
 /// # Errors
-///
 /// A refusal when another publish holds it past `wait`.
 pub fn pack_lock(ctx: &Ctx, program: &str, wait: Duration) -> Result<aterm_update_core::FileLock> {
     let dir = ctx.state_dir.join("locks");
@@ -87,34 +57,23 @@ pub fn pack_lock(ctx: &Ctx, program: &str, wait: Duration) -> Result<aterm_updat
     })
 }
 
-/// The distribution CPU floor a target is built for: the oldest CPU any supported OS
-/// runs on, never the builder's (`target-cpu=native` faults on an older user's machine,
-/// and cross-built it is refused outright). `None` where the compiler's default for the
-/// triple already is the floor.
+/// The distribution CPU floor a target is built for: the oldest CPU any supported OS runs on, never the builder's (`target-cpu=native` faults on an older user's machine, and cross-built it is refused outright).
 #[must_use]
 pub fn cpu_floor(triple: Triple) -> Option<&'static str> {
     match (triple.os(), triple.arch()) {
-        // macOS 11 runs on Ivy Bridge (no AVX2): x86-64-v2, never v3. Linux has no OS
-        // floor to reason from, so the silicon's SSE4.2/POPCNT era is the floor there too.
         (Os::Darwin | Os::Linux, crate::triple::Arch::X86_64) => Some("x86-64-v2"),
-        // The oldest Apple Silicon there is.
         (Os::Darwin, crate::triple::Arch::Aarch64) => Some("apple-m1"),
-        // aarch64 Linux/Windows: the default is armv8-a; x86_64 Windows: the default
-        // x86-64 baseline.
         _ => None,
     }
 }
 
-/// The `RUSTFLAGS` a pack's build sets — always set, so a repo's own target rustflags
-/// (its `target-cpu=native`) are replaced, never inherited.
+/// The `RUSTFLAGS` a pack's build sets — always set, so a repo's own target rustflags (its `target-cpu=native`) are replaced, never inherited.
 #[must_use]
 pub fn rustflags(triple: Triple) -> String {
     cpu_floor(triple).map_or_else(String::new, |cpu| format!("-C target-cpu={cpu}"))
 }
 
-/// Inherited variables a pack's build removes: each outranks, wraps or reroutes the
-/// `RUSTC` / `RUSTFLAGS` the pack sets (`CARGO_ENCODED_RUSTFLAGS` beats `RUSTFLAGS`, a
-/// wrapper runs whatever it likes, `RUSTUP_TOOLCHAIN` reroutes a proxy).
+/// Inherited variables a pack's build removes: each outranks, wraps or reroutes the `RUSTC` / `RUSTFLAGS` the pack sets (`CARGO_ENCODED_RUSTFLAGS` beats `RUSTFLAGS`, a wrapper runs whatever it likes, `RUSTUP_TOOLCHAIN` reroutes a proxy).
 pub const SCRUBBED_ENV: &[&str] = &[
     "CARGO_ENCODED_RUSTFLAGS",
     "CARGO_BUILD_RUSTFLAGS",
@@ -126,12 +85,8 @@ pub const SCRUBBED_ENV: &[&str] = &[
     "RUSTUP_TOOLCHAIN",
 ];
 
-/// The one thing a caller may add to a pack's build environment: a cross linker,
-/// `CARGO_TARGET_<TRIPLE>_LINKER`. Anything else could replace the seal's compiler or
-/// the distribution CPU floor, which the pack alone decides.
-///
+/// The one thing a caller may add to a pack's build environment: a cross linker, `CARGO_TARGET_<TRIPLE>_LINKER`.
 /// # Errors
-///
 /// A usage error naming the first other key.
 pub fn check_build_env(env: &[(String, String)]) -> Result<()> {
     for (k, _) in env {
@@ -186,9 +141,7 @@ fn version_of(p: &aterm_json::Value) -> Option<&str> {
 }
 
 /// Read `targo metadata --no-deps --format-version 1`'s JSON.
-///
 /// # Errors
-///
 /// A refusal when it is not that JSON.
 pub fn parse_metadata(json: &[u8], program: &str) -> Result<Metadata> {
     let v: aterm_json::Value = aterm_json::from_slice(json)
@@ -246,8 +199,7 @@ pub fn parse_metadata(json: &[u8], program: &str) -> Result<Metadata> {
     })
 }
 
-/// The workspace members' freshly built bin executables, from a `--message-format=json`
-/// stream: sorted, each once.
+/// The workspace members' freshly built bin executables, from a `--message-format=json` stream: sorted, each once.
 #[must_use]
 pub fn built_executables(stream: &[u8], meta: &Metadata) -> Vec<PathBuf> {
     let mut out: BTreeSet<PathBuf> = BTreeSet::new();
@@ -333,11 +285,8 @@ pub fn looks_internal(name: &str) -> bool {
         || (tokens.len() > 1 && (tokens[0] == "gen" || tokens[tokens.len() - 1] == "gen"))
 }
 
-/// Choose what ships and what is shimmed: the declared `expose` ∪ `bundle` (every name of
-/// which must have built), else every bin the name-token fallback keeps.
-///
+/// Choose what ships and what is shimmed: the declared `expose` ∪ `bundle` (every name of which must have built), else every bin the name-token fallback keeps.
 /// # Errors
-///
 /// A refusal for a declared bin that did not build, or an empty exposed set.
 pub fn select(meta: &Metadata, exes: &[PathBuf], triple: Triple) -> Result<Selection> {
     let name_of = |p: &Path| {
@@ -468,7 +417,6 @@ fn build(
             .iter()
             .map(|(k, v)| (k.clone(), OsString::from(v))),
     );
-    // Last, so nothing the caller passed can stand in for them.
     run.env.push(("RUSTC".into(), tc.trustc().into()));
     run.env
         .push(("RUSTFLAGS".into(), rustflags(request.triple).into()));
@@ -494,11 +442,8 @@ fn build(
     Ok(exes)
 }
 
-/// The stage `out/<program>` is rebuilt from scratch, so it must not hold the checkout
-/// the pack builds (`--out` set to the checkout's parent would delete it).
-///
+/// The stage `out/<program>` is rebuilt from scratch, so it must not hold the checkout the pack builds (`--out` set to the checkout's parent would delete it).
 /// # Errors
-///
 /// A refusal when it does.
 pub fn check_stage_dir(ctx: &Ctx, stage_dir: &Path, checkout: &Path) -> Result<()> {
     let checkout = std::fs::canonicalize(checkout)
@@ -528,8 +473,7 @@ fn reset_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(|e| Error::io(format!("mkdir {}", dir.display()), &e))
 }
 
-/// The policy note every pack prints: why the receipt is not enforced, or why it is
-/// required when nothing could read the switch (and what to fetch where).
+/// The policy note every pack prints: why the receipt is not enforced, or why it is required when nothing could read the switch (and what to fetch where).
 pub fn say_switch(ctx: &Ctx, trust_repo: &Path, switch: &Switch) {
     match switch {
         Switch::Dormant => eprintln!(
@@ -547,11 +491,8 @@ pub fn say_switch(ctx: &Ctx, trust_repo: &Path, switch: &Switch) {
     }
 }
 
-/// The scan of a staged payload against the admitted compiler; its record is the row's
-/// provenance.
-///
+/// The scan of a staged payload against the admitted compiler; its record is the row's provenance.
 /// # Errors
-///
 /// A refusal listing every finding: nothing is tarred, hashed or signed then.
 pub fn scan(
     stage_root: &Path,
@@ -575,9 +516,7 @@ pub fn scan(
     Ok(pkgdoc::provenance(compiler, report.objects))
 }
 
-/// What the signing half of a pack holds from its start: the key and the roster generation
-/// every signature is verified under ([`sign::elected`], once per run). Loaded before
-/// anything is built, so a pack that cannot sign stops in seconds.
+/// What the signing half of a pack holds from its start: the key and the roster generation every signature is verified under ([`sign::elected`], once per run).
 pub struct Signer {
     key: MachineKey,
     authority: std::sync::Arc<sign::Authority>,
@@ -585,9 +524,7 @@ pub struct Signer {
 
 impl Signer {
     /// Load the machine key and elect the roster.
-    ///
     /// # Errors
-    ///
     /// No key, or no roster that verifies.
     pub fn load(ctx: &Ctx) -> Result<Self> {
         Ok(Self {
@@ -603,15 +540,9 @@ impl Signer {
     }
 }
 
-/// Sign the manifest's exact bytes when a signer is given (re-asking the switch for an
-/// `unproven` row first), verify the pair and hold the parsed document to what was
-/// packed, and only then write the manifest and its signature.
-///
+/// Sign the manifest's exact bytes when a signer is given (re-asking the switch for an `unproven` row first), verify the pair and hold the parsed document to what was packed, and only then write the manifest and its signature.
 /// # Errors
-///
-/// The unproven gate's, the signer's or the self-check's refusal; neither file is
-/// written after one, and a signature an earlier run left is removed (it covers other
-/// bytes).
+/// The unproven gate's, the signer's or the self-check's refusal; neither file is written after one, and a signature an earlier run left is removed (it covers other bytes).
 pub fn write_manifest(
     ctx: &Ctx,
     doc: &pkgdoc::Doc,
@@ -646,9 +577,7 @@ pub fn write_manifest(
 }
 
 /// [`Pack`] over explicit tools — the seam the tests drive.
-///
 /// # Errors
-///
 /// Any gate's refusal; nothing is signed or uploaded after one.
 pub fn pack_with(ctx: &Ctx, request: &PackRequest, tools: &dyn Tools) -> Result<PackOutcome> {
     let program = &request.program;
@@ -665,7 +594,6 @@ pub fn pack_with(ctx: &Ctx, request: &PackRequest, tools: &dyn Tools) -> Result<
         ));
     }
     check_build_env(&request.env)?;
-    // Read before the stage is reset: the base may live under `out`.
     let base = request
         .merge_from
         .as_ref()
@@ -716,8 +644,6 @@ pub fn pack_with(ctx: &Ctx, request: &PackRequest, tools: &dyn Tools) -> Result<
              updating user's PATH. Use `atpkg-publish pack-bundle {program}`"
         )));
     }
-    // A declared tool no shim may carry is refused before anything is built, and one the
-    // name-token fallback picks before anything is staged (below).
     pkgdoc::check_exposes(program, &meta.expose)?;
     let exes = build(tools, &tc, request, &meta, &stage_dir)?;
     let gated = arch::gate(request.triple, &exes)?;
@@ -737,7 +663,6 @@ pub fn pack_with(ctx: &Ctx, request: &PackRequest, tools: &dyn Tools) -> Result<
     for (exe, name) in &sel.shipped {
         let dest = stage_root.join("bin").join(name);
         std::fs::copy(exe, &dest).map_err(|e| Error::io(format!("stage {name}"), &e))?;
-        // Best effort: a foreign-target object a host strip cannot read ships unstripped.
         let _ = tools.strip(&dest, false);
     }
 
@@ -800,11 +725,8 @@ pub fn pack_with(ctx: &Ctx, request: &PackRequest, tools: &dyn Tools) -> Result<
     })
 }
 
-/// `atpkg-publish pack <program> --checkout DIR [--triple T] [--build N] [--merge-from
-/// PKG] [--toolchain BIN] [--out DIR] [--trust-repo DIR] [--unsigned] [--upload]`.
-///
+/// `atpkg-publish pack <program> --checkout DIR [--triple T] [--build N] [--merge-from PKG] [--toolchain BIN] [--out DIR] [--trust-repo DIR] [--unsigned] [--upload]`.
 /// # Errors
-///
 /// A usage error for a malformed command line; the pack's refusals.
 pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     let mut ctx = ctx.clone();
@@ -834,14 +756,9 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// The command line as a [`PackRequest`]; `--trust-repo` moves where `ctx` reads the
-/// receipt switch. With no `--triple` the target is the host the pack's own compiler
-/// names (`trustc -vV`), so the label and the compiler agree.
-///
+/// The command line as a [`PackRequest`]; `--trust-repo` moves where `ctx` reads the receipt switch.
 /// # Errors
-///
-/// A usage error naming what is wrong; the toolchain's refusal when the triple must be
-/// read from it.
+/// A usage error naming what is wrong; the toolchain's refusal when the triple must be read from it.
 pub fn parse_args(ctx: &mut Ctx, args: &[String], tools: &dyn Tools) -> Result<PackRequest> {
     let usage = || {
         Error::usage(

@@ -1,47 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance: the shipping [`Log`] against the derived
-//! `SessionLogRing` model (`aterm_models_session::session_log_ring_model`, the
-//! model Tier-0 checks in `aterm-models/tests/derived_ring_ty.rs`).
-//!
-//! A seeded random walk drives a real three-record ring (the model's `Cap`,
-//! its low-water mark the model's `Low`) through every action the model has:
-//! opens and closes of a run, its turn and the turn's step (a turn closed
-//! over an open step writes the cascade the model calls `CloseTurnCascade`, a
-//! run closed over its turn and step `CloseRunCascade`), an orphan step (a
-//! stall asked under the run with no turn open, or under a closed turn,
-//! which attaches to the run `orphan=1`), marks and amends on the deepest
-//! open node (the model's `Mark`), marks and gaps on the run or the session
-//! whatever is open (`MarkOutside`), and an update that carries no records
-//! ([`Log::after_handoff`] at the drawn count plus one: `Draw`, `StandDown`
-//! past the reserve, `HandoffUncarried`), and one that carries it
-//! ([`Log::carry`] cut to the model's `CarryCap`, then [`Log::from_carry`]:
-//! `HandoffCarried`, its shed and `CarryDone`). After every action the real
-//! ring is projected onto the model's class counts through the shipping
-//! classifier ([`Log::class_of`]), and the model must reach that projection
-//! from the state before by the action and the eviction batch it arms, with
-//! every invariant holding.
-//!
-//! The projection is the soundness pin, so the negative controls show it is
-//! load-bearing: an eviction left uncounted, an open record of the open path
-//! taken, a close taken while its detail lives, and a fold recomputed from
-//! the ring are each rejected. Each real step also names the eviction actions
-//! the model's batch took to reach it, and the walks must drive every one of
-//! them. A three-record ring takes two records a batch from at most three
-//! candidates, where the order of closes and current detail never shows, so
-//! the over-half rule is bound at the model's `Cap = 6` by a script that
-//! makes it decide ([`the_over_half_rule_is_the_models_where_it_decides`]).
-//!
-//! Two of the policy's rules are bound by unit tests alone, not here: the
-//! newest record's shelter of the closes above it (only an amend of a closed
-//! node can make the newest record hang under a close, and the model has no
-//! such action: `ring_bounds::the_newest_record_and_the_close_above_it_stay`),
-//! and which open node's rollup counts a loss (the model counts losses, not
-//! where they land: `ring_bounds::an_evicted_record_counts_into_its_nearest_open_node`,
-//! `ring_bounds::an_amend_of_a_closed_node_hangs_where_it_did_or_is_refused`,
-//! `ring_bounds::an_amend_of_a_closed_node_reindexes_its_closed_ancestors_too`,
-//! `fold_laws`).
+//! Tier-1 conformance tests for [`Log`] against `SessionLogRing`
+//! ([`Log::after_handoff`], [`Log::carry`], [`Log::from_carry`], [`Log::class_of`],
+//! [`the_over_half_rule_is_the_models_where_it_decides`]).
 
 use aterm_models_session::session_log_ring_model;
 use aterm_slog::{
@@ -58,8 +20,7 @@ use crate::support::at;
 /// The real ring's record bound: the model's `Cap`.
 const CAP: usize = 3;
 
-/// The model's eviction actions, in no order: the batch the harness lets the
-/// model take after an append until it disarms (`ev = 0`).
+/// The model's eviction actions, in no order.
 const EVICTS: &[&str] = &[
     "EvictOldDetail",
     "EvictTurnDetail",
@@ -78,8 +39,7 @@ const RESERVE: u64 = 2;
 /// The carry's record bound in the walk: the model's `CarryCap`.
 const CARRY_CAP: usize = 2;
 
-/// The model at the real ring's bound, with `MaxSeq` and `After` out of the
-/// walk's way.
+/// The model at the real ring's bound, with `MaxSeq` and `After` out of the walk's way.
 fn model() -> Model {
     with_consts(
         &session_log_ring_model(),
@@ -113,14 +73,11 @@ struct World {
     turns: i64,
     /// Close records written for the current turn node.
     tclose: i64,
-    /// The update, played as the host plays it: the drawn count (`log_seq`)
-    /// while a manifest stands, the last seq the outgoing log assigned, and
-    /// whether the update happened.
+    /// The update, played as the host plays it.
     ceil: Option<u64>,
     hi: u64,
     updated: bool,
-    /// The successor's first seq, and for a carried update the open path
-    /// it crossed with (its code plus one) and whether it moved since.
+    /// The successor's first seq.
     hseq: u64,
     cpath: i64,
     moved: bool,
@@ -184,9 +141,7 @@ fn under(log: &Log, r: &Rec, root: Node) -> bool {
     false
 }
 
-/// The projection onto the model's variables. The fold's turn and total are
-/// passed in so the negative control can substitute a fold recomputed from
-/// the ring.
+/// The projection onto the model's variables.
 fn project_with(w: &World, fold_turn: bool, fold_turns: u32) -> State {
     let log = &w.log;
     let open = |lvl: Lvl| {
@@ -249,8 +204,6 @@ fn project_with(w: &World, fold_turn: bool, fold_turns: u32) -> State {
         ("hi", w.hi as i64),
         ("ceil", w.ceil.map_or(0, |c| c as i64)),
         ("drawn", i64::from(w.ceil.is_some())),
-        // The epoch the log is at, against the walk's first (0): the model's
-        // `ep` is whether it rose.
         ("ep", i64::from(log.ep() > 0)),
         (
             "holes",
@@ -291,8 +244,7 @@ fn project_with(w: &World, fold_turn: bool, fold_turns: u32) -> State {
 /// The eviction actions some path of the model's took, by name.
 type Used = std::collections::BTreeSet<&'static str>;
 
-/// `s` (reached by a path that took `used`) into `into`, its paths' actions
-/// merged with any other path's to the same state.
+/// Merge state `s` and its `used` eviction actions into `into`.
 fn merge(into: &mut Vec<(State, Used)>, s: State, used: Used) {
     match into.iter_mut().find(|(t, _)| *t == s) {
         Some((_, u)) => u.extend(used),
@@ -300,9 +252,7 @@ fn merge(into: &mut Vec<(State, Used)>, s: State, used: Used) {
     }
 }
 
-/// Every state the model reaches from `prev` by `action` and then the batch
-/// it armed, run to its end, each with the eviction actions the paths to it
-/// took.
+/// Reachable states from `prev` via `action` and its eviction batch, with actions taken.
 fn after_batch_paths(m: &Model, action: &str, prev: &State) -> Vec<(State, Used)> {
     let mut done: Vec<(State, Used)> = Vec::new();
     let mut frontier: Vec<(State, Used)> = m
@@ -347,8 +297,7 @@ fn after_batch_paths(m: &Model, action: &str, prev: &State) -> Vec<(State, Used)
     panic!("a batch that never ends from {prev:?} by `{action}`");
 }
 
-/// Every state the model reaches from `prev` by `action` and then the batch
-/// it armed, run to its end.
+/// Reachable states from `prev` via `action` and its eviction batch.
 fn after_batch(m: &Model, action: &str, prev: &State) -> Vec<State> {
     after_batch_paths(m, action, prev)
         .into_iter()
@@ -356,9 +305,7 @@ fn after_batch(m: &Model, action: &str, prev: &State) -> Vec<State> {
         .collect()
 }
 
-/// The real step `action` took from `prev` to `next` is one the model admits
-/// (the action, then its batch), and every invariant holds after it. Returns
-/// the eviction actions the model's paths to it took.
+/// Assert that the step from `prev` to `next` under `action` is admitted by the model.
 fn admitted(m: &Model, action: &str, prev: &State, next: &State) -> Used {
     let reach = after_batch_paths(m, action, prev);
     match reach.iter().find(|(s, _)| s == next) {
@@ -411,8 +358,6 @@ fn perform(w: &mut World, action: &'static str) {
             );
         }
         "OpenOrphanStep" => {
-            // Asked under the run, or under the closed turn: either way it
-            // attaches to the run, marked an orphan.
             let run = w.run.expect("a run is open");
             let asked = w
                 .closed_turn
@@ -477,7 +422,6 @@ fn perform(w: &mut World, action: &'static str) {
                 w.closed_turn = Some(t);
                 w.tclose += 1;
             }
-            // Every open node under the run closed with it, one record each.
             assert_eq!(w.log.last_seq() - seq, open_before);
             assert!(
                 w.log.open_nodes().is_empty(),
@@ -546,8 +490,6 @@ fn perform(w: &mut World, action: &'static str) {
             w.hseq = ceil + 1;
         }
         "Crash" => {
-            // A crash adoption, as the host plays it: a new seq space, its
-            // epoch above the last (the keeper tag's), `gap why=crash` first.
             let ep = w.log.ep() + 1;
             w.log = Log::with_limits(ep, w.limits);
             w.log.gap(GapWhy::Crash, 0, stamp);
@@ -561,7 +503,6 @@ fn perform(w: &mut World, action: &'static str) {
             w.hi = w.log.last_seq();
             let code = |n: Option<Node>, k: i64| i64::from(n.is_some()) * k;
             w.cpath = 1 + code(w.run, 1) + code(w.turn, 2) + code(w.step, 4);
-            // The carry cut to the model's `CarryCap` records.
             let out = w
                 .log
                 .carry(
@@ -632,7 +573,6 @@ fn walk(m: &Model, seed: u64, len: usize) -> std::collections::BTreeMap<&'static
             .copied()
             .filter(|a| m.action_enabled(model_action(a), &prev))
             .collect();
-        // The update late in the walk, so most of it runs before.
         let enabled: Vec<&'static str> = if w.clock < 2000 {
             enabled
                 .into_iter()
@@ -680,8 +620,6 @@ fn slog_ring_conforms_to_derived_model() {
     perform(&mut too_wide, "HandoffUncarried");
     admitted(&m, "HandoffUncarried", &before, &too_wide.project());
     let mut ran = std::collections::BTreeMap::new();
-    // A reachable, tightly bounded carry is an explicit positive control;
-    // stricter admission need not happen by chance in the seeded walks.
     let mut carried = World::new();
     for action in ["OpenRun", "Mark", "Mark", "Draw", "HandoffCarried"] {
         let prev = carried.project();
@@ -697,8 +635,6 @@ fn slog_ring_conforms_to_derived_model() {
             *ran.entry(k).or_insert(0usize) += v;
         }
     }
-    // Every action and every eviction the model's batch can take, the
-    // policy's order among them included, was driven by a real step.
     for a in ACTIONS.iter().chain(EVICTS).chain(&["(evicted)"]) {
         assert!(
             ran.get(a).copied().unwrap_or(0) > 0,
@@ -707,9 +643,6 @@ fn slog_ring_conforms_to_derived_model() {
     }
     eprintln!("ring conformance coverage: {ran:?}");
 
-    // The ty tier re-checks a sample of real transitions where it is
-    // installed (the action alone: the projection is taken after its batch,
-    // so the sample is of appends that arm none).
     let mut w = World::new();
     for action in ["OpenRun", "OpenTurn", "OpenStep"] {
         let from = w.project();
@@ -731,9 +664,6 @@ fn slog_ring_conforms_to_derived_model() {
     }
 }
 
-/// THE POLICY FUNCTIONS, by name: a batch starts where the model's append
-/// arms one (`over_limits`, the ring past `Cap`) and stops at the model's
-/// `Low` (`low_water`), and closes go before current detail exactly when
 /// the model's `Hf` says they pass half (`closes_over_half`).
 #[test]
 fn eviction_policy_is_the_models() {
@@ -752,15 +682,6 @@ fn eviction_policy_is_the_models() {
     }
 }
 
-/// THE OVER-HALF RULE IS THE MODEL'S, WHERE IT DECIDES: a three-record ring
-/// evicts two records a batch from at most three candidates, so closes and
-/// current detail are taken alike whichever goes first, and the rule never
-/// shows in the walk above. At the model's `Cap = 6` (`Low = 5`), five runs
-/// opened and closed, then session marks: a batch faces four closes (past
-/// half) and two current marks, and takes one close, then (the closes no
-/// longer past half) one mark. The real ring's step is the model's, by
-/// `EvictClose` then `EvictCurrentOut`. NEGATIVE CONTROL: the ring a rule
-/// without the half guard leaves (both marks taken, every close kept) is
 /// one the model never reaches, and so is the one that takes two closes.
 #[test]
 fn the_over_half_rule_is_the_models_where_it_decides() {
@@ -805,7 +726,6 @@ fn the_over_half_rule_is_the_models_where_it_decides() {
         "{used:?}"
     );
     let reach = after_batch(&m, "MarkOutside", &prev);
-    // NEGATIVE CONTROLS: detail first (the half guard gone), closes only.
     let mut detail_first = next.clone();
     detail_first.insert("cls", 4);
     detail_first.insert("dout", 1);
@@ -840,20 +760,17 @@ fn slog_ring_conformance_rejects_what_the_ring_never_does() {
         "the turn's detail and open went; its close stayed"
     );
 
-    // An eviction nobody counted.
     let mut uncounted = next.clone();
     uncounted.insert("lost", next["lost"] - 1);
     assert!(!after_batch(&m, "CloseTurn", &prev).contains(&uncounted));
     assert!(!m.check_invariant("NoSilentLoss", &uncounted));
 
-    // A close taken while its detail lives.
     let mut early = next.clone();
     early.insert("tdet", 1);
     early.insert("tcl", 0);
     assert!(!after_batch(&m, "CloseTurn", &prev).contains(&early));
     assert!(!m.check_invariant("RollupOutlivesDetail", &early));
 
-    // The open path's own record taken.
     let mut o = World::new();
     for action in ["OpenRun", "OpenTurn", "Mark", "Mark"] {
         perform(&mut o, action);
@@ -873,8 +790,6 @@ fn slog_ring_conformance_rejects_what_the_ring_never_does() {
     assert!(!m.check_invariant("OpenPathRetained", &taken));
     assert!(!after_batch(&m, "Mark", &before).contains(&taken));
 
-    // A fold recomputed from the ring: it no longer counts the closed turn
-    // whose open the batch took.
     let mut refold = Fold::new(w.log.ep());
     for r in w.log.window() {
         refold.apply(r);
@@ -889,7 +804,6 @@ fn slog_ring_conformance_rejects_what_the_ring_never_does() {
     assert!(!m.check_invariant("ProjectionIndependentOfEviction", &from_ring));
     assert!(!after_batch(&m, "CloseTurn", &prev).contains(&from_ring));
 
-    // A carried update that forgot the open path.
     let mut c = World::new();
     for action in ["OpenRun", "OpenTurn", "Draw"] {
         perform(&mut c, action);
@@ -917,8 +831,6 @@ fn slog_ring_conformance_rejects_what_the_ring_never_does() {
     assert!(!m.check_invariant("CarryKeepsOpenPath", &forgot));
     assert!(!after_batch(&m, "HandoffCarried", &before).contains(&forgot));
 
-    // A crash adoption that kept the epoch (two adoptions in one wall second,
-    // told nothing of the last epoch): its cursors would read on.
     let mut k = World::new();
     for action in ["OpenRun", "Mark"] {
         perform(&mut k, action);

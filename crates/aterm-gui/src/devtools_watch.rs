@@ -1,34 +1,13 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Developer Tools list, handled by the window.
-//!
-//! macOS holds every new program aterm starts for its first-run check unless aterm is on
-//! System Settings ▸ Privacy & Security ▸ Developer Tools (`atpkg::devtools`). Only the
-//! owner can switch it on, so the window brings them to the switch:
-//!
-//! * it reads the list at its first focus, and again when the owner comes back to aterm
-//!   while aterm is not on it, at most every [`REREAD_EVERY`] (the `privacy` verb's read,
-//!   on a worker, `Wake::DevToolsProbeReady` when done); the first focus after aterm
-//!   brought the owner to the pane reads however soon it comes
-//!   ([`DevToolsWatch::note_handed_over`]);
-//! * `not_granted` raises one digest line whose press opens the pane and whose second
-//!   capsule opens aterm's Settings ▸ Security
-//!   ([`crate::message_reporters::devtools_entry`]), and once per aterm version asks for
-//!   the pane brought up at a quiet moment (`App::hand_devtools_to_owner`,
-//!   [`crate::devtools_helper`]);
-//! * `granted` ends the line; `unknown` changes nothing.
-//!
-//! It never presses anything in System Settings, never writes TCC.db and never calls
-//! tccutil. A headless instance, and every unit test, reads nothing and opens nothing.
+//! Window-driven watcher for the macOS Developer Tools privacy list.
 
 use std::time::{Duration, Instant};
 
 use aterm_containment::DevToolGrant;
 
-/// While aterm is not on the list, a focus gain reads it again at most this often: one
-/// read is a `log show` of about a second, and an owner who declines still switches
-/// windows all day.
+/// Minimum interval between focus-triggered re-reads while aterm is not on the list.
 pub(crate) const REREAD_EVERY: Duration = Duration::from_secs(60);
 
 /// What one reading asks of the window.
@@ -36,8 +15,7 @@ pub(crate) const REREAD_EVERY: Duration = Duration::from_secs(60);
 pub(crate) enum Step {
     /// Nothing changes.
     Nothing,
-    /// aterm is not on the list: raise the line, and when `hand_over` ask for the pane
-    /// brought up for the owner.
+    /// Raises the digest line and optionally requests bringing up the Settings pane.
     Raise {
         /// Ask for the pane brought up (once per aterm version).
         hand_over: bool,
@@ -75,10 +53,7 @@ pub(crate) struct DevToolsWatch {
 }
 
 impl DevToolsWatch {
-    /// Whether a focus gain at `now` should read the list: the first one (the launch
-    /// read); the first after aterm brought the owner to the pane
-    /// ([`Self::note_handed_over`]); otherwise, while aterm is not on the list, one at
-    /// most every [`REREAD_EVERY`].
+    /// Returns whether a focus gain at `now` should read the Developer Tools list.
     pub(crate) fn wants_read(&mut self, now: Instant) -> bool {
         let want = !self.read_once
             || self.read_on_return
@@ -95,29 +70,20 @@ impl DevToolsWatch {
         want
     }
 
-    /// aterm just brought the owner to the Developer Tools pane: the next focus gain reads
-    /// the list, even within [`REREAD_EVERY`] of the last read (the launch read is seconds
-    /// old when the first focus hands the pane over) and whatever it said. One read, then
-    /// the gate is back.
+    /// Records that aterm opened the Developer Tools pane so the next focus gain re-reads.
     pub(crate) fn note_handed_over(&mut self) {
         self.read_on_return = true;
     }
 
-    /// The window's own hand-over was refused as `unknown` or `listed`, which decides
-    /// nothing against bringing the owner to the page: the next `not_granted` reading
-    /// asks again, once.
+    /// Resets the hand-over latch after an inconclusive helper attempt.
     pub(crate) fn forget_hand_over(&mut self) {
         self.handed_over = false;
     }
 
-    /// What a completed reading asks for. `opened_this_version`: aterm already opened
-    /// the pane for the running version (`atpkg::devtools::last_opened`).
+    /// Folds a completed `grant` reading into the watcher and returns the window [`Step`].
     pub(crate) fn observe(&mut self, grant: DevToolGrant, opened_this_version: bool) -> Step {
         match grant {
             DevToolGrant::Granted => {
-                // Only a process that read `not_granted` was checked before the switch
-                // went on, so only it holds a verdict macOS must be asked to redo; one
-                // already granted at its launch read was never refused.
                 if self.awaiting_owner {
                     self.owe_refresh();
                 }
@@ -135,24 +101,14 @@ impl DevToolsWatch {
         }
     }
 
-    /// The owner pressed "I've switched it on" (the panel aterm cannot confirm from,
-    /// its list unreadable without Full Disk Access): macOS is asked about aterm again
-    /// at once — every press, since one made before the password was typed met the
-    /// switch still off — and its answer is then the reading that confirms the press.
-    /// The `granted` reading it brings about asks no more.
+    /// Records that the owner confirmed switching on Developer Tools and requests a refresh.
     pub(crate) fn note_switched_on(&mut self) -> bool {
         self.refreshed = true;
         self.refresh_owed = false;
         true
     }
 
-    /// Whether the reading the owner's return brought ([`Self::note_handed_over`],
-    /// then [`Self::wants_read`]) asks macOS about aterm again: when it could not read
-    /// the list (`list_read` false: no Full Disk Access) and tccd has not answered
-    /// `granted`. Without the list, a process checked before the switch went on never
-    /// reads `granted` by itself — tccd is not asked about it again — so whatever the
-    /// owner did on the page (a press before their password, or none), coming back from
-    /// it asks once. Taken by the first completed reading after that focus gain.
+    /// Takes whether the owner's return reading requires refreshing macOS's verdict.
     pub(crate) fn take_return_prime(&mut self, list_read: bool, grant: DevToolGrant) -> bool {
         let owed = std::mem::take(&mut self.prime_on_return);
         let prime = owed && !list_read && grant != DevToolGrant::Granted;
@@ -163,8 +119,7 @@ impl DevToolsWatch {
         prime
     }
 
-    /// Whether macOS is owed an ask about aterm now (`atpkg::devtools::refresh_verdict`):
-    /// once per switch-on, and the answer is taken.
+    /// Takes whether a verdict refresh is owed to macOS.
     pub(crate) fn take_refresh(&mut self) -> bool {
         std::mem::take(&mut self.refresh_owed)
     }
@@ -217,8 +172,6 @@ mod tests {
             !watch.wants_read(t1 + REREAD_EVERY * 9),
             "on the list: focus reads nothing"
         );
-        // A refused hand-over, forgotten, asks again at the next `not_granted`, once;
-        // unforgotten (above) it asked once.
         watch.forget_hand_over();
         assert_eq!(
             watch.observe(DevToolGrant::NotGranted, false),
@@ -239,7 +192,6 @@ mod tests {
         let t0 = Instant::now();
         let soon = Duration::from_secs(20);
         assert!(soon < REREAD_EVERY);
-        // The control: launch read, not granted, back 20 s later: gated.
         let mut watch = DevToolsWatch::default();
         assert!(watch.wants_read(t0));
         assert_eq!(
@@ -247,7 +199,6 @@ mod tests {
             Step::Raise { hand_over: true }
         );
         assert!(!watch.wants_read(t0 + soon), "no hand-over: the gate holds");
-        // The same, with the pane handed over.
         let mut watch = DevToolsWatch::default();
         assert!(watch.wants_read(t0));
         assert_eq!(
@@ -261,8 +212,6 @@ mod tests {
             "one read: the gate is back"
         );
         assert!(watch.wants_read(t0 + soon + REREAD_EVERY));
-        // Not awaiting the owner (the list could not be read, or read on): an owner's
-        // press still has its return read.
         for grant in [DevToolGrant::Unknown, DevToolGrant::Granted] {
             let mut watch = DevToolsWatch::default();
             assert!(watch.wants_read(t0));

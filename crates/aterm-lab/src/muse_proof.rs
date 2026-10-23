@@ -1,50 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The proof for Muse Code in the lab.
-//!
-//! `muse-selftest [tag] [--keep]` (about 30 s): a lab of its own (the harness
-//! off: this is the jail's and the agent's proof, not the harness's), the
-//! REAL Muse Code launched in the tab against the stub's Meta model API
-//! ([`crate::muse`]: a scratch HOME, the lab's fake `META_API_KEY`,
-//! `--base-url` the stub, `--trust-workspace`, so no trust box and no sign-in
-//! draws), one turn the stub holds 3 s, then the witnesses, each with a
-//! control that shows it can see — one whose control saw nothing is
-//! UNPROVEN, never ok:
-//!
-//! * NOTHING REACHED META: no non-loopback socket of the lab (the egress
-//!   witness, which did see Muse Code's own process connect to the stub), and
-//!   every request to the stub's Meta routes (the turn, its side calls, the
-//!   model catalog) carried the lab's fake key, never a Meta login (there was
-//!   one);
-//! * THE OWNER'S `~/.config/muse` (and its sessions' `~/.local/share/muse`,
-//!   and `~/Library/Application Support/Muse`, whose session-name authority
-//!   1.4.10 opened whatever HOME said) UNTOUCHED, never looked at: no kernel
-//!   refusal names one (the log kept this lab's control refusal, a jailed
-//!   write into the run directory, or its silence is unproven), and no process
-//!   of Muse Code holds a file under one — while Muse Code did write under the
-//!   scratch HOME it was given, its `.config/muse` and `.local/share/muse`
-//!   (the control);
-//! * no process of Muse Code holds any other file of the owner's home outside
-//!   the run directory and its own build ([`crate::selftest::owner_strays`]);
-//! * NOTHING LEFT IN THE SHARED `/tmp`: the per-user
-//!   `/private/tmp/tbh-<uid>-rt/muse` (Muse Code's registry, which none of
-//!   `TMPDIR`, `TMP`, `TEMP`, `XDG_RUNTIME_DIR` or `HOME` moves), listed
-//!   before `up` and after `down`, differs only by entries that name a live
-//!   Muse Code outside the jail (the owner's, another lab's) and the
-//!   registry's shared directories and lock a first run makes, and nothing
-//!   the tab's Muse Code made there stands — the witness saw it hold its
-//!   lease, its socket and its session record (the control), which `down`
-//!   took back ([`crate::runtime_dirs`]);
-//! * nothing opened on the desktop (the open recorder; its control, a
-//!   bare-name `open` in the jail, was logged), the isolation probes on a
-//!   replica home with this lab's rules, `twin` refusing a planted link, an
-//!   orphan in the jail found and witnessed, and after `down` nothing left in
-//!   the jail.
-//!
-//! Exit 1 when a check fails. Nothing is typed into a sign-in screen: the
-//! fake key keeps every one away, and a screen that is no composer within 60
-//! s fails the run before any turn is typed.
+//! Lab selftest and isolation proof (`muse-selftest`) for Muse Code.
 
 use std::fs;
 use std::path::Path;
@@ -74,13 +31,10 @@ const REPLY: &str = "Hi! I am the local lab stub, not a model. (the selftest tur
 /// request.
 const PROMPT: &str = "carry on with the task";
 
-/// Muse Code's own directories under a home: its config (its login, its
-/// workspace trust) and its data (its sessions), relative to the home.
+/// Muse Code config and data directories relative to a home directory.
 pub const OWN_DIRS: [&str; 2] = [".config/muse", ".local/share/muse"];
 
-/// The owner's Muse Code directories, relative to the owner's home: its own
-/// two, and `Library/Application Support/Muse` (its session-name authority,
-/// which 1.4.10 reads from the account's home whatever HOME says).
+/// Owner Muse Code directories relative to the owner's home directory.
 pub const OWNER_DIRS: [&str; 3] = [
     ".config/muse",
     ".local/share/muse",
@@ -91,12 +45,7 @@ fn ok(b: bool) -> Verdict {
     if b { Verdict::Ok } else { Verdict::Fail }
 }
 
-/// The requests to the stub's Meta routes in its log, as `(how many, the
-/// auth labels that are not the lab's fake key)`: every `kind=muse…` line (the
-/// turn's `kind=muse`, a side call's `kind=muse-side`, the catalog's
-/// `kind=muse-models`) names the credential it carried
-/// ([`crate::stub::auth_label`]: `auth=key` is [`crate::stub::LAB_CODEX_KEY`]
-/// alone; a Meta login would read `jwt:…`, `other(N chars)` or `none`).
+/// Extracts Meta route request count and non-lab auth labels from `stub_log`.
 #[must_use]
 pub fn muse_auths(stub_log: &str) -> (usize, Vec<String>) {
     let mut n = 0;
@@ -117,20 +66,14 @@ pub fn muse_auths(stub_log: &str) -> (usize, Vec<String>) {
     (n, other)
 }
 
-/// The key check (module header): the stub took at least one request on its
-/// Meta routes — its control: Muse Code's requests reach the stub's log — and
-/// every one carried the lab's fake key and nothing else ([`muse_auths`]). No
-/// request fails it: Muse Code was never seen asking.
+/// Verifies that the stub observed Meta requests using only the lab's fake API key.
 #[must_use]
 pub fn key_verdict(stub_log: &str) -> Verdict {
     let (n, other) = muse_auths(stub_log);
     ok(n > 0 && other.is_empty())
 }
 
-/// The files `lsof -Fn` lines name under one of the owner's Muse Code
-/// directories (`<home>/<dir>` of [`OWNER_DIRS`], in each of the owner's
-/// `homes`: [`crate::paths::Paths::guarded_homes`]): the `n<path>` lines whose
-/// path is the directory or under it.
+/// Extracts open file paths from `lsof -Fn` output under [`OWNER_DIRS`] for `homes`.
 #[must_use]
 pub fn held_under(lsof_fn: &str, homes: &[String]) -> Vec<String> {
     let roots: Vec<String> = OWNER_DIRS
@@ -150,8 +93,7 @@ pub fn held_under(lsof_fn: &str, homes: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The kernel refusals (each one log line) that name one of the owner's
-/// Muse Code directories ([`OWNER_DIRS`] under each of `homes`).
+/// Filters kernel sandbox refusal lines naming [`OWNER_DIRS`] under `homes`.
 #[must_use]
 pub fn naming_own_dirs(refusals: &[String], homes: &[String]) -> Vec<String> {
     let roots: Vec<String> = OWNER_DIRS
@@ -174,11 +116,7 @@ pub fn naming_own_dirs(refusals: &[String], homes: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The owner's-data check (module header): no process of Muse Code holds a
-/// file under the owner's directories (`held`), and Muse Code wrote under the
-/// scratch HOME it was given (`wrote`, its control: a run that wrote nothing
-/// there shows nothing of where it writes) — with no Muse Code process seen
-/// (`pids`), or an incomplete open-file observation, nothing is shown.
+/// Verifies that no Muse Code process held files under the owner's directories.
 #[must_use]
 pub fn owner_verdict(held: &[String], wrote: &[String], pids: &[i32], observed: bool) -> Verdict {
     if !held.is_empty() {
@@ -238,7 +176,7 @@ fn held_turn(run: &Run) -> Result<(), Fail> {
     Ok(())
 }
 
-/// `muse-selftest [tag] [--keep]`.
+/// Runs `muse-selftest [tag] [--keep]`.
 pub fn cmd_muse_selftest(args: &[String]) -> Res {
     let verb = "muse-selftest";
     let (mut tag, mut keep) = (verb.to_string(), false);
@@ -258,7 +196,6 @@ pub fn cmd_muse_selftest(args: &[String]) -> Res {
         lifeline: !keep,
         ..UpOpts::from_env()
     };
-    // the shared runtime directory as it stands before up, for the last check
     let registry = crate::runtime_dirs::roots(crate::sys::getuid());
     let listed = crate::runtime_dirs::listing(&registry);
     let run = crate::lab::up(&tag, &o).map_err(|f| {
@@ -268,7 +205,6 @@ pub fn cmd_muse_selftest(args: &[String]) -> Res {
             Fail::die(format!("{verb}: up failed: {}", f.msg.unwrap_or_default()))
         }
     })?;
-    // the lab it brought up does not outlive it, however it ends
     let mut t = match checks(&run) {
         Ok(t) => t,
         Err(f) => {
@@ -304,8 +240,6 @@ pub fn cmd_muse_selftest(args: &[String]) -> Res {
             ),
             ok(t.before.contains(&t.orphan) && !t.pids.is_empty() && left.is_empty()),
         );
-        // what is new there since up: what down claimed and left, and anything else no live Muse Code outside the
-        // jail names that is not the registry's shared structure
         let made: Vec<String> = t.runtime.iter().map(|h| h.path.clone()).collect();
         let since = crate::runtime_dirs::after_down(
             &listed,
@@ -360,14 +294,7 @@ struct Before {
     runtime: Vec<Held>,
 }
 
-/// The runtime check: after `down`, nothing is left in the shared runtime
-/// directory (`left`: what the tab's Muse Code made that still stands, and
-/// anything new since `up` that no live Muse Code outside the jail names and
-/// that is not the registry's shared structure, [`crate::runtime_dirs::new_since`])
-/// — its control, the witness saw the tab's Muse Code hold its lease, its
-/// socket and its session record (`made`, paths): without all three, nothing
-/// is shown. Every listing and absence-sensitive recheck must also have
-/// completed; a known leftover fails even when another read was unknown.
+/// Verifies that Muse Code left no residual files in the shared runtime directory after shutdown.
 #[must_use]
 pub fn runtime_verdict(made: &[String], left: &[String], complete: bool) -> Verdict {
     let has = |end: &str, inside: &str| made.iter().any(|p| p.ends_with(end) && p.contains(inside));
@@ -388,12 +315,7 @@ pub fn runtime_verdict(made: &[String], left: &[String], complete: bool) -> Verd
 fn checks(run: &Run) -> Result<Before, Fail> {
     let verb = "muse-selftest";
     crate::muse::need_muse(run)?;
-    // the owner's homes: the account's, whatever HOME says, and HOME's when it names another
     let watched = Watched::of(crate::paths::paths());
-    // The refusals' control: a jailed write into the run directory, which the jail refuses; the unified log keeps
-    // such a report or drops it, so its silence about the owner's Muse Code directories counts only when it kept
-    // the control. The recorder's control: a bare-name `open` in the jail, on the agent's PATH, lands on the
-    // recorder and is logged.
     let ctlname = format!(
         "lab-control-refusal-{}-{}",
         std::process::id(),
@@ -435,7 +357,6 @@ fn checks(run: &Run) -> Result<Before, Fail> {
                     && l.contains("mode=selftest kind=muse auth=key")
             });
     }
-    // the witness must have seen Muse Code's own connection to the stub, under its pid
     let pids = muse_pids(run);
     let sockets = || fs::read_to_string(run.run.join("sockets.log")).unwrap_or_default();
     for _ in 0..20 {
@@ -476,8 +397,6 @@ fn checks(run: &Run) -> Result<Before, Fail> {
     }
     let opened = crate::recorder::Witness::read(run, &open_control);
     opened.print();
-    // the owner's Muse Code directories: what the kernel refused naming them, what Muse Code holds open, and its
-    // own writes under the scratch HOME
     let mut klog = String::new();
     let mut control = false;
     for _ in 0..3 {
@@ -502,7 +421,6 @@ fn checks(run: &Run) -> Result<Before, Fail> {
         .collect();
     let (mut held, mut strays, mut observed) = (Vec::new(), Vec::new(), true);
     let roots = lab_roots(run, &run.muse_bin, watched.homes());
-    // a file a failed or partial report names is still held; only complete reports prove that none is
     for &pid in &pids {
         let seen = observe_open_files(pid);
         observed &= seen.complete;
@@ -558,7 +476,6 @@ fn checks(run: &Run) -> Result<Before, Fail> {
             "none".into()
         }
     );
-    // what the tab's Muse Code made in its shared runtime directory, as the witness saw it hold them
     let runtime: Vec<Held> = crate::runtime_dirs::claimed(&run.run)
         .into_iter()
         .filter(|h| pids.contains(&h.pid))
@@ -686,9 +603,7 @@ mod tests {
 ";
 
     /// Every request to the stub's Meta routes names the key it carried: the
-    /// turn, its side calls and the catalog. NEGATIVE CONTROLS: a request
-    /// with a bearer token of another shape, or none, is named by its label;
-    /// a log with no Meta request counts none.
+    /// turn, its side calls and the catalog.
     #[test]
     fn every_meta_request_names_the_key_it_carried() {
         assert_eq!(muse_auths(STUB_LOG), (4, Vec::new()));
@@ -707,8 +622,7 @@ mod tests {
     /// THE KEY CHECK FAILS ON ANY CREDENTIAL BUT THE LAB'S KEY: the
     /// selftest's own log passes it; a Meta login — a bearer token of
     /// another shape, a request with none, each labelled as the stub labels
-    /// it ([`crate::stub::auth_label`]) — fails it. NEGATIVE CONTROL: a log
-    /// with no Meta request fails it too (its control saw nothing).
+    /// it ([`crate::stub::auth_label`]) — fails it.
     #[test]
     fn the_key_check_fails_on_any_credential_but_the_labs_key() {
         use crate::stub::auth_label;
@@ -735,10 +649,7 @@ mod tests {
     }
 
     /// A file of the owner's Muse Code directories open in a Muse Code
-    /// process is named, its config and its sessions alike. NEGATIVE
-    /// CONTROLS: the scratch HOME's own `.config/muse`, a sibling whose name
-    /// only begins the same (`.config/muse-other`), and the owner's other
-    /// files are not.
+    /// process is named, its config and its sessions alike.
     #[test]
     fn a_file_open_under_the_owners_muse_dirs_is_named() {
         let home = &["/Users//owner".to_string()];
@@ -764,7 +675,7 @@ mod tests {
 
     /// A kernel refusal naming the owner's Muse Code directories is named;
     /// one naming another directory of the owner's, or a sibling whose name
-    /// only begins the same, is not. NEGATIVE CONTROL: no refusal names none.
+    /// only begins the same, is not.
     #[test]
     fn a_refusal_naming_the_owners_muse_dirs_is_named() {
         let home = &["/Users//owner".to_string()];
@@ -787,8 +698,7 @@ mod tests {
     /// WATCHED: Muse Code 1.4.10 opened the account's own `session-names.db`
     /// whatever `HOME` said, so a file held, or a refusal named, under the
     /// account's home (the account database's) counts, as does one under the
-    /// scratch home's own. NEGATIVE CONTROL: the witness of `$HOME` alone (the
-    /// lab before this) sees none of the account's.
+    /// scratch home's own.
     #[test]
     fn under_a_scratch_home_the_account_muse_dirs_are_watched() {
         let homes = crate::paths::guarded("/Users//owner", "/private/tmp/s/home");
@@ -803,7 +713,6 @@ mod tests {
         );
         let refusals = vec![format!("deny(1) file-read-data {db}")];
         assert_eq!(naming_own_dirs(&refusals, &homes), refusals);
-        // NEGATIVE CONTROL: $HOME's witness alone
         let env_only = crate::paths::guarded("", "/private/tmp/s/home");
         assert_eq!(
             held_under(&lsof, &env_only),
@@ -815,8 +724,7 @@ mod tests {
     /// THE OWNER'S-DATA CHECK FAILS ON A HELD FILE whatever its control saw,
     /// holds when Muse Code wrote under its own scratch HOME and held
     /// nothing, and is UNPROVEN when it wrote nothing there or no Muse Code
-    /// process was seen. NEGATIVE CONTROLS: the two unproven shapes are never
-    /// ok.
+    /// process was seen.
     #[test]
     fn the_owner_check_fails_on_a_held_file_and_needs_its_control() {
         let held = vec!["/Users//owner/.config/muse/auth.json".to_string()];
@@ -832,9 +740,7 @@ mod tests {
 
     /// Only an admitted successful report proves an absence: a timeout,
     /// nonzero exit, warning or capture ceiling is unknown, never a clean
-    /// observer. A held owner file is evidence however it was shown: one a
-    /// failed or partial report names still fails, as does one another
-    /// process's report names despite a miss.
+    /// observer.
     #[test]
     fn an_open_file_observer_must_return_a_complete_successful_report() {
         use crate::selftest::complete_open_files;
@@ -894,7 +800,7 @@ mod tests {
     /// made in the shared runtime directory, holds when its lease, socket and
     /// session record were all seen and none is left, and is UNPROVEN when the
     /// witness saw fewer (a Muse Code that made none, or a registry of another
-    /// shape). NEGATIVE CONTROL: no record at all is never ok.
+    /// shape).
     #[test]
     fn the_runtime_check_fails_on_a_leftover_and_needs_all_three_seen() {
         let r = "/private/tmp/tbh-501-rt/muse";

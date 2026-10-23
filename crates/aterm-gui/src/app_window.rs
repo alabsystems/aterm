@@ -1209,6 +1209,21 @@ impl App {
         let startup_before_surface_create = Instant::now();
         if self.backend.is_gpu() {
             let (w_px, h_px) = (raw_px.width, raw_px.height);
+            // On X11 the window's own presenter goes with it, which the GL arm
+            // posts through where a `GLXWindow` would stall the server
+            // (`present::x11::X11FrameSink`).
+            #[cfg(target_os = "linux")]
+            let surface_result = self
+                .backend
+                .gpu_mut()
+                .unwrap()
+                .create_window_surface_with_sink(
+                    window.clone(),
+                    w_px,
+                    h_px,
+                    Box::new(crate::present::x11::X11FrameSink::new(window.clone())),
+                );
+            #[cfg(not(target_os = "linux"))]
             let surface_result =
                 self.backend
                     .gpu_mut()
@@ -1580,8 +1595,11 @@ impl App {
         let plan = crate::session_log::ClosedKeep::plan(&self.pool.drops_of(&ids));
         for (id, planned) in ids.into_iter().zip(plan) {
             if self.detach_session_view(id) {
-                let keep = (!exits_app)
-                    .then(|| planned.unwrap_or(crate::session_log::ClosedKeep::Skeleton));
+                let keep = if exits_app {
+                    crate::session_log::ClosedKeep::Summary
+                } else {
+                    planned.unwrap_or(crate::session_log::ClosedKeep::Skeleton)
+                };
                 self.retire_session_registration_keeping(id, keep);
             }
         }

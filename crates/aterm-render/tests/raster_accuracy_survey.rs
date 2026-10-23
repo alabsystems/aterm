@@ -83,9 +83,9 @@ fn record(face: &aterm_font::Face, gid: u16) -> Option<Rec> {
     Some(r)
 }
 
-/// Sub-scanlines per pixel row. 64 is "8x supersampled" squared in y; the x
+/// Sub-scanlines per pixel row.
 const SUB: usize = 64;
-/// Uniform subdivisions flattening a quad/cubic, for the reference only. A
+/// Uniform subdivisions flattening a quad/cubic, for the reference only.
 const REF_SEGMENTS: usize = 256;
 
 /// A flat edge list in grid space (px, y down, origin at the canvas top-left).
@@ -132,9 +132,12 @@ fn flatten_ref(segs: &[Seg], scale: f32, ox: f32, oy: f32, n: usize) -> Vec<(P, 
 }
 
 /// Two crossings this close in x are one crossing point: the interval between
+/// coincident crossings has no interior to carry a winding number.
 const X_TIE_PX: f32 = 1e-6;
 
 /// Nonzero-winding coverage of `edges` over a `w`x`h` grid, in 0..=1, and
+/// whether the outline reaches a winding outside `{0, +1}` (or `{0, -1}` when
+/// reversed), i.e. self-overlaps or mixes contour orientations.
 fn reference_coverage_phased(
     edges: &[(P, P)],
     w: usize,
@@ -174,6 +177,7 @@ fn row_buckets(edges: &[(P, P)], h: usize, phase: f32) -> Vec<Vec<u32>> {
 }
 
 /// The sweep behind [`reference_coverage_phased`]: `candidates(row)` names the
+/// edges row `row`'s sub-scanlines test, in edge order.
 fn reference_sweep<'a>(
     edges: &[(P, P)],
     w: usize,
@@ -264,6 +268,7 @@ struct Canvas {
 }
 
 /// Place a candidate mask (its own `xmin`/`ymin`/`w`/`h`, rows top-down) into
+/// the canvas.
 fn place(
     canvas: &Canvas,
     dst: &mut [f32],
@@ -290,6 +295,7 @@ fn place(
 }
 
 /// The placement of one fill: design-to-pixel `scale`, the translation the
+/// outline is mapped through, and the grid it lands in.
 #[derive(Clone, Copy)]
 struct FillGrid {
     scale: f32,
@@ -300,6 +306,8 @@ struct FillGrid {
 }
 
 /// Rasterize with `aterm_render::raster`'s fill but the harness's own
+/// flattening: each quad/cubic splits into `n` uniform pieces, `n` chosen so
+/// the polyline deviates from the curve by under `tol` px.
 fn fill_with_tolerance(
     segs: &[Seg],
     grid: FillGrid,
@@ -450,6 +458,7 @@ fn build_case(face: &aterm_font::Face, gid: u16, px: f32) -> Option<GlyphCase> {
 }
 
 /// [`build_case`] with the reference's sub-scanline ladder displaced by `phase`
+/// px; the candidate rasters are untouched.
 fn build_case_phased(face: &aterm_font::Face, gid: u16, px: f32, phase: f32) -> Option<GlyphCase> {
     let upem = f32::from(face.units_per_em());
     let scale = px / upem;
@@ -552,6 +561,14 @@ fn corpus_chars() -> Vec<char> {
 const PX: [f32; 8] = [8.0, 10.0, 12.0, 14.0, 16.0, 20.0, 24.0, 32.0];
 
 /// Ground truth is expensive — 64 sub-scanlines over a 256-fold reference
+/// flattening, per glyph, ~120 ms per raster in an unoptimised build — so the
+/// guard scores two corpora and picks by build profile: a build with debug
+/// assertions (`targo --unverified test -p aterm-render`, 16 s; the optimized
+/// `--profile opt-test` keeps them on too) gets the SAMPLE (137 of 144
+/// rasters, 7 dropped by the winding classifier); one without them
+/// (`targo --unverified test --release -p aterm-render --test render_suite --
+/// raster_accuracy_survey::`) gets the whole thing (2,108 of 2,320 rasters, 212
+/// dropped, 17 s).
 const fn guard_corpus() -> (&'static [f32], usize, usize) {
     if cfg!(debug_assertions) {
         // where a coarse flattening degrades worst.
@@ -587,6 +604,7 @@ fn guard_chars(bytes: &'static [u8], name: &str, stride: usize) -> Vec<char> {
 }
 
 /// The accuracy bound on `raster::draw_quad` / `raster::draw_cubic`, in three
+/// limbs:
 #[test]
 fn flattening_accuracy_is_bounded() {
     /// Corpus mean |coverage error|, in 0..255 units, pooled over every raster.

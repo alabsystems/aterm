@@ -1,32 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `amacs` client's two exchanges with the window hosting its tab (amacs
-//! design §6.1-§6.4; slice N2): `edit` asks for a fresh Editor view of a file
-//! beside the session, and `await edit` waits until that view is gone.
-//!
-//! [`edit`] is one exchange. The server answers once the view is installed,
-//! and refuses on its own deadline (30 s, `ERR timeout ticket=<t>`, after
-//! which a late admission is dropped), so the wait here outlasts it. What a
-//! failure means for the client is [`EditErr::falls_back_to_terminal`]: an
-//! `ERR` or a window nobody could ask sends it to its own terminal; a
-//! request the window took and did not answer never does, because the view
-//! may still open and a second editor on the file would race it.
-//!
-//! [`await_edit`] is RE-ARMED with no total limit. Each leg asks for the
-//! server's bound (600 s); `OK timeout` re-arms the same key at once, inside
-//! the server's orphan grace. A leg cut by its server going away (a seamless
-//! update closes every connection at its Commit, a crash closes them all) is
-//! re-dialled: the session's socket is resolved afresh
-//! ([`crate::resolve_sock_for`], the graph entry a successor republishes) and
-//! the wait is re-armed by `uri=`, because a successor knows no ticket the old
-//! process minted but waits on the file's Editor views. Nothing taking the
-//! wait within [`crate::redial::SUCCESSOR_BOUND`] ends it
-//! [`AwaitErr::Replaced`], which the client exits [`crate::EXIT_REPLACED`]
-//! with.
-//!
-//! Both are written against a [`Wire`]: the control socket, or a test's
-//! script and clock.
+//! Client `edit` and `await edit` exchanges ([`edit`], [`await_edit`],
+//! [`EditErr::falls_back_to_terminal`], [`crate::resolve_sock_for`],
+//! [`crate::redial::SUCCESSOR_BOUND`], [`AwaitErr::Replaced`], [`crate::EXIT_REPLACED`],
+//! [`Wire`]).
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -36,9 +14,7 @@ pub use amacs::protocol::edit::{AwaitEdit, AwaitKey, EditOk, EditOutcome, EditRe
 /// The connect phase of either exchange: a running aterm answers at once.
 const CONNECT_WAIT: Duration = Duration::from_secs(10);
 
-/// How long `edit` waits for its answer once sent: past the server's own
-/// admission deadline (30 s, then `ERR timeout ticket=<t>`), so the server's
-/// answer always comes first.
+/// How long `edit` waits for its answer once sent.
 const EDIT_REPLY_WAIT: Duration = Duration::from_secs(45);
 
 /// What one `await edit` leg asks for: the server's bound.
@@ -50,34 +26,24 @@ const REDIAL_POLL: Duration = Duration::from_millis(250);
 /// Why `edit` opened no view.
 #[derive(Debug)]
 pub enum EditErr {
-    /// The window answered `ERR …` (the whole line): the request was refused
-    /// and nothing opened.
+    /// The window answered `ERR …` (the whole line): the request was refused and nothing opened.
     Refused(String),
-    /// The window answered `ERR timeout ticket=<t>`: the admission outran the
-    /// server's deadline, the ticket is cancelled and a late view is dropped.
+    /// The window answered `ERR timeout ticket=<t>`.
     TimedOut(String),
-    /// No window could be asked (no instance, a dead socket, a connect phase
-    /// nobody served): the request was not sent.
+    /// No window could be asked (no instance, a dead socket, a connect phase nobody served).
     Unreachable(io::Error),
-    /// Request delivery began but its outcome is unknown (a failed send or
-    /// a missing reply): the window may still open the view.
+    /// Request delivery began but its outcome is unknown (a failed send or a missing reply).
     NoAnswer(io::Error),
-    /// The window answered a line this client cannot read: it may have opened
-    /// the view.
+    /// The window answered a line this client cannot read: it may have opened the view.
     Unreadable(String),
-    /// The request cannot be written as one wire line (a field holding
-    /// whitespace, a bad line number); it was not sent.
+    /// The request cannot be formatted as a single wire line; nothing was sent.
     Unsendable(String),
 }
 
 impl EditErr {
-    /// Whether the client edits in its own terminal instead (design §6.1): on
-    /// an `ERR` the window answered, or when no window could be asked. A
-    /// request the window took without answering (its deadline, or ours)
-    /// never does: the view may still open, and two editors would race on
-    /// one file.
+    /// Whether the client edits in its own terminal instead .
     #[must_use]
-    pub fn falls_back_to_terminal(&self) -> bool {
+    pub const fn falls_back_to_terminal(&self) -> bool {
         match self {
             Self::Refused(_) | Self::Unreachable(_) | Self::Unsendable(_) => true,
             Self::TimedOut(_) | Self::NoAnswer(_) | Self::Unreadable(_) => false,
@@ -106,11 +72,9 @@ pub enum AwaitErr {
     Refused(String),
     /// The window answered a line this client cannot read.
     Unreadable(String),
-    /// The server went away and nothing took the wait again within
-    /// [`crate::redial::SUCCESSOR_BOUND`]; the last thing heard is kept.
+    /// The server disconnected and no successor resumed within [`crate::redial::SUCCESSOR_BOUND`].
     Replaced(String),
-    /// The session cannot be framed as one stable selector; no resolution
-    /// or request was attempted.
+    /// The session cannot be framed as one stable selector; no resolution or request was attempted.
     Unsendable(String),
 }
 
@@ -136,8 +100,7 @@ impl std::error::Error for AwaitErr {}
 trait Wire {
     /// The socket of the instance hosting the session, resolved now.
     fn resolve(&mut self) -> io::Result<String>;
-    /// Send `request` (one framed line) to `sock` and read the status line it
-    /// answers, waiting `reply` for it once sent.
+    /// Send a framed `request` line to `sock` and read the status line within `reply`.
     fn send(&mut self, sock: &str, request: &str, reply: Duration) -> io::Result<String>;
     /// Wait between two looks for a successor.
     fn pause(&mut self, wait: Duration);
@@ -167,10 +130,7 @@ impl Wire for SocketWire<'_> {
     }
 }
 
-/// `@<sid> edit <request>` to the window hosting session `sid`
-/// (`$ATERM_PARENT_SESSION_ID`, `s-<hex>`): the installed view's ticket, or
-/// why none opened.
-///
+/// Send `@<sid> edit <request>` to the window hosting session `sid` (`$ATERM_PARENT_SESSION_ID`).
 /// # Errors
 ///
 /// [`EditErr`]: what the window answered, or why it was not asked.
@@ -193,8 +153,6 @@ fn edit_over(wire: &mut dyn Wire, sid: &str, request: &EditRequest) -> Result<Ed
 }
 
 /// Frame only the stable session selector the resolver and redial follow.
-/// Reuse their `s-<hex>` grammar, including short authored fixture IDs; local,
-/// self, list and whitespace-bearing selectors cannot name this client tab.
 fn edit_selector(sid: &str) -> Result<String, String> {
     let selector = format!("@{sid}");
     if crate::redial::target_sid(&selector).is_some_and(|named| named.as_str() == sid) {
@@ -218,10 +176,7 @@ fn edit_reply(reply: &str) -> Result<EditOk, EditErr> {
     Err(EditErr::Unreadable(reply.to_string()))
 }
 
-/// `@<sid> await edit <key>`, re-armed until the edit's outcome ([the
-/// module](self)). `uri` is the file the edit opened (`OK edit`'s canonical
-/// `uri=`), which a re-dial waits on.
-///
+/// `@<sid> await edit <key>`, re-armed until the edit's outcome ([the module](self)).
 /// # Errors
 ///
 /// [`AwaitErr`]: an unframeable session, a refusal, an unreadable answer, or
@@ -252,7 +207,6 @@ fn await_over(
 ) -> Result<EditOutcome, AwaitErr> {
     let selector = edit_selector(sid).map_err(AwaitErr::Unsendable)?;
     let mut sock = wire.resolve();
-    // Since when the wait has had no server to take it.
     let mut cut_since: Option<Instant> = None;
     loop {
         let request = AwaitEdit {
@@ -279,8 +233,6 @@ fn await_over(
                 key = AwaitKey::Uri(uri.to_string());
                 continue;
             }
-            // While re-dialling, a refusal is an instance that does not host
-            // the session yet (`ERR no such session`): look again.
             Leg::End(AwaitErr::Refused(line)) if cut_since.is_some() => line,
             Leg::End(end) => return Err(end),
             Leg::Cut(why) => why,
@@ -309,10 +261,6 @@ fn await_reply(line: &str, key: &AwaitKey) -> Leg {
     if line == "ERR unknown ticket" && matches!(key, AwaitKey::Ticket(_)) {
         return Leg::UnknownTicket;
     }
-    // The server's own ways of saying it is going away (its event loop is
-    // gone, its main thread dropped the waiter unanswered, the host behind a
-    // forward went) or cannot take the leg now (every lane busy, a token a
-    // successor's listener does not know yet): the wait was not refused.
     if line == "ERR event loop gone"
         || line == "ERR edit waiter was dropped"
         || aterm_types::control_verbs::host_gone(line).is_some()

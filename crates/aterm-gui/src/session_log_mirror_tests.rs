@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The bus mirror's GUI half: the two verbs over a
-//! real store and real session logs, the adoption latch, closed
-//! sessions' tails across an update (Q4), the fence (Q12), the alias (Q6),
-//! the old space an uncarried update ends (Q7), and the default that engages
-//! nothing (Q5).
+//! The bus mirror's GUI half: the two verbs over a real store and real session logs, the adoption latch, closed sessions' tails across an update (Q4), the fence (Q12), the alias (Q6), the old space an uncarried update ends (Q7), and the default that engages nothing (Q5).
 
 use aterm_slog::{
     Actor, BusCursor, Close, Conf, Fields, Key, Kind, Mark, Open, Out, Prior, RunOut, ShortId, Src,
@@ -125,9 +121,6 @@ fn a_take_hands_out_slots_and_a_landing_moves_the_cursor() {
         for (_, _, body) in &first {
             assert!(decode_bus(body).is_ok(), "{body}");
         }
-        // A take moves nothing: the same records and covers again (the
-        // space's first snapshot is not taken twice), each session's as a
-        // set: the order the take visits the sessions in is not its promise.
         let unsnapped = |v: &[(String, BusCursor, String)]| -> Vec<(String, String)> {
             let mut out: Vec<(String, String)> = v
                 .iter()
@@ -159,14 +152,12 @@ fn a_take_hands_out_slots_and_a_landing_moves_the_cursor() {
         commands(&a, 1);
         let (one, _) = slots(&cmd_log_take(&store, "n=1", Some(generation)));
         assert_eq!(one.len(), 1, "n= caps the take");
-        // A ghost lane is served nothing and moves nothing.
         let ghost = crate::fabric::next_bridge_generation();
         assert_eq!(
             cmd_log_take(&store, "", Some(ghost)),
             "OK 0 slots=0 stale=1\n"
         );
         assert_eq!(cmd_log_landed(&store, &land, Some(ghost)), "OK stale=1\n");
-        // The grammar.
         for bad in ["n=0", "n=65", "tier=content", "key=xyz", "frob=1"] {
             assert!(
                 cmd_log_take(&store, bad, Some(generation)).starts_with("ERR usage"),
@@ -202,7 +193,6 @@ fn a_landing_before_adoption_keeps_the_pin_and_lands_after_adoption() {
             tl.slog_mut().open_session(None, None, now);
         }
         commands(&h, 2);
-        // The carried cursor the export drew: the session's open landed.
         let landed = {
             let mut tl = h.ctx.timeline.lock().unwrap();
             let log = tl.slog_mut().mirror_log();
@@ -236,8 +226,6 @@ fn a_landing_before_adoption_keeps_the_pin_and_lands_after_adoption() {
             cmd_log_landed(&store, &unknown, Some(generation)),
             "OK gone\n"
         );
-        // NEGATIVE CONTROL: the same landing on a store not adopting is `gone`
-        // at once — what the bridge would drop its pin on.
         let fresh = crate::session_store::new_store();
         assert_eq!(cmd_log_landed(&fresh, &pair, Some(generation)), "OK gone\n");
     });
@@ -245,16 +233,13 @@ fn a_landing_before_adoption_keeps_the_pin_and_lands_after_adoption() {
 
 /// a session that closes with an unlanded tail keeps it for the
 /// bus; an update's manifest carries it as a tombstone; the successor's take
-/// says it as one exact `gap why=dropped n=<k>`, which lands `done`. A
-/// landing past the draw stands the Commit down, and once the Commit has
-/// read the draw no closed tail lands here.
+/// says it as one exact `gap why=dropped n=<k>`, which lands `done`.
 #[test]
 fn a_closed_sessions_unlanded_tail_crosses_an_update_as_one_dropped_cover() {
     crate::fabric::with_link_reset(|| {
         let generation = mirroring();
         let store = crate::session_store::new_store();
         let h = session(&store, 1);
-        // Mirrored in part: the session's open lands.
         let (first, _) = slots(&cmd_log_take(&store, "n=1", Some(generation)));
         assert_eq!(
             cmd_log_landed(&store, &landings(&first), Some(generation)),
@@ -271,7 +256,6 @@ fn a_closed_sessions_unlanded_tail_crosses_an_update_as_one_dropped_cover() {
             "the tail is kept"
         );
         let head = h.ctx.timeline.lock().unwrap().slog().log().ms_head();
-        // The update's manifest draws it.
         let manifest = crate::session_store::SessionHandoff::from_store(&store.read().unwrap());
         assert_eq!(
             manifest.mirror_dropped,
@@ -282,7 +266,6 @@ fn a_closed_sessions_unlanded_tail_crosses_an_update_as_one_dropped_cover() {
             "nothing moved since"
         );
         store.read().unwrap().mirror().lift_commit_fence();
-        // The successor says the rest as one cover.
         let successor = crate::session_store::new_store();
         successor
             .read()
@@ -300,8 +283,6 @@ fn a_closed_sessions_unlanded_tail_crosses_an_update_as_one_dropped_cover() {
             "OK done\n"
         );
         assert_eq!(successor.read().unwrap().mirror().counts(), (0, 0));
-        // This process went on landing the tail after the draw: the Commit
-        // stands down, and from its reading no closed tail lands here.
         let (rest, _) = slots(&cmd_log_take(&store, "n=1", Some(generation)));
         assert_eq!(
             cmd_log_landed(&store, &landings(&rest), Some(generation)),
@@ -365,7 +346,7 @@ fn a_landing_is_refused_under_the_commit_fence() {
 /// finds nothing moved, so the Commit goes on — is `fenced`, its cursor
 /// where the draw left it, never landed past the draw the successor's cover
 /// starts from: the landing reads the fence under the tails' lock, which
-/// the reading takes after setting it. After the stand-down it lands.
+/// the reading takes after setting it.
 #[test]
 fn a_landing_racing_the_commits_reading_is_fenced() {
     crate::fabric::with_link_reset(|| {
@@ -419,8 +400,7 @@ fn a_landing_racing_the_commits_reading_is_fenced() {
 }
 
 /// an edge's actor crosses as `by=e<8 hex>`, the bridge key's
-/// hash of its sid, never the sid; one edge is one alias. Without a key the
-/// actor is `-`.
+/// hash of its sid, never the sid; one edge is one alias.
 #[test]
 fn an_edges_actor_crosses_as_its_alias_never_its_sid() {
     crate::fabric::with_link_reset(|| {
@@ -506,7 +486,6 @@ fn an_uncarried_adoption_owes_the_old_spaces_tail() {
     assert_eq!((first.ep, first.ms), (3, Some(10)));
     assert_eq!(first.rec.f.get_u(Key::N), Some(3));
     assert_eq!(first.rec.f.get_word(Key::Why), Some("reset"));
-    // A keeper's crash adoption is another seq space with no cursor: none.
     let mut crashed = crate::session_log::SessionLog::default();
     let at = crashed.now();
     crashed.adopt(
@@ -521,9 +500,7 @@ fn an_uncarried_adoption_owes_the_old_spaces_tail() {
     assert_eq!(crashed.log().mirror_prior(), None);
 }
 
-/// with the mirror off nothing engages. A session that runs and
-/// closes leaves no tail, no tombstone, no manifest row, and its log no
-/// cursor; its carry holds no `ms=`.
+/// with the mirror off nothing engages.
 #[test]
 fn the_default_engages_nothing() {
     let store = crate::session_store::new_store();
@@ -552,8 +529,6 @@ fn the_default_engages_nothing() {
     let manifest = crate::session_store::SessionHandoff::from_store(&store.read().unwrap());
     assert!(manifest.mirror_dropped.is_empty());
 }
-
-// ---- fixer round (phase 4 review) ------------------------------------------
 
 /// A session registered in `store` over a ring of eight records, so a few
 /// bells evict; its open is `ms` 1.
@@ -655,8 +630,6 @@ fn a_session_closing_under_the_fence_keeps_its_tail_and_lands_after_the_stand_do
         );
         let (fenced, _) = slots(&cmd_log_take(&store, "", Some(generation)));
         assert!(fenced.is_empty(), "nothing past the fence: {fenced:?}");
-        // The update stands down (the session it drew is gone): the App lifts
-        // every live log's fence and the closed tails' with them.
         store.read().unwrap().mirror().lift_commit_fence();
         let (rest, _) = slots(&cmd_log_take(&store, "", Some(generation)));
         assert!(
@@ -681,8 +654,7 @@ fn a_session_closing_under_the_fence_keeps_its_tail_and_lands_after_the_stand_do
 /// falls where no take runs (a broker outage, before the bridge's first take)
 /// is kept whole when it closes: its take says from `ms` 1, the evicted ones
 /// as one exact cover, its close among the rest; and a live log no take
-/// reached carries its `ms` across an update. With the mirror off (the
-/// default) the same session keeps nothing.
+/// reached carries its `ms` across an update.
 #[test]
 fn a_session_no_take_reached_is_kept_whole_while_the_node_mirrors() {
     crate::fabric::with_link_reset(|| {
@@ -731,7 +703,6 @@ fn a_session_no_take_reached_is_kept_whole_while_the_node_mirrors() {
         let head = h.ctx.timeline.lock().unwrap().slog().log().ms_head();
         assert_eq!(view.max_ms(), head, "every ms said, the close last");
         assert_eq!(store.read().unwrap().mirror().counts(), (0, 0), "done");
-        // NEGATIVE CONTROL: the default keeps nothing of the same session.
         let off = crate::session_store::new_store();
         let h = small_session(&off, 1);
         commands(&h, 6);
@@ -746,8 +717,7 @@ fn a_session_no_take_reached_is_kept_whole_while_the_node_mirrors() {
 /// forgotten without locking any timeline — a busy one included — and every
 /// cursor starts over: a live session is taken again from its first record,
 /// a closed session's partly landed tail opens with one exact cover of what
-/// it no longer holds, a tombstone covers from `ms` 1. A new log's reader
-/// sees no hole.
+/// it no longer holds, a tombstone covers from `ms` 1.
 #[test]
 fn a_replaced_bus_log_starts_every_cursor_over_and_locks_no_timeline() {
     crate::fabric::with_link_reset(|| {
@@ -758,7 +728,6 @@ fn a_replaced_bus_log_starts_every_cursor_over_and_locks_no_timeline() {
         let mut old = std::collections::BTreeMap::new();
         drain(&store, generation, &mut old);
         commands(&b, 2);
-        // b's tail lands in part, then b closes.
         let (part, _) = slots(&cmd_log_take(&store, "n=1", Some(generation)));
         let part: Vec<_> = part
             .into_iter()
@@ -772,7 +741,6 @@ fn a_replaced_bus_log_starts_every_cursor_over_and_locks_no_timeline() {
             .unwrap()
             .deregister_local_as(2, ExitReason::ShellExit, ExitActor::Unknown);
         assert_eq!(store.read().unwrap().mirror().counts(), (1, 0));
-        // The forget, with a's timeline held by another thread all along.
         let (held_tx, held_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let ctx = a.ctx.clone();
@@ -784,7 +752,6 @@ fn a_replaced_bus_log_starts_every_cursor_over_and_locks_no_timeline() {
         held_rx
             .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
             .expect("the timeline is held");
-        // A predecessor's tombstone, landed to `ms` 3 of 9 in the old log.
         let tomb = "s-tomb";
         store
             .read()
@@ -818,7 +785,6 @@ fn a_replaced_bus_log_starts_every_cursor_over_and_locks_no_timeline() {
             new[b.sid.as_str()].covered() > 0,
             "the tail's landed part is one exact cover in the new log"
         );
-        // The tombstone starts over too: one cover of all nine, from `ms` 1.
         let view = new.get(tomb).expect("the tombstone is taken again");
         assert_eq!(view.covers(), &[(1, 9, "dropped")], "one exact cover");
         assert!(view.holds_start(), "tombstone: from ms 1");
@@ -830,16 +796,13 @@ fn a_replaced_bus_log_starts_every_cursor_over_and_locks_no_timeline() {
 /// FIXER F13's drawn generation, OFF: on a store that never
 /// mirrored — no hello asked, nothing taken, nothing engaged — a bus log
 /// replaced between an update's draw and its Commit stands nothing down.
-/// The export's own syncs (each session's carry source) engage nothing.
 #[test]
 fn a_replaced_bus_log_stands_no_update_down_on_a_store_that_never_mirrored() {
     let store = crate::session_store::new_store();
     let h = session(&store, 1);
     let manifest = crate::session_store::SessionHandoff::from_store(&store.read().unwrap());
     assert!(manifest.mirror_dropped.is_empty());
-    // The export: the session's carry source, its log synced and fenced.
     let _carry = h.ctx.timeline.lock().unwrap().slog_carry_source();
-    // `link log` answered `forgot=1` (the bridge's lane, mirror on or off).
     forget_landed(&store);
     assert!(
         !store.read().unwrap().mirror().past_draw(),
@@ -884,7 +847,6 @@ fn a_replaced_bus_log_stands_down_an_update_that_drew_a_cursor() {
         );
         store.read().unwrap().mirror().lift_commit_fence();
         h.ctx.timeline.lock().unwrap().slog_mut().lift_read_fence();
-        // A log whose cursor no sync has met yet (a successor's carried one).
         let carried = crate::session_store::new_store();
         let c = session(&carried, 1);
         c.ctx
@@ -907,11 +869,7 @@ fn a_replaced_bus_log_stands_down_an_update_that_drew_a_cursor() {
 
 /// FIXER F13's drawn generation, ADOPTED: a successor whose only cursors are
 /// its predecessor's tombstones — no live log synced, no recorded hello
-/// asking for the mirror — holds cursors all the same. A bus log replaced
-/// between the draw and the Commit stands the update down (the drawn row is
-/// the replaced log's cursor: a successor's cover from it would start at
-/// `ms` 4 of the new log, leaving 1..3 unsaid), and the retry's draw carries
-/// the tombstone from `ms` 0.
+/// asking for the mirror — holds cursors all the same.
 #[test]
 fn a_replaced_bus_log_stands_down_an_update_whose_only_cursors_are_adopted() {
     let store = crate::session_store::new_store();
@@ -969,7 +927,6 @@ fn the_verbs_are_refused_unless_the_recorded_hello_asked_and_retained_state_is_s
             "",
             "served: the bridge's own facts say the mirror"
         );
-        // The owner turned the mirror off; the bridge restarted and said so.
         let off = crate::fabric::next_bridge_generation();
         crate::fabric::bridge_attached(off);
         let hello = crate::fabric::cmd_hello("lane=2 build=x", Some(off));
@@ -1016,17 +973,6 @@ fn the_verbs_are_refused_unless_the_recorded_hello_asked_and_retained_state_is_s
         drop(h);
     });
 }
-
-// ---- TIER-1: the GUI half against the derived `LogMirror` model ----------
-//
-// The REAL GUI half — `log-take` and `log-landed` over a real store, its
-// adoption latch, the export's fence and its stand-down, a closed session's
-// tail ([`StoreMirror::retire`]) — driven by a test bridge that pins one
-// slot a take and publishes it to an in-memory `ev` face. After every step
-// the world is projected onto the model's variables and must be the model's
-// state after the matching actions (a refused landing is a stutter).
-// NEGATIVE CONTROLS: each GUI-half mutant replayed through the broken
-// handler it stands for ([`Broken`]), and the projected law breaks.
 
 struct GuiWorld {
     store: crate::session_store::Store,
@@ -1170,7 +1116,6 @@ impl GuiWorld {
                 }
                 (*head, *landed, *fence)
             }
-            // Nothing kept: nothing more is owed of it.
             None => (self.head_gone, self.head_gone, 0),
         };
         let (pin, plo, phi, pgap, onbus) = match &self.pin {
@@ -1245,8 +1190,6 @@ impl GuiWorld {
             "{what}: the broken handler should break {law}: {got:?}"
         );
     }
-
-    // ---- the real steps ------------------------------------------------
 
     fn append(&mut self) {
         seen(self.handle_now());
@@ -1418,7 +1361,6 @@ impl GuiWorld {
 fn a_closed_sessions_tail_conforms_to_the_model() {
     crate::fabric::with_link_reset(|| {
         let generation = mirroring();
-        // The cursor short of the fence.
         let mut w = GuiWorld::new(generation);
         w.append();
         w.fire(&["Append"]);
@@ -1454,7 +1396,6 @@ fn a_closed_sessions_tail_conforms_to_the_model() {
             (w.expect["rec1"], w.expect["rec2"], w.expect["rec3"]),
             (1, 1, 1)
         );
-        // The cursor AT the fence: everything up to it landed.
         let mut a = GuiWorld::new(generation);
         a.append();
         a.fire(&["Append"]);
@@ -1503,7 +1444,6 @@ fn the_gui_half_conforms_across_an_update_adopted_late() {
         assert_eq!(w.land(), "fenced");
         w.check("fenced: the pin stays");
         w.commit();
-        // The successor's own `mark - handoff` is its first record.
         w.fire(&["Commit", "Append"]);
         w.check("committed, not adopted");
         assert_eq!(w.land(), "adopting");
@@ -1527,8 +1467,6 @@ fn the_gui_half_conforms_across_an_update_adopted_late() {
 fn the_gui_half_conformance_rejects_each_mutant_through_its_broken_handler() {
     crate::fabric::with_link_reset(|| {
         let generation = mirroring();
-        // CloseDropsTail: a closing session with an unlanded record keeps no
-        // tail; nothing more is owed of it, and its close never reaches the bus.
         let mut c = GuiWorld::new(generation);
         c.append();
         c.take();
@@ -1542,15 +1480,11 @@ fn the_gui_half_conformance_rejects_each_mutant_through_its_broken_handler() {
         c.close();
         c.breaks("QuiescentMirrorComplete", "CloseDropsTail");
 
-        // DropUnadopted: `gone` for a session the successor has not adopted;
-        // the bridge drops its pin; the successor's carried cursor is behind
-        // it and covers what its ring evicted since.
         let mut d = GuiWorld::new(generation);
         d.take();
         d.publish();
         assert_eq!(d.land(), "ok");
         d.append();
-        // A bell after ms 2, so the successor's ring evicts ms 2 alone.
         d.bell();
         d.export();
         d.take();
@@ -1569,7 +1503,6 @@ fn the_gui_half_conformance_rejects_each_mutant_through_its_broken_handler() {
         d.publish();
         d.breaks("ReaderViewAtMostOnce", "DropUnadopted");
 
-        // LandUnderFence: a landing answered while the export's cursor stands.
         let mut f = GuiWorld::new(generation);
         f.append();
         f.export();
@@ -1582,7 +1515,6 @@ fn the_gui_half_conformance_rejects_each_mutant_through_its_broken_handler() {
             .set_broken(Broken::LandUnderFence);
         assert_eq!(f.land(), "ok", "the broken handler");
         f.breaks("NoLandUnderFence", "LandUnderFence");
-        // CONTROL: the real handler refuses the same landing.
         let mut real = GuiWorld::new(generation);
         real.append();
         real.export();
@@ -1593,8 +1525,7 @@ fn the_gui_half_conformance_rejects_each_mutant_through_its_broken_handler() {
 }
 
 /// A request admitted on the old lane cannot land its old bus cursor after
-/// another incarnation replaces that bus. The replacement is placed exactly
-/// between admission and mutation, without a timing race or another thread.
+/// another incarnation replaces that bus.
 #[test]
 fn an_old_lanes_landing_cannot_advance_a_replacement_bus_log() {
     crate::fabric::with_link_reset(|| {

@@ -67,21 +67,13 @@ fn pending(app: &App, wid: WindowId) -> Option<Trick> {
 }
 
 /// Where the trick flash stands, read at `t0`: an instant the test took
-/// before its first key. Every stamp a key or a present leaves is at or after
-/// `t0`, and the phase reads an earlier clock as no time elapsed, so this is
-/// the slot's state — none, unfound, found, revoked — with no clock in it.
-/// Read at `Instant::now()` instead, a stall between a key and the read (a
-/// loaded test process) ages a pending flash past its 750 ms give-up bound
-/// and a found one past its 1.1 s window, and the read says `Idle`.
+/// before its first key.
 fn flash(app: &App, wid: WindowId, t0: Instant) -> TrickFlashPhase {
     app.windows[&wid].fx.decos().trick_flash_phase(t0)
 }
 
 /// Whether the pet grieves a failed command (12 ms long), judged at `typed`:
-/// an instant the test took before the line's keys. The forgiveness window
-/// (`TRICK_SUBMIT_FORGIVEN`, 2 s from the line's Enter) reads an earlier
-/// clock as no time elapsed, so a stalled test process cannot age the line
-/// out of it the way a read at `Instant::now()` could.
+/// an instant the test took before the line's keys.
 fn grieves_at(app: &mut App, wid: WindowId, typed: Instant) -> bool {
     crate::app_render::pet_fails_a_command_for_test(
         app.windows.get_mut(&wid).expect("window"),
@@ -91,9 +83,7 @@ fn grieves_at(app: &mut App, wid: WindowId, typed: Instant) -> bool {
 }
 
 /// The line-abort set is exactly ⌃C ⌃Z ⌃\ ⌃J ⌃M with Ctrl and no Alt or
-/// Super; Shift does not disqualify (⌃⇧C is 0x03 too). Neighbours (⌃A, ⌃K,
-/// ⌃U, ⌃W, the bare letter, Alt and Super chords, Enter, Esc) are not, and
-/// an abort chord is still a `brk` to feeds that only know that bit.
+/// Super; Shift does not disqualify (⌃⇧C is 0x03 too).
 #[test]
 fn classify_press_marks_the_ctrl_abort_chords_as_line_abort_and_nothing_else() {
     for c in ['c', 'z', '\\', 'j', 'm'] {
@@ -131,8 +121,6 @@ fn classify_press_marks_the_ctrl_abort_chords_as_line_abort_and_nothing_else() {
     assert!(!classify_press(&named(NamedKey::Enter)).line_abort);
     assert!(!classify_press(&named(NamedKey::Escape)).line_abort);
     assert!(!classify_press(&InputEvent::KeySequence(vec![0x03])).line_abort);
-    // The job-control pair is exactly ⌃Z and ⌃\, always inside the abort
-    // set; the screen clear is exactly ⌃L, and a chord to everyone else.
     for c in ['c', 'z', '\\', 'j', 'm', 'l', 'a', 'u', 'w'] {
         let ev = chord(c, Modifiers::CTRL);
         let class = classify_press(&ev);
@@ -214,9 +202,7 @@ fn an_ime_commit_is_typed_text_and_its_end_is_not_a_boundary() {
 
 /// A name glued to its command, as an IME commits an unspaced script, is a
 /// guess: `猫咪坐下␣` latches and flashes nothing, and prose after it drops it
-/// unheard. A name after it, or Enter on a line that stayed pet talk, sends
-/// it final, the command first or last. A thing behind the name, or a verb
-/// that glued spells another word, is no call.
+/// unheard.
 #[test]
 fn a_name_glued_to_its_command_by_ime_commit_waits_for_a_name_or_enter() {
     let t0 = Instant::now();
@@ -299,7 +285,6 @@ fn program_output_a_paste_and_raw_controller_bytes_never_command_the_cat() {
         "…and the line now holds text the listener did not see"
     );
 
-    // A fresh line (Enter resets), then a controller's raw bytes.
     app.input(wid, named(NamedKey::Enter), Source::Human);
     assert!(!app.windows[&wid].trick_listener.is_poisoned());
     let ctl = Source::Controller;
@@ -321,8 +306,6 @@ fn program_output_a_paste_and_raw_controller_bytes_never_command_the_cat() {
         "`send 'echo '` then a typed `sleep␣` must not nap the cat"
     );
 
-    // `sit` typed, then `send 'xyz\n'`: the newline in the raw payload resets without
-    // evaluating the open token.
     app.input(wid, named(NamedKey::Enter), Source::Human);
     type_word(&mut app, wid, "sit");
     app.input(wid, InputEvent::KeySequence(b"xyz\n".to_vec()), ctl);
@@ -354,8 +337,7 @@ fn a_controller_key_commands_exactly_like_a_human_key() {
 
 /// `sit⏎`: Enter judges the open token (one final fire) and reports a
 /// pet-only line, which the host turns into exit-127 forgiveness: the
-/// shell's fast `command not found` does not grieve the cat. The same fast
-/// failure after an ordinary line sulks.
+/// shell's fast `command not found` does not grieve the cat.
 #[test]
 fn enter_on_sit_submits_a_pet_only_line_the_cat_forgives() {
     let (mut app, wid, _) = pet_app();
@@ -377,8 +359,6 @@ fn enter_on_sit_submits_a_pet_only_line_the_cat_forgives() {
         "`sit: command not found` is forgiven — the whole line was pet talk"
     );
 
-    // Negative control: the same failure after an ordinary command grieves,
-    // judged at the same early instant.
     let (mut plain, wid, _) = pet_app();
     let t0 = Instant::now();
     type_word(&mut plain, wid, "ls");
@@ -395,9 +375,7 @@ fn enter_on_sit_submits_a_pet_only_line_the_cat_forgives() {
 type GateCase = (&'static str, fn(&mut App));
 
 /// The four gates, each inert alone: the sparkle master off, the tricks
-/// sub-table off, Serious Mode, and a word on `ignore_words`. The listener
-/// is still fed (its line state stays coherent), but the pet hears nothing
-/// and no flash is noted.
+/// sub-table off, Serious Mode, and a word on `ignore_words`.
 #[test]
 fn the_master_the_tricks_bit_serious_mode_and_ignore_words_are_each_inert() {
     let t0 = Instant::now();
@@ -433,7 +411,6 @@ fn the_master_the_tricks_bit_serious_mode_and_ignore_words_are_each_inert() {
     for (label, setup) in setups {
         let (mut app, wid, session) = pet_app();
         setup(&mut app);
-        // Model the worker-prepared generation handoff, as the summon tests do.
         app.prepared_sparkle = app.config.prepare_sparkle_runtime();
         app.sparkle_dirty = true;
         app.recompute_sparkle();
@@ -454,9 +431,6 @@ fn the_master_the_tricks_bit_serious_mode_and_ignore_words_are_each_inert() {
             TrickLineFire::Withheld { session },
             "{label}: the fire is remembered as withheld"
         );
-        // Enter on the still-pure line confirms the tentative fire in the
-        // listener; the host must not let a withheld fire into the pet that
-        // way…
         app.input(wid, named(NamedKey::Enter), Source::Human);
         assert_eq!(
             pending(&app, wid),
@@ -468,9 +442,6 @@ fn the_master_the_tricks_bit_serious_mode_and_ignore_words_are_each_inert() {
             TrickLineFire::None,
             "{label}: the line is over"
         );
-        // …and the pet-only submit is not forgiven behind a closed gate:
-        // with the feature off the cat grieves, and an ignored `sit` is a
-        // real command whose failure is the user's.
         let grieving = crate::app_render::pet_fails_a_command_for_test(
             app.windows.get_mut(&wid).expect("window"),
             Instant::now(),
@@ -530,8 +501,6 @@ fn a_gate_closed_mid_line_blocks_the_confirmation_of_an_admitted_fire() {
             addressed: false
         }
     );
-    // The tentative latch is dropped the way a tick's TTL or a drain
-    // would drop it; the host memory stays, as it does on a reload.
     app.windows
         .get_mut(&wid)
         .expect("window")
@@ -553,11 +522,7 @@ fn a_gate_closed_mid_line_blocks_the_confirmation_of_an_admitted_fire() {
     assert!(!app.windows[&wid].fx.companion().brain().trick_engaged());
 }
 
-/// An erased line forgets its fire. `kitty sit␣` withheld (an ignored word,
-/// addressed, so no tentative fire to revoke), then ten Backspaces (the
-/// listener reports the line empty), then `kitty⏎`: a pet-only line the cat
-/// forgives, because the remembered fire was on text that no longer
-/// exists. An addressed withheld fire is the one kind no revoke ends.
+/// An erased line forgets its fire.
 #[test]
 fn an_erased_line_forgets_its_withheld_fire() {
     let (mut app, wid, session) = pet_app();
@@ -598,11 +563,7 @@ fn an_erased_line_forgets_its_withheld_fire() {
     );
 }
 
-/// `ignore_words` reads a fire's word and its command. A name glued to its
-/// command fires the whole run, so listing `坐下` holds back `坐下`,
-/// `猫咪坐下` and `坐下猫咪` alike, and listing the run holds back the run.
-/// A listed name holds back nothing, and a listed command holds back no other
-/// command glued to the same name. Each line names the pet after the word.
+/// `ignore_words` reads a fire's word and its command.
 #[test]
 fn ignore_words_holds_back_a_glued_run_by_its_command_never_by_its_name() {
     let t0 = Instant::now();
@@ -638,10 +599,7 @@ fn ignore_words_holds_back_a_glued_run_by_its_command_never_by_its_name() {
     }
 }
 
-/// The memory of a fire is keyed to its session. `sit␣` withheld on tab A,
-/// then `kitty⏎` on tab B's first, pure line: B's pet-only submit is
-/// forgiven. Back on A, the half-typed line is poisoned, so nothing fires
-/// there until a reset.
+/// The memory of a fire is keyed to its session.
 #[test]
 fn a_fire_remembered_on_one_tab_says_nothing_about_another_tabs_line() {
     let (mut app, wid, session_a) = pet_app();
@@ -763,9 +721,6 @@ fn naming_the_pet_makes_the_command_final() {
         },
         "the name confirmed the tentative fire"
     );
-    // …and the brain was told: `revoke_trick` drops only a tentative latch,
-    // so a confirmed one survives it (the tentative `sit␣` alone is dropped
-    // by the same call).
     let ws = app.windows.get_mut(&wid).expect("window");
     ws.fx.companion_mut().revoke_trick();
     assert_eq!(
@@ -785,9 +740,7 @@ fn naming_the_pet_makes_the_command_final() {
 }
 
 /// Look never wins a phrase: `hey kitty sit` leaves the pet holding a
-/// confirmed sit, and `pspsps kitty jump` a confirmed jump. The negative
-/// control is the verb-first order, where the phrase law absorbs the
-/// greeting.
+/// confirmed sit, and `pspsps kitty jump` a confirmed jump.
 #[test]
 fn the_verb_after_a_greeting_is_the_request() {
     for (line, want) in [
@@ -820,15 +773,7 @@ fn the_verb_after_a_greeting_is_the_request() {
 
 /// A present the motion policy demotes ends a pending kitty flash: its tick
 /// is unpaintable, and an unpaintable tick drops the slot
-/// (`TrickFlash::emit`). The same frames at Full motion find the word.
-///
-/// The present runs on a pinned frame clock (`App::redraw_window_at`): the
-/// flash gives up 750 ms after its key and ends 1.1 s after the frame that
-/// found it, and on the wall clock a stalled test thread (a loaded
-/// one-process suite) pushed the Full frame past one or the other, so it
-/// read `Idle`. The negative control is that clock: the same Full present,
-/// its frame seconds after the keys, finds a flash that already gave up. A
-/// present that ignored the pin would find the word there.
+/// (`TrickFlash::emit`).
 #[test]
 fn a_demoted_present_ends_a_pending_kitty_flash() {
     for (label, motion, late, fate) in [
@@ -852,10 +797,6 @@ fn a_demoted_present_ends_a_pending_kitty_flash() {
             .clone();
         term_lock(&term).process(b"sit ");
         let epoch = term_lock(&term).damage_epoch();
-        // Every key stamp is at or after `t0`, so `t0 + 300 ms` is inside the
-        // give-up bound of each however long the keys took; the late frame is
-        // past it however quickly they ran (a key queued behind a paste is
-        // stamped at most 1.5 s ahead, `ORDERED_EGRESS_WITNESS_GRACE`).
         let frame = if late {
             typed + Duration::from_secs(10)
         } else {
@@ -872,8 +813,7 @@ fn a_demoted_present_ends_a_pending_kitty_flash() {
 
 /// The flash of an addressed fire is never taken back by a revoke: the
 /// pet's `revoke_trick` is forwarded (a no-op on a confirmed latch), the
-/// flash finishes, and the memory ends. A tentative fire's revoke reaches
-/// both.
+/// flash finishes, and the memory ends.
 #[test]
 fn a_revoke_spares_the_flash_of_an_addressed_fire() {
     let t0 = Instant::now();
@@ -949,7 +889,6 @@ fn ctrl_c_and_ctrl_u_reset_the_line_where_esc_only_poisons_it() {
     type_word(&mut app, wid, "sit ");
     assert_eq!(pending(&app, wid), Some(Trick::Sit), "…until the reset");
 
-    // A tentative fire aborted by ⌃C is taken back.
     let (mut app, wid, _) = pet_app();
     type_word(&mut app, wid, "sit ");
     assert_eq!(pending(&app, wid), Some(Trick::Sit));
@@ -986,12 +925,7 @@ fn a_word_kill_clears_the_token_and_forward_kills_are_no_ops() {
     assert_eq!(pending(&app, wid), Some(Trick::Sit));
 }
 
-/// ⌃Z and ⌃\ reset only a line the listener can prove is empty. At a prompt
-/// shells ignore them and keep the half-typed line, so `sot` ⌃Z `sit␣` is
-/// `sotsit ` and must not fire (the line is poisoned until ⌃C), and a
-/// tentative fire they interrupt is taken back. A poisoned line is never
-/// proved empty, whatever its count reads: Esc then `sot`, ↑ and a paste each
-/// leave text the count never saw. A clean empty line stays clean.
+/// ⌃Z and ⌃\ reset only a line the listener can prove is empty.
 #[test]
 fn a_job_chord_resets_only_a_provably_empty_line_and_breaks_any_other() {
     let t0 = Instant::now();
@@ -1093,7 +1027,7 @@ fn a_screen_clear_keeps_the_line() {
 
 /// The pet obeys without the word engine: with every sparkle family off
 /// (the master on) nothing can flash, and `sit␣` still latches the pet, as
-/// `aterm help kitty` promises. The flash is best-effort; the command is not.
+/// `aterm help kitty` promises.
 #[test]
 fn with_every_sparkle_family_off_a_typed_command_moves_the_pet_and_cannot_flash() {
     let t0 = Instant::now();
@@ -1179,8 +1113,7 @@ fn a_no_echo_prompt_poisons_the_line_and_its_enter_resets_it() {
     );
     drop(app);
     drop(sink);
-    // SAFETY: both fds are ours and open; the borrowed-fd sink did not
-    // close the master.
+    // SAFETY: both fds are ours and open; the borrowed-fd sink did not close the master.
     unsafe {
         libc::close(slave);
         libc::close(master);
@@ -1189,9 +1122,7 @@ fn a_no_echo_prompt_poisons_the_line_and_its_enter_resets_it() {
 
 /// Serious Mode's drain resets the pet and ends the memory of the fire, but
 /// leaves the line to the listener (fed on every press, it still knows the
-/// line). So: prose typed before the drain keeps `sit␣` typed after it from
-/// firing; a fresh line is not deaf once Serious Mode lifts; and a
-/// pre-drain fire's confirmation reaches no pet.
+/// line).
 #[test]
 fn the_serious_drain_drops_the_hosts_memory_and_leaves_the_line_to_the_listener() {
     let t0 = Instant::now();
@@ -1214,8 +1145,6 @@ fn the_serious_drain_drops_the_hosts_memory_and_leaves_the_line_to_the_listener(
             "the listener still knows the line"
         );
     }
-    // The pre-drain fire's confirmation, once Serious Mode lifts: the
-    // listener confirms, the host remembers no admitted fire, no pet.
     app.set_serious_mode(false);
     assert!(app.trail_is_kitty_pet(), "fixture: the pet is back");
     type_word(&mut app, wid, "kitty ");
@@ -1225,8 +1154,6 @@ fn the_serious_drain_drops_the_hosts_memory_and_leaves_the_line_to_the_listener(
         "a fire drained with the pet is not confirmed into the new one"
     );
 
-    // Prose typed before the drain, a command word typed after Serious Mode
-    // lifts, on the same line: no fire.
     let (mut app, wid, _) = pet_app();
     type_word(&mut app, wid, "npm run ");
     app.set_serious_mode(true);
@@ -1238,15 +1165,10 @@ fn the_serious_drain_drops_the_hosts_memory_and_leaves_the_line_to_the_listener(
         "`npm run sit` is not a command to the cat, drain or no drain"
     );
     assert_eq!(flash(&app, wid, t0), TrickFlashPhase::Idle);
-    // The hand ends the line; the next one is judged as ever.
     app.input(wid, chord('c', Modifiers::CTRL), Source::Human);
     type_word(&mut app, wid, "sit ");
     assert_eq!(pending(&app, wid), Some(Trick::Sit));
 
-    // A line completed (so the listener is bound to this session and its
-    // next line is truly fresh), Serious Mode toggled on that fresh line,
-    // then `sit⏎` once it lifts: the cat sits, and the shell's `command
-    // not found` is forgiven.
     let (mut app, wid, _) = pet_app();
     type_word(&mut app, wid, "ls");
     app.input(wid, named(NamedKey::Enter), Source::Human);
@@ -1266,10 +1188,7 @@ fn the_serious_drain_drops_the_hosts_memory_and_leaves_the_line_to_the_listener(
     );
 }
 
-/// The introspection renderer declares the snapshot's row origin. `sit⏎` on the bottom row, at a
-/// prompt width that puts the shell's `command not found: sit` in the typed word's columns one
-/// row nearer the caret: with `set_scan_base_y` called before the rescan, a headless capture's
-/// flash lands on the typed line two rows up, not the error line.
+/// The introspection renderer declares the snapshot's row origin.
 #[test]
 fn a_headless_capture_declares_base_y_so_the_scrolled_flash_finds_the_typed_line() {
     let (mut app, wid, session) = pet_app();
@@ -1279,8 +1198,6 @@ fn a_headless_capture_declares_base_y_so_the_scrolled_flash_finds_the_typed_line
     {
         let term = app.pool.get(session).expect("session").term.clone();
         let mut t = term_lock(&term);
-        // Walk the caret to the bottom row, then echo the prompt and the
-        // typed word as a shell would.
         for _ in 0..rows.saturating_sub(1) {
             t.process(b"\r\n");
         }
@@ -1292,15 +1209,11 @@ fn a_headless_capture_declares_base_y_so_the_scrolled_flash_finds_the_typed_line
             "fixture: typed on the bottom row"
         );
     }
-    // The capture that records the caret the flash will anchor on.
     app.capture_words(wid, t0);
-    // The word was typed: the listener's line must know it.
     type_word(&mut app, wid, "sit");
-    // Enter is the boundary key: noted on the input path first…
     app.input(wid, named(NamedKey::Enter), Source::Human);
     assert_eq!(pending(&app, wid), Some(Trick::Sit));
     assert_eq!(flash(&app, wid, t0), TrickFlashPhase::Pending);
-    // …then the shell answers, scrolling the typed line two rows up.
     {
         let term = app.pool.get(session).expect("session").term.clone();
         term_lock(&term).process(format!("\r\nzsh: command not found: sit\r\n{prompt}").as_bytes());

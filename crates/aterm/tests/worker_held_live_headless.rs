@@ -1,37 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A WORKER HELD AT A SCREEN NO RULE KNOWS, against a real `aterm --headless`
-//! through the one `aterm` binary (`docs/DESIGN-sessions-as-subagents-2026-10-15.md`
-//! §2.2, the held deadline; the real-Claude lab's finding: the auto-mode billing
-//! notice after the composer, read `agent=unknown`, never stalled, and its
-//! manager's `await task` waited its whole hour).
-//!
-//! A worker started with `spawn agent=claude` runs a stand-in `claude` (a
-//! `#!/bin/sh` script run under the name `claude`, so the server reads it as
-//! Claude Code and the window harness supervises it) that draws a finished
-//! turn; the worker is under Autopilot Land (a spawn's default), so the
-//! harness types its LAND instruction (echoed into the composer, so the
-//! submit is verified the Claude Code way), and the stand-in answers it with
-//! a clean defense, a few lines starting `Nothing left:` — Land's landing,
-//! which publishes the done. It then takes the manager's follow-up `turn`
-//! (echoed the same way) and answers it with that notice,
-//! no composer, nothing moving. The held deadline, shortened for the test
-//! through its development seam (`ATERM_TASK_HELD_MS`), marks the task
-//! `stalled why=held` with the attention naming the screen, and the
-//! manager's `await task @w:<task_rev>` answers with that row — where without
-//! the deadline it would wait its timeout. Esc dismisses the notice: the
-//! worker moves, and the stall and its attention go (`working why=moved`).
-//!
-//! Every wait that must end is a one-minute hang detector, never a latency
-//! budget; the held deadline's bound is the seam's, not a sleep. A machine
-//! that refuses the headless instance is COULD NOT RUN, never a pass.
-//! ISOLATION: `support/launch_isolation.rs` and `support/headless_boot.rs`,
-//! the state seam (`ATERM_STATE_HOME`), and a PATH of the stand-in's folder
-//! and the system's alone, so no real `claude` can answer — in the tab's login
-//! shell too, after macOS's `path_helper`: the boot pins it and ends COULD NOT
-//! RUN unless that shell names `claude` by the stand-in's path
-//! ([`headless_boot::boot_with`]).
+//! Headless integration test for the worker held-screen stall deadline and Escape recovery.
 
 #![cfg(unix)]
 
@@ -161,14 +131,10 @@ fn write_worker(home: &Path) {
     let dir = home.join("screens");
     std::fs::create_dir_all(&dir).expect("the screens' folder");
     std::fs::write(home.join("fake.sh"), FAKE).expect("the fake");
-    // The conversations the fake draws its composer under, in raw mode's
-    // line ends, and the composer's rule.
     let top = |rows: &[&str]| rows.iter().map(|r| format!("{r}\r\n")).collect::<String>();
     std::fs::write(dir.join("ready.top"), top(&TASK_TURN)).expect("ready");
     std::fs::write(dir.join("defense.top"), top(&DEFENSE)).expect("the defense");
     std::fs::write(dir.join("rule"), "─".repeat(COLUMNS)).expect("the rule");
-    // The measured notice (2.1.301, the workers lab "On the way" 1), no
-    // composer: a screen no harness rule knows.
     let mut held: Vec<String> = TASK_TURN.iter().map(|r| (*r).to_string()).collect();
     held.extend(
         [
@@ -205,8 +171,6 @@ fn boot(tag: &str, held_ms: &str) -> Instance {
             let base = std::fs::read_to_string(&cfg).expect("the isolation config");
             assert!(base.contains(launch_isolation::HARNESS_OFF), "{base}");
             let base = base.replace(launch_isolation::HARNESS_OFF, "");
-            // The stand-in is no Claude Code a relaunch or an upgrade could
-            // bring back: the two switches keep it so.
             std::fs::write(
                 &cfg,
                 format!("{base}[harness]\nrelaunch = false\nupgrade = false\n"),
@@ -221,8 +185,6 @@ fn boot(tag: &str, held_ms: &str) -> Instance {
                     "PATH",
                     format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display()),
                 )
-                // Development seams (a debug build): the state root, the
-                // log a failed wait prints, and the held deadline.
                 .env("ATERM_STATE_HOME", tmp.join("state"))
                 .env("ATERM_LOG", "info")
                 .env("ATERM_TASK_HELD_MS", held_ms)
@@ -242,7 +204,6 @@ fn spawn_worker(inst: &Instance, manager: &str, task: &str) -> String {
     cmd.env("ATERM_PARENT_SESSION_ID", manager)
         .current_dir(inst.tmp.join("work"))
         .stdin(Stdio::piped());
-    // Asked again while the instance has not yet accepted it, or answers it busy: nothing was sent.
     let out = headless_boot::until_served(|| {
         let mut child = cmd.spawn().expect("spawn aterm ctl");
         let mut stdin = child.stdin.take().expect("its stdin");
@@ -320,12 +281,9 @@ fn a_worker_held_at_a_screen_no_rule_knows_is_stalled_and_its_manager_answered()
     let (_, manager) = boot_session(&inst);
     let worker = spawn_worker(&inst, &manager, "Fix the parser.");
 
-    // The task's own turn, the LAND instruction typed, its clean defense:
-    // Land's landing, the harness's done.
     let done = await_task(&inst, &format!("@{worker}:0"), &worker);
     assert_eq!(field(&done, "state"), Some("done"), "{done}");
 
-    // The manager's follow-up, verified by the line leaving the composer.
     let turn = ctl(
         &inst,
         &[
@@ -336,7 +294,6 @@ fn a_worker_held_at_a_screen_no_rule_knows_is_stalled_and_its_manager_answered()
             FOLLOW_UP,
         ],
     );
-    // The screen rows on stdout, the verdict on stderr.
     let said = format!(
         "{}{}",
         String::from_utf8_lossy(&turn.stdout),
@@ -350,7 +307,6 @@ fn a_worker_held_at_a_screen_no_rule_knows_is_stalled_and_its_manager_answered()
     assert_eq!(field(verdict, "submitted"), Some("1"), "{verdict}");
     let found = field(verdict, "task_rev").expect("task_rev=").to_string();
 
-    // The notice no rule knows, and nothing moving.
     let unknown = ctl(
         &inst,
         &[&format!("@{worker}"), "await", "agent", "unknown", HANG_MS],
@@ -363,8 +319,6 @@ fn a_worker_held_at_a_screen_no_rule_knows_is_stalled_and_its_manager_answered()
         diagnosis(&inst, &worker)
     );
 
-    // The manager's wait past the rev its follow-up's Enter found answers
-    // with the held stall, its attention naming the screen.
     let row = await_task(&inst, &format!("@{worker}:{found}"), &worker);
     assert_eq!(field(&row, "state"), Some("stalled"), "{row}");
     let attention = pct_decode(field(&row, "attention").expect("attention="));
@@ -380,9 +334,6 @@ fn a_worker_held_at_a_screen_no_rule_knows_is_stalled_and_its_manager_answered()
         "{record}"
     );
 
-    // Esc dismisses the notice: the worker moved, and the stall and its
-    // attention go (marked `working why=moved`, or done over it by the
-    // harness).
     ctl_ok(&inst, &[&format!("@{worker}"), "key", "escape"]);
     let give_up = Instant::now() + HANG;
     loop {

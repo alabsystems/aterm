@@ -1,21 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The controller's verified artifact cache: download each pinned artifact once, check its
-//! SHA-256, and upload it to hosts that lack it (design §8).
-//!
-//! Every byte comes through `/usr/bin/curl -q --proto =https --proto-redir =https
-//! --tlsv1.2 -fsSL --max-filesize …` in the port's fixed environment (no proxy or CA
-//! override from the caller, no `~/.curlrc`), into a temporary file inside `cache/`. Only a
-//! file that hashes to its pin is renamed to `cache/<sha256>`, so a name in the cache is a
-//! verified artifact and nothing else.
-//!
-//! aterm's own release is resolved the way install.sh resolves it ([`resolve_aterm`]):
-//! the release's `aterm-appcast.toml` names `aterm-<version>-mac.zip` and its
-//! `zip_sha256`, and must name Developer ID team A66A9P66Z7, which the official channel
-//! pins in the script itself. The zip is then checked here as install.sh checks it after
-//! download: one `aterm.app`, `codesign --verify --deep --strict` against that team,
-//! Gatekeeper, the bundle id and the version.
+//! Controller verified artifact cache, appcast resolution, and release-zip verification.
 
 use super::inventory::Paths;
 use crate::baseline::Baseline;
@@ -31,11 +17,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-/// The public repository every aterm release is published to (install.sh's
-/// `OFFICIAL_REPO_SLUG`).
+/// Public GitHub repository slug for official `aterm` releases.
 pub const RELEASE_REPO: &str = "alabsystems/aterm";
 
-/// The largest artifact the cache takes (curl's `--max-filesize`). Emacs's image is 179 MB.
+/// Maximum artifact download size (`--max-filesize`).
 pub const MAX_ARTIFACT_BYTES: u64 = 4 << 30;
 
 /// The largest appcast taken: a few dozen KiB in practice, and well under the port's 1 MiB
@@ -49,35 +34,33 @@ const MAX_SCRIPT_BYTES: u64 = 5_000_000;
 /// The bound on one download: a hang detector over a slow link, not a latency budget.
 const DOWNLOAD_BUDGET: Duration = Duration::from_secs(3600);
 
-/// Serialize this process's cache lookup and publish decisions. Temporary allocations
-/// are exclusive across calls, including other processes.
+/// Serialize this process's cache lookup and publish decisions.
 static FETCHING: Mutex<()> = Mutex::new(());
 
 /// One artifact a baseline needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Needed {
-    /// For messages (`app.Emacs`, `aterm 0.105.0`).
+    /// Human-readable label (`app.Emacs`, `aterm 0.105.0`).
     pub name: String,
-    /// `https://` only.
+    /// `https://` download URL.
     pub url: String,
-    /// Hex.
+    /// Expected lowercase hex SHA-256.
     pub sha256: String,
 }
 
-/// `aterm-<version>-mac.zip`, the release's lean zip (install.sh binds the name to the
-/// version exactly).
+/// Returns the canonical macOS release archive name (`aterm-<version>-mac.zip`).
 #[must_use]
 pub fn zip_name(version: &str) -> String {
     format!("aterm-{version}-mac.zip")
 }
 
-/// The tag-specific download URL of one release asset.
+/// Returns the tag-specific GitHub release download URL for `asset`.
 #[must_use]
 pub fn release_url(version: &str, asset: &str) -> String {
     format!("https://github.com/{RELEASE_REPO}/releases/download/v{version}/{asset}")
 }
 
-/// The appcast of release `version`, or of the newest release.
+/// Returns the `aterm-appcast.toml` URL for `version` (or the latest release).
 #[must_use]
 pub fn appcast_url(version: Option<&str>) -> String {
     match version {
@@ -88,19 +71,13 @@ pub fn appcast_url(version: Option<&str>) -> String {
     }
 }
 
-/// The install.sh of release `version`, from its tag, never `HEAD`.
-///
-/// Releases publish no SHA-256 for install.sh, so its pin is the hash of what this URL
-/// served when the command resolved it ([`resolve_aterm`]); every envelope that command
-/// signs carries that hash, and the agent checks the bytes against it. The baseline file is
-/// not rewritten: the next command resolves it again, unless the baseline pins it.
+/// Returns the tag-pinned `tools/install.sh` URL for `version`.
 #[must_use]
 pub fn install_sh_url(version: &str) -> String {
     format!("https://raw.githubusercontent.com/{RELEASE_REPO}/v{version}/tools/install.sh")
 }
 
-/// Every artifact `baseline` installs, after [`resolve_aterm`] has filled `[aterm]`, once
-/// each: `[[app]]` rows, Homebrew.pkg, the aterm release zip and its install.sh.
+/// Collects all unique artifacts required by `baseline`.
 #[must_use]
 pub fn needed(baseline: &Baseline) -> Vec<Needed> {
     let mut out: Vec<Needed> = Vec::new();
@@ -156,8 +133,6 @@ fn download(sys: &dyn System, url: &str, tmp: &Path, max: u64) -> Result<(), Str
     if !url.starts_with("https://") {
         return Err(format!("{url} is not https://; refusing to download it"));
     }
-    // The caller holds the exclusive directory containing this tool output until
-    // validation and publication finish. No prior partial path is adopted.
     let ran = sys
         .run(&curl(url, tmp, max))
         .map_err(|e| format!("curl {url}: {e}"))?;
@@ -179,13 +154,10 @@ fn cache_scratch<'s>(
     Scratch::new_in(sys, &cache, label).map_err(|e| format!("cache scratch: {e}"))
 }
 
-/// Make sure `cache/<sha256>` holds `item`: download it with `/usr/bin/curl --proto =https`
-/// when missing, and check the hash. Returns the cached path. A cached file that no
-/// longer hashes to its name is removed and fetched again.
+/// Ensures `cache/<sha256>` holds a verified copy of `item`, downloading via `curl` if needed.
 ///
 /// # Errors
-/// One line: not https, download failed, or the bytes do not hash to the pin (and then
-/// nothing is cached).
+/// Returns an error if the URL is not `https://`, download fails, or the SHA-256 mismatches.
 pub fn ensure(sys: &dyn System, paths: &Paths, item: &Needed) -> Result<PathBuf, String> {
     if !item.url.starts_with("https://") {
         return Err(format!(
@@ -239,8 +211,7 @@ pub fn ensure(sys: &dyn System, paths: &Paths, item: &Needed) -> Result<PathBuf,
     Ok(dest)
 }
 
-/// What a release's `aterm-appcast.toml` says about its mac zip. The appcast carries many
-/// more fields; only these decide an install.
+/// What a release's `aterm-appcast.toml` says about its mac zip.
 #[derive(Debug, Deserialize)]
 struct Appcast {
     version: String,
@@ -252,22 +223,19 @@ struct Appcast {
     team_id: Option<String>,
 }
 
-/// One release, as [`parse_appcast`] admitted it.
+/// Admitted release metadata from [`parse_appcast`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Release {
     /// `MAJOR.MINOR.PATCH`.
     pub version: String,
-    /// The SHA-256 of `aterm-<version>-mac.zip`, lowercase.
+    /// Lowercase hex SHA-256 of `aterm-<version>-mac.zip`.
     pub zip_sha256: String,
 }
 
-/// Admit an appcast the way install.sh does: a canonical version, equal to `want` when
-/// one is pinned; the zip named exactly `aterm-<version>-mac.zip` with a 64-digit
-/// SHA-256; and team A66A9P66Z7, refusing a manifest that omits or contradicts it (it
-/// rides unsigned, so the pin lives here, not in it).
+/// Parses and validates `aterm-appcast.toml` against optional pinned `want` version.
 ///
 /// # Errors
-/// One line naming the field that refused.
+/// Returns an error naming the first invalid or mismatched field.
 pub fn parse_appcast(text: &str, want: Option<&str>) -> Result<Release, String> {
     let cast: Appcast =
         aterm_toml::from_str(text).map_err(|e| format!("aterm-appcast.toml: {e}"))?;
@@ -331,9 +299,7 @@ fn fetch_text(sys: &dyn System, url: &str, max: u64) -> Result<String, String> {
     }
 }
 
-/// Fetch release `version`'s install.sh into the cache and return its SHA-256. It must
-/// look like the official script: the whole-file guard (`main "$@"` as its last line, so
-/// a cut-off download is refused) and the official Team ID pin.
+/// Fetch release `version`'s install.sh into the cache and return its SHA-256.
 fn fetch_install_sh(sys: &dyn System, paths: &Paths, version: &str) -> Result<String, String> {
     let _one = FETCHING
         .lock()
@@ -369,13 +335,10 @@ fn fetch_install_sh(sys: &dyn System, paths: &Paths, version: &str) -> Result<St
     Ok(sha)
 }
 
-/// Check the cached release zip `zip` here, before any host sees it, as install.sh checks
-/// its download: one `aterm.app`, signed by team A66A9P66Z7, accepted by Gatekeeper, with
-/// the release's bundle id and `version`. Expanded in an exclusively allocated cache
-/// scratch, whose ownership is retained through verification and cleanup.
+/// Verifies a cached release zip's bundle layout, Developer ID signature, Gatekeeper, and version.
 ///
 /// # Errors
-/// One line naming the check that refused.
+/// Returns an error naming the check that failed.
 pub fn verify_release_zip(
     sys: &dyn System,
     paths: &Paths,
@@ -445,21 +408,18 @@ fn set_string(table: &mut dyn aterm_toml::edit::TableLike, key: &str, value: &st
     table.insert(key, aterm_toml::edit::Item::Value(new));
 }
 
-/// What `[aterm]` resolves to: the release and the two pins every envelope carries.
+/// Resolved `[aterm]` release version and asset SHA-256 pins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AtermPins {
-    /// The release.
+    /// Release version.
     pub version: String,
-    /// Its mac zip's SHA-256, from its appcast.
+    /// SHA-256 of the macOS release zip from the appcast.
     pub archive_sha256: String,
-    /// Its install.sh's SHA-256: the baseline's pin, else what the release's tag served.
+    /// SHA-256 of the release tag's `install.sh`.
     pub install_sh_sha256: String,
 }
 
-/// The `[aterm]` pins one command resolved, keyed by what each baseline asked for
-/// (`version`, `archive_sha256`, `install_sh_sha256`, any of them absent): every host of one
-/// command gets the same release, and the appcast, install.sh and the release zip's checks
-/// run once per command, not once per host.
+/// Per-command memo of resolved `[aterm]` pins keyed by requested baseline fields.
 #[derive(Debug, Default)]
 pub struct AtermMemo {
     resolved: Vec<(AtermAsked, AtermPins)>,
@@ -468,18 +428,10 @@ pub struct AtermMemo {
 /// `[aterm]`'s three pins as a baseline writes them.
 type AtermAsked = (Option<String>, Option<String>, Option<String>);
 
-/// Fill `[aterm] archive_sha256` and `install_sh_sha256` for `[aterm] version` (or the
-/// newest release when it is absent) from the release's appcast and assets, verified the
-/// way install.sh verifies them. Rewrites the baseline text, keeping every comment; a
-/// baseline whose `[aterm]` is already filled, or that has none, comes back unchanged and
-/// nothing is fetched.
-///
-/// The zip is downloaded into the cache and checked ([`verify_release_zip`]) before its
-/// hash is written down. install.sh is fetched from the release's tag; a pin the baseline
-/// already holds for either is kept, and an archive pin the release contradicts is refused.
+/// Resolves and verifies `[aterm]` pins for `baseline_text`, rewriting the TOML in place.
 ///
 /// # Errors
-/// One line.
+/// Returns an error if appcast/asset retrieval, verification, or TOML rewriting fails.
 pub fn resolve_aterm(
     sys: &dyn System,
     paths: &Paths,
@@ -488,11 +440,10 @@ pub fn resolve_aterm(
     resolve_aterm_once(sys, paths, baseline_text, &mut AtermMemo::default())
 }
 
-/// [`resolve_aterm`], reusing what `memo` already resolved in this command for the same
-/// `[aterm]` table.
+/// Resolves `[aterm]` pins like [`resolve_aterm`], reusing `memo` across hosts.
 ///
 /// # Errors
-/// One line.
+/// Returns an error if resolution or TOML rewriting fails.
 pub fn resolve_aterm_once(
     sys: &dyn System,
     paths: &Paths,
@@ -576,7 +527,6 @@ fn write_pins(baseline_text: &str, pins: &AtermPins) -> Result<String, String> {
     set_string(table, "archive_sha256", &pins.archive_sha256);
     set_string(table, "install_sh_sha256", &pins.install_sh_sha256);
     let text = doc.to_string();
-    // What was written must read back as what was resolved.
     let back = crate::baseline::parse(&text)?;
     let back = back.aterm.unwrap_or_default();
     if back.version.as_deref() != Some(pins.version.as_str())
@@ -735,11 +685,9 @@ install_sh_sha256 = "dd92e2224c1c5a8e2c69992c4bafdf79142cf27f36a5bacfbfaa8efe129
         let got = ensure(&sys, &paths(), &item).unwrap();
         assert_eq!(got, PathBuf::from(format!("/m/cache/{sha}")));
         assert_eq!(sys.written(&format!("/m/cache/{sha}")).unwrap(), bytes);
-        // Cached now: no second download.
         let before = sys.calls().len();
         ensure(&sys, &paths(), &item).unwrap();
         assert_eq!(sys.calls().len(), before);
-        // Bytes that hash to something else are never cached.
         let sys = Fake::root();
         sys.on(
             &curl_key(url, &part("download", 0), MAX_ARTIFACT_BYTES),
@@ -826,7 +774,7 @@ install_sh_sha256 = "dd92e2224c1c5a8e2c69992c4bafdf79142cf27f36a5bacfbfaa8efe129
     }
 
     /// Script the newest release (v0.104.0) on `sys`: its appcast, zip, the zip's checks and
-    /// install.sh. Returns the zip's and install.sh's SHA-256 and the expansion it checks.
+    /// install.sh.
     fn scripted_release(sys: &Fake) -> (String, String, String) {
         let zip = b"the release zip";
         let zip_sha = sha_of(zip);
@@ -911,7 +859,6 @@ install_sh_sha256 = "dd92e2224c1c5a8e2c69992c4bafdf79142cf27f36a5bacfbfaa8efe129
             sys.written(&format!("/m/cache/{script_sha}")).unwrap(),
             b"#!/usr/bin/env bash\nOFFICIAL_TEAM_ID=\"A66A9P66Z7\"\nmain \"$@\"\n"
         );
-        // The expansion it checked is gone.
         assert!(sys.stat(Path::new(&verify)).is_err());
         assert!(
             sys.written(&format!("{verify}/aterm.app/Contents/Info.plist"))

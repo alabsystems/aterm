@@ -1,44 +1,13 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `atpkg-keys`: owner-only Ed25519 CLI for atpkg manifest signing and the paper master /
-//! machine roster the release channel runs on.
-//!
-//! ## Signing plumbing (called by `atpkg-publish`, not by hand)
-//!
-//!   atpkg-keys pubkey <key-file>                      print base64 pubkey of an existing key
-//!   atpkg-keys sign   <key-file> <file> [<sig-out>]   detached-sign <file>'s exact bytes
-//!   atpkg-keys verify-signed <master-pubkey-b64> <file> <file.sig> <roster> <roster.sig>
-//!                                                     verify a live roster machine signed <file>
-//!
-//! `pubkey` and `sign` take the machine key `setup`/`join` minted (`~/.aterm/machine.key`).
-//! `verify-signed` checks non-atpkg release files (such as `SHA256SUMS`) with the client's
-//! own roster verifier. Every signing key is born in provisioning so the roster accounts for it.
-//!
-//! ## Ceremony verbs
-//!
-//!   atpkg-keys setup          --id <id> [--pins <path>] [--roster <path>] [--key <path>]
-//!   atpkg-keys join           --id <id> [--pins <path>] [--roster <path>] [--key <path>]
-//!   atpkg-keys machine-revoke --id <id> [--roster <path>]
-//!   atpkg-keys master-check
-//!
-//! `setup` (first machine, once ever) generates the paper master, shows the 52 characters once
-//! on `/dev/tty`, arms `pins::PAPER_MASTER_PUBKEYS` after paper transcription is proven, mints
-//! `~/.aterm/machine.key` (`0600`), and writes the master-signed roster. `join` does the same
-//! on a later machine after proving the typed phrase against the committed anchor and existing
-//! roster. Neither commits or pushes.
-//!
-//! The master is read and shown only on `/dev/tty` (echo off on read): never argv, env, stdin,
-//! stdout, stderr or a file (`master.rs`). `--master` and its family are refused as compromised,
-//! and every unread argument or `--name=value` spelling is refused so no trust-anchor or key
-//! path ever silently falls back to a default.
+//! `atpkg-keys`: owner-only Ed25519 CLI for manifest signing and roster ceremonies.
 
 #[cfg(unix)]
 use atpkg_keys::fsio::{concat, read_bytes, write_bytes};
 #[cfg(unix)]
 use std::process::ExitCode;
 
-// POSIX-only owner tool (see lib.rs).
 #[cfg(windows)]
 fn main() {
     eprintln!("atpkg-keys: unsupported on Windows (POSIX-only owner signing tool)");
@@ -67,7 +36,7 @@ fn flag<'a>(argv: &'a Argv, name: &str) -> Option<&'a str> {
     None
 }
 
-/// Flag names that would carry the master on argv (leak vector 1), refused with a compromise warning.
+/// Flag names that would carry the master key on argv, refused with a compromise warning.
 #[cfg(unix)]
 const MASTER_FLAGS: &[&str] = &[
     "master",
@@ -79,8 +48,7 @@ const MASTER_FLAGS: &[&str] = &[
     "secret",
 ];
 
-/// Refuse every argument shape the verb does not read (`allowed` flags and at most
-/// `max_positional` bare arguments).
+/// Refuse any argument shape outside `allowed` flags and `max_positional` bare arguments.
 #[cfg(unix)]
 fn vet_args(
     verb: &str,
@@ -189,7 +157,6 @@ fn main() -> ExitCode {
     for slot in argv.iter_mut() {
         *slot = it.next();
     }
-    // Anything past the bounded vector would be dropped silently: refuse it instead.
     let overflowed = it.next().is_some();
 
     let r = if overflowed {
@@ -199,8 +166,6 @@ fn main() -> ExitCode {
             " after the verb",
         ]))
     } else {
-        // Per verb, not pooled, so a flag added to one verb cannot be silently accepted by
-        // another that ignores it.
         match verb.as_deref() {
             Some("pubkey") => {
                 vet_args("pubkey", &argv, &[], 1).and_then(|()| pubkey(positional(&argv, 0)))
@@ -244,12 +209,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// `println!` without the fmt machinery: one write of `line` + '\n', panicking on failure
-/// like `println!`.
-///
-/// `panic_any` is unsupported MIR for the Trust verifier; moving it into a local leaf only
-/// moves the obligation to that call, and an inline `panic!` is a charged assert edge, so the
-/// direct call is the minimal shape.
+/// `println!` without the fmt machinery.
 #[cfg(unix)]
 fn print_line(line: &str) {
     use std::io::Write as _;
@@ -286,10 +246,7 @@ fn pubkey(key: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-/// `verify-signed`: did a live machine of a roster that verifies under that master sign this
-/// file's exact bytes? Prints `OK: signed by machine <id> under roster seq <n>`. Any
-/// verification failure is one opaque `FAIL:` line (no oracle), an unreadable input names its
-/// path, and every refusal exits 1.
+/// `verify-signed`.
 #[cfg(unix)]
 fn verify_signed(argv: &Argv) -> Result<(), String> {
     const USAGE: &str = "usage: atpkg-keys verify-signed <master-pubkey-b64> <file> <file.sig> \
@@ -304,7 +261,6 @@ fn verify_signed(argv: &Argv) -> Result<(), String> {
         return Err(USAGE.to_string());
     };
     let read = |p: &str| read_bytes(p).map_err(|e| concat(&["read ", p, ": ", &e.to_string()]));
-    // A whole source tree's SHA256SUMS (see `fsio::read_bytes_up_to`).
     let file_bytes = atpkg_keys::fsio::read_bytes_up_to(file, 64 * 1024 * 1024)
         .map_err(|e| concat(&["read ", file, ": ", &e.to_string()]))?;
     let now =
@@ -338,12 +294,9 @@ fn sign(key: Option<&str>, msg: Option<&str>, sig_out: Option<&str>) -> Result<(
     let sig = atpkg_keys::sign(&read_key(key)?, &bytes)?;
     let path = match sig_out {
         Some(path) => path.to_string(),
-        // Default: <file>.sig next to the input.
         None => concat(&[msg, ".sig"]),
     };
     write_bytes(&path, &sig).map_err(|e| concat(&["write ", &path, ": ", &e.to_string()]))?;
-    // Collapse `$HOME` to `~`: publish transcripts can sit beside public releases, and an
-    // absolute path names this machine's account (atpkg-publish's `producer_to_client` pins it).
     let shown = match std::env::var("HOME") {
         Ok(home) if !home.is_empty() && path.starts_with(&home) => {
             concat(&["~", &path[home.len()..]])
@@ -360,15 +313,10 @@ fn sign(key: Option<&str>, msg: Option<&str>, sig_out: Option<&str>) -> Result<(
     Ok(())
 }
 
-// The paper master and the machine roster. The master is read from /dev/tty, used, and
-// scrubbed: never a parameter, never written, never printed after the one moment at
-// generation when the owner must read it (`master.rs`).
-
 #[cfg(unix)]
 use atpkg_keys::provision::{DEFAULT_ROSTER, MACHINE_KEY_REL, MACHINE_PUB_REL, home_path};
 
-/// Current unix seconds, or an error: every timestamp this tool writes is load-bearing
-/// (`valid_until` decides whether clients accept the roster), so a broken clock stops the mint.
+/// Current unix seconds, or an error.
 #[cfg(unix)]
 fn now_unix() -> Result<u64, String> {
     aterm_time::unix_secs().ok_or_else(|| {
@@ -376,8 +324,7 @@ fn now_unix() -> Result<u64, String> {
     })
 }
 
-/// Print the master's public identity: the fingerprint the owner eyeballs against paper,
-/// and the base64 public key that goes into `pins::PAPER_MASTER_PUBKEYS`.
+/// Print the master's public identity.
 #[cfg(unix)]
 fn announce_master(seed: &atpkg_keys::master::MasterSeed) -> Result<(), String> {
     print_line(&concat(&["master fingerprint: ", &seed.fingerprint()?]));
@@ -390,13 +337,11 @@ fn announce_master(seed: &atpkg_keys::master::MasterSeed) -> Result<(), String> 
 const PHRASE_HEADING: &str = "atpkg-keys: MASTER PHRASE — write it on paper, twice, in two \
      places. Shown once. Stored nowhere. Unrecoverable.";
 
-/// The rule that isolates the two lines the paper must carry from everything else on the
-/// screen, so the phrase cannot read as one unmarked line in a report.
+/// The rule that isolates the two lines the paper must carry from everything else on the screen.
 #[cfg(unix)]
 const PHRASE_RULE: &str = "----------------------------------------------------------------";
 
-/// Show the phrase on the terminal only: heading, 52 characters and fingerprint all go to the
-/// one `/dev/tty` handle, where no redirect can capture or swallow them.
+/// Show the phrase on the terminal only.
 #[cfg(unix)]
 fn show_phrase(
     tty: &mut atpkg_keys::master::Tty,
@@ -416,9 +361,7 @@ fn show_phrase(
     Ok(())
 }
 
-/// The transcription gate: nothing is armed until the phrase is retyped from the paper, since
-/// a shown-but-never-copied master would arm a tier nobody can extend or revoke. A mismatch
-/// re-shows the phrase and asks again; an abort (Ctrl-C/EOF) arms nothing.
+/// The transcription gate.
 #[cfg(unix)]
 fn confirm_transcription(
     tty: &mut atpkg_keys::master::Tty,
@@ -432,11 +375,9 @@ fn confirm_transcription(
              nothing is armed): ",
         )? {
             Ok(typed) => typed,
-            // EOF presents as an empty attempt: abort, or a closed tty would loop forever.
             Err(atpkg_keys::master::PhraseError::Length { got: 0 }) => {
                 return Err("nothing was typed at the transcription gate".to_string());
             }
-            // A typo is not an abort: say what was wrong and ask again.
             Err(e) => {
                 tty.write_line(&concat(&["atpkg-keys: ", &e.message(), " — try again."]))?;
                 continue;
@@ -460,8 +401,7 @@ fn confirm_transcription(
     }
 }
 
-/// `master-check`: type the phrase back and see the fingerprint again. Run it while the
-/// terminal still shows the original, so a bad transcription is still fixable.
+/// `master-check`: type the phrase back and see the fingerprint again.
 #[cfg(unix)]
 fn master_check() -> Result<(), String> {
     atpkg_keys::master::forbid_core_dumps();
@@ -486,8 +426,7 @@ const SETUP_ARMED_NOTHING: &str = "atpkg-keys: nothing was written and no phrase
      shown — no master exists as a result of this run. Fix the problem above and run \
      `atpkg-keys setup` again.";
 
-/// What `setup` says when the phrase was shown but the anchor not written: the paper arms
-/// nothing and must be destroyed, not filed.
+/// What `setup` says when the phrase was shown but the anchor not written.
 #[cfg(unix)]
 const SETUP_PAPER_ARMS_NOTHING: &str = "atpkg-keys: THE PHRASE ABOVE ARMS NOTHING. The \
      anchor file was not written, so the master you just saw is not referenced by anything \
@@ -495,19 +434,10 @@ const SETUP_PAPER_ARMS_NOTHING: &str = "atpkg-keys: THE PHRASE ABOVE ARMS NOTHIN
      setup` again — it will generate a different master.";
 
 /// `setup` / `join`: provision the paper master and a machine's signing key.
-///
-/// `setup` runs in safety order: (1) open `/dev/tty` before generating a master; (2) generate
-/// and plan in memory (failures emit [`SETUP_ARMED_NOTHING`]); (3) show the phrase and require
-/// a matching retype from paper; (4) arm the anchor (a write failure after display emits
-/// [`SETUP_PAPER_ARMS_NOTHING`]).
-///
-/// `join` reads the phrase, verifies it against the committed anchor and existing master-signed
-/// roster, and only then writes.
 #[cfg(unix)]
 fn provision(verb: atpkg_keys::provision::Verb, argv: &Argv) -> Result<(), String> {
     use atpkg_keys::provision as prov;
 
-    // Before anything sensitive exists in this process (leak vector 7).
     atpkg_keys::master::forbid_core_dumps();
 
     let id = flag(argv, "id").ok_or_else(|| {
@@ -523,8 +453,6 @@ fn provision(verb: atpkg_keys::provision::Verb, argv: &Argv) -> Result<(), Strin
             Some(p) => p.to_string(),
             None => prov::discover_pins_path()?,
         },
-        // Explicit path vs. discovered anchor (canonicalized symlinks to the discovered anchor
-        // count as discovery for `preflight`'s compiled-anchor check).
         pins_explicit: match flag(argv, "pins") {
             None => false,
             Some(p) => match (
@@ -543,7 +471,6 @@ fn provision(verb: atpkg_keys::provision::Verb, argv: &Argv) -> Result<(), Strin
         machine_pub: home_path(MACHINE_PUB_REL)?,
     };
 
-    // Every refusal decidable from fs state precedes secret generation or prompting.
     let pre = prov::preflight(verb, id, &paths)?;
 
     let report = match verb {
@@ -585,8 +512,7 @@ fn provision(verb: atpkg_keys::provision::Verb, argv: &Argv) -> Result<(), Strin
     Ok(())
 }
 
-/// Read, verify under `master_pubkey`, and parse an existing roster (`MustExist`), returning
-/// its compare-and-swap byte snapshot alongside the parsed [`aterm_update_core::roster::Roster`].
+/// Read, verify under `master_pubkey` ([`aterm_update_core::roster::Roster`]).
 #[cfg(unix)]
 fn load_roster(
     path: &str,
@@ -607,7 +533,7 @@ fn load_roster(
     )
 }
 
-/// Sign and atomically publish the roster and its `.sig` via [`atpkg_keys::provision::publish_roster_locked`].
+/// Sign and publish the roster and `.sig` via [`atpkg_keys::provision::publish_roster_locked`].
 #[cfg(unix)]
 fn publish_roster(
     lock: &atpkg_keys::provision::RosterLock,
@@ -650,9 +576,7 @@ fn show_roster(r: &aterm_update_core::roster::Roster) {
     }
 }
 
-/// `machine-revoke --id <id> [--roster <path>]`: withdraw a machine's signing authority under
-/// the paper master. To roll back builds a compromised key already signed, use
-/// `atpkg-publish index --yank` / `--min-build`.
+/// `machine-revoke --id <id> [--roster <path>]`.
 #[cfg(unix)]
 fn machine_revoke(argv: &Argv) -> Result<(), String> {
     atpkg_keys::master::forbid_core_dumps();

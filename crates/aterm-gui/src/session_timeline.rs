@@ -1278,7 +1278,7 @@ pub(crate) fn claim_supervisor_as(
         ctx.timeline
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .record(
+            .record_row(
                 "holder-claim",
                 format!(
                     "holder={} {}",
@@ -1777,6 +1777,7 @@ pub(crate) struct SessionTimeline {
     )>,
     path: Option<PathReading>,
     leader_copy: Option<(i32, &'static str)>,
+    leader_no_harness: Option<i32>,
     upgrade: Option<aterm_agent::harness::upgrade_drive::Row>,
     upgrade_note: Option<aterm_agent::harness::footer::UpgradeNote>,
     resizes: crate::resize_ledger::ResizeLedger,
@@ -1790,6 +1791,9 @@ pub(crate) struct SessionTimeline {
     gauges: AgentGauges,
     screen_rung_at: Option<std::time::Instant>,
     slog: crate::session_log::SessionLog,
+    /// Whether the debug cross-check ([`Self::cross_check`]) saw this session's ring and view apart: a dev instance logs only the first.
+    #[cfg(all(debug_assertions, not(test)))]
+    view_disagreed: std::sync::atomic::AtomicBool,
     need: crate::needs::Verdict,
     last_act: Option<String>,
     pending_self_tasks: VecDeque<aterm_agent::harness::acts::TaskFace>,
@@ -2160,11 +2164,90 @@ impl SessionTimeline {
     /// Append one event, evicting the oldest past the cap, and wake the session's watchers for a record. Returns its id.
     pub(crate) fn record(&mut self, kind: &'static str, payload: String) -> u64 {
         debug_assert_ne!(kind, META_CHANGE, "a meta-change is record_meta_change's");
+        debug_assert!(
+            !crate::session_timeline_view::ROW_ONLY.contains(&kind),
+            "a {kind} row is record_row's: the log holds it as its row alone"
+        );
         if kind == META_CHANGE {
             return self.next_id;
         }
         self.append(kind, payload)
     }
+
+    /// THE ONE WRITER OF A ROW-ONLY KIND ([`crate::session_timeline_view::ROW_ONLY`]): the session log's `row` mark, then the ring's row, in this one hold. Returns the ring row's id.
+    pub(crate) fn record_row(&mut self, kind: &'static str, payload: String) -> u64 {
+        debug_assert!(
+            crate::session_timeline_view::ROW_ONLY.contains(&kind),
+            "{kind} is no row-only kind: its writer writes its own mark"
+        );
+        let at = self.slog.now();
+        self.slog.observe_row(kind, &payload, at);
+        self.append(kind, payload)
+    }
+
+    /// A row a test writes by hand, of any kind, as [`Self::record_row`] writes it: a `row` mark and the ring's row.
+    #[cfg(test)]
+    pub(crate) fn record_hand_row(&mut self, kind: &'static str, payload: String) -> u64 {
+        let at = self.slog.now();
+        self.slog.observe_row(kind, &payload, at);
+        self.append(kind, payload)
+    }
+
+    /// The view past `after`, its newest `keep` rows (0: every one), copied under this lock to format after it (the `timeline` verb's).
+    pub(crate) fn view_copy(
+        &self,
+        after: Option<u64>,
+        keep: usize,
+    ) -> crate::session_timeline_view::ViewCopy {
+        self.cross_check();
+        crate::session_timeline_view::ViewCopy::of(self.slog.log(), after, keep)
+    }
+
+    /// The view past `after` (`None`: from the first row), with the row ids it no longer holds (the `events` digest's read).
+    pub(crate) fn view_since(
+        &self,
+        after: Option<u64>,
+    ) -> crate::session_timeline_view::TimelineView {
+        self.cross_check();
+        crate::session_timeline_view::timeline_rows_since(self.slog.log(), after)
+    }
+
+    /// The view's head: the last row id the log passed, `None` before any (the digest's early-out and seed, the chrome's cache key).
+    pub(crate) fn view_head(&self) -> Option<u64> {
+        Some(self.slog.row_head()).filter(|&h| h > 0)
+    }
+
+    /// The view's rows newest first, as `(kind, process-clock ms)`: the tab chrome's tail.
+    pub(crate) fn view_newest_first(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+        self.cross_check();
+        crate::session_timeline_view::newest_first(self.slog.log())
+    }
+
+    /// The ring held to the view at a reader's read, in a debug build ([`crate::session_timeline_view::ring_against_view`]): a test panics on a disagreement, a dev instance logs the session's first and reads on.
+    #[cfg(debug_assertions)]
+    fn cross_check(&self) {
+        let held = crate::session_timeline_view::ring_against_view(
+            self.events.iter(),
+            self.slog.burst_rows_owed(),
+            self.slog.log(),
+            self.slog.program_pending(),
+        );
+        if let Err(why) = held {
+            #[cfg(test)]
+            panic!("THE RING AND THE VIEW DISAGREE: {why}");
+            #[cfg(not(test))]
+            if !self
+                .view_disagreed
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                aterm_log::error!("timeline: the ring and the view disagree: {why}");
+            }
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[inline]
+    fn cross_check(&self) {}
 
     /// THE ONE `meta-change` WRITER, under the meta → timeline hold its writer already takes (`meta` is the store as the write left it).
     pub(crate) fn record_meta_change(
@@ -2184,7 +2267,7 @@ impl SessionTimeline {
     /// A raw `meta-change` row for a test that pins the timeline's own shapes and not a writer's.
     #[cfg(test)]
     pub(crate) fn record_raw_meta_change(&mut self, payload: String) -> u64 {
-        self.append(META_CHANGE, payload)
+        self.record_hand_row(META_CHANGE, payload)
     }
 
     fn append(&mut self, kind: &'static str, payload: String) -> u64 {
@@ -2214,11 +2297,11 @@ impl SessionTimeline {
         self.next_id
     }
 
-    /// THE `cwd-change` WRITER.
-    pub(crate) fn record_cwd_change(&mut self, cwd: Option<&str>) {
+    /// THE `cwd-change` WRITER: a row iff the session log's `cwd` mark moved; returns whether it recorded one.
+    pub(crate) fn record_cwd_change(&mut self, cwd: Option<&str>) -> bool {
         let at = self.slog.now();
         let Some(held) = self.slog.observe_cwd(cwd, at) else {
-            return;
+            return false;
         };
         let payload = if held.is_empty() {
             "cwd=-".to_string()
@@ -2226,6 +2309,7 @@ impl SessionTimeline {
             format!("cwd={}", crate::control::pct_encode(&held))
         };
         self.record(CWD_CHANGE, payload);
+        true
     }
 
     /// THE `title-change` WRITER (DESIGN §8: "the C-tier title keeps the `title-change` rows").
@@ -2366,14 +2450,14 @@ impl SessionTimeline {
         !transitions.is_empty()
     }
 
-    /// Events with `id > after` (all with `None`), oldest first.
+    /// Events with `id > after` (all with `None`), oldest first: a test's, holding the view to the ring.
+    #[cfg(test)]
     pub(crate) fn since(
         &self,
         after: Option<u64>,
     ) -> impl DoubleEndedIterator<Item = &TimelineEvent> + ExactSizeIterator {
         let start = match after {
             Some(a) if a <= self.next_id => self.events.partition_point(|e| {
-                #[cfg(test)]
                 crate::work_counts::retained_record_touched();
                 e.id <= a
             }),
@@ -2473,11 +2557,13 @@ impl SessionTimeline {
     }
 
     /// The highest recorded event id, or `None` when empty.
+    #[cfg(test)]
     pub(crate) fn high_id(&self) -> Option<u64> {
         self.events.back().map(|e| e.id)
     }
 
     /// The lowest retained event id, or `None` when empty.
+    #[cfg(test)]
     pub(crate) fn low_id(&self) -> Option<u64> {
         self.events.front().map(|e| e.id)
     }
@@ -2761,6 +2847,7 @@ impl SessionTimeline {
         self.agent.program_pgid = pgid;
         let had_reader = self.agent.reader.take().is_some();
         self.leader_copy = None;
+        self.leader_no_harness = None;
         if self.agent.program.take().is_some() || had_reader {
             // its worker must still see the foreground group leave.
             crate::harness_host::ring();
@@ -2823,7 +2910,7 @@ impl SessionTimeline {
         if offer == crate::holder_image::Offer::Published {
             self.advance_foreground_generation();
             if crate::holder_image::DEV_ROWS {
-                self.record(
+                self.record_row(
                     "holder-edge",
                     format!(
                         "kind={} token={} pgid={} present={} at_ns={}",
@@ -2834,7 +2921,7 @@ impl SessionTimeline {
                         image.read_ns,
                     ),
                 );
-                self.record(
+                self.record_row(
                     "holder-image",
                     format!("{} {}", image.payload(), crate::holder_image::dev_tail()),
                 );
@@ -2985,7 +3072,7 @@ impl SessionTimeline {
         }
         self.card_seen = Some(token);
         self.card_frames.seen = Some((token, row, self.card_frames.composed));
-        self.record(
+        self.record_row(
             "card-seen",
             format!(
                 "token={} rows_kind={rows_kind} row={row} after={} evidence=matching-screen {}",
@@ -3013,7 +3100,7 @@ impl SessionTimeline {
                     && self.card_frames.decorated_row != Some(row);
                 self.card_frames.decorated_row = Some(row);
                 if moved {
-                    self.record(
+                    self.record_row(
                         "card-row",
                         format!(
                             "token={} row={row} composed={composed} {}",
@@ -3033,7 +3120,7 @@ impl SessionTimeline {
                     };
                     let bare = self.card_frames.bare.of(token, row).max(late);
                     self.card_frames.bare = BareFrames::default();
-                    self.record(
+                    self.record_row(
                         "card-decorated",
                         format!(
                             "token={} row={row} bare_frames={bare} seen={} composed={composed} {}",
@@ -3044,7 +3131,7 @@ impl SessionTimeline {
                     );
                 }
                 if let Some(cause) = armed {
-                    self.record(
+                    self.record_row(
                         "card-armed",
                         format!(
                             "token={} cause={cause} composed={composed} {}",
@@ -3073,7 +3160,7 @@ impl SessionTimeline {
                 if self.card_frames.said != Some((token, why, row)) {
                     self.card_frames.said = Some((token, why, row));
                     let row = row.map_or_else(|| "-".to_string(), |r| r.to_string());
-                    self.record(
+                    self.record_row(
                         "card-bare",
                         format!(
                             "reason={} token={} row={row} composed={composed} {}",
@@ -3105,7 +3192,7 @@ impl SessionTimeline {
                     .as_deref()
                     .and_then(crate::holder_image::CardProgram::of)
             {
-                self.record(
+                self.record_row(
                     "holder-named",
                     format!(
                         "program={} pgid={pgid} {}",
@@ -3379,6 +3466,21 @@ impl SessionTimeline {
                 reported: same.is_some_and(|p| p.reported),
             });
         }
+    }
+
+    /// Record whether `pgid`'s leader was started with `--no-harness` / `--no-alab-harness`
+    /// (`ATERM_NO_HARNESS=1`).
+    pub(crate) fn set_leader_no_harness(&mut self, pgid: i32, no_harness: bool) {
+        if self.agent.program_pgid != pgid {
+            return;
+        }
+        self.leader_no_harness = no_harness.then_some(pgid);
+    }
+
+    /// Whether the current foreground leader was started with `--no-harness` / `--no-alab-harness`.
+    pub(crate) fn leader_no_harness(&self) -> bool {
+        self.leader_no_harness
+            .is_some_and(|pgid| pgid > 0 && pgid == self.agent.program_pgid)
     }
 
     /// `` of the last PATH measurement, or `None`.

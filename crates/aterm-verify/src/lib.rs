@@ -25,6 +25,10 @@ pub mod plan;
 #[cfg(unix)]
 pub mod provision;
 pub mod report;
+/// Nothing outlives its run: the run record, the stage-end survivor check and the next run's
+/// start ending a dead run's proven members (`docs/DESIGN-leftover-processes-2026-10-16.md`
+/// §3.3, §5.4, §8.1).
+pub mod runs;
 pub mod rustup;
 pub mod sched;
 pub mod scope;
@@ -177,6 +181,8 @@ pub fn fallback_build_dir(env: &EnvSnapshot, root: &Path, target: &Path) -> Opti
 }
 
 /// Whether this process may write the directory `dir` (`access(2)`, which a
+/// sandbox's denial answers too, as atpkg's shim asks it); `None` when `dir` is
+/// not a directory.
 #[cfg(unix)]
 fn writable_dir(dir: &Path) -> Option<bool> {
     use std::os::unix::ffi::OsStrExt as _;
@@ -268,6 +274,10 @@ pub struct Ctx {
     pub test_recorder: Option<PathBuf>,
     /// The machine-wide lock the timing stages hold while they run ([`plan::TIMED`]).
     pub timing_lock: Option<PathBuf>,
+    /// This run's record of its stage groups ([`runs::Runs`]), when it keeps one: every stage
+    /// child's group is told to it, and a stage's normal end sweeps its survivors. `None` off
+    /// the shipped run and wherever the rendezvous or the boot id cannot be read.
+    pub runs: Option<runs::Runs>,
 }
 
 /// A `CARGO_BUILD_JOBS` value as a job count.
@@ -372,7 +382,19 @@ impl Ctx {
             test_threads: pinned_threads,
             test_recorder: None,
             timing_lock: None,
+            runs: None,
         }
+    }
+
+    /// Keep this run's leftover record ([`runs::Runs`]) and set `ATERM_VERIFY_RUN` on every
+    /// stage child (W-run), so a descendant that leaves its group still names which run made
+    /// it.
+    #[must_use]
+    pub fn with_runs(mut self, runs: runs::Runs) -> Self {
+        self.child_env_add
+            .push((runs::VERIFY_RUN_ENV.into(), runs.env_value().into()));
+        self.runs = Some(runs);
+        self
     }
 
     /// Run `checks` ([`Ctx::checks`]), kept in [`checks::CHECKS`] order.
@@ -517,6 +539,7 @@ impl Ctx {
             child_ceiling: self.child_ceiling,
             remove_env: &self.child_env_remove,
             add_env: &self.child_env_add,
+            stage_groups: self.runs.as_ref().map(|r| r as &dyn exec::StageGroupEnd),
         }
     }
 
@@ -554,6 +577,7 @@ impl Ctx {
 }
 
 /// The machine-wide timing lock, held: released by `LOCK_UN` before its file
+/// closes.
 struct TimingLock(std::fs::File);
 
 impl TimingLock {
@@ -596,6 +620,7 @@ impl Drop for TimingLock {
 }
 
 /// Run `f` holding the run's timing lock, when it has one: two runs' timing
+/// stages never overlap.
 fn with_timing_lock<T>(ctx: &Ctx, f: impl FnOnce() -> T) -> T {
     let _held = ctx.timing_lock.as_deref().and_then(TimingLock::take);
     f()
@@ -650,6 +675,7 @@ pub fn selection(ctx: &Ctx, cone: Option<&str>) -> String {
 }
 
 /// When a stage started (from the run's start) and how long it ran: its `time`
+/// line in the log.
 type Clock = (Duration, Duration);
 
 /// One check's progress while the stages run.
@@ -784,6 +810,15 @@ pub fn run(
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     results.sort_by_key(|r| r.check);
+    // What the run's stages and its own end left behind, ended or named
+    // (`docs/DESIGN-leftover-processes-2026-10-16.md` §8.1.2, §8.1.4), goes into the receipt
+    // and the log above the verdict, which it does not change yet (§11 Q4).
+    if let Some(runs) = &ctx.runs {
+        for line in runs.end_of_run(&runs::LiveKernel) {
+            let _ = writeln!(log, "verify: {line}");
+            writeln!(out, "verify: {line}")?;
+        }
+    }
     let seconds = started.elapsed().as_secs_f64();
     let (line, code) = report::verdict(&results, ctx.release, seconds);
     let _ = writeln!(log, "\n{line}");
@@ -879,6 +914,8 @@ pub fn hold_toolchain(
 }
 
 /// The directories a run executes tools from: the toolchain directory, then the
+/// directory of each tool it took from the managed build ([`Toolchain::borrowed`]),
+/// each once, in that order.
 fn held_dirs(tools: &Toolchain) -> Vec<PathBuf> {
     let mut dirs = vec![tools.stage2_dir.clone()];
     for (_, file) in &tools.borrowed {
@@ -895,6 +932,8 @@ fn held_dirs(tools: &Toolchain) -> Vec<PathBuf> {
 const LOGS_KEPT: usize = 20;
 
 /// Open this run's log: `--log <path>` (read from `cwd`), else
+/// `<target>/verify/logs.noindex/<epoch>-<pid>.log`, keeping the newest
+/// [`LOGS_KEPT`].
 fn open_log(chosen: Option<&Path>, cwd: &Path, ctx: &Ctx) -> Option<(PathBuf, std::fs::File)> {
     let path = match chosen {
         Some(p) => cwd.join(p),
@@ -1042,6 +1081,16 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     let (_leases, lease_said) = hold_toolchain(&env, &tools, &root);
     #[cfg(unix)]
     exec::group::kill_on_interrupt();
+    // The run records' directory, verify's own rendezvous, resolved here and nowhere else.
+    let runs_dir = aterm_uds::control_socket_dir().map(|d| d.join("verify-runs"));
+    // The start pass: delete other boots' records, and end a dead run's proven members
+    // (§8.1.3), skipping this run's own pid.
+    if let (Some(dir), Some(boot)) = (&runs_dir, aterm_uds::process::boot_id()) {
+        let me = i32::try_from(std::process::id()).unwrap_or(0);
+        runs::end_dead_runs(dir, &boot, me, &runs::LiveKernel, &mut |line| {
+            eprintln!("verify: {line}");
+        });
+    }
 
     let path_env = tools.path_with_stage2_first(&env.path);
     let (scope, cone) = if !parsed.narrows() || parsed.all {
@@ -1070,6 +1119,16 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         .with_test_threads(parsed.test_threads)
         .with_timing_lock(Some(default_timing_lock()))
         .with_toolchain_lease(lease_said);
+    // Keep this run's record (and set ATERM_VERIFY_RUN on every child) when the rendezvous and
+    // boot id can be read; a run that cannot keeps none, and the next run's start pass simply
+    // has nothing of it to act on.
+    let ctx = match runs_dir
+        .as_deref()
+        .and_then(|dir| runs::Runs::open(&ctx, dir, exec::run))
+    {
+        Some(record) => ctx.with_runs(record),
+        None => ctx,
+    };
     let log = open_log(parsed.log.as_deref(), cwd, &ctx);
     let log_shown = log
         .as_ref()
@@ -1092,6 +1151,10 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
             exit::COULD_NOT_RUN
         }
     };
+    // The run's orderly end, after its run-end sweep (`run`): its record's removal.
+    if let Some(record) = &ctx.runs {
+        record.finish(&runs::LiveKernel);
+    }
     std::fs::remove_dir_all(&scratch).ok();
     code
 }
@@ -1207,6 +1270,7 @@ mod tests {
     use super::*;
 
     /// A tool the run took from the managed build runs out of THAT build, so the run
+    /// holds it for as long as it runs, once however many tools came from it.
     #[test]
     fn a_borrowed_tools_build_is_held_for_the_run() {
         use aterm_toolchain::lease::{self, Holders, Subject};
@@ -1312,6 +1376,7 @@ mod tests {
     }
 
     /// Every child builds in the caller's `CARGO_TARGET_DIR`, and
+    /// `--test-threads` reaches every child only when asked.
     #[test]
     fn every_child_builds_in_the_callers_target_dir_and_gets_the_threads_asked_for() {
         let theirs = Ctx::new(
@@ -1346,6 +1411,9 @@ mod tests {
     }
 
     /// THE MAIN LANE SHARES PLAIN TARGO'S CACHE exactly where atpkg's shim would
+    /// hand plain `targo` its build-cache `--config` (macOS, a root under a
+    /// writable `$HOME`, no layout chosen): then no child is pinned to a
+    /// CARGO_TARGET_DIR, and the target dir is still `<root>/target`.
     #[test]
     fn the_main_lane_shares_plain_targos_cache_exactly_where_the_shim_would() {
         let tmp = std::fs::canonicalize(mktemp_dir("atv-cache").expect("mktemp")).expect("real");
@@ -1395,6 +1463,9 @@ mod tests {
     }
 
     /// WHERE THE SHIM STEPS ASIDE the main lane is pinned to the run's target dir
+    /// and its intermediates still go where Spotlight never looks:
+    /// `<target>/build.noindex`, so only the uplifted artifacts land in the plain
+    /// folder.
     #[test]
     fn a_pinned_main_lane_keeps_its_intermediates_out_of_spotlight() {
         let pinned = |c: &Ctx| {
@@ -1481,6 +1552,8 @@ mod tests {
     }
 
     /// A rerun keeps `--no-windows` for a check it changes: a windowed stage's
+    /// (appkit) and one that skips its windowed rows (browser, whose WebKit
+    /// session opens windows).
     #[test]
     fn a_rerun_keeps_no_windows_where_the_flag_changes_the_check() {
         let c = |no_windows| {
@@ -1534,6 +1607,7 @@ mod tests {
     }
 
     /// The header says what the selection pulled into `dev`, and the package
+    /// that pulled each.
     #[test]
     fn the_header_names_what_the_selection_pulled_and_why() {
         let head = |crates: &[&str]| {

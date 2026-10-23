@@ -37,6 +37,7 @@ pub(crate) const BASH_STDERR: &str = "<bash-stderr>";
 pub(crate) const INTERRUPTED: &str = "[Request interrupted by user";
 
 /// A LOCAL COMMAND's own rows, as `wall_confirm`'s `local_command` reads a
+/// user row's string content: no turn of the conversation's.
 const LOCAL_COMMAND: [&str; 4] = [
     "<command-name>",
     "<command-message>",
@@ -220,6 +221,8 @@ pub enum StepEvent {
     /// The fold bound a file: its first `len` bytes are history.
     Bind {
         /// The file's length at the bind; for the file the registry named
+        /// while it did not exist ([`StepFold::note_vacant`]), its seed
+        /// (none of it, but a watermark the log held).
         len: u64,
     },
     /// A user row that starts a vendor turn (S3).
@@ -252,6 +255,7 @@ pub enum StepEvent {
         /// Its `durationMs`.
         vdur_ms: u64,
         /// Input tokens over its rows (input, cache writes and reads), each
+        /// message counted once at its largest ([`TURN_IDS_MAX`]).
         tok_in: u64,
         /// Output tokens over its rows.
         tok_out: u64,
@@ -441,6 +445,7 @@ impl EndFold {
 }
 
 /// A notice row (`isApiErrorMessage`) read as the harness reads it, its
+/// classes and wall kept and its text dropped.
 fn notice_of(line: &str) -> (Option<WallKind>, u8) {
     notice_read(line).map_or((None, 0), |n| {
         let classes = CLASSES
@@ -536,6 +541,8 @@ pub(super) fn quoted(line: &str, word: &str) -> bool {
 }
 
 /// The first decoded bytes of a user row's first text: its string content,
+/// or its content's first `text` part, with whether it was the string and
+/// whether it was read whole.
 struct Lead {
     bytes: [u8; LEAD_BYTES],
     len: usize,
@@ -553,6 +560,7 @@ impl Lead {
     }
 
     /// Whether this is a local command's own row (`wall_confirm`'s
+    /// `local_command`, on a string content only, as `user_entry` asks).
     fn local(&self) -> bool {
         if !self.string {
             return false;
@@ -569,6 +577,7 @@ impl Lead {
 }
 
 /// [`Lead`] of `line`, found after its `"message":` key; `None` where the
+/// content is neither a string nor holds a text part.
 fn lead(line: &str) -> Option<Lead> {
     let m = line.find("\"message\":")?;
     let rest = &line[m..];
@@ -642,6 +651,7 @@ fn lead(line: &str) -> Option<Lead> {
 }
 
 /// A `\uXXXX` escape at the start of `b` (a surrogate pair as one), and how
+/// many bytes it spans.
 fn unicode_escape(b: &[u8]) -> Option<(char, usize)> {
     let hex = |s: &[u8]| -> Option<u32> {
         let t = std::str::from_utf8(s.get(2..6)?).ok()?;
@@ -664,6 +674,7 @@ fn unicode_escape(b: &[u8]) -> Option<(char, usize)> {
 }
 
 /// A row's `timestamp` as wall ms: whole seconds (`parse_utc_fractional`'s
+/// rule) and the first three digits of its fraction.
 fn stamp_ms(s: &str) -> Option<u64> {
     let secs = u64::try_from(aterm_types::rfc3339::parse_utc_fractional(s)?).ok()?;
     let ms = s
@@ -726,6 +737,7 @@ impl TurnTokens {
 }
 
 /// The session the registry named with no transcript, and the file a
+/// later read found for it ([`StepFold::note_vacant`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Vacancy {
     /// The session id's fingerprint.
@@ -735,6 +747,7 @@ struct Vacancy {
 }
 
 /// A row that asks the model a turn though its words are no prompt, read
+/// and waiting for the assistant row that says the turn ran (module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Pending {
     /// Its `promptId`, else its `uuid` (none: counted lost if a turn ran).
@@ -760,6 +773,7 @@ enum Ask {
     /// A background task's wake: a turn waits for the model's row.
     Wake,
     /// A `!` shell command: the turn it may start waits, as a prompt
+    /// command's does.
     Command,
     /// A shell-mode command's output: nothing.
     Nothing,
@@ -778,6 +792,10 @@ fn fingerprint(id: &str) -> u64 {
 }
 
 /// THE OPENING HOLD: the steps of the bound file's first conversation rows,
+/// read before any prompt of theirs — the first turn's prompt row Claude
+/// Code writes after its turn's first rows (2.1.294 after the session
+/// limit's notice and `turn_duration`, 2.1.300 after the first call, each
+/// dated before them).
 #[derive(Clone, Debug)]
 struct Hold {
     /// Where the held steps start in the queue (those before are not held).
@@ -802,6 +820,9 @@ pub struct StepFold {
     /// Rows ending at or below this are history.
     seed: u64,
     /// THE VACANCY: the session the registry named while no transcript
+    /// existed for it, and once a read found its file, that file's
+    /// fingerprint ([`Self::note_vacant`], [`Self::note_found`]): only that
+    /// file, bound next, is bound from its first byte.
     vacant: Option<Vacancy>,
     /// The highest offset queued.
     through: u64,
@@ -812,10 +833,14 @@ pub struct StepFold {
     /// Latched off for the bound file ([`Self::latch`]).
     broken: bool,
     /// A vendor turn is running: a prompt or a model's row was read and no
+    /// turn end or interrupt since (`None`: not known, the bind's history
+    /// unread).
     in_turn: Option<bool>,
     /// A prompt command's row or a wake waiting for the assistant row that
+    /// says a turn ran (module docs).
     pending: Option<Pending>,
     /// The `promptId` of the last main-chain user row that named the
+    /// running turn ([`fingerprint`]; `upgrade.rs`'s `FinishedScan::turn`).
     vturn: Option<u64>,
     /// The opening hold ([`Hold`]).
     hold: Option<Hold>,
@@ -1117,11 +1142,14 @@ impl StepFold {
     }
 
     /// End the opening hold: what it held goes on in the queue as it was
+    /// read.
     fn release(&mut self) {
         self.hold = None;
     }
 
     /// A main-chain assistant row of a model's (never Claude Code's own
+    /// `<synthetic>` notice) with a row waiting for it: the turn it asked
+    /// ran.
     fn ran(&mut self, obj: &Map) -> Option<(StepId, Option<u64>)> {
         let model = obj
             .get("message")
@@ -1171,12 +1199,16 @@ impl StepFold {
     }
 
     /// Queue one step; a full queue drops its oldest step that is no
+    /// [`StepEvent::Bind`] or [`StepEvent::Off`] (those say which file the
+    /// rest came from and whether it is read at all, so the log never
+    /// loses them to a burst of rows), counting it in [`StepBatch::overflow`].
     fn enqueue_as(&mut self, pos: StepPos, state: StepState, ev: StepEvent) {
         self.queue.push_back(Step { pos, state, ev });
         self.trim();
     }
 
     /// Bound the queue to [`STEP_QUEUE`] as [`Self::enqueue_as`] says; the
+    /// opening hold's start moves with a step dropped before it.
     fn trim(&mut self) {
         while self.queue.len() > STEP_QUEUE {
             let pinned = |s: &Step| matches!(s.ev, StepEvent::Bind { .. } | StepEvent::Off { .. });
@@ -1192,6 +1224,7 @@ impl StepFold {
     }
 
     /// `live`: a row the log takes, past the seed and no older than the
+    /// floor (the model is said only on one).
     fn assistant(
         &mut self,
         line: &str,
@@ -1260,6 +1293,8 @@ impl StepFold {
     }
 
     /// A user row: its end entry, and the vendor turn's name when it is the
+    /// conversation's first prompt written after newer rows (the harness's
+    /// exception), for [`Self::push`] to hand to the opening hold.
     fn user(
         &mut self,
         line: &str,
@@ -1370,6 +1405,7 @@ impl StepFold {
     }
 
     /// A vendor turn's prompt: its tokens start over, and it is named by
+    /// its `promptId`, else its row's `uuid` (none: counted lost).
     fn prompt(&mut self, obj: &Map, out: &mut Vec<StepEvent>) {
         self.turn = TurnTokens::default();
         match vref_of(obj) {

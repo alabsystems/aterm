@@ -1,98 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Claude Code's Settings panel — the dialog `/usage`, `/status`, `/config` and `/stats` open,
-//! with the tabs `Status`, `Config`, `Usage`, `Stats`: whether the panel is what the screen
-//! shows ([`settings_panel`]), and what a row under its header says of the Usage tab
-//! ([`usage_tab_mark`], [`usage_unsettled`], [`panel_tail`]).
-//!
-//! The accounts probe (`docs/SPEC-claude-accounts-probe-2026-10-01.md`) types `/usage`, reads
-//! the panel only once it is settled (`aterm_agent::harness::usage::usage_panel_read`, built
-//! from these predicates), and closes it with an Escape fenced by the header row
-//! ([`SettingsPanel::header_guard`]).
-//!
-//! Measured on Claude Code 2.1.287 (`prompt::fixtures::USAGE_*`):
-//!
-//! * MEASURED on Claude Code 2.1.287, 2026-10-01, by the probe's live check
-//!   (the spec's §6: `/usage` typed at an idle composer of a private
-//!   headless aterm, the grid read every quarter second; the screens are
-//!   `prompt::fixtures::USAGE_*`, at 150x50, 150x80, 110x32, 60x50 and under
-//!   the inline renderer):
-//!   - THE FULLSCREEN RENDERER draws the panel in the composer's place,
-//!     under a full-width rule of `▔` (U+2594) from column zero; the row
-//!     right under the rule is `   Settings  Status   Config   Usage
-//!     Stats`, THREE columns in; every row under it is three columns in; no
-//!     composer frame is on the screen. (The same on 2.1.278, 2026-09-22:
-//!     aterm-agent's `tests/testdata/vendor/2.1.278/screen/usage.txt`.)
-//!   - THE INLINE RENDERER (`CLAUDE_CODE_NO_FLICKER=0`, the main screen)
-//!     draws it under a full-width `─` rule, TWO columns in, with `❯ /usage`
-//!     left in the transcript above — and once the panel grows past the
-//!     grid the main screen SCROLLS: the rule and the header leave it while
-//!     the cancel hint stays (`USAGE_INLINE_SCROLLED`). A panel like that
-//!     cannot be placed, and [`settings_panel`] says there is none.
-//!   - THE USAGE TAB OPENS UNSETTLED: 255 ms after the Enter it showed the
-//!     home's last-known windows with `Refreshing…` above the cancel hint
-//!     (the week at 9 %, no Fable window); a quarter second later the
-//!     fetched ones (10 %, the Fable window drawn). The figures on an
-//!     unsettled panel are the ones being replaced.
-//!   - THE TAIL IS ON THE GRID ONLY FOR A MOMENT ON AN ORDINARY PANE. The
-//!     tab draws its "contributing" block as `Scanning local sessions…`
-//!     first — the whole tab then fits 50 rows, the cancel hint last — and
-//!     one to two and a half seconds later (four runs) the scan fills the
-//!     block in, which at 50 rows (and at 47) pushes the hint under the
-//!     fold: the last row then ends in the vendor's `↓`. At 80 rows the
-//!     whole tab stays on the grid; at 32 the tail is under the fold from
-//!     the first read. `Scanning local sessions…` is the block's own word
-//!     and says nothing of the windows.
-//!   - The reader of this crate reads a panel screen `Idle`, NOT
-//!     authoritative, with no composer (`reader::read` over each capture).
-//!   - On Escape the inline renderer leaves `⎿  Settings dialog dismissed`
-//!     under the `❯ /usage` row; the fullscreen renderer leaves no row.
-//! * READ in the 2.1.287 bundle (the plan-limits component; the spec's §0),
-//!   NOT seen on a screen: with no figures at all the tab draws `Loading
-//!   usage data…` over the cancel hint; a failed load draws `Error: <why>`
-//!   (why: `Failed to load usage data`, or `Usage endpoint is rate limited.
-//!   Please try again in a moment.`) over a retry hint and the cancel hint;
-//!   an enrich error draws one line under the usage-credits block (`Showing
-//!   last-known usage (…)`, `Could not refresh usage data`, `Partial usage
-//!   data (…)`, `Per-model breakdown unavailable (…)`) and puts the retry
-//!   hint before the cancel hint. The draw order is the bundle's and the
-//!   captures agree with it as far as they go: the windows, a credit block,
-//!   the "contributing" block, usage credits, the enrich-error line,
-//!   `Refreshing…`, and LAST the hint row. The `…` is an escape in the
-//!   bundle, so the anchors carry the words without it.
-//! * MEASURED on Claude Code 2.1.301, 2026-10-15, in the real-Claude lab
-//!   (crates/aterm-lab; `prompt::fixtures::USAGE_*_2_1_301`, 120x50, both
-//!   renderers): AN ENRICH ERROR. Behind the lab's base URL the tab's read
-//!   of the usage body is refused, and the tab draws the session block, the
-//!   windows the answer headers carried (`Current session`, `Current week
-//!   (all models)`), `Could not refresh usage data`, and `r to retry · Esc
-//!   to cancel` as its last row — the retry hint on the cancel hint's row,
-//!   so no tail. With no profile scope on the login no read is made and the
-//!   tab is the session block alone, `Esc to cancel` last. Enter on a typed
-//!   `/usage` opens this tab though the menu lists `/usage-credits` right
-//!   under it; the fullscreen panel's `▔` rule carries the effort tag.
-//! * NOT MEASURED: the loading state, a failed load (`Error: …`), the other
-//!   enrich errors, the other three tabs (never opened: the Status tab names
-//!   the login), two accounts. A fixture of one of those states is COMPOSED
-//!   and says so.
+//! Claude Code Settings panel detection ([`settings_panel`]) and Usage tab row predicates.
 
 use crate::anchors::{anchor, guard_regex};
 use crate::phase::{has_composer_frame, is_rule};
 use crate::prompt::is_panel_rule;
 
 /// The header row's words in drawing order: the title, then the tabs the reader asks for.
-/// `Stats`, the fourth tab, is not asked for: the three before it place the row.
-///
-/// Not [`crate::anchors::ANCHORS`] rows, on purpose: aterm's own Settings surface spells these
-/// words in many files, so a one-word anchor would name aterm's UI as much as the vendor's. A
-/// caller that guards on the header asks [`SettingsPanel::header_guard`].
 const TITLE: &str = "Settings";
 const TABS: [&str; 3] = ["Status", "Config", "Usage"];
 
 /// First words of rows only the Usage tab draws: the `Session` block's first figure and the
-/// first window's title (measured on 2.1.278 and 2.1.287). One under the header tells the Usage
-/// tab from Status, Config and Stats.
+/// first window's title (measured on 2.1.278 and 2.1.287).
 const USAGE_MARKS: [&str; 2] = ["Total cost:", "Current session"];
 
 /// What a failed load draws before its reason, and the words every rate-limited reading
@@ -112,18 +32,17 @@ const UNSETTLED: [&str; 6] = [
     "usage.per_model",
 ];
 
-/// Which of Claude Code's two renderers drew the panel.
+/// Claude Code renderer that drew the Settings panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelRenderer {
-    /// The fullscreen renderer (the alternate screen): under a `▔` rule, three columns in.
+    /// Alternate-screen fullscreen renderer (`▔` rule, three-column indent).
     Fullscreen,
-    /// The inline renderer (the main screen, `CLAUDE_CODE_NO_FLICKER=0`): under a `─` rule, two
-    /// columns in.
+    /// Main-screen inline renderer (`─` rule, two-column indent).
     Inline,
 }
 
 impl PanelRenderer {
-    /// How many columns in the renderer draws the panel's rows.
+    /// Returns the left-margin column indent for this renderer.
     #[must_use]
     pub fn column(self) -> usize {
         match self {
@@ -133,23 +52,18 @@ impl PanelRenderer {
     }
 }
 
-/// The Settings panel on a screen: where its rule and its header row are,
-/// and which renderer drew it.
+/// Located Settings panel rule, header row index, and renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SettingsPanel {
-    /// The index of the full-width rule over the panel.
+    /// Row index of the full-width rule above the panel.
     pub rule: usize,
-    /// The index of the header row (`Settings  Status   Config   Usage …`).
+    /// Row index of the `Settings  Status   Config   Usage` header row.
     pub header: usize,
     pub renderer: PanelRenderer,
 }
 
 impl SettingsPanel {
-    /// The `key if=` / `await gone` guard for the header row as observed on `rows`: `^`, then the
-    /// row from column zero through the `Usage` tab's name with every space spelled `.`
-    /// ([`guard_regex`]) — one wire token that matches whatever tab spacing was drawn, and not a
-    /// copy of the row quoted at another column. Empty where `rows` does not hold this header: the
-    /// caller then presses nothing.
+    /// Builds the `key if=` / `await gone` regex guard for the observed header row.
     #[must_use]
     pub fn header_guard(&self, rows: &[String]) -> String {
         let Some(row) = rows.get(self.header) else {
@@ -159,8 +73,6 @@ impl SettingsPanel {
             return String::new();
         }
         let last = TABS[TABS.len() - 1];
-        // The first `Usage` after the title is the tab's: the title's own
-        // word is at the row's start, and `header_at` has placed the tabs.
         let Some(at) = row.find(last) else {
             return String::new();
         };
@@ -195,17 +107,7 @@ fn column_of(row: &str) -> usize {
     row.len() - row.trim_start_matches(' ').len()
 }
 
-/// The Settings panel, where it is what the screen shows. `Some` only when all hold:
-///
-/// * no composer frame is on the rows (the panel replaces the composer in both renderers);
-/// * a full-width rule — `▔` fullscreen, `─` inline — whose next non-blank row is the header
-///   at that renderer's column: `Settings` as a word, then `Status`, `Config` and `Usage` in
-///   that order;
-/// * every non-blank row below the header is at its column or further in.
-///
-/// With several such rules the lowest is the panel's (a transcript above may quote anything).
-/// The caller closes the panel with Escape, which elsewhere stops a turn, so a quoted panel, a
-/// header off its column, a drawn composer or a row further left under it all read `None`.
+/// Detects a settled Claude Code Settings panel on `rows`.
 #[must_use]
 pub fn settings_panel(rows: &[String]) -> Option<SettingsPanel> {
     if has_composer_frame(rows) {
@@ -233,17 +135,14 @@ pub fn settings_panel(rows: &[String]) -> Option<SettingsPanel> {
     })
 }
 
-/// Whether `row`, a row under the Settings header, is one only the Usage tab draws: `Total
-/// cost:`, a `Current session` window title, or the loading line.
+/// Returns `true` if `row` starts with a Usage-tab marker or `Error:`.
 #[must_use]
 pub fn usage_tab_mark(row: &str) -> bool {
     let t = crate::text::trim(row);
     USAGE_MARKS.iter().any(|mark| t.starts_with(mark)) || t.starts_with(anchor("usage.loading"))
 }
 
-/// Whether `row`, a row under the Settings header, says the Usage tab's figures are not
-/// settled: a load or refresh in flight, an enrich-error line, a failed load (`Error: …`), or
-/// any row that says `rate limited` (read in the 2.1.287 bundle).
+/// Returns `true` if `row` indicates the Usage tab is still loading or unsettled.
 #[must_use]
 pub fn usage_unsettled(row: &str) -> bool {
     let t = crate::text::trim(row);
@@ -252,11 +151,7 @@ pub fn usage_unsettled(row: &str) -> bool {
         || t.contains(RATE_LIMITED)
 }
 
-/// Whether `row` is the panel's tail: the cancel hint alone ([`anchor`] `prompt.cancel`, a key
-/// hint, so a rebound key is no tail), ASCII case ignored. The vendor draws it last, so the
-/// tail on the grid says the whole panel is: `Refreshing…` and the enrich-error line stand
-/// right above it and can be under the fold while the windows show. The hint with a retry
-/// beside it is not this row.
+/// Returns `true` if `row` is the panel's cancel-hint footer row.
 #[must_use]
 pub fn panel_tail(row: &str) -> bool {
     crate::text::trim(row).eq_ignore_ascii_case(anchor("prompt.cancel"))
@@ -271,8 +166,7 @@ mod tests {
     }
 
     /// Rows 1–10 and 21–26 of aterm-agent's `tests/testdata/vendor/2.1.278/screen/usage.txt`,
-    /// verbatim. The literal opens with a real line break, not `\`, which would eat the first
-    /// row's indent.
+    /// verbatim.
     const HEAD_2_1_278: &str = "
 ✻ Sautéed for 6s · done 1:16 PM
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
@@ -331,7 +225,6 @@ mod tests {
             None,
             "a row under it one column out"
         );
-        // The composer's frame above the panel, the rest as measured: the frame alone refuses it.
         let rule = "─".repeat(56);
         let framed: Vec<String> = [rule.clone(), "❯ ".to_string(), rule.clone()]
             .into_iter()
@@ -360,8 +253,6 @@ mod tests {
         ] {
             assert_eq!(edited(&|r| r[3] = header.to_string()), None, "{why}");
         }
-        // What does not matter: the spacing between tabs, a tab after them, a blank row under the
-        // rule, a toast inside the rule.
         for (why, header) in [
             (
                 "other spacing",
@@ -388,8 +279,7 @@ mod tests {
     }
 
     /// Every measured 2.1.287 screen places the panel: fullscreen under the `▔` rule on the
-    /// third row, inline under its `─` rule two columns in. The scrolled inline panel is no
-    /// panel, and the two renderers' rule and column are not interchangeable.
+    /// third row, inline under its `─` rule two columns in.
     #[test]
     fn the_panel_is_placed_on_every_measured_screen_of_both_renderers() {
         use crate::prompt::fixtures as fx;
@@ -418,7 +308,6 @@ mod tests {
                 "^...Settings..Status...Config...Usage",
                 "{what}"
             );
-            // The crate's own reader: idle, not authoritative, no composer.
             let reading = crate::read(Some("claude"), &screen, None);
             assert_eq!(
                 (
@@ -460,7 +349,7 @@ mod tests {
 
     /// Every measured screen holds a Usage-tab mark; only the refreshing one holds an unsettled
     /// row, and its last row is the tail too, which is why the settled rule asks for unsettled
-    /// rows first. `Scanning local sessions…` is no unsettled row.
+    /// rows first.
     #[test]
     fn the_measured_tabs_rows_are_told_by_the_predicates() {
         use crate::prompt::fixtures as fx;
@@ -501,7 +390,6 @@ mod tests {
             .find(|row| row.contains("Scanning local sessions"))
             .expect("the block is still scanning on the settled screen");
         assert!(!usage_unsettled(row) && !usage_tab_mark(row));
-        // The fold's arrow, as measured: ending a row of the block, or alone.
         assert!(last(&fx::screen(fx::USAGE_FOLD)).ends_with('↓'));
         assert_eq!(last(&fx::screen(fx::USAGE_SHORT)).trim(), "↓");
     }
@@ -511,9 +399,7 @@ mod tests {
     /// stub's header readings and the enrich error is a panel, a Usage tab
     /// and NOT SETTLED, and its last row (`r to retry · Esc to cancel`) is no
     /// tail; the session block alone (no read made) is settled and ends on
-    /// the tail. 2.1.307's fullscreen rule is bare `▔` (2.1.301's carried the
-    /// effort tag), read the same. NEGATIVE CONTROLS: the command menu before
-    /// the Enter and the screen after one Escape are no panel.
+    /// the tail.
     #[test]
     fn the_lab_tabs_read_as_measured() {
         use crate::prompt::fixtures as fx;
@@ -648,15 +534,12 @@ mod tests {
         let guard = panel.header_guard(&measured);
         assert_eq!(guard, "^...Settings..Status...Config...Usage");
         assert!(!guard.contains(char::is_whitespace));
-        // Another spacing gives another guard: it is the row, not a
-        // template.
         let mut spaced = measured.clone();
         spaced[3] = "   Settings   Status  Config  Usage  Stats".to_string();
         assert_eq!(
             panel.header_guard(&spaced),
             "^...Settings...Status..Config..Usage"
         );
-        // No header where the value says: no guard.
         let mut gone = measured.clone();
         gone[3] = "   Session".to_string();
         assert_eq!(panel.header_guard(&gone), "");

@@ -2,13 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Bridge from winit's `Key`/`NamedKey`/`PhysicalKey` to the engine's
-//! [`Key`]/[`NamedKey`], plus US-QWERTY `base_layout_key` derivation for
-//! Kitty `REPORT_ALTERNATE_KEYS`.
-//!
-//! Kept in its own crate so non-GUI crates that depend on `aterm-types`
-//! (`aterm-ctl`, `aterm-uds`) never pull in `winit` or platform windowing
-//! frameworks via Cargo feature unification.
+//! Bridge from winit's `Key`/`NamedKey`/`PhysicalKey` to the engine's [`Key`]/[`NamedKey`].
 
 use aterm_window::keyboard::{
     Key as WinitKey, KeyCode, KeyLocation, NamedKey as WinitNamed, PhysicalKey,
@@ -16,14 +10,7 @@ use aterm_window::keyboard::{
 
 use aterm_types::keyboard::{Key, NamedKey};
 
-/// Map a winit logical [`WinitKey`] (e.g. `ev.logical_key` or
-/// `key_without_modifiers()`) into the engine's [`Key`].
-///
-/// Returns `None` for keys the engine has no encoding for (dead keys,
-/// unidentified keys, and the long tail of winit `NamedKey` variants — TV/IME
-/// composition/launch/browser keys — that no terminal escape sequence covers).
-/// A `Character` logical key carries the single base codepoint; multi-grapheme
-/// logical strings (rare, IME-ish) are not single-key events and yield `None`.
+/// Map a winit logical [`WinitKey`] (e.g. `ev.logical_key` or `key_without_modifiers()`).
 #[inline]
 #[must_use]
 pub fn map_logical_key(key: &WinitKey) -> Option<Key> {
@@ -38,23 +25,15 @@ pub fn map_logical_key(key: &WinitKey) -> Option<Key> {
             Some(Key::Character(c))
         }
         WinitKey::Named(named) => map_named_key(*named).map(Key::Named),
-        // Dead keys and unidentified keys have no direct terminal encoding;
-        // they reach the PTY (if at all) via IME Commit, not as a key event.
         WinitKey::Dead(_) | WinitKey::Unidentified(_) => None,
     }
 }
 
 /// Map a winit [`WinitNamed`] into the engine's [`NamedKey`].
-///
-/// Covers navigation, editing, locks, system keys, F1–F35, media/audio keys,
-/// and modifiers. Keypad keys are mapped first via [`map_numpad_key`]
-/// (since winit reports keypad presses using main-block logical keys with
-/// `KeyLocation::Numpad`). Returns `None` for keys without a terminal encoding.
 #[inline]
 #[must_use]
 pub(crate) const fn map_named_key(named: WinitNamed) -> Option<NamedKey> {
     Some(match named {
-        // Navigation
         WinitNamed::ArrowUp => NamedKey::ArrowUp,
         WinitNamed::ArrowDown => NamedKey::ArrowDown,
         WinitNamed::ArrowLeft => NamedKey::ArrowLeft,
@@ -63,7 +42,6 @@ pub(crate) const fn map_named_key(named: WinitNamed) -> Option<NamedKey> {
         WinitNamed::End => NamedKey::End,
         WinitNamed::PageUp => NamedKey::PageUp,
         WinitNamed::PageDown => NamedKey::PageDown,
-        // Editing
         WinitNamed::Backspace => NamedKey::Backspace,
         WinitNamed::Delete => NamedKey::Delete,
         WinitNamed::Insert => NamedKey::Insert,
@@ -71,14 +49,12 @@ pub(crate) const fn map_named_key(named: WinitNamed) -> Option<NamedKey> {
         WinitNamed::Tab => NamedKey::Tab,
         WinitNamed::Escape => NamedKey::Escape,
         WinitNamed::Space => NamedKey::Space,
-        // Locks and system keys
         WinitNamed::CapsLock => NamedKey::CapsLock,
         WinitNamed::NumLock => NamedKey::NumLock,
         WinitNamed::ScrollLock => NamedKey::ScrollLock,
         WinitNamed::PrintScreen => NamedKey::PrintScreen,
         WinitNamed::Pause => NamedKey::Pause,
         WinitNamed::ContextMenu => NamedKey::ContextMenu,
-        // Function keys F1-F35
         WinitNamed::F1 => NamedKey::F1,
         WinitNamed::F2 => NamedKey::F2,
         WinitNamed::F3 => NamedKey::F3,
@@ -114,7 +90,6 @@ pub(crate) const fn map_named_key(named: WinitNamed) -> Option<NamedKey> {
         WinitNamed::F33 => NamedKey::F33,
         WinitNamed::F34 => NamedKey::F34,
         WinitNamed::F35 => NamedKey::F35,
-        // Media and audio keys
         WinitNamed::MediaPlay => NamedKey::MediaPlay,
         WinitNamed::MediaPause => NamedKey::MediaPause,
         WinitNamed::MediaPlayPause => NamedKey::MediaPlayPause,
@@ -127,29 +102,17 @@ pub(crate) const fn map_named_key(named: WinitNamed) -> Option<NamedKey> {
         WinitNamed::AudioVolumeDown => NamedKey::AudioVolumeDown,
         WinitNamed::AudioVolumeUp => NamedKey::AudioVolumeUp,
         WinitNamed::AudioVolumeMute => NamedKey::AudioVolumeMute,
-        // Modifier keys reported as key events. winit reports `Alt`/`Control`/
-        // `Shift`/`Super`/`Meta`/`Hyper` without a left/right distinction in the
-        // logical key (the side lives in `KeyLocation`); map to the LEFT variant
-        // here, and [`sided_modifier`] moves a right-side press to its *Right
-        // variant — kitty reports each side by its own code.
         WinitNamed::Shift => NamedKey::ShiftLeft,
         WinitNamed::Control => NamedKey::ControlLeft,
         WinitNamed::Alt => NamedKey::AltLeft,
         WinitNamed::Super => NamedKey::SuperLeft,
         WinitNamed::Hyper => NamedKey::HyperLeft,
         WinitNamed::Meta => NamedKey::MetaLeft,
-        // No terminal encoding: IME composition keys, TV/launch/browser/phone
-        // keys, brightness/power, etc. fall through to None.
         _ => return None,
     })
 }
 
-/// A modifier key on the side it was pressed: [`map_logical_key`] names every
-/// modifier by its LEFT variant, because winit's logical key carries no side, and
-/// the side lives in `location`. kitty reports the two sides by different codes
-/// (`LEFT_SHIFT` 57441, `RIGHT_SHIFT` 57447, …), so a right-side press becomes the
-/// engine's *Right variant; every other key, and a modifier on any other
-/// location, is returned as it is.
+/// A modifier key on the side it was pressed.
 #[inline]
 #[must_use]
 pub fn sided_modifier(key: Key, location: KeyLocation) -> Key {
@@ -168,10 +131,7 @@ pub fn sided_modifier(key: Key, location: KeyLocation) -> Key {
     Key::Named(right)
 }
 
-/// The physical key on the OTHER side of a sided modifier (`ShiftLeft` ↔
-/// `ShiftRight`, and Control, Alt and Super likewise), or `None` for any other
-/// key. Whether that key is still held decides a modifier release's own kitty
-/// bit ([`aterm_types::keyboard::NamedKey::modifier_twin`]).
+/// The physical key on the OTHER side of a sided modifier, or `None` for any other key.
 #[inline]
 #[must_use]
 pub const fn physical_modifier_twin(physical: PhysicalKey) -> Option<PhysicalKey> {
@@ -191,16 +151,7 @@ pub const fn physical_modifier_twin(physical: PhysicalKey) -> Option<PhysicalKey
     }))
 }
 
-/// Map a keypad press (`KeyLocation::Numpad`) to the engine's `Numpad*`
-/// [`Key`], or `None` when not a recognized keypad key.
-///
-/// Must be queried before [`map_logical_key`] because winit reports keypad
-/// presses using main-block logical keys (`Character("5")`, `Named(Enter)`).
-/// Uses the event's `logical_key` (not `key_without_modifiers()`, whose xkb
-/// level-0 symbol ignores NumLock) so layout-specific decimal keys (``.` vs
-/// `,`) and NumLock navigation states resolve accurately, falling back to
-/// `physical` (`KeyCode::Numpad5`) only for the nameless NumLock-off center
-/// key (`NumpadBegin`).
+/// Map a keypad press (`KeyLocation::Numpad`) to the engine's `Numpad*` [`Key`].
 #[must_use]
 pub fn map_numpad_key(
     physical: PhysicalKey,
@@ -250,9 +201,6 @@ pub fn map_numpad_key(
         WinitKey::Named(WinitNamed::PageDown) => NamedKey::NumpadPageDown,
         WinitKey::Named(WinitNamed::Insert) => NamedKey::NumpadInsert,
         WinitKey::Named(WinitNamed::Delete) => NamedKey::NumpadDelete,
-        // The NumLock-off centre key: matched on "the engine has no name for
-        // what winit reported" rather than on a winit variant, so xkb's
-        // `Unidentified` and Windows' `Clear` take the same arm.
         _ if physical == PhysicalKey::Code(KeyCode::Numpad5)
             && map_logical_key(logical).is_none() =>
         {
@@ -263,9 +211,7 @@ pub fn map_numpad_key(
     Some(Key::Named(named))
 }
 
-/// Unshifted US-QWERTY character for `physical`, used as the Kitty
-/// `REPORT_ALTERNATE_KEYS` `base_layout_key`, or `None` for non-printable
-/// keys.
+/// Unshifted US-QWERTY character for `physical`.
 #[inline]
 #[must_use]
 pub const fn base_layout_key_for(physical: PhysicalKey) -> Option<char> {
@@ -324,13 +270,7 @@ pub const fn base_layout_key_for(physical: PhysicalKey) -> Option<char> {
     })
 }
 
-/// The US-QWERTY letter a chord on a non-Latin layout names: `Some('c')` for a
-/// Russian `ru` press whose layout key (`key_without_modifiers()`) is 'с' on the
-/// physical C key. [`aterm_types::keyboard::layout_letter_twin`] is the gate, and
-/// wherever it names a letter the PTY encoder's Ctrl byte names no other US key,
-/// so a shortcut matcher that asks this names the letter the encoder would have
-/// sent. On a US digit or symbol key, where this names none, the encoder's Ctrl
-/// byte still follows the US key.
+/// The US-QWERTY letter a chord on a non-Latin layout names.
 #[inline]
 #[must_use]
 pub fn layout_letter_twin_for(logical: &WinitKey, physical: PhysicalKey) -> Option<char> {
@@ -345,9 +285,7 @@ pub fn layout_letter_twin_for(logical: &WinitKey, physical: PhysicalKey) -> Opti
     aterm_types::keyboard::layout_letter_twin(c, base_layout_key_for(physical))
 }
 
-/// Return the shifted US-QWERTY ASCII character for an unshifted US-QWERTY
-/// character (`'a'..'z'` → `'A'..'Z'`, `'1'` → `'!'`, `'/'` → `'?'`, etc.), or
-/// `None` if `base` is not a printable US-QWERTY base key.
+/// Return the shifted US-QWERTY ASCII character for an unshifted US-QWERTY character.
 #[inline]
 #[must_use]
 pub const fn us_qwerty_shifted_ascii(base: char) -> Option<char> {
@@ -385,11 +323,7 @@ const fn is_unicode_scalar(v: u32) -> bool {
     v <= 0xD7FF || (v >= 0xE000 && v <= 0x10_FFFF)
 }
 
-/// Encode a Kitty key event descriptor `(unicode_key, shifted_key,
-/// base_layout_key, modifiers_mask, event_type)` into a 14-byte little-endian
-/// wire frame (`u32, u32, u32, u8, u8`). Rejects any scalar that is not a valid
-/// Unicode scalar (`char::from_u32`) or an `event_type` outside `1..=3`
-/// (`1 = press, 2 = repeat, 3 = release`).
+/// Encode a Kitty key event descriptor `` into a 14-byte little-endian wire frame.
 #[inline]
 #[must_use]
 pub const fn encode_kitty_key_wire_le(
@@ -425,8 +359,7 @@ pub const fn encode_kitty_key_wire_le(
     ])
 }
 
-/// Decode a 14-byte little-endian Kitty key event wire frame produced by
-/// [`encode_kitty_key_wire_le`].
+/// Decode a 14-byte little-endian Kitty key event wire frame produced.
 #[inline]
 #[must_use]
 pub const fn decode_kitty_key_wire_le(wire: &[u8; 14]) -> Option<(char, char, char, u8, u8)> {
@@ -459,9 +392,7 @@ pub const fn decode_kitty_key_wire_le(wire: &[u8; 14]) -> Option<(char, char, ch
     Some((u, s, b, modifiers_mask, event_type))
 }
 
-/// Encode a Kitty key event descriptor `(unicode_key, shifted_key,
-/// base_layout_key, modifiers_mask, event_type)` into a 14-byte big-endian
-/// wire frame (`u32, u32, u32, u8, u8`).
+/// Encode a Kitty key event descriptor `` into a 14-byte big-endian wire frame.
 #[inline]
 #[must_use]
 pub const fn encode_kitty_key_wire_be(
@@ -497,8 +428,7 @@ pub const fn encode_kitty_key_wire_be(
     ])
 }
 
-/// Decode a 14-byte big-endian Kitty key event wire frame produced by
-/// [`encode_kitty_key_wire_be`].
+/// Decode a 14-byte big-endian Kitty key event wire frame produced by [`encode_kitty_key_wire_be`].
 #[inline]
 #[must_use]
 pub const fn decode_kitty_key_wire_be(wire: &[u8; 14]) -> Option<(char, char, char, u8, u8)> {
@@ -531,8 +461,7 @@ pub const fn decode_kitty_key_wire_be(wire: &[u8; 14]) -> Option<(char, char, ch
     Some((u, s, b, modifiers_mask, event_type))
 }
 
-/// Convert a 6-bit Kitty modifier mask (`Shift=1, Alt=2, Ctrl=4, Super=8,
-/// Hyper=16, Meta=32`) into its 1-based CSI parameter (`1 + (mask & 0x3f)`).
+/// Convert a 6-bit Kitty modifier mask into its 1-based CSI parameter (`1 +`).
 #[inline]
 #[must_use]
 pub const fn kitty_csi_modifier_param(modifiers_mask: u8) -> u8 {
@@ -606,7 +535,7 @@ mod tests {
     /// NumLock off: the navigation keysym is the keypad twin of the main-block
     /// key, and the centre key — which winit names on no platform — is
     /// NumpadBegin by its physical code, whether xkb reports `Unidentified` or
-    /// Windows reports `Clear`. Only the centre key gets that rescue.
+    /// Windows reports `Clear`.
     #[test]
     fn numlock_off_navigation_gets_numpad_twin() {
         assert_eq!(
@@ -692,9 +621,7 @@ mod tests {
         );
     }
 
-    /// The negative control: the main block is untouched. `5` above `R` and
-    /// the main Return are not keypad keys, and the LOCATION — not the
-    /// scancode — is what says a key is on the keypad.
+    /// The negative control: the main block is untouched.
     #[test]
     fn standard_location_is_untouched() {
         assert_eq!(
@@ -726,7 +653,6 @@ mod tests {
     #[test]
     fn character_logical_key_maps_through() {
         assert_eq!(map_logical_key(&ch("a")), Some(Key::Character('a')));
-        // A multi-codepoint logical key is not a single key.
         assert_eq!(map_logical_key(&ch("ab")), None);
     }
 
@@ -744,7 +670,6 @@ mod tests {
             base_layout_key_for(PhysicalKey::Code(KeyCode::Slash)),
             Some('/')
         );
-        // No printable US-QWERTY char for a function key.
         assert_eq!(base_layout_key_for(PhysicalKey::Code(KeyCode::F1)), None);
     }
 
@@ -752,7 +677,6 @@ mod tests {
     fn layout_letter_twin_names_the_us_letter_under_a_non_latin_letter() {
         let ch = |s: &str| WinitKey::Character(SmolStr::new(s));
         let key = |code| PhysicalKey::Code(code);
-        // Russian 'с' on C, Greek 'ψ' on C, Hebrew 'ב' on C.
         assert_eq!(
             layout_letter_twin_for(&ch("с"), key(KeyCode::KeyC)),
             Some('c')
@@ -765,12 +689,9 @@ mod tests {
             layout_letter_twin_for(&ch("ב"), key(KeyCode::KeyC)),
             Some('c')
         );
-        // A Latin layout keeps its own letters (AZERTY 'a' sits on US Q).
         assert_eq!(layout_letter_twin_for(&ch("a"), key(KeyCode::KeyQ)), None);
-        // A letter on a US digit or symbol key means what its layout says.
         assert_eq!(layout_letter_twin_for(&ch("é"), key(KeyCode::Digit2)), None);
         assert_eq!(layout_letter_twin_for(&ch("б"), key(KeyCode::Comma)), None);
-        // Not a letter, not a character, no physical key.
         assert_eq!(layout_letter_twin_for(&ch("№"), key(KeyCode::Digit3)), None);
         assert_eq!(
             layout_letter_twin_for(&WinitKey::Named(WinitNamed::Enter), key(KeyCode::Enter)),

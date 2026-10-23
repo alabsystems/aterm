@@ -1,24 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `.tar.zst` writer: a deterministic ustar/PAX archive of a staged tree, written
-//! in-process and compressed by the `zstd` CLI at level 19 ([`COMPRESSOR`]).
-//!
-//! The compressor is a child whose exit status is checked, and the asset is decoded back
-//! through the client's own decoder (`aterm_zstd::Decoder`) and held to the stream
-//! written, by length and XXH64, before it is hashed: a compressor that fails, does not
-//! start or writes anything else fails the pack.
-//!
-//! Members are named relative to the root (never `./`), sorted, with no xattrs. A
-//! hard-link group is one file plus `h` members (so a bundle's `librustc_driver` and
-//! `bin/rustc` = `bin/trustc` ship once). No symlink is written: the client's extractor
-//! refuses every one, and the signed `tree_root` is symlink-free by contract.
-//!
-//! Modes are normalized first to what the client's extractor lays down
-//! (`atpkg::extract::safe_mode`: `0755` for directories and anything executable, else
-//! `0644`): `tree_root` folds the mode, so any other mode would sign a root no client can
-//! reproduce. The suite extracts every archive with `atpkg::extract_tar_zst` and holds its
-//! `tree_root` to the stage's.
+//! The `.tar.zst` writer.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -32,30 +15,18 @@ use crate::error::{Error, Result};
 /// The zstd level every pack is compressed at.
 pub const LEVEL: i32 = 19;
 
-/// The program every pack is compressed by: the `zstd` CLI on the builder's `PATH`, run as
-/// `zstd -q -19 --single-thread -c` with the tar stream on its stdin and the asset as its
-/// stdout.
-///
-/// With a worker thread the CLI writes other bytes, hence `--single-thread`; the flags
-/// override `ZSTD_CLEVEL` and `ZSTD_NBTHREADS`, so the environment cannot change the bytes
-/// either. The CLI adds each frame's content checksum by default, and the client verifies
-/// it.
+/// The program every pack is compressed by.
 pub const COMPRESSOR: &str = "zstd";
 
-/// [`COMPRESSOR`]'s path on `PATH`: what a builder probes before it starts a build that
-/// ends in a pack ([`crate::api::Packer::can_pack`]).
-///
+/// [`COMPRESSOR`]'s path on `PATH`.
 /// # Errors
-///
 /// What is missing, worded for the lane's log: no executable `zstd` on `PATH`.
 pub fn compressor_on_path() -> std::result::Result<PathBuf, String> {
     compressor_in(std::env::var_os("PATH").as_deref())
 }
 
 /// [`compressor_on_path`] over the `PATH` value `path` (`None`: unset).
-///
 /// # Errors
-///
 /// As [`compressor_on_path`].
 pub fn compressor_in(path: Option<&OsStr>) -> std::result::Result<PathBuf, String> {
     path.and_then(|path| {
@@ -91,9 +62,7 @@ pub struct Packed {
     pub tree_root: String,
 }
 
-/// The signed size of a packed tree: the larger of its content and half its decompressed
-/// stream, so each of the client's `2 ×` allowances (content, and the structure around it)
-/// covers the whole stream.
+/// The signed size of a packed tree.
 #[must_use]
 pub fn disk_installed(content_bytes: u64, stream_bytes: u64) -> u64 {
     content_bytes.max(stream_bytes.div_ceil(2))
@@ -114,21 +83,14 @@ enum Member {
 }
 
 /// Pack the tree at `root` into `asset` (replaced), after normalizing its modes.
-///
 /// # Errors
-///
-/// A refusal for a symlink or special file in the tree, or a tree with no file at all; a
-/// could-not-run for any I/O failure.
+/// A refusal for a symlink or special file in the tree, or a tree with no file at all.
 pub fn write(root: &Path, asset: &Path) -> Result<Packed> {
     write_with(root, asset, OsStr::new(COMPRESSOR))
 }
 
-/// [`write`], compressing with `compressor` in place of [`COMPRESSOR`]: a zstd CLI at
-/// another path, or a stand-in that shows how the pack refuses a compressor that fails
-/// or writes another stream.
-///
+/// [`write`], compressing with `compressor` in place of [`COMPRESSOR`].
 /// # Errors
-///
 /// As [`write`].
 pub fn write_with(root: &Path, asset: &Path, compressor: &OsStr) -> Result<Packed> {
     let members = plan(root)?;
@@ -315,9 +277,7 @@ impl<W: Write> Write for Counting<W> {
 const STDERR_KEPT: u64 = 16 * 1024;
 
 /// Owns the compressor until its exit is reaped; dropped unreaped, it kills and reaps the
-/// child. It lives inside the thread scope, so on an error or unwind the child dies before
-/// the scope joins its stderr drain. The buffered pipe lives here too, so an unwinding
-/// `BufWriter::drop` never flushes into a child nobody drives.
+/// child.
 struct CompressorChild {
     child: aterm_uds::spawnfd::Child,
     input: Option<io::BufWriter<std::process::ChildStdin>>,
@@ -335,8 +295,6 @@ impl CompressorChild {
 
     fn close_input(&mut self) {
         if let Some(input) = self.input.take() {
-            // The normal path has flushed already; on an error or unwind the buffered
-            // bytes are discarded, never written.
             let (pipe, _buffered) = input.into_parts();
             drop(pipe);
         }
@@ -380,7 +338,6 @@ fn encode(members: &[Member], asset: &Path, compressor: &OsStr) -> io::Result<u6
         })?;
     let child = CompressorChild::new(child);
     let (streamed, n, sum, said, status) = std::thread::scope(move |scope| {
-        // Moved in so it drops before the scope's implicit joins on an error or unwind.
         let mut child = child;
         let stdin = child
             .child
@@ -393,9 +350,6 @@ fn encode(members: &[Member], asset: &Path, compressor: &OsStr) -> io::Result<u6
             .stderr
             .take()
             .ok_or_else(|| io::Error::other("the compressor's stderr was not piped"))?;
-        // Drained while the stream is written: a compressor that fills its stderr pipe
-        // would otherwise block while this thread blocks writing its stdin. If the drain
-        // cannot start, dropping `child` kills and reaps the compressor.
         let drain = std::thread::Builder::new()
             .name("pack-zstd-stderr".to_string())
             .spawn_scoped(scope, move || {
@@ -413,7 +367,6 @@ fn encode(members: &[Member], asset: &Path, compressor: &OsStr) -> io::Result<u6
             let streamed = tar(&mut out, members).and_then(|()| out.flush());
             (streamed, out.n, out.hash.digest())
         };
-        // `wait` closes stdin, which ends the stream; the drain reads on until zstd exits.
         let status = child.wait()?;
         let said = drain
             .join()
@@ -427,7 +380,6 @@ fn encode(members: &[Member], asset: &Path, compressor: &OsStr) -> io::Result<u6
         )));
     }
     streamed?;
-    // Durable: the asset is uploaded and signed for every client after this.
     aterm_durable::durable(&file)?;
     decodes_back(asset, n, sum)?;
     Ok(n)
@@ -435,8 +387,7 @@ fn encode(members: &[Member], asset: &Path, compressor: &OsStr) -> io::Result<u6
 
 /// Reads `asset` back through the decoder every client installs it with: one or more
 /// checksummed frames that decode to exactly the `n`-byte stream written, whose XXH64
-/// is `sum`. Without this, a bad stream from the compressor surfaces only when a client
-/// refuses it.
+/// is `sum`.
 fn decodes_back(asset: &Path, n: u64, sum: u64) -> io::Result<()> {
     let mut decoder = aterm_zstd::Decoder::new(std::fs::File::open(asset)?).require_checksum();
     let mut hash = Xxh64::new(0);

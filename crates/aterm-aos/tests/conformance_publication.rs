@@ -1,52 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1: the real [`Boundary`] follows `AosBoundaryPublication` (`aterm-models-aos`) in lock
-//! step, so the laws the model holds over its bounded space (`NeverMixed`, `EachInputOnce`,
-//! `StaleNeverCommitted`, `DeliveredToTheLivePair`) are properties of the code.
-//!
-//! The boundary hosts the toy schema under *tagged* code: the good toy step, then the code's tag
-//! folded into `seen`. The attached code has tag 0 and every prepare takes a fresh one, so two
-//! codes over the same inputs leave different states, and the projection can tell which
-//! publication installed the live state as well as which installed the live code.
-//!
-//! The projection (model variable: real observable):
-//!
-//! * `paused`: [`Boundary::is_paused`].
-//! * `rev`, `cur`: `pair().head.revision` and `pair().head.input_cursor`, less their values just
-//!   after attach (the walk's prelude moves both off zero for some seeds).
-//! * `code_v`: the publication whose candidate tag the live code carries (0 for the attached
-//!   code), or -1 for a code no publication installed.
-//! * `state_v`: `code_v` when the live state is that publication's installed state folded
-//!   through the live code over every input delivered since; otherwise the publication whose
-//!   pair the live state is (its installed state folded through its own code), or -1.
-//! * `queued`: [`Boundary::queued`], cross-checked against the harness's own copy of the queue.
-//! * `arrived`: the harness's count of `admit` calls that returned `Run`, `Queued` or `Rejected`.
-//! * `delivered`: the harness's count of inputs handed to a step, cross-checked against
-//!   `Stats::delivered`.
-//! * `pa`/`ra`/`ia` and `pb`/`rb`/`ib`: each slot's held `Prepared` and its `expected()` head,
-//!   relative to attach (zero while the slot is empty).
-//! * `stale`: latched when `commit` returned `Ok` for a `Prepared` whose expected head was not
-//!   the live head read just before the call.
-//!
-//! Each model action is one real call: `Input` is an `admit` that returned `Run`, then the live
-//! code's step and `advance`; `Hold` is an `admit` that returned `Queued`; `Overflow` one that
-//! returned `Rejected`; a `commit` the model's guard rules out is refused, consumes its candidate
-//! and is the model's `Discard`. Before every move the walk also makes the calls whose model
-//! guard is false (`pause` while paused, `prepare` and `reject` while running, a tick while
-//! paused): each refuses exactly and moves no projected variable. Delivery order, which the
-//! scalar model cannot state, is checked on the real queue: what each delivered input returned
-//! and the order the receiving pair's log holds them in.
-//!
-//! The seeded walks (a deterministic xorshift stream per seed and episode, under the committed
-//! configuration and the `Cap = 0` scenario) reach about half of the model's 510 states; a second
-//! test replays the model's shortest path to every reachable state and takes every move the
-//! model allows from it, so every transition of the bounded space is a checked real step.
-//!
-//! The negative controls take each `Buggy` dial in turn: the real boundary refuses the commit
-//! the stale mutant publishes (1), never shows the mixed mutant's successor at any store a commit
-//! can stop after (2, gated like the seam), and takes a step the lost-input (3) and wrong-pair
-//! (4) mutants do not admit.
+//! Conformance tests for `AosBoundaryPublication` ([`Boundary`], [`Boundary::is_paused`],
+//! [`Boundary::queued`]).
 
 use std::collections::BTreeSet;
 
@@ -312,10 +268,7 @@ struct Real {
 }
 
 impl Real {
-    /// An attached boundary with a queue of `cap`. `prelude` picks a history before the attach
-    /// the model starts at: up to two live inputs, and on odd values a restore (which mints a
-    /// revision) and a tick, so neither the revision nor the cursor starts at zero for every
-    /// seed.
+    /// An attached boundary with a queue of `cap`.
     fn new(prelude: u64, cap: usize) -> Real {
         let start = ToyState {
             total: 2,
@@ -496,8 +449,6 @@ impl Real {
                     .prepare(tagged(tag))
                     .expect("a candidate prepares against the paused head");
                 assert_eq!(Some(p.expected()), self.b.paused_head());
-                // The candidate replayed from the ancestor over the whole log: the live
-                // publication's installed state and every input delivered since.
                 let g = self.gens.last().expect("the attached publication");
                 assert_eq!(p.state(), &fold(&tagged(tag), &g.start, &g.since).state);
                 self.slots[slot(action)] = Some(p);
@@ -587,8 +538,6 @@ impl Real {
         let mut stats = self.b.stats();
         if self.b.is_paused() {
             assert_eq!(self.b.pause(), Err(PublishRefusal::AlreadyPaused));
-            // A tick is a frame the task does not observe while paused: neither queued nor
-            // delivered, so no input in the model.
             assert_eq!(self.b.admit(&ToyInput::Tick), Admit::Skipped);
             stats.skipped += 1;
             seen.already_paused += 1;
@@ -677,13 +626,11 @@ impl<'m> Walker<'m> {
     }
 
     /// Makes the calls the model rules out here, then picks a move the model allows: an enabled
-    /// action, or a commit of a held candidate whose `Commit` guard is false. `None` once the
-    /// bounded box is spent.
+    /// action, or a commit of a held candidate whose `Commit` guard is false.
     fn next_move(&mut self) -> Option<Move> {
         self.real.probe(&mut self.refusals);
         let held = [self.real.slots[0].is_some(), self.real.slots[1].is_some()];
         let moves = allowed(self.model, &self.st, held);
-        // Lean away from arrivals, which spend the bounded box, so runs reach later revisions.
         let quiet: Vec<Move> = moves
             .iter()
             .copied()
@@ -779,7 +726,7 @@ fn shortest_paths(model: &Model) -> Vec<(State, Vec<&'static str>)> {
 }
 
 /// Every seeded episode of the walk under `model` with a queue of `cap`; `each` sees every move
-/// taken. Returns how often each ruled-out call was made.
+/// taken.
 fn lockstep(model: &Model, cap: usize, seeds: u64, mut each: impl FnMut(&Step)) -> Refusals {
     let mut refusals = Refusals::default();
     for seed in 1..=seeds {
@@ -804,8 +751,7 @@ fn scripted<'m>(model: &'m Model, cap: usize, actions: &[&'static str]) -> Walke
     w
 }
 
-/// `seed`'s first episode, stopped before its first commit over a non-empty replay range. The
-/// walk is deterministic, so every call returns the same boundary.
+/// `seed`'s first episode, stopped before its first commit over a non-empty replay range.
 #[cfg(debug_assertions)]
 fn first_commit_over_a_range(model: &Model, seed: u64) -> Option<(Walker<'_>, Move)> {
     let mut w = Walker::new(model, 2, seed, 0);
@@ -824,7 +770,6 @@ fn first_commit_over_a_range(model: &Model, seed: u64) -> Option<(Walker<'_>, Mo
 #[test]
 fn the_real_boundary_follows_the_publication_model_in_lock_step() {
     let healthy = aos_boundary_publication_model();
-    // The committed configuration, then the scenario of a boundary built with no queue.
     for cap in [2usize, 0] {
         let model = interp::with_consts(&healthy, &[("Cap", index(cap))]);
         let mut fired = BTreeSet::new();
@@ -843,10 +788,7 @@ fn the_real_boundary_follows_the_publication_model_in_lock_step() {
     }
 }
 
-/// The seeded walks reach about half of the model's states. This replays the model's shortest
-/// path to each reachable state on a fresh boundary, makes the calls the model rules out there,
-/// then takes each move the model allows from it, so every transition of the bounded space is
-/// a checked real step.
+/// The seeded walks reach about half of the model's states.
 #[test]
 fn every_transition_of_the_publication_model_is_a_real_step() {
     let healthy = aos_boundary_publication_model();
@@ -891,8 +833,7 @@ fn every_transition_of_the_publication_model_is_a_real_step() {
 }
 
 /// Dial 1 publishes the second of two candidates prepared against one head once the first has
-/// committed (it compares the cursor and forgets the revision). The real boundary refuses that
-/// commit as `StaleHead`, and the candidate it consumed is the model's `Discard`.
+/// committed (it compares the cursor and forgets the revision).
 #[test]
 fn negative_control_stale_the_second_candidate_against_one_head_is_refused_where_the_mutant_publishes_it()
  {
@@ -927,7 +868,6 @@ fn negative_control_stale_the_second_candidate_against_one_head_is_refused_where
     assert!(!mutant.check_invariant("StaleNeverCommitted", &published));
     assert_ne!(step.got, published);
 
-    // Every state the seeded walks reach where only the mutant may commit a held candidate.
     let mut caught = 0u32;
     lockstep(&model, 2, SEEDS, |s| {
         let Move::RefusedCommit(x) = s.mv else { return };
@@ -947,11 +887,7 @@ fn negative_control_stale_the_second_candidate_against_one_head_is_refused_where
     assert!(caught > 0, "the walks reached the stale winner");
 }
 
-/// Dial 2 publishes the code alone. A commit stopped after any number of its stores leaves the
-/// complete old pair (the model's `Discard` of the candidate it consumed) or the complete new
-/// pair still paused with the queue whole, which the reject that ends the pause turns into the
-/// model's `Commit`; and a commit that completes is the model's `Commit`. None of them is the
-/// mutant's new code over old state.
+/// Dial 2 publishes the code alone.
 #[cfg(debug_assertions)]
 #[test]
 fn negative_control_mixed_a_commit_stopped_after_any_store_never_shows_new_code_over_old_state() {
@@ -964,8 +900,6 @@ fn negative_control_mixed_a_commit_stopped_after_any_store_never_shows_new_code_
 
     let model = aos_boundary_publication_model();
     let mixed = interp::with_buggy(&model, 2);
-    // The scripted commit, then each seed's first commit over a non-empty replay range (the
-    // candidate's state differs from the live one, so the state tells old from new too).
     let script: &[&'static str] = &["Input", "Pause", "PrepareA", "Hold", "Hold"];
     let reach = |seed: Option<u64>| match seed {
         None => Some((scripted(&model, 2, script), Move::Act("CommitA"))),
@@ -1041,7 +975,6 @@ fn negative_control_mixed_a_commit_stopped_after_any_store_never_shows_new_code_
                             "k = {k}"
                         );
                     }
-                    // Ending the pause delivers the queue to whichever pair is installed.
                     w.real.act("Reject", &mut w.rng);
                     let after = w.real.project();
                     assert_ne!(after, mutant, "k = {k}");
@@ -1064,8 +997,7 @@ fn negative_control_mixed_a_commit_stopped_after_any_store_never_shows_new_code_
     assert_eq!(kinds, BTreeSet::from([Left::Old, Left::New, Left::Done]));
 }
 
-/// Dial 3 resumes the old pair on a reject but drops the queue. The real reject delivers every
-/// queued input to the old pair, which the mutant does not admit.
+/// Dial 3 resumes the old pair on a reject but drops the queue.
 #[test]
 fn negative_control_lost_input_a_reject_delivers_every_queued_input_to_the_old_pair() {
     let model = aos_boundary_publication_model();
@@ -1092,8 +1024,7 @@ fn negative_control_lost_input_a_reject_delivers_every_queued_input_to_the_old_p
 }
 
 /// Dial 4 delivers the queue to the old pair and then installs the candidate's replayed state,
-/// which never saw it. The real commit delivers the queue to the new pair, so the live cursor
-/// counts it, which the mutant does not admit.
+/// which never saw it.
 #[test]
 fn negative_control_wrong_pair_a_commit_delivers_the_queue_to_the_new_pair() {
     let model = aos_boundary_publication_model();

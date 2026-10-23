@@ -1,66 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TIER-1 for `OccupancyDoor` (aterm-models-harness `occupancy_door_model`): the REAL pure
-//! decider (`occupancy::decide`), the REAL hold's clock (`HoldClock::step`), the REAL books
-//! (`Books`) and the REAL facts seam's seed (`FactsState::seed`) driven along every state of the
-//! model the real loop can reach, with up to two lines typed before it (so a later hold's nudge is
-//! walked apart from a first one), each step checked where it lands, a state seen before
-//! included: for each built-in rule (`wait-nudge@v1` and `hold-room@v1`, both the model's
-//! `due == 1`) under each autopilot (Cruise committed, Off and Land the model's scenarios).
-//! A wake (`due == 2`, `OpenWake`, §4.1) is not implemented yet: Tier 0 only, never walked here.
-//! `Sample` and `SampleLast` (the K Entry) are not implemented yet: not anchored, mirrored as no-ops.
-//!
-//! The projection, at each state: `held` is the clock's open hold having held the rule's age
-//! (30 min for the nudge, 2 h for the room), and `owed` the clock still awaiting the answer to
-//! the harness's line ([`HoldClock::wants_tail`]); the guards are the model's terms, each set as one of
-//! the real guards it stands for (`person` a person's grace, `hold=1` or a draft; `task` a
-//! taskless session or a person's exchange; `brake` a stall, credits, the memory wall or reach
-//! Down; `untaken` an act untaken), cycled across the walks; the autopilot is `Mode`; the
-//! condition is the hold of age undeclared for the nudge, and the board's room for hold-room. At
-//! every break (`door == 1`) the decider says `Due` exactly where `Intend` then `Type` would be
-//! enabled (with `OpenNudge` taken first where enabled: the decider has no memory of its own,
-//! so a condition met is due at the read that finds it), `Quiet` where nothing is due or the
-//! due line's condition failed (`Lapse`), `Held(g)` only where `g`'s term disables `Type`, and
-//! `Paced` only where the pace alone does — which no walk reaches: each rule's own spacing (a new
-//! hold's 30 min, hold-room's 2 h) outlasts the 20 min pace, which binds only between the two
-//! rules (`rules_tests::the_session_pace_holds_a_second_line`). A crash re-seeds the facts from the
-//! rows and leaves the episode untold.
-//!
-//! Each model action is mirrored on the real side: `Break` and `IdleRead` are a settled
-//! background read of a new break (the clock opens at the first; `IdleRead` keeps a hold open),
-//! with the agent's last words read where the clock wants them (nothing declared); `HoldAges`
-//! moves the clock past the rule's age; `Turn` from a break where a line is owed is the turn
-//! answering it (`LiveTurn { ours: true }`); a point's decision is fed once, as it closes the hold
-//! (`HoldCloses` at `door == 2`, a point that acts or finds no background work) or as `Turn`
-//! leaves it (the point that ends the answer, decided as one that would close the hold, or else
-//! one that decides nothing while the work shows); `HoldCloses` at `door == 0` is the edge into a
-//! live turn the harness did not type; `Fails` is the agent's `WAITING:` answer to a harness line
-//! (nudge) or the board's room gone (hold-room); `Intend`, `Type` and `Skip` book their rows (and
-//! `Type` the line in the books and the clock); `PaceLapses` moves the clock past the pace;
-//! `Close` is the next hold for the nudge and the 2 h spacing for hold-room; and `Crash`
-//! re-seeds a fresh `FactsState` from the rows. The guards' toggles, `Holds`, `OpenNudge`,
-//! `Sample` and `SampleLast` change nothing the real side keeps. After every step a fresh seed of
-//! the rows says the current episode told exactly where the model's book does (its kind's
-//! restart hold aside, which the model does not carry).
-//!
-//! The walk follows only what the real loop can do: no `UpgradeDue` (`IdleHost::upgrade_due`, not
-//! asked yet) and no `OpenWake`; `Intend` and `Type` at a break only (the loop decides only at
-//! drawn breaks); a hold comes of age only with its episode closed and the pace run out (both
-//! rules' ages outlast the pace, and a hold that ages opened after the last line); a due line
-//! whose condition failed is skipped and dropped before anything else (the decider judges it at
-//! the read); for the nudge, `Holds` never (its condition is the hold) and `Fails` only with no
-//! line owed (its `WAITING:` is read at the answer's break), and for hold-room `Close` only once
-//! the pace has run out, at a door with no line, and with the hold of age or none open (its 2 h
-//! spacing passes nowhere else). `Intend`'s anchor binds its enabling verdict (`Due`); its row is
-//! booked here, as the typing path will book it.
-//!
-//! NEGATIVE CONTROLS (`occupancy::fault`, planted in the real code): books that dedupe by the
-//! rule's name instead of the episode leave a second hold's nudge untold; a clock restarted at
-//! an idle read never holds a hold of age; a clock that ends the hold at the harness line's own
-//! turn, at the point that ends its answer, or at a point that decides nothing (F5) loses the
-//! hold the model keeps; a seed that reads an intent, or a skip, as told says told where the
-//! screen never got the line — each disagrees exactly there.
+//! Tier-1 conformance tests binding `OccupancyDoor` to `occupancy::decide`, `HoldClock`, and `Books`.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -343,8 +284,7 @@ fn point(closing: bool, variant: usize) -> HoldEvent {
     HoldEvent::DecidedPoint { acts, background }
 }
 
-/// Mirrors `action` (from `st` to `next`) on the real side. `false` where the real side
-/// disagrees with the step itself (a crash's seed, or a fresh seed's word on the episode).
+/// Mirrors `action` (from `st` to `next`) on the real side.
 fn mirror(action: &str, st: &State, next: &State, r: &mut Real, run: Run) -> bool {
     let rule = run.rule;
     match action {
@@ -352,8 +292,6 @@ fn mirror(action: &str, st: &State, next: &State, r: &mut Real, run: Run) -> boo
         "Point" => r.pointed = false,
         "Turn" => {
             if st["door"] == 2 && !std::mem::take(&mut r.pointed) {
-                // The point decided nothing that closed the hold: the one that ends a harness
-                // line's answer (decided as one that would close it), or one that decided
                 // nothing while the work showed.
                 r.clock.step(point(st["owed"] == 1, run.variant));
             }
@@ -418,8 +356,6 @@ fn mirror(action: &str, st: &State, next: &State, r: &mut Real, run: Run) -> boo
     if let Some(since) = r.clock.since_ms() {
         r.books.hold(since);
     }
-    // A successor seeded now says the episode told exactly where the book does (seeded long
-    // after the rows, so its kind's restart hold, which the model does not carry, is spent).
     if let Some(key) = r.episode {
         let mut seeded = FactsState::default();
         seeded.seed(&r.rows, i64::MAX);
@@ -474,7 +410,7 @@ fn typed(r: &Real) -> usize {
 
 /// Every reachable state of `m` the real loop can reach, with up to two lines typed before it,
 /// the real side mirrored along the first path to each; every step the walk follows is checked
-/// where it lands, a state seen before included. `strict`: a disagreement fails at once.
+/// where it lands, a state seen before included.
 fn walk(m: &Model, strict: bool, run: Run) -> Walked {
     let go = || {
         let init = Real {
@@ -521,6 +457,42 @@ fn walk(m: &Model, strict: bool, run: Run) -> Walked {
     }
 }
 
+/// How many threads [`walks`] spreads independent walks over.
+const WALK_WORKERS: usize = 4;
+
+/// [`walk`] of [`under`]`(mode)` for each `(mode, run)`, over [`WALK_WORKERS`] threads of their
+/// own (the fault seam is per thread), returned in `runs`' order. A walk's panic is re-raised
+/// as it was.
+fn walks(runs: &[(i64, Run)], strict: bool) -> Vec<Walked> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut done: Vec<(usize, Walked)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..WALK_WORKERS.min(runs.len()))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut mine = Vec::new();
+                    loop {
+                        let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&(mode, run)) = runs.get(at) else {
+                            return mine;
+                        };
+                        mine.push((at, walk(&under(mode), strict, run)));
+                    }
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    });
+    done.sort_by_key(|(at, _)| *at);
+    done.into_iter().map(|(_, w)| w).collect()
+}
+
 /// The model under autopilot `mode` (0 Off, 1 Cruise, 2 Land).
 fn under(mode: i64) -> Model {
     aterm_spec::interp::with_consts(&occupancy_door_model(), &[("Mode", mode)])
@@ -531,84 +503,85 @@ fn under(mode: i64) -> Model {
 /// term — and every action the walk follows is mirrored.
 #[test]
 fn tier1_the_real_decider_says_due_exactly_where_the_model_types() {
+    let mut runs = Vec::new();
     for mode in [1, 2, 0] {
         for rule in RuleId::ALL {
             let variants = if mode == 1 { 0..4 } else { 0..1 };
             for variant in variants {
-                let m = under(mode);
-                let w = walk(
-                    &m,
-                    true,
+                runs.push((
+                    mode,
                     Run {
                         rule,
                         variant,
                         fault: None,
                     },
-                );
-                let mut own = vec![
-                    "Turn",
-                    "Break",
-                    "Point",
-                    "HoldAges",
-                    "IdleRead",
-                    "HoldCloses",
-                    "PersonIn",
-                    "PersonOut",
-                    "TaskEnds",
-                    "TaskBegins",
-                    "BrakeOn",
-                    "BrakeOff",
-                    "ActOwed",
-                    "ActTaken",
-                    "Fails",
-                    "OpenNudge",
-                    "Intend",
-                    "Skip",
-                    "Lapse",
-                    "Crash",
-                    "Sample",
-                    "SampleLast",
-                ];
-                if rule == RuleId::HoldRoom {
-                    own.push("Holds");
-                }
-                if mode == 1 {
-                    own.extend(["Type", "PaceLapses", "Close"]);
-                } else {
-                    assert!(
-                        !w.fired.contains_key("Type"),
-                        "{rule:?} is Cruise's: nothing is typed under Mode = {mode}"
-                    );
-                }
-                for a in own {
-                    assert!(
-                        w.fired.contains_key(a),
-                        "{rule:?}, Mode = {mode}: {a} never mirrored: {:?}",
-                        w.fired
-                    );
-                }
-                let want: &[&str] = if mode == 1 {
-                    &[
-                        "Quiet",
-                        "Due",
-                        "Held(\"person\")",
-                        "Held(\"task\")",
-                        "Held(\"brake\")",
-                        "Held(\"untaken\")",
-                    ]
-                } else {
-                    &["Quiet", "Held(\"mode\")"]
-                };
-                for said in want {
-                    assert!(
-                        w.said.contains(*said),
-                        "{rule:?}, Mode = {mode}: never said {said}: {:?}",
-                        w.said
-                    );
-                }
-                assert!(w.states.len() > 100, "{}", w.states.len());
+                ));
             }
         }
+    }
+    for (&(mode, Run { rule, .. }), w) in runs.iter().zip(walks(&runs, true)) {
+        let mut own = vec![
+            "Turn",
+            "Break",
+            "Point",
+            "HoldAges",
+            "IdleRead",
+            "HoldCloses",
+            "PersonIn",
+            "PersonOut",
+            "TaskEnds",
+            "TaskBegins",
+            "BrakeOn",
+            "BrakeOff",
+            "ActOwed",
+            "ActTaken",
+            "Fails",
+            "OpenNudge",
+            "Intend",
+            "Skip",
+            "Lapse",
+            "Crash",
+            "Sample",
+            "SampleLast",
+        ];
+        if rule == RuleId::HoldRoom {
+            own.push("Holds");
+        }
+        if mode == 1 {
+            own.extend(["Type", "PaceLapses", "Close"]);
+        } else {
+            assert!(
+                !w.fired.contains_key("Type"),
+                "{rule:?} is Cruise's: nothing is typed under Mode = {mode}"
+            );
+        }
+        for a in own {
+            assert!(
+                w.fired.contains_key(a),
+                "{rule:?}, Mode = {mode}: {a} never mirrored: {:?}",
+                w.fired
+            );
+        }
+        let want: &[&str] = if mode == 1 {
+            &[
+                "Quiet",
+                "Due",
+                "Held(\"person\")",
+                "Held(\"task\")",
+                "Held(\"brake\")",
+                "Held(\"untaken\")",
+            ]
+        } else {
+            &["Quiet", "Held(\"mode\")"]
+        };
+        for said in want {
+            assert!(
+                w.said.contains(*said),
+                "{rule:?}, Mode = {mode}: never said {said}: {:?}",
+                w.said
+            );
+        }
+        assert!(w.states.len() > 100, "{}", w.states.len());
     }
 }
 
@@ -621,10 +594,9 @@ type Shows = fn(&State) -> bool;
 /// due; a clock restarted at an idle read, or one that ends the hold at the harness line's own
 /// turn, at the point that ends its answer, or at a point that decides nothing (F5), loses the
 /// hold the model keeps; a seed that reads an intent or a skip as told says told where the
-/// model's episode is untold. Each disagrees, and only where its defect shows.
+/// model's episode is untold.
 #[test]
 fn tier1_each_planted_defect_disagrees_where_the_model_says() {
-    let m = under(1);
     let controls: [(Fault, Option<RuleId>, Shows, Option<Shows>); 7] = [
         (
             Fault::DedupeByRule,
@@ -664,35 +636,45 @@ fn tier1_each_planted_defect_disagrees_where_the_model_says() {
             None,
         ),
     ];
+    let mut runs = Vec::new();
+    let mut checks = Vec::new();
     for (fault, only, shows, among) in controls {
         for rule in RuleId::ALL
             .into_iter()
             .filter(|r| only.is_none_or(|o| o == *r))
         {
             for variant in 0..3 {
-                let run = Run {
-                    rule,
-                    variant,
-                    fault: Some(fault),
-                };
-                let w = walk(&m, false, run);
-                assert!(
-                    !w.off.is_empty(),
-                    "{fault:?} ({rule:?}, variant {variant}) agreed everywhere"
-                );
-                assert!(
-                    w.off.iter().all(shows),
-                    "{fault:?} ({rule:?}, variant {variant}): {:?}",
-                    w.off
-                );
-                if let Some(among) = among {
-                    assert!(
-                        w.off.iter().any(among),
-                        "{fault:?} ({rule:?}, variant {variant}): {:?}",
-                        w.off
-                    );
-                }
+                runs.push((
+                    1,
+                    Run {
+                        rule,
+                        variant,
+                        fault: Some(fault),
+                    },
+                ));
+                checks.push((fault, shows, among));
             }
+        }
+    }
+    let walked = walks(&runs, false);
+    for ((&(_, Run { rule, variant, .. }), (fault, shows, among)), w) in
+        runs.iter().zip(checks).zip(walked)
+    {
+        assert!(
+            !w.off.is_empty(),
+            "{fault:?} ({rule:?}, variant {variant}) agreed everywhere"
+        );
+        assert!(
+            w.off.iter().all(shows),
+            "{fault:?} ({rule:?}, variant {variant}): {:?}",
+            w.off
+        );
+        if let Some(among) = among {
+            assert!(
+                w.off.iter().any(among),
+                "{fault:?} ({rule:?}, variant {variant}): {:?}",
+                w.off
+            );
         }
     }
 }

@@ -1,36 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The keyboard input source a `meta-keys --window` run selects, and putting the
-//! person's back after it.
-//!
-//! A dead key composes in the input source the login session has selected, and
-//! every app the person types into follows that selection, so a run that measures
-//! a German or French Option chord selects that layout for the whole desk. It
-//! does so only for its own run: [`Switch::begin`] records what is selected
-//! first, with what HIToolbox keeps of its own beside it (the input-source
-//! history and its kin, [`crate::sys::tis::BOOKKEEPING`]), a source the run
-//! enables is written to the record BEFORE it is enabled, and
-//! [`Switch::restore`] selects the recorded source again, disables exactly what
-//! the run enabled and writes that bookkeeping back as it was. The record is a file
-//! ([`record_path`]), so every exit path puts the desk back: a return or an
-//! error drops the [`Switch`]; an interrupt (`^C`, TERM, a hang-up) ends the run
-//! through [`crate::stop`], which drops it; a second interrupt runs
-//! `meta-keys --restore` before it exits; and a run that dies outright (SIGKILL,
-//! a crash) leaves the record, which the next run puts back before it starts
-//! ([`recover`]), as `meta-keys --restore` does by hand. One run holds the
-//! record at a time: [`Switch::begin`] creates it only where none is.
-//!
-//! A layout is selected only for its own rows ([`in_turn`]): the person's own is
-//! back before the run waits for an idle desk again, so a person who comes back
-//! between two layouts types in their own at once.
+//! The keyboard input source a `meta-keys --window` run selects, and putting the person's back after it.
 
 use std::path::{Path, PathBuf};
 
 use crate::stop::Stopped;
 
-/// One key of HIToolbox's own bookkeeping and its value (a binary property list),
-/// `None` where the key is absent.
+/// One key of HIToolbox's own bookkeeping and its value (a binary property list), `None` where the key is absent.
 pub type Pref = (String, Option<Vec<u8>>);
 
 /// The input sources of the login session, as HIToolbox has them.
@@ -40,28 +17,22 @@ pub trait Sources {
     /// The enabled input sources' IDs, in HIToolbox's order.
     fn enabled(&self) -> Vec<String>;
     /// Enable an installed source.
-    ///
     /// # Errors
     /// HIToolbox refused.
     fn enable(&self, id: &str) -> Result<(), String>;
     /// Disable a source.
-    ///
     /// # Errors
     /// HIToolbox refused.
     fn disable(&self, id: &str) -> Result<(), String>;
     /// Select an enabled source.
-    ///
     /// # Errors
     /// HIToolbox refused.
     fn select(&self, id: &str) -> Result<(), String>;
-    /// What HIToolbox writes of its own when a source is selected
-    /// (`AppleInputSourceHistory` and its kin, [`crate::sys::tis::BOOKKEEPING`]).
-    ///
+    /// What HIToolbox writes of its own when a source is selected (`AppleInputSourceHistory` and its kin, [`crate::sys::tis::BOOKKEEPING`]).
     /// # Errors
     /// It cannot be read.
     fn bookkeeping(&self) -> Result<Vec<Pref>, String>;
     /// Write that bookkeeping back as it was.
-    ///
     /// # Errors
     /// It cannot be written.
     fn put_bookkeeping(&self, prefs: &[Pref]) -> Result<(), String>;
@@ -94,8 +65,7 @@ impl Sources for HiToolbox {
     }
 }
 
-/// Where a run keeps its record: beside the desk lock, so a run from any checkout
-/// finds what another left.
+/// Where a run keeps its record: beside the desk lock, so a run from any checkout finds what another left.
 #[must_use]
 pub fn record_path() -> PathBuf {
     let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
@@ -105,8 +75,7 @@ pub fn record_path() -> PathBuf {
 /// What a run changed, written before it changes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
-    /// The run's pid and its start (seconds since the epoch): a pid alone could be
-    /// reused by the time a later run reads it.
+    /// The run's pid and its start (seconds since the epoch): a pid alone could be reused by the time a later run reads it.
     pub pid: i32,
     pub start: i64,
     /// The source selected before the run.
@@ -248,7 +217,6 @@ fn create(path: &Path, r: &Record) -> Result<(), String> {
 
 /// Put back what `r` says a run changed: its selection, then each source it
 /// enabled, disabled, then the bookkeeping HIToolbox wrote meanwhile, as it was.
-/// The record is removed only once all of that held.
 fn put_back(sources: &impl Sources, path: &Path, r: &Record) -> Result<(), String> {
     if sources.selected().as_deref() != Some(r.selected.as_str()) {
         sources.select(&r.selected)?;
@@ -269,12 +237,9 @@ fn put_back(sources: &impl Sources, path: &Path, r: &Record) -> Result<(), Strin
     }
 }
 
-/// Before a run: put back what an earlier run left in its record, when that run
-/// is gone. `Ok(None)`: no record; `Ok(Some(what))`: what was put back.
-///
+/// Before a run: put back what an earlier run left in its record, when that run is gone.
 /// # Errors
-/// The record is unreadable, a run that wrote it still runs, or HIToolbox
-/// refused the restore.
+/// The record is unreadable, a run that wrote it still runs, or HIToolbox refused the restore.
 pub fn recover(sources: &impl Sources, path: &Path) -> Result<Option<String>, String> {
     let Some(r) = read(path)? else {
         return Ok(None);
@@ -299,10 +264,7 @@ pub fn recover(sources: &impl Sources, path: &Path) -> Result<Option<String>, St
     )))
 }
 
-/// `meta-keys --restore`: put back what the record names, whoever wrote it (the
-/// hard exit of a run that is still alive asks this of a child). `Ok(None)`: no
-/// record.
-///
+/// `meta-keys --restore`: put back what the record names, whoever wrote it (the hard exit of a run that is still alive asks this of a child).
 /// # Errors
 /// The record is unreadable, or HIToolbox refused the restore.
 pub fn restore_now(sources: &impl Sources, path: &Path) -> Result<Option<Record>, String> {
@@ -313,8 +275,7 @@ pub fn restore_now(sources: &impl Sources, path: &Path) -> Result<Option<Record>
     Ok(Some(r))
 }
 
-/// A run's hold on the input sources: [`Switch::restore`] (or the drop) puts
-/// back what [`Switch::begin`] recorded.
+/// A run's hold on the input sources: [`Switch::restore`] (or the drop) puts back what [`Switch::begin`] recorded.
 pub struct Switch<'a, S: Sources> {
     sources: &'a S,
     path: PathBuf,
@@ -324,12 +285,9 @@ pub struct Switch<'a, S: Sources> {
 }
 
 impl<'a, S: Sources> Switch<'a, S> {
-    /// Record the selected source in `path`, which no record may hold yet;
-    /// nothing is changed yet.
-    ///
+    /// Record the selected source in `path`, which no record may hold yet; nothing is changed yet.
     /// # Errors
-    /// No source is selected, a record is there already (another run's, or one
-    /// left to put back), or the record cannot be written.
+    /// No source is selected, a record is there already (another run's, or one left to put back), or the record cannot be written.
     pub fn begin(sources: &'a S, path: &Path) -> Result<Switch<'a, S>, String> {
         let selected = sources
             .selected()
@@ -344,9 +302,7 @@ impl<'a, S: Sources> Switch<'a, S> {
         })
     }
 
-    /// Select `id` for the run, enabling it first when it is not enabled (and
-    /// recording that before enabling it).
-    ///
+    /// Select `id` for the run, enabling it first when it is not enabled (and recording that before enabling it).
     /// # Errors
     /// The record cannot be written, or HIToolbox refused.
     pub fn select(&mut self, id: &str) -> Result<(), String> {
@@ -359,7 +315,6 @@ impl<'a, S: Sources> Switch<'a, S> {
     }
 
     /// Put the person's input sources back.
-    ///
     /// # Errors
     /// HIToolbox refused; the record stays for the next run.
     pub fn restore(&mut self) -> Result<(), String> {
@@ -375,12 +330,10 @@ impl<'a, S: Sources> Switch<'a, S> {
 /// What a run does with each layout [`in_turn`] gives it.
 pub trait Lane {
     /// Wait for an idle desk: `Ok(Err(why))` when it never came.
-    ///
     /// # Errors
     /// The run was interrupted.
     fn await_idle(&mut self) -> Result<Result<(), String>, Stopped>;
     /// Measure the rows of layout `id`, which is selected now.
-    ///
     /// # Errors
     /// The run was interrupted.
     fn measure(&mut self, id: &str) -> Result<(), Stopped>;
@@ -392,12 +345,7 @@ pub trait Lane {
     fn refused(&mut self, id: &str, what: &str, why: &str);
 }
 
-/// Measure each of `ids` in turn, each from an idle desk and selected only for its
-/// own rows: its [`Switch`] puts the person's input sources back as soon as the
-/// rows end (or a person touched the desk), before the lane waits for the desk
-/// again. A layout after a wait that never went idle, a touch, or input sources
-/// that would not come back is skipped.
-///
+/// Measure each of `ids` in turn, each from an idle desk and selected only for its own rows: its [`Switch`] puts the person's input sources back as soon as the rows end (or a person touched the desk), before the lane waits for the desk again.
 /// # Errors
 /// The run was interrupted; the layout's switch puts the desk back as it drops.
 pub fn in_turn<S: Sources>(
@@ -679,7 +627,6 @@ mod tests {
         assert!(e.contains("holds the input sources"), "{e}");
         assert_eq!(hit.selected().as_deref(), Some(DE));
         assert!(path.exists());
-        // `--restore` puts it back whoever wrote it (a run's hard exit asks it).
         let r = restore_now(&hit, &path)
             .expect("restore")
             .expect("a record");

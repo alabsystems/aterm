@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm harness accounts renew` and `adopt-default`
-//! (`docs/DESIGN-claude-accounts-v2-2026-10-15.md` §5.3): the sign-in into a
-//! staging home, the check IN that home with the address compared in memory,
-//! the binding repointed only on a match, nothing run after a failed flow,
-//! the paste-code flow over SSH, the batch, and the other machines. Over a
-//! scripted host ([`RenewHost`]) that records every run, and over `/bin/sh`
-//! stand-ins for the real command builders. Every address is an example.com
-//! one, and no test output may carry it.
+//! Tests for `aterm harness accounts renew` and `adopt-default`.
 
 use std::cell::RefCell;
 
@@ -18,8 +11,7 @@ const OWNER: &str = "owner@example.com";
 const WORK: &str = "w2@example.com";
 
 /// This machine's own login (renewable, a browser profile of its own), a
-/// renewable second account, and one with no email. Each dir is spelled as
-/// the parser spells a string, so a Windows path's backslashes are escaped.
+/// renewable second account, and one with no email.
 fn roster_text(work_dir: &str) -> String {
     let dir = |d: &str| aterm_toml::Value::from(d).to_string();
     format!(
@@ -50,8 +42,7 @@ fn renew_env(tag: &str) -> (Tmp, Env) {
 /// home's `.claude.json` with the account it is told to (`signs_in_as`, the
 /// address the browser holds — `None`: the address it was hinted with), and
 /// exits `flow`; its check answers what THAT HOME's `.claude.json` says, as
-/// the vendor's does. Every run is recorded. An idle login is never asked:
-/// `auth_status` and `login` panic.
+/// the vendor's does.
 struct RenewHost {
     tty: bool,
     ssh_session: bool,
@@ -264,8 +255,6 @@ fn a_renewal_signs_in_to_a_staging_home_checks_it_there_and_repoints_the_binding
     let staging = store.logins_dir().join("main+1");
     let staging = staging.to_str().expect("utf-8").to_string();
     let opener = store.dir.join("bin").join(crate::harness::open_url::OPENER);
-    // The opener is a link to this program that only Unix makes
-    // (`opener_link`): elsewhere the page opens in the default browser.
     let browser = if cfg!(unix) {
         RenewBrowser::Profile {
             opener: opener.clone(),
@@ -311,7 +300,6 @@ fn a_renewal_signs_in_to_a_staging_home_checks_it_there_and_repoints_the_binding
     };
     assert!(out.contains(opens), "{out}");
     no_address(&env, &[&out, &err]);
-    // The report reads the roster through the binding.
     let (code, report, _) = acc(AccountsCmd::Report { json: false }, &env, &host);
     assert_eq!(code, exit(0));
     let line = report
@@ -333,7 +321,6 @@ fn a_renewal_signs_in_to_a_staging_home_checks_it_there_and_repoints_the_binding
     assert!(json.contains("\"renews\":true") && json.contains("\"login\":\"idle\""));
     no_address(&env, &[&report, &json]);
 
-    // A second renewal signs in to the next staging home, never over one.
     let host = RenewHost::new();
     let (code, ..) = acc(renew(&["main"], false, None), &env, &host);
     assert_eq!(code, exit(0));
@@ -350,9 +337,7 @@ fn a_renewal_signs_in_to_a_staging_home_checks_it_there_and_repoints_the_binding
 /// at their next idle turn end with `[harness] enabled`, `logins`, `relaunch` and
 /// `resume_limits` on; with one of them off nothing moves them, and the
 /// switch is named (the master switch, which leaves the others on in the
-/// file, by its own name). Either way the line that starts Claude Code under
-/// the renewed login by hand is printed (what a tab nothing relaunches is
-/// told to run). NEGATIVE CONTROL: the packaged config says they move.
+/// file, by its own name).
 #[test]
 fn a_renewal_says_what_moves_its_sessions_and_the_line_to_start_one_by_hand() {
     for (switch, off) in [
@@ -405,9 +390,7 @@ fn a_renewal_says_what_moves_its_sessions_and_the_line_to_start_one_by_hand() {
 /// A STAGING HOME IS NO ROW'S LOGIN DIRECTORY: renewed, `main` is bound to
 /// `logins/main+1`, and a label that reads like it — `main.1`, which `add`
 /// admits — gets a login directory of its own, empty, never `main`'s live
-/// one adopted as "a login made under this name before". A `+` name is no
-/// label at all. NEGATIVE CONTROL: the label of a row whose own directory
-/// holds a login made before is given that directory back.
+/// one adopted as "a login made under this name before".
 #[test]
 fn a_staging_home_is_never_a_rows_login_directory() {
     let (_tmp, env) = renew_env("renew-names");
@@ -437,7 +420,6 @@ fn a_staging_home_is_never_a_rows_login_directory() {
     );
     let (code, _, err) = acc(add("main+1"), &env, &host);
     assert_eq!(code, exit(1), "{err}");
-    // NEGATIVE CONTROL: a login made under a label before is its own again.
     let before = store.logins_dir().join("w9");
     std::fs::create_dir_all(&before).expect("mkdir");
     std::fs::write(before.join(".claude.json"), "{}").expect("write");
@@ -446,10 +428,7 @@ fn a_staging_home_is_never_a_rows_login_directory() {
     assert!(err.contains("already held files"), "{err}");
 }
 
-/// THE WRONG ACCOUNT: the browser signed in another account. Nothing live
-/// changes — no binding, no auth word, the staging home gone — and the
-/// attempt is recorded by label. NEGATIVE CONTROL: the happy path above,
-/// whose matching address repoints.
+/// THE WRONG ACCOUNT: the browser signed in another account.
 #[test]
 fn a_renewal_that_answers_another_account_changes_nothing_live() {
     let (_tmp, env) = renew_env("renew-wrong");
@@ -479,7 +458,6 @@ fn a_renewal_that_answers_another_account_changes_nothing_live() {
     assert_eq!(kinds, [accounts::Kind::WrongAccount]);
     assert!(!err.contains("someone-else"), "{err}");
     no_address(&env, &[&out, &err]);
-    // The report says so.
     let (_, report, _) = acc(AccountsCmd::Report { json: false }, &env, &host);
     assert!(report.contains("last renewal: wrong account"), "{report}");
 }
@@ -510,15 +488,12 @@ fn a_cancelled_renewal_runs_no_check_and_records_nothing() {
 }
 
 /// A recording failure is not a rollback: the binding and auth word can
-/// already be durable when appending the ledger fails. The checked home
-/// must remain usable wherever the durable binding points.
+/// already be durable when appending the ledger fails.
 #[test]
 fn a_renewal_keeps_its_published_home_when_the_ledger_cannot_be_appended() {
     let (_tmp, env) = renew_env("renew-published-ledger-failure");
     let store = env.accounts_store();
     store.ensure().expect("store");
-    // Loads and the binding/state writes still work; the later append does
-    // not. This is a real filesystem failure after publication.
     std::fs::create_dir(store.ledger_path()).expect("block ledger append");
     let host = RenewHost::new();
     let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
@@ -573,7 +548,6 @@ fn over_ssh_the_paste_code_flow_runs_and_the_profile_is_named() {
         ),
         "{out}"
     );
-    // A row with no profile: the default browser here, no opener made.
     let (_tmp, env) = renew_env("renew-default");
     let host = RenewHost::new();
     let (code, ..) = acc(renew(&["work-2"], false, None), &env, &host);
@@ -591,7 +565,6 @@ fn due_renews_only_what_is_due_and_says_when_nothing_is() {
     assert_eq!(code, exit(0));
     assert_eq!(out, "nothing is due on this machine\n");
     assert!(host.flows.borrow().is_empty());
-    // work-2's login said it ends in two days: due; main is not.
     let mut note = None;
     env.accounts_store()
         .transact_logins(env.now, &mut note, |_, logins| {
@@ -610,7 +583,6 @@ fn due_renews_only_what_is_due_and_says_when_nothing_is() {
     assert_eq!(renewed, [WORK]);
     assert!(out.contains("work-2: renewed"), "{out}");
     no_address(&env, &[&out, &err]);
-    // Not at a terminal: named, nothing run.
     let mut quiet = RenewHost::new();
     quiet.tty = false;
     let (code, out, _) = acc(renew(&["main"], false, None), &env, &quiet);
@@ -619,8 +591,7 @@ fn due_renews_only_what_is_due_and_says_when_nothing_is() {
     assert!(quiet.flows.borrow().is_empty());
 }
 
-/// Due selection needs the auth observations. A state this build cannot
-/// read must refuse the whole sitting before any local flow or remote run.
+/// Due selection needs the auth observations.
 #[test]
 fn due_renewal_refuses_foreign_state_before_local_or_remote_actions() {
     let (_tmp, env) = renew_env("renew-due-foreign-state");
@@ -671,13 +642,7 @@ fn uncertain_binding_bytes_refuse_renewal_before_local_or_remote_actions() {
 
 /// THE OTHER MACHINES, in the same sitting: `ssh -t <host> <aterm> harness
 /// accounts renew --due --here`, for `--on`'s and, under `--due`, the
-/// config's. The run it starts there — that very argv, parsed — renews that
-/// machine's own logins and goes on to NO machine, though its config names
-/// one (two machines naming each other, or one itself, would otherwise ssh
-/// back and forth without end). NEGATIVE CONTROLS: the same run without
-/// `--here` goes on to the config's machine; no `--on` and an empty config
-/// runs no ssh; an entry that could be read as an option of `ssh` refuses
-/// the run before anything.
+/// config's.
 #[test]
 fn other_machines_are_renewed_over_ssh_in_one_sitting() {
     let (_tmp, env) = renew_env("renew-on");
@@ -704,7 +669,6 @@ fn other_machines_are_renewed_over_ssh_in_one_sitting() {
         out.contains("renewing on m3:") && out.contains("renewing on m4:"),
         "{out}"
     );
-    // The config's machines, under --due.
     std::fs::write(
         env.config.as_ref().expect("a config"),
         "[harness]\nhosts = [\"m5\"]\n",
@@ -715,9 +679,6 @@ fn other_machines_are_renewed_over_ssh_in_one_sitting() {
     assert_eq!(code, exit(0));
     assert_eq!(host.sshed.borrow().len(), 1);
     assert_eq!(host.sshed.borrow()[0].0, "m5");
-    // The run that ssh starts on m5, under this same config: no machine after
-    // it.
-    // (After `<aterm> harness`, as `aterm` hands the verb its words.)
     let remote = host.sshed.borrow()[0].1[2..].to_vec();
     let Ok((Cmd::Accounts(there), _)) = parse(&remote) else {
         panic!("{remote:?} parses");
@@ -726,13 +687,11 @@ fn other_machines_are_renewed_over_ssh_in_one_sitting() {
     let (code, out, err) = acc(there, &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
     assert!(host.sshed.borrow().is_empty(), "one machine deep: {out}");
-    // A machine whose run fails fails the sitting.
     let mut failing = RenewHost::new();
     failing.ssh_exit = 1;
     let (code, _, err) = acc(renew(&[], true, None), &env, &failing);
     assert_eq!(code, exit(1));
     assert!(err.contains("on m5: exited 1"), "{err}");
-    // NEGATIVE CONTROLS.
     std::fs::write(env.config.as_ref().expect("a config"), "").expect("write");
     let host = RenewHost::new();
     let (code, ..) = acc(renew(&[], true, None), &env, &host);
@@ -750,8 +709,7 @@ fn other_machines_are_renewed_over_ssh_in_one_sitting() {
 /// EVERY LINE THAT TELLS THE OWNER TO SIGN A ROW IN NAMES THE VERB THAT
 /// ROW TAKES: `renew` for a row with an email (`login` refuses it), `login`
 /// for one without — the report's not-enrolled reason, `use`'s refusal of a
-/// row not enrolled, and `add`'s of a row already listed. NEGATIVE CONTROL:
-/// the row with no email is told `login` at each.
+/// row not enrolled, and `add`'s of a row already listed.
 #[test]
 fn each_line_that_signs_a_row_in_names_its_own_verb() {
     let (_tmp, env) = renew_env("renew-verbs");
@@ -862,7 +820,6 @@ fn adopt_default_lists_this_machines_own_login_once() {
     assert!(!err.contains("not-an-address"), "{err}");
     assert!(!env2.accounts_roster().expect("a path").exists());
     no_address(&env, &[&out, &err]);
-    // `add --email` points at renew.
     let (code, out, _) = acc_quiet(
         AccountsCmd::Add {
             label: "w2".into(),
@@ -946,10 +903,6 @@ fn a_whole_sitting_through_a_stand_in_checks_only_in_staging_homes() {
     let (tmp, env) = renew_env("renew-stand-in");
     let program = tmp.path().join("bin").join("claude");
     std::fs::create_dir_all(program.parent().expect("dir")).expect("mkdir");
-    // `auth login …`: writes the home's record of the address it was hinted
-    // with; `auth status --json`: answers that record, signed in ONLY in a
-    // home of its own with no login variable set. Every run is one line of
-    // `ran`, beside the program: its words and its home.
     aterm_tempfile::stand_in(
         &program,
         &format!(
@@ -1029,8 +982,7 @@ fn a_whole_sitting_through_a_stand_in_checks_only_in_staging_homes() {
 /// that holds them, Claude Code's own among them: the logins are its
 /// sessions', and the window's host turns the accounts and logins off with
 /// `[harness.claude] enabled = false`, so a renewal promised a move nothing
-/// would make. NEGATIVE CONTROLS: Codex's switch off leaves the promise; the
-/// master switch off is named first, as it holds every other.
+/// would make.
 #[test]
 fn a_renewal_names_claude_codes_own_switch_when_it_holds_the_sessions() {
     let read =

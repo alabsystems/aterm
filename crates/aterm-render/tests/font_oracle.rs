@@ -4,9 +4,10 @@
 //! The font oracle (TF.1 of docs/AUDIT-third-party-2026-10-15.md): answers recorded from the third-party font crates, which the first-party code replacing them is held to.
 
 mod corpus;
-/// aterm-font's shaper, which answers the `shape` lines here. `probe.rs`, the
+/// aterm-font's shaper, which answers the `shape` lines here.
 mod shaper;
 /// The reader `reader.rs` answers the `read` lines with: aterm-font, under
+/// ttf-parser's names (its outline sink trait is `OutlineSink`).
 mod font {
     pub(crate) use aterm_font::OutlineSink as OutlineBuilder;
     pub(crate) use aterm_font::*;
@@ -31,9 +32,12 @@ struct Loaded {
 }
 
 /// The face file keys this host has: `true` for a committed face, `false`
+/// for a system face.
 type Present = BTreeMap<String, bool>;
 
 /// Run `f` over every face file this host has, one file in memory at a time
+/// (Apple Color Emoji alone is ~190 MB, so nothing holds the set), and return
+/// the keys it saw.
 fn for_each_face(mut f: impl FnMut(&Loaded)) -> Present {
     let mut present = Present::new();
     for face in FACES {
@@ -64,6 +68,11 @@ fn tag(t: &[u8; 4]) -> u32 {
 }
 
 /// The variation instances a face's reader answers are recorded at: the
+/// default (no coordinates set), and for a variable face the instance aterm
+/// draws a primary at (`resolve_default_coords`: the `Regular` named instance,
+/// else `wght` 400), the `wght` 700 overlay the real-bold path asks for, and
+/// every axis at its minimum and maximum (one axis at a time, or all together
+/// on a face with more than four).
 fn reader_instances(bytes: &[u8], index: u32) -> Vec<Coords> {
     let mut out: Vec<Coords> = vec![Vec::new()];
     let Some(p) = variation::probe(bytes, index) else {
@@ -100,6 +109,8 @@ fn reader_instances(bytes: &[u8], index: u32) -> Vec<Coords> {
 }
 
 /// The feature list the renderer shapes with for a `font_features` config
+/// (`user`) and ligature mode: `ligature_shaping::build_feature_list`'s own
+/// output, as the `(tag, value)` pairs a corpus line carries.
 fn feature_list(user: &[FontFeature], ligatures_on: bool) -> Features {
     ligature_shaping::build_feature_list(user, ligatures_on)
         .iter()
@@ -108,6 +119,7 @@ fn feature_list(user: &[FontFeature], ligatures_on: bool) -> Features {
 }
 
 /// A typical multi-feature `font_features` config: a slashed zero, a
+/// stylistic set and a character variant at a value above 1.
 fn typical_config() -> [FontFeature; 3] {
     [
         FontFeature::new(*b"zero", 1),
@@ -122,6 +134,8 @@ fn no_calt_config() -> [FontFeature; 1] {
 }
 
 /// Whether `tag` is one a user sets in `font_features` to pick a glyph
+/// variant: the stylistic sets and character variants, and the other
+/// discretionary OpenType features.
 fn user_configurable(tag: [u8; 4]) -> bool {
     let numbered = |prefix: &[u8]| {
         tag.starts_with(prefix) && tag[2].is_ascii_digit() && tag[3].is_ascii_digit()
@@ -138,9 +152,12 @@ fn user_configurable(tag: [u8; 4]) -> bool {
 }
 
 /// What the run shaper's gate reads from a primary face, which also gates
+/// its styled siblings: whether `GSUB` has `liga`/`calt`, and which of the
+/// tags a config here sets it advertises.
 struct Gate {
     ligatures: bool,
     /// The tags `font_advertises_feature` answers yes for, among the
+    /// configured ones and the face's own user-configurable tags.
     advertised: BTreeSet<[u8; 4]>,
     /// The user-configurable tags face 0's `GSUB` lists, in tag order.
     user_tags: Vec<[u8; 4]>,
@@ -195,6 +212,7 @@ fn case(id: &str, text: &str) -> Case {
 }
 
 /// Programming ligatures and the strings around them: the feature-sensitive
+/// set every feature list is applied to.
 fn ligature_cases() -> Vec<Case> {
     [
         ("lig.arrow", "=>"),
@@ -261,6 +279,8 @@ const FEATURE_CASES: &[&str] = &[
 ];
 
 /// Automatic fractions, the normalization fallbacks rustybuzz applies before
+/// mapping (the shaper does not: [`ShapingDelta::Normalization`]), default
+/// ignorables, left-to-right mirroring pairs and symbols.
 fn misc_cases() -> Vec<Case> {
     [
         ("frac.half", "1\u{2044}2"),
@@ -292,6 +312,8 @@ fn misc_cases() -> Vec<Case> {
 }
 
 /// Right-to-left strings, each recorded in logical order and as the runs a
+/// reordered row holds: the row reordered to visual order as aterm-core's
+/// `compute_visual_order_cells` does (LTR paragraph), then cut at spaces.
 fn rtl_cases() -> Vec<Case> {
     let mut out = Vec::new();
     for (id, logical) in [
@@ -343,7 +365,7 @@ fn visual_runs(logical: &str) -> Vec<String> {
         .collect()
 }
 
-/// Devanagari and CJK. Apart from `deva.bare` and `cjk.halfwidth-kana`, these
+/// Devanagari and CJK.
 fn complex_cases() -> Vec<Case> {
     [
         ("deva.namaste", "\u{928}\u{92E}\u{938}\u{94D}\u{924}\u{947}"),
@@ -365,6 +387,7 @@ fn complex_cases() -> Vec<Case> {
 }
 
 /// The clusters `Renderer::shape_cluster` shapes on the colour face
+/// ([`corpus::EMOJI_CASES`], which the recorder shapes on rustybuzz too).
 fn emoji_cases() -> Vec<Case> {
     corpus::EMOJI_CASES
         .iter()
@@ -373,6 +396,9 @@ fn emoji_cases() -> Vec<Case> {
 }
 
 /// Strings a user feature changes on its own, with no ligature in sight:
+/// letters, digits and punctuation with stylistic alternates, small-capital
+/// candidates, and a single cell (with `font_features` configured, a run may
+/// be one cell long, `shaping_min_run`).
 fn feature_probe_cases() -> Vec<Case> {
     [
         ("feat.alternates", "a0l1Il|g@&$"),
@@ -396,6 +422,10 @@ enum Tier {
 }
 
 /// The instances the run shaper shapes a face at, each with its tier,
+/// mirroring `Renderer::compute_variations_for`: a variable primary is shaped
+/// at `resolve_default_coords` with the `font_variation` / `font_weight`
+/// requests applied, and with no coordinates set when that lands exactly on
+/// the `fvar` defaults.
 fn shaping_instances(bytes: &[u8], index: u32, roles: u8) -> Vec<(Tier, Coords)> {
     if roles & corpus::PRIMARY == 0 {
         return vec![(Tier::Reduced, Vec::new())];
@@ -430,6 +460,7 @@ fn shaping_instances(bytes: &[u8], index: u32, roles: u8) -> Vec<(Tier, Coords)>
 }
 
 /// Every shaping case a primary or styled face gets at one tier, each with its
+/// feature list.
 fn shaping_plan(gate: &Gate, tier: Tier) -> Vec<(Features, Case)> {
     let mut out = Vec::new();
     let mut add = |user: &[FontFeature], ligatures_on: bool, cases: Vec<Case>| {
@@ -489,7 +520,7 @@ fn shaping_plan(gate: &Gate, tier: Tier) -> Vec<(Features, Case)> {
     out
 }
 
-/// Shape every case `l`'s roles ask for. `gates` holds each primary's [`Gate`]
+/// Shape every case `l`'s roles ask for.
 fn shaping_lines(l: &Loaded, gates: &mut BTreeMap<&'static str, Gate>, out: &mut Vec<Line>) {
     if l.face.roles & corpus::PRIMARY != 0 {
         gates.insert(l.face.label, Gate::of(&l.bytes));
@@ -579,6 +610,7 @@ fn reader_lines(l: &Loaded, out: &mut Vec<Line>) {
 }
 
 /// `variation::varied_glyph_raster`'s answer: `(width, height, xmin, ymin,
+/// advance, coverage)`.
 type GlyphRaster = Option<(usize, usize, i32, i32, f32, Vec<u8>)>;
 
 fn glyph_raster(h: &mut Fnv, gid: u16, r: &GlyphRaster) {
@@ -597,6 +629,8 @@ fn glyph_raster(h: &mut Fnv, gid: u16, r: &GlyphRaster) {
 }
 
 /// aterm's own `font::Font` over this face: the cmap it builds, line metrics,
+/// per-glyph metrics, legacy kerning and coverage rasters, plus the run
+/// shaper's GSUB gate.
 fn font_answers(bytes: &Arc<Vec<u8>>, index: u32) -> Vec<(String, String)> {
     let mut out = Vec::new();
     if index == 0 {
@@ -715,6 +749,7 @@ fn font_answers(bytes: &Arc<Vec<u8>>, index: u32) -> Vec<(String, String)> {
 }
 
 /// aterm's `variation` module over a variable face: the axes and `Regular`
+/// instance it probes, and its metrics and coverage rasters at `coords`.
 fn vary_answers(bytes: &[u8], index: u32, coords: &[([u8; 4], f32)]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let Some(p) = variation::probe(bytes, index) else {
@@ -779,6 +814,7 @@ struct Report {
 }
 
 /// Hold `got` to the committed `want` text, leaving out the recorded lines of
+/// the kinds in `elsewhere` (another test replays them).
 fn compare(want: &str, got: &[Line], present: &Present, elsewhere: &[&str]) -> Report {
     let mut report = Report::default();
     let mut recorded: BTreeMap<String, Line> = BTreeMap::new();
@@ -852,7 +888,7 @@ fn blessing() -> bool {
     std::env::var_os("ATERM_BLESS_GOLDEN").is_some()
 }
 
-/// Bless `got` into `{name}.txt`, or hold it to that file. The recorded lines
+/// Bless `got` into `{name}.txt`, or hold it to that file.
 fn finish(name: &str, mut got: Vec<Line>, present: &Present, elsewhere: &[&str]) {
     let path = format!(
         "{}/tests/fixtures/font-oracle/{name}.txt",
@@ -929,6 +965,7 @@ fn answer<'a>(lines: &'a [Line], label: &str, feats: &str, case: &str) -> &'a st
 }
 
 /// The lines of committed faces whose answer at a non-default instance
+/// differs from the same case shaped with no coordinates set.
 fn moved_by_coordinates(lines: &[Line], present: &Present) -> usize {
     let case_of = |l: &Line| {
         format!(
@@ -952,6 +989,10 @@ fn moved_by_coordinates(lines: &[Line], present: &Present) -> usize {
 }
 
 /// What a shaping line's face has, for telling the replay's deltas apart: a
+/// `GPOS` or legacy `kern` table (rustybuzz positions with them), a `morx`
+/// table (rustybuzz shapes the colour face's sequences with it; on macOS
+/// CoreText does), and the nominal glyph of every character the corpus shapes
+/// and of its Bidi_Mirroring_Glyph.
 #[derive(Clone, Default)]
 struct ShapingTraits {
     positions: bool,
@@ -975,6 +1016,7 @@ fn shaping_traits(bytes: &[u8], index: u32, chars: &BTreeSet<char>) -> ShapingTr
 }
 
 /// Every character the corpus's `shape` lines feed the shaper, each with its
+/// Bidi_Mirroring_Glyph, and the space a default ignorable is drawn as.
 fn corpus_chars(corpus_text: &str) -> BTreeSet<char> {
     let mut out = BTreeSet::from([' ']);
     for line in corpus_text
@@ -991,13 +1033,20 @@ fn corpus_chars(corpus_text: &str) -> BTreeSet<char> {
 }
 
 /// The accepted ways aterm-font's shaper differs from a recorded rustybuzz
+/// ("upstream") answer, each told by what the answer holds, not by the case's
+/// name alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum ShapingDelta {
     /// Upstream normalizes before mapping: it decomposes a character the face
+    /// lacks, composes a base and mark the face has precomposed, reorders
+    /// marks by combining class, and gives spaces and U+2011 a fallback glyph.
     Normalization,
     /// Upstream mirrors every mirrorable character of a right-to-left run,
+    /// whatever its bidi level; here the bidi step mirrors by level
+    /// (`brackets_mirror_by_level_not_by_run`).
     Mirroring,
     /// Upstream positions with `GPOS`, `kern` or fallback mark placement; the
+    /// shaper advances by `hmtx` alone.
     Positions,
 }
 
@@ -1012,6 +1061,7 @@ fn ids_and_clusters(answer: &str) -> String {
 }
 
 /// An answer's `(glyph id, cluster)` pairs in logical order: a right-to-left
+/// answer lists its glyphs visually, so it is read backwards.
 fn logical_glyphs(answer: &str) -> Option<Vec<(u32, usize)>> {
     let (head, rest) = answer.split_once('|')?;
     let mut out = Vec::new();
@@ -1028,6 +1078,10 @@ fn logical_glyphs(answer: &str) -> Option<Vec<(u32, usize)>> {
 }
 
 /// The recorded answer as the shaper gives it, without mirroring: in a
+/// right-to-left answer, each glyph upstream drew for a mirrorable character
+/// as its Bidi_Mirroring_Glyph's nominal glyph is swapped back for the
+/// character's own, with the advance the answer records for that glyph (a
+/// bracket pair's advances differ on a proportional face).
 fn unmirrored(line: &Line, traits: &ShapingTraits) -> Option<String> {
     let text = corpus::unescape(&line.input)?;
     let (head, rest) = line.answer.split_once('|')?;
@@ -1059,6 +1113,11 @@ fn unmirrored(line: &Line, traits: &ShapingTraits) -> Option<String> {
 }
 
 /// Whether `now` maps the line's text as written, with no normalization: read
+/// in logical order and cut at its clusters, each cluster holds one glyph per
+/// character, and every character but a mark is drawn with its own nominal
+/// glyph (a default ignorable with the space's, which hides it), so nothing
+/// was decomposed, composed, reordered by combining class or given a
+/// fallback.
 fn unnormalized(line: &Line, now: &str, traits: &ShapingTraits) -> bool {
     let ignorable = |c: char| matches!(c, '\u{AD}' | '\u{200B}'..='\u{200F}' | '\u{2060}');
     let (Some(text), Some(glyphs), Some(recorded)) = (
@@ -1210,6 +1269,7 @@ fn compare_shaping(
 }
 
 /// The shaping replay: every `shape` line, recorded by rustybuzz 0.20.1,
+/// answered by aterm-font's shaper.
 #[test]
 fn shaping_answers_hold() {
     let path = format!(
@@ -1269,6 +1329,10 @@ fn shaping_answers_hold() {
 }
 
 /// Negative control for the delta classes: an advance that moves on a face
+/// with no positioning tables is not a positions delta, nor is a moved id or
+/// direction; a right-to-left answer is a mirroring delta only when it is the
+/// recorded one with every mirrored bracket swapped back; and a normalization
+/// case passes only when each character maps to its own glyph.
 #[test]
 fn a_shaping_delta_is_classified_narrowly() {
     let line = |case: &str, input: &str, answer: &str| Line {
@@ -1366,6 +1430,8 @@ fn a_shaping_delta_is_classified_narrowly() {
 }
 
 /// [`ShapingDelta::Normalization`]: on every `norm.*` and `*.niqqud.logical`
+/// line of a face this host has, the shaper maps each character to its own
+/// glyph ([`unnormalized`]).
 #[test]
 fn normalization_is_not_replayed() {
     let corpus_text = std::fs::read_to_string(format!(

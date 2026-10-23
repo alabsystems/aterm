@@ -92,7 +92,7 @@ pub struct InitialSetupObserved<T> {
 }
 
 impl<T> InitialSetupObserved<T> {
-    pub(in crate::macos_doctor) fn new(
+    pub(in crate::macos_doctor) const fn new(
         result: Result<T, String>,
         observation: Option<InitialSetupObservation>,
     ) -> Self {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-/// The home and per-user state of one test child, never the runner's. The
+/// The home and per-user state of one test child, never the runner's.
 #[cfg(windows)]
 struct PowerShellWorld {
     root: aterm_tempfile::TempDir,
@@ -53,7 +53,7 @@ impl PowerShellWorld {
         vars
     }
 
-    /// The start of every test child's `-Command`. It refuses, before sourcing
+    /// The start of every test child's `-Command`.
     fn home_guard() -> &'static str {
         "if ($HOME -cne $env:ATERM_TEST_HOME) { throw 'private PowerShell home not active' }; \
          $__test_profile = [psobject](Join-Path $HOME 'profile\\CurrentUserCurrentHost.ps1'); \
@@ -72,6 +72,7 @@ impl PowerShellWorld {
 }
 
 /// Plays the profiles a PowerShell runs at startup, in its order, from the files
+/// [`PowerShellWorld::home_guard`] points `$PROFILE` at, where a test wrote them.
 #[cfg(windows)]
 const PLAY_PROFILES: &str = "foreach ($__test_name in 'AllUsersAllHosts', 'AllUsersCurrentHost', \
      'CurrentUserAllHosts', 'CurrentUserCurrentHost') { \
@@ -79,6 +80,9 @@ const PLAY_PROFILES: &str = "foreach ($__test_name in 'AllUsersAllHosts', 'AllUs
      if (Test-Path -LiteralPath $__test_file) { . $__test_file } }; ";
 
 /// The block an earlier aterm setup wrote into a Windows PowerShell 5.1 profile:
+/// the whole `profile.ps1` it was found in on 2026-10-18 (308 bytes, LF line
+/// endings), which kept every 5.1 tab in Emacs mode and out of the key layer
+/// until the layer took it back (`$__aterm_legacy_emacs_block`).
 const LEGACY_EMACS_BLOCK: &str = "\
 # aterm: emacs line-editing so Ctrl+A/Ctrl+E/Ctrl+K/Ctrl+U... move the cursor\n\
 # (Windows PowerShell 5.1's PSReadLine defaults to \"Windows\" mode, where Ctrl+A =\n\
@@ -86,6 +90,8 @@ const LEGACY_EMACS_BLOCK: &str = "\
 if (Get-Module -ListAvailable PSReadLine) { Set-PSReadLineOption -EditMode Emacs }\n";
 
 /// The rows the KEY BINDINGS block binds, in its order: chord, function, and the
+/// stock Windows-mode function it may replace (`""`: the chord is unbound in
+/// Windows mode).
 const READLINE_ROWS: &[(&str, &str, &str)] = &[
     ("Ctrl+a", "BeginningOfLine", "SelectAll"),
     ("Ctrl+e", ACCEPT_THEN_END, ""),
@@ -112,9 +118,12 @@ const READLINE_ROWS: &[(&str, &str, &str)] = &[
 ];
 
 /// The BriefDescription of the `Ctrl+e` script block (`AcceptSuggestion`, then
+/// `EndOfLine`), which `Get-PSReadLineKeyHandler -Bound` lists as its function.
 const ACCEPT_THEN_END: &str = "AcceptSuggestionAndEndOfLine";
 
 /// The Alt+u/l/c functions, which PSReadLine 2.0.0 (Windows PowerShell 5.1)
+/// lacks, as it lacks `BackwardKillInput` (measured 2026-10-16 with
+/// `[Microsoft.PowerShell.PSConsoleReadLine].GetMethod`; 2.4.5 has all four).
 const CASE_WORD_FUNCTIONS: &[&str] = &["UpcaseWord", "DowncaseWord", "CapitalizeWord"];
 
 /// The chords Windows mode keeps: none of them may be a row.
@@ -135,6 +144,7 @@ const WINDOWS_MODE_KEEPS: &[&str] = &[
 ];
 
 /// The script's code without its comment lines, so a needle in a comment cannot
+/// satisfy a pin (SPECS.md §5.7).
 fn powershell_code() -> String {
     scripts::POWERSHELL
         .lines()
@@ -144,6 +154,8 @@ fn powershell_code() -> String {
 }
 
 /// The block's shape, on every host: after the readline shim, every gate, the
+/// `-Bound` read into an ordinal dictionary, the 2.0.0 fallbacks, and exactly the
+/// rows above.
 #[test]
 fn test_powershell_layers_readline_chords_over_windows_mode() {
     let code = powershell_code();
@@ -319,6 +331,7 @@ struct Bound {
     /// `Get-PSReadLineKeyHandler -Bound`, in its order: `(Key, Function)`.
     keys: Vec<(String, String)>,
     /// Which of `BackwardKillInput`, the [`CASE_WORD_FUNCTIONS`] and
+    /// `AcceptSuggestion` this PSReadLine has.
     has: std::collections::BTreeSet<String>,
     /// `(Get-PSReadLineOption).EditMode`.
     mode: String,
@@ -361,6 +374,7 @@ const LIST_BOUND: &str = "$l = @('version=' + (Get-Module PSReadLine).Version); 
      [Console]::Write($l -join [char]10)";
 
 /// Run `exe` with PSReadLine imported and then `prelude` (the user's profile), the
+/// integration as `how` says, and `env`; return what PSReadLine has bound.
 #[cfg(windows)]
 fn bound_after(exe: &Path, prelude: &str, how: Pwsh, env: &[(&str, &str)]) -> Bound {
     bound_after_in(&PowerShellWorld::new(), exe, prelude, how, env)
@@ -413,6 +427,8 @@ fn bound_after_in(
 }
 
 /// The rows a PSReadLine with `has` binds: `Ctrl+u` and `Ctrl+e` take their 2.0.0
+/// fallbacks, and every other row binds, the [`CASE_WORD_FUNCTIONS`] as the
+/// layer's script blocks of the same name where PSReadLine lacks them.
 #[cfg(windows)]
 fn expected_layer(
     has: &std::collections::BTreeSet<String>,
@@ -432,6 +448,7 @@ fn expected_layer(
 }
 
 /// pwsh 7 for the live tests: `$ATERM_TEST_PWSH`, else the first `pwsh.exe` on
+/// PATH.
 #[cfg(windows)]
 fn pwsh_exe() -> Option<PathBuf> {
     if let Some(explicit) = std::env::var_os("ATERM_TEST_PWSH") {
@@ -449,6 +466,7 @@ fn pwsh_exe() -> Option<PathBuf> {
 }
 
 /// Run `check` on Windows PowerShell 5.1, which every supported Windows has, and
+/// on pwsh 7 where it resolves.
 #[cfg(windows)]
 fn on_each_powershell(test: &str, mut check: impl FnMut(&Path)) {
     check(Path::new("powershell.exe"));
@@ -462,6 +480,7 @@ fn on_each_powershell(test: &str, mut check: impl FnMut(&Path)) {
 }
 
 /// In an aterm tab every row is bound and nothing else moves: the whole `-Bound`
+/// list is the stock one with the rows laid over it.
 #[cfg(windows)]
 #[test]
 fn test_powershell_binds_the_readline_chords_in_an_aterm_tab() {
@@ -518,6 +537,8 @@ fn test_powershell_binds_the_readline_chords_in_an_aterm_tab() {
 }
 
 /// A chord the profile bound (it runs before the integration) keeps the user's
+/// function, whether it was unbound in stock Windows mode (`Ctrl+e`), held a stock
+/// function the layer would replace (`Ctrl+y`), or is a script block (`Alt+b`).
 #[cfg(windows)]
 #[test]
 fn test_powershell_readline_layer_keeps_a_profiles_own_bindings() {
@@ -568,6 +589,9 @@ fn test_powershell_readline_layer_leaves_emacs_and_vi_alone() {
 }
 
 /// The Emacs mode of aterm's own legacy block is taken back: in an aterm tab whose
+/// profile holds [`LEGACY_EMACS_BLOCK`], as found or saved with CRLF and trailing
+/// blanks among other lines, the shell gets stock Windows mode plus exactly the
+/// rows, as a tab with no profile does.
 #[cfg(windows)]
 #[test]
 fn test_powershell_readline_layer_takes_back_atermss_legacy_emacs_block() {
@@ -620,6 +644,10 @@ fn test_powershell_readline_layer_takes_back_atermss_legacy_emacs_block() {
 }
 
 /// An Emacs mode the user chose stays exactly as the profile left it, block or no
+/// block: the user's own line, the block beside a comment naming EditMode (the
+/// documented way to keep Emacs with the block in place) or edited, the block with
+/// a key binding the switch to Windows mode would reset, in the profile text or
+/// bound as a script block by a module, the opt-out, and a shell outside aterm.
 #[cfg(windows)]
 #[test]
 fn test_powershell_readline_layer_keeps_an_emacs_the_user_chose() {
@@ -713,6 +741,7 @@ fn test_powershell_readline_layer_keeps_an_emacs_the_user_chose() {
 }
 
 /// `ATERM_DISABLE_READLINE_KEYS` keeps stock Windows mode in an aterm tab, and a
+/// shell outside aterm that sources the script keeps it too.
 #[cfg(windows)]
 #[test]
 fn test_powershell_readline_layer_honours_the_opt_out_and_stays_out_of_other_terminals() {
@@ -748,6 +777,9 @@ const PRESS_SEEDS: &[&str] = &[
 ];
 
 /// Each line typed after the seeds, as the bytes aterm writes (Ctrl+E is 0x05, Left
+/// `CSI D`), Enter not included, and the line history holds after Enter: where
+/// PSReadLine has `AcceptSuggestion` (pwsh 7's 2.4.5, predictions on), and where it
+/// does not (5.1's 2.0.0, where Ctrl+E is EndOfLine).
 #[cfg(windows)]
 const PRESSES: &[(&str, &str, &str)] = &[
     ("#S1 acc\x05X", "#S1 accept me fullyX", "#S1 accX"),
@@ -770,6 +802,7 @@ const PRESSES: &[(&str, &str, &str)] = &[
 ];
 
 /// A PowerShell at a real prompt in a ConPTY from aterm-pty, with a reader thread
+/// passing on what the console draws.
 #[cfg(windows)]
 struct ConptyShell {
     master: i32,
@@ -781,7 +814,7 @@ struct ConptyShell {
     _git_bash: Option<std::sync::MutexGuard<'static, ()>>,
 }
 
-/// Every Git Bash a test runs, one at a time. MSYS2's `/tmp` is the TEMP of the
+/// Every Git Bash a test runs, one at a time.
 #[cfg(windows)]
 static GIT_BASH: Mutex<()> = Mutex::new(());
 
@@ -903,6 +936,10 @@ impl Drop for ConptyShell {
 }
 
 /// Ctrl+E pressed at a real prompt in an aterm tab: with the caret at the end of the
+/// line it accepts the inline suggestion where PSReadLine has `AcceptSuggestion`;
+/// from inside the line the first press moves to the end and the second accepts, so
+/// Ctrl+E then Enter runs what was typed; with no suggestion, and on 5.1's PSReadLine
+/// 2.0.0, it is EndOfLine.
 #[cfg(windows)]
 #[test]
 fn test_powershell_ctrl_e_accepts_a_suggestion_only_at_the_end_of_the_line() {
@@ -1024,6 +1061,8 @@ fn test_powershell_ctrl_e_accepts_a_suggestion_only_at_the_end_of_the_line() {
 }
 
 /// Each line typed at a real prompt for the Alt+U/L/C test, as the bytes aterm
+/// writes (Home `CSI H`, Right `CSI C`, Alt+u `ESC u`), Enter not included, and
+/// the line history holds after Enter.
 #[cfg(windows)]
 const CASE_PRESSES: &[(&str, &str)] = &[
     (
@@ -1046,6 +1085,9 @@ const CASE_PRESSES: &[(&str, &str)] = &[
 ];
 
 /// Alt+U/L/C pressed at a real prompt in an aterm tab case the word from the caret,
+/// as readline's do, on every PSReadLine: 2.4.5's own UpcaseWord, DowncaseWord and
+/// CapitalizeWord, and the layer's script blocks on 5.1's 2.0.0, where Windows mode
+/// typed a bare u, l or c (`# uXalpha beta gamma`, measured 2026-10-18).
 #[cfg(windows)]
 #[test]
 fn test_powershell_alt_u_l_c_case_the_word_on_every_psreadline() {
@@ -1144,7 +1186,7 @@ fn test_powershell_alt_u_l_c_case_the_word_on_every_psreadline() {
     });
 }
 
-/// Exercise the actual hook loader against two owned homes. Even an explicit
+/// Exercise the actual hook loader against two owned homes.
 #[cfg(windows)]
 #[test]
 fn test_powershell_children_source_only_their_exclusive_home_hooks() {

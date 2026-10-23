@@ -145,7 +145,7 @@ pub enum Sight {
     Sighted(Holder),
 }
 
-/// A missing holder is proven only by an unlocked file. A refused query
+/// A missing holder is proven only by an unlocked file.
 #[cfg(any(target_os = "macos", test))]
 fn lock_checked(sight: Sight, lock: Option<bool>) -> Sight {
     match (lock, sight) {
@@ -317,6 +317,9 @@ fn judged(
 }
 
 /// How many of the free slots' gone writers' builds run on (module docs):
+/// the newest record first, each counted while the 5-minute load exceeds what
+/// the held slots and the orphans counted so far, this one included, explain
+/// (`load5 > (held + k) * ncpu / n`).
 fn discounted(
     mut candidates: Vec<&Record>,
     counts: SlotCounts,
@@ -470,6 +473,7 @@ mod live {
     use crate::kproc;
 
     /// One slot's read: kept, vanished between the listing and the read, or
+    /// refused to this user.
     enum Got {
         Slot(SlotObs),
         Vanished,
@@ -525,6 +529,7 @@ mod live {
     }
 
     /// The file's identity as the kernel's vnode answer spells it: `vst_dev`
+    /// is a 32-bit `dev_t`, which std widens with its sign.
     fn identity(meta: &std::fs::Metadata) -> (u32, u64) {
         (meta.dev() as u32, meta.ino())
     }

@@ -76,6 +76,8 @@ pub struct ActiveEventLoop {
 }
 
 /// LOCAL PATCH (aterm), 2026-09-26: the AppKit loop's delegate, or the
+/// display-free loop's state (`headless.rs`), whose arms below answer without
+/// AppKit or CoreGraphics' display services (a WindowServer connection).
 #[derive(Debug)]
 enum Backend {
     AppKit(aterm_objc::Retained<ApplicationDelegate>),
@@ -103,7 +105,7 @@ impl ActiveEventLoop {
         }
     }
 
-    pub(super) fn headless_state(&self) -> Option<&super::headless::LoopState> {
+    pub(super) const fn headless_state(&self) -> Option<&super::headless::LoopState> {
         match &self.backend {
             Backend::AppKit(_) => None,
             Backend::Headless(state) => Some(state),
@@ -212,7 +214,7 @@ impl<T> EventLoop<T> {
         AppKitEventLoop::new(attributes).map(Self::AppKit)
     }
 
-    pub fn window_target(&self) -> &RootWindowTarget {
+    pub const fn window_target(&self) -> &RootWindowTarget {
         match self {
             Self::AppKit(el) => el.window_target(),
             Self::Headless(el) => el.window_target(),
@@ -328,7 +330,7 @@ impl<T> AppKitEventLoop<T> {
         })
     }
 
-    fn window_target(&self) -> &RootWindowTarget {
+    const fn window_target(&self) -> &RootWindowTarget {
         &self.window_target
     }
 
@@ -482,6 +484,7 @@ pub struct EventLoopProxy<T> {
     sender: wake_queue::Sender<T>,
     source: CFRunLoopSourceRef,
     /// LOCAL PATCH (aterm): `source` is a display-free loop's shared wake
+    /// source, held by a retain ([`Self::sharing`]).
     shared: bool,
 }
 
@@ -526,7 +529,7 @@ impl<T> EventLoopProxy<T> {
 
     fn new(sender: wake_queue::Sender<T>) -> Self {
         unsafe {
-            extern "C" fn event_loop_proxy_handler(_: *mut c_void) {}
+            const extern "C" fn event_loop_proxy_handler(_: *mut c_void) {}
 
             let rl = CFRunLoopGetMain();
             let mut context = CFRunLoopSourceContext {
@@ -563,6 +566,9 @@ impl<T> EventLoopProxy<T> {
 }
 
 /// `+[NSApplication sharedApplication]`, the process-lifetime singleton — the
+/// same helper `app_state.rs` and `window_delegate.rs` carry, for the same
+/// reason: the marker objc2's binding demanded is objc2's requirement, not
+/// AppKit's, and every call site here still holds a witness.
 fn app() -> Id {
     // SAFETY: `+sharedApplication` (`@16#0:8`) returns the `NSApplication` singleton.
     unsafe { send_id(class(c"NSApplication").as_id(), sel!(sharedApplication)) }

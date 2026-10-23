@@ -55,7 +55,7 @@ struct Changes {
 }
 
 /// Never reuse an exported object incarnation after removal or owner replacement.
-fn fresh_incarnation(next: &mut u64) -> u64 {
+const fn fresh_incarnation(next: &mut u64) -> u64 {
     *next = next
         .checked_add(1)
         .expect("accessibility object incarnation exhausted");

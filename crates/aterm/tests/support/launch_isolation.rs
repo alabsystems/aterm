@@ -1,16 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Private host state for tests that launch the real window or session entry.
-//!
-//! Isolation is a scratch home and a scratch config, never an environment veto (the update
-//! system has no user-facing environment knobs): `$HOME` is private, so the package prefix,
-//! its reroute stubs and the `Updates/` ledger all live under it, and
-//! `$XDG_CONFIG_HOME/aterm/aterm.toml` switches every automatic lane off ([`CONFIG_OFF`]).
-//! The reroute's escape is the `--no-reroute` flag ([`NO_REROUTE`]), which a caller adds to
-//! its window/session argv before any `-e`/`--` payload, and a window's private socket is
-//! the `--control-sock` flag ([`control_sock`]): no environment variable selects a socket,
-//! the grid or headless mode.
+//! Private host state for launch tests ([`CONFIG_OFF`], [`NO_REROUTE`], [`control_sock`]).
+
 #![allow(
     clippy::disallowed_types,
     reason = "test code: a stand-in child may inherit descriptors"
@@ -19,15 +11,11 @@
 use std::path::Path;
 use std::process::Command;
 
-/// The flag that starts a window or session with the upstream Rust names restored: nothing
-/// laid under the scratch prefix, no launchd lane. A caller that does not study the reroute
-/// adds it.
+/// The flag that starts a window or session with the upstream Rust names restored.
 #[allow(dead_code)]
 pub const NO_REROUTE: &str = "--no-reroute";
 
-/// The window flag that binds its control socket at `<root>/run/aterm/aterm.sock`, the one
-/// path every window test dials (its token is `aterm.sock.token`). The session takes no
-/// socket.
+/// The window flag that binds its control socket at `<root>/run/aterm/aterm.sock`.
 #[allow(dead_code)]
 pub fn control_sock(root: &Path) -> [std::ffi::OsString; 2] {
     [
@@ -36,15 +24,10 @@ pub fn control_sock(root: &Path) -> [std::ffi::OsString; 2] {
     ]
 }
 
-/// `sockaddr_un.sun_path` is ~104 bytes on macOS/BSD; a socket path at or over
-/// this is refused before it can fail deep in `bind` or `connect`.
+/// `sockaddr_un.sun_path` is ~104 bytes on macOS/BSD.
 const MAX_SOCK_PATH: usize = 100;
 
-/// Whether a unix socket at `sock` fits `sun_path` as a client dials it: on its
-/// CANONICAL spelling, which a client that resolves the path dials (`/var` and
-/// `/tmp` are links into `/private` on macOS, eight bytes longer than either
-/// spelling a test boots with). The longest ancestor that exists is resolved
-/// and the rest rejoined, so a world can be measured before it is made.
+/// Whether a unix socket at `sock` fits `sun_path` as a client dials it.
 #[allow(dead_code)]
 pub fn sock_fits(sock: &Path) -> bool {
     let mut base = sock;
@@ -63,35 +46,20 @@ pub fn sock_fits(sock: &Path) -> bool {
     dialled.as_os_str().len() < MAX_SOCK_PATH
 }
 
-/// The automatic lanes, switched off the way Settings switches them off: `[update]
-/// enabled = false` (Check for updates automatically) with `auto_apply = false`,
-/// `[packages] enabled = false` (Automatic updates), the `[machine]` settings left
-/// alone, and the window's agent supervisor off ([`HARNESS_OFF`]).
+/// Config disabling automatic update, package, and agent supervisor lanes ([`HARNESS_OFF`]).
 pub const CONFIG_OFF: &str = "[update]\nenabled = false\nauto_apply = false\n\
                               [packages]\nenabled = false\n\
                               [machine]\nuniversal_control = \"leave\"\n\
                               [harness]\nenabled = false\n";
 
-/// [`CONFIG_OFF`]'s last table: Settings ▸ Agents off. The window supervises every
-/// agent session it hosts by default, a headless instance's included (owner,
-/// 2026-09-24), so a test that drives a fake `claude` would otherwise share the
-/// session with it. A test OF that supervisor takes this table out and writes its own.
+/// [`CONFIG_OFF`]'s last table: Settings ▸ Agents off.
 #[allow(dead_code)]
 pub const HARNESS_OFF: &str = "[harness]\nenabled = false\n";
 
-/// Arm `cmd`, a `--headless` launch, with a lifeline (`aterm_uds::lifeline`): the instance
-/// shuts down when this test process goes, however it goes. A `Drop` that kills the child
-/// runs on a panic, but not when the runner is SIGKILLed, a `timeout` fires or a person
-/// presses Ctrl-C twice, and an instance left behind would run for days holding a shell.
-/// Call it after `.stdin(..)` and before any `-e` payload, and keep the value alive as long
-/// as the instance should run (the booted instance holds it).
+/// Arm `cmd`, a `--headless` launch, with a lifeline (`aterm_uds::lifeline`).
 ///
 /// # Panics
-/// The lifeline's FIFO could not be made in `root`: a scratch world this test cannot write
-/// to is a broken fixture, not a reason to boot an unwatched instance.
-///
-/// Unix only, like `aterm_uds::lifeline`: this file is also included by a Windows
-/// test twin (`protected_spawn.rs`), and `verify cells` compiles it there.
+/// The lifeline's FIFO could not be created in `root`.
 #[cfg(unix)]
 #[allow(dead_code)]
 pub fn lifeline(cmd: &mut Command, root: &Path) -> aterm_uds::lifeline::Lifeline {
@@ -99,22 +67,14 @@ pub fn lifeline(cmd: &mut Command, root: &Path) -> aterm_uds::lifeline::Lifeline
         .unwrap_or_else(|e| panic!("arm the instance's lifeline in {}: {e}", root.display()))
 }
 
-/// Whether the control socket at `sock` is listening: a connect the kernel takes into the
-/// backlog, dropped at once (the server's own `control_auth::socket_is_live` probe). The
-/// socket file is not that signal: `bind(2)` creates it before `listen(2)`, and a client
-/// that dials in between is refused (`ECONNREFUSED`).
+/// Whether the control socket at `sock` is listening.
 #[cfg(unix)]
 #[allow(dead_code)]
 pub fn control_listening(sock: impl AsRef<Path>) -> bool {
     std::os::unix::net::UnixStream::connect(sock).is_ok()
 }
 
-/// A fresh private root for one launch, [`prepare`]d, and removed when the
-/// returned guard drops — the caller holds it until the launch has exited.
-/// Named `<label>-<unique>`, under `/tmp` on unix rather than `$TMPDIR`: a
-/// root holds a control socket (`run/aterm/aterm.sock`, [`control_sock`]), and a
-/// unix-socket path must fit in 104 bytes, which macOS's per-user temp dir (49
-/// of them) plus a unique name can exceed.
+/// A fresh private root for one launch ([`prepare`], [`control_sock`]), removed on drop.
 ///
 /// # Panics
 /// The root could not be created or prepared: a broken fixture.
@@ -132,31 +92,7 @@ pub fn scratch_root(label: &str) -> aterm_tempfile::TempDir {
     root
 }
 
-/// THE TAB'S LOGIN SHELL KEEPS THE PATH ITS INSTANCE WAS BOOTED WITH: `path`,
-/// said again by the login profiles of `root`'s scratch home.
-///
-/// A tab runs an ordinary login shell, and a login shell runs the system's
-/// profile before the person's. On macOS that profile (`/etc/zprofile` for zsh,
-/// `/etc/profile` for bash and sh) runs `path_helper`, which puts every
-/// `/etc/paths` and `/etc/paths.d` entry — `/opt/homebrew/bin` among them — IN
-/// FRONT of the PATH the shell was handed. A test that booted its instance with a
-/// stand-in's folder first found the machine's own program instead: measured
-/// 2026-10-18, the worker tests' `claude` was Homebrew's Claude Code 2.1.153,
-/// started under the scratch HOME — whose login is in the keychain, which no HOME
-/// scopes.
-///
-/// So `path` is said again where each login shell reads the person's profile,
-/// after the system's: `~/.zprofile` (zsh, after `/etc/zprofile`) and `~/.profile`
-/// (sh, and bash where neither `~/.bash_profile` nor `~/.bash_login` stands: aterm's
-/// macOS bash loader reads the first of the three after `/etc/profile`, as a login
-/// bash does). The pin opens the file: a profile the test wrote itself keeps its
-/// text after it, so what that text does to PATH still has the last word, and a
-/// `~/.bash_profile` or `~/.bash_login` it wrote gets the pin at its head too.
-///
-/// The pin is `path` exactly: the directories aterm's spawn adds around the
-/// launch PATH for its sessions (the scratch prefix's `agents/` in front, its
-/// `bin/` behind) are left off with the system's, so a tab finds a program where
-/// the test put one and nowhere the machine does.
+/// Pin `path` in the login shell profiles under `root`'s scratch home.
 ///
 /// # Errors
 /// A profile could not be read or written.
@@ -229,34 +165,25 @@ mod aterm_under_test;
 pub use aterm_under_test::aterm_executable;
 
 pub fn apply(cmd: &mut Command, root: &Path) {
-    // Isolated from this process's descriptors too, before any hook a caller adds: the
-    // launch holds its stdio (the lifeline on stdin) and nothing else. On a std without
-    // Trust's SP-1 strip, a child keeps any descriptor another test thread had open unflagged
-    // at the spawn (a pipe between its `pipe()` and its `F_SETFD`), for as long as its test runs.
     {
         use aterm_uds::spawnfd::InheritNothing as _;
         cmd.inherit_nothing();
     }
-    // The aterm under test is a fresh build whose first exec can wait out the
-    // system's code-policy check for over a minute: run that file once,
-    // unclocked, before the caller's clock starts (`aterm_spec::wait::first_exec`).
     let aterm = aterm_executable();
     if Path::new(cmd.get_program()) == aterm {
         aterm_spec::wait::first_exec(&aterm, &["--help"]);
     }
-    // Remove both inherited context and explicit command overrides before
-    // assigning this fixture's authority. Callers may then add the one setting
-    // they are testing (for example the containment mode or @self session id).
     let names: std::collections::BTreeSet<_> = std::env::vars_os()
         .map(|(name, _)| name)
         .chain(cmd.get_envs().map(|(name, _)| name.to_owned()))
         .collect();
     for name in names {
         let text = name.to_string_lossy();
-        // `__ATERM_` covers the internal protocol markers (the reroute passthrough), whose
-        // leading underscores say "not a user knob" and would otherwise slip the filter.
-        if text.starts_with("ATERM_") || text.starts_with("ATPKG_") || text.starts_with("__ATERM_")
-        {
+        // The verify run's mark is no authority and stays (`aterm_uds::process::VERIFY_RUN_VAR`).
+        let stripped = text.starts_with("ATERM_")
+            || text.starts_with("ATPKG_")
+            || text.starts_with("__ATERM_");
+        if stripped && text != aterm_uds::process::VERIFY_RUN_VAR {
             cmd.env_remove(name);
         }
     }
@@ -270,16 +197,10 @@ pub fn apply(cmd: &mut Command, root: &Path) {
         .env("XDG_CACHE_HOME", root.join("cache"))
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_STATE_HOME", root.join("state"))
-        // Control-socket discovery falls back to `$TMPDIR` after `$XDG_RUNTIME_DIR`
-        // (macOS's per-user runtime dir): a live aterm's socket must not be findable.
         .env("TMPDIR", root.join("tmp"))
-        // A development seam (these are debug builds): nothing to log.
         .env("ATERM_LOG", "off");
     #[cfg(unix)]
     cmd.env("SHELL", "/bin/sh");
-    // Windows reads the home, the package prefix and the fallback config from
-    // these instead (`aterm_types::dirs`, `atpkg::config::config_path` — though
-    // `XDG_CONFIG_HOME` above still wins for the config).
     #[cfg(windows)]
     cmd.env("USERPROFILE", root.join("home"))
         .env("LOCALAPPDATA", root.join("local"))

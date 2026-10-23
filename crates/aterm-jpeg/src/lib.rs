@@ -114,7 +114,7 @@ struct Decoder<'a> {
 }
 
 impl<'a> Decoder<'a> {
-    fn new(data: &'a [u8], max_dimension: usize) -> Option<Self> {
+    const fn new(data: &'a [u8], max_dimension: usize) -> Option<Self> {
         if !sniff(data) {
             return None;
         }

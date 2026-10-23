@@ -208,6 +208,11 @@ pub fn prepare_resident_pet_tick(
 }
 
 /// How loudly this frame's verdict lands on the pet, for both sync sites:
+///   * a non-program rung (favourite, launch) is always Quiet;
+///   * a program rung carries `authorised`, the tenure gate's ruling;
+///   * a Ceremony is demoted to Quiet when the incoming coat is within
+///     [`crate::kitty_registry::SUFFICIENT_DIFFERENCE`] of the coat on glass: a
+///     ceremony nobody can see is noise.
 #[must_use]
 #[inline]
 pub const fn pet_arrival_for_sync(
@@ -513,24 +518,30 @@ pub struct PetGlass {
     pub rows: u16,
 }
 
-/// The pet's per-session latches. Every key carries the session, so a tab or
+/// The pet's per-session latches.
 #[derive(Clone, Copy, Debug, Default)]
 struct Latches {
     /// `(session, completed_command_seq)`: the once-per-completion latch.
     cmd_seq: Option<(u64, u64)>,
     /// `(session, content_seq)`: the perk-and-watch burst latch, so a frame
+    /// can tell "the pane wrote" from "the pane repainted".
     content_seq: Option<(u64, u64)>,
     /// `(session, wrap_serial)`: the wrap-fact latch, compared with `!=` (see
+    /// [`wrap_fact_edge`]).
     wrap_serial: Option<(u64, u64)>,
     /// `((session, alt_screen), grid, (caret, painted))` as of the last present
+    /// the program had finished: what a torn frame's hidden write cursor is
+    /// read as.
     finished_caret: Option<FinishedCaret>,
     /// `((session, alt_screen), Terminal::sync_end_seq)` as the last present
+    /// read them: a frame whose count has moved on was closed in the stream.
     brackets: Option<((u64, bool), u64)>,
     /// A hidden cursor's move, not yet taken ([`HIDDEN_REST`]).
     hidden_rest: Option<HiddenRest>,
 }
 
 /// [`Latches::finished_caret`]: the caret reading of the last finished present
+/// on one surface's grid.
 #[derive(Clone, Copy, Debug)]
 struct FinishedCaret {
     surface: (u64, bool),
@@ -539,9 +550,11 @@ struct FinishedCaret {
 }
 
 /// A program that does not bracket its frames moves its hidden cursor through
+/// every repaint (the spinner's row, the status line) and back to the caret.
 const HIDDEN_REST: std::time::Duration = std::time::Duration::from_millis(30);
 
 /// [`Latches::hidden_rest`]: the caret taken, and the cell the hidden cursor
+/// has stood at since when, on one surface's grid.
 #[derive(Clone, Copy, Debug)]
 struct HiddenRest {
     surface: (u64, bool),
@@ -566,37 +579,48 @@ pub struct CompanionOwner {
     latches: Latches,
     pointer_px: Option<(f32, f32)>,
     /// This frame's drawn body in frame px, cleared whenever the pet is not drawn
+    /// so a stale rect can never eat a click.
     hit_rect: Option<(i32, i32, i32, i32)>,
     /// The alpha the last tick put on glass (`0` = nothing).
     last_alpha: u8,
     /// The last tick's base presentation gate: the word-cat bat reaches only a
+    /// pet that could be seen.
     last_visible: bool,
-    /// The resolved posture of the last frame. Static presentation does not
+    /// The resolved posture of the last frame.
     last_static: bool,
     /// The last tick under the load-shed latch: no offer lands sooner than
+    /// [`RESIDENT_SHED_CADENCE`] after it.
     last_shed_tick: Option<Instant>,
     /// The grid the last `prepare` resolved against — what `emit` bakes with.
     geom: EffectGeom,
     /// The pair and mapped arrival the last `emit` synced, for
+    /// [`Self::commit_hello_due`].
     last_sync: Option<((u8, u8), PetArrival)>,
     /// The pixel frame (pane origin and cell metrics) the last tick drew the
+    /// resident in; `None` when it put nothing on glass.
     drawn_frame: Option<PixelFrame>,
-    /// The pixel frame a pending re-sighting ghost was drawn in. The ghost stands
+    /// The pixel frame a pending re-sighting ghost was drawn in.
     resight_frame: Option<PixelFrame>,
     /// The pixel frame of each pane a ghost still fades on beside the focused
+    /// surface.
     own_glass: [Option<OwnGlass>; OWN_GLASS_MAX],
     /// The last own-glass key handed out (`OwnGlass::key`); never `0`.
     glass_key: u32,
     /// This frame's host vouched that the pending ghost's glass is on glass as
+    /// drawn.
     resight_offered: bool,
     /// `(session, serial)`: the task end this pet last cheered
+    /// ([`SessionRoom::landed`]), so a serial handed again (the host's mark
+    /// not yet read back) latches nothing.
     landed_taken: Option<(u64, u32)>,
 }
 
 /// At most this many own glasses at once ([`CompanionOwner::own_glass`]):
+/// one per ghost the lane can hold, plus the one a boundary displaces.
 const OWN_GLASS_MAX: usize = PET_DEPARTURES_MAX + 1;
 
 /// A ghost's own glass: the key its ghosts carry (`PetDepartureSprite::glass`)
+/// and the pixel frame they were drawn in.
 #[derive(Clone, Copy, Debug)]
 struct OwnGlass {
     key: u32,
@@ -606,6 +630,7 @@ struct OwnGlass {
 }
 
 /// Where a resident's cells land: grid origin in frame px, cell metrics, and the
+/// surface's place on glass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PixelFrame {
     origin: (i32, i32),
@@ -750,6 +775,11 @@ impl CompanionOwner {
     }
 
     /// The caret of a finished frame, as the companions take it: the cursor
+    /// itself, except a hidden one that moved with no bracket closing
+    /// (`bracketed` false: no newly closed frame ended at that cell), which
+    /// is taken at a new cell only once it has
+    /// rested there [`HIDDEN_REST`] ([`Latches::hidden_rest`]); until then
+    /// the caret taken before stands.
     #[inline]
     fn rested_caret(
         &mut self,
@@ -967,6 +997,8 @@ impl CompanionOwner {
     }
 
     /// THE KITTY CHEERS THE LANDING, WHEN YOU ARE THERE TO SEE IT
+    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.3): the room names
+    /// a task end no pet has cheered (`landed`, its serial).
     #[inline]
     fn take_landed(
         &mut self,
@@ -1723,6 +1755,7 @@ mod law_tests {
     }
 
     /// First sight and session switches baseline silently; a same-session change
+    /// is exactly one wrap, backward too (`!=`, not `>`).
     #[test]
     fn same_session_change_is_a_wrap_and_a_session_switch_never_is() {
         let mut seen = None;
@@ -1757,6 +1790,7 @@ mod law_tests {
     }
 
     /// Content movement alone is never a burst: the shell must be executing, the
+    /// viewport live, and the pane on the main screen.
     #[test]
     fn typing_echo_never_reads_as_a_burst() {
         assert!(!pet_output_burst(false, true, false, true, false));
@@ -1783,6 +1817,7 @@ mod law_tests {
     }
 
     /// A pet-mode summon exits plain whatever flourish was rolled; outside pet
+    /// mode the roll is untouched.
     #[test]
     fn pet_mode_summons_exit_plain() {
         let frame = |exit| CatFrame {
@@ -1808,6 +1843,8 @@ mod law_tests {
     }
 
     /// Non-program rungs are quiet whatever the gate ruled, a program rung carries
+    /// the gate's ruling, an undressed pet keeps its ceremony, and a near-identical
+    /// coat is demoted.
     #[test]
     fn the_arrival_mapping_rations_the_theater_by_rung_and_difference() {
         use crate::kitty_registry::{SUFFICIENT_DIFFERENCE, coat_distance};
@@ -1897,6 +1934,7 @@ mod owner_tests {
     }
 
     /// One owned, focused, unobscured pet-mode frame's facts; a test shapes
+    /// only the field it changes (`PetFacts { focused: false, ..pet_facts(..) }`).
     fn pet_facts<'a>(facts: &'a TerminalFacts, host: &'a HostFrameInput) -> PetFacts<'a> {
         PetFacts {
             facts,
@@ -1960,6 +1998,7 @@ mod owner_tests {
     }
 
     /// An unfocused surface feeds `caret: None` and the resident releases the
+    /// lane.
     #[test]
     fn the_brain_ticks_even_when_undrawable_so_the_lane_is_released() {
         let mut decos = WordDecorations::default();
@@ -2000,6 +2039,7 @@ mod owner_tests {
     }
 
     /// A press inside the drawn body (plus slop) latches a pet and is consumed;
+    /// outside passes.
     #[test]
     fn a_press_inside_the_body_plus_slop_pets_and_outside_passes() {
         let mut decos = WordDecorations::default();
@@ -2121,6 +2161,7 @@ mod owner_tests {
     }
 
     /// Wandering over the grid builds attention and re-arms the lane; off the grid
+    /// the pointer does not exist for the pet.
     #[test]
     fn a_pointer_over_the_grid_is_sensed_and_one_off_the_grid_is_not() {
         let mut decos = WordDecorations::default();
@@ -2153,6 +2194,7 @@ mod owner_tests {
     }
 
     /// A windowless still is at full opacity on its first frame, where a live
+    /// present's first tick starts a fade-in.
     #[test]
     fn a_static_capture_materialises_the_first_still() {
         let mut decos = WordDecorations::default();
@@ -2174,6 +2216,7 @@ mod owner_tests {
     }
 
     /// The emitter draws one body in the brain's latched pair with a non-zero
+    /// fingerprint; a favourite parks a differing pair, and never commits a hello.
     #[test]
     fn emit_draws_one_body_wearing_the_latched_pair_and_syncs_the_verdict() {
         let mut decos = WordDecorations::default();
@@ -2254,6 +2297,8 @@ mod owner_tests {
     }
 
     /// A program ceremony for a different enough coat commits on a drawn present,
+    /// never on a capture nor an emit that put nothing on glass, and a re-sync
+    /// under Quiet cannot commit again.
     #[test]
     fn the_hello_seam_commits_only_a_performed_ceremony_on_a_present() {
         use crate::kitty_registry::{SUFFICIENT_DIFFERENCE, coat_distance};
@@ -2337,6 +2382,7 @@ mod owner_tests {
     }
 
     /// On an unfinished frame a hidden caret is the write position: the sense
+    /// carries the last finished present's caret and paint, and the wrap waits.
     #[test]
     fn a_torn_frames_hidden_cursor_reads_as_the_last_finished_caret() {
         let mut decos = WordDecorations::default();
@@ -2397,6 +2443,10 @@ mod owner_tests {
     }
 
     /// The escort caret is the pet's caret reading for whichever companion the
+    /// glass has, the flying head (no pet owned, so the sense carries none)
+    /// included: a torn frame's hidden cursor reads as the last finished
+    /// present's caret, a finished frame's hidden caret is itself, and a torn
+    /// frame with no finished caret of its session reads none.
     #[test]
     fn the_escort_caret_is_the_finished_caret_for_every_companion() {
         for pet_mode in [true, false] {
@@ -2441,6 +2491,7 @@ mod owner_tests {
     }
 
     /// A program that never brackets its frames moves its hidden cursor through
+    /// a repaint and back.
     #[test]
     fn an_unbracketed_repaint_s_write_position_is_no_caret() {
         let mut decos = WordDecorations::default();
@@ -2632,6 +2683,7 @@ mod owner_tests {
     }
 
     /// The finished caret is a cell of the grid it was read on: a torn frame
+    /// after a resize reads none rather than the old grid's cell.
     #[test]
     fn a_torn_frame_after_a_resize_reads_no_old_caret() {
         let mut decos = WordDecorations::default();
@@ -2662,6 +2714,7 @@ mod owner_tests {
     }
 
     /// A capture reads and spends none of the present-owned diffs (completion,
+    /// burst, wrap) and sees no pointer, so the next present finds every edge.
     #[test]
     fn a_capture_spends_no_present_latch() {
         for capture in [CaptureMode::LiveCapture, CaptureMode::StaticCapture] {
@@ -2709,6 +2762,7 @@ mod owner_tests {
     }
 
     /// The completion edge comes back once per completion in the pet's session,
+    /// never on first sighting or a session switch.
     #[test]
     fn the_completion_edge_is_handed_back_once_and_never_on_a_session_switch() {
         let mut decos = WordDecorations::default();
@@ -2750,6 +2804,8 @@ mod owner_tests {
     }
 
     /// One present in session 1 whose room names the task end `landed`
+    /// (`SessionRoom::landed`), with the frame's fields shaped by `shape`; the
+    /// end handed back, and the frame drawn.
     fn landed_frame(
         owner: &mut CompanionOwner,
         decos: &mut WordDecorations,
@@ -2778,6 +2834,11 @@ mod owner_tests {
     }
 
     /// THE KITTY CHEERS THE LANDING, WHEN YOU ARE THERE TO SEE IT
+    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.3.5): while the
+    /// window is unfocused, or an app surface covers the grid, the end waits —
+    /// no frame hands it back and the pet latches nothing; the first frame
+    /// that shows the pane takes it (handed back for the glass to mark) and
+    /// the pet cheers.
     #[test]
     fn a_landing_is_cheered_once_by_the_first_frame_that_shows_it() {
         let mut decos = WordDecorations::default();
@@ -2840,6 +2901,9 @@ mod owner_tests {
     }
 
     /// NO CHEER WITHOUT THE PET (§11.3.1): under another trail style, or in
+    /// serious mode, the first frame that shows the pane still takes the end
+    /// — spent unplayed, so turning the pet on later replays nothing — and the
+    /// brain latches nothing.
     #[test]
     fn without_the_pet_a_landing_is_spent_unplayed() {
         for (why, glow, serious) in [
@@ -2882,6 +2946,12 @@ mod owner_tests {
     }
 
     /// THE PAPER LAW, AS THE OWNER WIRES IT (§11.3.7 of
+    /// `docs/DESIGN-harness-autopilot-2026-10-15.md`): `emit` hands the pet's
+    /// emitter the page it draws on, the terminal ground where no dark theme
+    /// is (`aterm_render::theme_is_dark`), so on white (Aterm Day) and cream
+    /// (Linen) paper each ♪ and ♥ in the air takes the point mark's ink
+    /// (`paper_mark_ink`: 4.5:1 against the page, its hue kept), and on a
+    /// dark ground it keeps its own colour.
     #[test]
     fn the_owner_inks_a_cheers_motes_for_the_page_it_draws_on() {
         use crate::kitty_pet::{PetMoteKind, PetMoteSprite};
@@ -2998,6 +3068,7 @@ mod owner_tests {
     }
 
     /// The load-shed latch takes the resident's frame train, not its motion: the
+    /// sense is full motion and a moving body is offered at the coarse cadence.
     #[test]
     fn the_shed_latch_takes_the_train_never_the_motion() {
         let mut decos = WordDecorations::default();
@@ -3031,6 +3102,7 @@ mod owner_tests {
     }
 
     /// Serious Mode's drain is a fresh brain (a latched trick, the body and the
+    /// species alike); the session latches survive.
     #[test]
     fn the_drain_is_a_fresh_brain_that_keeps_the_session_latches() {
         let mut decos = WordDecorations::default();
@@ -3070,6 +3142,7 @@ mod owner_tests {
     }
 
     /// A style that stops naming the pet and serious mode retire it; the Hidden
+    /// edge and history hide it (identity kept); load keeps the full resident.
     #[test]
     fn the_level_rules_retire_hide_and_preserve_the_resident_under_load() {
         let mut decos = WordDecorations::default();
@@ -3169,6 +3242,7 @@ mod owner_tests {
     }
 
     /// The shed contract: load shedding takes the resident's 60 fps frame train
+    /// and nothing else.
     fn resident_shed_model() -> aterm_spec::derive::Model {
         aterm_spec::ty_model! {
             ResidentShed {
@@ -3223,6 +3297,7 @@ mod owner_tests {
     }
 
     /// The owner over a real terminal, observed and ticked as the native present
+    /// does, with the host's shed facts and motion policy handed in per frame.
     struct ShedRig {
         term: aterm_core::terminal::Terminal,
         owner: CompanionOwner,
@@ -3234,10 +3309,12 @@ mod owner_tests {
         /// Replay the snap rule: the latch folded into the reduced-motion pin.
         old_rule: bool,
         /// Every offer after a shed tick lands no sooner than
+        /// [`RESIDENT_SHED_CADENCE`]: `[the owner's, the unfloored rule's]`.
         coarse: [bool; 2],
     }
 
     /// The resident's ordinary motion bound: 1.2 cells per 16 ms of clock (typing
+    /// through a shed measures at most 0.41; the snap, 5.4).
     const STEP_PER_FRAME: f32 = 1.2;
 
     impl ShedRig {
@@ -3257,6 +3334,7 @@ mod owner_tests {
         }
 
         /// One present `dt` after the last, with a key's echo when `key` is given;
+        /// returns the frame and whether its step stayed within the motion bound.
         fn present(
             &mut self,
             dt: Duration,
@@ -3306,6 +3384,7 @@ mod owner_tests {
         }
 
         /// A moving resident is on the train or owed a wake within the shed
+        /// cadence; a settled one owes nothing.
         fn paced(&self) -> bool {
             !self.owner.brain().needs_frames()
                 || self.owner.needs_frames()
@@ -3332,6 +3411,7 @@ mod owner_tests {
     }
 
     /// The shed edge on glass: typing at 80 ms/key, the load-shed latch engages
+    /// mid-run, holds while typing goes on and the resident settles, then clears.
     #[test]
     fn a_shed_edge_never_snaps_or_seats_a_moving_resident() {
         use crate::kitty_pet::PetAction;
@@ -3488,6 +3568,7 @@ mod owner_tests {
     }
 
     /// A capture takes the caller's motion policy and introduces no static
+    /// scheduler posture of its own; disabling retires the remembered posture.
     #[test]
     fn capture_and_reenable_do_not_leave_stale_static_scheduler_custody() {
         let mut decos = WordDecorations::default();
@@ -3544,6 +3625,8 @@ mod owner_tests {
     }
 
     /// The resident stays full and pettable through the held song and every tail
+    /// cutoff, sampled at its cadence or jumped to directly from the held song by an
+    /// occluded frame, even when a competing head has live alpha.
     #[test]
     fn a_song_and_its_tail_keep_full_resident_custody() {
         let model = aterm_models_effects::reduced_motion_companion_handoff_model();
@@ -3630,6 +3713,7 @@ mod owner_tests {
     }
 
     /// Reduced motion pins the resident at its station: it is drawn, and a caret
+    /// jump moves it without a walk.
     #[test]
     fn reduced_motion_pins_the_pet_at_its_station() {
         let mut decos = WordDecorations::default();
@@ -3656,6 +3740,7 @@ mod owner_tests {
     }
 
     /// Peek cues reach the brain as the landed head's centre in fractional cells:
+    /// a far peek is scenery, a near one latches a bat.
     #[test]
     fn peek_cues_reach_the_brain_as_fractional_cells() {
         let mut decos = WordDecorations::default();
@@ -3687,6 +3772,8 @@ mod owner_tests {
     }
 
     /// Over blank glass the frozen palette keys off [`ContrastFallback`]'s cursor
+    /// slot, not the default foreground: the key is `from_rgb(bg, cursor, accent)`,
+    /// and a neutral cursor on the same glass dresses a different cat.
     #[test]
     fn blank_glass_keys_the_pets_contrast_off_the_cursor_colour() {
         let bg = 0x0010_1010;
@@ -3730,6 +3817,7 @@ mod owner_tests {
     }
 
     /// `retire_coordinate_space` is surface only, so a later completion is still
+    /// felt; `retire_owner` also re-baselines the command probe.
     #[test]
     fn retire_coordinate_space_keeps_the_command_latch_and_retire_owner_rebaselines_it() {
         let sense_cmd = |owner: &mut CompanionOwner,
@@ -3798,6 +3886,8 @@ mod owner_tests {
     }
 
     /// Switching between the main and alternate screen buffers, or replacing/
+    /// re-gridding the owner, never leaks `finished_caret` or `hidden_rest`
+    /// from the prior surface.
     #[test]
     fn alt_screen_switch_and_owner_retire_do_not_leak_finished_caret_or_hidden_rest() {
         let mut decos = WordDecorations::default();

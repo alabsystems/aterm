@@ -1,79 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A `--headless` instance must never become a WindowServer client — read from
-//! tccd's own log, which is the only place the fact is recorded.
-//!
-//! WHY THIS IS THE CHECK. When a process opens its WindowServer connection,
-//! WindowServer asks tccd for a synchronous `kTCCServiceListenEvent` preflight
-//! of that binary ON WINDOWSERVER'S MAIN THREAD, and tccd `readdir`s the
-//! binary's directory to identify it. From a binary in a huge build directory
-//! that outran WindowServer's watchdog and killed every window on the machine,
-//! twice (AGENTS.md). Until 2026-09-26 every `aterm --headless` launch on
-//! macOS did it: the event loop was AppKit's, and `-[NSApplication init]` opens
-//! the connection. An idle `aterm --headless --cpu` drew one preflight within
-//! two seconds; the live-headless suites in this directory drew 50 in one run.
-//! Headless now builds winit's display-free loop
-//! (`crates/aterm-window/src/platform_impl/macos/headless.rs`). Nothing inside the
-//! process can say whether it connected without asking WindowServer itself, so
-//! this reads the preflights back out of the unified log, by pid:
-//!
-//! ```text
-//! log show --start <T0> --info --predicate 'process == "tccd"
-//!   AND eventMessage CONTAINS "requesting={TCCDProcess: identifier=com.apple.WindowServer"'
-//! ```
-//!
-//! and fails when any line's `accessing=` process is the instance's pid. The
-//! query names no line kind: tccd writes one preflight as several lines, and
-//! which ones varies — macOS 26.6 (25G83) writes two Info `AttributionChain:`
-//! lines per request and only sometimes a Default `AUTHREQ_ATTRIBUTION:` line
-//! (measured 2026-10-08; a census that required `AUTHREQ_ATTRIBUTION` missed
-//! most controls and could not run). Every such line carries the same
-//! `accessing=` pid, so the pids are de-duplicated.
-//!
-//! NON-VACUITY: THE POSITIVE CONTROL. An empty census proves nothing unless the
-//! census can see a preflight at all here: `log` may be unreadable, there may be
-//! no WindowServer session (an SSH login, a CI box), or a macOS release may
-//! reword the line. So after the instance is gone, `/usr/bin/osascript` calls
-//! `CGMainDisplayID()` — measured (2026-09-26) to draw exactly this preflight for
-//! osascript's pid — and the census must find THAT pid before the instance's
-//! absence counts. The control runs LAST, so seeing it also means the log had
-//! caught up with everything the instance did before it. `/usr/bin` is a small
-//! directory, and osascript is the tool the activation test already runs. When
-//! the control cannot be seen the test ends COULD NOT RUN
-//! (`aterm_spec::host::could_not_run`): nothing was decided, and `verify`
-//! records it so, never as a pass.
-//!
-//! A REWORDED LINE FAILS. Before it gives up as not run, the census asks tccd's log
-//! once more without its own predicate or parser, for any line naming both
-//! WindowServer and the control's pid. If tccd recorded the control and the
-//! census still cannot read it, the census is stale for this macOS, and that
-//! fails, quoting the lines. A live WindowServer session alone (a frontmost
-//! app) is not grounds to fail: tccd's lines sit in the log's memory buffers
-//! and were measured gone from `log show` within minutes (2026-10-08), so an
-//! unseen control cannot tell a stale reader from a line the log dropped.
-//!
-//! THE INSTANCE is driven, not merely idled: a `spawn` round trip (a user event
-//! through the loop), an `image` (the offscreen CPU render and font path), a
-//! held message (the message band's timers), a `chrome` read (the one verb that
-//! asked AppKit for the menu bar — see below), then three idle seconds, so a door
-//! on a lazy or timer path gets its chance.
-//!
-//! THE SECOND DOOR, `chrome`. With the display-free loop in place, a sweep of
-//! the control verbs against a headless instance (fresh instance per door,
-//! `DYLD_INSERT_LIBRARIES` on SkyLight's connection entry points) found exactly
-//! one more: `read_native_chrome` read the menu bar through
-//! `+[NSApplication sharedApplication]`, which CREATES the application object the
-//! loop no longer built — and one `aterm ctl chrome` drew one preflight. It now
-//! reads through the injected `App::app_menu_bar` (`menu (none)` headless), and
-//! this drive fails the day a verb brings the application object back.
-//!
-//! ISOLATION is `headless_activation.rs`'s (the shared
-//! `support/launch_isolation.rs` fixture, `--sock` on every call, a lifeline),
-//! under its own `atws-<pid>` scratch name, and the BOOT is the shared
-//! `support/headless_boot.rs`: an instance that cannot start FAILS (and one
-//! whose log shows it asked for a WindowServer connection fails naming that);
-//! a scratch, log, spawn or bind refusal is COULD NOT RUN.
+//! A `--headless` instance must never become a WindowServer client.
 
 #![cfg(target_os = "macos")]
 #![allow(
@@ -104,8 +32,7 @@ const LOG_SHOW_DEADLINE: Duration = Duration::from_secs(60);
 
 /// The unified-log predicate: every line tccd writes that names WindowServer as
 /// a TCC preflight's requester, whatever its kind (`AttributionChain:`,
-/// `AUTHREQ_ATTRIBUTION:`). A string constant so the prose above and the query
-/// cannot drift.
+/// `AUTHREQ_ATTRIBUTION:`).
 const PREDICATE: &str = "process == \"tccd\" \
                          AND eventMessage CONTAINS \"requesting={TCCDProcess: identifier=com.apple.WindowServer\"";
 
@@ -184,7 +111,6 @@ fn client_ok(inst: &Instance, args: &[&str]) -> String {
 }
 
 /// Local wall-clock `YYYY-MM-DD HH:MM:SS`, the shape `log show --start` reads.
-/// `/bin/date` rather than arithmetic here: the log speaks local time.
 fn log_timestamp() -> Option<String> {
     let out = Command::new("/bin/date")
         .arg("+%Y-%m-%d %H:%M:%S")
@@ -260,7 +186,7 @@ fn accessing_pids(log: &str) -> Vec<u32> {
 }
 
 /// The positive control: a CoreGraphics display query from osascript, whose pid
-/// the census must then find. `None` when osascript is unavailable or failed.
+/// the census must then find.
 fn positive_control() -> Option<u32> {
     let child = Command::new("/usr/bin/osascript")
         .args([
@@ -311,8 +237,6 @@ fn a_driven_headless_instance_draws_no_window_server_preflight() {
         ],
     );
     assert!(posted.starts_with("OK "), "notice: {posted:?}");
-    // The menu-bar read. What it answers is checked after the census, which is
-    // this test's verdict: a door here must fail as a preflight, not as text.
     let chrome = client_ok(&inst, &["chrome"]);
     std::thread::sleep(IDLE);
     let log = inst.log.clone();
@@ -328,9 +252,6 @@ fn a_driven_headless_instance_draws_no_window_server_preflight() {
             Ok(pids) if pids.contains(&control) => break pids,
             Ok(_) if Instant::now() < until => std::thread::sleep(Duration::from_millis(500)),
             Ok(pids) => {
-                // Did tccd record the control in a shape the census cannot read?
-                // Re-read the census after the raw lines, so a line that landed
-                // between the two queries decides instead of failing.
                 let raw = lines_naming_window_server_and(&start, control);
                 match (raw, preflighted_pids(&start)) {
                     (_, Ok(now)) if now.contains(&control) => break now,
@@ -368,7 +289,6 @@ fn a_driven_headless_instance_draws_no_window_server_preflight() {
         chrome.lines().any(|l| l == "menu (none)"),
         "a headless instance has no menu bar, and says so without asking AppKit: {chrome:?}"
     );
-    // The proof-it-ran marker: a NOT RUN never prints this line.
     notice(&format!(
         "window-server census: pid {pid} drew 0 WindowServer preflights; the osascript control \
          (pid {control}) was seen, as were {} other preflighted pid(s) since {start}",

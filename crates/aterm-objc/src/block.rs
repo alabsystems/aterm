@@ -10,9 +10,9 @@ use std::os::raw::{c_int, c_ulong};
 use std::ptr::NonNull;
 
 unsafe extern "C" {
-    /// The `isa` every stack block points at. Lives in libSystem's libclosure,
+    /// The `isa` every stack block points at.
     static _NSConcreteStackBlock: [*const c_void; 32];
-    /// Move a stack block to the heap, or retain a heap block. Returns nil on
+    /// Move a stack block to the heap, or retain a heap block.
     fn _Block_copy(block: *const c_void) -> *mut c_void;
     /// Release a heap block; runs `dispose` and frees on the last reference.
     fn _Block_release(block: *const c_void);
@@ -206,9 +206,11 @@ macro_rules! block_ctor {
                 }
 
                 /// `_Block_copy` has already `memmove`d the closure, which is
+                /// the Rust move; there is nothing left to copy.
                 unsafe extern "C" fn copy_helper(_dst: *mut c_void, _src: *const c_void) {}
 
                 /// Guarded like `invoke`, so a panicking `Drop` in a capture
+                /// aborts with a name rather than Rust's anonymous message.
                 unsafe extern "C" fn dispose_helper<F>(block: *mut c_void) {
                     let blk = block.cast::<Blk<F>>();
                     let guard = ::std::panic::catch_unwind(
@@ -281,6 +283,8 @@ pub trait BlockFn: Copy {
     type Ret;
 
     /// The block's signature as an extended encoding spells it, offsets
+    /// aside: the return, `@?` for the block itself, then each argument
+    /// (`v@?@` for `fn(Id)`).
     fn types() -> String;
 
     /// Call `block`'s `invoke` with `args`.

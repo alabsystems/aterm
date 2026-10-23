@@ -10,6 +10,8 @@ use std::ptr;
 pub(crate) use aterm_objc::{ClassPtr, Encode, Id, Sel, checked_msg};
 
 /// The Objective-C `BOOL` for this target, used for every `BOOL` in a send
+/// prototype: `aterm_objc::Bool`, `bool` on arm64 and `i8` (`signed char`) on
+/// x86_64, read as `!= 0`.
 use aterm_objc::Bool as ObjcBool;
 
 #[link(name = "objc")]
@@ -23,6 +25,7 @@ unsafe extern "C" {
 #[link(name = "Metal", kind = "framework")]
 unsafe extern "C" {
     /// Every Metal device, as a +1 `NSArray<id<MTLDevice>>`; elements are +0
+    /// until retained.
     fn MTLCopyAllDevices() -> Id;
 }
 
@@ -80,6 +83,7 @@ impl Obj {
 
 impl Drop for Obj {
     /// Releasing a Metal object runs the driver's dealloc path, which
+    /// autoreleases one object into the owner's current frame.
     fn drop(&mut self) {
         // SAFETY: `self.0` is non-null by construction (both constructors reject null) and holds exactly one +1 reference, released once here.
         unsafe { objc_release(self.0) }
@@ -437,6 +441,7 @@ pub(crate) fn choose_listed(
 }
 
 /// The Metal door: `MTLCreateSystemDefaultDevice`, the one Metal call that makes
+/// this process a WindowServer client.
 mod window_server_door {
     use super::{AutoreleasePool, Device, Id, Obj};
 
@@ -452,10 +457,12 @@ mod window_server_door {
         }
 
         /// The system default GPU (raw `MTLCreateSystemDefaultDevice`, the
+        /// discrete GPU on a dual-GPU Mac), or `None` without a Metal device.
         fn system_default_asks_window_server() -> Option<Self> {
             #[link(name = "Metal", kind = "framework")]
             unsafe extern "C" {
                 /// `CF_RETURNS_RETAINED`: the caller owns the +1 and must
+                /// release it, which [`Device`] does on drop.
                 fn MTLCreateSystemDefaultDevice() -> Id;
             }
             #[cfg(test)]
@@ -493,6 +500,7 @@ impl Device {
     }
 
     /// `MTLCopyAllDevices` (+1, owned) and, per element, the two facts
+    /// [`choose_listed`] reads (`None` for a nil slot).
     fn listing() -> Option<(Obj, Vec<Option<ListedGpu>>)> {
         // SAFETY: `MTLCopyAllDevices` is `CF_RETURNS_RETAINED`, so `Obj` releases the array once.
         unsafe {
@@ -968,6 +976,7 @@ pub(crate) fn dispatch_compute(
 }
 
 /// Wait for a committed command buffer and turn every non-success terminal
+/// state into a diagnostic.
 #[cfg(test)]
 fn wait_for_command_buffer(command_buffer: Id) -> Result<(), String> {
     const STATUS_COMPLETED: usize = 4;
@@ -1481,6 +1490,8 @@ mod tests {
     pub(super) static WINDOW_SERVER_ASKS: AtomicUsize = AtomicUsize::new(0);
 
     /// Every device `MTLCopyAllDevices` lists as `(name, isLowPower,
+    /// isHeadless)`, read independently of [`Device::listing`]. `None` without
+    /// Metal.
     fn listing_read_independently() -> Option<Vec<(String, bool, bool)>> {
         // SAFETY: as in `Device::listing`.
         unsafe {
@@ -1505,6 +1516,9 @@ mod tests {
     }
 
     /// [`Device::preferred`] calls `MTLCreateSystemDefaultDevice` only when
+    /// the listing cannot name the GPU, and otherwise returns exactly the GPU
+    /// the listing names (expected value derived from the raw listing, not
+    /// [`choose_listed`]).
     #[test]
     fn preferred_asks_the_window_server_only_when_the_listing_cannot_decide() {
         let _pool = AutoreleasePool::new();
@@ -1542,6 +1556,7 @@ mod tests {
     }
 
     /// Every listing shape [`choose_listed`] can meet, including dual- and
+    /// multi-GPU shapes.
     #[test]
     fn listing_decides_every_shape_it_can() {
         /// What [`choose_listed`] answers: the index it picked and its word.
@@ -1588,6 +1603,8 @@ mod tests {
     }
 
     /// An NSError's description is read by its counted UTF-16 units, so
+    /// neither of the strings a C-string read gets wrong truncates or blanks a
+    /// Metal compile or pipeline diagnostic.
     #[test]
     fn an_error_description_is_read_whole() {
         let _pool = AutoreleasePool::new();
@@ -1620,7 +1637,7 @@ mod tests {
         assert_eq!(read, C_STRING_HOLES.map(|(_, want)| want));
     }
 
-    /// [`Device::name`] reads `-name` by its counted UTF-16 units. The OS names
+    /// [`Device::name`] reads `-name` by its counted UTF-16 units.
     #[test]
     fn a_device_name_is_read_whole() {
         let _pool = AutoreleasePool::new();

@@ -1,29 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `vendor/forge.toml`: the fork ledger, and the `[patch.crates-io]` facts the rest of forge
-//! measures against.
-//!
-//! Upstream crates live under `vendor/`, redirected by `[patch.crates-io]` and carrying aterm's
-//! fixes. aterm maintains that code under several licenses, with obligations (Apache-2.0 §4(b)
-//! notices, retained LICENSE files, upstream provenance) no compiler enforces.
-//!
-//! The ledger has one `[[fork]]` block per vendored patch entry plus a `[forge]` header pinning
-//! the measurement methods. `targo --unverified forge check` holds it to the tree (`[OB-17]`): it
-//! must parse, and its fork blocks must be exactly the vendored patches, with path, version and
-//! license as the tree has them and `apache_notice` as `[OB-7]` reads that license. The census
-//! class is the census's own input: `aterm_census::scan_set::reviewed_forks` reads the same
-//! blocks. A fork's reason to exist is the comment block above it, not a key; the file is edited
-//! by hand.
-//!
-//! An unknown key is an error naming the key, so a typo cannot read as "obligation not claimed".
-//! A missing file is not a parse error: [`load`] returns an empty [`Policy`], and `[OB-17]` fails
-//! only once a vendored fork is patched in.
-//!
-//! A patch takes effect only while the vendored manifest's version satisfies the graph's
-//! requirement; otherwise the registry copy resolves again with no error. [`patch_entries`]
-//! reports, per entry, the version the lock resolved for the path package and any coexisting
-//! registry copies.
+//! `vendor/forge.toml`.
 
 use aterm_census::scan_set::{PatchTargetKind, classify_patch_target};
 use aterm_toml::edit::{DocumentMut, Item, TableLike};
@@ -32,25 +10,16 @@ use std::path::Path;
 /// The ledger's path, relative to the workspace root.
 pub const POLICY_PATH: &str = "vendor/forge.toml";
 
-/// The one LOC method forge implements: physical lines over every `*.rs` under
-/// the package root, including its tests and examples. A ledger naming another
-/// method is refused.
+/// The one LOC method forge implements.
 pub const LOC_METHOD: &str = "rs-physical-all-files-v1";
 
-/// The one graph method forge implements: `cargo tree -p <package> -e normal
-/// --target <triple> --prefix depth --no-dedupe --locked --offline`, parsed by
-/// depth prefix. Not `cargo metadata --filter-platform`, whose resolve is
-/// feature-unified across workspace members and over-counts.
+/// The one graph method forge implements.
 pub const GRAPH_METHOD: &str = "cargo-tree-normal-no-dedupe-locked-offline-v1";
 
-// --- the model -------------------------------------------------------------
-
-/// How `aterm-census`'s lock-order census classifies a vendored fork, as
-/// [`aterm_census::scan_set::reviewed_forks`] reads it from the same block.
+/// How `aterm-census`'s lock-order census classifies a vendored fork.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CensusMode {
-    /// Links into the shipped GUI process: scanned, with every lock identity in
-    /// a per-crate namespace so foreign names never merge with aterm's.
+    /// Links into the shipped GUI process.
     Scanned,
 }
 
@@ -67,32 +36,26 @@ impl CensusMode {
     }
 }
 
-/// One vendored, `[patch.crates-io]`-redirected upstream crate that aterm now
-/// maintains.
+/// One vendored, `[patch.crates-io]`-redirected upstream crate that aterm now maintains.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fork {
     /// The crates.io package this fork replaces ([`patched_package`]).
     pub name: String,
     /// The upstream version the fork keeps, so the existing `^` requirements still resolve.
-    /// Held to the vendored manifest by `[OB-17]`.
     pub version: String,
     /// Repo-relative directory (`vendor/indexmap`).
     pub path: String,
     /// The SPDX expression from the vendored manifest, verbatim.
     pub license: String,
-    /// `true` when this fork's license leaves no non-Apache option, so §4(b)
-    /// modification notices bind every file aterm modified. Must agree with
-    /// `[OB-7]`'s verdict (`targo --unverified forge check` `[OB-17]`).
+    /// `true` when this fork's license leaves no non-Apache option.
     pub apache_notice: bool,
     /// The lock-order census's classification.
     pub census_mode: CensusMode,
-    /// The identity namespace (`indexmap` ⇒ `indexmap::…`). Required for
-    /// [`CensusMode::Scanned`].
+    /// The identity namespace (`indexmap` ⇒ `indexmap::…`).
     pub census_namespace: Option<String>,
 }
 
 /// The `[forge]` header: the methods every number in a report was produced by.
-/// The cells are [`crate::resolve::default_cells`], declared once.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ForgeHeader {
     pub loc_method: String,
@@ -106,10 +69,7 @@ pub struct Policy {
     pub forks: Vec<Fork>,
 }
 
-// --- reading the ledger ----------------------------------------------------
-
-/// Read `<root>/vendor/forge.toml`. An absent file is an empty [`Policy`], not an error:
-/// whether absence is a finding is `[OB-17]`'s call.
+/// Read `<root>/vendor/forge.toml`.
 pub fn load(root: &Path) -> Result<Policy, String> {
     let path = root.join(POLICY_PATH);
     match std::fs::read_to_string(&path) {
@@ -123,15 +83,12 @@ pub fn load(root: &Path) -> Result<Policy, String> {
     }
 }
 
-/// Parse a ledger body. Split out from [`load`] so the fail-closed key rules
-/// are testable without a filesystem.
+/// Parse a ledger body.
 pub fn parse(text: &str) -> Result<Policy, String> {
     let doc: DocumentMut = text.parse().map_err(|e| {
         format!("{POLICY_PATH} is not valid TOML: {e} — fix the syntax; forge will not guess")
     })?;
 
-    // `[[carved]]` rows are the carve ledger, read by `targo --unverified forge check`'s
-    // `[OB-13]`; this reader only admits the key.
     for (key, _) in doc.as_table().iter() {
         if key != "forge" && key != "fork" && key != "carved" {
             return Err(format!(
@@ -207,8 +164,6 @@ fn header(item: &Item) -> Result<ForgeHeader, String> {
 }
 
 fn fork_block(t: &dyn TableLike, n: usize) -> Result<Fork, String> {
-    // Named by package once we have the name; by index until then, because an
-    // error about "block 3" in a file of near-identical blocks is not a fix.
     let ctx0 = format!("[[fork]] #{}", n + 1);
     let name = req_str(t, "name", &ctx0)?;
     let ctx = format!("[[fork]] `{name}`");
@@ -282,8 +237,6 @@ fn fork_block(t: &dyn TableLike, n: usize) -> Result<Fork, String> {
     })
 }
 
-// --- small typed accessors, each refusal naming the fix ---------------------
-
 fn check_keys(t: &dyn TableLike, allowed: &[&str], ctx: &str) -> Result<(), String> {
     for (key, _) in t.iter() {
         if !allowed.contains(&key) {
@@ -331,16 +284,12 @@ fn render_item(item: &Item) -> String {
     t.to_string()
 }
 
-// --- the measured `[patch.crates-io]` facts --------------------------------
-
-/// One `Cargo.lock` package record. The lock is TOML, so it is read with the
-/// same parser as everything else rather than scanned by hand.
+/// One `Cargo.lock` package record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LockEntry {
     pub name: String,
     pub version: String,
-    /// `None` for a path package: a workspace member, or a `[patch]` fork
-    /// (hence no checksum, and cargo-deny's `yanked = "deny"` never fires).
+    /// `None` for a path package: a workspace member, or a `[patch]` fork.
     pub source: Option<String>,
 }
 
@@ -388,21 +337,12 @@ pub fn lock_entries(root: &Path) -> Result<Vec<LockEntry>, String> {
     Ok(out)
 }
 
-/// The package a `[patch.crates-io]` row replaces: its `package` key when the row is renamed,
-/// else the row's own key.
-///
-/// A renamed row is how one manifest patches two semver-incompatible versions of one package
-/// (cargo's "Using `[patch]` with multiple versions"): cargo matches a row on the package it
-/// names, never on its key. Every forge reader of the patch table goes through this, so a row
-/// keyed `windows-sys-052` is measured as the `windows-sys` it replaces.
+/// The package a `[patch.crates-io]` row replaces.
 pub fn patched_package<'a>(key: &'a str, row: &'a Item) -> &'a str {
     row.get("package").and_then(Item::as_str).unwrap_or(key)
 }
 
-/// The semver-compatibility class of a version or a requirement's version
-/// part: what cargo treats as one version line. `1.4.2` and `^1.4` are `1`,
-/// `0.52.0` and `0.52` are `0.52`, `0.0.3` is `0.0.3`. Comparison operators,
-/// whitespace and any pre-release or build suffix are ignored.
+/// The semver-compatibility class of a version or a requirement's version part.
 pub fn semver_class(version: &str) -> String {
     let core = version.trim_start_matches(|c: char| "^=~<> ".contains(c));
     let core = core.split(['-', '+', ',', ' ']).next().unwrap_or_default();
@@ -422,8 +362,7 @@ pub fn semver_class(version: &str) -> String {
 }
 
 /// The semver class of a plain version or a bare, caret or exact requirement (the forms attest's
-/// `req_satisfied` models), else `None`. Wildcards, comparisons and compound requirements may
-/// span classes, so they stay in scope for the requirement reader to judge.
+/// `req_satisfied` models), else `None`.
 fn known_semver_class(version: &str) -> Option<String> {
     let version = version.trim();
     let number = version
@@ -447,15 +386,7 @@ fn known_semver_class(version: &str) -> Option<String> {
     Some(semver_class(number))
 }
 
-/// Whether `version` (or a requirement) of a patched package falls to a row whose own version
-/// is `row_version`.
-///
-/// A renamed row claims one version line of its package; a copy in another line is another
-/// row's target, or a registry package the ratchet counts. An un-renamed row answers for every
-/// copy of its name, so a fork's fix cannot be missing from a sibling major unnoticed. A renamed
-/// row into `vendor/` is scoped the same way, so rename a fork's row only when its fix belongs to
-/// that one line. With no readable `row_version`, or a requirement whose class is unknown, the
-/// row claims every copy (fail-closed).
+/// Whether `version` of a patched package falls to a row whose own version is `row_version`.
 pub fn in_row_scope(renamed: bool, row_version: Option<&str>, version: &str) -> bool {
     match row_version {
         Some(row) if renamed => match (known_semver_class(row), known_semver_class(version)) {
@@ -479,46 +410,32 @@ pub struct PatchEntry {
     pub manifest_version: String,
     /// The SPDX expression from the vendored manifest.
     pub license: String,
-    /// The version `Cargo.lock` resolved for the path copy of this package, or
-    /// `None` when there is none (the patch is not in effect).
+    /// The version `Cargo.lock` resolved for the path copy of this package.
     pub lock_version: Option<String>,
-    /// Registry-sourced versions of the same name that coexist with the fork, read from
-    /// `Cargo.lock` alone; for a renamed row, only those in its own version line
-    /// ([`in_row_scope`]). Non-empty means the fix may be absent from the copy that compiles;
-    /// the lock records no edge kinds, so whether a sibling ships is `[OB-12]`'s call over the
-    /// per-cell graph ([`crate::check`]).
+    /// Registry-sourced versions of the same name that coexist with the fork.
     pub shadowed_by: Vec<String>,
-    /// Third-party source under `vendor/`, or a first-party or absorbed member
-    /// under `crates/`, per [`aterm_census::scan_set::classify_patch_target`].
+    /// Third-party source under `vendor/`.
     pub kind: PatchTargetKind,
 }
 
 impl PatchEntry {
-    /// The patch is in effect: the lock resolved the path copy at exactly the
-    /// version the patched manifest declares.
+    /// The patch is in effect.
     pub fn is_live(&self) -> bool {
         self.lock_version.as_deref() == Some(self.manifest_version.as_str())
     }
 
-    /// A vendored fork: redistributed third-party source, owing provenance
-    /// obligations and a fork-ledger block. False for a first-party or absorbed
-    /// member.
+    /// A vendored fork.
     pub fn is_vendored(&self) -> bool {
         self.kind == PatchTargetKind::Vendored
     }
 
-    /// The row is keyed apart from the package it replaces
-    /// ([`patched_package`]), and so claims one version line of it.
+    /// The row is keyed apart from the package it replaces, and so claims one version line of it.
     pub fn is_renamed(&self) -> bool {
         self.key != self.name
     }
 }
 
-/// Read `[patch.crates-io]` from `<root>/Cargo.toml` and measure each entry
-/// against the vendored manifest and `Cargo.lock`.
-///
-/// Measurement only: drift is recorded here for `forge budget` and
-/// `forge check`; `[OB-12]` refuses a patch that does not take.
+/// Read `[patch.crates-io]` from `<root>/Cargo.toml` and measure each entry against the vendored.
 pub fn patch_entries(root: &Path) -> Result<Vec<PatchEntry>, String> {
     let manifest = root.join("Cargo.toml");
     let text = std::fs::read_to_string(&manifest)
@@ -576,9 +493,6 @@ pub fn patch_entries(root: &Path) -> Result<Vec<PatchEntry>, String> {
             ));
         }
 
-        // Two rows may patch two version lines of one name, so the path copy this row owns is
-        // the one at its own version; another path copy is recorded only when none matches,
-        // and reads as not live.
         let renamed = key != name;
         let mut lock_version = None;
         let mut shadowed_by = Vec::new();
@@ -608,10 +522,6 @@ pub fn patch_entries(root: &Path) -> Result<Vec<PatchEntry>, String> {
 }
 
 /// `(name, version, license)` from a patched crate's own manifest.
-///
-/// A vendored fork is outside the workspace, so an inherited
-/// (`workspace = true`) key there is a named error. A first-party or absorbed
-/// target is a member, so inheritance is resolved from `[workspace.package]`.
 fn patched_manifest(
     root: &Path,
     rel: &str,
@@ -632,12 +542,10 @@ fn patched_manifest(
         .get("package")
         .and_then(Item::as_table_like)
         .ok_or_else(|| format!("{}: no `[package]` table", path.display()))?;
-    // The root's `[workspace.package]`, read lazily and only for a member.
     let inherited = |key: &str| -> Option<String> {
         if kind == PatchTargetKind::Vendored {
             return None;
         }
-        // `key.workspace = true` is the only inheritance form cargo accepts.
         let claims_inheritance = pkg
             .get(key)
             .and_then(Item::as_table_like)
@@ -803,9 +711,7 @@ census.namespace = "smol_str"
         assert!(in_row_scope(true, Some("0.52.0"), "0.52.3"));
         assert!(!in_row_scope(true, Some("0.52.0"), "0.61.2"));
         assert!(!in_row_scope(true, Some("0.52.0"), "0.61"));
-        // An un-renamed row answers for every copy of its name.
         assert!(in_row_scope(false, Some("0.52.0"), "0.61.2"));
-        // An unreadable version claims every copy (fail-closed).
         assert!(in_row_scope(true, None, "0.61.2"));
     }
 }

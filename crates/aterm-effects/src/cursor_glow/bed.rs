@@ -13,6 +13,8 @@ pub(super) const DARK_BED_BAR: f32 = 4.8;
 pub(super) const DARK_BED_ALPHA_CAP: f32 = 236.0;
 
 /// The bed's luminance budget's clamp, the rainbow bed's: a theme whose ink
+/// is near black would solve a bed nobody sees, and the brightest budget is
+/// the bar's own answer at a white ink.
 const DARK_BED_LUMA_MIN: f32 = 0.020;
 /// See [`DARK_BED_LUMA_MIN`].
 const DARK_BED_LUMA_MAX: f32 = 0.150;
@@ -181,6 +183,9 @@ impl BedShape {
     }
 
     /// The bed's opacity and half-height (px) over a sample of coverage
+    /// `cov` in a cell `ch` tall, its spine [`DARK_BED_DY`] below the
+    /// middle, times `k` (the wedge's and the tail's taper): the reach never
+    /// crosses the row's edges.
     #[inline]
     const fn at(self, cov: u8, ch: f32, k: f32) -> (f32, f32) {
         let share = ((cov as f32) / self.full).clamp(0.0, 1.0) * k.clamp(0.0, 1.0);
@@ -194,24 +199,33 @@ impl BedShape {
 }
 
 /// The bed's spine below the cell's middle, as a share of the cell height:
+/// the middle of the x-height band, where the letters' bodies sit.
 const DARK_BED_DY: f32 = 0.04;
 
 /// Sparkle's gold rail's reach below the row, as a share of the cell
+/// height ([`BedShape::rail`]): its whole tail.
 const SPARKLE_RAIL: f32 = 0.24;
 /// Sparkle's rail's soft top ([`BedShape::rail_rise`]).
 const SPARKLE_RAIL_RISE: f32 = 0.5;
 
 /// How far a typed run's bed takes to rise from nothing at its tail, in
+/// cells: the oldest cell's bed feathers in rather than starting square on
+/// a cell edge.
 const DARK_BED_TAIL_CELLS: f32 = 1.0;
 
 /// The rail's full-strength plateau as a share of its reach: the top half
+/// holds and the bottom half melts, as the rainbow kitty's rail does.
 const DARK_RAIL_CORE: f32 = 0.5;
 
 /// The nested passes a leap's tube is laid in, widest first, so its cross
+/// section falls off from the spine to nothing instead of standing as a
+/// flat slab of one opacity.
 const LEAP_LAYERS: usize = 6;
 /// The longest stretch of air, in a leap's cells, its bed tube carries on
+/// across between two lines of text ([`lay_dark_bed`]).
 const LEAP_GAP_CELLS: usize = 3;
 /// How much wider than the bed's own girth a leap's outermost pass reaches,
+/// so its soft edge carries past where the flat tube ended.
 const LEAP_SPREAD: f32 = 1.4;
 
 /// The night arc's hue, degrees, for a hue `h`.
@@ -519,6 +533,12 @@ pub(crate) fn lay_dark_bed(
 }
 
 /// A wedge's runs ([`BedShape::wedge`]) into the pool `out`, returning how
+/// many are live: each one-row run is laid by distance from its head, in
+/// the direction it came from, `wedge` cells long in quarter-cell knots at
+/// the run's freshest coverage and with the path position falling from the
+/// head (`1`) to the tail's tip (`0`), so the tail is a comet's whatever
+/// span of cells is still live at a typing cadence; a run across rows (a
+/// leap) is its own samples.
 fn wedge_runs(
     runs: &[Vec<CometSample>],
     typing: &[Vec<bool>],
@@ -818,6 +838,7 @@ impl CursorGlow {
     }
 
     /// [`dark_bed_ink`], or (a test's negative control,
+    /// [`Self::bed_unsolved`]) the stop at its full value.
     fn bed_ink(&self, rgb: u32, page: u32, budget: f32, sat: f32) -> u32 {
         if self.bed_unsolved() {
             let rgb = crate::spectrum::spectrum_with_min_saturation(rgb & 0x00FF_FFFF, sat);

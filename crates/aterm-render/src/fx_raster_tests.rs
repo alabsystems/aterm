@@ -34,6 +34,7 @@ impl Rng {
 }
 
 /// A ground with structure and transmittance bytes, so a law that dropped the
+/// top byte or ignored the destination would show.
 fn ground(w: usize, h: usize, rng: &mut Rng) -> Vec<u32> {
     (0..w * h)
         .map(|_| {
@@ -212,9 +213,11 @@ fn whole(area: Area) -> FxSlice {
 }
 
 /// One drawable item: the item, its window-pixel origin, its draw rect and
+/// its palette.
 type Drawn<'a> = (&'a FxItem, (i64, i64), Area, &'a [FxInk]);
 
 /// Every drawable item of `layers` (slot/blend matching): its origin, its
+/// draw rect in window pixels (box ∩ clips ∩ frame), and its palette.
 fn draw_rects<'a>(
     f: &FxFrame,
     layers: &'a [FxLayer],
@@ -277,6 +280,9 @@ fn random_layers(rng: &mut Rng, f: &FxFrame, slot: FxSlot) -> Vec<FxLayer> {
 }
 
 /// RUN LISTS ARE PIXEL LAW F: the run-list stamp equals the per-pixel oracle
+/// byte for byte over random arts of every kind, scales 1..13× and between,
+/// flips, negative origins, palette bases past the end and indices past the
+/// palette, and arbitrary slices of the item.
 #[test]
 fn fx_run_lists_are_law_f() {
     let mut rng = Rng(0x5eed_f00d_1234_5678);
@@ -349,6 +355,9 @@ fn fx_run_lists_are_law_f() {
 }
 
 /// SLICING CHANGES NO BYTE: per layer list, the engine's band-sliced draw, an
+/// uncut whole stamp of every item, and a stamp cut into arbitrary sub-rects
+/// are byte-equal; with occluders, the engine's frame is the whole stamp
+/// outside every occluder and the untouched ground inside.
 #[test]
 fn fx_slicing_changes_no_byte() {
     let mut rng = Rng(0x0123_4567_89ab_cdef);
@@ -462,6 +471,8 @@ fn cuts(rng: &mut Rng, lo: i64, hi: i64) -> Vec<i64> {
 }
 
 /// THE NEAREST MAP IS THE INTEGER ONE: destination column `l` of a sprite
+/// `dw` wide over a `w`-texel art shows texel `l·w / dw` (mirrored under
+/// `flip_x`), at every ratio including the non-integer ones, and rows alike.
 #[test]
 fn fx_nearest_map_is_integer() {
     let pal: Vec<FxInk> = (0..16u32)
@@ -546,6 +557,8 @@ fn fx_nearest_map_is_integer() {
 }
 
 /// THE RECT LAW: an fx rect writes `over_premul(dst, glow_lerp_rgb(c0, c1, i,
+/// w), glow_lerp(a0, a1, i, w))` with `i` counted from the item's left edge,
+/// whatever slice of it is stamped; Ramps rows are one-row rects.
 #[test]
 fn fx_rects_and_ramps_are_the_glow_quad_law() {
     let mut rng = Rng(0xfeed_beef_0000_0001);
@@ -630,6 +643,8 @@ fn fx_rects_and_ramps_are_the_glow_quad_law() {
 }
 
 /// OUT OF RANGE WRITES NOTHING (pixel law F's defined rule, where GL's fetch
+/// is undefined): a rect whose second end is missing, an Index8 texel past
+/// the palette, a Straight sprite without its tint.
 #[test]
 fn fx_out_of_range_writes_nothing() {
     let (w, h) = (8usize, 4usize);
@@ -692,6 +707,7 @@ fn fx_out_of_range_writes_nothing() {
 }
 
 /// THE STORE IS THE LAW: the `alpha == 255` arm of the flat fill is
+/// `over_premul(dst, c, 255)` for every channel value and transmittance.
 #[test]
 fn the_opaque_store_is_over_premul_at_255() {
     for dst in (0..=255u32).map(|v| v << 24 | v << 16 | (255 - v) << 8 | ((v * 7) & 0xff)) {
@@ -707,6 +723,9 @@ fn the_opaque_store_is_over_premul_at_255() {
 }
 
 /// THE LINEAR LAW IS FREESPRITE'S: a Straight sprite with entry `ink` as tint
+/// and opacity writes what a FreeSprite of the same texels, tint and alpha
+/// writes, at 1:1 and at integer scales (where the integer map and the
+/// pixel-centre map agree).
 #[test]
 fn fx_linear_is_the_free_sprite_law() {
     let mut rng = Rng(0x7777_1111_2222_3333);
@@ -776,6 +795,8 @@ fn fx_linear_is_the_free_sprite_law() {
 }
 
 /// THE DIRTY GATE: on a damaged frame that re-lays only band `r`, the engine
+/// stamps only band `r`'s slice of an item spanning `r − 1..r + 1`, so the
+/// frame equals a full draw.
 #[test]
 fn fx_dirty_band_restamps_only_its_band() {
     let f = FxFrame {
@@ -842,6 +863,9 @@ fn fx_dirty_band_restamps_only_its_band() {
 }
 
 /// A COLUMN TABLE PER SIZE, BUILT ONLY TO DRAW: a frame's sprites build their
+/// column table ([`SpriteCols`]) once per run of one `(art width, dw)` (the
+/// rectangles of a rim's cover share one), never for a sprite whose every band
+/// is kept, and the frame equals the spec at every size.
 #[test]
 fn a_column_table_is_built_per_size_and_only_when_drawn() {
     let f = FxFrame {
@@ -935,6 +959,9 @@ fn a_column_table_is_built_per_size_and_only_when_drawn() {
 }
 
 /// A LAYER AWAY FROM EVERY OPEN BAND IS NOT READ: the slicer hands its sink
+/// no item of a layer whose extent meets no open band (a card on rows the
+/// frame keeps), and every item of one whose extent does, in Window and Grid
+/// space and under an offset.
 #[test]
 fn a_layer_away_from_every_open_band_is_not_read() {
     struct Count(Vec<u64>);
@@ -1005,6 +1032,7 @@ fn a_layer_away_from_every_open_band_is_not_read() {
 }
 
 /// OCCLUDERS COMPOSE: three overlapping chrome rects (a banner band, a menu
+/// card, a tab menu) all keep their pixels free of the layer.
 #[test]
 fn fx_occluders_compose() {
     let f = FxFrame {
@@ -1077,6 +1105,7 @@ fn fx_occluders_compose() {
 }
 
 /// The band of every pixel row is the band that holds it, at any geometry
+/// (the slicer's `band_of` against the one band rule).
 #[test]
 fn band_of_names_the_band_holding_the_row() {
     let mut rng = Rng(0xabcd_ef01_2345_6789);
@@ -1094,6 +1123,7 @@ fn band_of_names_the_band_holding_the_row() {
 }
 
 /// Nothing panics at the edges of the coordinate space: origins, offsets and
+/// clips at `i32::MIN`/`i32::MAX`, empty arts, zero sizes, huge palette bases.
 #[test]
 fn fx_extremes_never_panic() {
     let mut rng = Rng(0x1357_9bdf_2468_ace0);
@@ -1185,6 +1215,9 @@ fn fx_extremes_never_panic() {
 }
 
 /// PREMUL TEXELS ARE THEIR OWN PAINT, ADDITIVE ONES INCLUDED (§4.2: `a = 0`
+/// with `c ≠ 0` is additive light): through the engine, an additive texel
+/// adds its colour, an all-zero texel writes nothing, an opaque texel stores
+/// and a translucent black texel darkens by `over_premul`.
 #[test]
 fn fx_premul_additive_texel_adds_light() {
     let f = FxFrame {
@@ -1254,11 +1287,14 @@ fn fx_premul_additive_texel_adds_light() {
 }
 
 /// Whether window-or-layer pixel `(x, y)` lies in `r` (unbounded edges hold
+/// everything).
 fn holds(r: PxRect, x: i64, y: i64) -> bool {
     i64::from(r.x0) <= x && x < i64::from(r.x1) && i64::from(r.y0) <= y && y < i64::from(r.y1)
 }
 
 /// THE PLACEMENT ORACLE: the frame `layers` draw over `base`, computed per
+/// pixel from the spec text alone, sharing no placement code with the engine
+/// (`layer_place`, `item_place`, `Area`, the slicer):
 #[allow(clippy::too_many_arguments)]
 fn placed_by_spec(
     f: &FxFrame,
@@ -1359,6 +1395,7 @@ fn placed_by_spec(
 }
 
 /// A random Linear layer: Straight sprites (some clipped, some flipped,
+/// scaled up to 13×) over a palette of tints.
 fn random_linear_layer(rng: &mut Rng, f: &FxFrame, id: u64) -> FxLayer {
     let n = rng.range(1, 6) as usize;
     let pal = palette(rng, n);
@@ -1393,6 +1430,11 @@ fn random_linear_layer(rng: &mut Rng, f: &FxFrame, id: u64) -> FxLayer {
 }
 
 /// THE PLACEMENT IS THE SPEC'S: over random frames, layers of both spaces and
+/// both blends with offsets, bounded layer clips, bounded sprite clips,
+/// overlapping occluders and random dirty bands, the engine's frame equals
+/// the per-pixel placement oracle, and every pixel drawn lies inside its
+/// layer's sealed extent (so the bands B2 marks from the extent hold all the
+/// light the raster writes).
 #[test]
 fn fx_placement_is_the_spec() {
     let mut rng = Rng(0x0b5e_55ed_c0ff_ee00);
@@ -1483,6 +1525,9 @@ fn fx_placement_is_the_spec() {
 }
 
 /// MIXED CONTENT DRAWS NOTHING (the release fail-closed rule behind the debug
+/// mixture refusal): content holding an Exact rect and a Linear sprite, sealed
+/// through the unchecked seam, draws nothing as an Exact layer and nothing as
+/// a Linear layer.
 #[test]
 fn fx_mixed_content_draws_nothing() {
     let f = FxFrame {
@@ -1564,6 +1609,10 @@ fn fx_mixed_content_draws_nothing() {
 }
 
 /// THE BLOOM SOURCE IS LAW F: an Exact bloom layer's [`fx_bloom_quads`],
+/// drawn through the [`GlowQuad`] law (each quad row a [`fill_glow_span`]
+/// from the quad's own left edge), paint exactly what [`draw_layers`] stamps
+/// for those layers with every band open, under the same clips and
+/// occluders.
 #[test]
 fn fx_bloom_quads_are_law_f() {
     let mut rng = Rng(0xb100_3c0d_5eed_0001);
@@ -1657,6 +1706,9 @@ fn fx_bloom_quads_are_law_f() {
 }
 
 /// THE FRAME ART BUDGET: the frame's distinct arts are admitted in draw order
+/// (layers in list order, items in content order) while their width's total
+/// stays within [`aterm_core::render::FX_FRAME_ART_TEXELS`]; a sprite whose
+/// art would pass it draws nothing.
 #[test]
 fn fx_art_budget_refuses_past_the_frame_total() {
     use aterm_core::render::{FX_ART_MAX_SIDE, FX_FRAME_ART_TEXELS};
@@ -1751,6 +1803,9 @@ fn fx_art_budget_refuses_past_the_frame_total() {
 }
 
 /// ONE RULING PER SET OF CONTENTS: the frame art budget walks its layers
+/// only when their contents (by identity), slots or blends differ from the
+/// last ruling's, so a frame's passes and a card at rest rule once; and a
+/// changed set is ruled afresh, so a ruling is never another frame's.
 #[test]
 fn the_budget_rules_once_per_set_of_contents() {
     use aterm_core::render::{FX_ART_MAX_SIDE, FX_FRAME_ART_TEXELS};

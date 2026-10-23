@@ -298,7 +298,7 @@ fn err_halted_parks_until_the_hold_lifts_and_the_loop_goes_on() {
     assert!(rows[0].contains("\"decision\":\"deferred\""), "{rows:?}");
     assert!(rows[1].contains("\"decision\":\"approved\""), "{rows:?}");
     assert!(
-        rows[1].contains("\"rule_id\":\"read-only@classify-v5\""),
+        rows[1].contains("\"rule_id\":\"read-only@classify-v6\""),
         "{rows:?}"
     );
     let _ = std::fs::remove_dir_all(&jdir);
@@ -457,7 +457,7 @@ fn the_rm_breaker_is_approved_under_a_scratch_root_and_escalated_otherwise() {
     let rows = ledger_rows(&ledger);
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert!(
-        rows[0].contains("\"rule_id\":\"rm-breaker@v4\""),
+        rows[0].contains("\"rule_id\":\"rm-breaker@v5\""),
         "{rows:?}"
     );
     assert!(rows[0].contains("\"decision\":\"approved\""), "{rows:?}");
@@ -507,6 +507,15 @@ fn the_rm_breaker_is_approved_under_a_scratch_root_and_escalated_otherwise() {
     }
 }
 
+/// THE RM BREAKER'S TOO-MANY BOX OVER A PROVEN READ IS PRESSED AND LEDGERED UNDER
+/// `breaker-read-only@v6`, in a bypass session, under the safe rules alone: Claude Code 2.1.307
+/// draws that box over any command with more than 64 command substitutions, rm or none
+/// (MEASURED). The box is the MEASURED one with its command made thirteen barred lines of `echo`
+/// and five `$(true)`; the press is guarded by its first command row, and the one ledger row is
+/// `approved` under the rule. NEGATIVE CONTROL: the MEASURED box itself (one line of `echo` and 65
+/// `$(true)` wrapped into four barred rows, whose newline reading puts a `$(true)` where a
+/// command's name goes) is escalated, badged `rm-breaker`, nothing pressed, and its ledger row is
+/// no approval.
 #[test]
 fn the_too_many_breaker_over_a_proven_read_is_ledgered_under_its_rule() {
     use crate::supervise::policy::approval::tests as at;
@@ -533,7 +542,7 @@ fn the_too_many_breaker_over_a_proven_read_is_ledgered_under_its_rule() {
     let rows = ledger_rows(&ledger);
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert!(
-        rows[0].contains("\"rule_id\":\"breaker-read-only@v4\""),
+        rows[0].contains("\"rule_id\":\"breaker-read-only@v6\""),
         "{rows:?}"
     );
     assert!(rows[0].contains("\"decision\":\"approved\""), "{rows:?}");
@@ -568,27 +577,15 @@ fn the_too_many_breaker_over_a_proven_read_is_ledgered_under_its_rule() {
     let _ = std::fs::remove_dir_all(&ldir);
 }
 
-const ONE_LINE_PENDING: &str =
-    include_str!("policy/fixtures/claude-2.1.307-transcript-too-many-one-line-pending.jsonl");
-const TWIN_PENDING: &str =
-    include_str!("policy/fixtures/claude-2.1.307-transcript-too-many-twin-pending.jsonl");
-
-const FIRST_TURN_PENDING: &str =
-    include_str!("policy/fixtures/claude-2.1.307-transcript-too-many-first-turn-pending.jsonl");
-
-fn one_line_not_written() -> String {
-    let at = ONE_LINE_PENDING
-        .find("\"type\":\"assistant\"")
-        .expect("the call's row");
-    ONE_LINE_PENDING[..ONE_LINE_PENDING[..at].rfind('\n').expect("a row") + 1].to_string()
-}
-
+/// One hosted run of the safe rules over `screens` in a bypass session whose host's transcript
+/// tail is `tail`: the lines, the server's record, the ledger's rows and how many times the
+/// transcript was read.
 fn breaker_run(
     tag: &str,
     screens: Vec<Vec<String>>,
-    tails: &[&str],
+    tail: &str,
 ) -> (Vec<String>, Mock, Vec<String>, usize) {
-    let host = TailHost::of(tails);
+    let host = TailHost::of(&[tail]);
     let (ldir, ledger) = ledger_file(tag);
     let mut m = fenced(screens);
     m.cwd = Some("/Users/_owner/proj".to_string());
@@ -606,260 +603,59 @@ fn breaker_run(
     (lines, m, rows, host.asks())
 }
 
+/// A TOO-MANY BOX READS NO TRANSCRIPT AND WAITS FOR NONE (`breaker-read-only@v6`): breaker-4's
+/// lane read the agent's transcript for every too-many box the screen did not prove, retried
+/// it while it named no call and waited a 1 s settle, and the call it found could only add a
+/// reading, so it decided nothing. Now the measured box (one line of `echo` and 65 `$(true)`,
+/// whose newline reading is not a read) goes to a person on its screen's readings, badged
+/// `rm-breaker`, nothing pressed and no approval ledgered, with a host whose transcript holds
+/// a waiting Bash call never asked; the box whose barred lines are each a read is pressed and
+/// ledgered under the rule, the transcript never asked either. A lane that read the transcript
+/// for the measured box (the mutant: breaker-4's `box_command::wanted` read) asks it.
 #[test]
-fn a_transcript_call_cannot_approve_another_boxes_newline_reading_in_the_loop() {
+fn a_too_many_box_reads_no_transcript_and_waits_for_none() {
     use crate::supervise::policy::approval::tests as at;
-    use crate::supervise::policy::box_command;
-    let measured = || {
-        aterm_phase::prompt::fixtures::screen(
-            aterm_phase::prompt::fixtures::BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_307,
-        )
-    };
-    let lagging = one_line_not_written();
-    let (harmless, writing) = at::stale_box_commands();
-    let shown = box_command::barred_rows(&writing, 140).expect("ASCII box");
-    let original = box_command::tests::command_of("Echo 65 empty substitutions");
-    let stale = ONE_LINE_PENDING.replace(
-        &aterm_json::to_string(&original).expect("JSON string"),
-        &aterm_json::to_string(&harmless).expect("JSON string"),
+    // A Bash call waiting in the transcript, as breaker-4's lane would have found it.
+    let waiting = r#"{"parentUuid":null,"isSidechain":false,"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_lab0c1b6e09","name":"Bash","input":{"command":"echo x","description":"Echo"}}]},"uuid":"00000000-0000-4000-8000-0000000000b1"}"#;
+    let measured = aterm_phase::prompt::fixtures::screen(
+        aterm_phase::prompt::fixtures::BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_307,
     );
-    assert_ne!(stale, ONE_LINE_PENDING);
-    assert_eq!(
-        box_command::pending_bash(&stale, &[])
-            .expect("sole pending call")
-            .command,
-        harmless
-    );
-    let stale_box = at::too_many_box(&shown, true);
-    let prompt = aterm_phase::prompt::parse_prompt_v2(&stale_box).expect("the box");
-    assert_eq!(
-        box_command::drawn_as(&prompt, &stale_box, &harmless),
-        Ok(())
-    );
-    assert_eq!(box_command::drawn_as(&prompt, &stale_box, &writing), Ok(()));
-    for (what, screen, tails, why, expected_reads) in [
-        (
-            "lagging one-line call",
-            measured(),
-            vec![lagging.as_str(), ONE_LINE_PENDING],
-            "not read-only (newline reading)",
-            3,
-        ),
-        (
-            "first-turn call",
-            measured(),
-            vec![FIRST_TURN_PENDING],
-            "not read-only (newline reading)",
-            2,
-        ),
-        (
-            "the newline twin",
-            measured(),
-            vec![TWIN_PENDING],
-            "not read-only (newline reading)",
-            2,
-        ),
-        (
-            "changed within the settle",
-            measured(),
-            vec![ONE_LINE_PENDING, TWIN_PENDING],
-            "the waiting call changed within the settle",
-            2,
-        ),
-        (
-            "older echo still pending after the settle",
-            stale_box,
-            vec![stale.as_str()],
-            "not read-only (newline reading)",
-            2,
-        ),
-    ] {
-        let (lines, m, rows, asks) = breaker_run(what, vec![bypass_busy(), screen], &tails);
-        assert!(m.presses().is_empty(), "{what}: {:?}", m.requests);
-        assert!(
-            rows.iter()
-                .all(|r| !r.contains("\"decision\":\"approved\"")),
-            "{what}: {rows:?}"
-        );
-        let set = m
-            .requests
-            .iter()
-            .find_map(|r| r.strip_prefix("meta set attention owner=supervisor "))
-            .unwrap_or_else(|| panic!("{what}: escalated: {lines:?}"));
-        assert!(set.starts_with("claude rm-breaker: "), "{what}: {set}");
-        assert!(
-            set.contains(why) || rows.iter().chain(lines.iter()).any(|r| r.contains(why)),
-            "{what}: {set} {lines:?} {rows:?}"
-        );
-        assert!(asks >= expected_reads, "{what}: {asks}");
-    }
     let (lines, m, rows, asks) = breaker_run(
-        "unambiguous reads",
+        "breaker-measured-no-read",
+        vec![bypass_busy(), measured],
+        waiting,
+    );
+    assert!(lines[0].starts_with("EVENT prompt "), "{lines:?}");
+    assert!(m.presses().is_empty(), "{:?}", m.requests);
+    let set = m
+        .requests
+        .iter()
+        .find_map(|r| r.strip_prefix("meta set attention owner=supervisor "))
+        .expect("escalated");
+    assert!(set.starts_with("claude rm-breaker: "), "{set}");
+    assert!(
+        rows.iter()
+            .all(|r| !r.contains("\"decision\":\"approved\"")),
+        "{rows:?}"
+    );
+    assert_eq!(asks, 0, "the measured box asks the transcript nothing");
+    // NEGATIVE CONTROL: the box the screen proves is still approved, reading nothing.
+    let (out, m, rows, asks) = breaker_run(
+        "breaker-proven-no-read",
         vec![
             bypass_busy(),
             at::too_many_box(&at::sixty_five(&[]), true),
             busy_screen(),
         ],
-        &[ONE_LINE_PENDING],
-    );
-    assert_eq!(m.presses().len(), 1, "{:?}", m.requests);
-    assert!(lines[0].starts_with("APPROVED seq="), "{lines:?}");
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert!(rows[0].contains("\"decision\":\"approved\""), "{rows:?}");
-    assert!(
-        rows[0].contains("\"rule_id\":\"breaker-read-only@v4\""),
-        "{rows:?}"
-    );
-    assert_eq!(asks, 0);
-}
-
-#[derive(Debug)]
-struct TimedTailHost {
-    clock: Arc<crate::supervise::fx::ScriptedClock>,
-    before: String,
-    then: Option<(Duration, String)>,
-    asked: std::sync::Mutex<Vec<Instant>>,
-}
-
-impl TimedTailHost {
-    fn of(
-        clock: &Arc<crate::supervise::fx::ScriptedClock>,
-        before: &str,
-        then: Option<(Duration, &str)>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            clock: Arc::clone(clock),
-            before: before.to_string(),
-            then: then.map(|(after, t)| (after, t.to_string())),
-            asked: std::sync::Mutex::new(Vec::new()),
-        })
-    }
-
-    fn asked(&self) -> Vec<Duration> {
-        let asked = self.asked.lock().expect("the asks");
-        asked
-            .iter()
-            .map(|at| at.saturating_duration_since(asked[0]))
-            .collect()
-    }
-}
-
-impl IdleHost for TimedTailHost {
-    fn wants(&self) -> bool {
-        false
-    }
-    fn at_idle(&self) -> Option<HostStep> {
-        None
-    }
-    fn owns_turn_end(&self) -> bool {
-        false
-    }
-    fn transcript_tail(&self) -> Option<String> {
-        let now = self.clock.mono();
-        let mut asked = self.asked.lock().expect("the asks");
-        asked.push(now);
-        let since = now.saturating_duration_since(asked[0]);
-        Some(match &self.then {
-            Some((after, then)) if since >= *after => then.clone(),
-            _ => self.before.clone(),
-        })
-    }
-}
-
-fn breaker_run_paced(
-    tag: &str,
-    clock: Arc<crate::supervise::fx::ScriptedClock>,
-    host: Arc<TimedTailHost>,
-    ticks: Option<Duration>,
-) -> (Vec<String>, Mock, Vec<String>) {
-    let measured = aterm_phase::prompt::fixtures::screen(
-        aterm_phase::prompt::fixtures::BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_307,
-    );
-    let (ldir, ledger) = ledger_file(tag);
-    let mut m = fenced(vec![bypass_busy(), measured, busy_screen()]);
-    m.cwd = Some("/Users/_owner/proj".to_string());
-    m.vanish_after = Some(0);
-    m.key_gates = vec![(1, 0)];
-    m.ticks = ticks;
-    let opts = SuperviseOpts {
-        idle_host: Some(host as Arc<dyn IdleHost>),
-        ..auto(30)
-    };
-    let run = record_watch_on(&mut m, &opts, clock, |s| {
-        s.set_approval_env(owner_env());
-        s.set_approval_ledger(Some(ledger.clone()));
-        s.set_box_call_step(crate::supervise::policy::box_call::LAG_STEP);
-    });
-    crate::supervise::tape::testing::assert_replays(&run.tape, &run.header, &run.sent, &run.lines);
-    let rows = ledger_rows(&ledger);
-    let _ = std::fs::remove_dir_all(&ldir);
-    (run.lines, m, rows)
-}
-
-#[test]
-fn a_settled_transcript_cannot_remove_a_ticking_boxes_readings() {
-    let settle = crate::supervise::policy::box_call::LAG_STEP
-        * crate::supervise::policy::box_command::SETTLE_STEPS;
-    for (tag, change, ticks) in [
-        ("breaker-ticking", None, Some(Duration::from_secs(1))),
-        ("breaker-race", Some((settle / 2, TWIN_PENDING)), None),
-        ("breaker-tick-fast", None, Some(Duration::from_millis(1))),
-    ] {
-        let clock = virtual_clock();
-        let host = TimedTailHost::of(&clock, ONE_LINE_PENDING, change);
-        let (lines, m, rows) = breaker_run_paced(tag, clock, Arc::clone(&host), ticks);
-        assert!(m.presses().is_empty(), "{tag}: {:?}", m.requests);
-        assert!(
-            rows.iter()
-                .all(|r| !r.contains("\"decision\":\"approved\"")),
-            "{tag}: {rows:?}"
-        );
-        let set = m
-            .requests
-            .iter()
-            .find_map(|r| r.strip_prefix("meta set attention owner=supervisor "))
-            .unwrap_or_else(|| panic!("{tag}: escalated: {lines:?}"));
-        assert!(set.starts_with("claude rm-breaker: "), "{tag}: {set}");
-        let why = if change.is_some() {
-            "the waiting call changed within the settle"
-        } else {
-            "not read-only (newline reading)"
-        };
-        assert!(
-            set.contains(why) || rows.iter().chain(lines.iter()).any(|r| r.contains(why)),
-            "{tag}: {set} {lines:?} {rows:?}"
-        );
-        let asked = host.asked();
-        assert!(asked.len() >= 2, "{tag}: {asked:?}");
-        assert!(asked[1] >= settle, "the settle ran: {tag}: {asked:?}");
-    }
-}
-
-#[test]
-fn a_too_many_box_the_screen_proves_reads_no_transcript() {
-    use crate::supervise::policy::approval::tests as at;
-    let lines = at::sixty_five(&[]);
-    let (out, m, rows, asks) = breaker_run(
-        "breaker-proven-no-read",
-        vec![bypass_busy(), at::too_many_box(&lines, true), busy_screen()],
-        &[ONE_LINE_PENDING],
+        waiting,
     );
     assert_eq!(m.presses().len(), 1, "{:?}", m.requests);
     assert!(out[0].starts_with("APPROVED seq=102 "), "{out:?}");
     assert!(
-        rows[0].contains("\"rule_id\":\"breaker-read-only@v4\""),
+        rows[0].contains("\"rule_id\":\"breaker-read-only@v6\""),
         "{rows:?}"
     );
     assert_eq!(asks, 0, "a proven box asks the transcript nothing");
-    let measured = aterm_phase::prompt::fixtures::screen(
-        aterm_phase::prompt::fixtures::BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_307,
-    );
-    let (_, _, _, asks) = breaker_run(
-        "breaker-measured-reads",
-        vec![bypass_busy(), measured, busy_screen()],
-        &[ONE_LINE_PENDING],
-    );
-    assert!(asks >= 2, "{asks}");
 }
 
 fn bypass_idle() -> Vec<String> {

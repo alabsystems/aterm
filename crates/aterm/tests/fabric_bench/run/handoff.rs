@@ -1,53 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE HANDOFF ARM: what a seamless update's bridge handoff costs the node —
-//! the OUTAGE between the old bridge's exit and its successor carrying the
-//! node again, and what a post queued in that gap waits.
-//!
-//! A headless instance cannot hand off (it has no update to commit:
-//! `aterm-gui` `fabric_launch.rs`), so the arm models the bridges' half of
-//! one, which is all a bridge ever sees of a Commit, on one world of its own
-//! (`fbench-ho`), each round:
-//!
-//! 1. A SUCCESSOR comes up beside the instance that holds the node
-//!    ([`harness::World::successor_instance`]): one more headless `aterm`
-//!    armed with the same fabric command, so its bridge is a second bridge on
-//!    the one `--state`, with a control socket and a runtime dir of its own.
-//!    That bridge finds the dir held, reports `link down reason=state-locked`
-//!    and STANDS BY, trying the lock once every `STANDBY_POLL` (1 s,
-//!    `aterm-link` `bridge.rs` `hold_state_dir`). The successor hosts two
-//!    sessions of its own, its boot session and one spawned.
-//! 2. Untimed until here. The holder QUITS saying `bye handoff` (the QA seam
-//!    `ATERM_DEBUG_QUIT_BYE=handoff`, a development build's only, as
-//!    `roster_bye.rs` and `handoff_cost.rs` use it): its bridge takes the
-//!    word, withdraws no session, flushes nothing, and exits as its lanes
-//!    close; the broker fires its will.
-//! 3. The moment the old bridge is gone — `kill(pid, 0)` refused, read every
-//!    millisecond (its parent's supervisor, or launchd once the instance has
-//!    gone, reaps it at once) — one successor session posts a note to the
-//!    other. aterm queues it: its bridge is standing by.
-//! 4. The successor's bridge takes the dir at its next try, begins its run
-//!    (its durable OPEN fence, two full flushes, `StateDir::begin_run`),
-//!    publishes the node row and both sessions' presence rows under its own
-//!    pid and incarnation, and drains the gap's post, which its recipient's
-//!    `await inbox` answers.
-//!
-//! The successor is then the holder, and the next round hands it off in turn:
-//! `rounds=` handoffs, each one sampled window of the broker's heads, read off
-//! the stopped log afterwards as the attach phase reads its rounds
-//! ([`super::attach_rows`]).
-//!
-//! WHAT IT REPORTS, per handoff, on the bench's one clock: quit -> the old
-//! bridge gone; **the old bridge gone -> the successor's node and session rows
-//! acked** (the outage: no bridge carries the node), split at the successor's
-//! pid file (it took the lock) and its attach after it; the old bridge gone ->
-//! its will acked (the broker's view of the same exit, which may be earlier
-//! than the bench's); and the gap's post -> acked, -> **visible**. The lock
-//! is tried once a second, so the wait for it is expected to be spread over
-//! 0..1 s and to dominate the outage; if it does, the lever is a successor
-//! woken by the holder's exit instead of a poll, measured as its own
-//! before/after pair.
+//! THE HANDOFF ARM.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -71,20 +25,12 @@ const QUIT_BYE: (&str, &str) = ("ATERM_DEBUG_QUIT_BYE", "handoff");
 
 /// How often a standing-by bridge tries the held lock: `aterm-link`'s
 /// `STANDBY_POLL` (`bridge.rs`, private there), spelled here for
-/// [`phase_of`] alone. Nothing is judged against it.
+/// [`phase_of`] alone.
 const STANDBY_POLL: Duration = Duration::from_secs(1);
 
 /// WHERE IN THE SUCCESSOR'S POLL round `n` of `rounds` (1-based) quits: the
 /// holder waits `(n - 1) / rounds` of [`STANDBY_POLL`] after the standby was
-/// seen and the round set up. Without it every round would quit at the same
-/// point of the poll — the bench's own setup time after the standby began —
-/// and measure one phase of a 0..1 s wait over and over (a smoke run: 964 and
-/// 966 ms, twice). Spread, the rounds sample the poll; in use the phase is
-/// whatever the update's own steps make it. The steps are counted from the
-/// setup, not from the poll, and the setup starts at the standby's report of
-/// a failed try, so lands just after a try (2026-10-22: 20-36 ms) and
-/// the rounds sit near 0.03, 0.37 and 0.70 of the poll: their mean wait is
-/// about 0.63 of it, above a uniformly placed exit's half. Pure (unit-tested).
+/// seen and the round set up.
 fn phase_of(n: usize, rounds: usize) -> Duration {
     let rounds = u32::try_from(rounds.max(1)).unwrap_or(u32::MAX);
     let step = u32::try_from(n.saturating_sub(1)).unwrap_or(u32::MAX) % rounds;
@@ -127,7 +73,7 @@ struct Round {
 
 /// One handoff, timed: the holder `w` quits saying `bye handoff` while
 /// `succ` stands by; `from` posts `gap` to `to` the moment the old bridge is
-/// gone. Run inside the round's sampled window.
+/// gone.
 fn hand_off(
     w: &harness::World,
     succ: &harness::Successor,
@@ -140,9 +86,6 @@ fn hand_off(
     let node_subject = presence_subject(w, "node");
     let presence_filter = format!("/f/{FLEET}/pub/{}/*/presence", w.node);
     let session_subjects = [presence_subject(w, from), presence_subject(w, to)];
-    // Set up before the clock starts: the successor's control connection,
-    // where its recipient's inbox stands, and one subscription to the node's
-    // presence rows from the mark, so the window asks the broker nothing.
     let mut ctl = succ.ctl();
     let since = newest_id(&mut ctl, to);
     let mut watch = w
@@ -153,11 +96,8 @@ fn hand_off(
         .set_read_timeout(Some(DEADLINE))
         .expect("bound the presence subscription");
 
-    // THE ROUND'S PHASE in the successor's poll ([`phase_of`]). NOT a
-    // synchronisation sleep: nothing below waits on it having passed.
     std::thread::sleep(phase);
     let t_quit = clock.us();
-    // The instance may close the connection as it goes: the reply is not read.
     let _ = w.ctl().request("invoke Quit");
     aterm_spec::wait::within(DEADLINE, PID_POLL, || {
         (!harness::alive(old_pid)).then_some(())
@@ -170,8 +110,6 @@ fn hand_off(
         aterm_spec::wait::within(DEADLINE, PID_POLL, || read_pid(w).filter(|p| *p != old_pid))
             .unwrap_or_else(|| panic!("the successor's bridge took no dir within {DEADLINE:?}"));
     let t_pid = clock.us();
-    // Parked before the post can land: the successor's bridge has only just
-    // written its pid, and its attach's rows come first.
     let (woke_at, t_seen) =
         await_note(&mut ctl, clock, to, since).unwrap_or_else(|e| panic!("`{gap}`: {e}"));
     let listed = list_since(&mut ctl, to, since);
@@ -235,8 +173,6 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                 phase_of(n, spec.rounds),
             )
         });
-        // The old instance ends its quit on its own; then the successor is
-        // the world's instance, and the next round's holder.
         until("the old instance to exit after its quit", || {
             w.gui.as_mut()?.try_wait().ok().flatten()
         });
@@ -301,8 +237,6 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             r.gap,
             found.node
         );
-        // The old bridge's will: the first fired will on the node row past
-        // the mark.
         let will = recs
             .iter()
             .find(|rec| {
@@ -319,8 +253,6 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         series[5].push(ms(t.t_post, t.t_seen));
         series[6].extend(ms_opt(Some(t.t_post), t_gap_acked));
         series[7].extend(ms_opt(t_gap_acked, Some(t.t_seen)));
-        // What the broker wrote from the mark to the successor's last row,
-        // the gap's post and the old bridge's fired will apart.
         let window = || census::window(&recs, r.mark, last).filter(|rec| rec.seq != gap_seq);
         let c = census::census(window().filter(|rec| !fired.contains(&rec.seq)));
         for (class, n) in &c.by_class {
@@ -421,8 +353,6 @@ mod tests {
     /// one a further `1/rounds` of the poll in, never a whole poll.
     #[test]
     fn the_rounds_quit_spread_over_one_standby_poll() {
-        // Imported here, not at the module's head: the explicit bench
-        // (`harness = false`) compiles this module with no test to use them.
         use std::time::Duration;
 
         use super::{STANDBY_POLL, phase_of};

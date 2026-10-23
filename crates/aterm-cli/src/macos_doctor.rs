@@ -39,7 +39,7 @@ pub enum Action {
 }
 
 impl Action {
-    fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Self::Check => "check",
             Self::Apply => "apply",

@@ -1,52 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `sleep [tag] --for SECS [--hold SECS] [--at-act [--rule RULE] [--within
-//! SECS]]`: a sleep of the Mac of `SECS` seconds, emulated on a lab brought
-//! up with its clock (`LAB_CLOCK=1`, [`crate::clock`]). The lab never sleeps
-//! the Mac and never moves the system clock: it moves the clocks of its own
-//! processes alone.
-//!
-//! It stops the lab's OWN instance (`SIGSTOP` to the pid `env.sh` records,
-//! after rechecking that pid names the lab: [`crate::lab::names_this_lab`];
-//! never a process found by name), steps the offset file by `SECS`, holds
-//! the instance stopped `--hold SECS` more (0 unless given; decimals to the
-//! millisecond), and continues it (`SIGCONT`). Claude Code is not stopped (a
-//! stopped Claude Code hands the tab to its shell): it takes the step within
-//! 20 ms of its next clock read, and with no one draining its PTY its output
-//! waits for the continue. The instance, stopped across the step, reads no
-//! clock half way: at its next read the wall clock and the clocks that count
-//! a sleep stand `SECS` ahead of uptime, as after a real sleep.
-//!
-//! With `--at-act` it first waits (`--within SECS`, 3 h unless given, a hang
-//! detector) for the instance's harness to journal an act, a `CONTINUED`
-//! line written after the verb began (`--rule RULE`: of that rule alone, as
-//! `usage-resume@v1`), and stops the instance the moment it reads it (the
-//! journals are looked at every 2 ms; that the pid is still the lab's is
-//! asked every second of the wait and again immediately before the stop).
-//! The identity check and numeric signal still race; this is no owned
-//! process handle or guarantee that the stop precedes the loop's next read.
-//!
-//! Once continued, it waits (60 s, a hang detector) until the instance's own
-//! record says the new offset, and lists which of the lab's live processes
-//! took the step. A returned interrupt or failed offset write still attempts
-//! to continue the instance, after rechecking that it names the lab. Lost or
-//! unknown identity refuses another signal. Process termination or a panic
-//! can prevent this cleanup; no unconditional resume guarantee is made.
-//! An instance that ended while
-//! stopped (a driver's `crash TAG --keep-tree` in the hold, whose next
-//! instance starts at the stepped offset: a loop attached after a sleep it
-//! never measured) is said to have ended, with the offset it left, and the
-//! verb fails: there is nothing to continue.
-//!
-//! Refused, with nothing stopped and the offset as it was (exit 1): a lab up
-//! without its clock, a recorded pid that is no process of the lab, an
-//! instance that wrote no clock record (the library is not loaded in it), or
-//! an act that did not come. Exit 0 once the instance took the step; 1 when
-//! it did not (it was continued); 2 usage.
-//!
-//! The process operations are injected ([`Ops`]): [`Live`] makes them, and
-//! the tests' fake stops nothing and never sleeps.
+//! `sleep [tag] --for SECS [--hold SECS] [--at-act [--rule RULE] [--within SECS]]`: a sleep of the Mac of `SECS` seconds, emulated on a lab brought up with its clock (`LAB_CLOCK=1`, [`crate::clock`]).
 
 use std::collections::HashMap;
 use std::io::{Read as _, Seek as _, SeekFrom};
@@ -110,7 +65,6 @@ fn parse_ms(v: &str) -> Option<u64> {
 }
 
 /// `sleep`'s words (the tag already taken); `Ok(None)` for `-h`/`--help`.
-///
 /// # Errors
 /// An unknown word, no `--for`, a value out of its range, or `--rule` or
 /// `--within` without `--at-act`.
@@ -215,8 +169,7 @@ pub(crate) enum Sig {
     Cont,
 }
 
-/// The process operations a sleep makes, injected so its tests stop nothing
-/// and never sleep.
+/// The process operations a sleep makes, injected so its tests stop nothing and never sleep.
 pub(crate) trait Ops {
     /// Whether `pid` is a live process of the lab ([`crate::lab::names_this_lab`]).
     fn names_lab(&mut self, run: &Run, pid: i32) -> bool;
@@ -225,27 +178,22 @@ pub(crate) trait Ops {
     /// Whether `pid` lives.
     fn alive(&mut self, pid: i32) -> bool;
     /// The offset now, in whole seconds.
-    ///
     /// # Errors
     /// It cannot be read.
     fn read_offset(&mut self, run: &Run) -> Result<i64, String>;
     /// Set the offset (by a rename).
-    ///
     /// # Errors
     /// The write failed.
     fn write_offset(&mut self, run: &Run, secs: i64) -> Result<(), String>;
-    /// The lines the instance's harness journaled since the last call: the
-    /// first call returns none and marks where the journals end now.
+    /// The lines the instance's harness journaled since the last call: the first call returns none and marks where the journals end now.
     fn journal_lines(&mut self, run: &Run) -> Vec<String>;
     /// Send `sig` to `pid`.
-    ///
     /// # Errors
     /// The kernel refused it.
     fn signal(&mut self, pid: i32, sig: Sig) -> Result<(), String>;
     /// Now, in milliseconds since the epoch.
     fn now_ms(&mut self) -> i64;
     /// Wait `d`.
-    ///
     /// # Errors
     /// Interrupted.
     fn sleep(&mut self, d: Duration) -> Result<(), Fail>;
@@ -294,7 +242,6 @@ fn await_act(run: &Run, a: &Asked, ops: &mut impl Ops) -> Result<(Act, i64), Fai
     let every = PID_LOOK.as_millis() / ACT_LOOK.as_millis();
     poll(ops, Duration::from_secs(a.within), ACT_LOOK, |o| {
         got = o.journal_lines(run).iter().find_map(|l| act_of(l, rule));
-        // Periodic early refusal; the signal also has its own final admission.
         looks += 1;
         if got.is_none() && u128::from(looks) % every == 0 {
             gone = !o.names_lab(run, pid);
@@ -318,7 +265,6 @@ fn await_act(run: &Run, a: &Asked, ops: &mut impl Ops) -> Result<(Act, i64), Fai
 }
 
 /// Re-read the recorded instance's lab membership at the point of use.
-/// This is an observation, not an atomic process handle: check and signal still race.
 fn require_instance(run: &Run, pid: i32, ops: &mut impl Ops) -> Result<(), Fail> {
     if ops.names_lab(run, pid) {
         return Ok(());
@@ -330,7 +276,6 @@ fn require_instance(run: &Run, pid: i32, ops: &mut impl Ops) -> Result<(), Fail>
 }
 
 /// The sleep of lab `run`.
-///
 /// # Errors
 /// Refused (above), interrupted, the offset could not be stepped, or the
 /// instance did not take the step.
@@ -359,21 +304,17 @@ fn sleep(run: &Run, a: &Asked, ops: &mut impl Ops) -> Result<Slept, Fail> {
         None
     };
     let t_stop = ops.now_ms();
-    // The record reads and act wait may have outlived the entry admission.
     require_instance(run, pid, ops)?;
     ops.signal(pid, Sig::Stop)
         .map_err(|e| Fail::die(format!("sleep: instance {pid} could not be stopped: {e}")))?;
     let held = step_and_hold(run, a, ops, new);
     let t_cont = ops.now_ms();
-    // Keep the error/interrupt cleanup path, but never continue a PID on
-    // the strength of the admission made before the hold.
     let continued = if ops.names_lab(run, pid) {
         ops.signal(pid, Sig::Cont)
     } else {
         Err("the pid is no longer confirmed as this lab's".to_string())
     };
     if let Err(e) = continued {
-        // Ended in the hold (a crash a driver made: `crash --keep-tree`, whose next
         // instance starts at the stepped offset): nothing is left to continue.
         if !ops.alive(pid) {
             return Err(Fail::die(format!(
@@ -464,9 +405,7 @@ struct Tail {
 
 impl Tail {
     /// The whole lines `journals` (each with its length now) gained since the
-    /// last look; `read(path, from)` reads one from a place. A journal first
-    /// seen after the first look is new from its start; a line still being
-    /// written is read at the look after it ends.
+    /// last look; `read(path, from)` reads one from a place.
     fn lines(
         &mut self,
         journals: &[(PathBuf, u64)],
@@ -712,7 +651,6 @@ mod tests {
             }
             self.offset = secs;
             self.ev.push(Ev::Offset(secs));
-            // Claude Code, never stopped, takes it at its next read
             let now = self.clock;
             for (pid, _, steps) in &mut self.took {
                 if *pid == CLAUDE {
@@ -773,9 +711,7 @@ mod tests {
     }
 
     /// THE SLEEP: the instance alone is stopped, the offset stepped while it
-    /// is, held, and continued; nothing else is signalled. Once continued the
-    /// instance records the new offset, and the processes that took the
-    /// step are listed (Claude Code, never stopped, took it in the hold).
+    /// is, held, and continued; nothing else is signalled.
     #[test]
     fn the_offset_steps_between_a_stop_and_a_continue_of_the_instance_alone() {
         let mut f = fake();
@@ -798,7 +734,6 @@ mod tests {
             ]
         );
         assert!(s.not_yet.is_empty() && s.act.is_none());
-        // a second sleep steps on from the first
         let s = sleep(&lab(), &asked(&["--for", "60"]), &mut f).unwrap();
         assert_eq!((s.old, s.new), (1800, 1860));
     }
@@ -835,7 +770,6 @@ mod tests {
         assert!(read - act.t <= 2, "read {} ms after it", read - act.t);
         assert_eq!(s.t_stop, read);
         assert_eq!(f.ev[0], Ev::Signal(INSTANCE, Sig::Stop));
-        // with no rule named, the first act of any rule
         let mut f = fake();
         let t0 = f.clock;
         f.journal = vec![
@@ -847,7 +781,7 @@ mod tests {
     }
 
     /// AN INTERRUPT IN THE HOLD, OR A STEP THAT COULD NOT BE WRITTEN, STILL
-    /// CONTINUES THE CONFIRMED INSTANCE. Lost custody refuses another signal.
+    /// CONTINUES THE CONFIRMED INSTANCE.
     #[test]
     fn an_interrupt_or_a_failed_step_still_continues_the_instance() {
         let mut f = fake();
@@ -875,8 +809,6 @@ mod tests {
         );
         assert_eq!(f.offset, 0);
 
-        // A still-live PID that ceased to be this lab during the hold must
-        // not receive CONT, even though it received STOP before custody changed.
         let mut f = fake();
         f.ours_until = Some(f.clock + 1000);
         let e = sleep(&lab(), &asked(&["--for", "1800", "--hold", "3"]), &mut f).unwrap_err();
@@ -895,8 +827,7 @@ mod tests {
     /// AN INSTANCE THAT ENDS WHILE IT IS STOPPED (a crash a driver makes in
     /// the hold: `crash --keep-tree`, the next instance up at the stepped
     /// offset) is said to have ended, never to be left stopped: there is
-    /// nothing to continue. The verb fails (its instance took no step), the
-    /// offset stands, and nothing else is signalled.
+    /// nothing to continue.
     #[test]
     fn an_instance_that_ends_in_the_hold_is_said_gone_not_left_stopped() {
         let mut f = fake();
@@ -962,7 +893,6 @@ mod tests {
         .unwrap_err();
         assert!(e.msg.unwrap().contains("no act journaled within 5 s"));
         assert!(f.ev.is_empty() && f.offset == 0);
-        // the instance ends during the wait: refused within a second of it, before the act came
         let mut f = fake();
         let t0 = f.clock;
         f.journal = vec![line(t0 + 600_000, "continued", "usage-resume@v1")];
@@ -972,8 +902,6 @@ mod tests {
         assert!(f.ev.is_empty() && f.offset == 0);
         assert!(f.clock - t0 <= 61_000, "refused {} ms on", f.clock - t0);
 
-        // The act arrives at the same observation that loses custody. The
-        // periodic wait check must not lend its older result to STOP.
         let mut f = fake();
         let t0 = f.clock;
         f.journal = vec![line(t0 + 2, "continued", "usage-resume@v1")];
@@ -983,8 +911,6 @@ mod tests {
         assert!(f.ev.is_empty() && f.offset == 0);
         assert_eq!(f.clock, t0 + 2);
 
-        // A full-domain stored offset must refuse an unrepresentable step
-        // before either signalling or changing the offset.
         let mut f = fake();
         f.offset = i64::MAX;
         let e = sleep(&lab(), &asked(&["--for", "1"]), &mut f).unwrap_err();
@@ -992,7 +918,6 @@ mod tests {
         assert!(f.ev.is_empty());
         assert_eq!(f.offset, i64::MAX);
 
-        // Ordinary signed offsets still step through the same full path.
         let mut f = fake();
         f.offset = -1;
         let got = sleep(&lab(), &asked(&["--for", "1"]), &mut f).unwrap();

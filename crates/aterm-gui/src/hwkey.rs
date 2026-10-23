@@ -28,16 +28,18 @@ const FLAG_CONTROL: u64 = 1 << 18;
 const FLAG_OPTION: u64 = 1 << 19;
 const FLAG_COMMAND: u64 = 1 << 20;
 /// `NSEventModifierFlagFunction` — AppKit sets it on arrows and F-keys, and some
+/// responders read it, so a synthetic arrow must carry it too.
 const FLAG_FUNCTION: u64 = 1 << 23;
 
 /// Upper bound on one `hwkey` invocation: the verb blocks while it paces the stream, so an
+/// unbounded count would pin a control worker.
 const MAX_COUNT: u32 = 5000;
 /// Upper bound on the pacing interval, for the same reason.
 const MAX_INTERVAL_MS: u64 = 1000;
-/// Default pacing: 40 ms ≈ 25 keys/s, brisk typing. Not zero: a zero-interval burst measures
+/// Default pacing: 40 ms ≈ 25 keys/s, brisk typing.
 const DEFAULT_INTERVAL_MS: u64 = 40;
 
-/// A named key: `(name, keycode, characters)`. `characters` uses the private-use
+/// A named key: `(name, keycode, characters)`.
 const NAMED: &[(&str, u16, &str)] = &[
     ("enter", 36, "\r"),
     ("return", 36, "\r"),
@@ -158,6 +160,7 @@ fn ansi_keycode(c: char) -> Option<(u16, bool)> {
 }
 
 /// Strip leading inline modifier prefixes (`ctrl+`, `alt+`, …), mirroring
+/// [`crate::control_input::parse_key`]'s grammar so the two verbs read the same.
 fn take_inline_mods(body: &str) -> (u64, &str) {
     let mut m = 0u64;
     let mut rest = body;
@@ -176,6 +179,7 @@ fn take_inline_mods(body: &str) -> (u64, &str) {
 }
 
 /// Parse `mods=<list>` / `count=<n>` / `interval=<ms>` trailing tokens, returning them plus the
+/// residual body.
 fn take_tokens(rest: &str) -> Result<(u64, u32, u64, bool, String), String> {
     let mut mods = 0u64;
     let mut count = 1u32;
@@ -406,6 +410,10 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
 }
 
 /// A key-down (`down`) or key-up `NSEvent` built as a key press is: a CoreGraphics
+/// keyboard event for `keycode` with `flags` (`CGEventFlags` share the bit positions of
+/// `NSEventModifierFlags`), wrapped by `+[NSEvent eventWithCGEvent:]`, so its
+/// `characters` are the current layout's for that key and modifiers and its timestamp is
+/// the CoreGraphics event's own (the same seconds-since-boot clock).
 #[cfg(target_os = "macos")]
 fn press_event(keycode: u16, down: bool, flags: u64) -> aterm_objc::Id {
     use std::ffi::c_void;
@@ -451,6 +459,7 @@ mod tests {
     use super::{FLAG_CONTROL, FLAG_FUNCTION, FLAG_SHIFT, MAX_COUNT, parse_hwkey};
 
     /// A bare letter is the unshifted US-QWERTY key for it, with no modifiers and
+    /// both character strings equal — the shape AppKit reports for a plain press.
     #[test]
     fn a_plain_letter_is_its_unshifted_physical_key() {
         let s = parse_hwkey("x").expect("x parses");
@@ -462,6 +471,8 @@ mod tests {
     }
 
     /// SHIFT is DERIVED from the character, not demanded from the caller: `hwkey X`
+    /// must be the same physical key as `hwkey x` plus the shift flag, because that
+    /// is what the keyboard does.
     #[test]
     fn an_uppercase_letter_shifts_the_same_physical_key() {
         for (plain, shifted) in [("x", "X"), ("1", "!")] {
@@ -474,6 +485,8 @@ mod tests {
     }
 
     /// Control chords carry the C0 byte in `characters` (what AppKit delivers) and
+    /// the bare letter in `charactersIgnoringModifiers` (what winit reads for the
+    /// logical key).
     #[test]
     fn a_control_chord_carries_the_c0_byte_and_the_bare_letter() {
         let a = parse_hwkey("ctrl+u").unwrap();
@@ -485,6 +498,7 @@ mod tests {
     }
 
     /// Named keys resolve to their AppKit keycode and private-use character, and the ones AppKit
+    /// marks as function keys carry that flag.
     #[test]
     fn named_keys_match_appkit_codes_and_function_flag() {
         let enter = parse_hwkey("enter").unwrap();
@@ -509,6 +523,7 @@ mod tests {
     }
 
     /// winit unwraps `charactersIgnoringModifiers` with `.expect(...)`, so an empty string there
+    /// would panic on dispatch: no accepted spelling produces one.
     #[test]
     fn no_accepted_key_yields_empty_character_strings() {
         for spelling in [
@@ -546,6 +561,7 @@ mod tests {
     }
 
     /// Pacing tokens are additive and bounded; out-of-range or malformed values are refused,
+    /// never clamped or defaulted.
     #[test]
     fn pacing_tokens_are_additive_and_bounded() {
         let s = parse_hwkey("x count=200 interval=25").unwrap();
@@ -561,6 +577,7 @@ mod tests {
     }
 
     /// `shape=press` asks for the key-press shape and changes nothing else about the
+    /// key; the default is the built shape, and an unknown shape is refused.
     #[test]
     fn the_press_shape_is_asked_for_by_name_and_keeps_the_key() {
         let built = parse_hwkey("b mods=alt").unwrap();

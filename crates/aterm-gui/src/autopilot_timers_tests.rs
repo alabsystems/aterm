@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Autopilot's timer (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9.3.8):
-//! the `until=` parser and its DST rules, the reply, the index, and the
-//! App's writer, wire, fire and close.
+//! Autopilot's timer (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9.3.8): the `until=` parser and its DST rules, the reply, the index, and the App's writer, wire, fire and close.
 
 use super::*;
 use crate::session_timeline::{AUTOPILOT_USAGE, Fired, fire_land_at};
@@ -20,8 +18,8 @@ fn fixed(offset_s: i64) -> impl Fn(i64) -> Option<i64> {
 /// forward at 2027-03-28T01:00Z (02:00 local becomes 03:00) and back at
 /// 2026-10-25T01:00Z (03:00 local becomes 02:00).
 fn europe(unix: i64) -> Option<i64> {
-    const BACK: i64 = 1_792_890_000; // 2026-10-25T01:00:00Z
-    const FORWARD: i64 = 1_806_195_600; // 2027-03-28T01:00:00Z
+    const BACK: i64 = 1_792_890_000;
+    const FORWARD: i64 = 1_806_195_600;
     Some(if (BACK..FORWARD).contains(&unix) {
         3_600
     } else {
@@ -47,8 +45,7 @@ fn days(year: i64, month: i64, day: i64) -> i64 {
 }
 
 /// `<when>`: `HH:MM`, and `+<n>h`, `+<n>m`, `+<n>h<n>m` from 1 minute to 24
-/// hours. NEGATIVE CONTROLS: every other spelling, `+0m` and one minute past
-/// a day among them.
+/// hours.
 #[test]
 fn until_takes_a_clock_time_or_a_duration_from_a_minute_to_a_day() {
     for (text, want) in [
@@ -76,11 +73,11 @@ fn until_takes_a_clock_time_or_a_duration_from_a_minute_to_a_day() {
 
 /// `HH:MM` is the earliest instant STRICTLY after now that reads it: today's
 /// while it is ahead, else tomorrow's (the midnight wrap), and now itself is
-/// not after now. `+DURATION` is elapsed time from the next whole second.
+/// not after now.
 #[test]
 fn a_clock_time_is_todays_while_ahead_else_tomorrows() {
     let plus1 = fixed(3_600);
-    let now_ms = FRI_19Z * 1000; // 20:00 local
+    let now_ms = FRI_19Z * 1000;
     let today = (FRI_19Z + 3_600).div_euclid(86_400);
     let r = resolve(When::Clock(21 * 60), now_ms, &plus1).unwrap();
     assert_eq!(r.at_ms, at(today, 21, 0, 3_600) * 1000, "today");
@@ -101,13 +98,10 @@ fn a_clock_time_is_todays_while_ahead_else_tomorrows() {
     );
     let r = resolve(When::Clock(20 * 60), now_ms - 1, &plus1).unwrap();
     assert_eq!(r.at_ms, now_ms, "a millisecond before it, it is today's");
-    // Durations: from the next whole second, never short.
     let r = resolve(When::In(2), now_ms + 250, &plus1).unwrap();
     assert_eq!(r.at_ms, (FRI_19Z + 1 + 120) * 1000);
     let r = resolve(When::In(1440), now_ms, &plus1).unwrap();
     assert_eq!(r.at_ms - now_ms, 24 * 3_600 * 1000);
-    // A zone the platform cannot read places no clock time, and a duration
-    // still lands.
     let none = |_| None;
     assert_eq!(
         resolve(When::Clock(60), now_ms, &none),
@@ -119,37 +113,28 @@ fn a_clock_time_is_todays_while_ahead_else_tomorrows() {
 
 /// DST, §9.3.5: a time a spring-forward skips is refused WITH THE DATE on the
 /// day it would fall — and only there: one already behind now takes
-/// tomorrow's. A fall-back night reads a time twice: the earlier reading
-/// still ahead. So an `HH:MM` lies at most 25 h of elapsed time ahead.
+/// tomorrow's.
 #[test]
 fn dst_skipped_times_are_refused_and_repeated_ones_take_the_earlier_reading_ahead() {
     let mar27 = days(2027, 3, 27);
     let mar28 = days(2027, 3, 28);
     let oct24 = days(2026, 10, 24);
     let oct25 = days(2026, 10, 25);
-    // The evening before the clocks go forward: 02:30 tomorrow does not exist.
     let now = at(mar27, 22, 0, 3_600) * 1000;
     let refused = resolve(When::Clock(2 * 60 + 30), now, &europe).unwrap_err();
     assert_eq!(
         refused.reason().as_deref(),
         Some("02:30 does not exist on 2027-03-28 (the clocks go forward)")
     );
-    // 03:30 that morning exists, an hour after 01:59 by the wall.
     let r = resolve(When::Clock(3 * 60 + 30), now, &europe).unwrap();
     assert_eq!(r.at_ms, at(mar28, 3, 30, 7_200) * 1000);
-    // The same morning, after the jump: the skipped reading is behind now,
-    // so tomorrow's 02:30 is taken.
     let now = at(mar28, 10, 0, 7_200) * 1000;
     let r = resolve(When::Clock(2 * 60 + 30), now, &europe).unwrap();
     assert_eq!(r.at_ms, at(mar28 + 1, 2, 30, 7_200) * 1000);
-    // A 23 h night: 01:30 on the 27th to 01:30 on the 28th... is 24 h of wall
-    // reading and 24 h elapsed (before the jump), and 03:30 is 23 h ahead of
-    // 04:30 the day before.
     let now = at(mar27, 4, 30, 3_600) * 1000;
     let r = resolve(When::Clock(4 * 60), now, &europe).unwrap();
     assert_eq!((r.at_ms - now) / 1000, 23 * 3_600 - 30 * 60);
 
-    // The night the clocks go back reads 02:30 twice (at +02:00, then +01:00).
     let now = at(oct24, 23, 0, 7_200) * 1000;
     let r = resolve(When::Clock(2 * 60 + 30), now, &europe).unwrap();
     assert_eq!(
@@ -161,7 +146,6 @@ fn dst_skipped_times_are_refused_and_repeated_ones_take_the_earlier_reading_ahea
         r.reply(),
         format!("land_at={} local=2026-10-25T02:30+02:00", r.at_ms / 1000)
     );
-    // Between the two readings: the earlier is behind, the later still ahead.
     let now = at(oct25, 2, 45, 7_200) * 1000;
     let r = resolve(When::Clock(2 * 60 + 30), now, &europe).unwrap();
     assert_eq!(r.at_ms, at(oct25, 2, 30, 3_600) * 1000, "the later reading");
@@ -169,8 +153,6 @@ fn dst_skipped_times_are_refused_and_repeated_ones_take_the_earlier_reading_ahea
         r.reply(),
         format!("land_at={} local=2026-10-25T02:30+01:00", r.at_ms / 1000)
     );
-    // The bound: 03:30 on the 24th, asking for 03:30 — the day after holds a
-    // 25 h night, and it is never further.
     let now = at(oct24, 3, 30, 7_200) * 1000;
     let r = resolve(When::Clock(3 * 60 + 30), now, &europe).unwrap();
     assert_eq!((r.at_ms - now) / 1000, 25 * 3_600);
@@ -231,7 +213,6 @@ fn the_face_names_the_weekday_only_on_another_day() {
         (next.clock.as_str(), next.other_day),
         ("16:00", Some(Weekday::Sat))
     );
-    // The same instant, read from a zone where it is still Friday.
     let west = glass_of((FRI_19Z + 21 * 3_600) * 1000, now, &fixed(-18 * 3_600)).unwrap();
     assert_eq!((west.clock.as_str(), west.other_day), ("22:00", None));
     assert_eq!(glass_of(now, now, &|_| None), None);
@@ -239,15 +220,7 @@ fn the_face_names_the_weekday_only_on_another_day() {
 
 /// THE OFFER NAMES THE DAY IT WOULD ARM (§9.3.3, §9.3.4; the Together run's
 /// D6: `land_at = "18:36"` chosen at 18:49 armed Saturday's 18:36 while the
-/// menu row and the Settings button read `18:36`). Offered on Friday before
-/// 18:36 it arms today and reads `18:36`; at 18:36 itself (an `HH:MM` is
-/// strictly after now) and at 18:49 it arms Saturday and reads `Sat 18:36`,
-/// the words the state line says once armed. Across midnight: `00:10`
-/// offered at 23:59 Friday is `Sat 00:10`, at 00:05 Saturday it is today's,
-/// and at 00:10 Saturday Sunday's. The local date decides, not UTC's. At
-/// every offer the face is the armed instant's ([`resolve`], [`glass_of`]).
-/// NEGATIVE CONTROLS: a zone that cannot be read, and a time the clocks skip
-/// on the day it would fall, give the clock alone (no choice arms there).
+/// menu row and the Settings button read `18:36`).
 #[test]
 fn the_land_at_offer_names_the_day_once_todays_time_has_passed() {
     use aterm_agent::supervise::LandAt;
@@ -282,8 +255,6 @@ fn the_land_at_offer_names_the_day_once_todays_time_has_passed() {
             "the offer is the armed instant's face"
         );
     }
-    // 23:30 UTC on Friday is already Saturday 01:30 two hours east: there,
-    // 18:36 is still ahead today; seven hours west it is Friday 16:30.
     let late = at(fri, 23, 30, 0);
     assert_eq!(
         read(six, late, &utc),
@@ -297,7 +268,6 @@ fn the_land_at_offer_names_the_day_once_todays_time_has_passed() {
         read(six, late, &fixed(-7 * 3_600)),
         ("18:36".to_owned(), None)
     );
-    // NEGATIVE CONTROLS: no zone; a time the spring-forward skips that day.
     assert_eq!(read(six, late, &|_| None), ("18:36".to_owned(), None));
     let skipped = LandAt::parse("02:30").expect("a time");
     let night = at(days(2027, 3, 28), 1, 30, 3_600);
@@ -309,11 +279,7 @@ fn the_land_at_offer_names_the_day_once_todays_time_has_passed() {
 /// (§9.3.3: a menu or a page held open across the minute is built again
 /// then): before 18:36 the next turn is 18:36 itself (from there it arms
 /// tomorrow and names the day); after it, the next local midnight (from there
-/// tomorrow is today, and the day goes). Across every minute of a Friday and
-/// a Saturday morning, in three zones, the offer reads the same from one
-/// turn to the instant before the next, and differently at the turn — so a
-/// wake at the turn is the one that keeps the words true. NEGATIVE CONTROL:
-/// with no zone the offer is the clock alone and never turns (`None`).
+/// tomorrow is today, and the day goes).
 #[test]
 fn the_land_at_offer_turns_at_its_instant_and_at_midnight_only() {
     use aterm_agent::supervise::LandAt;
@@ -362,14 +328,12 @@ fn the_land_at_offer_turns_at_its_instant_and_at_midnight_only() {
             now += 60_000;
         }
     }
-    // NEGATIVE CONTROL.
     assert_eq!(offer_turns_at(six, FRI_19Z * 1000, &|_| None), None);
 }
 
 /// THE INDEX says when to look: a passed instant is due at once; the earliest
 /// due is the one deadline; a due entry is taken OUT; a moved wall derives
-/// every due again; an entry goes with its session. With nothing armed there
-/// is no deadline at all.
+/// every due again; an entry goes with its session.
 #[test]
 fn the_index_derives_its_dues_from_the_wall_and_takes_each_out_once() {
     let mut timers = AutopilotTimers::default();
@@ -413,7 +377,6 @@ fn the_index_derives_its_dues_from_the_wall_and_takes_each_out_once() {
     assert_eq!(due.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [8]);
     assert!(timers.take_due(now).is_empty(), "taken out once");
     assert_eq!(timers.earliest(), Some(now + Duration::from_secs(120)));
-    // Asleep for 100 s: the monotonic due stands still until the wall is read.
     let later = now + Duration::from_secs(1);
     timers.rederive(later, wall + 101_000, &utc);
     assert_eq!(timers.earliest(), Some(later + Duration::from_secs(19)));
@@ -426,11 +389,7 @@ fn the_index_derives_its_dues_from_the_wall_and_takes_each_out_once() {
 /// THE SAME INSTANT INDEXED AGAIN IS NO MOVE: a meta write that touched
 /// neither half of the pair (a title, an attention, a claim) re-reads the
 /// store, and the index derives the same instant's `due` from two clocks read
-/// later, a few microseconds off every time. That is no move, so the footer
-/// gets no wake for it (§9.3.6, item 1: the footer follows either half); the
-/// due itself follows the later reading, and what a restore's passed instant
-/// passed while stands for the fire's record. NEGATIVE CONTROLS: another
-/// instant, and another face (the zone moved), each move it.
+/// later, a few microseconds off every time.
 #[test]
 fn the_same_instant_indexed_again_is_no_move() {
     let mut timers = AutopilotTimers::default();
@@ -438,7 +397,6 @@ fn the_same_instant_indexed_again_is_no_move() {
     let now = Instant::now();
     let wall = FRI_19Z * 1000;
     assert!(timers.arm(7, wall + 120_000, now, wall, &utc, None));
-    // Read again 1.234 s later on the monotonic clock, 1.233 s on the wall.
     let later = now + Duration::from_millis(1_234);
     assert!(
         !timers.arm(7, wall + 120_000, later, wall + 1_233, &utc, None),
@@ -449,14 +407,12 @@ fn the_same_instant_indexed_again_is_no_move() {
         later + Duration::from_millis(118_767),
         "the due follows the later reading"
     );
-    // A restore's passed instant, indexed again live before its fire.
     assert!(timers.arm(8, wall - 5_000, now, wall, &utc, Some(ClosedOver::Aterm)));
     assert!(!timers.arm(8, wall - 5_000, later, wall + 1_233, &utc, None));
     assert_eq!(
         timers.entry(8).unwrap().passed_while,
         Some(ClosedOver::Aterm)
     );
-    // NEGATIVE CONTROLS.
     assert!(
         timers.arm(7, wall + 180_000, later, wall + 1_233, &utc, None),
         "another instant"
@@ -468,9 +424,7 @@ fn the_same_instant_indexed_again_is_no_move() {
 }
 
 /// DISPLAY DAY WORDS follow the date's first instant, even where clocks
-/// skip 00:00. Ordinary midnights, the first of a repeated midnight and an
-/// unreadable zone stay controls; an explicitly requested missing 00:00
-/// remains refused. This exercises the production deadline helpers only.
+/// skip 00:00.
 #[test]
 fn day_words_refresh_where_the_date_starts_when_midnight_is_skipped() {
     use aterm_agent::supervise::LandAt;
@@ -487,8 +441,6 @@ fn day_words_refresh_where_the_date_starts_when_midnight_is_skipped() {
     assert_eq!(day_words_turn_at(9 * DAY, &|_| None), None);
     assert_eq!(offer_turns_at(six, 9 * DAY, &|_| None), None);
 
-    // A one-hour spring jump at 00:00 (-5 to -4), and a fall return
-    // at 01:00 to 00:00 (-4 to -5), the existing day-start helper's lane.
     let spring = 10 * DAY + 5 * HOUR;
     let fall = 20 * DAY + 5 * HOUR;
     let zone = |unix_s: i64| {
@@ -568,12 +520,7 @@ fn wire(app: &mut App, rest: &str) -> (String, bool) {
 /// THE WIRE (§9.3.5): `meta set autopilot cruise until=+DURATION` stores the
 /// word and its instant as one write, answers `OK land_at=… local=…` with the
 /// `OK` leading, records the `meta-change` with the instant, and its wake
-/// indexes the timer; the bare `meta` prints `land_at=`. THE SAME WORD
-/// CANCELS: `meta set autopilot cruise` after it leaves no timer and no
-/// entry, and is a change (recorded, its wake posted). The owner's word for
-/// Cruise takes a time too. NEGATIVE CONTROLS: `until=` with `land`, `off` or
-/// no word, two of them, and a malformed `<when>` each refuse with the one
-/// usage line and store nothing.
+/// indexes the timer; the bare `meta` prints `land_at=`.
 #[test]
 fn the_wire_arms_a_timed_cruise_and_the_same_word_cancels_it() {
     let (mut app, host) = hosted();
@@ -614,7 +561,6 @@ fn the_wire_arms_a_timed_cruise_and_the_same_word_cancels_it() {
         Some(format!("field=autopilot value=cruise land_at={land_at}").as_str())
     );
 
-    // THE SAME WORD AGAIN, by hand: the timer goes, as a change.
     let before = meta_changes(&app).len();
     let (reply, changed) = wire(&mut app, "set autopilot cruise");
     assert_eq!(
@@ -631,7 +577,6 @@ fn the_wire_arms_a_timed_cruise_and_the_same_word_cancels_it() {
     assert!(app.autopilot_timers.is_empty(), "no entry left");
     assert_eq!(app.autopilot_timer_deadline(), None);
 
-    // The owner's word for Cruise; then `unset` cancels too.
     let (reply, _) = wire(&mut app, "set autopilot forever until=+1h30m");
     assert!(reply.starts_with("OK land_at="), "{reply}");
     assert!(!app.autopilot_timers.is_empty());
@@ -640,7 +585,6 @@ fn the_wire_arms_a_timed_cruise_and_the_same_word_cancels_it() {
     assert_eq!(stored(&app), (None, None));
     assert!(app.autopilot_timers.is_empty());
 
-    // Refusals: the one usage line, nothing stored.
     let usage = format!("ERR {AUTOPILOT_USAGE}\n");
     let only_cruise = format!("ERR until= goes with cruise only: {AUTOPILOT_USAGE}\n");
     for (rest, want) in [
@@ -665,13 +609,7 @@ fn the_wire_arms_a_timed_cruise_and_the_same_word_cancels_it() {
     host.shutdown_and_join();
 }
 
-/// THE FIRE IS A COMPARE-AND-SET (§9.3.6, item 5). Due, with the pair still
-/// stored, it writes `land` with no timer, marks the driver bit, records the
-/// change, rings the host and leaves the record. NEGATIVE CONTROLS: an `off`
-/// stored over the wire whose wake the App has not applied wins (the fire
-/// finds it and writes nothing, leaving no entry); a clock set back finds
-/// the wall short (nothing written; the remainder indexed); a re-arm stored
-/// first is indexed again at its new instant.
+/// THE FIRE IS A COMPARE-AND-SET (§9.3.6, item 5).
 #[test]
 fn the_fire_lands_only_the_stored_pair_and_the_hand_always_wins() {
     let (mut app, host) = hosted();
@@ -680,7 +618,6 @@ fn the_fire_lands_only_the_stored_pair_and_the_hand_always_wins() {
     set_fake_clocks(Some((mono, wall)));
     let land_at = wall + 120_000;
 
-    // Due, stored: Land.
     assert!(app.set_session_autopilot_timed(
         0,
         Some(Autopilot::Cruise),
@@ -726,14 +663,12 @@ fn the_fire_lands_only_the_stored_pair_and_the_hand_always_wins() {
         .records()
         .rfind(|r| r.key.as_deref() == Some(key.as_str()))
         .map(|r| r.title.clone());
-    // Under the glass title rule (§10.2.1): the time is the line's.
     assert_eq!(
         record.as_deref(),
         Some("Autopilot switched to land"),
         "{record:?}"
     );
 
-    // The race: armed, then `off` stored over the wire, its wake NOT applied.
     set_fake_clocks(Some((mono, wall)));
     assert!(app.set_session_autopilot_timed(
         0,
@@ -761,8 +696,6 @@ fn the_fire_lands_only_the_stored_pair_and_the_hand_always_wins() {
     app.on_meta_changed(0);
     assert!(app.autopilot_timers.is_empty());
 
-    // The clock set back under a due entry: the wall is short; nothing is
-    // written, and the remainder is indexed.
     set_fake_clocks(Some((mono, wall)));
     assert!(app.set_session_autopilot_timed(
         0,
@@ -779,8 +712,6 @@ fn the_fire_lands_only_the_stored_pair_and_the_hand_always_wins() {
         Some(due + Duration::from_secs(30))
     );
 
-    // A re-arm stored first (over the wire, its wake not applied): the fire
-    // finds the new instant and indexes it.
     let later = land_at + 600_000;
     assert!(
         crate::session_timeline::apply_autopilot(
@@ -816,7 +747,7 @@ fn the_fire_lands_only_the_stored_pair_and_the_hand_always_wins() {
 
 /// A SESSION CLOSED WITH A TIMER ARMED leaves no entry, so nothing wakes
 /// after it (§9.3.7): its entry goes with its registration, and no deadline
-/// is folded. NEGATIVE CONTROL: before the close, the deadline is there.
+/// is folded.
 #[test]
 fn closing_the_session_drops_its_timer() {
     let (mut app, host) = hosted();
@@ -869,7 +800,6 @@ fn run_claude(app: &App) {
 /// the landing) — that the harness lands all of it on the remote main branch;
 /// with the harness switched off, or Claude Code's own switch off, that
 /// nothing is landed; in a tab with no agent, that there is nothing to land.
-/// NEGATIVE CONTROL: only work the harness carries is landed.
 #[test]
 fn the_fire_says_what_it_found() {
     use aterm_agent::harness::acts::TaskFace;
@@ -916,7 +846,6 @@ fn the_fire_says_what_it_found() {
     let clock = glass_of(land_at, wall, &local_offset_at)
         .expect("the zone reads")
         .clock;
-    // Land's own sentence, from the one table (`autopilot::MODE_WORDS`).
     let land_words = crate::autopilot::mode_words(aterm_agent::supervise::Autopilot::Land)
         .record
         .to_string();
@@ -948,7 +877,6 @@ fn the_fire_says_what_it_found() {
         let what = format!("{agent} {face:?} {after:?}");
         assert_eq!(title, "Autopilot switched to land", "{what}");
         assert_eq!(detail.len(), 2, "{what}: {detail:?}");
-        // Who set it: the timer, by its own clock (§11.7.1).
         assert_eq!(
             detail[1],
             format!("set at the {} timer", clock.as_str()),
@@ -971,12 +899,7 @@ fn the_fire_says_what_it_found() {
 /// a tab split Claude Code | shell, a timer set on the shell's pane — or on
 /// Claude Code's before it exited there — fires with its place naming that
 /// pane, `Tab 1, right pane: …`, and says `no agent runs in this pane`,
-/// never `in the tab`, where Claude Code still runs in the left pane. Main
-/// read `Tab 1: … no agent runs in the tab`: the place named panes only
-/// among agents, and one agent beside a shell names none. NEGATIVE
-/// CONTROLS: a shell alone in its tab still reads `Tab 1: … no agent runs
-/// in the tab`, with no pane; and Claude Code's own record beside that
-/// shell still names no pane (one agent in the tab, §10.3.5).
+/// never `in the tab`, where Claude Code still runs in the left pane.
 #[test]
 fn a_fire_over_a_pane_with_no_agent_says_so_of_the_pane() {
     let wall = FRI_19Z * 1000;
@@ -1012,7 +935,6 @@ fn a_fire_over_a_pane_with_no_agent_says_so_of_the_pane() {
         .clock;
     let turned = format!("at {} Autopilot switched to land; ", clock.as_str());
 
-    // Claude Code | shell: the timer on the shell's pane.
     let (mut app, host) = hosted();
     let shell = app.split_active_stub_tab(crate::WindowId(0));
     run_claude(&app);
@@ -1029,7 +951,6 @@ fn a_fire_over_a_pane_with_no_agent_says_so_of_the_pane() {
         ],
         "the pane named, and the pane's own words"
     );
-    // CONTROL: Claude Code's own record beside the shell names no pane.
     let (_, claude) = fire(&mut app, 0);
     assert!(
         claude[0].starts_with("Tab 1: ") && !claude[0].contains("pane"),
@@ -1037,7 +958,6 @@ fn a_fire_over_a_pane_with_no_agent_says_so_of_the_pane() {
     );
     host.shutdown_and_join();
 
-    // CONTROL: a shell alone in its tab is the tab.
     let (mut app, host) = hosted();
     let (_, alone) = fire(&mut app, 0);
     assert_eq!(
@@ -1053,8 +973,7 @@ fn a_fire_over_a_pane_with_no_agent_says_so_of_the_pane() {
 /// A HAND CHANGE NAMES THE TIMER IT DROPPED (§10.2.3 item 8): a timed Cruise
 /// set from the window is recorded `Autopilot cruises until HH:MM`; a hand
 /// change to Land over it is recorded `Autopilot set to land` with a last
-/// line `the HH:MM landing time is cancelled`. NEGATIVE CONTROL: the same
-/// change over no timer carries no such line.
+/// line `the HH:MM landing time is cancelled`.
 #[test]
 fn a_hand_change_names_the_timer_it_dropped() {
     let (mut app, host) = hosted();
@@ -1086,7 +1005,6 @@ fn a_hand_change_names_the_timer_it_dropped() {
         ],
         "{detail:?}"
     );
-    // NEGATIVE CONTROL: no timer, no cancel line.
     assert!(app.set_session_autopilot(0, Some(Autopilot::Cruise), crate::autopilot::Surface::Menu));
     assert!(app.set_session_autopilot(0, Some(Autopilot::Land), crate::autopilot::Surface::Menu));
     let (_, detail) = last_record(&app);
@@ -1100,8 +1018,6 @@ fn a_hand_change_names_the_timer_it_dropped() {
 
 /// THE WINDOW'S CHOICES (the menu, Settings): `In(minutes)` arms from now, `At`
 /// takes `[harness] land_at`'s next reading, `Cancel` is Cruise with no timer.
-/// NEGATIVE CONTROLS: `At` with no `land_at` names nothing, and under the
-/// master switch (or with no host) nothing is written.
 #[test]
 fn the_windows_timer_choices_arm_and_cancel() {
     let (mut app, host) = hosted();
@@ -1148,8 +1064,7 @@ fn the_windows_timer_choices_arm_and_cancel() {
 /// ...AND BY THE SESSION'S OWN POSTURE, as its mode buttons are: a Claude
 /// Code session under `[harness.claude] enabled = false` is steered by
 /// nothing, so no timer choice arms or cancels there, though the window's
-/// harness runs (for Codex). NEGATIVE CONTROL: with only Codex's switch Off
-/// the same choice arms the Claude Code session's timed Cruise.
+/// harness runs (for Codex).
 #[test]
 fn a_timer_for_a_switched_off_agent_is_refused() {
     let wall = FRI_19Z * 1000;
@@ -1191,8 +1106,7 @@ fn a_timer_for_a_switched_off_agent_is_refused() {
 
 /// THE WALL MOVED (§9.3.6, item 6): asleep through the time, the monotonic
 /// due lies in the future still; `Wake::WallMoved` derives it again from the
-/// wall and the fire lands it. A focus gain does the same. NEGATIVE CONTROL:
-/// with no timer armed it reads no clock and moves nothing.
+/// wall and the fire lands it.
 #[test]
 fn a_moved_wall_derives_the_due_again() {
     let (mut app, host) = hosted();
@@ -1207,7 +1121,6 @@ fn a_moved_wall_derives_the_due_again() {
         Some(wall + 600_000),
         crate::autopilot::Surface::Menu
     ));
-    // Slept an hour: the monotonic clock moved a second.
     let woke = mono + Duration::from_secs(1);
     set_fake_clocks(Some((woke, wall + 3_600_000)));
     app.expire_autopilot_timers();
@@ -1227,8 +1140,7 @@ fn a_moved_wall_derives_the_due_again() {
 /// BEFORE A SUCCESSOR'S COMMIT nothing is folded and nothing fires (it is a
 /// candidate); the first park after the Commit rebuilds the index from every
 /// stored timer before it fires anything, a time that came meanwhile due at
-/// once — owed once. NEGATIVE CONTROL: the timer armed over the wire while
-/// the wake was dropped is not in the index until the rebuild.
+/// once — owed once.
 #[test]
 fn a_successor_fires_nothing_before_its_commit_and_rebuilds_at_it() {
     let (mut app, host) = hosted();
@@ -1248,7 +1160,6 @@ fn a_successor_fires_nothing_before_its_commit_and_rebuilds_at_it() {
         )
         .moved
     );
-    // Its wake is dropped before the Commit.
     assert!(
         app.admit_wake_before_commit(crate::Wake::MetaChanged { session: 0 })
             .is_none()
@@ -1257,7 +1168,6 @@ fn a_successor_fires_nothing_before_its_commit_and_rebuilds_at_it() {
         app.autopilot_timers.is_empty(),
         "not indexed: the wake was dropped"
     );
-    // An entry indexed by a graft is not folded or fired either.
     app.index_autopilot_timer(0, Some(ClosedOver::Aterm));
     assert_eq!(
         app.autopilot_timer_deadline(),
@@ -1272,9 +1182,6 @@ fn a_successor_fires_nothing_before_its_commit_and_rebuilds_at_it() {
         "no fire before Commit"
     );
     app.autopilot_timers.clear();
-    // The Commit lifts the gate (`Wake::ActivateCommittedHandoff`'s first
-    // step); the park after it rebuilds from the store, then the time that
-    // came lands.
     app.incoming_handoff_pending = false;
     app.settle_autopilot_commit();
     assert_eq!(
@@ -1285,7 +1192,6 @@ fn a_successor_fires_nothing_before_its_commit_and_rebuilds_at_it() {
     app.autopilot_timers.clear();
     app.settle_autopilot_commit();
     assert!(app.autopilot_timers.is_empty(), "owed once");
-    // The park itself settles first: a fresh successor, lifted, then parked.
     let (mut app, host2) = hosted();
     app.handoff_successor = true;
     let ctx = app.pool.get(0).unwrap().ctx.clone();

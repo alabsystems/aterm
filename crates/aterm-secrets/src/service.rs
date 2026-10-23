@@ -1,24 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The two long-running jobs: the subscriber (`aterm secrets watch`) and the server
-//! (`aterm secrets serve`), as a launchd user agent on macOS (`KeepAlive`, `ProcessType
-//! Background`, in `gui/<uid>`) or a `systemd --user` unit (`Restart=always`) on Linux.
-//! Children are built with `aterm_uds::spawnfd::command` and bounded by a deadline.
-//!
-//! The unit texts ([`plist_text`], [`systemd_unit`]), the paths ([`plist_path`],
-//! [`unit_path`], [`log_path`]) and the argv of every `launchctl` and `systemctl` call
-//! ([`launchctl_argv`], [`systemctl_argv`]) are pure; only [`install`], [`uninstall`] and
-//! [`state`] run anything. No test runs `launchctl` or `systemctl`.
-//!
-//! A job is one per login (its label in `gui/<uid>`, its unit in `systemd --user`), so
-//! [`install`] and [`uninstall`] act only for the login's own home ([`own_home`]): a scratch
-//! `$HOME` (a test Mac played on this one) would otherwise replace, or remove, the job the
-//! login's own vault runs.
-//!
-//! A job runs the executable [`program_for_service`] names: the running aterm, or the
-//! bundle it lives in, but never a build in a cargo target directory, which aterm frees when
-//! nobody uses it (the job would then fail to start at every login).
+//! Launchd and systemd service management for `aterm secrets` ([`plist_text`], [`systemd_unit`],
+//! [`plist_path`], [`unit_path`], [`log_path`], [`launchctl_argv`], [`systemctl_argv`],
+//! [`install`], [`uninstall`], [`state`], [`own_home`], [`program_for_service`]).
 
 use crate::Error;
 use std::path::{Path, PathBuf};
@@ -34,8 +19,7 @@ pub enum Job {
 }
 
 impl Job {
-    /// The launchd label / systemd unit stem: `systems.alab.aterm-secrets` and
-    /// `systems.alab.aterm-secrets-server`.
+    /// The launchd label / systemd unit stem.
     pub fn label(self) -> &'static str {
         match self {
             Job::Subscriber => "systems.alab.aterm-secrets",
@@ -76,12 +60,10 @@ pub const SYSTEMCTL_PATHS: [&str; 3] = [
     "/run/current-system/sw/bin/systemctl",
 ];
 
-/// How long one `launchctl` or `systemctl` call may take before it is called hung, killed
-/// and refused. A hang detector, not a latency budget.
+/// How long one `launchctl` or `systemctl` call may take before it is called hung.
 const CHILD_HANG: Duration = Duration::from_secs(30);
 
-/// How long [`install`] waits for launchd to forget a job it booted out before it
-/// bootstraps the new one (a job that ignores SIGTERM is killed after launchd's own 20 s).
+/// Timeout waiting for launchd to forget a booted-out job ([`install`]).
 #[cfg(target_os = "macos")]
 const BOOTOUT_SETTLE: Duration = Duration::from_secs(30);
 
@@ -115,8 +97,7 @@ fn unit_name(job: Job) -> String {
     format!("{}.service", job.label())
 }
 
-/// `text` as XML character data: the five predefined entities, so any path is a well-formed
-/// `<string>`.
+/// `text` as XML character data.
 fn xml_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -142,14 +123,7 @@ fn home_of_log(log: &Path) -> Option<&Path> {
     home.is_absolute().then_some(home)
 }
 
-/// The launchd property list for a job (pure).
-///
-/// `label` runs `program args…` at load (`RunAtLoad`) and is started again whenever it ends
-/// (`KeepAlive` true), as a `Background` process at `Nice` 5, its stdout and stderr appended
-/// to `log`. `EnvironmentVariables` holds `HOME` only: the home `log` lies under when `log` is
-/// [`log_path`]'s (`<home>/.config/aterm/secrets/<label>.log`, where [`install`] puts it);
-/// another log path writes no environment. Every string is XML-escaped; a path that is not
-/// UTF-8 is written lossily ([`install`] refuses one first).
+/// The launchd property list for a job (pure) ([`log_path`], [`install`]).
 pub fn plist_text(label: &str, program: &Path, args: &[String], log: &Path) -> String {
     let string = |s: &str| format!("<string>{}</string>", xml_escape(s));
     let mut argv = String::new();
@@ -204,9 +178,7 @@ pub fn plist_text(label: &str, program: &Path, args: &[String], log: &Path) -> S
     )
 }
 
-/// One argv element as systemd's `ExecStart` reads it back exactly: double-quoted, with C
-/// escapes for `\`, `"` and control characters, `%%` for a `%` (a specifier otherwise) and
-/// `$$` for a `$` (an environment substitution otherwise).
+/// One argv element as systemd's `ExecStart` reads it back exactly.
 pub fn systemd_word(word: &str) -> String {
     let mut out = String::with_capacity(word.len() + 2);
     out.push('"');
@@ -230,8 +202,7 @@ pub fn systemd_word(word: &str) -> String {
     out
 }
 
-/// A unit's free-text value (`Description`): one line, `%` doubled, no trailing `\` (which
-/// would continue the line).
+/// A unit's free-text value (`Description`): one line, `%` doubled, no trailing `\`.
 fn systemd_text(text: &str) -> String {
     let line: String = text
         .chars()
@@ -241,9 +212,7 @@ fn systemd_text(text: &str) -> String {
     line.trim_end_matches('\\').to_string()
 }
 
-/// The systemd user unit for a job (pure): `[Unit]` with `Description`, `[Service]` with
-/// `ExecStart` (each argv element quoted by [`systemd_word`]), `Restart=always` and
-/// `RestartSec=5`, `[Install]` with `WantedBy=default.target`.
+/// Render the systemd user unit for a job ([`systemd_word`]).
 pub fn systemd_unit(description: &str, program: &Path, args: &[String]) -> String {
     let mut exec = systemd_word(&program.to_string_lossy());
     for arg in args {
@@ -304,8 +273,7 @@ pub fn systemctl_argv(words: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// The running pid `launchctl print`'s text names: the service's own `pid = <n>` line (one
-/// tab deep; a nested section's is not it).
+/// The running pid `launchctl print`'s text names: the service's own `pid = <n>` line.
 pub fn print_pid(text: &str) -> Option<u32> {
     text.lines().find_map(|line| {
         let top = line.strip_prefix('\t')?;
@@ -317,16 +285,14 @@ pub fn print_pid(text: &str) -> Option<u32> {
     })
 }
 
-/// The pid `systemctl --user show -p MainPID --value` printed: `None` for `0` (not running)
-/// or anything unreadable.
+/// The pid `systemctl --user show -p MainPID --value` printed.
 pub fn main_pid(text: &str) -> Option<u32> {
     let text = text.trim();
     let text = text.strip_prefix("MainPID=").unwrap_or(text);
     text.parse().ok().filter(|pid| *pid > 0)
 }
 
-/// The first of `candidates` that exists: `systemctl`, or a clear refusal when this Linux has
-/// none (no systemd, so no user manager to keep a job running).
+/// The first of `candidates` that exists: `systemctl`, or a clear refusal when this Linux has none.
 pub fn systemctl_path(
     candidates: &[&str],
     exists: &dyn Fn(&Path) -> bool,
@@ -345,17 +311,10 @@ pub fn systemctl_path(
         })
 }
 
-/// Whether `path` is in a cargo build directory: under a directory named `target` that has a
-/// `Cargo.toml` beside it, under a `target` directory followed by a `debug` or `release`
-/// profile (directly or after a target triple), under a `.noindex` directory that is itself a
-/// target (its name contains `target`) or holds one (`<x>.noindex/target/…`), or under a
-/// directory holding a `CACHEDIR.TAG` (cargo tags every target directory so, whatever it is
-/// called; a tagged cache is disposable by definition). `exists` answers for the `Cargo.toml`
-/// and `CACHEDIR.TAG` probes.
+/// Whether `path` is in a cargo build directory.
 pub fn in_build_dir(path: &Path, exists: &dyn Fn(&Path) -> bool) -> bool {
     let names: Vec<&std::ffi::OsStr> = path.iter().collect();
     let mut dir = PathBuf::new();
-    // Every component but the last (the file itself) is a directory `path` is in.
     for (index, name) in names.iter().enumerate().take(names.len().saturating_sub(1)) {
         let text = name.to_string_lossy();
         let after = |offset: usize| {
@@ -385,10 +344,7 @@ pub fn in_build_dir(path: &Path, exists: &dyn Fn(&Path) -> bool) -> bool {
     false
 }
 
-/// Whether `path` is a copy that goes away: on a mounted disk image (`/Volumes/…`), in
-/// Gatekeeper's App Translocation copy (`/AppTranslocation/`), or under a temporary directory
-/// (the system's, `/tmp` or `/var/tmp`, as spelled or resolved). The rule
-/// `atpkg::stub::lasting` holds the app's own subscriber install to.
+/// Whether `path` is a copy that goes away.
 pub fn transient(path: &Path) -> bool {
     let text = path.to_string_lossy();
     let temp = [
@@ -402,14 +358,10 @@ pub fn transient(path: &Path) -> bool {
             .iter()
             .flat_map(|root| [root.canonicalize().ok(), Some(root.clone())])
             .flatten()
-            // A temporary directory that is the root itself (`TMPDIR=/`) holds everything.
             .any(|root| root.parent().is_some() && path.starts_with(&root))
 }
 
-/// The executable a job should run, given the running one (`exe`, canonical): the bundle's
-/// `Contents/MacOS` executable when `exe` lies inside an `.app` (the outermost one), else
-/// `exe`. Refuses a build in a cargo target directory ([`in_build_dir`]) and a copy that goes
-/// away ([`transient`]).
+/// Executable a job should run for `exe` ([`in_build_dir`], [`transient`]).
 pub fn service_program(exe: &Path, exists: &dyn Fn(&Path) -> bool) -> crate::Result<PathBuf> {
     if !exe.is_absolute() {
         return Err(Error::new(format!(
@@ -471,8 +423,7 @@ pub fn service_program(exe: &Path, exists: &dyn Fn(&Path) -> bool) -> crate::Res
     )))
 }
 
-/// The executable a job installed now should run: this process's own, canonicalized, mapped
-/// by [`service_program`] (the `.app` bundle's executable; never a cargo target directory).
+/// Executable a job installed now should run ([`service_program`]).
 pub fn program_for_service() -> crate::Result<PathBuf> {
     let exe = std::env::current_exe()
         .map_err(|e| Error::new(format!("cannot name this executable: {e}; pass --program")))?;
@@ -482,8 +433,7 @@ pub fn program_for_service() -> crate::Result<PathBuf> {
     service_program(&exe, &|path| std::fs::symlink_metadata(path).is_ok())
 }
 
-/// Refuse what a unit file cannot name faithfully: a relative, non-UTF-8 or missing program,
-/// or a control character in any word (XML 1.0 cannot carry most of them at all).
+/// Refuse what a unit file cannot name faithfully.
 fn check_argv(program: &Path, args: &[String]) -> crate::Result<()> {
     let Some(text) = program.to_str() else {
         return Err(Error::new(format!(
@@ -519,8 +469,7 @@ fn write_unit_file(path: &Path, text: &str) -> crate::Result<()> {
     crate::fsx::write_atomic(path, text.as_bytes(), 0o644)
 }
 
-/// Write the job's launchd plist (and make its private log directory): what [`install`] does
-/// on macOS before any `launchctl` call. Returns the plist.
+/// Write the job's launchd plist: what [`install`] does on macOS before any `launchctl` call.
 pub fn write_plist(
     home: &Path,
     job: Job,
@@ -535,8 +484,7 @@ pub fn write_plist(
     Ok(plist)
 }
 
-/// Write the job's systemd user unit: what [`install`] does on Linux before any `systemctl`
-/// call. Returns the unit file.
+/// Write the job's systemd user unit: what [`install`] does on Linux before any `systemctl` call.
 pub fn write_unit(
     home: &Path,
     job: Job,
@@ -609,18 +557,13 @@ fn systemctl() -> crate::Result<PathBuf> {
     systemctl_path(&SYSTEMCTL_PATHS, &|path| path.is_file())
 }
 
-/// Refuses an unresolved account home or a `home` that is not `account`, the home the
-/// account database gives this login: the job's label is the login's one, so a job installed
-/// for another home would replace the one the login's own home runs (and an uninstall would
-/// remove it).
+/// Refuses an unresolved account home or a `home` that is not `account`.
 pub fn own_home(home: &Path, account: Option<&Path>) -> crate::Result<()> {
     let Some(account) = account else {
         return Err(Error::new(
             "cannot resolve this login's account home for a per-login service",
         ));
     };
-    // One directory however spelt: by (device, inode) where both exist, which a firmlink
-    // (`/System/Volumes/Data/Users/…`) keeps and a canonical path does not.
     #[cfg(unix)]
     let same = {
         use std::os::unix::fs::MetadataExt as _;
@@ -656,24 +599,14 @@ fn check_own_home(home: &Path) -> crate::Result<()> {
     }
 }
 
-/// Install (or replace) and start `job` running `program args…` under `home`, which must be
-/// this login's own ([`own_home`]). Returns a line saying what was done.
-///
-/// macOS: the plist at [`plist_path`] (0644, atomically, logging to [`log_path`] in the 0700
-/// `~/.config/aterm/secrets`), then `launchctl bootout` of any loaded copy (not loaded is
-/// fine), `bootstrap` into `gui/<uid>` and `kickstart -k`. Linux: the unit at [`unit_path`],
-/// then `systemctl --user daemon-reload`, `enable --now` and `restart` (so a running job takes
-/// the new unit); refused by name where there is no `systemctl`.
+/// Install and start `job` under `home` ([`own_home`], [`plist_path`], [`unit_path`]).
 pub fn install(home: &Path, job: Job, program: &Path, args: &[String]) -> crate::Result<String> {
     check_own_home(home)?;
     #[cfg(target_os = "macos")]
     {
         let plist = write_plist(home, job, program, args)?;
         let label = job.label();
-        // Not loaded is the usual answer here, and fine.
         let _ = launchctl(Launchctl::Bootout(label));
-        // A bootout returns before launchd has forgotten a job that is still exiting; a
-        // bootstrap then would be refused as a duplicate.
         let settle = Instant::now() + BOOTOUT_SETTLE;
         while launchd_job(label)?.is_some() && Instant::now() < settle {
             std::thread::sleep(Duration::from_millis(100));
@@ -710,8 +643,7 @@ pub fn install(home: &Path, job: Job, program: &Path, args: &[String]) -> crate:
     }
 }
 
-/// Stop and remove `job`, for this login's own `home` ([`own_home`]). Returns false when it
-/// was not installed.
+/// Stop and remove `job`, for this login's own `home` ([`own_home`]).
 pub fn uninstall(home: &Path, job: Job) -> crate::Result<bool> {
     check_own_home(home)?;
     let remove = |path: &Path| match std::fs::remove_file(path) {
@@ -737,7 +669,6 @@ pub fn uninstall(home: &Path, job: Job) -> crate::Result<bool> {
         }
         let name = unit_name(job);
         if let Ok(systemctl) = systemctl() {
-            // A unit that is not loaded has nothing to stop.
             let _ = run(&systemctl, &systemctl_argv(&["disable", "--now", &name]));
             remove(&unit)?;
             run_ok(&systemctl, &systemctl_argv(&["daemon-reload"]))?;
@@ -748,12 +679,7 @@ pub fn uninstall(home: &Path, job: Job) -> crate::Result<bool> {
     }
 }
 
-/// `job`'s state: absent for a home that is not this login's own ([`own_home`]), whose job
-/// is the login's, not that home's.
-///
-/// macOS: installed when its plist is there or launchd has it loaded (`launchctl print
-/// gui/<uid>/<label>`, whose own `pid = ` line is the pid). Linux: installed when its unit is
-/// there; the pid is `systemctl --user show -p MainPID --value`.
+/// `job`'s state: absent for a home that is not this login's own ([`own_home`]).
 pub fn state(home: &Path, job: Job) -> crate::Result<State> {
     // The login's job is not this home's: a scratch `HOME` has none.
     if check_own_home(home).is_err() {
@@ -816,7 +742,6 @@ mod tests {
             std::os::unix::fs::symlink(&own, &link).expect("link");
             own_home(&link, Some(&own)).expect("through a link");
         }
-        // A test Mac played under a scratch HOME on this one.
         let error = own_home(&scratch, Some(&own)).expect_err("another home");
         assert!(error.0.contains("not this login's home"), "{error}");
         for home in [&own, &scratch] {
@@ -897,7 +822,6 @@ mod tests {
             "<string>/Users//a&amp;b/.config/aterm/secrets/systems.alab.aterm-secrets.log</string>";
         assert!(text.contains(&format!("\t<key>StandardOutPath</key>\n\t{log_line}\n")));
         assert!(text.contains(&format!("\t<key>StandardErrorPath</key>\n\t{log_line}\n")));
-        // HOME is the only variable.
         assert_eq!(text.matches("<key>").count(), 12, "{text}");
     }
 
@@ -924,8 +848,7 @@ mod tests {
         assert_eq!(xml_escape("plain/π"), "plain/π");
     }
 
-    /// `plutil -lint` reads the plist as launchd will. Negative control: an unescaped
-    /// ampersand does not lint.
+    /// `plutil -lint` reads the plist as launchd will.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_plist_is_well_formed_by_plutil() {
@@ -936,7 +859,6 @@ mod tests {
             std::fs::write(&path, text).expect("write");
             let mut cmd = aterm_uds::spawnfd::command(plutil);
             cmd.arg("-lint").arg(&path);
-            // A minute is a hang detector.
             let out = aterm_uds::deadline::output_until(
                 &mut cmd,
                 Instant::now() + Duration::from_secs(60),
@@ -1092,13 +1014,11 @@ mod tests {
             Path::new("/Users//x/aterm/target/x/y/aterm"),
             &cargo
         ));
-        // No Cargo.toml beside it, but a profile directory under it.
         assert!(in_build_dir(Path::new("/w/target/release/aterm"), &none));
         assert!(in_build_dir(
             Path::new("/w/target/aarch64-apple-darwin/release/aterm"),
             &none
         ));
-        // CARGO_TARGET_DIR in a .noindex cache, or a .noindex target.
         assert!(in_build_dir(
             Path::new("/Users//x/.cache/aterm-secrets-init.noindex/target/debug/deps/aterm"),
             &none
@@ -1111,7 +1031,6 @@ mod tests {
             Path::new("/Users//x/aterm/target.noindex/aterm (dev).app/Contents/MacOS/aterm"),
             &none
         ));
-        // Not builds.
         for path in [
             "/Applications/aterm.app/Contents/MacOS/aterm",
             "/Users//x/.local/bin/aterm",
@@ -1131,14 +1050,12 @@ mod tests {
         assert_eq!(service_program(app, &none), Ok(app.to_path_buf()));
         let plain = Path::new("/Users//x/.local/bin/aterm");
         assert_eq!(service_program(plain, &none), Ok(plain.to_path_buf()));
-        // A helper elsewhere in the bundle maps to the bundle's executable.
         let main = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
         let helper = Path::new("/Applications/aterm.app/Contents/Helpers/aterm");
         assert_eq!(
             service_program(helper, &|p: &Path| p == main),
             Ok(main.to_path_buf())
         );
-        // The outermost bundle wins.
         let nested =
             Path::new("/Applications/aterm.app/Contents/Library/X.app/Contents/MacOS/aterm");
         assert_eq!(
@@ -1185,8 +1102,6 @@ mod tests {
 
     #[test]
     fn the_test_binary_itself_is_refused_as_a_build() {
-        // A test binary lives in `<target dir>/debug/deps`, a directory cargo tags with
-        // CACHEDIR.TAG whatever it is called: the refusal's own case.
         let refused = program_for_service().unwrap_err();
         assert!(refused.0.contains("cargo target directory"), "{refused}");
     }
@@ -1199,7 +1114,6 @@ mod tests {
             &tag
         ));
         assert!(!in_build_dir(Path::new("/scratch/other/aterm"), &tag));
-        // The file itself is not a directory it is in.
         let own = |p: &Path| p == Path::new("/scratch/aterm/CACHEDIR.TAG");
         assert!(!in_build_dir(Path::new("/scratch/aterm"), &own));
     }
@@ -1232,7 +1146,6 @@ mod tests {
             "<string>{}</string>",
             xml_escape(&home.to_string_lossy())
         )));
-        // Again: replaced in place, no temporary left beside it.
         write_plist(&home, Job::Subscriber, &program, &args).expect("rewritten");
         let names: Vec<_> = std::fs::read_dir(plist.parent().expect("dir"))
             .expect("list")

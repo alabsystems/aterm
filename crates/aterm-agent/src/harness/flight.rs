@@ -1,95 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! IN-FLIGHT TOOL CALLS: what a quiet dot of Claude Code's agents panel waits
-//! on (`docs/DESIGN-harness-autopilot-2026-10-15.md` §10.6.13).
-//!
-//! The panel's fold ([`super::agents`]) reads work off the screen alone, and
-//! a row whose tokens have not moved for [`super::agents::STUCK_MS`] reads
-//! stuck. A subagent inside one long tool call is working, not stuck.
-//! MEASURED on Claude Code 2.1.304 (the lab, 2026-10-20; the screens are
-//! `aterm-phase`'s `claude-2.1.304-agents-panel-*long-bash*` fixtures, the
-//! rows `harness/testdata/flight/`): a background agent's 300 s Bash call
-//! (`timeout: 400000`) held its row at `↓ 6.2k tokens` from its second
-//! second to its fifth minute, a workflow's 200 s call held the workflow's
-//! row at `↓ 12.7k tokens`, and neither transcript grew during its call (no
-//! progress rows): the call's row, then its result's 300.26 s later.
-//!
-//! THE FOLD. Every subagent transcript the session's usage fold follows
-//! (`super::session_usage`: one read of what each file appends, no other
-//! file read for it and no watcher) feeds a [`FlightFold`] too: the time of
-//! its first row (the agent's start: within 0.2 s of the start its panel
-//! clock implies, measured) and the calls of its newest assistant message
-//! that no `tool_result` has answered. A new message answers every call of
-//! the ones before it (the API takes the next turn only after a result for
-//! each), so at most one message's calls are kept, [`FLIGHT_MAX`] of them; a
-//! message with more, or a row too long to read, leaves the file
-//! [`FileFlight::Unknown`] until the next message. A call that went to the
-//! background (`run_in_background: true`; its result is written at once,
-//! 33 ms measured) is never in flight. Only rows whose bytes hold a call's or
-//! a result's key, a `\u` escape or a turn's end (`end_turn`, and the other
-//! stop reasons a turn ends on: `stop_sequence`, `max_tokens`, `refusal`)
-//! are parsed, by a projection that keeps no argument but the two below and
-//! no result's content; any other assistant row says, by its kind alone,
-//! that the model's turn is known. A workflow's agent ENDS on its answered
-//! [`FINAL_TOOL`] call, with no assistant row after it: MEASURED on one run
-//! of 22 agents, 18 ended so and 4 on a `stop_sequence` text row, and before
-//! either was read every one of them read the model's turn for good, which
-//! held its run's row stuck beside a sibling's long call.
-//!
-//! ITS OWN BUDGET. A call may run for its declared timeout: Bash's `timeout`
-//! (ms, at most [`MAX_BUDGET_MS`], Claude Code's `BASH_MAX_TIMEOUT_MS`
-//! default), else [`DEFAULT_BUDGET_MS`] (Bash's default, and every other
-//! tool's: none declares one Claude Code enforces), plus [`CALL_SLACK_MS`].
-//! A call with no declared timeout outlives its budget at 150 s, where the
-//! screen's rule already turns a dot stuck: the budget only ever buys a call
-//! the time it asked for.
-//!
-//! THE MAPPING ([`place`]): a panel row is a file's only by EXACT agreement
-//! — its kind; its name, `name ?? agentType` of the file's `meta.json` for
-//! an agent (a workflow's: the run's script, `<slug>-<run>.js`, the panel's
-//! name slugged as Claude Code slugs it, [`workflow_slug`]); its activity,
-//! the meta's `description` whole or cut with `…` (Claude Code's own
-//! normalisation, [`panel_text`], in the pane's cells, [`cells`]); and its
-//! clock's implied start within the clock's resolution plus
-//! [`START_SLACK_MS`] of the file's first row (a workflow's script's mtime).
-//! Exactly one file must agree, and no other row may take it; else the row
-//! is [`Flight::Unknown`] and the screen's rules stand alone — no row reads
-//! busier than its screen shows unless its own file says so.
+//! Subagent in-flight tool-call tracking and panel-row placement.
 
 use std::sync::Arc;
 
 use aterm_json::Value;
 use aterm_phase::agents_panel::{PANEL_ROWS_MAX, PanelRow, RowKind, Span, text_hash};
 
-/// The slack past a call's own budget before it reads overdue: the 30 s the
-/// screen's rule gives Bash's two-minute default (`agents::STUCK_MS`).
+/// Grace period past a tool call's budget before it reads overdue.
 pub const CALL_SLACK_MS: u64 = 30_000;
-/// The budget of a call that declares none: Bash's default timeout.
+/// Default budget for a tool call that declares no timeout.
 pub const DEFAULT_BUDGET_MS: u64 = 120_000;
-/// The most a declared timeout buys: Bash's maximum.
+/// Maximum budget granted to a declared tool timeout.
 pub const MAX_BUDGET_MS: u64 = 600_000;
-/// The calls of one message a file keeps.
+/// Maximum in-flight tool calls tracked per assistant message.
 pub const FLIGHT_MAX: usize = 8;
-/// The slack, past the clock's resolution, a row's implied start may differ
-/// from its file's and still be that file's: measured within 0.2 s, and a
-/// panel read up to a repaint after Claude drew it.
+/// Allowed start-time slack past clock resolution when matching a panel row to a transcript.
 pub const START_SLACK_MS: u64 = 2_000;
-/// The bytes of a tool's name kept ([`ToolName`]).
+/// Maximum inline byte length of [`ToolName`].
 pub const TOOL_NAME_MAX: usize = 31;
 /// The tool whose `timeout` input is a budget Claude Code enforces.
 const TIMED_TOOL: &str = "Bash";
-/// The tool whose answered call (not an error) ends a workflow's agent: its
-/// schema output, the run's result.
+/// Tool whose non-error result ends a workflow subagent.
 pub const FINAL_TOOL: &str = "StructuredOutput";
 /// The stop reasons, besides `end_turn`, a turn ends on.
 const TURN_ENDS: [&str; 3] = ["stop_sequence", "max_tokens", "refusal"];
 
-/// A tool's name, inline: at most [`TOOL_NAME_MAX`] bytes. A longer name (an
-/// MCP tool's `mcp__<server>__<tool>`) is cut at a char boundary and ends
-/// with `…`, so the title that names it (`in mcp__claude_ai_Claude_Docs__… 4m`)
-/// never shows a cut name as if it were whole, and a cut name never equals a
-/// whole one.
+/// Inline tool name truncated at [`TOOL_NAME_MAX`] bytes with `…` when needed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct ToolName {
     len: u8,
@@ -97,7 +35,7 @@ pub struct ToolName {
 }
 
 impl ToolName {
-    /// `name`, whole where it fits, else cut to fit with `…` after the cut.
+    /// Constructs a [`ToolName`], truncating with `…` if `name` exceeds [`TOOL_NAME_MAX`].
     #[must_use]
     pub fn of(name: &str) -> Self {
         const CUT: &str = "\u{2026}";
@@ -120,7 +58,7 @@ impl ToolName {
         }
     }
 
-    /// The name as kept.
+    /// Returns the stored tool name.
     #[must_use]
     pub fn as_str(&self) -> &str {
         std::str::from_utf8(&self.bytes[..usize::from(self.len)]).unwrap_or("")
@@ -136,17 +74,17 @@ impl std::fmt::Debug for ToolName {
 /// One call in flight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Call {
-    /// Its `tool_use` id's hash.
+    /// Hash of the `tool_use` ID.
     pub id: u64,
     pub tool: ToolName,
-    /// Unix ms its row was written.
+    /// Unix timestamp (ms) when the call row was written.
     pub at_ms: i64,
-    /// What it may run for (module docs: ITS OWN BUDGET).
+    /// Allowed execution budget in milliseconds.
     pub budget_ms: u64,
 }
 
 impl Call {
-    /// Unix ms past which it has outlived its budget and the slack.
+    /// Unix timestamp (ms) after which the call exceeds its budget plus slack.
     #[must_use]
     pub fn until_ms(&self) -> i64 {
         let more = i64::try_from(self.budget_ms + CALL_SLACK_MS).unwrap_or(i64::MAX);
@@ -154,22 +92,21 @@ impl Call {
     }
 }
 
-/// What one subagent's transcript says it is doing.
+/// In-flight state of a subagent transcript.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum FileFlight {
-    /// Nothing certain: no call row read yet, a message with more calls than
-    /// kept, a row too long to read.
+    /// Indeterminate state (no rows yet, too many calls, or an oversized line).
     #[default]
     Unknown,
-    /// No call of its own in flight: the model's turn.
+    /// No tool call in flight; waiting on the model's turn.
     Model,
-    /// Its newest assistant row ended its turn, nothing in flight.
+    /// Newest assistant row ended the turn with nothing in flight.
     Done,
-    /// Waiting on calls of its own: the first to outlive its budget.
+    /// Waiting on in-flight tool calls (carries the earliest-expiring [`Call`]).
     Tool(Call),
 }
 
-/// One subagent transcript's calls in flight (module docs: THE FOLD).
+/// Incremental fold over a subagent transcript's in-flight tool calls.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FlightFold {
     /// Unix ms of its first row with a time.
@@ -194,25 +131,25 @@ fn id_hash(id: &str) -> u64 {
 }
 
 impl FlightFold {
-    /// A fold that has read nothing.
+    /// Creates an empty fold.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Unix ms of the file's first row with a time.
+    /// Unix timestamp (ms) of the transcript's first timestamped row.
     #[must_use]
     pub fn start_ms(&self) -> Option<i64> {
         self.start_ms
     }
 
-    /// Moved with every change of what the fold says.
+    /// Generation counter incremented whenever the fold's output changes.
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation
     }
 
-    /// What the file says as of the rows read.
+    /// Current [`FileFlight`] state of the transcript.
     #[must_use]
     pub fn flight(&self) -> FileFlight {
         if self.lost || !self.known {
@@ -226,8 +163,7 @@ impl FlightFold {
         }
     }
 
-    /// The fold starts over (the file was rewritten): what it said is gone,
-    /// and its generation moves on.
+    /// Resets the fold when the transcript is rewritten and advances the generation.
     pub fn restart(&mut self) {
         let generation = self.generation.wrapping_add(1);
         *self = Self {
@@ -236,15 +172,14 @@ impl FlightFold {
         };
     }
 
-    /// A row too long to read: whatever it was, the file is unknown until its
-    /// next message.
+    /// Marks the transcript unknown until the next assistant message after an oversized line.
     pub fn long_line(&mut self) {
         let before = (self.flight(), self.start_ms);
         self.lost = true;
         self.moved(before);
     }
 
-    /// Fold one complete row.
+    /// Folds one complete JSONL row.
     pub fn fold_bytes(&mut self, line: &[u8]) {
         let Ok(line) = std::str::from_utf8(line) else {
             return;
@@ -284,8 +219,6 @@ impl FlightFold {
                     .and_then(Value::as_str)
                     .map_or(0, id_hash);
                 if id != self.message {
-                    // A new message: every call of the ones before it was
-                    // answered (or abandoned) before it was asked for.
                     self.message = id;
                     self.calls = [None; FLIGHT_MAX];
                     self.lost = false;
@@ -311,7 +244,6 @@ impl FlightFold {
                         for slot in &mut self.calls {
                             if let Some(call) = slot.filter(|c| c.id == id) {
                                 *slot = None;
-                                // The agent's result, answered: it is done.
                                 if call.tool.as_str() == FINAL_TOOL && !error {
                                     self.done = true;
                                 }
@@ -374,8 +306,7 @@ fn wants(line: &str) -> bool {
         || TURN_ENDS.iter().any(|end| super::steps::quoted(line, end))
 }
 
-/// Claude Code's own normalisation of a panel row's text (2.1.304's `Fr`):
-/// control characters dropped, every run of white space one space, trimmed.
+/// Normalizes panel row text by dropping control characters and collapsing whitespace.
 #[must_use]
 pub fn panel_text(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
@@ -394,8 +325,7 @@ pub fn panel_text(raw: &str) -> String {
     out
 }
 
-/// `text` as the pane's text holds it: one char per cell, a wide glyph's
-/// right half a space of its own.
+/// Expands wide glyphs with a trailing space to match one char per terminal cell.
 #[must_use]
 pub fn cells(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -408,9 +338,7 @@ pub fn cells(text: &str) -> String {
     out
 }
 
-/// A workflow's name as Claude Code names its script (2.1.304's `Xae`):
-/// lower case, every run of characters other than `a-z0-9` one `-`, none at
-/// either end; `workflow` when nothing is left.
+/// Converts a workflow name into Claude Code's lowercase hyphenated script slug.
 #[must_use]
 pub fn workflow_slug(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
@@ -432,26 +360,22 @@ pub fn workflow_slug(name: &str) -> String {
     out
 }
 
-/// One agent or workflow run a panel row may be (module docs: THE MAPPING).
+/// Candidate agent or workflow run for matching against an agents-panel row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Flyer {
     /// [`RowKind::Agent`] or [`RowKind::Workflow`].
     pub kind: RowKind,
-    /// The hash its row's name must have: an agent's name in cells, a
-    /// workflow's slug ([`RowKey::name_hash`]).
+    /// Expected [`RowKey::name_hash`] for the panel row.
     pub name_hash: u64,
-    /// An agent's activity in cells ([`panel_text`], [`cells`]); `None` for
-    /// a workflow, whose row draws a bar.
+    /// Normalized cell activity string for an agent (`None` for a workflow).
     pub activity: Option<Arc<str>>,
-    /// Unix ms it started.
+    /// Unix timestamp (ms) when the run started.
     pub start_ms: i64,
     pub flight: FileFlight,
 }
 
 impl Flyer {
-    /// An agent's: its meta's `name ?? agentType` and `description` as
-    /// written (none, or one that normalises to nothing: a row with no
-    /// activity), started at `start_ms`.
+    /// Builds a [`Flyer`] for an agent from its metadata and start time.
     #[must_use]
     pub fn agent(name: &str, description: Option<&str>, start_ms: i64, flight: FileFlight) -> Self {
         Self {
@@ -466,8 +390,7 @@ impl Flyer {
         }
     }
 
-    /// A workflow run's: its script's slug, started at `start_ms`, its
-    /// agents' flights combined ([`combine`]).
+    /// Builds a [`Flyer`] for a workflow run from its script slug and combined flight.
     #[must_use]
     pub fn workflow(slug: &str, start_ms: i64, flight: FileFlight) -> Self {
         Self {
@@ -480,9 +403,7 @@ impl Flyer {
     }
 }
 
-/// A workflow run's flight from its agents': unknown if any is; the model's
-/// while any is in its turn; else waiting on the first call to outlive its
-/// budget; else done.
+/// Combines subagent [`FileFlight`] states into a workflow run's aggregate state.
 #[must_use]
 pub fn combine(flights: impl IntoIterator<Item = FileFlight>) -> FileFlight {
     let mut first: Option<Call> = None;
@@ -506,33 +427,32 @@ pub fn combine(flights: impl IntoIterator<Item = FileFlight>) -> FileFlight {
     }
 }
 
-/// A session's agents and workflow runs, as its usage fold last read them
-/// (`session_usage::SessionUsage::flights`).
+/// Snapshot of a session's active agents and workflow runs.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FlightTable {
     pub flyers: Vec<Flyer>,
 }
 
-/// What a row's activity reads as.
+/// Parsed activity text of an agents-panel row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Activity {
-    /// None drawn.
+    /// No activity drawn.
     #[default]
     None,
-    /// Whole: its hash.
+    /// Uncut activity text hash.
     Whole(u64),
-    /// Cut with `…`: the bytes before it, and their hash.
+    /// Ellipsis-truncated activity prefix length and hash.
     Cut { len: u16, hash: u64 },
 }
 
-/// What [`place`] matches one task row by, read off the pane's text.
+/// Matching key extracted from an agents-panel task row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RowKey {
     pub kind: RowKind,
-    /// An agent's name's hash; a workflow's slugged name's.
+    /// Hash of the agent's cell name or workflow's slugged name.
     pub name_hash: u64,
     pub activity: Activity,
-    /// The clock as drawn, `(ms, res_ms)`.
+    /// Drawn elapsed clock `(ms, resolution_ms)`.
     pub clock: Option<(u64, u32)>,
 }
 
@@ -549,9 +469,7 @@ fn columns(row: &str, span: Span) -> Option<&str> {
 }
 
 impl RowKey {
-    /// The key of `parsed`, read off `row` (the pane's text, one char per
-    /// cell, as `aterm_phase::agents_panel::one_cell` reads it): `None` for
-    /// a row that is no agent or workflow.
+    /// Extracts the [`RowKey`] for `parsed` from `row`, if it is an agent or workflow row.
     #[must_use]
     pub fn of(row: &str, parsed: &PanelRow) -> Option<Self> {
         if !matches!(parsed.kind, RowKind::Agent | RowKind::Workflow) {
@@ -609,18 +527,15 @@ impl RowKey {
     }
 }
 
-/// What the host tells the panel's fold of one row's own calls
-/// (`agents::PanelTrack::fold_flown`).
+/// Resolved in-flight state reported to the agents-panel tracker for one row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Flight {
-    /// No file is certainly the row's, or its file is unknown: the screen's
-    /// rules alone.
+    /// No unique transcript match or transcript state is unknown.
     #[default]
     Unknown,
-    /// Its file has no call in flight.
+    /// Matched transcript has no tool call in flight.
     Model,
-    /// Its file waits on `call` (its id's hash), of `tool`, written `age_ms`
-    /// ago, which outlives its budget `left_ms` from now (`0`: already).
+    /// Matched transcript is waiting on `tool` call `call`.
     Tool {
         call: u64,
         tool: ToolName,
@@ -629,10 +544,7 @@ pub enum Flight {
     },
 }
 
-/// Each row's [`Flight`] (`keys[i]` the key of the panel's row `i`, `None`
-/// for a row that is no task; past [`PANEL_ROWS_MAX`] rows none), from
-/// `table` at `wall_now_ms` (module docs: THE MAPPING). Fixed arrays,
-/// nothing allocated.
+/// Matches panel row `keys` against `table` at `wall_now_ms`.
 #[must_use]
 pub fn place(
     keys: &[Option<RowKey>],
@@ -657,7 +569,6 @@ pub fn place(
     let mut out = [Flight::Unknown; PANEL_ROWS_MAX];
     for (flight, &at) in out.iter_mut().zip(&found) {
         let Some(at) = at else { continue };
-        // Two rows that agree with one file: neither is certainly its.
         if found.iter().filter(|&&other| other == Some(at)).count() > 1 {
             continue;
         }

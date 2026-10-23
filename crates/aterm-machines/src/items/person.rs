@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The steps only a person can do, probed as root from the system TCC database so the
-//! controller can count them (design §6).
-//!
-//! Every item here is probe-only: it reads, decides `Ok` or [`Probe::Person`], and its apply
-//! refuses. The probe is written once ([`probe_step`]) over a "run this command" closure, so
-//! the agent probes through its [`System`] port and the controller's `screen` and `person
-//! --here` flows re-probe through signed `exec` requests with the same code.
+//! Manual macOS TCC and System Settings probes (`person` baseline items).
 
 use super::{Ctx, Item};
 use crate::model::{Probe, Read, User};
@@ -15,117 +9,96 @@ use crate::port::{Cmd, Ran, RunFailed, System};
 use serde::Deserialize;
 use std::time::Duration;
 
-/// The table.
+/// `[person]` baseline configuration table.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Table {
-    /// Remote Login on (always true by the time the agent runs; listed for the checklist).
+    /// Whether Remote Login must be enabled.
     #[serde(default)]
     pub remote_login: Option<bool>,
-    /// Remote Login's "Allow full disk access for remote users".
+    /// Whether Remote Login's "Allow full disk access for remote users" must be enabled.
     #[serde(default)]
     pub remote_full_disk_access: Option<bool>,
-    /// Screen Sharing turned on in System Settings, with its PostEvent and ScreenCapture grants.
+    /// Whether Screen Sharing and its TCC grants must be enabled.
     #[serde(default)]
     pub screen_sharing: Option<bool>,
-    /// Apps that need Full Disk Access (`"aterm"`).
+    /// Applications requiring Full Disk Access.
     #[serde(default)]
     pub full_disk_access: Vec<String>,
-    /// Apps to add to Developer Tools (`"aterm"`).
+    /// Applications requiring Developer Tools access.
     #[serde(default)]
     pub developer_tools: Vec<String>,
 }
 
-/// The system TCC database. Root over SSH can read it only with Remote Login's "Allow full
-/// disk access for remote users" on (design §1.7).
+/// Path to the system TCC SQLite database.
 pub const TCC_DB: &str = "/Library/Application Support/com.apple.TCC/TCC.db";
 
-/// The reader. `-readonly` so a probe can never write the database.
+/// Path to `/usr/bin/sqlite3`.
 pub const SQLITE3: &str = "/usr/bin/sqlite3";
 
-/// The database as the reader opens it: [`TCC_DB`] as an IMMUTABLE URI
-/// (`aterm_uds::foreign_db::immutable_uri`), so sqlite3 takes no lock on tccd's live file.
-/// tccd writes it in rollback-journal mode with no busy timeout, and a reader's `SHARED`
-/// lock that its `COMMIT` meets fails that `COMMIT` and loses the write (measured,
-/// `docs/measured/real-claude-lab-2026-10-15.md`, 2026-10-20). One command over SSH has no
-/// look at the file before and after it (the guard of the local read,
-/// `aterm_uds::foreign_db::read`), so a read that meets one of tccd's writes (a single row,
-/// rare) can answer rows of either side of it or fail (`Unusable`); the probe is one look the
-/// controller takes again, and either answer leaves the step to the person or done. A session
-/// without Full Disk Access is refused it as it is the path (`... authorization denied`, exit
-/// 1, measured).
+/// Formats [`TCC_DB`] as an immutable `file:` URI for lock-free SQLite reads.
 #[must_use]
 pub fn tcc_target() -> String {
     aterm_uds::foreign_db::immutable_uri(std::path::Path::new(TCC_DB))
 }
 
-/// launchd's control tool.
+/// Path to `/bin/launchctl`.
 pub const LAUNCHCTL: &str = "/bin/launchctl";
 
-/// The why of every TCC-backed step while the database is closed to this session.
+/// Diagnostic message when the system TCC database cannot be opened over SSH.
 pub const NEEDS_REMOTE_FDA: &str = "turn on Allow full disk access for remote users";
 
-/// aterm's own executable, whose `ctl privacy --json` record is the fallback for aterm's Full
-/// Disk Access when the TCC database is closed (design §6).
+/// Path to the installed `aterm` executable.
 pub const ATERM_EXE: &str = "/Applications/aterm.app/Contents/MacOS/aterm";
 
-/// Full Disk Access, through the modern Settings extension at its `Privacy_AllFiles` anchor
-/// (the spelling `aterm-gui`'s privacy menu opens; the scheme has a dot).
+/// System Settings URL for Privacy & Security ▸ Full Disk Access.
 pub const PANE_FULL_DISK_ACCESS: &str =
     "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles";
 
-/// The Developer Tools list at its `Privacy_DevTools` anchor (the spelling of
-/// `aterm_containment::consent::DEVTOOLS_SETTINGS_URL`).
+/// System Settings URL for Privacy & Security ▸ Developer Tools.
 pub const PANE_DEVELOPER_TOOLS: &str =
     "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_DevTools";
 
-/// Sharing ▸ Remote Login. The Sharing extension (`com.apple.Sharing-Settings.extension`,
-/// legacy id `com.apple.preferences.sharing`) declares the `Services_RemoteLogin` and
-/// `Services_ScreenSharing` anchors on 27. VM: opening this URL loaded the Sharing extension.
+/// System Settings URL for General ▸ Sharing ▸ Remote Login.
 pub const PANE_REMOTE_LOGIN: &str =
     "x-apple.systempreferences:com.apple.Sharing-Settings.extension?Services_RemoteLogin";
 
-/// Sharing ▸ Screen Sharing.
+/// System Settings URL for General ▸ Sharing ▸ Screen Sharing.
 pub const PANE_SCREEN_SHARING: &str =
     "x-apple.systempreferences:com.apple.Sharing-Settings.extension?Services_ScreenSharing";
 
-/// The launchd label of Remote Login (`/System/Library/LaunchDaemons/ssh.plist`, which ships
-/// `Disabled = true`).
+/// `launchd` service label for Remote Login (`sshd`).
 pub const SSHD_LABEL: &str = "com.openssh.sshd";
 
-/// The launchd label of Screen Sharing (also shipped `Disabled = true`).
+/// `launchd` service label for Screen Sharing.
 pub const SCREEN_SHARING_LABEL: &str = "com.apple.screensharing";
 
-/// The TCC client Screen Sharing's control and view grants belong to.
+/// TCC client identifier for the Screen Sharing agent.
 pub const SCREEN_SHARING_AGENT: &str = "com.apple.screensharing.agent";
 
-/// How long one read may take. A probe never waits for a person; this only catches a hung
-/// tool.
+/// How long one read may take.
 const READ_BUDGET: Duration = Duration::from_secs(20);
 
-/// The app names a baseline may use, and the bundle id TCC lists each under.
+/// Known application short names and their macOS bundle identifiers.
 pub const APPS: [(&str, &str); 1] = [("aterm", "com.aterm.aterm")];
 
-/// The five kinds of step, in the order a person does them: Remote Login and its FDA switch
-/// first (they are what lets anything be read), Screen Sharing, then every app's Full Disk
-/// Access before any Developer Tools entry (aterm is not launched before its FDA switch, so
-/// System Settings never offers "Quit & Reopen").
+/// Kind of manual macOS permission or sharing step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Kind {
-    /// Sharing ▸ Remote Login.
+    /// General ▸ Sharing ▸ Remote Login.
     RemoteLogin,
-    /// Sharing ▸ Remote Login ⓘ ▸ Allow full disk access for remote users.
+    /// General ▸ Sharing ▸ Remote Login ▸ Allow full disk access for remote users.
     RemoteFullDiskAccess,
-    /// Sharing ▸ Screen Sharing (which writes the agent's PostEvent and ScreenCapture rows).
+    /// General ▸ Sharing ▸ Screen Sharing.
     ScreenSharing,
-    /// Privacy & Security ▸ Full Disk Access, for one app.
+    /// Privacy & Security ▸ Full Disk Access for an app.
     FullDiskAccess,
-    /// Privacy & Security ▸ Developer Tools, for one app.
+    /// Privacy & Security ▸ Developer Tools for an app.
     DeveloperTools,
 }
 
 impl Kind {
-    /// Every kind, in order.
+    /// All step kinds in execution order.
     pub const ALL: [Self; 5] = [
         Self::RemoteLogin,
         Self::RemoteFullDiskAccess,
@@ -134,7 +107,7 @@ impl Kind {
         Self::DeveloperTools,
     ];
 
-    /// The step id (before `:<app>` for the per-app kinds).
+    /// Returns the step identifier prefix.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -146,7 +119,7 @@ impl Kind {
         }
     }
 
-    /// Where the switch is, in words.
+    /// Returns human-readable instructions for locating the setting.
     #[must_use]
     pub const fn words(self) -> &'static str {
         match self {
@@ -168,7 +141,7 @@ impl Kind {
         }
     }
 
-    /// The pane's `x-apple.systempreferences` URL.
+    /// Returns the `x-apple.systempreferences` URL for the setting pane.
     #[must_use]
     pub const fn pane(self) -> &'static str {
         match self {
@@ -179,14 +152,13 @@ impl Kind {
         }
     }
 
-    /// Whether the switch can only be flipped by a person at the Mac's own keyboard: Remote
-    /// Login carries the connection itself, and Screen Sharing is what remote control needs.
+    /// Returns whether this step requires physical console access.
     #[must_use]
     pub const fn at_console(self) -> bool {
         matches!(self, Self::RemoteLogin | Self::ScreenSharing)
     }
 
-    /// Whether reading this step needs the TCC database.
+    /// Returns whether probing this step reads the system TCC database.
     #[must_use]
     pub const fn reads_tcc(self) -> bool {
         matches!(
@@ -196,19 +168,19 @@ impl Kind {
     }
 }
 
-/// One person step: its kind and, for the per-app kinds, the app.
+/// Manual setup step with an optional target application.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PersonStep {
-    /// What kind of switch.
+    /// Step kind.
     pub kind: Kind,
-    /// The app as the baseline names it (`aterm`), for the per-app kinds.
+    /// Application name as written in the baseline (`None` for system-wide steps).
     pub app: Option<String>,
-    /// The bundle id TCC lists the app under, for the per-app kinds.
+    /// Resolved macOS bundle identifier (`None` for system-wide steps).
     pub bundle: Option<String>,
 }
 
 impl PersonStep {
-    /// A step with no app.
+    /// Creates a system-wide step with no target application.
     #[must_use]
     pub const fn of(kind: Kind) -> Self {
         Self {
@@ -218,10 +190,10 @@ impl PersonStep {
         }
     }
 
-    /// A per-app step.
+    /// Creates a per-application step.
     ///
     /// # Errors
-    /// One line when `app` is neither a known name nor a bundle id.
+    /// Returns an error if `app` is neither a known short name nor a valid bundle ID.
     pub fn for_app(kind: Kind, app: &str) -> Result<Self, String> {
         Ok(Self {
             kind,
@@ -230,11 +202,10 @@ impl PersonStep {
         })
     }
 
-    /// Parse a step id: `remote_login`, `remote_full_disk_access`, `screen_sharing`,
-    /// `full_disk_access:<app>` or `developer_tools:<app>`.
+    /// Parses a step identifier (`<kind>` or `<kind>:<app>`).
     ///
     /// # Errors
-    /// One line naming what is not a step.
+    /// Returns an error if `id` does not name a valid step and application.
     pub fn parse(id: &str) -> Result<Self, String> {
         let (name, app) = match id.split_once(':') {
             Some((n, a)) => (n, Some(a)),
@@ -258,7 +229,7 @@ impl PersonStep {
         }
     }
 
-    /// The step id, as `aterm machines screen <host> <step>` takes it.
+    /// Formats the canonical step identifier.
     #[must_use]
     pub fn id(&self) -> String {
         match &self.app {
@@ -267,7 +238,7 @@ impl PersonStep {
         }
     }
 
-    /// One human line for the report.
+    /// Formats a human-readable summary line for reports.
     #[must_use]
     pub fn title(&self) -> String {
         let app = self.app.as_deref().unwrap_or("");
@@ -280,7 +251,7 @@ impl PersonStep {
         }
     }
 
-    /// What the person does, in words, then the pane's URL.
+    /// Formats instructions and the System Settings pane URL.
     #[must_use]
     pub fn how(&self) -> String {
         let app = self.app.as_deref().unwrap_or("");
@@ -300,11 +271,10 @@ impl PersonStep {
     }
 }
 
-/// The bundle id TCC lists `app` under: a name from [`APPS`], or a bundle id itself.
+/// Resolves `app` from [`APPS`] or validates it as a bundle identifier.
 ///
 /// # Errors
-/// One line when `app` is neither. A bundle id is letters, digits, `.`, `-` and `_` only, so
-/// it can be quoted into the TCC query as it is.
+/// Returns an error if `app` is neither a known short name nor a valid bundle ID.
 pub fn bundle_id(app: &str) -> Result<String, String> {
     if let Some((_, bundle)) = APPS.iter().find(|(name, _)| name.eq_ignore_ascii_case(app)) {
         return Ok((*bundle).to_owned());
@@ -322,19 +292,18 @@ pub fn bundle_id(app: &str) -> Result<String, String> {
     }
 }
 
-/// One `access` row: who, which service, and its `auth_value` (2 is allowed, 0 denied).
+/// Row read from the TCC `access` table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TccRow {
-    /// The bundle id or path.
+    /// Client bundle ID or path.
     pub client: String,
-    /// `kTCCService…`.
+    /// TCC service name (`kTCCService…`).
     pub service: String,
-    /// `auth_value`.
+    /// Authorization value (`2` allowed, `0` denied).
     pub auth_value: i64,
 }
 
-/// The TCC query for `clients` (bundle ids; each is checked by [`bundle_id`]'s rules, so no
-/// quoting is needed beyond the single quotes).
+/// Builds the SQL query reading `access` rows for `clients`.
 #[must_use]
 pub fn tcc_query(clients: &[&str]) -> String {
     let list: Vec<String> = clients.iter().map(|c| format!("'{c}'")).collect();
@@ -344,14 +313,7 @@ pub fn tcc_query(clients: &[&str]) -> String {
     )
 }
 
-/// The options every TCC read passes before the database, as
-/// `aterm_containment::consent`'s Developer Tools probe does: `-init /dev/null` so the
-/// account's `.sqliterc` (sqlite3 finds it through the passwd home, not `$HOME`: VM, one under
-/// a scratch `HOME=` did not run) cannot change the output mode or run a command, since an
-/// init file runs even beside a query argument (VM: `sqlite3 -init <file> :memory: 'select
-/// 1'` ran its `.print` and `.mode line`); `-safe` so nothing can touch another file;
-/// `-nofollow`; and one `|`-separated line per row with no header. VM (sqlite 3.54.0): this
-/// argv as root read the same three rows as a bare `-readonly`, exit 0.
+/// Read-only `sqlite3` CLI flags used for every TCC probe.
 pub const SQLITE3_OPTIONS: [&str; 11] = [
     "-init",
     "/dev/null",
@@ -366,7 +328,7 @@ pub const SQLITE3_OPTIONS: [&str; 11] = [
     "|",
 ];
 
-/// The command that reads `clients`' rows.
+/// Builds the `sqlite3` [`Cmd`] querying `clients` from [`TCC_DB`].
 #[must_use]
 pub fn tcc_cmd(clients: &[&str]) -> Cmd {
     Cmd::new(SQLITE3)
@@ -376,7 +338,7 @@ pub fn tcc_cmd(clients: &[&str]) -> Cmd {
         .budget(READ_BUDGET)
 }
 
-/// The command that only opens the database: Remote Login's FDA switch, measured.
+/// Builds a `sqlite3` [`Cmd`] that probes read access to [`TCC_DB`].
 #[must_use]
 pub fn tcc_open_cmd() -> Cmd {
     Cmd::new(SQLITE3)
@@ -385,7 +347,7 @@ pub fn tcc_open_cmd() -> Cmd {
         .budget(READ_BUDGET)
 }
 
-/// `launchctl print-disabled system`: the enabled/disabled override of each system service.
+/// Builds the `launchctl print-disabled system` [`Cmd`].
 #[must_use]
 pub fn print_disabled_cmd() -> Cmd {
     Cmd::new(LAUNCHCTL)
@@ -395,9 +357,7 @@ pub fn print_disabled_cmd() -> Cmd {
 
 /// Why the database did not answer: [`NEEDS_REMOTE_FDA`] when TCC refused this session
 /// (`Error: unable to open database "file:…?immutable=1": authorization denied`, exit 1), else
-/// what the tool said. Only `authorization denied` is that refusal: every open failure starts `unable to
-/// open database`, and a missing or unreadable file (`…: unable to open database file`,
-/// measured on a path that does not exist) says nothing about the switch.
+/// what the tool said.
 fn tcc_refusal(ran: &Ran) -> String {
     let err = ran.err();
     if err.contains("authorization denied") {
@@ -407,10 +367,10 @@ fn tcc_refusal(ran: &Ran) -> String {
     }
 }
 
-/// The rows a TCC query printed (`client|service|auth_value`, one per line).
+/// Parses `client|service|auth_value` lines from `sqlite3` output.
 ///
 /// # Errors
-/// One line when a line is not such a row.
+/// Returns an error if any non-empty line is malformed.
 pub fn parse_tcc(text: &str) -> Result<Vec<TccRow>, String> {
     let mut rows = Vec::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
@@ -445,8 +405,7 @@ fn tcc_rows(
     }
 }
 
-/// `client`'s `auth_value` for `service`: the value, `Absent` when TCC holds no row (the app
-/// was never listed, which is the default: not granted).
+/// Looks up `client`'s `auth_value` for `service` in `rows`.
 #[must_use]
 pub fn grant(rows: &[TccRow], client: &str, service: &str) -> Read<i64> {
     rows.iter()
@@ -454,9 +413,7 @@ pub fn grant(rows: &[TccRow], client: &str, service: &str) -> Read<i64> {
         .map_or(Read::Absent, |r| Read::Value(r.auth_value))
 }
 
-/// Whether `label` is enabled in `launchctl print-disabled system`'s output: `Absent` when
-/// the service has no override (its plist's own `Disabled` holds, which for Remote Login and
-/// Screen Sharing is true). Older macOS printed `true` for disabled and `false` for enabled.
+/// Parses whether `label` is enabled in `launchctl print-disabled system` output.
 #[must_use]
 pub fn launchd_enabled(text: &str, label: &str) -> Read<bool> {
     if !text.contains("disabled services = {") {
@@ -491,19 +448,16 @@ fn service_enabled(label: &str, run: &mut dyn FnMut(&Cmd) -> Result<Ran, RunFail
     }
 }
 
-/// What a probe may know without reading: the facts the agent gathered, and the console
-/// user for aterm's own record. The controller's re-probe passes neither, so every read is
-/// fresh.
+/// Pre-gathered host facts and console user passed into [`probe_step`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Known<'a> {
-    /// [`crate::model::HostFacts::remote_full_disk_access`].
+    /// Cached result of the Remote Login Full Disk Access check.
     pub remote_full_disk_access: Option<bool>,
-    /// The account at the console.
+    /// Console user account, if any.
     pub console: Option<&'a User>,
 }
 
-/// Probe `step`, running each read through `run` (the agent's port, or a signed `exec` on
-/// the controller). Never waits: one read per question, each bounded.
+/// Probes `step` using `run` to execute system commands.
 pub fn probe_step(
     step: &PersonStep,
     known: Known<'_>,
@@ -579,7 +533,7 @@ pub fn probe_step(
 
 /// aterm's own Full Disk Access record (design §6's fallback), read as the console user from
 /// that user's running aterm: `devtools.list_probe` reads `no_full_disk_access` until aterm
-/// has FDA and `read` after (design §1.8). `None` when there is no such record to read.
+/// has FDA and `read` after (design §1.8).
 fn aterm_record(
     step: &PersonStep,
     console: Option<&User>,
@@ -594,8 +548,6 @@ fn aterm_record(
         .budget(READ_BUDGET);
     let ran = run(&cmd).ok().filter(Ran::success)?;
     let record: aterm_json::Value = aterm_json::from_str(&ran.out()).ok()?;
-    // The console user's running aterm answers, whichever it is: a dev build's record is
-    // about another bundle's grant, not this step's.
     if record.pointer("/identity/bundle_id")?.as_str()? != APPS[0].1 {
         return None;
     }
@@ -642,10 +594,10 @@ impl Item for PersonItem {
     }
 }
 
-/// The steps `table` asks for, in [`Kind`] order.
+/// Expands `table` into ordered [`PersonStep`]s.
 ///
 /// # Errors
-/// One line naming an app that is neither a known name nor a bundle id.
+/// Returns an error if any configured application name is invalid.
 pub fn steps(table: &Table) -> Result<Vec<PersonStep>, String> {
     let mut steps = Vec::new();
     for (wanted, kind) in [
@@ -666,11 +618,10 @@ pub fn steps(table: &Table) -> Result<Vec<PersonStep>, String> {
     Ok(steps)
 }
 
-/// The items `table` asks for. A `false` asks for nothing: these items only count switches a
-/// person turns on, and never turn anything off.
+/// Expands `table` into boxed [`Item`]s.
 ///
 /// # Errors
-/// One line naming what cannot be expanded.
+/// Returns an error if any configured application name is invalid.
 pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     let _ = ctx;
     Ok(steps(table)?
@@ -753,9 +704,7 @@ mod tests {
     /// THE READ TAKES NO LOCK ON tccd's FILE (macOS: Apple's `/usr/bin/sqlite3`): the
     /// options every TCC read passes, over a scratch database's immutable URI, answer its rows
     /// while the lock a committing writer holds is taken (`EXCLUSIVE`: `PENDING_BYTE` and
-    /// the 511 bytes after it). NEGATIVE CONTROL: the same options over the file's path meet
-    /// that lock (`database is locked`): that reader held `SHARED`, the lock that fails the
-    /// `COMMIT` of a writer with no busy timeout, as tccd is.
+    /// the 511 bytes after it).
     #[cfg(target_os = "macos")]
     #[test]
     fn the_tcc_read_takes_no_lock_a_writer_would_meet() {
@@ -816,8 +765,6 @@ mod tests {
 
     #[test]
     fn a_database_that_fails_to_open_for_another_reason_is_unusable_not_the_fda_switch() {
-        // sqlite3 on a path that does not exist (measured): the open fails, but TCC did not
-        // refuse anything, so the switch is unmeasured.
         let gone = Ran::exit(
             1,
             "Error: unable to open database \"file:/Library/Application%20Support/com.apple.TCC/TCC.db?immutable=1\": unable to open database file\n",
@@ -904,7 +851,6 @@ mod tests {
                 now: "on, with control".into()
             }
         );
-        // View-only: the control row is missing (Screen Sharing turned on by launchctl).
         let sys = Fake::root();
         sys.on(&print_disabled_cmd().display(), Ran::ok(PRINT_DISABLED_VM));
         sys.on(
@@ -915,7 +861,6 @@ mod tests {
             item("screen_sharing").probe(&sys, &ctx()),
             Probe::Person { .. }
         ));
-        // Never turned on: the service has no override, and TCC is not even read.
         let sys = Fake::root();
         sys.on(
             &print_disabled_cmd().display(),
@@ -1054,8 +999,6 @@ mod tests {
             item("full_disk_access:aterm").probe(&sys, &c),
             Probe::Ok { .. }
         ));
-        // A record from another bundle (a dev build running for the console user) says
-        // nothing about com.aterm.aterm's grant: the database's refusal stands.
         let sys = Fake::root();
         sys.on(&key(&["com.aterm.aterm"]), Ran::exit(1, TCC_DENIED));
         sys.on(
@@ -1075,7 +1018,6 @@ mod tests {
                 why: NEEDS_REMOTE_FDA.into()
             }
         );
-        // No aterm running: the database's refusal stands.
         let sys = Fake::root();
         sys.on(&key(&["com.aterm.aterm"]), Ran::exit(1, TCC_DENIED));
         assert_eq!(

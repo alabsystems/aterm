@@ -1,39 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE WINDOW'S AI CLIS (docs/DESIGN-ai-connections-2026-10-16.md §7.3, §10):
-//! the look the window takes at the AI CLIs aterm keeps a login to, what
-//! Settings ▸ Harness ▸ AI CLIs renders of it, and the `ai.` lines of Messages.
-//!
-//! **The look** is the doctor's own (`aterm_agent::ai::cli::look`, what `aterm
-//! ai` prints): it stats login files and reads records, and runs NO child
-//! process, so it never spends a login. It runs on a worker of its own
-//! ([`App::start_ai_looks`]), never on the event loop, and posts each reading
-//! back as `Wake::AiLooked`. The worker looks at start, every
-//! [`LOOK_EVERY`], when the AI store's wake marker (`<state>/ai/wake`, rewritten
-//! after every sign-in and review) changes, after an `[ai]` or fleet-document
-//! edit ([`App::ai_config_changed`]), and on the page's Refresh and arrival.
-//! With `[ai] enabled = false` it takes no look, and the AI lines end. A look
-//! first fetches the fleet document from its URL when one is named and due
-//! (every six hours; the page's Fetch now forces it), off the event loop.
-//!
-//! **The lines** ([`ai_entries`]) are `Family::Ai`, a LEVEL family: each look
-//! states its whole answer through `App::except_replace`. One
-//! `exceptions::Entry` per wanted CLI that needs a person — signed
-//! out, not installed, or a login due — keyed `ai.<cli>.<state>`, Warn for the
-//! preferred CLI and Info for the others, whose one button opens this page.
-//! Never a `Message::now`: signing in needs a terminal and a browser, not one
-//! press. For Claude Code, nothing accounts v2 already says: while its roster
-//! lists rows the AI lines raise nothing of Claude, and otherwise only its
-//! signed-out and not-installed states.
-//!
-//! **The page** renders [`AiProjection`], a pure function of [`AiState`],
-//! which the Harness snapshot carries (`HarnessState::ai`), so the Harness
-//! page's revision fan-out publishes both; nothing polls on the event loop.
-//! A row's Sign in opens a new tab and types `'<aterm>' ai login <cli>` (or
-//! `pkg install <cli>` for one not installed) into its fresh shell, as the
-//! operator's launch line is typed ([`App::ai_sign_in`]): an ordinary act,
-//! which grants nothing a shell lacks — the verb itself refuses under an agent.
+//! AI CLI status projection and login actions ([`App::start_ai_looks`], [`LOOK_EVERY`],
+//! [`App::ai_config_changed`], [`ai_entries`], [`AiProjection`], [`AiState`],
+//! [`App::ai_sign_in`]).
 
 use std::path::Path;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -54,18 +24,13 @@ use crate::native_settings::SettingsRoute;
 /// How often the window looks with nothing else asking (§7.3).
 pub(crate) const LOOK_EVERY: Duration = Duration::from_hours(6);
 
-/// How often the worker stats the AI store's wake marker between asks: a
-/// `stat`, on the worker, never the event loop.
+/// How often the worker stats the AI store's wake marker between asks.
 const WAKE_POLL: Duration = Duration::from_secs(5);
 
-/// The longest fact a row or a line carries, sanitized
-/// (`aterm_agent::ai::review::sanitize_block`), as `aterm ai` prints it.
+/// The longest fact a row or a line carries.
 const FACT_MAX: usize = 400;
 
-// The reading
-
-/// One AI CLI as the window's look judged it: plain data, its words already
-/// sanitized.
+/// One AI CLI as the window's look judged it: plain data, its words already sanitized.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AiCli {
     /// The connection's id (`codex`).
@@ -82,19 +47,13 @@ pub(crate) struct AiCli {
     pub(crate) mark: Mark,
     /// What is known, one line.
     pub(crate) fact: String,
-    /// THE PATH `fact` NAMES, as it says it ([`named_path`]): a copy on
-    /// `PATH` aterm does not manage. Only the look knows where it starts and
-    /// ends — a macOS path holds spaces ("Application Support") — so a row
-    /// that cuts its detail around the path is told it, never guesses it.
+    /// THE PATH `fact` NAMES, as it says it ([`named_path`]).
     pub(crate) path: Option<String>,
     /// The installed version.
     pub(crate) version: Option<String>,
 }
 
-/// The words of `foreign` as `fact` says them, where `fact` names that path:
-/// the path a row's detail must keep its end of ([`AiCli::path`]); `None`
-/// where there is no such copy, or the fact (cut at [`FACT_MAX`]) does not
-/// say all of it.
+/// Suffix of `foreign` preserved in `fact` ([`AiCli::path`], [`FACT_MAX`]).
 fn named_path(fact: &str, foreign: Option<&Path>) -> Option<String> {
     foreign
         .map(|path| one_line(&path.display().to_string()))
@@ -102,8 +61,7 @@ fn named_path(fact: &str, foreign: Option<&Path>) -> Option<String> {
 }
 
 impl AiCli {
-    /// Whether a definite install or sign-in action is needed: the doctor's
-    /// own rule, independent of whether a vendor lab has run.
+    /// Whether a definite install or sign-in action is needed.
     #[must_use]
     pub(crate) fn needs_you(&self) -> bool {
         self.state.needs_person(self.wanted)
@@ -134,15 +92,12 @@ pub(crate) struct AiReading {
     pub(crate) clis: Vec<AiCli>,
     /// Why the AI store's record was not used, if it was not.
     pub(crate) store_note: Option<String>,
-    /// What aterm holds of a fleet document from a URL, its last error one
-    /// sanitized line.
+    /// What aterm holds of a fleet document from a URL, its last error one sanitized line.
     pub(crate) held: Option<Held>,
 }
 
 impl AiReading {
-    /// The window's reading of `look`, taken at `now` (`offset_s`: the zone's
-    /// offset then), in `VENDORS` order; every fact passes the doctor's own
-    /// sanitizer.
+    /// The window's reading of `look`, taken at `now`.
     #[must_use]
     pub(crate) fn of(look: &aterm_agent::ai::cli::Look, now: i64, offset_s: Option<i64>) -> Self {
         let clis = connector::connections()
@@ -187,8 +142,7 @@ impl AiReading {
     }
 }
 
-/// `text` from outside aterm as one line the page and Messages may show:
-/// the doctor's sanitizer, newlines folded.
+/// `text` from outside aterm as one line the page and Messages may show.
 fn one_line(text: &str) -> String {
     aterm_agent::ai::review::sanitize_block(text, FACT_MAX)
         .replace(['\n', '\t'], " ")
@@ -196,9 +150,7 @@ fn one_line(text: &str) -> String {
         .to_string()
 }
 
-/// This machine's AI choices, resolved (`[ai]` over the fleet document):
-/// read from the window's config at every publish, so the page shows an edit
-/// before the look it starts lands.
+/// This machine's AI choices, resolved (`[ai]` over the fleet document).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AiChoices {
     /// The preferred CLI and where that came from.
@@ -277,11 +229,7 @@ impl Default for AiChoices {
     }
 }
 
-// The published state and its projection
-
-/// THE SETTINGS ▸ HARNESS ▸ AI CLIS SNAPSHOT: plain data, published whole
-/// with the Harness snapshot (`App::ai_state`); the page renders its
-/// [`Self::projection`].
+/// Settings ▸ Harness ▸ AI CLIs snapshot ([`Self::projection`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AiState {
     /// Whether the window looks (`[ai] enabled`).
@@ -327,8 +275,7 @@ pub(crate) struct AiCliRow {
     pub(crate) title: String,
     /// Its state and what is known.
     pub(crate) detail: String,
-    /// The path `detail` names ([`AiCli::path`]), which a one-line row keeps
-    /// the end of.
+    /// The path `detail` names ([`AiCli::path`]), which a one-line row keeps the end of.
     pub(crate) path: Option<String>,
     /// Sign in or Install, where it needs a person.
     pub(crate) act: Option<AiAct>,
@@ -374,8 +321,7 @@ fn from_words(from: From) -> &'static str {
     }
 }
 
-/// A row's state and fact, `signed-out · no login is stored`; the fact alone
-/// where it already says the state (`not installed`), never the state twice.
+/// A row's state and fact, `signed-out · no login is stored`.
 fn detail_words(word: &str, fact: &str) -> String {
     if fact.starts_with(&word.replace('-', " ")) {
         fact.to_string()
@@ -394,8 +340,7 @@ fn listed(names: &[&str]) -> String {
 }
 
 impl AiState {
-    /// An action needs both the current policy and the observed need. A
-    /// queued press or an older snapshot cannot restore a disabled CLI.
+    /// An action needs both the current policy and the observed need.
     pub(crate) fn actionable_cli(&self, id: &str) -> Option<&AiCli> {
         self.reading
             .as_ref()
@@ -404,8 +349,7 @@ impl AiState {
             .filter(|cli| cli.needs_you())
     }
 
-    /// What the page shows, derived once ([`AiProjection`]); `observed`:
-    /// whether the host has published its snapshot. Pure.
+    /// What the page shows, derived once ([`AiProjection`]).
     #[must_use]
     pub(crate) fn projection(&self, observed: bool) -> AiProjection {
         let choices = &self.choices;
@@ -445,8 +389,6 @@ impl AiState {
             reading.as_of.saturating_mul(1000),
             reading.offset_s,
         );
-        // Keep the last observation's versions, but never let its successful
-        // summary hide a refresh in flight or one that could not be read.
         if self.looking {
             return format!("Looking at the AI CLIs\u{2026} \u{b7} last observed {when}");
         }
@@ -470,8 +412,7 @@ impl AiState {
         format!("{words} \u{b7} looked {when}")
     }
 
-    /// One row per CLI this build has a connection for: from the reading
-    /// where there is one, else its name and why it was not looked at.
+    /// One row per CLI this build has a connection for.
     fn cli_rows(&self) -> Vec<AiCliRow> {
         let preferred = self.choices.preferred.0;
         connector::connections()
@@ -524,8 +465,7 @@ impl AiState {
             .collect()
     }
 
-    /// The REVIEWS card's facts, under its two rows (Reviews across AIs and
-    /// Reviewer permissions): who reviews and how long each may take.
+    /// The REVIEWS card's facts, under its two rows: who reviews and how long each may take.
     fn review_rows(&self) -> Vec<(String, String)> {
         let c = &self.choices;
         let row = |label: &str, value: String| (label.to_string(), value);
@@ -578,8 +518,7 @@ impl AiState {
         ]
     }
 
-    /// The FLEET card: this machine's name, the document and what became of
-    /// it, and what the readers said.
+    /// The FLEET card.
     fn fleet_rows(&self) -> Vec<(String, String)> {
         let c = &self.choices;
         let row = |label: &str, value: String| (label.to_string(), value);
@@ -645,13 +584,7 @@ impl AiState {
     }
 }
 
-// The lines
-
-/// THE AI LINES (`Family::Ai`, a level family): one entry per CLI that needs a
-/// person, keyed `ai.<cli>.<state>`, the preferred one Warn. For Claude Code,
-/// none while accounts v2's roster lists rows (`accounts_listed`: it speaks
-/// for Claude's login), and otherwise only signed out or not installed (a due
-/// login is accounts v2's to say). Pure.
+/// THE AI LINES (`Family::Ai`, a level family).
 #[must_use]
 pub(crate) fn ai_entries(reading: &AiReading, accounts_listed: bool) -> Vec<Entry> {
     reading
@@ -706,15 +639,12 @@ fn ai_entry(cli: &AiCli, preferred: bool) -> Entry {
     .log_line(format!("ai need={} cli={}", cli.state.word(), cli.id))
 }
 
-// The worker
-
 /// What the window asks of its look worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AiAsk {
     /// Look now (and keep looking: `[ai] enabled` is on).
     Look(u64),
-    /// Fetch the fleet document from its URL now, then look (the page's
-    /// Fetch now).
+    /// Fetch the fleet document from its URL now, then look (the page's Fetch now).
     Fetch(u64),
     /// Take no look until asked again (`[ai] enabled = false`).
     Off,
@@ -730,10 +660,7 @@ fn wake_stamp(path: Option<&Path>) -> Option<(Option<std::time::SystemTime>, u64
     Some((meta.modified().ok(), file))
 }
 
-/// THE LOOK WORKER'S LOOP: look when asked, when the wake marker at `wake`
-/// changes (it is rewritten after every sign-in and review), and once every
-/// `every`; never while off. Each reading goes to `send`, and the loop ends
-/// when `send` says the window is gone or every asker is.
+/// THE LOOK WORKER'S LOOP.
 fn look_loop(
     asks: &Receiver<AiAsk>,
     mut on: bool,
@@ -782,12 +709,7 @@ fn look_loop(
     }
 }
 
-/// One look, as the window takes it: the fleet document fetched from its URL
-/// when one is named and due (now, with `fetch`), then the doctor's look over
-/// this process's paths, with the environment a tab's shell has (aterm strips
-/// the AI variables from every shell it spawns, so a key set in the window's
-/// own environment is no key a tab's CLI would use). Runs no child process
-/// but the fetch's own `curl`.
+/// One look, as the window takes it.
 fn look_now(fetch: bool) -> Result<AiReading, String> {
     let mut env = aterm_agent::ai::cli::Env::from_process();
     env.vars
@@ -802,8 +724,7 @@ fn look_now(fetch: bool) -> Result<AiReading, String> {
     ))
 }
 
-/// The POSIX line typed into a fresh shell to run `exe` with fixed `args`:
-/// the program's path quoted, or `None` for a control character in it.
+/// The POSIX line typed into a fresh shell to run `exe` with fixed `args`.
 #[cfg(any(not(windows), test))]
 #[must_use]
 pub(crate) fn launch_line(exe: &Path, args: &[&str]) -> Option<String> {
@@ -818,9 +739,7 @@ pub(crate) fn launch_line(exe: &Path, args: &[&str]) -> Option<String> {
     ))
 }
 
-/// A Windows invocation for the shell the spawn resolved. PowerShell needs
-/// its call operator; cmd does not. Other shells need their own path
-/// translation and are refused. Fixed `args` are verb words and a CLI id.
+/// A Windows invocation for the shell the spawn resolved.
 #[cfg(any(windows, test))]
 fn windows_launch_line(exe: &Path, args: &[&str], shell: &Path) -> Option<String> {
     let exe = exe.to_str()?;
@@ -834,7 +753,6 @@ fn windows_launch_line(exe: &Path, args: &[&str], shell: &Path) -> Option<String
         .to_ascii_lowercase();
     let program = match name.strip_suffix(".exe").unwrap_or(&name) {
         "cmd" => {
-            // cmd expands both forms even inside quotes (delayed expansion
             // can be enabled by shell_args). Do not type a different path.
             if exe.contains(['%', '!']) {
                 return None;
@@ -844,7 +762,6 @@ fn windows_launch_line(exe: &Path, args: &[&str], shell: &Path) -> Option<String
         "pwsh" | "powershell" => {
             let mut quoted = String::from("& '");
             for c in exe.chars() {
-                // PowerShell accepts typographic single quotes as delimiters
                 // too, and doubles any member of this class to quote it.
                 if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
                     quoted.push(c);
@@ -859,10 +776,7 @@ fn windows_launch_line(exe: &Path, args: &[&str], shell: &Path) -> Option<String
     Some(format!("{program} {}", args.join(" ")))
 }
 
-// The App's own part
-
-/// What the App keeps for the AI CLIs: the worker's ask line, the newest
-/// reading, and whether Claude's accounts speak for Claude.
+/// What the App keeps for the AI CLIs.
 #[derive(Debug, Default)]
 pub(crate) struct AiScreen {
     /// The worker's ask line, once it runs.
@@ -875,14 +789,12 @@ pub(crate) struct AiScreen {
     pub(crate) looking: bool,
     /// Why no look could be taken.
     pub(crate) unavailable: Option<String>,
-    /// Whether accounts v2's roster lists rows (`AccountsSaid::Listed`): then
-    /// the AI lines say nothing of Claude.
+    /// Whether accounts v2's roster lists rows (`AccountsSaid::Listed`).
     pub(crate) accounts_listed: bool,
 }
 
 impl App {
-    /// THE SNAPSHOT Settings ▸ Harness ▸ AI CLIs renders: the choices in
-    /// force (the config's, no file read) and the newest reading.
+    /// THE SNAPSHOT Settings ▸ Harness ▸ AI CLIs renders.
     #[must_use]
     pub(crate) fn ai_state(&self) -> AiState {
         let enabled = self.config.ai.enabled();
@@ -895,10 +807,7 @@ impl App {
         }
     }
 
-    /// START THE LOOK WORKER, once (a second call finds it running): a named
-    /// thread that looks at once where `[ai] enabled` is on and then as
-    /// [`look_loop`] says, posting `Wake::AiLooked`. A window with no event
-    /// loop (a test App) starts none.
+    /// Start the AI CLI look worker thread once ([`look_loop`]).
     pub(crate) fn start_ai_looks(&mut self) {
         if self.ai_screen.asks.is_some() {
             return;
@@ -911,13 +820,10 @@ impl App {
         let wake = aterm_types::dirs::state_dir()
             .map(|root| aterm_agent::ai::store::Store::at(&root).wake_path());
         let (asks, asked) = std::sync::mpsc::channel();
-        // Background: nothing on the keystroke path waits for it.
         let spawned = crate::qos::spawn_lane_thread(
             "aterm-ai-look",
             crate::qos::Role::Background,
             move || {
-                // A look that panicked still answers, so Refresh is never
-                // left busy for a reading that will not come.
                 let look = |fetch: bool| {
                     std::panic::catch_unwind(|| look_now(fetch))
                         .unwrap_or_else(|_| Err("the look failed".to_string()))
@@ -950,15 +856,12 @@ impl App {
                 self.ai_screen.unavailable = Some(format!("the look could not start: {error}"));
             }
         }
-        // Switched off before this launch: a line an earlier run left open in
-        // the log ends now, since no look will ever say it again.
         if !on {
             self.clear_ai_entries();
         }
     }
 
-    /// Ask for a look now (the page's Refresh and arrival), and republish so
-    /// Refresh shows busy. Nothing while `[ai] enabled` is off.
+    /// Ask for a look now (the page's Refresh and arrival), and republish so Refresh shows busy.
     pub(crate) fn ask_ai_look(&mut self) {
         if self.config.ai.enabled()
             && let Some(asks) = &self.ai_screen.asks
@@ -969,9 +872,7 @@ impl App {
         self.publish_native_harness_state();
     }
 
-    /// Fetch the fleet document from its URL now, then look (the page's Fetch
-    /// now), and republish so the page shows busy. Nothing while `[ai]
-    /// enabled` is off.
+    /// Fetch the fleet document from its URL now, then look, and republish so the page shows busy.
     pub(crate) fn ask_ai_fetch(&mut self) {
         if self.config.ai.enabled()
             && let Some(asks) = &self.ai_screen.asks
@@ -982,8 +883,7 @@ impl App {
         self.publish_native_harness_state();
     }
 
-    /// `[ai]` or its fleet document changed (the config reload): look again
-    /// under it, or — switched off — stop looking and end every AI line.
+    /// `[ai]` or its fleet document changed (the config reload).
     pub(crate) fn ai_config_changed(&mut self) {
         let on = self.config.ai.enabled();
         self.ai_screen.generation = self.ai_screen.generation.wrapping_add(1);
@@ -1002,9 +902,7 @@ impl App {
         self.publish_native_harness_state();
     }
 
-    /// A look landed: kept, its lines handed to the digest, and the page
-    /// republished. A completion from before a policy edit or newer request
-    /// cannot replace the current facts or settle the current request.
+    /// A look landed: kept, its lines handed to the digest, and the page republished.
     pub(crate) fn finish_ai_look(&mut self, generation: u64, result: Result<AiReading, String>) {
         if generation != self.ai_screen.generation {
             return;
@@ -1023,8 +921,7 @@ impl App {
         self.publish_native_harness_state();
     }
 
-    /// Whether accounts v2's roster lists rows moved: the AI lines are said
-    /// again from the newest reading.
+    /// Whether accounts v2's roster lists rows moved.
     pub(crate) fn note_ai_accounts_listed(&mut self, listed: bool) {
         if self.ai_screen.accounts_listed != listed {
             self.ai_screen.accounts_listed = listed;
@@ -1032,8 +929,7 @@ impl App {
         }
     }
 
-    /// The AI lines as the newest reading has them, handed to the digest as
-    /// the family's WHOLE answer ([`Family::Ai`] is a level family).
+    /// Replace the digest's [`Family::Ai`] entries from the newest reading.
     pub(crate) fn hand_ai_entries(&mut self) {
         if !self.config.ai.enabled() {
             self.clear_ai_entries();
@@ -1053,12 +949,7 @@ impl App {
         }
     }
 
-    /// SIGN IN (OR INSTALL) ONE AI CLI: a new tab in window `window` whose
-    /// fresh shell is typed `'<aterm>' ai login <id>` — `pkg install <id>`
-    /// where the newest reading has it not installed — and Enter, as the
-    /// operator's launch line is. An id this build has no connection for, or
-    /// a program path a typed line cannot carry, opens nothing and says why
-    /// in `aterm.log`.
+    /// SIGN IN (OR INSTALL) ONE AI CLI.
     pub(crate) fn ai_sign_in(&mut self, window: crate::WindowId, id: &str) {
         let Some(c) = connector::connector(id) else {
             aterm_log::warn!("ai: no AI CLI is named {id:?}; nothing opened");
@@ -1104,8 +995,7 @@ impl App {
         );
     }
 
-    /// Type `line` and Enter into the newborn session `sid`'s shell
-    /// (`app_tabs::inject_launch_line`).
+    /// Type `line` and Enter into newborn session `sid` (`app_tabs::inject_launch_line`).
     fn type_into_new_session(&mut self, sid: &str, line: &str) {
         let found = {
             let store = self.store.read().unwrap_or_else(|p| p.into_inner());

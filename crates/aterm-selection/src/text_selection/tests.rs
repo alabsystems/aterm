@@ -28,16 +28,13 @@ fn test_contains_multiline() {
     sel.update_selection(2, 3, SelectionSide::Right);
     sel.complete_selection();
 
-    // Row 0: from col 5 to end
     assert!(!sel.contains(0, 4));
     assert!(sel.contains(0, 5));
     assert!(sel.contains(0, 80)); // Full line selected after start
 
-    // Row 1: full line
     assert!(sel.contains(1, 0));
     assert!(sel.contains(1, 80));
 
-    // Row 2: from start to col 3
     assert!(sel.contains(2, 0));
     assert!(sel.contains(2, 3));
     assert!(!sel.contains(2, 4));
@@ -50,7 +47,6 @@ fn test_contains_block() {
     sel.update_selection(2, 10, SelectionSide::Right);
     sel.complete_selection();
 
-    // Rectangular region: rows 0-2, cols 5-10
     assert!(sel.contains(0, 5));
     assert!(sel.contains(1, 7));
     assert!(sel.contains(2, 10));
@@ -66,7 +62,6 @@ fn test_extend_selection() {
     sel.update_selection(0, 10, SelectionSide::Right);
     sel.complete_selection();
 
-    // Shift-click to extend
     sel.extend_selection(2, 15, SelectionSide::Right);
     assert_eq!(sel.state(), SelectionState::InProgress);
     assert_eq!(sel.end().row, 2);
@@ -122,11 +117,9 @@ fn test_anchor_ordering() {
 /// `adjust_for_scroll` shifts both anchors by `-delta` and keeps the selection
 /// while every row stays in `-floor..max_rows` (`max_rows` is the live row
 /// count, so row `max_rows` is one past the last visible row); a row past
-/// either bound clears it. `i32::MAX` (the region-scroll sentinel) saturates
-/// instead of overflowing.
+/// either bound clears it.
 #[test]
 fn adjust_for_scroll_shifts_or_clears_at_the_bounds() {
-    // (start row, end row, delta, max_rows, floor, rows after or None = cleared)
     #[expect(clippy::type_complexity, reason = "a test's case table")]
     let cases: [(i32, i32, i32, i32, i32, Option<(i32, i32)>); 12] = [
         (5, 7, 2, 24, 23, Some((3, 5))),
@@ -206,12 +199,9 @@ fn test_translate_rows_for_presentation_saturates_at_i32_boundaries() {
 
 #[test]
 fn test_adjust_for_scroll_in_progress_selection() {
-    // Scroll adjustment must work on InProgress selections too,
-    // not just Complete ones.
     let mut sel = TextSelection::new();
     sel.start_selection(5, 3, SelectionSide::Left, SelectionType::Simple);
     sel.update_selection(7, 10, SelectionSide::Right);
-    // Deliberately do NOT call complete_selection()
     assert!(sel.is_in_progress());
 
     let visible = sel.adjust_for_scroll(2, 24, 23);
@@ -223,15 +213,6 @@ fn test_adjust_for_scroll_in_progress_selection() {
 
 #[test]
 fn test_adjust_for_scroll_deep_scrollback_survives_then_evicts() {
-    // A selection made deep in scrollback uses
-    // live-screen coords where scrollback is negative. With the lower clear
-    // bound derived from the visible height (-(max_rows-1) = -23), a single
-    // line of background output would scroll the selection past -23 and wipe
-    // it even though view pinning keeps the exact same text on screen.
-    // The clear bound must instead be the retained-history floor (-floor).
-    //
-    // Scenario: 24-row screen, 500 lines of scrollback, selection anchored
-    // ~40 lines back into history (rows -40 and -38).
     let max_rows = 24;
     let floor = 500;
     let mut sel = TextSelection::new();
@@ -239,8 +220,6 @@ fn test_adjust_for_scroll_deep_scrollback_survives_then_evicts() {
     sel.update_selection(-38, 10, SelectionSide::Right);
     sel.complete_selection();
 
-    // A single line of output (delta = 1) must NOT clear the selection:
-    // -41 and -39 are still far above the history floor (-500).
     let visible = sel.adjust_for_scroll(1, max_rows, floor);
     assert!(
         visible,
@@ -250,10 +229,6 @@ fn test_adjust_for_scroll_deep_scrollback_survives_then_evicts() {
     assert_eq!(sel.normalized_start().row, -41); // -40 - 1
     assert_eq!(sel.normalized_end().row, -39); // -38 - 1
 
-    // Scrolling the START endpoint below the retained-history floor (its row would
-    // drop to -41 - 460 = -501 < -500) evicts that endpoint's content — but NOT the
-    // end's, which is still retained at -499: the head clamps onto the
-    // oldest retained row and reports the loss.
     let visible = sel.adjust_for_scroll(460, max_rows, floor);
     assert!(
         visible,
@@ -304,9 +279,7 @@ fn test_adjust_for_scroll_clamps_the_evicted_end_anchor_on_an_upward_drag() {
 }
 
 /// A clamp that leaves nothing selectable is a TOTAL loss, not a partial one, and
-/// must not survive as a selection nothing paints and nothing copies. The surviving
-/// anchor here is itself `(min_row, 0, Left)`, so side adjustment retreats the end to
-/// `(min_row - 1, u16::MAX)` and the span is empty the instant the head clamps onto it.
+/// must not survive as a selection nothing paints and nothing copies.
 #[test]
 fn test_adjust_for_scroll_clears_when_the_clamp_collapses_the_span() {
     let mut sel = TextSelection::new();
@@ -314,8 +287,6 @@ fn test_adjust_for_scroll_clears_when_the_clamp_collapses_the_span() {
     sel.update_selection(-50, 0, SelectionSide::Left);
     sel.complete_selection();
 
-    // delta 1 => -50 and -51 against a floor of 50: the older anchor clamps onto
-    // -50, which is exactly where the surviving one already sits.
     assert!(!sel.adjust_for_scroll(1, 24, 50));
     assert!(
         !sel.has_selection(),
@@ -406,10 +377,6 @@ fn test_adjust_for_row_splice_clears_only_after_real_history_eviction() {
     assert!(retained.adjust_for_row_splice(3, 1, 5, 5));
     assert_eq!(retained.normalized_start().row, -5);
 
-    // One endpoint evicted by the splice is PARTIAL eviction and clamps, exactly as
-    // in `adjust_for_scroll`. Routing the splice through a byte-identical below-floor
-    // clear would have left a top-anchored archival splice destroying a whole
-    // selection for one evicted endpoint.
     let mut partly_evicted = TextSelection::new();
     partly_evicted.start_selection(-5, 0, SelectionSide::Left, SelectionType::Simple);
     partly_evicted.update_selection(-2, 2, SelectionSide::Right);
@@ -420,7 +387,6 @@ fn test_adjust_for_row_splice_clears_only_after_real_history_eviction() {
     assert_eq!(partly_evicted.normalized_end().row, -3);
     assert!(partly_evicted.truncated());
 
-    // Both endpoints gone is still a clear — the non-vacuity control.
     let mut evicted = TextSelection::new();
     evicted.start_selection(-5, 0, SelectionSide::Left, SelectionType::Simple);
     evicted.update_selection(-4, 2, SelectionSide::Right);
@@ -428,8 +394,6 @@ fn test_adjust_for_row_splice_clears_only_after_real_history_eviction() {
     assert!(!evicted.adjust_for_row_splice(3, 2, 5, 5));
     assert!(!evicted.has_selection());
 
-    // Row `max_rows` is one past the last live row: a splice leaving an anchor
-    // there clears, as `adjust_for_scroll` does.
     let mut outside = TextSelection::new();
     outside.start_selection(23, 0, SelectionSide::Left, SelectionType::Simple);
     outside.update_selection(24, 10, SelectionSide::Right);
@@ -440,10 +404,6 @@ fn test_adjust_for_row_splice_clears_only_after_real_history_eviction() {
 /// The render loop's precomputed bounds (`normalized_bounds` +
 /// `selection_contains_linear`/`_block`) agree with `contains` on every cell,
 /// for a forward, a backward and a block selection.
-///
-/// These anchors make `normalized_bounds()` equal `side_adjusted_bounds()`.
-/// A renderer caching arbitrary anchors must use `side_adjusted_bounds()` so
-/// Right-sided starts and Left-sided ends keep the same selected cells.
 #[test]
 fn precomputed_bounds_equivalent_to_contains() {
     use aterm_types::selection::{selection_contains_block, selection_contains_linear};
@@ -487,8 +447,6 @@ fn precomputed_bounds_equivalent_to_contains() {
         }
     }
 }
-
-// ── project_range tests ──
 
 /// `project_range` over each selection shape: side adjustment moves a Right
 /// start forward and a Left end back (to the previous row at column 0), Lines
@@ -569,7 +527,6 @@ fn project_range_projects_every_shape() {
             SelectionType::Simple,
             Some((0, 5, 2, 3, false)),
         ),
-        // Left at column 0 ends before the row, on the previous one.
         (
             "left end at col 0",
             (0, 5, Left),
@@ -590,22 +547,18 @@ fn project_range_projects_every_shape() {
     }
 }
 
-// ── include_all tests ──
-
 #[test]
 fn test_include_all_expands_sides() {
     let mut sel = TextSelection::new();
     sel.start_selection(0, 5, SelectionSide::Right, SelectionType::Simple);
     sel.update_selection(0, 10, SelectionSide::Left);
 
-    // Before include_all: Right start → col 6, Left end → col 9
     let proj_before = sel.project_range(79).expect("before");
     assert_eq!(proj_before.start_col, 6);
     assert_eq!(proj_before.end_col, 9);
 
     sel.include_all();
 
-    // After include_all: Left start → col 5, Right end → col 10
     let proj_after = sel.project_range(79).expect("after");
     assert_eq!(proj_after.start_col, 5);
     assert_eq!(proj_after.end_col, 10);
@@ -632,8 +585,6 @@ fn include_all_covers_both_endpoints_for_either_drag_direction() {
     }
 }
 
-// ── contains_cell wide character tests ──
-
 /// In a Block over columns 5..=10, a wide glyph is selected when either of its
 /// cells is inside: a lead at 4 (continuation at 5) and a continuation at 11
 /// (lead at 10) are in, and glyphs wholly outside are not.
@@ -643,7 +594,6 @@ fn a_block_selects_a_wide_glyph_either_of_whose_cells_is_inside() {
     sel.start_selection(0, 5, SelectionSide::Left, SelectionType::Block);
     sel.update_selection(2, 10, SelectionSide::Right);
     sel.complete_selection();
-    // (col, is_wide lead, is_wide_continuation, selected)
     for (col, wide, cont, want) in [
         (4u16, true, false, true),
         (5, false, true, true),
@@ -669,17 +619,9 @@ fn a_block_selects_a_wide_glyph_either_of_whose_cells_is_inside() {
 
 /// A drag that STARTS on the right half of a wide glyph must still paint the
 /// left half.
-///
-/// The copy path admits the whole glyph whenever either of its cells is in
-/// range — it has no way to emit half a cluster — so a highlight that stopped at
-/// the bare start column would put a character on the clipboard that the user
-/// never saw highlighted. A linear selection snaps a glyph whole for that
-/// reason, exactly as Block does: both ask `glyph_cell_span`, so the selection
-/// kind cannot change where a glyph's boundary lies.
 #[test]
 fn a_linear_drag_starting_on_a_wide_glyphs_continuation_still_paints_its_lead() {
     let mut sel = TextSelection::new();
-    // The glyph occupies cols 4-5; the drag starts on its continuation (col 5).
     sel.start_selection(0, 5, SelectionSide::Left, SelectionType::Simple);
     sel.update_selection(0, 10, SelectionSide::Right);
     sel.complete_selection();
@@ -693,8 +635,6 @@ fn a_linear_drag_starting_on_a_wide_glyphs_continuation_still_paints_its_lead() 
         sel.contains_cell(0, 5, false, true),
         "and its continuation, which is what the drag actually landed on"
     );
-    // A whole glyph one column further left is untouched: cols 2 and 3 are both
-    // outside, so nothing snaps it in.
     assert!(
         !sel.contains_cell(0, 2, true, false),
         "snapping reaches exactly one cell, never a glyph that is fully outside"
@@ -708,7 +648,6 @@ fn a_linear_drag_starting_on_a_wide_glyphs_continuation_still_paints_its_lead() 
 #[test]
 fn a_linear_drag_ending_on_a_wide_glyphs_lead_still_paints_its_continuation() {
     let mut sel = TextSelection::new();
-    // The glyph occupies cols 10-11; the drag stops on its lead (col 10).
     sel.start_selection(0, 2, SelectionSide::Left, SelectionType::Simple);
     sel.update_selection(0, 10, SelectionSide::Right);
     sel.complete_selection();
@@ -729,7 +668,7 @@ fn a_linear_drag_ending_on_a_wide_glyphs_lead_still_paints_its_continuation() {
 
 /// Anchor order is not selection order: dragging RIGHT-to-LEFT lands the same
 /// mid-glyph edges on the opposite anchors, and `normalized_start`/`_end` order
-/// them before the snap. Both edges must behave exactly as in the forward drag.
+/// them before the snap.
 #[test]
 fn a_backwards_drag_snaps_the_same_wide_glyph_edges_as_a_forwards_one() {
     let mut forwards = TextSelection::new();
@@ -826,56 +765,41 @@ fn a_linear_end_before_the_first_representable_row_is_empty() {
 
 #[test]
 fn test_contains_cell_block_continuation_at_col_zero() {
-    // Edge case: continuation at column 0 (shouldn't happen in practice,
-    // but must not underflow).
     let mut sel = TextSelection::new();
     sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Block);
     sel.update_selection(2, 5, SelectionSide::Right);
     sel.complete_selection();
 
-    // A continuation at col 0 has no lead to back up to; `glyph_cell_span`
-    // saturates to (0, 0) rather than wrapping to u16::MAX.
     assert!(sel.contains_cell(1, 0, false, true));
 }
-
-// ── column 0 boundary tests ──
 
 /// Selection ending at col 0 with Left side retreats to the previous row.
 #[test]
 fn test_contains_end_left_side_col_zero_multiline() {
-    // Selection from (0, 5, Left) to (2, 0, Left).
-    // Left-sided end at col 0 means "stop before col 0 on row 2",
-    // so nothing on row 2 should be selected.
     let mut sel = TextSelection::new();
     sel.start_selection(0, 5, SelectionSide::Left, SelectionType::Simple);
     sel.update_selection(2, 0, SelectionSide::Left);
     sel.complete_selection();
 
-    // Row 0: cols 5+ selected
     assert!(!sel.contains(0, 4));
     assert!(sel.contains(0, 5));
     assert!(sel.contains(0, 80));
 
-    // Row 1: entirely selected (middle row)
     assert!(sel.contains(1, 0));
     assert!(sel.contains(1, 40));
     assert!(sel.contains(1, 80));
 
-    // Row 2: nothing selected (end is "before col 0")
     assert!(
         !sel.contains(2, 0),
         "col 0 on end row must NOT be selected when end side is Left at col 0"
     );
     assert!(!sel.contains(2, 1));
 
-    // Row 3: not selected
     assert!(!sel.contains(3, 0));
 }
 
 /// Block selection: normalized_end always uses Right side, so user-provided
 /// Left side on the end anchor does not cause a col 0 off-by-one for blocks.
-/// The block normalization takes min/max of columns and forces Left/Right
-/// sides, making the block from col 0 to col 0 (1-column wide).
 #[test]
 fn test_contains_block_end_left_side_col_zero() {
     let mut sel = TextSelection::new();
@@ -883,8 +807,6 @@ fn test_contains_block_end_left_side_col_zero() {
     sel.update_selection(2, 0, SelectionSide::Left);
     sel.complete_selection();
 
-    // Block normalization forces start=Left, end=Right on the min/max columns.
-    // Both anchors have col 0, so the block is 1 column wide at col 0.
     assert!(
         sel.contains(1, 0),
         "block selection col 0..=0 should include col 0 (normalized_end forces Right side)"
@@ -897,10 +819,6 @@ fn test_contains_block_end_left_side_col_zero() {
 
 #[test]
 fn test_adjust_for_rows_shrink_relabels_every_row_by_the_same_amount() {
-    // 10 visible rows shrinking to 6. Since the rows-only shapes anchor at the
-    // CURSOR, the viewport gives up its top four rows to history and EVERY row —
-    // live or already-archived — moves by exactly -4. Measured against the engine
-    // in `probe`-style traces: rel 0 (line-55) -> rel -4, rel 7 (line-62) -> rel 3.
     let mut live = TextSelection::new();
     live.start_selection(2, 1, SelectionSide::Left, SelectionType::Simple);
     live.update_selection(5, 7, SelectionSide::Right);
@@ -936,7 +854,6 @@ fn test_adjust_for_rows_shrink_relabels_every_row_by_the_same_amount() {
     assert!(archived.is_in_progress());
     assert_eq!(archived.selection_type(), SelectionType::Block);
 
-    // A live span and an archived span move by the same 4 rows: one relabel.
     let mut degenerate = TextSelection::new();
     degenerate.start_selection(1, 0, SelectionSide::Left, SelectionType::Simple);
     degenerate.update_selection(1, 1, SelectionSide::Right);
@@ -944,21 +861,14 @@ fn test_adjust_for_rows_shrink_relabels_every_row_by_the_same_amount() {
     assert!(!degenerate.adjust_for_rows_shrink(0, 4, 50));
     assert!(!degenerate.has_selection());
 
-    // An empty selection is a no-op in every direction.
     let mut empty = TextSelection::new();
     assert!(empty.adjust_for_rows_shrink(6, 4, 50));
     assert!(!empty.has_selection());
 }
 
 /// A rows-only SHRINK is MONOTONIC, so no span can be torn by it.
-///
-/// Anchors are a row RANGE (the copy walk is `first_row..=last_row`), so a
-/// non-monotonic map would reverse a span crossing the cut and copy rows the user
-/// never selected. Should rows-only shapes stop anchoring at the cursor, this
-/// test fails.
 #[test]
 fn a_shrink_spares_a_span_that_crosses_the_cut() {
-    // 10 visible rows -> 6. A span over live rows 4..=7 crosses the old cut.
     let mut sel = TextSelection::new();
     sel.start_selection(4, 0, SelectionSide::Left, SelectionType::Simple);
     sel.update_selection(7, 5, SelectionSide::Right);
@@ -974,7 +884,6 @@ fn a_shrink_spares_a_span_that_crosses_the_cut() {
         "a reversed range copies rows the user never selected"
     );
 
-    // …and a span from scrollback into the live rows.
     let mut across = TextSelection::new();
     across.start_selection(-3, 0, SelectionSide::Left, SelectionType::Simple);
     across.update_selection(2, 5, SelectionSide::Right);
@@ -1053,12 +962,7 @@ fn expansion_acts_only_on_an_in_progress_selection_of_its_type() {
 
 /// `truncate_to_floor` over every small span, Simple and Block: every pair of
 /// endpoint rows -6..=3 (either drag direction), columns 0 and 2, and a history
-/// floor of 0..=6 rows. The outcomes are exhaustive: nothing evicted leaves the
-/// rows untouched and reports nothing; both endpoints evicted, or no history
-/// to clamp onto, clears; one endpoint evicted clamps it onto the floor row —
-/// keeping the other row exactly, reporting the loss and leaving the state
-/// machine where it was, and for a Block moving the ROW only — unless the
-/// clamp leaves nothing selectable, which clears.
+/// floor of 0..=6 rows.
 #[test]
 fn truncate_to_floor_over_every_small_span() {
     let oldest_abs = 1000u64;

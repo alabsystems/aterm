@@ -1,26 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Homebrew from its notarized `Homebrew.pkg`, then formulae and casks as the owning user
-//! (design §1.14, §8).
-//!
-//! Homebrew's install.sh refuses root, so the agent installs the pkg instead. Its scripts
-//! need to know whose `/opt/homebrew` it is: they honour `/var/tmp/.homebrew_pkg_user.plist`
-//! (key `HOMEBREW_PKG_USER`) only when it is a regular file owned by root, mode 0600, with
-//! no ACL, and fall back to the console user otherwise. The agent writes that file with
-//! the port's atomic write, which replaces a link planted at the name in the
-//! world-writable `/var/tmp` rather than following it. Not with `defaults write`: cfprefsd
-//! would write through such a link as root.
-//!
-//! Every `brew` runs as the owner (Homebrew refuses root), in the scrubbed environment of
-//! design §3.5 plus `HOMEBREW_NO_ANALYTICS=1` and `HOMEBREW_NO_ENV_HINTS=1`; a probe adds
-//! `HOMEBREW_NO_AUTO_UPDATE=1` so that reading what is installed never updates Homebrew.
-//! The first `brew` that needs Ruby downloads Homebrew's portable Ruby into the prefix
-//! (measured in the VM): that is Homebrew setting itself up, inside its own prefix, and
-//! `homebrew.ruby` is that step, between the pkg and the formulae, so a formula's read
-//! never starts the download.
-//!
-//! Apple silicon only: the pkg refuses Intel, and Intel has no bottles (design §1.14).
+//! Homebrew package, portable Ruby bootstrap, formulae, and casks for Apple silicon.
 
 use super::apps::{
     Artifact, Notes, account, cached_verified, check_artifact, clear_stage, fresh_stage,
@@ -45,9 +26,7 @@ pub const PKG_USER_PLIST: &str = "/var/tmp/.homebrew_pkg_user.plist";
 /// Homebrew.pkg's receipt id.
 pub const PKG_ID: &str = "sh.brew.homebrew";
 
-/// Where Homebrew keeps its portable Ruby. Measured on lab-03 (27.0) after `brew config`:
-/// `portable-ruby-version` holds `4.0.7`, `portable-ruby/current` is a link to `4.0.7`,
-/// and `portable-ruby/current/bin/ruby` is a regular file, mode 0555, owned by the owner.
+/// Directory where Homebrew stores its portable Ruby.
 pub const VENDOR: &str = "/opt/homebrew/Library/Homebrew/vendor";
 
 /// The link, under [`VENDOR`], to the portable Ruby `brew` runs. Homebrew re-points it when
@@ -77,12 +56,10 @@ pub struct Table {
     pub casks: Vec<String>,
 }
 
-/// The items `table` asks for: `homebrew.pkg`, `homebrew.ruby` after it, then
-/// `homebrew.formula.<name>` and `homebrew.cask.<name>`, each waiting for both.
+/// Expands `table` into `homebrew.pkg`, `homebrew.ruby`, and formula/cask items.
 ///
 /// # Errors
-/// One line naming what cannot be expanded: no owner, an owner this Mac does not have,
-/// a malformed pkg pin, a name `brew` would read as an option.
+/// Returns an error if the owner, package pin, or any formula/cask name is invalid.
 pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     let owner_name = table
         .owner
@@ -345,7 +322,6 @@ enum RubyState {
 /// `portable-ruby/current` the version `portable-ruby-version` names, and its `bin/ruby`
 /// executable. Otherwise that command first runs `brew vendor-install ruby`. Read as
 /// root, changing nothing.
-///
 /// # Errors
 /// One line when the answer could not be read.
 fn portable_ruby(sys: &dyn System) -> Result<RubyState, String> {
@@ -532,8 +508,6 @@ impl Item for Package {
                 };
             }
         }
-        // Without its Ruby, `brew list` would fetch it and answer nothing: wait for
-        // homebrew.ruby, which a plan judges first.
         match portable_ruby(sys) {
             Ok(RubyState::Ready(_)) => {}
             Ok(RubyState::Missing(what)) => {
@@ -557,9 +531,6 @@ impl Item for Package {
             Ok(ran) if ran.success() && !ran.out().trim().is_empty() => Probe::Ok {
                 now: ran.out().trim().to_owned(),
             },
-            // `brew list --versions <name>` exits 1 and prints nothing, on either stream,
-            // for a name that is not installed (VM). An exit 1 that says something on
-            // standard error is brew failing, which is no answer.
             Ok(ran)
                 if ran.status == Some(1) && ran.out().trim().is_empty() && ran.err().is_empty() =>
             {
@@ -742,7 +713,6 @@ mod tests {
                 to: "Homebrew in /opt/homebrew, owned by admin".into()
             }
         );
-        // Its Ruby and the formula plan too, behind the pkg.
         assert!(matches!(items[1].probe(&sys, &ctx), Probe::Change { .. }));
         assert!(matches!(items[2].probe(&sys, &ctx), Probe::Change { .. }));
     }
@@ -776,7 +746,6 @@ mod tests {
                 .position(|x| x == c)
                 .unwrap_or_else(|| panic!("{c}: {calls:#?}"))
         };
-        // Fetching Homebrew's Ruby is homebrew.ruby's step, not the install's.
         assert!(!calls.iter().any(|c| c.starts_with("admin$")), "{calls:#?}");
         let write = at(&format!("write {PKG_USER_PLIST} 600"));
         assert!(write < at(&format!("chown 0:0 {PKG_USER_PLIST}")));
@@ -791,7 +760,6 @@ mod tests {
                 "/usr/sbin/spctl -a -vv -t install {stage}/Homebrew-7.0.9.pkg"
             )) < write
         );
-        // installer refuses a path without `.pkg` (VM), so every check reads the staged copy.
         assert!(
             at(&format!("copy /c/{sha} {stage}/Homebrew-7.0.9.pkg 600"))
                 < at(&format!(
@@ -872,7 +840,6 @@ mod tests {
         ruby_in_place(&sys);
         let list =
             format!("admin$ {ENV} HOMEBREW_NO_AUTO_UPDATE=1 {BREW} list --formula --versions jq");
-        // Not installed (exit 1, nothing printed), then installed: VM.
         sys.on(&list, out_status(1, ""));
         sys.on(&list, ok("jq 1.8.2\n"));
         sys.on(
@@ -954,8 +921,6 @@ mod tests {
 
     #[test]
     fn the_owner_plist_is_the_document_homebrew_s_scripts_read() {
-        // `defaults read /var/tmp/.homebrew_pkg_user.plist HOMEBREW_PKG_USER` printed `admin`
-        // for exactly these bytes in the VM, and the pkg installed as admin.
         assert_eq!(
             pkg_user_plist(&admin().name),
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n\t<key>HOMEBREW_PKG_USER</key>\n\t<string>admin</string>\n</dict>\n</plist>\n"
@@ -966,8 +931,6 @@ mod tests {
 
     #[test]
     fn homebrew_without_its_ruby_fetches_only_the_ruby_as_the_owner() {
-        // The pkg installed and brew never run (or its first fetch failed): `brew
-        // --version` is shell alone and reads Ok, so the pkg's row cannot see this.
         let sys = Fake::root();
         brew_installed(&sys);
         sys.file(&format!("{VENDOR}/portable-ruby-version"), b"4.0.7\n");
@@ -994,7 +957,6 @@ mod tests {
         let sys = Fake::root();
         brew_installed(&sys);
         ruby_in_place(&sys);
-        // A Homebrew update named 4.0.8; `current` still points at 4.0.7.
         sys.file(&format!("{VENDOR}/portable-ruby-version"), b"4.0.8\n");
         let ctx = ctx_with(&sys, &[], true);
         let items = expand(&table(HOMEBREW_SHA), &ctx).unwrap();
@@ -1030,12 +992,10 @@ mod tests {
                 .map(|r| r.outcome)
                 .collect::<Vec<_>>()
         };
-        // A plan judges the formula after the Ruby it plans to fetch.
         assert_eq!(
             outcomes(Mode::Plan),
             [Outcome::Ok, Outcome::Planned, Outcome::Planned]
         );
-        // An apply whose fetch fails holds the formula back.
         sys.on(CONFIG, err(1, "curl: (6) Could not resolve host: ghcr.io"));
         assert_eq!(
             outcomes(Mode::Apply),

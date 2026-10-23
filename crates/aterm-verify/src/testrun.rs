@@ -522,6 +522,7 @@ pub fn not_started(b: &Binary, limit: std::time::Duration) -> Run {
 }
 
 /// A line of a failed recording pass worth quoting: its first diagnostic, or
+/// its last line.
 fn first_error(log: &str) -> String {
     let line = log
         .lines()
@@ -531,7 +532,7 @@ fn first_error(log: &str) -> String {
     line.trim().chars().take(200).collect()
 }
 
-/// Decide the test run's row exactly as the serial child's was decided. A test
+/// Decide the test run's row exactly as the serial child's was decided.
 fn decide(r: &mut Report, run: &Run, label: &str, env: &[(OsString, OsString)]) {
     r.decide_test_child(run, label, env);
 }
@@ -689,6 +690,8 @@ mod tests {
     }
 
     /// A RECORD IS THE PROCESS, BYTE FOR BYTE: every argument and variable
+    /// survives, spaces, `=` and newlines included, and anything that is not a
+    /// whole record is refused rather than read short.
     #[test]
     fn a_record_round_trips_and_a_torn_one_is_refused() {
         let r = Record {
@@ -713,6 +716,8 @@ mod tests {
     }
 
     /// THE RECORDER, THROUGH ITS OWN ENTRY POINT: each call takes the next
+    /// number, the file is the owner's alone, and what comes back is this
+    /// process — its directory and its environment — with the argv it was given.
     #[test]
     fn the_recorder_writes_the_next_owner_only_record() {
         let dir = crate::mktemp_dir("atv-rec").expect("mktemp");
@@ -787,6 +792,8 @@ mod tests {
     }
 
     /// THE COMPILE'S LIST, AND THE LOG WITHOUT IT: only test-mode executables
+    /// count, each with cargo's own flag, and every JSON line leaves the text
+    /// the ladder shows — the diagnostics and progress lines stay, in order.
     #[test]
     fn the_compile_names_its_test_executables_and_keeps_its_diagnostics() {
         let mut log = format!(
@@ -822,6 +829,8 @@ mod tests {
     }
 
     /// THE PLAN ADDS UP OR IT IS NOT A PLAN: every record meets the header cargo
+    /// printed for it and the compile's flag for its executable, the re-run spec
+    /// is cargo's.
     #[test]
     fn records_headers_and_the_compile_agree_or_the_plan_is_refused() {
         let log = "    Finished `test` profile\n\
@@ -891,6 +900,8 @@ mod tests {
     }
 
     /// THE POOL: never more than `jobs` at once, every binary once and with the
+    /// whole thread count, as cargo's own run gives it, and the answers in
+    /// declared order whatever order they finished in.
     #[test]
     fn binaries_share_the_pool_and_answer_in_declared_order() {
         let bins: Vec<Binary> = (0..9)
@@ -934,6 +945,8 @@ mod tests {
     }
 
     /// A BINARY THE RUN'S CEILING LEFT NO TIME TO START is a FAIL in cargo's
+    /// shape — its header, the run's TIMEOUT words, cargo's re-run
+    /// line — one finding for the row, which says so.
     #[test]
     fn a_binary_the_ceiling_left_no_time_for_is_a_fail() {
         let b = Binary {
@@ -964,6 +977,9 @@ mod tests {
     }
 
     /// THE COMBINED LOG IS CARGO'S, so every reader of cargo's reads it: the
+    /// failed tests come back with the re-run spec cargo would have printed, a
+    /// crash (no libtest 101) says how the process ended, and a binary whose
+    /// every failure is the machine's still reads as the machine's.
     #[test]
     fn the_combined_log_reads_as_cargos_to_every_reader_of_cargos() {
         let bins: Vec<Binary> = ["a", "b", "c"]

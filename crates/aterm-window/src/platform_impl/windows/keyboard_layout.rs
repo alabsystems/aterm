@@ -4,11 +4,6 @@
 // Derived from winit 0.30.13 src/platform_impl/windows/keyboard_layout.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by Andrew Yates for the aterm project in 2026; see the repository NOTICE.
-// Convert keyboard layout ids to and from windows-sys 0.61 pointer handles; take `SmolStr`
-// from `crate::keyboard`; read key state and the layout through `keyboard::key_state` and
-// `keyboard::replay`, so a recorded message sequence can drive the key path.
-
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -176,8 +171,6 @@ impl WindowsModifiers {
     }
 
     /// Removes the control modifier if the alt modifier is not present.
-    /// This is useful because on Windows: (Control + Alt) == AltGr
-    /// but we don't want to interfere with the AltGr state.
     pub fn remove_only_ctrl(mut self) -> WindowsModifiers {
         if !self.contains(WindowsModifiers::ALT) {
             self.remove(WindowsModifiers::CONTROL);
@@ -190,28 +183,11 @@ pub(crate) struct Layout {
     pub hkl: u64,
 
     /// Maps numpad keys from Windows virtual key to a `Key`.
-    ///
-    /// This is useful because some numpad keys generate different characters based on the locale.
-    /// For example `VK_DECIMAL` is sometimes "." and sometimes ",". Note: numpad-specific virtual
-    /// keys are only produced by Windows when the NumLock is active.
-    ///
-    /// Making this field separate from the `keys` field saves having to add NumLock as a modifier
-    /// to `WindowsModifiers`, which would double the number of items in keys.
     pub numlock_on_keys: HashMap<VIRTUAL_KEY, Key>,
-    /// Like `numlock_on_keys` but this will map to the key that would be produced if numlock was
-    /// off. The keys of this map are identical to the keys of `numlock_on_keys`.
+    /// Like `numlock_on_keys` but this will map to the key that would be produced if numlock was off.
     pub numlock_off_keys: HashMap<VIRTUAL_KEY, Key>,
 
-    /// Maps a modifier state to group of key strings
-    /// We're not using `ModifiersState` here because that object cannot express caps lock,
-    /// but we need to handle caps lock too.
-    ///
-    /// This map shouldn't need to exist.
-    /// However currently this seems to be the only good way
-    /// of getting the label for the pressed key. Note that calling `ToUnicode`
-    /// just when the key is pressed/released would be enough if `ToUnicode` wouldn't
-    /// change the keyboard state (it clears the dead key). There is a flag to prevent
-    /// changing the state, but that flag requires Windows 10, version 1607 or newer)
+    /// Maps a modifier state to group of key strings We're not using `ModifiersState` here because that object cannot express caps lock, but we need to handle caps lock too.
     pub keys: HashMap<WindowsModifiers, HashMap<KeyCode, Key>>,
     pub has_alt_graph: bool,
 }
@@ -228,14 +204,6 @@ impl Layout {
 
         let unknown_alt = vkey == VK_MENU;
         if !unknown_alt {
-            // Here we try using the virtual key directly but if the virtual key doesn't distinguish
-            // between left and right alt, we can't report AltGr. Therefore, we only do this if the
-            // key is not the "unknown alt" key.
-            //
-            // The reason for using the virtual key directly is that `MapVirtualKeyExW` (used when
-            // building the keys map) sometimes maps virtual keys to odd scancodes that don't match
-            // the scancode coming from the KEYDOWN message for the same key. For example: `VK_LEFT`
-            // is mapped to `0x004B`, but the scancode for the left arrow is `0xE04B`.
             let key_from_vkey =
                 vkey_to_non_char_key(vkey, native_code.clone(), self.hkl, self.has_alt_graph);
 
@@ -268,9 +236,7 @@ pub(crate) struct LayoutCache {
 }
 
 impl LayoutCache {
-    /// Checks whether the current layout is already known and
-    /// prepares the layout if it isn't known.
-    /// The current layout is then returned.
+    /// Checks whether the current layout is already known and prepares the layout if it isn't known.
     pub fn get_current_layout(&mut self) -> (u64, &Layout) {
         #[cfg(any(test, debug_assertions))]
         let replayed = super::keyboard::replay::layout();
@@ -307,23 +273,8 @@ impl LayoutCache {
             has_alt_graph: false,
         };
 
-        // We initialize the keyboard state with all zeros to
-        // simulate a scenario when no modifier is active.
         let mut key_state = [0u8; 256];
 
-        // `MapVirtualKeyExW` maps (non-numpad-specific) virtual keys to scancodes as if numlock
-        // was off. We rely on this behavior to find all virtual keys which are not numpad-specific
-        // but map to the numpad.
-        //
-        // src_vkey: VK  ==>  scancode: u16 (on the numpad)
-        //
-        // Then we convert the source virtual key into a `Key` and the scancode into a virtual key
-        // to get the reverse mapping.
-        //
-        // src_vkey: VK  ==>  scancode: u16 (on the numpad)
-        //    ||                    ||
-        //    \/                    \/
-        // map_value: Key  <-  map_vkey: VK
         layout.numlock_off_keys.reserve(NUMPAD_KEYCODES.len());
         for vk in 0..256 {
             let scancode = unsafe {
@@ -338,7 +289,6 @@ impl LayoutCache {
             }
             let keycode = match scancode_to_physicalkey(scancode) {
                 PhysicalKey::Code(code) => code,
-                // TODO: validate that we can skip on unidentified keys (probably never occurs?)
                 _ => continue,
             };
             if !is_numpad_specific(vk as VIRTUAL_KEY) && NUMPAD_KEYCODES.contains(&keycode) {
@@ -372,7 +322,6 @@ impl LayoutCache {
             }
         }
 
-        // Iterate through every combination of modifiers
         let mods_end = WindowsModifiers::FLAGS_END.bits();
         for mod_state in 0..mods_end {
             let mut keys_for_this_mod = HashMap::with_capacity(256);
@@ -380,10 +329,6 @@ impl LayoutCache {
             let mod_state = WindowsModifiers::from_bits_retain(mod_state);
             mod_state.apply_to_kbd_state(&mut key_state);
 
-            // Virtual key values are in the domain [0, 255].
-            // This is reinforced by the fact that the keyboard state array has 256
-            // elements. This array is allowed to be indexed by virtual key values
-            // giving the key state for the virtual key used for indexing.
             for vk in 0..256 {
                 let scancode = unsafe {
                     MapVirtualKeyExW(
@@ -399,13 +344,8 @@ impl LayoutCache {
                 let native_code = NativeKey::Windows(vk as VIRTUAL_KEY);
                 let key_code = match scancode_to_physicalkey(scancode) {
                     PhysicalKey::Code(code) => code,
-                    // TODO: validate that we can skip on unidentified keys (probably never occurs?)
                     _ => continue,
                 };
-                // Let's try to get the key from just the scancode and vk
-                // We don't necessarily know yet if AltGraph is present on this layout so we'll
-                // assume it isn't. Then we'll do a second pass where we set the "AltRight" keys to
-                // "AltGr" in case we find out that there's an AltGraph.
                 let preliminary_key =
                     vkey_to_non_char_key(vk as VIRTUAL_KEY, native_code, locale_id, false);
                 match preliminary_key {
@@ -420,15 +360,12 @@ impl LayoutCache {
                 let key = match unicode {
                     ToUnicodeResult::Str(str) => Key::Character(SmolStr::new(str)),
                     ToUnicodeResult::Dead(dead_char) => {
-                        // println!("{:?} - {:?} produced dead {:?}", key_code, mod_state,
-                        // dead_char);
+                        // Dead key.
                         Key::Dead(dead_char)
                     },
                     ToUnicodeResult::None => {
                         let has_alt = mod_state.contains(WindowsModifiers::ALT);
                         let has_ctrl = mod_state.contains(WindowsModifiers::CONTROL);
-                        // HACK: `ToUnicodeEx` seems to fail getting the string for the numpad
-                        // divide key, so we handle that explicitly here
                         if !has_alt && !has_ctrl && key_code == KeyCode::NumpadDivide {
                             Key::Character(SmolStr::new("/"))
                         } else {
@@ -438,15 +375,9 @@ impl LayoutCache {
                     },
                 };
 
-                // Check for alt graph.
-                // The logic is that if a key pressed with no modifier produces
-                // a different `Character` from when it's pressed with CTRL+ALT then the layout
-                // has AltGr.
                 let ctrl_alt: WindowsModifiers = WindowsModifiers::CONTROL | WindowsModifiers::ALT;
                 let is_in_ctrl_alt = mod_state == ctrl_alt;
                 if !layout.has_alt_graph && is_in_ctrl_alt {
-                    // Unwrapping here because if we are in the ctrl+alt modifier state
-                    // then the alt modifier state must have come before.
                     let simple_keys = layout.keys.get(&WindowsModifiers::empty()).unwrap();
                     if let Some(Key::Character(key_no_altgr)) = simple_keys.get(&key_code) {
                         if let Key::Character(key) = &key {
@@ -460,7 +391,6 @@ impl LayoutCache {
             layout.keys.insert(mod_state, keys_for_this_mod);
         }
 
-        // Second pass: replace right alt keys with AltGr if the layout has alt graph
         if layout.has_alt_graph {
             for mod_state in 0..mods_end {
                 let mod_state = WindowsModifiers::from_bits_retain(mod_state);
@@ -493,7 +423,6 @@ impl LayoutCache {
                 super::handle::from_usize(locale_id as usize),
             );
             if wide_len < 0 {
-                // If it's dead, we run `ToUnicode` again to consume the dead-key
                 wide_len = ToUnicodeEx(
                     vkey,
                     scancode,
@@ -757,38 +686,26 @@ fn keycode_to_vkey(keycode: KeyCode, hkl: u64) -> VIRTUAL_KEY {
     }
 }
 
-/// This converts virtual keys to `Key`s. Only virtual keys which can be unambiguously converted to
-/// a `Key`, with only the information passed in as arguments, are converted.
-///
-/// In other words: this function does not need to "prepare" the current layout in order to do
-/// the conversion, but as such it cannot convert certain keys, like language-specific character
-/// keys.
-///
-/// The result includes all non-character keys defined within `Key` plus characters from numpad
-/// keys. For example, backspace and tab are included.
+/// This converts virtual keys to `Key`s.
 fn vkey_to_non_char_key(
     vkey: VIRTUAL_KEY,
     native_code: NativeKey,
     hkl: u64,
     has_alt_graph: bool,
 ) -> Key {
-    // List of the Web key names and their corresponding platform-native key names:
-    // https://developer.mozilla.org/en-US/docs/Web/API/KeyboardEvent/key/Key_Values
-
     let primary_lang_id = primarylangid(loword(hkl as u32));
     let is_korean = primary_lang_id as u32 == LANG_KOREAN;
     let is_japanese = primary_lang_id as u32 == LANG_JAPANESE;
 
     match vkey {
-        VK_LBUTTON => Key::Unidentified(NativeKey::Unidentified), // Mouse
-        VK_RBUTTON => Key::Unidentified(NativeKey::Unidentified), // Mouse
+        VK_LBUTTON => Key::Unidentified(NativeKey::Unidentified),
+        VK_RBUTTON => Key::Unidentified(NativeKey::Unidentified),
 
-        // I don't think this can be represented with a Key
         VK_CANCEL => Key::Unidentified(native_code),
 
-        VK_MBUTTON => Key::Unidentified(NativeKey::Unidentified), // Mouse
-        VK_XBUTTON1 => Key::Unidentified(NativeKey::Unidentified), // Mouse
-        VK_XBUTTON2 => Key::Unidentified(NativeKey::Unidentified), // Mouse
+        VK_MBUTTON => Key::Unidentified(NativeKey::Unidentified),
+        VK_XBUTTON1 => Key::Unidentified(NativeKey::Unidentified),
+        VK_XBUTTON2 => Key::Unidentified(NativeKey::Unidentified),
         VK_BACK => Key::Named(NamedKey::Backspace),
         VK_TAB => Key::Named(NamedKey::Tab),
         VK_CLEAR => Key::Named(NamedKey::Clear),
@@ -799,18 +716,12 @@ fn vkey_to_non_char_key(
         VK_PAUSE => Key::Named(NamedKey::Pause),
         VK_CAPITAL => Key::Named(NamedKey::CapsLock),
 
-        // VK_HANGEUL => Key::Named(NamedKey::HangulMode), // Deprecated in favour of VK_HANGUL
-
-        // VK_HANGUL and VK_KANA are defined as the same constant, therefore
-        // we use appropriate conditions to differentiate between them
         VK_HANGUL if is_korean => Key::Named(NamedKey::HangulMode),
         VK_KANA if is_japanese => Key::Named(NamedKey::KanaMode),
 
         VK_JUNJA => Key::Named(NamedKey::JunjaMode),
         VK_FINAL => Key::Named(NamedKey::FinalMode),
 
-        // VK_HANJA and VK_KANJI are defined as the same constant, therefore
-        // we use appropriate conditions to differentiate between them
         VK_HANJA if is_korean => Key::Named(NamedKey::HanjaMode),
         VK_KANJI if is_japanese => Key::Named(NamedKey::KanjiMode),
 
@@ -840,7 +751,6 @@ fn vkey_to_non_char_key(
         VK_APPS => Key::Named(NamedKey::ContextMenu),
         VK_SLEEP => Key::Named(NamedKey::Standby),
 
-        // Numpad keys produce characters
         VK_NUMPAD0 => Key::Unidentified(native_code),
         VK_NUMPAD1 => Key::Unidentified(native_code),
         VK_NUMPAD2 => Key::Unidentified(native_code),
@@ -893,7 +803,6 @@ fn vkey_to_non_char_key(
         VK_NUMLOCK => Key::Named(NamedKey::NumLock),
         VK_SCROLL => Key::Named(NamedKey::ScrollLock),
         VK_OEM_NEC_EQUAL => Key::Unidentified(native_code),
-        // VK_OEM_FJ_JISHO => Key::Unidentified(native_code), // Conflicts with `VK_OEM_NEC_EQUAL`
         VK_OEM_FJ_MASSHOU => Key::Unidentified(native_code),
         VK_OEM_FJ_TOUROKU => Key::Unidentified(native_code),
         VK_OEM_FJ_LOYA => Key::Unidentified(native_code),
@@ -929,7 +838,6 @@ fn vkey_to_non_char_key(
         VK_LAUNCH_APP1 => Key::Named(NamedKey::LaunchApplication1),
         VK_LAUNCH_APP2 => Key::Named(NamedKey::LaunchApplication2),
 
-        // This function only converts "non-printable"
         VK_OEM_1 => Key::Unidentified(native_code),
         VK_OEM_PLUS => Key::Unidentified(native_code),
         VK_OEM_COMMA => Key::Unidentified(native_code),
@@ -963,7 +871,6 @@ fn vkey_to_non_char_key(
         VK_GAMEPAD_RIGHT_THUMBSTICK_RIGHT => Key::Unidentified(native_code),
         VK_GAMEPAD_RIGHT_THUMBSTICK_LEFT => Key::Unidentified(native_code),
 
-        // This function only converts "non-printable"
         VK_OEM_4 => Key::Unidentified(native_code),
         VK_OEM_5 => Key::Unidentified(native_code),
         VK_OEM_6 => Key::Unidentified(native_code),
@@ -992,10 +899,6 @@ fn vkey_to_non_char_key(
             if is_japanese {
                 Key::Named(NamedKey::Katakana)
             } else {
-                // This matches IE and Firefox behaviour according to
-                // https://developer.mozilla.org/en-US/docs/Web/API/KeyboardEvent/key/Key_Values
-                // At the time of writing, there is no `NamedKey::Finish` variant as
-                // Finish is not mentioned at https://w3c.github.io/uievents-key/
                 // Also see: https://github.com/pyfisch/keyboard-types/issues/9
                 Key::Unidentified(native_code)
             }

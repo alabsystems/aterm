@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Immediate actuator egress over a non-blocking pipe, which gives deterministic
-//! backpressure and, like a raw PTY master, can refuse with EAGAIN or short-write. The
-//! immediate API must never spill refused or tail bytes for a detached thread to inject
-//! later.
+//! Immediate actuator egress over a non-blocking pipe, which gives deterministic backpressure and,
+//! like a raw PTY master, can refuse with EAGAIN or short-write.
 
 #![cfg(unix)]
 
@@ -18,8 +16,8 @@ use aterm_spec::wait::MUST_HAPPEN;
 
 fn pipe_pair() -> (OwnedFd, OwnedFd) {
     let mut fds = [-1; 2];
-    // SAFETY: `fds` points to two initialized c_int slots; on success pipe(2)
-    // replaces both with owned descriptors, each wrapped exactly once below.
+    // SAFETY: `fds` points to two initialized c_int slots; on success pipe(2) replaces both with
+    // owned descriptors, each wrapped exactly once below.
     let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
     assert_eq!(rc, 0, "pipe: {}", std::io::Error::last_os_error());
     // SAFETY: successful pipe(2) returned two fresh, independently-owned fds.
@@ -61,8 +59,6 @@ fn initial_eagain_is_busy_zero_and_never_appears_later() {
     reader.read_exact(&mut old).expect("drain original fill");
     assert!(old.iter().all(|byte| *byte == b'.'));
 
-    // There is room now. A distinct accepted frame must be the very next sequence;
-    // this catches any rejected frame that was secretly spilled.
     assert_eq!(
         sink.try_write_frame_immediate(b"accepted"),
         ImmediateWrite::Full
@@ -80,8 +76,6 @@ fn short_write_is_partial_in_doubt_and_tail_is_never_injected() {
     sink.note_master_nonblocking(true);
     let mut reader = std::fs::File::from(read);
 
-    // Make some room, but less than the frame: an O_NONBLOCK pipe write larger than
-    // PIPE_BUF then short-writes deterministically, as a PTY may.
     let room = filled.min(8 * 1024);
     let mut prefix = vec![0_u8; room];
     reader.read_exact(&mut prefix).expect("make partial room");
@@ -95,9 +89,6 @@ fn short_write_is_partial_in_doubt_and_tail_is_never_injected() {
     assert!(accepted > 0);
     assert!(accepted < frame.len());
 
-    // Drain the untouched original suffix, then exactly the accepted P prefix; then
-    // switch the reader non-blocking: EAGAIN proves the unaccepted tail was not
-    // queued for a later drainer write.
     let old_remaining = filled - room;
     let mut landed = vec![0_u8; old_remaining + accepted];
     reader
@@ -123,11 +114,6 @@ fn short_write_is_partial_in_doubt_and_tail_is_never_injected() {
 /// `P` of the frame, then `after`, with nothing between. A second guarded
 /// write while the rest is queued is refused with zero bytes (`BusyZero`), so a
 /// guarded Enter can never overtake the text it submits.
-///
-/// NEGATIVE CONTROL: the plain immediate write over the same room answers
-/// `PartialInDoubt` and queues nothing (the test above): the rest of its frame
-/// never arrives. And a pipe with no room at all is refused by the guarded write
-/// as by the plain one — zero bytes, nothing queued, nothing later.
 #[test]
 fn the_guarded_write_queues_the_rest_of_a_short_write_and_delivers_it_whole() {
     let (read, write) = pipe_pair();
@@ -136,7 +122,6 @@ fn the_guarded_write_queues_the_rest_of_a_short_write_and_delivers_it_whole() {
     sink.note_master_nonblocking(true);
     let mut reader = std::fs::File::from(read);
 
-    // No room: refused exactly as the immediate write is, nothing queued.
     assert_eq!(
         sink.try_write_frame_whole_with_receipt(b"REJECTED"),
         (ImmediateWrite::BusyZero, None)
@@ -157,16 +142,12 @@ fn the_guarded_write_queues_the_rest_of_a_short_write_and_delivers_it_whole() {
     assert!(order.is_some(), "an accepted prefix carries its order");
     assert_eq!(sink.spilled_bytes(), frame.len() - accepted);
 
-    // A guarded write behind the queued rest is refused, zero bytes.
     assert_eq!(
         sink.try_write_frame_whole_with_receipt(b"\r"),
         (ImmediateWrite::BusyZero, None)
     );
-    // Another writer's frame queues behind the rest.
     assert_eq!(sink.write_frame_nonparking(b"after").expect("queued"), 5);
 
-    // The reader drains for at most a minute (a hang detector): the drainer
-    // hands the rest over as it reads.
     let old_remaining = filled - room;
     let want = old_remaining + frame.len() + b"after".len();
     aterm_pty::set_nonblocking(reader.as_raw_fd(), true).expect("nonblocking reader");
@@ -300,13 +281,6 @@ fn a_blocking_frame_behind(
 /// (`Shared::queue_rest_held`), so that writer is refused the direct lane
 /// (`direct_order_if_spill_empty`) and queues behind the rest: the reader
 /// gets the frame whole, then `after`.
-///
-/// NEGATIVE CONTROL: the same race with the plain immediate write, which
-/// queues no rest and sets no bit: the blocking frame takes the direct lane
-/// and `after` lands right behind the prefix the kernel took. That is the
-/// lane a guarded write's queued rest would lose `after` to if the bit were
-/// not set (checked by mutation on 2026-10-16: a `queue_rest_held` without
-/// its `fetch_or` fails the first half, `after` between head and rest).
 #[test]
 fn a_blocking_frame_that_saw_the_spill_empty_queues_behind_the_guarded_rest() {
     let (outcome, landed, frame) =
@@ -321,7 +295,6 @@ fn a_blocking_frame_that_saw_the_spill_empty_queues_behind_the_guarded_rest() {
     );
     assert_eq!(&landed[frame.len()..], b"after", "then the blocking frame");
 
-    // NEGATIVE CONTROL: no rest queued, no bit: the direct lane.
     let (outcome, landed, _) =
         a_blocking_frame_behind(|sink, frame| sink.try_write_frame_immediate_with_receipt(frame).0);
     let ImmediateWrite::PartialInDoubt { accepted } = outcome else {

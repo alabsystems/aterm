@@ -90,6 +90,7 @@ pub(crate) fn tail_lines(path: &Path, tail: u64) -> (Vec<LogLine>, usize) {
 }
 
 /// The last `tail` bytes across `path` and its `.1`, decoded into `out`
+/// oldest first; the count of lines the codec refused.
 fn read_pair(path: &Path, tail: u64, out: &mut Vec<LogLine>) -> usize {
     let mut skipped = 0;
     let current = regular_len(path);
@@ -117,6 +118,7 @@ fn regular_len(path: &Path) -> Option<u64> {
 }
 
 /// The last `tail` bytes of the regular file `path` as text, the partial first
+/// line of a cut dropped; `None` when it is not a regular file or unreadable.
 fn read_tail(path: &Path, tail: u64) -> Option<String> {
     let bytes = regular_len(path)?;
     let mut file = File::open(path).ok()?;
@@ -136,6 +138,7 @@ fn read_tail(path: &Path, tail: u64) -> Option<String> {
 }
 
 /// Decode every whole line of `text` into `out`; the count of lines the
+/// codec refused.
 fn decode_into(out: &mut Vec<LogLine>, text: &str) -> usize {
     let mut skipped = 0;
     for line in text.split('\n').filter(|l| !l.is_empty()) {
@@ -147,7 +150,7 @@ fn decode_into(out: &mut Vec<LogLine>, text: &str) -> usize {
     skipped
 }
 
-/// One line as it lands on disk: the codec's form plus the newline. A line
+/// One line as it lands on disk: the codec's form plus the newline.
 fn encoded(line: &LogLine) -> String {
     let mut s = line.encode();
     if s.len() >= MAX_LINE_BYTES {
@@ -158,12 +161,14 @@ fn encoded(line: &LogLine) -> String {
 }
 
 /// The two appenders behind the one lock: aterm's own file, and the wire's, opened at
+/// its first line.
 struct Files {
     host: RotatingFile,
     wire: WireFile,
 }
 
 /// The wire's file: not yet needed, open, or refused (its lines then go to
+/// the host's file — the log never drops).
 enum WireFile {
     Unopened(PathBuf, RotationBudget),
     Open(RotatingFile),
@@ -196,6 +201,7 @@ impl Files {
 }
 
 /// Append one line under the file lock, rotating first when a look is due
+/// ([`BUDGET`], [`WIRE_BUDGET`]).
 fn write_line(files: &Mutex<Files>, line: &str, shelf: Shelf) {
     if line.is_empty() {
         return;
@@ -209,6 +215,8 @@ fn write_line(files: &Mutex<Files>, line: &str, shelf: Shelf) {
 }
 
 /// What the caller hands the writer thread: a line to append, or a flush
+/// mark the thread answers once every line queued before it is on disk —
+/// raised by the flush's [`qos::Boost`] until then.
 enum Job {
     Line(String, Shelf),
     Flush(mpsc::SyncSender<()>, qos::Boost),
@@ -219,6 +227,7 @@ pub(crate) struct Writer {
     /// `None` only during drop, so the receiver sees the channel close.
     tx: Option<mpsc::SyncSender<Job>>,
     /// Lines the channel had no room for, oldest first: handed over ahead of
+    /// every later line ([`Self::hand_over`]).
     overflow: Arc<Mutex<VecDeque<(String, Shelf)>>>,
     overflowed: Arc<AtomicUsize>,
     files: Arc<Mutex<Files>>,
@@ -327,6 +336,8 @@ impl Writer {
     }
 
     /// A writer with no thread — the test's way of standing in for a dead
+    /// one deterministically (drop the receiver and every send is
+    /// `Disconnected`).
     #[cfg(test)]
     fn unattended(path: &Path, cap: usize) -> (Writer, mpsc::Receiver<Job>) {
         Self::open(path, cap, BUDGET, WIRE_BUDGET).expect("a temp file opens")
@@ -353,6 +364,7 @@ impl Writer {
     }
 
     /// Hand `queued` to the thread, oldest first, until the channel is full;
+    /// what is left waits there, in order.
     fn hand_over(&self, queued: &mut VecDeque<(String, Shelf)>) {
         while let Some((line, shelf)) = queued.pop_front() {
             let Some(tx) = &self.tx else {
@@ -421,6 +433,8 @@ impl Writer {
 
 impl Drop for Writer {
     /// Hand over what the overflow holds, close the channel, then wait for
+    /// the thread to write what it holds: the lines a process queued in its
+    /// last moments are its record.
     fn drop(&mut self) {
         let attended = self.thread.is_some();
         let queued =
@@ -614,6 +628,10 @@ mod tests {
     }
 
     /// A WRITER THAT FALLS BEHIND NEVER HOLDS THE CALLER: with its thread
+    /// paused mid-write (the files lock held, as a disk that stopped
+    /// answering would), four queues' worth of lines are appended at once and
+    /// a bounded flush answers `false` at its deadline; once the thread runs
+    /// again every line lands, none lost and in the order appended.
     #[test]
     fn a_paused_writer_holds_no_caller_and_lands_every_line_in_order_after() {
         let dir = scratch("paused");
@@ -653,6 +671,7 @@ mod tests {
     }
 
     /// Once a paused disk resumes, the writer lands every accepted line even
+    /// if the UI has gone idle.
     #[test]
     fn a_recovered_writer_drains_overflow_without_another_ui_call() {
         let dir = aterm_tempfile::tempdir().expect("a temp dir");
@@ -689,6 +708,7 @@ mod tests {
     }
 
     /// A budget small enough to rotate in a test: 4 KiB files, a look after
+    /// every write.
     const TINY: crate::logging::RotationBudget = crate::logging::RotationBudget {
         rotate_at: 4096,
         check_bytes: 0,
@@ -696,6 +716,7 @@ mod tests {
     };
 
     /// Three budgets' worth of appends leave the current file and one older copy, each
+    /// within the budget plus one look and one line.
     #[test]
     fn the_log_rotates_while_running_and_stays_bounded() {
         let dir = scratch("rotate");
@@ -723,6 +744,7 @@ mod tests {
     }
 
     /// The older copy's tail is read first: a `Posted` in `.1` meets its `Retired` in
+    /// the current file, and ids rise past the newest.
     #[test]
     fn a_launch_reads_across_the_rotation() {
         let dir = scratch("across");
@@ -755,6 +777,7 @@ mod tests {
     }
 
     /// Posted/Retired pairs pushed past the channel's depth all read back `Folded`: a
+    /// `Retired` written ahead of its `Posted` would replay as `Stale`.
     #[test]
     fn a_full_channel_never_puts_a_retired_line_ahead_of_its_posted_line() {
         let dir = scratch("reorder");
@@ -778,6 +801,7 @@ mod tests {
     }
 
     /// Wire lines rotate in `messages.wire.log`, bounded; `messages.log` keeps its one
+    /// host record unrotated, and a launch reads it back beside the wire's newest.
     #[test]
     fn a_wire_flood_never_rotates_aterms_own_record_off_disk() {
         let dir = scratch("wire-shelf");
@@ -829,6 +853,8 @@ mod tests {
     }
 
     /// Records interleaved across the two files load oldest-first by id, each meeting
+    /// its own `Retired`; ids continue past the newest; the wire's tail is read at most
+    /// [`WIRE_TAIL_BYTES`].
     #[test]
     fn a_launch_merges_the_two_files_by_id() {
         let dir = scratch("wire-merge");

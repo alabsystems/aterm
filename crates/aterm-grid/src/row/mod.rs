@@ -24,6 +24,7 @@ const fn u16_from_usize(value: usize) -> u16 {
 pub type BlankedHalves = [Option<u16>; 4];
 
 /// A cell an early-wrap hole can still be: a blank (space) that is no half of
+/// a wide glyph and no complex cluster.
 #[inline]
 const fn is_wrap_hole_blank(cell: &Cell) -> bool {
     use super::CellFlags;
@@ -39,7 +40,7 @@ const fn is_wrap_hole_blank(cell: &Cell) -> bool {
 pub struct Row {
     /// Cell storage.
     cells: PageSlice<Cell>,
-    /// One past the last cell output wrote (see [`Row::len`]). If 0, the row
+    /// One past the last cell output wrote (see [`Row::len`]).
     len: u16,
     /// Row flags.
     flags: RowFlags,
@@ -60,11 +61,18 @@ aterm_types::bitflags! {
         const DOUBLE_HEIGHT_TOP = 1 << 3;
         /// Double-height line, bottom half (DECDHL).
         const DOUBLE_HEIGHT_BOTTOM = 1 << 4;
-        /// At least one cell is a WIDE head. Set by every wide write and by
+        /// At least one cell is a WIDE head.
         const HAS_WIDE_CHARS = 1 << 5;
         /// The row was filled from a history [`Line`](aterm_scrollback::Line)
+        /// that ends two or more cells before the last column: its line goes on
+        /// at the row's length when the next row continues it, as the line
+        /// does in the tiered store, not at the last column an autowrap would
+        /// have filled.
         const ENDS_AT_LEN = 1 << 6;
         /// The row's last cell is an early-wrap hole: a width-2 glyph that
+        /// could not start there wrapped to the next row and left the cell
+        /// unwritten (xterm blanks it with the current background; Ghostty's
+        /// `spacer_head`).
         const EARLY_WRAP_HOLE = 1 << 7;
         /// Mask of DEC line attribute flags (DECDWL/DECDHL).
         const LINE_ATTRIBUTES = Self::DOUBLE_WIDTH.bits()
@@ -262,6 +270,8 @@ impl Row {
     }
 
     /// A write that lands on the last cell (`end`, exclusive, reaches the row
+    /// end) fills an early-wrap hole: the cell is content from now on, and the
+    /// row is as full as an autowrap leaves it.
     #[inline]
     fn note_write_through(&mut self, end: usize) {
         if end >= self.cells.len() {

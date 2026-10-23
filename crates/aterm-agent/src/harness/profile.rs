@@ -543,7 +543,7 @@ pub struct Context {
     pub login: Option<String>,
 }
 
-/// One exec variable, known unset versus unknown/conflicting. No environment
+/// One exec variable, known unset versus unknown/conflicting.
 fn exec_var<'a>(env: &'a [String], name: &str) -> Option<Option<&'a str>> {
     if env.is_empty() {
         return None;
@@ -707,6 +707,9 @@ pub fn login_method(
 }
 
 /// The profile Claude Code reads for the home a process's exec environment
+/// `env` names ([`effective`] over [`path_of`]'s home), for a user whose
+/// home is `user_home`; `None` where the records cannot be named (a
+/// relative or empty config directory with no working directory).
 fn effective_of(env: &[String], user_home: &Path) -> Option<PathBuf> {
     let var = |name: &str| {
         env.iter()
@@ -750,7 +753,7 @@ pub fn answers_to(env: &[String], user_home: &Path, email: &str) -> Option<bool>
     .flatten()
 }
 
-/// How long a cached `/usage` reading stays current ([`current_windows`]). Claude Code
+/// How long a cached `/usage` reading stays current ([`current_windows`]).
 const USAGE_CURRENT_S: i64 = 15 * 60;
 
 /// Facts for the requested on-screen account/subscription display.
@@ -906,6 +909,8 @@ pub fn muse_subscription_for(
 }
 
 /// The provider a Muse Code command line names (`--provider` in either
+/// spelling, a `-c`/`--config provider=…` for this run; the last one
+/// named, as its launch flags read), lower-cased.
 fn muse_provider_arg(argv: &[String]) -> Option<String> {
     let config_provider = |spec: &str| {
         let (key, value) = spec.split_once('=')?;
@@ -954,6 +959,7 @@ struct Selected {
 
 impl Drop for Selected {
     /// An address no display took — a refused selection's, or one that only gated the
+    /// plan — is zeroed before it is freed, as [`answers_to`]'s is.
     fn drop(&mut self) {
         if let Some(email) = self.email.take() {
             wipe(&mut email.into_bytes());
@@ -962,6 +968,9 @@ impl Drop for Selected {
 }
 
 /// THE ONE SELECTION behind [`subscription_for`] and [`plan_usage_for`]: the profile the
+/// process's own exec environment selects, for a stored login only, read once, and kept
+/// only where the roster binds that login to the address the profile names (see
+/// [`subscription_for`] for the cases).
 fn selected_profile(
     env: &[String],
     user_home: &Path,
@@ -1087,6 +1096,7 @@ impl Selected {
 }
 
 /// THE CURRENCY RULE of a cached `/usage` reading: the windows of `usage` that still say
+/// what is used at `now`.
 fn current_windows(usage: &UsageCache, now: i64) -> impl Iterator<Item = &CachedWindow> {
     let current = usage
         .fetched_at_ms
@@ -1102,6 +1112,8 @@ fn current_windows(usage: &UsageCache, now: i64) -> impl Iterator<Item = &Cached
 }
 
 /// The weekly bucket of `model`'s own family, for a model named by id
+/// (`claude-opus-5-5`), alias (`opus`) or display name (`Opus 5.5`); `None` for a family
+/// the usage body keeps no bucket of.
 fn model_bucket(model: &str) -> Option<Bucket> {
     let short = super::usage::model_short(model);
     let family: String = short
@@ -1125,6 +1137,7 @@ pub fn read(path: &Path) -> Result<Profile, NoProfile> {
 }
 
 /// [`read`]'s file handling, its bytes handed to `parse` before they are
+/// zeroed.
 fn read_with<T>(
     path: &Path,
     parse: impl FnOnce(&[u8]) -> Result<T, NoProfile>,
@@ -1167,6 +1180,7 @@ fn read_with<T>(
 }
 
 /// Zero `buf`, and keep the compiler from dropping the writes as dead
+/// before the free.
 fn wipe(buf: &mut [u8]) {
     buf.fill(0);
     std::hint::black_box(&*buf);
@@ -1251,6 +1265,7 @@ fn profile_of(raw: RawFile) -> Profile {
 }
 
 /// A rate-limit tier's word: a trailing `_<digits>x` taken as the multiple
+/// (`default_claude_max_20x` → `20x`), else the word itself.
 fn tier_word(raw: Word) -> Word {
     let multiple = raw
         .as_str()
@@ -1397,6 +1412,7 @@ fn fable_plan(plan: &Plan, flags: RawFeatures) -> FablePlan {
 }
 
 /// A share in percent (0-100, as the body carries it) in tenths, capped at
+/// 100%; `None` for a negative or non-finite one.
 fn pct_x10(pct: f64) -> Option<u16> {
     if !pct.is_finite() || pct < 0.0 {
         return None;
@@ -1410,6 +1426,7 @@ fn pct_x10(pct: f64) -> Option<u16> {
 }
 
 /// A whole number the file wrote as a JSON number; `None` past `i64` or not
+/// finite.
 fn whole(n: f64) -> Option<i64> {
     #[expect(clippy::cast_possible_truncation, reason = "range checked")]
     (n.is_finite() && n.abs() < 9.0e15).then(|| n.round() as i64)
@@ -1451,6 +1468,7 @@ pub fn instant(text: &str) -> Option<i64> {
 }
 
 /// A MODEL FAMILY'S NAME as a key or a flag spells it (`Fable`, `nimbus`),
+/// lowercased: letters alone, at most 32 — an id (digits, hyphens) is none.
 fn family(name: &str) -> Option<String> {
     (!name.is_empty() && name.len() <= 32 && name.bytes().all(|b| b.is_ascii_alphabetic()))
         .then(|| name.to_ascii_lowercase())
@@ -1600,6 +1618,7 @@ struct RawEnabled {
 }
 
 /// Drain one container's values unread, for a visitor handed a shape it
+/// does not keep.
 fn drain_seq<'de, A: SeqAccess<'de>>(mut seq: A) -> Result<(), A::Error> {
     while seq.next_element::<IgnoredAny>()?.is_some() {}
     Ok(())
@@ -1638,6 +1657,8 @@ macro_rules! lenient_scalars {
 }
 
 /// Muse Code's login store (`auth.json`), the `meta` provider's address
+/// alone kept: every other key read past unkept, as [`RawWho`]'s are, so
+/// no credential material another mechanism keeps there is materialized.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct RawMuseAuth {
@@ -1659,6 +1680,8 @@ struct RawMuseMeta {
 }
 
 /// Muse Code's global `settings.json`, its `provider` alone kept: what
+/// tells a Meta-account process from an `echo` or `local` one running
+/// under the same login store.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct RawMuseSettings {
@@ -1725,6 +1748,7 @@ impl<'de> Deserialize<'de> for Address {
 }
 
 /// AN OBJECT OF THE ALLOWLIST: `T` where the value is an object, `None`
+/// for any other value (read past, unkept).
 struct Obj<T>(Option<T>);
 
 impl<T> Default for Obj<T> {
@@ -1754,6 +1778,7 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Obj<T> {
 }
 
 /// AN ARRAY OF ALLOWLIST OBJECTS: each object element read as `T`, every
+/// other element read past; empty for any value that is not an array.
 struct List<T>(Vec<T>);
 
 impl<T> Default for List<T> {
@@ -1787,6 +1812,7 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for List<T> {
 }
 
 /// ONE SCALAR OF THE ALLOWLIST, whatever its type turned out to be: an
+/// array or an object where a scalar was expected is read past, unkept.
 #[derive(Default)]
 enum Leaf {
     /// The key was not there.
@@ -1870,6 +1896,8 @@ impl<'de> Deserialize<'de> for Leaf {
 }
 
 /// A CLAUDE ACCOUNT ID, HASHED AS IT IS READ ([`AccountKey::claude`]): the
+/// parser hands the string over borrowed from the file's bytes, and only
+/// the key is kept.
 #[derive(Default)]
 struct Hashed(Option<AccountKey>);
 
@@ -1914,6 +1942,7 @@ impl<'de> Deserialize<'de> for Hashed {
 }
 
 /// AN ARRAY OF WORDS, `None` unless the value is an array of strings that
+/// are all words (Claude Code reads anything else as unparseable).
 #[derive(Default)]
 struct Words(Option<Vec<Word>>);
 
@@ -1945,6 +1974,11 @@ impl<'de> Deserialize<'de> for Words {
 }
 
 /// `tengu_saffron_lattice.perModel`, as the one answer this reader needs:
+/// whether a FABLE model is billed to usage credits — `Some(true)` where any
+/// entry for an id that names Fable says `enabled: true` (Claude Code's own
+/// rule where two spellings of a model disagree), `Some(false)` where every
+/// such entry says `false`, `None` with no such entry or a value that is
+/// not an object.
 #[derive(Default)]
 struct FableEntries(Option<bool>);
 
@@ -1979,6 +2013,7 @@ impl<'de> Deserialize<'de> for FableEntries {
 }
 
 /// A STORED CONSENT (`{ "<org or acct:id>": true }`): whether any entry
+/// holds `true`.
 #[derive(Default)]
 struct Consent(bool);
 
@@ -2007,6 +2042,7 @@ impl<'de> Deserialize<'de> for Consent {
 }
 
 /// THE STORED CONSENTS PER FAMILY (`{ "<family>": { "<org or acct:id>":
+/// true } }`): the families ([`family`]) whose [`Consent`] holds.
 #[derive(Default)]
 struct Consents(Vec<String>);
 

@@ -130,6 +130,9 @@ dev-seams = [
 ]
 
 [dev-dependencies]
+# `plain_durable_flushes_in_tests!`: fabric_world and aterm_suite mark their process trees
+# as a test's, so the instances and brokers they start take a plain `fsync(2)`.
+aterm-durable = { workspace = true }
 # The live tests' raw process and descriptor calls (signals, waits, process groups, fd flags,
 # rlimits).
 libc = { workspace = true }

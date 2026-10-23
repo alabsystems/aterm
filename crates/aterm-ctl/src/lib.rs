@@ -698,7 +698,7 @@ fn allow_foreground_handoff(path: &str) {
 }
 
 #[cfg(not(windows))]
-fn allow_foreground_handoff(_path: &str) {}
+const fn allow_foreground_handoff(_path: &str) {}
 
 #[cfg(windows)]
 fn instance_pid_of(path: &str) -> Option<u32> {
@@ -1175,7 +1175,7 @@ enum TargetOrigin {
 }
 
 impl TargetOrigin {
-    fn settled(self) -> Self {
+    const fn settled(self) -> Self {
         match self {
             Self::Hosting => Self::Flagless,
             origin => origin,
@@ -1755,7 +1755,7 @@ fn missing_dir_reason() -> String {
         .to_string()
 }
 
-fn other_elevation_note() -> Option<String> {
+const fn other_elevation_note() -> Option<String> {
     #[cfg(windows)]
     {
         let elevated = aterm_uds::elevation::is_elevated();
@@ -1822,7 +1822,7 @@ struct Target {
 }
 
 impl Target {
-    fn named(pid: u32, sock: String) -> Self {
+    const fn named(pid: u32, sock: String) -> Self {
         Self {
             pid,
             sock,
@@ -2033,11 +2033,11 @@ impl ForeignFacts {
         }
     }
 
-    fn orphaned(&self) -> bool {
+    const fn orphaned(&self) -> bool {
         matches!(self, Self::Writer { orphaned: true, .. })
     }
 
-    fn writer_gone(&self) -> bool {
+    const fn writer_gone(&self) -> bool {
         matches!(self, Self::Stale | Self::NotAterm(_))
     }
 
@@ -2642,7 +2642,7 @@ const CAUSE_PRIORITY: [Cause; 8] = [
     Cause::Other,
 ];
 
-fn cause_of(probe: &Probe) -> Option<Cause> {
+const fn cause_of(probe: &Probe) -> Option<Cause> {
     match probe {
         Probe::Answered(_) => None,
         Probe::Refused { .. } => Some(Cause::Refused),

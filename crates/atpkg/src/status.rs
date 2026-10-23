@@ -342,6 +342,9 @@ pub fn write(layout: &Layout, status: &Status) -> io::Result<()> {
 }
 
 /// Whether `a` and `b` differ only in what a pass stamps as it goes (the outcome sentence
+/// and the clocks), which is all a hold coalesces: a lost stamp is re-stamped by the next
+/// pass, while a lost row (an activated build and its signed root, a seam, a tombstone)
+/// lets the next pass record a new build under an old root, which `verify` calls drift.
 fn only_stamps_differ(a: &Status, b: &Status) -> bool {
     let unstamped = |s: &Status| Status {
         updated_at: String::new(),
@@ -361,6 +364,8 @@ fn only_stamps_differ(a: &Status, b: &Status) -> bool {
 }
 
 /// Refuse a record with more per-program rows than [`MAX_STATUS_PROGRAMS`], in either map
+/// keyed by program, or a program with more refused-name entries than
+/// [`MAX_REFUSED_BUILDS`]: the bound every read and every write holds.
 fn bounded_rows(status: &Status) -> io::Result<()> {
     for (what, rows) in [
         ("programs", status.programs.len()),
@@ -406,6 +411,7 @@ fn render(status: &Status) -> io::Result<String> {
 }
 
 /// Put `text` at `layout.status()` so a power loss leaves the old record or this one: a
+/// temp beside it, `fsync`, `rename(2)`, then a directory sync.
 fn write_durably(layout: &Layout, text: &str) -> io::Result<()> {
     let dest = layout.status();
     let tmp = dest.with_file_name(format!("status.toml.tmp-{}", std::process::id()));
@@ -505,12 +511,15 @@ pub fn seed_for_rewrite(layout: &Layout) -> io::Result<Status> {
 }
 
 /// Whether the read error `why` means the record itself is bad, rather than that this read
+/// failed: bytes that do not parse, are not UTF-8 or exceed the bounds (`InvalidData`), or
+/// a path that is not a regular file.
 fn is_corrupt(layout: &Layout, why: &io::Error) -> bool {
     why.kind() == io::ErrorKind::InvalidData
         || std::fs::symlink_metadata(layout.status()).is_ok_and(|m| !m.file_type().is_file())
 }
 
 /// Replace a corrupt record with [`rebuilt_from_store`]'s, keeping the corrupt one beside
+/// it as `status.toml.corrupt-<unix>`, said once as a notice.
 fn heal(layout: &Layout, why: io::Error) -> io::Result<Status> {
     if !is_corrupt(layout, &why) {
         return Err(why);
@@ -535,6 +544,7 @@ fn heal(layout: &Layout, why: io::Error) -> io::Result<Status> {
 }
 
 /// `status.toml.corrupt-<unix>`, or `…-<unix>-<pid>` when a record was already kept aside
+/// in the same second.
 fn corrupt_path(layout: &Layout, unix: u64) -> PathBuf {
     let first = layout.prefix.join(format!("status.toml.corrupt-{unix}"));
     if std::fs::symlink_metadata(&first).is_err() {
@@ -640,6 +650,7 @@ mod held {
     use super::{Layout, PathBuf, Status, io};
 
     /// One held store: `record` is the record as it stands and `disk` as the file holds
+    /// it — each `None` until first read or written (`Some(None)`: the store has none).
     struct Held {
         prefix: PathBuf,
         depth: u32,
@@ -734,6 +745,7 @@ mod tests {
     }
 
     /// A pass that reached the index stamps its success and ends `ok`; one that did not ends
+    /// `failed` and keeps the success; the build fields move only on a different build.
     #[test]
     fn the_pass_end_stamps_say_what_the_pass_did() {
         use aterm_update_core::pkg_check::{PassOutcome, Stamps};
@@ -859,6 +871,8 @@ mod tests {
     }
 
     /// A rewriting writer heals an unreadable record (garbage, truncated, empty) by keeping
+    /// the bytes aside and rebuilding from the store, and its stamp lands; an absent record
+    /// seeds a fresh one and keeps nothing aside.
     #[test]
     fn rewriting_writers_heal_an_unreadable_record() {
         let l = layout("unreadable");
@@ -917,6 +931,7 @@ mod tests {
     }
 
     /// A read that failed (a permission, an I/O error) is not corruption: the healthy record
+    /// is left where it is, never moved aside or replaced.
     #[cfg(unix)]
     #[test]
     fn a_record_that_could_not_be_read_is_left_alone() {
@@ -983,6 +998,7 @@ mod tests {
     }
 
     /// While a store is held the stamps land in memory, where readers in this process see
+    /// them; the file is written once when the hold ends, and not at all if nothing changed.
     #[cfg(unix)]
     #[test]
     fn a_held_record_is_written_once_when_the_hold_ends() {
@@ -1028,6 +1044,7 @@ mod tests {
     }
 
     /// A row change is written through even while held: a pass killed after activating a
+    /// build must leave its row and signed root on disk.
     #[cfg(unix)]
     #[test]
     fn a_held_row_change_reaches_the_disk_at_once() {
@@ -1089,6 +1106,8 @@ mod tests {
     }
 
     /// The `seams` record round-trips beside the program rows (aterm-toml orders values
+    /// before sub-tables, so the array never lands inside the last `[programs.*]` table),
+    /// and a record without the field parses as no seams.
     #[test]
     fn seams_round_trip_and_default_empty() {
         let l = layout("seams");
@@ -1146,6 +1165,8 @@ mod tests {
     }
 
     /// The refused names a landing records (design S13): kept per build, beside the
+    /// program's other builds, bounded, dropped with the build, and never a write for a
+    /// landing that refused nothing, so a record without them is the bytes it was.
     #[test]
     fn refused_shims_are_recorded_per_build_bounded_and_dropped_with_the_build() {
         let l = layout("refused-shims");
@@ -1225,6 +1246,8 @@ mod tests {
     }
 
     /// The record's refused-name map holds the bound every read and write holds: no more
+    /// programs than [`MAX_STATUS_PROGRAMS`], no more than [`MAX_REFUSED_BUILDS`] entries
+    /// for one.
     #[test]
     fn a_record_over_the_refused_shims_bounds_is_neither_written_nor_read() {
         let l = layout("refused-bounds");
@@ -1277,6 +1300,7 @@ mod tests {
     }
 
     /// "Never checked" is exactly `status.toml` absent or `last_success_at` empty: a record
+    /// a failed pass wrote still reads as never checked; only [`stamp_success`] clears it.
     #[test]
     fn never_checked_holds_until_a_successful_pass_stamps_last_success_at() {
         let l = layout("never-checked");
@@ -1327,6 +1351,9 @@ mod tests {
     }
 
     /// Tier-1 of the derived model `AtpkgFullPassRule` (aterm-spec): every record the model
+    /// reaches at `Buggy=0`, laid down by the real writers and read as the session lane reads
+    /// it ([`pass_stamps`], then `full_pass_owed`), gives the model's `verdict` and pass in
+    /// flight, and starts a pass exactly when `SessionLook` does.
     #[test]
     fn the_full_pass_rule_conforms_to_its_derived_model() {
         use super::full_pass_rule_tier1::{legacy_stamps, looks, realize, records};

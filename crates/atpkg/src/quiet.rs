@@ -1,49 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Flip when quiet: an unattended update stages a new Trust toolchain at once and flips it
-//! only when nothing is using the one it replaces.
-//!
-//! A trust update can be published at any hour. The flip re-points `store/trust/current`
-//! and the `bin/` shims, and the next re-assertion re-lays the rustup view. A build in
-//! flight keeps the compiler it started with (gc keeps the build its processes run from),
-//! but a WORKFLOW is several commands: `targo build` then `targo test` through the shim, or
-//! a `verify` run's checks, run on two compilers the moment a flip lands between them —
-//! `Dirty …: the toolchain changed`, about 600 packages rebuilt with sccache misses, or
-//! E0514 on the `current` path (gap #12). `verify` and the cutter pin one physical
-//! directory per run, but only the flip itself can wait for the workflow to end.
-//!
-//! # The rule ([`decide`]; the derived model `AtpkgFlipQuiet`)
-//!
-//! * Only the unattended lanes wait ([`FlipPolicy::WhenQuiet`], carried by
-//!   [`crate::cli::DEFER_BUSY_FLIP_FLAG`]); a person's `aterm pkg update` (typed, or
-//!   Settings' Update now) flips at once.
-//! * Only the coherence group holding [`crate::seam::SEAM_PROGRAM`] waits; a singleton
-//!   verifier flipped under a running process keeps the build it runs from.
-//! * A revoked build (yanked, below the floor or tombstoned) never waits: revocation
-//!   outranks every consumer gate ([`crate::gate`]).
-//! * In use is a lease on a member's live build or the rustup view ([`crate::lease`]), a
-//!   process running from a member's build, its exec root or the view, or not known
-//!   (process table or leases unreadable), priced as in use as gc and the seam price it.
-//! * The wait is bounded by [`CEILING_SECS`] from the first deferral; a run pinned to the
-//!   old build still finishes on it (gc keeps a leased build).
-//!
-//! # Staged
-//!
-//! A deferral downloads and digest-checks every member's signed archive into
-//! `staging/<program>/`, so the flip needs no network: `flow::carried_archive` re-stages
-//! from it, re-checking the digest and the signed `tree_root`. The flip asks once more right
-//! before it re-points anything; a build that started meanwhile defers it again (the
-//! extracted tree is discarded, the archive kept).
-//!
-//! # The records
-//!
-//! `<prefix>/flip-deferred.toml` ([`Deferral`]) holds the wait; `aterm pkg doctor` prints it
-//! ([`Deferral::sentence`]) and the members' status rows say `deferred: …`. A [`Recheck`]
-//! host (the window's park, else the terminal session watching for updates) wakes a pass
-//! when it is [`due`]. Every pass that moves, holds or settles the group clears it.
-//! `<prefix>/view-left.toml` ([`ViewLeft`]) records a rustup view a landing flip left as it
-//! stood.
+//! Flip when quiet.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -53,14 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::store::Layout;
 
-/// How long an unattended flip waits for quiet, at most: four hours from the first
-/// deferral. Long enough for a release cut, or a command held by `aterm pkg lease`, to
-/// finish on the compiler it started with; short enough that a machine building all
-/// day still takes the day's toolchain the same day.
+/// How long an unattended flip waits for quiet, at most.
 pub const CEILING_SECS: i64 = 4 * 60 * 60;
 
-/// How often a [`Recheck`] host looks at a recorded deferral ([`due`]): each look is a lease
-/// read and at most one process-table walk.
+/// How often a [`Recheck`] host looks at a recorded deferral ([`due`]).
 pub const RECHECK: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// `<prefix>/flip-deferred.toml`.
@@ -72,14 +26,13 @@ pub fn record_path(layout: &Layout) -> PathBuf {
 /// Whether a pass may hold the toolchain's flip for quiet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlipPolicy {
-    /// Flip at once: a person asked (`aterm pkg update`, Settings), or a path that never
-    /// supersedes a live toolchain (a fresh install).
+    /// Flip at once.
     Now,
-    /// The unattended lanes: stage now, flip when quiet ([`decide`]).
+    /// The unattended lanes.
     WhenQuiet,
 }
 
-/// What a pass's flip decision reads: the policy, the clock and the process table.
+/// What a pass's flip decision reads.
 pub struct FlipGate<'a> {
     /// Whether this pass may wait at all.
     pub policy: FlipPolicy,
@@ -95,7 +48,7 @@ fn no_table() -> Option<Vec<PathBuf>> {
 }
 
 impl FlipGate<'static> {
-    /// Flip at once — every path that is not an unattended lane's whole pass.
+    /// Flip at once.
     pub const NOW: FlipGate<'static> = FlipGate {
         policy: FlipPolicy::Now,
         now: 0,
@@ -113,9 +66,9 @@ pub enum Busy {
         what: String,
         holders: crate::lease::Holders,
     },
-    /// A live process runs from it — the executable the kernel names.
+    /// A live process runs from it.
     Running { exe: PathBuf },
-    /// It could not be told — priced as in use.
+    /// It could not be told.
     Unknown { why: String },
 }
 
@@ -143,17 +96,13 @@ impl Busy {
 pub enum Verdict {
     /// Flip now: a person asked, the build is revoked, or nothing is using the toolchain.
     Flip,
-    /// Wait for quiet; the deferral started at `since`.
+    /// Wait for quiet.
     Defer { since: i64 },
-    /// The wait reached [`CEILING_SECS`] (it started at `since`): flip anyway, and say so.
+    /// The wait reached [`CEILING_SECS`] (it started at `since`).
     FlipAtCeiling { since: i64 },
 }
 
-/// The decision, pure. A [`FlipPolicy::Now`] pass, a `forced` one (a member's pinned or
-/// current build is yanked, below the floor or tombstoned) and a quiet toolchain flip at
-/// once. Otherwise the flip waits from `since` (the recorded first deferral; `None`, or one
-/// after `now` from a clock set back, starts it now) until [`CEILING_SECS`] have passed.
-/// The derived model `AtpkgFlipQuiet` states it; a conformance test below binds the two.
+/// The decision, pure.
 #[must_use]
 pub fn decide(
     policy: FlipPolicy,
@@ -173,10 +122,7 @@ pub fn decide(
     }
 }
 
-/// Whether the toolchain whose live builds are `live` (member → build) is in use: a lease on
-/// any of them or on a laid rustup view, else a process running from any of them, a trust
-/// build's exec root, or a laid view. Leases first (a few file tests); the process table is
-/// read once, only when no lease holds.
+/// Whether the toolchain whose live builds are `live` (member → build) is in use.
 #[must_use]
 pub fn probe(
     layout: &Layout,
@@ -238,7 +184,7 @@ pub struct Deferral {
     pub schema: u32,
     /// The coherence group whose flip waits (`rustc`).
     pub group: String,
-    /// Unix seconds of the first deferral of this wait — what the ceiling counts from.
+    /// Unix seconds of the first deferral of this wait.
     pub since: i64,
     /// Unix seconds of the last look.
     pub checked: i64,
@@ -250,15 +196,12 @@ pub struct Deferral {
     /// Member → the staged build the flip moves onto.
     #[serde(default)]
     pub to: BTreeMap<String, u64>,
-    /// Member → the file name of its staged archive in `staging/<member>/`: what the flip
-    /// re-stages from with no download (`flow::carried_archive`), and what every gc spares
-    /// while the wait stands ([`held_archives`]). Absent in an older record.
+    /// Member → the file name of its staged archive in `staging/<member>/`.
     #[serde(default)]
     pub assets: BTreeMap<String, String>,
 }
 
-/// What a held flip moves, as its record keeps it ([`note_deferred`]): the live builds it
-/// moves off, the staged ones it moves onto, and the staged archive of each.
+/// What a held flip moves, as its record keeps it ([`note_deferred`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Moves {
     /// Member → the live build the flip moves off.
@@ -282,7 +225,7 @@ impl Deferral {
         self.since.saturating_add(CEILING_SECS)
     }
 
-    /// The moves, as a person reads them: `trust build 9192 → 9200, trust-ir build 40 → 41`.
+    /// The moves, as a person reads them.
     #[must_use]
     pub fn moves(&self) -> String {
         let mut out: Vec<String> = Vec::new();
@@ -295,9 +238,7 @@ impl Deferral {
         out.join(", ")
     }
 
-    /// The doctor's line: what waits, since when, why, and the latest time it lands, promised
-    /// only while a [`Recheck`] host (`watcher`) wakes the pass; with none, it waits for the
-    /// next pass. Then the one command that installs it now.
+    /// The doctor's line.
     #[must_use]
     pub fn sentence(&self, now: i64, watcher: &crate::vendor_direct::watch::Watcher) -> String {
         use crate::vendor_direct::watch::Watcher;
@@ -350,7 +291,6 @@ pub(crate) fn clock(unix: i64) -> String {
     match u64::try_from(unix) {
         Ok(secs) if unix > 0 && unix != i64::MAX => {
             let stamp = aterm_types::rfc3339::format_rfc3339(secs);
-            // `YYYY-MM-DDTHH:MM:SSZ` → `YYYY-MM-DD HH:MM UTC`.
             match (stamp.get(..10), stamp.get(11..16)) {
                 (Some(day), Some(time)) => format!("{day} {time} UTC"),
                 _ => stamp,
@@ -360,9 +300,7 @@ pub(crate) fn clock(unix: i64) -> String {
     }
 }
 
-/// The recorded deferral, if one stands. An unreadable record is none: the next deferral
-/// writes a fresh one, so a lost record costs at most one more ceiling, never a flip under
-/// a build.
+/// The recorded deferral, if one stands.
 #[must_use]
 pub fn read(layout: &Layout) -> Option<Deferral> {
     let text =
@@ -373,7 +311,7 @@ pub fn read(layout: &Layout) -> Option<Deferral> {
         .filter(|d| d.schema == SCHEMA)
 }
 
-/// Write the record: temp + rename, so a reader sees the old record or the new one.
+/// Write the record.
 ///
 /// # Errors
 /// The render's or the write's.
@@ -394,7 +332,7 @@ pub(crate) fn write(layout: &Layout, record: &Deferral) -> io::Result<()> {
     written
 }
 
-/// Drop the record — the group moved, was held for another reason, or settled.
+/// Drop the record.
 pub(crate) fn clear(layout: &Layout) {
     let path = record_path(layout);
     if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
@@ -402,13 +340,7 @@ pub(crate) fn clear(layout: &Layout) {
     }
 }
 
-/// Record a deferral of `group` at `now`, with `since` the first deferral of this wait
-/// (the caller keeps it from a standing record of the same group, even across a newer
-/// publish).
-///
-/// Whether the record was written. The wait is bounded only by the record's `since`, so a
-/// wait that cannot be recorded would restart every pass and never reach [`CEILING_SECS`]:
-/// the caller flips at once instead.
+/// Record a deferral of `group` at `now`, preserving `since` from the first deferral of this wait.
 #[must_use]
 pub(crate) fn note_deferred(
     layout: &Layout,
@@ -435,8 +367,7 @@ pub(crate) fn note_deferred(
 }
 
 /// Whether a standing record still describes a wait: at least one build it moves off is in
-/// the store. One that outlived them all (an `uninstall --all`, a store emptied by hand)
-/// waits for nothing, and nothing is kept or woken for it.
+/// the store.
 fn stands(layout: &Layout, record: &Deferral) -> bool {
     record.from.iter().any(|(program, build)| {
         std::fs::symlink_metadata(layout.build_dir(program, *build)).is_ok()
@@ -448,16 +379,13 @@ fn stands(layout: &Layout, record: &Deferral) -> bool {
 pub enum Held {
     /// There is no record.
     Nothing,
-    /// The record describes a wait: a build it moves off is still in the store.
+    /// The record describes a wait.
     Waits(Deferral),
-    /// The record outlived every build it moves off (a store emptied by hand) and waits
-    /// for nothing. The next update pass ends it, and so does `aterm pkg repair`.
+    /// The record outlived every build it moves off (a store emptied by hand) and waits for nothing.
     Outlived(Deferral),
 }
 
-/// The deferral record as `aterm pkg doctor` reports it: a record [`stands`] refuses is
-/// [`Held::Outlived`], not a staged update. Read-only, as doctor is; the doors that write
-/// end it ([`end_outlived`]).
+/// The deferral record as `aterm pkg doctor` reports it.
 #[must_use]
 pub fn held(layout: &Layout) -> Held {
     match read(layout) {
@@ -467,9 +395,7 @@ pub fn held(layout: &Layout) -> Held {
     }
 }
 
-/// End the record when it outlived every build it moves off, as `uninstall` and `repair`
-/// run it under their store lock, so no update pass rewrites it meanwhile. `true` when a
-/// record was removed; one that still [`stands`] is kept.
+/// Retire the record under the store lock when it outlived every build it moves off.
 pub(crate) fn end_outlived(layout: &Layout) -> bool {
     if !read(layout).is_some_and(|record| !stands(layout, &record)) {
         return false;
@@ -478,10 +404,7 @@ pub(crate) fn end_outlived(layout: &Layout) -> bool {
     read(layout).is_none()
 }
 
-/// The archives a standing record's flip waits on (member → file name in
-/// `staging/<member>/`), which every gc spares: `install`, the seed and `atpkg gc` resolve
-/// other programs and would otherwise sweep them, and the flip would download again. Empty
-/// when no record [`stands`]; a name that is not one bare file name is dropped.
+/// The archives a standing record's flip waits on (member → file name in `staging/<member>/`), which every gc spares.
 #[must_use]
 pub fn held_archives(layout: &Layout) -> BTreeMap<String, String> {
     let Some(record) = read(layout).filter(|r| stands(layout, r)) else {
@@ -513,14 +436,11 @@ pub enum Due {
     Quiet,
     /// The wait reached its ceiling.
     Ceiling,
-    /// A rustup view a flip left behind is used by nothing now; the pass lays it
-    /// ([`ViewLeft`]).
+    /// A rustup view a flip left behind is used by nothing now.
     View,
 }
 
-/// A recorded deferral that is due, and which look of it: the record's `checked` stamp
-/// (for [`Due::View`], the view entry's), rewritten by every pass that holds the move
-/// again. A caller wakes one pass per stamp ([`Recheck`]).
+/// A recorded deferral that is due, and which look of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DueFlip {
     /// Why it is due.
@@ -529,10 +449,7 @@ pub struct DueFlip {
     pub checked: i64,
 }
 
-/// Whether a held toolchain move is due now: a standing deferral whose toolchain is quiet or
-/// whose wait reached its ceiling, else a rustup view left behind that nothing uses
-/// ([`view_due`]). What every [`Recheck`] host asks; the pass it wakes decides again.
-/// Read-only.
+/// Whether a held toolchain move is due now.
 #[must_use]
 pub fn due(layout: &Layout, now: i64) -> Option<DueFlip> {
     due_with(layout, now, &crate::gc::process_table)
@@ -573,24 +490,20 @@ fn flip_due(
     })
 }
 
-/// `<prefix>/view-left.toml`: the rustup views a pass left as they stood ([`ViewLeft`]).
+/// `<prefix>/view-left.toml`.
 #[must_use]
 pub fn view_record_path(layout: &Layout) -> PathBuf {
     layout.prefix.join("view-left.toml")
 }
 
-/// A rustup view left behind, recorded so it is laid as soon as nothing uses it. A flip that
-/// lands while the view is leased or run from re-points the store, but the seam leaves the
-/// view as it stands ([`crate::seam`]'s `Deferred`) and the flip's own record goes. The
-/// re-check ([`Due::View`]) wakes a pass once the view is quiet; the pass that lays it, or
-/// finds it current, clears the entry.
+/// A rustup view left behind, recorded so it is laid as soon as nothing uses it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ViewLeft {
     /// The build the view was not re-laid onto.
     pub build: String,
     /// Unix seconds the view was first left behind in this stretch.
     pub since: i64,
-    /// Unix seconds of the pass that last left it — the stamp a wake is keyed on.
+    /// Unix seconds of the pass that last left it.
     pub checked: i64,
     /// Why it was left, as the seam said it.
     pub why: String,
@@ -606,8 +519,7 @@ pub struct ViewsLeft {
     pub views: BTreeMap<String, ViewLeft>,
 }
 
-/// The recorded views left behind; none when no record stands or it cannot be read (a lost
-/// record costs one wait for the next pass, never a view re-laid under a build).
+/// The recorded views left behind.
 #[must_use]
 pub fn views_left(layout: &Layout) -> ViewsLeft {
     crate::metadata_io::read_bounded_regular_utf8(&view_record_path(layout), MAX_RECORD_BYTES)
@@ -641,9 +553,7 @@ fn write_views_left(layout: &Layout, record: &ViewsLeft) -> io::Result<()> {
     written
 }
 
-/// Record that a pass left the view `name` as it stood, not re-laid onto `build`, at `now`:
-/// `since` kept from a standing entry, `checked` this pass's. Best-effort: a view whose
-/// record cannot be written is laid by the next pass that finds it quiet.
+/// Record that a pass left the view `name` as it stood, not re-laid onto `build`, at `now`.
 pub(crate) fn note_view_left(
     layout: &Layout,
     name: &str,
@@ -666,13 +576,12 @@ pub(crate) fn note_view_left(
     let _ = write_views_left(layout, &record);
 }
 
-/// Rustup is gone, so every view left behind ends: a rustup that comes back is attached,
-/// and its view laid, by the next re-assertion (`seam::reassert`). Best-effort.
+/// Rustup is gone, so every view left behind ends.
 pub(crate) fn clear_views_left(layout: &Layout) {
     let _ = write_views_left(layout, &ViewsLeft::default());
 }
 
-/// The view `name` is as it should be — laid, current, or gone with its seam: its entry ends.
+/// The view `name` is as it should be.
 pub(crate) fn clear_view_left(layout: &Layout, name: &str) {
     let mut record = views_left(layout);
     if record.views.remove(name).is_some() {
@@ -682,7 +591,7 @@ pub(crate) fn clear_view_left(layout: &Layout, name: &str) {
 
 /// [`due_with`]'s half for the views a flip left behind: the first recorded view that is
 /// laid and unused (no lease, no process running from it) is due, keyed by its entry's
-/// `checked` stamp. Unreadable leases or process table count as in use.
+/// `checked` stamp.
 fn view_due(layout: &Layout, running: &dyn Fn() -> Option<Vec<PathBuf>>) -> Option<DueFlip> {
     let record = views_left(layout);
     for (name, left) in &record.views {
@@ -705,13 +614,7 @@ fn view_due(layout: &Layout, running: &dyn Fn() -> Option<Vec<PathBuf>>) -> Opti
     None
 }
 
-/// The re-check of a held toolchain move, as every host runs it (the window's package park,
-/// [`crate::vendor_direct::watch`]'s runner): [`due`] asked at most every [`RECHECK`]. Quiet
-/// wakes only on two looks in a row at the same record look (the same move, flip or view, at
-/// the same `checked` stamp): the gap between `targo build` and `targo test` is quiet for a
-/// second, and a rewritten stamp means a pass found the move in use. The ceiling wakes at
-/// once. One wake per record look: a pass that could not make the move leaves the stamp as
-/// it was, and is not rerun for it.
+/// The re-check of a held toolchain move, as every host runs it (the window's package park, [`crate::vendor_direct::watch`]'s runner).
 #[derive(Clone, Debug, Default)]
 pub struct Recheck {
     /// When [`Self::wake`] last looked.
@@ -724,17 +627,14 @@ pub struct Recheck {
 }
 
 impl Recheck {
-    /// Whether a look is due, without reading the store or taking a watch claim. A session
-    /// skips the rendezvous between looks with it; a refused claim is retried on the next
-    /// park slice without advancing `last`.
+    /// Whether a look is due, without reading the store or taking a watch claim.
     #[must_use]
     pub fn look_due(&self, now: std::time::Instant) -> bool {
         self.last
             .is_none_or(|at| now.saturating_duration_since(at) >= RECHECK)
     }
 
-    /// Whether to wake a pass now, `due` asked only when a look is due at `now` (a
-    /// monotonic instant).
+    /// Whether to wake a pass now, `due` asked only when a look is due at `now` (a monotonic instant).
     pub fn wake(&mut self, now: std::time::Instant, due: impl FnOnce() -> Option<DueFlip>) -> bool {
         if !self.look_due(now) {
             return false;
@@ -761,9 +661,7 @@ impl Recheck {
     }
 }
 
-/// Whether the held move that last woke this host still stands at the same record look: a
-/// scheduled pass can wait behind another host's pass that cleared or re-recorded the move,
-/// and the stale wake must not run a second update. A record read, not a process probe.
+/// Whether the held move that last woke this host still stands at the same record look.
 #[must_use]
 pub fn woken_move_still_stands(layout: &Layout, recheck: &Recheck) -> bool {
     match recheck.woke_for {
@@ -815,7 +713,6 @@ mod tests {
             wait(Some(T0), T0 + CEILING_SECS),
             Verdict::FlipAtCeiling { since: T0 }
         );
-        // A clock set back behind the record restarts the bounded wait from now.
         assert_eq!(wait(Some(T0 + 3600), T0), Verdict::Defer { since: T0 });
     }
 
@@ -847,7 +744,6 @@ mod tests {
         assert_eq!(since_of(&l, "other"), None);
         clear(&l);
         assert_eq!(read(&l), None);
-        // A record that cannot be parsed is none, never a flip held forever.
         std::fs::write(record_path(&l), b"schema = \"x\"\n").unwrap();
         assert_eq!(read(&l), None);
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -883,10 +779,8 @@ mod tests {
             probe(&l, &live, &|| Some(vec![root_exe.clone()])),
             Busy::Running { .. }
         ));
-        // A process in another build of trust is not this toolchain in use.
         let other = seed_build(&l, "trust", 9100);
         assert_eq!(probe(&l, &live, &|| Some(vec![other.clone()])), Busy::Quiet);
-        // A member's lease, read before (and without) the table.
         let lease = crate::lease::take(
             &l.prefix,
             &crate::lease::Subject::build("trust-ir", 40).unwrap(),
@@ -899,7 +793,6 @@ mod tests {
         });
         assert!(matches!(busy, Busy::Leased { .. }), "{busy:?}");
         drop(lease);
-        // The view: only once it is laid, then by lease and by process.
         let view = crate::seam::view_dir(&l, "trust");
         std::fs::create_dir_all(view.join("bin")).unwrap();
         let in_view = view.join("bin/targo");
@@ -923,9 +816,7 @@ mod tests {
     /// [`decide`] and [`Busy::is_quiet`] against the derived model `AtpkgFlipQuiet` at every
     /// reachable look: the model's `busy` maps onto a [`Busy`] (0 quiet, 1 a process running
     /// from it, 2 an unreadable table), `forced` onto revocation, and `age` onto the clock in
-    /// periods of `CEILING_SECS / Ceiling`. Exactly one of `Flip`/`Hold` is enabled at every
-    /// look and the real verdict matches it. Negative control: taking an unreadable table
-    /// for quiet disagrees at some reachable look.
+    /// periods of `CEILING_SECS / Ceiling`.
     #[test]
     fn the_flip_decision_refines_the_derived_model() {
         use aterm_models_atpkg::atpkg_flip_quiet_model;
@@ -1000,7 +891,6 @@ mod tests {
                 assert_eq!(since, T0, "the wait counts from its first deferral");
             }
         }
-        // A lease is in use exactly as a running process is.
         assert!(
             !Busy::Leased {
                 what: "trust build 1".into(),
@@ -1008,7 +898,6 @@ mod tests {
             }
             .is_quiet()
         );
-        // Negative control: an unreadable table taken for quiet.
         assert!(
             looks.iter().any(|s| {
                 let mutant = decide(
@@ -1069,8 +958,7 @@ mod tests {
     }
 
     /// [`Recheck`]: looked at once a minute; quiet wakes a pass only on two looks in a row
-    /// (a busy look between starts over), the ceiling at once, one wake per record look. A
-    /// view's look is keyed apart from the flip's, so a shared stamp cannot swallow its wake.
+    /// (a busy look between starts over), the ceiling at once, one wake per record look.
     #[test]
     fn the_recheck_wakes_on_two_quiet_looks_or_the_ceiling_once_per_look() {
         let look = |why, checked| move || Some(DueFlip { why, checked });
@@ -1102,7 +990,6 @@ mod tests {
             "a busy look between two quiet ones starts the count over"
         );
         assert!(r.wake(t1 + 3 * RECHECK, look(Due::Quiet, 2)));
-        // The view left behind by the pass that woke carries the same stamp: its own look.
         assert!(!r.wake(t1 + 4 * RECHECK, look(Due::View, 2)));
         assert!(
             r.wake(t1 + 5 * RECHECK, look(Due::View, 2)),
@@ -1122,7 +1009,6 @@ mod tests {
     fn a_quiet_look_at_one_move_is_not_the_first_of_two_at_another() {
         let look = |why, checked| move || Some(DueFlip { why, checked });
         let t0 = std::time::Instant::now();
-        // The view quiet while the flip is busy, then the flip quiet: one look at the flip.
         let mut r = Recheck::default();
         assert!(!r.wake(t0, look(Due::View, 1)));
         assert!(
@@ -1133,7 +1019,6 @@ mod tests {
             r.wake(t0 + 2 * RECHECK, look(Due::Quiet, 2)),
             "its second wakes the pass"
         );
-        // The flip quiet, then (the flip busy again) the view quiet: one look at the view.
         let mut r = Recheck::default();
         assert!(!r.wake(t0, look(Due::Quiet, 1)));
         assert!(
@@ -1141,7 +1026,6 @@ mod tests {
             "the view's first quiet look"
         );
         assert!(r.wake(t0 + 2 * RECHECK, look(Due::View, 2)));
-        // A pass held the flip again between two quiet looks: the count starts over.
         let mut r = Recheck::default();
         assert!(!r.wake(t0, look(Due::Quiet, 1)));
         assert!(

@@ -2,10 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! XTWINOPS (window manipulation) handlers: iconify/raise/lower, move and
-//! resize, maximize/fullscreen, state and size queries, and the title stack.
-//! Most operations go through the platform callback; text-area size and title
-//! reports are answered from terminal state.
+//! XTWINOPS window manipulation handlers and title stack.
 
 use std::sync::Arc;
 
@@ -26,11 +23,7 @@ const fn title_stack_targets(params: &[u16]) -> (bool, bool) {
 }
 
 impl TerminalHandler<'_> {
-    /// Handle XTWINOPS (`CSI Ps ; Ps ; Ps t`). A [`WindowOpsCapability`] is
-    /// minted once per dispatch (a matching policy rule wins over
-    /// `allow_window_ops`); without one, manipulation and reports are
-    /// unreachable. `response_cap` separately gates the replies. The title stack
-    /// (22/23 t) needs no capability. See [`super::window_auth`].
+    /// Handle XTWINOPS (`CSI Ps ; Ps ; Ps t`) ([`WindowOpsCapability`], [`super::window_auth`]).
     pub(super) fn handle_xtwinops(&mut self, response_cap: &ResponseCapability, params: &[u16]) {
         let ps = params.first().copied().unwrap_or(0);
         let mint_authority = WindowMintAuthority::new();
@@ -46,9 +39,6 @@ impl TerminalHandler<'_> {
                 }
             }
             None => {
-                // No capability: drop 1-21 (manipulation, geometry queries, title
-                // reports), which change host window state or leak data for
-                // fingerprinting. The title stack touches neither the callback
                 // nor the PTY.
                 if let 1..=21 = ps {
                     return;
@@ -58,16 +48,13 @@ impl TerminalHandler<'_> {
         self.handle_window_title_stack(ps, params);
     }
 
-    /// Minimum window size in pixels for resize operations, so a remote program
-    /// cannot shrink the window to something unusable.
+    /// Minimum window size in pixels for resize operations.
     const MIN_RESIZE_PIXELS: u16 = 200;
 
     /// Minimum window size in cells for resize operations.
     const MIN_RESIZE_CELLS: u16 = 10;
 
-    /// Dispatch XTWINOPS state/geometry subcommands (1-10). Reached only with a
-    /// minted [`WindowOpsCapability`], which every `invoke_window_callback`
-    /// call requires, so a new subcommand cannot skip the authorization.
+    /// Dispatch XTWINOPS state/geometry subcommands (1-10) ([`WindowOpsCapability`]).
     fn handle_window_state_or_geometry(
         &mut self,
         ps: u16,
@@ -82,11 +69,8 @@ impl TerminalHandler<'_> {
                 self.invoke_window_callback(WindowOperation::Iconify, cap);
             }
 
-            // Move is ignored: a remote program could push the window
-            // off-screen to hide it.
             3 => {}
 
-            // Window resize (pixels) — clamp to safe minimum
             4 => {
                 let height = params
                     .get(1)
@@ -113,7 +97,6 @@ impl TerminalHandler<'_> {
                 self.invoke_window_callback(WindowOperation::RefreshWindow, cap);
             }
 
-            // Window resize (cells) — clamp to safe minimum
             8 => {
                 let rows = params
                     .get(1)
@@ -145,20 +128,7 @@ impl TerminalHandler<'_> {
         true
     }
 
-    /// Dispatch XTWINOPS reports (11-21); `response_cap` gates the replies.
-    ///
-    /// A report needs a synchronous value, and the GUI's window callback declines
-    /// every report (its window ops post an async wake), so the engine answers
-    /// from state it holds when the callback does not:
-    /// - `18 t` (text area in cells): the grid.
-    /// - `14 t` (text area in pixels) and `16 t` (cell in pixels): the grid and
-    ///   the cell box from [`super::Terminal::set_cell_pixel_size`]; silent until
-    ///   reported.
-    /// - `20 t` / `21 t`: the engine's icon label and window title.
-    ///
-    /// The rest have no in-core answer: `11 t` state, `13 t` position, `14 ; 2 t`
-    /// whole-window pixels, `15 t` / `19 t` screen size. An unanswered query lets
-    /// an app fall back; a fabricated number cannot be told from a real one.
+    /// Dispatch XTWINOPS reports (11-21); `response_cap` gates replies.
     fn handle_window_reports(
         &mut self,
         response_cap: &ResponseCapability,
@@ -230,7 +200,6 @@ impl TerminalHandler<'_> {
         if let Some(WindowResponse::WindowState(iconified)) =
             self.invoke_window_callback(WindowOperation::ReportWindowState, cap)
         {
-            // CSI 1 t = not iconified, CSI 2 t = iconified
             let response = format!("\x1b[{}t", if iconified { 2 } else { 1 });
             self.send_response(response_cap, response.as_bytes());
         }
@@ -248,17 +217,12 @@ impl TerminalHandler<'_> {
             WindowOperation::ReportWindowPosition
         };
         if let Some(WindowResponse::Position { x, y }) = self.invoke_window_callback(op, cap) {
-            // CSI 3 ; x ; y t
             let response = format!("\x1b[3;{x};{y}t");
             self.send_response(response_cap, response.as_bytes());
         }
     }
 
     /// CSI 14 t (text area, pixels) and CSI 14 ; 2 t (whole window, pixels).
-    /// The host answers first; when it declines (the norm), the text-area arm
-    /// answers `rows x cols` of the host-reported cell box. The `; 2` arm has no
-    /// in-core answer (window padding and decoration are unknown) and stays
-    /// silent.
     fn report_window_size_pixels(
         &mut self,
         response_cap: &ResponseCapability,
@@ -276,16 +240,12 @@ impl TerminalHandler<'_> {
             self.text_area_pixels(cap)
         };
         if let Some((height, width)) = size {
-            // CSI 4 ; height ; width t
             let response = format!("\x1b[4;{height};{width}t");
             self.send_response(response_cap, response.as_bytes());
         }
     }
 
-    /// The text area in pixels as `(height, width)`: the host's answer if any,
-    /// else the grid times the host-reported cell box, else `None`. Shared by
-    /// CSI 14 t and XTSMGRAPHICS's sixel geometry, both under the window-ops
-    /// capability.
+    /// The text area in pixels as `(height, width)`.
     #[inline]
     pub(super) fn text_area_pixels(&mut self, cap: &WindowOpsCapability) -> Option<(u32, u32)> {
         match self.invoke_window_callback(WindowOperation::ReportTextAreaSizePixels, cap) {
@@ -296,8 +256,7 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// The text area in pixels, or `None` while no host has reported a cell
-    /// box. `u32` because a `u16` grid times a `u16` cell does not fit `u16`.
+    /// The text area in pixels, or `None` while no host has reported a cell box.
     #[inline]
     fn text_area_size_pixels(&self) -> Option<(u32, u32)> {
         let (cell_w, cell_h) = self.iterm2.host_cell_px()?;
@@ -315,16 +274,12 @@ impl TerminalHandler<'_> {
         if let Some(WindowResponse::SizePixels { height, width }) =
             self.invoke_window_callback(WindowOperation::ReportScreenSizePixels, cap)
         {
-            // CSI 5 ; height ; width t
             let response = format!("\x1b[5;{height};{width}t");
             self.send_response(response_cap, response.as_bytes());
         }
     }
 
-    /// CSI 16 t: one cell in pixels (image-capable TUIs size pictures with it),
-    /// from the cell box the host reported via
-    /// [`super::Terminal::set_cell_pixel_size`]. Silent until then: the engine's
-    /// 8x16 placeholder (for inline-image footprints) is not a measurement.
+    /// CSI 16 t: report cell size in pixels ([`super::Terminal::set_cell_pixel_size`]).
     fn report_cell_size_pixels(
         &mut self,
         response_cap: &ResponseCapability,
@@ -335,7 +290,6 @@ impl TerminalHandler<'_> {
             _ => self.iterm2.host_cell_px().map(|(w, h)| (h, w)),
         };
         if let Some((height, width)) = size {
-            // CSI 6 ; height ; width t
             let response = format!("\x1b[6;{height};{width}t");
             self.send_response(response_cap, response.as_bytes());
         }
@@ -356,7 +310,6 @@ impl TerminalHandler<'_> {
         if let Some(WindowResponse::SizeCells { rows, cols }) =
             self.invoke_window_callback(WindowOperation::ReportScreenSizeCells, cap)
         {
-            // CSI 9 ; rows ; cols t
             let response = format!("\x1b[9;{rows};{cols}t");
             self.send_response(response_cap, response.as_bytes());
         }
@@ -368,7 +321,6 @@ impl TerminalHandler<'_> {
             _ => self.title.icon.to_string(),
         };
         let label = Self::filter_title_for_report(&label);
-        // OSC L label ST
         let response = format!("\x1b]L{label}\x1b\\");
         self.send_response(response_cap, response.as_bytes());
     }
@@ -383,18 +335,11 @@ impl TerminalHandler<'_> {
             _ => self.title.window.to_string(),
         };
         let title = Self::filter_title_for_report(&title);
-        // OSC l title ST
         let response = format!("\x1b]l{title}\x1b\\");
         self.send_response(response_cap, response.as_bytes());
     }
 
-    /// Invoke the window callback if set, returning the response if any.
-    ///
-    /// `_cap` is a zero-sized proof that the caller minted a capability via
-    /// [`super::window_auth::WindowMintAuthority::try_mint_with_engine`]; its
-    /// constructor is `pub(super)` and its seal private, so reaching this
-    /// function implies the host authorized window operations. Taken by
-    /// reference so one capability covers several calls in one dispatch.
+    /// Invoke the window callback if set ([`super::window_auth::WindowMintAuthority`]).
     #[inline]
     pub(super) fn invoke_window_callback(
         &mut self,
@@ -408,8 +353,7 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Push current title(s) onto the title stack (`Arc<str>` clones, no
-    /// allocation); a slot the push does not name is left unsaved (`None`).
+    /// Push current title(s) onto the title stack (`Arc<str>` clones, no allocation).
     #[inline]
     fn push_title(&mut self, icon: bool, window: bool) {
         if self.title.stack.len() >= TITLE_STACK_MAX_DEPTH {
@@ -420,12 +364,7 @@ impl TerminalHandler<'_> {
         self.title.stack.push((icon_title, window_title));
     }
 
-    /// Pop title(s) from the title stack and restore them, re-capped at
-    /// [`super::MAX_TITLE_BYTES`]. As in xterm (`xtermPopTitle`'s `TryHigher`), a
-    /// slot the popped entry did not save takes the nearest older entry's, which
-    /// stays on the stack: vim pushes window then icon and pops in the same order,
-    /// and gets the window title back from the older entry. A saved empty title
-    /// is restored like any other.
+    /// Pop title(s) from the title stack and restore them, re-capped at [`super::MAX_TITLE_BYTES`].
     fn pop_title(&mut self, icon: bool, window: bool) {
         if let Some((icon_title, window_title)) = self.title.stack.pop() {
             let older = |slot: fn(&super::grouped_state::TitleStackEntry) -> &Option<Arc<str>>| {
@@ -448,8 +387,6 @@ impl TerminalHandler<'_> {
                 } else {
                     window_title
                 };
-                // Bump the title epoch only on a real change (as set_title does),
-                // so hosts polling `title_epoch()` see the restored title.
                 if *self.title.window != *capped {
                     self.title
                         .epoch
@@ -460,8 +397,7 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Filter a title for reporting: strip control characters (ESC included)
-    /// against title injection.
+    /// Filter a title for reporting: strip control characters against title injection.
     #[inline]
     fn filter_title_for_report(title: &str) -> String {
         title.chars().filter(|c| !c.is_control()).collect()
@@ -470,9 +406,9 @@ impl TerminalHandler<'_> {
 
 #[cfg(test)]
 mod tests {
+
     //! Tests for the `allow_window_ops` gate in XTWINOPS, feeding CSI sequences
     //! to `Terminal::process` and inspecting `take_response()`.
-
     use crate::terminal::Terminal;
     use aterm_policy::engine::PolicyEngine;
     use aterm_policy::{OriginTag, Policy, Response, profiles};
@@ -492,7 +428,6 @@ mod tests {
     fn csi_21t_title_report_suppressed_when_window_ops_disabled() {
         for query in [b"\x1b[21t".as_slice(), b"\x1b[20t".as_slice()] {
             let mut term = Terminal::new(24, 80);
-            // Default is false, but set explicitly to document the invariant.
             term.modes_mut().allow_window_ops = false;
             term.set_title("secret-title");
 
@@ -517,7 +452,6 @@ mod tests {
         let response = term
             .take_response()
             .expect("CSI 21 t should emit a response when allow_window_ops is true");
-        // Response format: OSC l <title> ST  (ESC ] l title ESC \)
         let as_str = std::str::from_utf8(&response).expect("response is valid UTF-8");
         assert!(
             as_str.contains("allowed-title"),
@@ -537,9 +471,7 @@ mod tests {
         term.modes_mut().allow_window_ops = false;
         term.set_title("original-title");
 
-        // Push current title onto the stack.
         term.process(b"\x1b[22t");
-        // Change title, then pop — the pop should restore "original-title".
         term.set_title("replaced-title");
         term.process(b"\x1b[23t");
 
@@ -558,10 +490,6 @@ mod tests {
     /// `title_epoch()`, as set_title and OSC 0/2 do.
     #[test]
     fn a_title_pushed_and_popped_slot_by_slot_comes_back() {
-        // vim pushes the window title then the icon name (22;2t 22;1t) and pops in
-        // the same order (23;2t 23;1t), not LIFO; with `:set title` it also pops,
-        // re-pushes and pops again on exit. As in xterm, a pop's unsaved slot takes
-        // the nearest older entry's, so the tab gets its own title back.
         for (before, vim) in [
             (
                 "orig",
@@ -572,7 +500,6 @@ mod tests {
                 b"\x1b[22;2t\x1b[22;1t\x1b]2;file.txt - VIM\x07\x1b]2;Thanks for flying Vim\x07\
                   \x1b[23;2t\x1b[23;1t\x1b[22;2t\x1b[22;1t\x1b[23;2t\x1b[23;1t",
             ),
-            // A saved empty title (a tab labelled by its cwd) is restored too.
             ("", b"\x1b[22t\x1b]2;prog\x07\x1b[23t"),
         ] {
             let mut term = Terminal::new(24, 80);
@@ -585,10 +512,8 @@ mod tests {
     #[test]
     fn csi_23t_title_pop_bumps_epoch_on_window_change() {
         let mut term = Terminal::new(24, 80);
-        // OSC 2 set window title "foo".
         term.process(b"\x1b]2;foo\x07");
         let after_foo = term.title_epoch();
-        // Push the current title, then set a different one.
         term.process(b"\x1b[22t");
         term.process(b"\x1b]2;bar\x07");
         let after_bar = term.title_epoch();
@@ -596,7 +521,6 @@ mod tests {
             after_bar > after_foo,
             "setting a fresh title should have advanced the epoch"
         );
-        // Pop: window title goes back to "foo" — a real change, so the epoch bumps.
         term.process(b"\x1b[23t");
         assert_eq!(
             term.title(),
@@ -646,10 +570,6 @@ mod tests {
             "CSI 21 t policy rule must not accidentally authorize CSI 20 t"
         );
     }
-
-    // XTWINOPS pixel reports (14t/16t), which image-capable TUIs ask before
-    // sizing a picture: the GUI host declines callback reports, so these answer
-    // from the grid and the host's cell box, and stay silent without one.
 
     /// A window with `allow_window_ops` alone — no window callback, exactly
     /// the shape of a real GUI session, whose callback declines reports.
@@ -701,7 +621,6 @@ mod tests {
     fn the_pixel_reports_stay_silent_when_no_host_has_measured_a_cell() {
         for query in [b"\x1b[14t".as_slice(), b"\x1b[16t".as_slice()] {
             let mut term = windowed_term(24, 80);
-            // Deliberately not calling set_cell_pixel_size.
             term.process(query);
             assert_eq!(
                 response_string(&mut term),
@@ -709,8 +628,6 @@ mod tests {
                 "{query:?} must not pass the 8x16 placeholder off as a measurement"
             );
         }
-        // Negative control: the same queries do answer once a host measures,
-        // so the silence above is the missing metric and not a dead path.
         let mut term = windowed_term(24, 80);
         term.set_cell_pixel_size(8, 16);
         term.process(b"\x1b[16t");
@@ -718,7 +635,7 @@ mod tests {
     }
 
     /// A zero axis is not a cell box any font could have, and reporting one
-    /// invites a divide-by-zero in the application. Treated as unmeasured.
+    /// invites a divide-by-zero in the application.
     #[test]
     fn a_zero_axis_cell_box_is_not_a_measurement() {
         let mut term = windowed_term(24, 80);

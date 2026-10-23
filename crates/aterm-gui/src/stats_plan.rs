@@ -1,58 +1,45 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE STATS DECK'S PLANNER (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §2–§4
-//! and §5.5): which form a window's deck takes, and where every column of
-//! either form goes. It is pure and never sees a reading. The form is a
-//! function of the window's height (§2.2); the columns are a function of the
-//! deck's width and the chrome face's advances ([`FaceMetrics`]), so a calm
-//! machine and a troubled one lay out the same cells.
-//!
-//! Every length here is in points. The width is floored on entry and every
-//! column edge is a whole point, so at 1× and 2× each edge falls on a device
-//! pixel. The reference for these tables was the planner of the throwaway
-//! mockup generator (§17); its golden numbers are this module's tests.
-
+//! Layout planner for the stats deck (`DeckForm`, column coordinates, core cluster modes, and header key placement).
 use aterm_render::font::Font;
 
 use crate::stats_deck::{FOLDED_PT, FULL_TABLE_PT};
 use crate::stats_paint::Bar;
 use crate::tray_raster::UnicodeChars;
 
-/// The deck's two forms (§2.1).
+/// Stats deck layout form.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) enum DeckForm {
-    /// Two blocks of four rows in 62 pt, the deck's old height (§4).
+    /// Two blocks of four rows in 62 pt.
     #[default]
     Folded,
-    /// The header line and the seven rows, in 62 pt plus Δ (§3).
+    /// Header line and seven rows in full height.
     Full,
 }
 
-/// `[sys] stats_deck_size`: a forced form, or `Auto` for the window's height
-/// to choose it (§2.2).
+/// Configured `[sys] stats_deck_size` preference.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) enum DeckSizePref {
-    /// Full on a tall window, Folded on a short one.
+    /// Choose `Full` or `Folded` from the window height.
     #[default]
     Auto,
-    /// Always Full.
+    /// Always use `Full`.
     Full,
-    /// Always Folded.
+    /// Always use `Folded`.
     Folded,
 }
 
 impl DeckSizePref {
-    /// Every choice, in the menu's order.
+    /// All preferences in menu order.
     pub(crate) const ALL: [Self; 3] = [Self::Auto, Self::Full, Self::Folded];
 
-    /// Parse the config value: `"auto"` (default), `"full"`, `"folded"`.
-    /// Unknown values read as the default.
+    /// Parses `[sys] stats_deck_size`, defaulting to `Auto`.
     pub(crate) fn parse(value: Option<&str>) -> Self {
         value.and_then(Self::from_word).unwrap_or_default()
     }
 
-    /// The config word for this choice.
+    /// Returns the config string for this preference.
     pub(crate) const fn word(self) -> &'static str {
         match self {
             Self::Auto => "auto",
@@ -61,7 +48,7 @@ impl DeckSizePref {
         }
     }
 
-    /// The choice's name in a menu.
+    /// Returns the menu title for this preference.
     pub(crate) const fn title(self) -> &'static str {
         match self {
             Self::Auto => "Automatic",
@@ -70,7 +57,7 @@ impl DeckSizePref {
         }
     }
 
-    /// The choice a config word names, or `None` for a word that is not one.
+    /// Parses a strict config word into a [`DeckSizePref`].
     pub(crate) fn from_word(word: &str) -> Option<Self> {
         let word = word.trim();
         Self::ALL
@@ -85,9 +72,7 @@ const FULL_FROM_AVAIL: f64 = 870.0;
 /// one line does not flap between the forms.
 const FULL_DOWN_TO_AVAIL: f64 = 850.0;
 
-/// The deck's form for a window whose grid would be `avail_pt` tall under
-/// the Folded deck ([`avail_pt`]), which was `prev` before (§2.2). It reads
-/// the window and the setting, never a reading.
+/// Chooses the [`DeckForm`] for `avail_pt` with hysteresis from `prev`.
 pub(crate) fn deck_form_for(avail_pt: f64, prev: DeckForm, pref: DeckSizePref) -> DeckForm {
     match pref {
         DeckSizePref::Full => DeckForm::Full,
@@ -106,9 +91,7 @@ pub(crate) fn deck_form_for(avail_pt: f64, prev: DeckForm, pref: DeckSizePref) -
     }
 }
 
-/// The grid's height in points under the Folded deck, for a frame
-/// `frame_h_px` tall with a `titlebar_px` titlebar at `scale` (§2.2). It
-/// depends on the window alone, never on the form it picks.
+/// Computes the available grid height in points under the folded deck.
 pub(crate) fn avail_pt(frame_h_px: f64, titlebar_px: f64, scale: f64) -> f64 {
     if !(scale.is_finite() && scale > 0.0) {
         return 0.0;
@@ -116,10 +99,7 @@ pub(crate) fn avail_pt(frame_h_px: f64, titlebar_px: f64, scale: f64) -> f64 {
     (frame_h_px - titlebar_px - (FOLDED_PT * scale).round()) / scale
 }
 
-/// What Full adds to the Folded height in device pixels at `scale` (§2.1):
-/// the 38 pt between the two tables, rounded to device pixels and then up
-/// to whole terminal cells of `cell_px`, so a change of form moves the grid
-/// by whole rows and leaves its bottom remainder alone.
+/// Returns the extra height in device pixels required by the full deck.
 pub(crate) fn full_delta_px(scale: f64, cell_px: usize) -> usize {
     if !(scale.is_finite() && scale > 0.0) {
         return 0;
@@ -130,9 +110,7 @@ pub(crate) fn full_delta_px(scale: f64, cell_px: usize) -> usize {
 }
 
 /// The chars a [`FaceMetrics`] table holds, in char order: printable ASCII
-/// and the punctuation the deck's text uses (§10). That covers the fixed
-/// labels and digits and also the words rule F measures (tab labels, cluster
-/// names, amounts).
+/// and the punctuation the deck's text uses (§10).
 fn deck_glyphs() -> impl Iterator<Item = char> {
     (' '..='~').chain(['·', '×', '–', '’', '…'])
 }
@@ -144,8 +122,7 @@ const HELVETICA_NEUE_UPEM: f64 = 1000.0;
 /// Helvetica Neue's advances in font units, `(char, regular, Medium)`: the
 /// macOS chrome's `TextFace::Ui` and `TextFace::UiBold`
 /// (`/System/Library/Fonts/HelveticaNeue.ttc` faces 0 and 10), for every
-/// char of [`deck_glyphs`]. Printed by `print_the_helvetica_neue_table`, an
-/// ignored macOS test, so the planner's goldens hold on every host.
+/// char of [`deck_glyphs`].
 #[cfg(test)]
 const HELVETICA_NEUE: [(char, u16, u16); 100] = [
     (' ', 278, 278),
@@ -250,12 +227,7 @@ const HELVETICA_NEUE: [(char, u16, u16); 100] = [
     ('…', 1000, 1000),
 ];
 
-/// All the planner knows of a face: each glyph's advance at 1 em in the
-/// chrome's UI face and in its bold (`TextFace::Ui`, `TextFace::UiBold`). A
-/// width is the sum of its chars' advances, as the reference planner
-/// measured, plus, for the installed UI faces ([`Self::of_faces`]), the
-/// pen's kerning and tracking: what the pen draws, so a clause's end is
-/// where the pen stops and the separator after it sits where it was planned.
+/// Glyph advance and kerning metrics for the chrome UI regular and bold faces.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct FaceMetrics {
     /// `(char, regular, bold)` advances per em, in char order.
@@ -288,8 +260,7 @@ impl FaceMetrics {
         }
     }
 
-    /// Helvetica Neue, the macOS chrome's face, from its embedded table: the
-    /// face the spec's golden numbers are measured in.
+    /// Returns embedded metrics for macOS Helvetica Neue.
     #[cfg(test)]
     pub(crate) fn helvetica_neue() -> Self {
         Self::from_rows(HELVETICA_NEUE.iter().map(|&(ch, regular, bold)| {
@@ -301,14 +272,9 @@ impl FaceMetrics {
         }))
     }
 
-    /// The installed UI faces as the pen draws them
-    /// (`tray_raster::Canvas::text`): each face's own advances, read through
-    /// the chrome's char-to-glyph map ([`UnicodeChars`]), its kerning between
-    /// two such chars, and the pen's tracking on each, so what is measured
-    /// is what is drawn. A char either face lacks is left out.
+    /// Extracts [`FaceMetrics`] from installed regular and bold [`Font`]s.
     pub(crate) fn of_faces(regular: &Font, bold: &Font) -> Self {
         let mut m = Self::advances_of(regular, bold);
-        // Each char's glyph in each face, looked up once for its 100 pairs.
         let glyphs: Vec<(char, u16, u16)> = m
             .advances
             .iter()
@@ -341,28 +307,20 @@ impl FaceMetrics {
         )
     }
 
-    /// The pen's placeholder: every char 0.6 em, as the rasterizer advances
-    /// with no UI face installed.
+    /// Returns placeholder metrics with 0.6 em fixed advances.
     pub(crate) fn placeholder() -> Self {
         Self::from_rows(std::iter::empty())
     }
 
-    /// The test stack's face: the embedded DejaVu Sans Mono that the chrome
-    /// draws in where no UI face is installed, as in unit tests
-    /// (`tray_raster`'s `ChromeFonts`). It has no bold, so both weights are
-    /// its regular.
+    /// Returns metrics for the embedded DejaVu Sans Mono test font.
     #[cfg(test)]
     pub(crate) fn test_stack() -> Self {
         let (_, face) = aterm_render::shared_parsed_face(aterm_render::embedded_font(), 0)
             .expect("the embedded DejaVu Sans Mono parses");
-        // With no UI face installed the pen draws these through its fallback,
-        // which neither kerns nor tracks.
         Self::advances_of(&face, &face)
     }
 
-    /// The advance of `s` at `pt`, in its regular or bold face: each char's
-    /// advance, with the pen's tracking on and kerning between the chars the
-    /// table has.
+    /// Measures the advance width of `s` at `pt` in regular or bold.
     pub(crate) fn width(&self, s: &str, pt: f64, bold: bool) -> f64 {
         let mut em = 0.0;
         let mut prev: Option<char> = None;
@@ -403,9 +361,7 @@ impl FaceMetrics {
             )
     }
 
-    /// Rule F (§6.0): the first of `forms` whose advance fits `room`, else
-    /// the last form cut with "…", or nothing when not even its first char
-    /// and "…" fit.
+    /// Returns the first candidate in `forms` that fits `room`, or truncates the last with `…`.
     pub(crate) fn fit(&self, forms: &[&str], room: f64, pt: f64, bold: bool) -> String {
         if let Some(form) = forms
             .iter()
@@ -505,7 +461,7 @@ fn whole_width(w_pt: f64) -> f64 {
     }
 }
 
-/// A column: its left edge and its width, in pt.
+/// Horizontal column span in points.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Col {
     pub(crate) x: f64,
@@ -517,7 +473,7 @@ impl Col {
         Self { x, w }
     }
 
-    /// Its right edge.
+    /// Right edge (`x + w`) in points.
     pub(crate) fn end(self) -> f64 {
         self.x + self.w
     }
@@ -534,8 +490,7 @@ impl Pen {
     }
 }
 
-/// A heat strip: `cols` cells `cell` pt wide at `pitch` pt, each one
-/// `period_s` seconds of the strip's ten minutes (§5.5).
+/// Ten-minute heat strip geometry.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Strip {
     pub(crate) x: f64,
@@ -559,7 +514,7 @@ impl Strip {
         }
     }
 
-    /// The last cell's right edge.
+    /// Right edge of the last strip cell.
     pub(crate) fn end(self) -> f64 {
         self.x + f64::from(self.cols.saturating_sub(1)) * self.pitch + self.cell
     }
@@ -570,28 +525,28 @@ impl Strip {
     }
 }
 
-/// A form's rows (§3.1, §4.1, §4.2): where each sits and how big its text is.
+/// Vertical row geometry and font sizes for a deck form.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Rows {
-    /// The header line's baseline.
+    /// Baseline of the header line.
     pub(crate) header_baseline: f64,
-    /// Row 0's cell top.
+    /// Top edge of row 0.
     pub(crate) top0: f64,
-    /// From one row's cell top to the next.
+    /// Vertical pitch between rows.
     pub(crate) pitch: f64,
-    /// A strip cell's height.
+    /// Height of a strip cell.
     pub(crate) cell: f64,
-    /// How many rows, a Cores row included.
+    /// Total number of rows.
     pub(crate) count: u32,
-    /// The text baseline below a cell's top.
+    /// Text baseline offset from a row's top.
     pub(crate) baseline: f64,
-    /// The name's size, and the %'s (both UiBold).
+    /// Font size for row names and percentages.
     pub(crate) name_pt: f64,
-    /// The amount's size.
+    /// Font size for resource amounts.
     pub(crate) amount_pt: f64,
-    /// The aterm and Tab figures' size.
+    /// Font size for `aterm` and `Tab` figures.
     pub(crate) figure_pt: f64,
-    /// The scope bar's height, centred on the cell.
+    /// Scope bar height.
     pub(crate) bar_h: f64,
 }
 
@@ -638,63 +593,57 @@ impl Rows {
         }
     }
 
-    /// Row `r`'s cell top.
+    /// Returns the top y-coordinate of row `r`.
     pub(crate) fn top(&self, r: u32) -> f64 {
         self.top0 + f64::from(r) * self.pitch
     }
 }
 
-/// The Full form's kinds, by the width they need (§3.2).
+/// Width tier for the `Full` deck form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum FullKind {
-    /// The cores block, 60 × 10 s at a pitch that grows, Details.
+    /// Cores block, 60-cell strip with variable pitch, and Details.
     Wide,
-    /// The cores block, 60 × 10 s at pitch 4, Details when it fits.
+    /// Cores block, 60-cell strip at 4 pt pitch, and optional Details.
     Mid,
-    /// A Cores row, no scope bar, the amount and both figures.
+    /// Cores row, no scope bar, amount, and both figures.
     Narrow,
-    /// A Cores row, a small scope bar and the amount.
+    /// Cores row, compact scope bar, and amount.
     Slim,
 }
 
 impl FullKind {
-    /// Every kind, widest first: the planner takes the first that fits.
+    /// All full kinds from widest to narrowest.
     pub(crate) const ALL: [Self; 4] = [Self::Wide, Self::Mid, Self::Narrow, Self::Slim];
 }
 
-/// Where the Full form's cores go (§3.4).
+/// Placement of CPU cores in the `Full` deck form.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum CoresAt {
-    /// The block left of the rows (wide, mid), and its divider's x.
+    /// Dedicated block to the left of the rows.
     Block { at: Col, divider: f64 },
-    /// The eighth row (narrow, slim): its room, from the strip's x to the
-    /// right margin.
+    /// Eighth row spanning from the strip to the right margin.
     Row(Col),
 }
 
-/// The Full form's columns (§3.2, §3.3).
+/// Column layout plan for the `Full` deck form.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct FullPlan {
-    /// The deck's width, in whole points.
+    /// Deck width in whole points.
     pub(crate) w: f64,
     pub(crate) kind: FullKind,
-    /// Too narrow for the table (under 160 pt, or where the strip itself
-    /// would cross the margin): the deck draws its ground only. The strip
-    /// crosses below W 164 on Helvetica Neue, so the floor is 4 pt above
-    /// §3.2's 160.
+    /// Whether the deck is too narrow to draw anything besides its background.
     pub(crate) ground_only: bool,
-    /// What each of the six gaps right of the strip grew by in a very wide
-    /// window (§3.3).
+    /// Extra width added to each gap right of the strip in wide windows.
     pub(crate) gap_grow: f64,
-    /// How far right the whole table moved to sit centred (§3.3). Every x
-    /// in this plan includes it.
+    /// Horizontal centering offset applied to all columns.
     pub(crate) offset: f64,
     pub(crate) rows: Rows,
     pub(crate) cores: CoresAt,
     pub(crate) name: Col,
     pub(crate) well: Col,
     pub(crate) strip: Strip,
-    /// The %, right-aligned in its column.
+    /// Right-aligned percentage column.
     pub(crate) pct: Option<Col>,
     pub(crate) bar: Option<Col>,
     pub(crate) amount: Option<Col>,
@@ -704,8 +653,7 @@ pub(crate) struct FullPlan {
 }
 
 impl FullPlan {
-    /// How the cores show for `clusters` on a deck `deck_pt` tall: the
-    /// block's squares, or the Cores row's mode (§3.4).
+    /// Chooses the [`CoresMode`] for `clusters` in a full deck of height `deck_pt`.
     pub(crate) fn cores_mode(
         &self,
         clusters: &[Cluster<'_>],
@@ -753,8 +701,7 @@ impl FullPlan {
     }
 
     /// A very wide window (§3.3): Details has `extra` pt more than its
-    /// greatest. The six gaps right of the strip grow first, then the table
-    /// is centred in what is left.
+    /// greatest.
     fn grow(&mut self, extra: f64) {
         let grow = (extra / 6.0).min(GROW_GAP_MAX).floor();
         let mut moved = 0.0;
@@ -778,9 +725,7 @@ impl FullPlan {
     }
 }
 
-/// The Full form's columns at `w_pt` (§3.2): the first of wide, mid, narrow
-/// and slim that fits, else slim with what crosses the right margin left
-/// out.
+/// Computes the [`FullPlan`] for deck width `w_pt`.
 pub(crate) fn plan_full(w_pt: f64, m: &FaceMetrics) -> FullPlan {
     let w = whole_width(w_pt);
     if let Some(plan) = FullKind::ALL
@@ -790,8 +735,6 @@ pub(crate) fn plan_full(w_pt: f64, m: &FaceMetrics) -> FullPlan {
     {
         return plan;
     }
-    // Below slim's fit the slim plan stays (§3.2): its amount is not drawn
-    // under 40 pt, and neither is a column that would cross the margin.
     let right = w - X0;
     let (mut plan, _) = lay_full(w, FullKind::Slim, m);
     plan.amount = plan.amount.filter(|amount| amount.w >= AMOUNT_DRAWN_MIN);
@@ -891,26 +834,24 @@ fn lay_full(w: f64, kind: FullKind, m: &FaceMetrics) -> (FullPlan, bool) {
     (plan, fits)
 }
 
-/// The Folded form's block kinds (the spec's fwide, fmid, fnarrow and fslim),
-/// by the block width they need (§4.1).
+/// Width tier for each block of the `Folded` deck form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum BlockKind {
-    /// 30 × 20 s, the amount, both figures, Details when the block has room.
+    /// 30-cell strip, amount, both figures, and optional Details.
     Wide,
-    /// 20 × 30 s, a small scope bar and the amount.
+    /// 20-cell strip, compact scope bar, and amount.
     Mid,
-    /// Small cells, the amount, and a scope bar when it fits.
+    /// Compact strip, amount, and optional scope bar.
     Narrow,
-    /// The strip and the % only; the state goes in the header (§4.4).
+    /// Strip and percentage only, with state in the header.
     Slim,
 }
 
 impl BlockKind {
-    /// Every kind, widest first: the planner takes the first that fits.
+    /// All block kinds from widest to narrowest.
     pub(crate) const ALL: [Self; 4] = [Self::Wide, Self::Mid, Self::Narrow, Self::Slim];
 
-    /// The Cores row's modes, in the order it tries them before the count
-    /// alone (§4.5).
+    /// Candidate [`CoresMode`]s for the Cores row in priority order.
     pub(crate) const fn cores_ladder(self) -> &'static [CoresMode] {
         match self {
             Self::Wide | Self::Mid => &[CoresMode::Big, CoresMode::Stack, CoresMode::Tiny],
@@ -919,7 +860,7 @@ impl BlockKind {
         }
     }
 
-    /// The size of the Cores row's captions: fslim's sit in the name column.
+    /// Font size for Cores row captions.
     pub(crate) const fn cores_caption_pt(self) -> f64 {
         match self {
             Self::Slim => 9.0,
@@ -928,31 +869,29 @@ impl BlockKind {
     }
 }
 
-/// One Folded block's columns (§4.1).
+/// Column layout plan for one block of the `Folded` deck form.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct BlockPlan {
     pub(crate) kind: BlockKind,
-    /// The block: its x and its width B.
+    /// Horizontal span of the block.
     pub(crate) at: Col,
     pub(crate) rows: Rows,
     pub(crate) name: Col,
     pub(crate) well: Col,
     pub(crate) strip: Strip,
-    /// The %, right-aligned; none below fslim's fit, where it moves to the
-    /// lens.
+    /// Right-aligned percentage column, if fitted.
     pub(crate) pct: Option<Col>,
     pub(crate) bar: Option<Col>,
     pub(crate) amount: Option<Col>,
     pub(crate) aterm: Option<Col>,
     pub(crate) tab: Option<Col>,
     pub(crate) details: Option<Col>,
-    /// Block B's Cores row: its room, from the strip's x (fslim's from the
-    /// name's) to the block's end (§4.5).
+    /// Horizontal span available for Block B's Cores row.
     pub(crate) cores: Col,
 }
 
 impl BlockPlan {
-    /// How block B's Cores row shows `clusters` (§4.5).
+    /// Chooses the [`CoresMode`] for Block B's Cores row.
     pub(crate) fn cores_mode(&self, clusters: &[Cluster<'_>], m: &FaceMetrics) -> CoresMode {
         cores_row_mode(
             clusters,
@@ -965,27 +904,20 @@ impl BlockPlan {
     }
 }
 
-/// The Folded form's columns (§4.1).
+/// Column layout plan for the `Folded` deck form.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct FoldedPlan {
-    /// The deck's width, in whole points.
+    /// Deck width in whole points.
     pub(crate) w: f64,
-    /// Too narrow for the table, where a block's strip would cross the
-    /// block's end: the deck draws its ground only. That is below W 285 on
-    /// Helvetica Neue, although §4.1 keeps name, well and strip everywhere
-    /// below W 345: under 285 the 10-minute strip does not fit the block,
-    /// and at W 160 the block (53 pt) does not hold the name and well.
+    /// Whether the deck is too narrow to draw anything besides its background.
     pub(crate) ground_only: bool,
-    /// The divider's x, mid-way between the blocks.
+    /// X-coordinate of the vertical divider between the two blocks.
     pub(crate) divider: f64,
-    /// Block A (CPU, GPU, Memory, Disk) and block B (Network, Tokens,
-    /// Processes, Cores).
+    /// Layout plans for Block A and Block B.
     pub(crate) blocks: [BlockPlan; 2],
 }
 
-/// The Folded form's columns at `w_pt` (§4.1): two blocks of one kind, the
-/// first of fwide, fmid, fnarrow and fslim that fits their width, capped
-/// and centred in a very wide deck.
+/// Computes the [`FoldedPlan`] for deck width `w_pt`.
 pub(crate) fn plan_folded(w_pt: f64, m: &FaceMetrics) -> FoldedPlan {
     let w = whole_width(w_pt);
     let mut b = ((w - 2.0 * X0 - BLOCK_GUTTER) / 2.0).floor().max(0.0);
@@ -1000,9 +932,6 @@ pub(crate) fn plan_folded(w_pt: f64, m: &FaceMetrics) -> FoldedPlan {
     let block = |x: f64| match kind {
         Some(kind) => lay_block(x, b, kind, m).0,
         None => {
-            // Below fslim's fit each block keeps its name, well and strip;
-            // the % moves to the lens (§4.1). Where the strip itself would
-            // cross the block, the deck is ground only (below).
             let (mut plan, _) = lay_block(x, b, BlockKind::Slim, m);
             plan.pct = None;
             plan
@@ -1091,22 +1020,19 @@ fn lay_block(x: f64, b: f64, kind: BlockKind, m: &FaceMetrics) -> (BlockPlan, bo
     (plan, fits)
 }
 
-/// The widths each kind starts at on a face (§3.2's and §4.1's tables).
+/// Minimum widths at which each full and folded kind fits on a face.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Breakpoints {
-    /// The least W each Full kind fits, in [`FullKind::ALL`]'s order.
+    /// Minimum deck widths for [`FullKind::ALL`].
     pub(crate) full: [f64; 4],
-    /// The least block width B each Folded kind fits, in
-    /// [`BlockKind::ALL`]'s order...
+    /// Minimum block widths for [`BlockKind::ALL`].
     pub(crate) block: [f64; 4],
-    /// ...and the least W that gives it, `2B + 53`.
+    /// Minimum deck widths (`2B + 53`) for [`BlockKind::ALL`].
     pub(crate) folded: [f64; 4],
 }
 
-/// Where each kind starts on `m`'s face: a scan of whole points, so it holds
-/// whatever the face does to the name columns. A kind that never fits under
-/// 8192 pt answers infinity.
+/// Scans whole-point widths to find the [`Breakpoints`] for `m`.
 #[cfg(test)]
 pub(crate) fn breakpoints(m: &FaceMetrics) -> Breakpoints {
     let first = |fits: &dyn Fn(f64) -> bool| {
@@ -1129,42 +1055,32 @@ pub(crate) fn breakpoints(m: &FaceMetrics) -> Breakpoints {
 const CORES_CAPTION_PT: f64 = 9.5;
 
 /// The cores block's square sizes, `(pitch, square)`, largest first (§3.4).
-/// The last is the Cores row's tiny square, which §3.4's four block sizes
-/// lack: without it 142 of T-G3's 625 machines (four named clusters from 50
-/// cores, three from 74, two from 121) would lose their grid on the
-/// shortest Full deck.
 const CORES_BLOCK_SIZES: [(f64, f64); 5] =
     [(11.0, 9.0), (9.0, 7.0), (7.0, 5.5), (5.5, 4.0), (2.5, 2.0)];
 
-/// The cores' words before the OS's topology is read, longest first. The
-/// cluster list is empty then, and unknown is never zero (§5.1), so no form
-/// says "0 cores".
+/// The cores' words before the OS's topology is read, longest first.
 const CORES_NOT_READ: [&str; 2] = ["cores not read", "not read"];
 
-/// One cluster of cores as the OS names it, fastest first (`ClusterView`'s
-/// order).
+/// CPU core cluster in OS performance order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Cluster<'a> {
     pub(crate) count: usize,
-    /// The OS's name ("Performance"); none where the OS names none (Linux).
+    /// Cluster name (`"Performance"`), or `None` when unnamed.
     pub(crate) name: Option<&'a str>,
 }
 
-/// How the cores show (§3.4, §4.5).
+/// Display mode for CPU cores.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum CoresMode {
-    /// The Full block (wide, mid): squares `sq` pt at `pitch` pt, `per_row`
-    /// to a row, each cluster under its caption.
+    /// Grid of squares in the dedicated full-deck cores block.
     Block { pitch: f64, sq: f64, per_row: u32 },
-    /// One row of cell-high squares at 10 pt pitch.
+    /// Single row of cell-high squares at 10 pt pitch.
     Big,
-    /// Two rows of squares `(cell − 0.5) / 2` tall, 0.5 pt apart.
+    /// Two stacked rows of half-height squares.
     Stack,
-    /// Three rows of 2 pt squares at 2.5 pt pitch.
+    /// Three stacked rows of 2 pt squares at 2.5 pt pitch.
     Tiny,
-    /// No squares. A row says the count in words, rule F cutting it to the
-    /// total ("128 cores"); the block keeps its title, which counts them.
-    /// Cores not yet read take this mode everywhere, and the words say so.
+    /// Text-only core count when no square layout fits.
     CountOnly,
 }
 
@@ -1185,10 +1101,7 @@ fn total_cores(clusters: &[Cluster<'_>]) -> usize {
     clusters.iter().map(|c| c.count).sum()
 }
 
-/// The Full block's squares on a deck `deck_pt` tall: the first size whose
-/// stack ends by `deck_pt − 6`, else the title's count alone (§3.4). On the
-/// shortest Full deck every machine of 4 to 128 cores in 1 to 4 clusters
-/// keeps a grid.
+/// Chooses the [`CoresMode`] for the full-deck cores block at height `deck_pt`.
 pub(crate) fn cores_block_mode(clusters: &[Cluster<'_>], deck_pt: f64) -> CoresMode {
     if total_cores(clusters) == 0 {
         return CoresMode::CountOnly;
@@ -1200,27 +1113,24 @@ pub(crate) fn cores_block_mode(clusters: &[Cluster<'_>], deck_pt: f64) -> CoresM
         .unwrap_or(CoresMode::CountOnly)
 }
 
-/// A named cluster's caption in the cores block (§3.4).
+/// Formatted count and name caption for a cluster in the cores block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CoresCaption {
-    /// The count and its space, in UiBold words ink: "12 ".
+    /// Core count with trailing space in bold.
     pub(crate) count: String,
-    /// The OS's name in words2, cut by rule F where the caption would pass
-    /// the block's 68 pt ("128 Performance" is 73 pt on Helvetica Neue).
+    /// Cluster name truncated to fit the 68 pt block width.
     pub(crate) name: String,
 }
 
 impl CoresCaption {
-    /// The caption's advance.
+    /// Returns the advance width of the caption.
     #[cfg(test)]
     pub(crate) fn width(&self, m: &FaceMetrics) -> f64 {
         m.width(&self.count, CORES_CAPTION_PT, true) + m.width(&self.name, CORES_CAPTION_PT, false)
     }
 }
 
-/// `cluster`'s caption in the cores block, whole count first and the name
-/// cut to what is left of the block (§3.4, rule F); none where the OS names
-/// no clusters.
+/// Formats `cluster`'s caption for the 68 pt cores block, or `None` if unnamed.
 pub(crate) fn cores_block_caption(cluster: &Cluster<'_>, m: &FaceMetrics) -> Option<CoresCaption> {
     let name = cluster.name?;
     let count = format!("{} ", cluster.count);
@@ -1229,9 +1139,7 @@ pub(crate) fn cores_block_caption(cluster: &Cluster<'_>, m: &FaceMetrics) -> Opt
     Some(CoresCaption { count, name })
 }
 
-/// Where the block's last squares end: from row 0's top, each cluster is a
-/// caption at `y + 8` when the OS names it, its squares from `y + 11` (from
-/// `y + 1` with no caption), and 4 pt of air (§3.4).
+/// Returns the bottom y-coordinate of the last square in the cores block.
 pub(crate) fn cores_block_bottom(clusters: &[Cluster<'_>], mode: CoresMode) -> f64 {
     let top = Rows::full(FullKind::Wide).top0;
     let CoresMode::Block { pitch, sq, per_row } = mode else {
@@ -1248,10 +1156,7 @@ pub(crate) fn cores_block_bottom(clusters: &[Cluster<'_>], mode: CoresMode) -> f
     bottom
 }
 
-/// The width a Cores row takes in `mode` (§3.4): per cluster its count
-/// (UiBold) and name at `caption_pt`, 3 pt, then its squares; 8 pt between
-/// clusters. The count alone takes its shortest words, the total; the
-/// block is not a row's mode and fits no room.
+/// Returns the width required by a Cores row in `mode`, or `f64::INFINITY` if it cannot fit.
 pub(crate) fn cores_row_width(
     clusters: &[Cluster<'_>],
     mode: CoresMode,
@@ -1290,8 +1195,7 @@ pub(crate) fn cores_row_width(
     }
 }
 
-/// A Cores row's mode in `room` pt: the first of `ladder` that fits, else
-/// the count alone (§3.4), which is also how cores not yet read show.
+/// Chooses the first [`CoresMode`] in `ladder` that fits `room`, or `CountOnly`.
 pub(crate) fn cores_row_mode(
     clusters: &[Cluster<'_>],
     room: f64,
@@ -1310,9 +1214,7 @@ pub(crate) fn cores_row_mode(
         .unwrap_or(CoresMode::CountOnly)
 }
 
-/// The cores block's title (§3.4), which counts the cores whatever their
-/// mode: "128 CPU cores", or "128 cores" where that does not fit the block.
-/// Before the topology is read it says "CPU cores not read".
+/// Formats the header title for the full-deck cores block.
 pub(crate) fn cores_block_title(clusters: &[Cluster<'_>], m: &FaceMetrics) -> String {
     let total = total_cores(clusters);
     if total == 0 {
@@ -1341,9 +1243,7 @@ fn count_words(clusters: &[Cluster<'_>]) -> String {
     }
 }
 
-/// The count-only row's words in `room` pt (§3.4): each named cluster's
-/// count ("128 cores: 64 Performance, 64 Efficiency"), else the total, cut
-/// by rule F; "cores not read" before the topology is read.
+/// Formats the text for a `CountOnly` Cores row within `room` points.
 pub(crate) fn cores_count_text(
     clusters: &[Cluster<'_>],
     room: f64,
@@ -1365,61 +1265,56 @@ pub(crate) fn cores_count_text(
     m.fit(&[&each, &total], room, caption_pt, false)
 }
 
-/// What a header label is (§3.5, §4.3, §4.4).
+/// Kind of label placed on the header line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Label {
-    /// "10 min ago" over a strip, in words2.
+    /// `"10 min ago"` over a strip.
     Time,
-    /// "now" over a % column, right-aligned at its x, in words2.
+    /// Right-aligned `"now"` over a percentage column.
     Now,
-    /// A scope's swatch, then its words: words ink before " · ", words2
-    /// after.
+    /// Scope swatch and label for `Bar`.
     Scope(Bar),
-    /// "Details", and " · point at a row for more" in words2 when it fits.
+    /// Details column header.
     Details,
-    /// fslim: the block's worst state after its mark, UiBold in the state's
-    /// ink.
+    /// Worst state summary in an `fslim` block header.
     State,
 }
 
-/// One label of the header line.
+/// Positioned label on the header line.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct HeaderLabel {
     pub(crate) label: Label,
-    /// Its left edge (a scope's swatch, a state's mark); a right edge for
-    /// [`Label::Now`].
+    /// Left edge (or right edge for [`Label::Now`]) in points.
     pub(crate) x: f64,
     pub(crate) text: String,
 }
 
-/// The header's own words, which the plan alone does not know.
+/// Dynamic text inputs for the header line.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct HeaderText<'a> {
-    /// The front tab's label ("Tab 2").
+    /// Active tab label (`"Tab 2"`).
     pub(crate) tab: &'a str,
-    /// The machine after "Global · ": "this Mac", or "this computer" off
-    /// macOS.
+    /// Machine noun after `"Global · "` (`"this Mac"` or `"this computer"`).
     pub(crate) machine: &'a str,
 }
 
-/// An fslim block's state for its header (§4.4), without the mark, which is
-/// a prim.
+/// Worst-state strings for an `fslim` block header.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StateLabel<'a> {
-    /// "<Resource> <word> +N".
+    /// Full `<Resource> <word> +N` string.
     pub(crate) full: &'a str,
-    /// "<Resource> <word>", rule F's next form.
+    /// Bare `<Resource> <word>` fallback string.
     pub(crate) bare: &'a str,
 }
 
-/// The key's items (§3.6).
+/// Legend item in the header key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KeyItem {
-    /// "cold", the seven heat swatches, "hot".
+    /// Heat ramp from `"cold"` to `"hot"`.
     Ramp,
-    /// A heat-6 cell with its over mark, "over max".
+    /// `"over max"` cell indicator.
     Over,
-    /// A hollow cell (or the baseline tick), "not read".
+    /// `"not read"` cell indicator.
     NotRead,
 }
 
@@ -1438,8 +1333,7 @@ impl KeyItem {
         }
     }
 
-    /// Its width on the header line: a 4 pt cell and 3 pt of air before its
-    /// words, or the seven swatches at 5 pt pitch between "cold" and "hot".
+    /// Returns the advance width of this key item on the header line.
     pub(crate) fn width(self, m: &FaceMetrics) -> f64 {
         let words = |s: &str| m.width(s, HEADER_PT, false);
         match self {
@@ -1450,26 +1344,26 @@ impl KeyItem {
     }
 }
 
-/// A stretch of the header line its labels leave free.
+/// Free horizontal span on the header line available for key items.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct KeySpan {
     pub(crate) x0: f64,
     pub(crate) x1: f64,
-    /// Over a strip, where the key reads best.
+    /// Whether this span lies above a heat strip.
     pub(crate) strip: bool,
 }
 
-/// Rule K's answer: where the key's items sit.
+/// Placement of legend key items across free header spans.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct KeyPlan {
-    /// The free spans, left to right.
+    /// Free header spans from left to right.
     pub(crate) spans: Vec<KeySpan>,
-    /// Each placed item and its x, left to right.
+    /// Placed key items and their x-coordinates from left to right.
     pub(crate) placed: Vec<(KeyItem, f64)>,
 }
 
 impl KeyPlan {
-    /// Whether `item` is drawn.
+    /// Returns whether `item` was placed.
     #[cfg(test)]
     pub(crate) fn has(&self, item: KeyItem) -> bool {
         self.placed.iter().any(|&(placed, _)| placed == item)
@@ -1494,16 +1388,11 @@ impl KeyScore {
     }
 }
 
-/// Rule K (§3.6): every assignment of the key's three items to the free
-/// spans (or to none) is tried, and the one placing the most weight wins,
-/// then the one with the most items over strips, then the leftmost. Items
-/// in one span draw in the order ramp, over max, not read, 10 pt apart.
+/// Assigns [`KeyItem`]s to free header `spans` to maximize priority weight.
 pub(crate) fn place_key(mut spans: Vec<KeySpan>, m: &FaceMetrics) -> KeyPlan {
     spans.sort_by(|a, b| a.x0.total_cmp(&b.x0));
     let widths = KeyItem::SEARCH.map(|item| item.width(m));
     let narrowest = widths.iter().copied().fold(f64::INFINITY, f64::min);
-    // A span too narrow for any item never takes one: leaving it out keeps
-    // the search small and changes no answer.
     let choices: Vec<Option<usize>> = std::iter::once(None)
         .chain(
             (0..spans.len())
@@ -1560,7 +1449,7 @@ pub(crate) fn place_key(mut spans: Vec<KeySpan>, m: &FaceMetrics) -> KeyPlan {
     KeyPlan { spans, placed }
 }
 
-/// The header line, its labels and its key.
+/// Complete layout plan for the header line and its legend key.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct HeaderPlan {
     pub(crate) labels: Vec<HeaderLabel>,
@@ -1649,7 +1538,7 @@ impl<'m> Header<'m> {
     }
 }
 
-/// The Full form's header line (§3.5) and its key (§3.6).
+/// Lays out the header line and key for a `Full` deck plan.
 pub(crate) fn header_full(plan: &FullPlan, text: HeaderText<'_>, m: &FaceMetrics) -> HeaderPlan {
     if plan.ground_only {
         return HeaderPlan::default();
@@ -1694,8 +1583,6 @@ pub(crate) fn header_full(plan: &FullPlan, text: HeaderText<'_>, m: &FaceMetrics
         } else {
             &[text.tab]
         };
-        // A label may run into the gap after its column, short of the
-        // next column by 8 pt (the right margin's 12 pt past the last).
         let tab_gap = plan.details.map_or(X0, |details| details.x - tab.end());
         for (col, bar, forms, gap) in [
             (aterm, Bar::Aterm, aterm_forms, tab.x - aterm.end()),
@@ -1732,9 +1619,7 @@ pub(crate) fn header_full(plan: &FullPlan, text: HeaderText<'_>, m: &FaceMetrics
     head.finish()
 }
 
-/// The Folded form's header line (§4.3, §4.4) and its key. `states` are the
-/// blocks' worst states, which only an fslim block (it has no amount) puts
-/// in its header.
+/// Lays out the header line and key for a `Folded` deck plan.
 pub(crate) fn header_folded(
     plan: &FoldedPlan,
     text: HeaderText<'_>,
@@ -1760,9 +1645,6 @@ pub(crate) fn header_folded(
                 let words = if MARK_ADVANCE + m.width(state.full, HEADER_PT, true) <= name_room {
                     state.full.to_owned()
                 } else if !a_spilled {
-                    // A long state spills into its strip's header. Only one
-                    // block's may, so the time label always has a strip:
-                    // block A's first, else block B's (§4.3).
                     strip_free = false;
                     a_spilled = i == 0;
                     m.fit(
@@ -1805,8 +1687,6 @@ pub(crate) fn header_folded(
             );
         }
     }
-    // The time label is drawn once: the blocks share one time axis. The
-    // other block's whole strip header is a key span.
     match free_strips {
         [Some(a), b] => {
             head.time(a);
@@ -1905,10 +1785,7 @@ mod tests {
         }
     }
 
-    /// T-G1, Full (§3.2, §3.3) on Helvetica Neue, at 1× and 2×. The plan
-    /// reads the width in points (`W · s` px at either scale): every edge
-    /// lands on a device pixel at both, and an odd px count at 2× plans as
-    /// the whole point under it.
+    /// T-G1, Full (§3.2, §3.3) on Helvetica Neue, at 1× and 2×.
     #[test]
     fn plan_golden_tables_full() {
         let m = hn();
@@ -1940,8 +1817,6 @@ mod tests {
                 divider: 88.0
             }
         );
-        // 2238 px at 2×: the strip's cells are 8 px at a 10 px pitch from px
-        // 334; at 1× 4 px at 5 px from px 167.
         assert_eq!([2.0, 1.0].map(|s| px(p.strip.x, s)), [334.0, 167.0]);
         assert_eq!([2.0, 1.0].map(|s| px(p.strip.cell, s)), [8.0, 4.0]);
 
@@ -1988,7 +1863,6 @@ mod tests {
         assert_eq!(p.amount, Some(Col::new(219.0, 119.0)));
         assert_eq!((p.aterm, p.tab, p.details), (None, None, None));
 
-        // §3.3: the gaps grow by up to 16, then the table is centred.
         let p = at(2560.0);
         assert_eq!((p.kind, p.strip.pitch), (FullKind::Wide, 9.0));
         assert_eq!((p.gap_grow, p.offset), (16.0, 369.0));
@@ -2068,7 +1942,6 @@ mod tests {
         );
         assert_eq!(details(&p).map(|d| d.map(|d| d.w)), [Some(560.0); 2]);
 
-        // Below fslim's fit each block keeps its name, well and strip.
         let p = at(320.0);
         assert_eq!(
             (kinds(&p), p.blocks.map(|b| b.pct)),
@@ -2152,10 +2025,6 @@ mod tests {
         assert_eq!(dejavu.block, [532.0, 323.0, 250.0, 151.0]);
         assert_eq!(dejavu.folded, [1117.0, 699.0, 553.0, 355.0]);
 
-        // Where the table starts at all: below these the strip would cross
-        // the margin (Full) or its block (Folded), and the deck is ground
-        // only. §3.2 says 160 and §4.1 keeps the strips below W 345 without
-        // a floor; the strips need 164 and 285.
         let drawn = |w: f64| {
             (
                 !plan_full(w, &hn()).ground_only,
@@ -2167,8 +2036,6 @@ mod tests {
             [(false, false), (true, false), (true, false), (true, true)]
         );
 
-        // Each breakpoint is where that kind starts: a point less plans the
-        // next kind down.
         for (m, bp) in [(&hn(), helvetica), (&stack, dejavu)] {
             for (kind, w) in FullKind::ALL.into_iter().zip(bp.full) {
                 assert_eq!(plan_full(w, m).kind, kind);
@@ -2191,8 +2058,7 @@ mod tests {
     /// §3.2, §3.3, §4.1 and §5.5 at every width from 160 to 5120 pt, on both
     /// faces: the columns keep their order inside the card (inside their
     /// block), each strip spans ten minutes in the kind's cells, and no
-    /// deck draws more than 420 cells. This is the plan's half of T-G4's
-    /// sweep and T-G9's cell bound; the text half needs the paint step.
+    /// deck draws more than 420 cells.
     #[test]
     fn every_width_plans_inside_the_card() {
         for m in [hn(), FaceMetrics::test_stack()] {
@@ -2251,10 +2117,7 @@ mod tests {
     }
 
     /// T-G5: the form is a function of the window and the setting, with a
-    /// 20 pt band of hysteresis, and Full adds whole cells. The deciding
-    /// function takes the window's avail, the form it had and the setting,
-    /// and no reading: the signature check below fails to compile the day it
-    /// takes a `Snapshot`.
+    /// 20 pt band of hysteresis, and Full adds whole cells.
     #[test]
     fn deck_height_is_a_function_of_the_window() {
         use crate::stats_deck::{StatsBars, deck_px};
@@ -2280,12 +2143,10 @@ mod tests {
             }
         }
 
-        // The owner's window: 2848 × 1992 px at 2× under an 80 px titlebar.
         let owner = avail_pt(1992.0, 80.0, 2.0);
         assert_eq!(owner, 894.0);
         assert_eq!(deck_form_for(owner, Folded, auto), Full);
 
-        // A 14 pt cell (28 px at 2×): Δ is three cells, so Full is 104 pt.
         assert_eq!(full_delta_px(2.0, 28), 84);
         assert_eq!(deck_px(StatsBars::Deck, Full, 2.0, 28), 208);
         for s in [1.0, 2.0] {
@@ -2298,7 +2159,6 @@ mod tests {
                 assert_eq!((full - folded) % cell, 0, "{at}");
                 assert_eq!(full - folded, full_delta_px(s, cell), "{at}");
                 assert!((table..table + cell).contains(&full), "{at}");
-                // The sill and off take no headroom in either form.
                 for bars in [StatsBars::Sill, StatsBars::Off] {
                     for deck in [Folded, Full] {
                         assert_eq!(deck_px(bars, deck, s, cell), 0, "{bars:?} {at}");
@@ -2384,8 +2244,7 @@ mod tests {
 
     /// T-G3: every machine's cores fit the Full block, the Full Cores row and
     /// the Folded Cores row at the narrowest width of every kind, in one of
-    /// their modes, and the count is always there. The block always keeps
-    /// its grid, and its captions stay inside it.
+    /// their modes, and the count is always there.
     #[test]
     fn cores_fit_every_machine() {
         let machines = machines();
@@ -2395,9 +2254,6 @@ mod tests {
             let folded = bp.folded.map(|w| plan_folded(w, &m).blocks[1]);
             for clusters in &machines {
                 let total: usize = clusters.iter().map(|c| c.count).sum();
-                // The block, on the shortest Full deck: the first square
-                // size whose stack ends by deck − 6, and never the count
-                // alone.
                 let title = cores_block_title(clusters, &m);
                 assert!(title.starts_with(&format!("{total} ")) && !title.ends_with('…'));
                 let floor = FULL_TABLE_PT - 6.0;
@@ -2457,8 +2313,6 @@ mod tests {
                 }
             }
 
-            // Before the topology is read there is no count, and nothing
-            // says zero: no squares, and the words say "not read".
             let unread = [Cluster {
                 count: 0,
                 name: None,
@@ -2487,8 +2341,6 @@ mod tests {
             }
         }
 
-        // Past T-G3's machines the block keeps only its title's count, and
-        // only where even the smallest squares end past deck − 6.
         let huge = [Cluster {
             count: 1024,
             name: None,
@@ -2558,7 +2410,6 @@ mod tests {
         let m = hn();
         let time_w = m.width(TIME_LABEL, HEADER_PT, false);
 
-        // W 1119: all three after "10 min ago".
         let plan = plan_full(1119.0, &m);
         let head = header_full(&plan, TEXT, &m);
         let after_time = plan.strip.x + time_w + KEY_GAP;
@@ -2585,7 +2436,6 @@ mod tests {
         let details = head.labels.iter().find(|l| l.label == Label::Details);
         assert_eq!(details.map(|l| l.text.as_str()), Some(DETAILS_LONG));
 
-        // Narrow: over max over the names, cold … hot after "■ Global".
         let plan = plan_full(550.0, &m);
         let head = header_full(&plan, TEXT, &m);
         assert_eq!(placed(&head, KeyItem::Over), Some(plan.name.x));
@@ -2599,7 +2449,6 @@ mod tests {
             "the ramp at {ramp}"
         );
 
-        // Slim: over max over the names, the three scopes from the bar.
         let plan = plan_full(350.0, &m);
         let head = header_full(&plan, TEXT, &m);
         assert_eq!(placed(&head, KeyItem::Over), Some(plan.name.x));
@@ -2609,8 +2458,6 @@ mod tests {
         );
         assert!(label_x(&head, Label::Scope(Bar::Tab)).is_some());
 
-        // fwide: the time label on block A, over max after it, the ramp and
-        // not read on block B's strip.
         let plan = plan_folded(1119.0, &m);
         let head = header_folded(&plan, TEXT, [None, None], &m);
         let [a, b] = plan.blocks;
@@ -2649,7 +2496,6 @@ mod tests {
         );
         assert_eq!(label_x(&head, Label::Time), Some(b.strip.x));
 
-        // When both have one, block B's stays over its name, cut.
         let head = header_folded(&plan, TEXT, [Some(long), Some(long)], &m);
         let b_state = head
             .labels

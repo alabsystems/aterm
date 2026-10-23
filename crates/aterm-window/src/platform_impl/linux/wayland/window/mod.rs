@@ -777,6 +777,7 @@ impl TryFrom<&str> for Theme {
     /// assert_eq!("dark".try_into(), Ok(Theme::Dark));
     /// assert_eq!("lIghT".try_into(), Ok(Theme::Light));
     /// ```
+    /// use aterm_window::window::Theme;
     fn try_from(theme: &str) -> Result<Self, Self::Error> {
         if theme.eq_ignore_ascii_case("dark") {
             Ok(Self::Dark)

@@ -10,12 +10,16 @@ use super::probe::{OnDisk, PolicyProbe};
 use crate::supervise::classify::{GLOB_CHARS, TEST_BINARY, TEST_UNARY, glob_match, numeric_format};
 
 /// The stand-in for the unique name `mktemp` makes: a component no deny rule
+/// and no literal root can match, rendered as `<mktemp>` in a target.
 const MKTEMP_NAME: &str = "\u{1}mktemp";
 
 /// The value of a `$(mktemp -d …)` whose directory is made where the line
+/// does not say — under the Bash tool's `$TMPDIR`, or relative to its
+/// working directory — rendered `<mktemp -d>`.
 const FRESH_DIR: &str = "\u{2}mktemp-d";
 
 /// zsh's history modifiers (`zshexpn`, "Modifiers"): after `$NAME:` one of
+/// these reshapes the value; any other character leaves `:` as text.
 const ZSH_MODIFIERS: &str = "aAcefFghlpPqQrsStuwWx&";
 
 /// A path as a reason or a target shows it: the `mktemp` stand-ins named.
@@ -25,6 +29,10 @@ fn rendered(path: &str) -> String {
 }
 
 /// Names the shell itself sets, ties or reads (module docs): a line that
+/// assigns one is not followed, whatever it assigns, since the value read
+/// back is not the one written (`$_`, `PWD` after a `cd`, `SECONDS`, zsh's
+/// read-only `status`) or the assignment changes what the rest of the line
+/// runs or how it splits (`PATH`/`path`, `IFS`, `argv`).
 const SHELL_NAMES: &[&str] = &[
     "_",
     "PWD",
@@ -201,6 +209,8 @@ impl ScratchRoot {
     }
 
     /// This root where the disk leads it: its literal directories resolved
+    /// (`probe`'s [`PolicyProbe::rm_physical`]; `/tmp/*` is `/private/tmp/*`
+    /// on macOS), its glob kept.
     fn on_disk(
         &self,
         cwd: &[String],
@@ -248,6 +258,8 @@ impl ScratchRoot {
     }
 
     /// Whether `comps` is strictly inside this root with no glob in any
+    /// component down to the first one under it: `rm -rf <root>/*` would
+    /// empty the root, `rm -rf <root>/x/*` stays inside `x`.
     fn holds_strictly_unglobbed(&self, comps: &[String]) -> bool {
         comps.len() > self.depth()
             && self.prefixes(comps)
@@ -313,6 +325,7 @@ enum Part {
         quoted: bool,
     },
     /// An expansion zsh computes and this resolver does not (module docs):
+    /// `$=V`, `$~V`, `$^V`, `$+V`, `$V:h`, a non-ASCII name.
     Opaque(String),
 }
 
@@ -334,6 +347,7 @@ enum Tok {
     Word(Word),
     Op(Op),
     /// A redirect operator; `Some(target)` when the target is glued to it
+    /// (`>&1`, `2>&-`), else the next word is its target.
     Redir(String, Option<String>),
 }
 
@@ -493,6 +507,7 @@ impl Lexer {
     }
 
     /// At a `$`: a variable, `${NAME}` / `${NAME:?…}`, `$(…)`, or a zsh form
+    /// this resolver does not compute ([`Part::Opaque`]).
     fn dollar(&mut self, quoted: bool) -> Result<(), String> {
         self.in_word = true;
         match self.peek(1) {
@@ -648,6 +663,7 @@ impl Lexer {
     }
 
     /// `[n]>`, `>>`, `>|`, `&>`, `>&n`, `<`: the operator, and its target when
+    /// glued to a `&`.
     fn redirect(&mut self) -> Result<(), String> {
         let mut op = String::new();
         if let Some(Part::Lit {
@@ -713,6 +729,8 @@ struct Cmd {
     prev: Op,
     next: Op,
     /// Its `&&`/`||` list ends in `&`: bash runs the whole list in a
+    /// background subshell, so an assignment in it is not the shell's after
+    /// it (`S=/x && true & echo "$S"` prints nothing in bash, `/x` in zsh).
     in_async_list: bool,
 }
 
@@ -779,14 +797,17 @@ enum Val {
     Known {
         text: String,
         /// The `$(mktemp -d)` runs (numbered in line order) whose failure
+        /// would empty a part of this value (module header).
         runs: Vec<u32>,
         /// The value were every one of `runs` to fail.
         failed: String,
         /// Whether the value is one run's output and nothing else, so it is
+        /// empty as a whole when that run fails: what `${V:?}` guards.
         whole: bool,
     },
     Unknown,
     /// Known once, then unknown after the command it names (its head),
+    /// which may have assigned it ([`Eval::forget_named`]).
     Forgotten(String),
 }
 
@@ -797,6 +818,10 @@ const KEYWORDS: &[&str] = &[
 ];
 
 /// Builtins that can change a variable, the positional parameters, what a
+/// name runs, how a later word expands, or the line's own text: zsh's
+/// `integer`/`float` evaluate their values as arithmetic (`integer T=A` reads
+/// `A`'s value, which can assign), and `setopt`, `emulate`, bash's `shopt`
+/// and a module `zmodload` loads change how every later word reads.
 const VAR_BUILTINS: &[&str] = &[
     "set",
     "integer",
@@ -836,12 +861,15 @@ struct Flow {
     /// The runs known made whenever it ran.
     made: Vec<u32>,
     /// The runs its success proves made: its only substitution a `$(mktemp
+    /// -d)` it assigned, or `test -n "$D"` of one.
     implies: Vec<u32>,
     /// Whether it began its `&&`/`||` list.
     began_list: bool,
 }
 
 /// The disk's side of the checks ("On the disk" in the module docs): the
+/// session cwd, the home directory and the scratch roots, each where it
+/// leads.
 struct Disk {
     cwd: Result<Vec<String>, String>,
     home: Option<Vec<String>>,
@@ -877,13 +905,19 @@ struct Eval<'a> {
     /// How many `$(mktemp -d)` runs the line has read: the next one's number.
     runs: u32,
     /// The runs known made from here on, whatever runs next: a `${D:?}` a
+    /// command that surely ran expanded, and `D=$(…) || exit`.
     made: Vec<u32>,
     prev: Flow,
     /// Every name the line expands somewhere not inside double quotes (a bare
+    /// `$D` or `${D}`, and any `$D` inside a `$(…)` or a zsh form), which
+    /// [`Self::fresh_dir`] refuses ([`unquoted_names`]).
     unquoted: HashSet<String>,
 }
 
 /// The names `toks` expand outside double quotes ([`Eval::unquoted`]): a
+/// [`Part::Var`] not quoted, and every `$NAME`, `${NAME` or zsh `$=NAME`-style
+/// reference inside a [`Part::Subst`] or [`Part::Opaque`], whose quoting is
+/// not read.
 fn unquoted_names(toks: &[Tok]) -> HashSet<String> {
     let mut out = HashSet::new();
     let scan = |out: &mut HashSet<String>, text: &str| {
@@ -972,6 +1006,8 @@ fn assignment(word: &Word) -> Option<(String, Word)> {
 }
 
 /// An assignment [`assignment`] does not read, at a command's head: an
+/// append (`S+=/..`) or a subscript (`S[0]=/etc`, which is `S=/etc` in bash;
+/// `S[1,-1]=/etc`, which is `S=/etc` in zsh).
 fn assignment_like(word: &Word) -> Option<String> {
     let Some(Part::Lit {
         text,
@@ -989,6 +1025,8 @@ fn assignment_like(word: &Word) -> Option<String> {
 }
 
 /// Whether an unquoted piece `t` of an assignment's value, after `before`,
+/// holds a `~` or `=` the shell expands there: at the value's start or after
+/// a `:` (module docs).
 fn value_expands(before: &str, t: &str) -> bool {
     let mut prev = before.chars().last();
     for c in t.chars() {
@@ -1001,6 +1039,9 @@ fn value_expands(before: &str, t: &str) -> bool {
 }
 
 /// Commands that take no word as a variable's name or as arithmetic,
+/// whatever it holds: a double-quoted word the resolver cannot compute under
+/// one of these names nothing ([`Eval::forget_named`]; zsh's `{S}>file`
+/// redirect assigns `S` under a builtin one, and is read apart).
 const PLAIN_CONSUMERS: &[&str] = &[
     "echo",
     "ls",
@@ -1065,14 +1106,26 @@ const PLAIN_CONSUMERS: &[&str] = &[
 ];
 
 /// Commands zsh evaluates a word of as arithmetic, which assigns and reads a
+/// variable's value as arithmetic in turn (zsh 5.9: `printf %d "S=5"`,
+/// `print -f %d "S=5"`, `[ -t "1/(S=5)" ]`, `return S=5` each set `S`; `[ 1
+/// -eq S=5 ]`, `printf %s S=5`, `kill`, `ulimit`, `umask`, `wait` do not).
 const ARITH_HEADS: &[&str] = &["printf", "print", "test", "[", "return"];
 
 /// How an [`ARITH_HEADS`] command reads its words (numbered from the
+/// command's head, 0), `words` as they expand and `parts` as written.
 #[derive(Debug, Default)]
 struct Reading {
     /// The words it evaluates as arithmetic: `test`/`[`'s word after `-t`;
+    /// `printf`'s arguments after its format (past `-v NAME` and `--`) unless
+    /// the format says otherwise ([`numeric_format`]; zsh takes a `-` word
+    /// other than `-v` as the format), and every word after a `-vNAME` word,
+    /// which bash reads as `-v NAME`; every word of `print -f` (`printf`'s own
+    /// reading) and of `return`.
     arith: Vec<usize>,
     /// The first word from which a word it does not evaluate names nothing:
+    /// `printf`'s format, when every word before it is `-v NAME` or `--` and
+    /// every word up to it stands as written ([`as_written`]), since only `-v
+    /// NAME`, an option, assigns.
     mute_from: usize,
 }
 
@@ -1147,6 +1200,8 @@ fn arith_words(head: &str, words: &[String], parts: &[Word]) -> Reading {
 }
 
 /// The words `test`/`[` read as a string or a file operand (numbered from
+/// the command's head, 0), by POSIX's rules for 1, 2 and 3 arguments, every
+/// operator a literal: `[ X ]`, `[ ! X ]`, `[ -n X ]`, `[ X = Y ]`, `[ !
 fn test_operands(head: &str, words: &[Word]) -> Vec<usize> {
     let args = match (head, words.get(1..).unwrap_or_default()) {
         ("test", args) => args,
@@ -1176,6 +1231,9 @@ fn test_operands(head: &str, words: &[Word]) -> Vec<usize> {
 }
 
 /// Whether the shell passes `word` on as exactly the one word it spells:
+/// quoted text, quoted variables, and unquoted text with no glob, no brace,
+/// no `~` (a leading one is the home directory, and `EXTENDED_GLOB` reads
+/// any other) and no leading `=` (zsh's `=cmd`).
 fn as_written(word: &Word) -> bool {
     word.iter().enumerate().all(|(k, p)| match p {
         Part::Lit { quoted: true, .. } | Part::Var { quoted: true, .. } => true,
@@ -1192,6 +1250,10 @@ fn as_written(word: &Word) -> bool {
 }
 
 /// Whether the shell may make other words of `word`: an unquoted `{`, which
+/// brace-expands (`{%d,A}` is `%d A`, `-{vS,-}` is `-vS --`), or an unquoted
+/// glob, which becomes the names in the working directory (`printf %d *`
+/// with a file `S=5` there sets `S` in zsh, as does `[ ^-vS ]` under
+/// `EXTENDED_GLOB` beside files `-t` and `S=5`).
 fn expands_apart(word: &Word) -> bool {
     word.iter().enumerate().any(|(k, p)| match p {
         Part::Lit {
@@ -1211,6 +1273,7 @@ fn unstand(text: &str) -> String {
 }
 
 /// Whether some word or substitution on a command carries an `rm` token
+/// that is not the command's own head.
 fn mentions_rm(text: &str) -> bool {
     text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '-')))
         .map(str::to_ascii_lowercase)
@@ -1218,6 +1281,7 @@ fn mentions_rm(text: &str) -> bool {
 }
 
 /// `rm` by any letter case: the default macOS volume is case-insensitive, so
+/// `Rm` and `/BIN/RM` run `/bin/rm`.
 fn is_rm_head(h: &str) -> bool {
     matches!(
         h.to_ascii_lowercase().as_str(),
@@ -1236,6 +1300,7 @@ fn is_exit(cmd: &Cmd) -> bool {
 }
 
 /// A known value unknown after the command `head` ([`Val::Forgotten`]); an
+/// unknown one keeps its own reason.
 fn forget(v: &mut Val, head: &str) {
     if matches!(v, Val::Known { .. }) {
         *v = Val::Forgotten(clip(head, 20));
@@ -1254,10 +1319,12 @@ struct Operand {
     text: String,
     glob: bool,
     /// Each `$(mktemp -d)` run the operand is built on, and the variable it
+    /// came through.
     runs: Vec<(u32, String)>,
     /// The operand were those runs to fail.
     failed: String,
     /// It is one variable and nothing else, whose value is one run's output:
+    /// `""` (or no word at all) when that run fails, which removes nothing.
     alone: bool,
 }
 
@@ -1292,6 +1359,7 @@ impl Eval<'_> {
     }
 
     /// The runs the `${V:?}` among `parts` guard, `V` as the line has it
+    /// now: each `V` whose value is one run's output (`Val::Known::whole`).
     fn guarded_runs<'p>(&self, parts: impl Iterator<Item = &'p Part>) -> Vec<u32> {
         let mut out = Vec::new();
         for p in parts {
@@ -1311,6 +1379,11 @@ impl Eval<'_> {
     }
 
     /// [`Self::command`]'s reading of the command itself: `Ok` with the runs
+    /// its success proves made, and the runs its `${V:?}` words guard, each
+    /// read where the shell expands it: an assignment's after the ones before
+    /// it on the command, every other word before the command assigns
+    /// anything (`E=${D:?} D=…` guards the old `D`; `export` expands all its
+    /// words first).
     fn simple(
         &mut self,
         cmd: &Cmd,
@@ -1418,6 +1491,11 @@ impl Eval<'_> {
     }
 
     /// What a command this resolver does not model may do to the line's
+    /// variables: a builtin may assign a variable named in its words (`print
+    /// -v S /etc`, `print -vS`, bash `printf -vS`, `zparseopts a:=S`, `zstyle -s
+    /// c s S`, `zformat -f S /etc`, `stat -A S`) or evaluate a word as
+    /// arithmetic, which assigns (`[ -t "1/(S=5)" ]`, zsh `printf %d "S=5"`), so
+    /// every variable a word names, as the word expands, is unknown after it.
     fn forget_named(&mut self, cmd: &Cmd, head: &str) {
         for w in &cmd.words {
             if let [
@@ -1540,6 +1618,9 @@ impl Eval<'_> {
     }
 
     /// A word zsh evaluates as arithmetic, `text` as it expands: every name
+    /// it reads is unknown after it, and zsh reads a variable's value as
+    /// arithmetic in turn (`A=S=5; printf %d A` sets `S`), so so is every name
+    /// that value reads, and on.
     fn forget_arith(&mut self, text: &str, head: &str) -> bool {
         let mut todo = vec![text.to_string()];
         let mut seen = HashSet::new();
@@ -1569,6 +1650,7 @@ impl Eval<'_> {
     }
 
     /// `test -n "$D"`, `test -d "$D"`, `test -e "$D"` and their `[ … ]` forms,
+    /// `D` one run's output: their success proves the run made.
     fn test_implies(&self, head: &str, args: &[Word]) -> Vec<u32> {
         let args = match (head, args) {
             ("test", args) => args,
@@ -1601,6 +1683,7 @@ impl Eval<'_> {
     }
 
     /// `export NAME=value` is an assignment under the same rule; `export NAME`
+    /// changes nothing this resolver reads; anything else escalates.
     fn export(&mut self, rest: &[Word], surely: bool) -> Result<(), String> {
         let mut bound = Vec::new();
         for w in &rest[1..] {
@@ -1625,11 +1708,13 @@ impl Eval<'_> {
     }
 
     /// A variable's value as this line assigned it; a name it did not
+    /// assign is not known (module header, "Variables from the environment").
     fn lookup(&self, name: &str) -> Val {
         self.env.get(name).cloned().unwrap_or(Val::Unknown)
     }
 
     /// An assignment's value: no word splitting or globbing; a `~` or `=`
+    /// the shell expands there unresolved ([`value_expands`]).
     fn value(&mut self, parts: &Word) -> Val {
         let mut text = String::new();
         let mut failed = String::new();
@@ -1777,6 +1862,14 @@ impl Eval<'_> {
     }
 
     /// The fresh-directory rule (module docs, "A directory the line itself
+    /// just made"): `Some(Ok(target))` when `word` is `"$D"` or lies lexically
+    /// under it, `D` exactly one `$(mktemp -d …)` run's output, that run
+    /// proven made where the rm runs (`made`, or the operand's own `${D:?}`)
+    /// unless the operand is `"$D"` alone, the operand quoted and, for a path
+    /// under `$D`, every use of `$D` on the line double-quoted, and the rule
+    /// not withheld ([`RmScope::roots`]); `Some(Err(why))` when `word` starts
+    /// with such a `D` and one of those fails; `None` when it does not start
+    /// with one.
     fn fresh_dir(&self, word: &Word, made: &[u32]) -> Option<Result<String, String>> {
         let (
             Part::Var {
@@ -1948,6 +2041,7 @@ impl Eval<'_> {
     }
 
     /// Where the operand points, and whether it may point there: as written,
+    /// then on the disk ([`Self::on_disk`]).
     fn check(&self, text: &str) -> Result<String, String> {
         if text.is_empty() {
             return Err("an empty rm operand".to_string());
@@ -1985,6 +2079,8 @@ impl Eval<'_> {
     }
 
     /// The operand's directories resolved on the disk ([`PolicyProbe::rm_physical`]),
+    /// and the path they lead to checked again, against the cwd, the home
+    /// directory and the roots as the disk has them ([`Disk`]).
     fn on_disk(&self, comps: &[String], follow_last: bool, shown: &str) -> Result<(), String> {
         let dirs = if follow_last {
             comps.len()
@@ -2028,6 +2124,8 @@ impl Eval<'_> {
 }
 
 /// Whether `comps` is past every [`critical_path`] (with `home`), is not
+/// `cwd` or an ancestor of it, and is strictly inside one of `roots`;
+/// `shown` names it in the reason.
 fn inside(
     comps: &[String],
     shown: &str,
@@ -2054,6 +2152,9 @@ fn inside(
 }
 
 /// `mktemp -d [-q] [-t PREFIX]` → [`FRESH_DIR`] (under the Bash tool's
+/// `$TMPDIR`, which is never proven: module docs); `mktemp -d [-q]
+/// /abs/dir/name.XXXX` → `/abs/dir/<mktemp>`; a relative template →
+/// [`FRESH_DIR`] (under the Bash tool's working directory).
 fn mktemp_dir(subst: &str) -> Option<String> {
     let words: Vec<&str> = subst.split_whitespace().collect();
     if words.first() != Some(&"mktemp") {
@@ -2114,6 +2215,7 @@ pub(crate) fn abs_components(path: &str) -> Option<Vec<String>> {
 }
 
 /// BSD and GNU `rm` flags that only change how the named operands are
+/// removed.
 fn is_known_flag(word: &str) -> bool {
     if let Some(long) = word.strip_prefix("--") {
         return matches!(
@@ -2138,11 +2240,18 @@ fn is_known_flag(word: &str) -> bool {
 }
 
 /// Whether `s` holds a character by which zsh globs a word into more names
+/// ([`GLOB_CHARS`]: `*`, `?`, `[`, and `EXTENDED_GLOB`'s `^`, `#` and `(`;
+/// `rm -rf /tmp/w/^x` removes every name there but `x`).
 fn has_glob(s: &str) -> bool {
     s.contains(GLOB_CHARS)
 }
 
 /// The paths no operand may name whatever root holds it, compared
+/// ASCII-case-insensitively (as the default macOS volume is): `Some(its
+/// name)` for the filesystem root, the home directory, an ancestor of it or a
+/// glob directly inside it, `/Users` or `/home` or a direct child of either
+/// (somebody's home), a glob in the first component (`/*`, `/u*/x`), and any
+/// `.git` component.
 fn critical_path(comps: &[String], home: Option<&[String]>) -> Option<&'static str> {
     let prefix_of = |a: &[String], b: &[String]| {
         a.len() <= b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))

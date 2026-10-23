@@ -1,31 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The phaser emitter cursor: under the `phaser` trail style the block cursor is
-//! the emitter the beam fires from.
-//!
-//! * **The block fill follows the beam's rolling hue**, the sweep phase the
-//!   streak is laid in (from [`crate::cursor_glow::CursorGlow::beam_hue`]), so
-//!   the beam reads as light leaving the cursor. At rest the fill is a whisper
-//!   of the beam hue over the cursor's own colour ([`PhaserConfig::base`]: OSC
-//!   12 / `cursor_color`); under the keys it saturates to the vivid beam colour.
-//!   On a light page with no pinned colour the block IS the beam's hue, clean
-//!   and saturated, deepened by lightness to read clearly on the page, on a
-//!   wheel that steps over the hues paper can only show as khaki
-//!   (`color_math::light_spectrum_hue`); the bar it fires does the same.
-//! * **Beam-axis energy wings**: an additive pair of lens-shaped side lobes on
-//!   the horizontal axis, spanning the cell height and tapering sideways, at a
-//!   dim static floor while idle and swelling with the typing cadence.
-//! * **A prism fringe**: the outer wing layers split slightly off the core hue
-//!   (trailing spectrum left, leading right), unlike the rainbow kitty's banded
-//!   ring.
-//!
-//! Text-safe: the host floors the fill against the page (`crate::cursor_fx::floor_block_fill`,
-//! unless it wears a pinned cursor colour) and the renderer's `floor_cursor_fill` adds the user's
-//! `minimum_contrast` on top (off by default). The wings are additive [`GlowQuad`] light with
-//! capped coverage, drawn on dark pages only; only the dim outer tint reaches over neighbouring
-//! glyphs. Pure in the injected `now`, it settles to inactive when the charge dies (then rides
-//! the blink cadence).
+//! The phaser emitter cursor: under the `phaser` trail style the block cursor is the emitter the beam fires from.
 
 use aterm_time::Instant;
 
@@ -36,9 +12,7 @@ use crate::effect_util::push_fx_rect as push_rect;
 use crate::effect_util::{lerp, mix_rgb};
 
 /// The block base the beam hue tints from on a dark theme when the host names
-/// none: white. A light theme's block is the beam's hue itself
-/// ([`light_emitter_fill`]). A host that knows a pinned cursor colour passes
-/// it as [`PhaserConfig::base`] instead.
+/// none: white.
 const BASE_DARK_THEME: u32 = 0x00FF_FFFF;
 
 /// The emitter block on a light page with no pinned cursor colour: the beam's
@@ -48,8 +22,7 @@ const BASE_DARK_THEME: u32 = 0x00FF_FFFF;
 /// ([`crate::color_math::light_body_fill`]) and held by lightness alone to
 /// the light emitter's contrast on white
 /// ([`crate::cursor_beam::LIGHT_EMITTER_CONTRAST`]), so it reads as the
-/// emitter rather than a drab near-black. The host still floors it against
-/// the cell it sits on.
+/// emitter rather than a drab near-black.
 #[inline]
 fn light_emitter_fill(hue: f32, e: f32) -> u32 {
     let clean = hsv2rgb(crate::color_math::light_spectrum_hue(hue), 1.0, 1.0);
@@ -60,15 +33,11 @@ fn light_emitter_fill(hue: f32, e: f32) -> u32 {
     )
 }
 
-/// Charged breath (turns/sec of the wing pulse) and its depth. The phase freezes
-/// below [`SETTLED_ENERGY`], so an unrelated present after a long idle never
-/// advances a hidden clock and changes brightness.
+/// Charged breath (turns/sec of the wing pulse) and its depth.
 const PULSE_HZ: f32 = 0.30;
 const PULSE_DEPTH: f32 = 0.55;
 
 /// Saturation / value / base-mix ramps from idle whisper to vivid charged fill.
-/// Idle saturation is above the rainbow cursor's (0.32) so the fill reads as the
-/// beam's hue even at rest.
 const SAT_IDLE: f32 = 0.45;
 const SAT_MAX: f32 = 1.0;
 const VAL_IDLE: f32 = 0.85;
@@ -77,16 +46,12 @@ const MIX_IDLE: f32 = 0.22;
 const MIX_MAX: f32 = 0.88;
 
 /// Wing reach past the cell edge in cell widths: a tight idle glow, up to over a
-/// neighbour cell at full charge. Only the dim outer layer runs the full reach
-/// ([`WING_LAYERS`]), so the far tint never buries a glyph.
+/// neighbour cell at full charge.
 const REACH_IDLE: f32 = 0.30;
 const REACH_MAX: f32 = 1.60;
 
 /// The nested lens layers, innermost last: (reach ×, coverage ×, hue fringe in
-/// turns, height ×). The bright core hugs the cell and spans its height; outer
-/// layers are the faint prism fringe, flatter the further they reach, so the far
-/// light is a slim flare on the beam axis that stays off neighbouring ascenders
-/// and descenders. Additive overlap builds the sideways falloff.
+/// turns, height ×).
 const WING_LAYERS: [(f32, f32, f32, f32); 4] = [
     (1.00, 0.18, 0.10, 0.45),
     (0.74, 0.38, 0.06, 0.62),
@@ -95,16 +60,13 @@ const WING_LAYERS: [(f32, f32, f32, f32); 4] = [
 ];
 
 /// Innermost-layer peak coverage (× charge, pre-cap): a dim idle port, a bright
-/// charged core. Every push is also clamped by [`COV_CAP`] (the light rod's
-/// text-safety band), since the wings overlap neighbouring glyph cells.
+/// charged core.
 const COV_IDLE: f32 = 46.0;
 const COV_MAX: f32 = 132.0;
 const COV_CAP: f32 = 96.0;
 
 /// Stack budget for the strip where all four [`WING_LAYERS`] overlap (hugging the cursor's cell
-/// edges, where the newest typed glyphs sit). The per-layer [`COV_CAP`] alone lets the sum reach
-/// ~280 at full charge and saturate those glyphs, so the shared core is capped so
-/// `Σ(layer × core) ≤ budget`, the rainbow ribbon's text-safety ceiling.
+/// edges, where the newest typed glyphs sit).
 const WING_STACK_BUDGET: f32 = 150.0;
 /// Σ of the [`WING_LAYERS`] coverage multipliers (the worst-case overlap).
 const WING_STACK_OVERLAP: f32 = 2.24;
@@ -118,32 +80,22 @@ const SETTLED_ENERGY: f32 = 0.02;
 pub struct PhaserConfig {
     /// Master on/off (the `phaser` style opted in and the cursor is a focused, visible block).
     pub enabled: bool,
-    /// Overall scale `0..1` — the reduced-motion / load-shed amplitude, folded in
-    /// by the host exactly like the aurora. 0 ⇒ fully inert (plain themed cursor).
+    /// Overall scale `0..1` — the reduced-motion / load-shed amplitude, folded in by the host exactly like the aurora. 0 ⇒ fully inert (plain themed cursor).
     pub intensity: f32,
-    /// The block's colour at rest, `0x00RRGGBB`: a PINNED cursor colour (a configured
-    /// `cursor_color` or a program's OSC 12). The beam hue is a tint over it that comes in with
-    /// the charge, so a settled caret is exactly the user's cursor colour. The fill leaves the tick as
-    /// [`aterm_render::RenderInput::cursor_fill_override`], which replaces the frame cursor
-    /// colour, so it must carry the host's colour, as the comet and beam rod do. `None` uses
-    /// white on a dark theme ([`BASE_DARK_THEME`]) and the beam's own hue on a light one
-    /// ([`light_emitter_fill`]).
+    /// The block's colour at rest, `0x00RRGGBB`: a PINNED cursor colour (a configured `cursor_color` or a program's OSC 12).
     pub base: Option<u32>,
 }
 
-/// What a tick produced: the beam-hued block fill to hand the renderer and a fingerprint that
-/// changes on every visible step (0 when off).
+/// What a tick produced: the beam-hued block fill to hand the renderer and a fingerprint that changes on every visible step (0 when off).
 #[derive(Clone, Copy, Debug)]
 pub struct PhaserFrame {
-    /// The beam-hued block-fill colour `0x00RRGGBB`, or `None` when the emitter
-    /// is off (the renderer then keeps the ordinary themed cursor fill).
+    /// The beam-hued block-fill colour `0x00RRGGBB`, or `None` when the emitter is off (the renderer then keeps the ordinary themed cursor fill).
     pub fill: Option<u32>,
     /// Fingerprint of the emitted fill + wings (0 ⇒ nothing this frame).
     pub fp: u64,
 }
 
-/// Per-window emitter animation state — one breath phase plus the last clock
-/// reading and a latched charge. Tiny + Copy-cheap.
+/// Per-window emitter animation state — one breath phase plus the last clock reading and a latched charge.
 #[derive(Default)]
 pub struct CursorPhaser {
     /// Idle-breath phase in turns `0..1`.
@@ -154,21 +106,14 @@ pub struct CursorPhaser {
 }
 
 impl CursorPhaser {
-    /// Whether the host must keep arming the animation tick: only while the
-    /// emitter is charged (typing or cooling). Once settled the idle glow rides
-    /// the blink cadence.
+    /// Whether the host must keep arming the animation tick: only while the emitter is charged (typing or cooling).
     #[inline]
     #[must_use]
     pub const fn is_active(&self) -> bool {
         self.energy > SETTLED_ENERGY
     }
 
-    /// Advance one frame at `now` with the beam's rolling `hue` (turns `0..1`,
-    /// read from [`crate::cursor_glow::CursorGlow::beam_hue`] after the aurora
-    /// tick), typing `energy` (`0..1`), the block cursor cell `cur` (`None`:
-    /// hidden), theme darkness, grid `geom` and resolved `cfg`. Appends the
-    /// additive wings to `out` and returns the block fill and a fingerprint.
-    /// Pure: no wall clock.
+    /// Advance one frame at `now` with the beam's rolling `hue` (turns `0..1`, read from [`crate::cursor_glow::CursorGlow::beam_hue`] after the aurora tick), typing `energy` (`0..1`), the block cursor cell `cur` (`None`: hidden), theme darkness, grid `geom` and resolved `cfg`.
     #[allow(clippy::too_many_arguments)]
     pub fn tick(
         &mut self,
@@ -182,21 +127,14 @@ impl CursorPhaser {
         out: &mut Vec<GlowQuad>,
     ) -> PhaserFrame {
         let e = (energy.clamp(0.0, 1.0) * cfg.intensity.clamp(0.0, 1.0)).clamp(0.0, 1.0);
-        // Inert (equal to the plain themed cursor) when off, with degenerate
-        // geometry, or at zero amplitude (reduced motion / load shed), like the
-        // rainbow block.
         if !cfg.enabled || geom.cw == 0 || geom.ch == 0 || cfg.intensity <= 0.0 {
-            self.energy = 0.0; // inert: report settled so the host disarms the tick
+            self.energy = 0.0;
             self.last = Some(now);
             return PhaserFrame { fill: None, fp: 0 };
         }
         let was_active = self.energy > SETTLED_ENERGY;
         self.energy = e;
 
-        // Advance the breath only across a continuously charged interval: an
-        // idle emitter has no timer, so integrating time on the next unrelated
-        // present would make settled pixels jump. A fresh charge starts from the
-        // frozen phase.
         let active = e > SETTLED_ENERGY;
         let dt = if was_active && active {
             self.last
@@ -210,15 +148,9 @@ impl CursorPhaser {
         if active {
             self.pulse = (self.pulse + dt * PULSE_HZ).fract();
         }
-        let breath = 0.5 + 0.5 * (self.pulse * std::f32::consts::TAU).sin(); // 0..1
+        let breath = 0.5 + 0.5 * (self.pulse * std::f32::consts::TAU).sin();
 
-        // The block fill: the cursor's own colour tinted toward the beam's hue with charge. The
-        // host floors it against the page, so the glyph stays sharp, unless it wears a pinned
-        // cursor colour.
         let fill = match cfg.base {
-            // A pinned cursor colour is the settled emitter itself: the beam's
-            // hue tints it only with the charge
-            // ([`crate::color_math::wear_pinned`]).
             Some(pinned) if e <= SETTLED_ENERGY => pinned & 0x00FF_FFFF,
             Some(pinned) => {
                 let beam = hsv2rgb(hue, lerp(SAT_IDLE, SAT_MAX, e), lerp(VAL_IDLE, VAL_MAX, e));
@@ -236,10 +168,6 @@ impl CursorPhaser {
             None => light_emitter_fill(hue, e),
         };
 
-        // The additive wings, drawn only over a visible in-grid cursor cell,
-        // with a small breathing idle floor. Dark themes only: additive lobes
-        // cannot brighten a white ground and would only lift neighbouring
-        // glyphs; the theme-aware fill is the emitter's tell on light themes.
         let charge = COV_IDLE / COV_MAX * (0.45 + PULSE_DEPTH * breath) + e;
         if dark_theme
             && let Some((cr, cc)) = cur
@@ -250,9 +178,6 @@ impl CursorPhaser {
             self.emit_wings(cr, cc, e, charge, hue, geom, cfg, out);
         }
 
-        // Fingerprint: quantized hue, breath, charge and fill, so a settled
-        // emitter skips the present but any visible step forces a repaint.
-        // Never 0 while enabled (the idle glow is always drawable).
         let fp = ((hue * 1024.0) as u64)
             .wrapping_mul(1_000_003)
             .wrapping_add((charge * 255.0) as u64)
@@ -265,8 +190,7 @@ impl CursorPhaser {
         }
     }
 
-    /// Emit the two lens-shaped wings as premultiplied additive quads. Bounded by construction:
-    /// `WING_LAYERS.len()` layers × (cell_h / slab) slabs × 2 sides.
+    /// Emit the two lens-shaped wings as premultiplied additive quads.
     #[allow(
         clippy::too_many_arguments,
         reason = "cursor cell + charge/hue + geometry/config; one internal call site"
@@ -283,19 +207,13 @@ impl CursorPhaser {
         out: &mut Vec<GlowQuad>,
     ) {
         let (cw, ch) = (geom.cw as f32, geom.ch as f32);
-        // Window-absolute cell edges (`Geom` carries the grid origin), so the
-        // wings sit on the cursor and carry the rows their pixels overlap.
         let cell_l = i32::from(geom.origin_x) + cc as i32 * geom.cw as i32;
         let cell_r = cell_l + geom.cw as i32;
         let cy = f32::from(geom.origin_y) + (cr as f32 + 0.5) * ch;
         let reach = (REACH_IDLE + (REACH_MAX - REACH_IDLE) * e) * cw;
-        // Core coverage, capped so the four-layer overlap strip at the cell
-        // edge — over the newest typed glyphs — stays under the stack budget.
         let cov_core =
             (COV_MAX * charge * cfg.intensity).min(WING_STACK_BUDGET / WING_STACK_OVERLAP);
 
-        // Slab height ~1/8 cell (min 2px): fine enough that the tapering lens
-        // reads as a point, not a staircase.
         let slab = ((ch * 0.125) as i32).max(2);
         let cy_i32 = cy as i32;
         for &(rx, cov_x, fringe, hx) in &WING_LAYERS {
@@ -307,8 +225,6 @@ impl CursorPhaser {
             if cov == 0 {
                 continue;
             }
-            // Prism fringe: the left lobe trails the sweep, the right leads it. The core layer
-            // (fringe 0) is the pure beam hue on both sides.
             let left_premul = premul_rgb(hsv2rgb(hue - fringe, 0.95, 1.0), cov);
             let right_premul = if fringe == 0.0 {
                 left_premul
@@ -320,9 +236,6 @@ impl CursorPhaser {
             let mut dy = -half_h_i32;
             while dy < half_h_i32 {
                 let h = slab.min(half_h_i32 - dy).max(1);
-                // Elliptical lens: half-width at the slab's vertical centre,
-                // full reach on the beam axis, tapering to a point at the
-                // layer's top and bottom.
                 let ym = (dy as f32 + h as f32 * 0.5) / half_h;
                 let hw = (r * (1.0 - ym * ym).max(0.0).sqrt()) as i32;
                 if hw >= 1 {
@@ -359,7 +272,6 @@ mod tests {
         PhaserConfig {
             enabled: true,
             intensity: 1.0,
-            // No host base: these fixtures pin the theme-polar bloom.
             base: None,
         }
     }
@@ -442,7 +354,6 @@ mod tests {
         };
         let red = fill_at(0.0);
         let cyan = fill_at(0.5);
-        // Red-ish hue ⇒ red channel dominates; cyan-ish ⇒ red is the weakest.
         let (rr, rg, rb) = ((red >> 16) & 0xff, (red >> 8) & 0xff, red & 0xff);
         let (cr_, cg, cb) = ((cyan >> 16) & 0xff, (cyan >> 8) & 0xff, cyan & 0xff);
         assert!(
@@ -512,9 +423,7 @@ mod tests {
     /// ON PAPER THE EMITTER AND ITS BAR STEP OVER THE MUDDY HUES: every beam
     /// phase gives a light block whose hue lies outside
     /// [`crate::color_math::LIGHT_MUDDY_HUES`], and every hue on the light
-    /// wheel is one of the others, in order. Negative control: the whole
-    /// wheel's yellow, deepened to the same contrast, is the khaki the
-    /// judges saw.
+    /// wheel is one of the others, in order.
     #[test]
     fn the_light_emitter_steps_over_the_muddy_hues() {
         use crate::color_math::{LIGHT_MUDDY_HUES, light_spectrum_hue, rgb2hsv};
@@ -548,16 +457,11 @@ mod tests {
     }
 
     /// The host's cursor colour is the emitter block on either theme polarity.
-    /// The fill becomes `RenderInput::cursor_fill_override`, which the renderer
-    /// applies instead of `frame_cursor(input)`, so a settled caret must be the
-    /// host's colour and two colours must never collapse to one block.
     #[test]
     fn host_base_is_the_settled_block_on_either_polarity() {
         let g = geom();
         let mut out = Vec::new();
         let t = Instant::now();
-        // A settled emitter (energy 0) with a fixed beam hue: only the base can move this fill
-        // between two ticks.
         let settled = |base: u32, dark: bool, out: &mut Vec<GlowQuad>| {
             let c = PhaserConfig {
                 base: Some(base),
@@ -587,8 +491,6 @@ mod tests {
                 "two cursor colours must not paint one identical block (dark={dark})"
             );
         }
-        // …and charge still blooms the beam hue over that base: the charged fill differs
-        // markedly.
         let c = PhaserConfig {
             base: Some(0x00FF_0000),
             ..cfg()

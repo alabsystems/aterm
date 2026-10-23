@@ -1,55 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A read-only ZIP central-directory reader for the `zip` vendor payload lane.
-//!
-//! First-party because a third-party zip crate would be a supply-chain edge in the crate
-//! whose subject is supply chain (as `src/tarread.rs` is for tar), and `/usr/bin/ditto -x
-//! -k` writes every member to disk before anything can vet it.
-//!
-//! This reader only parses. Every member goes to the same [`super::Layer`] as the tar lanes
-//! as `(raw path, kind, mode, body)`, so the slip vet, `strip_components`, the caps, the
-//! mode sanitizing, the in-root symlink rule and the `tree_root` fold are inherited.
-//! Inflate is `aterm_codec::inflate::stream`.
-//!
-//! The central directory is the authority, never the local headers (whose sizes a
-//! streaming writer may not have known): the end record is found by a bounded backward
-//! scan, ZIP64 locator/record and extra fields are honoured when a fixed field is
-//! saturated, and a local header only says where the body starts. Methods `0` (store) and
-//! `8` (deflate). Unix (`3`) and Darwin (`19`) hosts supply `st_mode` in the external
-//! attributes, which decides regular/directory/symlink and the exec bit; any other host
-//! yields mode 0, laid down `0644`.
-//!
-//! This reader only PARSES. Every member is handed to the same [`super::Layer`] as the
-//! tar lanes with `(raw path, kind, mode, body)`, so the slip vet, `strip_components`,
-//! the byte and entry caps, the mode sanitizing, the selected symlink policy and the
-//! `tree_root` fold are inherited by construction. Inflate is first-party
-//! (`aterm_codec::inflate::stream`), the streaming driver over the same engine the
-//! terminal's Kitty `o=z` path uses.
-//!
-//! # What it reads
-//!
-//! The CENTRAL DIRECTORY is the authority (never the local headers, whose sizes a
-//! streaming writer may not have known): the end-of-central-directory record is found
-//! by a bounded backward scan, the ZIP64 locator/record and the ZIP64 extra field are
-//! honoured when a fixed field is saturated, and each member's body is located through
-//! its local header, whose only role is to say where the name/extra end. Methods `0`
-//! (store) and `8` (deflate). Unix (`3`) and Darwin (`19`) hosts supply `st_mode` in the
-//! external attributes, which decides regular/directory/symlink and the exec bit; any
-//! other host yields mode 0 — laid down `0644`, never executable.
-//!
-//! # What it refuses (each an `ExtractError`, never a panic)
-//!
-//! Encryption (both flags), any other compression method, multi-disk archives, a name
-//! containing NUL or a backslash, any record/name/extra/body that overruns its span or
-//! the file, a central directory whose size disagrees with its records, trailing bytes
-//! after the end record, a stored member whose two sizes disagree, a body whose length
-//! disagrees with the declared size, a symlink target over `PATH_MAX`, and any kind but
-//! file, directory or (where admitted) symlink.
-//!
-//! CRC-32 is not verified: the download's `sha256` already covered the file, and the
-//! signed `tree_root` re-verify over the laid-down bytes is a stronger check (a corrupt
-//! inflate stream yields a mismatching root).
+//! Read-only ZIP central-directory parser and extractor for the `zip` vendor payload lane.
 
 use std::cell::Cell;
 use std::fs::File;
@@ -122,7 +74,6 @@ struct CentralDirectory {
     size: u64,
 }
 
-/// Find the end-of-central-directory record by a bounded backward scan and read the
 /// central directory's span from it (or from the ZIP64 record it points at).
 fn locate(file: &mut File, len: u64) -> io::Result<CentralDirectory> {
     if len < EOCD_LEN {
@@ -130,10 +81,8 @@ fn locate(file: &mut File, len: u64) -> io::Result<CentralDirectory> {
     }
     let window = len.min(EOCD_SEARCH);
     file.seek(SeekFrom::Start(len.saturating_sub(window)))?;
-    // `window <= 65_557`, so the cast is exact.
     let mut tail = vec![0u8; window as usize];
     file.read_exact(&mut tail)?;
-    // Scan back from the last position a full record fits.
     let mut pos = tail.len().saturating_sub(EOCD_LEN as usize);
     loop {
         if u32_at(&tail, pos)? == SIG_EOCD {
@@ -144,7 +93,6 @@ fn locate(file: &mut File, len: u64) -> io::Result<CentralDirectory> {
         }
         pos = pos.saturating_sub(1);
     }
-    // The comment must run exactly to EOF: anything after the record is not a zip.
     let comment_len = usize::from(u16_at(&tail, pos.saturating_add(20))?);
     if pos
         .saturating_add(EOCD_LEN as usize)
@@ -188,7 +136,6 @@ fn locate(file: &mut File, len: u64) -> io::Result<CentralDirectory> {
     Ok(cd)
 }
 
-/// The ZIP64 locator sits immediately before the end record and names the ZIP64 end
 /// record, which carries the 64-bit count/size/offset.
 fn locate_zip64(file: &mut File, eocd_abs: u64) -> io::Result<CentralDirectory> {
     if eocd_abs < 20 {
@@ -240,7 +187,6 @@ struct Record {
     external: u32,
 }
 
-/// Read the record at `at`, which must lie (with its variable tail) inside `[at, end)`.
 /// Returns the record and the offset of the next one.
 fn read_record(file: &mut File, at: u64, end: u64) -> io::Result<(Record, u64)> {
     let fixed_end = at
@@ -256,7 +202,6 @@ fn read_record(file: &mut File, at: u64, end: u64) -> io::Result<(Record, u64)> 
         return Err(bad("central directory record has a bad signature"));
     }
     let made_by = u16_at(&h, 4)?;
-    // The high byte of "version made by" is the host system.
     let host = (made_by >> 8) as u8;
     let flags = u16_at(&h, 8)?;
     let method = u16_at(&h, 10)?;
@@ -281,14 +226,11 @@ fn read_record(file: &mut File, at: u64, end: u64) -> io::Result<(Record, u64)> 
     file.read_exact(&mut name)?;
     let mut extra = vec![0u8; usize::from(extra_len)];
     file.read_exact(&mut extra)?;
-    // The comment is skipped by the next seek.
     let mut comp_size = u64::from(comp);
     let mut uncomp_size = u64::from(uncomp);
     let mut local_offset = u64::from(lho);
     let mut disk = u32::from(disk_start);
     if comp == 0xFFFF_FFFF || uncomp == 0xFFFF_FFFF || lho == 0xFFFF_FFFF || disk_start == 0xFFFF {
-        // The ZIP64 extra field lists, in this order, only the fields the fixed record
-        // saturated.
         let mut p: usize = 0;
         let mut found = false;
         while p.saturating_add(4) <= extra.len() {
@@ -345,7 +287,6 @@ fn read_record(file: &mut File, at: u64, end: u64) -> io::Result<(Record, u64)> 
     ))
 }
 
-/// Where a record's body starts: past its local header, whose name/extra lengths are
 /// the only thing read from it. The body must end before the central directory.
 fn body_offset(file: &mut File, rec: &Record, cd_offset: u64) -> io::Result<u64> {
     let hdr_end = rec
@@ -376,7 +317,6 @@ fn body_offset(file: &mut File, rec: &Record, cd_offset: u64) -> io::Result<u64>
     Ok(data)
 }
 
-/// Regular / directory / symlink / other, from the name's trailing slash and the Unix
 /// type bits (when the host supplied them).
 fn classify(name: &[u8], unix_mode: u32) -> EntryKind {
     if name.last() == Some(&b'/') {
@@ -405,8 +345,6 @@ fn name_to_path(bytes: &[u8]) -> io::Result<PathBuf> {
     }
 }
 
-/// The body of `rec` as a reader of its uncompressed bytes, bounded on the compressed side
-/// by `Take` (a body never reads past its own span) and on the uncompressed side by the
 /// caller's cap.
 fn open_body<'f>(
     file: &'f mut File,
@@ -440,8 +378,7 @@ fn open_body<'f>(
     }
 }
 
-/// Extract the zip at `archive` into `dest_root` through a [`Layer`] — see the module
-/// docs for what is supported and refused.
+/// Extracts the ZIP archive at `archive` into `dest_root` through a [`Layer`].
 pub(super) fn extract(
     archive: &Path,
     dest_root: &Path,
@@ -452,7 +389,6 @@ pub(super) fn extract(
     let mut file = File::open(archive)?;
     let len = file.metadata()?.len();
     let cd = locate(&mut file, len)?;
-    // No structural reader in this lane: the budget is a refund sink nothing drains.
     let budget = Rc::new(Cell::new(TAR_ENTRY_STRUCTURAL_BUDGET));
     let mut layer = Layer::open(dest_root, max_total_bytes, max_entries, true, opts, budget)?;
     let end = cd.offset.saturating_add(cd.size);
@@ -460,7 +396,6 @@ pub(super) fn extract(
     let mut seen: u64 = 0;
     while seen < cd.entries {
         seen = seen.saturating_add(1);
-        // The entry cap first, so a record count nothing backs is bounded by it.
         layer.next_entry()?;
         let (rec, next) = read_record(&mut file, at, end)?;
         at = next;

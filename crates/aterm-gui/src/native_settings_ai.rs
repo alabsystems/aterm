@@ -1,60 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! SETTINGS ▸ HARNESS ▸ AI CLIS (docs/DESIGN-ai-connections-2026-10-16.md
-//! §10): the AI CLIs aterm keeps one working login to — Claude Code, Codex
-//! CLI, Antigravity CLI, Muse Code — a SPECIAL route, Harness's sub-page,
-//! built like the Harness page over the host's [`crate::ai_screen::AiState`]
-//! (which the Harness snapshot carries). Four cards, in order:
-//!
-//! 1. **THIS MACHINE** — the registry rows Preferred AI CLI (`ai.preferred`)
-//!    and Look for AI CLI problems (`ai.enabled`), each with its note, and
-//!    "From the fleet document." where that is where the preferred CLI came
-//!    from; under it the page's Refresh (look again, off the event loop).
-//! 2. **AI CLIS** — who needs you, then one row per CLI: its name and
-//!    version, its state and what is known (the doctor's words, sanitized),
-//!    a **Sign in** (or **Install**) where it needs a person, and its "Use
-//!    <product> on this machine" switch (`ai.<id>.use`). These say USE, not
-//!    supervise: the Harness page's "Supervise … sessions" switches are the
-//!    harness's hold on an agent's sessions, a thing apart. Sign in opens a
-//!    new tab that runs `aterm ai login <id>` (`App::ai_sign_in`).
-//! 3. **REVIEWS** — the rows Reviews across AIs (`ai.reviews`, on by
-//!    default) and Reviewer permissions (`ai.review_permissions`, inherit by
-//!    default), then who reviews and for how long, with Open aterm.toml at
-//!    `[ai] reviewers` (the list's order is a Manual row).
-//! 4. **FLEET DOCUMENT** — the rows This machine's name in the fleet
-//!    (`ai.machine`), Fleet document (`ai.fleet`, a path or an https:// URL)
-//!    and Fleet signer's public key (`ai.fleet_key`), then what became of the
-//!    document and what aterm holds of a URL's, with Fetch now (off the event
-//!    loop) and Open aterm.toml at `[ai] fleet`.
-//!
-//! The ordinary `settings/set/<key>` controls carry the rows, so OCC saves,
-//! Undo, Reset (which removes this machine's key, so it follows the fleet
-//! again), Search and Modified behave as on every page; the preferred CLI's
-//! row opens the ordinary choice picker, which takes the page while open.
+//! Native Settings `Harness ▸ AI CLIs` sub-page layout and actions.
 
 use super::harness_page::{CARD_GAP, metadata_cards, row_cards};
 use super::*;
 use crate::ai_screen::{AiAct, AiCliRow, AiProjection};
 use crate::native_app::HarnessRequest;
 
-/// Every action the page mints starts with this (`ai/refresh`,
-/// `ai/sign-in/<id>`, `ai/open-config/<what>`).
+/// Prefix for all action identifiers minted by the AI CLIs page.
 pub(crate) const AI_ACTION_PREFIX: &str = "ai/";
 
-/// The page's registry rows' prefix: every `[ai]` key with a row.
+/// Registry key prefix for `[ai]` settings rows.
 pub(super) const AI_KEY_PREFIX: &str = "ai.";
 
-/// The Refresh button's key and action: look at the AI CLIs again.
+/// Action identifier for the Refresh button.
 pub(super) const AI_REFRESH: &str = "ai/refresh";
 
-/// The REVIEWS card's Open aterm.toml: the editor at `[ai] reviewers`.
+/// Action identifier for opening `aterm.toml` at `[ai] reviewers`.
 pub(super) const AI_OPEN_REVIEWS: &str = "ai/open-config/reviewers";
 
-/// The FLEET DOCUMENT card's Open aterm.toml: the editor at `[ai] fleet`.
+/// Action identifier for opening `aterm.toml` at `[ai] fleet`.
 pub(super) const AI_OPEN_FLEET: &str = "ai/open-config/fleet";
 
-/// The FLEET DOCUMENT card's Fetch now: fetch the document from its URL.
+/// Action identifier for fetching the fleet document immediately.
 pub(super) const AI_FLEET_FETCH: &str = "ai/fleet-fetch";
 
 /// A CLI's Sign in (or Install): `ai/sign-in/<id>`.
@@ -64,9 +33,7 @@ const AI_SIGN_IN_PREFIX: &str = "ai/sign-in/";
 /// own, so a status row's button stands in the switches' column.
 const ROW_GAP: f32 = 12.0;
 
-/// The page's registry rows, in the registry's order: every row of an `[ai]`
-/// key ([`prefs::NESTED_LEAVES`]), so a fifth CLI's switch is on the page with
-/// no list here.
+/// Iterates over all `[ai]` registry setting rows in declaration order.
 pub(super) fn ai_page_rows() -> impl Iterator<Item = &'static str> {
     prefs::NESTED_LEAVES
         .iter()
@@ -90,14 +57,13 @@ const FLEET_ROWS: [&str; 3] = [
 /// The words a row adds where its value came from the fleet document.
 const FROM_FLEET: &str = "From the fleet document.";
 
-/// The action of `id`'s Sign in (or Install).
+/// Formats the Sign-in / Install action identifier for CLI `id`.
 #[must_use]
 pub(super) fn sign_in_action(id: &str) -> String {
     format!("{AI_SIGN_IN_PREFIX}{id}")
 }
 
-/// The page's subtitle, which yields to nothing: it must fit the compact
-/// phone page and the minimum Medium measure.
+/// Returns the subtitle for the AI CLIs page at `width`.
 pub(super) fn ai_page_subtitle(width: SettingsWidth) -> &'static str {
     if width == SettingsWidth::Compact {
         "Logins, the preferred CLI, reviews."
@@ -106,7 +72,7 @@ pub(super) fn ai_page_subtitle(width: SettingsWidth) -> &'static str {
     }
 }
 
-/// The page's palette commands while it is the route.
+/// Builds command-palette entries for the AI CLIs page.
 pub(super) fn ai_commands(ai: &crate::ai_screen::AiState) -> Vec<Command> {
     vec![
         Command {
@@ -137,11 +103,7 @@ pub(super) fn ai_commands(ai: &crate::ai_screen::AiState) -> Vec<Command> {
 }
 
 impl SettingsApp {
-    /// A press on the page ([`AI_ACTION_PREFIX`]): Refresh and a CLI's Sign in
-    /// become typed host requests ([`HarnessRequest`]); Open aterm.toml is the
-    /// Manual route's own act, aimed at the key its card shows. A Sign in for
-    /// a CLI the newest look does not have needing a person writes nothing
-    /// and says why.
+    /// Handles an `ai/*` action press on the AI CLIs page.
     pub(super) fn reduce_ai_action(
         &mut self,
         view: &mut SettingsViewState,
@@ -197,8 +159,7 @@ impl SettingsApp {
     }
 }
 
-/// THE PAGE: its heading pinned, then its cards as one scrolling list. While
-/// a choice picker for one of its rows is open, the picker takes the page.
+/// Builds the AI CLIs settings page UI node and layout metrics.
 pub(super) fn ai_page(
     state: &SettingsViewState,
     ai: &AiProjection,
@@ -280,10 +241,7 @@ fn ai_cards(
     room: f32,
 ) -> Vec<(UiNode, f32)> {
     let inner = card_text_width(card_width);
-    // Each fact card its own label column ([`fact_label_width`]).
     let label_width = |rows: &[(String, String)]| fact_label_width(rows, inner);
-    // What one row of a continued card may take: the room under its heading,
-    // at the tight padding.
     let heading_height = 22.0_f32.max(16.0 * settings_text_scale());
     let row_room =
         (room - 2.0 * super::harness_page::TIGHT_CARD_PAD - heading_height - CARD_GAP).max(0.0);
@@ -391,9 +349,7 @@ fn setting_rows(
 }
 
 /// The AI CLIS card's rows: who needs you, then for each CLI its status row
-/// and its "Use on this machine" switch. The switches' shared note is drawn
-/// once, after the last of them ([`prefs::RowNote::Shared`]); a switch whose
-/// value came from the fleet document says so in its own row.
+/// and its "Use on this machine" switch.
 fn cli_rows(
     state: &SettingsViewState,
     ai: &AiProjection,
@@ -408,8 +364,6 @@ fn cli_rows(
         .iter()
         .map(|row| format!("ai.{}.use", row.id))
         .collect();
-    // A switch's own note: that its value came from the fleet document, and
-    // the switches' note where it is the only one.
     let own: Vec<Option<String>> = ai
         .clis
         .iter()
@@ -424,8 +378,6 @@ fn cli_rows(
             (!words.is_empty()).then(|| words.join(" "))
         })
         .collect();
-    // The switches are one box under their status rows: their facts are
-    // placed alike ([`place_box_facts`]).
     let switches: Vec<(&str, Option<prefs::RowNote<'_>>)> = keys
         .iter()
         .map(String::as_str)
@@ -436,7 +388,6 @@ fn cli_rows(
         .collect();
     let mut placed = page_finished_rows(state, &switches, width, inner, None);
     place_box_facts(&mut placed);
-    // Two switches or more share their note, after the last of them.
     if last > 0
         && let Some(closing) = placed.last_mut()
     {
@@ -471,14 +422,7 @@ fn quiet_line(key: &str, text: &str, width: f32) -> (UiNode, f32) {
 
 /// One CLI's status row: its name and version over its state and fact
 /// (each wrapped whole to the text column; the row's group carries both), and its
-/// Sign in or Install where it needs a person. A row on a line where the
-/// measure allows; stacked on a compact page.
-///
-/// A ONE-LINE ROW TALLER THAN A SCREEN STACKS (`row_room`, what one row of
-/// the card may take): its words over its button, a column the list lists
-/// a line at a time, so every line of it is whole on some screen — a row
-/// cannot be listed in parts, and at 2× text in a 182pt-tall window its
-/// fact's lines beside Install stood taller than the list.
+/// Sign in or Install where it needs a person.
 fn cli_status_row(
     row: &AiCliRow,
     width: SettingsWidth,
@@ -508,7 +452,6 @@ fn cli_status_row_as(
     let key = format!("ai/cli/{}", row.id);
     let button = row.act.map(|act| {
         let label = act.label();
-        // One width for every act, so the buttons stand as one column.
         let button_width = [AiAct::SignIn, AiAct::Install]
             .iter()
             .map(|act| crate::native_ui::native_button_label_width(act.label()) + 40.0)
@@ -541,9 +484,6 @@ fn cli_status_row_as(
                     } else {
                         Length::Fixed(button_width)
                     })
-                    // Beside words on lines, the band a one-line row's
-                    // control has, at the row's top: never stretched down
-                    // a row its words make taller.
                     .height(Length::Fixed(if compact {
                         control_height
                     } else {
@@ -553,22 +493,12 @@ fn cli_status_row_as(
             button_width,
         )
     });
-    // Beside its words, the button keeps the setting rows' control column:
-    // the same gap, and Reset's place after it (`reset_slot_width`).
     let text_width = match (&button, compact) {
         (Some((_, button_width)), false) => {
             (inner - button_width - reset_slot_width() - 2.0 * ROW_GAP).max(0.0)
         }
         _ => inner,
     };
-    // THE NAME AND THE FACT ARE WHOLE ON EVERY ROW: each wrapped to the
-    // text column ([`wrapped_words_node`]) — between words, a path at its
-    // folders — and the row as tall as its lines, on a stacked row and on a
-    // one-line row beside its button alike. A one-line row cut its fact to
-    // one line: at 2× text in a 1564pt window (the page's 720pt measure, a
-    // 434pt column beside Install and Reset's place) it read "not installed
-    // by aterm (a… …/reroute/claude)", two ellipses, the words saying what
-    // sits at that path gone, while the card's health line wrapped.
     let (title, title_height) = wrapped_words_node(
         &format!("{key}/title"),
         &row.title,
@@ -600,7 +530,6 @@ fn cli_status_row_as(
             height,
         );
     }
-    // A setting row's band: its controls inset 4 above and below.
     let height = width.row_height().max(title_height + detail_height + 8.0);
     let words = UiNode::new(
         format!("{key}/words"),

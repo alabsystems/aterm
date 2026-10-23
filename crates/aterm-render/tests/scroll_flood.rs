@@ -2,18 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Bottom-pinned output flood: the shift-aware damage diff.
-//!
-//! A flood keeps `display_offset` at 0 while every output line advances
-//! `base_y`, so `compute_dirty_rows` admits the frame on its equal-offset arm
-//! and compares destination row `r` against source row `r`, which differs on
-//! every row of a slid screen; the rigid planner refuses it too, because the
-//! row the writer touched changed. `scroll_shift_plan(RetainedRows::Diff)`
-//! compares row `r` against row `r + da`, marks what really changed, and the
-//! CPU path blits the rest.
-//!
-//! Two halves: a count pin (a flood repaints a handful of rows, not the
-//! screen) and a byte-identity oracle (every rescued frame equals a fresh full
-//! repaint, since a row marked clean is a row whose pixels were moved).
 
 use aterm_core::render::{DecoBlend, DecoGlyph, InkCell, WordDecoration};
 use aterm_core::terminal::Terminal;
@@ -28,7 +16,6 @@ fn renderer_px(px: f32) -> Renderer {
         .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
-/// Render through the warm damage cache, assert byte-identity against a fresh
 /// full repaint of the same input, and return `(outcome, repainted_rows)`.
 fn render_both(
     warm: &mut Renderer,
@@ -57,10 +44,6 @@ fn render_both(
     (outcome, painted)
 }
 
-/// A bottom-pinned flood at 1/2/4/8/16 lines per frame repaints the exposed
-/// rows plus the overshoot apron, never the screen, and every frame is
-/// byte-identical to a full repaint. Swept over px because the seam geometry
-/// (`cell_h` parity, glyph overshoot) decides when a shift is unsound (13/14 px
 /// are the seam-hazard sizes, as in `scroll_blit.rs`).
 #[test]
 fn bottom_pinned_flood_repaints_the_exposed_strip_not_the_screen() {
@@ -70,8 +53,6 @@ fn bottom_pinned_flood_repaints_the_exposed_strip_not_the_screen() {
             let mut wc = WindowCpu::new();
             let (rows, cols) = (50usize, 60usize);
             let mut term = Terminal::new(rows as u16, cols as u16);
-            // Distinct lines: a uniform flood compares equal row for row and
-            // gate-hits.
             for i in 0..200 {
                 term.process(format!("line {i} \u{2502} output text here\r\n").as_bytes());
             }
@@ -96,9 +77,6 @@ fn bottom_pinned_flood_repaints_the_exposed_strip_not_the_screen() {
                     rescued += 1;
                 }
             }
-            // The ceiling: the exposed strip (`rate`), the row the writer was
-            // still filling, and the two-row overshoot apron. A row-against-itself
-            // diff reports `rows - 1` at every rate.
             let avg = painted_total as f64 / frames as f64;
             let ceiling = (rate + 4) as f64;
             assert!(
@@ -114,14 +92,6 @@ fn bottom_pinned_flood_repaints_the_exposed_strip_not_the_screen() {
     }
 }
 
-/// The flood with content that defeats a naive shift: accented capitals and box
-/// glyphs on every line (upward overshoot) and a shade-dither bar every fifth
-/// line (absolute-Y-parity rasters an odd-pixel shift lands at the wrong phase,
-/// so the planner re-rasters them). Byte-identity is the assertion, and the
-/// rescue must still fire.
-///
-/// The bar is periodic on purpose: with every row phase-sensitive and an odd
-/// shift nothing is left to blit, `render_core` declines the memmove, and the
 /// test would be vacuous.
 #[test]
 fn flood_with_shade_and_overshoot_content_is_byte_exact() {
@@ -170,8 +140,6 @@ fn flood_with_shade_and_overshoot_content_is_byte_exact() {
     }
 }
 
-/// A status line rewritten in place at viewport row 3 while the bottom floods:
-/// the shift-aware plan marks that row and the two above it (whose blitted
 /// copies carry its old upward overshoot), byte-identical to a full repaint.
 #[test]
 fn a_changed_row_mid_screen_rides_the_flood_byte_exact() {
@@ -187,8 +155,6 @@ fn a_changed_row_mid_screen_rides_the_flood_byte_exact() {
         let mut rescued = 0usize;
         let frames = 10usize;
         for f in 0..frames {
-            // Rewrite the status line, park the cursor back at the bottom-left
-            // so the frame is still a static-cursor slide, then flood a line.
             term.process(format!("\x1b[4;1H\u{2593} status {f} \u{c5}\u{2588}").as_bytes());
             term.process(format!("\x1b[{rows};1H").as_bytes());
             term.process(format!("flood {f} \u{c9} text\r\n").as_bytes());
@@ -212,9 +178,6 @@ fn a_changed_row_mid_screen_rides_the_flood_byte_exact() {
     }
 }
 
-/// `RetainedRows::Rigid` (the GPU present path) and `Diff` (the CPU path) differ
-/// only on a retained row whose content changed: wherever Rigid plans, Diff
-/// plans the same row set, and on a flood Rigid refuses while Diff rescues.
 /// Why the GPU keeps Rigid is measured at `RetainedRows::Rigid`.
 #[test]
 fn rigid_and_diff_agree_except_on_a_changed_retained_row() {
@@ -226,8 +189,6 @@ fn rigid_and_diff_agree_except_on_a_changed_retained_row() {
         term.process(format!("line {i} some output text\r\n").as_bytes());
     }
 
-    // (a) A history scroll with no content change (the GPU's arm): both
-    // policies agree, set for set.
     let before = term.cell_frame(rows, cols);
     term.scroll_display(3);
     let after = term.cell_frame(rows, cols);
@@ -260,8 +221,6 @@ fn rigid_and_diff_agree_except_on_a_changed_retained_row() {
         "Diff must mark exactly Rigid's rows when no retained row changed"
     );
 
-    // (b) A flood frame: one retained row (the line the writer was filling)
-    // changes, so Rigid refuses the plan and Diff rescues it.
     term.scroll_display(-3); // back to the bottom
     let pinned = term.cell_frame(rows, cols);
     term.process(b"a flooded line of output\r\n");
@@ -306,11 +265,9 @@ fn rigid_and_diff_agree_except_on_a_changed_retained_row() {
     );
 }
 
-/// How a case lays the card line's ink and star for the frame `k` lines into
 /// the flood: the line's row then, and the row and column the overlays sit on.
 type Overlay = fn(usize, usize) -> (Vec<InkCell>, Vec<WordDecoration>);
 
-/// The ink of an 8-cell word starting at column 2 of `row` (a gradient), in
 /// colour family `tone`.
 fn word_ink(row: usize, tone: u8) -> Vec<InkCell> {
     (0..8)
@@ -322,7 +279,6 @@ fn word_ink(row: usize, tone: u8) -> Vec<InkCell> {
         .collect()
 }
 
-/// The star leading the line on `row`, its sprite in the row's own band
 /// (`dy` 0) unless `dy` says otherwise.
 fn star(row: usize, col: u16, dy: i8) -> WordDecoration {
     WordDecoration {
@@ -337,18 +293,6 @@ fn star(row: usize, col: u16, dy: i8) -> WordDecoration {
     }
 }
 
-/// ROW-LOCAL OVERLAYS RIDE THE FLOOD (B3, the inline card's line): a line's
-/// animated ink and its in-band star (`dy` 0), laid a row higher with every
-/// streamed line as the card host lays them, keep the shift-aware rescue and
-/// are slid with their row, not rebuilt. Overlays that do not move with their
-/// line are rebuilt on the rows they leave and reach: ink held on its row,
-/// ink recoloured, ink gone, a star moved along its row. Every frame equals a
-/// full repaint, at the overshoot-hazard sizes. A jittered star (`dy` ≠ 0)
-/// spills into the row above and still refuses the rescue.
-///
-/// The negative controls are mutations (run by hand, recorded in the lane
-/// report): dropping `row_overlays_differ_shifted` from the `Diff` arm of
-/// `scroll_shift_plan` fails "held" (the slid ink where the frame draws none),
 /// and dropping its decoration half fails "star moves".
 #[test]
 fn ink_and_an_in_band_star_ride_the_flood() {
@@ -385,8 +329,6 @@ fn ink_and_an_in_band_star_ride_the_flood() {
             for i in 0..60 {
                 term.process(format!("line {i} \u{c9}\u{c1} text\r\n").as_bytes());
             }
-            // The card's line, five rows up from the bottom, and the line
-            // the writer is filling.
             term.process(b"\xe2\x9c\xa6 the card line \xc3\x89\r\n");
             for i in 0..4 {
                 term.process(format!("after {i} \u{c5} text\r\n").as_bytes());
@@ -439,13 +381,6 @@ fn ink_and_an_in_band_star_ride_the_flood() {
     }
 }
 
-/// The RIGID plan (the GPU's history-scroll rescue) holds overlays to the
-/// same rule: a wheel scroll whose ink and star moved with their line plans
-/// the blit, and one whose ink stayed on its row refuses it (a retained row
-/// changed), as does one whose star stayed.
-///
-/// The negative control is a mutation (run by hand, recorded in the lane
-/// report): dropping `row_overlays_differ_shifted` from the `Rigid` check of
 /// `scroll_shift_plan` plans the held case.
 #[test]
 fn the_rigid_plan_refuses_overlays_that_stay_on_their_row() {

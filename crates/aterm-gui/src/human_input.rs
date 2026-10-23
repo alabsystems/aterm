@@ -13,18 +13,36 @@ pub(crate) struct HumanInputStamp {
     at: AtomicU64,
     count: AtomicU64,
     /// THE NUMBER OF THE LAST GESTURE THAT REACHED THE PROGRAM,
+    /// `0` for none: a key that encodes to
+    /// bytes, text, a paste, a wheel the program is sent (a report or
+    /// alternate scroll), a mouse press under tracking, a drag the tracking
+    /// mode reports ([`reaches_program`]).
     reached: AtomicU64,
     /// THE NUMBER OF THE LAST GESTURE THAT OPENED A BURST,
+    /// `0` for none: published after the count and
+    /// before [`Self::reached`], so a reading that holds a reaching
+    /// gesture's number holds whether it opened a burst.
     burst: AtomicU64,
     /// The same moment on the clock that counts through sleep
+    /// (`aterm_uds::process::continuous_ms`) plus one, `0` for never or no
+    /// such clock: what the survey's `human_ms=` is taken on
+    /// ([`Self::age_ms`]).
     at_continuous: AtomicU64,
     /// The number of the last gesture that was [`Gesture::PlainEnter`]; `0`
+    /// for none.
     last_plain_enter: AtomicU64,
     /// THE OUTGOING PROCESS'S AGE OF THE LAST GESTURE, in milliseconds plus
+    /// one (so `0` stays "none carried"), as of [`Self::carried_at`]
+    /// ([`Self::carry`]): read only while no gesture of this process is
+    /// stamped (`at` is `0`), every one of which is later.
     carried_ms: AtomicU64,
     /// When the carried age was taken here ([`crate::metrics::now_us`]).
     carried_at: AtomicU64,
     /// WHEN THE HOST BEGAN SERVING THE SESSION, on this process's clock
+    /// ([`crate::metrics::now_us`], microseconds): its start here, or the
+    /// Commit a seamless successor adopted it at — earlier than this
+    /// process's own start (negative) where the outgoing process said how
+    /// long it served the shell with no person's gesture ([`Self::serve_from`]).
     served_from_us: AtomicI64,
 }
 
@@ -252,6 +270,8 @@ impl crate::App {
     }
 
     /// [`Self::write_person_stamps_at_commit`] for the pool sessions `ids`,
+    /// at `path`: each one's keyed age, or how long it was served with no
+    /// person's gesture ([`HumanInputStamp::unkeyed_ms`]).
     fn write_person_stamps_of(
         &self,
         ids: &[u64],
@@ -418,6 +438,7 @@ mod tests {
     }
 
     /// Never until a gesture, then the time since it, whole milliseconds;
+    /// a clock read that raced behind the stamp reads 0, never wraps.
     #[test]
     fn the_stamp_reads_never_then_the_time_since() {
         let s = HumanInputStamp::default();
@@ -434,6 +455,9 @@ mod tests {
     }
 
     /// A CARRIED STAMP READS ITS AGE ON, AND A GESTURE HERE TAKES OVER (LC-4
+    /// of ): carried 90 s old, the session reads 90 s at the
+    /// carry and 100 s ten seconds on — never "never" — with its count still
+    /// this process's; a gesture here then reads from itself.
     #[test]
     fn a_carried_stamp_reads_its_age_on_until_a_gesture_here() {
         let s = HumanInputStamp::default();
@@ -457,6 +481,7 @@ mod tests {
     }
 
     /// A reader that loads the count and then the stamp (the order `status` and `text --json`
+    /// use) never sees gesture `n` counted beside an earlier gesture's stamp.
     #[test]
     fn a_read_that_sees_a_gesture_counted_sees_its_stamp() {
         use std::sync::Arc;
@@ -493,6 +518,8 @@ mod tests {
     }
 
     /// The first gesture and the first after
+    /// [`crate::session_timeline::HUMAN_BURST_GAP_MS`] of quiet open a burst; gestures inside one
+    /// do not, however long it lasts.
     #[test]
     fn a_persons_burst_opens_after_the_gap_without_input() {
         let gap_us = crate::session_timeline::HUMAN_BURST_GAP_MS * 1000;
@@ -523,6 +550,7 @@ mod tests {
     }
 
     /// The App input seam ([`crate::App::input`]) stamps a person's arrow, never a controller's
+    /// arrow, a key release or a focus change.
     #[test]
     fn the_seam_stamps_a_persons_arrow_and_never_a_controllers() {
         use crate::input::Source;
@@ -555,6 +583,12 @@ mod tests {
     }
 
     /// THE PERSON'S STAMPS CROSS A SEAMLESS UPDATE (LC-4 of ):
+    /// the outgoing process writes, for the sessions it hands over, the age
+    /// of each one's last person's gesture — a stamp it carried itself from
+    /// an earlier update included — and for a session nobody keyed, how long
+    /// it served it so (`-<age>`, the review's KR-2); the successor's Commit
+    /// carries each onto the shell adopted under the id it names and
+    /// consumes the sidecar.
     #[cfg(unix)]
     #[test]
     fn the_persons_stamps_cross_a_seamless_update_at_its_commit() {
@@ -646,6 +680,10 @@ mod tests {
     }
 
     /// NEVER, AND FOR HOW LONG (the review of LC-4, KR-2): a session reads
+    /// how long the host has served it with nobody's gesture, from its start
+    /// here or the age [`HumanInputStamp::serve_from`] gives it, and nothing
+    /// once a person keyed it — here, or carried; a start ahead of the
+    /// clock reads `0`, never wraps.
     #[test]
     fn a_never_keyed_session_reads_how_long_it_was_served() {
         let s = HumanInputStamp::default();
@@ -681,6 +719,8 @@ mod tests {
     }
 
     /// THE PLAIN-ENTER MARKER, through the real App input seam
+    /// ([`crate::App::input`], the headless App's session 0): a person's
+    /// Enter press marks the count's last gesture as a plain Enter.
     #[test]
     fn only_a_persons_plain_enter_press_marks_the_count() {
         use crate::input::{PasteFraming, Source};
@@ -746,6 +786,7 @@ mod tests {
     }
 
     /// An arrow, a digit, Enter, a chord and a paste count; a release, a focus change and a
+    /// resize do not.
     #[test]
     fn navigation_counts_and_releases_hovers_focus_and_geometry_do_not() {
         assert!(is_person_gesture(&key(KeyEventType::Press)));
@@ -772,6 +813,8 @@ mod tests {
     }
 
     /// THE COUNTS ARE ONE READING: at the one point a note
+    /// can be read apart (counted, its class not yet published) the reading
+    /// holds the gesture's count and not its class; after the note, both.
     #[test]
     fn a_reading_that_sees_a_gesture_reach_the_program_counts_it() {
         let s = HumanInputStamp::default();
@@ -798,6 +841,9 @@ mod tests {
     }
 
     /// A DRAG REACHES THE PROGRAM ONLY WHERE ITS MODE REPORTS MOTION (T1,
+    /// T39): under X10 (9) and normal (1000) tracking a held-button motion
+    /// sends nothing, so it neither dismisses a box nor answers mail; under
+    /// button-event (1002) and any-event (1003) tracking it is reported.
     #[test]
     fn a_drag_reaches_the_program_only_where_its_mode_reports_motion() {
         use crate::input::PixelOffset;

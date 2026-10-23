@@ -39,22 +39,28 @@ impl Fault {
 /// Where a shell starts when neither its folder nor the home folder answers.
 pub(crate) const LOCAL_STAND_IN: &str = "/";
 
-/// How long a spawn waits for the folder check. A local folder answers in
+/// How long a spawn waits for the folder check.
 #[cfg(all(unix, not(test)))]
 const CHECK_BUDGET: Duration = Duration::from_millis(250);
 
 /// This crate's tests judge local scratch folders, whose check must answer:
+/// they wait it as a hang detector, since a loaded parallel run starved a
+/// check of 250 ms and read its folder as kept (the restore and spawn suites
+/// on the Linux lane).
 #[cfg(all(unix, test))]
 const CHECK_BUDGET: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// The most checks left waiting on a hung volume at once: past this, a spawn
+/// does not start another and judges its folder as one that did not answer
+/// ([`start_fault`]), so a mount that stopped answering costs a bounded number
+/// of parked threads.
 #[cfg(unix)]
 const CHECKS_IN_FLIGHT_MAX: usize = if cfg!(test) { 64 } else { 4 };
 
 #[cfg(unix)]
 static CHECKS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
-/// Each check still running, by its folder and when it started. A folder whose
+/// Each check still running, by its folder and when it started.
 #[cfg(unix)]
 static CHECKS_RUNNING: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
 
@@ -78,6 +84,8 @@ pub(crate) fn folder_fault(dir: &str) -> Option<Fault> {
 }
 
 /// [`folder_fault`] over its check, its cap and its mount table: not judged,
+/// at once, for a folder beside a check that did not answer
+/// ([`beside_silent`]).
 #[cfg(unix)]
 fn folder_fault_in(
     in_flight: &'static AtomicUsize,
@@ -112,6 +120,7 @@ pub(crate) fn start_fault(dir: &str) -> Option<Fault> {
 }
 
 /// [`start_fault`] over its check, its cap and its mount table (`mount`: the
+/// mount point holding a folder on a volume that is not local).
 #[cfg(unix)]
 fn start_fault_in(
     in_flight: &'static AtomicUsize,
@@ -175,12 +184,16 @@ fn answers_in(
 }
 
 /// [`volume_answers`]'s look without the time limit: what it finds is not the
+/// question, only that the volume answered.
 #[cfg(unix)]
 fn look_now(dir: &str) {
     let _ = std::fs::symlink_metadata(dir);
 }
 
 /// Whether `dir` sits on a volume that is not local (`mount` names the mount
+/// point holding a folder on one, `None` for a local one) beside a check that
+/// has run past `budget`: a check of another folder on that same mount,
+/// still running.
 #[cfg(unix)]
 fn beside_silent(dir: &str, budget: Duration, mount: impl Fn(&str) -> Option<PathBuf>) -> bool {
     let silent: Vec<String> = CHECKS_RUNNING
@@ -218,6 +231,9 @@ pub(crate) fn canonical_folder(dir: &str) -> Option<String> {
 }
 
 /// [`canonical_folder`] over its check, its cap, its budget and its mount
+/// table: `None` where the check found no canonical form, did not answer
+/// within `budget`, could not start with the cap full, or sits beside a check
+/// that did not answer ([`beside_silent`]).
 #[cfg(unix)]
 fn canonical_in(
     in_flight: &'static AtomicUsize,
@@ -232,7 +248,7 @@ fn canonical_in(
     within(in_flight, budget, dir, check).flatten()
 }
 
-/// [`canonical_folder`] without the time limit. On Windows it is spelled
+/// [`canonical_folder`] without the time limit.
 fn canonical_now(dir: &str) -> Option<String> {
     let canonical = std::fs::canonicalize(dir).ok()?;
     let canonical = canonical.to_string_lossy().into_owned();
@@ -242,6 +258,8 @@ fn canonical_now(dir: &str) -> Option<String> {
 }
 
 /// `canonical` without the verbatim prefix Windows' `canonicalize` answers
+/// with, where the path has a spelling without it: `\\?\C:\x` is `C:\x`, and
+/// `\\?\UNC\srv\share\x` is `\\srv\share\x`.
 #[cfg(any(windows, test))]
 fn without_verbatim(canonical: &str) -> Option<String> {
     let rest = canonical.strip_prefix(r"\\?\")?;
@@ -253,6 +271,11 @@ fn without_verbatim(canonical: &str) -> Option<String> {
 }
 
 /// Run `check(dir)` on a thread of its own and wait at most `budget` for it:
+/// `Some` of its answer, or `None` when it did not answer in time, when a
+/// check of `dir` started earlier is still running past `budget`
+/// ([`CHECKS_RUNNING`]: it did not answer either), when
+/// [`CHECKS_IN_FLIGHT_MAX`] checks counted in `in_flight` are already waiting,
+/// or when no thread could be started.
 #[cfg(unix)]
 fn within<T: Send + 'static>(
     in_flight: &'static AtomicUsize,
@@ -303,6 +326,7 @@ fn within<T: Send + 'static>(
 }
 
 /// [`folder_fault`] without the time limit: `stat`, then `access(X_OK)` for a
+/// folder that is there.
 #[cfg(unix)]
 fn fault_now(dir: &str) -> Option<Fault> {
     let judged = |error: &std::io::Error| match error.raw_os_error() {
@@ -326,12 +350,17 @@ fn fault_now(dir: &str) -> Option<Fault> {
 }
 
 /// Whether `dir` is on a volume that is not local, by the kernel's mount
+/// table ([`mount_table`]) read through this machine's path aliases
+/// ([`Aliases::here`]) — the one question about a folder whose check hangs
+/// that cannot hang too.
 #[cfg(unix)]
 fn remote_volume(dir: &str) -> bool {
     remote_mount_here()(dir).is_some()
 }
 
 /// The mount point holding a folder on a volume that is not local, by this
+/// machine's mount table ([`mount_table`], read at the first ask and kept for
+/// the rest of the closure's life) and path aliases ([`remote_mount_of`]).
 #[cfg(unix)]
 fn remote_mount_here() -> impl Fn(&str) -> Option<PathBuf> {
     let table = std::cell::OnceCell::new();
@@ -346,6 +375,9 @@ fn remote_mount_here() -> impl Fn(&str) -> Option<PathBuf> {
 }
 
 /// PURE: the mount point, spelled one way by `aliases`, of the mount that
+/// holds `dir` — the longest mount point that is a whole-component prefix of
+/// it, both so spelled, and of equal ones the last listed, the one mounted on
+/// top — when that mount is not local; `None` for a folder on a local one.
 #[cfg(unix)]
 fn remote_mount_of<'a>(
     dir: &str,
@@ -376,12 +408,16 @@ pub(crate) struct Aliases {
 const DATA_VOLUME: &str = "/System/Volumes/Data";
 
 /// How many root links one spelling follows: a synthetic link can point
+/// through another (`/home`), never round in a loop the kernel would refuse.
 #[cfg(unix)]
 const LINK_HOPS: usize = 4;
 
 #[cfg(unix)]
 impl Aliases {
     /// PURE: the aliases named by the root's symlinks (`links`: a name at `/`
+    /// and its target as read, relative ones relative to `/`) and the text of
+    /// `/usr/share/firmlinks` (`firmlinks`: a path, a tab, the same folder
+    /// relative to the data volume, per line).
     fn of(links: impl IntoIterator<Item = (PathBuf, PathBuf)>, firmlinks: &str) -> Self {
         Self {
             links: links
@@ -398,6 +434,7 @@ impl Aliases {
     }
 
     /// PURE: `path` spelled one way: root links followed (up to [`LINK_HOPS`]),
+    /// then a firmlink's path spelled on the data volume.
     fn spelled(&self, path: &Path) -> PathBuf {
         let mut path = path.to_path_buf();
         for _ in 0..LINK_HOPS {
@@ -410,6 +447,8 @@ impl Aliases {
     }
 
     /// `path` with the longest of `aliases` it starts with (by whole
+    /// components) replaced by that alias's target; `None` when it starts with
+    /// none.
     fn through(aliases: &[(PathBuf, PathBuf)], path: &Path) -> Option<PathBuf> {
         aliases
             .iter()
@@ -425,6 +464,7 @@ impl Aliases {
     }
 
     /// This machine's aliases, read once (the launch reads them ahead,
+    /// [`warm`]).
     fn here() -> &'static Self {
         static HERE: std::sync::OnceLock<Aliases> = std::sync::OnceLock::new();
         HERE.get_or_init(|| {
@@ -445,6 +485,8 @@ pub(crate) fn warm() {
 }
 
 /// The root's symlinks and their targets as read: entries of `/`, the root
+/// volume (sealed on macOS), each typed from its directory record, so nothing
+/// here asks a network volume mounted on one of them.
 #[cfg(unix)]
 fn root_links() -> Vec<(PathBuf, PathBuf)> {
     let Ok(entries) = std::fs::read_dir("/") else {
@@ -467,6 +509,8 @@ unsafe extern "C" {
 }
 
 /// Every mount point, and whether its volume is local (`MNT_LOCAL`), as the
+/// kernel last recorded them: `MNT_NOWAIT` asks no file system to refresh its
+/// numbers, so a hung mount is listed without being touched.
 #[cfg(target_os = "macos")]
 fn mount_table() -> Vec<(std::path::PathBuf, bool)> {
     use std::os::unix::ffi::OsStringExt as _;
@@ -504,18 +548,23 @@ fn mount_table() -> Vec<(std::path::PathBuf, bool)> {
 }
 
 /// Every mount point of this process's mount namespace, and whether its volume
+/// is local, from `/proc/self/mountinfo` as the machine's one mount-table reader
+/// reads it ([`aterm_sysprobe::volumes::table`]): the kernel prints it from its own
+/// records, asking no file system, so a hung share is listed without being
+/// touched.
 #[cfg(target_os = "linux")]
 fn mount_table() -> Vec<(std::path::PathBuf, bool)> {
     judged(aterm_sysprobe::volumes::table())
 }
 
 /// No mount table is read on another Unix: every folder is judged local, and a
+/// check that does not answer keeps its folder.
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 fn mount_table() -> Vec<(std::path::PathBuf, bool)> {
     Vec::new()
 }
 
-/// PURE: `table`'s mount points, each with whether its volume is local. A table
+/// PURE: `table`'s mount points, each with whether its volume is local.
 #[cfg(any(target_os = "linux", all(test, unix)))]
 fn judged(table: aterm_sysprobe::volumes::Table) -> Vec<(PathBuf, bool)> {
     let whole = table.complete;
@@ -687,6 +736,10 @@ pub(crate) fn retarget_folder(dir: &str) -> Option<String> {
 }
 
 /// PURE: [`retarget_folder`] over `remote` ([`remote_volume`]) and `read`
+/// (the bounded read of the kernel path, [`retarget_now`]): nothing for a
+/// folder judged not local, and nothing for one whose kernel path is — a
+/// person's own symlink into a network volume is judged local by the folder
+/// it is in, and only the read, bounded, follows it there.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn retarget_folder_in(
     dir: &str,
@@ -700,6 +753,8 @@ fn retarget_folder_in(
 }
 
 /// [`retarget_folder`] without the time limit, against this process's own
+/// `HOME` and `PWD`, which every shell it spawns inherits (`aterm_pty` sets
+/// neither).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn retarget_now(dir: &str) -> Option<String> {
     let kernel = kernel_path(dir)?;
@@ -733,6 +788,9 @@ pub(crate) fn retarget_in(
 }
 
 /// The path the kernel records for folder `dir` — what `getcwd()` answers
+/// there: through a firmlink (`/Users`, not `/System/Volumes/Data/Users`),
+/// with every symlink resolved and the names' own case — from
+/// `getattrlist(ATTR_CMN_FULLPATH)`, a metadata read like `stat`.
 #[cfg(target_os = "macos")]
 fn kernel_path(dir: &str) -> Option<String> {
     #[repr(C)]
@@ -800,7 +858,7 @@ fn kernel_path(dir: &str) -> Option<String> {
     String::from_utf8(text.get(..len)?.to_vec()).ok()
 }
 
-/// See the macOS twin. Linux: the path the kernel names for the folder's own
+/// See the macOS twin.
 #[cfg(target_os = "linux")]
 fn kernel_path(dir: &str) -> Option<String> {
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -816,10 +874,11 @@ fn kernel_path(dir: &str) -> Option<String> {
 }
 
 static NOTED_PENDING: AtomicBool = AtomicBool::new(false);
-/// The folders noted since the last park, oldest first, each once. Every
+/// The folders noted since the last park, oldest first, each once.
 static NOTED: Mutex<Vec<(String, Fault)>> = Mutex::new(Vec::new());
 
 /// Note a folder a shell was asked to start in and could not, for the next
+/// park's row.
 fn note(dir: String, fault: Fault) {
     let Ok(mut noted) = NOTED.lock() else {
         return;
@@ -896,6 +955,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     /// A WORKER'S TRUSTED FOLDER is spelled as Claude Code's folder-trust
+    /// dialog spells it: Windows' verbatim `\\?\` prefix comes off a drive's
+    /// path and a share's; a path with no other spelling keeps it, and any
+    /// other path is not one this rewrites.
     #[test]
     fn a_canonical_folder_is_spelled_without_the_verbatim_prefix() {
         for (verbatim, plain) in [
@@ -922,6 +984,7 @@ mod tests {
     }
 
     /// Each way a folder is Missing or Shut; the scratch folder itself is the
+    /// negative control.
     #[cfg(unix)]
     #[test]
     fn each_folder_a_shell_cannot_start_in_is_judged_and_a_folder_is_not() {
@@ -929,6 +992,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         use std::sync::atomic::AtomicUsize;
         /// This test's own in-flight count: the process-wide one is shared
+        /// with every test that spawns a shell in a folder.
         static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
         let folder_fault =
             |dir: &str| within(&IN_FLIGHT, Duration::from_secs(60), dir, fault_now).flatten();
@@ -963,6 +1027,8 @@ mod tests {
     }
 
     /// A CHECK THAT DOES NOT ANSWER KEEPS A LOCAL FOLDER: `within` gives up on
+    /// a check still running, so a hung volume costs the wait, never the event
+    /// loop, and a spawn keeps a folder on a local volume.
     #[cfg(unix)]
     #[test]
     fn a_check_that_does_not_answer_in_time_keeps_the_folder() {
@@ -970,8 +1036,11 @@ mod tests {
         use std::sync::{Condvar, Mutex, PoisonError};
 
         /// This test's own in-flight count: the process-wide one is shared with
+        /// every test that spawns a shell in a folder, and four checks those
+        /// leave waiting would fill the cap and turn this `None` into the cap's.
         static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
         /// The hung check has started (so a `None` is the budget's, not the
+        /// in-flight cap's), and the gate it waits behind until the verdict.
         static ENTERED: AtomicBool = AtomicBool::new(false);
         static GATE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
         fn hangs(_: &str) -> Option<Fault> {
@@ -1028,6 +1097,9 @@ mod tests {
     }
 
     /// WITH THE CAP FULL NO CHECK STARTS, and the folder is judged as one that
+    /// did not answer: a folder on a volume that is not local is
+    /// `Unresponsive`, never handed to the child's `chdir` unchecked; a local
+    /// one stands.
     #[cfg(unix)]
     #[test]
     fn a_full_cap_judges_the_folder_by_its_volume() {
@@ -1056,6 +1128,9 @@ mod tests {
     }
 
     /// A FOLDER WHOSE CHECK IS STILL RUNNING PAST THE BUDGET IS ANSWERED AT
+    /// ONCE: the next spawn there starts no second check to wait out beside the
+    /// first (the control socket's `spawn cwd=` checked twice, a New Tab again
+    /// each time), and judges the folder as one that did not answer.
     #[cfg(unix)]
     #[test]
     fn a_folder_whose_check_has_not_answered_is_not_checked_again_beside_it() {
@@ -1113,6 +1188,11 @@ mod tests {
     }
 
     /// A CHECK PAST THE BUDGET ANSWERS FOR ITS WHOLE VOLUME WHEN THAT VOLUME IS
+    /// NOT LOCAL: once one folder's check on a network share has run past the
+    /// budget, every other folder there is judged at once — a spawn's as one
+    /// that did not answer, the restore's count and `spawn cwd=`'s refusal as
+    /// not judged, a worker's folder as not trusted, the identities' folder as
+    /// not answering — and no check starts beside it.
     #[cfg(unix)]
     #[test]
     fn a_check_past_the_budget_answers_for_its_whole_volume_when_it_is_not_local() {
@@ -1209,6 +1289,11 @@ mod tests {
     }
 
     /// A VOLUME ANSWERS BY A LOOK IN TIME, AND A LOCAL ONE IS READ ANYWAY
+    /// (`volume_answers`, the state folder): a look that answers —
+    /// whatever it found — says a network volume answers; one that does not
+    /// answer in time says it does not, and the same question again is
+    /// answered at once, with no second look; a local volume is read with no
+    /// look made, since its silence would be a starved CPU's.
     #[cfg(unix)]
     #[test]
     fn a_volume_answers_by_a_look_in_time_and_a_local_one_is_read_anyway() {
@@ -1281,6 +1366,9 @@ mod tests {
     }
 
     /// A WORKER'S FOLDER IS TRUSTED ONLY AS READ IN TIME: its canonical form
+    /// read past the budget, or not read at all with the cap full, is `None`
+    /// (`spawn agent= cwd=` then trusts nothing, and the harness asks), where
+    /// the check would have answered a folder.
     #[cfg(unix)]
     #[test]
     fn a_workers_folder_read_late_or_never_trusts_nothing() {
@@ -1288,9 +1376,11 @@ mod tests {
         use std::sync::{Condvar, Mutex, PoisonError};
 
         /// This test's own in-flight counts (the process-wide one is shared
+        /// with every test that spawns a shell in a folder).
         static FULL: AtomicUsize = AtomicUsize::new(super::CHECKS_IN_FLIGHT_MAX);
         static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
         /// The hung check has started (so its `None` is the budget's, not the
+        /// cap's), and the gate it waits behind until the verdict.
         static ENTERED: AtomicBool = AtomicBool::new(false);
         static GATE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
         fn answers(_: &str) -> Option<String> {
@@ -1339,6 +1429,9 @@ mod tests {
     }
 
     /// THE VOLUME IS THE LONGEST MOUNT POINT HOLDING THE FOLDER, by whole path
+    /// components: a network share under a local root is not local, a local
+    /// mount inside a share is, `/Volumes/shared` is not inside
+    /// `/Volumes/share`, and a path no mount holds is local.
     #[cfg(unix)]
     #[test]
     fn a_folder_is_judged_by_the_longest_mount_that_holds_it() {
@@ -1372,6 +1465,12 @@ mod tests {
     }
 
     /// A FOLDER BEHIND MACOS'S FIXED ALIASES IS JUDGED BY THE MOUNT BEHIND
+    /// THEM, read lexically from the root's links and `/usr/share/firmlinks`
+    /// as this machine has them: `/home` is the automounter's map on the data
+    /// volume (not local), so a network home is no longer judged by `/`; a
+    /// share recorded as `/Volumes/share` holds the same folder spelled on the
+    /// data volume; and a local disk mounted inside a firmlinked folder still
+    /// wins over a share recorded around it the other way.
     #[cfg(unix)]
     #[test]
     fn a_folder_behind_a_root_link_or_firmlink_is_judged_by_the_mount_behind_it() {
@@ -1412,6 +1511,12 @@ mod tests {
     }
 
     /// LINUX'S MOUNT TABLE, AS `/proc/self/mountinfo` WRITES IT AND THE
+    /// MACHINE'S ONE READER READS IT ([`aterm_sysprobe::volumes::parse_mountinfo`]):
+    /// a disk, a memory file system, a btrfs subvolume with propagation tags and
+    /// a bind mount are local; NFS, SMB, sshfs, NTFS through FUSE, a VM's host
+    /// share (its mount point written with an escaped space), WSL's drive share,
+    /// the automounter's map and CephFS are not; and a share mounted over a
+    /// local folder at one point judges it, being listed after.
     #[cfg(unix)]
     #[test]
     fn linux_mountinfo_judges_shares_and_user_space_volumes_not_local() {
@@ -1470,6 +1575,8 @@ mod tests {
     }
 
     /// THIS MACHINE'S MOUNT TABLE READS: a scratch folder and the root are on
+    /// local volumes, so a folder there that does not answer in time keeps
+    /// today's behaviour.
     #[cfg(unix)]
     #[test]
     fn a_scratch_folder_is_on_a_local_volume() {
@@ -1513,6 +1620,8 @@ mod tests {
     }
 
     /// The home folder stands in for a folder a shell cannot start in, naming it
+    /// and why; a present folder and an empty ask change nothing, and with no
+    /// home folder the request stands.
     #[test]
     fn a_folder_a_shell_cannot_start_in_starts_it_in_home_and_a_present_one_is_unchanged() {
         let fault = |dir: &str| match dir {
@@ -1566,6 +1675,10 @@ mod tests {
     }
 
     /// A SHELL HANDED NO FOLDER NEVER CHDIRS INTO A HOME THAT STOPPED
+    /// ANSWERING (session 0 of an aterm started from Finder): the folder the
+    /// PTY goes to unasked, on a volume that is not local by the mount table,
+    /// is checked, and silent it starts the shell in `/`, named as the home
+    /// that did not answer.
     #[test]
     fn a_home_that_stopped_answering_starts_an_unasked_shell_in_the_root() {
         let fault = |dir: &str| match dir {
@@ -1675,6 +1788,8 @@ mod tests {
     }
 
     /// A fall-back said once its shell is up reaches the queue in order, each
+    /// folder once, and the queue empties when taken; a start that used its
+    /// folder notes nothing.
     #[test]
     fn a_start_that_fell_back_reaches_the_queue_and_one_that_did_not_says_nothing() {
         let _lane = crate::message_inbox::lane_test_guard();
@@ -1704,6 +1819,7 @@ mod tests {
     }
 
     /// A held pane's folder (ssh: maybe another machine's) is taken only when it
+    /// is here; the same folder from a pane at its own prompt is taken.
     #[test]
     fn a_held_panes_folder_is_taken_only_when_it_is_here() {
         let gone = |dir: &str| (dir == "/home/me/proj").then_some(Fault::Missing);
@@ -1719,6 +1835,9 @@ mod tests {
     }
 
     /// A PARKED SPARE'S RETARGET names the one `$PWD` every shell's start
+    /// would: the folder's kernel path, unless the inherited `$HOME` or `$PWD`
+    /// names the folder spelled otherwise (zsh would take it, bash would not)
+    /// or one FIFO line cannot carry it.
     #[test]
     fn a_retarget_names_the_folder_only_as_every_shell_would() {
         use std::ffi::OsStr;
@@ -1753,6 +1872,8 @@ mod tests {
     }
 
     /// A retarget never moves a spare onto a volume that is not local: not to a
+    /// folder judged so (nothing is read there), and not through a person's
+    /// own symlink from a local folder into one (the bounded read lands there).
     #[test]
     fn a_retarget_never_lands_on_a_volume_that_is_not_local() {
         let remote = |dir: &str| dir.starts_with("/Volumes/share");
@@ -1778,6 +1899,8 @@ mod tests {
     }
 
     /// The kernel's path for a folder is what `getcwd()` names there (`pwd -P`
+    /// run in it): through the root's link and a firmlink, in the names' own
+    /// case.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_kernel_path_is_the_one_getcwd_names() {
@@ -1816,6 +1939,7 @@ mod tests {
     }
 
     /// Linux: the kernel's path for a folder is what `getcwd()` names there
+    /// (`pwd -P` run in it), every symlink on the way resolved.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_kernel_path_is_the_one_getcwd_names() {
@@ -1854,6 +1978,9 @@ mod tests {
     }
 
     /// A pane's folder read on the event loop and judged later, where the
+    /// spawn waits: a held pane's folder that is gone is not taken, one that is
+    /// here is, and a folder the pane's own shell reported is taken either way;
+    /// of several panes, the first whose folder is taken gives it.
     #[cfg(unix)]
     #[test]
     fn a_pane_folder_read_now_is_judged_when_the_spawn_runs() {

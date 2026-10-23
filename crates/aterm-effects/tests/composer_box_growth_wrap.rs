@@ -1,21 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Claude Code's composer wrap, with the real bytes: when typing wraps to a new line, the
-//! previous row's rainbow follows its text and flows toward the fold rather than vanishing,
-//! and the new row continues the walk without a hard colour edge.
-//!
-//! What the composer writes (captured from Claude Code under a Python pty, 90×30, one key per
-//! 60 ms): per ordinary key one glyph addressed from home; a Space a caret move only; and at
-//! the wrap key one chunk that repaints the bottom-anchored box one row higher without a
-//! scroll: the rule up a row, the text row rewritten a row up minus the word the wrap moved,
-//! the continuation row holding that word beside a glyph Ink's diff reused, and the caret
-//! making a same-row backward move.
-//!
-//! Every law runs at the host seam: a real `Terminal` driven byte for byte, rows sampled as
-//! `app_render.rs`'s frame hold samples them, ticked through `CursorGlow::tick` at 16.7 ms,
-//! keys at 60 ms, reading each row's coverage census frame by frame (helpers after
-//! `tests/new_line_fade.rs`).
+//! Claude Code's composer wrap, with the real bytes: when typing wraps to a new line, the previous row's rainbow follows its text and flows toward the fold rather than vanishing, and the new row continues the walk without a hard colour edge.
 
 use crate::common::{
     caret_sample, note_blink, observe_caret_row, observe_ribbon_rows, rainbow_cfg,
@@ -47,12 +33,7 @@ const TEXT_ROW: usize = 28;
 const OLD_ROW: u16 = (TEXT_ROW - 1) as u16;
 const NEW_ROW: u16 = OLD_ROW - 1;
 
-/// The synchronized-output bracket. Ink wraps every repaint in DEC 2026 (sync-begin, hide,
-/// rewrite, show, sync-end; see `tests/ink_wrap_line_fill_repro.rs`), and the seam reads the
-/// hide inside it as the repaint blink that admits an alt-screen re-anchor
-/// (`Terminal::repaint_blink_epoch`, `CursorGlow::blink_fresh`). The pty capture lacks it
-/// (nothing answered DECRQM 2026 there; aterm does); without it the wrap reads as a keyless
-/// park.
+/// The synchronized-output bracket.
 const SYNC_BEGIN: &str = "\x1b[?2026h";
 const SYNC_END: &str = "\x1b[?2026l";
 
@@ -430,8 +411,7 @@ const RISE_TOL: f32 = 2e-3;
 
 /// The largest step the band's far edge took away from the fold (left) between
 /// two frames that each hold at least `floor` of the light, in px; `0` when it
-/// only moved toward it. Below that share the last slabs' alpha bytes round in
-/// and out of zero.
+/// only moved toward it.
 fn worst_far_edge_step(curve: &[Sample], floor: f32) -> u16 {
     curve
         .windows(2)
@@ -468,7 +448,6 @@ fn typed_to_the_wrap() -> (Host, f32, usize, f32) {
     let mut h = Host::new();
     h.type_str(LINE1);
     h.type_str(" WH");
-    // The last echo is sampled on the next frame.
     h.next_frame();
     let c = h.term.cursor();
     assert_eq!((c.row, c.col), (OLD_ROW, 88), "the caret stands after `WH`");
@@ -482,8 +461,6 @@ fn typed_to_the_wrap() -> (Host, f32, usize, f32) {
         pre_cov > 0.5,
         "the row is well lit before the wrap: {pre_cov}"
     );
-    // Cells the text carries: the first row's glyphs, columns 2..=84; the
-    // eaten Space at 85 and the moved word at 86..=87 stay for the re-anchor.
     let line_end = 2 + LINE1.len() as u16 - 1;
     let n_pre = live.iter().filter(|&&c| c <= line_end).count();
     let t_w = h
@@ -497,9 +474,7 @@ fn typed_to_the_wrap() -> (Host, f32, usize, f32) {
 }
 
 /// The band follows its text: one frame after the wrap it stands on the row above under its
-/// glyphs at ≥ 60% of the pre-wrap coverage and is not melted at +0.15 s. `ribbon_followed=`
-/// counts every carried cell; `ribbon_retired=` at most the moved word's old cells and the
-/// eaten space.
+/// glyphs at ≥ 60% of the pre-wrap coverage and is not melted at +0.15 s.
 #[test]
 fn one_frame_after_the_wrap_the_band_stands_under_its_text_a_row_up_and_is_not_melted() {
     let (mut h, pre_cov, n_pre, _) = typed_to_the_wrap();
@@ -535,8 +510,6 @@ fn one_frame_after_the_wrap_the_band_stands_under_its_text_a_row_up_and_is_not_m
         "one frame after the wrap the followed band carries the light it had: {cov} \
          against {pre_cov} before"
     );
-    // Not melted: well past `RETIRE_MELT_S`, the row still carries most of
-    // its light.
     let melt = ((RETIRE_MELT_S + 0.03) * 1000.0) as u64;
     h.idle(melt);
     let cov = h.coverage(NEW_ROW);
@@ -574,10 +547,6 @@ fn the_followed_row_flows_into_the_fold_and_is_dark_by_the_flows_end() {
         at(0.5).cov > 0.0 && at(0.5).resident > 0,
         "the followed row is still lit at +0.5 s: {shown}"
     );
-    // The band flows toward the fold: its far edge only moves toward the fold
-    // point. The light-weighted centroid can drift back late in the fade
-    // (colour floors differ by hue), so it is not the measure; the rigid
-    // slide's pitch is pinned in `ribbon.rs`'s drift test.
     let far: Vec<(f32, Option<u16>)> = curve.iter().map(|s| (s.t, s.left)).collect();
     assert!(
         worst_far_edge_step(&curve, 0.05 * curve[0].cov) <= 1,
@@ -603,7 +572,6 @@ fn the_followed_row_flows_into_the_fold_and_is_dark_by_the_flows_end() {
          band: {shown}",
         worst_step(&curve)
     );
-    // The far end goes first: by +0.3 s the left edge has moved right.
     h = typed_to_the_wrap().0;
     h.wrap(LINE1);
     h.next_frame();
@@ -631,14 +599,10 @@ fn the_followed_row_flows_into_the_fold_and_is_dark_by_the_flows_end() {
 /// restarted its fast phase at the fold is caught.
 const AFTER_LONG: &str = " ATERM claude code how is the rainbow now";
 
-/// The new row keeps the old row's pace. The old row was typed 86 cells from its first, so it
-/// lays at [`WALK_LAY_RATE`] a cell (asserted from its `W`/`H` cells). After the wrap and 41
-/// more keys every column `c` from the relaid `W` at 2 carries `t_w + (c − 2) · WALK_LAY_RATE`:
-/// the relaid `H` keeps its old-row `t` and the walk does not restart its `1/16` fast leg.
+/// The new row keeps the old row's pace.
 #[test]
 fn the_new_row_continues_the_old_rows_walk_at_the_pace_it_had_reached() {
     let (mut h, _, _, t_w) = typed_to_the_wrap();
-    // The premise: the old row's pace at its end, read off its own cells.
     let old = |h: &Host, col: u16| {
         h.ribbon()
             .cells()
@@ -677,7 +641,6 @@ fn the_new_row_continues_the_old_rows_walk_at_the_pace_it_had_reached() {
         "the new row is laid past the walk's fast phase: {} cells",
         ts.len()
     );
-    // The pace: every step is the old row's step.
     for w in ts.windows(2) {
         let (c0, t0) = w[0];
         let (c1, t1) = w[1];
@@ -688,8 +651,6 @@ fn the_new_row_continues_the_old_rows_walk_at_the_pace_it_had_reached() {
             t1 - t0
         );
     }
-    // The seam: the colour is continuous — the relaid word keeps the
-    // colours it had on the old row.
     let (_, t_first) = ts[0];
     let (_, t_second) = ts[1];
     assert!(
@@ -697,7 +658,6 @@ fn the_new_row_continues_the_old_rows_walk_at_the_pace_it_had_reached() {
         "the relaid `WH` keeps the t it had on the old row: `W` {t_first} against \
          {t_w}, `H` {t_second} against {t_h}: {ts:?}"
     );
-    // …and so every column is the old walk continued.
     for &(col, t) in &ts {
         let want = t_w + f32::from(col - 2) * WALK_LAY_RATE;
         assert!(
@@ -708,9 +668,7 @@ fn the_new_row_continues_the_old_rows_walk_at_the_pace_it_had_reached() {
     }
 }
 
-/// Negative control: a true re-layout still melts. The same bytes with different text a row
-/// up: nothing follows, the old cells retire on the melt (`ribbon_retired=` counts the band,
-/// `ribbon_followed=` stays 0), and the row the text went to is dark.
+/// Negative control: a true re-layout still melts.
 #[test]
 fn a_true_re_layout_with_different_text_a_row_up_still_melts_the_old_band() {
     let (mut h, _, n_pre, _) = typed_to_the_wrap();
@@ -768,11 +726,7 @@ fn unwrap_bytes(line: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// A Backspace back through the fold re-wets the row the hand came back to. After the wrap, a
-/// Backspace unwraps and the follow pass carries the flowing band back down onto the caret's
-/// row, where the hand keeps backspacing. The row holds its light like the same run on a
-/// never-wrapped line (the control), not draining as a flowing orphan, with the unwrap echo on
-/// the Backspace's frame and one frame late.
+/// A Backspace back through the fold re-wets the row the hand came back to.
 #[test]
 fn a_backspace_back_through_the_fold_rewets_the_row_the_hand_returned_to() {
     fn backspace_run(h: &mut Host, from_col: usize, n: usize) -> Vec<(u64, f32)> {
@@ -795,14 +749,12 @@ fn a_backspace_back_through_the_fold_rewets_the_row_the_hand_returned_to() {
         out
     }
     let line = format!("{LINE1} WH");
-    // The control: the same line, the same Backspace run, no round trip.
     let (mut c, _, _, _) = typed_to_the_wrap();
     c.idle(160);
     let ctl = backspace_run(&mut c, 3 + line.chars().count(), 30);
     let floor = |v: &[(u64, f32)]| v[6..].iter().map(|s| s.1).fold(f32::MAX, f32::min);
     let want = floor(&ctl);
     for late in [false, true] {
-        // The fold's round trip: wrap, then the Backspace that unwraps.
         let (mut h, _, _, _) = typed_to_the_wrap();
         h.wrap(LINE1);
         h.next_frame();
@@ -842,16 +794,10 @@ fn a_backspace_back_through_the_fold_rewets_the_row_the_hand_returned_to() {
     }
 }
 
-/// An unwrap takes the seam off the line the hand came back to. The wrap armed the new-line
-/// seam on the caret's row; the unwrap carries line 1 back down onto that row, which no longer
-/// holds a continued line, so the seam must clear or its floor lights the whole tail under the
-/// Backspace run. Read from column 12: for the first two Backspaces the hot edge is still
-/// `WHY`'s, whose falloff reaches back to column 2.
+/// An unwrap takes the seam off the line the hand came back to.
 #[test]
 fn an_unwrap_takes_the_seam_off_the_line_the_hand_came_back_to() {
     const TAIL_FROM: u16 = 12;
-    // `n` Backspaces from `from_col` at the hand's cadence, frames run until `until`: the
-    // worst frame's far tail on the caret's row.
     fn backspaces(h: &mut Host, from_col: usize, n: usize, until: Instant) -> f32 {
         let (mut k, mut worst) = (0usize, 0.0f32);
         while h.next_frame <= until {
@@ -873,7 +819,6 @@ fn an_unwrap_takes_the_seam_off_the_line_the_hand_came_back_to() {
     }
     let line = format!("{LINE1} WH");
     let from_col = 3 + line.chars().count();
-    // The control: the same line and the same Backspace run, no round trip.
     let (mut c, _, _, _) = typed_to_the_wrap();
     let until = c.now + Duration::from_millis(1600);
     let ctl = backspaces(&mut c, from_col, 8, until);
@@ -918,9 +863,7 @@ fn cohorts_on(h: &Host, row: u16) -> Vec<(u16, f32, f32, u16, u16, bool)> {
 
 /// A wrap whose old row melts still continues the walk on the next row: other text a row up
 /// (the old band melting in `RETIRE_MELT_S`) with the hand typing on at 60 ms, so its first
-/// keys land while melting cells are resident. A run with no standing cell is not joinable
-/// (`Ribbon::join_cohort`): every column `c` from the relaid `W` at 2 carries
-/// `t_w + (c − 2) · WALK_LAY_RATE`, never a restart at red.
+/// keys land while melting cells are resident.
 #[test]
 fn after_a_wrap_whose_old_row_melts_the_next_row_continues_the_walk_at_its_pace() {
     let (mut h, _, _, t_w) = typed_to_the_wrap();
@@ -994,11 +937,7 @@ fn newline_down_bytes() -> Vec<u8> {
 }
 
 /// Claude Code's Shift+Enter starts the walk again, whichever way the box grows
-/// (`Ribbon::fresh_line`). Thirty keys, Shift+Enter as the host hands it over (the
-/// composer-newline hint and typed stamp, a key-time `ComposerNewline`, not `note_return`), the
-/// repaint, and twenty keys: the new line continues the colour one step past the old line's end
-/// and walks the fast leg (`d0 = 0`, `1/16` a cell), whether the caret stays on its row
-/// (bottom-anchored) or moves down (the top-anchored control).
+/// (`Ribbon::fresh_line`).
 #[test]
 fn a_shift_enter_newline_starts_the_walk_again_in_a_bottom_anchored_box_too() {
     for bottom in [true, false] {
@@ -1021,7 +960,6 @@ fn a_shift_enter_newline_starts_the_walk_again_in_a_bottom_anchored_box_too() {
             "{what}: the premise, thirty cells from column 2"
         );
         let t_next = old.t_at(32);
-        // Shift+Enter: the newline hint and the typed stamp at the key.
         let t = h.last_key + Duration::from_millis(KEY_MS);
         h.advance_to(t);
         h.now = t;
@@ -1092,8 +1030,6 @@ fn a_shift_enter_newline_starts_the_walk_again_in_a_bottom_anchored_box_too() {
 /// However soon the new line's first key follows the Shift+Enter, the walk starts again: the
 /// key is pressed before the frame that observes the repaint (mode 1: repaint at the chord, key
 /// half-way to the next frame; mode 2: key 20 or 45 ms after the chord, repaint after the key).
-/// Its echo is swept on its press clock, so the gate is dated at the chord's press, ignores the
-/// chord's own stamp, and waits for the observed home before an echo spends it.
 #[test]
 fn a_shift_enter_newline_starts_the_walk_again_however_soon_the_first_key_follows() {
     for bottom in [true, false] {
@@ -1122,7 +1058,6 @@ fn a_shift_enter_newline_starts_the_walk_again_however_soon_the_first_key_follow
                 .expect("the old line's run");
             assert_eq!(old.col1, 32, "{what}: the premise, thirty cells");
             let t_next = old.t_at(32);
-            // Shift+Enter: the newline hint and the typed stamp at the key.
             let t = h.last_key + Duration::from_millis(KEY_MS);
             h.advance_to(t);
             h.now = t;
@@ -1137,8 +1072,6 @@ fn a_shift_enter_newline_starts_the_walk_again_however_soon_the_first_key_follow
             if mode == 1 {
                 h.term.process(&repaint);
             }
-            // The new line's first key: half-way to the next frame (mode
-            // 1), or `lag_ms` after the chord (mode 2).
             let k = if mode == 1 {
                 t + (h.next_frame - t) / 2
             } else {

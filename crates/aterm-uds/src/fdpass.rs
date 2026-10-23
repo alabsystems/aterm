@@ -47,6 +47,8 @@ pub struct Received {
 /// Send `payload` and `fds` as one message on `stream`.
 ///
 /// # Errors
+/// * `InvalidInput`: an empty payload (a zero-length stream `sendmsg` drops
+///   the control message on Linux), or more than [`MAX_FDS`] descriptors.
 ///
 /// Returns `InvalidInput` if `fds` is non-empty and `payload` is empty or `fds.len() > MAX_FDS`.
 pub fn send_with_fds(
@@ -60,6 +62,7 @@ pub fn send_with_fds(
 /// Send `bufs` in order as one gather write on `stream`.
 ///
 /// # Errors
+/// Anything `sendmsg(2)` reports (`EPIPE` if the peer is gone).
 ///
 /// Returns the underlying socket write error.
 pub fn send_vectored(stream: &CtlStream, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
@@ -69,6 +72,8 @@ pub fn send_vectored(stream: &CtlStream, bufs: &[IoSlice<'_>]) -> io::Result<usi
 /// Receive one message and up to `max_fds` descriptors from `stream` into `buf`.
 ///
 /// # Errors
+/// * `InvalidInput`: an empty `buf` (indistinguishable from EOF), or
+///   `max_fds` above [`MAX_FDS`].
 ///
 /// Returns `InvalidInput` if `max_fds > MAX_FDS` or `InvalidData` on control-message truncation.
 pub fn recv_with_fds(stream: &CtlStream, buf: &mut [u8], max_fds: usize) -> io::Result<Received> {
@@ -78,6 +83,7 @@ pub fn recv_with_fds(stream: &CtlStream, buf: &mut [u8], max_fds: usize) -> io::
 /// Return the connected peer's PID as reported by the kernel.
 ///
 /// # Errors
+/// * Anything `getsockopt(2)` reports, notably `ENOTCONN`.
 ///
 /// Returns an error if the platform credential query fails or is unsupported.
 pub fn peer_pid(stream: &CtlStream) -> io::Result<u32> {
@@ -87,6 +93,7 @@ pub fn peer_pid(stream: &CtlStream) -> io::Result<u32> {
 /// Return [`peer_pid`] for raw socket descriptor `fd` without taking ownership.
 ///
 /// # Errors
+/// As [`peer_pid`]'s, and `EBADF`/`ENOTSOCK` for a descriptor that names no socket.
 ///
 /// Same as [`peer_pid`].
 #[cfg(unix)]
@@ -94,7 +101,7 @@ pub fn peer_pid_of_fd(fd: std::os::fd::RawFd) -> io::Result<u32> {
     scm::peer_pid_of_fd(fd)
 }
 
-/// The two ABIs this file mirrors field-for-field. Everything outside `abi` is
+/// The two ABIs this file mirrors field-for-field.
 #[cfg(any(
     target_vendor = "apple",
     all(
@@ -111,6 +118,7 @@ mod scm {
     use crate::CtlStream;
 
     /// `struct iovec` — identical on both supported ABIs, so it is declared
+    /// once and referred to from each `abi::MsgHdr`.
     #[repr(C)]
     struct IoVec {
         iov_base: *mut core::ffi::c_void,
@@ -126,9 +134,12 @@ mod scm {
     };
 
     /// `IOV_MAX` on Darwin and Linux: a longer `msg_iov` is `EMSGSIZE`, so a
+    /// gather takes this many slices and returns short.
     const MAX_IOV: usize = 1024;
 
     /// Darwin's `sys/socket.h`: `msg_iovlen`/`msg_flags` are `int` and
+    /// `msg_namelen`/`msg_controllen` are `socklen_t` (`u32`), unlike Linux,
+    /// so the structs are spelled out per platform.
     #[cfg(target_vendor = "apple")]
     mod abi {
         use std::io;
@@ -233,6 +244,7 @@ mod scm {
     }
 
     /// Linux's `bits/socket.h` on x86-64/aarch64, item for item as the Darwin `abi`:
+    /// `msg_iovlen`/`msg_controllen` are `size_t`, `msg_namelen` is `socklen_t`.
     #[cfg(not(target_vendor = "apple"))]
     mod abi {
         use std::io;
@@ -270,6 +282,7 @@ mod scm {
         pub const SEND_FLAGS: i32 = 0x4000;
 
         /// `SO_PEERCRED` at `SOL_SOCKET`, answering a `struct ucred`
+        /// (`pid_t pid; uid_t uid; gid_t gid;` — three 32-bit fields).
         const SO_PEERCRED: i32 = 17;
         const UCRED_LEN: usize = 12;
 
@@ -348,12 +361,13 @@ mod scm {
         fn fcntl(fd: RawFd, cmd: i32, ...) -> i32;
     }
 
-    /// `fcntl(2)`'s descriptor-flag setter and the one flag there is. Same
+    /// `fcntl(2)`'s descriptor-flag setter and the one flag there is.
     const F_SETFD: i32 = 2;
     const FD_CLOEXEC: i32 = 1;
 
     const CMSG_HDR_LEN: usize = size_of::<abi::CmsgHdr>();
     /// `CMSG_DATA`'s offset from the header, `CMSG_ALIGN(sizeof(cmsghdr))`:
+    /// 12 on Darwin, 16 on Linux (see each `abi::CMSG_ALIGNMENT`).
     const CMSG_DATA_OFFSET: usize = cmsg_align(CMSG_HDR_LEN);
     /// One passed descriptor is one `int` on the wire.
     const FD_LEN: usize = size_of::<RawFd>();
@@ -365,16 +379,20 @@ mod scm {
     }
 
     /// `CMSG_SPACE`: header + payload, each rounded up; the buffer size a
+    /// message needs, which is what the receive offers the kernel.
     const fn cmsg_space(data_len: usize) -> usize {
         CMSG_DATA_OFFSET + cmsg_align(data_len)
     }
 
     /// `CMSG_LEN`: header + payload, payload not rounded up; what `cmsg_len`
+    /// must say, and what the send gives as `msg_controllen`.
     const fn cmsg_len(data_len: usize) -> usize {
         CMSG_DATA_OFFSET + data_len
     }
 
     /// A control buffer with `cmsghdr` alignment: the kernel reads and writes a
+    /// `struct cmsghdr` at offset 0, though this file's parse never assumes
+    /// alignment.
     #[repr(C, align(8))]
     struct ControlBuf([u8; CONTROL_LEN]);
 
@@ -539,6 +557,8 @@ mod scm {
     }
 
     /// Validate what `getsockopt` answered: the option must have come back at
+    /// its full size (a short answer means we read something that is not the
+    /// structure we asked for), and a pid must be a pid.
     fn checked_pid(pid: i32, got_len: usize, want_len: usize) -> io::Result<u32> {
         if got_len != want_len {
             return Err(io::Error::new(
@@ -567,12 +587,15 @@ mod scm {
     /// What one control-buffer walk found.
     struct ControlScan {
         /// Raw descriptor numbers, in message order; not owned yet, so the
+        /// caller must take ownership immediately.
         fds: Vec<RawFd>,
         /// The buffer did not contain everything its headers claimed (or a
+        /// header was malformed).
         truncated: bool,
     }
 
     /// Walk `control` (the bytes the kernel wrote) and collect every `SCM_RIGHTS` descriptor
+    /// number in it.
     fn scan_control(control: &[u8]) -> ControlScan {
         let mut scan = ControlScan {
             fds: Vec::new(),
@@ -638,6 +661,8 @@ mod scm {
         };
 
         /// One `SCM_RIGHTS` header whose `cmsg_len` claims `claimed` descriptors, then
+        /// `present` descriptor numbers, cut to `keep` bytes (what `msg_controllen` would
+        /// say): the shape a truncated receive leaves.
         fn control(claimed: usize, present: &[i32], keep: usize) -> Vec<u8> {
             let mut buf = vec![0u8; CONTROL_LEN];
             abi::write_cmsg_len(&mut buf, cmsg_len(claimed * FD_LEN));
@@ -663,6 +688,7 @@ mod scm {
         }
 
         /// Every message is walked, each header at the aligned end of the one before (here a
+        /// foreign one whose one data byte leaves padding), and only `SCM_RIGHTS` yields.
         #[test]
         fn a_complete_message_yields_every_descriptor_in_order() {
             let buf = control(3, &[7, 8, 9], cmsg_space(3 * FD_LEN));
@@ -710,6 +736,7 @@ mod scm {
         }
 
         /// The whole descriptors are reported (ours to close) and the half-copied one makes
+        /// the message fatal.
         #[test]
         fn a_partial_descriptor_at_the_tail_is_truncation() {
             let buf = control(3, &[7, 8], CMSG_DATA_OFFSET + FD_LEN + 2);
@@ -725,6 +752,8 @@ mod scm {
         }
 
         /// Neither a non-`SCM_RIGHTS` message (another type, or `SCM_RIGHTS`'s number at
+        /// another level) nor a header shorter than its own data area yields a descriptor;
+        /// the runt is refused, and a header with no data at all is no runt.
         #[test]
         fn foreign_and_malformed_headers_yield_no_descriptors() {
             for (level, kind) in [
@@ -751,6 +780,9 @@ mod scm {
         }
 
         /// A peer that sends past `MAX_FDS` (`send_with_fds` refuses to; a raw `sendmsg` does
+        /// not), up to the twice-`MAX_FDS` budget the module documents, is still a visible
+        /// over-count: every descriptor it sent is named, closed and refused, and none stays
+        /// here.
         #[test]
         fn an_over_send_past_the_cap_is_named_closed_and_refused() {
             use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -805,6 +837,9 @@ mod scm {
         }
 
         /// A receiver at its descriptor limit, where the kernel installs fewer descriptors than
+        /// were sent, refuses the message and keeps none that did arrive: Linux installs what
+        /// fits, names only those and flags `MSG_CTRUNC` (the flag alone tells it from a whole
+        /// message), and Darwin fails the `recvmsg` (`EMFILE`).
         #[test]
         fn a_message_the_kernel_could_not_install_whole_is_refused() {
             use std::os::fd::{AsFd as _, AsRawFd as _};
@@ -875,6 +910,7 @@ mod scm {
     }
 
     /// A send to a hung-up peer with SIGPIPE at its default, in a helper
+    /// process: the test process's own SIGPIPE is not ours to change.
     #[cfg(test)]
     mod sigpipe_tests {
         use std::io::{IoSlice, Write as _};
@@ -913,6 +949,8 @@ mod scm {
         }
 
         /// A gather to a `socketpair` end whose peer closed, with SIGPIPE at
+        /// its default (as `Command::exec` leaves it before `execve`), is
+        /// `EPIPE` and the sender lives.
         #[test]
         fn a_gather_to_a_hung_up_peer_is_epipe_not_sigpipe() {
             let (status, text) = helper("send_vectored");
@@ -956,6 +994,7 @@ mod scm {
 }
 
 /// Every other target: the same entry points, returning `Unsupported`, except
+/// [`send_vectored`] and Windows' [`peer_pid`].
 #[cfg(not(any(
     target_vendor = "apple",
     all(

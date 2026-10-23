@@ -30,7 +30,7 @@ mod tests;
 
 use fs::{Appender, Held, JournalFs};
 
-/// The errnos the journal tells apart (module docs). A target without POSIX
+/// The errnos the journal tells apart (module docs).
 #[cfg(unix)]
 mod errno {
     pub(super) use libc::{EAGAIN, EDQUOT, EINTR, EIO, ENOLCK, ENOSPC, ENOTSUP, EWOULDBLOCK};
@@ -602,6 +602,8 @@ fn run(
 }
 
 /// The directory a running lane writes, or a stand-in that refuses
+/// everything (a symlinked, foreign or unreadable one stops the journal at
+/// its first step).
 fn open_dir(logs: &std::path::Path) -> Arc<dyn JournalFs> {
     #[cfg(unix)]
     match fs::PinnedJournalFs::open(logs, true) {
@@ -658,6 +660,7 @@ impl JournalFs for Refused {
 }
 
 /// Run one writer step; a panic stops the journal (its attention raised),
+/// and the producers go on appending.
 fn guarded<T: Targets>(w: &mut Writer<T>, f: impl FnOnce(&mut Writer<T>)) {
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(w)));
     if caught.is_err() {
@@ -801,7 +804,7 @@ impl Retirements {
     }
 }
 
-/// Caller-owned before spawn, worker-owned afterward. The owner token
+/// Caller-owned before spawn, worker-owned afterward.
 struct RetirementLease {
     store: crate::session_store::Store,
     owner: Arc<()>,
@@ -937,6 +940,8 @@ struct Track {
 }
 
 /// A session the backstop let go: a probe of its log when it went (its
+/// space, the open path), the seq it had reached and how many it held past
+/// the writer's cursor.
 struct Dropped {
     take: journal::Take,
     through: u64,
@@ -1165,6 +1170,7 @@ impl<T: Targets> Writer<T> {
     }
 
     /// Merge the store's sessions into the tracks: a new one starts, one
+    /// that left retires (its timeline kept until its close is written).
     fn refresh(&mut self) {
         let Some(targets) = self.targets.try_targets() else {
             self.owed = true;
@@ -1219,6 +1225,7 @@ impl<T: Targets> Writer<T> {
     }
 
     /// Keep the stronger existing cursor/Arc when the queued packet names
+    /// that exact timeline; a compact fallback must not re-count its records.
     fn import_retired(&mut self, retired: RetiredTarget) {
         let (sid, timeline, dropped) = match retired {
             RetiredTarget::Timeline(sid, timeline) => (sid, Some(timeline), None),
@@ -1279,6 +1286,8 @@ impl<T: Targets> Writer<T> {
     }
 
     /// A new segment: the old one flushed, the volume's room checked, the
+    /// next number created exclusive, its header written, every session to
+    /// restate itself, then retention.
     fn rotate(&mut self) -> bool {
         if let Some(mut old) = self.seg.take() {
             let _ = old.file.sync();
@@ -1334,6 +1343,7 @@ impl<T: Targets> Writer<T> {
     }
 
     /// Whether the volume has room: checked at each rotation and once a
+    /// minute; under [`FREE_FLOOR`] the journal pauses before ENOSPC.
     fn room(&mut self) -> bool {
         let now = self.clock.mono();
         if self
@@ -1393,6 +1403,9 @@ impl<T: Targets> Writer<T> {
     }
 
     /// The pass's lines: retired tracks first (exempt from the pass's byte
+    /// bound), then the live ones; no track's lines once the
+    /// segment (`size` so far) would pass its rotation size, so a segment is
+    /// never more than one take's lines past it.
     fn batch(&mut self, n: u32, size: u64) -> (Vec<u8>, Vec<LineMark>) {
         let mut buf: Vec<u8> = Vec::new();
         let mut marks: Vec<LineMark> = Vec::new();
@@ -1521,6 +1534,8 @@ impl<T: Targets> Writer<T> {
     }
 
     /// Write `buf` in one `write(2)` (EINTR retried): every mark whose lines
+    /// are wholly on disk moves its track's cursor; after a short or failed
+    /// write the segment is abandoned, never repaired.
     fn write(&mut self, buf: &[u8], marks: &[LineMark]) -> usize {
         if buf.is_empty() {
             return 0;
@@ -1649,6 +1664,7 @@ impl<T: Targets> Writer<T> {
     }
 
     /// The update's drain is whole when every fenced session is `#handed`:
+    /// then the chain's trailer, and nothing more.
     fn maybe_hand_off(&mut self) {
         if self.owed || !self.saw_all {
             return;
@@ -1729,6 +1745,10 @@ impl<T: Targets> Writer<T> {
     }
 
     /// The quit's closes, only while every session is wholly journaled: each
+    /// track not done holds its timeline, its cursor at its log's head in the
+    /// space it last wrote, and its snap in this segment (so a reader places
+    /// the closes); a retired session not done (its close or its loss not yet
+    /// written) is behind too.
     fn quit_lines(&self) -> Option<Vec<u8>> {
         if self.targets.pending_targets() {
             return None;

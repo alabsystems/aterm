@@ -89,6 +89,8 @@ trust_island! {
 }
 
 /// Out-params for the folded emoji-cluster + combining-mark extraction
+/// (`render_row_into_impl`): `(clusters, combining)`, where each entry is the
+/// cell column paired with its `(base+combining)` string / combining `char`s.
 type ExtrasOut<'a> = (
     &'a mut Vec<(usize, Box<str>)>,
     &'a mut Vec<(usize, Box<[char]>)>,
@@ -113,7 +115,7 @@ pub enum UnderlineStyle {
 }
 
 impl UnderlineStyle {
-    /// Resolve the packed underline bits to a single variant. The composite styles
+    /// Resolve the packed underline bits to a single variant.
     #[inline]
     const fn from_flags(cflags: CellFlags) -> Self {
         if cflags.contains(CellFlags::DOTTED_UNDERLINE) {
@@ -139,8 +141,10 @@ pub enum Script {
     #[default]
     Normal,
     /// Subscript: small, its foot on the cell's floor, and moved `nudge`
+    /// [`Script::NUDGES_PER_CELL`]ths of a cell sideways (negative: left).
     Sub {
         /// Sideways offset of the glyph, in [`Script::NUDGES_PER_CELL`]ths
+        /// of a cell.
         nudge: i8,
     },
 }
@@ -188,6 +192,7 @@ pub struct RenderCell {
 }
 
 /// A blank cell with `ch == ' '` (not `'\0'`), since renderers blit `ch`
+/// unconditionally.
 impl Default for RenderCell {
     #[inline]
     fn default() -> Self {
@@ -211,9 +216,12 @@ impl Default for RenderCell {
 }
 
 /// The plain-cell style memo's key: a plain cell's style depends on its colors and flags, and
+/// on whether it holds a shape the theme-pair floor leaves alone
+/// ([`super::color_resolve::is_shape_glyph`]).
 type PlainStyleKey = (crate::grid::PackedColors, CellFlags, bool);
 
 /// What the memo keeps per key: foreground, background, underline, and the
+/// strikethrough, overline, bold and italic flags.
 type PlainStyle = ([u8; 3], [u8; 3], UnderlineStyle, bool, bool, bool, bool);
 
 impl Terminal {
@@ -289,6 +297,7 @@ impl Terminal {
     }
 
     /// Core of [`render_row_into`](Self::render_row_into), with an optional `extras_out` sink
+    /// for the emoji-cluster and combining-mark classification.
     fn render_row_into_impl(
         &self,
         row: usize,
@@ -321,6 +330,7 @@ impl Terminal {
     }
 
     /// The per-cell resolution pass of [`render_row_into_impl`](Self::render_row_into_impl)
+    /// over one resolved row `view` (`out` and `extras_out` cleared by the caller).
     #[allow(
         clippy::too_many_lines,
         reason = "single per-cell resolution pass (colors + decorations + emoji/combining extraction) over a row"
@@ -587,11 +597,14 @@ impl Terminal {
     }
 
     /// Batch equivalent of [`images_row_into`](Self::images_row_into) for every
+    /// row in `0..rows` of the current viewport.
     fn images_frame_into(&self, images: &mut Vec<Vec<(usize, aterm_grid::ImageRef)>>, rows: usize) {
         self.images_frame_of(images, rows, ImageRows::Viewport);
     }
 
     /// The image placements of rows `0..rows` of `frame`, driven by one pass
+    /// over the extras map instead of `rows x cols` probes, so the cost is
+    /// proportional to the extras present.
     fn images_frame_of(
         &self,
         images: &mut Vec<Vec<(usize, aterm_grid::ImageRef)>>,
@@ -670,6 +683,9 @@ impl Terminal {
     }
 
     /// If the cell at (`row`,`col`) is a Kitty Unicode placeholder (U+10EEEE), decode it
+    /// ([`decode_cell`](super::kitty_placeholder::decode_cell)) and return an
+    /// [`ImageRef`](aterm_grid::ImageRef) into the image its virtual placement shows, so a
+    /// virtual placement reuses the direct-placement compositor.
     fn placeholder_image_ref(
         &self,
         row: u16,
@@ -687,6 +703,10 @@ impl Terminal {
     }
 
     /// The image a placeholder naming image `image_id` and virtual placement
+    /// `placement_id` draws: that placement's (laid out by its `U=1` put); for
+    /// placement `0`, the image's newest virtual placement — kitty lets the
+    /// terminal choose — or, when it has none, the stored image as its transmit
+    /// laid it out.
     fn kitty_placeholder_image(
         &self,
         image_id: u32,
@@ -700,6 +720,8 @@ impl Terminal {
     }
 
     /// The tiles of the Kitty placements relative to a virtual placement
+    /// ([`kitty_floating`](super::kitty_floating)), each where it shows now:
+    /// `(screen row, col, tile)` for every footprint cell on screen.
     fn kitty_floating_tiles(&self) -> Vec<(u16, u16, aterm_grid::ImageRef)> {
         let floating = &self.transient.kitty_floating;
         super::kitty_floating::floating_tiles(self.grid(), &self.transient)
@@ -790,6 +812,7 @@ impl Terminal {
     }
 
     /// The damage-scoped continuity check (clauses justified on
+    /// [`cell_frame_damage_scoped_into`](Self::cell_frame_damage_scoped_into)).
     fn damage_scoped_refill_refusal(
         &self,
         scratch: &crate::render::RenderInput,
@@ -848,6 +871,8 @@ impl Terminal {
     }
 
     /// The scrolled continuity proof: may a scratch filled while parked in
+    /// history be carried to the engine's current offset by rotating its rows
+    /// and re-resolving only the exposed strip?
     fn scrolled_scoped_refill_delta(
         &self,
         scratch: &crate::render::RenderInput,
@@ -883,6 +908,9 @@ impl Terminal {
     }
 
     /// Carry a parked scratch to a new offset: rotate its three retained
+    /// per-row channels (`cells`, `clusters`, `combining`; every other per-row
+    /// channel is rewritten each fill) and write the exposed strip's refill
+    /// mask into `mask` (the resident `refill_mask_scratch`).
     fn rotate_scrolled_scratch(
         scratch: &mut crate::render::RenderInput,
         rows: usize,
@@ -913,6 +941,8 @@ impl Terminal {
     }
 
     /// Fill `scratch.apron_row` with the row just below a `rows`-tall viewport:
+    /// the apron at offset `d` is the bottom viewport row at offset `d - 1`,
+    /// which a sub-row up-glide slides in.
     fn apron_row_into(&self, scratch: &mut crate::render::RenderInput, rows: usize) {
         let d = self.grid().display_offset();
         let cursor_col = (self.cursor_visible() && self.projected_cursor_row() == rows)
@@ -1008,6 +1038,8 @@ impl Terminal {
     }
 
     /// The shared fill behind [`cell_frame_into`](Self::cell_frame_into)
+    /// (`refill_mask: None`, every row) and the damage-scoped arm
+    /// (`Some(mask)`, only marked rows re-resolve).
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_possible_wrap,
@@ -1154,6 +1186,9 @@ impl Terminal {
 }
 
 /// A combining char that marks its cell as a multi-codepoint emoji sequence:
+/// ZWJ (U+200D), a skin-tone modifier (U+1F3FB–U+1F3FF), combining enclosing
+/// keycap (U+20E3), a regional indicator (U+1F1E6–U+1F1FF, the second half of
+/// a flag pair), or a tag character (U+E0020–U+E007F, a 🏴 subdivision flag).
 #[inline]
 const fn is_emoji_sequence_marker(c: char) -> bool {
     matches!(
@@ -1163,6 +1198,8 @@ const fn is_emoji_sequence_marker(c: char) -> bool {
 }
 
 /// A combining char that attaches to its base but has no glyph of its own, so it must never
+/// reach the CPU/GPU mark loops: they blit whatever `glyph_key` returns for a mark, which for
+/// one of these is the primary's `.notdef` box over the base.
 #[inline]
 const fn draws_no_glyph(c: char) -> bool {
     matches!(c as u32, 0xFE0E | 0xFE0F | 0xE0000..=0xE0FFF)
@@ -1178,12 +1215,15 @@ const fn pack_rgb(c: aterm_types::Rgb) -> u32 {
 #[derive(Clone, Copy)]
 enum ImageRows {
     /// The viewport: rows `0..display_offset` are history (read through the
+    /// grid's own viewport) and live screen row `s` is row `s + display_offset`.
     Viewport,
     /// The live screen: row `s` is live screen row `s`, whatever the viewport
+    /// shows.
     Live,
 }
 
 /// A scrolled-back viewport row's direct image placements, in `extras_iter`
+/// order (callers sort), expanded from the history line's image spans.
 fn push_history_images(
     grid: &Grid,
     visible_row: u16,
@@ -1205,6 +1245,10 @@ fn push_history_images(
 }
 
 /// Order one row's image list by column and, within a cell, by draw order
+/// ([`ImageRef::draw_key`](aterm_grid::ImageRef::draw_key)) — stable, so the
+/// layers a cell already holds in that order keep it — keeping each cell's
+/// top [`MAX_IMAGE_LAYERS`](aterm_grid::MAX_IMAGE_LAYERS), as a cell's own
+/// stack does.
 fn order_image_layers(row: &mut Vec<(usize, aterm_grid::ImageRef)>) {
     row.sort_by_key(|(col, image)| (*col, image.draw_key()));
     let mut kept = 0;
@@ -1222,6 +1266,8 @@ fn order_image_layers(row: &mut Vec<(usize, aterm_grid::ImageRef)>) {
 }
 
 /// Deterministic cost meter for the batch inline-image reader (the shape of
+/// `aterm_grid::test_counters`): a complexity claim is asserted as an operation count, not
+/// wall-clock.
 #[cfg(test)]
 mod image_probe_meter {
     thread_local! {
@@ -1248,6 +1294,9 @@ mod tests {
     use super::*;
 
     /// `logical_row_into` is the frame's own extraction of the row: its cells,
+    /// clusters and combining marks equal `cell_frame_into`'s for a row the frame
+    /// leaves in logical order, and it says when the frame does not: a DEC double
+    /// width line, and (with BiDi) a row it reorders.
     #[test]
     fn a_logical_row_is_the_frames_row_and_says_when_the_frame_moves_it() {
         let mut term = Terminal::new(4, 12);
@@ -1280,6 +1329,7 @@ mod tests {
     }
 
     /// OSC 8 hyperlinked cells render underlined, unless the program chose its
+    /// own decoration.
     #[test]
     fn a_hyperlink_is_underlined_and_a_program_decoration_still_wins() {
         let mut term = Terminal::new(2, 32);
@@ -1318,6 +1368,7 @@ mod tests {
     }
 
     /// A scratch reused across a split and an unsplit must not carry the split
+    /// compositor's per-pane spans or selections into a direct snapshot.
     #[test]
     fn cell_frame_into_clears_compositor_pane_spans() {
         use crate::render::{DefaultBgSpan, LineSizeSpan, PaneSelection, SelectionClip};
@@ -1468,6 +1519,8 @@ mod tests {
     }
 
     /// The frame carries both row-identity stamps from its extraction
+    /// boundary: the footer revision a protected-footer splice moves, and the
+    /// renumber epoch a width reflow moves without moving the revision.
     #[test]
     fn cell_frame_stamps_row_revision_and_history_renumber_epoch() {
         let mut spliced = Terminal::new(5, 10);
@@ -1512,6 +1565,7 @@ mod tests {
     }
 
     /// `images_frame_into` against the per-row `images_row` reference for
+    /// `rows` rows: same columns, same image, same tile.
     fn assert_images_parity(term: &Terminal, rows: usize, what: &str) -> usize {
         let mut batch: Vec<Vec<(usize, aterm_grid::ImageRef)>> = Vec::new();
         term.images_frame_into(&mut batch, rows);
@@ -1538,6 +1592,10 @@ mod tests {
     }
 
     /// The batch `images_frame_into` fill is identical to the per-row `images_row` for every
+    /// row: a direct iTerm2 placement, a Kitty placeholder, non-image extras that emit nothing,
+    /// a scrolled extras map with stale entries, a `rows` request past the grid, and a viewport
+    /// scrolled back over the image (the batch walks the history row's extras, the reference
+    /// probes).
     #[test]
     fn images_frame_into_matches_per_row() {
         let mut term = Terminal::new(10, 30);
@@ -1568,6 +1626,7 @@ mod tests {
     }
 
     /// The live reader keys its rows by live screen row whatever the viewport
+    /// shows.
     #[test]
     fn live_images_frame_ignores_the_viewport() {
         use super::super::kitty_placeholder::PLACEHOLDER;
@@ -1647,6 +1706,8 @@ mod tests {
     }
 
     /// Cost as an operation count: a plain-text screen costs 0 probes, and
+    /// with one hyperlink the batch reader pays one lookup per extra, not
+    /// rows x cols.
     #[test]
     fn images_frame_costs_the_extras_not_rows_times_cols() {
         const ROWS: u16 = 40;
@@ -1680,6 +1741,9 @@ mod tests {
     }
 
     /// The presentation flags a render cell carries for the renderer's face
+    /// choice: VS16 widens a text-default base and asks for colour, VS15
+    /// narrows a default emoji and asks for text, and neither a bare
+    /// text-default base nor a wide CJK ideograph asks for either.
     #[test]
     fn variation_selectors_set_the_presentation_flags() {
         for (text, emoji, mono, wide) in [
@@ -1729,6 +1793,7 @@ mod tests {
     }
 
     /// SGR 58:5:n (indexed underline colour) resolves against the live palette
+    /// at extraction time.
     #[test]
     fn indexed_underline_color_resolves_against_live_palette() {
         let mut term = Terminal::new(2, 8);
@@ -1754,6 +1819,8 @@ mod tests {
     }
 
     /// [`Terminal::presentation_fingerprint`] keys caches of resolved rows (the apron memo, the
+    /// control socket's `screen since=<etag>`), so every input the resolver reads beside the
+    /// grid must move it.
     #[test]
     fn presentation_fingerprint_moves_with_every_resolver_input() {
         use crate::config::TerminalConfig;
@@ -1813,6 +1880,11 @@ mod tests {
     }
 
     /// Every non-plain grapheme lands in exactly one lane: an emoji sequence
+    /// (ZWJ family, skin tone, keycap, regional-indicator flag, tag-sequence
+    /// subdivision flag) is a shaping cluster at its lead column; a real
+    /// diacritic run is an overlay holding every mark in arrival order; a VS16
+    /// emoji, an unpaired third regional indicator and a default-ignorable mark
+    /// (a lone tag, an ideographic variation selector) are neither.
     #[test]
     fn graphemes_split_into_emoji_clusters_and_diacritic_overlays() {
         const FAMILY: &str = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
@@ -1875,6 +1947,9 @@ mod tests {
     }
 
     /// A rendition belongs to the character, not the column: the spacer of a
+    /// wide glyph (CJK, or VS16-widened through its own spacer path) renders
+    /// blank, flagged `wide`, in the lead's colours and rules, since the
+    /// rasterizer spills the glyph's right half into it.
     #[test]
     fn a_wide_glyphs_spacer_carries_the_leads_rendition() {
         let look = |c: &RenderCell| (c.fg, c.bg, c.underline, c.strikethrough, c.overline);
@@ -1901,6 +1976,8 @@ mod tests {
     }
 
     /// The apron at offset `d` is the bottom viewport row at offset `d - 1`,
+    /// for a shallow scroll (a live row), at the `d == rows` seam, and deeper
+    /// than the frame (a history row); there is no apron at the live bottom.
     #[test]
     fn apron_row_is_the_bottom_row_one_offset_shallower() {
         let (rows, cols) = (6usize, 10usize);
@@ -1962,7 +2039,7 @@ mod tests {
         assert!(text.starts_with("line "), "apron text: {text:?}");
     }
 
-    /// Cursor-only updates do not bump the row-content generation. The apron
+    /// Cursor-only updates do not bump the row-content generation.
     #[test]
     fn apron_memo_refreshes_cursor_without_rematerializing_the_row() {
         let (rows, cols) = (6usize, 10usize);
@@ -1992,6 +2069,9 @@ mod tests {
     }
 
     /// The apron holds resolved colour: a recolor (host palette push, OSC 4,
+    /// default-background change, DECSCNM) moves no `content_gen`, so after
+    /// each recolor the kept apron must equal a fresh extraction, while a
+    /// stationary fill between recolors keeps the memo.
     #[test]
     fn apron_memo_rematerializes_on_every_recolor() {
         let (rows, cols) = (6usize, 12usize);
@@ -2047,6 +2127,7 @@ mod tests {
     }
 
     /// A DEC line-size change (DECSWL, `ESC # 5`) is a content change, so the
+    /// memoized apron does not keep a stale `DoubleWidth`.
     #[test]
     fn the_apron_follows_a_dec_line_size_change() {
         use crate::grid::LineSize;
@@ -2078,6 +2159,8 @@ mod tests {
     }
 
     /// One scratch, two terminals: tabs of a window share `input_scratch`, and
+    /// two grids fed the same output park at equal `(offset, content_gen,
+    /// epoch, rows, cols)`.
     #[test]
     fn apron_memo_never_carries_another_terminals_row() {
         let (rows, cols) = (6usize, 12usize);
@@ -2108,6 +2191,9 @@ mod tests {
     }
 
     /// `render_row_at_screen` is the live-frame twin of `render_row`: identical
+    /// at `display_offset == 0`, but ignores a GUI scroll-back, so socket
+    /// `cell`/`screen`/`cells` reads never pair scrolled-back colours with the
+    /// live glyph.
     #[test]
     fn render_row_at_screen_ignores_display_offset() {
         let text = |cells: &[RenderCell]| cells.iter().map(|c| c.ch).collect::<String>();
@@ -2141,6 +2227,9 @@ mod tests {
     }
 
     /// The DEC cursor belongs to the active grid, not retained history: a
+    /// scroll that pushes its row off the viewport bottom hides it, returning
+    /// live restores it, and a small scroll that leaves its row on screen
+    /// keeps it drawn, projected down by the offset.
     #[test]
     fn cell_frame_projects_the_dec_cursor_while_its_row_stays_on_screen() {
         let mut term = Terminal::new(2, 8);
@@ -2168,6 +2257,7 @@ mod tests {
     }
 
     /// The same real-parser row must keep its glyphs, selectors and ordered
+    /// marks when its live split representation becomes a history grapheme.
     #[test]
     fn borrowed_marks_preserve_live_ring_and_tiered_rendering() {
         const CORPUS: &str = "👩\u{200D}💻 👍🏽 🇺🇸 1\u{FE0F}\u{20E3} ❤\u{FE0F} ⌚\u{FE0E} e\u{0301}\u{0323} A\u{E0001} 中";
@@ -2224,6 +2314,7 @@ mod tests {
     }
 
     /// Randomized differential fuzz over a mutation alphabet chosen to attack
+    /// the continuity proof.
     #[test]
     fn dmg1_fuzz_scoped_vs_full_over_random_mutation_streams() {
         use crate::render::FrameRefill;
@@ -2320,6 +2411,7 @@ mod tests {
     }
 
     /// The split compositor's shared `pane_scratch`: two same-dims terminals
+    /// alternately refilling one scratch.
     #[test]
     fn dmg1_shared_scratch_across_two_terminals_never_leaks_rows() {
         let (rows, cols) = (6usize, 24usize);
@@ -2349,6 +2441,8 @@ mod tests {
     }
 
     /// Per-cause attribution, one clause at a time: from a settled scratch
+    /// that provably takes the scoped arm, apply exactly one mutation and
+    /// require that clause's own cause.
     #[test]
     fn dmg1_every_continuity_clause_reports_its_own_cause() {
         use crate::render::{FrameRefill, FullRefillCause, RenderInput, RowOrder};
@@ -2357,6 +2451,7 @@ mod tests {
         const COLS: usize = 32;
 
         /// A terminal with scrollback and a scratch whose continuity chain is
+        /// live: the next damage-scoped refill takes the scoped arm.
         fn settled() -> (Terminal, RenderInput) {
             let mut term = Terminal::new(ROWS as u16, COLS as u16);
             for i in 0..20 {
@@ -2492,6 +2587,8 @@ mod tests {
     }
 
     /// Fixture: a terminal with history and a scratch parked in it (filled at a
+    /// non-zero offset), so the next scrolled refill is a candidate for the
+    /// scrolled proof.
     fn scr2_parked_in_history(
         rows: usize,
         cols: usize,
@@ -2522,6 +2619,8 @@ mod tests {
     }
 
     /// The scrolled debug check compares engine channels only: the GUI stamps
+    /// host-owned overlay channels (wallpaper, atlases, effect streams,
+    /// sprites, ink, cursor overrides) into the scratch after each fill.
     #[test]
     fn scr2_debug_net_ignores_host_overlays() {
         use crate::render::FrameRefill;
@@ -2539,6 +2638,8 @@ mod tests {
     }
 
     /// One scrolled oracle step: a fresh full extract, then the scoped refill,
+    /// then content equality; the row-revision lane must be withheld from
+    /// every frame filled while scrolled.
     fn scr2_step(
         term: &mut Terminal,
         scratch: &mut crate::render::RenderInput,
@@ -2562,6 +2663,8 @@ mod tests {
     }
 
     /// History evicted from under a viewport parked at the top: the grid
+    /// re-clamps the offset and survivors keep their absolute numbers, so the
+    /// rotation stays right whether or not the evictor bumped `content_gen`.
     #[test]
     fn scr2_eviction_under_a_parked_viewport_matches_the_full_extract() {
         const ROWS: usize = 8;
@@ -2596,6 +2699,8 @@ mod tests {
     }
 
     /// Scrolled reach: the refilled strip is exactly the rows the offset moved
+    /// (one for a one-row step, three for steps of one and two between fills,
+    /// whose tracker bits say `0..2`, zero for a frame that moved nothing).
     #[test]
     fn scr2_scrolled_wheel_step_refills_only_the_exposed_strip() {
         use crate::render::FrameRefill;
@@ -2656,6 +2761,9 @@ mod tests {
     }
 
     /// Scrolled oracle: byte equality with a fresh full extraction across a
+    /// compound move whose net exceeds the viewport while the tracker stays
+    /// partial, the clamp at the top of history, and output while parked (the
+    /// re-pin, and a write into a visible live row).
     #[test]
     fn scr2_scrolled_scoped_extraction_matches_full_extract_across_history_ends_and_output() {
         use crate::render::{FrameRefill, FullRefillCause};

@@ -1,60 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The screen writer: a back-buffer of cells laid out as aterm's grid lays them out, and
-//! the bytes that turn one frame into the next (docs/DESIGN-amacs-2026-10-19.md §5.4).
-//!
-//! # Cells
-//!
-//! A [`Screen`] is rows × cols [`Cell`]s. A cell holds what one grid cell holds: a base
-//! character and the characters the grid stores with it (combining marks, variation
-//! selectors, the tail of a ZWJ sequence, a flag's second half, a skin tone), its width
-//! (1 or 2, and 0 for the right half of a wide cell) and its [`Style`].
-//! [`Screen::put`] lays text out a character at a time with
-//! [`aterm_grapheme::GridColumns`], the grid's own layout, never with per-cluster widths,
-//! so every cell lands where aterm's grid puts it under either ambiguous-width policy.
-//!
-//! # Any cell can be written on its own
-//!
-//! [`diff`] rewrites only the cells that changed, each after a cursor move. The grid
-//! decides whether a character opens a cell or joins the one before by looking at that
-//! cell, so the screen keeps every row in a form in which each cell, written after its
-//! left neighbour, lands as itself:
-//!
-//! - A put continues from the cell on its left as the grid would when the put is
-//!   written: a flag's second half joins a lone first half, a skin tone joins a wide
-//!   emoji base, a character after a ZWJ joins that cell, and a leading combining mark
-//!   or variation selector joins it (VS16 widening it).
-//! - A cell just right of a put that would join the put's last cell, were the two
-//!   written in a row, is blanked. So is a wide cell a put or a fill cuts in half.
-//! - Controls (C0, DEL, C1) are drawn as U+FFFD; a zero-width character with no cell
-//!   before it is dropped.
-//! - A cell stores at most [`MAX_JOINED`] characters after its base, as the grid's
-//!   does. A character that would join a full cell is dropped, a VS16 or VS15 with it:
-//!   the grid would still widen or narrow the cell, but its text, written again,
-//!   would no longer say so.
-//! - A put stops at the first character that does not fit: a wide character at the last
-//!   column, or a VS16 that would widen a cell there (the grid does not widen it).
-//! - VS15 narrows a wide cell to one column and leaves the column after it blank in the
-//!   default style, as the grid does; writing that cell empties that column again, so
-//!   the diff rewrites it after the cell when it holds anything else. VS15 after a
-//!   regional indicator is dropped: a narrowed half flag would take in another half
-//!   flag written beside it.
-//!
-//! # Frames
-//!
-//! [`diff`] writes the changed cells left to right in as few bytes as it finds: a
-//! relative or absolute cursor move, or a rewrite of the unchanged cells between two
-//! changes, whichever is shorter; the shortest SGR from the style before; EL for a row's
-//! blank tail. The writer starts from the cursor `prev` shows and ends at the one `next`
-//! shows, in its DECSCUSR shape. When the terminal confirmed DEC 2026 a frame that
-//! changes cells is one synchronized update; otherwise the cursor is hidden while cells
-//! change. Every frame leaves SGR at its default, which the next frame assumes.
-//! [`repaint`] draws a whole frame on a terminal in an unknown state: the first frame,
-//! and after a resize or a suspension. It first puts back the state an earlier program
-//! may have left that moves or reshapes text (a scroll region, origin mode, left and
-//! right margins, insert mode, a shifted or graphic charset, SGR), so a later diff
-//! builds on exactly the frame it drew.
+//! Screen cell back-buffer and frame diff/repaint ANSI writer.
 
 use aterm_grapheme::{GridColumns, GridStep};
 use aterm_types::text_shaping::AmbiguousWidth;
@@ -65,14 +12,10 @@ use crate::tty::Size;
 const VS15: char = '\u{FE0E}';
 const REPLACEMENT: char = '\u{FFFD}';
 
-/// The characters one cell stores after its base: the grid's
-/// `CellExtra::MAX_COMBINING`, which `aterm_grapheme::GridColumns` mirrors.
+/// Maximum combining characters stored after a cell's base character.
 pub const MAX_JOINED: usize = 16;
 
-/// The most rows, and the most columns, a [`Screen`] holds: aterm's grid's
-/// `MAX_GRID_ROWS` and `MAX_GRID_COLS`. A terminal reports its own size, so a frame
-/// is clamped to this, as the grid is, and a `u16::MAX × u16::MAX` report cannot make
-/// it allocate billions of cells.
+/// Maximum rows or columns in a [`Screen`].
 pub const MAX_SIDE: u16 = 4096;
 
 /// The most cells a [`Screen`] holds: [`MAX_SIDE`] squared.
@@ -117,7 +60,7 @@ impl Attrs {
         self.0
     }
 
-    /// The set these bits name; bits no attribute uses are dropped.
+    /// Returns the attribute set for `bits`, masking out unused bits.
     #[inline]
     #[must_use]
     pub const fn from_bits(bits: u8) -> Self {
@@ -192,7 +135,7 @@ pub struct Pos {
     pub col: u16,
 }
 
-/// One grid cell (see the module docs).
+/// One grid cell.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Cell {
     /// The base and what the grid stores with it; empty for the right half of a wide
@@ -225,8 +168,7 @@ impl Cell {
         }
     }
 
-    /// The base and the characters stored with it; empty for the right half of a wide
-    /// cell.
+    /// Base character and joined characters; empty for a wide cell continuation.
     #[inline]
     #[must_use]
     pub fn grapheme(&self) -> &str {
@@ -287,7 +229,7 @@ const fn is_regional_indicator(c: char) -> bool {
     matches!(c, '\u{1F1E6}'..='\u{1F1FF}')
 }
 
-/// A frame: rows × cols cells, the cursor and its shape. See the module docs.
+/// A frame of rows × cols cells, cursor position, and cursor shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Screen {
     size: Size,
@@ -298,8 +240,7 @@ pub struct Screen {
 }
 
 impl Screen {
-    /// A blank frame of `size`, each side clamped to [`MAX_SIDE`], laid out under the
-    /// terminal's ambiguous-width policy, with no cursor shown.
+    /// Creates a blank frame of `size` clamped to [`MAX_SIDE`] with no cursor shown.
     #[must_use]
     pub fn new(size: Size, ambiguous: AmbiguousWidth) -> Self {
         let size = Size {
@@ -314,8 +255,6 @@ impl Screen {
                 size.rows
             },
         };
-        // Each side is clamped, so the product never exceeds `MAX_CELLS`; the check says
-        // so where the allocation's bound is proved.
         let count = usize::from(size.cols) * usize::from(size.rows);
         let count = if count > MAX_CELLS { MAX_CELLS } else { count };
         Self {
@@ -408,8 +347,7 @@ impl Screen {
         self.size.cols as usize
     }
 
-    /// Where `row`, `col` sits in `cells`. Every caller keeps `col` inside the row, so
-    /// the sum never saturates.
+    /// Where `row`, `col` sits in `cells`.
     #[inline]
     const fn index(&self, row: u16, col: usize) -> usize {
         (row as usize * self.size.cols as usize).saturating_add(col)
@@ -465,9 +403,7 @@ impl Screen {
         }
     }
 
-    /// Write `text` in `style` from `row`, `col`, as the grid lays it out (see the module
-    /// docs), and return the column after it: where the terminal's cursor stands once it
-    /// is written. Text past the right edge is not drawn.
+    /// Writes `text` in `style` from `row`, `col` and returns the ending column.
     pub fn put(&mut self, row: u16, col: u16, text: &str, style: Style) -> u16 {
         if row >= self.size.rows || col >= self.size.cols {
             return col.min(self.size.cols);
@@ -476,16 +412,12 @@ impl Screen {
         let start = usize::from(col);
         self.split(row, start);
 
-        // The walk starts from the cell on the left, as the grid's does: the characters
-        // it stores decide what the put's first character joins.
         let mut walker = GridColumns::with_ambiguous_width(self.ambiguous);
         let mut origin = start;
         let mut current = None;
         if start > 0 {
             let head = self.head(row, start - 1);
             let left = self.get(row, head);
-            // A narrowed cell takes nothing written beside it: it is not wide, ends in no
-            // ZWJ, and holds no lone regional indicator (VS15 after one is dropped).
             if !left.narrowed {
                 for c in left.text.chars() {
                     walker.step(c);
@@ -500,8 +432,6 @@ impl Screen {
             let c = if c.is_control() { REPLACEMENT } else { c };
             let mut next = walker.clone();
             match next.step(c) {
-                // Column sums stay inside the row (a put stops at its edge), so none
-                // saturates.
                 GridStep::Opens { col, width } => {
                     let at = origin.saturating_add(col);
                     if at.saturating_add(width) > cols {
@@ -526,8 +456,6 @@ impl Screen {
                     cell.text.push(c);
                 }
                 GridStep::Joins { widened } => {
-                    // With no cell before it, a zero-width character is dropped; so is
-                    // one that would join a full cell, the walk left as if it never came.
                     let Some(at) = current else {
                         continue;
                     };
@@ -566,7 +494,6 @@ impl Screen {
         let end = origin.saturating_add(walker.column()).min(cols);
         self.mend(row, start.saturating_sub(1), end);
 
-        // The cell after the put would join its last cell were the two written in a row.
         if end < cols {
             let right = self.get(row, end);
             if let Some(base) = right.base()
@@ -582,8 +509,7 @@ impl Screen {
         u16::try_from(end).unwrap_or(self.size.cols)
     }
 
-    /// Blank `from..to` of `row` in `style`. A wide cell the range cuts in half is
-    /// blanked whole.
+    /// Blanks `from..to` of `row` in `style`, including any split wide cells.
     pub fn fill(&mut self, row: u16, from: u16, to: u16, style: Style) {
         let to = to.min(self.size.cols);
         if row >= self.size.rows || from >= to {
@@ -597,7 +523,7 @@ impl Screen {
         }
     }
 
-    /// Restyle the cells of `row` that `from..to` touches, whole, keeping their text.
+    /// Restyles the cells of `row` that `from..to` touches, keeping their text.
     pub fn set_style(&mut self, row: u16, from: u16, to: u16, style: Style) {
         let to = usize::from(to.min(self.size.cols));
         if row >= self.size.rows || usize::from(from) >= to {
@@ -615,9 +541,7 @@ impl Screen {
     }
 }
 
-/// The bytes that turn `prev`, the frame the terminal shows, into `next`; none when
-/// nothing changed. A frame of another size or ambiguous-width policy is a
-/// [`repaint`]. See the module docs.
+/// Returns the bytes that turn `prev` into `next`, or [`repaint`] if size or width policy changed.
 #[must_use]
 pub fn diff(prev: &Screen, next: &Screen, caps: &Caps) -> Vec<u8> {
     if prev.size != next.size || prev.ambiguous != next.ambiguous {
@@ -626,9 +550,7 @@ pub fn diff(prev: &Screen, next: &Screen, caps: &Caps) -> Vec<u8> {
     Painter::paint(prev, next, caps.sync_2026, false)
 }
 
-/// The bytes that draw `next` whole on a terminal in an unknown state: the charset and
-/// SGR reset, the screen cleared, then every cell that is not blank, the cursor and its
-/// shape.
+/// Returns the bytes that draw `next` from scratch after resetting terminal modes and clearing.
 #[must_use]
 pub fn repaint(next: &Screen, caps: &Caps) -> Vec<u8> {
     let blank = Screen::new(next.size, next.ambiguous);
@@ -665,12 +587,9 @@ impl Painter<'_> {
         let mut p = Painter {
             next,
             out: Vec::new(),
-            // The terminal shows `prev`, so its cursor stands where `prev` shows one.
             at: if full { None } else { prev.cursor },
             sgr: Style::default(),
         };
-        // A synchronized update shows no cursor mid-frame; without one the cursor is
-        // hidden while cells are written, so it does not flit across the screen.
         let sync = sync && cells;
         let mut visible = !full && prev.cursor.is_some();
         if sync {
@@ -726,9 +645,6 @@ impl Painter<'_> {
             if need.get(col) != Some(&true) {
                 continue;
             }
-            // A changed right half is written with its wide cell (a frame's first column
-            // is never one); writing a narrowed cell empties the column after it, which
-            // is written again when it holds more.
             let cell = next.get(row, col);
             if cell.is_continuation()
                 && let Some(left) = col.checked_sub(1).and_then(|left| need.get_mut(left))
@@ -744,7 +660,6 @@ impl Painter<'_> {
                 *right = true;
             }
         }
-        // The row's blank tail, which one EL can write.
         let mut tail = cols;
         while tail > 0 && next.get(row, tail - 1).is_erased() {
             tail -= 1;
@@ -865,7 +780,6 @@ fn moves(from: Option<Pos>, to: Pos) -> Vec<u8> {
             best = bytes;
         }
     };
-    // Widened, so a 1-based column or the row after one cannot overflow.
     let (from_row, to_row) = (u32::from(from.row), u32::from(to.row));
     if from.row == to.row {
         let (a, b) = (u32::from(from.col), u32::from(to.col));
@@ -932,7 +846,6 @@ fn sgr_bytes(from: Style, to: Style) -> Vec<u8> {
     if from == to {
         return Vec::new();
     }
-    // The changes alone. SGR 22 resets bold and dim together.
     let mut changes = Vec::new();
     let off = from.attrs.difference(to.attrs);
     let mut on = to.attrs.difference(from.attrs);
@@ -958,7 +871,6 @@ fn sgr_bytes(from: Style, to: Style) -> Vec<u8> {
     if from.bg != to.bg {
         color_params(to.bg, true, &mut changes);
     }
-    // A reset and everything `to` sets.
     let mut reset = Vec::new();
     if to != Style::default() {
         reset.push(0);
@@ -1011,26 +923,20 @@ mod tests {
         let plain = Style::default();
         assert_eq!(s.put(0, 0, "a中b", plain), 4);
         assert_eq!(s.row_text(0), "a中b      ");
-        // A flag's halves put apart meet in one cell, as the grid joins them.
         let mut s = screen(10);
         assert_eq!(s.put(0, 0, "\u{1F1FA}", plain), 2);
         assert_eq!(s.put(0, 2, "\u{1F1F8}x", plain), 3);
         assert_eq!(s.row_text(0), "\u{1F1FA}\u{1F1F8}x       ");
-        // A wide character that does not fit is not drawn; nor is what follows it.
         let mut s = screen(3);
         assert_eq!(s.put(0, 1, "a中b", plain), 2);
         assert_eq!(s.row_text(0), " a ");
-        // VS15 narrows a wide emoji and leaves the column after it blank.
         let mut s = screen(6);
         assert_eq!(s.put(0, 0, "\u{231A}\u{FE0E}x", plain), 3);
         assert_eq!(s.cell(0, 0).unwrap().width(), 1);
         assert_eq!(s.row_text(0), "\u{231A}\u{FE0E} x   ");
-        // Controls are drawn as U+FFFD.
         let mut s = screen(4);
         s.put(0, 0, "\t\x1b", plain);
         assert_eq!(s.row_text(0), "\u{FFFD}\u{FFFD}  ");
-        // A cell keeps 16 characters after its base, as the grid does: the rest are
-        // dropped, a VS16 that would widen it with them.
         let mut s = screen(4);
         let marks = "\u{301}".repeat(20);
         assert_eq!(s.put(0, 0, &format!("e{marks}"), plain), 1);
@@ -1060,7 +966,6 @@ mod tests {
         s.put(0, 2, "\u{1F1F8}", plain);
         s.put(0, 0, "\u{1F1FA}", plain);
         assert_eq!(s.row_text(0), "\u{1F1FA}    ");
-        // Cutting a wide cell in half blanks it whole.
         let mut s = screen(6);
         s.put(0, 0, "中文", plain);
         s.put(0, 1, "x", plain);

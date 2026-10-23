@@ -56,6 +56,9 @@ pub use work::{Spent, take_spent};
 
 pub mod opentype_layout {
     //! The [OpenType Layout](
+    //! https://docs.microsoft.com/en-us/typography/opentype/spec/chapter2#overview)
+    //! common tables: script, feature and lookup lists, coverage and class
+    //! definitions, (chained) context lookups and feature variations.
     pub use crate::ggg::*;
 }
 
@@ -498,6 +501,7 @@ impl FromData for TableRecord {
 }
 
 /// The most variation axes a [`Face`] keeps coordinates for; a face with
+/// more is read at its default instance only.
 const MAX_VAR_COORDS: usize = 64;
 
 #[derive(Clone)]
@@ -1581,6 +1585,7 @@ impl<'a> Face<'a> {
     }
 
     /// Adds the `MVAR` delta for `tag` at the current instance, truncated
+    /// toward zero as upstream does; a sum outside i16 leaves `value` as is.
     #[inline]
     fn apply_metrics_variation_to(&self, tag: Tag, value: &mut i16) {
         if self.is_variable() {

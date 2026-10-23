@@ -93,6 +93,7 @@ pub fn package_entrypoint(text: &str) -> Option<PathBuf> {
 }
 
 /// The package root `root`'s manifest text and entrypoint, read bounded and never through a
+/// link.
 fn manifest_of(root: &Path) -> Option<(String, PathBuf)> {
     let text = crate::metadata_io::read_bounded_regular_utf8(
         &root.join(PACKAGE_JSON),
@@ -223,6 +224,7 @@ pub fn parse_upstream(text: &str) -> Option<Upstream> {
 }
 
 /// The day of a UTC time as `alab/package.sh` records one (`2026-10-20T13:50:13Z`), or
+/// `None` for any other shape.
 fn utc_day(time: &str) -> Option<String> {
     let shaped = time.len() == 20
         && time.bytes().enumerate().all(|(i, b)| match i {

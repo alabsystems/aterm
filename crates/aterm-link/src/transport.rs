@@ -117,11 +117,12 @@ pub fn connect(endpoint: &str, deadline: Duration) -> io::Result<(Conn, Closer)>
     Ok((conn, closer))
 }
 
-/// The reconnect back-off floor and ceiling. §7: a bridge reconnects with jittered
+/// The reconnect back-off floor and ceiling.
 const RECONNECT_MIN: Duration = Duration::from_millis(100);
 pub(crate) const RECONNECT_MAX: Duration = Duration::from_secs(5);
 
 /// How long a link must have stayed up for its loss to restart the back-off from
+/// [`RECONNECT_MIN`] and be redialled at once.
 const LINK_STABLE: Duration = RECONNECT_MAX;
 
 /// One broker client's reconnect back-off.
@@ -176,6 +177,7 @@ impl Backoff {
 }
 
 /// `b` jittered into `[b/2, b]` by `r`: integer-only, and never longer than
+/// `b`.
 fn jittered(b: Duration, r: u64) -> Duration {
     let half = b / 2;
     let span = u64::try_from((b - half).as_micros()).unwrap_or(u64::MAX);
@@ -199,23 +201,23 @@ pub fn describe(path: &str, e: &io::Error) -> String {
     }
 }
 
-/// THE MINT SECRET READER.
+/// THE MINT SECRET READER: astream's [`astream_cap::capfile::read_secret_at`], every refusal
+/// naming `path` exactly as given (a bare name too, never `./<name>`).
 ///
 /// # Errors
 /// A missing file or directory (`NotFound`, which a caller may answer with a hint).
 pub fn read_mint_secret(path: &str) -> io::Result<Vec<u8>> {
-    let path = std::path::Path::new(path);
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{}: a mint secret's path names a file", path.display()),
-        ));
-    };
-    let dir = match path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir,
-        _ => std::path::Path::new("."),
-    };
-    astream_cap::capfile::read_secret_in(dir, name)
+    astream_cap::capfile::read_secret_at(path)
+}
+
+/// [`read_mint_secret`] as it reads once the secret's directory is 0700
+/// ([`astream_cap::capfile::read_secret_at_narrowed`]): `fabric on --dry-run`'s reader, since the
+/// real run narrows the root before it reads the secret. A real read never uses it.
+///
+/// # Errors
+/// [`read_mint_secret`]'s, but for its directory's group or other mode bits.
+pub fn read_mint_secret_narrowed(path: &str) -> io::Result<Vec<u8>> {
+    astream_cap::capfile::read_secret_at_narrowed(path)
 }
 
 #[cfg(test)]
@@ -223,6 +225,8 @@ mod tests {
     use super::*;
 
     /// A connect's deadline bounds both directions: a `hello` nobody answers and a
+    /// post bigger than the socket's buffers to a broker that stopped reading both
+    /// fail at it.
     #[test]
     fn a_connects_deadline_ends_a_hello_nobody_answers_and_a_publish_nobody_reads() {
         use std::os::unix::net::UnixListener;
@@ -263,6 +267,9 @@ mod tests {
     }
 
     /// A broker that sent a subscription its mail and hung up BEFORE the subscriber
+    /// re-bounds its reads (macOS: `EINVAL`, the socket is shut down both ways) is no
+    /// error: the bound is set or lifted, and the subscription still reads the mail,
+    /// then the close.
     #[test]
     fn a_subscription_whose_broker_already_hung_up_reads_its_mail_then_the_close() {
         use astream_broker::proto::{
@@ -331,6 +338,8 @@ mod tests {
     }
 
     /// A READ BELOW A RETAINING BROKER'S FLOOR READS ON FROM IT:
+    /// three records on one face, the log cut below the
+    /// second.
     #[test]
     fn a_fetch_below_the_retained_floor_reads_on_from_it() {
         let dir = aterm_tempfile::Builder::new()
@@ -370,6 +379,7 @@ mod tests {
     }
 
     /// A MINT SECRET IS READ BY ASTREAM'S ONE SECRET-FILE RULE, over its directory
+    /// and its name; the dry run's [`read_mint_secret_narrowed`] waives the directory's mode alone.
     #[test]
     fn a_mint_secret_is_owner_only_long_enough_and_read_byte_for_byte() {
         use std::os::unix::fs::PermissionsExt;
@@ -410,7 +420,17 @@ mod tests {
         let e = read_mint_secret(p).expect_err("a directory open to others");
         assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
         assert!(e.to_string().contains("chmod 700"), "{e}");
+        assert!(!e.to_string().contains("exposed"), "{e}");
         once(p, &e);
+        // A dry run reads it as the real run will once the root is narrowed: the
+        // directory's mode alone is waived, the file's own is not.
+        assert_eq!(read_mint_secret_narrowed(p).expect("once narrowed"), bytes);
+        mode(&path, 0o644);
+        let e = read_mint_secret_narrowed(p).expect_err("the file's own mode");
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        assert!(e.to_string().contains("chmod 600"), "{e}");
+        once(p, &e);
+        mode(&path, 0o600);
         mode(&dir, 0o700);
 
         let linked = dir.join("linked.secret");
@@ -446,6 +466,76 @@ mod tests {
             "a non-OS error is kept as said"
         );
     }
+
+    /// Set in the child [`a_bare_secret_name_is_read_here_and_named_as_given`] runs.
+    const BARE_NAME_CHILD_ENV: &str = "ATERM_LINK_TEST_BARE_SECRET_CHILD";
+
+    /// A BARE `--secret-file` IS READ IN THE CURRENT DIRECTORY AND NAMED AS GIVEN, never as
+    /// `./<name>`: this test binary, run again in a scratch directory, refuses `mint.secret` for
+    /// its own mode and for its directory's and a missing bare name by that name; the control
+    /// reads the same 0600 secret there once the directory is 0700.
+    #[test]
+    fn a_bare_secret_name_is_read_here_and_named_as_given() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &str, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod")
+        };
+        if std::env::var_os(BARE_NAME_CHILD_ENV).is_some() {
+            let bare = "mint.secret";
+            let bytes = std::fs::read(bare).expect("the parent's secret");
+            let named_as_given = |e: &io::Error, rest: &str| {
+                let said = describe(bare, e);
+                assert!(said.starts_with(&format!("{bare}{rest}")), "{said}");
+                assert!(!said.contains("./mint.secret"), "{said}");
+                assert_eq!(said, e.to_string(), "the name is not prefixed twice");
+            };
+            mode(".", 0o700);
+            mode(bare, 0o644);
+            let e = read_mint_secret(bare).expect_err("readable by others");
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+            named_as_given(&e, " is mode 0644: ");
+            mode(bare, 0o600);
+            mode(".", 0o755);
+            let e = read_mint_secret(bare).expect_err("a directory open to others");
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+            named_as_given(&e, ": its directory . is mode 0755: ");
+            mode(".", 0o700);
+            let absent = read_mint_secret("absent.secret").expect_err("absent");
+            assert_eq!(absent.kind(), io::ErrorKind::NotFound);
+            let said = describe("absent.secret", &absent);
+            assert!(said.starts_with("absent.secret: "), "{said}");
+            assert_eq!(read_mint_secret(bare).expect("a bare name, here"), bytes);
+            // On a line of its own: the harness has printed the test's name without one.
+            println!("\nbare-name=read");
+            return;
+        }
+        let scratch = aterm_tempfile::tempdir().expect("scratch");
+        let here = scratch.path().join("here");
+        std::fs::create_dir(&here).expect("here");
+        let secret = here.join("mint.secret");
+        std::fs::write(&secret, [0x5a; 32]).expect("write");
+        mode(secret.to_str().expect("utf8"), 0o600);
+        let mut child =
+            aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"));
+        child
+            .args([
+                "transport::tests::a_bare_secret_name_is_read_here_and_named_as_given",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(BARE_NAME_CHILD_ENV, "1")
+            .current_dir(&here);
+        let out = aterm_uds::deadline::output_within(&mut child, Duration::from_secs(60))
+            .expect("the child ran within the hang detector");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            stdout.lines().any(|line| line == "bare-name=read"),
+            "the child ran no check: {stdout}"
+        );
+    }
+
     /// Equal jitter: every draw lies in `[b/2, b]`, both ends reachable.
     #[test]
     fn a_jittered_wait_lies_in_the_upper_half_of_the_back_off() {
@@ -460,6 +550,7 @@ mod tests {
     }
 
     /// A link lost right after it came up is a failed attach (it waits and doubles);
+    /// only one that stayed up restarts the back-off at the floor and redials at once.
     #[test]
     fn only_a_link_that_stayed_up_resets_the_back_off() {
         let within = |d: Duration, b: Duration| b / 2 <= d && d <= b;

@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the account stats' view and its two renderings ([`super::view`],
-//! [`super::text`], [`super::json`]). Every state, profile and spend here is
-//! composed in memory, on a fixed clock: invented ids and labels, no file.
+//! Tests for the account stats' view and its two renderings ([`super::view`], [`super::text`], [`super::json`]).
 
 use aterm_json::{Value, json};
 
@@ -124,8 +122,7 @@ fn doc(look: &Look<'_>) -> Value {
 /// DAY ONE, THE PACKAGED CONFIG (design "What you get"): the tap off and no
 /// `/usage` seen, every empty figure says why — `usage-tap-off` for the two
 /// windows, `no-usage-seen` for Fable, beside the plan's own Fable answer —
-/// in the text and in JSON. NEGATIVE CONTROLS: with the tap on it is
-/// `no-reading`, and for a home the tap does not serve `tap-not-this-home`.
+/// in the text and in JSON.
 #[test]
 fn day_one_every_empty_figure_names_its_reason() {
     let p = profile(None);
@@ -161,7 +158,6 @@ fn day_one_every_empty_figure_names_its_reason() {
         "unknown is null, never 0"
     );
     assert_eq!(windows[0]["state"], Value::Null);
-    // NEGATIVE CONTROLS: the tap on; another home.
     for (tap, word) in [
         (Tap::On, "no-reading"),
         (Tap::OtherHome, "tap-not-this-home"),
@@ -179,8 +175,7 @@ fn day_one_every_empty_figure_names_its_reason() {
 /// vendor named, `source: tap`, this machine, `current`; the text reads
 /// `42.5% used · 57.5% left · resets 18:05 (in 1h25m)   as of 1m (tap,
 /// here)`. AFTER ITS RESET it is VOID — `window reset 18:05, no reading
-/// since`, `used_pct: null`, `missing: window-reset` — never 0%. NEGATIVE
-/// CONTROL: a minute before the reset it is still current.
+/// since`, `used_pct: null`, `missing: window-reset` — never 0%.
 #[test]
 fn a_tap_figure_is_current_to_a_tenth_and_void_after_its_reset() {
     let state = tapped(425, 710, NOW - MIN);
@@ -211,7 +206,6 @@ fn a_tap_figure_is_current_to_a_tenth_and_void_after_its_reset() {
         ),
         "{shown}"
     );
-    // After the reset: void.
     let after = Look {
         now: NOW + 86 * MIN,
         ..l
@@ -226,7 +220,6 @@ fn a_tap_figure_is_current_to_a_tenth_and_void_after_its_reset() {
         shown.contains("  5h     \u{2014}  window reset 18:05, no reading since\n"),
         "{shown}"
     );
-    // NEGATIVE CONTROL: a minute before it, current.
     let before = Look {
         now: NOW + 84 * MIN,
         ..l
@@ -239,10 +232,7 @@ fn a_tap_figure_is_current_to_a_tenth_and_void_after_its_reset() {
 
 /// A LIMIT RESET USED INSIDE THE WINDOW, NO READING SINCE (design §3.5): the
 /// figure held is cut by the epoch — `reset used 16:30, no reading since`,
-/// `missing: reset-used`, `epoch_at` named. S5's word that a reset refilled
-/// the week cuts a figure the `/usage` cache held from before it. NEGATIVE
-/// CONTROLS: with no epoch the same figure is current; S5's refill from
-/// before the cache's read leaves the cached figure standing.
+/// `missing: reset-used`, `epoch_at` named.
 #[test]
 fn a_reset_used_with_no_reading_since_says_so() {
     let mut state = tapped(1000, 400, NOW - HOUR);
@@ -264,7 +254,6 @@ fn a_reset_used_with_no_reading_since_says_so() {
         shown.contains("  5h     \u{2014}  reset used 16:30, no reading since\n"),
         "{shown}"
     );
-    // NEGATIVE CONTROL: no epoch, current.
     let plain = tapped(1000, 400, NOW - HOUR);
     let l = look(plain.accounts.get("main"), &p, Tap::On);
     assert_eq!(
@@ -272,7 +261,6 @@ fn a_reset_used_with_no_reading_since_says_so() {
         Value::from(100u64)
     );
 
-    // S5's refill word cuts the week the cache held from before it.
     let cached = profile(Some(
         json!({"seven_day": {"utilization": 96.0, "resets_at": "2026-10-18T20:50:00Z"}}),
     ));
@@ -298,7 +286,6 @@ fn a_reset_used_with_no_reading_since_says_so() {
         Value::from("reset-used"),
         "{week}"
     );
-    // NEGATIVE CONTROL: refilled before the cache was read: the 96% stands.
     said.accounts.get_mut("main").expect("held").warned_week = Some(accounts::WindowSaid {
         pct: None,
         reset: None,
@@ -331,8 +318,7 @@ fn week_said(pct_x10: u32, at: i64, said: accounts::WindowSaid) -> accounts::Acc
 /// before the merge (design §3.5): the `/usage` cache's week of 98%, fetched
 /// two days ago, the tap's 5% read a minute ago with no epoch kept beside
 /// it, and a reset used a day ago — the week is the tap's 5%, read after the
-/// reset, never `reset used, no reading since`. NEGATIVE CONTROL: the tap's
-/// reading from before the reset too, both are cut, and the week says so.
+/// reset, never `reset used, no reading since`.
 #[test]
 fn a_reset_used_cuts_each_source_before_the_merge() {
     let cached = profile(Some(
@@ -355,7 +341,6 @@ fn a_reset_used_cuts_each_source_before_the_merge() {
         ),
         "{week}"
     );
-    // NEGATIVE CONTROL: read before the reset, the tap's figure is cut too.
     let before = week_said(50, NOW - 3 * DAY, used);
     let l = look(Some(&before), &cached, Tap::On);
     let week = &doc(&l)["accounts"][0]["windows"][1];
@@ -369,8 +354,7 @@ fn a_reset_used_cuts_each_source_before_the_merge() {
 /// A LIMIT THAT LIFTED BY ITSELF REFILLED NOTHING INSIDE ITS WINDOW
 /// ([`accounts::reset_outcome`]'s `Lifted`, design §3.5): its word names the
 /// reset that came, and the next window's 20%, read before the outcome was,
-/// stands. NEGATIVE CONTROL: the same word of a reset USED (no reset named)
-/// cuts it — `reset used`.
+/// stands.
 #[test]
 fn a_limit_that_lifted_by_itself_cuts_nothing() {
     let p = profile(None);
@@ -387,7 +371,6 @@ fn a_limit_that_lifted_by_itself_cuts_nothing() {
         (&Value::from(200u64), &Value::Null),
         "{week}"
     );
-    // NEGATIVE CONTROL: a reset used.
     let used = week_said(
         200,
         NOW - 2 * DAY,
@@ -410,9 +393,7 @@ fn a_limit_that_lifted_by_itself_cuts_nothing() {
 /// state the tap of an older build wrote — shows its figures, `source:
 /// sample`, as of the sample; beside the tap's record, a sample that says
 /// another figure (the probe's 45% over the tap's 42.5%) merges by the one
-/// rule. NEGATIVE CONTROL: the sample the tap itself wrote, the
-/// whole-percent copy of its record, adds nothing — the figure is the tap's,
-/// to a tenth.
+/// rule.
 #[test]
 fn a_figure_held_only_in_the_sample_is_shown() {
     let p = profile(None);
@@ -446,7 +427,6 @@ fn a_figure_held_only_in_the_sample_is_shown() {
             "{windows}"
         );
     }
-    // NEGATIVE CONTROL: the tap's own copy is no second figure.
     let mut state = tapped(425, 710, NOW - MIN);
     let l = look(state.accounts.get("main"), &p, Tap::On);
     let five = win(&view(&l), SESSION_LIMIT)
@@ -454,7 +434,6 @@ fn a_figure_held_only_in_the_sample_is_shown() {
         .cloned()
         .expect("current");
     assert_eq!((five.pct_x10, five.source.as_str()), (425, SOURCE_TAP_WORD));
-    // The probe's panel beside it: the larger, from the sample.
     accounts::note_sample(&mut state, "main", sample(45, NOW), NOW);
     let l = look(state.accounts.get("main"), &p, Tap::On);
     let five = win(&view(&l), SESSION_LIMIT)
@@ -468,8 +447,7 @@ fn a_figure_held_only_in_the_sample_is_shown() {
 /// the `/usage` cache's 60% under one reset give 60% from the cache (the
 /// largest), a wall gives 100% until its reset, and the Fable week comes
 /// from the cache's `limits[]` row under its own name — as last seen, two
-/// days old, `/usage`. NEGATIVE CONTROL: a cached week under an OLDER reset
-/// than the tap's gives way to the tap's newer window.
+/// days old, `/usage`.
 #[test]
 fn every_source_of_a_window_merges_by_one_rule() {
     let state = tapped(400, 300, NOW - MIN);
@@ -502,7 +480,6 @@ fn every_source_of_a_window_merges_by_one_rule() {
         shown.contains("as of 2d (/usage, here) \u{b7} plan: Fable included\n"),
         "{shown}"
     );
-    // A wall: 100% until its reset.
     let mut walled = state.clone();
     walled.accounts.get_mut("main").expect("held").walls.insert(
         SESSION_LIMIT.to_string(),
@@ -528,9 +505,7 @@ const SOURCE_TAP_WORD: &str = accounts::SOURCE_TAP;
 /// THE DOLLARS (design §3.6, A5's figures wired in): with a current reading
 /// of the week at 50% and $20 of list-price spend before it, the week holds
 /// `≥$40` and `≈$20` is left; with no reading the figure is rolling and no
-/// capacity is claimed. Credits in use in the window suppress both
-/// (`on-credits`). NEGATIVE CONTROL: the same spend with no reading claims
-/// no capacity.
+/// capacity is claimed.
 #[test]
 fn the_dollars_come_from_the_spend_beside_the_windows_reading() {
     let prices = PriceTable::from_toml(PRICES_TOML).expect("the table");
@@ -582,7 +557,6 @@ fn the_dollars_come_from_the_spend_beside_the_windows_reading() {
     assert_eq!(d["complete"], Value::from(true));
     let shown = text(&l, &v);
     assert!(shown.contains(" of \u{2265}"), "{shown}");
-    // Credits in use in the window: no capacity.
     let mut credited = state.clone();
     credited.accounts.get_mut("main").expect("held").credits = Some(Credits::InUse(CreditsUse {
         since: NOW - HOUR,
@@ -597,7 +571,6 @@ fn the_dollars_come_from_the_spend_beside_the_windows_reading() {
     let v2 = view(&l2);
     let week = dollars(&l2, &v2, win(&v2, WEEK_LIMIT)).expect("a figure");
     assert_eq!(week.capacity.err(), Some(spend::Why::OnCredits));
-    // NEGATIVE CONTROL: no reading, rolling, no capacity.
     let l3 = Look { account: None, ..l };
     let v3 = view(&l3);
     let week = dollars(&l3, &v3, win(&v3, WEEK_LIMIT)).expect("a figure");
@@ -631,12 +604,7 @@ fn shown_with(
 /// ([`Account::of_another`], the rule `note_reading` drops it by): `main`'s
 /// record holds account A's figures — the five hours at a wall, the week at
 /// 80% with S5's warning of it, credits in use — and the home's profile now
-/// names account B, of which no reading has come. The view says B's key and
-/// none of A's figures: each window is empty and says `no-reading` (the tap
-/// is on, and has read nothing of B), no `100%` is printed, and no window's
-/// dollars are on credits. NEGATIVE CONTROLS: the profile naming A shows
-/// A's wall and its credits; an unkeyed record (one an older build wrote),
-/// of no account the view can tell, is shown.
+/// names account B, of which no reading has come.
 #[test]
 fn a_record_of_another_account_is_not_shown_under_the_one_signed_in() {
     let prices = PriceTable::from_toml(PRICES_TOML).expect("the table");
@@ -692,7 +660,6 @@ fn a_record_of_another_account_is_not_shown_under_the_one_signed_in() {
         assert!(shown.contains(row), "{row:?} in {shown}");
     }
     assert!(!shown.contains("100%"), "{shown}");
-    // NEGATIVE CONTROL: the profile names A, whose record it is.
     let a = profile(None);
     let (d, shown) = shown_with(&spend, &a, state.accounts.get("main"));
     let five = &d["accounts"][0]["windows"][0];
@@ -702,7 +669,6 @@ fn a_record_of_another_account_is_not_shown_under_the_one_signed_in() {
     );
     assert!(on_credits(&d), "{d}");
     assert!(shown.contains("  5h     100% used"), "{shown}");
-    // NEGATIVE CONTROL: an unkeyed record says nothing of whose it is.
     let mut unkeyed = state.clone();
     unkeyed.accounts.get_mut("main").expect("held").key = None;
     let (d, _) = shown_with(&spend, &b, unkeyed.accounts.get("main"));
@@ -710,8 +676,6 @@ fn a_record_of_another_account_is_not_shown_under_the_one_signed_in() {
         d["accounts"][0]["windows"][0]["used_pct"],
         Value::from(100u64)
     );
-    // Several logins make home-wide spend ambiguous, not the identity of
-    // the profile/cache. B's cache is still B's and cannot merge A's wall.
     let cached_b = profile_of(
         other,
         Some(json!({
@@ -740,8 +704,6 @@ fn a_record_of_another_account_is_not_shown_under_the_one_signed_in() {
         assert!(shown.contains("  5h     20% used"), "{shown}");
         assert!(shown.contains("  week   60% used"), "{shown}");
         assert!(!shown.contains("100%"), "{shown}");
-        // Positive controls: a keyed record of B, or an unkeyed legacy
-        // record, is admitted beside this same profile/cache.
         for key in [Some(b_key), None] {
             let mut admitted = state.accounts["main"].clone();
             admitted.key = key;
@@ -780,20 +742,7 @@ fn profile_cached_by(uuid: &str, cached_by: &str, fetched: i64) -> Result<Profil
 
 /// SPEND SINCE ANOTHER ACCOUNT WAS SEEN ON THE HOME IS UNATTRIBUTED (design
 /// §3.6): the fold is home-wide, so its messages since a second account was
-/// seen there cannot be put on the one the profile names. Account A spent
-/// in the home two hours ago; B now signs in.
-/// * Before B's first reading — the record is A's (`of_another`) — the
-///   rolling week reads `(rolling 7d, unattributed)`, and JSON's
-///   `attribution` is `unattributed`.
-/// * After it — the record is B's, its key changed an hour ago
-///   (`keyed_at`), B's week at 10% — the week's capacity and `left` read
-///   `— unattributed` (`suppressed`), never `≥` A's dollars over B's
-///   reading. So they do where B's record never changed key but the cached
-///   `/usage` body names A, fetched inside the week.
-///
-/// NEGATIVE CONTROLS: the key changed, or A's cache was fetched, before
-/// every window began — `assumed`, and the capacity is claimed; the profile
-/// naming A, whose record it is — `assumed`.
+/// seen there cannot be put on the one the profile names.
 #[test]
 fn spend_since_another_account_was_seen_on_the_home_is_unattributed() {
     let prices = PriceTable::from_toml(PRICES_TOML).expect("the table");
@@ -822,19 +771,16 @@ fn spend_since_another_account_was_seen_on_the_home_is_unattributed() {
     );
     let attribution = |d: &Value| d["accounts"][0]["spend"]["attribution"].clone();
     let b = profile_of(OTHER, None);
-    // Before B's first reading: the record is A's.
     let mut a_state = tapped(100, 500, NOW - MIN);
     a_state.accounts.get_mut("main").expect("held").key = a_key;
     let (d, shown) = shown_with(&spend, &b, a_state.accounts.get("main"));
     assert_eq!(attribution(&d), Value::from("unattributed"), "{d}");
     assert!(shown.contains("(rolling 7d, unattributed)"), "{shown}");
-    // NEGATIVE CONTROL: the profile names A, whose record it is.
     let a = profile(None);
     let (d, shown) = shown_with(&spend, &a, a_state.accounts.get("main"));
     assert_eq!(attribution(&d), Value::from("assumed"), "{d}");
     assert!(shown.contains(" of \u{2265}"), "{shown}");
 
-    // After it: B's record, its key changed an hour ago.
     let keyed = |keyed_at: Option<i64>| {
         let mut state = tapped(100, 100, NOW - MIN);
         let held = state.accounts.get_mut("main").expect("held");
@@ -871,18 +817,15 @@ fn spend_since_another_account_was_seen_on_the_home_is_unattributed() {
     );
     assert!(shown.contains("left \u{2014} unattributed"), "{shown}");
     assert!(!shown.contains(" of \u{2265}"), "{shown}");
-    // NEGATIVE CONTROL: the key changed before every window began.
     let (figure, d, shown) = week(&b, &keyed(Some(NOW - 8 * DAY)));
     assert!(figure.capacity.is_ok(), "{figure:?}");
     assert_eq!(attribution(&d), Value::from("assumed"));
     assert!(shown.contains(" of \u{2265}"), "{shown}");
 
-    // A cache of A's, fetched inside the week, on B's unchanged record.
     let cached = profile_cached_by(OTHER, UUID, NOW - 2 * DAY);
     let (figure, d, _) = week(&cached, &keyed(None));
     assert_eq!(figure.capacity.err(), Some(spend::Why::Unattributed));
     assert_eq!(attribution(&d), Value::from("unattributed"));
-    // NEGATIVE CONTROL: fetched before every window began.
     let before = profile_cached_by(OTHER, UUID, NOW - 8 * DAY);
     let (figure, d, _) = week(&before, &keyed(None));
     assert!(figure.capacity.is_ok(), "{figure:?}");
@@ -893,8 +836,7 @@ fn spend_since_another_account_was_seen_on_the_home_is_unattributed() {
 /// key of the account the default home's profile names): A's record — a
 /// wall on the five hours, the week at 80% — under B's key shows nothing,
 /// each window empty and `no-reading`, as `accounts stats` says at the same
-/// moment. NEGATIVE CONTROLS: under A's key, A's wall (100%); with no key
-/// read, the record is shown.
+/// moment.
 #[test]
 fn the_accounts_report_shows_no_record_of_another_account() {
     let mut state = tapped(400, 800, NOW - MIN);
@@ -925,7 +867,6 @@ fn the_accounts_report_shows_no_record_of_another_account() {
             (None, Some(Missing::NoReading))
         ]
     );
-    // The stats view of the same moment.
     let b = profile_of(OTHER, None);
     let l = look(Some(record), &b, Tap::On);
     assert_eq!(
@@ -937,7 +878,6 @@ fn the_accounts_report_shows_no_record_of_another_account() {
             .collect::<Vec<_>>(),
         shown(profile::AccountKey::claude(OTHER))
     );
-    // NEGATIVE CONTROLS: A's own key; no key read.
     for key in [profile::AccountKey::claude(UUID), None] {
         assert_eq!(shown(key), [(Some(1000), None), (Some(800), None)]);
     }
@@ -945,7 +885,7 @@ fn the_accounts_report_shows_no_record_of_another_account() {
 
 /// WHO USES IT AND ITS LOGIN (design §3.3): the sessions on the home now and
 /// S7's word, in the text and JSON; a census that could not be read says
-/// so, never `0`. NEGATIVE CONTROL: with no renewable row no login is said.
+/// so, never `0`.
 #[test]
 fn the_used_row_names_the_sessions_and_the_login() {
     let p = profile(None);
@@ -1018,7 +958,7 @@ fn the_texts_spans_instants_and_dollars() {
 /// from before it) and aterm's own limit reset claimed and used on it, the
 /// wall's slot keeps a cleared record — no wall — so the week says `reset
 /// used`, never 100%, and a reading after it (3% under the same reset) is
-/// the week. NEGATIVE CONTROL: the wall standing is the week's 100%.
+/// the week.
 #[test]
 fn a_reset_used_clears_its_walls_hundred_percent() {
     let mut state = tapped(400, 900, NOW - HOUR);
@@ -1035,7 +975,6 @@ fn a_reset_used_clears_its_walls_hundred_percent() {
         let l = look(state.accounts.get("main"), &p, Tap::On);
         doc(&l)["accounts"][0]["windows"][1].clone()
     };
-    // NEGATIVE CONTROL: the wall standing.
     let walled = week(&state);
     assert_eq!(
         (&walled["used_pct"], &walled["source"]),
@@ -1095,7 +1034,7 @@ fn a_reset_used_clears_its_walls_hundred_percent() {
 /// message's dollars count in the week and in the Opus week, never in the
 /// Sonnet week, whose figure the cached `/usage` body holds; a week of a
 /// model no family names (`seven_day_other`, `Haiku`) has no dollars at
-/// all. NEGATIVE CONTROL: the week sums every model's.
+/// all.
 #[test]
 fn a_per_model_weeks_dollars_are_its_own_models() {
     let prices = PriceTable::from_toml(PRICES_TOML).expect("the table");
@@ -1178,8 +1117,7 @@ fn each_unknown_model_week_is_its_own_window() {
 /// week warned at 97% and walled at 100%, then a limit reset used in a tab
 /// (no outcome of aterm's recorded: S5's warning and the wall stay) and the
 /// same process's next reading at 2% — the view's week is the 2%, never the
-/// warning's 97% or the wall's 100%. NEGATIVE CONTROL: with no refill seen,
-/// the wall's 100% stands.
+/// warning's 97% or the wall's 100%.
 #[test]
 fn a_refill_the_tap_saw_cuts_the_warning_and_the_wall() {
     let read = |pct_x10: u32, refilled: Option<u32>, at: i64| TapRead {
@@ -1228,7 +1166,6 @@ fn a_refill_the_tap_saw_cuts_the_warning_and_the_wall() {
         .cloned()
         .expect("current");
     assert_eq!((week.pct_x10, week.source.as_str()), (20, SOURCE_TAP_WORD));
-    // NEGATIVE CONTROL.
     let state = walled(None);
     let l = look(state.accounts.get("main"), &p, Tap::On);
     let week = win(&view(&l), WEEK_LIMIT)

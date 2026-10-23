@@ -46,6 +46,8 @@ mod macos {
     use crate::{Wake, WindowId, toolbar};
 
     /// `+[NSMenu popUpContextMenu:withEvent:forView:]`, the strip's one pop site
+    /// (toolbar.rs), as the class method it is: `(cls, _cmd, menu, event,
+    /// view)`, void.
     type PopUpContextMenu = unsafe extern "C-unwind" fn(Id, Sel, Id, Id, Id);
 
     /// The site that replaces it for the life of the drive process.
@@ -193,6 +195,8 @@ mod macos {
     }
 
     /// `+[NSEvent mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:]`,
+    /// encoded `@92@0:8Q16{CGPoint=dd}24Q40d48q56@64q72q80f88`: `pressure` is
+    /// `f32` and the two counters are `NSInteger`.
     unsafe fn mouse_event(
         kind: usize,
         loc: CGPoint,
@@ -232,6 +236,7 @@ mod macos {
     }
 
     /// `+[NSEvent keyEventWithType:…]`, encoded
+    /// `@96@0:8Q16{CGPoint=dd}24Q40d48q56@64@72@80B88S92`.
     unsafe fn key_event(kind: usize, win: isize, chars: Id, code: u16) -> Id {
         // SAFETY: as [`mouse_event`], against the signature above.
         unsafe {
@@ -278,6 +283,7 @@ mod macos {
     const CTRL: usize = 1 << 18;
 
     /// How long a stage waits for macOS to make the drive the active app with
+    /// its window key before it clicks anyway.
     const FOCUS_WAIT: Duration = Duration::from_secs(10);
 
     /// An autoreleased `NSString`, for an event's `-characters`.
@@ -305,6 +311,7 @@ mod macos {
     }
 
     /// Round to a sixteenth of a point, so a layout figure is printable without
+    /// a float's last bit deciding whether two transcripts differ.
     fn r4(v: f64) -> f64 {
         (v * 16.0).round() / 16.0
     }
@@ -392,11 +399,13 @@ mod macos {
     }
 
     /// The presence line the model's hover for tab `i` ends in, which the
+    /// extension's bare tooltip lacks.
     fn presence_line(i: usize) -> String {
         format!("last typed into by worker-{i} at 14:02")
     }
 
     /// Whether every chip's hover, as `chrome` reads it, is the strip's tooltip
+    /// with its presence line, not the extension's bare one.
     fn hovers_keep_presence(handle: &toolbar::ToolbarHandle, n: usize) -> (bool, String) {
         let chrome = toolbar::read_tab_chrome(handle).unwrap_or_default();
         ((0..n).all(|i| chrome.contains(&presence_line(i))), chrome)
@@ -470,10 +479,11 @@ mod macos {
         }
     }
 
-    /// The findings ledger. `check` prints every question it asked, passing or
+    /// The findings ledger.
     struct Ctx {
         findings: Vec<String>,
         /// Clicks that failed while another app held activation: they measured
+        /// nothing about the strip (exit 2 when nothing else failed).
         unmeasured: Vec<String>,
     }
     impl Ctx {
@@ -485,6 +495,7 @@ mod macos {
         }
 
         /// A click that reaches the strip only while the drive is the active app
+        /// with its window key.
         fn check_focused(&mut self, focused: bool, ok: bool, msg: String) {
             if ok || focused {
                 self.check(ok, msg);
@@ -496,6 +507,7 @@ mod macos {
     }
 
     /// The strip container, reached the way AppKit reaches it: window ->
+    /// toolbar -> items -> item 0 -> view.
     unsafe fn strip_of(ns_window: Id) -> Id {
         // SAFETY: `ns_window` is a live `NSWindow`.
         unsafe {
@@ -548,6 +560,8 @@ mod macos {
     }
 
     /// Capture `view` through AppKit's `-cacheDisplayInRect:` pair and return
+    /// `(w, h, bytes)`: what `drawRect:` actually put down, so a class that
+    /// registers every encoding correctly yet draws the wrong thing is caught.
     unsafe fn capture(view: Id) -> Option<(usize, usize, Vec<u8>)> {
         // SAFETY: `view` is a live `NSView` on the main thread.
         unsafe {
@@ -578,6 +592,7 @@ mod macos {
     }
 
     /// Per-column ink profile: how many non-transparent samples each x column
+    /// holds.
     fn ink_columns(w: usize, h: usize, px: &[u8]) -> Vec<u32> {
         let spp = px.len().checked_div(w * h).unwrap_or(4).max(1);
         let mut cols = vec![0u32; w];
@@ -624,6 +639,8 @@ mod macos {
     }
 
     /// Every protocol reachable from `seed`, following protocol inheritance
+    /// (`NSTextFieldDelegate` inherits `NSControlTextEditingDelegate`, where two
+    /// of the three rename rows are declared).
     fn expand_protocols(into: &mut Vec<String>, seed: impl IntoIterator<Item = String>) {
         for name in seed {
             let mut stack = vec![name];
@@ -637,7 +654,7 @@ mod macos {
         }
     }
 
-    /// The protocols a protocol itself inherits. `protocol_copyProtocolList` has
+    /// The protocols a protocol itself inherits.
     fn protocol_parents(proto: aterm_objc::ProtocolPtr) -> Vec<String> {
         unsafe extern "C" {
             fn protocol_copyProtocolList(
@@ -668,6 +685,7 @@ mod macos {
     }
 
     /// Where a row's shape is written down outside this tree, and what that
+    /// authority says.
     unsafe fn authority_for(cls: ClassPtr, s: Sel) -> Option<(String, String)> {
         // SAFETY: `cls` is a live class object.
         let mut protos: Vec<String> = Vec::new();
@@ -698,13 +716,16 @@ mod macos {
         /// The instance this class was read from, and how it was found.
         found_by: &'static str,
         /// The name `declare_class!` registered, used only to ask
+        /// `objc_getClass` whether the live object's class is that class.
         name: &'static CStr,
         cls: ClassPtr,
         /// A protocol the class must conform to, if its rows come from one; an
+        /// encoding check cannot see a class that stopped claiming it.
         conforms: Option<&'static CStr>,
     }
 
     /// Read every registered row of `d`'s class and check it against whatever
+    /// the runtime says it should be.
     fn audit_declared(cx: &mut Ctx, d: &Declared) {
         println!("  --  {} found by {}", d.name.to_string_lossy(), d.found_by);
         if d.cls.is_null() {

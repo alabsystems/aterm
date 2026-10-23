@@ -1,37 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TIER-1 for `SupervisorCreditsHold` (aterm-models-harness
-//! `supervisor_credits_hold_model`): the REAL screen reader (`aterm_phase::read`,
-//! over the measured 2.1.300 screen that says `Now using usage credits`, and
-//! the same screen with the notice gone) and the REAL turn-end decider
-//! (`decide_turn_end`, with the real `TurnEndState` it keeps) driven along
-//! EVERY reachable state of the model, under `[harness] usage_credits` off
-//! (the default since the owner's ) and on.
-//!
-//! Each model action is mirrored on the real side: a turn's end is the point
-//! `observe`d with the turn's work, the reading's reset the one the loop keeps
-//! from the notice credits started on (`Session::note_credits`), dropped once
-//! a composer shows no notice past it (or past the bound with no placed
-//! reset), and the episode's start the loop's first read of the notice;
-//! `CreditsStart` keeps a reset `ResetAt` ticks out
-//! less the grace (`reset_grace` = one tick), so the wait ends at the model's
-//! reset; `CreditsStartUnread` keeps none; the hold's bound with none named
-//! (`credits_bound`) is `Bound` ticks; `NoticeGone` removes only the drawn
-//! no-reset notice, keeping its known episode until the bound; `Tick` moves
-//! the clock a minute; `OwnAct` is the decider's continuation, recorded with
-//! `acted`; `Tell` is
-//! its escalation, recorded with `credits_told` as the loop does. At every
-//! point the decider TYPES exactly where `OwnAct` is enabled, TELLS exactly
-//! where `Tell` is, and otherwise waits until exactly the tick the reset —
-//! with none named, the bound — makes `OwnAct` enabled.
-//!
-//! NEGATIVE CONTROLS: a decider run under the key on where the model has it
-//! off, a loop that keeps no reset from the started notice, and a hold with no
-//! bound (the policy before the review of 2026-10-19) disagree — each exactly
-//! at the points the hold decides; the model's `Buggy` branch (`ActsOnCredits`)
-//! breaks `NoOwnActOnCredits`, `StaleNoticeHolds` breaks `NoStaleHold`, and
-//! `UnboundedHold` breaks `NoEndlessHold`.
+//! Tier-1 conformance test for `SupervisorCreditsHold` (`supervisor_credits_hold_model`).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -188,8 +158,6 @@ fn mirror(m: &Model, action: &str, next: &State, r: &mut Real, cfg: &SupervisorC
         "NoticeGone" | "NoticeReturns" => {
             let notice = action == "NoticeReturns";
             if notice {
-                // A new loop-carried notice; the policy keeps any earlier
-                // episode's original start when that episode still stands.
                 if !r.known {
                     r.start = r.now;
                 }
@@ -212,8 +180,6 @@ fn mirror(m: &Model, action: &str, next: &State, r: &mut Real, cfg: &SupervisorC
         }
         "TurnEnds" | "AnotherWindow" => {
             let notice = next["notice"] == 1;
-            // Independently mirror Session::note_credits' carrier expiry;
-            // do not take the model's `known` field as the real answer.
             if !notice
                 && r.kept
                     .map_or(r.now >= r.start + r.st.timing.credits_bound, |reset| {
@@ -223,8 +189,6 @@ fn mirror(m: &Model, action: &str, next: &State, r: &mut Real, cfg: &SupervisorC
                 r.known = false;
                 r.kept = None;
             }
-            // Another window past the one named, or past the bound: a new
-            // episode, from this point.
             if action == "AnotherWindow" && next["clock"] == 0 {
                 r.start = r.now;
             }
@@ -365,9 +329,6 @@ fn tier1_the_real_decider_holds_usage_credits_exactly_where_the_model_says() {
             walked.fired
         );
         assert!(walked.states.len() > 10, "{}", walked.states.len());
-        // These states are reached and checked against the actual policy,
-        // not inferred from a drawn notice: known credits hold before their
-        // bound even with no notice; no episode and expiry permit an act.
         let point = |s: &&State| s["point"] == 1 && s["notice"] == 0;
         assert!(
             walked

@@ -7,10 +7,12 @@
 //!
 //! A window tells its owner, in colour and in words, that something in it
 //! needs them, and offers the one act: the border ([`Rim`],
-//! [`View::rim_glow`]) and the pill ([`Pill`], [`pill_words`],
-//! [`pill_layout`]) draw the window's MOST PRESSING session — any tab, any
-//! pane ([`drive::Desk::pressing_session`]) — and each tab's chip its own
-//! mark ([`ChipLevel`]). All three read the host's PUBLISHED need verdict
+//! [`View::rim_glow`]) draws the window's most pressing session — any tab,
+//! any pane ([`drive::Desk::pressing_session`]). The pill ([`Pill`],
+//! [`pill_words`], [`pill_layout`]) draws the most pressing need with
+//! [`NeedFact::show_pill`], and each tab's chip its own mark ([`ChipLevel`]).
+//! A host can retain a reported need on the border and chip without a pill.
+//! All three read the host's PUBLISHED need verdict
 //! ([`Facts::need`], [`NeedFact`]); nothing here classifies a need again.
 //!
 //! The host gathers the [`Facts`] (the published need, the person's hold,

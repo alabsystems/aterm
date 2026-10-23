@@ -1,56 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The PTY relay of `nudge-trial`: a transparent go-between for the REAL
-//! Claude Code and aterm's PTY.
-//!
-//! ```text
-//! aterm's PTY  <-->  this relay  <-->  an inner PTY  <-->  the program (Claude Code)
-//! ```
-//!
-//! WHAT IT IS FOR. aterm repairs a tab a resize left drawn one row off (the
-//! repaint nudge) by telling that one program its terminal is a row shorter
-//! and then its true size again. To test that against the real program a tab
-//! has to be displaced on demand, and a displacement needs a resize the
-//! program never hears about. Every size change of aterm's PTY reaches the
-//! relay (SIGWINCH), which passes it on to the inner PTY unless it is HELD. A
-//! flap written to the control socket while the relay is held (shrink, some
-//! output, grow) moves aterm's grid and leaves Claude Code with the screen it
-//! painted: the incident, forced.
-//!
-//! * `SIGUSR1` HOLD: size changes of the outer PTY are no longer passed on.
-//! * `SIGUSR2` RELEASE: the outer size AS IT IS NOW is passed on (nothing
-//!   happens when it equals the inner one).
-//!
-//! Nothing else is touched: bytes go both ways as they come, and the relay
-//! signals nothing but its own child (at its exit). The nudge's own resize
-//! pair passes through a released relay like any other resize, which is the
-//! point: it must reach the program for the repair to work.
-//!
-//! THE NAME. The relay is this program copied under the name `node`, and the
-//! name is load-bearing: aterm names a tab's program by its executable (the
-//! foreground process of the tab's PTY, here the relay), and for `node`, `bun`
-//! and `deno`, the runtimes an npm install of Claude Code runs under, it reads
-//! the SCREEN to tell whether an agent is behind them. So the relay is classed
-//! by what Claude Code draws, as a Claude Code started by npm is, with no dev
-//! seam; under any other name it would be an unknown program and the nudge
-//! would not run at all.
-//!
-//! `node [--log FILE] -- command [args…]`: FILE gets one line per event
-//! (`HOLD`, `RELEASE`, `held RxC` for a size change not passed on, `told RxC`
-//! for new rows or columns passed on, `pixels RxC` for new pixels only), so a
-//! trial can say what the program was told. The inner program gets a session
-//! and a controlling terminal of its own (`ctty`, below), so the kernel tells
-//! it of every size the relay passes on.
-//!
-//! THE RECORDER. `aterm-lab ptyrec <log> -- command [args…]` is the same relay
-//! run by hand in a terminal, keeping a TAKE of every chunk: `<t_ns> O <hex>`
-//! for the program's output and `<t_ns> I <hex>` for the input passed to it,
-//! `t_ns` the monotonic clock's nanoseconds, one line per read, appended. The
-//! program's window follows the outer terminal's at the start and at every
-//! SIGWINCH (24x80 when the outer side is no terminal). The real-byte replays
-//! of aterm-effects (`tests/common/mod.rs`, `recording`) read these takes; the
-//! line shape is theirs.
+//! Transparent PTY relay (`node`) for `nudge-trial` and `ptyrec` session recording.
 
 use crate::sys::{self, WinSize};
 use std::io::Write as _;
@@ -76,9 +27,7 @@ fn same(a: &WinSize, b: &WinSize) -> bool {
 }
 
 /// Pass the outer size on to the inner PTY when it differs (the kernel then
-/// signals the program). aterm sets pixels with every resize, so a release can
-/// pass on new pixels with the same rows and columns: that is `pixels`; a new
-/// count of rows or columns is `told`.
+/// signals the program).
 fn pass_size_on(master: i32, inner: &mut WinSize, log: &mut Option<std::fs::File>) {
     let Some(outer) = sys::winsize(0) else { return };
     if same(&outer, inner) {
@@ -97,7 +46,7 @@ fn pass_size_on(master: i32, inner: &mut WinSize, log: &mut Option<std::fs::File
 /// A take of `ptyrec` (module doc): the open log, written a line per chunk.
 struct Take(std::fs::File);
 
-/// Which way a chunk went: `O` the program wrote it, `I` it was passed to the program.
+/// Direction of a recorded PTY chunk (`O` output, `I` input).
 #[derive(Clone, Copy)]
 pub(crate) enum Way {
     Out,
@@ -105,9 +54,7 @@ pub(crate) enum Way {
 }
 
 impl Take {
-    /// One chunk's line, `<t_ns> O|I <hex>`, written whole. A take that can
-    /// no longer be written is reported once and closed; the relay goes on,
-    /// the program never told.
+    /// One chunk's line, `<t_ns> O|I <hex>`, written whole.
     fn chunk(take: &mut Option<Self>, way: Way, bytes: &[u8]) {
         let Some(Take(f)) = take else { return };
         let line = take_line(sys::monotonic_ns(), way, bytes);
@@ -118,7 +65,7 @@ impl Take {
     }
 }
 
-/// A take's line (module doc): the stamp, the way, the bytes in lower-case hex.
+/// Formats one `ptyrec` log line (`<t_ns> <O|I> <hex>`).
 pub(crate) fn take_line(t_ns: u64, way: Way, bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut line = String::with_capacity(bytes.len() * 2 + 24);
@@ -164,8 +111,7 @@ fn drain(master: i32, take: &mut Option<Take>) {
     }
 }
 
-/// `[--log FILE] -- command [args…]` → (the log, the command); `None` when the
-/// grammar is not met (no `--`, or nothing after it).
+/// Parses `[--log FILE] -- command [args…]` into `(log_path, command)`.
 #[must_use]
 pub fn parse_args(args: &[String]) -> Option<(Option<String>, &[String])> {
     let (logpath, rest) = match args {
@@ -180,7 +126,7 @@ pub fn parse_args(args: &[String]) -> Option<(Option<String>, &[String])> {
     }
 }
 
-/// `node [--log FILE] -- command [args…]`.
+/// Entry point for `node [--log FILE] -- command [args…]`.
 #[must_use]
 pub fn main(args: &[String]) -> i32 {
     let Some((logpath, command)) = parse_args(args) else {
@@ -191,8 +137,7 @@ pub fn main(args: &[String]) -> i32 {
     relay(command, log, None)
 }
 
-/// `aterm-lab ptyrec <log> -- command [args…]` (module doc): the relay, by
-/// hand, keeping a take in `<log>` (appended). Exit: the program's.
+/// Entry point for `aterm-lab ptyrec <log> -- command [args…]`.
 #[must_use]
 pub fn ptyrec(args: &[String]) -> i32 {
     let Some((take, command)) = parse_ptyrec(args) else {
@@ -208,7 +153,7 @@ pub fn ptyrec(args: &[String]) -> i32 {
     }
 }
 
-/// `<log> -- command [args…]` → (the take's path, the command).
+/// Parses `<log> -- command [args…]` into `(log_path, command)`.
 #[must_use]
 pub fn parse_ptyrec(args: &[String]) -> Option<(&str, &[String])> {
     match args {
@@ -227,8 +172,7 @@ fn append(path: &str) -> std::io::Result<std::fs::File> {
 }
 
 /// The size a take hands on when its outer side is no terminal: ptyrec's
-/// 24x80. The nudge relay's outer side is a tab, and with none it hands on
-/// 0x0, as it always has ([`relay`]).
+/// 24x80.
 const NO_TERMINAL: WinSize = WinSize {
     ws_row: 24,
     ws_col: 80,
@@ -247,7 +191,6 @@ const NO_SIZE: WinSize = WinSize {
 /// The relay proper: `command` behind an inner PTY, bytes both ways, the
 /// outer size passed on unless held; `log` gets its events, `take` every chunk.
 fn relay(command: &[String], mut log: Option<std::fs::File>, mut take: Option<Take>) -> i32 {
-    // Handlers first: a signal between the spawn and the loop is queued, not fatal (SIGUSR1's default).
     let Ok(signals) = sys::SignalPipe::install(&[
         libc::SIGWINCH,
         libc::SIGUSR1,
@@ -259,7 +202,6 @@ fn relay(command: &[String], mut log: Option<std::fs::File>, mut take: Option<Ta
     ]) else {
         return 1;
     };
-    // Raw on the outer side, so bytes go through untouched (put back when this ends).
     let raw = sys::RawMode::enter(0);
     let mut inner = sys::winsize(0).unwrap_or(if take.is_some() { NO_TERMINAL } else { NO_SIZE });
     let (master, slave) = match aterm_pty::open_pty_pair() {
@@ -275,7 +217,6 @@ fn relay(command: &[String], mut log: Option<std::fs::File>, mut take: Option<Ta
     let spawned = (|| {
         let (a, b, c) = (slave.try_clone()?, slave.try_clone()?, slave.try_clone()?);
         let exe = std::env::current_exe()?;
-        // named for the CLI, not `node`: under that name this program is the relay again
         aterm_uds::spawnfd::command(exe)
             .arg0("aterm-lab")
             .arg("ctty")
@@ -333,7 +274,6 @@ fn relay(command: &[String], mut log: Option<std::fs::File>, mut take: Option<Ta
                             break 'run;
                         }
                     }
-                    // TERM, HUP, INT: leave cleanly
                     _ => break 'run,
                 }
             }
@@ -347,7 +287,6 @@ fn relay(command: &[String], mut log: Option<std::fs::File>, mut take: Option<Ta
         }
     }
     drop(raw);
-    // The program's terminal hangs up (SIGHUP); one that ignores it is killed. Its own child only is signalled.
     sys::close(master);
     let status = status.or_else(|| {
         for _ in 0..40 {
@@ -365,13 +304,7 @@ fn relay(command: &[String], mut log: Option<std::fs::File>, mut take: Option<Ta
     })
 }
 
-/// `aterm-lab ctty [--arg0 NAME] -- command…`: take stdin's terminal as this
-/// session's controlling terminal, then become `command` (its `argv[0]` NAME
-/// when given: the link relay starts a login shell as `-zsh`,
-/// [`crate::link`]). The relay starts its program this way, in a session of
-/// its own, so the kernel tells the program of every size change (SIGWINCH
-/// goes to a terminal's foreground group) without code between a fork and an
-/// exec.
+/// Entry point for `aterm-lab ctty [--arg0 NAME] -- command…`.
 #[must_use]
 pub fn ctty(args: &[String]) -> i32 {
     let (arg0, args) = match args {
@@ -411,7 +344,6 @@ mod tests {
         assert_eq!(cmd, &v(&["env", "A=1", "claude"])[..]);
         let a = v(&["--", "true"]);
         assert_eq!(parse_args(&a).map(|(l, c)| (l, c.len())), Some((None, 1)));
-        // the ctty helper's own argument list is not a relay's
         assert!(parse_args(&v(&["ctty", "--", "true"])).is_none());
         assert!(parse_args(&v(&["--log", "x", "--"])).is_none());
         assert!(parse_args(&v(&["echo", "hi"])).is_none());

@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHAT THE AI LAYER HAS SEEN OF EACH CLI'S LOGIN (docs/DESIGN-ai-connections-2026-10-16.md
-//! §6.4): `<aterm state>/ai/`, 0700.
-//!
-//! * `connections.json` (schema 1): per CLI, the newest run that worked under its default
-//!   login and how (`review|login`), the newest end and its closed reason word, and when its
-//!   usage limit lifts. Never a token, an email, a vendor's text or a prompt.
-//! * `ai.lock`, held across each read-edit-write and never across a run; `wake`, rewritten
-//!   after every write so the window looks again.
-//!
-//! Claude's login is accounts v2's: nothing of it is written here but the outcomes of the
-//! reviews aterm ran under it. A `connections.json` of another schema is not used and never
-//! written over.
+//! WHAT THE AI LAYER HAS SEEN OF EACH CLI'S LOGIN: `<aterm state>/ai/`, 0700.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -105,8 +94,7 @@ pub enum Outcome {
     Worked,
     /// The login has ended.
     Ended(Ended),
-    /// The usage limit is reached, until this time when the text named it. A limit is also
-    /// a run that reached the vendor with a working login.
+    /// The usage limit is reached, until this time when the text named it.
     Limited(Option<i64>),
 }
 
@@ -117,7 +105,7 @@ fn int(n: i64) -> Value {
 /// One CLI's record.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Record {
-    /// Opaque observation identity, changed by every stored note. Legacy records have none.
+    /// Opaque observation identity, changed by every stored note.
     pub generation: Option<String>,
     /// The newest run that worked, unix seconds.
     pub used_at: Option<i64>,
@@ -228,9 +216,7 @@ pub struct Records {
 
 impl Records {
     /// Parses a record file's text.
-    ///
     /// # Errors
-    ///
     /// Why it is not used ([`Unread`]).
     pub fn parse(text: &str) -> Result<Records, Unread> {
         let doc: Value = aterm_json::from_str(text).map_err(|e| Unread::Torn(e.to_string()))?;
@@ -308,18 +294,14 @@ impl Store {
     }
 
     /// Makes the directory, 0700, this user's own; or says why it is not.
-    ///
     /// # Errors
-    ///
     /// It cannot be made, or it is not this user's private directory.
     pub fn ensure(&self) -> io::Result<()> {
         aterm_types::fs_restricted::ensure_private_dir(&self.dir)
     }
 
     /// Takes `ai.lock`, waiting for its holder: every holder is a short read-edit-write.
-    ///
     /// # Errors
-    ///
     /// The directory or the lock file cannot be made or opened.
     pub fn acquire(&self) -> io::Result<Lock> {
         self.ensure()?;
@@ -346,9 +328,7 @@ impl Store {
     }
 
     /// The records; an absent file is empty.
-    ///
     /// # Errors
-    ///
     /// Why the file is not used ([`Unread`]).
     pub fn load(&self) -> Result<Records, Unread> {
         match crate::harness::accounts::read_bounded(&self.dir.join(RECORD_FILE), RECORD_MAX_BYTES)
@@ -359,11 +339,8 @@ impl Store {
         }
     }
 
-    /// Records `outcome` of `id`, seen by `how` at `now`, then rewrites the wake. A torn
-    /// record is replaced; another schema's is left alone.
-    ///
+    /// Records `outcome` of `id`, seen by `how` at `now`, then rewrites the wake.
     /// # Errors
-    ///
     /// The lock, the record or the wake could not be written.
     pub fn note(&self, id: &str, how: How, outcome: Outcome, now: i64) -> io::Result<()> {
         let _held = self.acquire()?;
@@ -376,11 +353,7 @@ impl Store {
     }
 
     /// Records a run's outcome only while its frozen login observation is still current.
-    /// Same-second replacements have different generations. An unreadable store cannot
-    /// prove ownership and is left untouched, including a torn record.
-    ///
     /// # Errors
-    ///
     /// The lock, entropy, record or wake could not be read or written.
     pub fn note_if_current(
         &self,
@@ -413,9 +386,6 @@ impl Store {
         let record = records.by_id.entry(id.to_string()).or_default();
         record.apply(how, outcome, now);
         record.generation = Some(generation);
-        // Ordered: older login outcomes are tolerated (the next review or login
-        // writes them again), and the wake marker means only "changed" to a live
-        // watcher, which no power loss leaves.
         crate::harness::upgrade_models::write_atomic_ordered(
             &self.dir.join(RECORD_FILE),
             &records.render(),

@@ -1,66 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind for `ChromeRegrowFloor`
-//! (`aterm_models_gui::chrome_regrow_floor_model`, ruling 414) —
-//! after any rise of a window's chrome rows, neither the band's quiet fall nor
-//! the tab strip's fall re-grids the window back inside
-//! `CHROME_REGROW_SETTLE`.
-//!
-//! WHAT WAS MEASURED (2026-09-29, main `8b24e99a4`, real windows, a stand-in
-//! that reads its size 20 ms after the `SIGWINCH` and ticks a spinner every
-//! 5 ms): a chrome row rising milliseconds before the band's quiet shrink
-//! shifted the alternate screen (a net-zero shrink-then-grow pair). The
-//! presence row was that other source then; presence owns no chrome row since
-//! the owner surfaces (2026-10-16), and the TAB STRIP is the one other row a
-//! window's grid gives way to. On 2026-10-19 the windowed lane
-//! (`aterm-lab presence-flap --window --phases X`) measured the strip's fall —
-//! a Settings edit, then immediate and unfloored — re-gridding a window back
-//! 38 ms after a band row's rise; the strip's fall waits the floor since.
-//!
-//! THE RIG. Everything shipping is REAL: the band through the center
-//! (`MessageCenter::post`, `dismiss`) and the host's step
-//! (`App::settle_messages`: the band's commit with the floor the host hands,
-//! the re-grid, the rise noted on every window); the strip through
-//! `App::set_tab_strip_rows`, the seam every config load and reload takes, and
-//! its waiting fall through `App::settle_strip_fall`, run by the host's step;
-//! and the loop's wake (`App::settle_messages`, `App::sync_message_band_rows`).
-//! The window is a headless one standing in for glass
-//! (`chrome_regrids_for_test`, which every glass test of the host reads
-//! through `app_presence::chrome_regrids_grid`: the floor, and the band's
-//! afford law), and the rig steps ONE clock, so every instant is the rig's.
-//! The window's own shrink is the stand-in's terminal rows taken to none
-//! ([`Step::Cramp`]), which a real window's `on_resize` books after a drag or
-//! a zoom.
-//!
-//! The schedules: the two measured ones (each with its negative control), an
-//! edit back while the strip's fall waits (`StripBack`), an edit down outside
-//! the floor (taken at once), and the window's own shrink taking the band's
-//! waiting row inside the floor (`BandTaken`).
-//!
-//! Each step is one of the model's: an EVENT (a source's want or rise), a
-//! passage of TIME with no host code run (a tick of the floor, the band's own
-//! quiet), or the loop's WAKE. After each, the host is projected onto the
-//! model's variables ([`project`]) and checked BY NAME: an event or a passage
-//! of time must be the model's action it is; a wake that re-grids must be a
-//! fall the model admits; a wake that declines must decline exactly where
-//! the model enables no fall. The host's armed deadline must name the floor.
-//!
-//! Projection: `bw`/`b` the band's want (`MessageCenter::wanted_rows`) and
-//! reserved rows (`message_band_rows`); `sw`/`s` the rows the Settings ask for
-//! the strip (a waiting fall's, else the strip's) and the strip's rows; `bq`
-//! whether a
-//! pending fall's OWN due has passed (`MessageCenter::quiet_shrink_at`);
-//! `since` the ENGINE's count, off the window's `RegrowFloor`; and — ground
-//! truth, from what the rig SAW — `age` (the chrome total's last rise),
-//! `quick` (an unforced fall inside the settle of it), `cramped` (the rig
-//! took the window's room) and `flips`.
-//!
-//! NEGATIVE CONTROLS: each measured schedule on a window with no floor (a
-//! headless window not standing in for glass: the law before the floor, a fall
-//! once its own cause ran) re-grids back inside the settle, which the
-//! committed model rejects and `Buggy = 1` admits only as the law that shipped
-//! — `BandFallOwnQuiet` for the band, `StripFallAtOnce` for the strip.
+//! Tier-1 bind for `ChromeRegrowFloor` (`aterm_models_gui::chrome_regrow_floor_model`, ruling 414).
 
 use std::time::{Duration, Instant};
 
@@ -94,8 +35,6 @@ pub(crate) fn project(app: &App, wid: WindowId, now: Instant, seen: &Seen) -> St
     let ws = app.windows.get(&wid).expect("the rig's window");
     let bw = app.messages.wanted_rows() > 0;
     let b = app.message_band_rows > 0;
-    // The band's OWN quiet reads as run unless a fall of it is pending and
-    // its own due is still ahead.
     let bq = !(b && !bw) || app.messages.quiet_shrink_at().is_some_and(|x| now >= x);
     let young = |at: Option<Instant>| at.is_some_and(|x| now < x);
     let strip = app.tab_strip_rows > 0;
@@ -139,8 +78,7 @@ enum Step {
     StripBack,
     /// The window's frame loses its room: the stand-in's terminal rows drop
     /// to none, so its grid can afford no band row (the drag or zoom a real
-    /// window's `on_resize` books). The afford law reads the stand-in as
-    /// glass (`app_presence::chrome_regrids_grid`).
+    /// window's `on_resize` books).
     Cramp,
     /// Time passes to the given offset past the rig's origin, running no
     /// host code: the model's action it is, or `None` for a span in which
@@ -334,8 +272,7 @@ fn fires_event(model: &Model, action: &str, fall: &str, before: &State, after: &
 }
 
 /// The fixed build: every step the model's, every wake's decision the model's, every
-/// projected state inside the invariants. Returns how many wakes re-gridded and how many
-/// declined.
+/// projected state inside the invariants.
 fn check_fixed(rig: &Rig) -> (usize, usize) {
     let (mut fell, mut declined) = (0, 0);
     for (i, (step, before, after)) in rig.trace.iter().enumerate() {
@@ -413,8 +350,7 @@ fn check_control(rig: &Rig, mutant: &str) {
 }
 
 /// RISE THEN BANDSHRINK: a band row is up and dismissed; 5 ms before its
-/// quiet shrink the strip grows. The band waits the floor, and its state
-/// deadline names it.
+/// quiet shrink the strip grows.
 fn rise_then_bandshrink(rig: &mut Rig) {
     let ms = Duration::from_millis;
     let dropped = ms(1000);
@@ -448,7 +384,6 @@ fn a_strip_rise_just_before_the_bands_quiet_shrink_holds_it_to_the_floor() {
         let (fell, declined) = check_fixed(&rig);
         assert_eq!((fell, declined), (1, 1), "{:#?}", rig.trace);
 
-        // NEGATIVE CONTROL: no floor — the shrink lands 5 ms after the rise.
         let mut control = Rig::new(false);
         rise_then_bandshrink(&mut control);
         assert_eq!(control.app.message_band_rows, 0);
@@ -458,8 +393,7 @@ fn a_strip_rise_just_before_the_bands_quiet_shrink_holds_it_to_the_floor() {
 
 /// BAND RISE THEN STRIPFALL (the pair measured on 2026-10-19, 38 ms apart):
 /// the strip is up and long settled; a band row rises, and 38 ms later a
-/// Settings edit takes the strip down. The strip's fall waits the floor, and
-/// the host's wake names it.
+/// Settings edit takes the strip down.
 fn band_rise_then_stripfall(rig: &mut Rig) {
     let ms = Duration::from_millis;
     let rise = ms(2000);
@@ -497,7 +431,6 @@ fn a_settings_edit_just_after_a_band_rise_holds_the_strips_fall_to_the_floor() {
         let (fell, declined) = check_fixed(&rig);
         assert_eq!((fell, declined), (1, 1), "{:#?}", rig.trace);
 
-        // NEGATIVE CONTROL: no floor — the edit re-grids 38 ms after the rise.
         let mut control = Rig::new(false);
         band_rise_then_stripfall(&mut control);
         assert_eq!(control.app.tab_strip_rows, 0);
@@ -547,8 +480,7 @@ fn a_settings_edit_down_outside_the_floor_takes_the_strip_at_once() {
 }
 
 /// The window's own shrink, band row: a band row rises and is dismissed, and 100 ms later,
-/// inside both its floor and its own quiet, the window loses its room. The window takes
-/// the row at the next wake, neither quiet nor floor applying: `BandTaken`.
+/// inside both its floor and its own quiet, the window loses its room.
 fn band_taken(rig: &mut Rig) {
     let ms = Duration::from_millis;
     rig.run(&[
@@ -603,7 +535,6 @@ fn only_a_window_whose_grid_moves_for_its_chrome_has_a_floor() {
         assert!(floor.is_some());
         assert_eq!(glass.app.chrome_regrow_floor(glass.wid), floor);
         assert_eq!(glass.app.band_regrow_floor(), floor);
-        // The strip's rise is a rise on that floor too.
         glass.set_clock(glass.now + Duration::from_secs(5));
         glass.step(Step::StripRise);
         assert!(glass.floor() > floor, "the strip's rise moved the anchor");

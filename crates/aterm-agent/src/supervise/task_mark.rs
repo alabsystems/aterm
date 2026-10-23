@@ -20,12 +20,18 @@ use crate::supervise::tape::core::TapeValue;
 use crate::supervise::tape::doors;
 
 /// What the done edge's result came to ([`Session::publish_done`]'s round
+/// trip at [`doors::TASK_RESULT`]): the transcript's settle — its waits, and
+/// whether the done edge's turn was read to its end; `None` with no
+/// transcript — and the snapshot written, or why none was.
 struct ResultTaken {
     settle: Option<(u32, bool)>,
     snap: Result<Snapshot, String>,
 }
 
 /// The words a snapshot says it has no result by
+/// (`crate::harness::result::report`'s, an older build's `no-marker`, and
+/// `no-transcript`): what a tape's `unavailable` is read back as, a word no
+/// build wrote refused.
 const UNAVAILABLE: &[&str] = &[
     "no-check",
     "no-report",
@@ -37,6 +43,7 @@ const UNAVAILABLE: &[&str] = &[
 ];
 
 /// [`ResultTaken`] as a tape holds it: the snapshot written, or why none
+/// was (`error`), exactly one of the two.
 #[derive(Serialize, Deserialize)]
 struct ResultWire {
     settle: Option<(u32, bool)>,
@@ -153,11 +160,13 @@ pub(crate) fn task_read(reply: &CtlReply) -> Option<TaskRead> {
 pub const LANDED_WHY: &str = "landed";
 
 /// Whether the record `t` is a landing this harness published: `done
+/// why=landed` ([`LANDED_WHY`]).
 fn is_landing(t: &TaskRead) -> bool {
     t.state == "done" && t.why.as_deref() == Some(LANDED_WHY)
 }
 
 /// The result file's stem for the task the record at `rev` stands for, in
+/// session `sel` (`@s-…`): `<gsid>-<rev>`, the task file's own pairing.
 fn result_stem(sel: Option<&str>, rev: u64) -> String {
     let sid: String = sel
         .unwrap_or_default()
@@ -201,6 +210,11 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// The landing of this point, published, its result snapshotted under
+    /// `tasks`: `Ok(true)` once the record was read and, where it was
+    /// `working` — or `done` and opened `again` by someone else's turn, or
+    /// `done` by an older build's word (no landing, [`is_landing`]) — marked
+    /// (or refused for good); `Ok(false)` where a request went unserved or a
+    /// committing update held the mark back.
     fn publish_done(
         &mut self,
         seq: u64,
@@ -367,6 +381,7 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// The task opened again by someone else's turn: a `done` record marked
+    /// `working why=turn`.
     fn reopen_task(&mut self, seq: u64, review: &mut dyn Review) -> Result<(), Fail> {
         let r = self.call(&["task"])?;
         if task_read(&r).is_none_or(|t| t.state != "done") {
@@ -427,6 +442,8 @@ mod tests {
     use super::*;
 
     /// A server that answers `task` with `record` (`None`: `OK task -`), the
+    /// tab's `blocks 2 --json` with `blocks` (`None`: refused), and every
+    /// mark `OK task … changed=1`, keeping the requests.
     struct Tab {
         record: Option<&'static str>,
         blocks: Option<&'static str>,
@@ -474,6 +491,7 @@ mod tests {
     }
 
     /// THE AGENT GONE FOR GOOD MARKS ITS TASK `exited`: with the code its
+    /// shell's block ended with, keeping a done task's result.
     #[test]
     fn an_agent_gone_for_good_marks_its_task_exited_with_its_code() {
         let run = |record, blocks| {
@@ -527,6 +545,7 @@ mod tests {
     }
 
     /// The record is read by key off the `task` reply and the mark's own;
+    /// `OK task -`, a refusal and a server before the verb are no record.
     #[test]
     fn a_task_reply_is_read_by_key() {
         let reply = |code: i32, stdout: &str| CtlReply {

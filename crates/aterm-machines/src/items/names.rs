@@ -1,40 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Computer names: `scutil --set ComputerName|LocalHostName|HostName` and the SMB NetBIOSName (design §5.1).
-//!
-//! `scutil` does not set the name SMB advertises, so a Computer Name change also writes
-//! `NetBIOSName` in `/Library/Preferences/SystemConfiguration/com.apple.smb.server`, derived
-//! the way macOS derives a Local hostname (apostrophes dropped, other punctuation and spaces
-//! as hyphens), uppercased and cut to NetBIOS's 15 characters.
-//!
-//! A name may hold `{hardware}`, which the agent fills from its own facts
-//! ([`crate::hardware::describe`]): spaced in the Computer Name (`m10 MacBook Pro M4 Max
-//! 36GB 1TB`), in label form in the Local hostname (`m10-MacBook-Pro-M4-Max-36GB-1TB`),
-//! dropping whole parts from the right (the disk first) when the label would pass 63
-//! characters. A Mac whose hardware could not be read keeps its names: each such item is
-//! unknown, never a name with a part missing.
-//!
-//! The Local hostname is the whole name in label form, so a tag or inventory name with `.` or
-//! `_` (which `--name` allows) gives one `scutil` takes: `lab_03.b` is `lab-03-b` there and
-//! `lab_03.b` in the Computer Name, as written. The controller derives the same name
-//! ([`planned_local_host_name`]) to find a Mac whose rename's report it never got.
-//!
-//! Measured in the macOS 27.0 VM, as root over SSH: `scutil --get HostName` answers
-//! `HostName: not set` on standard error with exit 1 when it is unset, which is the
-//! documented "not set" ([`Read::Absent`]); `scutil --set HostName ''` unsets it again;
-//! `scutil --set LocalHostName 'bad name.x'` fails `SCPreferencesSetLocalHostName() failed:
-//! Invalid argument`, and so do `lab_03` and `lab.03` while `lab-03-b` is taken, which is
-//! why the Local hostname is put in label form, and checked, when the baseline expands.
-//!
-//! macOS writes its own NetBIOSName about five seconds after a name changes and again at
-//! every restart, from the Local hostname: `lab-03` when it fits, a generated
-//! `VIRTUALMAC-F72E` when it does not (VM 27.0, renamed to
-//! `lab-03-Virtual-Machine-M5-8GB-84GB`), over whatever `com.apple.smb.server` held. It
-//! keeps a name a network service's `SMB` settings carry (System Settings ▸ Network ▸
-//! Details ▸ WINS), so the NetBIOS item writes it there for every service as well: in the
-//! VM, a name kept that way held through a rename and a restart, and one written only to
-//! `com.apple.smb.server` was replaced by both.
+//! Computer names (`ComputerName`, `LocalHostName`, `HostName`, and SMB `NetBIOSName`)
+//! ([`crate::hardware::describe`], [`planned_local_host_name`], [`Read::Absent`]).
 
 use super::{Ctx, Item};
 use crate::hardware::{self, Description, PLACEHOLDER};
@@ -49,8 +17,7 @@ pub const SCUTIL: &str = "/usr/sbin/scutil";
 /// The SMB server's preferences (a `defaults` domain given as a path).
 pub const SMB_SERVER: &str = "/Library/Preferences/SystemConfiguration/com.apple.smb.server";
 
-/// SystemConfiguration's preferences, whose network services' `SMB` settings may name the
-/// NetBIOS name macOS keeps.
+/// SystemConfiguration's preferences.
 pub const SC_PREFERENCES: &str = "/Library/Preferences/SystemConfiguration/preferences.plist";
 
 /// NetBIOS names are at most 15 characters.
@@ -63,14 +30,11 @@ pub const LABEL_MAX: usize = 63;
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Table {
-    /// `ComputerName`; `{name}` and `{tag}` fill from the inventory, `{hardware}` from the
-    /// Mac. Also sets the SMB NetBIOSName.
+    /// `ComputerName`; `{name}` and `{tag}` fill from the inventory, `{hardware}` from the Mac.
     pub computer_name: Option<String>,
-    /// `LocalHostName`, the Bonjour `.local` name: letters, digits and hyphens, any other
-    /// character a hyphen as macOS makes a Local hostname of a Computer Name (an inventory
-    /// name `lab_03.b` is `lab-03-b`; `{hardware}` fills in that form).
+    /// `LocalHostName`, the Bonjour `.local` name.
     pub local_host_name: Option<String>,
-    /// `HostName`, a fully qualified name; `""` unsets it, and leaving it out leaves it alone.
+    /// `HostName`, a fully qualified name.
     pub host_name: Option<String>,
 }
 
@@ -129,12 +93,7 @@ pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     Ok(items)
 }
 
-/// The Local hostname `template` asks for on a Mac described by `hardware`: the name in the
-/// form macOS derives a Local hostname from a Computer Name in ([`hardware::label_form`]: an
-/// inventory name `lab_03.b` gives `lab-03-b`, which `scutil` takes where it refuses the
-/// name as written), `{hardware}` filled by as many of the Mac's parts as fit a DNS label
-/// ([`fit_label`]), the description said once ([`said_once`]). Unknown when it holds
-/// `{hardware}` and the hardware could not be read.
+/// The Local hostname `template` asks for on a Mac described by `hardware`.
 ///
 /// # Errors
 /// One line when a placeholder is left or nothing of the name is left for a label.
@@ -161,11 +120,7 @@ fn local_wanted(template: &str, hardware: &Result<Description, String>) -> Resul
     Ok(Wanted::Value(name))
 }
 
-/// The Local hostname `template` (a baseline's `[names] local_host_name`, the controller's
-/// placeholders filled) gives the Mac `hardware` describes, exactly as the agent's run sets
-/// it: the controller finds a Mac its baseline renamed at that `.local` name when the run's
-/// report never came back. `None` when `template` holds `{hardware}` and no description is
-/// known, or gives no name.
+/// The Local hostname `template` resolves to with `{hardware}` expanded.
 #[must_use]
 pub fn planned_local_host_name(template: &str, hardware: Option<&Description>) -> Option<String> {
     let hardware = hardware.cloned().ok_or_else(String::new);
@@ -192,16 +147,7 @@ fn with_hardware(
 }
 
 /// `template` without the description of this Mac it already gives just before
-/// `{hardware}`, so the hardware is said once. A name with no letters-then-digits tag is
-/// its own `{tag}`, so once a Mac is named `lab-03-Virtual-Machine-M5-8GB-90GB`, `here`
-/// (which names the Mac by its Local hostname) and a re-enrolled Mac (named by it) fill
-/// `{tag}-{hardware}` with that whole name: without this each apply would add the
-/// hardware again. Only words that are, in label form and case aside, this Mac's own
-/// description (or the first parts of it, as a name cut to 63 characters keeps them) are
-/// taken off, from the right, as often as they repeat, and never the whole name before
-/// `{hardware}`: `Andrews-MacBook-Pro-{hardware}` on a MacBook Pro is
-/// `Andrews-MacBook-Pro-M4-Max-36GB-1TB`, and `lab-Mac-mini-1` keeps its words, so two
-/// names that differ still differ once filled.
+/// `{hardware}`, so the hardware is said once.
 fn said_once(template: &str, hardware: &Result<Description, String>) -> String {
     let (Ok(d), Some((before, after))) = (hardware, template.split_once(PLACEHOLDER)) else {
         return template.to_owned();
@@ -249,9 +195,6 @@ fn check_computer_name(name: &str) -> Result<(), String> {
             "[names] computer_name {name:?} must be a non-empty line of text"
         ));
     }
-    // scutil's getopt permutes its arguments (in the VM, `scutil --get ComputerName -d`
-    // runs with -d), so a value starting `-` is read as options: `-f<path>` would point
-    // root's preferences write at <path>.
     if name.starts_with('-') {
         return Err(format!(
             "[names] computer_name {name:?} must not start with a hyphen (scutil reads it as an option)"
@@ -264,7 +207,7 @@ fn check_computer_name(name: &str) -> Result<(), String> {
 /// label's 63 characters, whole parts dropped from the right (the disk, then the memory,
 /// then the chip), never what the template says around it, all of it in label form
 /// ([`hardware::label_form`]: runs of hyphens one, none at either end, so `{tag}-{hardware}`
-/// with no part left is the tag). A template with no `{hardware}` is its label form.
+/// with no part left is the tag).
 fn fit_label(template: &str, labels: &[String]) -> String {
     let mut n = labels.len();
     loop {
@@ -276,10 +219,7 @@ fn fit_label(template: &str, labels: &[String]) -> String {
     }
 }
 
-/// The short handle an inventory name starts with: its leading letters-then-digits word
-/// (`m10` of `m10-MacBook-M4-Max-36GB-1TB`, `lab07`), or the whole name when it starts with
-/// no such word (`lab-07`). The controller fills `{tag}` with it, and `enroll` names a Mac
-/// by its Local hostname's.
+/// The short handle an inventory name starts with.
 #[must_use]
 pub fn tag(name: &str) -> &str {
     let end = name
@@ -299,8 +239,7 @@ pub fn tag(name: &str) -> &str {
     }
 }
 
-/// The NetBIOS name for `computer_name`: the Local hostname macOS would derive from it
-/// ([`hardware::label_form`]), uppercased, at most 15 characters. `None` when nothing is left.
+/// The NetBIOS name for `computer_name`.
 #[must_use]
 pub fn netbios_name(computer_name: &str) -> Option<String> {
     let mut out = hardware::label_form(computer_name).to_ascii_uppercase();
@@ -309,8 +248,7 @@ pub fn netbios_name(computer_name: &str) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-/// What `scutil --get <pref>` read: the value with its line ending removed, `Absent` for
-/// the documented `<pref>: not set` (exit 1), `Unusable` otherwise.
+/// What `scutil --get <pref>` read.
 #[must_use]
 pub fn read_scutil(ran: &Ran) -> Read<String> {
     if ran.success() {
@@ -437,8 +375,7 @@ enum Wanted {
     Value(String),
     /// Not set.
     Unset,
-    /// Not known: the template holds `{hardware}` and the Mac's hardware could not be read
-    /// (why). The item probes unusable and changes nothing.
+    /// Not known: the template holds `{hardware}` and the Mac's hardware could not be read (why).
     Unknown(String),
 }
 
@@ -511,8 +448,7 @@ impl Item for Scutil {
 /// Each network service's id and the NetBIOS name its `SMB` settings keep (`None`: none).
 type Pins = Vec<(String, Option<String>)>;
 
-/// `plutil -extract NetworkServices xml1 -o - <SC_PREFERENCES>`: the network services and
-/// their settings (12 ms on the MacBook Air).
+/// `plutil -extract NetworkServices xml1 -o - <SC_PREFERENCES>`.
 #[must_use]
 pub fn services_cmd() -> Cmd {
     Cmd::new("/usr/bin/plutil").args([
@@ -528,8 +464,7 @@ pub fn services_cmd() -> Cmd {
 /// The NetBIOS name each network service keeps, from [`services_cmd`]'s XML.
 ///
 /// # Errors
-/// One line when it is not a dictionary of services keyed by UUID (the ids go into a
-/// `scutil --prefs` script).
+/// One line when it is not a dictionary of services keyed by UUID.
 pub fn parse_services(xml: &[u8]) -> Result<Pins, String> {
     let PValue::Dict(services) = crate::plist::parse(xml)? else {
         return Err("NetworkServices is not a dictionary".to_owned());
@@ -558,10 +493,7 @@ pub fn parse_services(xml: &[u8]) -> Result<Pins, String> {
         .collect()
 }
 
-/// The `scutil --prefs` commands that set (`Some`) or remove (`None`) `NetBIOSName` in
-/// each network service's `SMB` settings, keeping the rest of them: an `SMB` entity a
-/// service lacks reads as `No such key` and leaves the empty dictionary `d.init` made
-/// (VM 27.0). `None` when a name could not be written into the script as one word.
+/// The `scutil --prefs` commands that set (`Some`) or remove (`None`) `NetBIOSName`.
 #[must_use]
 pub fn pin_script<'a>(
     pins: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
@@ -590,14 +522,6 @@ pub fn pin_script<'a>(
 
 /// The SMB server's `NetBIOSName`, kept across restarts and renames by naming it in each
 /// network service's `SMB` settings, as System Settings ▸ Network ▸ Details ▸ WINS does.
-///
-/// Without that macOS puts back its own name (VM 27.0, measured): about five seconds after
-/// a Computer Name or Local hostname change, and at every restart, `smb-sync-preferences`
-/// writes the Local hostname when it fits in 15 characters and a generated
-/// `VIRTUALMAC-F72E` when it does not, over whatever `com.apple.smb.server` held. Named in
-/// a service's `SMB` settings, the name held through a rename and a restart. The item
-/// writes both: the services, so macOS keeps it, and `com.apple.smb.server`, so SMB
-/// answers by it now rather than five seconds later.
 struct NetBios {
     /// The name, or why it is not known (the Computer Name it follows is not).
     wanted: Result<String, String>,
@@ -666,9 +590,6 @@ impl Item for NetBios {
             Ok(ran) => read_defaults_string(&ran),
             Err(e) => Read::Unusable(format!("{}: {e}", cmd.display())),
         };
-        // NetBIOS names are case-insensitive, and macOS writes its own: VM (27.0), a
-        // Computer Name change set by this family as `LAB-02` read `lab-02` a few minutes
-        // later. The same name in another case is the name wanted.
         let now = match now {
             Read::Value(v) if v.eq_ignore_ascii_case(wanted) => Read::Value(wanted.clone()),
             Read::Unusable(why) => return Probe::Unusable { why },
@@ -849,9 +770,6 @@ mod tests {
 
     #[test]
     fn a_local_hostname_is_the_label_macos_would_make_of_it_and_never_one_scutil_refuses() {
-        // In the VM (27.0) `scutil --set LocalHostName` refused `bad name.x`, `lab_03` and
-        // `lab.03` (`SCPreferencesSetLocalHostName() failed: Invalid argument`) and took
-        // `lab-03-b`. A name `--name` allows is set in the form macOS makes of it.
         for (asked, set) in [
             ("bad name.x", "bad-name-x"),
             ("lab_03", "lab-03"),
@@ -863,7 +781,6 @@ mod tests {
         ] {
             assert_eq!(local_of(asked, air()).as_deref(), Ok(set), "{asked:?}");
         }
-        // Nothing left for a label, or more than one label holds: refused.
         let long = "a".repeat(64);
         for bad in ["", "._.", long.as_str()] {
             assert!(
@@ -871,7 +788,6 @@ mod tests {
                 "{bad:?}"
             );
         }
-        // The Computer Name keeps the name as written; its NetBIOS name is in label form.
         let items = expand(&described("lab_03.b"), &on(air())).unwrap();
         let sys = Fake::root();
         sys.on("/usr/sbin/scutil --get ComputerName", Ran::ok("x\n"))
@@ -893,7 +809,6 @@ mod tests {
                 "\"lab-03-b-MacBook-Air-M5-32GB-4TB\""
             ]
         );
-        // The controller's planned name for the same template is the one the run sets.
         let air = crate::hardware::describe(&air()).unwrap();
         assert_eq!(
             planned_local_host_name("lab_03.b-{hardware}", Some(&air)).as_deref(),
@@ -914,7 +829,6 @@ mod tests {
     fn a_host_name_or_computer_name_scutil_would_misread_is_refused_when_the_baseline_expands() {
         assert!(expand(&table(None, None, Some("lab_07.example")), &ctx()).is_err());
         assert!(expand(&table(Some(" "), None, None), &ctx()).is_err());
-        // scutil would read these as its own options, as root.
         for bad in ["-f/etc/sudoers", "-d", "-"] {
             assert!(
                 expand(&table(Some(bad), None, None), &ctx()).is_err(),
@@ -927,7 +841,6 @@ mod tests {
     #[test]
     fn netbios_names_follow_the_local_hostname_rule_uppercased_to_fifteen_characters() {
         assert_eq!(netbios_name("lab-07").as_deref(), Some("LAB-07"));
-        // The VM's own Computer Name, whose Local hostname macOS made `Manageds-Virtual-Machine`.
         assert_eq!(
             netbios_name("Managed\u{2019}s Virtual Machine").as_deref(),
             Some("MANAGEDS-VIRTUA")
@@ -977,7 +890,6 @@ mod tests {
             "/usr/bin/defaults write /Library/Preferences/SystemConfiguration/com.apple.smb.server NetBIOSName -string LAB-07",
             Ran::ok(""),
         )
-        // The services as probed, as apply reads them, and as read back.
         .on(&services_read(), Ran::ok(SERVICES))
         .on(&services_read(), Ran::ok(SERVICES))
         .on(&services_read(), Ran::ok(&services_keeping("LAB-07")))
@@ -999,8 +911,6 @@ mod tests {
             rows[0].revert.as_deref(),
             Some("/usr/sbin/scutil --set ComputerName 'Managed\u{2019}s Virtual Machine'")
         );
-        // The NetBIOS name is written where macOS keeps it, and its revert takes it off
-        // each service again.
         assert!(sys.calls().contains(&"/usr/sbin/scutil --prefs".to_owned()));
         let netbios = rows[1].revert.as_deref().unwrap();
         assert!(
@@ -1017,7 +927,6 @@ mod tests {
                 "{netbios}"
             );
         }
-        // An unset HostName reverts by unsetting it, as `scutil --set HostName ''` does.
         assert_eq!(
             rows[2].revert.as_deref(),
             Some("/usr/sbin/scutil --set HostName ''")
@@ -1027,9 +936,6 @@ mod tests {
 
     #[test]
     fn the_starter_baseline_takes_a_hand_set_host_name_off_with_the_rename() {
-        // The rehearsal's lab Mac (VM 27.0): its old name set by hand in all three places,
-        // `sudo scutil --set HostName m201-Air-M2-24GB-1TB-2` among them. A rename that left
-        // HostName alone left `hostname`, shell prompts and ssh at the old name.
         let text = crate::baseline::fill(
             crate::controller::templates::DEFAULT_BASELINE,
             &[("name", "m201"), ("tag", "m201")],
@@ -1104,7 +1010,6 @@ mod tests {
 
     #[test]
     fn a_missing_netbios_name_is_absent_and_reverts_by_deleting_it() {
-        // `defaults read …/com.apple.smb.server NoSuchKey` in the VM (27.0's wording).
         let missing = Ran::exit(
             1,
             "Error: Could not find key 'NetBIOSName' in domain 'SystemConfiguration/com.apple.smb.server'.",
@@ -1124,7 +1029,6 @@ mod tests {
                 to: "\"LAB-07\"".into()
             }
         );
-        // Every service already keeps it: only the live name is put back.
         assert_eq!(
             item.revert().as_deref(),
             Some(
@@ -1135,9 +1039,6 @@ mod tests {
 
     #[test]
     fn a_netbios_name_no_network_service_keeps_is_a_change_macos_would_undo_at_restart() {
-        // VM 27.0: written to com.apple.smb.server alone, `LAB-03-THIRD-LO` read
-        // `VIRTUALMAC-F72E` after a restart, and so did a name written five seconds before
-        // a rename; kept in the Ethernet service's SMB settings, it held through both.
         let sys = Fake::root();
         sys.on(NETBIOS_READ, Ran::ok("LAB-03\n"))
             .on(&services_read(), Ran::ok(SERVICES));
@@ -1149,7 +1050,6 @@ mod tests {
                 to: "\"LAB-03\"".into()
             }
         );
-        // One service of three keeping it is not enough: another may be the primary.
         let sys = Fake::root();
         sys.on(NETBIOS_READ, Ran::ok("LAB-03-SVCPIN\n"))
             .on(&services_read(), Ran::ok(SERVICES_PINNED));
@@ -1159,7 +1059,6 @@ mod tests {
         );
         let item = NetBios::new(Ok("LAB-03-SVCPIN".into()));
         assert!(matches!(item.probe(&sys, &ctx()), Probe::Change { .. }));
-        // Unreadable services, or an unreadable name, leave it unknown, never a guess.
         let sys = Fake::root();
         sys.on(NETBIOS_READ, Ran::ok("LAB-03\n"));
         assert!(matches!(
@@ -1184,7 +1083,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             SERVICE_IDS.map(|id| (id, None))
         );
-        // The commands that pinned LAB-03-SVCPIN in the VM, for every service.
         let script = pin_script(SERVICE_IDS.map(|id| (id, Some("M14-MACBOOK-AIR")))).unwrap();
         let mut want = String::from("open\nlock\n");
         for id in SERVICE_IDS {
@@ -1194,7 +1092,6 @@ mod tests {
         }
         want.push_str("commit\napply\nunlock\nclose\nquit\n");
         assert_eq!(script, want);
-        // Nothing that is not one plain word goes into the script.
         assert_eq!(pin_script([(ETHERNET, Some("A B"))]), None);
         assert_eq!(pin_script([("x\nquit", Some("A"))]), None);
         assert!(
@@ -1245,7 +1142,6 @@ mod tests {
 
     #[test]
     fn the_air_is_named_for_what_it_is_and_the_plan_shows_each_rename() {
-        // The MacBook Air's names, read with scutil and defaults (macOS's own NetBIOS name).
         let sys = Fake::root();
         sys.on(
             "/usr/sbin/scutil --get ComputerName",
@@ -1295,7 +1191,6 @@ mod tests {
 
     #[test]
     fn bonjours_conflict_suffix_and_stale_specs_are_renamed_to_what_the_mac_reads() {
-        // m1-Air-M2-24GB-1TB-2: macOS's "-2", added on a Bonjour conflict, is not the owner's.
         let m1 = HostFacts {
             model_name: "MacBook Air".into(),
             chip: "Apple M2".into(),
@@ -1323,7 +1218,6 @@ mod tests {
             rows[0].revert.as_deref(),
             Some("/usr/sbin/scutil --set LocalHostName m1-Air-M2-24GB-1TB-2")
         );
-        // An Intel Mac: its speed's point becomes a hyphen in the label, as macOS makes it.
         let m4 = HostFacts {
             model_name: "MacBook Pro".into(),
             chip: "Intel Core i7".into(),
@@ -1358,7 +1252,6 @@ mod tests {
 
     #[test]
     fn a_mac_whose_hardware_could_not_be_read_keeps_its_names_and_is_unknown() {
-        // No facts at all: nothing is read, nothing is set, and each row says why.
         let sys = Fake::root();
         let mut facts = air();
         facts.memory_bytes = 0;
@@ -1370,7 +1263,6 @@ mod tests {
             assert!(r.why.as_deref().unwrap().contains("hw.memsize"), "{r:#?}");
         }
         assert!(sys.calls().is_empty(), "{:?}", sys.calls());
-        // A placeholder that is still a typo is refused even then.
         let err = expand(&table(None, Some("{tga}-{hardware}"), None), &ctx())
             .err()
             .unwrap();
@@ -1379,7 +1271,6 @@ mod tests {
 
     #[test]
     fn a_local_hostname_too_long_for_a_label_drops_hardware_from_the_right_never_the_tag() {
-        // Labels: MacBook-Pro, M4-Max, 36GB, 1TB (11 + 6 + 4 + 3, a hyphen between).
         let m10 = HostFacts {
             model_name: "MacBook Pro".into(),
             chip: "Apple M4 Max".into(),
@@ -1402,7 +1293,6 @@ mod tests {
         assert_eq!(local("m10").unwrap(), "m10-MacBook-Pro-M4-Max-36GB-1TB");
         let tag40 = "classroom-b-bench-twelve-left-by-the-door";
         assert_eq!(tag40.len(), 41);
-        // 41 + 27 = 68: the disk goes, then the memory (63 at most).
         assert_eq!(local(tag40).unwrap(), format!("{tag40}-MacBook-Pro-M4-Max"));
         let tag60 = "a".repeat(60);
         assert_eq!(local(&tag60).unwrap(), tag60);
@@ -1451,7 +1341,6 @@ mod tests {
 
     #[test]
     fn a_name_that_already_describes_the_mac_is_not_described_again() {
-        // The VM's facts (27.0: VirtualMac2,1, "Apple M5 (Virtual)", 8 GiB, a 90.0 GB disk).
         let vm = HostFacts {
             model_name: "Virtual Machine".into(),
             chip: "Apple M5 (Virtual)".into(),
@@ -1470,11 +1359,8 @@ mod tests {
             "lab-03 Virtual Machine M5 8GB 90GB".to_owned(),
             "lab-03-Virtual-Machine-M5-8GB-90GB".to_owned(),
         );
-        // lab-03 has no letters-then-digits tag, so once renamed, `here` (and a re-enrolled
-        // Mac) fill {tag} with the whole new name: the second apply changes nothing.
         assert_eq!(names_for("lab-03", &vm), named);
         assert_eq!(names_for(&named.1, &vm), named);
-        // A name that said it twice already, or in another case, is said once.
         assert_eq!(
             names_for(&format!("{}-Virtual-Machine-M5", named.1), &vm),
             named
@@ -1483,10 +1369,8 @@ mod tests {
             names_for("LAB-03-virtual-machine-m5-8gb-90gb", &vm).1,
             "LAB-03-Virtual-Machine-M5-8GB-90GB"
         );
-        // A name cut to 63 characters keeps what it kept.
         let cut = "classroom-b-bench-twelve-left-by-the-door-MacBook-Pro-M4-Max";
         assert_eq!(names_for(cut, &m10).1, cut);
-        // macOS's own Local hostname names the model once.
         assert_eq!(
             names_for("Andrews-MacBook-Pro", &m10),
             (
@@ -1494,8 +1378,6 @@ mod tests {
                 "Andrews-MacBook-Pro-M4-Max-36GB-1TB".to_owned()
             )
         );
-        // Words that are not this Mac's description stay, so names that differ still differ;
-        // a name that is nothing but the description keeps it as its tag.
         assert_eq!(
             names_for("lab-MacBook-Pro-1", &m10).1,
             "lab-MacBook-Pro-1-MacBook-Pro-M4-Max-36GB-1TB"
@@ -1505,8 +1387,6 @@ mod tests {
             "MacBook-Pro-MacBook-Pro-M4-Max-36GB-1TB"
         );
         assert_eq!(names_for("m10", &m10).1, "m10-MacBook-Pro-M4-Max-36GB-1TB");
-        // A Computer Name in another script keeps its words; one that is punctuation and
-        // the description alone keeps all of it.
         let computer = |template: &str| {
             let t = table(Some(template), None, None);
             let item = &expand(&t, &on(m10.clone())).unwrap()[0];

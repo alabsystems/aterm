@@ -63,6 +63,7 @@ pub(crate) fn project_selection_custody(term: &Terminal, base: u64) -> [i64; 5] 
 }
 
 /// One fixture's running abstract state: the observed projection plus the
+/// harness-carried variables (see the module doc).
 struct Custody {
     /// Absolute row corresponding to model row 0.
     base: u64,
@@ -87,7 +88,7 @@ impl Custody {
         }
     }
 
-    /// The full 11-variable state. Refreshes the carried interval whenever the real
+    /// The full 11-variable state.
     fn state(&mut self, term: &Terminal) -> [i64; 11] {
         let [alive, lo, hi, floor, truncated] = project_selection_custody(term, self.base);
         if alive == 1 {
@@ -110,6 +111,8 @@ impl Custody {
     }
 
     /// Record what the step just fired: the model writes the pre-state into the
+    /// `prev_*` shadows, stamps `last_event`, and (for the damage actions only)
+    /// assigns the band.
     fn fired(&mut self, prev: [i64; 11], tag: i64, band: Option<(i64, i64)>) {
         self.shadow = (prev[0], prev[1], prev[2]);
         self.last_event = tag;
@@ -158,7 +161,7 @@ fn engine_fixture(rows: u16, history: usize) -> (Terminal, u64) {
     (term, base)
 }
 
-/// Arm a completed selection over model rows `lo..=hi` of an engine fixture. Fixture
+/// Arm a completed selection over model rows `lo..=hi` of an engine fixture.
 fn arm(term: &mut Terminal, base: u64, lo: i64, hi: i64) {
     let grid = term.grid();
     let live_top = i64::try_from(
@@ -176,6 +179,7 @@ fn arm(term: &mut Terminal, base: u64, lo: i64, hi: i64) {
 }
 
 /// Model rows of the damage band the harness is about to aim at visible rows
+/// `first..=last`, read back out of the real grid's own coordinate function.
 fn band_of(term: &Terminal, base: u64, first: u16, last: u16) -> (i64, i64) {
     let grid = term.grid();
     let base = i64::try_from(base).expect("base fits i64");
@@ -186,6 +190,7 @@ fn band_of(term: &Terminal, base: u64, first: u16, last: u16) -> (i64, i64) {
 }
 
 /// Drive one damage case: arm `sel_lo..=sel_hi`, damage visible rows `first..=last`
+/// with real EL batches, and validate the step against `action`.
 fn damage_case(
     action: &'static str,
     sel: (i64, i64),
@@ -228,6 +233,7 @@ fn damage_case(
 }
 
 /// The GUI half: one real `App`, one real terminal, six validated transitions driven
+/// through the genuine gesture and press seams.
 fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -360,6 +366,8 @@ fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
 }
 
 /// The both-endpoints-gone arm of `Evict`, asserted directly rather than ty-validated:
+/// `Evict` re-floors `sel_lo` even when it destroys the selection, so the model's
+/// post-state names a row the dead selection cannot be asked about.
 fn evict_destroys_a_selection_whose_whole_interval_fell_off(ev: &mut StepEvidence) {
     let (mut term, base) = engine_fixture(4, 2);
     arm(&mut term, base, 0, 0);

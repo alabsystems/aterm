@@ -2,24 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Word boundaries shared by double-click selection, find-field word motions,
-//! and native editor word motions.
-//!
-//! The caller supplies the base word-character predicate ([`is_word_char`] by
-//! default, or non-separator under a configured separator set). Zero-width
-//! characters are placed as follows:
-//!
-//! - Marks (`Grapheme_Cluster_Break` Extend/SpacingMark or other non-control
-//!   zero-width chars) attach to the preceding character's word, and to no word
-//!   after a separator.
-//! - Prepended marks (`Grapheme_Cluster_Break=Prepend`) attach to the following
-//!   word character.
-//! - Format controls that spell a word belong to it only in context: ZWNJ/ZWJ
-//!   next to a virama, between two cursive-joining letters, or (for ZWJ) between
-//!   `Extended_Pictographic` characters; and script-specific format controls
-//!   ([`SCRIPT_CONTROLS`]) between two letters of their script.
-//! - Every other zero-width control ends a word under any classifier; visible
-//!   controls (`char_width > 0`) are classified as base characters.
+//! Word boundary classification ([`is_word_char`], [`SCRIPT_CONTROLS`]).
 
 use std::ops::Range;
 
@@ -32,8 +15,7 @@ const ZWNJ: char = '\u{200C}';
 /// Zero width joiner.
 const ZWJ: char = '\u{200D}';
 
-/// The default word character: a letter or digit of any script, or `_` (the
-/// readline and xterm convention).
+/// The default word character: a letter or digit of any script, or `_`.
 #[must_use]
 #[inline]
 pub fn is_word_char(c: char) -> bool {
@@ -41,21 +23,6 @@ pub fn is_word_char(c: char) -> bool {
 }
 
 /// The words of `text`, in order, as byte ranges.
-///
-/// `is_word` says which characters are word characters on their own; a word
-/// is a maximal run of those plus the characters that belong to them: the
-/// marks after a word character, the prepended marks before one, and a format
-/// control where it spells the word (a ZWNJ or ZWJ next to a virama, between
-/// two letters of a cursive-joining script or inside an emoji ZWJ sequence; a
-/// script's own format controls between two of its letters). Every other
-/// zero-width control, and a joiner anywhere else, is in no word, whatever
-/// `is_word` says of it.
-///
-/// One pass, linear in `text`'s length: a run of prepended marks or of a
-/// script's format controls is read once, and a joiner looks ahead only over
-/// the marks right after it, so no character is classified more than a few
-/// times. A range starts and ends on character boundaries, and its first
-/// character is never a mark or a format control.
 #[inline]
 pub const fn words<F: Fn(char) -> bool>(text: &str, is_word: F) -> Words<'_, F> {
     Words {
@@ -68,16 +35,7 @@ pub const fn words<F: Fn(char) -> bool>(text: &str, is_word: F) -> Words<'_, F> 
     }
 }
 
-/// The byte offset of the last character before `position` that ends every
-/// word around it (a zero-width control, or a character `is_word` rejects
-/// that is no mark, prepended mark or format control that can spell a word),
-/// or 0 if there is none. `position` is floored onto a character boundary.
-///
-/// No word spans that character and the walk carries nothing past it, so the
-/// words of `&text[at..]`, shifted by `at`, are exactly the words of `text`
-/// that start at or after `at`, every word that ends after `position` among
-/// them: a caret's next words are read from there, not from the start of the
-/// line. Reads back only as far as that character.
+/// Byte offset of the last word-ending character before `position`, or 0 if none.
 #[must_use]
 pub fn word_break_before<F: Fn(char) -> bool>(text: &str, position: usize, is_word: F) -> usize {
     text.get(..floor_char_boundary(text, position))
@@ -92,11 +50,7 @@ pub fn word_break_before<F: Fn(char) -> bool>(text: &str, position: usize, is_wo
         .map_or(0, |(at, _)| at)
 }
 
-/// The start of the last word of `text` that starts before `position`, or
-/// `None` if no word does: where a caret's word-left motion lands.
-///
-/// Reads back only to the word break before that word, and forward only to
-/// `position`, so a caret's motion costs the distance it moves.
+/// The start of the last word of `text` that starts before `position`, or `None` if no word does.
 #[must_use]
 pub fn word_start_before<F: Fn(char) -> bool>(
     text: &str,
@@ -149,8 +103,7 @@ pub struct Words<'t, F> {
     prev: Option<char>,
     /// Whether the character before `at` is in a word.
     prev_in: bool,
-    /// The last letter before `at`, marks and the controls that spell its word
-    /// passed over, while it is in a word.
+    /// The last letter before `at`.
     letter: Option<char>,
 }
 
@@ -161,9 +114,7 @@ impl<F: Fn(char) -> bool> Words<'_, F> {
         role(c) == Role::Base && (self.is_word)(c)
     }
 
-    /// Classify the next unit at `self.at` (one character, or a run of
-    /// prepended marks or of one script's format controls, which share one
-    /// fate): whether it is in a word. `None` at the end of the text.
+    /// Classify the next unit at `self.at`: whether it is in a word.
     fn step(&mut self) -> Option<bool> {
         let mut rest = self.text.get(self.at..)?.chars();
         let c = rest.next()?;
@@ -217,8 +168,7 @@ impl<F: Fn(char) -> bool> Words<'_, F> {
         Some(in_word)
     }
 
-    /// Whether `joiner` (ZWNJ or ZWJ), after a character in a word and before
-    /// `after`, spells that word rather than standing between two words.
+    /// Whether `joiner` (ZWNJ or ZWJ) joins into the surrounding word.
     fn spells_word(&self, joiner: char, mut after: std::str::Chars<'_>) -> bool {
         let Some(next) = after.clone().next() else {
             return false;
@@ -232,7 +182,6 @@ impl<F: Fn(char) -> bool> Words<'_, F> {
         if self.prev.is_some_and(is_virama) || is_virama(next) {
             return true;
         }
-        // The letter after the joiner, the marks after it passed over.
         let letter = if next_role == Role::Base {
             Some(next)
         } else {
@@ -276,8 +225,7 @@ enum Role {
     Mark,
     /// Belongs to the character after it (UAX #29 GB9b).
     Prepend,
-    /// A format control that can spell a word (ZWNJ, ZWJ, a script's own
-    /// controls): in a word only where it spells one.
+    /// A format control that can spell a word: in a word only where it spells one.
     Joiner,
     /// A zero-width control that ends any word.
     Break,
@@ -299,8 +247,7 @@ fn role(c: char) -> Role {
     }
 }
 
-/// A script that spells words with format controls of its own: the controls,
-/// and the code points its letters are drawn from (inclusive ranges).
+/// A script that spells words with format controls of its own.
 struct ScriptControls {
     controls: (u32, u32),
     letters: (u32, u32),
@@ -320,26 +267,16 @@ impl ScriptControls {
     }
 }
 
-/// The scripts whose own format controls belong to a word between two of
-/// their letters, with the blocks those letters are in (Unicode 16.0.0
-/// `Blocks.txt`; block ranges never move).
+/// The scripts whose own format controls belong to a word between two of their letters.
 static SCRIPT_CONTROLS: [ScriptControls; 3] = [
-    // MONGOLIAN VOWEL SEPARATOR, in the Mongolian block. It was a space (Zs)
-    // before Unicode 6.3, so between letters of another script it still
-    // separates them.
     ScriptControls {
         controls: (0x180E, 0x180E),
         letters: (0x1800, 0x18AF),
     },
-    // The Egyptian hieroglyph format controls (joiners, insertions, segments,
-    // enclosures), between the signs of the Egyptian Hieroglyphs, Egyptian
-    // Hieroglyph Format Controls and Egyptian Hieroglyphs Extended-A blocks.
     ScriptControls {
         controls: (0x13430, 0x1343F),
         letters: (0x13000, 0x143FF),
     },
-    // The shorthand format controls (letter overlap, continuing overlap, down
-    // step, up step), between Duployan letters.
     ScriptControls {
         controls: (0x1BCA0, 0x1BCA3),
         letters: (0x1BC00, 0x1BC9F),
@@ -352,36 +289,25 @@ fn script_controls(c: char) -> Option<&'static ScriptControls> {
     SCRIPT_CONTROLS.iter().find(|script| script.has_control(c))
 }
 
-/// Whether `c` is `Extended_Pictographic`, an element an emoji ZWJ sequence
-/// joins.
+/// Whether `c` is `Extended_Pictographic`, an element an emoji ZWJ sequence joins.
 #[inline]
 fn is_pictographic(c: char) -> bool {
     gcb_class(c) == GCB::Extended_Pictographic
 }
 
-/// Whether `c` is a virama (`Canonical_Combining_Class=9`, Virama), the sign
-/// that kills a consonant's vowel and that a joiner after or before it turns
-/// into a half form, an eyelash ra or a ya-phala.
+/// Whether `c` is a virama (`Canonical_Combining_Class=9`).
 #[inline]
 fn is_virama(c: char) -> bool {
     in_ranges(VIRAMA, c as u32)
 }
 
-/// Whether `c` joins its neighbours cursively (`Joining_Type` Dual, Left,
-/// Right or Join_Causing): the letters of Arabic, Syriac, N'Ko, Mongolian and
-/// the other cursive scripts, between which ZWNJ and ZWJ decide whether two
-/// letters join.
+/// Whether `c` joins its neighbours cursively (`Joining_Type` Dual, Left, Right or Join_Causing).
 #[inline]
 fn joins_cursively(c: char) -> bool {
     in_ranges(JOINING, c as u32)
 }
 
-/// `Canonical_Combining_Class=9` (Virama) ranges, inclusive `(lo, hi)`, sorted
-/// and disjoint.
-///
-/// Source: Unicode 16.0.0 `DerivedCombiningClass.txt`, the UCD version of the
-/// crate's other tables, range-merged. The tests below check it against that
-/// file, every code point; re-extract from the matching UCD release to update.
+/// `Canonical_Combining_Class=9` (Virama) ranges, inclusive `(lo, hi)`, sorted and disjoint.
 static VIRAMA: &[(u32, u32)] = &[
     (0x094D, 0x094D),
     (0x09CD, 0x09CD),
@@ -443,11 +369,7 @@ static VIRAMA: &[(u32, u32)] = &[
     (0x1612F, 0x1612F),
 ];
 
-/// `Joining_Type` Dual_Joining, Left_Joining, Right_Joining and Join_Causing
-/// ranges, inclusive `(lo, hi)`, sorted and disjoint.
-///
-/// Source: Unicode 16.0.0 `DerivedJoiningType.txt`, range-merged and checked
-/// against that file the same way.
+/// `Joining_Type` Dual_Joining.
 static JOINING: &[(u32, u32)] = &[
     (0x0620, 0x0620),
     (0x0622, 0x064A),
@@ -580,7 +502,7 @@ mod tests {
 
     /// A joiner belongs to a word exactly where it spells it: next to a virama,
     /// between two letters of a cursive-joining script, inside an emoji ZWJ
-    /// sequence. Anywhere else, and at either end of a run, it is in no word.
+    /// sequence.
     #[test]
     fn a_joiner_belongs_to_a_word_only_where_it_spells_it() {
         for word in [
@@ -623,9 +545,6 @@ mod tests {
                 "\u{0628}\u{200C}\u{200C}\u{0628}",
                 &["\u{0628}", "\u{0628}"],
             ),
-            // A script's own control beside letters of another script (the
-            // Mongolian vowel separator was a space before Unicode 6.3), or at
-            // either end of a run of its own.
             ("ab\u{180E}cd", &["ab", "cd"]),
             ("\u{0628}\u{180E}\u{0628}", &["\u{0628}", "\u{0628}"]),
             ("\u{1820}\u{180E}x", &["\u{1820}", "x"]),
@@ -640,8 +559,6 @@ mod tests {
         ] {
             assert_eq!(split(text), parts, "{text:?}");
         }
-        // An emoji ZWJ sequence is one glyph: where emoji are word characters,
-        // its ZWJ keeps it whole. Between a letter and an emoji it does nothing.
         let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
         assert_eq!(
             split_at_spaces(&format!("a{family}b c")),
@@ -739,8 +656,6 @@ mod tests {
                 "{lookups} classifications for {chars} characters"
             );
         }
-        // The break before a caret is found by reading back to it, not by
-        // reading the line.
         let text = "ab.".repeat(64 * 1024);
         ROLE_LOOKUPS.with(|n| n.set(0));
         assert_eq!(
@@ -784,8 +699,6 @@ mod tests {
                 }
             }
         }
-        // From the end of a long line of short words, a step left reads only
-        // the last word and the break before it.
         let text = "ab.".repeat(64 * 1024);
         ROLE_LOOKUPS.with(|n| n.set(0));
         assert_eq!(
@@ -793,7 +706,6 @@ mod tests {
             Some(text.len() - 3)
         );
         assert!(ROLE_LOOKUPS.with(std::cell::Cell::get) <= 8);
-        // Past a run of separators, the step reads back over the run once.
         let text = format!("ab{}", " ".repeat(64 * 1024));
         ROLE_LOOKUPS.with(|n| n.set(0));
         assert_eq!(word_start_before(&text, text.len(), is_word_char), Some(0));

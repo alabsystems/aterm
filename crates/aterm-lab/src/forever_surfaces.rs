@@ -33,9 +33,11 @@ const IDLE_SEARCH_MS: i64 = 8 * 60_000;
 const IDLE_TRIES: usize = 3;
 
 /// The front tab's capture: one file, overwritten (a bare name is confined to
+/// the instance's images directory).
 const FRONT_IMAGE: &str = "forever-front.png";
 
 /// The hang detector of a look's or a press's effect (a wait for something
+/// that must happen).
 const STEP_WAIT: Duration = Duration::from_secs(60);
 
 /// Recorded window surface observations for a single tab ([`Window::note`]).
@@ -358,6 +360,7 @@ fn strings(s: &str) -> Option<(Vec<String>, &str)> {
 }
 
 /// A printed list of optional strings (`[None, Some("a")]`) at the head of
+/// `s`.
 fn options(s: &str) -> Option<Vec<Option<String>>> {
     let mut rest = s.strip_prefix('[')?;
     let mut v = Vec::new();
@@ -609,6 +612,8 @@ pub fn every_of(rows: &[(String, String)]) -> Option<String> {
 const EVERY_KEY: &str = "harness/session/all";
 
 /// Its Timer's disclosure (key and action alike): pressed open, the page
+/// brings the row on its screen first, as a hand reaching it would; pressed
+/// again, closed.
 const EVERY_TIMER: &str = "harness/session/all/timer";
 
 /// Extracts the integer count preceding `word` in a summary `line`.
@@ -677,6 +682,7 @@ pub fn drawn_is_face(c: &Chip) -> bool {
 }
 
 /// Whether harness `program` draws no chip (its line `face=- drawn=-
+/// why=no-footer`): Gemini CLI.
 fn footless(program: &str) -> bool {
     program == "gemini"
 }
@@ -687,6 +693,7 @@ fn no_footer(c: &Chip) -> bool {
 }
 
 /// The entries of `list` standing in `[from, until)`: the last one at or
+/// before `from` (what stood when it opened), then each one inside.
 fn standing(list: &[(i64, String)], from: i64, until: i64) -> Vec<&(i64, String)> {
     let first = list.iter().rposition(|(t, _)| *t <= from);
     list.iter()
@@ -1068,6 +1075,8 @@ fn compose(a: Verdict, name: &str, b: Verdict) -> Verdict {
 }
 
 /// The faces a chain's chip may wear at `t`: its Autopilot's, a landing
+/// Land's `landed` from its DONE on (either within 10 s of it: the face moves
+/// at the next read), a person's exchange's `theirs` (L13).
 fn faces_at(chain: Chain, done: Option<i64>, t: i64) -> Vec<&'static str> {
     match chain.autopilot() {
         "cruise" => vec!["cruise"],
@@ -1087,6 +1096,10 @@ fn faces_at(chain: Chain, done: Option<i64>, t: i64) -> Vec<&'static str> {
 }
 
 /// EVERY CHIP FACE ITS AUTOPILOT'S (every chain): each `autopilot` line read
+/// since its first prompt wears a face its Autopilot allows ([`faces_at`]),
+/// and a tab behind the front one draws nothing (`drawn=- why=not-drawn`,
+/// never a stale face); Gemini CLI's every line `face=- drawn=-
+/// why=no-footer`.
 fn chip_faces(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let w = &seen.window;
     let lines: Vec<&(i64, String)> = w
@@ -1143,6 +1156,7 @@ fn chip_faces(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
 }
 
 /// NEVER AN END (every chain but L16's and L17's, and L5 under the floor):
+/// `status end=-` at every read; unread (`?`) throughout is unobserved.
 fn never_ended(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let ends: Vec<&(i64, String)> = seen
         .status
@@ -1169,6 +1183,9 @@ fn never_ended(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
 }
 
 /// NEVER A ROW (every chain but L16's and L17's, and L5 under the floor): no
+/// Done for you row and no `done` in its tab's states — but a worker's own
+/// task record's (L7: its row is that record's) — and no need row where its
+/// replies name none.
 fn never_a_row(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let w = &seen.window;
     let mut bad = Vec::new();
@@ -1226,6 +1243,7 @@ fn chips_in(seen: &Seen, from: i64, until: i64) -> Vec<(i64, Chip, String)> {
 }
 
 /// L1: `face=land` while it lands: a chip line `face=land` standing between
+/// the land act and its landing (Gemini CLI: its no-footer line).
 fn l1_face(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let Some((t1, _)) = seen
         .acts(aterm_agent::supervise::policy::turn_end::RULE_LAND)
@@ -1256,6 +1274,7 @@ fn l1_face(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
 }
 
 /// The span its need stood in: from its `NEEDS` line to the `CLEARED …
+/// needs` (or the landing, or the watch's end) after it.
 fn need_span(seen: &Seen, t0: i64) -> Option<(i64, i64)> {
     let (tn, _) = seen.first_after("NEEDS ", t0)?;
     let until = seen
@@ -1305,6 +1324,7 @@ fn l3_count(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
 }
 
 /// A [`Window::menu`] entry's `<section>-head|` line: the header's count
+/// (`Needs you (2)`: 2) and the rows the menu listed under it.
 fn head_of(menu: &str, section: &str) -> Option<(Option<usize>, usize)> {
     let head = menu
         .lines()
@@ -1318,6 +1338,9 @@ fn head_of(menu: &str, section: &str) -> Option<(Option<usize>, usize)> {
 }
 
 /// L3: its row under `Needs you (N)` in the worker's words (`◇ land-a —
+/// rotate the deploy key · #`, never `<program> needs you:`), the header's
+/// `N` the rows the menu lists under it (every tab's need, so 1 or more),
+/// and `attention` among its tab's states, while its need stood.
 fn l3_row(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let Some((from, until)) = need_span(seen, cx.t0) else {
         return Verdict::Unobserved("no NEEDS line (L3's records)".into());
@@ -1393,6 +1416,7 @@ fn l3_row(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
 }
 
 /// L5: `face=landed` after the landing (Gemini CLI: its no-footer line), and
+/// the page's state for it `landed <time>`.
 fn l5_landed(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let Some((d, _)) = seen.first_after("DONE ", cx.t0) else {
         return Verdict::Unobserved("no landing (L5's records)".into());
@@ -1452,6 +1476,8 @@ fn l5_landed(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
 }
 
 /// L7: the worker's row under Done for you, `✓ land-e — landed #`, after its
+/// landing; and at rest, the menu's This Mac `N landed` counting every tab
+/// whose `status` says `task=landed`, it among them.
 fn l7_rows(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let Some((d, _)) = seen.first_after("DONE ", cx.t0) else {
         return Verdict::Unobserved("no landing (L7's records)".into());
@@ -1504,6 +1530,11 @@ fn l7_rows(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
 const UNREST: &str = "the window never read at rest (END not reached)";
 
 /// L7 ON THE PAGE (4c), at rest: its today line leads with the run's
+/// landings this day (`5 landed today`: each landed tab's `DONE …
+/// rule=land@v1`, as the A/B book counts them), and SESSIONS' Every session
+/// row counts the tabs under Land by their faces — `N landed` every tab whose
+/// `status` says `task=landed` under Land, `M landing` the others under Land
+/// — never calling a landed tab landing.
 fn l7_page(seen: &Seen, _cx: &Ctx<'_>) -> Verdict {
     let Some(rest) = seen.window.rest.as_deref() else {
         return Verdict::Unobserved(UNREST.into());
@@ -1583,6 +1614,7 @@ fn end_stands(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
 }
 
 /// Its `•` and its Done for you row (`✓ <label> — landed #`) once landed,
+/// before the END's look: what is wrong, and what was read.
 fn end_marks(seen: &Seen, cx: &Ctx<'_>) -> Result<String, Verdict> {
     let Some((d, _)) = seen.first_after("DONE ", cx.t0) else {
         return Err(Verdict::Unobserved("no landing (its records)".into()));
@@ -1636,6 +1668,10 @@ fn step<'a>(w: &'a Window, name: &str) -> Option<&'a (i64, String)> {
 }
 
 /// Its `step=<name>` line of END left its end standing, unseen with its `•`
+/// and its Done for you row (`end_seen=0 … done_row=yes`, `done` among its
+/// states where it is behind): `sweep`, a tab brought forward with no look,
+/// sees no end; `look-on`, the look begun on another tab, sees none behind
+/// it; `still`, a tab switch to land-j under the look, none of land-k's.
 fn left_it(w: &Window, cx: &Ctx<'_>, name: &str, why: &str) -> Result<String, Verdict> {
     let Some((t, l)) = step(w, name) else {
         return Err(Verdict::Unobserved(format!(
@@ -1656,6 +1692,8 @@ fn left_it(w: &Window, cx: &Ctx<'_>, name: &str, why: &str) -> Result<String, Ve
 }
 
 /// L16: its `•` and its row once landed; brought forward with no look, and
+/// behind the tab the look began on, its end stands; brought in front under
+/// the look (`tab <land-j>`): `end_seen=1`, the `•` and the row gone.
 fn l16_look(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let marks = match end_marks(seen, cx) {
         Ok(s) => s,
@@ -1690,6 +1728,9 @@ fn l16_look(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
 }
 
 /// L17: its `•` and its row once landed; brought forward with no look, behind
+/// the tab the look began on, and behind land-j once a tab switch under the
+/// look saw land-j's, its end stands; after the press on its row (the look
+/// on): it in front (`selected=1`), `end_seen=1`, the row gone.
 fn l17_press(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let marks = match end_marks(seen, cx) {
         Ok(s) => s,
@@ -1728,9 +1769,13 @@ fn l17_press(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
 }
 
 /// N1–N4: the words each step's reply's yield is told by (its last row,
+/// which `EVENT idle` quotes: its last need, or the defense) and the count
+/// `status` wants of its needs.
 const N_STEPS: [(&str, usize); 4] = [(NEED_B, 2), (DEFENSE_HEAD, 0), (NEED_A, 1), (NEED_C, 2)];
 
 /// Step `k` of N1–N4's span: from its reply's yield (the first `EVENT idle`
+/// holding its head after the act that asked it; the first prompt's for N1)
+/// to the next act, or the watch's end.
 fn n_span(seen: &Seen, t0: i64, k: usize) -> Result<(i64, i64), Verdict> {
     let acts: Vec<i64> = seen
         .all_acts()
@@ -1763,6 +1808,7 @@ fn n_span(seen: &Seen, t0: i64, k: usize) -> Result<(i64, i64), Verdict> {
 }
 
 /// The act that asked step `k` of N1–N4: none for N1 (the first prompt), a
+/// continuation for N2 and N4, the done check for N3.
 const N_ASKED: [Option<&str>; 4] = [
     None,
     Some(aterm_agent::supervise::policy::turn_end::RULE_CONTINUE),
@@ -1833,6 +1879,7 @@ pub fn judge_needs_step(seen: &Seen, t0: i64, k: usize) -> Verdict {
 }
 
 /// N1–N4 on `status` and `meta`: settled at the span's end, `needs_n=` the
+/// step's count (`-` for none) and the entry the first need's, carrying on.
 fn n_status(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
     let (from, until) = match n_span(seen, cx.t0, k) {
         Ok(s) => s,
@@ -1884,6 +1931,11 @@ fn n_status(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
 }
 
 /// N1–N4 on the window: every chip line standing in the span drawn as its
+/// face (the front tab; Gemini CLI its no-footer line), and, settled, its
+/// need row naming the first need with no count (every other need has a
+/// row of its own one level in, [`n_further`]), and its page
+/// state naming the first need with the others' count (` (+1 more)`), the
+/// need alone, or none.
 fn n_window(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
     let (from, until) = match n_span(seen, cx.t0, k) {
         Ok(s) => s,
@@ -1968,9 +2020,14 @@ fn n_window(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
 }
 
 /// N1–N4's further needs, each on a row of its own one level in under the
+/// tab's row (`indent=1`): (b) at N1, none at N2 and N3, (c) and
+/// never (b) at N4 — a set that moved under the same first need.
 const N_OTHERS: [&[&str]; 4] = [&[NEED_B], &[], &[], &[NEED_C]];
 
 /// N1–N4's ROWS ONE LEVEL IN (§12.2.1, §12.5.4's N1–N4 row):
+/// settled at the span's end, the rows the menu draws one level in under
+/// the tab's own need row ([`menu_of`]'s `indent=1` lines) are exactly that
+/// step's other needs, whole ([`N_OTHERS`]).
 fn n_further(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
     let until = match n_span(seen, cx.t0, k) {
         Ok((_, until)) => until,
@@ -1995,11 +2052,14 @@ fn n_further(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
 }
 
 /// Why a want of a chain's page row is unread: its row was never on the
+/// page's screen (Settings ▸ Harness draws one screen of its rows, and
+/// `inspect … text` reads that screen), so the page judges nothing of it.
 fn off_page(label: &str) -> String {
     format!("{label}'s row was never on the page's screen")
 }
 
 /// A want's verdict from what it found wrong (`bad`: FAIL) and what it
+/// could not read (`unread`: UNOBSERVED), else PASS.
 fn told(said: String, bad: &[String], unread: &[String]) -> Verdict {
     if !bad.is_empty() {
         Verdict::Fail(format!("{said}: {}", bad.join("; ")))
@@ -2016,6 +2076,7 @@ fn metric(line: &str, key: &str) -> String {
 }
 
 /// The owners of a `deadline_arms_by_owner=` (`owner:n/m,…`) or
+/// `deadline_fires_by_owner=` (`owner:n,…`) value, `none` and `-` naming none.
 fn owners(v: &str) -> Vec<&str> {
     if matches!(v, "" | "-" | "none") {
         return Vec::new();
@@ -2181,12 +2242,16 @@ pub fn judge_end(desk: &Desk, tabs: &[(Chain, &Window)], program: &str) -> Verdi
 }
 
 /// The deadline owner presence keeps (the pill's age, the claim's lapse):
+/// armed at rest, never fired there.
 const PRESENCE: &str = "presence";
 
 /// The deadline owner of the status sweep, which answers a program's output.
 const SWEEP: &str = "session_status";
 
 /// How many times the status sweep may fire for each `Output` wake at idle:
+/// a write owes the agent's follow-up look (`SessionStatus::next_wake`, once
+/// the output pauses) and the transition that look may owe — two, measured
+/// 1.75 and 2.1 a write over Muse Code's 16 tabs — with room for one more.
 const SWEEP_FIRES_PER_WRITE: u64 = 3;
 
 /// `n / d` for the report (0 for none).
@@ -2199,6 +2264,7 @@ fn ratio(n: u64, d: u64) -> f64 {
 }
 
 /// The count `owner` has in a `deadline_fires_by_owner=` (`owner:n,…`) or
+/// `deadline_arms_by_owner=` (`owner:n/m,…`: its `n`) value; 0 where absent.
 fn count_of(v: &str, owner: &str) -> u64 {
     v.split(',')
         .find_map(|p| {
@@ -2223,6 +2289,7 @@ pub fn glance(door: &Door<'_>, desk: &Desk) -> Glance {
 }
 
 /// The windows' ids in `inspect app/v1 tabs`: each `window id=<n>`, and the
+/// Settings page's `(window, view)` where a leaf is `kind=app app=settings`.
 fn windows_of(tabs: &str) -> (Vec<String>, Option<(String, String)>) {
     let mut windows = Vec::new();
     let mut page = None;
@@ -2244,6 +2311,8 @@ fn windows_of(tabs: &str) -> (Vec<String>, Option<(String, String)>) {
 }
 
 /// The window an `invoke NewWindow` made: the first window of `inspect
+/// app/v1 tabs` (each `tabs()` read) that `before` does not hold, read again
+/// until one shows, for `within` at most.
 fn new_window(
     before: &[String],
     within: Duration,
@@ -2314,6 +2383,7 @@ pub fn window_of(ls: &str, sid: &str) -> Option<String> {
 }
 
 /// What one tab's END step read: `step=<name> end=… end_seen=…
+/// selected=<0|1|-> states=… done_row=<yes|no>[ pressed=…]`.
 fn step_line(door: &Door<'_>, tab: &Tab, name: &str, pressed: Option<&str>) -> String {
     let s = on(door, &tab.sid, &["status"]);
     let g = Glance::of(now_ms(), &door.out(&["chrome"]), "");
@@ -2343,6 +2413,9 @@ fn step_line(door: &Door<'_>, tab: &Tab, name: &str, pressed: Option<&str>) -> S
 }
 
 /// The soonest instant a tab's journal names its next act at (the last
+/// `WAITING … until=<stamp>`, `DONE` or `LEFT` after its last act, where a
+/// `WAITING`: its `until`, read as `now` where it passed within the last
+/// minute — the act is on its way) and the latest journal line's time.
 fn due_and_quiet(tabs: &[Tab], now: i64) -> (Option<i64>, i64) {
     let mut due: Option<i64> = None;
     let mut last = 0;
@@ -2375,6 +2448,8 @@ fn due_and_quiet(tabs: &[Tab], now: i64) -> (Option<i64>, i64) {
 }
 
 /// A journal's lines less those the same as the line before them: the loop
+/// writing one decision again (a `WAITING` with the same seq, `until` and
+/// reason) says nothing new.
 fn news(journal: &[(i64, String)]) -> impl Iterator<Item = &(i64, String)> {
     journal
         .iter()
@@ -2384,6 +2459,8 @@ fn news(journal: &[(i64, String)]) -> impl Iterator<Item = &(i64, String)> {
 }
 
 /// Tab `name`'s journal lines inside `[from, from + ms]` (`<name> +t
+/// <line>`): those that moved, and those written again, each the same as the
+/// line before it ([`news`]).
 fn moves_in(name: &str, j: &[(i64, String)], from: i64, ms: i64) -> (Vec<String>, Vec<String>) {
     let mut moved = Vec::new();
     let mut relogged = Vec::new();
@@ -2414,6 +2491,10 @@ pub fn unix_ms_of(stamp: &str) -> Option<i64> {
 }
 
 /// THE END'S IDLE WINDOW: once every tab's journal stood still
+/// [`IDLE_QUIET_BEFORE_MS`] and no tab's next act falls within it and
+/// [`IDLE_CLEAR_AFTER_MS`] after, `metrics reset`, [`IDLE_MS`] with no read,
+/// then `metrics` and `metrics percentiles`; a window an act or a journal
+/// line fell in is tried again, [`IDLE_TRIES`] in all.
 fn idle_window(
     run: &crate::run::Run,
     door: &Door<'_>,

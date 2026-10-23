@@ -1,40 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Engine conformance of the crash-restore journal (the crash-restore plan §7.3): every
-//! engine mutation either rides the tail or forces a keyframe, and the history ring joins
-//! below what a restore carries.
-//!
-//! A live `Terminal` runs a seeded mix of input — SGR, wide and combining UTF-8, escapes
-//! and an OSC 8 link split across slices, DECSTBM, the alternate screen, a `?2026`
-//! frame, ED3, RIS, the kitty keyboard stack, verified shell-integration marks, resizes
-//! including the 64→63→64 flap with a draw between its halves, the synthesized bytes of
-//! a foreground handback and a manual reset — and the host's setters (`apply_config`,
-//! `set_color_scheme`, `set_cell_pixel_size`). It is journaled as the window journals it:
-//! resizes caught up from the engine's own resize journal in engine order before each
-//! slice (and at once, for a resize with no output: the journal lane's nudge), the slice
-//! appended after `process`, keyframes when the K1–K7 policy says so on a clock the test
-//! drives, the config fingerprint stored and a keyframe forced when a setter moves it, and
-//! a clear (an ED3 or a RIS moves the history fence's clear generation) keyframed and
-//! then settled (`JournalWriter::settle_clear`), so every later check restores across the
-//! settle.
-//!
-//! At every record boundary and every keyframe the region is restored by the real
-//! `recover` into a scratch engine built as the restorer builds one (with the host's
-//! settings of that moment): the restored visible screen must equal the live one and the
-//! restore must say it is exact — or, when a verified mark sat in the tail past the
-//! keyframe budget, a regrid or a kitty-graphics command sat in it, or the replay ended
-//! inside a sequence it can only swallow, say it is not, with exactly that counted.
-//!
-//! THE HISTORY HALF (increment 5): the history ring is exported every few slices as the
-//! window's journal worker exports it, so it is caught up at some boundaries and behind at
-//! others. At every exact restore the head the replay moved on is the live history, the
-//! lines the checkpoint carries are its newest at the same rows, and where the ring meets
-//! them its lines below them are the live history's: imported lines plus carried lines
-//! are the live history over the same rows. Where it does not meet them, the window's
-//! join counts the gap (the window's own tests hold that count).
-//!
-//! NEGATIVE CONTROL: a tap that drops RESIZE records fails on the flap.
+//! Crash-restore journal engine conformance and history-ring join tests.
 
 use aterm_core::config::TerminalConfig;
 use aterm_core::grid::ResizePolicy;
@@ -167,7 +134,6 @@ fn scenario() -> Vec<Step> {
             }
             paint
         }),
-        // The flap, with a draw between its halves: the alternate screen's rows move.
         Step::Resize(ROWS - 1, COLS),
         Step::Output(b"\x1b[1;1Hdrawn between the halves".to_vec()),
         Step::Resize(ROWS, COLS),
@@ -186,10 +152,6 @@ fn scenario() -> Vec<Step> {
         Step::Output(b"after a manual reset\r\n\x1b[38;2;10;20;30mtruecolour".to_vec()),
         Step::Quiet,
         Step::Idle(300),
-        // `icat` after a command started: the mark's K6 keyframe is due at once, and its
-        // capture is deferred (K5) while the kitty-graphics query is open. The mark stays
-        // counted and the open query is counted swallowed until the query ends and the
-        // deferred keyframe lands.
         Step::Pieces(vec![
             format!(
                 "\r\n\x1b]133;C;id={}\x07$ icat\r\n\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA",
@@ -198,7 +160,6 @@ fn scenario() -> Vec<Step> {
             .into_bytes(),
             b"\x1b\\".to_vec(),
         ]),
-        // An XTGETTCAP query split across reads: its reply lives in its handler.
         Step::Pieces(vec![b"\x1bP+q544e".to_vec(), b"\x1b\\".to_vec()]),
         Step::Mark("A"),
         Step::Output(b"$ ".to_vec()),
@@ -288,8 +249,6 @@ impl Session {
         }
         let identity = HistoryIdentity::of(&fence);
         let store = self.writer.store();
-        // The negative control's labels run one row past the lines they hold, a run with no
-        // hole in it: every row the ring names is one later than the line it holds.
         let shift = u64::from(self.ring_shifted);
         let next = |ring: &HistoryWriter| ring.end_row().saturating_sub(shift);
         if identity != self.ring.identity() || next(&self.ring) < fence.oldest {
@@ -315,8 +274,7 @@ impl Session {
     /// is the live history, the lines its checkpoint carries are the live history's newest,
     /// at the same rows, and where the ring meets them its lines below them are the live
     /// history's too, so imported lines plus carried lines are the live history over the
-    /// same rows. Where the ring does not meet them the window's join counts the gap (its
-    /// own tests hold the count); a clear or a reflow inside the tail leaves no head.
+    /// same rows.
     fn check_history(&mut self, label: &str, restored: &Restored) -> Result<(), String> {
         let Ok(facts) = restored.join_facts() else {
             return Ok(());
@@ -352,7 +310,7 @@ impl Session {
             {
                 let take = carried_from - export.first;
                 if take == 0 {
-                    // The checkpoint carries every line the head names: nothing to join.
+                    // Checkpoint already carries every line named by the head.
                     return Ok(());
                 }
                 let mut ring = Vec::new();
@@ -385,8 +343,6 @@ impl Session {
     }
 
     fn keyframe(&mut self, reason: Reason) {
-        // The window's bridge: the history the ring has not reached, at most the cap (none
-        // once the ring has caught up, so the ring alone brings the history back).
         let fence = self.term.history_fence();
         let lag = if HistoryIdentity::of(&fence) == self.ring.identity() {
             fence
@@ -399,13 +355,10 @@ impl Session {
             .bridge_cap()
             .min(usize::try_from(lag).unwrap_or(usize::MAX));
         self.tap.catch_up(&self.term, &mut self.writer);
-        // The window's marks reach the cap whatever the bridge (its `Writer::capture`).
         let Some(checkpoint) = self
             .term
             .checkpoint_journal_marked(bridge, reason.bridge_cap())
         else {
-            // K5: the parser holds a sequence no keyframe carries whole; retried at the
-            // next slice end.
             self.policy.keyframe_deferred(reason);
             self.deferrals += 1;
             return;
@@ -422,8 +375,6 @@ impl Session {
         };
         self.writer.write_keyframe(&input).expect("a keyframe fits");
         if reason == Reason::Clear {
-            // The clear's keyframe: nothing from before the clear stays in the slots or
-            // the tail, and every check after this restores across the settle.
             self.writer.settle_clear().expect("settled");
             self.settles += 1;
         }
@@ -446,9 +397,6 @@ impl Session {
             self.writer.set_gathered(self.gathered).expect("gathered");
         }
         self.term.process(bytes);
-        // The slice's verified marks are counted before its append, so no stop after the
-        // append can leave one in the tail uncounted; the next keyframe's commit clears
-        // them.
         let verified = self.term.shell_marks_verified() - marks;
         self.writer.note_marks(verified).expect("marks");
         if synthesized {
@@ -456,14 +404,11 @@ impl Session {
         } else {
             self.writer.append_slice(bytes).expect("appended");
         }
-        // The worker exports every few slices: the ring is caught up at some boundaries,
-        // behind at the rest.
         self.since_export += 1;
         if self.since_export >= 3 {
             self.export();
         }
         if self.term.history_fence().clear_gen != clear_gen {
-            // An ED3 or a RIS: the window learns it from the fence (the worker's reset)
             // and the next slice end forces the clear's keyframe.
             self.policy.note_clear();
         }
@@ -471,8 +416,6 @@ impl Session {
         let decision =
             self.policy
                 .after_slice(self.now, self.writer.tail_since_keyframe(), verified);
-        // With no keyframe due, the policy alone moved: the region and the engine are
-        // the ones just checked, and the same check would see the same bytes.
         if decision.keyframe.is_some() {
             self.decide(decision);
             self.check(&format!("{label}, after its keyframe"))?;
@@ -483,8 +426,6 @@ impl Session {
     /// Restore the region and hold it to the live engine.
     fn check(&mut self, label: &str) -> Result<(), String> {
         self.checks += 1;
-        // `recover` only reads its view, and nothing writes the region while it runs:
-        // the writer's own store is the region as a death here would leave it.
         let host = self.host;
         let recovery = recover(
             self.writer.store(),
@@ -499,14 +440,6 @@ impl Session {
             return Err(format!("{label}: no screen: {recovery:?}"));
         };
         if !restored.exact {
-            // A verified mark in the tail, a width change or rows grow in it (which depend
-            // on where the history sits and on the resize undo's stash, neither of which a
-            // checkpoint carries), a kitty-graphics command in it (which depends on the
-            // image store and the host's medium resolver), a main-screen unscroll (which
-            // pulls history the scratch engine may not hold), or a replay that ended inside a
-            // sequence the restore can only swallow (the live engine still delivers it):
-            // counted, and a restore that says so is the conformant one. Anything else is
-            // a loss.
             let mut counted = restored.losses.clone();
             counted.marks_lost = 0;
             counted.regrids_replayed = 0;
@@ -593,11 +526,7 @@ fn differing(a: &TerminalCheckpoint, b: &TerminalCheckpoint) -> Vec<String> {
 /// projection, less its lineage's seed uncertainty (`HolderRepr::seed_untrusted`: a
 /// restore that took output after its install carries it by design, for the host's
 /// adoption to read, and a live engine never does), with the kitty keyboard stack's
-/// entries at and above each stack pointer cleared. Those entries are unreachable (a
-/// push writes its slot before a pop can read it), and `restore_snapshot` carries only
-/// the live ones, so a live engine that pushed and popped still holds a stale value
-/// there that no restore, seamless or crash, ever brings back. `None` while the parser
-/// holds a sequence no keyframe carries whole.
+/// entries at and above each stack pointer cleared.
 fn visible(t: &Terminal) -> Option<TerminalCheckpoint> {
     let mut c = t.checkpoint_journal(0)?.without_seed_lineage();
     let k = &mut c.kitty_keyboard;
@@ -699,7 +628,6 @@ fn run_with(
                         session.term.resize_ordinal(),
                     )
                     .expect("word");
-                // The journal lane's nudge: the parse thread records it at once.
                 session.tap.catch_up(&session.term, &mut session.writer);
                 session
                     .policy
@@ -741,8 +669,7 @@ fn run_with(
 }
 
 /// The scenario, cut at many seeded boundaries, restores exactly at every record and
-/// every keyframe. Each seed is its own session sharing nothing with the others, so the
-/// seeds run side by side and are held to the claims in seed order.
+/// every keyframe.
 #[test]
 fn every_boundary_restores_the_live_screen() {
     let runs: Vec<(u64, Result<Session, String>)> = std::thread::scope(|scope| {
@@ -771,7 +698,6 @@ fn every_boundary_restores_the_live_screen() {
             "seed {seed}: {} checks",
             session.checks
         );
-        // A verified mark sits inside a keyframe or is counted: both happen here.
         assert!(
             session.counted_marks > 0,
             "seed {seed}: a mark inside the budget was counted"
@@ -788,9 +714,6 @@ fn every_boundary_restores_the_live_screen() {
             session.settles >= 2,
             "seed {seed}: the ED3 and the RIS were each settled after their keyframe"
         );
-        // The history half: the ring supplied the lines below the restored ones at several
-        // boundaries (the keyframe's bridge is only what the ring lacked), and was behind
-        // them (a gap the window's join counts) at others.
         assert!(
             session.joined > 5 && session.gaps > 0,
             "seed {seed}: the ring joined at {} checks, left a gap at {}",
@@ -807,8 +730,7 @@ fn every_boundary_restores_the_live_screen() {
     }
 }
 
-/// NEGATIVE CONTROL: a tap that drops RESIZE records fails on the flap. The flap is a step
-/// of the scenario, not of a seed's cuts, so one seed shows it.
+/// NEGATIVE CONTROL: a tap that drops RESIZE records fails on the flap.
 #[test]
 fn a_tap_that_drops_resizes_fails_on_the_flap() {
     let Err(why) = run(1, true, false) else {

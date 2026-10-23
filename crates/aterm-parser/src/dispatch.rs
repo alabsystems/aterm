@@ -272,6 +272,8 @@ impl Parser {
     }
 
     /// Read `input` inside an open tmux passthrough wrapper (`crate::tmux`)
+    /// up to and including its next ESC, or the ESC's follower when one is
+    /// pending, handing the state machine the payload unwrapped.
     fn advance_unwrapping<'a, S: ActionSink>(&mut self, input: &'a [u8], sink: &mut S) -> &'a [u8] {
         if self.tmux == TmuxPassthrough::Escape {
             let Some((&byte, rest)) = input.split_first() else {
@@ -321,7 +323,7 @@ impl Parser {
         }
     }
 
-    /// The state machine over `input` as it arrived. Returns the rest
+    /// The state machine over `input` as it arrived.
     fn advance_plain<'a, S: ActionSink>(&mut self, input: &'a [u8], sink: &mut S) -> &'a [u8] {
         let mut remaining = input;
         let wrapped = self.tmux.is_open();
@@ -443,6 +445,7 @@ impl Parser {
     }
 
     /// Bulk fast paths for the three string states, extracted from
+    /// `advance_fast` (see the call site).
     fn advance_string_states_bulk<'a, S: ActionSink>(
         &mut self,
         mut remaining: &'a [u8],
@@ -498,6 +501,7 @@ impl Parser {
     }
 
     /// Find the first byte that the DCS-passthrough bulk fast path must NOT
+    /// bulk-copy into `dcs_put_bulk`.
     #[inline]
     fn find_dcs_passthrough_boundary(input: &[u8]) -> usize {
         super::simd::find_any_of(input, [0x18, 0x1A, 0x1B, 0x9C, 0x7F]).unwrap_or(input.len())
@@ -538,7 +542,7 @@ impl Parser {
         self.push_current_param(self.last_was_colon);
     }
 
-    /// Collect an intermediate byte (dropped past `MAX_INTERMEDIATES`). Not
+    /// Collect an intermediate byte (dropped past `MAX_INTERMEDIATES`).
     #[inline]
     fn collect_intermediate(&mut self, byte: u8) {
         if self.intermediates.len() < MAX_INTERMEDIATES {
@@ -560,7 +564,7 @@ impl Parser {
         }
     }
 
-    /// Split an OSC payload on `;` in one forward scan and dispatch it. Takes
+    /// Split an OSC payload on `;` in one forward scan and dispatch it.
     fn parse_and_dispatch_osc<S: ActionSink>(data: &[u8], sink: &mut S, bel_terminated: bool) {
         let Some(k) = data.iter().position(|&b| b == b';') else {
             let params: [&[u8]; 1] = [data];
@@ -578,6 +582,8 @@ impl Parser {
     }
 
     /// General OSC dispatch for 3+ semicolon-separated parameters, seeded with
+    /// the already-split first two parameters `(p0, p1)` and `rest` after the
+    /// second semicolon.
     #[inline(never)]
     fn parse_osc_from_third_param<S: ActionSink>(
         p0: &[u8],

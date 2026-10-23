@@ -2,21 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! The shared input reducer, `EditorInput` (design §4.4; slice S4).
-//!
-//! One key-to-command semantics for both faces: aterm's native Editor view
-//! maps each winit event to an [`EditorInput`], the terminal face maps each
-//! decoded terminal event, and [`EditorWorkspace::handle_input`] decides what
-//! it means. Chords and prefixes (`C-x`, `M-g`, and in the terminal face ESC
-//! as Meta), the `C-u` argument, self-insertion, the minibuffer's own keys
-//! and a paste are all
-//! decided here, so the two faces cannot fork. The keymap's [`Profile`]
-//! carries what differs by face: the GUI's platform spellings and its Super
-//! (⌘) shortcuts.
-//!
-//! What stays with a face is what only it can see: focus traversal between
-//! its controls (F6 in the GUI), its own panels (the config editor's
-//! completion list), the input method's preedit, and pointer hit testing
-//! (the face hands over the document byte it found).
 
 use aterm_types::keyboard::{Key, Modifiers, NamedKey};
 
@@ -29,40 +14,31 @@ use crate::store::DocumentStore;
 /// One input a face hands the engine.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EditorInput {
-    /// A key press or auto-repeat (a face never sends a release). `key` is
-    /// the key as the layout names it without Shift, and `text` is what the
-    /// layout typed for it, when it types (Shift+a's `A`, a German Shift+2's
-    /// `"`): a self-inserting key inserts `text`, or `key`'s own character
-    /// when there is none.
+    /// A key press or auto-repeat (a face never sends a release).
     Key {
         key: Key,
         mods: Modifiers,
         text: Option<String>,
     },
-    /// Committed text that is not one key: an input method's commit, an
-    /// assistive technology's insert.
+    /// Committed text that is not one key.
     Text(String),
-    /// A paste: inserted as one transaction, never read as keys, so a
-    /// newline in it is a newline and never submits a minibuffer.
+    /// A paste: inserted as one transaction, never read as keys, so a newline in it is a newline
+    /// and never submits a minibuffer.
     Paste(String),
-    /// A pointer press or drag at the document byte the face's hit test
-    /// found. `extend` keeps the anchor (Shift-click, a drag), and
-    /// `visible_lines` is how many lines the face shows.
+    /// A pointer press or drag at the document byte the face's hit test found.
     Pointer {
         byte: usize,
         extend: bool,
         visible_lines: usize,
     },
-    /// The view gained (`true`) or lost keyboard focus. A pending key
-    /// sequence survives it, as in Emacs.
+    /// The view gained (`true`) or lost keyboard focus.
     Focus(bool),
 }
 
 /// What one input did, for the face that delivered it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Reduction {
-    /// What the face carries out, in order: a save, a buffer switch, a
-    /// status line.
+    /// What the face carries out, in order: a save, a buffer switch, a status line.
     pub effects: Vec<EditorEffect>,
     /// How the face follows up.
     pub follow: Follow,
@@ -71,18 +47,12 @@ pub struct Reduction {
 /// How a face follows up one input.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Follow {
-    /// The input was the editor's: the face brings the primary caret into
-    /// view and repaints.
+    /// The input was the editor's: the face brings the primary caret into view and repaints.
     #[default]
     Reveal,
-    /// The input scrolled the viewport and left the caret where it was,
-    /// possibly off screen: the face repaints without revealing it. No key
-    /// does this (Page Down pages the caret too); a face's own scrolling,
-    /// such as the wheel, does.
+    /// The input scrolled the viewport and left the caret where it was, possibly off screen.
     Scrolled,
-    /// The input changed nothing: a key nothing names, a focus change. The
-    /// face may give such a key a meaning of its own (the GUI moves focus on
-    /// a modified Tab).
+    /// The input changed nothing: a key nothing names, a focus change.
     Ignored,
 }
 
@@ -141,9 +111,6 @@ impl EditorWorkspace {
             EditorInput::Key { key, mods, text } => {
                 self.reduce_editor_key(store, view, key, mods, text)
             }
-            // Committed text and a paste are not keys: each ends an ESC
-            // waiting for one rather than being read as Meta, and inserts as
-            // one transaction.
             EditorInput::Text(text) => {
                 view.end_escape_prefix();
                 self.insert_text(store, view, &text).map(Reduction::reveal)
@@ -173,7 +140,6 @@ impl EditorWorkspace {
     }
 
     /// Select the whole document (⌘A, and a face's Select All menu item).
-    /// The minibuffer, while open, owns the gesture and refuses it.
     pub fn select_whole_document(
         &mut self,
         store: &DocumentStore,
@@ -203,19 +169,11 @@ impl EditorWorkspace {
         mods: Modifiers,
         text: Option<String>,
     ) -> Result<Reduction, EditorError> {
-        // A keypad key is its main-block twin: KP_5 types `5`, KP_Enter is
-        // Enter. Only the keypad's digits and operators type.
         let (key, text) = match key.main_block_twin() {
             Some(Key::Character(glyph)) => (Key::Character(glyph), Some(glyph.to_string())),
             Some(twin) => (twin, text),
             None => (key, text),
         };
-        // In the terminal face ESC is Meta for the next key the keymap can
-        // spell. A key it has no name for (Up, Home, a function key) and a
-        // Super key (a chord has none) end the ESC instead, and do what they
-        // do without it: so Escape, then Down, moves down. The ESC's HUD goes
-        // either way, so the face repaints even for a key that then does
-        // nothing. (A GUI's Escape never leaves an ESC pending.)
         let spelled = !mods.intersects(Modifiers::SUPER | Modifiers::HYPER)
             && KeyChord::from_key(&key, mods).is_some();
         if !spelled && view.end_escape_prefix() {
@@ -239,9 +197,6 @@ impl EditorWorkspace {
         text: Option<String>,
     ) -> Result<Reduction, EditorError> {
         let super_shortcuts = self.keymap.profile().super_shortcuts();
-        // ⌘S saves whatever else is held or half typed: the platform's
-        // reflex outranks a pending sequence, which stays pending (all but
-        // an ESC, which a ⌘ key ends).
         if super_shortcuts
             && mods.contains(Modifiers::SUPER)
             && matches!(key, Key::Character('s' | 'S'))
@@ -250,10 +205,6 @@ impl EditorWorkspace {
                 .execute(store, view, EditorCommand::Save)
                 .map(Reduction::reveal);
         }
-        // TAB completes an M-x query whatever is held. A modified TAB no
-        // sequence waits for is the face's (Shift+Tab and Control-Tab are a
-        // GUI's focus traversal), so the reducer declines it; plain TAB is
-        // the keymap's, below.
         if matches!(key, Key::Named(NamedKey::Tab)) && !view.chord_pending() {
             if matches!(view.minibuffer, Minibuffer::Command { .. }) {
                 return self
@@ -264,9 +215,6 @@ impl EditorWorkspace {
                 return Ok(Reduction::ignored());
             }
         }
-        // A modified key, or any key while a sequence (or ESC) waits, is a
-        // chord for the keymap. A key the keymap cannot name is dropped and
-        // leaves the sequence waiting.
         if view.chord_pending()
             || mods.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::META)
         {
@@ -319,7 +267,6 @@ impl EditorWorkspace {
                 } else {
                     EditorCommand::MoveForward
                 };
-                // Shift extends: every selection keeps its anchor.
                 let anchors = if mods.contains(Modifiers::SHIFT) {
                     view.selections.iter().map(|s| s.anchor).collect()
                 } else {
@@ -354,11 +301,6 @@ impl EditorWorkspace {
                     self.execute(store, view, EditorCommand::Newline)?
                 }
             }
-            // Escape closes an open minibuffer at once. Otherwise a GUI's
-            // Escape quits, as it always has, and the terminal face's is the
-            // ESC prefix, Meta for the next key (`handle_chord`,
-            // `Profile::escape_is_meta`). A GUI's Escape after a pending
-            // prefix (`C-x`) is that sequence's next key, which nothing binds.
             Key::Named(NamedKey::Escape)
                 if view.minibuffer_active()
                     || !(self.keymap.profile().escape_is_meta() || view.chord_pending()) =>
@@ -370,15 +312,12 @@ impl EditorWorkspace {
                     KeyChord::from_key(&key, Modifiers::empty()).expect("Escape has a chord name");
                 self.handle_chord(store, view, escape)?
             }
-            // Page Up and Page Down page the caret with the view, Emacs'
-            // scroll-down/up-command (`C-v` and `M-v` off the Windows GUI).
             Key::Named(NamedKey::PageUp) => {
                 self.execute(store, view, EditorCommand::ScrollPageUp)?
             }
             Key::Named(NamedKey::PageDown) => {
                 self.execute(store, view, EditorCommand::ScrollPageDown)?
             }
-            // Plain TAB is the keymap's: indent-for-tab-command.
             Key::Named(NamedKey::Tab) => match KeyChord::from_key(&key, mods) {
                 Some(chord) => self.handle_chord(store, view, chord)?,
                 None => return Ok(Reduction::ignored()),
@@ -457,20 +396,17 @@ mod tests {
     #[test]
     fn profile_tables() {
         let command = KeyResolution::Command;
-        // The terminal face is Emacs: C-s searches, and nothing else saves.
         assert_eq!(
             resolve(Profile::Terminal, "C-s"),
             command(EditorCommand::IncrementalSearch)
         );
         assert_eq!(resolve(Profile::Terminal, "M-s"), KeyResolution::Unbound);
-        // Windows saves on C-s and keeps isearch on M-s.
         let windows = Profile::Gui(Platform::Windows);
         assert_eq!(resolve(windows, "C-s"), command(EditorCommand::Save));
         assert_eq!(
             resolve(windows, "M-s"),
             command(EditorCommand::IncrementalSearch)
         );
-        // C-v and M-v page, except on the Windows GUI, where Ctrl+V pastes.
         for profile in PROFILES {
             let windows = profile == Profile::Gui(Platform::Windows);
             for (chord, page) in [
@@ -488,12 +424,10 @@ mod tests {
                 );
             }
         }
-        // ⌥← is word motion on the Mac.
         assert_eq!(
             resolve(Profile::Gui(Platform::Mac), "M-left"),
             command(EditorCommand::MoveWordBackward)
         );
-        // Only a GUI has a Super key.
         for profile in PROFILES {
             assert_eq!(
                 profile.super_shortcuts(),
@@ -571,7 +505,6 @@ mod tests {
                 );
             }
 
-            // ESC ESC quits in the terminal face; two Escapes quit twice in a GUI.
             let (mut store, mut workspace, mut view, _) = editor(profile, "abc");
             for _ in 0..2 {
                 press(&mut store, &mut workspace, &mut view, escape());
@@ -579,8 +512,6 @@ mod tests {
             assert!(!view.chord_pending(), "{profile:?}");
             assert_eq!(view.prefix_hud, None, "{profile:?}");
 
-            // After a prefix, Escape is the sequence's next key in every
-            // face, and nothing binds it.
             press(
                 &mut store,
                 &mut workspace,
@@ -620,7 +551,6 @@ mod tests {
             assert_eq!(view.primary_selection().head, 11, "{profile:?}: Down moved");
             assert!(!view.chord_pending(), "{profile:?}");
             assert_eq!(view.prefix_hud, None, "{profile:?}");
-            // The next letter types: the ESC is gone.
             press(
                 &mut store,
                 &mut workspace,
@@ -636,8 +566,6 @@ mod tests {
                 "{profile:?}"
             );
 
-            // A key nothing reads still ends a pending ESC, and the face
-            // repaints; with no ESC pending (a GUI) the key is ignored.
             press(&mut store, &mut workspace, &mut view, escape());
             let reduction = press(
                 &mut store,
@@ -656,7 +584,6 @@ mod tests {
             );
             assert!(!view.chord_pending(), "{profile:?}");
 
-            // Committed text and a paste insert, and end the ESC.
             for input in [
                 EditorInput::Text("é".to_string()),
                 EditorInput::Paste("p".to_string()),
@@ -674,7 +601,6 @@ mod tests {
                 "{profile:?}"
             );
 
-            // C-x waits on through a key it cannot spell.
             press(
                 &mut store,
                 &mut workspace,
@@ -691,7 +617,6 @@ mod tests {
             assert!(view.chord_pending(), "{profile:?}");
         }
 
-        // A GUI's ⌘Z after Escape undoes, as it did when Escape only quit.
         let (mut store, mut workspace, mut view, document) =
             editor(Profile::Gui(Platform::Mac), "abc");
         press(
@@ -710,8 +635,6 @@ mod tests {
         assert_eq!(store.snapshot(document).unwrap().text.as_ref(), "abc");
         assert!(!view.chord_pending());
 
-        // In the terminal face C-u outlives the ESC: C-u ESC Down moves four
-        // lines, and the argument's HUD is back while it waits.
         let (mut store, mut workspace, mut view, _) = editor(Profile::Terminal, text);
         press(
             &mut store,
@@ -745,7 +668,6 @@ mod tests {
         let escape = key(Key::Named(NamedKey::Escape), Modifiers::empty());
         let c_x = key(Key::Character('x'), Modifiers::CTRL);
         for profile in PROFILES {
-            // Only the terminal face's ESC waits for a key.
             let befores = if profile.escape_is_meta() {
                 vec![&escape, &c_x]
             } else {
@@ -825,7 +747,6 @@ mod tests {
             key(Key::Character('b'), Modifiers::empty()),
         );
         assert_eq!(view.primary_selection().head, 11);
-        // The next b types: ESC armed one key only.
         press(
             &mut store,
             &mut workspace,
@@ -834,7 +755,6 @@ mod tests {
         );
         assert_eq!(view.primary_selection().head, 12);
 
-        // ESC C-g cancels the prefix.
         press(&mut store, &mut workspace, &mut view, escape());
         press(
             &mut store,
@@ -844,8 +764,6 @@ mod tests {
         );
         assert!(!view.chord_pending());
 
-        // C-u ESC x: M-x keeps the argument for the command it runs, so
-        // `forward-char` moves four.
         view.selections = vec![Selection::caret(0)];
         press(
             &mut store,
@@ -876,7 +794,6 @@ mod tests {
         );
         assert_eq!(view.primary_selection().head, 4);
 
-        // In an open minibuffer one Escape closes it, with nothing pending.
         press(
             &mut store,
             &mut workspace,
@@ -895,7 +812,6 @@ mod tests {
         let tab = || key(Key::Named(NamedKey::Tab), Modifiers::empty());
         let (mut store, mut workspace, mut view, document) =
             editor(Profile::Terminal, "ab\nx\n\tz");
-        // Column 2 → 4; column 0 → 4; after a tab (column 4) → 8.
         view.selections = vec![
             Selection::caret(2),
             Selection::caret(3),
@@ -915,7 +831,6 @@ mod tests {
                 Selection::caret(16)
             ]
         );
-        // One undo takes the whole indent back.
         workspace
             .execute(&mut store, &mut view, EditorCommand::Undo)
             .unwrap();
@@ -924,8 +839,6 @@ mod tests {
             "ab\nx\n\tz"
         );
 
-        // Two carets on one line both land on a tab stop: the second counts
-        // the indent the first put in before it.
         let (mut store, mut workspace, mut view, document) = editor(Profile::Terminal, "ab");
         view.selections = vec![Selection::caret(1), Selection::caret(2)];
         press(&mut store, &mut workspace, &mut view, tab());
@@ -935,14 +848,12 @@ mod tests {
             vec![Selection::caret(4), Selection::caret(8)]
         );
 
-        // A region keeps its text: the indent goes in at the head.
         let (mut store, mut workspace, mut view, document) = editor(Profile::Terminal, "one two");
         view.selections = vec![Selection { anchor: 0, head: 3 }];
         press(&mut store, &mut workspace, &mut view, tab());
         assert_eq!(store.snapshot(document).unwrap().text.as_ref(), "one  two");
         assert_eq!(view.selections, vec![Selection::caret(4)]);
 
-        // A modified TAB is the face's: declined, and the text is untouched.
         for mods in [Modifiers::SHIFT, Modifiers::CTRL, Modifiers::ALT] {
             let reduction = press(
                 &mut store,
@@ -953,7 +864,6 @@ mod tests {
             assert_eq!(reduction, Reduction::ignored(), "{mods:?}");
         }
         assert_eq!(store.snapshot(document).unwrap().text.as_ref(), "one  two");
-        // ... unless a sequence waits for it: C-x S-tab is the keymap's.
         press(
             &mut store,
             &mut workspace,
@@ -971,7 +881,6 @@ mod tests {
             [EditorEffect::Status("C-x S-tab is not bound".to_string())]
         );
 
-        // In M-x, TAB completes the query and never edits the document.
         press(
             &mut store,
             &mut workspace,
@@ -1026,7 +935,6 @@ mod tests {
         let (reduction, _, _) = save(Profile::Terminal, &[]);
         assert_eq!(reduction, Reduction::ignored());
 
-        // ⌘A selects the document; in the terminal face Super+a types nothing.
         let (mut store, mut workspace, mut view, document) =
             editor(Profile::Gui(Platform::Other), "abc");
         press(
@@ -1071,7 +979,6 @@ mod tests {
         );
         assert_eq!(store.snapshot(document).unwrap().text.as_ref(), "\"5");
 
-        // A paste into an open minibuffer stays in it, newline and all.
         workspace
             .execute(&mut store, &mut view, EditorCommand::GotoLine)
             .unwrap();
@@ -1104,8 +1011,6 @@ mod tests {
         assert_eq!(snapshot.text.as_ref(), "\"5one\ntwo");
         assert_eq!(snapshot.seq.0, before.0 + 1, "a paste is one transaction");
 
-        // A paste is never read as keys: one digit after C-u is text, and
-        // the argument ends with it.
         press(
             &mut store,
             &mut workspace,
@@ -1143,8 +1048,6 @@ mod tests {
             &mut view,
             key(Key::Named(NamedKey::PageDown), Modifiers::empty()),
         );
-        // A four-line view pages two lines (a screen less two of context),
-        // and the caret goes with it.
         assert_eq!(reduction, Reduction::reveal(Vec::new()));
         assert_eq!(view.primary_selection().head, "line\n".len() * 2);
         assert_eq!(view.viewport_anchor, "line\n".len() * 2);

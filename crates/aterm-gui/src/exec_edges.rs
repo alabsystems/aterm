@@ -1,33 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE KERNEL EDGES, the gather's half (card engine §3.3): the session's
-//! [`ProcWatch`] heard at each poll the PTY gather already makes, turned into
-//! foreground edges by [`FgCutter::proc_seen`].
-//!
-//! The watch joins the gather's polls (`aterm_pty::read_or_wake`, both parks of
-//! `drain_more_nonblocking`), so a batch with no process event costs no system
-//! call. When it is readable the gather drains it here, at the offset the poll
-//! left the batch at, with `tcgetpgrp` sampled once for the drain, and only for
-//! a drain that holds an `exec` (a fork's and an exit's need none). An `exec`
-//! is an edge only when it enters or leaves a card-relevant image (a drawer,
-//! or atpkg's shim launching one) in the group in front or in place of its
-//! leader; its image is read here, at the event, so the parse stage publishes
-//! it before any slice that may hold the image's bytes. Everything else (a
-//! `/usr/bin/true`, a compiler's `exec`s, a member's `exec`) folds into the
-//! sampled cut after one image read.
-//!
-//! At most one edge per batch, as before: an `exec` heard while the batch
-//! already carries one waits here and goes out after the batch as a byte-free
-//! edge (`GatherMsg::Edge`). A sampled edge first watches its new group's
-//! leader ([`ProcWatch::follow`]) and hears what is queued: an `exec` of that
-//! leader is this edge's own, read with it, and moves where the new holder's
-//! run begins to the end of the batch ([`ExecEdges::absorb`]), since its bytes
-//! may follow that `exec` anywhere after the cut.
-//!
-//! Every drain that holds an event (a fork, an `exec`, an exit) also tells the
-//! stuck engine's kernel edge (`crate::vitals_host::ProcEdge`): a parked
-//! engine looks again when a job may have started or ended, output or none.
+//! Kernel process-event edge gatherer ([`ProcWatch`], [`ProcWatch::follow`],
+//! [`FgCutter::proc_seen`], [`ExecEdges::absorb`]).
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -37,11 +12,7 @@ use aterm_uds::procwatch::{NoWatch, ProcEvent, ProcWatch};
 use crate::foreground_handback::{FgCutter, ProcSeen};
 use crate::holder_image::{HolderImage, ReadImage};
 
-/// `SessionFactory::proc_watch` as shipped: the session's kqueue watch
-/// ([`ProcWatch::open`]), counting a reader on macOS that wanted one and got
-/// none for want of a kqueue (`EMFILE`; `metrics`' `procwatch_fallbacks`): it
-/// runs the byte-driven arm in full. A gone shell and a platform with no
-/// `exec` event are no fallback.
+/// `SessionFactory::proc_watch` as shipped: the session's kqueue watch ([`ProcWatch::open`]).
 pub(crate) fn shipping_watch(shell: i32) -> Option<ProcWatch> {
     match ProcWatch::open(shell) {
         Ok(watch) => Some(watch),
@@ -53,11 +24,7 @@ pub(crate) fn shipping_watch(shell: i32) -> Option<ProcWatch> {
     }
 }
 
-/// Whether the shipping factory makes process watches: always, but in a build
-/// that compiles dev seams started with `ATERM_DEV_NO_PROCWATCH=1`
-/// ([`aterm_types::dev_seam!`]), read once at startup, which measures the
-/// readers without one in the same binary (§8's fork loop, the watch on
-/// against off).
+/// Whether the shipping factory makes process watches ([`aterm_types::dev_seam!`]).
 pub(crate) fn watch_wanted() -> bool {
     !aterm_types::dev_seam!("ATERM_DEV_NO_PROCWATCH").is_some_and(|v| v == "1")
 }
@@ -70,33 +37,21 @@ pub(crate) struct ExecEdges {
     events: Vec<ProcEvent>,
     /// `exec`s heard while the batch carried its edge, oldest first.
     deferred: VecDeque<ProcEvent>,
-    /// The image this gather last read for an edge, and the group it was read
-    /// for: what an `exec` leaves, and what a late `exec` is compared with.
+    /// The image this gather last read for an edge, and the group it was read for.
     held: Option<Arc<HolderImage>>,
     /// The image the batch's kernel edge was read with, until the batch goes.
     image: Option<Arc<HolderImage>>,
-    /// The image read at the last `exec` that folded (no edge), and its group:
-    /// the sampled edge to that group, with no `exec` of its leader heard
-    /// since, gives it to the read as the group's last
-    /// ([`ExecEdges::read_edge`]), which keeps it re-stamped when the leader's
-    /// start and executable are unchanged (a fork loop's command is read once,
-    /// not twice).
+    /// Image and group of the last folded `exec` ([`ExecEdges::read_edge`]).
     folded: Option<Arc<HolderImage>>,
     read: ReadImage,
     /// The watch's overflow count last booked in `metrics`.
     overflow: u64,
-    /// The stuck engine's kernel edge, told of every drain that held an
-    /// event (a fork, an `exec`, an exit: a job may have started or ended):
-    /// the process's [`crate::vitals_host::PROC_EDGE`]; a test's own.
+    /// Stuck-engine edge notified on process events ([`crate::vitals_host::PROC_EDGE`]).
     proc_edge: &'static crate::vitals_host::ProcEdge,
 }
 
 impl ExecEdges {
-    /// The gather's half for `watch`, reading images with `read`
-    /// (`SessionFactory::edge_image`). `holder` is the cutter's seed: watched
-    /// from the start when it is not the shell (an adopted or restored job the
-    /// watch did not see forked is still adopted by `ProcWatch::new`; one past
-    /// the cap is followed here).
+    /// The gather's half for `watch`, reading images with `read` (`SessionFactory::edge_image`).
     pub(crate) fn new(mut watch: ProcWatch, read: ReadImage, holder: i32) -> Self {
         if holder > 0 && holder != watch.shell() {
             watch.follow(holder);
@@ -119,11 +74,7 @@ impl ExecEdges {
         self.watch.fd()
     }
 
-    /// The watch was readable after `filled` bytes of this batch (a park it
-    /// ended, or `0`: before the batch's first byte), and `fg` reads
-    /// `tcgetpgrp(master)` (at most once, after the drain, for its first
-    /// `exec`). Drain it into `cutter`; `true` delivers the batch now (it
-    /// carries an edge).
+    /// Drain readable process events after `filled` bytes into `cutter`.
     pub(crate) fn heard(
         &mut self,
         cutter: &mut FgCutter,
@@ -147,9 +98,7 @@ impl ExecEdges {
         deliver
     }
 
-    /// A drain that held an event tells the stuck engine's kernel edge
-    /// ([`crate::vitals_host::ProcEdge`]): one atomic swap, and one wake to
-    /// the loop only while it is armed.
+    /// Notify the stuck engine's kernel edge ([`crate::vitals_host::ProcEdge`]).
     fn tell_vitals(&self, events: &[ProcEvent]) {
         if !events.is_empty() {
             self.proc_edge.heard();
@@ -161,9 +110,7 @@ impl ExecEdges {
         !self.deferred.is_empty()
     }
 
-    /// Between batches: feed the waiting `exec`s to a cutter just begun, until
-    /// one is an edge (`true`; the rest keep waiting) or none is left. `fg` as
-    /// for [`ExecEdges::heard`].
+    /// Feed waiting `exec`s between batches until one cuts an edge ([`ExecEdges::heard`]).
     pub(crate) fn replay(&mut self, cutter: &mut FgCutter, fg: impl FnMut() -> i32) -> bool {
         let mut fg = FgOnce::new(fg);
         while let Some(ev) = self.deferred.pop_front() {
@@ -185,8 +132,6 @@ impl ExecEdges {
         let ProcEvent::Exec { pid, pgid, late } = ev else {
             return cutter.carries_edge();
         };
-        // A leader's `exec` retires the image its group folded with, edge or
-        // not: the leader is no longer that image.
         if self.folded.as_ref().is_some_and(|f| f.pgid == pid) {
             self.folded = None;
         }
@@ -205,16 +150,7 @@ impl ExecEdges {
         edge
     }
 
-    /// Read `to`'s image now and say whether an edge from `from` to it is the
-    /// card's business: it is a drawer or a launcher, or the image it leaves
-    /// is (or is unknown to this gather: fail toward cutting). A `late` event,
-    /// which may restate an `exec` already read, is an edge only where the
-    /// image differs from the one held.
-    ///
-    /// The read is fresh (no last image to keep): the kernel says the image
-    /// changed, and a kept read cannot see an `exec` of the same executable
-    /// (atpkg's `sh` reroute stub `exec`ing its `sh` twin). One that folds is
-    /// kept for the sampled edge's read ([`ExecEdges::read_edge`]).
+    /// Read `to`'s image and check for a card edge ([`ExecEdges::read_edge`]).
     fn relevant(&mut self, from: i32, to: i32, late: bool) -> bool {
         let image = Arc::new((self.read)(to, None));
         let left = self
@@ -242,10 +178,7 @@ impl ExecEdges {
         self.image.take()
     }
 
-    /// A sampled edge to `to` was found: watch its leader, then hear what is
-    /// queued. `true` when that includes an `exec` of the leader: the image
-    /// read next names it, and its bytes may lie anywhere after the cut. Every
-    /// other `exec` waits for after the batch.
+    /// A sampled edge to `to` was found: watch its leader, then hear what is queued.
     pub(crate) fn absorb(&mut self, to: i32) -> bool {
         let start = std::time::Instant::now();
         self.watch.follow(to);
@@ -267,12 +200,7 @@ impl ExecEdges {
         absorbed
     }
 
-    /// A sampled edge's new holder's image, held. Read afresh (as A1 reads
-    /// every sampled edge) when `absorbed` (its leader's `exec` came with the
-    /// edge); otherwise given the image the folded `exec` of that group read,
-    /// if any, which the read keeps when the leader's start and executable
-    /// are unchanged: every `exec` of the leader since was heard (it is
-    /// registered from its fork, or followed), and would have replaced it.
+    /// A sampled edge's new holder's image, held.
     pub(crate) fn read_edge(&mut self, to: i32, absorbed: bool) -> Arc<HolderImage> {
         let folded = self.folded.take().filter(|f| !absorbed && f.pgid == to);
         let image = Arc::new((self.read)(to, folded.as_deref()));
@@ -289,8 +217,7 @@ impl ExecEdges {
     }
 }
 
-/// One drain's `tcgetpgrp(master)`: read when its first `exec` needs it, and
-/// then the same for the rest of the drain.
+/// One drain's `tcgetpgrp(master)`.
 struct FgOnce<F> {
     probe: F,
     read: Option<i32>,

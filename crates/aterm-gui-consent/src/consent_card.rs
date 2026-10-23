@@ -24,6 +24,7 @@ pub const MAX_RECORD_BYTES: usize = 160;
 pub const WATCH_FOR: Duration = Duration::from_secs(30 * 60);
 
 /// How long the launch one-shot waits for its worker's verdict before asking
+/// again.
 const DECIDE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How many verdicts the one-shot will wait for before giving up for the life of the process.
@@ -221,6 +222,9 @@ pub fn read_marker(config_path: Option<&Path>) -> Option<Marker> {
 }
 
 /// Every marker and record write in this process holds this: the owner's
+/// answer and an `opened` can be recorded from two workers at once, and
+/// `record_marker`'s keep-`not-now` check (and the record's read-merge-write)
+/// must see the other's write, not race it.
 static MARKER_WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Record `marker`.
@@ -412,6 +416,7 @@ pub fn verified_here(
 }
 
 /// The stamp's next text: `current`'s lines with `key` added (none twice), the newest
+/// [`MAX_VERIFIED_HOSTS`] kept.
 fn with_verified_host(current: &str, key: &str) -> Option<String> {
     let mut hosts: Vec<&str> = current
         .lines()
@@ -454,7 +459,7 @@ pub fn write_verified_host(
     }
 }
 
-/// This process's start, in unix seconds. Set by [`note_process_start`] at the
+/// This process's start, in unix seconds.
 static PROCESS_STARTED_AT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
 /// The current unix time in seconds (`0` if the clock is before the epoch).
@@ -807,14 +812,18 @@ pub enum CardPhase {
 pub struct CardState {
     phase: CardPhase,
     /// When the offer became due — the anchor of a due card's wait on a
+    /// pending probe.
     due_since: Option<Instant>,
     /// When the question was first raised in this episode.
     first_raised: Option<Instant>,
     /// The owner pressed something on the row (Open Settings, or Details).
     owner_acted: bool,
     /// How many times the one-shot has asked its worker for a verdict
+    /// ([`DECIDE_ATTEMPTS`]).
     decide_attempts: u8,
     /// A need arrived while the card was busy (launch check under way, or a
+    /// question already raised): it is re-evaluated the moment the phase
+    /// settles ([`CardState::take_pending_need`]).
     pending_need: bool,
 }
 
@@ -1012,6 +1021,8 @@ mod tests {
     use aterm_containment::consent::{DrClass, FdaState, Folder};
 
     /// The stamp is a set: each Mac that verified the grant stays named whatever another
+    /// sharing the directory writes later, none twice, the newest sixteen kept; a Mac
+    /// not named reads `Some(false)`, and no stamp or no UUID reads `None`.
     #[test]
     fn the_verified_stamp_keeps_every_mac_that_verified() {
         use super::{MAX_VERIFIED_HOSTS, verified_here, with_verified_host, write_verified_host};
@@ -1075,6 +1086,8 @@ mod tests {
     }
 
     /// The two bounded waiting phases share one expiry contract: the clock step
+    /// is the host reaching the phase's absolute deadline, which a pending
+    /// observation cannot extend.
     fn bounded_wait_model() -> aterm_spec::derive::Model {
         aterm_spec::ty_model! {
             MacosAccessCardBoundedWait {
@@ -1101,6 +1114,8 @@ mod tests {
     }
 
     /// Drives the real due and watching states to just before and exactly at
+    /// their scheduled expiry; expiry settles without further pending
+    /// observations.
     #[test]
     fn bounded_wait_conforms_at_each_real_phase_deadline() {
         let now = Instant::now();
@@ -1160,6 +1175,7 @@ mod tests {
     }
 
     /// The live settings guard over the lifecycle phases: disabling a visible
+    /// or queued card retires it for good.
     fn current_policy_model() -> aterm_spec::derive::Model {
         aterm_spec::ty_model! {
             MacosAccessCardCurrentPolicy {
@@ -1207,6 +1223,7 @@ mod tests {
     }
 
     /// Drive all five phases, then disable either or both settings; a late verdict or
+    /// re-enabling cannot resurrect a settled card.
     #[test]
     fn current_policy_conforms_in_every_real_phase() {
         fn phase_value(state: CardState) -> i64 {
@@ -1320,6 +1337,7 @@ mod tests {
     }
 
     /// A verified grant reading off inside [`LAUNCH_SETTLE`] neither asks nor marks the grant
+    /// regressed; after it, the same facts do.
     #[test]
     fn a_verified_grant_reading_off_in_a_fresh_process_is_settling_not_regressed() {
         let verified = AccessRecord {
@@ -1350,6 +1368,7 @@ mod tests {
     }
 
     /// A prompt while the probe reads granted asks nothing and is logged as an anomaly; aterm's
+    /// own refused read is not that anomaly.
     #[test]
     fn a_prompt_while_the_probe_reads_granted_logs_an_anomaly_and_asks_nothing() {
         let granted = NeedFacts {
@@ -1373,6 +1392,7 @@ mod tests {
     }
 
     /// `state=opened` lapses with the rule it reports: past `OWNER_ACTED_HOLD`
+    /// the card asks again, so the token must not say nothing more is coming.
     #[test]
     fn the_opened_state_lapses_with_the_owner_acted_hold() {
         let record = AccessRecord {
@@ -1530,6 +1550,7 @@ mod tests {
     }
 
     /// A grant verified earlier and read as off now opens a new epoch: the ask is allowed at once
+    /// and its words say so, and once asked it is `RecentlyAsked` again.
     #[test]
     fn an_ask_after_a_verified_grant_reads_regressed_and_opens_a_new_epoch() {
         let facts = need_facts(app_data_prompt());
@@ -1656,6 +1677,7 @@ mod tests {
     }
 
     /// *Open Settings*, the switch on, `Later` on Apple's sheet: the older window still reads
+    /// `denied` and, past the renewal, a program of it prompts.
     #[test]
     fn an_owner_who_opened_settings_is_not_asked_again_by_an_older_window() {
         let t = 10_000_000_u64;
@@ -1719,6 +1741,8 @@ mod tests {
     }
 
     /// The marker: path beside `aterm.toml`, one token, round-trips through the shared marker
+    /// rules, tolerates a hand edit's trailing newline, and `clear_opened` removes only an
+    /// `opened` marker.
     #[test]
     fn the_marker_round_trips_beside_the_config() {
         let dir = std::env::temp_dir().join(format!(
@@ -1775,6 +1799,9 @@ mod tests {
     }
 
     /// The card's answer, the access record and the verified-host line are only
+    /// ordered ahead of their renames (aterm-durable's counting seam): each one lost
+    /// brings its question back, or is merged again, and nothing off this device
+    /// waits on it.
     #[test]
     fn the_cards_records_are_only_ordered() {
         use aterm_durable::{Flush, seam::Recording};
@@ -1827,7 +1854,7 @@ mod tests {
         assert!(eperm.event_line().contains("tab 2"));
     }
 
-    /// One question per epoch, however many process generations an update brings. The only
+    /// One question per epoch, however many process generations an update brings.
     fn asked_once_model() -> aterm_spec::derive::Model {
         aterm_spec::ty_model! {
             AccessCardAskedOnce {
@@ -1869,6 +1896,8 @@ mod tests {
     }
 
     /// The real rules through simulated restarts: the record file is the only memory between
+    /// generations, the model's actions fire in lockstep, and its variables are projected from
+    /// the real state.
     struct Epochs {
         dir: std::path::PathBuf,
         config: std::path::PathBuf,
@@ -1884,6 +1913,7 @@ mod tests {
         /// Negative control: an ask that ignores the window's age.
         ignores_window_age: bool,
         /// A negative control: the run departs from the model, so its guards are not asserted
+        /// (its invariants are the check).
         lenient: bool,
     }
 
@@ -1969,6 +1999,7 @@ mod tests {
         }
 
         /// Do the real thing the model action stands for; `Err` if a decision
+        /// disagrees with the model's guard.
         fn apply(
             &mut self,
             model: &aterm_spec::derive::Model,
@@ -2072,6 +2103,7 @@ mod tests {
     }
 
     /// The real `decide_need` and record persistence follow the model action by action across
+    /// process generations.
     #[test]
     fn asked_once_conforms_across_process_generations() {
         let model = asked_once_model();
@@ -2225,6 +2257,7 @@ mod tests {
     }
 
     /// `on_need` re-arms only a settled card; a need that arrives while it is busy is kept and
+    /// given up when it settles.
     #[test]
     fn on_need_re_arms_a_settled_card_and_reoffer_no_longer_exists() {
         let t0 = Instant::now();
@@ -2272,6 +2305,7 @@ mod tests {
     }
 
     /// A verdict that never arrives lapses and is asked for again, given up on only after
+    /// [`DECIDE_ATTEMPTS`].
     #[test]
     fn a_swallowed_verdict_is_asked_for_again_and_then_given_up_on() {
         let t0 = Instant::now();

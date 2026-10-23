@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// The accounting handle owns the wait, including a nonblocking look while a
+/// pipe handshake keeps the child alive, and caches status and usage together.
 #[cfg(all(
     target_pointer_width = "64",
     any(target_vendor = "apple", target_os = "linux")
@@ -118,6 +119,10 @@ fn write_mode(path: &Path, body: &str, mode: u32) {
 }
 
 /// **EVERY STDIO MODE ROUND-TRIPS.** A piped stdin into a piped stdout;
+/// `output()`'s defaults (stdin `/dev/null`, both outputs captured); a null
+/// stdout; descriptors handed as stdin (an `io::pipe` end), stdout and stderr
+/// (files); `status()` carrying the exit code; and two floods at once, which
+/// stall unless both pipes are read together.
 #[test]
 fn every_stdio_mode_round_trips() {
     let mut child = command("/bin/cat")
@@ -196,6 +201,7 @@ fn every_stdio_mode_round_trips() {
 }
 
 /// A descriptor handed at a number a file action may not name (Darwin's libc
+/// refuses 10 240 and up) still reaches its slot: the spawn places a copy.
 #[test]
 fn a_descriptor_at_any_number_reaches_its_slot() {
     let floor: RawFd = 10_300;
@@ -248,6 +254,9 @@ fn staged_inherit() {
 }
 
 /// **AN INHERITED STDIO IS THIS PROCESS'S, AND A CLOSED ONE IS `/dev/null`.** A
+/// child whose stdout is inherited writes into this process's stdout; one
+/// whose inherited stderr this process has CLOSED gets `/dev/null` there, so
+/// its writes succeed and its first `open` does not land on 2.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn an_inherited_stdio_reaches_the_child_and_a_closed_one_is_null() {
@@ -333,6 +342,11 @@ fn staged_closed_stdio() {
 }
 
 /// **A PIPE END THIS PROCESS KEEPS NEVER PASSES FOR ITS CLOSED STDIO.** In a
+/// process that has closed its stdin and stdout, `io::pipe()` hands out 0
+/// and 1 — so this process's end of a child's pipe lands there and, left
+/// there, reads to the spawn as this process's own stdio, which an inherited
+/// slot hands the child (a child given the write end of its own stdin as its
+/// stdout waits for its stdin's end forever).
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_pipe_end_this_process_keeps_never_passes_for_its_closed_stdio() {
@@ -411,6 +425,7 @@ macro_rules! configured {
 }
 
 /// What a run came to: its code and both outputs, or the error's kind and
+/// errno.
 type Outcome = Result<(Option<i32>, String, String), (io::ErrorKind, Option<i32>)>;
 
 fn outcome(run: io::Result<std::process::Output>) -> Outcome {
@@ -425,6 +440,10 @@ fn outcome(run: io::Result<std::process::Output>) -> Outcome {
 }
 
 /// **`std`'S RULES, ROW FOR ROW.** Every row runs through
+/// `std::process::Command` and through [`command`] with the same program,
+/// arguments, environment edits and working directory, and must come to the
+/// same thing: the same exit code and output, or the same error — kind and
+/// errno.
 #[test]
 fn programs_arguments_environments_and_directories_match_std() {
     let scratch = Scratch::new("parity");
@@ -690,6 +709,9 @@ fn the_accessors_answer_what_the_command_was_given() {
 }
 
 /// **`arg0` IS THE CHILD'S `argv[0]`, AND ONLY THAT.** The program named is
+/// still what is searched for and run (a bare `sh` on the `PATH`), the child
+/// reads the `arg0` given (`sh -c` with no operand sets `$0` from it), and
+/// the accessors and `Debug` answer as `std`'s do.
 #[test]
 fn arg0_is_the_childs_argv_zero_and_only_that() {
     use std::os::unix::process::CommandExt as _;
@@ -723,6 +745,8 @@ fn arg0_is_the_childs_argv_zero_and_only_that() {
 }
 
 /// The shell a test runs: `held` or `clear` for `fd`, then ` out` on stdout,
+/// `err` on stderr, exit 3 — so one run shows the inheritance, the stdout
+/// pipe, the stderr pipe and the status at once.
 fn held_out_err(fd: RawFd) -> [String; 2] {
     [
         "-c".to_string(),
@@ -734,6 +758,12 @@ fn held_out_err(fd: RawFd) -> [String; 2] {
 }
 
 /// **A CHILD HOLDS ITS STDIO AND NOTHING ELSE, AND ITS PIPES STILL WORK.** An
+/// unflagged descriptor reaches a deliberately leaky raw spawn (the control,
+/// [`test_support::leaky_output`]: not `std`'s `Command`, whose child Trust's
+/// std hands nothing above stdio) and none of the three paths through
+/// [`command`] — `spawn` with a piped stdout, `output`
+/// (both pipes captured, the status kept) and `status` — nor a `std` command
+/// given [`InheritNothing::inherit_nothing`].
 #[test]
 fn a_command_child_holds_its_stdio_and_its_pipes_and_nothing_else() {
     let held = unflagged_at_or_above(64);
@@ -789,12 +819,13 @@ fn a_command_child_holds_its_stdio_and_its_pipes_and_nothing_else() {
 }
 
 /// How many spawns the pair race runs through [`command`], and through a
+/// deliberately leaky raw spawn for its control.
 #[cfg(target_vendor = "apple")]
 const PAIR_RACE_SPAWNS: usize = 400;
 #[cfg(target_vendor = "apple")]
 const PAIR_RACE_CONTROL_SPAWNS: usize = 200;
 
-/// The staged half of the pair race. A thread makes `UnixStream::pair()`s as
+/// The staged half of the pair race.
 #[cfg(target_vendor = "apple")]
 fn staged_pair_race() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -842,6 +873,8 @@ fn staged_pair_race() {
 }
 
 /// **ZERO LEAKS UNDER A RACING `UnixStream::pair()`, OVER 400 SPAWNS.** A leaky
+/// spawn racing another thread's socketpair carries a pair end into some of
+/// its children (the control); [`command`] carries it into none.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn no_pair_end_reaches_a_command_child_while_another_thread_makes_pairs() {
@@ -897,6 +930,7 @@ fn sigset_of(signals: &[i32]) -> SigSet {
 }
 
 /// The stage a mask probe runs as: this test binary, printing the signal mask
+/// it was started with ([`signal_mask_probe_stage`]).
 const MASK_PROBE: &str = "mask-probe";
 
 /// `MASK=` and the mask a probe printed, from `out`'s stdout.
@@ -925,6 +959,7 @@ macro_rules! mask_probe {
 }
 
 /// THE MASK PROBE, when [`STAGE_ENV`] names it (nothing otherwise): print the
+/// signal mask this process was started with.
 #[test]
 fn signal_mask_probe_stage() {
     if std::env::var(STAGE_ENV).as_deref() != Ok(MASK_PROBE) {
@@ -1030,6 +1065,10 @@ fn staged_signals() {
 }
 
 /// **NO SIGNAL STARTS BLOCKED; THE DISPOSITIONS ARE `std`'S.** In a process
+/// that ignores SIGUSR2 and a thread that blocks SIGUSR1 and SIGTERM, a
+/// [`command`] child starts with an empty mask (`ps` reads it; a `std` child,
+/// the control, copies the thread's) and dies of SIGTERM, has SIGPIPE at its
+/// default and SIGUSR2 still ignored — what `std` gives.
 #[test]
 fn a_child_starts_with_no_signal_blocked_and_std_s_dispositions() {
     const NAME: &str =
@@ -1044,6 +1083,10 @@ fn a_child_starts_with_no_signal_blocked_and_std_s_dispositions() {
 }
 
 /// **THE HANDLE REAPS ONCE AND KILLS ONLY ITS OWN.** A second `wait` answers
+/// from the first, `try_wait` after it too, and `kill` after the reap signals
+/// nobody and answers `Ok`; a running child is running for `try_wait`, `kill`
+/// ends it and `wait` reports the signal; `wait` closes a piped stdin first,
+/// so a child reading it to its end is not left waiting.
 #[test]
 fn the_child_handle_reaps_once_and_kills_only_its_own() {
     let mut done = command("/bin/sh")
@@ -1104,6 +1147,8 @@ fn until_zombie(pid: u32) {
 }
 
 /// **A DROPPED HANDLE LEAVES NO ZOMBIE.** A child that has exited when its
+/// handle is dropped is collected by the drop; the control — a `std` child
+/// dropped the same way — stays a zombie until someone waits for it.
 #[test]
 fn a_dropped_handle_of_an_exited_child_leaves_no_zombie() {
     let ours = command("/usr/bin/true").spawn().expect("spawn");
@@ -1130,6 +1175,8 @@ fn a_dropped_handle_of_an_exited_child_leaves_no_zombie() {
 }
 
 /// **A CHILD STARTED SUSPENDED RUNS ONLY ONCE RESUMED.** `spawn` returns with the
+/// child exec'd and stopped (`ps`: `T`) before its first instruction, so the shell has
+/// not left its marker; [`Child::resume`] runs it to a clean exit that leaves it.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_child_started_suspended_runs_only_once_resumed() {
@@ -1175,6 +1222,8 @@ fn a_child_started_suspended_runs_only_once_resumed() {
 }
 
 /// **A HELD CHILD DIES UNRUN WITH ITS HOLDER, EVEN ONE THAT IGNORES `SIGHUP`.** The
+/// staged holder ignores `SIGHUP` (as `nohup` or a lane that sets `SIG_IGN` would), starts
+/// a shell stopped in a group of its own, and exits without resuming or killing it.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_held_child_dies_unrun_with_its_holder_even_one_ignoring_hangups() {
@@ -1213,6 +1262,9 @@ fn a_held_child_dies_unrun_with_its_holder_even_one_ignoring_hangups() {
 }
 
 /// **A SUSPENDED START IT CANNOT KEEP STARTS NOTHING.** Beside `exec` it answers
+/// `Unsupported` before trying (the program does not exist, which a tried `exec`
+/// answers `NotFound`, this process untouched either way); off Darwin every spawn
+/// does, and the child never runs.
 #[test]
 fn a_suspended_start_it_cannot_keep_starts_nothing() {
     let err = command("/nonexistent/spawnfd-suspended-exec")
@@ -1239,6 +1291,8 @@ fn a_suspended_start_it_cannot_keep_starts_nothing() {
 }
 
 /// [`Command::process_group`] and [`Command::setsid`] are the spawn's own:
+/// the child leads a group of its own, or a session (and its group) of its
+/// own, read back with `getpgid` and `getsid`.
 #[test]
 fn a_child_leads_the_group_or_the_session_it_was_given() {
     unsafe extern "C" {
@@ -1311,6 +1365,7 @@ fn a_child_leads_the_group_or_the_session_it_was_given() {
 }
 
 /// `responsibility_get_pid_responsible_for_pid(pid)`: the process macOS
+/// charges `pid`'s TCC and syspolicyd questions to.
 #[cfg(target_vendor = "apple")]
 fn responsible_for(pid: u32) -> i32 {
     use core::ffi::{c_char, c_void};
@@ -1339,6 +1394,12 @@ fn responsible_for(pid: u32) -> i32 {
 }
 
 /// **A DISCLAIMED CHILD IS ITS OWN RESPONSIBLE PROCESS.** This test binary,
+/// started through [`command`] with [`Command::disclaim_responsibility`], is a
+/// STAGE that asks macOS who is responsible for whom: itself (its own pid);
+/// a PLAIN `/bin/sleep` it starts (the stage's pid — the negative control,
+/// true only if the stage really was disclaimed); and a DISCLAIMED
+/// `/bin/sleep` it starts (that child's own pid, where its plain sibling
+/// answered the stage's).
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_disclaimed_child_is_its_own_responsible_process() {
@@ -1402,6 +1463,10 @@ fn a_disclaimed_child_is_its_own_responsible_process() {
 }
 
 /// **A DISCLAIM THE OS CANNOT HONOUR STARTS NOTHING.** Asked to disclaim
+/// through an SPI no image exports (the stand-in for a macOS without it, and
+/// for every other OS), `spawn`, `output` and `status` each answer
+/// `Unsupported` and the child — a shell that would leave a marker — never
+/// runs.
 #[test]
 fn a_disclaim_the_os_cannot_honour_starts_nothing() {
     const ABSENT: &core::ffi::CStr = c"responsibility_spawnattrs_setdisclaim_absent";
@@ -1437,6 +1502,7 @@ fn a_disclaim_the_os_cannot_honour_starts_nothing() {
 }
 
 /// **A DISCLAIM IS DARWIN'S.** Elsewhere `spawn`, `output` and `status` answer
+/// `Unsupported` and start nothing (`exec`: the staged test below).
 #[cfg(not(target_vendor = "apple"))]
 #[test]
 fn a_disclaim_is_unsupported_off_darwin() {
@@ -1453,6 +1519,8 @@ fn a_disclaim_is_unsupported_off_darwin() {
 }
 
 /// The staged half of [`a_command_exec_replaces_this_process_holding_nothing`]:
+/// hold an unflagged descriptor; fail one `exec` (Darwin: the table is left as
+/// it was); then BECOME `/bin/sh` through [`command`].
 fn staged_exec() {
     let held = unflagged_at_or_above(64);
     let fd = held.as_raw_fd();
@@ -1477,6 +1545,9 @@ fn staged_exec() {
 }
 
 /// **`exec` HANDS THE NEW IMAGE NOTHING ABOVE STDIO.** A process that replaces
+/// itself with [`command`]'s program hands that program nothing of its own
+/// above stdio — and, on Darwin, a failed `exec` leaves its own table as it
+/// was (`POSIX_SPAWN_SETEXEC`: no strip ran in it).
 #[test]
 fn a_command_exec_replaces_this_process_holding_nothing() {
     const NAME: &str =
@@ -1490,6 +1561,9 @@ fn a_command_exec_replaces_this_process_holding_nothing() {
 }
 
 /// **AN `exec` THAT MUST DISCLAIM IS REFUSED.** `POSIX_SPAWN_SETEXEC` with the
+/// disclaim attribute is unmeasured, so [`Command::exec`] beside
+/// [`Command::disclaim_responsibility`] answers `Unsupported` before trying —
+/// on every OS.
 #[test]
 fn an_exec_that_must_disclaim_is_refused() {
     const NAME: &str = "spawnfd::command_tests::an_exec_that_must_disclaim_is_refused";
@@ -1507,6 +1581,9 @@ fn an_exec_that_must_disclaim_is_refused() {
 }
 
 /// **AN `exec` HANDS OVER A CLOSE-ON-EXEC SOURCE AS `spawn` DOES.** Darwin's
+/// `POSIX_SPAWN_SETEXEC` closes this process's close-on-exec descriptors
+/// before it runs the file actions, so a `dup2` or an inherit FROM one answers
+/// `EBADF` — and every descriptor `std` opens is close-on-exec.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn an_exec_hands_over_a_close_on_exec_source() {
@@ -1543,6 +1620,10 @@ fn an_exec_hands_over_a_close_on_exec_source() {
 }
 
 /// A program still open for writing is tried again, not refused at once: Linux
+/// refuses its exec (`ETXTBSY`) while anything holds it open for writing — a child another
+/// thread forked while it was being written holds that descriptor until its own exec — and
+/// the spawn tries again after the pause between tries, here the moment this test's writer
+/// lets go.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_spawn_refused_as_text_busy_starts_once_the_writer_lets_go() {

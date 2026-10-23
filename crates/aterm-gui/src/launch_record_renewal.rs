@@ -2,35 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Renewing a stale LaunchServices record, an inherent-impl split of `App`.
-//!
-//! A process LaunchServices launched that then `execve`s in place keeps a stale record
-//! for life: LaunchServices lists the app with no pid (`-1`), so System Settings' Quit &
-//! Reopen misses it, its menu-bar item is never placed, and TCC attributes it to the
-//! bundle it first saw ([`crate::app_launch_successor::OwnLaunchRecord::Stale`]). A
-//! running process recovers only through a fresh launch, and a fixed build cannot stop
-//! every way a process ends up stale (an older build's successor that swapped and
-//! re-exec'd itself, a window's left-stage escape, causes not yet measured). So a stale
-//! process renews its own record: a same-image seamless handoff
-//! ([`crate::app_update_handoff::SameImageHandoff::RenewLaunchRecord`]) to a fresh
-//! LaunchServices launch of this very build, whose record is sound (measured
-//! 2026-10-20: a stale parent's `openApplicationAtURL` successor is named with its pid).
-//!
-//! * WHEN ([`decide`]): only with `[update] auto_apply` on (nothing replaces the process
-//!   unasked otherwise, so switching it off ends the renewal, an attempt in flight
-//!   included), the overlap handoff available, a clean commit stamp, no update staged or
-//!   in flight (the update lane's own handoff renews the record as it lands), the
-//!   installed bundle this build, and a live terminal session to hand over. A renewal's
-//!   successor never renews again.
-//! * HOW: the automatic update lane's ladder and gates, read-only
-//!   ([`crate::native_update_auto_intent::apply_phase`],
-//!   [`crate::native_update_auto_intent::automatic_park_refusal`], the launched lane's
-//!   park gate), with the renewal's own anchor, capped below `Land` so it never parks over
-//!   typing. The LaunchServices (out-of-band) lane only: the fork lane's successor keeps
-//!   this process's launchd job, which ends with it, and the cold lane execs in place,
-//!   which is what leaves the record stale.
-//! * BOUND: [`ATTEMPTS`] counted attempts per process, spaced by [`SPACING`]; an activity
-//!   deferral or a held close preflight costs none. Exhausted or ruled out, the digest's
-//!   entry gives the person the step.
 
 use std::time::{Duration, Instant};
 
@@ -38,14 +9,10 @@ use crate::app_launch_successor::OwnLaunchRecord;
 use crate::native_update_auto_intent::ApplyPhase;
 use crate::native_updater_service::ApplyMode;
 
-/// The lineage marker a renewal's successor is launched with: the parent's pid. Taken at
-/// startup (`main_entry`), so no shell inherits it. Lineage, not authority: a value only
-/// stops a renewal, and none grants one. Not an `ATERM_HANDOFF_*` name, which the census
-/// admits only as a handoff authority name.
+/// The lineage marker a renewal's successor is launched with: the parent's pid.
 pub(crate) const RENEWED_FROM_ENV: &str = "ATERM_LAUNCH_RECORD_RENEWED_FROM";
 
-/// Counted renewal attempts per process. Every one that launched a successor costs a
-/// launch, so this bounds the launches a terminal that never pauses can cause.
+/// Counted renewal attempts per process.
 pub(crate) const ATTEMPTS: u8 = 3;
 
 /// The wait before the attempt after the `k`-th counted one (`SPACING[k - 1]`).
@@ -58,13 +25,10 @@ const WORK_REPOLL: Duration = Duration::from_secs(2);
 
 /// How soon a renewal the person's live state holds looks again: unsaved native work, or
 /// no live terminal session to hand over (every pane's command exited under `--hold`, or
-/// only documents and Settings open). Each changes only when the person acts, so a short
-/// repoll would wake an idle aterm for nothing; the automatic lane re-checks the same
-/// terminal wait on its 60 s block cooldown. Never a failed attempt.
+/// only documents and Settings open).
 const PERSON_STATE_REPOLL: Duration = Duration::from_secs(60);
 
-/// The facts [`decide`] reads, every one a memory read on the main thread: no filesystem
-/// probe and no codesign (the worker proves the installed bundle before it launches).
+/// The facts [`decide`] reads, every one a memory read on the main thread: no filesystem probe and no codesign (the worker proves the installed bundle before it launches).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RenewalFacts {
     /// This process is a renewal's successor, launched from that pid ([`RENEWED_FROM_ENV`]).
@@ -73,18 +37,15 @@ pub(crate) struct RenewalFacts {
     pub(crate) auto_apply: bool,
     /// `App::seamless_handoff_unavailable` names a reason.
     pub(crate) handoff_unavailable: bool,
-    /// This build's commit stamp is clean (`aterm_update::commit_matches` with itself):
-    /// the adoption proof hashes it, and the worker matches the installed bundle by it.
+    /// This build's commit stamp is clean (`aterm_update::commit_matches` with itself): the adoption proof hashes it, and the worker matches the installed bundle by it.
     pub(crate) clean_commit: bool,
     /// A stage is on record, or the automatic lane holds an intent.
     pub(crate) update_pending: bool,
-    /// The installed bundle's build as the last updater observation read it; `None`
-    /// when not yet observed.
+    /// The installed bundle's build as the last updater observation read it; `None` when not yet observed.
     pub(crate) installed_build: Option<u64>,
     /// This process's build.
     pub(crate) current_build: u64,
-    /// A check, download or apply is in flight, a handoff is, or a person's Install is
-    /// held.
+    /// A check, download or apply is in flight, a handoff is, or a person's Install is held.
     pub(crate) update_work: bool,
     /// Counted attempts so far.
     pub(crate) attempts: u8,
@@ -160,14 +121,6 @@ pub(crate) enum RenewalDecision {
 }
 
 /// THE ARMING DECISION: the first rule that holds, in this order.
-///
-/// A marked successor never renews. With the automatic lane off, no overlap handoff, or
-/// no clean commit stamp (which the adoption proof and the worker's bundle check both
-/// refuse), no renewal can run. A pending update belongs to the update lane, ahead of the
-/// installed-bundle rule (an installed newer build is imported as a stage). Update work in
-/// flight may stage one, so it is waited for, ahead of exhaustion, so a stage that
-/// arrives with the last failure is left to the update. With no live terminal there is
-/// no overlap lane: wait for one.
 #[must_use]
 pub(crate) fn decide(facts: RenewalFacts) -> RenewalDecision {
     if let Some(from) = facts.renewed_from {
@@ -240,8 +193,7 @@ enum RenewalState {
         armed_at: Instant,
         retry_at: Instant,
     },
-    /// An attempt's successor is launching or held. `ending`: why its return ends the
-    /// renewal instead of re-arming it, once something has.
+    /// An attempt's successor is launching or held.
     InFlight {
         armed_at: Instant,
         ending: Option<InFlightEnd>,
@@ -250,8 +202,7 @@ enum RenewalState {
     Ended,
 }
 
-/// Why an attempt in flight ends the renewal at its return instead of re-arming it. The
-/// first reason stands, as [`decide`] would rank them.
+/// Why an attempt in flight ends the renewal at its return instead of re-arming it.
 #[derive(Clone, Copy)]
 enum InFlightEnd {
     /// `[update] auto_apply` went off: nothing replaces this process unasked.
@@ -303,8 +254,7 @@ impl LaunchRecordRenewal {
         }
     }
 
-    /// The phase the launched lane's park gate reads for a renewal's attempt at `now`
-    /// ([`renewal_phase`]); the strictest, `PreferIdle`, with no anchor.
+    /// The phase the launched lane's park gate reads for a renewal's attempt at `now` ([`renewal_phase`]); the strictest, `PreferIdle`, with no anchor.
     pub(crate) fn gate_phase(&self, now: Instant) -> ApplyPhase {
         match self.state {
             RenewalState::Armed { armed_at, .. } | RenewalState::InFlight { armed_at, .. } => {
@@ -328,8 +278,7 @@ impl LaunchRecordRenewal {
     }
 }
 
-/// What the quiet close preflight answers a renewal
-/// (`App::quiet_native_update_safety_token`).
+/// What the quiet close preflight answers a renewal (`App::quiet_native_update_safety_token`).
 pub(crate) enum QuietPreflight {
     /// Ready, with the evidence the attempt carries.
     Ready(crate::app_native::NativeUpdateSafetyToken),
@@ -362,21 +311,14 @@ impl crate::App {
         }
     }
 
-    /// Whether `SameImageHandoff::RenewLaunchRecord` is granted now: this process measured
-    /// its own record stale, is no renewal's successor, and its renewal is armed (the
-    /// poll's call, before it moves to `InFlight`). Naming the variant grants nothing.
+    /// Whether `SameImageHandoff::RenewLaunchRecord` is granted now: this process measured its own record stale, is no renewal's successor, and its renewal is armed (the poll's call, before it moves to `InFlight`).
     pub(crate) fn launch_record_renewal_authorizes(&self) -> bool {
         self.own_launch_record == Some(OwnLaunchRecord::Stale)
             && self.launch_record_renewal.renewed_from.is_none()
             && matches!(self.launch_record_renewal.state, RenewalState::Armed { .. })
     }
 
-    /// `OwnLaunchRecord::Stale`, as measured (`App::note_own_launch_record`): arms the
-    /// renewal, or settles it at once when nothing will renew the record here. While it
-    /// is armed no entry stands: this process books none, and withdraws the one it
-    /// adopted from its parent at Commit (`App::book_launch_unregistered`, the same key),
-    /// so the person is told to quit and open aterm again only once no renewal runs
-    /// ([`Self::settle_launch_record_renewal`] books it then).
+    /// `OwnLaunchRecord::Stale`, as measured (`App::note_own_launch_record`): arms the renewal, or settles it at once when nothing will renew the record here.
     pub(crate) fn note_stale_launch_record(&mut self, now: Instant) {
         if !matches!(self.launch_record_renewal.state, RenewalState::Idle) {
             return;
@@ -399,9 +341,7 @@ impl crate::App {
         }
     }
 
-    /// One look of an armed renewal whose time has come (`about_to_wait`): the decision
-    /// again, then the automatic lane's entry gate at the renewal's phase, the quiet close
-    /// preflight, and the attempt.
+    /// One look of an armed renewal whose time has come (`about_to_wait`): the decision again, then the automatic lane's entry gate at the renewal's phase, the quiet close preflight, and the attempt.
     pub(crate) fn poll_launch_record_renewal(&mut self, now: Instant) {
         let RenewalState::Armed { armed_at, .. } = self.launch_record_renewal.state else {
             return;
@@ -418,7 +358,6 @@ impl crate::App {
                 return;
             }
         }
-        // The entry gate, as the automatic lane's: a refusal costs nothing.
         let phase = renewal_phase(now.saturating_duration_since(armed_at));
         let mode = renewal_mode(phase);
         if let Some(reason) = crate::native_update_auto_intent::automatic_park_refusal(
@@ -457,7 +396,6 @@ impl crate::App {
             std::process::id(),
             crate::running_build_number()
         );
-        // Still `Armed` during the call, which is what grants the variant.
         match self.apply_staged_update_now(
             token,
             mode,
@@ -471,7 +409,6 @@ impl crate::App {
                     ending: None,
                 };
             }
-            // A sudo prompt, a tab still starting, the quiet epoch: not an attempt.
             Err(error) if error.is_activity_deferred() => {
                 aterm_log::debug!("launch record: the renewal was deferred: {error}");
                 self.record_update_switch_stopped(true, &error.to_string());
@@ -487,11 +424,7 @@ impl crate::App {
         }
     }
 
-    /// A renewal attempt's completion came back with this process still running
-    /// (`App::reduce_returned_handoff_completion`; a Commit never returns: the parent
-    /// exits). Re-arms it, or ends it when an update took over or the automatic lane went
-    /// off. Returns whether its stop is routine: another attempt is armed, or the update
-    /// lands by itself.
+    /// A renewal attempt's completion came back with this process still running (`App::reduce_returned_handoff_completion`; a Commit never returns: the parent exits).
     pub(crate) fn reduce_returned_launch_record_renewal(
         &mut self,
         lane: crate::app_native::HandoffFailureLane,
@@ -517,9 +450,7 @@ impl crate::App {
         k < ATTEMPTS
     }
 
-    /// Ends the renewal and books what `outcome` says, once: the entry whose step is the
-    /// person's when no renewal runs or none worked, or a ripening claim of it when an
-    /// update's handoff will renew the record (it shows only if that update never lands).
+    /// Ends the renewal and books what `outcome` says, once: the entry whose step is the person's when no renewal runs or none worked, or a ripening claim of it when an update's handoff will renew the record (it shows only if that update never lands).
     pub(crate) fn settle_launch_record_renewal(&mut self, outcome: RenewalDecision) {
         let pid = std::process::id();
         let entry = match outcome {
@@ -544,9 +475,6 @@ impl crate::App {
                      record as it lands"
                 );
                 self.launch_record_renewal.state = RenewalState::Ended;
-                // Only the claim: an entry open now (adopted from the parent, or kept by an
-                // update attempt that returned) would show the step before that update had
-                // its chance.
                 self.except_end(&crate::update_words::launch_unregistered_entry(0).key());
                 self.except_after(
                     &crate::update_words::own_launch_record_stale_entry(pid),
@@ -560,18 +488,12 @@ impl crate::App {
         self.except(&entry);
     }
 
-    /// An update was staged (`App::finish_native_update_reconcile`): an attempt in flight
-    /// yields to the update lane, whose handoff renews the record as it lands
-    /// ([`Self::end_launch_record_renewal_in_flight`]). An armed renewal needs nothing:
-    /// its next look answers `LeaveToUpdate`.
+    /// An update was staged (`App::finish_native_update_reconcile`): an attempt in flight yields to the update lane, whose handoff renews the record as it lands ([`Self::end_launch_record_renewal_in_flight`]).
     pub(crate) fn yield_launch_record_renewal_to_update(&mut self) {
         self.end_launch_record_renewal_in_flight(InFlightEnd::LeaveToUpdate);
     }
 
-    /// `[update] auto_apply` went off (`about_to_wait`'s on-to-off edge): nothing replaces
-    /// this process unasked, so the renewal ends as [`decide`] would rule. An armed one
-    /// books the entry now, and an attempt in flight stands down
-    /// ([`Self::end_launch_record_renewal_in_flight`]) and books it at its return.
+    /// `[update] auto_apply` went off (`about_to_wait`'s on-to-off edge): nothing replaces this process unasked, so the renewal ends as [`decide`] would rule.
     pub(crate) fn end_launch_record_renewal_for_updates_off(&mut self) {
         match self.launch_record_renewal.state {
             RenewalState::Armed { .. } => self.settle_launch_record_renewal(RenewalDecision::Book(
@@ -585,11 +507,7 @@ impl crate::App {
     }
 
     /// Ends an attempt in flight at its return with `end` instead of re-arming it (the
-    /// first reason stands). One still before its park stands down now: the stand-down
-    /// for a worker that holds the successor, and the cancel for one still proving the
-    /// bundle or waiting for the dial, which reads nothing else, so it ends there rather
-    /// than launch and hold a successor only to stand it down. A parked one finishes
-    /// within its freeze budget.
+    /// first reason stands).
     fn end_launch_record_renewal_in_flight(&mut self, end: InFlightEnd) {
         let RenewalState::InFlight { ending, .. } = &mut self.launch_record_renewal.state else {
             return;
@@ -610,8 +528,7 @@ impl crate::App {
         }
     }
 
-    /// Whether the overlap handoff in flight is a renewal's attempt: its record carries
-    /// `SameImageHandoff::RenewLaunchRecord`.
+    /// Whether the overlap handoff in flight is a renewal's attempt: its record carries `SameImageHandoff::RenewLaunchRecord`.
     pub(crate) fn launch_record_renewal_in_flight(&self) -> bool {
         let renews = |same_image: Option<crate::app_update_handoff::SameImageHandoff>| {
             same_image
@@ -666,7 +583,6 @@ mod tests {
         };
         let rows = [
             (base, Renew),
-            // Each fact alone, to the decision it owns.
             (
                 RenewalFacts {
                     renewed_from: Some(47362),
@@ -730,7 +646,6 @@ mod tests {
                 },
                 Wait(RenewalWait::Terminal),
             ),
-            // Precedence.
             (
                 RenewalFacts {
                     renewed_from: Some(47362),

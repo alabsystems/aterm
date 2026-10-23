@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Overview's "On the fabric" group:
-//! the read parsed and composed from a captured brief, a chip
-//! that nothing acts on, a read landing on the open card and a later one
-//! clearing it, the minute's wake, one read at a time, the last good read
-//! kept, and no read where the fabric is off. Every clock is a hand-set
-//! stamp ([`FabricGlance::clock_ms`]) or an instant the code recorded.
+//! The Overview's "On the fabric" group: the read parsed and composed from a captured brief, a chip that nothing acts on, a read landing on the open card and a later one clearing it, the minute's wake, one read at a time, the last good read kept, and no read where the fabric is off.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, channel};
@@ -21,9 +16,6 @@ use crate::overview::{OverviewAct, OverviewState};
 /// `aterm fabric brief --json` AS IT PRINTS: captured byte for byte from
 /// aterm-link's renderer (`fabric_brief::render_json`) over five session
 /// logs' mirror bodies, read at [`READ_AT`] on a host whose node is `n-2`.
-/// `s-mine` failed on this host's own node; `s-quiet` is open and needs
-/// nothing; `s-appr` sits in a bash box on `n-1`; `s-fail`'s command failed
-/// on `n-3`; `s-old` sat in an edit box on `n-3` six minutes before.
 const CAPTURED: &str = concat!(
     r#"{"v":2,"fleet":"f1","head":1000,"from":0,"scanned":0,"pages":0,"partial":0,"#,
     r#""opaque":0,"foreign":0,"dup":0,"reordered":0,"budget":2000,"used":243,"more":0,"#,
@@ -102,10 +94,7 @@ fn chip(
 /// node is gone (`partial` holds `node-gone`); the one on this host's own
 /// node (`"this":true`) and the one with no need are not; nor is one whose
 /// node holds a space, which no node id does (it would split the `controls
-/// overview` line). An answer that is not the brief's object is no
-/// snapshot, said `no-brief`. NEGATIVE CONTROLS, run: `word` without its
-/// filter keeps the spaced node and fails it; a parse that reads no
-/// `partial` keeps `s-old` on a live node and fails it.
+/// overview` line).
 #[test]
 fn the_read_keeps_each_remote_need_and_drops_this_nodes() {
     let snap = parse(CAPTURED, READ_AT).expect("the brief's object");
@@ -126,7 +115,6 @@ fn the_read_keeps_each_remote_need_and_drops_this_nodes() {
             .collect::<Vec<_>>(),
         [("s-appr", false), ("s-fail", false), ("s-old", true)]
     );
-    // A word no node id, face or need word holds drops its session.
     let spaced = CAPTURED.replace(
         r#""node":"n-1","sid":"s-appr""#,
         r#""node":"n 1","sid":"s-appr""#,
@@ -157,16 +145,7 @@ type Row<'a> = (&'a str, Option<&'a str>, Option<u64>, bool, u64, Want<'a>);
 /// THE GROUP, COMPOSED (table): each need is a chip in the clause's own
 /// words, ◇ for a box or a question and ◆ for a failure, a wall or a
 /// session not responding, its age the fold's plus the time since the read
-/// (shown only). WHETHER IT COUNTS IS WHETHER IT IS KNOWN TO STAND NOW,
-/// never how long it has waited: a box open 429 s on a fresh read counts
-/// (the session writes nothing while it waits), as does one of no known
-/// age; a chip is older (listed, never counted) when its read is older than
-/// `COUNT_FRESH` (300 s: the reads since failed) or its node is gone. A word
-/// the group lists no chip for is none. NEGATIVE CONTROLS, run: a compose
-/// that drops the need (`mark_of` answering `None`) shows no chip and fails
-/// it; the fold's age against `COUNT_FRESH` (the rule this replaced) says
-/// the waiting box older and fails it; a compose that ignores `gone` fails
-/// the node-gone row.
+/// (shown only).
 #[test]
 fn the_group_composes_each_need_in_the_clauses_words() {
     let snap = parse(CAPTURED, READ_AT).expect("the brief's object");
@@ -312,8 +291,7 @@ fn the_group_composes_each_need_in_the_clauses_words() {
 /// said older (here `s-old`'s node is gone); the selection follows its
 /// chip by identity when a read moves the list; and NOTHING ACTS on a
 /// fabric chip: ⏎, `t`, `r` and ⌫ (twice) on one all answer `None` and arm
-/// no confirm. NEGATIVE CONTROL, run: ⏎ on a fabric chip wired to `raise`
-/// fails it.
+/// no confirm.
 #[test]
 fn the_card_lists_the_group_counts_the_fresh_and_acts_on_none() {
     let snap = parse(&captured_with_old_gone(), READ_AT).expect("the brief's object");
@@ -361,7 +339,6 @@ fn the_card_lists_the_group_counts_the_fresh_and_acts_on_none() {
         "no confirm armed"
     );
 
-    // A later read: the box on n-1 closed. The selection stays on s-fail.
     assert!(card.set_fabric(group(chips[1..].to_vec())));
     assert_eq!(
         card.selected_fabric().map(|c| c.sid.as_str()),
@@ -377,12 +354,7 @@ fn the_card_lists_the_group_counts_the_fresh_and_acts_on_none() {
 
 /// WHAT THE CARD SHOWS MOVES THE CARD, A SECOND OF AGE DOES NOT: every
 /// compose adds the seconds since the read, so a status rebuild a second
-/// later hands the card chips whose exact age moved. That repaints nothing
-/// (`set_fabric` answers no change, the fingerprint stands) while the chip's
-/// coarse words stand, and `controls overview` still reads the exact age;
-/// once the words move (a minute on), it repaints. NEGATIVE CONTROL, run:
-/// change detection over the whole chip (exact age included) answers a
-/// change a second on and fails it.
+/// later hands the card chips whose exact age moved.
 #[test]
 fn a_seconds_age_repaints_nothing_until_its_words_move() {
     let snap = FabricSnapshot {
@@ -437,7 +409,6 @@ struct Held {
 
 impl FabricRunner for Held {
     fn run(&self) -> ReadAnswer {
-        // A dropped sender (the test ended) answers too.
         let _ = self.go.lock().unwrap().recv();
         Ok(self.body.clone())
     }
@@ -473,9 +444,7 @@ fn fabric_app(runner: Arc<dyn FabricRunner>, clock_ms: u64) -> crate::App {
 /// the fabric is on kicks one read; its landing (`Wake::FabricRead`'s arm)
 /// lists the bash box on n-1 under "On the fabric" and counts it with the
 /// failure on n-3 and the box on n-3 that has waited six minutes (each is
-/// open on a fresh read). The next read answers the box on n-1 closed, and
-/// its chip is gone. NEGATIVE CONTROL, run: a read that answers the old
-/// body again keeps the chip and fails it.
+/// open on a fresh read).
 #[test]
 fn a_read_lands_on_the_open_card_and_a_closed_need_leaves_it() {
     let closed = CAPTURED.replace(r#""need":"approval:bash""#, r#""need":null"#);
@@ -533,10 +502,6 @@ fn a_read_lands_on_the_open_card_and_a_closed_need_leaves_it() {
 /// card is open and no read is out, the loop is armed a minute after the
 /// last read began, whatever re-snapshots the card meanwhile and with no
 /// paint; at that instant the tick reads again, and not a second before.
-/// A read out arms nothing (its landing wakes the loop); a closed card arms
-/// nothing; a kick that finds the fabric gone off disarms it for good.
-/// NEGATIVE CONTROLS, run: the re-read left to the paint path (no wake)
-/// fails it; a wake armed while a read is out fails it.
 #[test]
 fn an_open_card_reads_the_fabric_again_a_minute_on_with_no_paint() {
     let mut app = fabric_app(Answers::of(&[CAPTURED, CAPTURED]), READ_AT);
@@ -550,7 +515,6 @@ fn an_open_card_reads_the_fabric_again_a_minute_on_with_no_paint() {
         .kicked_at
         .expect("the open's read began");
     let step = crate::app_overview::OVERVIEW_AGE_STEP;
-    // A status rebuild re-snapshots the card: the wake stands.
     app.overview_refresh_all();
     assert_eq!(app.overview_fabric_wake(), Some(began + step));
     app.tick_overview_fabric(began + step - Duration::from_secs(1));
@@ -562,13 +526,11 @@ fn an_open_card_reads_the_fabric_again_a_minute_on_with_no_paint() {
     await_read(&app, 2);
     assert_eq!(app.overview_fabric_wake(), Some(second + step));
 
-    // A closed card arms nothing, and its tick reads nothing.
     app.overview_exit(WindowId(0));
     assert_eq!(app.overview_fabric_wake(), None);
     app.tick_overview_fabric(second + step * 2);
     assert_eq!(app.agents.overview_fabric.started, 2);
 
-    // The fabric gone off: the due kick spawns nothing and disarms.
     assert!(app.open_overview().is_ok());
     await_read(&app, 3);
     app.agents.overview_fabric.configured = false;
@@ -581,8 +543,7 @@ fn an_open_card_reads_the_fabric_again_a_minute_on_with_no_paint() {
 
 /// ONE READ AT A TIME: while a read is out, a kick (the card opened again,
 /// the minute's tick) is that read's and starts no other, and no wake is
-/// armed; the read's answer lands once. NEGATIVE CONTROL, run: the kick
-/// without its `reading` guard starts a second read and fails it.
+/// armed; the read's answer lands once.
 #[test]
 fn a_kick_while_a_read_is_out_is_that_reads() {
     let (go, wait) = channel();
@@ -608,12 +569,7 @@ fn a_kick_while_a_read_is_out_is_that_reads() {
 /// THE LAST GOOD READ IS KEPT, AND THE FAILURE SAID: a read that fails after
 /// a good one leaves the good one's chips listed, and the card says the
 /// failure in a closed word — `fabric_error=refused` on `controls
-/// overview`'s header and "the last read failed" on the group's. Once the
-/// good read is older than `COUNT_FRESH` (the hand-set clock moved on), its
-/// chips are listed older and the title counts none. NEGATIVE CONTROL, run:
-/// a failed read that drops the snapshot lists no chip and fails it.
-/// A worker that unwinds also ends its read, keeps the last good snapshot,
-/// and allows the next read to replace it instead of leaving the card busy.
+/// overview`'s header and "the last read failed" on the group's.
 #[test]
 fn a_failed_read_keeps_the_last_good_one_and_says_so() {
     struct Panics;
@@ -656,7 +612,6 @@ fn a_failed_read_keeps_the_last_good_one_and_says_so() {
         .expect("the group's header");
     assert!(header.ends_with("the last read failed"), "{header}");
 
-    // Five minutes and a second on, with no good read since.
     app.agents.overview_fabric.clock_ms = Some(READ_AT + 301_000);
     app.overview_refresh_all();
     let lines = app.read_aux_controls(AuxTarget::Overview);
@@ -710,8 +665,7 @@ fn a_failed_read_keeps_the_last_good_one_and_says_so() {
 
 /// ⏎ AND EVERY KEY ON A FABRIC CHIP REACH NO PROGRAM (App level, the
 /// session's own PTY observed): the card stays open on the chip, and no
-/// byte is written to the session. NEGATIVE CONTROL, run: ⏎ wired to
-/// `raise` closes the card and fails it.
+/// byte is written to the session.
 #[cfg(unix)]
 #[test]
 fn every_key_on_a_fabric_chip_writes_nothing_anywhere() {
@@ -785,9 +739,7 @@ fn every_key_on_a_fabric_chip_writes_nothing_anywhere() {
 /// NO FABRIC, NO READ, NO GROUP (headless): where this aterm's fabric is
 /// off, opening the Overview and the minute's tick spawn nothing and arm
 /// nothing, and the card holds no group — even with a read's snapshot
-/// still in the slot (the fabric turned off since). NEGATIVE CONTROLS, run:
-/// a kick that skips the fabric check starts a read and fails it; a group
-/// that skips it lists the old snapshot's chips and fails it.
+/// still in the slot (the fabric turned off since).
 #[test]
 fn with_no_fabric_configured_no_read_is_spawned() {
     let mut app = crate::App::headless_for_test();
@@ -836,9 +788,7 @@ fn the_read_asks_for_the_whole_machine_form() {
 /// THE REAL READ RUNS A CHILD AND SAYS WHY IN A WORD (`ChildRunner::run`, a
 /// stand-in program for `aterm`): what it prints on a clean exit is the
 /// answer; a non-zero exit, or nothing printed, is `refused` (no text of
-/// its stderr kept); a program that does not start is `run`. NEGATIVE
-/// CONTROL, run: a runner that takes any exit's stdout answers the refusal's
-/// and fails it.
+/// its stderr kept); a program that does not start is `run`.
 #[cfg(unix)]
 #[test]
 fn the_real_read_runs_a_child_and_says_why_in_a_word() {

@@ -44,6 +44,7 @@ impl Entry {
 }
 
 /// The roots a header can name, in the order a tie between two that are the
+/// same directory goes to: the first named keeps it.
 const ROOT_IDS: [&str; 6] = ["ledger", "journal", "notes", "rules", "state", "home"];
 
 /// No roots: a path written as it is.
@@ -168,7 +169,7 @@ impl Roots {
         })
     }
 
-    /// A replay's file path must name one of its remapped roots. The ordinary
+    /// A replay's file path must name one of its remapped roots.
     fn decode_file(&self, raw: &[u8]) -> Result<PathBuf, String> {
         if !raw.starts_with(b"@") || raw.starts_with(b"@@") {
             return Err("a remapped file path must name a root".to_string());
@@ -225,6 +226,10 @@ fn windows_root_namespace(dir: &Path) -> PathBuf {
 }
 
 /// The path the loop opens for a file it was given as `path`: an absolute
+/// one as it is; a relative one (`--journal run.jsonl`, a `rules_file` of
+/// `standing.md`) from this process's directory, which every open of it
+/// resolves against and which the loop never changes — the same file, named
+/// so a root can hold it ([`Header::capture`]).
 fn opened(path: &Path) -> PathBuf {
     if path.is_absolute() {
         return path.to_path_buf();
@@ -238,6 +243,7 @@ fn os_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
 }
 
 /// Off unix a path is written as its text, a character it cannot spell
+/// replaced: the supervisor runs on unix hosts.
 #[cfg(not(unix))]
 fn os_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
     s.to_string_lossy().into_owned().into_bytes()
@@ -313,6 +319,7 @@ pub(crate) fn unescape(text: &str) -> Result<Vec<u8>, String> {
 }
 
 /// A duration as a header writes it: exact, in the largest unit that holds
+/// it, and `max` for [`Duration::MAX`] (a budget that never runs out).
 fn duration_text(d: Duration) -> String {
     if d == Duration::MAX {
         return "max".to_string();
@@ -433,15 +440,18 @@ struct Line {
 pub(crate) struct Reader {
     lines: Vec<Line>,
     /// Each line's place in [`Self::lines`], by its section and key: how a
+    /// key is found ([`Self::find`]) and a key said twice is caught.
     index: BTreeMap<String, BTreeMap<String, usize>>,
     section: String,
     remapped_io: bool,
     /// Each `[section] key` the header did not name that this build
+    /// supplied ([`Self::or_shipped`]).
     supplied: Vec<String>,
 }
 
 impl Reader {
     /// The lines after the `atape` line, each `[section]`, `key=value` or
+    /// `key`; a key said twice in one section is refused.
     fn parse(body: &str) -> Result<Self, String> {
         let mut lines: Vec<Line> = Vec::new();
         let mut index: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
@@ -644,6 +654,7 @@ impl Reader {
     }
 
     /// Every key of the section that starts `prefix` and is not yet taken,
+    /// taken, in order: `(rest of the key, value, line)`.
     fn prefixed(&mut self, prefix: &str) -> Vec<(String, Option<String>, usize)> {
         let section = &self.section;
         self.lines
@@ -997,6 +1008,7 @@ const RULES_FILE: &str = "rules_file";
 const WITHHELD: &str = "withheld.";
 
 /// What [`Header::supplied`] says of a policy its header marked inexact
+/// (`exact=false`): the replay runs this build's nearest rebuild of it.
 const INEXACT: &str = "exact=false: the run's policy is one no owner's file spells; \
                        the replay runs the nearest policy its texts rebuild";
 

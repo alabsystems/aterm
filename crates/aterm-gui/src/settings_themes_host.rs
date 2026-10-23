@@ -2,41 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The host half of Settings' theme picker footer and Needs-attention rows
-//! ([`crate::native_app::ThemesRequest`]): open the themes folder or one theme
-//! file, or import a theme through the platform file picker.
-//!
-//! The view supplies identity only (a catalog id, never a path); the folder is
-//! resolved here from [`aterm_types::scheme::user_theme_dir`], the same folder
-//! the catalog reads. An import goes through
-//! [`aterm_types::scheme_install::install_theme_file_as_new`], the write path
-//! `aterm theme import` takes, and the catalog picks the new file up through
-//! its folder watcher like any other file dropped there. Settings ▸ Themes'
-//! "Save as theme…" writes the theme the view serialized through the same
-//! atomic writer ([`save_into`]); after a save or an import the host reads the
-//! folder again at once ([`crate::App::rediscover_themes_now`]) rather than
-//! waiting for the watcher's next poll, so the new theme can be selected. A
-//! card's Trash moves the theme's file to the Trash ([`trash_from`]) —
-//! recoverable, never an unlink — and the folder is read again the same way.
-//! Keep on a Community row adds a community pack theme ([`add_pack_into`]) through
-//! `aterm_theme_pack::install`, the path `aterm theme install` takes.
-//!
-//! What the host reaches beyond the themes folder — the system Trash, the
-//! platform's open-in-workspace and its file picker — goes through
-//! [`ThemesHostArms`], whose arm for a headless instance reaches none of
-//! them.
+//! The host half of Settings' theme picker footer and Needs-attention rows.
 
 use crate::native_app::{ThemesOutcome, ThemesRequest};
 
-/// What the themes host reaches beyond the themes folder. A HEADLESS
-/// INSTANCE (a lab's, a harness's) reaches none of it: its themes folder is
-/// its scratch world's, and the account's Trash, Finder and desktop are not
-/// its to touch — the system trash tool files by the account's real home
-/// whatever `HOME` says, and a picker or Finder would open on the owner's
-/// desktop. Its Trash is the `.trash` folder beside its themes
-/// ([`move_to_trash_fallback`]), recoverable inside its world; opening a
-/// file or the folder, and importing through a picker, say they are not
-/// done here.
+/// What the themes host reaches beyond the themes folder.
 #[derive(Clone, Copy)]
 pub(crate) struct ThemesHostArms {
     /// Move a theme file to where it can be put back.
@@ -98,9 +68,7 @@ fn refuse_choose() -> Result<Option<std::path::PathBuf>, String> {
     Err("a headless instance shows no file picker".to_string())
 }
 
-/// Perform `request` against the live themes folder, reaching beyond it
-/// only through `arms`. Main thread only: an import runs the modal file
-/// picker.
+/// Perform `request` against the live themes folder, reaching beyond it only through `arms`.
 pub(crate) fn perform(request: &ThemesRequest, arms: ThemesHostArms) -> ThemesOutcome {
     let Some(dir) = aterm_types::scheme::user_theme_dir() else {
         return ThemesOutcome::Failed {
@@ -137,9 +105,7 @@ fn perform_in(
     }
 }
 
-/// Install the community pack theme `id` into `dir`, never over a different
-/// file of that name (`aterm_theme_pack::install`, the path `aterm theme
-/// install` takes). A copy already there unchanged counts as added.
+/// Install the community pack theme `id` into `dir`, never over a different file of that name.
 pub(crate) fn add_pack_into(dir: &std::path::Path, id: &str) -> ThemesOutcome {
     let Some(theme) = aterm_theme_pack::find(id) else {
         return ThemesOutcome::Failed {
@@ -162,9 +128,7 @@ pub(crate) fn add_pack_into(dir: &std::path::Path, id: &str) -> ThemesOutcome {
     }
 }
 
-/// Move theme `id`'s file out of `dir` with `mover`. Only a name no
-/// built-in answers to, naming a regular file in the folder, moves: a
-/// symlink or a traversal spelling names nothing.
+/// Move theme `id`'s file out of `dir` with `mover`.
 pub(crate) fn trash_from(
     dir: &std::path::Path,
     id: &str,
@@ -188,8 +152,6 @@ pub(crate) fn trash_from(
     }
 }
 
-/// The live mover: the system's trash tool where it has one (macOS ships
-/// it), else a `.trash` folder beside the themes, which the catalog does not
 /// read. Either way the file can be put back.
 fn move_to_trash(file: &std::path::Path) -> Result<(), String> {
     if crate::consent_retire::trash_tool_present() {
@@ -219,8 +181,6 @@ fn move_to_trash_fallback(
         }
         Err(error) => return Err(error.to_string()),
     };
-    // As with the temporary-directory allocator, a bounded exclusive claim
-    // avoids both overwrite races and an unbounded scan of old recoveries.
     for _ in 0..5 {
         let token = aterm_uds::rand::hex_token::<16>().map_err(|error| error.to_string())?;
         let recovery_name = format!("theme-{token}");
@@ -231,8 +191,6 @@ fn move_to_trash_fallback(
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.to_string()),
         };
-        // No Drop removes this directory. Once rename happens, all failures
-        // keep the bytes here and say where they can be recovered.
         return source.move_to_recovery(&recovery, name).map_err(|error| {
             format!(
                 "recovery folder {} retained: {error}",
@@ -243,11 +201,7 @@ fn move_to_trash_fallback(
     Err("could not claim a new recovery directory; the theme was not moved".to_string())
 }
 
-/// Write `text` into `dir` as the new theme `id`, through the one theme
-/// write path ([`aterm_types::scheme_install::write_atomically`]), never
-/// over an existing file. The id must be a valid theme name that no built-in
-/// answers to, and the text must parse as a theme: the view serialized it,
-/// but the host does not write what it has not checked.
+/// Write `text` into `dir` as the new theme `id`.
 pub(crate) fn save_into(dir: &std::path::Path, id: &str, text: &str) -> ThemesOutcome {
     if let Err(why) = aterm_types::scheme::validate_user_theme_name(id) {
         return ThemesOutcome::Failed {
@@ -281,8 +235,6 @@ pub(crate) fn save_into(dir: &std::path::Path, id: &str, text: &str) -> ThemesOu
     }
 }
 
-/// The file behind catalog id `id` in `dir`, when it is a regular file there.
-/// An id that is not a valid theme name (an unreadable row's lossy spelling)
 /// names no file.
 fn theme_file(dir: &std::path::Path, id: &str) -> Option<std::path::PathBuf> {
     aterm_types::scheme::validate_user_theme_name(id).ok()?;
@@ -335,11 +287,7 @@ fn open(
 }
 
 impl crate::App {
-    /// Read the themes folder again off the event loop and hand the catalog
-    /// to the ordinary catalog reload ([`crate::Wake::ThemeCatalogChanged`]),
-    /// as the folder watcher does. A theme Settings just wrote is then
-    /// selectable without waiting out the watcher's poll. A failed read
-    /// changes nothing: the watcher keeps the admitted catalog as before.
+    /// Read the themes folder again off the event loop and hand the catalog to the ordinary.
     pub(crate) fn rediscover_themes_now(&self) {
         let Some(proxy) = self.proxy.clone() else {
             return;
@@ -378,7 +326,6 @@ mod tests {
         dir
     }
 
-    /// Only a valid id that names a regular file in the folder resolves; a
     /// traversal spelling or a missing file names nothing.
     #[test]
     fn theme_file_resolves_only_a_regular_file_by_a_valid_id() {
@@ -391,8 +338,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Save as theme writes a file the catalog admits under that id, never
-    /// over an existing theme, and refuses a built-in's name or a bad id
     /// before writing anything.
     #[test]
     fn save_writes_a_new_theme_once_and_refuses_bad_names() {
@@ -433,8 +378,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Trash moves a theme of the person's own out of the folder (the catalog
-    /// no longer lists it), and refuses a built-in's name, a missing file and
     /// a symlink without calling the mover.
     #[test]
     fn trash_moves_only_a_regular_theme_file_of_the_persons_own() {
@@ -475,11 +418,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A HEADLESS INSTANCE'S REACHES STOP AT ITS THEMES FOLDER: its Trash
-    /// moves the file into the `.trash` folder beside the themes (the
-    /// catalog no longer lists it, the bytes are still there), and Open and
-    /// Import say they are not done here, the folder untouched. Negative
-    /// control: a windowed instance gets the live arms — the system Trash,
     /// the platform's open and its picker.
     #[test]
     fn a_headless_instance_trashes_into_its_own_folder_and_opens_nothing() {
@@ -526,7 +464,6 @@ mod tests {
         assert_eq!(kept, vec![text.to_string()], "the bytes stay in the folder");
         let catalog = crate::app_config::ThemeCatalog::discover_in(&dir);
         assert!(!catalog.ready_names().any(|name| name == "mine"));
-        // Each refusal is the isolated arm's own.
         let refused_open = (isolated.open)(&dir).expect_err("the isolated open refuses");
         let refused_choose = (isolated.choose)().expect_err("the isolated picker refuses");
         for (request, refusal) in [
@@ -564,7 +501,6 @@ mod tests {
         files
     }
 
-    /// The window's import writes a new theme the catalog then lists, and
     /// a second import of the same file refuses instead of overwriting.
     #[test]
     fn import_writes_a_theme_the_catalog_lists_and_never_overwrites() {
@@ -588,8 +524,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A community add installs the pack's file; again it is already there
-    /// (still added); an unknown id or an edited file of that name fails
     /// and leaves the file alone.
     #[test]
     fn add_pack_installs_once_and_keeps_an_edited_file() {
@@ -615,8 +549,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Every pack theme, installed, loads through the catalog the window
-    /// reads, as exactly the colours its file holds. Negative control: a
     /// broken copy beside them is listed, not loaded, with its reason.
     #[test]
     fn pack_themes_load_through_the_catalog() {

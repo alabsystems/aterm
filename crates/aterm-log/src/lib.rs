@@ -2,52 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Minimal logging facade for aterm.
-//!
-//! Drop-in replacement for the `log` crate with zero external dependencies.
-//! Provides five log levels (`error`, `warn`, `info`, `debug`, `trace`) and
-//! corresponding macros. A global logger can be installed at program startup;
-//! if none is set, log messages are silently discarded.
-//!
-//! ## Usage
-//!
-//! ```rust
-//! use aterm_log::{info, warn, error, debug, trace};
-//!
-//! info!("server started on port {}", 8080);
-//! warn!("connection pool at {}% capacity", 90);
-//! error!("failed to bind: {}", "address in use");
-//! debug!("parsed {} bytes", 1024);
-//! trace!("entering function");
-//! ```
-//!
-//! ## Installing a logger
-//!
-//! ```rust
-//! use aterm_log::{Log, Level, LevelFilter, Metadata, Record, set_logger, set_max_level};
-//!
-//! struct StderrLogger;
-//!
-//! impl Log for StderrLogger {
-//!     fn enabled(&self, metadata: &Metadata) -> bool {
-//!         metadata.level() <= Level::Info
-//!     }
-//!     fn log(&self, record: &Record<'_>) {
-//!         if self.enabled(&record.metadata()) {
-//!             eprintln!("[{}] {}: {}", record.level(), record.target(), record.args());
-//!         }
-//!     }
-//!     fn flush(&self) {}
-//! }
-//!
-//! static LOGGER: StderrLogger = StderrLogger;
-//!
-//! set_logger(&LOGGER).expect("logger already set");
-//! set_max_level(LevelFilter::Info);
-//! ```
 
-// Under the Trust verifier, register the `trust` tool namespace so the
-// `#[cfg_attr(trust_verify, trust::skip)]` opt-out on `__log` resolves; plain
-// rustc never sets `trust_verify`, so this is inert off-Trust.
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
 
@@ -92,7 +47,7 @@ impl Level {
         matches!(self, Self::Error | Self::Warn)
     }
 
-    /// Return the numeric rank (`1 = Error` .. `5 = Trace`).
+    /// Return the numeric rank (`1 = Error` ..
     #[inline]
     #[must_use]
     pub const fn rank(self) -> u8 {
@@ -159,7 +114,7 @@ impl fmt::Display for Level {
     }
 }
 
-/// Filter for log levels. `Off` disables all logging.
+/// Filter for log levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(usize)]
 pub enum LevelFilter {
@@ -178,20 +133,9 @@ pub enum LevelFilter {
 }
 
 impl LevelFilter {
-    /// Parse an `ATERM_LOG`-style level name (`off`, `error`, `warn`, `info`,
-    /// `debug`, `trace`), ASCII case-insensitively, ignoring surrounding
-    /// whitespace. Returns `None` for anything else so callers choose their
-    /// own default.
-    ///
-    /// ```rust
-    /// use aterm_log::LevelFilter;
-    /// assert_eq!(LevelFilter::parse("Warn"), Some(LevelFilter::Warn));
-    /// assert_eq!(LevelFilter::parse("verbose"), None);
-    /// ```
+    /// Parse an `ATERM_LOG`-style level name (`off`, `error`, `warn`, `info`, `debug`, `trace`), ASCII case-insensitively, ignoring surrounding whitespace.
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
-        // An if-chain, not a lookup table: iterating a `[(&str, LevelFilter); 6]`
-        // needs an array-to-slice unsize coercion the verifier cannot lower.
         let s = s.trim();
         if s.eq_ignore_ascii_case("off") {
             Some(LevelFilter::Off)
@@ -211,20 +155,15 @@ impl LevelFilter {
     }
 }
 
-/// The size one log file may reach before a host rotates it to `<name>.1`
-/// (keeping total log size near 8 MiB).
+/// The size one log file may reach before a host rotates it to `<name>.1` (keeping total log size near 8 MiB).
 pub const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Maximum bytes of one sanitized INFO, DEBUG or TRACE record body (see
-/// [`sanitize_record`]).
+/// Maximum bytes of one sanitized INFO, DEBUG or TRACE record body (see [`sanitize_record`]).
 pub const MAX_RECORD_BYTES: usize = 512;
 
-/// Maximum bytes of one sanitized WARN or ERROR record body (see
-/// [`sanitize_record_for`]).
+/// Maximum bytes of one sanitized WARN or ERROR record body (see [`sanitize_record_for`]).
 pub const MAX_ALERT_RECORD_BYTES: usize = 1024;
 
-// Emits native `ensures` clauses under `cfg(trust_verify)` and a plain fn on
-// other compilers. Theorems refer to `trust_import_aterm_log__<fn>`.
 #[cfg(trust_verify)]
 macro_rules! trust_contract_fn {
     (
@@ -266,8 +205,7 @@ macro_rules! verify_island {
 }
 
 trust_contract_fn! {
-    /// Whether a log file of `len` bytes has outgrown [`MAX_LOG_BYTES`] and should
-    /// be rotated.
+    /// Whether a log file of `len` bytes has outgrown [`MAX_LOG_BYTES`] and should be rotated.
     #[must_use]
     pub fn should_rotate(len: u64) -> bool
     clauses [ensures result == (len > 4194304) by should_rotate_is_threshold]
@@ -276,8 +214,6 @@ trust_contract_fn! {
     }
 }
 
-// Spec `should-rotate-threshold` (SPECS.md): for every length, rotation is due
-// exactly past MAX_LOG_BYTES = 4 MiB. Kernel-checked against the compiled body.
 verify_island! {
     clean {
         theorem should_rotate_is_threshold (len : UInt64) :
@@ -286,8 +222,7 @@ verify_island! {
     }
 }
 
-/// The body cap for a record at `level`: [`MAX_ALERT_RECORD_BYTES`] for WARN
-/// and ERROR, [`MAX_RECORD_BYTES`] for everything else.
+/// The body cap for a record at `level`: [`MAX_ALERT_RECORD_BYTES`] for WARN and ERROR, [`MAX_RECORD_BYTES`] for everything else.
 #[inline]
 #[must_use]
 pub const fn record_cap(level: Level) -> usize {
@@ -298,10 +233,6 @@ pub const fn record_cap(level: Level) -> usize {
 }
 
 /// Sanitize one formatted record body for a line-oriented log file.
-///
-/// Replaces control characters (C0, DEL, C1) with U+FFFD to prevent record
-/// forgery (`\n`) or terminal escape injection (`ESC]…`), and caps length near
-/// [`MAX_RECORD_BYTES`] with `…`. Clean short input is returned borrowed.
 #[inline]
 #[must_use]
 pub fn sanitize_record(msg: &str) -> Cow<'_, str> {
@@ -326,7 +257,6 @@ fn sanitize_capped(msg: &str, cap: usize) -> Cow<'_, str> {
     if clean && msg.len() <= cap {
         return Cow::Borrowed(msg);
     }
-    // Constant capacity so the verifier can bound the reservation (`cap` plus a 3-byte `…`).
     const OUT_CAPACITY: usize = MAX_ALERT_RECORD_BYTES + 4;
     let cap = if cap > MAX_ALERT_RECORD_BYTES {
         MAX_ALERT_RECORD_BYTES
@@ -335,7 +265,6 @@ fn sanitize_capped(msg: &str, cap: usize) -> Cow<'_, str> {
     };
     let mut out = String::with_capacity(OUT_CAPACITY);
     for c in msg.chars() {
-        // Count the replacement's 3-byte width so 1-byte control chars cannot overrun `cap`.
         let (pushed, pushed_len) = if c.is_control() {
             ('\u{FFFD}', 3usize)
         } else {
@@ -431,7 +360,7 @@ pub trait Log: Send + Sync {
     fn flush(&self);
 }
 
-static MAX_LEVEL: AtomicUsize = AtomicUsize::new(0); // LevelFilter::Off
+static MAX_LEVEL: AtomicUsize = AtomicUsize::new(0);
 static LOGGER: std::sync::OnceLock<&'static dyn Log> = std::sync::OnceLock::new();
 
 /// Set the global maximum log level.
@@ -439,10 +368,8 @@ pub fn set_max_level(level: LevelFilter) {
     MAX_LEVEL.store(level as usize, Ordering::Relaxed);
 }
 
-/// Install a global logger. Returns `Err` if one is already installed.
-///
+/// Install a global logger.
 /// # Errors
-///
 /// Returns `SetLoggerError` if a logger has already been set.
 pub fn set_logger(logger: &'static dyn Log) -> Result<(), SetLoggerError> {
     match LOGGER.set(logger) {
@@ -463,11 +390,8 @@ impl fmt::Display for SetLoggerError {
 
 impl std::error::Error for SetLoggerError {}
 
-/// Log a record. Called by the macros; not intended for direct use.
+/// Log a record.
 #[doc(hidden)]
-// Skipped by the verifier: the body calls `OnceLock::get` and a runtime-chosen
-// `dyn Log` impl, neither of which it can see. Each concrete logger is verified
-// on its own, and `log!` call sites treat this as an expected absent callee.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn __log(
     level: Level,
@@ -566,21 +490,13 @@ macro_rules! trace {
 }
 
 /// Process-global environment mutation serialized through a single lock.
-///
-/// `set_var` and `remove_var` are `unsafe` because they race `getenv` on other
-/// threads, and the Trust toolchain denies them via `env_mutation`. Routing all
-/// in-process mutations through [`ENV_LOCK`] serializes our own writers and
-/// lock-aware readers, though `getenv` in C libraries on other threads remains
-/// unsynchronized; callers must still be single-threaded startup, launcher, or
-/// test paths.
 pub mod env {
     use std::ffi::{OsStr, OsString};
     use std::sync::{Mutex, MutexGuard};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Acquire [`ENV_LOCK`], recovering from poisoning. Named `env_lock` (not
-    /// `lock`) so `aterm-census` registers it in `GUARD_HELPERS`.
+    /// Acquire [`ENV_LOCK`], recovering from poisoning.
     fn env_lock() -> MutexGuard<'static, ()> {
         match ENV_LOCK.lock() {
             Ok(guard) => guard,
@@ -637,8 +553,7 @@ pub mod env {
         set_locked(key.as_ref(), value.as_ref());
     }
 
-    /// Run `body` with `key` set to `value`, holding [`ENV_LOCK`] and restoring
-    /// the prior state on return or unwind. `body` must not re-enter this module.
+    /// Run `body` with `key` set to `value`, holding [`ENV_LOCK`] and restoring the prior state on return or unwind.
     pub fn scoped<T>(
         key: impl AsRef<OsStr>,
         value: impl AsRef<OsStr>,
@@ -647,8 +562,7 @@ pub mod env {
         scoped_opt(key.as_ref(), Some(value.as_ref()), body)
     }
 
-    /// Run `body` with `key` unset, holding [`ENV_LOCK`] and restoring the prior
-    /// state on return or unwind. `body` must not re-enter this module.
+    /// Run `body` with `key` unset, holding [`ENV_LOCK`] and restoring the prior state on return or unwind.
     pub fn scoped_unset<T>(key: impl AsRef<OsStr>, body: impl FnOnce() -> T) -> T {
         scoped_opt(key.as_ref(), None, body)
     }
@@ -756,14 +670,12 @@ mod tests {
         assert_eq!(info, sanitize_record(&long));
         assert!(info.len() <= MAX_RECORD_BYTES + '…'.len_utf8());
 
-        // A WARN body between the two caps is kept whole, and borrowed.
         let mid = "m".repeat(MAX_RECORD_BYTES + 100);
         assert!(matches!(sanitize_record_for(Level::Warn, &mid), Cow::Borrowed(m) if m == mid));
     }
 
     #[test]
     fn test_sanitize_record_replaces_control_characters() {
-        // ESC (escape injection), newline (record forgery), DEL, C1 CSI.
         let msg = "path '\x1b]0;evil\x07\nFAKE\u{7f}\u{9b}'";
         let out = sanitize_record(msg);
         assert!(!out.chars().any(char::is_control));
@@ -775,8 +687,7 @@ mod tests {
 
     #[test]
     fn test_sanitize_record_cap_respects_char_boundaries() {
-        // Multibyte chars straddling the cap must not split a code point.
-        let long = "é".repeat(MAX_RECORD_BYTES); // 2 bytes each
+        let long = "é".repeat(MAX_RECORD_BYTES);
         let out = sanitize_record(&long);
         assert!(out.len() <= MAX_RECORD_BYTES + '…'.len_utf8());
         assert!(out.ends_with('…'));
@@ -785,7 +696,6 @@ mod tests {
 
     #[test]
     fn test_sanitize_record_control_char_at_boundary_stays_within_reservation() {
-        // A 1-byte control char at either cap is pushed as 3-byte U+FFFD.
         for (level, cap) in [
             (Level::Info, MAX_RECORD_BYTES),
             (Level::Error, MAX_ALERT_RECORD_BYTES),
@@ -800,8 +710,8 @@ mod tests {
 
 #[cfg(test)]
 mod env_tests {
-    //! Each test uses a distinct key so parallel tests do not race on values.
 
+    //! Each test uses a distinct key so parallel tests do not race on values.
     #[test]
     fn take_reads_and_removes_in_one_step() {
         const KEY: &str = "ATERM_LOG_TEST_TAKE";

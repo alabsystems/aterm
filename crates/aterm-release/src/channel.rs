@@ -62,6 +62,7 @@ pub fn check_channel_version(
 }
 
 /// Read one `key = "value"` string out of one line-oriented `[table]`: only `key = "value"`
+/// on its own line inside the header counts.
 fn table_string(toml: &str, table: &str, key: &str) -> Option<String> {
     let mut in_table = false;
     for line in toml.lines() {
@@ -86,7 +87,7 @@ fn table_string(toml: &str, table: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Exactly two non-empty GitHub-name segments. Mirrors `aterm_update_core::is_valid_slug`,
+/// Exactly two non-empty GitHub-name segments.
 fn validate_slug(slug: &str) -> Result<()> {
     let ok_segment = |segment: &str| {
         !segment.is_empty()
@@ -400,23 +401,33 @@ pub fn head_patch_argv(endpoint: &str) -> Vec<String> {
 
 /// Both halves of putting one cut onto its channel release.
 pub trait ChannelRelease {
-    /// Has this cut's head PATCH already landed? Asked first, read-only: the bound release
+    /// Has this cut's head PATCH already landed?
     fn head_made(&mut self) -> Result<bool>;
     /// The local half: `dist/` re-proved against the signed appcast (and the roster pair
+    /// against the master signature), and the path of every asset this cut publishes.
     fn artifacts(&mut self) -> Result<Vec<PathBuf>>;
     /// Converge one asset onto the release under a durable one-shot upload intent,
+    /// re-downloaded and proved byte-identical to the local file.
     fn upload(&mut self, file: &Path) -> Result<()>;
     /// From a fresh listing: the release carries exactly the asset set the deployed
+    /// updater elects, each byte-identical to this cut's artifact.
     fn prove_assets(&mut self) -> Result<()>;
     /// The head half of the floors alone, from what the channel serves now: the channel
+    /// head (the release the evergreen pointer names) is this cut or older.
     fn ratchet_head(&mut self) -> Result<()>;
     /// Every floor: [`Self::ratchet_head`], then the fleet's — the carried apply floor,
+    /// the monotonic build, and a machine-roster generation this cut's roster covers.
     fn ratchet(&mut self) -> Result<()>;
     /// Bind the release object this cut publishes onto — the engine's source release,
+    /// adopted, or a draft created under a durable one-shot intent — and record it in
+    /// the journal.
     fn bind(&mut self) -> Result<()>;
     /// The one PATCH that makes the release the channel head: [`HEAD_PATCH`], guarded by
+    /// the release capability and lease.
     fn make_head(&mut self) -> Result<()>;
     /// What a credential-less client now sees: the release elected by the client's
+    /// replay, the evergreen pointer naming it and serving its appcast, and every
+    /// required asset downloading.
     fn prove_head(&mut self) -> Result<()>;
 }
 
@@ -456,6 +467,8 @@ mod tests {
     const REAL_MANIFEST: &str = include_str!("../../../Cargo.toml");
 
     /// The source publish and the binary cut share one vX.Y.0 release, so the source
+    /// attestation pair rides beside the elected set at most once each; any other
+    /// foreign name, or a duplicate, is refused.
     #[test]
     fn the_source_attestation_pair_may_share_the_release_and_nothing_else_may() {
         let mut with_pair = required_asset_names("0.65.0", true, true);
@@ -483,6 +496,8 @@ mod tests {
     }
 
     /// The channel's workspace version must EQUAL the cut's: behind (the observed
+    /// `v0.6.0` tag on a `0.5.0` tree) and ahead both refuse; an empty body is the
+    /// only skip, and a manifest with no version is unknown, never absent.
     #[test]
     fn the_channel_version_must_equal_the_cut() {
         let at = |v: &str| format!("[workspace.package]\nversion = \"{v}\"\nedition = \"2024\"\n");
@@ -590,6 +605,7 @@ update_channel = \"someone/else\"
     }
 
     /// The sidecar is only worth publishing if `shasum -a 256 -c` accepts it: hex digest,
+    /// two spaces, exact asset name, one trailing newline.
     #[test]
     fn sidecar_contents_are_shasum_check_records() {
         let hash = "c6".repeat(32);
@@ -700,6 +716,7 @@ update_channel = \"someone/else\"
     }
 
     /// The provenance record and the dSYM archive are refused on the channel, and no
+    /// reading of the version (not even a lost journal's widest) calls either publishable.
     #[test]
     fn the_debugging_aids_never_join_the_channel_set() {
         let aids = [
@@ -717,6 +734,8 @@ update_channel = \"someone/else\"
     }
 
     /// A release is this version's when it holds nothing a cut of this version does not
+    /// publish, and a withdrawal takes the journal's uploads (or, with a lost journal,
+    /// every app asset of this version), never a source shape.
     #[test]
     fn a_withdrawal_takes_this_cuts_assets_and_never_the_source_shapes() {
         let v = "0.95.0";

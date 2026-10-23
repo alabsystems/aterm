@@ -2,9 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The client (design §10.1): a call is routed, loaded, authorized at the door, sent through
-//! the effect seam (`Fx::gh`), classified, rate-recorded and retried, every pause slept through
-//! `Fx::sleep`. The only memo is a repository's numeric id.
+//! HTTP client for routed, rate-recorded, and retried GitHub API calls.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -47,8 +45,7 @@ pub enum Accept {
 }
 
 impl Accept {
-    /// `application/vnd.github+json`, `application/vnd.github.raw+json`,
-    /// `application/vnd.github.sha`, `application/octet-stream`, or the media type.
+    /// Header value for this `Accept` media type.
     #[inline]
     #[must_use]
     pub fn header_value(&self) -> &str {
@@ -65,9 +62,7 @@ impl Accept {
 /// A call's default body limit: 32 MiB.
 const CALL_LIMIT: u64 = 32 << 20;
 
-/// One request, before routing. `#[non_exhaustive]` stops a struct literal outside agh, not an
-/// assignment to a field, so `method` can be set after `Call::get`: `Github::call` refuses any
-/// method but GET and HEAD before routing (plan §8, pipeline step 0).
+/// One request before routing.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Call {
@@ -75,9 +70,9 @@ pub struct Call {
     pub method: Method,
     /// The origin's role.
     pub origin: OriginRole,
-    /// The path, already encoded (`path::segment` and friends).
+    /// The path, already encoded.
     pub path: String,
-    /// Raw pairs; `path_and_query` encodes them.
+    /// Raw query pairs; `path_and_query` encodes them.
     pub query: Vec<(String, String)>,
     /// The Accept header.
     pub accept: Accept,
@@ -91,25 +86,20 @@ pub struct Call {
     pub deadlines: Deadlines,
     /// `If-None-Match`.
     pub if_none_match: Option<String>,
-    /// Whether a 404 is probed (design §7.3).
+    /// Whether a 404 is probed.
     pub probe_404: bool,
     /// Whether a 301 is followed.
     pub follow_moved: bool,
-    /// Whether one redirect hop to the CDN is made. `call_stream` only: `Fx::gh` rewrites a
-    /// CDN `Location`'s signed query, so `call` refuses a call with `hop` set (CouldNotRun
-    /// `Protocol`) before anything is routed or sent.
+    /// Whether one redirect hop to the CDN is made (`call_stream` only).
     pub hop: bool,
     /// `None`: the client's policy.
     pub retry: Option<RetryPolicy>,
-    /// Hand back any status as an `Answered`, unclassified, with no retry, probe, move or hop:
-    /// the web probe (`Public::probe`) alone.
+    /// Hand back any status as an `Answered`, unclassified, with no retry, probe, move, or hop.
     pub answer_any: bool,
 }
 
 impl Call {
-    /// GET on the api origin, Accept Json, Read idempotency, a 32 MiB limit, `Deadlines::JSON`,
-    /// no validator, the 404 probe on, `follow_moved` when `route.access == Read`, no hop, the
-    /// client's retry policy, `answer_any` off.
+    /// Build a GET call on the API origin with standard defaults.
     pub fn get(path: impl Into<String>, route: RouteRequest) -> Call {
         let follow_moved = route.access == Access::Read;
         Call {
@@ -227,9 +217,7 @@ impl Call {
         self
     }
 
-    /// `path`, then `path::query(&self.query)` when there is a query, joined by `?`, or by
-    /// `&` when `path` already carries a query of its own (a later page's link, a raw path
-    /// as typed).
+    /// Encoded path and query string.
     #[must_use]
     pub fn path_and_query(&self) -> String {
         if self.query.is_empty() {
@@ -320,8 +308,7 @@ impl std::fmt::Debug for Streamed {
     }
 }
 
-/// What a client has done so far, as the CLI's receipt reads it once its verb ran. Each field
-/// is the last seen; under threads it is advisory.
+/// Client request telemetry read by the CLI receipt.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Meter {
     /// Requests sent (retries, probes, moves and hops included).
@@ -334,14 +321,12 @@ pub struct Meter {
     pub moved: Option<(Slug, Slug)>,
     /// Whether a hop was made.
     pub hopped: bool,
-    /// Whether a read went anonymous without `--anonymous` (a chain's anonymous step, or no
-    /// agh.toml): the receipt then prints itself when the anonymous budget is under 10.
+    /// Whether a read went anonymous without `--anonymous`.
     pub fell_to_anonymous: bool,
 }
 
 impl Meter {
-    /// The last request's identity as a label: the profile's name, or `anonymous` (also when
-    /// nothing was sent).
+    /// The last request's identity as a label.
     #[inline]
     pub(crate) fn label(&self) -> &str {
         self.as_.as_ref().map_or("anonymous", IdentityRef::label)
@@ -389,9 +374,7 @@ pub struct GithubBuilder {
 }
 
 impl GithubBuilder {
-    /// Defaults: `HttpTransport::new(env)`, `Endpoints::github_com()`, `ProcessEnv`,
-    /// `RateBook::none()`, `Fx::live()`, caller `lib`, `RetryPolicy::STANDARD`, a new
-    /// `Redactor`.
+    /// Create a builder with default transport, endpoints, env, rate book, fx, and retry policy.
     #[must_use]
     pub fn new(router: Router) -> GithubBuilder {
         GithubBuilder {
@@ -408,17 +391,14 @@ impl GithubBuilder {
         }
     }
 
-    /// Another transport: `ScriptedTransport` or `HttpTransport::direct` in tests. `Transport`
-    /// is sealed, so these and `HttpTransport::new` are all it can be: no transport but agh's
-    /// own is ever handed a header.
+    /// Set a custom sealed transport.
     #[must_use]
     pub fn transport(mut self, transport: Arc<dyn Transport>) -> GithubBuilder {
         self.transport = Some(transport);
         self
     }
 
-    /// `Endpoints::github_com()` or, in a test or debug build, `Endpoints::loopback(..)`: the
-    /// only two an `Endpoints` outside agh can be.
+    /// Set the target endpoints.
     #[must_use]
     pub fn endpoints(mut self, endpoints: Endpoints) -> GithubBuilder {
         self.endpoints = endpoints;
@@ -439,8 +419,7 @@ impl GithubBuilder {
         self
     }
 
-    /// The effect seam every clock read, sleep and round trip of this client crosses: the
-    /// CLI's `Ctx.fx`, or `Fx::simulated` in a test.
+    /// Set the effect seam for clock reads, sleeps, and round trips.
     #[must_use]
     pub fn fx(mut self, fx: Arc<Fx>) -> GithubBuilder {
         self.fx = Some(fx);
@@ -504,16 +483,11 @@ impl GithubBuilder {
 }
 
 impl Github {
-    /// The pipeline, the body read whole.
+    /// Execute a call and read its body whole.
     ///
     /// # Errors
     ///
-    /// The routed, classified error. In M1, a `call.method` other than GET and HEAD is Refused
-    /// `policy.method_not_read` before anything is routed, loaded or sent (plan §8, step 0). A call
-    /// with `hop` set is CouldNotRun `Protocol`, why `a hop is followed only by a streamed
-    /// call`, also before anything is routed: `Fx::gh` rewrites a CDN `Location`, so the hop
-    /// could only fail. The rate book is read and written for api-origin calls only (step
-    /// 2): the web and CDN origins do not spend the API budget.
+    /// Returns the routed, classified error, or refuses non-GET/HEAD or hopped calls.
     pub fn call(&self, call: &Call) -> Result<Answered> {
         method_gate(call)?;
         if call.hop {
@@ -528,9 +502,7 @@ impl Github {
             .and_then(Got::into_answered)
     }
 
-    /// The pipeline, the body streamed (2xx only; a non-2xx body is read, up to 64 KiB, to
-    /// classify it). The one pipeline that follows `call.hop`: `Fx::gh_stream` hands back the
-    /// `Location` as sent.
+    /// Execute a call and stream its 2xx body.
     ///
     /// # Errors
     ///
@@ -608,8 +580,7 @@ impl Github {
             .clone()
     }
 
-    /// Load (once per process, then cached) and judge a profile. A loaded token is taught to
-    /// the redactor.
+    /// Load (once per process, then cached) and judge a profile.
     #[must_use]
     pub fn presence(&self, profile: &str) -> Presence {
         let Some(row) = self.inner.router.profile(profile) else {
@@ -633,8 +604,7 @@ impl Github {
         }
     }
 
-    /// `Profile::drafts_vouched` of the router's profile over its cached credential; false when
-    /// the profile is unknown or gives no credential.
+    /// Whether the profile's cached credential vouches for draft access.
     #[must_use]
     pub fn drafts_vouched(&self, profile: &str) -> bool {
         if self.presence(profile) != Presence::Present {
@@ -653,9 +623,7 @@ impl Github {
         self.inner.router.decide(route, &|p| self.presence(p))
     }
 
-    /// The repository's id: the memo, else `GET /repos/{o}/{r}` under `route` re-targeted to
-    /// `Repo(slug)`, so the Router judges the repository the request reads, whatever target
-    /// the caller's route named.
+    /// Return the repository's numeric ID from the memo or via `GET /repos/{o}/{r}`.
     ///
     /// # Errors
     ///
@@ -664,7 +632,7 @@ impl Github {
         self.repo_id_counted(slug, route).map(|(id, _)| id)
     }
 
-    /// `repo_id`, with the requests it sent (0 from the memo): the page walker counts them.
+    /// `repo_id`, with the requests it sent (0 from the memo).
     pub(crate) fn repo_id_counted(&self, slug: &Slug, route: &RouteRequest) -> Result<(u64, u32)> {
         if let Some(id) = self
             .inner
@@ -700,10 +668,7 @@ impl Github {
             .insert(slug.key(), id);
     }
 
-    /// The same transport, endpoints, env, rate book, fx, caller, retry policy, redactor and
-    /// backstop over another router, with its own credential cache, id memo and meter.
-    /// Provisioning binds a new token's login through a one-profile router
-    /// (`identity::provision::add`), so no call ever skips the router.
+    /// Clone client configuration over another router with fresh caches and meter.
     #[must_use]
     pub fn with_router(&self, router: Router) -> Github {
         let inner = &self.inner;
@@ -751,9 +716,7 @@ enum Body {
     Stream(Box<dyn Read + Send>),
 }
 
-/// A streamed 2xx body held to the call's limit (plan §8 step 9). Byte `limit + 1` is an io error
-/// whose inner error is aterm-http's `TooLarge`, the error aterm-http's own limit gives, so
-/// `wire_kind_of` reads both alike.
+/// A streamed 2xx body held to the call's limit (plan §8 step 9).
 struct Bounded {
     inner: Box<dyn Read + Send>,
     limit: u64,
@@ -773,7 +736,6 @@ impl Read for Bounded {
         if buf.is_empty() {
             return Ok(0);
         }
-        // One byte past the limit is enough to know the limit is passed.
         let room = self.limit.saturating_add(1).saturating_sub(self.consumed);
         let want = usize::try_from(room).map_or(buf.len(), |room| room.min(buf.len()));
         if want == 0 {
@@ -806,9 +768,7 @@ struct Got {
 
 impl Got {
     /// The answer: `whole` is a `Reading::Whole` body, already read and held to the call's
-    /// limit (`Prepared::held`), and taken as it is; with none, the body streams. A streamed
-    /// body is held to `limit` here: the wire request's own limit is at least `HEAD_MAX`, so
-    /// that a failed answer's body can always be read to classify it (`Prepared::request`).
+    /// limit (`Prepared::held`), and taken as it is; with none, the body streams.
     fn of(
         response: WireResponse,
         whole: Option<Vec<u8>>,
@@ -844,8 +804,7 @@ impl Got {
         }
     }
 
-    /// `call`'s answer. A streamed body is read whole here, and a read failure is the
-    /// call's error, as in `Prepared::held`, never a truncated answer.
+    /// `call`'s answer.
     fn into_answered(self) -> Result<Answered> {
         let body = match self.body {
             Body::Whole(bytes) => bytes,
@@ -911,10 +870,7 @@ struct Prepared {
 }
 
 impl Prepared {
-    /// The wire request this attempt sends. Its wire limit is at least `HEAD_MAX`, whole or
-    /// streamed, so a failed answer's body is read to classify it even under a small call
-    /// limit (a file or an asset shorter than GitHub's error JSON). An answer the call takes
-    /// is held to the call's limit after: a whole body by `held`, a stream by `Got::of`.
+    /// The wire request this attempt sends.
     fn request(&self) -> WireRequest<'_> {
         WireRequest {
             method: self.method,
@@ -930,12 +886,6 @@ impl Prepared {
     /// An answer the call takes, held to the call's limit: a whole body longer than `limit`
     /// is the wire's `TooLarge` at `Answered`, exactly as a wire read under that limit would
     /// have answered it; a stream is held as it is read (`Got::of`).
-    ///
-    /// `Fx::gh` hands on a body longer than the wire's `max(limit, HEAD_MAX)` cut one byte
-    /// past it, with its head, so every such refusal keeps its status, request id and rate
-    /// (plan §8 step 8), and names the call's own limit.
-    ///
-    /// The whole body is handed back, for `Got::of` to take as it is; a stream is `None`.
     fn held(&self, response: &mut WireResponse) -> std::result::Result<Option<Vec<u8>>, WireError> {
         match self.reading {
             Reading::Whole => response.read_body(self.limit).map(Some),
@@ -990,10 +940,7 @@ fn after_prefix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
         .filter(|rest| rest.is_empty() || rest.starts_with(['/', '?']))
 }
 
-/// `call` re-targeted at a moved repository's new name, as the move step (plan §8 step 5) sent it:
-/// a `/repos/{old}` prefix becomes `/repos/{new}`, and a route about `old` is about `new`, so
-/// the Router decides it for the repository's new owner (design §7.2). The page walker uses it
-/// for the pages after a followed 301; any other path is kept.
+/// Retarget `call` to a moved repository's new slug.
 pub(crate) fn retarget(call: &mut Call, old: &Slug, new: &Slug) {
     if let Some(rest) = after_prefix(&call.path, &repo_root(old)).map(str::to_string) {
         call.path = format!("{}{rest}", repo_root(new));
@@ -1003,9 +950,7 @@ pub(crate) fn retarget(call: &mut Call, old: &Slug, new: &Slug) {
     }
 }
 
-/// The pipeline's step 0 refusal (plan §8): Refused `policy.method_not_read`, why `{METHOD} is a
-/// write, and agh M1 sends only GET and HEAD`, next `writes arrive in M2: use gh for now`.
-/// `Raw::get` gives the same refusal before any request of its own.
+/// Build the refusal error for write methods in M1.
 pub(crate) fn method_refusal(method: Method, repo: Option<&Slug>) -> Error {
     Refusal {
         code: RefusalCode::MethodNotRead,
@@ -1028,13 +973,10 @@ fn method_gate(call: &Call) -> Result<()> {
     }
 }
 
-/// A failed answer's kept headers and the first 64 KiB of its body. A read that fails part
-/// way (a body cut short) is classified on the bytes it read: `read_to_end` keeps them, and
-/// the status and headers alone still classify the answer.
+/// A failed answer's kept headers and the first 64 KiB of its body.
 fn head_of(response: WireResponse) -> (Vec<(String, String)>, Vec<u8>) {
     let WireResponse { headers, body, .. } = response;
     let mut head = Vec::new();
-    // The error is dropped, not the bytes before it.
     body.take(HEAD_MAX)
         .read_to_end(&mut head)
         .unwrap_or_default();
@@ -1221,9 +1163,6 @@ impl Github {
         let prepared = self.prepare(call, decided, reading);
         let key = book_key(&decided.identity);
         let booked = call.origin == OriginRole::Api && self.inner.rate_book.enabled();
-        // `/rate_limit` spends no budget (design §13.2), and it is what `agh rate` reads when
-        // the book says a budget is spent, so the book never refuses it; its answer is still
-        // recorded.
         let free = path_only(&call.path) == "/rate_limit";
         if booked && !free {
             let now = self.inner.fx.wall_secs()?;
@@ -1344,9 +1283,6 @@ struct Failed<'a> {
 
 impl Github {
     /// Steps 5 to 7: a move, the hop, the 404 rules; any other error goes to the retry rule.
-    /// An `Err` here is final: it is never retried. The hop's own failures (its wire error
-    /// or its classified status) and the 404 probe's own error come back as `Flow::Retry`,
-    /// so `should_retry` judges them like any other answer's (plan §8 steps 4, 6 and 7).
     fn judge(
         &self,
         call: &Call,
@@ -1361,9 +1297,6 @@ impl Github {
                 let id = location.and_then(|l| moved_id(l, &self.inner.endpoints));
                 match id {
                     Some(id)
-                        // A WriterRead or a write never follows a 301, whatever
-                        // `follow_moved` says (design §7.2): the cutter must not silently
-                        // switch repositories, and `Call`'s fields are public.
                         if call.method.is_read()
                             && call.route.access == Access::Read
                             && call.origin == OriginRole::Api
@@ -1391,9 +1324,7 @@ impl Github {
         }
     }
 
-    /// Step 5: follow a 301 to `/repositories/{id}` once. The id is looked up anonymously,
-    /// the original access is routed again for the new slug, and the request is issued once
-    /// more under `/repos/{new}` with `follow_moved` off.
+    /// Step 5: follow a 301 to `/repositories/{id}` once.
     fn follow_move(
         &self,
         call: &Call,
@@ -1404,7 +1335,6 @@ impl Github {
         let Some(old) = repo_of(&call.route).cloned() else {
             return Err(failed.error);
         };
-        // Only a path under `/repos/{old}` is re-targeted (`retarget` keeps any other).
         if after_prefix(&call.path, &repo_root(&old)).is_none() {
             return Err(failed.error);
         }
@@ -1430,8 +1360,6 @@ impl Github {
                     .with_next("name its new owner/name with -R")
                     .with_repo(old.to_string()));
             }
-            // The lookup's route is Unscoped, so its own errors name no repository; every
-            // error of the call names the one it was about (plan §8 step 8).
             Err(error) if error.repo.is_none() => return Err(error.with_repo(old.to_string())),
             Err(error) => return Err(error),
         };
@@ -1450,8 +1378,6 @@ impl Github {
                 ))
                 .with_repo(old.to_string())
             })?;
-        // The lookup named the id's repository, so a numeric next link of the new name's
-        // listing needs no request of its own (`repo_id`).
         self.remember_repo_id(&new, id);
         let mut moved = call.clone();
         retarget(&mut moved, &old, &new);
@@ -1467,14 +1393,7 @@ impl Github {
         Ok(got)
     }
 
-    /// Step 6: the one hop, sent with no credential (`hop::rebuild`). Its 2xx is the answer;
-    /// another redirect is CouldNotRun `Protocol`; any other status is classified. What fails
-    /// before the hop is sent (no Location, a Location `hop::rebuild` refuses) is final. What
-    /// the hop itself answers (a wire error, a classified status) goes to `should_retry`, whose
-    /// next attempt starts again at the api origin for a fresh Location. Both final errors keep
-    /// the redirect's exchange (its status, request id and rate, step 8). The hop's own errors
-    /// are anonymous (it carries no credential), and their `tried` names the redirect and,
-    /// when the hop answered, its status.
+    /// Step 6: the one hop, sent with no credential (`hop::rebuild`).
     fn hop(
         &self,
         call: &Call,
@@ -1512,8 +1431,6 @@ impl Github {
             meter.hopped = true;
         }
         let requests = failed.requests.saturating_add(1);
-        // The hop is sent with no credential, so its own failures are the anonymous hop's,
-        // and `tried` names the redirect it followed (who was sent, and what it answered).
         let redirected = Tried::Sent {
             as_: prepared.as_.label().to_string(),
             status: failed.status,
@@ -1528,7 +1445,6 @@ impl Github {
             }
         };
         let status = response.status;
-        // Only a 2xx: the hop carries no If-None-Match, so a 304 here is a second redirect.
         if is_success(status, Reading::Stream) {
             let mut got = Got::of(response, None, &prepared.as_, requests, None, call.limit);
             got.hopped = true;
@@ -1557,8 +1473,7 @@ impl Github {
         Ok(Flow::Retry(error, 1))
     }
 
-    /// Step 7: a 404 on a `Repo(slug)` target (design §7.3). Its NotFound and NotVisible
-    /// are final; the probe's own error goes to the retry rule.
+    /// Step 7: a 404 on a `Repo(slug)` target (design §7.3).
     fn judge_404(
         &self,
         call: &Call,
@@ -1571,8 +1486,6 @@ impl Github {
         let as_ = prepared.as_.label().to_string();
         let root = repo_root(slug);
         let path = path_only(&call.path);
-        // A missing OAuth scope is named whatever the verdict (design §7.2): it is the one sign
-        // that the 404 is the token's scope, not an absent resource.
         let scope_next =
             classify::missing_scope(failed.headers).map(|scope| classify::scope_next(&scope));
         let next = scope_next
@@ -1641,7 +1554,6 @@ impl Github {
                     path: probe_path,
                     status: got.status,
                 };
-                // The next is classify's: the kind's, or the missing scope it names.
                 Err(error
                     .recast(Kind::NotFound, why)
                     .with_tried(vec![sent, probe]))
@@ -1659,8 +1571,6 @@ impl Github {
                     .with_tried(vec![sent, probe])
                     .with_next(next))
             }
-            // The probe's own error is the call's, and goes to `should_retry` under the call's
-            // attempt count (step 4): the probe itself is sent once, with no retry of its own.
             Err(probed) => Ok(Flow::Retry(probed, probe_sent)),
         }
     }

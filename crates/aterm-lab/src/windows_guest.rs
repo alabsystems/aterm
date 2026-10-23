@@ -8,6 +8,10 @@ use std::fmt::Write as _;
 
 /// STOCK EXCEPTION: no Windows build of the Trust toolchain is published.
 /// STOCK EXCEPTION: no Windows build of the Trust toolchain is published (the
+/// atpkg `trust` releases carry the aarch64-apple-darwin asset alone), and
+/// Trust ships only its host's std, so the guest compiles with rustup's stock
+/// toolchain plus the x86_64 std: m6's, the Windows build lane's sanctioned
+/// exception (stock 1.97.1 msvc), so a result here is one m6 would see.
 pub const RUST: &str = "1.97.1";
 
 /// Rustup-init for aarch64 Windows.
@@ -444,6 +448,7 @@ pub struct Step {
 }
 
 /// Every step's preamble: stop on a cmdlet's error, no progress records
+/// (PowerShell 5.1 writes them to a redirected stdout as CLIXML).
 const PREAMBLE: &str =
     "$ErrorActionPreference = 'Stop'\n$ProgressPreference = 'SilentlyContinue'\n";
 
@@ -820,6 +825,8 @@ pub fn desktop_step() -> Step {
 }
 
 /// A PowerShell condition that holds when the runner has an active console
+/// session (`query user`, read through cmd.exe so its "No User exists" on
+/// stderr is no PowerShell error).
 fn desktop_condition() -> String {
     format!("((cmd /d /c 'query user 2>nul') -match '^\\s*>?{RUNNER}\\s.*\\sActive\\s')")
 }
@@ -1170,6 +1177,8 @@ mod tests {
     }
 
     /// cmd.exe's reading of a quoted word: quote state toggled at every `"`,
+    /// `^` outside quotes escaping the next character; what is left is the
+    /// command line the program gets.
     fn as_cmd_hands_on(word: &str) -> Result<String, char> {
         let mut out = String::new();
         let mut quoted = false;
@@ -1192,6 +1201,7 @@ mod tests {
     }
 
     /// CommandLineToArgvW's reading of one word (backslashes before a quote
+    /// halved, a quote after an odd run kept, quotes otherwise toggling).
     fn as_argv_reads(word: &str) -> String {
         let mut out = String::new();
         let mut backslashes = 0usize;

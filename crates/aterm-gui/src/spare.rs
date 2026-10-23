@@ -1007,85 +1007,14 @@ pub(crate) enum Scan {
 }
 
 #[cfg(target_os = "macos")]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct BsdInfoWithUniqId {
-    pbsd: libc::proc_bsdinfo,
-    p_uuid: [u8; 16],
-    p_uniqueid: u64,
-    p_puniqueid: u64,
-    p_idversion: i32,
-    p_orig_ppidversion: i32,
-    p_reserve2: u64,
-    p_reserve3: u64,
-}
-
-#[cfg(target_os = "macos")]
-const PROC_PIDT_BSDINFOWITHUNIQID: libc::c_int = 18;
-
-#[cfg(target_os = "macos")]
-fn launched_before(launcher: i32, shell: i32) -> bool {
-    shell.wrapping_sub(launcher) > 0
-}
-
-#[cfg(target_os = "macos")]
-fn launchd_idversion() -> Option<i32> {
-    uniq_identifier(1).map(|info| info.p_idversion)
-}
-
-#[cfg(target_os = "macos")]
-#[repr(C)]
-struct UniqIdentifierInfo {
-    p_uuid: [u8; 16],
-    p_uniqueid: u64,
-    p_puniqueid: u64,
-    p_idversion: i32,
-    p_orig_ppidversion: i32,
-    p_reserve2: u64,
-    p_reserve3: u64,
-}
-
-#[cfg(target_os = "macos")]
-fn uniq_identifier(pid: i32) -> Option<UniqIdentifierInfo> {
-    const PROC_PIDUNIQIDENTIFIERINFO: libc::c_int = 17;
-    let mut info = std::mem::MaybeUninit::<UniqIdentifierInfo>::zeroed();
-    let size = std::mem::size_of::<UniqIdentifierInfo>() as libc::c_int;
-    // SAFETY: `info` is `size` writable bytes; the kernel writes at most `size` bytes.
-    let n = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            PROC_PIDUNIQIDENTIFIERINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            size,
-        )
-    };
-    // SAFETY: zero-initialised plain data, and a full record was written.
-    (n == size).then(|| unsafe { info.assume_init() })
-}
+use aterm_uds::process::{
+    BsdInfoWithUniqId, bsdinfo_uniq, launchd_idversion, launched_before, uniq_identifier,
+};
 
 #[cfg(target_os = "macos")]
 fn short_parent(pid: i32) -> Option<i32> {
     let info = aterm_uds::process::read_short_info(pid)?;
     i32::try_from(info.pbsi_ppid).ok()
-}
-
-#[cfg(target_os = "macos")]
-fn bsdinfo_uniq(pid: i32) -> Option<BsdInfoWithUniqId> {
-    let mut info = std::mem::MaybeUninit::<BsdInfoWithUniqId>::zeroed();
-    let size = std::mem::size_of::<BsdInfoWithUniqId>() as libc::c_int;
-    // SAFETY: `info` is `size` writable bytes; the kernel writes at most `size` bytes.
-    let n = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            PROC_PIDT_BSDINFOWITHUNIQID,
-            0,
-            info.as_mut_ptr().cast(),
-            size,
-        )
-    };
-    // SAFETY: zero-initialised plain data, and a full record was written.
-    (n == size).then(|| unsafe { info.assume_init() })
 }
 
 #[cfg(target_os = "macos")]
@@ -4423,8 +4352,8 @@ impl App {
                 .timeline
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .record(
-                    "spare adopted",
+                .record_row(
+                    crate::session_timeline_view::SPARE_ADOPTED,
                     format!(
                         "tier={} age_ms={} rc_ms={}",
                         transit.tier.as_str(),

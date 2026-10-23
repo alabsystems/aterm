@@ -374,6 +374,19 @@ pub(crate) fn home_abbreviated(path: &str) -> String {
     }
 }
 
+/// A close a test runs inside another ([`CLOSE_BETWEEN_WRITES`]).
+#[cfg(test)]
+pub(crate) type BetweenWrites = Box<dyn FnOnce(&mut App)>;
+
+#[cfg(test)]
+thread_local! {
+    /// What a test runs between a close's two store writes (its deregister,
+    /// which links its closed-index slot, and its log's attach): another
+    /// close, interleaved.
+    pub(crate) static CLOSE_BETWEEN_WRITES: std::cell::RefCell<Option<BetweenWrites>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 impl App {
     /// Detach one terminal view and retire all per-session auxiliary state only when the pool confirms that this was the final attachment.
     pub(crate) fn detach_session_view(&mut self, session: u64) -> bool {
@@ -1523,11 +1536,12 @@ impl App {
         let connections_revision = self.connections.revision();
         let upgrade_revision = self.upgrade_view.revision();
         let activity_revision = self.session_status_revision(session);
+        // The view's head (the session log's row head): one integer.
         let high_id = ctx
             .timeline
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .high_id()
+            .view_head()
             .unwrap_or(0);
         let now = crate::turn_ledger::now_ms();
         let clause = self.chrome_clause_read(retry_window, session, &ctx.timeline, now);
@@ -1587,7 +1601,7 @@ impl App {
         });
         let timeline: Vec<chrome::TimelineNote> = {
             let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-            chrome::timeline_tail(tl.since(None).rev().map(|e| (e.kind, e.t_ms)))
+            chrome::timeline_tail(tl.view_newest_first())
         };
         let can_rename = self.can_rename_session(retry_window);
         let upgrade = sid.as_ref().and_then(|sid| {
@@ -5625,17 +5639,14 @@ impl App {
 
     /// Retire everything keyed by a DROPPED session's stable sid — the shared tail of every mid-run close path, called only after `detach_session_view` returned `true` (the view count actually hit 0): deregister from the process-wide registry (P1.1), remove a worker's task file (`task_launch::retire_task_file`), retire the sibling-discovery graph entry, then run the close-time CONNECTION sweep (design §1.4#4) — drop the closed session's connection records and revoke every edge row it was the SOURCE of in the surviving sessions' tables.
     pub(crate) fn retire_session_registration(&mut self, id: u64) {
-        self.retire_session_registration_keeping(
-            id,
-            Some(crate::session_log::ClosedKeep::Skeleton),
-        );
+        self.retire_session_registration_keeping(id, crate::session_log::ClosedKeep::Skeleton);
     }
 
-    /// [`Self::retire_session_registration`], its closed-session index entry as `keep` says (`None`: none at all, for a close that ends the app, whose index nobody would read): a batch close keeps the skeletons of its last closes only (`session_log::ClosedKeep::plan`, ranked by the closes the batch makes, not its views).
+    /// [`Self::retire_session_registration`], its closed-session index entry as `keep` says: a batch close keeps the skeletons of its last closes only (`session_log::ClosedKeep::plan`, ranked by the closes the batch makes, not its views), and a close that ends the app its summary.
     pub(crate) fn retire_session_registration_keeping(
         &mut self,
         id: u64,
-        keep: Option<crate::session_log::ClosedKeep>,
+        keep: crate::session_log::ClosedKeep,
     ) {
         #[cfg(target_os = "macos")]
         self.withdraw_askpass_session(id);
@@ -5656,25 +5667,40 @@ impl App {
             closing.as_ref().map(|ctx| ctx.watchers.hold_rings()),
             instance.hold_rings(),
         );
-        let stable = self
+        // The deregister links the session's closed-index slot (its exit) in
+        // the write that records its roster exit; what the link frees is
+        // dropped after that write.
+        let deregistered = self
             .store
             .write()
             .unwrap_or_else(|p| p.into_inner())
-            .deregister_local_as(id, reason, by);
-        let reads = closing.as_ref().filter(|_| keep.is_some()).map(|ctx| {
+            .deregister_closing(id, reason, by);
+        let (stable, exit_seq) = match deregistered {
+            Some(closed) => {
+                drop(closed.freed);
+                (Some(closed.sid), closed.exit_seq)
+            }
+            None => (None, None),
+        };
+        let reads = closing.as_ref().map(|ctx| {
             let mut edges = ctx.edges.lock().unwrap_or_else(|p| p.into_inner());
             edges.keep_only(aterm_session::Op::ReadScreen);
             (std::sync::Arc::clone(&ctx.edges), edges.len())
         });
-        if let (Some(stable), Some(ctx), Some((reads, read_rows)), Some(keep)) =
-            (stable.as_ref(), closing, reads, keep)
+        #[cfg(test)]
+        if let Some(between) = CLOSE_BETWEEN_WRITES.with(|b| b.borrow_mut().take()) {
+            between(self);
+        }
+        // The slot's log is built under the session's timeline lock alone and
+        // attached by its seq in a second store write.
+        if let (Some(stable), Some(seq), Some(ctx), Some((reads, read_rows))) =
+            (stable.as_ref(), exit_seq, closing, reads)
         {
-            let entry = {
+            let log = {
                 let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
                 crate::session_log::ClosedLog::kept_from(
                     tl.slog().log(),
                     stable.clone(),
-                    id,
                     reads,
                     read_rows,
                     ctx.nonce,
@@ -5685,7 +5711,7 @@ impl App {
                 .store
                 .write()
                 .unwrap_or_else(|p| p.into_inner())
-                .link_closed_log(entry);
+                .keep_closed_log(seq, log);
             drop(freed);
         }
         drop(held);
@@ -7351,10 +7377,10 @@ mod session_chrome_app_tests {
         {
             let ctx = &app.pool.get(0).expect("session 0").ctx;
             let mut tl = ctx.timeline.lock().unwrap();
-            tl.record("cwd-change", "cwd=/tmp".into());
+            tl.record_hand_row("cwd-change", "cwd=/tmp".into());
             for _ in 0..crate::session_chrome::TIMELINE_TAIL + 2 {
-                tl.record("agent-change", "agent=busy".into());
-                tl.record("human", "bytes=1".into());
+                tl.record_hand_row("agent-change", "agent=busy".into());
+                tl.record_hand_row("human", "bytes=1".into());
             }
         }
         let titles = app.tab_titles(WindowId(0));

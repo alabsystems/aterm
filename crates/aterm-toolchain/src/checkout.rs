@@ -84,9 +84,11 @@ pub fn gone_placed(
 }
 
 /// Entries an empty folder may hold and still read as empty: what Finder
+/// leaves in a folder it showed.
 const FINDER_LITTER: &[&str] = &[".DS_Store", ".localized"];
 
 /// Whether the folder at `p` holds nothing but [`FINDER_LITTER`]: what a
+/// volume's mount point reads while the volume is not mounted.
 fn empty_folder(p: &Path) -> std::io::Result<bool> {
     for entry in std::fs::read_dir(p)? {
         let name = entry?.file_name();
@@ -98,6 +100,10 @@ fn empty_folder(p: &Path) -> std::io::Result<bool> {
 }
 
 /// The device of the entry at `p`, a link not followed: `st_dev`; on Windows
+/// the one identity export's volume serial
+/// (`aterm_sysprobe::volumes::file_id`, the width [`Placing::home_dev`] is
+/// read in), an error where it cannot be read (a FAT volume keeps no file
+/// ids: never a narrower stand-in).
 fn device_of(p: &Path) -> std::io::Result<u64> {
     #[cfg(unix)]
     {
@@ -226,6 +232,7 @@ pub fn gone_with(
 }
 
 /// The looks [`placed_gone`] makes: `stat`, `dev` and `empty` of
+/// [`gone_with`].
 type Looks<'a> = (
     &'a mut dyn FnMut(&Path) -> std::io::Result<bool>,
     &'a mut dyn FnMut(&Path) -> std::io::Result<u64>,
@@ -233,6 +240,11 @@ type Looks<'a> = (
 );
 
 /// The sight of a workspace nested in a removed checkout ([`gone_placed`]):
+/// its nearest existing ancestor (`nearest`, a real folder below `home`, or
+/// `home` itself) is on the home volume's device, holds something (an EMPTY
+/// folder is what a volume's custom mount point — `~/Developer/ext` — reads
+/// while the volume is unplugged: its workspaces are away, not removed), and
+/// no mount point lies on the path between that ancestor and the workspace.
 fn placed_gone(
     checkout: &Path,
     home: &Path,
@@ -267,6 +279,8 @@ fn placed_gone(
 }
 
 /// Is the mount point `m` (of a complete table, [`Placing::mounts`]) on the
+/// path between `ancestor` and `checkout` — under `ancestor` but not it, and
+/// at or above `checkout`?
 fn mounted_between(m: &Path, ancestor: &Path, checkout: &Path) -> bool {
     #[cfg(windows)]
     {
@@ -308,6 +322,9 @@ pub fn never_looked_at(checkout: &Path, home: Option<&Path>) -> Option<String> {
 }
 
 /// Windows' [`VOLUME_ROOTS`]: the place `checkout` lies in when it is not on
+/// `$HOME`'s own drive (or share) — by the root of the key of
+/// `aterm_sysprobe::paths` (`C:\`, `\\SRV\SHARE\`), any spelling — or when
+/// there is no `$HOME` to name that drive, or either path cannot be keyed.
 #[cfg(windows)]
 fn off_home_drive(checkout: &Path, home: Option<&Path>) -> Option<String> {
     let on_home_drive =
@@ -319,6 +336,10 @@ fn off_home_drive(checkout: &Path, home: Option<&Path>) -> Option<String> {
 }
 
 /// The names of `path` past `root`, when `root` is a prefix of it component
+/// by component ([`same_name`]); on Windows by the key of
+/// `aterm_sysprobe::paths` (a verbatim prefix stripped, case folded as NTFS
+/// folds it: those names come back folded), `None` where either cannot be
+/// keyed.
 fn below(path: &Path, root: &Path) -> Option<Vec<std::ffi::OsString>> {
     #[cfg(windows)]
     {
@@ -357,6 +378,10 @@ fn below(path: &Path, root: &Path) -> Option<Vec<std::ffi::OsString>> {
 }
 
 /// One path component against a name: blind to ASCII case on macOS (its
+/// file systems are, by default); on Windows blind to case as NTFS folds it
+/// (each side keyed by `aterm_sysprobe::paths::windows_key` as a name of one
+/// folder), a `name` ending in `*` matching every component it begins
+/// ([`HOME_SKIP`]'s `OneDrive*`); exact elsewhere.
 fn same_name(component: &std::ffi::OsStr, name: &str) -> bool {
     #[cfg(windows)]
     {
@@ -398,6 +423,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     /// What the fixture's `/`-rooted paths are rooted at: a drive on Windows,
+    /// where a path with no prefix is not absolute.
     const ROOT: &str = if cfg!(windows) { "C:" } else { "" };
 
     /// The fixture path `p` (`/`-rooted), absolute here.
@@ -406,6 +432,7 @@ mod tests {
     }
 
     /// A file system of named folders (`true`), links (`false`) and their
+    /// devices; anything else is missing.
     struct Fs {
         entries: BTreeMap<PathBuf, (bool, u64)>,
     }
@@ -449,6 +476,8 @@ mod tests {
     }
 
     /// A WORKSPACE NESTED IN A REMOVED CHECKOUT IS GONE once it can be placed:
+    /// `~/dev/codex-r3/codex-rs` with `~/dev/codex-r3` missing and `~/dev`
+    /// there on the home volume.
     #[test]
     fn a_workspace_nested_in_a_removed_checkout_is_gone_only_where_it_can_be_placed() {
         let fs = Fs::new(&[
@@ -502,6 +531,9 @@ mod tests {
     }
 
     /// WINDOWS' FOLDERS NEVER LOOKED INTO: `AppData` and every `OneDrive*`, in
+    /// any case NTFS folds alike, and a path spelled verbatim (`\\?\C:\…`, as
+    /// `std::fs::canonicalize` answers) against a plain `$HOME` in another
+    /// case; and any drive but `$HOME`'s.
     #[cfg(windows)]
     #[test]
     fn appdata_and_every_onedrive_are_never_looked_into_in_any_spelling() {
@@ -547,6 +579,11 @@ mod tests {
     }
 
     /// WINDOWS PLACES A NESTED WORKSPACE AS UNIX DOES: the home's device and
+    /// its folders' are the one identity export's volume serial (the stub
+    /// this replaced named no device, so nothing was ever placed), a verbatim
+    /// spelling of the workspace is below a plain `$HOME`, and a folder mount
+    /// point the table lists plain (`C:\…`) is between when the walk spells
+    /// it verbatim.
     #[cfg(windows)]
     #[test]
     fn a_windows_workspace_nested_in_a_removed_checkout_is_placed_by_its_volume_serial() {

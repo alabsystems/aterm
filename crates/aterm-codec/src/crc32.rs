@@ -33,7 +33,7 @@ impl Crc32 {
 
     /// Fold `data` into the running checksum.
     #[inline]
-    pub fn update(&mut self, data: &[u8]) {
+    pub const fn update(&mut self, data: &[u8]) {
         self.0 = crc32_ieee_update(self.0, data);
     }
 

@@ -1,36 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The watch: a look at one tab's upgrade that records off any point.
-//!
-//! Every bound the upgrade has (re-ask, give-up, rest, re-arm, retarget) lives
-//! inside a step, and a step runs only at a point the session offers. A session
-//! offering none (a limit's wall, a login box, a turn that never ends) would
-//! have no clock running, so the window's host wakes at each record's deadline
-//! ([`super::watch_at`]) and hands the tab here.
-//!
-//! The watch has no hands. It reads by running the ordinary visit as a dry run
-//! ([`super::Opts::dry_run`]) and writes only under a `try_lock` of the sweep
-//! lock (a held lock is a real visit, so the watch skips). It records its own
-//! fields, the word its read found ([`look_word`]), the usage limit's reset
-//! (`St::limit_until`) and whether it is money (`St::limit_spend`), and makes
-//! at most three hands-free changes:
-//!
-//! 1. the retarget ([`St::for_target`]) onto another build than the record's,
-//!    said once in the ledger as `retargeted:<from>-><to>`;
-//! 2. the limit hold ([`St::hold_clock`]): a usage limit the transcript names a
-//!    reset for holds the re-ask and ready clocks until then;
-//! 3. the re-arm ([`super::rearm`]) of a stopped round that has rested, where
-//!    the reducer's own read says so.
-//!
-//! NO HANDS, BY THE CONNECTION: every connection the watch's read makes is
-//! READ-ONLY (`RelayClient::reads_only`): the pass connects through
-//! `connect_at`, which makes a dry run's read-only; a roster read's always is
-//! (`roster_connection`). Such a connection sends the read verbs alone
-//! (`aterm_agent::READ_VERBS`: status, screen, `await`, …) and refuses every
-//! other request before a byte is written, so no path the watch takes can
-//! type, press, paste, lease or signal over it
-//! (`a_dry_runs_connection_reads_and_has_no_hands`).
+//! Read-only upgrade watch ([`super::watch_at`], [`super::Opts::dry_run`], [`look_word`]).
+//! Applies hands-free [`St::for_target`], [`St::hold_clock`], and [`super::rearm`] updates.
 
 use std::path::PathBuf;
 
@@ -40,15 +12,12 @@ use super::{
     rounds_step, save_at, state_dir, step, sweep_lock, tail_to_end, watch_at,
 };
 
-/// Who looks and why (the window's host, [`watch`]). A told watch reads every
-/// record of the tab still owed a step; a woken one only those past their
-/// [`watch_at`].
+/// Who looks and why ([`watch`], [`watch_at`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Watcher {
     /// The aterm build that looks (`<version>+g<commit>`).
     pub by: String,
-    /// The loop guard that withheld the latest point it did not offer
-    /// ([`crate::supervise::Guard::word`]); empty: none said.
+    /// Latest withholding loop guard ([`crate::supervise::Guard::word`]); empty if none.
     pub guard: String,
     /// The last point the loop offered, unix seconds; `0`: none.
     pub point_at: u64,
@@ -59,25 +28,17 @@ pub struct Watcher {
 /// What one [`watch`] read and wrote.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Watched {
-    /// The step the reducer would take now (the dry run's word, e.g.
-    /// `would-announce`, `wait:limited`, `would-rearm:<why>`, `gave-up@box`);
-    /// empty when nothing was read.
+    /// The step the reducer would take now.
     pub step: String,
-    /// The word the look records on the read's own record ([`look_word`]), or
-    /// the record's own word where the act's last checks recorded it past
-    /// where this read stops ([`St::held_past_go`]).
+    /// Word recorded on the read's record ([`look_word`], [`St::held_past_go`]).
     pub wait: String,
     /// The target the read found (`<version>(<source>)`, or `-`).
     pub to: String,
-    /// The reset of the usage limit the transcript (Codex: its wall) names,
-    /// unix seconds.
+    /// The reset of the usage limit the transcript (Codex: its wall) names, unix seconds.
     pub limit_until: Option<u64>,
-    /// What was written, one word each: `looked` (the watch's own fields),
-    /// `retargeted:<from>-><to>`, `held:<until>`, `rearmed:<why>`.
+    /// What was written, one word each.
     pub wrote: Vec<String>,
-    /// Why nothing was written: `no-record` (no record of the tab owed a
-    /// step), `not-due`, `busy` (a real visit holds the sweep lock), `moved`
-    /// (a visit moved the record since the read), or the lock's own refusal.
+    /// Why nothing was written: `no-record`, `not-due`, `busy`, `moved`, or the lock's own refusal.
     pub skipped: Option<String>,
 }
 
@@ -130,16 +91,7 @@ pub fn watch(opts: &Opts, tab: &str, how: &Watcher) -> Watched {
     watch_with(opts, tab, how, now_s(), &step)
 }
 
-/// [`watch`] at `now`, reading through `read` (the product's [`step`]; a test
-/// drives the real visit with its own kernel and targets) handed a dry run of
-/// `opts` for `tab`.
-///
-/// The look and the hands-free re-arm of `HarnessUpgradeProgress`
-/// (`aterm_models_harness::harness_upgrade_progress_model`): the watch records
-/// what holds the move now as its read found it ([`look_word`]), and re-arms a
-/// rested round, typing nothing, in that order when it does both, so the word
-/// recorded is the new round's. Bound in `upgrade_watch_tests.rs`
-/// (`the_real_watch_is_the_derived_look`).
+/// [`watch`] at `now`, reading through `read` ([`step`], [`look_word`]).
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -166,10 +118,7 @@ pub(super) fn watch_with(
     watch_in(opts, tab, how, now, read)
 }
 
-/// [`watch_with`]'s look. The whole look runs at `now` ([`at_second`]): its read decides whether a
-/// limit still holds, a wait has run out or a reset has passed at the second
-/// the watch was given, as the look itself does — never the wall clock, which
-/// would read a limit handed a second before its reset as over.
+/// [`watch_with`]'s look ([`at_second`]).
 pub(super) fn watch_in(
     opts: &Opts,
     tab: &str,
@@ -199,8 +148,6 @@ fn look_at(
     if owed.is_empty() {
         return Watched::skipped("not-due");
     }
-    // The read: the ordinary visit as a dry run, which takes no lock and types,
-    // signals and writes nothing.
     let dry = Opts {
         dry_run: true,
         only_sid: Some(tab.to_string()),
@@ -209,8 +156,6 @@ fn look_at(
     };
     let r = read(&dry);
     let session = (r.tab == tab && r.session != "-").then(|| r.session.clone());
-    // A record with no tab is this tab's only when the read found its
-    // conversation here, the proof a real visit records the tab by.
     let owed: Vec<(String, St)> = owed
         .into_iter()
         .filter(|(name, st)| !st.tab.is_empty() || session.as_deref() == Some(name.as_str()))
@@ -218,8 +163,6 @@ fn look_at(
     if owed.is_empty() {
         return Watched::skipped("no-record");
     }
-    // The agent's records: under the Claude home its record names, else the
-    // user's own.
     let records = session
         .as_deref()
         .and_then(|s| owed.iter().find(|(name, _)| name == s))
@@ -227,19 +170,12 @@ fn look_at(
             || super::Records::of(&opts.home, None),
             |(_, st)| st.agent_records(&opts.home),
         );
-    // The transcript, read once: until when its usage limit holds (the reset it
-    // names, else a re-ask's wait after a row naming none), which holds the
-    // round's clocks ([`sanctioned`]), and the reset it names, which the record
-    // keeps (`St::limit_until`, never the wait). `None` where it could not be
-    // read, and the record keeps what it had.
     let tail = session
         .as_deref()
         .and_then(|s| records.transcript(s))
         .map(|p| tail_to_end(&p, TAIL_BYTES).0);
     let limit_until = tail.as_deref().and_then(upgrade::transcript_limit_until);
     let limit_reset = tail.as_deref().and_then(upgrade::transcript_limit_reset);
-    // Only a Claude Code visit's dry read says where it read, so only its reads
-    // are worded.
     let claude = owed
         .iter()
         .any(|(name, st)| session.as_deref() == Some(name.as_str()) && reads_transcript(st.agent));
@@ -252,8 +188,6 @@ fn look_at(
         wrote: Vec::new(),
         skipped: None,
     };
-    // The write, under the sweep lock or not at all: a busy lock is a real
-    // visit, which is progress.
     let _held = match sweep_lock(opts) {
         Ok(held) => held,
         Err("another-sweep") => {
@@ -271,8 +205,6 @@ fn look_at(
             continue;
         };
         let ours = session.as_deref() == Some(name.as_str());
-        // Moved since the read (a visit's step) or looked at since: the read is
-        // stale for it.
         if (st.tab != tab && !(st.tab.is_empty() && ours))
             || st.progress_key != before.progress_key
             || st.looked_at != before.looked_at
@@ -293,34 +225,19 @@ fn look_at(
                 tab.clone_into(&mut st.tab);
             }
         }
-        // A told watch of a record not yet due makes only the sanctioned
-        // changes: stamping its look would push the record's watch on by
-        // `WATCH_GAP` at every worker start and activation notice, and a stream
-        // of those would starve the due watch that alone re-parks a worker that
-        // stopped asking.
         if !due && changed.is_empty() {
             continue;
         }
-        // A re-arm read's word is the new round's: recorded only over the round
-        // this watch re-armed.
         let rearmed = changed.iter().any(|w| w.starts_with("rearmed:"));
-        // A word the act's own last checks recorded past where this read stops
-        // (the notice's fence, the restart's last look) is kept: the read
-        // cannot see what held it.
         if ours && st.held_past_go(&r.step) {
             out.wait.clone_from(&st.wait);
         } else if ours && !out.wait.is_empty() && (rearmed || !r.step.starts_with("would-rearm:")) {
             st.note_wait(&out.wait, now);
             st.restart_look = false;
-            // Nothing holds the move: no process stands beside that word
-            // (`St::held_by`).
             if out.wait == upgrade::NEXT_POINT {
                 st.held_by.clear();
             }
         }
-        // The limit's reset as this read says it, for the owner's view
-        // (`Row::limit_passed`): Claude Code's transcript's. And whether that
-        // limit is money, no usage window (`St::limit_spend`).
         if let Some(tail) = tail
             .as_deref()
             .filter(|_| ours && reads_transcript(st.agent))
@@ -332,8 +249,6 @@ fn look_at(
         if due {
             st.looked_at = now;
             st.looked_by.clone_from(&how.by);
-            // The guard said is the one that withheld the latest point: a point
-            // offered since, with no guard said after it, leaves none standing.
             if !how.guard.is_empty() {
                 st.guard.clone_from(&how.guard);
             } else if how.point_at > st.point_at {
@@ -350,16 +265,10 @@ fn look_at(
     out
 }
 
-/// Whether the watch reads `agent`'s record as Claude Code's: through its
-/// transcript, which names its limit's reset, and through its visit's dry
-/// read, which says where it read and the target it found ([`look_word`],
-/// [`sanctioned`]). A Codex record (a codex-alab's relaunch) has none: its
-/// agent keeps its own limits.
+/// Whether the watch reads `agent`'s record as Claude Code's ([`look_word`], [`sanctioned`]).
 fn reads_transcript(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
-        // Muse Code, agy and Gemini CLI: no upgrade record of theirs is
-        // watched, and no Claude Code transcript is read for them.
         upgrade::Agent::Codex
         | upgrade::Agent::Muse
         | upgrade::Agent::Agy
@@ -367,15 +276,7 @@ fn reads_transcript(agent: upgrade::Agent) -> bool {
     }
 }
 
-/// The word a look records for its read `step` (`St::wait`): what holds the
-/// move now.
-///
-/// * A read that waits (`wait:<why>`): the wait's word ([`upgrade::wait_word`],
-///   with Claude's own `status` beside `not-idle`).
-/// * A Claude Code read (`claude`) that would take the round's next step
-///   ([`rounds_step`]): what holds that step's point ([`AT_POINT`]), else
-///   [`upgrade::NEXT_POINT`].
-/// * Anything else: no word, and the record keeps its own.
+/// Word for `step` ([`upgrade::wait_word`], [`rounds_step`], [`AT_POINT`], [`upgrade::NEXT_POINT`])
 pub(super) fn look_word(step: &str, claude: bool, status: impl FnOnce() -> String) -> String {
     if let Some(why) = step.strip_prefix("wait:") {
         return upgrade::wait_word(why, &status());
@@ -389,8 +290,7 @@ pub(super) fn look_word(step: &str, claude: bool, status: impl FnOnce() -> Strin
     )
 }
 
-/// The upgrade records of tab `tab` still owed a step ([`due_by`]), by file
-/// name. A record that does not parse is skipped.
+/// The upgrade records of tab `tab` still owed a step ([`due_by`]), by file name.
 fn tab_records(opts: &Opts, tab: &str) -> Vec<(String, St)> {
     let Ok(dir) = std::fs::read_dir(state_dir(opts)) else {
         return Vec::new();
@@ -403,9 +303,6 @@ fn tab_records(opts: &Opts, tab: &str) -> Vec<(String, St)> {
                 return None;
             }
             let name = path.file_stem()?.to_string_lossy().into_owned();
-            // Skips the relaunch's records filed beside the upgrade's
-            // (`St::cause`). A record with no tab is kept only when the read
-            // finds its conversation in this tab.
             let st = load(opts, &name).filter(|st| {
                 (st.tab == tab || st.tab.is_empty()) && st.is_upgrade() && due_by(st).is_some()
             })?;
@@ -416,8 +313,7 @@ fn tab_records(opts: &Opts, tab: &str) -> Vec<(String, St)> {
     out
 }
 
-/// Claude's own status of `session` from its session file under `records`,
-/// which a `not-idle` wait word carries; empty where none is read.
+/// Claude's own status of `session` from its session file under `records`.
 fn status_of(records: &super::Records, session: Option<&str>) -> String {
     let Some(session) = session else {
         return String::new();
@@ -429,9 +325,7 @@ fn status_of(records: &super::Records, session: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
-/// The target a report names (`<version>(<source>)`), as a candidate to
-/// retarget onto; its `exe` is empty, since [`St::for_target`] records only the
-/// version and the source.
+/// Parse a `<version>(<source>)` retarget candidate for [`St::for_target`].
 fn target_of(to: &str) -> Option<Candidate> {
     let (version, source) = to.strip_suffix(')')?.split_once('(')?;
     let source = match source {
@@ -446,16 +340,7 @@ fn target_of(to: &str) -> Option<Candidate> {
     })
 }
 
-/// The three sanctioned changes to `st` (the record the read `r` was about).
-/// None types, signals or ends anything; the retarget and the re-arm are said
-/// in the ledger as a step would say them:
-///
-/// * the retarget, when the read found another target for a Claude Code
-///   record not yet restarting: the record becomes what the next visit's
-///   [`St::for_target`] would make it;
-/// * the limit hold, when the transcript names a reset still to come;
-/// * the re-arm, when the dry read says a stopped round has rested
-///   (`would-rearm:<why>`) and its rest reads due here too.
+/// The three sanctioned changes to `st` (the record the read `r` was about) ([`St::for_target`]).
 fn sanctioned(
     opts: &Opts,
     r: &Report,
@@ -478,16 +363,12 @@ fn sanctioned(
     {
         let old = st.to.clone();
         let tab = st.tab.clone();
-        // The watch's own fields carry over to the retargeted record.
         let (looked_at, looked_by, point_at, guard) = (
             st.looked_at,
             st.looked_by.clone(),
             st.point_at,
             st.guard.clone(),
         );
-        // The model the next visit would hand it: an announced round's promise.
-        // A pending round's is the visit's own decision, and it has no notice
-        // to lose.
         let promised = st.promised_model().map(str::to_owned);
         let how;
         (*st, how) = St::retarget(
@@ -498,9 +379,6 @@ fn sanctioned(
             Proc::default(),
             now,
         );
-        // A ready covers any version (`St::retarget`): a round not yet
-        // restarting, for the same model and on the build the session still
-        // runs, moves onto the newer build in place and keeps its tab.
         if st.phase == Phase::Pending {
             st.tab = tab;
         }

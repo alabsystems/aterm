@@ -1,38 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A PUSH STREAM'S HANG-UP, DELIVERED AS A WAKE.
-//!
-//! A `subscribe` connection is push-only once acked: its client keeps its
-//! write half open and sends nothing more, so any byte or end-of-file on the
-//! server end means the client is gone (`subscription-peer-liveness`). That is
-//! `POLLIN` exactly: a quiet open peer raises nothing, and a byte, a
-//! half-close's end-of-file or a close raises it. One thread,
-//! `aterm-peer-watch`, polls every push stream together with its bell. When a
-//! stream turns readable it marks that stream [`Peer::Gone`] and rings the
-//! [`Watchers`] list its push loop parks on with its sessions' lists. A push
-//! loop with no timer of its own then parks until something rings, instead of
-//! waking every 250 ms to probe its peer.
-//!
-//! Push streams only: a half-closed REQUEST client is still there to read its
-//! answer ([`aterm_uds::hangup`]), and its end-of-file raises `POLLIN` too.
-//!
-//! THE STREAM'S OWN DESCRIPTOR. The thread polls the descriptor the push loop
-//! writes, never a duplicate: closing a duplicated AF_UNIX descriptor can block
-//! on macOS, and one blocked close on this one thread would stall every
-//! subscription's hang-up. So the thread closes nothing. It also never polls a
-//! descriptor whose stream may have closed, since the next open can take that
-//! number: a [`PeerGuard`] borrows its stream for its whole life, and its drop
-//! takes the entry out and waits until the thread has let go.
-//!
-//! A WATCH THAT STOPS. If the thread cannot start, [`watch_push`] answers
-//! `None` and the caller probes on a timer. If the thread's poll fails or its
-//! loop panics, it stops: every stream it watched reads [`Peer::Unwatched`]
-//! and is rung, so its push loop goes back to probing on a timer, and later
-//! watches answer `None`. The failure ends no subscription.
-//!
-//! LOCKS. The command inbox is a strict leaf, held only to post or take
-//! commands. The thread rings a stream's list with no lock held.
+//! Push-stream peer hang-up watcher ([`Peer::Gone`], [`Peer::Unwatched`],
+//! [`Watchers`], [`aterm_uds::hangup`], [`PeerGuard`], [`watch_push`]).
 
 use std::io::{Read as _, Write as _};
 use std::marker::PhantomData;
@@ -76,8 +46,7 @@ impl Peer {
     }
 }
 
-/// One watched stream's verdict and the list rung when it settles, shared by
-/// the thread and the stream's guard.
+/// One watched stream's verdict and wake list.
 struct Watched {
     peer: AtomicU8,
     wakes: Arc<Watchers>,
@@ -88,9 +57,7 @@ impl Watched {
         Peer::from_u8(self.peer.load(Ordering::Acquire))
     }
 
-    /// Settle a stream still [`Peer::Watching`] at `peer`: whether this call
-    /// settled it, and its list is owed a ring. A settled stream keeps its
-    /// first verdict: a client that went before the watch stopped stays gone.
+    /// Settle a stream still [`Peer::Watching`] at `peer`.
     fn settle(&self, peer: Peer) -> bool {
         self.peer
             .compare_exchange(
@@ -103,9 +70,7 @@ impl Watched {
     }
 }
 
-/// Settle every stream in `watched` at `peer`, THEN ring the lists of those
-/// it settled: a watcher woken by any one ring reads every verdict of the
-/// same pass already stored.
+/// Settle every stream in `watched` at `peer`, THEN ring the lists of those it settled.
 fn settle_all(watched: impl IntoIterator<Item = Arc<Watched>>, peer: Peer) -> usize {
     let settled: Vec<Arc<Watched>> = watched.into_iter().filter(|w| w.settle(peer)).collect();
     for w in &settled {
@@ -140,15 +105,12 @@ struct Entry {
 }
 
 /// The commands posted and not yet taken; `None` once the thread has stopped.
-/// A poster reads that under this lock, so nothing is posted after the stop's
-/// last look.
 type Inbox = Mutex<Option<Vec<Command>>>;
 
 /// A running peer watch: the handle that posts to its thread.
 pub(crate) struct PeerWatch {
     inbox: Arc<Inbox>,
-    /// The write end of the thread's bell (non-blocking): a byte wakes its
-    /// poll. The thread ends when the last handle drops it.
+    /// The write end of the thread's bell (non-blocking): a byte wakes its poll.
     bell: UnixStream,
     next_token: AtomicU64,
 }
@@ -172,7 +134,6 @@ impl PeerWatch {
         match std::thread::Builder::new()
             .name("aterm-peer-watch".to_string())
             .spawn(move || {
-                // On the path that frees a push lane when its client goes.
                 crate::qos::set_self(crate::qos::Role::Responsive);
                 watch_thread(&polled, &listen);
             }) {
@@ -188,8 +149,7 @@ impl PeerWatch {
         }
     }
 
-    /// Watch `stream`'s client until the guard drops; `None` once the thread
-    /// has stopped.
+    /// Watch `stream`'s client until the guard drops; `None` once the thread has stopped.
     pub(crate) fn watch<'a>(self: &Arc<Self>, stream: &'a CtlStream) -> Option<PeerGuard<'a>> {
         let watched = Arc::new(Watched {
             peer: AtomicU8::new(Peer::Watching.as_u8()),
@@ -209,8 +169,7 @@ impl PeerWatch {
         })
     }
 
-    /// Post `command` and ring the bell: `false`, the command dropped, once
-    /// the thread has stopped.
+    /// Post `command` and ring the bell: `false`, the command dropped, once the thread has stopped.
     fn post(&self, command: Command) -> bool {
         {
             let mut inbox = self.inbox.lock_or_recover();
@@ -219,7 +178,6 @@ impl PeerWatch {
             };
             pending.push(command);
         }
-        // Non-blocking: a full bell already has a wake pending.
         let _ = (&self.bell).write(&[1]);
         true
     }
@@ -231,16 +189,13 @@ impl PeerWatch {
     }
 }
 
-/// Watch `stream`'s client on the process's peer watch, started by the first
-/// push stream; `None` when it could not start or has stopped.
+/// Watch `stream`'s client on the process's peer watch, started by the first push stream.
 pub(crate) fn watch_push(stream: &CtlStream) -> Option<PeerGuard<'_>> {
     static WATCH: OnceLock<Option<Arc<PeerWatch>>> = OnceLock::new();
     WATCH.get_or_init(PeerWatch::start).as_ref()?.watch(stream)
 }
 
-/// One push stream on a peer watch. The stream is borrowed for the guard's
-/// life, because the thread polls its descriptor until the drop has released
-/// it.
+/// One push stream on a peer watch.
 pub(crate) struct PeerGuard<'a> {
     watch: Arc<PeerWatch>,
     token: u64,
@@ -254,17 +209,14 @@ impl PeerGuard<'_> {
         self.watched.peer()
     }
 
-    /// The list rung when the verdict settles: when the client goes, or when
-    /// the watch stops while it is there.
+    /// The list rung when the verdict settles.
     pub(crate) fn wakes(&self) -> &Arc<Watchers> {
         &self.watched.wakes
     }
 }
 
 impl Drop for PeerGuard<'_> {
-    /// Take the stream off the poll set and wait until the thread has let go
-    /// of its descriptor, which may close once the borrow ends. A thread that
-    /// stopped polls nothing, and drops the release it never took.
+    /// Take the stream off the poll set and wait until the thread has let go of its descriptor.
     fn drop(&mut self) {
         let (released, done) = sync_channel(1);
         if self.watch.post(Command::Release {
@@ -276,17 +228,13 @@ impl Drop for PeerGuard<'_> {
     }
 }
 
-/// The thread: its loop, then the stop. Every stream still watched when it
-/// stops (polled, or posted and not yet taken) is handed back as
-/// [`Peer::Unwatched`].
+/// The thread: its loop, then the stop ([`Peer::Unwatched`]).
 fn watch_thread(inbox: &Inbox, listen: &UnixStream) {
     let mut entries: Vec<Entry> = Vec::new();
     let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         poll_loop(inbox, listen, &mut entries)
     }))
     .unwrap_or_else(|_| Some("its loop panicked".to_string()));
-    // Nothing is posted after this look and nothing is polled again, so a
-    // release dropped here lets its guard close a descriptor no poll holds.
     let pending = inbox.lock_or_recover().take().unwrap_or_default();
     let posted = pending.into_iter().filter_map(|command| match command {
         Command::Watch { watched, .. } => Some(watched),
@@ -304,9 +252,7 @@ fn watch_thread(inbox: &Inbox, listen: &UnixStream) {
     }
 }
 
-/// One `poll(2)` over the bell and every watched stream, for `POLLIN`, until
-/// the last handle drops the bell (`None`) or the thread cannot go on
-/// (`Some(why)`).
+/// Poll the bell and watched streams until the bell closes (`None`) or polling fails (`Some`).
 fn poll_loop(inbox: &Inbox, listen: &UnixStream, entries: &mut Vec<Entry>) -> Option<String> {
     let mut fds: Vec<libc::pollfd> = Vec::new();
     loop {
@@ -324,11 +270,7 @@ fn poll_loop(inbox: &Inbox, listen: &UnixStream, entries: &mut Vec<Entry>) -> Op
         let Ok(count) = libc::nfds_t::try_from(fds.len()) else {
             return Some(format!("{} descriptors are too many to poll", fds.len()));
         };
-        // SAFETY: `fds` is an initialized, exclusively borrowed array of
-        // `count` pollfds. Its descriptors are `listen`'s, alive across the
-        // call, and each entry's, whose stream its guard borrows until this
-        // thread has taken the entry out (below, after the call returns). -1
-        // waits until a descriptor is ready or a signal interrupts.
+        // SAFETY: `fds` is an initialized, exclusively borrowed array of `count` pollfds.
         let ready = unsafe { libc::poll(fds.as_mut_ptr(), count, -1) };
         if ready < 0 {
             let error = std::io::Error::last_os_error();
@@ -337,8 +279,6 @@ fn poll_loop(inbox: &Inbox, listen: &UnixStream, entries: &mut Vec<Entry>) -> Op
             }
             return Some(format!("its poll failed: {error}"));
         }
-        // The streams this poll watched. Downward, so a `swap_remove` only
-        // moves an entry already looked at.
         let mut gone = Vec::new();
         for index in (0..entries.len()).rev() {
             if fds[index + 1].revents != 0 {
@@ -401,11 +341,6 @@ mod tests {
         sub.wait(Duration::ZERO)
     }
 
-    /// A QUIET OPEN CLIENT IS KEPT; ONE THAT GOES IS A WAKE. The client's
-    /// hang-up, its half-close and a stray byte each settle the stream
-    /// `Gone` and ring the list a push loop parks on, with no timer: the
-    /// wait is a hang detector, and the ring is the only thing that can end
-    /// it. Negative control: the quiet open client is still `Watching`, with
     /// no ring, after the others' polls have run past it.
     #[test]
     fn the_peer_watch_wakes_a_quiet_subscription_on_hangup() {
@@ -413,7 +348,6 @@ mod tests {
         let (quiet_server, _quiet_client) = CtlStream::pair().expect("pair");
         let quiet = watch.watch(&quiet_server).expect("watched");
         let quiet_sub = Subscription::single(quiet.wakes());
-        // How a client goes, and what it does to its end.
         type End = (&'static str, fn(&CtlStream));
         let ends: [End; 3] = [
             ("hang-up", |client| {
@@ -441,14 +375,6 @@ mod tests {
         assert!(!rang(&quiet_sub), "and its list never rang");
     }
 
-    /// A RELEASED DESCRIPTOR IS NEVER POLLED: the guard's drop returns only
-    /// once the thread has taken the entry out, so a stream that closes (and
-    /// a descriptor number reused) after it is a stranger's. Here the
-    /// released stream turns readable and the poll runs past it: a barrier
-    /// stream's hang-up must be seen, by a poll that reports every ready
-    /// descriptor it holds and stores all its verdicts before any ring.
-    /// Negative control: a stream still watched, made readable the same way,
-    /// is settled no later than that poll. Counterfactual, run: a release
     /// that leaves the entry in settles the released stream too.
     #[test]
     fn peer_watch_never_polls_a_released_descriptor() {
@@ -480,10 +406,6 @@ mod tests {
         );
     }
 
-    /// A STOPPED WATCH HANDS ITS STREAMS BACK: each reads `Unwatched` and is
-    /// rung, so its push loop wakes and probes on a timer again, and a later
-    /// watch answers `None`. A client that went before the stop stays
-    /// `Gone`. Negative control: before the stop the open client reads
     /// `Watching` with no ring.
     #[test]
     fn a_stopped_peer_watch_hands_its_streams_back() {
@@ -506,14 +428,11 @@ mod tests {
         );
         assert_eq!(open.peer(), Peer::Unwatched, "handed back to the probe");
         assert_eq!(gone.peer(), Peer::Gone, "a settled verdict stays");
-        // The stop takes the inbox before it rings, so the refusal is
-        // already a fact.
         let (late_server, _late_client) = CtlStream::pair().expect("pair");
         assert!(
             watch.watch(&late_server).is_none(),
             "a stopped watch refuses"
         );
-        // The guards drop with the thread gone: they wait on nothing.
         drop((open, gone));
     }
 }

@@ -4,6 +4,7 @@
 //! The Linux lane's proof (`linux proof`; `targo --unverified verify linux` runs it).
 
 //! STOCK EXCEPTION: the guest's Rust is rustup's stock toolchain
+//! ([`crate::linux_guest::RUST`]); no Linux build of Trust exists.
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -149,6 +150,7 @@ pub fn parse_a11y(args: &[String]) -> Result<ProofArgs, Fail> {
 }
 
 /// The words `proof`, `gone`, `cpu` and `a11y` share; `displays` stays empty
+/// when none is named.
 fn parse_args(args: &[String], verb: &str) -> Result<ProofArgs, Fail> {
     let mut p = ProofArgs {
         arches: Vec::new(),
@@ -465,6 +467,7 @@ pub fn seat_env(runtime: &str, mutter_pid: &str, bin: &str) -> Vec<(String, Stri
 }
 
 /// Whether Xvfb's display lists no MIT-SHM (`xdpyinfo -queryExtensions`),
+/// so a CPU row on it can only have taken the presenter's PutImage path.
 fn no_shm(up: &Up) -> Result<(), String> {
     let out = up.sh(&guest::with_env(
         &[Display::Xvfb.client_env(&up.runtime)],
@@ -869,6 +872,7 @@ impl Gui<'_> {
     }
 
     /// `client`: what aterm-gui is told to reach its display by; `None` runs
+    /// it `--headless`.
     fn start_unit(
         &self,
         client: Option<&[(String, String)]>,
@@ -988,6 +992,8 @@ impl Gui<'_> {
     }
 
     /// The CPU presenter's row (LW.6): typed, echoed, resized (new buffers),
+    /// `render=ok`, and the frame aterm presented (`image`), held to the
+    /// display server's own pixels ([`Gui::held_to_server`]).
     fn judge_cpu(&self, display: Display, results: &Path) -> Result<String, String> {
         if !self.up.sh(&guest::wait_socket(&self.sock(), 60)).ok() {
             return Err("the control socket never listened (60 s)".into());
@@ -1233,6 +1239,8 @@ impl Gui<'_> {
     }
 
     /// The whole primary monitor of the lane's Mutter, as `lane-bus cast`
+    /// writes it (a ScreenCast frame read through PipeWire), copied out as
+    /// `<name><suffix>-monitor.png`.
     fn mutter_cast(&self, results: &Path, suffix: &str) -> Result<PathBuf, String> {
         let pid = unit_pid(self.up, &format!("{}mutter", guest::UNIT_PREFIX))
             .ok_or_else(|| "Mutter's unit has no main pid".to_string())?;
@@ -1265,6 +1273,7 @@ impl Gui<'_> {
     }
 
     /// The X window's pixels (`lane-bus xgrab` of the window aterm-gui's
+    /// unit owns), copied out as `<name><suffix>.ppm`.
     fn x_grab(&self, display: Display, results: &Path, suffix: &str) -> Result<PathBuf, String> {
         let x = vec![display.client_env(&self.up.runtime)];
         let pid = unit_pid(self.up, &Self::unit_name())
@@ -1315,6 +1324,8 @@ impl Gui<'_> {
     }
 
     /// aterm-gui's window in the scene graph of the weston that is `display`
+    /// (`weston-debug scene-graph`, which weston's `--debug` allows): where
+    /// weston shows it.
     fn weston_view(&self, display: Display) -> Result<WestonView, String> {
         let pid = unit_pid(self.up, &Self::unit_name())
             .ok_or_else(|| "aterm-gui's unit has no main pid".to_string())?;
@@ -1331,6 +1342,9 @@ impl Gui<'_> {
     }
 
     /// The whole output of the weston that is `display`, as
+    /// `weston-screenshooter` writes it (a PNG in its working directory,
+    /// through `weston_capture_v1`), copied out as
+    /// `<name><suffix>-output.png`.
     fn weston_shot(
         &self,
         display: Display,
@@ -1374,6 +1388,7 @@ impl Gui<'_> {
     }
 
     /// A GPU row's drive: its detail, and the `backend=` `metrics` names once
+    /// the frame is taken, which [`drew_on_gpu`] judges with the journal.
     fn judge(
         &self,
         display: Option<Display>,
@@ -2445,6 +2460,8 @@ mod tests {
     }
 
     /// A refused verb says how it ended, so the stats Deck's empty reply
+    /// would tell a guest-side signal (a silent exit 255) from this Mac's
+    /// `limactl` ended on one (no exit status).
     #[test]
     fn a_refused_verb_says_how_it_ended() {
         let out = |code: Option<i32>, text: &str| Out {
@@ -2511,6 +2528,7 @@ mod tests {
     }
 
     /// `gone` kills Xvfb and weston unless told otherwise, and only `gone`
+    /// builds the wgpu oracle.
     #[test]
     fn gone_runs_its_displays_and_alone_takes_the_oracle() {
         let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
@@ -2532,6 +2550,7 @@ mod tests {
     }
 
     /// `a11y` runs its own rows on every arch unless named; its aterm-gui rows
+    /// are Xvfb's, so it takes no display.
     #[test]
     fn a11y_runs_its_rows_alone_on_every_arch_unless_named() {
         let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
@@ -2556,6 +2575,8 @@ mod tests {
     }
 
     /// `--weston-renderer` is taken where it chooses a weston's renderer
+    /// (proof, gone, cpu, deck), and refused by `edges`, whose one weston row
+    /// is pixman's whatever a run names.
     #[test]
     fn the_weston_renderer_is_taken_where_it_starts_a_weston() {
         let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
@@ -2573,6 +2594,7 @@ mod tests {
     }
 
     /// The shape of a `text` reply measured under Xvfb on 2026-10-16: only the
+    /// output row is the echo alone; the typed line carries the arithmetic.
     #[test]
     fn the_echo_row_is_the_output_never_the_typed_line() {
         let screen = "user@lima:/w$ echo LANE-$((6*7))\nLANE-42\nuser@lima:/w$ \n\n";
@@ -2589,6 +2611,7 @@ mod tests {
     }
 
     /// The shape measured in the guest on 2026-10-16: a staged child's own
+    /// `test result:` and `FAILED` lines inside a failing test's section.
     const STAGED: &str = "\
      Running unittests src/lib.rs (lane/target/debug/deps/aterm_uds-04e96a6b8de7de57)
 
@@ -2823,6 +2846,8 @@ error: 1 target failed:
     }
 
     /// The frame found where it shows whole; negative controls: one pixel
+    /// off (nowhere), a live row's pixel off (still there), shown twice (not
+    /// placed), larger than the screen.
     #[test]
     fn a_frame_is_found_where_it_shows_whole() {
         let pixel = |x: usize, y: usize| [u8::try_from(x).unwrap(), u8::try_from(y).unwrap(), 7];
@@ -2856,6 +2881,7 @@ error: 1 target failed:
     }
 
     /// A window's buffer wider and taller than its frame: the frame at its
+    /// offset, the bands around it each the frame's nearest pixel.
     #[test]
     fn a_buffer_s_bands_continue_the_frame_s_edge() {
         let pixel = |x: usize, y: usize| [u8::try_from(x).unwrap(), u8::try_from(y).unwrap(), 7];

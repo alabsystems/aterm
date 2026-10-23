@@ -1,70 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The relaunch line's read of a returned prompt: whether the line that resumes an agent the
-//! harness ended may be typed at the shell's prompt.
+//! Relaunch prompt model: whether the resume line may be typed at the shell prompt.
 
 use aterm_spec::derive::{Liveness, Model, and_, eq, int, or_, var};
 
-/// One relaunch's reads of one returned prompt.
-///
-/// The world, chosen first (`phase` 0 → 3) and then left alone but for a person's keys:
-/// * `mark` — the shell's input mark (`blocks 1 --json`'s `cmd`/`cmdcol`, read through `line`):
-///   0 none (no integration, or a newest block that is not `entering`: a running command holds
-///   the terminal), 1 it names the prompt's row (it reads, left of its column, as the cursor's
-///   row does), 2 it names another row: a mark the engine misplaced, or a person's typing that
-///   wrapped past the prompt's row, which look the same.
-/// * `stamped` — the host's stamp dates a person's last key against the agent's end (the age is
-///   `text --json`'s `human_ms`, the end the one the restart asked, `relaunch::end_asked_at`);
-///   0 where it cannot: an older host, a session never keyed since the host began serving it (a
-///   seamless update's successor reads every adopted session so), or a relaunch on exit, whose
-///   record is dated after the agent left.
-/// * `blank` — the text left of the cursor ends in a blank: the prompt's own shape while nothing
-///   is typed after it, else the shape of what is.
-/// * `person` — a person's keys reached the shell's line since the agent's end was asked, and
-///   what they typed stands there (`Key`, unfair: the world's).
-///
-/// One try of the relaunch line (`relaunch::first_mark` and the fenced paste after it) is
-/// exactly one of:
-/// * `Read`, weakly fair (the host carries a restart in flight every `CARRY_EVERY` until it
-///   lands): the line goes in where a mark naming the prompt's row finds the cursor at its
-///   column, where a mark names another row and the stamp proves no person keyed since the end,
-///   or, with no mark, on the cursor following a blank. The shape rule's blind spot, typeahead
-///   that ends in a blank, is the price of a shell with no integration, and why the first
-///   invariant is about marked prompts.
-/// * `WaitTyping` — the wait says `typing`: a person's text after a mark on the prompt's row, or
-///   no mark, no blank and nothing to prove the line clean (a person's keys, or no stamp).
-/// * `WaitElsewhere` — the wait says `mark-elsewhere`: the mark names another row and the stamp
-///   cannot clear the line (a person's keys, or no stamp).
-/// * `WaitUnmarked` — the wait says `unmarked`: no mark, a cursor not after a blank, and a stamp
-///   that shows nobody keyed. Nothing says the shell is at a prompt (`claude; read`'s builtin
-///   holds the terminal as a prompt does), so the stamp never stands in for the prompt's shape.
-///
-/// `said` keeps the last wait's word (1 `typing`, 2 `mark-elsewhere`, 3 `unmarked`).
-///
-/// `NeverOverAPersonAtAMarkedPrompt`: the line never goes in after a person's keys at a prompt
-/// the shell marked. `OnlyAtAnAttestedPrompt`: the line goes in only where the shell's mark or
-/// the prompt's shape says a prompt is there, never on the stamp alone.
-/// `TypingIsAPersonsWhereStamped`: a wait says `typing` only with a person's keys behind it,
-/// wherever the host stamps them. [`relaunch_prompt_read_liveness`] is the progress half.
-///
-/// `Buggy = 1` mutants, each its own action:
-/// * `ElsewhereReadAsTyping` — a mark naming another row read as a person's typing, every try
-///   after it waiting `typing`. Breaks the liveness and the word.
-/// * `ElsewhereTypedBlind` — trust the screen over a mark it cannot match, and type. Breaks the
-///   first invariant (typing that wrapped past the prompt's row).
-/// * `ElsewhereByShape` — fall back to the shape rule when the mark names another row. Breaks
-///   the first invariant the same way, for wrapped typing that ends in a blank.
-/// * `UnmarkedTypedByStamp` — the stamp stands in for the shape where no mark says the shell is
-///   at a prompt, typing into whatever holds the terminal. Breaks `OnlyAtAnAttestedPrompt`.
-///
-/// Tier-1 (`aterm-agent`'s `upgrade_drive_tests::
-/// the_real_prompt_read_conforms_to_the_model`) drives the real
-/// `relaunch::type_relaunch_line` against a stand-in tab in every world of
-/// this model, with and without a person's keys, and checks that it typed
-/// exactly where `Read` is enabled and said exactly the word of the wait the
-/// model takes everywhere else; tab #1's world is among them, and a
-/// never-keyed stamp projects as unstamped.
+/// One relaunch's reads of one returned prompt ([`relaunch_prompt_read_liveness`]).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn relaunch_prompt_read_model() -> Model {
@@ -133,11 +74,7 @@ pub fn relaunch_prompt_read_model() -> Model {
     }
 }
 
-/// `APromptNobodyKeyedIsTypedAt` over [`relaunch_prompt_read_model`]: the line goes in, unless a
-/// person's keys stand at the prompt or nothing the host reads can prove it clean (no mark and
-/// no blank, or a mark elsewhere and no stamp). Weak fairness on one choice of each phase of the
-/// world and on `Read` (the host's carry); `Key` stays unfair. Broken by `ElsewhereReadAsTyping`
-/// alone.
+/// `APromptNobodyKeyedIsTypedAt` over [`relaunch_prompt_read_model`].
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::liveness(relaunch_prompt_read_model)]
@@ -157,8 +94,6 @@ pub fn relaunch_prompt_read_liveness() -> Liveness {
                 ),
             ),
         ),
-        // One choice per phase says the world gets chosen (each phase's choices are enabled
-        // together, and a fair one is taken unless another is).
         weak: vec!["Unmarked", "Unstamped", "EndsInText", "Read"],
         strong: vec![],
         mutants: vec!["ElsewhereReadAsTyping"],

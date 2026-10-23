@@ -1,27 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The seam: what a verb body needs from whatever is hosting the session.
+//! Host capability and session-access traits for control verbs.
 
 use std::borrow::Cow;
 use std::time::Duration;
 
 use aterm_core::terminal::Terminal;
 
-/// What a host can do. Verbs gate on these, so a host lacking a facility
-/// answers `ERR unsupported` instead of a plausible empty answer.
+/// Host capabilities on which control verbs gate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HostCapabilities {
-    /// Pixels can be captured (`image`/`video`/`window`/`chrome`).
+    /// Whether pixels can be captured (`image`/`video`/`window`/`chrome`).
     pub frame_source: bool,
-    /// A windowing event loop exists to repaint and to route synthetic input.
+    /// Whether a windowing event loop exists to repaint and route synthetic input.
     pub event_loop: bool,
-    /// A system clipboard is reachable (`copy`).
+    /// Whether the system clipboard is reachable (`copy`).
     pub clipboard: bool,
-    /// A roster is kept, so [`SessionHost::sessions`] and
-    /// [`SessionHost::resolve`] answer for real. `false` says "I keep no
-    /// index", which an empty `Vec` alone could not distinguish from "no
-    /// sessions".
+    /// Whether a session roster is kept for [`SessionHost::sessions`] and [`SessionHost::resolve`].
     pub roster: bool,
 }
 
@@ -68,15 +64,14 @@ impl HostCapabilities {
     }
 }
 
-/// A session's lifecycle as its host observes it: the `sessions` wire
-/// vocabulary, onto which each host maps its own states.
+/// Session lifecycle state in the `sessions` wire vocabulary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionState {
-    /// Registered, engine + input sink live, reader not yet confirmed.
+    /// Registered with live engine and input sink before reader confirmation.
     Spawning,
-    /// Live: something is feeding the engine.
+    /// Live session feeding the engine.
     Alive,
-    /// The command exited; the engine is still readable.
+    /// Command exited while the engine remains readable.
     Exited,
 }
 
@@ -107,38 +102,29 @@ impl SessionState {
     }
 }
 
-/// One row of [`SessionHost::sessions`]: exactly the fields a `sessions`/`ls`
-/// line carries.
+/// One row of [`SessionHost::sessions`] matching a `sessions`/`ls` wire line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionEntry {
-    /// Process-local id: the sid every other method on this trait takes.
+    /// Process-local session ID.
     pub sid: u64,
-    /// Stable fabric identity (`s-<hex>`) — the `@<id>` selector form, and what
-    /// survives a restart that renumbers `sid`.
+    /// Stable fabric identity (`s-<hex>`).
     pub id: String,
-    /// The spawning session's stable id, if any (the family tree).
+    /// Spawning session's stable ID, if any.
     pub parent: Option<String>,
-    /// Lifecycle; see [`SessionState`].
+    /// Session lifecycle state.
     pub state: SessionState,
-    /// Live title, best effort.
+    /// Best-effort live title.
     pub title: String,
-    /// Whether any user metadata is set (the wire's `meta=<1|0>`), so a fleet
-    /// driver knows which sessions to query without N round trips.
+    /// Whether any user metadata is set (`meta=<1|0>`).
     pub has_meta: bool,
 }
 
-/// A wire `@<selector>` target the roster can answer. `@.` (self) is absent:
-/// self is the connection's own session, which the dispatcher knows and the
-/// roster does not. So is a bare `@`, which names nothing: the dispatcher
-/// refuses it (`aterm_types::control_verbs::EMPTY_SELECTOR`), never reading
-/// it as self. The wire's selector is read by the one request grammar
-/// ([`aterm_types::control_request::Selector`]); an `Id` is a body that
-/// grammar reads as a stable id.
+/// Wire `@<selector>` target resolved against the session roster.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Selector<'a> {
-    /// `@<n>` — the process-local sid.
+    /// `@<n>` process-local session ID.
     Local(u64),
-    /// `@s-<hex>` — the stable fabric id.
+    /// `@s-<hex>` stable fabric ID.
     Id(&'a str),
 }
 
@@ -177,104 +163,50 @@ impl<'a> Selector<'a> {
     }
 }
 
-/// Blocking wake handle from [`SessionHost::subscribe`].
-///
-/// A handle rather than a `wait(sid, timeout)` method because `wait` must be
-/// registered before it re-checks the entry snapshot, so a completion landing
-/// in that gap still leaves a notify pending.
+/// Blocking wake handle returned by [`SessionHost::subscribe`].
 pub trait ChangeWait {
-    /// Park until the session changes, or until `timeout` elapses. `true` on a
-    /// wake, `false` on timeout, or earlier once [`Self::caller_gone`] would
-    /// answer `true`. A spurious/coalesced wake is fine — every caller
-    /// re-reads the state it is waiting on.
+    /// Parks until the session changes, `timeout` elapses, or [`Self::caller_gone`] is true.
     fn wait(&self, timeout: Duration) -> bool;
 
-    /// Whether the client that asked for this wait has hung up. A socket host
-    /// checks its connection, and parks in slices short enough to notice; the
-    /// default is never gone. Waiting verbs return their lane when `true`.
+    /// Whether the client that requested this wait has disconnected.
     fn caller_gone(&self) -> bool {
         false
     }
 }
 
-/// A host of one or more terminal sessions, addressed by process-local sid.
-///
-/// # The roster answers fleet-wide; every other method fails closed on a foreign sid
-///
-/// [`SessionHost::sessions`] and [`SessionHost::resolve`] answer for the whole
-/// roster. Per-session methods answer only for sids this host serves (possibly
-/// one: `aterm-gui`'s host is session-scoped). A sid it does not serve gets
-/// `None` (a no-op for returnless methods), never its own session under a
-/// borrowed number, which keeps the cross-host sequence safe:
-///
-/// ```
-/// use aterm_control::{Selector, SessionHost};
-///
-/// fn clear_selected(host: &impl SessionHost, sel: Selector<'_>) -> Option<()> {
-///     let sid = host.resolve(sel)?;  // fleet-wide answer
-///     host.with_terminal_mut(sid, |t| t.text_selection_mut().clear())
-///                                    // None unless THIS host serves that sid
-/// }
-/// ```
-///
-/// Resolve to pick a target, then obtain a host bound to it.
-///
-/// Not object-safe: the `impl FnOnce` accessors cost no `Box` per verb and
-/// keep the host's lock guard (and `aterm-gui`'s debug lock-hold tripwire) on
-/// the host's side. Both hosts dispatch statically.
+/// Host of one or more terminal sessions addressed by process-local `sid`.
 pub trait SessionHost {
-    /// What this host can do; see [`HostCapabilities`].
+    /// Capabilities supported by this host.
     fn capabilities(&self) -> HostCapabilities;
 
-    /// The roster behind `sessions`/`ls`: every session this host serves,
-    /// ascending by `sid`. A host serving one session returns one entry; only a
-    /// host keeping no roster ([`HostCapabilities::roster`] false) may answer
-    /// empty.
+    /// Returns all sessions served by this host, ordered by ascending `sid`.
     fn sessions(&self) -> Vec<SessionEntry>;
 
-    /// Resolve a `@<selector>` against the roster; `None` when it holds no such
-    /// session (the caller answers `ERR no such session` rather than falling
-    /// back) and for every selector on a host with no roster. The sid need not
-    /// be one this host serves (see [`SessionHost`]).
+    /// Resolves `@<selector>` against the roster.
     fn resolve(&self, selector: Selector<'_>) -> Option<u64>;
 
-    /// Run `f` against session `sid`'s terminal, or `None` if this host does not
-    /// serve `sid`. Closure-based so the host owns the guard type.
+    /// Runs `f` against session `sid`'s terminal if served by this host.
     fn with_terminal<R>(&self, sid: u64, f: impl FnOnce(&Terminal) -> R) -> Option<R>;
 
-    /// [`SessionHost::with_terminal`] with mutable access.
+    /// Runs `f` with mutable access to session `sid`'s terminal if served by this host.
     fn with_terminal_mut<R>(&self, sid: u64, f: impl FnOnce(&mut Terminal) -> R) -> Option<R>;
 
-    /// Ask the host to repaint `sid`. A no-op on a host with no event loop, and on
-    /// a sid it does not serve.
+    /// Requests a repaint for `sid` if served by this host.
     fn request_redraw(&self, sid: u64);
 
-    /// Register interest in `sid`'s changes for the life of the returned handle
-    /// (see [`ChangeWait`]). A sid this host does not serve gets a handle that
-    /// only times out.
+    /// Subscribes to changes on `sid` for the lifetime of the returned handle.
     fn subscribe(&self, sid: u64) -> Box<dyn ChangeWait + '_>;
 
-    /// Whether session `sid` has ended — its program exited or it was closed —
-    /// so a verb parked on it answers `ERR exited` rather than waiting out its
-    /// deadline. The host notifies [`SessionHost::subscribe`]'s handles when it
-    /// happens. Defaults to `false`: a host whose sessions outlive every verb.
+    /// Returns whether session `sid` has ended.
     fn session_ended(&self, sid: u64) -> bool {
         let _ = sid;
         false
     }
 
-    /// Place `text` on the system clipboard; `false` if the write failed. Only
-    /// called when [`HostCapabilities::clipboard`] is set.
+    /// Writes `text` to the system clipboard.
     fn clipboard_set(&self, text: &str) -> bool;
 
-    /// A shell-reported working directory as this host's platform names it
-    /// (what `blocks` prints for `cwd`).
-    ///
-    /// The engine stores the cwd as reported; for OSC 7 that is the RFC 8089
-    /// URI path (`/C:/Users//x` on Windows from `file://host/C:/Users//x`), kept
-    /// so recordings decode the same everywhere. The default is the identity,
-    /// correct on POSIX; a Windows host converts, so a pwsh block reads
-    /// `C:\Users\x` like a cmd block.
+    /// Converts a shell-reported working directory into the host platform's native path format.
     fn native_cwd<'p>(&self, reported: &'p str) -> Cow<'p, str> {
         Cow::Borrowed(reported)
     }

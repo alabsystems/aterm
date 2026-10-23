@@ -16,6 +16,7 @@ use aterm_objc::send::{
 use aterm_objc::{autoreleasepool, class, sel, Bool, Id, MainThread};
 
 /// An optional handler consulted from `applicationShouldTerminate:` — see
+/// [`set_quit_confirm_hook`].
 static QUIT_CONFIRM_HOOK: OnceLock<fn() -> bool> = OnceLock::new();
 
 /// Register a handler consulted before the app terminates via AppKit's `terminate:` (Dock-icon "Quit", AppleScript `quit`, logout/restart/shutdown — gestures that do NOT pass through the app menu's Quit item).
@@ -40,6 +41,7 @@ use crate::window::WindowId as RootWindowId;
 #[derive(Debug)]
 pub(super) struct AppState {
     /// LOCAL PATCH (aterm): the raw `NSApplicationActivationPolicy`, which is
+    /// an `NSInteger` — see the seam's `NS_APPLICATION_ACTIVATION_POLICY_*`.
     activation_policy: Option<isize>,
     activate_ignoring_other_apps: bool,
     run_loop: RunLoop,
@@ -60,6 +62,7 @@ pub(super) struct AppState {
     wait_timeout: Cell<Option<Instant>>,
     pending_redraw: RefCell<Vec<WindowId>>,
     /// LOCAL PATCH (aterm), 2026-10-17: the proxies' wake flag, read at the
+    /// end of each `cleared` (`wake_queue.rs`, COALESCED WAKES).
     wake_armed: wake_queue::Armed,
 }
 
@@ -202,6 +205,7 @@ impl ApplicationDelegate {
     }
 
     /// The main-thread witness objc2's `mutability::MainThreadOnly` used to
+    /// derive from the receiver's type.
     #[track_caller]
     fn mtm(&self) -> MainThread {
         MainThread::new().expect(
@@ -365,6 +369,10 @@ impl ApplicationDelegate {
     }
 
     /// LOCAL PATCH (aterm): a NESTED run loop inside the handler (an
+    /// app-modal `NSAlert runModal`) turns the observers with the handler
+    /// borrowed, so nothing re-arms the waker, and a past-due `WaitUntil` left
+    /// it firing at its 0.1 µs interval in every common mode: 88 % CPU for as
+    /// long as the dialog stood.
     fn stop_waker_in_nested_loop(&self) {
         if self.ivars().event_handler.in_use() {
             self.ivars().waker.borrow_mut().stop();
@@ -474,6 +482,8 @@ impl ApplicationDelegate {
 pub(crate) struct HandlePendingUserEvents;
 
 /// Returns the minimum `Option<Instant>`, taking into account that `None`
+/// equates to an infinite timeout, not a zero timeout (so can't just use
+/// `Option::min`)
 fn min_timeout(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
     a.map_or(b, |a_timeout| b.map_or(Some(a_timeout), |b_timeout| Some(a_timeout.min(b_timeout))))
 }

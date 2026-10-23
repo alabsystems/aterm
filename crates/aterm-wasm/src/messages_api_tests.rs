@@ -39,6 +39,9 @@ fn clocked(rows: u16, cols: u16) -> (AtermTerminal, Instant) {
 }
 
 /// Every reply the binding gives is the engine's own reply to the same
+/// line at the same instant — usage, lane and title refusals, the live-row
+/// cap, a record, a row, a restate, a finish, a dismissal, a press — so the
+/// web's `notice` IS the control socket's grammar, not a second copy.
 #[test]
 fn wire_replies_and_caps_are_the_engines() {
     let (mut t, t0) = clocked(20, 80);
@@ -113,6 +116,8 @@ fn wire_replies_and_caps_are_the_engines() {
 }
 
 /// AN IDLE BAND ARMS NO TIMER: nothing posted, and a record — a success or
+/// info `post`, which goes to the log and never to the glass — leave
+/// `messages_next_wake_ms` at -1 and the band empty.
 #[test]
 fn an_idle_band_arms_no_timer() {
     let (mut t, t0) = clocked(20, 80);
@@ -150,6 +155,7 @@ fn a_held_warn_arms_exactly_its_hold() {
 }
 
 /// A busy row's comet asks for the engine's 33 ms grid only while the band
+/// may move; the still look asks for no frame between its words' ticks.
 #[test]
 fn a_comet_wakes_on_the_frame_grid_only_while_moving() {
     let (mut t, t0) = clocked(20, 80);
@@ -165,6 +171,8 @@ fn a_comet_wakes_on_the_frame_grid_only_while_moving() {
 }
 
 /// F4 (ruling 435): the wake is the native window's rule, so a resize
+/// between a tick and a render is read at the NEW width — the same answer
+/// the page gets once it renders.
 #[test]
 fn a_resize_before_the_render_wakes_for_the_new_width() {
     let (mut t, t0) = clocked(20, 20);
@@ -186,6 +194,8 @@ fn a_resize_before_the_render_wakes_for_the_new_width() {
 }
 
 /// Ruling 436: a glide in flight is read on the page's measured frame
+/// period — a 120 Hz page wakes every ~8 ms where the default reads 60 Hz
+/// — and a period that is not a positive number changes nothing.
 #[test]
 fn a_glide_is_read_on_the_pages_frame_period() {
     let glide_wake = |period: Option<f64>| {
@@ -210,6 +220,8 @@ fn a_glide_is_read_on_the_pages_frame_period() {
 }
 
 /// Ruling 436: the page's pointer is a hand exactly where a press acts —
+/// `band_press_acts` agrees with what `band_press` does on every cell of
+/// a row, with and without a Details view — and never off the band.
 #[test]
 fn the_pointer_is_a_hand_exactly_where_a_press_acts() {
     let fresh = |details: bool| {
@@ -259,6 +271,7 @@ fn a_settled_band_needs_no_frame() {
 }
 
 /// DMG-1 UNDER A BAND: an echo frame refills only its damaged rows, because
+/// the render takes last frame's band rows off the kept scratch first.
 #[test]
 fn an_echo_frame_under_a_band_takes_the_scoped_refill() {
     let (mut t, t0) = clocked(20, 80);
@@ -283,6 +296,8 @@ fn an_echo_frame_under_a_band_takes_the_scoped_refill() {
 }
 
 /// WITH NO BAND ROW NOTHING CHANGES: a terminal that only recorded a
+/// message renders byte for byte what one that never heard of the band
+/// does.
 #[test]
 fn no_band_row_leaves_the_frame_byte_identical() {
     let mut plain = term(12, 60);
@@ -304,6 +319,7 @@ fn no_band_row_leaves_the_frame_byte_identical() {
 }
 
 /// The rows RESERVE space: the frame grows by exactly the band's rows, the
+/// grid starts below them, and the terminal's own rows are all still there.
 #[test]
 fn the_frame_grows_by_the_band_rows() {
     let mut plain = term(12, 60);
@@ -334,6 +350,7 @@ fn the_frame_grows_by_the_band_rows() {
 }
 
 /// When the band leaves, the frame is the band-less frame again — the
+/// cached renderer keeps no band pixel, no bleed and no stale gutter.
 #[test]
 fn the_band_leaving_restores_the_bandless_frame() {
     let mut plain = term(12, 60);
@@ -375,6 +392,7 @@ fn the_band_leaving_restores_the_bandless_frame() {
 }
 
 /// The `messages` read is the engine's rows over the ring, paged as the
+/// control socket pages them.
 #[test]
 fn messages_read_pages_the_log() {
     let (mut t, t0) = clocked(20, 80);
@@ -404,6 +422,10 @@ fn messages_read_pages_the_log() {
 }
 
 /// F2, A HIDDEN PAGE ARMS NOTHING (ruling 337): a live row — a busy one
+/// past its grace, and a held warning — arms `-1` while the page is
+/// hidden, where the same rows on a visible page each arm a wake (a
+/// still look included, the negative control); hidden, the band draws
+/// the still look.
 #[test]
 fn a_hidden_page_arms_no_timer_and_resumes() {
     let (mut t, t0) = clocked(20, 80);
@@ -449,7 +471,7 @@ fn details_chip(t: &AtermTerminal, row: usize) -> (usize, usize) {
     (c.col, c.width)
 }
 
-/// THE POINTER ON THE WEB (c). Without a Details view the links are
+/// THE POINTER ON THE WEB (c).
 #[test]
 #[allow(
     clippy::too_many_lines,
@@ -535,6 +557,8 @@ fn the_pointer_lights_only_the_chip_and_a_press_is_notice_act() {
 }
 
 /// Without a Details view, `notice act <id> details` performs nothing AND
+/// changes nothing — nothing was shown, so nothing is marked seen — while
+/// with one it marks the row seen, as native's press does.
 #[test]
 fn a_details_press_needs_the_pages_details_view() {
     let (mut t, t0) = clocked(12, 60);
@@ -549,6 +573,7 @@ fn a_details_press_needs_the_pages_details_view() {
 }
 
 /// The overflow row: with a Details view a press anywhere on it opens the
+/// view at the top of the log; without one it is words alone.
 #[test]
 fn the_overflow_row_opens_the_details_view_only_with_one() {
     let (mut t, t0) = clocked(3, 60);
@@ -577,6 +602,10 @@ fn the_overflow_row_opens_the_details_view_only_with_one() {
 }
 
 /// D, CSS `forced-colors`: the five system colours become the engine's
+/// forced inks (`BandInks::forced`, the native High Contrast mapping),
+/// the look turns ungraded, the band is re-inked in them (its ground is
+/// `ButtonFace`), a theme change under them moves nothing, and switching
+/// them off returns the theme's frame byte for byte.
 #[test]
 fn forced_colors_own_the_band_ungraded() {
     let (mut t, t0) = clocked(12, 60);
@@ -630,6 +659,9 @@ fn forced_colors_own_the_band_ungraded() {
 }
 
 /// E, THE LOG ACROSS RELOADS: the lines the page keeps are the engine's
+/// `m1` codec lines, each decoding to the record it was drained as —
+/// a record posted since the last tick included — paged by a cursor; a
+/// page that fell behind the journal reads a `dropped` line first.
 #[test]
 fn the_log_drains_as_codec_lines_since_a_cursor() {
     let (mut t, t0) = clocked(20, 80);
@@ -678,6 +710,8 @@ fn the_log_drains_as_codec_lines_since_a_cursor() {
 }
 
 /// E, THE QUIT RECORD: a closing page's rows are recorded as cut off by
+/// the quit (ruling 267) — a determinate row with its percent — and the
+/// lines come back from the page's cursor; the band empties.
 #[test]
 fn a_closing_page_writes_the_quit_record() {
     let (mut t, t0) = clocked(20, 80);
@@ -727,6 +761,7 @@ fn a_closing_page_writes_the_quit_record() {
 }
 
 /// The lines a page instance has not handed its store yet, as the page
+/// keeps them: `messages_log_since`'s lines after its head, from `cursor`.
 fn kept_since(t: &mut AtermTerminal, cursor: f64) -> (f64, String) {
     let out = t.messages_log_since_at(cursor);
     let mut lines = out.lines();
@@ -755,6 +790,10 @@ fn states(t: &AtermTerminal) -> Vec<(u64, String)> {
 }
 
 /// F, THE LOG ACROSS RELOADS (ruling 345): the lines one visit kept come
+/// back on the next as the LOG — a record keeps its outcome, a held
+/// warning and a progress row the page never closed come back `stale`,
+/// never on the band, and arm no timer — and the next post's id is above
+/// every kept one.
 #[test]
 fn a_restored_log_is_records_and_never_the_glass() {
     let (mut a, t0) = clocked(20, 80);
@@ -812,6 +851,11 @@ fn a_restored_log_is_records_and_never_the_glass() {
 }
 
 /// A restore loads the kept log ONCE and before the first notice:
+/// restoring twice, or restoring lines this visit drained itself, is
+/// refused and changes nothing (the engine's replay alone WOULD load a
+/// retired record twice — the negative control); a line the page kept
+/// twice is read once; and three visits sharing one store (drain →
+/// restore → drain → restore) load every record once, under distinct ids.
 #[test]
 fn restoring_twice_or_after_a_post_never_duplicates() {
     let (mut a, t0) = clocked(20, 80);
@@ -874,6 +918,8 @@ fn restoring_twice_or_after_a_post_never_duplicates() {
 }
 
 /// Two tabs of one site share the store and mint ids from their own
+/// counters: both records load, the second under a fresh id above both —
+/// the native loader's rule for two writers of one file (ruling 270).
 #[test]
 fn two_tabs_sharing_a_store_both_load() {
     let (mut a, t0) = clocked(20, 80);
@@ -903,6 +949,9 @@ fn two_tabs_sharing_a_store_both_load() {
 }
 
 /// A restore's input is bounded and junk-proof: torn, foreign and
+/// over-long lines are skipped and counted, and only the newest
+/// [`RESTORE_CAP`] lines are read — the older ones counted, their records
+/// not loaded — while the next id is still above every line READ.
 #[test]
 fn a_restore_skips_junk_and_reads_only_the_newest_lines() {
     let (mut a, t0) = clocked(20, 80);
@@ -945,6 +994,8 @@ fn a_restore_skips_junk_and_reads_only_the_newest_lines() {
 }
 
 /// The Details view's data: one record's `messages` row, the same bytes
+/// `messages_read` answers for it — the first id and a later one — and
+/// `OK 0` for an id the ring does not hold or a page's junk number.
 #[test]
 fn messages_entry_is_the_records_row() {
     let (mut t, t0) = clocked(20, 80);
@@ -965,6 +1016,10 @@ fn messages_entry_is_the_records_row() {
 }
 
 /// The web's percent-encoder is the control socket's, byte for byte: every
+/// byte value a `str` can carry (each ASCII byte, and every two-byte scalar,
+/// which walks every lead byte `C2`–`DF` over every continuation byte
+/// `80`–`BF`; the three- and four-byte leads by a stride through the rest),
+/// and a UTF-8 corpus.
 #[test]
 fn pct_encode_is_the_control_wires() {
     for b in 0u8..=0x7f {
@@ -996,7 +1051,7 @@ fn pct_encode_is_the_control_wires() {
     }
 }
 
-/// The band row under frame pixel row `y` is `y.checked_sub(grid_top)? /
+/// The band row under frame pixel row `y` is `y.checked_sub(grid_top)?
 #[test]
 fn band_row_is_the_pixel_rows_band_row() {
     assert_eq!(band_row(9, 10, 16), None, "above the band");
@@ -1034,6 +1089,8 @@ fn band_row_is_the_pixel_rows_band_row() {
 }
 
 /// A pixel on a committed band row is that row and the geometry's column;
+/// a pixel above the band, below its last row, negative or not a number
+/// is `None`.
 #[test]
 fn cell_under_is_the_band_cell_under_a_pixel() {
     let (mut t, t0) = clocked(12, 60);
@@ -1083,6 +1140,7 @@ fn cell_under_is_the_band_cell_under_a_pixel() {
 }
 
 /// The tick's reply: bit 0, the band changed (a row-count change is a
+/// change); bit 1, its row count did.
 #[test]
 fn the_tick_reply_is_two_bits() {
     assert_eq!(tick_bits(false, false), 0);
@@ -1092,6 +1150,8 @@ fn the_tick_reply_is_two_bits() {
 }
 
 /// `getTimezoneOffset()` minutes WEST of UTC are the engine's seconds
+/// EAST, rounded half away from zero; a day or more either way, or not a
+/// number, is UTC.
 #[test]
 fn a_page_offset_is_seconds_east_of_utc() {
     for (west_min, east_s) in [
@@ -1130,6 +1190,9 @@ fn a_page_offset_is_seconds_east_of_utc() {
 }
 
 /// The band-less frame `a` moved down by `n` band rows, as the banded
+/// frame `b` must be: every grid stream `n` rows lower, every pixel `n·ch`
+/// lower, every window-space quad re-tagged onto the row its moved pixel
+/// lies in (an in-grid quad on its old row + `n`).
 #[allow(
     clippy::too_many_lines,
     reason = "one assertion per RenderInput stream"
@@ -1285,6 +1348,9 @@ fn assert_translated(
 }
 
 /// EFFECTS UNDER A BAND ARE THE BAND-LESS FRAME, TRANSLATED (design ruling
+/// 331): the web effects pipeline places its window-space streams from ONE
+/// chrome origin that never counted the band, so the prepend moves them
+/// (`HostRowPixels::Translate`).
 #[test]
 fn effects_under_a_band_are_the_bandless_frame_translated() {
     let mut plain = term(16, 60);
@@ -1377,6 +1443,7 @@ fn effects_under_a_band_are_the_bandless_frame_translated() {
 }
 
 /// One golden scene: its name and its events in time order — a `notice`
+/// line, or a shot (`None`), at ms from the center's birth.
 type Scene = (String, Vec<(u64, Option<String>)>);
 
 /// FNV-1a-64 — the golden's digest (the native writer's `web_fnv`).
@@ -1390,6 +1457,7 @@ fn fnv(bytes: &[u8]) -> u64 {
 }
 
 /// One golden frame line from this module's composed frame — the native
+/// writer's `web_golden_line`, over the page's own RGBA.
 fn golden_line(key: &str, t: &AtermTerminal) -> String {
     use std::fmt::Write as _;
     let n = t.band.committed();
@@ -1432,6 +1500,8 @@ fn golden_line(key: &str, t: &AtermTerminal) -> String {
 }
 
 /// One theme at one width of [`the_web_band_is_the_native_golden`]: every
+/// scene in both looks, replayed through `notice`, tick and `render` on a
+/// terminal of its own; its frames' golden lines, and the RGBA pixels digested.
 fn replay_golden(
     (tname, [fg, bg, cursor, sel, blue, cyan, red, yellow]): &(String, [u32; 8]),
     cols: u16,
@@ -1469,6 +1539,11 @@ fn replay_golden(
 }
 
 /// THE WEB BAND IS THE NATIVE GOLDEN (design ruling 333): every scene of
+/// `tests/fixtures/band_native.tsv` — which aterm-gui writes from the
+/// native window's band — replayed through THIS module's `notice`, tick
+/// and `render`, lands on every digest: each band row's cells, raster and
+/// pixels, the bleed, and the pixels above the grid, in every theme, width
+/// and look the golden holds.
 #[test]
 #[allow(clippy::too_many_lines, reason = "one replay of the golden's matrix")]
 fn the_web_band_is_the_native_golden() {
@@ -1578,6 +1653,10 @@ fn the_web_band_is_the_native_golden() {
 }
 
 /// The three rows both web modules' page tests post — a record, a held
+/// warning and an error, each detail a sentence and a technical line —
+/// ticked a second later; and the page's lines for them read 90 s after
+/// they were stamped, on a UTC clock (the CPU and the GPU module pin the
+/// SAME lines: one grammar, the engine's).
 fn post_page_rows(t: &mut AtermTerminal, t0: Instant) -> Vec<String> {
     for (i, line) in [
         "post ci Build finished -- 12 tests\\nall green",
@@ -1614,6 +1693,8 @@ fn post_page_rows(t: &mut AtermTerminal, t0: Instant) -> Vec<String> {
 }
 
 /// The `page` line's chrome keys (ruling 396), after every older key: a
+/// page whose tag filter admits `all` entries, `problems` of them
+/// warnings or errors, under the chip worded `chip` (`None`: every tag).
 fn page_chrome(all: usize, problems: usize, chip: Option<&str>) -> String {
     let on = u8::from(chip.is_none());
     let current = chip.unwrap_or("All");
@@ -1623,6 +1704,12 @@ fn page_chrome(all: usize, problems: usize, chip: Option<&str>) -> String {
 }
 
 /// THE SETTINGS ▸ MESSAGES PAGE ON THE WEB (ruling 387): rows posted
+/// through `notice` come back from `messages_page` as the engine's page
+/// grammar with every word said — newest first, a script's tags as their
+/// chips (`Deploy`, `CI`), the rows on the band `showing now` and the
+/// record `recorded`, each detail's sentence and technical lines, each
+/// entry's meta line and Copy text, each chip's label and the page's
+/// chrome words (ruling 396) — framed `OK <n>`.
 #[test]
 fn the_web_page_is_the_engines_page() {
     let (mut t, t0) = clocked(20, 80);
@@ -1678,6 +1765,11 @@ fn the_web_page_is_the_engines_page() {
 }
 
 /// THE WEB'S HOST OFFERS NOTHING IT CANNOT DO (rulings 387, 389): a
+/// restored native log's crash record offers its `Open log` NOT
+/// pressable — a page has no filesystem — and its `Manual` (a footer
+/// button worded `Open Manual`, ruling 396) NOT pressable either: the
+/// web performs no navigation, and no press route reaches a record
+/// (`notice act` on it answers `no live message`, pinned here).
 #[test]
 fn the_web_page_offers_no_file_and_no_upgrade() {
     let (mut t, t0) = clocked(20, 80);

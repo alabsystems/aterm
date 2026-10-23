@@ -112,6 +112,7 @@ unsafe impl Sync for Sel {}
 
 impl std::fmt::Debug for Sel {
     /// Prints the selector's name via `sel_getName`; that a `SEL` points at its
+    /// own name is an objc4 implementation detail, not ABI.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.0.is_null() {
             return f.write_str("Sel(null)");
@@ -234,9 +235,10 @@ pub struct ObjcSuper {
 
 #[link(name = "objc")]
 unsafe extern "C-unwind" {
-    /// Declared with no parameter list on purpose. Every call goes through
+    /// Declared with no parameter list on purpose.
     fn objc_msgSend();
     /// Same discipline as [`objc_msgSend`], but the first argument is a
+    /// `*const ObjcSuper` rather than the receiver.
     fn objc_msgSendSuper();
 }
 
@@ -255,6 +257,8 @@ unsafe extern "C" {
     fn objc_autoreleasePoolPush() -> *mut c_void;
     fn objc_autoreleasePoolPop(pool: *mut c_void);
     /// Hand a +1 reference to the innermost pool, for [`autorelease`]: a
+    /// declared method returning an object not named
+    /// `new*`/`alloc`/`copy*`/`mutableCopy*` owes its caller +0.
     fn objc_autorelease(obj: Id) -> Id;
 
     pub(crate) fn objc_allocateClassPair(
@@ -395,6 +399,7 @@ fn stret_entry() -> *const c_void {
 }
 
 /// Unreachable off x86_64: [`returns_indirectly`] is `const false` there, so
+/// the call folds away.
 #[cfg(not(target_arch = "x86_64"))]
 #[inline]
 fn stret_entry() -> *const c_void {
@@ -587,6 +592,7 @@ pub fn protocols_registered_by_aterm() -> Vec<&'static CStr> {
 }
 
 /// The registry behind [`protocols_registered_by_aterm`], and the lock that
+/// serializes [`protocol_or_register`].
 fn registered() -> &'static std::sync::Mutex<Vec<&'static CStr>> {
     static REGISTERED: std::sync::Mutex<Vec<&'static CStr>> = std::sync::Mutex::new(Vec::new());
     &REGISTERED
@@ -779,6 +785,8 @@ impl Obj {
 
 impl Drop for Obj {
     /// Releasing may run `dealloc`, which can autorelease into the current
+    /// frame; holding an [`AutoreleasePool`] across the scope is the caller's
+    /// obligation, not a hidden push/pop per release.
     fn drop(&mut self) {
         // SAFETY: `self.0` is non-null by construction and holds exactly one +1 reference, released once here.
         unsafe { objc_release(self.0) }

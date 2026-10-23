@@ -9,9 +9,6 @@ use super::{
     handoff_masters_have_activity, handoff_ready_deadline, kill_and_reap_handoff_child,
     make_cloexec_pipe, wait_handoff_ready, worker_claim_handoff_reaper,
 };
-// The strip goes on every std candidate that outlives a moment (each `sleep 30`, each
-// [`parked`] process and its group), before any hook of its own: it holds its stdio and
-// nothing else of this process.
 use aterm_uds::spawnfd::InheritNothing as _;
 use std::io::{BufRead as _, Read as _};
 use std::os::unix::process::CommandExt as _;
@@ -62,16 +59,12 @@ impl Drop for ProcessGroupCleanup {
 
 /// The process a fixture parks where a test then waits, under a one-minute hang detector,
 /// to see the kill or the group sweep under test end it: `sleep` for
-/// [`aterm_spec::wait::PARKED_SECS`], past that minute. A `sleep 30` here ended by itself
-/// inside it, and a reaper that killed nothing, or swept no group, passed.
+/// [`aterm_spec::wait::PARKED_SECS`], past that minute.
 fn parked() -> String {
     format!("sleep {}", aterm_spec::wait::PARKED_SECS)
 }
 
 fn assert_process_group_gone(leader: i32, descendant: i32, message: &str) {
-    // Waits for launchd to reap an orphaned descendant, which this process cannot hurry; a
-    // real regression leaves the descendant ([`parked`]) alive past this wait, so this is a
-    // failure bound.
     let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     loop {
         let group_gone = unsafe { libc::kill(-leader, 0) } != 0
@@ -82,15 +75,12 @@ fn assert_process_group_gone(leader: i32, descendant: i32, message: &str) {
             return;
         }
         if std::time::Instant::now() >= deadline {
-            // Fail clean: no long-lived fixture escapes.
             unsafe {
                 libc::kill(-leader, libc::SIGKILL);
                 libc::kill(descendant, libc::SIGKILL);
             }
             panic!("{message}");
         }
-        // Sleep, not yield: a yielding thread stays runnable and competes with the reaping
-        // it waits for.
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
@@ -114,9 +104,6 @@ fn final_handoff_admission_conforms_to_every_model_guard() {
     };
     assert!(handoff_commit_admitted(all));
 
-    // Process-local egress (paste-order FIFO, sink spill) sits behind the model's single
-    // "deliver queued input" step, so it is fenced here directly: unflushed egress blocks
-    // Commit like an undrained OS input queue.
     assert!(
         !handoff_commit_admitted(HandoffCommitFacts {
             egress_settled: false,
@@ -254,16 +241,12 @@ fn final_handoff_admission_conforms_to_every_model_guard() {
 /// flips the death peek without consuming the queued bytes.
 #[test]
 fn queued_output_is_buffered_mid_flight_but_peer_death_still_revokes() {
-    // A real PTY pair, not a pipe: poll(2)'s HUP semantics differ, and the death peek's
-    // contract is stated for masters. Close-on-exec from birth, so a child another test spawns
-    // never keeps the slave open past its exec.
     let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
     let live = [(1u64, master, 4242i32)];
 
     assert!(!handoff_masters_have_activity(&live), "quiet pty is quiet");
     assert!(!handoff_masters_closed(&live), "live peer is not dead");
 
-    // "Shell output" queued in the kernel for the (future) child.
     // SAFETY: bounded write of a stack byte to the test-owned slave.
     assert_eq!(
         unsafe { libc::write(slave, [0x62u8].as_ptr().cast(), 1) },
@@ -278,14 +261,8 @@ fn queued_output_is_buffered_mid_flight_but_peer_death_still_revokes() {
         "mid-flight, queued output buffers through instead of revoking"
     );
 
-    // Nonblocking, so the close flushes the unread output at once instead of
-    // waiting out the tty's drain (0.6 s on macOS) to flush it.
     aterm_pty::set_nonblocking(slave, true).expect("nonblocking slave");
     aterm_pty::close_fd(slave);
-    // Eventual, not same-instant: production peeks repeatedly across the overlap, and macOS can
-    // surface the HUP edge a scheduler quantum after close(2), or only once a sibling test's
-    // fork holding a copy of the slave execs. A stale-identity bug never reports closed, so the
-    // minute's hang detector cannot mask it.
     let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     while !handoff_masters_closed(&live) {
         assert!(
@@ -298,26 +275,20 @@ fn queued_output_is_buffered_mid_flight_but_peer_death_still_revokes() {
 }
 
 /// A hung-up master is not output waiting: an exited `--hold` pane's master is
-/// reported `POLLIN|POLLHUP` forever on macOS. Death is `handoff_masters_closed`'s
-/// question; the activity peek answers only for live masters, including when
-/// the dead one still has bytes queued and beside a live quiet one.
+/// reported `POLLIN|POLLHUP` forever on macOS.
 #[test]
 fn a_hung_up_master_is_never_output_waiting() {
     let open = || aterm_pty::open_pty_pair().expect("open_pty_pair");
     let (exited, exited_slave) = open();
     let (alive, alive_slave) = open();
-    // The exited command's last words, still queued when it died.
     // SAFETY: bounded write of a stack byte to the test-owned slave.
     assert_eq!(
         unsafe { libc::write(exited_slave, [0x62u8].as_ptr().cast(), 1) },
         1
     );
-    // Nonblocking, so the close flushes the unread output at once instead of
-    // waiting out the tty's drain (0.6 s on macOS) to flush it.
     aterm_pty::set_nonblocking(exited_slave, true).expect("nonblocking slave");
     aterm_pty::close_fd(exited_slave);
     let dead = [(1u64, exited, 4242i32)];
-    // Eventual, as in the sibling test above.
     let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     while !handoff_masters_closed(&dead) {
         assert!(std::time::Instant::now() < deadline, "the slave hung up");
@@ -332,7 +303,6 @@ fn a_hung_up_master_is_never_output_waiting() {
         !handoff_masters_have_activity(&desk),
         "a dead pane beside a quiet live one leaves the desk quiet"
     );
-    // …and a live master with bytes waiting still holds the gate.
     // SAFETY: bounded write of a stack byte to the test-owned slave.
     assert_eq!(
         unsafe { libc::write(alive_slave, [0x62u8].as_ptr().cast(), 1) },
@@ -342,8 +312,6 @@ fn a_hung_up_master_is_never_output_waiting() {
         handoff_masters_have_activity(&desk),
         "a live session's unread output is still output"
     );
-    // The master first: a slave closed over output its master never read
-    // waits out the tty's drain (0.6 s on macOS).
     aterm_pty::close_fd(alive);
     aterm_pty::close_fd(alive_slave);
     aterm_pty::close_fd(exited);
@@ -351,8 +319,7 @@ fn a_hung_up_master_is_never_output_waiting() {
 
 /// Worker level: the ready wait completes to `ProofReady` while a handed master
 /// has queued output, and a cancel poke is typed `ActivityRevoked`, never a
-/// generic rejection. A handed session ending while the proof is awaited is
-/// typed as the park types it.
+/// generic rejection.
 #[test]
 fn ready_wait_types_a_handed_session_s_death_as_activity() {
     let expected = crate::seamless::adoption_proof(
@@ -402,7 +369,6 @@ fn ready_wait_tolerates_queued_output_and_types_cancel_as_activity() {
     )
     .expect("bounded proof fixture");
 
-    // Master with queued output the whole time.
     let mut master = [0i32; 2];
     // SAFETY: plain pipe(2) into a valid 2-slot out-array.
     assert_eq!(unsafe { libc::pipe(master.as_mut_ptr()) }, 0, "master pipe");
@@ -474,13 +440,10 @@ fn ready_poll_classifies_queued_master_output_as_a_yield() {
         ReadyPollAction::NoProgress,
         "queued master output must yield, never busy-spin"
     );
-    // A bare wake with nothing readable is also just a yield.
     assert_eq!(
         classify_ready_poll(&[pfd(0), pfd(0)]),
         ReadyPollAction::NoProgress
     );
-    // Death on a master dominates, even while it reports readable bytes (macOS
-    // reports a dead slave as POLLIN|POLLHUP).
     assert_eq!(
         classify_ready_poll(&[pfd(0), pfd(libc::POLLIN | libc::POLLHUP)]),
         ReadyPollAction::SessionDied,
@@ -491,7 +454,6 @@ fn ready_poll_classifies_queued_master_output_as_a_yield() {
         ReadyPollAction::SessionDied,
         "master death outranks a readable proof"
     );
-    // A readable proof is progress — even with queued output alongside it.
     assert_eq!(
         classify_ready_poll(&[pfd(libc::POLLIN), pfd(libc::POLLIN)]),
         ReadyPollAction::ReadProof
@@ -529,16 +491,13 @@ fn full_reject_channel_remains_worker_owned_but_disconnect_does_not() {
 
 #[test]
 fn cancellation_kills_descendant_process_group_before_returning() {
-    // std, not spawnfd: `HandoffCandidateHandle::Forked` holds a `std::process::Child`, as in
-    // the shipped fork lane (same in the tests below).
     let mut command = std::process::Command::new("/bin/sh");
     command
         .inherit_nothing()
         .arg("-c")
         .arg(format!("{} & printf '%s\\n' \"$!\"; wait", parked()))
         .stdout(std::process::Stdio::piped());
-    // SAFETY: async-signal-safe setpgid only; identical to the production
-    // update child setup and executed after fork/before exec.
+    // SAFETY: async-signal-safe setpgid only, executed after fork/before exec.
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) == 0 {
@@ -563,9 +522,6 @@ fn cancellation_kills_descendant_process_group_before_returning() {
 
     let candidate = HandoffCandidate::of_unreaped_child(&child);
     let mut handle = HandoffCandidateHandle::Forked(child);
-    // The leader `wait`s on its parked descendant, so a reap that signalled
-    // nothing returns only when that sleep ends, group gone by then: its death
-    // by SIGKILL is the verdict, not the reap's return.
     assert_eq!(
         killed_and_reaped(candidate, &mut handle),
         HandoffRollbackWarrant::Reaped,
@@ -616,8 +572,6 @@ fn pre_ready_death_preserves_leader_identity_until_normal_group_reap() {
     stdout.read_to_end(&mut eof).expect("leader stdout EOF");
     assert_eq!(unsafe { libc::kill(descendant, 0) }, 0, "descendant live");
 
-    // Tier-1 projection: an exited, unreaped leader with a live same-group descendant; rollback
-    // is enabled only after the group is signalled and then the direct child reaped.
     let model = aterm_models_misc::native_update_overlap_handoff_model();
     let mut model_state = model.init_state();
     for action in [
@@ -632,8 +586,6 @@ fn pre_ready_death_preserves_leader_identity_until_normal_group_reap() {
         );
     }
 
-    // The write end stays open (a sibling fork's stray copy), so only asking the leader sees
-    // the death, and asking must leave its identity for the group sweep.
     let (proof_rd, _stray_proof_wr) = make_cloexec_pipe().expect("proof pipe");
     let candidate = HandoffCandidate::of_unreaped_child(&child);
     let mut handle = HandoffCandidateHandle::Forked(child);
@@ -666,15 +618,11 @@ fn pre_ready_death_preserves_leader_identity_until_normal_group_reap() {
     assert!(worker_claim_handoff_reaper(&arbiter));
     assert!(model.fire("WorkerWinsRejectArbiter", &mut model_state));
 
-    // Negative control: wait-before-kill is executable only in the mutant and
-    // violates the ordering property while this descendant is live.
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let mut old_order = model_state.clone();
     assert!(buggy.fire("BuggyWaitBeforeGroupSignal", &mut old_order));
     assert!(!buggy.check_invariant("ProcessGroupSignalPrecedesDirectChildReap", &old_order,));
     assert_eq!(old_order["descendant_live"], 1);
-    // Negative control: a sweep reaching only the leader (`kill(pid)` for
-    // `kill(-pgid)`) leaves this descendant running.
     let mut leader_only = model_state.clone();
     assert!(buggy.fire("BuggySignalLeaderOnly", &mut leader_only));
     assert_eq!(leader_only["group_signaled"], 1);
@@ -728,7 +676,6 @@ fn a_launchservices_pid_mismatch_after_transfer_is_rejected_and_reaped() {
     let leader = i32::try_from(child.id()).expect("bounded child pid");
     let mut cleanup = ProcessGroupCleanup::new(leader);
 
-    // Tier-1 projection: a launch answer naming another pid is the model's mismatched proof.
     let model = aterm_models_misc::native_update_overlap_handoff_model();
     let mut model_state = model.init_state();
     for action in [
@@ -742,7 +689,6 @@ fn a_launchservices_pid_mismatch_after_transfer_is_rejected_and_reaped() {
         );
     }
 
-    // The proof pipe stays open: nothing but the corroboration ends this wait.
     let (proof_rd, _proof_wr) = make_cloexec_pipe().expect("proof pipe");
     let expected = crate::seamless::adoption_proof(
         "corroboration-test",
@@ -756,8 +702,6 @@ fn a_launchservices_pid_mismatch_after_transfer_is_rejected_and_reaped() {
     let (_cancel_tx, cancel_rx) = std::sync::mpsc::sync_channel(1);
     let stranger = leader.saturating_add(1);
     let in_flight = crate::app_launch_successor::LaunchInFlight::scripted(Some(stranger));
-    // A far deadline the test bounds at a minute (the hang detector): a wait ignoring the
-    // corroboration would run to `TimedOut`.
     let started = std::time::Instant::now();
     assert_eq!(
         wait_handoff_ready(
@@ -811,8 +755,7 @@ fn a_launchservices_pid_mismatch_after_transfer_is_rejected_and_reaped() {
 }
 
 /// The stray writer: a copy of the proof pipe's write end outliving the
-/// candidate holds EOF back. The candidate's own end ends the wait as
-/// `ChildDied`, and asking leaves the status for the reap.
+/// candidate holds EOF back.
 #[test]
 fn a_candidate_that_ends_behind_a_stray_proof_writer_ends_the_ready_wait() {
     let expected = crate::seamless::adoption_proof(
@@ -839,12 +782,9 @@ fn a_candidate_that_ends_behind_a_stray_proof_writer_ends_the_ready_wait() {
         );
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    // The stray copy: this test keeps the write end open, so no EOF can come.
     let (proof_rd, _stray_proof_wr) = make_cloexec_pipe().expect("proof pipe");
     let (_cancel_tx, cancel_rx) = std::sync::mpsc::sync_channel(1);
 
-    // Negative control, the wait with EOF as its only news: the candidate is gone
-    // and the wait still runs to its deadline.
     assert_eq!(
         wait_handoff_ready(
             &proof_rd,
@@ -859,8 +799,6 @@ fn a_candidate_that_ends_behind_a_stray_proof_writer_ends_the_ready_wait() {
         crate::UpdateHandoffOutcome::TimedOut,
         "a stray writer hides the death from an EOF-only wait"
     );
-    // No timing claim: with the writer held, `ChildDied` can only come from
-    // the candidate probe, never from EOF or the far deadline.
     assert_eq!(
         wait_handoff_ready(
             &proof_rd,
@@ -876,7 +814,6 @@ fn a_candidate_that_ends_behind_a_stray_proof_writer_ends_the_ready_wait() {
         "the candidate's own end ends the wait"
     );
 
-    // A match, not a `let … else`: off macOS the fork lane is the only variant.
     #[cfg_attr(
         not(target_os = "macos"),
         expect(
@@ -966,26 +903,12 @@ fn candidate_in_own_group(
 /// be rejected as gone.
 #[test]
 fn a_stopped_candidate_is_not_gone() {
-    // The candidate stops itself. A SIGSTOP sent from here can land while it is
-    // still exec'ing (`spawn` returns once the first exec commits; `/bin/sh` is a
-    // shim that execs a shell, which execs `sleep`), and Darwin mishandles a
-    // SIGSTOP that arrives mid-exec. Usually it is dropped: `kill` answers 0, the
-    // child runs on, and the wait below ends only at its hang detector. Rarely
-    // the stop is reported but the child is left frozen at its first dyld
-    // syscall, the reaper's SIGKILL right after does not end it, and the reap's
-    // `wait` blocks for good. Measured on Darwin 27.0.0 under load: 11 of 6,000
-    // sends through this fixture stopped nothing, and 2,400 runs of this test
-    // gave one of each failure. A SIGKILL on its own was never lost (0 of 9,600
-    // sent into the same exec windows). The shell's own `kill` stops it once its
-    // exec is done, so no signal is in flight across an exec.
     let (candidate, mut handle, mut cleanup) =
         candidate_in_own_group("kill -STOP $$; exec sleep 30");
     let pid = libc::pid_t::try_from(candidate.pid).expect("bounded pid");
-    // Not vacuous: the kernel has reported the stop before the probe is asked.
     let stopped_by = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     loop {
-        // SAFETY: a zeroed out-parameter of exactly the type waitid fills;
-        // WNOWAIT consumes nothing.
+        // SAFETY: zeroed siginfo_t for waitid with WNOWAIT.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         let rc = unsafe {
             libc::waitid(
@@ -1053,14 +976,10 @@ fn a_matching_or_pending_launch_answer_leaves_the_proof_wait_to_its_outcome() {
 
 #[test]
 fn emergency_reaper_kills_group_even_after_leader_exits() {
-    // std on purpose: the emergency reaper reaps this pid behind the handle, and spawnfd's
-    // `Child` would `waitpid` the (possibly recycled) number again on drop.
     let mut command = std::process::Command::new("/bin/sh");
     command
         .inherit_nothing()
         .arg("-c")
-        // The descendant does not retain stdout, so EOF proves the leader
-        // completed its immediate exit without our test reaping it.
         .arg(format!(
             "{} >/dev/null 2>&1 & printf '%s\\n' \"$!\"; exit 0",
             parked()
@@ -1100,7 +1019,6 @@ fn emergency_reaper_kills_group_even_after_leader_exits() {
         HandoffRollbackWarrant::Reaped,
         "the emergency reaper still prefers `waitpid` when the candidate is ours"
     );
-    // The emergency reaper consumed this child; the explicit wait sees ECHILD.
     let _ = child.wait();
     assert!(arbiter.finish_reap(crate::HandoffReaperOwner::Emergency));
     cleanup.disarm();
@@ -1138,8 +1056,7 @@ fn a_running_candidate_is_unproven_and_a_vacant_pid_is_the_proof() {
 
 /// A candidate this process did not fork (the LaunchServices shape) is proven terminated
 /// anyway: `waitpid` answers `ECHILD` and the orphan leads no process group (`sh -c` has no job
-/// control), so only the identity-corroborated direct signal can end it. The orphan is
-/// [`parked`]: it ends on its own only after the wait below has failed.
+/// control), so only the identity-corroborated direct signal can end it.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_candidate_we_never_forked_is_still_proven_terminated() {
@@ -1156,7 +1073,6 @@ fn a_candidate_we_never_forked_is_still_proven_terminated() {
     let mut orphan_line = String::new();
     stdout.read_line(&mut orphan_line).expect("orphan pid line");
     let orphan: u32 = orphan_line.trim().parse().expect("numeric orphan pid");
-    // Reaping the middle process is what reparents the orphan to launchd.
     parent.wait().expect("reap the orphan's parent");
     let raw = i32::try_from(orphan).expect("bounded orphan pid");
 
@@ -1180,13 +1096,9 @@ fn a_candidate_we_never_forked_is_still_proven_terminated() {
     );
 
     super::signal_handoff_candidate(candidate);
-    // Bounded here only, so a broken fallback fails rather than hangs the suite;
-    // `wait_for_handoff_candidate_to_terminate` has no bound, because in production the
-    // alternative to waiting is resuming a reader without proof.
     let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     while !handoff_candidate_terminated(candidate) {
         if std::time::Instant::now() >= deadline {
-            // Fail clean: no fixture outlives its assertion.
             // SAFETY: SIGKILL to the fixture's own orphan.
             unsafe { libc::kill(raw, libc::SIGKILL) };
             panic!("the outside proof never established that orphan {orphan} terminated");
@@ -1196,15 +1108,7 @@ fn a_candidate_we_never_forked_is_still_proven_terminated() {
 }
 
 /// A pid whose birth stamp disagrees with the candidate's was recycled: proof the candidate
-/// terminated, and a bystander the reap path must not SIGKILL. The bystander exits on its own
-/// within 30 s.
-///
-/// Whether the reap path signalled it is read from how it died, with no beat: the test sends
-/// its own SIGTERM and reaps. A SIGKILL the reap path posted first ends it as SIGKILL whatever
-/// follows (it cannot be caught and outranks SIGTERM), so only an untouched bystander dies of
-/// the test's SIGTERM. The probe this replaces, `kill(pid, 0)` 50 ms after the reap path,
-/// passed a bystander the path had killed: a killed child stays a zombie until it is reaped,
-/// and a zombie answers `kill(pid, 0)`.
+/// terminated, and a bystander the reap path must not SIGKILL.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_pid_whose_birth_record_disagrees_is_proof_of_death_and_is_never_signalled() {
@@ -1216,8 +1120,6 @@ fn a_pid_whose_birth_record_disagrees_is_proof_of_death_and_is_never_signalled()
         .expect("spawn a stand-in for whoever recycled the pid");
     let candidate = HandoffCandidate {
         pid: bystander.id(),
-        // The pid the candidate was born at, paired with a birth instant
-        // that is not the one the kernel reports for it now.
         birth: Some(super::HandoffCandidateBirth {
             seconds: 1,
             microseconds: 1,
@@ -1247,7 +1149,7 @@ fn a_pid_whose_birth_record_disagrees_is_proof_of_death_and_is_never_signalled()
 /// The launched lane's group-sweep gate is a kernel read: a process that made its
 /// own group (as `contain_own_process_group` does) reads as leading it, and one
 /// that inherited its parent's does not, so `-pid` is sent only when it names the
-/// candidate's own group. Both fixtures exit on their own within 30 s.
+/// candidate's own group.
 #[cfg(unix)]
 #[test]
 fn the_group_sweep_gate_reads_whether_the_candidate_leads_its_own_group() {
@@ -1292,7 +1194,7 @@ fn the_group_sweep_gate_reads_whether_the_candidate_leads_its_own_group() {
 /// The corroborated arm's group sweep reaches the helpers of a fork-lane candidate
 /// whose leader exited between the identity read and the sweep: the leader is an
 /// unreaped zombie, Darwin answers `getpgid` on it with ESRCH, and the fork lane's
-/// pin (`candidate_is_our_child`) licenses the sweep. The helper is [`parked`].
+/// pin (`candidate_is_our_child`) licenses the sweep.
 #[cfg(unix)]
 #[test]
 fn a_corroborated_candidate_whose_leader_already_exited_still_has_its_group_swept() {
@@ -1312,7 +1214,6 @@ fn a_corroborated_candidate_whose_leader_already_exited_still_has_its_group_swep
         .read_line(&mut line)
         .expect("read the helper pid");
     let helper: libc::pid_t = line.trim().parse().expect("helper pid");
-    // The leader exits right after the echo: wait for its zombie, unreaped.
     let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     while super::probe_handoff_candidate(leader_pid) != super::HandoffCandidateProbe::Exited {
         assert!(
@@ -1353,26 +1254,21 @@ fn a_corroborated_candidate_whose_leader_already_exited_still_has_its_group_swep
 /// Runs [`contain_own_process_group`] in a forked child (`setpgid` is process-wide and
 /// irreversible) and reports through its exit status whether it leads its own group; a second
 /// `setpgid(0, 0)` must be refused exactly when it is a session leader, witnessing which kernel
-/// path the first call took. The child makes only async-signal-safe calls: libtest is
-/// multi-threaded at fork time.
+/// path the first call took.
 fn forked_child_contains_itself(become_session_leader: bool) -> bool {
-    // SAFETY: fork from a multi-threaded harness, with a child that performs
-    // async-signal-safe calls only — see the doc comment above.
+    // SAFETY: fork from a multi-threaded harness; child runs async-signal-safe calls only.
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork failed");
     if pid == 0 {
         if become_session_leader {
-            // SAFETY: async-signal-safe. The child inherited the harness's group
-            // with a fresh pid, so it cannot lead that group and `setsid` is
-            // permitted; if it fails, the refusal check below fails the test.
+            // SAFETY: async-signal-safe setsid in a fresh child pid.
             unsafe { libc::setsid() };
         }
         let contained = contain_own_process_group() == ProcessGroupContainment::OwnGroupLeader;
         // SAFETY: async-signal-safe; targets the calling process only.
         let refused = unsafe { libc::setpgid(0, 0) } != 0;
         let as_expected = contained && refused == become_session_leader;
-        // SAFETY: async-signal-safe process exit; nothing is unwound and no
-        // atexit handler of the harness's may run in this child.
+        // SAFETY: async-signal-safe process exit without unwinding or atexit handlers.
         unsafe { libc::_exit(i32::from(!as_expected)) }
     }
     let mut status = 0i32;

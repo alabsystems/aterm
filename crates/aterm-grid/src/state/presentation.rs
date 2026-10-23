@@ -87,6 +87,7 @@ impl BandSet {
 }
 
 /// Sort `bands` ascending by low edge and merge every overlapping or adjacent
+/// pair, in place.
 fn merge_bands(bands: &mut [(u64, u64)]) -> usize {
     for i in 1..bands.len() {
         let mut j = i;
@@ -123,7 +124,7 @@ pub enum SelectionDamage {
 }
 
 impl SelectionDamage {
-    /// Copy this value's bands into `out`, returning how many were written. `None`
+    /// Copy this value's bands into `out`, returning how many were written.
     fn spill(self, out: &mut [(u64, u64)]) -> usize {
         match self {
             Self::None | Self::All => 0,
@@ -500,6 +501,7 @@ mod tests {
     }
 
     /// Collect the bands a value names, read through `clears_selection` (the
+    /// consumer-facing spelling), so a test can state the whole answer.
     fn bands_of(damage: SelectionDamage) -> Vec<(u64, u64)> {
         let mut out = Vec::new();
         let cleared = damage.clears_selection(|lo_abs, hi_abs| {
@@ -520,6 +522,7 @@ mod tests {
     }
 
     /// Adjacent and overlapping bands coalesce, which is what keeps a row-by-row
+    /// repaint from consuming a set slot per row.
     #[test]
     fn adjacent_and_overlapping_bands_coalesce() {
         let rows = band(3, 3).union(band(4, 4)).union(band(5, 5));
@@ -528,6 +531,9 @@ mod tests {
     }
 
     /// Order independence holds across the arity bound: a sequence that
+    /// momentarily exceeds the bound (a box border drawn as two overlapping
+    /// pieces and then filled) keeps its gaps when the final cover fits, folded
+    /// in either order.
     #[test]
     fn union_is_order_independent_past_the_arity_bound() {
         let seq = [
@@ -554,6 +560,7 @@ mod tests {
     }
 
     /// Past the bound the set absorbs a pair, never collapsing to the hull, and covers every
+    /// damaged row.
     #[test]
     fn overflow_absorbs_a_pair_and_still_covers_every_damaged_row() {
         let ten = [
@@ -592,7 +599,7 @@ mod tests {
         }
     }
 
-    /// At the bound the set is exact; one past it gives up a gap, not the whole set. Which of
+    /// At the bound the set is exact; one past it gives up a gap, not the whole set.
     #[test]
     fn past_the_arity_bound_one_gap_is_given_up_not_all_of_them() {
         let mut damage = SelectionDamage::None;

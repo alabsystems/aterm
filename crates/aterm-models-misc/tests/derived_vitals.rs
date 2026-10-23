@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 use aterm_models_misc::{
-    explain_honesty_model, scope_balance_model, stuck_verdict_liveness, stuck_verdict_model,
+    end_by_proof_model, explain_honesty_model, scope_balance_model, stuck_verdict_liveness,
+    stuck_verdict_model,
 };
 use aterm_spec::{interp, verify};
 
@@ -82,6 +83,51 @@ fn the_stuck_verdict_holds_and_each_law_has_its_own_mutant() {
     // Named at φ ≥ 8: stuck at once.
     assert!(model.fire("Relabel", &mut s));
     assert_eq!((s["cls"], s["v"]), (2, 2));
+}
+
+/// END BY PROOF (`docs/DESIGN-leftover-processes-2026-10-16.md` §4.4): the protocol holds with
+/// no mutant — no signal follows a read whose identity moved or whose tier was lost — and the
+/// mutant that signals without the judgment breaks that law. Tier-1 against the real
+/// `end_proven` is `aterm-verify`'s `conformance_end_by_proof`.
+#[test]
+fn the_end_by_proof_holds_and_its_mutant_signals_after_a_move() {
+    let model = end_by_proof_model();
+    verify::prove_and_catch_scalar(&model, "end by proof");
+
+    // The one law has its own mutant, and the committed config breaks none.
+    let mut buggy = interp::with_buggy(&model, 1);
+    buggy.invariants.retain(|i| i.name == "NoUnprovenSignal");
+    assert!(
+        interp::bmc(&buggy).is_err(),
+        "Buggy 1 signals after a moved identity or a lost tier"
+    );
+
+    // The healthy runs: no signal before its own judgment; a move before the SIGTERM, or a
+    // tier lost after it, sends nothing more, so `bad` stays 0 as the protocol reaches v == 2
+    // (done).
+    let mut s = model.init_state();
+    assert!(!model.action_enabled("Term", &s), "no SIGTERM unjudged");
+    assert!(model.fire("Move", &mut s));
+    assert!(
+        !model.action_enabled("Judge", &s),
+        "no judgment holds after a move"
+    );
+    assert!(model.fire("Stop", &mut s));
+    assert_eq!((s["v"], s["bad"]), (2, 0), "a moved read sends nothing");
+    let mut s = model.init_state();
+    assert!(model.fire("Judge", &mut s));
+    assert!(model.fire("Term", &mut s));
+    assert!(
+        !model.action_enabled("Kill", &s),
+        "the SIGTERM's judgment does not serve the SIGKILL"
+    );
+    assert!(model.fire("Lose", &mut s));
+    assert!(
+        !model.action_enabled("Judge", &s) && !model.action_enabled("Kill", &s),
+        "no SIGKILL once the tier is lost"
+    );
+    assert!(model.fire("Stop", &mut s));
+    assert_eq!((s["v"], s["bad"]), (2, 0), "a lost tier sends nothing more");
 }
 
 /// THE SCOPE BALANCE (`docs/DESIGN-system-awareness-2026-10-16.md` §7.7, §17): it holds with no

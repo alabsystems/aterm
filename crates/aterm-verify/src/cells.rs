@@ -4,6 +4,9 @@
 //! `verify cells`: cross-cell lint and type-check across Windows, linux-arm, and wasm32.
 
 //! STOCK EXCEPTION: the Trust sysroot carries only the host std, so each cell
+//! compiles on a rustup toolchain carrying its triple's std (stable first),
+//! driven by path from a neutral cwd so neither this repo's Trust pin nor its
+//! Trust-only cargo config reaches it.
 use aterm_uds::output::CommandOutput as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -30,6 +33,7 @@ pub const FLEET_HOST_TRIPLES: [&str; 3] = [
 ];
 
 /// The clippy config the browser cells lint with: std's clock panics on
+/// wasm32-unknown-unknown, which no host lint can see.
 const WASM_CLIPPY_CONF: &str = "crates/aterm-time/wasm32";
 
 /// The cells this check compiles by default: forge's own list, less the hosted triples.
@@ -239,7 +243,7 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
 }
 
 /// The windows-sys oracles, `aterm-win32-oracle`'s two verbs (WB.1, WB.2 and WB.3 of docs/AUDIT-third-party-2026-10-15.md), each with what it holds to the registry crates of its version. (STOCK EXCEPTION)
-/// either Windows cell runs each once. The same STOCK EXCEPTION as the cells:
+/// either Windows cell runs each once.
 pub const WIN32_ORACLES: [(&str, &str); 2] = [
     (
         "oracle",
@@ -300,7 +304,7 @@ pub fn win32_oracle_not_run_reason(output: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// One row per [`WIN32_ORACLES`] verb. The oracle's exit is read as the libc
+/// One row per [`WIN32_ORACLES`] verb.
 fn win32_oracles(ctx: &Ctx, r: &mut Report, have_rustup: bool) {
     for (verb, holds) in WIN32_ORACLES {
         let label = format!("win32 {verb} ({holds}; x86_64 and aarch64 pc-windows-msvc)");
@@ -343,6 +347,8 @@ fn win32_oracles(ctx: &Ctx, r: &mut Report, have_rustup: bool) {
 }
 
 /// The `cshim` rows no cell of this run used: one naming a triple no forge
+/// cell has is dead; one whose cell did not run is held to that cell's graph
+/// unless `--cell` narrowed the run.
 fn audit_policy(ctx: &Ctx, r: &mut Report, policy: &[Shim], ran: &[Cell]) {
     let all = aterm_forge::resolve::default_cells();
     let mut graphs: BTreeMap<String, Result<(Graph, BTreeSet<PkgId>), String>> = BTreeMap::new();
@@ -425,6 +431,7 @@ pub fn shim_lanes(shim: &Shim, library: &BTreeSet<PkgId>, tests: &BTreeSet<PkgId
 }
 
 /// `Some(why)` when `shim`'s version is in neither pass's graph, which a
+/// version bump does: its build script was never read.
 fn dead_shim(shim: &Shim, library: &BTreeSet<PkgId>, tests: &BTreeSet<PkgId>) -> Option<String> {
     let versions: BTreeSet<&str> = library
         .iter()
@@ -458,6 +465,8 @@ pub struct TestGraph {
 }
 
 /// The test-target pass's graph for `cell`: the selection
+/// [`test_selection`] makes from `members` and the cell's `normal` package
+/// names, resolved by `targo tree` for exactly that selection.
 fn test_graph(
     ctx: &Ctx,
     cell: &Cell,
@@ -494,6 +503,8 @@ fn test_graph(
 }
 
 /// `targo tree` over the workspace less `excluded`, for `triple`, with normal
+/// and dev edges and no proc-macro or build subtrees (host code a target
+/// override cannot help): the depth-prefixed forest, one root per member.
 fn test_tree(
     targo: &Path,
     path: &std::ffi::OsStr,
@@ -531,6 +542,7 @@ fn test_tree(
 /// A line forge cannot read, or a forest that is not the one asked for.
 pub fn parse_test_forest(text: &str, roots: &BTreeSet<String>) -> Result<BTreeSet<PkgId>, String> {
     /// One depth-0 tree: whether its root is a proc macro, and every line from
+    /// the root down, as (depth, package).
     struct RootTree {
         proc_macro: bool,
         lines: Vec<(usize, PkgId)>,
@@ -624,7 +636,7 @@ pub fn parse_test_forest(text: &str, roots: &BTreeSet<String>) -> Result<BTreeSe
     Ok(nodes)
 }
 
-/// The cell's packages compiled for the host ([`host_side`]). A third-party
+/// The cell's packages compiled for the host ([`host_side`]).
 fn host_side_of(ctx: &Ctx, graph: &Graph, paths: &BTreeMap<PkgId, PathBuf>) -> BTreeSet<PkgId> {
     host_side(graph, |id| {
         aterm_forge::loc::package_dir(&ctx.root, id, paths.get(id).map(PathBuf::as_path))
@@ -639,6 +651,7 @@ fn library_nodes(ctx: &Ctx, graph: &Graph, paths: &BTreeMap<PkgId, PathBuf>) -> 
 }
 
 /// One cell's graph from forge's own resolver, asking this run's targo, under
+/// the run's ceiling.
 fn graph_of(ctx: &Ctx, cell: &Cell) -> Result<(Graph, BTreeMap<PkgId, PathBuf>), String> {
     let (cargo, root, owned) = (ctx.forge_cargo(), ctx.root.clone(), cell.clone());
     crate::exec::bounded(ctx.child_ceiling, move || {
@@ -649,6 +662,7 @@ fn graph_of(ctx: &Ctx, cell: &Cell) -> Result<(Graph, BTreeMap<PkgId, PathBuf>),
 }
 
 /// One cell, end to end: its graph, its shims, its toolchain, the lint of
+/// its root package, and the all-targets pass over its workspace members.
 fn check_cell(
     ctx: &Ctx,
     rustup: &Path,
@@ -967,6 +981,7 @@ fn read_cargo_run(
 }
 
 /// The two cargo runs one cell makes, sharing its toolchain, cwd, target
+/// dir and shims.
 struct CellCargo<'a> {
     ctx: &'a Ctx,
     triple: &'a str,
@@ -978,6 +993,10 @@ struct CellCargo<'a> {
 
 impl CellCargo<'_> {
     /// `<toolchain cargo> <verb> --target <triple> …` with this cell's
+    /// environment: the toolchain's own `rustc`, its bin first on PATH (so
+    /// `cargo clippy` finds `cargo-clippy` beside it), its lib first on the
+    /// loader path ([`crate::rustup::Toolchain::loader_env`]), and the cells
+    /// lane's job cap, since the cells compile beside the run's other builds.
     fn base(&self, verb: &str) -> Cmd {
         let mut path = OsString::new();
         if let Some(bin) = self.toolchain.cargo.parent() {
@@ -1013,6 +1032,9 @@ impl CellCargo<'_> {
     }
 
     /// The lint of the cell's root package: of clippy, only the `clippy.toml`
+    /// bans (every other clippy lint is the host's), the browser cells with
+    /// their own clock-only config; rustc's own warnings are read from the
+    /// stream ([`is_cell_warning`]).
     fn lint(&self, cell: &Cell) -> Cmd {
         let mut cmd = self
             .base("clippy")
@@ -1061,6 +1083,7 @@ pub fn lint_flags(triple: &str) -> &'static [&'static str] {
 }
 
 /// The workspace member names, from `targo metadata --no-deps` (the NAME,
+/// which `--exclude` takes, is not always the directory).
 fn member_names(ctx: &Ctx) -> Result<BTreeSet<String>, String> {
     let out = aterm_uds::spawnfd::command(&ctx.tools.targo)
         .args([
@@ -1292,6 +1315,7 @@ pub fn package_id_name(id: &str) -> &str {
 }
 
 /// Is `dir` inside `root`, both canonicalised (`/tmp` and `/private/tmp`
+/// name one place on macOS)?
 fn not_owed_note(proc_macros: &BTreeSet<String>, host_deps: &BTreeSet<String>) -> String {
     let mut kinds = Vec::new();
     if !proc_macros.is_empty() {
@@ -1387,6 +1411,7 @@ mod tests {
     }
 
     /// No `--cell` is the foreign cells; a name picks that cell, hosted or
+    /// not; an unknown name is refused.
     #[test]
     fn a_run_checks_the_foreign_cells_or_each_cell_named() {
         assert_eq!(selected(&[]).expect("default"), foreign_cells());
@@ -1443,6 +1468,7 @@ mod tests {
     }
 
     /// A test-only C oracle is live in the test-target pass alone; a stale
+    /// version or an unselected member's oracle is live in neither.
     #[test]
     fn a_test_only_c_oracle_is_shimmed_only_in_the_test_target_pass() {
         let normal = aterm_forge::resolve::parse_tree(
@@ -1482,6 +1508,9 @@ mod tests {
     }
 
     /// The test-target forest of a real (private, compiler-free) workspace
+    /// holds only the selected members, their dev-dependencies and their
+    /// target dependencies: no build-only or proc-macro subtree, no excluded
+    /// member's oracle.
     #[test]
     fn the_test_target_forest_has_only_selected_members_dev_and_target_dependencies() {
         let dir = aterm_tempfile::tempdir().expect("private resolver fixture");
@@ -1569,6 +1598,8 @@ mod tests {
     }
 
     /// A member a selected proc macro depends on is printed as two roots, its
+    /// target node and its host node (the SP.6 shape: aterm-serde-derive on
+    /// aterm-macro-support).
     #[test]
     fn a_member_a_proc_macro_uses_is_read_as_its_target_copy() {
         let dir = aterm_tempfile::tempdir().expect("private resolver fixture");
@@ -1654,6 +1685,7 @@ mod tests {
     }
 
     /// Only an artifact under the triple's own directory counts, a host unit
+    /// (a proc macro, a build script) never; test units only when asked.
     #[test]
     fn only_the_triples_own_artifacts_count() {
         let graph = names(&["a", "b", "c"]);
@@ -1682,6 +1714,8 @@ mod tests {
     }
 
     /// rustc's own warnings are the cell's: an item only another OS calls
+    /// (`dead_code`) or an import only it uses never warns on the host, so the
+    /// cell's compile is where it shows.
     #[test]
     fn a_rustc_warning_is_a_cell_finding_and_a_clippy_one_is_the_hosts() {
         let graph = names(&["gui"]);
@@ -1881,6 +1915,7 @@ mod tests {
     }
 
     /// The members the graph carries are selected; the rest are excluded,
+    /// except a patched one, whose exclusion would drop its patch.
     #[test]
     fn the_test_pass_selects_the_graph_and_never_excludes_a_patch() {
         let members = names(&["a", "b", "arrayvec", "z"]);
@@ -1891,6 +1926,7 @@ mod tests {
     }
 
     /// A crate only a proc macro reaches compiles for the host with it and is
+    /// not owed a target artifact; one a non-proc-macro path also reaches is.
     #[test]
     fn a_crate_only_proc_macros_reach_is_host_side() {
         let id = |n: &str| PkgId::new(n, "1.0.0");
@@ -1942,6 +1978,7 @@ mod tests {
     }
 
     /// A cell's cargo builds in its own directory of the cells lane, capped at
+    /// the lane's jobs and never above the caller's own `CARGO_BUILD_JOBS`.
     #[test]
     fn a_cells_cargo_runs_in_the_cells_lane_under_its_job_cap() {
         let env_of = |caller: Option<&str>| {
@@ -1987,6 +2024,7 @@ mod tests {
     }
 
     /// Either Windows cell brings both windows-sys oracles, once each; a run
+    /// with no Windows cell runs neither.
     #[test]
     fn a_windows_cell_brings_both_windows_sys_oracles_built_in_the_cells_lane() {
         let all = aterm_forge::resolve::default_cells();
@@ -2043,6 +2081,7 @@ mod tests {
     }
 
     /// An oracle that decided nothing says why on its last `could not run`
+    /// line, which becomes the row's reason; a finding's output has none.
     #[test]
     fn a_win32_oracle_that_could_not_run_names_its_reason() {
         assert_eq!(

@@ -1,40 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The lab's sleep clock. `LAB_CLOCK=1 targo --unverified lab up TAG` loads
-//! the clock library (`crates/aterm-lab-clock`: what it shifts and how) into
-//! the lab's OWN instance and into the Claude Code its `claude` launches, at
-//! offset 0; `sleep TAG --for SECS` ([`crate::sleep`]) stops the instance and
-//! steps the offset, which is what a sleep of the Mac looks like from inside
-//! a process. No other lab, no process outside this lab's jail, and none of
-//! the other agents (Codex, Gemini CLI, agy, Muse Code) load it.
-//!
-//! Its files ([`Layout`]), each written by the lab from OUTSIDE the jail but
-//! the records:
-//!
-//! * `runs/<tag>/clock/libaterm_lab_clock.dylib`: the library, which `up`
-//!   builds from this checkout (`targo --unverified build -p aterm-lab-clock
-//!   --lib`, by the `targo` that built this program, into
-//!   `target/lab-clock.noindex/`, which Spotlight skips) and copies here,
-//!   where no jailed process can replace it while a launch reads it;
-//! * `runs/<tag>/clock/offset`: the offset, whole seconds, `0` at `up`;
-//!   `sleep` steps it by a rename;
-//! * `runs/<tag>/clock/claude`: when the Claude Code under test has a
-//!   hardened runtime (its signature's `runtime` flag: dyld then refuses
-//!   `DYLD_INSERT_LIBRARIES`), a clone of it signed ad hoc (`codesign --force
-//!   --sign -`), which the lab launches by path in its place (`CLAUDE_BIN`
-//!   names it, and the jail is rendered for it);
-//! * `runs/<tag>/scratch/clock/`: each process's record (`<pid>.txt`: its
-//!   pid, parent, executable and offset), the one place of the clock jailed
-//!   code writes ([`crate::protected::SCRATCH_DIRS`]), read through no link.
-//!
-//! The variables ([`vars`]) are the lab's own: the instance gets them at
-//! every launch of it (`up`'s, and `restore`'s and `crash`'s relaunches:
-//! [`crate::lab::instance_vars`]), and `claude.sh` hands them to Claude Code
-//! (the instance's shells are system binaries, which drop every `DYLD_*`
-//! variable, so nothing reaches Claude Code through them);
-//! `LAB_INSTANCE_ENV` and `claude -e` never hand one ([`is_clock_var`]).
-//! `down` keeps the offset and the records in `logs/<tag>-<time>/clock/`.
+//! Lab sleep clock injection ([`crate::sleep`], [`Layout`],
+//! [`crate::protected::SCRATCH_DIRS`], [`vars`], [`crate::lab::instance_vars`],
+//! [`is_clock_var`]).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -87,9 +56,7 @@ pub(crate) fn is_clock_var(name: &str) -> bool {
     name == "DYLD_INSERT_LIBRARIES" || name.starts_with("LABCLOCK_")
 }
 
-/// The variables that load the clock (none unless the lab is up with it): the
-/// library, its offset file and record directory, and the continuous switch
-/// (the clocks that count a sleep move with the wall).
+/// The variables that load the clock (none unless the lab is up with it).
 #[must_use]
 pub(crate) fn vars(run: &Run) -> Vec<(String, String)> {
     if run.clock != "1" {
@@ -115,8 +82,7 @@ pub(crate) fn hardened(codesign_dv: &str) -> bool {
         .any(|f| f & CS_RUNTIME != 0)
 }
 
-/// The library a build made, from its `--message-format json` lines: the
-/// `.dylib` of the `aterm_lab_clock` cdylib's `compiler-artifact`.
+/// The library a build made, from its `--message-format json` lines.
 #[must_use]
 pub(crate) fn artifact_of(json_lines: &str) -> Option<PathBuf> {
     json_lines.lines().find_map(|line| {
@@ -141,9 +107,7 @@ pub(crate) fn artifact_of(json_lines: &str) -> Option<PathBuf> {
     })
 }
 
-/// Build the library from checkout `repo` with the `targo` that built this
-/// program, into a target dir of its own (no lock shared with another build),
-/// and name what it built.
+/// Build the library from checkout `repo` with the `targo` that built this program.
 ///
 /// # Errors
 /// No `targo` is known, the build failed, or it named no library.
@@ -199,14 +163,10 @@ fn codesign_dv(bin: &Path) -> Result<String, String> {
     ))
 }
 
-/// Lay lab `run`'s clock at `up`, before its jail is rendered: the library
-/// built and copied in, the offset at 0, and Claude Code cloned and signed
-/// ad hoc when its runtime is hardened (`CLAUDE_BIN` then names the clone).
-/// `CLOCK=1` is recorded once it is laid.
+/// Lay lab `run`'s clock at `up`, before its jail is rendered.
 ///
 /// # Errors
-/// The library did not build, a file could not be written, or the clone
-/// could not be signed or kept its hardened runtime.
+/// Build, file write, or ad-hoc code-signing failure.
 pub(crate) fn lay(run: &mut Run, repo: &Path) -> Result<(), String> {
     let l = Layout::of(run);
     fs::create_dir_all(&l.dir).map_err(|e| format!("cannot make {}: {e}", l.dir.display()))?;

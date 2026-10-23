@@ -232,6 +232,7 @@ pub struct Snapshot {
     /// [`SCHEMA`]'s SHA-256 over the take, lowercase hex.
     pub digest: String,
     /// What the digest was taken over, kept so [`Snapshot::verify`] can name what
+    /// changed.
     listing: Listing,
 }
 
@@ -375,6 +376,7 @@ pub(crate) fn git_text(dir: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 /// The id git gives an object of `kind` holding `data`: the object format's hash
+/// (SHA-1 for a 40-digit id, SHA-256 for a 64-digit one) over `<kind> <len>\0<data>`.
 fn object_id(kind: &str, data: &[u8], hex_digits: usize) -> Option<String> {
     let algorithm = match hex_digits {
         40 => &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
@@ -388,6 +390,7 @@ fn object_id(kind: &str, data: &[u8], hex_digits: usize) -> Option<String> {
 }
 
 /// One repository's `git cat-file --batch`, asked for one object at a time, every answer
+/// held to the id and kind asked for.
 struct ObjectReader {
     dir: PathBuf,
     child: aterm_uds::spawnfd::Child,
@@ -418,6 +421,7 @@ impl ObjectReader {
     }
 
     /// The bytes of the object `oid`, which must be a `kind`: refused unless git
+    /// answers for that id with that kind, and the bytes hash to that id.
     fn read(&mut self, oid: &str, kind: &str) -> Result<Vec<u8>, String> {
         let read = self.answer(oid, kind);
         if read.is_err() {
@@ -478,6 +482,7 @@ impl ObjectReader {
     }
 
     /// End git: close its stdin, drain what a refusal left unread (so it cannot block
+    /// on a full pipe before it reads the end), and wait for it.
     fn close(&mut self) -> (std::io::Result<std::process::ExitStatus>, String) {
         drop(self.stdin.take());
         let _ = std::io::copy(&mut self.stdout, &mut std::io::sink());
@@ -515,6 +520,7 @@ impl Drop for ObjectReader {
 }
 
 /// Append every file of `commit`'s tree in `repos[repo]` under `prefix`, recursing into
+/// each gitlink at the commit it records, one [`ObjectReader`] per repository.
 fn list_tree(
     repos: &mut Vec<PathBuf>,
     repo: usize,
@@ -540,6 +546,8 @@ fn list_tree(
 }
 
 /// Read `commit` and walk its tree: append each file to `out`, refuse what a release
+/// cannot build from, and return each gitlink — its path in this repository and the
+/// commit it records — for [`list_tree`] to recurse into.
 fn walk_commit(
     reader: &mut ObjectReader,
     repo: usize,
@@ -640,7 +648,7 @@ struct RawEntry<'a> {
     id: String,
 }
 
-/// A tree object's entries, each id `raw_len` bytes. `None` when the bytes are not
+/// A tree object's entries, each id `raw_len` bytes.
 fn tree_entries(data: &[u8], raw_len: usize) -> Option<Vec<RawEntry<'_>>> {
     let mut entries = Vec::new();
     let mut rest = data;
@@ -689,6 +697,8 @@ fn submodule_at(sub: &Path, oid: &str, path: &[u8]) -> Result<(), String> {
 }
 
 /// Sync `commit`'s tree in `repo`, submodules included, into `sync`'s `src/`, then remove
+/// every path under `src/` the tree does not name ([`Syncer::prune_under`]) before anything
+/// reads it.
 fn take_tree(repo: &Path, commit: &str, sync: &mut Syncer) -> Result<(), String> {
     let mut repos = vec![repo.to_path_buf()];
     let mut entries = Vec::new();
@@ -698,6 +708,7 @@ fn take_tree(repo: &Path, commit: &str, sync: &mut Syncer) -> Result<(), String>
 }
 
 /// Stream every entry's blob through one `git cat-file --batch` per repository
+/// into `sync`, each held to its tree entry's id.
 fn read_blobs(repos: &[PathBuf], entries: &[TreeEntry], sync: &mut Syncer) -> Result<(), String> {
     for (index, dir) in repos.iter().enumerate() {
         let mine: Vec<&TreeEntry> = entries.iter().filter(|e| e.repo == index).collect();
@@ -822,6 +833,7 @@ fn path_bytes(path: &Path) -> Vec<u8> {
 }
 
 /// A relative path of plain components only: no root, no `.`, no `..`, no empty
+/// component — what git itself allows in a tree, checked again before any write.
 fn check_relative(path: &[u8]) -> Result<(), String> {
     let ok = !path.is_empty()
         && path
@@ -842,6 +854,7 @@ pub struct Syncer {
     root: PathBuf,
     keep: BTreeSet<PathBuf>,
     /// The names each directory the sync has looked in holds on disk, read once and
+    /// kept current by every write and removal here.
     names: BTreeMap<PathBuf, BTreeSet<OsString>>,
     report: SyncReport,
 }
@@ -917,6 +930,8 @@ impl Syncer {
     }
 
     /// What is at `rel` under exactly that name, or `None`: an entry the volume finds
+    /// there under another spelling is removed first, unless this sync wrote it — then
+    /// the tree names both spellings, and that is refused.
     fn exact(&mut self, rel: &Path) -> Result<Option<fs::Metadata>, String> {
         let full = self.root.join(rel);
         let meta = match fs::symlink_metadata(&full) {
@@ -999,6 +1014,8 @@ impl Syncer {
     }
 
     /// `rel` (a file or a whole directory) was removed: counted, taken out of its
+    /// directory's listing, and every listing under it forgotten, so a later
+    /// [`Syncer::put`] sees the disk as it now is.
     fn removed(&mut self, rel: &Path) {
         let parent = rel.parent().unwrap_or_else(|| Path::new(""));
         if let (Some(names), Some(name)) = (self.names.get_mut(parent), rel.file_name()) {
@@ -1066,6 +1083,7 @@ impl Syncer {
 }
 
 /// The components of a take path, refused unless it is a non-empty relative path of
+/// plain components: nothing a [`Syncer`] writes or removes is outside its root.
 fn take_parts(rel: &Path) -> Result<Vec<&OsStr>, String> {
     let parts: Vec<&OsStr> = rel
         .components()
@@ -1088,6 +1106,7 @@ fn same_entry(a: &fs::Metadata, b: &fs::Metadata) -> bool {
 }
 
 /// Without inode identity, no other spelling is ever taken for this one: [`Syncer`]
+/// refuses rather than remove what it cannot name.
 #[cfg(not(unix))]
 fn same_entry(_a: &fs::Metadata, _b: &fs::Metadata) -> bool {
     false
@@ -1197,6 +1216,7 @@ pub fn locked_crates(lock_text: &str) -> Result<Vec<LockedCrate>, String> {
 }
 
 /// Every `<cargo_home>/registry/cache/*/<name>-<version>.crate` the lockfile names:
+/// which locked crate it is, where, and whether its SHA-256 is the lock's checksum.
 fn cached_archives<'a>(
     locked: &'a [LockedCrate],
     cargo_home: &Path,
@@ -1281,7 +1301,7 @@ pub(crate) fn refuse_root_cargo_config() -> Result<(), String> {
     Ok(())
 }
 
-/// Remove any Cargo config from the vendoring `CARGO_HOME`. The cutter writes none, and
+/// Remove any Cargo config from the vendoring `CARGO_HOME`.
 fn clear_cargo_home_config(cargo_home: &Path) -> Result<(), String> {
     for name in ["config.toml", "config"] {
         let path = cargo_home.join(name);
@@ -1422,7 +1442,7 @@ fn vendor_into(
     Ok(locked.len())
 }
 
-/// Hand every file under `from` to `sync`, at `prefix`. A symbolic link is refused, as
+/// Hand every file under `from` to `sync`, at `prefix`.
 fn put_tree(sync: &mut Syncer, from: &Path, prefix: &Path) -> Result<(), String> {
     let mut dirs = vec![(from.to_path_buf(), prefix.to_path_buf())];
     while let Some((dir, rel)) = dirs.pop() {
@@ -1465,7 +1485,7 @@ fn is_exec(_meta: &fs::Metadata) -> bool {
     false
 }
 
-/// Every file under `root`, by relative path: `file\0<mode>\0<sha256>`. The sync
+/// Every file under `root`, by relative path: `file\0<mode>\0<sha256>`.
 fn listing(root: &Path) -> Result<Listing, String> {
     let mut out = Listing::new();
     let mut dirs = vec![(root.to_path_buf(), Vec::new())];
@@ -1540,6 +1560,7 @@ mod tests {
     use super::*;
 
     /// git with nothing of this machine's own configuration in it
+    /// ([`crate::ledger::testing::git`]).
     fn git(dir: &Path, args: &[&str]) -> String {
         let out = crate::ledger::testing::git()
             .arg("-C")
@@ -1568,6 +1589,7 @@ mod tests {
     }
 
     /// The reader refuses planted bytes under an id (which plain `git cat-file` serves, the
+    /// negative control), a wrong kind and a missing object; a refusal closes it.
     #[test]
     fn the_object_reader_holds_every_answer_to_its_id_and_kind() {
         let scratch = aterm_tempfile::Builder::new()
@@ -1616,6 +1638,8 @@ mod tests {
     }
 
     /// A path the new commit dropped is gone from `src/` when [`take_tree`] returns, before
+    /// [`vendor_into`] reads it (a `members = ["crates/*"]` workspace still takes a leftover
+    /// crate as a member).
     #[test]
     fn a_path_the_commit_dropped_is_gone_from_src_before_vendoring_reads_it() {
         let scratch = aterm_tempfile::Builder::new()

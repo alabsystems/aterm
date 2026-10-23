@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The cold-launch apply + rollback lane: real private entry points of `install.rs`
-//! against a scratch staging root and same-volume fixtures. The fixture bundles carry no
-//! executable, so a revert's closing re-exec fails with ENOENT and returns.
-
+//! against a scratch staging root and same-volume fixtures.
 use std::path::Path;
 
 use super::*;
@@ -29,14 +27,6 @@ fn read_id(dir: &Path) -> String {
 /// A crash-loop revert — the previous build swapped back over the install, the
 /// new one quarantined, a re-exec — is booked in `health.toml`, so `update
 /// status`, the pull-down row and the persistent-failure notice can see it.
-///
-/// Drives the real revert: armed sentinel at `MAX_BOOT_ATTEMPTS`, OLD at the
-/// fixed rollback path, NEW installed, under the apply lock, once for each way the
-/// image may be replaced. A replaceable launch's revert, and a window's that keeps its
-/// image, re-exec the restored build: the fixture has no executable, so that exec fails
-/// and the function returns `ReExecFailed` instead of replacing this process. A
-/// LaunchServices-launched successor's revert attempts no exec at all and returns
-/// `Reverted` for its caller to exit. Either way the disk ends the same.
 #[test]
 fn a_crash_loop_revert_is_booked_in_the_failure_ledger() {
     use crate::ImageReplacement::{LaunchedSuccessor, Replaceable, WindowKeepsImage};
@@ -60,8 +50,6 @@ fn a_crash_loop_revert_is_booked_in_the_failure_ledger() {
         };
         let lock = FileLock::acquire(&s.apply_lock).unwrap();
 
-        // The operator floor sits ABOVE the restored build (a yanked predecessor): the
-        // revert still happens — a crash loop is strictly worse than a yank.
         crate::manifest::Floor::bump_and_write(&s.floor(), 1500, 0, 0);
         assert_eq!(crate::manifest::Floor::read(&s.floor()).min_build, 1500);
         let restored = VerifiedRollback {
@@ -104,7 +92,6 @@ fn a_crash_loop_revert_is_booked_in_the_failure_ledger() {
             "the crash-looping build is quarantined"
         );
 
-        // The revert reached the failure ledger.
         let health = Health::read(&s.health());
         assert!(
             health.apply_failures >= 1,
@@ -123,8 +110,7 @@ fn a_crash_loop_revert_is_booked_in_the_failure_ledger() {
 
 /// A crash-loop revert's inverse swap and the quarantine it records before the
 /// rollback goes take `install_flush`'s tier (aterm-durable's counting seam), on this
-/// volume and as if the install root were on another device. Those two sites are
-/// every flush the revert takes through aterm-durable.
+/// volume and as if the install root were on another device.
 #[test]
 fn a_crash_loop_reverts_swap_and_quarantine_take_the_install_tier() {
     use aterm_durable::Flush::{Durable, Ordered};
@@ -177,8 +163,7 @@ fn a_crash_loop_reverts_swap_and_quarantine_take_the_install_tier() {
     assert_eq!(elsewhere, [Durable; 5], "another device");
 }
 
-/// The pure law behind `check_boot_health`'s count. The arm's first launch always counts,
-/// and an unreadable age counts the launch (fail toward counting, never toward silence).
+/// The pure law behind `check_boot_health`'s count.
 #[test]
 fn a_launch_inside_the_burst_window_of_a_counted_one_is_not_counted_again() {
     use std::time::Duration;
@@ -232,7 +217,6 @@ fn an_armed_boot_health_check_times_out_without_counting_a_launch() {
         send.send(result).unwrap();
     });
     let before_release = receive.recv_timeout(Duration::from_secs(60));
-    // Release and join before asserting, so an unbounded wait cannot hang the test.
     drop(holder);
     worker.join().unwrap();
     let result =
@@ -253,8 +237,6 @@ fn an_armed_boot_health_check_times_out_without_counting_a_launch() {
     state.insert("counted", i64::from(sentinel.read_state().unwrap().1));
     assert!(model.check_invariant("LaunchDoesNotAwaitHeldLock", &state));
 
-    // Negative control: an unbounded acquire under the same held lock cannot complete
-    // before release, which violates the bounded-launch law.
     let holder = FileLock::acquire(&s.apply_lock).unwrap();
     let lock_path = s.apply_lock.clone();
     let (send, receive) = mpsc::channel();
@@ -345,7 +327,6 @@ fn a_forgive_that_meets_a_held_apply_lock_is_given_back_once_it_frees() {
         started: (1, 2),
     };
     sentinel.observe_launch_by(11, Some(killed)).unwrap();
-    // A sibling's ditto or codesign, holding the lock past the give-back's wait.
     let holder = FileLock::acquire(&s.apply_lock).unwrap();
     assert!(
         forgive_trial_launch_of_at(
@@ -364,7 +345,6 @@ fn a_forgive_that_meets_a_held_apply_lock_is_given_back_once_it_frees() {
         "nothing moves the count without the lock"
     );
     drop(holder);
-    // The next holder of the lock pays what is owed before it reads the count.
     {
         let _lock = FileLock::acquire(&s.apply_lock).unwrap();
         pay_owed_trial_launches(&s, &sentinel);
@@ -374,7 +354,6 @@ fn a_forgive_that_meets_a_held_apply_lock_is_given_back_once_it_frees() {
         Some((11, 0)),
         "the owed launch is given back once the lock frees"
     );
-    // Paid once: a second pass, or the same ask again, gives back nothing more.
     sentinel.observe_launch(11).unwrap();
     {
         let _lock = FileLock::acquire(&s.apply_lock).unwrap();
@@ -385,7 +364,7 @@ fn a_forgive_that_meets_a_held_apply_lock_is_given_back_once_it_frees() {
 }
 
 /// A third boot's count pays two owed give-backs first, so a healthy build is not
-/// reverted. Negative control: two real crashes still bring the third boot to the revert.
+/// reverted.
 #[test]
 fn owed_give_backs_are_paid_before_a_later_boot_counts() {
     use std::time::Duration;
@@ -450,7 +429,6 @@ fn trial_give_back_projection(
     let on = |launch: Option<TrialLauncher>| {
         i64::from(launch.is_some_and(|launch| named.contains(&launch.name())))
     };
-    // The candidate's launch is owed back: its debt is on disk (`owe_trial_launch`).
     let owed = candidate.is_some_and(|launch| {
         owed_give_backs_dir(s)
             .join(format!(
@@ -468,16 +446,9 @@ fn trial_give_back_projection(
 }
 
 /// Tier-1 of `NativeUpdateTrialGiveBack`: overlapping launches of one trial are given back
-/// by name. Each trace step runs the real `count_trial_launch` and give-backs against a
-/// scratch sentinel, with live stand-ins as the launchers, and the ledger must stand where
-/// the model does after every step. The traces cover a sibling's give-back racing the
-/// candidate's snapshots (X, Y, Z), a settle by the name the candidate stamped
-/// (`SettledUnnamed`: A, P, E, K, I2, L), and a settle owed past a held apply lock
-/// (`SettledOwed`: O, Q). Negative controls: the model's mutants `Buggy=1`, `2` and `3`.
+/// by name.
 #[test]
 fn overlapping_launches_of_one_trial_are_given_back_by_name() {
-    // `spawnfd`'s `Command`: a stand-in inherits its stdio and nothing else, never
-    // another test thread's pipe.
     use aterm_uds::spawnfd::{Child, Command};
     const BUILD: u64 = 11;
     let spawn = || -> Child {
@@ -490,7 +461,6 @@ fn overlapping_launches_of_one_trial_are_given_back_by_name() {
         child.kill().unwrap();
         child.wait().unwrap();
     };
-    // Every step is seconds apart in the field: never a burst.
     let backdate = |s: &Staging| {
         std::fs::File::options()
             .write(true)
@@ -500,7 +470,6 @@ fn overlapping_launches_of_one_trial_are_given_back_by_name() {
             .unwrap();
     };
     let launcher = |child: &Child| TrialLauncher::of(child.id()).expect("a running child");
-    // A handoff target, or (`handoff_target = false`) a cold launch.
     let count_as = |s: &Staging, launch: TrialLauncher, handoff_target: bool| {
         count_trial_launch(
             s,
@@ -525,8 +494,6 @@ fn overlapping_launches_of_one_trial_are_given_back_by_name() {
         );
         backdate(s);
     };
-    // `Buggy=1`'s rule: give one launch back, whichever it is, when the count moved
-    // since the asker's snapshot and stands above zero.
     let by_movement = |s: &Staging, snapshot: u32| {
         let now = trial_launch_count_at(s, BUILD);
         if now > 0 && now != snapshot {
@@ -534,8 +501,6 @@ fn overlapping_launches_of_one_trial_are_given_back_by_name() {
         }
         backdate(s);
     };
-    // `Buggy=3`'s unnamed settle: the newest launch named since the parent's snapshot
-    // whose process is gone, whoever made it.
     let by_newest_gone = |s: &Staging, snapshot: &[LaunchName]| {
         let gone = boot_sentinel(s)
             .named_launches(BUILD)
@@ -677,19 +642,12 @@ fn overlapping_launches_of_one_trial_are_given_back_by_name() {
             ],
         ),
     ];
-    // Every trace starts from a copy of one disk, made once by the real `arm` and
-    // `count_trial_launch`: the trial armed and its kept launch counted, its process gone
-    // (arming per trace cost a quarter of the test's wall time). Sharing one dead
-    // process's name is sound: the code only matches a name or asks whether it runs.
     let kept = scratch("trial-give-back-kept-crash");
     boot_sentinel(&kept).arm(BUILD).unwrap();
     let mut crash = spawn();
     count(&kept, launcher(&crash));
     stop(&mut crash);
     let model = aterm_models_update::native_update_trial_give_back_model();
-    // One rule's replay of every trace, and the invariants it broke. Each trace runs in a
-    // scratch staging of its own (a copy of `kept`) with stand-ins of its own, so the four
-    // rules' replays share nothing and run at once, a thread each.
     let replay = |buggy: i64| {
         let model = aterm_spec::interp::with_buggy(&model, buggy);
         let mut broken = Vec::new();
@@ -730,8 +688,6 @@ fn overlapping_launches_of_one_trial_are_given_back_by_name() {
                         count_as(&s, launcher(&child), false);
                         sibling = Some(child);
                     }
-                    // The sibling is this machine's environment: it gives its own
-                    // launch back by name under either rule, or its parent does.
                     "SiblingGivesBack" => {
                         by_name(&s, sibling_launch.unwrap());
                         stop(sibling.as_mut().unwrap());
@@ -744,8 +700,6 @@ fn overlapping_launches_of_one_trial_are_given_back_by_name() {
                         let child = spawn();
                         candidate_launch = Some(launcher(&child));
                         candidate = Some(child);
-                        // The candidate's first act, before its boot apply can
-                        // count: its own name, beside the rendezvous.
                         write_trial_launch_stamp(&stamp, candidate_launch.unwrap()).unwrap();
                     }
                     "Boots" => {
@@ -768,8 +722,6 @@ fn overlapping_launches_of_one_trial_are_given_back_by_name() {
                             by_name(&s, candidate_launch.unwrap());
                         }
                     }
-                    // Another aterm holds the apply lock past the settle's wait;
-                    // `Buggy=1` drops the give-back.
                     "SettledOwed" => {
                         if buggy != 1 {
                             let holder = FileLock::acquire(&s.apply_lock).unwrap();
@@ -785,7 +737,6 @@ fn overlapping_launches_of_one_trial_are_given_back_by_name() {
                         }
                         backdate(&s);
                     }
-                    // The next holder of the lock that is no counted boot.
                     "PaysOwed" => {
                         let _lock = FileLock::acquire(&s.apply_lock).unwrap();
                         pay_owed_trial_launches(&s, &boot_sentinel(&s));
@@ -807,9 +758,6 @@ fn overlapping_launches_of_one_trial_are_given_back_by_name() {
                     _ => unreachable!("{action}"),
                 }
                 assert!(model.fire(action, &mut state));
-                // The count's movement leaves names behind, so under it only the
-                // count is the ledger's; the model's `mine` is the truth it failed
-                // to keep.
                 for (var, real) in
                     trial_give_back_projection(&s, BUILD, candidate_launch, sibling_launch)
                 {
@@ -858,9 +806,6 @@ fn overlapping_launches_of_one_trial_are_given_back_by_name() {
         };
         let mut expected: Vec<(&str, &str)> = match buggy {
             0 => Vec::new(),
-            // The count's movement erases a kept crash in A, I2, K and X, and
-            // keeps Y's killed candidate's launch; O's dropped give-back leaves
-            // its launch under the sibling's count.
             1 => [erased("A"), erased("I2"), erased("K"), erased("X")]
                 .concat()
                 .into_iter()
@@ -870,8 +815,6 @@ fn overlapping_launches_of_one_trial_are_given_back_by_name() {
                 ])
                 .collect(),
             2 => [erased("A"), erased("I2"), erased("K")].concat(),
-            // The newest gone name takes I2's and K's crashed siblings' launches,
-            // and L's sibling's for the candidate's.
             _ => vec![
                 ("I2", "AKeptCrashStaysCounted"),
                 ("K", "AKeptCrashStaysCounted"),
@@ -886,11 +829,7 @@ fn overlapping_launches_of_one_trial_are_given_back_by_name() {
 /// An earlier launcher of the trial that stays alive and
 /// unconfirmed (its recovery proof failing on every retry) must not shield later
 /// launches that are not the handoff target — a new window, a sibling, a candidate
-/// booting the installed image for a newer target. Each of those counts, so the
-/// budget-exhausted escape is still reached and the trial cannot stay armed (and
-/// every newer update deferred) for as long as that one process lives.
-///
-/// Negative control: the same later launches as handoff targets are not counted.
+/// booting the installed image for a newer target.
 #[test]
 fn a_live_unconfirmed_launcher_does_not_shield_non_target_launches() {
     use aterm_uds::spawnfd::{Child, Command};
@@ -918,7 +857,6 @@ fn a_live_unconfirmed_launcher_does_not_shield_non_target_launches() {
         let s = scratch(label);
         let sentinel = boot_sentinel(&s);
         sentinel.arm(11).unwrap();
-        // The wedged driver: the first launch, alive for the whole test.
         let mut driver = spawn();
         count_trial_launch(
             &s,
@@ -971,8 +909,7 @@ fn a_live_unconfirmed_launcher_does_not_shield_non_target_launches() {
 }
 
 /// A healthy headless boot must not confirm a build whose windows crash before their
-/// first frame. Control: the headless self-update lane (no window launch) counts and
-/// confirms.
+/// first frame.
 #[test]
 fn a_headless_launch_neither_counts_nor_settles_a_trial_a_window_launched() {
     use crate::TrialWitness::{Headless, Window};
@@ -994,12 +931,10 @@ fn a_headless_launch_neither_counts_nor_settles_a_trial_a_window_launched() {
     let installed = s.root.join("Applications").join("aterm.app");
     let rollback = arm_window_trial(&s, &installed, 11, &"ab".repeat(32));
     let sentinel = boot_sentinel(&s);
-    // The window's candidate: counted, then it crashes before Commit.
     count_trial_launch(&s, &sentinel, 11, None, true, Window).unwrap();
     backdate(&s);
     assert_eq!(sentinel.read_state(), Some((11, 1)));
 
-    // The harness's headless instance, alive and well.
     let mut harness = spawn();
     count_trial_launch(&s, &sentinel, 11, Some(launcher(&harness)), false, Headless).unwrap();
     backdate(&s);
@@ -1010,8 +945,6 @@ fn a_headless_launch_neither_counts_nor_settles_a_trial_a_window_launched() {
             .any(|recorded| recorded.launcher == launcher(&harness)),
         "not a launcher whose overlap could shield the window's next candidate"
     );
-    // The older build's window keeps its own standing reason in the ledger's one refusal
-    // slot, keyed to the build it runs.
     let standing = "a quiet moment is awaited; retried at 12:00";
     Health::record_apply_refusal(&s.health(), 10, standing);
     let status_before = std::fs::read_to_string(&s.status).ok();
@@ -1032,11 +965,7 @@ fn a_headless_launch_neither_counts_nor_settles_a_trial_a_window_launched() {
         "the trial stays armed"
     );
     assert!(rollback.exists(), "and the predecessor stays on disk");
-    // …and the wait is said where `update status` reads it, with its deadline (law L5),
-    // read from the trial's own records…
     window_trial_wait_at(&s, 11, unix_now_secs()).expect("the trial waits");
-    // …never written over what the older build's window keeps there: a refusal keyed to
-    // build 11 would replace it, and that window would ignore it.
     let ledger = Health::read(&s.health());
     assert_eq!(
         ledger.last_apply_refusal, standing,
@@ -1054,13 +983,10 @@ fn a_headless_launch_neither_counts_nor_settles_a_trial_a_window_launched() {
         "another build's report says nothing about it"
     );
 
-    // The window's next candidate is counted, beside the live headless instance.
     let mut candidate = spawn();
     count_trial_launch(&s, &sentinel, 11, Some(launcher(&candidate)), true, Window).unwrap();
     backdate(&s);
     assert_eq!(sentinel.read_state(), Some((11, 2)), "toward the revert");
-    // Control: a window's confirmation goes on to the proof (which these unsealed
-    // fixtures fail, so it answers "retry"); only the headless one stopped short.
     assert!(!confirm_boot_health_at(
         &s,
         11,
@@ -1072,9 +998,6 @@ fn a_headless_launch_neither_counts_nor_settles_a_trial_a_window_launched() {
     stop(&mut harness);
     stop(&mut candidate);
 
-    // Control: the headless self-update lane. With no window launch, the headless launch
-    // counts and its confirmation goes on to the proof (which these fixtures fail: "retry").
-    // A proven one is `a_headless_launch_that_comes_first_leaves_the_predecessor_for_the_windows`.
     let lane = scratch("boot-headless-lane");
     let installed = lane.root.join("Applications").join("aterm.app");
     arm_window_trial(&lane, &installed, 12, &"cd".repeat(32));
@@ -1089,7 +1012,6 @@ fn a_headless_launch_neither_counts_nor_settles_a_trial_a_window_launched() {
         bundle_at(&installed),
         Duration::from_millis(100),
     ));
-    // No window is awaited: what the report says is the proof that refused it.
     let report = window_trial_wait_at(&lane, 12, unix_now_secs()).expect("the refusal is said");
     let refusal = crate::health::Health::read(&lane.health()).trial_proof_failure;
     assert!(!refusal.is_empty() && report.contains(&refusal), "{report}");
@@ -1100,8 +1022,7 @@ fn a_headless_launch_neither_counts_nor_settles_a_trial_a_window_launched() {
 /// A window's confirmation that the trial's recovery proof refuses answers only
 /// "retry", and the GUI retries it on its backoff for as long as it runs: the
 /// reason is said once per distinct reason, not once per try, and `update status`
-/// reports it instead of asking for a window that is already open. The passing
-/// proof that confirms the trial ends the report.
+/// reports it instead of asking for a window that is already open.
 #[test]
 fn a_window_confirmation_the_proof_refuses_is_said_once_and_asks_for_no_window() {
     use crate::TrialWitness::Window;
@@ -1162,9 +1083,6 @@ fn receipt_for(s: &Staging, build: u64, digest: &str) {
 }
 
 /// The other order: a harness's instance confirms the trial before any window launches it.
-/// That settles the headless path alone: the sentinel disarms and the predecessor stays,
-/// recorded as unproven for windows. The next window launch puts the build back on trial,
-/// where its crashes count and only a window's confirmation settles it.
 #[test]
 fn a_headless_launch_that_comes_first_leaves_the_predecessor_for_the_windows() {
     use crate::TrialWitness::{Headless, Window};
@@ -1177,8 +1095,6 @@ fn a_headless_launch_that_comes_first_leaves_the_predecessor_for_the_windows() {
     let sentinel = boot_sentinel(&s);
     let proven = |_: &Path| Ok(());
 
-    // The harness's instance: counted (no window has launched the trial), and
-    // proven at its socket bind.
     count_trial_launch(&s, &sentinel, 11, None, false, Headless).unwrap();
     assert_eq!(sentinel.read_state(), Some((11, 1)));
     assert!(confirm_boot_health_at_with_proof(
@@ -1209,7 +1125,6 @@ fn a_headless_launch_that_comes_first_leaves_the_predecessor_for_the_windows() {
         (11, digest.as_str(), installed.as_path())
     );
 
-    // Another headless launch changes nothing: nothing is armed, nothing is counted.
     assert!(
         check_boot_health_with_lock_wait(
             &s,
@@ -1225,8 +1140,6 @@ fn a_headless_launch_that_comes_first_leaves_the_predecessor_for_the_windows() {
     );
     assert_eq!(sentinel.read_state(), None);
 
-    // The window switches: its candidate (a handoff target) is the build's first
-    // window launch, and puts it back on trial — counted.
     let outcome = check_boot_health_with_lock_wait(
         &s,
         11,
@@ -1260,9 +1173,6 @@ fn a_headless_launch_that_comes_first_leaves_the_predecessor_for_the_windows() {
         WindowLaunch::Waiting { .. }
     ));
 
-    // It crashed before its first frame (this test process stood in for it, and is
-    // no launcher once it is gone); so do the window's next two candidates, each
-    // counted toward the revert.
     std::fs::write(trial_launchers_path(&s), "11\n").unwrap();
     for _ in 1..MAX_BOOT_ATTEMPTS {
         backdate(&s);
@@ -1273,7 +1183,6 @@ fn a_headless_launch_that_comes_first_leaves_the_predecessor_for_the_windows() {
         "a crash loop reverts"
     );
 
-    // Meanwhile a headless confirmation settles nothing…
     assert!(confirm_boot_health_at_with_proof(
         &s,
         11,
@@ -1285,8 +1194,6 @@ fn a_headless_launch_that_comes_first_leaves_the_predecessor_for_the_windows() {
     assert_eq!(sentinel.read_state(), Some((11, MAX_BOOT_ATTEMPTS)));
     assert!(rollback.exists());
 
-    // CONTROL: …and a window's confirmation settles it and keeps the predecessor only for
-    // that window.
     assert!(confirm_boot_health_at_with_proof(
         &s,
         11,
@@ -1313,7 +1220,6 @@ fn a_window_re_trial_is_bounded() {
     use crate::TrialWitness::Window;
     use std::time::Duration;
     let digest = "ab".repeat(32);
-    // A trial of 11 settled by a headless launch, predecessor kept.
     let settled = |label: &str| {
         let s = scratch(label);
         let installed = s.root.join("Applications").join("aterm.app");
@@ -1333,7 +1239,6 @@ fn a_window_re_trial_is_bounded() {
     let now = unix_now_secs();
     let wait = WINDOW_TRIAL_HEADLESS_WAIT.as_secs();
 
-    // Another install, another build, a ready publication: nothing armed, record kept.
     let (s, installed) = settled("boot-retrial-scope");
     let sentinel = boot_sentinel(&s);
     let elsewhere = s.root.join("Other").join("aterm.app");
@@ -1353,7 +1258,6 @@ fn a_window_re_trial_is_bounded() {
         WindowUnproven::read(&s).is_some(),
         "still the windows' record"
     );
-    // A window launch that cannot take the apply lock re-arms nothing, and goes on.
     let held = FileLock::acquire(&s.apply_lock).unwrap();
     assert!(
         check_boot_health_with_lock_wait(
@@ -1371,7 +1275,6 @@ fn a_window_re_trial_is_bounded() {
     );
     drop(held);
     assert_eq!(sentinel.read_state(), None);
-    // Inside the wait (the edge) it re-arms; the next swap's trial clears a record.
     assert!(rearm_window_unproven_trial(
         &s,
         &sentinel,
@@ -1382,7 +1285,6 @@ fn a_window_re_trial_is_bounded() {
     assert_eq!(sentinel.read_state(), Some((11, 0)));
     let _ = std::fs::remove_dir_all(&s.root);
 
-    // Lapsed (and a record the clock cannot place): dropped, nothing armed.
     for (label, at) in [
         ("boot-retrial-lapsed", now - wait),
         ("boot-retrial-ahead", now + wait),
@@ -1400,7 +1302,6 @@ fn a_window_re_trial_is_bounded() {
         let _ = std::fs::remove_dir_all(&s.root);
     }
 
-    // The predecessor gone, or the receipt naming another artifact: dropped.
     let (s, installed) = settled("boot-retrial-no-predecessor");
     let sentinel = boot_sentinel(&s);
     std::fs::remove_dir_all(rollback_path(&installed)).unwrap();
@@ -1419,8 +1320,6 @@ fn a_window_re_trial_is_bounded() {
     assert_eq!(sentinel.read_state(), None);
     let _ = std::fs::remove_dir_all(&s.root);
 
-    // The re-arm takes `install_flush`'s tier (aterm-durable's counting seam): ordered
-    // on this volume, durable as if the install root were on another device.
     let [here, elsewhere] = on_and_off_the_install_device(|| {
         let (s, installed) = settled("boot-retrial-tier");
         let sentinel = boot_sentinel(&s);
@@ -1444,7 +1343,6 @@ fn a_window_re_trial_is_bounded() {
         "another device: the trial identity keeps its own same-device guard"
     );
 
-    // A trial armed by the next swap owns the fixed path: the record goes with it.
     let (s, installed) = settled("boot-retrial-next-swap");
     let ready = Ready {
         build_number: 12,
@@ -1466,9 +1364,7 @@ fn a_window_re_trial_is_bounded() {
 
 /// A live HEADLESS launch of the trial does not exempt a WINDOW's overlapping
 /// handoff target from the count: a long-lived harness must not shield window
-/// candidates that crash before their first frame. A window launch exempts a
-/// window's target, and a headless target is exempted beside any live launch. A launcher line an older
-/// build wrote (no fourth field) reads as a window's.
+/// candidates that crash before their first frame.
 #[test]
 fn a_live_headless_launch_does_not_shield_a_windows_candidate() {
     use crate::TrialWitness::{Headless, Window};
@@ -1518,7 +1414,6 @@ fn a_live_headless_launch_does_not_shield_a_windows_candidate() {
         let _ = std::fs::remove_dir_all(&s.root);
     }
 
-    // An older build's line has no fourth field: a window's launch.
     let s = scratch("boot-shield-old-line");
     std::fs::write(
         trial_launchers_path(&s),
@@ -1583,8 +1478,6 @@ fn a_window_launch_record_answers_only_for_the_armed_trial() {
         WindowLaunch::Waiting { .. }
     ));
 
-    // Re-published under a new digest and armed by an image that leaves the
-    // record where it was (a raw re-arm: marker, then sentinel, nothing else).
     sentinel.confirm().unwrap();
     FailedMark::record_required(&s.trial(), 11, &"ef".repeat(32), Some(&installed)).unwrap();
     sentinel.arm(11).unwrap();
@@ -1604,7 +1497,6 @@ fn a_window_launch_record_answers_only_for_the_armed_trial() {
         "a headless launch of it counts, as before"
     );
 
-    // A trial that ends answers for nothing, even with the file left behind…
     count_trial_launch(&s, &sentinel, 11, None, true, Window).unwrap();
     assert!(matches!(
         trial_window_launch(&s, 11, unix_now_secs()),
@@ -1616,7 +1508,6 @@ fn a_window_launch_record_answers_only_for_the_armed_trial() {
         WindowLaunch::None,
         "a disarmed trial's record is no record"
     );
-    // …and every end this crate owns removes it with the trial's identity.
     clear_trial_identity(&s);
     assert!(!trial_window_launch_path(&s).exists());
     assert!(FailedMark::read(&s.trial()).is_none());
@@ -1656,13 +1547,10 @@ fn the_wait_for_a_window_ends() {
         "a record the clock cannot place holds nothing"
     );
 
-    // Lapsed: backdate the record past the wait, and a headless launch counts…
     let stale = format!("11 {} {}\n", "ab".repeat(32), unix_now_secs() - wait - 1);
     std::fs::write(trial_window_launch_path(&s), stale).unwrap();
     count_trial_launch(&s, &sentinel, 11, None, false, Headless).unwrap();
     assert_eq!(sentinel.read_state(), Some((11, 2)), "counted again");
-    // …and its confirmation goes on to the proof (these unsealed fixtures fail it,
-    // so it answers "retry"), where one inside the wait stopped short.
     assert!(!confirm_boot_health_at(
         &s,
         11,
@@ -1671,7 +1559,6 @@ fn the_wait_for_a_window_ends() {
         bundle_at(&installed),
         Duration::from_millis(100),
     ));
-    // A window launch renews the wait.
     backdate(&s);
     count_trial_launch(&s, &sentinel, 11, None, true, Window).unwrap();
     assert!(matches!(
@@ -1714,14 +1601,7 @@ fn another_trial_holding_the_install_refuses_the_swap_as_a_passing_moment() {
 
 /// A predecessor no revert could restore is no revert, not unproven health: a
 /// Team-ID-pinned build swapped in over an ad hoc one, whose
-/// retained bundle this build's verifier refuses for ever. Every other term of the
-/// recovery proof holds (the installed trial is sealed, verified and exactly
-/// receipted), so a window's confirmation settles the trial and clears the fixed
-/// path, and a counted launch of a trial nobody confirmed settles it too, keeping
-/// the stage for that launch to apply instead of deferring on the proof.
-///
-/// Control: a fixed path that verifies but is not a strict predecessor — what a
-/// crash-cut NEW looks like — still holds the trial, and stays on disk.
+/// retained bundle this build's verifier refuses for ever.
 #[test]
 fn a_predecessor_this_build_cannot_verify_does_not_hold_its_trial() {
     use crate::TrialWitness::Window;
@@ -1740,7 +1620,6 @@ fn a_predecessor_this_build_cannot_verify_does_not_hold_its_trial() {
             }
         }
     }
-    // Verdict on an ad hoc predecessor that a Team-ID-pinned build replaced.
     let ad_hoc = || -> Identity {
         Err(
             "bundle policy: codesign --verify (team-pinned requirement) failed: \
@@ -1753,7 +1632,6 @@ fn a_predecessor_this_build_cannot_verify_does_not_hold_its_trial() {
     let digest = "ab".repeat(32);
     let wait = Duration::from_millis(100);
 
-    // A window's confirmation at its health checkpoint.
     let s = scratch("boot-no-revert-confirm");
     let installed = s.root.join("Applications").join("aterm.app");
     let rollback = arm_window_trial(&s, &installed, 11, &digest);
@@ -1782,7 +1660,6 @@ fn a_predecessor_this_build_cannot_verify_does_not_hold_its_trial() {
     );
     let _ = std::fs::remove_dir_all(&s.root);
 
-    // A counted launch of a trial no window has confirmed, with a newer stage waiting.
     let s = scratch("boot-no-revert-launch");
     let installed = s.root.join("Applications").join("aterm.app");
     let rollback = arm_window_trial(&s, &installed, 11, &digest);
@@ -1849,9 +1726,6 @@ fn corrupt_sentinel(s: &Staging) {
 }
 
 /// A trial whose sentinel cannot be read is never answered "confirmed" unsettled.
-/// The sentinel reads a corrupt file as no trial at all, so a confirmation that only
-/// checked the sentinel would answer `true` while the trial's identity, the retained
-/// predecessor and the corrupt sentinel itself all stayed on disk.
 #[test]
 fn a_window_confirmation_over_an_unreadable_sentinel_settles_the_trial() {
     use crate::TrialWitness::Window;

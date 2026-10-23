@@ -1,25 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// The single source of truth for the offscreen colour-target formats.
-//
-// wgpu checks at draw time that a pass's attachment view format equals its
-// pipeline's target format, and aborts the pass otherwise. Every such choice is
-// a pure function here, so a pipeline and its attachment cannot be edited
-// apart. `the_srgb_view_is_a_declared_alias_of_srgb_storage` checks that each
-// view format is one the texture declares, and the `gpu_pipeline_format` ay
-// proof checks the equality, for both `srgb_offscreen` states.
 
 #[cfg(wgpu_arm)]
 use wgpu::TextureFormat;
 
 /// The stored offscreen format, equal to the default view (`off.view`) format.
-/// Native keeps `Rgba8Unorm` and aliases an sRGB view for the linear-light base
-/// passes; downlevel (GLES/WebGL2) cannot alias, so the texture itself is
-/// `Rgba8UnormSrgb`. Stored bytes are sRGB either way.
-///
-/// Every pipeline whose pass attaches `off.view` (additive glow and deco-add,
-/// bloom composite and extract, tray, test/readback blit) builds with this.
 #[must_use]
 #[inline]
 #[cfg(wgpu_arm)]
@@ -31,9 +16,7 @@ pub(crate) const fn offscreen_format(srgb_offscreen: bool) -> TextureFormat {
     }
 }
 
-/// The sRGB view format attached by the base, cursor and deco-over passes so
-/// blending composites in linear light. Always `Rgba8UnormSrgb` (the alias on
-/// native, the texture's own format on downlevel).
+/// The sRGB view format attached by the base, cursor and deco-over passes so blending composites in linear light.
 #[must_use]
 #[inline]
 #[cfg(wgpu_arm)]
@@ -41,9 +24,7 @@ pub(crate) fn offscreen_srgb_view_format(srgb_offscreen: bool) -> TextureFormat 
     offscreen_format(srgb_offscreen).add_srgb_suffix()
 }
 
-/// The `view_formats` alias list the offscreen texture must declare so the sRGB
-/// view can be created (wgpu panics otherwise). Native only; downlevel needs
-/// none.
+/// The `view_formats` alias list the offscreen texture must declare so the sRGB view can be created (wgpu panics otherwise).
 #[must_use]
 #[inline]
 #[cfg(wgpu_arm)]
@@ -55,34 +36,12 @@ pub(crate) const fn offscreen_view_formats(srgb_offscreen: bool) -> &'static [Te
     }
 }
 
-/// The HDR present gate as pure decision functions, exhaustively checked by
-/// `tests/hdr_gate.rs`'s full enumeration.
-///
-/// Attach ([`hdr_swapchain_wants_f16`], `GpuRenderer::create_window_surface`):
-/// `Rgba16Float` iff `hdr_glow` is on and the surface offers it; otherwise the
-/// 8-bit non-sRGB pick. The macOS Metal arm narrows this by screen
-/// ([`hdr_swapchain_wants_f16_on_screen`]) and upgrades an 8-bit window live
-/// via [`hdr_screen_upgrade_wants_f16`] (`GpuRenderer::upgrade_surface_for_screen`).
-/// The swapchain sets `wantsExtendedDynamicRangeContent` from
-/// `format == Rgba16Float`.
-///
-/// Present ([`hdr_present_plan`], `present_input`): keyed on the swapchain's
-/// actual format, so an 8-bit surface never linear-encodes or boosts, and an
-/// f16 surface keeps decoding correctly with the boost gated on `hdr_glow`.
-///
-/// # Invariants
-/// * `hdr_glow == false` means f16 is never chosen, hence no linear encode and
-///   no boost pass.
-/// * `blit_linear_encode == swapchain_is_f16`: the encode follows the surface,
-///   not the config.
-/// * `glow_boost_pass ⇒ swapchain_is_f16 ∧ glow_nonempty ∧ hdr_glow`.
+/// The HDR present gate as pure decision functions, exhaustively checked by `tests/hdr_gate.rs`'s full enumeration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HdrPlan {
-    /// The blit decodes the offscreen's sRGB bytes to linear (clamped to 1.0) for
-    /// the extended-linear-sRGB f16 swapchain.
+    /// The blit decodes the offscreen's sRGB bytes to linear (clamped to 1.0) for the extended-linear-sRGB f16 swapchain.
     pub blit_linear_encode: bool,
-    /// Run the HDR aurora pass after the blit: re-emit the glow quads additively
-    /// above 1.0, clamped to the panel headroom (`aterm_render::hdr`).
+    /// Run the HDR aurora pass after the blit.
     pub glow_boost_pass: bool,
 }
 
@@ -93,17 +52,7 @@ pub const fn hdr_swapchain_wants_f16(hdr_glow: bool, supports_f16: bool) -> bool
     hdr_glow && supports_f16
 }
 
-/// The attach gate narrowed by screen (macOS Metal arm): [`hdr_swapchain_wants_f16`]
-/// and the window's screen reports EDR potential
-/// (`NSScreen.maximumPotentialExtendedDynamicRangeColorComponentValue`) above 1.0.
-/// On a potential-1.0 screen an f16 swapchain draws no crown (zero headroom, and
-/// [`sdr_boost_pass`] is off on f16) yet costs more GPU time and memory.
-///
-/// The potential, unlike the current value the present reads as `edr_max`, is
-/// brightness-independent and fixed per `NSScreen`; a display-settings change can
-/// create a new `NSScreen`, so the frontend re-checks 8-bit windows via
-/// [`hdr_screen_upgrade_wants_f16`]. `None` (unresolved screen) keeps the
-/// unconditional pick; a non-finite potential counts as SDR.
+/// The attach gate narrowed by screen (macOS Metal arm).
 #[must_use]
 #[inline]
 pub fn hdr_swapchain_wants_f16_on_screen(
@@ -115,13 +64,7 @@ pub fn hdr_swapchain_wants_f16_on_screen(
         && screen_edr_potential.is_none_or(|p| aterm_render::hdr::sanitize_edr_max(p) > 1.0)
 }
 
-/// Live SDR-to-f16 upgrade on the macOS Metal arm
-/// (`GpuRenderer::upgrade_surface_for_screen`): an 8-bit swapchain becomes
-/// `Rgba16Float` iff the attach gate would pick f16 and the window's current
-/// screen positively reports EDR potential. Unlike the attach gate, `None`
-/// upgrades nothing (a window in transit stays as it is). Implies
-/// [`hdr_swapchain_wants_f16_on_screen`]. `swapchain_is_f16` keeps the function
-/// total; callers short-circuit f16 surfaces before the AppKit read.
+/// Live SDR-to-f16 upgrade on the macOS Metal arm (`GpuRenderer::upgrade_surface_for_screen`).
 #[must_use]
 #[inline]
 pub fn hdr_screen_upgrade_wants_f16(
@@ -135,11 +78,7 @@ pub fn hdr_screen_upgrade_wants_f16(
         && screen_edr_potential.is_some_and(|p| aterm_render::hdr::sanitize_edr_max(p) > 1.0)
 }
 
-/// The monitor-change re-pick's decision, in the order the throttled re-query
-/// needs: the f16 surface and the proven gate first, and only past them the
-/// screen read `screen_edr_potential`, an AppKit read the re-query must not
-/// pay for every 8-bit window. Equal to [`hdr_screen_upgrade_wants_f16`] over
-/// the potential it reads.
+/// The monitor-change re-pick's decision, in the order the throttled re-query needs.
 #[must_use]
 #[inline]
 pub fn hdr_screen_upgrade_decision(
@@ -154,7 +93,7 @@ pub fn hdr_screen_upgrade_decision(
     hdr_screen_upgrade_wants_f16(hdr_glow, supports_f16, false, screen_edr_potential())
 }
 
-/// Present: what the HDR path does on this present. See [`HdrPlan`].
+/// Present: what the HDR path does on this present.
 #[must_use]
 #[inline]
 pub const fn hdr_present_plan(
@@ -169,35 +108,17 @@ pub const fn hdr_present_plan(
 }
 
 /// What to do after configuring an already-live swapchain.
-///
-/// DX12 recreates the swapchain on every `Surface::configure`, resetting its
-/// colour space, and Windows can disable HDR without any reconfigure. An f16
-/// surface is valid only when scRGB was re-tagged; otherwise it falls back
-/// atomically to the retained SDR format, since DWM would read linear pixels as
-/// gamma 2.2 while capture claimed extended-linear.
-///
-/// Bound to `aterm_models_render::hdr_reconfigure_retag_model` through the
-/// concrete apply path by
-/// `renderer::tests::hdr_reconfigure_apply_conforms_to_retag_model`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HdrReconfigurePlan {
-    /// The surface was already SDR; reconfiguring does not change its colour space.
+    /// The surface was already SDR.
     KeepSdr,
     /// The f16 swapchain was successfully re-tagged scRGB.
     KeepHdr,
-    /// Re-tagging the recreated f16 swapchain failed; configure the retained
-    /// non-sRGB 8-bit format before another present.
+    /// Re-tagging the recreated f16 swapchain failed.
     FallbackToSdr,
 }
 
-/// Projection onto the `HdrReconfigureRetag` variables `<<stage, retagged,
-/// is_f16, capture_linear>>`, built only by
-/// [`crate::WindowGpu::project_hdr_reconfigure_state`].
-///
-/// Only `capture_linear` is read back off applied state, so the check compares
-/// the model's successor with what `apply_hdr_reconfigure_plan` /
-/// `apply_hdr_surface_upgrade` actually produced. `is_f16` is the planner's
-/// resolved format; `stage`/`retagged` are drive coordinates. Test-only.
+/// Projection onto `HdrReconfigureRetag` state, built by [`crate::WindowGpu::project_hdr_reconfigure_state`].
 #[cfg(all(test, wgpu_arm))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HdrReconfigureProjection {
@@ -205,20 +126,13 @@ pub(crate) struct HdrReconfigureProjection {
     pub(crate) stage: u8,
     /// Whether the attempted scRGB re-tag succeeded.
     pub(crate) retagged: bool,
-    /// Whether the plan resolved to `Rgba16Float` (planner-derived; the
-    /// configure happens on the `GpuSurface`).
+    /// Whether the plan resolved to `Rgba16Float` (planner-derived; the configure happens on the `GpuSurface`).
     pub(crate) is_f16: bool,
-    /// Whether the window's applied capture metadata declares extended-linear
-    /// sRGB; an apply that skips its half violates
-    /// `CaptureMatchesSurfaceEncoding`.
+    /// Whether the window's applied capture metadata declares extended-linear sRGB.
     pub(crate) capture_linear: bool,
 }
 
-/// Resolve the post-reconfigure surface encoding from the current format and
-/// whether scRGB was re-established. Each `HdrReconfigureRetag` action is
-/// anchored here and on the apply that performs its metadata half
-/// (`WindowGpu::apply_hdr_reconfigure_plan`, or
-/// `WindowGpu::apply_hdr_surface_upgrade` for `UpgradeSucceeds`).
+/// Resolve the post-reconfigure surface encoding from the current format and whether scRGB was re-established.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -300,10 +214,7 @@ pub const fn hdr_reconfigure_plan(
     }
 }
 
-/// Live SDR-to-HDR: is an f16 upgrade admitted on this present?
-/// `supports_f16` is the attach-time capability (not tied to the opt-in, which
-/// can be hot-reloaded); `output_hdr_enabled` is the throttled Windows output
-/// probe. The scRGB tag still goes through [`hdr_reconfigure_plan`].
+/// Live SDR-to-HDR.
 #[must_use]
 #[inline]
 pub const fn hdr_live_upgrade_wants_f16(
@@ -314,10 +225,7 @@ pub const fn hdr_live_upgrade_wants_f16(
     hdr_glow && supports_f16 && output_hdr_enabled
 }
 
-/// Whether to run the SDR glow-boost pass: the swapchain is not f16 (exclusive
-/// with the HDR boost), glow instances exist, and the budget is positive.
-/// Separate from [`HdrPlan`] so the Tier-1 model stays stable. It draws into the
-/// swapchain only; the offscreen is untouched.
+/// Whether to run the SDR glow-boost pass.
 #[must_use]
 #[inline]
 pub const fn sdr_boost_pass(swapchain_is_f16: bool, glow_nonempty: bool, budget: f32) -> bool {
@@ -328,10 +236,6 @@ pub const fn sdr_boost_pass(swapchain_is_f16: bool, glow_nonempty: bool, budget:
 mod tests {
     use super::*;
 
-    // For both `srgb_offscreen` states the sRGB view format is the texture format
-    // or a declared alias (wgpu's create_view panics otherwise), and the stored
-    // bytes are sRGB-encoded, the contract readback and the destination share
-    // (the `gpu_pipeline_format` ay property).
     #[test]
     #[cfg(wgpu_arm)]
     fn the_srgb_view_is_a_declared_alias_of_srgb_storage() {
@@ -354,17 +258,12 @@ mod tests {
     /// non-positive or invalid budget.
     #[test]
     fn sdr_boost_gate_is_exclusive_and_fail_off() {
-        // Fires only on the exact ship condition.
         assert!(sdr_boost_pass(false, true, 0.1));
-        // f16 swapchain -> the EDR pass owns it.
         assert!(!sdr_boost_pass(true, true, 0.1));
-        // No instances -> nothing to draw.
         assert!(!sdr_boost_pass(false, false, 0.1));
-        // Zero / negative / NaN budget -> off (NaN > 0.0 is false).
         assert!(!sdr_boost_pass(false, true, 0.0));
         assert!(!sdr_boost_pass(false, true, -1.0));
         assert!(!sdr_boost_pass(false, true, f32::NAN));
-        // Exclusivity with the proven plan, all 8 boolean corners x positive budget:
         for hdr_glow in [false, true] {
             for f16 in [false, true] {
                 for nonempty in [false, true] {
@@ -385,9 +284,9 @@ mod tests {
     fn screen_gate_narrows_only_on_a_known_sdr_screen() {
         let potentials = [
             None,
-            Some(1.0),  // an external SDR monitor
-            Some(2.0),  // a MacBook Pro built-in panel (measured)
-            Some(16.0), // Pro Display XDR
+            Some(1.0),
+            Some(2.0),
+            Some(16.0),
             Some(1.0 + f32::EPSILON),
             Some(0.0),
             Some(-1.0),
@@ -414,9 +313,7 @@ mod tests {
                 }
             }
         }
-        // Non-vacuity: the five SDR answers each narrow the one (on, supported) corner.
         assert_eq!(narrowed, 5, "the screen gate must bite on every SDR answer");
-        // The pinned corners, spelled out.
         assert!(hdr_swapchain_wants_f16_on_screen(true, true, None));
         assert!(hdr_swapchain_wants_f16_on_screen(true, true, Some(2.0)));
         assert!(!hdr_swapchain_wants_f16_on_screen(true, true, Some(1.0)));
@@ -476,10 +373,7 @@ mod tests {
                 }
             }
         }
-        // Non-vacuity: the three EDR answers each upgrade the one (on, supported,
-        // 8-bit) corner.
         assert_eq!(upgraded, 3, "the upgrade must bite on every EDR answer");
-        // The pinned corners, spelled out.
         assert!(hdr_screen_upgrade_wants_f16(true, true, false, Some(2.0)));
         assert!(
             !hdr_screen_upgrade_wants_f16(true, true, false, None),

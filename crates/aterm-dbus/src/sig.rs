@@ -251,7 +251,7 @@ struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    fn new(sig: &'a [u8], fd_ok: bool) -> std::result::Result<Self, SigFault> {
+    const fn new(sig: &'a [u8], fd_ok: bool) -> std::result::Result<Self, SigFault> {
         if sig.len() > MAX_SIGNATURE {
             return Err(SigFault::Bad("signature longer than 255 bytes"));
         }
@@ -270,7 +270,7 @@ impl<'a> Parser<'a> {
     }
 
     #[inline]
-    fn open_struct(&mut self) -> std::result::Result<(), SigFault> {
+    const fn open_struct(&mut self) -> std::result::Result<(), SigFault> {
         if self.structs >= MAX_STRUCT_DEPTH {
             return Err(SigFault::Bad("structs nested deeper than 32"));
         }
@@ -279,7 +279,7 @@ impl<'a> Parser<'a> {
     }
 
     #[inline]
-    fn close_struct(&mut self) {
+    const fn close_struct(&mut self) {
         self.structs = self.structs.saturating_sub(1);
     }
 

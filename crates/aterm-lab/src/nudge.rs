@@ -1,52 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `nudge-trial`: force displacements on the REAL Claude Code and judge what
-//! aterm's repaint nudge does (`[render] repaint_nudge`;
-//! `docs/DESIGN-render-integrity-2026-09-28.md` sections 4 and 8).
-//!
-//! ```text
-//! aterm-lab nudge-trial [tag] [--mode on|log|off] [--trials N] [--expect on|log|off] [--via mode|key] [--no-hold]
-//! ```
-//!
-//! Claude Code runs in the lab's first tab behind the PTY relay ([`crate::relay`]).
-//! A trial forces the incident: the relay HOLDS the size changes it passes on,
-//! `ctl resize` shrinks the tab one row, output reaches the tab (a DEC 1004
-//! mode set written to the tab's tty, which changes no cell and ends the
-//! engine's undo; with `--via key` a typed `x`, so a real Claude frame lands in
-//! the shrunk grid), `ctl resize` grows it back, the relay RELEASES. Claude
-//! Code never heard of the pair, so aterm's grid and Claude's screen disagree
-//! by a row. The trial then reads what aterm did (`resizes`: the epoch row,
-//! `nudge=`, `nudged=`; `status render=`; `aterm.log`) and the screen against
-//! a fresh repaint (`ctl text` before the flap, right after it, at the end, and
-//! after a real resize pair Claude Code hears), and judges it:
-//!
-//! | expect | a trial PASSES when |
-//! | --- | --- |
-//! | `on` | the epoch is `healed by=nudge`; `resizes` and `status` read `render=ok`; one nudge (`nudged` +1, one `hold rows=` and one `healed by=nudge` line); Claude Code was told a row shorter, then the true size; the rows equal the fresh repaint |
-//! | `log` | the epoch stands at `desync-risk` (`by=-`); both read `render=desync-risk`; no nudge; no size told; the screen still differs from the repaint; exactly one `would-nudge` line |
-//! | `off` | as `log`, with no nudge line at all |
-//!
-//! A trial that never displaced anything (no epoch of class agent that owes
-//! rows, one the program closed itself, a screen right after the flap equal
-//! to the baseline, no reference to judge by) is INCONCLUSIVE, never a pass.
-//! Exit 0: every trial met the expectation; 1: one did not (also when the run
-//! then could not go on); 3: no trial failed but one was INCONCLUSIVE, or the
-//! verb could not run; 2: usage. `--no-hold` is the control: the relay hides
-//! nothing, every trial must be INCONCLUSIVE.
-//!
-//! The nudge may try three times per session-hour, a minute apart, once per
-//! epoch: at most 3 trials per lab, 62 s apart where the lab's nudge acts (4 s
-//! for `off` and `log`, which count nothing); a lab whose budget the trials
-//! would overrun is refused. With no tag the verb brings up a lab of its own
-//! (`LAB_TRUST=1`, `[harness] continue = false`, so only the trial moves the
-//! screen) and takes it down however the verb ends (a SIGKILL through the
-//! lab's lifeline); a tag that is up
-//! is used as it is. Results: `$LAB_STATE/results/nudge-trial-NN/`.
-//! NOT OBSERVED by it: a windowed aterm, a real window drag, a person's own
-//! keys, the update handoff's adoption arm, tmux/screen/ssh, a displacement
-//! nobody forced. A driver killed with SIGKILL leaves, on a lab that was up,
-//! the relay held: `kill -USR2` on the relay releases it.
+//! `nudge-trial`: repaint-nudge trials on Claude Code ([`crate::relay`]).
 
 use std::fs;
 use std::io::Write as _;
@@ -62,15 +17,13 @@ use crate::stop;
 use crate::util::{now, scratch_text};
 use crate::{Fail, Res};
 
-/// Any output between the halves of a flap ends the engine's undo (which would
-/// hand the rows back); DEC 1004 (focus reporting) changes no cell, and Claude
-/// Code sets it itself.
+/// Any output between the halves of a flap ends the engine's undo (which would hand the rows back).
 const MODE_SET: &[u8] = b"\x1b[?1004h";
 /// Rows that may differ between two readings of one screen (a spinner frame, a transient hint).
 const SLACK: usize = 1;
 /// Seconds between two flaps of a lab whose nudge acts: 3 tries per session-hour, a 60 s cooldown.
 const SPACING: f64 = 62.0;
-/// Seconds a trial watches after the flap before it reads the end state (the nudge starts after ~2.5 s).
+/// Seconds a trial waits after the flap before reading the end state.
 const OBSERVE: f64 = 8.0;
 /// The most a trial waits for a nudge that is still running.
 const OBSERVE_CAP: f64 = 30.0;
@@ -274,7 +227,7 @@ impl Lab<'_> {
     }
 }
 
-/// The `[render] repaint_nudge` word of an `aterm.toml` (`None`: no key, the compiled default `on`).
+/// Parse the `[render] repaint_nudge` value from an `aterm.toml`.
 #[must_use]
 pub fn configured_nudge(toml: &str) -> Option<String> {
     toml.lines().find_map(|l| {
@@ -289,8 +242,7 @@ pub fn configured_nudge(toml: &str) -> Option<String> {
     })
 }
 
-/// The lab's PTY relay, found in the instance's process tree by its path; looked up
-/// again before every signal and write, and nothing else is ever signalled or written to.
+/// The lab's PTY relay, found in the instance's process tree by its path.
 struct Relay {
     instance: i32,
     exe: String,
@@ -306,10 +258,7 @@ impl Relay {
         }
     }
 
-    /// The one process under the instance whose command line is the relay's
-    /// (its path, alone or followed by its arguments): the lab's process walk
-    /// (`procs::descendants`) and each one's `ps -o command=`, never a parse
-    /// of `ps`'s padded columns.
+    /// Find the relay process under the instance by command line (`procs::descendants`).
     fn pid(&self) -> R<i32> {
         let found: Vec<i32> = crate::procs::descendants(self.instance)
             .into_iter()
@@ -349,7 +298,7 @@ impl Relay {
         self.lines().len()
     }
 
-    /// SIGUSR1, then until the relay's own log says it holds: no size change may reach it before that.
+    /// SIGUSR1, then until the relay's own log says it holds.
     fn hold(&self) -> R<()> {
         let n = self.mark();
         self.signal(libc::SIGUSR1)?;
@@ -515,9 +464,7 @@ impl Trial {
 #[derive(Debug)]
 struct NoFrame(String);
 
-/// HOLD; shrink one row; output reaches the tab; grow back; RELEASE. The grow
-/// and the release happen whatever fails between: a tab is never left a row
-/// short, a relay never left holding.
+/// HOLD; shrink one row; output reaches the tab; grow back; RELEASE.
 fn flap(
     lab: &Lab<'_>,
     relay: &Relay,
@@ -532,7 +479,6 @@ fn flap(
         }
         lab.resize(rows - 1, cols);
         if via == "key" {
-            // a real Claude frame: the key is drawn, at the rows Claude believes in, into the shrunk grid
             let shrunk = lab.screen();
             let _ = lab.door.ctl(&["send", "x"]);
             let end = now() + 5.0;
@@ -544,7 +490,6 @@ fn flap(
             }
         } else {
             relay.write_tty(MODE_SET)?;
-            // the bytes are in the engine before the grow is
             stop::sleep(std::time::Duration::from_millis(100))?;
         }
         Ok(None)
@@ -557,7 +502,6 @@ fn flap(
 }
 
 /// Force one displacement and read everything; the judgement is [`judge`]'s.
-/// How a trial flaps: the tab's true size, whether the relay holds, and what lands between the halves.
 struct How<'a> {
     rows: i64,
     cols: i64,
@@ -596,7 +540,6 @@ fn trial(ctx: &mut Ctx, lab: &Lab<'_>, relay: &Relay, k: u32, how: &How<'_>) -> 
     }
     m.t_flap = now();
     ctx.mark(&format!("trial {k}: flap done"), None);
-    // right after: the nudge cannot have started (it waits for the epoch's judgement)
     m.shot = lab.screen();
     loop {
         let (h, _) = lab.resizes();
@@ -616,14 +559,12 @@ fn trial(ctx: &mut Ctx, lab: &Lab<'_>, relay: &Relay, k: u32, how: &How<'_>) -> 
         }
         stop::sleep(std::time::Duration::from_millis(300))?;
     }
-    // every frame of the trial, as the stream gave it: the displaced one cannot be missed
     let frames = ctx
         .rec
         .as_ref()
         .map(|r| r.frames_from(frames0))
         .unwrap_or_default();
     if via == "key" {
-        // the x the flap typed: gone before the end state is read, so no screen holds it
         let _ = lab.door.ctl(&["key", "backspace"]);
         stop::sleep(std::time::Duration::from_millis(700))?;
     }
@@ -657,7 +598,6 @@ fn trial(ctx: &mut Ctx, lab: &Lab<'_>, relay: &Relay, k: u32, how: &How<'_>) -> 
         })
         .collect();
     m.told = relay.told(relay0);
-    // the reference: a fresh repaint, which a real resize pair (that Claude Code hears) makes
     ctx.mark(&format!("trial {k}: real resize pair"), None);
     for r in [rows - 1, rows] {
         lab.resize(r, cols);
@@ -667,7 +607,7 @@ fn trial(ctx: &mut Ctx, lab: &Lab<'_>, relay: &Relay, k: u32, how: &How<'_>) -> 
     Ok(m)
 }
 
-/// PASS, FAIL or INCONCLUSIVE for one trial against the mode expected, and the checks that did not hold.
+/// PASS, FAIL or INCONCLUSIVE for one trial against the mode expected.
 fn judge(expect: &str, m: &mut Trial) -> (String, Vec<String>) {
     let rows_h = usize::try_from(m.rows).unwrap_or(0);
     m.shot_rows = std::iter::once(differing(&m.shot, &m.before).len())
@@ -700,7 +640,6 @@ fn judge(expect: &str, m: &mut Trial) -> (String, Vec<String>) {
             e.word("class")
         ));
     }
-    // An aterm before the column debt prints no `cut=`: it owed rows or nothing.
     if e.shift == 0 && e.pushed == 0 && e.get("cut").unwrap_or("0") == "0" {
         return inconclusive("the epoch owes nothing (shift=0 pushed=0 cut=0)".into());
     }
@@ -1032,7 +971,6 @@ fn drive(tag: &str, o: &Opts) -> Result<i32, stop::Stopped> {
                 ScnErr::Failed(m) => could_not(m),
             })?;
         }
-        // else the tab must already run Claude Code behind the relay
         let relay = Relay::new(&run);
         relay.pid()?;
         ctx.put("expect", expect.as_str());
@@ -1040,7 +978,6 @@ fn drive(tag: &str, o: &Opts) -> Result<i32, stop::Stopped> {
         ctx.put("via", o.via.as_str());
         ctx.put("hold", !o.no_hold);
         ctx.put("claude", run.claude_ver.as_str());
-        // aterm's classifier reads the screen the relay's name leaves to it
         let end = now() + 10.0;
         while now() < end
             && field(&lab.door.out(&["status"]), "agent").unwrap_or_else(|| "-".into()) == "-"
@@ -1062,7 +999,6 @@ fn drive(tag: &str, o: &Opts) -> Result<i32, stop::Stopped> {
             );
             return Ok(3);
         }
-        // the mode the lab runs decides how long its nudge needs between flaps and how many it has
         let acts = !matches!(word.as_deref(), Some("off" | "log"));
         let gap = if acts { SPACING } else { 4.0 };
         let nudged0: i64 = hget(&lab.resizes().0, "nudged")
@@ -1147,7 +1083,6 @@ fn drive(tag: &str, o: &Opts) -> Result<i32, stop::Stopped> {
         Ok(c) => Ok(c),
         Err(Out::Stopped(s)) => Err(s),
         Err(Out::CouldNot(CouldNotRun(why))) => {
-            // a failure is not hidden by what came after
             let failed = results.iter().filter(|m| m.verdict == "FAIL").count();
             println!("nudge-trial: COULD NOT RUN: {why}");
             if failed > 0 {
@@ -1159,7 +1094,7 @@ fn drive(tag: &str, o: &Opts) -> Result<i32, stop::Stopped> {
     }
 }
 
-/// `nudge-trial [tag] [--mode on|log|off] [--trials N] [--expect on|log|off] [--via mode|key] [--no-hold]`.
+/// Run `nudge-trial` with the given CLI arguments.
 pub fn cmd_nudge_trial(args: &[String]) -> Res {
     let usage = |m: &str| Fail::usage(format!("nudge-trial: {m}"));
     let (mut tag, mut mode) = (None::<String>, None::<String>);
@@ -1204,7 +1139,6 @@ pub fn cmd_nudge_trial(args: &[String]) -> Res {
             s => tag = Some(s.to_string()),
         }
     }
-    // no tag: a lab of its own (an explicit tag that is up is the only lab used as it is)
     let tag = tag.unwrap_or_else(|| format!("nudge-{}", std::process::id()));
     if !crate::paths::valid_tag(&tag) {
         return Err(usage(&format!(
@@ -1220,7 +1154,6 @@ pub fn cmd_nudge_trial(args: &[String]) -> Res {
             )));
         }
     } else {
-        // the harness must type nothing into the tab and the folder trust is seeded: only the trial moves the screen
         let mut u = UpOpts::from_env();
         u.trust = true;
         u.harness_keys = "continue = false".into();
@@ -1233,7 +1166,6 @@ pub fn cmd_nudge_trial(args: &[String]) -> Res {
             if let Some(m) = &f.msg {
                 eprintln!("aterm-lab: {m}");
             }
-            // setup is no verdict: 3, not 1
             eprintln!("aterm-lab: nudge-trial: COULD NOT RUN: the lab did not come up");
             if f.stopped.is_some() {
                 return Err(f);

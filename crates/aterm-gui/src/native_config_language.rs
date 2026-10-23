@@ -1440,7 +1440,14 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         "harness.human_grace_s",
         "Seconds aterm waits after you type in a session",
         ConfigSchemaKind::Scalar(EditKind::Integer),
-        &["supervisor", "human", "keyboard", "grace"],
+        &[
+            "supervisor",
+            "human",
+            "keyboard",
+            "grace",
+            "deny",
+            "countdown",
+        ],
         true,
     ),
     manual(
@@ -5510,7 +5517,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · asks the agent to reach a stopping point and answer READY first · off: a session moves only when it is idle"
         }
         "harness.human_grace_s" => {
-            " · the supervisor types nothing into that session for this long"
+            " · the supervisor types nothing into that session for this long, short of an untouched box's auto-deny: that box is answered 15 s before its countdown runs out"
         }
         "disk.apply" => {
             " · the consent aterm harness disk --apply <class> needs before it removes anything"

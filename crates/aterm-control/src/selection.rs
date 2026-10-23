@@ -14,10 +14,11 @@ use crate::wire::{
     trimmed_len, wait_ms,
 };
 
-/// The host does not resolve the target sid. Unreachable from a dispatcher that
+/// The host does not resolve the target sid.
 const NO_SESSION: &str = "ERR no such session\n";
 
 /// The `blocks [N]` argument: the last `N` blocks, or all of them when `N` is
+/// absent, unparsable or not smaller than the count.
 fn last_n<'a, T>(all: &'a [T], rest: &str) -> &'a [T] {
     match rest.trim().parse::<usize>() {
         Ok(n) if n < all.len() => &all[all.len() - n..],
@@ -125,7 +126,7 @@ pub fn blocktext(host: &impl SessionHost, sid: u64, id: u64, trim: bool) -> Stri
     }
 }
 
-/// Block `id`'s raw output text, or the reply line that refuses it. The enum
+/// Block `id`'s raw output text, or the reply line that refuses it.
 fn block_text(t: &Terminal, id: u64) -> Result<String, &'static str> {
     use aterm_core::terminal::BlockText;
     let block = t.block_by_id(id).ok_or("ERR no such block\n")?;
@@ -136,7 +137,7 @@ fn block_text(t: &Terminal, id: u64) -> Result<String, &'static str> {
     }
 }
 
-/// Frame block output `text` (see [`blocktext`]). Runs with no lock held. The
+/// Frame block output `text` (see [`blocktext`]).
 fn frame_block_text(text: &str, trim: bool) -> String {
     use std::fmt::Write as _;
     #[cfg(test)]
@@ -161,6 +162,8 @@ fn frame_block_text(text: &str, trim: bool) -> String {
 }
 
 /// The newest completed block (ids are monotonic and blocks iterate
+/// oldest-first; an id baseline, unlike a count, survives eviction) plus
+/// whether any block is still in flight.
 fn scan_blocks(t: &Terminal) -> (Option<(u64, Option<i32>)>, bool) {
     use aterm_core::terminal::BlockState;
     let mut newest_done: Option<(u64, Option<i32>)> = None;
@@ -226,6 +229,7 @@ pub fn cmd_wait(host: &impl SessionHost, sid: u64, rest: &str) -> String {
 }
 
 /// Process-wide smart-selection rules, built lazily once (the builtin rules
+/// compile regexes).
 static SMART_RULES: OnceLock<SmartSelection> = OnceLock::new();
 
 /// The engine's builtin smart-selection rules (lazy singleton).
@@ -234,6 +238,7 @@ fn smart_rules() -> &'static SmartSelection {
 }
 
 /// Rows of a wrapped line joined on each side of a click before the word rules
+/// run, doubling while the match still reaches a window edge.
 const WORD_WINDOW_ROWS: usize = 2;
 
 /// The widest a double-click looks, in rows of the wrapped line.
@@ -481,7 +486,7 @@ pub fn cmd_copy(host: &impl SessionHost, sid: u64) -> String {
     }
 }
 
-/// Click gestures against soft wraps. A soft-wrapped line is one logical line
+/// Click gestures against soft wraps.
 #[cfg(test)]
 mod gesture_tests {
     use aterm_core::selection::SelectionType;
@@ -495,6 +500,7 @@ mod gesture_tests {
     const TAIL: &str = ":1.85 cargo build --release --features gpu,wayland";
 
     /// That command on row 0/1, then a separate logical line after a hard
+    /// newline (the boundary the join must never cross).
     fn wrapped_command() -> (Terminal, String) {
         let cmd = format!("{HEAD}{TAIL}");
         assert_eq!(HEAD.len(), 80, "the head must fill the row exactly");
@@ -505,6 +511,7 @@ mod gesture_tests {
     }
 
     /// A word straddling the wrap: `STRADDLEWORD` starts at column 74 of row 0
+    /// and finishes on row 1.
     fn wrapped_word() -> Terminal {
         let mut term = Terminal::new(6, 80);
         let filler = "word ".repeat(14) + "abc ";
@@ -514,11 +521,14 @@ mod gesture_tests {
     }
 
     /// Rebuild the text the highlight covers from the predicate the renderer
+    /// paints with (`TextSelection::contains`), joining rows by the copy's
+    /// soft-wrap rule.
     fn highlighted_text(term: &Terminal) -> String {
         highlighted_text_from(term, 0)
     }
 
     /// [`highlighted_text`] from selection-space row `first_row` (negative:
+    /// scrollback) down to the screen's last row.
     fn highlighted_text_from(term: &Terminal, first_row: i32) -> String {
         let cols = term.cols();
         let rows = i32::from(term.rows());
@@ -541,6 +551,7 @@ mod gesture_tests {
     }
 
     /// A triple-click on the head of a soft-wrapped command must
+    /// copy the whole command, not the 80 bytes that fit on the row.
     #[test]
     fn a_line_click_selects_the_whole_soft_wrapped_logical_line() {
         let (mut term, cmd) = wrapped_command();
@@ -568,6 +579,7 @@ mod gesture_tests {
     }
 
     /// Clicking the continuation row reaches back to the head, so where the
+    /// user clicks in a wrapped line does not change the result.
     #[test]
     fn a_line_click_on_the_continuation_row_selects_the_same_logical_line() {
         let (mut term, cmd) = wrapped_command();
@@ -602,6 +614,7 @@ mod gesture_tests {
     }
 
     /// A double-click on a word straddling the wrap must select the whole word,
+    /// not the `STRADD` fragment on the clicked row.
     #[test]
     fn a_word_click_selects_a_word_straddling_the_wrap_whole() {
         let mut term = wrapped_word();
@@ -620,7 +633,7 @@ mod gesture_tests {
         assert_eq!(term.selection_to_string().as_deref(), Some("STRADDLEWORD"));
     }
 
-    /// A double-click on a word after an Indic conjunct selects that word. The
+    /// A double-click on a word after an Indic conjunct selects that word.
     #[test]
     fn a_word_click_after_an_indic_conjunct_selects_the_word() {
         let c = "\u{0928}\u{094D}\u{0926}\u{0940}";
@@ -644,6 +657,8 @@ mod gesture_tests {
     }
 
     /// The same after Sinhala `ශ්‍රී`: a ZWJ ends its first UAX #29 cluster and
+    /// the grid folds the next cluster's letter into the same cell, so five of
+    /// them fill five cells, not the ten a per-cluster count gives.
     #[test]
     fn a_word_click_after_a_sinhala_zwj_conjunct_selects_the_word() {
         let sri = "\u{0DC1}\u{0DCA}\u{200D}\u{0DBB}\u{0DD3}";
@@ -655,6 +670,9 @@ mod gesture_tests {
     }
 
     /// A double-click on a word that a format control spells selects all of it:
+    /// the Persian half space, the ZWJ of Bengali ya-phala, the Mongolian vowel
+    /// separator and the Egyptian hieroglyph joiners sit between letters the grid
+    /// draws in separate cells, and must not end the word.
     #[test]
     fn a_word_click_on_a_word_a_joiner_spells_selects_it_whole() {
         for (word, last) in [
@@ -680,6 +698,8 @@ mod gesture_tests {
     }
 
     /// A word wider than `WORD_WINDOW_ROWS` rows, clicked in its middle, comes
+    /// back whole: the match runs off both edges of the first window and both
+    /// arms widen.
     #[test]
     fn a_word_wider_than_the_window_is_still_selected_whole() {
         let cols = 80usize;
@@ -708,6 +728,7 @@ mod gesture_tests {
     }
 
     /// Widening stops at the logical line's own end: a token ending exactly on
+    /// the last row of a wrapped line does not reach into the next line.
     #[test]
     fn widening_stops_at_the_end_of_the_logical_line() {
         let mut term = Terminal::new(6, 80);
@@ -722,6 +743,9 @@ mod gesture_tests {
     }
 
     /// With `ambiguous_width = "wide"` the grid draws an East Asian Ambiguous
+    /// character (`→`) in two cells, and a double-click measures the line the
+    /// same way: a click on any cell of `foo` (cells 4-6) selects `foo`, on the
+    /// screen and from scrollback.
     #[test]
     fn a_double_click_measures_ambiguous_characters_as_the_grid_draws_them() {
         let mut term = Terminal::new(4, 20);
@@ -768,6 +792,9 @@ mod gesture_tests {
     }
 
     /// A double-click on a wrapped run selects the word in the cells the grid
+    /// drew it in when a row holds a VS16 base the grid kept one cell wide in
+    /// its last column (it has no room for the spacer), on the screen and from
+    /// scrollback.
     #[test]
     fn a_word_click_after_a_last_column_vs16_base_selects_the_word_drawn_there() {
         let mut term = Terminal::new(4, 10);
@@ -812,6 +839,10 @@ mod gesture_tests {
     }
 
     /// A double-click selects the word in the cells the grid drew it in when
+    /// two regional indicators were drawn into neighbouring cells out of order:
+    /// the grid folds a flag half only into the cell before the cursor, so they
+    /// stay two cells, two columns each, where a walk of the row's text pairs
+    /// them into one two-column flag.
     #[test]
     fn a_word_click_after_regional_indicators_drawn_apart_selects_the_word_drawn_there() {
         let mut term = Terminal::new(4, 10);
@@ -874,6 +905,7 @@ mod gesture_tests {
     }
 
     /// A word double-clicked in a history row written before a live switch
+    /// to `ambiguous_width = "wide"` copies the word drawn there.
     #[test]
     fn a_word_copied_from_history_after_a_live_ambiguous_switch_is_the_word_drawn_there() {
         let mut term = Terminal::new(4, 20);
@@ -905,6 +937,7 @@ mod gesture_tests {
     }
 
     /// An ordinary unwrapped line still selects exactly itself, word and line
+    /// alike, with the same anchors.
     #[test]
     fn unwrapped_lines_and_words_are_unchanged() {
         let mut term = Terminal::new(6, 80);
@@ -950,6 +983,7 @@ mod blocktext_tests {
     }
 
     /// Two-step reference framing: every line collapsed and `trim_end`ed, and
+    /// `trim` drops rows that are blank by a spaces-only test.
     fn two_step_reply(text: &str, trim: bool) -> String {
         let rows: Vec<String> = text
             .lines()
@@ -981,6 +1015,7 @@ mod blocktext_tests {
     }
 
     /// Each row is collapsed and trimmed, `trim` drops exactly the blank tail,
+    /// and every reply is the one the two-step framing gave, byte for byte.
     #[test]
     fn blocktext_frames_each_row_and_trims_the_blank_tail() {
         let text = "out\x01\n\u{a0}\n\x01 \t\n\n";
@@ -1022,6 +1057,7 @@ mod blocktext_tests {
     }
 
     /// [`MemoryHost`] that records whether a block reply was framed while it
+    /// held the terminal.
     struct Watching {
         inner: MemoryHost,
         framed_inside: Cell<usize>,
@@ -1059,6 +1095,7 @@ mod blocktext_tests {
     }
 
     /// `blocktext` frames its reply after the host has released the terminal,
+    /// with or without `trim`; a refusal frames nothing.
     #[test]
     fn blocktext_frames_after_the_terminal_lock() {
         let host = Watching {

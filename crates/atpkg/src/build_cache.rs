@@ -2,22 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Rust build intermediates out of Spotlight (macOS).
-//!
-//! A command that builds gets a build directory Spotlight skips: `--config
-//! build.build-dir=<cache><workspace>/.cargo-build` when nothing else chose a target or
-//! build directory (binaries stay in `target/`, the rest goes under
-//! `~/Library/Caches/aterm/cargo-build.noindex`), else `<target>/build.noindex` under the
-//! target directory it builds into; only a caller's own build directory keeps cargo's
-//! layout. The rule itself is `aterm_toolchain::build_cache` ([`decide`], re-exported
-//! here with the rest of it); the `targo`/`targo-tippy` shims decide in `sh`
-//! ([`shim_block`]), `cargo` in an aterm tab through [`with_build_dir_here`], and
-//! `aterm-verify` for the children it starts; the tests hold the `sh` and Rust halves to
-//! one rule. Only `targo trust`, whose cargo reads no `--config`, gets its folder through
-//! the environment (`CARGO_BUILD_BUILD_DIR`); every other command is handed a `--config`,
-//! which a nested cargo started by the build never inherits. [`reclaim`] removes what
-//! nobody builds into any more: whole build directories, and inside one that stays what no
-//! build reads again ([`stale`]); [`reclaim_home_watched`] also takes the pinned tools
-//! nobody ran for a month from the tooling cache `verify provision` fills ([`tooling`]).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -30,8 +14,7 @@ pub mod tooling;
 
 pub use stale::RECLAIM_STALE;
 
-/// When a workspace is gone: the rule the window's disk watch uses too. It never looks
-/// into a privacy-guarded folder or a mounted volume.
+/// When a workspace is gone: the rule the window's disk watch uses too.
 pub use aterm_toolchain::checkout;
 
 pub use aterm_toolchain::build_cache::*;
@@ -51,20 +34,14 @@ const WRITE_DEPTH: usize = 3;
 /// A build directory whose workspace is seen gone goes once unwritten this long.
 pub const RECLAIM_GONE: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Below the disk watch's floor, a build directory whose workspace is seen gone goes once
-/// unwritten this long ([`reclaim_watched`]'s `gone_after` there) instead of
-/// [`RECLAIM_GONE`]: nobody
-/// builds into a removed workspace again, and a day of waiting is a day of a full disk. Ten
-/// minutes, the window the harness's disk watch keeps for a just-finished build.
+/// Below the disk watch's floor, a build directory whose workspace is seen gone goes once unwritten this long ([`reclaim_watched`]'s `gone_after` there) instead of [`RECLAIM_GONE`]: nobody builds into a removed workspace again, and a day of waiting is a day of a full disk.
 pub const RECLAIM_GONE_UNDER_PRESSURE: Duration = Duration::from_secs(10 * 60);
 
-/// Any build directory goes once unwritten this long, whatever its workspace's state: it
-/// is a cache, and a month on the compiler has usually moved and cargo would rebuild anyway.
+/// Any build directory goes once unwritten this long, whatever its workspace's state: it is a cache, and a month on the compiler has usually moved and cargo would rebuild anyway.
 pub const RECLAIM_IDLE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// The shim's half, rendered ahead of a `targo`/`targo-tippy` shim's `exec` on macOS:
-/// shell builtins only. It puts `--config …` in front of `"$@"`, or for `targo trust`
-/// (whose cargo reads no `--config`) exports `CARGO_BUILD_BUILD_DIR` to that exec.
+/// shell builtins only.
 const SH_BLOCK: &str = r#"# aterm: build intermediates out of Spotlight
 __atb_t=
 __atb_c=${HOME-}/Library/Caches/aterm/cargo-build.noindex
@@ -183,8 +160,7 @@ else
 fi
 "#;
 
-/// The block a shim forwarding to the store file `name` carries: `targo`'s, or
-/// `targo-tippy`'s, which names no subcommand (it is the lint). `None` for any other tool.
+/// The block a shim forwarding to the store file `name` carries: `targo`'s, or `targo-tippy`'s, which names no subcommand (it is the lint).
 #[must_use]
 pub fn shim_block(name: &str) -> Option<String> {
     match name {
@@ -194,8 +170,7 @@ pub fn shim_block(name: &str) -> Option<String> {
     }
 }
 
-/// [`with_build_dir`] on this process's machine; `None` off macOS. It hands `--config`
-/// only: `targo trust`'s folder goes through the environment, which the shim sets.
+/// [`with_build_dir`] on this process's machine; `None` off macOS.
 #[must_use]
 pub fn with_build_dir_here(args: &[String], tool: Tool) -> Option<Vec<String>> {
     if !cfg!(target_os = "macos") {
@@ -222,9 +197,7 @@ fn writable(dir: &Path) -> Option<bool> {
         .then(|| crate::platform::dir_writable_by_caller(dir))
 }
 
-/// Whether a cargo that reports `release` (its `-vV` line) reads `build.build-dir` and its
-/// `{workspace-root}` template: stable 1.91 and every later release, and any pre-release
-/// from 1.92 on (a 1.91 nightly may predate the stabilisation).
+/// Whether a cargo that reports `release` (its `-vV` line) reads `build.build-dir` and its `{workspace-root}` template: stable 1.91 and every later release, and any pre-release from 1.92 on (a 1.91 nightly may predate the stabilisation).
 #[must_use]
 pub fn release_reads_build_dir(release: &str) -> bool {
     let (version, pre) = release
@@ -238,27 +211,18 @@ pub fn release_reads_build_dir(release: &str) -> bool {
     }
 }
 
-/// WHY A BUILD DIRECTORY GOES ([`reclaim`], [`reclaim_watched`]): what its intent row, its
-/// removal row and the watch's account of it say — each rule [`reclaim`] takes one by, with
-/// the figures it was taken on.
+/// WHY A BUILD DIRECTORY GOES ([`reclaim`], [`reclaim_watched`]): what its intent row, its removal row and the watch's account of it say — each rule [`reclaim`] takes one by, with the figures it was taken on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unused {
-    /// Its workspace is seen gone ([`checkout::gone_placed`]) and nothing wrote it for
-    /// `idle`, at least the pass's window `after` ([`RECLAIM_GONE`], or
-    /// [`RECLAIM_GONE_UNDER_PRESSURE`] below the disk watch's floor).
+    /// Its workspace is seen gone ([`checkout::gone_placed`]) and nothing wrote it for `idle`, at least the pass's window `after` ([`RECLAIM_GONE`], or [`RECLAIM_GONE_UNDER_PRESSURE`] below the disk watch's floor).
     Gone { idle: Duration, after: Duration },
-    /// Nothing wrote it for `idle`, [`RECLAIM_IDLE`] or more: it goes whatever its
-    /// workspace's state, which was not looked at — it may still be there.
+    /// Nothing wrote it for `idle`, [`RECLAIM_IDLE`] or more: it goes whatever its workspace's state, which was not looked at — it may still be there.
     Idle { idle: Duration },
     /// What an earlier pass renamed aside and did not finish removing.
     Unfinished,
-    /// A completed pinned tool of the tooling cache nothing ran for `idle`, at least
-    /// `after` ([`RECLAIM_IDLE`]). Unfinished provisioning scratches are retained
-    /// ([`tooling`]).
+    /// A completed pinned tool of the tooling cache nothing ran for `idle`, at least `after` ([`RECLAIM_IDLE`]).
     Tooling { idle: Duration, after: Duration },
-    /// PART of a build directory that stays ([`stale`]): `incremental` crate folders and
-    /// `units` an old compiler built, each unwritten for `after` ([`RECLAIM_STALE`]) or more.
-    /// The path that goes is the stage they were moved into.
+    /// PART of a build directory that stays ([`stale`]): `incremental` crate folders and `units` an old compiler built, each unwritten for `after` ([`RECLAIM_STALE`]) or more.
     Stale {
         incremental: usize,
         units: usize,
@@ -266,15 +230,7 @@ pub enum Unused {
     },
 }
 
-/// Removes the build directories under the cache `root` that nobody builds into any more,
-/// and returns them: one unwritten for [`RECLAIM_GONE`] whose workspace is seen gone
-/// ([`checkout::gone`], `home` naming the folders it never looks into), and any unwritten
-/// for [`RECLAIM_IDLE`]. From each build directory that stays, what no build reads again
-/// goes ([`stale`]), returned as the stage it was moved into. One whose build lock a build
-/// holds is kept whole; each other is renamed aside while its locks are held, then removed.
-/// A stage an earlier pass renamed aside and did not finish removing is finished, and
-/// returned too. Never follows a symlink and never leaves `root`. Mirror folders left empty
-/// go too.
+/// Removes the build directories under the cache `root` that nobody builds into any more, and returns them: one unwritten for [`RECLAIM_GONE`] whose workspace is seen gone ([`checkout::gone`], `home` naming the folders it never looks into), and any unwritten for [`RECLAIM_IDLE`].
 pub fn reclaim(root: &Path, home: Option<&Path>, now: SystemTime) -> Vec<PathBuf> {
     reclaim_watched(root, home, now, RECLAIM_GONE, None, &mut |_, _| true)
         .into_iter()
@@ -282,21 +238,7 @@ pub fn reclaim(root: &Path, home: Option<&Path>, now: SystemTime) -> Vec<PathBuf
         .collect()
 }
 
-/// [`reclaim`] as the window's disk watch runs it, each directory returned with why it went
-/// ([`Unused`]): a gone workspace's build directory goes once unwritten for `gone_after`
-/// ([`RECLAIM_GONE`] while the volume is only low, [`RECLAIM_GONE_UNDER_PRESSURE`] below the
-/// floor); and with `placing` (the home volume's device and a complete mount table), a
-/// workspace nested in a removed checkout is gone too ([`checkout::gone_placed`]).
-///
-/// WRITE-AHEAD: `record` is asked for each build directory about to go, and why, with its
-/// locks held and before anything of it is moved — and for a stage an earlier pass left
-/// ([`Unused::Unfinished`]) before it is removed; one it answers `false` for (its intent
-/// could not be put on record — a full disk) is kept. The caller may size it there. What
-/// goes from a build directory that stays ([`Unused::Stale`]) is asked for as the stage it
-/// was moved into under the locks, holding exactly what goes; refused, each entry is moved
-/// back before the locks are let go. What is returned was removed whole: a stage finished is
-/// returned as [`Unused::Unfinished`], so each intent asked has its outcome; a directory
-/// whose removal was cut short is returned by the pass that finishes its stage.
+/// [`reclaim`] as the window's disk watch runs it, each directory returned with why it went ([`Unused`]): a gone workspace's build directory goes once unwritten for `gone_after` ([`RECLAIM_GONE`] while the volume is only low, [`RECLAIM_GONE_UNDER_PRESSURE`] below the floor); and with `placing` (the home volume's device and a complete mount table), a workspace nested in a removed checkout is gone too ([`checkout::gone_placed`]).
 pub fn reclaim_watched(
     root: &Path,
     home: Option<&Path>,
@@ -343,7 +285,7 @@ const MAX_DEPTH: usize = 64;
 
 /// One mirror folder `dir` under `root`: judge its `.cargo-build`, finish a removal an
 /// earlier pass left, walk its other children, then remove `dir` itself if it ended empty
-/// and is not brand new. Returns whether anything under `dir` was removed.
+/// and is not brand new.
 impl Sweep<'_> {
     /// Whether the stage at `path` may be cleared: `Some(false)` where there is none (a
     /// missing stage needs no intent), `Some(true)` where one stands and its intent is on
@@ -373,8 +315,7 @@ impl Sweep<'_> {
     /// it all this pass), and the decision made again from a fresh survey under those locks;
     /// moved into the stage `dir`/[`DOOMED`] under the locks, recorded as that stage
     /// ([`Unused::Stale`]; refused, every entry moves back), and removed with the locks let
-    /// go. An entry that cannot move back stays in the stage, which the next pass records
-    /// and finishes. Returns whether anything was moved.
+    /// go.
     fn prune(&mut self, dir: &Path, leaf: &Path) -> bool {
         let Some(seen) = look(leaf) else {
             return false;
@@ -398,8 +339,6 @@ impl Sweep<'_> {
         if look(leaf).is_none_or(|again| again.locks != seen.locks) {
             return false;
         }
-        // The unlocked survey only avoided needless lock attempts. Re-read the
-        // compiler classification and every artifact under the Cargo locks.
         let doomed = stale::decide(
             &stale::survey(
                 &stale::Disk,
@@ -452,7 +391,6 @@ impl Sweep<'_> {
             drop(held);
             return any;
         }
-        // A build that started meanwhile waited on these, and finds what it needs in place.
         drop(held);
         if std::fs::remove_dir_all(&stage).is_ok() {
             self.removed.push((stage, why));
@@ -494,11 +432,7 @@ impl Sweep<'_> {
                     any |= self.finish_stage(&doomed);
                 }
                 let moved = std::fs::rename(&child, &doomed).is_ok();
-                // A build that started meanwhile waited on these, and builds into a new folder.
                 drop(held);
-                // Returned only once removed whole: a removal cut short leaves its rest a
-                // stage, which the next pass records and finishes as [`Unused::Unfinished`]
-                // — counted there, and never twice.
                 if moved {
                     any = true;
                     if std::fs::remove_dir_all(&doomed).is_ok() {
@@ -524,9 +458,6 @@ impl Sweep<'_> {
 /// path — the inverse of [`aterm_toolchain::build_cache::build_dir`]'s join on macOS, the
 /// one platform anything writes the cache on ([`with_build_dir_here`], the shim and
 /// `aterm-verify` add a build directory there alone; [`reclaim_home`] runs there alone).
-/// On Windows nothing writes it (`<root>C:\…` could not even be named: a `:` inside a
-/// component), and a folder found under it anyway reads as `\<rel>`, no absolute path,
-/// which `checkout::gone_placed` refuses: nothing under it is called gone.
 fn workspace_of(root: &Path, dir: &Path) -> Option<PathBuf> {
     let rel = dir.strip_prefix(root).ok()?;
     Some(Path::new("/").join(rel))
@@ -534,8 +465,7 @@ fn workspace_of(root: &Path, dir: &Path) -> Option<PathBuf> {
 
 /// `leaf`'s build locks, held, and why it goes ([`Unused`]), when nobody builds into
 /// `leaf`, `workspace`'s build directory, any more: idle long enough, no build holding a
-/// lock, and nothing written since it was first looked at. The workspace is looked at only
-/// when the age alone does not decide.
+/// lock, and nothing written since it was first looked at.
 fn unused(
     workspace: &Path,
     leaf: &Path,
@@ -610,8 +540,7 @@ struct Seen {
 }
 
 /// The newest modification time of `leaf` and every folder down to [`WRITE_DEPTH`]
-/// levels below it, and the cargo locks on the way; never follows a link. `None` when
-/// `leaf` is not a real directory.
+/// levels below it, and the cargo locks on the way; never follows a link.
 fn look(leaf: &Path) -> Option<Seen> {
     let meta = std::fs::symlink_metadata(leaf).ok()?;
     if !meta.is_dir() {
@@ -651,9 +580,7 @@ fn age(now: SystemTime, then: SystemTime) -> Duration {
     now.duration_since(then).unwrap_or(Duration::ZERO)
 }
 
-/// Admit the actual configured store independently of cache-supplied sysroots. Unknown
-/// or unsafe roots keep units. The default owned package subtree is the sole exception
-/// to the home Library fence; every component is still checked before looking below it.
+/// Admit the actual configured store independently of cache-supplied sysroots.
 #[cfg(unix)]
 fn compiler_store(home: Option<&Path>) -> Option<PathBuf> {
     use std::os::unix::fs::MetadataExt as _;
@@ -717,8 +644,7 @@ fn compiler_store(_: Option<&Path>) -> Option<PathBuf> {
     None
 }
 
-/// [`reclaim_watched`] over this user's cache, now, then [`tooling::reclaim`] over its
-/// tooling cache, `record` asked before each removal; nothing off macOS or without a home.
+/// [`reclaim_watched`] over this user's cache, now, then [`tooling::reclaim`] over its tooling cache, `record` asked before each removal; nothing off macOS or without a home.
 pub fn reclaim_home_watched(
     gone_after: Duration,
     placing: Option<&checkout::Placing>,
@@ -742,16 +668,13 @@ pub fn reclaim_home_watched(
     })
 }
 
-/// [`reclaim`] over this user's cache, now, each path returned with why it went; nothing
-/// off macOS or without a home.
+/// [`reclaim`] over this user's cache, now, each path returned with why it went; nothing off macOS or without a home.
 #[must_use]
 pub fn reclaim_home() -> Vec<(PathBuf, Unused)> {
     reclaim_home_watched(RECLAIM_GONE, None, &mut |_, _| true)
 }
 
-/// WHAT A PASS WOULD TAKE, read and never acted on ([`plan`]): one build directory that
-/// would go whole, the parts that would go from one that stays, or a stage an earlier pass
-/// left.
+/// WHAT A PASS WOULD TAKE, read and never acted on ([`plan`]): one build directory that would go whole, the parts that would go from one that stays, or a stage an earlier pass left.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Planned {
     /// The build directory, or the stage.
@@ -760,16 +683,11 @@ pub struct Planned {
     pub why: Unused,
     /// What would be removed: `path` itself, or the parts of it.
     pub paths: Vec<PathBuf>,
-    /// Its cargo locks could not all be taken just now (a build holds one): a pass now
-    /// keeps it whole.
+    /// Its cargo locks could not all be taken just now (a build holds one): a pass now keeps it whole.
     pub held: bool,
 }
 
-/// [`reclaim_watched`]'s decisions over the cache `root` at `now`, read and never acted on:
-/// nothing is moved or removed and no stage is finished. Each build directory's cargo locks
-/// are only tried, and let go at once, to say whether a build holds one ([`Planned::held`]).
-/// What would go from one that stays is what [`stale::decide`] says of its survey; the pass
-/// itself re-reads each under the locks first.
+/// [`reclaim_watched`]'s decisions over the cache `root` at `now`, read and never acted on: nothing is moved or removed and no stage is finished.
 #[must_use]
 pub fn plan(
     root: &Path,
@@ -787,8 +705,7 @@ pub fn plan(
     planned
 }
 
-/// [`plan`] for this user's cache now, with the day's window ([`reclaim_home`]'s), then
-/// [`tooling::plan`] for its tooling cache; nothing off macOS or without a home.
+/// [`plan`] for this user's cache now, with the day's window ([`reclaim_home`]'s), then [`tooling::plan`] for its tooling cache; nothing off macOS or without a home.
 #[must_use]
 pub fn plan_home() -> Vec<Planned> {
     if !cfg!(target_os = "macos") {
@@ -871,8 +788,7 @@ fn plan_walk(pass: PlanPass<'_>, dir: &Path, depth: usize, planned: &mut Vec<Pla
     }
 }
 
-/// The bytes `paths` hold on disk: each file's allocated blocks once, however many names it
-/// has among them, never following a link.
+/// The bytes `paths` hold on disk: each file's allocated blocks once, however many names it has among them, never following a link.
 #[must_use]
 pub fn allocated(paths: &[PathBuf]) -> u64 {
     let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();

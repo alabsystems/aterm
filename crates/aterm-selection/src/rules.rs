@@ -1,29 +1,23 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
 //! Selection rule types and smart selection engine.
-//!
-//! Provides regex-based rules for context-aware text selection.
 
 pub(crate) use super::builtin_patterns::BuiltinRules;
 use aterm_regex::Regex;
 use aterm_types::text_shaping::AmbiguousWidth;
 
 /// Priority levels for selection rules.
-///
-/// Higher priority rules are checked first. When multiple rules match,
-/// the highest priority match wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 #[derive(Default)]
 pub(crate) enum RulePriority {
-    /// Lowest priority - fallback rules
+    /// Lowest priority - fallback rules.
     Low = 0,
-    /// Normal priority - most built-in rules
+    /// Normal priority - most built-in rules.
     #[default]
     Normal = 1,
-    /// High priority - specific patterns that should override general ones
+    /// High priority - specific patterns that should override general ones.
     High = 2,
 }
 
@@ -34,15 +28,15 @@ pub enum SelectionRuleKind {
     Url,
     /// File path (absolute or relative)
     FilePath,
-    /// Email address
+    /// Email address.
     Email,
-    /// IPv4 or IPv6 address
+    /// IPv4 or IPv6 address.
     IpAddress,
     /// Git commit hash (7+ hex characters)
     GitHash,
     /// Quoted string (single or double quotes)
     QuotedString,
-    /// UUID
+    /// UUID.
     Uuid,
     /// Semantic version (semver)
     SemVer,
@@ -76,9 +70,8 @@ impl SelectionRule {
     /// Create a new selection rule.
     ///
     /// # Panics
-    ///
     /// Panics if the pattern is not a valid regex.
-    #[allow(clippy::expect_used)] // Documented panic contract — invalid regex is a programmer error.
+    #[allow(clippy::expect_used)]
     pub(crate) fn new(name: &str, kind: SelectionRuleKind, pattern: &str) -> Self {
         Self {
             name: name.to_string(),
@@ -106,8 +99,6 @@ impl SelectionRule {
     }
 
     /// Find the match that contains the given byte position.
-    ///
-    /// Returns `None` if no match contains that position.
     #[must_use]
     #[inline]
     pub(crate) fn find_at_position<'a>(
@@ -121,9 +112,7 @@ impl SelectionRule {
     }
 }
 
-/// A match result from the smart selection system (the tests' view of a rule
-/// hit; production word selection needs only its span, see
-/// [`SmartSelection::word_boundaries_at`]).
+/// A smart-selection rule match result (see [`SmartSelection::word_boundaries_at`]).
 #[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct SelectionMatch {
@@ -144,7 +133,6 @@ impl SelectionMatch {
     /// Create a new selection match.
     ///
     /// # Panics
-    ///
     /// Panics if `end < start`.
     pub(crate) fn new(
         text: impl Into<String>,
@@ -203,8 +191,7 @@ pub struct SmartSelection {
     /// Selection rules, sorted by priority (highest first)
     rules: Vec<SelectionRule>,
     /// Optional host-configured word-SEPARATOR set (xterm.js `wordSeparators`
-    /// semantics), consulted only by the basic word walk. `None` (the default)
-    /// keeps the class-based logic (alphanumeric + `_`).
+    /// semantics), consulted only by the basic word walk.
     word_separators: Option<String>,
 }
 
@@ -236,17 +223,12 @@ impl SmartSelection {
     }
 
     /// Add a selection rule.
-    ///
-    /// Rules are maintained in priority order (highest first).
     pub(crate) fn add_rule(&mut self, rule: SelectionRule) {
         self.rules.push(rule);
-        // Highest priority first.
         self.rules.sort_by_key(|r| std::cmp::Reverse(r.priority));
     }
 
     /// Find the best match at the given byte position in the text.
-    ///
-    /// Returns the highest-priority match that contains the position.
     #[cfg(test)]
     #[must_use]
     pub(super) fn find_at(&self, text: &str, byte_pos: usize) -> Option<SelectionMatch> {
@@ -276,26 +258,12 @@ impl SmartSelection {
             .find_map(|rule| Some((rule, rule.find_at_position(text, byte_pos)?)))
     }
 
-    /// Override the characters that BREAK a word for the basic (non-rule)
-    /// double-click word walk — xterm.js `wordSeparators` semantics: with a
-    /// set configured, a word is a maximal run of NON-separator characters
-    /// (a mark still belongs to the character it hangs off, and an invisible
-    /// format control still breaks: [`aterm_grapheme::words`]). `None`
-    /// restores the default class-based logic (alphanumeric + `_`).
-    ///
-    /// Smart-selection RULES (url/file_path/email/…) still take precedence in
-    /// [`word_boundaries_at`](Self::word_boundaries_at); the separators only
-    /// shape the fallback word.
+    /// Override the characters that BREAK a word for the basic (non-rule) double-click word walk.
     pub fn set_word_separators(&mut self, separators: Option<&str>) {
         self.word_separators = separators.map(str::to_owned);
     }
 
     /// Get the word boundaries for smart selection at a position.
-    ///
-    /// If a rule matches at the position, returns the match boundaries.
-    /// Otherwise, returns word boundaries based on whitespace/punctuation
-    /// (or on the configured [`set_word_separators`](Self::set_word_separators)).
-    /// Both `byte_pos` and the returned offsets are in bytes.
     #[must_use]
     pub fn word_boundaries_at(&self, text: &str, byte_pos: usize) -> Option<(usize, usize)> {
         // First try smart selection rules.
@@ -303,31 +271,17 @@ impl SmartSelection {
             return Some((m.start(), m.end()));
         }
 
-        // Fall back to basic word boundaries
         Self::basic_word_boundaries_with(self.word_separators.as_deref(), text, byte_pos)
     }
 
-    /// Get word boundaries at a column (display-width) position of `text`
-    /// laid out left to right in one go: converts column→byte by walking the
-    /// text, calls `word_boundaries_at`, and converts the result back.
-    ///
-    /// A grid row's text is no measure of its columns: two flag halves drawn
-    /// into neighbouring cells out of order are two cells the walk pairs into
-    /// one, and a VS16 base the grid kept one cell wide in the last column is
-    /// one cell the walk widens. Grid code maps a row through the cells its
-    /// text was read from instead (`aterm_core::terminal::smart_word_in_cells`).
-    ///
-    /// A column at or past the end of the text names an empty cell: `None`.
+    /// Get word boundaries at a column (display-width) position of `text` laid out left to right in one go.
     #[must_use]
     #[inline]
     pub fn word_boundaries_at_column(&self, text: &str, column: usize) -> Option<(usize, usize)> {
         self.word_boundaries_at_column_with(text, column, AmbiguousWidth::Single)
     }
 
-    /// [`word_boundaries_at_column`](Self::word_boundaries_at_column) with the
-    /// columns measured under the terminal's `ambiguous_width` policy: with
-    /// [`AmbiguousWidth::Double`] an East Asian Ambiguous character (`→`, `─`)
-    /// takes the two cells the grid draws it in.
+    /// [`word_boundaries_at_column`](Self::word_boundaries_at_column) with the columns measured under the terminal's `ambiguous_width` policy.
     #[must_use]
     pub fn word_boundaries_at_column_with(
         &self,
@@ -346,18 +300,6 @@ impl SmartSelection {
     }
 
     /// Get basic word boundaries (fallback when no rule matches).
-    ///
-    /// Treats sequences of alphanumeric characters and underscores as words,
-    /// with what belongs to them: their marks, a prepended mark, and a format
-    /// control that spells the word (a ZWNJ or ZWJ, the Mongolian vowel
-    /// separator, an Egyptian hieroglyph joiner). Any other invisible character
-    /// separates two words. This is [`aterm_grapheme::words`], the rule the
-    /// find field's and the editor's word motions follow too.
-    /// Handles Unicode text: CJK, accented Latin, Cyrillic, etc.
-    ///
-    /// Test-only pin of the DEFAULT (no-separator) classifier; production goes
-    /// through [`word_boundaries_at`](Self::word_boundaries_at), which passes
-    /// the configured separators.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn basic_word_boundaries(text: &str, byte_pos: usize) -> Option<(usize, usize)> {
@@ -379,14 +321,10 @@ impl SmartSelection {
             return None;
         }
 
-        // Clamp to last valid position
         let pos = byte_pos.min(text.len().saturating_sub(1));
 
-        // Snap to nearest char boundary at or before pos
         let snap = (0..=pos).rev().find(|&i| text.is_char_boundary(i))?;
 
-        // The word the snapped character belongs to, if any, read from the last
-        // word break before it.
         let is_word = |c: char| is_word_char(seps, c);
         let from = aterm_grapheme::word_break_before(text, snap, is_word);
         let word = aterm_grapheme::words(text.get(from..)?, is_word)
@@ -399,8 +337,7 @@ impl SmartSelection {
 /// Whether `ch`, standing on its own, is a word character under the active
 /// classifier: the configured separator set (a word is any run of
 /// non-separators — xterm.js `wordSeparators`), or the default class
-/// ([`aterm_grapheme::is_word_char`]: alphanumeric + `_`). Which invisible and
-/// attached characters join it is [`aterm_grapheme::words`]'s to say.
+/// ([`aterm_grapheme::is_word_char`]: alphanumeric + `_`).
 #[inline]
 fn is_word_char(seps: Option<&str>, ch: char) -> bool {
     match seps {
@@ -410,12 +347,6 @@ fn is_word_char(seps: Option<&str>, ch: char) -> bool {
 }
 
 /// Convert a GRID column to the byte position of the grapheme drawn there.
-///
-/// Columns are the grid's (see [`aterm_grapheme::grid_graphemes`]), not
-/// display width: the grid advances per CHARACTER outside emoji, so a
-/// cluster's display width is the wrong charge for an Indic conjunct and
-/// double-click landed on the wrong cells. A column inside a multi-cell
-/// grapheme names its start; past the text, `text.len()`.
 #[cfg(test)]
 pub(crate) fn column_to_byte_pos(text: &str, column: usize) -> usize {
     column_to_byte_pos_with(text, column, AmbiguousWidth::Single)
@@ -431,12 +362,7 @@ fn column_to_byte_pos_with(text: &str, column: usize, ambiguous: AmbiguousWidth)
     text.len()
 }
 
-/// The grid columns `start..end` (exclusive) that bytes `start_byte..end_byte`
-/// are drawn in.
-///
-/// A grapheme the grid folds into the cell before it (the `ය` of Sinhala
-/// `ක්‍ය`) starts in that cell, so a word that starts with one still covers
-/// the cell its first letter is drawn in.
+/// The grid columns `start..end` (exclusive) that bytes `start_byte..end_byte` are drawn in.
 #[cfg(test)]
 pub(crate) fn byte_span_to_columns(
     text: &str,

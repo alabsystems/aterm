@@ -53,6 +53,7 @@ struct Conn {
     stream: CtlStream,
     pid: u32,
     /// A frame to this peer could not be written ([`Server::send`]): nothing
+    /// more is written to it, and its frames are still read through its EOF.
     unwritable: bool,
 }
 
@@ -64,6 +65,7 @@ pub struct Server {
     conns: BTreeMap<ConnId, Conn>,
     custody: BTreeMap<Rdev, OwnedFd>,
     /// Every crash-restore companion held, by the number given at its arrival, with the master
+    /// it rides beside.
     companions: BTreeMap<CompanionId, (Rdev, OwnedFd)>,
     next_companion: CompanionId,
     watches: BTreeMap<u32, ExitWatch>,
@@ -77,10 +79,13 @@ pub struct Server {
     own_pid: u32,
     refused_dials: u64,
     /// COMPANIONs this keeper accepted since it started (`status companions_taken=`): each one
+    /// a region it now holds in place of whatever its claim held before.
     companions_taken: u64,
     /// Why the last dial was refused unchecked, as last printed: printed once per reason, and
+    /// forgotten at the next admitted dial.
     unchecked_said: Option<String>,
     /// Frames read after their writer's exit had already arrived, before the
+    /// exit was recorded ([`Server::drain_pid`]).
     frames_behind_exit: u64,
     /// Frames the keeper could not write to their peer ([`Server::send`]).
     replies_lost: u64,
@@ -88,15 +93,21 @@ pub struct Server {
     #[cfg(test)]
     test_fail_next_dup: bool,
     /// A test seam: every reason a dial was turned away unchecked, never cleared
+    /// ([`Server::test_unchecked_ever`]).
     #[cfg(test)]
     test_unchecked_ever: Vec<String>,
 }
 
 /// A per-connection receive/send budget: once a frame's header has arrived,
+/// the rest must follow within this, or the connection is dropped; a frame the
+/// peer does not take within it is the last one written to it
+/// ([`Server::send`]).
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 /// The loop's clock tick when nothing is readable.
 const TICK_MS: i32 = 250;
 /// The most frames [`Server::drain_pid`] reads from one connection of a dead
+/// peer: more than a socket buffer of the smallest frame (8 KiB of 8-byte
+/// headers).
 const DRAIN_MAX_FRAMES: usize = 1024;
 
 struct Env<'a> {
@@ -421,7 +432,7 @@ impl Server {
         self.apply(outs);
     }
 
-    /// Watch `pid`'s exit (a PENDING successor, an orphan's leader). A pid
+    /// Watch `pid`'s exit (a PENDING successor, an orphan's leader).
     fn watch_pid(&mut self, pid: u32) {
         if self.watches.contains_key(&pid) {
             return;
@@ -448,6 +459,7 @@ impl Server {
     }
 
     /// Stream order (§5.3 step 4, "K reads BYE and then EOF"): every frame a peer wrote before it
+    /// died (a claim, its BYE) is read before its death is recorded.
     fn drain_pid(&mut self, pid: u32) {
         let ids: Vec<ConnId> = self
             .conns
@@ -479,6 +491,7 @@ impl Server {
     }
 
     /// Read one frame of `id` and handle it: `true` when a frame was read,
+    /// `false` when the connection is over (EOF, a malformed frame, a stall).
     fn read_conn(&mut self, id: ConnId) -> bool {
         let Some(conn) = self.conns.get(&id) else {
             return false;
@@ -547,6 +560,7 @@ impl Server {
     }
 
     /// REGISTER: read the descriptor's rdev (`fstat`, the one call ever made
+    /// on a master) and let the core decide.
     fn register(
         &mut self,
         id: ConnId,
@@ -579,6 +593,7 @@ impl Server {
     }
 
     /// COMPANION: check what the descriptor is ([`companion_fault`], which neither maps nor
+    /// reads it), number it, and let the core decide; it is held only when the core keeps it.
     fn companion(
         &mut self,
         id: ConnId,
@@ -648,6 +663,7 @@ impl Server {
     }
 
     /// Send the OFFER of `rdev` to `conn` with a duplicate of the custody copy, and to a window
+    /// that journals, with the brake and a COMPANION_OFFER of the region right after it.
     fn offer(&mut self, conn: ConnId, rdev: Rdev, journal: Option<crate::core::OfferJournal>) {
         let Some(rec) = self.core.records().get(&rdev).cloned() else {
             return;
@@ -698,7 +714,7 @@ impl Server {
         }
     }
 
-    /// Write one frame to `conn`. A failed write (the peer died or closed its end, or took nothing
+    /// Write one frame to `conn`.
     fn send(&mut self, conn: ConnId, frame: &Frame, fd: Option<&OwnedFd>) {
         let Some(c) = self.conns.get(&conn) else {
             return;
@@ -709,6 +725,7 @@ impl Server {
     }
 
     /// One frame for `conn` was not written: a write failed ([`Self::send`]), or an OFFER's
+    /// duplicate of the custody copy could not be made (`EMFILE`).
     fn end_writing(&mut self, conn: ConnId) {
         let Some(c) = self.conns.get_mut(&conn) else {
             return;
@@ -773,7 +790,7 @@ impl Server {
 
     /// Borrows the underlying [`KeeperCore`].
     #[must_use]
-    pub fn core(&self) -> &KeeperCore {
+    pub const fn core(&self) -> &KeeperCore {
         &self.core
     }
 
@@ -851,6 +868,10 @@ mod tests {
     use crate::wire::{CAP_SENDS_BYE, PeerClass};
 
     /// A LAB DESK'S MARKER IS READ AS ANY MARKER IS: `aterm-gui`'s
+    /// lab desk names its marker `crash-marker-<pid>-<nanos>-lab.log`, and the keeper reads it as
+    /// it reads an `app` or `other` one: missing, the exit path ran (Released); there with its
+    /// lock free, a death with no exit path (Dead), and so its consumed `.seen` name; held, a live
+    /// owner (Held).
     #[test]
     fn a_lab_desks_marker_is_read_as_any_marker_is() {
         use std::os::unix::ffi::OsStrExt as _;
@@ -906,6 +927,7 @@ mod tests {
     }
 
     /// A peer wrote HELLO, a claim and BYE, then closed its end before the keeper read any: the
+    /// WELCOME is lost, the claim and the BYE are still read, and the EOF drops the connection.
     #[test]
     fn a_failed_write_ends_the_writing_never_the_reading() {
         let dir = std::env::temp_dir().join(format!("akk-unit-{}-unwritable", std::process::id()));
@@ -993,6 +1015,8 @@ mod tests {
     }
 
     /// A fresh PTY master no other process holds, and its rdev (`aterm_pty::open_pty_pair`:
+    /// close-on-exec from the open, so a sibling test's child cannot hold it, and redriven when
+    /// XNU's `/dev/ptmx` race answers `-6`).
     fn a_pty_master() -> (OwnedFd, Rdev) {
         use std::os::fd::FromRawFd as _;
         let (master, slave) = aterm_pty::open_pty_pair().expect("a fresh PTY pair");
@@ -1028,7 +1052,7 @@ mod tests {
         }
     }
 
-    /// Turn until the one connection's EOF drops it. The peer's end is closed
+    /// Turn until the one connection's EOF drops it.
     fn until_its_eof(server: &mut Server) {
         let started = Instant::now();
         while !server.conns.is_empty() {
@@ -1042,18 +1066,22 @@ mod tests {
     /// What the second window of [`offer_to_a_second_window`] saw and left.
     struct OfferSeen {
         /// The frames it read, in order, up to the keeper's EOF (or the second
+        /// frame after the WELCOME), with each OFFER's descriptor's rdev.
         read: Vec<(Frame, Option<Rdev>)>,
         /// The master window A left orphaned.
         orphan_rdev: Rdev,
         bye_read: bool,
         claim_read: bool,
         /// The orphan is Orphaned again after B's EOF: an offer is made to a
+        /// connection, and returns when that connection is gone.
         returned_at_eof: bool,
         replies_lost: u64,
         dropped_at_eof: bool,
     }
 
     /// Window A claims a master and crashes; window B says HELLO — offered
+    /// A's master — then claims its own and says BYE, all written before the
+    /// keeper reads any of it.
     fn offer_to_a_second_window(fail_dup: bool) -> OfferSeen {
         let me = std::process::id();
         let dir =
@@ -1159,6 +1187,7 @@ mod tests {
     }
 
     /// The duplicate fails as `EMFILE` would: the recipient reads the WELCOME then EOF, its claim
+    /// and BYE are still read, and the offer returns to Orphaned at its EOF.
     #[test]
     fn an_offer_that_cannot_be_duplicated_ends_the_writing_never_the_reading() {
         let failed = offer_to_a_second_window(true);
@@ -1202,6 +1231,7 @@ mod tests {
     }
 
     /// The keeper takes in custody only a read-only POSIX shared-memory object of the kind and
+    /// length claimed, within the bounds; everything else is named, and nothing is mapped.
     #[test]
     fn a_companion_must_be_a_read_only_region_of_its_claimed_length() {
         use crate::wire::COMPANION_JOURNAL as JOURNAL;
@@ -1243,6 +1273,10 @@ mod tests {
     }
 
     /// The loop's descriptors follow the core's decisions exactly: after a COMPANION, a second
+    /// one that supersedes it (`Out::CloseCompanion`), and the RELEASE that removes the record
+    /// (`Out::Close`, which closes every companion beside the master), the regions the loop
+    /// holds are the core's, the status counts them from the descriptors (`fstat`), and the
+    /// kernel's own table of this process shows exactly that many of the region's size.
     #[test]
     fn the_loop_holds_exactly_the_regions_the_core_keeps() {
         use aterm_uds::shm::{PAGE, Region};

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /// `ditto` names files the bundle chose, so a line naming one after the passing key
+/// leaves an unpack failure the refusal it is, still reading the name.
 #[test]
 fn a_ditto_failure_quoting_a_refusal_key_is_still_a_refusal() {
     use std::os::unix::process::ExitStatusExt as _;
@@ -25,6 +26,8 @@ fn a_ditto_failure_quoting_a_refusal_key_is_still_a_refusal() {
 }
 
 /// An installed bundle replaced by a hand-built, ad-hoc-signed one cannot be the
+/// rollback source, so the successor's boot apply would refuse to swap, stay the
+/// old build and refuse its target (read by the parent as `ChildDied`).
 #[test]
 fn a_process_with_no_replaceable_bundle_refuses_before_anything_parks() {
     super::preverify_installed_rollback_source(None, 100, Some("abcdef0"))
@@ -43,6 +46,7 @@ fn a_process_with_no_replaceable_bundle_refuses_before_anything_parks() {
 }
 
 /// The post-swap re-exec command pins `--window` first and carries the re-exec nonce,
+/// the from-build and the restored handoff authority the successor's prearm needs.
 #[test]
 fn boot_reexec_command_pins_mode_and_restores_handoff_env() {
     let handoff_env = vec![(
@@ -91,6 +95,8 @@ fn boot_reexec_command_pins_mode_and_restores_handoff_env() {
 }
 
 /// The crash-loop revert's re-exec is pinned to its mode, as the boot swap's is: a
+/// window started as `aterm --window` from a shell still has that terminal on stdin,
+/// and handed the stripped argv alone the router would read it as a session.
 #[test]
 fn rollback_reexec_command_pins_mode_and_restores_handoff_env() {
     let osv = |list: &[&str]| -> Vec<std::ffi::OsString> {
@@ -139,6 +145,8 @@ fn rollback_reexec_command_pins_mode_and_restores_handoff_env() {
 }
 
 /// `rfc3339_delta_secs` inverts `format_rfc3339` across day and leap boundaries and
+/// fails closed on malformed input, as the persistent-failure notice's duration gate
+/// needs.
 #[test]
 fn rfc3339_delta_round_trips_and_fails_closed() {
     for (a, b, want) in [
@@ -194,6 +202,7 @@ fn write_ready(s: &Staging, build: u64) {
 }
 
 /// Two processes arming one build swap it in once (Tier-1 of
+/// `NativeUpdateTwoProcessApply`).
 #[test]
 fn two_processes_arming_one_build_swap_it_once() {
     use aterm_spec::interp::State;
@@ -296,6 +305,8 @@ fn two_processes_arming_one_build_swap_it_once() {
 }
 
 /// A `ready.toml` whose staged bundle is gone clears itself: this recovery runs
+/// before the `is_publishable` retirement, so returning Err would defer every
+/// launch permanently.
 #[test]
 fn a_ready_marker_whose_staged_bundle_vanished_retires_instead_of_deferring_forever() {
     let (s, root) = temp_staging();
@@ -322,6 +333,8 @@ fn a_ready_marker_whose_staged_bundle_vanished_retires_instead_of_deferring_fore
 }
 
 /// The attribution fields are optional on the wire: a `ready.toml` written
+/// without them keeps parsing, so an upgrade does not strand a staged build
+/// behind a `Corrupt` marker.
 #[test]
 fn a_ready_marker_without_attribution_still_parses() {
     let legacy = r#"
@@ -338,6 +351,7 @@ staged_at = "2026-08-17T00:00:00Z"
 }
 
 /// An oversized changelog would make the marker invisible, not large (every
+/// reader goes through `read_ledger_text`, `None` above `MAX_LEDGER_BYTES`).
 #[test]
 fn an_oversized_manifest_changelog_is_clamped_by_characters_not_bytes() {
     let wide = "—".repeat(MAX_READY_CHANGELOG_CHARS * 4);
@@ -374,6 +388,7 @@ fn an_oversized_manifest_changelog_is_clamped_by_characters_not_bytes() {
 }
 
 /// A verified bundle unpacked beside the stage, its `Info.plist` naming `build` built
+/// from `commit`, for [`publish_verified_stage`] to publish.
 fn incoming_stage(s: &Staging, build: u64, commit: &str) -> PathBuf {
     let incoming = s.staged_dir().join("aterm.app.incoming");
     make_app(&incoming, "R");
@@ -389,7 +404,7 @@ fn incoming_stage(s: &Staging, build: u64, commit: &str) -> PathBuf {
     incoming
 }
 
-/// A STAGE WITHDRAWN WHILE IT DOWNLOADED IS NEVER PUBLISHED. The publish shares the
+/// A STAGE WITHDRAWN WHILE IT DOWNLOADED IS NEVER PUBLISHED.
 #[test]
 fn a_stage_withdrawn_while_it_downloaded_is_never_published() {
     let commit = "0123456789abcdef0123456789abcdef01234567";
@@ -476,6 +491,8 @@ fn a_stage_withdrawn_while_it_downloaded_is_never_published() {
 }
 
 /// Build `build`, signed by `machine` under roster generation 9, published as a
+/// stage whose roster authorization was last confirmed at `confirmed` (unix
+/// seconds; `None`: never, as an older build's marker).
 fn publish_confirmed_stage(
     s: &Staging,
     build: u64,
@@ -510,7 +527,7 @@ fn publish_confirmed_stage(
     ready
 }
 
-/// A COLD LAUNCH DOES NOT SWAP IN A STAGE NO CHECK HAS CONFIRMED FOR A DAY. Build
+/// A COLD LAUNCH DOES NOT SWAP IN A STAGE NO CHECK HAS CONFIRMED FOR A DAY.
 #[test]
 fn a_cold_launch_waits_for_a_check_to_confirm_a_stale_roster_authorization() {
     let (s, root) = temp_staging();
@@ -563,6 +580,9 @@ fn a_cold_launch_waits_for_a_check_to_confirm_a_stale_roster_authorization() {
 }
 
 /// A launch waiting for its roster confirmation is no stuck update: booking the wait
+/// restarts the pending clock (which counts from the stage's first sighting, across
+/// days the app was closed), so the overdue notice speaks only if the wait outlasts
+/// its hour.
 #[test]
 fn a_launch_waiting_for_its_roster_confirmation_restarts_the_overdue_clock() {
     let (s, root) = temp_staging();
@@ -605,6 +625,8 @@ fn a_launch_waiting_for_its_roster_confirmation_restarts_the_overdue_clock() {
 }
 
 /// The in-session lane waits too: the full pre-verification and the cached pass both
+/// refuse a stage whose roster confirmation is stale, passing, before `codesign` and
+/// before any policy is read.
 #[test]
 fn the_pre_park_checks_refuse_a_stage_whose_roster_confirmation_is_stale() {
     let (s, root) = temp_staging();
@@ -635,6 +657,9 @@ fn the_pre_park_checks_refuse_a_stage_whose_roster_confirmation_is_stale() {
 }
 
 /// A check's confirmation lands on the stage it judged and ends the wait it answers:
+/// the marker's stamp moves to the check's time, a marker another process replaced
+/// meanwhile is left alone, and the ledger's standing refusal is withdrawn only when
+/// it was the wait for a confirmation.
 #[test]
 fn a_confirmation_stamps_the_judged_stage_and_withdraws_only_the_wait_it_answers() {
     let (s, root) = temp_staging();
@@ -712,6 +737,9 @@ fn a_confirmation_stamps_the_judged_stage_and_withdraws_only_the_wait_it_answers
 }
 
 /// A confirmation is dated by the roster's read and never moves backwards: a stage is
+/// stamped with the instant its check began reading the roster, not the write (a long
+/// download must not add its hours to the window), and a later read already on the
+/// marker is kept over an earlier one landing after it, unless it is ahead of the clock.
 #[test]
 fn a_confirmation_is_dated_by_the_roster_read_and_never_moves_backwards() {
     let (s, root) = temp_staging();
@@ -793,6 +821,7 @@ fn a_confirmation_is_dated_by_the_roster_read_and_never_moves_backwards() {
 }
 
 /// A FLOOR THAT IS THERE BUT COULD NOT BE READ WITHDRAWS NOTHING AND ADMITS
+/// NOTHING.
 #[test]
 fn a_floor_that_could_not_be_read_admits_no_stage() {
     use std::os::unix::fs::PermissionsExt;
@@ -867,6 +896,8 @@ fn a_floor_that_could_not_be_read_admits_no_stage() {
 }
 
 /// A sibling's hold of the apply lock is a moment, not a verdict: a publish that
+/// outwaits it is a passing refusal, never booked against the verified build, and the
+/// bundle and staged generation are left for the next check to publish.
 #[test]
 fn a_publish_that_outwaits_a_sibling_s_apply_lock_is_not_booked_against_the_build() {
     let (s, root) = temp_staging();
@@ -897,6 +928,8 @@ fn a_publish_that_outwaits_a_sibling_s_apply_lock_is_not_booked_against_the_buil
 }
 
 /// A marker that would read as absent is never committed, and refusing it keeps the
+/// readable generation already staged: the size guard runs before the lock and
+/// before the old marker and bundle are removed.
 #[test]
 fn publish_refuses_a_marker_that_would_exceed_the_ledger_cap() {
     let (s, root) = temp_staging();
@@ -1002,7 +1035,7 @@ fn read_ready_classifies_all_states() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// THE SHARED STAGE'S STATE IS A MOMENT, NOT A VERDICT ON THE BUILD. A sibling
+/// THE SHARED STAGE'S STATE IS A MOMENT, NOT A VERDICT ON THE BUILD.
 #[test]
 fn a_stage_state_refusal_is_passing_and_a_verdict_is_not() {
     let (s, root) = temp_staging();
@@ -1084,6 +1117,8 @@ fn a_stage_state_refusal_is_passing_and_a_verdict_is_not() {
 }
 
 /// The floor check a worker runs alone, when a fresh cached pass let it skip the full
+/// pre-verification, gives the full check's refusal off the same file, and is silent
+/// at or above the floor and with no floor written.
 #[test]
 fn the_floor_check_alone_refuses_only_below_the_floor() {
     let (s, root) = temp_staging();
@@ -1104,6 +1139,7 @@ fn the_floor_check_alone_refuses_only_below_the_floor() {
 }
 
 /// A check of the installed bundle that did not finish is not a person's to
+/// clear.
 #[test]
 fn a_timeout_verifying_the_installed_bundle_is_not_a_person_refusal() {
     let root = std::env::temp_dir().join(format!(
@@ -1146,6 +1182,10 @@ fn a_timeout_verifying_the_installed_bundle_is_not_a_person_refusal() {
 }
 
 /// A CODESIGN RUN THAT ENDED WITHOUT A VERDICT IS NOT ONE,
+/// driven through the REAL reader and the real `codesign`: an installed bundle
+/// whose main executable codesign cannot read just then exits 1 with "<bundle>:
+/// Permission denied" — a fact about this machine (`CodesignError::judged_nothing_at`), never
+/// the installed-source refusal that tells a person to reinstall a healthy app.
 #[test]
 fn a_codesign_run_without_a_verdict_on_the_installed_bundle_is_not_a_person_refusal() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1184,6 +1224,10 @@ fn a_codesign_run_without_a_verdict_on_the_installed_bundle_is_not_a_person_refu
 }
 
 /// A bundle modified after signing is a verdict, through the real reader and
+/// `codesign`: only a run that knowably judged nothing is passing, so the seal's words
+/// ("a sealed resource is missing or invalid", "invalid Info.plist", "unsealed contents
+/// present in the bundle root") are a verdict on the stage and the installed-source
+/// refusal on the installed bundle.
 #[test]
 fn a_bundle_modified_after_signing_is_a_verdict_not_a_moment() {
     let root = std::env::temp_dir().join(format!(
@@ -1270,6 +1314,8 @@ fn a_bundle_modified_after_signing_is_a_verdict_not_a_moment() {
 }
 
 /// The pre-park check refuses a non-writable install location before the park, naming
+/// the folder and the remedy, as the person's to clear: a read-only install never
+/// costs a park or a structural failure against a healthy build.
 #[test]
 fn a_non_writable_install_location_is_refused_before_the_park_as_a_person_s() {
     use std::os::unix::fs::PermissionsExt;
@@ -1306,6 +1352,7 @@ fn a_non_writable_install_location_is_refused_before_the_park_as_a_person_s() {
 }
 
 /// A write that failed for a moment (a full disk) is a passing refusal on every
+/// lane that asks, never the person's "move aterm".
 #[test]
 fn a_full_disk_at_the_install_location_is_a_passing_refusal_not_the_person_s() {
     let app = Path::new("/Applications/aterm.app");
@@ -1329,6 +1376,7 @@ fn a_full_disk_at_the_install_location_is_a_passing_refusal_not_the_person_s() {
 }
 
 /// The handoff-policy reader for a pre-verification that must refuse: any read is
+/// the failure (no refused bundle's policy is ever read).
 const NEVER_READ: &dyn Fn(&Path) -> aterm_update_core::handoff_policy::PolicyRead = &|path| {
     panic!(
         "a refused candidate's handoff policy was read: {}",
@@ -1337,6 +1385,8 @@ const NEVER_READ: &dyn Fn(&Path) -> aterm_update_core::handoff_policy::PolicyRea
 };
 
 /// A staged `.app` shaped like a release (an `Info.plist` naming `build` and a
+/// handoff policy asking every producer for blank screens) that carries no
+/// signature.
 fn unsigned_bundle_with_a_policy(
     app: &Path,
     build: u64,
@@ -1366,6 +1416,9 @@ fn unsigned_bundle_with_a_policy(
 }
 
 /// A handoff policy in an unverified bundle is never read, since its authority is the
+/// signature that seals it with the successor's code: an unsigned stage whose marker,
+/// plist and policy look right fails its codesign policy before the reader runs, both
+/// as a staged download and as an installed bundle an activation would exec.
 #[test]
 fn a_handoff_policy_in_an_unverified_bundle_is_never_read() {
     let (s, root) = temp_staging();
@@ -1416,6 +1469,8 @@ fn a_handoff_policy_in_an_unverified_bundle_is_never_read() {
 }
 
 /// The pre-verification is timed as a whole: entering one holds the apply lock and
+/// opens a budget no longer than `APPLY_BUDGET`, both released on drop, so
+/// [`crate::HANDOFF_PREVERIFY_BOUND`] (their sum, the fork lane's ceiling) is a bound.
 #[test]
 fn a_pre_verification_holds_the_lock_and_runs_under_the_verification_budget() {
     let (s, root) = temp_staging();
@@ -1555,7 +1610,7 @@ fn expected_handoff_authority_is_exact_build_commit_and_digest() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A QUARANTINE RECORD THAT COULD NOT BE READ ADMITS NOTHING. Build 20 crash-looped
+/// A QUARANTINE RECORD THAT COULD NOT BE READ ADMITS NOTHING.
 #[test]
 fn a_quarantine_record_that_could_not_be_read_admits_no_stage() {
     use std::os::unix::fs::PermissionsExt;
@@ -1658,6 +1713,8 @@ fn a_quarantine_record_that_could_not_be_read_admits_no_stage() {
 }
 
 /// Rollback authority is the receipt of the exact sealed OLD build and commit, and a
+/// restore that cannot rewrite the receipt fails closed: the NEW receipt is cleared
+/// rather than surviving as OLD authority.
 #[test]
 fn inverse_swap_receipt_restore_binds_old_identity_and_fails_closed() {
     let (staging, root) = temp_staging();
@@ -1834,6 +1891,7 @@ fn fixture_identity(path: &Path) -> i64 {
 }
 
 /// Projects the real fixed paths and exact ledgers back onto the derived
+/// transaction variables.
 fn assert_real_disk_projection(
     state: &aterm_spec::interp::State,
     staging: &Staging,
@@ -1883,6 +1941,10 @@ fn swap_root(label: &str) -> PathBuf {
 }
 
 /// A swap's parents take the tier its caller found (aterm-durable's counting seam):
+/// [`install_flush`] answers ordered when `Updates/` and the install root share a
+/// device, so the swap and its inverse order their entries ahead of the receipt and
+/// the deletions that follow, and durable when the install root is another device,
+/// where a barrier would order nothing.
 #[test]
 fn a_swap_on_the_install_device_orders_its_entries_and_another_device_stays_durable() {
     use aterm_durable::{Flush, seam::Recording};
@@ -1915,6 +1977,10 @@ fn a_swap_on_the_install_device_orders_its_entries_and_another_device_stays_dura
 }
 
 /// The boot lane's own transaction takes [`install_flush`]'s tier at every step
+/// (aterm-durable's counting seam), run on this volume and as if the install root were
+/// on another device: the trial's arm ([`prepare_trial`]), the swap and its receipt
+/// ([`swap_in_and_record_receipt`]), and after a failed re-exec the inverse swap and
+/// the receipt OLD had ([`unswap_after_failed_exec`]).
 #[test]
 fn the_boot_lanes_arm_swap_and_unswap_take_the_install_tier() {
     use aterm_durable::{Flush, seam::Recording};
@@ -1981,6 +2047,8 @@ fn the_boot_lanes_arm_swap_and_unswap_take_the_install_tier() {
 }
 
 /// A swap whose receipt could not be written is rolled back with [`install_flush`]'s
+/// tier ([`roll_back_unreceipted_swap`]), on this volume and as if the install root
+/// were on another device.
 #[test]
 fn an_unreceipted_swaps_rollback_takes_the_install_tier() {
     use aterm_durable::{Flush, seam::Recording};
@@ -2010,6 +2078,8 @@ fn an_unreceipted_swaps_rollback_takes_the_install_tier() {
 }
 
 /// The receipt a counted launch binds from `ready.toml` after a cut between the swap
+/// and the receipt ([`prove_current_trial`]) takes [`install_flush`]'s tier, on this
+/// volume and as if the install root were on another device.
 #[test]
 fn a_trials_recovered_receipt_takes_the_install_tier() {
     use aterm_durable::{Flush, seam::Recording};
@@ -2054,6 +2124,8 @@ fn a_trials_recovered_receipt_takes_the_install_tier() {
 }
 
 /// A newer stage superseding an unconfirmed activation puts the running build back
+/// with [`install_flush`]'s tier ([`supersede_activation_locked`]), on this volume
+/// and as if the install root were on another device.
 #[test]
 fn a_superseded_activations_inverse_swap_takes_the_install_tier() {
     use aterm_durable::{Flush, seam::Recording};
@@ -2146,6 +2218,9 @@ fn same_volume_pre_swap_failure_restores_published_stage() {
 }
 
 /// A swap whose installed receipt cannot be written rolls back, and on a
+/// cross-volume install (the candidate copied to the fixed path, the stage left
+/// intact) the stage comes out exactly as it stood: the published bytes kept and
+/// the redundant fixed copy reclaimed, never both deleted by a failed EXDEV move.
 #[test]
 fn a_failed_receipt_after_a_copied_swap_keeps_the_intact_stage() {
     let (s, root) = temp_staging();
@@ -2236,6 +2311,8 @@ fn unresolved_installed_bundle_cannot_disarm_or_gc_trial() {
 }
 
 /// The two mismatched-sentinel shapes are disjoint, and neither admits a process
+/// not running the installed build: an overlapping process from another build has
+/// no authority to disarm anything.
 #[test]
 fn dead_authority_and_abandoned_preswap_shapes_are_disjoint() {
     assert!(dead_authority_trial(1001, 1001, 1000));
@@ -2286,6 +2363,9 @@ fn write_ready_for(s: &Staging, build: u64, commit: &str) {
 }
 
 /// The disk a failed launched-lane handoff leaves behind, with a newer release staged:
+/// build 11 installed and mid-trial (two counted launches; a structural `ChildDied`
+/// keeps its launch), the running build 10 retained at the fixed rollback path, 11's
+/// receipt and trial marker, and build 12 staged and ready.
 fn superseded_activation_desk() -> (crate::paths::ScratchStaging, PathBuf, PathBuf) {
     let (s, root) = temp_staging();
     let installed = root.join("Applications").join("aterm.app");
@@ -2332,6 +2412,12 @@ fn supersede_desk(
 }
 
 /// A newer stage retires the unconfirmed activation without counting a launch of
+/// it: the running build is back at the install path, the activation's trial is
+/// disarmed at its two counted launches (never a third, which `check_boot_health`
+/// would revert and poison on), nothing is quarantined, the stage is untouched,
+/// and the boot apply's preconditions hold for the next candidate (the installed
+/// bundle is the running build, no trial owns the fixed path, `ready.toml` names
+/// the newer build).
 #[test]
 fn a_newer_stage_supersedes_an_unconfirmed_activation_without_counting_a_launch() {
     let (s, root, installed) = superseded_activation_desk();
@@ -2406,6 +2492,9 @@ fn a_newer_stage_supersedes_an_unconfirmed_activation_without_counting_a_launch(
 }
 
 /// While another window's candidate of the activation runs (the trial's launcher
+/// record knows it is alive), the retire must not disarm the trial and delete the
+/// bundle under a candidate that could still prove and commit: it waits and moves
+/// nothing.
 #[test]
 fn a_supersede_waits_while_another_windows_candidate_of_the_activation_runs() {
     use aterm_uds::spawnfd::Command;
@@ -2463,6 +2552,8 @@ fn a_supersede_waits_while_another_windows_candidate_of_the_activation_runs() {
 }
 
 /// A window's fresh cached pass for an activation another window has since retired
+/// (the running build back at the install path) would launch that older build, whose
+/// boot apply takes a stage this attempt never authorized.
 #[test]
 fn a_cached_activation_pass_refuses_once_the_install_path_holds_another_build() {
     let (s, root, _installed) = superseded_activation_desk();
@@ -2492,6 +2583,9 @@ fn a_cached_activation_pass_refuses_once_the_install_path_holds_another_build() 
 }
 
 /// The crash cut where the exchange happened and the disarm did not (the staging root
+/// refuses the sentinel's removal) is the "crash right after inverse rollback" shape
+/// `recover_abandoned_preswap_trial_if_exact` finishes, its sentinel still at two
+/// launches, and is reported as the retire it was.
 #[test]
 fn a_supersede_that_cannot_disarm_leaves_the_cut_the_next_boot_apply_finishes() {
     use std::os::unix::fs::PermissionsExt;
@@ -2540,6 +2634,9 @@ fn a_supersede_that_cannot_disarm_leaves_the_cut_the_next_boot_apply_finishes() 
 }
 
 /// Nothing moves unless every precondition holds: each way the disk can differ
+/// from the one shape the transaction can undo refuses, leaving the activation
+/// installed, its trial armed at the same count, the predecessor retained, and
+/// the stage in place.
 #[test]
 fn a_supersede_moves_nothing_unless_every_precondition_holds() {
     type Mutation = fn(&Staging, &Path, &Path);
@@ -2692,6 +2789,7 @@ fn a_supersede_moves_nothing_unless_every_precondition_holds() {
 }
 
 /// An out-of-band install (install.sh, a DMG drag) during an armed trial leaves a
+/// sentinel for a build no longer installed.
 #[test]
 fn a_trial_armed_below_the_running_build_is_retired_not_kept_forever() {
     let (s, root) = temp_staging();
@@ -2728,7 +2826,7 @@ fn a_trial_armed_below_the_running_build_is_retired_not_kept_forever() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A trial belongs to the install it swapped. A same-build process launched from
+/// A trial belongs to the install it swapped.
 #[test]
 fn a_trial_is_owned_by_the_install_it_swapped_and_no_sibling_bundle() {
     let (s, root) = temp_staging();
@@ -2758,6 +2856,8 @@ fn a_trial_is_owned_by_the_install_it_swapped_and_no_sibling_bundle() {
 }
 
 /// The unrecoverable mismatched-sentinel shapes get a budgeted escape counted in
+/// a separate file: incrementing the boot sentinel from another build's launches
+/// could revert a build that never crashed.
 #[test]
 fn an_unrecoverable_foreign_trial_is_disarmed_on_a_budget_not_on_sight() {
     let (s, root) = temp_staging();
@@ -2797,6 +2897,8 @@ fn an_unrecoverable_foreign_trial_is_disarmed_on_a_budget_not_on_sight() {
 }
 
 /// A trial owned by another install that still exists is not disarmed by a
+/// sibling's exhausted budget unless that owner has been idle for a day; an owner
+/// that is gone cedes at the budget.
 #[test]
 fn a_present_owners_trial_survives_a_siblings_budget_until_the_owner_is_long_idle() {
     let (s, root) = temp_staging();
@@ -2827,7 +2929,7 @@ fn a_present_owners_trial_survives_a_siblings_budget_until_the_owner_is_long_idl
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A live trial belonging to another installation is never disarmed. The staging
+/// A live trial belonging to another installation is never disarmed.
 #[test]
 fn a_foreign_trial_whose_owner_is_still_launching_is_never_disarmed() {
     let (s, root) = temp_staging();
@@ -2859,6 +2961,7 @@ fn a_foreign_trial_whose_owner_is_still_launching_is_never_disarmed() {
 }
 
 /// A new armed build restarts the budget: launches counted against a replaced
+/// trial must not carry over and disarm the new one early.
 #[test]
 fn the_foreign_trial_budget_does_not_accumulate_across_trials() {
     let (s, root) = temp_staging();
@@ -2877,6 +2980,8 @@ fn the_foreign_trial_budget_does_not_accumulate_across_trials() {
 }
 
 /// Only a refusal is recorded as one: the every-launch outcomes would rewrite
+/// `status.toml` on every boot, and a re-exec failure belongs in the failure
+/// ledger (`record_apply_failure` clears refusals, never the reverse).
 #[test]
 fn only_a_deferred_boot_apply_is_recorded_as_a_refusal() {
     let deferred = ApplyOutcome::Deferred("trial 1000 unconfirmed".to_string());
@@ -2919,6 +3024,10 @@ fn active_trial_digest_rejects_same_build_commit_receipt_with_other_artifact() {
 }
 
 /// Tier-1 conformance for the native update disk machine: drives the real
+/// fixed-path exchange, inverse rollback, sentinel, exact receipt, startup
+/// authority reducer, health cleanup and the settle without revert of a trial
+/// whose predecessor the running verifier refuses, projecting each observation
+/// onto the model Tier-0 proves and bug-mutates.
 #[test]
 fn native_update_disk_transaction_model_conforms_to_real_swap_recovery_and_health_guards() {
     let model = aterm_models_misc::native_update_disk_transaction_model();
@@ -3431,6 +3540,7 @@ fn native_update_disk_transaction_model_conforms_to_real_swap_recovery_and_healt
 }
 
 /// One central directory file header for `name`, declaring `uncompressed`
+/// bytes and carrying `extra` as its extra field.
 fn central_header(name: &str, uncompressed: u32, extra: &[u8]) -> Vec<u8> {
     let mut header = Vec::new();
     header.extend_from_slice(&CENTRAL_HEADER_SIGNATURE.to_le_bytes());
@@ -3459,6 +3569,7 @@ fn central_header(name: &str, uncompressed: u32, extra: &[u8]) -> Vec<u8> {
 }
 
 /// An End Of Central Directory record with the given (already-encoded)
+/// fields, so a test can declare a sentinel or a deliberate mismatch.
 fn eocd(entries: u16, size: u32, offset: u32, comment: &[u8]) -> Vec<u8> {
     let mut record = Vec::new();
     record.extend_from_slice(&EOCD_SIGNATURE.to_le_bytes());
@@ -3474,6 +3585,7 @@ fn eocd(entries: u16, size: u32, offset: u32, comment: &[u8]) -> Vec<u8> {
 }
 
 /// A stand-in for the local-file-header area, so the directory offset under
+/// test is never the degenerate zero.
 const ZIP_PREFIX: &[u8] = b"PK\x03\x04stub!!";
 
 /// Write `bytes` to a fresh temp path and hand back a guard that removes it.
@@ -3511,6 +3623,11 @@ fn well_formed_zip(entries: &[(&str, u32)]) -> Vec<u8> {
 }
 
 /// What the claim admits, read exactly — entry count and summed uncompressed bytes:
+/// a directory `ditto -c -k` could plausibly have written; one behind an archive
+/// comment (the scan minds the variable-length tail rather than assume the record
+/// sits at EOF - 22); and a container with the toolchain seed sealed into the
+/// signed `.app`, far past 1 GiB but inside the one bound the cutter validates every
+/// published asset against, which the extract cap must never sit below.
 #[test]
 fn zip_claim_reads_every_directory_a_publisher_could_write() {
     assert_eq!(
@@ -3561,7 +3678,7 @@ fn zip_claim_reads_every_directory_a_publisher_could_write() {
     }
 }
 
-/// What the claim refuses, each for its own reason. These build central directories
+/// What the claim refuses, each for its own reason.
 #[test]
 fn zip_claim_refuses_every_directory_it_cannot_bound() {
     let over = usize::try_from(MAX_EXTRACT_ENTRIES).unwrap() + 1;
@@ -3672,6 +3789,8 @@ fn zip_claim_refuses_every_directory_it_cannot_bound() {
 }
 
 /// This machine's free space is checked before `ditto` is spawned: a declared
+/// size the volume cannot hold is refused; a size it holds passes; a volume that will not report passes too
+/// (`ditto` decides, with its stderr kept).
 #[test]
 fn the_stage_refuses_an_unpack_the_volume_cannot_hold() {
     let (_s, root) = temp_staging();
@@ -3689,6 +3808,7 @@ fn the_stage_refuses_an_unpack_the_volume_cannot_hold() {
 }
 
 /// `tree_bytes` is what the DMG lane's copy will write: regular files summed,
+/// directories and symlinks counted as nothing and not followed.
 #[test]
 fn tree_bytes_sums_regular_files_and_never_follows_links() {
     let (_s, root) = temp_staging();
@@ -3704,6 +3824,9 @@ fn tree_bytes_sums_regular_files_and_never_follows_links() {
 }
 
 /// Both lanes sweep both kinds of scratch: a `mnt-<pid>` a DMG stage left behind
+/// (possibly with its image still attached) is reclaimed by the zip lane too, and
+/// the sweep runs before the unpack, so a zip `ditto` cannot open still reclaims
+/// the leftover.
 #[test]
 fn the_zip_lane_reclaims_a_dmg_era_mountpoint() {
     let (s, root) = temp_staging();
@@ -3744,6 +3867,8 @@ fn the_zip_lane_reclaims_a_dmg_era_mountpoint() {
 }
 
 /// A window's settled trial keeps its predecessor at the fixed path for that window:
+/// macOS judges the window by the bundle at the path its first consent check saw (design
+/// §2.2).
 #[test]
 fn a_kept_predecessor_is_released_only_after_its_window_and_outside_a_trial() {
     let (staging, root) = temp_staging();
@@ -3820,6 +3945,7 @@ fn a_kept_predecessor_is_released_only_after_its_window_and_outside_a_trial() {
 }
 
 /// [`process_uses`] reads the live process list: this test's own executable is under its
+/// directory, and nothing uses a directory just made.
 #[test]
 fn process_uses_sees_a_running_executable_and_not_an_unused_directory() {
     let exe = std::env::current_exe().unwrap();
@@ -3832,6 +3958,7 @@ fn process_uses_sees_a_running_executable_and_not_an_unused_directory() {
 }
 
 /// A path scan is clear only when it found no user and no unreadable process that may
+/// run from the bundle.
 #[test]
 fn a_kept_bundle_is_not_unused_when_a_process_that_may_run_from_it_could_not_be_read() {
     let dir = Path::new("/Applications/aterm.app.rollback");
@@ -3887,6 +4014,7 @@ fn a_kept_bundle_is_not_unused_when_a_process_that_may_run_from_it_could_not_be_
 }
 
 /// The kept record names the very bundle whose window confirmed: path display text is
+/// not an address codec.
 #[test]
 fn a_kept_predecessors_record_preserves_its_exact_path_and_refuses_extra_input() {
     use std::os::unix::ffi::OsStringExt;
@@ -3966,6 +4094,7 @@ fn a_kept_predecessors_record_preserves_its_exact_path_and_refuses_extra_input()
 }
 
 /// An unreadable holder is not an ended one: its successor image is outside the kept
+/// rollback, so the path scan cannot make up the missing birth evidence.
 #[test]
 fn a_kept_predecessor_outlives_an_unreadable_holder() {
     use aterm_uds::holders::Exe;
@@ -4018,6 +4147,7 @@ fn a_kept_predecessor_outlives_an_unreadable_holder() {
 }
 
 /// ONE CHECK OF BOTH BUNDLES, BEFORE ANYTHING MOVES (steps 6–7,
+/// [`verify_stage_and_prepare`]).
 #[test]
 fn both_bundles_are_checked_at_once_before_anything_moves() {
     type Identity = Result<(u64, String), String>;
@@ -4226,6 +4356,7 @@ fn the_old_bundle_recheck_follows_the_operation_that_prepared_new() {
 }
 
 /// A WINDOW LAUNCH LEAVES THE STAGE FOR ITS WINDOW, AND EXECS ONLY TO REVERT OR ESCAPE
+/// (Tier-1 of `NativeUpdateBootImage`, 2026-10-19).
 #[test]
 fn a_window_launch_leaves_the_stage_for_its_window_and_execs_only_to_revert_or_escape() {
     use crate::ImageReplacement::{LaunchedSuccessor, Replaceable, WindowKeepsImage};
@@ -4541,6 +4672,8 @@ fn a_window_launch_leaves_the_stage_for_its_window_and_execs_only_to_revert_or_e
 }
 
 /// Which start-probe failures leave the candidate unproven: a probe killed at its
+/// ceiling (the helper timeout or the apply budget) and a wait that failed started it
+/// and never saw it exit.
 #[test]
 fn only_a_probe_that_lost_a_started_candidate_leaves_it_unproven() {
     let what = "candidate --version probe";
@@ -4700,6 +4833,7 @@ fn a_start_probe_killed_before_its_candidate_exited_leaves_it_where_it_ran() {
 }
 
 /// Across volumes the candidate is a copy at the fixed path beside an intact stage: an
+/// unproven one stays there with the stage and its marker, recorded.
 #[test]
 fn an_unproven_copied_candidate_stays_beside_its_stage() {
     let (s, root) = temp_staging();

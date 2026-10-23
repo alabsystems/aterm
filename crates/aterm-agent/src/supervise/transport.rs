@@ -1,23 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The supervisor's persistent transport: [`RelayCtl`], the [`Ctl`] seam over
-//! persistent control connections (a [`RelayClient`] on each). The other
-//! [`Ctl`] is the `aterm-ctl`-per-request [`crate::CtlClient`].
-//!
-//! A held socket avoids forking the `aterm` binary per request, and an in-GUI
-//! host has no binary to fork. [`RelayCtl`] renders every reply as `aterm-ctl`
-//! prints it (the framing table
-//! [`aterm_types::control_verbs::framing_of`], `ERR …` on stderr at exit 1,
-//! timeouts at exit 124, counted rows on stdout), so every judgment in the
-//! loop ([`CtlReply::lost`], `timed_out`, `unknown_form`, `skipped`) reads the
-//! same either way.
-//!
-//! A lost connection is reported in `aterm-ctl`'s own words, so the loop rides
-//! it out the same way, and the next request dials again, re-resolving the
-//! socket when none was named (following the `latest` alias after a
-//! self-update's handoff) and re-reading a session's graph entry (following
-//! its host's successor).
+//! The supervisor's persistent transport: [`RelayCtl`], the [`Ctl`] seam over persistent control connections (a [`RelayClient`] on each).
 
 use std::io;
 use std::path::PathBuf;
@@ -38,8 +22,7 @@ const DEFAULT_REPLY_WAIT: Duration = Duration::from_secs(60);
 /// connection is judged hung.
 const AWAIT_MARGIN: Duration = Duration::from_secs(5);
 
-/// Where [`RelayCtl`] sends what no session's host answers: a named socket,
-/// or the one `aterm-ctl` would resolve (re-resolved at every dial).
+/// Where [`RelayCtl`] sends what no session's host answers: a named socket, or the one `aterm-ctl` would resolve (re-resolved at every dial).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Endpoint {
     /// This socket (`--socket`, the host's own).
@@ -48,22 +31,7 @@ pub enum Endpoint {
     Resolved { self_sid: Option<String> },
 }
 
-/// Persistent, authenticated control connections behind the [`Ctl`] seam,
-/// one per instance that answers its requests.
-///
-/// A server that relays a request to the instance hosting its session hands
-/// that instance the rest of the connection. One connection that carried a
-/// relayed request carried every later one there too: a request naming
-/// another session went on through a chain of relays, and one naming none
-/// (`who`, `inbox`) was answered by the far instance. So a connection carries
-/// only requests one instance answers:
-///
-/// * a request naming a session ([`aterm_ctl::target_sid`]) goes to the
-///   instance that session's graph entry names ([`aterm_ctl::hosting_sock`]),
-///   which answers it itself. When no entry names one, or nothing listens
-///   there, it goes to the [`Endpoint`] on a connection of that session's
-///   own, since the endpoint may relay it;
-/// * every other request goes to the endpoint, which answers it itself.
+/// Persistent, authenticated control connections behind the [`Ctl`] seam, one per instance that answers its requests.
 pub struct RelayCtl {
     endpoint: Endpoint,
     /// A token given up front (the host's own) for the endpoint's socket;
@@ -130,9 +98,7 @@ enum Route<'a> {
 
 /// Why a dial gave no connection.
 enum DialError {
-    /// Nothing listens at the socket (`ENOENT`, `ECONNREFUSED`). At a graph
-    /// entry's socket that is a stale entry, not the request's failure: the
-    /// request goes where an unhosted session's does, as `aterm ctl`'s does.
+    /// Nothing listens at the socket (`ENOENT`, `ECONNREFUSED`).
     NoHost(String),
     /// Anything else, the request's failure.
     Failed(String),
@@ -147,8 +113,7 @@ impl DialError {
 }
 
 impl RelayCtl {
-    /// A transport that dials on its first request, reading each session's
-    /// host from the rendezvous dir.
+    /// A transport that dials on its first request, reading each session's host from the rendezvous dir.
     pub fn new(endpoint: Endpoint, token: Option<String>) -> Self {
         Self {
             endpoint,
@@ -163,11 +128,7 @@ impl RelayCtl {
         }
     }
 
-    /// A transport that presents `token` first and, should the listener
-    /// answer `ERR auth` (a seamless update's successor rebound the socket,
-    /// and does not know a token this process held only in memory), the
-    /// token beside the socket from then on: the request is sent again on
-    /// that connection, once — the refused one ran nothing (design §2.5).
+    /// A transport that presents `token` first and, should the listener answer `ERR auth` (a seamless update's successor rebound the socket, and does not know a token this process held only in memory), the token beside the socket from then on: the request is sent again on that connection, once — the refused one ran nothing (design §2.5).
     pub fn preferring(endpoint: Endpoint, token: String) -> Self {
         Self {
             beside_on_refusal: true,
@@ -183,9 +144,7 @@ impl RelayCtl {
         self
     }
 
-    /// Dial the endpoint now rather than at the first request that rides its
-    /// connection, so a socket that cannot be reached is told here.
-    ///
+    /// Dial the endpoint now rather than at the first request that rides its connection, so a socket that cannot be reached is told here.
     /// # Errors
     /// The socket could not be resolved, reached, or its token read.
     pub fn connect(&mut self) -> Result<(), String> {
@@ -281,11 +240,6 @@ impl RelayCtl {
     }
 
     /// The index of the connection `route` rides, dialled when none does.
-    ///
-    /// A session's route is decided once per connection: the connection of
-    /// the instance its graph entry named, else its own connection to the
-    /// endpoint. It is decided again, from the graph entry, only once that
-    /// connection is lost.
     fn conn_for(&mut self, route: Route<'_>) -> Result<usize, String> {
         let (sid, named) = match route {
             Route::Endpoint => return self.endpoint_conn(),
@@ -296,9 +250,6 @@ impl RelayCtl {
         if let Some(at) = self.conns.iter().position(|c| c.carries.hosts(s)) {
             return Ok(at);
         }
-        // A request aimed at the session's host rides its relayed connection
-        // too: the host answers it once the endpoint relayed, and until then
-        // the endpoint does, as on its own connection.
         let relayed = |c: &Conn| matches!(&c.carries, Carries::Relayed(r) if r == s);
         if let Some(at) = self.conns.iter().position(relayed) {
             return Ok(at);
@@ -371,13 +322,9 @@ impl RelayCtl {
             Ok(at) => at,
             Err(e) => return Ok(client_failure(&e)),
         };
-        // A cut that came before the connection's handle was registered hung
-        // up none of it.
         if self.cut.load(Ordering::SeqCst) {
             return Err("the supervisor was stopped".to_string());
         }
-        // Whether this connection authenticated with the token given up front
-        // ([`Self::dial`]): only that token is dropped on a refusal.
         let given_token = self.token.is_some() && self.is_endpoint(&self.conns[at].sock);
         let conn = &mut self.conns[at].client;
         let _ = conn.transport().set_read_timeout(Some(wait));
@@ -390,9 +337,6 @@ impl RelayCtl {
         };
         match got {
             Ok((header, _)) if header == "ERR auth" && self.beside_on_refusal && given_token => {
-                // The token given up front was refused: from now on, the
-                // one beside the socket. The listener closes a refused
-                // connection, and ran nothing on it.
                 self.beside_on_refusal = false;
                 self.token = None;
                 self.drop_conn(at);
@@ -465,9 +409,7 @@ fn lossy(body: Vec<u8>) -> String {
     String::from_utf8(body).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
-/// A reply rendered as `aterm-ctl` renders it: `header` the status line, `body` the counted rows
-/// (`Lines`) or raw bytes (`Bytes`). The supervisor's tests build their scripted replies through
-/// it, so a reply shape no transport produces cannot pass for one.
+/// A reply rendered as `aterm-ctl` renders it: `header` the status line, `body` the counted rows (`Lines`) or raw bytes (`Bytes`).
 pub(super) fn render(
     verb: &str,
     framing: Framing,
@@ -532,8 +474,6 @@ impl Ctl for RelayCtl {
         let shut = Arc::clone(&self.shut);
         Some(Box::new(move || {
             cut.store(true, Ordering::SeqCst);
-            // Each half on its own ([`aterm_uds::hangup::hang_up`]): Darwin refuses a both-ways
-            // `shutdown` of a socket whose server half-closed toward us, shutting nothing.
             for (_, s) in shut.lock().unwrap_or_else(PoisonError::into_inner).iter() {
                 aterm_uds::hangup::hang_up(s);
             }
@@ -602,8 +542,7 @@ mod tests {
     /// (`ERR auth`: an update's successor rebound the socket and never knew
     /// a token held only in memory) is dropped for the one beside the socket,
     /// and the request goes out again on that connection, once; every later
-    /// request uses it. NEGATIVE CONTROL: a transport built with `new` keeps
-    /// the refusal.
+    /// request uses it.
     #[test]
     fn a_refused_preferred_token_falls_back_to_the_one_beside_the_socket() {
         let dir = crate::supervise::test_scratch_path("relayctl", "prefer");
@@ -649,7 +588,6 @@ mod tests {
         );
         let second = c.call(&["@s-1", "send", "y"]).expect("send");
         assert_eq!(second.code, 0, "{second:?}");
-        // Closed, so the scratch server takes the next connection.
         drop(c);
         let mut plain = RelayCtl::new(Endpoint::Socket(path), Some("memory-tok".to_string()));
         let refused = plain.call(&["@s-1", "send", "z"]).expect("send");
@@ -722,8 +660,6 @@ mod tests {
         );
         let meta = c.call(&["@s-1", "meta"]).expect("meta");
         assert_eq!(meta.stdout, "OK title=- attention=-\n");
-        // `search`'s ` incomplete` marker: the hits on stdout, `aterm-ctl`'s
-        // note for it on stderr, then the header (the report reads both).
         let search = c.call(&["@s-1", "search", "^›", "regex"]).expect("search");
         assert_eq!(
             (search.stdout.as_str(), search.stderr.as_str()),
@@ -779,7 +715,6 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("dir");
         let sock = dir.join("a.sock");
         let listener = UnixListener::bind(&sock).expect("bind");
-        // Accept and never answer.
         let h = std::thread::spawn(move || listener.accept().map(|(s, _)| s));
         let mut c = RelayCtl::new(
             Endpoint::Socket(sock.to_string_lossy().into_owned()),
@@ -791,7 +726,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
             cut();
         });
-        // The await asks for five minutes; the bound is a one-minute hang detector.
         let started = std::time::Instant::now();
         let r = c.call(&["await", "inbox", "since=0", "timeout", "300000"]);
         assert!(r.is_err(), "{r:?}");
@@ -809,8 +743,7 @@ mod tests {
     }
 
     /// The cut hangs up a connection its server half-closed (a relay passes its child's EOF on
-    /// so) while the transport still holds it: the server reads its end-of-file at the cut. A
-    /// both-ways `shutdown` fails here on Darwin (`ENOTCONN`) and shuts nothing.
+    /// so) while the transport still holds it: the server reads its end-of-file at the cut.
     #[test]
     fn the_interrupter_hangs_up_a_connection_its_server_half_closed() {
         use std::io::Read as _;
@@ -973,13 +906,6 @@ mod tests {
     /// instance's one connection, authenticated with the token beside its
     /// socket (the given token is the endpoint's alone), and so does a request
     /// aimed at the session's host ([`Ctl::call_at_host_of`]).
-    ///
-    /// NEGATIVE CONTROL: a request naming no session goes to the endpoint on
-    /// the endpoint's connection, also after the session's requests. The
-    /// endpoint here relays the session as a server does, handing the host the
-    /// rest of a connection that carried it: one endpoint connection for every
-    /// request (run by hand) has the session answered through that relay
-    /// (`OK s-ab-host`), and every request after it too.
     #[test]
     fn a_worker_on_another_instance_gets_its_own_connection() {
         let dir = crate::supervise::ScratchDir::new("relayctl", "hosts");
@@ -1022,12 +948,6 @@ mod tests {
     /// A SESSION NO HOST ANSWERS FOR RIDES A CONNECTION OF ITS OWN to the
     /// endpoint, which may relay it: a graph entry naming a socket nothing
     /// listens on (a crashed host), one naming a removed socket, and no entry.
-    /// A session's requests share its connection, and a request aimed at its
-    /// host rides it too, reaching the host the endpoint relayed to.
-    ///
-    /// NEGATIVE CONTROL: the endpoint's own connection answers for the
-    /// endpoint after the endpoint relayed `s-cd`. Sending that session's
-    /// requests on it (run by hand) answers that `meta` `OK s-cd-host`.
     #[test]
     fn a_session_no_host_answers_for_rides_a_connection_of_its_own() {
         let dir = crate::supervise::ScratchDir::new("relayctl", "nohost");
@@ -1069,11 +989,7 @@ mod tests {
     /// A HOST THAT HANGS UP IS FOUND AGAIN BY ITS GRAPH ENTRY: the request it
     /// dropped is lost, in `aterm-ctl`'s words, and the next one reads the
     /// entry again and reaches the successor it names now (a self-update's),
-    /// with that successor's token. Nothing reaches the endpoint.
-    ///
-    /// NEGATIVE CONTROL: the old host still accepts, so a transport that
-    /// dialled the socket it routed to before instead of reading the entry
-    /// again is answered `OK old`.
+    /// with that successor's token.
     #[test]
     fn a_host_that_hangs_up_is_found_again_by_its_graph_entry() {
         let dir = crate::supervise::ScratchDir::new("relayctl", "successor");
@@ -1107,10 +1023,6 @@ mod tests {
     /// THE CUT HANGS UP EVERY CONNECTION the transport holds, the endpoint's
     /// and each host's, while it still holds them, and every request after it
     /// fails, whichever connection it would ride.
-    ///
-    /// NEGATIVE CONTROL (run by hand): hanging up only the connection dialled
-    /// last, the one handle the transport kept before, leaves the endpoint's
-    /// connection open and its end is never read.
     #[test]
     fn the_interrupter_hangs_up_every_connection() {
         let dir = crate::supervise::ScratchDir::new("relayctl", "cut-all");
@@ -1132,7 +1044,6 @@ mod tests {
         assert_eq!(stdout(c.call(&["@s-ab", "meta"])), "OK host\n");
         let cut = c.interrupter().expect("interrupter");
         cut();
-        // Each must end; the bound is a minute's hang detector (AGENTS.md).
         for (name, at) in [("endpoint", &endpoint), ("host", &host)] {
             at.ended
                 .recv_timeout(aterm_spec::wait::MUST_HAPPEN)

@@ -1,31 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE PROGRAM CHECK WATCH: whether macOS's program check (`syspolicyd`)
-//! still answers, read once a minute and judged by
-//! [`aterm_vitals::program_check`].
-//!
-//! A stuck check stands for good: no new program starts on the Mac, and the
-//! window server can die at a privacy check, logging the owner out
-//! (2026-10-20, after 4.5 days stuck). Only the owner can end it, by
-//! restarting the Mac, so it is the one alert of its kind on the glass
-//! ([`crate::message_reporters::program_check_stuck`]); each tab's `status`
-//! carries the board's state ([`status_fields`]), and the harness types no
-//! continuation while it stands ([`stuck`]).
-//!
-//! The reads run on a thread of their own, one at a time ([`start`]), never
-//! on a pass of the harness host: in a wedge another reader on that pass can
-//! hang for good (reading the arguments of a program held mid-start, M29 of
-//! the leftover-processes design), and the watch must still read. Every
-//! macOS instance starts it, a headless one too: its harness supervises
-//! agents by default (`[harness] headless`), and the hold is theirs. A live
-//! instance a test boots starts one too, at the same cadence ([`every`]); no
-//! unit test does.
-//!
-//! A development build's `program-check full` holds each look's reading at
-//! the kernel's limit ([`cmd`]), so the whole path — the five-minute judge,
-//! the alert, the harness's hold, `status` — runs on a real window without a
-//! wedged Mac; `program-check live` reads the pool as it is again.
+//! Background watcher for macOS `syspolicyd` worker pool saturation.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -62,9 +38,7 @@ impl Board {
     }
 }
 
-/// The process's board: the watch writes it ([`start`]), `status` reads
-/// it ([`status_fields`]), and the harness host reads it through
-/// `Acts::program_check` ([`stuck`]).
+/// Process-wide `syspolicyd` check board.
 pub(crate) static BOARD: Mutex<Board> = Mutex::new(Board::new());
 
 /// Whether this build stands a full reading in ([`cmd`]): a development
@@ -88,13 +62,7 @@ fn now_ms() -> u64 {
     u64::try_from(EPOCH.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Fold the look taken at `at_ms` into `board`; the note the window is owed,
-/// if any: [`HostNote::ProgramCheckStuck`] at every look while the check is
-/// stuck, with the figures of the look it turned stuck at (a repeat post is
-/// the window's duplicate until the owner's word on the row lapses), and
-/// [`HostNote::ProgramCheckUnstuck`] at the first answering reading and
-/// whenever it stops being stuck (it answers, its daemon is gone, or a new
-/// one is judged afresh), so the alert stands exactly while [`stuck`] does.
+/// Folds `look` at `at_ms` into `board` and returns any [`HostNote`] owed to the window.
 pub(crate) fn step(board: &mut Board, at_ms: u64, look: Look) -> Option<HostNote> {
     let was_stuck = matches!(board.judge.state(), State::Stuck { .. });
     let now = match look {
@@ -179,12 +147,7 @@ fn parse(rest: &str, injection: bool, watching: bool) -> Result<Option<bool>, &'
     Ok(Some(full))
 }
 
-/// `program-check [full|live]` (control socket): `OK reading=<live|full>`
-/// and the board as `status` words it ([`status_fields`]). In a development
-/// build `full` holds each later look's reading at the kernel's limit
-/// ([`stood_in`]) and `live` reads the pool as it is again; the next look
-/// takes either up, and the judge, the alert and the hold follow as they do
-/// for a real wedge.
+/// Handles the `program-check [full|live]` control verb.
 pub(crate) fn cmd(rest: &str) -> String {
     match parse(rest, STAND_IN_ENABLED, WATCHING.load(Ordering::SeqCst)) {
         Ok(Some(full)) => FULL_STAND_IN.store(full, Ordering::SeqCst),
@@ -199,9 +162,7 @@ pub(crate) fn cmd(rest: &str) -> String {
     format!("OK reading={reading} {}\n", status_fields())
 }
 
-/// Whether `board` reads the check stuck: the harness then types no
-/// continuation ([`crate::harness_host`]'s `withholds_turn_end`), since every
-/// program an agent starts would never start.
+/// Returns whether `board` currently judges `syspolicyd` stuck.
 pub(crate) fn stuck(board: &Mutex<Board>) -> bool {
     matches!(
         board
@@ -213,10 +174,7 @@ pub(crate) fn stuck(board: &Mutex<Board>) -> bool {
     )
 }
 
-/// `status`'s program check fields: `syspolicyd=<-|ok|full|stuck>
-/// syspolicyd_workers=<n>/<limit|-> syspolicyd_full_ms=<ms>`, `-` each where
-/// unknown (not read yet, not macOS), and the limit's `-`
-/// where the kernel names none. From the board under its leaf lock; no I/O.
+/// Formats the `syspolicyd=*` fields for `status`.
 pub(crate) fn status_fields() -> String {
     let b = BOARD.lock().unwrap_or_else(PoisonError::into_inner);
     let state = b.judge.state();
@@ -249,10 +207,7 @@ fn every() -> std::time::Duration {
     crate::harness_host::DISK_TICK
 }
 
-/// Start the watch: on macOS, windowed or headless, a thread of its own reads
-/// `syspolicyd` once a minute, from a minute after the start, for the life of
-/// the process, each note it owes handed to `note`; nothing off macOS. A read
-/// that panics is said and the next is taken at its time.
+/// Starts the background `syspolicyd` watcher thread on macOS.
 pub(crate) fn start(note: Arc<dyn Fn(HostNote) + Send + Sync>) {
     if !cfg!(target_os = "macos") {
         return;
@@ -357,7 +312,6 @@ mod tests {
                 "unstuck", "-", "-", "stuck", "stuck", "stuck", "unstuck", "-"
             ]
         );
-        // Each look while it stands tells the edge's figures again.
         for told in &notes[3..6] {
             assert_eq!(
                 *told,
@@ -367,8 +321,6 @@ mod tests {
                 })
             );
         }
-        // Negative control: a pool that drains before the bound tells
-        // nothing past the first answer.
         assert_eq!(
             words(&[
                 (0, reading(95, true)),

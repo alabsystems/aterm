@@ -139,6 +139,8 @@ pub(crate) const ROSTER_FRESHNESS_SECS: u64 = 24 * 60 * 60;
 pub(crate) const ROSTER_RECONFIRM_AFTER_SECS: u64 = 60 * 60;
 
 /// How far ahead of this Mac's clock a confirmation may sit and still count: a clock
+/// stepped back by more (an NTP correction, a hand-set date) leaves the age
+/// unknowable, which reads as stale — the next check stamps it again.
 const ROSTER_CONFIRMATION_SKEW_SECS: u64 = 60;
 
 /// The words every stale-confirmation refusal carries.
@@ -247,7 +249,7 @@ impl Ready {
     }
 }
 
-/// Bind the required XML Info.plist. `None` means the cheap binding is
+/// Bind the required XML Info.plist.
 fn cheap_staged_identity_matches(ready: &Ready, app: &Path) -> Option<bool> {
     let plist = app.join("Contents/Info.plist");
     let metadata = match std::fs::symlink_metadata(&plist) {
@@ -401,6 +403,9 @@ pub struct FloorObservation<'a> {
 }
 
 /// The refusal of a gate that could not get through one of the update records it
+/// judges by (`error`: the floor, the quarantine ledger or `failed.toml` this read could
+/// not open or read just then): passing ([`crate::PASSING_REFUSAL_KEY`]), never the
+/// permissive default the record's display read falls back to.
 fn records_unreadable(error: String) -> String {
     crate::verify::mark_passing(format!(
         "aterm can't read its update records ({error}), so no update installs until it \
@@ -418,6 +423,9 @@ impl Floor {
     }
 
     /// [`Self::read`] for the writer, which replaces what it reads: a present floor this
+    /// read could not get through (`EMFILE`, `EIO`, a mode this uid cannot open) is an
+    /// error, never the all-zero default, which would write `roster_seq`, `min_build` and
+    /// the revocation set away on a moment's failure.
     fn read_for_replace(path: &Path) -> Result<Self, String> {
         let text = crate::read_ledger_text_checked(path)
             .map_err(|error| format!("read {}: {error}", path.display()))?;
@@ -455,6 +463,7 @@ impl Floor {
     }
 
     /// This floor with its sources made to explain its numbers, in the one form it is
+    /// written in ([`FloorSources::step`] with nothing observed).
     fn canonical(mut self) -> Self {
         (self.min_build, self.min_build_sources) =
             self.min_build_sources.step(self.min_build, &[], 0, None);
@@ -493,6 +502,7 @@ impl Floor {
     }
 
     /// [`Self::bump_and_write`] that returns the failure instead of warning, so a test can
+    /// pin both halves of a failed commit: the error is reported and the temp file is gone.
     #[cfg(test)]
     fn bump_and_write_reporting(
         path: &Path,
@@ -525,6 +535,8 @@ impl Floor {
     }
 
     /// The floor `cur` becomes after `observation` — pure, so the rule is testable
+    /// without a file: record the revocations, retract what their machines raised,
+    /// then raise by the observation unless its machine is revoked.
     fn after(cur: Self, observation: &FloorObservation<'_>) -> Self {
         let mut next = cur;
         for id in observation.revoked {
@@ -604,6 +616,9 @@ impl FailedMark {
     }
 
     /// [`Self::read`] for a writer that replaces or removes what it reads: a present memo
+    /// this read could not get through (`EMFILE`, `EIO`, a mode this uid cannot open) is
+    /// an error, never "no memo", since this file may hold the only record of a
+    /// quarantine.
     fn read_for_replace(path: &Path) -> Result<Option<Self>, String> {
         let text = crate::read_ledger_text_checked(path)
             .map_err(|error| format!("read {}: {error}", path.display()))?;
@@ -861,6 +876,8 @@ impl Quarantine {
     }
 
     /// [`Self::read`] for [`Self::record`], which replaces what it reads: a present
+    /// ledger this read could not get through is an error, never the empty ledger
+    /// that would write every verdict it holds away (as [`Floor::read_for_replace`]).
     fn read_for_replace(path: &Path) -> Result<Self, String> {
         let text = crate::read_ledger_text_checked(path)
             .map_err(|error| format!("read {}: {error}", path.display()))?;
@@ -948,6 +965,7 @@ pub(crate) fn artifact_quarantined_for_gate(
 }
 
 /// One bounded machine state as both spec tiers exchange it — variable name to
+/// bounded value.
 #[cfg(any(test, debug_assertions))]
 type SpecState = std::collections::BTreeMap<&'static str, i64>;
 
@@ -987,6 +1005,9 @@ mod tests {
     use super::*;
 
     /// Which flush each record write takes (aterm-durable's counting seam): the floor stays
+    /// durable; a receipt, a quarantine and its ledger take the tier their caller found;
+    /// a trial identity is ordered beside an install root on its device and durable with
+    /// none; the timed memo's move of a quarantine into the ledger is ordered.
     #[test]
     fn each_record_write_names_its_flush() {
         use aterm_durable::seam::Recording;
@@ -1030,6 +1051,8 @@ mod tests {
     }
 
     /// A quarantine `failed.toml` alone held (an older build's revert) survives any number
+    /// of moments and stage failures of another artifact, carried into the quarantine
+    /// ledger.
     #[test]
     fn a_timed_memo_never_erases_a_quarantine() {
         let staging = crate::paths::Staging::scratch("timed-keeps-quarantine");
@@ -1057,6 +1080,8 @@ mod tests {
     }
 
     /// A read that fails is not an absent record: with `failed.toml` holding build 7's
+    /// quarantine and the ledger build 9's, a mode this uid cannot open on either file (a
+    /// stand-in for `EMFILE`/`EIO`) makes every writer keep it.
     #[test]
     fn a_record_the_writer_could_not_read_survives() {
         use std::os::unix::fs::PermissionsExt;
@@ -1141,6 +1166,7 @@ mod tests {
     }
 
     /// Repeats of the same artifact widen the backoff and saturate; a different
+    /// artifact resets it.
     #[test]
     fn the_retry_budget_widens_saturates_and_resets_on_a_new_artifact() {
         let root =
@@ -1185,6 +1211,8 @@ mod tests {
     }
 
     /// A quarantine lives in its own field (a zero `retry_after` reads as "already
+    /// elapsed", like a pre-budget marker) and outlives every later stage event: neither
+    /// another build's failure nor a success (which clears the backoff memo) erases it.
     #[test]
     fn a_quarantine_survives_a_later_stage_failure_of_another_build() {
         const NOW: u64 = 1_000_000;
@@ -1249,6 +1277,8 @@ mod tests {
     }
 
     /// The bounded timeline class of a real unix-seconds value relative to the recorded
+    /// deadline, as the `NativeUpdateFailedMarkSuppression` machine's `probe_now`/`deadline`
+    /// classes.
     fn timeline_class(now: u64, deadline: u64) -> i64 {
         if deadline == 0 {
             i64::try_from(now.min(3)).expect("bounded class fits i64")
@@ -1264,6 +1294,8 @@ mod tests {
     }
 
     /// The writer/reader suppression contract pair, exhaustively: each real writer's value,
+    /// probed by the real [`FailedMark::suppresses`] through every bounded input class of
+    /// `NativeUpdateFailedMarkSuppression`, both transitions validated against the machine.
     #[test]
     fn failed_mark_suppression_exhaustively_refines_the_model() {
         use std::collections::BTreeSet;
@@ -1406,6 +1438,7 @@ mod tests {
     }
 
     /// The healthy machine rejects both halves of the writer/reader divergence, and
+    /// `Buggy=1` reproduces them, so the contract is not vacuous.
     #[test]
     fn failed_mark_suppression_model_negative_controls_are_non_vacuous() {
         let model = aterm_models_update::native_update_failed_mark_suppression_model();
@@ -1606,6 +1639,7 @@ mod tests {
     }
 
     /// Lock the published wire shape: the full field set the ship tool emits, including
+    /// the `'''` multiline `changelog` and extra keys, parses and reads back.
     #[test]
     fn parses_full_gen_appcast_shape() {
         let m = Manifest::parse(
@@ -1734,6 +1768,8 @@ changelog = '''
     }
 
     /// A floor this read could not get through publishes nothing: a stage signed by a
+    /// machine the floor revokes is not "verified and ready" while that floor cannot be
+    /// read (mode 000 stands in for `EMFILE`/`EIO`).
     #[test]
     fn an_unreadable_floor_publishes_nothing() {
         use std::os::unix::fs::PermissionsExt;
@@ -1785,6 +1821,7 @@ changelog = '''
     }
 
     /// The live parser (delegating to the shared aterm-update-core validator) refuses a
+    /// `min_build` above its own build.
     #[test]
     fn manifest_rejects_min_build_above_its_own_build() {
         Manifest::parse(
@@ -1831,6 +1868,8 @@ changelog = '''
     }
 
     /// Every mixed-version pairing reads the floor as before: an older build reads this
+    /// build's file as its own, and a number found with no provenance (an older build
+    /// rewrote the file) is unattributed, so no revocation lowers it.
     #[test]
     fn a_floor_without_provenance_is_never_lowered_and_an_old_reader_sees_the_numbers() {
         #[derive(Deserialize)]
@@ -1923,6 +1962,7 @@ changelog = '''
     }
 
     /// A floor that cannot be committed (the rename fails) is reported, naming the lost
+    /// advance, and leaves no temp file behind.
     #[test]
     fn a_floor_that_cannot_be_committed_is_reported_and_leaves_no_temp_file() {
         let root = std::env::temp_dir().join(format!("aterm-floor-commit-{}", std::process::id()));
@@ -1956,6 +1996,7 @@ changelog = '''
     }
 
     /// A floor the write could not read (mode 000 standing in for `EMFILE`/`EIO`) is never
+    /// replaced with defaults: the advance is refused and reported.
     #[test]
     fn a_floor_the_write_could_not_read_is_never_replaced_with_defaults() {
         use std::os::unix::fs::PermissionsExt;
@@ -2032,6 +2073,8 @@ changelog = '''
     }
 
     /// A stage confirmed less than a day ago may be swapped in; one confirmed a day or more
+    /// ago, never, in a shape this module does not write, or ahead of the clock waits, as a
+    /// passing refusal naming when the roster was last read.
     #[test]
     fn a_stage_is_swapped_only_inside_a_day_of_its_roster_confirmation() {
         let now = 1_790_000_000;
@@ -2099,6 +2142,7 @@ changelog = '''
     }
 
     /// The confirmation is one additive key: v0.98.0's marker shape reads a marker that
+    /// carries it, and this build reads v0.98.0's marker as unconfirmed.
     #[test]
     fn the_roster_confirmation_is_one_additive_key_both_ways() {
         #[derive(serde::Deserialize)]

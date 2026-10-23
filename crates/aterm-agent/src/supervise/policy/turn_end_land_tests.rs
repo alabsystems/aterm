@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// LAND'S STRICT READING, measured (`fixtures/land-defense-table.txt`):
-// included into `turn_end_tests.rs`' `land_reading` module, so `super::*`
-// is that module's (the policy's items and the tests' helpers).
-
 /// The rows of `fixtures/land-defense-table.txt`: `(open, defense)`, a
 /// literal `\n` in a row a line break.
 fn land_table() -> Vec<(bool, String)> {
@@ -76,14 +72,8 @@ fn land_reads_the_defense_table_as_labelled() {
 /// of [`LAND_FAMILIES`] taken out, some OPEN defense of the table lands —
 /// so no family is dead weight, and none can be dropped without the table
 /// saying which defense it would let through.
-///
-/// A defense can land without a family only where that family read
-/// something in it, so each family's search reads first the OPEN rows that
-/// spell one of its rows, then every other OPEN row: the same rows, the
-/// likely ones first, and each read is Land's whole reading.
 #[test]
 fn every_land_family_is_load_bearing() {
-    // What landing asks of a row apart from the families, read once a row.
     let open: Vec<(String, String)> = land_table()
         .into_iter()
         .filter(|(open, reply)| {
@@ -172,7 +162,6 @@ fn land_reads_the_needs_table_as_labelled() {
         landed.len(),
         landed.join("\n")
     );
-    // NEGATIVE CONTROLS.
     assert!(rows.iter().any(|(row, reply)| {
         matches!(row, NeedsRow::Need(_))
             && open_work_strict(Some(&needs::defense_body(reply))).is_empty()

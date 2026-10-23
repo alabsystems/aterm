@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The viewport projection: the bounded, source-addressable lines a frame
-//! paints, the line index ([`EditorLines`]) it reads them through, and the
-//! line and display-cell geometry that paint, hit testing and vertical motion
-//! share.
+//! The viewport projection: the bounded, source-addressable lines a frame paints, the line index ([`EditorLines`]) it reads them through, and the line and display-cell geometry that paint, hit testing and vertical motion share.
 
 use std::ops::Range;
 
@@ -25,12 +22,7 @@ pub(super) fn line_end(text: &str, position: usize) -> usize {
         .map_or(text.len(), |relative| position.saturating_add(relative))
 }
 
-/// Where the text of `position`'s line ends: at its `\n`, or before the
-/// `\r` of a CRLF ending. amacs keeps CRLF byte-exact (design §2.2) and
-/// UAX #29 makes `\r\n` one character, so end-of-line motion, column
-/// motion and kill-line stop here and never park a caret between the two,
-/// where a typed character would split the ending. A caret already past
-/// the `\r` (an outside selection) keeps [`line_end`].
+/// Where the text of `position`'s line ends: at its `\n`, or before the `\r` of a CRLF ending. amacs keeps CRLF byte-exact (design §2.2) and UAX #29 makes `\r\n` one character, so end-of-line motion, column motion and kill-line stop here and never park a caret between the two, where a typed character would split the ending.
 pub(super) fn line_text_end(text: &str, position: usize) -> usize {
     let end = line_end(text, position);
     let before = end.saturating_sub(1);
@@ -41,10 +33,7 @@ pub(super) fn line_text_end(text: &str, position: usize) -> usize {
     }
 }
 
-/// The line ending a document's lines use, which a command that breaks a
-/// line puts in: `"\r\n"` when its first line ends in one, else `"\n"`.
-/// amacs keeps a CRLF file's endings byte-exact (design §2.2), so a newline
-/// it adds to one is a CRLF too.
+/// The line ending a document's lines use, which a command that breaks a line puts in: `"\r\n"` when its first line ends in one, else `"\n"`. amacs keeps a CRLF file's endings byte-exact (design §2.2), so a newline it adds to one is a CRLF too.
 pub(super) fn document_line_break(text: &str) -> &'static str {
     match text.find('\n') {
         Some(newline) if text[..newline].ends_with('\r') => "\r\n",
@@ -98,16 +87,7 @@ pub(super) fn byte_of_line(text: &str, line: usize) -> usize {
         .unwrap_or(text.len())
 }
 
-/// Byte offset at which every line of `text` begins: `[0, …]`, exactly one entry
-/// per line, so the length IS the line count. One pass over the document.
-///
-/// A caller that renders the same document revision repeatedly holds one of these
-/// and asks [`EditorLines`] instead of re-deriving the answers from the bytes:
-/// the line count stops costing a full scan, `line_number` becomes a binary
-/// search, and `byte_of_line` becomes an index. Without it a single editor frame
-/// walked the whole document four to six times, so frame time — and typing
-/// latency, since the reducer re-renders — grew linearly with file size all the
-/// way to the 32 MiB document limit.
+/// Byte offset at which every line of `text` begins: `[0, …]`, exactly one entry per line, so the length IS the line count.
 #[cfg(any(test, debug_assertions))]
 pub fn line_starts(text: &str) -> Vec<usize> {
     let mut starts = Vec::with_capacity(1 + text.len() / 40);
@@ -122,26 +102,9 @@ pub fn line_starts(text: &str) -> Vec<usize> {
 }
 
 /// Ceiling on resident line-index entries: 2 Mi × 8 B = **16 MiB**.
-///
-/// The index costs one `usize` PER LINE, and line count is bounded only by the
-/// byte count — so an accepted document (the editor's limit is
-/// `DEFAULT_DOCUMENT_LIMIT`, 32 MiB) that is mostly newlines would demand
-/// ~33.5 M entries, i.e. **~268 MiB resident**, and roughly double that
-/// transiently while a post-edit rebuild exists alongside the `Arc` it replaces.
-/// That is a memory cliff reachable from ordinary valid input, which is not a
-/// trade a rendering speed-up is allowed to make.
-///
-/// 2 Mi entries covers every realistic document: at the 32 MiB limit it admits
-/// anything averaging ≥ 16 bytes per line. Past it [`line_starts_capped`]
-/// declines, and the caller falls back to [`EditorLines::scanning`] — the exact
-/// pre-index behaviour, which answers identically in O(n) time and O(1) memory.
 pub const MAX_LINE_INDEX_ENTRIES: usize = 2 << 20;
 
 /// [`line_starts`], but declines rather than exceed [`MAX_LINE_INDEX_ENTRIES`].
-///
-/// Returns `None` for a document too line-dense to index within the ceiling. The
-/// scan stops at the ceiling, so the peak allocation is bounded even for the
-/// documents it refuses.
 pub fn line_starts_capped(text: &str) -> Option<Vec<usize>> {
     let mut starts = Vec::with_capacity((1 + text.len() / 40).min(MAX_LINE_INDEX_ENTRIES));
     starts.push(0);
@@ -156,21 +119,14 @@ pub fn line_starts_capped(text: &str) -> Option<Vec<usize>> {
     Some(starts)
 }
 
-/// How one editor path answers the three line questions (count, line-of-byte,
-/// byte-of-line) about a document.
-///
-/// The answers are identical either way — this only chooses whether they are
-/// derived by scanning the text or read out of a resident [`line_starts`] index.
-/// Occasional callers (reducer edges that touch a document once) scan; the render
-/// path, which asks all three several times per frame, indexes.
+/// How one editor path answers the three line questions (count, line-of-byte, byte-of-line) about a document.
 pub struct EditorLines<'a> {
     text: &'a str,
     starts: Option<&'a [usize]>,
 }
 
 impl<'a> EditorLines<'a> {
-    /// Derive every answer from the bytes, allocation-free. The historical
-    /// behaviour, kept for one-shot callers.
+    /// Derive every answer from the bytes, allocation-free.
     pub fn scanning(text: &'a str) -> Self {
         Self { text, starts: None }
     }
@@ -187,8 +143,7 @@ impl<'a> EditorLines<'a> {
         self.text
     }
 
-    /// Total line count: trailing text after the last line break still counts as
-    /// a line, and an empty document is one line.
+    /// Total line count: trailing text after the last line break still counts as a line, and an empty document is one line.
     pub fn total(&self) -> usize {
         self.starts.map_or_else(
             || {
@@ -202,8 +157,7 @@ impl<'a> EditorLines<'a> {
         )
     }
 
-    /// The count of line breaks strictly before `position` — i.e. the 0-based
-    /// line `position` falls on.
+    /// The count of line breaks strictly before `position` — i.e. the 0-based line `position` falls on.
     pub fn number_at(&self, position: usize) -> usize {
         self.starts.map_or_else(
             || line_number(self.text, position),
@@ -224,10 +178,7 @@ impl<'a> EditorLines<'a> {
     }
 }
 
-/// A selected byte span within one projected editor line. `bytes` is relative
-/// to [`EditorViewportLine::source`]; `continues` means the selection also owns
-/// the line break (or later text) and therefore paints through one trailing
-/// cell even when the visible line itself is empty.
+/// A selected byte span within one projected editor line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditorSelectionSpan {
     pub bytes: Range<usize>,
@@ -236,9 +187,6 @@ pub struct EditorSelectionSpan {
 }
 
 /// One bounded, source-addressable line prepared for native editor paint.
-/// Keeping source byte ranges beside the display text lets pointer and
-/// accessibility adapters map back to the canonical document without a second
-/// independently wrapped representation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EditorSyntaxClass {
     Table,
@@ -249,18 +197,14 @@ pub enum EditorSyntaxClass {
     Comment,
 }
 
-/// One UTF-8-safe syntax run relative to [`EditorViewportLine::text`]. Language
-/// services prepare these runs before paint; the renderer only lowers the
-/// already-bounded visible projection.
+/// One UTF-8-safe syntax run relative to [`EditorViewportLine::text`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditorSyntaxSpan {
     pub bytes: Range<usize>,
     pub class: EditorSyntaxClass,
 }
 
-/// One UTF-8-safe diagnostic underline relative to the visible line. The
-/// human-readable diagnostic remains in the editor modeline/assist projection;
-/// paint needs only severity and source cells.
+/// One UTF-8-safe diagnostic underline relative to the visible line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditorDiagnosticSpan {
     pub bytes: Range<usize>,
@@ -271,9 +215,7 @@ pub struct EditorDiagnosticSpan {
 pub struct EditorViewportLine {
     pub number: usize,
     pub source: Range<usize>,
-    /// Display column of `source.start` in the unsliced logical line. Paint and
-    /// pointer mapping seed tab stops from this shared phase after horizontal
-    /// caret reveal shifts the source window.
+    /// Display column of `source.start` in the unsliced logical line.
     pub column_start: usize,
     pub text: String,
     pub selections: Vec<EditorSelectionSpan>,
@@ -282,8 +224,7 @@ pub struct EditorViewportLine {
     pub diagnostics: Vec<EditorDiagnosticSpan>,
 }
 
-/// Visible-only editor projection. Large documents never copy or lay out more
-/// than the requested bounded line window.
+/// Visible-only editor projection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditorViewportProjection {
     pub first_line: usize,
@@ -292,11 +233,6 @@ pub struct EditorViewportProjection {
 }
 
 /// Project a stable, line-aligned editor viewport from canonical document bytes.
-///
-/// The returned text and byte coordinates are UTF-8 safe. A trailing newline
-/// produces its real final empty line, and a selection crossing a newline keeps
-/// enough information to paint the selected end-of-line cell. Work is capped so
-/// a corrupt geometry value cannot turn one frame into whole-document layout.
 #[cfg(any(test, debug_assertions))]
 pub fn project_viewport(
     text: &str,
@@ -427,10 +363,6 @@ trust_contract_fn! {
     }
 }
 
-// Specs `projected-column-limit-bounds` and `projected-column-limit-identity`
-// (SPECS.md), kernel-checked against the compiled body. On this target Trust
-// reads a `usize` as a `UInt64`; the proofs are the two case splits the body
-// makes.
 verify_island! {
     clean {
         theorem projected_column_limit_floor_le_cap : Nat.le (UInt64.toNat 4) (UInt64.toNat 4096) := by
@@ -474,12 +406,10 @@ verify_island! {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HorizontalWindowAnchor {
-    /// Exact display-column offset for ordinary lines. Every visible row uses
-    /// the same offset, so vertical movement keeps columns visually aligned.
+    /// Exact display-column offset for ordinary lines.
     Columns(usize),
     /// Bounded fallback for a pathological line whose prefix alone exceeds the
-    /// per-line projection budget. The byte offset remains UTF-8-clamped per row
-    /// and, crucially, keeps the primary caret in the retained source band.
+    /// per-line projection budget.
     ByteOffset {
         line_start: usize,
         window_start: usize,
@@ -487,18 +417,10 @@ enum HorizontalWindowAnchor {
 }
 
 /// Display cells occupied by one complete editor grapheme at `column`.
-///
-/// Tabs retain the editor's canonical four-cell phase. Every other cluster
-/// uses the same Unicode width authority as the terminal, including CJK,
-/// combining sequences, flags, and ZWJ emoji. This function is crate-visible
-/// so native UI hit testing and paint geometry cannot drift from projection.
 pub fn editor_grapheme_columns(grapheme: &str, column: usize) -> usize {
     if grapheme == "\t" {
         4 - column % 4
     } else if grapheme.chars().any(char::is_control) {
-        // The editor suppresses control clusters rather than asking the font
-        // rasterizer to render a terminal-style replacement cell. Geometry
-        // must make the same choice or projection, hit testing, and paint
         // disagree (and a control-only line defeats the visible-cell bound).
         0
     } else {
@@ -507,8 +429,6 @@ pub fn editor_grapheme_columns(grapheme: &str, column: usize) -> usize {
 }
 
 /// Display-cell offset of the complete graphemes ending at or before `byte`.
-/// `column_start` supplies tab phase for a horizontally projected row; the
-/// returned value is relative to that origin.
 pub fn editor_display_column(text: &str, byte: usize, column_start: usize) -> usize {
     let requested = clamp_to_char_boundary(text, byte.min(text.len()));
     let mut column = column_start;
@@ -556,12 +476,6 @@ fn horizontal_window_anchor(
         clamp_to_char_boundary(text, caret.saturating_sub(byte_budget).max(line_start));
     let mut window_start = caret;
     let mut left_columns = 0usize;
-    // The workspace grapheme iterator is forward-only. Materialize at most the
-    // already-bounded 32 KiB fallback window, then walk it backwards. Do not
-    // select the artificial first cluster when the scan begins mid-line: it
-    // may be the suffix of a pathological cluster that started before the
-    // byte budget. If no later boundary exists, showing from the caret is the
-    // bounded fail-safe and never emits a partial grapheme.
     let graphemes = text[search_start..caret]
         .grapheme_indices()
         .collect::<Vec<_>>();
@@ -569,9 +483,6 @@ fn horizontal_window_anchor(
         if relative == 0 && search_start > line_start {
             break;
         }
-        // Reverse traversal cannot recover the absolute phase of an earlier
-        // tab without scanning the unbounded prefix. Four is its conservative
-        // maximum; the exact forward pass begins again at the projected origin.
         let columns = if grapheme == "\t" {
             4
         } else {
@@ -590,9 +501,7 @@ fn horizontal_window_anchor(
 }
 
 /// Choose one UTF-8-safe, width-bounded slice using the workspace's shared
-/// horizontal anchor. Source ranges remain canonical: no visual ellipsis bytes
-/// are injected, so pointer, selection, IME, and accessibility all map through
-/// the exact text that paint receives.
+/// horizontal anchor.
 fn bounded_line_window(
     text: &str,
     start: usize,
@@ -626,10 +535,6 @@ fn bounded_line_window(
             line_start,
             window_start,
         } => {
-            // Only the pathological primary line owns a proven bounded
-            // grapheme start. Other visible rows begin at their real line
-            // boundary rather than reusing a byte offset that could bisect a
-            // different cluster (and would require scanning an unbounded
             // prefix merely to recover tab phase).
             if start == line_start {
                 (window_start.clamp(start, end), 0)
@@ -740,7 +645,7 @@ mod tests {
     fn viewport_projection_is_visible_only_utf8_safe_and_source_addressable() {
         let text = "zero\nβeta\nlast\n";
         let (_, _, mut view, _) = editor(text);
-        view.viewport_anchor = "zero\n".len() + 1; // deliberately inside β
+        view.viewport_anchor = "zero\n".len() + 1;
         view.selections = vec![
             Selection {
                 anchor: "zero\n".len(),
@@ -908,8 +813,6 @@ mod tests {
 
     #[test]
     fn viewport_projection_has_a_total_byte_budget_across_many_large_lines() {
-        // Zero-width control bytes exercise the byte ceiling independently of
-        // the (normally much tighter) visible-column ceiling.
         let line = format!("{}\n", "\u{0001}".repeat(40 * 1024));
         let text = line.repeat(40);
         let (_, _, view, _) = editor(&text);
@@ -928,21 +831,14 @@ mod tests {
 
     /// The resident line index is BOUNDED, and declining to build it is not a
     /// behaviour change — `EditorLines::scanning` answers identically.
-    ///
-    /// Regression guard for a memory cliff reachable from valid input: the index
-    /// costs one `usize` per LINE, so a mostly-newline document at the editor's
-    /// 32 MiB limit would want ~33.5 M entries (~268 MiB resident, ~2x that
-    /// while a post-edit rebuild coexists with the `Arc` it replaces).
     #[test]
     fn line_index_is_capped_and_the_fallback_answers_identically() {
-        // Dense enough to blow the cap: one line per byte.
         let dense = "\n".repeat(MAX_LINE_INDEX_ENTRIES + 8);
         assert!(
             line_starts_capped(&dense).is_none(),
             "a document past the cap must decline to be indexed"
         );
 
-        // Just under the cap still indexes, and agrees with a full scan.
         let ok = "\n".repeat(64);
         let starts = line_starts_capped(&ok).expect("under the cap must index");
         assert_eq!(
@@ -951,8 +847,6 @@ mod tests {
             "capped index must equal the plain one"
         );
 
-        // The fallback the caller takes when indexing is declined is observably
-        // identical on every question EditorLines answers.
         let scanning = EditorLines::scanning(&dense);
         let reference = line_starts(&dense);
         let indexed = EditorLines::indexed(&dense, &reference);

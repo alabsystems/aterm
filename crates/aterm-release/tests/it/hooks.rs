@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The publication engine's hooks (`ship hook`), over scratch repositories: the
-//! pre-promote's worktree of the engine's commit, and the export transforms run the way
-//! the engine runs them — from a superproject whose astream gitlink the export must
-//! carry as files.
+//! The publication engine's hooks (`ship hook`), over scratch repositories.
 
 use std::path::{Path, PathBuf};
 
@@ -14,13 +11,9 @@ use crate::hook::{
 };
 use crate::transforms::{Inputs, run};
 
-// Spelled in halves: whole, the export's own rewrite would change them in this file's
-// exported copy, and the account word would trip the export's guard.
 const ACCOUNT: &str = concat!("aya", "tes");
 const PRIVATE_ORG: &str = concat!("andrew", "yatesai");
 
-/// git, isolated from this machine's configuration (local submodules allowed), found on a
-/// `PATH` with git's exec-path first: the fixture's and the hooks' own git (which take this
 /// env) skip macOS's xcrun trampoline.
 #[derive(Clone)]
 struct Git {
@@ -35,8 +28,6 @@ impl Git {
                 ("HOME".into(), home.to_string_lossy().into_owned()),
                 ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
                 ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
-                // Nor a person's global ignore or attributes file, which git finds under
-                // `$XDG_CONFIG_HOME` before `HOME` ([`aterm_uds::fixture_git::hermetic`]).
                 ("XDG_CONFIG_HOME".into(), "/dev/null".into()),
                 ("GIT_TERMINAL_PROMPT".into(), "0".into()),
                 ("GIT_CONFIG_COUNT".into(), "4".into()),
@@ -49,8 +40,6 @@ impl Git {
                     "GIT_CONFIG_VALUE_2".into(),
                     "fixture@example.invalid".into(),
                 ),
-                // No `git maintenance run --auto` after each commit, fetch or push: it does
-                // nothing in a fixture this small.
                 ("GIT_CONFIG_KEY_3".into(), "maintenance.auto".into()),
                 ("GIT_CONFIG_VALUE_3".into(), "false".into()),
             ],
@@ -98,7 +87,6 @@ fn scratch() -> (aterm_tempfile::TempDir, PathBuf, Git) {
     (dir, root, git)
 }
 
-/// A repository whose first commit records `ONE` beside a submodule, whose second
 /// records `TWO`, and whose working tree holds an uncommitted `THREE`.
 fn repo_with_history(root: &Path, git: &Git) -> (PathBuf, String) {
     let sub = root.join("sub");
@@ -132,10 +120,6 @@ fn worktrees(git: &Git, repo: &Path) -> usize {
         .count()
 }
 
-/// PRE-PROMOTE ASKS THE COMMIT'S OWN TREE: the check runs in a worktree of exactly the
-/// engine's commit (never the working tree, which may hold another branch or edits),
-/// its submodules at the gitlinks it records, building into the target dir's own
-/// `pre-promote` directory —
 /// and the check's verdict is the hook's. The worktree is gone afterwards.
 #[test]
 fn pre_promote_asks_the_commits_own_tree_and_leaves_no_worktree() {
@@ -194,9 +178,6 @@ fn pre_promote_asks_the_commits_own_tree_and_leaves_no_worktree() {
     );
 }
 
-/// UNDER `ship release` THE RUNNING RELEASE'S CUTTER ANSWERS: `ATERM_RELEASE_CUTTER` is
-/// R's own binary, so it is asked from the repository root, with no worktree and no
-/// build; a name that is not an executable file refuses rather than fall back to
 /// another cutter. It runs as from the operator's shell.
 #[test]
 fn pre_promote_asks_the_running_releases_cutter_and_builds_nothing() {
@@ -291,9 +272,6 @@ fn pre_promote_asks_the_running_releases_cutter_and_builds_nothing() {
     assert_eq!(removed, ["CARGO", "TARGO_LANE"]);
 }
 
-/// THE COMMIT'S OWN CUTTER RUNS AS FROM THE OPERATOR'S SHELL: what the `ship` alias
-/// handed the hook (cargo's and targo's own variables, the frontend's library path) never
-/// reaches it; the caller's toolchain pin and PATH do, and it builds into the shared
 /// target directory, in the commit's worktree.
 #[test]
 fn the_commits_own_cutter_inherits_nothing_from_the_alias() {
@@ -361,8 +339,6 @@ fn the_commits_own_cutter_inherits_nothing_from_the_alias() {
     assert_eq!(cmd.get_current_dir(), Some(Path::new("/scratch/tree")));
 }
 
-/// PRE-PROMOTE REFUSES RATHER THAN CHECK SOME OTHER CODE (exit 2, the check never asked):
-/// no commit named, one this repository does not hold, no checkout to run from, or a
 /// check that could not run.
 #[test]
 fn pre_promote_refuses_rather_than_check_some_other_code() {
@@ -426,10 +402,6 @@ fn astream_crate(dir: &Path, name: &str, deps: &str) {
     std::fs::write(dir.join(format!("crates/{name}/src/lib.rs")), "// ONE\n").unwrap();
 }
 
-/// The astream fixture. Its crates depend on each other in every shape cargo follows
-/// (`workspace = true` and a dotted key through the root's `[workspace.dependencies]`, an
-/// optional row, a target table), beside a dev-dependency and a crate nothing reaches;
-/// the wire crate says `ONE` at the first commit and `TWO` at the second, which also adds
 /// astream-hash and cap's path dependency on it.
 fn astream(root: &Path, git: &Git) -> PathBuf {
     let dir = root.join("astream");
@@ -452,8 +424,6 @@ fn astream(root: &Path, git: &Git) -> PathBuf {
     ] {
         astream_crate(&dir, c, "");
     }
-    // What a build reads beside src/: the build script and the shared file every crate
-    // includes; and the targets that stay private.
     let wire = dir.join("crates/astream-wire");
     std::fs::write(wire.join("build.rs"), "fn main() {}\n").unwrap();
     std::fs::write(wire.join("contract_fn.rs"), "// SHARED\n").unwrap();
@@ -511,7 +481,6 @@ fn exported_astream(export: &Path) -> Vec<String> {
     v
 }
 
-/// A superproject whose CAPTURED commit gitlinks astream at ONE while its checkout has
 /// moved on to TWO; the captured sha.
 fn superproject(root: &Path, git: &Git, astream: &Path) -> (PathBuf, String) {
     let sp = root.join("super");
@@ -534,8 +503,6 @@ fn superproject(root: &Path, git: &Git, astream: &Path) -> (PathBuf, String) {
     (sp, captured)
 }
 
-/// The export as the engine hands it over: the workspace manifests and toolchain pin as
-/// committed, the file whose bare `/Users/` is behaviour, every shape a rewrite exists
 /// for, and a crate declaring a target whose file the export withholds.
 fn export_fixture(export: &Path) -> String {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -571,8 +538,6 @@ fn export_fixture(export: &Path) -> String {
     .unwrap();
     std::fs::write(fx.join("tests/suite.rs"), "#[test]\nfn t() {}\n").unwrap();
     link_crate(export, "astream-broker");
-    // A workspace member's dev-dependency is read whenever cargo loads the workspace, as
-    // aterm-conformance's astream-term (the differential VT oracle's fold) is.
     let oracle = export.join("crates/oracle");
     std::fs::create_dir_all(&oracle).unwrap();
     std::fs::write(
@@ -617,16 +582,6 @@ fn tree_text(dir: &Path, out: &mut String) {
     }
 }
 
-/// THE EXPORT TRANSFORMS: astream written as files from the EXPORTED commit's gitlink (not
-/// the checkout's), only the crates the export's path
-/// dependencies reach (optional, target and workspace rows, and an exported member's
-/// dev-dependency; never an astream crate's own dev-dependency, no unreached crate), each
-/// with its build script and the files beside src/ but none of its test, example or bench
-/// targets;
-/// every guarded shape
-/// rewritten to exactly the guards' form and nothing else moved — the toolchain pin, the
-/// version (a patch slot other than 0 reaches the engine as declared) and a bare
-/// `/Users/` that is behaviour all ship as written; a declared target whose file is
 /// withheld is dropped with its comment.
 #[test]
 fn the_transforms_write_astream_from_the_exported_commit_and_leave_no_guarded_shape() {
@@ -657,7 +612,6 @@ fn the_transforms_write_astream_from_the_exported_commit_and_leave_no_guarded_sh
     let toml_before = std::fs::read_to_string(export.join("Cargo.toml")).unwrap();
     let lock_before = std::fs::read_to_string(export.join("Cargo.lock")).unwrap();
     let pin_before = std::fs::read(export.join("rust-toolchain.toml")).unwrap();
-    // the negative control: before the transforms, every shape is there to be found
     assert_eq!(guarded(&lib).len(), 6, "{:?}", guarded(&lib));
 
     let said = run(&Inputs {
@@ -755,9 +709,6 @@ fn the_transforms_write_astream_from_the_exported_commit_and_leave_no_guarded_sh
     assert!(toml_before.contains(&format!("version = \"{dev_version}\"")));
 }
 
-/// THE ASTREAM SET IS READ AT THE CAPTURED GITLINK, never listed: a crate the newer
-/// gitlink adds (and a dependency names) is exported from it; an export depending on a
-/// crate the gitlink lacks is refused, naming it, rather than staged with a manifest no
 /// public clone resolves.
 #[test]
 fn the_astream_crates_are_derived_at_the_captured_gitlink() {
@@ -798,9 +749,6 @@ fn the_astream_crates_are_derived_at_the_captured_gitlink() {
     );
 }
 
-/// THE EXPORTED LOCKFILE HOLDS WHAT THE EXPORT CARRIES: a workspace package whose manifest
-/// the exported commit has and the export withholds leaves Cargo.lock with what only it
-/// reached, as cargo writes the lock of the exported workspace; a lock that names nothing
 /// withheld is left byte for byte.
 #[test]
 fn a_withheld_package_leaves_the_exported_lock() {
@@ -861,7 +809,6 @@ fn a_withheld_package_leaves_the_exported_lock() {
         assert!(said.contains(&gone.to_string()), "{said:?}");
     }
 
-    // nothing withheld: the lock is left as it was
     std::fs::create_dir_all(export.join("crates/lab")).unwrap();
     std::fs::copy(
         sp.join("crates/lab/Cargo.toml"),
@@ -881,7 +828,6 @@ fn a_withheld_package_leaves_the_exported_lock() {
     );
 }
 
-/// A checkout that never initialized the submodule (a pre-submodule branch) holds the
 /// exported commit but not astream's objects: refused by name, not staged from.
 #[test]
 fn an_uninitialized_astream_checkout_is_refused_by_name() {
@@ -912,7 +858,6 @@ fn an_uninitialized_astream_checkout_is_refused_by_name() {
     );
 }
 
-/// A repository whose first commit has no cutter, whose second's transforms say `ONE`
 /// and whose third's say `TWO`, beside a lockfile and a README: (repo, [c0, c1, c2]).
 fn cutter_history(root: &Path, git: &Git) -> (PathBuf, [String; 3]) {
     let repo = root.join("cutter");
@@ -929,7 +874,6 @@ fn cutter_history(root: &Path, git: &Git) -> (PathBuf, [String; 3]) {
     (repo, [c0, c1, c2])
 }
 
-/// Which way `transforms` went: the rules run here (with this sha), or the captured
 /// commit's own cutter asked (its worktree's rules, the sha, the target), or neither.
 #[derive(Debug, PartialEq, Eq)]
 enum Ran {
@@ -990,11 +934,6 @@ fn dispatch(facts: &Transforms) -> (i32, Ran, String) {
     (code, ran, said)
 }
 
-/// THE EXPORT IS REWRITTEN BY THE EXPORTED COMMIT'S OWN RULES: this cutter runs them only
-/// when its whole source tree is the captured commit's; an edited or untracked
-/// file, an edited lockfile, or a captured
-/// commit older than the checkout hands the export to that commit's own cutter, built
-/// in a throwaway worktree of exactly it, into the target dir's `pre-promote.noindex` — never
 /// this working tree's code.
 #[test]
 fn the_transforms_run_as_the_captured_commits_own_code() {
@@ -1018,17 +957,13 @@ fn the_transforms_run_as_the_captured_commits_own_code() {
         target: repo.join("build/shared/pre-promote.noindex"),
     };
 
-    // the checkout IS the captured commit: here, with the full sha for HEAD
     let (code, ran, said) = dispatch(&facts("HEAD"));
     assert_eq!((code, ran), (0, Ran::Here(c2.clone())), "{said}");
     assert!(said.contains("== rewritten"), "{said}");
-    // Even an unrelated edit delegates conservatively: no source-cone list
-    // can silently omit a new path dependency or build input.
     std::fs::write(repo.join("README.md"), "edited\n").unwrap();
     assert_eq!(dispatch(&facts(&c2)).1, there("// TWO\n", &c2));
     std::fs::write(repo.join("README.md"), "readme\n").unwrap();
 
-    // the rules edited, a file added to the crate, the lockfile edited: the commit's own
     for (edit, undo) in [
         (
             Box::new(|| std::fs::write(&rules, "// WIP\n").unwrap()) as Box<dyn Fn()>,
@@ -1057,16 +992,12 @@ fn the_transforms_run_as_the_captured_commits_own_code() {
     }
     assert_eq!(source_differs(&repo, &git.env, &c2), None);
 
-    // `pub stage --commit <older>`: the older commit's rules, from its own worktree
     let (code, ran, said) = dispatch(&facts(&c1[..10]));
     assert_eq!((code, ran), (0, there("// ONE\n", &c1)), "{said}");
     assert_eq!(worktrees(&git, &repo), 1);
     assert_eq!(std::fs::read_to_string(&rules).unwrap(), "// TWO\n");
 }
 
-/// The transforms refuse (exit 1, nothing run) rather than rewrite the export with some
-/// other commit's rules: a captured commit this repository does not hold, one with no
-/// `ship hook transforms` to ask, or a commit's own cutter that still finds its source
 /// differs (it would only hand the export on again).
 #[test]
 fn the_transforms_refuse_rather_than_run_other_rules() {
@@ -1099,17 +1030,11 @@ fn the_transforms_refuse_rather_than_run_other_rules() {
         assert!(said.contains(words), "{words}: {said}");
     }
     assert_eq!(worktrees(&git, &repo), 1);
-    // the delegated marker is only that commit's: another commit is still handed on
     let (code, ran, _) = dispatch(&facts(&c1, Some(&"f".repeat(40))));
     assert_eq!(code, 0);
     assert!(matches!(ran, Ran::There { .. }), "{ran:?}");
 }
 
-/// The cutter's path dependencies and Cargo inputs are executable rules too.
-/// Exercise the real source judge over a committed checkout: each local
-/// difference is a source other than the captured commit's, and restoring it
-/// makes it that commit's again. Ignored includes/config files matter just as
-/// untracked files do. The dispatcher runs end to end on one tracked input and
 /// one ignored one: the captured worktree, then the identical checkout again.
 #[test]
 fn export_cutter_attests_dependency_sources_and_workspace_inputs() {
@@ -1147,8 +1072,6 @@ fn export_cutter_attests_dependency_sources_and_workspace_inputs() {
         git_env: git.env.clone(),
     };
     assert_eq!(dispatch(&facts).1, Ran::Here(captured.clone()));
-    // Each local difference is a source that is not the captured commit's (the selection
-    // `transforms` delegates on), and the restored tree is that commit's again.
     let differs = || source_differs(&facts.source, &git.env, &captured);
     let mut wrong = Vec::new();
     for path in tracked {
@@ -1180,9 +1103,6 @@ fn export_cutter_attests_dependency_sources_and_workspace_inputs() {
         wrong.is_empty(),
         "local inputs read as the captured source: {wrong:#?}"
     );
-    // End to end, a tracked input outside the cutter's crate and an ignored extra: each
-    // runs the captured commit's own cutter in a worktree that is gone afterwards, and the
-    // restored tree runs here.
     let expected = Ran::There {
         rules: "// TWO\n".to_owned(),
         full: captured.clone(),
@@ -1206,7 +1126,6 @@ fn export_cutter_attests_dependency_sources_and_workspace_inputs() {
     assert_eq!(worktrees(&git, &repo), 1, "delegated trees were removed");
 }
 
-/// A path dependency behind a gitlink is part of the cutter's source too:
 /// the recorded revision alone does not attest dirty or extra local files.
 #[test]
 fn export_cutter_attests_submodule_working_sources() {

@@ -27,6 +27,8 @@ pub const POLL_GAP: Duration = Duration::from_millis(20);
 pub struct Instance {
     pub child: Child,
     /// Cut after `child` is killed (fields drop after `Drop::drop`), and closed by
+    /// the kernel if this test process dies first: the instance goes with it
+    /// ([`launch_isolation::lifeline`]).
     _lifeline: aterm_uds::lifeline::Lifeline,
     pub tmp: PathBuf,
     pub log: PathBuf,
@@ -129,6 +131,7 @@ pub fn scratch_root(prefix: &str) -> PathBuf {
 }
 
 /// Whether the log shows the OS refusing the control socket's `bind` — a
+/// sandboxed runner, not a product failure.
 fn bind_refused_by_the_os(log: &str) -> bool {
     log.lines().any(|l| {
         l.contains("control socket bind failed")
@@ -137,12 +140,16 @@ fn bind_refused_by_the_os(log: &str) -> bool {
 }
 
 /// Whether the log shows CoreGraphics refusing a WindowServer connection — its
+/// own words when a process with no GUI session to join (an ssh login, a CI
+/// box) asks for one.
 fn window_server_refused(log: &str) -> bool {
     log.contains("FAILED TO establish the default connection to the WindowServer")
         || log.contains("_CGSDefaultConnection() is NULL")
 }
 
 /// A dead or never-ready child whose log shows it ASKED for a WindowServer
+/// connection fails the boot, naming the door (module doc): a headless
+/// instance never asks, so the refusal is the product's, not the login's.
 fn fail_if_it_asked_for_the_window_server(log: &Path, tail: &str) {
     let whole = std::fs::read_to_string(log).unwrap_or_default();
     assert!(
@@ -155,6 +162,7 @@ fn fail_if_it_asked_for_the_window_server(log: &Path, tail: &str) {
 }
 
 /// The environment refusal a dead or socketless child's log names, if any:
+/// the OS refusing the socket's `bind`.
 fn environment_refusal(tail: &str) -> Option<&'static str> {
     bind_refused_by_the_os(tail).then_some("the OS refused the control socket's bind")
 }
@@ -282,6 +290,7 @@ fn boot_under(
 
 std::thread_local! {
     /// The stand-ins [`standin`] puts in place while a boot's `configure` runs
+    /// ([`boot_with`], on that boot's thread); `None` outside one.
     static CONFIGURED: std::cell::RefCell<Option<Vec<PathBuf>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -290,6 +299,7 @@ std::thread_local! {
 pub const STANDIN_UNRESOLVED: &str = "the instance's login shell names a stand-in by another path";
 
 /// The PATH `cmd` launches with: the one set on it, none where it was removed,
+/// else this process's, which it inherits.
 fn launch_path(cmd: &Command) -> Option<std::ffi::OsString> {
     match cmd.get_envs().find(|(key, _)| *key == "PATH") {
         Some((_, value)) => value.map(std::ffi::OsStr::to_owned),
@@ -298,6 +308,7 @@ fn launch_path(cmd: &Command) -> Option<std::ffi::OsString> {
 }
 
 /// Whether `a` and `b` name one file or folder: the same text, or the same
+/// place once both resolve.
 fn same_place(a: &Path, b: &Path) -> bool {
     a == b
         || matches!(
@@ -307,6 +318,7 @@ fn same_place(a: &Path, b: &Path) -> bool {
 }
 
 /// The stand-ins of `standins` a shell reaches by name: each whose folder is
+/// an entry of `path`, once.
 fn reached_by_name(standins: Vec<PathBuf>, path: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
     let Some(path) = path else {
         return Vec::new();
@@ -325,6 +337,9 @@ fn reached_by_name(standins: Vec<PathBuf>, path: Option<&std::ffi::OsStr>) -> Ve
 }
 
 /// THE GUARD ([`boot_with`], module doc): the instance's own login shell names
+/// each of `standins` by the stand-in's path, or the test ends COULD NOT RUN
+/// ([`STANDIN_UNRESOLVED`]) with what it named instead — before the test can
+/// type anything: nothing has been typed but `command -v`.
 #[track_caller]
 fn prove_standins_resolve(inst: &Instance, standins: &[PathBuf]) {
     let names: Vec<&str> = standins
@@ -474,6 +489,7 @@ pub fn await_ready<T>(
 /// Where a hung instance waits: one of its threads as `/usr/bin/sample` reads it over one second (macOS).
 pub fn thread_stack(pid: u32, log: &Path, thread: Option<&str>) -> String {
     /// Enough for the frames from a thread's entry to its wait, at aterm's
+    /// depth.
     const STACK_LINES: usize = 80;
     if !cfg!(target_os = "macos") {
         return "(no sampler on this platform)".to_owned();
@@ -678,6 +694,12 @@ pub fn standin(path: &Path, text: &str) {
 }
 
 /// The build tree's read-only copy of `text` ([`standin`]): made by whichever
+/// process first needs it — written under a name of its own, then linked
+/// into place, so a concurrent maker finds it whole or makes it — and
+/// trusted only when it reads back as `text` (a digest is no proof) and is
+/// still read-only and executable: the mode is what keeps one test from
+/// writing every test's fake, so a file that lost it (a `chmod -R u+w` of the
+/// target dir, say) is not shared — the caller writes its own.
 fn shared_file(text: &str) -> Option<PathBuf> {
     use std::hash::{Hash, Hasher};
     use std::os::unix::fs::PermissionsExt;
@@ -704,6 +726,7 @@ fn shared_file(text: &str) -> Option<PathBuf> {
 }
 
 /// Run `file` once, unbounded, `--version` its argument and every output and
+/// input null: the first exec the system checks ([`standin`]).
 fn run_once(file: &Path) {
     let _ = Command::new(file)
         .arg("--version")

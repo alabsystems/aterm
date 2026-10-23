@@ -1,26 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The droplet cursor (`water` trail style): the block cursor is a cool aqua
-//! fill under an additive bead with a specular glint, drips beading off its
-//! belly and ripple rings spreading below. It breathes off the aurora's blaze
-//! ([`crate::cursor_glow::CursorGlow::blaze`]): calm at rest, sloshing and
-//! dripping under the keys, splashing on a jump flare.
-//!
-//! On a light page the water runs the other way: the fill deepens toward the
-//! abyss with the surge, and bead, glint, rings and drips are not drawn
-//! (additive light cannot brighten a white ground, and over a glyph it only
-//! lifts the ink toward the page).
-//!
-//! Text safety: given its page ([`DropletConfig::ground`]) the fill's ramp
-//! position is solved against it, so the caret and the glyph cut out of it
-//! keep [`CARET_PAGE_MIN_CONTRAST`] on any ground while the colour stays on
-//! the water ramp; the host's page floor
-//! ([`crate::cursor_fx::floor_block_fill`]) and the renderer's
-//! `minimum_contrast` floor stand behind it. Bead, drips and rings are
-//! additive [`GlowQuad`] light with capped coverage. Pure in the injected
-//! `now`; it settles to inactive when the surge dies, then rides the blink
-//! cadence.
+//! Liquid droplet block-cursor effect (`water` trail style) with bead, glints, ripples, and drips.
 
 use aterm_time::Instant;
 
@@ -30,8 +11,7 @@ use crate::cursor_fx::CARET_PAGE_MIN_CONTRAST;
 use crate::cursor_glow::{Geom, push_ripple_ring};
 use crate::effect_util::{push_soft_disc, water_ramp};
 
-/// Slosh rate in turns/second, at rest and at full surge. The phase advances
-/// only on rendered frames, so a settled bead sways at the blink cadence.
+/// Slosh rate in turns/second, at rest and at full surge.
 const SLOSH_IDLE: f32 = 0.9;
 const SLOSH_ACTIVE: f32 = 4.2;
 
@@ -40,8 +20,7 @@ const SLOSH_ACTIVE: f32 = 4.2;
 const RADIUS_IDLE: f32 = 0.52;
 const RADIUS_MAX: f32 = 0.78;
 
-/// Innermost-disc coverage before intensity, at rest and at full surge. The
-/// outer discs scale down from it, each clamped by [`COV_CAP`].
+/// Innermost-disc coverage before intensity, at rest and at full surge.
 const COV_IDLE: f32 = 60.0;
 const COV_MAX: f32 = 148.0;
 /// Per-quad additive coverage ceiling: inner discs saturate here over the
@@ -53,8 +32,7 @@ const COV_CAP: f32 = 92.0;
 /// edge: this much more coverage keeps the bead as bright to the eye.
 const DISC_SOFT_GAIN: f32 = 1.35;
 
-/// Ripple cadence in rings/second, at rest and at full surge. Two rings run
-/// half a cycle apart.
+/// Ripple cadence in rings/second, at rest and at full surge.
 const RIPPLE_IDLE: f32 = 0.35;
 const RIPPLE_ACTIVE: f32 = 1.15;
 /// How far a ring rolls out, in bead-radii, over its life (`u` 0→1).
@@ -73,45 +51,33 @@ const DRIP_FALL: f32 = 1.05;
 /// Below this surge the droplet reports inactive, so the host stops the tick.
 const SETTLED_SURGE: f32 = 0.02;
 
-/// Resolved per-frame inputs (Copy so the host reads it out before borrowing state).
+/// Per-frame configuration for the droplet cursor effect.
 #[derive(Clone, Copy, Debug)]
 pub struct DropletConfig {
-    /// On when the `water` style is chosen and the cursor is a focused, visible
-    /// block.
+    /// Whether the `water` style is active on a focused, visible block cursor.
     pub enabled: bool,
-    /// Overall scale `0..1` (reduced motion / load shed); 0 is fully inert.
+    /// Overall effect scale in `0.0..=1.0` (`0.0` is inert).
     pub intensity: f32,
-    /// The page the caret sits on (the live default background,
-    /// `0x00RRGGBB`): the fill's ramp position is solved against it and its
-    /// polarity picks the arm (a light page deepens the water and draws no
-    /// additive light). `None` is the dark arm with the ramp unsolved, for
-    /// callers with no page.
+    /// Default background color (`0x00RRGGBB`) against which fill contrast is solved.
     pub ground: Option<u32>,
 }
 
-/// What a tick produced: the liquid block fill and a fingerprint that changes
-/// on every visible step (0 when off).
+/// Output of [`CursorDroplet::tick`] for one frame.
 #[derive(Clone, Copy, Debug)]
 pub struct DropletFrame {
-    /// The liquid block-fill colour `0x00RRGGBB`, or `None` when the droplet is
-    /// off (the renderer then keeps the ordinary themed cursor fill).
+    /// Liquid block-fill color (`0x00RRGGBB`), or `None` when disabled.
     pub fill: Option<u32>,
-    /// Fingerprint of the emitted fill + bead + rings + drips (0 ⇒ nothing this frame).
+    /// Frame fingerprint of the emitted fill and quads (`0` when inert).
     pub fp: u64,
 }
 
 /// The band of water-ramp positions whose colour keeps
-/// [`CARET_PAGE_MIN_CONTRAST`] against `ground`, as `(lo, hi)`. The ramp's
-/// luminance climbs with `t` (abyss to foam), so on a dark page the band is
-/// `[lo, 1]` and on a light one `[0, hi]`; each edge is bisected on the
-/// ramp's own bytes. An unreachable floor collapses the band onto the
-/// ramp's end that contrasts most.
+/// [`CARET_PAGE_MIN_CONTRAST`] against `ground`, as `(lo, hi)`.
 fn ramp_band_on(ground: u32) -> (f32, f32) {
     let meets = |t: f32| {
         crate::color_math::contrast_ratio(water_ramp(t), ground) >= CARET_PAGE_MIN_CONTRAST
     };
     let dark = aterm_render::theme_is_dark(ground);
-    // The end of the ramp on the far side of the page from the ground.
     let far = if dark { 1.0 } else { 0.0 };
     if !meets(far) {
         return (far, far);
@@ -120,7 +86,6 @@ fn ramp_band_on(ground: u32) -> (f32, f32) {
     if meets(near) {
         return (0.0, 1.0);
     }
-    // `pass` always meets, `fail` never: the edge lies between.
     let (mut pass, mut fail) = (far, near);
     for _ in 0..20 {
         let mid = 0.5 * (pass + fail);
@@ -133,8 +98,7 @@ fn ramp_band_on(ground: u32) -> (f32, f32) {
     if dark { (pass, 1.0) } else { (0.0, pass) }
 }
 
-/// Per-window droplet state: slosh, ripple and drip phases, the last clock
-/// reading, and a latched surge.
+/// Per-window state for the liquid droplet cursor effect.
 #[derive(Default)]
 pub struct CursorDroplet {
     /// Rolling slosh (caustic shimmer) phase in turns `0..1`.
@@ -152,18 +116,14 @@ pub struct CursorDroplet {
 }
 
 impl CursorDroplet {
-    /// Whether the host must keep arming the animation tick: only while the
-    /// water is surging (typing, or a splash calming).
+    /// Returns whether the droplet surge is still active and requires animation ticks.
     #[must_use]
     #[inline]
     pub const fn is_active(&self) -> bool {
         self.surge > SETTLED_SURGE
     }
 
-    /// Advance one frame at `now` with the water's `surge` (`0..1`, the aurora's
-    /// blaze read after its tick), the block cursor cell `cur` (`None`: hidden),
-    /// grid `geom` and `cfg`. Appends the additive droplet to `out`; returns the
-    /// block fill and a fingerprint.
+    /// Advances one frame at `now` and appends additive droplet quads to `out`.
     pub fn tick(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -174,16 +134,13 @@ impl CursorDroplet {
         out: &mut Vec<GlowQuad>,
     ) -> DropletFrame {
         let e = (surge.clamp(0.0, 1.0) * cfg.intensity.clamp(0.0, 1.0)).clamp(0.0, 1.0);
-        // Inert (the plain themed cursor) when off, with degenerate geometry,
-        // or at zero intensity.
         if !cfg.enabled || geom.cw == 0 || geom.ch == 0 || cfg.intensity <= 0.0 {
-            self.surge = 0.0; // inert: report settled so the host disarms the tick
+            self.surge = 0.0;
             self.last = Some(now);
             return DropletFrame { fill: None, fp: 0 };
         }
         self.surge = e;
 
-        // Advance by real dt, clamped so a long stall doesn't fling the phases.
         let dt = self
             .last
             .map(|t| now.saturating_duration_since(t).as_secs_f32())
@@ -194,16 +151,8 @@ impl CursorDroplet {
         self.ripple = (self.ripple + dt * (RIPPLE_IDLE + RIPPLE_ACTIVE * e)).fract();
         self.drip = (self.drip + dt * (DRIP_IDLE + DRIP_ACTIVE * e)).fract();
         let phase = self.slosh * std::f32::consts::TAU;
-        // The shared caustic envelope 0..1 — two incommensurate sines so the
-        // shimmer never reads as a metronome pulse.
         let shimmer = 0.5 + 0.35 * phase.sin() + 0.15 * (phase * 2.7 + 1.3).sin();
 
-        // The block fill, shimmering with the caustics. On a dark page: deep
-        // still water at rest, bright azure at full surge, capped below the
-        // additive heart's foam so the round bead, not the rectangle, is the
-        // brightest thing. On a light page the surge deepens it toward the
-        // abyss instead. Either way the ramp position stays inside the band
-        // that keeps the page floor against the actual ground.
         let dark = cfg.ground.is_none_or(aterm_render::theme_is_dark);
         let caustic = 0.05 * (shimmer - 0.5);
         let t = if dark {
@@ -227,8 +176,6 @@ impl CursorDroplet {
         };
         let fill = water_ramp(t);
 
-        // The additive droplet, drawn only over a visible in-grid cursor cell
-        // on a dark page.
         if dark
             && let Some((cr, cc)) = cur
             && (cr as usize) < geom.rows
@@ -237,15 +184,13 @@ impl CursorDroplet {
             self.emit_bead(cr, cc, e, shimmer, phase, geom, cfg, out);
         }
 
-        // Fingerprint: quantized phases + surge + fill, so a settled bead
-        // early-outs the present but any visible step forces a repaint.
         let fp = ((self.slosh * 512.0) as u64)
             .wrapping_mul(1_000_003)
             .wrapping_add(((self.ripple * 512.0) as u64) << 20)
             .wrapping_add(((self.drip * 512.0) as u64) << 40)
             .wrapping_add((e * 255.0) as u64)
             .wrapping_add((fill as u64) << 12)
-            | 1; // never 0 while enabled — still water is always drawable
+            | 1;
 
         DropletFrame {
             fill: Some(fill),
@@ -272,22 +217,13 @@ impl CursorDroplet {
         out: &mut Vec<GlowQuad>,
     ) {
         let (cw, ch) = (geom.cw as f32, geom.ch as f32);
-        // Bead centre in window px (the grid origin is folded in here, once),
-        // floated to 0.46 of the cell so drips and waterline have headroom.
         let cx = f32::from(geom.origin_x) + (cc as f32 + 0.5) * cw;
         let cy = f32::from(geom.origin_y) + (cr as f32 + 0.46) * ch;
         let radius = (RADIUS_IDLE + (RADIUS_MAX - RADIUS_IDLE) * e) * ch;
         let cov_core =
             (COV_IDLE + (COV_MAX - COV_IDLE) * e) * cfg.intensity * (0.84 + 0.16 * shimmer);
 
-        // Concentric discs, outermost first (misty rim to foam-white heart);
-        // additive overlap builds the radial gradient. Each disc is a soft
-        // round mark ([`push_soft_disc`]): it falls off to nothing at its
-        // rim, so the bead is round and wet, never a stack of hard slabs.
-        // The bead hangs a little heavy and sloshes sideways, gently at rest,
-        // churning at full surge.
         let discs: [(f32, f32, f32); 4] = [
-            // (radius ×, coverage ×, water_ramp t)
             (1.00, 0.30, 0.24 + 0.06 * e),
             (0.82, 0.58, 0.46 + 0.12 * e),
             (0.62, 0.85, 0.66 + 0.16 * e),
@@ -310,13 +246,9 @@ impl CursorDroplet {
             );
         }
 
-        // Specular glint: an off-centre highlight high on the bead's shoulder
-        // plus a small echo below, flickering with the caustics; soft points
-        // of light, not chips.
         let glint_cov = (cov_core * (0.80 + 0.20 * shimmer)).min(COV_CAP);
         let gx = cx - radius * 0.30 + (phase.sin() * radius * 0.05);
         let gr = (radius * 0.14).max(1.5);
-        // Aqua-tinged, not glacial white: a wet gleam.
         push_soft_disc(
             out,
             geom,
@@ -325,7 +257,6 @@ impl CursorDroplet {
             0x00B4_EAF0,
             glint_cov,
         );
-        // The echo: a pinprick lower-right, half the size, half the light.
         push_soft_disc(
             out,
             geom,
@@ -335,8 +266,6 @@ impl CursorDroplet {
             glint_cov * 0.5,
         );
 
-        // Ripple rings: two flattened ellipses half a life apart, scaled by the
-        // surge (invisible on still water).
         if e > 0.0 {
             let ring_rgb = water_ramp(0.74 + 0.10 * e);
             let y0 = cy + radius * 0.88;
@@ -356,10 +285,6 @@ impl CursorDroplet {
             }
         }
 
-        // Drips: one lazy drip at rest, rain as the surge wakes the outer lanes.
-        // A drop grows on the belly for the first 30% of its life, then
-        // detaches and accelerates down, fading: a soft round bead, drawn
-        // out a little as it falls.
         let belly = cy + radius * 0.80;
         let body = water_ramp(0.68);
         for &(dx, off, wake) in &DRIP_LANES {
@@ -369,11 +294,9 @@ impl CursorDroplet {
             let u = (self.drip + off).fract();
             let x = cx + dx * cw + (phase + off * 7.0).sin() * 1.5;
             let (y, r, stretch, cov) = if u < 0.30 {
-                // Beading: the drop grows on the belly.
                 let s = u / 0.30;
                 (belly, 1.2 + radius * 0.08 * s, 1.0, cov_core * 0.70 * s)
             } else {
-                // Falling: detach, accelerate, fade.
                 let v = (u - 0.30) / 0.70;
                 (
                     belly + v * v * DRIP_FALL * ch,
@@ -495,7 +418,6 @@ mod tests {
         let mut d = CursorDroplet::default();
         let mut out = Vec::new();
         let t = Instant::now();
-        // A corner cell so clamping is exercised.
         for i in 0..8 {
             if i == 7 {
                 out.clear();
@@ -582,7 +504,6 @@ mod tests {
         let mut out = Vec::new();
         e.tick(Some((cr, cc)), t0, 1.0, real, &cfg(), &mut out);
         assert!(!out.is_empty(), "the emitter drew nothing to place");
-        // The caret cell in window px, from the one anchor every emitter shares.
         let (x0c, y0c) = (
             i32::from(real.origin_x) + i32::from(cc) * real.cw as i32,
             i32::from(real.origin_y) + i32::from(cr) * real.ch as i32,
@@ -602,7 +523,6 @@ mod tests {
             real.origin_x,
             real.origin_y
         );
-        // Every quad inside the effects box (the grid plus the head band).
         for q in &out {
             assert!(
                 i32::from(q.x) >= real.fx_left() && i32::from(q.x + q.w) <= real.fx_right(),
@@ -617,8 +537,6 @@ mod tests {
                 q.y + q.h
             );
         }
-        // Identity: at origin (0,0) the window form equals the grid form, so
-        // the other tests here are unaffected.
         let mut at_origin = Vec::new();
         let mut f = CursorDroplet::default();
         f.tick(Some((3, 10)), t0, 1.0, geom(), &cfg(), &mut at_origin);
@@ -666,8 +584,7 @@ mod tests {
 
     /// On a light page at full surge the droplet keeps its caret: the fill is
     /// solved against the actual ground (white and Solarized's off-white) and
-    /// no additive bead lands on it. Negative control: the dark arm (no page)
-    /// over white foams the caret under 3:1.
+    /// no additive bead lands on it.
     #[test]
     fn the_light_droplet_keeps_its_caret_on_a_light_page() {
         for page in [0x00FF_FFFF, 0x00FD_F6E3] {
@@ -693,8 +610,7 @@ mod tests {
 
     /// On the dark default page still water is solved up the ramp until the
     /// fill clears the page floor, so the glyph cut out of it in the page
-    /// colour stays readable. Negative control: the same tick with no page is
-    /// the unsolved deep water under it.
+    /// colour stays readable.
     #[test]
     fn still_water_is_solved_against_a_dark_page() {
         const PAGE: u32 = 0x0011_1318;
@@ -721,8 +637,7 @@ mod tests {
     /// THE BEAD IS ROUND AND SOFT: at full surge the light across the bead's
     /// middle row climbs to its heart and falls away a little at a time (no
     /// pixel steps by more than a quarter of the peak), and down its middle
-    /// column too, where hard-edged slabs once stood it in stairs. Negative
-    /// control: a hard slab of the same light steps its whole peak at once.
+    /// column too, where hard-edged slabs once stood it in stairs.
     #[test]
     fn the_bead_is_round_and_soft() {
         let g = Geom {

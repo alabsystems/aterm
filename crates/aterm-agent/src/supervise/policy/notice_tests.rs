@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Every notice holds the owner's four-part shape (module docs): checked by
-//! structure — sentences, placeholders, the message engine's own word rules,
-//! the band's title rule — never by the words themselves.
+//! Every notice holds the owner's four-part shape (module docs): checked by structure — sentences, placeholders, the message engine's own word rules, the band's title rule — never by the words themselves.
 
 use std::collections::BTreeSet;
 
@@ -60,9 +58,7 @@ fn longest_reset() -> String {
 }
 
 /// The usage limit's notices raised where aterm continues the tab past the
-/// limit's reset: each says when the limit resets, where that is known. (The
-/// roster's reports where it continues none, [`LIMIT_ROSTER_KEPT`] and
-/// [`LIMIT_UNREAD_KEPT`], have no reset to name.)
+/// limit's reset: each says when the limit resets, where that is known.
 const LIMITS: [NoticeText; 14] = [
     LIMIT_SIGN_IN,
     LIMIT_RENEW,
@@ -83,8 +79,7 @@ const LIMITS: [NoticeText; 14] = [
 /// [`stay_why`] NAMES EVERY SETTING THAT HOLDS THE TAB, and only those (the
 /// review of the login carry, r4h-2): each of the seven combinations of
 /// `accounts`, `relaunch` and `resume_limits` off is a clause of
-/// [`STAY_WHYS`] that names exactly their lines, each its own. NEGATIVE
-/// CONTROL: none off names nothing.
+/// [`STAY_WHYS`] that names exactly their lines, each its own.
 #[test]
 fn the_stay_clause_names_every_setting_that_holds_the_tab() {
     let lines = [
@@ -254,8 +249,6 @@ fn placeholders_are_known_and_every_one_is_filled() {
                 );
             }
         }
-        // The reset is named where it is known, in the expectation that
-        // names it, and only there.
         if let Some(part) = n.expect_reset {
             assert!(names(part).contains(&RESET), "{}: {part:?}", n.id);
             assert!(
@@ -338,8 +331,6 @@ fn what_aterm_did_is_aterms_and_the_expectation_asks_nothing() {
 /// the step says so — never a command with words in its label's place, never
 /// another command (`--due` renewed nothing of a row a renewal signed in
 /// another account for — the review of the login carry, 2026-10-20).
-/// NEGATIVE CONTROL: a command that fits is the step's own end, and no line
-/// of Details.
 #[test]
 fn a_label_is_named_whole_where_it_fits_and_never_cut_in_a_command() {
     let short = RENEWAL_WRONG_ACCOUNT.fill(Some("main"), None);
@@ -375,8 +366,6 @@ fn a_label_is_named_whole_where_it_fits_and_never_cut_in_a_command() {
             assert!(f.todo.contains(&"b".repeat(LABEL_ROOM)), "{}", n.id);
             assert_eq!(f.command, None, "{}", n.id);
         }
-        // A step that names the label in a sentence names it clipped where
-        // it would not fit whole, and never points at Details.
         if n.todo_as.is_some() {
             let f = n.fill(Some(&long), longest_why(n));
             assert!(f.todo.contains(&"a".repeat(LABEL_ROOM)), "{}", n.id);
@@ -388,8 +377,7 @@ fn a_label_is_named_whole_where_it_fits_and_never_cut_in_a_command() {
 
 /// A ROSTER ROW IS NAMED AS A NAME, never as a possessor (the review of the
 /// owner's notices, 2026-10-20: `sign in with main's own account` read as if
-/// `main` were a person): no filled part says `<label>'s`. NEGATIVE CONTROL:
-/// the step that read so is caught by the same check.
+/// `main` were a person): no filled part says `<label>'s`.
 #[test]
 fn a_label_is_never_a_possessor() {
     let possessive = |part: &str, label: &str| part.contains(&format!("{label}'s"));
@@ -409,9 +397,7 @@ fn a_label_is_never_a_possessor() {
 /// lost login in again themselves says, where the session's login is a
 /// roster row, whose own account to sign in with — nothing at the hand-off of
 /// their own `/login` does, and another account makes two rows of the roster
-/// one. NEGATIVE CONTROLS: with no label the step is the plain one, naming
-/// none; and a usage limit's sign-in, which asks for ANOTHER account, names
-/// no row whatever the label.
+/// one.
 #[test]
 fn a_sign_in_by_hand_on_a_roster_login_names_the_row() {
     let lost = [
@@ -429,10 +415,8 @@ fn a_sign_in_by_hand_on_a_roster_login_names_the_row() {
             n.id
         );
         assert!(n.takes_label(), "{}", n.id);
-        // NEGATIVE CONTROL: no label, the plain step.
         assert_eq!(n.fill(None, longest_why(n)).todo, n.todo, "{}", n.id);
     }
-    // NEGATIVE CONTROL: another account's sign-in names no row.
     let other = LIMIT_SIGN_IN.fill(Some("pool-7"), None);
     assert!(!LIMIT_SIGN_IN.takes_label());
     assert!(
@@ -446,9 +430,7 @@ fn a_sign_in_by_hand_on_a_roster_login_names_the_row() {
 /// A USAGE LIMIT'S NOTICE SAYS WHEN THE TAB GOES ON BY ITSELF (the review
 /// of the band, 2026-10-20: none named the reset, nor that aterm continues
 /// the tab after it, which happens whatever the owner does): filled with
-/// the reset, each limit notice's expectation names it. NEGATIVE CONTROLS:
-/// filled with none, the expectation is the one it always was; and a notice
-/// that is no usage limit's says nothing of a reset it is given.
+/// the reset, each limit notice's expectation names it.
 #[test]
 fn a_limit_notice_names_its_reset_where_it_is_known() {
     let reset = "on Oct 23 at 9am";
@@ -466,12 +448,10 @@ fn a_limit_notice_names_its_reset_where_it_is_known() {
             "{}: only the expectation says the reset",
             n.id
         );
-        // NEGATIVE CONTROL: no reset known, the sentence it always had.
         let unknown = n.fill_reset(label, None, None);
         assert_eq!(unknown.expect, n.fill(label, None).expect, "{}", n.id);
         assert!(!unknown.expect.contains(reset), "{}", n.id);
     }
-    // NEGATIVE CONTROL: a lost login's notice has no reset to say.
     for n in ALL.iter().filter(|n| !LIMITS.iter().any(|l| l.id == n.id)) {
         assert_eq!(n.expect_reset, None, "{}", n.id);
         let f = n.fill_reset(Some("pool-7"), longest_why(n), Some(reset));
@@ -481,8 +461,7 @@ fn a_limit_notice_names_its_reset_where_it_is_known() {
 
 /// THE BAND IS THE WINDOW'S (the review of the band, 2026-10-20): it shows
 /// whichever tab is in front, so no step says `this tab` — read on tab 2,
-/// `Press Esc in this tab` would interrupt whatever runs there. NEGATIVE
-/// CONTROL: the step that read so is caught by the same check.
+/// `Press Esc in this tab` would interrupt whatever runs there.
 #[test]
 fn no_step_says_this_tab() {
     let says = |step: &str| step.to_lowercase().contains("this tab");
@@ -500,9 +479,7 @@ fn no_step_says_this_tab() {
 /// A STEP THAT RUNS A COMMAND HAS ITS SHORT FORM, a sentence none: the band
 /// shows a command whole or puts [`COMMAND_UNDER_DETAILS`] in its place,
 /// never a cut of it (the review of the band, 2026-10-20: `Run aterm harness
-/// accounts renew…` at 514 px). The short form is one action the engine
-/// admits. NEGATIVE CONTROL: a sentence step, cut at its end on a narrow
-/// band, has none.
+/// accounts renew…` at 514 px).
 #[test]
 fn a_command_step_has_its_short_form() {
     assert_eq!(Step::new(COMMAND_UNDER_DETAILS).fault(), None);
@@ -524,8 +501,7 @@ fn a_command_step_has_its_short_form() {
 /// carry, r3h-3): `accounts use <label>` pins the account for every session
 /// until the pin is ended, so the notice that asks for it names, on a line
 /// of Details ([`NoticeText::undo`]), the one command that ends the pin —
-/// another command than the step's. NEGATIVE CONTROL: a step done once it is
-/// done (a sign-in, a renewal, a report) names none.
+/// another command than the step's.
 #[test]
 fn a_pin_names_how_it_ends() {
     let pins = |n: &NoticeText| n.todo.contains("accounts use ");
@@ -564,8 +540,6 @@ fn short_title_fault(short: &str, title: &str) -> Option<&'static str> {
 /// not fit, so it holds [`short_title_fault`]'s shape, and it is one per
 /// title — two notices share a short form exactly where they share their
 /// title, so the band never says less of a difference the title makes.
-/// NEGATIVE CONTROLS: the title with its place fitted on, a short form no
-/// narrower than its title, and one word alone are each refused.
 #[test]
 fn a_short_title_says_what_happened_in_two_or_three_words() {
     for n in ALL {
@@ -609,8 +583,6 @@ fn step_args(f: &Filled) -> Option<Vec<String>> {
 /// EVERY COMMAND A STEP RUNS IS ONE `aterm harness` TAKES: the owner copies
 /// it from the band or from Details, so it parses as the verb's own grammar
 /// does (`crate::harness::cli::parse`), at a label of every length.
-/// NEGATIVE CONTROL: a verb the grammar does not have is refused by the same
-/// parse.
 #[test]
 fn every_command_a_step_runs_is_one_aterm_harness_takes() {
     use crate::harness::cli::parse;
@@ -633,9 +605,7 @@ fn every_command_a_step_runs_is_one_aterm_harness_takes() {
 /// A NOTICE'S RECORD CLOSES IN WORDS TRUE OF HOW IT ENDED (the review of the
 /// login carry, r8c-7): a usage limit, where no login was lost, closes as the
 /// switch to another account that ends it, never as a login back; a lost or
-/// renewed login closes as its login back. Either is a glass title with the
-/// tab's place fitted on. NEGATIVE CONTROL: the two words differ, so a usage
-/// limit closed in a lost login's would be caught.
+/// renewed login closes as its login back.
 #[test]
 fn a_notice_closes_in_words_true_of_how_it_ended() {
     let limits: Vec<&str> = LIMITS

@@ -74,7 +74,7 @@ impl Endian {
 #[cfg_attr(trust_verify, trust::ensures(result >= pos && result - pos < align && result % align == 0))]
 #[inline]
 #[must_use]
-pub fn pad_to(pos: usize, align: usize) -> usize {
+pub const fn pad_to(pos: usize, align: usize) -> usize {
     let rem = pos % align;
     if rem == 0 { pos } else { pos + (align - rem) }
 }
@@ -160,7 +160,7 @@ pub(crate) struct Writer {
 
 impl Writer {
     #[inline]
-    pub(crate) fn new(endian: Endian, base: usize) -> Self {
+    pub(crate) const fn new(endian: Endian, base: usize) -> Self {
         Self {
             buf: Vec::new(),
             endian,
@@ -170,7 +170,7 @@ impl Writer {
     }
 
     #[inline]
-    fn pos(&self) -> usize {
+    const fn pos(&self) -> usize {
         self.base.saturating_add(self.buf.len())
     }
 
@@ -241,7 +241,7 @@ impl Writer {
     }
 
     #[inline]
-    fn enter(&mut self) -> Result<()> {
+    const fn enter(&mut self) -> Result<()> {
         if self.depth >= MAX_DEPTH {
             return Err(Error::Invalid("containers nested deeper than 64"));
         }
@@ -250,7 +250,7 @@ impl Writer {
     }
 
     #[inline]
-    fn leave(&mut self) {
+    const fn leave(&mut self) {
         self.depth = self.depth.saturating_sub(1);
     }
 
@@ -446,7 +446,7 @@ impl<'a> Reader<'a> {
     }
 
     #[inline]
-    fn enter(&mut self) -> Result<()> {
+    const fn enter(&mut self) -> Result<()> {
         if self.depth >= MAX_DEPTH {
             return Err(Error::malformed(
                 "containers nested deeper than 64",
@@ -458,7 +458,7 @@ impl<'a> Reader<'a> {
     }
 
     #[inline]
-    fn leave(&mut self) {
+    const fn leave(&mut self) {
         self.depth = self.depth.saturating_sub(1);
     }
 

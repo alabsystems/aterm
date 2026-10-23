@@ -1,48 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Scroll kinematics: the pure motion core for pixel-true smooth scrolling (position
-//! decomposition, the wheel glide, the overscroll spring and the auto-fading scroll pill).
-//! Pure math over explicit inputs, so its laws are lattice-tested below. The glide's wake
-//! discipline, including the host's Full→Reduced settle (land at the target and disarm in one
-//! edge), also has a Tier-0 model, `aterm_spec::derive::scroll_glide_model`.
-//!
-//! Everything here is PURE (integer/float math over explicit inputs — no
-//! `&Terminal`, no rendering, no clock reads except through the thin `Instant`
-//! wrappers), so the M1 PROVE bullets are machine-checked over deliberate
-//! input lattices under plain `cargo test`, and the glide's wake discipline
-//! has an abstract ty twin (`aterm_models_render::scroll_glide_model`, checked
-//! by the real Trust `ty` in aterm-models' `derived_ring_ty`). That same model
-//! includes the host's Full→Reduced settle transition: land at the intended
-//! target and disarm in one edge, with no Reduced-policy deadline retained.
-//!
-//! 1. **Decomposition** ([`decompose`]): for every `scroll_px: i64` and `cell_h >= 1`,
-//!    `rows * cell_h + frac == scroll_px` with `frac ∈ [0, cell_h)`. Division is outside the
-//!    ty `Expr` language, so the lattice test is the proof layer.
-//! 2. **Glide convergence** ([`glide_position`], [`Glide`]): the ease-out reaches its target
-//!    exactly at `elapsed >= dur`, moves monotonically toward it, and `sample` then reports
-//!    done, after which the host drops the state (no perpetual wake).
-//! 3. **Spring overshoot-freedom** ([`spring_displacement`]): the critically damped release
-//!    never changes sign, never grows in magnitude, and falls below any ε in bounded time.
-//!    Transcendental, so the proof layer is a dense time-lattice test.
-//!
-//! Callers gate on [`MotionPolicy`](crate::motion): under Reduced motion the glide is never
-//! armed (`MotionEffect::SmoothScroll`) and the pill shows and hides without a fade
-//! (`MotionEffect::ScrollPill`).
+//! Scroll kinematics for pixel-true smooth scrolling, overscroll spring, and scroll pill.
 
 use std::time::{Duration, Instant};
 
 /// Wheel-glide ease-out duration (ms).
 pub(crate) const GLIDE_MS: u64 = 180;
 
-/// Precise (trackpad) deltas: how long the band holds the finger's last sub-row position
-/// before the rest-settle begins (ms). A trackpad sends ~120 deltas/s while the finger moves,
-/// so a gap this long means it stopped.
+/// Trackpad sub-row hold duration before rest-settle begins (ms).
 pub(crate) const TRACK_REST_MS: u64 = 100;
 
-/// Precise deltas: the rest-settle's ease-out to the nearest whole row (ms). The engine is
-/// whole-row at rest (selection and mouse mapping stay exact); the distance is at most half a
-/// cell.
+/// Trackpad rest-settle ease-out duration to the nearest whole row (ms).
 pub(crate) const TRACK_SETTLE_MS: u64 = 120;
 
 /// How long the pill stays fully opaque after the last scroll activity.
@@ -51,69 +20,50 @@ pub(crate) const PILL_HOLD_MS: u64 = 900;
 /// Fade-out ramp length after the hold (skipped under Reduced motion).
 pub(crate) const PILL_FADE_MS: u64 = 300;
 
-/// Critically damped spring rate (rad/s): settles to ~1% in ~350 ms.
+/// Critically damped spring rate (rad/s).
 pub(crate) const SPRING_OMEGA: f64 = 18.0;
 
 /// Displacement below which the spring is done (self-disarm threshold, px).
 pub(crate) const SPRING_EPS_PX: f64 = 0.5;
 
-/// Elastic-overscroll settle cap (ms): the last wake the host arms for a bounce. A sub-cell
-/// amplitude decays below [`SPRING_EPS_PX`] in ~350 ms at [`SPRING_OMEGA`], so
-/// [`OverscrollSpring::sample`] disarms earlier; this bound keeps the wake count finite.
+/// Elastic-overscroll settle cap (ms).
 pub(crate) const SPRING_SETTLE_MS: u64 = 400;
 
-/// Decompose an absolute scroll position in pixels into whole rows plus a fractional-pixel
-/// remainder: `rows * cell_h + frac == scroll_px` and `0 <= frac < cell_h` for every
-/// `scroll_px` and `cell_h >= 1`. Euclidean division keeps `frac` non-negative for negative
-/// (elastic-overscroll) positions, where truncation would not.
+/// Decompose an absolute scroll position in pixels into whole rows plus fractional remainder.
 #[must_use]
 pub(crate) fn decompose(scroll_px: i64, cell_h: i64) -> (i64, i64) {
     debug_assert!(cell_h >= 1, "cell height must be positive");
     (scroll_px.div_euclid(cell_h), scroll_px.rem_euclid(cell_h))
 }
 
-/// The whole-row position nearest to `scroll_px`: the rest-settle target of a tracked glide.
-/// Half a cell rounds toward history. Non-negative for `scroll_px >= 0`, and never above a
-/// whole row `r` for a position at or below `r`, so a target clamped into
-/// `[0, max_rows * cell_h]` stays clamped.
+/// The whole-row position nearest to `scroll_px`.
 #[must_use]
 pub(crate) fn nearest_row_px(scroll_px: i64, cell_h: i64) -> i64 {
     debug_assert!(cell_h >= 1, "cell height must be positive");
     (scroll_px + cell_h / 2).div_euclid(cell_h) * cell_h
 }
 
-/// The eased glide position at `elapsed_ms` of a `dur_ms` ease-out-cubic from `start_px` to
-/// `target_px`: exactly `start_px` at 0, exactly `target_px` once `elapsed_ms >= dur_ms` (or
-/// `dur_ms == 0`), and monotone toward the target in between, never overstepping it.
+/// The eased glide position at `elapsed_ms` of a `dur_ms` ease-out-cubic from `start_px` to `target_px`.
 #[must_use]
 pub(crate) fn glide_position(start_px: i64, target_px: i64, elapsed_ms: u64, dur_ms: u64) -> i64 {
     if elapsed_ms >= dur_ms || dur_ms == 0 {
         return target_px;
     }
-    // u ∈ (0, 1); ease-out cubic e = 1 - (1-u)^3 ∈ (0, 1), monotone in u.
     let u = elapsed_ms as f64 / dur_ms as f64;
     let inv = 1.0 - u;
     let e = 1.0 - inv * inv * inv;
     let delta = target_px - start_px;
-    // Rounding keeps a monotone sequence monotone, and e < 1 keeps it within
-    // [start, target].
     start_px + (delta as f64 * e).round() as i64
 }
 
-/// A self-disarming wheel glide: an ease-out from `start_px` to `target_px` over
-/// [`GLIDE_MS`], or for a precise gesture a band parked at the finger's sub-row position
-/// whose ease is the rest-settle to the nearest whole row ([`Self::tracked`]). The host
-/// samples it on frame-paced wakes and drops it once `sample` reports done, so no deadline
-/// stays armed (model: `scroll_glide_model`).
+/// A self-disarming wheel or tracked glide.
 #[derive(Debug)]
 pub(crate) struct Glide {
     start_px: i64,
     target_px: i64,
     t0: Instant,
     dur: Duration,
-    /// Precise deltas: the sub-pixel remainder of the tracked position. Rounding each delta
-    /// would lag the finger (at 0.5 rows / 100 ms a 120 Hz delta is 1.42 px, which rounds to
-    /// 1 px: 30% slow). Zero for a notch glide.
+    /// Precise deltas: the sub-pixel remainder of the tracked position.
     carry_px: f64,
 }
 
@@ -130,11 +80,7 @@ impl Glide {
         }
     }
 
-    /// A glide parked at `pos_px` with no ease that, unless [`Self::track`] moves it first,
-    /// settles to the nearest whole row ([`nearest_row_px`]) starting [`TRACK_REST_MS`] after
-    /// `now` and lasting [`TRACK_SETTLE_MS`]. The settle is the glide itself (`t0` is the rest
-    /// boundary), so [`Self::sample`] before `t0` returns the tracked position and the
-    /// `scroll_glide_model` invariants hold unchanged.
+    /// A glide parked at `pos_px` that settles to the nearest whole row after [`TRACK_REST_MS`].
     #[must_use]
     pub(crate) fn tracked(pos_px: i64, cell_h: i64, now: Instant) -> Self {
         let mut g = Self::new(pos_px, pos_px, now);
@@ -150,20 +96,7 @@ impl Glide {
         self.dur = Duration::from_millis(TRACK_SETTLE_MS);
     }
 
-    /// Move the tracked position by `delta_px` (signed, fractional; positive is into history)
-    /// from the current sample, clamp into `[0, max_px]`, and re-arm the rest-settle from
-    /// `now`. Returns the clamped-away excess (signed px), which the host hands to the
-    /// elastic-overscroll bounce. The sub-pixel remainder is carried while the delta fits and
-    /// dropped at an edge, so a finger held past the top banks no phantom return.
-    ///
-    /// WHY NO EASE (the law this replaces was `extend_target`): a precise
-    /// delta IS a position, not an intent. Any ease over whole-row banked
-    /// targets renders a constant finger speed as a sawtooth — the band
-    /// idles until a row banks, then covers it; measured at 120 Hz with a 34
-    /// px cell the per-frame velocity of the extending chain ran
-    /// `0,0,5,4,3,9,…,27,12,4,34` at 4 rows/100 ms and `…,1,1,0,0,0,0,5,4,…`
-    /// at 1 row/100 ms, which is the "blocky" scrolling reported on
-    /// 2026-09-22.
+    /// Move the tracked position by `delta_px`, clamp into `[0, max_px]`, and re-arm rest-settle.
     pub(crate) fn track(&mut self, delta_px: f64, cell_h: i64, max_px: i64, now: Instant) -> i64 {
         let (pos, _) = self.sample(now);
         let want = pos as f64 + self.carry_px + delta_px;
@@ -179,20 +112,14 @@ impl Glide {
         want_px - clamped
     }
 
-    /// Gesture end (`TouchPhase::Ended`, or the seam handing a precise delta to an app that
-    /// took the mouse mid-gesture): start the rest-settle now. A no-op for a glide already
-    /// easing.
+    /// Gesture end: start the rest-settle now.
     pub(crate) fn release(&mut self, now: Instant) {
         if now < self.t0 {
             self.t0 = now;
         }
     }
 
-    /// The next wake for this glide at `now`: one at the rest boundary while parked
-    /// (`now < t0`, position constant), else the frame cadence capped at [`Self::end`].
-    /// Test-only pure form of the law; production reads the stored anchor
-    /// (`ScrollGlideState::wake_deadline`, re-anchored to [`Self::settle_start`] while parked),
-    /// so a park never re-derives a wake from the clock.
+    /// The next wake for this glide at `now`.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn next_wake(&self, now: Instant, frame_iv: Duration) -> Instant {
@@ -203,25 +130,19 @@ impl Glide {
         }
     }
 
-    /// When the ease begins (`t0`): already past for a notch glide; for a tracked band, the
-    /// rest boundary, the one wake the host owes while parked
-    /// (`ScrollGlideState::next_tick` anchors to it).
+    /// When the ease begins (`t0`).
     #[must_use]
     pub(crate) fn settle_start(&self) -> Instant {
         self.t0
     }
 
-    /// Shift start and target by `delta_px` without touching the clock: the frame moved under
-    /// the glide. The host calls this when the engine's `display_offset` is not the row the
-    /// glide last set (SCR-1's re-pin after output, `Grid::repin_display_offset`), so the ease
-    /// stays on the content the reader is looking at instead of drifting toward live.
+    /// Shift start and target by `delta_px` without touching the clock.
     pub(crate) fn shift(&mut self, delta_px: i64) {
         self.start_px += delta_px;
         self.target_px += delta_px;
     }
 
-    /// The eased position at `now`, and whether the glide is done (position == target). Once
-    /// done the host drops the glide, disarming its wake.
+    /// The eased position at `now`, and whether the glide is done.
     #[must_use]
     pub(crate) fn sample(&self, now: Instant) -> (i64, bool) {
         let elapsed = now.saturating_duration_since(self.t0);
@@ -235,38 +156,30 @@ impl Glide {
         (if done { self.target_px } else { pos }, done)
     }
 
-    /// Redirect the glide toward `target_px`, restarting the ease from the current sample (a
-    /// mid-glide wheel notch chains smoothly).
+    /// Redirect the glide toward `target_px`, restarting the ease from the current sample.
     pub(crate) fn retarget(&mut self, target_px: i64, now: Instant) {
         let (pos, _) = self.sample(now);
         self.start_px = pos;
         self.target_px = target_px;
         self.t0 = now;
-        // A notch chained onto a tracked glide (a wheel click mid-gesture) takes the full
-        // ease, with whole-row positions.
         self.dur = Duration::from_millis(GLIDE_MS);
         self.carry_px = 0.0;
     }
 
-    /// The glide's current target (absolute px), for chained retargeting.
+    /// The glide's current target (absolute px).
     #[must_use]
     pub(crate) fn target_px(&self) -> i64 {
         self.target_px
     }
 
-    /// When the glide completes: the last wake the host arms.
+    /// When the glide completes.
     #[must_use]
     pub(crate) fn end(&self) -> Instant {
         self.t0 + self.dur
     }
 }
 
-/// Critically damped spring displacement `t_s` seconds after release from rest at `x0_px`:
-/// `x(t) = x0 · (1 + ωt) · e^{-ωt}`.
-///
-/// The factor `(1+ωt)e^{-ωt}` (ζ = 1, `v0 = 0`) lies in `(0, 1]` for `t >= 0`, so the
-/// displacement keeps the sign of `x0` (no overshoot), its magnitude never grows, and it
-/// falls below any ε in bounded time (`spring_never_overshoots_and_decays`).
+/// Critically damped spring displacement `t_s` seconds after release from rest at `x0_px`.
 #[must_use]
 pub(crate) fn spring_displacement(x0_px: f64, omega: f64, t_s: f64) -> f64 {
     debug_assert!(omega > 0.0);
@@ -274,27 +187,21 @@ pub(crate) fn spring_displacement(x0_px: f64, omega: f64, t_s: f64) -> f64 {
     x0_px * (1.0 + wt) * (-wt).exp()
 }
 
-/// Map raw overscroll pixels past a history end to the resisted elastic displacement: 0.3×,
-/// sign preserved, monotone and odd. Integer, so the translation consumes exact px.
+/// Map raw overscroll pixels past a history end to the resisted elastic displacement.
 #[must_use]
 pub(crate) fn overscroll_resist(raw_px: i64) -> i64 {
     raw_px.signum() * (raw_px.abs() * 3) / 10
 }
 
-/// A self-disarming elastic-overscroll bounce, released from a signed sub-cell displacement
-/// when a scroll pushes past a history end and decaying through [`spring_displacement`]. The
-/// host samples it on frame-paced wakes (feeding the signed `scroll_frac_px` the grid-band
-/// translate presents) and drops it once done, like [`Glide`]. Reduced motion never arms one.
+/// A self-disarming elastic-overscroll bounce.
 #[derive(Debug)]
 pub(crate) struct OverscrollSpring {
     /// The signed release amplitude (device px): positive bounces the band up, negative down.
-    /// Re-seeded from the live displacement by [`Self::add_impulse`].
     x0_px: f64,
     t0: Instant,
     dur: Duration,
     /// The next frame-paced tick: an anchor the host sets one period out in
-    /// `release_overscroll` and advances phase-locked in `tick_overscroll`. `new` seeds it at
-    /// `now`, so an unanchored spring ticks on the next wake rather than never.
+    /// `release_overscroll` and advances phase-locked in `tick_overscroll`.
     next_tick: Instant,
 }
 
@@ -310,26 +217,24 @@ impl OverscrollSpring {
         }
     }
 
-    /// The one wake this bounce owes `about_to_wait`: its anchored next tick,
-    /// capped at the settle bound. Stored state only — a park cannot move it.
+    /// The anchored next tick capped at the settle bound.
     #[must_use]
     pub(crate) fn wake_deadline(&self) -> Instant {
         self.end().min(self.next_tick)
     }
 
-    /// The anchored next tick (see [`Self::wake_deadline`]).
+    /// The anchored next tick.
     #[must_use]
     pub(crate) fn next_tick(&self) -> Instant {
         self.next_tick
     }
 
-    /// Re-anchor the next tick (the host's release and its phase-locked tick).
+    /// Re-anchor the next tick.
     pub(crate) fn set_next_tick(&mut self, next: Instant) {
         self.next_tick = next;
     }
 
-    /// The signed displacement at `now` and whether the bounce is done: below
-    /// [`SPRING_EPS_PX`] or past the [`SPRING_SETTLE_MS`] cap. The host then drops it.
+    /// The signed displacement at `now` and whether the bounce is done.
     #[must_use]
     pub(crate) fn sample(&self, now: Instant) -> (f64, bool) {
         let elapsed = now.saturating_duration_since(self.t0);
@@ -338,29 +243,21 @@ impl OverscrollSpring {
         (disp, done)
     }
 
-    /// Re-release from the current displacement plus `delta_px` (a chained overscroll stacks
-    /// onto the live bounce), restarting the decay at `now`. Clamped to `±max_px`, so a hard
-    /// flick never builds a bounce past the sub-row translate's one-cell domain.
+    /// Re-release from the current displacement plus `delta_px`, clamped to `±max_px`.
     pub(crate) fn add_impulse(&mut self, delta_px: f64, max_px: f64, now: Instant) {
         let (cur, _) = self.sample(now);
         self.x0_px = (cur + delta_px).clamp(-max_px, max_px);
         self.t0 = now;
     }
 
-    /// When the bounce is guaranteed settled: the last wake the host arms.
+    /// When the bounce is guaranteed settled.
     #[must_use]
     pub(crate) fn end(&self) -> Instant {
         self.t0 + self.dur
     }
 }
 
-/// Scroll-pill thumb geometry on a `track_px`-tall track for `view_rows` over `history_rows`
-/// of scrollback at `display_offset` (0 = live bottom, `history_rows` = top).
-///
-/// `None` when there is nothing to show (no history, degenerate track). Otherwise
-/// `(y_px, len_px)` with `y + len <= track_px`, `len >= min(min_len_px, track_px)`, `len`
-/// proportional to `view_rows` over the total, and `y` non-increasing in `display_offset`:
-/// flush bottom at offset 0, flush top at `history_rows`.
+/// Scroll-pill thumb geometry `(y_px, len_px)` on a `track_px`-tall track.
 #[must_use]
 pub(crate) fn pill_geometry(
     track_px: u32,
@@ -381,10 +278,7 @@ pub(crate) fn pill_geometry(
     Some((y, len))
 }
 
-/// The pill's alpha `since_touch_ms` after the last scroll activity. `animated` is the
-/// `ScrollPill` motion gate: `true` ramps 255→0 over [`PILL_FADE_MS`] after the hold; `false`
-/// (Reduced motion) is binary, 255 until the hold ends, then 0. Monotone non-increasing, and
-/// 0 by `PILL_HOLD_MS + PILL_FADE_MS` in both modes.
+/// The pill's alpha `since_touch_ms` after the last scroll activity.
 #[must_use]
 pub(crate) fn pill_alpha(since_touch_ms: u64, animated: bool) -> u8 {
     if since_touch_ms < PILL_HOLD_MS {
@@ -397,19 +291,17 @@ pub(crate) fn pill_alpha(since_touch_ms: u64, animated: bool) -> u8 {
     if into_fade >= PILL_FADE_MS {
         return 0;
     }
-    // Linear ramp 255→0 across the fade window (integer, monotone).
     (255 - (into_fade * 255) / PILL_FADE_MS) as u8
 }
 
-/// Auto-fading scroll-pill state: the last scroll activity plus the [`pill_alpha`] envelope.
-/// Once the alpha hits 0, [`Self::next_deadline`] is `None` and the loop idles.
+/// Auto-fading scroll-pill state.
 #[derive(Debug, Default)]
 pub(crate) struct PillFade {
     last_touch: Option<Instant>,
 }
 
 impl PillFade {
-    /// Record scroll activity at `now`: the pill (re)shows fully opaque.
+    /// Record scroll activity at `now`.
     pub(crate) fn touch(&mut self, now: Instant) {
         self.last_touch = Some(now);
     }
@@ -430,9 +322,7 @@ impl PillFade {
         self.alpha(now, animated) > 0
     }
 
-    /// The next wake this pill needs: one at the hold boundary while opaque; during the fade,
-    /// the frame cadence capped at the ramp end (whose wake paints the erase frame); `None`
-    /// once invisible.
+    /// The next wake this pill needs, or `None` once invisible.
     #[must_use]
     pub(crate) fn next_deadline(
         &self,
@@ -461,17 +351,7 @@ impl PillFade {
 mod tests {
     //! M1 PROVE bullets, Tier-1 (real code): lattice/exhaustive proofs of the
     //! decomposition law, glide convergence, spring overshoot-freedom, and
-    //! the pill laws — over the SHIPPING kinematics above. The glide's wake
-    //! discipline also carries a Tier-0 abstract twin
-    //! (`aterm_models_render::scroll_glide_model`) checked by the real Trust
-    //! `ty` (proves at `Buggy=0`, counterexample at `Buggy=1`); these tests
-    //! bind ordinary convergence to the code that ships, while app_input's
-    //! `reduced_motion_settle_conforms_to_scroll_glide_model` binds the policy
-    //! transition. Division and
-    //! transcendentals are outside the ty `Expr` language, so the lattices
-    //! here are the always-on proof layer for (1) and (3) — the documented
-    //! waiver, mirroring the box-drawing rounding law's size-lattice proof.
-
+    //! the pill laws — over the SHIPPING kinematics above.
     use super::*;
 
     /// Cell heights on an odd/even lattice.
@@ -479,12 +359,10 @@ mod tests {
 
     /// PROVE (1) — decomposition law: `rows*cell_h + frac == px` with
     /// `frac ∈ [0, cell_h)` for EVERY point of a signed px lattice × the
-    /// cell-height lattice. Includes negative px (elastic overscroll) where
-    /// truncating division would violate the frac range.
+    /// cell-height lattice.
     #[test]
     fn scroll_px_decomposition_law() {
         for &ch in &CELL_HEIGHTS {
-            // Dense band around zero + coarse sweep across ±3 cells and far out.
             for px in (-3 * ch - 2..=3 * ch + 2).chain([-1_000_003, -65_536, 65_537, 1_000_003]) {
                 let (rows, frac) = decompose(px, ch);
                 assert_eq!(
@@ -498,7 +376,6 @@ mod tests {
                 );
             }
         }
-        // Non-vacuity: both a nonzero row part and a nonzero frac occur.
         assert_eq!(decompose(17, 8), (2, 1));
         assert_eq!(decompose(-1, 8), (-1, 7), "negative px borrows a full row");
     }
@@ -508,12 +385,12 @@ mod tests {
     #[test]
     fn glide_converges_monotonically_and_exactly() {
         let cases: [(i64, i64); 6] = [
-            (0, 960),      // downward into history
-            (960, 0),      // back to live
-            (0, 0),        // degenerate (already there)
-            (-64, 128),    // crossing zero
-            (7, 8),        // sub-cell hop
-            (100_000, -3), // large jump, sign change
+            (0, 960),
+            (960, 0),
+            (0, 0),
+            (-64, 128),
+            (7, 8),
+            (100_000, -3),
         ];
         for (start, target) in cases {
             for step_ms in [1u64, 7, 16, 33] {
@@ -572,7 +449,6 @@ mod tests {
                     break;
                 }
             }
-            // Retarget mid-flight: the chain converges from the sampled point.
             let mut g = Glide::new(0, 960, t0);
             let mid = t0 + Duration::from_millis(90);
             let (mid_pos, mid_done) = g.sample(mid);
@@ -596,13 +472,12 @@ mod tests {
     #[test]
     fn a_precise_stream_tracks_one_to_one() {
         let t0 = Instant::now();
-        let cell = 34i64; // Retina 2x, 15 px face
-        let tick = Duration::from_micros(8_333); // 120 Hz
+        let cell = 34i64;
+        let tick = Duration::from_micros(8_333);
         let max_px = 1_000 * cell;
         for rows_per_100ms in [0.5f64, 1.0, 2.0, 4.0] {
             let px_per_tick = rows_per_100ms * cell as f64 * 8.333 / 100.0;
 
-            // The track law.
             let mut g = Glide::tracked(0, cell, t0);
             let mut now = t0;
             let mut finger = 0.0f64;
@@ -632,7 +507,6 @@ mod tests {
                 mn >= 1 && mx <= 2 * mn,
                 "even motion at {rows_per_100ms} rows/100 ms: max {mx} px/frame, min {mn}"
             );
-            // Rest: one wake at the boundary, the position held, then the settle.
             let rest_end = now + Duration::from_millis(TRACK_REST_MS);
             assert_eq!(
                 g.next_wake(now, tick),
@@ -658,7 +532,6 @@ mod tests {
                 (landed - prev).abs() <= cell / 2,
                 "…the NEAREST one ({landed} from {prev})"
             );
-            // Release: a gesture end starts the settle at once.
             let mut r = Glide::tracked(7, cell, t0);
             r.release(t0 + Duration::from_millis(3));
             assert_eq!(
@@ -685,7 +558,6 @@ mod tests {
             for omega in [8.0f64, SPRING_OMEGA, 30.0] {
                 let mut prev_mag = x0.abs();
                 let mut settled_at: Option<f64> = None;
-                // 1ms lattice over 2s — far past any settle bound used here.
                 for ms in 0..=2000u32 {
                     let t = f64::from(ms) / 1000.0;
                     let x = spring_displacement(x0, omega, t);
@@ -709,7 +581,6 @@ mod tests {
                 );
             }
         }
-        // Negative control: an underdamped response (ζ < 1) does flip sign.
         let underdamped =
             |x0: f64, t: f64| x0 * (0.5 * SPRING_OMEGA * t).cos() * (-0.3 * SPRING_OMEGA * t).exp();
         assert!(
@@ -724,7 +595,6 @@ mod tests {
     #[test]
     fn overscroll_spring_bounces_and_self_disarms() {
         let t0 = Instant::now();
-        // A downward bounce (negative amplitude, as a top-of-history overscroll releases).
         let sp = OverscrollSpring::new(-12.0, t0);
         assert_eq!(sp.end(), t0 + Duration::from_millis(SPRING_SETTLE_MS));
         let (d0, done0) = sp.sample(t0);
@@ -732,7 +602,6 @@ mod tests {
             (d0 - -12.0).abs() < 1e-9 && !done0,
             "t=0 sits at the release amplitude"
         );
-        // Frame-paced wakes converge to done within the settle cap.
         let mut prev_mag = d0.abs();
         let mut wakes = 0u64;
         let mut now = t0;
@@ -762,7 +631,6 @@ mod tests {
             "disarms by the settle cap"
         );
 
-        // Chained impulse: re-release from the live displacement, clamped to ±max.
         let mut sp = OverscrollSpring::new(6.0, t0);
         let mid = t0 + Duration::from_millis(20);
         let (live, _) = sp.sample(mid);
@@ -799,7 +667,6 @@ mod tests {
             for view in [1u32, 24, 60] {
                 for hist in [1u32, 5, 240, 100_000] {
                     let mut prev_y: Option<u32> = None;
-                    // Offset sweep including both endpoints exactly.
                     let offsets = [0, 1, hist / 3, hist / 2, hist.saturating_sub(1), hist];
                     let mut uniq: Vec<u32> = offsets.to_vec();
                     uniq.sort_unstable();
@@ -826,7 +693,6 @@ mod tests {
                 }
             }
         }
-        // No history / degenerate geometry → no pill.
         assert_eq!(pill_geometry(100, 8, 24, 0, 0), None);
         assert_eq!(pill_geometry(0, 8, 24, 50, 0), None);
         assert_eq!(pill_geometry(100, 8, 0, 50, 0), None);
@@ -853,7 +719,6 @@ mod tests {
                 "invisible by HOLD+FADE (the disarm bound)"
             );
         }
-        // Non-vacuity: the animated ramp has a genuine intermediate value.
         let mid = pill_alpha(PILL_HOLD_MS + PILL_FADE_MS / 2, true);
         assert!(mid > 0 && mid < 255, "fade ramp passes through mid alphas");
     }
@@ -871,23 +736,19 @@ mod tests {
             "untouched pill arms nothing"
         );
         p.touch(t0);
-        // During the hold: one wake at the hold boundary.
         assert_eq!(
             p.next_deadline(t0, true, iv),
             Some(t0 + Duration::from_millis(PILL_HOLD_MS))
         );
-        // During the fade: frame-paced, capped at the ramp end.
         let in_fade = t0 + Duration::from_millis(PILL_HOLD_MS + PILL_FADE_MS / 2);
         let d = p
             .next_deadline(in_fade, true, iv)
             .expect("fading pill arms");
         assert!(d <= t0 + Duration::from_millis(PILL_HOLD_MS + PILL_FADE_MS));
         assert!(d > in_fade);
-        // After the ramp: alpha 0, disarmed.
         let after = t0 + Duration::from_millis(PILL_HOLD_MS + PILL_FADE_MS);
         assert_eq!(p.alpha(after, true), 0);
         assert_eq!(p.next_deadline(after, true, iv), None, "self-disarm");
-        // Reduced motion: the hold-boundary wake is the erase wake; nothing after.
         let hold_end = t0 + Duration::from_millis(PILL_HOLD_MS);
         assert_eq!(p.next_deadline(hold_end, false, iv), None);
         assert!(!p.is_active(hold_end, false), "binary hide at the boundary");

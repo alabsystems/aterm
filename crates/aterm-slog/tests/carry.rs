@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The carry across a seamless update (design §5.2, phase 2A): the fold's
-//! snapshot, the tracker's carry line, the log's carry and its cut, the
-//! successor's continuation, the readers' fence, and hostile input.
+//! The carry across a seamless update (design §5.2, phase 2A).
 
 use aterm_slog::{
     Actor, BoxWord, CarryAdopt, CarryBudget, CarryError, Close, Conf, Cursor, Fields, Fold, GapWhy,
@@ -15,7 +13,7 @@ use aterm_spec::rng::XorShift;
 use crate::support::{WALL0, agent_session, at};
 
 /// Seeded traffic on an agent session: turns with steps and verdict marks,
-/// needs, claims, mail, commands. Returns the run.
+/// needs, claims, mail, commands.
 fn traffic(log: &mut Log, rng: &mut XorShift, n: usize, ms0: u64) -> Node {
     let run = log
         .open_nodes()
@@ -370,8 +368,7 @@ fn carry_and_closed_summary_exclude_content_fields_from_the_fold() {
 /// THE FOLD CROSSES AS IT STANDS: a snapshot restored folds on exactly as
 /// the original, over the same later records, for seeded traffic (needs,
 /// claims, totals, the open path, the newest closed nodes and every field's
-/// confidence). NEGATIVE CONTROL: a fold rebuilt from the records alone, the
-/// ring having evicted, does not.
+/// confidence).
 #[test]
 fn fold_snapshot_round_trips_and_folds_on_identically() {
     for seed in 1..=20u64 {
@@ -526,7 +523,7 @@ fn a_carried_log_reads_like_its_predecessor_and_says_the_handoff_hole() {
 /// memory would evict first (closed detail before the open records of
 /// closed turns, those before closes), never the open path, and counts each
 /// shed record as an eviction: in `lost=` and its nearest open node's
-/// rollup. NEGATIVE CONTROL: with room for all, nothing is shed.
+/// rollup.
 #[test]
 fn the_carry_cut_is_the_eviction_order_and_counts_what_it_shed() {
     let mut log = Log::new(1);
@@ -586,13 +583,10 @@ fn the_carry_cut_is_the_eviction_order_and_counts_what_it_shed() {
     let (new, _, stats) = Log::from_carry(&cut.lines, adopt_at(&log, 99_000)).expect("reads");
     assert_eq!(stats.shed, cut.shed);
     assert_eq!(new.lost(), log.lost() + cut.shed, "shed counts as lost");
-    // Detail (bells) went before any turn's open, the opens before closes.
     let kept = |pred: &dyn Fn(&Rec) -> bool| new.window().filter(|r| pred(r)).count();
     let bells = kept(&|r| r.k == Kind::Bell);
     let opens = kept(&|r| r.op == aterm_slog::Op::Open && r.k == Kind::Turn && r.node != open_turn);
     let closes = kept(&|r| r.op == aterm_slog::Op::Close && r.k == Kind::Turn);
-    // The order: a bell kept means every open kept; an open kept means
-    // every close kept.
     assert!(
         bells == 0 || opens == 40,
         "closed detail before opens: {bells} {opens}"
@@ -611,8 +605,6 @@ fn the_carry_cut_is_the_eviction_order_and_counts_what_it_shed() {
         new.is_open(run) && new.is_open(open_turn),
         "the open path crosses"
     );
-    // A closed turn whose open record was shed still knows its parent: its
-    // close is the run's, for `log r1` and for the eviction class.
     let orphaned = new
         .window()
         .filter(|r| r.op == aterm_slog::Op::Close && r.k == Kind::Turn)
@@ -627,7 +619,6 @@ fn the_carry_cut_is_the_eviction_order_and_counts_what_it_shed() {
         Some(run),
         "{orphaned}'s parent crossed"
     );
-    // The shed records were under the run (the closed turns'): its rollup.
     let roll = new.open_entry(run).expect("open").roll;
     assert_eq!(
         u64::from(roll.lost),
@@ -724,7 +715,6 @@ fn a_carried_open_node_closes_dur_wall() {
         )
         .expect("turn");
     let out = log.carry(CarryBudget::SESSION, &[]).expect("carried");
-    // The successor's clock starts near 0 while the wall moved on 30 s.
     let a = CarryAdopt {
         at: Stamp::new(WALL0 + 31_000, 200),
         ..adopt_at(&log, 0)
@@ -781,7 +771,6 @@ fn a_tracker_carried_mid_sequence_writes_what_an_uncarried_one_would() {
             if cut == Some(i) {
                 let line = tr.carry_line(at(*ms - 1));
                 let out = log.carry(CarryBudget::SESSION, &[line]).expect("carried");
-                // The successor's clock: its own monotonic zero, the wall on.
                 let now = Stamp::new(WALL0 + *ms - 1, 50);
                 mono_shift = 50 - (*ms as i64 - 1);
                 let a = CarryAdopt {
@@ -814,9 +803,6 @@ fn a_tracker_carried_mid_sequence_writes_what_an_uncarried_one_would() {
         assert_eq!(run_all(Some(cut)), plain, "carried before step {cut}");
     }
 
-    // A young successor clock cannot represent the resting word's whole age
-    // as a nonnegative local origin. Its deadline and elapsed age still agree
-    // with the uninterrupted tracker, both before and after the settle is due.
     for (age, successor_mono) in [(500u64, 0), (2500, 0), (2500, 5000)] {
         let mut plain_log = Log::new(1);
         let run = agent_session(&mut plain_log, 0);
@@ -867,9 +853,6 @@ fn a_tracker_carried_mid_sequence_writes_what_an_uncarried_one_would() {
         );
     }
 
-    // A wall-clock rollback puts the carried origin in the successor's
-    // future. Elapsed age stays zero until that origin, then reaches one
-    // settle interval exactly when the original tracker does.
     let mut plain_log = Log::new(1);
     let run = agent_session(&mut plain_log, 0);
     let mut plain = TurnTracker::new(run);
@@ -901,7 +884,7 @@ fn a_tracker_carried_mid_sequence_writes_what_an_uncarried_one_would() {
 
 /// ATTRIBUTION ACROSS AN UPDATE (by both clocks): an input an hour old is
 /// carried as nothing and attributes no turn in the successor, however young
-/// its clock; one 2 s old still does. NEGATIVE CONTROL: the 2 s input.
+/// its clock; one 2 s old still does.
 #[test]
 fn a_carried_input_attributes_only_while_recent_by_the_wall() {
     let opened_by = |input_ms_ago: u64| -> Actor {
@@ -910,8 +893,6 @@ fn a_carried_input_attributes_only_while_recent_by_the_wall() {
         let mut tr = TurnTracker::new(run);
         let now_ms = 10_000_000;
         tr.note_input(Actor::Human, at(now_ms - input_ms_ago));
-        // Carried as the export saw it, an hour on the old clock is kept as
-        // the line: drop happens at the carry for anything past 5 s.
         let line = tr.carry_line(at(now_ms));
         let succ_now = Stamp::new(WALL0 + now_ms + 300, 300);
         let mut tr = TurnTracker::from_carry_line(&line, succ_now).expect("reads");
@@ -931,7 +912,6 @@ fn a_carried_input_attributes_only_while_recent_by_the_wall() {
         Actor::Human,
         "NEGATIVE CONTROL: 2 s old, it does"
     );
-    // Even a line that carries an old input (written by hand) fails closed.
     let mut log = Log::new(1);
     let run = agent_session(&mut log, 0);
     let line = format!(
@@ -949,7 +929,7 @@ fn a_carried_input_attributes_only_while_recent_by_the_wall() {
 
 /// THE READERS' FENCE: once a carry is taken, readers see nothing past it
 /// until the fence lifts, the fold as it stood included; the log goes on
-/// recording. Lifted (the update stood down), they read on.
+/// recording.
 #[test]
 fn a_fenced_log_shows_readers_nothing_past_its_carry() {
     let mut log = Log::new(1);
@@ -1046,7 +1026,6 @@ fn a_hostile_carry_never_panics_and_is_refused_whole() {
         }
         check(&lines);
     }
-    // Specific refusals, each of the whole carry.
     let refused = |lines: Vec<String>, why: &str| {
         assert!(Log::from_carry(&lines, a).is_err(), "{why} was read");
     };
@@ -1064,9 +1043,6 @@ fn a_hostile_carry_never_panics_and_is_refused_whole() {
         .expect("an open line");
     v[open_at] = v[open_at].replacen("open r", "open r9999", 1);
     refused(v, "a node past the counters");
-    // The line count is a bound of its own: lines short enough to stay
-    // within the byte bound, one past the count, are refused for it; at
-    // the count, for something else.
     let lines_long = |n: usize| {
         let mut v = good.lines.clone();
         v.resize(n, String::new());
@@ -1087,8 +1063,6 @@ fn a_hostile_carry_never_panics_and_is_refused_whole() {
     v.retain(|l| !(l.starts_with("r ") && l.contains(" open r1 ")));
     refused(v, "an open node without its open record");
 
-    // A stale producer may have written closed=0 while including the session's
-    // close. Neither that record nor a closed fold may revive the session.
     let mut v = good.lines.clone();
     let close = Rec {
         seq: log.last_seq() + 1,
@@ -1128,10 +1102,6 @@ fn a_hostile_carry_never_panics_and_is_refused_whole() {
     v.push("fold closed - spawn out=ui-close dur_ms=1 t=1 by=human opened_by=aterm src=aterm conf=exact".into());
     refused(v, "a carried closed fold despite an open flag");
 
-    // THE RECEIVER'S BYTE BOUND, on well-formed carries: one a little past
-    // a session's budget reads (an earlier build's writer estimated its
-    // header's and rollups' widths); one at the bound reads; one byte past
-    // it (in an opaque host line) is refused whole.
     let mut big = Log::new(2);
     agent_session(&mut big, 0);
     let fat = Fields::new()
@@ -1218,9 +1188,7 @@ fn a_carried_log_takes_the_manifests_reserved_ids() {
 /// `SEQ_LIMIT`), or one at or above the count the successor is told to start
 /// from, refuses the carry, so no successor saturates and repeats its seqs or
 /// draws a ceiling below its own head (which would stand every later Commit
-/// down). The uncarried path reads a count past the limit as none: a new seq
-/// space. NEGATIVE CONTROL: the carry as written reads, and so does one whose
-/// head is just below the count.
+/// down).
 #[test]
 fn a_carry_past_the_seq_limit_or_the_manifests_count_is_refused() {
     let mut rng = XorShift::new(23);
@@ -1256,7 +1224,6 @@ fn a_carry_past_the_seq_limit_or_the_manifests_count_is_refused() {
         let got = Log::from_carry(&lines, CarryAdopt { next_seq, ..a });
         assert!(got.is_err(), "{why} was read");
     }
-    // A count past the limit, uncarried: a new seq space from 1.
     let after = Log::after_handoff(
         3,
         Limits::SESSION,
@@ -1270,7 +1237,6 @@ fn a_carry_past_the_seq_limit_or_the_manifests_count_is_refused() {
         "a count no log reaches is none"
     );
 
-    // NEGATIVE CONTROL: as written, and with the head just below the count.
     assert!(Log::from_carry(&good.lines, a).is_ok());
     let (tight, _, _) = Log::from_carry(
         &good.lines,
@@ -1292,8 +1258,7 @@ fn a_carry_past_the_seq_limit_or_the_manifests_count_is_refused() {
 /// bytes, is left out, never written, and the carry reads with the rest of
 /// the host's lines; a tracker on a wall whose detail is of any length
 /// writes a line within the bound (the step's field as the log holds it) and
-/// its successor continues that wall with the same field. NEGATIVE CONTROL:
-/// the long line written into the carry by hand refuses it whole.
+/// its successor continues that wall with the same field.
 #[test]
 fn a_host_line_past_the_bound_is_left_out_and_the_carry_reads() {
     let mut log = Log::new(1);
@@ -1331,7 +1296,6 @@ fn a_host_line_past_the_bound_is_left_out_and_the_carry_reads() {
         "the tracker crossed, the long line did not"
     );
     assert!(TurnTracker::from_carry_line(&back[1], at(1_000)).is_some());
-    // The step's detail crosses as the log's field holds it.
     let held = log
         .window()
         .rfind(|r| r.k == Kind::Wall && r.op == aterm_slog::Op::Open)
@@ -1344,7 +1308,6 @@ fn a_host_line_past_the_bound_is_left_out_and_the_carry_reads() {
         .expect("the step's detail crossed");
     assert_eq!(carried, held);
 
-    // NEGATIVE CONTROL: written by hand, the long line refuses the carry.
     let mut lines = out.lines.clone();
     let i = lines
         .iter()
@@ -1352,8 +1315,6 @@ fn a_host_line_past_the_bound_is_left_out_and_the_carry_reads() {
         .expect("a host line");
     lines[i] = format!("host {}", "x".repeat(2000));
     assert!(Log::from_carry(&lines, a).is_err());
-    // Nor do host lines past the count or the bytes a carry passes, each
-    // line within its own bound.
     let refused = |lines: &[String]| {
         matches!(
             Log::from_carry(lines, a),
@@ -1372,11 +1333,6 @@ fn a_host_line_past_the_bound_is_left_out_and_the_carry_reads() {
         *l = format!("host {}", "x".repeat(900));
     }
     assert!(refused(&wide), "five 900-byte host lines");
-    // AT THE BOUNDS, SENDER AND RECEIVER AGREE: host lines each a whole
-    // carry line with their tag, together the host bytes exactly, all
-    // cross, where a line one byte longer before them, and one more line
-    // of one byte after them, are left out; one byte more in a line, or in
-    // all of them, refuses the carry.
     let max = aterm_slog::CARRY_MAX_LINE - "host ".len();
     let whole = (aterm_slog::CARRY_MAX_HOST_BYTES - 1) / (max + 1);
     let mut full = vec!["x".repeat(max); whole];
@@ -1456,12 +1412,7 @@ fn carried_turn() -> (Log, Node, Node, Node, Vec<String>) {
 }
 
 /// a carried fold that tracks an open node
-/// twice disagrees with its log, which holds it open once. Read, the log's
-/// close of the turn would leave the fold's other copy open for good, so the
-/// carry is refused whole, never repaired. CONTROL: the carry as written
-/// reads, and the turn's close closes it in the fold too.
-/// NEGATIVE CONTROL: without the check (`Fold::agrees_with_open`), the
-/// duplicate reads and the fold keeps the closed turn open.
+/// twice disagrees with its log, which holds it open once.
 #[test]
 fn a_duplicated_fold_open_line_is_refused() {
     let (log, _, turn, _, lines) = carried_turn();
@@ -1500,11 +1451,7 @@ fn a_duplicated_fold_open_line_is_refused() {
 
 /// a carried fold's open node must be one the
 /// carried log holds open, of the same kind and under the same parent (the
-/// deepest open node above it). Each disagreement refuses the whole carry:
-/// a `fold open` line for a run the log holds closed, the open turn's line
-/// moved under the session, the open run's line of another run kind.
-/// NEGATIVE CONTROL: without the check each reads, and the fold shows a run
-/// or a turn the log does not hold so.
+/// deepest open node above it).
 #[test]
 fn a_fold_open_line_for_a_node_the_log_does_not_hold_open_is_refused() {
     let (log, run, turn, ghost, lines) = carried_turn();
@@ -1554,9 +1501,7 @@ fn a_fold_open_line_for_a_node_the_log_does_not_hold_open_is_refused() {
 
 /// a closed session holds
 /// nothing open, so a summary whose fold tracks an open node disagrees with
-/// it and is refused whole. CONTROL: the summary as written reads.
-/// NEGATIVE CONTROL: without the check it reads, its fold showing a run
-/// open in a closed session.
+/// it and is refused whole.
 #[test]
 fn a_closed_summary_whose_fold_holds_a_node_open_is_refused() {
     let mut log = Log::new(1);

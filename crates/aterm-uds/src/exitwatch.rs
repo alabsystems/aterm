@@ -1,32 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A kernel witness of another process's death, with its full `wait(2)` status,
-//! so the PTY keeper can classify how a window ended.
-//!
-//! Darwin's `kqueue` `EVFILT_PROC` with `NOTE_EXIT | NOTE_EXITSTATUS` delivers a
-//! process's wait status to a watcher that is not its parent, provided the
-//! watcher may signal the target (a same-uid watcher may). `exit(7)` reads
-//! `0x0700`, `SIGKILL` reads `0x9`.
-//!
-//! Properties callers rely on:
-//! * The event is durable: XNU queues the knote inside `proc_exit` and it stays
-//!   queued until read, even if someone else reaps the target.
-//! * The knote is one-shot: the read dequeues it, so the watch keeps what it
-//!   read and answers the same on every later call.
-//!
-//! `poll(2)` reports the watch's kqueue readable once the event is queued, so a
-//! single-threaded loop can wait on many watches beside its sockets ([`ExitWatch::as_raw_fd`]).
-//!
-//! Register while the target is alive; if it is already gone (`ESRCH`),
-//! [`ExitWatch::watch`] answers `None`. Other platforms also answer `None`
-//! (Linux's `pidfd` cannot read a non-child's status).
-//!
-//! [`ExitMoment`] records when rather than how: a thread stamps the exit the
-//! moment the kernel reports it (this kqueue on Darwin, a `pidfd` on Linux).
-//! `aterm ctl subscribe` orders a relaunch's start against it.
+//! A kernel witness of another process's death.
 
-/// A one-process exit watch. See the module docs.
+/// A one-process exit watch.
 #[derive(Debug)]
 pub struct ExitWatch {
     #[cfg(target_vendor = "apple")]
@@ -35,7 +12,6 @@ pub struct ExitWatch {
     seen: std::sync::OnceLock<i32>,
 }
 
-// The kqueue FFI, shared with `procwatch`'s exec edges.
 #[cfg(target_vendor = "apple")]
 pub(crate) mod kq {
     /// `struct kevent` (sys/event.h), 32 bytes on both Apple ABIs.
@@ -79,12 +55,9 @@ pub(crate) mod kq {
 }
 
 impl ExitWatch {
-    /// Watch `pid`, which must still be alive. `None`: it is already gone, it
-    /// is not a process anyone watches (`<= 1`), or this platform has no
-    /// primitive.
+    /// Watch `pid`, which must still be alive.
     #[cfg(target_vendor = "apple")]
     #[must_use]
-    // Skip: bottoms out at the `kqueue`/`kevent`/`fcntl` FFI calls.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn watch(pid: u32) -> Option<Self> {
         use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -98,8 +71,6 @@ impl ExitWatch {
         }
         // SAFETY: `raw` is a fresh descriptor this process exclusively owns.
         let kqfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-        // Close-on-exec by house rule (Darwin does not inherit a kqueue across
-        // fork anyway).
         // SAFETY: F_SETFD takes an int and touches only this descriptor's flags.
         unsafe { kq::fcntl(kqfd.as_raw_fd(), kq::F_SETFD, kq::FD_CLOEXEC) };
         let change = kq::Kevent {
@@ -110,8 +81,6 @@ impl ExitWatch {
             data: 0,
             udata: std::ptr::null_mut(),
         };
-        // No output slot: a registration failure (ESRCH) then comes back through
-        // the return value, never as an EV_ERROR event mistaken for an exit.
         // SAFETY: one change entry, live for the call; no event list requested.
         let rc = unsafe {
             kq::kevent(
@@ -145,11 +114,8 @@ impl ExitWatch {
     }
 
     /// The target's `wait(2)`-encoded status if the kernel has recorded one.
-    /// Never blocks and never reaps. Once it has answered, it answers the same
-    /// on every later call.
     #[cfg(target_vendor = "apple")]
     #[must_use]
-    // Skip: bottoms out at the `kevent` FFI call.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn exit_status(&self) -> Option<i32> {
         use std::os::fd::AsRawFd as _;
@@ -188,7 +154,6 @@ impl ExitWatch {
         {
             return None;
         }
-        // The status is the low 32 bits of `data`, in `wait(2)`'s encoding.
         let raw = i32::try_from(event.data & 0xffff_ffff).ok()?;
         Some(*self.seen.get_or_init(|| raw))
     }
@@ -208,8 +173,7 @@ impl ExitWatch {
         self.kq.as_raw_fd()
     }
 
-    /// See the Darwin twin: never called, since [`ExitWatch::watch`] answers `None` here. `-1` is
-    /// the one value `poll(2)` skips.
+    /// See the Darwin twin: never called, since [`ExitWatch::watch`] answers `None` here.
     #[cfg(not(target_vendor = "apple"))]
     #[must_use]
     pub fn as_raw_fd(&self) -> i32 {
@@ -223,32 +187,17 @@ pub fn exit_moment_thread(pid: u32) -> String {
     format!("aterm-exit-moment-{pid}")
 }
 
-/// When another process ended: a thread that waits for nothing else calls `stamp` as the
-/// kernel reports the exit (Darwin: [`ExitWatch`]'s kqueue; Linux: a `pidfd`). Neither event
-/// carries a time, so the stamp is the thread's own read on waking: after the exit, and before
-/// anything that must first learn of it. If the pid was already reused, the stamp follows the
-/// later process's exit.
-///
-/// `None` for a pid already gone (`ESRCH`), a platform with no primitive (Windows, the BSDs), a
-/// thread that cannot be spawned, and on Linux a kernel without `pidfd_open` or an
-/// architecture whose syscall number is not wired. Dropping the watch ends its thread without
-/// waiting for it.
+/// When another process ended.
 #[derive(Debug)]
 pub struct ExitMoment<T> {
     stamped: std::sync::Arc<std::sync::OnceLock<T>>,
-    /// Dropped with the watch: the thread's pipe reads end-of-file and the
     /// thread returns.
     #[cfg(unix)]
     _cancel: std::io::PipeWriter,
 }
 
 impl<T: Clone + Send + Sync + 'static> ExitMoment<T> {
-    /// Watch `pid`, which must still be alive, and stamp its exit with
-    /// `stamp`. `None`: see the type.
-    ///
-    /// The second `cfg` is redundant to the compiler (`wasm32-unknown-unknown`
-    /// is not `unix`) but needed by the wasm census, which reads only the
-    /// spellings it knows.
+    /// Watch `pid`, which must still be alive, and stamp its exit with `stamp`.
     #[cfg(unix)]
     #[cfg(not(target_arch = "wasm32"))]
     #[must_use]
@@ -292,13 +241,7 @@ impl<T: Clone + Send + Sync + 'static> ExitMoment<T> {
     }
 }
 
-/// A descriptor `poll(2)` reports readable once `pid` has exited (Darwin: an [`ExitWatch`]
-/// kqueue; Linux: a `pidfd`), for a loop that waits on it beside its own. Nothing is read or
-/// reaped. `None`: see [`ExitMoment`].
-///
-/// The watch is on the pid as it stands at the call: a caller whose pid may have been reissued
-/// proves it still names its process after this returns (a process that ended cannot come back
-/// under the same pid with the same start time).
+/// A descriptor `poll(2)` reports readable once `pid` has exited (Darwin.
 #[cfg(unix)]
 #[cfg(not(target_arch = "wasm32"))]
 #[must_use]
@@ -321,15 +264,12 @@ type ExitReadable = ExitWatch;
 #[cfg(all(unix, not(target_vendor = "apple")))]
 type ExitReadable = std::os::fd::OwnedFd;
 
-/// Something that `poll(2)` reports readable once `pid` has exited — Darwin:
 /// the [`ExitWatch`] kqueue.
 #[cfg(target_vendor = "apple")]
 fn exit_readable(pid: u32) -> Option<ExitReadable> {
     ExitWatch::watch(pid)
 }
 
-/// See the Darwin twin. Linux: `pidfd_open(pid, 0)`, close-on-exec by
-/// default. Its syscall number is 434 on every architecture this arm compiles
 /// for (alpha, ia64 and mips differ, and are not wired).
 #[cfg(all(
     any(target_os = "linux", target_os = "android"),
@@ -341,7 +281,6 @@ fn exit_readable(pid: u32) -> Option<ExitReadable> {
         target_arch = "riscv64"
     )
 ))]
-// Skip: bottoms out at the `syscall` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
 fn exit_readable(pid: u32) -> Option<ExitReadable> {
     use std::os::fd::FromRawFd as _;
@@ -350,8 +289,7 @@ fn exit_readable(pid: u32) -> Option<ExitReadable> {
         fn syscall(number: core::ffi::c_long, ...) -> core::ffi::c_long;
     }
     let pid = i32::try_from(pid).ok().filter(|p| *p > 1)?;
-    // SAFETY: `pidfd_open` takes a pid and a flags word, and returns a new
-    // descriptor or -1; nothing is borrowed.
+    // SAFETY: `pidfd_open` takes a pid and a flags word, and returns a new descriptor or -1.
     let fd = unsafe { syscall(SYS_PIDFD_OPEN, pid, 0u32) };
     let fd = i32::try_from(fd).ok().filter(|fd| *fd >= 0)?;
     // SAFETY: `fd` is a fresh descriptor this process exclusively owns.
@@ -377,10 +315,8 @@ fn exit_readable(_pid: u32) -> Option<ExitReadable> {
     None
 }
 
-/// Block until `target` or `cancel` is readable: `true` when the target is
 /// (the exit came), `false` when only the cancel pipe is or `poll` fails.
 #[cfg(unix)]
-// Skip: a blocking `poll(2)` wait (FFI, unverifiable body).
 #[cfg_attr(trust_verify, trust::skip)]
 fn wait_readable(target: i32, cancel: i32) -> bool {
     #[repr(C)]
@@ -389,8 +325,6 @@ fn wait_readable(target: i32, cancel: i32) -> bool {
         events: i16,
         revents: i16,
     }
-    // `nfds_t`: `unsigned long` in glibc and musl, `unsigned int` on Darwin,
-    // the BSDs and Android's bionic.
     #[cfg(target_os = "linux")]
     type Nfds = core::ffi::c_ulong;
     #[cfg(not(target_os = "linux"))]
@@ -398,7 +332,6 @@ fn wait_readable(target: i32, cancel: i32) -> bool {
     unsafe extern "C" {
         fn poll(fds: *mut PollFd, nfds: Nfds, timeout: i32) -> i32;
     }
-    // The same bit on Darwin, the BSDs and Linux.
     const POLLIN: i16 = 0x1;
     loop {
         let mut fds = [
@@ -421,7 +354,6 @@ fn wait_readable(target: i32, cancel: i32) -> bool {
             }
             return false;
         }
-        // The exit first: when both came at once, the exit is still the fact.
         if fds[0].revents != 0 {
             return true;
         }
@@ -434,7 +366,7 @@ fn wait_readable(target: i32, cancel: i32) -> bool {
 #[cfg(all(test, unix))]
 mod moment_tests {
     use super::{ExitMoment, exit_moment_thread};
-    // `spawnfd`'s, so a `sleep 600` does not hold another test thread's pipe.
+
     use crate::spawnfd::Command;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
@@ -451,7 +383,6 @@ mod moment_tests {
         now
     }
 
-    /// The stamp lands after the kill, on the watch's own thread; a gone pid cannot be
     /// watched; a watch dropped before the exit ends its thread without stamping.
     #[test]
     fn the_moment_is_stamped_when_the_kernel_reports_the_exit() {
@@ -507,7 +438,6 @@ mod moment_tests {
         let watch = ExitMoment::watch(idle.id(), stamp).expect("watch");
         let thread = watch.thread_alive();
         drop(watch);
-        // The thread holds its half of the stamp until it returns.
         let deadline = Instant::now() + Duration::from_secs(60);
         while thread.upgrade().is_some() {
             assert!(
@@ -529,10 +459,9 @@ mod moment_tests {
 #[cfg(all(test, target_vendor = "apple"))]
 mod tests {
     use super::ExitWatch;
-    // `spawnfd`'s, as in `moment_tests` above.
+
     use crate::spawnfd::{Command, Stdio};
 
-    /// Exit 7 reads `0x0700`, SIGKILL `0x9`; a second read answers the same, and the watch
     /// does not reap.
     #[test]
     fn the_watch_reads_exit_and_signal_statuses() {
@@ -571,7 +500,6 @@ mod tests {
         assert!(ExitWatch::watch(1).is_none());
     }
 
-    /// Block on the watch's descriptor, never on a clock: the event is queued inside
     /// `proc_exit`, which `wait` has already observed.
     fn wait_for(watch: &ExitWatch) -> i32 {
         #[repr(C)]
@@ -588,7 +516,6 @@ mod tests {
             events: 1,
             revents: 0,
         };
-        // A minute is a hang detector, not a latency budget.
         // SAFETY: one live pollfd.
         let rc = unsafe { poll(&mut pfd, 1, 60_000) };
         assert_eq!(rc, 1, "the exit event is queued");

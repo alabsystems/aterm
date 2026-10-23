@@ -263,6 +263,17 @@ pub struct KeyEvent {
     ///     _ => {}, // Handle other events
     /// }
     /// ```
+    /// use aterm_window::event::{ElementState, KeyEvent, WindowEvent};
+    /// use aterm_window::keyboard::{KeyCode, PhysicalKey};
+    /// # let window_event = WindowEvent::RedrawRequested; // To make the example compile
+    /// match window_event {
+    ///     WindowEvent::KeyboardInput {
+    ///         event:
+    ///             KeyEvent {
+    ///                 physical_key: PhysicalKey::Code(KeyCode::KeyW),
+    ///                 state: ElementState::Pressed,
+    ///                 repeat: false,
+    ///                 ..
     pub repeat: bool,
 
     /// Platform-specific key event fields.
@@ -345,51 +356,51 @@ pub struct Modifiers {
 
 impl Modifiers {
     /// The state of the modifiers.
-    pub fn state(&self) -> ModifiersState {
+    pub const fn state(&self) -> ModifiersState {
         self.state
     }
 
     /// The state of the left shift key.
-    pub fn lshift_state(&self) -> ModifiersKeyState {
+    pub const fn lshift_state(&self) -> ModifiersKeyState {
         self.mod_state(ModifiersKeys::LSHIFT)
     }
 
     /// The state of the right shift key.
-    pub fn rshift_state(&self) -> ModifiersKeyState {
+    pub const fn rshift_state(&self) -> ModifiersKeyState {
         self.mod_state(ModifiersKeys::RSHIFT)
     }
 
     /// The state of the left alt key.
-    pub fn lalt_state(&self) -> ModifiersKeyState {
+    pub const fn lalt_state(&self) -> ModifiersKeyState {
         self.mod_state(ModifiersKeys::LALT)
     }
 
     /// The state of the right alt key.
-    pub fn ralt_state(&self) -> ModifiersKeyState {
+    pub const fn ralt_state(&self) -> ModifiersKeyState {
         self.mod_state(ModifiersKeys::RALT)
     }
 
     /// The state of the left control key.
-    pub fn lcontrol_state(&self) -> ModifiersKeyState {
+    pub const fn lcontrol_state(&self) -> ModifiersKeyState {
         self.mod_state(ModifiersKeys::LCONTROL)
     }
 
     /// The state of the right control key.
-    pub fn rcontrol_state(&self) -> ModifiersKeyState {
+    pub const fn rcontrol_state(&self) -> ModifiersKeyState {
         self.mod_state(ModifiersKeys::RCONTROL)
     }
 
     /// The state of the left super key.
-    pub fn lsuper_state(&self) -> ModifiersKeyState {
+    pub const fn lsuper_state(&self) -> ModifiersKeyState {
         self.mod_state(ModifiersKeys::LSUPER)
     }
 
     /// The state of the right super key.
-    pub fn rsuper_state(&self) -> ModifiersKeyState {
+    pub const fn rsuper_state(&self) -> ModifiersKeyState {
         self.mod_state(ModifiersKeys::RSUPER)
     }
 
-    fn mod_state(&self, modifier: ModifiersKeys) -> ModifiersKeyState {
+    const fn mod_state(&self, modifier: ModifiersKeys) -> ModifiersKeyState {
         if self.pressed_mods.contains(modifier) {
             ModifiersKeyState::Pressed
         } else {
@@ -418,6 +429,7 @@ impl From<ModifiersState> for Modifiers {
 /// ];
 /// assert_eq!(events.last(), Some(&Ime::Commit("é".into())));
 /// ```
+/// use aterm_window::event::Ime;
 ///
 /// ```
 /// use aterm_window::event::Ime;
@@ -437,6 +449,7 @@ impl From<ModifiersState> for Modifiers {
 /// ];
 /// assert_eq!(events.last(), Some(&Ime::Commit("啊不".into())));
 /// ```
+/// use aterm_window::event::Ime;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Ime {
     /// The IME was enabled.

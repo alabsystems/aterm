@@ -6,8 +6,7 @@
 use super::*;
 
 /// Sparkle's glitter train survives the next keystroke: an unlicensed batch
-/// reaches no teardown and a licensed one mints without clearing. Shed a train
-/// over real `geom()` cell centres, type the next key, and count what is left.
+/// reaches no teardown and a licensed one mints without clearing.
 #[test]
 fn the_sparkle_glitter_train_outlives_the_keystroke_that_follows_it() {
     let g = geom();
@@ -20,8 +19,6 @@ fn the_sparkle_glitter_train_outlives_the_keystroke_that_follows_it() {
     glow.observe_row(2, 6, &row, t0);
     let t1 = t0 + Duration::from_millis(8);
     glow.tick(Some((2, 6)), t1, &c, g, &mut out);
-    // Glitter over the typed cells (columns 2..6), each grain born inside its
-    // cell as `spawn_burst_particles` places it.
     for col in 2..6u16 {
         let (cx, cy) = g.cell_center(2, col);
         glow.particles.push(Particle {
@@ -36,7 +33,6 @@ fn the_sparkle_glitter_train_outlives_the_keystroke_that_follows_it() {
             born: t1,
         });
     }
-    // …and one grain over a cell this batch is about to rewrite.
     let (rx, ry) = g.cell_center(2, 9);
     glow.particles.push(Particle {
         x0: rx,
@@ -49,8 +45,6 @@ fn the_sparkle_glitter_train_outlives_the_keystroke_that_follows_it() {
         cov_scale: 1.0,
         born: t1,
     });
-    // The next key: a licensed typed advance whose batch also rewrites the cell one of the
-    // grains is flying over.
     let mut rewritten = row;
     rewritten[6] = 's';
     rewritten[9] = 'Z';
@@ -62,9 +56,6 @@ fn the_sparkle_glitter_train_outlives_the_keystroke_that_follows_it() {
         glow.particles.len() >= 5,
         "the glitter behind the caret survives its own keystroke's echo"
     );
-    // All five grains remain: a grain is a projectile already leaving its
-    // birth pixel, so the rewritten cell under it does not speak for it. Only
-    // age and the wholesale teardowns (reset / dark) retire the family.
     for col in 2..6u16 {
         let (cx, _) = g.cell_center(2, col);
         assert!(
@@ -79,8 +70,7 @@ fn the_sparkle_glitter_train_outlives_the_keystroke_that_follows_it() {
 }
 
 /// A denied program relocation retires only movement-owned click-dedup
-/// credit. The already-earned key-time sound remains queued, while the next
-/// genuine admitted key can establish and spend a fresh credit normally.
+/// credit.
 #[test]
 fn denied_move_preserves_queued_sound_but_retires_stale_keyed_credit() {
     let g = geom();
@@ -96,8 +86,6 @@ fn denied_move_preserves_queued_sound_but_retires_stale_keyed_credit() {
     assert_eq!(glow.sound_cues.len(), 1);
     assert_eq!(glow.keyed_clicks, 1);
 
-    // No exact candidate: this CUP is dark and consumes the uncorrelated
-    // classifier. It must not erase the sound already earned at key time.
     glow.tick(
         Some((2, 3)),
         first + Duration::from_millis(1),
@@ -129,9 +117,7 @@ fn denied_move_preserves_queued_sound_but_retires_stale_keyed_credit() {
 }
 
 /// `note_user_gesture` keeps the banked typed stamps: a Tab-class gesture landing with two keys'
-/// echoes in flight licenses its own sweep and leaves the bank intact. The Tab's 4-cell sweep is
-/// a hop the two presses cannot explain (`no-credits`, a forget edge), so the pool is forgotten
-/// and the following keyless `+1` is refused.
+/// echoes in flight licenses its own sweep and leaves the bank intact.
 #[test]
 fn user_gesture_keeps_banked_typed_stamps_for_in_flight_echoes() {
     let g = geom();
@@ -140,25 +126,18 @@ fn user_gesture_keeps_banked_typed_stamps_for_in_flight_echoes() {
     let mut glow = CursorGlow::default();
     let mut out = Vec::new();
     glow.tick(Some((2, 2)), t0, &c, g, &mut out);
-    // Two real keys banked, echoes not yet observed.
     let k1 = t0 + Duration::from_millis(10);
     glow.note_typed(k1);
     glow.note_typed(k1 + Duration::from_millis(5));
-    // Tab lands mid-burst: the gesture class arms without wiping the bank.
     glow.note_user_gesture(k1 + Duration::from_millis(8));
     assert!(
         glow.type_hint
             .any_fresh(k1 + Duration::from_millis(9), CursorGlow::TYPE_HINT_FRESH),
         "arming the gesture class must not destroy banked typed stamps"
     );
-    // The tab sweep spawns (licensed by the gesture; spawn's class-blind
-    // FIFO consumption also pops the oldest stamp)…
     let e1 = k1 + Duration::from_millis(20);
     glow.tick(Some((2, 6)), e1, &c, g, &mut out);
     assert_eq!(glow.spawns(), 1, "the tab sweep itself is licensed");
-    // The two presses could not explain a 4-cell hop, so the sweep forgot
-    // them, and the remaining fresh stamp is no licence without a press: the
-    // next `+1` is refused.
     assert_eq!(glow.in_flight_tally().forgotten, 1);
     assert_eq!(glow.typed_credits_within(e1), 0);
     let e2 = e1 + Duration::from_millis(16);
@@ -183,20 +162,16 @@ fn hidden_boundary_spares_fresh_typed_stamps_and_retires_stale() {
     let mut glow = CursorGlow::default();
     let mut out = Vec::new();
     glow.tick(Some((2, 2)), t0, &c, g, &mut out);
-    // A repaint bracket catches a frame hidden…
     glow.tick(None, t0 + Duration::from_millis(16), &c, g, &mut out);
-    // …two real keys land while hidden…
     let k = t0 + Duration::from_millis(30);
     glow.note_typed(k);
     glow.note_typed(k + Duration::from_millis(5));
-    // …and the bracket completes: hidden→visible at the same cell.
     glow.tick(Some((2, 2)), k + Duration::from_millis(10), &c, g, &mut out);
     assert!(
         glow.type_hint
             .any_fresh(k + Duration::from_millis(11), CursorGlow::TYPE_HINT_FRESH),
         "fresh typed stamps must survive the hidden→visible boundary"
     );
-    // Their echoes are licensed and lay light.
     glow.tick(Some((2, 3)), k + Duration::from_millis(20), &c, g, &mut out);
     glow.tick(Some((2, 4)), k + Duration::from_millis(36), &c, g, &mut out);
     assert_eq!(
@@ -205,14 +180,11 @@ fn hidden_boundary_spares_fresh_typed_stamps_and_retires_stale() {
         "echoes of keys pressed inside the hide bracket must spawn after it completes"
     );
 
-    // The stale half: a bank older than TYPE_HINT_FRESH is fully retired at
-    // the boundary.
     let mut stale = CursorGlow::default();
     let s0 = Instant::now();
     stale.tick(Some((2, 2)), s0, &c, g, &mut out);
     stale.note_typed(s0 + Duration::from_millis(1));
     stale.tick(None, s0 + Duration::from_millis(16), &c, g, &mut out);
-    // Boundary completes 400 ms later — the stamp is stale by then.
     stale.tick(
         Some((2, 2)),
         s0 + Duration::from_millis(400),
@@ -237,13 +209,9 @@ fn hidden_caret_typed_echo_anchors_to_print_site() {
     let t0 = Instant::now();
     let mut glow = CursorGlow::default();
     let mut out = Vec::new();
-    // The TUI drew its input row; the cursor is hidden from the start.
     glow.observe_print_anchor(Some((2, 2, 1)));
     glow.tick(None, t0, &c, g, &mut out);
     assert_eq!(glow.spawns(), 0);
-    // A program-only rewrite advancing a status row's end: no stamps, nothing
-    // lit, and that row is branded a program row; the input row, which only
-    // advances with keys, is not, so the echo below lights.
     glow.observe_print_anchor(Some((5, 10, 2)));
     glow.tick(None, t0 + Duration::from_millis(8), &c, g, &mut out);
     glow.observe_print_anchor(Some((5, 11, 3)));
@@ -253,7 +221,6 @@ fn hidden_caret_typed_echo_anchors_to_print_site() {
         0,
         "program-only output under a hidden cursor must paint nothing"
     );
-    // A real key; its echo lands while the cursor stays hidden.
     let k = t0 + Duration::from_millis(30);
     glow.note_typed(k);
     glow.observe_print_anchor(Some((2, 3, 4)));
@@ -276,7 +243,6 @@ fn parked_caret_typed_echo_anchors_and_visible_moves_own_their_tick() {
     let t0 = Instant::now();
     let mut glow = CursorGlow::default();
     let mut out = Vec::new();
-    // Parked at the origin cell, every frame.
     glow.tick(Some((0, 0)), t0, &c, g, &mut out);
     glow.observe_print_anchor(Some((2, 2, 1)));
     glow.tick(
@@ -297,8 +263,6 @@ fn parked_caret_typed_echo_anchors_and_visible_moves_own_their_tick() {
         "a licensed echo under a parked cursor must anchor to the echoed row"
     );
 
-    // Visible-move ownership: a normal shell echo (cursor moves with the
-    // anchor) spawns exactly once even with surplus stamps banked.
     let mut shell = CursorGlow::default();
     let s0 = Instant::now();
     shell.tick(Some((2, 2)), s0, &c, g, &mut out);
@@ -324,10 +288,7 @@ fn parked_caret_typed_echo_anchors_and_visible_moves_own_their_tick() {
     );
 }
 
-/// A program row's forward end-advance never consumes a banked typed stamp. With the cursor
-/// hidden, the input row (11) advances only after `note_typed` while the status row (9) grows on
-/// its own ~150 ms cadence (a Claude Code timer); a row seen advancing its end with no gesture
-/// fresh is branded a program row and refuses anchored sweeps, so every input echo lights.
+/// A program row's forward end-advance never consumes a banked typed stamp.
 #[test]
 fn program_row_end_advance_never_consumes_a_typed_stamp() {
     let g = geom();
@@ -336,29 +297,21 @@ fn program_row_end_advance_never_consumes_a_typed_stamp() {
     let mut glow = CursorGlow::default();
     let mut out = Vec::new();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
-    // Hidden from the start; both rows drawn once (seed, no advance yet).
     glow.tick(None, t0, &c, g, &mut out);
     glow.observe_print_anchor(Some((9, 10, 1)));
     glow.tick(None, at(16), &c, g, &mut out);
     glow.observe_print_anchor(Some((11, 2, 2)));
     glow.tick(None, at(32), &c, g, &mut out);
-    // The status row's keyless advance (its 150 ms tick, nobody typing) spawns nothing and
-    // brands row 9 a program row.
     glow.observe_print_anchor(Some((9, 11, 3)));
     glow.tick(None, at(150), &c, g, &mut out);
     assert_eq!(glow.spawns(), 0, "keyless growth must stay dark");
-    // k1 and its echo on the input row: licensed, anchored, lit.
     glow.note_typed(at(240));
     glow.observe_print_anchor(Some((11, 3, 4)));
     glow.tick(None, at(245), &c, g, &mut out);
     assert_eq!(glow.spawns(), 1, "the input echo must still light");
-    // k2 banks a stamp; the status row's next tick is sampled before k2's echo,
-    // inside the stamp's freshness window.
     glow.note_typed(at(330));
     glow.observe_print_anchor(Some((9, 12, 5)));
     glow.tick(None, at(336), &c, g, &mut out);
-    // The status row must never be judged as an echo: any ring record on row 9
-    // other than the row-discrimination refusal is a spent stamp.
     let status_row_spends = glow
         .admission_log()
         .filter(|r| {
@@ -369,8 +322,6 @@ fn program_row_end_advance_never_consumes_a_typed_stamp() {
         status_row_spends, 0,
         "a program row's end-advance must never consume a banked typed stamp"
     );
-    // …and because the stamp was not spent on the status row, k2's real echo still lights:
-    // judged input-row echoes == keys typed.
     glow.observe_print_anchor(Some((11, 4, 6)));
     glow.tick(None, at(340), &c, g, &mut out);
     let input_row_echoes = glow.admission_log().filter(|r| r.origin.0 == 11).count();
@@ -382,9 +333,7 @@ fn program_row_end_advance_never_consumes_a_typed_stamp() {
 
 /// The spoken-for arm: a spinner counter holds constant width until `(9)`
 /// becomes `(10)`, so its first end-advance has no keyless history and the
-/// taint brand cannot refuse it mid-burst. While another row's licensed
-/// anchored echo is younger than the stamp window, the echo lane is spoken for
-/// and no other row may spend a stamp.
+/// taint brand cannot refuse it mid-burst.
 #[test]
 fn a_program_rows_first_advance_mid_burst_cannot_steal_the_echo() {
     let g = geom();
@@ -394,21 +343,16 @@ fn a_program_rows_first_advance_mid_burst_cannot_steal_the_echo() {
     let mut out = Vec::new();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
     glow.tick(None, t0, &c, g, &mut out);
-    // Spinner row 10 seeded at its constant width; input row 12 seeded.
     glow.observe_print_anchor(Some((10, 19, 1)));
     glow.tick(None, at(16), &c, g, &mut out);
     glow.observe_print_anchor(Some((12, 2, 2)));
     glow.tick(None, at(32), &c, g, &mut out);
-    // Spinner repaints at the same end column: no advance, no history for row 10.
     glow.observe_print_anchor(Some((10, 19, 3)));
     glow.tick(None, at(150), &c, g, &mut out);
-    // k1's echo establishes the input row as the echo row.
     glow.note_typed(at(240));
     glow.observe_print_anchor(Some((12, 3, 4)));
     glow.tick(None, at(245), &c, g, &mut out);
     assert_eq!(glow.spawns(), 1, "the input echo must light");
-    // k2 banks a stamp; the counter crosses its digit width: row 10's first advance, brandless,
-    // mid-burst, stamp-fresh.
     glow.note_typed(at(330));
     glow.observe_print_anchor(Some((10, 20, 5)));
     glow.tick(None, at(336), &c, g, &mut out);
@@ -422,7 +366,6 @@ fn a_program_rows_first_advance_mid_burst_cannot_steal_the_echo() {
         crossing_spends, 0,
         "a program row's first advance mid-burst must not steal the echo"
     );
-    // k2's real echo still lights off its surviving stamp.
     glow.observe_print_anchor(Some((12, 4, 6)));
     glow.tick(None, at(340), &c, g, &mut out);
     let input_row_echoes = glow.admission_log().filter(|r| r.origin.0 == 12).count();
@@ -433,9 +376,7 @@ fn a_program_rows_first_advance_mid_burst_cannot_steal_the_echo() {
 }
 
 /// A program row's brand survives a busy TUI printing on five rows (Claude Code mid-turn:
-/// spinner, composer, bullet, tool timer, workflow timer). After a hesitation beyond the 250 ms
-/// spoken-for hold, the spinner prints a digit between the `i` press and its echo: it is refused
-/// `program-row`, forgets nothing, and `i`'s echo lights its cell (no gap in `s▯de`).
+/// spinner, composer, bullet, tool timer, workflow timer).
 #[test]
 fn a_busy_tuis_status_row_keeps_its_brand_across_five_print_rows() {
     let g = Geom {
@@ -450,8 +391,6 @@ fn a_busy_tuis_status_row_keeps_its_brand_across_five_print_rows() {
     let at = |ms: u64| t0 + Duration::from_millis(ms);
     let mut glow = CursorGlow::default();
     let mut out = Vec::new();
-    // Claude Code's rows, top to bottom; the caret is drawn on the composer row and every status
-    // write walks it back there.
     const BULLET: u16 = 4;
     const TOOL: u16 = 7;
     const SPINNER: u16 = 10;
@@ -467,25 +406,18 @@ fn a_busy_tuis_status_row_keeps_its_brand_across_five_print_rows() {
             glow.observe_caret_drawn(true);
             glow.tick(Some((COMPOSER, caret)), at(ms), &c, g, &mut out);
         };
-    // The busy screen with nobody typing: the spinner's seconds digit
-    // advances its row's end keylessly — the brand.
     frame(&mut glow, None, 2, 0);
     frame(&mut glow, Some((SPINNER, 11, '✻')), 2, 16);
     frame(&mut glow, Some((SPINNER, 18, '1')), 2, 100);
     frame(&mut glow, Some((BULLET, 1, '●')), 2, 150);
     frame(&mut glow, Some((TOOL, 20, '2')), 2, 200);
     frame(&mut glow, Some((WORKFLOW, 25, '5')), 2, 250);
-    // The fifth row: the composer draws its prompt.
     frame(&mut glow, Some((COMPOSER, 2, ' ')), 2, 300);
-    // The spinner's glyph frame retreats its end (no advance, no brand).
     frame(&mut glow, Some((SPINNER, 11, '✽')), 2, 350);
     assert_eq!(glow.spawns(), 0, "the busy screen alone lights nothing");
-    // `s`, echoed on the composer row: the visible lane's licensed echo.
     glow.note_typed_expected(at(1000), 1, false, rk::TypedClass::Glyph, 's');
     frame(&mut glow, Some((COMPOSER, 3, 's')), 3, 1012);
     frame(&mut glow, Some((SPINNER, 11, '✻')), 3, 1100);
-    // The hesitation: `i` pressed 322 ms after `s` echoed, the spinner's digit
-    // 3 ms later and 13 ms before `i`'s echo, outside the spoken-for hold.
     glow.note_typed_expected(at(1334), 1, false, rk::TypedClass::Glyph, 'i');
     frame(&mut glow, Some((SPINNER, 18, '3')), 3, 1337);
     let spinner = glow
@@ -503,8 +435,6 @@ fn a_busy_tuis_status_row_keeps_its_brand_across_five_print_rows() {
     for ms in (1516..=1600).step_by(16) {
         frame(&mut glow, None, 5, ms);
     }
-    // The digit is no key's echo, every composer echo is licensed, and each
-    // key lights its own cell.
     let refused: Vec<_> = glow
         .admission_log()
         .filter(|r| r.origin.0 == COMPOSER && r.reason == CursorGlow::DECLINE_NO_FRESH_HINT)
@@ -550,8 +480,6 @@ fn a_ticking_status_row_keeps_its_brand_beside_a_streaming_transcript() {
         glow.observe_caret_drawn(true);
         glow.tick(Some((COMPOSER, 2)), at(ms), &c, g, &mut out);
     };
-    // The spinner's glyph frame, then its digit: a keyless advance — the
-    // brand. The bullet prints once and never again.
     frame(&mut glow, SPINNER, 11, '✻');
     frame(&mut glow, SPINNER, 18, '1');
     frame(&mut glow, BULLET, 1, '●');
@@ -559,8 +487,6 @@ fn a_ticking_status_row_keeps_its_brand_beside_a_streaming_transcript() {
         glow.anchor_row(SPINNER).is_some_and(|(_, m)| m.tainted),
         "PRECONDITION: the spinner is branded"
     );
-    // A transcript streams onto twenty new rows, the spinner's glyph frame
-    // printing after every fourth: twenty-two rows, more than the lane holds.
     for k in 0..20u16 {
         frame(&mut glow, 5 + k, 29, 'e');
         if k % 4 == 3 {
@@ -625,10 +551,7 @@ enum ScrollBeforeI {
 /// The frames of [`a_status_tick_below_the_caret_forgets_no_press_while_the_hand_types`]:
 /// a composer on row 10 with its caret drawn, and a footer on row 12 whose
 /// first print (a timer ending at 15) came before typing began, so it is
-/// unbranded. `s` echoes on the composer; then `before_i` is pressed, the
-/// screen scrolls per `scroll_before_i`, `i` is pressed, and the footer's token
-/// counter advances to 35 3 ms after `i`'s press and 13 ms before its echo,
-/// over 250 ms after the composer's last echo.
+/// unbranded.
 fn footer_tick_in_a_hesitated_keys_window(
     before_i: BeforeI,
     scroll_before_i: ScrollBeforeI,
@@ -697,13 +620,11 @@ fn status_tick_in_a_hesitated_keys_window(
             composer -= 1;
             footer -= 1;
             frame(&mut glow, None, (composer, 3), 1100);
-            // The footer's timer is its first print in the new coordinates.
             frame(&mut glow, Some((footer, 15, '2')), (composer, 3), 1200);
         }
         ScrollBeforeI::ComposerStays => {
             glow.note_scroll(1);
             glow.drop_row_probe();
-            // The composer redrawn on its own row, its caret where it was.
             frame(&mut glow, Some((composer, 3, 's')), (composer, 3), 1100);
             frame(&mut glow, Some((footer, 15, '2')), (composer, 3), 1200);
         }
@@ -736,11 +657,7 @@ fn status_tick_in_a_hesitated_keys_window(
 
 /// The visible-parked minibuffer gate refuses a run ending on a glyph no live
 /// press typed, and forgets the presses only when that run is the keys' own
-/// echo: below the drawn caret with the hand not typing on the caret's row. An
-/// unbranded footer below Claude Code's composer ticking between a hesitated
-/// key's press and echo is refused `program-row` and forgets nothing. Control:
-/// a different-class press first (zle's Ctrl-R) takes the hand off the row,
-/// and the same refusal forgets the press.
+/// echo: below the drawn caret with the hand not typing on the caret's row.
 #[test]
 fn a_status_tick_below_the_caret_forgets_no_press_while_the_hand_types() {
     for scroll in [ScrollBeforeI::None, ScrollBeforeI::WithTheContent] {
@@ -783,9 +700,7 @@ fn a_status_tick_above_the_caret_forgets_no_press_with_the_hand_off_its_row() {
 /// A line-editing press (a Backspace, an arrow) keeps the hand on its row
 /// ([`CursorGlow::clear_typed_keeping_hand`]), so the next key is guarded: the
 /// footer's unbranded tick in its window, over 250 ms after the edit's echo, is
-/// refused `program-row` and forgets nothing. zle's Ctrl-R still takes the hand
-/// off (control in
-/// [`a_status_tick_below_the_caret_forgets_no_press_while_the_hand_types`]).
+/// refused `program-row` and forgets nothing.
 #[test]
 fn a_line_editing_key_keeps_the_hand_on_its_row() {
     for before_i in [BeforeI::Backspace, BeforeI::Arrows] {
@@ -806,10 +721,7 @@ fn a_line_editing_key_keeps_the_hand_on_its_row() {
 }
 
 /// When the caret stays on its screen row under a scroll, the hand's row stays with the caret,
-/// not the content. A full-screen Claude Code is bottom-anchored: each transcript line scrolls
-/// the screen above the composer and redraws composer and footer on the same rows, so the
-/// footer's tick in the next key's window forgets nothing. (`s`'s cell rode the scroll up;
-/// `i`'s, column 3, is typed on the redrawn composer.)
+/// not the content.
 #[test]
 fn a_composer_that_stays_put_under_a_scroll_keeps_the_hand_on_its_row() {
     for before_i in [BeforeI::Nothing, BeforeI::Backspace, BeforeI::Arrows] {
@@ -830,10 +742,7 @@ fn a_composer_that_stays_put_under_a_scroll_keeps_the_hand_on_its_row() {
 /// Enter takes the hand off its row only when it hands the line to a shell, or
 /// when the host cannot tell ([`CursorGlow::note_return`]); into a foreground
 /// program's composer (shell integration says a command runs, or the alternate
-/// screen is up) it keeps it ([`CursorGlow::note_return_keeping_hand`]). Claude
-/// Code redraws its empty composer on the same row with the spinner above; the
-/// spinner's seconds reach the next key's glyph 3 ms after its press and are
-/// refused `program-row`, and the key's cell lights.
+/// screen is up) it keeps it ([`CursorGlow::note_return_keeping_hand`]).
 #[test]
 fn the_first_key_after_a_submit_into_a_program_s_composer_is_guarded() {
     let g = Geom {
@@ -859,19 +768,14 @@ fn the_first_key_after_a_submit_into_a_program_s_composer_is_guarded() {
         glow.observe_caret_drawn(true);
         glow.tick(Some((COMPOSER, col)), at(ms), &c, g, &mut out);
     };
-    // The composer holds a line typed earlier; `ls` ends it.
     frame(&mut glow, Some((COMPOSER, 20, ' ')), 20, 0);
     glow.note_typed_expected(at(1000), 1, false, rk::TypedClass::Glyph, 'l');
     frame(&mut glow, Some((COMPOSER, 21, 'l')), 21, 1012);
     glow.note_typed_expected(at(1100), 1, false, rk::TypedClass::Glyph, 's');
     frame(&mut glow, Some((COMPOSER, 22, 's')), 22, 1112);
-    // Enter, into the program that owns the line; the composer comes back
-    // empty on its row, and the spinner prints its glyph frame above it.
     glow.note_return_keeping_hand(at(1200));
     frame(&mut glow, Some((COMPOSER, 2, ' ')), 2, 1230);
     frame(&mut glow, Some((SPINNER, 11, '✻')), 2, 1300);
-    // The first key after the submit, and the spinner's seconds reaching
-    // `…1` 3 ms after its press, 373 ms after the submit's licensed response.
     glow.note_typed_expected(at(1600), 1, false, rk::TypedClass::Glyph, '1');
     frame(&mut glow, Some((SPINNER, 18, '1')), 2, 1603);
     let verdict = glow
@@ -908,10 +812,7 @@ fn the_first_key_after_a_submit_into_a_program_s_composer_is_guarded() {
 }
 
 /// A press the hand's-row hold kept ([`PressCredits::held_through`]) pays only for a move on the
-/// hand's row. In Emacs `C-u 8` echoes `C-u 8-` below the caret, refused `program-row` without
-/// forgetting the press; the caret's keyless fold to the next row 600 ms later then finds no
-/// credit and is refused. The hold keeps every press banked through its frame: `8` stamped 3 ms
-/// before the echo area's frame or in that frame's own instant.
+/// hand's row.
 #[test]
 fn a_press_the_hold_kept_pays_for_no_hop_off_the_hand_s_row() {
     let g = Geom {
@@ -940,15 +841,11 @@ fn a_press_the_hold_kept_pays_for_no_hop_off_the_hand_s_row() {
                 glow.tick(Some(caret), at(ms), &c, g, &mut out);
             };
         frame(&mut glow, Some((BUFFER, 58, ' ')), (BUFFER, 58), 0);
-        // `a` typed at the caret, to the row's last column: the hand is on its row.
         glow.note_typed_expected(at(1000), 1, false, rk::TypedClass::Glyph, 'a');
         frame(&mut glow, Some((BUFFER, 59, 'a')), (BUFFER, 59), 1012);
-        // C-u, as the host sends it (a kill: the line-editing close, then the
-        // kill class); after `echo-keystrokes` Emacs prints `C-u-`.
         glow.clear_typed_keeping_hand(at(1100));
         glow.note_kill(at(1100), true);
         frame(&mut glow, Some((ECHO_AREA, 4, '-')), (BUFFER, 59), 2100);
-        // `8`, and the echo area's `C-u 8-` at 2503 ms.
         glow.note_typed_expected(at(key_ms), 1, false, rk::TypedClass::Glyph, '8');
         frame(&mut glow, Some((ECHO_AREA, 6, '-')), (BUFFER, 59), 2503);
         let verdict = glow
@@ -958,7 +855,6 @@ fn a_press_the_hold_kept_pays_for_no_hop_off_the_hand_s_row() {
         for ms in (2519..=3000).step_by(16) {
             frame(&mut glow, None, (BUFFER, 59), ms);
         }
-        // A keyless fold of the caret off the hand's row, no key behind it.
         frame(&mut glow, None, (BUFFER + 1, 0), 3100);
         let hop = glow
             .admission_log()
@@ -978,11 +874,7 @@ fn a_press_the_hold_kept_pays_for_no_hop_off_the_hand_s_row() {
 }
 
 /// A press the hand's-row hold kept is paid by its own late echo on the hand's
-/// row, however late. A footer ticks 3 ms after `i`'s press and is refused
-/// `program-row` (ending on a foreign glyph, or on `i` itself); the stalled
-/// composer echoes `i` 400 ms or 2 s later with a stale stamp, the in-flight
-/// press pays, and the cell lights. Only the in-flight patience bounds a held
-/// press.
+/// row, however late.
 #[test]
 fn a_held_press_pays_for_its_own_late_echo_on_the_hand_s_row() {
     let g = Geom {
@@ -1053,11 +945,7 @@ fn a_held_press_pays_for_its_own_late_echo_on_the_hand_s_row() {
 }
 
 /// While the hand types on the drawn caret's row, an advance on another row is
-/// no key's echo, whatever glyph it ends on. An unbranded spinner prints its
-/// seconds' `0` between a hesitated `0` press and its echo; the run ends on a
-/// live press's glyph, so the glyph test passes it, but the hand's row refuses
-/// it `program-row`: no stamp or credit spent, nothing laid on the spinner
-/// row, and the key's own echo lights its cell.
+/// no key's echo, whatever glyph it ends on.
 #[test]
 fn a_status_tick_ending_on_a_live_press_s_glyph_is_no_key_s_echo() {
     let g = Geom {
@@ -1084,12 +972,9 @@ fn a_status_tick_ending_on_a_live_press_s_glyph_is_no_key_s_echo() {
         glow.tick(Some((COMPOSER, col)), at(ms), &c, g, &mut out);
     };
     frame(&mut glow, Some((COMPOSER, 2, ' ')), 2, 0);
-    // The spinner's glyph frame: its first print, an endpoint and no brand.
     frame(&mut glow, Some((SPINNER, 11, '✻')), 2, 100);
     glow.note_typed_expected(at(1000), 1, false, rk::TypedClass::Glyph, '1');
     frame(&mut glow, Some((COMPOSER, 3, '1')), 3, 1012);
-    // The hesitated `0`, and the spinner's seconds reaching `…0` 3 ms after
-    // its press, 325 ms after `1` echoed (outside the spoken-for hold).
     glow.note_typed_expected(at(1334), 1, false, rk::TypedClass::Glyph, '0');
     frame(&mut glow, Some((SPINNER, 18, '0')), 3, 1337);
     let verdict = glow
@@ -1125,13 +1010,7 @@ fn a_status_tick_ending_on_a_live_press_s_glyph_is_no_key_s_echo() {
     );
 }
 
-/// The taint brand never brands the established echo row (the `last_anchor_sweep` holder). After
-/// more than 250 ms of quiet an undelivered paste (stamped and revoked in one event-loop turn)
-/// advances that row with no licence fresh: it stays dark and brands nothing, and later typed
-/// echoes are licensed. The exemption is safe because only a licensed anchored echo writes
-/// `last_anchor_sweep`, which a program row never gets; it goes by identity, not freshness, since
-/// the quiet gap outlasts any stamp window. The delivered sibling is
-/// `a_delivered_insert_lights_a_hidden_caret_tui_at_its_print_anchor`.
+/// The taint brand never brands the established echo row (the `last_anchor_sweep` holder).
 #[test]
 fn an_unlicensed_paste_must_not_brand_the_established_echo_row() {
     let g = geom();
@@ -1140,12 +1019,9 @@ fn an_unlicensed_paste_must_not_brand_the_established_echo_row() {
     let mut glow = CursorGlow::default();
     let mut out = Vec::new();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
-    // Hidden caret from the start; input row 11 seeded.
     glow.tick(None, t0, &c, g, &mut out);
     glow.observe_print_anchor(Some((11, 2, 1)));
     glow.tick(None, at(16), &c, g, &mut out);
-    // Typed echoes licensed on the input row make it the established echo row (the
-    // `last_anchor_sweep` holder).
     glow.note_typed(at(30));
     glow.observe_print_anchor(Some((11, 3, 2)));
     glow.tick(None, at(35), &c, g, &mut out);
@@ -1153,9 +1029,6 @@ fn an_unlicensed_paste_must_not_brand_the_established_echo_row() {
     glow.observe_print_anchor(Some((11, 4, 3)));
     glow.tick(None, at(125), &c, g, &mut out);
     assert_eq!(glow.spawns(), 2, "phase-1 typed echoes must light");
-    // >250 ms quiet (every stamp stale), then the paste: gesture stamped and
-    // revoked in the same turn (enqueue is not delivery), bytes advancing the
-    // input row 8 cells.
     let paste = at(420);
     glow.note_user_gesture(paste);
     glow.revoke_input_hints_at(paste);
@@ -1166,7 +1039,6 @@ fn an_unlicensed_paste_must_not_brand_the_established_echo_row() {
         2,
         "an UNDELIVERED paste advance stays dark — nothing licensed it"
     );
-    // Typed keys at 90 ms; each echo advances the input row by one cell.
     for (i, key_ms) in [520u64, 610, 700].into_iter().enumerate() {
         let i = i as u64;
         glow.note_typed(at(key_ms));

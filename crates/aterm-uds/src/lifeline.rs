@@ -88,6 +88,7 @@ impl Lifeline {
 /// Returns an error if [`Lifeline::arm`] fails.
 pub fn arm_for_process(cmd: &mut crate::spawnfd::StdCommand, dir: &Path) -> io::Result<()> {
     /// The held ends, kept for the life of the process: never dropped, so the
+    /// kernel closes each when the process ends and at no other moment.
     static HELD: std::sync::Mutex<Vec<Lifeline>> = std::sync::Mutex::new(Vec::new());
     let lifeline = Lifeline::arm(cmd, dir)?;
     HELD.lock()
@@ -138,6 +139,8 @@ pub fn adopt(number: RawFd) -> io::Result<OwnedFd> {
 }
 
 /// [`adopt`]'s and [`check`]'s shared half: every check a lifeline must pass,
+/// made through a private close-on-exec copy of `number` (3 or above), which is
+/// returned.
 fn validated_copy(number: RawFd) -> io::Result<File> {
     if number < 0 {
         return Err(io::Error::new(
@@ -238,6 +241,7 @@ pub fn wait_for_cut(lifeline: OwnedFd) -> Cut {
 }
 
 /// [`wait_for_cut`]'s loop over any reader, so each answer a read can give is
+/// driven deterministically in a test.
 fn read_until_cut(mut lifeline: impl io::Read, gap: Duration) -> Cut {
     let mut buf = [0_u8; 64];
     loop {
@@ -258,7 +262,7 @@ unsafe extern "C" {
     fn mkfifo(path: *const std::ffi::c_char, mode: Mode) -> i32;
 }
 
-/// `mode_t`: 16 bits on Darwin, 32 on Linux. The width matters: Apple's arm64
+/// `mode_t`: 16 bits on Darwin, 32 on Linux.
 #[cfg(target_vendor = "apple")]
 type Mode = u16;
 #[cfg(not(target_vendor = "apple"))]
@@ -269,6 +273,7 @@ const F_GETFD: i32 = 1;
 /// `fcntl(2)`'s status-flag getter; 3 on every supported Unix.
 const F_GETFL: i32 = 3;
 /// The access-mode bits of the status flags, and the read-only mode: 3 and 0 on
+/// every supported Unix.
 const O_ACCMODE: i32 = 3;
 const O_RDONLY: i32 = 0;
 
@@ -280,6 +285,7 @@ mod tests {
     use std::process::Command;
 
     /// `fcntl(2)`'s status-flag setter (4 on every supported Unix) and
+    /// `O_NONBLOCK`, which differs: 0x0004 on Darwin, 0x0800 on Linux.
     const F_SETFL: i32 = 4;
     #[cfg(target_vendor = "apple")]
     const O_NONBLOCK: i32 = 0x0004;
@@ -303,6 +309,7 @@ mod tests {
     }
 
     /// The node that descriptor `fd` refers to, as (device, inode), or `None`
+    /// when the number is not open.
     fn node(fd: RawFd) -> Option<(u64, u64)> {
         use std::os::unix::fs::MetadataExt as _;
         let meta = crate::spawnfd::descriptor_metadata(fd).ok()?;
@@ -341,6 +348,8 @@ mod tests {
     }
 
     /// Every answer a read can give: bytes, an interrupt and a would-block keep
+    /// it reading; end-of-file ends it as `Closed` on exactly that call, and a
+    /// failed read ends it as `Failed`.
     #[test]
     fn only_end_of_file_or_a_failed_read_ends_the_wait() {
         let mut script = Script {
@@ -371,6 +380,7 @@ mod tests {
     }
 
     /// While the held end lives, the far end is not at end-of-file (a
+    /// non-blocking read would block); once it is cut, the read is end-of-file.
     #[test]
     fn the_far_end_reads_end_of_file_only_after_the_cut() {
         let dir = scratch("carrier");
@@ -409,6 +419,8 @@ mod tests {
     }
 
     /// `arm` gives the child the far end as stdin and names it `--lifeline-fd 0`:
+    /// a `/bin/sh` that copies stdin to nowhere finishes only after the launcher
+    /// lets go.
     #[test]
     fn an_armed_child_reads_end_of_file_when_the_launcher_lets_go() {
         let dir = scratch("child");
@@ -430,9 +442,12 @@ mod tests {
     }
 
     /// Selects the staged launcher: present in the environment means this is
+    /// the launcher that gets SIGKILLed; its value is the directory for marks.
     const STAGE_ENV: &str = "ATERM_UDS_LIFELINE_STAGE";
 
     /// A launcher arms two children with [`arm_for_process`] and is then
+    /// SIGKILLed; both children still read end-of-file because the kernel
+    /// closed the held end.
     #[test]
     fn a_sigkilled_launcher_cuts_its_process_lifeline() {
         if let Some(dir) = std::env::var_os(STAGE_ENV) {
@@ -502,6 +517,8 @@ mod tests {
     const COPIES_STAGE_ENV: &str = "ATERM_UDS_LIFELINE_COPIES_STAGE";
 
     /// An instance holding a copy of its launcher's end (as bash 3.2 leaks at
+    /// fd 11) would wait on itself forever; `close_inherited_copies` closes
+    /// exactly that copy, and the wait then ends at once.
     #[test]
     fn an_inherited_copy_of_the_lifeline_is_closed_and_the_cut_then_arrives() {
         if let Some(dir) = std::env::var_os(COPIES_STAGE_ENV) {
@@ -538,6 +555,8 @@ mod tests {
     const SOCKETS_STAGE_ENV: &str = "ATERM_UDS_LIFELINE_SOCKETS_STAGE";
 
     /// Given a socket lifeline the sweep closes nothing: every TCP and UDP
+    /// socket stats as the same (device, inode 0), and a socketpair's ends are
+    /// different inodes, so node identity cannot find a socket's copies.
     #[test]
     fn the_sweep_never_closes_a_socket_that_merely_stats_alike() {
         if std::env::var_os(SOCKETS_STAGE_ENV).is_some() {
@@ -636,6 +655,7 @@ mod tests {
     }
 
     /// `adopt` moves the lifeline to a close-on-exec copy at 3 or above and
+    /// closes the original when it is not a stdio number.
     #[test]
     fn adopt_moves_the_descriptor_and_retires_the_original() {
         let dir = scratch("adopt");
@@ -665,6 +685,7 @@ mod tests {
     }
 
     /// A pipe or FIFO end open for writing (`exec 9<>fifo` then `--lifeline-fd 9`, or a bare
+    /// write end) is refused and left open.
     #[test]
     fn adopt_refuses_an_end_open_for_writing() {
         let dir = scratch("writable");
@@ -706,6 +727,8 @@ mod tests {
     }
 
     /// [`check`] gives [`adopt`]'s verdicts and moves nothing: a lifeline it passes is the same
+    /// FIFO end at the same number with the same flags, still adoptable, and a refusal leaves
+    /// the number open.
     #[test]
     fn check_judges_like_adopt_and_moves_nothing() {
         let dir = scratch("check");

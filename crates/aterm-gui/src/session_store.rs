@@ -1092,6 +1092,17 @@ pub(crate) struct SessionStore {
 /// Shared thread-safe handle to [`SessionStore`].
 pub(crate) type Store = Arc<RwLock<SessionStore>>;
 
+/// What [`SessionStore::deregister_closing`] did.
+#[must_use]
+pub(crate) struct Deregistered {
+    /// The sid that left.
+    pub(crate) sid: SessionId,
+    /// The roster seq of its `Exited` record and closed-index slot; `None` when nothing was recorded.
+    pub(crate) exit_seq: Option<u64>,
+    /// What the slot's link freed, to drop once the store's lock is released.
+    pub(crate) freed: Vec<Arc<aterm_slog::Log>>,
+}
+
 /// Creates a new empty shared [`Store`].
 #[must_use]
 pub(crate) fn new_store() -> Store {
@@ -1134,10 +1145,16 @@ impl SessionStore {
                 ExitReason::Unknown,
                 None,
                 ExitActor::Unknown,
+                crate::turn_ledger::now_ms(),
             );
         }
     }
 
+    /// Appends one roster record stamped `t_ms`, evicting the oldest past [`ROSTER_JOURNAL_CAP`]; returns its seq.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one record's fields, every caller naming each"
+    )]
     fn record_roster(
         &mut self,
         sid: String,
@@ -1146,7 +1163,8 @@ impl SessionStore {
         reason: ExitReason,
         exit_code: Option<i32>,
         actor: ExitActor,
-    ) {
+        t_ms: u64,
+    ) -> u64 {
         self.roster_seq += 1;
         if self.roster.len() == ROSTER_JOURNAL_CAP {
             self.roster.pop_front();
@@ -1156,13 +1174,14 @@ impl SessionStore {
             sid,
             local_id,
             change,
-            t_ms: crate::turn_ledger::now_ms(),
+            t_ms,
             reason,
             exit_code,
             actor,
         });
         crate::harness_host::ring();
         self.instance_watchers.ring_watchers();
+        self.roster_seq
     }
 
     /// Returns the instance-wide watcher list notified on every roster journal append.
@@ -1183,6 +1202,7 @@ impl SessionStore {
             ExitReason::Unknown,
             None,
             ExitActor::Unknown,
+            crate::turn_ledger::now_ms(),
         );
         true
     }
@@ -1197,6 +1217,7 @@ impl SessionStore {
             ExitReason::Unknown,
             None,
             ExitActor::Unknown,
+            crate::turn_ledger::now_ms(),
         );
     }
 
@@ -1341,13 +1362,25 @@ impl SessionStore {
         self.deregister_local_as(local_id, ExitReason::Unknown, ExitActor::Unknown)
     }
 
-    /// Deregisters `local_id` with explicit [`ExitReason`] and [`ExitActor`] attribution.
+    /// [`Self::deregister_closing`]'s sid alone, what it freed dropped here: for a test that holds the store alone.
+    #[cfg(test)]
     pub(crate) fn deregister_local_as(
         &mut self,
         local_id: u64,
         reason: ExitReason,
         actor: ExitActor,
     ) -> Option<SessionId> {
+        self.deregister_closing(local_id, reason, actor)
+            .map(|d| d.sid)
+    }
+
+    /// Deregisters `local_id` with explicit [`ExitReason`] and [`ExitActor`] attribution, linking its closed-index slot in the write that records its roster exit, so the slots stay in roster-seq order; its log is attached after by that seq ([`Self::keep_closed_log`]).
+    pub(crate) fn deregister_closing(
+        &mut self,
+        local_id: u64,
+        reason: ExitReason,
+        actor: ExitActor,
+    ) -> Option<Deregistered> {
         let exit_code = self.exit_codes.remove(&local_id);
         self.frozen_path.remove(&local_id);
         self.rekey_channel.remove(&local_id);
@@ -1380,20 +1413,36 @@ impl SessionStore {
                 retirements.retire(&sid, &h.ctx.timeline, tl.slog());
             }
             mirror.retire(sid.as_str(), tl.slog_mut());
-            reason
+            (reason, at.mono_ms)
         });
-        if let Some(reason) = resolved {
-            self.by_id.remove(&sid);
-            self.record_roster(
-                sid.as_str().to_string(),
+        let mut closed = Deregistered {
+            sid,
+            exit_seq: None,
+            freed: Vec::new(),
+        };
+        if let Some((reason, t_ms)) = resolved {
+            self.by_id.remove(&closed.sid);
+            let seq = self.record_roster(
+                closed.sid.as_str().to_string(),
                 local_id,
                 RosterChange::Exited,
                 reason,
                 exit_code,
-                actor,
+                actor.clone(),
+                t_ms,
             );
+            closed.freed = self.closed_logs.link(crate::session_log::ClosedExit {
+                seq,
+                t_ms,
+                sid: closed.sid.clone(),
+                local_id,
+                reason,
+                exit_code,
+                actor,
+            });
+            closed.exit_seq = Some(seq);
         }
-        Some(sid)
+        Some(closed)
     }
 
     /// Updates `local_id`'s [`SessionState`] and wakes watchers on transitions.
@@ -1431,12 +1480,13 @@ impl SessionStore {
         }
     }
 
-    /// Links a closed session's log entry into the bounded [`crate::session_log::ClosedLogs`] index.
-    pub(crate) fn link_closed_log(
+    /// Attaches a closed session's log to the slot [`Self::deregister_closing`] linked under roster seq `seq`; returns what it freed, to drop once this lock is released.
+    pub(crate) fn keep_closed_log(
         &mut self,
-        entry: crate::session_log::ClosedLog,
+        seq: u64,
+        log: crate::session_log::ClosedLog,
     ) -> Vec<Arc<aterm_slog::Log>> {
-        self.closed_logs.link(entry)
+        self.closed_logs.keep_closed(seq, log)
     }
 
     /// Returns the bounded [`crate::session_log::ClosedLogs`] index.

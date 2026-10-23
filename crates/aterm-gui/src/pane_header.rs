@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Subordinate, per-leaf chrome for a split tab. The canonical plan owns the
-//! reserved row; this module only names and paints it. A flat rail and a small
-//! branch/ordinal distinguish siblings from the parent tab's selectable cards.
+//! Subordinate, per-leaf chrome for a split tab.
 
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -39,7 +37,6 @@ struct Header {
 impl HeaderCache {
     pub(crate) fn paint(&self, input: &mut RenderInput) {
         if !self.entries.is_empty() {
-            // This is host chrome written after extraction, so it cannot keep
             // an engine-only snapshot identity or a composed retention blessing.
             input.snapshot_seq = input.snapshot_seq.wrapping_add(1);
         }
@@ -90,7 +87,6 @@ impl HeaderCache {
                             },
                         )
                     }));
-                    // Stable: the pane's other cells keep their layer order.
                     images.sort_by_key(|(col, _)| *col);
                 }
             }
@@ -99,10 +95,7 @@ impl HeaderCache {
 }
 
 impl App {
-    /// Refreshes each split leaf's header and returns their fingerprint (0 for none). Reads are
-    /// nonblocking: a contended PTY keeps the previous label. The fingerprint gates both repaint
-    /// and the cached raster, so a title- or focus-only change repaints even under the native
-    /// strip.
+    /// Refreshes each split leaf's header and returns their fingerprint (0 for none).
     pub(crate) fn refresh_pane_headers(&mut self, wid: WindowId, plan: &VisibleLeafPlan) -> u64 {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return 0;
@@ -112,8 +105,6 @@ impl App {
             return 0;
         }
         let mut cache = std::mem::take(&mut ws.pane_headers);
-        // The window's own scale: the Fluent label is sized off the strip's
-        // chrome base ([`header_label_px`]), not off the cell.
         let scale = ws.scale as f32;
         cache.entries.retain(|entry| {
             plan.leaves
@@ -150,18 +141,12 @@ impl App {
             match self.view_store.get(leaf.view).copied() {
                 Some(View::Terminal(view)) => {
                     indicators = self.session_status_indicators(view.session);
-                    // Written into the resident strings, as `refill_strip_titles`
-                    // does: the rungs of `resolved_terminal_title_rung`, then
-                    // "Terminal", without a per-frame allocation.
                     if let Some(session) = self.pool.get(view.session)
                         && let Ok(meta) = session.ctx.meta.try_lock()
                     {
                         if !meta.presentation_value_into("icon", &mut entry.icon) {
                             entry.icon.clear();
                         }
-                        // The header's mark is the session's published need
-                        // (the presence slot, no lock): a wait the harness
-                        // settles is no mark, as on the tab (owner surfaces §5).
                         entry.need_mark = self
                             .presence
                             .slot(view.session)
@@ -256,21 +241,7 @@ impl App {
     }
 }
 
-/// The header row's fill for band tones `colors`: under the Fluent split
-/// chrome (Windows) the pane's own ground, the terminal background the band
-/// calls its well ([`chrome_band::BandColors`]'s `field_bg`); the band's tone
-/// under the Classic chrome.
-///
-/// On the ground, a split tab is one surface from the strip's selected tab
-/// down: the tab opens through the seam into the header row
-/// ([`crate::tab_bar::StripFloor`]), the header's label, dot and accent rule
-/// sit on the pane's ground over the quiet hairline that closes it against the
-/// grid, and the divider's gap is that ground too, as Windows Terminal's panes
-/// (which have no headers) meet their tab. On the band's tone the selected tab
-/// opened into a grey band as an island of the ground, and in a real window
-/// the band's foot was a dark stripe between the strip and the headers (the
-/// 2026-10-18 judges' `selected-tab-opens-onto-grey-band`,
-/// `selected-tab-opens-into-header-band`).
+/// The header row's fill for band tones `colors`: under the Fluent split chrome (Windows) the pane's own ground, the terminal background the band calls its well ([`chrome_band::BandColors`]'s `field_bg`); the band's tone under the Classic chrome.
 pub(crate) fn header_ground(colors: &chrome_band::BandColors) -> [u8; 3] {
     if crate::pane_chrome::split_chrome() == crate::pane_chrome::SplitChrome::Fluent {
         colors.field_bg
@@ -281,9 +252,7 @@ pub(crate) fn header_ground(colors: &chrome_band::BandColors) -> [u8; 3] {
 
 /// `colors` with its header inks held to their floors on `ground`
 /// ([`header_ground`]): the words (`value`, `label`, `warn`) to AA, the dot and
-/// the focus rule (`accent`) to the 3:1 of a graphical mark. The band floored
-/// them on its own tone; on the ground most already clear (the band is the
-/// ground stepped toward the ink), and this keeps every theme legible there.
+/// the focus rule (`accent`) to the 3:1 of a graphical mark.
 fn inks_on(mut colors: chrome_band::BandColors, ground: [u8; 3]) -> chrome_band::BandColors {
     if ground == colors.bar_bg {
         return colors;
@@ -297,16 +266,13 @@ fn inks_on(mut colors: chrome_band::BandColors, ground: [u8; 3]) -> chrome_band:
     colors
 }
 
-/// The header's tones for palette `p`: the band's, on [`header_ground`] as
-/// their `bar_bg`, inks floored there ([`inks_on`]).
+/// The header's tones for palette `p`: the band's, on [`header_ground`] as their `bar_bg`, inks floored there ([`inks_on`]).
 pub(crate) fn header_colors(p: impl Into<chrome_band::ChromePalette>) -> chrome_band::BandColors {
     let band = chrome_band::band_colors(p);
     inks_on(band, header_ground(&band))
 }
 
 fn label(ordinal: usize, icon: &str, title: &str) -> String {
-    // OSC/meta text is data: never allow a newline, tab or bidi override to
-    // impersonate another pane. Limit before font shaping, even for huge OSCs.
     let clean = |s: &str, max: usize| -> String {
         let mut result = String::new();
         let mut remaining_chars = max * 8;
@@ -349,12 +315,8 @@ fn semantic_row(
 ) -> SemanticRow {
     let colors = header_colors(theme);
     let fluent = crate::pane_chrome::split_chrome() == crate::pane_chrome::SplitChrome::Fluent;
-    // The band's blank cell on the header's own fill ([`header_ground`]).
     let mut cell = chrome_band::cell(' ', colors.label, colors.bar_bg, false, true);
     if fluent {
-        // The strip's seam (or a divider's hairline) is the one rule above a
-        // Fluent header; a second, top seam here would stack three rules in a
-        // row and a half.
         cell.overline = false;
         cell.overline_color = None;
     }
@@ -373,7 +335,6 @@ fn semantic_row(
         marker.fg = if focused { colors.accent } else { colors.label };
     }
     let status = status_label(indicators);
-    // Focus is the `▸` marker and the label's colour; the right side is status alone.
     let suffix = if cols >= 6 {
         status.to_string()
     } else {
@@ -383,11 +344,7 @@ fn semantic_row(
     let label_cols = cols.saturating_sub(1 + suffix_cols + usize::from(suffix_cols > 0));
     let label = fit_cell_label(label, label_cols);
     let mut col = 1;
-    // The grid's own walk over the label, so a cluster is painted in exactly
-    // the cells `fit_cell_label` measured it in.
     let mut grid = aterm_grapheme::GridColumns::new();
-    // The cell a joining character (a mark, a selector, a letter the grid
-    // folds after a ZWJ) attaches to.
     let mut base: Option<usize> = None;
     for cluster in aterm_grapheme::split_graphemes(&label) {
         let mut after = grid.clone();
@@ -429,7 +386,6 @@ fn semantic_row(
                 } else {
                     row.combining.push((at, vec![ch].into_boxed_slice()));
                 }
-                // VS16 widened the cell it joined.
                 if step == (aterm_grapheme::GridStep::Joins { widened: true }) {
                     mark_continuation(&mut row.cells, at);
                 }
@@ -595,13 +551,6 @@ fn draw_native_icon(
 }
 
 /// The header label's size in a `row_h`-px header row at the window's `scale`.
-///
-/// Fluent (Windows): the Secondary step on the tab strip's own chrome base
-/// ([`crate::tab_bar::chrome_label_base_px`], 13 logical px), so the pane's
-/// header reads one step below the tab title above it in the same face. It
-/// was sized off the cell (`Secondary` of 0.8 × the row, 16.6 px in the 23 px
-/// Windows row against the tabs' 13 px: the 2026-10-18 judges'
-/// `pane-header-type-larger-than-tab`). Classic keeps the cell-sized label.
 fn header_label_px(row_h: f32, scale: f32, fluent: bool) -> crate::type_scale::StepPx {
     if fluent {
         TypeStep::Secondary.px(crate::tab_bar::chrome_label_base_px(row_h, scale))
@@ -610,14 +559,7 @@ fn header_label_px(row_h: f32, scale: f32, fluent: bool) -> crate::type_scale::S
     }
 }
 
-/// The focused Fluent header's accent rule in a header row `h` device pixels
-/// tall: its first pixel row and its thickness, whole pixels at the row's foot
-/// (two at 100%, three at 150%, four at 200%: twice the row's 24 px unit,
-/// rounded). The focus ring's side lines start on its top row and turn into it
-/// across the divider gap (`crate::pane_chrome::focus_ring_rects`), so the
-/// rule and the ring meet in an L; the rule was an antialiased line the ring
-/// passed three pixels short of (the 2026-10-18 judge's
-/// `focus-ring-header-corner-notch`).
+/// The focused Fluent header's accent rule in a header row `h` device pixels tall: its first pixel row and its thickness, whole pixels at the row's foot (two at 100%, three at 150%, four at 200%: twice the row's 24 px unit, rounded).
 #[must_use]
 pub(crate) fn focus_rule_rows(h: u32) -> (u32, u32) {
     let unit = (h as f32 / 24.0).max(0.5);
@@ -630,23 +572,15 @@ pub(crate) fn focus_rule_rows(h: u32) -> (u32, u32) {
 const HEADER_FOOT_ALPHA: u8 = 45;
 
 /// The least contrast a Fluent header's foot holds against the ground it and
-/// the grid below share ([`header_ground`]). The label at
-/// [`HEADER_FOOT_ALPHA`] is 2.04:1 on Default's ground but 1.17:1 on Default
-/// Light's (`#e5e6e8` on `#f6f7f9`), where an unfocused header nearly merged
-/// into its grid (the 2026-10-18 judges' `j3d-light-header-foot-faint`).
+/// the grid below share ([`header_ground`]).
 const HEADER_FOOT_FLOOR: f64 = 1.5;
 
 /// The foot's colour ([`HEADER_FOOT_ALPHA`]); under the Fluent chrome, where
 /// the header wears its pane's ground and the foot is all that closes it
 /// against the grid, held at [`HEADER_FOOT_FLOOR`] there: the label ink laid
-/// at the least opacity that clears it, as an opaque tone. A foot that clears
-/// the floor (every dark theme) is drawn as before, and the Classic header,
-/// whose band fill already parts it from the grid, too. The focused header's
-/// accent underline covers the foot either way.
+/// at the least opacity that clears it, as an opaque tone.
 fn header_foot(colors: &chrome_band::BandColors, fluent: bool) -> crate::widget::Rgba {
     let quiet = rgba(colors.label, HEADER_FOOT_ALPHA);
-    // The label ink at `alpha` over the fill as the pen lays a hairline:
-    // linear-light source-over.
     let laid = |alpha: u8| -> [u8; 3] {
         let a = f32::from(alpha) / 255.0;
         std::array::from_fn(|k| {
@@ -684,8 +618,6 @@ fn raster(
     colors: chrome_band::BandColors,
     native_icon: Option<TabIconKind>,
 ) -> Option<Arc<ImageData>> {
-    // The proportional pen cannot paint every glyph the terminal cascade can.
-    // Keep its semantic cells visible for CJK/emoji rather than covering real
     // content with a raster containing missing-glyph holes.
     if !tray_raster::strip_band_run_coverable(label) {
         return None;
@@ -708,7 +640,6 @@ fn raster(
     let fg = if focused { colors.value } else { colors.label };
     let accent = if focused { colors.accent } else { colors.label };
     let y = tray_raster::row_baseline(0.0, h - scale, size.get());
-    // Shared straight band, with a quiet seam against the content.
     let mut prims = vec![DrawPrim::Line {
         x1: 0.0,
         y1: h - 0.5,
@@ -718,8 +649,6 @@ fn raster(
         color: header_foot(&colors, fluent),
     }];
     if fluent {
-        // A dot, not a tree branch: the accent on the focused pane (whose
-        // side of each divider carries the accent ring), a quiet one beside it.
         prims.push(DrawPrim::Dot {
             cx: 12.0 * scale,
             cy: h * 0.5,
@@ -727,10 +656,6 @@ fn raster(
             color: rgba(accent, if focused { 255 } else { 120 }),
         });
         if focused {
-            // The selected header's accent underline (a Fluent selected tab's):
-            // the header says at a glance which pane has the keyboard. On whole
-            // pixel rows from the pane's first column, where the focus ring's
-            // side line turns into it ([`focus_rule_rows`]).
             let (top, thick) = focus_rule_rows(u32::from(height));
             let mid = top as f32 + thick as f32 / 2.0;
             prims.push(DrawPrim::Line {
@@ -743,8 +668,6 @@ fn raster(
             });
         }
     } else {
-        // A small branch; only the focused child gets a short accent rail; no
-        // top-level tab shape.
         prims.extend([
             DrawPrim::Line {
                 x1: 10.0 * scale,
@@ -775,7 +698,6 @@ fn raster(
         }
     }
     let status = status_label(indicators);
-    // Focus is the accent rail and the bold label; the right side is status alone.
     let suffix = status.to_string();
     let suffix_size = if fluent {
         size
@@ -897,8 +819,7 @@ mod tests {
 
     /// The Fluent header (Windows) has no top seam of its own (the strip's rule
     /// or a divider's hairline is above it) and marks the focused pane with a
-    /// dot, the other with nothing. NEGATIVE CONTROL: the Classic header keeps
-    /// its seam and its branch glyphs.
+    /// dot, the other with nothing.
     #[test]
     fn a_fluent_header_has_no_top_seam_and_dots_the_focused_pane() {
         let theme = aterm_render::Theme::default();
@@ -926,9 +847,7 @@ mod tests {
     /// THE FLUENT HEADER WEARS ITS PANE'S GROUND ([`header_ground`]): its cells and
     /// its raster are the terminal's background, so the strip's selected tab opens
     /// into it, and on every bundled scheme its words keep AA and its dot and rule
-    /// 3:1 there. NEGATIVE CONTROL: the Classic header keeps the band's tone, which
-    /// the Fluent header wore until 2026-10-18 under a ground-coloured selected
-    /// tab (the judges' `selected-tab-opens-onto-grey-band`).
+    /// 3:1 there.
     #[test]
     fn a_fluent_header_wears_its_panes_ground() {
         use crate::pane_chrome::{SplitChrome, with_split_chrome};
@@ -980,7 +899,6 @@ mod tests {
                 )
             })
             .expect("the header rasters");
-            // The far end of the row, clear of the label and over its hairline.
             let width = 20 * 9;
             let at = (2 * width + width - 2) * 4;
             assert_eq!(
@@ -996,9 +914,7 @@ mod tests {
     /// scheme its foot, the hairline under it, holds [`HEADER_FOOT_FLOOR`]
     /// against the ground the header and the grid share, in the raster too; a
     /// foot that already cleared it (Default's 2.04:1) is the same quiet line
-    /// as before, and the Classic header keeps its line. NEGATIVE CONTROL: the
-    /// label at [`HEADER_FOOT_ALPHA`] alone is under the floor on Default Light
-    /// (1.17:1, the judges' `j3d-light-header-foot-faint`).
+    /// as before, and the Classic header keeps its line.
     #[test]
     fn an_unfocused_fluent_header_keeps_its_foot_off_the_grid() {
         use crate::pane_chrome::{SplitChrome, with_split_chrome};
@@ -1071,9 +987,7 @@ mod tests {
     /// pane's first pixel column to its last ([`focus_rule_rows`]: two rows at
     /// 100%, three at 150%, four at 200%, at the row's foot), the rows the focus
     /// ring's side line turns into (`crate::pane_chrome::focus_ring_rects`); the
-    /// row above it is not the accent. NEGATIVE CONTROL: the rule it replaced,
-    /// `2 × (h/24)` thick centred `h/24` above the foot, began 0.08 px into its
-    /// top row at 100%, so that row was antialiased, not the ring's.
+    /// row above it is not the accent.
     #[test]
     fn the_focused_fluent_rule_lies_on_whole_rows_from_the_panes_edge() {
         use crate::pane_chrome::{SplitChrome, with_split_chrome};
@@ -1138,9 +1052,6 @@ mod tests {
     /// THE HEADER READS BELOW THE TAB: under the Fluent chrome the pane
     /// header's label is the Secondary step of the strip's own chrome base, at
     /// every scale smaller than the tab title above it, in the same face.
-    /// NEGATIVE CONTROL: the cell-sized Classic label, which the Fluent header
-    /// used until 2026-10-18, is 16.6 px in the 23 px Windows row against the
-    /// strip's 13 px.
     #[test]
     fn the_fluent_header_label_sits_a_step_below_the_tab_title() {
         for (row_h, scale) in [(23.0f32, 1.0f32), (29.0, 1.25), (35.0, 1.5), (46.0, 2.0)] {
@@ -1289,7 +1200,6 @@ mod tests {
                 .set("attention", Some("Needs review".into())),
             Some(true)
         );
-        // The `meta set` wake publishes the need the header marks.
         app.refresh_presence_session(session);
         assert_ne!(app.refresh_pane_headers(wid, &plan), focused);
         assert!(

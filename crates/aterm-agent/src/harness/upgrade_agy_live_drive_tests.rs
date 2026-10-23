@@ -35,6 +35,7 @@ enum Twin {
 }
 
 /// One message of the conversation: its id, its priority, how long ago it
+/// was written (ms), and whether `read.json` marks it read.
 #[derive(Clone, Debug)]
 struct Msg {
     id: &'static str,
@@ -49,12 +50,15 @@ enum Shared {
     /// Its argv names the conversation (`--conversation=<uuid>`).
     Resuming,
     /// It holds the conversation's database with no presence lock (`-c`, an
+    /// in-TUI `/resume`).
     Lockless,
     /// The process table cannot be read.
     Unread,
 }
 
 /// One witness of the gate that changes between the first look and the last
+/// (from the hand's `lease` on): what a cron firing or a task ending in that
+/// window writes, or what a person starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Between {
     /// A background task's `RUNNING` row lands in the transcript.
@@ -75,14 +79,17 @@ enum Between {
 #[derive(Clone, Debug, Default)]
 struct Knobs {
     /// The screen before the signal (a lab fixture): `None` idle at a turn's
+    /// end.
     screen: Option<&'static str>,
     /// The tab is held (`hold=1`).
     held: bool,
     /// Held from the Nth `status` read on (the last look's).
     held_from: Option<usize>,
     /// The transcript's rows (default: a finished turn of this process);
+    /// `Err(())` for no transcript at all.
     transcript: Option<Result<String, ()>>,
     /// The summary query's answer (default: the conversation's row idle);
+    /// `Err(())` for a database that cannot be read.
     summary: Option<Result<String, ()>>,
     /// The conversation's messages.
     messages: Vec<Msg>,
@@ -109,6 +116,7 @@ struct Knobs {
     /// The host's step (hand the relaunch back to the loop).
     hand_back: bool,
     /// Another process holds the conversation's lock from the hand's take on
+    /// (between the first look and the last).
     lock_moves: bool,
     /// The agy holds no presence lock (a fresh agy that took no turn).
     no_conversation: bool,
@@ -117,10 +125,13 @@ struct Knobs {
     /// One witness changes between the first look and the last.
     between: Option<Between>,
     /// The command line the shell's integration recorded for the command the
+    /// tab runs (default `sh agy.sh`, a launcher naming no agy).
     cmdline: Option<&'static str>,
 }
 
 /// The scripted kernel: [`TUI`] runs under [`SHELL`] until the signal,
+/// holding the conversation's lock; its relaunch [`NEW`] appears when the
+/// line is typed and takes it.
 struct LiveKernel {
     exited: Arc<AtomicBool>,
     relaunched: Arc<AtomicBool>,
@@ -405,6 +416,7 @@ fn message_body(id: &str, priority: &str) -> String {
 }
 
 /// One idle agy behind a build: its config with the conversation's files,
+/// the store's builds and the twin, the stand-in instance, the kernel.
 struct LiveRig {
     dir: ScratchDir,
     opts: Opts,
@@ -417,6 +429,7 @@ struct LiveRig {
 }
 
 /// Lays a store build `build` of `version` under `store`: its program and
+/// its record.
 fn lay(store: &Path, build: &str, version: &str) -> PathBuf {
     let exe = store.join(build).join("bin/agy");
     std::fs::create_dir_all(exe.parent().expect("bin")).expect("store");
@@ -435,6 +448,9 @@ fn served(fixture: &str) -> String {
 }
 
 /// The conversation's files a [`Between`] change writes under `generated`
+/// (`<config>/brain/<uuid>/.system_generated`) as the hand is taken: a
+/// background task's `RUNNING` row appended to the transcript, or a HIGH
+/// message unread.
 fn change_on_disk(generated: &Path, what: Between) {
     match what {
         Between::Transcript => {
@@ -713,6 +729,8 @@ impl LiveRig {
     }
 
     /// The lane's own carry of the tab's record in flight (what the host's
+    /// exit watch and its idle point reach, `agy_carry_in_flight`), over this
+    /// rig's kernel, as a loop's carry takes it (`hand_back` off).
     fn carry(&self) -> Report {
         let st = self.record().expect("a record in flight");
         let r = Report {
@@ -742,6 +760,12 @@ impl Drop for LiveRig {
 }
 
 /// AN IDLE AGY BEHIND A NEWER BUILD IS RESTARTED ONTO IT, ITS CONVERSATION
+/// KEPT, AND NOTHING IS TYPED AFTER: one SIGTERM to that very process; the
+/// claim on disk before it (in flight, the upgrade's cause, the process, the
+/// conversation, the twin, quiet), which makes its exit `0` the harness's own
+/// restart; one line typed — the managed twin with the launch's `--effort`
+/// and `--conversation=<uuid>` — and no continuation; the record done once the
+/// new process holds the conversation's presence lock (`done:resumed`).
 #[test]
 fn an_idle_agy_behind_is_restarted_onto_the_new_build_and_nothing_is_typed() {
     let rig = LiveRig::new("idle", Knobs::default());
@@ -815,6 +839,9 @@ fn an_idle_agy_behind_is_restarted_onto_the_new_build_and_nothing_is_typed() {
 }
 
 /// THE HOST'S STEP hands the relaunched agy back to its loop (`adopted`: it
+/// leads the tab and holds the conversation's lock), whose next idle point
+/// carries it on QUIETLY: the lock held by the new process, nothing typed
+/// (`done:resumed`).
 #[test]
 fn the_hosts_step_adopts_and_its_carry_types_nothing() {
     let rig = LiveRig::new(
@@ -835,6 +862,8 @@ fn the_hosts_step_adopts_and_its_carry_types_nothing() {
 }
 
 /// THE EXIT CARRIED BY THE HOST'S EXIT WATCH: a shell slow to take its
+/// terminal back leaves the step `wait:shell-prompt` with the claim in
+/// flight.
 #[test]
 fn a_restart_left_in_flight_is_carried_as_the_harnesss_own() {
     let ready = Arc::new(AtomicBool::new(false));
@@ -859,6 +888,8 @@ fn a_restart_left_in_flight_is_carried_as_the_harnesss_own() {
 }
 
 /// THE QUIET ADOPTION NEEDS THE LOCK: a relaunched agy that never takes the
+/// conversation's presence lock started a fresh one (agy says `conversation
+/// not found`): `refused:started-fresh`, nothing typed but the line.
 #[test]
 fn a_relaunch_that_never_holds_the_lock_started_fresh() {
     let mut rig = LiveRig::new(
@@ -875,6 +906,7 @@ fn a_relaunch_that_never_holds_the_lock_started_fresh() {
 }
 
 /// One knob, the word the step waits on, and nothing signalled or typed: no
+/// record is left where none stood.
 fn holds(name: &str, knobs: Knobs, want: &str) {
     let rig = LiveRig::new(name, knobs);
     let r = rig.visit();
@@ -892,6 +924,8 @@ fn restarts(name: &str, knobs: Knobs) {
 }
 
 /// G-A2(b), THE TRANSCRIPT: a command task running, a daemon task, a
+/// subagent working — each with no end row in this process's rows — hold the
+/// restart; a torn transcript, and none at all, fail closed.
 #[test]
 fn the_transcript_holds_running_work() {
     let with = |rows: String| Knobs {
@@ -943,6 +977,10 @@ fn the_transcript_holds_running_work() {
 }
 
 /// G-A1 AND G-A2(c), THE SUMMARY ROW: `RUNNING` (a turn, or a turn's end a
+/// moment after the screen reads it over) holds the restart as `turn-open`,
+/// `not_fully_idle` as background work, a subagent's own row `RUNNING` as a
+/// subagent; a database that cannot be read, and no row of the
+/// conversation, fail closed.
 #[test]
 fn the_summary_row_holds_the_turn_and_the_work() {
     let answer = |text: String| Knobs {
@@ -991,6 +1029,8 @@ fn the_summary_row_holds_the_turn_and_the_work() {
 }
 
 /// G-A2(e), THE WAKES: a waking message unread, or read but just written,
+/// holds the restart (`queued-work`); one `read.json` cannot parse fails
+/// closed.
 #[test]
 fn a_pending_wake_holds_the_restart() {
     let msg = |priority, ago_ms, read| Msg {
@@ -1030,6 +1070,12 @@ fn a_pending_wake_holds_the_restart() {
 }
 
 /// G-A1'S SCREEN HALF AND G-A2(a)/(d), AND THE PERSON: agy's own background
+/// work drawn under the composer (a task's panel row; with the panel turned
+/// off, a subagent's count alone) holds the restart as background work; a
+/// turn's spinner, an exit pending and a turn that ended on a wall as a
+/// screen not idle; a draft, a hold, a child process of any name (a daemon
+/// task's bare `sleep`, which Claude Code's shell-name list misses) and an
+/// unreadable process table each by its own word.
 #[test]
 fn the_screen_the_person_and_any_child_hold_the_restart() {
     use aterm_phase::agy::fixtures::lab;
@@ -1078,6 +1124,11 @@ fn the_screen_the_person_and_any_child_hold_the_restart() {
 }
 
 /// THE BUILD AND THE ORDER: a probe of the new build out of time or exiting
+/// is no proof (`wait:build-fails`); a twin naming the running build or an
+/// older one moves nothing (`current`); a launch no relaunch can carry is
+/// never restarted (`skip:…`); a fresh agy that holds no conversation has
+/// nothing to resume (`wait:no-session`); and at a background break nothing
+/// acts (`wait:break`).
 #[test]
 fn the_build_the_order_and_the_launch_hold_the_restart() {
     holds(
@@ -1135,6 +1186,13 @@ fn the_build_the_order_and_the_launch_hold_the_restart() {
 }
 
 /// THE LAST LOOK AND THE SIGNAL put the claim back: a hold landing between
+/// the claim and the signal, the conversation's lock taken by another
+/// process meanwhile, or ANY witness of the gate turning in that window — a
+/// background task's row in the transcript, a waking message unread, the
+/// summary row `RUNNING`, a child process, a busy screen, another agy on the
+/// conversation (`wait:changed-before-signal`: the last look is the whole
+/// gate again, never its hold half alone) — and a signal the server refuses
+/// (`wait:signal-held`) leave no record, nothing typed.
 #[test]
 fn a_change_before_the_signal_or_its_refusal_takes_the_claim_back() {
     holds(
@@ -1183,6 +1241,10 @@ fn a_change_before_the_signal_or_its_refusal_takes_the_claim_back() {
 }
 
 /// G-A3, THE CLAIM ON DISK BEFORE THE SIGNAL: a claim whose write does not
+/// complete (a directory where the tab's record goes) waits
+/// (`wait:claim-unwritten`), signals nothing and types nothing, and leaves
+/// what stood there as it was — an exit with no claim on disk would be read
+/// as someone's graceful end, and the agy it ended never relaunched.
 #[test]
 fn a_claim_that_cannot_be_written_signals_nothing() {
     let blocked = LiveRig::new("claim-write-refused", Knobs::default());
@@ -1204,6 +1266,9 @@ fn a_claim_that_cannot_be_written_signals_nothing() {
 }
 
 /// G-A4, ANOTHER AGY ON THE CONVERSATION: one whose argv names it, or one
+/// holding its database with no lock (`agy -c` in another tab), holds the
+/// restart (`wait:conversation-shared`) — its relaunch could never type while
+/// that agy has it open — and so does a process table that cannot be read.
 #[test]
 fn another_agy_on_the_conversation_holds_the_restart() {
     for (name, shared) in [
@@ -1230,6 +1295,9 @@ fn another_agy_on_the_conversation_holds_the_restart() {
 }
 
 /// G-A4, A LAUNCH THAT SET ITS OWN ENVIRONMENT on its typed line (the shell's
+/// record of the command the tab runs) is never restarted
+/// (`skip:env-not-carried`): the relaunch line runs in the shell's
+/// environment, and the key and endpoint would be gone.
 #[test]
 fn a_launch_that_set_its_own_environment_is_not_restarted() {
     holds(
@@ -1259,6 +1327,7 @@ fn a_launch_that_set_its_own_environment_is_not_restarted() {
 }
 
 /// [`live::upgrade_due`]: due while behind, not due when current, never
+/// another lane's tab (a leader that is no `agy`).
 #[test]
 fn the_tab_is_due_while_its_build_is_behind() {
     let behind = LiveRig::new("due", Knobs::default());
@@ -1287,6 +1356,12 @@ fn the_tab_is_due_while_its_build_is_behind() {
 }
 
 /// THE SUMMARY DATABASE IS READ LIVE, WITH NO LOCK, IN BOTH OF ITS STATES
+/// (macOS: Apple's `/usr/bin/sqlite3`), over a database laid as agy lays its
+/// own (WAL mode, the table's columns): CLOSED — no `-wal`, no `-shm`, as agy
+/// leaves it some 30 s after its last write — it is read as an immutable
+/// file, and the read leaves neither file behind; OPEN — another connection
+/// holding it with rows still in its `-wal` — from a private copy of the file
+/// and its `-wal`, which holds them once the holder has committed.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_summary_database_is_read_only_open_or_closed() {
@@ -1387,6 +1462,11 @@ fn the_summary_database_is_read_only_open_or_closed() {
 }
 
 /// THE SUMMARY READ NEVER LOCKS OUT A WRITER (macOS: Apple's `/usr/bin/sqlite3`),
+/// over the database as a holder that died leaves it — rows still in a large
+/// `-wal`, the `-shm` beside it, no connection: the state in which a reader
+/// through SQLite, the first to open it, empties the WAL index and rebuilds it
+/// holding the index's write and recover locks (agy's own open makes the same
+/// unbuilt index for a moment).
 #[cfg(all(target_os = "macos", debug_assertions))]
 #[test]
 fn the_summary_read_never_locks_out_a_writer_with_no_busy_timeout() {
@@ -1479,6 +1559,7 @@ fn the_summary_read_never_locks_out_a_writer_with_no_busy_timeout() {
 }
 
 /// The messages look: none, a directory that cannot be read, a message that
+/// cannot be read.
 #[test]
 fn the_messages_look_reads_the_directory_and_fails_closed() {
     let dir = scratch("messages-look");
@@ -1522,6 +1603,10 @@ fn versions(landed: i64) -> (&'static str, &'static str) {
 }
 
 /// The screen a state stands for, as agy 1.4.0 draws it: a draft (over the
+/// panel where work runs and it is drawn); a screen not idle (a turn's
+/// spinner over the panel, a turn's spinner, an exit pending); else the work
+/// drawn under an ended turn (its panel row, or its count alone with the
+/// panel off) or the end of a turn.
 fn state_rows(s: &State) -> Vec<String> {
     use aterm_phase::agy::fixtures::lab;
     let work = s["task"] == 1 || s["daemon"] == 1 || s["subagent"] == 1;
@@ -1563,6 +1648,9 @@ fn state_rows(s: &State) -> Vec<String> {
 }
 
 /// The summary query's answer a state stands for: the row `RUNNING` through
+/// a turn (and a moment past its end), not fully idle while a task, a timer
+/// or a subagent runs — never for a daemon task (measured) — and the
+/// subagent's own row `RUNNING` while it works.
 fn state_summary(s: &State) -> String {
     let status = if s["turn"] == 1 {
         "CASCADE_RUN_STATUS_RUNNING"
@@ -1578,6 +1666,8 @@ fn state_summary(s: &State) -> String {
 }
 
 /// The transcript a state stands for: a finished turn, a command task's
+/// `RUNNING` row, a daemon task's, a subagent's spawn — each still open — and
+/// a torn tail where it cannot be read.
 fn state_transcript(s: &State) -> String {
     let mut text = finished_turn(AT);
     if s["task"] == 1 {
@@ -1596,6 +1686,17 @@ fn state_transcript(s: &State) -> String {
 }
 
 /// THE REAL DECISION AT STATE `s`: the order of its builds
+/// ([`pure::moves_onto`]) and the gate ([`pure::gate`]) over the look the
+/// real readers make of its world, composed by the drive's own
+/// [`live::look_of`] — the person by the `status` line's own rule
+/// (`held_by_status`), the screen by agy's reader and the background-work
+/// witness, the summary by its rule, the transcript by
+/// [`pure::quiet_transcript`], the children by the process rule
+/// (`descendants_in`: a command task's shell, a daemon's bare command; a
+/// timer and a subagent are no process), the wakes by [`pure::wakes`], the
+/// other agys on the conversation by [`live::sharers`] over a kernel that
+/// answers one (`agy -c` in another tab) where the state says so: `rigs`,
+/// alone and shared.
 fn real_restarts(s: &State, rigs: &(LiveRig, LiveRig)) -> bool {
     let (running, target) = versions(s["landed"]);
     let rows = state_rows(s);
@@ -1633,6 +1734,9 @@ fn real_restarts(s: &State, rigs: &(LiveRig, LiveRig)) -> bool {
 }
 
 /// THE REAL CLAIM: the record the step writes before its signal, from a
+/// snapshot of the agy it ends, read by the one rule the host's exit watch
+/// reads a leaving agent by (`relaunch::ended_by_restart`): `true` is its exit
+/// relaunched as the harness's own restart.
 fn real_claim_relaunches() -> bool {
     let rig = LiveRig::new("tier1-claim", Knobs::default());
     let args = rig.kernel.args(TUI).expect("argv");
@@ -1658,6 +1762,13 @@ fn real_claim_relaunches() -> bool {
 }
 
 /// Tier-1 of `HarnessAgyQuietUpgrade` (aterm-models-harness
+/// `harness_agy_quiet_upgrade_model`): every state the model reaches before
+/// the move is replayed through the real order, screen reader, summary rule,
+/// transcript reader, person rule, process rule, wake rule, sharers and gate:
+/// the model's first `Look` is enabled EXACTLY where the real quiet flow's
+/// first look opens, and once the claim is on disk its `Restart` exactly
+/// where the real last look still opens and its `TakeBack` exactly where it
+/// does not (the last look is the whole gate again).
 #[test]
 fn tier1_the_real_agy_quiet_upgrade_conforms_to_the_model() {
     let model = aterm_models_harness::harness_agy_quiet_upgrade_model();

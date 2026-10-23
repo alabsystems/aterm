@@ -34,7 +34,8 @@ fn bounded_paste_text(text: &str) -> &str {
 }
 
 /// Sanitizer policy shared by paste formatting and its allocation-free
-/// authored-payload probe.
+/// authored-payload probe. Not `const`: stable's `char::is_control` is not,
+/// and the cross cells build this crate on stable.
 #[inline]
 fn paste_char_allowed(c: char) -> bool {
     !(c.is_control() && c != '\t' && c != '\n' && c != '\r')
@@ -62,7 +63,7 @@ const fn paste_byte_kept(b: u8) -> bool {
 
 /// Whether one sanitizer-surviving character can advance or reposition the
 /// cursor. Zero-width marks, variation selectors and joiners cannot land a
-/// cursor on their own.
+/// cursor on their own. Not `const`, as [`paste_char_allowed`] is not.
 #[inline]
 fn paste_char_can_move(c: char) -> bool {
     paste_char_allowed(c) && (matches!(c, '\t' | '\n' | '\r') || aterm_grapheme::char_width(c) > 0)
@@ -490,6 +491,7 @@ impl Terminal {
     /// use aterm_core::terminal::Terminal;
     ///
     /// let mut term = Terminal::new(24, 80);
+    /// // The mode says nothing here: the caller's decision is what frames it.
     ///
     /// // Without bracketed paste mode
     /// assert_eq!(term.format_paste("hello"), b"hello");
@@ -501,6 +503,7 @@ impl Terminal {
     ///     b"\x1b[200~hello\x1b[201~"
     /// );
     /// ```
+    /// use aterm_core::terminal::Terminal;
     #[inline]
     #[must_use]
     pub fn format_paste(&self, text: &str) -> Vec<u8> {
@@ -548,6 +551,7 @@ impl Terminal {
     /// term.process(b"\x1b[?2004h");
     /// assert_eq!(term.format_paste_framed("hello", false), b"hello");
     /// ```
+    /// use aterm_core::terminal::Terminal;
     #[must_use]
     pub fn format_paste_framed(&self, text: &str, bracketed: bool) -> Vec<u8> {
         let text = bounded_paste_text(text);

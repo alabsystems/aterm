@@ -3967,8 +3967,8 @@ pub(crate) fn program_check_stuck(workers: u64, limit: Option<u64>) -> Message {
     .line(then.words())
     .line(cause_words)
     .line(
-        "No new program can start on this Mac, and a privacy check can freeze the screen \
-             and close every window. Logging out does not clear it.",
+        "Most new programs cannot start on this Mac, and a privacy check can freeze the \
+             screen and close every window. Logging out does not clear it.",
     )
     .now(Ask::standing(why, then))
     .line(format!(

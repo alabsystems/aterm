@@ -1,34 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The repaint nudge, host side: the driver around the pure machine in
-//! `aterm_core::terminal::repaint_nudge`. The machine says when the session's PTY is set one row
-//! short ([`Act::Hold`]) and back ([`Act::Release`]); this file reads the world into [`Facts`],
-//! performs those two PTY writes and keeps the release from being lost. It reaches the world only
-//! through [`NudgeWorld`] ([`AppWorld`] in production, a table in the tests).
-//!
-//! The ordinary layout passes cannot repair a PTY left short (they write the PTY only when the
-//! engine's size moves), so the release does not rest on this driver's own exit paths:
-//!
-//! 1. the hold is a [`PtyGuard`] whose `Drop` sets the PTY to the engine's current size;
-//! 2. a hold has a hard deadline, [`PTY_HOLD_CAP_MS`], and the tick first releases any hold
-//!    past it;
-//! 3. [`NudgeHost::pty_short`] lives outside the drivers and is emptied only when `TIOCGWINSZ`
-//!    reads the engine's size, so a hold whose driver vanished meets the same deadline;
-//! 4. a handoff freeze calls [`NudgeHost::release_all`] first, and `Facts::frozen` is a gate;
-//! 5. a window pass that changes the engine's size sets the PTY to its plan anyway: the machine
-//!    forgets the hold ([`Act::Forget`], no write).
-//!
-//! An attempt that held always ends judged (healed, a give-up the owner hears, or a drop whose
-//! reason is true) with one `aterm.log` line ([`end_line`]). A real resize that moves the engine
-//! ends it [`Dropped::Superseded`]; if that resize comes back, the epoch judge raises the give-up
-//! the attempt would have reached ([`NudgeWorld::superseded`], `crate::resize_epoch`).
-//!
-//! Armed by the epoch's judgement (`resize_epoch::note_nudge_due`), never by the status sweep;
-//! ticked from `about_to_wait`, its next instant folded into the loop's deadline under
-//! `DeadlineOwner::RenderEpoch`. `[render] repaint_nudge`: `on` acts; `log` runs everything but
-//! the two PTY writes and logs `would-nudge ...`; `off` arms nothing. Only the agent class is
-//! ever held.
+//! Host-side repaint nudge driver ([`Act::Hold`], [`Act::Release`], [`Facts`], [`NudgeWorld`],
+//! [`AppWorld`], [`PtyGuard`], [`PTY_HOLD_CAP_MS`], [`NudgeHost::pty_short`],
+//! [`NudgeHost::release_all`], [`Act::Forget`], [`end_line`], [`Dropped::Superseded`],
+//! [`NudgeWorld::superseded`]).
 
 use std::collections::HashMap;
 
@@ -39,31 +15,22 @@ use aterm_core::terminal::repaint_nudge::{
 
 use crate::resize_epoch::NudgeView;
 
-/// The adoption arm's epoch id: an adoption is not one of the ledger's epochs
-/// and is tried once per session.
+/// The adoption arm's epoch id.
 pub(crate) const ADOPTION_EPOCH: u64 = u64::MAX;
 
-/// The beat at which a held PTY that the reconcile could not clear is retried
-/// once its hard deadline has passed.
+/// Retry interval for a held PTY past its hard deadline.
 const PTY_RETRY_MS: u64 = 250;
 
-/// How long after its reader attached a repaint-adopted agent tab is given to
-/// answer the adoption pulse with a full repaint before the nudge is armed.
+/// Grace period for an adopted agent tab to repaint before arming the nudge.
 pub(crate) const ADOPTION_WAIT_MS: u64 = 1_500;
 
-/// How long the class of a repaint-adopted tab is waited for (the presence
-/// classifier names a program by its foreground group, which an adopted session
-/// has only after its first sweep). A program not known to be Claude Code by
-/// then is left to the pulse alone.
+/// How long the class of a repaint-adopted tab is waited for.
 pub(crate) const ADOPTION_CLASS_MS: u64 = 5_000;
 
-/// Sessions adopted with a blank engine on purpose (`Adopted::repaint`), noted
-/// by `spawn_session` and drained by the host's tick: a process-wide list, like
-/// the epoch look's, because the spawn seam has no `App` to hand it to.
+/// Sessions adopted with a blank engine on purpose (`Adopted::repaint`).
 static REPAINT_ADOPTIONS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
 
-/// `spawn_session` adopted `session` with a blank screen its program is
-/// expected to repaint.
+/// `spawn_session` adopted `session` with a blank screen its program is expected to repaint.
 #[cfg(unix)]
 pub(crate) fn note_repaint_adoption(session: u64) {
     REPAINT_ADOPTIONS
@@ -85,15 +52,12 @@ fn repaint_adoptions_pending() -> bool {
         .is_empty()
 }
 
-/// What a session's world says, minus the two facts only the host knows (the
-/// mode and whether another session is held).
+/// What a session's world says, minus the two facts only the host knows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct WorldFacts {
-    /// The machine's facts with `mode` and `other_hold` left at defaults and
-    /// `person_quiet_ms` to be filled from [`Self::gesture_ms`].
+    /// Machine facts with [`Self::gesture_ms`] and default `mode`/`other_hold`.
     pub(crate) facts: Facts,
-    /// Milliseconds since a person's last gesture on the session, `None`
-    /// when none has reached it in this process.
+    /// Milliseconds since a person's last gesture on the session.
     pub(crate) gesture_ms: Option<u64>,
     /// The host's cell size in device pixels, for the winsize pixel fields.
     pub(crate) cell_px: Option<(u16, u16)>,
@@ -132,11 +96,9 @@ pub(crate) trait NudgeWorld {
     fn now_ms(&self) -> u64;
     /// Whether the session is still hosted.
     fn alive(&self, session: u64) -> bool;
-    /// Whether the session's PTY reader is attached (an adopted session's
-    /// reader is deferred until Commit; nothing it draws is seen before).
+    /// Whether the session's PTY reader is attached.
     fn attached(&self, session: u64) -> bool;
-    /// The facts of the session's world now; `None` when the terminal is busy
-    /// (asked again shortly) or the session is gone.
+    /// The facts of the session's world now.
     fn facts(&mut self, session: u64) -> Option<WorldFacts>;
     /// The PTY's size as the kernel reports it, `None` when unreadable.
     fn pty_dims(&self, session: u64) -> Option<(u16, u16)>;
@@ -155,14 +117,11 @@ pub(crate) trait NudgeWorld {
     fn mark_tried(&mut self, session: u64, epoch: u64);
     /// The machine's phase and attempt count, for the `resizes` header.
     fn stamp(&mut self, session: u64, phase: &'static str, nudged: u32);
-    /// The attempt ended; let the ledger read the engine (an epoch the repaint
-    /// healed closes `by=nudge`) and tell whoever watches.
+    /// The attempt ended.
     fn publish(&mut self, session: u64);
-    /// The repair failed and the screen is probably still a row off. The production world hands
-    /// it to the window after the step, which raises the `render.<tab>.unrepaired` digest line.
+    /// The repair failed and the screen is probably still a row off.
     fn give_up(&mut self, session: u64, epoch: u64, why: GiveUp);
-    /// A real resize superseded the attempt for `epoch`: the epoch judge owes
-    /// its end if the resize comes back (`crate::resize_epoch`).
+    /// A real resize superseded the attempt for `epoch`.
     fn superseded(&mut self, session: u64, epoch: u64);
     /// The epoch's numbers for the log line.
     fn epoch_view(&self, session: u64) -> Option<NudgeView>;
@@ -171,8 +130,7 @@ pub(crate) trait NudgeWorld {
 struct NudgeDriver {
     machine: RepaintNudge,
     guard: Option<PtyGuard>,
-    /// When this driver was made: the "attach" of a session that no person has
-    /// touched in this process.
+    /// When this driver was made.
     attached_ms: u64,
     /// The next instant the machine asked to be stepped, if any.
     wake_ms: Option<u64>,
@@ -186,8 +144,7 @@ struct NudgeDriver {
     last_answer_ms: Option<u64>,
 }
 
-/// A repaint-adopted session waiting to be told apart: repainted by the
-/// adoption pulse (a gain), or left blank by a program that will not (armed).
+/// A repaint-adopted session waiting to be told apart.
 struct Watch {
     /// When the reader was first seen attached and the session unfrozen.
     since_ms: Option<u64>,
@@ -202,7 +159,6 @@ pub(crate) struct NudgeHost {
     watch: HashMap<u64, Watch>,
     drivers: HashMap<u64, NudgeDriver>,
     /// Sessions whose PTY is held one row short, and since when (timeline ms).
-    /// Outside the drivers on purpose: see the module note, (3).
     pty_short: HashMap<u64, u64>,
 }
 
@@ -246,8 +202,7 @@ impl NudgeHost {
         self.pty_short.len()
     }
 
-    /// Arm the nudge for `session`'s `epoch` (or an adoption). `true` when the
-    /// machine took it.
+    /// Arm the nudge for `session`'s `epoch` (or an adoption).
     pub(crate) fn arm<W: NudgeWorld>(
         &mut self,
         w: &mut W,
@@ -278,10 +233,7 @@ impl NudgeHost {
         true
     }
 
-    /// Let every hold go before a handoff freeze, so the successor adopts each PTY at the size
-    /// its program believes. Each attempt then waits the freeze out as after a release (no parked
-    /// reader carries an answer): a successor judges the debt it is handed, and after a rollback
-    /// the attempt is judged as any other. An armed one waits at its freeze gate.
+    /// Let every hold go before a handoff freeze.
     #[cfg(any(unix, test))]
     pub(crate) fn release_all<W: NudgeWorld>(&mut self, w: &mut W) {
         let now = w.now_ms();
@@ -295,12 +247,7 @@ impl NudgeHost {
         }
     }
 
-    /// The host lets `session`'s hold go (`why`): the guard's drop sets the
-    /// PTY to the engine's size, the map entry goes once the kernel agrees
-    /// (the reconcile), and the attempt waits for its answer as after a
-    /// release ([`RepaintNudge::let_go`]), stepped at once. `resizes` says so
-    /// now: the step that would stamp it may not read the world for a while
-    /// (the deadline fires when no step could).
+    /// Release `session`'s hold (`why`) and step [`RepaintNudge::let_go`].
     fn let_go<W: NudgeWorld>(&mut self, w: &mut W, session: u64, now: u64, why: &str) {
         let Some(driver) = self.drivers.get_mut(&session) else {
             return;
@@ -318,8 +265,7 @@ impl NudgeHost {
         ));
     }
 
-    /// One session's held PTY: set it to the engine's size and forget it when
-    /// the kernel agrees. Returns whether the hold is gone.
+    /// One session's held PTY: set it to the engine's size and forget it when the kernel agrees.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -356,12 +302,10 @@ impl NudgeHost {
         }
     }
 
-    /// Run every driver one step and settle the held-PTY map. Returns the
-    /// instant (timeline ms) the loop must call again, if any.
+    /// Run every driver one step and settle the held-PTY map.
     pub(crate) fn tick<W: NudgeWorld>(&mut self, w: &mut W) -> Option<u64> {
         let now = w.now_ms();
         let mut next = self.tick_watch(w, now);
-        // (2) and (3): a hold past its hard deadline, or whose driver is gone.
         let short: Vec<(u64, u64)> = self.pty_short.iter().map(|(s, t)| (*s, *t)).collect();
         for (session, since) in short {
             let driving = self
@@ -373,15 +317,11 @@ impl NudgeHost {
                 continue;
             }
             if driving {
-                // No step ended the hold (the loop did not tick, or the
-                // terminal lock answered nothing at every look): the deadline
                 // does, and the attempt is judged at the steps below.
                 self.let_go(w, session, now, &format!("hold past {PTY_HOLD_CAP_MS} ms"));
             }
-            // A driver finished or gone leaves the map entry as the only record.
             self.reconcile_one(w, session);
         }
-        // Drivers of sessions that are gone.
         let gone: Vec<u64> = self
             .drivers
             .keys()
@@ -395,10 +335,6 @@ impl NudgeHost {
         let sessions: Vec<u64> = self.drivers.keys().copied().collect();
         for session in sessions {
             let phase = self.drivers.get(&session).map(|d| d.machine.phase());
-            // A driver in flight is stepped at every tick (one `try_lock` and a
-            // few loads): its gates end with an event the loop sees, and a
-            // superseding resize or a halt must be seen at once, not at the
-            // machine's next timer. A finished one only reports its deadline.
             if !matches!(phase, Some(Phase::Armed | Phase::Short | Phase::Restoring)) {
                 if let Some(at) = self.drivers.get(&session).and_then(|d| d.wake_ms) {
                     next = Some(next.map_or(at, |n| n.min(at)));
@@ -409,9 +345,6 @@ impl NudgeHost {
                 next = Some(next.map_or(at, |n| n.min(at)));
             }
         }
-        // A held PTY has a deadline of its own. Past its cap, an entry the reconcile could not
-        // clear (lock contended or poisoned, kernel did not confirm) is retried at a slow beat,
-        // never at an instant already gone, which would re-arm an immediate wake every turn.
         for since in self.pty_short.values() {
             let at = since.saturating_add(PTY_HOLD_CAP_MS);
             let at = if at > now {
@@ -424,8 +357,7 @@ impl NudgeHost {
         next
     }
 
-    /// Watch a session `spawn_session` adopted blank (mode `off` watches
-    /// nothing): see [`Self::tick_watch`].
+    /// Watch a session `spawn_session` adopted blank ([`Self::tick_watch`]).
     pub(crate) fn watch_adoption(&mut self, session: u64) {
         if self.mode != Mode::Off {
             self.watch.entry(session).or_insert(Watch {
@@ -435,10 +367,7 @@ impl NudgeHost {
         }
     }
 
-    /// Settle every watched adoption: repainted by the pulse (a gain), still blank and known to
-    /// be Claude Code (armed once), or not Claude Code (left to the pulse). The clock runs from
-    /// the reader's attach with no handoff freeze on, never from the spawn, which for a deferred
-    /// reader is well before anything the program draws can be seen.
+    /// Settle every watched adoption.
     fn tick_watch<W: NudgeWorld>(&mut self, w: &mut W, now: u64) -> Option<u64> {
         let mut next: Option<u64> = None;
         let sessions: Vec<u64> = self.watch.keys().copied().collect();
@@ -458,7 +387,6 @@ impl NudgeHost {
             let facts = world.facts;
             if !w.attached(session) || facts.frozen {
                 entry.since_ms = None;
-                // The attach (or the end of the freeze) is an event the loop sees.
                 continue;
             }
             let since = *entry.since_ms.get_or_insert(now);
@@ -466,7 +394,6 @@ impl NudgeHost {
                 entry.base = (facts.full_clears, facts.screen_replaced);
             }
             if facts.full_clears > entry.base.0 || facts.screen_replaced > entry.base.1 {
-                // The pulse (or the program) repainted it: a gain.
                 self.watch.remove(&session);
                 continue;
             }
@@ -483,8 +410,6 @@ impl NudgeHost {
                 continue;
             }
             if waited >= ADOPTION_CLASS_MS {
-                // Not known to be Claude Code on the alternate screen this long after attach:
-                // left to the pulse.
                 self.watch.remove(&session);
                 continue;
             }
@@ -501,7 +426,6 @@ impl NudgeHost {
     fn step_one<W: NudgeWorld>(&mut self, w: &mut W, session: u64, now: u64) -> Option<u64> {
         let other_hold = self.pty_short.keys().any(|held| *held != session);
         let Some(world) = w.facts(session) else {
-            // Busy terminal: ask again shortly.
             let driver = self.drivers.get_mut(&session)?;
             let at = now.saturating_add(50);
             driver.wake_ms = Some(at);
@@ -548,7 +472,6 @@ impl NudgeHost {
                 if w.pty_dims(sid).is_none_or(|pty| pty == facts.engine) {
                     self.pty_short.remove(&sid);
                 } else {
-                    // The kernel did not take it: the reconcile keeps trying.
                     w.log(format!(
                         "repaint nudge session={sid} release not confirmed; reconciling"
                     ));
@@ -566,8 +489,6 @@ impl NudgeHost {
                 };
             }
             Act::Forget => {
-                // Someone else's layout pass set the PTY: it is theirs, so
-                // nothing is written. The map entry goes once the kernel reads
                 // the engine's size; until then the reconcile sets it.
                 if let Some(guard) = driver.guard.take() {
                     guard.disarm();
@@ -600,7 +521,6 @@ impl NudgeHost {
             }
             Act::Healed { second_ms, .. } => driver.last_answer_ms = Some(second_ms),
             Act::Dropped(Dropped::Superseded) if reason == Reason::Debt => {
-                // The program was given a size of its own; if the resize comes
                 // back after the wait, the epoch judge owes this attempt's end.
                 w.superseded(sid, epoch);
             }
@@ -618,7 +538,6 @@ impl NudgeHost {
                 reason.word()
             ));
         }
-        // Whatever ended the attempt, the PTY ends at the engine's size.
         let finished = matches!(driver.machine.phase(), Phase::Rest | Phase::Idle);
         let phase = driver.machine.phase();
         let nudged = driver.machine.nudged();
@@ -638,7 +557,6 @@ impl NudgeHost {
         let driver = self.drivers.get_mut(&sid)?;
         if driver.stamped != (phase, nudged) {
             driver.stamped = (phase, nudged);
-            // A finished machine is idle again; `nudged` keeps the count.
             w.stamp(
                 sid,
                 if phase == Phase::Rest {
@@ -653,11 +571,7 @@ impl NudgeHost {
     }
 }
 
-/// How the step's `act` ended the attempt, for its `aterm.log` line: every end
-/// of an attempt that held and every give-up has one; `None` for an act that
-/// ends nothing (the hold and its release have lines of their own) and for a
-/// drop before any hold (nothing was tried). An exhaustive match, so a new end
-/// is never silent by default.
+/// How the step's `act` ended the attempt, for its `aterm.log` line.
 fn end_line(act: Act, was: Phase, machine: &RepaintNudge) -> Option<String> {
     let ms = |at: Option<u64>| at.map_or_else(|| "-".to_string(), |ms| ms.to_string());
     let held = matches!(was, Phase::Short | Phase::Restoring);
@@ -668,20 +582,14 @@ fn end_line(act: Act, was: Phase, machine: &RepaintNudge) -> Option<String> {
         } => Some(format!("healed by=nudge answer_ms={first_ms},{second_ms}")),
         Act::GaveUp(why) => Some(format!("gave-up why={}", why.word())),
         Act::Dropped(Dropped::Superseded) => Some("superseded by a real resize".to_string()),
-        // The wait for the size that stands was spent, but the engine owes
-        // nothing: nothing to report (the machine's module note).
         Act::Dropped(Dropped::NothingOwed) if held => Some(format!(
             "ended unanswered with nothing owed first_answer_ms={}",
             ms(machine.first_answer_ms())
         )),
-        // The size that stands was answered with no first answer seen (a hold
-        // someone else ended, or a short size left unanswered until the
-        // release): repainted, nothing to report.
         Act::Dropped(Dropped::Repainted) => Some(format!(
             "repainted with no first answer answer_ms=-,{}",
             ms(machine.second_answer_ms())
         )),
-        // The one release that ends the attempt (the machine's `step_short`).
         Act::Release if machine.phase() == Phase::Rest => Some(
             "ended at the release: the alternate screen was left, so no debt of it is left to \
              repair"
@@ -703,14 +611,10 @@ fn end_line(act: Act, was: Phase, machine: &RepaintNudge) -> Option<String> {
     }
 }
 
-// The App's half.
-
 /// The production world: the `App`'s sessions.
 pub(crate) struct AppWorld<'a> {
     pub(crate) app: &'a crate::App,
-    /// The `(session, epoch)` pairs the step gave up on: the window raises the
-    /// digest line once the step has returned the borrow of the app
-    /// ([`crate::App::note_render_unrepaired`]).
+    /// `(session, epoch)` pairs the step gave up on ([`crate::App::note_render_unrepaired`]).
     pub(crate) gave_up: Vec<(u64, u64, GiveUp)>,
 }
 
@@ -741,9 +645,6 @@ impl NudgeWorld for AppWorld<'_> {
     }
 
     fn facts(&mut self, session: u64) -> Option<WorldFacts> {
-        // The release is proven by reading the kernel's size back
-        // (`TIOCGWINSZ`, [`aterm_pty::size`]); a platform whose PTY cannot be
-        // read (ConPTY answers `None` always) has no proof that a held PTY
         // was put back, so it holds nothing.
         if !cfg!(unix) {
             return None;
@@ -752,8 +653,6 @@ impl NudgeWorld for AppWorld<'_> {
         let s = app.pool.get(session)?;
         let now_us = crate::metrics::now_us();
         let (alt_screen, owed, selection, frame_open, clears, replaced, engine, cell_px) = {
-            // A lock a panic poisoned is read as the rest of the window reads
-            // it: `None` is for a busy terminal, asked again shortly.
             let term = crate::term_try_lock(&s.term)?;
             (
                 term.modes().alternate_screen,
@@ -839,9 +738,6 @@ impl NudgeWorld for AppWorld<'_> {
         let Some(s) = self.app.pool.get(session) else {
             return PtyGuard::new(|| {});
         };
-        // The guard holds a sink clone, so the master stays open until it drops: a bare number
-        // could name another tab's PTY by the next tick. The terminal is read only for its size
-        // (the parse stage or a worker can outlive the master, so it proves nothing about it).
         let sink = std::sync::Arc::clone(&s.ctx.sink);
         let term = std::sync::Arc::downgrade(&s.term);
         PtyGuard::new(move || {
@@ -884,8 +780,6 @@ impl NudgeWorld for AppWorld<'_> {
         let Ok(term) = s.term.try_lock() else { return };
         let probe = crate::resize_ledger::EngineProbe::sample(&term);
         drop(term);
-        // A verdict that moved is recorded, and the record wakes the session's
-        // watchers.
         let _ = s
             .ctx
             .timeline
@@ -921,8 +815,7 @@ impl NudgeWorld for AppWorld<'_> {
 }
 
 impl crate::App {
-    /// Arm the nudge for every untried agent-class epoch at `desync-risk`, and raise the give-up
-    /// owed for a superseded attempt whose resize came back. One atomic load when nothing changed.
+    /// Arm the nudge for every untried agent-class epoch at `desync-risk`.
     fn arm_nudges(&mut self) {
         let generation = crate::resize_epoch::nudge_due_generation();
         if self.nudges.mode() == Mode::Off || generation == self.nudge_gen_seen {
@@ -967,8 +860,7 @@ impl crate::App {
         }
     }
 
-    /// Run the repaint nudge one step (see the module note). Called from the
-    /// event loop's `about_to_wait`, right after the epoch look.
+    /// Run the repaint nudge one step (see the module note).
     pub(crate) fn tick_nudges(&mut self) {
         if repaint_adoptions_pending() {
             for session in take_repaint_adoptions() {
@@ -976,7 +868,6 @@ impl crate::App {
             }
         }
         self.arm_nudges();
-        // A repair that gave up is a line of the digest until its epoch heals.
         self.check_render_repairs();
         if self.nudges.is_idle() {
             self.nudge_wake_ms = None;
@@ -1222,15 +1113,12 @@ mod tests {
         let (mut host, mut w) = armed(Mode::On);
         host.tick(&mut w);
         assert_eq!(host.held(), 1);
-        // The window resized the engine; the layout pass set the PTY to its plan.
         w.s.borrow_mut().engine.insert(1, (62, 200));
         w.s.borrow_mut().pty.insert(1, (62, 200));
         w.advance(10);
         host.tick(&mut w);
         assert_eq!(host.held(), 0, "the hold is forgotten");
         assert_eq!(w.pty(1), (62, 200), "the layout's size stands");
-        // Unanswered when the wait ends: the program was given a size of its
-        // own, so the attempt is superseded, never a give-up.
         w.advance(ANSWER_TIMEOUT_MS);
         host.tick(&mut w);
         assert_eq!(w.pty(1), (62, 200));
@@ -1242,7 +1130,6 @@ mod tests {
 
     #[test]
     fn every_exit_path_lifts_the_hold() {
-        // A halt during the hold.
         let (mut host, mut w) = armed(Mode::On);
         host.tick(&mut w);
         w.s.borrow_mut().halted = true;
@@ -1250,7 +1137,6 @@ mod tests {
         host.tick(&mut w);
         assert_eq!(w.pty(1), ENGINE, "halt");
         assert_eq!(host.held(), 0);
-        // No answer at all.
         let (mut host, mut w) = armed(Mode::On);
         host.tick(&mut w);
         w.advance(ANSWER_TIMEOUT_MS);
@@ -1266,7 +1152,6 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("gave-up why=no-answer"))
         );
-        // The session goes away.
         let (mut host, mut w) = armed(Mode::On);
         host.tick(&mut w);
         w.s.borrow_mut().engine.remove(&1);
@@ -1283,11 +1168,9 @@ mod tests {
         assert_eq!(host.tick(&mut w), None, "nothing armed, nothing folded");
         assert!(host.arm(&mut w, 1, Reason::Debt, 7));
         assert!(!host.is_idle());
-        // Held: the deadline is the hold's own hard cap at the latest.
         w.advance(PERSON_GATE_MS);
         let next = host.tick(&mut w).expect("a held PTY has a deadline");
         assert!(next <= w.now_ms() + PTY_HOLD_CAP_MS);
-        // Finished: nothing folded again.
         w.advance(ANSWER_TIMEOUT_MS);
         host.tick(&mut w);
         w.advance(ANSWER_TIMEOUT_MS);
@@ -1301,8 +1184,6 @@ mod tests {
         let (mut host, mut w) = armed(Mode::On);
         host.tick(&mut w);
         assert_ne!(w.pty(1), ENGINE);
-        // A panic unwinding the tick, a teardown race: the driver is dropped
-        // with its hold.
         host.drivers.remove(&1);
         assert_eq!(w.pty(1), ENGINE, "the guard's drop set the engine's size");
     }
@@ -1312,8 +1193,6 @@ mod tests {
         let (mut host, mut w) = armed(Mode::On);
         host.tick(&mut w);
         assert_ne!(w.pty(1), ENGINE, "held short");
-        // The machine is not stepped at all (the terminal lock is busy), so
-        // none of its own timeouts can release the hold: only the cap does.
         w.s.borrow_mut().blind = true;
         w.advance(PTY_HOLD_CAP_MS - 1);
         host.tick(&mut w);
@@ -1327,8 +1206,6 @@ mod tests {
             Some(&(1, "restoring", 1)),
             "`resizes` says the hold is over, though no step can read the world"
         );
-        // The map entry stays until the kernel's size is confirmed against the
-        // engine's facts, and it never asks the loop for an instant gone.
         let next = host
             .tick(&mut w)
             .expect("an unconfirmed entry keeps a wake");
@@ -1337,9 +1214,6 @@ mod tests {
         host.tick(&mut w);
         assert_eq!(w.pty(1), ENGINE);
         assert_eq!(host.held(), 0, "confirmed: the map is emptied");
-        // The deadline let the hold go; the attempt, its one try spent at the
-        // hold, is judged as after any release: unanswered on a tab that still
-        // owes rows, the give-up the owner hears, and `resizes` says it ended.
         w.advance(ANSWER_TIMEOUT_MS);
         host.tick(&mut w);
         assert_eq!(w.s.borrow().gave_up, [(1, 7, GiveUp::NoAnswer)]);
@@ -1351,8 +1225,6 @@ mod tests {
     fn a_lost_drivers_hold_is_found_and_released_by_the_reconcile() {
         let (mut host, mut w) = armed(Mode::On);
         host.tick(&mut w);
-        // The driver vanishes without running its guard (a leaked guard): only
-        // the app-level map remembers the hold.
         let driver = host.drivers.remove(&1).unwrap();
         std::mem::forget(driver);
         assert_ne!(w.pty(1), ENGINE);
@@ -1392,8 +1264,6 @@ mod tests {
         host.release_all(&mut w);
         assert_eq!(w.pty(1), ENGINE);
         assert_eq!(host.held(), 0);
-        // The attempt, its one try spent at the hold, waits the freeze out: a
-        // parked reader carries no answer, and nothing is judged under it.
         w.s.borrow_mut().frozen = true;
         for _ in 0..3 {
             w.advance(ANSWER_TIMEOUT_MS);
@@ -1401,8 +1271,6 @@ mod tests {
         }
         assert!(w.s.borrow().gave_up.is_empty(), "nothing judged frozen");
         assert_eq!(w.pty(1), ENGINE, "and nothing held again");
-        // A rollback lifts the freeze: the wait starts again and the attempt is
-        // judged as after any release.
         w.s.borrow_mut().frozen = false;
         host.tick(&mut w);
         assert!(w.s.borrow().gave_up.is_empty(), "the wait starts again");
@@ -1439,7 +1307,6 @@ mod tests {
             host.tick(&mut w);
         }
         assert_eq!(w.s.borrow().gave_up, [(1, 7, GiveUp::NoAnswer)]);
-        // The same epoch does not come back.
         assert!(!host.arm(&mut w, 1, Reason::Debt, 7));
     }
 
@@ -1448,7 +1315,6 @@ mod tests {
         let mut w = Fake::new(&[1]);
         let mut host = NudgeHost::new(Mode::On);
         assert!(host.arm(&mut w, 1, Reason::Debt, 7));
-        // Never touched: waits PERSON_GATE_MS from the driver's creation.
         host.tick(&mut w);
         assert_eq!(w.pty(1), ENGINE, "held back by the never-stamped gate");
         w.advance(PERSON_GATE_MS);
@@ -1478,7 +1344,6 @@ mod tests {
             "{:?}",
             w.s.borrow().logs
         );
-        // Armed, it waits out the never-touched gate like any nudge, then holds.
         w.advance(PERSON_GATE_MS);
         host.tick(&mut w);
         assert_ne!(w.pty(1), ENGINE, "held one row short");
@@ -1498,7 +1363,6 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("reason=adoption") && l.contains("healed by=nudge"))
         );
-        // Once: the same adoption is not armed again.
         host.watch_adoption(1);
         for _ in 0..8 {
             w.advance(ADOPTION_WAIT_MS);
@@ -1561,13 +1425,11 @@ mod tests {
             "armed before the reader attached: {:?}",
             w.s.borrow().logs
         );
-        // The Commit lands: the reader attaches, and the clock starts.
         w.s.borrow_mut().attached = true;
         host.tick(&mut w);
         w.advance(ADOPTION_WAIT_MS - 1);
         host.tick(&mut w);
         assert!(w.s.borrow().logs.iter().all(|l| !l.contains("adoption")));
-        // A freeze restarts it.
         w.s.borrow_mut().frozen = true;
         host.tick(&mut w);
         w.s.borrow_mut().frozen = false;
@@ -1626,8 +1488,7 @@ mod tests {
 
     /// The production guard holds the session's master, not its number: with the session and its
     /// terminal gone (a tab closed during a hold), the guard alone keeps the master open and puts
-    /// that PTY back at the size the hold recorded. A captured number could by then name another
-    /// tab's PTY.
+    /// that PTY back at the size the hold recorded.
     #[cfg(unix)]
     #[test]
     fn the_restore_guard_holds_the_master_past_its_session() {
@@ -1637,8 +1498,7 @@ mod tests {
         use aterm_session::sink::SinkWriter;
 
         let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-        // SAFETY: both are fresh descriptors this test alone owns; the sink
-        // takes the master.
+        // SAFETY: Both are fresh descriptors this test alone owns; the sink takes the master.
         let (sink, slave) = unsafe {
             (
                 Arc::new(SinkWriter::new_owned(OwnedFd::from_raw_fd(master))),
@@ -1648,7 +1508,6 @@ mod tests {
         let pinned = Arc::downgrade(&sink);
         let app = crate::App::headless_for_test_with_sink(sink);
         let engine = Arc::downgrade(&app.pool.get(0).expect("session 0").term);
-        // The hold: one row short of the engine's 24 rows.
         aterm_pty::resize(master, 23, 80);
         let guard = AppWorld::new(&app).restore_guard(0, (24, 81), None);
         drop(app);

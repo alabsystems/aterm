@@ -376,6 +376,7 @@ pub(crate) fn push_rect(
 }
 
 /// One flat source-over quad: `rgb` premultiplied by `alpha` (the stream's
+/// contract, `out = color + dst·(255 − alpha)/255`).
 fn push_quad(
     out: &mut Vec<GlowQuad>,
     (x, y, w, h): (u32, u32, u32, u32),
@@ -440,6 +441,8 @@ mod tests {
     }
 
     /// THE THUMB IN A DIVIDER GAP sits on the hairline with the same air from
+    /// the text on each side, at every scale, resting or widened, and never
+    /// covers a column of either pane.
     #[test]
     fn a_gap_thumb_is_centred_on_the_hairline_clear_of_both_panes() {
         for (cw, ch) in [(9u32, 23u32), (14, 35), (18, 46), (10, 20), (7, 17)] {
@@ -480,6 +483,10 @@ mod tests {
     }
 
     /// A FLUENT RESTING THUMB IN A GAP BESIDE THE RING covers the hairline and
+    /// grows away from the ring, at every scale and on either side: a stroke
+    /// of ground between it and the ring (which stands one stroke clear of the
+    /// line on its pane's side), at least two pixels from the far pane's text,
+    /// inside the gap.
     #[test]
     fn a_fluent_resting_thumb_beside_the_ring_grows_away_from_it() {
         for (cw, ch) in [
@@ -542,6 +549,9 @@ mod tests {
     }
 
     /// THE WIDENED BAR IN A GAP BESIDE THE RING keeps to the ring's far side
+    /// at every scale and on either side: it covers the hairline, a stroke of
+    /// ground lies between it and the ring's stroke, it stays a stroke clear
+    /// of the far pane's text, and it is no wider than the centred track.
     #[test]
     fn a_widened_gap_bar_beside_the_ring_keeps_off_it() {
         for (cw, ch) in [
@@ -599,6 +609,9 @@ mod tests {
     }
 
     /// ONE TONE OVER THE HAIRLINE: from `solid` up the thumb is opaque in the
+    /// ink composed over the ground, so the hairline under it cannot show;
+    /// below it the solid tone fades, and over the ground every step is the
+    /// plain translucent ink's tone.
     #[test]
     fn a_thumb_over_the_ground_is_one_tone_over_the_hairline_too() {
         let (ink, ground, line) = ([0xf8, 0xf8, 0xf2], [0x28, 0x2a, 0x36], [0x5a, 0x5c, 0x68]);
@@ -637,6 +650,8 @@ mod tests {
     }
 
     /// ONE RESTING IDIOM UNDER THE FLUENT CHROME: the thin indicator, at the
+    /// same width and the same (doubled) opacity whatever lane it rests in;
+    /// the Classic chrome keeps its thin thumb at its own opacity.
     #[test]
     fn the_fluent_resting_thumb_is_one_width_and_one_ink() {
         let m = m();
@@ -741,6 +756,7 @@ mod tests {
     }
 
     /// Every quad is source-over (alpha > 0), lies in one row band, and the
+    /// bar's pixels are exactly its rectangle: corners shaved, the middle solid.
     #[test]
     fn a_bar_is_rounded_source_over_and_banded() {
         let mut out = Vec::new();

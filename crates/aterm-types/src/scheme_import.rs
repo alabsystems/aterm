@@ -2,27 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! `aterm theme import`: offline converters from other terminals' theme
-//! formats into aterm's native theme file.
-//!
-//! The native reader ([`crate::scheme::parse_theme_str`]) stays the one parser
-//! of untrusted theme text the window ever runs: it accepts aterm's own
-//! `key = value` format and nothing else. Another terminal's theme comes in
-//! only through an explicit import, which converts it here once and writes a
-//! native file ([`to_native_conf`]) that the window then reads like any other.
-//!
-//! Every converter is pure and bounded: input above [`MAX_IMPORT_BYTES`] is
-//! refused before it is decoded, nothing is fetched, no include or import line
-//! is followed, and the container formats (plist, JSON, TOML tables) are read
-//! to a fixed nesting depth. A key with no aterm equivalent is not an error:
-//! it is listed in [`ImportReport::dropped`], so the user sees what the
-//! conversion left behind. Only a document that cannot be read at all, or one
-//! with no foreground or background, fails.
-//!
-//! Formats: kitty (`key value` lines), Ghostty (`key = value`,
-//! `palette = N=#hex`), Alacritty TOML (`[colors.*]`), iTerm2 `.itermcolors`
-//! (an XML property list), a Windows Terminal JSON scheme (alone, in an array,
-//! or in a `settings.json`), base16 / base24 YAML, and aterm's own format.
+//! `aterm theme import`: offline converters from other terminals' theme formats into aterm's native theme file.
 
 use crate::Rgb;
 use crate::scheme::{
@@ -31,12 +11,11 @@ use crate::scheme::{
     parse_theme_str, sniff_foreign_format,
 };
 
-/// The largest theme file an import reads, in bytes: the same bound the
-/// window puts on a theme file in the themes folder.
+/// The largest theme file an import reads, in bytes: the same bound the window puts on a theme file in the themes folder.
 pub const MAX_IMPORT_BYTES: usize = MAX_USER_THEME_FILE_BYTES;
 
 /// How deep a plist or JSON document may nest, and how many parts a TOML key
-/// may have. A theme needs three levels; settings files need about six.
+/// may have.
 const MAX_NESTING: usize = 16;
 
 /// How many dropped keys a report lists by name; the rest are counted.
@@ -95,34 +74,27 @@ impl ImportFormat {
     }
 }
 
-/// What a conversion produced: the colours and identity text the native file
-/// will carry, and what the source held that aterm has no place for.
+/// What a conversion produced: the colours and identity text the native file will carry, and what the source held that aterm has no place for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportReport {
     /// The format the source was read as.
     pub format: ImportFormat,
-    /// The converted colours. `name` is the source's own name for the theme
-    /// (empty when it has none); `appearance` is `Dark` unless the source
-    /// declared one ([`ImportReport::appearance_declared`]).
+    /// The converted colours.
     pub scheme: ColorScheme,
-    /// Whether the source said whether it is dark or light. When it did not,
-    /// the native file leaves `appearance` out and the catalog measures it.
+    /// Whether the source said whether it is dark or light.
     pub appearance_declared: bool,
     /// The source's description, if it carries one.
     pub description: Option<String>,
     /// The source's author, if it carries one.
     pub author: Option<String>,
-    /// The source's keys that have no aterm equivalent, in source order and
-    /// without repeats. Dropping a key is not an error.
+    /// The source's keys that have no aterm equivalent, in source order and without repeats.
     pub dropped: Vec<String>,
     /// What the conversion assumed or filled in, one sentence each.
     pub notes: Vec<String>,
 }
 
 impl ImportReport {
-    /// This report as a native theme file, with `header` written as comment
-    /// lines above it. [`parse_theme_str`] reads the result back to this
-    /// report's scheme, description, author and appearance flag.
+    /// This report as a native theme file, with `header` written as comment lines above it.
     #[must_use]
     pub fn to_native_conf(&self, header: &[&str]) -> String {
         to_native_conf(
@@ -167,7 +139,6 @@ pub enum ImportError {
 
 impl core::fmt::Display for ImportError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // Trust gate: `write_str` rather than `write!` (see `trust_fmt`).
         match self {
             ImportError::TooLarge { bytes } => {
                 f.write_str("the file is ")?;
@@ -210,15 +181,9 @@ impl core::fmt::Display for ImportError {
 
 impl std::error::Error for ImportError {}
 
-/// Read `bytes` (the contents of `file_name`, whose extension guides format
-/// detection) as a theme in any format an import reads. `pick` names the
-/// scheme to take when the file holds several (a Windows Terminal
-/// `settings.json`); without a match the first is taken and a note says so.
-///
+/// Read `bytes` (the contents of `file_name`, whose extension guides format detection) as a theme in any format an import reads.
 /// # Errors
-/// [`ImportError::TooLarge`] before anything is decoded, then
-/// [`ImportError::NotUtf8`], [`ImportError::UnknownFormat`], or the
-/// converter's own error.
+/// [`ImportError::TooLarge`] before anything is decoded, then [`ImportError::NotUtf8`], [`ImportError::UnknownFormat`], or the converter's own error.
 pub fn import_theme(
     file_name: Option<&str>,
     bytes: &[u8],
@@ -232,9 +197,7 @@ pub fn import_theme(
     convert(format, text, pick)
 }
 
-/// Which format `text` (from a file named `file_name`) is in. A distinctive
-/// extension decides; otherwise the content does. `None` when it is none of
-/// them.
+/// Which format `text` (from a file named `file_name`) is in.
 #[must_use]
 pub fn detect_format(file_name: Option<&str>, text: &str) -> Option<ImportFormat> {
     let extension = file_name
@@ -262,12 +225,9 @@ pub fn detect_format(file_name: Option<&str>, text: &str) -> Option<ImportFormat
     }
 }
 
-/// Convert `text` as `format`. `pick` is as for [`import_theme`].
-///
+/// Convert `text` as `format`.
 /// # Errors
-/// [`ImportError::TooLarge`] past [`MAX_IMPORT_BYTES`];
-/// [`ImportError::Malformed`] for a document that cannot be read;
-/// [`ImportError::MissingColour`] when no foreground or background results.
+/// [`ImportError::TooLarge`] past [`MAX_IMPORT_BYTES`]; [`ImportError::Malformed`] for a document that cannot be read; [`ImportError::MissingColour`] when no foreground or background results.
 pub fn convert(
     format: ImportFormat,
     text: &str,
@@ -289,13 +249,6 @@ pub fn convert(
 }
 
 /// The native theme file for a scheme: the one serializer of aterm's format.
-/// `header` lines are written first as `#` comments. Text fields are made
-/// safe for the format (no control characters, at most
-/// [`MAX_THEME_TEXT_CHARS`], nothing the reader would take for a comment), so
-/// [`parse_theme_str`] always reads the output; when they already were safe
-/// it reads back exactly `scheme`, `description`, `author` and
-/// `appearance_declared` (with `scheme.appearance` `Dark` when undeclared).
-/// Keys are written in [`THEME_KEYS`] order.
 #[must_use]
 pub fn to_native_conf(
     scheme: &ColorScheme,
@@ -313,30 +266,19 @@ pub fn to_native_conf(
     write_native_conf(&theme, header, false)
 }
 
-/// The native theme file for a whole parsed theme: colours, identity,
-/// `schema`, `bold_is_bright` and typography, in [`THEME_KEYS`] order, the
-/// typography under a header saying aterm.toml keys of the same name win.
-/// [`parse_theme_str`] reads it back to `theme` (with no skipped keys: a key
-/// this aterm does not know cannot be written) whenever its text fields were
-/// already safe.
+/// The native theme file for a whole parsed theme: colours, identity, `schema`, `bold_is_bright` and typography, in [`THEME_KEYS`] order, the typography under a header saying aterm.toml keys of the same name win.
 #[must_use]
 pub fn to_native_conf_package(theme: &ParsedTheme, header: &[&str]) -> String {
     write_native_conf(theme, header, false)
 }
 
-/// [`to_native_conf_package`] for a person to edit, as
-/// [`to_native_conf_commented`] is: every key the theme leaves out, the
-/// typography keys too, is a commented-out example under its description.
+/// [`to_native_conf_package`] for a person to edit, as [`to_native_conf_commented`] is: every key the theme leaves out, the typography keys too, is a commented-out example under its description.
 #[must_use]
 pub fn to_native_conf_package_commented(theme: &ParsedTheme, header: &[&str]) -> String {
     write_native_conf(theme, header, true)
 }
 
-/// [`to_native_conf`] for a person to edit: the same keys and values, each
-/// under a comment from [`THEME_KEYS`] saying what it does and what leaving
-/// it out means, every key the theme leaves out written as a commented-out
-/// example line, and each ANSI slot named. It reads back exactly as
-/// [`to_native_conf`]'s output does.
+/// [`to_native_conf`] for a person to edit: the same keys and values, each under a comment from [`THEME_KEYS`] saying what it does and what leaving it out means, every key the theme leaves out written as a commented-out example line, and each ANSI slot named.
 #[must_use]
 pub fn to_native_conf_commented(
     scheme: &ColorScheme,
@@ -513,12 +455,7 @@ fn push_hex_colour(out: &mut String, colour: Rgb) {
     }
 }
 
-/// `text` made safe as a native `name` / `description` / `author` value: control
-/// characters become spaces, whitespace before a `#` or `;` is removed (the
-/// reader would take ` #…` for a comment), it is cut to
-/// [`MAX_THEME_TEXT_CHARS`] and trimmed. `None` when nothing is left.
-/// Idempotent, and the identity on text that was already safe: what
-/// [`to_native_conf`] writes for a text field is exactly this.
+/// `text` made safe as a native `name` / `description` / `author` value: control characters become spaces, whitespace before a `#` or `;` is removed (the reader would take ` #…` for a comment), it is cut to [`MAX_THEME_TEXT_CHARS`] and trimmed.
 #[must_use]
 pub fn sanitize_text(text: &str) -> Option<String> {
     let mut out = String::new();
@@ -566,9 +503,7 @@ fn cat(parts: &[&str]) -> String {
 }
 
 /// A colour as other terminals write it: `#RRGGBB`, `RRGGBB`, `#RGB`, `RGB`
-/// (Ghostty writes hex without `#`), `0xRRGGBB`, optionally quoted. Laxer
-/// than the native [`parse_hex`] on purpose: the importer reads another
-/// terminal's file, and what it writes back is always the six-digit form.
+/// (Ghostty writes hex without `#`), `0xRRGGBB`, optionally quoted.
 fn parse_foreign_colour(value: &str) -> Option<Rgb> {
     let value = unquote(value.trim());
     if let Some(hex) = value
@@ -781,7 +716,6 @@ impl Draft {
             let count = self.dropped_unlisted.to_string();
             self.note(cat(&["and ", &count, " more dropped keys not listed"]));
         }
-        // An unset slot keeps the engine default, as in a native file.
         let mut ansi = ColorScheme::default().ansi;
         for (target, colour) in ansi.iter_mut().zip(self.ansi) {
             if let Some(colour) = colour {
@@ -834,14 +768,9 @@ fn line_of(text: &str, offset: usize) -> usize {
         .saturating_add(1)
 }
 
-// aterm (native)
-
 fn convert_native(text: &str) -> Result<ImportReport, ImportError> {
     match parse_theme_str(text) {
         Ok(parsed) => {
-            // An import carries colours and identity only; a native file's
-            // type settings, `bold_is_bright` and `schema` are named as
-            // dropped so nothing goes silently.
             let mut dropped: Vec<String> = Vec::new();
             if parsed.schema.is_some() {
                 dropped.push("schema".to_string());
@@ -876,10 +805,8 @@ fn convert_native(text: &str) -> Result<ImportReport, ImportError> {
     }
 }
 
-// kitty
-
 /// kitty: `key value` lines, `#` comments, and the kitty-themes metadata
-/// comments (`## name: …`, `## author: …`, `## blurb: …`). Later lines win.
+/// comments (`## name: …`, `## author: …`, `## blurb: …`).
 fn convert_kitty(text: &str) -> Result<ImportReport, ImportError> {
     let mut draft = Draft::new(ImportFormat::Kitty);
     for raw in text.lines() {
@@ -924,7 +851,6 @@ fn convert_kitty(text: &str) -> Result<ImportReport, ImportError> {
                 );
             }
             "selection_background" => draft.colour(Slot::Selection, key, value),
-            // `none` keeps each cell's own colour, which is aterm's default too.
             "selection_foreground" if none => {}
             "selection_foreground" => draft.colour(Slot::SelectionForeground, key, value),
             "active_tab_background" => {
@@ -947,10 +873,7 @@ fn convert_kitty(text: &str) -> Result<ImportReport, ImportError> {
     draft.finish()
 }
 
-// Ghostty
-
 /// Ghostty: `key = value` lines with hyphenated keys, `palette = N=#hex`.
-/// Later lines win.
 fn convert_ghostty(text: &str) -> Result<ImportReport, ImportError> {
     let mut draft = Draft::new(ImportFormat::Ghostty);
     for raw in text.lines() {
@@ -998,8 +921,6 @@ fn convert_ghostty(text: &str) -> Result<ImportReport, ImportError> {
     draft.finish()
 }
 
-// Alacritty (a TOML subset)
-
 /// Where `#` starts a comment in a TOML line (outside strings), or the
 /// line's length.
 fn toml_comment_start(line: &str) -> usize {
@@ -1020,7 +941,7 @@ fn toml_comment_start(line: &str) -> usize {
 }
 
 /// Split `s` at each top-level `separator` (outside strings, brackets and
-/// braces). `None` when a string is left open.
+/// braces).
 fn toml_split(s: &str, separator: u8) -> Option<Vec<&str>> {
     let mut parts = Vec::new();
     let mut quote: Option<u8> = None;
@@ -1099,7 +1020,7 @@ fn toml_key(raw: &str) -> Option<Vec<String>> {
 }
 
 /// A single-line TOML string value (basic `"…"` with escapes, or literal
-/// `'…'`). `None` for any other value.
+/// `'…'`).
 fn toml_string(raw: &str) -> Option<String> {
     let raw = raw.trim();
     if let Some(inner) = raw.strip_prefix('\'') {
@@ -1140,7 +1061,6 @@ fn toml_string(raw: &str) -> Option<String> {
 }
 
 /// Alacritty: the `[colors.*]` tables of its TOML config or theme file.
-/// Every other key is dropped; `import` lines are not followed.
 fn convert_alacritty(text: &str) -> Result<ImportReport, ImportError> {
     let format = ImportFormat::Alacritty;
     let mut draft = Draft::new(format);
@@ -1166,7 +1086,6 @@ fn convert_alacritty(text: &str) -> Result<ImportReport, ImportError> {
         let (Some(key), Some(_)) = (parts.first(), parts.get(1)) else {
             return Err(malformed(format, lineno, "expected `key = value`"));
         };
-        // The value is everything after the first top-level `=`.
         let value = line.get(key.len().saturating_add(1)..).unwrap_or("").trim();
         let mut path = table.clone();
         path.extend(toml_key(key).ok_or_else(|| malformed(format, lineno, "bad key"))?);
@@ -1174,7 +1093,6 @@ fn convert_alacritty(text: &str) -> Result<ImportReport, ImportError> {
             return Err(malformed(format, lineno, "keys nest too deeply"));
         }
         if value.starts_with("\"\"\"") || value.starts_with("'''") {
-            // A multi-line string is never a colour: skip to its close.
             let fence = value.get(..3).unwrap_or("\"\"\"");
             if value.len() < 6 || !value.get(3..).unwrap_or("").contains(fence) {
                 loop {
@@ -1191,7 +1109,6 @@ fn convert_alacritty(text: &str) -> Result<ImportReport, ImportError> {
         }
         let mut depth = toml_bracket_delta(value);
         while depth > 0 {
-            // A multi-line array or table: never a colour, skip to its close.
             let Some((_, next)) = lines.next() else {
                 return Err(malformed(format, lineno, "unterminated array"));
             };
@@ -1220,8 +1137,7 @@ fn convert_alacritty(text: &str) -> Result<ImportReport, ImportError> {
     draft.finish()
 }
 
-/// Place one Alacritty key. `value` is the string value, `None` for a value
-/// of any other type.
+/// Place one Alacritty key.
 fn alacritty_assign(draft: &mut Draft, path: &[String], value: Option<&str>) {
     let dotted = path.join(".");
     let parts: Vec<&str> = path.iter().map(String::as_str).collect();
@@ -1247,7 +1163,6 @@ fn alacritty_assign(draft: &mut Draft, path: &[String], value: Option<&str>) {
         return draft.drop_key(&dotted);
     };
     match value {
-        // Retaining the cell's foreground is native selection text's default.
         "CellForeground" if slot == Slot::SelectionForeground => {}
         "CellForeground" | "CellBackground" => {
             draft.drop_key(&dotted);
@@ -1259,8 +1174,6 @@ fn alacritty_assign(draft: &mut Draft, path: &[String], value: Option<&str>) {
         _ => draft.colour(slot, &dotted, value),
     }
 }
-
-// iTerm2 (.itermcolors, an XML property list)
 
 /// A property-list value, reduced to what a colour theme needs.
 #[derive(Debug, Clone, PartialEq)]
@@ -1343,7 +1256,6 @@ impl<'a> PlistScanner<'a> {
         } else {
             (TagKind::Open, inner)
         };
-        // The name ends at the first space (attributes follow it).
         let name = inner.split_whitespace().next().unwrap_or("");
         Ok((name, kind))
     }
@@ -1525,9 +1437,7 @@ fn iterm_colour(entries: &[(String, PlistValue)]) -> Option<(Rgb, Option<String>
     ))
 }
 
-/// iTerm2: the colour dictionaries of an `.itermcolors` property list. A
-/// key's `(Dark)` variant stands in when the plain key is absent; `(Light)`
-/// variants are dropped.
+/// iTerm2: the colour dictionaries of an `.itermcolors` property list.
 fn convert_iterm(text: &str) -> Result<ImportReport, ImportError> {
     let format = ImportFormat::ITerm;
     let mut scanner = PlistScanner { text, pos: 0 };
@@ -1583,8 +1493,6 @@ fn convert_iterm(text: &str) -> Result<ImportReport, ImportError> {
     }
     draft.finish()
 }
-
-// Windows Terminal (JSON, with comments and trailing commas)
 
 /// A JSON value, reduced to what a colour scheme needs.
 #[derive(Debug, Clone, PartialEq)]
@@ -1829,7 +1737,7 @@ fn scheme_object_name(entries: &[(String, JsonValue)]) -> Option<&str> {
 }
 
 /// Windows Terminal: a scheme object on its own, in an array, or in a
-/// `settings.json`'s `schemes`. `pick` chooses among several by name.
+/// `settings.json`'s `schemes`.
 fn convert_windows_terminal(text: &str, pick: Option<&str>) -> Result<ImportReport, ImportError> {
     let format = ImportFormat::WindowsTerminal;
     let mut reader = JsonReader {
@@ -1906,8 +1814,6 @@ fn scheme_objects(items: &[JsonValue]) -> Vec<&[(String, JsonValue)]> {
         .collect()
 }
 
-// base16 / base24 (YAML)
-
 /// The base16 / base24 slot names, `base00` … `base17`.
 const BASE_NAMES: [&str; 24] = [
     "base00", "base01", "base02", "base03", "base04", "base05", "base06", "base07", "base08",
@@ -1953,8 +1859,6 @@ fn yaml_scalar(raw: &str) -> &str {
 
 /// base16 / base24: the classic flat file (`scheme:`, `author:`, `base00:` …)
 /// and the tinted-theming form (`name:`, `variant:`, a `palette:` map).
-/// Colours map the way base16-shell does; with all of `base12` … `base17`
-/// present (base24), the bright colours 9-14 take them.
 fn convert_base16(text: &str) -> Result<ImportReport, ImportError> {
     let format = ImportFormat::Base16;
     let mut draft = Draft::new(format);
@@ -2006,7 +1910,6 @@ fn convert_base16(text: &str) -> Result<ImportReport, ImportError> {
                 _ => draft.drop_key(key),
             },
             "system" if matches!(value, "base16" | "base24") => {}
-            // The file's id in the tinted-theming repositories, not a colour.
             "slug" => {}
             _ => draft.drop_key(key),
         }
@@ -2020,8 +1923,6 @@ fn convert_base16(text: &str) -> Result<ImportReport, ImportError> {
                 key: BASE_NAMES.get(index).copied().unwrap_or("base00"),
             })
     };
-    // base16-shell's mapping: 0 bg, 1 red, 2 green, 3 yellow, 4 blue,
-    // 5 magenta, 6 cyan, 7 fg; 8 comments, 9-14 repeat 1-6, 15 brightest.
     let normal = [0x00, 0x08, 0x0B, 0x0A, 0x0D, 0x0E, 0x0C, 0x05];
     for (slot, &source) in normal.iter().enumerate() {
         draft.set(Slot::Ansi(slot), get(source)?);
@@ -2133,7 +2034,6 @@ mod tests {
             None,
             PALETTE,
         );
-        // kitty's active tab background is aterm's `active_tab_color`.
         want.chrome.active_tab = Some(rgb(0x7aa2f7));
         assert_eq!(report.scheme, want);
         assert_eq!(report.author.as_deref(), Some("enkia"));
@@ -2181,8 +2081,7 @@ mod tests {
 
     /// Spec `scheme-palette-generate-key`: Ghostty's `palette-generate`
     /// carries to the theme's `palette_generate`, is written back out and
-    /// reads again. NEGATIVE CONTROL: a value that is not `true`/`false` is
-    /// dropped, and the flag stays off.
+    /// reads again.
     #[test]
     fn ghostty_import_carries_palette_generate() {
         let base = "background = #1a1b26\nforeground = #c0caf5\n";
@@ -2208,9 +2107,7 @@ mod tests {
     /// THE CHROME KEYS IMPORT FROM THEIR FOREIGN NAMES: Ghostty's
     /// `split-divider-color` is `border_color` and Alacritty's search-match
     /// background is `search_match_color`, each written back out and read
-    /// again. NEGATIVE CONTROL: a neighbouring foreign chrome key aterm has no
-    /// key for (Ghostty's `cursor-text`, Alacritty's search-match foreground)
-    /// is still dropped.
+    /// again.
     #[test]
     fn chrome_keys_import_from_their_foreign_names() {
         let ghostty = "background = #1a1b26\n\
@@ -2291,8 +2188,6 @@ mod tests {
                  [colors.selection]\ntext = '{value}'\n"
             );
             let report = convert(ImportFormat::Alacritty, &text, None).unwrap();
-            // Native selection text can retain the cell foreground, but it
-            // cannot dynamically follow each cell's background.
             assert_eq!(report.scheme.selection_fg, None);
             assert_eq!(
                 report
@@ -2302,8 +2197,6 @@ mod tests {
                 dropped,
                 "{value}"
             );
-            // Both inputs omit the ANSI palette; the unsupported dynamic
-            // background additionally earns a conversion-loss note.
             assert_eq!(report.notes.len(), if dropped { 2 } else { 1 }, "{value}");
             assert_round_trips(&report);
         }
@@ -2506,8 +2399,6 @@ mod tests {
 
     #[test]
     fn unknown_keys_are_reported_not_fatal() {
-        // Every format: a key aterm has no place for is listed and the rest
-        // converts. The negative control is the same file without it.
         let cases: [(ImportFormat, &str, &str); 6] = [
             (
                 ImportFormat::Kitty,
@@ -2555,7 +2446,6 @@ mod tests {
             let clean = convert(format, &format!("{body}{close}"), None).unwrap();
             assert!(clean.dropped.is_empty(), "{format:?}: {:?}", clean.dropped);
             let with = convert(format, &format!("{body}{extra}{close}"), None).unwrap();
-            // Alacritty names a key by its table path (`colors.primary.frobnicate`).
             assert!(
                 with.dropped.len() == 1 && with.dropped[0].ends_with("frobnicate"),
                 "{format:?}: {:?}",
@@ -2575,10 +2465,8 @@ mod tests {
                 bytes: MAX_IMPORT_BYTES + 1
             })
         );
-        // Negative control: the same file at exactly the bound converts.
         bytes.truncate(MAX_IMPORT_BYTES);
         assert!(import_theme(Some("big.conf"), &bytes, None).is_ok());
-        // `convert` keeps the bound for callers that pass text directly.
         let text = "x".repeat(MAX_IMPORT_BYTES + 1);
         assert!(matches!(
             convert(ImportFormat::Kitty, &text, None),
@@ -2748,7 +2636,6 @@ mod tests {
                     Ok(theme),
                     "{name}:\n{text}"
                 );
-                // A native file imports as itself, dropping nothing.
                 let report = convert(ImportFormat::Native, &text, None).unwrap();
                 assert_eq!(report.scheme, theme.scheme, "{name}");
                 assert!(report.dropped.is_empty(), "{name}: {:?}", report.dropped);

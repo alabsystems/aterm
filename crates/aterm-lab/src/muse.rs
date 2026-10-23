@@ -1,42 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The REAL Muse Code (Meta's `muse`: the managed store binary or
-//! `$LAB_MUSE`, by path) in the lab's tab, against the stub's Meta model API
-//! ([`crate::stub::muse`]). The launch line names every variable it needs:
-//!
-//! * `HOME` is the scratch's `home/`, and the XDG directories are set under it
-//!   (`XDG_CONFIG_HOME=<home>/.config`, …): Muse Code keeps its config, its
-//!   workspace trust and its login in `<home>/.config/muse`, its sessions in
-//!   `<home>/.local/share/muse`, and the tab's own `XDG_CONFIG_HOME` is the
-//!   instance's; `TMPDIR` is the scratch's `tmp/` (its workspace probes and
-//!   shell-sandbox directories), which the tab leaves unset;
-//! * `META_API_KEY` is the lab's fixed fake key (`lab-not-a-key`, the stub
-//!   logs it as `auth=key`): it beats any login, so no account is ever asked
-//!   for; the other providers' keys and base URLs (`OPENAI_*`,
-//!   `ANTHROPIC_*`, `OPENROUTER_*`) and the other agents' homes it reads
-//!   (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`) are unset;
-//! * `--base-url http://127.0.0.1:<port>` sends the catalog and every turn to
-//!   the stub, and `TBH_AUTH_BASE_URL`/`TBH_MINT_BASE_URL` its auth and mint
-//!   calls; `TBH_DISABLE_TELEMETRY=1`, `TBH_DISABLE_FEATURE_CONFIG=1` and
-//!   `TBH_DISABLE_DEFAULT_PLUGIN_INSTALL=1` keep the lanes that call home off;
-//! * every proxy variable is the lab's black hole (egress is trapped, and the
-//!   jail keeps every connect on loopback), `NO_PROXY` loopback.
-//!
-//! Two places none of the variables tried moves: the account's
-//! `~/Library/Application Support/Muse` (its session-name authority, which
-//! 1.4.10 opens whatever HOME and the XDG variables say) is on the jail's
-//! protected list, and its local Session registry
-//! stays in the shared `/private/tmp/tbh-<uid>-rt/muse` (measured: `TMPDIR`,
-//! `TMP`, `TEMP`, `XDG_RUNTIME_DIR` and `HOME` pointed into the scratch left
-//! it there), whose entries of this run `down` takes back
-//! ([`crate::runtime_dirs`]).
-//!
-//! The harness keys are the lab's (`up`'s `LAB_HARNESS_KEYS`; the captures
-//! turn it off). A login, a server outside the lab's process tree and the
-//! other ways to reach Meta are refused ([`safe_args`]). Muse Code's retries
-//! are its own (`provider_retry.max_attempts`, 10 by default, honouring
-//! `retry-after`): `-- -c provider_retry.max_attempts=N` changes them.
+//! Real Muse Code launcher and option validation against the lab stub.
 
 use std::path::Path;
 
@@ -53,7 +18,7 @@ fn lab(args: &[String]) -> Result<(Run, Vec<String>), Fail> {
     Ok((Run::load(&tag)?, a))
 }
 
-/// The lab has a Muse Code to run.
+/// Checks that the lab has a Muse Code binary to run.
 ///
 /// # Errors
 /// None is there.
@@ -67,13 +32,7 @@ pub fn need_muse(run: &Run) -> Result<(), Fail> {
     Ok(())
 }
 
-/// Refuse what would start a login, store a credential, start a server
-/// outside the lab's process tree or reach Meta by another road: these
-/// words anywhere in `args` (a subcommand, an option's value), from the
-/// subcommands `muse --help` lists (1.4.10): `login`, `logout`, `auth`,
-/// `mcp` (an MCP server's OAuth), `serve`, `session-message`, `plugins`,
-/// `sandbox` (its setup), `voice` (a transcription service), and the option
-/// `--api-key-stdin`.
+/// Rejects arguments that initiate login, credential storage, external servers, or egress.
 ///
 /// # Errors
 /// What was refused.
@@ -100,9 +59,7 @@ pub fn safe_args(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// The variables the launcher sets for the lab's own ends (the fake key, the
-/// stub, the black hole): an `-e` may not replace them, nor name another
-/// provider's key or base URL, which would carry a turn past the stub.
+/// Rejects `-e` overrides for environment variables owned by the lab launcher.
 pub fn safe_env(kv: &str) -> Result<(), String> {
     let key = kv.split_once('=').map_or(kv, |(k, _)| k);
     let up = key.to_ascii_uppercase();
@@ -122,8 +79,7 @@ pub fn safe_env(kv: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The launcher the tab types (`sh muse.sh`: `clear`, then `exec`), so the
-/// tab's process IS Muse Code, launched by path ([module docs](self)).
+/// Builds the `muse.sh` launcher script executed inside the lab tab.
 #[must_use]
 pub fn launcher(run: &Run, envs: &[String], args: &[String]) -> String {
     let w = run.w.to_string_lossy();
@@ -284,7 +240,6 @@ mod tests {
         ] {
             assert!(safe_args(&v(&["--trust-workspace", bad])).is_err(), "{bad}");
         }
-        // NEGATIVE CONTROL: the options the captures pass, and a prompt that merely holds a word
         assert!(
             safe_args(&v(&[
                 "--trust-workspace",
@@ -342,7 +297,6 @@ mod tests {
         );
     }
 
-    /// An `-e` never replaces the fake key, the stub or the black hole.
     /// NEGATIVE CONTROL: an ordinary variable passes.
     #[test]
     fn an_extra_variable_never_replaces_the_lab_s_own() {

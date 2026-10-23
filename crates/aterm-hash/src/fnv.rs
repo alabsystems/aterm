@@ -2,41 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! FNV-1a/64, the workspace's one stable hash.
-//!
-//! Unlike [`FxHasher`](crate::FxHasher) or std's `DefaultHasher`, its values
-//! are fixed by the published algorithm, so they may persist and be compared
-//! across processes, crates and releases (the `status` `hash=` stamp,
-//! accessibility node ids, cache file names, pet-atlas host ids). It is never
-//! a security primitive.
-//!
-//! The byte loop, the offset basis and the prime are astream-wire's
-//! (`astream_wire::hash::{fnv1a_64_update, FNV1A_64_INIT, FNV1A_64_PRIME}`),
-//! the function astream's `assign_partition` hashes a partition key with: one
-//! FNV across aterm and the bus it builds on. Both compute the published
-//! algorithm, so persisted values match. astream-wire exports the word fold
-//! too (`astream_wire::hash::fnv1a_64_mix_u64`), and [`fnv_mix_u64`] is that
-//! function, still computed here for a reason its doc gives. What stays here
-//! is what astream exports no counterpart for: the 128-bit member and the
-//! fixed-width little-endian feeds.
-//!
-//! - [`fnv1a_64`] hashes one byte slice, and [`fnv1a_64_extend`] continues a
-//!   running hash, so extending by `a` and then `b` is the hash of `a ++ b`.
-//! - [`Fnv1a64`] is that running hash as a value, for a stream of writes.
-//! - [`fnv_mix_u64`] is the word fold: it XORs a whole `u64` into the state
-//!   before the multiply. Over a byte zero-extended to `u64` it is one byte
-//!   step of the hash; over wider words it is a different function, the one
-//!   the scalar fingerprints fold.
 
-/// The FNV-1a/64 offset basis: the hash of no bytes (astream-wire's
-/// `FNV1A_64_INIT`, under the name aterm's callers already spell).
+/// The FNV-1a/64 offset basis: the hash of no bytes.
 pub const FNV64_OFFSET: u64 = astream_wire::hash::FNV1A_64_INIT;
 
-/// The FNV-64 prime, 2^40 + 0x1b3: astream-wire's `FNV1A_64_PRIME`, the prime
-/// its byte loop multiplies by, under the name aterm's callers already spell.
-/// The word fold ([`fnv_mix_u64`]) multiplies by it. Two tests hold it:
-/// `matches_the_published_vectors` takes the word fold over bytes to the
-/// published vectors, and `the_word_fold_agrees_with_astreams_byte_loop` holds
-/// that fold to astream's loop and to astream's own word fold.
+/// The FNV-64 prime, 2^40 + 0x1b3.
 pub const FNV64_PRIME: u64 = astream_wire::hash::FNV1A_64_PRIME;
 
 /// FNV-1a/64 of `bytes`.
@@ -54,16 +24,6 @@ pub const fn fnv1a_64_extend(hash: u64, bytes: &[u8]) -> u64 {
 }
 
 /// One fold step: `(hash ^ word) * FNV64_PRIME`, wrapping.
-///
-/// This is astream-wire's `fnv1a_64_mix_u64`, computed here rather than
-/// called. That function and the `fnv1a_64_mul_prime` kernel it calls carry
-/// no `#[inline]`, and dev and test builds compile astream-wire at opt-level
-/// 0, while aterm-effects folds its per-frame fingerprints through this one:
-/// each word would cost two unoptimized out-of-line calls. It moves onto
-/// astream's once astream marks both `#[inline]` (astream first), or once an
-/// A/B of aterm-effects' `effects_suite` shows the call costs nothing.
-/// `the_word_fold_agrees_with_astreams_byte_loop` holds the two to one
-/// function.
 #[inline]
 #[must_use]
 pub const fn fnv_mix_u64(hash: u64, word: u64) -> u64 {
@@ -76,17 +36,14 @@ pub const FNV128_OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
 /// The FNV-128 prime, 2^88 + 0x13b.
 pub const FNV128_PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
 
-/// FNV-1a/128 of `bytes`: the 128-bit member of the same published family,
-/// for content addresses whose collision space must outlast 64 bits (the
-/// render engine's fx art ids, `aterm_core::render::FxArt`).
+/// FNV-1a/128 of `bytes`.
 #[inline]
 #[must_use]
 pub const fn fnv1a_128(bytes: &[u8]) -> u128 {
     fnv1a_128_extend(FNV128_OFFSET, bytes)
 }
 
-/// The FNV-1a/128 state `hash` continued over `bytes`, so extending by `a`
-/// and then `b` is the hash of `a ++ b`.
+/// The FNV-1a/128 state `hash` continued over `bytes`.
 #[inline]
 #[must_use]
 pub const fn fnv1a_128_extend(hash: u128, bytes: &[u8]) -> u128 {
@@ -196,8 +153,7 @@ pub const fn bucket_index(hash: u64, bucket_count: usize) -> usize {
     }
 }
 
-/// FNV-1a/64 over successive writes: [`finish`](Self::finish) is the
-/// [`fnv1a_64`] of everything written, concatenated.
+/// FNV-1a/64 over successive writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fnv1a64(u64);
 
@@ -279,14 +235,6 @@ mod tests {
     use super::*;
 
     /// FNV's published vectors; a wrong prime can agree in the low 40 bits only.
-    /// These are the conformance check on astream-wire's byte loop: every
-    /// value aterm persisted (`hash=`, node ids, cache names) is one of these
-    /// functions' outputs, so they must not change.
-    /// Each 64-bit vector is also taken through this file's word fold
-    /// ([`fnv_mix_u64`] over the bytes widened), so the fold computed here, not
-    /// only astream's loop, is held to the published algorithm. [`FNV64_PRIME`]
-    /// is astream-wire's `FNV1A_64_PRIME`, the prime that loop multiplies by,
-    /// so a wrong one fails both rows.
     #[test]
     fn matches_the_published_vectors() {
         let word_fold = |bytes: &[u8]| {
@@ -314,12 +262,7 @@ mod tests {
 
     /// The byte loop and the word fold `fnv1a_64_mix_u64` are astream-wire's;
     /// [`fnv_mix_u64`] is this file's copy of that fold (its doc says why it is
-    /// not yet a call). Over bytes widened to `u64` the copy and astream's loop
-    /// must stay one function, and over whole words the copy and astream's fold
-    /// must. Negative control: a fold under a prime one bit away (above the
-    /// low 40, where the published vectors are weakest) parts from the loop and
-    /// from astream's fold, so the agreement above is a check, not a
-    /// tautology.
+    /// not yet a call).
     #[test]
     fn the_word_fold_agrees_with_astreams_byte_loop() {
         let fold = |prime: u64, bytes: &[u8]| {

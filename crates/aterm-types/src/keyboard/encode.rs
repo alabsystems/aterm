@@ -115,6 +115,9 @@ pub fn encode_key_with_text(
 }
 
 /// The chord modifiers that make a press something other than TEXT: with any
+/// of them held the key writes its chord form (a control byte, an ESC prefix,
+/// a CSI form) where one exists, and otherwise the character the layout types
+/// at that level ([`encode_key_with_text`]).
 const NON_TEXT_MODIFIERS: Modifiers = Modifiers::CTRL
     .union(Modifiers::ALT)
     .union(Modifiers::META)
@@ -122,6 +125,7 @@ const NON_TEXT_MODIFIERS: Modifiers = Modifiers::CTRL
     .union(Modifiers::SUPER);
 
 /// `layout_text` when it may stand for the layout's character on this key: a character key
+/// and a printable glyph.
 #[inline]
 #[cfg_attr(trust_verify, trust::skip)]
 fn layout_glyph(key: &Key, layout_text: Option<char>) -> Option<char> {
@@ -132,6 +136,9 @@ fn layout_glyph(key: &Key, layout_text: Option<char>) -> Option<char> {
 }
 
 /// The US key a Ctrl chord on a non-Latin layout stands for: `Some('c')` for Ctrl + Russian
+/// 'с' (physical C) and `Some('[')` for Ctrl + Russian 'х' or German 'ü' (physical [), the C0
+/// byte kitty (its `alternate_key` for a non-ASCII key) and ghostty (its physical key) send;
+/// Terminal.app and iTerm2 send Ctrl + Russian 'с' as ETX too.
 #[cfg_attr(trust_verify, trust::skip)]
 fn ctrl_layout_twin(
     key: &Key,
@@ -230,12 +237,14 @@ fn should_encode_kitty_event(
 }
 
 /// Chord modifiers — the bits that make a key combination "ambiguous" in
+/// legacy encodings.
 const CHORD_MODIFIERS: Modifiers = Modifiers::SHIFT
     .union(Modifiers::ALT)
     .union(Modifiers::CTRL)
     .union(Modifiers::SUPER);
 
 /// Kitty's recovery keys have no release event unless report-all is active,
+/// regardless of modifiers.
 #[inline]
 #[cfg_attr(trust_verify, trust::skip)]
 const fn is_reset_escape_hatch_key(key: &Key) -> bool {
@@ -246,6 +255,7 @@ const fn is_reset_escape_hatch_key(key: &Key) -> bool {
 }
 
 /// Whether a key press/repeat needs the CSI-u form under kitty modes that keep text as text
+/// (disambiguate, and event-types-only repeats).
 #[inline]
 #[cfg_attr(trust_verify, trust::skip)]
 fn key_event_needs_csi_u(key: &Key, modifiers: Modifiers) -> bool {
@@ -259,7 +269,7 @@ fn key_event_needs_csi_u(key: &Key, modifiers: Modifiers) -> bool {
     }
 }
 
-/// Encode using the Kitty keyboard protocol. Functional keys with a legacy CSI form (arrows,
+/// Encode using the Kitty keyboard protocol.
 #[cfg_attr(trust_verify, trust::skip)]
 fn encode_kitty(
     key: &Key,
@@ -320,6 +330,7 @@ fn encode_kitty(
 }
 
 /// For a named key with a legacy CSI form, that form with kitty's modifier value (1+mods);
+/// `None` for keys that use CSI u.
 #[cfg_attr(trust_verify, trust::skip)]
 fn encode_kitty_legacy_functional(
     key: &Key,
@@ -382,6 +393,7 @@ fn append_mod_event(buf: &mut Vec<u8>, mod_value: u8, event: Option<KeyEventType
 }
 
 /// Letter-final keys: CSI [1;{mod}[:event]] {letter}
+/// Without modifiers/event: CSI {letter}
 #[cfg_attr(trust_verify, trust::skip)]
 fn letter_final(letter: u8, mod_value: u8, event: Option<KeyEventType>) -> Vec<u8> {
     let mut buf = Vec::with_capacity(12);
@@ -494,6 +506,7 @@ fn associated_text_codepoints(
 }
 
 /// The character a named key types, before any control-code filter: Space, Enter (`'\r'`),
+/// Tab (`'\t'`) and Backspace (`'\x7f'`).
 #[inline]
 #[must_use]
 const fn named_key_text(named: NamedKey) -> Option<char> {
@@ -507,6 +520,8 @@ const fn named_key_text(named: NamedKey) -> Option<char> {
 }
 
 /// The Shift level a layout's typed glyph stands for, for kitty's shifted key: the glyph,
+/// except that a lowercase letter typed with Shift held is Caps Lock's doing (xkb's Lock
+/// cancels Shift on a letter), so the level is its capital.
 #[cfg_attr(trust_verify, trust::skip)]
 fn shift_level(glyph: char) -> char {
     if !glyph.is_lowercase() {
@@ -572,25 +587,30 @@ pub const fn shifted_character(c: char, modifiers: Modifiers) -> Option<char> {
 }
 
 /// ConPTY win32-input-mode: `VK_RETURN` (13) and scan code 0x1C (28), shared by both Enter
+/// keys; the keypad's is flagged `ENHANCED_KEY` in `dwControlKeyState`.
 const WIN32_VK_RETURN: u32 = 13;
 const WIN32_SC_RETURN: u32 = 28;
 /// `VK_ESCAPE` / scan 0x01 and `VK_BACK` / scan 0x0E, with the `UnicodeChar` a Windows
+/// keyboard gives each: ESC (0x1B) and BS (0x08).
 const WIN32_VK_ESCAPE: u32 = 0x1b;
 const WIN32_SC_ESCAPE: u32 = 0x01;
 const WIN32_ESCAPE_CHAR: u32 = 0x1b;
 const WIN32_VK_BACK: u32 = 0x08;
 const WIN32_SC_BACK: u32 = 0x0e;
 const WIN32_BACK_CHAR: u32 = 0x08;
-/// `dwControlKeyState` bits (wincon.h). The LEFT modifier bits stand for either side: once
+/// `dwControlKeyState` bits (wincon.h).
 const WIN32_SHIFT_PRESSED: u32 = 0x10;
 const WIN32_LEFT_CTRL_PRESSED: u32 = 0x08;
 const WIN32_LEFT_ALT_PRESSED: u32 = 0x02;
 const WIN32_ENHANCED_KEY: u32 = 0x100;
 /// The `UnicodeChar` of an Enter-chord record: what the physical chord carries under Windows
+/// Terminal (the OS's `ToUnicode` of it), so every ReadConsoleInput reader (.NET `ReadKey`,
+/// libuv, MSYS, cmd.exe) sees the record it sees under WT.
 const WIN32_SHIFT_ENTER_CHAR: u32 = 13;
 const WIN32_CTRL_ENTER_CHAR: u32 = 10;
 
 /// The four `INPUT_RECORD` fields a routed key decides — `wVirtualKeyCode`,
+/// `wVirtualScanCode`, `UnicodeChar` and `dwControlKeyState`.
 struct Win32KeyRecord {
     vk: u32,
     sc: u32,
@@ -599,6 +619,14 @@ struct Win32KeyRecord {
 }
 
 /// The win32-input-mode record for a key conhost cannot read from legacy VT, or reads as a
+/// different key, or `None` for a key it reads correctly, which keeps its legacy bytes: the
+/// Enter chords legacy VT has no byte for ([`win32_enter_chord`]), the keys whose legacy bytes
+/// conhost holds once it has read a record ([`win32_escape_record`]), Ctrl+H and Ctrl+J,
+/// whose BS and LF conhost reads as Ctrl+Backspace and Ctrl+Enter
+/// ([`win32_ctrl_character_record`]), and the named keys legacy
+/// loses or misnames: Ctrl+Break, the keypad, and the Space and Backspace chords, and under
+/// OpenConsole ([`KeyboardMode::OPENCONSOLE_HOST`]) KP_Begin and F13-F20
+/// ([`encode_win32_keys::win32_named_record`]).
 #[cfg_attr(trust_verify, trust::skip)]
 fn win32_key_record(
     key: &Key,
@@ -616,6 +644,7 @@ fn win32_key_record(
 }
 
 /// The win32-input-mode record for an Enter chord: `Some` only for Enter (main block or
+/// keypad) with SHIFT and/or CTRL, ALT riding along.
 #[cfg_attr(trust_verify, trust::skip)]
 const fn win32_enter_chord(key: &Key, modifiers: Modifiers) -> Option<Win32KeyRecord> {
     let mut cs = match key {
@@ -651,6 +680,7 @@ const fn win32_enter_chord(key: &Key, modifiers: Modifiers) -> Option<Win32KeyRe
 }
 
 /// Whether conhost's input parser, once it has read a win32-input-mode record, holds these
+/// legacy key bytes instead of delivering the key they spell (conhost 10.0.26200).
 #[inline]
 const fn conhost_holds_once_switched(legacy: &[u8]) -> bool {
     match legacy {
@@ -664,6 +694,8 @@ const fn conhost_holds_once_switched(legacy: &[u8]) -> bool {
 }
 
 /// The record for a key whose legacy bytes [`conhost_holds_once_switched`]: Escape (any
+/// modifiers), Alt+Backspace, and a character chord legacy spells as one of those forms
+/// (Ctrl+[ and Ctrl+3 are a lone ESC, Alt+[ is `ESC [`, Ctrl+Alt+8 is `ESC DEL`).
 #[cfg_attr(trust_verify, trust::skip)]
 fn win32_escape_record(
     key: &Key,
@@ -709,6 +741,9 @@ const LEGACY_CTRL_H: u8 = 0x08;
 const LEGACY_CTRL_J: u8 = 0x0a;
 
 /// The record for a Ctrl letter chord whose legacy byte conhost reads as a different key:
+/// `Some` only when the legacy bytes are a lone BS or a lone LF, which a letter key writes
+/// for Ctrl+H and Ctrl+J and their Shift chords, Caps Lock or not (and Ctrl+р on a Russian
+/// layout's H key, through [`ctrl_layout_twin`]).
 #[cfg_attr(trust_verify, trust::skip)]
 fn win32_ctrl_character_record(
     key: &Key,
@@ -744,6 +779,7 @@ fn win32_ctrl_character_record(
 }
 
 /// The US-QWERTY main-block key that types `c`: its `wVirtualKeyCode`, its set-1 scan code (a
+/// physical position, the same on every layout), and whether `c` is its shifted glyph.
 #[cfg_attr(trust_verify, trust::skip)]
 fn us_physical_key(c: char) -> Option<(u32, u32, bool)> {
     const LETTER_SCAN: [u8; 26] = [
@@ -785,6 +821,8 @@ fn us_physical_key(c: char) -> Option<(u32, u32, bool)> {
 }
 
 /// The win32-input-mode `INPUT_RECORD` pair (key-down, then key-up) for a routed key:
+/// `CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _` with all six fields spelled, as Windows Terminal writes
+/// them (microsoft/terminal doc/specs/#4999-win32-input-mode.md).
 #[cfg_attr(trust_verify, trust::skip)]
 fn encode_win32_record_pair(record: &Win32KeyRecord) -> Vec<u8> {
     let mut buf = Vec::with_capacity(48);
@@ -893,6 +931,7 @@ fn encode_xterm_other_keys(
 }
 
 /// xterm modifyOtherKeys level 1 (`mokUser`) preserves ordinary Shift-only and
+/// established Ctrl mappings, but reports otherwise ambiguous combinations.
 fn xterm_modify_other_keys_level1_applies(key: &Key, modifiers: Modifiers) -> bool {
     if modifiers.is_empty() {
         return false;

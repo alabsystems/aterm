@@ -82,6 +82,7 @@ pub(crate) fn set_plist_string(plist: &str, key: &str, value: &str) -> Result<St
 }
 
 /// Minimal XML escaping for plist string content (versions, hashes and reverse-DNS ids):
+/// belt and braces.
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -387,7 +388,7 @@ pub fn place_handoff_policy(
     Ok(policy)
 }
 
-/// The bundle executable's mode: runnable, and writable by nobody. `~/.local/bin/aterm` is
+/// The bundle executable's mode: runnable, and writable by nobody.
 #[cfg(unix)]
 const EXE_MODE: u32 = 0o555;
 
@@ -542,6 +543,7 @@ mod staging_tests {
     }
 
     /// A finished cut removes its own staging directory, but never from under a live
+    /// process or on a process list it could not read.
     #[test]
     fn a_finished_cut_discards_its_staging_bundle_only_when_provably_unused() {
         let dist = scratch("discard");
@@ -578,6 +580,8 @@ mod exe_mode_tests {
     use std::os::unix::fs::PermissionsExt;
 
     /// The laid executable is exactly r-x, so a copy through a link to it (what
+    /// `cp build ~/.local/bin/aterm` is) is refused and leaves its bytes, and the bundle
+    /// holding it still deletes whole, as the updater and `ship dev-app` delete bundles.
     #[test]
     fn a_copy_through_a_link_to_the_bundle_executable_never_rewrites_it() {
         let scratch = aterm_tempfile::TempDir::new().expect("owned bundle scratch");

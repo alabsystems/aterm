@@ -1,0 +1,51 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-22, the screen after event 979 of a tab's cast (`aterm ctl @<sid> cast`, asciicast v2) replayed into aterm's engine (`lab idle-points cast`, `lab halfdraw scan --event 979`): a private headless aterm (144x50) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab), three tabs under the harness (the half-drawn-frame lab's `mu3-d`, tab 2, round 7) · the turn's STATUS ROW still bare after its glyph cycled once: `◇ Thinking` at event 978, `◈ Thinking` here at 73.063 s for 0.022 s, then `◈ Working (0s · esc to interrupt)` at event 980 — read idle with no evidence (the reader's first-frame anchor takes `◇` alone) · the lab's random project dir is spelled /private/tmp/at.lab0 here
+  • check 41 passed
+  • check 42 passed
+  • check 43 passed
+  • check 44 passed
+  • check 45 passed
+  • check 46 passed
+  • check 47 passed
+  • check 48 passed
+  • check 49 passed
+  • check 50 passed
+  • check 51 passed
+  • check 52 passed
+  • check 53 passed
+  • check 54 passed
+  • check 55 passed
+  • check 56 passed
+  • check 57 passed
+  • check 58 passed
+  • check 59 passed
+  • check 60 passed
+  • check 61 passed
+  • check 62 passed
+  • check 63 passed
+  • check 64 passed
+  • check 65 passed
+  • check 66 passed
+  • check 67 passed
+  • check 68 passed
+  • check 69 passed
+  • check 70 passed
+  • check 71 passed
+  • check 72 passed
+  • check 73 passed
+  • check 74 passed
+  • check 75 passed
+  • check 76 passed
+  • check 77 passed
+  • check 78 passed
+  • check 79 passed
+  • check 80 passed
+  Nothing left: the parser is committed and pushed to origin/main.
+
+❯ write the landing report round 7
+
+◈ Thinking
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

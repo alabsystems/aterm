@@ -255,10 +255,17 @@ pub fn describe_own(tier: Durability) -> String {
 const STRICT_PROMISE: &str = "an ack is on the disk: a power loss loses nothing acked";
 
 /// The records aterm's [`escalation`] table keeps through a power loss, in
+/// the words this build's own promise uses ([`Durability::promise`]).
 const SPARED: &str =
     "never a halt, a person's own words, mail to a person, or a person's read mark";
 
 /// WHAT A WEAK TIER CAN LOSE (`tier` is ordered or relaxed), as `(head,
+/// loss)`: for ordered, bounded by `horizon_ms` as a `Hello` reports it
+/// (`None`: no horizon, so only an escalated record, a flush asked for or a
+/// clean stop flushes in full) by the bound astream states
+/// ([`astream_broker::ServedInfo::horizon_ms`]: the oldest ack no full flush
+/// covers is at most the horizon plus one batch plus one full flush old); for
+/// relaxed, everything since the open.
 fn loss(tier: Durability, horizon_ms: Option<u32>, what: &str) -> (&'static str, String) {
     match tier {
         Durability::Ordered => (
@@ -294,6 +301,13 @@ fn loss(tier: Durability, horizon_ms: Option<u32>, what: &str) -> (&'static str,
 }
 
 /// A WEAK TIER'S PROMISE WITH THE NUMBERS ITS BROKER REPORTS (`tier` is
+/// ordered or relaxed): what a power loss can take — for ordered, bounded by
+/// the horizon it reports (`None`: no horizon, so only an escalated record, a
+/// flush asked for or a clean stop flushes in full), the bound astream states
+/// ([`astream_broker::ServedInfo::horizon_ms`]: the oldest ack no full flush
+/// covers is at most the horizon plus one batch plus one full flush old) —
+/// and what it never takes: the records its reported rules name, or nothing
+/// when it has none.
 fn weak_promise(
     tier: Durability,
     info: &astream_broker::ServedInfo,
@@ -327,6 +341,8 @@ pub fn mark_path(log: &Path) -> PathBuf {
 }
 
 /// A boot id for a test that stands in a reboot, distinct for each `n` (never
+/// the all-zero id, which astream reads as unknown): the 16 bytes of the UUID
+/// `00000000-0000-0000-0000-0000000001nn`.
 #[cfg(test)]
 pub(crate) fn test_boot(n: u8) -> [u8; 16] {
     let mut boot = [0u8; 16];
@@ -336,12 +352,15 @@ pub(crate) fn test_boot(n: u8) -> [u8; 16] {
 }
 
 /// The bytes a build before lineage wrote at a relaxed log's mark for boot
+/// `boot` ([`MARK_SUFFIX`]), in the kernel text macOS answers (the upper-case
+/// UUID, which that build wrote as it read it): what the migration tests plant.
 #[cfg(test)]
 pub(crate) fn legacy_mark_text(boot: &[u8; 16]) -> String {
     legacy_mark_of(&boot_text(boot).to_uppercase())
 }
 
 /// The bytes a build before lineage wrote at a relaxed log's mark when the
+/// kernel answered `kernel_text` for its boot.
 #[cfg(test)]
 pub(crate) fn legacy_mark_of(kernel_text: &str) -> String {
     format!(
@@ -534,7 +553,7 @@ pub fn open_escalating(
     })
 }
 
-/// Remove `path` so a power loss does not bring it back. An absent one is
+/// Remove `path` so a power loss does not bring it back.
 fn remove_durably(path: &Path) -> io::Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => crate::state::sync_dir(path.parent().unwrap_or(Path::new(""))),
@@ -557,6 +576,7 @@ mod tests {
     }
 
     /// `n` publishes through the broker served at `sock`, each one acked
+    /// before the next is sent.
     fn publish(sock: &Path, producer: u64, from_seq: u64, n: u64) {
         let mut c = astream_broker::Client::connect(sock).expect("connect");
         for seq in from_seq..from_seq + n {
@@ -570,6 +590,7 @@ mod tests {
     }
 
     /// Cut the log file back to `len` bytes: what a power loss leaves of
+    /// writes that never reached the disk.
     fn cut(log: &Path, len: u64) {
         std::fs::OpenOptions::new()
             .write(true)
@@ -580,6 +601,7 @@ mod tests {
     }
 
     /// Option values are whole argument words, including a filename that is
+    /// itself the durability flag.
     #[test]
     fn a_broker_option_value_is_not_a_durability_flag() {
         let base = ["aterm", "link", "broker", "/r/bus.sock"];
@@ -684,7 +706,7 @@ mod tests {
         assert!(named.iter().all(Option::is_none));
     }
 
-    /// THE WORD, THE ARGV AND THE DEFAULT. Every word round-trips, a bare
+    /// THE WORD, THE ARGV AND THE DEFAULT.
     #[test]
     fn the_word_the_argv_and_the_default() {
         for tier in [Durability::Strict, Durability::Ordered, Durability::Relaxed] {
@@ -738,7 +760,7 @@ mod tests {
         );
     }
 
-    /// `ORDERED IS SERVED ORDERED, WITH ATERM'S TABLE`. The word maps to
+    /// `ORDERED IS SERVED ORDERED, WITH ATERM'S TABLE`.
     #[test]
     fn ordered_is_served_ordered_with_aterms_table() {
         use astream_broker::{ServedInfo, ServedReason, Tier};
@@ -845,7 +867,7 @@ mod tests {
         }
     }
 
-    /// A BROKER THAT SERVES A WEAK TIER IS TOLD BY WHAT IT REPORTS. Ordered
+    /// A BROKER THAT SERVES A WEAK TIER IS TOLD BY WHAT IT REPORTS.
     #[test]
     fn a_weak_tier_is_told_by_what_its_broker_reports() {
         use astream_broker::{ServedInfo, ServedReason, Tier};
@@ -936,6 +958,8 @@ mod tests {
     }
 
     /// The legacy mark reads as unclean against exactly another boot, an
+    /// unreadable mark or no boot to compare — never the same boot, never no
+    /// mark.
     #[test]
     fn only_another_boot_or_an_uncertain_mark_is_unclean() {
         let (one, two) = (test_boot(1), test_boot(2));
@@ -985,6 +1009,9 @@ mod tests {
     }
 
     /// The kernel's own text for this boot, read as a build before this one
+    /// read it and NOT through astream: `sysctl -n kern.bootsessionuuid` on
+    /// macOS (the sysctl that build called), `/proc/sys/kernel/random/boot_id`
+    /// on Linux.
     fn kernel_boot_text() -> Option<String> {
         if cfg!(target_vendor = "apple") {
             let mut sysctl = aterm_uds::spawnfd::command("/usr/sbin/sysctl");
@@ -1059,7 +1086,7 @@ mod tests {
         );
     }
 
-    /// THE HAZARD, AND ASTREAM'S CURE, ON REAL FILES. A relaxed broker in
+    /// THE HAZARD, AND ASTREAM'S CURE, ON REAL FILES.
     #[test]
     fn a_power_loss_under_relaxed_moves_the_generation_with_lineage() {
         let dir = scratch();
@@ -1136,6 +1163,8 @@ mod tests {
     }
 
     /// A RESTART IN ONE BOOT IS NOT A LOG CHANGE: the page cache outlived the
+    /// broker, so a relaxed reopen after a stop that did not close the log
+    /// keeps the identity and the records.
     #[test]
     fn a_restart_or_a_clean_stop_keeps_the_identity() {
         let dir = scratch();
@@ -1177,7 +1206,7 @@ mod tests {
         );
     }
 
-    /// THE LEGACY-MARK MIGRATION: ONE DECISION, NO DOUBLE RENEWAL. A build
+    /// THE LEGACY-MARK MIGRATION: ONE DECISION, NO DOUBLE RENEWAL.
     #[test]
     fn the_legacy_mark_moves_the_generation_once_and_is_removed() {
         let dir = scratch();
@@ -1248,6 +1277,9 @@ mod tests {
     }
 
     /// THE LINEAGE WINDOW, END TO END: astream keeps the newest
+    /// [`astream_broker::Lineage::MAX`] steps, and a reader whose generation
+    /// needs an older one forgets ([`crate::state::LogWitness::continues`]
+    /// answers `None`), exactly as before lineage.
     #[test]
     fn a_reader_older_than_the_lineage_window_forgets() {
         let dir = scratch();
@@ -1304,7 +1336,7 @@ mod tests {
         );
     }
 
-    /// THE LEGACY MARK ALONE MOVES THE GENERATION WITH LINEAGE. Every other
+    /// THE LEGACY MARK ALONE MOVES THE GENERATION WITH LINEAGE.
     #[test]
     fn a_legacy_mark_alone_moves_the_generation_with_lineage() {
         let dir = scratch();
@@ -1361,6 +1393,8 @@ mod tests {
     }
 
     /// RELAXED ON A HOST THAT NAMES NO BOOT RUNS, the safe way: astream
+    /// cannot tell a reboot from a restart there, so every unclean stop moves
+    /// the generation, a process crash included.
     #[test]
     fn what_open_refuses_and_what_it_leaves_alone() {
         let dir = scratch();
@@ -1416,6 +1450,7 @@ mod tests {
     }
 
     /// One record kind the table test writes: who writes it, where, and
+    /// whether the table must escalate it.
     enum Write {
         /// A publish on `subject` under `who`'s caps.
         Publish(Who, String),
@@ -1439,6 +1474,7 @@ mod tests {
     const TABLE_PERSON: &str = "h-x";
 
     /// Every record kind of the table, as aterm's own builders spell it
+    /// ([`crate::subject`]), with whether it must be escalated.
     fn table_writes() -> Vec<(&'static str, Write, bool)> {
         use crate::subject;
         let (f, node, p) = (TABLE_FLEET, TABLE_NODE, TABLE_PERSON);
@@ -1500,6 +1536,9 @@ mod tests {
     }
 
     /// Write every [`table_writes`] record through a guarded broker opened
+    /// at `tier` with `table`, and answer, per kind, whether its record was
+    /// on stable media when its ack arrived — astream's own matcher, staged
+    /// as a real client's records are.
     fn escalated_by(
         tier: Durability,
         table: astream_broker::Escalation,
@@ -1603,6 +1642,7 @@ mod tests {
     }
 
     /// The guarded broker takes the tier too (astream's `OpenOptions::guard`):
+    /// a relaxed guarded open refuses an un-attached publish like a strict one.
     #[test]
     fn a_guarded_relaxed_broker_is_still_guarded() {
         let dir = scratch();

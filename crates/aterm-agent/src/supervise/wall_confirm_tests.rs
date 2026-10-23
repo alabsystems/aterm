@@ -84,6 +84,7 @@ fn every_kind() -> Vec<WallKind> {
 }
 
 /// Whether two kinds are one class to [`confirms`]: the same wall answered
+/// the same way.
 fn same_class(a: WallKind, b: WallKind) -> bool {
     let class = |k: WallKind| {
         if k.reads_limited() {
@@ -101,6 +102,8 @@ fn same_class(a: WallKind, b: WallKind) -> bool {
 }
 
 /// Every wall the policy acts on, as Claude Code 2.1.294 wrote it, ends the transcript on its own
+/// notice row (its measured `error` word), which confirms the wall the screen drew and no wall of
+/// another class.
 #[test]
 fn every_wall_claude_code_writes_confirms_its_own_kind_and_no_other() {
     let cases: [(&str, &[&str], Option<&str>); 12] = [
@@ -205,6 +208,7 @@ fn every_wall_claude_code_writes_confirms_its_own_kind_and_no_other() {
 }
 
 /// A tool's output in a wall's words (a Bash call, a shell-mode `!`, MCP results of several
+/// blocks or a long first block) confirms no wall: the transcript ends on the model's reply.
 #[test]
 fn a_tools_output_confirms_no_wall() {
     for name in [
@@ -226,6 +230,7 @@ fn a_tools_output_confirms_no_wall() {
 }
 
 /// A transcript cut before its notice and `turn_duration` is lagging (at the prompt, the model's
+/// call, the tool's result, or empty); a notice, or any end a `turn_duration` closed, is not.
 #[test]
 fn a_transcript_cut_before_its_notice_is_lagging() {
     let rows = |name: &str| -> Vec<&'static str> { fixture(name).lines().skip(1).collect() };
@@ -276,6 +281,7 @@ fn at(row: &str, at: &str) -> String {
 }
 
 /// `row` (a measured row) with its `parentUuid` set to `parent` (a JSON
+/// value: `null`, or a quoted id).
 fn parent(row: &str, parent: &str) -> String {
     let from = row.find("\"parentUuid\":").expect("a parent") + "\"parentUuid\":".len();
     let to = from + row[from..].find(',').expect("its end");
@@ -291,6 +297,8 @@ fn row_of(name: &str, needle: &str) -> &'static str {
 }
 
 /// Rows that are no entry of the conversation's (a subagent's notice, a local command's rows,
+/// the meta nudge, a compaction's summary) leave the notice the newest entry; a prompt, a tool's
+/// result and the model's words end it.
 #[test]
 fn only_the_conversations_own_entries_end_a_notice() {
     let notice = row_of("529", "\"isApiErrorMessage\":true");
@@ -343,6 +351,7 @@ fn only_the_conversations_own_entries_end_a_notice() {
 }
 
 /// The file's order decides, not the rows' clocks: an entry written after the notice ends it
+/// whatever its `timestamp` says.
 #[test]
 fn the_files_order_decides_but_for_the_conversations_first_row() {
     let notice = at(
@@ -408,6 +417,8 @@ fn the_files_order_decides_but_for_the_conversations_first_row() {
 }
 
 /// Every row the measured local commands wrote (`system` and `user` rows, caveats, a
+/// `compact_boundary`, a summary, a prompt command's `<command-message>` row) is passed over,
+/// alone and all together, after a notice of every class.
 #[test]
 fn a_local_commands_rows_are_no_turn_and_no_notice() {
     let commands: Vec<&str> = fixture("local-commands").lines().skip(1).collect();
@@ -502,6 +513,13 @@ fn a_local_commands_rows_are_no_turn_and_no_notice() {
 }
 
 /// A NOTICE THE TABLE DOES NOT NAME is classed by the `error` word Claude
+/// Code wrote with it: words no phrase of the wall table holds, with
+/// `rate_limit` and `billing_error` a limit's notice, `authentication_failed`
+/// a lost login's, `server_error` an API error's, and (2.1.300's own words
+/// for a request it refuses, 2026-10-15) `invalid_request`, `model_not_found`,
+/// `account_on_hold` and `max_output_tokens` an API error's too — each
+/// confirming its own class and no other; an `error` word of no class
+/// confirms nothing.
 #[test]
 fn a_notice_the_table_does_not_name_is_classed_by_its_error_word() {
     const WORDS: &str = "Something went sideways on our end";
@@ -538,6 +556,9 @@ fn a_notice_the_table_does_not_name_is_classed_by_its_error_word() {
 }
 
 /// The 529 fixture's last turn — its prompt, Claude Code's notice and the
+/// `turn_duration` that closed it — with the notice's words `text`, its
+/// `error` word, its `apiErrorStatus` (`None`: left out) and its typed
+/// `apiError` (`None`: none), as 2.1.300 writes a notice of each kind.
 fn notice_turn(text: &str, error: &str, status: Option<u16>, api_error: Option<&str>) -> String {
     let rows: Vec<&str> = fixture("529").lines().collect();
     let at = rows
@@ -582,6 +603,12 @@ fn notice_turn(text: &str, error: &str, status: Option<u16>, api_error: Option<&
 }
 
 /// A TURN THAT ENDED ON CLAUDE CODE'S OWN ERROR ROW IS A WALL (2026-10-15):
+/// a CLOSED notice is the wall its words name (the one table; the vendor's
+/// `Run /compact` remedy for images and attachments the full context's), else the
+/// wall its typed fields name — an `apiError` of 2.1.300's terminal set, an
+/// `error` word of a refused request, a `billing_error`, a status the vendor
+/// does not retry, an `authentication_failed` — and anything else the
+/// server's, retried.
 #[test]
 fn a_closed_error_notice_is_the_wall_its_words_or_its_typed_fields_name() {
     let refused = |code| {
@@ -600,6 +627,7 @@ fn a_closed_error_notice_is_the_wall_its_words_or_its_typed_fields_name() {
     };
     const MODEL: &str = "There's an issue with the selected model (claude-opus-9). It may not exist or you may not have access to it. Run /model to pick a different model.";
     /// A notice's words, `error` word, status and typed `apiError`, and the
+    /// wall it is.
     type Case<'a> = (
         &'a str,
         &'a str,
@@ -857,6 +885,10 @@ fn a_closed_error_notice_is_the_wall_its_words_or_its_typed_fields_name() {
 }
 
 /// THE SCREEN'S UNNAMED `API Error` NAMED BY THE NOTICE THAT CONFIRMED IT
+/// (the review of 2026-10-15): an `API Error: <the server's words>` with no
+/// status the table names nothing of reads on the screen as the server's,
+/// retried hourly for good, and is confirmed by its notice's `error` word
+/// alone.
 #[test]
 fn a_confirmed_unnamed_api_error_is_the_wall_its_notice_is_typed_as() {
     let server = WallKind::ApiError {
@@ -994,6 +1026,10 @@ fn a_confirmed_unnamed_api_error_is_the_wall_its_notice_is_typed_as() {
 }
 
 /// Main-chain rows of the shape Claude Code writes around a turn it started
+/// itself (the keys of the trust session's rows, 2.1.267-2.1.300: a
+/// `<task-notification>` prompt of origin `task-notification`, the model's
+/// reply, the `turn_duration` that closes it with its pending counts),
+/// written at `at` (`HH:MM:SS` on 2026-10-07).
 mod carried {
     pub(super) fn notification(at: &str) -> String {
         format!(
@@ -1038,6 +1074,10 @@ mod carried {
 }
 
 /// BG-1's transcript half: a turn that ended waiting on background work —
+/// the newest main-chain `turn_duration` counts a workflow or a background
+/// agent still pending, closes the newest entry (the model's reply), was
+/// written by the process launched before it, and no person's row follows
+/// it — and only that.
 #[test]
 fn a_turn_that_ended_waiting_on_background_work_is_read_only_where_it_stands() {
     use carried::{closed, launch, notification, reply, tail};
@@ -1096,6 +1136,10 @@ fn a_turn_that_ended_waiting_on_background_work_is_read_only_where_it_stands() {
 }
 
 /// The other side of the same row (the verifier's correction 3): the turn
+/// CLOSED WITH NOTHING PENDING — the newest main-chain `turn_duration`
+/// closes the model's reply, this process wrote it, no person's row follows,
+/// and its counts say nothing pending (absent, as Claude Code writes a zero,
+/// or 0).
 #[test]
 fn a_turn_closed_with_nothing_pending_is_read_only_where_it_stands() {
     use carried::{closed, launch, notification, reply, tail};
@@ -1156,6 +1200,8 @@ fn a_turn_closed_with_nothing_pending_is_read_only_where_it_stands() {
 }
 
 /// WHICH LIMIT A NOTICE ROW NAMES (KI-1015-1 W3): its words through the wall
+/// table, else its `quotaLimits.rateLimitType` — which also names the limit
+/// of words that name none of their own.
 #[test]
 fn a_limit_row_names_its_limit_by_its_words_else_its_limit_type() {
     let weekly = row_of("weekly-limit", "\"isApiErrorMessage\":true");
@@ -1266,6 +1312,10 @@ fn a_limit_row_names_its_limit_by_its_words_else_its_limit_type() {
 }
 
 /// A LIMIT ONLY THE TRANSCRIPT NAMES is named as where the screen read it
+/// (the integration of API-1's `transcript_found` and LIM-4): words that
+/// name no limit of their own take the bucket their `rateLimitType` names,
+/// that type riding the message so the fallback is never the model at its
+/// limit.
 #[test]
 fn a_limit_only_the_transcript_names_takes_its_rows_type() {
     const WORDS: &str = "You've hit your limit · resets 6pm";
@@ -1296,7 +1346,7 @@ fn a_limit_only_the_transcript_names_takes_its_rows_type() {
     );
 }
 
-/// THE MODEL CHOSEN SINCE A LIMIT'S NOTICE ROW. On Claude Code 2.1.302 (the lab's `r21lebk5`) a
+/// THE MODEL CHOSEN SINCE A LIMIT'S NOTICE ROW.
 #[test]
 fn a_tail_names_the_model_chosen_since_a_notice() {
     use super::chosen_since_notice;

@@ -12919,7 +12919,15 @@ fn words_of(store: &Store) -> HashMap<String, Autopilot> {
                 .meta
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .autopilot_word()?;
+                .autopilot_word()
+                .or_else(|| {
+                    h.ctx
+                        .timeline
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .leader_no_harness()
+                        .then_some(Autopilot::Off)
+                })?;
             Some((h.sid.as_str().to_string(), word))
         })
         .collect()

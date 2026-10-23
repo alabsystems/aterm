@@ -335,7 +335,7 @@ impl<A: Array> SmallVec<A> {
         self.regrow(new_cap);
     }
 
-    /// Moves the items into fresh storage with room for `new_cap`. Called only
+    /// Moves the items into fresh storage with room for `new_cap`.
     fn regrow(&mut self, new_cap: usize) {
         let old = core::mem::replace(&mut self.store, A::Store::with_capacity(new_cap));
         for item in old.into_iter() {
@@ -579,6 +579,7 @@ where
     A::Item: Clone,
 {
     /// As upstream: a clone of a spilled vector whose items fit inline is
+    /// inline.
     #[inline]
     fn clone(&self) -> SmallVec<A> {
         SmallVec::from(self.as_slice())
@@ -696,6 +697,7 @@ impl<'a, A: Array> IntoIterator for &'a mut SmallVec<A> {
 pub struct Drain<'a, A: Array> {
     vec: &'a mut SmallVec<A>,
     /// The items not yet yielded: the last `remaining` items of `vec`, in
+    /// reverse order, so the next one is `vec`'s last.
     remaining: usize,
 }
 
@@ -735,6 +737,7 @@ impl<A: Array> FusedIterator for Drain<'_, A> {}
 
 impl<A: Array> Drop for Drain<'_, A> {
     /// Drops the items not yielded, front to back (the reversed run's last
+    /// first), leaving `[head | tail]`.
     fn drop(&mut self) {
         let keep = self.vec.len() - self.remaining;
         self.remaining = 0;

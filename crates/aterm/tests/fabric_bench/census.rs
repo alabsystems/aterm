@@ -1,34 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHAT THE LOG HOLDS: every record a world's broker wrote, read back once the
-//! broker has stopped, and counted per kind of record over a measured window.
-//!
-//! WHY THE FILE AND NOT A `Fetch`. The bridge's inbox commits are records too —
-//! astream writes a group commit as a hidden `/a/commit` record that consumes
-//! an offset and costs the same Strict fsync as a publish — and every delivery
-//! path, `Fetch` included, skips hidden subjects on purpose. A census over
-//! `Fetch` would show the posts and never the commits, which are precisely the
-//! records the bridge's batching takes away: it commits its inbox cursor once
-//! no inbox record is queued and every `INBOX_COMMIT_EVERY` (256) records
-//! (`Bridge::round`), so a burst costs a few commits where it once cost one per
-//! message, and how many depends on when the queue drains. So each world's log
-//! is opened with [`astream_broker::BrokerLog`] after its broker has shut down
-//! — `BrokerHandle::shutdown` joins the writer and releases the log's exclusive
-//! lock before it returns — and read whole: every record, hidden or not, at its
-//! own offset.
-//!
-//! A RECORD'S KIND is its subject with the identities taken out ([`class_of`]):
-//! `/f/f1/in/<node>/<sid>/<node>/note` is a post on an inbox lane, whoever sent
-//! it to whom. The table that comes out names every kind the window held, so a
-//! record nobody expected (a presence republish a roster round made, an `ev`
-//! per delivery) is counted where it can be seen rather than folded away.
-//!
-//! A FIRED WILL IS NOT THE NEXT BRIDGE'S COST. When the bench SIGKILLs a bridge
-//! the broker publishes that bridge's registered will (its node row, `state=gone`)
-//! — a record the kill caused, landing inside the attach window that follows.
-//! [`will_firings`] names those records by the one mark astream leaves on them,
-//! so the attach census counts them apart instead of billing them to the attach.
+//! WHAT THE LOG HOLDS.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
@@ -52,8 +25,7 @@ pub struct Rec {
 }
 
 impl Rec {
-    /// A pure commit record, or a record that carries a commit beside its
-    /// output (astream's `process_and_produce`).
+    /// A pure commit record, or a record that carries a commit beside its output.
     #[must_use]
     pub fn commits(&self) -> bool {
         self.commit.is_some() || self.subject == COMMIT_SUBJECT
@@ -61,12 +33,8 @@ impl Rec {
 }
 
 /// Every record of the stopped broker's log at `path`, in offset order.
-///
 /// # Panics
-///
-/// The log does not open — the broker still holds it, or it is not a log. The
-/// census runs only after `BrokerHandle::shutdown` returned, which released the
-/// lock, so either is a broken run.
+/// The log does not open — the broker still holds it, or it is not a log.
 #[must_use]
 pub fn read_log(path: &Path) -> Vec<Rec> {
     let log = astream_broker::BrokerLog::open(path)
@@ -87,25 +55,21 @@ pub fn read_log(path: &Path) -> Vec<Rec> {
         .collect()
 }
 
-/// A body's first line, lossily decoded: where a presence row keeps its
-/// tokens.
+/// A body's first line, lossily decoded: where a presence row keeps its tokens.
 #[must_use]
 pub fn head_line(body: &[u8]) -> String {
     let head = body.split(|b| *b == b'\n').next().unwrap_or_default();
     String::from_utf8_lossy(head).into_owned()
 }
 
-/// The value of the `key=value` token in `head`, if it has one. Pure
-/// (unit-tested).
+/// The value of the `key=value` token in `head`, if it has one.
 #[must_use]
 pub fn token<'a>(head: &'a str, key: &str) -> Option<&'a str> {
     head.split_whitespace()
         .find_map(|t| t.strip_prefix(key)?.strip_prefix('='))
 }
 
-/// A subject with its identities taken out: a node segment (`n-…`) reads
-/// `<node>`, a session (`s-…`) `<sid>`, a human or agent principal (`h-…`,
-/// `a-…`) `<principal>`. Pure (unit-tested).
+/// A subject with its identities taken out.
 #[must_use]
 pub fn class_of(subject: &str) -> String {
     subject
@@ -130,8 +94,7 @@ pub fn class_of(subject: &str) -> String {
 pub struct Census {
     /// Every record, hidden or not.
     pub total: usize,
-    /// Records a subscriber or a `Fetch` would never see (`/a/commit`,
-    /// `/a/will`, `/a/bind`).
+    /// Records a subscriber or a `Fetch` would never see (`/a/commit`, `/a/will`, `/a/bind`).
     pub hidden: usize,
     /// Records that commit a consumer group ([`Rec::commits`]).
     pub commits: usize,
@@ -144,7 +107,7 @@ pub fn window(recs: &[Rec], lo: u64, hi: u64) -> impl Iterator<Item = &Rec> {
     recs.iter().filter(move |r| (lo..=hi).contains(&r.seq))
 }
 
-/// The census of `recs` — a [`window`], perhaps filtered. Pure (unit-tested).
+/// The census of `recs` — a [`window`], perhaps filtered.
 #[must_use]
 pub fn census<'a>(recs: impl IntoIterator<Item = &'a Rec>) -> Census {
     let mut c = Census::default();
@@ -157,8 +120,7 @@ pub fn census<'a>(recs: impl IntoIterator<Item = &'a Rec>) -> Census {
     c
 }
 
-/// The first record at or after `from` that commits `group` up to `upto` or
-/// past it: the moment a consumer's cursor covered offset `upto`.
+/// The first record at or after `from` that commits `group` up to `upto` or past it.
 #[must_use]
 pub fn covering_commit<'a>(recs: &'a [Rec], group: &str, upto: u64, from: u64) -> Option<&'a Rec> {
     recs.iter().filter(|r| r.seq >= from).find(|r| {
@@ -168,15 +130,7 @@ pub fn covering_commit<'a>(recs: &'a [Rec], group: &str, upto: u64, from: u64) -
     })
 }
 
-/// The offsets of every record that is a FIRED WILL. Pure (unit-tested).
-///
-/// astream persists a registered will as a hidden `/a/will` record carrying the
-/// will's own idempotency key in its producer fields, and fires it as an
-/// ordinary publish under that same key (`store.rs`, `WillRecord`). So a
-/// visible record whose `(producer_id, producer_seq)` an earlier `/a/will`
-/// registered IS that will, fired: no other record can carry the key, because
-/// the broker dedups on it (and aterm-link registers its will at astream's
-/// `will_seq(inc)`, whose low word `WILL_SEQ_LOW` no ordinary publish takes).
+/// The offsets of every record that is a FIRED WILL.
 #[must_use]
 pub fn will_firings(recs: &[Rec]) -> BTreeSet<u64> {
     let mut registered: HashSet<(u64, u64)> = HashSet::new();
@@ -191,15 +145,9 @@ pub fn will_firings(recs: &[Rec]) -> BTreeSet<u64> {
     fired
 }
 
-/// Whether the record right after offset `seq` is `group`'s commit covering
-/// it — what the latency phase's idle-bridge wait takes for granted when it
-/// treats "the head passed `seq + 1`" as "the delivery's commit is durable".
-/// Pure (unit-tested).
-///
+/// Whether the record right after offset `seq` is `group`'s commit covering it.
 /// # Errors
-///
-/// What sits at `seq + 1` instead, so the bench can say why its idle wait no
-/// longer waits for the commit.
+/// What sits at `seq + 1` instead.
 pub fn next_is_its_commit(recs: &[Rec], group: &str, seq: u64) -> Result<(), String> {
     let next = recs.iter().find(|r| r.seq == seq + 1);
     match next {
@@ -219,14 +167,8 @@ pub fn next_is_its_commit(recs: &[Rec], group: &str, seq: u64) -> Result<(), Str
     }
 }
 
-/// Whether `group`'s commit covering offset `upto` lands BEFORE the record at
-/// `fence` — what the burst phase's fence takes for granted when it bounds the
-/// burst's window by that commit: a commit that also covers the fence, or
-/// lands after it, puts the fence's whole post -> deliver round trip (and its
-/// post record) inside the burst's numbers. Pure (unit-tested).
-///
+/// Whether `group`'s commit covering offset `upto` lands BEFORE the record at `fence`.
 /// # Errors
-///
 /// No commit covers `upto`, or the one that does lands after `fence`.
 pub fn lands_before(recs: &[Rec], group: &str, upto: u64, fence: u64) -> Result<(), String> {
     match covering_commit(recs, group, upto, upto) {

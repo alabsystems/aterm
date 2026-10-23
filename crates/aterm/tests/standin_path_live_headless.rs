@@ -1,46 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A STAND-IN ON THE INSTANCE'S PATH IS WHAT ITS LOGIN SHELL NAMES, or the
-//! boot ends COULD NOT RUN before the test can type anything
-//! (`support/headless_boot.rs`'s guard over `support/launch_isolation.rs`'s
-//! `pin_login_path`).
-//!
-//! THE BUG (measured 2026-10-18): the worker tests booted a headless instance
-//! with `PATH=<stand-in folder>:/usr/bin:/bin:/usr/sbin:/sbin`, but a tab runs a
-//! login shell, macOS's system profile (`/etc/zprofile`, `/etc/profile`) runs
-//! `path_helper`, and that put `/etc/paths.d`'s `/opt/homebrew/bin` in front: the
-//! worker's `claude` was Homebrew's Claude Code, started under the scratch HOME.
-//!
-//! * THE PIN: under zsh and under bash, the boot session's login shell names
-//!   `claude` by the stand-in's path — the system profile ran, and the scratch
-//!   home's profile said the instance's PATH again after it. That `claude` is
-//!   put by hand, not by `headless_boot::standin`, so the guard asks nothing
-//!   of it and a broken pin reaches this file's assert: a FAIL, where the
-//!   guard's refusal would be COULD NOT RUN, which `verify` files as the
-//!   host's (and every guarded stand-in test with it). The guard's own pass is
-//!   the records' control below, whose stand-in it asks about.
-//! * THE GUARD, NEGATIVE CONTROLS, each a boot that must end COULD NOT RUN:
-//!   - a decoy folder ahead of the stand-in's on the instance's own PATH,
-//!     holding a program of the stand-in's name — `aterm-test-standin-x`, a
-//!     name no machine has, so nothing real can answer it however the guard
-//!     fares;
-//!   - (macOS) the pin undone by the test's own `~/.zprofile`, which runs after
-//!     it and runs `path_helper` again: `/usr/bin` (every Mac's `/etc/paths`) is
-//!     then in front of a stand-in named `uptime`. The same boot stands in
-//!     `claude`, and the refusal says what the shell named it — on a Mac with
-//!     Homebrew's Claude Code, Homebrew's path: the bug, caught by the guard.
-//!
-//! NOTHING RUNS A STAND-IN HERE but [`NOBODYS`], in the records' own control:
-//! the guard and the other tests type `command -v` alone, and no harness or
-//! worker is on to type anything (the isolation config's harness-off table).
-//! Every stand-in and the decoy record into [`MARKS`]' folder — outside the
-//! scratch world, which a refused boot removes — when they run: the control
-//! shows a run leaves its record, and every other test asserts the folder
-//! empty.
-//!
-//! Every wait is a one-minute hang detector. A machine that refuses the
-//! headless instance is COULD NOT RUN ([`headless_boot::boot_with`]).
+//! Headless boot login-shell `PATH` pinning tests for test stand-ins.
 
 #![cfg(unix)]
 
@@ -149,10 +110,7 @@ fn put_script(path: &Path, text: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 }
 
-/// The guard's refusal of the boot `boot` makes: its message. A boot the guard
-/// let through fails the test; any other panic (a machine that refuses the
-/// instance, a product that cannot start) is the test's own outcome, raised
-/// again.
+/// The guard's refusal of the boot `boot` makes: its message.
 fn refusal(boot: impl FnOnce() -> Instance) -> String {
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(boot));
     let payload = match caught {
@@ -177,11 +135,6 @@ fn refusal(boot: impl FnOnce() -> Instance) -> String {
 /// The pin: the boot session's login shell under `shell` names `claude` by its
 /// stand-in's path, the system profile's `path_helper` notwithstanding, and
 /// nothing ran it.
-///
-/// The stand-in is put by hand ([`put_script`]), so the guard asks nothing of
-/// it: a pin that breaks fails the assert here, naming what the shell found,
-/// instead of ending the boot COULD NOT RUN. Nothing types more than
-/// `command -v`, so even then nothing runs what it found.
 fn pinned(tag: &str, shell: &str) {
     let marks = marks();
     let inst = headless_boot::boot_with(
@@ -258,8 +211,7 @@ fn a_stand_in_typed_by_name_runs_and_its_record_says_so() {
 }
 
 /// NEGATIVE CONTROL: a decoy of the stand-in's name in a folder ahead of the
-/// stand-in's on the instance's own PATH. The guard ends the boot naming the
-/// decoy, and neither ran.
+/// stand-in's on the instance's own PATH.
 #[test]
 fn a_decoy_ahead_of_the_stand_in_ends_the_boot_could_not_run() {
     let marks = marks();
@@ -278,9 +230,7 @@ fn a_decoy_ahead_of_the_stand_in_ends_the_boot_could_not_run() {
 
 /// NEGATIVE CONTROL (macOS): the test's own `~/.zprofile`, which runs after
 /// the pin, runs `path_helper` again, so the system's folders are in front of
-/// the stand-ins once more. The guard ends the boot naming `/usr/bin/uptime`
-/// for the stand-in `uptime`; it says what `claude` is too (Homebrew's, where a
-/// Mac has it), and nothing ran.
+/// the stand-ins once more.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_login_profile_that_puts_the_system_first_again_ends_the_boot_could_not_run() {

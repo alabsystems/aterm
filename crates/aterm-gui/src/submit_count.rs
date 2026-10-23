@@ -7,52 +7,11 @@
 //! paste, an IME commit, a development build's `as=person`) or a control
 //! client (`send`, `key`, `paste`, `feed`, `turn`: the harness's own acts, a
 //! lab's prompt, an orchestrator's).
-//!
-//! What it is for: the harness tells one ended turn from the next by what it
-//! READS (the message that opened the turn, the words that end it), and a
-//! turn answered between two of its reads, opened by the same words as the
-//! one before or answered with the very words of the reply before it, reads
-//! as the point it came after (P4 of
-//! `docs/measured/forever-lab-2026-10-20.md`). aterm writes every byte typed
-//! into the tab, so it knows a submission happened whatever the screen shows:
-//! a count that moved since the point the harness judged last says a new turn
-//! was asked, and one that did not says the same words are the same turn.
-//!
-//! **What counts** ([`SubmitInput::of`]): a plain Enter press (no Shift,
-//! Ctrl, Alt or Super held; keypad Enter too), or a carriage return in raw
-//! bytes, written after at least one composing input since the last one: a
-//! key press that is no plain Enter (a character, Backspace, an arrow,
-//! Shift+Enter's newline), text, a paste, a raw byte that is no CR. An Enter
-//! over nothing typed since the last (a second Enter, a lone Enter at an empty
-//! composer) is no submission. A key release, a modifier or lock key alone, a
-//! mouse report, a focus or colour report and an engine reply compose
-//! nothing, and only the egress law's writes are read
-//! (`crate::app_input::OutputEchoTracker`), so reports never reach it.
-//!
-//! **When it counts**: at the write's full acceptance by the session's sink
-//! (`EgressReceipt::fully_accepted_nonempty`), before the program can have
-//! read the bytes, so a read of the screen that shows the program's answer to
-//! a submission, followed by a read of this count, counts that submission.
-//! A write the sink refused moved nothing and counts nothing.
-//!
-//! **What it is not**: a reading of the composer. aterm reads no composer at
-//! the moment of the key (the press path takes no terminal lock), so a draft
-//! typed and then deleted before its Enter, or an Esc before an Enter on an
-//! empty composer, counts as a submission the program answered with nothing.
-//! A reader pairs the count with the screen it reads, and a count that moved
-//! while the screen stands as it did is a submission not drawn yet, or none.
-//!
-//! Lock-free: one relaxed-to-acquire flag and one counter per session, written
-//! once per accepted input write. The count lives in this process: a session
-//! carried across a seamless update starts again at `0`, as `human_seq` does.
-
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::input::InputEvent;
 
-/// One session's submission count ([`Self::submits`]) and whether anything
-/// was composed since the last Enter. Lives on
-/// `crate::app_input::OutputEchoTracker`, beside its count of input writes.
+/// Session submission count ([`Self::submits`]) and composing state since the last Enter.
 #[derive(Debug, Default)]
 pub(crate) struct SubmitCount {
     /// A composing input was accepted since the last Enter.
@@ -64,18 +23,14 @@ pub(crate) struct SubmitCount {
 /// What one input write means for the count ([`SubmitInput::of`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum SubmitInput {
-    /// Composes nothing and submits nothing: a key release, a modifier or
-    /// lock key alone, a mouse or focus event, empty bytes.
+    /// Composes nothing and submits nothing.
     #[default]
     Neither,
     /// Composes: a key press that is no plain Enter, text, a paste.
     Composes,
     /// A plain Enter press: submits what was composed since the last.
     Enter,
-    /// Raw bytes holding `crs` carriage returns: `lead` is whether a byte
-    /// that is no CR comes before the first, `inner` how many of the later
-    /// ones follow such a byte since the CR before, `tail` whether one comes
-    /// after the last.
+    /// Raw bytes holding `crs` carriage returns.
     Raw {
         lead: bool,
         crs: u32,
@@ -121,8 +76,7 @@ impl SubmitInput {
         }
     }
 
-    /// The class of raw `bytes` written verbatim (`send`, `feed`, a
-    /// `[key_sequences]` chord, committed text).
+    /// Classify raw `bytes` written verbatim (`send`, `feed`, chord, or committed text).
     fn raw(bytes: &[u8]) -> Self {
         let mut lead = false;
         let mut crs = 0_u32;
@@ -155,8 +109,7 @@ impl SubmitInput {
 }
 
 impl SubmitCount {
-    /// An input write of class `input` was fully accepted by the session's
-    /// sink: fold it into the count.
+    /// An input write of class `input` was fully accepted by the session's sink.
     pub(crate) fn accepted(&self, input: SubmitInput) {
         match input {
             SubmitInput::Neither => {}
@@ -185,8 +138,7 @@ impl SubmitCount {
         }
     }
 
-    /// How many submissions the session's program has been written in this
-    /// process (`text --json`'s `"submits"`).
+    /// Submissions written to the session's program in this process (`text --json`'s `"submits"`).
     pub(crate) fn submits(&self) -> u64 {
         self.submits.load(Ordering::Acquire)
     }
@@ -225,7 +177,6 @@ mod tests {
 
     #[test]
     fn an_enter_over_something_typed_is_a_submission_whoever_typed_it() {
-        // A person's keys, then Enter.
         let count = SubmitCount::default();
         let typed = [
             press(Key::Character('h')),
@@ -233,22 +184,17 @@ mod tests {
             enter(),
         ];
         assert_eq!(written(&count, &typed), 1);
-        // A control client's `send` then `key enter` (the harness's act, a lab's prompt).
         let sent = [InputEvent::KeySequence(b"keep going".to_vec()), enter()];
         assert_eq!(written(&count, &sent), 2);
-        // A `turn`'s paste then its Enter.
         let turn = [
             InputEvent::Paste("land the task".to_string(), PasteFraming::AtDrain),
             enter(),
         ];
         assert_eq!(written(&count, &turn), 3);
-        // Raw bytes that carry their own CR, one submission per line typed.
         let raw = [InputEvent::KeySequence(b"one\rtwo\r".to_vec())];
         assert_eq!(written(&count, &raw), 5);
-        // History recalled with an arrow, then Enter: the arrow composed.
         let recalled = [press(Key::Named(NamedKey::ArrowUp)), enter()];
         assert_eq!(written(&count, &recalled), 6);
-        // Keypad Enter submits as Enter does.
         let keypad = [
             press(Key::Character('x')),
             press(Key::Named(NamedKey::NumpadEnter)),
@@ -259,7 +205,6 @@ mod tests {
     #[test]
     fn an_enter_over_nothing_typed_and_a_newline_are_no_submission() {
         let count = SubmitCount::default();
-        // A lone Enter, a second Enter, a bare CR.
         let empty = [enter(), press(Key::Character('a')), enter(), enter()];
         assert_eq!(
             written(&count, &empty),
@@ -270,7 +215,6 @@ mod tests {
             written(&count, &[InputEvent::KeySequence(b"\r".to_vec())]),
             1
         );
-        // Shift+Enter is the composer's newline: it composes, and submits nothing.
         let shifted = key(
             Key::Named(NamedKey::Enter),
             Modifiers::SHIFT,
@@ -278,7 +222,6 @@ mod tests {
         );
         assert_eq!(written(&count, &[shifted]), 1);
         assert_eq!(written(&count, &[enter()]), 2, "the newline was composed");
-        // A release, a modifier alone and a lock key compose nothing.
         let inert = [
             key(
                 Key::Character('a'),
@@ -290,11 +233,8 @@ mod tests {
             enter(),
         ];
         assert_eq!(written(&count, &inert), 2);
-        // Nor does a mouse report or a focus event.
         let reports = [InputEvent::Focus(true), enter()];
         assert_eq!(written(&count, &reports), 2);
-        // A Enter's own release, under kitty's event-type reports, composes
-        // nothing: the Enter after it is over an empty composer.
         let release = key(
             Key::Named(NamedKey::Enter),
             Modifiers::empty(),
@@ -306,7 +246,6 @@ mod tests {
     #[test]
     fn raw_bytes_carry_their_composing_across_writes() {
         let count = SubmitCount::default();
-        // Text sent with no CR composes; the CR of the next write submits it.
         assert_eq!(
             written(&count, &[InputEvent::KeySequence(b"draft".to_vec())]),
             0
@@ -315,13 +254,11 @@ mod tests {
             written(&count, &[InputEvent::KeySequence(b"\r".to_vec())]),
             1
         );
-        // Text after the last CR composes for the next Enter.
         assert_eq!(
             written(&count, &[InputEvent::KeySequence(b"a\rb".to_vec())]),
             2
         );
         assert_eq!(written(&count, &[enter()]), 3);
-        // Blank lines between CRs are no submissions.
         assert_eq!(
             written(&count, &[InputEvent::KeySequence(b"\r\r\r".to_vec())]),
             3

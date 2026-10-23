@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier 3 on faithful cargo layouts: a checkout with its git files, its
-//! working tree and its build directory, everything written now and the
-//! survey moved eight days later ([`now_after_write`]), so all of it reads
-//! idle but what a case writes "today".
+//! Tier 3 on faithful cargo layouts.
 
 use super::super::tests::{Tmp, lay_profile, lay_target, now_after_write};
 use super::super::{
@@ -27,8 +24,7 @@ fn set_mtime(path: &Path, at: i64) {
 
 /// A checkout at `<tmp>/repo`: `.git/index`, `.git/logs/HEAD`, a manifest
 /// and a source file, and its build directory `target/` (one profile,
-/// `debug/`) with `doc/` and `criterion/` at its root. Answers the canonical
-/// checkout and build directory.
+/// `debug/`) with `doc/` and `criterion/` at its root.
 fn checkout(tmp: &Tmp) -> (PathBuf, PathBuf) {
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(repo.join(".git/logs")).expect("git");
@@ -110,8 +106,7 @@ fn kept_why(rep: &super::super::Report, dir: &Path) -> Option<String> {
 /// a session working in the checkout, a process with its working directory
 /// there, a profile written two days ago, only `.rustc_info.json` for a
 /// marker, a volume mounted inside it, and an installed link resolving into
-/// its `debug/`. NEGATIVE CONTROL for the link: a link elsewhere keeps no
-/// candidate.
+/// its `debug/`.
 #[test]
 fn every_clause_clear_makes_a_whole_idle_row_and_each_unmet_one_keeps_it() {
     let now = now_after_write(8);
@@ -172,8 +167,6 @@ fn every_clause_clear_makes_a_whole_idle_row_and_each_unmet_one_keeps_it() {
         (
             "installed link",
             Box::new(|tmp, _, target| {
-                // The PATH directory itself can be the installed link. Its
-                // ordinary binary is not an entry-level symlink.
                 std::fs::write(target.join("debug/tool"), b"installed tool").expect("tool");
                 std::os::unix::fs::symlink(target.join("debug"), tmp.path().join("bin"))
                     .expect("installed directory alias");
@@ -201,8 +194,6 @@ fn every_clause_clear_makes_a_whole_idle_row_and_each_unmet_one_keeps_it() {
         assert!(why.contains(word), "{word}: {why:?} {:#?}", rep.notes);
     }
 
-    // The mount table may prohibit following an intermediate component;
-    // that does not establish that the final destination is outside the build.
     for remote in [true, false] {
         let tmp = Tmp::new("idle-unknown-mount");
         let (repo, target) = checkout(&tmp);
@@ -241,8 +232,6 @@ fn every_clause_clear_makes_a_whole_idle_row_and_each_unmet_one_keeps_it() {
         );
     }
 
-    // A session working in the checkout, and a process with its working
-    // directory there.
     let tmp = Tmp::new("idle-session");
     let (repo, target) = checkout(&tmp);
     let rep = survey(
@@ -272,8 +261,6 @@ fn every_clause_clear_makes_a_whole_idle_row_and_each_unmet_one_keeps_it() {
         rep.notes
     );
 
-    // A volume mounted inside it, from a table read whole; and a table cut
-    // short proves nothing.
     let mut mounted = aterm_sysprobe::volumes::table();
     mounted.mounts.push(aterm_sysprobe::volumes::Mount {
         on: target.join("mnt"),
@@ -305,7 +292,6 @@ fn every_clause_clear_makes_a_whole_idle_row_and_each_unmet_one_keeps_it() {
     let rep = survey(&tmp, &repo, &target, now, |r| r.mounts = Some(cut), &nobody);
     assert!(kept_why(&rep, &target).is_some_and(|w| w.contains("not read whole")));
 
-    // x.py's bootstrap trees are never tier 3's: not assessed at all.
     let rep = survey(
         &tmp,
         &repo,
@@ -323,8 +309,7 @@ fn every_clause_clear_makes_a_whole_idle_row_and_each_unmet_one_keeps_it() {
 }
 
 /// Off by `disk.idle_build_dirs` the row is listed, report-only, saying why;
-/// `idle_build_days` below one turns it off too. NEGATIVE CONTROL: the shipped
-/// default is on.
+/// `idle_build_days` below one turns it off too.
 #[test]
 fn the_row_is_report_only_while_tier_3_is_off() {
     let now = now_after_write(8);
@@ -403,9 +388,7 @@ fn a_working_tree_walk_cut_short_keeps_it() {
 
 /// THE REMOVAL EMPTIES EACH PROFILE AND KEEPS IT: afterwards `debug/` and its
 /// three lock files are there and nothing else of it; `doc/`, `criterion/`,
-/// `CACHEDIR.TAG` and `.rustc_info.json` are untouched. NEGATIVE CONTROL: a
-/// second taker of the second profile's lock between the two profiles keeps
-/// that profile whole, the first already emptied, the refusal said.
+/// `CACHEDIR.TAG` and `.rustc_info.json` are untouched.
 #[test]
 fn the_removal_empties_each_profile_under_its_locks_and_keeps_the_rest() {
     let now = now_after_write(8);
@@ -425,7 +408,6 @@ fn the_removal_empties_each_profile_under_its_locks_and_keeps_the_rest() {
         volume: None,
     };
     let seen = now;
-    // A second taker of the other profile's lock once the first is released.
     let mut held: Vec<target::Build> = Vec::new();
     let mut first: Option<PathBuf> = None;
     let profiles = [target.join("debug"), target.join("release")];
@@ -480,7 +462,6 @@ fn the_removal_empties_each_profile_under_its_locks_and_keeps_the_rest() {
     );
     assert!(done.bytes >= 8192, "{done:?}");
 
-    // Again, nothing held: the other profile is emptied too.
     let done =
         target::reclaim_profiles(&target, &judge, seen, 7 * DAY, &mut || Ok(()), &mut || {
             Ok(())
@@ -546,8 +527,6 @@ fn the_removal_reads_the_clock_and_the_mount_table_again_under_the_locks() {
 /// A build directory a search from `$HOME` found (`~/repo/target`, its
 /// discovery root `~`) serves `~/repo`, the git worktree above it — not `~`:
 /// a session working in `~` itself does not keep it, one in `~/repo` does.
-/// NEGATIVE CONTROL: `$HOME` is never a checkout (a dotfiles repository there,
-/// or none above the build directory, keeps it).
 #[test]
 fn a_build_directory_found_from_home_serves_the_checkout_above_it() {
     let now = now_after_write(8);
@@ -586,7 +565,6 @@ fn a_build_directory_found_from_home_serves_the_checkout_above_it() {
         &nobody,
     );
     assert!(kept_why(&rep, &target).is_some_and(|w| w.contains("a session works")));
-    // No worktree above it: the root is `$HOME`, which is no checkout.
     std::fs::remove_dir_all(repo.join(".git")).expect("no git");
     let rep = survey(&tmp, &repo, &target, now, from_home, &nobody);
     assert!(
@@ -599,9 +577,7 @@ fn a_build_directory_found_from_home_serves_the_checkout_above_it() {
 /// TIER 3 EMPTIES ONLY CARGO'S OWN OUTPUTS of a profile: its caches,
 /// `examples/`, its dep-info files and its uplifted artifacts (a byte-identical
 /// copy of its hashed `deps/` twin, a hard link to it, a `.dSYM` link into
-/// `deps/`). NEGATIVE CONTROLS, each kept and said: an app bundle a packager
-/// wrote, a database a tool keeps beside its binary, a person's file, and a
-/// file named like an uplift whose twin differs.
+/// `deps/`).
 #[test]
 fn the_removal_takes_only_cargos_outputs_and_keeps_the_rest_of_a_profile() {
     let now = now_after_write(8);
@@ -629,8 +605,6 @@ fn the_removal_takes_only_cargos_outputs_and_keeps_the_rest_of_a_profile() {
     w("notes.txt", 10);
     w("deps/other-0123456789abcdef", 10);
     w("other", 11);
-    // A custom file can have a cargo-looking name and the twin's exact size
-    // without holding the same bytes. It is not cargo's output to rebuild.
     w("deps/custom-0123456789abcdef", 4096);
     let custom_bytes = vec![4u8; 4096];
     std::fs::write(p.join("custom"), &custom_bytes).expect("custom bytes");
@@ -700,9 +674,7 @@ fn the_removal_takes_only_cargos_outputs_and_keeps_the_rest_of_a_profile() {
 }
 
 /// The uplift rule, pure: `<stem><ext>` and its hashed twin
-/// `<stem>-<hash><ext>`, `-` read as `_`. NEGATIVE CONTROLS: another
-/// extension, a short or non-hex hash, another stem, a dotted twin of a bare
-/// binary.
+/// `<stem>-<hash><ext>`, `-` read as `_`.
 #[test]
 fn an_uplift_is_named_by_its_hashed_twin() {
     use super::super::target::uplift_twin;
@@ -722,7 +694,7 @@ fn an_uplift_is_named_by_its_hashed_twin() {
 /// right before its delete: a `between` that refuses (a `cargo test` started
 /// from an idle profile after the survey, cargo having given its lock up)
 /// keeps every profile, nothing deleted, and it is asked only once the locks
-/// are held. NEGATIVE CONTROL: the same removal with `between` clear empties.
+/// are held.
 #[test]
 fn the_process_check_runs_under_the_locks_before_the_first_delete() {
     let now = now_after_write(8);
@@ -773,7 +745,7 @@ fn the_process_check_runs_under_the_locks_before_the_first_delete() {
 
 /// THE OWNER'S VERB NEVER TAKES A TIER-3 ROW, whatever `disk.apply` says: its
 /// plan for `cargo-targets` lists the whole idle build directory as reported,
-/// never removed. NEGATIVE CONTROL: the window's pass, for a demand, plans it.
+/// never removed.
 #[test]
 fn the_verb_reports_tier_3_and_never_takes_it() {
     let now = now_after_write(8);
@@ -801,7 +773,6 @@ fn the_verb_reports_tier_3_and_never_takes_it() {
 /// through a link from `~/a-wt` into `~/z-main/target.noindex` is not judged
 /// by `~/a-wt`'s quiet (refused, said); an agent's `CARGO_TARGET_DIR` is never
 /// tier 3's; a build directory with no git checkout above it is refused.
-/// NEGATIVE CONTROL: the same directory found from `~/z-main` is a row.
 #[test]
 fn tier_3_judges_the_checkout_the_build_directory_lies_in() {
     let now = now_after_write(8);
@@ -848,8 +819,7 @@ fn tier_3_judges_the_checkout_the_build_directory_lies_in() {
 /// non-automounted mounts of a table read whole: a link chain resolves; the
 /// same chain where the table calls its volume remote (a stalled share) or
 /// automounted is never followed (`None`), nor is anything on a table read
-/// short. Clause 5 keeps candidates when a link or its directory cannot be
-/// resolved locally.
+/// short.
 #[test]
 fn links_are_resolved_only_on_local_mounts() {
     let tmp = Tmp::new("idle-resolve");
@@ -868,8 +838,6 @@ fn links_are_resolved_only_on_local_mounts() {
         .expect("a mount holds it")
         .on
         .clone();
-    // A listed directory may itself be a symlink. Resolve it before listing
-    // and interpret each relative target against the physical directory.
     let physical = base.join("physical/bin");
     std::fs::create_dir_all(&physical).expect("physical bin");
     std::fs::write(base.join("physical/tool"), b"x").expect("physical tool");
@@ -911,9 +879,6 @@ fn links_are_resolved_only_on_local_mounts() {
         assert_eq!(resolve_local(&base.join("links/tool"), &t), None);
         unresolved_remote
             .push(inbound_links(std::slice::from_ref(&base.join("links")), Some(&t)).is_err());
-        // Even an empty aliased folder must refuse before enumeration when
-        // its captured mount is remote/automounted; there is no target to
-        // trigger a later per-entry fence.
         unresolved_enumeration
             .push(inbound_links(std::slice::from_ref(&empty_alias), Some(&t)).is_err());
     }
@@ -924,8 +889,6 @@ fn links_are_resolved_only_on_local_mounts() {
     assert_eq!(resolve_local(&base.join("links/tool"), &cut), None);
     assert!(inbound_links(&[base.join("links")], Some(&cut)).is_err());
 
-    // An unresolved local relative target is not proof it points elsewhere.
-    // Its as-written path includes `..`, and the missing leaf cannot canonicalize.
     let unknown = base.join("unknown-links");
     std::fs::create_dir(&unknown).expect("owned link folder");
     let link = unknown.join("tool");
@@ -946,9 +909,7 @@ fn links_are_resolved_only_on_local_mounts() {
 /// A walk ends only on a local folder ([`resolve_local`]): `/` where the
 /// table calls its mount remote holds no component for a step to place, and
 /// resolves to nothing — as a link onto a remote root does, which ends the
-/// walk there (the old walk answered the root it ended on). NEGATIVE
-/// CONTROL: a local root resolves to itself. From the table alone: nothing
-/// is opened.
+/// walk there (the old walk answered the root it ended on).
 #[test]
 fn a_walk_that_ends_on_a_remote_root_resolves_to_nothing() {
     let root = |local: bool| aterm_sysprobe::volumes::Table {
@@ -974,7 +935,7 @@ fn a_walk_that_ends_on_a_remote_root_resolves_to_nothing() {
 
 /// The other-user fence of a whole removal past a sizing walk cut short: a
 /// walk that runs past its bound, or a folder it cannot read, rules nothing
-/// out (`Some`). NEGATIVE CONTROL: a small tree read whole is clear (`None`).
+/// out (`Some`).
 #[test]
 fn an_ownership_walk_cut_short_rules_nothing_out() {
     use std::os::unix::fs::PermissionsExt as _;

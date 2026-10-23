@@ -1,44 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm ctl --host <h> …`: THE STEP-IN — this Mac drives another Mac's
-//! aterm over the fleet (`docs/DESIGN-sessions-as-subagents-2026-10-15.md`
-//! §5.1), with the worker's recipe as it is on one Mac and a host named:
-//!
-//! ```text
-//! aterm ctl --host <h> spawn agent=claude [model=<m>] [cwd=<absolute>] - < task
-//! aterm ctl --host <h> await task @<w>[,@<w2>…] since=0 [any|all] [timeout=<ms>]
-//! aterm ctl --host <h> await task @<w>:<rev>[,…]     (every later wait)
-//! aterm ctl --host <h> @<w> result | status | text | screen
-//! aterm ctl --host <h> @<w> turn [settle=submitted] <text>
-//! aterm ctl --host <h> @<w> key <k> | send <text>
-//! aterm ctl --host <h> hold <w> on|off [reason=<pct>]
-//! aterm ctl --host <h> @<w> close          (a worker this Mac spawned there)
-//! aterm ctl --host <h> survey              (`survey --host <h>`)
-//! ```
-//!
-//! Each request is one connection the fleet client this binary links dials
-//! ([`FleetDriveFn`]: the fleet's `drive` op, this Mac proving its node key
-//! and the peer proving the node this Mac's book records for the host named,
-//! under the key it binds to that node). The peer serves it
-//! only to the nodes its person named (`aterm fleet allow drive --from <this
-//! Mac>` there), admits only the verbs above, types each as "<this Mac> over
-//! the fleet", records it in its Messages, and refuses every write while its
-//! person holds the session (Take Over). The client keeps what it can to
-//! itself: sessions are named by their sids (`@s-…`, as `survey --host <h>`
-//! shows them) — `@self`, a local number and a list name sessions of THIS
-//! Mac — a worker's folder is that Mac's (an absolute `cwd=`, or none: no
-//! folder of this one), and no stdin frame but a worker's task is sent.
-//!
-//! A drive connection lasts 30 s on the peer (`aterm_net::fleet::
-//! SERVED_WITHIN`), so: `await task` waits in legs of at most 20 s, each a
-//! fresh connection, up to its own deadline as on one Mac (`await_task`),
-//! a leg the peer did not serve — busy, restarting, cut — asked again
-//! within it; a `turn` waits at most [`TURN_MAX_MS`] (20 s when it names no
-//! `timeout=`), and a longer one is `settle=submitted` then `await task
-//! @<w>:<task_rev>`. As on one Mac, a bare `@<w>` waits past the rev its
-//! worker is at when the wait starts, so a first wait says `since=0`: a
-//! short task is often done before it.
+//! `aterm ctl --host <h> …`.
 
 use std::env;
 use std::fmt;
@@ -54,26 +17,20 @@ use super::{
     validate_request_parts, worker_starter,
 };
 
-/// A drive connection's stream, as the fleet client hands it over: read and
-/// written by the deadline it was dialled with.
+/// A drive connection's stream, as the fleet client hands it over.
 pub trait DriveStream: io::Read + Write {}
 
 impl<T: io::Read + Write> DriveStream for T {}
 
-/// ONE DRIVE CONNECTION to another Mac's aterm ([`FleetDriveFn`]): proved,
-/// and ready for the request lines that Mac's drive gate admits.
+/// ONE DRIVE CONNECTION to another Mac's aterm ([`FleetDriveFn`]).
 pub struct DriveLink {
     /// The proved stream.
     pub stream: Box<dyn DriveStream>,
-    /// How the peer is named in what this client says: its host as this
-    /// machine knows it.
+    /// How the peer is named in what this client says: its host as this machine knows it.
     pub label: String,
 }
 
-/// THE FLEET CLIENT'S DRIVE DIAL the `aterm` binary links: the peer the word
-/// names (a host, node id or address its book records), reached within the
-/// one deadline for the dial and every exchange after it — or why it was not
-/// reached, or will not be driven from here.
+/// THE FLEET CLIENT'S DRIVE DIAL the `aterm` binary links.
 pub type FleetDriveFn = fn(&str, Duration) -> Result<DriveLink, DriveRefused>;
 
 /// Why a drive dial reached no peer to drive ([`FleetDriveFn`]).
@@ -81,10 +38,7 @@ pub type FleetDriveFn = fn(&str, Duration) -> Result<DriveLink, DriveRefused>;
 pub struct DriveRefused {
     /// What to say of it.
     pub why: String,
-    /// Whether the same dial a moment later may be served: the peer's share
-    /// of drive connections for this machine's address was full (`NO
-    /// capacity`), or nothing listened at its port (an aterm restarting, or
-    /// its listener rebinding). Everything else is said once.
+    /// Whether the same dial a moment later may be served.
     pub again: bool,
 }
 
@@ -124,8 +78,7 @@ const DRIVE_WITHIN: Duration = Duration::from_secs(28);
 const TURN_WAIT_MS: u64 = 20_000;
 
 /// The longest `timeout=` a turn over a drive takes: its connection is cut at
-/// 30 s, the dial and the reply inside it. The driven Mac's drive gate holds
-/// a turn to the same.
+/// 30 s, the dial and the reply inside it.
 const TURN_MAX_MS: u64 = aterm_types::control_verbs::DRIVE_TURN_MAX_MS;
 
 /// The options a `turn` reads before its text (`help turn`).
@@ -151,8 +104,7 @@ fn refused(why: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, why.into())
 }
 
-/// `aterm ctl --host <host> <parts…>` ([the module](self)). `total` is the
-/// explicit `--timeout` when one was given, for `await task`'s whole wait.
+/// `aterm ctl --host <host> <parts…>` ([the module](self)).
 pub(crate) fn run(
     host: &str,
     parts: &[String],
@@ -223,7 +175,7 @@ pub(crate) fn run(
 
 /// Refuse a leading selector that names a session of THIS Mac, or none by
 /// its sid: over the fleet a session is `@s-<hex>`, as `survey --host`
-/// shows it. A lone selector names one session.
+/// shows it.
 fn refuse_local_selector(parts: &[String]) -> io::Result<()> {
     let Some(selector) = parts.first().filter(|p| p.starts_with('@')) else {
         return Ok(());
@@ -247,16 +199,11 @@ fn is_sid(word: &str) -> bool {
 
 /// The options the server's dispatch takes off a `turn` before the turn's
 /// own (`aterm-gui`'s `take_leading_options`): the exactly-once `id=`, the
-/// `if-supervisor=` fence and a leading `cause=`. A `--` among them is taken
-/// too, and ends them.
+/// `if-supervisor=` fence and a leading `cause=`.
 const TURN_LEADING: &[&str] = &["id=", "if-supervisor=", "cause="];
 
 /// A turn's wait over a drive: its `timeout=`, at most [`TURN_MAX_MS`], or
-/// [`TURN_WAIT_MS`] added where it names none. Only the options before the
-/// text are read, as the server reads them: the dispatch's leading ones
-/// ([`TURN_LEADING`]) first, then the turn's ([`TURN_OPTIONS`]); an added
-/// `timeout=` goes between the two, so each of the dispatch's is still read
-/// as one and the text is left as written.
+/// [`TURN_WAIT_MS`] added where it names none.
 fn turn_wait(parts: &mut Vec<String>) -> io::Result<()> {
     let at = parts
         .iter()
@@ -346,8 +293,7 @@ fn spawn_head(args: &[String], starter: Option<&str>) -> io::Result<String> {
 
 /// A worker's spawn over `link`: the line `head`; then, once it is answered
 /// `GO <n>`, the `task`, and the answer printed as on one Mac (a second `GO`
-/// read past). Any other answer to the line is the answer, and not a byte of
-/// the task is sent.
+/// read past).
 fn spawn_exchange(link: DriveLink, head: &str, task: &[u8]) -> io::Result<ExitCode> {
     let DriveLink { mut stream, label } = link;
     let go = aterm_types::control_verbs::task_frame_go(task.len());

@@ -27,6 +27,8 @@ pub const MAX_INSERT_BYTES: usize = 32 * 1024 * 1024;
 pub struct JournalDocumentKey(pub u64);
 
 /// What the MAC of a document key covers ahead of the URI: a fixed,
+/// NUL-terminated label, so the tag of one purpose is never the tag of another
+/// under the same secret.
 const JOURNAL_KEY_DOMAIN: &[u8] = b"aterm draft journal document key v1\0";
 
 impl JournalDocumentKey {
@@ -161,6 +163,8 @@ pub fn line_ending_of(bytes: &[u8]) -> LineEnding {
 
 trust_contract_fn! {
     /// Whether `byte`, read after `previous`, is a bare line feed: an LF with no
+    /// CR before it, which keeps a file's line breaks as they are
+    /// ([`line_ending_of`]).
     #[must_use]
     fn is_bare_line_feed(previous: u8, byte: u8) -> bool
     clauses [ensures result == (byte == 10 && previous != 13) by is_bare_line_feed_is_lf_after_no_cr]
@@ -182,6 +186,8 @@ verify_island! {
 pub const UTF8_BOM: [u8; 3] = [0xef, 0xbb, 0xbf];
 
 /// The most [`encode_for_disk`] reserves before it writes: a byte order mark
+/// past the document limit, which no save may exceed (its preflight refuses a
+/// longer image).
 const ENCODE_RESERVE_CEILING: usize = crate::host::DEFAULT_DOCUMENT_LIMIT + UTF8_BOM.len();
 
 /// The bytes a save of `text` writes for a file held with `encoding`.
@@ -1410,6 +1416,9 @@ const _: () = assert!(MAX_INSERT_LEN == 33_554_432);
 
 trust_contract_fn! {
     /// Whether one journal edit may follow an edit that ended at `previous_end`
+    /// (0 before the first): its range runs forward, it starts at or after that
+    /// end, so a record's edits are sorted and never overlap, and it inserts at
+    /// most [`MAX_INSERT_BYTES`].
     #[must_use]
     fn journal_edit_in_order(start: u64, end: u64, previous_end: u64, insert_len: u64) -> bool
     clauses [ensures result == (start <= end && (previous_end <= start && insert_len <= 33554432)) by journal_edit_in_order_is_shape]
@@ -2257,6 +2266,9 @@ mod tests {
     }
 
     /// Every string of up to 8 characters over `a`, CR and LF, with and without
+    /// a byte order mark: the held text encodes back to exactly the file's
+    /// bytes; the file is held as CRLF exactly when it has a line feed and each
+    /// one has a CR before it; and then exactly one CR goes per line feed.
     #[test]
     fn held_text_encodes_back_to_the_files_bytes() {
         let mut files = vec![String::new()];
@@ -2309,6 +2321,7 @@ mod tests {
     }
 
     /// A plan carries the buffer's text and, apart from it, the bytes the file
+    /// gets; a plain document's are one allocation.
     #[test]
     fn a_save_plan_encodes_the_text_with_the_mapping_it_was_read_with() {
         let crlf = DiskEncoding {
@@ -2355,6 +2368,7 @@ mod tests {
     }
 
     /// `journal_edit_in_order` is proved for one edit (SPECS.md); this holds
+    /// the loop that threads each edit's end into the next check.
     #[test]
     fn a_delta_takes_sorted_disjoint_forward_edits_only() {
         let (_store, id, snapshot) = snapshot("abcd");

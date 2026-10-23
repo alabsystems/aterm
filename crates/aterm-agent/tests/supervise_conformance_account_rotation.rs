@@ -44,15 +44,20 @@ const DAY: i64 = 24 * HOUR;
 const WINDOW: &str = "five_hour";
 
 /// A wall the walk records names a reset this far ahead: far enough that no
+/// account "becomes usable within 15 minutes".
 const WALL_S: i64 = 4 * HOUR;
 
 /// The account whose window is about to reset: its wall names a reset this
+/// near, and its sample's window ends this near.
 const SOON_S: i64 = MIN;
 
 /// The clock's step at a reset: past the near wall's end (its reset plus the
+/// 150 s grace), and so past the near window's end.
 const RESET_STEP_S: i64 = SOON_S + accounts::RESET_GRACE_S + 1;
 
 /// How long the canary has held when the model's hold stands: long enough
+/// ago that the step below ends it, and recent enough that a reset's step
+/// does not.
 const HELD_S: i64 = accounts::CANARY_HOLD_S / 2;
 
 /// The clock's step at the hold's lapse: to the end of its ten minutes.
@@ -61,6 +66,8 @@ const LAPSE_STEP_S: i64 = accounts::CANARY_HOLD_S - HELD_S;
 const _: () = assert!(HELD_S + RESET_STEP_S < accounts::CANARY_HOLD_S);
 
 /// A session at the notice of a wall the owner lifted (the model's `n1`, `n2`): how
+/// long before [`NOW`] the limit row it stands at was written, and how long before
+/// [`NOW`] the owner cleared that account, after the row.
 const NOTICE_ROW_S: i64 = MIN / 2;
 const CLEARED_S: i64 = MIN / 4;
 const _: () = assert!(CLEARED_S < NOTICE_ROW_S);
@@ -69,6 +76,7 @@ const _: () = assert!(CLEARED_S < NOTICE_ROW_S);
 const GONE: &str = "s-gone";
 
 /// The model's variables for the three accounts' conditions, the two
+/// sessions' accounts and waits, and its actions for a session's point.
 const CONDS: [&str; 3] = ["d1", "d2", "sh"];
 const SESSIONS: [&str; 2] = ["s1", "s2"];
 const WAITING: [&str; 2] = ["w1", "w2"];
@@ -81,6 +89,7 @@ const NOTICES: [&str; 2] = ["n1", "n2"];
 const SIDS: [&str; 2] = ["s-one", "s-two"];
 
 /// The model's variables the real state carries; the rest are the host's or the
+/// model's record of its last step.
 const SEEN: [&str; 13] = [
     "d1", "d2", "sh", "act", "run", "prov", "prev", "pp", "pin", "hold", "s1", "s2", "rot",
 ];
@@ -108,11 +117,13 @@ struct World {
     /// Days until each account's week resets, where the samples carry one.
     weeks: Option<[i64; 3]>,
     /// How a lapsed hold is read: the canary's record still there, ten minutes old
+    /// (`true`), or none, its session forgotten (`false`).
     silent_record: bool,
 }
 
 impl World {
     /// The design's own roster: this machine's login, a second dedicated
+    /// account and a shared one.
     fn of(labels: [&'static str; 3], weeks: Option<[i64; 3]>, silent_record: bool) -> World {
         let row = |label: &str, class: Class, dir: Option<&str>| Row {
             label: label.to_string(),
@@ -143,6 +154,8 @@ impl World {
     }
 
     /// Account 1 before account 2 because its week resets sooner — with the
+    /// labels the other way round, and the shared account's week the soonest
+    /// of all (its class still puts it last).
     fn by_week() -> World {
         World::of(["work-2", "main", "pool-a"], Some([2, 5, 1]), false)
     }
@@ -187,6 +200,7 @@ impl World {
 }
 
 /// The rotations already spent when the model's hour opens: the real bound less the
+/// model's `Budget` (0 when the model is walked at the real bound).
 fn spent_before(w: &World, m: &Model) -> i64 {
     let before = w.bound() - cnst(m, "Budget");
     assert!(before >= 0, "the model's Budget is past the real bound");
@@ -194,6 +208,7 @@ fn spent_before(w: &World, m: &Model) -> i64 {
 }
 
 /// A settled `/usage` read: low or not, in a session window ending at
+/// `window_end`, with this world's week.
 fn sample(w: &World, account: i64, low: bool, window_end: i64, at: i64) -> Sample {
     let k = usize::try_from(account - 1).unwrap();
     Sample {
@@ -272,6 +287,7 @@ fn project(w: &World, m: &Model, st: &State, soon: Option<i64>) -> accounts::Sta
 }
 
 /// The [`SEEN`] variables' values, in that order: the real state read back
+/// ([`abstraction`]), or a model state's ([`seen`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Seen([i64; SEEN.len()]);
 
@@ -305,6 +321,7 @@ impl std::fmt::Debug for Seen {
 }
 
 /// The read back: the real state onto the model's variables, through the real
+/// `condition` at `now`.
 fn abstraction(w: &World, m: &Model, real: &accounts::State, now: i64) -> Seen {
     let mut out = Seen([0; SEEN.len()]);
     for (var, account) in CONDS.iter().zip(1..) {
@@ -355,11 +372,13 @@ fn seen(st: &State) -> Seen {
 }
 
 /// `read == seen(st)` for the model state `st` the real code is shown as `key`
+/// ([`SHOWN`], whose first variables are [`SEEN`]): asked at every state and edge.
 fn read_is_seen(read: &Seen, key: &Shown) -> bool {
     read.0 == key[..SEEN.len()]
 }
 
 /// The model variables the real code is shown: [`SEEN`], which [`project`] builds the
+/// real state from, and the notices, which say what point a session is asked at.
 const SHOWN: [&str; SEEN.len() + NOTICES.len()] = {
     let mut shown = [""; SEEN.len() + NOTICES.len()];
     let mut k = 0;
@@ -382,6 +401,7 @@ fn shown(st: &State) -> Shown {
 }
 
 /// The model state of just those variables: what the real code is handed, so a read
+/// of any other is a missing key and fails loudly instead of making the memo wrong.
 fn shown_state(key: &Shown) -> State {
     SHOWN_SORTED.iter().map(|&k| (SHOWN[k], key[k])).collect()
 }
@@ -394,6 +414,7 @@ static SHOWN_SORTED: std::sync::LazyLock<[usize; SHOWN.len()]> = std::sync::Lazy
 });
 
 /// A whole model state, in the variables' order: the key a walk visits and
+/// memoises the model's own answers by.
 fn flat(st: &State) -> Vec<i64> {
     st.values().copied().collect()
 }
@@ -402,6 +423,7 @@ fn flat(st: &State) -> Vec<i64> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Hold {
     /// An account that has not served a response yet is out, and its
+    /// canary's hold stands.
     Canary,
     /// The hour's rotations are spent.
     Breaker,
@@ -413,6 +435,7 @@ enum Hold {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Verdict {
     /// Relaunch under the model's account `to`: by a rotation, in the place
+    /// of a canary that did not answer (`takes`), or following.
     Move {
         to: i64,
         rotates: bool,
@@ -426,6 +449,7 @@ enum Verdict {
     /// At a plain turn end, no move.
     Stay,
     /// Advice the model has no word for at this point: a probe, a wall with
+    /// no instant to wait for.
     Other(String),
 }
 
@@ -435,12 +459,16 @@ enum Ask {
     /// Its own: its wall where its account is limited, else a plain turn end.
     ItsPoint,
     /// Its own, where the model has it at the notice of a wall the owner lifted
+    /// ([`ask_of`]): a wall whose row was written before the owner cleared the
+    /// account, which is no longer limited.
     Notice,
     /// A plain turn end, whatever its account: on a limited one, the wall is
+    /// one another tab recorded.
     TurnEnd,
 }
 
 /// The real advice for session `i`, and whether the point it was asked at is
+/// its wall.
 type Advisor = fn(&World, &accounts::State, usize, Ask, i64) -> (Advice, bool);
 
 fn at_its_wall(w: &World, real: &accounts::State, i: usize, now: i64) -> bool {
@@ -452,6 +480,7 @@ fn at_its_wall(w: &World, real: &accounts::State, i: usize, now: i64) -> bool {
 }
 
 /// The point the model has session `i` at in `st`, as it is asked about: the
+/// notice of a wall the owner lifted, or its own point.
 fn ask_of(st: &State, i: usize) -> Ask {
     if st[NOTICES[i]] == 1 {
         Ask::Notice
@@ -461,6 +490,7 @@ fn ask_of(st: &State, i: usize) -> Ask {
 }
 
 /// Whether session `i`, asked at `ask`, stands at a wall — and, at the notice
+/// of one the owner lifted, when the row it stands at was written.
 fn wall_of(w: &World, real: &accounts::State, i: usize, ask: Ask, now: i64) -> (bool, Option<i64>) {
     match ask {
         Ask::Notice => (true, Some(NOW - NOTICE_ROW_S)),
@@ -470,6 +500,7 @@ fn wall_of(w: &World, real: &accounts::State, i: usize, ask: Ask, now: i64) -> (
 }
 
 /// The roster's two askers, which share one signature: `accounts::advise`
+/// and `accounts::advise_past_probe`.
 type Asker = fn(&Roster, &accounts::State, &BTreeSet<String>, &Me<'_>, &Point, Mode, i64) -> Advice;
 
 /// `asker` for session `i`, at its wall or at a plain turn end, under `mode`.
@@ -516,6 +547,7 @@ fn advise_at(
 }
 
 /// The real `accounts::advise_past_probe` for session `i` ([`asked_at`]): what a
+/// host hands on beside a due probe, and what its commit re-asks.
 fn advise_past_at(
     w: &World,
     real: &accounts::State,
@@ -557,6 +589,7 @@ fn advise(w: &World, real: &accounts::State, i: usize, ask: Ask, now: i64) -> (A
 }
 
 /// Today's rule (a negative control): with no roster a usage wall is waited out, and
+/// nothing else is done.
 fn todays_rule(w: &World, real: &accounts::State, i: usize, ask: Ask, now: i64) -> (Advice, bool) {
     let (at_wall, _) = wall_of(w, real, i, ask, now);
     let advice = if at_wall {
@@ -608,6 +641,7 @@ fn freed(st: &State, i: usize) -> State {
 }
 
 /// A model, and how a step of it is taken: by name ([`Model`]), or on its
+/// resolved form ([`Resolving`]), where the graph asks it of every state.
 trait Rule {
     fn model(&self) -> &Model;
 
@@ -627,6 +661,7 @@ impl Rule for Model {
 }
 
 /// A model with its [`Resolution`]: the same first successor, without the
+/// string-keyed environment a step by name builds.
 struct Resolving<'m> {
     m: &'m Model,
     at: &'m Resolution,
@@ -647,6 +682,8 @@ impl Rule for Resolving<'_> {
 }
 
 /// The move the model's `action` makes for session `i` from `free`, where it
+/// is enabled: a rotation where the model counts one, a take of the canary's
+/// place where the account moved onto has not served a response.
 fn the_models_move(
     rule: &(impl Rule + ?Sized),
     action: &str,
@@ -665,6 +702,7 @@ fn the_models_move(
 }
 
 /// What the model tells session `i` at `st`, with the host free and awake: read off
+/// its own guards (`Move…`, `Wait…`), never restated here.
 fn expected(rule: &(impl Rule + ?Sized), st: &State, i: usize) -> Verdict {
     let m = rule.model();
     let free = freed(st, i);
@@ -694,16 +732,18 @@ fn expected(rule: &(impl Rule + ?Sized), st: &State, i: usize) -> Verdict {
 }
 
 /// What the model tells session `i` at a plain turn end on a limited account
+/// (`Leave…`): the move, or a stay.
 fn expected_leaving(rule: &(impl Rule + ?Sized), st: &State, i: usize) -> Verdict {
     the_models_move(rule, LEAVES[i], &freed(st, i), i, true).unwrap_or(Verdict::Stay)
 }
 
-/// The same move, or no move on either side. What is compared on a real
+/// The same move, or no move on either side.
 fn the_move(v: &Verdict) -> Option<&Verdict> {
     matches!(v, Verdict::Move { .. }).then_some(v)
 }
 
 /// What a model action decides for a session, where it is a session's decision: the
+/// supervisor's own steps, and the defects that stand in for them.
 enum Decision {
     Move {
         to: i64,
@@ -715,7 +755,7 @@ enum Decision {
     Resumes,
 }
 
-/// The session a model action decides for, at which point, and what. A
+/// The session a model action decides for, at which point, and what.
 fn decision(action: &str, before: &State, after: &State) -> Option<(usize, Ask, Decision)> {
     let moved = |i: usize, ask: Ask, sound: bool| {
         let rotates = after["rot"] != before["rot"];
@@ -751,7 +791,7 @@ fn decision(action: &str, before: &State, after: &State) -> Option<(usize, Ask, 
     }
 }
 
-/// Whether the real advice is the model's decision. A wait with the agent's
+/// Whether the real advice is the model's decision.
 fn agrees(decided: &Decision, real: &Verdict, jobs_hold: bool) -> bool {
     match decided {
         Decision::Move { to, rotates, takes } => matches!(
@@ -764,12 +804,15 @@ fn agrees(decided: &Decision, real: &Verdict, jobs_hold: bool) -> bool {
 }
 
 /// The busy work of the turn that ended at a point: real work, so no
+/// short-turn back-off stands between a plain turn end and its continuation.
 const REAL_WORK: Duration = Duration::from_secs(30 * 60);
 
 /// The notice a session at its wall shows: the session window's, as
+/// [`WINDOW`] is.
 const NOTICE: &str = "You've hit your session limit · resets 3pm";
 
 /// The supervisor's two clocks as one: the `Instant` that is the unix second [`NOW`],
+/// read once a test, so every decision is made on a fixed clock.
 #[derive(Debug, Clone, Copy)]
 struct Clock(Instant);
 
@@ -786,6 +829,7 @@ impl Clock {
 }
 
 /// A plain turn end as the loop reads it: idle, an empty composer, a task,
+/// in a session whose host relaunches it.
 fn turn_end(worked: Option<Duration>) -> TurnEndReading {
     TurnEndReading {
         phase: Phase::Idle,
@@ -851,6 +895,7 @@ fn turn_end(worked: Option<Duration>) -> TurnEndReading {
 }
 
 /// A turn that ended on the session window's limit, whose notice names
+/// `reset`.
 fn limit(reset: Instant, worked: Option<Duration>) -> TurnEndReading {
     TurnEndReading {
         wall: Some(WallKind::UsageSession),
@@ -872,14 +917,19 @@ fn unadvised(reading: &TurnEndReading) -> TurnEndReading {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Host {
     /// One that keeps the roster: asked about the loop's point, it answers with the
+    /// advice as a window's host builds it ([`mapped`]).
     Roster,
     /// Today's host (a negative control): it advises nothing (`IdleHost::account`'s
+    /// default).
     NoRoster,
     /// A host that hands the roster's advice over with no opening
+    /// ([`AccountAdvice::of_roster`]): a session held at its wall waits out its hold,
+    /// or the hour, whole.
     Uncut,
 }
 
 /// Where session `i` was asked: its point, the date of the row it stands at
+/// where the walk dates one, and the mode.
 #[derive(Debug, Clone, Copy)]
 struct Place {
     i: usize,
@@ -889,6 +939,10 @@ struct Place {
 }
 
 /// The roster's advice as the policy takes it, built as a window's host builds it:
+/// `advice` (what the roster answered at `place`), the roster's real next opening,
+/// and, only where `advice` is the probe, what the roster advises past it
+/// (`accounts::advise_past_probe` on the same state, point, mode and second), all
+/// through [`AccountAdvice::of_roster_at`].
 fn mapped(
     w: &World,
     real: &accounts::State,
@@ -918,6 +972,10 @@ fn mapped(
 }
 
 /// The host asked about `point` for session `i` (aterm-gui's `account_advice`): the
+/// real `advise` under `mode` at the loop's point (a turn end, or a usage limit the
+/// host takes for the roster's only where it is the session's process's own; no
+/// session here shows a limit another process wrote), through the policy's own
+/// mapping.
 fn hosted(
     w: &World,
     real: &accounts::State,
@@ -939,6 +997,7 @@ fn hosted(
 }
 
 /// One decision of the loop's for a session (`turn_end_loop.rs`: `observe`, then
+/// `account_advise`, then `decide_turn_end`).
 #[derive(Debug, Clone)]
 struct Round {
     /// The point the host was asked about; `None`: it was not asked.
@@ -952,6 +1011,9 @@ struct Round {
 }
 
 /// The loop's order, which is part of what is bound: the point is folded in; the host
+/// is asked where, and only where, the policy has a point for it
+/// (`TurnEndState::account_point`), on the state after the fold; its answer goes on
+/// the reading; the decision is made on both.
 fn round(
     te: &mut TurnEndState,
     mut reading: TurnEndReading,
@@ -980,10 +1042,13 @@ fn round(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Asked {
     /// The host is asked to relaunch it under the model's account `to` — at
+    /// its wall, or ahead of one — under `account-rotate@v1`, and where the
+    /// relaunch is not made the point gets exactly today's action.
     Move { to: i64, ahead: bool },
     /// Its wall is waited out: until today's instant, or a sooner one.
     Waits,
     /// The wall's own continuation, typed at once by the limit-resume rule
+    /// where today's rule waits: the notice of a wall the owner lifted.
     Resume,
     /// Exactly today's action, at a point that is not waited at.
     Today,
@@ -1020,6 +1085,7 @@ fn asked(w: &World, r: &Round) -> Asked {
 }
 
 /// What the model has the decider ask, read off what it tells the session
+/// ([`expected`], [`expected_leaving`]).
 fn wanted(told: &Verdict) -> Asked {
     match told {
         Verdict::Move { to, ahead, .. } => Asked::Move {
@@ -1034,6 +1100,7 @@ fn wanted(told: &Verdict) -> Asked {
 }
 
 /// The same move asked, or no move asked on either side ([`the_move`]'s
+/// reason: the probe).
 fn the_ask(a: &Asked) -> Option<&Asked> {
     matches!(a, Asked::Move { .. }).then_some(a)
 }
@@ -1055,6 +1122,10 @@ struct Decided {
 }
 
 /// The real decider for session `i` of `real`, at the point `ask`: a `TurnEndState`
+/// that has seen nothing before it; the turn's end as the loop reads it (on its
+/// account's limit where the session is at its wall, with the reset on record, or the
+/// one a lifted wall's notice still names; else a plain turn end); the host asked as
+/// the loop asks it; and `advisor`'s advice handed over as a host hands it.
 #[allow(clippy::too_many_arguments)]
 fn decide(
     w: &World,
@@ -1113,7 +1184,7 @@ fn decide(
     Decided { te, round, asked }
 }
 
-/// Whether what the real decider asks is the model's decision. A wait with the
+/// Whether what the real decider asks is the model's decision.
 fn asks(decided: &Decision, real: &Asked, jobs_hold: bool) -> bool {
     match decided {
         Decision::Move { to, .. } => matches!(real, Asked::Move { to: t, .. } if t == to),
@@ -1123,6 +1194,7 @@ fn asks(decided: &Decision, real: &Asked, jobs_hold: bool) -> bool {
 }
 
 /// The wait's instant, by the model's reason for it: `Ok` where the real decider's
+/// wait ends when that reason does.
 fn the_wait_ends(
     w: &World,
     real: &accounts::State,
@@ -1155,6 +1227,8 @@ fn the_wait_ends(
 }
 
 /// The session a model action types a continuation of a move's own into, and
+/// where that move was made: `Resumed…`'s at the session's wall, the
+/// defect's ahead of one.
 fn typed_after_a_move(action: &str) -> Option<(usize, AccountAt)> {
     match action {
         "Resumed1" => Some((0, AccountAt::Wall)),
@@ -1165,6 +1239,10 @@ fn typed_after_a_move(action: &str) -> Option<(usize, AccountAt)> {
 }
 
 /// Whether the real code types a continuation of the move's own into a
+/// session just relaunched under the account labelled `to` by a move made
+/// `at`, at `now`: the relaunch's last step (`relaunch::carried_quietly` on
+/// the record's cause, `account:<label>`), or the policy's (`restarted`, and
+/// the wall's resume owed then).
 fn a_moves_own_continuation(to: &str, at: AccountAt, now: Instant) -> bool {
     let relaunch_types = !relaunch::carried_quietly(&format!("account:{to}"), false);
     let mut te = TurnEndState::new(TurnEndTiming::default());
@@ -1177,6 +1255,8 @@ fn a_moves_own_continuation(to: &str, at: AccountAt, now: Instant) -> bool {
 }
 
 /// A move made, on the policy's side: the model's `Move…` / `Leave…` of the session
+/// whose decision `d` asked for it, recorded as `restart_agent` records an adopted
+/// relaunch (`restarted(.., true, ..)`).
 #[allow(clippy::too_many_arguments)]
 fn a_move_made(
     w: &World,
@@ -1289,6 +1369,8 @@ fn a_move_made(
 }
 
 /// The owner lifted the wall session `i` stands at (the model's `Use…` of its
+/// account, mirrored through the real `pin`: `before` is the real state the wall was
+/// on record in, `after` the one the pin left, at `now`).
 #[allow(clippy::too_many_arguments)]
 fn the_owners_clearing(
     w: &World,
@@ -1377,6 +1459,7 @@ struct Bounds {
 }
 
 /// Around an ask: the session's own bounds, which no model state carries, tried on
+/// the decision `d` wherever it asks for a move.
 fn around_an_ask(
     w: &World,
     st: &State,
@@ -1472,6 +1555,7 @@ fn around_an_ask(
 }
 
 /// The `wall` mode, the control (`[harness] accounts = "wall"`: move only at the
+/// wall, no rotation ahead of a limit, no probe).
 fn under_wall_mode(
     w: &World,
     st: &State,
@@ -1652,22 +1736,29 @@ struct Walk {
     fired: BTreeMap<&'static str, usize>,
     off: Vec<Off>,
     /// What the real decider asked, over every state and both sessions at
+    /// their own points: a move, a wait, today's action.
     moves: usize,
     waits: usize,
     todays: usize,
     /// …and the wall's own continuation, at the notice of one the owner
+    /// lifted.
     resumes: usize,
     /// The moves the real decider asked of a session at a plain turn end on a
+    /// limited account (`Leave…`).
     leaving_moves: usize,
     /// How many of the model's moves were made on the policy's side.
     made: usize,
     /// The asks the session's own bounds were tried around.
     bounds: Bounds,
     /// The rotations ahead of a wall that `[harness] accounts = "wall"`
+    /// does not advise ([`under_wall_mode`]): where the two modes differ.
     wall_withholds: usize,
     /// The sessions with nothing usable whose wait was read a minute from a
+    /// window's reset.
     woken: usize,
     /// The sessions held for the canary or the breaker whose wait was read a
+    /// minute from a window's reset, and how many of those the same advice
+    /// with no opening left asleep past it.
     held_woken: usize,
     held_asleep: usize,
     /// The sessions at the wall of the account the owner pinned.
@@ -1696,6 +1787,8 @@ impl Walk {
     }
 
     /// What the real code found at a projection of the model state (see
+    /// [`Lane`]) — its counts and the places it parted from the model —
+    /// found again at `state`, one of the model states that share it.
     fn add(&mut self, found: &Walk, strict: bool, state: &Arc<State>) {
         self.moves += found.moves;
         self.waits += found.waits;
@@ -1717,6 +1810,7 @@ impl Walk {
 }
 
 /// A rotation the real advice asks of session `i`, tried and taken back, and
+/// raced by the other session.
 fn around_a_rotation(w: &World, m: &Model, st: &State, base: &accounts::State, i: usize) {
     let (
         Advice::Move {
@@ -1809,6 +1903,7 @@ fn around_a_rotation(w: &World, m: &Model, st: &State, base: &accounts::State, i
 }
 
 /// A take of the canary's place the real advice asks of session `i`, tried
+/// and given up, and raced by the other session.
 fn around_a_take(w: &World, m: &Model, st: &State, base: &accounts::State, i: usize) {
     let taking = |advice: Advice| match advice {
         Advice::Move {
@@ -1880,6 +1975,8 @@ fn around_a_take(w: &World, m: &Model, st: &State, base: &accounts::State, i: us
 }
 
 /// The real code, as the walk asks it: `advisor` answers for the roster (the real
+/// `advise`, or today's rule in its place) and `host` is whether the session's host
+/// hands that answer to the decider at all.
 struct Lane<'a> {
     w: &'a World,
     m: &'a Model,
@@ -1894,9 +1991,11 @@ struct AtState {
     /// The projection, as the real code was handed it.
     st: Arc<State>,
     /// Its own counts and disagreements: the projection read back, and what
+    /// the decider asked.
     found: Walk,
     base: accounts::State,
     /// Each session's own point, as the model has it there: its wall, a
+    /// plain turn end, or the notice of a wall the owner lifted.
     own: [Ask; 2],
     told: [Verdict; 2],
     /// A session on a limited account, asked at a plain turn end.
@@ -1906,14 +2005,19 @@ struct AtState {
 }
 
 /// One edge of the walk as the real code is shown it, and what the model says
+/// at its two ends: everything [`Lane::at_edge`] reads, so the key of what it
+/// finds.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Edge {
     from: Shown,
     action: &'static str,
     to: Shown,
     /// The agent's jobs run at the state the edge leaves, which is the host's
+    /// and no [`SHOWN`] variable, and the edge is session 1's decision: a wait
+    /// is then the host's refusal of whatever was advised.
     jobs_hold: bool,
     /// What the model tells both sessions at the state the edge leaves, and
+    /// at the one it reaches (`None` for a defect: that state is no one's).
     held: [Verdict; 2],
     after: Option<[Verdict; 2]>,
 }
@@ -1933,7 +2037,7 @@ impl Lane<'_> {
         )
     }
 
-    /// The real code at the projection `st`. A disagreement is collected here
+    /// The real code at the projection `st`.
     fn at_state(&self, key: &Shown) -> AtState {
         let (w, m, advisor) = (self.w, self.m, self.advisor);
         let st = Arc::new(shown_state(key));
@@ -1980,6 +2084,7 @@ impl Lane<'_> {
     }
 
     /// What the real code is tried around at a state, which only a strict walk
+    /// does.
     fn around(&self, here: &AtState) -> Walk {
         let (w, m, st, base) = (self.w, self.m, &*here.st, &here.base);
         let mut found = Walk::default();
@@ -2004,6 +2109,9 @@ impl Lane<'_> {
     }
 
     /// The real code on an edge from the projection `here`: what the action decides
+    /// for a session is what that session was advised at this state, at the point the
+    /// action stands for, and what it does to the state is what the real transaction
+    /// does.
     fn at_edge(&self, here: &AtState, edge: &Edge) -> Walk {
         let Lane {
             w,
@@ -2172,15 +2280,19 @@ impl Lane<'_> {
 }
 
 /// The model's half of a walk: every state of `m` the sound rule reaches, in the
+/// walk's order (breadth first from `Init`), what the model tells both sessions at
+/// each, and each step it takes from each.
 struct Graph {
     m: Model,
     /// Every state reached, in the walk's order.
     nodes: Vec<Node>,
     /// How many states the sound rule reached: every node, and — where the
+    /// graph stops at a broken law — the states queued behind it.
     reached: usize,
     /// Each projection ([`Shown`]) of a node, in the order first visited.
     shown: Vec<Shown>,
     /// Each edge as the real code is shown it ([`Edge`]), in the order first
+    /// taken, and the projection it leaves (an index into `shown`).
     edges: Vec<(usize, Edge)>,
 }
 
@@ -2194,8 +2306,10 @@ struct Node {
     /// What the model tells both sessions here ([`expected`]).
     held: [Verdict; 2],
     /// What it tells a session on a limited account at a plain turn end
+    /// ([`expected_leaving`]); `None` for a session on any other account.
     leaving: [Option<Verdict>; 2],
     /// Each action enabled here, in the model's order, and its edge (an index
+    /// into [`Graph::edges`]).
     steps: Vec<(&'static str, usize)>,
 }
 
@@ -2211,6 +2325,7 @@ fn sound_steps<'g>(
 }
 
 /// A map key and its hash, computed where the graph's work is spread over the cores,
+/// so the one-at-a-time merge only probes (hashing dominated building the graph).
 struct Hashed<K> {
     hash: u64,
     key: K,
@@ -2279,6 +2394,7 @@ struct Step {
 /// The state a [`Step`] reaches.
 enum Reaches {
     /// A defect's, which the walk does not go on from: as the real code is
+    /// shown it.
     Defect(Box<Shown>),
     /// A state reached before: its index.
     Reached(usize),
@@ -2287,6 +2403,8 @@ enum Reaches {
 }
 
 /// A model resolved once ([`Resolved`]: its successors and laws, case for case
+/// and in the same order, on a state's values), and where its [`SHOWN`]
+/// variables sit in a state's values.
 struct Resolution {
     resolved: Resolved,
     shown: [usize; SHOWN.len()],
@@ -2301,6 +2419,7 @@ impl Resolution {
 }
 
 /// The model at `st`: its laws, and its first successor by each action — by
+/// its index, where it is among the states `reached` so far.
 fn expand(
     m: &Model,
     at: &Resolution,
@@ -2343,7 +2462,7 @@ fn expand(
 }
 
 impl Graph {
-    /// The graph of `m`. `strict`: for strict walks alone, which stop at the first
+    /// The graph of `m`.
     fn of(m: Model, strict: bool) -> Graph {
         let at = Resolution::of(&m);
         let init = m.init_state();
@@ -2470,6 +2589,7 @@ impl Graph {
 }
 
 /// The graph of the committed model, built once a process and walked by every lane
+/// that asks about it (the Tier-1 walk's two readings and today's rule).
 fn sound() -> &'static Graph {
     static SOUND: OnceLock<Graph> = OnceLock::new();
     SOUND.get_or_init(|| Graph::of(supervisor_account_rotation_model(), false))
@@ -2479,8 +2599,10 @@ fn sound() -> &'static Graph {
 enum Slot<T> {
     Done(T),
     /// It panicked: the payload, raised where the walk meets the job
+    /// ([`Slot::get`]).
     Panicked(Mutex<Option<Box<dyn Any + Send>>>),
     /// Not run: an earlier job of its pool panicked, or the job it needs did,
+    /// and the walk meets that one first.
     Skipped,
 }
 
@@ -2493,6 +2615,9 @@ impl<T> Slot<T> {
     }
 
     /// The job's value, or its panic raised here, on the walk's thread: the
+    /// message again (the job's thread printed it with the place it was
+    /// raised), so the test fails with the message a walk asking one state at
+    /// a time failed with.
     fn get(&self) -> &T {
         let payload = match self {
             Slot::Done(value) => return value,
@@ -2524,6 +2649,7 @@ impl<T> Slot<T> {
 }
 
 /// `job` at every index below `n`, spread over the machine's cores, each result at
+/// its own index.
 fn pooled<T: Send>(n: usize, job: impl Fn(usize) -> Option<T> + Sync) -> Vec<Slot<T>> {
     let next = AtomicUsize::new(0);
     let first_panic = AtomicUsize::new(usize::MAX);
@@ -2573,11 +2699,15 @@ fn pooled<T: Send>(n: usize, job: impl Fn(usize) -> Option<T> + Sync) -> Vec<Slo
 }
 
 /// What a walk asks of the real code: the projections it judges and the edges it
+/// takes.
 #[derive(Clone, Copy)]
 struct Part {
     /// Every projection judged against the model's answers at its states (and,
+    /// in a strict walk, the model's laws there and the bounds tried around
+    /// it); else only the projections the edges taken leave, as those edges
+    /// read them.
     states: bool,
-    /// The actions whose edges are taken. Every action's firings are counted
+    /// The actions whose edges are taken.
     edges: fn(&str) -> bool,
 }
 
@@ -2589,7 +2719,7 @@ impl Part {
     };
 }
 
-/// Walk the graph `g` with the real code, the `part` of it asked. `strict` asserts the
+/// Walk the graph `g` with the real code, the `part` of it asked.
 fn walk(w: &World, g: &Graph, advisor: Advisor, host: Host, strict: bool, part: Part) -> Walk {
     let lane = Lane {
         w,
@@ -2788,6 +2918,10 @@ fn tier1_the_real_advice_and_transactions_are_the_models_at_every_reachable_stat
 }
 
 /// Negative controls: every defect of the `Buggy = 1` model, at every state the sound
+/// rule reaches where it can fire, is disagreed with (the supervisor's by the real
+/// advice and by the real decider fed it, the world's unread wall by the real
+/// recorder, the carry-on after an early move by the real relaunch rule and policy);
+/// and today's rule is not the model, in place of `advise` or as the decider's host.
 #[test]
 fn the_defects_and_todays_rule_disagree_with_the_real_code() {
     let w = World::by_label();
@@ -2933,6 +3067,8 @@ fn the_defects_and_todays_rule_disagree_with_the_real_code() {
 }
 
 /// One real state, begun empty and changed only by the real transactions and a real
+/// clock, kept in step with the model, which runs at the real bound so nothing is
+/// seeded.
 struct InStep {
     w: World,
     m: Model,
@@ -2976,6 +3112,7 @@ impl InStep {
     }
 
     /// What the roster advises session `i` past a due probe
+    /// (`accounts::advise_past_probe`), at the point the model has it at.
     fn told_past(&self, i: usize) -> Advice {
         let (at_wall, written) = wall_of(&self.w, &self.real, i, ask_of(&self.st, i), self.now);
         advise_past_at(
@@ -3059,6 +3196,7 @@ impl InStep {
     }
 
     /// The model's `Lapse` and the real clock at the end of the canary's ten
+    /// minutes.
     fn lapse(&mut self) {
         let before = self.st.clone();
         assert!(self.m.fire("Lapse", &mut self.st), "Lapse at {before:?}");
@@ -3176,6 +3314,8 @@ fn a_real_history_from_an_empty_state_stays_in_step_with_the_model() {
 }
 
 /// The breaker, at the real bound and from an empty state: two accounts take turns at
+/// their walls, each lifting before the other's is hit, and the seventh wall inside
+/// the hour is waited out.
 #[test]
 fn six_rotations_in_an_hour_are_the_bound_and_the_seventh_wall_is_waited_out() {
     let mut h = InStep::begin(5 * MIN);
@@ -3246,6 +3386,7 @@ fn six_rotations_in_an_hour_are_the_bound_and_the_seventh_wall_is_waited_out() {
 }
 
 /// The canary that never answers, from an empty state: the session that rotated
+/// alone sits on the account it chose and never gets a response.
 #[test]
 fn a_canary_that_never_answers_is_replaced_by_the_next_session_after_its_hold() {
     let mut h = InStep::begin(4 * HOUR);
@@ -3326,7 +3467,7 @@ fn a_canary_that_never_answers_is_replaced_by_the_next_session_after_its_hold() 
     assert_eq!(h.told(1), take);
 }
 
-/// Proof travels with the account, from an empty state. A wall is recorded on the
+/// Proof travels with the account, from an empty state.
 #[test]
 fn a_strike_goes_back_to_an_account_that_never_served_as_unproven() {
     let onto = |takes_canary: bool| Advice::Move {
@@ -3409,6 +3550,10 @@ fn a_strike_goes_back_to_an_account_that_never_served_as_unproven() {
 }
 
 /// The decider carried: [`InStep`]'s real accounts state and its model, and beside
+/// them each session's real `TurnEndState`, carried from its first point on and
+/// changed only as the loop changes it: a point folded in and decided ([`round`]), an
+/// act typed (`acted`), a restart recorded (`restarted`), a move's answer told
+/// (`account_told`).
 struct Carried {
     h: InStep,
     clock: Clock,
@@ -3422,6 +3567,7 @@ struct Carried {
 
 impl Carried {
     /// Both sessions' first turns end with work and no wall, and are carried
+    /// on as today.
     fn begin(wall_s: i64) -> Carried {
         let mut c = Carried {
             h: InStep::begin(wall_s),
@@ -3454,6 +3600,8 @@ impl Carried {
     }
 
     /// Session `i`'s turn ran and ended, on the limit whose notice names `wall` or on
+    /// none, and what that says of a move of its own not yet answered is told
+    /// (`account_answer`, `account_told`: the loop's first step at a point).
     fn turn_ends(&mut self, i: usize, wall: Option<i64>) -> Option<AccountAnswer> {
         self.screen[i] = wall;
         self.worked[i] = Some(REAL_WORK);
@@ -3466,6 +3614,7 @@ impl Carried {
     }
 
     /// One decision for session `i` at what its screen shows now, the host answering
+    /// with the real advice on the real state.
     fn ask(&mut self, i: usize) -> Round {
         let at = self.at();
         let worked = self.worked[i].take();
@@ -3498,6 +3647,7 @@ impl Carried {
     }
 
     /// The model's wall on an account, and the turns of `sessions` ending on
+    /// it.
     fn wall(&mut self, action: &str, sessions: &[usize]) {
         self.h.step(action);
         let reset = self.h.now + self.h.wall_s;
@@ -3519,6 +3669,8 @@ impl Carried {
     }
 
     /// The host could not make the relaunch `r` asks for, and says `word`: what it
+    /// committed for the move is taken back exactly (`Strike::NotMoved`), and the
+    /// loop does with the word what `restart_agent` does.
     fn not_made(&mut self, i: usize, r: &Round, word: &str) {
         let (why, otherwise) = Carried::restart(r);
         let Restart::Account { to, .. } = why else {
@@ -3569,6 +3721,7 @@ impl Carried {
     }
 
     /// The host made the relaunch `r` asks for: the model's `action`, the real
+    /// transaction, and `restarted(.., true, ..)`.
     fn make(&mut self, i: usize, r: &Round, action: &str) {
         let (why, _) = Carried::restart(r);
         let Asked::Move { to, .. } = self.said(r) else {
@@ -3584,6 +3737,9 @@ impl Carried {
     }
 
     /// Session `i`'s first point after a move, at the relaunched prompt: the host is
+    /// asked nothing, the relaunch typed nothing, and the point's own act is `rule`'s
+    /// (the wall's resume after a move at a wall, the continue policy's after one
+    /// ahead of a wall), and is typed.
     fn first_act(&mut self, i: usize, rule: &str) {
         let first = self.ask(i);
         assert_eq!(first.point, None, "{:?}", first.action);
@@ -3592,7 +3748,7 @@ impl Carried {
     }
 }
 
-/// The session's own bounds along one carried history (design §6, "Bounds. Per
+/// The session's own bounds along one carried history (design §6, "Bounds.
 #[test]
 fn the_sessions_own_bounds_part_from_the_model_only_toward_todays_rule() {
     let mut c = Carried::begin(20 * MIN);
@@ -3736,6 +3892,8 @@ fn the_sessions_own_bounds_part_from_the_model_only_toward_todays_rule() {
 }
 
 /// The first turn under the new login is the model's `Served` or its `Strike`: what
+/// the real decider reads off the point after its own move (`account_answer`) is the
+/// model's step the host then takes.
 #[test]
 fn the_first_turn_under_the_new_login_is_the_models_served_or_its_strike() {
     let mut c = Carried::begin(4 * HOUR);

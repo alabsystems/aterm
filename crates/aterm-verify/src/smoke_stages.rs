@@ -15,7 +15,7 @@ use crate::smoke::{
     socket_listening,
 };
 
-/// Does a reply say `OK` and a field (`OK <…>`)? Every counter is then read by
+/// Does a reply say `OK` and a field (`OK <…>`)?
 fn ok_reply(reply: &str) -> bool {
     reply.starts_with("OK ")
 }
@@ -24,8 +24,11 @@ fn ok_reply(reply: &str) -> bool {
 pub const SMOKE_CONFIG: &str = "cursor_trail_style = \"rainbow kitty pet\"\ncursor_momentum_glow = true\ntrail_sounds = true\n";
 
 /// Late (`past`) `cursor_effect` arms the burst may book: healthy effects-on
+/// bursts arm ~430 deadlines and book 0-2 late, so four leaves two of headroom.
 const CURSOR_EFFECT_LATE_MAX: u64 = 4;
 /// …and as a share of the owner's arms, so a burst that armed little cannot pass
+/// on the absolute bound alone: more than one late arm in fifty fails once more
+/// than one arm was late.
 const CURSOR_EFFECT_LATE_SHARE_DEN: u64 = 50;
 
 /// The `cursor_effect` owner's `arms/past` out of a `metrics` reply's `deadline_arms_by_owner=owner:arms/past,...` ledger.
@@ -85,25 +88,36 @@ pub fn effects_verdict(reply: &str) -> Result<String, String> {
 }
 
 /// 30 hardware keys at ~20/s, then a second to settle — a human-shaped light
+/// typing burst, deliberately not a socket-flood test.
 const BURST_KEYS: usize = 30;
 const BURST_GAP: Duration = Duration::from_millis(50);
 const SETTLE: Duration = Duration::from_secs(1);
 
 /// The input->present ceiling, on the true maximum (`>=` fails) and on the
+/// bucketed p99 (`>` fails): far over a healthy burst's maximum (under 10 ms,
+/// OS queue residence included, effects on or off) and far under a lost-wake
+/// build's 300-530 ms worst case.
 const INPUT_PRESENT_CEILING_MS: u64 = 250;
 /// Frames the window must present over the burst: a healthy build presents one
+/// or more per key (30+ even with the effects off), a lost-wake build ~10.
 const FRAMES_FLOOR: u64 = 15;
 /// Hardware keys that must reach the `KeyboardInput` arm (`n_key_write`) before
+/// any hardware slice verdict means anything: half the burst, the frames
+/// floor's ratio.
 const HW_KEY_WRITE_FLOOR: u64 = 15;
 /// Input→present samples the burst must book (`n_input`, one per presented key)
+/// before the input→present ceilings mean anything, at the same ratio: a burst
+/// that booked none would pass both on a maximum of 0 ms.
 const HW_INPUT_FLOOR: u64 = 15;
-/// `key->write` p99 ceiling, OS queue residence included. A healthy release
+/// `key->write` p99 ceiling, OS queue residence included.
 const KEY_WRITE_P99_CEILING_MS: u64 = 40;
 /// Worst wait for the terminal mutex at the key-press site (presses and
+/// releases, which `key->write` does not sample).
 const TERM_WAIT_PRESS_MAX_CEILING_MS: u64 = 25;
-/// Drawable-acquire p99 ceiling: three 60 Hz frames. Live windows read
+/// Drawable-acquire p99 ceiling: three 60 Hz frames.
 const ACQUIRE_P99_CEILING_MS: u64 = 50;
 /// Present->glass p99 ceiling: the compositor leg, `presentDrawable:`
+/// registration to the drawable's `presentedTime`.
 const PRESENT_GLASS_P99_CEILING_MS: u64 = 50;
 /// The socket-listen budget.
 pub const SOCKET_POLLS: usize = 600;
@@ -121,6 +135,7 @@ struct Sandbox {
 
 impl Sandbox {
     /// A fresh sandbox whose `aterm.toml` starts with `extra` lines, ahead of the
+    /// fixed tables (top-level keys must precede the first `[table]`).
     fn with_config(tag: &str, extra: &str) -> Option<Self> {
         let tmp = crate::mktemp_dir(tag).ok()?;
         std::fs::create_dir(tmp.join("home")).ok()?;
@@ -155,7 +170,7 @@ impl Sandbox {
         self.rundir.join("aterm/aterm.sock")
     }
 
-    /// Reap the child and remove the sandbox. A teardown that could not retire
+    /// Reap the child and remove the sandbox.
     fn teardown(&mut self, r: &mut Report) {
         if let Some(mut child) = self.child.take() {
             let (ok, _) = retire_smoke_child(&mut child);
@@ -182,6 +197,7 @@ enum Ready {
 }
 
 /// Launch the handed bundle's `aterm-gui` in `sb` and wait for its control
+/// socket; the bundle's `aterm-ctl` drives it.
 fn bring_up(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, bundle: &crate::MeasureArtifact) -> Ready {
     let tag = "gui smoke";
     let (gui, ctl) = (bundle.bin("aterm-gui"), bundle.bin("aterm-ctl"));
@@ -208,11 +224,7 @@ fn bring_up(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, bundle: &crate::Measure
         }
     };
     let mut cmd = Command::new(&gui);
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("ATERM_") {
-            cmd.env_remove(name);
-        }
-    }
+    gui_env(ctx, &mut cmd);
     cmd.current_dir(&ctx.root)
         .env("PATH", &ctx.path_env)
         .env("HOME", sb.tmp.join("home"))
@@ -241,6 +253,23 @@ fn bring_up(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, bundle: &crate::Measure
     Ready::Stopped
 }
 
+/// The smoke instance's inherited environment: no `ATERM_*` session, capability, handoff,
+/// fabric or update authority (its own bindings are set after this removal), and the run's
+/// mark (`ATERM_VERIFY_RUN`, [`crate::runs::VERIFY_RUN_ENV`]) every child of a run carries,
+/// so a run killed while the instance is up leaves it to the next run's start pass to judge.
+fn gui_env(ctx: &Ctx, cmd: &mut Command) {
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("ATERM_") {
+            cmd.env_remove(name);
+        }
+    }
+    for (name, value) in &ctx.child_env_add {
+        if name == crate::runs::VERIFY_RUN_ENV {
+            cmd.env(name, value);
+        }
+    }
+}
+
 /// What the smoke's listen wait found ([`wait_to_listen`]).
 #[derive(Debug, PartialEq, Eq)]
 enum Listen {
@@ -253,6 +282,7 @@ enum Listen {
 }
 
 /// [`SOCKET_POLLS`] looks at `exited` and then `up`, `gap` apart ([`POLL_GAP`]
+/// in a real run), and one last look at `up` after them.
 fn wait_to_listen(
     gap: Duration,
     mut exited: impl FnMut() -> bool,
@@ -313,6 +343,8 @@ pub fn gui_typing_smoke(ctx: &Ctx, r: &mut Report) {
 }
 
 /// Frontmost, first present, reset, the paced HARDWARE burst, settle; then the
+/// effects verdict on the `metrics` summary ([`effects_verdict`]), and
+/// [`hardware_key_verdict`] on the summary and `metrics percentiles` together.
 fn typing_burst(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_bin: &Path) {
     let Some(pid) = sb.child.as_ref().map(Child::id) else {
         r.cannot_run("gui smoke: no child to measure");
@@ -383,6 +415,9 @@ fn typing_burst(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_bin: &Path) {
 }
 
 /// THE REAL KEY PATH REACHES A NATIVE VIEW (xa-20): with Settings in front of a
+/// real window, one `hwkey tab` — a real NSEvent through the OS queue, winit's
+/// `KeyboardInput` arm, `App::on_key` and the native-view key path — must move
+/// Settings' keyboard focus.
 fn settings_hardware_key_step(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_bin: &Path) {
     let tag = "gui smoke: settings key path";
     let Some(pid) = sb.child.as_ref().map(Child::id) else {
@@ -453,7 +488,7 @@ fn settings_hardware_key_step(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_b
     }
 }
 
-/// Every reason this stage cannot measure anything. Each is a skip: the machine
+/// Every reason this stage cannot measure anything.
 fn gui_smoke_unavailable(ctx: &Ctx) -> Option<String> {
     if std::env::consts::OS != "macos" {
         return Some("gui smoke (macOS only)".into());
@@ -494,6 +529,7 @@ pub fn hwkey_burst_args() -> Vec<String> {
 }
 
 /// The text of `<name>=<value>` in a metrics reply (the last occurrence, as the
+/// numeric helpers read it), for a verdict line; `?` when absent.
 fn reply_field<'a>(reply: &'a str, name: &str) -> &'a str {
     let needle = format!(" {name}=");
     reply
@@ -673,6 +709,7 @@ mod tests {
     }
 
     /// The post-burst `metrics` summary a healthy burst leaves, with the readings
+    /// the verdict gates set per case.
     fn summary(frames: u64, max_input: &str, retries: u64, drops: u64, sync: u64) -> String {
         format!(
             "OK backend=gpu rows=24 cols=80 scrollback_truncated_lines=0 frames={frames} \
@@ -689,6 +726,7 @@ mod tests {
     }
 
     /// A `metrics percentiles` reply in the verb's own field order, with the slices
+    /// the hardware verdict reads set per case.
     fn percentiles(
         n_key_write: u64,
         key_write: &str,
@@ -714,6 +752,8 @@ mod tests {
     }
 
     /// The same reply with one `max_*_ms` field replaced: the bucketed p99 is an
+    /// exclusive bucket edge, so a case meaning "a sample really crossed the bar"
+    /// has to move the max too, as the verdict requires.
     fn with_max(reply: &str, field: &str, value: &str) -> String {
         let at = reply
             .find(&format!("{field}="))
@@ -734,6 +774,10 @@ mod tests {
     }
 
     /// The effects verdict reads the `cursor_effect` owner out of the ledger by
+    /// NAME and the ribbon witness by name; passes a healthy burst; fails both
+    /// an absolute and a share late-arm regression and effects that never
+    /// engaged (the first cut read an absent owner as `(0, 0)` and PASSED it) —
+    /// never a burst whose ledger or witness is simply missing.
     #[test]
     fn the_effects_verdict_demands_engagement_and_bounds_late_arms() {
         let reply = |ledger: &str, under: u64| {
@@ -809,6 +853,7 @@ mod tests {
     }
 
     /// The input ceilings cannot pass vacuously: a burst that booked no
+    /// input→present sample reads `max 0 ms` and `p99 0 ms`, under both bars.
     #[test]
     fn a_burst_that_booked_no_input_samples_is_a_failure_not_a_pass() {
         let hw = |n: u64| {
@@ -820,6 +865,8 @@ mod tests {
     }
 
     /// A sampled acquire or compositor slice must publish its true maximum, or a
+    /// p99 far over its ceiling would pass once the max field was renamed or
+    /// dropped.
     #[test]
     fn a_sampled_slice_without_its_maximum_fails_closed() {
         let without = |reply: &str, field: &str| {
@@ -912,6 +959,29 @@ mod tests {
         sb.teardown(&mut r);
         assert!(!sb.tmp.exists(), "the sandbox removes itself");
         assert_eq!(r.outcomes().count(), 0, "a clean teardown says nothing");
+    }
+
+    /// The smoke instance carries the run's mark and no other `ATERM_*` it would inherit.
+    /// NEGATIVE CONTROL: strip without setting the mark, and the instance carries no run id.
+    #[test]
+    fn the_smoke_instance_carries_the_runs_mark() {
+        let mut ctx = ctx();
+        ctx.child_env_add
+            .push((crate::runs::VERIFY_RUN_ENV.into(), "71-1".into()));
+        let mut cmd = Command::new("/bin/true");
+        gui_env(&ctx, &mut cmd);
+        let set: Vec<_> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| v.map(|v| (k.to_owned(), v.to_owned())))
+            .collect();
+        assert_eq!(
+            set,
+            [(
+                std::ffi::OsString::from(crate::runs::VERIFY_RUN_ENV),
+                std::ffi::OsString::from("71-1")
+            )],
+            "{cmd:?}"
+        );
     }
 
     #[test]

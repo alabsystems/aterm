@@ -402,8 +402,11 @@ WHAT IT DOES
   assertions`): neither system nor display idle-sleeps (lid close or explicit Sleep
   still sleeps). Click toggles on/off; right-click or Control-click opens the menu
   (1h, 8h, 24h, Forever, Enable at Startup, Quit Caffeine). Timed spans end on the
-  Timed spans end on the wall clock; reboot resets to off, while logout preserves what
-  was on in the same boot.
+  wall clock; reboot resets to off, while logout preserves what was on in the same
+  boot. Enable at Startup counts only while aterm's switch under Background App
+  Activity (System Settings > General > Login Items & Extensions) is on: off,
+  `startup` reads `blocked` and the menu row opens Login Items. A job `launchctl
+  disable` turned off reads `disabled`; turning Enable at Startup on lifts that.
 
 VERBS
   aterm caffeine [start]                        start the menu-bar mug job
@@ -662,10 +665,14 @@ WHAT IT IS
     (`compact_on_context_wall = true`), renews expired logins (`logins = "renew"`),
     and relaunches a crashed agent on its conversation (`relaunch = true`).
   * Human grace and stalls: after a person types, clicks or scrolls, the supervisor
-    holds off for `human_grace_s` (120 s; `status human_ms=`). While a hold stands
-    (`hold=1`) or an external supervisor holds a lease (`supervisor=external`), the
-    window only watches. A worker frozen past `stall_term_after_s` (600 s, `input=stalled`)
-    is warned about once or restarted if `stall_term = true`.
+    holds off for `human_grace_s` (120 s; `status human_ms=`), but on a box or question
+    nobody has touched since it came up that Claude Code will deny on a timer (`⚠ …
+    deny this request in M:SS`, read ticking) only until 15 s before that deny
+    (`HOLD-ENDED`); a gesture of yours after that skips its keys still to go.
+    While a hold stands (`hold=1`) or an external supervisor holds a lease
+    (`supervisor=external`), the window only watches. A worker frozen past
+    `stall_term_after_s` (600 s, `input=stalled`) is warned about once or restarted if
+    `stall_term = true`.
   Every decision is recorded in the session's journal (`aterm drive ledger`) and
   approval ledger (`aterm harness ledger`).
 
@@ -693,8 +700,8 @@ AUTOPILOT — how far the harness carries a session's work
   within 10 minutes, left unnudged).
 
   NEEDS YOU: a report line starting `NEEDS YOU: <what only a person can give>` raises
-  an `owner=needs kind=ask` entry on the menu bar (`❯N`), window border and pill at
-  once while the harness keeps the agent working on everything else; `NEEDS YOU:
+  an `owner=needs kind=ask` entry on the menu bar (`❯N`) and window border
+  while the harness keeps the agent working on everything else; `NEEDS YOU:
   nothing`, someone else's turn, or switching Autopilot to `off` clears it.
 
 THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
@@ -745,7 +752,8 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   upgrade [true]                  move idle sessions onto newer builds/models
   upgrade_ask [false]             true: ask the agent before restarting for an upgrade;
                                   false: restart quietly at a genuinely idle point
-  human_grace_s [120]             seconds to keep hands off after a person's input
+  human_grace_s [120]             seconds to keep hands off after a person's input (to
+                                  15 s before an untouched box's auto-deny at most)
   occupancy ["observe"]           wait measurement: `"observe"`, `"off"` or `"prompt"`
 
   Per-agent switch: `[harness.<agent>] enabled = false` (`claude`, `codex`, `agy`,
@@ -2369,10 +2377,14 @@ THE BADGE, BORDER, PILL AND MARKS
   * Menu bar (`❯`): `❯` nothing needed; `❯•` items waiting under "To look at" or "Done
     for you"; `❯N` N active needs across this Mac and recent fleet reads (red if any is
     stuck).
-  * Window border & pill: red (stuck) or amber (decide) for the window's most pressing
-    session (`View ▸ Show Needs in Windows` or `[presence] rim` toggles). Tab marks:
-    `◆` stuck, `◇` decide, `□` held by you, `•` unviewed landing/done, `–` failed command.
-    `Agents ▸ Next That Needs You` (`⇧⌘J`) cycles through active needs.
+  * Window border: red (stuck) or amber (decide) for the window's most pressing
+    session (`View ▸ Show Needs in Windows` or `[presence] rim` toggles).
+  * Tab-strip pill: unanswered approvals, questions and other direct requests.
+    Worker `NEEDS YOU:` reports have no pill; they remain in the menu bar, Overview,
+    tab hover and border. A direct request in the same session takes precedence
+    over a report. A visible pill's `+N` includes other sessions with reports.
+  * Tab marks: `◆` stuck, `◇` decide, `□` held by you, `•` unviewed landing/done,
+    `–` failed command. `Agents ▸ Next That Needs You` (`⇧⌘J`) cycles through active needs.
 
 TAKE OVER, HAND BACK AND HOLD COST
   `Agents ▸ Take Over This Tab` (or right-click tab, or `t` in Overview) sets a
@@ -2538,7 +2550,7 @@ fn rustup_unlinked_row(store_has_targo: bool, unserved: bool) -> String {
 /// local route, a dev link of a locally built sysroot. On aarch64 Linux the install
 /// answers "unavailable … no build is published for this target", so naming it sent the
 /// reader round a loop.
-fn trust_install_act(unserved: bool) -> &'static str {
+const fn trust_install_act(unserved: bool) -> &'static str {
     if unserved {
         "`aterm pkg link trust <sysroot> …` (no Trust build is published for this target; \
          docs/LINUX-LOCAL-TOOLCHAIN.md)"
@@ -3800,7 +3812,7 @@ fn is_toolchain_bin(dir: &Path) -> bool {
 }
 
 /// What a refused exec-root guard says about the root file it refused.
-fn refusal_words(why: Refusal) -> &'static str {
+const fn refusal_words(why: Refusal) -> &'static str {
     match why {
         Refusal::Symlink => "is a symbolic link",
         Refusal::Missing => "does not resolve",
@@ -4045,8 +4057,8 @@ fn agent_page(sid: Option<&str>) -> String {
          no report as the end; land continues every turn end until all of the work is on the\n  \
          remote main branch and a reply defends that in a few lines starting `Nothing left:`;\n  \
          off types nothing.\n  \
-         NEEDS YOU: a report line starting `NEEDS YOU:` puts that need on the person's menu bar,\n  \
-         border and pill at once (`NEEDS YOU: nothing` takes it down); the work goes on.\n",
+         NEEDS YOU: a report line starting `NEEDS YOU:` puts that need on the person's menu bar\n  \
+         and window border (`NEEDS YOU: nothing` takes it down); the work goes on.\n",
     );
     s.push_str(
         "\nDISK SPACE (one volume, shared by every session on it)\n  \

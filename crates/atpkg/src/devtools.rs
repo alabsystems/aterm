@@ -305,6 +305,7 @@ pub fn facts() -> Option<Facts> {
 }
 
 /// `[privacy] observer = false` in the aterm.toml the window loads
+/// (`aterm_types::dirs::aterm_config_path`).
 fn config_observer_off() -> bool {
     aterm_types::dirs::aterm_config_path()
         .and_then(|path| std::fs::read_to_string(path).ok())
@@ -312,6 +313,7 @@ fn config_observer_off() -> bool {
 }
 
 /// The pure half of [`config_observer_off`]: whether `[privacy] observer` is the boolean
+/// `false`, parsed with `aterm_toml` as the window parses the file.
 fn observer_off_in(text: &str) -> bool {
     text.parse::<aterm_toml::Table>()
         .ok()
@@ -730,6 +732,7 @@ pub const DECLINE_HOLD_S: u64 = 30 * 86_400;
 pub const DECLINE_REPEAT_HOLD_S: u64 = 90 * 86_400;
 
 /// How far back an earlier decline makes a new one a repeat: the message center's
+/// `FILED_KEEP`.
 const DECLINE_KEEP_S: u64 = 180 * 86_400;
 
 /// How far ahead of the clock a marker (a decline, the page's last opening) may be stamped and still count: the message center's `FILING_SKEW_MS`.
@@ -756,6 +759,7 @@ pub fn declined_until() -> Option<Declined> {
 }
 
 /// The pure half of [`declined_until`]: the newest valid line of `text`, and whether it
+/// still holds at `now`.
 fn decline_holding(text: &str, now: u64) -> Option<Declined> {
     let declines: Vec<(String, u64)> = text.lines().filter_map(parse_opened).collect();
     let ((version, at), earlier) = declines.split_last()?;
@@ -779,6 +783,7 @@ fn decline_holding(text: &str, now: u64) -> Option<Declined> {
 }
 
 /// The marker's next text: `text`'s valid lines with `<version> <now>` appended, the
+/// newest [`DECLINES_KEPT`] kept.
 fn with_decline(text: &str, version: &str, now: u64) -> String {
     let mut lines: Vec<String> = text
         .lines()
@@ -822,6 +827,7 @@ pub fn await_switch(
 const REACH_CEILING: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Run `program args…` to its exit within [`REACH_CEILING`]; its stderr's first line when
+/// it fails.
 fn run_quietly(program: &str, args: &[&str]) -> Result<(), String> {
     let out = aterm_uds::deadline::output_until(
         aterm_uds::spawnfd::command(program).args(args),
@@ -858,6 +864,8 @@ pub fn open_pane() -> Result<(), String> {
 pub const PRIME_VERB: &str = "__devtools-prime";
 
 /// How long the one new program [`run_prime`] starts may take: a hang detector, never
+/// a budget (a first exec macOS still checks can wait in `_dyld_start` for a minute
+/// under load).
 #[cfg(target_os = "macos")]
 const PRIME_CEILING: std::time::Duration = std::time::Duration::from_secs(180);
 
@@ -974,6 +982,9 @@ mod tests {
     }
 
     /// The row's level for each verdict: `ok` on the list (or tccd allowing), `warn` off it,
+    /// switched off, or switched on while tccd still checks — with the count of programs
+    /// tccd checked when it answered, and no command that changes the list on the owner's
+    /// behalf — and `note`, never `ok`, when nothing could be read.
     #[test]
     fn the_row_says_the_state_the_cost_and_the_fix() {
         let quiet = DevToolProbe::refused(DevToolProbeLabel::NoRecentRequest);
@@ -1032,6 +1043,7 @@ mod tests {
     }
 
     /// The hand-over acts only on `not_granted`: an empty list gets Terminal listed first so
+    /// the pane exists, and the pane opens; `granted` and `unknown` do nothing at all.
     #[test]
     fn the_hand_over_opens_the_pane_only_for_not_granted() {
         let quiet = DevToolProbe::refused(DevToolProbeLabel::NoRecentRequest);
@@ -1146,6 +1158,8 @@ mod tests {
     }
 
     /// Each page aterm brings up keeps its own pair of markers: opening or declining Full Disk
+    /// Access never holds back Developer Tools, and `aterm doctor`'s Developer Tools files keep
+    /// their names.
     #[test]
     fn each_page_keeps_its_own_markers() {
         assert_eq!(DEVELOPER_TOOLS.opened, "devtools-pane-opened");
@@ -1164,6 +1178,9 @@ mod tests {
     }
 
     /// A decline holds 30 days, and 90 when an earlier one lies within 180 days before it
+    /// (the message center's spans for the owner's own choice); it never holds for good, a
+    /// stamp from a clock since corrected keeps nothing quiet, and a line the marker cannot
+    /// parse is skipped rather than read as a decline.
     #[test]
     fn a_decline_holds_a_month_then_three_and_never_for_good() {
         const DAY: u64 = 86_400;
@@ -1212,6 +1229,9 @@ mod tests {
     }
 
     /// The words every surface shares: the drag is never offered without the + route (drop
+    /// acceptance is unmeasured, D15); "should" is said exactly while D14 is unmeasured;
+    /// the digest's step is one action; the wrong switches are named in the how; and no
+    /// restart, elimination or coverage word appears.
     #[test]
     fn the_words_pair_the_drag_with_plus_and_say_should_until_d14() {
         for skips in [false, true] {
@@ -1361,6 +1381,7 @@ mod tests {
     }
 
     /// `[privacy] observer = false` stops `aterm doctor`'s reads as it stops the window's; only
+    /// that boolean in that table does, and a file the window would not load is not "off".
     #[test]
     fn only_privacy_observer_false_stops_the_devtools_read() {
         assert!(observer_off_in("[privacy]\nobserver = false\n"));

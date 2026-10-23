@@ -19,6 +19,8 @@ use crate::claude_card::{PaneGeom, card_now};
 use crate::{App, WindowId};
 
 /// What Claude drew one panel row's parts in: each `Some(fg)` where every
+/// cell of the part is plain ([`plain_cell`]) and of that one ink, else
+/// `None` (Claude's look stands there).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct RowInk {
     pointer: Option<[u8; 3]>,
@@ -39,6 +41,7 @@ pub(crate) struct PanelRead {
     /// What the fold is told of each row's bullet colour.
     tints: [Tint; PANEL_ROWS_MAX],
     /// What each task row is matched to its agent's file by
+    /// (`aterm_agent::harness::flight::place`), read off its text.
     keys: [Option<RowKey>; PANEL_ROWS_MAX],
 }
 
@@ -108,6 +111,8 @@ pub(crate) fn read_panel(
 }
 
 /// The one ink of every cell of `span` (pane columns) on frame row
+/// `frame_row`, where each is plain ([`plain_cell`]) and none holds a
+/// cluster, a combining mark or an image; else `None`.
 fn part_ink(
     scratch: &RenderInput,
     cells: &[RenderCell],
@@ -141,6 +146,8 @@ fn touches<T>(channel: &[Vec<(usize, T)>], row: usize, cols: &std::ops::Range<us
 }
 
 /// Whether `cell` is Claude's plain text on the pane's ground: its ink plain
+/// ([`plain_fg`]), its ground the pane's, no line of any kind, one cell
+/// wide and no presentation asked, set on the line.
 fn plain_cell(cell: &RenderCell, blank: RenderCell) -> bool {
     cell.bg == blank.bg
         && !cell.wide
@@ -156,9 +163,15 @@ fn plain_cell(cell: &RenderCell, blank: RenderCell) -> bool {
 }
 
 /// How far, per channel, a plain ink may stray from neutral or from the
+/// line between the pane's ground and its ink.
 const PLAIN_SLACK: f32 = 12.0;
 
 /// Whether `fg` is one of Claude's plain inks on a pane whose blank is
+/// `blank`: a neutral grey (Claude's panel grey, `#999999` dark and
+/// `#666666` light, measured on 2.1.304), or a colour on the line from the
+/// pane's ground to its default ink (the default itself, a dim of it) —
+/// never one of Claude's status colours (success, error, warning, its
+/// blues), which lie far off both.
 fn plain_fg(fg: [u8; 3], blank: RenderCell) -> bool {
     let f = fg.map(f32::from);
     let spread =
@@ -195,6 +208,7 @@ pub(crate) struct PanelLeaf {
 }
 
 /// The window's pixel geometry for a panel's light: the cell, the left
+/// padding and the y of frame row 0, window-absolute.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Px {
     cw: usize,
@@ -204,6 +218,7 @@ struct Px {
 }
 
 /// What a panel's look was made from ([`PanelEntry::key`]): the same key,
+/// the same ink and light.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct LookKey {
     read_gen: u64,
@@ -219,10 +234,12 @@ struct LookKey {
     pane: PaneGeom,
     px: Px,
     /// Rows the frame leaves as Claude drew them (bit `k`: the panel's row
+    /// `k`): the cursor's, the chrome's.
     skip: u32,
 }
 
 /// One session's agents panel on the window's glass: its fold, its last
+/// reading and look, and its motion.
 #[derive(Debug)]
 struct PanelEntry {
     /// The plan leaf it was last found at: the repaint key's lookup.
@@ -235,12 +252,16 @@ struct PanelEntry {
     /// Moved with every new reading: what the look is keyed by.
     read_gen: u64,
     /// The fold's next turn, in ms on the window's clock, as of the last
+    /// fold or retime: the wake that judges it retimes the dots
+    /// ([`App::claude_panels_due`]), and a frame is asked only where their
+    /// look moved.
     due: Option<u64>,
     /// When the panel's stuck dots began to breathe (ms), while one shows.
     breath_since: Option<u64>,
     /// The breath ran its course: the stuck dots rest until a re-arm.
     breath_rested: bool,
     /// The panel's rows whose dot was stuck at the last frame (bit `k`: the
+    /// panel's row `k`): a row joining them starts a new course.
     stuck_rows: u32,
     /// At the last frame: the bar crested, a stuck dot breathed.
     crest: bool,
@@ -248,6 +269,7 @@ struct PanelEntry {
     /// Drawn by the latest splice of this window.
     shown: bool,
     /// Its next frame was asked for (`App::claude_panels_due`); no further
+    /// wake is armed for it until a frame draws it.
     asked: bool,
     key: Option<LookKey>,
     ink: Vec<InkCell>,
@@ -278,11 +300,17 @@ impl PanelEntry {
     }
 
     /// Whether this panel on show may want a frame with nothing new on the
+    /// screen — known without a clock: its bar crests, a stuck dot
+    /// breathes, or a dot's next turn is due some time.
     fn live(&self) -> bool {
         self.shown && (self.crest || self.breathing || self.due.is_some())
     }
 
     /// The frame it wants at `now` (ms on the window's clock, `None`: not
+    /// read, the panel not live), as the repaint key's term: the crest's
+    /// step and the breath's while they move, and the dots' look as the
+    /// last fold or retime left it — so a turn come due that moves no dot's
+    /// look (a fade's tick under its next 1/32 step) moves no key.
     fn wanted(&self, now: Option<u64>, grid: PanelGrid) -> u64 {
         let mut h = mix(self.track.fingerprint()).rotate_left(42);
         if let Some(now) = now {
@@ -300,6 +328,9 @@ impl PanelEntry {
     }
 
     /// When (ms) it next wants a frame, from the frame it last drew: the
+    /// crest's next step on `grid` (its wake, [`PanelGrid::wake`]), the
+    /// breath's next step (its rest at the end), the fold's next turn, and
+    /// now where a retime since moved the dots' look.
     fn next(&self, grid: PanelGrid) -> Option<u64> {
         if !self.shown || self.asked {
             return None;
@@ -334,6 +365,7 @@ pub(crate) struct WindowPanels {
     /// The window's panel clock's zero: every ms here is since it.
     epoch: Option<Instant>,
     /// Where the motion's steps fall on that clock, as the last frame found
+    /// it ([`PanelGrid::of`]).
     grid: PanelGrid,
 }
 
@@ -364,6 +396,8 @@ impl PanelGrid {
     }
 
     /// `t` (ms on the window's clock) on the ripple's: in phase with the
+    /// card's (`crest` is periodic in `GLINT_PERIOD_MS`), a period ahead so
+    /// it never underflows.
     fn ripple(self, t: u64) -> u64 {
         t + GLINT_PERIOD_MS - self.phase
     }
@@ -379,11 +413,13 @@ impl PanelGrid {
     }
 
     /// When (ms on the window's clock) step `step`'s frame is asked: its
+    /// start, and the slack.
     fn wake(self, step: u64) -> u64 {
         (step * FLOW_STEP_MS + self.phase + self.slack).saturating_sub(GLINT_PERIOD_MS)
     }
 
     /// The latest wake at or before `t` (`t` itself before the first): where
+    /// a breath's course starts, so its steps are the crest's.
     fn floor(self, t: u64) -> u64 {
         let k = (t + GLINT_PERIOD_MS).saturating_sub(self.phase + self.slack) / FLOW_STEP_MS;
         Some(self.wake(k)).filter(|&w| w <= t).unwrap_or(t)
@@ -417,6 +453,7 @@ impl WindowPanels {
 }
 
 /// The wall clock in unix ms, or a test's: what the flight table's times
+/// are on.
 fn wall_ms() -> i64 {
     #[cfg(test)]
     if let Some(ms) = TEST_WALL.with(std::cell::Cell::get) {
@@ -528,6 +565,7 @@ struct LookIn<'a> {
 }
 
 /// Make a panel's look into `ink` (sorted, unique) and `halo`, each emptied
+/// first (module header: THE RAINBOW, THE DOTS).
 fn make_look(look: &LookIn<'_>, ink: &mut Vec<InkCell>, halo: &mut Vec<RainHalo>) {
     #[cfg(test)]
     crate::work_counts::panel_look_made();

@@ -29,6 +29,7 @@ pub const CRASHES: &str = "crashes";
 pub const CONVERSATIONS: &str = "conversations";
 
 /// The hidden flag that moves the Gemini directory (absolute; a relative one
+/// is ignored by agy, which logs `.gemini must be an absolute path`).
 const FLAG_GEMINI_DIR: &str = "gemini_dir";
 
 /// The hidden flag that moves the app data directory under it (relative).
@@ -38,6 +39,8 @@ const FLAG_APP_DATA_DIR: &str = "app_data_dir";
 const FLAG_CONVERSATION: &str = "conversation";
 
 /// How a flag takes its value (Go's `flag` package, which agy's parser
+/// follows: measured, a switch alone or `=true`/`=false`, a value attached or
+/// the next token whatever it looks like).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Arity {
     /// A switch: never takes the next token.
@@ -54,12 +57,16 @@ enum Fate {
     /// Dropped with its value.
     Drop,
     /// The relaunch is refused ([`ArgvRefusal::NotResumable`]); the launch is
+    /// still a TUI.
     Refuse,
     /// The launch is no TUI at all: it prints, or runs one prompt, and exits
+    /// ([`is_tui_argv`]).
     OneShot,
 }
 
 /// agy's flags (`agy --help`, 1.4.0, and the two hidden ones the premeasure
+/// found), named without their dashes as Go reads them, each with its fate on
+/// a relaunch.
 const FLAGS: &[(&str, Arity, Fate)] = &[
     ("add-dir", Arity::One, Fate::Drop),
     ("agent", Arity::One, Fate::Drop),
@@ -116,6 +123,8 @@ const SUBCOMMANDS: &[&str] = &[
 ];
 
 /// A flag token as Go reads it: its name (one or two dashes off) and the
+/// value attached after `=`, or `None` for a token that is no flag (a
+/// positional, `-` alone, `--`, or three dashes).
 fn flag_token(tok: &str) -> Option<(&str, Option<&str>)> {
     let bare = tok.strip_prefix("--").or_else(|| tok.strip_prefix('-'))?;
     if bare.is_empty() || bare.starts_with('-') || bare.starts_with('=') {
@@ -134,6 +143,8 @@ struct Read {
 }
 
 /// Why a [`read`] stopped, with its word: a flag the table does not know, a
+/// flag that refuses a relaunch of a TUI, or what makes the launch no TUI at
+/// all (a one-shot flag, a subcommand, a positional).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Stop {
     Unknown(String),
@@ -151,6 +162,7 @@ impl From<Stop> for ArgvRefusal {
 }
 
 /// [`Read`] of `argv` (`argv[0]` first), or why it cannot be carried
+/// ([`Stop`]).
 fn read(argv: &[String]) -> Result<Read, Stop> {
     let mut out = Read::default();
     let mut i = 1;
@@ -203,6 +215,7 @@ pub fn is_tui_argv(argv: &[String]) -> bool {
 }
 
 /// A one-shot flag or a subcommand anywhere before `--`, read without the
+/// flag table (an unknown flag may or may not take a value).
 fn one_shot_anywhere(argv: &[String]) -> bool {
     argv.iter()
         .skip(1)
@@ -214,6 +227,8 @@ fn one_shot_anywhere(argv: &[String]) -> bool {
 }
 
 /// The last value of the flag `want` in `argv`, any spelling (`-x=v`,
+/// `--x=v`, `-x v`, `--x v`), read as Go reads it — before `--`, the last
+/// occurrence winning.
 fn flag_value<'a>(argv: &'a [String], want: &str) -> Option<&'a str> {
     let mut found = None;
     let mut i = 1;
@@ -423,6 +438,8 @@ impl ExitKind {
 }
 
 /// The signals that stop a job (`SIGTSTP`, Ctrl-Z's; `SIGSTOP`; `SIGTTIN`;
+/// `SIGTTOU`): a stopped job's block ends with `128` plus one of them, the
+/// process alive.
 #[cfg(unix)]
 const STOP_SIGNALS: [libc::c_int; 4] = [libc::SIGTSTP, libc::SIGSTOP, libc::SIGTTIN, libc::SIGTTOU];
 #[cfg(not(unix))]

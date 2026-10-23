@@ -1,17 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// A REPLAYED LOOP (`run_tests.rs`'s `replay_loop` module): a recorded watch
-// replayed strictly from its tape, then the same tape edited — a reply byte
-// flipped, a clock read dropped, two requests swapped, a printed line
-// changed, a policy key changed in the header — each edit caught as the
-// first divergence at its door and of its class; a recorded panic reproduced
-// at the same place; a replay stopped at a door, a tape cut short, a tape in
-// its text form, and the tapes no replay can stand on.
-//
-// Every assertion is on the structured report (`tape::report::Report`), never
-// its rendering.
-
 use astream_effects::{EffectRecord, ReplayDivergence};
 
 use crate::supervise::run::approval_loop::PANIC_AT_DECIDE;
@@ -150,8 +139,6 @@ fn a_recorded_watch_replays_in_either_form() {
             .iter()
             .any(|l| l.starts_with("APPROVED seq=102 "))
     );
-    // The rendering lists each ACT the replayed loop made (`> …`), the
-    // box's press among them, and only the acts: its reads are counted.
     let rendered = report.render();
     let listed: Vec<&str> = rendered
         .lines()
@@ -181,10 +168,7 @@ fn a_recorded_watch_replays_in_either_form() {
 /// the review the manager reads as its value, not as lines through the `out`
 /// door, so its tape's end holds that review under the exit code, and the
 /// replay is REPRODUCED only when the replayed loop returns the very same
-/// text — twice alike. The negative control: the recorded review edited (a
-/// build that rendered the review otherwise on the same screens, requests
-/// and rows) — every door agrees, and the replay DIVERGES at the end, as an
-/// output.
+/// text — twice alike.
 #[test]
 fn a_recorded_supervise_replays_and_its_review_is_compared() {
     let (header, items, review) = recorded_supervise();
@@ -371,8 +355,7 @@ fn one_header_key_changed_is_a_decision_divergence() {
 /// A PANIC IN THE POLICY REPRODUCES: a run that panics where it decides a box
 /// (a planted panic, this thread's) leaves a tape that ends unwound; its
 /// replay panics at the same place, every record consumed — PANICKED, the
-/// same message. The negative control: replayed with the panic no longer
-/// planted, the loop goes past where the recorded one died — DIVERGED.
+/// same message.
 #[test]
 fn a_recorded_panic_replays_to_panicked() {
     let mut m = script();
@@ -446,9 +429,7 @@ impl Ctl for PanicsAt<'_> {
 /// value to tape — but its tape says the door and the request it died at
 /// (`NOTE_UNWOUND_IN`); its replay, every record before it reproduced,
 /// reaches that door asking that very request: PANICKED inside `ctl`, with
-/// the recorded message, exit 4. The negative controls: the note naming
-/// another request (a build that asks otherwise where the run died), and no
-/// note at all — each DIVERGED, the tape over under the loop.
+/// the recorded message, exit 4.
 #[test]
 fn a_panic_inside_a_door_replays_to_panicked_at_that_door() {
     use crate::supervise::tape::core::{NOTE_UNWOUND_IN, unwound_in_text};
@@ -598,9 +579,7 @@ fn a_replaying_door_never_calls_the_transport() {
 }
 
 /// The tapes no replay can stand on are refused, each named: bytes that are
-/// no tape, and roots that would land on a directory that exists. (A run
-/// with a mail lane went with the lane, removed 2026-10-15: no recording
-/// took `--mail`, and the header's retired keys are read and dropped.)
+/// no tape, and roots that would land on a directory that exists.
 #[test]
 fn a_tape_no_replay_can_stand_on_is_refused() {
     let (header, items) = recorded();
@@ -621,8 +600,7 @@ fn a_tape_no_replay_can_stand_on_is_refused() {
 /// window host, over a tape whose run had none, is not refused — a run with
 /// a host replays now — and DIVERGES at the host's first call: the replayed
 /// loop tells its host the task's face as it starts (`host.task_face`),
-/// where the tape holds the claim. A host's answer never comes from anywhere
-/// but the tape.
+/// where the tape holds the claim.
 #[test]
 fn a_host_the_tape_never_answered_diverges_at_its_first_call() {
     let (header, items) = recorded();
@@ -644,26 +622,11 @@ fn a_host_the_tape_never_answered_diverges_at_its_first_call() {
 }
 
 /// THE APPROVAL POLICY'S HOME IS A VALUE, AND ITS LOOKS THERE ARE THE TAPE'S
-/// (`tape::header`'s module docs). A run approves a Read of a file under the
-/// owner's home, drawn as an absolute path and proven by a `~/proj` trust
-/// root, after looking at the disk there — where the path's links lead and
-/// whether a folder on its way holds a hidden twin — each look taped with
-/// its path under the header's `home` root. The home is then removed and the
-/// tape replayed from its remapped header: REPRODUCED, so no look reached the
-/// machine (a live one would find no file there and hand the box over).
-///
-/// The negative control is the remap the header does not make: the same tape
-/// with the policy's home moved under a replay's base, as each file's root
-/// is, DIVERGES at the decision. The `~/proj` root then names a directory the
-/// screen's path is not under, so the Read is no longer proven: the home is
-/// compared with what the screen draws, and a replay must judge the box by
-/// the recorded one.
+/// (`tape::header`'s module docs).
 #[cfg(unix)]
 #[test]
 fn the_policys_home_is_a_value_and_its_looks_there_are_the_tapes() {
     let dir = crate::supervise::ScratchDir::new("replay", "home");
-    // Every link resolved, as the probe's resolver sees it (macOS's `/tmp` is
-    // `/private/tmp`): a path the live looks prove.
     let home = crate::supervise::test_canonical(&dir).join("owner");
     let file = home.join("proj").join("notes.md");
     std::fs::create_dir_all(home.join("proj")).expect("proj");
@@ -703,7 +666,6 @@ fn the_policys_home_is_a_value_and_its_looks_there_are_the_tapes() {
     );
     let header = run.header.encode();
     let items = recover(&run.tape.reframed(&header)).items;
-    // Each look is asked by the path under the home's root.
     for door in [doors::PROBE_REAL_COMPONENTS, doors::PROBE_HIDDEN_TWIN] {
         let asked: Vec<&[u8]> = items
             .iter()
@@ -735,7 +697,6 @@ fn the_policys_home_is_a_value_and_its_looks_there_are_the_tapes() {
         report.render()
     );
 
-    // The negative control: the policy's home where a remap puts a root.
     let base = Path::new("/nonexistent/aterm-replay-home/absent");
     let moved = crate::supervise::tape::header::Header::decode_remapped(&header, base)
         .expect("decodes remapped")
@@ -760,8 +721,6 @@ fn the_policys_home_is_a_value_and_its_looks_there_are_the_tapes() {
         .collect();
     assert_ne!(remapped_home, header);
     let report = replayed(&remapped_home, &items);
-    // The moved home proves nothing lexically, so the replay decides with no
-    // look where the recorded run looked first.
     let d = diverged(&report);
     assert_eq!(d.class, Class::Decision, "{d:?}");
     assert_eq!(d.door.as_deref(), Some(doors::DECIDE_APPROVAL), "{d:?}");

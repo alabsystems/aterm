@@ -7,7 +7,7 @@
 // fontations' test fonts and are not carried.
 // See ../../../LICENSE-FONTATIONS for the upstream license.
 
-//! Latin blue values.
+//! Unscaled and scaled Latin/CJK alignment blue zones.
 
 use super::{
     super::{
@@ -20,25 +20,16 @@ use super::{
 };
 
 /// Maximum number of blue values.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afblue.h#L328>
 const MAX_BLUES: usize = 8;
 
-// <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afblue.h#L73>
 const BLUE_STRING_MAX_LEN: usize = 51;
 
-/// Defines the zone(s) that are associated with a blue value.
+/// Alignment zone flags associated with a blue value.
 #[derive(Copy, Clone, PartialEq, Eq, Default, Debug)]
 #[repr(transparent)]
 pub struct BlueZones(u16);
 
 impl BlueZones {
-    // These properties ostensibly come from
-    // <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afblue.h#L317>
-    // but are modified to match those at
-    // <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.h#L68>
-    // so that when don't need to keep two sets and adjust during blue
-    // computation.
     pub const NONE: Self = Self(0);
     pub const TOP: Self = Self(1 << 1);
     pub const SUB_TOP: Self = Self(1 << 2);
@@ -53,8 +44,6 @@ impl BlueZones {
         self.0 & other.0 == other.0
     }
 
-    // Used for generated data structures because the bit-or operator
-    // cannot be const.
     #[must_use]
     pub(crate) const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
@@ -134,44 +123,39 @@ impl core::ops::BitAndAssign for BlueZones {
     }
 }
 
-/// An unscaled alignment zone.
-// FreeType keeps a single array of blue values per metrics set
-// and mutates when the scale factor changes. We'll separate them so
-// that we can reuse unscaled metrics as immutable state without
-// recomputing them (which is the expensive part).
-// <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.h#L77>
+/// Unscaled alignment zone.
 #[derive(Copy, Clone, PartialEq, Eq, Default, Debug)]
 pub struct UnscaledBlue {
-    /// Position of the blue.
+    /// Reference position.
     pub position: i32,
-    /// Overshoot value of the blue.
+    /// Overshoot position.
     pub overshoot: i32,
-    /// Maximum extent of outlines used to compute this blue.
+    /// Maximum outline extent.
     pub ascender: i32,
-    /// Minimum extent of outlines used to compute this blue.
+    /// Minimum outline extent.
     pub descender: i32,
-    /// Active zones for this blue.
+    /// Active zone flags.
     pub zones: BlueZones,
 }
 
 pub(crate) type UnscaledBlues = Vec<UnscaledBlue>;
 
-/// A scaled alignment zone.
+/// Scaled alignment zone.
 #[derive(Copy, Clone, PartialEq, Eq, Default, Debug)]
 pub struct ScaledBlue {
-    /// Scaled position of the blue.
+    /// Scaled reference position.
     pub position: ScaledWidth,
-    /// Scaled overshoot for the blue.
+    /// Scaled overshoot position.
     pub overshoot: ScaledWidth,
-    /// Active zones for this blue.
+    /// Active zone flags.
     pub zones: BlueZones,
-    /// True if the blue is active.
+    /// Whether this blue zone is active at the current scale.
     pub is_active: bool,
 }
 
 pub(crate) type ScaledBlues = Vec<ScaledBlue>;
 
-/// Compute unscaled blues values for each axis.
+/// Computes unscaled blue values for each axis of `style`.
 pub(crate) fn compute_unscaled_blues(
     shaper: &Shaper,
     coords: &[F2Dot14],
@@ -179,19 +163,15 @@ pub(crate) fn compute_unscaled_blues(
 ) -> [UnscaledBlues; 2] {
     match style.script.group {
         ScriptGroup::Default => [
-            // Default group doesn't have horizontal blues
             Default::default(),
             compute_default_blues(shaper, coords, style),
         ],
         ScriptGroup::Cjk => compute_cjk_blues(shaper, coords, style),
-        // Indic group doesn't use blue values (yet?)
         ScriptGroup::Indic => Default::default(),
     }
 }
 
 /// Compute unscaled blue values for the default script set.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L314>
 fn compute_default_blues(shaper: &Shaper, coords: &[F2Dot14], style: &StyleClass) -> UnscaledBlues {
     let mut blues = UnscaledBlues::new();
     let (mut outline_buf, mut flats, mut rounds) = buffers();
@@ -200,7 +180,6 @@ fn compute_default_blues(shaper: &Shaper, coords: &[F2Dot14], style: &StyleClass
     let flat_threshold = units_per_em / 14;
     let mut cluster_shaper = shaper.cluster_shaper(style);
     let mut shaped_cluster = ShapedCluster::default();
-    // Walk over each of the blue character sets for our script.
     for (blue_str, blue_zones) in style.script.blues {
         let mut ascender = i32::MIN;
         let mut descender = i32::MAX;
@@ -230,13 +209,10 @@ fn compute_default_blues(shaper: &Shaper, coords: &[F2Dot14], style: &StyleClass
                     continue;
                 }
                 let outline = outline_buf.as_ref();
-                // Reject glyphs that can't produce any rendering
                 if outline.points.len() <= 2 {
                     continue;
                 }
                 let mut best_y: Option<i16> = None;
-                // Find the extreme point depending on whether this is a top or
-                // bottom blue
                 let best_contour_and_point = if blue_zones.is_top_like() {
                     outline.find_last_contour(|point| {
                         if best_y.is_none() || Some(point.y) > best_y {
@@ -268,8 +244,6 @@ fn compute_default_blues(shaper: &Shaper, coords: &[F2Dot14], style: &StyleClass
                     continue;
                 };
                 let best_x = best_contour[best_point_ix].x as i32;
-                // Now determine whether the point belongs to a straight or
-                // round segment by examining the previous and next points.
                 let [mut on_point_first, mut on_point_last] =
                     if best_contour[best_point_ix].is_on_curve() {
                         [Some(best_point_ix); 2]
@@ -278,12 +252,8 @@ fn compute_default_blues(shaper: &Shaper, coords: &[F2Dot14], style: &StyleClass
                     };
                 let mut segment_first = best_point_ix;
                 let mut segment_last = best_point_ix;
-                // Look for the previous and next points on the contour that
-                // are not on the same Y coordinate, then threshold the
-                // "closeness"
                 for (ix, prev) in cycle_backward(best_contour, best_point_ix) {
                     let dist = (prev.y as i32 - best_y).abs();
-                    // Allow a small distance or angle (20 == roughly 2.9 degrees)
                     if dist > 5 && ((prev.x as i32 - best_x).abs() <= (20 * dist)) {
                         break;
                     }
@@ -297,11 +267,8 @@ fn compute_default_blues(shaper: &Shaper, coords: &[F2Dot14], style: &StyleClass
                 }
                 let mut next_ix = 0;
                 for (ix, next) in cycle_forward(best_contour, best_point_ix) {
-                    // Save next_ix which is used in "long" blue computation
-                    // later
                     next_ix = ix;
                     let dist = (next.y as i32 - best_y).abs();
-                    // Allow a small distance or angle (20 == roughly 2.9 degrees)
                     if dist > 5 && ((next.x as i32 - best_x).abs() <= (20 * dist)) {
                         break;
                     }
@@ -314,24 +281,6 @@ fn compute_default_blues(shaper: &Shaper, coords: &[F2Dot14], style: &StyleClass
                     }
                 }
                 if blue_zones.is_long() {
-                    // Taken verbatim from FreeType:
-                    //
-                    // "If this flag is set, we have an additional constraint to
-                    // get the blue zone distance: Find a segment of the topmost
-                    // (or bottommost) contour that is longer than a heuristic
-                    // threshold.  This ensures that small bumps in the outline
-                    // are ignored (for example, the `vertical serifs' found in
-                    // many Hebrew glyph designs).
-                    //
-                    // If this segment is long enough, we are done.  Otherwise,
-                    // search the segment next to the extremum that is long
-                    // enough, has the same direction, and a not too large
-                    // vertical distance from the extremum.  Note that the
-                    // algorithm doesn't check whether the found segment is
-                    // actually the one (vertically) nearest to the extremum.""
-                    //
-                    // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L641>
-                    // heuristic threshold value
                     let length_threshold = units_per_em / 25;
                     let dist = (best_contour[segment_last].x as i32
                         - best_contour[segment_first].x as i32)
@@ -343,9 +292,7 @@ fn compute_default_blues(shaper: &Shaper, coords: &[F2Dot14], style: &StyleClass
                             best_contour.len() - 1,
                         )
                     {
-                        // heuristic threshold value
                         let height_threshold = units_per_em / 4;
-                        // find previous point with different x value
                         let mut prev_ix = best_point_ix;
                         for (ix, prev) in cycle_backward(best_contour, best_point_ix) {
                             if prev.x as i32 != best_x {
@@ -353,7 +300,6 @@ fn compute_default_blues(shaper: &Shaper, coords: &[F2Dot14], style: &StyleClass
                                 break;
                             }
                         }
-                        // skip for degenerate case
                         if prev_ix == best_point_ix {
                             continue;
                         }
@@ -365,9 +311,7 @@ fn compute_default_blues(shaper: &Shaper, coords: &[F2Dot14], style: &StyleClass
                         let mut hit = false;
                         loop {
                             if !hit {
-                                // no hit, adjust first point
                                 first = last;
-                                // also adjust first and last on curve point
                                 if best_contour[first].is_on_curve() {
                                     p_first = Some(first);
                                     p_last = Some(first);
@@ -383,7 +327,6 @@ fn compute_default_blues(shaper: &Shaper, coords: &[F2Dot14], style: &StyleClass
                                 last = 0;
                             }
                             if (best_y - best_contour[first].y as i32).abs() > height_threshold {
-                                // vertical distance too large
                                 hit = false;
                                 if last == segment_first {
                                     break;
@@ -461,11 +404,6 @@ fn compute_default_blues(shaper: &Shaper, coords: &[F2Dot14], style: &StyleClass
                     }
                 }
                 best_y += y_offset;
-                // Is the segment round?
-                // 1. horizontal distance between first and last oncurve point
-                //    is larger than a heuristic flat threshold, then it's flat
-                // 2. either first or last point of segment is offcurve then
-                //    it's round
                 let is_round = match (on_point_first, on_point_last) {
                     (Some(first), Some(last))
                         if (best_contour[last].x as i32 - best_contour[first].x as i32).abs()
@@ -479,10 +417,9 @@ fn compute_default_blues(shaper: &Shaper, coords: &[F2Dot14], style: &StyleClass
                     }
                 };
                 if is_round && blue_zones.is_neutral() {
-                    // Ignore round segments for neutral zone
+                    // Ignore round segments for neutral zone.
                     continue;
                 }
-                // This seems to ignore LATIN_SUB_TOP?
                 if blue_zones.is_top() {
                     if best_y > best_y_extremum {
                         best_y_extremum = best_y;
@@ -539,14 +476,12 @@ fn compute_default_blues(shaper: &Shaper, coords: &[F2Dot14], style: &StyleClass
         }
         blues.push(blue);
     }
-    // sort bottoms
     let mut sorted_indices: [usize; MAX_BLUES] = core::array::from_fn(|ix| ix);
     let blue_values = blues.as_mut_slice();
     let len = blue_values.len();
     if len == 0 {
         return blues;
     }
-    // sort from bottom to top
     for i in 1..len {
         for j in (1..=i).rev() {
             let first = &blue_values[sorted_indices[j - 1]];
@@ -567,7 +502,6 @@ fn compute_default_blues(shaper: &Shaper, coords: &[F2Dot14], style: &StyleClass
             sorted_indices.swap(j, j - 1);
         }
     }
-    // and adjust tops
     for i in 0..len - 1 {
         let index1 = sorted_indices[i];
         let index2 = sorted_indices[i + 1];
@@ -601,28 +535,13 @@ fn satisfies_min_long_segment_len(first_ix: usize, last_ix: usize, contour_last:
     let inclusive_diff = if first_ix <= last_ix {
         last_ix - first_ix
     } else {
-        // If first_ix > last_ix, then we want to capture the sum of the ranges
-        // [first_ix, contour_last] and [0, last_ix]
-        // We add 1 here to ensure the element that crosses the boundary is
-        // included. For example, if first_ix == contour_last and
         // last_ix == 0, then we want the result to be 1
         contour_last - first_ix + 1 + last_ix
     };
-    // The +2 matches FreeType. The assumption is that this includes sufficient
-    // points to detect a bump and extend the segment?
-    // <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L663>
     inclusive_diff + 2 <= contour_last
 }
 
 /// Compute unscaled blue values for the CJK script set.
-///
-/// Note: unlike the default code above, this produces two sets of blues,
-/// one for horizontal zones and one for vertical zones, respectively. The
-/// horizontal set is currently not generated because this has been
-/// disabled in FreeType but the code remains because we may want to revisit
-/// in the future.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afcjk.c#L277>
 fn compute_cjk_blues(
     shaper: &Shaper,
     coords: &[F2Dot14],
@@ -633,13 +552,8 @@ fn compute_cjk_blues(
     let font = shaper.font();
     let mut cluster_shaper = shaper.cluster_shaper(style);
     let mut shaped_cluster = ShapedCluster::default();
-    // Walk over each of the blue character sets for our script.
     for (blue_str, blue_zones) in style.script.blues {
         let is_horizontal = blue_zones.is_horizontal();
-        // Note: horizontal blue zones are disabled by default and have been
-        // for many years in FreeType:
-        // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afcjk.c#L35>
-        // and <https://gitlab.freedesktop.org/freetype/freetype/-/commit/084abf0469d32a94b1c315bee10f621284694328>
         if is_horizontal {
             continue;
         }
@@ -653,8 +567,6 @@ fn compute_cjk_blues(
         let mut n_fills = 0;
         let mut is_fill = true;
         for cluster in blue_str.split(' ') {
-            // The '|' character is used as a sentinel in the blue string that
-            // signifies a switch to characters that define "flat" values
             // <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afcjk.c#L380>
             if cluster == "|" {
                 is_fill = false;
@@ -674,11 +586,9 @@ fn compute_cjk_blues(
                     continue;
                 }
                 let outline = outline_buf.as_ref();
-                // Reject glyphs that can't produce any rendering
                 if outline.points.len() <= 2 {
                     continue;
                 }
-                // Step right up and find an extrema!
                 let best_pos = outline
                     .points
                     .iter()
@@ -707,8 +617,6 @@ fn compute_cjk_blues(
         if n_flats == 0 && n_fills == 0 {
             continue;
         }
-        // Now determine the reference and overshoot of the blue; simply
-        // take the median after a sort
         fills[..n_fills].sort_unstable();
         flats[..n_flats].sort_unstable();
         let (mut blue_ref, mut blue_shoot) = if n_flats == 0 {
@@ -720,8 +628,6 @@ fn compute_cjk_blues(
         } else {
             (fills[n_fills / 2] as i32, flats[n_flats / 2] as i32)
         };
-        // Make sure blue_ref >= blue_shoot for top/right or vice versa for
-        // bottom left
         if blue_shoot != blue_ref {
             let under_ref = blue_shoot < blue_ref;
             if blue_zones.is_top() ^ under_ref {
@@ -753,8 +659,7 @@ fn buffers<T: Copy + Default>() -> (
     )
 }
 
-/// Iterator that begins at `start + 1` and cycles through all items
-/// of the slice in forward order, ending with `start`.
+/// Iterates forward cyclically through `items` starting at `start + 1` and ending at `start`.
 pub(super) fn cycle_forward<T>(items: &[T], start: usize) -> impl Iterator<Item = (usize, &T)> {
     let len = items.len();
     let start = start + 1;
@@ -764,8 +669,7 @@ pub(super) fn cycle_forward<T>(items: &[T], start: usize) -> impl Iterator<Item 
     })
 }
 
-/// Iterator that begins at `start - 1` and cycles through all items
-/// of the slice in reverse order, ending with `start`.
+/// Iterates backward cyclically through `items` starting at `start - 1` and ending at `start`.
 pub(super) fn cycle_backward<T>(items: &[T], start: usize) -> impl Iterator<Item = (usize, &T)> {
     let len = items.len();
     (0..len).rev().map(move |ix| {

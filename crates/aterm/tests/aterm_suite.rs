@@ -9,6 +9,9 @@
 //!
 //! Run one file's tests with `targo --unverified test -p aterm --test aterm_suite -- <file>::`.
 
+#[cfg(test)]
+aterm_durable::plain_durable_flushes_in_tests!();
+
 #[cfg(unix)]
 #[path = "support/child_output.rs"]
 mod child_output;

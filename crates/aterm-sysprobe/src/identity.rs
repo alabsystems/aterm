@@ -1,51 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHO A PROCESS IS, BY THE KERNEL'S WORD (macOS): what the cause engine
-//! names a coalition's lead by (`docs/DESIGN-resource-details-2026-10-20.md`
-//! §2.3).
-//!
-//! * [`identity`] — one process's image basename (`proc_pidpath`) and its
-//!   code signature as the kernel holds it (`csops`): the status flags, the
-//!   validation category, the signing identifier and, for a developer's
-//!   signature, the team id. Every read answers for every user's process
-//!   unprivileged, opens no file and asks no daemon.
-//! * [`voucher`] — what the status and category vouch for, in the closed
-//!   words the wire prints ([`Voucher::word`]). PURE.
-//! * [`team_of`] — the team id a signature's category lets a reader keep.
-//! * [`blob_text`] — the text of a `CS_OPS_IDENTITY` or `CS_OPS_TEAMID`
-//!   answer. PURE.
-//!
-//! A signing identifier is a claim the signer chose: only [`voucher`] says
-//! whose it is (a fresh binary signed ad hoc as `com.apple.mds` reads that
-//! identifier and category 10, RD §2.3 rule 3).
-//!
-//! `csops` on pid 0 reads the CALLER, not the kernel (RD §2.3 rule 4): pid 0
-//! is never read. Every other platform answers `None`.
-
-// The status flags and validation categories are the SDK's
-// (`Kernel.framework/Headers/kern/cs_blobs.h`), held to it by
-// `tests/proc_info_sdk.rs` through `SDK_ROWS`; `csops` and its operations
-// have no SDK header (`imp`).
+//! Process image basename and kernel code-signature inspection (`proc_pidpath`, `csops`).
 
 /// `CS_VALID`: the signature is valid now.
 pub const CS_VALID: u32 = 0x0000_0001;
 /// `CS_ADHOC`: signed with no identity.
 pub const CS_ADHOC: u32 = 0x0000_0002;
-/// `CS_LINKER_SIGNED`: signed ad hoc by the linker. The kernel keeps this
-/// bit and not [`CS_ADHOC`] for such an image (status `0x22020201`, category
-/// 10, for a `cc`-built probe whose code directory reads
-/// `adhoc,linker-signed`: `answers/sign/q1-out-1.txt` under
-/// `~/.cache/aterm-design-evidence/details-2026-10-20`).
+/// `CS_LINKER_SIGNED`: signed ad hoc by the linker.
 pub const CS_LINKER_SIGNED: u32 = 0x0002_0000;
 /// `CS_PLATFORM_BINARY`: the kernel holds the image as macOS's own.
 pub const CS_PLATFORM_BINARY: u32 = 0x0400_0000;
-/// `CS_DEBUGGED`: debugged and let run with invalid pages. The kernel answers
-/// the category and the signing identifier only with it or [`CS_VALID`].
+/// `CS_DEBUGGED`: debugged and allowed to run with invalid pages.
 pub const CS_DEBUGGED: u32 = 0x1000_0000;
-/// `CS_SIGNED`: the process has a signature, valid or not now. With neither
-/// it nor [`CS_VALID`] the process is unsigned, and the kernel then refuses
-/// its category (`EINVAL`).
+/// `CS_SIGNED`: the process has a signature, valid or not.
 pub const CS_SIGNED: u32 = 0x2000_0000;
 
 /// `CS_VALIDATION_CATEGORY_PLATFORM`: macOS's own.
@@ -65,8 +33,7 @@ pub const CATEGORY_LOCAL_SIGNING: u32 = 7;
 /// `CS_VALIDATION_CATEGORY_NONE`: a signature in no category (an ad-hoc one).
 pub const CATEGORY_NONE: u32 = 10;
 
-/// The flags and categories above as the C names the SDK must agree with:
-/// `tests/proc_info_sdk.rs` asserts each on `arm64` and `x86_64`.
+/// C constant names and values checked against the macOS SDK.
 #[cfg(target_os = "macos")]
 pub const SDK_ROWS: &[(&str, i64)] = &[
     ("CS_VALID", CS_VALID as i64),
@@ -103,13 +70,10 @@ pub const SDK_ROWS: &[(&str, i64)] = &[
     ("CS_VALIDATION_CATEGORY_NONE", CATEGORY_NONE as i64),
 ];
 
-/// The bytes a `CS_OPS_IDENTITY` or `CS_OPS_TEAMID` answer is read into: the
-/// [`BLOB_HEADER`] and at most 247 bytes of text and its NUL. The kernel
-/// refuses a longer one (`ERANGE`).
+/// Buffer size for `CS_OPS_IDENTITY` or `CS_OPS_TEAMID` responses.
 pub const BLOB_CAP: usize = 256;
 
-/// The header xnu writes before the text: four zero bytes, then the whole
-/// answer's length (header, text and NUL), big-endian.
+/// 8-byte header written by xnu before blob text.
 pub const BLOB_HEADER: usize = 8;
 
 /// One process's identity, read now ([`identity`]).
@@ -119,12 +83,9 @@ pub struct Identity {
     pub exe: String,
     /// Its code-signing status flags (`CS_OPS_STATUS`); `None` when refused.
     pub cs_status: Option<u32>,
-    /// Its validation category (`CS_OPS_VALIDATION_CATEGORY`: 1 platform, 2
-    /// TestFlight, 3 development, 4 App Store, 5 enterprise, 6 Developer ID,
-    /// 7 local signing, 10 none); `None` when refused.
+    /// Validation category (`CS_OPS_VALIDATION_CATEGORY`), or `None` when refused.
     pub category: Option<u32>,
-    /// Its signing identifier (`CS_OPS_IDENTITY`); `None` when the kernel
-    /// holds none or the signature is not valid.
+    /// Signing identifier (`CS_OPS_IDENTITY`), or `None` when absent or invalid.
     pub signing_id: Option<String>,
     /// Its team id (`CS_OPS_TEAMID`), as [`team_of`] keeps it.
     pub team: Option<String>,
@@ -138,8 +99,7 @@ impl Identity {
     }
 }
 
-/// What a process's signature vouches for, by the kernel's status and
-/// validation category ([`voucher`]).
+/// What a process's signature vouches for ([`voucher`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Voucher {
     /// macOS's own: the platform flag and category 1.
@@ -152,19 +112,16 @@ pub enum Voucher {
     Development,
     /// An enterprise certificate (category 5).
     Enterprise,
-    /// Signed with no identity: local signing (category 7), or category 10
-    /// with an ad-hoc or linker signature.
+    /// Signed with no identity (category 7 or ad-hoc/linker category 10).
     AdHoc,
-    /// No signature: neither [`CS_SIGNED`] nor [`CS_VALID`] (the kernel then
-    /// refuses the category).
+    /// No signature (`CS_SIGNED` and `CS_VALID` both unset).
     Unsigned,
     /// Anything else, or a refused read.
     Unknown,
 }
 
 impl Voucher {
-    /// The wire word: `apple`, `app_store`, `developer_id`, `development`,
-    /// `enterprise`, `ad_hoc`, `unsigned`, `unknown`.
+    /// Returns the wire word for this voucher.
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
@@ -180,11 +137,7 @@ impl Voucher {
     }
 }
 
-/// What a signature with `status` flags and validation `category` vouches
-/// for. Unsigned is the status's alone, since the kernel refuses an unsigned
-/// process's category; Apple needs both the platform flag and category 1. A
-/// refused status, or a signed process's refused category, is
-/// [`Voucher::Unknown`]. PURE.
+/// Classifies code-signing `status` flags and validation `category` into a [`Voucher`].
 #[must_use]
 pub const fn voucher(status: Option<u32>, category: Option<u32>) -> Voucher {
     let Some(status) = status else {
@@ -208,10 +161,7 @@ pub const fn voucher(status: Option<u32>, category: Option<u32>) -> Voucher {
     }
 }
 
-/// The team id of a signature of validation `category`: `read` (the
-/// `CS_OPS_TEAMID` answer) is asked only for a developer's signature
-/// (categories 3–6), and its text kept only when [`is_team_id`]. PURE but
-/// for `read`.
+/// Returns the validated team ID for a developer signature category (3–6).
 #[must_use]
 pub fn team_of(category: Option<u32>, read: impl FnOnce() -> Option<String>) -> Option<String> {
     if !matches!(category, Some(CATEGORY_DEVELOPMENT..=CATEGORY_DEVELOPER_ID)) {
@@ -229,11 +179,7 @@ pub fn is_team_id(text: &str) -> bool {
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
 }
 
-/// The text of a `CS_OPS_IDENTITY` or `CS_OPS_TEAMID` answer `blob`: the
-/// bytes after the [`BLOB_HEADER`] up to the first NUL, whose header holds
-/// zeros and the answer's length. `None` for an empty text, one with no NUL
-/// in `blob`, a header that does not hold its length (a layout this decode
-/// does not read), or text that is not UTF-8. PURE.
+/// Extracts the NUL-terminated UTF-8 string from a `CS_OPS_IDENTITY` or `CS_OPS_TEAMID` blob.
 #[must_use]
 pub fn blob_text(blob: &[u8]) -> Option<String> {
     let (header, body) = blob.split_at_checked(BLOB_HEADER)?;
@@ -246,13 +192,7 @@ pub fn blob_text(blob: &[u8]) -> Option<String> {
     String::from_utf8(body[..end].to_vec()).ok()
 }
 
-/// `pid`'s identity, read now; `None` for pid 0 (`csops` would read the
-/// caller), when its image path cannot be read (the process is gone) or is
-/// another after the signature's reads (an exec between them, which keeps
-/// the pid and the birth: launchd's `xpcproxy` becoming its service), and
-/// off macOS. A birth read again after guards only against an exit and the
-/// pid's reuse: a caller that keeps an identity reads it again when the
-/// process's image changes (its name in the next sweep).
+/// Reads `pid`'s executable basename and code-signing identity from the kernel.
 #[must_use]
 pub fn identity(pid: u32) -> Option<Identity> {
     if pid == 0 {
@@ -274,13 +214,7 @@ mod imp {
     /// `CS_OPS_VALIDATION_CATEGORY`: the validation category, a `u32`.
     const CS_OPS_VALIDATION_CATEGORY: u32 = 17;
 
-    // Declared here rather than in `crates/aterm-libc`, whose cells are
-    // generated from the crates.io `libc` and held to it by `libc-oracle`
-    // item for item: upstream does not declare `csops`. It is a libSystem
-    // export (`libsystem_kernel`) and takes no `$`-suffixed link name on
-    // either Darwin arch. Only its read operations are passed here.
     unsafe extern "C" {
-        /// `int csops(pid_t, unsigned int ops, void *useraddr, size_t usersize)`
         /// — xnu `bsd/sys/codesign.h`; no SDK header declares it.
         fn csops(
             pid: libc::pid_t,
@@ -293,18 +227,15 @@ mod imp {
     /// One `u32` answer of `ops` for `pid` (above 0); `None` when refused.
     fn word(pid: libc::pid_t, ops: u32) -> Option<u32> {
         let mut out = 0u32;
-        // SAFETY: `out` is a live `u32` and the size passed is its own; `ops`
-        // is a read operation, which writes at most that many bytes.
+        // SAFETY: `out` is a writable `u32` matching the passed size.
         let rc = unsafe { csops(pid, ops, (&raw mut out).cast(), std::mem::size_of::<u32>()) };
         (rc == 0).then_some(out)
     }
 
-    /// The text of one blob answer of `ops` for `pid` (above 0); `None` when
     /// refused, longer than [`BLOB_CAP`] or not decoded.
     fn text(pid: libc::pid_t, ops: u32) -> Option<String> {
         let mut blob = [0u8; BLOB_CAP];
-        // SAFETY: `blob` is `BLOB_CAP` writable bytes, the size passed, and
-        // the kernel copies no more than that (`ERANGE` past it).
+        // SAFETY: `blob` is `BLOB_CAP` writable bytes matching the passed size.
         let rc = unsafe { csops(pid, ops, blob.as_mut_ptr().cast(), blob.len()) };
         if rc != 0 {
             return None;
@@ -326,8 +257,6 @@ mod imp {
             signing_id: text(cs_pid, CS_OPS_IDENTITY),
             team,
         };
-        // An exec between the reads would mix two images' answers: they
-        // stand only when the image read after them is the one read before.
         (crate::process_path(pid)? == path).then_some(read)
     }
 }

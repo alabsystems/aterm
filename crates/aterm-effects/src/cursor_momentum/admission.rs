@@ -290,6 +290,7 @@ pub fn admit_tick(
 }
 
 /// The admitted geometry, narrowed: every extent fits `u16`, so the budget's
+/// arithmetic starts from small integers.
 #[derive(Clone, Copy, Debug)]
 struct Grid {
     cw: u16,
@@ -366,9 +367,12 @@ const WIDEST: f32 = 1.0;
 const LIGHT_ELLIPSE_SEGMENTS: i64 = 24;
 
 /// Each `push_fx_ramp` call per working dark-halo row: both sides of every
+/// knot pair.
 const DARK_CALLS_PER_ROW: usize = 2 * HALO_SEGMENTS;
 
 /// `emit_halo`'s worst case over every amplitude (the module docs): the
+/// engine's row grid at `s = 1`, eight calls per working row, one quad per
+/// `ch`-band each call's clipped row meets.
 fn dark_halo_budget((cr, cc): (u16, u16), geom: &Geom, g: &Grid, radius: f32) -> Option<usize> {
     let (cw, ch) = (geom.cw as f32, geom.ch as f32);
     let (_, cy) = geom.cell_center(cr, cc);
@@ -414,6 +418,8 @@ fn dark_halo_budget((cr, cc): (u16, u16), geom: &Geom, g: &Grid, radius: f32) ->
 }
 
 /// `emit_light_halo`'s worst case over every amplitude (the module docs): the
+/// slabs that can meet the clip at `s = 1` times the rows a slab can cover,
+/// capped by `ribbon_beam`'s own budget.
 fn light_halo_budget((cr, cc): (u16, u16), geom: &Geom, g: &Grid, radius: f32) -> Option<usize> {
     let cw = geom.cw as f32;
     let (cx, _) = geom.cell_center(cr, cc);

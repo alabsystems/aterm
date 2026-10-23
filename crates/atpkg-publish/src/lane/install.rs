@@ -2,25 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `atpkg-publish lane install <alab|linux>` and `lane disarm`: snapshot and arm.
-//!
-//! * refuse a box with no machine key or record (the lane signs; a Linux builder that only
-//!   stages for another machine's ceremony says `--keyless`), and a checkout whose build
-//!   inputs differ from HEAD unless `--allow-dirty` (recorded);
-//! * hold the lane's lock across build → swap → arm, so no run is torn down mid-publish;
-//! * build `atpkg-publish` with the store's `targo --unverified build --release --locked`
-//!   into `<state>/build/target.noindex` (Spotlight skips it), copy it to a unique
-//!   `<state>/lane.<stamp>.<suffix>/` and
-//!   record `INSTALLED-FROM` (commit, dirty list, toolchain); only a successful arm swaps
-//!   the `lane` link (one rename) and prunes older snapshots, keeping the previous one for
-//!   rollback; `--no-arm` only builds and renders;
-//! * render the units ([`super::units`]) naming the snapshot path and its sha256, lint them
-//!   (`plutil -lint`, `systemd-analyze --user verify`), and arm them: launchd booted out
-//!   and bootstrapped into `gui/<uid>`; systemd reloaded and the timer enabled `--now`;
-//! * `disarm` boots the agent out or disables the timer and removes the units, leaving the
-//!   snapshot for inspection; it also removes the retired vendor agent.
-//!
-//! The build and the service manager are injected ([`Machine`]), so every step but the
-//! real `launchctl`/`systemctl` is tested on rendered files in a scratch home.
 
 use std::path::{Path, PathBuf};
 
@@ -58,9 +39,7 @@ pub struct InstallFlags {
 
 impl InstallFlags {
     /// Parse `lane install <lane>`'s flags.
-    ///
     /// # Errors
-    ///
     /// A usage error naming the flag.
     pub fn parse(args: &[String]) -> Result<Self> {
         let mut f = Self::default();
@@ -93,9 +72,7 @@ pub struct Built {
 /// Builds the snapshot's binary.
 pub trait SnapshotBuilder {
     /// Build `atpkg-publish` from `repo` into `target_dir`.
-    ///
     /// # Errors
-    ///
     /// Why the build could not run or failed.
     fn build(&self, repo: &Path, target_dir: &Path, log: &Path) -> Result<Built>;
 }
@@ -112,23 +89,17 @@ pub enum Lint {
 /// The service manager.
 pub trait ServiceManager {
     /// Lint the rendered units at `paths`.
-    ///
     /// # Errors
-    ///
     /// The linter's refusal.
     fn lint(&self, kind: LaneKind, paths: &[PathBuf]) -> Result<Lint>;
 
     /// (Re)arm the installed units at `paths`.
-    ///
     /// # Errors
-    ///
     /// Why the manager refused.
     fn arm(&self, kind: LaneKind, paths: &[PathBuf]) -> Result<()>;
 
     /// Stop the lane's units (and the retired vendor agent).
-    ///
     /// # Errors
-    ///
     /// Why the manager refused.
     fn disarm(&self, kind: LaneKind) -> Result<()>;
 }
@@ -151,9 +122,7 @@ pub struct Machine {
 
 impl Machine {
     /// The machine this process runs on.
-    ///
     /// # Errors
-    ///
     /// A refusal on a host that is neither macOS nor Linux.
     pub fn production(ctx: &Ctx) -> Result<Self> {
         let os = if cfg!(target_os = "macos") {
@@ -165,7 +134,6 @@ impl Machine {
                 "the lanes run on macOS (alab) and Linux (linux)",
             ));
         };
-        // systemd's own rule for the user unit directory.
         let config = std::env::var_os("XDG_CONFIG_HOME")
             .filter(|v| !v.is_empty())
             .map_or_else(|| ctx.home.join(".config"), PathBuf::from);
@@ -191,9 +159,7 @@ impl Machine {
     }
 
     /// Refuse a lane this machine's service manager does not run.
-    ///
     /// # Errors
-    ///
     /// The refusal naming the OS the lane runs on.
     pub fn check_os(&self, kind: LaneKind) -> Result<()> {
         let wants = match kind {
@@ -242,9 +208,7 @@ pub struct Installed {
 }
 
 /// `atpkg-publish lane install <lane> [--allow-dirty] [--no-arm] [--keyless]`.
-///
 /// # Errors
-///
 /// What [`install_with`] answers.
 pub fn install(ctx: &Ctx, kind: LaneKind, flags: &InstallFlags) -> Result<()> {
     let tx = Transcript::new("lane install", super::report::Sink::Stdout);
@@ -252,12 +216,8 @@ pub fn install(ctx: &Ctx, kind: LaneKind, flags: &InstallFlags) -> Result<()> {
 }
 
 /// The install, over an injected machine.
-///
 /// # Errors
-///
-/// A refusal for the wrong OS, a missing machine key or record, a dirty checkout, a lane run in
-/// flight, a build that produced nothing, a snapshot that does not hash to its build, or a
-/// unit its linter refuses.
+/// A refusal for the wrong OS, a missing machine key or record, a dirty checkout, a lane run in flight, a build that produced nothing, a snapshot that does not hash to its build, or a unit its linter refuses.
 #[allow(clippy::too_many_lines)]
 pub fn install_with(
     ctx: &Ctx,
@@ -268,8 +228,6 @@ pub fn install_with(
 ) -> Result<Installed> {
     machine.check_os(kind)?;
     let keyless_ok = kind == LaneKind::Linux && flags.keyless;
-    // A run signs through `identity::signer_for`, which reads both the key and its record:
-    // arm nothing whose first real run would refuse.
     let identity = [
         ("machine key", &ctx.identity.key),
         ("machine record", &ctx.identity.record),
@@ -312,8 +270,6 @@ pub fn install_with(
         ));
     }
 
-    // The unit pins XDG_CONFIG_HOME: the store a run resolves through it must be the one
-    // whose shims the unit's PATH names.
     if atpkg::toolchain::atpkg_prefix(&ctx.home, Some(&machine.config_home)) != ctx.pkg_prefix {
         return Err(Error::refused(format!(
             "the atpkg store this install resolved ({}) is not the one {} names — set \
@@ -335,7 +291,6 @@ pub fn install_with(
         }
     };
 
-    // --- build into a target dir of its own, never the checkout's ----------------------
     let build_dir = ctx.state_dir.join("build");
     std::fs::create_dir_all(&build_dir)
         .map_err(|e| Error::io(format!("mkdir {}", build_dir.display()), &e))?;
@@ -347,8 +302,6 @@ pub fn install_with(
     let built = machine
         .builder
         .build(repo, &build_dir.join("target.noindex"), &log)?;
-    // The checkout is shared: an edit or commit that landed during the build was compiled
-    // into the signer, and INSTALLED-FROM would name a tree it was not built from.
     if Inputs::read(repo)? != before {
         return Err(Error::refused(format!(
             "the build inputs of {} changed while the snapshot was building (HEAD, an edit, \
@@ -359,11 +312,7 @@ pub fn install_with(
     let built_hash = atpkg::tree::sha256_file(&built.binary)
         .map_err(|e| Error::io(format!("hash {}", built.binary.display()), &e))?;
 
-    // --- a fresh snapshot, beside the live one -------------------------------------------
     let stamp = stamp(ctx.now_unix);
-    // An incremental reinstall can start in the same second as the previous one.
-    // Armed units name these immutable paths directly, so a clock stamp is only a
-    // readable prefix: exclusive creation supplies the unique suffix.
     let snapshot_dir = aterm_tempfile::Builder::new()
         .prefix(&format!("lane.{stamp}."))
         .tempdir_in(&ctx.state_dir)
@@ -400,13 +349,8 @@ pub fn install_with(
         built.toolchain
     );
     super::report::write_atomic(&snapshot.join("INSTALLED-FROM"), &installed_from)?;
-    // From rendering onward a unit may name this directory. Failed linting or
-    // arming also leaves it available for inspection and a later successful install.
     let snapshot = snapshot_dir.keep();
 
-    // Older (shell-lane) units name paths through the `lane` link, so it moves only once
-    // the manager has switched to this binary: --no-arm and a failed arm must leave the old
-    // executable reachable.
     let link = ctx.state_dir.join("lane");
     let previous = std::fs::read_link(&link).ok().filter(|p| *p != snapshot);
     tx.say(format!(
@@ -418,7 +362,6 @@ pub fn install_with(
             .unwrap_or_default()
     ));
 
-    // --- render, lint, arm -----------------------------------------------------------------
     let spec = UnitSpec {
         kind,
         binary: binary.clone(),
@@ -430,8 +373,6 @@ pub fn install_with(
     };
     let rendered_dir = ctx.state_dir.join("units");
     let rendered = write_units(&rendered_dir, &units::render(&spec))?;
-    // Linted where the manager will read them: systemd resolves a unit's references
-    // against its own search path, so an armed unit is linted in place.
     let armed = if flags.no_arm {
         Vec::new()
     } else {
@@ -443,7 +384,6 @@ pub fn install_with(
     {
         Ok(lint) => lint,
         Err(e) => {
-            // A unit its linter refuses never stays where the manager would load it.
             for p in &armed {
                 let _ = std::fs::remove_file(p);
             }
@@ -471,8 +411,6 @@ pub fn install_with(
         return Ok(out);
     }
     machine.services.arm(kind, &out.armed)?;
-    // Commit the convenience/legacy alias only once every arm step succeeds. Reserve
-    // a unique empty path for an older plain directory so it is retained for rollback.
     if link.is_dir() && !is_symlink(&link) {
         let legacy = aterm_tempfile::Builder::new()
             .prefix(&format!("lane.legacy.{stamp}."))
@@ -483,8 +421,6 @@ pub fn install_with(
         out.previous = Some(legacy.keep());
     }
     swap_link(&link, &out.snapshot)?;
-    // Until arming succeeds the manager may still hold an older unit naming any
-    // retained snapshot. Failed and --no-arm installs therefore never prune.
     for entry in std::fs::read_dir(&ctx.state_dir)
         .map_err(|e| Error::io(format!("read {}", ctx.state_dir.display()), &e))?
         .flatten()
@@ -523,11 +459,8 @@ pub fn install_with(
     Ok(out)
 }
 
-/// `atpkg-publish lane disarm <lane>`: stop the units and remove them; the snapshot is
-/// left for inspection.
-///
+/// `atpkg-publish lane disarm <lane>`: stop the units and remove them; the snapshot is left for inspection.
 /// # Errors
-///
 /// Why the service manager refused.
 pub fn disarm(ctx: &Ctx, kind: LaneKind, machine: &Machine) -> Result<()> {
     machine.check_os(kind)?;
@@ -584,12 +517,9 @@ impl Inputs {
 }
 
 /// The build inputs that differ from HEAD: changed against it, or untracked.
-///
 /// # Errors
-///
 /// When `repo` is not a work tree.
 pub fn dirty_inputs(repo: &Path) -> Result<Vec<String>> {
-    // Names only: a status column would be trimmed off the first line of git's output.
     let mut dirty = Vec::new();
     for head in [
         &["diff", "--name-only", "HEAD", "--"][..],
@@ -673,9 +603,7 @@ fn write_units(dir: &Path, units: &[Unit]) -> Result<Vec<PathBuf>> {
         .collect()
 }
 
-/// The production build: the atpkg store's `targo`, in the explicit unverified lane, with
-/// `--locked` (the lockfile is the reviewed dependency set) and the scrubbed environment
-/// no stage of the workspace may inherit (a `RUSTFLAGS` replaces the config's flags).
+/// The production build: the atpkg store's `targo`, in the explicit unverified lane, with `--locked` (the lockfile is the reviewed dependency set) and the scrubbed environment no stage of the workspace may inherit (a `RUSTFLAGS` replaces the config's flags).
 #[derive(Debug)]
 pub struct TargoBuild {
     /// The store's Trust bin dir.
@@ -782,9 +710,7 @@ impl ServiceManager for Launchd {
         self.retire_vendor(&uid);
         for p in paths {
             let domain = format!("gui/{uid}/{}", units::LAUNCHD_LABEL);
-            // Not loaded is the usual answer, and the lock means no run is in flight.
             let _ = run_tool("launchctl", &["bootout", &domain]);
-            // launchd never rotates its own capture: fresh per arm.
             let _ = std::fs::write(self.state_dir.join("alab.launchd.log"), b"");
             let out = run_tool(
                 "launchctl",
@@ -826,11 +752,8 @@ impl Launchd {
     }
 }
 
-/// `plutil -lint` over rendered plists — what launchd reads. Off macOS there is no
-/// `plutil`: said, never a pass.
-///
+/// `plutil -lint` over rendered plists — what launchd reads.
 /// # Errors
-///
 /// `plutil`'s refusal.
 pub fn lint_plists(paths: &[PathBuf]) -> Result<Lint> {
     if !Path::new("/usr/bin/plutil").is_file() {
@@ -855,11 +778,8 @@ pub struct Systemd {
     pub unit_dir: PathBuf,
 }
 
-/// `systemd-analyze --user verify` over rendered units, where systemd is (said, never a
-/// pass, where it is not).
-///
+/// `systemd-analyze --user verify` over rendered units, where systemd is (said, never a pass, where it is not).
 /// # Errors
-///
 /// The verifier's refusal.
 pub fn lint_systemd(paths: &[PathBuf]) -> Result<Lint> {
     let Ok(out) = aterm_uds::spawnfd::command("systemd-analyze")

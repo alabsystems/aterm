@@ -1,33 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The producer half of the machine-roster tier: this machine's public identity, the
-//! cut-time gate that proves it is still authorized, and the stamp that puts attribution
-//! inside the signed appcast bytes.
-//!
-//! [`authorize_cut`] answers "may this machine publish?": the signing key must belong to a
-//! machine named by a valid, unrevoked roster signed by a pinned paper master
-//! (`aterm_update_core::pins::PAPER_MASTER_PUBKEYS`). It runs the client's own verifier
-//! over the bytes to be published, and the client consults nothing else
-//! (`aterm_update::github::fetch_authoritative_release`). It judges freshness only; the
-//! client's replay floor is channel state, judged by `publish::roster_floor_covered`. The
-//! two together are the client's chain. The call order is the safety argument:
-//!
-//! * [`authorize_cut`] runs from `publish::preflight_signature_policy` with the other
-//!   pre-claim gates, before the ledger burns a build number or anything remote changes,
-//!   and only for a `publish::RosterDuty::Sign` entry (a re-entry finishing signed bytes
-//!   has no attribution left to choose).
-//! * [`attribute`] runs in `publish::stage_manifest`, between assembly and serialization,
-//!   so the attribution is inside the signed bytes.
-//! * [`RosterDocument`] is carried from the gate to the build step, so the roster that
-//!   authorized the cut is byte-identically the one it publishes.
-//! * [`verify_published_roster`] proves that a roster downloaded from a published release
-//!   (recovery), or about to be uploaded from `dist/` (`publish::step_publish`), is the one
-//!   that release's signed manifest names.
-//!
-//! The identity file ([`MachineIdentity`], `~/.aterm/machine.toml`) holds no secret; the
-//! key (`~/.aterm/machine.key`) is loaded only by `sign.rs`. `tests/it/machine_roster.rs`
-//! exercises the rules with synthetic masters.
+//! The producer half of the machine-roster tier: this machine's public identity, the cut-time gate that proves it is still authorized, and the stamp that puts attribution inside the signed appcast bytes.
 
 use std::path::{Path, PathBuf};
 
@@ -36,23 +10,20 @@ use aterm_update_core::roster::{Attribution, Roster, verify_roster};
 
 use crate::ledger::{Error, Result};
 
-/// This machine's public identity, as `atpkg-keys setup`/`join` recorded it. Every field is
-/// public, so `Debug` is not redacted (unlike `sign.rs`'s `ReleaseCredentials`).
+/// This machine's public identity, as `atpkg-keys setup`/`join` recorded it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct MachineIdentity {
-    /// The machine id — `"m3"`. What a verifier reports and a deny-list names.
+    /// The machine id — `"m3"`.
     pub id: String,
-    /// The machine's base64 Ed25519 public key. The secret half never leaves this machine.
+    /// The machine's base64 Ed25519 public key.
     pub pubkey: String,
-    /// RFC3339 mint time. Informational.
+    /// RFC3339 mint time.
     #[serde(default)]
     pub minted_at: String,
 }
 
 impl MachineIdentity {
-    /// Read the identity from `path`. A missing file is `Ok(None)`, the ordinary state of a
-    /// machine that does not publish; a present but unreadable or incomplete one is an error,
-    /// since guessing an identity is the silent wrong answer attribution exists to prevent.
+    /// Read the identity from `path`.
     pub fn read(path: &Path) -> Result<Option<Self>> {
         if !path.exists() {
             return Ok(None);
@@ -72,17 +43,12 @@ impl MachineIdentity {
     }
 }
 
-/// `~/.aterm/machine.toml`, beside the key `atpkg-keys setup`/`join` wrote. `None` without
-/// `HOME`: the path is only a cross-check, so not finding it must not refuse a cut.
+/// `~/.aterm/machine.toml`, beside the key `atpkg-keys setup`/`join` wrote.
 pub fn conventional_identity_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".aterm/machine.toml"))
 }
 
-/// What this machine claims its id is: the release-credentials profile's `machine_id` when
-/// set (it is part of the command that ran), else `~/.aterm/machine.toml`. The claim only
-/// feeds one comparison against the roster's key-to-id map, where a disagreement refuses
-/// the cut: it can narrow what is accepted, never widen it, so reading this ambient state
-/// re-opens nothing `--release-credentials` closed.
+/// What this machine claims its id is: the release-credentials profile's `machine_id` when set (it is part of the command that ran), else `~/.aterm/machine.toml`.
 pub fn declared_machine_id(
     profile_machine_id: Option<&str>,
     identity_path: Option<&Path>,
@@ -96,9 +62,7 @@ pub fn declared_machine_id(
     Ok(MachineIdentity::read(path)?.map(|identity| identity.id))
 }
 
-/// The master-signed roster and its detached signature, read once. They travel together
-/// (either alone proves nothing), and the bytes are held rather than the path so the cut
-/// publishes exactly the roster that authorized it. Nothing here is secret.
+/// The master-signed roster and its detached signature, read once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RosterDocument {
     /// The exact `aterm-machines.toml` bytes, unparsed and unmodified.
@@ -108,8 +72,7 @@ pub struct RosterDocument {
 }
 
 impl RosterDocument {
-    /// The detached signature's conventional name, `<roster>.sig`: one name in the profile,
-    /// so a second key cannot point at a signature over a different roster.
+    /// The detached signature's conventional name, `<roster>.sig`: one name in the profile, so a second key cannot point at a signature over a different roster.
     #[must_use]
     pub fn signature_path(roster: &Path) -> PathBuf {
         let mut name = roster.as_os_str().to_os_string();
@@ -117,8 +80,7 @@ impl RosterDocument {
         PathBuf::from(name)
     }
 
-    /// Read both halves, naming whichever is missing. A missing file is an error, not `None`:
-    /// this runs only once the tier is armed and the profile names a roster.
+    /// Read both halves, naming whichever is missing.
     pub fn read(roster: &Path) -> Result<Self> {
         let signature_path = Self::signature_path(roster);
         let bytes = std::fs::read(roster).map_err(|e| {
@@ -139,33 +101,16 @@ impl RosterDocument {
     }
 }
 
-/// How much of the freshness window a cut must still have ahead of it. Every client checks
-/// `valid_until` at a later clock than the producer (by the cut's length plus its poll
-/// delay), and `fetch_authoritative_release` has no fallback to an older release, so a
-/// roster admitted with seconds left publishes a head the fleet refuses until a re-signed
-/// cut. Six hours covers a universal build, notarization and upload (most of an hour) and
-/// the clients' polls after it.
+/// How much of the freshness window a cut must still have ahead of it.
 pub const MIN_REMAINING_WINDOW_SECS: i64 = 6 * 60 * 60;
 
-/// The master-admitted roster on the public channel's latest release: its `roster_seq`
-/// and verified bytes, or `None` when that release carries no roster. That generation is
-/// the fleet's floor (clients ratchet on observing the asset, `Floor::bump_and_write`),
-/// and it can be newer than the head manifest's `roster_seq`, since a join attaches the
-/// new pair to releases already published. The bytes matter at equal generation: two
-/// machines that each minted N+1 from the same seed agree on the number and disagree on
-/// the document ([`roster_lineage_agrees`]).
-///
-/// Fetched anonymously (`releases/latest/download/…`, as `provision` seeds) and admitted
-/// under the committed paper master, so a forged asset cannot ratchet the producer. A
-/// transport or verification failure is an error; the caller fails the gate on it.
+/// The master-admitted roster on the public channel's latest release: its `roster_seq` and verified bytes, or `None` when that release carries no roster.
 pub(crate) fn channel_roster_document(
     slug: &str,
 ) -> std::result::Result<Option<(u64, Vec<u8>)>, String> {
     let url = |asset: &str| format!("https://github.com/{slug}/releases/latest/download/{asset}");
     let bytes = match anonymous_fetch(&url(aterm_update_core::roster::ROSTER_ASSET), 65_536) {
         Ok(b) => b,
-        // No roster on the latest release: no floor. Anything but a clean 404 in curl -f's
-        // stderr is "cannot tell", never "none".
         Err(e) if e.contains("returned error: 404") => return Ok(None),
         Err(e) => return Err(e),
     };
@@ -179,10 +124,7 @@ pub(crate) fn channel_roster_document(
     Ok(Some((parsed.roster_seq, verified.as_slice().to_vec())))
 }
 
-/// At equal generation the cut's roster (the pair in `dist/`) and the channel's must be the
-/// same document; otherwise two lineages exist at one number, and whichever ships later
-/// strands every client that ratcheted on the other. `None` channel: nothing to disagree
-/// with.
+/// At equal generation the cut's roster (the pair in `dist/`) and the channel's must be the same document; otherwise two lineages exist at one number, and whichever ships later strands every client that ratcheted on the other.
 pub(crate) fn roster_lineage_agrees(
     local_roster: &[u8],
     carried_seq: Option<u64>,
@@ -237,15 +179,7 @@ fn anonymous_fetch(url: &str, cap: usize) -> std::result::Result<Vec<u8>, String
     Ok(out.stdout)
 }
 
-/// The cut-time gate: prove that `signing_pubkey` belongs to a machine the roster
-/// authorizes, and return the attribution the manifest will carry.
-///
-/// It runs the client's verifier, in the client's order (master signature, parse,
-/// freshness, deny-list, identity), over the bytes to be published: a gate that checked
-/// other conditions would pass releases the fleet rejects. Freshness is judged at
-/// `now_unix + MIN_REMAINING_WINDOW_SECS`. The replay floor is passed as 0: it is channel
-/// state, which [`crate::publish::roster_floor_covered`] judges pre-claim and again under
-/// the lease. `now_unix` is injected so every expiry case is testable.
+/// The cut-time gate: prove that `signing_pubkey` belongs to a machine the roster authorizes, and return the attribution the manifest will carry.
 pub fn authorize_cut(
     master_pubkeys: &[&str],
     roster_bytes: Vec<u8>,
@@ -261,7 +195,6 @@ pub fn authorize_cut(
     })?;
     let roster = Roster::parse(&verified)
         .map_err(|e| Error::new(format!("the machine roster is unusable ({e:?})")))?;
-    // Replay floor 0 (`publish::roster_floor_covered` owns it); freshness at the horizon.
     roster
         .admit(0, now_unix.saturating_add(MIN_REMAINING_WINDOW_SECS))
         .map_err(|e| {
@@ -274,9 +207,6 @@ pub fn authorize_cut(
             ))
         })?;
 
-    // Compared as base64 text, which is as strict as the client: the cut's key has been
-    // through `publish::canonical_update_pubkey`, and the decoder both sides use refuses
-    // non-canonical padding and trailing bits.
     let me = roster
         .machines
         .iter()
@@ -288,8 +218,6 @@ pub fn authorize_cut(
                  join --id <id>`, or cut from a machine that is listed"
             ))
         })?;
-    // Revocation through the client's own lookup, so a cut-off machine cannot publish one
-    // last release from a stale local roster.
     let machine = roster.machine(&me.id, now_unix).map_err(|e| {
         Error::new(format!(
             "this machine ({}) may not sign: {e:?}. If it was revoked, that is the \
@@ -304,10 +232,7 @@ pub fn authorize_cut(
     })
 }
 
-/// Which key the roster maps `id` to, for refusal messages only: the mismatch refusal in
-/// [`crate::publish::channel_signature_policy`] offers "cut with the key that belongs to
-/// <id>" only when the roster names that machine. `None` when the roster does not verify,
-/// parse, or name the id. It authorizes nothing; [`authorize_cut`] does.
+/// Which key the roster maps `id` to, for refusal messages only: the mismatch refusal in [`crate::publish::channel_signature_policy`] offers "cut with the key that belongs to <id>" only when the roster names that machine.
 #[must_use]
 pub fn roster_pubkey_for(
     master_pubkeys: &[&str],
@@ -324,15 +249,7 @@ pub fn roster_pubkey_for(
         .map(|m| m.pubkey.clone())
 }
 
-/// Prove that a roster downloaded from an already published release (or about to be
-/// uploaded from `dist/`) is the document that release's manifest is attributed under, and
-/// return the asset's `roster_seq`. The manifest neither signs nor digests the roster
-/// assets, so they are bound by the master's signature (authorship) and the manifest's
-/// signed `machine_id`/`roster_seq` (this release's roster).
-///
-/// Freshness and the deny-list are not re-judged: [`authorize_cut`] admitted these bytes,
-/// they already shipped, and recovery could only cure such a failure by publishing
-/// different bytes. Clients judge both for themselves.
+/// Prove that a roster downloaded from an already published release (or about to be uploaded from `dist/`) is the document that release's manifest is attributed under, and return the asset's `roster_seq`.
 pub fn verify_published_roster(
     master_pubkeys: &[&str],
     roster_bytes: Vec<u8>,
@@ -350,10 +267,6 @@ pub fn verify_published_roster(
     })?;
     let roster = Roster::parse(&verified)
         .map_err(|e| Error::new(format!("the published machine roster is unusable ({e:?})")))?;
-    // `machine_id`/`roster_seq` are inside the manifest's signed bytes. The asset may be
-    // newer than the attribution (a join attaches the new pair to releases already
-    // shipped), as the client admits (`Attribution::bind`: manifest seq <= roster seq); an
-    // older asset, or no attribution, is a roster the manifest does not name.
     match roster_seq {
         Some(claimed) if claimed <= roster.roster_seq => {}
         _ => {
@@ -373,13 +286,10 @@ pub fn verify_published_roster(
              contradicts the signed manifest"
         )));
     }
-    // The asset's own generation, what a recovery writes.
     Ok(roster.roster_seq)
 }
 
-/// Stamp attribution into the manifest before it is serialized and signed: `machine_id`
-/// makes the signature unrelabellable and `roster_seq` stops an old roster being paired
-/// with this release. Stamped after signing, either could be rewritten.
+/// Stamp attribution into the manifest before it is serialized and signed: `machine_id` makes the signature unrelabellable and `roster_seq` stops an old roster being paired with this release.
 pub fn attribute(manifest: &mut Manifest, who: &Attribution) {
     manifest.machine_id = Some(who.machine_id.clone());
     manifest.roster_seq = Some(who.roster_seq);
@@ -394,7 +304,6 @@ mod tests {
     }
     use ring::signature::{Ed25519KeyPair, KeyPair};
 
-    // Obviously synthetic seeds; they appear nowhere but here.
     const MASTER: [u8; 32] = [0x51; 32];
     const M3: [u8; 32] = [0x52; 32];
     const M11: [u8; 32] = [0x53; 32];
@@ -444,8 +353,6 @@ mod tests {
         let one_second_left = FIXTURE_VALID_UNTIL - 1;
         let (bytes, sig, master) = roster(&[]);
         authorize_cut(&[&master], bytes, &sig, &pk(&M3), one_second_left).unwrap_err();
-        // Precondition, so the refusal above is not vacuous: the client's own rule (no
-        // margin) still admits this roster at this instant.
         let (bytes, sig, master) = roster(&[]);
         let verified = verify_roster(&[&master], bytes, &sig).unwrap();
         Roster::parse(&verified)
@@ -453,7 +360,6 @@ mod tests {
             .admit(0, one_second_left)
             .expect("the client's bound is still open — only the producer looks ahead");
 
-        // The boundary: exactly the window left refuses; one second more admits.
         let just_short = FIXTURE_VALID_UNTIL - MIN_REMAINING_WINDOW_SECS;
         let (bytes, sig, master) = roster(&[]);
         assert!(authorize_cut(&[&master], bytes, &sig, &pk(&M3), just_short).is_err());
@@ -462,7 +368,7 @@ mod tests {
     }
 
     /// Two master-signed documents at the same generation are a lineage fork, which the number
-    /// admits, so the bytes decide. Different generations, or no channel roster, are not.
+    /// admits, so the bytes decide.
     #[test]
     fn an_equal_generation_with_a_different_document_is_a_lineage_fork() {
         let ours = b"roster_seq = 4\n[[machine]]\nid = \"m3\"\n".to_vec();
@@ -482,7 +388,6 @@ mod tests {
         let (bytes, sig, master) = roster(&[]);
         verify_published_roster(&[&master], bytes.clone(), &sig, "m3", Some(6))
             .expect("the roster this manifest names");
-        // A lapsed roster still recovers: the bytes already shipped.
         let lapsed = Roster::parse(&verify_roster(&[&master], bytes.clone(), &sig).unwrap())
             .unwrap()
             .admit(0, 1_900_000_000);
@@ -490,14 +395,11 @@ mod tests {
         verify_published_roster(&[&master], bytes.clone(), &sig, "m3", Some(6))
             .expect("recovery does not re-judge a window it cannot change");
 
-        // What refuses: a manifest claiming a newer generation than the asset (7 over 6),
-        // or none. An asset newer than the attribution (after a join) recovers.
         verify_published_roster(&[&master], bytes.clone(), &sig, "m3", Some(7)).unwrap_err();
         verify_published_roster(&[&master], bytes.clone(), &sig, "m3", None).unwrap_err();
         verify_published_roster(&[&master], bytes.clone(), &sig, "m3", Some(5))
             .expect("a newer roster asset over an older attribution is what a join produces");
         verify_published_roster(&[&master], bytes.clone(), &sig, "m99", Some(6)).unwrap_err();
-        // An unarmed tree cannot check a rostered release, and says so.
         verify_published_roster(&[], bytes, &sig, "m3", Some(6)).unwrap_err();
     }
 

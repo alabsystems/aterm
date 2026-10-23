@@ -117,7 +117,7 @@ impl DigestBuilder {
     }
 
     #[inline]
-    pub(crate) fn finish(self) -> Digest {
+    pub(crate) const fn finish(self) -> Digest {
         Digest(self.0.finalize())
     }
 }

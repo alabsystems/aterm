@@ -31,6 +31,7 @@ pub const RESTATE_QUIET: Duration = Duration::from_mins(10);
 pub const STANDING_QUIET: Duration = Duration::from_hours(24);
 
 /// Stems a reason may not lean on: it says why a person is needed, not that something
+/// is pending.
 const WAITING_STEMS: [&str; 10] = [
     "waiting",
     "retry",
@@ -208,13 +209,13 @@ impl Mover {
 
     /// Open `aterm.toml` at the line that is wrong.
     #[must_use]
-    pub fn open_config_editor(line: Option<u32>) -> Self {
+    pub const fn open_config_editor(line: Option<u32>) -> Self {
         Self(Intent::OpenConfigEditor { line })
     }
 
     /// Open a new window (the GPU-lost remedy).
     #[must_use]
-    pub fn new_window() -> Self {
+    pub const fn new_window() -> Self {
         Self(Intent::NewWindow)
     }
 
@@ -229,7 +230,7 @@ impl Mover {
 
     /// The intent the capsule carries.
     #[must_use]
-    pub fn intent(&self) -> &Intent {
+    pub const fn intent(&self) -> &Intent {
         &self.0
     }
 }
@@ -271,7 +272,7 @@ impl Then {
 
     /// The button, when one press does it.
     #[must_use]
-    pub fn mover(&self) -> Option<&Mover> {
+    pub const fn mover(&self) -> Option<&Mover> {
         self.mover.as_ref()
     }
 
@@ -452,6 +453,7 @@ enum Stay {
     /// A transient row.
     For(Span),
     /// A decision row: a question that waits ten minutes for a yes or a no
+    /// ([`Hold::Ask`]).
     Question,
     /// Until resolved or read. The fact's identity is the row's key.
     Standing,
@@ -462,7 +464,7 @@ enum Stay {
 impl Ask {
     /// A transient ask.
     #[must_use]
-    pub fn flash(why: Why, then: Then, span: Span) -> Self {
+    pub const fn flash(why: Why, then: Then, span: Span) -> Self {
         Self {
             why,
             then,
@@ -482,7 +484,7 @@ impl Ask {
 
     /// A decision row.
     #[must_use]
-    pub fn question(why: Reason, then: Then) -> Self {
+    pub const fn question(why: Reason, then: Then) -> Self {
         Self {
             why: Why::Question(why),
             then,
@@ -501,7 +503,7 @@ impl Ask {
 
     /// The hold the ask earns.
     #[must_use]
-    pub fn hold(&self) -> Hold {
+    pub const fn hold(&self) -> Hold {
         match &self.stay {
             Stay::For(span) => Hold::For(span.duration()),
             Stay::Question => Hold::Ask {
@@ -514,25 +516,25 @@ impl Ask {
 
     /// The reason.
     #[must_use]
-    pub fn why(&self) -> &Why {
+    pub const fn why(&self) -> &Why {
         &self.why
     }
 
     /// The one action.
     #[must_use]
-    pub fn then(&self) -> &Then {
+    pub const fn then(&self) -> &Then {
         &self.then
     }
 
     /// `true` for an ask adopted from an older parent's carry (or lent to a test fixture).
     #[must_use]
-    pub(crate) fn is_adopted(&self) -> bool {
+    pub(crate) const fn is_adopted(&self) -> bool {
         matches!(self.stay, Stay::Adopted)
     }
 
     /// `true` when the ask outlasts a look.
     #[must_use]
-    pub fn is_standing(&self) -> bool {
+    pub const fn is_standing(&self) -> bool {
         matches!(self.stay, Stay::Standing | Stay::Adopted)
     }
 
@@ -579,13 +581,19 @@ pub struct LaterAsk {
     fingerprint: Fingerprint,
     resurface: Resurface,
     /// Its words move only when its fact does, never every look
+    /// ([`Self::restated_at_once`]).
     at_once: bool,
 }
 
 impl LaterAsk {
     /// A person is needed for something that can wait.
     #[must_use]
-    pub fn person(why: Why, then: Then, fingerprint: Fingerprint, resurface: Resurface) -> Self {
+    pub const fn person(
+        why: Why,
+        then: Then,
+        fingerprint: Fingerprint,
+        resurface: Resurface,
+    ) -> Self {
         Self {
             why: LaterWhy::Person(why),
             then,
@@ -597,14 +605,14 @@ impl LaterAsk {
 
     /// Words that move only when the fact itself does (the tabs an outage holds, counted as they join and leave it) are news each time.
     #[must_use]
-    pub fn restated_at_once(mut self) -> Self {
+    pub const fn restated_at_once(mut self) -> Self {
         self.at_once = true;
         self
     }
 
     /// Whether a restatement of its words is shown at once ([`Self::restated_at_once`]).
     #[must_use]
-    pub fn restates_at_once(&self) -> bool {
+    pub const fn restates_at_once(&self) -> bool {
         self.at_once
     }
 
@@ -655,25 +663,25 @@ impl LaterAsk {
 
     /// The reason.
     #[must_use]
-    pub fn why(&self) -> &LaterWhy {
+    pub const fn why(&self) -> &LaterWhy {
         &self.why
     }
 
     /// The one action.
     #[must_use]
-    pub fn then(&self) -> &Then {
+    pub const fn then(&self) -> &Then {
         &self.then
     }
 
     /// The fact's identity.
     #[must_use]
-    pub fn fingerprint(&self) -> &Fingerprint {
+    pub const fn fingerprint(&self) -> &Fingerprint {
         &self.fingerprint
     }
 
     /// How long a dismissal holds.
     #[must_use]
-    pub fn resurface(&self) -> Resurface {
+    pub const fn resurface(&self) -> Resurface {
         self.resurface
     }
 
@@ -790,7 +798,7 @@ impl Class {
 impl Need {
     /// The plain class.
     #[must_use]
-    pub fn class(&self) -> Class {
+    pub const fn class(&self) -> Class {
         match self {
             Self::Unclassified => Class::Unclassified,
             Self::Record => Class::Record,

@@ -12,6 +12,9 @@
 //! `harness::boot_permit` caps the tests holding live stacks at once.
 #![cfg(unix)]
 
+#[cfg(test)]
+aterm_durable::plain_durable_flushes_in_tests!();
+
 mod harness;
 
 mod bridge_e2e;

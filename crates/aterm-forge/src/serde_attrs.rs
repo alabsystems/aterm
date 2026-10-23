@@ -63,11 +63,11 @@ impl Tok {
     }
 }
 
-fn ident_start(c: char) -> bool {
+const fn ident_start(c: char) -> bool {
     c.is_ascii_alphabetic() || c == '_'
 }
 
-fn ident_char(c: char) -> bool {
+const fn ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
@@ -371,7 +371,7 @@ enum Position {
 }
 
 impl Position {
-    fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Self::Container => "container",
             Self::Variant => "variant",

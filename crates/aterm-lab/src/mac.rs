@@ -1,42 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The macOS guest lane on this Mac: a disposable tart VM (Apple's Virtualization
-//! framework) for the checks that must not run on the owner's desktop, because what
-//! they do can put a macOS dialog naming aterm in front of the owner.
-//!
-//! `mac dmg` (`targo --unverified lab mac help`) is the disk-image acceptance: the
-//! `dmg_acceptance` benches of atpkg (a vendor image's single app staged, an image with
-//! none refused), aterm-containment (a real mount inside a bundle is not crossed),
-//! aterm-uds (a force-detached volume's working directory reads `ENOENT`) and
-//! aterm-update (the updater's no-zip lane and `tools/install.sh`'s image path), each
-//! attaching real images with `hdiutil`. It:
-//!
-//! * builds the four benches here with `--no-run` (nothing is attached on this Mac) and
-//!   shares them read-only (`tart run --dir`);
-//! * clones a fresh VM from [`IMAGE`] (a Cirrus Labs `base` image: the `vanilla` ones
-//!   carry no guest agent, and the lane drives the guest only through `tart exec`, never
-//!   a connection to the guest's address, which can raise macOS's Local Network dialog);
-//! * turns SIP on in the clone (`csrutil clear`, answered by the guest's own
-//!   administrator, then a reboot): the image ships with SIP off, and with it off the
-//!   kernel asks tccd nothing about files, so no consent question could be observed
-//!   (measured 2026-10-20: a `~/Desktop` read reached tccd only once SIP was on);
-//!   `--fda` first grants the guest agent Full Disk Access in the clone's TCC database,
-//!   which only SIP off allows;
-//! * runs each bench in the guest under [`ROW`] with tccd's log streamed, and prints its
-//!   rows, then the removable-volume requests tccd saw and a control: a `~/Desktop` read
-//!   that must reach tccd (or, under `--fda`, pass on the grant), without which a count
-//!   of zero proves nothing;
-//! * deletes the clone (`--keep` stops it and keeps it, renamed `aterm-mac-dmg-kept-<pid>`).
-//!
-//! A lane killed before its clean-up leaves its clone, booted in its own session so a
-//! terminal's ^C cannot cut the stop short. The next run reports names whose lane pid
-//! is absent; the name alone does not establish ownership, so it leaves those VMs intact.
-//!
-//! Exit 0 every row passed, 1 a row failed (a hang detector's firing included) or a bench
-//! could not be built, 3 NOT RUN (no tart, the guest did not boot or answer, or a row the
-//! guest refused: COULD NOT RUN). Measured results:
-//! `docs/DESIGN-macos-tcc-prompts-2026-08-30.md` §1.6c.
+//! Disposable macOS guest VM lane via `tart` ([`IMAGE`], [`ROW`]).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -51,9 +16,7 @@ use crate::{Fail, LAB, Res, stop};
 /// Exit status of a lane that could not run: never a pass.
 pub const NOT_RUN: i32 = 3;
 
-/// The image a clone is made from: macOS 27 with the Tart Guest Agent (`tart exec`) and
-/// no Xcode. `$LAB_MAC_IMAGE` or `--image` names another; one without the agent is NOT
-/// RUN.
+/// The image a clone is made from: macOS 27 with the Tart Guest Agent (`tart exec`) and no Xcode.
 pub const IMAGE: &str = "ghcr.io/cirruslabs/macos-golden-gate-base:latest";
 
 /// Where tart lives when `$LAB_TART` names none (Homebrew's prefixes).
@@ -67,20 +30,16 @@ pub const BENCHES: [(&str, &str); 4] = [
     ("aterm-update", "update-dmg"),
 ];
 
-/// A boot until the guest agent answers: a hang detector, never a budget (about 20 to
-/// 40 s measured).
+/// A boot until the guest agent answers.
 const BOOT: Duration = Duration::from_secs(300);
-/// One bench in the guest: a hang detector. A consent dialog parks `hdiutil` until it
-/// is answered, and nobody answers in the guest.
+/// One bench in the guest: a hang detector.
 const ROW: Duration = Duration::from_secs(300);
 /// One short guest command (a copy, a status read).
 const STEP: Duration = Duration::from_secs(120);
-/// How long the control's `~/Desktop` read may take before it counts as parked on a
-/// consent question.
+/// Timeout before a `~/Desktop` control read counts as parked on a consent prompt.
 const CONTROL: Duration = Duration::from_secs(15);
 
-/// The guest's view of the share, and the guest folder the benches run from (outside
-/// the share, so a run never reads the shared volume).
+/// The guest's view of the share.
 const GUEST_SHARE: &str = "/Volumes/My Shared Files/lane";
 const GUEST_DIR: &str = "/tmp/aterm-mac-lane";
 
@@ -124,8 +83,7 @@ fn not_run(why: impl std::fmt::Display) -> Fail {
     Fail::exit(NOT_RUN, format!("NOT RUN: {why}"))
 }
 
-/// The `tart` to run: `named` (`$LAB_TART`) alone when it is given, else the first of
-/// Homebrew's paths that `executable` accepts.
+/// The `tart` to run.
 ///
 /// # Errors
 /// A relative `named` (usage), or none that runs (NOT RUN).
@@ -144,8 +102,7 @@ pub fn pick_tart(named: Option<&str>, executable: impl Fn(&str) -> bool) -> Resu
     }
 }
 
-/// The benches' executables, by package, from cargo's `--message-format=json` lines:
-/// each `compiler-artifact` of a target named `dmg_acceptance` that names an executable.
+/// The benches' executables, by package, from cargo's `--message-format=json` lines.
 #[must_use]
 pub fn bench_executables(json_lines: &str) -> BTreeMap<String, PathBuf> {
     json_lines
@@ -162,9 +119,6 @@ pub fn bench_executables(json_lines: &str) -> BTreeMap<String, PathBuf> {
         })
         .filter_map(|v| {
             let exe = v.get("executable").and_then(aterm_json::Value::as_str)?;
-            // `path+file:///…/crates/<package>#<version>`, or `…/<dir>#<package>@<version>`
-            // where the folder is named otherwise: the name after the `#`, else the last
-            // path segment before it.
             let id = v.get("package_id").and_then(aterm_json::Value::as_str)?;
             let (path, fragment) = id.split_once('#')?;
             let package = match fragment.split_once('@') {
@@ -181,20 +135,16 @@ pub fn bench_executables(json_lines: &str) -> BTreeMap<String, PathBuf> {
 pub enum Verdict {
     /// Every row it planned passed.
     Pass,
-    /// A row failed, or the bench ended without its `measure result:` line (a crash, or
-    /// the hang detector that a consent question parking `hdiutil` fires).
+    /// A row failed or the bench ended without its `measure result:` line.
     Fail,
-    /// No row failed, but the guest refused one (COULD NOT RUN: a wedged disk-image or
-    /// trust service, a missing tool), or it planned none: nothing was decided.
+    /// No row failed, but the guest refused one (`COULD NOT RUN`).
     NotRun,
 }
 
-/// The words a row's panic opens with when the host refused it
-/// (`aterm_uds::host::could_not_run`), which the benches' harness records as a FAIL.
+/// The words a row's panic opens with when the host refused it (`aterm_uds::host::could_not_run`).
 const REFUSED_PANIC: &str = "measurement panicked: aterm-gate: COULD NOT RUN";
 
-/// A bench's report read: the lines to print (every `measure …` line, and under each row
-/// that did not pass the detail that says why) and its [`Verdict`].
+/// A bench's report read ([`Verdict`]).
 #[must_use]
 pub fn read_report(out: &str) -> (Vec<&str>, Verdict) {
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -206,8 +156,6 @@ pub fn read_report(out: &str) -> (Vec<&str>, Verdict) {
     let mut shown = Vec::new();
     let mut rows: Vec<Row> = Vec::new();
     let mut ended = false;
-    // Whether the lines below the latest row are its detail, to show; and whether the
-    // first of them is still to come (a FAIL whose first says the host refused it).
     let (mut detail, mut first) = (false, false);
     for line in out.lines() {
         if let Some(row) = line.strip_prefix("measure row: ") {
@@ -248,9 +196,7 @@ pub fn read_report(out: &str) -> (Vec<&str>, Verdict) {
     (shown, verdict)
 }
 
-/// Names that may belong to an ended lane: each `aterm-mac-dmg-<pid>` among `names`
-/// whose pid is not `me` and not `alive`. These are diagnostic candidates only: neither
-/// a matching name nor an absent pid establishes ownership or permits deleting a VM.
+/// Names that may belong to an ended lane.
 #[must_use]
 pub fn ended_lane_candidates(names: &str, me: i32, alive: impl Fn(i32) -> bool) -> Vec<String> {
     names
@@ -269,9 +215,7 @@ pub fn ended_lane_candidates(names: &str, me: i32, alive: impl Fn(i32) -> bool) 
 /// The name every lane clone is made under, before its lane's pid.
 const LANE_VM: &str = "aterm-mac-dmg-";
 
-/// What tccd's log says, from its `Handling access request to <service>, from Sub:{…}`
-/// lines: each `SystemPolicyRemovableVolumes` request (its subject), and how many
-/// `SystemPolicyDesktopFolder` requests it handled.
+/// What tccd's log says, from its `Handling access request to <service>, from Sub:{…}` lines.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct TccSeen {
     pub removable: Vec<String>,
@@ -301,9 +245,7 @@ pub fn tcc_seen(log: &str) -> TccSeen {
     seen
 }
 
-/// The control's verdict: whether file consent is enforced in the guest, so a count of
-/// no removable-volume request means something. Without Full Disk Access a `~/Desktop`
-/// read must reach tccd (and park on its question); with it, the read must pass.
+/// The control's verdict.
 pub fn control_verdict(
     fda: bool,
     desktop_read_passed: bool,
@@ -436,7 +378,6 @@ impl Drop for Vm {
     fn drop(&mut self) {
         self.stop();
         if self.keep {
-            // Distinguish an explicitly kept VM from ended-lane candidates.
             let kept = format!("{LANE_VM}kept-{}", std::process::id());
             let renamed = aterm_uds::spawnfd::command(&self.tart)
                 .args(["rename", &self.name, &kept])
@@ -473,8 +414,7 @@ fn report_ended_lanes(tart: &str) {
     }
 }
 
-/// Whether `csrutil status` says SIP is wholly on: enabled, with no protection of a
-/// custom configuration disabled.
+/// Whether `csrutil status` reports SIP enabled.
 fn sip_on(status: &str) -> bool {
     status.contains("status: enabled") && !status.contains("disabled")
 }
@@ -492,14 +432,11 @@ fn reap_within(child: &mut Child, limit: Duration) {
     let _ = child.wait();
 }
 
-/// SIP on: `csrutil clear` (which reads an administrator's name and password from a
-/// terminal: `expect` gives it one, and the guest's own administrator answers), then the
-/// reboot it takes effect at.
+/// Enable SIP via `csrutil clear` in the guest before rebooting.
 const SIP_ON: &str = "/usr/bin/expect -c 'set timeout 30; spawn sudo -n csrutil clear; \
                       expect \"user:\"; send \"admin\\r\"; expect \"assword\"; send \"admin\\r\"; expect eof'";
 
-/// Full Disk Access for the guest agent in the system TCC database (writable only while
-/// SIP is off), under its designated requirement.
+/// Grant Full Disk Access to the guest agent in the system TCC database while SIP is off.
 fn fda_grant() -> String {
     format!(
         "set -e; a=$(readlink -f {GUEST_AGENT}); \
@@ -536,8 +473,6 @@ pub fn cmd_dmg(args: &[String]) -> Res {
     let tart = pick_tart(named.as_deref(), crate::sys::executable)?;
     report_ended_lanes(&tart);
 
-    // 1. The benches, built here and never run here, by the targo that runs the lab
-    // (`$CARGO`; the lab's own PATH holds no toolchain).
     let repo = &paths().repo;
     let targo = std::env::var_os("CARGO").unwrap_or_else(|| "targo".into());
     let mut build = aterm_uds::spawnfd::command(&targo);
@@ -576,12 +511,9 @@ pub fn cmd_dmg(args: &[String]) -> Res {
                 "the build named no dmg_acceptance bench of {package}"
             ))
         })?;
-        // Out of `deps/`: a binary run from a huge directory outruns WindowServer's TCC
-        // preflight watchdog (AGENTS.md), and the share holds only what the guest runs.
         std::fs::copy(exe, share.join(name)).map_err(|e| format!("{}: {e}", exe.display()))?;
     }
 
-    // 2. The guest: SIP on (and the grant first, under --fda).
     println!("mac dmg: cloning {image} (tart pulls it first when this Mac has no copy)");
     let mut vm = Vm::clone_from(&tart, &image, share, keep)?;
     vm.boot()?;
@@ -607,7 +539,6 @@ pub fn cmd_dmg(args: &[String]) -> Res {
         )));
     }
 
-    // 3. The rows, with tccd's log streamed.
     vm.sh(
         &format!(
             "rm -rf {GUEST_DIR} && mkdir -p {GUEST_DIR} && cp '{GUEST_SHARE}'/*-dmg {GUEST_DIR}/"
@@ -649,7 +580,6 @@ pub fn cmd_dmg(args: &[String]) -> Res {
         }
     }
 
-    // 4. What tccd saw, and the control that says it means something.
     let control = vm.exec("ls ~/Desktop >/dev/null", CONTROL);
     let desktop_read_passed = control.is_ok_and(|o| o.status.success());
     let _ = vm.exec("sudo -n pkill -INT -f '^/usr/bin/log stream'", STEP);
@@ -707,7 +637,6 @@ mod tests {
         let all = |_: &str| true;
         assert_eq!(pick_tart(Some("/x/tart"), all).unwrap(), "/x/tart");
         assert_eq!(pick_tart(Some("rel/tart"), all).unwrap_err().code, 2);
-        // A named tart that does not run is NOT RUN, never Homebrew's in its place.
         assert_eq!(pick_tart(Some("/x/tart"), none).unwrap_err().code, NOT_RUN);
         assert_eq!(pick_tart(None, all).unwrap(), TART_PATHS[0]);
         assert_eq!(
@@ -721,8 +650,6 @@ mod tests {
     fn only_the_dmg_acceptance_executables_are_taken_by_package() {
         let lines = [
             r#"{"reason":"compiler-artifact","package_id":"path+file:///w/crates/atpkg#0.107.0","target":{"name":"dmg_acceptance"},"executable":"/b/deps/dmg_acceptance-1"}"#,
-            // Another target of the same package, a library (no executable), and a
-            // build-finished line: none is a bench.
             r#"{"reason":"compiler-artifact","package_id":"path+file:///w/crates/atpkg#0.107.0","target":{"name":"atpkg"},"executable":"/b/deps/atpkg-9"}"#,
             r#"{"reason":"compiler-artifact","package_id":"path+file:///w/crates/aterm-uds#0.107.0","target":{"name":"dmg_acceptance"},"executable":null}"#,
             r#"{"reason":"build-finished","success":true}"#,
@@ -763,7 +690,6 @@ mod tests {
                     measure result: x planned=2 passed=2 failed=0 refused=0\n";
         let (shown, verdict) = read_report(pass);
         assert_eq!(verdict, Verdict::Pass);
-        // A passing row's detail is not printed.
         assert_eq!(
             shown,
             [
@@ -786,7 +712,6 @@ mod tests {
             ]
         );
 
-        // Refused by the guest, typed or through `could_not_run`'s panic: nothing decided.
         let typed = "measure row: x::a COULD NOT RUN\nno hdiutil\n\
                      measure result: x planned=1 passed=0 failed=0 refused=1\n";
         assert_eq!(read_report(typed).1, Verdict::NotRun);
@@ -795,7 +720,6 @@ mod tests {
                         measurement panicked: aterm-gate: COULD NOT RUN — trustd did not answer\n\
                         measure result: x planned=1 passed=0 failed=1 refused=0\n";
         assert_eq!(read_report(panicked).1, Verdict::NotRun);
-        // A refusal beside a finding is the finding's verdict.
         let both = format!(
             "{}{fail}",
             typed.replace(
@@ -804,16 +728,13 @@ mod tests {
             )
         );
         assert_eq!(read_report(&both).1, Verdict::Fail);
-        // Only a FAIL's first detail line can say the host refused it.
         let later = "measure row: x::a FAIL\nleft != right\n\
                      measurement panicked: aterm-gate: COULD NOT RUN — quoted\n\
                      measure result: x planned=1 passed=0 failed=1 refused=0\n";
         assert_eq!(read_report(later).1, Verdict::Fail);
 
-        // Cut short (a hang detector, a crash): no verdict line, never a pass.
         assert_eq!(read_report("measure row: x::a PASS\n").1, Verdict::Fail);
         assert_eq!(read_report("tart exec: timed out").1, Verdict::Fail);
-        // A complete report of nothing planned decides nothing.
         let empty = "measure result: x planned=0 passed=0 failed=0 refused=0\n";
         assert_eq!(read_report(empty).1, Verdict::NotRun);
     }
@@ -822,7 +743,6 @@ mod tests {
     fn ended_lane_candidates_exclude_live_and_kept_names() {
         let names = "aterm-mac-dmg-100\naterm-mac-dmg-200\naterm-mac-dmg-300\n\
                      aterm-mac-dmg-kept-100\naterm-mac-dmg-\naterm-mac-dmg-1x\nother-vm\n";
-        // 100 is gone, 200 is alive (a concurrent lane, or a reused pid), 300 is this lane.
         let alive = |pid: i32| pid == 200;
         assert_eq!(
             ended_lane_candidates(names, 300, alive),
@@ -869,7 +789,6 @@ mod tests {
         let silent = TccSeen::default();
         assert!(control_verdict(false, false, &asked).is_ok());
         assert!(control_verdict(true, true, &silent).is_ok());
-        // SIP off: the read passes and tccd hears nothing.
         assert!(control_verdict(false, true, &silent).is_err());
         assert!(control_verdict(false, false, &silent).is_err());
         assert!(control_verdict(false, true, &asked).is_err());

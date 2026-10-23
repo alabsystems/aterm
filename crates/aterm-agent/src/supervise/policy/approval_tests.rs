@@ -311,11 +311,22 @@ fn the_2_1_281_breaker_with_its_auto_deny_countdown_is_the_rm_rules() {
         assert!(!unproven.contains("unattended session"), "{unproven}");
         let mut noted = read.clone();
         noted.insert(q + 2, String::new());
-        noted.insert(q + 3, " This command requires approval".to_string());
+        noted.insert(q + 3, " Parse error".to_string());
         let why = reason(&on_screen(&noted, &ctx())).to_string();
-        assert!(
-            why.contains("vendor note: This command requires approval"),
-            "{why}"
+        assert!(why.starts_with("the box carries a vendor note: "), "{why}");
+        // A note under the countdown makes the countdown a note too, so even
+        // the vendor's no-rule note there escalates; above the countdown it is
+        // lifted under its own rule (`no-rule-read-only@v1`), the countdown
+        // still no note.
+        noted[q + 3] = " This command requires approval".to_string();
+        let why = reason(&on_screen(&noted, &git_host(ctx()))).to_string();
+        assert!(why.starts_with("the box carries a vendor note: "), "{why}");
+        let mut lifted = read.clone();
+        lifted.insert(q, " This command requires approval".to_string());
+        lifted.insert(q + 1, String::new());
+        assert_eq!(
+            approved(&on_screen(&lifted, &git_host(ctx()))),
+            Some(RULE_NO_RULE_READ_ONLY)
         );
     }
 }
@@ -429,7 +440,6 @@ fn under_zsh_only_a_plain_line_is_a_proven_read() {
         "echo \"$x:h\"",
         "echo $=x",
         "echo ${x}[1]",
-        "wc -l src/{a,b}.rs",
         "rg \"fn \\w+\" src",
     ] {
         let b = bash_box(&[line], Some("Look"));
@@ -2758,33 +2768,25 @@ pub(crate) fn sixty_five(swaps: &[(usize, &str)]) -> Vec<String> {
     lines
 }
 
-/// Commands with identical box rows but different effects.
-pub(crate) fn stale_box_commands() -> (String, String) {
-    let harmless = format!(
-        "echo{} {} touch /tmp/aterm-source-only-counterexample",
-        " $(true)".repeat(65),
-        "x".repeat(23)
-    );
-    let writing = harmless.replace(" touch ", "\ntouch ");
-    (harmless, writing)
-}
-
+/// A TOO-MANY BOX IS JUDGED BY ITS SCREEN'S READINGS ALONE
+/// (`breaker-read-only@v6`): no transcript is read, and every refusal the
+/// screen's readings give is kept. The measured box (`echo` and 65 `$(true)`
+/// as one line, wrapped into four barred rows) is refused on its newline
+/// reading, which puts a `$(true)` where a command's name goes, in manual
+/// mode and in bypass, under a bash and a zsh startup; so is its captured
+/// newline twin (the same box rows under another call's row), and the
+/// reason names no transcript.
+///
+/// NEGATIVE CONTROL: the box whose barred lines are each a read (thirteen
+/// lines of `echo` and five `$(true)`) is approved under the rule, with no
+/// unproven warning, under a zsh startup too.
 #[test]
-fn a_transcript_call_cannot_remove_the_boxes_other_readings() {
-    use super::super::box_command::tests::command_of;
-    use super::super::box_command::{barred_rows, drawn_as};
+fn a_too_many_box_is_judged_by_its_screens_readings_alone() {
     use phase_fixtures::{
         BOX_RM_TOO_MANY_NO_RM_2_1_307, BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_307, screen,
     };
     let label = "the rm circuit breaker (not ruled out: too many command substitutions to \
                  analyze; the command need not name rm)";
-    let space = command_of("Echo 65 empty substitutions");
-    let call = |command: &str| {
-        Some(Ok(BoxCommand {
-            id: "toolu_lab0c1b6e01".to_string(),
-            command: command.to_string(),
-        }))
-    };
     let zsh = || Ok(ShellStartup::of_parts(Vec::new(), true));
     for (text, base) in [
         (BOX_RM_TOO_MANY_NO_RM_2_1_307, ctx()),
@@ -2792,110 +2794,34 @@ fn a_transcript_call_cannot_remove_the_boxes_other_readings() {
     ] {
         let rows = screen(text);
         for c in [
+            base.clone(),
             ApprovalCtx {
-                box_command: call(&space),
-                ..base.clone()
-            },
-            ApprovalCtx {
-                box_command: call(&space),
                 shell: zsh(),
                 ..base.clone()
             },
         ] {
-            let d = on_screen(&rows, &c);
-            assert!(
-                reason(&d).contains("not read-only (newline reading)"),
-                "{d:?}"
-            );
-        }
-        let twin = command_of("Probe too-many-newline-twin");
-        let other = command_of("Probe wrap-long-word");
-        let mut from_subagent = rows.clone();
-        let title = from_subagent
-            .iter()
-            .position(|r| r == " Bash command")
-            .expect("the title row");
-        from_subagent[title] = " Bash command · from a subagent".to_string();
-        for (what, rows, box_command, why) in [
-            (
-                "the newline twin",
-                rows.clone(),
-                call(&twin),
-                "; the transcript's waiting Bash call is not the box's: the call's row ",
-            ),
-            (
-                "another command",
-                rows.clone(),
-                call(&other),
-                "; the transcript's waiting Bash call is not the box's: the command draws 6 rows",
-            ),
-            (
-                "no call named",
-                rows.clone(),
-                Some(Err("the transcript holds 2 calls waiting".to_string())),
-                "; no transcript call taken: the transcript holds 2 calls waiting",
-            ),
-            (
-                "from a subagent",
-                from_subagent,
-                call(&space),
-                "; the transcript's waiting Bash call is not the box's: the box is not one",
-            ),
-            (
-                "nothing read",
-                rows.clone(),
-                None,
-                "not read-only (newline reading): a command whose name this check cannot read",
-            ),
-        ] {
-            let c = ApprovalCtx {
-                box_command,
-                ..base.clone()
-            };
             let r = reason(&on_screen(&rows, &c)).to_string();
-            assert!(r.starts_with(&format!("{label}: ")), "{what}: {r}");
-            assert!(r.contains(why), "{what}: {r}");
+            assert!(r.starts_with(&format!("{label}: ")), "{r}");
+            assert!(r.contains("not read-only (newline reading)"), "{r}");
+            assert!(!r.contains("transcript"), "{r}");
         }
-
-        let (harmless, writing) = stale_box_commands();
-        assert!(classify_command(&harmless).read_only);
-        assert!(!classify_command(&writing).read_only);
-        let displayed = barred_rows(&writing, 140).expect("ASCII box rows");
-        let stale_rows = too_many_box(&displayed, base.bypass_mode);
-        let prompt = aterm_phase::prompt::parse_prompt_v2(&stale_rows).expect("the box");
-        assert_eq!(drawn_as(&prompt, &stale_rows, &harmless), Ok(()));
-        assert_eq!(drawn_as(&prompt, &stale_rows, &writing), Ok(()));
-        let c = ApprovalCtx {
-            box_command: call(&harmless),
-            ..base.clone()
-        };
-        let d = on_screen(&stale_rows, &c);
-        assert!(matches!(d, Decision::Escalate { .. }), "{d:?}");
-
-        let lines = sixty_five(&[]);
-        let unambiguous = too_many_box(&lines, base.bypass_mode);
-        let command = lines.join("\n");
-        for box_command in [None, call(&command)] {
-            let d = on_screen(
-                &unambiguous,
-                &ApprovalCtx {
-                    box_command,
-                    shell: zsh(),
-                    ..base.clone()
-                },
-            );
+        // NEGATIVE CONTROL
+        let unambiguous = too_many_box(&sixty_five(&[]), base.bypass_mode);
+        for c in [
+            base.clone(),
+            ApprovalCtx {
+                shell: zsh(),
+                ..base.clone()
+            },
+        ] {
+            let d = on_screen(&unambiguous, &c);
             assert_eq!(pressed(&d), (RULE_BREAKER_READ_ONLY, Choice::Digit(1)));
             assert_eq!(unproven_of(&d), None);
         }
     }
-    let twin = command_of("Probe too-many-newline-twin");
-    let c = ApprovalCtx {
-        box_command: call(&twin),
-        ..ctx()
-    };
     let r = reason(&on_screen(
         &screen(super::super::box_command::tests::TWIN_SCREEN),
-        &c,
+        &ctx(),
     ))
     .to_string();
     assert!(
@@ -2903,111 +2829,85 @@ fn a_transcript_call_cannot_remove_the_boxes_other_readings() {
         "the twin's own box: {r}"
     );
     assert!(
-        r.contains(
-            "not read-only (newline reading): a command whose name this check cannot read ($(…)) \
-             (the matching transcript call does not remove screen readings)"
+        r.ends_with(
+            "not read-only (newline reading): a command whose name this check cannot read ($(…))"
         ),
         "the twin's own box: {r}"
     );
 }
 
+/// EVERY MEASURED BARRED BOX IS JUDGED BY ITS SCREEN ALONE: the 2.1.307 and
+/// 2.1.308 captures breaker-4 measured its transcript lane on (long words,
+/// spaces and newlines at a wrap, tabs, East Asian wide characters, the
+/// call's row's cut, characters its renderer model refused, and the stale
+/// box an older read call stood waiting under; MEASURED 2026-10-22,
+/// `docs/measured/breaker-transcript-and-zsh-2026-10-22.md`) are each
+/// handed to a person on the screen's own readings, in manual mode and in
+/// bypass, as `main` decided them with no transcript read: every
+/// too-many box on a reading that is not a read, the backticks box on its
+/// `Parse error` note. No reason names a transcript.
+///
+/// NEGATIVE CONTROL: the captures are boxes, all of them Bash boxes the
+/// breaker or a vendor note holds, so the loop above judged each (a capture
+/// that read as no box would pass vacuously).
 #[test]
-fn the_measured_stale_call_is_one_more_reading_never_the_boxes_alone() {
-    use super::super::box_command::pending_bash;
-    use super::super::box_command::tests::{STALE_PENDING, STALE_S_ID, STALE_SCREEN};
+fn every_measured_barred_box_is_judged_by_its_screen_alone() {
+    use super::super::box_command::tests::{
+        REFUSED_308, SCREENS, SCREENS_308, SHORT_BACKTICKS, STALE_SCREEN, TABS,
+    };
     let label = "the rm circuit breaker (not ruled out: too many command substitutions to \
                  analyze; the command need not name rm)";
-    let rows = phase_fixtures::screen(STALE_SCREEN);
-    let call = pending_bash(STALE_PENDING, &[]).expect("S, waiting");
-    assert_eq!(call.id, STALE_S_ID);
-    assert!(classify_command(&call.command).read_only);
-    let zsh = || Ok(ShellStartup::of_parts(Vec::new(), true));
-    for c in [
-        ApprovalCtx {
-            box_command: Some(Ok(call.clone())),
-            ..ctx()
-        },
-        ApprovalCtx {
-            box_command: Some(Ok(call.clone())),
-            shell: zsh(),
-            ..ctx()
-        },
-    ] {
-        let d = on_screen(&rows, &c);
-        let r = reason(&d).to_string();
-        assert!(r.starts_with(&format!("{label}: ")), "{r}");
-        assert!(r.contains("not read-only (newline reading)"), "{r}");
-        assert!(
-            r.ends_with("(the matching transcript call does not remove screen readings)"),
-            "{r}"
-        );
-    }
-    let r = reason(&on_screen(&rows, &ctx())).to_string();
-    assert!(r.starts_with(&format!("{label}: ")), "{r}");
-    assert!(r.contains("not read-only (newline reading)"), "{r}");
-    assert!(!r.contains("transcript"), "{r}");
-}
-
-#[test]
-fn a_too_many_box_over_tabs_or_wide_characters_adds_the_transcripts_command() {
-    use super::super::box_command::tests::{CALLS_308, REFUSED_308, SCREENS_308, command_in};
-    let label = "the rm circuit breaker (not ruled out: too many command substitutions to \
-                 analyze; the command need not name rm)";
-    let call = |command: &str| {
-        Some(Ok(BoxCommand {
-            id: "toolu_lab0c1b6e02".to_string(),
-            command: command.to_string(),
-        }))
-    };
-    let capture = |name: &str| {
-        SCREENS_308
-            .iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, t)| phase_fixtures::screen(t))
-            .expect(name)
-    };
-    for name in ["w-tabs", "w-tab-after-wide", "w-cjk-words", "w-hangul"] {
-        let command = command_in(CALLS_308, &format!("Probe {name}"));
-        assert!(classify_command(&command).read_only, "{name}");
-        let c = ApprovalCtx {
-            box_command: call(&command),
-            ..ctx()
-        };
-        let r = reason(&on_screen(&capture(name), &c)).to_string();
-        assert!(r.starts_with(&format!("{label}: ")), "{name}: {r}");
-        assert!(
-            r.contains("not read-only (newline reading)")
-                && r.ends_with(" (the matching transcript call does not remove screen readings)"),
-            "{name}: {r}"
-        );
-    }
-    let tabs = command_in(CALLS_308, "Probe w-tabs");
-    assert!(tabs.contains('\t'));
-    let c = ApprovalCtx {
-        box_command: call(&tabs.replace('\t', " ")),
-        ..ctx()
-    };
-    let r = reason(&on_screen(&capture("w-tabs"), &c)).to_string();
-    assert!(r.starts_with(&format!("{label}: ")), "{r}");
-    assert!(
-        r.contains("; the transcript's waiting Bash call is not the box's: the command's row 1"),
-        "{r}"
-    );
-    for (name, text, named) in REFUSED_308 {
-        let command = command_in(CALLS_308, &format!("Probe {name}"));
-        let c = ApprovalCtx {
-            box_command: call(&command),
-            ..ctx()
-        };
-        let r = reason(&on_screen(&phase_fixtures::screen(text), &c)).to_string();
-        assert!(r.starts_with(&format!("{label}: ")), "{name}: {r}");
-        assert!(r.contains(named), "{name}: {r}");
+    let mut captures: Vec<(&str, &str)> = SCREENS.to_vec();
+    captures.extend_from_slice(SCREENS_308);
+    captures.extend(REFUSED_308.iter().map(|(n, t, _)| (*n, *t)));
+    captures.extend([
+        ("wrap-tabs", TABS),
+        ("stale-n", STALE_SCREEN),
+        ("w-short-backticks", SHORT_BACKTICKS),
+    ]);
+    assert_eq!(captures.len(), 45, "every measured capture");
+    for (name, text) in captures {
+        let rows = phase_fixtures::screen(text);
+        let p = aterm_phase::prompt::parse_prompt_v2(&rows).expect(name);
+        // NEGATIVE CONTROL
+        assert_eq!(p.kind, PromptKind::Bash, "{name}");
+        assert!(p.gutter, "{name}: barred rows");
+        for base in [ctx(), bypass()] {
+            let d = on_screen(&rows, &base);
+            let r = reason(&d).to_string();
+            assert!(matches!(d, Decision::Escalate { .. }), "{name}: {d:?}");
+            let why = if name == "w-short-backticks" {
+                r.contains("Parse error")
+            } else {
+                r.starts_with(&format!("{label}: ")) && r.contains("not read-only (")
+            };
+            assert!(why, "{name}: {r}");
+            assert!(!r.contains("transcript"), "{name}: {r}");
+        }
     }
 }
 
+/// NO RULE PROVES A BASH BOX FROM A READING WHOSE WORDS TURN ON A BLANK THE
+/// SCREEN CANNOT SHOW (`read-only@classify-v6`, `breaker-read-only@v6`,
+/// `rm-breaker@v5`; [`blanks_shown`]; MEASURED 2026-10-22 under `/bin/bash`
+/// 3.2, the measured note's §B). The screen draws a tab as the blanks to its
+/// stop and shows no blank at a row's end, so `echo \⇥#; tee x` (the tab at
+/// column 6, drawn as two blanks) draws as `echo \  #; tee x`, which reads as
+/// an echo and a comment, and `echo a\ ⏎tee x` draws as `echo a\⏎tee x`,
+/// which reads as one echo: each command runs `tee x`, and every reading of
+/// its rows classifies read-only. Each box is escalated, the reason naming
+/// the reading and the form: a one-row Bash box and a barred one under the
+/// read-only rule, the too-many breaker in manual mode and in bypass, and
+/// the rm breaker over a proven rm. (A here-document on barred rows needs
+/// no such check here: the classifier refuses its space reading, which
+/// holds no body.)
+///
+/// NEGATIVE CONTROLS, each approved under its rule: a backslash before one
+/// blank and a word (`a\ b`, read alike whether the blank is a tab drawn as
+/// one), blanks before a `#` that no backslash escapes, and a here-string.
 #[test]
 fn a_reading_that_turns_on_a_blank_the_screen_cannot_show_proves_no_box() {
-    use super::super::box_command::tests::drawn_screen;
+    // The commands the rows below are drawn for.
     assert!(!classify_command("echo \\\t#; tee x").read_only);
     assert!(!classify_command("echo a\\ \ntee x").read_only);
     assert!(classify_command("echo \\  #; tee x").read_only);
@@ -3059,26 +2959,10 @@ fn a_reading_that_turns_on_a_blank_the_screen_cannot_show_proves_no_box() {
     let five = "echo $(true) $(true) $(true) $(true) $(true)";
     let mut lines = sixty_five(&[(12, &format!("{five} a\\"))]);
     lines.push("tee x".to_string());
-    let shown = lines.join("\n");
-    let call = Some(Ok(BoxCommand {
-        id: "toolu_lab0c1b6e03".to_string(),
-        command: shown.clone(),
-    }));
     for base in [ctx(), bypass()] {
         let rows = too_many_box(&lines, base.bypass_mode);
         refused(&on_screen(&rows, &base), label, ends, "the too-many box");
     }
-    let (_, rows) = drawn_screen(&shown);
-    let c = ApprovalCtx {
-        box_command: call,
-        ..ctx()
-    };
-    let d = on_screen(&rows, &c);
-    refused(&d, label, ends, "the too-many box and its call");
-    assert!(
-        reason(&d).ends_with(" (the matching transcript call does not remove screen readings)"),
-        "{d:?}"
-    );
     let control = sixty_five(&[(12, &format!("{five} a\\ b"))]);
     for base in [ctx(), bypass()] {
         let d = on_screen(&too_many_box(&control, base.bypass_mode), &base);
@@ -3089,7 +2973,7 @@ fn a_reading_that_turns_on_a_blank_the_screen_cannot_show_proves_no_box() {
         );
     }
 
-    let rm = "S=/private/tmp/claude-502/x; rm -rf \"$S/t5\"";
+    let rm = "rm -rf /private/tmp/claude-502/scratch/x";
     let d = on_screen(&rm_box(&format!("{rm}; echo \\  #; tee x")), &bypass());
     refused(&d, "rm circuit breaker: ", tab, "the rm breaker");
     let d = on_screen(&rm_box(&format!("{rm}; echo a\\ b")), &bypass());
@@ -3114,6 +2998,627 @@ fn readings_read_only_names_the_classifiers_refusal_before_the_blanks() {
         "{r}"
     );
     assert_eq!(readings_read_only(&["ls x".to_string()], &[]), Ok(()));
+}
+
+/// Claude Code 2.1.308's Bash boxes over the probes of
+/// `docs/measured/box-notes-2026-10-22.md` (MEASURED in the real-Claude lab,
+/// manual mode, 144 columns), each under the note the vendor drew for it.
+const NOTE_BOXES: &[(&str, &str)] = &[
+    (
+        "n01-awk-read",
+        include_str!("fixtures/claude-2.1.308-box-bash-note-n01-awk-read.txt"),
+    ),
+    (
+        "n03-compound-outside",
+        include_str!("fixtures/claude-2.1.308-box-bash-note-n03-compound-outside.txt"),
+    ),
+    (
+        "n05-less",
+        include_str!("fixtures/claude-2.1.308-box-bash-note-n05-less.txt"),
+    ),
+    (
+        "n21-dev-null",
+        include_str!("fixtures/claude-2.1.308-box-bash-note-n21-dev-null.txt"),
+    ),
+    (
+        "n26-pipeline",
+        include_str!("fixtures/claude-2.1.308-box-bash-note-n26-pipeline.txt"),
+    ),
+    (
+        "n31-two-lines",
+        include_str!("fixtures/claude-2.1.308-box-bash-note-n31-two-lines.txt"),
+    ),
+    (
+        "n07-assignment",
+        include_str!("fixtures/claude-2.1.308-box-bash-note-n07-assignment.txt"),
+    ),
+    (
+        "n09-sort-o",
+        include_str!("fixtures/claude-2.1.308-box-bash-note-n09-sort-o.txt"),
+    ),
+    (
+        "h2-hidden-tcp",
+        include_str!("fixtures/claude-2.1.308-box-bash-note-h2-hidden-tcp.txt"),
+    ),
+    (
+        "h5-hidden-sed-w",
+        include_str!("fixtures/claude-2.1.308-box-bash-note-h5-hidden-sed-w.txt"),
+    ),
+    (
+        "n11-variable",
+        include_str!("fixtures/claude-2.1.308-box-bash-note-n11-variable.txt"),
+    ),
+    (
+        "n14-quoted-text",
+        include_str!("fixtures/claude-2.1.308-box-bash-note-n14-quoted-text.txt"),
+    ),
+    (
+        "n15-command-as-file",
+        include_str!("fixtures/claude-2.1.308-box-bash-note-n15-command-as-file.txt"),
+    ),
+    (
+        "n16-parse-error",
+        include_str!("fixtures/claude-2.1.308-box-bash-note-n16-parse-error.txt"),
+    ),
+    (
+        "n23-variable-braces",
+        include_str!("fixtures/claude-2.1.308-box-bash-note-n23-variable-braces.txt"),
+    ),
+    (
+        "n24-nested-command",
+        include_str!("fixtures/claude-2.1.308-box-bash-note-n24-nested-command.txt"),
+    ),
+    (
+        "n25-brace-expansion",
+        include_str!("fixtures/claude-2.1.308-box-bash-note-n25-brace-expansion.txt"),
+    ),
+    (
+        "n10-awk-system",
+        include_str!("fixtures/claude-2.1.308-box-bash-note-n10-awk-system.txt"),
+    ),
+    (
+        "n17-find-exec",
+        include_str!("fixtures/claude-2.1.308-box-bash-note-n17-find-exec.txt"),
+    ),
+    (
+        "n19-cd-git",
+        include_str!("fixtures/claude-2.1.308-box-bash-note-n19-cd-git.txt"),
+    ),
+    (
+        "n30-awk-option",
+        include_str!("fixtures/claude-2.1.308-box-bash-note-n30-awk-option.txt"),
+    ),
+    (
+        "h8-dev-tcp",
+        include_str!("fixtures/claude-2.1.308-box-bash-note-h8-dev-tcp.txt"),
+    ),
+];
+
+/// The screen of [`NOTE_BOXES`]' `name`.
+fn note_box(name: &str) -> Vec<String> {
+    NOTE_BOXES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, t)| phase_fixtures::screen(t))
+        .unwrap_or_else(|| panic!("the capture {name}"))
+}
+
+/// THE VENDOR'S NO-RULE NOTE ALONE IS LIFTED BY THE READ-ONLY PROOF, UNDER
+/// ITS OWN RULE (`no-rule-read-only@v1`; MEASURED 2026-10-22 on 2.1.308,
+/// `docs/measured/box-notes-2026-10-22.md`): Claude Code draws `This command
+/// requires approval` where no allow rule matched and its own read-only
+/// check did not prove the command, after its parse, its too-complex walk
+/// and its flag checks found nothing to say. Each measured box under it
+/// whose every reading aterm proves a read is approved under the rule, its
+/// one-shot `Yes` pressed (never the `don't ask again` row): an awk read,
+/// awk then `cat /etc/hosts` (a read outside the working directory, which
+/// draws only a folder grant, no note), `less`, a write to `/dev/null`, a
+/// pipeline, two lines; under a zsh startup too.
+///
+/// NEGATIVE CONTROLS, each under the same note and escalated with the
+/// note named: a prefix assignment (`FOO=1 awk …`, which the vendor draws
+/// this note over and the classifier vets only against its hazard list), a
+/// write (`sort -o`), and the two concerns the note hid in the lab's
+/// compound lines, a later subcommand's network redirect (`cat <
+/// /dev/tcp/…`) and its `sed` write (`w out.txt`); a bypass session; the
+/// note beside a second note; the note's text changed by one character.
+#[test]
+fn the_no_rule_note_alone_is_lifted_by_the_read_only_proof_under_its_own_rule() {
+    let zsh = || Ok(ShellStartup::of_parts(Vec::new(), true));
+    for name in [
+        "n01-awk-read",
+        "n03-compound-outside",
+        "n05-less",
+        "n21-dev-null",
+        "n26-pipeline",
+        "n31-two-lines",
+    ] {
+        let rows = note_box(name);
+        let p = aterm_phase::prompt::parse_prompt_v2(&rows).expect(name);
+        assert_eq!(p.notes, [anchor("box.note_no_rule")], "{name}");
+        for c in [
+            git_host(ctx()),
+            ApprovalCtx {
+                shell: zsh(),
+                ..git_host(ctx())
+            },
+        ] {
+            let d = on_screen(&rows, &c);
+            assert_eq!(
+                pressed(&d),
+                (RULE_NO_RULE_READ_ONLY, Choice::Digit(1)),
+                "{name}: {d:?}"
+            );
+            assert_eq!(unproven_of(&d), None, "{name}");
+        }
+    }
+    // NEGATIVE CONTROLS
+    let noted = |why: &str, r: &str| {
+        r.contains(why) && r.ends_with("(the box's vendor note: This command requires approval)")
+    };
+    for (name, why) in [
+        (
+            "n07-assignment",
+            "assigns a variable (space reading): FOO=1",
+        ),
+        ("n09-sort-o", "not read-only (space reading): sort -o"),
+        (
+            "h2-hidden-tcp",
+            "an input redirect from /dev/tcp/127.0.0.1/9 (space reading) may open a network \
+             connection",
+        ),
+        (
+            "h5-hidden-sed-w",
+            "not read-only (space reading): sed s///w",
+        ),
+    ] {
+        let rows = note_box(name);
+        let p = aterm_phase::prompt::parse_prompt_v2(&rows).expect(name);
+        assert_eq!(p.notes, [anchor("box.note_no_rule")], "{name}");
+        let r = reason(&on_screen(&rows, &git_host(ctx()))).to_string();
+        assert!(noted(why, &r), "{name}: {r}");
+    }
+    let rows = note_box("n01-awk-read");
+    let r = reason(&on_screen(&rows, &bypass())).to_string();
+    assert!(r.contains("bypass session"), "{r}");
+    let at = rows
+        .iter()
+        .position(|r| r.trim() == anchor("box.note_no_rule"))
+        .expect("the note row");
+    let mut two = rows.clone();
+    two.insert(at + 1, String::new());
+    two.insert(at + 2, " Parse error".to_string());
+    let r = reason(&on_screen(&two, &git_host(ctx()))).to_string();
+    assert_eq!(
+        r,
+        "the box carries a vendor note: This command requires approval"
+    );
+    let mut other = rows.clone();
+    other[at] = " This command requires approval!".to_string();
+    let r = reason(&on_screen(&other, &git_host(ctx()))).to_string();
+    assert_eq!(
+        r,
+        "the box carries a vendor note: This command requires approval!"
+    );
+}
+
+/// The measured n01 box (an awk read under the no-rule note) with its
+/// command row made `command`.
+fn no_rule_box(command: &str) -> Vec<String> {
+    let rows: Vec<String> = note_box("n01-awk-read")
+        .into_iter()
+        .map(|r| {
+            if r == " awk 'NR<3' README.md" {
+                format!(" {command}")
+            } else {
+                r
+            }
+        })
+        .collect();
+    let p = aterm_phase::prompt::parse_prompt_v2(&rows).expect(command);
+    assert_eq!(p.command, command);
+    assert_eq!(p.notes, [anchor("box.note_no_rule")], "{command}");
+    rows
+}
+
+/// THE NO-RULE NOTE STAYS WITH A PERSON OVER WHAT IT MAY STAND FOR AND THE
+/// PROOF DOES NOT SETTLE ([`no_rule_clear`]): Claude Code 2.1.308 draws it
+/// even where its own read-only check passed (read in its bundle at byte
+/// 17777748), over an unquoted glob for a program off its glob-safe list,
+/// `xargs` beside a Read deny rule, and an assignment, so a box under it is
+/// refused, the note named, when a reading holds an unquoted glob beside a
+/// program off [`GLOB_SAFE`] (`awk 'NR<3' *`, a glob in a redirect or in
+/// another command of the line, `cd` before a glob), runs `xargs`, `env` or
+/// `export` anywhere on the classifier's walk to a program (behind
+/// `timeout` too), assigns a variable anywhere on that walk (after `time`,
+/// `time -p`, `!`, `if`, a redirect, in a pipeline, a subshell or a
+/// substitution; `+=` the classifier refuses itself), or runs a `for` loop;
+/// under a bash startup, where the zsh grammar check does not apply.
+///
+/// NEGATIVE CONTROLS, each approved under the rule: the same awk read with
+/// its glob quoted or escaped, globs beside programs on the list (behind
+/// `timeout` too), an assignment-shaped operand after the program
+/// (`awk -v n=3`, `grep 'a=b'`), and the awk read alone.
+#[test]
+fn the_no_rule_note_stays_with_a_person_over_what_it_may_stand_for() {
+    for (command, why) in [
+        (
+            "awk 'NR<3' *",
+            "an unquoted glob `*` (space reading) beside awk",
+        ),
+        (
+            "awk 'NR<3' < *.md",
+            "an unquoted glob `*` (space reading) beside awk",
+        ),
+        (
+            "awk 'NR<3' src/?.rs",
+            "an unquoted glob `?` (space reading) beside awk",
+        ),
+        (
+            "awk 'NR<3' [ab].md",
+            "an unquoted glob `[` (space reading) beside awk",
+        ),
+        (
+            "grep foo *.md | awk 'NR<3'",
+            "an unquoted glob `*` (space reading) beside awk",
+        ),
+        (
+            "echo \"$(ls *.md)\" | awk 'NR<3'",
+            "an unquoted glob `*` (space reading) beside awk",
+        ),
+        (
+            "cd src; ls *.rs",
+            "an unquoted glob `*` (space reading) beside cd",
+        ),
+        ("xargs cat < list.txt", "runs xargs (space reading)"),
+        (
+            "find . -name x | xargs grep foo",
+            "runs xargs (space reading)",
+        ),
+        ("env awk 'NR<3' README.md", "runs env (space reading)"),
+        (
+            "timeout 5 env awk 'NR<3' README.md",
+            "runs env (space reading)",
+        ),
+        (
+            "export FOO; awk 'NR<3' README.md",
+            "runs export (space reading)",
+        ),
+        (
+            "time FOO=1 awk 'NR<3' README.md",
+            "assigns a variable (space reading): FOO=1",
+        ),
+        (
+            "time -p FOO=1 awk 'NR<3' README.md",
+            "assigns a variable (space reading): FOO=1",
+        ),
+        (
+            "! FOO=1 awk 'NR<3' README.md",
+            "assigns a variable (space reading): FOO=1",
+        ),
+        (
+            "if FOO=1 awk 'NR<3' README.md; then echo x; fi",
+            "assigns a variable (space reading): FOO=1",
+        ),
+        (
+            "< README.md FOO=1 awk 'NR<3'",
+            "assigns a variable (space reading): FOO=1",
+        ),
+        (
+            "timeout 5 env FOO=1 awk 'NR<3' README.md",
+            "assigns a variable (space reading): FOO=1",
+        ),
+        (
+            "awk 'NR<3' README.md | FOO=1 awk 'NR<3'",
+            "assigns a variable (space reading): FOO=1",
+        ),
+        (
+            "( FOO=1 awk 'NR<3' README.md )",
+            "assigns a variable (space reading): FOO=1",
+        ),
+        (
+            "echo $(FOO=1 awk 'NR<3' README.md)",
+            "assigns a variable (space reading): FOO=1",
+        ),
+        (
+            "for FOO in a; do awk 'NR<3' README.md; done",
+            "assigns a for loop's variable (space reading)",
+        ),
+    ] {
+        let rows = no_rule_box(command);
+        let r = reason(&on_screen(&rows, &git_host(ctx()))).to_string();
+        assert!(
+            r.contains(why)
+                && r.ends_with("(the box's vendor note: This command requires approval)"),
+            "{command}: {r}"
+        );
+    }
+    // The assignment form `+=`, which the classifier refuses on its own.
+    let r = reason(&on_screen(
+        &no_rule_box("FOO+=1 awk 'NR<3' README.md"),
+        &git_host(ctx()),
+    ))
+    .to_string();
+    assert!(r.contains("not read-only (space reading): FOO+=1"), "{r}");
+    // NEGATIVE CONTROLS
+    for command in [
+        "awk 'NR<3' '*.md'",
+        "awk 'NR<3' \\*.md",
+        "awk 'NR<3' \"src/*.rs\"",
+        "grep -n foo *.md",
+        "wc -l src/*.rs",
+        "ls *.md; head -3 *.md",
+        "timeout 5 grep foo *.md",
+        "awk -v n=3 'NR<n' README.md",
+        "grep 'a=b' README.md",
+        "awk 'NR<3' README.md",
+    ] {
+        let d = on_screen(&no_rule_box(command), &git_host(ctx()));
+        assert_eq!(
+            pressed(&d),
+            (RULE_NO_RULE_READ_ONLY, Choice::Digit(1)),
+            "{command}: {d:?}"
+        );
+    }
+}
+
+/// EVERY OTHER NOTE CLAUDE CODE 2.1.308 DRAWS ON A BASH BOX STAYS WITH A
+/// PERSON (MEASURED 2026-10-22, `docs/measured/box-notes-2026-10-22.md`):
+/// the too-complex notes (`A variable…`, `Quoted text…`, `A command used as
+/// a file…`, `Parse error`, `A variable in braces…`, `A nested command…`,
+/// `Brace expansion`) say the vendor's walk stopped at the first form it
+/// could not check and checked nothing else, a form the classifier has
+/// holes in (it reads `sort x {-o,y}` as a read; bash runs `sort x -o y`);
+/// the flag and command notes (`awk program contains system()…`, `find with
+/// '-exec'…`, a `cd` before git, `awk has an option…`, a `/dev/tcp`
+/// redirect) name a concern of the vendor's own. Each box is escalated with
+/// its note, whatever the classifier says of its command (it proves `for`,
+/// `<<<`, `${HOME}`, `$(date)`, `ls {a,b}`, `find -exec grep` and `cd sub
+/// && git status` reads; the brace expansion is refused on aterm's own
+/// proof too, [`brace_free`]).
+///
+/// NEGATIVE CONTROL: the boxes whose command the read-only rule proves, with
+/// their one-row note taken off, are approved under `read-only@classify-v6`,
+/// so it is the note that holds each.
+#[test]
+fn every_other_vendor_note_on_a_bash_box_stays_with_a_person() {
+    for (name, note, proven) in [
+        (
+            "n11-variable",
+            "A variable in this command can't be checked before it runs",
+            true,
+        ),
+        (
+            "n14-quoted-text",
+            "Quoted text in this command can't be checked before it runs",
+            true,
+        ),
+        (
+            "n15-command-as-file",
+            "A command used as a file in this command can't be checked before it runs",
+            false,
+        ),
+        ("n16-parse-error", "Parse error", false),
+        (
+            "n23-variable-braces",
+            "A variable in braces in this command can't be checked before it runs",
+            true,
+        ),
+        (
+            "n24-nested-command",
+            "A nested command in this command can't be checked before it runs",
+            true,
+        ),
+        ("n25-brace-expansion", "Brace expansion", false),
+        (
+            "n10-awk-system",
+            "awk program contains system() which executes arbitrary commands",
+            false,
+        ),
+        (
+            "n17-find-exec",
+            "find with '-exec' executes commands or modifies files",
+            false,
+        ),
+        (
+            "n19-cd-git",
+            "This command changes directory before running a version-control command",
+            false,
+        ),
+        (
+            "n30-awk-option",
+            "awk has an option that can't be checked before it runs",
+            false,
+        ),
+        (
+            "h8-dev-tcp",
+            "Redirect involving /dev/tcp or /dev/udp opens a network connection",
+            false,
+        ),
+    ] {
+        let rows = note_box(name);
+        let d = on_screen(&rows, &git_host(ctx()));
+        let r = reason(&d).to_string();
+        assert!(
+            r.starts_with(&format!("the box carries a vendor note: {note}")),
+            "{name}: {r}"
+        );
+        if !proven {
+            continue;
+        }
+        // NEGATIVE CONTROL
+        let bare: Vec<String> = rows.into_iter().filter(|r| r.trim() != note).collect();
+        let d = on_screen(&bare, &git_host(ctx()));
+        assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{name}: {d:?}");
+    }
+}
+
+/// NO RULE PROVES A BASH BOX WHOSE COMMAND MAY OPEN A NETWORK CONNECTION BY
+/// READING A FILE ([`network_free`]; a safety fix to `read-only@classify-v6`,
+/// `breaker-read-only@v6` and `rm-breaker@v5`): bash opens `/dev/tcp/H/P` and
+/// `/dev/udp/H/P` in a redirect as a socket (after its expansions, so
+/// `/dev/"tcp"/…` is one too), an expansion may compute that target, and
+/// gawk's `getline <` opens `/inet/…`. The classifier reads each as a read.
+/// MEASURED on 2.1.308: alone such a redirect draws its own note, but after
+/// a subcommand that draws the no-rule note it draws only that note, and a
+/// subcommand that reads outside the working directory draws none. Each
+/// form is refused, the target named: a one-row box with no note (the
+/// read-only rule), the too-many breaker's box and the rm breaker's.
+///
+/// NEGATIVE CONTROLS, each approved: an input redirect from a file, a
+/// here-string, a descriptor (`<&3`), and `cat /dev/tcp/…` with no
+/// redirect (a path bash opens as a file, which macOS does not have).
+#[test]
+fn a_reading_that_may_open_a_network_connection_proves_no_box() {
+    for (cmd, target) in [
+        ("cat < /dev/tcp/127.0.0.1/9", "/dev/tcp/127.0.0.1/9"),
+        (
+            "cat /etc/hosts; cat </dev/udp/127.0.0.1/9",
+            "/dev/udp/127.0.0.1/9",
+        ),
+        ("grep x 0< /dev/\"tcp\"/h/80", "/dev/tcp/h/80"),
+        ("cat < \"$F\"", "$…"),
+        ("head -c1 < $(echo x)", "$…"),
+    ] {
+        assert!(classify_command(cmd).read_only, "{cmd}");
+        let r = reason(&on_screen(&bash_box(&[cmd], Some("Read")), &ctx())).to_string();
+        assert!(
+            r.contains(&format!(
+                "an input redirect from {target} (space reading) may open a network connection"
+            )),
+            "{cmd}: {r}"
+        );
+    }
+    let gawk = "awk 'BEGIN{getline l < \"/inet/tcp/0/h/80\"}'";
+    assert!(classify_command(gawk).read_only);
+    let r = reason(&on_screen(&bash_box(&[gawk], Some("Read")), &ctx())).to_string();
+    assert!(
+        r.contains("names a gawk network file (space reading)"),
+        "{r}"
+    );
+    let label = "the rm circuit breaker (not ruled out: too many command substitutions to \
+                 analyze; the command need not name rm)";
+    let lines = sixty_five(&[(12, "cat < /dev/tcp/127.0.0.1/9")]);
+    for base in [ctx(), bypass()] {
+        let r = reason(&on_screen(&too_many_box(&lines, base.bypass_mode), &base)).to_string();
+        assert!(r.starts_with(&format!("{label}: ")), "{r}");
+        assert!(r.contains("may open a network connection"), "{r}");
+    }
+    let rm = "rm -rf /private/tmp/claude-502/scratch/x";
+    let r = reason(&on_screen(
+        &rm_box(&format!("{rm}; cat < /dev/tcp/127.0.0.1/9")),
+        &bypass(),
+    ))
+    .to_string();
+    assert!(r.starts_with("rm circuit breaker: "), "{r}");
+    assert!(r.contains("may open a network connection"), "{r}");
+    // NEGATIVE CONTROLS
+    for cmd in [
+        "grep -c x < README.md",
+        "wc -l <<< x",
+        "cat <&3",
+        "cat /dev/tcp/127.0.0.1/9",
+    ] {
+        let d = on_screen(&bash_box(&[cmd], Some("Read")), &ctx());
+        assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{cmd}: {d:?}");
+    }
+    let d = on_screen(&rm_box(&format!("{rm}; grep -c x < README.md")), &bypass());
+    assert_eq!(approved(&d), Some(RULE_RM_BREAKER), "{d:?}");
+}
+
+/// NO RULE PROVES A BASH BOX WHOSE COMMAND HOLDS A BRACE EXPANSION
+/// ([`brace_free`]; a safety fix to `read-only@classify-v6`,
+/// `breaker-read-only@v6` and `rm-breaker@v5`): bash makes words of an
+/// unquoted `{a,b}` or `{a..b}` before any grammar applies, so `sort x
+/// {-o,y}` runs `sort x -o y` (MEASURED 2026-10-22: `echo sort x {-o,y}`
+/// under `/bin/bash` 3.2.57 and zsh 5.9 prints `sort x -o y`), a write
+/// classify-v5 read as a sort of three files. Breaker-4's
+/// `breaker-read-only@v4` approved the too-many box over that line, in a
+/// bypass session too: the breaker's box draws no `Brace expansion` note.
+/// Each form below that the classifier still reads is refused with the
+/// braces named, a one-row box with no note, the too-many breaker's box
+/// under the bash session and bypass, and the rm breaker's rest of line, so
+/// the brace check is what refuses it. A quoted separator inside the braces
+/// expands all the same (`{"a",b}`), a brace inside `$(…)` is the line's
+/// even inside double quotes, and an escaped `$` opens no `$'…'`. The
+/// measured `sort` writes are refused by classify-v6 on its own now, and by
+/// the brace check too.
+///
+/// NEGATIVE CONTROLS, each approved: a quoted awk program and a quoted
+/// regex interval, `find … {} +`, `${HOME}`, an escaped and a quoted brace
+/// pair, and a brace pair with no separator.
+#[test]
+fn a_reading_that_holds_a_brace_expansion_proves_no_box() {
+    for (cmd, braces) in [
+        ("wc -l {a,b}.md", "{a,b}"),
+        ("wc -l {\"a\",b}.md", "{\"a\",b}"),
+        ("echo $(wc -l {a,b}.md)", "{a,b}"),
+        ("echo a{1..3}", "{1..3}"),
+        ("echo \"$(wc -l \"a\" {a,b}.md)\"", "{a,b}"),
+        ("wc \\$'a\\' {a,b}.md b'c'", "{a,b}"),
+        ("grep -c x README.md; ls {a,{b,c}}", "{a,{b,c}}"),
+    ] {
+        assert!(classify_command(cmd).read_only, "{cmd}");
+        let r = reason(&on_screen(&bash_box(&[cmd], Some("Read")), &ctx())).to_string();
+        assert!(
+            r.contains(&format!(
+                "a brace expansion (space reading): {braces}, which bash"
+            )),
+            "{cmd}: {r}"
+        );
+    }
+    // The measured write: `read-only@classify-v6` refuses it on its own (lane
+    // A's brace-into-a-flag check), and the brace check refuses it too.
+    for cmd in [
+        "sort x {-o,y}",
+        "sort x {\"-o\",y}",
+        "sort {-o,y} README.md",
+        "echo \"$(sort x \"a\" {-o,y})\"",
+        "sort \\$'a\\' {-o,y} b'c'",
+    ] {
+        assert!(brace_free(&[cmd.to_string()]).is_err(), "{cmd}");
+        let d = on_screen(&bash_box(&[cmd], Some("Read")), &ctx());
+        assert!(matches!(d, Decision::Escalate { .. }), "{cmd}: {d:?}");
+    }
+    let label = "the rm circuit breaker (not ruled out: too many command substitutions to \
+                 analyze; the command need not name rm)";
+    let lines = sixty_five(&[(12, "wc -l {a,b}.md")]);
+    for base in [ctx(), bypass()] {
+        let r = reason(&on_screen(&too_many_box(&lines, base.bypass_mode), &base)).to_string();
+        assert!(r.starts_with(&format!("{label}: ")), "{r}");
+        assert!(
+            r.contains("a brace expansion (space reading): {a,b}"),
+            "{r}"
+        );
+    }
+    let rm = "rm -rf /private/tmp/claude-502/scratch/x";
+    let r = reason(&on_screen(
+        &rm_box(&format!("{rm}; wc -l {{a,b}}.md")),
+        &bypass(),
+    ))
+    .to_string();
+    assert!(
+        r.starts_with("rm circuit breaker: a brace expansion"),
+        "{r}"
+    );
+    // NEGATIVE CONTROLS
+    for cmd in [
+        "awk '{print $1}' README.md",
+        "grep -E 'a{1,3}' README.md",
+        "find . -name x -exec grep -l y {} +",
+        "echo ${HOME}",
+        "echo \\{a,b\\}",
+        "echo \"{a,b}\"",
+        "echo {a}",
+        "echo \"$(echo '{a,b}')\"",
+        "echo $'{a,b}'",
+    ] {
+        let d = on_screen(&bash_box(&[cmd], Some("Read")), &ctx());
+        assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{cmd}: {d:?}");
+    }
+    let lines = sixty_five(&[(12, "sort -k2 README.md")]);
+    let d = on_screen(&too_many_box(&lines, true), &bypass());
+    assert_eq!(approved(&d), Some(RULE_BREAKER_READ_ONLY), "{d:?}");
 }
 
 #[test]

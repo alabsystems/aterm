@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `ship release`'s step machine ([`crate::release`]) driven against a fake world: a
-//! scratch release directory (the journal and the run claim are real files), and a
-//! [`Backend`] whose git, engine, records, children, clock and owner's aterm are in
-//! memory. What the machine owns is what these tests hold it to: the order, the
-//! skip-by-facts rule, the resume after a stop at each step, the final line's shape,
-//! the dry run, the owner ask while the long steps run, the READY candidate kept, one
-//! run per clone and the re-exec guard, and the prepare with its visible half's re-asks.
+//! `ship release`'s step machine ([`crate::release`]) driven against a fake world.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -37,14 +31,12 @@ struct World {
     started: String,
     alive: BTreeMap<u32, String>,
     times: String,
-    // git
     history: Vec<String>,
     versions: BTreeMap<String, String>,
     head: String,
     on_main: bool,
     origin_tags: BTreeMap<String, String>,
     ledger: Vec<String>,
-    // the engine, the cut, the receipts
     published: BTreeMap<String, String>,
     newest: Option<String>,
     cut: Option<CutState>,
@@ -61,7 +53,6 @@ struct World {
     /// The cut's claim lands (main takes the release commit, the ledger its line) and the
     /// cut then fails before it journals anything.
     claim_lands_unjournaled: bool,
-    // behaviours
     machine_refusals: Vec<Refusal>,
     /// The preflight's own blocks: R's commit-only gates and the engine's readiness.
     blocks: Vec<Refusal>,
@@ -389,7 +380,6 @@ impl Backend for World {
         if self.ls_remote_down {
             return Err("origin did not answer".into());
         }
-        // a finished cut published its version's tag, on the release commit
         if let Some(cut) = self.cut.as_ref().filter(|cut| cut.finished)
             && tag == format!("v{}", cut.version)
         {
@@ -453,7 +443,6 @@ impl Backend for World {
     fn move_to(&mut self, commit: &str) -> Result<(), Refusal> {
         self.calls.push(format!("move {}", &commit[..4]));
         self.head = commit.to_string();
-        // a signal as the move's child ends: the move itself is done
         self.interrupt_at("move");
         Ok(())
     }
@@ -498,7 +487,6 @@ impl Backend for World {
             None => Answer::no("its bundle is not built yet (step 5)"),
             Some(a) => yes(&self.verified, "PASSED", &a.macho_sha256),
         };
-        // promotable only naming the engine that staged it, as the real reader holds it
         let attested =
             self.attested.as_deref() == Some(c.commit.as_str()) && self.staged_by.is_some();
         Facts {
@@ -674,7 +662,6 @@ impl Backend for World {
             self.staged_by = Some(self.engine.clone());
             self.peer_staged = false;
             if self.child_note_at_stage {
-                // a step's child that ended, its note left behind
                 std::fs::write(
                     World::release_dir(self).join(RUNNING_CHILD_FILE),
                     "pid 999\nstarted Thu Oct  9 01:00:00 2026\nstep stage\n",
@@ -716,10 +703,7 @@ impl Backend for World {
     fn cut(&mut self, args: &[String], _p: &Prover) -> Ran {
         self.calls.push(format!("cut {}", args[3..].join(" ")));
         let resuming = args.iter().any(|a| a == "--resume");
-        // The cut claims the journal's reservation, never another number: one the
-        // tail has reached refuses before the claim, nothing burned.
         let Some(reserved) = self.journal().and_then(|j| j.reserved) else {
-            // a resume finishes the claim its own journal holds, the bytes it names:
             // it reads no release journal
             if resuming && let Some(cut) = self.cut.as_mut() {
                 cut.finished = self.cut_finishes;
@@ -816,8 +800,6 @@ fn lease_held() -> Refusal {
     )
 }
 
-// (a) end to end ----------------------------------------------------------------
-
 #[test]
 fn a_bump_runs_every_step_in_order_and_ends_released() {
     let mut w = World::new();
@@ -833,8 +815,6 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
         .map(String::as_str)
         .filter(|c| !matches!(*c, "audit" | "lease" | "cut-gates") && !c.starts_with("ls-remote"))
         .collect();
-    // the real stage first (the preflight, then it), the fixture generator beside the
-    // build, and the engine asked again right before the publish
     assert_eq!(
         order,
         [
@@ -858,7 +838,6 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
             "land-fixtures",
         ]
     );
-    // two provisioning audits: the checks', and the publish's
     assert_eq!(w.count("audit"), 2, "{:?}", w.calls);
     let j = w.journal().unwrap();
     assert_eq!((j.version.as_str(), j.commit.as_str()), ("0.6.0", BUMP));
@@ -907,8 +886,6 @@ fn a_second_run_finds_everything_done_and_only_checks() {
     );
 }
 
-// (a') the release's own handoff fixtures ---------------------------------------------
-
 /// A refusing generator refuses the release at the build step it runs beside, before the
 /// publish and the claim: nothing public, no number burned, and the bundle is kept, so the run
 /// after the fix stages the fixtures alone.
@@ -928,8 +905,6 @@ fn a_generator_that_refuses_refuses_the_release_before_its_claim() {
         "the bundle is kept"
     );
 
-    // fixed on main: the same reservation is staged, nothing built again, and the
-    // release goes on
     w.generator_refuses = false;
     w.calls.clear();
     let (code, last) = w.run(mac());
@@ -981,8 +956,6 @@ fn fixtures_staged_and_not_landed_are_landed_by_the_next_run() {
     );
     assert!(w.fixtures_on_main);
 }
-
-// (b) resume after a stop at each step --------------------------------------------
 
 /// A run stopped at any step — refused by it, by a bug in the release itself (a panic),
 /// or by the engine sync after `pub stage` failing — ends in one line, its claim gone,
@@ -1040,8 +1013,6 @@ fn a_run_stopped_at_any_step_resumes_there_and_repeats_nothing_done() {
             |w| w.latest_lags = false,
         ),
     ];
-    // resumed bare, and by the very command that stopped (docs/RELEASING.md: "it resumes
-    // where it stopped"), a `--bump` past the cut included
     for ((step, broken, mend), again) in cases
         .into_iter()
         .flat_map(|case| [(case, mac()), (case, bump())])
@@ -1049,8 +1020,6 @@ fn a_run_stopped_at_any_step_resumes_there_and_repeats_nothing_done() {
         let mut w = World::new();
         broken(&mut w);
         let (code, last) = w.run(bump());
-        // a refusal, exit 1 — a panic and a failed sync included; verify's exit 3 (a
-        // check could not run) is the one resumable stop here, exit 3
         let exit = if step == Step::Verify { 3 } else { 1 };
         assert_eq!(code, exit, "{step:?}: {last}");
         assert!(
@@ -1068,8 +1037,6 @@ fn a_run_stopped_at_any_step_resumes_there_and_repeats_nothing_done() {
         let (code, last) = w.run(again);
         assert_eq!(code, 0, "{step:?}: {last}\n{:#?}", w.out);
         assert!(last.starts_with("RELEASED aterm 0.6.0"), "{step:?}: {last}");
-        // nothing the first run finished is run again: never a second build, nor a
-        // second reservation the bytes built under the first would not carry
         for (call, done_by) in [
             ("bump", Step::Commit),
             ("reserve", Step::Build),
@@ -1083,7 +1050,6 @@ fn a_run_stopped_at_any_step_resumes_there_and_repeats_nothing_done() {
             }
         }
         if step == Step::Cut {
-            // past the claim: the cut resumes its own journal, every pre-claim gate past
             assert!(w.calls.iter().any(|c| c == "cut --resume"), "{:?}", w.calls);
             assert_eq!(
                 w.count("commit-gates") + w.count("cut-gates"),
@@ -1097,8 +1063,6 @@ fn a_run_stopped_at_any_step_resumes_there_and_repeats_nothing_done() {
         assert_eq!(j.commit, BUMP, "{step:?}: the candidate is kept");
     }
 }
-
-// (c) the dry run ------------------------------------------------------------------
 
 /// A dry run that would go ahead — an owner gap open — changes nothing: no journal, no
 /// claim, no step that writes, and nobody asked.
@@ -1241,18 +1205,13 @@ fn what_would_refuse_the_release_refuses_it_before_anything_changes() {
     }
 }
 
-// (e) the owner, asked once, while the long steps run ---------------------------------
-
 /// An owner gap is asked once, at the checks, before the stage; the long steps run; the
-/// release waits for it at the publish and goes on once it closes. An ask the owner's
-/// aterm did not take is raised again at the next audit, and journaled only once
-/// delivered.
+/// release waits for it at the publish and goes on once it closes.
 #[test]
 fn an_owner_gap_is_asked_once_the_long_steps_run_and_the_release_waits_then_goes_on() {
     for undelivered in [0, 1] {
         let mut w = World::new();
         w.undelivered = undelivered;
-        // open at the checks' audit and at the publish's; closed at its first re-audit
         w.audits = VecDeque::from([owner_gap(), owner_gap(), passes()]);
         let (code, last) = w.run(bump());
         assert_eq!(code, 0, "{last}\n{:#?}", w.out);
@@ -1303,22 +1262,16 @@ fn an_audit_that_could_not_ask_is_a_resumable_stop_where_it_is_needed() {
     assert_eq!(w.count("publish"), 0, "{:?}", w.calls);
 }
 
-// (f) the READY candidate is kept --------------------------------------------------
-
 /// A bare re-run keeps the READY candidate when main moved on: it never chases main.
-/// (`--commit` replacing it is held below, with the asks it carries.)
 #[test]
 fn a_bare_rerun_keeps_the_ready_candidate() {
     let mut w = World::new();
-    // stop it at the wait at the publish, READY: the owner's gap holds, and the fake's
-    // sleep is ended by making the next audit refuse
     w.audits = VecDeque::from([owner_gap(), owner_gap(), machine_gap()]);
     let (code, _) = w.run(bump());
     assert_eq!(code, 1);
     let j = w.journal().unwrap();
     assert_eq!(j.commit, BUMP);
     assert!(w.macho().is_some_and(|m| w.verified.contains(&m)), "READY");
-    // main moves on
     w.history.push(NEXT.into());
     w.versions.insert(NEXT.into(), "0.6.0".into());
     w.audits = VecDeque::from([passes()]);
@@ -1350,8 +1303,6 @@ fn a_published_candidate_cannot_be_replaced() {
     );
 }
 
-// (g) one run per clone; the re-exec guard ------------------------------------------
-
 #[test]
 fn a_second_run_in_the_same_clone_is_refused_naming_the_first() {
     let mut w = World::new();
@@ -1369,7 +1320,6 @@ fn a_second_run_in_the_same_clone_is_refused_naming_the_first() {
         "{last}"
     );
     assert!(w.calls.is_empty(), "{:?}", w.calls);
-    // a dead holder (or its pid reused by another process) is no holder
     w.alive.insert(777, "Fri Oct 10 01:00:00 2026".into());
     assert_eq!(w.run(bump()).0, 0, "{:#?}", w.out);
     assert!(
@@ -1380,9 +1330,7 @@ fn a_second_run_in_the_same_clone_is_refused_naming_the_first() {
 }
 
 /// A cutter that is not R's own re-execs as R's own cutter ONCE (the same pid: its claim
-/// adopted); a re-exec that still is not R's refuses at step 3, never looping. THE
-/// RE-EXEC KEEPS R: `--commit origin/main` names main's tip when the run starts, and the
-/// run re-executed after main moved keeps the R it chose and journaled.
+/// adopted); a re-exec that still is not R's refuses at step 3, never looping.
 #[test]
 fn a_cutter_that_is_not_rs_own_reexecs_once_and_keeps_the_candidate() {
     let mut w = World::new();
@@ -1395,7 +1343,6 @@ fn a_cutter_that_is_not_rs_own_reexecs_once_and_keeps_the_candidate() {
     let (code, last) = w.run(tip.clone());
     assert_eq!(w.count("reexec"), 1, "{:?}", w.calls);
     assert_eq!(code, 1, "the fake's exec fails: {last}");
-    // after the exec: the claim is this process's own (same pid, same start time)
     let adopt = |w: &World| {
         std::fs::write(
             w.release_dir().join(RUNNING_FILE),
@@ -1409,7 +1356,6 @@ fn a_cutter_that_is_not_rs_own_reexecs_once_and_keeps_the_candidate() {
     assert_eq!((code, w.count("reexec")), (1, 0), "no loop: {last}");
     assert!(last.starts_with("REFUSED at 3/11 commit"), "{last}");
 
-    // R's own cutter, built while main moved on: the run keeps R
     adopt(&w);
     w.history.push(NEXT.into());
     w.versions.insert(NEXT.into(), "0.6.0".into());
@@ -1425,14 +1371,10 @@ fn a_cutter_that_is_not_rs_own_reexecs_once_and_keeps_the_candidate() {
     );
 }
 
-// (h) what the cut would refuse: at minute one, and again right before the publish -----
-
 /// A judge that cannot answer is no "no": it stops at step 4 as COULD NOT RUN, never
 /// after the hours of the steps whose record it would then not read either.
 #[test]
 fn a_judge_that_cannot_answer_stops_at_minute_one() {
-    // resumed with step 4 journaled already (a COULD NOT RUN at `verify release`): still
-    // stopped at step 4, before the long steps
     let mut w = World::new();
     w.verify_passes = false;
     w.verify_code = 3;
@@ -1449,8 +1391,7 @@ fn a_judge_that_cannot_answer_stops_at_minute_one() {
     assert_eq!(w.count("verify"), 0, "{:?}", w.calls);
 }
 
-/// The ledger row is written before sign-release. A nonzero publish refuses once,
-/// and its row must not let a re-run claim or ship before that missing work is done.
+/// The ledger row is written before sign-release.
 #[test]
 fn a_publish_that_recorded_source_but_failed_signing_cannot_be_skipped_into_a_cut() {
     let mut w = World::new();
@@ -1473,8 +1414,6 @@ fn a_publish_that_recorded_source_but_failed_signing_cannot_be_skipped_into_a_cu
     );
     assert!(w.cut.is_none(), "nothing was claimed");
 
-    // The owner finishes the signing work the refusal names. Reuse the verified
-    // candidate and the already published source without another public write.
     w.source_attested.insert(BUMP.into());
     w.calls.clear();
     let (code, last) = w.run(mac());
@@ -1499,7 +1438,6 @@ fn a_fresh_cut_whose_publish_is_skipped_is_audited_and_waits_before_its_claim() 
     assert!(last.starts_with("REFUSED at 9/11 cut"), "{last}");
     assert!(w.published.contains_key(BUMP) && w.cut.is_none());
 
-    // open at the checks' audit and at the one before the cut; closed at its re-audit
     w.cut_claims = true;
     w.cut_code = 0;
     w.audits = VecDeque::from([owner_gap(), owner_gap(), passes()]);
@@ -1514,10 +1452,7 @@ fn a_fresh_cut_whose_publish_is_skipped_is_audited_and_waits_before_its_claim() 
     assert!(sleep < gates && gates < cut, "{:?}", w.calls);
 }
 
-/// THE RE-CHECK RIGHT BEFORE WHAT GOES PUBLIC. The publish audits the provisioning
-/// first, and may wait there for the owner — hours; so what the cut would refuse is
-/// asked again after that wait, right before `pub publish` — and what changed during the
-/// wait (a rostered peer cut v0.6.0, the disk filled) refuses there, nothing public.
+/// THE RE-CHECK RIGHT BEFORE WHAT GOES PUBLIC.
 #[test]
 fn what_changes_while_the_publish_waits_is_asked_again_right_before_it() {
     type Change = fn(&mut World);
@@ -1546,12 +1481,9 @@ fn what_changes_while_the_publish_waits_is_asked_again_right_before_it() {
     }
 }
 
-// (i) interrupted, never orphaned ------------------------------------------------------
-
 /// A signal ends the step's child — or the wait for the owner — and the release ends in
 /// ONE line, `INTERRUPTED at <step>`, exit 130, its claim gone, nothing past that step
 /// run: at step 3, R's cutter is never exec'd (an exec forgets every signal caught).
-/// The same command resumes there, bumping nothing twice.
 #[test]
 fn an_interrupt_ends_the_run_in_one_line_and_it_resumes() {
     type Setup = fn(&mut World);
@@ -1613,7 +1545,7 @@ const INTERRUPT_PROBE: &str = "ATERM_RELEASE_INTERRUPT_PROBE";
 
 /// The verify step's child in the probe: a shell (the step's child, its group's leader)
 /// and a subshell it leaves running (another member of that group), each writing what
-/// it was sent once its trap is armed. Bounded, so nothing outlives a broken run long.
+/// it was sent once its trap is armed.
 const PROBE_STEP: &str = r#"d="$1"
 ( trap 'echo TERM > "$d/grandchild"; exit 0' TERM
   echo armed > "$d/grandchild.armed"
@@ -1623,11 +1555,7 @@ echo armed > "$d/child.armed"
 wait
 "#;
 
-/// A REAL INTERRUPT, END TO END. The release (a process of its own: this test binary
-/// re-run as the probe) runs its verify step's child through the real spawn path; a
-/// SIGTERM sent to the RELEASE alone reaches every member of the step's group (the
-/// child and the subshell it left running), the release waits for the step to end, and
-/// its last line is `INTERRUPTED …`, exit 130.
+/// A REAL INTERRUPT, END TO END.
 #[cfg(unix)]
 #[test]
 fn a_real_sigterm_reaches_the_steps_group_and_ends_interrupted() {
@@ -1659,7 +1587,6 @@ fn a_real_sigterm_reaches_the_steps_group_and_ends_interrupted() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    // a hang detector, never a latency budget
     let bound = Instant::now() + Duration::from_secs(60);
     let armed = |who: &str| scratch.path().join(format!("{who}.armed")).exists();
     while !(armed("child") && armed("grandchild")) {
@@ -1707,8 +1634,7 @@ fn a_real_sigterm_reaches_the_steps_group_and_ends_interrupted() {
 /// beside each other (the build and the fixture generator), each noted on its own
 /// (`running.child.<pid>`; a bare `running.child` is an older cutter's note): any one
 /// still alive holds the clone, named, and the refusal says to stop that process, never
-/// its group, where a trustd it started may live. The notes of the ones that ended hold
-/// nothing, and the next run clears them.
+/// its group, where a trustd it started may live.
 #[test]
 fn every_child_a_killed_step_left_running_holds_the_clone() {
     let mut w = World::new();
@@ -1724,10 +1650,8 @@ fn every_child_a_killed_step_left_running_holds_the_clone() {
         )
         .unwrap();
     };
-    // the live child's note is read after an ended one's: every note is asked
     note(dir.join(RUNNING_CHILD_FILE), 801);
     note(crate::release::child_note(&dir, 802), 802);
-    // a stray file that only looks like a note is none
     std::fs::write(dir.join(format!("{RUNNING_CHILD_FILE}.x")), "pid 803\n").unwrap();
     w.alive.insert(802, "Thu Oct  9 01:30:02 2026".into());
     let (code, last) = w.run(bump());
@@ -1745,8 +1669,6 @@ fn every_child_a_killed_step_left_running_holds_the_clone() {
         "the dead children's notes are cleared"
     );
 }
-
-// (j) the owner's asks: delivered, carried, withdrawn
 
 /// A check that got no answer resolves nothing: owner gap, COULD NOT RUN, owner gap is
 /// ONE ask, resolved only when the check passes — here across two runs, the first
@@ -1835,12 +1757,8 @@ fn an_ask_no_journal_took_is_withdrawn_when_the_run_stops_before_step_3() {
     assert_eq!(w.withdrawn, ["release.notary"]);
 }
 
-// (k) a claim forgotten, the site, the successor, the re-exec, --forget ---------------
-
 /// No claim is held to a prover, because no resume compiles: the cut claims bytes the release
-/// already built and verified, and its journal (`dist/cut-state.toml`) names them. So
-/// `--forget` around a claimed, unfinished cut drops nothing its resume needs: the next run
-/// resumes with `--resume` and never reserves, builds or verifies again.
+/// already built and verified, and its journal (`dist/cut-state.toml`) names them.
 #[test]
 fn a_claim_forgotten_and_resumed_is_never_built_again() {
     let mut w = World::new();
@@ -1901,13 +1819,11 @@ fn a_site_this_machine_cannot_sync_is_a_recorded_hand_step_and_the_release_ends(
         j.finished() && j.has("after-cut") && j.has("site-deferred"),
         "{j:?}"
     );
-    // a later run says it again, and re-runs nothing
     w.calls.clear();
     let (code, last) = w.run(mac());
     assert_eq!(code, 0, "{last}");
     assert!(last.contains(crate::release::SITE_BY_HAND), "{last}");
     assert_eq!(w.count("after-cut 0.6.0"), 0, "{:?}", w.calls);
-    // asked for no deploy (SITE_NO_DEPLOY): said as not deployed, never as already shown
     let undeployed =
         crate::release_steps::site_outcome(&Ok(crate::site::Outcome::NoDeploy), Vec::new())
             .unwrap();
@@ -1916,7 +1832,6 @@ fn a_site_this_machine_cannot_sync_is_a_recorded_hand_step_and_the_release_ends(
         "{undeployed:?}"
     );
     assert!(!undeployed.site_deferred);
-    // a failed sync is a stop that names the failure and keeps the transcript's end
     let failed = crate::release_steps::site_outcome(
         &Err(crate::site::Failure::Child {
             child: "git push",
@@ -1931,7 +1846,6 @@ fn a_site_this_machine_cannot_sync_is_a_recorded_hand_step_and_the_release_ends(
             .contains("the site sync failed: push to origin main failed"),
         "{failed:?}"
     );
-    // exit 4 (deployed, the live site not agreeing yet) is still a stop to retry
     let mut w = World::new();
     w.site = Ok(crate::site::Outcome::LiveDisagrees {
         deployed: true,
@@ -1958,7 +1872,6 @@ fn a_shape_refusal_names_its_way_out_and_following_it_ships_the_successor() {
     let (code, last) = w.run(bump());
     assert_eq!(code, 1);
     assert!(last.starts_with("REFUSED at 10/11 after-cut"), "{last}");
-    // v0.6.0 is cut: its tag on origin, its ledger line
     w.origin_tags.insert("v0.6.0".into(), BUMP.into());
     w.ledger.push("0.6.0".into());
     w.calls.clear();
@@ -2008,15 +1921,8 @@ fn forget_takes_no_flag_it_would_ignore() {
     ));
 }
 
-// (p) prepare, then release -------------------------------------------------------------
-
 /// `--prepare` runs the heavy half and stops before the publish: PREPARED in the journal
-/// with the prover it held, the clone's run markers let go before its line. A bare run
-/// then asks the live world again before anything is public: what it cannot use or
-/// cannot ask (a prover that is not the prepared build; an origin that does not answer)
-/// stops it at step 1, nothing run, the prepare kept; then it asks the provisioning, the
-/// tag and the engine — which moved since it staged, so the stage runs again — and goes
-/// on from the publish, nothing heavy run again.
+/// with the prover it held, the clone's run markers let go before its line.
 #[test]
 fn a_prepare_stops_before_the_publish_and_the_bare_run_reasks_then_releases() {
     let mut w = World::new();
@@ -2037,7 +1943,6 @@ fn a_prepare_stops_before_the_publish_and_the_bare_run_reasks_then_releases() {
         w.cut.is_none() && w.published.is_empty(),
         "nothing claimed or public"
     );
-    // the run's markers let go before its line (the release holds no machine lock)
     assert_eq!(
         w.running_at_prepared,
         Some(false),
@@ -2089,7 +1994,6 @@ fn a_prepare_stops_before_the_publish_and_the_bare_run_reasks_then_releases() {
         mend(&mut w);
     }
 
-    // the engine moved since it staged
     w.engine = "f1f1f1f1f1".into();
     w.calls.clear();
     let (code, last) = w.run(mac());
@@ -2107,7 +2011,6 @@ fn a_prepare_stops_before_the_publish_and_the_bare_run_reasks_then_releases() {
             .position(|c| c == call)
             .unwrap_or_else(|| panic!("{call}: {:?}", w.calls))
     };
-    // asked first, before the stage again: the provisioning, the tag, the engine
     for asked in ["audit", "ls-remote v0.6.0", "engine-now"] {
         assert!(at(asked) < at("stage"), "{asked}: {:?}", w.calls);
     }
@@ -2115,11 +2018,7 @@ fn a_prepare_stops_before_the_publish_and_the_bare_run_reasks_then_releases() {
     assert!(at("stage") < at("publish"), "{:?}", w.calls);
 }
 
-/// Only a claimed cut is past its prepare. A visible half that published and then stopped
-/// short of the claim (a peer claimed past the reservation) leaves the source public and its
-/// PREPARED record stale: the next bare run refuses before anything heavy, keeping the record;
-/// `--prepare` reserves anew, builds, verifies and records PREPARED again over the published
-/// source; and the bare run after it releases that build.
+/// Only a claimed cut is past its prepare.
 #[test]
 fn a_prepare_overtaken_after_its_publish_is_prepared_again_then_released() {
     let mut w = World::new();
@@ -2130,7 +2029,6 @@ fn a_prepare_overtaken_after_its_publish_is_prepared_again_then_released() {
     assert_eq!(code, 0, "{last}\n{:#?}", w.out);
     let first = w.journal().unwrap().prepared.unwrap();
 
-    // the visible half publishes; a peer claims past the reservation as the cut starts
     w.overtaken_at_cut = true;
     let (code, last) = w.run(mac());
     assert_eq!(code, 1, "{last}\n{:#?}", w.out);
@@ -2140,7 +2038,6 @@ fn a_prepare_overtaken_after_its_publish_is_prepared_again_then_released() {
         "public, nothing claimed"
     );
 
-    // the bare run refuses: the ledger reached the prepared build — nothing heavy runs
     w.calls.clear();
     let (code, last) = w.run(mac());
     assert_eq!(code, 1, "{last}\n{:#?}", w.out);
@@ -2154,7 +2051,6 @@ fn a_prepare_overtaken_after_its_publish_is_prepared_again_then_released() {
         "the record is kept"
     );
 
-    // `--prepare` makes it fresh over the published source: reserved anew, built, verified
     w.calls.clear();
     let (code, last) = w.run(ReleaseOptions {
         prepare: true,
@@ -2171,7 +2067,6 @@ fn a_prepare_overtaken_after_its_publish_is_prepared_again_then_released() {
         w.calls
     );
 
-    // the bare run asks again and releases the fresh build
     w.calls.clear();
     let (code, last) = w.run(mac());
     assert_eq!(code, 0, "{last}\n{:#?}", w.out);
@@ -2182,10 +2077,6 @@ fn a_prepare_overtaken_after_its_publish_is_prepared_again_then_released() {
 }
 
 /// EVERY RELEASE PUBLISHES BY THE ENGINE THAT STAGED IT, ATTESTED AS THE STAGING TIER IS.
-/// The stage comes before the long steps, hours before the publish: an engine whose code
-/// moved meanwhile (the checkout is shared), or a staging tier a peer's `pub stage aterm`
-/// moved (`pub promote` refuses that attestation), stages R again right before the
-/// publish — never a stop, never a refusal every re-run would meet again.
 #[test]
 fn what_moved_while_the_long_steps_ran_stages_again_before_the_publish() {
     type Move = fn(&mut World);
@@ -2226,12 +2117,9 @@ fn what_moved_while_the_long_steps_ran_stages_again_before_the_publish() {
     }
 }
 
-// the pure pieces -------------------------------------------------------------------
-
 /// Relative path flags are anchored ONCE, where the release started: the steps and the
 /// re-exec as R's own cutter run from the clone's root, where they would name another
-/// place. An existing one is canonical, one that does not exist yet is joined (for step 1
-/// to refuse by its full name), and an absolute one is left as given.
+/// place.
 #[test]
 fn relative_path_flags_are_anchored_once_where_the_release_started() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -2285,16 +2173,12 @@ fn a_public_version_is_major_minor_zero() {
     }
 }
 
-// (l) build once ---------------------------------------------------------------------
-
 /// `verify release` decides step 6 by its exit alone: a FAIL (1) refuses naming the
 /// command that reruns it; any other exit (3: a check could not run or was skipped; 2: a
 /// refused command line) is a resumable stop, never a pass; and a pass whose record
 /// cannot be read is a resumable stop too.
 #[test]
 fn the_verify_step_refuses_on_any_exit_but_a_recorded_pass() {
-    // (verify's exit, the release's exit): only a FAIL is a refusal; the rest stop
-    // resumably, a pass whose record cannot be read included
     for (code, exit) in [(1, 1), (3, 3), (2, 3), (0, 3)] {
         let mut w = World::new();
         w.verify_code = code;
@@ -2345,7 +2229,6 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_only_a_pass
     std::fs::create_dir_all(&bin).unwrap();
     let said = dir.path().join("said");
     let mode = dir.path().join("mode");
-    // The stand-in: says how it was run, then leaves the clone as `mode` asks.
     std::fs::write(
         bin.join("targo"),
         format!(
@@ -2393,7 +2276,6 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_only_a_pass
         )
     );
 
-    // A pass that dirtied the clone, or moved it off R's tree, is no pass.
     for how in ["dirty", "move"] {
         set("0", how);
         let refused =
@@ -2408,7 +2290,6 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_only_a_pass
         );
     }
 
-    // A clone that is not clean as the step starts never runs the checks.
     std::fs::write(repo.join("stray.txt"), "before").unwrap();
     std::fs::remove_file(&said).unwrap();
     set("0", "");
@@ -2427,8 +2308,6 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_only_a_pass
 /// it — and never claimed again, whether a peer's release overtook it while `verify
 /// release` judged it (the release stops there, nothing burned) or this clone's claim
 /// of it landed with no cut journal (the cut stopped between its push and its journal).
-/// Either way the next run reserves anew, builds and verifies (a verified bundle under a
-/// spent number is no use), and the cut claims the fresh number.
 #[test]
 fn a_spent_reservation_is_built_again_never_renumbered() {
     type Spend = fn(&mut World);

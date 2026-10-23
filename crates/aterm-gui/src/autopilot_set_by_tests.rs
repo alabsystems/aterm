@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHO SET A SESSION'S AUTOPILOT (`docs/DESIGN-harness-autopilot-2026-10-15.md`
-//! §11.7.5) on the App: the wire's write recorded with its writer, every
-//! window surface naming itself, `meta`'s two fields, the carry across a
-//! restore, and the SESSIONS row's setting line. Each test says its negative
-//! control; the mutations that must fail them are recorded in the landing
-//! commit.
+//! Session autopilot writer attribution tests.
 
 use super::*;
 use crate::autopilot_timers::{TimerChoice, set_fake_clocks};
@@ -100,13 +95,7 @@ fn field(reply: &str, key: &str) -> Option<String> {
 /// connection leaves the session's keyed record — none was left in an older format
 /// — with the title a window write has and its last line `set over
 /// aterm ctl`; `meta unset autopilot` records the hand back to the default
-/// with the same line; aterm's harness and the fabric name themselves. A
-/// session's edge connection is refused the write (the Owner rule, §11.7.6),
-/// so nothing is stored or recorded from it; the setter words an edge
-/// writer's sid would read are `from tab 2 (<its label>)`, and `from session
-/// <short sid>` once no live session has it. NEGATIVE CONTROLS: `meta set
-/// title x`, a same-word write and a second wake for the same write leave no
-/// new record.
+/// with the same line; aterm's harness and the fabric name themselves.
 #[test]
 fn a_write_over_the_wire_is_recorded_with_its_writer() {
     let (mut app, host) = hosted();
@@ -129,7 +118,6 @@ fn a_write_over_the_wire_is_recorded_with_its_writer() {
         Some((Actor::Ctl, None))
     );
 
-    // NEGATIVE CONTROLS: another field, the same word, the same wake again.
     let (_, changed) = wire(&mut app, 0, "set title x");
     assert!(changed, "the title moved");
     assert_eq!(records(&app, 0).len(), 1, "no harness record for a title");
@@ -138,7 +126,6 @@ fn a_write_over_the_wire_is_recorded_with_its_writer() {
     app.on_meta_changed(0);
     assert_eq!(records(&app, 0).len(), 1, "a same-word write records none");
 
-    // The hand back to the default, by whoever wrote it.
     let (_, changed) = wire(&mut app, 0, "unset autopilot");
     assert!(changed);
     let (title, detail) = records(&app, 0).last().cloned().unwrap();
@@ -151,7 +138,6 @@ fn a_write_over_the_wire_is_recorded_with_its_writer() {
         ]
     );
 
-    // aterm's harness and the fabric over the wire.
     wire_by(&mut app, 0, "set autopilot land", Actor::Harness);
     assert_eq!(
         last_line(&app, 0).as_deref(),
@@ -160,7 +146,6 @@ fn a_write_over_the_wire_is_recorded_with_its_writer() {
     wire_by(&mut app, 0, "set autopilot off", Actor::Bridge);
     assert_eq!(last_line(&app, 0).as_deref(), Some("set over the fabric"));
 
-    // A session's edge connection: refused, so nothing stored or recorded.
     let tok = {
         let ctx = app.pool.get(0).unwrap().ctx.clone();
         let mut edges = ctx.edges.lock().unwrap();
@@ -181,7 +166,6 @@ fn a_write_over_the_wire_is_recorded_with_its_writer() {
     );
     assert_eq!(records(&app, 0).len(), before);
 
-    // An edge writer's words: the second tab, by its tab and label.
     let wid = WindowId(0);
     let second = app.next_session_id;
     app.push_stub_tab(wid, crate::stub_session(second));
@@ -204,7 +188,6 @@ fn a_write_over_the_wire_is_recorded_with_its_writer() {
         format!("set from tab 2 ({label})")
     };
     assert_eq!(last_line(&app, 0), Some(want));
-    // Gone: its short sid.
     let gone = aterm_session::SessionId::generate();
     let gone_actor = crate::session_log::sid_actor(gone.as_str()).expect("minted");
     assert!(apply_autopilot(&ctx, Some("off".into()), None, gone_actor, None).moved);
@@ -222,8 +205,7 @@ fn a_write_over_the_wire_is_recorded_with_its_writer() {
 /// THE WAKE READS THE DROPPED TIMER FIRST (§11.7.3, item 3): a timed Cruise
 /// armed over the wire, then `meta set autopilot land` over the wire — the
 /// record says the timer it dropped is cancelled, as a window write's does,
-/// and who set it. NEGATIVE CONTROL: indexing before the read (the order
-/// in an older format) loses the cancel line.
+/// and who set it.
 #[test]
 fn a_wire_write_says_the_timer_it_dropped() {
     let (mut app, host) = hosted();
@@ -260,7 +242,6 @@ fn a_wire_write_says_the_timer_it_dropped() {
 /// Autopilot menu (a mode and its cancel), a SESSIONS row (a mode and its
 /// Timer), the `Every session` row and the timer's fire each store their own
 /// setter — `meta`'s word for it — and end the record with their own words.
-/// NEGATIVE CONTROL: the bulk row reporting `Settings` fails its row.
 #[test]
 fn every_surface_names_itself() {
     use crate::autopilot_menu::{MenuAct, MenuRow};
@@ -270,8 +251,6 @@ fn every_surface_names_itself() {
     let wall = FRI_19Z * 1000;
     set_fake_clocks(Some((mono, wall)));
     let wid = WindowId(0);
-    // A menu row chosen as a person chooses it: opened over the chip's
-    // cell, the row that acts `act`.
     let choose = move |app: &mut App, act: MenuAct| {
         app.open_autopilot_menu(wid, 0, (20, 2), false);
         let row = app
@@ -284,7 +263,6 @@ fn every_surface_names_itself() {
             .unwrap_or_else(|| panic!("no {act:?} row"));
         app.choose_autopilot_menu_row(row);
     };
-    // Each step: what it does, the setter's `meta` word, the record's line.
     type Step = Box<dyn Fn(&mut App)>;
     let steps: Vec<(&str, Step, &str, String)> = vec![
         (
@@ -371,7 +349,6 @@ fn every_surface_names_itself() {
         assert_eq!(last_line(&app, 0).as_ref(), Some(line), "{name}");
     }
 
-    // The timer's fire: armed from the menu, landed at its clock.
     choose(&mut app, MenuAct::Timer(TimerChoice::In(60)));
     let until = app.autopilot_timers.glass(0).expect("armed");
     let land_at = app.autopilot_timers.entry(0).unwrap().land_at_ms;
@@ -388,8 +365,6 @@ fn every_surface_names_itself() {
         last_line(&app, 0),
         Some(format!("set at the {} timer", until.clock.as_str()))
     );
-    // The menu's note and the SESSIONS row say when the word was written,
-    // by its timer (§11.7.7): the fire ran at the timer's own minute here.
     assert_eq!(
         app.autopilot_set_by_words(0)
             .map(|words| words.line(None))
@@ -408,10 +383,7 @@ fn every_surface_names_itself() {
 /// appended after `land_at=` — `-` and `-` for a word never set, the writer
 /// and its unix second once one is, `restored` and `-` for a word a leaf
 /// carried with no setter, and the setter kept beside an unset word (who
-/// handed it back). Every in-tree reader keys by name: the loop's reader is
-/// held to it in `aterm-agent` (`the_autopilot_word_is_read_past_who_set_it`).
-/// NEGATIVE CONTROL: an `autopilot_since=` printed for a word never set
-/// fails the first assertion.
+/// handed it back).
 #[test]
 fn meta_says_who_set_the_word_and_when() {
     let (mut app, host) = hosted();
@@ -437,7 +409,6 @@ fn meta_says_who_set_the_word_and_when() {
         )),
         "{reply}"
     );
-    // A word with no setter: carried by a leaf from an older format.
     {
         let ctx = app.pool.get(0).unwrap().ctx.clone();
         let mut meta = ctx.meta.lock().unwrap();
@@ -456,14 +427,7 @@ fn meta_says_who_set_the_word_and_when() {
 /// THE SETTER'S CARRIED FORM (§11.7.3, item 5): `<setter> <unix ms>`, read
 /// back to the setter it was written from, in its one form; a setter this
 /// build cannot read — an unknown surface or word, no time — is none, so
-/// the word reads `restored`, never as a writer it was not. The image every
-/// capture takes ([`crate::session_timeline::SessionMeta::sanitized`]) keeps
-/// the setter beside a word, drops it with the word, and carries no
-/// revision; a leaf's carried meta ([`crate::restore::TerminalLeafRestore`])
-/// keeps it only beside a word too. The App's paths — cold, reopen, graft,
-/// a driver's write winning — are `app_restore_tests`'
-/// `the_setter_rides_the_cold_restore_the_reopen_and_the_graft`. NEGATIVE
-/// CONTROL: an unknown word read as a sid fails the `nonsense` row.
+/// the word reads `restored`, never as a writer it was not.
 #[test]
 fn the_setter_is_carried_in_one_form_and_dropped_with_its_word() {
     use crate::autopilot::Surface;
@@ -511,7 +475,6 @@ fn the_setter_is_carried_in_one_form_and_dropped_with_its_word() {
         .expect("an edge writer's sid");
     assert_eq!(carried.word(), sid.as_str());
 
-    // The capture's image: beside the word, dropped with it.
     let mut meta = crate::session_timeline::SessionMeta::default();
     let _ = meta.set_autopilot(Some("off".into()), None);
     meta.note_autopilot_set_by(AutopilotSetBy {
@@ -531,7 +494,6 @@ fn the_setter_is_carried_in_one_form_and_dropped_with_its_word() {
         "no word, no setter"
     );
 
-    // A leaf's carried meta: beside a word only, and only where it parses.
     let leaf = |autopilot: Option<&str>, by: &str| crate::restore::TerminalLeafRestore {
         sid: None,
         lineage: None,
@@ -572,15 +534,13 @@ fn the_setter_is_carried_in_one_form_and_dropped_with_its_word() {
 /// ctl`, the clock time, never an age, its weekday from a day before —
 /// while the detail says only where it is and how the harness holds it; a
 /// session handed back to the default says `follows the default` on the same
-/// line. NEGATIVE CONTROL: the row with no setter composed reads `its own
-/// setting` alone and fails the first assertion.
+/// line.
 #[test]
 fn a_sessions_row_says_who_set_its_word_and_when() {
     let (mut app, host) = hosted();
     let at = FRI_19Z + 5 * 60;
     set_fake_clocks(Some((Instant::now(), at * 1000)));
     wire(&mut app, 0, "set autopilot off");
-    // The local clock and day, read here from the zone, not the stamp.
     let offset = crate::autopilot_timers::local_offset_at(at).expect("a zone");
     let local = at + offset;
     let clock = format!(
@@ -600,14 +560,12 @@ fn a_sessions_row_says_who_set_its_word_and_when() {
         "{}",
         row(&app).detail
     );
-    // A day later the line names the day it was set.
     set_fake_clocks(Some((Instant::now(), (at + 86_400) * 1000)));
     let weekday = crate::claude_lights::Weekday::of_days(local.div_euclid(86_400)).short();
     assert_eq!(
         row(&app).setting,
         format!("its own setting, set {weekday} {clock} over aterm ctl")
     );
-    // Under the default: no setter said.
     wire(&mut app, 0, "unset autopilot");
     assert_eq!(row(&app).setting, "follows the default");
     assert!(
@@ -623,9 +581,7 @@ fn a_sessions_row_says_who_set_its_word_and_when() {
 /// a timer armed from the menu fires — its record says what the
 /// fire found and `set at the 13:00 timer` — and the session's next wake
 /// for another field (`meta set title x` over the wire) records nothing,
-/// since the fire noted its revision as recorded. NEGATIVE CONTROL: the fire
-/// not noting its revision lets that wake record the session again, `Autopilot
-/// set to land` … `set by its timer`, over the fire's own words.
+/// since the fire noted its revision as recorded.
 #[test]
 fn a_later_wake_never_replaces_the_fires_record() {
     use crate::autopilot_menu::{MenuAct, MenuRow};

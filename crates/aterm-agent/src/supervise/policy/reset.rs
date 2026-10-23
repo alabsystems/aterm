@@ -1,25 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A limit reset, as the loop, its host and the policies speak of one
-//! (`docs/SPEC-claude-accounts-resets-2026-10-02.md`): what the loop asks its
-//! host before the grant row's first key ([`ResetAsk`]) and what the host
-//! answers ([`ResetWord`]: the go, a moment's wait, or the one word why not);
-//! the verdict on the confirmation the row opens ([`confirm_verdict`]); what
-//! the loop tells its host when the step ends ([`ResetEnd`]) and what the host
-//! read of it ([`ResetOutcome`]).
-//!
-//! A reset is the owner's scarce purchase, so everything here refuses by
-//! default: [`confirm_verdict`] says Enter only where every condition holds,
-//! and each that does not has its own word ([`KeepWhy`]), which the ledger's
-//! `reset-kept` row carries. Pure: nothing here reads a screen, a clock or a
-//! file, and nothing types.
-//!
-//! None of it has been seen live: its reader's texts (`aterm_phase::reset`)
-//! come from Claude Code's 2.1.304 bundle, never a screen, and `[harness]
-//! limit_reset` defaults off. 2.1.304 offers resets of several kinds
-//! (`aterm_phase::ResetKind`): the ask and the go carry the kind of the row
-//! taken, and a confirmation of any other kind is kept ([`KeepWhy::Kind`]).
+//! Limit-reset policy and confirmation verdict ([`ResetAsk`], [`ResetWord`], [`confirm_verdict`],
+//! [`KeepWhy`], [`KeepWhy::Kind`], [`ResetEnd`], [`ResetOutcome`]).
 
 use std::fmt;
 use std::time::Duration;
@@ -28,35 +11,24 @@ use aterm_phase::{ConfirmRead, ResetKind};
 
 use crate::harness::accounts::OFFER_EXPIRING_S;
 
-/// How long the vendor's own continuation is given to start after a reset
-/// whose answer line asks for nothing (it queued one itself, and starts it at
-/// once): the supervisor's continuation is owed only past it
-/// (`TurnEndState::reset_told`).
+/// Grace period for the vendor's own continuation after a reset (`TurnEndState::reset_told`).
 pub const RESET_CONTINUES_WAIT: Duration = Duration::from_secs(60);
 
-/// What the loop asks its host before the grant row's first key
-/// (`IdleHost::reset_take`): the row as read (`aterm_phase::ResetRow`).
+/// What the loop asks its host before the grant row's first key (`IdleHost::reset_take`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResetAsk {
-    /// The kind of reset the row offers (`aterm_phase::ResetRow::kind`),
-    /// never the Fable one. Handed back in the go ([`ResetGo::kind`]).
+    /// Reset kind offered by the row ([`ResetGo::kind`]).
     pub kind: ResetKind,
     /// The resets of that kind left, as the row counts them.
     pub left: u32,
-    /// The grant's last day as the row draws it (`Oct 5`): a day, not a
-    /// deadline. Handed back in the go ([`ResetGo::day`]).
+    /// The grant's last day as the row draws it ([`ResetGo::day`]).
     pub day: String,
-    /// The first second of that day (unix seconds), placed in the wall
-    /// notice's zone where the loop holds one, else the local one; `None`
-    /// where the day did not place.
+    /// The first second of that day (unix seconds).
     pub day_start: Option<i64>,
 }
 
 impl ResetAsk {
-    /// The go for this ask: what only the host knows (`until`, `long`,
-    /// `limits`), with the row's own kind, count and day carried over
-    /// unchanged, so the confirmation is held to the row that was taken
-    /// ([`confirm_verdict`]).
+    /// Build a [`ResetGo`] carrying this ask's kind, count, and day ([`confirm_verdict`]).
     #[must_use]
     pub fn go(&self, until: i64, long: bool, limits: Vec<String>) -> ResetGo {
         ResetGo {
@@ -70,22 +42,16 @@ impl ResetAsk {
     }
 }
 
-/// The host's go ([`ResetWord::Take`]): the claim is this session's, and what
-/// the confirmation must agree with.
+/// The host's go ([`ResetWord::Take`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResetGo {
-    /// The wall's reset (unix seconds), from this process's own transcript
-    /// row: with the account, what the claim is keyed on.
+    /// The wall's reset (unix seconds), from this process's own transcript row.
     pub until: i64,
-    /// The wall stands more than a day from now: the reset is worth taking
-    /// whenever its deadline is.
+    /// The wall stands more than a day from now.
     pub long: bool,
-    /// The names the walled window is drawn by in a confirmation's body
-    /// (`session`, `weekly`, `Opus`, `Sonnet`): one of them must be among the
-    /// limits the body says it refills.
+    /// Names the walled window is drawn by in a confirmation's body.
     pub limits: Vec<String>,
-    /// The kind of reset the row offered ([`ResetAsk::kind`]): the one the
-    /// confirmation must be of.
+    /// The kind of reset the row offered ([`ResetAsk::kind`]): the one the confirmation must be of.
     pub kind: ResetKind,
     /// The resets left as the row counted them ([`ResetAsk::left`]).
     pub left: u32,
@@ -93,24 +59,18 @@ pub struct ResetGo {
     pub day: String,
 }
 
-/// Why the host did not give the go ([`ResetWord::No`]): one stable word each
-/// ([`Self::word`]), for the loop's one `SKIPPED` line per dialog mount. None
-/// is tried again at that mount, and none spends anything.
+/// Why the host did not give the go ([`ResetWord::No`]): one stable word each ([`Self::word`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetNo {
     /// `[harness] limit_reset` is off, read live.
     Off,
     /// No host answers here (the trait's default).
     NoHost,
-    /// The host could not read what it judges by: no Claude Code in the tab,
-    /// no seat, a process whose login did not read.
+    /// The host could not read what it judges by.
     Unread,
-    /// The process is not on the default login: it names a login directory,
-    /// its login is not the stored one in the default home, or its roster row
-    /// has a directory.
+    /// The process is not on the default login.
     NotDefaultLogin,
-    /// Another login is in the way: the roster's active row is another one,
-    /// or another row's account ran within the vendor's profile window.
+    /// Another login is in the way.
     OtherLogin,
     /// The last quota rejection in the transcript is not this process's.
     NotOwnWall,
@@ -118,19 +78,15 @@ pub enum ResetNo {
     NoReset,
     /// The walled window is not one a grant clears.
     Window,
-    /// Neither a wall that stands more than a day nor a grant whose last day
-    /// could hold a deadline within one.
+    /// Neither a long wall nor a grant whose last day holds a deadline within a day.
     NotQualifying,
     /// Another session's claim for this wall is in flight.
     Held,
     /// This wall has had its one attempt.
     Attempted,
-    /// The accounts store did not admit: a refused roster, a state that could
-    /// not be written.
+    /// The accounts store did not admit: a refused roster, a state that could not be written.
     State,
-    /// macOS's program check is stuck: nothing the resumed agent starts would
-    /// start. Nothing is claimed, so the wall's one attempt is kept for a
-    /// dialog raised after the check clears.
+    /// macOS's program check is stuck: nothing the resumed agent starts would start.
     ProgramCheck,
 }
 
@@ -172,8 +128,7 @@ impl ResetNo {
         ResetNo::ProgramCheck,
     ];
 
-    /// [`Self::word`] read back (a harness tape's host answer,
-    /// `supervise::tape::host`); `None` for a word it never gives.
+    /// [`Self::word`] read back (a harness tape's host answer, `supervise::tape::host`).
     #[must_use]
     pub fn of_word(word: &str) -> Option<ResetNo> {
         ResetNo::ALL.into_iter().find(|no| no.word() == word)
@@ -185,24 +140,18 @@ impl ResetNo {
 pub enum ResetWord {
     /// The claim is this session's: the row may be pressed.
     Take(ResetGo),
-    /// Not yet answerable (the wall's row is not written, the store's lock is
-    /// held): ask again in a moment.
+    /// Not yet answerable: ask again in a moment.
     Again,
     /// No, and why.
     No(ResetNo),
 }
 
-/// Why a reset was kept: the confirmation was not entered (it is Escaped), or
-/// the step ended before one stood. One stable word each ([`fmt::Display`]),
-/// the reason of the ledger's `reset-kept` row.
+/// Why a reset was kept rather than entered ([`fmt::Display`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeepWhy {
-    /// The confirmation did not read exactly, and the first part that did
-    /// not (`aterm_phase::ConfirmRead::Inexact`: `title`, `options`, `kind`,
-    /// `early`, `body`, `week`, `count`, `deadline`).
+    /// The confirmation did not read exactly.
     Inexact(&'static str),
-    /// It is the confirmation of another kind of reset than the row taken
-    /// (a `Use a full reset?` where a `Use a 5-hour reset (…)` was pressed).
+    /// Confirmation is for a different reset kind than the row taken.
     Kind,
     /// Its body names none of the limits the wall is drawn by.
     OtherLimit,
@@ -210,8 +159,7 @@ pub enum KeepWhy {
     Count,
     /// Its deadline's day is not the row's day.
     Day,
-    /// The wall is not a long one, and its deadline did not place or is not
-    /// ahead.
+    /// The wall is not a long one, and its deadline did not place or is not ahead.
     Deadline,
     /// The wall is not a long one, and its deadline is more than a day off.
     NotQualifying,
@@ -225,8 +173,7 @@ pub enum KeepWhy {
     CheckTimeout,
     /// The Enter was written and the confirmation still stands.
     EnterNotTaken,
-    /// A loop that did not take the row found the confirmation: it never
-    /// enters one.
+    /// A loop that did not take the row found the confirmation: it never enters one.
     Successor,
     /// The confirmation was gone before it was judged.
     Closed,
@@ -272,11 +219,7 @@ impl KeepWhy {
         KeepWhy::Closed,
     ];
 
-    /// The ledger's word for why a reset was kept ([`fmt::Display`], the
-    /// reason of a `declined` row under [`super::approval::RULE_LIMIT_RESET`])
-    /// in a person's words, for Settings ▸ Harness's DECIDED FOR YOU
-    /// (`crate::harness::stats`); `None` for a word no build writes. Read
-    /// through the words [`fmt::Display`] writes, so the two cannot drift.
+    /// Human-readable text for a [`fmt::Display`] word under [`super::approval::RULE_LIMIT_RESET`].
     #[must_use]
     pub fn plain_words(word: &str) -> Option<String> {
         if let Some(part) = word.strip_prefix("inexact-").filter(|p| !p.is_empty()) {
@@ -322,26 +265,8 @@ pub enum Verdict {
     Keep(KeepWhy),
 }
 
-/// The verdict on a reset confirmation: [`Verdict::Enter`] only where all of
-/// these hold, checked in this order; the first that does not is the
-/// [`Verdict::Keep`]:
-///
-/// 1. `read` is [`ConfirmRead::Exact`] ([`KeepWhy::Inexact`] with the
-///    reader's word; [`KeepWhy::Closed`] for a box that is no confirmation);
-/// 2. it is of the row's kind (`go.kind`) — [`KeepWhy::Kind`];
-/// 3. a limit its body names is one the wall is drawn by (`go.limits`,
-///    compared as drawn) — [`KeepWhy::OtherLimit`];
-/// 4. its count is the row's, and one at least — [`KeepWhy::Count`];
-/// 5. its deadline's text is the row's day followed by ` at ` and an hour —
-///    [`KeepWhy::Day`];
-/// 6. the wall is a long one (`go.long`), or the deadline is placed
-///    (`deadline`, unix seconds), ahead of `now` and no more than
-///    [`OFFER_EXPIRING_S`] away — [`KeepWhy::Deadline`] where it is not
-///    placed or not ahead, [`KeepWhy::NotQualifying`] where it is further;
-/// 7. the cursor is on the yes — [`KeepWhy::Focus`].
-///
-/// `deadline` is the confirmation's own day and hour as the loop placed it;
-/// a long wall does not consult it.
+/// Verdict on a reset confirmation: [`Verdict::Enter`] on [`ConfirmRead::Exact`] within
+/// [`OFFER_EXPIRING_S`], else [`Verdict::Keep`] ([`KeepWhy::Inexact`], [`KeepWhy::Closed`]).
 #[must_use]
 pub fn confirm_verdict(
     read: &ConfirmRead,
@@ -394,18 +319,13 @@ pub struct ResetEnd {
     pub entered: bool,
     /// Why it was kept, where the loop kept it.
     pub kept: Option<KeepWhy>,
-    /// What a confirmation that read exactly offered: the one source of an
-    /// offer's record.
+    /// What a confirmation that read exactly offered: the one source of an offer's record.
     pub offer: Option<ResetOffer>,
-    /// The loop will not ask again: with no answer line read, the host
-    /// answers what stands without one.
+    /// The loop will not ask again.
     pub last: bool,
 }
 
-/// AN OFFER OF ONE KIND ([`ResetEnd::offer`], and what the host records):
-/// 2.1.304 counts each kind apart (`{left} left` in a row and its
-/// confirmation, `{kindResets} left` in an answer), so a count is never an
-/// account's whole.
+/// AN OFFER OF ONE KIND ([`ResetEnd::offer`], and what the host records).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResetOffer {
     /// The kind counted.
@@ -416,29 +336,21 @@ pub struct ResetOffer {
     pub use_by: Option<i64>,
 }
 
-/// What the host read of the step's end (`IdleHost::reset_told`): the
-/// vendor's one answer line, from the transcript.
+/// What the host read of the step's end (`IdleHost::reset_told`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetOutcome {
     /// No answer line yet: asked again.
     Pending,
-    /// A reset of `kind` was spent and the limits are refilled. `asks`: the
-    /// line asks for a message to continue (the vendor queued none of its
-    /// own); `left`: the resets of that kind left as the line counts them;
-    /// `cleared_at`: the unix second the claimed wall was cleared at.
+    /// A reset of `kind` was spent and the limits are refilled.
     Spent {
         kind: ResetKind,
         asks: bool,
         left: Option<u32>,
         cleared_at: i64,
     },
-    /// A reset of `kind` was spent and the walled limit STILL STANDS
-    /// (`aterm_phase::ResetLine::Walled`): no wall was cleared, and what
-    /// the session is owed is what a kept reset owes it. `left` as for
-    /// [`Self::Spent`].
+    /// A reset of `kind` was spent while the walled limit still stands ([`Self::Spent`]).
     Walled { kind: ResetKind, left: u32 },
-    /// The wall had lifted by itself and nothing was spent; `asks` and
-    /// `cleared_at` as for [`Self::Spent`].
+    /// The wall lifted by itself with nothing spent (fields as for [`Self::Spent`]).
     Lifted { asks: bool, cleared_at: i64 },
     /// The reset was kept.
     Kept,
@@ -522,8 +434,6 @@ mod tests {
                 "Oct 5 at 3pm"
             )
         );
-        // The 5-hour and the full reset's own confirmations, each after its
-        // own row at a wall of the limit it refills.
         for (fixture, kind, left, limit) in [
             (composed::CONFIRM_SESSION, ResetKind::Session, 2, "session"),
             (composed::CONFIRM_FULL, ResetKind::Full, 1, "weekly"),
@@ -539,7 +449,6 @@ mod tests {
                 Verdict::Enter,
                 "{kind:?}"
             );
-            // NEGATIVE CONTROL: the same confirmation after the weekly row.
             assert_eq!(
                 confirm_verdict(
                     &read(fixture),
@@ -561,12 +470,10 @@ mod tests {
                 Verdict::Enter
             );
         }
-        // The 60-column wrap reads the same confirmation.
         assert_eq!(
             confirm_verdict(&read(composed::CONFIRM_60), &go(), None, NOW),
             Verdict::Enter
         );
-        // A wall drawn by either of two names, and a body that refills two.
         let either = ResetGo {
             limits: vec!["Sonnet".to_string(), "weekly".to_string()],
             ..go()
@@ -726,13 +633,11 @@ mod tests {
                 "{what}"
             );
         }
-        // Both counts nought: no reset is left to use.
         let none_left = with_read(&|c| c.left = 0);
         assert_eq!(
             confirm_verdict(&none_left, &with_go(&|g| g.left = 0), None, NOW),
             Verdict::Keep(KeepWhy::Count)
         );
-        // Where several do not hold, the first is the word.
         let other_and_unfocused = with_read(&|c| {
             c.limits = vec!["session".to_string()];
             c.yes_focused = false;
@@ -755,7 +660,7 @@ mod tests {
 
     /// At a wall that is not long, a deadline within a day (to the second) is
     /// entered; one a minute past it, one not placed, one now and one in the
-    /// past are kept. Negative control: at a long wall each is entered.
+    /// past are kept.
     #[test]
     fn a_short_wall_is_reset_only_where_the_offer_expires_within_a_day() {
         let read = read(composed::CONFIRM);
@@ -840,8 +745,7 @@ mod tests {
     /// DECIDED FOR YOU): each word the ledger's `declined` row can carry —
     /// read through [`fmt::Display`], so a word reworded there is reworded
     /// here — reads as a sentence, never the hyphenated code, an inexact
-    /// read with its part named. NEGATIVE CONTROL: a word no build
-    /// writes, and `inexact-` with no part, have none.
+    /// read with its part named.
     #[test]
     fn every_kept_resets_word_has_a_persons_words() {
         for why in KeepWhy::WORDED

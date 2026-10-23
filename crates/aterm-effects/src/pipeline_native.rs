@@ -518,6 +518,7 @@ impl EffectsPipeline {
     }
 
     /// Every cursor-anchored mark but the resident's: the three torn seams
+    /// differ only in what the pet does.
     #[inline]
     fn retire_torn_marks(&mut self, band: TornBand, now: Instant) {
         match band {
@@ -1265,6 +1266,7 @@ pub(super) fn step_cursor_family(
 }
 
 /// The rain engine's one construction: built on first need, never for an off
+/// config.
 #[inline]
 fn rain_engine(
     rain: &mut Option<Box<MatrixRain>>,
@@ -1274,6 +1276,9 @@ fn rain_engine(
 }
 
 /// One receipt arms its licences at its delivery instant: the insert half
+/// (Rainbow Kitty only) bounded at the dispatch; the key half re-stamps the
+/// revoked licence as a pure stamp, and the classic trail takes the twins it
+/// stamps at dispatch (typed stamp, generic move, nav).
 #[inline]
 fn apply_delivery(cursor: &mut CursorFx, rainbow: bool, d: Delivery) {
     if rainbow && let Some(width) = d.insert {
@@ -1352,6 +1357,8 @@ mod flying_head_tests {
     }
 
     /// A window with the flying head on glass at `FROM` (a collection hello
+    /// presents it), its placement follower at rest there, and v2 engaged;
+    /// then a licensed jump to `to`, the meteor, observed at `t1`.
     fn fly(t0: Instant, t1: Instant, to: (u16, u16)) -> EffectsPipeline {
         let mut fx = EffectsPipeline::for_window();
         let cfg = rainbow_kitty();
@@ -1389,6 +1396,8 @@ mod flying_head_tests {
     }
 
     /// §7.2(a): on the teleport frame the placement snaps to the landing, the spine is floored
+    /// at `disp ≥ 0.97` from a cooled head, the whip reads `lead == −0.30` at `t₀`, the eyes
+    /// squint through the flight and 200 ms past arrival, and the squash lands on `t₀ + T`.
     #[test]
     fn the_flying_head_is_at_the_landing_on_frame_zero_and_squashes_on_arrival() {
         let t0 = Instant::now();

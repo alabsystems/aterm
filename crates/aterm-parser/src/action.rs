@@ -2,25 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Parser actions and the sink trait.
-//!
-//! # PTY provenance (Phase 1 of #7877, issue #8005)
-//!
-//! Every slice-bearing argument on [`ActionSink`] is
-//! wrapped in [`Provenance<_, Pty>`] (from `aterm-provenance`). This tags the
-//! bytes at the type level as originating from an adversarial PTY, and the
-//! Rust compiler then refuses to let them reach a `Host`-privileged sink
-//! without an explicit `authorize_*` ceremony.
-//!
-//! The parser wraps each slice at its PTY entry point via
-//! [`aterm_provenance::pty_wrap_ref`] (see `dispatch.rs`). That is the only
-//! place the `Pty` tag is introduced; every downstream `ActionSink` method
-//! already receives pre-tagged data.
-//!
-//! Implementers of `ActionSink` consume the wrapped values via `.as_ref()`
-//! — the wrapper is `#[repr(transparent)]` so this is zero-cost. Scalars
-//! (`u8`, `char`, `u16`, `bool`) remain unwrapped: the trait's hot paths
-//! dispatch per-byte and the slice wrappers already protect the byte
-//! payload carriers where escape-sequence injection is possible.
 
 use aterm_provenance::{Provenance, Pty};
 
@@ -82,17 +63,11 @@ pub enum Action<'a> {
 }
 
 /// Receives parser actions.
-///
-/// Only [`print`](Self::print), [`execute`](Self::execute) and
-/// [`csi_dispatch`](Self::csi_dispatch) are required; the rest default to
-/// no-ops or to those. Slice arguments are PTY data (`Provenance<_, Pty>`),
-/// read with `.as_ref()`.
 pub trait ActionSink {
     /// Print a character to the screen at the cursor position.
     fn print(&mut self, c: char);
 
     /// Bulk print a run of printable ASCII (`data` holds only 0x20-0x7E).
-    /// Default: per-character `print`.
     #[inline]
     fn print_ascii_bulk(&mut self, data: &Provenance<[u8], Pty>) {
         for &b in data.as_ref() {
@@ -100,8 +75,7 @@ pub trait ActionSink {
         }
     }
 
-    /// Bulk print a run of two or more decoded non-ASCII characters, so a sink
-    /// can amortize per-character work over it. Default: per-character `print`.
+    /// Bulk print a run of two or more decoded non-ASCII characters.
     #[inline]
     fn print_unicode_bulk(&mut self, chars: &Provenance<[char], Pty>) {
         for &c in chars.as_ref() {
@@ -113,11 +87,6 @@ pub trait ActionSink {
     fn execute(&mut self, byte: u8);
 
     /// A CSI sequence has been parsed.
-    ///
-    /// # Parameters
-    /// - `params`: Numeric parameters (e.g., `[31]` for `ESC[31m`)
-    /// - `intermediates`: Intermediate bytes (e.g., [?] for `ESC[?1h`)
-    /// - `final_byte`: The final byte (e.g., 'm' for SGR)
     fn csi_dispatch(
         &mut self,
         params: &Provenance<[u16], Pty>,
@@ -125,9 +94,7 @@ pub trait ActionSink {
         final_byte: u8,
     );
 
-    /// A CSI sequence with colon subparameters has been parsed, in place of
-    /// `csi_dispatch`: bit `i` of `subparam_mask` is set if `params[i]` follows
-    /// a `:`. Default: `csi_dispatch`, ignoring the mask.
+    /// A CSI sequence with colon subparameters has been parsed, in place of `csi_dispatch`.
     #[inline]
     fn csi_dispatch_with_subparams(
         &mut self,
@@ -140,20 +107,14 @@ pub trait ActionSink {
     }
 
     /// An escape sequence has been parsed.
-    ///
-    /// Default: no-op.
     #[inline]
     fn esc_dispatch(&mut self, _intermediates: &Provenance<[u8], Pty>, _final_byte: u8) {}
 
     /// An OSC sequence has been parsed.
-    ///
-    /// Default: no-op.
     #[inline]
     fn osc_dispatch(&mut self, _params: &Provenance<[&[u8]], Pty>) {}
 
-    /// An OSC sequence has been parsed. `bel_terminated`: BEL (0x07) ended it,
-    /// not ST; a handler that replies (an OSC 52 query) echoes the same
-    /// terminator. Default: `osc_dispatch`.
+    /// An OSC sequence has been parsed.
     #[inline]
     fn osc_dispatch_with_terminator(
         &mut self,
@@ -164,8 +125,6 @@ pub trait ActionSink {
     }
 
     /// Start of a DCS sequence.
-    ///
-    /// Default: no-op.
     #[inline]
     fn dcs_hook(
         &mut self,
@@ -176,13 +135,10 @@ pub trait ActionSink {
     }
 
     /// Data byte within a DCS sequence.
-    ///
-    /// Default: no-op.
     #[inline]
     fn dcs_put(&mut self, _byte: u8) {}
 
     /// Bulk data bytes within a DCS sequence (sixel, tmux passthrough).
-    /// Default: per-byte `dcs_put`.
     #[inline]
     fn dcs_put_bulk(&mut self, data: &Provenance<[u8], Pty>) {
         for &b in data.as_ref() {
@@ -191,33 +147,18 @@ pub trait ActionSink {
     }
 
     /// End of a DCS sequence.
-    ///
-    /// `canceled` is `true` when the string was aborted by CAN (0x18) or SUB
-    /// (0x1A), or broken off by an ESC that does not begin ST (`ESC [`, a second
-    /// ESC, ...), rather than terminated by ST (`ESC \` or 0x9C): the sink should
-    /// DISCARD any accumulated payload (e.g. drop a half-decoded Sixel image,
-    /// leave a query unanswered) instead of finalizing it. `false` for ST. An
-    /// ESC's verdict waits for the byte after it, so the call comes with that
-    /// byte, before whatever it dispatches.
-    ///
-    /// Default: no-op.
     #[inline]
     fn dcs_unhook(&mut self, _canceled: bool) {}
 
     /// Start of an APC (Application Program Command): ESC _ or 0x9F, up to ST.
-    ///
-    /// Default: no-op.
     #[inline]
     fn apc_start(&mut self) {}
 
     /// Data byte within an APC sequence.
-    ///
-    /// Default: no-op.
     #[inline]
     fn apc_put(&mut self, _byte: u8) {}
 
-    /// Bulk data bytes within an APC sequence; kitty graphics streams multi-MB
-    /// base64 through it. Default: per-byte `apc_put`.
+    /// Bulk data bytes within an APC sequence; kitty graphics streams multi-MB base64 through it.
     #[inline]
     fn apc_put_bulk(&mut self, data: &Provenance<[u8], Pty>) {
         for &b in data.as_ref() {
@@ -225,11 +166,7 @@ pub trait ActionSink {
         }
     }
 
-    /// End of an APC sequence. `canceled`: CAN or SUB ended it, so discard the
-    /// payload (a truncated kitty graphics command), as
-    /// [`dcs_unhook`](Self::dcs_unhook) does.
-    ///
-    /// Default: no-op.
+    /// End of an APC sequence.
     #[inline]
     fn apc_end(&mut self, _canceled: bool) {}
 }

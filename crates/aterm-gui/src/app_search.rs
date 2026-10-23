@@ -49,11 +49,14 @@ pub(crate) enum SearchEdit {
 }
 
 /// Byte offset of the previous word boundary before `at`: the start of the word the
+/// caret is in, or else of the word before it.
 fn prev_word_boundary(s: &str, at: usize) -> usize {
     aterm_grapheme::word_start_before(s, at, aterm_grapheme::is_word_char).unwrap_or(0)
 }
 
 /// Byte offset of the next word boundary after `at`: the end of the word the caret is
+/// in, or else of the word after it — the forward twin of [`prev_word_boundary`],
+/// read from the last word break before the caret.
 fn next_word_boundary(s: &str, at: usize) -> usize {
     let from = aterm_grapheme::word_break_before(s, at, aterm_grapheme::is_word_char);
     aterm_grapheme::words(
@@ -179,6 +182,7 @@ pub(crate) fn apply_field_edit(text: &mut String, cursor: &mut usize, edit: Sear
 }
 
 /// Drop the find highlight only when the output that invalidated the matches could
+/// have moved the text under it.
 fn clear_selection_if_content_is_mutable(term: &mut crate::TermGuard<'_>) -> bool {
     let live_top_abs = u64::try_from(term.grid().base_y()).unwrap_or(u64::MAX);
     let live_bottom_abs = live_top_abs.saturating_add(u64::from(term.rows().saturating_sub(1)));
@@ -248,6 +252,7 @@ impl CountFacts {
     }
 
     /// Why a floor is a floor, when the code knows; `partial history` when it
+    /// does not.
     fn cause(&self, hits: bool, short: bool) -> Option<String> {
         if self.history_away {
             None
@@ -341,6 +346,7 @@ fn comma_list(words: &[String]) -> String {
 #[derive(Default)]
 pub(crate) struct SearchState {
     /// A delayed clipboard reply belongs to this open field, even if a new
+    /// field in the same tab later has the same query.
     #[cfg(any(target_os = "linux", all(test, unix)))]
     paste_lifetime: std::sync::Arc<()>,
     pub(crate) query: String,
@@ -348,6 +354,7 @@ pub(crate) struct SearchState {
     pub(crate) cursor: usize,
     pub(crate) matches: Vec<(i32, u16, u32)>,
     /// The exact point-relative hit when it lies outside the capped batch, kept apart
+    /// so a truncated ⌘S/⌘R repeat never shifts 100k elements.
     point_match: Option<(i32, u16, u32)>,
     /// The most rows any match in [`Self::matches`] spans past its own (0 while none straddles a soft wrap).
     pub(crate) max_match_rows: i32,
@@ -494,6 +501,7 @@ impl SearchState {
     }
 
     /// Select the first/last match at the Emacs search origin, wrapping at the
+    /// buffer edge.
     fn anchored_index(&self, matches: &[(i32, u16, u32)], base_y: i64) -> usize {
         if matches.is_empty() {
             return 0;
@@ -538,6 +546,7 @@ impl SearchState {
     }
 
     /// Record how far the deepest hit in the installed batch reaches below the
+    /// row it starts on, for a grid `cols` wide ([`Self::max_match_rows`]).
     fn note_match_rows(&mut self, cols: usize) {
         let cols = cols.max(1);
         let depth = |&(_, _, end): &(i32, u16, u32)| end as usize / cols;
@@ -766,7 +775,7 @@ impl App {
         self.search_enter_impl_in(wid, forward, false);
     }
 
-    /// Shared entry path. Plain Cmd-F starts at the beginning of the buffer;
+    /// Shared entry path.
     fn search_enter_impl_in(
         &mut self,
         wid: crate::WindowId,
@@ -1114,6 +1123,7 @@ impl App {
     }
 
     /// Highlight the current match through the text selection, scroll it into view,
+    /// and show the find state in the window title.
     fn search_apply_current_in(&mut self, wid: crate::WindowId) {
         let Some(ws) = self.windows.get(&wid) else {
             return;
@@ -1673,6 +1683,7 @@ impl App {
     }
 
     /// Window `wid`'s find bar as the `find` verb reports it, read from the
+    /// [`SearchState`] the bar paints, so the wire and the glass agree.
     fn find_status_in(&self, wid: crate::WindowId) -> FindStatus {
         let Some(search) = self.windows.get(&wid).and_then(|ws| ws.search.as_ref()) else {
             return FindStatus::CLOSED;
@@ -1750,6 +1761,8 @@ impl FindStatus {
 }
 
 /// The empty-query snapshot for `search_recompute_from_anchor_in` (base row, row
+/// revision, renumber epoch, content seq, width) under one short guard, in a free
+/// fn so the lock census sees the guard end (see the call site).
 fn empty_query_term_snapshot(term: &std::sync::Mutex<Terminal>) -> (i64, u64, u64, u64, usize) {
     let terminal = term_lock(term);
     (
@@ -1770,6 +1783,7 @@ mod tests {
     use crate::{App, WindowId, term_lock};
 
     /// An App whose session writes to an observer pipe, so a test can assert that a
+    /// control verb put nothing on the PTY.
     #[cfg(unix)]
     fn app_observing_pty() -> (App, [i32; 2]) {
         use std::sync::Arc;
@@ -1801,6 +1815,8 @@ mod tests {
     }
 
     /// The `find` verb never puts a byte on the PTY: with the bar closed every editing
+    /// arm is a no-op, so `find type` is no back door to the shell for a read-only
+    /// edge; with it open the text lands in the query.
     #[cfg(unix)]
     #[test]
     fn typing_into_the_find_bar_never_reaches_the_pty() {
@@ -1952,6 +1968,7 @@ mod tests {
     }
 
     /// The verb runs the field editor the keystrokes run, and reports the query the
+    /// bar holds.
     #[test]
     fn find_key_edits_run_the_field_editor_the_keystrokes_run() {
         let mut app = App::headless_for_test();
@@ -1979,6 +1996,7 @@ mod tests {
     }
 
     /// `case`/`regex` toggle, as their keystrokes do, and the reply says which way the
+    /// flag went; `accept`/`cancel` close the bar, so the reply is `open=0`.
     #[test]
     fn the_find_toggles_report_the_flag_they_left_behind() {
         let mut app = App::headless_for_test();
@@ -1998,6 +2016,7 @@ mod tests {
     }
 
     /// A `SearchState` seeded with three matches (scrollback row -1, live rows 0/1),
+    /// for driving `step`/`current_match` headlessly.
     fn seeded() -> SearchState {
         SearchState {
             query: "foo".to_string(),
@@ -2027,6 +2046,7 @@ mod tests {
     }
 
     /// Native-title ownership: find outranks the continuously refreshed canonical
+    /// title.
     #[test]
     fn native_title_override_transitions_preserve_latest_canonical_title() {
         use crate::app_window::{WindowTitleAuthority, window_title_authority};
@@ -2072,6 +2092,8 @@ mod tests {
     }
 
     /// An invalid pattern is not a miss: while the history is away for a rewrap,
+    /// the window title and the spoken status still give the bad-pattern verdict,
+    /// the same one they give with the history home, never the history-away one.
     #[test]
     fn an_invalid_pattern_outranks_the_history_being_away() {
         let pattern = |regex_error, history_away| SearchState {
@@ -2104,6 +2126,7 @@ mod tests {
     }
 
     /// Occurrences of `needle` in the visible rows, read off the grid: the ground
+    /// truth, independent of every index and cache the search path builds.
     #[cfg(test)]
     fn visible_occurrences(
         term: &std::sync::Arc<std::sync::Mutex<super::Terminal>>,
@@ -2130,6 +2153,7 @@ mod tests {
     }
 
     /// A count the terminal has moved past is never stated as a census: after output
+    /// the bar and the wire mark it stale, and the next recompute drops the mark.
     #[test]
     fn output_since_the_count_is_marked_on_the_glass_and_on_the_wire() {
         let mut app = App::headless_for_test();
@@ -2197,6 +2221,8 @@ mod tests {
     }
 
     /// After a `clear` (`ED 2` + `ED 3`: no history left) a rows-grow appends blank rows
+    /// at the bottom, and find still sees every hit on the glass: the end-to-end check
+    /// that index reuse keys the retained rows correctly across such a grow.
     #[test]
     fn growing_the_window_after_a_clear_keeps_the_visible_screen_searchable() {
         let mut app = App::headless_for_test();
@@ -2235,6 +2261,8 @@ mod tests {
     }
 
     /// A shrink that trims a screen-clear's trailing blanks moves the counter with the
+    /// rows it drops (`Grid::keep_keys_across_bottom_rows`), so no key slides: the deep
+    /// needle keeps its absolute row and that row holds it.
     #[test]
     fn shrinking_the_window_after_a_screen_clear_keeps_history_correctly_keyed() {
         let mut app = App::headless_for_test();
@@ -2296,6 +2324,7 @@ mod tests {
     }
 
     /// A find state holding `query` with the caret at its end — the state typing
+    /// leaves behind, and the starting point for the editing tests below.
     fn field(query: &str) -> SearchState {
         let mut state = SearchState::default();
         state.set_query(query.to_string());
@@ -2322,6 +2351,7 @@ mod tests {
     }
 
     /// ⎋/⏎/⇥ are commands in find mode: their text (`\u{1b}`, `\r`, `\t`, as winit
+    /// reports it) never reaches the query, and a multi-line paste is flattened.
     #[test]
     fn control_characters_never_enter_the_query() {
         let mut s = field("");
@@ -2337,6 +2367,7 @@ mod tests {
     }
 
     /// Deletions respect the caret and the word boundaries readline uses: ⌫ / ⌦ by
+    /// character, ^W / ⌥⌫ by word, ^U / ^K to the line edges.
     #[test]
     fn deletions_respect_caret_and_word_boundaries() {
         let mut s = field("alpha beta");
@@ -2366,6 +2397,7 @@ mod tests {
     }
 
     /// Every motion and edit is character-wise on a multi-byte query, and a caret
+    /// mid-codepoint or past the end is floored/clamped, never a panic or a split.
     #[test]
     fn editing_is_utf8_safe() {
         let mut s = field("héllo");
@@ -2422,6 +2454,10 @@ mod tests {
     }
 
     /// ⌥←/⌥→, ^W and ⌥⌫ step over a word whole in every script and stop where a
+    /// double-click ends it: a mark, a virama or a format control that spells the word
+    /// (ZWNJ, ZWJ, the Mongolian vowel separator) belongs to it, while an invisible
+    /// character between two words (a joiner between Latin letters, a bidi override,
+    /// the word joiner) still separates them.
     #[test]
     fn word_motions_step_over_whole_words_like_a_double_click() {
         for word in [
@@ -2476,6 +2512,8 @@ mod tests {
     }
 
     /// `map_matches` turns absolute rows into selection rows (`abs − base_y`, negative
+    /// = scrollback), exclusive ends inclusive, and sorts into visual order whatever
+    /// the engine's order.
     #[test]
     fn map_matches_abs_to_selection_inclusive_sorted() {
         let base_y = 100;
@@ -2492,6 +2530,7 @@ mod tests {
     }
 
     /// Out-of-`i32`/`u16`-range rows or columns are dropped, never wrapped, so a
+    /// pathological absolute row cannot corrupt the selection coordinates.
     #[test]
     fn map_matches_drops_out_of_range() {
         let ms = vec![SearchMatch::new(0, 0, 1)];
@@ -2528,6 +2567,7 @@ mod tests {
     }
 
     /// With no matches a step is a no-op with no current match, but it still sets the
+    /// direction.
     #[test]
     fn find_state_step_no_matches_is_noop() {
         let mut s = SearchState {
@@ -2549,6 +2589,8 @@ mod tests {
     }
 
     /// Truncated point navigation: an Emacs point outside the capped batch is
+    /// selected on its own, never inserted into (or shifting) the batch; a point
+    /// inside the batch is selected in place.
     #[test]
     fn truncated_point_install_selects_an_out_of_batch_point_without_touching_the_batch() {
         let mut state = SearchState {
@@ -2566,6 +2608,8 @@ mod tests {
     }
 
     /// End-to-end state semantics over a real terminal: backward initial typing lands
+    /// on the last hit, reversals and repeats wrap, empty-query recall honors direction,
+    /// and legacy Cmd-F resets an open search to forward/first-match behavior.
     #[test]
     fn emacs_direction_reversal_repeat_wrap_empty_recall_and_cmd_f_legacy() {
         let mut app = App::headless_for_test();
@@ -2609,6 +2653,7 @@ mod tests {
     }
 
     /// Incremental search starts at the content the user is reading, matching
+    /// Emacs point semantics instead of jumping to a global buffer extreme.
     #[test]
     fn emacs_search_is_anchored_to_scrolled_viewport_in_both_directions() {
         let mut app = App::headless_for_test();
@@ -2668,6 +2713,7 @@ mod tests {
     }
 
     /// Streaming output invalidates a batch without a rescan per chunk; the next repeat
+    /// refreshes once and navigates from the old point, reaching the appended hit.
     #[test]
     fn streaming_output_marks_search_dirty_then_repeat_refreshes_latest_content() {
         let mut app = App::headless_for_test();
@@ -2705,6 +2751,8 @@ mod tests {
     }
 
     /// Scrollback twin of the test above, pinning the narrowed clear: output that
+    /// invalidates the matches keeps a highlight on archived rows (`post_process` has
+    /// already accounted for eviction and renumbering).
     #[test]
     fn streaming_output_keeps_a_scrollback_highlight_alive() {
         let mut app = App::headless_for_test();
@@ -2748,6 +2796,7 @@ mod tests {
     }
 
     /// ⌘F on a scrolled-back viewport with nothing to go to (empty query, no match)
+    /// leaves the view alone: positioning by absolute row makes no row mean no move.
     #[test]
     fn opening_find_with_nothing_to_show_does_not_move_the_viewport() {
         let mut app = App::headless_for_test();
@@ -2783,6 +2832,8 @@ mod tests {
     }
 
     /// ⎋ restores a scrolled-back origin across a protected-footer splice (the
+    /// codex/Claude Code shape), asserted on row text since the splice moves rows
+    /// relative to the tail.
     #[test]
     fn cancel_restores_a_scrolled_back_origin_across_a_footer_splice() {
         let mut app = App::headless_for_test();
@@ -2823,6 +2874,8 @@ mod tests {
     }
 
     /// A tab/pane switch is not a find exit: the neutral close hands the title back and
+    /// parks the origin, so a reopen and ⎋ land on what the user was reading before
+    /// the interrupted find.
     #[test]
     fn a_neutral_close_parks_the_find_origin_for_the_next_open() {
         let mut app = App::headless_for_test();
@@ -2918,6 +2971,7 @@ mod tests {
     }
 
     /// A fault injected into the real app right after a real step, named by
+    /// the model action that step ends on.
     #[cfg(unix)]
     type NavPatch = fn(&mut App, WindowId, &str);
 
@@ -2926,6 +2980,7 @@ mod tests {
     fn no_nav_patch(_: &mut App, _: WindowId, _: &str) {}
 
     /// `EmacsSearchNavigation`'s `Buggy = 1`, one member per law, each as the
+    /// net effect it would have on the real app at its own action.
     #[cfg(unix)]
     fn nav_member(member: &str, app: &mut App, wid: WindowId, action: &str) {
         use aterm_core::selection::{SelectionSide, SelectionType};
@@ -2962,6 +3017,7 @@ mod tests {
     }
 
     /// One run of the navigation trace: the real app, the model state it must
+    /// match, and every PTY byte the observer pipe has seen so far.
     #[cfg(unix)]
     struct NavRun<'m> {
         app: App,
@@ -2976,6 +3032,7 @@ mod tests {
     #[cfg(unix)]
     impl NavRun<'_> {
         /// Drive one real step, inject the patch, advance the model through
+        /// `actions`, and require every projected variable to be the model's.
         fn step(
             &mut self,
             actions: &[&'static str],
@@ -3036,6 +3093,7 @@ mod tests {
     }
 
     /// Drive the navigation trace on a real headless App whose PTY is an observer
+    /// pipe, with `patch` injected after every real step.
     #[cfg(unix)]
     fn emacs_navigation_trace(
         model: &aterm_spec::derive::Model,
@@ -3136,6 +3194,9 @@ mod tests {
     }
 
     /// Tier-1 conformance for the derived `EmacsSearchNavigation` model: the trace
+    /// drives the real chord seam, search, output refresh and ⎋/⏎ exits on a headless
+    /// App, and after every step requires the real find state, selection and PTY
+    /// observer (and the viewport restore at ⎋) to be the model's.
     #[cfg(unix)]
     #[test]
     fn emacs_navigation_conforms_to_derived_transition_model() {
@@ -3185,6 +3246,8 @@ mod tests {
     }
 
     /// Codex-style protected footer refreshes rebuild absolute coordinates without
+    /// losing reverse-search direction: after the piecewise insertion the last footer
+    /// hit is still current, never a stale or transient first hit.
     #[test]
     fn codex_protected_footer_refresh_preserves_backward_last_match() {
         let mut app = App::headless_for_test();
@@ -3226,6 +3289,8 @@ mod tests {
     }
 
     /// After a protected-footer revision a forward repeat restarts inclusively at the
+    /// true beginning: the before-first sentinel must not clamp to `(0, 0)` under a
+    /// strict comparison and skip the first retained hit.
     #[test]
     fn codex_protected_footer_forward_refresh_keeps_row_zero_match() {
         let mut app = App::headless_for_test();
@@ -3258,6 +3323,7 @@ mod tests {
     }
 
     /// Claude's classic in-place UI and alternate-screen UI both search the currently
+    /// active grid.
     #[test]
     fn claude_classic_and_alternate_active_grid_search_routing() {
         let mut app = App::headless_for_test();
@@ -3304,6 +3370,7 @@ mod tests {
     }
 
     /// Press custody: a search jump selects with no gesture around it, so it records
+    /// the `UserSelect` itself.
     #[test]
     fn a_search_jump_records_who_took_the_selection() {
         let mut app = App::headless_for_test();

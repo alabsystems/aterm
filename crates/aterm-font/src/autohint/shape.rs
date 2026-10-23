@@ -9,12 +9,7 @@
 // mode only (the nominal mode served upstream's FreeType validation).
 // See ../../LICENSE-FONTATIONS for the upstream license.
 
-//! Shaping support for autohinting: the glyphs a style's reference
-//! characters map to (through a style's feature where it has one), and the
-//! glyphs `GSUB` reaches, which take the style of the script whose lookups
-//! reach them (FreeType afshaper.c). Every walk of a shaper's `GSUB` spends
-//! one budget ([`LayoutWork`]), one unit per lookup, subtable and entry it
-//! visits; a walk that runs past it refuses the table.
+//! Shaping support for autohinting: the glyphs a style's reference characters map to (through a style's feature where it has one), and the glyphs `GSUB` reaches, which take the style of the script whose lookups reach them (FreeType afshaper.c).
 
 use super::GlyphId;
 use super::charmap::Charmap;
@@ -29,33 +24,18 @@ use crate::work::LayoutWork;
 use core::ops::Range;
 
 /// The traversals of `GSUB` a shaper's walks may spend ([`LayoutWork`]).
-/// The style walk visits each lookup once per style whose scripts reach it,
-/// so a face whose lookups serve several scripts may be walked several
-/// times over. The most on this Mac (2026-10-19, 523 faces with `GSUB`) is
-/// 0.26 traversals, by a Hiragino Sans W3 face, and a style's metrics walk
-/// spends at most 0.04 (Trattatello).
 const STYLE_WALK_TRAVERSALS: u64 = 8;
 
-// To prevent infinite recursion in contextual lookups. Matches HB
-// <https://github.com/harfbuzz/harfbuzz/blob/c7ef6a2ed58ae8ec108ee0962bef46f42c73a60c/src/hb-limits.hh#L53>
 const MAX_NESTING_DEPTH: usize = 64;
 
 #[derive(Copy, Clone, Default, Debug)]
 pub(crate) struct ShapedGlyph {
     pub id: GlyphId,
-    /// This may be used for computing vertical alignment zones, particularly
-    /// for glyphs like super/subscripts which might have adjustments in GPOS.
-    ///
-    /// Note that we don't do the same in the horizontal direction which
-    /// means that we don't care about the x-offset.
+    /// This may be used for computing vertical alignment zones, particularly for glyphs like super/subscripts which might have adjustments in GPOS.
     pub y_offset: i32,
 }
 
 /// Container for storing the result of shaping a cluster.
-///
-/// Some of our input "characters" for metrics computations are actually
-/// multi-character [grapheme clusters](https://www.unicode.org/reports/tr29/#Grapheme_Cluster_Boundaries)
-/// that may expand to multiple glyphs.
 pub(crate) type ShapedCluster = Vec<ShapedGlyph>;
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -63,8 +43,6 @@ pub(crate) enum ShaperCoverageKind {
     /// Shaper coverage that traverses a specific script.
     Script,
     /// Shaper coverage that also includes the `Dflt` script.
-    ///
-    /// This is used as a catch all after all styles are processed.
     Default,
 }
 
@@ -97,7 +75,6 @@ fn select_script(list: &ScriptList, tags: &[Tag]) -> Option<u16> {
 /// first (HarfBuzz's `hb_ot_all_tags_from_script`): the version 3 and 2 tags
 /// of the Indic scripts that have them, then the old tag.
 fn script_tags_from_unicode(unicode_script: Tag) -> Vec<Tag> {
-    // Unicode script code to "new" OpenType script tag.
     const NEW_TAGS: &[(&[u8; 4], &[u8; 4])] = &[
         (b"Beng", b"bng2"),
         (b"Deva", b"dev2"),
@@ -121,18 +98,14 @@ fn script_tags_from_unicode(unicode_script: Tag) -> Vec<Tag> {
         }
         tags.push(Tag::from_bytes(new_tag));
     }
-    // The old tag (HarfBuzz hb-ot-tag.cc).
     let old: [u8; 4] = match &bytes {
         b"Zmth" => *b"math",
-        // Katakana and Hiragana both map to 'kana'
         b"Hira" => *b"kana",
-        // Spaces at the end are preserved, unlike ISO 15924
         b"Laoo" => *b"lao ",
         b"Yiii" => *b"yi  ",
         b"Nkoo" => *b"nko ",
         b"Vaii" => *b"vai ",
         _ => {
-            // Else, just change the first char to lowercase
             let mut b = bytes;
             b[0] = b[0].to_ascii_lowercase();
             b
@@ -199,10 +172,7 @@ fn coverage_get(coverage: &Coverage, gid: GlyphId) -> Option<u16> {
     coverage.get(crate::GlyphId(u16::try_from(gid.to_u32()).ok()?))
 }
 
-/// Maps characters to glyphs and handles extended style coverage beyond
-/// glyphs that are available in the character map.
-///
-/// Roughly covers the functionality in <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afshaper.c>.
+/// Maps characters to glyphs and handles extended style coverage beyond glyphs that are available in the character map.
 pub(crate) struct Shaper<'a, 'f> {
     font: &'f HintFont<'a>,
     charmap: Charmap<'a>,
@@ -221,8 +191,7 @@ impl<'a, 'f> Shaper<'a, 'f> {
         }
     }
 
-    /// The same face with its `GSUB` dropped, for a face whose walk ran
-    /// past its budget ([`Self::refused`]).
+    /// The same face with its `GSUB` dropped, for a face whose walk ran past its budget ([`Self::refused`]).
     pub fn without_gsub(&self) -> Self {
         Self {
             font: self.font,
@@ -280,10 +249,6 @@ impl<'a, 'f> Shaper<'a, 'f> {
     }
 
     /// Uses layout tables to compute coverage for the given style.
-    ///
-    /// Returns `true` if any glyph styles were updated for this style.
-    ///
-    /// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afshaper.c#L99>
     pub(crate) fn compute_coverage(
         &self,
         style: &StyleClass,
@@ -302,7 +267,6 @@ impl<'a, 'f> Shaper<'a, 'f> {
         {
             *a = Some(b);
         }
-        // <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afshaper.c#L153>
         let default_script = Tag::from_bytes(b"DFLT");
         if coverage_kind == ShaperCoverageKind::Default {
             if script_tags[0].is_none() {
@@ -313,22 +277,15 @@ impl<'a, 'f> Shaper<'a, 'f> {
                 script_tags[2] = Some(default_script);
             }
         } else {
-            // Script classes contain some non-standard tags used for special
-            // purposes. We ignore these
-            // <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afshaper.c#L167>
             let non_standard_tags = [
-                // Khmer symbols
                 Some(Tag::from_bytes(b"Khms")),
-                // Latin subscript fallbacks
                 Some(Tag::from_bytes(b"Latb")),
-                // Latin superscript fallbacks
                 Some(Tag::from_bytes(b"Latp")),
             ];
             if non_standard_tags.contains(&script_tags[0]) {
                 return false;
             }
         }
-        // Check each requested script that is available in GSUB
         let mut gsub_handler = GsubHandler::new(
             &self.charmap,
             &lookup_list,
@@ -342,14 +299,11 @@ impl<'a, 'f> Shaper<'a, 'f> {
             tag.and_then(|tag| index_for_tag(&have, tag))
                 .and_then(|ix| script_list.get(ix))
         }) {
-            // And all language systems for each script
             let langsys = (0..script.languages.len())
                 .filter_map(|i| script.languages.get(i))
                 .chain(script.default_language);
             for langsys in charged(&self.work, langsys) {
                 for feature_ix in charged(&self.work, langsys.feature_indices.into_iter()) {
-                    // If our style has a feature tag, we only look at that
-                    // specific feature; otherwise, handle all of them
                     let Some(tag) = feature_list.tag(feature_ix) else {
                         continue;
                     };
@@ -359,9 +313,7 @@ impl<'a, 'f> Shaper<'a, 'f> {
                     let Some(feature) = feature_list.get(feature_ix) else {
                         continue;
                     };
-                    // And now process associated lookups
                     for index in feature.lookup_indices {
-                        // We only care about errors here for testing, and
                         // the budget's: past it the walk stops.
                         if gsub_handler.process_lookup(index) == Err(ProcessLookupError::OverBudget)
                         {
@@ -372,11 +324,8 @@ impl<'a, 'f> Shaper<'a, 'f> {
             }
         }
         if let Some(range) = gsub_handler.finish() {
-            // If we get a range then we captured at least some glyphs so
-            // let's try to assign our current style
             let mut result = false;
             for glyph_style in &mut glyph_styles[range] {
-                // We only want to return true here if we actually assign the
                 // style to avoid computing unnecessary metrics
                 result |= glyph_style.maybe_assign_gsub_output_style(style);
             }
@@ -395,8 +344,6 @@ pub(crate) struct ClusterShaper<'a, 's, 'f> {
 
 impl ClusterShaper<'_, '_, '_> {
     pub(crate) fn shape(&mut self, input: &str, output: &mut ShapedCluster) {
-        // First fill the output cluster with the nominal character
-        // to glyph id mapping
         output.clear();
         for ch in input.chars() {
             output.push(ShapedGlyph {
@@ -413,10 +360,6 @@ impl ClusterShaper<'_, '_, '_> {
                     glyph_ix += 1;
                 }
             }
-            // Reject clusters that weren't modified by the feature.
-            // FreeType detects this by shaping twice and comparing gids
-            // but we just track substitutions
-            // <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afshaper.c#L528>
             if !did_subst || self.shaper.refused() {
                 output.clear();
             }
@@ -443,10 +386,6 @@ impl ClusterShaper<'_, '_, '_> {
         else {
             return false;
         };
-        // For now, just applying single substitutions because we're
-        // currently only handling shaping for "feature" styles like
-        // c2sc (caps to small caps) which are (almost?) always
-        // single substs
         for table in charged(&self.shaper.work, subtables(&lookup)) {
             if let SubstitutionSubtable::Single(table) = table {
                 match table {
@@ -479,32 +418,12 @@ impl ClusterShaper<'_, '_, '_> {
 }
 
 /// Captures glyphs from the GSUB table that aren't present in cmap.
-///
-/// FreeType does this in a few phases:
-/// 1. Collect all lookups for a given set of scripts and features.
-///    <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afshaper.c#L174>
-/// 2. For each lookup, collect all _output_ glyphs.
-///    <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afshaper.c#L201>
-/// 3. If the style represents a specific feature, make sure at least one of
-///    the characters in the associated blue string would be substituted by
-///    those lookups. If none would be substituted, then we don't assign the
-///    style to any glyphs because we don't have any modified alignment
-///    zones.
-///    <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afshaper.c#L264>
-///
-/// We roll these into one pass over the lookups below so that we don't have
-/// to allocate a lookup set or iterate them twice. Note that since
-/// substitutions are checked for individual characters, we ignore ligatures
-/// and contextual lookups (and alternates since they aren't applicable).
 struct GsubHandler<'a, 'b> {
     charmap: &'a Charmap<'a>,
     lookup_list: &'a LookupList<'a>,
     style: &'a StyleClass,
     glyph_styles: &'a mut [GlyphStyle],
-    // Set to true when we need to check if any substitutions are available
-    // for our blue strings. This is the case when style.feature != None
     need_blue_substs: bool,
-    // Keep track of our range of touched gids in the style list
     min_gid: usize,
     max_gid: usize,
     lookup_depth: usize,
@@ -522,9 +441,6 @@ impl<'a, 'b> GsubHandler<'a, 'b> {
         work: &'a LayoutWork,
     ) -> Self {
         let min_gid = glyph_styles.len();
-        // If we have a feature, then we need to check the blue string to see
-        // if any substitutions are available. If not, we don't enable this
-        // style because it won't have any affect on alignment zones
         let need_blue_substs = style.feature.is_some();
         Self {
             charmap,
@@ -541,20 +457,15 @@ impl<'a, 'b> GsubHandler<'a, 'b> {
     }
 
     fn process_lookup(&mut self, lookup_index: u16) -> Result<(), ProcessLookupError> {
-        // Every reference spends, those to a lookup already visited too.
         self.work.spend(1).ok_or(ProcessLookupError::OverBudget)?;
-        // General protection against stack overflows
         if self.lookup_depth == MAX_NESTING_DEPTH {
             return Err(ProcessLookupError::ExceededMaxDepth);
         }
-        // Skip lookups that have already been processed
         if !self.visited_set.insert(lookup_index) {
             return Ok(());
         }
         self.lookup_depth += 1;
-        // Actually process the lookup
         let result = self.process_lookup_inner(lookup_index);
-        // Out we go again
         self.lookup_depth -= 1;
         result
     }
@@ -574,9 +485,6 @@ impl<'a, 'b> GsubHandler<'a, 'b> {
                                 (i32::from(gid) + i32::from(delta)) as u16,
                             ));
                         }
-                        // Check input coverage for blue strings if
-                        // required and if we're not under a contextual
-                        // lookup
                         if self.need_blue_substs && self.lookup_depth == 1 {
                             self.check_blue_coverage(&coverage);
                         }
@@ -588,7 +496,6 @@ impl<'a, 'b> GsubHandler<'a, 'b> {
                         for gid in charged(work, substitutes.into_iter()) {
                             self.capture_glyph(u32::from(gid.0));
                         }
-                        // See above
                         if self.need_blue_substs && self.lookup_depth == 1 {
                             self.check_blue_coverage(&coverage);
                         }
@@ -600,7 +507,6 @@ impl<'a, 'b> GsubHandler<'a, 'b> {
                             self.capture_glyph(u32::from(gid.0));
                         }
                     }
-                    // See above
                     if self.need_blue_substs && self.lookup_depth == 1 {
                         self.check_blue_coverage(&table.coverage);
                     }
@@ -675,9 +581,6 @@ impl<'a, 'b> GsubHandler<'a, 'b> {
         }
         let range = self.min_gid..self.max_gid + 1;
         if self.need_blue_substs {
-            // We didn't find any substitutions for our blue strings so
-            // we ignore the style. Clear the GSUB marker for any touched
-            // glyphs
             for glyph in self.glyph_styles.get_mut(range)? {
                 glyph.clear_from_gsub();
             }
@@ -697,7 +600,6 @@ impl<'a, 'b> GsubHandler<'a, 'b> {
                 .next()
                 .is_some()
             {
-                // Condition satisfied, so don't check any further subtables
                 self.need_blue_substs = false;
                 return;
             }
@@ -722,9 +624,7 @@ impl<'a> VisitedLookupSet<'a> {
     }
 
     /// If the given lookup index is not already in the set, adds it and
-    /// returns `true`. Returns `false` otherwise.
-    ///
-    /// This follows the behavior of `HashSet::insert`.
+    /// returns `true`.
     fn insert(&mut self, lookup_index: u16) -> bool {
         let byte_ix = lookup_index as usize / 8;
         let bit_mask = 1 << (lookup_index % 8) as u8;
@@ -760,9 +660,6 @@ mod bounds_tests;
 mod tests {
     use super::*;
 
-    // read-fonts 0.43.2 src/tables/layout/script.rs
-    // `simple_script_tag_from_unicode`, `exception_script_tag_from_unicode`
-    // and `multi_script_tags_from_unicode`.
     #[test]
     fn simple_script_tag_from_unicode() {
         for unicode_tag in [b"Cyrl", b"Grek", b"Hebr", b"Latn"] {
@@ -794,7 +691,6 @@ mod tests {
             (b"Beng", &[b"bng3", b"bng2", b"beng"]),
             (b"Orya", &[b"ory3", b"ory2", b"orya"]),
             (b"Mlym", &[b"mlm3", b"mlm2", b"mlym"]),
-            // There's no version 3 tag for Myanmar
             (b"Mymr", &[b"mym2", b"mymr"]),
         ];
         for (unicode_tag, ot_tags) in cases {
@@ -813,7 +709,6 @@ mod tests {
         assert!(set.insert(0));
         assert!(!set.insert(0));
         assert!(set.insert(15));
-        // Past the set's bits reads as already visited.
         assert!(!set.insert(16));
         set.clear();
         assert!(set.insert(0));

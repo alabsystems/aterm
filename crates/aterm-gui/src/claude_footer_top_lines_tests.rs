@@ -12,9 +12,11 @@ use aterm_effects::harness_card::CardPalette;
 const PGID: i32 = 4343;
 
 /// Codex's slab on a dark ground, measured (`48;2;45;47;51`, the 0.154.0
+/// take).
 const SLAB: [u8; 3] = [45, 47, 51];
 
 /// Session `session` runs `program` (its published foreground name), as the
+/// status sweep publishes it.
 fn set_program(app: &App, session: u64, program: &str) {
     let ctx = app.pool.get(session).expect("session").ctx.clone();
     let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -23,6 +25,7 @@ fn set_program(app: &App, session: u64, program: &str) {
 }
 
 /// This window's host holding `session`'s claim: the harness carries it,
+/// and its top line wears the theme.
 fn held(app: &mut App, session: u64) -> Hosted {
     let host = hosted(app);
     let ctx = app.pool.get(session).expect("session").ctx.clone();
@@ -38,6 +41,7 @@ fn held(app: &mut App, session: u64) -> Hosted {
 }
 
 /// The rows of a measured screen (`aterm-phase`'s fixtures, `aterm ctl
+/// text` of the real CLI): its comment lines (`# …`) aside.
 fn fixture_rows(fixture: &str) -> Vec<String> {
     fixture
         .lines()
@@ -81,6 +85,7 @@ fn marks_on(app: &App, wid: WindowId, session: u64) -> usize {
 }
 
 /// What one pass cost the top line: allocations in the whole pass, its
+/// reads and its compositions.
 fn top_cost(app: &mut App, wid: WindowId) -> (usize, usize, usize) {
     let (plan, route) = app.active_visible_frame_layout(wid).expect("a layout");
     let _ = (
@@ -96,6 +101,7 @@ fn top_cost(app: &mut App, wid: WindowId) -> (usize, usize, usize) {
 }
 
 /// The window, `rows` × `cols`, showing `screen` in its one pane, which
+/// runs `program`.
 fn pane_of(rows: u16, cols: u16, program: &str) -> (App, WindowId, u64) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -106,6 +112,13 @@ fn pane_of(rows: u16, cols: u16, program: &str) -> (App, WindowId, u64) {
 }
 
 /// GEMINI CLI WEARS THE LOCKUP ON ITS LIVE-ZONE RULE (design §6.1–§6.2,
+/// test 13's glass): on the measured 0.46.0 screens — `idle` and
+/// `end-of-turn` at 144 columns, `narrow-end-of-turn` at 72 — a Gemini pane
+/// this window's host holds, which holds no footer facts, gets its lockup
+/// two `─` in on the `─` rule above its mode row and `alab harness ● on` at
+/// its right, one mark layer over the icon; every other row — the `▄` input
+/// band, the prompt, the `▀` band, the status row — is byte-identical to
+/// Gemini's own.
 #[test]
 fn gemini_wears_the_lockup_on_its_live_zone_rule() {
     for (fixture, cols) in [
@@ -211,6 +224,9 @@ fn gemini_wears_the_lockup_on_its_live_zone_rule() {
 }
 
 /// The pane's rows of a Codex screen `cols` wide (the 0.154.0 take's
+/// shape, [`aterm_phase::codex`]'s module header): the session card, a
+/// blank row, the composer's three rows — pad, prompt, pad — erased onto
+/// `slab` (`None`: left on the pane's own ground), and the footer.
 fn codex_screen(cols: usize, slab: Option<[u8; 3]>) -> String {
     let cut = |s: &str| s.chars().take(cols).collect::<String>();
     let on = slab.map_or(String::new(), |[r, g, b]| format!("\x1b[48;2;{r};{g};{b}m"));
@@ -242,6 +258,9 @@ fn codex_screen(cols: usize, slab: Option<[u8; 3]>) -> String {
 const PAD: usize = 5;
 
 /// A CODEX PAD READS ONLY WHERE ITS CELLS PROVE THE SLAB (design §6.1,
+/// §10.2.7; test 14's glass): on Codex's composer erased onto its slab, the
+/// pad row above `›` reads as a `Slab` run — the whole pane row, its blank
+/// the slab's — and the pane's footer and card read none.
 #[test]
 fn a_codex_pad_reads_only_where_its_cells_prove_the_slab() {
     let cols = 100usize;
@@ -309,6 +328,10 @@ fn a_codex_pad_reads_only_where_its_cells_prove_the_slab() {
 }
 
 /// A SLAB LEFT BEHIND BY A THEME CHANGE KEEPS ITS LETTERS READABLE (design
+/// §6.1, §8): Codex keeps the slab it chose at launch when the theme moves
+/// under it (an appearance pair turning light), and erases it in the new
+/// theme's ink — the real codex-alab 0.164.0-dev's pad, `#2b2d33` on
+/// `#2d2f33`, 2026-10-21.
 #[test]
 fn a_slab_left_by_a_theme_change_keeps_its_letters_readable() {
     use aterm_effects::color_math::contrast_ratio;
@@ -361,6 +384,7 @@ fn a_slab_left_by_a_theme_change_keeps_its_letters_readable() {
     let off = SwitchPaint {
         face: HarnessSwitch::Off(SwitchOff::Master),
         hover: false,
+        version: None,
     };
     let quiet = switch_cell(
         'a',
@@ -385,6 +409,11 @@ fn a_slab_left_by_a_theme_change_keeps_its_letters_readable() {
 }
 
 /// THE ACCENT ON A SLAB THE THEME DID NOT CHOOSE READS ON IT (design §8):
+/// the switch's `on` pill is the theme's accent, chosen for the theme's own
+/// ground; Codex's slab is its own, and a dark slab outlives a turn to
+/// Default Light — the real codex-alab 0.164.0-dev, 2026-10-21, where the
+/// light accent's pill read 2.6:1 on the slab and its letters the same on
+/// it.
 #[test]
 fn the_switchs_accent_reads_on_a_slab_the_theme_did_not_choose() {
     use aterm_effects::color_math::contrast_ratio;
@@ -443,6 +472,8 @@ fn the_switchs_accent_reads_on_a_slab_the_theme_did_not_choose() {
 }
 
 /// Codex's agent switch's copy for the session's group: what admits a
+/// codex-alab whose self-claim is not proven (`harness_host`'s
+/// `codex_alab_runs`).
 struct CopyGuard(String);
 
 impl Drop for CopyGuard {
@@ -475,6 +506,7 @@ fn copy_for(app: &App, session: u64) -> CopyGuard {
 }
 
 /// Session `session`'s claim: codex-alab's own, PROVEN (`self_claim`), or
+/// none.
 fn set_proven(app: &App, session: u64, proven: bool) {
     let ctx = app.pool.get(session).expect("session").ctx.clone();
     let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
@@ -500,6 +532,14 @@ fn switch_of(app: &App, wid: WindowId, session: u64) -> Option<crate::claude_lig
 }
 
 /// CODEX GETS A SWITCH ONLY AS CODEX-ALAB (design §6.2): at every width
+/// from 20 to 160 a vendor `codex` pane — no proven self-claim, no copy, no
+/// ALab image: no host admits it — wears the lockup named `codex` on its
+/// slab's pad (its blanks the slab's, never tinted) and no switch; a
+/// codex-alab pane whose self-claim is proven wears the lockup named
+/// `codex-alab` (the owner's name for it, its letters floored to 4.5:1 on
+/// the slab) and `alab harness ● on`, its glyphs on Cruise's arc in the
+/// slab's letter law, and a switch whose press writes the session's word
+/// `off`; it never reads the vendor's bare `codex`.
 #[test]
 fn codex_gets_a_switch_only_as_codex_alab() {
     let (mut app, wid, session) = pane_of(24, 100, "codex");
@@ -654,6 +694,9 @@ fn codex_gets_a_switch_only_as_codex_alab() {
 }
 
 /// THE PET HOLDS CODEX'S LOCKUP AND SWITCH, NEVER THE PAD BETWEEN
+/// (`crate::pet_chrome`): what the footer's write puts on the glass is the
+/// resident pet's protected ground, and on Codex's slab every cell aterm
+/// writes is a blank of the slab, so the write is all the pet has to go by.
 #[test]
 fn the_pet_holds_codexs_lockup_and_switch_never_the_pad_between() {
     let (mut app, wid, session) = pane_of(24, 100, "codex");
@@ -704,6 +747,11 @@ fn the_pet_holds_codexs_lockup_and_switch_never_the_pad_between() {
 }
 
 /// A SENT MESSAGE IS NEVER CODEX'S TOP LINE (design §5.6 invariant 1,
+/// §10.2.7): a codex-alab pane whose self-claim is proven, its composer
+/// replaced by an approval (`› 1. Yes, proceed`) under the message the
+/// person sent (`› fix the tests` on the slab's tint, padded as the
+/// composer is), is written nowhere: no row changes, no mark layer stands,
+/// no switch is put where a press would reach it.
 #[test]
 fn a_sent_message_is_never_codexs_top_line() {
     let cols = 100usize;
@@ -790,12 +838,14 @@ fn a_sent_message_is_never_codexs_top_line() {
 const LIT: SwitchPaint = SwitchPaint {
     face: HarnessSwitch::On,
     hover: false,
+    version: None,
 };
 
 /// The session's own Off: `○ off ▐ on ▌`.
 const OFF: SwitchPaint = SwitchPaint {
     face: HarnessSwitch::Off(SwitchOff::Session),
     hover: false,
+    version: None,
 };
 
 /// A plain top rule's run of `len` cells at frame column 2.
@@ -813,6 +863,7 @@ fn plain_run(len: usize) -> TopRun {
 }
 
 /// The top line of `program`'s `build` on `run`, resting or with the
+/// pointer on its lockup.
 fn lockup_key(
     (program, build): (aterm_phase::Program, Build),
     run: TopRun,
@@ -844,6 +895,7 @@ fn lockup_key(
 }
 
 /// Column `c` of a composition over `run` (the run's own `─` where it
+/// writes none).
 fn cell_at(top: &ComposedTop, run: TopRun, c: usize) -> RenderCell {
     c.checked_sub(top.col)
         .and_then(|k| top.cells.get(k))
@@ -852,6 +904,9 @@ fn cell_at(top: &ComposedTop, run: TopRun, c: usize) -> RenderCell {
 }
 
 /// Whether a hovered composition `hovered` keeps `rest`'s layout: the
+/// switch at the same columns, every cell outside its lockup (pads and
+/// title included) the resting cell — so the same tint stops — and, where
+/// a title is drawn, two `─` after it before the switch (or the span's end).
 fn keeps_the_layout(rest: &ComposedTop, hovered: &ComposedTop, run: TopRun) -> Result<(), String> {
     if rest.switch != hovered.switch {
         return Err("the switch moved".into());
@@ -883,6 +938,7 @@ fn keeps_the_layout(rest: &ComposedTop, hovered: &ComposedTop, run: TopRun) -> R
 }
 
 /// The title a hovered composition shows: the cells from the name's place
+/// to the lockup's trailing pad.
 fn title_of(top: &ComposedTop, run: TopRun) -> String {
     let at = top.lockup.start + aterm_effects::cli_marks::ICON_RUN;
     (at..top.lockup.end.saturating_sub(1))
@@ -891,6 +947,17 @@ fn title_of(top: &ComposedTop, run: TopRun) -> String {
 }
 
 /// THE HOVER TITLE NEVER MOVES THE SWITCH (design §7): for agy, version
+/// `1.4.0`, and for codex-alab, whose name is the longest, version
+/// `0.164.0`, at every span from 8 to 80 and under each switch and theme —
+/// lit on Cruise, Off in white, lit bare, no host — the composition with the
+/// pointer on the lockup lays the switch at the resting columns and every
+/// cell outside the lockup as resting (so the tint's stops), leaves two `─`
+/// before the switch, and names `Antigravity CLI 1.4.0` (21 cells) where it
+/// fits, `Antigravity CLI` where only the product does, and `agy` where
+/// neither does — falling back in that order as the span narrows on one
+/// form of the switch (a narrower form frees room again); and
+/// `Codex 0.164.0` where it fits, else `codex-alab`: never the product alone,
+/// `Codex`, narrower than the name it would cover.
 #[test]
 fn the_hover_title_never_moves_the_switch() {
     use aterm_phase::Program;
@@ -1012,6 +1079,7 @@ fn the_hover_title_never_moves_the_switch() {
 }
 
 /// Window pixel at the centre of frame cell `(row, col)` of `wid`: the
+/// inverse of `App::frame_cell_at`, checked against it.
 fn cell_px(app: &App, wid: WindowId, (row, col): (usize, usize)) -> (f64, f64) {
     let (cw, ch) = app.win_cell_size(wid);
     let (ox, oy) = app.frame_origin(wid);
@@ -1026,6 +1094,10 @@ fn cell_px(app: &App, wid: WindowId, (row, col): (usize, usize)) -> (f64, f64) {
 }
 
 /// [`the_hover_title_never_moves_the_switch`] on the glass: Claude Code's
+/// pane this window's host holds, its facts naming build 2.1.283 — and the
+/// title let go with no motion once its line moves from under the still
+/// pointer (the composer grown a row), the moved line at rest; while the
+/// line stays under it, the title stands frame after frame (CONTROL).
 fn hover_title_on_the_glass() {
     let (mut app, wid, session) = probe_glass();
     {
@@ -1114,6 +1186,8 @@ fn hover_title_on_the_glass() {
 }
 
 /// The probe's screen as Claude lays it in a window `rows` × `cols`: its
+/// rules as wide as the window, a blank transcript row above it for every
+/// row more.
 fn screen_at(live: &Live<'_>, rows: u16, cols: u16) -> Vec<String> {
     let mut s: Vec<String> = screen(live)
         .into_iter()
@@ -1131,6 +1205,8 @@ fn screen_at(live: &Live<'_>, rows: u16, cols: u16) -> Vec<String> {
 }
 
 /// Claude Code's pane ([`probe_glass`]), read as Claude, whose top line the
+/// harness holds — its lockup and its switch on the glass — and the host's
+/// guard.
 fn claude_held() -> (App, WindowId, u64, Hosted) {
     let (mut app, wid, session) = probe_glass();
     {
@@ -1143,6 +1219,7 @@ fn claude_held() -> (App, WindowId, u64, Hosted) {
 }
 
 /// The window re-gridded to `rows` × `cols` and Claude's screen re-laid in
+/// it — no frame painted yet.
 fn regrid(app: &mut App, wid: WindowId, session: u64, rows: u16, cols: u16) {
     assert!(
         app.apply_term_resize(wid, rows, cols),
@@ -1158,6 +1235,7 @@ fn next_frame(app: &mut App, wid: WindowId) {
 }
 
 /// The pointer moved to frame cell `cell` and resting there: the motion's
+/// pixel kept as the window's, and the glass asked as a motion asks it.
 fn point_at(app: &mut App, wid: WindowId, cell: (usize, usize)) -> crate::claude_lights::OverChips {
     let (x, y) = cell_px(app, wid, cell);
     let ws = app.windows.get_mut(&wid).expect("window");
@@ -1167,11 +1245,14 @@ fn point_at(app: &mut App, wid: WindowId, cell: (usize, usize)) -> crate::claude
 }
 
 /// The session whose harness switch the pointer is over, as the next frame
+/// draws it.
 fn switch_hovered(app: &App, wid: WindowId) -> Option<u64> {
     app.windows[&wid].claude_lights.switch_hover
 }
 
 /// A RE-GRID'S POINTER IS HIT-TESTED ON THE GLASS IT LANDS ON: Claude Code's
+/// pane this window's host holds, the pointer resting on its top line's
+/// switch.
 #[test]
 fn a_regrid_hit_tests_the_glass_it_lands_on() {
     use crate::claude_lights::OverChips;
@@ -1295,6 +1376,9 @@ fn a_regrid_hit_tests_the_glass_it_lands_on() {
 }
 
 /// A RE-GRID BRINGS THE HOVER TITLE UNDER A STILL POINTER: the pointer
+/// resting two rows under Claude Code's top line, on the composer's bottom
+/// rule, where the line's lockup lands when the window grows two rows and
+/// Claude lays its screen two rows lower.
 #[test]
 fn a_regrid_brings_the_hover_title_under_a_still_pointer() {
     let (mut app, wid, session, _host) = claude_held();

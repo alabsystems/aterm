@@ -1,64 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `predict-live`: predictive editing on a REAL aterm, over a link with a real
-//! round trip (`docs/DESIGN-predictive-editing-2026-10-20.md`, "Live").
-//!
-//! The predictor's safety theorem and its measurement run a simulated host.
-//! This runs the shipping one: a private aterm (a debug build: its
-//! `$ATERM_TRACE_PREDICT` seam is on), a real zsh or bash behind the
-//! [`crate::link`] relay with aterm's shell integration, keys pressed through
-//! `hwkey` (the OS event queue, winit, the press path), and frames drawn by its
-//! render paths: the single pane's, then a split pane's (the composed path).
-//!
-//! What it holds, from the instance itself:
-//!
-//! * THE TRACE (`aterm-predict press|frame` lines in the instance's log): each
-//!   press the predictor was handed and the op it armed, and each frame that
-//!   painted a prediction, with the rows the paint touched as the engine had
-//!   them and as they were drawn, and both cursors.
-//! * THE FAR END'S OWN SCREEN: the relay's take, replayed through aterm-core
-//!   at the size the far end was told. The screen key `k` SETTLES to is the far
-//!   end's once it wrote everything it wrote before it read the next key.
-//!   The replay is checked against the instance's own `text` at the start and
-//!   the end of each phase, so the oracle is the instance's screen.
-//!
-//! And judges, per phase:
-//!
-//! * FIDELITY: every painted frame claims the screen its newest visible key
-//!   settles to (the theorem's FRAME FIDELITY): each row it touched must be
-//!   that screen's row, and the cursor it drew that screen's cursor. A frame
-//!   that differs is a WRONG frame, listed with its cells; in `adaptive` there
-//!   must be none.
-//! * BEFORE THE ECHO: a correct frame whose engine rows or cursor are not yet
-//!   that screen showed it AHEAD of the echo; a key counts as shown before its
-//!   echo when such a frame shows its state or a later key's on its line, and
-//!   its PERCEIVED latency is the press to the first such frame.
-//! * METRICS: `metrics percentiles`' `n_input`, `input_predicted`,
-//!   `input_p50/p95/p99_ms`, `n_present`, `present_p50/p95/p99_ms` and the far
-//!   end's `echo` round trip, read after each phase's corpus, with prediction
-//!   on and off.
-//! * NOT VACUOUSLY: a frame that names no press is not judged, so a phase
-//!   with prediction on holds only with none; a windowed one over a link of
-//!   at least [`MUST_PAINT_RTT_MS`] must also have painted, shown keys before
-//!   their echo, and booked some key's input slice at its prediction
-//!   (`input_predicted` above zero: the wiring from the press path through
-//!   the render paths to the present, which no unit test of one half sees).
-//!   With prediction off nothing may paint and `input_predicted` must be 0.
-//!
-//! It OPENS A WINDOW on the desktop of whoever runs it and presses keys in it,
-//! so it runs only with `--window`; it raises the window only after the
-//! keyboard and pointer have been idle for 3 s, and a phase during which a
-//! person touched them, or whose `hwkey` said the window was not the key window
-//! of the active app (`key=0`), is NOT MEASURED. One instance at a time, each
-//! ended by its own process group. `--headless` runs the single-pane phase in a
-//! headless instance through `key` instead: the press path and the link, which
-//! a headless aterm never presents (no frame is painted there).
-//!
-//! `predict-live --window|--headless [--aterm PATH] [--shell zsh|bash]…
-//! [--rtt MS]… [--mode on|off]… [--rounds N] [--no-split] [--out DIR]`; exit 0
-//! every phase judged held, 1 a wrong frame or a check failed, 3 not run or
-//! not measured.
+//! Live predictive-editing harness over a real aterm and link relay
+//! ([`crate::link`], [`MUST_PAINT_RTT_MS`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -67,8 +11,6 @@ use std::time::{Duration, Instant};
 use crate::instance::{self, Instance, Launch, World};
 use crate::stop::{self, Stopped};
 use crate::{Fail, LAB, Res};
-
-// ------------------------------------------------------------------ the corpus
 
 /// One key of the corpus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,8 +35,7 @@ impl Key {
         }
     }
 
-    /// The `key` request that presses it (the main thread's input seam: a
-    /// headless instance has no window to post into).
+    /// The `key` request that presses it.
     #[must_use]
     pub fn key(self) -> String {
         match self {
@@ -110,21 +51,14 @@ impl Key {
     }
 }
 
-/// One command line of the corpus: its family and its keys, Enter last.
+/// One command line of the corpus.
 #[derive(Clone, Debug)]
 pub struct Line {
     pub family: &'static str,
     pub keys: Vec<Key>,
 }
 
-/// The plan's editing kinds, each a harmless command line whatever the line
-/// editor's bindings: plain typing, a typo and Backspace, `←`/`→` fixes with
-/// a mid-line erase and insert, a mid-line insert, a mid-line erase, Ctrl-D
-/// and Delete inside the text, Home and End, Ctrl-A and Ctrl-E (`true; `
-/// typed at the line's start: where a binding is missing it lands at the end
-/// and the line still runs), and a missed letter put back several cells back;
-/// `rounds` times over, so each line edge's binding can be learned (two
-/// echoes) and each class proven per line.
+/// The plan's editing kinds, each a harmless command line whatever the line editor's bindings.
 #[must_use]
 pub fn corpus(rounds: usize) -> Vec<Line> {
     use Key::{Ch, Ctrl, Named};
@@ -206,9 +140,7 @@ pub fn corpus(rounds: usize) -> Vec<Line> {
     (0..rounds).flat_map(|_| one()).collect()
 }
 
-/// How long after the previous key a key is pressed: a typist's cadence
-/// (90 to 150 ms between glyphs), a notice before an edit key and before
-/// Enter, nothing timed.
+/// How long after the previous key a key is pressed.
 #[must_use]
 pub fn gap(prev: Option<Key>, key: Key, n: usize) -> Duration {
     const CADENCE: [u64; 4] = [90, 130, 110, 150];
@@ -220,8 +152,6 @@ pub fn gap(prev: Option<Key>, key: Key, n: usize) -> Duration {
         _ => Duration::from_millis(base),
     }
 }
-
-// ------------------------------------------------------------------ the trace
 
 /// A press the predictor was handed (`aterm-predict press`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -240,7 +170,7 @@ pub struct Frame {
     /// The engine's cursor, and the one drawn.
     pub cursor: (usize, usize),
     pub shown: (usize, usize),
-    /// Each row the paint touched: (row, as the engine had it, as drawn).
+    /// Each row the paint touched.
     pub rows: Vec<(usize, String, String)>,
 }
 
@@ -249,8 +179,7 @@ pub struct Frame {
 pub enum Event {
     Press(Press),
     Frame(Frame),
-    /// The frame after a painted one that painted none: glass shows the
-    /// engine's screen again (`aterm-predict clear`).
+    /// The frame after a painted one that painted none.
     Clear(u64),
 }
 
@@ -285,7 +214,7 @@ fn seq(s: &str) -> Option<u64> {
     s.parse().ok()
 }
 
-/// Every trace line of `log`, in order; other lines are skipped.
+/// Every trace line of `log`, in order.
 #[must_use]
 pub fn parse_trace(log: &str) -> Vec<Event> {
     let mut out = Vec::new();
@@ -336,8 +265,6 @@ pub fn parse_trace(log: &str) -> Vec<Event> {
     out
 }
 
-// ------------------------------------------------------------------ the far end
-
 /// One line of a link take ([`crate::link`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Chunk {
@@ -345,7 +272,7 @@ pub enum Chunk {
     In(Vec<u8>),
     /// Output it wrote.
     Out(Vec<u8>),
-    /// The window it was told: rows, columns.
+    /// The window it was told.
     Size(u16, u16),
 }
 
@@ -359,7 +286,7 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// A take's lines, in order; a torn or foreign line is skipped.
+/// A take's lines, in order.
 #[must_use]
 pub fn parse_take(text: &str) -> Vec<Chunk> {
     text.lines()
@@ -409,10 +336,7 @@ fn trim(s: &str) -> String {
     s.trim_end_matches([' ', '\0']).to_string()
 }
 
-/// The far end's screen just before it read each input of `take` (one per
-/// `In` chunk, in order), and once it wrote everything (the last entry): so
-/// the screen input `j` settles to is entry `j + 1`. Replayed through
-/// aterm-core at the size the take says the far end was told.
+/// The far end's screen just before it read each input of `take` (one per `In` chunk, in order).
 #[must_use]
 pub fn replay(take: &[Chunk]) -> Vec<Screen> {
     let mut term: Option<aterm_core::terminal::Terminal> = None;
@@ -434,9 +358,7 @@ pub fn replay(take: &[Chunk]) -> Vec<Screen> {
     out
 }
 
-// ------------------------------------------------------------------ the judge
-
-/// What one phase's frames came to.
+/// Frame verdicts and timing metrics for one phase.
 #[derive(Debug, Default)]
 pub struct Verdict {
     /// Frames that painted, and of them the `adaptive` ones.
@@ -450,21 +372,15 @@ pub struct Verdict {
     pub wrong: Vec<String>,
     /// Correct frames ahead of the echo.
     pub ahead: usize,
-    /// Keys counted (every press but a line terminator), and of them those
-    /// shown before their echo, by class.
+    /// Keys counted (every press but a line terminator).
     pub keys: HashMap<String, (usize, usize)>,
-    /// The press to the first frame ahead of the echo showing it, µs, per
-    /// key shown before its echo.
+    /// The press to the first frame ahead of the echo showing it, µs.
     pub perceived_us: Vec<u64>,
     /// Painted frames still on glass when a line had settled ([`left_on_glass`]).
     pub left_on_glass: Vec<String>,
 }
 
-/// EVENTUAL, on glass: once a line's output has landed and the screen has
-/// settled (the corpus waits for that before each line's first key, and
-/// before the phase ends), no prediction is left on glass. Glass shows a
-/// painted frame from its `frame` line until the `clear` after it; a frame
-/// still shown at a line's first press, or at the end, is listed.
+/// Eventual, on glass: once a line's output has landed and the screen has settled.
 #[must_use]
 pub fn left_on_glass(events: &[Event]) -> Vec<String> {
     let mut out = Vec::new();
@@ -517,8 +433,6 @@ fn engine_is(frame: &Frame, screen: &Screen) -> bool {
 }
 
 /// Hold every frame of a phase to the screen its newest key settles to.
-/// `presses` are the phase's, in order, and `settled[k]` the screen press
-/// `k` settles to (from [`replay`], aligned by the caller).
 #[must_use]
 pub fn judge(presses: &[Press], frames: &[Frame], settled: &[Screen]) -> Verdict {
     let mut v = Verdict::default();
@@ -527,7 +441,6 @@ pub fn judge(presses: &[Press], frames: &[Frame], settled: &[Screen]) -> Verdict
         .enumerate()
         .filter_map(|(i, p)| p.armed.map(|s| (s, i)))
         .collect();
-    // The index of the press that starts each press's line.
     let mut line_start = Vec::with_capacity(presses.len());
     let mut start = 0;
     for (i, p) in presses.iter().enumerate() {
@@ -579,8 +492,6 @@ pub fn judge(presses: &[Press], frames: &[Frame], settled: &[Screen]) -> Verdict
             continue;
         }
         v.ahead += 1;
-        // Every key of the line up to k whose own settled screen the engine
-        // did not yet show is shown here, ahead of its echo.
         for q in (line_start[k]..=k).rev() {
             if presses[q].key == "submit" || settled.get(q).is_none_or(|s| engine_is(f, s)) {
                 break;
@@ -615,8 +526,6 @@ pub fn quantile(xs: &[u64], q: f64) -> u64 {
     let rank = ((q * s.len() as f64).ceil() as usize).clamp(1, s.len());
     s[rank - 1]
 }
-
-// ------------------------------------------------------------------ the run
 
 /// One configuration of a run.
 #[derive(Clone, Debug)]
@@ -670,8 +579,7 @@ fn metric_line(reply: &str) -> String {
 /// The round trip at or above which a windowed phase with prediction on must
 /// paint: twice the 20 ms at which `adaptive` opens its display gate
 /// (aterm-predict's `DISPLAY_OPEN_MS`), so the link stands clear of the
-/// gate's own threshold. Below it, whether the gate opens is the gate's call,
-/// and the phase is held to what it painted alone.
+/// gate's own threshold.
 const MUST_PAINT_RTT_MS: u64 = 40;
 
 /// The instance's screen as `text` prints it: its rows, trailing blanks trimmed.
@@ -742,13 +650,11 @@ struct Phase {
     name: &'static str,
     verdict: Option<Verdict>,
     metrics: String,
-    /// `input_predicted`: the keys whose input slice a prediction on glass
-    /// closed, before their echo (`None` when the reply had none).
+    /// `input_predicted`: the keys whose input prediction on glass closed, before their echo.
     predicted: Option<u64>,
     oracle: String,
     notes: Vec<String>,
-    /// Prediction off: whether the phase held (no frame painted a prediction,
-    /// and the far end's replay is the instance's screen).
+    /// Prediction off: whether the phase held.
     off_held: bool,
 }
 
@@ -756,7 +662,7 @@ struct Run<'a> {
     inst: Instance,
     client: aterm_agent::RelayClient<aterm_uds::CtlStream>,
     headless: bool,
-    /// Prediction on (`adaptive`); off, the phase is the metrics' control.
+    /// Prediction on (`adaptive`).
     on: bool,
     rtt: u64,
     rounds: usize,
@@ -816,8 +722,7 @@ impl Run<'_> {
     }
 
     /// Type the corpus: each line's keys at a typist's cadence, then wait for
-    /// its output and the next prompt. One `image` is taken mid-line on the
-    /// first plain line of (`frame-<tag>.png`).
+    /// its output and the next prompt.
     fn type_corpus(&mut self, image: bool) -> Result<(), Halt> {
         let lines = corpus(self.rounds);
         let mut n = 0;
@@ -848,8 +753,6 @@ impl Run<'_> {
 
     /// `image` now, mid-line, copied to the output directory.
     fn capture(&mut self) -> Result<(), Halt> {
-        // Through the CLI: an artifact reply is acknowledged by its reader
-        // (`ACK-CHALLENGE`), which the client process does.
         let reply = self.inst.ctl(&["image"]).first();
         let path = reply
             .split_whitespace()
@@ -931,7 +834,6 @@ impl Run<'_> {
             );
             None
         } else if presses.len() == inputs && start_ok && end_ok {
-            // Press k's settled screen: just before the far end read input k+1.
             let settled: Vec<Screen> = (0..presses.len())
                 .map(|k| screens[in_offset + k + 1].clone())
                 .collect();
@@ -959,18 +861,6 @@ impl Run<'_> {
 }
 
 /// Why a phase did not hold, one line each; none when it held.
-///
-/// With prediction on, every painted frame is held to its settled screen
-/// (none WRONG), each must name the press it claims (one that names none is
-/// not judged, so a trace that attributes nothing would hold vacuously), and
-/// none may be left on glass once a line settled. A WINDOWED phase over a link
-/// at or above [`MUST_PAINT_RTT_MS`] must also show what it is run to show:
-/// frames painted, keys shown before their echo, and `input_predicted` above
-/// zero, the typing metric seeing them (the press path's tag, the render
-/// paths' mark and the present's booking together, which no unit test of
-/// one half sees). With prediction off (the control), nothing may paint, the
-/// far end's replay must be the instance's screen, and no key's slice may
-/// close at a prediction.
 fn failures(cfg: &Config, windowed: bool, phase: &Phase) -> Vec<String> {
     let predicted = phase
         .predicted
@@ -1498,8 +1388,6 @@ mod tests {
             "a wrong cursor is caught"
         );
 
-        // A frame drawn once the echo landed (its engine is the settled
-        // screen already) is held but shows nothing early.
         let late = frame(260, 0, "$ a", "$ a", 3, 3);
         let v = judge(&presses, &[late], &settled);
         assert!(v.wrong.is_empty());
@@ -1635,13 +1523,7 @@ mod tests {
         );
     }
 
-    /// NOT VACUOUSLY. A windowed phase with prediction on holds when it
-    /// painted, showed keys before their echo and booked their slices at
-    /// their prediction; one that painted nothing, whose frames name no press,
-    /// or whose typing metric saw no prediction (the wiring defect of
-    /// 2026-10-20 that every unit test missed) does not. Headless, and below
-    /// the round trip the display gate must open at, painting is not required.
-    /// With prediction off, a key closed at a prediction fails the control.
+    /// NOT VACUOUSLY.
     #[test]
     fn a_phase_holds_only_when_it_showed_what_it_is_run_to_show() {
         let held = phase(Some(shown()), Some(1), false);

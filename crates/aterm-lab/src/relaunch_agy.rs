@@ -1,75 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `agy-relaunch [tag] [--keep]`: THE AGY LANE, LIVE — the real agy (the
-//! lab's, launched by the seeded `agy` verb: its scratch `agy-home` holds the
-//! Gemini API provider and the onboarding done, so no sign-in screen draws and
-//! no browser opens) under a private headless aterm with the harness ON and
-//! `[harness] relaunch` at its default, against the stub's Gemini API. A lab
-//! of its own (`agy-relaunch-<pid>` unless a tag is given; the headless-restore
-//! seam on, so a desk is kept as a window keeps one). The instance's package
-//! prefix (`<scratch home>/Library/Application Support/aterm/pkg`) gets an
-//! `agents/agy` twin that exports `AGY_CLI_DISABLE_AUTO_UPDATE='true'` and
-//! execs the lab's build, as atpkg lays one: the relaunch types the managed
-//! twin, never the store path the process ran. The tab's shell gets the
-//! environment the lab's launcher gives agy but its `HOME` (the scratch
-//! home's): the relaunch line carries the `HOME` agy ran under (`agy-home`).
-//! Every step reads what it judges off the real thing: the processes under the
-//! instance, the conversation's presence lock each holds (`lsof`), the shell's
-//! command blocks (`blocks --json`), the host's own log and the upgrade
-//! ledger's rows, and the stub's request dumps.
-//!
-//! 1. **Crash.** agy takes a turn (`remember the word PELICAN-4417`); once the
-//!    crash journal names its conversation, it is SIGKILLed (block `137`, its
-//!    crash file left). It must come back in the tab resuming the SAME
-//!    conversation, the typed line naming the twin, the relaunched process in
-//!    its launch directory, and the harness's continuation must reach the
-//!    stub with the earlier turn in the same request.
-//! 2. **A resumed agy's crash.** The relaunched agy is SIGKILLed: its relaunch
-//!    line's block must say `137`, and it must be relaunched again.
-//!    **2a, 2b. A second agy on its conversation.** In a tab of its own (whose
-//!    crash back-off is its own), an agy takes a turn on a new conversation;
-//!    a second agy is opened with `-c` in another tab, which resumes that
-//!    newest conversation: it must draw `Conversation already open`, hold no
-//!    presence lock and hold the conversation's database. The first is
-//!    SIGKILLed: while the second runs, the host must decide
-//!    `wait:conversation-held` and type nothing (2a); once the second
-//!    `/quit`s, the crash must be relaunched on its conversation, the stub
-//!    seeing its turn again (2b). Both tabs are closed after.
-//! 3. **Ctrl-Z.** The relaunched agy is stopped (block `146`, alive, its lock
-//!    held): the host leaves it (`not relaunched: not-exited`), nothing is
-//!    typed, and no agy is started; `fg` brings it back.
-//! 4. **A clean `/quit`** of it: its `fg` block says `0`, the host's own
-//!    decision (`step=ended:graceful-exit`, after the crash back-off's step)
-//!    is read, and nothing is relaunched.
-//! 5. **A relaunch agy refuses is typed once.** A fresh agy takes a turn on a
-//!    conversation of its own; the twin is pointed at a build that refuses a
-//!    flag (`--lab-refused-flag`: agy exits `2` before any TUI, as a newer
-//!    build refuses a carried flag), and the agy is SIGKILLed. The host's line
-//!    must be typed once, its block must say `2`, the host must decide
-//!    `step=refused:resume-refused`, and nothing may be typed again for 75 s
-//!    more.
-//! 6. **From another directory.** The conversation is resumed by hand in a
-//!    subshell from the project while the tab's shell sits in a subdirectory,
-//!    then, once the crash journal names that agy, SIGKILLed: the line must
-//!    `cd` to the launch's directory first, and the relaunched agy run there.
-//! 7. **Restore after a crash.** aterm is SIGKILLed while that agy runs; the
-//!    next launch on the same state reopens the tab, and the agy must come
-//!    back there on its conversation, its continuation saying aterm ended, the
-//!    earlier turn in the request.
-//! 8. **Restore after a quit** (`invoke Quit`), the same way.
-//! 9. **Started fresh**, in the tab the quit's restore reopened (whose crash
-//!    back-off starts over: in the first tab this would be the fourth crash's
-//!    relaunch, ten minutes out). The twin is pointed at a build that reads
-//!    another config (`--app_data_dir=lab-fresh`, seeded as the verb seeds:
-//!    the provider and the onboarding, the project trusted) and the restored
-//!    agy is SIGKILLed: the relaunched agy says `conversation not found` and
-//!    holds no lock on it, so the host decides `refused:started-fresh` and no
-//!    continuation is typed.
-//!
-//! The report names each fact as read. Exit 0 when every phase holds (an
-//! UNOBSERVED phase is said as such, and named on the last line), 1 when one
-//! does not, 3 could not run.
+//! `agy-relaunch [tag] [--keep]`: THE AGY LANE, LIVE — the real agy (the lab's, launched by the seeded `agy` verb: its scratch `agy-home` holds the Gemini API provider and the onboarding done, so no sign-in screen draws and no browser opens) under a private headless aterm with the harness ON and `[harness] relaunch` at its default, against the stub's Gemini API.
 
 use std::path::Path;
 use std::time::Duration;
@@ -86,22 +18,19 @@ use crate::stop;
 use crate::util::now_ms;
 use crate::{Fail, LAB, Res};
 
-/// The word the first turn asks agy to remember: the request after a
-/// relaunch carries it only where the conversation came back with its turns.
+/// The word the first turn asks agy to remember: the request after a relaunch carries it only where the conversation came back with its turns.
 pub const WORD: &str = "PELICAN-4417";
 
 /// The word the fresh agy of phase 5 is asked to remember.
 pub const WORD2: &str = "OSPREY-6620";
 
-/// The flag the refusing build adds: agy 1.4.0 refuses an unknown flag with
-/// `flags provided but not defined` and exits 2 before any TUI (measured).
+/// The flag the refusing build adds: agy 1.4.0 refuses an unknown flag with `flags provided but not defined` and exits 2 before any TUI (measured).
 pub const REFUSED_FLAG: &str = "--lab-refused-flag";
 
 /// The app data directory the fresh-starting build reads.
 pub const FRESH_DIR: &str = "lab-fresh";
 
-/// The harness's continuation as agy is typed it, after a crash
-/// (`relaunch::resumed_prompt_as`, agy's product name).
+/// The harness's continuation as agy is typed it, after a crash (`relaunch::resumed_prompt_as`, agy's product name).
 pub const CONTINUED_CRASH: &str = "[aterm harness] Relaunched: Antigravity CLI exited";
 
 /// …and after aterm's own end.
@@ -142,8 +71,7 @@ fn config(run: &Run, app: &str) -> std::path::PathBuf {
     run.w.join(Agent::Agy.home()).join(".gemini").join(app)
 }
 
-/// The conversation of the presence lock a path names under `config`
-/// (`<config>/presence/<uuid>.lock`).
+/// The conversation of the presence lock a path names under `config` (`<config>/presence/<uuid>.lock`).
 #[must_use]
 pub fn lock_conversation(config: &Path, path: &str) -> Option<String> {
     let rest = Path::new(path).strip_prefix(config).ok()?;
@@ -176,9 +104,7 @@ fn resuming(run: &Run, conv: &str, not: &[i32]) -> Option<(i32, Vec<String>)> {
         .find(|(pid, w)| !not.contains(pid) && resumed(w) == Some(conv))
 }
 
-/// The shell environment a relaunched agy reaches the stub with, as the
-/// lab's launcher gives it agy ([`crate::gemini::launcher`]) but its `HOME`,
-/// which the relaunch line carries from the process.
+/// The shell environment a relaunched agy reaches the stub with, as the lab's launcher gives it agy ([`crate::gemini::launcher`]) but its `HOME`, which the relaunch line carries from the process.
 #[must_use]
 pub fn shell_exports(run: &Run) -> String {
     use crate::util::shell_quote as q;
@@ -223,8 +149,7 @@ pub fn twin_script(build: &str) -> String {
     )
 }
 
-/// A stand-in build named `agy` that runs the lab's build with `flag` first:
-/// what a twin execs to make a relaunch refused, or start fresh.
+/// A stand-in build named `agy` that runs the lab's build with `flag` first: what a twin execs to make a relaunch refused, or start fresh.
 #[must_use]
 pub fn build_with(bin: &str, flag: &str) -> String {
     format!(
@@ -238,8 +163,7 @@ pub fn build_with(bin: &str, flag: &str) -> String {
 /// typed there reaches the stub), and an agy launched in it by the lab's
 /// seeded launcher with `args` (the verb's scratch `agy-home`, its provider
 /// and onboarding already seeded by the first launch): its tab and pid once
-/// that agy draws its composer. Every read of the tab names it (`@<sid>`);
-/// the caller closes it.
+/// that agy draws its composer.
 fn open_tab(run: &Run, proj: &str, known: &[i32], args: &[&str]) -> Result<(String, i32), Fail> {
     let door = Door::new(run)?;
     let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
@@ -291,7 +215,7 @@ pub const WORD3: &str = "EGRET-3301";
 
 /// Phases 2a and 2b ([module docs](self)): a second agy opened by `-c`
 /// beside an agy of its own, each in a tab of its own in `proj`; `known`, the
-/// agy processes the check has seen. Both tabs are closed again.
+/// agy processes the check has seen.
 #[allow(clippy::too_many_lines)]
 fn beside(run: &Run, proj: &str, known: &[i32], failed: &mut Vec<String>) -> Result<(), Fail> {
     let door = Door::new(run)?;
@@ -305,8 +229,6 @@ fn beside(run: &Run, proj: &str, known: &[i32], failed: &mut Vec<String>) -> Res
     let Some(conv_b) = wait_for(60, || conversation_of(run, holder_b))? else {
         return Err(could_not("the second tab's agy holds no presence lock"));
     };
-    // The host reads the conversation at its loop's idle points (the lock
-    // names no pid): once its journal names it, the host's snapshot does.
     let journaled = wait_for(30, || restore::desk_naming(run, &conv_b))?.is_some();
     let mut seen = known.to_vec();
     seen.push(holder_b);
@@ -331,8 +253,6 @@ fn beside(run: &Run, proj: &str, known: &[i32], failed: &mut Vec<String>) -> Res
     let before = newest_dump(run);
     let t = now_ms();
     let _ = crate::sys::kill(holder_b, libc::SIGKILL);
-    // The host decides after the crash back-off's first step: a hang
-    // detector.
     let waited = wait_for(60, || {
         host_said(
             run,
@@ -499,7 +419,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
     );
     let mut failed = Vec::new();
     let mut unseen = Vec::new();
-    // ---- the twin, and the shell's environment
     let pkg = run.w.join("home/Library/Application Support/aterm/pkg");
     let twin = pkg.join("agents/agy");
     put_twin(&twin, &run.agy_bin)?;
@@ -517,7 +436,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
     stop::sleep(Duration::from_millis(500))?;
     println!("  twin      {} -> {}", twin.display(), run.agy_bin);
 
-    // ---- 1. a crash, relaunched on its conversation in its directory
     run = launch_agy(tag, &[])?;
     let door = Door::new(&run)?;
     turn(&door, &format!("remember the word {WORD}"))?;
@@ -602,7 +520,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
         &mut failed,
     );
 
-    // ---- 2. the resumed agy crashes: its block's word, and again relaunched
     door.await_idle(2000, 60)?;
     let before = newest_dump(&run);
     let t2 = now_ms();
@@ -631,15 +548,11 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
         return Ok(Verdict::Failed);
     };
 
-    // ---- 2a, 2b. a second agy opened by `-c` beside an agy of its own, in
-    // tabs of their own (whose crash back-off is their own: this tab's
-    // phases keep their steps)
     let Some(proj) = workspace.clone() else {
         return Ok(Verdict::Failed);
     };
     beside(&run, &proj, &[pid1, pid2, pid3], &mut failed)?;
 
-    // ---- 3. Ctrl-Z: stopped, alive, never relaunched; `fg` brings it back
     door.await_idle(2000, 60)?;
     stop::sleep(Duration::from_secs(2))?;
     let t3 = now_ms();
@@ -647,7 +560,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
     stop::sleep(Duration::from_secs(3))?;
     let stopped_exit = exit_of(&door, &relaunch_line);
     let state3 = crate::procs::state_of(pid3);
-    // The host decides after the crash back-off's step: a hang detector.
     let decided3 = wait_for(130, || {
         host_said(
             &run,
@@ -684,7 +596,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
     send_when_free(&door, "fg")?;
     stop::sleep(Duration::from_secs(3))?;
 
-    // ---- 4. a clean /quit is not relaunched: the host's own decision read
     door.await_idle(2000, 60)?;
     stop::sleep(Duration::from_secs(5))?;
     let t4 = now_ms();
@@ -730,7 +641,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
         _ => said(false, what4, &mut failed),
     }
 
-    // ---- 5. a relaunch agy refuses is typed once, never again
     let known5 = [pid1, pid2, pid3];
     run = launch_agy(tag, &[])?;
     let door = Door::new(&run)?;
@@ -793,7 +703,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
     );
     put_twin(&twin, &run.agy_bin)?;
 
-    // ---- 6. a crash relaunched from a shell elsewhere: the line `cd`s first
     let Some(proj) = workspace.clone() else {
         return Ok(Verdict::Failed);
     };
@@ -829,14 +738,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
     known.push(pid4);
     door.seen("^>", 60)?;
     door.await_idle(2000, 30)?;
-    // Killed only once the host's snapshot names THIS agy on its
-    // conversation (its journal names its pid), as phase 7 waits: the host
-    // reads it as it attaches, and again at the agent's first idle point
-    // where that read came before agy held its conversation's lock. Killed
-    // first, the host has no conversation to relaunch it on
-    // (`ended:no-conversation`), which is no word on the `cd` (agm4 and agm5,
-    // on the merge of origin/main 790e8c5828: its first idle point lands as
-    // the screen has been quiet for 2 s, with this check's kill).
     let pid4_row = format!("pid = {pid4}");
     let journal6 = wait_for(30, || {
         restore::desk_naming(&run, &conv)
@@ -875,7 +776,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
     };
     known.push(pid5);
 
-    // ---- 7. restore: aterm crashes while it runs, the reopened tab brings it back
     let pid7 = pid5;
     door.await_idle(2000, 60)?;
     let pid_row = format!("pid = {pid7}");
@@ -917,7 +817,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
     };
     known.push(pid8);
 
-    // ---- 8. restore: aterm is quit while it runs, the reopened tab brings it back
     let door = Door::new(&run)?;
     door.await_idle(2000, 60)?;
     let pid_row = format!("pid = {pid8}");
@@ -955,10 +854,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
         return Ok(Verdict::Failed);
     };
     known.push(pid9);
-    // ---- 9. a relaunch that starts fresh: told, nothing typed into it. In the
-    // tab the quit's restore reopened, whose crash back-off starts over (in
-    // the first tab this would be the fourth crash's relaunch, ten minutes
-    // out).
     let door = Door::new(&run)?;
     door.await_idle(2000, 60)?;
     let fresh_config = config(&run, FRESH_DIR);
@@ -1071,8 +966,6 @@ pub fn cmd_agy_relaunch(args: &[String]) -> Res {
     u.restore = true;
     u.trust = true;
     u.lifeline = !keep;
-    // No turn-end continuation of the supervisor's between the phases: the
-    // relaunch's own carry-on is what is judged.
     u.harness_keys = format!("{}\ncontinue = false", u.harness_keys);
     if let Err(f) = crate::lab::up(&tag, &u) {
         if let Some(m) = &f.msg {
@@ -1105,8 +998,6 @@ mod tests {
     }
 
     /// An agy's words name the conversation it resumes, any spelling.
-    /// NEGATIVE CONTROLS: a plain launch, `-c`, a flag that only begins like
-    /// it.
     #[test]
     fn a_relaunched_agy_names_the_conversation_it_resumes() {
         assert_eq!(
@@ -1119,8 +1010,7 @@ mod tests {
         assert_eq!(resumed(&words("--conversations=c1")), None);
     }
 
-    /// A presence lock names its conversation under its config. NEGATIVE
-    /// CONTROLS: another directory, another config.
+    /// A presence lock names its conversation under its config.
     #[test]
     fn a_presence_lock_names_its_conversation() {
         let config = Path::new("/s/agy-home/.gemini/antigravity-cli");

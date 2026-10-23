@@ -1,18 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Linux lane's signature verifier: `linux_release_verify`, the Python and
-//! OpenSSL the installer embeds so `curl … | bash` fetches no helper, held to
-//! the updater's Rust chain.
-//!
-//! Every proof is built by the Rust signer. The installer decides through its
-//! own function, run from the script: a `python3` stand-in hands the heredoc
-//! to [`HARNESS`], which swaps only the trust anchor (no synthetic proof can
-//! be signed by the paper master) and runs the embedded code. The reference is
-//! the decision `aterm update install` takes on the same bytes before it places
-//! a binary ([`updater_verdict`]). The installer runs the candidate as soon as
-//! its own check passes, so a laxer installer runs a binary the updater
-//! refuses, and a stricter one strands a fresh install.
+//! Linux release signature verifier (`linux_release_verify`) equivalence tests
+//! ([`HARNESS`], [`updater_verdict`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -31,17 +21,7 @@ const SLUG: &str = "example/aterm";
 const SIGNER: &str = "synthetic";
 const OTHER: &str = "other";
 
-/// Runs the verifier the installer pipes to `python3 -`. `run`: the script as
-/// `__main__` with its master pin replaced, exit status and all. `pins`: the
-/// master keys it trusts. `calls`: each line of `$STUB_CALLS` (`function`,
-/// space-separated pins, arguments; tab-separated) answered on one line; a
-/// `json:function` takes each argument as JSON (a number, a list, `null`). A
-/// function may carry one stand-in for its call, `function|target=<JSON>`:
-/// `os.getxattr` answers each attribute from the JSON table (`null`, it
-/// exists; an errno; `ENODATA` for one the table leaves out), and any other
-/// target is a verifier function that answers the JSON whatever it is asked.
-/// `STUB_SIGNATURES=once`: the verifier's own `verify_ed25519` runs once per
-/// distinct key, bytes and signature in the batch, its answer reused.
+/// Runs the verifier the installer pipes to `python3 -`.
 const HARNESS: &str = r#"import contextlib, errno, io, json, os, sys, types
 source = sys.stdin.read()
 marker = "\nMASTER_PUBKEYS = "
@@ -115,7 +95,7 @@ struct Tools {
 }
 
 /// Where the verifier's tools are looked for: each list in order, the first candidate
-/// that meets the floor taken. Injected, so a test can stand up a host with neither.
+/// that meets the floor taken.
 #[derive(Default)]
 struct Search {
     python: Vec<PathBuf>,
@@ -202,9 +182,7 @@ impl Verifier {
         Self::with(scratch, &Search::host())
     }
 
-    /// The verifier under `scratch`, over the tools `search` finds. A host without them
-    /// ends the test COULD NOT RUN saying what is missing (their `TOOLS` rows' refusals):
-    /// never a pass, and never a FAIL, which would charge the installer with the host's gap.
+    /// The verifier under `scratch`, over the tools `search` finds.
     fn with(scratch: &Scratch, search: &Search) -> Self {
         let tools = tools_in(search).unwrap_or_else(|absent| {
             aterm_uds::host::could_not_run_without(&absent);
@@ -213,8 +191,6 @@ impl Verifier {
         let bin = scratch.mkdir("verifier-bin");
         scratch.stand_in(
             "verifier-bin/python3",
-            // The installer runs its verifier isolated (`python3 -I -`); the
-            // stand-in holds it to that and drops the flag the harness re-adds.
             "#!/bin/sh\n[ \"$1\" = -I ] || { echo 'install.sh ran python3 without -I' >&2; exit 97; }\nshift\nexec \"$STUB_PYTHON\" -I \"$STUB_HARNESS\" \"$@\"\n",
         );
         symlink(&tools.openssl, &bin.join("openssl"));
@@ -753,9 +729,7 @@ fn main_call(case: &Case, laid: &Laid) -> String {
     .join("\t")
 }
 
-/// The installer's answer as an [`Accepted`], or why it refused. An acceptance
-/// whose size, build or roster generation is no u64 (`7.0`, `-1`) reads as a
-/// crash: no Rust verdict can name it.
+/// The installer's answer as an [`Accepted`], or why it refused.
 fn installer_verdict(answer: &str) -> Result<Accepted, String> {
     let (kind, rest) = answer.split_once('\t').unwrap_or((answer, ""));
     if kind != "ok" {
@@ -777,7 +751,7 @@ enum Rule {
     Shared,
     /// The installer's own, stricter than the updater by design: the signed
     /// origin bind, the source commit's spelling, an explicit schema, and a
-    /// whole-roster refusal when any member is malformed. It must refuse.
+    /// whole-roster refusal when any member is malformed.
     Installer,
 }
 
@@ -1267,8 +1241,6 @@ fn corpus(keys: &Keys) -> Vec<Case> {
     let mut cases = vec![Case::base(keys)];
     cases.extend(MUTATIONS.iter().map(|m| apply(&[m])));
     let combinable: Vec<&Mutation> = MUTATIONS.iter().collect();
-    // The mutations a release survives alone, combined, reach the accepting
-    // side's interactions; any mutation on top of them reaches the refusals'.
     let neutral: Vec<&Mutation> = combinable
         .iter()
         .copied()
@@ -1332,9 +1304,6 @@ fn differential(scratch: &Scratch, verifier: &Verifier, script: &Path) -> Tally 
         calls.push(main_call(case, &laid));
         expected.push(updater_verdict(case, &laid.proofs));
     }
-    // Most cases carry the base case's roster or appcast: the verifier's signature check
-    // is asked once per batch for each distinct proof ([`HARNESS`]), every case still
-    // decided by `main` over its own files.
     let once = [("STUB_SIGNATURES", "once")];
     let answers = ask_verifier_with(scratch, verifier, script, &calls, &once);
     let mut tally = Tally {
@@ -1369,13 +1338,7 @@ fn differential(scratch: &Scratch, verifier: &Verifier, script: &Path) -> Tally 
 /// §10 S2: with its tools looked up nowhere, the verifier ends COULD NOT RUN saying what
 /// is missing and that nothing provides it before S11, never a FAIL: a host without
 /// Python 3.11+ and OpenSSL 3 did not run these tests, which is no verdict on the
-/// installer. A Python and an OpenSSL below the floor are no copy either (stock macOS
-/// has both: 3.9.6 and LibreSSL).
-///
-/// The words are read from the pure halves ([`tools_in`] and the rows' refusals), never
-/// from a caught COULD NOT RUN, whose sentinel in this test's output would record a
-/// regression here as the machine's refusal. The one caught panic comes last and is
-/// asserted only to carry the sentinel.
+/// installer.
 #[test]
 fn a_host_without_the_verifiers_tools_ends_could_not_run() {
     let scratch = Scratch::new();
@@ -1591,7 +1554,6 @@ fn the_durable_policy_binds_the_installed_file() {
         )
     };
     let fresh = "f".repeat(64);
-    // (name, the record's tail, the target's bytes, the record's target)
     let rows: [(&str, String, Vec<u8>, bool); 8] = [
         ("plain", String::new(), raw.clone(), true),
         (
@@ -1625,7 +1587,6 @@ fn the_durable_policy_binds_the_installed_file() {
             true,
         ),
         ("elsewhere", String::new(), raw.clone(), false),
-        // A rollback interrupted before its rename: the target is still the new build.
         (
             "rolling-back-before-the-rename",
             format!(
@@ -1650,16 +1611,12 @@ fn the_durable_policy_binds_the_installed_file() {
         state(&store, &(record(&named) + tail));
         stores.push(store);
     }
-    // A state directory that is a symlink is not the updater's own.
     let linked = scratch.mkdir("policy/linked");
     symlink(
         scratch.mkdir("policy/elsewhere-dir"),
         &linked.join(".aterm-update"),
     );
     stores.push(linked);
-    // Each refused: (name, an edit of the record, its tail, the target's bytes,
-    // the modes of the state directory, the state file and the target, a word
-    // of the refusal).
     let installed = format!("sha256 = {digest:?}\n");
     let tampered = [raw.as_slice(), b"tampered"].concat();
     let private = [0o700, 0o600, 0o755];
@@ -2001,8 +1958,7 @@ fn the_user_private_group_rule_is_the_updaters() {
 /// embedded verifier's `check_install_path` and the updater's
 /// `install_path::refusal`, as is one on the primary group whose access ACL
 /// gives another account its group class's bits (the mode unchanged); and each
-/// of those groups is private, or not, to both. A user-private group's write
-/// bit is no other account's, unless an access ACL makes it another's.
+/// of those groups is private, or not, to both.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_install_path_walk_is_the_updaters_on_this_machine() {
@@ -2011,10 +1967,10 @@ fn the_install_path_walk_is_the_updaters_on_this_machine() {
     };
     let scratch = Scratch::new();
     let verifier = Verifier::new(&scratch);
-    // SAFETY: getgid has no preconditions and cannot fail.
+    // SAFETY: Getgid has no preconditions and cannot fail.
     let primary = unsafe { libc::getgid() };
     let mut gids = vec![primary];
-    // SAFETY: a zero count asks only for the number of supplementary groups.
+    // SAFETY: A zero count asks only for the number of supplementary groups.
     let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
     let mut more = vec![0; usize::try_from(count).expect("a group count")];
     // SAFETY: `more` has room for exactly `count` gids.
@@ -2025,7 +1981,6 @@ fn the_install_path_walk_is_the_updaters_on_this_machine() {
             gids.push(gid);
         }
     }
-    // Unshielded: the scratch root's chain, with no private directory of its own.
     let open = aterm_tempfile::Builder::new()
         .prefix("install-sh-open.")
         .tempdir_in(crate::support::scratch_root())
@@ -2092,13 +2047,10 @@ fn the_install_path_walk_is_the_updaters_on_this_machine() {
             "gid {gid}"
         );
     }
-    // On a machine whose primary group is a user-private one, its write bit
-    // refuses nothing (the scratch root's own chain is one the walk admits).
     if is_user_private_group(primary) {
         let own = open_root.join(format!("g{primary}-775/store"));
         assert!(refusal(&own).is_ok(), "{}", own.display());
     }
-    // An access ACL that lets another account write takes that back.
     let shared = open_root.join("acl-775/store");
     let why = refusal(&shared).expect_err("an ACL that grants write");
     assert!(why.contains("writable by other users"), "{why}");
@@ -2110,8 +2062,7 @@ fn the_install_path_walk_is_the_updaters_on_this_machine() {
 /// stand-in filesystem: over every pair of answers the two ACL attributes'
 /// length queries can give (it exists, `ENODATA`, `ENOTSUP`, another errno),
 /// the embedded verifier's `access_acl`, its `os.getxattr` standing in for
-/// the file, and the updater's `acl_carried` alike. A file on NFSv4, whose
-/// ACL is `system.nfs4_acl` with no POSIX attribute, carries one.
+/// the file, and the updater's `acl_carried` alike.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_acl_rule_is_the_updaters_on_a_stand_in_nfs4_file() {
@@ -2207,8 +2158,6 @@ fn the_filesystem_rule_is_the_updaters() {
         )
     }));
     calls.push("json:remote_filesystem|libc=null\t-\t\"/\"".into());
-    // A store whose one writable component is on this user's primary group,
-    // below a scratch root the walk admits.
     let open = aterm_tempfile::Builder::new()
         .prefix("install-sh-fs.")
         .tempdir_in(root)
@@ -2246,7 +2195,7 @@ fn the_filesystem_rule_is_the_updaters() {
     }
     assert_eq!(filesystem_type_at(Path::new("/proc")), Some(0x9FA0));
     assert_eq!(unloaded, ["ok\ttrue"], "no C library: remote");
-    // SAFETY: getgid has no preconditions and cannot fail.
+    // SAFETY: Getgid has no preconditions and cannot fail.
     let admitted = is_user_private_group(unsafe { libc::getgid() });
     assert_eq!(
         walks[0].starts_with("ok\t"),
@@ -2262,17 +2211,14 @@ fn the_filesystem_rule_is_the_updaters() {
 /// The passwd enumeration is the updater's on this machine's accounts: for
 /// root's group, this user's primary group and `nogroup`, the embedded
 /// verifier's `primary_members` (`getpwent_r` through ctypes) lists the uids
-/// the updater's does, in order. Its `private_group` refuses a group whose
-/// enumeration fails or names another account, which it must therefore ask:
-/// on a machine whose primary group is this user's private one, that group
-/// is private with the true enumeration and not with another account in it.
+/// the updater's does, in order.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_passwd_enumeration_is_the_updaters_on_this_machine() {
     use aterm_update::linux::install_path::{is_user_private_group, primary_members};
     let scratch = Scratch::new();
     let verifier = Verifier::new(&scratch);
-    // SAFETY: getuid and getgid have no preconditions and cannot fail.
+    // SAFETY: Getuid and getgid have no preconditions and cannot fail.
     let (uid, primary) = unsafe { (libc::getuid(), libc::getgid()) };
     let gids = [0, primary, 65534];
     let mut calls: Vec<String> = gids
@@ -2381,8 +2327,6 @@ fn what_the_installer_makes_its_verifier_admits_under_any_umask() {
             s(&store.join("not/yet"))
         ));
     }
-    // The pre-flight's refusal names the remedy for a directory of this user's
-    // that nothing private above it shields.
     let shared = open_root.join("shared");
     std::fs::create_dir(&shared).expect("mkdir");
     chmod(&shared, 0o757);
@@ -2392,14 +2336,9 @@ fn what_the_installer_makes_its_verifier_admits_under_any_umask() {
     ));
     let answers = ask_verifier(&scratch, &verifier, &install_sh(), &calls);
     let (last, admitted) = answers.split_last().expect("answers");
-    // The scratch root's chain is one the verifier admits (`scratch_root`).
     for answer in admitted {
         assert!(answer.starts_with("ok\t"), "{answer}");
     }
-    // The installer's own pre-flight, through the shell wrapper the run takes:
-    // the verifier's refusal becomes the skip reason, its prefix stripped. Its
-    // `python3` is the found 3.11+ (`Verifier::lib`): the system one may be
-    // older (macOS's /usr/bin/python3 is 3.9, without tomllib).
     let mut lib = verifier.lib(&install_sh());
     lib.env("STUB_MODE", "run").env(
         "STUB_MASTER_PUBKEYS",
@@ -2443,7 +2382,7 @@ fn what_the_installer_makes_its_verifier_admits_under_any_umask() {
 /// `0700`, as `$XDG_RUNTIME_DIR` is) contains `dir`.
 fn shielded(dir: &Path) -> bool {
     use std::os::unix::fs::MetadataExt as _;
-    // SAFETY: getuid has no preconditions and cannot fail.
+    // SAFETY: Getuid has no preconditions and cannot fail.
     let me = unsafe { libc::getuid() };
     dir.ancestors()
         .any(|a| std::fs::symlink_metadata(a).is_ok_and(|m| m.uid() == me && m.mode() & 0o077 == 0))
@@ -2477,14 +2416,12 @@ fn a_disabled_fresh_install_keeps_its_policy_on_retry() {
     let enrolled = scratch.mkdir("fresh/enrolled");
     state(&enrolled, &(header(&enrolled, true) + &identities[1]));
     stores.push(enrolled);
-    // A built identity with no digest is no fresh install's.
     let unbuilt = scratch.mkdir("fresh/unbuilt");
     state(
         &unbuilt,
         &(header(&unbuilt, false) + "[installed]\nbuild = 5\nsha256 = \"\"\n"),
     );
     stores.push(unbuilt);
-    // A disabled install whose trial awaits recovery has no target to vanish from.
     let trial = scratch.mkdir("fresh/trial");
     state(
         &trial,
@@ -2526,8 +2463,6 @@ fn a_revoked_machines_floor_is_withdrawn() {
     let mut case = Case::base(&keys);
     case.revoked = vec!["thief".into()];
     const BIG: u64 = 9_999_999_999;
-    // (name, the recorded min_build, the durable revocations, its sources, the build
-    // installed or a word of the refusal)
     type Sources<'a> = (&'a str, u64, &'a str, &'a str, Result<u64, &'a str>);
     let sources: [Sources<'_>; 8] = [
         (
@@ -2573,7 +2508,6 @@ fn a_revoked_machines_floor_is_withdrawn() {
             "[min_build_sources]\nbase = 9999999999\n[min_build_sources.machines]\nother = 9999999999\n",
             Ok(100),
         ),
-        // Sources that are no table are refused, never a crash.
         (
             "malformed",
             BIG,
@@ -2857,12 +2791,7 @@ fn an_older_release_is_judged_under_the_current_signed_policy() {
 }
 
 /// The verifier the installer pipes to `python3` imports nothing from the
-/// directory the install runs in. A piped install's working directory is
-/// wherever the person typed the command (`~/Downloads`), and `python3 -` puts it
-/// ahead of the standard library, so a `base64.py` there (the verifier's first
-/// import) would run inside the signature check. The real `python3` runs here;
-/// the argument-less call is refused either way. Negative control: the same
-/// verifier without `-I` imports the plant.
+/// directory the install runs in.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_verifier_imports_nothing_from_the_directory_the_install_runs_in() {

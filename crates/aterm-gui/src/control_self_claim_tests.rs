@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE PROVEN SELF-CLAIM ([`crate::self_claim`]) at the claim store and over a
-//! real connection: the claim rule, the replacement it buys, the clear when
-//! its process leaves, and — against a real process on a real pty, speaking
-//! over a real socket served by the real lanes — the kernel's peer pid that
-//! proves it, with a descendant and an inherited connection as the negative
-//! controls.
+//! Self-claim verification tests ([`crate::self_claim`]).
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
@@ -67,27 +62,20 @@ fn meta_changes(ctx: &crate::SessionCtx) -> Vec<String> {
 fn the_claim_rule_lets_only_a_proof_replace_and_only_a_proof_renew_a_proof() {
     let host = "aterm-harness@77";
     let me = "codex-alab@500";
-    // Nothing standing: anyone takes it.
     assert_eq!(claim_rule(None, false, me, false), ClaimRule::Take);
     assert_eq!(claim_rule(None, false, me, true), ClaimRule::Take);
-    // A proof replaces the window host's claim…
     assert_eq!(
         claim_rule(Some((host, false)), false, me, true),
         ClaimRule::Replace
     );
-    // …and a proven claim whose process is gone.
     assert_eq!(
         claim_rule(Some(("codex-alab@499", true)), true, me, true),
         ClaimRule::Replace
     );
-    // The same proven holder renews with a proof.
     assert_eq!(
         claim_rule(Some((me, true)), false, me, true),
         ClaimRule::Renew
     );
-    // NEGATIVE CONTROLS: an unproven request replaces nothing — not the
-    // host's, not a dead proof's — and never renews a proof (a forgery of
-    // the holder's spelling from a model's tool process);
     assert_eq!(
         claim_rule(Some((host, false)), false, me, false),
         ClaimRule::Busy
@@ -100,8 +88,6 @@ fn the_claim_rule_lets_only_a_proof_replace_and_only_a_proof_renew_a_proof() {
         claim_rule(Some((me, true)), false, me, false),
         ClaimRule::Busy
     );
-    // a proof replaces no other supervisor's claim, nor a proven claim whose
-    // process runs.
     assert_eq!(
         claim_rule(Some(("watcher@elsewhere", false)), false, me, true),
         ClaimRule::Busy
@@ -110,7 +96,6 @@ fn the_claim_rule_lets_only_a_proof_replace_and_only_a_proof_renew_a_proof() {
         claim_rule(Some(("codex-alab@499", true)), false, me, true),
         ClaimRule::Busy
     );
-    // An unproven claim's holder renews as before.
     assert_eq!(
         claim_rule(Some(("watcher", false)), false, "watcher", false),
         ClaimRule::Renew
@@ -122,17 +107,14 @@ fn a_proven_claim_replaces_the_hosts_and_a_dead_proofs_and_leaves_with_its_proce
     let h = crate::session_store::test_handle_on(7501, -1);
     let ctx = h.ctx.as_ref();
     let now = crate::metrics::now_us();
-    // The window host's loop holds the session.
     let host = format!("aterm-harness@{}", std::process::id());
     assert!(claim_supervisor_as(ctx, &host, None, None, None, now, aterm_slog::Actor::Ctl).is_ok());
-    // An unproven self-claim is an ordinary foreign claim: busy.
     let me = format!("codex-alab@{}", std::process::id());
     assert_eq!(
         claim_supervisor_as(ctx, &me, Some(1), None, None, now, aterm_slog::Actor::Ctl),
         Err(host.clone())
     );
     assert_eq!(shown(ctx), (Some(host.clone()), false));
-    // Proven: it replaces the host's, and says whose it replaced.
     let claimed = claim_supervisor_as(
         ctx,
         &me,
@@ -146,31 +128,24 @@ fn a_proven_claim_replaces_the_hosts_and_a_dead_proofs_and_leaves_with_its_proce
     assert!(claimed.changed);
     assert_eq!(claimed.replaced.as_deref(), Some(host.as_str()));
     assert_eq!(shown(ctx), (Some(me.clone()), true));
-    // A forgery of its spelling from another connection is refused and
-    // moves nothing: the claim stays bound and proven.
     assert_eq!(
         claim_supervisor_as(ctx, &me, Some(2), None, None, now, aterm_slog::Actor::Ctl),
         Err(me.clone())
     );
     assert_eq!(shown(ctx), (Some(me.clone()), true));
-    // The host's own claim cannot take it back.
     assert_eq!(
         claim_supervisor_as(ctx, &host, None, None, None, now, aterm_slog::Actor::Ctl),
         Err(me.clone())
     );
-    // While its process leads the group in front, the claim stands…
     let pid = i32::try_from(stand_in()).expect("a pid");
     assert!(!release_proven_if_gone(ctx, pid, now));
     assert_eq!(shown(ctx), (Some(me.clone()), true));
-    // …and once another group leads, it is cleared and recorded.
     assert!(release_proven_if_gone(ctx, pid + 1, now));
     assert_eq!(shown(ctx), (None, false));
     assert_eq!(
         meta_changes(ctx).last().map(String::as_str),
         Some("field=supervisor value=-")
     );
-    // A proven claim whose process is gone is replaced by a new proof, and
-    // cleared even while its pid is the one in front.
     assert!(
         claim_supervisor_as(
             ctx,
@@ -208,7 +183,6 @@ fn a_proven_claim_replaces_the_hosts_and_a_dead_proofs_and_leaves_with_its_proce
     )
     .expect("a proof replaces a dead proof");
     assert_eq!(claimed.replaced.as_deref(), Some(me.as_str()));
-    // An unproven claim is never cleared by the foreground's move.
     assert!(release_supervisor(ctx, None, now, aterm_slog::Actor::Ctl));
     assert!(
         claim_supervisor_as(
@@ -229,8 +203,7 @@ fn a_proven_claim_replaces_the_hosts_and_a_dead_proofs_and_leaves_with_its_proce
 /// THE FENCE (§2): a write fenced `if-supervisor=<holder>` passes only while
 /// that holder holds the live claim — the window host's, until a proven
 /// self-claim replaces it; then the host's is refused naming the new holder,
-/// and the self-claim's passes. NEGATIVE CONTROL: with no claim at all, a
-/// fenced write is refused (`-`).
+/// and the self-claim's passes.
 #[test]
 fn a_fenced_write_lands_only_under_its_holders_claim() {
     use crate::session_timeline::supervisor_fence;
@@ -268,8 +241,7 @@ fn a_fenced_write_lands_only_under_its_holders_claim() {
 /// THE FENCE HOLDS ACROSS THE WRITE (§2): a write the host's fence admitted
 /// and that is still in flight keeps a proven replacement from being
 /// answered until it lands, and once the replacement is answered every
-/// write under the host's fence is refused. NEGATIVE CONTROL: with no write
-/// in flight the replacement is answered at once.
+/// write under the host's fence is refused.
 #[test]
 fn a_replacement_waits_for_the_writes_the_replaced_fence_admitted() {
     use crate::session_timeline::FencedWrite;
@@ -297,7 +269,6 @@ fn a_replacement_waits_for_the_writes_the_replaced_fence_admitted() {
             answered_tx.send(claimed.map(|c| c.replaced)).expect("send");
         })
     };
-    // The claim moved (a new write reads the new holder)…
     let moved = Instant::now();
     while shown(&ctx).0.as_deref() != Some(me.as_str()) {
         assert!(
@@ -307,7 +278,6 @@ fn a_replacement_waits_for_the_writes_the_replaced_fence_admitted() {
         std::thread::yield_now();
     }
     assert!(FencedWrite::enter(&ctx, host, now).is_err());
-    // …but the replacement is not answered while the admitted write stands.
     assert!(
         answered.try_recv().is_err(),
         "answered under a write in flight"
@@ -324,7 +294,6 @@ fn a_replacement_waits_for_the_writes_the_replaced_fence_admitted() {
         FencedWrite::enter(&ctx, host, now).err().as_deref(),
         Some(format!("ERR busy supervisor={me}\n").as_str())
     );
-    // NEGATIVE CONTROL: nothing in flight, answered at once.
     assert!(release_supervisor(&ctx, None, now, aterm_slog::Actor::Ctl));
     assert!(claim_supervisor_as(&ctx, host, None, None, None, now, aterm_slog::Actor::Ctl).is_ok());
     assert!(
@@ -344,11 +313,6 @@ fn a_replacement_waits_for_the_writes_the_replaced_fence_admitted() {
 /// `meta set harness_act <act>` (§5): only the live PROVEN self-claim's
 /// holder records an act, on its claim's connection or on one the kernel
 /// proves again; it is one `harness-act` row and `status last_act=`.
-/// NEGATIVE CONTROLS: no claim, an unproven claim's own connection, and a
-/// proven claim's other connection with no proof are each `ERR denied` and
-/// record nothing.
-/// The native client's exact prepare/set exchange passes through the real meta
-/// dispatcher, including the landing mark and the task-face wake.
 #[test]
 fn bounded_harness_acts_prepare_and_publish_through_real_meta_dispatch() {
     use aterm_agent::harness::acts::TaskFace;
@@ -408,7 +372,6 @@ fn bounded_harness_acts_prepare_and_publish_through_real_meta_dispatch() {
         assert_eq!(timeline.landing_mark(), Some(mark));
         assert_eq!(timeline.take_self_tasks(), [TaskFace::Theirs]);
     }
-    // Ordinary callers keep their existing unbounded spelling.
     let (reply, wakes) = serve("set harness_act continue@v1", Some(2));
     assert_eq!(reply, "OK\n");
     assert!(matches!(
@@ -468,7 +431,6 @@ fn bounded_harness_acts_reject_expiry_and_stale_proof_without_publication() {
     };
     let bounded = format!("set harness_act left-to-person@v1 until_us={}", base + 100);
     let denied = ("ERR denied\n".to_string(), false);
-    // Neither a free session nor an unproven holder may prepare or publish.
     for proven in [false, true] {
         if proven {
             claim_supervisor_as(
@@ -498,7 +460,6 @@ fn bounded_harness_acts_reject_expiry_and_stale_proof_without_publication() {
         aterm_slog::Actor::Ctl,
     )
     .expect("proven holder");
-    // The two commands share the same connection/kernel identity admission.
     let reused = |_: &str| Some(gone());
     let replaced = |_: &str| {
         assert!(release_supervisor(ctx, None, base, aterm_slog::Actor::Ctl));
@@ -562,8 +523,6 @@ fn bounded_harness_acts_reject_expiry_and_stale_proof_without_publication() {
         ("ERR clock unavailable\n".to_string(), false)
     );
     clock.set(base);
-    // The request is fresh when admitted, but its off-lock identity proof
-    // finishes at the exact expiry. No old task face may reach later work.
     let expired = |_: &str| {
         clock.set(base + 100);
         Some(running())
@@ -573,7 +532,6 @@ fn bounded_harness_acts_reject_expiry_and_stale_proof_without_publication() {
         ("ERR expired harness_act\n".to_string(), false)
     );
     empty();
-    // The matching control is still valid one microsecond before expiry.
     clock.set(base);
     let fresh = |_: &str| {
         clock.set(base + 99);
@@ -604,10 +562,6 @@ fn a_harness_act_rechecks_claim_expiry_at_the_timeline_commit() {
             aterm_slog::Actor::Ctl,
         )
         .expect("standing proven claim");
-        // Advance the injected clock only once the timeline commit hold is
-        // acquired: the claim was live through the off-lock identity proof,
-        // but its TTL elapsed while waiting for that final lock. The act's
-        // own publication deadline remains valid, isolating claim authority.
         let clock = || {
             if ctx.timeline.try_lock().is_err() {
                 expires
@@ -663,7 +617,6 @@ fn only_a_proven_claims_holder_records_an_act() {
     };
     let denied = Some(("ERR denied\n".to_string(), false));
     let ok = Some(("OK\n".to_string(), true));
-    // Not this form: falls through to `meta`.
     assert_eq!(
         cmd_meta_harness_act(
             ctx,
@@ -679,7 +632,6 @@ fn only_a_proven_claims_holder_records_an_act() {
         cmd_meta_harness_act(ctx, None, Some(1), aterm_slog::Actor::Ctl, &proof, ""),
         None
     );
-    // No claim.
     assert_eq!(
         cmd_meta_harness_act(
             ctx,
@@ -702,7 +654,6 @@ fn only_a_proven_claims_holder_records_an_act() {
         ),
         denied
     );
-    // An unproven claim, on its own connection.
     let me = format!("codex-alab@{}", std::process::id());
     assert!(
         claim_supervisor_as(ctx, &me, Some(1), None, None, now, aterm_slog::Actor::Ctl).is_ok()
@@ -730,7 +681,6 @@ fn only_a_proven_claims_holder_records_an_act() {
         ),
         denied
     );
-    // Proven, bound to connection 2.
     assert!(release_supervisor(ctx, None, now, aterm_slog::Actor::Ctl));
     assert!(
         claim_supervisor_as(
@@ -755,7 +705,6 @@ fn only_a_proven_claims_holder_records_an_act() {
         ),
         ok
     );
-    // Another connection: only with the kernel's proof again.
     assert_eq!(
         cmd_meta_harness_act(
             ctx,
@@ -789,8 +738,6 @@ fn only_a_proven_claims_holder_records_an_act() {
         )
     );
     let before = acts(ctx);
-    // The pid alone is not identity: a reproof under another kernel start
-    // cannot speak for the standing claim.
     let reused = |_: &str| Some(gone());
     assert_eq!(
         cmd_meta_harness_act(
@@ -803,8 +750,6 @@ fn only_a_proven_claims_holder_records_an_act() {
         ),
         denied
     );
-    // A release and new claim can land during the off-lock kernel look.
-    // Even the same holder/pid/start cannot authorize the older request.
     let moved = |_: &str| {
         assert!(release_supervisor(ctx, None, now, aterm_slog::Actor::Ctl));
         assert!(
@@ -833,7 +778,6 @@ fn only_a_proven_claims_holder_records_an_act() {
         denied
     );
     assert_eq!(acts(ctx), before, "a stale act records nothing");
-    // Usage: no act, two, a token no owner key could be, and `unset`.
     let usage = Some((
         "ERR usage: meta prepare harness_act | meta set harness_act <act> [until_us=<n>]\n"
             .to_string(),
@@ -856,10 +800,6 @@ fn only_a_proven_claims_holder_records_an_act() {
             "{rest}"
         );
     }
-    // A landing's pre-admission reading belongs to the admitted act's
-    // commit, not a later caller-side write. Two admitted landings replace
-    // the mark in their commit order, including one reproved on another
-    // connection. Neither an ordinary act nor a refused landing replaces it.
     let landing = |program_turns, busy_entries| crate::session_timeline::LandingMark {
         program_turns,
         busy_entries,
@@ -924,8 +864,6 @@ fn only_a_proven_claims_holder_records_an_act() {
         "nor replaces the admitted mark"
     );
 
-    // A prepare grants only a bounded deadline under the same proven claim;
-    // it neither records an act nor changes a landing or queues a face.
     let _ = ctx.timeline.lock().unwrap().take_self_tasks();
     let before = acts(ctx);
     let base = 100;
@@ -955,8 +893,6 @@ fn only_a_proven_claims_holder_records_an_act() {
         }
         clock.get()
     };
-    // Both the full lease and final admissible microsecond commit the
-    // earlier count snapshot. No real sleep stands in for the boundary.
     for admitted in [base, until - 1] {
         clock.set(admitted);
         guarded_read.set(false);
@@ -983,7 +919,6 @@ fn only_a_proven_claims_holder_records_an_act() {
     for expired in [until, until + 1] {
         clock.set(base);
         guarded_read.set(false);
-        // Expiry during off-lock admission must still refuse at commit.
         let delayed_proof = |_: &str| {
             clock.set(expired);
             Some(running())
@@ -1012,8 +947,6 @@ fn only_a_proven_claims_holder_records_an_act() {
         );
         assert!(ctx.timeline.lock().unwrap().take_self_tasks().is_empty());
     }
-    // A forged longer horizon is not a lease, and an overflowing server
-    // clock cannot grant one. A prepare without another proof is refused.
     assert_eq!(
         cmd_meta_harness_act_with_clock(
             ctx,
@@ -1058,12 +991,7 @@ fn only_a_proven_claims_holder_records_an_act() {
 /// the hold that records the `harness-act` row, an act the log has a word
 /// for writes `mark act word=<w> rule=<act, @ written.> by=<the
 /// connection's actor> src=mark conf=claim`, and its wake is taken in that
-/// hold (the caller's change wake notifies). The mark lands on the deepest
-/// open node, as `aterm help` teaches (`mark <node> act`): the session (`-`)
-/// while nothing is open, the approval's step while one is. An act with no
-/// word (`finished@v1`) is a record too, `word=unknown` with no `rule=` (the
-/// review of 6F-7), its act whole at `harness_act=`. NEGATIVE CONTROL: a
-/// denied act writes neither row nor mark.
+/// hold (the caller's change wake notifies).
 #[test]
 fn a_proven_holders_act_is_one_act_mark_by_the_connection() {
     use super::control_session::cmd_meta_harness_act;
@@ -1119,7 +1047,6 @@ fn a_proven_holders_act_is_one_act_mark_by_the_connection() {
             .slog_take_wake(),
         "the act's wake was taken in its own hold"
     );
-    // An approval box opens: the next act lands on its step.
     let step = super::tests::with_open_approval(&h);
     assert_eq!(
         cmd_meta_harness_act(
@@ -1174,8 +1101,6 @@ fn a_proven_holders_act_is_one_act_mark_by_the_connection() {
         ),
     ];
     assert_eq!(marks(ctx), (3, want.clone()));
-    // NEGATIVE CONTROL: another connection with no proof is denied, and
-    // writes nothing.
     assert_eq!(
         cmd_meta_harness_act(
             ctx,
@@ -1218,7 +1143,6 @@ fn a_proven_claim_is_never_carried_across_an_update() {
         meta.handoff_supervisor(now, "aterm-harness@1"),
         (None, false)
     );
-    // Negative control: the same lease unproven is carried.
     assert!(release_supervisor(ctx, None, now, aterm_slog::Actor::Ctl));
     assert!(claim_supervisor_as(ctx, &me, None, ttl, None, now, aterm_slog::Actor::Ctl).is_ok());
     let meta = ctx
@@ -1242,8 +1166,6 @@ fn the_peer_pid_is_read_only_on_a_direct_connection() {
     );
     let direct = super::DirectPeer::enter();
     assert_eq!(serving_peer_pid(), Some(std::process::id()));
-    // A nested serve, including one that unwinds, cannot erase the outer
-    // request's peer context or leave its descriptor on a reusable thread.
     let nested = std::panic::catch_unwind(|| {
         let (_nested_client, nested_server) = CtlStream::pair().expect("nested pair");
         let _serving = ServingFd::enter(&nested_server);
@@ -1262,9 +1184,6 @@ fn the_peer_pid_is_read_only_on_a_direct_connection() {
 /// dispatch's `meta` arm does: [`super::control_session::cmd_meta_supervisor`]
 /// with the proof read from the connection and the session's PTY master
 /// ([`super::prove_self_claim_by`]), and every other `meta` as a bare read.
-/// `alab_image` is the image fact: the real one
-/// ([`crate::self_claim::runs_alab_build`]), or a stand-in that takes the
-/// claimant's `perl` for an ALab build.
 #[cfg(target_os = "macos")]
 struct MetaService {
     ctx: Arc<crate::SessionCtx>,
@@ -1344,8 +1263,7 @@ impl LaneService for MetaService {
 /// the pty's foreground group), connecting to `sock` and claiming
 /// `codex-alab@<pid>` — its own pid (`self`, and `ttl` with a lease), or,
 /// from a FORKED child (a descendant, as a model's tool process is), its
-/// parent's (`child`). It prints the reply and waits for its stdin to close
-/// with the connection open, so a connection-bound claim stands meanwhile.
+/// parent's (`child`).
 #[cfg(target_os = "macos")]
 const CLAIMANT: &str = r#"
 use IO::Socket::UNIX;
@@ -1371,7 +1289,7 @@ if ($mode eq "child") {
 "#;
 
 /// Own the claimant's process group and master, including on an assertion's
-/// unwind. Only this fixture's newly created group is ever killed.
+/// unwind.
 #[cfg(target_os = "macos")]
 struct Claimant {
     child: std::process::Child,
@@ -1382,9 +1300,7 @@ struct Claimant {
 #[cfg(target_os = "macos")]
 impl Claimant {
     fn kill_group(&self) {
-        // SAFETY: pre_exec made this fixture's freshly spawned child its own
-        // session and group leader before spawn returned. Signal that group
-        // alone, including the forked negative-control child.
+        // SAFETY: `pre_exec` made this child its own session and group leader.
         if let Ok(pid) = i32::try_from(self.child.id()) {
             unsafe { libc::kill(-pid, libc::SIGKILL) };
         }
@@ -1428,15 +1344,12 @@ fn claimant(sock: &std::path::Path, mode: &str) -> Claimant {
     use std::os::fd::{FromRawFd, OwnedFd};
     use std::os::unix::process::CommandExt;
     let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-    // SAFETY: both descriptors are fresh and owned by this fixture.
+    // SAFETY: Both descriptors are fresh and owned by this fixture.
     let master = unsafe { OwnedFd::from_raw_fd(master) };
     let slave = unsafe { OwnedFd::from_raw_fd(slave) };
     use std::os::fd::AsRawFd as _;
     aterm_pty::set_nonblocking(master.as_raw_fd(), true).expect("nonblocking master");
     let stdio = || std::process::Stdio::from(slave.try_clone().expect("dup slave"));
-    // std's Command on purpose: the pty child needs `pre_exec` (setsid +
-    // TIOCSCTTY), which spawnfd lacks; the strip first, so it holds its
-    // terminal and nothing else of this process.
     let mut program = std::process::Command::new("/usr/bin/perl");
     program
         .inherit_nothing()
@@ -1448,9 +1361,7 @@ fn claimant(sock: &std::path::Path, mode: &str) -> Claimant {
         .stdin(stdio())
         .stdout(stdio())
         .stderr(stdio());
-    // SAFETY: runs in the forked child before exec, after stdio is in place:
-    // `setsid` and `ioctl(TIOCSCTTY)` are async-signal-safe and touch nothing
-    // of the parent's.
+    // SAFETY: Runs in the forked child before exec, after stdio is in place.
     unsafe {
         program.pre_exec(|| {
             if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY.into(), 0) < 0 {
@@ -1478,8 +1389,7 @@ fn read_until_done(master: i32) -> String {
         aterm_spec::wait::MUST_HAPPEN,
         "the claimant reports DONE",
         || {
-            // SAFETY: reads into a local buffer from this fixture's open,
-            // nonblocking master, so the outer hang detector can always run.
+            // SAFETY: Reads into a local buffer from this fixture's open, nonblocking master.
             let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
             if n > 0 {
                 text.extend_from_slice(&buf[..usize::try_from(n).unwrap_or(0)]);
@@ -1508,11 +1418,6 @@ fn read_until_done(master: i32) -> String {
 /// claims under its own pid — proven (`supervisor_proven=1`), by the kernel's
 /// peer pid of that connection, the live `tcgetpgrp` of the master and its
 /// image (here a stand-in that takes `perl` for an ALab build).
-/// NEGATIVE CONTROLS: the same claim made from its forked child — a
-/// descendant, as a model's tool process is of the TUI — names the leader's
-/// pid but is not its connection's peer; with the REAL image fact, `perl`
-/// is no ALab build; and a `ttl=` lease is never proven. Each is an ordinary
-/// claim, unproven.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_claim_is_proven_by_its_connections_peer_leading_the_foreground() {
@@ -1575,7 +1480,6 @@ fn a_claim_is_proven_by_its_connections_peer_leading_the_foreground() {
             (Some(holder.clone()), want_proven),
             "{mode}: {said}"
         );
-        // `meta` prints it.
         let meta = super::control_session::cmd_meta(
             &handle.term,
             &crate::session_store::new_store(),
@@ -1592,12 +1496,8 @@ fn a_claim_is_proven_by_its_connections_peer_leading_the_foreground() {
             )),
             "{meta}"
         );
-        // End only this fixture's process group, then reap under the hang detector.
         claimant.kill_and_wait();
         if want_proven {
-            // Its process gone, the proven claim is cleared: by its
-            // connection's end, or at the sweep's next look, whichever is
-            // first.
             let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
             while shown(&handle.ctx) != (None, false) {
                 let _ = release_proven_if_gone(&handle.ctx, -1, crate::metrics::now_us());
@@ -1612,13 +1512,13 @@ fn a_claim_is_proven_by_its_connections_peer_leading_the_foreground() {
 }
 
 /// A frame header resolves before its full payload and before ordinary
-/// dispatch. Its real direct peer still counts against an unstarted shell.
+/// dispatch.
 #[test]
 fn a_startup_binary_header_is_counted_from_the_current_direct_peer() {
     let store = crate::session_store::new_store();
     let handle = crate::session_store::test_handle(907);
     let witness = Arc::clone(&handle.ctx.witness);
-    // SAFETY: getsid(0) reads this test process's own session identity.
+    // SAFETY: Getsid(0) reads this test process's own session identity.
     let leader = unsafe { libc::getsid(0) };
     assert!(leader > 0);
     witness.shell.set((leader, None)).expect("unobserved shell");
@@ -1668,14 +1568,13 @@ fn a_startup_binary_header_is_counted_from_the_current_direct_peer() {
     );
 }
 
-/// A subscription resolves on its new worker. The same scoped socket peer
-/// counts there, while a subscription with no direct lineage counts nothing.
+/// A subscription resolves on its new worker.
 #[test]
 fn a_startup_subscription_resolution_uses_its_scoped_peer() {
     let store = crate::session_store::new_store();
     let handle = crate::session_store::test_handle(908);
     let witness = Arc::clone(&handle.ctx.witness);
-    // SAFETY: getsid(0) reads only this test process's own session identity.
+    // SAFETY: Getsid(0) reads only this test process's own session identity.
     let leader = unsafe { libc::getsid(0) };
     assert!(leader > 0);
     witness.shell.set((leader, None)).expect("unobserved shell");

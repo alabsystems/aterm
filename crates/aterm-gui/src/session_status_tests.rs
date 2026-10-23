@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use crate::session_timeline::SessionTimeline;
 
 /// The record ends `seq=<n|-> hash=<hex16|->`, in that order: the pair a stamped report opens
+/// with and `history` can be held against.
 fn assert_stamp_rides_last(record: &str) {
     let stamp = record
         .rsplit_once(" seq=")
@@ -72,7 +73,7 @@ fn stale_claude_sample_cannot_restart_a_stopped_footer_watch() {
     assert!(!observer.footer_asked.contains_key(&7));
 }
 
-/// THE RE-ASK AT THE DRAWER'S EXEC EDGE (card engine §3.10). atpkg's shim
+/// THE RE-ASK AT THE DRAWER'S EXEC EDGE (card engine §3.10).
 #[test]
 fn an_exec_into_a_store_or_native_claude_asks_for_the_footer_again() {
     use atpkg::image::{ImageBuild, ImageSource, ProgramTag};
@@ -182,6 +183,8 @@ fn settle(fsm: &mut StatusFsm, ev: &Evidence, at: Instant) -> Instant {
 }
 
 /// cmd.exe's `%PROMPT%` integration marks prompts and never a command, so `ping
+/// -n 30 127.0.0.1` runs under the `Entering` block of the prompt it was typed
+/// at.
 #[test]
 fn a_prompt_only_shell_running_a_job_reads_running() {
     let t0 = Instant::now();
@@ -211,6 +214,9 @@ fn a_prompt_only_shell_running_a_job_reads_running() {
 }
 
 /// The other side of the line: a shell whose marks HAVE reported a command keeps
+/// its prompt's authority over a child it started in the background
+/// (`Start-Process notepad`), and a prompt-only shell with no live child stays
+/// idle on its prompt block.
 #[test]
 fn only_a_prompt_that_never_reported_a_command_yields_to_a_job() {
     for shell in [ShellEvidence::Prompt, ShellEvidence::Entering] {
@@ -251,6 +257,8 @@ fn only_a_prompt_that_never_reported_a_command_yields_to_a_job() {
 }
 
 /// What "reported a command" is read from: cmd.exe's prompt marks (A, B, then
+/// the typed line and its output, then the next prompt) never move the
+/// completed-command count; pwsh's C…D does.
 #[test]
 fn prompt_marks_alone_never_report_a_command() {
     use crate::quit_safety::shell_reports_commands;
@@ -276,6 +284,7 @@ fn prompt_marks_alone_never_report_a_command() {
 }
 
 /// Every phase has a wire spelling and the classifier produces each one: the `status` verb's
+/// vocabulary is exhaustive.
 #[test]
 fn every_phase_is_reachable_and_has_a_wire_spelling() {
     let spellings = [
@@ -342,6 +351,8 @@ fn alt_screen_transition_is_a_resync_not_activity() {
 }
 
 /// On a shell-integrated session, output that moves nothing reads `output_activity` (the
+/// `movement_reason` the foreground-job arm uses), so `ctl status` shows whether the movement
+/// clock is stale (`docs/EFFECTS-AND-WAKE-FOLLOWUPS-2026-08-24.md` item 21).
 #[test]
 fn executing_names_output_only_movement_as_output_activity() {
     let t0 = Instant::now();
@@ -381,6 +392,10 @@ fn executing_names_output_only_movement_as_output_activity() {
 }
 
 /// OUTPUT THAT MOVES NO CELL NEVER STARTS `Running`
+/// (docs/measured/vitals-multi-tab-2026-10-22.md): a program at rest whose
+/// writes mark no cell (Muse Code's SGR reset every ~9 s, Gemini CLI's OSC 11
+/// query once a minute) stays where it rests (`Quiet` with a foreground job,
+/// `Unknown` with no foreground evidence at all) and owes the sweep no wake.
 #[test]
 fn output_that_moves_no_cell_sustains_running_but_never_starts_it() {
     for (shell, job, rest) in [
@@ -446,6 +461,10 @@ fn published(phase: Phase, last_outcome: Outcome) -> Status {
 }
 
 /// A command Ctrl+C stopped reads as interrupted, not as a failure code:
+/// STATUS_CONTROL_C_EXIT, which a Windows console program (`ping -t` in pwsh,
+/// measured 2026-10-17 as `failed (exit -1073741510)`) and a pwsh line Ctrl+C
+/// stopped report, everywhere; Git Bash's 130 on Windows, so its tabs read as
+/// pwsh's.
 #[test]
 fn a_ctrl_c_exit_reads_as_interrupted() {
     let text = |phase, exit_code| {
@@ -518,6 +537,7 @@ fn indicators_map_work_and_failure_without_claiming_unsaved_state() {
 }
 
 /// End to end on the real fan-out: a background pane's transition reaches the tab its window
+/// renders, which a focus-addressed status path would miss.
 #[test]
 fn a_background_pane_going_busy_marks_its_tab() {
     use crate::tab_model::TabIndicators;
@@ -560,6 +580,8 @@ fn a_background_pane_going_busy_marks_its_tab() {
 }
 
 /// The classifier's bit (`status_attention`) is refolded from the leaves, never ORed back from
+/// the stored one: a cleared failure releases the tab while a native sibling's out-of-band
+/// `attention` survives.
 #[test]
 fn a_cleared_failure_releases_the_tab_while_a_native_sibling_keeps_its_own_mark() {
     let mut app = crate::App::headless_for_test();
@@ -629,6 +651,7 @@ fn a_cleared_failure_releases_the_tab_while_a_native_sibling_keeps_its_own_mark(
 }
 
 /// What the chrome shows: the fold both renderers and the introspection serializer read, not
+/// either owner's field alone.
 fn attention_of(app: &crate::App, wid: crate::WindowId, tab_id: crate::tab_model::TabId) -> bool {
     app.windows[&wid]
         .tab_set
@@ -653,6 +676,7 @@ fn settle_observer(
 }
 
 /// The sweep records each published transition as one `status-change` event on the session's
+/// timeline (RFC §7), which the `events` digest pushes as `EVENT <local> status …`.
 #[test]
 fn the_status_sweep_records_one_status_change_per_published_transition() {
     let mut app = crate::App::headless_for_test();
@@ -739,6 +763,9 @@ fn the_status_sweep_records_one_status_change_per_published_transition() {
 }
 
 /// A prompt reports only the block it closed ([`completed_block`]): the finished command behind
+/// a prompt, the current block while it is `Complete`, nothing while a command runs, and nothing
+/// when the prompt closed a block that never completed (an empty Enter, a replaced shell), so an
+/// older command's result never comes back.
 #[test]
 fn a_prompt_reports_the_block_it_closed_and_no_older_one() {
     let mut term = aterm_core::terminal::Terminal::new(24, 80);
@@ -780,6 +807,9 @@ fn a_prompt_reports_the_block_it_closed_and_no_older_one() {
 }
 
 /// A SCROLLBACK ERASE NEVER LEAVES THE STATUS ON AN EARLIER EXIT: the
+/// reviewer's probes through the real sweep, typed into a zsh-style prompt:
+/// `sh -c 'exit 6'`, a command that writes ED 3 and exits 5, and `clear; sh
+/// -c 'exit 4'` (macOS `clear` writes ED 3).
 #[test]
 fn a_scrollback_erase_never_leaves_the_status_on_an_earlier_exit() {
     let mut app = crate::App::headless_for_test();
@@ -855,6 +885,7 @@ fn a_scrollback_erase_never_leaves_the_status_on_an_earlier_exit() {
 }
 
 /// A session without shell integration has one failure edge, its lifecycle exit, and no block
+/// to tell failures apart: the mark arms once on the published edge and a look quiets it.
 #[test]
 fn a_session_without_shell_integration_arms_its_mark_on_the_published_edge() {
     let t0 = Instant::now();
@@ -874,6 +905,8 @@ fn a_session_without_shell_integration_arms_its_mark_on_the_published_edge() {
 }
 
 /// The flapping policy (RFC §15): a `status-change` event is taken only when the published phase
+/// or outcome moved, and dwell bounds how often that happens, so output alternating with silence
+/// faster than dwell yields at most one event per dwell interval.
 #[test]
 fn rapid_heuristic_transitions_append_at_most_one_status_event_per_dwell() {
     let fast = StatusPolicy {
@@ -928,7 +961,7 @@ fn rapid_heuristic_transitions_append_at_most_one_status_event_per_dwell() {
     );
 }
 
-/// A PTY exit publishes `Exited` immediately and stays there. Under `--hold` the pane outlives
+/// A PTY exit publishes `Exited` immediately and stays there.
 #[test]
 fn an_exited_pane_stays_exited_instead_of_reverting_to_ready() {
     let mut app = crate::App::headless_for_test();
@@ -1008,6 +1041,7 @@ fn a_collected_exit_code_becomes_the_outcome() {
 }
 
 /// A live policy edit reaches sessions that already exist: each FSM holds its own copy of the
+/// policy, so updating only the observer would leave open tabs on the old numbers.
 #[test]
 fn a_policy_edit_reaches_live_sessions_and_reopens_the_deadline() {
     let t0 = Instant::now();
@@ -1059,6 +1093,7 @@ fn a_policy_edit_reaches_live_sessions_and_reopens_the_deadline() {
 }
 
 /// `tab_status = false` is a real off: no classification at all, and the records already on
+/// screen are retired rather than frozen.
 #[test]
 fn turning_tab_status_off_stops_classifying_and_retires_the_records() {
     let mut app = crate::App::headless_for_test();
@@ -1093,6 +1128,7 @@ fn turning_tab_status_off_stops_classifying_and_retires_the_records() {
 }
 
 /// `tab_status_badge = false` keeps the record and only quiets the chrome: the two switches are
+/// independent.
 #[test]
 fn the_badge_switch_quiets_chrome_without_stopping_classification() {
     let mut app = crate::App::headless_for_test();
@@ -1115,6 +1151,9 @@ fn the_badge_switch_quiets_chrome_without_stopping_classification() {
 }
 
 /// `land_at=` AND `task=` (the Autopilot design, §9.3.5 and §9.4.1), on
+/// `status`, the `sessions` roster and the bare `meta`: `-` with nothing
+/// stored, just before the screen's stamp on `status` and last on the
+/// roster's row.
 #[test]
 fn the_status_record_and_the_roster_carry_land_at_and_task() {
     use aterm_agent::harness::acts::TaskFace;
@@ -1251,6 +1290,11 @@ fn the_status_record_and_the_roster_carry_land_at_and_task() {
 }
 
 /// `pause=` AFTER `task=` (the Autopilot design, §10.5.1), on `status` and
+/// the `sessions` roster: the unix second the loop's pause after short
+/// turns ends, told through the host's own wake (`App::apply_harness_fact`,
+/// `HarnessFact::Pause`), printed under `task=`'s rule — an agent session
+/// whose live claim THIS window's host holds — and `-` once the pause is
+/// over.
 #[test]
 fn the_status_record_and_the_roster_carry_the_pause_after_task() {
     const AT: i64 = 1_792_249_260;
@@ -1337,6 +1381,9 @@ fn the_status_record_and_the_roster_carry_the_pause_after_task() {
 }
 
 /// `autopilot=` beside `supervisor=` (the Autopilot design, §5): `-` for a session that runs no
+/// agent the harness supervises; once one does, its effective Autopilot (`off` with no host to
+/// supervise it, then the table's default under one, then the session's own word) on both arms
+/// of the record.
 #[test]
 fn the_status_record_carries_the_effective_autopilot_beside_supervisor() {
     let mut app = crate::App::headless_for_test();
@@ -1391,6 +1438,9 @@ fn the_status_record_carries_the_effective_autopilot_beside_supervisor() {
 }
 
 /// `launch=` and `launch_seq=` (the launch witness, `crate::launch_witness`)
+/// ride after `human_seq=` and are judged against THAT count: `person` while
+/// it is the mark's, `since` once a person's gesture moved it; the screen's
+/// stamp stays last.
 #[test]
 fn the_status_record_judges_the_launch_witness_by_its_own_count() {
     use crate::launch_witness::{Launch, Why};
@@ -1418,6 +1468,8 @@ fn the_status_record_judges_the_launch_witness_by_its_own_count() {
 }
 
 /// `editing=<n>` (amacs §6.7) counts the open `edit` tickets holding the
+/// session, just before the stamp: each ticket's hold adds one, and its
+/// resolve (or an orphan's lapse) takes it away again.
 #[test]
 fn status_reports_editing_count() {
     use crate::control_edit::hold::{self, Hold};
@@ -1602,6 +1654,10 @@ fn fabric_batch_does_not_wait_for_a_background_timeline_writer() {
 }
 
 /// The `status` verb's reply, the machine contract a poller parses: ONE
+/// line, `schema=1` first so a consumer can reject an unknown major, the
+/// `seq= hash=` stamp last, and the SAME keys in the same order on both
+/// arms — never classified and classified — so no field appears from
+/// nowhere and an additive field cannot land on one arm only.
 #[test]
 fn the_status_record_keeps_one_field_set_on_both_arms() {
     crate::fabric::with_link_reset(the_status_record_keeps_one_field_set_on_both_arms_body);
@@ -1694,6 +1750,8 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
 }
 
 /// `consent_at_risk` is emitted on the conjunction and nothing else: silent while the cwd is
+/// unknown (every session without shell integration), present once a reported cwd lands under
+/// a protected root.
 #[test]
 fn consent_at_risk_rides_the_reasons_token_only_on_the_conjunction() {
     assert_eq!(Reason::ConsentPrompt.as_str(), "consent_at_risk");
@@ -1734,7 +1792,7 @@ fn consent_at_risk_rides_the_reasons_token_only_on_the_conjunction() {
     }
 }
 
-/// A prompt is `Idle` however its grid moves. `EnteringCommand` is the steady
+/// A prompt is `Idle` however its grid moves.
 #[test]
 fn movement_at_a_prompt_publishes_nothing_and_owes_no_wake() {
     for shell in [ShellEvidence::Entering, ShellEvidence::Prompt] {
@@ -1775,6 +1833,8 @@ fn movement_at_a_prompt_publishes_nothing_and_owes_no_wake() {
 }
 
 /// A TUI that outputs without moving the grid (identical sync-bracketed repaints, heartbeats)
+/// keeps a `Running` its grid movement started alive through `output_recently` while
+/// `last_movement` goes stale, so the retire wake rides the fresher clock (`owed_wake` says why).
 #[test]
 fn output_without_movement_arms_the_retire_wake_off_the_freshest_clock() {
     let t0 = Instant::now();
@@ -1806,6 +1866,7 @@ fn output_without_movement_arms_the_retire_wake_off_the_freshest_clock() {
 }
 
 /// `next_wake` clamps every slot's owed instant to its own observation gate: `due()` refuses the
+/// slot until `next_due`, so an earlier deadline could only fire, be refused and re-arm.
 #[test]
 fn an_armed_wake_never_precedes_its_own_observation_gate() {
     let t0 = Instant::now();
@@ -1837,6 +1898,8 @@ fn an_armed_wake_never_precedes_its_own_observation_gate() {
 }
 
 /// The sweep skips a session whose terminal `try_lock` the PTY reader holds, a path that never
+/// reaches `observe`; `note_skipped` still advances the slot's `next_due`, or `next_wake` would
+/// re-arm the same past instant every turn under the sustained output that contends the lock.
 #[test]
 fn a_refused_sample_still_advances_the_observation_gate() {
     let t0 = Instant::now();
@@ -1886,6 +1949,8 @@ fn a_refused_sample_still_advances_the_observation_gate() {
 }
 
 /// The RFC §4 privacy rule as a table: the program's basename, an
+/// allow-listed subcommand at most, never an argument — and the wrappers,
+/// assignments and paths an agent's real command lines carry.
 #[test]
 fn command_detail_keeps_the_program_and_an_allowlisted_subcommand_only() {
     let cases: &[(&str, Option<&str>)] = &[
@@ -2009,6 +2074,12 @@ fn command_detail_keeps_the_program_and_an_allowlisted_subcommand_only() {
 }
 
 /// A quoted or escaped space is part of its word, so a program at a spaced
+/// path reads its name — the live upgrade's relaunch from `Application
+/// Support` read `detail=Application` (D3, 2026-09-26), and pwsh's backtick
+/// escape read `detail=Program` (0.95.0) — and that quote must never carry
+/// an ARGUMENT into `detail=`: the first D3 fix published `'t' --token
+/// SECRET`, a session id, and `tok`/`hunter2` from lines whose quoting POSIX
+/// and fish read differently.
 #[test]
 fn a_quoted_program_path_reads_its_name_and_never_an_argument() {
     let store = "Library/Application Support/aterm/pkg/agents/claude";
@@ -2142,6 +2213,7 @@ fn a_quoted_program_path_reads_its_name_and_never_an_argument() {
 }
 
 /// `executing_detail` is the one producer: an executing block names its (sanitized)
+/// command; a prompt, an entering block and a completed block name nothing.
 #[test]
 fn executing_detail_reads_only_an_executing_block() {
     let mut term = aterm_core::terminal::Terminal::new(24, 80);
@@ -2170,6 +2242,10 @@ fn executing_detail_reads_only_an_executing_block() {
 }
 
 /// A FULL CLEAR WHILE THE COMMAND RUNS (a program that clears and draws on
+/// the main screen): the engine moves the block's rows the clear blanked to
+/// the cleared screen's top row and its command rows are gone, so the scrape
+/// names nothing rather than what the program drew on the row the command
+/// was typed on; OSC 633;E's line still names it.
 #[test]
 fn a_full_clear_while_the_command_runs_never_names_what_the_program_drew() {
     for named in [false, true] {
@@ -2207,6 +2283,8 @@ fn a_full_clear_while_the_command_runs_never_names_what_the_program_drew() {
 }
 
 /// The `status` record's `detail=`: the sanitized running command while the block executes, `-`
+/// otherwise; answered before the classifier's first publish and never by waiting on a contended
+/// terminal.
 #[test]
 fn the_status_record_details_the_executing_block_and_nothing_else() {
     let mut app = crate::App::headless_for_test();
@@ -2272,6 +2350,7 @@ fn the_status_record_details_the_executing_block_and_nothing_else() {
 }
 
 /// The sweep folds `executing_detail` onto the published status ([`StatusObserver::set_detail`]):
+/// an Executing block publishes the sanitized program, and idle clears it.
 #[test]
 fn the_sweep_publishes_the_running_detail_onto_the_chrome_status() {
     let mut app = crate::App::headless_for_test();
@@ -2310,6 +2389,10 @@ fn the_sweep_publishes_the_running_detail_onto_the_chrome_status() {
 }
 
 /// `task_state=<state|-> task_rev=<n>` (2026-10-15), after `pause=`: the
+/// session's task record, read from the timeline leaf the agent columns come
+/// from — `-`/`0` for a session with no task, the state and rev once one is
+/// marked — and named apart from `task=`, the task's face under Land, which
+/// a session with no live claim here prints `-` whatever its record says.
 #[test]
 fn the_status_record_carries_the_task_record() {
     use crate::task_record::{TaskMark, TaskState, mark_session_task};
@@ -2337,6 +2420,8 @@ fn the_status_record_carries_the_task_record() {
 }
 
 /// `conpty=` names the console host a Windows session runs in, `-` for a key
+/// no pseudoconsole is behind, and is absent off Windows, where a live
+/// record keeps the bytes every earlier build wrote.
 #[test]
 fn the_conpty_field_names_the_host_on_windows_and_is_absent_elsewhere() {
     use aterm_pty::ConsoleHostKind;
@@ -2367,7 +2452,7 @@ fn the_conpty_field_names_the_host_on_windows_and_is_absent_elsewhere() {
     assert_eq!(record.contains(" conpty="), cfg!(windows), "{record}");
 }
 
-/// ONE FOREGROUND READ PER LOOK. The group in front (`tcgetpgrp` on the PTY
+/// ONE FOREGROUND READ PER LOOK.
 #[test]
 fn a_look_reads_the_foreground_group_once() {
     use std::cell::Cell;
@@ -2414,6 +2499,8 @@ fn a_look_reads_the_foreground_group_once() {
 }
 
 /// `status needs_n=` (Autopilot v5 §12.2.1): a harness's ask naming one more
+/// need reads `needs=ask needs_n=2`; a lone need `needs_n=1`; an approval,
+/// another owner's ask and no need `needs_n=-`.
 #[test]
 fn status_counts_a_harness_needs() {
     use aterm_types::needs::AttentionKind;

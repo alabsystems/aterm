@@ -35,6 +35,8 @@ impl Review for Notes {
 const NEED: &str = "the App Store signing credential";
 
 /// A turn that ended after 12 minutes of work, the worker's last words
+/// `lines` (the first under Claude Code's `⏺`, the rest beneath it), at an
+/// empty composer in bypass mode.
 fn said(lines: &[&str]) -> Vec<String> {
     let mut drawn = vec![format!("⏺ {}", lines[0])];
     drawn.extend(lines[1..].iter().map(|l| format!("  {l}")));
@@ -65,6 +67,8 @@ fn journaled(path: &Path, kind: &str) -> Vec<String> {
 }
 
 /// `screens` watched under Cruise, every screen of `gates` sitting until
+/// the loop's next act, journaled at a scratch journal of `tag`: the
+/// scripted server and that journal's path.
 fn watched(tag: &str, screens: Vec<Vec<String>>, gates: Vec<usize>) -> (Mock, PathBuf, PathBuf) {
     watched_with(tag, screens, gates, |_| {})
 }
@@ -100,6 +104,13 @@ fn watched_with(
 }
 
 /// THE WORKER'S NEEDS GO UP ONCE AND COME DOWN WHEN NONE STANDS: a report
+/// with a NEEDS YOU line puts the `needs` owner's entry up at its point —
+/// `meta set attention owner=needs kind=ask <program> needs you: <need> —
+/// carrying on` — journaled `NEEDS seq=<n> count=1 attention=OK <need>`; the
+/// busy reads after it and the same need said again at the next point put
+/// nothing more up and take nothing down; the worker's `NEEDS YOU: nothing`
+/// takes it down (`meta unset attention owner=needs`, journaled `CLEARED
+/// seq=<n> needs attention=OK …`).
 #[test]
 fn the_workers_needs_go_up_once_and_come_down_when_none_stands() {
     let (m, dir, journal) = watched(
@@ -165,6 +176,8 @@ fn the_workers_needs_go_up_once_and_come_down_when_none_stands() {
 }
 
 /// A NEW SET OF NEEDS IS PUT UP AGAIN: a second need beside the first is a
+/// new set, and the entry is set once more, naming the first need and how
+/// many more stand (`(+1 more)`), journaled `count=2`.
 #[test]
 fn a_new_set_of_needs_is_put_up_again() {
     let (m, dir, journal) = watched(
@@ -194,6 +207,10 @@ fn a_new_set_of_needs_is_put_up_again() {
 }
 
 /// AN OFF PARK AND THE LOOP'S END TAKE THE NEEDS ENTRY DOWN
+/// (`Session::lower_badges`, `Session::release_attention`): `meta unset
+/// attention owner=needs`, journaled `CLEARED seq=<n> needs attention=OK
+/// <why>` — the session's autopilot off, the loop ended — and never as an
+/// escalation's badge.
 #[test]
 fn an_off_park_and_the_loops_end_take_the_needs_entry_down() {
     let entry = format!("claude needs you: {NEED} — carrying on");
@@ -259,6 +276,9 @@ fn an_off_park_and_the_loops_end_take_the_needs_entry_down() {
 }
 
 /// THE WORKER'S NEEDS ARE NEVER PUT UP BEHIND ANOTHER SUPERVISOR'S CLAIM: a
+/// loop watching behind a holder (a proven self-claim's codex-alab raises
+/// its own) folds the point and its NEEDS YOU line in, and sends no
+/// `owner=needs` request and journals no `NEEDS`.
 #[test]
 fn the_workers_needs_are_never_put_up_behind_another_supervisors_claim() {
     let run = |behind: bool| {
@@ -311,6 +331,11 @@ fn the_workers_needs_are_never_put_up_behind_another_supervisors_claim() {
 }
 
 /// A PERSON'S TURN TAKES THE NEEDS DOWN: the worker's NEEDS YOU is up, and
+/// a person, at the keyboard through the point (their grace holds the
+/// loop's act), types a turn of their own — someone else's turn, after
+/// which the need no longer stands (the policy forgets it there) — so the
+/// entry comes down at that turn's end, journaled `CLEARED … needs … none
+/// stands now`.
 #[test]
 fn a_persons_turn_takes_the_needs_down() {
     let run = |person: bool| {
@@ -372,6 +397,9 @@ fn left_entry() -> String {
 }
 
 /// A NEEDS ENTRY A LOOP BEFORE THIS ONE LEFT COMES DOWN AT THE FIRST POINT
+/// WHERE NO NEED STANDS (`lifecycle.rs`'s `reconcile`, `escalate.rs`'s
+/// `NEEDS_LEFT`): a loop that crashed left `owner=needs` up, which no loop
+/// would ever take down, so the menu bar said "needs you" for ever.
 #[test]
 fn a_needs_entry_left_by_a_loop_before_comes_down_at_the_first_point() {
     let run = |left: bool, behind: bool, screen: Vec<String>| {
@@ -444,6 +472,9 @@ fn a_needs_entry_left_by_a_loop_before_comes_down_at_the_first_point() {
 }
 
 /// THE WHOLE LOOP TAKES A LEFT NEEDS ENTRY DOWN AT ITS FIRST POINT: the
+/// watch's start reads the entry a loop before it left, and the first
+/// point, naming no need, takes it down, journaled with the start's reason
+/// — once: the loop's end has nothing left to take down.
 #[test]
 fn the_loop_takes_a_left_needs_entry_down_at_its_first_point() {
     let screens = || {
@@ -478,6 +509,7 @@ fn the_loop_takes_a_left_needs_entry_down_at_its_first_point() {
 }
 
 /// codex-alab's own NEEDS YOU entry, as it raises it beside its proven
+/// self-claim (the contract's §5 NEEDS YOU row).
 fn self_claims_entry() -> String {
     format!("Codex needs you: {NEED} — carrying on")
 }
@@ -486,6 +518,13 @@ fn self_claims_entry() -> String {
 const SELF_CLAIM: &str = "codex-alab@4242";
 
 /// BESIDE A PROVEN SELF-CLAIM THE NEEDS ENTRY IS NEVER THIS LOOP'S (the
+/// codex-alab contract's §5 NEEDS YOU row; `beside.rs`'s
+/// `needs_not_ours`): codex-alab raises and takes down `owner=needs`
+/// itself, so the hosted loop watching beside it — through a report naming
+/// a need, the worker's `NEEDS YOU: nothing`, and an Off park — sends no
+/// `owner=needs` request (none even refused locally: nothing of it is
+/// journaled), and codex-alab's standing entry is left as it stands, never
+/// adopted as one a loop before this one left.
 #[test]
 fn beside_a_proven_self_claim_the_loop_never_writes_or_unsets_the_needs_entry() {
     let run = |beside: bool, word: &'static str| {
@@ -563,6 +602,11 @@ fn beside_a_proven_self_claim_the_loop_never_writes_or_unsets_the_needs_entry() 
 }
 
 /// BESIDE A PROVEN SELF-CLAIM NOTHING IS UNSET, WHATEVER THE CLAIM'S STATE
+/// AT THAT MOMENT (`beside.rs`'s `needs_not_ours`, not the claim alone): a
+/// set this loop holds told — however it came to — is only forgotten at an
+/// Off park whose claim was given back (`Claim::GivenBack`, which watches
+/// behind no one) and at the loop's end after its claim went
+/// (`Claim::Off`), never taken down: the entry is codex-alab's.
 #[test]
 fn beside_a_self_claim_a_given_back_or_released_claim_unsets_no_needs_entry() {
     let lowered = |beside: bool, claim: claim::Claim, end: bool| {
@@ -619,6 +663,7 @@ fn beside_a_self_claim_a_given_back_or_released_claim_unsets_no_needs_entry() {
 }
 
 /// A need of 150 characters: whole on the window's host, cut to the entry's
+/// 64 cells on the wire.
 const LONG_NEED: &str = "grant Screen Recording to com.aterm.aterm in System Settings ▸ Privacy \
                          & Security ▸ Screen Recording, so the windowed checks can capture the \
                          menu bars";
@@ -627,6 +672,7 @@ const LONG_NEED: &str = "grant Screen Recording to com.aterm.aterm in System Set
 const NEEDS_DOOR: &str = "host.needs_standing";
 
 /// A window's host that keeps every NEEDS YOU set it is told
+/// ([`IdleHost::needs_standing`]), with the entry's text it was told with.
 #[derive(Debug, Default)]
 struct Hears {
     told: Mutex<Vec<(Vec<String>, String)>>,
@@ -660,6 +706,10 @@ impl IdleHost for Hears {
 }
 
 /// `screens` watched under Cruise with `host` as the window's, every screen
+/// of `gates` sitting until the loop's next act, RECORDED, beside a proven
+/// self-claim when `beside` (codex-alab's own entry standing): the scripted
+/// server and the recorded run, whose tape replays (strict and in acts mode)
+/// as recorded.
 fn heard(
     screens: Vec<Vec<String>>,
     gates: Vec<usize>,
@@ -670,6 +720,7 @@ fn heard(
 }
 
 /// [`heard`], the scripted server answering the `owner=needs` requests with
+/// `replies` first (none left: `OK`).
 fn heard_with(
     screens: Vec<Vec<String>>,
     gates: Vec<usize>,
@@ -707,6 +758,8 @@ fn heard_with(
 }
 
 /// The recorded run's tells of the needs set and its `owner=needs`
+/// requests, in the tape's order: `host <entry>` for a tell, `ctl set` or
+/// `ctl unset` for a request.
 fn needs_doors(run: &RecordedWatch) -> Vec<String> {
     let read = crate::supervise::tape::recover::recover(&run.tape.sink.bytes());
     read.items
@@ -730,6 +783,7 @@ fn needs_doors(run: &RecordedWatch) -> Vec<String> {
 }
 
 /// The report of a run's NEEDS YOU set: [`LONG_NEED`] said at two points in
+/// turn, then `NEEDS YOU: nothing`.
 fn long_need_then_none() -> Vec<Vec<String>> {
     vec![
         busy_screen(),
@@ -748,6 +802,13 @@ fn long_need_then_none() -> Vec<Vec<String>> {
 }
 
 /// THE HOST HEARS THE WHOLE SET BEFORE THE ENTRY GOES UP
+/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.3, §12.2.6): over a
+/// recorded run, the window's host is told the set — a 150-character need
+/// whole, where the entry carries it cut at 64 cells — and the entry's exact
+/// text BEFORE the `meta set attention owner=needs` that puts it up, and
+/// `(&[], "")` before the `unset` that takes it down; told once per change:
+/// nothing at the busy reads, nothing at the next point that says the same
+/// need.
 #[test]
 fn the_host_hears_the_whole_set_before_the_entry_goes_up() {
     assert_eq!(LONG_NEED.chars().count(), 150);
@@ -806,6 +867,8 @@ fn the_host_hears_the_whole_set_before_the_entry_goes_up() {
 }
 
 /// The window's host, the scripted server's `owner=needs` requests and the
+/// entry it holds after [`NEED`]'s point is decided and carried out
+/// `edges` times, the server answering those requests with `replies` first.
 fn told_at_one_point(replies: Vec<CtlReply>, edges: usize) -> (Arc<Hears>, Mock) {
     let mut m = Mock::new(vec![needing("Pushed the parser fix; the release is next.")]);
     m.autopilot = Some("cruise");
@@ -835,6 +898,9 @@ fn told_at_one_point(replies: Vec<CtlReply>, edges: usize) -> (Arc<Hears>, Mock)
 }
 
 /// A CAP'S REFUSAL TELLS THE HOST THE CUT TEXT (§12.2.3): the server refuses
+/// the entry as too long for a tighter cap than the loop's own, the loop
+/// cuts it to that cap and sets it again — and tells the host again first,
+/// with the cut text, so what the host holds is the text the server stores.
 #[test]
 fn a_cap_refusal_tells_the_host_the_cut_text() {
     let (host, m) = told_at_one_point(vec![err("attention too long (max 40 bytes)")], 1);
@@ -862,6 +928,10 @@ fn a_cap_refusal_tells_the_host_the_cut_text() {
 }
 
 /// A REQUEST THE CONNECTION LOST TELLS THE HOST NOTHING TWICE: the set's
+/// first `meta set` is lost (the server replaced under it), so the next
+/// point sends it again — the same set, the same text — and the host, told
+/// before the first, is not told again: once per change, never where nothing
+/// moved.
 #[test]
 fn a_lost_request_tells_the_host_nothing_twice() {
     let (host, m) = told_at_one_point(
@@ -886,6 +956,11 @@ fn a_lost_request_tells_the_host_nothing_twice() {
 }
 
 /// A SET THAT MOVES UNDER THE SAME ENTRY IS TOLD (§12.2.3 item 2): `[A, B]`
+/// and then `[A, C]` put up the same entry (`claude needs you: A (+1 more)
+/// — carrying on`), so only the window's host can learn that the second
+/// need moved: it is told each set whole, the same entry's text with each,
+/// and then the take-down, while the loop sends the entry again for the
+/// moved set.
 #[test]
 fn a_set_that_moves_under_the_same_entry_is_told() {
     let (a, b, c) = (
@@ -936,6 +1011,10 @@ fn a_set_that_moves_under_the_same_entry_is_told() {
 }
 
 /// A LOST REQUEST LEAVES THE WINDOW TOLD WHAT STANDS: each tell comes
+/// before its request, so a request the connection lost leaves the
+/// window's host told what never landed — (a) the take-down of an entry
+/// whose `unset` was lost twice and that still stands, (b) another set
+/// whose `meta set` was lost twice while the first stands.
 #[test]
 fn a_lost_request_leaves_the_window_told_what_stands() {
     let lost = || replaced("aterm (pid 10) went away before it answered (exit 75)");
@@ -1053,6 +1132,12 @@ fn a_lost_request_leaves_the_window_told_what_stands() {
 }
 
 /// THE WINDOW FORGETS WITH THE LOOP WHERE THE ENTRY STOPS BEING ITS OWN
+/// (`Session::needs_not_ours`): a set this loop put up and told, then a
+/// claim behind another supervisor, then an Off park — the loop forgets
+/// its set and sends nothing (the entry is the other's to keep), and the
+/// window's host is told `(&[], "")`, so it keeps no words for an entry
+/// this loop no longer holds; the claim back and the same set named again,
+/// the host hears it again with the entry put up again.
 #[test]
 fn the_window_forgets_with_the_loop_where_the_entry_stops_being_ours() {
     let mut m = Mock::new(vec![needing("Pushed the parser fix; the release is next.")]);
@@ -1123,6 +1208,9 @@ fn the_window_forgets_with_the_loop_where_the_entry_stops_being_ours() {
 }
 
 /// A TAPE RECORDED BEFORE THE HOST HEARD THE SET (`docs/DESIGN-harness-autopilot-2026-10-15.md`
+/// §12.7, "the engine lift"): the recorded run of
+/// [`the_host_hears_the_whole_set_before_the_entry_goes_up`] with its
+/// `host.needs_standing` outputs taken off, as a build before them taped it.
 #[test]
 fn an_old_tape_replays_in_acts_mode_and_strictly_differs_at_the_new_call() {
     use crate::supervise::tape::replay::{Options, replay};
@@ -1175,6 +1263,11 @@ fn an_old_tape_replays_in_acts_mode_and_strictly_differs_at_the_new_call() {
 }
 
 /// A LOOP'S FIRST POINT READS A REPLY CUT AT THE ROWS' TOP WHOLE ON AGY
+/// (`TurnEndState::reads_turn_whole`; the review of b9/spawn-residuals, F1):
+/// a reply whose `NEEDS YOU:` row is above the screen, in the history, its
+/// message's caret row with it, is read up to that message and its need put
+/// up — a successor's first read after a seamless update, a restart after a
+/// fault, Off to Land.
 #[test]
 fn a_first_point_reads_a_reply_cut_at_the_rows_top_whole() {
     use aterm_phase::agy::fixtures::lab::WORKER_FIRST_PROMPT;
@@ -1311,6 +1404,8 @@ fn a_first_point_reads_a_reply_cut_at_the_rows_top_whole() {
 }
 
 /// The measured column-0 cells of agy's screen
+/// `aterm_phase::agy::fixtures::lab::PERSON_PARAGRAPHS_LONG_REPLY`, by grid
+/// row (`supervise/fixtures/agy-1.4.0-lab-person-paragraphs-long-reply.cells`).
 fn agy_paragraph_cells() -> BTreeMap<(usize, usize), String> {
     include_str!("fixtures/agy-1.4.0-lab-person-paragraphs-long-reply.cells")
         .lines()
@@ -1323,6 +1418,13 @@ fn agy_paragraph_cells() -> BTreeMap<(usize, usize), String> {
 }
 
 /// A PERSON'S PARAGRAPHS IN AGY ARE NEVER AGY'S NEED
+/// (`Session::message_bounded_by_cells`; lab r16o): on agy's measured screen
+/// of a person's message of two paragraphs — the second `NEEDS YOU: the
+/// person's own words after a blank line.`, agy's blank row between them
+/// like the one that ends the message — under the stub's long reply, the
+/// loop reads the message's column-0 cells (the measured ones), takes the
+/// blank row drawn in its caret row's style out of the message, and puts up
+/// no need at the point: the reply is agy's alone.
 #[test]
 fn a_persons_paragraphs_in_agy_are_never_its_need() {
     use aterm_phase::agy::fixtures::lab::PERSON_PARAGRAPHS_LONG_REPLY;
@@ -1416,6 +1518,8 @@ fn a_persons_paragraphs_in_agy_are_never_its_need() {
 }
 
 /// What the cells say of agy's screen at a loop's point (the runs of the
+/// tests below): the screen read, [`Mock::cells`] for its grid rows or
+/// none readable, and the history above it with [`Mock::history_cells`].
 struct AgyCells {
     shown: Vec<String>,
     cells: Option<BTreeMap<(usize, usize), String>>,
@@ -1436,6 +1540,8 @@ struct AgyPoint {
 }
 
 /// A loop's point under Cruise on agy's screen as `at` serves it, as
+/// `a_persons_paragraphs_in_agy_are_never_its_need` runs one; the entry it
+/// put up, if any, names the needs standing.
 fn agy_point(at: AgyCells) -> AgyPoint {
     let mut m = Mock::new(vec![at.shown.clone()]);
     m.program = "agy";
@@ -1492,6 +1598,11 @@ fn agy_point(at: AgyCells) -> AgyPoint {
 }
 
 /// The measured screen `PERSON_PARAGRAPHS_LONG_REPLY` with its reply drawn
+/// `more` paragraphs of three longer (the stub's three again, a blank row
+/// before each, as agy draws a reply's paragraphs: DRAWN, not measured),
+/// and its cells: the measured ones, the rows drawn in a reply's
+/// (`d0d0d0`, no attribute, as every measured reply row's), the composer's
+/// moved down with it.
 fn agy_long_reply(more: usize) -> (Vec<String>, BTreeMap<(usize, usize), String>) {
     use aterm_phase::agy::fixtures::lab::PERSON_PARAGRAPHS_LONG_REPLY;
     use aterm_phase::prompt::fixtures::screen;
@@ -1534,6 +1645,7 @@ fn agy_long_reply(more: usize) -> (Vec<String>, BTreeMap<(usize, usize), String>
 const THEIRS: &str = "the person's own words after a blank line.";
 
 /// `shown` with the first row from the bottom that starts with `prefix`
+/// agy's own need, two columns in as its reply's rows.
 fn agys_need_at(shown: &[String], prefix: &str) -> Vec<String> {
     let mut rows = shown.to_vec();
     let at = rows
@@ -1545,6 +1657,13 @@ fn agys_need_at(shown: &[String], prefix: &str) -> Vec<String> {
 }
 
 /// A PERSON'S PARAGRAPHS ABOVE THE ROWS READ ARE NEVER AGY'S NEED:
+/// on a pane taller than the loop's 40-row tail
+/// whose reply under the person's message runs past it — the message's
+/// caret row, its blank row and its `NEEDS YOU:` paragraph above the tail's
+/// first row, so its read bounds nothing and the reply reads cut at the
+/// rows' top — the point's read of the turn whole reads the grid and bounds
+/// the message there by its cells (`cell <r> 0` of the grid's rows), and no
+/// need stands; agy's own need in that reply still does, alone.
 #[test]
 fn a_persons_paragraphs_above_the_rows_read_are_never_agys_need() {
     let (shown, cells) = agy_long_reply(3);
@@ -1590,6 +1709,14 @@ fn a_persons_paragraphs_above_the_rows_read_are_never_agys_need() {
 }
 
 /// A PERSON'S PARAGRAPHS SCROLLED INTO THE HISTORY ARE NEVER AGY'S NEED:
+/// the person's message's caret row, its
+/// blank row and its `NEEDS YOU:` paragraph scrolled up out of the grid, its
+/// reply's later rows and the composer on it, the point's read of the turn
+/// whole joins the history above the grid and bounds the message there by
+/// the cells of the history's rows (`cell abs=<n> 0`, which reads a history
+/// row's cells as they were drawn: `aterm-gui`'s
+/// `a_history_rows_cell_reads_as_it_did_on_the_screen`), and no need
+/// stands; agy's own need in that reply still does, alone.
 #[test]
 fn a_persons_paragraphs_scrolled_into_the_history_are_never_agys_need() {
     let (drawn, cells) = agy_long_reply(3);
@@ -1639,6 +1766,17 @@ fn a_persons_paragraphs_scrolled_into_the_history_are_never_agys_need() {
 }
 
 /// A MESSAGE'S CELLS FOLD NOTHING THEY DO NOT PROVE
+/// (`Session::message_cells`): on agy's
+/// measured screen, the message's blank rows are taken out only where the
+/// caret row's cell reads agy's caret, every blank row taken out reads a
+/// blank in its style, and a plain blank row under them ends the message —
+/// otherwise the screen stays as its text reads (FAIL TOWARD A KEPT NEED):
+/// every blank row read in the caret's style (no row ends the message)
+/// keeps agy's own need in its reply standing; a blank row that reads a
+/// glyph, or reads nothing, under the message keeps agy's need on its
+/// reply's first row standing; a caret row whose cell reads no `>` (the
+/// screen moved under the reads) folds nothing, and the person's paragraph
+/// stands as the text reads it.
 #[test]
 fn a_messages_cells_fold_nothing_they_do_not_prove() {
     use aterm_phase::agy::fixtures::lab::PERSON_PARAGRAPHS_LONG_REPLY;

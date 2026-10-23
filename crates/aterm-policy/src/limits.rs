@@ -38,8 +38,9 @@ pub struct TokenBucket {
     /// Token refill rate in tokens-per-second.
     refill_per_second: u64,
     /// Hard cap on a single `try_consume(amount)` call, independent of
+    /// the bucket level.
     per_sequence_max: u64,
-    /// Last refill instant. `None` until the first `try_consume` seeds it,
+    /// Last refill instant.
     last_refill: Option<Instant>,
 }
 
@@ -145,7 +146,7 @@ impl RateLimitSlot {
 pub struct RateLimiterSet {
     /// One bucket per DISTINCT declared id, in first-declaration order.
     buckets: Vec<TokenBucket>,
-    /// Declared id → its index in `buckets`. Consulted by the string-keyed
+    /// Declared id → its index in `buckets`.
     slots: HashMap<String, usize>,
 }
 

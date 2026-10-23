@@ -1,51 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The fx layers on the GPU (`docs/DESIGN-card-engine-2026-10-19.md` §4.6):
-//! the [`FxInstance`] stream, the append-only [`FxAtlas`], the per-frame
-//! palette, and the arm-neutral residency every arm's tail syncs from.
-//!
-//! **One slicer.** The engine's `aterm_render::slice_layers` decides which
-//! slices a frame draws, under the same `row_active` band gate as every other
-//! stream, with the clips and the occluder subtraction the CPU stamps by. Each
-//! slice becomes one 32-byte instance that names its ITEM (origin, kind, atlas
-//! region, palette base), never its pixels, so the three fragment twins
-//! (`fs_fx`, `fs_fx_linear`) re-derive pixel law F per pixel from the
-//! absolute pixel and the unclamped origin, exactly as the CPU does.
-//!
-//! **The origin mod 2¹⁶.** An item's origin is an `i64` (a layer offset plus
-//! an item position plus the grid shift); the instance stores it modulo 2¹⁶ as
-//! the `i16` bit pattern. Every slice lies inside its item's box, whose sides
-//! are `u16`, so the item-local pixel `l = p − O` lies in `[0, 2¹⁶)` and
-//! `(p − O₁₆) mod 2¹⁶` IS `l`: no origin is ever out of range and no item is
-//! culled for one (the design's "cull by clip first" is not needed).
-//!
-//! **The palette is per frame, never a shared texture.** Every frame that
-//! draws fx instances concatenates the palettes of the layers it draws (each
-//! content once, in first-drawn order) and the arm uploads them through its
-//! per-frame ring: a Metal frame-slot `ArmStream` bound as `device const
-//! uint*`, a wgpu storage buffer written on the queue, a GL ring of three
-//! palette textures. A word is the entry's RGBA bytes read little-endian
-//! (`r | g << 8 | b << 16 | a << 24`), so one byte stream serves the buffer
-//! arms and the GL texture alike. At rest nothing is built or uploaded.
-//!
-//! **The atlas is append-only.** Two textures, `R8Unorm` (Index8) and
-//! `Rgba8Unorm` (Premul and Straight), each minted on its first art, start at
-//! 512² and double to a 4096² cap. Residency is keyed by `FxArt::id` within an
-//! atlas generation; a resident region is never rewritten. When a frame's arts
-//! do not fit, a new generation is minted holding only the arts the frame
-//! references (compaction); frames in flight keep the old texture alive. Arts
-//! are held by `Arc` in the generation's log, so any arm (a re-minted Metal
-//! arm, a GL context on another display, a lost device) refills completely
-//! from the CPU side.
+//! The fx layers on the GPU (`docs/DESIGN-card-engine-2026-10-19.md` §4.6).
 
 use super::*;
 use aterm_core::render::{FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxSlot, FxTexels};
 use aterm_render::{FxBudget, FxFrame, FxSlice, FxSliceSink, FxSlicer, GlowQuad};
 
-/// One band slice of one fx item, as the vertex stage reads it
-/// ([`pipeline_table::FX_LAYOUT`]). Every field is an integer the fragment
-/// reads flat: pixel law F has no interpolant.
+/// One band slice of one fx item, as the vertex stage reads it ([`pipeline_table::FX_LAYOUT`]).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FxInstance {
@@ -53,16 +15,13 @@ pub(crate) struct FxInstance {
     pub(crate) rect: [u16; 4],
     /// The item's window-pixel origin `O` modulo 2¹⁶ (the module header).
     pub(crate) origin: [i16; 2],
-    /// A sprite's destination size `(dw, dh)`; `[0, 0]` for Rect and Ramps.
+    /// A sprite's destination size `(dw, dh)`.
     pub(crate) dst: [u16; 2],
-    /// A sprite's atlas region `(x, y, w, h)`; `[w, 0, 0, 0]` for Rect and
-    /// Ramps (the ramp width).
+    /// A sprite's atlas region `(x, y, w, h)`.
     pub(crate) src: [u16; 4],
-    /// The absolute palette entry the item's `ink` names in this frame's
-    /// palette.
+    /// The absolute palette entry the item's `ink` names in this frame's palette.
     pub(crate) pal: u32,
-    /// Kind, flip, texel kind and Index8 reach ([`FX_KIND_SPRITE`] and its
-    /// siblings).
+    /// Kind, flip, texel kind and Index8 reach ([`FX_KIND_SPRITE`] and its siblings).
     pub(crate) flags: u32,
 }
 impl_pod_zeroable!(FxInstance {
@@ -75,41 +34,35 @@ impl_pod_zeroable!(FxInstance {
 });
 const _: () = assert!(std::mem::size_of::<FxInstance>() as u64 == pipeline_table::FX_LAYOUT.stride);
 
-/// `flags` bits 0-1: a Rect (one ramp over entries `pal`, `pal + 1`).
+/// `flags` bits 0-1.
 pub(crate) const FX_KIND_RECT: u32 = 0;
-/// `flags` bits 0-1: Ramps (row `r` ramps over `pal + 2r`, `pal + 2r + 1`).
+/// `flags` bits 0-1.
 pub(crate) const FX_KIND_RAMPS: u32 = 1;
-/// `flags` bits 0-1: a Sprite (texels from the atlas region `src`).
+/// `flags` bits 0-1.
 pub(crate) const FX_KIND_SPRITE: u32 = 2;
-/// `flags` bit 2: mirror a sprite horizontally.
+/// `flags` bit 2.
 pub(crate) const FX_FLIP: u32 = 1 << 2;
-/// `flags` bits 3-4: the texel kind (0 Index8, 1 Rgba8Premul, 2
-/// Rgba8Straight).
+/// `flags` bits 3-4.
 pub(crate) const FX_TEXELS_SHIFT: u32 = 3;
-/// `flags` bits 8-15: an Index8 sprite's reach, the indices `1..=reach` that
-/// name a palette entry (`min(255, len − ink)`).
+/// `flags` bits 8-15.
 pub(crate) const FX_REACH_SHIFT: u32 = 8;
 
-/// The atlas's first side, and its cap (also clamped to the device's 2-D
-/// texture limit, [`GpuRenderer::fx_atlas_cap`]).
+/// The atlas's first side, and its cap (also clamped to the device's 2-D texture limit, [`GpuRenderer::fx_atlas_cap`]).
 pub(crate) const FX_ATLAS_MIN: u32 = 512;
 pub(crate) const FX_ATLAS_CAP: u32 = 4096;
 
-/// The fx streams a frame draws, by `(slot, blend)`. Each is one instanced
-/// draw at its slot (design §4.5), staged as its `StreamId::Fx*` twin.
+/// The fx streams a frame draws, by `(slot, blend)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FxStream {
-    /// Linear layers at Under: `G_BASE_BG` right after the under-text free
-    /// sprites (the sRGB view).
+    /// Linear layers at Under.
     LinearUnder = 0,
-    /// Exact layers at Under: `G_GLOW_UNDER` right after `glow_under`.
+    /// Exact layers at Under.
     Under,
-    /// Exact layers at Glow: `G_GLOW` right after the cursor aurora.
+    /// Exact layers at Glow.
     Glow,
-    /// Exact layers at Over: `G_GLOW` right after the nova light.
+    /// Exact layers at Over.
     Over,
-    /// Linear layers at Over: `G_FREE_OVER` right after the over-text free
-    /// sprites.
+    /// Linear layers at Over.
     LinearOver,
 }
 
@@ -117,8 +70,7 @@ pub(crate) enum FxStream {
 pub(crate) const FX_STREAM_COUNT: usize = FxStream::LinearOver as usize + 1;
 
 impl FxStream {
-    /// The stream a layer draws into, or `None` for the one placement the
-    /// engine refuses (a Linear layer at Glow: the CPU draws it nowhere).
+    /// The stream a layer draws into, or `None` for the one placement the engine refuses (a Linear layer at Glow: the CPU draws it nowhere).
     #[inline]
     pub(crate) const fn of(slot: FxSlot, blend: FxBlend) -> Option<Self> {
         match (slot, blend) {
@@ -132,21 +84,18 @@ impl FxStream {
     }
 }
 
-/// A palette entry as its frame-palette word: the RGBA bytes read
-/// little-endian.
+/// A palette entry as its frame-palette word.
 #[inline]
 pub(crate) const fn palette_word(ink: FxInk) -> u32 {
     let c = ink.color;
     ((c >> 16) & 0xff) | (((c >> 8) & 0xff) << 8) | ((c & 0xff) << 16) | ((ink.alpha as u32) << 24)
 }
 
-/// Palette entries per row of the GL arm's palette texture (`cell.glsl`
-/// fetches entry `j` at `(j % 1024, j / 1024)`).
+/// Palette entries per row of the GL arm's palette texture (`cell.glsl` fetches entry `j` at `(j % 1024, j / 1024)`).
 #[cfg(gl_arm)]
 pub(crate) const FX_PALETTE_ROW: u32 = 1024;
 
-/// The GL arm's palette ring depth: three textures written in turn, the
-/// depth of the Metal arm's frame-slot ring its palette stream lives in.
+/// The GL arm's palette ring depth.
 #[cfg(gl_arm)]
 pub(crate) const FX_PALETTE_RING: usize = 3;
 
@@ -155,7 +104,7 @@ pub(crate) const FX_PALETTE_RING: usize = 3;
 pub(crate) enum FxAtlasKind {
     /// `R8Unorm`: Index8 arts.
     R8 = 0,
-    /// `Rgba8Unorm`: Rgba8Premul and Rgba8Straight arts.
+    /// `Rgba8Unorm`.
     Rgba = 1,
 }
 
@@ -205,9 +154,7 @@ struct Shelf {
     x: u32,
 }
 
-/// A best-fit shelf packer over a `side × side` square. No gutter: the
-/// fragment reads texels by integer address, never filtered, so a neighbour's
-/// texel is never sampled.
+/// A best-fit shelf packer over a `side × side` square.
 #[derive(Debug, Default)]
 struct ShelfPack {
     side: u32,
@@ -255,8 +202,7 @@ impl ShelfPack {
     }
 }
 
-/// One of the two fx atlases, CPU side: the packer, the residency of the
-/// current generation, and its upload log.
+/// One of the two fx atlases, CPU side.
 #[derive(Debug)]
 pub(crate) struct FxAtlasSide {
     kind: FxAtlasKind,
@@ -270,14 +216,11 @@ pub(crate) struct FxAtlasSide {
     log: Vec<(Arc<FxArt>, [u16; 4])>,
     /// Prefetched arts this generation's mint could not place beside the
     /// arts the frame drew; skipped as hints until the next mint, so an
-    /// overfull prefetch cannot re-mint every frame. A frame that DRAWS one
-    /// places it all the same.
+    /// overfull prefetch cannot re-mint every frame.
     unfit_hint: FxHashSet<u128>,
     /// Drawn arts this generation's mint could not place: only on a device
     /// whose 2-D texture limit holds the cap below 4096 (at 4096 every art
     /// set the frame budget admits fits, `aterm_core::render::FX_FRAME_ART_TEXELS`).
-    /// Their items draw nothing until the next mint, without re-minting
-    /// every frame.
     unfit_drawn: FxHashSet<u128>,
 }
 
@@ -353,7 +296,6 @@ impl FxAtlasSide {
     }
 
     fn record(&mut self, art: &Arc<FxArt>, x: u32, y: u32) {
-        // The side is at most the 4096 cap, so every coordinate is a `u16`.
         let region = [x as u16, y as u16, art.w(), art.h()];
         self.resident.insert(art.id(), region);
         self.log.push((Arc::clone(art), region));
@@ -362,9 +304,7 @@ impl FxAtlasSide {
     /// Mint a new generation holding `draw`, then what of `hint` fits beside
     /// it, each tallest first: at the smallest side from the current one (512
     /// at the first) doubling to `cap` that holds them all, or at `cap` with
-    /// what fits. The drawn arts pack first on a fresh texture, so at the 4096
-    /// cap every set the frame budget admits fits whatever the hints
-    /// (`aterm_core::render::FX_FRAME_ART_TEXELS`).
+    /// what fits.
     fn mint(&mut self, draw: &[Arc<FxArt>], hint: &[Arc<FxArt>], cap: u32) {
         let tallest_first = |arts: &[Arc<FxArt>]| {
             let mut order: Vec<Arc<FxArt>> = arts.to_vec();
@@ -441,8 +381,7 @@ impl FxAtlas {
     }
 }
 
-/// The renderer's fx state: the atlases, the frame palette, the slicer's
-/// scratch and the per-frame counts `metrics` reads.
+/// The renderer's fx state.
 #[derive(Debug, Default)]
 pub(crate) struct FxGpu {
     pub(crate) atlas: FxAtlas,
@@ -450,8 +389,7 @@ pub(crate) struct FxGpu {
     /// This frame's palette words.
     pub(crate) palette: Vec<u32>,
     /// `(content pointer, base)` of the contents drawn this frame: each
-    /// content's palette is appended once. Frame-local (the layers outlive the
-    /// build), so pointer identity is sound.
+    /// content's palette is appended once.
     bases: Vec<(usize, u32)>,
     /// The content identities and draw eligibility the last admission saw:
     /// slot and blend filter the sprite walk, even when content is unchanged.
@@ -466,10 +404,7 @@ pub(crate) struct FxGpu {
     /// The frame art budget's ruling the admission reads (the slicer rules
     /// the same one for the instances).
     budget: FxBudget,
-    /// Sprite items refused this frame, drawing nothing: those the frame art
-    /// budget refuses (on every backend alike), and, on a device whose
-    /// texture limit holds the atlas below 4096², those whose art the atlas
-    /// could not hold (`fx_refused_last`).
+    /// Sprite items refused this frame, drawing nothing.
     pub(crate) refused: u64,
     /// Atlas bytes the arm uploaded for this frame (set by the arm's sync).
     pub(crate) atlas_bytes: u64,
@@ -480,10 +415,7 @@ pub(crate) struct FxGpu {
 }
 
 impl FxGpu {
-    /// Make every art this frame's layers draw, and every prefetched art,
-    /// resident in the CPU atlases. Nothing happens when the layer contents
-    /// are the same `Arc`s with the same slots and blends, and the prefetch
-    /// list is the same `Arc`s as at the last admission.
+    /// Make every art this frame's layers draw, and every prefetched art, resident in the CPU atlases.
     pub(crate) fn admit(&mut self, layers: &[FxLayer], prefetch: &[Arc<FxArt>], cap: u32) {
         let same = self.memo_cap == cap
             && self.memo_contents.len() == layers.len()
@@ -502,8 +434,6 @@ impl FxGpu {
             w.clear();
         }
         self.seen.clear();
-        // The arts the frame draws are exactly the slicer's: its drawn
-        // sprites less those the frame budget refuses.
         self.budget.rule(layers);
         let Self {
             want, seen, budget, ..
@@ -534,9 +464,7 @@ impl FxGpu {
         self.memo_cap = cap;
     }
 
-    /// Whether `prefetch` is the list the last admission saw (identity): its
-    /// arts are resident, or known not to fit, so a frame that re-presents
-    /// cached pixels owes it nothing (`render_input_cached`'s gate).
+    /// Whether `prefetch` is the list the last admission saw (identity).
     #[inline]
     pub(crate) fn prefetch_admitted(&self, prefetch: &[Arc<FxArt>]) -> bool {
         self.memo_prefetch.len() == prefetch.len()
@@ -547,9 +475,7 @@ impl FxGpu {
                 .all(|(m, p)| Arc::ptr_eq(m, p))
     }
 
-    /// Build this frame's fx instances into `out` (one vector per
-    /// [`FxStream`], cleared first) and its palette, slicing every layer
-    /// under `band_open`. The atlases must have admitted this frame's layers.
+    /// Build this frame's fx instances into `out` (one vector per [`FxStream`], cleared first) and its palette, slicing every layer under `band_open`.
     pub(crate) fn build(
         &mut self,
         f: &FxFrame,
@@ -587,9 +513,7 @@ impl FxGpu {
         self.refused = sink.refused + self.slicer.budget().refused_items();
     }
 
-    /// The bloom source of this frame's `bloom` layers appended to
-    /// `cursor_glow_add`'s quads, or `None` when no layer blooms (the caller
-    /// then reads `cursor_glow_add` alone, allocation-free).
+    /// Append this frame's `bloom` layers to `cursor_glow_add`, or return `None` when no layer blooms.
     pub(crate) fn bloom_source<'s>(
         &'s mut self,
         f: &FxFrame,
@@ -612,16 +536,13 @@ impl FxGpu {
     }
 }
 
-/// Whether a frame feeds the bloom: the cursor aurora, or an fx layer that
-/// blooms. The one gate every bloom site reads (with `enable_bloom`).
+/// Whether a frame feeds the bloom.
 #[inline]
 pub(crate) fn bloom_source_live(input: &RenderInput) -> bool {
     !input.cursor_glow_add.is_empty() || input.fx_layers.iter().any(|l| l.bloom)
 }
 
-/// Whether the present's crown (the HDR or SDR aurora boost over the bloom
-/// source) has light to read: an aurora quad on the grid, or a `bloom` fx
-/// layer. The crown draws only a non-empty source.
+/// Whether the present's crown (the HDR or SDR aurora boost over the bloom source) has light to read.
 #[inline]
 pub(crate) fn crown_glow_present(input: &RenderInput) -> bool {
     input
@@ -667,18 +588,14 @@ impl<'a> FxSliceSink<'a> for FxBuild<'_, 'a> {
             return false;
         };
         let len = layer.content.palette().len() as u64;
-        // `len − ink`, the entries from `ink` on (0 past the palette).
         let reach_of = |ink: u32| len.saturating_sub(u64::from(ink));
         let (flags, dst, src, ink, reads_palette, y_limit) = match item {
-            // Both ramp ends must exist, or the CPU draws nothing.
             FxItem::Rect(r) => {
                 if reach_of(r.ink) < 2 {
                     return false;
                 }
                 (FX_KIND_RECT, [0, 0], [r.w, 0, 0, 0], r.ink, true, i64::MAX)
             }
-            // Row r reads entries ink + 2r and ink + 2r + 1: the first
-            // `reach / 2` rows have both, the rest write nothing.
             FxItem::Ramps(r) => {
                 let rows = reach_of(r.ink) / 2;
                 if rows == 0 {
@@ -701,14 +618,12 @@ impl<'a> FxSliceSink<'a> for FxBuild<'_, 'a> {
                     return false;
                 }
                 let Some(region) = self.atlas.region(art) else {
-                    // Not resident (an unfit art): fail closed.
                     self.refused += 1;
                     return false;
                 };
                 let flip = if sp.flip_x { FX_FLIP } else { 0 };
                 let (texels, reads_palette) = match art.texels() {
                     FxTexels::Index8 => {
-                        // Indices 1..=reach name an entry; the rest, nothing.
                         let reach = reach_of(sp.ink).min(255);
                         if reach == 0 {
                             return false;
@@ -716,7 +631,6 @@ impl<'a> FxSliceSink<'a> for FxBuild<'_, 'a> {
                         ((reach as u32) << FX_REACH_SHIFT, true)
                     }
                     FxTexels::Rgba8Premul => (1 << FX_TEXELS_SHIFT, false),
-                    // The tint entry must exist, or the CPU draws nothing.
                     FxTexels::Rgba8Straight => {
                         if reach_of(sp.ink) == 0 {
                             return false;
@@ -734,7 +648,6 @@ impl<'a> FxSliceSink<'a> for FxBuild<'_, 'a> {
                 )
             }
         };
-        // The origin mod 2¹⁶, as the `i16` bit pattern (the module header).
         let wrap = |v: i64| v.rem_euclid(1 << 16) as u16 as i16;
         self.cur = Some((
             FxCur {
@@ -776,8 +689,6 @@ impl<'a> FxSliceSink<'a> for FxBuild<'_, 'a> {
         } else {
             0
         };
-        // A slice lies in the frame, whose sides the framebuffer clamp holds
-        // below 2¹⁶.
         self.out[cur.stream as usize].push(FxInstance {
             rect: [
                 s.x0 as u16,
@@ -794,20 +705,14 @@ impl<'a> FxSliceSink<'a> for FxBuild<'_, 'a> {
     }
 }
 
-/// One arm's texture of one fx atlas: the generation it holds and how much of
-/// that generation's log it has uploaded.
+/// One arm's texture of one fx atlas.
 pub(crate) struct FxArmTex {
     pub(crate) tex: crate::device_layer::LayerTexture,
     generation: u64,
     uploaded: usize,
 }
 
-/// Bring an arm's texture of `side` up to date: a texture of another
-/// generation (or none, or one `fresh` rejects: a GL name on another context)
-/// is re-minted and filled with the whole log; a current one gets the log's
-/// new arts appended, each in its own fresh region, after `before_append`
-/// (Metal settles the frames that may sample it). Before the first mint the
-/// texture is a 1×1 placeholder that no instance reads.
+/// Bring an arm's texture of `side` up to date.
 pub(crate) fn sync_fx_tex(
     handle: crate::device_layer::DeviceHandle<'_>,
     slot: &mut Option<FxArmTex>,
@@ -878,10 +783,7 @@ pub(crate) struct FxSynced {
     pub(crate) appended: bool,
 }
 
-/// Whether an arm must sync its texture of `side` this frame: always when the
-/// frame draws fx (both bindings must exist), else only to make prefetched
-/// arts resident (a generation the arm does not hold yet, or new log
-/// entries). At rest, neither.
+/// Whether an arm must sync its texture of `side` this frame.
 #[inline]
 pub(crate) fn fx_tex_due(slot: &Option<FxArmTex>, side: &FxAtlasSide, drawing: bool) -> bool {
     drawing
@@ -954,7 +856,6 @@ mod tests {
                 assert!(apart, "{a:?} overlaps {b:?}");
             }
         }
-        // An append keeps every resident region and the generation.
         let more: Vec<_> = small.iter().cloned().chain([art(30, 30, 99)]).collect();
         fx.admit(&[sprite_layer(&more)], &[], FX_ATLAS_CAP);
         let side = fx.atlas.side(FxAtlasKind::R8);
@@ -966,8 +867,6 @@ mod tests {
                 "a resident region never moves"
             );
         }
-        // Overflow: a frame of arts that cannot all fit at 512 mints a new,
-        // larger generation holding only them.
         let big: Vec<_> = (0..12).map(|i| art(200, 150, 100 + i)).collect();
         fx.admit(&[sprite_layer(&big)], &[], FX_ATLAS_CAP);
         let side = fx.atlas.side(FxAtlasKind::R8);
@@ -979,7 +878,6 @@ mod tests {
             "compaction keeps only the frame's arts"
         );
         assert!(small.iter().all(|a| side.region(a.id()).is_none()));
-        // An unchanged frame admits nothing.
         let layers = [sprite_layer(&big)];
         fx.admit(&layers, &[], FX_ATLAS_CAP);
         let mints = fx.atlas.side(FxAtlasKind::R8).generation();
@@ -989,9 +887,7 @@ mod tests {
 
     /// On a device whose texture limit holds the cap below an art (here 512
     /// against a 600-wide art), the art is unfit: refused and counted, its
-    /// items draw nothing, and the frame does not re-mint for it again. At
-    /// the 4096 cap no art the engine admits is ever unfit
-    /// ([`every_frame_within_the_art_budget_is_resident`]).
+    /// items draw nothing, and the frame does not re-mint for it again.
     #[test]
     fn an_art_past_the_cap_fails_closed_without_thrashing() {
         let mut fx = FxGpu::default();
@@ -1002,8 +898,6 @@ mod tests {
         assert!(side.region(arts[0].id()).is_some());
         assert!(side.region(arts[1].id()).is_none());
         let mints = side.generation();
-        // A new frame with the same arts (new layer identity) re-admits but
-        // does not mint for the unfit art.
         fx.admit(&[sprite_layer(&arts)], &[], 512);
         assert_eq!(fx.atlas.side(FxAtlasKind::R8).generation(), mints);
         let f = FxFrame {
@@ -1024,15 +918,7 @@ mod tests {
     /// arts keep the budget's law (each side at most half the cap, at most a
     /// quarter of the cap's area in all) is wholly resident after admission,
     /// in disjoint regions, whatever the generation held before and whatever
-    /// the prefetch asks beside it. The law is scale-free (the 4096 cap with
-    /// `FX_ART_MAX_SIDE` and `FX_FRAME_ART_TEXELS` is this at 16×), so the
-    /// history runs at a 256 cap: 400 frames of tall, flat, square and small
-    /// arts, recurring and new, that append and compact; then the full-scale
-    /// extremes at 4096.
-    ///
-    /// Hand mutation (run when written): a mint that packs the prefetch with
-    /// the drawn arts, all tallest first (the first as-built mint), leaves a
-    /// drawn art out at frame 115.
+    /// the prefetch asks beside it.
     #[test]
     fn every_frame_within_the_art_budget_is_resident() {
         let mut rng = 0x2545_f491_4f6c_dd1du64;
@@ -1045,7 +931,6 @@ mod tests {
         let mut serial = 0u32;
         let mut fresh = |w: u32, h: u32| {
             serial += 1;
-            // The serial in the first bytes keeps every art's id distinct.
             let mut data = vec![1u8; (w * h) as usize];
             for (b, s) in data.iter_mut().zip(serial.to_le_bytes()) {
                 *b = s;
@@ -1110,7 +995,6 @@ mod tests {
                 (arts, seen)
             };
             let (draw, drawn) = pick(budget >> next(3), &mut next, &mut pool);
-            // One frame in four also prefetches, up to four budgets.
             let hinted = if next(4) == 0 { 4 * budget } else { 0 };
             let (hint, _) = pick(hinted, &mut next, &mut pool);
             let hint: Vec<_> = hint
@@ -1130,9 +1014,6 @@ mod tests {
             mints > 40 && appends > 40,
             "the history compacts ({mints} mints) and appends ({appends})"
         );
-        // The full scale's extremes: one art of the largest side, two that
-        // fill the budget, and the budget in one-texel-wide columns; each
-        // under a prefetch of the largest arts.
         let max = u32::from(aterm_core::render::FX_ART_MAX_SIDE);
         let extremes = [
             vec![fresh(max, max)],
@@ -1158,8 +1039,6 @@ mod tests {
     #[test]
     fn instances_name_their_item_and_palettes_append_once() {
         let mut fx = FxGpu::default();
-        // Two additive entries, then two source-over ones (a rect's ends
-        // share a mode).
         let palette = vec![
             FxInk::add(0x10_20_30),
             FxInk::add(0x11_22_33),
@@ -1168,8 +1047,6 @@ mod tests {
         ];
         let content = Arc::new(FxContent::new(
             vec![
-                // Reaches from far left of the frame into it: its origin
-                // wraps, its local pixel does not.
                 FxItem::Rect(FxRect {
                     x: -65_000,
                     y: 6,
@@ -1216,7 +1093,6 @@ mod tests {
             2 * 2 * 2,
             "two layers of two rects, each cut at y = 8"
         );
-        // −65000 mod 2¹⁶ = 536: the fragment's (p − 536) mod 2¹⁶ is p + 65000.
         let wide: Vec<_> = under.iter().filter(|i| i.src[0] == 65_535).collect();
         assert_eq!(wide.len(), 4);
         assert!(wide.iter().all(|i| i.origin == [536, 6] && i.pal == 2));
@@ -1224,15 +1100,11 @@ mod tests {
         let narrow: Vec<_> = under.iter().filter(|i| i.src[0] == 4).collect();
         assert!(narrow.iter().all(|i| i.origin == [2, 6] && i.pal == 0));
         assert!(under.iter().all(|i| i.flags == FX_KIND_RECT));
-        // Band gating: with only band 1 open, only the lower halves build.
         fx.build(&f, &layers, &[], |b| b == 1, &mut out);
         let under = &out[FxStream::Under as usize];
         assert_eq!(under.len(), 4);
         assert!(under.iter().all(|i| i.rect[1] == 8 && i.rect[3] == 3));
 
-        // Draw eligibility may change through the public layer fields while
-        // the sealed content stays the same Arc. An initially refused slot
-        // or blend must not memoize that refusal into a later valid frame.
         let art = Arc::new(
             FxArt::new(1, 1, FxTexels::Rgba8Straight, vec![10, 20, 30, 255]).expect("sized"),
         );
@@ -1253,8 +1125,6 @@ mod tests {
             ("slot", FxSlot::Glow, FxBlend::Linear),
             ("blend", FxSlot::Under, FxBlend::Exact),
         ] {
-            // Construct validly, then exercise the renderer's fail-closed
-            // public-field policy, without bypassing its debug constructor.
             let mut layer = FxLayer::new(
                 3,
                 Arc::clone(&linear),

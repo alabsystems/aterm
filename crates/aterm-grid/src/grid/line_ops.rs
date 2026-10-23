@@ -8,6 +8,10 @@ use crate::row::LineSize;
 
 impl Grid {
     /// Whether ICH/DCH shift the cursor row's cells only inside
+    /// `[cursor, right_bound)` (the bounded row ops) rather than through the
+    /// row's end: under a DECSLRM margin (`margined`), and wherever
+    /// `right_bound` stops short of the row, as on a DECDWL/DECDHL row, whose
+    /// line is its first half (`effective_cols_for_row`).
     #[inline]
     const fn shift_is_bounded(&self, right_bound: u16, margined: bool) -> bool {
         margined || right_bound < self.storage.cols
@@ -847,6 +851,9 @@ mod tests {
     }
 
     /// ICH shifts the rest of the cursor row right (dropping what passes the
+    /// edge), DCH shifts it left (blank-filling the end), ECH blanks in place;
+    /// each clamps its count to the row, leaves the other rows alone and
+    /// consumes the pending wrap.
     #[test]
     fn char_ops_edit_only_the_cursor_row() {
         use CharOp::*;
@@ -890,6 +897,9 @@ mod tests {
     }
 
     /// IL inserts blank rows at the cursor row and DL deletes rows there,
+    /// shifting only the rest of the scroll region (rows past it are pushed
+    /// out or blank-filled), clamping the count to the region, and homing the
+    /// cursor column; a zero count or a cursor outside the region is a no-op.
     #[test]
     fn line_ops_shift_rows_within_the_region() {
         type Case<'a> = (
@@ -1045,6 +1055,8 @@ mod tests {
     }
 
     /// IL and DL with DECLRMM active are no-ops when the cursor column is
+    /// outside the horizontal margins, even when the cursor row is inside the
+    /// vertical scroll region.
     #[test]
     fn test_il_and_dl_margined_cursor_col_outside_margins_are_noops() {
         type Op = fn(&mut Grid);
@@ -1073,6 +1085,7 @@ mod tests {
     }
 
     /// Inside both margins and region, margined IL still shifts (guard does not
+    /// over-fire).
     #[test]
     fn test_il_margined_cursor_inside_margins_still_shifts() {
         let mut grid = Grid::new(24, 80);
@@ -1088,6 +1101,9 @@ mod tests {
     }
 
     /// Margined IL/DL and scroll_region_*_margined write cells via get_mut,
+    /// bypassing len maintenance; when the margined copy blanks a row's tail,
+    /// Row.len must still shrink, or row_text/search/scrollback emit phantom
+    /// trailing spaces.
     #[test]
     fn test_dl_margined_shrinks_len_when_blanks_cover_tail() {
         let mut grid = Grid::new(24, 80);
@@ -1111,6 +1127,9 @@ mod tests {
     }
 
     /// DECIC and DECDC shift the rows of the vertical scroll region (rows
+    /// 0..=10) and are no-ops when the cursor row is outside it, even when the
+    /// cursor column is within the horizontal margins; inside it DECIC still
+    /// inserts (the guard does not over-fire).
     #[test]
     fn test_decic_and_decdc_act_only_inside_the_vertical_region() {
         type Op = fn(&mut Grid);

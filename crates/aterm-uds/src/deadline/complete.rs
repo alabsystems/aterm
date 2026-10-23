@@ -4,7 +4,9 @@
 //! Additive complete-stdout capture for consumers that replace data or admit an inventory.
 //! The older diagnostic capture keeps its tail/grace semantics unchanged.
 
-use super::{DRAIN_GRACE, ExitWait, OUTPUT_KEEP, RunError, drain, reap_within};
+use super::{
+    DRAIN_GRACE, ExitWait, Grace, OUTPUT_KEEP, PipeEnd, RunError, drain, pipe_end, reap_within,
+};
 use crate::spawnfd::{Child, Command, Stdio};
 use std::io::{self, Read};
 use std::process::Output;
@@ -74,7 +76,8 @@ pub fn output_until_complete_stdout(
 /// dropped spawnfd handle hands a child still unsettled to the existing reaper;
 /// returning a refusal does not certify child or descendant exit. After child exit,
 /// stdout may finish for the existing [`DRAIN_GRACE`]; an open descendant-held stream is a
-/// refusal, not a complete empty/short result. Stderr deliberately keeps the older
+/// refusal, not a complete empty/short result. Past the grace a pipe no descendant holds is
+/// read on ([`Grace`]). Stderr deliberately keeps the older
 /// diagnostic tail behavior; this API does not certify stderr completeness.
 ///
 /// As in the older capture, a reader still blocked after grace can outlive the call on
@@ -97,7 +100,7 @@ pub fn output_until_complete_stdout_from(
         .spawn()
         .map_err(|error| CompleteOutputError::Run(RunError::Spawn(error)))?;
     let stdout = match child.stdout.take() {
-        Some(stream) => match drain_stdout(stream) {
+        Some(stream) => match drain_stdout(pipe_end(&stream), stream) {
             Ok(stdout) => stdout,
             Err(error) => {
                 end_bounded(&mut child);
@@ -112,7 +115,10 @@ pub fn output_until_complete_stdout_from(
     let stderr = match child
         .stderr
         .take()
-        .map(|stream| drain(stream, "stderr"))
+        .map(|stream| {
+            let pipe = pipe_end(&stream);
+            drain(stream, pipe, "stderr")
+        })
         .transpose()
     {
         Ok(stderr) => stderr,
@@ -139,9 +145,15 @@ pub fn output_until_complete_stdout_from(
             }
         }
     };
-    let by = Instant::now() + DRAIN_GRACE;
-    let stdout = stdout.collect(by)?;
-    let stderr = stderr.map(|stream| stream.collect(by)).unwrap_or_default();
+    let grace = Grace {
+        by: Instant::now() + DRAIN_GRACE,
+        until: deadline,
+        group: Some(child.id()),
+    };
+    let stdout = stdout.collect(&grace)?;
+    let stderr = stderr
+        .map(|stream| stream.collect(&grace))
+        .unwrap_or_default();
     Ok(Output {
         status,
         stdout,
@@ -162,13 +174,23 @@ fn end_bounded(child: &mut Child) {
 /// A result exists only after the actual Read observed EOF (or an explicit read error).
 struct CompleteDrain {
     ended: mpsc::Receiver<Result<Vec<u8>, CompleteOutputError>>,
+    pipe: Option<PipeEnd>,
 }
 
 impl CompleteDrain {
-    fn collect(self, by: Instant) -> Result<Vec<u8>, CompleteOutputError> {
-        self.ended
-            .recv_timeout(by.saturating_duration_since(Instant::now()))
-            .map_err(|_| CompleteOutputError::StdoutIncomplete)?
+    /// The stdout, once its reader saw EOF; a refusal when `grace` stops it first.
+    fn collect(self, grace: &Grace) -> Result<Vec<u8>, CompleteOutputError> {
+        let ended = match self
+            .ended
+            .recv_timeout(grace.by.saturating_duration_since(Instant::now()))
+        {
+            Err(mpsc::RecvTimeoutError::Timeout) => match grace.read_on(self.pipe.as_ref()) {
+                Some(wait) => self.ended.recv_timeout(wait),
+                None => Err(mpsc::RecvTimeoutError::Timeout),
+            },
+            ended => ended,
+        };
+        ended.map_err(|_| CompleteOutputError::StdoutIncomplete)?
     }
 }
 
@@ -201,7 +223,10 @@ fn read_stdout(mut stream: impl Read) -> Result<Vec<u8>, CompleteOutputError> {
 
 // wasm32 never links aterm-uds; the census's wasm closure scans it anyway (OB-12).
 #[cfg(not(target_arch = "wasm32"))]
-fn drain_stdout(stream: impl Read + Send + 'static) -> io::Result<CompleteDrain> {
+fn drain_stdout(
+    pipe: Option<PipeEnd>,
+    stream: impl Read + Send + 'static,
+) -> io::Result<CompleteDrain> {
     let (finished, ended) = mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("child-complete-stdout".into())
@@ -209,7 +234,7 @@ fn drain_stdout(stream: impl Read + Send + 'static) -> io::Result<CompleteDrain>
             let result = read_stdout(stream);
             let _ = finished.send(result);
         })?;
-    Ok(CompleteDrain { ended })
+    Ok(CompleteDrain { ended, pipe })
 }
 
 #[cfg(test)]

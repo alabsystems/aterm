@@ -18,12 +18,15 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// How long anything here may take before it is a hang rather than a slow
+/// machine (AGENTS.md: a hang detector is a minute, never a latency budget).
 const DEADLINE: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// The mint secret every scratch broker is guarded with.
 const SECRET: &[u8] = b"fabric-cli-test-mint-secret-0032";
 
 /// A broker client holding the fleet's unbound root grant (`/f/t1/>`), minted
+/// under [`SECRET`] — the god cap a human or a bridge stand-in publishes with
+/// here, on a broker that checks every request.
 fn root_client(sock: &str) -> astream_broker::Client {
     let mut c = harness::broker_client(sock);
     let root = astream_cap::mint(SECRET, "/f/t1/>").expect("mint the fleet root");
@@ -33,6 +36,7 @@ fn root_client(sock: &str) -> astream_broker::Client {
 }
 
 /// A private directory under `/tmp` — short, because a Unix socket path must
+/// fit `sun_path` (104 bytes on macOS) and a per-user `$TMPDIR` does not.
 struct Scratch {
     dir: aterm_tempfile::TempDir,
 }
@@ -77,6 +81,7 @@ impl Scratch {
     }
 
     /// The bridge command, in the spelling `aterm fabric on` writes
+    /// (`aterm link serve`) or the argv0 alias's (`aterm-link serve`).
     fn command(&self, sock: &str, alias: bool) -> String {
         let program = if alias {
             "/usr/local/bin/aterm-link serve".to_string()
@@ -100,6 +105,7 @@ impl Scratch {
 }
 
 /// `aterm fabric <args>` in the sealed environment, with `env_cmd` as
+/// `ATERM_FABRIC_COMMAND` when given.
 fn fabric_cmd(s: &Scratch, env_cmd: Option<&str>, args: &[&str]) -> Command {
     let mut cmd = Command::new(harness::aterm_to_launch());
     cmd.args(["link", "fabric"])
@@ -133,13 +139,14 @@ fn json(text: &str) -> aterm_json::Value {
     aterm_json::from_str(text).unwrap_or_else(|e| panic!("not JSON ({e}): {text}"))
 }
 
-/// A broker process, killed on drop. Started by `spawnfd`: it holds its stdio
+/// A broker process, killed on drop.
 struct Broker {
     child: aterm_uds::spawnfd::Child,
 }
 
 impl Broker {
     /// `aterm link broker <sock> <log> --secret-file <secret>`, returned once
+    /// it prints `listening`.
     fn spawn(s: &Scratch) -> Self {
         Self::serve(
             &s.sock(),
@@ -149,6 +156,7 @@ impl Broker {
     }
 
     /// `aterm link broker <sock> <log> <extra>…`, returned once it prints
+    /// `listening`.
     fn serve(sock: &str, log: &str, extra: &[&str]) -> Self {
         Self::serve_env(sock, log, extra, &[])
     }
@@ -200,6 +208,9 @@ fn line_reader(out: ChildStdout) -> mpsc::Receiver<String> {
 }
 
 /// **A READINESS LINE NOBODY READS DOES NOT STOP THE BROKER.** A supervisor
+/// may read the first `listening` line and close the pipe; `println!` on a
+/// closed stdout panics, which would kill the broker right after binding and
+/// take its socket with it.
 #[test]
 fn a_broker_whose_stdout_reader_left_keeps_serving() {
     let s = Scratch::new("epipe");
@@ -264,6 +275,9 @@ fn the_secret_beside_the_socket_guards_it_and_the_report_measures_the_guard() {
 }
 
 /// **THE TIER NAMED IS READ OFF THE BROKER'S PROCESS, THE TIER SERVED OFF ITS
+/// `Hello`.** A real `aterm link broker --durability relaxed`: the report's
+/// BROKER section and its JSON say `relaxed`, served `relaxed`, and doctor names
+/// it as a fact.
 #[test]
 fn the_report_reads_the_brokers_durability_off_its_process() {
     const ORDERED_SERVED: &str = if cfg!(target_vendor = "apple") {
@@ -357,6 +371,9 @@ fn the_report_reads_the_brokers_durability_off_its_process() {
 }
 
 /// **THE REPORT AND ITS DOCTOR SAY WHAT THE BROKER SAYS OF ITS LOG**, end to
+/// end: a real `aterm link broker --durability relaxed`, guarded, whose
+/// `Hello` entry 0x04 the report's probe reads and whose astream
+/// `<log>.health` the report reads with astream's reader.
 #[test]
 fn the_report_and_its_doctor_say_what_the_broker_says_of_its_log() {
     let s = Scratch::new("health");
@@ -542,6 +559,11 @@ fn the_default_off_the_boot_volume_is_served_strict_and_says_why() {
 }
 
 /// **A RELAXED BROKER'S CLEAN STOP CLOSES ITS LOG, AND A REBOOT AFTER IT KEEPS
+/// THE IDENTITY.** A real `aterm link broker --durability relaxed`, one post
+/// acked, then SIGTERM — what launchd sends at logout and shutdown and `aterm
+/// fabric off`'s bootout sends: it exits 0 with its socket unlinked, having
+/// dropped its listeners, which is astream's clean close (a full flush, then
+/// `Closed` in `<log>.id`).
 #[test]
 fn a_weak_brokers_clean_stop_closes_its_log_and_a_reboot_keeps_its_identity() {
     use astream_broker::{Boot, BrokerLog, Durability, OpenOptions, Prepared};
@@ -640,6 +662,8 @@ fn a_weak_brokers_clean_stop_closes_its_log_and_a_reboot_keeps_its_identity() {
 }
 
 /// **DOCTOR READS THE ROLE OF THE FABRIC ITS REPORT IS ABOUT.** The report
+/// follows `$ATERM_FABRIC_COMMAND`; the role its remedies are spelled for must
+/// come from the same root, not from the environment's default one.
 #[test]
 fn doctor_reads_the_role_of_the_fabric_its_report_is_about() {
     let s = Scratch::new("role");
@@ -682,10 +706,11 @@ fn doctor_reads_the_role_of_the_fabric_its_report_is_about() {
     );
 }
 
-/// The producer sequence every publish here takes the next of. ONE counter for
+/// The producer sequence every publish here takes the next of.
 static SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Publish `(subject, body)` records straight to the broker, as a bridge or a
+/// human would; answers each one's offset.
 fn publish(sock: &str, records: &[(String, String)]) -> Vec<u64> {
     let mut c = root_client(sock);
     records
@@ -702,6 +727,11 @@ fn publish(sock: &str, records: &[(String, String)]) -> Vec<u64> {
 }
 
 /// **`aterm link broker` OPENS WITH THE ONE CONSTRUCTOR**:
+/// the production broker binary retains its log by
+/// `aterm_link::broker_rules::default_rules` and its `Hello` advertises
+/// exactly them, as the world's in-process broker does
+/// (`broker_retention`'s test); a restart, on the same log, sets them again
+/// (astream advertises only the rules set since its open).
 #[test]
 fn the_broker_binary_advertises_the_default_rules() {
     let s = Scratch::new("rules");
@@ -786,6 +816,7 @@ fn doctor_retire_ghosts_refuses_while_an_instance_has_not_answered() {
 }
 
 /// **A PIPED `y` IS NOT CONSENT.** Without a terminal there is exactly one way
+/// to say yes and it is `--yes`, which says so in the argv.
 #[test]
 fn doctor_retire_ghosts_does_not_take_a_piped_yes() {
     let s = Scratch::new("ghostpipe");
@@ -871,7 +902,7 @@ fn with_no_command_the_fabric_is_off_says_where_it_looked_and_exits_2() {
     assert_eq!(code, 2, "{err}");
 }
 
-/// A SOCKET FILE IS NOT A BROKER. A socket that was bound and abandoned — the
+/// A SOCKET FILE IS NOT A BROKER.
 #[test]
 fn a_dead_socket_file_is_unreachable_and_a_warning() {
     let s = Scratch::new("dead");
@@ -899,7 +930,7 @@ fn a_dead_socket_file_is_unreachable_and_a_warning() {
     assert!(arr(&v, "traffic").is_empty());
 }
 
-/// A LIVE BROKER, READ FOR REAL — and the env override beats the file. The
+/// A LIVE BROKER, READ FOR REAL — and the env override beats the file.
 #[test]
 fn a_live_broker_is_read_for_real_and_the_env_overrides_the_file() {
     let s = Scratch::new("live");
@@ -1001,6 +1032,10 @@ fn a_live_broker_is_read_for_real_and_the_env_overrides_the_file() {
 }
 
 /// A broker that ANSWERS `Hello` and `Attach` and REFUSES the read, on `sock`,
+/// until the test process exits — what `Broker::open_guarded` does when the cap
+/// file's grants do not cover `/f/<fleet>/>` (a `--fleet` typo in the bridge
+/// command), and what a broker that dies between the attach and the head query
+/// does too.
 fn refusing_broker(sock: &str) {
     use astream_broker::proto::{
         Request, Response, decode_request, encode_response, read_frame, write_frame,
@@ -1039,6 +1074,7 @@ fn refusing_broker(sock: &str) {
 }
 
 /// **A BROKER THAT REFUSES THE READ IS NOT `reachable yes`.** The connect, the
+/// `Hello` and every `Attach` succeed; the head query is refused.
 #[test]
 fn a_broker_that_refuses_the_read_is_not_reachable_yes() {
     let s = Scratch::new("refuse");
@@ -1112,6 +1148,8 @@ impl Drop for Tail {
 }
 
 /// `tail --from` REPLAYS exactly the records from that offset, one line each,
+/// in the TRAFFIC columns and with bodies hidden; `--bodies` adds the text
+/// after the trust label; a bare `tail` shows only what arrives after it starts.
 #[test]
 fn tail_replays_from_an_offset_hides_bodies_and_follows_live() {
     let s = Scratch::new("tail");
@@ -1175,7 +1213,7 @@ fn usage_errors_exit_2_and_help_exits_0() {
     assert_eq!(code, 2, "{err}");
 }
 
-/// A FILTER THE BROKER WOULD REFUSE NEVER REACHES IT. `tail --filter` passes
+/// A FILTER THE BROKER WOULD REFUSE NEVER REACHES IT.
 #[test]
 fn a_filter_the_broker_would_refuse_is_a_usage_error_before_the_dial() {
     let s = Scratch::new("filter");
@@ -1219,6 +1257,7 @@ fn broker_run(args: &[&str]) -> (i32, String, String) {
 }
 
 /// **A LOG THE BROKER REFUSES AS CORRUPT HAS A REPAIR THIS BINARY SHIPS, AND
+/// DOCTOR PRESCRIBES IT** (audit 51).
 #[test]
 fn a_corrupt_log_is_prescribed_and_repaired_by_the_shipped_verb() {
     let s = Scratch::new("repair");

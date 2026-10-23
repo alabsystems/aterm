@@ -4,8 +4,8 @@
 //! Two rules live here, for one reason: they are the two that every face of astream
 //! reads off disk, and both used to be written again by each face that read them.
 //! The line format is below. The secret-file rule ([`check_private`],
-//! [`read_private_file`], [`read_secret_file`], [`read_secret_in`], [`SECRET_MIN`]),
-//! judged through astream-sys's owner-only rule, is at the end of this doc.
+//! [`read_private_file`], [`read_secret_file`], [`read_secret_in`], [`read_secret_at`],
+//! [`read_secret_at_narrowed`], [`SECRET_MIN`]), judged through astream-sys's owner-only rule, is at the end of this doc.
 //!
 //! A cap file holds a node's whole ring, one minted capability per line, in exactly
 //! the shape `asb mint` prints — so the file a mint wrote is the file every face
@@ -84,14 +84,20 @@
 //!   path ([`check_private`] opens it too), and a face that READS a secret goes
 //!   through [`read_private_file`] or [`read_secret_file`], never a check and then
 //!   its own read.
-//! * A SECRET IN A DIRECTORY OF ITS OWN ([`read_secret_in`]): the directory is opened
-//!   without following a link and held to the same owner-only rule as a directory
-//!   (0700 or tighter, ours, no ACL allow entry), because whoever can write it can
-//!   replace the secret or give it a second name; the name is one path component;
-//!   the file is opened without following a link (`O_NOFOLLOW`) and must have ONE
-//!   link, because a second name for it may sit in a directory others can reach.
-//!   The path readers ([`read_private_file`], [`read_secret_file`]) still follow a
-//!   link at the path: an operator who points `--secret-file` at one keeps working.
+//! * A SECRET IN A DIRECTORY OF ITS OWN ([`read_secret_in`], and [`read_secret_at`]
+//!   over one path's directory and name): the directory is opened without following
+//!   a link and held to the same owner-only rule as a directory (0700 or tighter,
+//!   ours, no ACL allow entry), because whoever can write it can replace the secret
+//!   or give it a second name; the name is one path component; the file is opened
+//!   without following a link (`O_NOFOLLOW`) and must have ONE link, because a
+//!   second name for it may sit in a directory others can reach. The directory's
+//!   refusal names the `chmod` that closes it but does not call the secret exposed:
+//!   a directory others can open or write lets them replace the secret, not read it,
+//!   and the file's own clauses, judged next, say whether others could read it.
+//!   [`read_secret_at_narrowed`] is the dry run of a caller that narrows the
+//!   directory's mode before it reads. The path readers ([`read_private_file`],
+//!   [`read_secret_file`]) still follow a link at the path: an operator who points
+//!   `asb --secret-file` at one keeps working.
 //! * EXACT BYTES ([`read_private_file`], [`read_secret_file`]): the secret is every
 //!   byte the file holds, a trailing newline or space included. A mint secret is
 //!   `head -c 32 /dev/urandom`, raw random bytes that begin or end with a whitespace
@@ -105,19 +111,21 @@
 //!   `NotFound` (the file is not there, which a caller may answer with a hint),
 //!   `PermissionDenied` (another owner, a group/other bit, an ACL allow entry, a
 //!   symlink or a second link where [`read_secret_in`] refuses them, or an OS
-//!   refusal to open it), `InvalidInput` (not a regular file, or a name of more than
-//!   one component) and `InvalidData` (too short). Every message starts with the path, once: an OS
-//!   error, which never names one, is re-wrapped as `<path>: <error>` with its kind
-//!   kept, so a caller prefixes only its own flag (`--secret-file {e}`) and never
-//!   names the path twice.
+//!   refusal to open it), `InvalidInput` (not a regular file, a directory that is no
+//!   directory, a name of more than one component, or a path that names no file)
+//!   and `InvalidData` (too short). Every message starts with the path, once, as its
+//!   caller spelled it (a bare name is not `./<name>`): an OS error, which never
+//!   names one, is re-wrapped as `<path>: <error>` with its kind kept, so a caller
+//!   prefixes only its own flag (`--secret-file {e}`) and never names the path twice.
 //!
 //! `asb` reads `--secret-file` through [`read_secret_file`], and `serve` reads the
 //! `--key-file` it serves under through [`read_private_file`] (the key is hex, so
 //! `asb` trims and decodes it, and its own decoder holds it to 32 bytes). aterm's
-//! fabric reads its `mint.secret` through [`read_secret_file`] too (its
-//! `read_mint_secret`, aterm b84c08997f), so the broker that verifies and the verb
-//! that mints read a secret by this one code; [`read_secret_in`] is the reader for
-//! such a secret kept in a directory of its own. [`read_file`] does
+//! fabric reads its `mint.secret` through [`read_secret_at`] (its
+//! `read_mint_secret`, for `aterm link broker --secret-file`, `aterm link mint` and
+//! `aterm fabric on`/`mint-for`), so the broker that verifies and the verb that mints
+//! read a secret by this one code, and `fabric on --dry-run` through
+//! [`read_secret_at_narrowed`] when its root step would narrow the root. [`read_file`] does
 //! NOT check a cap file's mode: a face that wants that reads the file with
 //! [`read_private_file`] and parses it with [`parse_text`].
 
@@ -439,15 +447,17 @@ fn dir_refusal(path: &Path, dir: &Path, why: astream_sys::NotPrivate) -> std::io
             PermissionDenied,
             format_args!(
                 ": its directory {dir} is mode {mode:04o}: a secret's directory must be its \
-                 owner's alone (0700); run `chmod 700 {dir}` and treat the secret as exposed"
+                 owner's alone (0700), so that nobody else can replace the secret or give it \
+                 a second name; run `chmod 700 {dir}`"
             ),
         ),
         NotPrivate::Acl => refused(
             path,
             PermissionDenied,
             format_args!(
-                ": its directory {dir} {why}; run `chmod -N {dir}` and treat the secret as \
-                 exposed"
+                ": its directory {dir} {why}: a secret's directory must be its owner's alone, \
+                 so that nobody else can replace the secret or give it a second name; run \
+                 `chmod -N {dir}`"
             ),
         ),
         NotPrivate::Owner(_) => refused(
@@ -479,9 +489,20 @@ fn open_private(
     path: &Path,
     links: astream_sys::Links,
 ) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
-    let file = match astream_sys::open_nonblocking(path, links) {
+    open_private_as(path, path, links)
+}
+
+/// [`open_private`] of the file at `at`, every refusal naming it as `path`: the
+/// spelling its caller was given ([`read_secret_at`] opens a bare name's file beneath
+/// `.` and names it as given).
+fn open_private_as(
+    at: &Path,
+    path: &Path,
+    links: astream_sys::Links,
+) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    let file = match astream_sys::open_nonblocking(at, links) {
         Ok(file) => file,
-        Err(_) if links == astream_sys::Links::Refuse && is_link(path) => {
+        Err(_) if links == astream_sys::Links::Refuse && is_link(at) => {
             return Err(refused(
                 path,
                 std::io::ErrorKind::PermissionDenied,
@@ -608,9 +629,9 @@ pub fn read_secret_file(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
 /// name of more than one component, a file that is not a regular file, or a
 /// directory that is no directory; `PermissionDenied` for a symlink, a second link,
 /// another owner, a group/other bit or an access list, on the file or the
-/// directory, naming the command that closes it; `InvalidData` for a short secret;
-/// and any other read error with its own kind. Each message starts with the
-/// secret's path, `dir` joined with `name`.
+/// directory, naming the command that closes a mode or an access list;
+/// `InvalidData` for a short secret; and any other read error with its own kind.
+/// Each message starts with the secret's path, `dir` joined with `name`.
 pub fn read_secret_in(dir: impl AsRef<Path>, name: &str) -> std::io::Result<Vec<u8>> {
     let dir = dir.as_ref();
     let path = dir.join(name);
@@ -621,11 +642,89 @@ pub fn read_secret_in(dir: impl AsRef<Path>, name: &str) -> std::io::Result<Vec<
             format_args!(": a secret's name in its directory is one path component"),
         ));
     }
+    secret_in(dir, name.as_ref(), &path, DirMode::AsItStands)
+}
+
+/// [`read_secret_in`] over `path`'s own directory and file name, every refusal
+/// starting with `path` exactly as given: the reader for a secret named by one path
+/// (a `--secret-file`) that is held to the directory rule too. A bare name is read
+/// in the current directory and named as given, never as `./<name>`.
+///
+/// # Errors
+///
+/// [`read_secret_in`]'s, each message starting with `path`; and `InvalidInput` for a
+/// path that names no file (`/`, an empty path, one ending in `..`).
+pub fn read_secret_at(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
+    let path = path.as_ref();
+    let (dir, name) = dir_and_name(path)?;
+    secret_in(dir, name, path, DirMode::AsItStands)
+}
+
+/// [`read_secret_at`] as it will read once the secret's directory has been narrowed to
+/// 0700: a directory refused for its mode bits ALONE passes, while every other clause
+/// of the directory's (no directory, a symlink, another owner, an access-list allow
+/// entry) and every clause of the file's still refuses. astream-sys judges a
+/// directory's mode last ([`astream_sys::owner_private_dir`]), so a mode refusal means
+/// every other clause held, and `chmod 700` is all that stands between this answer and
+/// [`read_secret_at`]'s.
+///
+/// This is the reading of a DRY RUN whose real run narrows the directory before it
+/// reads the secret (aterm's `fabric on`: its root step makes the root 0700, then its
+/// secret step reads the secret in it), so the preview judges the secret the real run
+/// will read rather than refusing a directory the real run will have fixed. A real read
+/// never uses it: it narrows the directory first, then reads with [`read_secret_at`].
+///
+/// # Errors
+///
+/// [`read_secret_at`]'s, but for a directory's group or other mode bits.
+pub fn read_secret_at_narrowed(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
+    let path = path.as_ref();
+    let (dir, name) = dir_and_name(path)?;
+    secret_in(dir, name, path, DirMode::Narrowed)
+}
+
+/// `path`'s directory (`.` for a bare name) and file name, or `InvalidInput` naming
+/// `path` when it names no file.
+fn dir_and_name(path: &Path) -> std::io::Result<(&Path, &std::ffi::OsStr)> {
+    let Some(name) = path.file_name() else {
+        return Err(refused(
+            path,
+            std::io::ErrorKind::InvalidInput,
+            format_args!(": a secret's path names no file"),
+        ));
+    };
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    Ok((dir, name))
+}
+
+/// How [`secret_in`] holds its directory's mode bits.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirMode {
+    /// As they stand: a group or other bit refuses the directory.
+    AsItStands,
+    /// As they will stand once the caller has narrowed them to 0700
+    /// ([`read_secret_at_narrowed`]).
+    Narrowed,
+}
+
+/// The secret `name` in `dir`, opened at `dir` joined with `name` and named as `path`
+/// in every refusal: [`read_secret_in`]'s rule, its directory's mode held as `mode`
+/// says. `name` is one path component; the caller made sure of it.
+fn secret_in(
+    dir: &Path,
+    name: &std::ffi::OsStr,
+    path: &Path,
+    mode: DirMode,
+) -> std::io::Result<Vec<u8>> {
+    let at = dir.join(name);
     let opened = match astream_sys::open_nonblocking(dir, astream_sys::Links::Refuse) {
         Ok(opened) => opened,
         Err(_) if is_link(dir) => {
             return Err(refused(
-                &path,
+                path,
                 std::io::ErrorKind::PermissionDenied,
                 format_args!(
                     ": its directory {} is a symlink: a secret's directory is read through \
@@ -634,29 +733,31 @@ pub fn read_secret_in(dir: impl AsRef<Path>, name: &str) -> std::io::Result<Vec<
                 ),
             ));
         }
-        Err(e) => return Err(at_path(&path, e)),
+        Err(e) => return Err(at_path(path, e)),
     };
     // No secret is `NotFound` whatever its directory is: the directory is judged
     // when there is a secret in it to keep, so a caller that answers a missing
     // secret by making one (after making its directory private) is told the secret
     // is missing, not that a directory it has yet to fix is open. This `lstat`
     // decides only which refusal is said; the reads below decide what is read.
-    match std::fs::symlink_metadata(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(at_path(&path, e)),
+    match std::fs::symlink_metadata(&at) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(at_path(path, e)),
         _ => {}
     }
-    if let Err(why) = astream_sys::owner_private_dir(&opened).map_err(|e| at_path(&path, e))? {
-        return Err(dir_refusal(&path, dir, why));
+    match astream_sys::owner_private_dir(&opened).map_err(|e| at_path(path, e))? {
+        Ok(_) => {}
+        Err(astream_sys::NotPrivate::Mode(_)) if mode == DirMode::Narrowed => {}
+        Err(why) => return Err(dir_refusal(path, dir, why)),
     }
     drop(opened);
-    let (file, meta) = open_private(&path, astream_sys::Links::Refuse)?;
+    let (file, meta) = open_private_as(&at, path, astream_sys::Links::Refuse)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
         let links = meta.nlink();
         if links != 1 {
             return Err(refused(
-                &path,
+                path,
                 std::io::ErrorKind::PermissionDenied,
                 format_args!(
                     " has {links} links: a secret in a private directory has exactly one (a \
@@ -667,7 +768,7 @@ pub fn read_secret_in(dir: impl AsRef<Path>, name: &str) -> std::io::Result<Vec<
     }
     #[cfg(not(unix))]
     let _ = meta;
-    at_least_min(&path, read_judged(&path, file)?)
+    at_least_min(path, read_judged(path, file)?)
 }
 
 /// Keep the accumulated bytes available to wipe if a reader fails partway through.

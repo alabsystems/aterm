@@ -5,15 +5,11 @@
 
 use super::*;
 
-/// Bounded model for the occupied-cell rainbow body budget. `Raise` explores
-/// every integer request through and beyond the 236 ceiling. `Buggy=1`
-/// forwards an over-budget request instead of clamping it and must produce a
-/// counterexample, so the proof is not vacuous.
+/// Bounded model for the occupied-cell rainbow body budget.
 fn rainbow_occupied_coverage_model() -> aterm_spec::derive::Model {
     use aterm_spec::ty_model;
     ty_model! {
         RainbowOccupiedCoverage {
-            // The bed's byte ceiling, `ribbon::UNDER_COV_CAP`.
             const Cap = 236;
             const RequestedMax = 270;
             const Buggy = 0;
@@ -32,8 +28,7 @@ fn rainbow_occupied_coverage_model() -> aterm_spec::derive::Model {
     }
 }
 
-/// Bounded lifecycle for a rainbow cell reclaimed while retracting. Visibility
-/// is quantized for exhaustive exploration; `Buggy=1` snaps back to full.
+/// Bounded lifecycle for a rainbow cell reclaimed while retracting.
 fn rainbow_retract_rearm_model() -> aterm_spec::derive::Model {
     use aterm_spec::ty_model;
     ty_model! {
@@ -62,9 +57,7 @@ fn rainbow_retract_rearm_model() -> aterm_spec::derive::Model {
 }
 
 /// "rainbow kitty" is the style's user-facing name; "rainbow" maps to it too,
-/// and the laser sweep is "phaser". Rainbow kitty draws no shared comet beam
-/// (its body is the streak). Every name the style has shipped under still
-/// parses.
+/// and the laser sweep is "phaser".
 #[test]
 fn rainbow_kitty_parse_and_beam() {
     assert_eq!(GlowStyle::parse("rainbow kitty"), GlowStyle::RainbowKitty);
@@ -88,9 +81,7 @@ fn rainbow_kitty_parse_and_beam() {
     assert!(style_has_beam("phaser"), "phaser keeps the shared beam");
 }
 
-/// Tier 0: exhaust the 0..=270 request lattice. The body clamp proves the
-/// occupied-cell budget; the pass-through mutant fails once a request past the
-/// 236 cap is reachable.
+/// Tier 0: exhaust the 0..=270 request lattice.
 #[test]
 fn rainbow_occupied_coverage_derived_model_proves_and_catches_regression() {
     assert_eq!(
@@ -111,13 +102,7 @@ fn rainbow_retract_rearm_model_proves_and_catches_brightness_snap() {
 }
 
 /// A live frame of the effect through the public `tick` seam, so every stream
-/// is present (ribbon bed, starfield, wake, crown, fresh-ink pops). Returns the
-/// engine (its `under`/`halo` streams resident), this frame's over-ink stream,
-/// and the frame instant.
-///
-/// The row probe is fed as the host does ([`CursorGlow::observe_row`] before
-/// every `tick`, then the flanking rows), so the typed run carries glyphs the
-/// engine can see.
+/// is present (ribbon bed, starfield, wake, crown, fresh-ink pops).
 fn typed_burst(
     c: &GlowConfig,
     g: Geom,
@@ -128,9 +113,7 @@ fn typed_burst(
     typed_burst_from_phase(c, g, row, cols, gap, 0.0)
 }
 
-/// [`typed_burst`] from a chosen point on the rolling hue. A mark shorter than
-/// `1 / RAINBOW_LAID_SWEEP_PER_CELL` cells covers only part of the arc (see
-/// [`RAINBOW_KITTY_HUE_STEP`]), so callers can sweep the start.
+/// [`typed_burst`] from a chosen point on the rolling hue.
 fn typed_burst_from_phase(
     c: &GlowConfig,
     g: Geom,
@@ -178,8 +161,6 @@ fn the_brightest_pixel_in_the_frame_is_under_the_cursor() {
     let mut brightest_field = 0.0f32;
     for raw in ["rainbow kitty", "rainbow kitty underline"] {
         let c = cfg_for_style_name(raw, true);
-        // A real frame per trial: the cadence moves the momentum spine, plume,
-        // starfield and fresh-ink pops, the light the caret competes with.
         for gap_ms in [18u64, 28, 45, 90] {
             let (glow, over_engine, at) =
                 typed_burst(&c, g, row, 5..col + 1, Duration::from_millis(gap_ms));
@@ -219,9 +200,6 @@ fn the_brightest_pixel_in_the_frame_is_under_the_cursor() {
                             };
                         let mark = over.len();
                         let fill = if flare {
-                            // Steady, then a charged flip to arm the flare,
-                            // then the frame at its peak (`pop` is a half-sine,
-                            // so the arming frame is exactly 0).
                             caret_tick(false, at, &mut over);
                             over.truncate(mark);
                             caret_tick(true, at, &mut over);
@@ -230,9 +208,6 @@ fn the_brightest_pixel_in_the_frame_is_under_the_cursor() {
                         } else {
                             caret_tick(false, at, &mut over)
                         };
-                        // Non-vacuous: both ornaments survive (in premultiplied
-                        // levels the rim is a visible hem and the peak flare
-                        // keeps its white arm).
                         let rim_level = over[mark..]
                             .iter()
                             .map(|q| {
@@ -253,10 +228,6 @@ fn the_brightest_pixel_in_the_frame_is_under_the_cursor() {
                             }
                         );
 
-                        // Compose in renderer order, ink-free on purpose: the
-                        // clause ranks the effect's own light against the
-                        // caret, and the theme foreground (`#C8D3F5`, luminance
-                        // 166) is not the effect's.
                         let mut f = Glass::new(g, c.theme_bg);
                         f.add_quads(glow.under_quads());
                         f.add_quads(&over);
@@ -266,11 +237,6 @@ fn the_brightest_pixel_in_the_frame_is_under_the_cursor() {
                         let (cx0, cy0, cx1, cy1) = f.cell_rect(row, col);
                         let in_cell =
                             |y: i32, x: i32| (cy0..cy1).contains(&y) && (cx0..cx1).contains(&x);
-                        // Glyph rows only: the comet's vivid rail lives in the
-                        // leading below a row (the top `RAIL_REACH_MAX_CH` of
-                        // the band under it) with its own ceiling
-                        // (`RAIL_LUMA_CEIL`); L5 is the caret's law where
-                        // letters are.
                         let rail_px = (crate::rainbow_kitty::ribbon::RAIL_REACH_MAX_CH
                             * g.ch as f32)
                             .ceil() as i32;
@@ -292,9 +258,6 @@ fn the_brightest_pixel_in_the_frame_is_under_the_cursor() {
                                     if l > best_outside.0 {
                                         best_outside = (l, y, x, colr);
                                     }
-                                    // The sparkle field is the white-ish
-                                    // population; one bright star makes this a
-                                    // real frame, not a bare ribbon.
                                     let (r, gg, b) =
                                         ((colr >> 16) & 0xff, (colr >> 8) & 0xff, colr & 0xff);
                                     if r.min(gg).min(b) > 40 {
@@ -342,12 +305,6 @@ fn the_brightest_pixel_in_the_frame_is_under_the_cursor() {
          this clause is about — the brightest one reached only \
          {brightest_field:.0} of luminance"
     );
-    // A margin, not a tie: the promised margin is
-    // `RAINBOW_CARET_LIGHT_FLOOR · (1 - RAINBOW_SPARKLE_LIGHT_SHARE)` = 8
-    // levels, less one level per composited byte for rounding. A star can sit
-    // at the field's ceiling (solved to a fractional level, `145 / 2.35 =
-    // 61.7`, cast to 61), and the caret's and the star's composites each round
-    // to a byte, which can land up to two levels against the margin.
     let promised = RAINBOW_CARET_LIGHT_FLOOR * (1.0 - RAINBOW_SPARKLE_LIGHT_SHARE) - 2.0;
     assert!(
         worst_margin >= promised,
@@ -370,17 +327,11 @@ fn every_kitty_spelling_draws_the_resident_and_flying_stays_reachable() {
         "kitty pet",
         "pet kitty",
         "  Rainbow Kitty  ",
-        // Geometry is not an animal: the underline spellings are the ribbon
-        // drawn under the baseline and must draw the pet. All four, because
-        // `spellings::TRAIL_STYLE_ALIASES` canonicalises the other three
-        // onto this one.
         "rainbow kitty underline",
         "rainbow underline",
         "underline rainbow",
         "nyan underline",
         "  Rainbow Kitty Underline  ",
-        // `… tall` names the default geometry (`ribbon_tall` is true for both),
-        // so it must not swap the companion. All four spellings, as above.
         "rainbow kitty tall",
         "rainbow tall",
         "tall rainbow",
@@ -394,8 +345,6 @@ fn every_kitty_spelling_draws_the_resident_and_flying_stays_reachable() {
         assert!(GlowStyle::style_names_any_pet(s), "{s}");
         assert!(!GlowStyle::style_names_flying_kitty(s), "{s}");
     }
-    // The flying head: explicit spellings plus every historical alias that
-    // has ever selected it. All ride the same ribbon; none is a pet.
     for s in [
         "rainbow kitty flying",
         "flying kitty",
@@ -411,7 +360,6 @@ fn every_kitty_spelling_draws_the_resident_and_flying_stays_reachable() {
             "{s:?} must keep the flying head"
         );
     }
-    // Disjointness, stated as the property rather than as a spot check.
     for s in [
         "rainbow kitty",
         "kitty",
@@ -435,7 +383,6 @@ fn every_kitty_spelling_draws_the_resident_and_flying_stays_reachable() {
             "{s:?} claims both animals"
         );
     }
-    // Choosing the geometry must not change the animal.
     assert_eq!(
         GlowStyle::style_names_any_pet("rainbow kitty"),
         GlowStyle::style_names_any_pet("rainbow kitty underline"),
@@ -446,8 +393,6 @@ fn every_kitty_spelling_draws_the_resident_and_flying_stays_reachable() {
             && !GlowStyle::style_names_underline_ribbon("rainbow kitty"),
         "…and the two really are the geometry fork, or the line above is vacuous"
     );
-    // The dog is untouched: widening the kitty list must not reach a dog
-    // spelling, and the bare kitty word must not become a dog.
     for dog in ["rainbow dog pet", "dog pet", "pet dog", "rainbow puppy pet"] {
         assert!(GlowStyle::style_names_dog_pet(dog), "{dog}");
         assert!(!GlowStyle::style_names_kitty_pet(dog), "{dog}");
@@ -455,8 +400,6 @@ fn every_kitty_spelling_draws_the_resident_and_flying_stays_reachable() {
     for cat in ["rainbow kitty", "kitty", "rainbow kitty pet"] {
         assert!(!GlowStyle::style_names_dog_pet(cat), "{cat}");
     }
-    // No non-kitty style has a companion; kitty-named geometry spellings
-    // (`tall`, `underline`, `flat`) draw the resident.
     for s in ["comet", "phaser", "lumen", "off"] {
         assert!(!GlowStyle::style_names_kitty_pet(s), "{s}");
         assert!(!GlowStyle::style_names_flying_kitty(s), "{s}");
@@ -471,8 +414,6 @@ fn rainbow_ribbon_brightens_with_typing_momentum() {
     let c = cfg(GlowStyle::RainbowKitty, true);
     let band_ink = |glow: &mut CursorGlow, out: &Vec<GlowQuad>| -> u64 {
         let _ = glow;
-        // Weight by area so the strip subdivision of hot bands (the wave
-        // curve) doesn't inflate "ink" by quad count alone.
         out.iter()
             .map(|q| {
                 (((q.color >> 16) & 0xff) + ((q.color >> 8) & 0xff) + (q.color & 0xff)) as u64
@@ -481,7 +422,6 @@ fn rainbow_ribbon_brightens_with_typing_momentum() {
             })
             .sum()
     };
-    // Cold: one isolated single-cell move from rest.
     let mut cold = CursorGlow::default();
     let mut out = Vec::new();
     let t0 = Instant::now();
@@ -489,18 +429,17 @@ fn rainbow_ribbon_brightens_with_typing_momentum() {
     let t1 = t0 + Duration::from_millis(16);
     cold.note_synthetic_typed(t1, 1);
     cold.tick(Some((3, 3)), t1, &c, g, &mut out);
-    out.extend_from_slice(cold.under_quads()); // ribbon rides the under-ink stream
+    out.extend_from_slice(cold.under_quads());
     let cold_ink = band_ink(&mut cold, &out);
-    // Hot: a sustained fast run of single-cell advances builds heat.
     let mut hot = CursorGlow::default();
     let mut t = Instant::now();
     hot.tick(Some((3, 2)), t, &c, g, &mut out);
     for col in 3..14u16 {
-        t += Duration::from_millis(18); // ~55 cps → heat ramps
+        t += Duration::from_millis(18);
         hot.note_synthetic_typed(t, 1);
         hot.tick(Some((3, col)), t, &c, g, &mut out);
     }
-    out.extend_from_slice(hot.under_quads()); // ribbon rides the under-ink stream
+    out.extend_from_slice(hot.under_quads());
     let hot_ink = band_ink(&mut hot, &out);
     assert!(
         hot_ink > cold_ink,
@@ -529,7 +468,7 @@ fn rainbow_ribbon_spans_four_letters_at_any_rhythm() {
             glow.heat < 0.05,
             "{gap_ms} ms: a slow cadence must stay cold"
         );
-        out.extend_from_slice(glow.under_quads()); // ribbon rides the under-ink stream
+        out.extend_from_slice(glow.under_quads());
         let cols = ribbon_cols(&out, 3, g);
         assert!(
             cols.len() >= 4,
@@ -574,8 +513,7 @@ fn rainbow_coalesced_typing_sweeps_every_skipped_cell() {
 
 /// A hand at human speed into an app that repaints late: seven presses at 10
 /// keys/s, one repaint ~700 ms later, one observed move of seven columns (and
-/// one of ten). A credit is spent by the cells it lays and survives until then,
-/// so the presses that earned the cells pay for them however old they are.
+/// one of ten).
 #[test]
 fn a_late_repaint_lays_every_cell_the_hand_typed() {
     let g = geom();
@@ -586,12 +524,9 @@ fn a_late_repaint_lays_every_cell_the_hand_typed() {
         let mut glow = CursorGlow::default();
         let t0 = Instant::now();
         glow.tick(Some((3, 2)), t0, &c, g, &mut out);
-        // The hand: one press every 100 ms, nothing echoed yet.
         for i in 0..u64::from(keys) {
             glow.note_typed_cells(t0 + Duration::from_millis(i * 100), 1);
         }
-        // The app repaints once, `lag_ms` after the first key: all `keys`
-        // glyphs appear at once and the caret is observed `keys` columns on.
         let at = t0 + Duration::from_millis(lag_ms);
         glow.tick(Some((3, 2 + keys)), at, &c, g, &mut out);
 
@@ -633,7 +568,6 @@ fn a_caret_that_advances_with_no_unpaid_press_still_buys_nothing() {
         );
     }
     let lit_after_typing = v2_cols(&glow, 3);
-    // 400 ms of silence, then the caret walks four columns by itself.
     glow.tick(
         Some((3, 11)),
         t0 + Duration::from_millis(620),
@@ -651,10 +585,7 @@ fn a_caret_that_advances_with_no_unpaid_press_still_buys_nothing() {
 
 /// Refutation control for [`a_late_repaint_lays_every_cell_the_hand_typed`]:
 /// vim's `w` is one press that hops a word, and one key must not paint a ribbon
-/// over it. Five 1-cell echoes spend their credits as they land, so the lone
-/// `w` finds an empty pool: its swept cells stay dark and the refusal is
-/// recorded naming `no-credits`; control: ordinary admitted typing reads
-/// `licensed` and keeps its own band.
+/// over it.
 #[test]
 fn a_refused_rainbow_sweep_names_the_credit_budget_that_refused_it() {
     let g = geom();
@@ -664,7 +595,6 @@ fn a_refused_rainbow_sweep_names_the_credit_budget_that_refused_it() {
     let t0 = Instant::now();
     glow.tick(Some((3, 2)), t0, &c, g, &mut out);
 
-    // Five ordinary echoes spend their five credits as they land.
     for i in 1..=5u16 {
         let at = t0 + Duration::from_millis(u64::from(i) * 40);
         glow.note_typed_cells(at, 1);
@@ -686,8 +616,6 @@ fn a_refused_rainbow_sweep_names_the_credit_budget_that_refused_it() {
         "nothing was refused yet: {admitted:?}"
     );
 
-    // One press, caret jumps five columns: vim's `w`. Refused by the credit
-    // budget, and the ring must say which budget.
     let at = t0 + Duration::from_millis(260);
     glow.note_typed_cells(at, 1);
     glow.tick(
@@ -708,7 +636,6 @@ fn a_refused_rainbow_sweep_names_the_credit_budget_that_refused_it() {
         tally.declined > admitted.declined,
         "the refusal must be counted, not reported as licensed: {tally:?}"
     );
-    // And the light is unchanged: this is an instrument, not an admission.
     let cols = v2_cols(&glow, 3);
     let bought: Vec<u16> = (7..=10u16).filter(|col| cols.contains(col)).collect();
     assert!(
@@ -751,9 +678,6 @@ fn rainbow_sequential_and_coalesced_typing_lay_equivalent_hues() {
         &mut out,
     );
 
-    // C2: the field is a function of position in the cohort, so cells 2..=5
-    // take the same stops whether they arrived one key at a time or as one
-    // wide echo.
     let laid = |glow: &CursorGlow| {
         (2..=5u16)
             .map(|col| (col, glow.v2.field_at(3, col)))
@@ -773,13 +697,11 @@ fn rainbow_sequential_and_coalesced_typing_lay_equivalent_hues() {
 
 /// Width-credit pricing: one press of a wide glyph advances two columns, so its
 /// echo coalesces on that press's 2-cell credit and sweeps the continuation
-/// cell. The same hop on a 1-cell credit is a skim and is refused, and an
-/// admitted coalesce spends its credits so they cannot fund a second echo.
+/// cell.
 #[test]
 fn a_wide_glyphs_single_press_sweeps_its_continuation_cell() {
     let g = geom();
     let c = cfg(GlowStyle::RainbowKitty, true);
-    // The typed wide glyph: one press, priced at two cells.
     let mut glow = CursorGlow::default();
     let mut out = Vec::new();
     let t = Instant::now();
@@ -791,16 +713,12 @@ fn a_wide_glyphs_single_press_sweeps_its_continuation_cell() {
         live.contains(&4) && live.contains(&5),
         "the wide glyph's two cells are ribbon cells: {live:?}"
     );
-    // The pool is spent: an immediate second 2-cell hop (hint still fresh) has
-    // nothing to pay with and is refused.
     glow.tick(Some((3, 8)), t + Duration::from_millis(40), &c, g, &mut out);
     let after = v2_cols(&glow, 3);
     assert!(
         !after.contains(&6) && !after.contains(&7),
         "spent credits must not fund a second multi-cell echo: {after:?}"
     );
-    // Control: the same 2-cell hop on a 1-cell credit is a skim (vim `w` over
-    // wide text); the continuation cell is never painted as typing.
     let mut skim = CursorGlow::default();
     let mut out2 = Vec::new();
     let t2 = Instant::now();
@@ -823,18 +741,12 @@ fn a_wide_glyphs_single_press_sweeps_its_continuation_cell() {
 /// A program that echoes wide glyphs for narrow keys (a terminal-side input
 /// method, a TUI in full-width forms): the host banks one cell per press but
 /// the caret advances two, so a raw-column share rule (`credits * 4 >=
-/// dc_abs * 3`) could never pass. The share is denominated in glyphs: the row
-/// probe ([`CursorGlow::observe_row`]) spells a wide glyph's continuation
-/// column `'\0'`, and those columns in the swept run count as second halves of
-/// glyphs the presses laid. Each press claims at most one extra column, so over
-/// an all-wide run the rule reduces to `presses >= 0.75 * glyphs`.
+/// dc_abs * 3`) could never pass.
 #[test]
 fn a_wide_glyph_echo_pays_for_the_cells_its_own_glyphs_occupy() {
     let g = geom();
     let c = cfg(GlowStyle::RainbowKitty, true);
 
-    // A row of `n` wide glyphs from `from`: lead char at its column, `'\0'` at
-    // the continuation, as `Terminal::row_cols_into` hands `observe_row`.
     let wide_row = |from: u16, n: u16| {
         let mut cols = [' '; 40];
         for i in 0..n {
@@ -845,8 +757,6 @@ fn a_wide_glyph_echo_pays_for_the_cells_its_own_glyphs_occupy() {
         cols
     };
 
-    // Seven keys at 10/s; one repaint 700 ms after the first echoes each as a
-    // 2-cell glyph, so the caret moves fourteen columns in one move.
     let mut glow = CursorGlow::default();
     let mut out = Vec::new();
     let t0 = Instant::now();
@@ -864,7 +774,6 @@ fn a_wide_glyph_echo_pays_for_the_cells_its_own_glyphs_occupy() {
         "the seven wide glyphs the hand typed left black cells {dark:?}; lit: {cols:?}"
     );
 
-    // Control 1: the same probe over narrow text, seven keys, seven columns.
     let mut narrow = CursorGlow::default();
     let mut out = Vec::new();
     let t0 = Instant::now();
@@ -884,8 +793,6 @@ fn a_wide_glyph_echo_pays_for_the_cells_its_own_glyphs_occupy() {
         "narrow text under the same probe must be unchanged: dark {dark:?}, lit {cols:?}"
     );
 
-    // Control 2: one press over the same wide row (vim `w`). The floor reads
-    // the raw ledger, so one credit is one credit.
     let mut skim = CursorGlow::default();
     let mut out = Vec::new();
     let t0 = Instant::now();
@@ -901,8 +808,6 @@ fn a_wide_glyph_echo_pays_for_the_cells_its_own_glyphs_occupy() {
         "one press bought {bought:?} cells of wide text it only skimmed; lit: {cols:?}"
     );
 
-    // Control 3: two presses over seven wide glyphs claim two extra columns:
-    // 4 paid against 14 swept is 16 >= 42, refused.
     let mut short = CursorGlow::default();
     let mut out = Vec::new();
     let t0 = Instant::now();
@@ -919,12 +824,6 @@ fn a_wide_glyph_echo_pays_for_the_cells_its_own_glyphs_occupy() {
         "two presses bought seven wide glyphs {bought:?}; lit: {cols:?}"
     );
 
-    // Control 4: each press claims at most ONE extra column. Two presses
-    // over three wide glyphs pay 2 + 2 of 6 swept (16 < 18), refused; were
-    // every continuation free, 2 + 3 would pass.
-    // Control 5: the two-press floor. One press over ONE wide glyph (vim's
-    // `l` across it) would pay 1 + 1 of 2 swept, three quarters and more,
-    // yet one credit is one credit.
     for (presses, glyphs) in [(2u64, 3u16), (1, 1)] {
         let mut few = CursorGlow::default();
         let mut out = Vec::new();
@@ -934,7 +833,6 @@ fn a_wide_glyph_echo_pays_for_the_cells_its_own_glyphs_occupy() {
             few.note_typed_cells(t0 + Duration::from_millis(10 + i * 100), 1);
         }
         let to = 2 + 2 * glyphs;
-        // 50 ms after the last press: its stamp is fresh, the share rule judges.
         let at = t0 + Duration::from_millis(60 + (presses - 1) * 100);
         few.observe_row(3, to, &wide_row(2, glyphs), at);
         few.tick(Some((3, to)), at, &c, g, &mut out);
@@ -961,8 +859,6 @@ fn rainbow_typed_row_has_no_interior_gaps() {
     for (i, hop) in [1u16, 3, 1, 2, 5, 1, 4, 2].into_iter().enumerate() {
         col += hop;
         t += Duration::from_millis(40 + (i as u64 % 3) * 30);
-        // Each hop models `hop` batched echoes — arm one press per glyph
-        // (the anti-stray press budget).
         for k in 0..u64::from(hop) {
             glow.note_synthetic_typed(t - Duration::from_millis(2) - Duration::from_millis(k), 1);
         }
@@ -991,13 +887,9 @@ fn rainbow_typing_wrap_folds_around_the_line_end() {
     let mut out = Vec::new();
     let t = Instant::now();
     glow.tick(Some((3, 38)), t, &c, g, &mut out);
-    // The wrap shape: from the second-to-last column (a wide-glyph wrap)
-    // down one row to column 1, backed by the committed wide glyph.
     let wrapped = t + Duration::from_millis(30);
     glow.note_synthetic_typed(wrapped, 2);
     glow.tick(Some((4, 1)), wrapped, &c, g, &mut out);
-    // Observe one beat later: the feathered birth ease keeps the folded
-    // cells near-zero on the frame the fold is laid.
     glow.tick(
         Some((4, 1)),
         t + Duration::from_millis(150),
@@ -1015,14 +907,11 @@ fn rainbow_typing_wrap_folds_around_the_line_end() {
         new_row.contains(&0),
         "the new row starts at its left edge: {new_row:?}"
     );
-    // No diagonal smear: nothing swept between the fold columns.
     assert!(
         !old_row.contains(&20) && !new_row.contains(&20),
         "no mid-row cells were invented by the fold"
     );
 
-    // …and a cold +2 hop after the fold, with no press behind it, sweeps
-    // nothing: the license declines it before the classifier runs.
     let program = wrapped + Duration::from_millis(400);
     glow.tick(Some((4, 3)), program, &c, g, &mut out);
     let after = v2_cols(&glow, 4);
@@ -1045,16 +934,13 @@ fn rainbow_typed_hide_bridge_spans_the_batch() {
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         glow.tick(Some((3, 2)), t, &c, g, &mut out);
-        glow.tick(None, t + Duration::from_millis(10), &c, g, &mut out); // echo hides
+        glow.tick(None, t + Duration::from_millis(10), &c, g, &mut out);
         if hint {
-            // The batch is 4 echoed glyphs: 4 presses (anti-stray budget).
             for i in 0..4u64 {
                 glow.note_synthetic_typed(t + Duration::from_millis(15 + i), 1);
             }
         }
         glow.tick(Some((3, 6)), t + Duration::from_millis(30), &c, g, &mut out);
-        // Observe one beat later: the feathered birth ease keeps a just-bridged
-        // cell near zero on its landing frame.
         glow.tick(
             Some((3, 6)),
             t + Duration::from_millis(150),
@@ -1079,9 +965,7 @@ fn rainbow_typed_hide_bridge_spans_the_batch() {
 }
 
 /// First-key orphan: the first key after a multi-second pause takes a long
-/// chained life. When a fast burst buries it, the rhythm-aware retro-clamp voids
-/// that life, so the whole ribbon, the first key's cell included, fades as one
-/// rather than leaving a stuck cell after a jump.
+/// chained life.
 #[test]
 fn rainbow_first_key_orphan_does_not_outlive_the_ribbon() {
     let g = geom();
@@ -1090,7 +974,7 @@ fn rainbow_first_key_orphan_does_not_outlive_the_ribbon() {
     let mut out = Vec::new();
     let cw = g.cw as u16;
     let lit = |glow: &CursorGlow| -> std::collections::BTreeSet<(u16, u16)> {
-        glow.under_quads() // ribbon rides the under-ink stream
+        glow.under_quads()
             .iter()
             .filter(|q| is_ribbon_quad(q.color))
             .map(|q| (q.row, q.x / cw))
@@ -1099,29 +983,22 @@ fn rainbow_first_key_orphan_does_not_outlive_the_ribbon() {
     let t0 = Instant::now();
     glow.tick(Some((3, 1)), t0, &c, g, &mut out);
     glow.note_synthetic_typed(t0, 1);
-    glow.tick(Some((3, 2)), t0, &c, g, &mut out); // establish the rhythm clock
-    // A 3 s pause, then one lone key (its inter-key gap is a full 3 s).
+    glow.tick(Some((3, 2)), t0, &c, g, &mut out);
     let t_orphan = t0 + Duration::from_millis(3000);
     glow.note_synthetic_typed(t_orphan, 1);
     glow.tick(Some((3, 3)), t_orphan, &c, g, &mut out);
-    // Then a fast 20-key burst establishes a much faster rhythm.
     let mut t = t_orphan;
     for k in 1..=20u16 {
         t += Duration::from_millis(50);
         glow.note_synthetic_typed(t, 1);
         glow.tick(Some((3, 3 + k)), t, &c, g, &mut out);
     }
-    // The finger lifts to navigate elsewhere (a jump resets the tail, so the
-    // exit swoosh cannot mask per-cell life); the ribbon must fade within a
-    // beat or two.
     t += Duration::from_millis(50);
     glow.note_synthetic_move(t);
     glow.tick(Some((0, 5)), t, &c, g, &mut out);
     let t_last = t;
     let orphan = (3u16, 3u16);
 
-    // Within ~1.5 s the first key's cell is gone while the burst still glows:
-    // it does not outlive the ribbon it started.
     glow.tick(
         Some((0, 5)),
         t_last + Duration::from_millis(1500),
@@ -1134,8 +1011,6 @@ fn rainbow_first_key_orphan_does_not_outlive_the_ribbon() {
         !mid.contains(&orphan),
         "the first-key orphan fades with the burst, not 10s later: {mid:?}"
     );
-    // And nothing is left parked anywhere long after — no lone mini-rainbow
-    // burning at constant brightness while the rest of the screen is dark.
     glow.tick(
         Some((0, 5)),
         t_last + Duration::from_millis(8000),
@@ -1162,7 +1037,6 @@ fn rainbow_decays_to_empty_when_idle() {
     glow.note_synthetic_move(t);
     glow.tick(Some((2, 8)), t, &c, g, &mut out);
     assert!(!out.is_empty(), "ribbon present right after a move");
-    // Long after the comet duration, no move: everything decays away.
     let fp = glow.tick(Some((2, 8)), t + Duration::from_secs(2), &c, g, &mut out);
     assert!(out.is_empty(), "ribbon fully decayed when idle");
     assert_eq!(

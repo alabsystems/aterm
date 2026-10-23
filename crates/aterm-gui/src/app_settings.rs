@@ -7,6 +7,7 @@
 use crate::App;
 
 /// `/usr/bin/tccutil`'s presence, read once per process (the Security page republishes
+/// every park).
 fn tccutil_presence_once() -> aterm_containment::TccutilPresence {
     static PRESENCE: std::sync::OnceLock<aterm_containment::TccutilPresence> =
         std::sync::OnceLock::new();
@@ -14,10 +15,13 @@ fn tccutil_presence_once() -> aterm_containment::TccutilPresence {
 }
 
 /// The font rows the terminal's latest font generation could not find, for
+/// a Settings view opened after that generation.
 static SETTINGS_FONT_REFUSALS: std::sync::Mutex<Vec<crate::native_font_catalog::FontRefusal>> =
     std::sync::Mutex::new(Vec::new());
 
 /// The installed fonts the Settings font pickers offer: the Settings
+/// controller they were last listed for, and the last list the listing
+/// thread sent.
 static SETTINGS_FONT_FAMILIES: std::sync::Mutex<(
     Option<crate::native_app::AppInstanceId>,
     Option<std::sync::Arc<aterm_render::font_catalog::MonospaceFamilies>>,
@@ -35,6 +39,7 @@ pub(crate) fn settings_font_families()
 
 impl App {
     /// Every live Settings presentation in `wid`, focused or not: a split or restore may
+    /// put Settings beside a terminal or another app, so focus is not identity.
     fn settings_tabs_in_window(
         &self,
         wid: crate::WindowId,
@@ -84,6 +89,7 @@ impl App {
     }
 
     /// Find the Settings presentation in `wid`: active and focused first, then stable
+    /// tab/view order.
     fn settings_tab_in_window(
         &self,
         wid: crate::WindowId,
@@ -295,6 +301,8 @@ impl App {
     }
 
     /// Give every Settings view what the terminal's sealed font generation
+    /// draws each style with, so an unset font row names it ("Automatic (SF
+    /// Mono Italic)").
     fn hand_settings_drawn_faces(&mut self) {
         let drawn = self.backend.drawn_faces().cloned();
         let mut views = Vec::new();
@@ -464,6 +472,7 @@ impl App {
     }
 
     /// The Settings views of `views` on the Security page: only they carry the
+    /// block.
     fn security_route_views(
         &self,
         views: Vec<(crate::WindowId, crate::tab_model::ViewId)>,
@@ -522,6 +531,8 @@ impl App {
     }
 
     /// The Security page's half of [`Self::sync_settings_consent_posture`], over
+    /// `views` (every Settings view): build the block once and hand it to each view
+    /// on the Security route.
     fn publish_security_page(&mut self, views: Vec<(crate::WindowId, crate::tab_model::ViewId)>) {
         let targets = self.security_route_views(views);
         if targets.is_empty() {
@@ -536,6 +547,7 @@ impl App {
     }
 
     /// Whether `view` is on screen: a leaf of its window's active tab, in a window
+    /// the OS does not report occluded (minimized or fully covered).
     fn settings_view_on_screen(
         &self,
         wid: crate::WindowId,
@@ -551,6 +563,8 @@ impl App {
     }
 
     /// Hand the Security block's projection, and the gesture arms, to each of
+    /// `targets` (the Settings views on that page), repainting a view whose
+    /// block changed.
     fn publish_macos_access(
         &mut self,
         targets: &[(crate::WindowId, crate::tab_model::ViewId)],
@@ -580,6 +594,7 @@ impl App {
     }
 
     /// The gesture drain for [`Self::sync_settings_consent_posture`], over every
+    /// Settings view it found.
     fn drain_settings_gesture_requests(
         &mut self,
         views: &[(crate::WindowId, crate::tab_model::ViewId)],
@@ -707,7 +722,7 @@ impl App {
         }
     }
 
-    /// Consume the first confirmed request in the stable view traversal order. Other
+    /// Consume the first confirmed request in the stable view traversal order.
     #[cfg(any(target_os = "macos", test))]
     fn apply_askpass_off_requests(
         &mut self,
@@ -749,6 +764,7 @@ impl App {
     }
 
     /// Assemble what the Security page renders: `App` state, the cached probe, and one
+    /// `proc_pidpath` for the image anchor.
     fn macos_access_projection(&mut self, on_screen: bool) -> crate::native_settings::MacosAccess {
         let facts = if on_screen {
             self.consent_panel_facts()
@@ -800,6 +816,11 @@ impl App {
     }
 
     /// What the Security page's DEVELOPER TOOLS card renders (debugger design
+    /// §9.1; owner ask 2026-10-15): the CACHED devtools slot answer — the
+    /// switch's row, tccd's answer and the verdict they join to, the one the
+    /// digest line and the helper panel act on — with tccd's answer aged in
+    /// whole minutes so the equality-gated republish repaints at most once a
+    /// minute.
     fn devtools_access_facts(&mut self, on_screen: bool) -> crate::native_settings::DevToolsFacts {
         let gate = self.config.privacy_probe_gate();
         let observer_off = self.config.privacy_observer_off();
@@ -854,6 +875,7 @@ impl App {
     }
 
     /// The Security block's *Move to Trash* status row: under way, refused before
+    /// it started, or the last move's summary.
     fn claimant_retire_status(&self) -> Option<String> {
         if self.claimant_retire.is_live() {
             return Some("Moving copies of aterm to the Trash\u{2026}".to_string());
@@ -1311,6 +1333,8 @@ impl App {
     }
 
     /// Where window `wid`'s visible grid (and the tab strip above it) sits in the client
+    /// area, in physical pixels (the space the AT-SPI adapter reports root bounds in),
+    /// from the window's own metrics.
     #[cfg(a11y_tree)]
     fn grid_a11y_geometry(&self, wid: crate::WindowId) -> Option<crate::a11y_tree::GridGeometry> {
         // An unknown window would fall back to the shared backend metrics, another
@@ -1382,6 +1406,7 @@ impl App {
     }
 
     /// Window `wid`'s visible split panes as one terminal document each, sliced from the
+    /// composed cells the frame was drawn from.
     #[cfg(a11y_tree)]
     fn grid_a11y_panes(
         &self,
@@ -1449,6 +1474,7 @@ impl App {
     }
 
     /// The painted selection covering one published document: the whole visible grid
+    /// (`row_off = 0`, full column range) or one pane's rectangle.
     #[cfg(a11y_tree)]
     fn grid_a11y_selection(
         &self,
@@ -1509,6 +1535,7 @@ impl App {
     }
 
     /// The chrome messages window `wid` is showing now: surfaces that speak unprompted
+    /// and then leave, which a screen reader cannot find by exploring.
     #[cfg(a11y_tree)]
     fn grid_a11y_messages(&self, wid: crate::WindowId) -> Vec<crate::a11y_tree::GridMessage> {
         use crate::a11y_tree::{ChromeMessage, GridMessage};
@@ -1728,6 +1755,7 @@ impl App {
     }
 
     /// A committed row still has the id and action authorization captured by
+    /// the publisher.
     #[cfg(a11y_tree)]
     fn committed_a11y_message(
         &self,
@@ -1742,6 +1770,8 @@ impl App {
     }
 
     /// The message on committed band row `row` of window `wid` now, or `None` when the
+    /// row is not committed, is the overflow link, or holds no message: the live
+    /// re-check every a11y activate makes.
     #[cfg(a11y_tree)]
     fn committed_band_message(
         &self,
@@ -1930,6 +1960,10 @@ mod tests {
     use aterm_effects::trail_sound::{SoundGesture, SoundKind, SoundVoice};
 
     /// THE RUNNING APP REUSES A SHORT WINDOW'S CHROME BETWEEN ITS FRAMES
+    /// (#64): the pass the event loop runs before every wait hands each
+    /// Settings view the facts it shows (its session runtime, the font list,
+    /// the faces drawn, the access posture), and a frame of the preview's
+    /// clock compiles the page again.
     #[test]
     fn an_idle_pass_and_a_frame_of_the_clock_keep_the_chrome_decided() {
         use crate::native_app::AppViewState;
@@ -2362,6 +2396,7 @@ mod tests {
     }
 
     /// A headless instance on the Security page runs the park hop and publishes no
+    /// posture: no probe read, no `NSWorkspace`, no block to press.
     #[test]
     fn a_headless_security_page_publishes_no_consent_posture_and_touches_no_probe() {
         let mut app = App::headless_for_test();
@@ -2569,6 +2604,8 @@ mod tests {
     }
 
     /// A finished move reaches the projection: the worker's report arrives, the
+    /// wake folds it (and invalidates the census), and the projection carries
+    /// the per-copy outcomes and the status row.
     #[test]
     fn a_finished_move_reaches_the_projection() {
         let mut app = App::headless_for_test();
@@ -2624,6 +2661,7 @@ mod tests {
     }
 
     /// The publish step hands a real projection to a Security view, and the
+    /// view renders the move: its status row and its per-copy line.
     #[test]
     fn a_published_move_renders_on_the_security_page() {
         let mut app = App::headless_for_test();
@@ -2657,6 +2695,8 @@ mod tests {
     }
 
     /// The wakes that land a consent fact (a probe answer, a warm-up row, a
+    /// *Move to Trash* report) leave the repaint to the park's publish step,
+    /// which repaints the window whose Security block changed and no other.
     #[test]
     fn a_consent_publication_repaints_only_the_changed_security_view() {
         let mut app = App::headless_for_test();
@@ -2712,6 +2752,7 @@ mod tests {
     }
 
     /// The Full Disk Access probe and the DEVELOPER TOOLS card's `log show` start
+    /// only while a Security view is on screen (debugger design §9.1, O12).
     #[test]
     fn a_hidden_security_page_starts_no_fda_or_devtools_probe() {
         use crate::consent_state::SlotKind;
@@ -2818,6 +2859,7 @@ mod tests {
     }
 
     /// A confirmed warm-up that the host cannot start says why, in the view it
+    /// was confirmed from, in place of the line that said it was asking.
     #[test]
     fn a_confirmed_warm_up_that_starts_nothing_says_why() {
         let mut app = App::headless_for_test();
@@ -2851,6 +2893,9 @@ mod tests {
     }
 
     /// A confirmed debugger-access press is drained at the park and handed to
+    /// `begin_debugger_access_change`, whose gates refuse it on a headless
+    /// instance before any arm is reached; the refusal rides the row's facts,
+    /// nothing is in flight, and the park arms no deadline for it.
     #[test]
     fn a_confirmed_debugger_change_on_a_headless_instance_starts_nothing_and_says_why() {
         use aterm_containment::consent::DebuggerChange;
@@ -2902,6 +2947,9 @@ mod tests {
     }
 
     /// THE `WF(Notice)` SITE, App level (debugger design §5.1, §5.4): while a
+    /// change is under way the App folds the lane's `RESULT_RECHECK` into the
+    /// park, and the park's own consent-lane tick takes a result whose wake
+    /// never came and re-probes.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_debugger_change_under_way_is_folded_into_the_park_and_read_by_its_tick() {
@@ -2972,6 +3020,12 @@ mod tests {
     }
 
     /// THE DEVELOPER TOOLS HAND-OVER at the park (owner ask 2026-10-15), the
+    /// debugger change's sibling: the window's own hand-over waits for a quiet
+    /// moment and arms nothing while no aterm window is focused; the owner's
+    /// press opens the page and shows the helper panel through the one lane;
+    /// while the panel is up the App folds its turn into the park as
+    /// `DeadlineOwner::DevToolsHandOver`, and the park's own consent-lane tick
+    /// reads the list on a worker and takes the result whatever its wake did.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_devtools_hand_over_under_way_is_folded_into_the_park_and_read_by_its_tick() {
@@ -3067,6 +3121,10 @@ mod tests {
     }
 
     /// THE DEVELOPER TOOLS CARD'S BUTTON (owner ask 2026-10-15) is the one
+    /// hand-over: its press is recorded on the view, the park performs it
+    /// through `App::hand_devtools_to_owner(Origin::Settings)` — the page, and
+    /// the helper panel beside it — and what it did lands on the view's bar
+    /// with the route in words.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_developer_tools_cards_press_is_the_one_hand_over() {
@@ -3139,6 +3197,11 @@ mod tests {
     }
 
     /// A PRESS ON A LIST READ EMPTY waits for `spctl developer-mode
+    /// enable-terminal` before the page can open: the card's bar says the page is
+    /// on its way, and when the run ends it says how it came out — opened, opened
+    /// with macOS showing no list because the run failed (and the panel says why
+    /// and offers Show it), or (the negative control) not — instead of a promise
+    /// left standing.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_cards_press_that_waits_for_spctl_hears_how_the_page_came_out() {
@@ -3229,6 +3292,11 @@ mod tests {
     }
 
     /// A HAND-OVER THE OWNER DID NOT PRESS, JUDGED QUIET BEFORE ITS `spctl` RUN, IS
+    /// JUDGED AGAIN WHEN THE RUN ENDS (the run takes as long as syspolicyd takes): the
+    /// moment has passed — here no aterm window is focused — so System Settings does
+    /// not take focus; the hand-over waits for the next quiet moment with the run's
+    /// answer, and then opens the page without running `spctl` again, the panel
+    /// saying Terminal is aterm's doing.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_hand_over_judged_quiet_before_spctl_is_judged_again_when_it_ends() {
@@ -3317,6 +3385,10 @@ mod tests {
     }
 
     /// THE WINDOW'S OWN HAND-OVER, REFUSED AS UNKNOWN AT ITS QUIET MOMENT (a later
+    /// reading read nothing: no Full Disk Access, no new program in tccd's window), is
+    /// no decision against it: the next `not_granted` reading asks for it again,
+    /// rather than the once-per-process latch keeping it from ever coming back in this
+    /// process.
     #[cfg(target_os = "macos")]
     #[test]
     fn an_automatic_hand_over_refused_as_unknown_asks_again_at_the_next_reading() {
@@ -3363,6 +3435,10 @@ mod tests {
     }
 
     /// What the DEVELOPER TOOLS card is told: while the window's own re-read is
+    /// out, the switch the hand-over lane last read stands in (no flicker to
+    /// "Checking…" on every focus gain); and when aterm last opened the page is
+    /// read from the shared marker ONCE — not per park — taken from the lane
+    /// when the lane writes it, and read again only after a focus gain.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_devtools_card_reads_the_lanes_switch_and_the_opened_marker_once() {
@@ -3423,6 +3499,12 @@ mod tests {
     }
 
     /// `aterm ctl devtools hand-over [now]` (owner ask 2026-10-15) is the one
+    /// hand-over with `Origin::Ctl`, held to the window's own rules because
+    /// every in-session client may send it: the bare form never opens the page
+    /// as it asks but waits for a quiet moment; `now` (a person at `aterm
+    /// doctor`'s terminal) shows only the panel — the asker opens the page —
+    /// and ends any hand-over still waiting, so the page is not brought up a
+    /// second time later.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_control_verbs_ask_is_held_to_the_windows_own_rules() {
@@ -3546,6 +3628,8 @@ mod tests {
     }
 
     /// What a lane step asks of the host: an unchanged re-probe is the owner's decline
+    /// (the shared quiet doubles, nothing retries), and an observed transition is a
+    /// record under `privacy.debugger`, never a row.
     #[test]
     fn a_debugger_change_that_reads_unchanged_is_a_decline_and_an_observed_one_a_record() {
         use crate::debugger_access::{DebuggerRecord, DriftStep, LaneStep, Outcome};
@@ -3602,6 +3686,8 @@ mod tests {
     }
 
     /// The real park step drains a confirmed press from every Settings view in a
+    /// window, one that has left the Security page included, and hands every view the
+    /// process's one record of the owner's declines.
     #[test]
     fn the_park_drains_every_settings_view_and_shares_the_decline_record() {
         let mut app = App::headless_for_test();
@@ -3963,6 +4049,7 @@ mod tests {
     }
 
     /// The audition is gated like a keystroke: the "Music effects" master off, zero
+    /// volume, or serious mode pushes nothing (and the latch still moves).
     #[test]
     fn the_audition_is_gated_like_a_keystroke() {
         let mut app = app_with_capture();
@@ -3990,6 +4077,7 @@ mod tests {
     }
 
     /// The reload path auditions a changed voice once and an unchanged one never:
+    /// re-applying the same config (or an alias) is silent.
     #[test]
     fn a_config_swap_auditions_only_a_changed_voice_and_never_twice() {
         let mut app = app_with_capture();
@@ -4013,6 +4101,7 @@ mod tests {
     }
 
     /// The window's `a11y_active` latch gates tree building: down until an OS client
+    /// attaches (every OS window has an adapter), up on attach, down on detach.
     #[cfg(a11y_tree)]
     #[test]
     fn accessibility_publish_latches_on_attach_and_clears_on_detach() {
@@ -4193,6 +4282,8 @@ mod tests {
 }
 
 /// The production wiring for chrome-message live regions: the `App` methods that read
+/// the live window and decide what a screen reader is told (which band is on the
+/// glass, how the frame cut it), on a real `App`.
 #[cfg(all(test, a11y_tree))]
 mod a11y_message_wiring_tests {
     use std::time::Instant;
@@ -4208,6 +4299,8 @@ mod a11y_message_wiring_tests {
     }
 
     /// A band row is announced where it is painted, and only while it is: the tree reads
+    /// the committed `message_band_rows` the splice trims to, and volatile figures stay
+    /// out of the spoken half so a byte counter never re-announces the row.
     #[test]
     fn a_band_row_is_announced_at_the_row_it_reserves_and_only_while_it_holds_it() {
         let mut app = App::headless_for_test();
@@ -4262,6 +4355,8 @@ mod a11y_message_wiring_tests {
     }
 
     /// A row that asks is an alert, not status: the Full Disk Access question reaches
+    /// assistive technology with the alert role at the band's polite politeness, while
+    /// work in flight stays a progress indicator.
     #[test]
     fn a_decision_row_is_an_alert() {
         let mut app = App::headless_for_test();
@@ -4283,6 +4378,9 @@ mod a11y_message_wiring_tests {
     }
 
     /// Activating a band row performs its body press (the row's `Details ›`, Settings ▸
+    /// Messages at that entry in this window); the `Details ›` child carries its full
+    /// label and does the same; an authored child performs its own intent; an activate
+    /// on a row the frame no longer carries does nothing.
     #[test]
     fn activating_a_band_row_performs_its_body_press_and_a_capsule_child_its_intent() {
         let mut app = App::headless_for_test();
@@ -4492,6 +4590,8 @@ mod a11y_message_wiring_tests {
     }
 
     /// An a11y activate on any committed band row opens that row's `Details ›` (Settings
+    /// ▸ Messages at that entry in this window), reads the row (a held one folds; the row
+    /// count holds through its quiet) and leaves its neighbour alone.
     #[test]
     fn a11y_activate_on_a_row_opens_details() {
         let settings = |app: &App, wid: WindowId| {
@@ -4650,6 +4750,8 @@ mod a11y_message_wiring_tests {
     }
 
     /// A countdown never re-announces a row: a download's latched ETA rides the
+    /// description as a reader says it ("about … left"); the spoken name is the title
+    /// alone.
     #[test]
     fn a_countdown_never_reannounces_a_row() {
         let mut app = App::headless_for_test();

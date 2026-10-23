@@ -187,6 +187,7 @@ pub struct Out {
 }
 
 /// A line saying `limactl` itself ended on a signal, for its output; empty
+/// when it exited.
 fn ended_on_signal(status: std::process::ExitStatus) -> String {
     use std::os::unix::process::ExitStatusExt as _;
     status.signal().map_or_else(String::new, |signal| {
@@ -703,7 +704,7 @@ pub struct Up {
     pub home: String,
     pub runtime: String,
     pub booted_here: bool,
-    /// Reserved on the first display start, once per run. Both success and
+    /// Reserved on the first display start, once per run.
     config: OnceLock<Result<guest::Config, String>>,
     /// What it took, in order.
     pub timings: Vec<Step>,
@@ -818,6 +819,7 @@ impl Up {
 }
 
 /// Remove `home`'s [`GUEST_DIR`] in the guest and trim its disk
+/// ([`Up::clean_build`]).
 fn clean_guest_build(lima: &Lima, home: &str) -> Result<(), String> {
     let dir = format!("{home}/{GUEST_DIR}");
     let out = lima.shell(home, &["rm".into(), "-rf".into(), dir], None);
@@ -934,6 +936,7 @@ pub fn bring_up() -> Result<Up, Fail> {
 }
 
 /// What the guest's build directory holds for the checkout `repo`, from
+/// whether [`GUEST_DIR`] exists and what its [`BUILT_FROM`] names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BuildOutput {
     /// No build directory: this run makes it and names itself in it.
@@ -999,6 +1002,8 @@ fn claim_build_output(up: &Up, repo: &str) -> Result<Option<Step>, Fail> {
 }
 
 /// Empty Rosetta's AOT cache when it was not emptied in this boot
+/// ([`guest::ROSETTA_CACHE`] says why): the step, or `None` when this boot's
+/// cache stands.
 fn reset_rosetta_cache(up: &Up) -> Option<Step> {
     let boot = up.sh(&["cat".into(), guest::BOOT_ID.into()]);
     let stamp = up.sh(&["cat".into(), guest::ROSETTA_CACHE_BOOT.into()]);
@@ -1028,6 +1033,7 @@ fn reset_rosetta_cache(up: &Up) -> Option<Step> {
 }
 
 /// Provision the guest when its stamp is not the plan's fingerprint: the
+/// seconds it took, or `None` when it was current.
 fn provision(up: &Up) -> Result<Option<f64>, Fail> {
     let steps = guest::provision_steps();
     let want = guest::fingerprint(&steps);
@@ -1084,6 +1090,7 @@ fn cmd_up() -> Res {
 }
 
 /// Stop the VM `up` held, removing the build output its `exec`s left (a
+/// session's output is kept between its `exec`s, never past its `down`).
 fn cmd_down() -> Res {
     let lima = Lima::find()?;
     let _lock = LaneLock::take()?;
@@ -1475,6 +1482,7 @@ mod tests {
     use super::*;
 
     /// A process that dies of a signal says which; one that exits says
+    /// nothing more.
     #[test]
     fn a_signal_that_ended_limactl_is_named() {
         let run = |script: &str| {
@@ -1491,6 +1499,8 @@ mod tests {
     }
 
     /// An empty reply says how it ended: a silent exit 255 (a guest-side
+    /// signal looks so), `limactl` itself ended (no exit status), or a plain
+    /// exit.
     #[test]
     fn a_failure_names_how_it_ended() {
         let out = |code: Option<i32>, text: &str| Out {
@@ -1542,6 +1552,7 @@ mod tests {
     }
 
     /// A run builds on the guest's output only when its stamp names this
+    /// checkout.
     #[test]
     fn a_run_builds_only_on_its_own_checkouts_output() {
         let me = "/Users//u/aterm-dv-a";
@@ -1563,6 +1574,8 @@ mod tests {
     }
 
     /// A linked worktree's `.git` file names its gitdir under the main checkout's
+    /// `.git`, whose `commondir` leads back to that `.git`: the guest mounts it
+    /// beside the worktree.
     #[test]
     fn a_linked_worktree_mounts_its_repositorys_git_directory() {
         let root = aterm_tempfile::tempdir().expect("scratch");

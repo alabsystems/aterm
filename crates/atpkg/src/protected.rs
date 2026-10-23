@@ -1,35 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The folders macOS guards with a per-folder consent dialog, named once for atpkg's
-//! unattended lanes (the update pass, the first-launch seed, the doctor's ambient walk) so
-//! none of them opens one by accident.
-//!
-//! macOS attributes the dialog to the responsible app, aterm, so an unattended open under
-//! `~/Documents` raises an unexplained dialog in front of nobody and parks the pass on a
-//! modal with no timeout (`docs/DESIGN-macos-tcc-prompts-2026-08-30.md` §1.4).
-//!
-//! `stat`/`lstat`/`realpath` on a protected path are not gated (§1.5); `open()` of file
-//! data, directory enumeration, `access(R|W_OK)`, extended-attribute reads and
-//! writes/creates are. So a lane that follows a symlink (a `~/.zshrc` into a dotfiles repo)
-//! may `canonicalize` it and check the result with [`under_protected_root`] before its
-//! first open.
-//!
-//! * the six per-folder services under `$HOME` ([`HOME_FOLDERS`]), which
-//!   `aterm_containment::sbpl::PRIVATE_SUBDIRS` denies;
-//! * the two file-provider domains under `~/Library` ([`LIBRARY_DOMAINS`]): iCloud Drive
-//!   (`Mobile Documents`) and third-party sync providers (`CloudStorage`), EPERM even under
-//!   a held Full Disk Access grant (§3.4);
-//! * the two App Data roots under `~/Library`
-//!   ([`aterm_containment::sbpl::APP_DATA_ROOTS`]): `Containers` and `Group Containers`,
-//!   which macOS guards with `kTCCServiceSystemPolicyAppData` (`"… would like to access
-//!   data from other apps."`). An Allow there is forgotten when the responsible process
-//!   exits (§1.6a), so an unattended pass that follows a link into either root raises a
-//!   modal dialog on every launch where Full Disk Access is not held;
-//! * `/Volumes` ([`ABSOLUTE_ROOTS`]): network and removable volumes, each its own service.
-//!
-//! `~/Library` as a whole is not a root: atpkg's own store lives under
-//! `~/Library/Application Support`.
+//! macOS TCC-protected folders ([`under_protected_root`], [`HOME_FOLDERS`],
+//! [`LIBRARY_DOMAINS`], [`aterm_containment::sbpl::APP_DATA_ROOTS`], [`ABSOLUTE_ROOTS`]).
 
 use std::path::{Component, Path};
 
@@ -51,11 +24,6 @@ pub const LIBRARY_DOMAINS: &[(&str, &str)] =
 pub const ABSOLUTE_ROOTS: &[&str] = &["/Volumes"];
 
 /// Whether `path` lies at or under a root macOS guards with a consent dialog.
-///
-/// Purely lexical (no symlink followed, nothing stat'ed), and per component:
-/// `$HOME/Documentsx` is not `$HOME/Documents`. Hand it a `canonicalize`d path (not gated,
-/// §1.5) to ask about the file that would be opened. `home` is compared as given, so a
-/// caller whose home may be reached through a link canonicalizes both sides.
 #[must_use]
 pub fn under_protected_root(home: &Path, path: &Path) -> bool {
     if ABSOLUTE_ROOTS
@@ -89,15 +57,7 @@ pub fn under_protected_root(home: &Path, path: &Path) -> bool {
         || under_app_data(home, path)
 }
 
-/// Whether `path` lies at or under a file-provider domain: iCloud Drive
-/// (`Library/Mobile Documents`) or a third-party sync provider (`Library/CloudStorage`).
-///
-/// Narrower than [`under_protected_root`] on purpose: a held Full Disk Access grant reaches
-/// the `$HOME` folders and `/Volumes`, so refusing them would block consented work. The
-/// file-provider domains are the class that grant does not reliably cover (`NEVER_COVERED`
-/// in the `privacy` verb), so an access there can raise a dialog in aterm's name, a consent
-/// surface a program inside a session would control. Lexical, per component; shares
-/// [`LIBRARY_DOMAINS`] with its sibling.
+/// Whether `path` is under a file-provider domain ([`under_protected_root`], [`LIBRARY_DOMAINS`]).
 #[must_use]
 pub fn under_file_provider_domain(home: &Path, path: &Path) -> bool {
     let Ok(rest) = path.strip_prefix(home) else {
@@ -118,23 +78,7 @@ pub fn under_file_provider_domain(home: &Path, path: &Path) -> bool {
         .any(|(lib, domain)| first == *lib && second == *domain)
 }
 
-/// Whether `path` lies at or under a root macOS guards with
-/// `kTCCServiceSystemPolicyAppData` (`"… would like to access data from other
-/// apps."`): `Library/Containers` or `Library/Group Containers` under `home`
-/// ([`aterm_containment::sbpl::APP_DATA_ROOTS`]).
-///
-/// Separate from [`under_file_provider_domain`] because a held Full Disk Access
-/// grant DOES cover App Data, whereas file-provider domains can still prompt
-/// under FDA; separate from [`HOME_FOLDERS`] because an App Data Allow is
-/// session-scoped (forgotten when the responsible process exits, design §1.6a)
-/// and has no System Settings toggle, so every unattended lane inside aterm
-/// (the supervisor's hidden-twin listing, the harness's disk discovery, the
-/// footer's git probe, atpkg's protected-root fence) refuses to list or walk
-/// inside it.
-///
-/// Purely lexical, per component; any unnormalized `..` component below `home`
-/// fails closed (`true`). Shares [`aterm_containment::sbpl::APP_DATA_ROOTS`]
-/// with `aterm-containment`, so the two crates cannot drift.
+/// Whether `path` lies under an app-data root ([`under_file_provider_domain`], [`HOME_FOLDERS`]).
 #[must_use]
 pub fn under_app_data(home: &Path, path: &Path) -> bool {
     let Ok(rest) = path.strip_prefix(home) else {
@@ -173,7 +117,6 @@ mod tests {
                 "{p} is also protected at large"
             );
         }
-        // Protected, but reached by a held grant: the narrow predicate must not claim them.
         let protected_elsewhere = [
             "/Users//someone/Documents/notes.md",
             "/Users//someone/Desktop/notes.md",
@@ -189,7 +132,6 @@ mod tests {
                 "{p} is protected but is not a file-provider domain"
             );
         }
-        // Per component, never a string prefix, and `~/Library` alone is neither.
         for p in [
             "/Users//someone/Library",
             "/Users//someone/Library/CloudStoragex/a",

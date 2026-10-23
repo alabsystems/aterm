@@ -10,6 +10,8 @@ use crate::PageStore;
 use crate::Row;
 
 /// One captured source cell for a DECCRA (`copy_rect`) ring restore:
+/// `(row_offset, col_offset, fg_rgb, bg_rgb, complex_char)`, all relative to the
+/// destination rect.
 type RingCapture = (u16, u16, Option<[u8; 3]>, Option<[u8; 3]>, Option<char>);
 
 impl Grid {
@@ -60,6 +62,9 @@ impl Grid {
     }
 
     /// Write the BCE truecolor background for the cells of `cols` on `row`
+    /// that a selective erase cleared: every cell there that is not protected
+    /// afterwards (the fill never is, and a protected cell keeps its own
+    /// colours and ring bytes).
     fn fill_bce_rgb_unprotected(&mut self, row: u16, cols: core::ops::Range<u16>) {
         if self.storage.cursor_template_bg_rgb.is_none() {
             return;
@@ -116,6 +121,7 @@ impl Grid {
     }
 
     /// Keep `row`'s length over the last cell left of `before` that still
+    /// carries a combining mark.
     fn keep_len_over_marks(&mut self, row: u16, before: u16) {
         let len = self.row(row).map_or(0, crate::Row::len);
         if len >= before || self.storage.extras.is_empty() {
@@ -205,6 +211,7 @@ impl Grid {
     }
 
     /// Clear a range of full rows for a screen-level erase: xterm's
+    /// `ClearBufRows`, including its line-attribute reset.
     fn clear_rows(&mut self, range: core::ops::Range<u16>, selective: bool) {
         let fill = self.storage.cursor_template;
         for row in range.clone() {
@@ -276,6 +283,7 @@ impl Grid {
     }
 
     /// ED 0 / DECSED 0 without the wrap reset: the cursor row from the cursor
+    /// on, then every row below it.
     fn erase_below_cursor(&mut self, selective: bool) {
         self.erase_to_end_of_line_core(selective);
         let cursor_row = self.storage.cursor.row;
@@ -288,6 +296,7 @@ impl Grid {
     }
 
     /// ED 1 / DECSED 1 without the wrap reset: every row above the cursor, then
+    /// the cursor row up to and including the cursor.
     fn erase_above_cursor(&mut self, selective: bool) {
         let cursor_row = self.storage.cursor.row;
         self.clear_rows(0..cursor_row, selective);
@@ -438,6 +447,7 @@ impl Grid {
     }
 
     /// Reset the deferred wrap the way xterm's protected erase (`ClearInLine2`)
+    /// does: only when some cell of the erase's span is unprotected.
     fn reset_wrap_unless_span_protected(
         &mut self,
         full_rows: core::ops::Range<u16>,
@@ -603,6 +613,8 @@ impl Grid {
     }
 
     /// Rewrite the attribute flags of every cell in a rectangle, or with
+    /// `stream` (DECSACE stream mode) a character stream, through `edit`: the
+    /// walk behind DECCARA and DECRARA.
     fn edit_attrs(
         &mut self,
         top: u16,
@@ -957,6 +969,7 @@ mod tests {
     }
 
     /// Arm a real deferred wrap: print row `row` to its last column with
+    /// deferred autowrap.
     fn arm_wrap_on_row(grid: &mut Grid, row: u16, cols: u16) {
         grid.move_cursor_to(row, 0);
         for col in 0..cols {
@@ -979,6 +992,7 @@ mod tests {
     }
 
     /// Helper: after an erase reset the wrap, the next printable must overwrite
+    /// the parked last column of `row` — not wrap to the next row.
     fn assert_next_glyph_overwrites_last_col(grid: &mut Grid, row: u16, cols: u16) {
         grid.write_char_wrap('?');
         assert_eq!(
@@ -1042,6 +1056,7 @@ mod tests {
         }
 
         /// Whether the erase reaches `(row, col)` with the cursor at
+        /// `(cr, cc)`: the cursor cell is always inclusive.
         fn covers(self, (cr, cc): (u16, u16), (row, col): (u16, u16)) -> bool {
             match self {
                 Self::El0 | Self::Sel0 => row == cr && col >= cc,
@@ -1063,6 +1078,9 @@ mod tests {
     }
 
     /// Run `op` on a filled `size` grid with the cursor at `cursor` (parked
+    /// there by a real deferred wrap when `armed`) and `protected` cells, then
+    /// check every cell: erased exactly where the op reaches, minus protected
+    /// cells for the selective ops.
     fn erase_and_check(
         op: Erase,
         size: (u16, u16),
@@ -1104,6 +1122,9 @@ mod tests {
     }
 
     /// EVERY EL/ED/DECSEL/DECSED ERASES EXACTLY ITS SPAN: from the cursor
+    /// (inclusive) to the end, from the start, or the whole line or screen,
+    /// leaving every other row alone, and the selective forms skip DECSCA
+    /// protected cells — at every cursor corner and on a 1x1 grid.
     #[test]
     fn every_erase_clears_exactly_its_span() {
         const PROTECTED: &[(u16, u16)] = &[(0, 1), (1, 3), (1, 6), (2, 0), (2, 8), (3, 4), (3, 9)];
@@ -1117,7 +1138,7 @@ mod tests {
         }
     }
 
-    /// THE DEFERRED WRAP FOLLOWS XTERM'S util.c. Every EL/ED resets it (ED 3
+    /// THE DEFERRED WRAP FOLLOWS XTERM'S util.c.
     #[test]
     fn erases_reset_the_pending_wrap_as_xterm_does() {
         const ROW_0: &[(u16, u16)] = &[(0, 0), (0, 1), (0, 2), (0, 3), (0, 4)];
@@ -1182,6 +1203,8 @@ mod tests {
     }
 
     /// DECALN fills the whole screen with default-attribute 'E's over whatever
+    /// was there, homes the cursor, resets the scroll region, clears the
+    /// pending wrap and returns every row to single width.
     #[test]
     fn decaln_fills_the_screen_and_resets_the_cursor_state() {
         for (rows, cols) in [(4, 10), (1, 1)] {
@@ -1215,6 +1238,9 @@ mod tests {
     }
 
     /// DECERA, DECSERA, DECFRA and DECCARA touch exactly their rectangle,
+    /// clamped to the grid; an inverted rectangle is a no-op; DECSERA alone
+    /// skips protected cells; and none of them (nor DECCRA) consumes the
+    /// pending wrap.
     #[test]
     fn rect_ops_touch_exactly_their_rectangle() {
         type Rect = (u16, u16, u16, u16);
@@ -1390,6 +1416,9 @@ mod tests {
     }
 
     /// DECSEL/DECSED erase with the BCE background, as EL/ED do: xterm's
+    /// protected erases reach the same `ClearCells` (screen.c), which writes
+    /// the current colour pair over each unprotected segment, and Ghostty's
+    /// `clearUnprotectedCells` clears each run with its blank cell.
     #[test]
     fn selective_erases_fill_with_the_bce_background() {
         use crate::{Cell, PackedColors};
@@ -1463,6 +1492,8 @@ mod tests {
     }
 
     /// A BCE blank is content: a selective erase that paints past the old end
+    /// of a short row grows the row's length to the last coloured cell, so the
+    /// renderer draws the run (the non-selective erases' `len` rule).
     #[test]
     fn a_selective_bce_erase_counts_as_row_content() {
         use crate::{Cell, PackedColors};
@@ -1488,6 +1519,7 @@ mod tests {
     }
 
     /// The truecolor half: the cleared cells carry only the RGB marker, so the
+    /// ring must hold their bytes; a protected cell's stay untouched.
     #[test]
     fn a_selective_erase_writes_the_truecolor_ring_for_the_cleared_cells_only() {
         use crate::{Cell, PackedColor};
@@ -1825,6 +1857,9 @@ mod tests {
     }
 
     /// A combining mark on a printed blank keeps its cell in the row through an
+    /// erase to its right: `$ ` with a mark on its space (attached as the
+    /// terminal attaches one: the extra, and the row's length over it), a glyph
+    /// written after it and erased with EL 0.
     #[test]
     fn erase_to_end_of_line_keeps_a_marked_blank_in_the_row() {
         for marked in [true, false] {
@@ -1853,6 +1888,7 @@ mod tests {
     }
 
     /// EL 0 that bisects a wide pair gives the orphaned half the BCE
+    /// background, not default colours.
     #[test]
     fn erase_to_end_of_line_gives_the_wide_orphan_the_bce_background() {
         use crate::{Cell, PackedColors};
@@ -1891,6 +1927,7 @@ mod tests {
     }
 
     /// The truecolor half: a BCE cell holds only an RGB marker, so the ring
+    /// must extend to the orphan that now carries the marker.
     #[test]
     fn erase_to_end_of_line_extends_the_bce_truecolor_ring_to_the_wide_orphan() {
         use crate::{Cell, PackedColor};
@@ -1924,6 +1961,7 @@ mod tests {
     }
 
     /// EL 1 hits the right boundary instead: the continuation just past the
+    /// erase is the orphan.
     #[test]
     fn erase_from_start_of_line_gives_the_wide_orphan_the_bce_background() {
         use crate::{Cell, PackedColors};
@@ -1960,6 +1998,7 @@ mod tests {
     }
 
     /// The truecolor half of EL 1: the orphaned continuation sits one column
+    /// past the erased range, so `fill_bce_rgb_range` runs to `span.end`.
     #[test]
     fn erase_from_start_of_line_extends_the_bce_truecolor_ring_to_the_wide_orphan() {
         use crate::{Cell, PackedColor};
@@ -2006,6 +2045,7 @@ mod tests {
     }
 
     /// EL 2 over a DECLRMM-margin row: the orphan just past the right margin
+    /// takes the BCE blank, and the ring follows it.
     #[test]
     fn erase_line_within_margins_gives_the_wide_orphan_the_bce_background_and_ring() {
         use crate::{Cell, PackedColor};
@@ -2062,6 +2102,8 @@ mod tests {
     }
 
     /// DECERA does not give the orphan the BCE background: xterm's
+    /// `ScrnFillRectangle` fixup is `Clear1Cell(ld, left - 1)`, a bare clear
+    /// without the colour pair.
     #[test]
     fn erase_rect_keeps_the_wide_orphan_empty_under_a_bce_background() {
         use crate::{Cell, PackedColors};
@@ -2087,6 +2129,7 @@ mod tests {
     }
 
     /// DECFRA's fill glyph must not bleed into the orphan one column outside the
+    /// rectangle.
     #[test]
     fn fill_rect_keeps_the_wide_orphan_empty() {
         use crate::{Cell, PackedColors};
@@ -2268,6 +2311,7 @@ mod tests {
     }
 
     /// Set a row's DEC line attribute the way `ESC#3` / `ESC#4` / `ESC#6` does:
+    /// the row flag plus the grid-level fast-path flag.
     fn poison_row(grid: &mut Grid, row: u16, size: crate::LineSize) {
         if let Some(r) = grid.row_mut(row) {
             r.set_line_size(size);

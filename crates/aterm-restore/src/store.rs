@@ -80,7 +80,7 @@ pub trait RegionStore: RegionView {
 }
 
 /// The range `[at, at + len)` if it is inside `0..region`.
-fn span(at: usize, len: usize, region: usize) -> Result<std::ops::Range<usize>, StoreError> {
+const fn span(at: usize, len: usize, region: usize) -> Result<std::ops::Range<usize>, StoreError> {
     match at.checked_add(len) {
         Some(end) if end <= region => Ok(at..end),
         _ => Err(StoreError::OutOfBounds { at, len }),
@@ -113,6 +113,7 @@ impl VecStore {
     }
 
     /// The bytes, whatever a panicking holder left (every access is a whole copy or a
+    /// whole word, so there is no half-made state to refuse).
     fn lock_bytes(&self) -> MutexGuard<'_, Vec<u8>> {
         self.bytes.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -336,7 +337,7 @@ impl<S: RegionView> Touched<S> {
 
     /// The region whose pages this counts.
     #[must_use]
-    pub fn get_ref(&self) -> &S {
+    pub const fn get_ref(&self) -> &S {
         &self.inner
     }
 
@@ -402,6 +403,7 @@ impl<S: RegionStore> RegionStore for Touched<S> {
 }
 
 /// The window's region: the shared mapping itself (`aterm_uds::shm`), read-write in the window
+/// that journals the session and read-only in the one that restores it.
 #[cfg(unix)]
 impl RegionView for aterm_uds::shm::Region {
     fn len(&self) -> usize {
@@ -525,6 +527,7 @@ mod tests {
     use super::*;
 
     /// Byte copies at every alignment land exactly, leave their neighbours alone, and
+    /// read back; words round-trip; every access outside the region is refused.
     #[test]
     fn the_heap_region_copies_and_bounds_like_the_mapping() {
         let store = VecStore::new(64);
@@ -571,6 +574,8 @@ mod tests {
     }
 
     /// A shared region takes a writer on one thread and another thread's word at the
+    /// same time, as the window's parse and gather threads write one session's region:
+    /// every store lands, and the session recovers from it as from an unshared one.
     #[test]
     fn a_shared_region_takes_two_threads_words() {
         use crate::layout::{Geometry, OFF_STREAM_GATHERED};
@@ -648,6 +653,8 @@ mod tests {
     }
 
     /// A touched region counts each page once, at its first store, whatever wrote it and
+    /// however often; a refused store counts nothing; the meter carries every live region's
+    /// pages and takes a region's back when it is dropped.
     #[test]
     fn a_touched_region_counts_each_page_once_and_gives_them_back_when_dropped() {
         let meter = Arc::new(AtomicU64::new(0));
@@ -708,6 +715,8 @@ mod tests {
     }
 
     /// A replaced region takes every clone's next store, with what the seed stored already
+    /// in it; the region it replaced comes back as it was; a region of another length is
+    /// refused and the shared one left in place.
     #[test]
     fn a_replaced_region_takes_every_clone_s_next_store() {
         let shared = Shared::new(VecStore::new(64));

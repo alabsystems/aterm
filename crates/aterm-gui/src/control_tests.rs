@@ -11307,6 +11307,36 @@ fn the_caret_anchor_rides_the_screen_around_a_growing_composer() {
     assert_eq!((t.keys.concat().as_str(), t.enters), (text, 1));
 }
 
+/// A stall that is no wait for a frame (the typing thread descheduled under load, here a
+/// key's own delivery taking 100 ms) keeps every later key a cadence behind the one before
+/// it. Negative control: keys due on a fixed schedule from the first go out in a burst to
+/// catch up, seven in about 60 ms.
+#[test]
+fn a_stall_is_never_caught_up_in_a_burst() {
+    let stall = |k: usize, _: &Composer, _: &SessionHandle| {
+        if k == 3 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    };
+    let text = "hello world";
+    let t = composer_turn_with(
+        &composer_rule(),
+        76,
+        "cadence=20 timeout=60000",
+        text,
+        &stall,
+    );
+    assert!(t.verdict.contains(" submitted=1 "), "{}", t.verdict);
+    assert_eq!((t.keys.concat().as_str(), t.enters), (text, 1));
+    let ms = |a: usize, b: usize| t.sent_at[b].duration_since(t.sent_at[a]).as_millis();
+    assert!(
+        ms(2, 3) >= 100,
+        "key 4 went out after the stall: {}",
+        ms(2, 3)
+    );
+    assert!(ms(3, 10) >= 135, "no burst after the stall: {}", ms(3, 10));
+}
+
 #[test]
 fn a_torn_frame_is_never_judged() {
     let write_at = |n: usize, close: &'static str| {

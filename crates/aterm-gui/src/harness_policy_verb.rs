@@ -1,54 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `@<sid> harness policy` (the native harness contract §3): aterm's
-//! `[harness]` policy for ONE session, as one reader of aterm.toml answers it,
-//! so an agent that supervises itself (codex-alab) never parses the file.
-//!
-//! ```text
-//! OK gen=<cfg_gen> effective=<on|off> why=<word> <key>=<pct value|-> … questions=<word>
-//!    done_check_text=<pct> land_text=<pct> land_nudge_text=<pct> land_answer_text=<pct>
-//!    needs_hint_text=<pct> needs_ack_text=<pct>
-//! ```
-//!
-//! - `gen=` is the policy cell's generation (`0`: the launch read); the
-//!   `harness-policy gen=<n>` event on `subscribe @self` names the same
-//!   number when the cell moves.
-//! - `effective=`/`why=` are computed by aterm for THIS session, first refusal
-//!   first: `unhosted` (no control socket, nothing supervises), `disabled`
-//!   (`[harness] enabled = false`), `headless` (a headless instance under
-//!   `headless = false`), `agent-off` (the session's agent's own table is
-//!   off), `suspended` (the host is handed off for a seamless update),
-//!   `hold` (a standing halt on the session), `autopilot-off` (the session's
-//!   Autopilot is `off`); `enabled` when it is on.
-//! - every `[harness]` key follows, in `SupervisorConfig`'s own spelling and
-//!   order ([`SupervisorConfig::texts`]), percent-encoded, `-` for an empty
-//!   value; `continue_text=` already composed with the `rules_file` text the
-//!   way aterm's own continuation is ([`continuation_text`]);
-//! - `questions=`, resolved: the session's own `meta questions` word over
-//!   `answer_questions` (off reads `ask`) and `question_priority`;
-//! - then Autopilot Cruise / Land's fixed words, ADDITIVE keys after
-//!   `questions=` (the codex-alab contract's §3; owner 2026-10-19, "we need
-//!   this functionality in ALL HARNESSES"), each the exact text aterm's own
-//!   loop types for this session ([`act_texts`]), so a self-supervising agent
-//!   types aterm's words and never a copy that drifts from them:
-//!   `done_check_text=` (Cruise's defend-and-find-more prompt,
-//!   `continue-done-check@v1`, without the open work, repository, reversible
-//!   and ack suffixes a point adds), `land_text=` (`land@v1`),
-//!   `land_nudge_text=` (`land-nudge@v1`) and `land_answer_text=`
-//!   (`land-answer@v1`), each composed with the `rules_file` text exactly as
-//!   the loop composes the act (the rules after the words, cut to fit the
-//!   composer's verbatim cap); and `needs_hint_text=` (the NEEDS YOU hint
-//!   after an answer) and `needs_ack_text=` (the ack once per new set of
-//!   needs), the two SUFFIXES, bare: the loop types them inside an act,
-//!   before that act's one copy of the standing rules, never with rules of
-//!   their own — a suffix composed with them would type the rules twice in
-//!   every act that carries it. The session's Autopilot word is no key here
-//!   (`autopilot=` is the `[harness]` table's default): an agent reads its
-//!   own from `status autopilot=`.
-//!
-//! An edge token reads only `OK effective=<on|off>`: the full policy, the
-//! texts included, is the owner's.
+//! `@<sid> harness policy` (the native harness contract §3): aterm's `[harness]` policy for ONE session, as one reader of aterm.toml answers it, so an agent that supervises itself (codex-alab) never parses the file.
 
 use aterm_agent::supervise::policy::needs::{NEEDS_ACK, NEEDS_HINT};
 use aterm_agent::supervise::policy::turn_end::{
@@ -57,8 +10,7 @@ use aterm_agent::supervise::policy::turn_end::{
 use aterm_agent::supervise::{Autopilot, SupervisorConfig};
 use aterm_phase::Program;
 
-/// What the main thread knows of one session's policy: the facts the reply is
-/// made of, all but the rules file's text (read off the main thread).
+/// What the main thread knows of one session's policy: the facts the reply is made of, all but the rules file's text (read off the main thread).
 #[derive(Clone, Debug)]
 pub(crate) struct PolicyFacts {
     /// The policy cell's generation.
@@ -78,8 +30,7 @@ pub(crate) struct Posture {
     pub(crate) hosted: bool,
     /// This instance is headless.
     pub(crate) headless: bool,
-    /// The session's agent, where the server names one (else Codex: the
-    /// agent that asks).
+    /// The session's agent, where the server names one (else Codex: the agent that asks).
     pub(crate) agent: Program,
     /// The host is suspended for a seamless update's handoff.
     pub(crate) suspended: bool,
@@ -112,8 +63,7 @@ pub(crate) fn effective(cfg: &SupervisorConfig, p: Posture) -> (bool, &'static s
     (false, why)
 }
 
-/// `questions=`: the session's own word over `answer_questions` (off reads
-/// `ask`) and `question_priority`.
+/// `questions=`: the session's own word over `answer_questions` (off reads `ask`) and `question_priority`.
 #[must_use]
 pub(crate) fn questions(cfg: &SupervisorConfig, session: Option<&str>) -> String {
     match session {
@@ -123,8 +73,7 @@ pub(crate) fn questions(cfg: &SupervisorConfig, session: Option<&str>) -> String
     }
 }
 
-/// The additive text keys after `questions=` (module doc), in their wire
-/// order.
+/// The additive text keys after `questions=` (module doc), in their wire order.
 pub(crate) const ACT_TEXT_KEYS: [&str; 6] = [
     "done_check_text",
     "land_text",
@@ -134,10 +83,7 @@ pub(crate) const ACT_TEXT_KEYS: [&str; 6] = [
     "needs_ack_text",
 ];
 
-/// Autopilot Cruise / Land's fixed words as aterm's own loop types them
-/// for a session whose standing rules read `rules` (module doc), keyed by
-/// [`ACT_TEXT_KEYS`]: the four whole acts through the turn-end policy's own
-/// composers (the rules after the words), the two suffixes bare.
+/// Autopilot Cruise / Land's fixed words as aterm's own loop types them for a session whose standing rules read `rules` (module doc), keyed by [`ACT_TEXT_KEYS`]: the four whole acts through the turn-end policy's own composers (the rules after the words), the two suffixes bare.
 #[must_use]
 pub(crate) fn act_texts(rules: Option<&str>) -> [(&'static str, String); 6] {
     let [done_check, land, nudge, answer, hint, ack] = ACT_TEXT_KEYS;
@@ -151,10 +97,7 @@ pub(crate) fn act_texts(rules: Option<&str>) -> [(&'static str, String); 6] {
     ]
 }
 
-/// The reply line (module doc), newline-terminated. `rules` is the standing
-/// rules' text as the loop reads it
-/// (`aterm_agent::supervise::run::standing_rules`); `owner` whether the
-/// connection is owner-class.
+/// The reply line (module doc), newline-terminated.
 #[must_use]
 pub(crate) fn reply(facts: &PolicyFacts, rules: Option<&str>, owner: bool) -> String {
     let (on, why) = facts.effective;
@@ -192,8 +135,7 @@ pub(crate) fn reply(facts: &PolicyFacts, rules: Option<&str>, owner: bool) -> St
     line
 }
 
-/// The verb's control-thread half: `harness policy` (any other form is its
-/// usage line), the facts fetched by `fetch`, the rules file read here.
+/// The verb's control-thread half: `harness policy` (any other form is its usage line), the facts fetched by `fetch`, the rules file read here.
 pub(crate) fn cmd(
     rest: &str,
     owner: bool,
@@ -204,8 +146,6 @@ pub(crate) fn cmd(
     }
     match fetch() {
         Ok(facts) => {
-            // The rules file is read only for an owner's reply, off the
-            // main thread.
             let rules = owner
                 .then(|| aterm_agent::supervise::run::standing_rules(&facts.policy))
                 .flatten();
@@ -250,9 +190,7 @@ impl crate::App {
         })
     }
 
-    /// The policy cell moved: every session's `subscribe @<sid>` stream gets
-    /// `EVENT <local> harness-policy gen=<n>`, so an agent that answers for
-    /// itself re-reads `harness policy` on it rather than on a clock.
+    /// The policy cell moved: every session's `subscribe @<sid>` stream gets `EVENT <local> harness-policy gen=<n>`, so an agent that answers for itself re-reads `harness policy` on it rather than on a clock.
     pub(crate) fn announce_harness_policy(&self) {
         let generation = self.harness_policy.generation();
         for pooled in self.pool.iter() {
@@ -264,10 +202,7 @@ impl crate::App {
 /// The timeline kind (and `events` wire word) of the policy cell's move.
 pub(crate) const HARNESS_POLICY_EVENT: &str = "harness-policy";
 
-/// The policy cell's move to `generation`, on one session's timeline: the
-/// `harness-policy gen=<n>` row [`crate::App::announce_harness_policy`] writes on
-/// every session's (the wire goldens write theirs through it too), and in the same
-/// hold the session log's `mark - policy gen=<n>`, on every session as the row is.
+/// The policy cell's move to `generation`, on one session's timeline: the `harness-policy gen=<n>` row [`crate::App::announce_harness_policy`] writes on every session's (the wire goldens write theirs through it too), and in the same hold the session log's `mark - policy gen=<n>`, on every session as the row is.
 pub(crate) fn record_policy_move(
     timeline: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
     generation: u64,
@@ -387,8 +322,6 @@ mod tests {
         for (p, cfg, why) in cases {
             assert_eq!(effective(&cfg, p), (false, why), "{why}");
         }
-        // A headless instance under the default `headless = true` is on, and a
-        // claude table switched off leaves codex on.
         let claude_off = SupervisorConfig {
             off: vec![Program::Claude],
             ..full.clone()
@@ -403,8 +336,6 @@ mod tests {
             ),
             (true, "enabled")
         );
-        // The table's own `autopilot = off` is off too; a session's `cruise`
-        // word over it is on.
         let table_off = SupervisorConfig {
             autopilot: Autopilot::Off,
             ..full
@@ -505,10 +436,7 @@ mod tests {
     /// with no rules standing, and with rules standing composed exactly as
     /// the loop composes them (the act's own suffix-free words, then the
     /// rules once) — and `needs_hint_text` and `needs_ack_text` are the two
-    /// suffixes, bare. NEGATIVE CONTROLS: a suffix carries no rules (one
-    /// composed with them would type the rules twice in every act it
-    /// rides), the four acts do; Cruise's words are not Land's; and an edge
-    /// reads none of them.
+    /// suffixes, bare.
     #[test]
     fn the_six_texts_are_the_loops_own_words_composed_as_it_composes_them() {
         use aterm_agent::supervise::policy::turn_end::{DONE_CHECK, LAND, LAND_ANSWER, LAND_NUDGE};
@@ -542,7 +470,6 @@ mod tests {
             }
         }
         assert_ne!(bare[0].1, bare[1].1, "Cruise's words are not Land's");
-        // The texts stay out of an edge's reply.
         let edge = reply(&facts(cfg), Some(rules), false);
         assert!(
             ACT_TEXT_KEYS.iter().all(|k| field(&edge, k).is_none()),
@@ -593,8 +520,7 @@ mod tests {
     /// THE REAL ADOPTION of a watcher's post moves the generation `harness
     /// policy` answers and records `harness-policy gen=<n>` on the session's
     /// timeline, which the `events` digest pushes; the facts are the real
-    /// App's (a test App has no host: `unhosted`). NEGATIVE CONTROL: a stamp
-    /// no newer than the one in force moves nothing and announces nothing.
+    /// App's (a test App has no host: `unhosted`).
     #[test]
     fn the_policys_move_is_announced_on_every_sessions_stream() {
         let mut app = crate::App::headless_for_test();
@@ -636,7 +562,6 @@ mod tests {
         let now = line(&app);
         assert!(now.starts_with("OK gen=2 "), "{now}");
         assert!(now.contains(" continue_text=carry%20on "), "{now}");
-        // Older than the one in force: nothing moves, nothing is said.
         app.adopt_harness_policy(first);
         assert_eq!(events(&app), ["gen=2"]);
         assert_eq!(

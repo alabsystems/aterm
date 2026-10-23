@@ -6,6 +6,8 @@
 use super::*;
 
 /// A config that changes enough settings for Modified to scroll at every size:
+/// rows with their facts on a second line, one-row cards and a key only
+/// aterm.toml holds.
 const CHANGED: &str = "theme = \"Dracula\"\ncolumns = 120\nlines = 40\n\
     allow_osc52_query = true\nscrollback_lines = 5000\ncursor_blink = false\n\
     cursor_trail_style = \"comet\"\nsearch_history_lines = 2000\n\
@@ -35,6 +37,8 @@ fn paging_view(
 }
 
 /// The scrolling list a compiled page draws for `plan`'s screen at `top`: the
+/// node that carries a scroll thumb (the sidebar's aside), drawn as tall as
+/// that screen.
 fn painted_list(
     compiled: &crate::native_ui::CompiledUi,
     plan: &scroll::ScrollPlan,
@@ -62,11 +66,17 @@ fn painted_list(
 }
 
 /// What a node paints that a person reads or presses: words, a control, a
+/// picture — not a group, and not the list's thumb.
 fn paints_content(node: &crate::native_ui::PaintNode) -> bool {
     !matches!(node.content, UiContent::Group(_)) && !node.key.as_str().ends_with("/thumb")
 }
 
 /// The stops the compiled screen whose first stop is `top` SHOWS WHOLE, judged
+/// from its paint: a stop is shown whole where everything it paints — its
+/// words and controls — is drawn uncut and at full strength, none of it cut
+/// by the list's edges, scrolled under a kept caption, or fading in the strip
+/// under the room, and where all it draws lies on the list as painted (what
+/// an edge cuts away entirely is in no paint node).
 fn shown_whole(
     compiled: &crate::native_ui::CompiledUi,
     plan: &scroll::ScrollPlan,
@@ -108,6 +118,8 @@ fn shown_whole(
 }
 
 /// One screen of the turn: where the list is — its first stop, and how far
+/// past that stop's seat it is scrolled (a screen Page Up scrolled to end on
+/// a stop) — and what it shows whole.
 struct Turned {
     top: usize,
     offset: f32,
@@ -121,6 +133,7 @@ impl Turned {
 }
 
 /// The screen a render draws now, from the stop it drew from: not the
+/// scroll it was asked for, which a landing or a reveal moves.
 fn screen_now(
     runtime: &NativeRuntime,
     instance: crate::native_app::AppInstanceId,
@@ -141,6 +154,11 @@ fn screen_now(
 }
 
 /// MODIFIED'S ROW WHOSE FACTS THE STRIP HOLDS IS SHOWN WHOLE, AND PAGE DOWN
+/// TURNS PAST IT (review): every Modified row carries its facts on a
+/// second line, so at the shipped 102x29 and at 150x48 the room's edge falls
+/// between a row's field and its facts, which the strip kept for a status bar
+/// painted legibly under it, while the screen did not count the row, and Page
+/// Down opened the next screen on that row again.
 #[test]
 fn modifieds_row_whose_facts_the_strip_holds_is_shown_and_turned_past() {
     let mut found = 0;
@@ -222,6 +240,11 @@ fn modifieds_row_whose_facts_the_strip_holds_is_shown_and_turned_past() {
 }
 
 /// PAGE DOWN AND PAGE UP TURN OVER EXACTLY WHAT A SCREEN SHOWED WHOLE: on
+/// every route at 60x20, 80x24, 102x29 and 150x48, with no settings changed
+/// and with many, each Page Down from the list's top shows no stop the screen
+/// before it showed whole — until the last screen, which is anchored at the
+/// list's end and full — and skips none; Page Up, from the end back to the
+/// top, likewise.
 #[test]
 fn page_keys_turn_over_exactly_what_a_screen_showed_whole() {
     let mut turned = 0usize;
@@ -335,6 +358,17 @@ fn page_keys_turn_over_exactly_what_a_screen_showed_whole() {
 }
 
 /// NO SCREEN ENDS ON BLANK GROUND UNDER A CARD IT CUTS: on every route, every
+/// screen with stops after it, at 60x20, 80x24, 102x29, 150x48 and 167x36
+/// (with no settings changed and with many), the card the list's bottom edge
+/// cuts is drawn on to the page's bottom — its room and the strip kept for a
+/// status bar — with no band of blank over 8pt under it; a screen that ends on
+/// a whole card instead ends on that card's boundary, the gap and less than
+/// [`scroll::PEEK_MIN`] of the next card under it, and the next screen starts
+/// with the next card — the list's first screen only: any later one scrolls
+/// on into its first card's padding until the next card peeks in (the peek
+/// seat), where it ended on a whole card over up to 26pt of blank with
+/// nothing of the next in view (Window at 150x48 under SESSION, Appearance at
+/// 167x36 under TEXT & CONTRAST).
 #[test]
 fn no_screen_ends_on_blank_under_a_card_it_cuts() {
     let (mut cut_screens, mut whole_foot_screens) = (0usize, 0usize);
@@ -455,6 +489,11 @@ fn no_screen_ends_on_blank_under_a_card_it_cuts() {
 }
 
 /// A STATUS BAR NEVER MOVES THE LIST, EVEN UNDER A ROW WHOSE FACTS IT
+/// COVERS: the keyboard on a row the screen shows with its facts in the strip
+/// kept for a bar, a bar that comes takes that strip — the facts go under
+/// it, the row's control stays whole and live where it was — and the list
+/// does not scroll to bring the facts back: nothing scrolled it, and the
+/// control the keyboard is on is in view.
 #[test]
 fn a_bar_over_a_rows_facts_never_moves_the_list() {
     let mut found = 0;
@@ -537,6 +576,11 @@ fn a_bar_over_a_rows_facts_never_moves_the_list() {
 }
 
 /// SHORT WINDOWS SHED CHROME BEFORE CONTENT, ONE MEASURED STEP AT A TIME
+/// ([`PageChrome`]): a page whose list's first screen holds its lead — its
+/// first stop and the first row of controls after it — keeps its whole
+/// chrome; one whose does not gives its subtitle, then its insets, to the
+/// list, the least step that lets the first screen hold it, the heading that
+/// names the page staying; and one no step helps keeps its own.
 #[test]
 fn a_short_window_sheds_chrome_only_as_far_as_the_first_screen_needs() {
     use aterm_containment::{FdaScope, ImageAnchor};
@@ -655,6 +699,10 @@ fn a_short_window_sheds_chrome_only_as_far_as_the_first_screen_needs() {
 }
 
 /// THE BAR'S ROOM AND THE CHROME NEVER STARVE THE LIST (#58, [`PageChrome`]):
+/// at 220×12 with 2× text (1564×180) Settings ▸ Themes kept 64pt for a status
+/// bar that was not up and gave its chooser 68pt, so every 72pt row was cut;
+/// the list now takes that room, and every row of the chooser is whole on its
+/// screen.
 #[test]
 fn the_room_kept_for_a_status_bar_never_cuts_every_row() {
     at_each_text_scale(&[1.0, 2.0], "the bar's room", |scale| {
@@ -771,6 +819,9 @@ fn the_room_kept_for_a_status_bar_never_cuts_every_row() {
 }
 
 /// THE CHROME IS DECIDED ONCE PER LAYOUT INPUT, NOT EVERY FRAME (#64): a
+/// short window sheds its page's chrome by seating the page under each rung
+/// of a ladder, and an animated preview re-rendered the page every frame, so
+/// every frame ran the ladder again.
 #[test]
 fn a_short_windows_chrome_is_decided_once_per_layout_input() {
     let remembered = || super::CHROME_REMEMBERED.with(std::cell::Cell::get);
@@ -826,6 +877,7 @@ fn a_short_windows_chrome_is_decided_once_per_layout_input() {
 }
 
 /// Where the compiled page draws its list's controls and words: each node's
+/// key, rect and clip, the list's thumb aside.
 fn list_paint(compiled: &crate::native_ui::CompiledUi) -> Vec<(String, [i64; 8])> {
     let round = |value: f32| (value * 100.0).round() as i64;
     compiled
@@ -855,6 +907,9 @@ fn list_paint(compiled: &crate::native_ui::CompiledUi) -> Vec<(String, [i64; 8])
 }
 
 /// A PAGE TURN WITH THE KEYBOARD IN THE LIST LANDS WHERE THE TURN SAYS:
+/// Page Down and Page Up take the keyboard to the first (last) control the
+/// new screen shows whole, and that control is on the screen, so the render
+/// after the turn draws the turn's screen — no reveal moves it.
 #[test]
 fn a_keyboard_page_turn_lands_where_the_turn_says() {
     let mut turned = 0usize;
@@ -955,6 +1010,9 @@ fn a_keyboard_page_turn_lands_where_the_turn_says() {
 }
 
 /// A STATUS BAR THAT COMES NEVER CHANGES THE PAGE'S CHROME: a short window
+/// sheds a page's chrome measured as the page seats with no bar up, so the
+/// heading, the subtitle and the insets stay where they were when a bar
+/// comes.
 #[test]
 fn a_status_bar_never_changes_the_page_chrome() {
     let mut shed = 0usize;
@@ -1028,6 +1086,8 @@ fn a_status_bar_never_changes_the_page_chrome() {
 }
 
 /// THE LIST'S KEYS NEVER WORK A CONTROL THEY CARRIED THE KEYBOARD TO: Page
+/// Up and Down and Home and End take the keyboard through the list, and
+/// stay the list's on a slider, however the keyboard got there.
 #[test]
 fn the_lists_keys_never_change_a_control_they_carried_the_keyboard_to() {
     let end = AppEvent::TextInput(TextInputEvent::End { extend: false });
@@ -1183,6 +1243,9 @@ fn the_lists_keys_never_change_a_control_they_carried_the_keyboard_to() {
 }
 
 /// A NOTE A RUN OF ROWS SHARES HEADS NO CONTROL, ON ANY PAGE: on every route
+/// at 80x24, 102x29 and 150x48, with no settings changed and with many, every
+/// screen's stop that paints a run's shared note (`settings/shared-note/…`)
+/// holds no control.
 #[test]
 fn a_shared_note_heads_no_control_on_any_page() {
     let mut notes = 0usize;
@@ -1239,6 +1302,9 @@ fn a_shared_note_heads_no_control_on_any_page() {
 }
 
 /// A COPY WITHOUT ITS PACKAGE TOOL, AS THE LAB'S HEADLESS COPY IS: Packages
+/// at 80x24 draws the reroute switch, its own note and all, whole over the
+/// consent note ("Saved for a copy of aterm that has its package tool.") the
+/// hard edge cuts away.
 #[test]
 fn packages_without_its_tool_turns_past_the_reroute_switch_it_drew_whole() {
     let mut service = crate::packages_screen::PackagesService::new();
@@ -1311,6 +1377,7 @@ fn packages_without_its_tool_turns_past_the_reroute_switch_it_drew_whole() {
 }
 
 /// OPENING A MESSAGE NEVER CHANGES THE PAGE'S CHROME: Messages measures its
+/// first screen with every entry closed.
 #[test]
 fn opening_a_message_never_changes_the_page_chrome() {
     let mut log = sample_messages();
@@ -1355,6 +1422,8 @@ fn opening_a_message_never_changes_the_page_chrome() {
 }
 
 /// A LIST WALKS ITS CONTROLS IN THE ORDER THE PAGE DRAWS THEM: Tab past a
+/// screen's edge and the list's keys go by the list's order of controls, so
+/// every screen's controls stand in it as the compiled page orders them.
 #[test]
 fn a_list_walks_its_controls_in_the_order_the_page_draws_them() {
     let source = format!("{CHANGED}faint_opacity = 0.4\nbackground_opacity = 0.9\n");
@@ -1404,6 +1473,8 @@ fn a_list_walks_its_controls_in_the_order_the_page_draws_them() {
 }
 
 /// The short windows the short-window sweep covers: 220x12, 220x13 and
+/// 220x16, 102x12, 102x16 and 80x16 (the narrow windows' 180-240pt), 60x20,
+/// 80x20 and 80x24.
 const SHORT_SIZES: [(f32, f32); 9] = [
     (1_564.0, 180.0),
     (1_564.0, 194.0),
@@ -1417,6 +1488,7 @@ const SHORT_SIZES: [(f32, f32); 9] = [
 ];
 
 /// [`shown_whole`], a list that shows all of itself — drawn with no thumb —
+/// included: every stop it draws whole there.
 fn shown_whole_on(
     compiled: &crate::native_ui::CompiledUi,
     plan: &scroll::ScrollPlan,
@@ -1462,6 +1534,8 @@ fn shown_whole_on(
 }
 
 /// What one walk over a list's screens found: the stops it showed whole,
+/// each group caption it drew and whether it drew that whole on some screen,
+/// and what the audit flagged on any screen it drew.
 #[derive(Default)]
 struct Walk {
     whole: BTreeSet<usize>,
@@ -1470,6 +1544,9 @@ struct Walk {
 }
 
 /// Each group caption the compiled screen whose first stop is `top` draws on
+/// its list, by key (a caption on several lines as one), and whether it is
+/// drawn whole in the list's room: none of its lines cut by an edge, fading
+/// in the strip under the room, or past it.
 fn captions_drawn(
     compiled: &crate::native_ui::CompiledUi,
     plan: &scroll::ScrollPlan,
@@ -1515,6 +1592,8 @@ fn captions_drawn(
 }
 
 /// Walk the list from where it stands, each `event` drawn as the window draws
+/// between presses, until one moves it no further: every stop each screen
+/// shows whole, judged from its paint, and each screen's audit.
 fn walk_screens(
     runtime: &mut NativeRuntime,
     instance: crate::native_app::AppInstanceId,
@@ -1553,6 +1632,17 @@ fn walk_screens(
 }
 
 /// EVERY STOP OF A SHORT WINDOW'S LIST IS WHOLE ON SOME SCREEN, BY PAGE DOWN
+/// AND BY THE WHEEL, AND NO SCREEN SLICES A WORD OR A PICTOGRAM AT AN EDGE
+/// (#96-#99, and the sweep that followed them): every route, at 220x12,
+/// 220x13, 220x16, 102x12, 102x16, 80x16, 60x20, 80x20 and 80x24, 1× and 2×
+/// text, both themes, from the list's top a stop at a time (the wheel) and a
+/// screen at a time (Page Down), each screen judged from its paint
+/// ([`shown_whole`]): every stop that draws anything is drawn whole on some
+/// screen of each walk, so is every group caption it draws (in the room,
+/// not fading in the strip under it), and no screen overflows, clips by
+/// accident, paints a mark over another, or cuts a line of words or a
+/// pictogram through at either edge of a list
+/// ([`crate::native_ui::CompiledUi::sliced_marks`]).
 #[test]
 fn every_stop_of_a_short_window_is_whole_by_page_and_by_wheel() {
     at_each_text_scale(&[1.0, 2.0], "short windows", |scale| {
@@ -1677,6 +1767,22 @@ fn every_stop_of_a_short_window_is_whole_by_page_and_by_wheel() {
 }
 
 /// A PAGE TURN TAKES THE KEYBOARD ONTO ITS SCREEN (#84): on every route but
+/// Messages and Themes (which move the keyboard through their own rows), at
+/// the short windows and 22x24, 80x24, 102x29 and 150x48, 1× and 2× text,
+/// with no setting changed and with several (rows that carry a Reset), the
+/// keyboard on the first screen's first control, each Page Down to the
+/// list's end and each Page Up back leaves the keyboard on a control of a
+/// stop the new screen shows as a landing on it reveals it (its controls
+/// and words whole, its padding cut or not) — where the turn moved it, the
+/// screen's first such control, by Page Up as by Page Down (Page Up took it
+/// to the screen's last, so the next Down arrow scrolled the list back to
+/// the screen the turn had left): at 80x24 at 2× text
+/// Page Down to Top Settings' Sparkle words passed over Profanity's switch,
+/// whose stop the screen's edge cut only in its padding, to Feline's — or,
+/// where none of those holds a
+/// control, on a control the screen draws live, cut by its edge, the list
+/// where the turn put it — or, on a screen of words that draws no control
+/// at all, where it was.
 #[test]
 fn a_page_turn_takes_the_keyboard_onto_its_screen() {
     at_each_text_scale(&[1.0, 2.0], "page focus", |scale| {
@@ -1817,6 +1923,20 @@ fn a_page_turn_takes_the_keyboard_onto_its_screen() {
 }
 
 /// A STOP TALLER THAN ANY ROOM THE WINDOW GIVES IS LISTED IN PIECES THE ROOM
+/// HOLDS (#97): what a short window's every screen cut is whole on some
+/// screen Page Down shows — Software Update's automatic-update switch, in
+/// the 218pt workbench beside the status card (the pair stacks where it is
+/// taller than the 72pt and 92pt lists of 220x12 and 220x13 at 1× text);
+/// About's byline, beside the wordmark in a 126pt short hero (the full
+/// hero is listed a row at a time where that row is taller than the 100pt
+/// list of 102x12 at 2×); Tab Color's wheel (its floor no taller than the
+/// list); the theme card's Follow system switch (its 112pt row cut into
+/// pieces); and Modified's empty-state line (the summary pinned over it
+/// listed first where pinning left the list 32pt); and the list's last
+/// stop, measured as the last screen draws it — with no strip under it —
+/// Manual's row for a key only aterm.toml holds (74pt in the 68pt list of
+/// 220x12 at 2× text, its top cut on the only screen that drew it in the
+/// room).
 #[test]
 fn a_stop_taller_than_any_room_is_whole_on_some_screen() {
     let cases: [(f32, SettingsRoute, f32, f32, &str); 7] = [
@@ -1900,6 +2020,9 @@ fn a_stop_taller_than_any_room_is_whole_on_some_screen() {
 }
 
 /// A CONTROL IS NEVER LISTED WITHOUT THE WORDS THAT NAME IT where the two
+/// fit the list's room: on Appearance at 80x16 and 102x16 with 2× text,
+/// every screen the wheel shows that draws a switch or a slider whole draws
+/// its name too.
 #[test]
 fn a_control_is_listed_with_the_words_that_name_it() {
     let cases = [
@@ -1966,6 +2089,9 @@ fn a_control_is_listed_with_the_words_that_name_it() {
 }
 
 /// MESSAGES' LIST HOLDS AN ENTRY WHOLE IN A SHORT WINDOW (the short-window
+/// sweep's Messages): at the short windows and 80x24, 1× and 2× text, every
+/// screen of the Messages page the wheel or Page Down shows audits clean,
+/// and every entry the list holds is whole on some screen of each walk.
 #[test]
 fn messages_list_holds_an_entry_whole_in_a_short_window() {
     at_each_text_scale(&[1.0, 2.0], "short messages", |scale| {
@@ -2043,6 +2169,12 @@ fn messages_list_holds_an_entry_whole_in_a_short_window() {
 }
 
 /// MANUAL'S EXPLANATION IS SET ON LINES OF ITS OWN HEIGHT: where a compact
+/// window shows no subtitle, the aterm.toml card opens with what Manual is,
+/// wrapped on lines as tall as the card's lines — not as tall as the whole
+/// path under it, which it took for its line height (f222a198c4b): once the
+/// path wrapped (a folder outside the home folder, at 2× text in a 102x12
+/// window) each line of the explanation was 144pt, taller than the 100pt
+/// list, and on no screen whole.
 #[test]
 fn manuals_explanation_is_set_on_lines_of_its_own_height() {
     at_each_text_scale(&[1.0, 2.0], "manual explanation", |scale| {
@@ -2091,6 +2223,11 @@ fn manuals_explanation_is_set_on_lines_of_its_own_height() {
 }
 
 /// END REACHES THE LIST'S END BEFORE ANY RENDER HAS MEASURED IT: a
+/// navigation, an aterm.toml change and a focus move each take away the
+/// bound the last render measured, and an End that comes before the next
+/// render — a headless instance driven over ctl, a real window's key before
+/// its frame — lands that render on the list's last screen, as an End after
+/// a render does.
 #[test]
 fn end_reaches_the_lists_end_before_a_render_has_measured_it() {
     let mut ended = 0usize;
@@ -2173,6 +2310,10 @@ fn end_reaches_the_lists_end_before_a_render_has_measured_it() {
 }
 
 /// NO PAGE DOWN ONLY MOVES THE LIST: on every route at 80x24, 102x29 and
+/// 150x48 — Cursor Styles with Beam saved too — each Page Down from the
+/// list's top to its end, the turn onto the last screen included, shows a
+/// stop the screen before did not show whole, or draws the list's end the
+/// screen before did not.
 #[test]
 fn no_page_down_only_moves_the_list() {
     let mut turned = 0usize;
@@ -2240,6 +2381,15 @@ fn no_page_down_only_moves_the_list() {
 }
 
 /// A NOTE IS NEVER LEFT ALONE AT THE TOP BY THE WHEEL, AND NO SCREEN DRAWS A
+/// CAPTION TWICE: on Settings ▸ Harness (supervision off, as the lab's), AI
+/// CLIs and Tab Control at 80x24, 102x29 and 150x48, a wheel turned a notch
+/// at a time from the list's top never seats a screen at a note on the rows
+/// over it that its row shows with it — the wheel at Harness 102x29 left the
+/// Gemini row's shared note alone under SUPERVISION · CONTINUED, its rows
+/// scrolled away — and no screen paints two captions that read alike: the
+/// pages cut a tall group into continued cards, each with a heading of its
+/// own, under the one the list keeps (two SUPERVISION · CONTINUED headings on
+/// one screen).
 #[test]
 fn the_wheel_leaves_no_note_alone_and_no_screen_draws_a_caption_twice() {
     let mut notches = 0usize;

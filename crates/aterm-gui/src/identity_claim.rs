@@ -13,17 +13,19 @@ const CLAIMS_DIR: &str = "claims";
 
 /// An exclusive hold on one session id, alive while this value is.
 pub(crate) struct Claim {
-    /// The locked claim file, held open so the lock stays taken. Unix reads it in
+    /// The locked claim file, held open so the lock stays taken.
     #[cfg_attr(
         windows,
         expect(dead_code, reason = "held for its close: the open handle is the claim")
     )]
     file: std::fs::File,
     /// The id this claim holds — so [`settle_transferred`] can tell an id it already
+    /// holds from one it still has to take.
     sid: String,
 }
 
 /// The drop releases the claim at once with `LOCK_UN`, not the close: a child
+/// another thread is spawning holds a copy of every descriptor until it execs.
 impl Drop for Claim {
     fn drop(&mut self) {
         #[cfg(unix)]
@@ -41,7 +43,7 @@ pub(crate) enum ClaimOutcome {
     Unprovable(String),
 }
 
-/// Every claim this process holds, kept alive for its whole life. A `Vec`:
+/// Every claim this process holds, kept alive for its whole life.
 static HELD: std::sync::Mutex<Vec<Claim>> = std::sync::Mutex::new(Vec::new());
 
 /// Park a claim for the process's lifetime.
@@ -56,6 +58,7 @@ pub(crate) fn release_claims_for_test() {
 }
 
 /// The ids this process adopted (from the environment premint or a handoff)
+/// rather than minted: the only ids of ours another process can also hold.
 static ADOPTED: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
 
 /// Record that this process is answering to an id it did NOT mint.
@@ -74,6 +77,7 @@ fn adopted_here(sid: &SessionId) -> bool {
 }
 
 /// The claim file for `sid` under `dir`, or `None` for an id not of the minted
+/// shape.
 fn claim_path(dir: &Path, sid: &SessionId) -> Option<PathBuf> {
     crate::spawn::is_valid_session_id(sid.as_str()).then(|| dir.join(CLAIMS_DIR).join(sid.as_str()))
 }
@@ -109,11 +113,13 @@ fn successor_marker_path(dir: &Path, sid: &SessionId) -> Option<PathBuf> {
 }
 
 /// The epoch record beside a claim file: `claims/<sid>.ep` (module doc, "The
+/// epoch record").
 fn epoch_record_path(dir: &Path, sid: &SessionId) -> Option<PathBuf> {
     claim_path(dir, sid).map(|claim| claim.with_file_name(format!("{}.ep", sid.as_str())))
 }
 
 /// A small claim-side record, read without following or waiting on a final
+/// link or FIFO.
 #[cfg(any(unix, windows))]
 fn read_claim_record(path: &Path) -> Option<String> {
     use std::io::Read as _;
@@ -161,7 +167,7 @@ fn read_claim_record(_: &Path) -> Option<String> {
     None
 }
 
-/// Publish through an exclusive directory of this write's own. No existing
+/// Publish through an exclusive directory of this write's own.
 fn write_claim_record(path: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     let parent = path.parent().ok_or_else(|| {
@@ -303,6 +309,7 @@ pub(crate) fn live_holder_in(dir: &Path, sid: &SessionId) -> Option<u32> {
 }
 
 /// The per-user control directory, unmodified: the one place every instance
+/// contends, whatever `--control-sock` says.
 fn rendezvous_dir() -> Option<PathBuf> {
     #[cfg(test)]
     {
@@ -356,6 +363,7 @@ pub(crate) fn live_holder(sid: &SessionId) -> Option<u32> {
 }
 
 /// The pid of this process's own seamless-update candidate while a handoff
+/// decides, `0` for none (`pid_alive(0)` is false).
 static HANDOFF_CANDIDATE: AtomicU32 = AtomicU32::new(0);
 
 /// A handoff lane's registration of its candidate, held from the candidate's creation (dial or fork) to the lane's return.
@@ -382,7 +390,7 @@ pub(crate) fn register_handoff_candidate(pid: u32) -> CandidateRegistration {
 
 #[cfg(unix)]
 impl CandidateRegistration {
-    /// The attempt is over: the candidate committed or was proven dead. Clears
+    /// The attempt is over: the candidate committed or was proven dead.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -493,7 +501,7 @@ pub(crate) fn hold_transferred(sid: &SessionId) {
     }
 }
 
-/// Open (or create) the claim file. Unix: 0600, never truncated — a peer may hold
+/// Open (or create) the claim file.
 #[cfg(unix)]
 fn open_claim(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -505,7 +513,7 @@ fn open_claim(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
-/// Windows: the share mode is the claim. `share_mode(0)` makes a second open
+/// Windows: the share mode is the claim.
 #[cfg(windows)]
 fn open_claim(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
@@ -518,6 +526,8 @@ fn open_claim(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// `flock(LOCK_EX | LOCK_NB)`: `Ok(true)` when the lock is ours, `Ok(false)` when
+/// a peer holds it, `Err` otherwise (e.g. no `flock` support), which must read
+/// as "cannot prove", never "free".
 #[cfg(unix)]
 fn lock_exclusive(file: &std::fs::File) -> std::io::Result<bool> {
     use std::os::fd::AsRawFd;
@@ -538,12 +548,14 @@ fn lock_exclusive(file: &std::fs::File) -> std::io::Result<bool> {
 }
 
 /// Windows has no `flock`; the exclusive share mode in [`open_claim`] already did
+/// the work, so a handle in hand IS the lock.
 #[cfg(windows)]
 fn lock_exclusive(_file: &std::fs::File) -> std::io::Result<bool> {
     Ok(true)
 }
 
 /// Whether an open failed because a peer holds the file exclusively (Windows'
+/// sharing violation).
 #[cfg(windows)]
 fn is_sharing_violation(e: &std::io::Error) -> bool {
     /// `ERROR_SHARING_VIOLATION`.
@@ -573,6 +585,9 @@ mod tests {
     }
 
     /// A pid that is alive on every host and never this process: 1 (init/launchd)
+    /// on Unix; 4 (System) on Windows, where pid 1 does not exist and
+    /// `OpenProcess` on 4 fails with ERROR_ACCESS_DENIED, which `pid_alive`
+    /// counts as alive (as `kill(pid, 0)`'s `EPERM`).
     const LIVE_FOREIGN_PID: u32 = if cfg!(windows) { 4 } else { 1 };
 
     /// A discovery entry a live foreign instance would have written.
@@ -601,6 +616,8 @@ mod tests {
     }
 
     /// A dropped claim is free at once even while a duplicate descriptor on the
+    /// same open file description (`try_clone`, as a spawning child holds until
+    /// it execs) is still open.
     #[cfg(unix)]
     #[test]
     fn a_dropped_claim_is_free_while_a_copy_of_its_descriptor_lives() {
@@ -619,6 +636,9 @@ mod tests {
     }
 
     /// Tier-1 binding for `SessionIdClaim`: each model `Launch` is one real
+    /// `claim_for_adoption`, and `holders` must equal the callers told yes, with the id free,
+    /// locked by a live holder, and unlocked while a live foreign entry holds it (the handoff
+    /// shape, where only the entry gate refuses).
     #[test]
     fn session_id_claim_conformance_real_adoption_projects_onto_model() {
         let _guard = rendezvous_test_guard();
@@ -706,6 +726,9 @@ mod tests {
     }
 
     /// Tier-1 binding for the handoff window (`SessionIdClaim`'s `PredecessorExits` /
+    /// `SuccessorPublishes`) through the real `claim_for_adoption`, `mark_successor_in` and
+    /// `settle_transferred_in`: with the predecessor gone (no flock, its entry naming a dead pid)
+    /// and the successor unpublished, only the Commit marker refuses a launch.
     #[cfg(unix)]
     #[test]
     fn the_handoff_window_is_held_by_the_successor_marker() {
@@ -799,6 +822,8 @@ mod tests {
     }
 
     /// Anything but the minted shape is refused before it becomes a filename,
+    /// so a hostile `$ATERM_SESSION_ID` cannot aim the claim at a path; being
+    /// `Unprovable`, it also does not adopt.
     #[test]
     fn a_malformed_injected_id_never_becomes_a_path() {
         let d = dir();
@@ -830,6 +855,8 @@ mod tests {
     }
 
     /// The second gate: an id whose discovery entry names a live foreign process
+    /// is held even when its claim file is free; an entry naming a dead process
+    /// or us is not.
     #[test]
     fn a_live_discovery_entry_holds_an_id_a_dead_one_does_not() {
         let d = dir();
@@ -869,6 +896,8 @@ mod tests {
     }
 
     /// The candidate registration (bound to `HandoffAddressOwner`'s `Launch` and `Reject`):
+    /// while it lives, an adopted id whose entry names that pid is served here, and its drop
+    /// clears only its own pid.
     #[cfg(unix)]
     #[test]
     fn a_handoff_candidate_registration_is_exactly_its_own() {
@@ -944,6 +973,7 @@ mod tests {
 }
 
 /// `HandoffAddressOwner` environment actions, each waived where its Tier-1 (`tests`)
+/// binds it.
 #[cfg(any(test, debug_assertions))]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "HandoffAddressOwner",

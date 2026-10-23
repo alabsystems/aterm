@@ -10,7 +10,6 @@ use super::super::policy::approval::{
     keeps_trying_its_limit, limit_no_reset_reason, proof_would_lift, unvoiced_tools,
 };
 use super::super::policy::box_call;
-use super::super::policy::box_command::{self, BoxCommand};
 use super::super::policy::box_facts::{BoxFacts, QuestionFacts};
 use super::super::policy::login::PickerGate;
 use super::super::policy::question::{begun, fall_back_to, is_question_rule};
@@ -364,12 +363,276 @@ fn note_dialog(review: &mut dyn Review, seq: u64, rule_id: &str, rows: &[String]
 /// What "the same box" is after a press ([`Session::box_left`]).
 pub(super) fn box_identity(rows: &[String]) -> Option<String> {
     let v2 = aterm_phase::parse_prompt_v2(rows)?;
+    Some(identity_of(&v2, rows))
+}
+
+/// [`box_identity`] of the box `v2` read on `rows`.
+fn identity_of(v2: &aterm_phase::PromptV2, rows: &[String]) -> String {
     let mut key = format!("{}\n", v2.kind.name());
-    for (_, row) in box_rows(&v2, rows) {
+    for (_, row) in box_rows(v2, rows) {
         key.push_str(row);
         key.push('\n');
     }
-    Some(key)
+    key
+}
+
+/// How long before the vendor's auto-deny a person's hold on a box ends when
+/// nobody has touched its episode ([`Session::held_for_person`],
+/// [`Episode`]) — so the policy's answer is
+/// pressed and seen taken before Claude Code denies the box (`⚠ Claude Code
+/// will automatically deny this request in 1:44, …`,
+/// [`aterm_phase::PromptV2::auto_deny_left`]). The deny is the outcome nobody
+/// chose: the worker's command fails, and the work it was part of stalls.
+/// Fifteen seconds holds what the press needs with room to spare: the deny
+/// as read, which may fall up to about a second after the vendor's
+/// ([`Countdown`]: the frame read may be a tick old), the look at the hold's
+/// end (its read, `status` and `meta`, milliseconds on the local socket), a
+/// fenced press skipped because the countdown ticked between the read and
+/// the key and decided again, a refused one's first back-offs
+/// ([`REFUSAL_PAUSE`] doubling), and the box seen leaving after the key
+/// ([`leave_wait`]). It leaves a person 1:45 of the vendor's 2:00 to touch
+/// the session, which makes the box theirs.
+pub(super) const DENY_MARGIN: Duration = Duration::from_secs(15);
+
+/// How long a press inside [`DENY_MARGIN`] of its box's auto-deny waits for
+/// the box to leave ([`leave_wait`]) before it reads the box as not taken: a
+/// taken key takes a ticking box down within about a second (within 5 ms the
+/// vendor wipes its countdown, and the box is gone some 550 ms on; 2.1.283,
+/// measured), so three seconds leave room before the deny for a few more
+/// presses where the loop presses again, or for a person to answer a box it
+/// hands them.
+const LEAVE_NEAR_DENY: Duration = Duration::from_secs(3);
+
+/// How long a press made `now` waits for its box to leave
+/// ([`Session::box_left`]): one [`WAIT_STEP`]; on a box Claude Code denies
+/// at `deny` ([`Session::deny_at`]), until [`DENY_MARGIN`] before the deny
+/// if that is sooner, and [`LEAVE_NEAR_DENY`] for a press inside that
+/// margin. A key the box did not take is then seen not taken before the
+/// deny — pressed again under `approve = "all"` (and for a question's answer
+/// or a limit dialog's row), handed to a person under `safe`, with time left
+/// to answer it: a whole step there would end only when the vendor's deny
+/// took the box down, the approval ledgered for a box Claude Code denied.
+fn leave_wait(now: Instant, deny: Option<Instant>) -> Duration {
+    let Some(deny) = deny else {
+        return WAIT_STEP;
+    };
+    let to_margin = deny
+        .checked_sub(DENY_MARGIN)
+        .map_or(Duration::ZERO, |end| end.saturating_duration_since(now));
+    to_margin.max(LEAVE_NEAR_DENY).min(WAIT_STEP)
+}
+
+/// How far apart two reads may place the deny and still read one countdown
+/// running with the loop's clock ([`Countdown`]): a frame up to a tick old,
+/// seconds rounded down and the PTY's lag put one read's placing up to about
+/// two seconds from another's. A countdown a later read places further off
+/// than this is none that runs with the clock; a time a read shows that
+/// stood longer than this has stopped.
+const TICK_SLACK: Duration = Duration::from_secs(3);
+
+/// How soon a hold looks again at a box whose countdown is not seen ticking
+/// ([`DenyClock::Unseen`]): Claude Code redraws its countdown every second,
+/// so a read a second on shows it a second lower.
+pub(super) const TICK_LOOK: Duration = Duration::from_secs(1);
+
+/// THE AUTO-DENY COUNTDOWN a read showed on a box ([`Session::countdown`],
+/// kept on every read: [`Session::keep_countdown`]), believed only once seen
+/// TICKING.
+/// The text is read only where Claude Code draws it
+/// ([`aterm_phase::PromptV2::auto_deny`]), and even there it is believed only
+/// once a later read shows less time left, in step with the loop's clock:
+/// two reads placing the deny within [`TICK_SLACK`] of each other. Nothing
+/// the worker writes ticks — a description, a command or a question that
+/// spells a countdown stands still — so no text of the worker's ends
+/// anyone's hold (2026-10-15). A time that stands longer than [`TICK_SLACK`]
+/// is a countdown that stopped, believed no longer; a time that rises is
+/// the countdown started over, believed again once it ticks. Whatever
+/// Claude Code redraws of the box between two reads — its `1 of 2` label,
+/// its rows re-wrapped, the loop's own decline in its input, another box
+/// drawn in its place — two placings in step are one countdown ticking: the
+/// deny is where they put it, so a redraw never holds the box a second more
+/// to see it tick.
+///
+/// The deny is placed on the loop's clock at the instant the read was asked
+/// for plus the time it showed, by the first read that showed that time:
+/// within about a second of the vendor's own deadline either way. Claude
+/// Code redraws the countdown once a second, so the frame a read returns was
+/// mostly drawn before the read was asked for and may be up to a tick old
+/// (later than the deadline, by that age and the PTY's lag), and its seconds
+/// are rounded down (earlier); [`DENY_MARGIN`] absorbs both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Countdown {
+    /// The box, as [`box_identity`] keys it.
+    identity: String,
+    /// The time the read showed.
+    left: Duration,
+    /// When the countdown runs out, by the first read that showed `left`.
+    deny_at: Instant,
+    /// When that first read was asked for.
+    since: Instant,
+    /// When this read was asked for.
+    asked: Instant,
+    /// A read showed less time than the one before it, in step with the
+    /// clock, and the time has not stood still since.
+    ticking: bool,
+    /// The journal said this countdown's hold's end (`HOLD-ENDED`,
+    /// [`Session::held_for_person`]): said once a countdown.
+    ended_said: bool,
+}
+
+/// The countdown of the box on `rows`, read by a request asked at `asked`
+/// ([`Countdown`]), not yet seen ticking: `None` with no box, or a box whose
+/// countdown says no time this build reads (none drawn where Claude Code
+/// draws it, the screen-reader form). A screen with no `⚠` on it is not
+/// parsed: the countdown is led by one, its words wrapped over rows or not.
+pub(super) fn countdown_of(rows: &[String], asked: Instant) -> Option<Countdown> {
+    if !rows.iter().any(|r| r.contains('⚠')) {
+        return None;
+    }
+    let v2 = aterm_phase::parse_prompt_v2(rows)?;
+    let left = v2.auto_deny_left()?;
+    Some(Countdown {
+        identity: identity_of(&v2, rows),
+        left,
+        deny_at: asked.checked_add(left)?,
+        since: asked,
+        asked,
+        ticking: false,
+        ended_said: false,
+    })
+}
+
+impl Countdown {
+    /// This read's countdown, after `before` (the last read's), whatever box
+    /// each was drawn on: the same time keeps its placing — and its tick,
+    /// while it has stood no longer than [`TICK_SLACK`] — and less time in
+    /// step with the clock is a tick, both the same countdown (its hold's end
+    /// said or not). More time is the countdown started over, and less out
+    /// of step with the clock another one: each starts afresh.
+    pub(super) fn after(mut self, before: Option<&Self>) -> Self {
+        let Some(b) = before.filter(|b| self.left <= b.left) else {
+            return self;
+        };
+        if self.left == b.left {
+            self.deny_at = b.deny_at;
+            self.since = b.since;
+            self.ticking = b.ticking && self.asked.saturating_duration_since(b.since) <= TICK_SLACK;
+        } else {
+            let apart = self
+                .deny_at
+                .saturating_duration_since(b.deny_at)
+                .max(b.deny_at.saturating_duration_since(self.deny_at));
+            self.ticking = apart <= TICK_SLACK;
+            if !self.ticking {
+                return self;
+            }
+        }
+        self.ended_said = b.ended_said;
+        self
+    }
+
+    /// When Claude Code denies the box: `None` until its countdown is seen
+    /// ticking.
+    pub(super) fn deny(&self) -> Option<Instant> {
+        self.ticking.then_some(self.deny_at)
+    }
+}
+
+/// What the loop knows of Claude Code's auto-deny of the box a read shows
+/// ([`Session::deny_clock`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum DenyClock {
+    /// No countdown on the box is believed: the hold stands as it always has.
+    None,
+    /// A countdown is drawn where Claude Code draws it but is not seen
+    /// ticking ([`Countdown`]): not yet, or no longer (its time stood longer
+    /// than [`TICK_SLACK`], a redraw the vendor stalled). A hold on an
+    /// untouched box looks again within [`TICK_LOOK`] to see it tick, for as
+    /// long as it is drawn: the read that sees it running again places the
+    /// deny.
+    Unseen,
+    /// Claude Code denies the box at `deny`: no hold on it runs past
+    /// [`DENY_MARGIN`] before that, unless someone has touched its episode
+    /// ([`Episode`]).
+    At { deny: Instant },
+}
+
+/// THE BOX EPISODE, and whether anyone touched the session while it ran:
+/// the one rule that decides whether a hold on a box may end before the
+/// vendor's deny. An episode runs from the first read that shows any box to
+/// the first read that shows none ([`Session::keep_episode`], every read): a
+/// box Claude Code redraws, re-wraps, relabels (`1 of 2`, another ask
+/// stacked behind it) or replaces with another box within it is the same
+/// episode, and keeps what the episode knows. An episode someone TOUCHED is
+/// theirs: no hold on any box of it ends at [`DENY_MARGIN`], it is held as it
+/// always was, and Claude Code's deny stands for the answer they left
+/// unfinished (they were there). The cap ends only a person's hold in an
+/// episode nobody touched: the incident's, typed near 22 s before the box
+/// came up. A touch is a fact the server records, latched for the whole
+/// episode, and never read off a box's face, which Claude Code redraws by
+/// itself (a footer cut to the pane, a stacked-asks label):
+///
+/// * A PERSON'S GESTURE: the session's person count (`human_seq`) on a read
+///   of the episode above its BASELINE, the count on the newest read before
+///   the episode's first — so a gesture in the gap between that read and the
+///   first counts. The loop's own keys are never counted (control verbs).
+///   That read may be a whole wait step ([`WAIT_STEP`]) before the box while
+///   the worker is busy. So the cap's reach rests on `human_grace_s`: at the
+///   default, the vendor's own two minutes, the grace outlasts the deny
+///   only from a gesture in the last moments before the box, which mostly
+///   falls after that read, a touch; a longer grace runs past it from a
+///   gesture up to the grace less two minutes before the box, and the cap
+///   ends those holds where that gesture came before that read (the
+///   CHANGELOG says so).
+/// * ANOTHER DRIVER'S HAND on the session (`status hand=`: a drive lease, a
+///   named turn), on a status read made while the episode runs
+///   ([`Session::foreground_program`]; every decision that may answer a box
+///   of it reads one first, [`Session::decide_box`]): their keys carry no
+///   count. A hand only a status read before the episode found (a lease let
+///   go before the box came up) is none: the episode's own status read says
+///   whether it is still on.
+/// * WHAT CANNOT BE TOLD: an episode whose first read is the loop's first
+///   read of the session (a loop that attached mid-box, or started on it); a
+///   read of it without the person count or the person stamp (a host older
+///   than them, which no press can fence on the person either); a count
+///   below the baseline (one that started over: a session adopted across a
+///   seamless update counts from 0 again).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Episode {
+    /// The person count of the newest read before the episode's first:
+    /// `None` with no such read, or one that carried none.
+    baseline: Option<u64>,
+    /// What touched the episode, for the journal: `None` while nothing has.
+    by: Option<&'static str>,
+}
+
+/// What touched an episode another driver's hand was on ([`Episode`]).
+const BY_DRIVER: &str = "another driver's hand was on the session while it was up";
+
+impl Episode {
+    /// `by` touched the episode, unless something did before.
+    fn touch(&mut self, by: &'static str) {
+        self.by.get_or_insert(by);
+    }
+
+    /// One read of the episode (`screen`) against its baseline: what touched
+    /// it, the first touch kept.
+    fn read(&mut self, screen: &Screen) {
+        let by = match (self.baseline, screen.human_seq, screen.human) {
+            (None, _, _) | (_, None, _) | (_, _, HumanInput::Unknown) => {
+                "whether a person touched it since it appeared cannot be told"
+            }
+            (Some(then), Some(now), _) if now > then => {
+                "a person's gesture was counted on the session since it appeared"
+            }
+            (Some(then), Some(now), _) if now < then => {
+                "the session's person count started over since it appeared, so whether a \
+                 person touched it cannot be told"
+            }
+            _ => return,
+        };
+        self.touch(by);
+    }
 }
 
 /// The rows the box `v2` on `rows` is made of, with their indexes.
@@ -551,10 +814,7 @@ impl<C: Ctl> Session<'_, C> {
         self.person = field("human_ms")
             .and_then(|ms| ms.parse::<u64>().ok())
             .and_then(|ms| self.fx.mono().checked_sub(Duration::from_millis(ms)));
-        self.driver = crate::harness::relaunch::driver_hand(&r.stdout);
-        if self.driver {
-            self.person = Some(self.fx.mono());
-        }
+        self.note_hand(&r.stdout);
         let program = field("program");
         let named_agent = program
             .as_deref()
@@ -565,6 +825,16 @@ impl<C: Ctl> Session<'_, C> {
         } else {
             program
         })
+    }
+
+    /// Another driver's hand on `status` holds the loop as a person's key does and touches the box
+    /// episode.
+    pub(super) fn note_hand(&mut self, status: &str) {
+        self.driver = crate::harness::relaunch::driver_hand(status);
+        if self.driver {
+            self.person = Some(self.fx.mono());
+            self.episode_driven();
+        }
     }
 
     fn box_facts(&mut self, fresh_cwd: bool, reads: Reads) -> Result<BoxFacts, Fail> {
@@ -680,55 +950,6 @@ impl<C: Ctl> Session<'_, C> {
         Some(call.tool)
     }
 
-    fn box_command(&mut self, opts: &SuperviseOpts) -> Option<Result<BoxCommand, String>> {
-        let host = opts.idle_host.as_deref()?;
-        let Some(tail) = host.transcript_tail() else {
-            return Some(Err("no transcript of the agent's to read".to_string()));
-        };
-        let mut found = box_command::pending_bash(&tail, &self.calls_spent);
-        for _ in 0..box_call::LAG_TRIES {
-            if found.is_ok() {
-                break;
-            }
-            self.fx.sleep(self.setup.box_call_step);
-            let Some(tail) = host.transcript_tail_again() else {
-                break;
-            };
-            found = box_command::pending_bash(&tail, &self.calls_spent);
-        }
-        let call = match found {
-            Ok(call) => call,
-            Err(why) => return Some(Err(why)),
-        };
-        let settle = self.setup.box_call_step * box_command::SETTLE_STEPS;
-        let (first, sighted_now) = match &self.box_seen {
-            Some((seen, at)) if *seen == call => (*at, false),
-            _ => {
-                let now = self.fx.mono();
-                self.box_seen = Some((call.clone(), now));
-                (now, true)
-            }
-        };
-        let since = self.fx.since(first);
-        if !sighted_now && since >= settle {
-            self.box_proved = Some(call.id.clone());
-            return Some(Ok(call));
-        }
-        self.fx.sleep(settle.saturating_sub(since));
-        let again = host
-            .transcript_tail_again()
-            .map(|tail| box_command::pending_bash(&tail, &self.calls_spent));
-        Some(match again {
-            Some(Ok(again)) if again == call => {
-                self.box_proved = Some(call.id.clone());
-                Ok(call)
-            }
-            Some(Ok(_)) => Err("the waiting call changed within the settle".to_string()),
-            Some(Err(why)) => Err(format!("within the settle, {why}")),
-            None => Err("the transcript could not be read again".to_string()),
-        })
-    }
-
     /// The box on the screen has left.
     pub(super) fn box_gone(&mut self) {
         self.box_first_seen = None;
@@ -743,7 +964,6 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     fn spend_proved(&mut self) {
-        self.box_seen = None;
         if let Some(id) = self.box_proved.take() {
             self.calls_spent.push(id);
             let over = self.calls_spent.len().saturating_sub(SPENT_CALLS);
@@ -976,14 +1196,6 @@ impl<C: Ctl> Session<'_, C> {
             && proof_would_lift(&reading, rows, &ctx)
         {
             facts.box_call = self.box_call(p, opts, ctx.home.as_deref());
-            ctx = self.approval_ctx(&facts, opts, allow);
-        }
-        if let Some(p) = reading.prompt.as_ref()
-            && box_command::wanted(reading.program, p, || {
-                matches!(decide(&reading, rows, &ctx), Decision::Escalate { .. })
-            })
-        {
-            facts.box_command = self.box_command(opts);
             ctx = self.approval_ctx(&facts, opts, allow);
         }
         let decide_here = |ctx: &ApprovalCtx| {
@@ -1365,13 +1577,14 @@ impl<C: Ctl> Session<'_, C> {
         seq: u64,
         act: &str,
         fresh: bool,
+        clock: DenyClock,
         opts: &SuperviseOpts,
         review: &mut dyn Review,
     ) -> Result<bool, Fail> {
         if fresh {
             self.program = self.foreground_program()?;
         }
-        let Some(until) = self.hands_off_until(opts) else {
+        let Some(grace_ends) = self.hands_off_until(opts) else {
             return Ok(false);
         };
         let who = if self.driver {
@@ -1379,12 +1592,44 @@ impl<C: Ctl> Session<'_, C> {
         } else {
             "a person is typing"
         };
+        let (until, why) = match (clock, self.touched()) {
+            (DenyClock::None, _) => (grace_ends, String::new()),
+            (DenyClock::Unseen, Some(by)) => (grace_ends, format!("; {by}: held as ever")),
+            (DenyClock::At { deny, .. }, Some(by)) => (
+                grace_ends,
+                format!(
+                    "; {by}: held as ever, and the vendor denies it at {}",
+                    self.utc_at(deny)
+                ),
+            ),
+            (DenyClock::Unseen, None) => (
+                grace_ends.min(self.fx.mono() + TICK_LOOK),
+                "; a countdown on it is read again to see it tick".to_string(),
+            ),
+            (DenyClock::At { deny }, None) => {
+                let now = self.fx.mono();
+                let cap = deny.checked_sub(DENY_MARGIN).unwrap_or(now);
+                if now >= cap {
+                    // Said once a countdown ([`Countdown::ended_said`]).
+                    if let Some(c) = self.countdown.as_mut().filter(|c| !c.ended_said) {
+                        c.ended_said = true;
+                        review.note(&format!(
+                            "HOLD-ENDED seq={seq} {who}, but nobody has touched the box and the \
+                             vendor denies it at {}: the policy's answer goes now ({act})",
+                            self.utc_at(deny)
+                        ));
+                    }
+                    return Ok(false);
+                }
+                (
+                    grace_ends.min(cap),
+                    format!("; the vendor denies it at {}", self.utc_at(deny)),
+                )
+            }
+        };
         review.note(&format!(
-            "HELD seq={seq} {who}: hands off until {} ({act})",
-            utc_stamp(
-                u64::try_from(self.now_unix()).unwrap_or(0)
-                    + until.saturating_duration_since(self.fx.mono()).as_secs()
-            )
+            "HELD seq={seq} {who}: hands off until {} ({act}{why})",
+            self.utc_at(until)
         ));
         let until = self
             .setup
@@ -1393,6 +1638,145 @@ impl<C: Ctl> Session<'_, C> {
         self.set_due(until, "a person is typing");
         self.held = true;
         Ok(true)
+    }
+
+    pub(super) fn utc_at(&self, at: Instant) -> String {
+        utc_stamp(
+            u64::try_from(self.now_unix()).unwrap_or(0)
+                + at.saturating_duration_since(self.fx.mono()).as_secs(),
+        )
+    }
+
+    /// When Claude Code auto-denies the box on `rows`, once its countdown is seen ticking.
+    pub(super) fn deny_at(&self, rows: &[String]) -> Option<Instant> {
+        #[cfg(test)]
+        if self.deny_cap_off {
+            return None;
+        }
+        let identity = box_identity(rows)?;
+        self.deny_of(self.countdown_of_box(&identity)?)
+    }
+
+    fn deny_of(&self, c: &Countdown) -> Option<Instant> {
+        let deny = c.deny()?;
+        #[cfg(test)]
+        if let Some(read) = self.read_clock_now() {
+            let now = self.fx.mono();
+            return Some(match deny.checked_duration_since(read) {
+                Some(ahead) => now + ahead,
+                None => now.checked_sub(read.duration_since(deny)).unwrap_or(now),
+            });
+        }
+        Some(deny)
+    }
+
+    fn countdown_of_box(&self, identity: &str) -> Option<&Countdown> {
+        self.countdown.as_ref().filter(|c| c.identity == identity)
+    }
+
+    /// Keeps the countdown on `rows` (asked for at `asked`); a read with none forgets it.
+    pub(super) fn keep_countdown(&mut self, rows: &[String], asked: Instant) {
+        let Some(read) = countdown_of(rows, asked) else {
+            self.countdown = None;
+            return;
+        };
+        self.countdown = Some(read.after(self.countdown.as_ref()));
+    }
+
+    /// Keeps the box episode `screen` reads, its baseline `before` (the prior read's person count);
+    /// a read with no box ends it.
+    pub(super) fn keep_episode(&mut self, screen: &Screen, before: Option<Option<u64>>) {
+        #[cfg(test)]
+        {
+            let shown = box_identity(&screen.rows);
+            if self.episode_per_box && self.last_box.is_some() && shown != self.last_box {
+                self.episode = None;
+            }
+            self.last_box = shown;
+        }
+        if aterm_phase::parse_prompt_v2(&screen.rows).is_none() {
+            self.episode = None;
+            return;
+        }
+        let episode = self.episode.get_or_insert_with(|| Episode {
+            baseline: before.flatten(),
+            by: None,
+        });
+        episode.read(screen);
+    }
+
+    pub(super) fn episode_driven(&mut self) {
+        if let Some(e) = self.episode.as_mut() {
+            e.touch(BY_DRIVER);
+        }
+    }
+
+    pub(super) fn touched(&self) -> Option<&'static str> {
+        #[cfg(test)]
+        if self.touch_off {
+            return None;
+        }
+        self.episode.as_ref().and_then(|e| e.by)
+    }
+
+    /// The one person count every key of an answer names: an untouched episode's baseline, else
+    /// `seen`'s.
+    pub(super) fn person_fence(&self, seen: &Screen) -> Option<u64> {
+        match &self.episode {
+            Some(e) if e.by.is_none() => e.baseline,
+            _ => seen.human_seq,
+        }
+    }
+
+    pub(super) fn deny_clock(&self, screen: &Screen) -> DenyClock {
+        #[cfg(test)]
+        if self.deny_cap_off {
+            return DenyClock::None;
+        }
+        let Some(identity) = box_identity(&screen.rows) else {
+            return DenyClock::None;
+        };
+        let Some(c) = self.countdown_of_box(&identity) else {
+            return DenyClock::None;
+        };
+        match self.deny_of(c) {
+            Some(deny) => DenyClock::At { deny },
+            None => DenyClock::Unseen,
+        }
+    }
+
+    /// Whether nobody touched the box's episode and its ticking countdown is within [`DENY_MARGIN`]
+    /// of the deny.
+    pub(super) fn hold_over(&self, screen: &Screen) -> bool {
+        self.touched().is_none()
+            && matches!(
+                self.deny_clock(screen),
+                DenyClock::At { deny, .. } if self.fx.mono() + DENY_MARGIN >= deny
+            )
+    }
+
+    /// The quiet a retry waits for, and how long: [`SETTLE_MS`] within [`DENY_MARGIN`] of a ticking
+    /// deny, where two seconds of quiet never come.
+    pub(super) fn still_wait(&self, screen: &Screen) -> (&'static str, Duration) {
+        let DenyClock::At { deny, .. } = self.deny_clock(screen) else {
+            return (IDLE_MS, WAIT_STEP);
+        };
+        let now = self.fx.mono();
+        match deny.checked_sub(DENY_MARGIN).filter(|end| *end > now) {
+            Some(end) => (IDLE_MS, WAIT_STEP.min(end - now)),
+            None => (
+                SETTLE_MS,
+                WAIT_STEP.min(deny.saturating_duration_since(now)),
+            ),
+        }
+    }
+
+    fn box_grace(&self, opts: &SuperviseOpts, screen: &Screen) -> Duration {
+        if self.hold_over(screen) {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(u64::from(opts.policy.human_grace_s))
+        }
     }
 
     /// Until when the loop keeps its hands off the session.
@@ -1534,14 +1918,16 @@ impl<C: Ctl> Session<'_, C> {
                 self.wait(&["seq", &seq.to_string()], PROGRAM_SETTLE)?;
                 return Ok(Step::Again { settle: false });
             }
-            LaunchCall::Held => {
-                if answers && self.held_for_person(seq, "the box's answer", false, opts, review)? {
-                    if p.kind == PromptKind::Question {
-                        self.question.person_gave_input();
-                    }
+            LaunchCall::Held if answers => {
+                if p.kind == PromptKind::Question && self.hands_off_until(opts).is_some() {
+                    self.question.person_gave_input();
+                }
+                let clock = self.deny_clock(&turn.screen);
+                if self.held_for_person(seq, "the box's answer", false, clock, opts, review)? {
                     return Ok(Step::Review(turn));
                 }
             }
+            LaunchCall::Held => {}
         }
         self.auto_act(turn, p, decision, opts, approved, deadline, review)
     }
@@ -1604,7 +1990,7 @@ impl<C: Ctl> Session<'_, C> {
                     .enter_target()
                     .is_some_and(|target| answers(&dialog, target));
                 let this_question = question_key(&dialog, &turn.screen.rows);
-                let grace = Duration::from_secs(u64::from(opts.policy.human_grace_s));
+                let grace = self.box_grace(opts, &turn.screen);
                 let text_word = self.question.deciding.is_some_and(|w| w.text().is_some());
                 let reask = (answering || text_word).then_some(this_question.as_str());
                 match self.question_hold(
@@ -1689,7 +2075,18 @@ impl<C: Ctl> Session<'_, C> {
             }
             (Act::Approve { .. }, _) => unproven.clone().unwrap_or_default(),
         };
-        let grace = Duration::from_secs(u64::from(opts.policy.human_grace_s));
+        let grace = self.box_grace(opts, &turn.screen);
+        // A press past a person's hold (a box episode nobody touched, within
+        // [`DENY_MARGIN`] of its auto-deny, their grace still running) is
+        // fenced on the person (`if-human=`), every key of it, as a
+        // question's and a decline's keys always are, on the episode's
+        // baseline ([`Self::person_fence`]): one who gestured since skips it
+        // ([`Press::Yielded`]), and that gesture touched the episode, so the
+        // box is theirs from the next read on ([`Episode`]). A digit is
+        // always fenced on the judged read's count, which in an untouched
+        // episode is that baseline ([`Self::press_one_guarded`]).
+        let past_hold = self.hold_over(&turn.screen) && self.hands_off_until(opts).is_some();
+        let person = past_hold.then(|| self.person_fence(&turn.screen)).flatten();
         let pressing = match &act {
             Act::Approve {
                 guard,
@@ -1704,13 +2101,17 @@ impl<C: Ctl> Session<'_, C> {
                 guard,
                 choice: Choice::Focus { steps, label },
             } => {
-                let person = turn.screen.human_seq.filter(|_| {
-                    reset
-                        || p.kind == PromptKind::Trust
-                        || p.kind == PromptKind::AutocompactOffer
-                        || rule_id == super::super::policy::login::RULE_LOGIN_METHOD
-                        || is_muse(&self.reader(&turn.screen.rows).program())
-                });
+                let person = turn
+                    .screen
+                    .human_seq
+                    .filter(|_| {
+                        reset
+                            || p.kind == PromptKind::Trust
+                            || p.kind == PromptKind::AutocompactOffer
+                            || rule_id == super::super::policy::login::RULE_LOGIN_METHOD
+                            || is_muse(&self.reader(&turn.screen.rows).program())
+                    })
+                    .or(person);
                 self.press_focused(
                     &p,
                     *steps,
@@ -1729,7 +2130,8 @@ impl<C: Ctl> Session<'_, C> {
                 let person = turn
                     .screen
                     .human_seq
-                    .filter(|_| p.kind == PromptKind::AutocompactOffer);
+                    .filter(|_| p.kind == PromptKind::AutocompactOffer)
+                    .or(person);
                 self.press_focused(&p, *steps, label, key, guard, &turn.screen, person, None)?
             }
             Act::Approve {
@@ -1937,7 +2339,8 @@ impl<C: Ctl> Session<'_, C> {
                 self.answered(&act, rule_id, &what, &over, (at, seq), review)?;
                 note_unproven(review, at, rule_id, unproven.as_deref());
                 let identity = box_identity(&turn.screen.rows).unwrap_or_default();
-                let screen = match self.box_left(at, &identity, deadline)? {
+                let deny = self.deny_at(&turn.screen.rows);
+                let screen = match self.box_left(at, &identity, deny, deadline)? {
                     Past::Moved => {
                         self.press_retry = None;
                         return Ok(Step::Again { settle: true });
@@ -2466,7 +2869,9 @@ impl<C: Ctl> Session<'_, C> {
     ) -> Result<Option<Hold>, Fail> {
         let seq = turn.screen.seq;
         let quiet_ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX);
+        let over = self.hold_over(&turn.screen);
         match turn.screen.human {
+            _ if over => {}
             HumanInput::Never | HumanInput::NeverFor(_) => {}
             HumanInput::Ago(ms) if ms >= quiet_ms => {}
             HumanInput::Ago(ms) => {
@@ -2537,7 +2942,8 @@ impl<C: Ctl> Session<'_, C> {
                          key's effect: read again once the screen holds still"
                     ));
                 }
-                let settled = matches!(self.wait(&["idle", IDLE_MS], WAIT_STEP)?, Wait::Latched);
+                let (quiet, step) = self.still_wait(&turn.screen);
+                let settled = matches!(self.wait(&["idle", quiet], step)?, Wait::Latched);
                 if let Some(p) = self.question.pending.as_mut() {
                     if settled {
                         p.waited = true;
@@ -2705,25 +3111,37 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    fn box_left(&mut self, at: u64, identity: &str, deadline: Instant) -> Result<Past, Fail> {
-        let until = self.fx.mono() + WAIT_STEP;
+    fn box_left(
+        &mut self,
+        at: u64,
+        identity: &str,
+        deny: Option<Instant>,
+        deadline: Instant,
+    ) -> Result<Past, Fail> {
+        let pressed = self.fx.mono();
+        let mut until = pressed + leave_wait(pressed, deny);
         let mut since = at;
         let mut by = deadline;
         loop {
-            match self.moved_past(since, by, WAIT_STEP)? {
-                Past::Moved => {}
-                Past::Still(None) if self.fx.mono() < deadline => {
-                    // The step from the press ran out, the budget did not.
-                    return Ok(Past::Still(Some(self.screen()?)));
-                }
+            let step = until.saturating_duration_since(pressed);
+            let (now, moved) = match self.moved_past(since, by, step)? {
+                Past::Moved => (self.screen()?, true),
+                Past::Still(Some(now)) => (now, false),
+                // The step from the press ran out, the budget did not.
+                Past::Still(None) if self.fx.mono() < deadline => (self.screen()?, false),
                 still => return Ok(still),
-            }
-            let now = self.screen()?;
+            };
             if box_identity(&now.rows).as_deref() != Some(identity) {
                 self.box_gone();
                 return Ok(Past::Moved);
             }
-            if self.fx.mono() >= until {
+            // The deny as this read shows it: a countdown first seen ticking
+            // places it, and the wait shortens to it; a countdown the read no
+            // longer shows is the deny called off (Claude Code wipes it once a
+            // key reaches the box), and the wait is the whole step again, so a
+            // box slow to leave after its key is not pressed a second time.
+            until = pressed + leave_wait(pressed, self.deny_at(&now.rows));
+            if !moved || self.fx.mono() >= until {
                 return Ok(Past::Still(Some(now)));
             }
             since = now.seq;
@@ -2809,7 +3227,7 @@ mod act_tests {
         ),
         ("decline@v1", Outcome::Declined, "rm -rf /"),
         (RULE_LOGIN, Outcome::Typed, "/login"),
-        ("read-only@classify-v5", Outcome::Skipped, "ls"),
+        ("read-only@classify-v6", Outcome::Skipped, "ls"),
         ("-", Outcome::Escalated, ""),
         ("wall-wait@v1", Outcome::Waiting, ""),
     ];

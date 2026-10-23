@@ -2,13 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! A durable obligation to activate desktop preferences after their write.
-//!
-//! A process interrupted between writing preferences and relaunching their consumer
-//! must not forget that work on the next invocation. The marker precedes every write
-//! and survives a failed relaunch. A failed marker removal merely repeats activation.
-//! One pass relaunches each consumer once, after every write it reads
-//! ([`relaunch_settled`], from the pass's one activation in `init_preferences`); which
-//! process reads which domain is [`readers`].
 
 use crate::model::User;
 use crate::port::{Cmd, System};
@@ -19,23 +12,13 @@ use std::time::{Duration, Instant};
 const RECORD: &[u8] = b"aterm init desktop activation pending v1\n";
 const DIRECTORY: &str = "Library/Application Support/aterm/init-activation";
 
-/// The marker of a write to another app's sandbox container
-/// ([`crate::items::defaults::CONTAINED`]: Notification Center's widget list), kept apart
-/// from its family's: only a pass that holds Full Disk Access reaches that container, so
-/// only such a pass begins, discharges or reports it, and a pass without the grant, which
-/// relaunches the family's other readers, cannot clear what Notification Center still owes.
+/// The marker of a write to another app's sandbox container ([`crate::items::defaults::CONTAINED`]: Notification Center's widget list), kept apart from its family's: only a pass that holds Full Disk Access reaches that container, so only such a pass begins, discharges or reports it, and a pass without the grant, which relaunches the family's other readers, cannot clear what Notification Center still owes.
 pub const CONTAINED_MARKER: &str = "notificationcenter";
 
-/// The marker of a write to the Window Manager's widget keys (on the desktop and in Stage
-/// Manager), whose relaunch is the Dock's.
+/// The marker of a write to the Window Manager's widget keys (on the desktop and in Stage Manager), whose relaunch is the Dock's.
 pub const WIDGETS_MARKER: &str = "desktopwidgets";
 
-/// The marker an older aterm (0.114.0 and before) wrote before every widgets write,
-/// Notification Center's widget list with the Window Manager's keys, and cleared once the
-/// Dock and Notification Center were relaunched. This one writes it no more: a pass that
-/// finds it pending carries what it owes to [`WIDGETS_MARKER`] and [`CONTAINED_MARKER`]
-/// before it writes, so the Dock relaunches for it and Notification Center does too, once,
-/// when a pass holds Full Disk Access.
+/// The marker an older aterm (0.114.0 and before) wrote before every widgets write, Notification Center's widget list with the Window Manager's keys, and cleared once the Dock and Notification Center were relaunched.
 pub const LEGACY_WIDGETS_MARKER: &str = "widgets";
 
 fn path(user: &User, family: &str) -> Result<PathBuf, String> {
@@ -80,7 +63,6 @@ fn parents(sys: &dyn System, user: &User, marker: &Path) -> Result<(), String> {
 }
 
 /// Whether a previous write still needs its consumer relaunched.
-///
 /// # Errors
 /// Unreadable, foreign, linked or malformed activation state.
 pub fn pending(sys: &dyn System, user: &User, family: &str) -> Result<bool, String> {
@@ -106,13 +88,11 @@ pub fn pending(sys: &dyn System, user: &User, family: &str) -> Result<bool, Stri
 }
 
 /// Persist activation work before the first preference write.
-///
 /// # Errors
 /// The private marker cannot be safely written.
 pub fn begin(sys: &dyn System, user: &User, family: &str) -> Result<(), String> {
     let marker = path(user, family)?;
     parents(sys, user, &marker)?;
-    // A malformed existing obligation must not be silently replaced.
     pending(sys, user, family)?;
     sys.create_dir_all(
         marker
@@ -124,9 +104,6 @@ pub fn begin(sys: &dyn System, user: &User, family: &str) -> Result<(), String> 
     parents(sys, user, &marker)?;
     sys.write_user_file(user, &marker, RECORD, 0o600)
         .map_err(|_| "cannot persist pending desktop activation".to_owned())?;
-    // Publish every ancestor entry as well as the marker's rename. Do not stop at
-    // an existing directory: an interrupted earlier attempt may have created it
-    // without completing its parent flush. HOME itself need not have existed yet.
     for directory in marker.parent().into_iter().flat_map(Path::ancestors) {
         sys.durable_dir(directory)
             .map_err(|_| "cannot persist the desktop activation directory entries".to_owned())?;
@@ -135,7 +112,6 @@ pub fn begin(sys: &dyn System, user: &User, family: &str) -> Result<(), String> 
 }
 
 /// Clear the obligation only after activation has succeeded.
-///
 /// # Errors
 /// The marker is malformed or cannot be removed; rerunning safely repeats activation.
 pub fn finish(sys: &dyn System, user: &User, family: &str) -> Result<(), String> {
@@ -149,14 +125,7 @@ pub fn finish(sys: &dyn System, user: &User, family: &str) -> Result<(), String>
 /// The desktop processes a pass relaunches, in the order it relaunches them.
 pub const RELAUNCHED: [&str; 3] = ["Dock", "Finder", "NotificationCenter"];
 
-/// The processes that read `domain`'s preferences and relaunch to read a write to it, in
-/// [`RELAUNCHED`] order: the one table the init pass (each family's readers are those of
-/// the domains its keys are in) and the doctor's relaunch after its own writes both read.
-/// The Dock reads its own; the Finder draws the desktop icons; Notification Center its
-/// widgets. `com.apple.WindowManager` relaunches the Dock, as the doctor always has:
-/// WindowManager.app, whose domain it is, is not relaunched, since its launchd job
-/// (`KeepAlive`, `SuccessfulExit = false`) does not start it again after a clean exit.
-/// Any other domain: none.
+/// The processes that read `domain`'s preferences and relaunch to read a write to it, in [`RELAUNCHED`] order: the one table the init pass (each family's readers are those of the domains its keys are in) and the doctor's relaunch after its own writes both read.
 #[must_use]
 pub fn readers(domain: &str) -> &'static [&'static str] {
     match domain {
@@ -169,7 +138,7 @@ pub fn readers(domain: &str) -> &'static [&'static str] {
 
 /// How long [`relaunch_settled`] waits on what it relaunched, looking once a second: the
 /// one-minute hang detector, never a latency budget (a consumer that settles is done at
-/// once). Both bounds hold, since the looks between the sleeps take time too.
+/// once).
 const PATIENCE: Duration = Duration::from_secs(60);
 const POLLS: u32 = 60;
 
@@ -186,24 +155,7 @@ enum State<W> {
     },
 }
 
-/// Relaunch each of `processes` that runs, once, in turn, and return once each is up again
-/// and past its start or the minute is out: for each, `Ok`, or why not. A consumer is up
-/// once every old process of it has exited, a new one runs, and `look` (what it reads, as
-/// the read-back will) answers the same twice, a second apart, under the same new
-/// processes; `look` answers `Err` while what it reads shows its start is not past (a
-/// Dock that has not yet given the tiles it was handed their GUIDs). A consumer killed
-/// while starting, or one that is starting, can write the preferences it read at its start
-/// back over newer ones (the Dock's pins did, 2026-10-21); a new pid alone does not say
-/// that start is past. Each relaunched consumer is waited on whatever another does, so
-/// none is left starting for what writes or relaunches next (a rollback). No running
-/// consumer needs no relaunch: its next start reads the written values. A relaunch that
-/// fails signalled nothing (`killall` exits 0 once it signalled, 1 when nothing matched;
-/// no `killall` runs without the session), so it is not waited on. Stored preferences alone
-/// cannot discharge the obligation.
-///
-/// A consumer's answer is an error for an incomplete process census, a failed relaunch, an
-/// interrupted wait, or, after the minute, an old process that survives, one that does not
-/// start again, or one still starting. The caller keeps the markers of what it serves.
+/// Relaunch each of `processes` that runs, once, in turn, and return once each is up again and past its start or the minute is out: for each, `Ok`, or why not.
 pub fn relaunch_settled<W: PartialEq>(
     sys: &dyn System,
     user: &User,
@@ -498,10 +450,7 @@ mod tests {
 
     /// A relaunched consumer counts as up only once its old process exited, a new one
     /// runs, and what it reads stopped changing across a poll under that same process: a
-    /// Dock still starting can write what it read back. One that does not start again, or
-    /// keeps rewriting, fails after the one-minute hang detector, never on a latency
-    /// budget. Negative control: returning once the old pid exits passes the rewriting
-    /// case after its first read.
+    /// Dock still starting can write what it read back.
     #[test]
     fn a_relaunched_consumer_is_up_once_it_runs_again_and_what_it_reads_is_still() {
         let who = user("alice", 501);
@@ -513,7 +462,6 @@ mod tests {
             sys.on("alice@gui$ /usr/bin/killall -u alice Dock", Ran::ok(""));
             sys.on("alice$ /bin/sleep 1", Ran::ok(""));
         };
-        // It settles once two reads a second apart agree: its second and third.
         let sys = Fake::root();
         script(&sys, Ran::ok("124\n"));
         let reads = std::sync::Mutex::new(vec![1, 2, 2, 2]);
@@ -522,7 +470,6 @@ mod tests {
         });
         assert_eq!(answers, [Ok(())]);
         assert_eq!(sleeps(&sys), 2);
-        // It never starts again.
         let sys = Fake::root();
         script(
             &sys,
@@ -537,7 +484,6 @@ mod tests {
             .unwrap_err();
         assert!(why.contains("has not started again"), "{why}");
         assert_eq!(sleeps(&sys), 59);
-        // It keeps rewriting what it reads.
         let sys = Fake::root();
         script(&sys, Ran::ok("124\n"));
         let count = std::sync::atomic::AtomicU32::new(0);
@@ -549,7 +495,6 @@ mod tests {
         assert!(why.contains("Dock still rewrites what it reads"), "{why}");
         assert_eq!(sleeps(&sys), 59);
         assert_eq!(kills(&sys), 1);
-        // What it reads says its start is not past (a Dock whose tiles have no GUIDs yet).
         let sys = Fake::root();
         script(&sys, Ran::ok("124\n"));
         let looks = std::sync::Mutex::new(vec![Err("tiles"), Err("tiles"), Ok(()), Ok(())]);
@@ -561,9 +506,7 @@ mod tests {
     }
 
     /// Two equal reads count only under the same new processes: a consumer that started
-    /// again between them (a crash right after its start) is looked at again. Negative
-    /// control: comparing only what it reads settles a poll early, on the pair that spans
-    /// two processes.
+    /// again between them (a crash right after its start) is looked at again.
     #[test]
     fn two_equal_reads_settle_a_consumer_only_under_the_same_new_process() {
         let who = user("alice", 501);
@@ -583,8 +526,7 @@ mod tests {
     /// Each consumer gets its own answer, and every one that was relaunched is waited on
     /// whatever another does: a census that fails or a relaunch that cannot be made (it
     /// signalled nothing, so nothing of it is awaited) does not cut short the wait for one
-    /// already killed, which a rollback would otherwise relaunch while it starts. Negative
-    /// control: returning at the first failure leaves the Dock unlooked at.
+    /// already killed, which a rollback would otherwise relaunch while it starts.
     #[test]
     fn every_relaunched_consumer_is_waited_on_whatever_another_does() {
         let who = user("alice", 501);

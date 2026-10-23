@@ -26,7 +26,9 @@ fn ctl(args: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_aterm-ctl"));
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
-        if name.starts_with("ATERM_") || name == "TMUX" || name == "STY" || name == "ZELLIJ" {
+        // The verify run's mark is no authority and stays (`VERIFY_RUN_VAR`).
+        let aterm = name.starts_with("ATERM_") && name != aterm_uds::process::VERIFY_RUN_VAR;
+        if aterm || name == "TMUX" || name == "STY" || name == "ZELLIJ" {
             command.env_remove(key);
         }
     }

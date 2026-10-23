@@ -15,6 +15,7 @@ use crate::extra::{CellCoord, CellExtra};
 #[derive(Debug, Clone)]
 pub(crate) struct ComplexCharRing {
     /// Flat array: `entries[ring_row * stride + col]`, raw `char` codepoints,
+    /// `'\0'` = empty.
     entries: Vec<char>,
     /// Columns per row (for index calculation).
     stride: u16,
@@ -185,6 +186,7 @@ impl RingSpans for ComplexCharRing {
     }
 
     /// Clear the `[left, right_excl)` column span of one external row with one
+    /// `fill`.
     #[inline]
     fn clear_range(&mut self, row: u16, left: u16, right_excl: u16) {
         let end = right_excl.min(self.stride);
@@ -202,7 +204,7 @@ impl RingSpans for ComplexCharRing {
 /// Dense ring-buffer storage for cells whose only extra is fg/bg RGB (no hyperlink, underline colour or extended flags), laid out like `ComplexCharRing`.
 #[derive(Debug, Clone)]
 pub(crate) struct RgbColorRing {
-    /// FG entries, `fg[ring_row * stride + col]`. `None` until a true-colour fg
+    /// FG entries, `fg[ring_row * stride + col]`.
     fg: Option<Box<[u32]>>,
     /// BG entries, laid out and allocated like `fg`.
     bg: Option<Box<[u32]>>,
@@ -324,6 +326,8 @@ impl RgbColorRing {
     }
 
     /// Store fg and/or bg RGB across `[col_start, col_end)` of `row` with one
+    /// `fill` per present plane, equivalent to `set_fg`/`set_bg` per column
+    /// (`fill_run_matches_per_cell_set`).
     #[inline]
     fn fill_runs(
         &mut self,
@@ -463,6 +467,7 @@ impl RingSpans for RgbColorRing {
     }
 
     /// Copy a `[left, right]` column span from `src_row` to `dst_row`; the
+    /// caller clears vacated rows.
     #[inline]
     fn copy_row_span(&mut self, src_row: u16, dst_row: u16, left: u16, right: u16) {
         let hi = right.min(self.stride.saturating_sub(1));
@@ -477,6 +482,7 @@ impl RingSpans for RgbColorRing {
     }
 
     /// Clear RGB entries for a column range on a single row, so erased cells do
+    /// not keep ring RGB that would shadow their default colors.
     #[inline]
     fn clear_range(&mut self, row: u16, start_col: u16, end_col: u16) {
         let end = end_col.min(self.stride);
@@ -499,6 +505,8 @@ impl RingSpans for RgbColorRing {
 }
 
 /// Row-span primitives both dense rings provide, so the rectangular shifts built
+/// on them — and the full-width region shifts, which are the rect shift over
+/// `[0, stride - 1]` — are written once.
 trait RingSpans {
     /// Number of visible rows (ring capacity).
     fn visible_rows(&self) -> u16;
@@ -547,6 +555,7 @@ trait RingSpans {
     fn clear_range(&mut self, row: u16, left: u16, right_excl: u16);
 
     /// Rect shift up by `n` within rows `[top, bottom]` × cols `[left, right]`
+    /// (DECLRMM).
     fn shift_rect_up(&mut self, top: u16, bottom: u16, left: u16, right: u16, n: u16) {
         if n == 0 || top > bottom || left > right {
             return;
@@ -567,6 +576,7 @@ trait RingSpans {
     }
 
     /// Rect shift down by `n` within rows `[top, bottom]` × cols `[left, right]`
+    /// (DECLRMM).
     fn shift_rect_down(&mut self, top: u16, bottom: u16, left: u16, right: u16, n: u16) {
         if n == 0 || top > bottom || left > right {
             return;
@@ -588,6 +598,7 @@ trait RingSpans {
 }
 
 /// Copy columns `[left, hi]` of the row at `src_base` onto the row at `dst_base`
+/// with one `copy_within`; out-of-range dimensions skip the copy, never panic.
 #[inline]
 fn copy_span<T: Copy>(plane: &mut [T], src_base: usize, dst_base: usize, left: u16, hi: u16) {
     if left > hi {
@@ -602,6 +613,7 @@ fn copy_span<T: Copy>(plane: &mut [T], src_base: usize, dst_base: usize, left: u
 }
 
 /// ICH on one ring row, `start < hi`: columns `[start, hi - count)` move right by
+/// `count`, `[start, start + count)` become `blank`, and what passes `hi` drops.
 #[inline]
 fn shift_right_in<T: Copy>(
     plane: &mut [T],
@@ -621,6 +633,7 @@ fn shift_right_in<T: Copy>(
 }
 
 /// DCH on one ring row, `start < hi`: columns `[start + count, hi)` move left by
+/// `count` and the last `count` columns before `hi` become `blank`.
 #[inline]
 fn shift_left_in<T: Copy>(plane: &mut [T], base: usize, start: u16, count: u16, hi: u16, blank: T) {
     let (s, h) = (base + start as usize, base + hi as usize);
@@ -633,6 +646,8 @@ fn shift_left_in<T: Copy>(plane: &mut [T], base: usize, start: u16, count: u16, 
 }
 
 /// Compact after this many accumulated scroll rows: rare enough to amortize to
+/// O(1) per scroll, small enough to bound stale-entry memory and keep
+/// `row_offset` plus the screen height clear of u16 overflow.
 const COMPACT_THRESHOLD: u16 = 256;
 
 /// Maximum number of hyperlink-bearing entries allowed in `CellExtras`.
@@ -687,16 +702,24 @@ pub struct CellExtras {
     /// Dense ring for non-BMP complex chars, allocated on first non-BMP write.
     complex_ring: Option<Box<ComplexCharRing>>,
     /// Dense ring for cells whose only extra is fg/bg RGB, allocated on first
+    /// such write.
     rgb_ring: Option<Box<RgbColorRing>>,
     /// Scratch for [`Self::enforce_hyperlink_limit_cold`]'s candidate walk:
+    /// empty between calls, it keeps its capacity so the cold path does not
+    /// allocate.
     hyperlink_scratch: Vec<CellCoord>,
     /// Upper bound on the number of hyperlink-bearing entries in `data`, which
+    /// guards [`Self::enforce_hyperlink_limit`]: `data.len()` also counts marks,
+    /// colours, flags and images, so guarding on it would walk the whole map on
+    /// every linked write once anything else filled it.
     hyperlink_upper_bound: usize,
     /// Sticky: an inline image has been placed here at some point; reset only by
+    /// [`Self::clear`].
     any_image: bool,
 }
 
 /// Reset or insert the empty entry at internal key `key` for a writer's new cell:
+/// the rule [`CellExtras::fresh`] and `set_range_uniform`'s map path share.
 #[inline]
 fn fresh_slot(
     data: &mut FxHashMap<CellCoord, CellExtra>,
@@ -1438,6 +1461,8 @@ impl CellExtras {
     }
 
     /// Apply the accumulated `row_offset` plus an additional `shift` in one pass:
+    /// drop stale entries and those scrolled off (external row < shift), re-key
+    /// survivors to offset 0, then enforce the hyperlink limit.
     #[inline(never)]
     fn apply_offset_and_shift(&mut self, shift: u16) {
         self.apply_offset_and_shift_only(shift);
@@ -1445,6 +1470,7 @@ impl CellExtras {
     }
 
     /// The compaction core without the hyperlink-limit enforcement, so
+    /// [`Self::enforce_hyperlink_limit_cold`] can compact without recursing.
     #[inline(never)]
     fn apply_offset_and_shift_only(&mut self, shift: u16) {
         let total = match self.row_offset.checked_add(shift) {
@@ -1652,6 +1678,8 @@ mod tests {
     use super::*;
 
     /// Both rings ignore a column at or past their stride: a read is `None`
+    /// and a write a no-op, never an alias into the next ring row's slots
+    /// (row 0, col 10 of a 10-wide ring is row 1, col 0's slot).
     #[test]
     fn ring_columns_past_the_stride_never_alias_the_next_row() {
         let mut complex = ComplexCharRing::new(4, 10);
@@ -1678,6 +1706,8 @@ mod tests {
     }
 
     /// Scrolling a ring by at least its visible rows (e.g. `CSI 65535 S`)
+    /// recycles it whole and resets `ring_offset`, so later writes stay
+    /// readable.
     #[test]
     fn ring_overscroll_recycles_and_resets_the_offset() {
         for n in [4, 5, 65535] {
@@ -1705,6 +1735,9 @@ mod tests {
     }
 
     /// EVERY CLEAR REACHES BOTH STORES (#7697): `clear_row`, `clear_range`,
+    /// `clear_rows` and `clear_rect` remove exactly their cells from the
+    /// HashMap and from the RGB ring (where RGB-only writes live), keep every
+    /// other cell, and an empty range clears nothing.
     #[test]
     fn every_clear_removes_exactly_its_cells_from_map_and_rgb_ring() {
         type Clear = fn(&mut CellExtras);
@@ -1780,6 +1813,8 @@ mod tests {
     }
 
     /// `fill_runs` leaves the ring exactly as per-cell `set_fg`/`set_bg` does,
+    /// including empty, overhanging and fully out-of-range runs (which must not
+    /// allocate the plane).
     #[test]
     fn fill_run_matches_per_cell_set() {
         let rgb_f = [17u8, 34, 51];
@@ -1827,6 +1862,8 @@ mod tests {
     }
 
     /// `RgbColorRing::clear_range` leaves the planes exactly as a per-column loop
+    /// does, including a stale `row >= visible_rows` and non-zero ring offsets,
+    /// and never allocates an absent plane.
     #[test]
     fn clear_range_matches_per_cell_clear() {
         fn clear_range_per_cell(ring: &mut RgbColorRing, row: u16, start_col: u16, end_col: u16) {
@@ -1894,6 +1931,7 @@ mod tests {
     }
 
     /// `ComplexCharRing::clear_range`'s one `fill('\0')` equals a per-column
+    /// store, across the same kinds of ranges.
     #[test]
     fn complex_clear_range_matches_per_cell_clear() {
         fn clear_range_per_cell(ring: &mut ComplexCharRing, row: u16, left: u16, right_excl: u16) {
@@ -2002,6 +2040,8 @@ mod tests {
     }
 
     /// Sharing is unobservable: `set_range_uniform` gives every cell of an OSC 8
+    /// run the same `Arc<HyperlinkData>`, so a later single-cell edit must
+    /// copy-on-write and leave its neighbours' link alone.
     #[test]
     fn per_cell_hyperlink_edit_does_not_leak_across_the_run() {
         const RUN_URL: &str = "https://example.com/run";

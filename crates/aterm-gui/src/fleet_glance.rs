@@ -21,6 +21,7 @@ pub(crate) const FLEET_TOLD_MAX: usize = 512;
 /// One read's whole bound: the child's own deadline is 3 s a peer, so this is the kill, never a wait it is expected to reach.
 pub(crate) const READ_CAP: Duration = Duration::from_secs(10);
 /// The most fleet peers one snapshot keeps (`aterm_net`'s book is bounded
+/// too); the rest are counted as not read.
 const MACS_MAX: usize = 256;
 
 /// One need on a fleet peer, from its facts row.
@@ -304,6 +305,9 @@ fn field<'a>(object: &'a aterm_json::Map, key: &str) -> Option<&'a str> {
 }
 
 /// One fleet peer's answer, labelled `label`: its header and its session
+/// rows, read by the Mac whose node is `own_node`; `unproven` where it proved
+/// no node key this Mac binds, whose node, host and drive are then its claim
+/// and not taken ([`FleetMac::unproven`]).
 fn mac_of(
     label: &str,
     instance: &aterm_json::Map,
@@ -415,6 +419,10 @@ fn mac_of(
 }
 
 /// A content peer's words for its row's need `word`, as a local row has
+/// them (§3: "titles and words appear only where that Mac's `[fleet]
+/// allow` is content"): an ask's own text — the row's attention excerpt is
+/// the entry the session is ranked by, the ask itself — a box's kind
+/// (`agent_detail`), a wall's kind and the reset it names.
 fn content_what(word: NeedWord, row: &aterm_json::Map) -> Option<String> {
     use crate::needs::{HarnessAsk, ROW_WHAT_MAX, fold_clip, need_words};
     match word {
@@ -529,6 +537,9 @@ pub(crate) fn read_book(state: &Path) -> BookFacts {
 }
 
 /// [`read_book`] off unix, where there is no book to read
+/// (`aterm_net::fleet_member` is unix-only): a fleet key says only that it is
+/// in a fleet — and no reader starts off macOS anyway
+/// (`App::fleet_glance_may_start`).
 #[cfg(not(unix))]
 fn read_book_peers(_state: &Path, in_fleet: bool) -> BookFacts {
     BookFacts {
@@ -538,6 +549,12 @@ fn read_book_peers(_state: &Path, in_fleet: bool) -> BookFacts {
 }
 
 /// [`read_book`]'s book: whether it names peers that joined this Mac, or
+/// only its issuer — and then, since the issuer's book (S11) makes a
+/// member's read whole, whether the last read got that book
+/// ([`aterm_net::fleet_member::holds_issuer_book`]): a member holding it
+/// knows the whole fleet, one without it (its issuer an older aterm that
+/// shares none, or no read yet) only its issuer — and whether its issuer's
+/// entry binds a key ([`BookFacts::unbound_issuer`]).
 #[cfg(unix)]
 fn read_book_peers(state: &Path, in_fleet: bool) -> BookFacts {
     let book = aterm_net::fleet_member::read_peers(state).unwrap_or_default();
@@ -757,6 +774,10 @@ pub(crate) fn spawn(runner: Box<dyn FleetRunner>, seams: ReaderSeams) -> Option<
 }
 
 /// The reader: look, read when [`should_poll`] (or a [`Kick::Now`]) says,
+/// write the slot ([`carry`]ing a silent Mac's last rows), tell the App,
+/// then wait for a kick, the tick, or the next instant the read or one Mac's
+/// rows in it stops counting ([`FleetSnapshot::next_lapse`]), whichever is
+/// first.
 fn reader_loop(
     mut runner: Box<dyn FleetRunner>,
     seams: &ReaderSeams,
@@ -849,6 +870,7 @@ pub(crate) fn is_herald_key(key: u64) -> bool {
 }
 
 /// A fleet need's transition key within its slot: its word's hash — a facts
+/// row carries no verdict rev, so one notice per (Mac, session, word).
 fn need_key(word: NeedWord) -> u64 {
     aterm_hash::fnv1a_64(word.word().as_bytes())
 }
@@ -951,6 +973,7 @@ impl crate::App {
     }
 
     /// Whether a fleet glance may start here: never headless (no child, no
+    /// thread), never off macOS, never twice.
     fn fleet_glance_may_start(&self) -> bool {
         !self.headless && cfg!(target_os = "macos") && self.fleet_glance.is_none()
     }

@@ -124,14 +124,18 @@ impl LiveHealth for aterm_messages::MessageCenter {
 }
 
 /// The flow row's glyph while it checks what arrived: `↻` is working; the phases that
+/// move a build in wear [`MOVING_IN`].
 const FLOW_GLYPH: char = '\u{21bb}';
 /// `⇣`: a build moving in (downloading, installing, finishing) and the ready build that
+/// waits for `Install now` (`✓` reads as done, a still `↻` as stalled).
 const MOVING_IN: char = '\u{21e3}';
 /// `✓` — the landing's record, and the ready build the lane installs by
+/// itself (a record).
 const READY: char = '\u{2713}';
 /// `⚠` — an outcome the person acts on.
 const NEEDS_YOU: char = '\u{26a0}';
 /// `ℹ` — a record of the lane working (a record wears its
+/// outcome's mark, never the working `↻` of a row still moving).
 const NOTED: char = '\u{2139}';
 
 /// How a staged build will be applied: what the staged row's detail may promise.
@@ -168,6 +172,7 @@ pub(crate) enum AutoApplyVeto {
 
 impl AutoApplyVeto {
     /// The clause the sentence leads the fallback with — what the reader can
+    /// act on, worded like the standalone arms for the same states.
     fn clause(self) -> String {
         match self {
             Self::Config => aterm_update_core::settings::install_switch_off(),
@@ -269,6 +274,7 @@ pub(crate) fn flow_title(verb: &str, version: &str) -> String {
 }
 
 /// The flow row: its phase title, the working glyph, `phase` behind
+/// `Details ›`, a meter (a fill, or busy), `hold`, the progress key.
 fn flow(title: String, phase: &str, meter: Meter, hold: Hold) -> Message {
     let mark = if phase == CHECKING {
         FLOW_GLYPH
@@ -693,7 +699,7 @@ pub(crate) fn layout_folded(fold: &crate::restore::LayoutFold) -> Option<Message
 /// The supersede key of the folded-desk record: one per update.
 pub(crate) const KEY_LAYOUT_FOLDED: &str = "update.layout-folded";
 
-/// How many lost drafts the row spells out, each on its own line. Far above
+/// How many lost drafts the row spells out, each on its own line.
 const SETTINGS_DRAFTS_SHOWN: usize = 16;
 
 /// An update carried unsaved Settings text across and the new build could not reopen some of it.
@@ -745,6 +751,7 @@ pub(crate) fn settings_drafts_not_reopened(
 }
 
 /// "1 older line stayed behind in 1 tab" / "12345 older lines stayed behind
+/// in 3 tabs".
 #[cfg(any(unix, test))]
 fn scrollback_lost_words(lines: u64, tabs: usize) -> String {
     let lines = if lines == 1 {
@@ -761,6 +768,7 @@ fn scrollback_lost_words(lines: u64, tabs: usize) -> String {
 }
 
 /// "1 tab repainted" / "3 tabs repainted", or `None` for a handoff that
+/// carried every screen exactly.
 fn repainted_words(repainted: usize) -> Option<String> {
     match repainted {
         0 => None,
@@ -846,6 +854,10 @@ pub(crate) fn cold_lane_tabs_not_kept(cause: &str) -> Message {
 const BUSY: &str = "the terminal was busy";
 
 /// A stopped switch's reason in a person's words, as `(a substring of the reason, the
+/// words)`, keyed on the producers' own literals in `app_update_handoff.rs` and
+/// `native_update_auto_intent.rs`: the park gate's waits (a hold-cap stand-down names the
+/// last one it waited on, so they come first), the stand-downs and misses of both lanes,
+/// and the fork lane's activity refusals.
 #[cfg(any(unix, test))]
 const STAND_DOWN_CAUSES: &[(&str, &str)] = &[
     (
@@ -897,6 +909,9 @@ const STAND_DOWN_CAUSES: &[(&str, &str)] = &[
 ];
 
 /// What a stopped switch's `why` comes down to for a person: a stand-down's
+/// cause ([`STAND_DOWN_CAUSES`]), else a failure the apply lane can name
+/// ([`crate::update_apply_trouble::named_clause`]); `None` for anything
+/// else, whose account stays in aterm.log.
 #[cfg(any(unix, test))]
 fn stopped_cause(why: &str) -> Option<&'static str> {
     STAND_DOWN_CAUSES
@@ -967,10 +982,13 @@ pub(crate) fn with_named_cause(said: &str, reason: &str) -> String {
 }
 
 /// What `CaptureRefusal`'s Display puts ahead of a refusal of the open tabs
+/// together; the refusal's own words follow it.
 #[cfg(any(unix, test))]
 const CAPTURE_REFUSED: &str = "the park's capture refused: ";
 
 /// What a capture refusal past a cap no update carries says is past it and
+/// where (`restore::RestoreManifest::why_not_whole`), without the refusal's
+/// prefix; `None` for any other account.
 #[cfg(any(unix, test))]
 fn past_cap_cause(why: &str) -> Option<&str> {
     why.contains(crate::restore::UPDATE_CAP_KEY).then(|| {
@@ -980,6 +998,8 @@ fn past_cap_cause(why: &str) -> Option<&str> {
 }
 
 /// Whether a capture refusal names one tab (`CaptureRefusal`'s "the park's capture refused
+/// session N: …") rather than the open tabs together (their layout, or their records over
+/// what one handover carries), which no single tab changing is owed to.
 #[cfg(any(unix, test))]
 fn capture_refusal_names_a_tab(message: &str) -> bool {
     message.contains("refused session")
@@ -1161,6 +1181,8 @@ pub(crate) fn health_entry_delay(body: &str, now_unix: i64) -> Duration {
 }
 
 /// The start a carried warning's excerpt dates (`since Sep 14`, [`health_since`]'s words)
+/// at `now_unix`: the end of that UTC day, in the latest year whose day has begun by now,
+/// so the digest's day is never cut short.
 fn health_excerpt_since(line: &str, now_unix: i64) -> Option<i64> {
     let (month, day) = line.strip_prefix("since ")?.split_once(' ')?;
     let month = MONTHS.iter().position(|m| *m == month)? + 1;
@@ -1238,6 +1260,8 @@ pub(crate) const CHECKER_STALLED_TITLE: &str = "Update check stopped";
 pub(crate) const CHECKER_LOCK_HELD_TITLE: &str = "Another aterm's update check is stuck";
 
 /// Every title the watchdog's warning has worn, today's first: a row an older
+/// build carried under the family key is read back to its kind by these
+/// ([`HealthKind::of_row`]).
 const CHECKER_STALLED_TITLES: [&str; 2] = [CHECKER_STALLED_TITLE, "aterm's update check stopped"];
 
 /// The body of the warning the window's watchdog (`crate::update_checker_watch`) raises under [`CHECKER_STALLED_TITLE`].
@@ -1446,6 +1470,7 @@ pub(crate) fn own_launch_record_renewal_spent_entry(pid: u32, attempts: u8) -> E
 }
 
 /// Why the person, and not aterm, ends a stale record: once aterm's own renewal has not
+/// run or not worked, only their fresh open gives macOS a new record.
 #[cfg(target_os = "macos")]
 const STALE_RECORD_REASON: &str =
     "only quitting aterm and opening it again gives macOS a new record of it";
@@ -1509,6 +1534,7 @@ mod tests {
     }
 
     /// D5: a calm Info row on glass, by what was folded (windows merged into tabs, tabs
+    /// moved, both), singular and plural, and nothing for a layout that folded nothing.
     #[test]
     fn a_folded_desk_is_said_as_a_calm_record() {
         use crate::restore::LayoutFold;
@@ -1591,6 +1617,7 @@ mod tests {
     }
 
     /// Behind the channel is an Info record in the dev channel's words with what to do
+    /// behind it; at or newer than the newest release says nothing.
     #[test]
     fn a_dev_builds_standing_is_a_record() {
         use crate::message_reporters::{Attention, attention};
@@ -1633,6 +1660,9 @@ mod tests {
     }
 
     /// A dev build named aterm.app is a digest entry of its own, keyed apart from the
+    /// standing, saying what it writes and the release's verb that puts each thing back:
+    /// `aterm pkg repair` never touches the agent primer, so the primer names
+    /// `aterm agents install`.
     #[test]
     fn a_dev_build_that_writes_the_release_setup_says_what_and_what_puts_it_back() {
         let entry = dev_build_entry(ALL_WRITES);
@@ -1701,6 +1731,7 @@ mod tests {
     }
 
     /// Every posture the App can compute, both vetoes of the disabled handoff
+    /// included.
     fn every_posture() -> Vec<ApplyPosture> {
         use ApplyPosture as P;
         let mut postures = vec![
@@ -1735,6 +1766,10 @@ mod tests {
     }
 
     /// The install switch has one name on the staged line too: a build that
+    /// `[update] auto_apply` holds for a press says the switch's name as
+    /// Settings paints it right under that line on Software Update ("Install
+    /// updates automatically"), alone or after a handoff cause, as the Linux
+    /// held download does.
     #[test]
     fn a_build_held_by_the_install_switch_names_the_switch() {
         use ApplyPosture as P;
@@ -1762,6 +1797,10 @@ mod tests {
     }
 
     /// A lane that tries again by itself asks nothing:
+    /// its `Couldn't install` is a record — FYI goes to the log, never the
+    /// glass — while a stopped lane keeps its
+    /// row and its `Install now`, with the failure's few words beside the
+    /// title where they change what the person does (`Couldn't install aterm v0.92.0 · disk full`).
     #[test]
     fn a_self_retry_is_a_record_and_a_stopped_lane_says_its_cause() {
         let retry = needs_install(
@@ -1807,6 +1846,8 @@ mod tests {
     }
 
     /// Every flow row completes in its finished form: `Downloaded`,
+    /// `Verified`, `Installed`, never a participle beside a ✓, with nothing else on the
+    /// row moving at 60, 80, 120 and 160 columns.
     #[test]
     fn every_flow_row_completes_in_its_finished_form() {
         use crate::message_band::assert_completes_in_place as completes;
@@ -1843,6 +1884,7 @@ mod tests {
     }
 
     /// Every row is an update row with a glyph from the band's closed set and
+    /// a title inside the cap; the capsule route is the page's own path.
     #[test]
     fn every_update_row_carries_an_admitted_glyph_and_a_capped_title() {
         let rows = [
@@ -1919,6 +1961,7 @@ mod tests {
     }
 
     /// A build whose next start its boot trial rolls back is not ready: an Info record
+    /// with `ℹ`, `aterm vX is on hold`, its sentence naming the newer release.
     #[test]
     fn a_spent_trial_is_recorded_on_hold_not_ready() {
         let m = staged("0.95.0", 11, Some(ApplyPosture::TrialSpent));
@@ -1939,6 +1982,9 @@ mod tests {
     }
 
     /// Every phase from the first byte to the switch is the flow row (Info, keyed
+    /// `update.progress`, verb first), its phase word behind `Details ›`, a
+    /// fill with its amount where the total is known and busy where it is not, both
+    /// waiting out the progress grace.
     #[test]
     fn update_reports_map_to_the_flow_row() {
         use aterm_update::Progress as P;
@@ -2051,6 +2097,8 @@ mod tests {
     }
 
     /// Every row the lane composes is progress with its indicator, a decision, a failure
+    /// the person acts on, or a record, never a confirmation or a still Info row on the
+    /// glass, and every glass title is terse.
     #[test]
     fn every_update_message_earns_its_row() {
         use crate::message_reporters::{Attention, attention};
@@ -2167,6 +2215,7 @@ mod tests {
     }
 
     /// A failed update keeps its whole cause: a 600-char sentence with a
+    /// URL is every word behind the flow row's excerpt, never pre-cut.
     #[test]
     fn a_failed_update_keeps_its_whole_cause() {
         let cause = format!(
@@ -2193,6 +2242,8 @@ mod tests {
     }
 
     /// The staged row says how the update installs and never asks for a restart:
+    /// where a press installs it, the ready row with the `Install now` capsule; every
+    /// other posture, the automatic lane included, is a record.
     #[test]
     fn a_staged_row_says_how_the_update_installs_and_never_asks_for_a_restart() {
         use ApplyPosture as P;
@@ -2301,6 +2352,8 @@ mod tests {
     }
 
     /// The App refines the staged row with the full words once the lane has armed or stood
+    /// down; a lane that installs by itself (armed, or retrying later) is a record, which
+    /// the host folds the ready row into rather than restating it.
     #[test]
     fn a_posture_restatement_carries_the_full_words() {
         use ApplyPosture as P;
@@ -2329,6 +2382,7 @@ mod tests {
     }
 
     /// `Install now` rides the staged row only where a press is how the build installs
+    /// (design §7.3).
     #[test]
     fn the_staged_row_carries_install_only_under_a_manual_posture() {
         use ApplyPosture as P;
@@ -2371,6 +2425,7 @@ mod tests {
     }
 
     /// The scrollback row says how much scrollback stayed behind, in how many tabs, and where the per-tab
+    /// count is: a failure on glass, never a record only.
     #[test]
     fn the_scrollback_row_counts_the_lines_and_the_tabs() {
         let m = scrollback_lost(12_345, 3);
@@ -2394,6 +2449,8 @@ mod tests {
     }
 
     /// The scrollback row says why: a carry the successor's policy withheld is the new version's request,
+    /// with no claim that the screen or its newest lines crossed; a failure keeps the
+    /// failure row word for word; a mix claims nothing about what crossed.
     #[test]
     fn the_scrollback_row_says_a_withheld_carry_as_the_policys_request() {
         let text = |m: &Message| format!("{} | {}", m.title, m.detail.join(" | "));
@@ -2517,6 +2574,8 @@ mod tests {
     }
 
     /// A carried Settings draft the new build could not reopen is a failure on glass naming
+    /// each field with the text typed (it exists nowhere else now), counting the unreadable
+    /// ones; it opens Settings and never asks for a restart.
     #[test]
     fn a_settings_draft_the_update_could_not_reopen_is_said_with_its_text() {
         let m = settings_drafts_not_reopened(&[draft("font_family", "Menlo Nerd")], 0, None);
@@ -2564,6 +2623,8 @@ mod tests {
     }
 
     /// Installing and finishing are the flow row (busy, under the handoff's cap, a title per
+    /// phase, the phase word behind `Details ›`), sharing the progress key so each replaces
+    /// the last.
     #[test]
     fn the_switch_and_the_landing_share_the_flow_row() {
         let i = installing("9.9.9");
@@ -2598,6 +2659,7 @@ mod tests {
     }
 
     /// A successor that adopted sessions onto a blank screen says in the landing record how
+    /// many tabs it repainted and why; a desk that crossed exactly keeps the bare record.
     #[test]
     fn the_landing_names_the_tabs_it_repainted() {
         let one = landed("0.92.0", 7, 1, None);
@@ -2632,6 +2694,8 @@ mod tests {
     }
 
     /// The update's records (the switch began, stopped, how long it took) are keyless
+    /// `LogOnly` records, every version spelled `aterm vX`, the duration a line of the
+    /// landing, never a second entry.
     #[test]
     fn the_update_records_say_what_happened_when() {
         let s = switch_started(Some("0.79.0"), "0.78.0");
@@ -2714,6 +2778,7 @@ mod tests {
     }
 
     /// Every stand-down reason the lanes write, copied from its producer, reads as what it
+    /// means: never "park", "rung", "PTY", "successor" or a second promise to retry.
     #[test]
     fn every_stand_down_reason_is_said_in_a_persons_words() {
         for why in [
@@ -2754,6 +2819,7 @@ mod tests {
     }
 
     /// A failed install's record says the ledger's reason in a person's words, or nothing
+    /// past its own words; the ledger's text is never spliced in.
     #[test]
     fn a_failed_install_record_never_splices_the_ledgers_text() {
         let named = with_named_cause(
@@ -2775,6 +2841,7 @@ mod tests {
     }
 
     /// The cold lane's lost tabs are a record with no Software Update capsule,
+    /// which could not bring them back, and no apply outcome's key.
     #[test]
     fn tabs_not_kept_offers_no_action_that_cannot_help() {
         let msg = cold_lane_tabs_not_kept("open restore lock: Permission denied (os error 13)");
@@ -2784,6 +2851,7 @@ mod tests {
     }
 
     /// A capture refusal names one tab only when its message names one; the
+    /// layout and the records over one handover's limit are the open tabs'.
     #[test]
     fn a_capture_refusal_record_names_the_tabs_it_is_about() {
         assert!(
@@ -2839,6 +2907,8 @@ mod tests {
                                     over the 4194304-byte limit one handover carries)";
 
     /// The second refusal holds the next try 10 minutes and the third 30, however the
+    /// tabs change (`app_native::capture_refusal_spacing`), so those records say when the
+    /// next try is; the first, released at the next probe, does not.
     #[test]
     fn a_refusal_that_came_back_says_when_the_next_try_is() {
         use crate::app_native::{CAPTURE_REFUSAL_PROBE, capture_refusal_spacing};
@@ -2878,6 +2948,8 @@ mod tests {
     }
 
     /// The download instant crosses the handoff on the wall clock and comes back on the
+    /// successor's monotonic one, so the record says how long the whole update took, for
+    /// this build only.
     #[test]
     fn the_download_instant_round_trips_the_carry_for_its_build() {
         let now = Instant::now();
@@ -2901,6 +2973,8 @@ mod tests {
     }
 
     /// What the lane answers by itself is a record; a lane that stopped is a decision row
+    /// whose `Install now` is the Version menu's press; an attempt nothing retries is a
+    /// failure row with the page.
     #[test]
     fn an_outcome_is_a_record_unless_the_person_acts_on_it() {
         let retry = outcome(
@@ -2958,6 +3032,8 @@ mod tests {
     }
 
     /// A persistent failure is one warning per class: the title names the broken half, the
+    /// excerpt since when, the whole sentence behind Details, the Software Update capsule,
+    /// the warning's hold, never Standing.
     #[test]
     fn the_health_warning_names_the_half_and_since_when() {
         let body = "20 failed checks in a row since 2026-09-14T22:04:36Z: release manifests \
@@ -3017,6 +3093,8 @@ mod tests {
     }
 
     /// The disabled-handoff line says what the admission classifier does:
+    /// nothing installs while a terminal is open, and it lands once they are
+    /// closed — never a threat to the shells, never a restart.
     #[test]
     fn the_disabled_handoff_line_says_what_the_admission_classifier_does() {
         use crate::native_update_admission::{

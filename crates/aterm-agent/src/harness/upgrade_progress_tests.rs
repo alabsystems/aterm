@@ -1,35 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! No upgrade stuck forever, bound to the code (design record 2026-09-28, §4.4): the derived
-//! `HarnessUpgradeProgress` machine against the real reducer and the real classifier, over every
-//! state the committed machine reaches with its gap latch clear. The `keep` latch (the watch
-//! records only a read that waits; closed by `upgrade::held_point` and `upgrade::NEXT_POINT`) is
-//! a negative control. The other gap, a limit left a quiet record at any age, is the classifier's
-//! to close (`St::limit_until`, [`Row::limit_passed`]), bound in T1-f.
-//!
-//! * T1-a, the reducer of the ask-and-drain flow (`upgrade_ask = true`, opt-in): each state
-//!   becomes the facts of real looks (an idle point, a settled break, the watch's dry read), and
-//!   the real `upgrade::requested_step` (with `upgrade::break_step` at a break) enables the
-//!   machine's `StepAtIdle`/`RestartAtIdle`/`StepAtBreak` exactly where it acts, landing the same
-//!   phase; the word the real watch records of the dry read (`upgrade_watch::look_word`) is the
-//!   class the machine's `Watch` records. Negative controls: 0.94's break arm (every phase
-//!   answered `background` at a break), the terminal stop (a stopped round waits `failed` for
-//!   good), `RestartOverWork`, the latch's look (`RecordedWordStands`), and a posture-blind
-//!   neutral word.
-//! * T1-a', the quiet upgrade's read (`upgrade_ask = false`, the default): the word the real
-//!   watch records is the neutral one exactly where nothing holds the quiet restart, else the
-//!   class of what does.
-//! * T1-f, the classifier: each state becomes a record ([`Row`]) whose projection
-//!   ([`progress_projection`]) is the state, and [`Row::attention`] holds it to the rule that a
-//!   wait is a record: a fresh record is quiet save for a limit past its named reset (a fault
-//!   line) and the agent's own work held for a day (a digest line); a record with no progress
-//!   for a day is told, a limit only past its longest; and every turn of the class by time alone
-//!   falls at an instant [`next_change`] names. T1-f' holds the quiet flow's rows ([`Row::quiet`])
-//!   to the same.
-//! * The refused notice's instant: a fault line that turns at `refused_at + TELL_S` is an instant
-//!   [`next_change`] names.
-
+//! Conformance tests binding `HarnessUpgradeProgress` to the upgrade reducer and classifier.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use aterm_models_harness::harness_upgrade_progress_model;
@@ -219,7 +191,6 @@ fn class(word: &str) -> i64 {
 
 /// The 0.94 break arm: at a break of the agent's own work every phase waited
 /// `background` before the phase was looked at (no notice, give-up or re-arm).
-/// Replayed over the real reducer.
 fn break_arm_094(s: &State, look: Look) -> Step {
     let (step, f) = real_step(s, look);
     if f.background_point {
@@ -230,7 +201,7 @@ fn break_arm_094(s: &State, look: Look) -> Step {
 }
 
 /// The terminal stop: a stopped round waited `failed` for good, never
-/// re-armed. Replayed over the real reducer.
+/// re-armed.
 fn terminal_stop(s: &State, look: Look) -> Step {
     let (step, _) = real_step(s, look);
     if matches!(phase_of(s), Phase::Failed(_)) {
@@ -268,10 +239,6 @@ fn the_real_reducer_is_the_derived_machine() {
     let (mut idle_acts, mut break_acts, mut reads, mut acting) = (0, 0, 0, 0);
     let mut caught: BTreeSet<&str> = BTreeSet::new();
     for s in states.iter().filter(|s| s["phase"] <= 2) {
-        // The step at a point. The restart is its own action at an idle point
-        // (`RestartAtIdle`: the READY heard, nothing under the agent); every
-        // other act there is `StepAtIdle`'s; a break never restarts
-        // (`break_step`).
         for (action, posture) in [("StepAtIdle", 2), ("RestartAtIdle", 2), ("StepAtBreak", 1)] {
             let (step, f) = real_step(s, Look::Point);
             let landed = lands(step);
@@ -296,8 +263,6 @@ fn the_real_reducer_is_the_derived_machine() {
                     break_acts += 1;
                 }
             }
-            // Negative controls: each old rule refuses, somewhere, a step the
-            // machine and the real reducer take.
             if today.action_enabled(action, s) {
                 if lands(break_arm_094(s, Look::Point)).is_none() {
                     caught.insert("0.94's break arm");
@@ -307,17 +272,11 @@ fn the_real_reducer_is_the_derived_machine() {
                 }
             }
         }
-        // `RestartOverWork`: the restart over processes under the agent,
-        // which the real reducer never takes.
         if buggy.action_enabled("RestartOverWork", s) {
             let (step, _) = real_step(s, Look::Point);
             assert_ne!(step, Step::Terminate, "{s:?}");
             caught.insert("RestartOverWork");
         }
-        // The watch's read, at every posture: the dry read's word, and the
-        // word the real watch records of it, the class the machine's `Watch`
-        // records. Where the read re-arms, the watch re-arms and records the
-        // new round's word in one pass: `WatchRearms`, then `Watch`.
         let (step, f) = real_step(s, Look::Read);
         let dry = dry_word(&step, &f);
         let word = look_word(&dry, true, || f.status.clone());
@@ -333,7 +292,6 @@ fn the_real_reducer_is_the_derived_machine() {
             "{s:?}: `{dry}` records `{word}`"
         );
         reads += 1;
-        // The watch's re-arm: exactly where the real read re-arms.
         assert_eq!(
             today.action_enabled("WatchRearms", s),
             step == Step::Rearm,
@@ -341,16 +299,11 @@ fn the_real_reducer_is_the_derived_machine() {
         );
         if !dry.starts_with("wait:") {
             acting += 1;
-            // The gap is closed for a Claude Code record only: a Codex record's
-            // act read records nothing and keeps the last word a look found.
             assert_eq!(
                 look_word(&dry, false, || f.status.clone()),
                 "",
                 "{s:?}: a Codex record's `{dry}`"
             );
-            // Negative control: a read that acts records nothing and the record
-            // keeps its word (the latch's machine). Where that word is not what
-            // holds the move now, it is caught.
             let old = s["cause"];
             let mut latched = with(s, "keep", 1);
             assert!(kept.fire("Watch", &mut latched), "{s:?}");
@@ -358,9 +311,6 @@ fn the_real_reducer_is_the_derived_machine() {
             if old != looked["cause"] {
                 caught.insert("RecordedWordStands");
             }
-            // Negative control: one neutral word for every act read, blind to
-            // what holds its point: at a person's box it names aterm's own
-            // class where the machine names the person (`NoStaleLook`).
             let blind = look_word(
                 dry.split_once(crate::harness::upgrade_drive::AT_POINT)
                     .map_or(dry.as_str(), |(act, _)| act),
@@ -388,7 +338,6 @@ fn the_real_reducer_is_the_derived_machine() {
         ])
     );
 
-    // The anchors are linked, name the one projection, and were entered.
     let mut anchored: Vec<(&str, &str)> = xref::refinements()
         .filter(|a| a.machine == "HarnessUpgradeProgress")
         .map(|a| {
@@ -449,14 +398,7 @@ fn read_word(s: &State, f: &Facts) -> String {
 }
 
 /// What holds the quiet upgrade's restart at `s`, as classes of the machine's `cause`; `None`
-/// where nothing does (the neutral word's). A resting round: its own rest. Else, for the round
-/// the read acts on (a rested one re-armed: the new pending round): at an idle point (or a
-/// limit's notice a grace past its reset), nothing with no processes under the agent, else their
-/// work; a turn or a break, its own work; a limit before its reset, the limit; a person's box, the
-/// person, or either with processes under the agent too (both hold the restart and the view tells
-/// both at once). An announced round past its window that its own work holds gives up (the quiet
-/// flow asks nothing again, so it would stand announced for good): its release goes at the next
-/// point a notice may go, which nothing holds at an idle point.
+/// where nothing does (the neutral word's).
 fn quiet_truth(s: &State) -> Option<BTreeSet<i64>> {
     if s["phase"] == 2 && s["clock"] == 0 {
         return Some(BTreeSet::from([0]));
@@ -485,11 +427,7 @@ fn quiet_bound(s: &State, word: &str) -> bool {
     }
 }
 
-/// T1-a', the quiet upgrade's read (see the module header). The quiet flow's one step is the
-/// restart at a genuinely idle point ([`upgrade::quiet_step`]); what it shares with the machine is
-/// the recorded word, bound over every reachable state read quietly ([`quiet_facts`],
-/// [`quiet_truth`]). Negative controls: the ask flow's reducer, `RestartOverWork`, a notice past
-/// its reset still read as a limit, and the posture-blind neutral word.
+/// T1-a', the quiet upgrade's read (see the module header).
 #[test]
 fn the_quiet_upgrades_read_records_what_holds_its_restart() {
     let today = main_today();
@@ -509,7 +447,6 @@ fn the_quiet_upgrades_read_records_what_holds_its_restart() {
         } else {
             held += 1;
         }
-        // Negative control: the ask flow's read at the same state.
         let asking = Facts {
             quiet: false,
             ..f.clone()
@@ -517,7 +454,6 @@ fn the_quiet_upgrades_read_records_what_holds_its_restart() {
         if !quiet_bound(s, &read_word(s, &asking)) {
             caught.insert("the ask flow's read");
         }
-        // Negative control: `RestartOverWork`, the processes unread.
         let blind_to_work = Facts {
             background: Vec::new(),
             ..f.clone()
@@ -525,7 +461,6 @@ fn the_quiet_upgrades_read_records_what_holds_its_restart() {
         if !quiet_bound(s, &read_word(s, &blind_to_work)) {
             caught.insert("RestartOverWork");
         }
-        // Negative control: a notice past its reset is a limit.
         let before_c9 = Facts {
             limited: f.limited || s["posture"] == 3,
             ..f.clone()
@@ -533,7 +468,6 @@ fn the_quiet_upgrades_read_records_what_holds_its_restart() {
         if !quiet_bound(s, &read_word(s, &before_c9)) {
             caught.insert("main before C9");
         }
-        // Negative control: one neutral word for every act read.
         let step = upgrade::requested_step(
             &Request::None,
             &phase_of(s),
@@ -566,8 +500,7 @@ fn the_quiet_upgrades_read_records_what_holds_its_restart() {
 /// wait by a word of that class (its own work in the words each phase
 /// records; a person's box; a limit; an act's empty word), how long it has
 /// been `behind`, the round's clock through its stamps, a re-armed round's
-/// `last_stop`. No holder and no processes named: the class is the word's.
-/// `progress` is when the record last acted (its minting, notice or stop).
+/// `last_stop`.
 fn row(s: &State, behind: u64, progress: u64) -> Row {
     let phase = match phase_of(s) {
         Phase::Announced { asks, .. } if progress != NOW - 60 => Phase::Announced {
@@ -613,8 +546,6 @@ fn row(s: &State, behind: u64, progress: u64) -> Row {
             progress
         },
         minted_at: progress,
-        // The limit's named reset as the transcript said it: passed (and its
-        // grace) where the world's `reset` has, an hour ahead where not.
         limit_until: match (s["cause"], s["reset"]) {
             (2, 1) => NOW - LIMIT_GRACE_S - 60,
             (2, _) => NOW + 3_600,
@@ -701,27 +632,19 @@ fn the_real_view_is_the_derived_machine() {
     let (mut quiet, mut faults, mut digests, mut stale_told, mut timed) = (0, 0, 0, 0, 0);
     for s in states.iter().filter(|s| s["phase"] <= 2) {
         for behind in BEHIND {
-            // A fresh record: it acted a minute ago.
             let r = row(s, behind, NOW - 60);
-            // The projection is the state.
             let proj = progress_projection(&r, NOW);
             let mut want: BTreeMap<&str, i64> = ["phase", "rearmed", "cause", "clock"]
                 .into_iter()
                 .map(|k| (k, s[k]))
                 .collect();
-            // The world's reset, as the record reads it: over a recorded limit.
             want.insert("reset", if s["cause"] == 2 { s["reset"] } else { 0 });
             assert_eq!(proj, want, "{s:?}\n{r:?}");
-            // The class is the classifier's own reading of the record.
             assert_eq!(
                 proj["cause"] == 0,
                 r.overdue_cause(NOW) == OWN_WORK,
                 "{s:?}"
             );
-            // The rule, at every state: a wait is a record. Nothing marks the
-            // tab or takes a row, whatever the age, and the only things told of
-            // a record that acts are a limit that has ended (aterm's own line in
-            // the log) and the agent's own work held for a day (one digest line).
             assert!(r.interrupt(NOW).is_none(), "{s:?}: an interrupt for a wait");
             assert!(r.badge(NOW).is_none(), "{s:?}: the tab is marked");
             match r.attention(NOW) {
@@ -738,8 +661,6 @@ fn the_real_view_is_the_derived_machine() {
                 }
                 Attention::Interrupt(n) => panic!("{s:?}: {n:?}"),
             }
-            // A limit whose reset has passed is told, whatever the age or the
-            // phase; one whose reset is ahead is a record.
             if s["cause"] == 2 {
                 assert_eq!(
                     matches!(r.attention(NOW), Attention::Fault(_)),
@@ -747,8 +668,6 @@ fn the_real_view_is_the_derived_machine() {
                     "{s:?}"
                 );
             }
-            // Weak fairness of the view: every turn of the class by time
-            // alone is an instant [`next_change`] names, so the host looks then.
             let horizon = NOW + 10 * 86_400;
             let rows = std::slice::from_ref(&r);
             let turned = turns(&r, NOW, horizon, &deadlines(&r));
@@ -761,10 +680,6 @@ fn the_real_view_is_the_derived_machine() {
                 timed += 1;
             }
         }
-        // No wait is quiet without an end: the same record with no progress
-        // for the longest a quiet wait may stand is told (a fault line in the
-        // log or a digest line), unless it is a limit whose reset is still
-        // ahead, which stands to [`LIMIT_MAX_S`] and no further.
         let never = LIMIT_MAX_S + 3_600;
         let r = row(s, never, NOW - never);
         assert!(
@@ -811,10 +726,7 @@ fn quiet_row(s: &State, behind: u64, progress: u64) -> Row {
 
 /// T1-f', the classifier under the quiet flow: it reads the flow its rows are read under (an
 /// announced round nothing asks again judged as pending, a limit past its named reset told only
-/// after the quiet move's chance). Every state the machine reaches becomes a quiet row
-/// ([`quiet_row`]) held to T1-f's rule, the quiet limit's own deadline among the instants
-/// [`next_change`] must name. Negative control: the ask flow's classification faults a spent limit
-/// at the instant the quiet move may first go, where the quiet flow still waits for the move.
+/// after the quiet move's chance).
 #[test]
 fn the_real_quiet_view_is_the_derived_machine_read_quietly() {
     let today = main_today();
@@ -846,8 +758,6 @@ fn the_real_quiet_view_is_the_derived_machine_read_quietly() {
                     "{s:?}"
                 );
             }
-            // Weak fairness of the view, quietly: the quiet tell of a limit
-            // is a deadline of its own.
             let horizon = NOW + 10 * 86_400;
             let mut candidates = deadlines(&r);
             candidates.push(r.limit_until.saturating_add(LIMIT_GRACE_S + QUIET_MOVE_S));
@@ -860,7 +770,6 @@ fn the_real_quiet_view_is_the_derived_machine_read_quietly() {
                 timed += 1;
             }
         }
-        // No wait is quiet without an end, quietly.
         let never = LIMIT_MAX_S + 3_600;
         let r = quiet_row(s, never, NOW - never);
         assert!(
@@ -868,9 +777,6 @@ fn the_real_quiet_view_is_the_derived_machine_read_quietly() {
             "{s:?}: quiet with no end\n{r:?}"
         );
         assert!(r.interrupt(NOW).is_none(), "{s:?}");
-        // Negative control: at the instant the ask flow tells a limit (the
-        // grace past a named reset), the quiet world's reset has not passed
-        // its move's chance.
         if s["cause"] == 2 && s["reset"] == 0 {
             let at_grace = Row {
                 limit_until: NOW - LIMIT_GRACE_S - 60,
@@ -900,10 +806,7 @@ fn the_real_quiet_view_is_the_derived_machine_read_quietly() {
 /// The refused notice's instant is named: a notice aterm's own fence refused is aterm's fault to
 /// fix [`TELL_S`] after the first refusal ([`Row::refused_notice`]), before the move is overdue,
 /// and [`next_change`] names `refused_at + TELL_S`, so the host looks then rather than at the next
-/// watch (up to [`WATCH_GAP`] later). Negative controls: the view without that arm (the chain of
-/// instants less this one; each arm's instant is independent) leaves the turn unnamed with no
-/// watch due for hours; with no refusal counted, or a wait that is no refused notice, nothing of
-/// the kind is named and nothing turns.
+/// watch (up to [`WATCH_GAP`] later).
 #[test]
 fn the_refused_notices_tell_is_an_instant_the_view_names() {
     let refused = Row {
@@ -924,8 +827,6 @@ fn the_refused_notices_tell_is_an_instant_the_view_names() {
     let seen = named(std::slice::from_ref(&refused), NOW, horizon);
     assert!(seen.contains(&tell), "named: {seen:?}");
     assert_eq!(next_change(std::slice::from_ref(&refused), NOW), Some(tell));
-    // Negative control: without the arm and with no watch due, no look is
-    // named before the move is overdue, hours after the tell.
     let unwatched = Row {
         watch_at: 0,
         ..refused.clone()
@@ -933,10 +834,6 @@ fn the_refused_notices_tell_is_an_instant_the_view_names() {
     let mut before = named(std::slice::from_ref(&unwatched), NOW, horizon);
     assert!(before.remove(&tell), "the arm names it");
     assert!(before.range(tell..).next().is_none(), "{before:?}");
-    // Negative controls: no refusal counted (the wait is then aterm's own
-    // stuck one from when it began, [`HARNESS_TELL_S`], an instant the view
-    // names too, but never `refused_at + TELL_S`), or no refused notice
-    // waiting: no such instant, and no turn.
     let uncounted = Row {
         refused: 0,
         refused_at: 0,

@@ -8,12 +8,18 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// How long [`local_host_names`] holds this machine's names before it reads
+/// them again: a rename reaches the tab titles within it, and the per-frame
+/// refill pays one `gethostname(2)` that often, never per frame.
 const NAMES_FOR: Duration = Duration::from_secs(5);
 
 /// This machine's host name as configured and its short form.
 type Names = (String, String);
 
 /// This machine's names: the hostname as configured, plus its short form
+/// (the label before the first dot, which is what bash's `\h` writes), read
+/// again once they are [`NAMES_FOR`] old — so a machine renamed while aterm
+/// runs (System Settings › Sharing, `scutil --set`, a DHCP lease's name)
+/// stops being matched by its old name within that, never at a relaunch.
 fn local_host_names() -> Arc<Names> {
     static NAMES: Mutex<Option<(Instant, Arc<Names>)>> = Mutex::new(None);
     let mut held = NAMES.lock().unwrap_or_else(PoisonError::into_inner);
@@ -33,6 +39,9 @@ fn local_host_names() -> Arc<Names> {
 }
 
 /// This machine's host name: the one shared answer
+/// ([`aterm_uds::process::host_name`]) — `$HOSTNAME`, else the OS's own
+/// (`gethostname(2)`, the name a shell's `\h` and `\H` print), with no spawn
+/// on any platform.
 fn resolve_hostname() -> Option<String> {
     aterm_uds::process::host_name()
 }
@@ -64,6 +73,8 @@ pub(crate) fn note_this_machine_name() {
 }
 
 /// The kernel's name for this machine now (`gethostname(3)`), or `None`:
+/// never `$HOSTNAME`, which [`resolve_hostname`] reads first, as a local
+/// shell reports the kernel's name whatever this process's environment says.
 fn kernel_host_name() -> Option<String> {
     #[cfg(unix)]
     {
@@ -133,6 +144,9 @@ impl MachineNames {
 }
 
 /// Whether `host` is the machine named `name`, read whole: the two names alike
+/// (ASCII case aside) once a trailing `.` and one `.local` or `.localdomain`
+/// suffix are taken off each, the forms a Mac's own name comes in (`m19.local`,
+/// `m19.localdomain`, `m19`).
 fn names_machine(host: &str, name: &str) -> bool {
     fn bare(name: &str) -> &str {
         let name = name.strip_suffix('.').unwrap_or(name);
@@ -188,6 +202,8 @@ pub(crate) fn informative(title: &str) -> Informative<'_> {
 }
 
 /// [`informative`] with Git Bash's home (its POSIX spelling, `/c/Users//me`)
+/// and the Windows profile folder (`C:\Users\me`) handed in, so a test can
+/// name them rather than read this machine's.
 #[must_use]
 fn informative_under<'a>(
     title: &'a str,
@@ -248,6 +264,8 @@ impl std::fmt::Display for Informative<'_> {
 }
 
 /// Git Bash's home in its own POSIX spelling (`/c/Users//me`), read once: the
+/// `HOME` the environment sets, which Git Bash adopts (a Windows spelling
+/// converted), else `%USERPROFILE%`, where Git Bash puts it by default.
 fn msys_home() -> Option<&'static str> {
     #[cfg(windows)]
     {
@@ -268,6 +286,8 @@ fn msys_home() -> Option<&'static str> {
 }
 
 /// A home directory in MSYS's POSIX spelling: `C:\Users\me` reads
+/// `/c/Users//me` (the drive letter lower-cased, as Git Bash's `$PWD` writes
+/// it); a path already POSIX is kept.
 #[cfg(any(windows, test))]
 fn msys_spelling(home: &str) -> Option<String> {
     let home = home.trim();
@@ -289,6 +309,8 @@ fn msys_spelling(home: &str) -> Option<String> {
 }
 
 /// The part of `path` past Git Bash's `home` (`""` for home itself, else from
+/// the `/` that follows it), compared without regard to ASCII case as Windows
+/// paths are; `None` when `path` is not at or under it.
 fn msys_home_suffix<'p>(path: &'p str, home: &str) -> Option<&'p str> {
     let home = home.trim_end_matches('/');
     if home.is_empty() {
@@ -300,6 +322,8 @@ fn msys_home_suffix<'p>(path: &'p str, home: &str) -> Option<&'p str> {
 }
 
 /// The Windows profile folder (`%USERPROFILE%`, `C:\Users\me`), read once, its
+/// trailing separators dropped: the home a pwsh tab's title reads as `~`
+/// (`$HOME` there is the profile folder).
 fn windows_home() -> Option<&'static str> {
     #[cfg(windows)]
     {
@@ -325,6 +349,9 @@ fn windows_home() -> Option<&'static str> {
 }
 
 /// The part of a Windows title past the profile folder `home` (`C:\Users\me`)
+/// that heads it: `""` for the folder itself, else from the separator after
+/// it (`\aterm`), or from cmd.exe's ` - ` before a running command
+/// (`C:\Users\me - ping x` reads ` - ping x`).
 fn windows_home_suffix<'t>(title: &'t str, home: &str) -> Option<&'t str> {
     let home = home.trim_end_matches(['\\', '/']);
     if home.len() <= "C:".len() {
@@ -338,6 +365,7 @@ fn windows_home_suffix<'t>(title: &'t str, home: &str) -> Option<&'t str> {
 }
 
 /// The MSYS2 environments whose name Git for Windows' bash writes before the
+/// working directory in its title (`$TITLEPREFIX:$PWD`).
 const MSYS_TITLE_PREFIXES: [&str; 7] = [
     "MINGW64:",
     "MINGW32:",
@@ -349,6 +377,7 @@ const MSYS_TITLE_PREFIXES: [&str; 7] = [
 ];
 
 /// The path of Git Bash's title, its environment prefix removed:
+/// `MINGW64:/c/Users//me/src` reads `/c/Users//me/src`.
 fn msys_title_path(title: &str) -> Option<&str> {
     MSYS_TITLE_PREFIXES
         .iter()
@@ -389,6 +418,7 @@ pub(crate) fn without_console_program_path(title: &str) -> &str {
 }
 
 /// [`without_local_identity`] with this machine's names handed in, so a test chooses
+/// the hosts rather than inheriting the machine running the suite.
 #[must_use]
 fn without_identity_of<'a>(title: &'a str, local_full: &str, local_short: &str) -> &'a str {
     let trimmed = title.trim();
@@ -410,6 +440,8 @@ fn without_identity_of<'a>(title: &'a str, local_full: &str, local_short: &str) 
 }
 
 /// Whether `host` names this machine, comparing the short forms too because a
+/// prompt may write either (`\h` short, `\H` fully qualified) while the machine
+/// reports the other.
 fn host_is_local(host: &str, local_full: &str, local_short: &str) -> bool {
     if local_full.is_empty() && local_short.is_empty() {
         return false;
@@ -430,11 +462,16 @@ mod tests {
     const SHORT: &str = "m17-tower";
 
     /// [`informative_under`] with no Git Bash home and no profile folder, as a
+    /// string.
     fn shed(title: &str) -> String {
         informative_under(title, None, None).to_string()
     }
 
     /// A WINDOWS TITLE UNDER THE PROFILE FOLDER READS `~`, as the pwsh prompt's
+    /// title does: cmd.exe's `C:\Users\me\aterm` is `~\aterm`, the folder
+    /// itself `~`, and a running command's `C:\Users\me\aterm - ping x` keeps
+    /// its command (`~\aterm - ping x`), in any case of the drive or the
+    /// folder.
     #[test]
     fn windows_titles_read_the_profile_folder_as_a_tilde() {
         let home = Some(r"C:\Users\m6-an");
@@ -486,6 +523,8 @@ mod tests {
     }
 
     /// Git Bash's `MINGW64:` (and its sibling environments') prefix is dropped
+    /// so the chip shows the path, whose end the strip keeps; a title that only
+    /// starts with such a word, or names no path after it, is left alone.
     #[test]
     fn git_bash_titles_lose_their_environment_prefix() {
         assert_eq!(
@@ -503,6 +542,8 @@ mod tests {
     }
 
     /// GIT BASH'S HOME READS `~` in the tab, as its own prompt writes it and as
+    /// a pwsh tab's title already does: `MINGW64:/c/Users//me/src` is `~/src`,
+    /// home itself `~`, in any case of the drive letter or the folder.
     #[test]
     fn git_bash_titles_read_home_as_a_tilde() {
         let home = Some("/c/Users//m6-an");
@@ -534,6 +575,8 @@ mod tests {
     }
 
     /// The home Git Bash adopts, in its own spelling: a Windows `HOME` or
+    /// `USERPROFILE` gets the lower-case drive and forward slashes, a POSIX one
+    /// is kept, and a share or a relative path is no home it can name.
     #[test]
     fn a_home_is_spelled_as_git_bash_spells_it() {
         assert_eq!(
@@ -551,6 +594,8 @@ mod tests {
     }
 
     /// The network renames a Mac with no `HostName` set while aterm runs: a
+    /// shell started before the move reports the old name, one started after
+    /// it the new one, and both are this machine.
     #[test]
     fn every_name_the_kernel_gave_this_machine_stays_its_own() {
         let mut names = super::MachineNames::default();
@@ -579,6 +624,7 @@ mod tests {
     }
 
     /// A citation's host is this machine only by its WHOLE name, in any case,
+    /// with or without `.local` / `.localdomain`.
     #[test]
     fn a_citation_host_is_this_machine_only_by_its_whole_name() {
         for (host, name) in [
@@ -612,6 +658,8 @@ mod tests {
     }
 
     /// A seamless update's predecessor's names are kept as OLDER than the
+    /// successor's own, once each, and past the bound the oldest go: a carried
+    /// shell's start-up name stays this machine's.
     #[test]
     fn the_names_a_predecessor_read_are_kept_as_older() {
         let mut names = super::MachineNames::default();
@@ -635,6 +683,10 @@ mod tests {
     }
 
     /// Only this machine's own `user@host:` prefix is shed: the stock prompt
+    /// keeps its directory, a title that is only this machine leaves nothing
+    /// (the caller's fall-through to the cwd rung), another machine keeps the
+    /// identity that is the point of the tab, and a title a program chose is
+    /// returned untouched.
     #[test]
     fn only_this_machines_prompt_identity_is_shed() {
         for (title, want) in [
@@ -677,6 +729,7 @@ mod tests {
     }
 
     /// ConPTY's title for a fresh console, the program's own path, leaves `""`: the
+    /// fall-through to the cwd rung.
     #[test]
     fn only_a_bare_console_program_path_is_shed() {
         for path in [
@@ -723,6 +776,7 @@ mod tests {
     }
 
     /// Windows names this machine from the OS, with no `hostname.exe` child, in a form
+    /// that a prompt naming this host in any case matches.
     #[cfg(windows)]
     #[test]
     fn windows_names_this_machine_without_a_child() {

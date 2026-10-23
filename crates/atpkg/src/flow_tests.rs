@@ -11,10 +11,13 @@ use std::path::PathBuf;
 use crate::sig::testkit;
 
 /// The synthetic paper master (the root of trust) and the one machine its roster
+/// authorizes: the pair the whole crate signs with.
 const ROOT_SEED: [u8; 32] = testkit::MASTER_SEED;
 const RELEASE_SEED: [u8; 32] = testkit::MACHINE_SEED;
 
 /// A durable build floor of `index_build`, recorded under the generation these fixtures
+/// publish at so it binds (a floor stamped with another generation is waived, and a test
+/// that built one would pass vacuously).
 fn fl(index_build: u64) -> BuildFloor {
     BuildFloor {
         index_build,
@@ -32,6 +35,7 @@ fn anchor_of(master_seed: &[u8; 32]) -> Anchor {
 }
 
 /// The attribution head every fixture index carries — `machine_id` + `roster_seq`
+/// must name the machine that actually signs, or the bind refuses the index.
 fn attribution() -> String {
     format!(
         "machine_id = \"{}\"\nroster_seq = {}\n",
@@ -56,11 +60,13 @@ fn scratch(label: &str) -> crate::testdir::Dir {
 }
 
 /// The archive member a build's `bin/<name>` executable is: `bin/<name>` on Unix,
+/// `bin/<name>.exe` on Windows ([`tool_bin`]'s file).
 fn bin_entry(name: &str) -> String {
     format!("bin/{name}{}", crate::platform::EXE_SUFFIX)
 }
 
 /// A raw USTAR + zstd archive with `bin/ay` (+ a sensitive `bin/git` to prove the shim
+/// gate).
 fn make_archive(dir: &Path) -> PathBuf {
     make_archive_with(dir, b"#!/bin/true\nay", b"0000755\0")
 }
@@ -88,6 +94,7 @@ fn tar_entry(name: &str, content: &[u8], mode: &[u8; 8]) -> Vec<u8> {
 }
 
 /// As [`make_archive`], but with explicit `bin/ay` content and tar mode (the resolve-check
+/// tests ship a native-object magic with no exec bit, so the spawn fails).
 fn make_archive_with(dir: &Path, ay_content: &[u8], ay_mode: &[u8; 8]) -> PathBuf {
     make_archive_of(dir, ay_content, ay_mode, &[])
 }
@@ -115,6 +122,7 @@ fn make_archive_of(dir: &Path, ay_content: &[u8], ay_mode: &[u8; 8], extra: &[&s
 }
 
 /// A fake fetcher serving a fixed signed index, a fixed signed pkg manifest, and a
+/// local archive (copied on download).
 struct Fake {
     index: Vec<u8>,
     index_sig: Vec<u8>,
@@ -152,22 +160,27 @@ impl Fetcher for Fake {
 }
 
 /// Build the whole synthetic signed release (index + pkg + archive) consistent with the
+/// real sha256 + tree_root of the archive.
 fn fixture(dir: &Path) -> Fake {
     fixture_with_kind(dir, "binary")
 }
 
 /// As [`fixture`], but with an explicit artifact `kind` (`app-bundle`, `sysroot-bundle`)
+/// for the per-kind dispatch.
 fn fixture_with_kind(dir: &Path, kind: &str) -> Fake {
     fixture_from(dir, kind, make_archive(dir), None)
 }
 
 /// As [`fixture_with_kind`], but with explicit `bin/ay` content + tar mode (the
+/// resolve-check rollback tests ship a native-object magic that cannot spawn).
 #[cfg(unix)]
 fn fixture_with(dir: &Path, kind: &str, ay_content: &[u8], ay_mode: &[u8; 8]) -> Fake {
     fixture_from(dir, kind, make_archive_with(dir, ay_content, ay_mode), None)
 }
 
 /// The `tree_root` a producer signs for `archive`: a throwaway stage into `probe` through
+/// the extractor's own fold, which on Windows folds the declared modes (`crate::tree`'s
+/// module docs) where the plain on-disk walk folds `0`.
 fn signed_root_of(archive: &Path, probe: &Path) -> String {
     let _ = std::fs::remove_dir_all(probe);
     crate::extract::extract_tar_zst_tree(
@@ -224,6 +237,8 @@ fn fixture_from(dir: &Path, kind: &str, archive: PathBuf, signed_root: Option<&s
 }
 
 /// A signed release whose one artifact row carries the archive's real digests
+/// (sha256/tree_root/size) plus `row` verbatim (the `kind`/`protocol` pair and the vendor
+/// keys under test), so an admitted row stages through a fetcher serving `download_url`.
 fn fixture_vendor(dir: &Path, row: &str) -> Fake {
     let archive = make_archive(dir);
     let sha = crate::tree::file_sha256(&archive).unwrap();
@@ -266,6 +281,8 @@ fn fixture_vendor(dir: &Path, row: &str) -> Fake {
 const HTTPS_HEAD: &str = "kind = \"binary\"\nprotocol = \"https\"\n";
 
 /// The vendor row every vendor-lane test starts from: a binary over https from a real
+/// allow-listed host on the tar-zst lane (the archive fixture is a tar.zst), no raw-binary
+/// `entry`.
 const VENDOR_ROW: &str = "kind = \"binary\"\nprotocol = \"https\"\nurl = \"https://github.com/openai/codex/releases/download/rust-v0.150.0/codex-package-aarch64-apple-darwin.tar.zst\"\npayload = \"tar-zst\"\nvendor = \"OpenAI\"\n";
 
 fn layout(dir: &Path) -> Layout {
@@ -284,11 +301,14 @@ fn shim_of(layout: &Layout, name: &str) -> PathBuf {
 }
 
 /// The concrete executable path a `tool` shim forwards to inside `build_dir`
+/// (`bin/<tool>` on Unix, `bin\<tool>.exe` on Windows) — what `ops::which` returns.
 fn tool_bin(build_dir: &Path, name: &str) -> PathBuf {
     build_dir.join("bin").join(tool(name).exe_file())
 }
 
 /// The sidecar a failed stage wrote goes with the build that never came to exist, and a
+/// build the failed stage left standing keeps its own: its shims still need their
+/// environment.
 #[test]
 fn a_failed_stage_takes_its_sidecar_and_spares_a_standing_build_s() {
     let dir = scratch("orphan-sidecar");
@@ -369,6 +389,8 @@ fn ay_installs_end_to_end_from_a_signed_release() {
 }
 
 /// A shell is never shimmed (design S13): a signed manifest exposing `pwsh`, whose build
+/// ships `bin/pwsh`, lays no `bin/pwsh`, records the refusal, and `aterm pkg doctor`'s
+/// `base.pkg.refused` row names it.
 #[test]
 fn a_manifest_exposing_pwsh_is_refused_a_shim_and_the_doctor_row_names_it() {
     let installed = |label: &str, exposes: &str| {
@@ -517,6 +539,9 @@ fn refused_said(layout: &Layout) -> Vec<(String, String)> {
 }
 
 /// A GROUP MEMBER's refused names are recorded where it is staged, under its build and
+/// beside the live build's (design S13), and the doctor says the entry of the build
+/// `current` names: an aborted flip leaves the live build's names said, never the staged
+/// build's; the applied flip says the new build's.
 #[test]
 fn a_group_member_records_its_refused_names_at_stage_and_the_doctor_says_the_current_builds() {
     let staged = |label: &str, poisoned: bool| {
@@ -604,6 +629,7 @@ fn refused_sentence(build: &str, name: &str) -> String {
 }
 
 /// What an older atpkg laid under `name` (a name no shim may carry now): a copy of `from`,
+/// a live shim, so it forwards where `from` does.
 fn lay_as_older_atpkg(layout: &Layout, from: &Path, name: &str) -> PathBuf {
     let to = layout
         .bin_dir()
@@ -622,6 +648,8 @@ fn persons_own(layout: &Layout, name: &str) -> PathBuf {
 }
 
 /// A SHIM AN OLDER ATPKG LAID under a name now refused (design S13: `pwsh` joined the list)
+/// never outlives its build's revocation: the tombstone pass, which tombstones only admitted
+/// names, removes it, so a yanked build's `bin/pwsh` stops running it too.
 #[test]
 fn a_revocation_removes_a_shim_an_older_atpkg_laid_under_a_now_refused_name() {
     let dir = scratch("refused-tomb");
@@ -668,6 +696,8 @@ fn a_revocation_removes_a_shim_an_older_atpkg_laid_under_a_now_refused_name() {
 }
 
 /// An upgrade's prune removes a shim an older atpkg laid under a name now refused into the
+/// program's store at another build (design S13), which the prune used to skip, so it kept
+/// the old build looking active and running.
 #[test]
 fn an_upgrade_prunes_a_shim_an_older_atpkg_laid_under_a_now_refused_name() {
     let dir = scratch("refused-prune");
@@ -696,6 +726,9 @@ fn an_upgrade_prunes_a_shim_an_older_atpkg_laid_under_a_now_refused_name() {
 }
 
 /// THE ANTI-REPLAY BIND (§4.2) at every manifest read: a GENUINELY signed manifest served
+/// for a request it does not name — another build of the program, older or newer, or
+/// another program at that build — is refused by the singleton install, the group stage
+/// and the root recovery alike, and nothing is staged.
 #[test]
 fn a_signed_manifest_served_for_another_request_is_refused_at_every_read() {
     let control = scratch("pkg-bind-control");
@@ -762,6 +795,7 @@ fn a_signed_manifest_served_for_another_request_is_refused_at_every_read() {
 }
 
 /// The env that turns [`probe_an_install_under_an_open_umask`] on: the scratch directory
+/// it installs under.
 #[cfg(unix)]
 const OPEN_UMASK_ENV: &str = "ATPKG_FLOW_OPEN_UMASK_DIR";
 /// That probe's name, as `--exact` wants it.
@@ -769,6 +803,7 @@ const OPEN_UMASK_ENV: &str = "ATPKG_FLOW_OPEN_UMASK_DIR";
 const OPEN_UMASK_PROBE: &str = "flow::tests::probe_an_install_under_an_open_umask";
 
 /// Every entry under `dir` (never through a link) whose mode lets its group or anyone
+/// else write it, as `<path relative to base> <mode>`.
 #[cfg(unix)]
 fn writable_by_others(base: &Path, dir: &Path, out: &mut Vec<String>) {
     for entry in std::fs::read_dir(dir).unwrap() {
@@ -789,6 +824,8 @@ fn writable_by_others(base: &Path, dir: &Path, out: &mut Vec<String>) {
 }
 
 /// The child half of [`an_install_under_an_open_umask_leaves_nothing_others_can_write`]:
+/// under umask `000`, the end-to-end install plus a shim-env sidecar and a stage-refusal
+/// memo leave nothing in the prefix writable by group or others.
 #[cfg(unix)]
 #[test]
 fn probe_an_install_under_an_open_umask() {
@@ -819,6 +856,9 @@ fn probe_an_install_under_an_open_umask() {
 }
 
 /// An install's store must not depend on the umask it runs under: in a root-staged system
+/// prefix, a `002`/`000` umask would leave `store/`, build roots, `staging/` and the records
+/// beside a build writable by group or others, so another user could swap a build's `bin/`,
+/// the asset between its digest check and extraction, or a record a later verb believes.
 #[cfg(unix)]
 #[test]
 fn an_install_under_an_open_umask_leaves_nothing_others_can_write() {
@@ -839,6 +879,7 @@ fn an_install_under_an_open_umask_leaves_nothing_others_can_write() {
 }
 
 /// Phase integration (R5): the SAME end-to-end install, run under a live
+/// `--progress-file` pass.
 #[test]
 fn install_phases_land_in_the_progress_file() {
     let _slot = crate::progress::own_pass_slot();
@@ -881,6 +922,8 @@ fn install_phases_land_in_the_progress_file() {
 }
 
 /// Through the real install flow: a re-install that fails to stage (a live `ay@18`, then a
+/// signed `tree_root` that does not describe the bytes) leaves the toolchain installed,
+/// complete and on PATH.
 #[test]
 fn a_restage_that_fails_leaves_the_live_toolchain_installed_and_on_path() {
     let dir = scratch("restage-keeps-toolchain");
@@ -1000,6 +1043,7 @@ fn a_failed_stage_retains_one_verified_archive_and_a_digest_failure_none() {
 }
 
 /// A signer refusal is handled as a digest refusal: the archive and its `.part` go, and the
+/// memo holds the next pass off the wire from the first refusal until the digests move.
 #[test]
 fn a_signer_refusal_reclaims_its_archive_and_binds_until_the_digests_move() {
     let dir = scratch("signer-refusal");
@@ -1313,6 +1357,7 @@ fn a_failed_singleton_download_still_fills_the_resolved_asset_collector() {
 }
 
 /// The fetcher contract for the vendor lane: `download_url` is refused by default, so a
+/// test fetcher and the `dir:` registry fetcher never reach the network by accident.
 #[test]
 fn a_fetcher_refuses_vendor_urls_unless_it_opts_in() {
     struct Inert;
@@ -1361,6 +1406,8 @@ fn a_fetcher_refuses_vendor_urls_unless_it_opts_in() {
 }
 
 /// A `github-release` row's `asset` is joined onto `staging/<program>/`, which the flow
+/// unlinks and sweeps for `*.part` before any download, so an asset that is a path
+/// (absolute, or climbing with `..`) is refused before either runs.
 #[test]
 fn install_never_unlinks_outside_staging_for_a_release_row() {
     let req = InstallRequest {
@@ -1423,6 +1470,7 @@ fn install_never_unlinks_outside_staging_for_a_release_row() {
 }
 
 /// The vendor lane end to end through the real flow:
+/// 1.
 #[test]
 fn an_https_row_is_admitted_then_downloaded_only_through_the_vendor_lane() {
     let req = InstallRequest {
@@ -1521,6 +1569,8 @@ fn an_https_row_is_admitted_then_downloaded_only_through_the_vendor_lane() {
 }
 
 /// The release lane is capped by the row's signed size, as the vendor lane is: the disk
+/// gate runs once before the transfer and the sha256 gate sees only the whole file, so the
+/// cap the fetcher is given is all that bounds the bytes as they land.
 #[test]
 fn a_github_release_download_is_capped_at_the_rows_signed_size() {
     struct CapFake {
@@ -1577,6 +1627,8 @@ fn a_github_release_download_is_capped_at_the_rows_signed_size() {
 }
 
 /// Design S7 end to end: a manifest declaring `shim_env = ["DISABLE_AUTOUPDATER=1"]` lays a
+/// shim that exports it before it execs, records it in the `<build>.shim-env` sidecar for
+/// the verbs that hold no manifest, and still resolves with `which`.
 #[test]
 fn a_shim_env_manifest_lays_an_exporting_shim_and_a_bad_one_is_refused() {
     struct VendorFake {
@@ -1707,6 +1759,8 @@ fn a_shim_env_manifest_lays_an_exporting_shim_and_a_bad_one_is_refused() {
 }
 
 /// A dependency the user's own copy satisfies (`system = "<bin>"`, on PATH outside the
+/// prefix) is reported `DepResult::System(path)` and never installed: no manifest fetched,
+/// no managed copy laid beside it.
 #[cfg(unix)]
 #[test]
 fn a_system_satisfied_dependency_is_never_pulled_in_as_a_managed_copy() {
@@ -1813,6 +1867,9 @@ fn app_bundle_refused_closed_but_sysroot_bundle_installs() {
 }
 
 /// Mach-O magic over garbage, shipped with tar mode 0644: the magic makes
+/// [`crate::macho::is_native_object`] admit it to the resolve check, and the
+/// missing exec bit makes the spawn fail (`EACCES`) — [`crate::sysroot::resolve_check`]'s
+/// documented "cannot spawn" arm — so [`bundle_resolve_check`] errors.
 #[cfg(unix)]
 const BROKEN_NATIVE_BIN: &[u8] = &[0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0];
 #[cfg(unix)]
@@ -1932,6 +1989,8 @@ fn install_tombstone_disables_the_old_shim() {
 }
 
 /// An up-to-date pass re-points a missing `current` witness at the build the pin and the
+/// shims agree on (the `doctor` remedy for `NoLiveWitness`), with no fetch; a second pass
+/// is a no-op.
 #[test]
 fn an_up_to_date_pass_reasserts_a_missing_current_witness() {
     let dir = scratch("witness");
@@ -1971,6 +2030,7 @@ fn an_up_to_date_pass_reasserts_a_missing_current_witness() {
 }
 
 /// The Rosetta repair through the real apply decision: a live build (the shim view reports
+/// it) whose `<build>.ready` this slice refuses is re-staged, not read as already current.
 #[test]
 fn a_live_build_this_slice_cannot_vouch_for_is_re_staged() {
     let dir = scratch("otherslice");
@@ -2123,16 +2183,19 @@ fn prog_archive(dir: &Path, program: &str, build: u64) -> PathBuf {
 }
 
 /// A signed release whose `stable` channel pins a `rustc` coherence group (trust@4821 +
+/// ay@18), with consistent per-build manifests and archives.
 fn group_fixture(dir: &Path) -> Fake {
     group_fixture_with(dir, &[])
 }
 
 /// [`group_fixture`] with each program in `unserved` published only for a foreign
+/// triple — how the release looks from a host the publisher does not build it for.
 fn group_fixture_with(dir: &Path, unserved: &[&str]) -> Fake {
     group_fixture_of(dir, unserved, &[])
 }
 
 /// [`group_fixture_with`] with each program in `bundles` shipped as a `sysroot-bundle`
+/// (the `self-contained` default), as the trust toolchain is.
 fn group_fixture_of(dir: &Path, unserved: &[&str], bundles: &[&str]) -> Fake {
     let mut pkg = HashMap::new();
     let mut archives = HashMap::new();
@@ -2187,6 +2250,7 @@ fn group_fixture_of(dir: &Path, unserved: &[&str], bundles: &[&str]) -> Fake {
 const QUIET_T0: i64 = 1_790_000_000;
 
 /// A store whose `rustc` tuple is live at trust@4800 + ay@17, which [`group_fixture`]'s
+/// trust@4821 + ay@18 supersede.
 fn live_toolchain(layout: &Layout) -> std::collections::BTreeMap<String, u64> {
     seed_build(layout, "trust", 4800, true);
     seed_build(layout, "ay", 17, true);
@@ -2221,6 +2285,15 @@ fn quiet_pass(
 }
 
 /// WHEN WAITING CANNOT HELP, A BUSY TOOLCHAIN FLIPS AT ONCE:
+/// * a wait nothing can record is no wait — the ceiling is measured from the record's
+///   `since`, so with the record unwritable every pass would begin the wait again and a
+///   busy machine would hold the toolchain for good;
+/// * only the compiler's move waits — trust already at its pin, a sibling moving, the
+///   build running from the live trust keeps its compiler whatever flips;
+/// * nothing live, nothing to wait for — trust has no live build (a tombstone being
+///   re-staged, a member the tuple pulls back in), so a busy SIBLING held a disabled
+///   toolchain disabled for up to four hours behind a process not using it;
+/// * a revoked live build never waits — ay@17 yanked, the tuple force-upgrades.
 #[test]
 fn a_busy_toolchain_flips_at_once_when_waiting_cannot_help() {
     type Prep = fn(&Layout) -> std::collections::BTreeMap<String, u64>;
@@ -2295,6 +2368,8 @@ fn a_busy_toolchain_flips_at_once_when_waiting_cannot_help() {
 }
 
 /// Stage now, flip when quiet: an unattended pass meeting a build running from the live
+/// toolchain stages every moving member's signed archive, extracts and flips nothing, and
+/// records the wait.
 #[test]
 fn an_unattended_pass_stages_the_toolchain_and_flips_it_when_quiet() {
     let dir = scratch("quiet-stage");
@@ -2378,6 +2453,7 @@ fn an_unattended_pass_stages_the_toolchain_and_flips_it_when_quiet() {
 }
 
 /// A download that fails its signed digest while the flip waits is the stage's failure: the
+/// pass aborts, the bad archive goes, and the refusal memo is written.
 #[test]
 fn a_staged_archive_that_fails_its_digest_aborts_and_is_remembered() {
     let dir = scratch("quiet-poison");
@@ -2407,6 +2483,7 @@ fn a_staged_archive_that_fails_its_digest_aborts_and_is_remembered() {
 }
 
 /// A LEASE HOLDS THE FLIP TOO, with no process in sight: a release cut between
+/// two steps.
 #[test]
 fn a_lease_or_an_unreadable_table_holds_the_flip() {
     let dir = scratch("quiet-lease");
@@ -2444,6 +2521,7 @@ fn a_lease_or_an_unreadable_table_holds_the_flip() {
 }
 
 /// The wait is bounded: four hours from the first deferral the flip lands however busy the
+/// toolchain is.
 #[test]
 fn the_ceiling_flips_a_busy_toolchain_and_a_person_never_waits() {
     {
@@ -2500,6 +2578,7 @@ fn the_ceiling_flips_a_busy_toolchain_and_a_person_never_waits() {
 }
 
 /// A held flip no group holds any longer is over: a pass that skips the toolchain's group
+/// whole (nothing of it installed) ends the record.
 #[test]
 fn a_held_flip_no_group_holds_is_ended_by_the_next_pass() {
     let dir = scratch("quiet-orphan");
@@ -2519,6 +2598,7 @@ fn a_held_flip_no_group_holds_is_ended_by_the_next_pass() {
 }
 
 /// The last look: quiet when the pass began, but a build started during the extract, so the
+/// flip is held after all, the extracted trees go, and the archives stay for the next flip.
 #[test]
 fn a_build_started_during_the_extract_holds_the_flip_after_all() {
     let dir = scratch("quiet-last-look");
@@ -2571,6 +2651,8 @@ fn a_build_started_during_the_extract_holds_the_flip_after_all() {
 }
 
 /// [`group_fixture`]'s release with the `rustc` tuple pinned only through a `pin_by_target`
+/// overlay for [`TRIPLE`]: the raw `pin` names trust@4820 (no manifest served) and no `ay`;
+/// the overlay replaces trust with 4821 and adds ay@18.
 fn overlay_group_fixture(dir: &Path) -> Fake {
     let mut fake = group_fixture(dir);
     let index_body = format!(
@@ -2588,6 +2670,7 @@ fn overlay_group_fixture(dir: &Path) -> Fake {
 }
 
 /// The update lanes honour the per-target pin: the overlay-added `ay` is a member and
+/// `trust` lands on the overlay's 4821, never the raw channel's.
 #[test]
 fn update_lanes_apply_the_per_target_pin_overlay() {
     for lane in ["channel", "program"] {
@@ -2638,6 +2721,7 @@ fn update_lanes_apply_the_per_target_pin_overlay() {
 }
 
 /// The tuple-bootstrap lane stages what its caller planned: `bootstrap_group` resolves the
+/// same per-target view as the CLI's plan and the `group_missing_triple` prescan.
 #[test]
 fn bootstrap_group_stages_the_per_target_pin_overlay() {
     let dir = scratch("overlay-bootstrap");
@@ -2680,6 +2764,7 @@ fn bootstrap_group_stages_the_per_target_pin_overlay() {
 }
 
 /// `plan_update` decides against the per-target pin: trust@4821 is up to date (not a move to
+/// another target's 4820), and the overlay-added `ay` is pinned.
 #[test]
 fn plan_update_decides_against_the_per_target_pin_overlay() {
     let dir = scratch("overlay-plan");
@@ -2886,6 +2971,8 @@ fn a_group_abort_never_discards_a_member_that_was_already_live() {
 }
 
 /// The same repair inside the group transaction, which decides per member: a tuple member
+/// whose store tree this slice cannot vouch for is re-staged, not held at UpToDate beside
+/// its healthy sibling.
 #[test]
 fn a_group_member_this_slice_cannot_vouch_for_is_re_staged() {
     let dir = scratch("group-otherslice");
@@ -3079,6 +3166,7 @@ fn seed_build(layout: &Layout, program: &str, build: u64, activate: bool) {
 }
 
 /// An index-only Fake (rollback never downloads) pinning `ay`, with a configurable
+/// `min_build` and `yanked` list.
 fn rollback_index(min_build: u64, yanked: &[&str]) -> Fake {
     let yanked_toml = if yanked.is_empty() {
         String::new()
@@ -3102,6 +3190,7 @@ fn rollback_index(min_build: u64, yanked: &[&str]) -> Fake {
 }
 
 /// [`rollback_index`] with the floor published per program (`min_build_by_program`) and the
+/// channel-wide floor at 0.
 fn rollback_index_per_program(floor_ay: u64) -> Fake {
     let index_body = format!(
         "schema = 2\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n{attr}\
@@ -3119,6 +3208,9 @@ fn rollback_index_per_program(floor_ay: u64) -> Fake {
 }
 
 /// Exhaustive conformance for the removed-member hold: what an unattended update does to a
+/// coherence tuple part of which the user uninstalled, enumerated over ay {absent, safe,
+/// revoked} × trust {absent, installed} × removal records × exclusions, against {clean,
+/// installed-build-yanked, pin-yanked}.
 #[test]
 fn the_removed_member_hold_is_exhaustively_safe() {
     let channels = [
@@ -3142,6 +3234,7 @@ fn the_removed_member_hold_is_exhaustively_safe() {
 }
 
 /// Every case of the removed-member hold on one channel; returns how many reached a report
+/// (a resolve/verify failure is not this predicate's business).
 fn removed_member_hold_cases(cname: &str, make: fn(&Path) -> Fake) -> usize {
     let fixture_dir = scratch(&format!("hold-fixture-{cname}"));
     let fake = make(&fixture_dir);
@@ -3164,6 +3257,7 @@ fn removed_member_hold_cases(cname: &str, make: fn(&Path) -> Fake) -> usize {
 }
 
 /// What `ay` is in the store before the pass: absent, at the pin (18), or at the build
+/// the `yank-installed` channel revokes (17).
 #[derive(Clone, Copy, Debug)]
 enum Ay {
     Absent,
@@ -3379,6 +3473,7 @@ fn a_local_pin_holds_a_whole_group_and_never_moves_it() {
 }
 
 /// Fixture: the pin (ay=18) is valid but the installed ay@17 is yanked, so `decide` returns
+/// Install (force-upgrade off 17), not Tombstone.
 fn group_fixture_yanking_ay17(dir: &Path) -> Fake {
     let mut f = group_fixture(dir);
     let index_body = format!(
@@ -3461,6 +3556,7 @@ fn a_pin_never_suppresses_a_tombstone() {
 }
 
 /// [`fixture`] (the singleton `ay`, no `coherence_group`) with its own pin yanked, so
+/// `decide` tombstones it and the pass disables its live shims.
 fn fixture_yanking_the_pin(dir: &Path) -> Fake {
     let mut f = fixture(dir);
     let index_body = format!(
@@ -3542,6 +3638,9 @@ fn a_plain_update_revives_a_tombstoned_singleton_when_its_pin_is_good_again() {
 }
 
 /// Rollback lands on the highest retained build below the active one that the gate
+/// still admits: never a yanked build, never one below the floor — the channel's, or the
+/// floor published for THIS program (`min_build_by_program`), never another's — and with
+/// none left it refuses.
 #[test]
 fn rollback_selects_the_highest_gate_valid_build_below_current() {
     for (label, fake, want) in [
@@ -3588,6 +3687,7 @@ fn rollback_selects_the_highest_gate_valid_build_below_current() {
 }
 
 /// A gutted rollback target (orphaned `lib/`, no `bin/`, a legacy bare `ok\n` marker) would
+/// remove every shim, so selection asks the tree directly and skips it.
 #[test]
 fn rollback_refuses_a_target_whose_tools_are_gone_and_takes_the_one_below() {
     let dir = scratch("rollback-gutted");
@@ -3643,6 +3743,8 @@ fn rollback_refuses_a_target_whose_tools_are_gone_and_takes_the_one_below() {
 }
 
 /// The pins that hold a rolled-back program, as the update pass's pin gate reads them: its
+/// own when ungrouped, any group member's, never an uninstalled or excluded sibling's, and
+/// none while a member's current build is revoked.
 #[test]
 fn rollback_reports_the_pins_that_hold_it() {
     type Next = (Vec<String>, Option<(String, u64)>);
@@ -3797,6 +3899,7 @@ fn rollback_reports_the_pins_that_hold_it() {
 }
 
 /// A signed release naming `ay`@18 + `ny`@9 (no coherence group), with configurable
+/// per-program `requires` and channel `yanked`.
 fn requires_fixture(
     dir: &Path,
     yanked: &[&str],
@@ -3857,6 +3960,8 @@ fn requires_fixture(
 }
 
 /// The retired index-row `requires` is refused on both lanes: `install` refuses ay before any
+/// manifest is fetched, and the update lane aborts ay's group with the same sentence, held on
+/// its current build.
 #[test]
 fn a_program_naming_the_retired_requires_is_refused_on_both_lanes() {
     let dir = scratch("requires-retired");
@@ -3979,6 +4084,7 @@ fn requires_pulls_in_missing_dep() {
 }
 
 /// A dependency the gate refuses (a yanked build, or a program the signed index does not
+/// list) is skipped, not fatal: `ay` still installs, and the gate is not bypassed.
 #[test]
 fn requires_skips_a_yanked_or_unreachable_dep() {
     for (label, yanked, dep) in [
@@ -4163,6 +4269,7 @@ fn apply_channel_skips_a_linked_group_member() {
 }
 
 /// A [`Fake`] whose index fetch can be toggled to fail or to succeed empty, with a
+/// controllable `source_id` for the same-source cache guard.
 struct FlakyFake {
     inner: Fake,
     fail: std::cell::Cell<bool>,
@@ -4231,6 +4338,8 @@ fn cached_index_is_used_only_on_same_source_fetch_failure() {
 }
 
 /// The typed lanes name the network: `plan_update` resolves live with no cache, so an
+/// unreached source is `Unreachable` with the transport's reason, and a reached source that
+/// lists nothing is `NoIndex`.
 #[test]
 fn a_typed_lane_reports_an_unreached_index_as_the_network() {
     let dir = scratch("typed-unreachable");
@@ -4370,6 +4479,7 @@ fn dir_fetcher_installs_end_to_end() {
 }
 
 /// A build dir with the given executables, created directly in the store (the
+/// flip/rollback tests below need on-disk shape, not a signed archive).
 fn bare_build(l: &Layout, program: &str, build: u64, bins: &[&str]) -> PathBuf {
     let dir = l.build_dir(program, build);
     std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -4380,6 +4490,7 @@ fn bare_build(l: &Layout, program: &str, build: u64, bins: &[&str]) -> PathBuf {
 }
 
 /// Rollback restores the prior build's whole surface: a tool the new build dropped lost its
+/// shim to the new build's prune, so the restore set is the new exposes plus the prior `bin/`.
 #[test]
 fn rollback_restores_a_tool_the_new_build_dropped() {
     let dir = scratch("rb-union");
@@ -4420,6 +4531,8 @@ fn rollback_restores_a_tool_the_new_build_dropped() {
 }
 
 /// A trust rollback never takes another program's shim: a sysroot bundle's `bin/` carries
+/// other programs' backends, and a `bin/ty` re-pointed into `store/trust/<prior>` would be
+/// pruned by the next trust flip.
 #[cfg(unix)]
 #[test]
 fn a_trust_rollback_never_takes_another_programs_shim() {
@@ -4503,6 +4616,7 @@ fn a_trust_rollback_never_takes_another_programs_shim() {
 }
 
 /// A listing name's alias gets its own ownership check: the free primary `trustd` is
+/// restored into the prior build, but the dev-linked `alab-trustd` is left alone.
 #[cfg(unix)]
 #[test]
 fn a_rollback_never_takes_a_foreign_alias_of_a_listing_name() {
@@ -4561,6 +4675,8 @@ fn a_rollback_never_takes_a_foreign_alias_of_a_listing_name() {
 }
 
 /// A program installed without a `current` link and with no shim still owns its names: a
+/// trust rollback that finds `ay` in the prior bundle's `bin/` must not take it while a
+/// complete `ay` build is in the store, or the next trust flip prunes it.
 #[cfg(unix)]
 #[test]
 fn a_rollback_respects_a_program_installed_without_a_current_link() {
@@ -4609,6 +4725,9 @@ fn a_rollback_respects_a_program_installed_without_a_current_link() {
 }
 
 /// A rollback to an affected trust build lays its exec root before its shims: rolled back
+/// from 8595 to a retained 8590 with no root yet, the undo lays `compat/trust/8590` and the
+/// re-pointed `tippy` shim routes through it at once, since the single-program lanes run no
+/// reconcile after a failed flip.
 #[cfg(unix)]
 #[test]
 fn rollback_to_an_affected_trust_build_lays_its_root_and_routes() {
@@ -4667,6 +4786,8 @@ fn rollback_to_an_affected_trust_build_lays_its_root_and_routes() {
 }
 
 /// Aliases ride with their primary: a rollback re-points `alab-<tool>` at the prior build
+/// (dropping the alias of a tool the prior build lacks), a fresh-install rollback removes it,
+/// and a tombstone disables it.
 #[test]
 fn aliases_are_rolled_back_and_tombstoned_with_their_primary() {
     let dir = scratch("rb-alias");
@@ -4742,7 +4863,7 @@ fn aliases_are_rolled_back_and_tombstoned_with_their_primary() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The front-of-PATH twin follows the rollback. An agent program is laid at `bin/<tool>` and
+/// The front-of-PATH twin follows the rollback.
 #[test]
 fn rollback_repoints_the_front_of_path_agents_twin() {
     let dir = scratch("rb-agents-twin");
@@ -4814,6 +4935,7 @@ fn set_mode(path: &Path, mode: u32) {
 }
 
 /// A failed flip leaves `store/<program>/current` naming the prior build, agreeing with the
+/// untouched shims, never the build the abort deletes.
 #[test]
 fn a_failed_flip_points_the_witness_back_at_the_prior_build() {
     let dir = scratch("flip-witness");
@@ -4849,6 +4971,7 @@ fn a_failed_flip_points_the_witness_back_at_the_prior_build() {
 }
 
 /// The fresh-install variant: no prior build exists, so the repair removes the witness link
+/// a half-made write left naming the new build, which the abort cleanup deletes.
 #[test]
 fn a_failed_fresh_install_flip_removes_the_witness_link() {
     let dir = scratch("flip-fresh");
@@ -4937,6 +5060,7 @@ fn a_bundle_resolve_check_runs_from_its_stage_and_the_flip_takes_its_verdict() {
 }
 
 /// PKG-6 #11 — A GROUP STARTS A BUNDLE'S RESOLVE CHECK AT ITS STAGE, BEFORE THE NEXT
+/// MEMBER STAGES.
 #[test]
 fn a_group_starts_a_bundles_resolve_check_before_the_next_member_stages() {
     type Began = Result<PathBuf, std::sync::mpsc::RecvTimeoutError>;
@@ -5006,6 +5130,7 @@ fn a_group_starts_a_bundles_resolve_check_before_the_next_member_stages() {
 }
 
 /// Where the link write fails atomically (POSIX: `store/<program>/` read-only), the link is
+/// as it was and the repair re-writes the same target.
 #[cfg(unix)]
 #[test]
 fn an_atomic_link_write_failure_leaves_the_witness_on_the_prior_build() {
@@ -5035,6 +5160,8 @@ fn an_atomic_link_write_failure_leaves_the_witness_on_the_prior_build() {
 }
 
 /// The strandage bound a resumable download needs: our partial survives, every other
+/// partial or archive in the program's staging dir is reclaimed, and nothing else is
+/// touched.
 #[test]
 fn a_resumable_download_strands_at_most_one_partial_per_program() {
     let dir = crate::testdir::dir("atpkg-sweep-part-");
@@ -5068,6 +5195,7 @@ fn a_resumable_download_strands_at_most_one_partial_per_program() {
 }
 
 /// The group path holds the same strandage bound, driven through `apply_channel` so it pins
+/// `stage_member`'s call.
 #[test]
 fn a_group_member_stage_strands_at_most_one_partial_per_program() {
     let dir = scratch("group-part-sweep");
@@ -5144,6 +5272,7 @@ impl Fetcher for Counting {
 }
 
 /// Append bytes to a fixture's archive after its manifest signed the honest sha256, so every
+/// download fails the signed digest gate.
 fn poison(archive: &Path) {
     use std::io::Write as _;
     let mut f = std::fs::OpenOptions::new()
@@ -5170,6 +5299,7 @@ fn age_refusal(memo: &Path) {
 }
 
 /// The refetch bound on the singleton lane: re-proving a digest mismatch costs the whole
+/// asset.
 #[test]
 fn a_digest_refusal_is_not_refetched_on_every_tick() {
     let dir = scratch("digest-refusal");
@@ -5237,6 +5367,9 @@ fn a_digest_refusal_is_not_refetched_on_every_tick() {
 }
 
 /// The hold on the singleton lane: a `tree_root` mismatch repeats on every re-stage, so from
+/// the first such verdict the row is held (no download, no stage, the canonical `held:` row
+/// naming the retry), the verified archive is kept, the hold never lapses, and the explicit
+/// door forgets it.
 #[test]
 fn a_tree_root_mismatch_is_held_off_every_later_tick_until_asked() {
     let dir = scratch("tree-root-hold");
@@ -5344,6 +5477,7 @@ fn a_tree_root_mismatch_is_held_off_every_later_tick_until_asked() {
 }
 
 /// The refetch bound on the group lane: the tuple still aborts and retries once for free,
+/// but the third download is skipped and the abort says so.
 #[test]
 fn a_group_member_s_digest_refusal_is_not_refetched_on_every_tick() {
     let dir = scratch("group-digest-refusal");
@@ -5423,6 +5557,8 @@ fn a_group_member_s_digest_refusal_is_not_refetched_on_every_tick() {
 }
 
 /// The default set's disk check reads a tuple as its transaction does: a sibling's local pin
+/// or a revoked pin lands nothing, and it counts every member the transaction stages,
+/// including an installed member incomplete for this slice.
 #[test]
 fn a_tuple_s_planned_landing_is_what_its_transaction_stages() {
     let dir = scratch("planned-tuple");
@@ -5482,6 +5618,7 @@ fn a_tuple_s_planned_landing_is_what_its_transaction_stages() {
 }
 
 /// The set's peak is what each unit's gate checks in the worst queue order: with that much
+/// free (plus the reserve) every order passes, with one byte less some order fails.
 #[test]
 fn the_set_peak_is_what_every_unit_gate_checks_in_any_order() {
     const MIB: u64 = 1 << 20;
@@ -5539,6 +5676,7 @@ fn the_set_peak_is_what_every_unit_gate_checks_in_any_order() {
 }
 
 /// A signed release pinning `programs` — `(name, build, signed size)` each, one real archive
+/// apiece — with the ones `tuple` names in one `rustc` coherence group.
 fn ahead_release(dir: &Path, programs: &[(&str, u64, u64)], tuple: &[&str]) -> Fake {
     let mut pkg = HashMap::new();
     let mut archives = HashMap::new();
@@ -5589,6 +5727,10 @@ fn ahead_release(dir: &Path, programs: &[(&str, u64, u64)], tuple: &[&str]) -> F
 const LANE_THREAD: &str = "atpkg-download-ahead";
 
 /// A [`Fake`] whose downloads go into one ordered log beside the test's own marks
+/// (`start:<asset>`, `end:<asset>`, and whatever the test notes), each with the thread that
+/// asked; a download of the asset `hold` names waits until the test lets it go, one of an
+/// asset in `refused` fails as a dropped link does, and the first of an asset in `flaky`
+/// fails as a dropped transfer does.
 struct Recorder {
     inner: Fake,
     log: std::sync::Mutex<Vec<(String, String)>>,
@@ -5832,6 +5974,7 @@ fn the_lane_stays_within_its_budget_and_a_bigger_archive_waits_for_the_pass() {
 }
 
 /// A legacy release row may omit its compressed size, but zero is an unknown
+/// download cap, not a zero-byte archive.
 #[test]
 fn a_tuple_with_an_unknown_archive_size_downloads_inline_without_disabling_sized_units() {
     let dir = scratch("ahead-unknown-size");
@@ -6417,6 +6560,10 @@ fn the_resolve_check_follows_a_symlinked_bin_to_its_object() {
 }
 
 /// THE LINK GOES IN THE ORDER THE PROGRAMS WERE TAKEN, not in the order their landings reach
+/// the transfer: a later ticket is not next while an earlier one — taken first, its landing
+/// perhaps still short of its transfer — is open, and is next once that one is released or
+/// dropped (its transfer over, or its landing ended or moved no byte), whichever ticket gave
+/// up first; a transfer waiting on it starts then.
 #[test]
 fn a_later_download_ticket_waits_for_every_earlier_one() {
     let turns = DownloadTurns::default();

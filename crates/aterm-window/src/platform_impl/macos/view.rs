@@ -81,7 +81,7 @@ impl ModLocationMask {
     }
 }
 
-fn key_to_modifier(key: &Key) -> Option<ModifiersState> {
+const fn key_to_modifier(key: &Key) -> Option<ModifiersState> {
     match key {
         Key::Named(NamedKey::Alt) => Some(ModifiersState::ALT),
         Key::Named(NamedKey::Control) => Some(ModifiersState::CONTROL),
@@ -723,6 +723,7 @@ impl WinitView {
     }
 
     /// The main-thread witness objc2's `mutability::MainThreadOnly` used to
+    /// derive from the receiver's type.
     #[track_caller]
     fn mtm(&self) -> aterm_objc::MainThread {
         aterm_objc::MainThread::new()
@@ -744,12 +745,14 @@ impl WinitView {
     }
 
     /// The marked text's length in UTF-16 code units — `-length` on
+    /// `NSAttributedString`, which is what `markedRange` reports.
     fn marked_text_length(&self) -> usize {
         // SAFETY: The ivar holds a live `NSMutableAttributedString`.
         unsafe { send_usize(self.ivars().marked_text.borrow().id(), sel!(length)) }
     }
 
     /// Drop the old tracking rect and install one over the current frame,
+    /// answering that frame.
     fn reset_tracking_rect(&self) -> CGRect {
         // SAFETY: `-removeTrackingRect:` `v24@0:8q16`, `-frame` `{CGRect=…}16@0:8`.
         unsafe {
@@ -773,6 +776,7 @@ impl WinitView {
     }
 
     /// LOCAL PATCH (aterm): the return is a bare [`Obj`] rather than
+    /// `Retained<NSWindow>`, for the reason on `ViewState::_ns_window`.
     fn window(&self) -> Obj {
         // TODO: Simply use `window` property on `NSView`.
         self.ivars()._ns_window.load().expect("view to have a window")
@@ -1035,6 +1039,7 @@ unsafe fn utf16_len(s: Id) -> usize {
 }
 
 /// An empty `NSMutableAttributedString`, +1 — `objc2`'s
+/// `NSMutableAttributedString::new()`.
 fn new_marked_text() -> Obj {
     // SAFETY: `+new` is `@16@0:8` and is in the `new` family, so the result is +1 and is adopted.
     unsafe { Obj::from_owned(send_id(class(c"NSMutableAttributedString").as_id(), sel!(new))) }
@@ -1055,6 +1060,8 @@ fn mouse_button(event: Id) -> MouseButton {
 }
 
 /// The +1 key event the `keyDown:`/`keyUp:` rows work on: rebuilt without its Option
+/// characters when `option_as_alt` makes the held Option an Alt ([`option_is_alt`]), a copy
+/// otherwise.
 fn replace_event(event: Id, option_as_alt: OptionAsAlt) -> Obj {
     // SAFETY: `event` is the live `NSEvent` AppKit delivered.
     let (kind, flags) =

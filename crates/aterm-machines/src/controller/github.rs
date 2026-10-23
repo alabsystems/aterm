@@ -1,44 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Registering and revoking each host's GitHub key with the fleet's machine user (design §7).
-//!
-//! No gh (docs/DESIGN-init-system-2026-10-20.md S14, §6.1 row 22). The machine user's token is
-//! a login-keychain entry on the controller that `aterm machines github login` files ([`login`])
-//! through CLT git's osxkeychain helper (`git credential approve`, the token on standard input
-//! alone; [`crate::git_credential`]) under the host [`TOKEN_HOST`], not `github.com`, so git's
-//! own github.com lookups (a clone, a fetch) never hand it out. Each command reads it back with
-//! `git credential fill`, checks with `GET /user` that it signs in as the account, and talks to
-//! GitHub's REST API through [`System::github_rest`] (aterm-http): the token is an
-//! `Authorization` header this process builds, never an argument, a variable, a log line or
-//! an error.
-//!
-//! What GitHub answers (REST version 2022-11-28), which the tests' fixtures follow with
-//! made-up ids, keys and tokens:
-//!
-//! * `GET /user`: 200 and the account's `login`; 401 `Bad credentials` for a token it no longer
-//!   accepts. A classic token's answers carry `X-OAuth-Scopes`, the scopes it holds; a
-//!   fine-grained token's carry none.
-//! * `GET /user/keys?per_page=100`: 200 and a JSON array of `{id, key, …}`, `key` being
-//!   `<type> <base64>` (GitHub keeps no comment), paged by `Link`.
-//! * `POST /user/keys` with `{"title", "key"}`: 201 and the new key's `id`; 422 `Validation
-//!   Failed` with `errors[].message` for a key it refuses.
-//! * `DELETE /user/keys/{id}`: 204.
-//! * A token without [`KEY_SCOPE`]: 404 `Not Found` on each of those, with
-//!   `X-Accepted-OAuth-Scopes` naming the scopes the endpoint takes.
+//! Host GitHub key registration and revocation ([`login`], [`crate::git_credential`],
+//! [`TOKEN_HOST`], [`System::github_rest`], [`KEY_SCOPE`]).
 
 use crate::git_credential::Git;
 use crate::github_pages;
 use crate::port::{GithubResponse, RestMethod, Secret, System};
 use serde::Serialize;
 
-/// The host the machine user's token is filed under in the login keychain: the API's, which
-/// no git remote names.
+/// The host the machine user's token is filed under in the login keychain.
 pub const TOKEN_HOST: &str = "api.github.com";
 
-/// The OAuth scope listing, adding and deleting the account's SSH keys needs (a classic
-/// token's; a fine-grained token needs read and write of "Git SSH keys"). GitHub answers a
-/// token without it `Not Found`.
+/// OAuth scope required to list, add, and delete the account's SSH keys.
 pub const KEY_SCOPE: &str = "admin:public_key";
 
 /// The key listing, at GitHub's largest page.
@@ -64,8 +38,7 @@ fn valid_login(account: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
-/// The git `account`'s token is stored and read through, once `account` is a login and that
-/// git is installed.
+/// Resolve the git binary used to store and read `account`'s token.
 fn keychain(sys: &dyn System, account: &str) -> Result<Git, String> {
     if !valid_login(account) {
         return Err(format!("{account:?} is not a GitHub login"));
@@ -81,14 +54,13 @@ fn keychain(sys: &dyn System, account: &str) -> Result<Git, String> {
     Ok(git)
 }
 
-/// An authenticated session as the machine user. Holds the token, so it has no `Debug`.
+/// An authenticated session as the machine user.
 struct Session {
     token: Secret,
 }
 
 impl Session {
-    /// Read `account`'s token from the login keychain and check that it signs in as
-    /// `account`.
+    /// Read `account`'s token from the login keychain and check that it signs in as `account`.
     fn open(sys: &dyn System, account: &str) -> Result<Self, String> {
         let git = keychain(sys, account)?;
         let Some(token) = git.fill(sys, None, TOKEN_HOST, account)? else {
@@ -148,8 +120,7 @@ fn scopes(value: &str) -> impl Iterator<Item = &str> {
     value.split(',').map(str::trim).filter(|s| !s.is_empty())
 }
 
-/// The scope the token lacks for an endpoint, when GitHub's answer says: the first of the
-/// endpoint's `X-Accepted-OAuth-Scopes` when the token's `X-OAuth-Scopes` holds none of them.
+/// The scope the token lacks for an endpoint, when GitHub's answer says.
 fn missing_scope(headers: &[(String, String)]) -> Option<&str> {
     let accepted = header(headers, "x-accepted-oauth-scopes")?;
     let held: Vec<&str> = header(headers, "x-oauth-scopes")
@@ -170,8 +141,7 @@ fn api_message(body: &[u8]) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// One line for an answer that is not the one wanted: the status, the API's message, and the
-/// scope the token lacks when GitHub names it.
+/// One line for an answer that is not the one wanted.
 fn failure(method: RestMethod, endpoint: &str, answer: &GithubResponse) -> String {
     let mut line = format!("GitHub {method} {endpoint}: HTTP {}", answer.status);
     if let Some(message) = api_message(&answer.body) {
@@ -218,13 +188,7 @@ struct NewKey<'a> {
     key: &'a str,
 }
 
-/// Register every `github.key@<user>` public key in `report` that the machine user
-/// `account` does not hold yet, titled `aterm-machines:<host_name>:<user>`.
-///
-/// `keys` are `(user, public key line)`. A key the account already holds (the same type and
-/// body, whatever its comment) is not sent again; its id is returned so the controller
-/// records it. When some keys fail, the error names them; the ones that landed are found by
-/// the listing on the next run.
+/// Register each `github.key@<user>` public key in `report` not yet held by `account`.
 ///
 /// # Errors
 /// One line (no token for `account`, the token is for another login, the API refused).
@@ -291,13 +255,6 @@ pub fn register(
 }
 
 /// Delete each key id from the machine user `account`, and read the account's keys back.
-/// Returns each deleted key as `<type> <base64>`: the keys the account held under those ids,
-/// so the controller can refuse to register them again.
-///
-/// A key is revoked when the listing after the deletes no longer holds it. A `DELETE`'s own
-/// answer cannot say so: GitHub answers `Not Found (HTTP 404)` both for a key already gone and
-/// for a token without [`KEY_SCOPE`], and a revocation that reported a live key gone would
-/// leave an unenrolled Mac its access.
 ///
 /// # Errors
 /// One line per key the account still holds, or why the keys could not be listed.
@@ -345,14 +302,10 @@ pub fn revoke(sys: &dyn System, account: &str, ids: &[u64]) -> Result<Vec<String
     }
 }
 
-/// Store `token` as the machine user `account`'s (`aterm machines github login`), once
-/// GitHub confirms it signs in as `account` and, for a classic token (whose answers list its
-/// scopes), that it holds [`KEY_SCOPE`]; then read it back from the login keychain.
+/// Validate `token` against `account` and [`KEY_SCOPE`], then store it in the login keychain.
 ///
 /// # Errors
-/// One line (not a login, no CLT git, GitHub refused the token, it is another account's or
-/// lacks the scope, or the keychain did not hand it back). Nothing is stored on an error
-/// before the store, and no error carries the token.
+/// Returns a message if validation or keychain storage fails.
 pub fn login(sys: &dyn System, account: &str, token: Secret) -> Result<(), String> {
     let git = keychain(sys, account)?;
     let session = Session { token };
@@ -387,8 +340,7 @@ mod tests {
     /// The key the VM's admin made (see items::github's fixtures).
     const ALICE_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJpFPtSPTOuLIj6oqQTj8ndNDVNHFp4renP47+wxFYao aterm-machines:lab-07:alice";
 
-    /// GitHub's own example ed25519 key shape, as `GET /user/keys` returns keys: type and
-    /// body, no comment.
+    /// GitHub's own example ed25519 key shape, as `GET /user/keys` returns keys.
     const BOB_BODY: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl";
 
     /// Two more made-up ed25519 bodies, for keys the account holds for other hosts.
@@ -397,12 +349,10 @@ mod tests {
         "AAAAC3NzaC1lZDI1NTE5AAAAIKClQs4JkZ6qk49IjNe40mEc2+O0ppqqJHbHKh7uv2yZ",
     ];
 
-    /// The body GitHub sent for `GET user/keys/1` (a key id the account does not hold),
-    /// captured byte for byte: compact, no newline. Nothing reads its `documentation_url`.
+    /// GitHub `404 Not Found` body for `GET user/keys/1`.
     const NOT_FOUND_BODY: &str = r#"{"message":"Not Found","documentation_url":"https://docs.github.com/rest/users/keys#get-a-public-ssh-key-for-the-authenticated-user","status":"404"}"#;
 
-    /// The body GitHub sent for `GET user` with a made-up token, captured byte for byte:
-    /// indented, CRLF line ends.
+    /// The body GitHub sent for `GET user` with a made-up token, captured byte for byte.
     const BAD_CREDENTIALS_BODY: &str = "{\r\n  \"message\": \"Bad credentials\",\r\n  \"documentation_url\": \"https://docs.github.com/rest\",\r\n  \"status\": \"401\"\r\n}";
 
     /// What GitHub names for the key endpoints in `X-Accepted-OAuth-Scopes`.
@@ -452,8 +402,7 @@ mod tests {
         );
     }
 
-    /// A controller whose login keychain holds a token for `fleetbot` that signs in as
-    /// `login`.
+    /// A controller whose login keychain holds a token for `fleetbot` that signs in as `login`.
     fn controller(login: &str) -> Fake {
         let sys = Fake::default();
         git(&sys);
@@ -530,7 +479,6 @@ mod tests {
                 .count(),
             1
         );
-        // The token came from the keychain, through the one pinned helper.
         assert_eq!(calls[0], script::credential(None, "fill"));
         clean(&sys);
     }
@@ -599,7 +547,6 @@ mod tests {
         assert!(err.contains("holds no GitHub token for fleetbot"), "{err}");
         assert!(err.contains("aterm machines github login"), "{err}");
         assert_eq!(sys.calls(), [script::credential(None, "fill")]);
-        // Without CLT git the keychain is not read at all, and the remedy is init's item.
         let sys = Fake::default();
         let err = revoke(&sys, "fleetbot", &[1]).unwrap_err();
         assert!(err.contains("aterm init --only base.clt"), "{err}");
@@ -608,7 +555,6 @@ mod tests {
 
     #[test]
     fn a_token_github_no_longer_accepts_stops_at_the_login_check() {
-        // The keychain still holds it; only `GET /user` says GitHub refuses it.
         let sys = Fake::default();
         git(&sys);
         script::holds(&sys, None, TOKEN_HOST, "fleetbot", TOKEN);
@@ -633,8 +579,6 @@ mod tests {
     fn a_refused_post_names_the_apis_reason() {
         let sys = controller("fleetbot");
         lists(&sys, &[]);
-        // GitHub's reference shows no body for this 422: the `errors[]` entry is made up, in
-        // the layout of the measured 422 of `GET search/repositories?q=`.
         sys.on_github_rest(
             RestMethod::Post,
             "/user/keys",
@@ -660,7 +604,6 @@ mod tests {
     #[test]
     fn a_key_is_revoked_when_the_listing_no_longer_holds_it() {
         let sys = controller("fleetbot");
-        // Before: …105 is held and …106 is already gone. After the delete: neither.
         lists(
             &sys,
             &[(100_000_101, OTHER_BODIES[0]), (100_000_105, BOB_BODY)],
@@ -702,7 +645,6 @@ mod tests {
                 ),
                 "{err}"
             );
-            // Negative control: a token that holds the scope gets no scope hint.
             assert_eq!(
                 err.contains("the token lacks the admin:public_key scope"),
                 hint,
@@ -729,8 +671,6 @@ mod tests {
 
     #[test]
     fn a_listing_entry_out_of_shape_stops_the_revocation() {
-        // An entry the listing cannot read could hide a key still held, which a revocation
-        // would then report gone.
         let sys = controller("fleetbot");
         sys.on_github_rest(
             RestMethod::Get,
@@ -768,8 +708,6 @@ mod tests {
         assert!(sys.calls().is_empty());
     }
 
-    /// `aterm machines github login` stores the token only once GitHub signs it in as the
-    /// account with the key scope, and reads it back. Negative controls: another account's
     /// token, a classic token without the scope, and one GitHub refuses each store nothing.
     #[test]
     fn login_stores_a_token_only_after_github_vouches_for_it() {
@@ -783,7 +721,6 @@ mod tests {
                 ),
                 None,
             ),
-            // A fine-grained token lists no scopes: GitHub's answers on use are the check.
             (answer(200, &[], &user("fleetbot")), None),
             (
                 answer(

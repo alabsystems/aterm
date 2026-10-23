@@ -79,6 +79,7 @@ impl Flock {
 }
 
 /// How often [`Flock::lock_within`] re-tries a held lock: a holder's millisecond critical
+/// section costs one tick.
 const LOCK_POLL: Duration = Duration::from_millis(50);
 
 impl std::ops::Deref for Flock {
@@ -107,12 +108,15 @@ pub(crate) use aterm_toolchain::record_lock::RecordLock;
 pub struct StoreLock {
     _file: Flock,
     /// The holder record this lock announced ([`StoreLock::announce_holder`]), removed on
+    /// release.
     holder: Option<PathBuf>,
     /// The store this lock serializes — what [`held_by_this_process`] answers for.
     prefix: PathBuf,
 }
 
 /// The prefixes whose store lock a live [`StoreLock`] in this process holds, one entry per
+/// lock, so a writer can ask whether it is the store's one writer without the guard (the
+/// package log rotates only then, `crate::packages_log`).
 static HELD: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 /// Whether a [`StoreLock`] on `layout`'s store is alive in this process.
@@ -268,7 +272,7 @@ impl std::error::Error for StoreLockError {}
 /// The exit code a CLI-edge contention refusal carries: sysexits `EX_TEMPFAIL` (75), the one code atpkg reserves for "try again later", so a machine caller (the window's launch lanes, `install.sh`) classifies by code, never by the sentence.
 pub const CONTENDED_EXIT: u8 = 75;
 
-/// How often a waiting acquisition re-tries the lock ([`repoll_store_lock`]). A poll is
+/// How often a waiting acquisition re-tries the lock ([`repoll_store_lock`]).
 const WAIT_POLL: Duration = Duration::from_millis(50);
 
 /// How long a waiter stays silent before it announces the wait (`on_first_contention`).
@@ -277,7 +281,7 @@ pub const WAIT_ANNOUNCE_GRACE: Duration = Duration::from_secs(2);
 /// A development seam (`aterm_types::dev_seam!`; a shipped binary does not read it): the grace in milliseconds, so a test that needs only the announcement does not wait it out.
 pub const WAIT_ANNOUNCE_GRACE_SEAM: &str = "ATPKG_WAIT_ANNOUNCE_GRACE_MS";
 
-/// The longest wait a caller can ask for. A `--wait-lock` value is parsed from argv,
+/// The longest wait a caller can ask for.
 const WAIT_MAX: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Acquire the store lock, waiting up to `timeout` for a holder to release it: one [`try_lock_store`], then write-free re-opens ([`repoll_store_lock`]) every [`WAIT_POLL`] until it succeeds, the deadline passes, or `still_wanted` says the caller has gone (both `Err(Contended)`, so a waiter whose window quit stands down instead of racing a successor's waiter).
@@ -360,6 +364,8 @@ pub(crate) fn lock_store_waiting_on(
 }
 
 /// One poll of the wait: the lock file re-opened by path (an fd held across the wait would
+/// "acquire" an orphan inode once the prefix was removed and re-created), under a prefix
+/// that is still a real directory ([`prefix_is_a_real_dir`]).
 fn repoll_store_lock(layout: &Layout, path: &Path) -> Result<StoreLock, StoreLockError> {
     if !prefix_is_a_real_dir(&layout.prefix) {
         return try_lock_store(layout);
@@ -387,6 +393,7 @@ pub fn try_lock_store(layout: &Layout) -> Result<StoreLock, StoreLockError> {
 }
 
 /// Whether `prefix` is still a real directory, the one shape a poll may re-open the lock
+/// under without vetting again.
 fn prefix_is_a_real_dir(prefix: &Path) -> bool {
     std::fs::symlink_metadata(prefix)
         .is_ok_and(|md| md.file_type().is_dir() && !crate::platform::is_reparse(&md))
@@ -409,6 +416,8 @@ pub fn store_writer_released(layout: &Layout) -> bool {
 }
 
 /// The open-and-try-lock half of [`try_lock_store`], over a vetted prefix: creates the lock
+/// file `0600` if missing and takes the flock without blocking; what each
+/// [`lock_store_waiting`] poll repeats.
 fn open_store_lock(path: &Path) -> Result<StoreLock, StoreLockError> {
     let file = match open_lock_file(path) {
         Ok(f) => f,
@@ -434,6 +443,9 @@ fn open_store_lock(path: &Path) -> Result<StoreLock, StoreLockError> {
 }
 
 /// The lock file at `path`, created `0600` if it is missing and never truncated (a lock
+/// file is a rendezvous, not data: the FileLock discipline), opened IN the directory
+/// that is at `path`'s parent now: that directory is opened without following a link,
+/// then the file by name inside it (`openat`).
 #[cfg(unix)]
 fn open_lock_file(path: &Path) -> io::Result<File> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
@@ -489,6 +501,7 @@ mod tests {
 
     thread_local! {
         /// What runs in this thread's next waiting poll, after its vet of the prefix
+        /// and before its open ([`between_vet_and_open`]).
         static BETWEEN_VET_AND_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
             const { std::cell::RefCell::new(None) };
     }
@@ -505,6 +518,8 @@ mod tests {
     }
 
     /// A waiter's clock whose sleep moves its time and returns at once
+    /// ([`lock_store_waiting_on`]): a wait of seconds runs its every poll with none of them
+    /// spent.
     struct ManualClock<'a> {
         origin: Instant,
         elapsed: std::cell::Cell<Duration>,
@@ -546,6 +561,7 @@ mod tests {
     }
 
     /// The release probe never creates, writes or claims the writer lock, and answers once
+    /// the writer drops.
     #[test]
     fn release_probe_is_read_only_and_never_claims_the_writer_lock() {
         let layout = temp_layout("release-probe");
@@ -619,6 +635,8 @@ mod tests {
     }
 
     /// A person's typed verb reads as the holder only while its process lives and the lock is
+    /// held; a lane never does, a dead or stale record reads as nobody, and the record goes
+    /// with the lock.
     #[cfg(unix)]
     #[test]
     fn the_holder_record_names_a_person_only_while_one_holds_the_store() {
@@ -663,6 +681,8 @@ mod tests {
     }
 
     /// With the lock held, a second `Layout` over the same prefix (a separate open file
+    /// description, as a second process presents) is refused at once, naming the lock path;
+    /// a drop frees it.
     #[test]
     fn contended_store_lock_refuses_loudly_and_releases_on_drop() {
         let a = temp_layout("contend");
@@ -756,6 +776,7 @@ mod tests {
     }
 
     /// A dropped lock is free at once while a copy of its descriptor lives: a child mid-spawn
+    /// holds one until it execs, and `try_clone` (`dup`) is that copy.
     #[test]
     fn a_dropped_store_lock_is_free_while_a_copy_of_its_descriptor_lives() {
         let a = temp_layout("dup");
@@ -793,6 +814,7 @@ mod tests {
     }
 
     /// First contact: with no prefix yet the lock is still takeable (the first `install` needs
+    /// it), and the created prefix and the lock file carry the hardened modes.
     #[test]
     fn store_lock_creates_the_prefix_and_hardens_the_lock_file() {
         let l = temp_layout("fresh");
@@ -817,6 +839,8 @@ mod tests {
     }
 
     /// Re-taking the lock moves no stamp on the prefix, an ancestor of every store build and
+    /// exec root whose ctime tippy snapshots (a same-value `chmod` or `setxattr` moves ctime
+    /// on APFS).
     #[cfg(unix)]
     #[test]
     fn a_second_store_lock_moves_no_stamp_on_the_prefix() {
@@ -845,6 +869,7 @@ mod tests {
     }
 
     /// An unusable prefix (a plain file where the directory should be) is a fail-closed `Io`
+    /// refusal, never a lock-free pass.
     #[test]
     fn unusable_prefix_refuses_instead_of_passing_lock_free() {
         let l = temp_layout("badprefix");
@@ -861,6 +886,7 @@ mod tests {
     }
 
     /// A prefix that is a SYMLINK is refused (F16) as `PermissionDenied`, and nothing is
+    /// opened through the link.
     #[cfg(unix)]
     #[test]
     fn a_symlinked_prefix_is_refused_and_never_followed() {
@@ -884,7 +910,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&target.prefix);
     }
 
-    /// A holder that releases inside the grace is waited out silently. It lets go at the
+    /// A holder that releases inside the grace is waited out silently.
     #[test]
     fn lock_store_waiting_acquires_when_the_holder_drops_and_stays_silent_inside_the_grace() {
         let a = temp_layout("wait-drop");
@@ -923,6 +949,8 @@ mod tests {
     }
 
     /// Past the grace the wait is ANNOUNCED — exactly once, naming the lock path, at the
+    /// first poll the grace has passed by — and the waiter still proceeds when the holder
+    /// finally lets go (here, as it is told the wait was announced).
     #[test]
     fn lock_store_waiting_announces_once_after_the_grace_then_acquires() {
         let a = temp_layout("wait-announce");
@@ -956,6 +984,7 @@ mod tests {
     }
 
     /// A holder that never lets go: the waiter announces once, then times out with the same
+    /// `Contended` refusal a typed verb gets.
     #[test]
     fn lock_store_waiting_times_out_with_contended() {
         let a = temp_layout("wait-timeout");
@@ -991,6 +1020,9 @@ mod tests {
     }
 
     /// The one poll that DOES vet again: a prefix removed under the wait (the
+    /// holder's `gc`, a hand `rm -rf`) makes the re-open fail `NotFound`, and that
+    /// poll is the full acquisition — the prefix comes back hardened and the lock
+    /// is taken on the real, new file rather than an orphan inode.
     #[cfg(unix)]
     #[test]
     fn lock_store_waiting_re_vets_a_prefix_that_vanished_under_it() {
@@ -1033,10 +1065,12 @@ mod tests {
     }
 
     /// A WAITING POLL RE-VETS THE PREFIX'S SHAPE, NOT ONLY ITS PRESENCE (F16, the
+    /// symlinked-prefix refusal).
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn lock_store_waiting_refuses_a_prefix_swapped_for_a_symlink_under_it() {
         /// Exchange the two names in one step (`renamex_np(RENAME_SWAP)` /
+        /// `renameat2(RENAME_EXCHANGE)`).
         fn exchange(a: &Path, b: &Path) -> io::Result<()> {
             use std::os::unix::ffi::OsStrExt as _;
             let a = std::ffi::CString::new(a.as_os_str().as_bytes())?;
@@ -1132,6 +1166,7 @@ mod tests {
     }
 
     /// An unusable prefix is not something to wait on: the `Io` refusal comes back
+    /// at once, with no announcement.
     #[test]
     fn lock_store_waiting_never_waits_on_io() {
         let l = temp_layout("wait-badprefix");
@@ -1161,6 +1196,10 @@ mod tests {
     }
 
     /// A waiter whose caller has gone (`still_wanted` says no — the window that
+    /// spawned it quit) stands down with `Contended` instead of polling out its
+    /// whole bound and then racing a successor's waiter for the freed lock: at
+    /// the very poll that found it gone, one poll into a bound of two minutes, with
+    /// nothing announced inside the grace.
     #[test]
     fn lock_store_waiting_stands_down_when_no_longer_wanted() {
         let a = temp_layout("wait-orphan");
@@ -1197,6 +1236,7 @@ mod tests {
     }
 
     /// A caller gone past the grace is never announced to: the orphan check precedes the
+    /// announcement on every poll (announcing to a dead window's pipe is EPIPE).
     #[test]
     fn lock_store_waiting_never_announces_to_a_caller_that_has_gone() {
         let a = temp_layout("wait-orphan-late");

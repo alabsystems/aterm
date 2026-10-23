@@ -40,7 +40,7 @@ impl Stage {
         1 << self as u8
     }
 
-    fn selected(self, plan: &Plan) -> bool {
+    const fn selected(self, plan: &Plan) -> bool {
         match self {
             Self::Workstation => !plan.selection.workstation().is_empty(),
             Self::Spotlight => plan.selection.contains(Setting::Spotlight),
@@ -533,7 +533,7 @@ struct RestartCommit {
 impl InitialSetupRestart {
     /// Whether the same final admission step can still be confirmed or retried.
     /// Errors before that step do not leave a pending operation.
-    pub fn pending(&self) -> bool {
+    pub const fn pending(&self) -> bool {
         self.final_commit.is_some()
     }
 
@@ -4444,7 +4444,12 @@ mod tests {
                     Look::Unreached(NO_ROUTE.into())
                 }
             }
-            fn keep(&self, into: &Path) -> aterm_secrets::Result<()> {
+            fn keep(&self, into: &Path, replaces: &Replaces) -> aterm_secrets::Result<()> {
+                if let Replaces::Read(expected) = replaces
+                    && self.status.lock().unwrap().config != *expected
+                {
+                    return Err(aterm_secrets::Error::new("the fixture's vault changed"));
+                }
                 self.log
                     .lock()
                     .unwrap()
@@ -4454,7 +4459,7 @@ mod tests {
             fn join(
                 &self,
                 _sys: &dyn aterm_machines::port::System,
-                source: &str,
+                (source, replaces): (&str, &Replaces),
                 _password: Option<&SecretBytes>,
                 interactive: bool,
                 _wait: std::time::Duration,
@@ -4467,7 +4472,15 @@ mod tests {
                 }
                 let status = member(source, Membership::Pending);
                 let code = status.machine.as_ref().map(|(_, code)| code.clone());
-                *self.status.lock().unwrap() = status;
+                {
+                    let mut current = self.status.lock().unwrap();
+                    if let Replaces::Read(expected) = replaces
+                        && current.config != *expected
+                    {
+                        return Err(aterm_secrets::Error::new("the fixture's vault changed"));
+                    }
+                    *current = status;
+                }
                 requested();
                 Ok(JoinOutcome::Pending {
                     code: code.expect("a join makes a key"),

@@ -227,7 +227,6 @@ const STATES: [&str; 45] = [
     "checkable",
     "has_popup",
     "read_only",
-    // Bit 44: AT-SPI's `ATSPI_STATE_LAST_DEFINED` marker, never set.
     "last_defined",
 ];
 
@@ -623,7 +622,6 @@ fn describe(
         );
     }
     if ifaces.iter().any(|i| i == "Component") {
-        // Window-relative (1) and screen (0) extents.
         for (key, coord) in [("extents_window", 1u32), ("extents_screen", 0u32)] {
             let ext = call(
                 conn,
@@ -802,9 +800,7 @@ fn render(v: &Value) -> String {
     }
 }
 
-/// One event's line: `<ms> <pid> <Interface>.<Member> <path> <body>`. An AT-SPI
-/// event's body is `(siiva{sv})`: the detail, two numbers, any data and
-/// properties, which print only when there are any.
+/// One event's line: `<ms> <pid> <Interface>.<Member> <path> <body>`.
 fn event_line(ms: u128, pid: u32, msg: &Message) -> String {
     let iface = msg
         .interface
@@ -841,7 +837,6 @@ fn event_line(ms: u128, pid: u32, msg: &Message) -> String {
 /// `atspi-listen <app> <out> <stop>`.
 fn listen(app: &str, out: &Path, stop: &Path) -> Result<(), Fail> {
     let mut conn = a11y_bus()?;
-    // Every signal: AT-SPI's events are signals without a destination.
     conn.add_match("type='signal'", CALL).map_err(Fail::fault)?;
     let registry = owner(&mut conn, REGISTRY).unwrap_or_default();
     let mut file = std::fs::OpenOptions::new()
@@ -850,7 +845,6 @@ fn listen(app: &str, out: &Path, stop: &Path) -> Result<(), Fail> {
         .open(out)
         .map_err(|e| Fail::Fault(format!("{}: {e}", out.display())))?;
     let started = Instant::now();
-    // sender → its process, when it is an application named `app`.
     let mut names: Vec<(String, Option<u32>)> = Vec::new();
     while !stop.exists() {
         if started.elapsed() > LISTEN_LIMIT {
@@ -862,7 +856,6 @@ fn listen(app: &str, out: &Path, stop: &Path) -> Result<(), Fail> {
         let msg = match conn.recv(Some(Duration::from_millis(200))) {
             Ok(Some(m)) => m,
             Ok(None) => continue,
-            // A malformed message is consumed and named; the connection stays.
             Err(e @ (aterm_dbus::Error::Malformed { .. } | aterm_dbus::Error::Unsupported(_))) => {
                 let _ = writeln!(file, "{} ERR {}", started.elapsed().as_millis(), e);
                 continue;
@@ -978,8 +971,7 @@ impl Step {
 
 /// The motion that makes a session's pointer before its keyboard: up and left
 /// past any lane screen, so the seat parks it in the top-left corner, where
-/// no lane window lies. Every pointer session starts there, so its steps aim
-/// from the corner, never from where an earlier session left the pointer.
+/// no lane window lies.
 const PARK: Step = Step::Motion {
     dx: -4000,
     dy: -4000,
@@ -1011,7 +1003,6 @@ fn keysym(word: &str) -> Option<u32> {
     if let Some((_, k)) = KEYSYMS.iter().find(|(n, _)| *n == word) {
         return Some(*k);
     }
-    // A single printable ASCII character is its own keysym (Latin-1).
     let mut chars = word.chars();
     match (chars.next(), chars.next()) {
         (Some(c), None) if c.is_ascii_graphic() => Some(u32::from(c)),
@@ -1204,33 +1195,7 @@ fn await_file(path: &str, limit: Duration) -> Result<(), Fail> {
 
 /// `seat <mutter-pid> <app> <app-pid> <step>...`: a RemoteDesktop session of
 /// the Mutter that is process `mutter-pid`, for the steps' length; Mutter
-/// ends it, and removes its devices, when it stops. A Shift tap goes first,
-/// and the steps start once the application's frame is `active`: its window
-/// has the new keyboard's focus, so no key is lost while the client binds the
-/// keyboard (with no key at all, Mutter never gave the window focus within a
-/// minute: measured 2026-10-16). The frame must be
-/// inactive first, so a focus the last session's keyboard left behind (its
-/// leave not handled yet) is never taken for this one's. A step that must
-/// see its keys land ends with a `touch` the lab waits for and a `wait` that
-/// keeps the devices until the lab has seen them.
-///
-/// When the steps drive the pointer, the session makes it first ([`PARK`]),
-/// before the Shift tap, so the awaited focus proves the seat has the pointer
-/// too. Mutter 46 runs an input event's filter, which moves the Wayland
-/// seat's pointer focus, as the event comes, but hands a new device to the
-/// Wayland seat only at the stage's next update (its `DEVICE_ADDED` waits in
-/// the stage's queue). A motion in between moves a pointer the seat does not
-/// have yet: no surface takes its focus, and the window under it hears no
-/// `enter` until a later motion repicks (measured 2026-10-17: the window bound
-/// the pointer 0.2 ms after Mutter announced it, but Mutter had already pinged
-/// that window for the motion onto it, and never sent it an `enter`). The two
-/// devices' `DEVICE_ADDED` keep the stage's queue in the order they were
-/// made, so the pointer is announced before the keyboard whose focus the
-/// steps wait for.
-///
-/// An `app` of `-` names a client that publishes no AT-SPI frame (aterm-wayland's
-/// live seat test): no focus is awaited, and the client paces the steps itself
-/// with `wait` steps on files it creates once its keyboard has the focus.
+/// ends it, and removes its devices, when it stops.
 fn seat(mutter: u32, app: &str, pid: u32, steps: &[Step]) -> Result<(), Fail> {
     let mut a11y = if app == NO_APP {
         None
@@ -1241,8 +1206,6 @@ fn seat(mutter: u32, app: &str, pid: u32, steps: &[Step]) -> Result<(), Fail> {
         await_focus(a11y, app, pid, false)?;
     }
     let mut conn = Connection::session().map_err(|e| Fail::NotHere(format!("session bus: {e}")))?;
-    // The Mutter that is `mutter`: the one of its unique names that answers
-    // for RemoteDesktop.
     let mut rd = None;
     for name in names_of(&mut conn, mutter) {
         if call(
@@ -1288,19 +1251,12 @@ fn seat(mutter: u32, app: &str, pid: u32, steps: &[Step]) -> Result<(), Fail> {
     if a11y.is_some() && steps.iter().any(Step::drives_pointer) {
         run(&mut conn, &[PARK])?;
     }
-    // Mutter makes the touchscreen with the session's first touch, which no
-    // client hears (none has bound it yet, as with the keyboard): a tap in
-    // the top-left corner. A step that must reach a client waits until the
-    // client has bound it (the lab reads its wire log).
     if stream.is_some() {
         run(
             &mut conn,
             &[Step::FingerDown(Point::At(0, 0)), Step::FingerUp],
         )?;
     }
-    // Mutter gives the seat its keyboard with the session's first key event,
-    // which no client hears (it binds the keyboard only then), and the
-    // window takes the keyboard's focus once it has: a harmless Shift tap.
     let prime = [
         Step::Key {
             keysym: 0xffe1,
@@ -1319,8 +1275,6 @@ fn seat(mutter: u32, app: &str, pid: u32, steps: &[Step]) -> Result<(), Fail> {
     let done = focused.and_then(|()| run(&mut conn, steps));
     let _ = call(&mut conn, rd, &session, RD_SESSION, "Stop", Vec::new());
     done?;
-    // The session ends once the window has lost the keyboard's focus: what
-    // the lab does next lands on a window without one, every time.
     if let Some(a11y) = a11y.as_mut() {
         await_focus(a11y, app, pid, false)?;
     }
@@ -1332,11 +1286,7 @@ fn seat(mutter: u32, app: &str, pid: u32, steps: &[Step]) -> Result<(), Fail> {
 /// Mutter that is process `mutter`, as its compositor composited it, written
 /// to `out` as a PNG: a ScreenCast session of its own (no RemoteDesktop, the
 /// cursor left out), whose PipeWire stream `gst-launch-1.0` reads one buffer
-/// of (`pipewiresrc`, `videoconvert`, `pngenc`). Mutter sends the monitor's
-/// whole frame first, so the one buffer is the screen as it is now. The
-/// PipeWire node is the user's daemon's (`XDG_RUNTIME_DIR`), which the stream
-/// needs before the session starts: without it the session's `Start` fails
-/// and the verb says so (NOT AVAILABLE).
+/// of (`pipewiresrc`, `videoconvert`, `pngenc`).
 fn cast(mutter: u32, out: &Path) -> Result<(), Fail> {
     let mut conn = Connection::session().map_err(|e| Fail::NotHere(format!("session bus: {e}")))?;
     let sc = names_of(&mut conn, mutter)
@@ -1369,8 +1319,6 @@ fn cast(mutter: u32, out: &Path) -> Result<(), Fail> {
             )));
         }
     };
-    // The primary monitor (an empty connector), the cursor hidden (Mutter's
-    // `cursor-mode` 0).
     let hidden = Value::dict(
         Type::Str,
         Type::Variant,
@@ -1499,15 +1447,7 @@ fn motion_from(path: &str) -> Result<(i32, i32), String> {
 /// `xseat <app> <app-pid> <step>...`: `seat`'s steps faked through XTEST on
 /// the X display `DISPLAY` names ([`crate::xtest`]), the input of weston's x11
 /// backend nested in it: weston's seat reads its X window, which covers the X
-/// screen. That seat's keyboard and pointer live as long as weston does, so
-/// unlike [`seat`] nothing is made and no key primes them, and the frame keeps
-/// the keyboard's focus when the steps end. What an earlier session left
-/// pressed (one stopped mid-drag) stays pressed in the X server, so a session
-/// first lets go of every button and key held down. The steps start once `app`'s frame
-/// is `active` (the window has the keyboard's focus; an `app` of `-` awaits
-/// none), and a session that drives the pointer first parks it in the
-/// screen's top-left corner, as [`seat`]'s does, so its steps aim from there.
-/// A finger step is refused: XTEST fakes no touchscreen.
+/// screen.
 fn xseat(app: &str, pid: u32, steps: &[Step]) -> Result<(), Fail> {
     if steps.iter().any(Step::drives_touch) {
         return Err(Fail::Usage(
@@ -1584,7 +1524,7 @@ fn relative_motion(
 
 /// A screencast of the primary monitor, tied to the RemoteDesktop session
 /// `session` (it starts and stops with it): the stream a finger's position
-/// is given in. Its object path.
+/// is given in.
 fn record_monitor(conn: &mut Connection, rd: &str, session: &str) -> Result<String, Fail> {
     let id = property(conn, rd, session, RD_SESSION, "SessionId").map_err(Fail::Fault)?;
     let id = id
@@ -1611,7 +1551,6 @@ fn record_monitor(conn: &mut Connection, rd: &str, session: &str) -> Result<Stri
             )));
         }
     };
-    // The primary monitor (an empty connector), with no properties.
     let none = Value::dict(Type::Str, Type::Variant, Vec::new()).map_err(Fail::fault)?;
     let body = call(
         conn,
@@ -1656,7 +1595,6 @@ fn run_steps(
     let finger = |conn: &mut Connection, member: &str, at: &Point| -> Result<(), String> {
         let stream = stream.ok_or("a finger step in a session without a screencast")?;
         let (x, y) = point(at)?;
-        // Mutter 46 takes the stream's object path as a string (`(sudd)`).
         let body = vec![
             Value::Str(stream.to_owned()),
             Value::U32(0),
@@ -1843,7 +1781,6 @@ mod tests {
         assert!(parse_steps(&w(&["tap:nosuchkey"])).is_err());
         assert!(parse_steps(&w(&["hold"])).is_err());
         assert!(parse_steps(&[]).is_err());
-        // A drag: the button's halves apart, the pointer moved between them.
         assert_eq!(
             parse_steps(&w(&[
                 "press:left",
@@ -1872,7 +1809,6 @@ mod tests {
         assert!(parse_steps(&w(&["move:1,x"])).is_err());
         assert!(parse_steps(&w(&["move:200000,0"])).is_err());
         assert!(parse_steps(&w(&["press:nosuchbutton"])).is_err());
-        // A finger: put down, moved and lifted, at points of the screen.
         assert_eq!(
             parse_steps(&w(&[
                 "finger-down:640,400",

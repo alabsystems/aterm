@@ -43,7 +43,7 @@ impl HintMode {
         }
     }
 
-    /// The hinter target this mode stands for; `None` = hinting disabled. Horizontal fitting
+    /// The hinter target this mode stands for; `None` = hinting disabled.
     #[inline]
     const fn options(self) -> Option<Target> {
         match self {
@@ -149,7 +149,7 @@ pub(crate) fn hinted_glyph_raster(
     Some((w, h, x_min as i32, y_min as i32, advance, cov))
 }
 
-/// One recorded outline segment, in hinted pixel space (y up). Recorded rather than streamed
+/// One recorded outline segment, in hinted pixel space (y up).
 enum Cmd {
     Move(f32, f32),
     Line(f32, f32),
@@ -239,6 +239,7 @@ impl PathPen {
 }
 
 /// The recording half (pixels, y up), as plain methods so both the `OutlineSink` impl below
+/// and the subpixel raster's unhinted outline can feed it.
 impl PathPen {
     #[inline]
     pub(crate) fn move_to(&mut self, x: f32, y: f32) {
@@ -292,9 +293,11 @@ mod tests {
     use super::*;
 
     /// The `wght` axis tag, in the same big-endian `u32` spelling the renderer
+    /// stores coords in ([`crate::variation::WGHT_TAG`]).
     const WGHT: u32 = u32::from_be_bytes(*b"wght");
 
     /// The embedded DejaVu Sans Mono (the default `embedded-font` feature), so these tests
+    /// never depend on system font files.
     fn dejavu() -> &'static [u8] {
         crate::embedded_font()
     }
@@ -304,6 +307,7 @@ mod tests {
     }
 
     /// Per-row peak coverage ≥ `t` — a row whose brightest texel is near-full
+    /// renders a solid (not washed) stroke crossing there.
     fn rows_with_peak(cov: &[u8], w: usize, h: usize, t: u8) -> usize {
         (0..h)
             .filter(|&r| (0..w).any(|c| cov[r * w + c] >= t))
@@ -311,6 +315,7 @@ mod tests {
     }
 
     /// At 12px the grid-fitted 'l' has a near-saturated stem texel on nearly every row, where
+    /// the unhinted raster's fractional stem phase splits the stem across two columns.
     #[test]
     fn full_hinting_snaps_the_l_stem_at_12px() {
         let hint = full_instance(12.0);
@@ -334,6 +339,7 @@ mod tests {
     }
 
     /// The reported advance is linear (scaled hmtx), not the hinted advance, and bit-identical
+    /// to the unhinted `Font`'s: cell geometry must not move with hinting.
     #[test]
     fn advance_stays_linear() {
         let jetbrains: &[u8] = include_bytes!("../tests/fixtures/jetbrains-mono.ttf");
@@ -359,6 +365,8 @@ mod tests {
     }
 
     /// A space has no outline: blank raster carrying just the advance (the
+    /// variation path's blank-glyph convention, which the blit treats as a
+    /// no-op).
     #[test]
     fn space_is_blank_with_advance() {
         let hint = full_instance(12.0);
@@ -371,6 +379,7 @@ mod tests {
     }
 
     /// `HintMode::Off` yields no options, so the bank hands out no instance and the unhinted
+    /// path runs bit-for-bit.
     #[test]
     fn off_mode_disables_the_bank() {
         let mut bank = HintBank::default();
@@ -387,6 +396,7 @@ mod tests {
     }
 
     /// Re-fill the same recorded outline with a 4 px slack ring (four times production's) and
+    /// crop the ink box back out.
     fn generous_slack_raster(pen: &PathPen, w: usize, h: usize) -> Vec<u8> {
         const SLACK: usize = 4;
         let (x_min, y_max) = (pen.min_x.floor(), pen.max_y.ceil());
@@ -407,6 +417,7 @@ mod tests {
     }
 
     /// `(area, perimeter)` of the fitted outline in px² / px, by the shoelace
+    /// formula over a fine flattening.
     fn area_and_perimeter(pen: &PathPen) -> (f32, f32) {
         const SUB: usize = 32;
         let (mut area, mut perim) = (0.0f32, 0.0f32);
@@ -467,6 +478,7 @@ mod tests {
     }
 
     /// The ppem sweep's glyphs: printable ASCII, the box-drawing and block run, a Nerd Font PUA
+    /// sample (all the bundled symbols face carries), and a CJK sample for a face that has one.
     fn sweep_chars() -> Vec<char> {
         let mut v: Vec<char> = (' '..='~').collect();
         v.extend("─│┌┐└┘├┤┬┴┼━┃█▀▄▌▐░▒▓".chars());
@@ -477,7 +489,7 @@ mod tests {
         v
     }
 
-    /// No glyph rasterizes as a filled block at any desktop ppem, in any mode. A fitted outline
+    /// No glyph rasterizes as a filled block at any desktop ppem, in any mode.
     #[test]
     fn ppem_sweep_no_glyph_rasterizes_as_a_filled_block() {
         let faces: [(&str, &[u8]); 2] = [
@@ -550,6 +562,7 @@ mod tests {
     }
 
     /// At a variable instance the hinted path's advance is the instantiated unhinted raster's,
+    /// to the bit: both read `hmtx` + `HVAR` at the same coords through the same reader.
     #[test]
     fn advance_at_an_instance_is_the_unhinted_one() {
         let bytes = crate::display_face_bytes("engraved").expect("the bundled engraved face");
@@ -581,6 +594,8 @@ mod tests {
     }
 
     /// The bank keys on the variation slot, so two instantiations of the same bytes at one px
+    /// are distinct instances: the regular and `wght`≈700 bold cuts of a variable face with no
+    /// Bold sibling (Windows' Cascadia Mono) coexist in one atlas.
     #[test]
     fn bank_keys_on_the_variation_slot() {
         let mut bank = HintBank::default();

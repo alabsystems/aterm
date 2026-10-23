@@ -615,6 +615,7 @@ pub fn verify_pinned(
 }
 
 /// The manifest pair of `tag`, from the public owner's download host, else the staging
+/// owner, into `dir`: `(dir, where it came from)`.
 fn fetch_pair(
     ctx: &Ctx,
     repo: &str,
@@ -642,6 +643,7 @@ fn fetch_pair(
 }
 
 /// One asset of `tag` into `dir`, from where the pair came: the public download host when
+/// it serves it (at most the row's signed size), else the staging owner.
 fn fetch_asset(
     ctx: &Ctx,
     repo: &str,

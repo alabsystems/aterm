@@ -735,6 +735,9 @@ fn secret_file_in_a_private_directory_is_read_through_no_link() {
         text.contains(&format!("`chmod 700 {}`", dir.display())),
         "{text}"
     );
+    // The 0600 secret in it was readable by nobody else: the refusal closes the
+    // directory without telling its owner to treat the secret as exposed.
+    assert!(!text.contains("exposed"), "{text}");
     // No secret is NotFound whatever its directory is: the directory is judged when
     // there is a secret in it to keep.
     assert_eq!(
@@ -780,4 +783,139 @@ fn secret_file_in_a_private_directory_is_read_through_no_link() {
     } else {
         assert!(e.to_string().contains("is owned by uid 0"), "{e}");
     }
+}
+
+/// `read_secret_at` is `read_secret_in` over one path's directory and file name, every
+/// refusal naming the path EXACTLY as given. Over real files: the same 32-byte secret
+/// in a 0700 directory reads (the control); a symlink to it is refused; the same
+/// directory at 0755 is refused naming `chmod 700 <dir>`; a bare name is read in the
+/// current directory and named as given, never as `./<name>` (a missing one is
+/// NotFound starting `<name>: `); and a path that names no file is InvalidInput.
+#[cfg(unix)]
+#[test]
+fn secret_file_at_a_path_is_its_directory_and_name() {
+    let scratch = secret_scratch("at");
+    let dir = scratch.path();
+    let bytes = [0x5a; SECRET_MIN];
+    let real = dir.join("mint.secret");
+    std::fs::write(&real, bytes).unwrap();
+    chmod(&real, 0o600);
+    assert_eq!(read_secret_at(&real).expect("private"), bytes);
+
+    let link = dir.join("linked.secret");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let e = read_secret_at(&link).expect_err("a symlink");
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(
+        e.to_string()
+            .starts_with(&format!("{} is a symlink: ", link.display())),
+        "{e}"
+    );
+
+    chmod(dir, 0o755);
+    let e = read_secret_at(&real).expect_err("a loose directory");
+    chmod(dir, 0o700);
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+    let text = e.to_string();
+    assert!(
+        text.starts_with(&format!(
+            "{}: its directory {} is mode 0755: ",
+            real.display(),
+            dir.display()
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("`chmod 700 {}`", dir.display())),
+        "{text}"
+    );
+
+    // The test's current directory holds no such file.
+    let bare = format!("astream-absent-{}.secret", std::process::id());
+    let e = read_secret_at(&bare).expect_err("absent");
+    assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+    assert!(e.to_string().starts_with(&format!("{bare}: ")), "{e}");
+
+    for nothing in ["/", "", "x/.."] {
+        assert_eq!(
+            read_secret_at(nothing).expect_err("no file").kind(),
+            std::io::ErrorKind::InvalidInput,
+            "{nothing:?}"
+        );
+    }
+}
+
+/// `read_secret_at_narrowed` reads a secret as `read_secret_at` will once its
+/// directory is 0700, and waives nothing else. Over real files: a 0600 secret in a
+/// 0755 directory reads, though `read_secret_at` refuses the same read (the control);
+/// a 0644 secret there is still refused for its own mode, naming `chmod 600`; a second
+/// link is still refused; a symlinked directory is still refused; a missing secret is
+/// NotFound; and on macOS an access-list allow entry on the 0755 directory is still
+/// refused, naming `chmod -N <dir>`: only a directory refused for its mode bits alone
+/// passes.
+#[cfg(unix)]
+#[test]
+fn secret_file_narrowed_waives_only_the_directorys_mode() {
+    let scratch = secret_scratch("narrowed");
+    let dir = scratch.path();
+    let bytes = [0x5a; SECRET_MIN];
+    let real = dir.join("mint.secret");
+    std::fs::write(&real, bytes).unwrap();
+    chmod(&real, 0o600);
+    chmod(dir, 0o755);
+    assert_eq!(
+        read_secret_at(&real)
+            .expect_err("a loose directory, as it stands")
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        read_secret_at_narrowed(&real).expect("once narrowed"),
+        bytes
+    );
+
+    chmod(&real, 0o644);
+    let e = read_secret_at_narrowed(&real).expect_err("the file's own mode");
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(
+        e.to_string()
+            .starts_with(&format!("{} is mode 0644: ", real.display())),
+        "{e}"
+    );
+    assert!(e.to_string().contains("chmod 600"), "{e}");
+    chmod(&real, 0o600);
+
+    let second = dir.join("second.secret");
+    std::fs::hard_link(&real, &second).unwrap();
+    let e = read_secret_at_narrowed(&real).expect_err("two links");
+    assert!(e.to_string().contains("has 2 links"), "{e}");
+    std::fs::remove_file(&second).unwrap();
+
+    let dir_link = scratch.path().with_extension("link");
+    std::os::unix::fs::symlink(dir, &dir_link).unwrap();
+    let e = read_secret_at_narrowed(dir_link.join("mint.secret")).expect_err("a symlinked dir");
+    let _ = std::fs::remove_file(&dir_link);
+    assert!(e.to_string().contains("is a symlink"), "{e}");
+
+    assert_eq!(
+        read_secret_at_narrowed(dir.join("absent.secret"))
+            .expect_err("absent")
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
+
+    #[cfg(target_vendor = "apple")]
+    {
+        chmod_acl(&["+a", "everyone allow list"], dir);
+        let e = read_secret_at_narrowed(&real).expect_err("the directory's ACL");
+        chmod_acl(&["-N"], dir);
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            e.to_string()
+                .contains(&format!("`chmod -N {}`", dir.display())),
+            "{e}"
+        );
+    }
+    chmod(dir, 0o700);
+    assert_eq!(read_secret_at(&real).expect("narrowed by hand"), bytes);
 }

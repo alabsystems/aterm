@@ -44,6 +44,8 @@ pub enum Open {
     /// A run started with no terminal.
     Turn,
     /// A task accepted or started with no end (G-M2); `background` where its
+    /// last word says it runs in the background (`terminal process running`,
+    /// an output `background_running`).
     Task {
         /// Its last word names background work.
         /// Its last word names background work.
@@ -69,6 +71,7 @@ impl Open {
 }
 
 /// The record's `payload_type`, its `payload`, and its `recorded_at`
+/// (microseconds), where it has them.
 fn record(v: &Value) -> Option<(&str, &Value, Option<u64>)> {
     Some((
         v.get("payload_type")?.as_str()?,
@@ -103,6 +106,7 @@ pub fn part_start(log: &str, pid: u32, since_us: u64) -> Option<(usize, u64)> {
 }
 
 /// A task event's id and kind, of either shape Muse writes: `runtime.session`
+/// with payload `kind: task`, or `runtime.session.task`.
 fn task_event<'a>(payload_type: &str, payload: &'a Value) -> Option<(&'a str, &'a Value)> {
     let task = match payload_type {
         "runtime.session" => payload.get("kind")?.as_str()? == "task",
@@ -132,9 +136,14 @@ fn run_event<'a>(payload_type: &str, payload: &'a Value) -> Option<(&'a str, &'a
 const TASK_ENDS: [&str; 4] = ["completed", "cancelled", "failed", "rejected"];
 
 /// THE TASK KINDS THAT CARRY NO WORK A RESTART COULD LOSE, by the `task_kind`
+/// their `proposed` event names: an open task of one holds nothing (G-M2's
+/// open-task rule reads every other kind, so a kind first seen is work and
+/// holds — fail closed).
 const NO_WORK_TASKS: [&str; 1] = ["session_name.allocate"];
 
 /// Whether a task's event says its work runs in the background: its status
+/// `terminal process running`, or an output whose chunk names
+/// `execution_state` `background_running`.
 fn says_background(event: &Value) -> bool {
     match event.get("kind").and_then(Value::as_str) {
         Some("status") => {
@@ -148,7 +157,7 @@ fn says_background(event: &Value) -> bool {
     }
 }
 
-/// An inbox item's key: its source's kind and the task it tells of. A queued
+/// An inbox item's key: its source's kind and the task it tells of.
 fn inbox_key(source: Option<&Value>) -> (String, String) {
     let field = |k: &str| {
         source

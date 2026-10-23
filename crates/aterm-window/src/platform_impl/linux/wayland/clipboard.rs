@@ -42,12 +42,14 @@ const TEXT_MIMES_C: [&CStr; 5] =
     [c"text/plain;charset=utf-8", c"UTF8_STRING", c"text/plain", c"TEXT", c"STRING"];
 
 /// A foreign paste larger than this is cut off: a terminal paste is text, and an
+/// unbounded read of a hostile source must not exhaust memory.
 const MAX_PASTE_BYTES: usize = 16 << 20;
 
 /// How long a paste waits for a foreign source (the request, the pipe and the
+/// read all fit inside it on a healthy compositor; a hung owner is refused).
 const PASTE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// How long a copy made OFF the loop thread waits for the loop's verdict. The
+/// How long a copy made OFF the loop thread waits for the loop's verdict.
 const COPY_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The two protocol steps a copy takes at the compositor.
@@ -252,7 +254,7 @@ impl WaylandClipboard {
     }
 }
 
-/// The loop's answer to one copy, as the caller's `bool`. A verdict that never
+/// The loop's answer to one copy, as the caller's `bool`.
 fn copy_verdict(verdict: &mpsc::Receiver<CopyOutcome>) -> bool {
     match verdict.recv_timeout(COPY_TIMEOUT) {
         Ok(outcome) => outcome.placed(),
@@ -260,7 +262,7 @@ fn copy_verdict(verdict: &mpsc::Receiver<CopyOutcome>) -> bool {
     }
 }
 
-/// Write `bytes` to a requester's pipe on a helper thread. Refuse a pipe we
+/// Write `bytes` to a requester's pipe on a helper thread.
 fn write_on_thread(pipe: OwnedFd, bytes: Vec<u8>) {
     if set_nonblocking(&pipe).is_err() {
         return;
@@ -340,7 +342,7 @@ pub(crate) trait SelectionPort {
     /// Offer a fresh source for `selection` and hand it to the seat with `serial`.
     fn claim(&mut self, selection: WaylandSelection, serial: u32) -> bool;
 
-    /// THE COPY. One body, for production and for the test, so the order and the
+    /// THE COPY.
     fn copy(&mut self, selection: WaylandSelection, serial: u32) -> CopyOutcome {
         if !self.focused() {
             return if self.offers(selection) {
@@ -383,6 +385,8 @@ impl SelectionPort for WinitSelectionPort<'_> {
     }
 
     /// Dropping the source IS the release: aterm-wayland's `Source` destroys its
+    /// proxy in `Drop` (as smithay-client-toolkit 0.19.2's `CopyPasteSource` and
+    /// `PrimarySelectionSource` did before LW.7).
     fn release(&mut self, selection: WaylandSelection) {
         drop(self.state.clipboard.offered_mut(selection).take());
     }
@@ -421,6 +425,7 @@ impl SelectionPort for WinitSelectionPort<'_> {
 
 impl WinitState {
     /// The seat a copy speaks for: the one whose keyboard or pointer last gave
+    /// this client a serial — the compositor validates `set_selection` against it.
     fn clipboard_seat(&self) -> Option<(u32, u32)> {
         self.seats
             .keys()
@@ -442,7 +447,7 @@ impl WinitState {
         }
     }
 
-    /// One copy, at the seat that holds this client's newest input serial. The
+    /// One copy, at the seat that holds this client's newest input serial.
     fn clipboard_copy(&mut self, selection: WaylandSelection) -> CopyOutcome {
         let Some((seat, serial)) = self.clipboard_seat() else {
             warn!("wayland clipboard: no seat has given this client an input serial yet — {selection:?} copy not offered");
@@ -467,6 +472,7 @@ impl WinitState {
     }
 
     /// Stop answering for `selection`: give up the source we offer (if any) and
+    /// empty the own slot.
     fn clipboard_disown(&mut self, selection: WaylandSelection) {
         drop(self.clipboard.offered_mut(selection).take());
         if let Ok(mut shared) = self.clipboard.shared.lock() {
@@ -535,8 +541,10 @@ mod tests {
     use super::*;
 
     /// One seat, the compositor behind it, and the clipboard a SEPARATE client
+    /// reads — the measured rules and nothing else.
     struct FakeSeat {
         /// The shared own-selection slot: what a source of OURS serves when a paste
+        /// asks for it.
         slot: String,
         /// The source we offer, if we offer one.
         offered: Option<u32>,
@@ -549,6 +557,7 @@ mod tests {
         /// The selection: which of OUR sources holds it, and the serial behind it.
         selection: Option<(u32, u32)>,
         /// What the compositor answers with once no source of ours holds the
+        /// selection.
         cached: String,
         /// Every protocol step this client sent, in order.
         wire: Vec<Step>,
@@ -579,12 +588,13 @@ mod tests {
         }
 
         /// One copy, the way the real one arrives: the handle writes the shared slot
+        /// on the calling thread, then the loop runs the port.
         fn copy_text(&mut self, text: &str, serial: u32) -> CopyOutcome {
             self.slot = text.to_owned();
             self.copy(WaylandSelection::Clipboard, serial)
         }
 
-        /// What another client on the system reads. A selection held by a source of
+        /// What another client on the system reads.
         fn read(&self) -> String {
             match self.selection {
                 Some(_) => self.slot.clone(),
@@ -592,7 +602,7 @@ mod tests {
             }
         }
 
-        /// The proxy is destroyed. If that source WAS the selection, the compositor
+        /// The proxy is destroyed.
         fn destroy(&mut self, source: u32) {
             self.wire.push(Step::Destroy(source));
             if self.selection.is_some_and(|(held, _)| held == source) {

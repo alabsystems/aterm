@@ -180,6 +180,7 @@ unsafe extern "C" {
     static NS_APPEARANCE_NAME_DARK_AQUA: Id;
 
     /// `NSGraphics.h:222` — `APPKIT_EXTERN void NSBeep(void);`, a C function AppKit exports
+    /// (`_NSBeep`), bound as a symbol like the globals above.
     #[link_name = "NSBeep"]
     fn ns_beep();
 }

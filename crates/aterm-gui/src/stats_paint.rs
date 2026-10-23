@@ -87,14 +87,14 @@ pub(crate) enum Instrument {
 
 impl Instrument {
     /// The rows' instruments in the lens's ←/→ order; How to read is
-    /// reached by the header alone (§11.4).
-    pub(crate) const ALL: [Self; 7] = [
+    /// reached by the header alone (§11.4). Tokens lives in the AI CLI
+    /// harness template rather than the OS Resource Monitor.
+    pub(crate) const ALL: [Self; 6] = [
         Self::Cpu,
         Self::Gpu,
         Self::Memory,
         Self::Disk,
         Self::Network,
-        Self::Tokens,
         Self::Processes,
     ];
 

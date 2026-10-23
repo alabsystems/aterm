@@ -53,6 +53,7 @@ pub(crate) struct State {
     maximized: Cell<bool>,
 
     /// This field tracks the current fullscreen state of the window
+    /// (as seen by `WindowDelegate`).
     fullscreen: RefCell<Option<Fullscreen>>,
     target_fullscreen: RefCell<Option<Option<Fullscreen>>>,
     in_fullscreen_transition: Cell<bool>,
@@ -269,7 +270,7 @@ aterm_objc::declare_class! {
             self.queue_event(WindowEvent::HoveredFileCancelled);
         }
 
-        /// Key-Value Observing. The only row here whose authority is a CLASS
+        /// Key-Value Observing.
         @sel(observeValueForKeyPath:ofObject:change:context:)
         fn observe_value(
             &self,
@@ -544,6 +545,7 @@ impl WindowDelegate {
     }
 
     /// A +1 handle to this delegate — objc2's `NSObjectProtocol::retain`, which
+    /// this class no longer inherits.
     fn retained(&self) -> aterm_objc::Retained<Self> {
         // SAFETY: `self` borrows a live instance of this class, so `as_id()` is a live non-null receiver for `objc_retain`.
         unsafe { aterm_objc::Retained::retain(self.as_id()) }
@@ -582,6 +584,7 @@ impl WindowDelegate {
     }
 
     /// `-[NSWindow contentRectForFrameRect:[self frame]]` — the content rect in
+    /// screen coordinates, which five callers here want and none want apart.
     fn content_rect(&self) -> Rect {
         // SAFETY: `-frame` is `{CGRect}@:` and `-contentRectForFrameRect:` is `{CGRect}@:{CGRect}` on `NSWindow`.
         unsafe {
@@ -965,7 +968,7 @@ impl WindowDelegate {
     }
 
     #[inline]
-    pub fn is_decorated(&self) -> bool {
+    pub const fn is_decorated(&self) -> bool {
         true
     }
 
@@ -987,7 +990,7 @@ impl WindowDelegate {
     }
 
     #[inline]
-    pub fn set_ime_purpose(&self, _purpose: ImePurpose) {}
+    pub const fn set_ime_purpose(&self, _purpose: ImePurpose) {}
 
     #[inline]
     pub fn focus_window(&self) {

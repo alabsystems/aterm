@@ -1,43 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 of the harness tape's models (the replay plan's §9). Model 1, `SuperviseTapeRecovery`
-//! (`aterm_models_harness::supervise_tape_recovery_model`): the real writer and the real reader,
-//! bound to the model; models 2 and 3 follow below, each under its own heading.
-//!
-//! The real [`TapeWriter`] writes three tapes, of one, two and three frames — the magic
-//! with the header, then records frames each closed by an act — every frame's write one
-//! `Write` step of the model, after which the bytes on the sink read back as exactly the
-//! frames the model says are written. Then the real [`recover`] reads, of each tape:
-//!
-//! * every byte-offset truncation — the model's schedule is `Write` once per frame wholly
-//!   before the cut, then `Tear` when the cut falls inside a frame and `Crash` when it falls
-//!   on a frame's end, then `Recover`;
-//! * every byte flipped under three masks, 0x01, 0x80 and 0xff (the low bit, the high bit,
-//!   every bit; not the other 252 values a byte can take) — `Write` once per frame,
-//!   `Crash`, then `RotMagic` for a byte of the magic, `Rot` for a byte of a frame with a
-//!   whole frame after it, or `RotLast` for a byte of the last frame, then `Recover`. The
-//!   one-frame tape is the header alone, whose magic damaged is refused although no frame
-//!   follows it;
-//! * every arrangement of its whole frames at most one frame longer than the tape that is
-//!   neither the tape nor a prefix of it (a prefix is `Crash` at a frame's end) — frames
-//!   repeated, dropped or moved: `Write` once per frame, `Crash`, `Misplace`, `Recover`.
-//!
-//! Each reading is projected ([`project`]) onto the variables the reading decides
-//! (`recovered`, `refused`, `said_torn`, `done`) and compared with the model's state after
-//! the same schedule; every invariant is checked on the model state with the real reading
-//! put in, and the real items must be exactly the items of the whole frames read
-//! (`RecoveredIsPrefix` on the bytes, not only on the count). Each write and each read is
-//! its own execution-evidence window, so the anchors on `TapeWriter::put` (`Write`) and
-//! `recover` (`Recover`) are witnessed by the steps they claim.
-//!
-//! The negative controls are two readers, each the shipping reader's own body with one
-//! test off. One ignores xxh64: the bind rejects it — some readings disagree with the
-//! model, a damaged frame is read as written (`RotRefused` broken on the real reading),
-//! and those readings are what the `Buggy = 1` machine, the checksum-blind reader,
-//! predicts. The other ignores the place a sum names, as format 1's sums let a reader do:
-//! frames out of place are read as written (`MisplacedRefused`), as the `Buggy = 6`
-//! machine predicts, and only there.
+//! Tier-1 of the harness tape's models (the replay plan's §9).
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -65,8 +29,7 @@ use crate::supervise::{Ctl, CtlReply};
 
 const MACHINE: &str = "SuperviseTapeRecovery";
 
-/// The variables a reading decides, as the real reading has them: `recovered` the whole
-/// frames it returned, `refused` a fault, `said_torn` a torn tail.
+/// The variables a reading decides, as the real reading has them.
 pub(crate) fn project(read: &Recovered) -> BTreeMap<&'static str, i64> {
     BTreeMap::from([
         ("done", 1),
@@ -189,9 +152,6 @@ fn cases(tape: &Tape) -> Vec<Case> {
             schedule,
         });
     }
-    // Every arrangement of the whole frames, at most one frame longer than the tape, that is
-    // neither the tape nor a prefix of it (a prefix is a crash between frames): whole frames
-    // repeated, dropped or moved at rest.
     let n = tape.ends.len();
     let mut of_len: Vec<Vec<usize>> = vec![Vec::new()];
     let mut orders = Vec::new();
@@ -218,8 +178,6 @@ fn cases(tape: &Tape) -> Vec<Case> {
             schedule,
         });
     }
-    // The last frame starts where the one before it ends; the header, the only frame of a
-    // one-frame tape, starts after the magic its write carries.
     let last_start = match tape.ends.as_slice() {
         [.., before, _] => *before,
         _ => MAGIC.len(),
@@ -267,8 +225,7 @@ impl std::fmt::Debug for Disagreement {
     }
 }
 
-/// Bind `reader` to the model over every case: the disagreements. With `ev`, each read
-/// is a `Recover` step window.
+/// Bind `reader` to the model over every case: the disagreements.
 fn bind(
     model: &Model,
     tape: &Tape,
@@ -290,7 +247,6 @@ fn bind(
             .map(|inv| inv.name)
             .filter(|name| !model.check_invariant(name, &real))
             .collect();
-        // The items, not only their count: exactly the whole records frames read.
         let frames = reading.frames.saturating_sub(1).min(tape.records.len());
         let prefix: Vec<_> = tape.records[..frames].iter().flatten().cloned().collect();
         if real != expected || !broken.is_empty() || reading.items != prefix {
@@ -316,7 +272,6 @@ fn the_real_writer_and_reader_conform_to_the_model() {
     for frames in 1..=3 {
         let tape = write_tape(&model, &mut ev, frames);
         assert_eq!(tape.ends.len() as u64, frames);
-        // n + n² + … + n^(n+1) arrangements, less the n that are the tape or a prefix of it.
         let misplaced = cases(&tape)
             .iter()
             .filter(|c| c.schedule.contains(&"Misplace"))
@@ -371,7 +326,6 @@ fn a_reader_that_ignores_xxh64_is_rejected() {
         "a damaged frame is read as written: {:?}",
         wrong.first()
     );
-    // Where it reads a damaged frame through, it is the checksum-blind machine.
     let predicted = read_through.iter().any(|d| {
         let blind_state = walk(&blind_model, &d.schedule);
         ["recovered", "refused", "said_torn"]
@@ -379,8 +333,6 @@ fn a_reader_that_ignores_xxh64_is_rejected() {
             .all(|v| blind_state[v] == d.real[v])
     });
     assert!(predicted, "the Buggy = 1 machine predicts a read-through");
-    // And the bind is not vacuous the other way: the shipping reader's verdicts on the
-    // same cases differ from the blind reader's.
     assert!(bind(&model, &tape, &recover, None).is_empty());
 }
 
@@ -418,28 +370,6 @@ fn a_reader_that_ignores_places_is_rejected() {
     });
     assert!(predicted, "the Buggy = 6 machine predicts a read-through");
 }
-
-// -- model 2: a replay's cursor, both arms -----------------------------------
-//
-// Tier-1 of `SuperviseReplayCursor` (`aterm_models_harness::supervise_replay_cursor_model`,
-// the replay plan's §9 model 2): the real replay core, asked through its replaying door
-// (`Fx::exchange` in its replay mode, a live call that counts itself if it is ever made), over
-// a real four-record tape — `status` (a read), `key 1` (an act), `meta` (a read), `key 2` (an
-// act) — by schedules drawn from `aterm_spec::rng`, each request one step window. After each
-// step the core is projected onto the model's six variables and compared with the model's
-// state after the same schedule. Two binds: the STRICT core (`ReplayCore::start`) against the
-// committed machine (`Acts = 0`), and the COUNTERFACTUAL core (`ReplayCore::start_acts`, the
-// acts cursor of `tape::acts`) against the acts scenario (`Acts = 1`). The anchors on
-// `ReplayCore::step` (every strict move), `ReplayCore::step_acts` (every acts move) and
-// `ReplayCore::halt` (every move that diverges) are witnessed by the steps they claim.
-//
-// `served_future` is read off what the core SERVED: each record's reply names its request, so
-// a reply from a record past the act the loop has not taken is a value from the future.
-//
-// The negative controls: a cursor that resyncs a read it does not hold forward to the next
-// record that matches, across the act between — the lenient synthesis the plan rejected — and,
-// for the acts arm, the acts cursor with no segment bound on its resync; each bind rejects its
-// own for passing an act, and where it resyncs it is the `Buggy = 2` machine of its arm.
 
 const CURSOR: &str = "SuperviseReplayCursor";
 
@@ -494,14 +424,9 @@ fn ask_for(action: &str, pos: i64) -> Vec<&'static str> {
     let at = |p: i64| TAPE_WORDS[usize::try_from(p.clamp(0, 3)).unwrap_or(0)].to_vec();
     match action {
         "AskNext" | "AskAfterDivergence" => at(pos),
-        // A read the segment does not hold: before its act, the read ahead
-        // of it past the act — what a lenient cursor would resync to;
-        // after, the read of the segment before.
         "AskOtherRead" if pos <= 1 => vec!["meta"],
         "AskOtherRead" => vec!["status"],
-        // The read the segment served, its act next.
         "AskRepeat" => at(pos - 1),
-        // The segment's act, its read unasked.
         "AskClosingAct" => at(pos + 1),
         "AskOtherAct" => vec!["key", "9"],
         "AskPastEnd" => vec!["status"],
@@ -788,8 +713,6 @@ fn conforms(acts: bool) {
     let model = cursor_machine(i64::from(acts), 0);
     let mut ev = StepEvidence::new(CURSOR);
     let mut rng = XorShift::new(61);
-    // The tape asked whole and then past its end, which a draw over seven
-    // moves rarely reaches, first; then the drawn schedules.
     let whole: Vec<&'static str> = ["AskNext"; 4]
         .into_iter()
         .chain(["AskPastEnd", "AskAfterDivergence"])
@@ -885,24 +808,6 @@ fn an_acts_cursor_unbounded_by_its_segment_is_rejected() {
     rejected_for_passing_an_act(1, &CURSOR_MOVES, UnboundedActsCursor::default);
 }
 
-// -- model 3: the stop flag's latch ------------------------------------------
-//
-// Tier-1 of `SupervisorRaisedLatch` (`aterm_models_harness::supervisor_raised_latch_model`,
-// the replay plan's §9 model 3): a real recorded loop of four operations — a read of the
-// stop flag through the loop's door (`Fx::raised`), a round trip through the recording door
-// (`TapedCtl`), a read, a round trip — while a REAL OTHER THREAD raises the flag before
-// the operation the schedule names (a handshake places it there, so each point is reached
-// on every run). Its tape is then replayed through the replaying door by the same loop. Each
-// run is projected onto `marked` and `mark` (whether the recorder taped the flag, and how
-// many of the loop's operations had completed when it did — read off the recorder's own
-// count) and `diverged` (the replay's verdict), beside the model's run of the same schedule.
-// The negative control is a setter that appends the flag's record itself, at the moment it
-// raises it: the bind rejects it, and the `Buggy = 1` machine predicts it. A second run has
-// the thread raise the flag at moments of its own over many seeds, racing the loop: no
-// replay diverges and every replayed read answers as the recorded one did. A third adds
-// the window's host to the race (T7): the thread also turns the host's answer, which the
-// loop reads through the taped host, and the replay's host gives every answer back.
-
 const LATCH: &str = "SupervisorRaisedLatch";
 
 /// What a recorded loop and its replay did, as the model's variables see them.
@@ -945,7 +850,6 @@ fn door_words(op: usize) -> Vec<String> {
 /// Record the four-operation loop, the flag raised by another thread before
 /// operation `raise_at` (`4`: after the last; `None`: never), the setter
 /// appending the flag's record itself when `setter_tapes`; then replay it.
-/// What it did, and each step through `ev` when given.
 fn latch_run(
     raise_at: Option<usize>,
     setter_tapes: bool,
@@ -973,8 +877,6 @@ fn latch_run(
     let core = TapeCore::start(writer, VERBATIM, origin, "test");
     let fx = clock.recording(Arc::clone(&core));
     let flag = Arc::new(AtomicBool::new(false));
-    // The other thread: raises the flag when told, says so, and — the
-    // negative control — tapes the flag itself as it raises it.
     let (tell, told) = mpsc::channel::<()>();
     let (done, raised) = mpsc::channel::<()>();
     let host = {
@@ -1018,7 +920,6 @@ fn latch_run(
                 let _ = taped.call(&words);
             }
         });
-        // A read that taped the flag: the recorder counted one effect more.
         if op % 2 == 0 && core.effects() > before {
             mark.get_or_insert(op);
         }
@@ -1037,7 +938,6 @@ fn latch_run(
         .iter()
         .filter_map(|i| i.record().cloned())
         .collect();
-    // The replay: the same loop, through the replaying door.
     let replay_core = ReplayCore::start(records, VERBATIM, VERBATIM, "test", None);
     let rfx = Fx::replay(Arc::clone(&replay_core));
     let mut lane = ReplayCtl::new(rfx.clone(), doors::CTL);
@@ -1249,10 +1149,7 @@ fn a_flag_raised_at_any_moment_replays_exactly() {
 /// HOST (the replay plan's T7): beside the stop flag, the loop asks its host whether it wants
 /// a point (`host.wants`, through the taped host the loop is handed, `Fx::host_door`), and
 /// the host's thread raises the stop and turns the host's answer at moments of its own,
-/// racing the loop, over many seeds. The host's answers are the host's thread's as the loop
-/// read them, so they are values the loop observed: each is on the tape where it was read,
-/// and the replay — the replay's host, nothing behind it — gives every one back in order,
-/// the stop's latch beside them, with no divergence.
+/// racing the loop, over many seeds.
 #[test]
 fn a_host_racing_the_loop_replays_exactly() {
     use super::core::TapeCore;
@@ -1336,8 +1233,6 @@ fn a_host_racing_the_loop_replays_exactly() {
             .collect();
         let core = ReplayCore::start(records, VERBATIM, VERBATIM, "test", None);
         let rfx = Fx::replay(Arc::clone(&core));
-        // The replay's door hands back the replay's host whatever it is
-        // given: the racing host is never asked again.
         let rhost = rfx.host_door(&(Arc::new(Racing::default()) as Arc<dyn IdleHost>));
         let mut lane = ReplayCtl::new(rfx.clone(), doors::CTL);
         let replayed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

@@ -1,36 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The instance's node log (design §2.1 "node", §2.6 "Per instance"; phase 5
-//! sub-phase 5J): [`NODE_LOG_RECORDS`] records at node `n`, what
-//! the instance itself did rather than any session.
-//!
-//! ```text
-//! 1 open n start prev_end=- by=aterm src=aterm conf=exact t=…
-//! 2 amend n start prev_end=signal code=11 by=aterm src=aterm conf=exact t=…
-//! 3 mark n link state=connected gen=4 by=bridge src=fabric conf=exact t=…
-//! 4 mark n config key=privacy.enabled by=aterm src=aterm conf=exact t=…
-//! ```
-//!
-//! - **Its records.** One `open n start` (first, once: the node is opened by
-//!   the instance's start and never closed, its end is the next process's
-//!   `prev_end=`), `amend n start` refinements of it, and `link` and
-//!   `config` marks ([`NODE_MARKS`]). Nothing else is written here, and no
-//!   session record is written to it.
-//! - **Readers** hold [`Log::read`](crate::Log::read)'s contract: a pull
-//!   [`Cursor`], `since` exclusive, and a [`Gap`] that tells a reader, once
-//!   and exactly, how many records of the seqs it covered were evicted. The
-//!   ring is a plain FIFO (no level-aware eviction: nothing here is pinned
-//!   but its newest records), so the evicted seqs are always the oldest.
-//!   Held to the `SessionLogCursor` model's Tier-1 projection
-//!   (`tests/conformance_node_log.rs`).
-//! - **Local, additive and RAM only (T27).** No fold, no carry (each process
-//!   writes its own `start`), no journal (D3) and nothing bus class (D4):
-//!   [`Rec::is_bus_class`] and [`Rec::is_turn_class`] are false for every
-//!   record this log takes, so the bus mirror's encoder refuses each.
-//! - **Its epoch** is the host's: the second the process started, say. A
-//!   cursor of another epoch that holds a seq is another process's seq
-//!   space and reads [`GapWhy::Reset`].
+//! The instance's node log (design §2.1 "node", §2.6 "Per instance"; phase 5 sub-phase 5J).
 
 use std::collections::VecDeque;
 
@@ -43,12 +14,10 @@ use crate::vocab::{Actor, Conf, Kind, Node, Op, Src};
 /// The node log's bound: records, oldest evicted first (DESIGN §2.6).
 pub const NODE_LOG_RECORDS: usize = 1024;
 
-/// The mark kinds the node log takes: the fabric link's state and a config
-/// key that changed (DESIGN §6's instance row).
+/// The mark kinds the node log takes: the fabric link's state and a config key that changed.
 pub const NODE_MARKS: &[Kind] = &[Kind::Link, Kind::Config];
 
-/// The instance's node log: a bounded FIFO ring of node `n`'s records with
-/// exact gap counts.
+/// The instance's node log: a bounded FIFO ring of node `n`'s records with exact gap counts.
 #[derive(Clone, Debug)]
 pub struct NodeLog {
     ep: u32,
@@ -65,8 +34,7 @@ impl NodeLog {
         NodeLog::bounded(ep, NODE_LOG_RECORDS)
     }
 
-    /// An empty node log of epoch `ep` bounded by `records` (at least one):
-    /// the models' and tests' small rings.
+    /// An empty node log of epoch `ep` bounded by `records`: the models' and tests' small rings.
     #[must_use]
     pub fn bounded(ep: u32, records: usize) -> NodeLog {
         NodeLog {
@@ -131,17 +99,7 @@ impl NodeLog {
         self.last_seq > 0
     }
 
-    /// Records after `cursor`, at most `max` of them, and the gap the read
-    /// crossed: [`Log::read`](crate::Log::read)'s contract on a FIFO ring.
-    ///
-    /// The read covers the seqs from the cursor (exclusive) to its `next`:
-    /// the last record returned when `max` cut it, else the head; `max = 0`
-    /// covers only the seqs up to the first live record. Its [`Gap`] counts,
-    /// exactly, the evicted seqs it covered ([`GapWhy::Evicted`]). A cursor
-    /// ahead of the head, or of another epoch with a seq in it, reads
-    /// [`GapWhy::Reset`] and every live record from the oldest, its count
-    /// every evicted seq. A cursor at seq 0 has read nothing, whatever epoch
-    /// it names.
+    /// Records after `cursor`, at most `max` of them, and the gap the read crossed.
     #[must_use]
     pub fn read(&self, cursor: Cursor, max: usize) -> Read<'_> {
         let head = self.last_seq;
@@ -158,7 +116,6 @@ impl NodeLog {
             (_, Some(last)) if recs.len() == max => last.seq,
             _ => head,
         };
-        // FIFO: the evicted seqs are exactly those below the oldest live one.
         let evicted_to = self.oldest_seq().saturating_sub(1).min(next);
         let lost = evicted_to.saturating_sub(from);
         let gap = (reset || lost > 0).then(|| Gap {
@@ -177,14 +134,9 @@ impl NodeLog {
         }
     }
 
-    /// The instance's start: `open n start` with `f` (`prev_end=`, the
-    /// previous run's end as far as is known yet). The first record, once.
-    /// Returns its seq.
-    ///
+    /// The instance's start: `open n start` with `f`.
     /// # Errors
-    ///
-    /// [`Refused::AlreadyOpen`] once any record was written, or a field or
-    /// encoding refusal.
+    /// [`Refused::AlreadyOpen`] once any record was written, or a field or encoding refusal.
     pub fn start(&mut self, f: Fields, at: Stamp) -> Result<u64, Refused> {
         if self.started() {
             return Err(Refused::AlreadyOpen);
@@ -192,13 +144,9 @@ impl NodeLog {
         self.append(Op::Open, own(f), at)
     }
 
-    /// Refine the start with `f` (`prev_end=` once the recovery ledger was
-    /// read): `amend n start`. Returns its seq.
-    ///
+    /// Refine the start with `f` (`prev_end=` once the recovery ledger was read): `amend n start`.
     /// # Errors
-    ///
-    /// [`Refused::NotIssued`] before [`NodeLog::start`], or a field or
-    /// encoding refusal.
+    /// [`Refused::NotIssued`] before [`NodeLog::start`], or a field or encoding refusal.
     pub fn amend_start(&mut self, f: Fields, at: Stamp) -> Result<u64, Refused> {
         if !self.started() {
             return Err(Refused::NotIssued(Node::INSTANCE));
@@ -206,14 +154,9 @@ impl NodeLog {
         self.append(Op::Amend, own(f), at)
     }
 
-    /// A point fact on node `n`: a [`NODE_MARKS`] kind. `m.at` must be
-    /// `None` or node `n`. Returns its seq.
-    ///
+    /// A point fact on node `n`: a [`NODE_MARKS`] kind.
     /// # Errors
-    ///
-    /// [`Refused::KindDoesNotFit`] for any other kind, [`Refused::NotIssued`]
-    /// for a mark aimed at another node, [`Refused::NotOpen`] before
-    /// [`NodeLog::start`], or a field or encoding refusal.
+    /// [`Refused::KindDoesNotFit`] for any other kind.
     pub fn mark(&mut self, m: Mark, at: Stamp) -> Result<u64, Refused> {
         if !NODE_MARKS.contains(&m.kind) {
             return Err(Refused::KindDoesNotFit(m.kind));

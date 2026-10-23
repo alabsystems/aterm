@@ -1,39 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE ACCOUNT STATS OF ONE MACHINE (`docs/DESIGN-account-stats-2026-10-15.md`
-//! §3, §7.1, §7.2): what `aterm harness accounts stats` says of the Claude
-//! Code account of the home its environment names — its five-hour and weekly
-//! windows, its Fable week as last seen, its plan, its usage credits, its
-//! list-price dollars, the sessions on it and its login — each figure with
-//! its own `as of`, source and machine, current or void at its own reset, and
-//! every empty figure with the one closed word that says why ([`Missing`]).
-//!
-//! It is a VIEW over what is already kept, never a second record:
-//!
-//! * the accounts state ([`super::accounts::State`]): each window's figure
-//!   as the usage tap recorded it ([`Account::windows`]), the sample where
-//!   it says another (the `/usage` probe's panel, a state an older build
-//!   wrote: [`accounts::sample_window`]), the walls, the warnings and the
-//!   limit reset's refill S5 keeps, the credits word — none of it where the
-//!   record is keyed to another account than the profile's (`Look::record`);
-//! * the home's profile, read on demand by the allowlist
-//!   ([`super::profile`]): the plan, the credits word Claude Code keeps, the
-//!   `/usage` body it cached (the only passive source of the Fable week), and
-//!   how the plan bills Fable;
-//! * the home's spend ([`super::spend`]), folded in memory by the caller;
-//! * the login state S7 keeps ([`super::accounts::login_state`]) and the
-//!   Claude Codes running on the home now (the caller's census).
-//!
-//! A WINDOW'S FIGURE is every source's reading of it merged by the one rule
-//! ([`merge_fig`]: the newest reset anchor, then the newest epoch — a limit
-//! reset used inside the window — then the largest), the void ones kept only
-//! where no current one is, so a window whose reset passed reads `window reset
-//! 15:10, no reading since` and never 0%.
-//!
-//! A LEAF (§8.2): nothing that decides imports it, and its API is the view
-//! and its two renderings. Labels and keys only: no email, id, path or vendor
-//! flag name leaves it.
+//! Per-machine Claude Code account stats view ([`Missing`], [`super::accounts::State`],
+//! [`Account::windows`], [`accounts::sample_window`], [`super::profile`], [`super::spend`],
+//! [`super::accounts::login_state`], [`merge_fig`]).
 
 use std::fmt::Write as _;
 
@@ -47,22 +17,19 @@ use super::profile::{self, Bucket, NoProfile, Profile};
 use super::spend::{self, Spend};
 use super::usage::rfc3339_utc;
 
-/// [`WindowFig::source`] of a figure the home's cached `/usage` body held
-/// (`cachedUsageUtilization`, design F3).
+/// [`WindowFig::source`] of a figure the home's cached `/usage` body held.
 pub const SOURCE_USAGE_CACHE: &str = "usage-cache";
 
-/// [`WindowFig::source`] of a usage wall: 100% until its reset.
+/// [`WindowFig::source`] of a usage wall.
 pub const SOURCE_WALL: &str = "wall";
 
-/// [`WindowFig::source`] of Claude Code's warning that a window is filling
-/// (`You've used N% of your weekly limit`): a figure at least that high.
+/// [`WindowFig::source`] of Claude Code's warning that a window is filling.
 pub const SOURCE_WARNING: &str = "warning";
 
 /// THE MODEL FAMILY A PER-MODEL WEEK'S DOLLARS ARE SUMMED FOR
 /// ([`spend::Spend::sum`], the catalog family of each message's model):
 /// the Fable week's every Fable model's, the Sonnet and Opus weeks' their
-/// own. `None` for a week of a model no family names (`seven_day_other`):
-/// it has no dollars.
+/// own.
 fn week_family(id: &str) -> Option<&'static str> {
     [
         (Bucket::Fable, "fable"),
@@ -73,20 +40,18 @@ fn week_family(id: &str) -> Option<&'static str> {
     .find_map(|(bucket, family)| (bucket.id() == id).then_some(family))
 }
 
-/// WHETHER THE USAGE TAP CAN HAVE READ THIS HOME'S WINDOWS.
+/// Whether the usage tap can have read this home's windows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tap {
     /// `[harness] usage_tap = false`, the packaged value.
     Off,
     /// On.
     On,
-    /// On, but no tap reading is recorded under the label: readings are
-    /// recorded for the rows of a roster that admits, or the machine's own
-    /// row where none is listed (`super::accounts::tap_roster`).
+    /// On, but no tap reading is recorded under the label.
     OtherHome,
 }
 
-/// WHY A FIGURE IS EMPTY, one closed word each ([`Missing::word`]).
+/// Why a figure is empty, one closed word each ([`Missing::word`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Missing {
     /// The tap is off and nothing else read the window.
@@ -95,11 +60,11 @@ pub enum Missing {
     TapOtherHome,
     /// The tap is on and has recorded nothing of the window.
     NoReading,
-    /// The window's reset passed with no reading since.
+    /// The window's reset passed with no reading.
     WindowReset,
-    /// A limit reset was used inside the window, with no reading since.
+    /// A limit reset was used inside the window, with no reading.
     ResetUsed,
-    /// No `/usage` was seen on this home: the profile holds no usage body.
+    /// No `/usage` was seen on this home.
     NoUsageSeen,
     /// The usage body this home cached has no row for the window.
     NoRow,
@@ -127,7 +92,7 @@ impl Missing {
     }
 }
 
-/// S7'S WORD ON THE LOGIN, where the label's roster row is renewable.
+/// S7's word on the login, where the label's roster row is renewable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Login {
     /// `ok`, `due`, `expired` or `idle` ([`super::accounts::LoginState`]).
@@ -136,7 +101,7 @@ pub struct Login {
     pub renew_by: Option<i64>,
 }
 
-/// THE HOME'S SPEND, folded by the caller.
+/// The home's spend, folded by the caller.
 #[derive(Debug, Clone, Copy)]
 pub struct SpendLook<'a> {
     /// The buckets.
@@ -145,37 +110,26 @@ pub struct SpendLook<'a> {
     pub complete: bool,
 }
 
-/// EVERYTHING THE VIEW IS BUILT FROM, gathered by the caller.
+/// Everything the view is built from, gathered by the caller.
 #[derive(Debug, Clone, Copy)]
 pub struct Look<'a> {
     /// Unix seconds.
     pub now: i64,
-    /// The local clock's offset from UTC, seconds: the text's times only.
+    /// The local clock's offset from UTC, seconds.
     pub tz_s: i64,
-    /// This machine's kept id ([`super::accounts::Store::machine_id`]);
-    /// `None` where none could be kept.
+    /// This machine's kept id ([`super::accounts::Store::machine_id`]).
     pub machine: Option<&'a str>,
-    /// The selected home's display label, which does not establish the
-    /// identity of the account its profile currently names ([`Self::key`]).
+    /// The selected home's display label.
     pub label: &'a str,
     /// The home's profile, as the allowlist read it.
     pub profile: &'a Result<Profile, NoProfile>,
-    /// What the accounts state holds of the label; `None` with nothing. The
-    /// view reads it through `Look::record`: never another account's.
+    /// What the accounts state holds of the label.
     pub account: Option<&'a Account>,
     /// The accounts state could not be read.
     pub state_unread: bool,
-    /// The roster lists several accounts, every one a login of the default
-    /// home (accounts v2 rotation): the home's spend is several accounts'
-    /// ([`Self::another_seen`]). Its profile still names the account whose
-    /// figures this view shows, so a known key mismatch refuses the record
-    /// even here ([`Self::record`]).
+    /// The roster lists several accounts, every one a login of the default home.
     pub several: bool,
-    /// A Claude Code running on the home now is not on its stored login (an
-    /// API key, Bedrock, Vertex or a route of its own in its environment:
-    /// the host's `ProcessLogin` verdict, as the census reads it): its spend
-    /// is in the home's, and no capacity is claimed from it (design §3.6,
-    /// `api-key-seen`).
+    /// A Claude Code running on the home now is not on its stored login.
     pub api_key_seen: bool,
     /// [`Tap`].
     pub tap: Tap,
@@ -185,26 +139,20 @@ pub struct Look<'a> {
     pub prices_as_of: Option<&'a str>,
     /// [`Login`], where the label's row is renewable.
     pub login: Option<Login>,
-    /// The Claude Codes running on this home now, or why they were not
-    /// counted.
+    /// The Claude Codes running on this home now, or why they were not counted.
     pub sessions: Result<usize, &'a str>,
 }
 
 impl<'a> Look<'a> {
     /// THE RECORD THE VIEW READS: what the accounts state holds of the
     /// label, unless it is another account's than the one the profile names
-    /// ([`Account::of_another`], `note_reading`'s own rule). Another account
-    /// signed in to the home since it was written, and no reading under the
-    /// new key has dropped it yet: its windows, walls, warnings and credits
-    /// were the old account's, so the view has no record, and each window
-    /// says why as for an account nothing was read of. Every figure the view
-    /// takes from the state goes through here.
+    /// ([`Account::of_another`], `note_reading`'s own rule).
     fn record(&self) -> Option<&'a Account> {
         self.account.filter(|a| !a.of_another(self.key()))
     }
 
     /// The key of the account the home's profile currently names, where it
-    /// was read. A roster of several logins does not change that identity.
+    /// was read.
     fn key(&self) -> Option<profile::AccountKey> {
         self.profile.as_ref().ok().and_then(|p| p.key)
     }
@@ -216,7 +164,7 @@ impl<'a> Look<'a> {
     /// since when is not known); the instant the record's key changed
     /// ([`Account::keyed_at`], the `epoch` row's); the fetch of a cached
     /// `/usage` body that named another account
-    /// ([`Profile::usage_of_another_at`]). `None`: none was seen.
+    /// ([`Profile::usage_of_another_at`]).
     fn another_seen(&self) -> Option<i64> {
         let held = (self.several || self.account.is_some_and(|a| a.of_another(self.key())))
             .then_some(self.now);
@@ -235,8 +183,7 @@ impl<'a> Look<'a> {
     /// the current account's where no other account was seen on the home
     /// since `from` ([`Self::another_seen`]); else UNATTRIBUTED, all of it
     /// (no share of it is split off by time), so no capacity and no `left`
-    /// is claimed from it. The fold is home-wide: it cannot tell the two
-    /// accounts' messages apart.
+    /// is claimed from it.
     fn attribution(&self, from: i64) -> spend::Attribution {
         if self.another_seen().is_some_and(|at| at >= from) {
             spend::Attribution::Unattributed { share: 1.0 }
@@ -246,7 +193,7 @@ impl<'a> Look<'a> {
     }
 }
 
-/// ONE WINDOW AS THE VIEW HAS IT.
+/// One window as the view has it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Win {
     /// The closed bucket id ([`Bucket::id`]).
@@ -259,26 +206,24 @@ pub struct Win {
     pub length_s: i64,
     /// The figure, current or void or cut by a reset used inside it.
     pub fig: Option<WindowFig>,
-    /// Why it says nothing now: no figure, a void one, a cut one.
+    /// Why it says nothing now.
     pub missing: Option<Missing>,
 }
 
 impl Win {
-    /// The figure, where it is current and not cut: what the window holds now.
+    /// The figure, where it is current and not cut.
     #[must_use]
     pub fn current(&self, now: i64) -> Option<&WindowFig> {
         self.fig.as_ref().filter(|f| f.current(now) && !f.cut())
     }
 }
 
-/// THE VIEW OF ONE ACCOUNT.
+/// The view of one account.
 #[derive(Debug, Clone, PartialEq)]
 pub struct View {
-    /// The five-hour window, the week, the Fable week, then any other
-    /// per-model week the cached body names.
+    /// The five-hour window, the week, the Fable week.
     pub windows: Vec<Win>,
-    /// A non-zero tenth was seen in the account's figures: they are read
-    /// to a tenth, not a whole percent.
+    /// A non-zero tenth was seen in the account's figures.
     pub tenths: bool,
 }
 
@@ -296,10 +241,6 @@ fn fig(pct_x10: u32, reset: i64, at: i64, by: &str, source: &str) -> WindowFig {
 
 /// THE ONE FIGURE OF A WINDOW FROM ALL ITS SOURCES (module docs): current
 /// figures merged by [`merge_fig`]; with none current, the newest void one.
-/// S5's word that a limit reset was used inside the window at `refilled` is
-/// an epoch of every current source whose window of `length_s` it falls in,
-/// before the merge: its epoch rule then cuts what was served before the
-/// reset, from whichever source, and keeps what was served after it.
 fn one_figure(
     sources: impl IntoIterator<Item = WindowFig>,
     refilled: Option<i64>,
@@ -338,15 +279,13 @@ fn said_fig(said: &WindowSaid, by: &str) -> Option<WindowFig> {
 }
 
 /// The instant S5's word says a limit reset was USED inside the window: a
-/// word with neither a figure nor a reset. A limit that lifted by itself
-/// names the reset that came ([`WindowSaid::reset`]) and refilled nothing
-/// inside its window.
+/// word with neither a figure nor a reset.
 fn said_refill(said: Option<&WindowSaid>) -> Option<i64> {
     said.filter(|s| s.pct.is_none() && s.reset.is_none())
         .map(|s| s.at)
 }
 
-/// THE VIEW of `look` (module docs).
+/// The view of `look` (module docs).
 #[must_use]
 pub fn view(look: &Look<'_>) -> View {
     let now = look.now;
@@ -354,8 +293,6 @@ pub fn view(look: &Look<'_>) -> View {
     let account = look.record();
     let cache = look.profile.as_ref().ok().and_then(|p| p.usage.as_ref());
     let cache_at = cache.map(|c| c.fetched_at_ms.div_euclid(1000));
-    // The cached body's rows of `bucket`, of the model `name` where one is
-    // asked.
     let cached = |bucket: Bucket, name: Option<&str>| -> Vec<&profile::CachedWindow> {
         cache
             .into_iter()
@@ -384,8 +321,6 @@ pub fn view(look: &Look<'_>) -> View {
         let Some(a) = account else {
             return Vec::new();
         };
-        // A cleared wall's record (a limit reset used or lifted on it) is no
-        // wall: it only keeps an older row from putting the wall back.
         let wall = a
             .walls
             .get(id)
@@ -450,9 +385,6 @@ pub fn view(look: &Look<'_>) -> View {
             fig: f,
         });
     }
-    // The Fable week (every allowlisted name is one bucket, design F2), the
-    // Sonnet and Opus weeks, then each other model's week the cached body
-    // names: one window per name (`seven_day_other`, its name in `name`).
     let mut weeks = vec![
         (Bucket::Fable, None),
         (Bucket::SevenDaySonnet, None),
@@ -495,16 +427,7 @@ pub fn view(look: &Look<'_>) -> View {
     View { windows, tenths }
 }
 
-/// THE TWO WINDOWS THE ACCOUNTS STATE HOLDS OF `account` — the usage tap's
-/// figures, the sample, its walls, S5's warnings and refills — by the view's
-/// own rule, an empty one saying why by `tap`: what `aterm harness accounts`
-/// shows of them, so it never disagrees with `accounts stats`. `key` is the
-/// key of the account the default home's profile names
-/// (`super::profile::default_home_key`, the read the host keys every reading
-/// by; none under a roster of several, [`Look::several`]): a record of
-/// another key is the old account's, and none of it is shown
-/// ([`Account::of_another`], as `Look::record` reads it). No profile is
-/// read here.
+/// The two windows the accounts state holds of `account`.
 #[must_use]
 pub fn held_windows(
     account: &Account,
@@ -535,13 +458,10 @@ pub fn held_windows(
     held
 }
 
-// The dollars
-
 /// How a figure's source was read, for its resolution ([`spend::ReadingKind`]).
 fn reading_kind(source: &str) -> spend::ReadingKind {
     match source {
         SOURCE_WALL => spend::ReadingKind::Wall,
-        // A `/usage` panel floors; the probe's sample is one.
         SOURCE_SAMPLE => spend::ReadingKind::Floored,
         _ => spend::ReadingKind::Rounded,
     }
@@ -556,11 +476,7 @@ fn on_credits(account: Option<&Account>, from: i64) -> bool {
     )
 }
 
-/// ONE WINDOW'S DOLLARS (design §3.6): spent so far in it, and with a
-/// current reading its capacity and what is left; rolling with none. The
-/// two vendor windows sum every model's spend, a per-model week its own
-/// family's ([`week_family`]); `None` with no spend, and for a week of a
-/// model no family names.
+/// One window's dollars.
 #[must_use]
 pub fn dollars(look: &Look<'_>, view: &View, win: &Win) -> Option<spend::Figure> {
     let spend = look.spend?.spend;
@@ -599,8 +515,6 @@ pub fn dollars(look: &Look<'_>, view: &View, win: &Win) -> Option<spend::Figure>
     };
     Some(spend::figure(spend, &ask))
 }
-
-// The text
 
 const DASH: &str = "\u{2014}";
 const DOT: &str = " \u{b7} ";
@@ -660,8 +574,7 @@ fn clock(t: i64, now: i64, tz_s: i64) -> String {
     }
 }
 
-/// A percent in tenths as the text says it: `62.5%` where the account's
-/// figures carry tenths, else `71%`.
+/// A percent in tenths as the text says it.
 pub fn percent(x10: u32, tenths: bool) -> String {
     if tenths {
         format!("{}.{}%", x10 / 10, x10 % 10)
@@ -678,7 +591,6 @@ fn usd(v: f64) -> String {
     if v < 10.0 {
         return format!("${v:.2}");
     }
-    // Whole dollars, grouped by thousands; a figure past u64 is no figure.
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -814,8 +726,6 @@ fn dollars_part(name: &str, figure: &spend::Figure, whose: spend::Attribution) -
     }
     let mut part = format!("{name} {}", usd(figure.used.usd));
     match &figure.capacity {
-        // Uncalibrated: the spread of closed windows waits for the series
-        // (A2).
         Ok(c) => {
             let _ = write!(
                 part,
@@ -831,8 +741,7 @@ fn dollars_part(name: &str, figure: &spend::Figure, whose: spend::Attribution) -
     part
 }
 
-/// The text of `look` (design "What you get"): the header, the account's
-/// line, and one row per window, the dollars, and who uses it.
+/// Render the plain-text view of `look`.
 #[must_use]
 pub fn text(look: &Look<'_>, view: &View) -> String {
     let now = look.now;
@@ -877,7 +786,6 @@ pub fn text(look: &Look<'_>, view: &View) -> String {
     for win in &view.windows {
         out.push_str(&window_row(look, view, win, p));
     }
-    // The dollars: the two windows' and, with a Fable reading, Fable's.
     match look.spend {
         Some(s) => {
             let mut parts = Vec::new();
@@ -942,8 +850,6 @@ pub fn text(look: &Look<'_>, view: &View) -> String {
     out
 }
 
-// The JSON (design §7.2, schema 1)
-
 /// `key` as Unix seconds and `key_rfc3339` as the same instant in UTC, both
 /// `null` for an instant nobody read.
 fn put_time(o: &mut Map, key: &str, t: Option<i64>) {
@@ -969,8 +875,7 @@ fn reason(missing: Missing) -> Value {
     Value::Object(o)
 }
 
-/// One window as `--json` carries it (design §7.2): `accounts stats`' and
-/// `accounts --json`'s `windows`.
+/// One window as `--json` carries it.
 #[must_use]
 pub fn window_value(win: &Win, now: i64) -> Value {
     let mut o = Map::new();
@@ -1091,9 +996,7 @@ fn spend_window_json(win: &Win, figure: &spend::Figure, on_credits: bool) -> Val
     Value::Object(o)
 }
 
-/// The `--json` document of `look` (design §7.2, schema 1): the fields one
-/// machine fills, each `null` where it says nothing, every empty window with
-/// its `missing.reason`.
+/// Render the `--json` document of `look` (schema 1).
 #[must_use]
 pub fn json(look: &Look<'_>, view: &View, aterm: &str) -> String {
     let now = look.now;
@@ -1148,8 +1051,6 @@ pub fn json(look: &Look<'_>, view: &View, aterm: &str) -> String {
     );
     a.insert("agent".to_owned(), Value::from("claude"));
     a.insert("label".to_owned(), Value::from(look.label));
-    // The profile's own word where it could not be read: every figure it
-    // fills (the plan, the credits, the Fable answer) is `null`.
     a.insert(
         "missing".to_owned(),
         look.profile
@@ -1211,7 +1112,6 @@ pub fn json(look: &Look<'_>, view: &View, aterm: &str) -> String {
                 .iter()
                 .filter_map(|w| Some((w, dollars(look, view, w)?)))
                 .collect();
-            // Since the oldest open window began (design §3.6).
             let oldest = figures.iter().map(|(_, f)| f.from).min();
             o.insert(
                 "attribution".to_owned(),

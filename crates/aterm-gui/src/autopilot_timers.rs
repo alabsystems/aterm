@@ -89,6 +89,7 @@ impl std::fmt::Display for Date {
 }
 
 /// The local day number (days since 1970-01-01, local) of unix second `at`
+/// under offset `offset_s`.
 fn local_days(at: i64, offset_s: i64) -> i64 {
     (at + offset_s).div_euclid(86_400)
 }
@@ -269,6 +270,7 @@ pub(crate) fn offer_turns_at(
 }
 
 /// When the next local date starts: the day words an open menu or page
+/// shows need refreshing there, whether or not an exact 00:00 exists.
 fn day_words_turn_at(now_ms: i64, offset_at: &dyn Fn(i64) -> Option<i64>) -> Option<i64> {
     const DAY_S: i64 = 86_400;
     let offset = offset_at(now_ms.div_euclid(1000))?;
@@ -351,8 +353,12 @@ pub(crate) enum ClosedOver {
 pub(crate) struct AutopilotTimers {
     entries: HashMap<u64, TimerEntry>,
     /// A seamless update's successor rebuilt the index after its Commit
+    /// ([`App::settle_autopilot_commit`]): owed once, then never again.
     committed: bool,
     /// When an open Autopilot menu's or Settings ▸ Harness page's `land_at`
+    /// offer turns its words ([`offer_turns_at`]): the wall instant, unix ms,
+    /// and the monotonic `due` derived from it, noted where the offer is
+    /// built ([`App::note_land_at_offer`]); `None` with nothing offered.
     offer_due: Option<(i64, Instant)>,
 }
 
@@ -479,6 +485,7 @@ impl AutopilotTimers {
 }
 
 /// The monotonic instant the wall reads `land_at_ms` at, from a reading of
+/// both clocks (`now`, `wall_ms`): `now` itself where it has passed.
 fn due_at(land_at_ms: i64, now: Instant, wall_ms: i64) -> Instant {
     let ahead = u64::try_from(land_at_ms.saturating_sub(wall_ms)).unwrap_or(0);
     now + Duration::from_millis(ahead)
@@ -538,6 +545,7 @@ impl App {
     }
 
     /// The index follows `stored`; where what the chip shows moved, the
+    /// footer is posted and an open menu built again.
     fn index_autopilot_timer_at(
         &mut self,
         local_id: u64,
@@ -593,6 +601,8 @@ impl App {
     }
 
     /// The menu's rows and the page built again from the wall as it reads
+    /// now (each notes the next turn); the note dropped first, so with
+    /// neither open none is left.
     fn autopilot_offer_turned(&mut self) {
         self.autopilot_timers.offer_due = None;
         if let Some(session) = self.autopilot_menu.as_ref().map(|menu| menu.session) {
@@ -622,6 +632,7 @@ impl App {
     }
 
     /// The index built again from every session's stored pair (the Commit's,
+    /// [`Self::settle_autopilot_commit`]).
     fn rebuild_autopilot_timers(&mut self) {
         let stored: Vec<(u64, i64)> = self
             .pool
@@ -724,6 +735,10 @@ impl App {
     }
 
     /// The fan-out after a fire stored `land` (the same as a click's): the
+    /// tab chrome and the session's `events` watchers, the footer, the A/B
+    /// arm, the page, and the message log's record — which says what the
+    /// fire found ([`Self::autopilot_fire_over`]), and who set it: the timer
+    /// (§11.7.1, `set at the 18:00 timer`).
     fn autopilot_timer_landed(&mut self, local_id: u64, entry: TimerEntry, revision: u64) {
         self.autopilot_recorded.insert(local_id, revision);
         self.journal_owner_words(local_id);
@@ -762,6 +777,11 @@ impl App {
     }
 
     /// WHAT THE FIRE FOUND on session `local_id` (`sid`, §10.2.3 item 8),
+    /// for its record: the window's harness off (no host, the master
+    /// switch), no agent in the pane (and whether its tab holds other
+    /// panes, [`Self::pane_place`]: the line then says `this pane`, since
+    /// another may run an agent), the agent's own switch off, else work the
+    /// harness lands.
     fn autopilot_fire_over(&self, local_id: u64, sid: &str) -> crate::message_reporters::FireOver {
         use crate::autopilot::HarnessPosture;
         use crate::message_reporters::FireOver;

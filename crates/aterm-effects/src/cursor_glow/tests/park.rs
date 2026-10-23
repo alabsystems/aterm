@@ -1,16 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The park: Ink's rewrite observed as two sync brackets ~40 ms apart, the
-//! caret parked at the start of the input, then the row rewritten to its end
-//! plus the new glyph.
+//! The park: Ink's rewrite observed as two sync brackets ~40 ms apart, the caret parked at the start of the input, then the row rewritten to its end plus the new glyph.
 
 use super::*;
 
 /// S6b: five keys, each echoed as a park to col 2 and a return to the
-/// row's end plus one, ~60 ms apart. One typed echo per key: every
-/// typed cell lit, the prompt cells dark, nothing refused, nothing
-/// forgotten, the return rows judged from the park's origin.
+/// row's end plus one, ~60 ms apart.
 #[test]
 fn an_ink_rewrite_observed_as_park_and_return_is_one_typed_echo_per_key() {
     let g = wide_geom();
@@ -19,7 +15,6 @@ fn an_ink_rewrite_observed_as_park_and_return_is_one_typed_echo_per_key() {
     let mut glow = CursorGlow::default();
     let t0 = Instant::now();
     glow.tick(Some((11, 2)), t0, &c, g, &mut out);
-    // k1: a plain echo.
     glow.note_typed(t0);
     glow.tick(
         Some((11, 3)),
@@ -28,7 +23,6 @@ fn an_ink_rewrite_observed_as_park_and_return_is_one_typed_echo_per_key() {
         g,
         &mut out,
     );
-    // k2..k5: park, then return.
     let mut end = 3u16;
     let mut t = t0;
     for _ in 0..4 {
@@ -99,8 +93,7 @@ fn an_ink_rewrite_observed_as_park_and_return_is_one_typed_echo_per_key() {
 
 /// S6c: three keys typed into a stall, the rewrite arriving with no stamp fresh:
 /// the park is held on the in-flight pool (nothing forgotten), and its return is
-/// the batch's echo from the origin, licensed by the pool. Control: the same
-/// park with an empty pool is refused at once.
+/// the batch's echo from the origin, licensed by the pool.
 #[test]
 fn an_ink_park_after_a_stall_is_held_on_the_in_flight_pool_and_its_return_sweeps_the_batch() {
     let g = wide_geom();
@@ -141,7 +134,6 @@ fn an_ink_park_after_a_stall_is_held_on_the_in_flight_pool_and_its_return_sweeps
     assert_eq!(glow.in_flight_tally().park_returns, 1);
     assert_eq!(bridged(&glow), 0);
 
-    // Control: the same park over an empty pool is refused at once.
     let mut empty = CursorGlow::default();
     let pre = pre_roll(&mut empty, 11, t0, &c, g);
     empty.tick(
@@ -162,7 +154,7 @@ fn an_ink_park_after_a_stall_is_held_on_the_in_flight_pool_and_its_return_sweeps
 /// A park with no return flushes at its own clock: the stamp variant writes a
 /// `licence=key` row from origin to landing (a two-cell jump), consumes the
 /// park's stamp and moves the mirror to the landing; the in-flight variant is
-/// refused and the pool forgotten. A keyless +2 after either is refused.
+/// refused and the pool forgotten.
 #[test]
 fn a_park_with_no_return_flushes_as_todays_verdict() {
     let g = wide_geom();
@@ -208,7 +200,6 @@ fn a_park_with_no_return_flushes_as_todays_verdict() {
         "a keyless +2 after the flush is refused"
     );
 
-    // The in-flight variant: no stamp, one press, no return.
     let mut stalled = CursorGlow::default();
     let pre = pre_roll(&mut stalled, 11, t0, &c, g);
     stalled.note_typed(pre + Duration::from_millis(85));
@@ -235,13 +226,7 @@ fn a_park_with_no_return_flushes_as_todays_verdict() {
     assert_eq!(stalled.in_flight_tally().park_flushed, 1);
 }
 
-/// A one-cell park's flush drains nothing. A key typed, the caret seen one
-/// column left (a repaint parking on the trailing space it just drew), held as a
-/// park and flushed after the window: the flush judges it `typing` and hands v2
-/// a same-row backward `Typed` move with no erase. The host admits a re-anchor
-/// only past two cells (`classify_move`'s `raw_dist > 2`), and the ribbon's
-/// `ribbon::RE_ANCHOR_MIN_CELLS` matches, so no cell is retracted and the mirror
-/// sits at the landing; the three-cell control re-anchors.
+/// A one-cell park's flush drains nothing.
 #[test]
 fn a_one_cell_park_flushed_as_typing_drains_no_cell_of_the_band() {
     let g = wide_geom();
@@ -273,7 +258,6 @@ fn a_one_cell_park_flushed_as_typing_drains_no_cell_of_the_band() {
         glow.tick(Some((11, landing)), park_at, &c, g, &mut out);
         assert!(glow.held_park.is_some(), "{back} back: held");
         assert!(leaving(&glow).is_empty(), "{back} back: nothing while held");
-        // Silence past the window: the flush.
         let quiet = park_at + past_park_window();
         glow.tick(Some((11, landing)), quiet, &c, g, &mut out);
         assert_eq!(glow.in_flight_tally().park_flushed, 1, "{back} back");
@@ -303,8 +287,7 @@ fn a_one_cell_park_flushed_as_typing_drains_no_cell_of_the_band() {
 }
 
 /// A park followed by a Backspace flushes before the erase (its `Move` precedes
-/// the `Erase` in v2's event order) and the retreat keeps its classification. A
-/// scroll does not flush it: the park rides with its row and is judged there.
+/// the `Erase` in v2's event order) and the retreat keeps its classification.
 #[test]
 fn a_park_followed_by_a_backspace_flushes_before_the_erase() {
     let g = wide_geom();
@@ -348,9 +331,6 @@ fn a_park_followed_by_a_backspace_flushes_before_the_erase() {
         "the bs-paired retreat is judged as today"
     );
 
-    // A scroll: the park rides with its row and is judged there
-    // (`a_held_park_rides_a_band_move_or_a_scroll_and_its_return_lands_on_the_moved_row`
-    // covers the return and the off-the-top flush).
     let mut scrolled = CursorGlow::default();
     let pre = pre_roll(&mut scrolled, 11, t0, &c, g);
     scrolled.note_typed(pre + Duration::from_millis(85));
@@ -374,10 +354,7 @@ fn a_park_followed_by_a_backspace_flushes_before_the_erase() {
 
 /// The box-growth wrap re-anchors identically under the park rule: Claude
 /// Code's input box grows a row up, so the caret's row stays constant and the
-/// wrap is a same-row hop far left, then typing from the new column. The park
-/// flushes as the re-anchor (only the landing lit), the +1 follows, ring rows in
-/// order, nothing forgotten, nothing on the in-flight licence, and the cat's
-/// fold pulse arrives dated at the wrap.
+/// wrap is a same-row hop far left, then typing from the new column.
 #[test]
 fn a_box_growth_wrap_reanchors_identically_under_the_park_rule() {
     let g = geom();
@@ -460,15 +437,7 @@ fn a_short_retreat_beside_a_fresh_stamp_keeps_the_hide_bridge_verdict() {
     }
 }
 
-/// A held park rides a band move or a scroll. Codex prints a line every
-/// 10–230 ms while the hand types and Ink's park/return gap is ~40 ms, so a
-/// streamed line between them slides the composer row down (or up, with the
-/// transcript archiving). The park translates under the [`band_row`] law like
-/// every row-addressed member: inside the band it rides `delta`; past the edge
-/// it is judged first in the pre-move space. Likewise a scroll (a transcript
-/// line on the main screen) carries it `row - rows`, flushing only when carried
-/// off the top. The return is recognised on the moved row where the mirror
-/// sits, and the key's cell lights. Both directions.
+/// A held park rides a band move or a scroll.
 #[test]
 fn a_held_park_rides_a_band_move_or_a_scroll_and_its_return_lands_on_the_moved_row() {
     let g = wide_geom();
@@ -537,9 +506,6 @@ fn a_held_park_rides_a_band_move_or_a_scroll_and_its_return_lands_on_the_moved_r
         );
         assert_eq!(glow.v2.caret_mirror(), (moved, 6), "{what}");
     }
-    // Carried past the band's edge or off the top: no honest row, so the park
-    // is judged first in the pre-move space
-    // (`a_park_with_no_return_flushes_as_todays_verdict`'s verdict, at the move).
     /// What carried it, the row the park is held on, and the move.
     type Carry = (&'static str, u16, fn(&mut CursorGlow));
     let carried: [Carry; 2] = [
@@ -568,8 +534,7 @@ fn a_held_park_rides_a_band_move_or_a_scroll_and_its_return_lands_on_the_moved_r
 
 /// The host's pre-roll with the print anchor fed on every echo tick, as
 /// `app_render` feeds it: "I t" typed and echoed per key from `(row, 2)`, caret
-/// at `(row, 5)`. Returns the clock of the last echo and the anchor sequence
-/// reached.
+/// at `(row, 5)`.
 fn pre_roll_anchored(
     glow: &mut CursorGlow,
     row: u16,
@@ -598,12 +563,7 @@ fn pre_roll_anchored(
     (t + Duration::from_millis(3), seq)
 }
 
-/// The return seen on the anchored lane. Ink's second bracket (hide, rewrite,
-/// show) can be sampled mid-bracket: the caret hidden and the print anchor
-/// advanced from the park's origin to the row's new end. The anchored lane
-/// recognises that return on the visible lane's terms and judges
-/// `origin -> end` on the key's own stamp. Shapes: the hidden frame with and
-/// without the print in, and the whole bracket on the visible lane (control).
+/// The return seen on the anchored lane.
 #[test]
 fn a_held_parks_return_is_recognised_on_the_anchored_lane() {
     let g = wide_geom();
@@ -667,9 +627,7 @@ fn a_held_parks_return_is_recognised_on_the_anchored_lane() {
 
 /// The same-end return: a repaint with no new glyph (a spinner or status frame
 /// between park and echo) rewrites the row to its old end, `landing -> origin`,
-/// zero cells. The two moves cancel and the mirror never left the origin, so
-/// the park is dropped silently: nothing consumed, no `Move`, no ring row, and
-/// the stamp survives for its own echo.
+/// zero cells.
 #[test]
 fn a_park_returning_to_its_own_origin_is_not_a_re_anchor() {
     let g = geom();
@@ -683,7 +641,6 @@ fn a_park_returning_to_its_own_origin_is_not_a_re_anchor() {
     glow.tick(Some((3, 2)), at(420), &c, g, &mut out);
     assert!(glow.held_park.is_some(), "the park is held");
     let rows_at_park = ring_rows(&glow).len();
-    // The spinner's repaint: the row rewritten to its old end.
     glow.tick(Some((3, 5)), at(460), &c, g, &mut out);
     assert!(glow.held_park.is_none(), "the park is dropped");
     assert_eq!(
@@ -703,7 +660,6 @@ fn a_park_returning_to_its_own_origin_is_not_a_re_anchor() {
         "the key's stamp survives for its own echo"
     );
     assert_eq!(glow.typed_credits_within(at(460)), 1);
-    // The key's own echo.
     glow.tick(Some((3, 6)), at(520), &c, g, &mut out);
     assert_eq!(
         ring_rows(&glow).last(),
@@ -718,8 +674,6 @@ fn a_park_returning_to_its_own_origin_is_not_a_re_anchor() {
     let tally = glow.in_flight_tally();
     assert_eq!((tally.park_flushed, tally.forgotten), (0, 0), "{tally:?}");
     assert_eq!(glow.admission_tally().declined, 0);
-    // …and a stalled key's rewrite (held on the pool, no stamp fresh)
-    // to its own end is dropped the same way, the pool kept.
     let mut glow = CursorGlow::default();
     three_visible_echoes(&mut glow, t0, &mut out);
     glow.note_typed(at(400));
@@ -743,12 +697,7 @@ fn a_park_returning_to_its_own_origin_is_not_a_re_anchor() {
     assert!(!v2_cols(&glow, 3).contains(&1));
 }
 
-/// A park flushed after its window sweeps no prompt cell. Under a stall Ink's
-/// rewrite can come after the 0.25 s park window, so the park flushes as a typed
-/// re-anchor; its landing sweep (`re_anchor_lays_landing`, for the box-growth
-/// wrap whose landing is the wrapped glyph) runs only if the row probe showed a
-/// glyph at the landing cell when the park was held. Control: a park onto a
-/// program glyph (`ab` printed left of the typing) still sweeps it.
+/// A park flushed after its window sweeps no prompt cell.
 #[test]
 fn a_park_flushed_after_its_window_lights_no_blank_landing() {
     let g = wide_geom();
@@ -776,12 +725,10 @@ fn a_park_flushed_after_its_window_lights_no_blank_landing() {
         assert_eq!(glow.spawns(), 3, "{prefix:?}: the pre-roll");
         let k = t + ms(88);
         glow.note_typed(k);
-        // The park, the row intact.
         let park_at = k + ms(10);
         probe(&mut glow, &row, 2, park_at);
         glow.tick(Some((11, 2)), park_at, &c, g, &mut out);
         assert!(glow.held_park.is_some(), "{prefix:?}: held");
-        // Silence past the window: the flush.
         let quiet = park_at + past_park_window();
         probe(&mut glow, &row, 2, quiet);
         glow.tick(Some((11, 2)), quiet, &c, g, &mut out);
@@ -803,8 +750,6 @@ fn a_park_flushed_after_its_window_lights_no_blank_landing() {
             "{prefix:?}: the landing cell: {:?}",
             v2_cols(&glow, 11)
         );
-        // The late rewrite: refused (the designed verdict), and the
-        // landing cell stays as the flush left it.
         row.push('h');
         let ret = quiet + ms(50);
         probe(&mut glow, &row, 6, ret);
@@ -819,14 +764,7 @@ fn a_park_flushed_after_its_window_lights_no_blank_landing() {
     }
 }
 
-/// A delivered insert echoed through an Ink park is laid. Under Ink's
-/// park-and-rewrite the caret parks left, then the row is rewritten to its end
-/// plus the new text, and a dropped path takes that route. A fresh delivered
-/// insert holds a park like a stamp does, and the rewrite is a return when the
-/// insert's echo shape fits from the park's origin; the insert arm lays
-/// `origin..target`, paying any surplus from pre-park presses. Control: a park
-/// held on the insert alone with no return is flushed at its own clock and
-/// refused, like an unheld keyless park.
+/// A delivered insert echoed through an Ink park is laid.
 #[test]
 fn an_insert_echoed_through_an_ink_park_is_laid() {
     let g = wide_geom();
@@ -834,7 +772,6 @@ fn an_insert_echoed_through_an_ink_park_is_laid() {
     let t0 = Instant::now();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
     let mut out = Vec::new();
-    // No key in flight: the drop alone.
     let mut glow = CursorGlow::default();
     three_visible_echoes(&mut glow, t0, &mut out);
     glow.note_insert_delivered(at(700), InsertWidth::Cells(63));
@@ -856,7 +793,6 @@ fn an_insert_echoed_through_an_ink_park_is_laid() {
     assert_eq!(glow.insert_tally().lit, 1);
     assert_eq!(glow.in_flight_tally().park_returns, 1);
     assert_eq!(glow.admission_tally().declined, 0);
-    // One key in flight ahead of the drop.
     let mut glow = CursorGlow::default();
     three_visible_echoes(&mut glow, t0, &mut out);
     glow.note_typed(at(650));
@@ -880,8 +816,6 @@ fn an_insert_echoed_through_an_ink_park_is_laid() {
         0,
         "the surplus cell paid by the press"
     );
-    // Control: held on the insert alone, no return — flushed at its own
-    // clock and refused like an unheld keyless park.
     let mut glow = CursorGlow::default();
     three_visible_echoes(&mut glow, t0, &mut out);
     glow.note_insert_delivered(at(700), InsertWidth::Cells(63));
@@ -897,13 +831,7 @@ fn an_insert_echoed_through_an_ink_park_is_laid() {
     assert!(glow.held_park.is_none());
 }
 
-/// A late park flush cannot spend a stamp banked after the park. `flush_park`
-/// judges at the park's own clock, and every freshness read is
-/// `now.saturating_duration_since(t) <= window`, true for any `t >= now`. So the
-/// flush judges against the banks as they stood at the park: stamps and presses
-/// banked after it are set aside and put back afterwards, and a refusal's
-/// forget drops only the presses in flight at the park. The later key's own echo
-/// then lights.
+/// A late park flush cannot spend a stamp banked after the park.
 #[test]
 fn a_late_park_flush_cannot_spend_a_stamp_banked_after_the_park() {
     let g = geom();
@@ -923,7 +851,6 @@ fn a_late_park_flush_cannot_spend_a_stamp_banked_after_the_park() {
     let k5 = at(2700);
     glow.note_typed(k5);
     assert_eq!(glow.typed_credits_within(k5), 2);
-    // The flush, on the first tick after the new key.
     glow.tick(Some((3, 2)), k5 + Duration::from_millis(5), &c, g, &mut out);
     assert_eq!(
         ring_rows(&glow).last(),
@@ -946,7 +873,6 @@ fn a_late_park_flush_cannot_spend_a_stamp_banked_after_the_park() {
         "the prompt cell lit: {:?}",
         v2_cols(&glow, 3)
     );
-    // The new key's own echo, from where the rewrite left the caret.
     glow.tick(
         Some((3, 3)),
         k5 + Duration::from_millis(40),
@@ -963,14 +889,7 @@ fn a_late_park_flush_cannot_spend_a_stamp_banked_after_the_park() {
     assert!(v2_cols(&glow, 3).contains(&2));
 }
 
-/// A park flushed before a scroll or band move lays in the moved rows. A
-/// key-class edge (`note_return`) flushes a held park, leaving its v2 events
-/// (the landing `Sweep`, the `Move`) in the engine's buffer in pre-move rows.
-/// Buffered row-addressed events move with the marks: a `Sweep` / `Rewrite`
-/// under the mark law (dropped past the band's edge), a `Move`'s ends under the
-/// position law (saturated). The first shape is the park riding the scroll and
-/// flushing past its window on the moved row: the same cells, laid there
-/// directly.
+/// A park flushed before a scroll or band move lays in the moved rows.
 #[test]
 fn a_park_flushed_before_a_scroll_or_band_move_lays_in_the_moved_rows() {
     let g = geom();

@@ -6,30 +6,41 @@
 use super::*;
 
 /// Floor of the momentum term, deliberately high: a single cold delete is
+/// still clearly acknowledged, and momentum carries it from there.
 pub(super) const ERASE_MOM_FLOOR: f32 = 0.55;
-/// Ceiling on the weight term. `sqrt(cells)` grows the burst with what
+/// Ceiling on the weight term.
 pub(super) const ERASE_WEIGHT_CAP: f32 = 3.4;
-/// Sparkles at drive 1.0. A cold single-character Backspace (drive =
+/// Sparkles at drive 1.0.
 pub(super) const ERASE_POOF_STARS: f32 = 8.0;
 /// Hard ceiling on one poof's sparkle count, well under `MAX_PARTICLES`, so a
+/// held Ctrl-U mash cannot crowd out the rest of the family, with headroom for
+/// a line kill over a word kill.
 pub(super) const ERASE_POOF_CAP: usize = 18;
 /// How wide, in cells, one poof's debris may spread whatever the erased span:
+/// a long span spread evenly would read as a dotted rule, so the span sets the
+/// energy ([`erase_weight`]), not the geometry.
 pub(super) const ERASE_POOF_SPREAD_CELLS: f32 = 9.0;
 /// How much headroom above the erased row the debris needs before it is allowed
+/// to rise.
 pub(super) const ERASE_POOF_LIFT_CELLS: f32 = 1.2;
 /// The hero grain's `cov_scale` (its coverage multiplier in `emit_particles`):
+/// `MIN` at a single character, `MIN + SPAN` at a killed line, so the poof's
+/// central pop grows with the weight of what vanished.
 pub(super) const ERASE_HERO_SCALE_MIN: f32 = 0.80;
 pub(super) const ERASE_HERO_SCALE_SPAN: f32 = 0.09;
 /// The poof's body grains' `cov_scale` (their coverage multiplier in
+/// `emit_particles`).
 pub(super) const ERASE_ROUND_SCALE: f32 = 0.5;
 
 /// The weight term: how big the vanished span reads, in
+/// `1.0..=`[`ERASE_WEIGHT_CAP`].
 #[inline]
 pub(super) fn erase_weight(cells: u16) -> f32 {
     f32::from(cells.max(1)).sqrt().min(ERASE_WEIGHT_CAP)
 }
 
 /// The poof's energy: the momentum term (floored at [`ERASE_MOM_FLOOR`]) times
+/// the [`erase_weight`] of what vanished.
 #[inline]
 pub(super) fn erase_poof_drive(mom: f32, cells: u16) -> f32 {
     (ERASE_MOM_FLOOR + (1.0 - ERASE_MOM_FLOOR) * mom.clamp(0.0, 1.0)) * erase_weight(cells)
@@ -37,6 +48,7 @@ pub(super) fn erase_poof_drive(mom: f32, cells: u16) -> f32 {
 
 impl CursorGlow {
     /// A non-typing move slams the flare, except a fire jump (its meteor carries
+    /// the drama) and a pure navigation move (no light).
     #[inline]
     pub(super) const fn retire_abandoned_light(&mut self, mv: &MoveCtx) {
         let &MoveCtx {
@@ -51,6 +63,8 @@ impl CursorGlow {
     }
 
     /// The aural twin of this spawn: cue the sound the classification earned,
+    /// debiting the key-time click ledger only on the arms a printable key's
+    /// echo can land on.
     pub(super) fn cue_move_sound(&mut self, mv: &MoveCtx) {
         let &MoveCtx {
             pr,
@@ -113,6 +127,8 @@ impl CursorGlow {
     }
 
     /// Per-style spark lifetime for this move: typing wakes chain to the
+    /// observed cadence, jumps take the configured full life (the phaser jump
+    /// a brisk clamp).
     pub(super) fn move_spark_life(&self, mv: &MoveCtx, gap: f32) -> f32 {
         let &MoveCtx { cfg, typing, .. } = mv;
         let full_life = cfg.duration.as_secs_f32().max(0.001);
@@ -187,6 +203,11 @@ impl CursorGlow {
     }
 
     /// Fire's one-line rule (and the phaser's): every flame off the caret's
+    /// new row `cr` (and, after a leap back along it, right of the landing
+    /// `cc`) gutters out over [`Self::FLAME_SNUFF_S`], and every spark not
+    /// born on that row (all of them after a leap back) over
+    /// [`Self::SPARK_SNUFF_S`]: the line it flew over is printed text now
+    /// (an Enter at the bottom carries it onto the echoed command).
     pub(super) fn snuff_off_line(
         &mut self,
         (cr, cc): (u16, u16),
@@ -206,6 +227,10 @@ impl CursorGlow {
     }
 
     /// The flying half of [`Self::snuff_off_line`], for every style that
+    /// sheds grains: each one not born on the caret's new row `cr` (every
+    /// one after a leap back along it) goes out within `within_s` seconds
+    /// (a fire's sparks over [`Self::SPARK_SNUFF_S`], every other style's
+    /// grains at once).
     pub(super) fn snuff_sparks_off_line(
         &mut self,
         cr: u16,
@@ -228,6 +253,7 @@ impl CursorGlow {
     }
 
     /// The per-move light: exactly one arm (the fire meteor, the navigation
+    /// no-wake arm, or the swept comet path).
     #[allow(
         clippy::too_many_arguments,
         reason = "the classified move + the shared per-move scalars spawn derives; a single internal call site"
@@ -411,6 +437,7 @@ impl CursorGlow {
     }
 
     /// Admit one lightning onset at `now` (a jump strike, or a typing crackle
+    /// when `crackle`), recording it when admitted: lightning's flash limiter.
     pub(super) fn admit_bolt(&mut self, now: Instant, crackle: bool) -> bool {
         #[cfg(test)]
         if self.bolts_unlimited {
@@ -432,6 +459,7 @@ impl CursorGlow {
     }
 
     /// Laser: a jump forges a strike along the jump vector; sustained hot
+    /// typing crackles short stray arcs off the charged trail.
     pub(super) fn spawn_lightning(&mut self, mv: &MoveCtx) {
         let &MoveCtx {
             pr,
@@ -523,6 +551,7 @@ impl CursorGlow {
     }
 
     /// The per-style particle burst for this move: jump-scaled showers,
+    /// heat-scaled typing sheds; fire meteor moves defer to the strike.
     pub(super) fn spawn_burst_particles(&mut self, mv: &MoveCtx, fire_meteor: bool) {
         let &MoveCtx {
             pr,
@@ -865,6 +894,9 @@ impl CursorGlow {
     }
 
     /// A jump strike's main channel's shortest life, seconds: one flash that
+    /// is out well inside 120 ms (an Enter at the bottom strikes up through
+    /// the lines it just printed, and a strike that held a sixth of a second
+    /// read as a white bar over them, not a flash).
     pub(super) const STRIKE_LIFE_S: f32 = 0.07;
     /// A strike's forks' shortest life, seconds: they go out first.
     pub(super) const FORK_LIFE_S: f32 = 0.05;
@@ -872,6 +904,8 @@ impl CursorGlow {
     pub(super) const STRIKE_LIFE_SPREAD_S: f32 = 0.03;
 
     /// Forge one lightning bolt from `from` to `to`: midpoint-displacement
+    /// jagging (amplitude halving each round) frozen at spawn, so the strike
+    /// holds its shape.
     pub(super) fn spawn_bolt(
         &mut self,
         from: (f32, f32),
@@ -963,6 +997,8 @@ impl CursorGlow {
     }
 
     /// The meteor's debris: at the strike, embers erupt along the coalesced
+    /// flight path (biased toward the landing) and die fast, so the landing
+    /// row is quiet again well under a second.
     pub(super) fn meteor_strike_fountain(&mut self, m: &Meteor, now: Instant, geom: Geom) {
         let cell = geom.ch as f32;
         let (dx, dy) = (m.x1 - m.x0, m.y1 - m.y0);
@@ -1113,6 +1149,7 @@ impl CursorGlow {
     }
 
     /// Make this frame's row probe the one the emitters read
+    /// ([`Self::probed_text_spans`]).
     #[inline]
     pub(super) const fn rotate_row_probe(&mut self) {
         if self.row_cur_meta.is_some() {
@@ -1124,6 +1161,10 @@ impl CursorGlow {
     }
 
     /// Emit one erase poof over the vanished span `[c0..c1)` of `row` (`n` net
+    /// columns erased) in the style's own language, never squares over glyphs:
+    /// neutral smoke puffs (plus sparkles on rainbow kitty and sparkle, droplets
+    /// on water, ice glints on comet), or quench steam on fire while
+    /// [`Self::note_kill`]'s quench damps the flame.
     #[allow(
         clippy::too_many_arguments,
         reason = "span + clock + config + geometry + cue ownership; kept explicit at the three poof_scan branches"
@@ -1228,6 +1269,7 @@ impl CursorGlow {
     }
 
     /// The erase sparkle poof (v1 rainbow kitty / sparkle): glitter twinkles off
+    /// the vanished span plus one bright white-cored pop at its centre.
     #[allow(
         clippy::too_many_arguments,
         reason = "span + geometry scalars + clock; the two internal call sites are the two erase detectors"
@@ -1297,6 +1339,7 @@ impl CursorGlow {
     }
 
     /// The neutral-grey smoke poof puffs: the hot-cursor smoke's buoyant motion
+    /// with a short life.
     #[allow(
         clippy::too_many_arguments,
         reason = "span + geometry scalars; two internal call sites (spawn_poof)"
@@ -1334,6 +1377,10 @@ impl CursorGlow {
     }
 
     /// Quench steam, the one burst behind a deletion echo
+    /// ([`Self::update_typing_thermals`]) and a killed span
+    /// ([`Self::spawn_poof`]): `puffs` billowing puffs born at `x_at(k)` (±
+    /// half a cell `cw`) on `oy`, every third a tiny bright short-lived hiss
+    /// speck.
     pub(super) fn spawn_quench_steam(
         &mut self,
         puffs: usize,
@@ -1369,6 +1416,10 @@ impl CursorGlow {
 }
 
 /// Lightning's flash law, checked at build time: the onset budget is within
+/// the crate's photosensitivity bound, and the crackle refractory leaves a
+/// second's last slot to a jump strike (crackles alone fill at most
+/// `BOLT_FLASHES_PER_S - 1`), which also holds them above one every third of
+/// a second.
 const _: () = assert!(
     CursorGlow::BOLT_FLASHES_PER_S as f32 <= TWINKLE_FLASH_BOUND_HZ
         && CursorGlow::CRACKLE_REFRACTORY_S > 1.0 / TWINKLE_FLASH_BOUND_HZ
@@ -1377,6 +1428,7 @@ const _: () = assert!(
 );
 
 /// The laser streak's scintillation swells once per cycle; its rate stays
+/// under the same bound.
 const _: () = assert!(
     CursorGlow::LASER_RIPPLE_OMEGA / std::f32::consts::TAU <= TWINKLE_FLASH_BOUND_HZ,
     "the laser ripple flashes over the WCAG 2.3.1 general-flash bound"

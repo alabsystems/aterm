@@ -1,32 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The asciicast v2 codec: the recording model ([`CastHeader`], [`CastEvent`]),
-//! its writer ([`write_into`]) and its reader ([`parse`]).
-//!
-//! Both directions live here, so a header key or a timeline rule is spelled
-//! once. The server lifts its recorder into these values once (rebased), writes
-//! them for `cast` and audits the same values for `cast drift`; the client path
-//! reads a fetched or saved recording back into them. What the writer is given
-//! the reader returns, at the format's resolution (six decimals of a second)
-//! and for headers a producer writes (the `aterm_dropped` rule on [`write_into`]).
-//!
-//! The text is what `asciinema play` and `agg` accept: a JSON header object on
-//! the first line, then one `[t, "o", "<data>"]` line per output burst and one
-//! `[t, "r", "<cols>x<rows>"]` line per resize. Players ignore aterm's own
-//! header keys (`aterm_resize_undo`, `aterm_truncated`, `aterm_dropped`,
-//! `aterm_handoff`).
+//! The asciicast v2 codec: the recording model ([`CastHeader`], [`CastEvent`]), its writer ([`write_into`]) and its reader ([`parse`]).
 
 use aterm_core::grid::ResizeLaw;
 
 use crate::wire::json_escape_into;
 
-/// One recorded event. `D` is the output burst's storage: the server passes its
-/// recorder's shared `Arc<[u8]>`s; the reader owns `Vec<u8>`s.
+/// One recorded event.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CastEvent<D> {
-    /// `[t, "o", data]`: program output. `t` is seconds on the cast's own
-    /// timeline, exactly as `cast` prints it.
+    /// `[t, "o", data]`: program output.
     Output {
         /// Seconds since the (possibly rebased) recording start.
         t: f64,
@@ -55,8 +39,7 @@ impl<D> CastEvent<D> {
     }
 }
 
-/// Bursts the reader could not hand to the recorder (a full writer queue), as
-/// the header's `aterm_dropped` object discloses them.
+/// Bursts the reader could not hand to the recorder (a full writer queue), as the header's `aterm_dropped` object discloses them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CastDrops {
     /// Bursts dropped.
@@ -65,57 +48,34 @@ pub struct CastDrops {
     pub bytes: u64,
 }
 
-/// The header's `aterm_handoff` object: the recording starts at a seamless
-/// update, and the adopted session's output and screen before it are not in it.
+/// The header's `aterm_handoff` object: the recording starts at a seamless update, and the adopted session's output and screen before it are not in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HandoffHeader {
-    /// The build number of the process that handed the session across, when
-    /// it was known (`from_build`, `null` when not).
+    /// The build number of the process that handed the session across, when it was known (`from_build`, `null` when not).
     pub from_build: Option<u64>,
 }
 
 /// The asciicast header's facts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CastHeader {
-    /// Width (cols) in force at the first event: the recording's start, or the
-    /// size after the last resize a drop-oldest eviction removed.
+    /// Width (cols) in force at the first event: the recording's start, or the size after the last resize a drop-oldest eviction removed.
     pub width: u16,
     /// Height (rows), kept with [`width`](Self::width).
     pub height: u16,
-    /// Head events drop-oldest evicted (`aterm_truncated.evicted_events`): the
-    /// leading engine state is incomplete when this is non-zero, and the
-    /// producer rebased every `t` to the first retained event.
+    /// Head events drop-oldest evicted (`aterm_truncated.evicted_events`): the leading engine state is incomplete when this is non-zero, and the producer rebased every `t` to the first retained event.
     pub evicted: u64,
-    /// `Some` when the producer counts drops (0 included); `None` for a
-    /// recording whose producer does not say: a file from an older aterm, or
-    /// from another recorder.
+    /// `Some` when the producer counts drops (0 included); `None` for a recording whose producer does not say: a file from an older aterm, or from another recorder.
     pub dropped: Option<CastDrops>,
-    /// `Some(true)` when the recording says its engine kept the resize undo
-    /// (`aterm_resize_undo`: every aterm since the undo writes it); `None` for a
-    /// recording that does not say, a file from an aterm before it. `cast drift`
-    /// replays a recording that carries the key under that law only
-    /// ([`Undo::Match`](crate::cast_drift::Undo::Match) never second-guesses it),
-    /// so an undo regression in the recording engine still reads `unfaithful`.
+    /// `Some(true)` when the recording says its engine kept the resize undo (`aterm_resize_undo`: every aterm since the undo writes it); `None` for a recording that does not say, a file from an aterm before it.
     pub resize_undo: Option<bool>,
-    /// The resize laws the recording's engine may have laid its rows out
-    /// under, the newest first ([`CastHeader::laws_named`] of its
-    /// `aterm_resize_undo`): each replay runs under one, the next only when
-    /// the ones before it do not reproduce the live screen. 3 names the
-    /// current law (a width change lays the rows out where the rows hand-back
-    /// puts them); 2 the rows hand-back, as two aterms wrote it (before and
-    /// after the pushed rows were owed back); 1 and a recording that does not
-    /// say, the law before it (what is owed forgotten before each resize).
+    /// The resize laws the recording's engine may have laid its rows out under, the newest first ([`CastHeader::laws_named`] of its `aterm_resize_undo`): each replay runs under one, the next only when the ones before it do not reproduce the live screen. 3 names the current law (a width change lays the rows out where the rows hand-back puts them); 2 the rows hand-back, as two aterms wrote it (before and after the pushed rows were owed back); 1 and a recording that does not say, the law before it (what is owed forgotten before each resize).
     pub resize_laws: &'static [ResizeLaw],
-    /// `Some` when the recording starts at a seamless update
-    /// (`aterm_handoff`).
+    /// `Some` when the recording starts at a seamless update (`aterm_handoff`).
     pub handoff: Option<HandoffHeader>,
 }
 
 impl CastHeader {
-    /// The laws a recording whose header carries `aterm_resize_undo: value`
-    /// (`None`: no key) was made under, the newest first: the law before the
-    /// rows hand-back for no key and 0, and the newest law this aterm knows for
-    /// a value only a newer one writes.
+    /// The laws a recording whose header carries `aterm_resize_undo: value` (`None`: no key) was made under, the newest first: the law before the rows hand-back for no key and 0, and the newest law this aterm knows for a value only a newer one writes.
     #[must_use]
     #[inline]
     pub const fn laws_named(value: Option<u64>) -> &'static [ResizeLaw] {
@@ -139,16 +99,13 @@ pub struct Asciicast {
 }
 
 impl Asciicast {
-    /// The recording cut at `until` seconds (later events dropped), to hold a
-    /// saved cast against a screen captured at that instant.
+    /// The recording cut at `until` seconds (later events dropped), to hold a saved cast against a screen captured at that instant.
     #[must_use]
     pub fn until(mut self, until: f64) -> Self {
         self.events.retain(|e| e.t() <= until);
         self
     }
 }
-
-// The writer
 
 /// `aterm_truncated`'s note.
 const TRUNCATED_NOTE: &str = "drop-oldest evicted the head; leading ANSI state incomplete; \
@@ -158,24 +115,7 @@ const TRUNCATED_NOTE: &str = "drop-oldest evicted the head; leading ANSI state i
 const HANDOFF_NOTE: &str = "recording restarted at a seamless update; the output and screen \
                             before it are not in this recording";
 
-/// Append `header` and `events` as asciicast v2 text: the header line, then one
-/// newline-terminated line per event with `t` printed to six decimals. `out`
-/// grows once, by an upper bound on the text before escaping expands a
-/// payload, so a reply built here is one allocation.
-///
-/// The header is `{"version": 2, "width": W, "height": H`, then, in this order:
-/// `"aterm_resize_undo"` when the header says: 0 without the undo, else the
-/// value of the newest law [`CastHeader::resize_laws`] names
-/// ([`ResizeLaw::header_value`]; 1 when it names none); `aterm_truncated` when
-/// `evicted > 0`; `aterm_dropped` when a burst was dropped (a count of none is
-/// omitted, and [`parse`] reads that silence back as zero from a header that
-/// carries the resize-law key, which every producer that counts drops writes);
-/// and `aterm_handoff` when the recording starts at a seamless update.
-///
-/// A payload is JSON-escaped: each maximal valid UTF-8 run through
-/// [`json_escape_into`], and each invalid subpart as one U+FFFD, as
-/// `String::from_utf8_lossy` decodes them. A producer that splits a character
-/// across bursts carries the incomplete lead to the next burst itself.
+/// Append `header` and `events` as asciicast v2 text: the header line, then one newline-terminated line per event with `t` printed to six decimals.
 pub fn write_into<D: AsRef<[u8]>>(out: &mut String, header: &CastHeader, events: &[CastEvent<D>]) {
     use std::fmt::Write as _;
     out.reserve(len_hint(events));
@@ -259,13 +199,7 @@ fn escape_bytes_into(out: &mut String, bytes: &[u8]) {
     }
 }
 
-// The reader
-
-/// Parse the text `cast` answers (and `asciinema rec` writes): a JSON header
-/// object on the first non-blank line, then one `[t, "<kind>", "<data>"]` array
-/// per line. `o` and `r` events are kept; any other kind (`i`, `m`) is skipped.
-/// The header's aterm keys are read when present ([`CastHeader`]). Errors name
-/// the 1-based line.
+/// Parse the text `cast` answers (and `asciinema rec` writes): a JSON header object on the first non-blank line, then one `[t, "<kind>", "<data>"]` array per line.
 pub fn parse(text: &str) -> Result<Asciicast, String> {
     let mut lines = text
         .lines()
@@ -305,9 +239,6 @@ fn parse_header(line: &str) -> Result<CastHeader, String> {
         .unwrap_or(0);
     let law = get("aterm_resize_undo").and_then(Json::as_u64);
     let resize_undo = law.map(|v| v != 0);
-    // aterm counted the reader's drops a day before it wrote the resize-law
-    // key, and writes `aterm_dropped` only when there was one: under the key,
-    // its absence is a count of zero.
     let dropped = match get("aterm_dropped") {
         Some(d) => Some(CastDrops {
             bursts: d.get("bursts").and_then(Json::as_u64).unwrap_or(0),
@@ -496,7 +427,6 @@ impl JsonReader<'_> {
                 {
                     self.i += 1;
                 }
-                // The span is ASCII by the loop's own filter.
                 let lit = String::from_utf8_lossy(&self.s[start..self.i]).into_owned();
                 if lit.parse::<f64>().is_err() {
                     return Err(format!("bad JSON number {lit:?}"));
@@ -528,9 +458,7 @@ impl JsonReader<'_> {
         Ok(v)
     }
 
-    /// A JSON string at the cursor (on its `"`). Escapes decode, `\uXXXX`
-    /// included; a surrogate pair joins into one scalar and a lone surrogate
-    /// becomes U+FFFD.
+    /// A JSON string at the cursor (on its `"`).
     fn string(&mut self) -> Result<String, String> {
         if self.s.get(self.i) != Some(&b'"') {
             return Err("expected a JSON string".to_string());
@@ -551,8 +479,6 @@ impl JsonReader<'_> {
                 None => return Err("unterminated JSON string".to_string()),
                 Some(b'"') => {
                     self.i += 1;
-                    // The source is a `&str` and every escape pushes a whole
-                    // scalar, so this is valid UTF-8; lossy is the total form.
                     return Ok(String::from_utf8_lossy(&out).into_owned());
                 }
                 Some(_) => {
@@ -594,8 +520,6 @@ impl JsonReader<'_> {
                     let scalar = 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00);
                     return Ok(char::from_u32(scalar).unwrap_or('\u{FFFD}'));
                 }
-                // Not a low surrogate: the high one stands alone, and the
-                // escape after it is read on its own.
                 self.i = save;
             }
             return Ok('\u{FFFD}');
@@ -714,10 +638,7 @@ mod tests {
     /// What the writer is given the reader returns: every header field, the
     /// handoff included, and every event, for headers producers write and
     /// timestamps at the format's resolution; the seeds draw every form of
-    /// every field. Invalid payload bytes come back as `from_utf8_lossy` reads
-    /// them. Negative control: outside that domain the omissions show, a count
-    /// of no drops without the resize-law key reads back as unsaid and the key
-    /// without a count as none dropped.
+    /// every field.
     #[test]
     fn write_then_parse_round_trips() {
         let mut forms = std::collections::BTreeSet::new();
@@ -796,8 +717,7 @@ mod tests {
     /// only, `0` `Some(false)`, absent `None` (a file from an aterm before the
     /// undo), the last three under the law before the rows hand-back, a value
     /// only a newer aterm writes under the newest law this one knows, and the
-    /// rest of the header is read as ever. A header with the key and no
-    /// `aterm_dropped` counted no drop.
+    /// rest of the header is read as ever.
     #[test]
     fn the_resize_law_key_is_read_from_the_header() {
         let read = |header: &str| {

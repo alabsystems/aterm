@@ -1,33 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance test for `SupervisorUsageWall`
-//! (`supervisor_usage_wall_model`), driving `aterm_phase::read` and
-//! `decide_turn_end` (`TurnEndState`) across every reachable model state:
-//!
-//! - **Wall detection & placement**: verifies walls with or without background
-//!   shells (`bg`), print-based vs session-window placement (`place_reset`),
-//!   and `Met` after a turn or untaken act (`TurnEndState::untaken_act`).
-//! - **Left wall (`NoticeLeaves`)**: verifies waiting when the notice leaves an
-//!   idle screen, early termination on `PersonTurnServed`, and immunity to
-//!   unrelated limits in `ConversationResumed` / `ArmedConversationResumed`.
-//! - **Take windows (`OwnActTyped`, `MetInWindow`)**: verifies walls appearing
-//!   or answering within the 30 s take window (`held`) are tracked and not
-//!   misread as taken when the window expires.
-//! - **Cancelled notices (`WallAppearsLeft`, `MetLeftUnread`, `PersonWallLeft`,
-//!   `OlderLeftResumed`)**: verifies `TurnEndState::left_answer` over
-//!   `aterm_phase::left_wall` when `Esc` cancels the countdown before the first
-//!   read, and bounds older resumed limits within the session window.
-//! - **Usage credits (`Credits`)**: verifies `Now using usage credits` is not
-//!   treated as a spend wall (`NoWallOnCredits`).
-//! - **Usage tap (`Tapped`, accounts v2 S10a)**: verifies a wall whose notice is
-//!   cut before its reset (`· rese…`) waits on the back-off until the tap reads
-//!   (`TapReads`), then to the tap's reset and its grace through the real
-//!   `TapClock` and `timed`, and that the window rolling over (`TapRollsOver`)
-//!   leaves that reset standing; with no tap source the loop types on the
-//!   back-off (`TapResetIgnored`). Which reading counts is bound by
-//!   `supervise/tap_clock_tests.rs` and `tap_clock_loop_tests.rs`.
-
+//! Tier-1 conformance test binding `SupervisorUsageWall` (`supervisor_usage_wall_model`) to `aterm_phase::read` and `decide_turn_end`.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -80,9 +54,7 @@ fn credits_model() -> Model {
 
 /// [`walled_model`] with the policy's own acts' take windows (`OwnAct = 1`:
 /// the continue policy's act, and the wall's own retry): walked with the real
-/// window ([`timing`]). A `Met` while the window is open is a turn that ran
-/// into the wall again (its point judges the act at once); the wall answering
-/// with no turn run inside the window is `MetInWindow`.
+/// window ([`timing`]).
 fn windowed_model() -> Model {
     aterm_spec::interp::with_consts(&walled_model(), &[("OwnAct", 1)])
 }
@@ -194,9 +166,8 @@ fn timing(m: &Model) -> TurnEndTiming {
 }
 
 /// The screen a state stands for: the wall (`bg`: the shell the tab counted
-/// kept, else the done row and the footer without it), the same wall with its
-/// notice cut (`cut`, [`cut_walled`]), the wall whose notice left the screen
-/// ([`left`]), or a worker at work.
+/// kept, else the done row and the footer without it), the wall whose notice
+/// left the screen ([`left`]), or a worker at work.
 #[derive(Clone, Copy)]
 enum Screen {
     Walled,
@@ -281,9 +252,7 @@ fn rows(st: &State) -> Vec<String> {
 
 /// The REAL [`TurnEndReading::of`] of `read` over `screen`'s rows, made once
 /// per thread for each set of inputs: it is pure, and a walk hands it the same
-/// ones again and again (it was two thirds of a walk's time). A hit is the
-/// same rows, the same `worked` and `reset_at`, and a read EQUAL to the one
-/// it was made from.
+/// ones again and again (it was two thirds of a walk's time).
 fn turn_end_reading(
     screen: Screen,
     read: &aterm_phase::Reading,
@@ -424,7 +393,6 @@ fn reading(
 ) -> TurnEndReading {
     let (r, read) = Screen::of(st).read();
     let mut read = read.clone();
-    // A reader that takes usage credits for a spend wall.
     if run.credits_as_wall && st["credits"] == 1 && read.credits.is_some() {
         let mut w = aterm_phase::Wall {
             kind: aterm_phase::WallKind::Spend,
@@ -441,7 +409,6 @@ fn reading(
         };
         read.wall = Some(w);
     }
-    // Resolve a cancelled limit notice via `left_answer` when `read.wall` is absent.
     if read.wall.is_none()
         && !run.blind_to_left
         && let Some(w) = real
@@ -553,8 +520,6 @@ fn expected(m: &Model, st: &State) -> Verdict {
     if st["held"] == 1 {
         return Verdict::Take;
     }
-    // A cut wall the tap has not read yet: the back-off from the wall, which
-    // the tap's reading decides again before a tick (the loop's edge).
     if st["cut"] == 1 && st["tap"] == 0 {
         return Verdict::Wait(minutes(m, "Rung2"));
     }
@@ -604,11 +569,7 @@ fn mirror(
     let now = real.now;
     let on_the_print = |appeared: Instant| appeared + placed_after_the_print(m, cnst(m, "ResetAt"));
     match action {
-        // The world the decider sees only through the screen: background
-        // work, and the account's tokens back before the named reset.
         "BackgroundStarts" | "BackgroundEnds" | "LimitLiftedEarly" => {}
-        // A turn the credits carry: the worker at work, nothing for the
-        // decider; its end an ordinary point after real work.
         "CreditsServes" => {}
         "CreditsTurnEnds" => {
             let mut quiet = after.clone();
@@ -618,10 +579,6 @@ fn mirror(
             t.said_tail = Some("Stage done.".to_string());
             real.st.observe(&t, now);
         }
-        // The Buggy model's misplaced reset is a wall like any other on the
-        // REAL side: the real loop places the reset where the notice says.
-        // Inside the own act's take window the wall answered that act at
-        // once: no turn ran, no busy read.
         "WallAppears" | "WallAppearsLate" | "WallMisplaced" => {
             real.appeared = now;
             real.reset = Some(on_the_print(now));
@@ -629,19 +586,12 @@ fn mirror(
             let r = reading(after, worked, real.reset, run, &real.st);
             real.st.observe(&r, now);
         }
-        // The limit answers the own act at once and its notice is cancelled
-        // before any read: the first reading is the cancel under the notice,
-        // no turn's work.
         "WallAppearsLeft" => {
             real.appeared = now;
             real.reset = Some(on_the_print(now));
             let r = reading(after, None, real.reset, run, &real.st);
             real.st.observe(&r, now);
         }
-        // A person's prompt at a turn's end the loop looked at (the idle
-        // point folded in first), met by the limit at once and cancelled
-        // before the loop's next read: the first reading is the cancel under
-        // the notice, no turn's work.
         "PersonWallLeft" => {
             let mut quiet = before.clone();
             quiet.insert("wall", 0);
@@ -654,9 +604,6 @@ fn mirror(
             let r = reading(after, None, real.reset, run, &real.st);
             real.st.observe(&r, now);
         }
-        // Another conversation's older cancelled limit inside the own act's
-        // window: read as the act's answer, its past clock placed as the
-        // hostless loop places a reset nothing dated.
         "OlderLeftResumed" => {
             real.appeared = now;
             let placed = older_left_placed(run.uncapped);
@@ -669,8 +616,6 @@ fn mirror(
             let r = reading(after, None, real.reset, run, &real.st);
             real.st.observe(&r, now);
         }
-        // The continue policy's act at a turn's end, recorded as the loop
-        // records one it typed.
         "OwnActTyped" => {
             let typed = TurnEndAction::Type {
                 text: "keep going".to_string(),
@@ -679,8 +624,6 @@ fn mirror(
             let r = reading(before, None, real.reset, run, &real.st);
             real.st.acted(&typed, &r, now);
         }
-        // Found standing, nothing to date its print: the session rule's
-        // placement, in the past.
         "WallFoundSitting" => {
             real.appeared = now;
             real.reset = Some(
@@ -690,9 +633,6 @@ fn mirror(
             let r = reading(after, None, real.reset, run, &real.st);
             real.st.observe(&r, now);
         }
-        // A tick past an act's take window is the window's end: the loop's
-        // wait on it runs out, and it reads the point again, which judges the
-        // act (`turn_end_now`).
         "Tick" => {
             if run.answer_read_as_taken
                 && before["held"] == 1
@@ -717,13 +657,7 @@ fn mirror(
             }
             real.st.acted(&a, &r, now);
         }
-        // The wall answers the act: printed again after a turn, or standing
-        // with the line held and no turn run. Read BEFORE the point is folded
-        // in, as the loop reads it: a print the loop watched, placed where the
-        // notice says.
         "Met" => {
-            // A `Met` while the act's window is open is a turn that ran into
-            // the wall (`MetInWindow` is the answer with none run).
             let worked = (!run.unseen || before["held"] == 1).then_some(SHORT);
             let answered = !run.blind_to_untaken && real.st.untaken_act().is_some();
             if worked.is_some() || answered {
@@ -732,12 +666,6 @@ fn mirror(
             let r = reading(after, worked, real.reset, run, &real.st);
             real.st.observe(&r, now);
         }
-        // The wall answers the retry at once, no turn run, inside its window:
-        // read as the loop reads it — a wall standing where its own act went
-        // untaken answered that act, a print placed where the notice says —
-        // and folded in with no point yet.
-        // ... and its notice cancelled before any read: the first reading is
-        // the cancel under the answer's notice.
         "MetInWindow" | "MetLeftUnread" => {
             let answered = !run.blind_to_untaken && real.st.untaken_act().is_some();
             if answered {
@@ -755,8 +683,6 @@ fn mirror(
             real.st.observe(&t, now);
             real.tap = None;
         }
-        // A wall whose notice is cut, a turn having run into it: read with no
-        // reset, its tap clock started at this first read.
         "WallAppearsCut" => {
             real.appeared = now;
             real.cut_at = real.unix;
@@ -765,10 +691,6 @@ fn mirror(
             let r = reading(after, Some(LONG), None, run, &real.st);
             real.st.observe(&r, now);
         }
-        // The tap's run after the wall was read: the wall's window full, its
-        // reset `CutAt` ticks after the wall. Then its run at the reset: the
-        // window dropped. Each folded into the clock as the loop folds it, and
-        // the point read again with what `timed` makes of it.
         "TapReads" | "TapRollsOver" => {
             let r = reading(after, None, None, run, &real.st);
             let kind = r.wall.expect("the cut wall");
@@ -806,15 +728,10 @@ fn mirror(
             let r = reading(after, None, real.reset, run, &real.st);
             real.st.observe(&r, now);
         }
-        // The notice leaves the screen: the left screen is a point, no work
-        // since. Another conversation resumed there: its history is the
-        // point, no work since.
         "NoticeLeaves" | "ConversationResumed" | "ArmedConversationResumed" => {
             let r = reading(after, None, real.reset, run, &real.st);
             real.st.observe(&r, now);
         }
-        // A person's turn the account served, no read having seen it busy:
-        // its screen read by the real reader, and folded in.
         "PersonTurnServed" => {
             let r = person_turned();
             let read = aterm_phase::read(Some("claude"), &r, Some(2));
@@ -830,7 +747,6 @@ fn mirror(
             }
             real.st.observe(&t, now);
         }
-        // The defects: not the real code's moves.
         "WallMasked"
         | "GivesUp"
         | "MetKeepsTheGuess"
@@ -855,7 +771,6 @@ fn mirror(
 /// notice named exactly while the model's wall stands — shown, acted on, or
 /// left (`wall != 0`).
 fn waits_as_modelled(real: &Real, st: &State) -> bool {
-    // A cut wall names its reset once the tap read it.
     let named = st["wall"] != 0 && (st["cut"] == 0 || st["tap"] >= 1);
     real.st.waits_on_named_reset() == named
 }
@@ -939,8 +854,6 @@ fn walk_until(m: &Model, strict: bool, run: Run, first_off: bool) -> Walked {
                 {
                     *early.entry(action.name).or_default() += 1;
                 }
-                // Checked at the transition, not at the state: the walk
-                // keeps the real side of the first path to reach a state.
                 if !run.masked && !waits_as_modelled(&r, &next) {
                     assert!(
                         !strict,
@@ -967,8 +880,6 @@ fn walk_until(m: &Model, strict: bool, run: Run, first_off: bool) -> Walked {
 #[test]
 fn tier1_the_real_reader_and_decider_continue_a_usage_wall_exactly_where_the_model_allows() {
     let m = walled_model();
-    // A wall that answers an act after a turn ran into it, and one that
-    // answers with the line held and no turn run.
     for unseen in [false, true] {
         let run = Run {
             unseen,
@@ -1025,8 +936,6 @@ fn the_loop_that_ties_no_continuation_to_its_limit_ends_the_wait_on_a_resume_at_
         resumed - early,
         "every resume at the armed wall in its reset's last minute ends the wait"
     );
-    // ... and the model's defect is that loop: it types into the standing
-    // limit before its tokens are back.
     let buggy = aterm_spec::interp::with_buggy(&m, 1);
     let mut st = buggy.init_state();
     for a in [
@@ -1043,8 +952,6 @@ fn the_loop_that_ties_no_continuation_to_its_limit_ends_the_wait_on_a_resume_at_
 #[test]
 fn tier1_a_limit_met_inside_the_own_acts_take_window_is_tracked_where_the_model_says() {
     let m = windowed_model();
-    // A wall that answers after the window too: a turn that ran into it, or
-    // the line held with no turn run.
     for unseen in [false, true] {
         let walked = walk(
             &m,
@@ -1055,9 +962,6 @@ fn tier1_a_limit_met_inside_the_own_acts_take_window_is_tracked_where_the_model_
             },
         );
         let states = &walked.states;
-        // The continue policy's act (`tries = 0`) and the retry, each with a
-        // wall read inside its window, with its notice left there, and with
-        // its notice cancelled before any read.
         let count = |pick: &dyn Fn(&State) -> bool, retried: bool| {
             states
                 .iter()
@@ -1094,8 +998,6 @@ fn tier1_a_limit_met_inside_the_own_acts_take_window_is_tracked_where_the_model_
 #[test]
 fn the_buggy_model_and_every_past_loop_disagree_with_the_real_code() {
     let walled = walled_model();
-    // The mask is the shell's: walked with no notice leaving the screen,
-    // where a wall the masked reader never read would be left unread too.
     let unleft = aterm_spec::interp::with_consts(&walled, &[("Leaves", 0)]);
     let buggy = aterm_spec::interp::with_buggy(&walled, 1);
     let windowed = windowed_model();
@@ -1255,10 +1157,6 @@ fn tier1_the_tap_times_a_cut_wall_exactly_where_the_model_acts() {
 /// THE LOOP WITHOUT THE TAP SOURCE is not the model: at a wall whose notice is
 /// cut it waits on the policy's back-off and types there — before the reset
 /// the tap read — the model's `TapResetIgnored`, caught by `NoBlindAct`.
-/// Walked so, the real side disagrees at cut walls alone, among them the
-/// back-off's tick with the tap's reset read; the model with the tap
-/// switched off (`Tapped = 0`, no cut wall) agrees with the same loop
-/// everywhere — the control is the tap's alone.
 #[test]
 fn the_loop_without_the_tap_types_into_a_cut_wall_on_its_back_off() {
     let m = tapped_model();
@@ -1287,7 +1185,6 @@ fn the_loop_without_the_tap_types_into_a_cut_wall_on_its_back_off() {
     );
     let off = walk(&walled_model(), false, run).off;
     assert!(off.is_empty(), "{off:?}");
-    // ... and the model's defect is that loop.
     let buggy = aterm_spec::interp::with_buggy(&m, 1);
     let mut st = buggy.init_state();
     for a in [

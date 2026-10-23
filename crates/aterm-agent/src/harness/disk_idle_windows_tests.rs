@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for tier 3 on Windows: clause 5's `.cmd` shims atpkg installs by
-//! are read back as the programs they run, each laid by atpkg's own writer;
-//! every path of two sources is placed by the one path rule (a session's
-//! `C:\x`, a kernel's `C:\X\`, a candidate's `\\?\C:\x`); a session whose
-//! working directory is unknown keeps every candidate; the walks start at
-//! the path's own drive and name each folder's volume by its serial.
-
+//! Windows tier-3 disk-idle tests: `.cmd` shims, path canonicalization, 8.3 short paths, and per-drive volume walks.
 use super::*;
 use crate::harness::disk::tests::{Tmp, lay_target, now_after_write};
 use aterm_sysprobe::volumes::{Mount, NETWORK};
@@ -16,7 +10,6 @@ const DAY: i64 = 86_400;
 
 /// A checkout at `<tmp>\repo`: `.git\index`, `.git\logs\HEAD`, a manifest
 /// and a source file, and its build directory `target\` (one profile).
-/// Answers the canonical checkout and build directory (`\\?\C:\…`).
 fn checkout(tmp: &Tmp) -> (PathBuf, PathBuf) {
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(repo.join(".git").join("logs")).expect("git");
@@ -81,9 +74,7 @@ fn two_drives() -> Table {
 /// A SESSION'S WORKING DIRECTORY IS PLACED BY THE ONE RULE: resolved, in
 /// any spelling against a candidate's verbatim one; not resolved (gone, or
 /// unreadable), on Windows it keeps every candidate of its volume — and of
-/// every volume when it names none (a share, no table). NEGATIVE CONTROLS:
-/// a resolved folder beside the candidate, and an unresolved one on another
-/// local volume, keep nothing.
+/// every volume when it names none (a share, no table).
 #[test]
 fn a_session_cwd_is_placed_by_the_one_rule_and_an_unresolved_one_by_its_volume() {
     let t = two_drives();
@@ -114,9 +105,7 @@ fn a_session_cwd_is_placed_by_the_one_rule_and_an_unresolved_one_by_its_volume()
 /// whose working directory is UNKNOWN (the reason named), a session working
 /// in it spelled plain and in capitals, one whose folder is gone from its
 /// volume, an installed link resolving into it spelled so, and a build
-/// directory nested in it spelled so. A folder beside it, resolved, keeps
-/// nothing. The device is set by hand from the one identity export (the
-/// survey's own reading of it is `target::dev_of`'s).
+/// directory nested in it spelled so.
 #[test]
 fn tier_3_on_a_windows_checkout_holds_every_spelling_and_an_unknown_cwd() {
     let tmp = Tmp::new("idle-win-assess");
@@ -125,10 +114,6 @@ fn tier_3_on_a_windows_checkout_holds_every_spelling_and_an_unknown_cwd() {
     let now = now_after_write(8);
     let mut t = super::super::scan_target(&target, now, 7, true).expect("a build directory");
     t.origin = Origin::Checkout { root: repo.clone() };
-    // The survey's device and profile readings are `target`'s own (its
-    // Windows reading of a profile's caches is its own work): this test
-    // judges the clauses after them, so it states them as read — the one
-    // profile `lay_target` lays, last used when it was written.
     t.device = aterm_sysprobe::volumes::file_id(&target, true).map(|id| id.dev);
     t.walk_cut_short = None;
     if t.profiles.is_empty() {
@@ -231,8 +216,7 @@ fn tier_3_on_a_windows_checkout_holds_every_spelling_and_an_unknown_cwd() {
 
 /// CLAUSE 4B PLACES THE KERNEL'S SPELLING: a process whose working directory
 /// the kernel writes plain, in capitals, with a trailing separator, uses the
-/// candidate canonical as `\\?\C:\…`, and keeps it. NEGATIVE CONTROL: one
-/// working beside it keeps nothing.
+/// candidate canonical as `\\?\C:\…`, and keeps it.
 #[test]
 fn clause_4b_places_the_kernels_spelling_on_its_candidate() {
     use aterm_uds::holders::{PathScan, PathUse};
@@ -313,15 +297,7 @@ impl Drop for Waiting {
 /// one scan of the running processes over two
 /// candidates, and a `cmd.exe` of this test's started in the first one's
 /// `target\debug` spelled with 8.3 short names (a process keeps the spelling
-/// it was started in as its working directory). The first candidate is kept
-/// by it; the second stays one. The scan reports the use in the spelling it
-/// placed it by (spelled long), so each candidate places it by the same rule;
-/// reported as the kernel wrote it, it placed under neither, and the one
-/// process held EVERY candidate. NEGATIVE CONTROL: the same child started in
-/// the same folder spelled long gives the same answers. Only the processes
-/// this test started are read ([`aterm_uds::holders::scan_path_users_of_within`],
-/// each name waited for up to the hang detector). PREMISE, stated where it
-/// fails: the volume generates short names and the child keeps the spelling.
+/// it was started in as its working directory).
 #[test]
 fn clause_4b_keeps_only_the_candidate_a_short_spelled_working_directory_is_in() {
     let tmp = Tmp::new("idle-win-4b-short");
@@ -378,18 +354,7 @@ fn clause_4b_keeps_only_the_candidate_a_short_spelled_working_directory_is_in() 
 /// folder by folder, before the mount table places it — so on the table as
 /// read it resolves where its long spelling does, and where the table calls
 /// its volume remote it is never opened: `Unresolved`, as the long spelling
-/// is. The old gate could place the short name on no mount, so called it
-/// not remote and opened it (`canonicalize`, on a share that may stall) —
-/// a real folder, which the open resolved: this row is the "never opened"
-/// check. A share's short name, which only its server could spell, is
-/// `Unresolved` too, from the table alone (the key cannot place it); that
-/// row pins the ANSWER only, which the old gate's failed open gave as well.
-/// What pins that a share is decided from the table, never read: a share
-/// spelled long walks to `Ok(None)`, placed remote, where any read of a
-/// `.invalid` host could only fail — a walk that read a component before
-/// placing it fails there. NEGATIVE CONTROL: on the table as read both
-/// spellings resolve to the folder (its key). PREMISE, stated where it
-/// fails: the volume generates short names.
+/// is.
 #[test]
 fn a_short_spelled_session_cwd_is_opened_only_on_a_local_volume() {
     let tmp = Tmp::new("idle-win-cwd-short");
@@ -439,8 +404,6 @@ fn a_short_spelled_session_cwd_is_opened_only_on_a_local_volume() {
 /// or the root of a drive the table calls remote, holds no component for a
 /// step to place, and resolves to nothing — as a link onto one does, which
 /// ends the walk there (the old walk answered the root it ended on).
-/// NEGATIVE CONTROL: a local drive's root resolves to itself. From the table
-/// alone: nothing is opened.
 #[test]
 fn a_walk_that_ends_on_a_remote_root_resolves_to_nothing() {
     let t = two_drives();
@@ -462,11 +425,7 @@ fn a_walk_that_ends_on_a_remote_root_resolves_to_nothing() {
 }
 
 /// THE WALKS START AT THE PATH'S OWN DRIVE: a path resolves from its drive's
-/// root (never `/`), through a junction to the folder it names. The
-/// working-tree walk names each folder's volume by its serial and is quiet
-/// on a checkout written days ago. NEGATIVE CONTROLS: a missing component,
-/// a relative or MSYS-style path and a table not read whole resolve to
-/// nothing; a file written now is no quiet working tree.
+/// root (never `/`), through a junction to the folder it names.
 #[test]
 fn the_walks_start_at_the_paths_own_drive() {
     let tmp = Tmp::new("idle-win-walks");
@@ -507,9 +466,7 @@ fn the_walks_start_at_the_paths_own_drive() {
 
 /// A WORKTREE'S GIT DIRECTORY IS PLACED ON ITS DRIVE AND READ: a `.git` file
 /// naming an absolute git directory (as `git worktree add` writes it) is
-/// placed through the mount table and its `index` dated. NEGATIVE CONTROLS:
-/// an index written now keeps the checkout, and with no table read whole
-/// the git directory is not read at all.
+/// placed through the mount table and its `index` dated.
 #[test]
 fn a_worktrees_git_directory_is_placed_on_its_drive_and_read() {
     let tmp = Tmp::new("idle-win-gitdir");
@@ -592,9 +549,7 @@ fn an_atpkg_shim_reads_back_as_the_program_it_runs() {
 /// A SHIM'S PROGRAM IS RECORDED AS THE CANDIDATES ARE SPELLED: resolved,
 /// verbatim and in its case on disk, so a shim naming a program inside a
 /// build directory — through any case, or a junction — is a link into that
-/// candidate's canonical path. NEGATIVE CONTROLS: the shim's own text never
-/// matches the canonical candidate (the comparison clause 5 makes), and a
-/// program that is not there cannot be resolved, which keeps every candidate.
+/// candidate's canonical path.
 #[test]
 fn a_shims_program_is_recorded_as_the_candidates_are_spelled() {
     let tmp = Tmp::new("idle-shim-link");

@@ -1,23 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The colour, shell-integration and title sub-projections of a
-//! [`TerminalCheckpoint`](super::TerminalCheckpoint): state an application set
-//! that an in-session update must carry.
-//!
-//! * [`ColorRepr`] carries the colour state as a diff from the host's
-//!   configured baseline, so adopting into a terminal whose theme changed
-//!   applies the application's overrides (OSC 4, OSC 10/11) on the new theme.
-//!   The XTPUSHCOLORS stack travels as [`ColorOverridesRepr`] diffs too, so a
-//!   pop after the handoff also lands on the new theme.
-//! * [`ShellRepr`] carries the OSC 133/633 phase, the in-progress mark and
-//!   block, the completed ones still readable, and the monotonic counters
-//!   observers key on. Rows are absolute and each grid's absolute row counter
-//!   is carried, so a mark names the same line after the handoff and a command
-//!   running across the update still completes on its D.
-//! * [`TitleRepr`] carries the window title (OSC 0/2), the icon name (OSC 0/1)
-//!   and the XTWINOPS title stack (CSI 22/23 t), restored as OSC input
-//!   ([`Terminal::restore_title`]).
+//! The colour, shell-integration and title sub-projections of a [`TerminalCheckpoint`](super::TerminalCheckpoint): state an application set that an in-session update must carry.
 
 use std::collections::VecDeque;
 
@@ -41,10 +25,7 @@ pub struct PaletteOverrideRepr {
     pub rgb: Rgb,
 }
 
-/// A dynamic colour slot whose live value may be "unset" (cursor, selection
-/// foreground/background). Present in a [`ColorRepr`] only when the slot
-/// differs from the host's configured value; `rgb: None` then means the
-/// application explicitly cleared it.
+/// A dynamic colour slot whose live value may be "unset" (cursor, selection foreground/background).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ColorSlotRepr {
@@ -52,9 +33,7 @@ pub struct ColorSlotRepr {
     pub rgb: Option<Rgb>,
 }
 
-/// One XTPUSHCOLORS (OSC 30001) stack entry, whole: the shape a parent that
-/// predates [`ColorRepr::stack_overrides`] writes. Read (as a diff from this
-/// engine's baseline), never written.
+/// One XTPUSHCOLORS (OSC 30001) stack entry, whole: the shape a parent that predates [`ColorRepr::stack_overrides`] writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ColorStackEntryRepr {
@@ -72,12 +51,7 @@ pub struct ColorStackEntryRepr {
     pub selection_foreground: Option<Rgb>,
 }
 
-/// The colour slots an application overrode, as a diff from the host's
-/// configured baseline. `Default` is "nothing overridden".
-///
-/// The one colour-diff form: [`ColorRepr`]'s live slots, each XTPUSHCOLORS
-/// stack entry, and what `apply_config` replays over a new theme, so a
-/// program's colours survive any baseline change.
+/// The colour slots an application overrode, as a diff from the host's configured baseline.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ColorOverridesRepr {
@@ -139,8 +113,7 @@ impl ColorOverridesRepr {
     }
 }
 
-/// The colour state applications set, as a diff from the configured baseline
-/// (see the module docs). `Default` is "nothing overridden".
+/// The colour state applications set, as a diff from the configured baseline (see the module docs).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ColorRepr {
@@ -180,15 +153,13 @@ pub struct ColorRepr {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub selection_foreground: Option<ColorSlotRepr>,
-    /// The XTPUSHCOLORS stack, oldest first, as whole entries. Read only when
-    /// `stack_overrides` is empty; never written.
+    /// The XTPUSHCOLORS stack, oldest first, as whole entries.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Vec::is_empty")
     )]
     pub stack: Vec<ColorStackEntryRepr>,
-    /// The XTPUSHCOLORS stack, oldest first, each entry a diff from the
-    /// configured baseline. A parent that predates this field carries `stack`.
+    /// The XTPUSHCOLORS stack, oldest first, each entry a diff from the configured baseline.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Vec::is_empty")
@@ -242,8 +213,7 @@ impl ColorState {
             .map_or_else(|| ColorPalette::default_color(index), |p| p.get(index))
     }
 
-    /// The live colours as a diff from the configured baseline: what a program
-    /// set (OSC 4/10/11/12/17/19/21) and nothing the theme supplies.
+    /// The live colours as a diff from the configured baseline: what a program set (OSC 4/10/11/12/17/19/21) and nothing the theme supplies.
     pub(super) fn capture_overrides(&self) -> ColorOverridesRepr {
         let palette = (0..=u8::MAX)
             .filter_map(|index| {
@@ -273,9 +243,7 @@ impl ColorState {
         }
     }
 
-    /// Set every live slot to its configured baseline — the palette only when
-    /// `palette` (a caller whose palette writes are gated passes the gate).
-    /// The stack is left alone.
+    /// Set every live slot to its configured baseline — the palette only when `palette` (a caller whose palette writes are gated passes the gate).
     pub(super) fn restore_baseline(&mut self, palette: bool) {
         if palette {
             match self.configured_palette.clone() {
@@ -290,8 +258,7 @@ impl ColorState {
         self.selection_foreground = self.configured_selection_foreground;
     }
 
-    /// Write a diff's slots over the live colours — its palette entries only
-    /// when `palette`. Slots the diff leaves out keep their live value.
+    /// Write a diff's slots over the live colours — its palette entries only when `palette`.
     pub(super) fn apply_overrides(&mut self, overrides: &ColorOverridesRepr, palette: bool) {
         if palette && !overrides.palette.is_empty() {
             let live = self.palette_mut();
@@ -342,11 +309,7 @@ impl ColorState {
     }
 }
 
-/// The titles a program set: the window title, the icon name, and the
-/// XTWINOPS title stack, whole. `Default` is a terminal nothing has titled.
-///
-/// Every string is what the engine stores, already capped and stripped of controls;
-/// a restore does both again ([`Terminal::restore_title`]), as the wire is untrusted.
+/// The titles a program set: the window title, the icon name, and the XTWINOPS title stack, whole.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TitleRepr {
@@ -362,20 +325,13 @@ pub struct TitleRepr {
         serde(default, skip_serializing_if = "String::is_empty")
     )]
     pub icon: String,
-    /// The title stack, bottom first, as `(icon name, window title)` pairs —
-    /// the engine's own order. An entry pushed for one of the two holds an
-    /// empty string for the other, read back as a slot that push did not save
-    /// when reading the legacy form without [`Self::stack_saved`].
+    /// The title stack, bottom first, as `(icon name, window title)` pairs — the engine's own order.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Vec::is_empty")
     )]
     pub stack: Vec<(String, String)>,
     /// Presence of the icon and window slots in each stack entry, bottom first.
-    /// Emitted only when the stack contains a saved empty title, which the legacy
-    /// string pairs cannot distinguish from an unsaved slot. A missing entry uses
-    /// the legacy rule (a sanitized nonempty string means saved). Older consumers
-    /// can still read `stack`, with their original ambiguity for saved empties.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Vec::is_empty")
@@ -414,8 +370,7 @@ pub struct ShellSpanRepr {
     pub command_start_col: Option<u16>,
     /// Absolute row where output started.
     pub output_start_row: Option<u64>,
-    /// Absolute row where output ended (a mark's `output_end_row`, a block's
-    /// `end_row`).
+    /// Absolute row where output ended (a mark's `output_end_row`, a block's `end_row`).
     pub end_row: Option<u64>,
     /// Exit code.
     pub exit_code: Option<i32>,
@@ -443,29 +398,21 @@ pub struct OutputBlockRepr {
     pub state: u8,
     /// Whether the user collapsed it.
     pub collapsed: bool,
-    /// A full clear blanked rows it reads its text from after its command
-    /// finished (`OutputBlock::text_cleared`). Absent from a predecessor that
-    /// did not record it, and left out when false, so that state re-encodes as
-    /// it was written.
+    /// A full clear blanked rows it reads its text from after its command finished (`OutputBlock::text_cleared`).
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_false"))]
     pub text_cleared: bool,
-    /// Its command rows were lost while it was being built: a full clear
-    /// blanked them or a scrollback erase took them
-    /// (`OutputBlock::command_text_cleared`). Absent from a predecessor that
-    /// did not record it, and left out when false, as `text_cleared` is.
+    /// Its command rows were lost while it was being built: a full clear blanked them or a scrollback erase took them (`OutputBlock::command_text_cleared`).
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_false"))]
     pub command_text_cleared: bool,
     /// Rows, times and text.
     pub span: ShellSpanRepr,
 }
 
-/// Shell-integration state (see the module docs). `Default` is a terminal
-/// that never saw a mark.
+/// Shell-integration state (see the module docs).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ShellRepr {
-    /// A→B→C→D phase: `0` none, `1` prompt, `2` command input, `3` executing,
-    /// `4` finished.
+    /// A→B→C→D phase: `0` none, `1` prompt, `2` command input, `3` executing, `4` finished.
     #[cfg_attr(feature = "serde", serde(default))]
     pub phase: u8,
     /// Coarse shell state: `0` ground, `1` prompt, `2` entering, `3` executing.
@@ -501,36 +448,25 @@ pub struct ShellRepr {
     /// Completed-command counter observers key on; never replayed backwards.
     #[cfg_attr(feature = "serde", serde(default))]
     pub completed_seq: u64,
-    /// Started-command counter (accepted OSC 133/633 C); never replayed
-    /// backwards, nor restored below the carried blocks that reached C.
-    /// Absent from a predecessor that did not count it, and left out at `0`,
-    /// so a terminal that never started a command encodes as a predecessor's
-    /// did.
+    /// Started-command counter (accepted OSC 133/633 C); never replayed backwards, nor restored below the carried blocks that reached C.
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero_seq"))]
     pub started_seq: u64,
     /// The shell signs its own cwd report (`ShellIntegrationState::signs_cwd`).
-    /// Absent from a predecessor that did not read signatures, and left out when
-    /// false.
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_false"))]
     pub signs_cwd: bool,
-    /// The shell finished a command it never marked with `C`
-    /// (`ShellIntegrationState::unmarked_run`). Absent or left out when false.
+    /// The shell finished a command it never marked with `C` (`ShellIntegrationState::unmarked_run`).
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_false"))]
     pub unmarked_run: bool,
-    /// The phase predates the nonce the shell just took: only its next accepted
-    /// `A` makes the phase current. Absent from predecessors and left out when false.
+    /// The phase predates the nonce the shell just took: only its next accepted `A` makes the phase current.
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_false"))]
     pub phase_stale: bool,
-    /// An OSC 7 held at the prompt of a shell that does not sign its own
-    /// (`ShellIntegrationState::held_cwd`), which the shell's next `A` applies.
+    /// An OSC 7 held at the prompt of a shell that does not sign its own (`ShellIntegrationState::held_cwd`), which the shell's next `A` applies.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub held_cwd: Option<CwdReportRepr>,
-    /// The cwd a foreground job's report replaced at the shell's prompt
-    /// (`ShellIntegrationState::cwd_before_job`), which comes back once the host
-    /// says no job holds the foreground.
+    /// The cwd a foreground job's report replaced at the shell's prompt (`ShellIntegrationState::cwd_before_job`), which comes back once the host says no job holds the foreground.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Option::is_none")
@@ -538,9 +474,7 @@ pub struct ShellRepr {
     pub cwd_before_job: Option<CwdReportRepr>,
 }
 
-/// A reported cwd as a checkpoint carries it: the path it stores (none: it
-/// clears the cwd) and the host its OSC 7 named (none: a local one). Installed
-/// only when the engine would store it from an OSC 7.
+/// A reported cwd as a checkpoint carries it: the path it stores (none: it clears the cwd) and the host its OSC 7 named (none: a local one).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CwdReportRepr {
@@ -769,22 +703,16 @@ impl Terminal {
         }
     }
 
-    /// Write a program's colour diff over this terminal's configured colours
-    /// (the stack excluded). Sets the slots only: [`Self::apply_color_repr`]
-    /// adds the callbacks a handoff fires, `apply_config` its own change set.
+    /// Write a program's colour diff over this terminal's configured colours (the stack excluded).
     #[inline]
     pub(super) fn apply_color_overrides(&mut self, overrides: &ColorOverridesRepr) {
         self.color.apply_overrides(overrides, true);
     }
 
-    /// Apply a carried [`ColorRepr`] over this terminal's configured colours, taking
-    /// the OSC mutation's authority and damage path for the restored foreground,
-    /// background, cursor and palette.
+    /// Apply a carried [`ColorRepr`] over this terminal's configured colours, taking the OSC mutation's authority and damage path for the restored foreground, background, cursor and palette.
     pub(super) fn apply_color_repr(&mut self, repr: &ColorRepr) {
         use super::ColorTarget;
         self.apply_color_overrides(&repr.overrides());
-        // A parent that predates `stack_overrides` sent whole entries; they become
-        // diffs from this terminal's baseline.
         let stack: Vec<ColorOverridesRepr> = if repr.stack_overrides.is_empty() {
             repr.stack
                 .iter()
@@ -814,19 +742,7 @@ impl Terminal {
         }
     }
 
-    /// Project the shell-integration state (see [`ShellRepr`]). Completed marks
-    /// and blocks every row of which is older than `oldest_carried_row` name
-    /// only lines the carry does not hold, so they are left behind, oldest
-    /// first up to the first one that names a line it holds: the ids carried
-    /// stay one run, by the rule `forget_erased_history` keeps them by
-    /// ([`super::handler::block_rows_end`]). It goes by the last row each
-    /// names, not its prompt row, which a full clear can move above the
-    /// previous block's (a `clear` moves the rows of the block it caught
-    /// running to the cleared screen's top, and Ctrl-L restarts the prompt
-    /// there). One whose earlier rows the carry does not hold reads them as
-    /// `BlockText::Evicted`, as the live terminal does once the ring evicts
-    /// them. The in-progress mark and block always travel (a running command
-    /// must still complete).
+    /// Project the shell-integration state (see [`ShellRepr`]).
     pub(super) fn capture_shell_repr(&self, oldest_carried_row: u64) -> ShellRepr {
         let s = &self.shell;
         ShellRepr {
@@ -891,13 +807,7 @@ impl Terminal {
         }
     }
 
-    /// Install a carried [`TitleRepr`] as if a program had sent it: every string
-    /// capped and stripped as the OSC handler stores one, and the stack cut to its
-    /// bottom [`TITLE_STACK_MAX_DEPTH`] entries, as a live engine drops a push onto a
-    /// full stack. A real window-title change bumps [`Terminal::title_epoch`].
-    ///
-    /// Not the host's `set_title`, which caps but does not sanitize: a carried title
-    /// is a program's words read back from a file, so it gets the program's rules.
+    /// Install a carried [`TitleRepr`] as if a program had sent it: every string capped and stripped as the OSC handler stores one, and the stack cut to its bottom [`TITLE_STACK_MAX_DEPTH`] entries, as a live engine drops a push onto a full stack.
     pub fn restore_title(&mut self, repr: &TitleRepr) {
         let window = carried_title(&repr.window);
         if *self.title.window != *window {
@@ -928,8 +838,7 @@ impl Terminal {
             .collect();
     }
 
-    /// Install a carried [`ShellRepr`], bounding what a wire can hand in to the
-    /// engine's own caps.
+    /// Install a carried [`ShellRepr`], bounding what a wire can hand in to the engine's own caps.
     pub(super) fn apply_shell_repr(&mut self, repr: &ShellRepr) {
         let s = &mut self.shell;
         s.phase = phase_from_wire(repr.phase);
@@ -952,14 +861,8 @@ impl Terminal {
             .cloned()
             .map(OutputBlockRepr::into_block)
             .collect();
-        // Monotonic counters only move forward, even onto a terminal that already
-        // counted commands of its own.
         s.next_block_id = s.next_block_id.max(repr.next_block_id);
         s.completed_seq = s.completed_seq.max(repr.completed_seq);
-        // Each carried block that reached C took a C of its own, so the count
-        // never reads below them: a predecessor that did not count C's carries
-        // none, and a live shell's stream must not read as one that never
-        // started a command.
         let proven = s
             .output_blocks
             .iter()
@@ -967,9 +870,6 @@ impl Terminal {
             .filter(|b| matches!(b.state, BlockState::Executing | BlockState::Complete))
             .count() as u64;
         s.started_seq = s.started_seq.max(repr.started_seq).max(proven);
-        // The shell's habits and the reports its prompt left pending are the
-        // carry's: a report held at this engine's previous prompt, or a cwd
-        // its own job replaced, belongs to a shell this projection replaces.
         s.signs_cwd = repr.signs_cwd;
         s.unmarked_run = repr.unmarked_run;
         s.phase_stale = repr.phase_stale;
@@ -978,15 +878,8 @@ impl Terminal {
             .cwd_before_job
             .as_ref()
             .and_then(CwdReportRepr::to_report);
-        // Nor is the stored cwd's host: the restore installs the carried cwd,
-        // which this engine's host never qualified. The shell's next OSC 7
-        // names it again.
         s.cwd_host = None;
-        // The cwd installed beside this projection is the carry's: no report
-        // this engine counted stands behind it (`Terminal::reported_cwd_seq`).
         s.cwd_carried = true;
-        // Nor is the last D's copy: a block id it names may belong to this
-        // terminal's own blocks rather than the carried ones.
         s.last_finished = None;
     }
 }

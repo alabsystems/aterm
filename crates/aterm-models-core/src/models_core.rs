@@ -126,6 +126,8 @@ pub fn terminal_modes_model() -> Model {
 }
 
 /// Which defect a wake-latch model's `Buggy = 1` replays: one machine
+/// ([`damage_to_present_model`], [`wake_heal_evidence_model`]) held to three laws, each with the
+/// mutant that breaks it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WakeLatchMutant {
     /// A one-shot latch: no heal, no watchdog deadline and no re-post, so a lost wake starves its session's presents.

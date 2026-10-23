@@ -295,6 +295,7 @@ pub(crate) const DESCENT_EM: f64 = 0.22;
 const HEADER_BASE_FULL: f64 = 11.5;
 const HEADER_BASE_FOLDED: f64 = 9.5;
 /// Where the header's hit region ends: Full's row 0 starts its hit at
+/// 16 − 1.5 (§11.1), Folded's at 12.5 (§11.2).
 const HEADER_HIT_FULL: f64 = 14.5;
 const HEADER_HIT_FOLDED: f64 = 12.5;
 /// Where the per-minute gridlines start (§3.1, §4.1).
@@ -307,6 +308,7 @@ const MARK_EM: f64 = 1.1;
 /// The gap between an amount and its state words (rule S).
 const STATE_GAP: f64 = 6.0;
 /// The strips' cell periods, seconds (§5.5): 60 × 10 s, 30 × 20 s and
+/// 20 × 30 s.
 const STRIP_PERIODS: [u32; 3] = [10, 20, 30];
 
 /// The chrome face's advances the deck measures with: the UI faces the rasterizer draws `TextFace::Ui` and `UiBold` in, or the pen's 0.6 em placeholder while none is installed (as in headless tests).
@@ -340,6 +342,7 @@ pub(crate) fn deck_metrics() -> Arc<FaceMetrics> {
 }
 
 /// A text and its advance at 1 pt in the deck's face, regular and bold:
+/// measured once, so fitting it at any size is arithmetic.
 #[derive(Clone, Debug, PartialEq)]
 struct Txt {
     s: String,
@@ -363,6 +366,7 @@ fn txts(forms: impl IntoIterator<Item = String>, m: &FaceMetrics) -> Vec<Txt> {
 }
 
 /// Rule F (§6.0): the first form whose advance fits `room`, else the last
+/// form cut with "…".
 fn fit(forms: &[Txt], room: f64, pt: f64, bold: bool, m: &FaceMetrics) -> String {
     if let Some(t) = forms.iter().find(|t| t.w(pt, bold) <= room + 0.01) {
         return t.s.clone();
@@ -373,6 +377,7 @@ fn fit(forms: &[Txt], room: f64, pt: f64, bold: bool, m: &FaceMetrics) -> String
 }
 
 /// The scope bar's segments as shares of the row's capacity (§6), each
+/// `0..=1`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct BarFill {
     /// The machine's; none on Tokens, which has no Global figure (§6.6).
@@ -386,6 +391,7 @@ struct BarFill {
 }
 
 /// A row's state for where Details is absent (rule S) and for the fslim
+/// header (§4.4).
 #[derive(Clone, Debug, PartialEq)]
 struct StateTxt {
     state: State,
@@ -430,11 +436,13 @@ struct RowWords {
     heat_now: Option<f32>,
     pct: Txt,
     /// The sentence in the strip's place (§6.2, §6.6), or "reading…": its
+    /// forms, longest first (rule F).
     strip_text: Option<Vec<Txt>>,
     /// The strip's columns at each of [`STRIP_PERIODS`].
     cols: [Vec<HeatCell>; 3],
     bar: Option<BarFill>,
     /// The amount's forms on each ladder: Det (with the compact forms that
+    /// repeat no Details figure after them), Cols, NoCols.
     amount: [Vec<Txt>; 3],
     state: Option<StateTxt>,
     scope: ScopeTxt,
@@ -459,13 +467,24 @@ pub(crate) struct DeckWords {
     reading: bool,
 }
 
+/// The OS resources the Resource Monitor deck draws (Tokens moved to the AI
+/// CLI standard harness template).
+pub(crate) const DECK_RESOURCES: [Resource; 6] = [
+    Resource::Cpu,
+    Resource::Gpu,
+    Resource::Memory,
+    Resource::Disk,
+    Resource::Network,
+    Resource::Processes,
+];
+
 impl DeckWords {
     /// `input`'s snapshot in words, measured with `m`.
     pub(crate) fn new(input: &DeckInput<'_>, m: &FaceMetrics) -> Self {
         let Some(snap) = input.snap else {
             return Self::reading(m);
         };
-        let rows = Resource::ALL
+        let rows = DECK_RESOURCES
             .iter()
             .map(|&res| RowWords::new(res, snap, input.tab_key, &input.locale, m))
             .collect();
@@ -499,8 +518,9 @@ impl DeckWords {
     }
 
     /// Before the first snapshot: each row's name and "reading…" where its
+    /// strip goes.
     fn reading(m: &FaceMetrics) -> Self {
-        let rows = Resource::ALL
+        let rows = DECK_RESOURCES
             .iter()
             .map(|&res| RowWords {
                 res,
@@ -605,6 +625,8 @@ impl RowWords {
 }
 
 /// The scope bar's segments for `res` (§6): Global, aterm and Tab where
+/// the scopes count in the row's unit (CPU, Memory, Processes; Tokens
+/// without Global), the machine's alone where they do not.
 fn bar_fill(res: Resource, view: &ResourceView, snap: &Snapshot) -> Option<BarFill> {
     let cap = view.binding().capacity;
     let share = |fig: &ScopeFig| -> Option<f32> {
@@ -753,6 +775,7 @@ impl Table {
     }
 
     /// Row `r`'s hit band: its cell, and half the gap to each neighbour
+    /// (§11.1, §11.2).
     fn band(&self, r: u32) -> (f64, f64) {
         let gap = self.rows.pitch - self.rows.cell;
         let top = self.rows.top(r);
@@ -786,6 +809,7 @@ pub(crate) fn kind_ink(i: &VitalsInks, k: InkKind) -> Rgb {
 }
 
 /// A grid of core squares on whole device px: its origin, its pitch and a
+/// square's side.
 struct Lattice {
     x: f32,
     y: f32,
@@ -923,7 +947,7 @@ impl<'a> Deck<'a> {
         }
     }
 
-    /// `s` at `(x, base)` in pt; answers its advance. `room` is the column
+    /// `s` at `(x, base)` in pt; answers its advance.
     #[expect(
         clippy::too_many_arguments,
         reason = "a text run's place, size, weight, ink and column"
@@ -986,6 +1010,7 @@ impl<'a> Deck<'a> {
     }
 
     /// `[mark] text`: the mark at `x + 0.42 em`, the words after 1.1 em;
+    /// answers the advance.
     #[expect(
         clippy::too_many_arguments,
         reason = "a marked run's place, mark, size, weight, ink and column"
@@ -1083,6 +1108,7 @@ impl<'a> Deck<'a> {
     }
 
     /// A column with no reading: a 1 px outline, or a 1 px tick along the
+    /// bottom of a cell under 4 × 4 px (§9.2).
     fn hollow_cell(&mut self, (x, y, w, h): Rect, radius: f32, small: bool) {
         let ink = self.inks.hollow;
         if small {
@@ -1101,6 +1127,7 @@ impl<'a> Deck<'a> {
     }
 
     /// The per-minute gridlines in the strip's inter-cell gaps from `y0` to
+    /// `y1`, broken over the rows in `holes` (§3.1).
     fn gridlines(&mut self, strip: &Strip, y0: f64, y1: f64, holes: &[(f64, f64)]) {
         if !self.draw {
             return;
@@ -1208,6 +1235,7 @@ impl<'a> Deck<'a> {
     }
 
     /// The amount slot, saying the row's state where Details is absent
+    /// (rule S, §6.0).
     fn amount(&mut self, col: Col, base: f64, pt: f64, row: &RowWords, t: &Table) {
         let room = Some((col.x, col.end()));
         let words_ink = self.inks.words;
@@ -1275,6 +1303,8 @@ impl<'a> Deck<'a> {
     }
 
     /// Details (rule D, §6.0): for each kept set, from every clause down to
+    /// the keep-only set, every clause long, then shortened one at a time
+    /// from the lowest priority up; the first arrangement that fits wins.
     fn details(&mut self, col: Col, base: f64, clauses: &[ClauseTxt]) {
         let pt = SMALL_PT;
         let sep = Txt::new(" \u{b7} ", self.m);
@@ -1449,6 +1479,8 @@ impl<'a> Deck<'a> {
     }
 
     /// The lattice a grid of core squares `side` pt at `pitch` pt sits on
+    /// from `(x, y)` pt: a pitch of whole device px (rounded down, so the
+    /// grid never outgrows its plan) and a square at least 1 px under it.
     fn lattice(&self, x: f64, y: f64, pitch: f64, side: f64) -> Lattice {
         let step = (pitch * self.s).floor().max(2.0) as f32;
         Lattice {
@@ -1460,6 +1492,7 @@ impl<'a> Deck<'a> {
     }
 
     /// The core at column `col` and row `row` of `grid`; hollow when
+    /// unreadable.
     fn core(&mut self, grid: &Lattice, (col, row): (usize, usize), heat: Option<f32>, radius: f32) {
         if !self.draw {
             return;
@@ -1479,6 +1512,7 @@ impl<'a> Deck<'a> {
     }
 
     /// The cores block (wide, mid; §3.4): the title on the header line, then
+    /// each cluster's caption and squares.
     fn cores_block(&mut self, at: Col, top0: f64, words: &DeckWords) {
         let clusters = words.clusters();
         let room = Some((at.x, at.end()));
@@ -1521,6 +1555,7 @@ impl<'a> Deck<'a> {
     }
 
     /// A Cores row in `room` (§3.4, §4.5): per cluster its count and name,
+    /// then its squares in `mode`, or the count in words.
     fn cores_row(
         &mut self,
         room: Col,
@@ -1679,6 +1714,7 @@ impl<'a> Deck<'a> {
     }
 
     /// One key item at `x` on the header line (rule K, §3.6): drawn the way
+    /// the strip beside it draws.
     fn key(&mut self, item: KeyItem, x: f64, base: f64, small: bool) {
         let words2 = self.inks.words2;
         let top = base - 7.0;
@@ -1772,7 +1808,7 @@ impl<'a> Deck<'a> {
             .filter(|(row, _)| row.strip_text.is_some())
             .map(|(_, r)| (rows.top(r) - gap / 2.0, rows.top(r) + rows.cell + gap / 2.0))
             .collect();
-        let last = rows.top(Resource::ALL.len() as u32 - 1) + rows.cell;
+        let last = rows.top(DECK_RESOURCES.len() as u32 - 1) + rows.cell;
         self.gridlines(&plan.strip, GRID_FROM_FULL, last, &holes);
         match plan.cores {
             CoresAt::Block { at, divider } => {
@@ -1787,7 +1823,7 @@ impl<'a> Deck<'a> {
                 }
             }
             CoresAt::Row(room) => {
-                let r = Resource::ALL.len() as u32;
+                let r = DECK_RESOURCES.len() as u32;
                 let top = rows.top(r);
                 let ink = self.inks.words;
                 self.text(
@@ -1924,6 +1960,8 @@ impl<'a> Deck<'a> {
 }
 
 /// A Folded block's worst state for an fslim header (§4.4): the worst of
+/// its rows' states, a ◢ before a ● at one level (the well's order, §6),
+/// else the first among equals; "+N" for the other rows that have one.
 fn block_state<'w>(rows: &[&'w RowWords], x: f64) -> Option<HeadState<'w>> {
     let with: Vec<(&RowWords, &StateTxt)> = rows
         .iter()
@@ -2128,6 +2166,8 @@ impl crate::App {
     }
 
     /// The sill's floor, words and accent: the front tab's session's own
+    /// theme when it draws one (Choose Tab Theme, `theme session set`), else
+    /// the instance's.
     fn sill_floor(&self, tab_key: Option<u64>) -> (Rgb, Rgb, Rgb) {
         let rgb = |c: u32| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
         let theme = self.theme;
@@ -2177,6 +2217,7 @@ impl crate::App {
     }
 
     /// A cheap hash of everything the card's prims read: the snapshot's
+    /// sequence, the form, the geometry and placement, the tab and the inks.
     fn deck_input_key(&self, f: &DeckFrame) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -2199,6 +2240,8 @@ impl crate::App {
     }
 
     /// The card's prims, laid out only when their inputs moved
+    /// (`WindowState::deck_memo` keeps the last input key and prims' print;
+    /// `WindowState::stats_hits` the hit regions).
     fn deck_layout(&self, wid: crate::WindowId, f: &DeckFrame, key: u64) -> Vec<DrawPrim> {
         let input = DeckInput {
             snap: self.vitals.snapshot.as_deref(),
@@ -2370,6 +2413,8 @@ impl crate::App {
 const A11Y_TITLE: &str = "Stats deck, last 10 minutes";
 
 /// A share (1 is 100 %) as a meter's value: a whole percent, as the % column
+/// prints it, never past 100 (the over mark and the words carry the
+/// excess); `None` when unknown.
 #[cfg(a11y_tree)]
 fn meter_pct(share: Option<f32>) -> Option<f32> {
     share.filter(|v| v.is_finite()).map(|v| {
@@ -2398,7 +2443,7 @@ pub(crate) fn stats_a11y_group(
             &empty
         }
     };
-    let meters = Resource::ALL
+    let meters = DECK_RESOURCES
         .iter()
         .map(|&res| StatsMeter {
             name: words::resource_name(res).into(),
@@ -2488,6 +2533,7 @@ pub(crate) mod tests {
     };
 
     /// Gives this test thread's windows the stats bars, as glass gives a
+    /// real window ([`stats_drawn_on`]), until the guard drops.
     #[must_use]
     pub(crate) fn attach_stats() -> Attached {
         TESTS_ATTACHED.with(|c| c.set(true));
@@ -2504,6 +2550,9 @@ pub(crate) mod tests {
     }
 
     /// Only the Deck takes room: the head the grid fit reads is the same for
+    /// the sill and off, so the config apply's re-grid predicate agrees with
+    /// the head for every pair of forms, and a sill ↔ off change re-grids
+    /// nothing.
     #[test]
     fn only_a_change_into_or_out_of_the_deck_moves_the_head() {
         const CELL: usize = 28;
@@ -2531,7 +2580,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// T-G6: the head sites and `deck_frame` agree. Every site that derives
+    /// T-G6: the head sites and `deck_frame` agree.
     #[test]
     fn head_sites_agree() {
         use aterm_window::dpi::PhysicalSize;
@@ -2617,6 +2666,7 @@ pub(crate) mod tests {
     }
 
     /// The setting forces the form on every window event and never moves it
+    /// otherwise; a frame not sized yet keeps it.
     #[test]
     fn the_deck_size_setting_forces_the_form() {
         let mut app = crate::App::headless_for_test();
@@ -2711,6 +2761,7 @@ pub(crate) mod tests {
     }
 
     /// A snapshot after three readings: ten cores in two clusters, memory, a
+    /// GPU, a volume, aterm with one tab running claude.
     pub(crate) fn snapshot() -> Snapshot {
         let mut v = aterm_vitals::Vitals::new();
         let tabs = vec![TabRoot {
@@ -2816,6 +2867,9 @@ pub(crate) mod tests {
     }
 
     /// T-V9 on every built-in theme's band (Stats Deck v2 §9.4): the inks
+    /// solved on the band ground, with the band's words and accent as
+    /// [`DeckFrame`] solves them, hold every Deck floor the ground leaves in
+    /// reach.
     #[test]
     fn deck_inks_hold_on_every_built_in_band() {
         let blends = matches!(
@@ -2897,6 +2951,10 @@ pub(crate) mod tests {
     };
 
     /// Where the Deck sits in the head: under macOS's titlebar at the head's
+    /// foot, as it always has; where the strip is the window's band (Linux,
+    /// Windows) at the head's top, with the band's lift less the Deck so the
+    /// band keeps its whole height under it (the Linux lane's
+    /// `proof-20261019-174123` found it over the band's middle).
     #[cfg(unix)]
     #[test]
     fn the_deck_takes_the_heads_foot_under_a_titlebar_and_its_top_over_a_band() {
@@ -2946,6 +3004,9 @@ pub(crate) mod tests {
     }
 
     /// A point over the Deck is not a strip column, though a point above the
+    /// grid clamps onto the strip's row: a press there is the Deck's
+    /// (`App::stats_press`), and a pointer resting on it lights no tab and
+    /// steps no strip drag.
     #[cfg(unix)]
     #[test]
     fn a_point_over_the_deck_is_no_strip_column() {
@@ -3014,6 +3075,7 @@ pub(crate) mod tests {
     }
 
     /// Before the first snapshot each row names itself and says "reading…"
+    /// where its strip goes, and nothing is a hit yet.
     #[test]
     fn before_the_first_snapshot_the_deck_says_it_is_reading() {
         let empty = Snapshot::default();
@@ -3033,12 +3095,14 @@ pub(crate) mod tests {
                 assert!(said.iter().any(|s| s == name), "{form:?}: {said:?}");
             }
             let reading = said.iter().filter(|s| *s == "reading\u{2026}").count();
-            assert_eq!(reading, Resource::ALL.len(), "{form:?}: {said:?}");
+            assert_eq!(reading, DECK_RESOURCES.len(), "{form:?}: {said:?}");
             assert!(hits.is_empty(), "{form:?}: {hits:?}");
         }
     }
 
     /// The header's scope labels carry their inks as swatches (§3.5): the
+    /// machine's, aterm's and the tab's, so a newcomer reads which ink is
+    /// whose without a legend.
     #[test]
     fn every_bar_label_carries_its_ink_as_a_key() {
         let snap = snapshot();
@@ -3061,6 +3125,8 @@ pub(crate) mod tests {
     }
 
     /// A meter's value is the share as a whole percent up to 100, but a
+    /// share above 0 that the % column prints as "<1%" keeps a tenth, so it
+    /// is not 0 beside words that say "less than 1 percent".
     #[cfg(a11y_tree)]
     #[test]
     fn a_meter_under_half_a_percent_is_not_zero() {
@@ -3075,7 +3141,7 @@ pub(crate) mod tests {
         assert_eq!(words::pct(Some(0.004)), "<1%");
     }
 
-    /// T-G12 (Stats Deck v2 §12): the deck reads as one group of seven
+    /// T-G12 (Stats Deck v2 §12): the deck reads as one group of six OS
     #[cfg(a11y_tree)]
     #[test]
     fn a11y_meters() {
@@ -3086,7 +3152,14 @@ pub(crate) mod tests {
             utc_offset_s: 0,
         };
         let said = |snap: &Snapshot| stats_a11y_group(Some(snap), Some(FRONT), &MAC);
-        let meter = |snap: &Snapshot, res: Resource| said(snap).meters[res.index()].clone();
+        let meter = |snap: &Snapshot, res: Resource| {
+            let want = words::resource_name(res);
+            said(snap)
+                .meters
+                .into_iter()
+                .find(|m| m.name == want)
+                .expect("meter in DECK_RESOURCES")
+        };
 
         let calm = scene(Scene::Calm);
         let g = said(&calm);
@@ -3094,17 +3167,9 @@ pub(crate) mod tests {
         let names: Vec<&str> = g.meters.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(
             names,
-            [
-                "CPU",
-                "GPU",
-                "Memory",
-                "Disk",
-                "Network",
-                "Tokens",
-                "Processes"
-            ]
+            ["CPU", "GPU", "Memory", "Disk", "Network", "Processes"]
         );
-        for (m, &res) in g.meters.iter().zip(&Resource::ALL) {
+        for (m, &res) in g.meters.iter().zip(&DECK_RESOURCES) {
             assert_eq!(m.words, words::row_sentence(res, &calm, Some(FRONT), &MAC));
         }
         assert_eq!(g.meters[0].value, Some(98.0));
@@ -3158,10 +3223,8 @@ pub(crate) mod tests {
             missing: Some(NoFigure::NoAgent),
         };
         first.resources[Resource::Tokens.index()].tabs = vec![(FRONT, no_agent)];
-        let tokens = meter(&first, Resource::Tokens);
-        assert_eq!(tokens.value, None);
         assert_eq!(
-            tokens.words,
+            words::row_sentence(Resource::Tokens, &first, Some(FRONT), &MAC),
             "Tokens: learning aterm's peak, 1 of 10 minutes. aterm 3.1 thousand per minute. Tab \
              2 has no agent. Not read for 9 of the last 10 minutes. Input 410 thousand tokens \
              per minute, cache re-reads included. Plan limit not read."
@@ -3173,11 +3236,11 @@ pub(crate) mod tests {
         assert_eq!((gpu.value, gpu.words.as_str()), (None, "GPU: not read."));
 
         let reading = stats_a11y_group(None, Some(FRONT), &MAC);
-        for (m, &res) in reading.meters.iter().zip(&Resource::ALL) {
+        for (m, &res) in reading.meters.iter().zip(&DECK_RESOURCES) {
             assert_eq!(m.value, None, "{m:?}");
             assert_eq!(m.words, format!("{}: reading.", words::resource_name(res)));
         }
-        assert_eq!(reading.meters.len(), Resource::ALL.len());
+        assert_eq!(reading.meters.len(), DECK_RESOURCES.len());
         assert!(reading.cores.is_empty());
     }
 }

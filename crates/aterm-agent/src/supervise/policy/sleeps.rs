@@ -105,6 +105,8 @@ pub struct Boot {
 }
 
 /// Whether this host's kernel spells its boot id lower-case: Linux's and
+/// Android's `/proc/sys/kernel/random/boot_id` do, macOS's
+/// `kern.bootsessionuuid` does not.
 const KERNEL_SPELLS_LOWER: bool = cfg!(any(target_os = "linux", target_os = "android"));
 
 impl Boot {
@@ -288,6 +290,7 @@ impl SleepBook {
 }
 
 /// The system's last sleep (`last`), where it is one that ended before the
+/// look at `now_ms`.
 fn before_look(now_ms: i64, last: Option<(i64, i64)>) -> Option<(i64, i64)> {
     last.filter(|&(slept, woke)| slept < woke && woke <= now_ms)
 }

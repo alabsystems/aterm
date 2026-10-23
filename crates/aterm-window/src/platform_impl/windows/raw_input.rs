@@ -4,9 +4,6 @@
 // Derived from winit 0.30.13 src/platform_impl/windows/raw_input.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by Andrew Yates for the aterm project in 2026; see the repository NOTICE.
-// Use a null pointer when unregistering the raw-input target.
-
 use std::mem::{self, size_of};
 use std::ptr;
 
@@ -143,9 +140,6 @@ pub fn register_all_mice_and_keyboards_for_raw_input(
     mut window_handle: HWND,
     filter: DeviceEvents,
 ) -> bool {
-    // RIDEV_DEVNOTIFY: receive hotplug events
-    // RIDEV_INPUTSINK: receive events even if we're not in the foreground
-    // RIDEV_REMOVE: don't receive device events (requires NULL hwndTarget)
     let flags = match filter {
         DeviceEvents::Never => {
             window_handle = std::ptr::null_mut();
@@ -194,7 +188,6 @@ fn button_flags_to_element_state(
     down_flag: u32,
     up_flag: u32,
 ) -> Option<ElementState> {
-    // We assume the same button won't be simultaneously pressed and released.
     if util::has_flag(button_flags, down_flag) {
         Some(ElementState::Pressed)
     } else if util::has_flag(button_flags, up_flag) {
@@ -225,48 +218,15 @@ pub fn get_keyboard_physical_key(keyboard: RAWKEYBOARD) -> Option<PhysicalKey> {
         }
     };
     let scancode = if keyboard.MakeCode == 0 {
-        // In some cases (often with media keys) the device reports a scancode of 0 but a
-        // valid virtual key. In these cases we obtain the scancode from the virtual key.
         unsafe { MapVirtualKeyW(keyboard.VKey as u32, MAPVK_VK_TO_VSC_EX) as u16 }
     } else {
         keyboard.MakeCode | extension
     };
     if scancode == 0xe11d || scancode == 0xe02a {
-        // At the hardware (or driver?) level, pressing the Pause key is equivalent to pressing
-        // Ctrl+NumLock.
-        // This equivalence means that if the user presses Pause, the keyboard will emit two
-        // subsequent keypresses:
-        // 1, 0xE11D - Which is a left Ctrl (0x1D) with an extension flag (0xE100)
-        // 2, 0x0045 - Which on its own can be interpreted as Pause
-        //
-        // There's another combination which isn't quite an equivalence:
-        // PrtSc used to be Shift+Asterisk. This means that on some keyboards, pressing
-        // PrtSc (print screen) produces the following sequence:
-        // 1, 0xE02A - Which is a left shift (0x2A) with an extension flag (0xE000)
-        // 2, 0xE037 - Which is a numpad multiply (0x37) with an extension flag (0xE000). This on
-        //             its own it can be interpreted as PrtSc
-        //
-        // For this reason, if we encounter the first keypress, we simply ignore it, trusting
-        // that there's going to be another event coming, from which we can extract the
-        // appropriate key.
-        // For more on this, read the article by Raymond Chen, titled:
-        // "Why does Ctrl+ScrollLock cancel dialogs?"
-        // https://devblogs.microsoft.com/oldnewthing/20080211-00/?p=23503
+        // Ignore prefix scancodes emitted before Pause (0xE11D) and PrintScreen (0xE02A).
         return None;
     }
     let physical_key = if keyboard.VKey == VK_NUMLOCK {
-        // Historically, the NumLock and the Pause key were one and the same physical key.
-        // The user could trigger Pause by pressing Ctrl+NumLock.
-        // Now these are often physically separate and the two keys can be differentiated by
-        // checking the extension flag of the scancode. NumLock is 0xE045, Pause is 0x0045.
-        //
-        // However in this event, both keys are reported as 0x0045 even on modern hardware.
-        // Therefore we use the virtual key instead to determine whether it's a NumLock and
-        // set the KeyCode accordingly.
-        //
-        // For more on this, read the article by Raymond Chen, titled:
-        // "Why does Ctrl+ScrollLock cancel dialogs?"
-        // https://devblogs.microsoft.com/oldnewthing/20080211-00/?p=23503
         PhysicalKey::Code(KeyCode::NumLock)
     } else {
         scancode_to_physicalkey(scancode as u32)
@@ -286,22 +246,7 @@ pub fn get_keyboard_physical_key(keyboard: RAWKEYBOARD) -> Option<PhysicalKey> {
             | KeyCode::Numpad9,
         ) = physical_key
         {
-            // On Windows, holding the Shift key makes numpad keys behave as if NumLock
-            // wasn't active. The way this is exposed to applications by the system is that
-            // the application receives a fake key release event for the shift key at the
-            // moment when the numpad key is pressed, just before receiving the numpad key
-            // as well.
-            //
-            // The issue is that in the raw device event (here), the fake shift release
-            // event reports the numpad key as the scancode. Unfortunately, the event
-            // doesn't have any information to tell whether it's the
-            // left shift or the right shift that needs to get the fake
-            // release (or press) event so we don't forward this
-            // event to the application at all.
-            //
-            // For more on this, read the article by Raymond Chen, titled:
-            // "The shift key overrides NumLock"
-            // https://devblogs.microsoft.com/oldnewthing/20040906-00/?p=37953
+            // Ignore synthetic Shift events emitted by Windows when Shift overrides NumLock.
             return None;
         }
     }

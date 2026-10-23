@@ -2959,6 +2959,12 @@ impl PetBrain {
     /// if let Some(star) = pet.note_v2_offer(&offer) { v2.catch_star(star, now); }
     /// # }
     /// ```
+    /// # use aterm_effects::{cursor_glow::Geom, kitty_pet::{PetBrain, PetFrame}, rainbow_kitty::{Engine, companion}};
+    /// # use aterm_time::Instant;
+    /// # fn offer_after_tick(v2: &mut Engine, pet: &mut PetBrain, pet_frame: &PetFrame, geom: Geom, now: Instant) {
+    /// let offer = v2.pet_offer(geom, companion::PetOnGlass::of(pet_frame, geom));
+    /// if let Some(star) = pet.note_v2_offer(&offer) { v2.catch_star(star, now); }
+    /// # }
     pub fn note_v2_offer(&mut self, offer: &PetOffer) -> Option<StarCatch> {
         self.mote_rgb = offer.mote_rgb;
         if let Some(at) = offer.perk_at

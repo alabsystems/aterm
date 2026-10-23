@@ -2,61 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Packed 8-byte cell (16 MB for 10,000 lines x 200 cols).
-//!
-//! - `char_data` (2 bytes): the UTF-16 code unit of a BMP character, or an
-//!   overflow table index when `COMPLEX` is set.
-//! - `colors` (4 bytes, [`PackedColors`]): FG index in bits 0-7 and BG index in
-//!   bits 8-15 (a StyleId in bits 0-15 when `USES_STYLE_ID` is set), the
-//!   has-extras bit 16, FG mode in bits 24-27 and BG mode in bits 28-31.
-//! - `flags` (2 bytes, [`CellFlags`]): attributes in bits 0-13, `USES_STYLE_ID`
-//!   in bit 14, `COMPLEX` in bit 15.
-//!
-//! Every cell is 8 bytes (16 MB for 10,000 lines x 200 cols).
-//!
-//! ```text
-//! ┌────────────────────────────────────────────────────────────────┐
-//! │ char_data (2 bytes)                                            │
-//! │   - UTF-16 code unit for BMP (U+0000-U+FFFF)                   │
-//! │   - Overflow table index when flags.COMPLEX is set             │
-//! ├────────────────────────────────────────────────────────────────┤
-//! │ colors (4 bytes) - Packed foreground and background            │
-//! │   - Bits 0-7:   FG color index (0-255) or FG mode indicator    │
-//! │   - Bits 8-15:  BG color index (0-255) or BG mode indicator    │
-//! │   - Bits 16-23: Extra color data / overflow indicator          │
-//! │   - Bits 24-31: Color mode flags                               │
-//! ├────────────────────────────────────────────────────────────────┤
-//! │ flags (2 bytes) - Cell attributes                              │
-//! │   - Bits 0-14: Standard attributes                             │
-//! │   - Bit 15: COMPLEX flag (char_data is overflow index)         │
-//! └────────────────────────────────────────────────────────────────┘
-//! ```
-//!
-//! ## Overflow Tables (in CellExtra)
-//!
-//! When a cell needs more than 8 bytes can express:
-//! - Complex characters (emoji, combining marks, non-BMP): string table
-//! - True color RGB: separate fg/bg overflow tables
-//! - Hyperlinks: URL storage
-//! - Underline color: separate color storage
-//!
-//! Few cells need overflow.
-//!
-//! ## Verification
-//!
-//! - Exhaustive tests: `cell_tests.rs`
-//!   (`cell_packing_is_lossless_over_every_input`: every char, every visual
-//!   flag set, every indexed colour pair and every overflow index).
-//! - Compile-time assert: `size_of::<Cell>() == 8`
+//! Packed 8-byte terminal cell (`char_data`, `colors`, and `flags`).
 
 pub use super::cell_colors::{PackedColor, PackedColors};
 pub use super::cell_flags::CellFlags;
 
-// Constructors (from_ascii_fast, from_ascii_styled, new, with_style,
-// with_overflow_index) and color
-// conversion helpers are in cell_constructors.rs.
-
-/// A single terminal cell (8 bytes). See module docs for layout details.
+/// A single 8-byte terminal cell.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(C, packed)]
 pub struct Cell {
@@ -111,13 +62,10 @@ impl Cell {
         flags: CellFlags::empty(),
     };
 
-    /// A BCE (Background Color Erase) blank, as VT420/xterm erases fill: a space
-    /// with default foreground, the given background and no flags. A default
-    /// background gives `Cell::EMPTY`.
+    /// Creates a Background Color Erase (BCE) blank cell with the given background.
     #[must_use]
     #[inline]
     pub const fn bce_blank(bg_colors: PackedColors) -> Self {
-        // Keep only BG mode (bits 28-31) and BG index (bits 8-15).
         let bg_only = bg_colors.0 & 0xF000_FF00;
         if bg_only == 0 {
             Self::EMPTY
@@ -130,8 +78,7 @@ impl Cell {
         }
     }
 
-    /// Create a BCE blank cell from a `PackedColor` background. For RGB only the
-    /// mode bit is set; the RGB value is written to `CellExtras` per position.
+    /// Creates a BCE blank cell from a `PackedColor` background.
     #[must_use]
     #[inline]
     #[cfg(test)]
@@ -145,13 +92,7 @@ impl Cell {
         }
     }
 
-    // Constructors in cell_constructors.rs: from_ascii_fast, from_ascii_styled,
-    // new, with_style, convert_colors, convert_legacy_colors, with_overflow_index.
-
-    /// Get the raw char_data value.
-    ///
-    /// If `is_complex()`, this is an overflow table index.
-    /// Otherwise, it's a UTF-16 code unit (BMP codepoint).
+    /// Returns the raw `char_data` value (BMP code unit or overflow table index).
     #[must_use]
     #[inline]
     pub const fn char_data(&self) -> u16 {
@@ -179,11 +120,7 @@ impl Cell {
         }
     }
 
-    /// Get the character, or U+FFFD for a complex cell (non-BMP character or
-    /// grapheme cluster), whose text lives in `CellExtras`.
-    ///
-    /// [`Grid::resolved_char(row, col)`](crate::Grid::resolved_char) resolves
-    /// complex cells.
+    /// Returns the BMP character, or U+FFFD for a complex cell.
     #[must_use]
     #[inline]
     pub const fn char(&self) -> char {
@@ -212,9 +149,7 @@ impl Cell {
         self.colors
     }
 
-    /// Set the character (BMP only). A non-BMP character stores U+FFFD and trips a
-    /// deliberate misuse `debug_assert!` (Trust's L0 gate reports it as an accepted
-    /// refutation at `cp = 0x10000`); those go through `set_overflow_index`.
+    /// Sets a single-width BMP character (non-BMP characters use `set_overflow_index`).
     #[inline]
     #[allow(
         clippy::cast_possible_truncation,
@@ -232,9 +167,6 @@ impl Cell {
             0xFFFD // U+FFFD REPLACEMENT CHARACTER (non-BMP misuse fallback)
         };
         self.char_data = char_data;
-        // set_char writes a single-width BMP character, so clear COMPLEX, WIDE and
-        // WIDE_CONTINUATION; otherwise DECFRA over wide characters leaves stale WIDE
-        // flags, and over continuations a stale bit 10 that reads as PROTECTED.
         let mut flags = self.flags;
         flags.remove(CellFlags::COMPLEX);
         flags.remove(CellFlags::WIDE);
@@ -288,10 +220,7 @@ impl Cell {
         flags.contains(CellFlags::WIDE_CONTINUATION)
     }
 
-    /// Check if this cell is protected from selective erase.
-    ///
-    /// `PROTECTED` shares bit 10 with `WIDE_CONTINUATION`, so this is also true for
-    /// every wide-continuation spacer; `Row::is_cell_protected()` disambiguates.
+    /// Checks if this cell has the `PROTECTED` / `WIDE_CONTINUATION` bit set.
     #[must_use]
     #[inline]
     #[cfg(test)]

@@ -24,6 +24,7 @@ pub fn seam() -> (String, String) {
 }
 
 /// Every tape file under `dir`, at any depth (a session's directory, `kept/`),
+/// in path order.
 fn tapes_under(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut found = Vec::new();
     let mut dirs = vec![dir.to_path_buf()];
@@ -56,6 +57,8 @@ fn tapes_under(dir: &Path) -> io::Result<Vec<PathBuf>> {
 }
 
 /// Whether the tape at `path` carries its run's end: its loop ended (a tape
+/// whose loop the instance's end cut off mid-wait has none, and replays only
+/// as ENDED).
 fn ended(path: &Path) -> bool {
     std::fs::read(path)
         .ok()
@@ -64,6 +67,8 @@ fn ended(path: &Path) -> bool {
 }
 
 /// The sessions under the store `dir` with a tape that has no end yet — a
+/// loop still recording — each by its directory's name, which is its sid
+/// without the `@` (`store::session_dir`); `kept/` is a person's, never one.
 fn recording(dir: &Path) -> io::Result<Vec<String>> {
     let mut sids = Vec::new();
     for path in tapes_under(dir)? {
@@ -244,6 +249,7 @@ fn machine_scrub_of(p: &crate::paths::Paths) -> Result<(Scrub, PathBuf), String>
 }
 
 /// A promote's source as named: a results run by its name
+/// (`s1-plain-01`, under `<state>/results/`), else the path given.
 fn source_path(from: &str) -> PathBuf {
     let run = crate::scn::results_dir().join(from);
     if !from.contains('/') && run.is_dir() {
@@ -254,6 +260,7 @@ fn source_path(from: &str) -> PathBuf {
 }
 
 /// The scenario a results run is a run of: its directory's name without
+/// the run's `-NN`.
 fn scenario_of(run: &Path) -> Option<String> {
     let name = run.file_name()?.to_str()?;
     let (scenario, k) = name.rsplit_once('-')?;
@@ -262,6 +269,7 @@ fn scenario_of(run: &Path) -> Option<String> {
 }
 
 /// Whether `name` may name a corpus tape: lower-case letters, digits, `-`
+/// and `.`, a letter or digit first, and a file name's length.
 fn corpus_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
@@ -303,6 +311,8 @@ fn the_tape(source: &Path) -> Result<PathBuf, String> {
 }
 
 /// Why a scenario run's summary says the run did not go as its scenario
+/// meant — the `error` it noted (no card, no idle row, a decision never
+/// journaled) or the `exception` it ended on — or `None`.
 fn run_failed(summary: &J) -> Option<String> {
     ["error", "exception"].into_iter().find_map(|key| {
         let said = summary.get(key).filter(|v| v.truthy())?;
@@ -315,6 +325,8 @@ fn run_failed(summary: &J) -> Option<String> {
 }
 
 /// A results run's refusal ([`run_failed`]) from its `summary.json`, when
+/// `source` is a directory that holds one; a summary that does not read is
+/// refused too.
 fn summary_refusal(source: &Path) -> Result<(), String> {
     let path = source.join("summary.json");
     if !source.is_dir() || !path.exists() {
@@ -333,6 +345,9 @@ fn summary_refusal(source: &Path) -> Result<(), String> {
 }
 
 /// What `new` loses of the corpus tape it would replace, each by its census
+/// word ([`Census`]): acts by their count, each a step the corpus holds a
+/// build to; a kind of decision (an approval, a question, a turn end, a
+/// wall) only when `new` holds none of a kind `old` held.
 fn lost(old: &Census, new: &Census) -> Vec<&'static str> {
     let mut lost: Vec<&'static str> = [
         ("approval(s)", old.approvals, new.approvals),
@@ -351,6 +366,7 @@ fn lost(old: &Census, new: &Census) -> Vec<&'static str> {
 }
 
 /// What the corpus tape at `path` holds, when there is one (one that does
+/// not read holds nothing a promote could lose).
 fn held(path: &Path) -> Option<Census> {
     let raw = std::fs::read(path).ok()?;
     Some(
@@ -399,6 +415,7 @@ fn promote_into(
 }
 
 /// What a promote or a rerecord says it wrote: the tape, what it holds and
+/// costs, and what the tape it replaced held.
 fn said_promoted(verb: &str, out: &Path, kept: &corpus::Promoted, old: Option<&Census>) {
     println!(
         "{verb} {}: {}, {} effects, {} bytes of text",
@@ -583,6 +600,7 @@ fn jailed(bin: &Path, allowed: &Path, asked: &Path) -> Result<Jailed, Fail> {
 }
 
 /// A child's pipe read to its end on a thread of its own, so neither pipe
+/// fills while the other is read: its text, at the join.
 fn drain<P: io::Read + Send + 'static>(pipe: Option<P>) -> std::thread::JoinHandle<String> {
     std::thread::spawn(move || {
         let mut text = String::new();
@@ -725,6 +743,9 @@ mod corpus_tests {
     }
 
     /// THE JAIL'S PROFILE names the binary and the tape it is given and no
+    /// other file: every read denied but theirs and the loader's, every
+    /// write, the network, every program but the binary and every fork; and
+    /// a path the profile cannot quote is refused.
     #[test]
     fn the_jails_profile_names_its_binary_and_tape_only() {
         let profile =
@@ -745,6 +766,9 @@ mod corpus_tests {
     }
 
     /// A RUN THAT DID NOT GO AS ITS SCENARIO MEANT IS NOT PROMOTED: a results
+    /// run whose summary records an `error` (no card, a decision never
+    /// journaled) or an `exception` is refused before its tape is read, and
+    /// so is one whose summary does not read; nothing is written.
     #[test]
     fn a_failed_run_is_not_promoted() {
         let owned = aterm_tempfile::tempdir().expect("owned scratch");
@@ -768,6 +792,8 @@ mod corpus_tests {
     }
 
     /// A RERECORD THAT LOSES WHAT THE CORPUS KEPT IS NAMED: every kind the
+    /// tape it replaces held more of — the survey's dismissal gone leaves
+    /// only the host's act; a box never drawn leaves no approval.
     #[test]
     fn a_tape_holding_fewer_names_what_it_lost() {
         let old = Census {
@@ -815,6 +841,7 @@ mod scrub_tests {
     use super::*;
 
     /// A tape recorded under a scratch HOME takes the account's home as the home (its
+    /// store's paths name it), and the scratch HOME's too.
     #[test]
     fn under_a_scratch_home_the_account_home_is_scrubbed_too() {
         let top = aterm_tempfile::Builder::new()

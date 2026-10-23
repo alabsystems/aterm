@@ -2,16 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The signed index and everything it pins.
-//!
-//! | module | does |
-//! |---|---|
-//! | [`index`] | `index`: the next signed index, a typed [`crate::api::Delta`] over the verified head |
-//! | [`mirror`] | `mirror`: exactly the signed packs an index pins, made public |
-//! | [`group`] | `publish-group rustc`: the trust bundle and its siblings from one seal |
-//! | [`seed`] | the seed pin: the re-pin a SEED-MINT names is on the trust repo's main |
-//! | [`status`] | `status`: the verified head, printed |
-//!
-//! The production release host is [`crate::host::gh`].
 
 pub mod group;
 pub mod index;
@@ -24,8 +14,7 @@ use std::path::Path;
 use crate::error::{Error, Result};
 use crate::host::{HostError, Probe, ReleaseHost, Slug};
 
-/// A verb's transcript: every line it says, in order. A real run echoes each line as it
-/// is said (a group publish takes an hour); a test captures them and reads them back.
+/// A verb's transcript: every line it says, in order.
 #[derive(Debug)]
 pub struct Log {
     verb: &'static str,
@@ -99,13 +88,7 @@ impl Log {
     }
 }
 
-/// A scratch directory under the system temporary directory, removed when dropped
-/// however the verb ends.
-///
-/// It is created new, mode 0700, under a random name, and never adopts an existing
-/// directory: on a shared `/tmp` a local user who pre-created it could plant the bytes a
-/// compare-and-swap compares against, or swap the head's `index.toml` between its
-/// verification and its re-read.
+/// Private scratch directory under the system temp dir, removed on drop.
 #[derive(Debug)]
 pub struct Scratch(aterm_tempfile::TempDir);
 
@@ -130,14 +113,10 @@ impl Scratch {
     }
 }
 
-/// How many times an authenticated download is tried: the release-asset endpoint answers
-/// an intermittent HTTP 500 after other assets of the same call have landed. Only
-/// [`HostError::Unreachable`] is retried; [`HostError::NotFound`] is an answer.
+/// Maximum attempts for an authenticated download on [`HostError::Unreachable`].
 pub const DOWNLOAD_ATTEMPTS: usize = 3;
 
-/// [`ReleaseHost::download`], tried [`DOWNLOAD_ATTEMPTS`] times, [`ReleaseHost::retry_pause`]
-/// apart, while the host does not answer. Every attempt replaces what an earlier one left
-/// in `dir`.
+/// [`ReleaseHost::download`] retried up to [`DOWNLOAD_ATTEMPTS`] times on unreachable errors.
 ///
 /// # Errors
 ///
@@ -163,16 +142,10 @@ pub fn download_retried(
     Err(last)
 }
 
-/// How many times an asset this run just created or uploaded is probed on the download
-/// host, [`ReleaseHost::retry_pause`] apart, before it is called unserved: the download
-/// host serves a fresh release only after a while (2026-10-20: `atpkg-index-76` still
-/// answered 404 eight seconds after it was published, and 200 within half a minute).
-/// Thirteen probes five seconds apart are a one-minute hang detector, not a latency budget.
+/// Maximum public-availability probes for a newly uploaded release asset.
 pub const SERVE_PROBES: usize = 13;
 
-/// What the download host answers for `asset` of a release this run just created or
-/// uploaded: [`Probe::Present`] as soon as it serves it, else its last answer after
-/// [`SERVE_PROBES`] probes.
+/// Probes the download host up to [`SERVE_PROBES`] times until `asset` is [`Probe::Present`].
 #[must_use]
 pub fn probe_served(host: &dyn ReleaseHost, slug: &Slug, tag: &str, asset: &str) -> Probe {
     let mut answer = Probe::Absent;
@@ -188,9 +161,7 @@ pub fn probe_served(host: &dyn ReleaseHost, slug: &Slug, tag: &str, asset: &str)
     answer
 }
 
-/// A freshness horizon a client can read and has not passed: exactly
-/// `YYYY-MM-DDTHH:MM:SSZ` (the client treats anything else as lapsed) and after `now`.
-/// Returns its epoch seconds.
+/// Parses a future `YYYY-MM-DDTHH:MM:SSZ` freshness horizon after `now_unix` as epoch seconds.
 ///
 /// # Errors
 ///
@@ -213,8 +184,7 @@ pub fn horizon(what: &str, stamp: &str, now_unix: i64, remedy: &str) -> Result<i
     Ok(at)
 }
 
-/// A host failure while doing `what`, as this crate's error: an answer the caller did not
-/// expect is a refusal, no answer is a could-not-run.
+/// Maps a [`HostError`] while doing `what` to this crate's [`Error`].
 #[must_use]
 pub fn host_error(what: impl std::fmt::Display, e: &HostError) -> Error {
     match e {
@@ -224,7 +194,6 @@ pub fn host_error(what: impl std::fmt::Display, e: &HostError) -> Error {
 }
 
 /// The value after `flag` in `args` at `i`, advancing `i` past it.
-///
 /// # Errors
 ///
 /// A usage error when the flag is the last argument.

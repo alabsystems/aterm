@@ -140,6 +140,7 @@ impl ToldNeeds {
     }
 
     /// The held set a reader reads beside `standing`: the one told last
+    /// where it describes that entry, else the outgoing one where it does.
     fn reading(&self, standing: Option<&str>) -> Option<&std::sync::Arc<HarnessNeeds>> {
         [&self.current, &self.outgoing]
             .into_iter()
@@ -329,6 +330,7 @@ pub(crate) struct NeedWords<'a> {
 /// Between the program's word and the need in a harness's entry.
 const NEEDS_YOU: &str = " needs you: ";
 /// The tail a harness's entry ends with
+/// (`aterm_agent::supervise::escalate::needs_attention_text`).
 const CARRYING_ON: &str = " \u{2014} carrying on";
 
 /// The need without aterm's frame.
@@ -355,6 +357,7 @@ pub(crate) fn need_words(text: &str) -> Option<NeedWords<'_>> {
 }
 
 /// `rest` without its ` — carrying on`, whole or cut from its dash on, and
+/// whether any of it stood.
 fn without_carrying_on(rest: &str) -> (&str, bool) {
     let dash = " \u{2014}".len();
     let cuts = CARRYING_ON
@@ -375,6 +378,7 @@ fn without_carrying_on(rest: &str) -> (&str, bool) {
 }
 
 /// `<first> (+N more)` read into the first need and `N`; `None` where the
+/// text does not end with a whole count.
 fn more_count(rest: &str) -> Option<(&str, u16)> {
     let body = rest.strip_suffix(" more)")?;
     let at = body.rfind(" (+")?;
@@ -485,12 +489,15 @@ pub(crate) const NEED_TOLD_MAX: usize = aterm_agent::supervise::policy::needs::N
 pub(crate) const REMEDY_TEXT_MAX: usize = crate::session_timeline::META_ATTENTION_KEYED_MAX;
 
 /// The attention owners [`of`] reads nothing from: the server's own stall
+/// entry ([`NeedWord::Frozen`] says it) and the live upgrade's, which the
+/// message band tells.
 const NOT_ASKS: [&str; 2] = [
     crate::input_stall::SERVER_ATTENTION_OWNER,
     aterm_agent::harness::upgrade_drive::ATTENTION_OWNER,
 ];
 
 /// The wall kinds a usage limit reads as (`aterm_phase::WallKind::reads_limited`
+/// less the API's 429, which is an API error).
 const LIMIT_WALLS: [&str; 4] = ["usage-session", "usage-weekly", "model-bucket", "spend"];
 
 /// The classifier: `facts` → [`Verdict`] (the module doc's rule).
@@ -507,12 +514,14 @@ pub(crate) fn of(facts: &NeedFacts) -> Verdict {
     let (wall_need, wall_wait, recheck_unix) = wall.map_or((None, None, None), |(agent, kind)| {
         wall_outcome(facts, agent, kind, supervisor_waits)
     });
+    let boxed = box_need(facts);
+    let ask = ask.filter(|need| need.harness.is_none() || boxed.is_none());
     let candidates = [
         stall_need(facts),
         task_need(facts),
         wall_need.clone(),
         ask,
-        box_need(facts),
+        boxed,
     ];
     let waiting = if wall_need.is_some() {
         None
@@ -531,7 +540,7 @@ pub(crate) fn of(facts: &NeedFacts) -> Verdict {
     }
 }
 
-/// The published stall: frozen, or stopped with input queued. Its words are
+/// The published stall: frozen, or stopped with input queued.
 fn stall_need(facts: &NeedFacts) -> Option<Need> {
     let stall = facts.stall.as_ref()?;
     let words = stall_words(&stall.text);
@@ -573,12 +582,15 @@ pub(crate) fn stall_remedy(words: &str, hand_back: bool, resume: Option<&str>) -
 }
 
 /// A stall's text without its remedy: everything before its first ` — `
+/// (`input_stall::attention_text` puts the remedy after one, and the facts
+/// before it carry none).
 fn stall_words(text: &str) -> &str {
     text.split_once(" \u{2014} ")
         .map_or(text, |(words, _)| words)
 }
 
 /// A stalled task: the window host's deadline's words where its attention
+/// stands, else the why in words.
 fn task_need(facts: &NeedFacts) -> Option<Need> {
     let task = facts.task.as_ref().filter(|task| task.stalled)?;
     let deadline = facts
@@ -601,6 +613,7 @@ fn task_need(facts: &NeedFacts) -> Option<Need> {
 }
 
 /// What `agent`'s wall of `kind` makes of the session: a need, a wait, and
+/// when an unsupervised limit's reset changes it.
 fn wall_outcome(
     facts: &NeedFacts,
     agent: &AgentFact,
@@ -713,6 +726,7 @@ pub(crate) fn wall_reset_what(kind: &str, reset: Option<&str>) -> String {
 }
 
 /// [`wall_what`], where an API error caused by the network says its cause
+/// (the verdict's host-side subject).
 fn wall_what_of(agent: &AgentFact, kind: &str, reset: Option<&str>) -> String {
     match agent.subject.as_deref().filter(|s| !s.is_empty()) {
         Some(cause) if kind == "api-error" => fold_clip(cause, ROW_WHAT_MAX),
@@ -720,9 +734,13 @@ fn wall_what_of(agent: &AgentFact, kind: &str, reset: Option<&str>) -> String {
     }
 }
 
-/// What the attention entries make of the session: the most recent ask,
+/// What the attention entries make of the session: the most recent actionable ask,
+/// the most recent wait (a record, in its writer's words: [`WaitWord::Entry`]),
+/// and whether the supervisor loop's own entry is one (what may wait a wall
+/// out, [`wall_outcome`]).
 fn attention_outcome(facts: &NeedFacts) -> (Option<Need>, Option<Waiting>, bool) {
     let mut ask = None;
+    let mut reported_ask = None;
     let mut wait: Option<WaitEntry> = None;
     let mut supervisor_waits = false;
     for entry in facts
@@ -750,12 +768,17 @@ fn attention_outcome(facts: &NeedFacts) -> (Option<Need>, Option<Waiting>, bool)
                     || fold_clip(text.trim_start_matches('⚠').trim_start(), ROW_WHAT_MAX),
                     |ask| ask.line(ROW_WHAT_MAX),
                 );
-                ask = Some(Need {
+                let need = Need {
                     word: NeedWord::Ask,
                     key: ask_key(text),
                     what,
                     harness,
-                });
+                };
+                if need.harness.is_some() {
+                    reported_ask.get_or_insert(need);
+                } else {
+                    ask = Some(need);
+                }
             }
             AttentionKind::Ask => {}
         }
@@ -766,24 +789,38 @@ fn attention_outcome(facts: &NeedFacts) -> (Option<Need>, Option<Waiting>, bool)
         reset: None,
         entry: Some(entry),
     });
-    (ask, wait, supervisor_waits)
+    (ask.or(reported_ask), wait, supervisor_waits)
 }
 
 /// THE NEEDS OWNER'S ASK IN THE WORKER'S WORDS: the set `told` beside this
+/// entry ([`NeedFacts::told_needs`], which reads a set only beside the
+/// entry text it was told with) under the program the entry names, whole;
+/// else, or where the entry names no program this build knows,
+/// the entry's own parse ([`need_words`], 2a); `None` where neither reads.
 fn harness_ask(text: &str, told: Option<&[String]>) -> Option<HarnessAsk> {
+    let (head, rest) = text.split_once(NEEDS_YOU)?;
+    let program = aterm_phase::Program::ALL
+        .into_iter()
+        .find(|program| program.name().eq_ignore_ascii_case(head.trim()))?;
     let parsed = need_words(text);
-    let program = parsed.map(|words| words.program).or_else(|| {
-        let (head, _) = text.split_once(NEEDS_YOU)?;
-        aterm_phase::Program::ALL
-            .into_iter()
-            .find(|program| program.name().eq_ignore_ascii_case(head.trim()))
-    });
-    told.zip(program)
-        .and_then(|(needs, program)| HarnessAsk::told(needs, program))
+    told.and_then(|needs| HarnessAsk::told(needs, program))
         .or_else(|| parsed.map(HarnessAsk::of))
+        .or_else(|| {
+            // Older writers could clip off the suffix before the entry was stored.
+            let (first, _) = without_carrying_on(rest);
+            let first = first.trim();
+            (!first.is_empty()).then(|| {
+                HarnessAsk::of(NeedWords {
+                    first,
+                    more: 0,
+                    program,
+                })
+            })
+        })
 }
 
 /// An entry's words without a leading `kind=` an older server stored as
+/// text ([`resolved_kind`] reads past it the same way).
 fn entry_words(text: &str) -> &str {
     let text = text.trim();
     match text.split_once(' ') {
@@ -798,6 +835,8 @@ pub(crate) fn ask_key(text: &str) -> u64 {
 }
 
 /// An entry's kind: the one its writer named, else (§2.4's legacy rule) a
+/// wait only where its text opens with the harness's limit prefix while the
+/// harness answers the agent's wall, and an ask otherwise.
 fn resolved_kind(entry: &AttentionFact, wall_answer: WallAnswer) -> AttentionKind {
     if let Some(kind) = entry.kind {
         return kind;
@@ -817,6 +856,7 @@ fn resolved_kind(entry: &AttentionFact, wall_answer: WallAnswer) -> AttentionKin
 }
 
 /// A box or a question no harness answers: no supervisor, or a hold that
+/// keeps every harness's hands off.
 fn box_need(facts: &NeedFacts) -> Option<Need> {
     let agent = facts.agent.as_ref()?;
     if facts.supervised && facts.hold.is_none() {

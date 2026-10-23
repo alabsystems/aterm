@@ -1,88 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The real-agent lab: launches the real Claude Code, Codex ([`codex`]),
-//! Gemini CLI / Antigravity CLI (`agy`, [`gemini`]; screens in [`gemini_captures`]),
-//! or Muse Code ([`muse`]; proof in [`muse_proof`]) TUI by path inside a private
-//! headless `aterm` against a local API stub (Anthropic, OpenAI Responses,
-//! Gemini, or Meta). Everything runs inside one `sandbox-exec` profile with no
-//! tokens, login, or network egress (`docs/measured/real-claude-lab-2026-10-15.md`;
-//! subscriber account-stats facts in [`stats`]).
-//!
-//! macOS only (`sandbox-exec`), requires managed agent binaries (`aterm pkg
-//! install claude`, etc.) and an `aterm` built with dev seams:
-//!
-//! ```sh
-//! targo --unverified build -p aterm --features dev-seams   # target/debug/aterm; or LAB_ATERM=/path/to/aterm
-//! targo --unverified lab selftest                          # ~25 s; exit 1 when a check fails
-//! targo --unverified lab nudge-trial                       # ~2.5 min: repaint nudge against real Claude Code
-//! targo --unverified lab help                              # list all verbs
-//! ```
-//!
-//! Run from an unsandboxed shell (`sandbox-exec` profiles do not nest).
-//!
-//! # Layout (`$LAB_STATE`)
-//!
-//! Default state root: `/private/tmp/at.lab-<uid>/<checkout>-<hash>/` (must sit
-//! outside every guarded home, with no quotes, backslashes, or symlinks):
-//! - `runs/<tag>/`: live lab state. `scratch/` is the only directory jailed code
-//!   may write (`home/`, `cfg/`, `state/`, `dump/`, `modes/`, `mode`, `reply.txt`,
-//!   `tool.json`, `headers.json`, `account.json`, `stub.log`, `stub.port`,
-//!   `security.log`, `relay.log`, `statusline.jsonl`, `claude-debug.log`,
-//!   `config-change.log` via [`settings_witness`], `codex-home/`, `open.log`,
-//!   `open-control.log`, `control-home/`, `gemini-home/`, `agy-home/`, `tmp/`,
-//!   `clock/`; guarded by [`protected::SCRATCH_DIRS`], [`sys::scratch_read`],
-//!   [`sys::put`]). Everything outside `scratch/` (`env.sh`, `jail.sb`,
-//!   `jailed.pids`, `sockets.log`, `egress.log`, `members.txt`, `runtime.txt`,
-//!   launchers, `bin/aterm-lab`, `shim/{security,open,aterm}`, `relay/node`,
-//!   `clock/`) is read-only to jailed processes.
-//! - `logs/<tag>-<time>/`: retained by `down`.
-//! - `captures/` and `results/`: fixture captures and scenario/trial outputs.
-//!
-//! Binary resolution (recorded once at `up` in `env.sh`; no agent runs outside
-//! the jail, `--version` included):
-//! - `aterm`: `$LAB_ATERM` (physical path, no symlinks) or `target/{debug,release}/aterm`
-//!   (must honour `ATERM_STATE_HOME`).
-//! - Agents: `$LAB_CLAUDE`, `$LAB_CODEX`, `$LAB_AGY`, `$LAB_MUSE` (or `aterm pkg
-//!   which <name>`'s resolved store binary), and `$LAB_GEMINI` (or
-//!   `/opt/homebrew/bin/gemini`).
-//!
-//! # Environment & Isolation
-//!
-//! The lab strips inherited `ATERM*`, `CLAUDE*`, `ANTHROPIC*`, `ATPKG*`,
-//! `CODEX*`, `COPILOT*`, `CURSOR*` and proxy variables, sets `xcrun_nocache=1`,
-//! and runs from `/`. Always use `targo --unverified lab ctl TAG <verb>`, never
-//! bare `aterm ctl` ([`door`]).
-//!
-//! `up` environment knobs: `LAB_SURVEY=1`, `LAB_TRUST=1`, `LAB_RESTORE=1`
-//! ([`restore`]), `LAB_CLOCK=1` ([`clock`], for [`sleep`]), `LAB_FIRST_RUN=1`,
-//! `LAB_HARNESS_KEYS`, `LAB_ATERM_TOML`, `LAB_COLS`, `LAB_LINES`, `LAB_SCALE`,
-//! `LAB_PROXY=dead`, `LAB_CODEX_MODEL`, `LAB_INSTANCE_ENV` (`TMPDIR` and
-//! `ATERM_DEBUG_*`/`ATERM_DEV_*` seams only; [`lab::instance_env`]), and
-//! [`crash`] for instance crash/relaunch.
-//!
-//! Credentials are synthetic (`sk-ant-api03-LABLABLAB…` via `apiKeyHelper`, or
-//! `sk-ant-oat01-LABLABLAB…` under `claude TAG --subscriber`). Keychain reads hit
-//! [`tripwire`]; network egress is watched by [`sampler`] (`egress TAG`, `lsof
-//! TAG`) and every jailed process is tracked by [`sys::jail_pids`].
-//!
-//! # Traps
-//!
-//! * Enable forced surveys live after launch (`survey TAG on`), not at launch
-//!   (where the first-run notice pushes the survey header above the 40-row window).
-//! * Do not set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` or `DISABLE_TELEMETRY`
-//!   when testing surveys.
-//! * Wait 9s after `settings TAG` before a turn that depends on the new rule.
-//! * `harness TAG continue=false` suppresses the 2m/4m/8m idle `keep going` nudge.
-//!
-//! # Standalone & Cross-OS Lanes
-//!
-//! Verbs that run outside a jailed stub lab: [`instance`], [`trail_gallery`],
-//! [`trail_contrast`], [`presence`] (`presence-flap`), [`meta_keys`] (with
-//! [`input_sources`]), [`predict_live`], [`aos_repair`], [`codex_alab_proof`]
-//! ([`codex_rig`], [`codex_alab_model`]), [`linux`] ([`linux_proof`]),
-//! [`windows`], [`abrew_admission`], [`relay`] (`ptyrec`), [`link`], and
-//! [`workers`]. See [`USAGE`] below for every verb and flag.
+//! The real-agent lab: launches the real Claude Code, Codex ([`codex`]), Gemini CLI / Antigravity CLI (`agy`, [`gemini`]; screens in [`gemini_captures`]), or Muse Code ([`muse`]; proof in [`muse_proof`]) TUI by path inside a private headless `aterm` against a local API stub (Anthropic, OpenAI Responses, Gemini, or Meta).
 
 #![deny(unsafe_code)]
 
@@ -132,6 +51,8 @@ mod gemini_captures;
 mod gemini_proof;
 #[cfg(target_os = "macos")]
 mod halfdraw;
+#[cfg(target_os = "macos")]
+mod idlepoints;
 #[cfg(target_os = "macos")]
 mod input_sources;
 #[cfg(target_os = "macos")]
@@ -267,8 +188,7 @@ mod workers;
 /// How a person runs this program: every hint that tells them what to type next spells it so.
 pub const LAB: &str = "targo --unverified lab";
 
-/// Poll `pred` every 100 ms until it holds (`true`) or `within` passes
-/// (`false`); a hang detector for something that must happen, interruptible.
+/// Poll `pred` every 100 ms until it holds (`true`) or `within` passes (`false`); a hang detector for something that must happen, interruptible.
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn wait_until(within: std::time::Duration, mut pred: impl FnMut() -> bool) -> bool {
@@ -366,6 +286,12 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
                                  capture managed Claude Code footer screens across modes on a fresh lab
   halfdraw scan <cast> --program claude|agy|muse|gemini [--show N] [--event I]
                                  replay a cast one PTY read per batch to report DEC 2026 brackets and unguarded busy gaps
+  idle-points scan <tape|dir>... --program claude|agy|muse|gemini|auto [--show N]
+                                 re-read harness tapes' turn-end points: idle with no evidence, and no last line named
+  idle-points cast <cast>... --program claude|agy|muse|gemini [--show N]
+                                 replay a cast: every idle spell inside a turn, how long it stood, whether it was vouched
+  idle-points gate <lab logs dir>...
+                                 place a Muse Code lab's harness points against its sessions' runs (mid-reply, in the gate)
   probe [tag] [--replica]        run jail and replica-home isolation probes (--replica: replica home only)
   selftest [tag] [--keep]        end-to-end Claude Code proof (~25 s: turn, survey, harness, egress, tripwire, probes, twin)
   nudge-trial [tag] [--mode on|log|off] [--trials N] [--expect on|log|off] [--via mode|key] [--no-hold]
@@ -445,9 +371,10 @@ Outside any lab (no jail, no stub):
   predict-live --window|--headless [--aterm PATH] [--shell zsh|bash]... [--rtt MS]... [--mode on|off]...
                [--rounds N] [--no-split] [--out DIR]
                                  verify predictive editing over a simulated RTT `link` in single and split panes
-  codex-alab-proof [--package DIR] [--aterm PATH] [--keep] [--policy-only]
+  codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--keep]
+                   [--policy-only|--upgrade-only]
                                  end-to-end native harness proof on the real codex-alab package against a loopback fake model
-                                 (~11 min; --policy-only runs the cybersecurity refusal lane)
+                                 (~11 min; --policy-only runs cybersecurity refusal; --upgrade-only checks one live handoff)
   reduce <transcript|rollout> --program claude|codex [--out FILE]
                                  key-only transcript/rollout reducer for harness step fixtures (verifies reader equivalence before writing)
   ptyrec <log> -- <cmd> [args...]
@@ -465,8 +392,7 @@ Exit: 0 pass, 1 finding (failed check), 2 usage, 3 could not run.
 Operator guide: `targo --unverified doc -p aterm-lab --open` (crates/aterm-lab/src/main.rs).
 ";
 
-/// Why a verb ended: a message for stderr (when there is one), its exit
-/// status, and the interrupt that cut it short (when one did).
+/// Why a verb ended: a message for stderr (when there is one), its exit status, and the interrupt that cut it short (when one did).
 #[derive(Debug)]
 pub struct Fail {
     /// Printed as `aterm-lab: <msg>`.
@@ -603,6 +529,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "workers" => workers::cmd_workers(args),
         "footers" => footers::cmd_footers(args),
         "halfdraw" => halfdraw::cmd_halfdraw(args),
+        "idle-points" => idlepoints::cmd_idle_points(args),
         "paths" => verbs::cmd_paths(),
         "instance" => instance::cmd_instance(args),
         "resource-attribution" => resource_attribution::cmd(args),
@@ -668,20 +595,14 @@ fn main() -> std::process::ExitCode {
     let mut argv = std::env::args();
     let argv0 = argv.next().unwrap_or_default();
     let args: Vec<String> = argv.collect();
-    // The roles this program plays under other names, inside a lab.
     let code = match std::path::Path::new(&argv0)
         .file_name()
         .and_then(|n| n.to_str())
     {
         Some("node") => relay::main(&args),
-        // The link relay under a shell's name, so aterm integrates the shell behind it
-        // ([`link`]): no env scrubbing, the shell gets aterm's environment as given.
         Some(name @ ("zsh" | "-zsh" | "bash" | "-bash")) => link::as_shell(name, &args),
         Some("security") => tripwire::main(&args),
         Some("open") => recorder::main(&args),
-        // The fleet-sim fixtures, run under their own names by a session's
-        // shell (a link in the simulation's `bin/`): no env scrubbing, so the
-        // Claude-Code-shaped fixture's own HOME reaches it.
         Some("claude") => fleet_fixture::claude(&args),
         Some("build-loop") => fleet_fixture::build_loop(&args),
         Some("ps") => codex_rig::ps_main(&args),
@@ -689,36 +610,25 @@ fn main() -> std::process::ExitCode {
             let cmd = args.first().cloned().unwrap_or_default();
             let rest = args.get(1..).unwrap_or_default();
             match cmd.as_str() {
-                // jailed and witness roles: their environment is the lab's, kept as given
                 "stub" => stub::main(rest),
                 "sampler" => sampler::main(rest),
                 "ctty" => relay::ctty(rest),
-                // a recorder run by hand: the program it records gets the
-                // caller's environment as given, as the take's reader expects
                 "ptyrec" => relay::ptyrec(rest),
-                // the link relay run by hand: its program gets the caller's environment
                 "link" => link::main(rest),
                 "probe-inside" => probe::inside_main(rest),
                 "probe-tiocsti" => probe::tiocsti_child(),
                 "hold" => recorder::hold(rest),
                 "keeper" => instance::keeper_main(rest),
-                // an app-band instance's launchd job: its environment is the world's, read from the world
                 "band" => band::band_main(rest),
                 "band-launch" => band::launch_main(rest),
                 "band-standin" => band::standin_main(rest),
                 "presence-standin" => presence::standin_main(rest),
-                // the build-slot holder `slot-lane` starts, this program again
                 slot_lane::HOLD_VERB => slot_lane::hold_main(rest),
                 "key-dump" => meta_keys::keydump_main(rest),
                 "mcp-standin" => codex_rig::mcp_main(rest),
                 _ => {
-                    // A lab must never reach the owner's live aterm or Claude Code: forget what the
-                    // calling shell inherited from them before any thread starts.
                     sys::forget_env(paths::forgotten);
                     sys::confine_env();
-                    // These read files or print and make nothing: no state dir to check
-                    // (`fleet-sim` writes its record through `need_state`, which makes the
-                    // default private first).
                     let r = if matches!(
                         cmd.as_str(),
                         "" | "help"

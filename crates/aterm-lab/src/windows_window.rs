@@ -1,52 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `windows window [--arch A]...`: WB.3's runtime smoke (docs/AUDIT-third-
-//! party-2026-10-15.md, section 7), a windowed `aterm-gui` in the runner's
-//! desktop session of the lane's VM ([`crate::windows`]), driven as a person
-//! drives it: by the VM's USB keyboard and tablet through QMP, so every key
-//! and click goes through Windows' own input stack, focus, IME and window
-//! manager. It is what the windows-sys 0.61 facade over `aterm-win32` and the
-//! winit fork's handle conversions are judged by at runtime.
-//!
-//! Once per run, the display: the virtio-gpu's monitor
-//! ([`crate::windows::VIRTIO_GPU`], 1920x1200, display scaling 100-200 %)
-//! made primary at (0,0) at 100 %, ramfb's 800x600 to its right. Then per
-//! arch (x86_64 under Prism):
-//!
-//! 1. `cargo build -p aterm-gui -p aterm-ctl`;
-//! 2. launch: one `aterm-gui` (scratch config, automatic lanes off), its
-//!    window of class `aterm` per-monitor DPI aware at 96 dpi on the
-//!    primary, `geometry=window`, drawing on the GPU on WARP;
-//! 3. type: clicked, [`TYPED`] typed on the keyboard, its echo awaited;
-//! 4. IME: Win+Space to Microsoft's Japanese IME, the IME opened, `nihon`
-//!    composed, converted (Space) and committed (Enter) into a PowerShell
-//!    line that prints `IME-日本` only when the committed text reached it;
-//! 5. resize: the window's right edge dragged 180 px left, the grid narrower,
-//!    and PowerShell's `[Console]::WindowWidth` printing the new width;
-//! 6. DPI: the primary monitor's scaling set to 150 % while aterm runs: its
-//!    scale 1.50 and its window at 144 dpi, still rendering, still typing;
-//! 7. monitor: Win+Shift+Right to the 96-dpi second monitor (scale 1.00),
-//!    Win+Shift+Left back (1.50);
-//! 8. close: Alt+F4, exit status 0, no panic;
-//! 9. launch at 150 %: a second `aterm-gui` started on the scaled monitor at
-//!    1.50 and 144 dpi, closed the same way. With `--cpu`, before it closes,
-//!    its window is lifted until 120 client rows are past the screen's top
-//!    edge, PowerShell clears its screen and prints a line there, and the
-//!    window is moved back down onto the screen ([`Run::exposed`]): the rows
-//!    that come back, which Windows did not draw, must be painted.
-//!
-//! The monitor's scaling is put back to 100 % at the end. Exit 0 every row
-//! passed, 1 a row failed, 3 NOT RUN. Report and screenshots:
-//! `$LAB_STATE/windows/`.
-//!
-//! `--cpu` runs the same rows on aterm's CPU presenter (`aterm-gui --cpu`,
-//! the cursor still and the stats Deck off, as the Linux lane's `--cpu` rows
-//! run): the launch row requires `backend=cpu`, and the launch, type, IME,
-//! resize, DPI and monitor rows each hold the frame aterm presented
-//! (`image`) to the window's own pixels, which the desk helper reads back
-//! from its DC (`readback`: `BitBlt` into a bitmap, then `GetDIBits`). WARP only: the VM has no GPU, so a real GPU's
-//! driver, and real x86_64 hardware, are m6's to run.
+//! `windows window [--arch A]...`: WB.3's runtime smoke (docs/AUDIT-third- party-2026-10-15.md, section 7), a windowed `aterm-gui` in the runner's desktop session of the lane's VM ([`crate::windows`]), driven as a person drives it: by the VM's USB keyboard and tablet through QMP, so every key and click goes through Windows' own input stack, focus, IME and window manager.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -72,9 +27,7 @@ const WITHIN: Duration = Duration::from_secs(60);
 /// PowerShell's first three lines at 150 %.
 const LIFT: i32 = 120;
 
-/// What [`Run::exposed`] has PowerShell do while the window's top rows are
-/// past the screen's edge: clear the screen and print [`EXPOSED_ECHO`] on its
-/// first line, which no key typed shows.
+/// What [`Run::exposed`] has PowerShell do while the window's top rows are past the screen's edge: clear the screen and print [`EXPOSED_ECHO`] on its first line, which no key typed shows.
 pub const EXPOSED_TYPED: &str = "Clear-Host; Write-Output ('ROWS-' + 6*7)";
 pub const EXPOSED_ECHO: &str = "ROWS-42";
 
@@ -90,41 +43,31 @@ fn crop(px: &[u8], w: usize, n: usize, r: desk::Rect) -> (Vec<u8>, usize, usize)
     (out, rr - l, b - t)
 }
 
-/// What the IME row types around the composition, and what PowerShell
-/// prints only when the IME's committed text (`日本`, from `nihon`) reached it.
+/// What the IME row types around the composition, and what PowerShell prints only when the IME's committed text (`日本`, from `nihon`) reached it.
 pub const IME_BEFORE: &str = "Write-Output ('IME-' + '";
 pub const IME_READING: &str = "nihon";
 pub const IME_AFTER: &str = "')\n";
 pub const IME_ECHO: &str = "IME-日本";
 
-/// aterm's composition (`chrome`'s `ime` line) after each key of
-/// [`IME_READING`] (a romaji letter that waits for the next key shows
-/// full-width), and once Space converted it.
+/// aterm's composition (`chrome`'s `ime` line) after each key of [`IME_READING`] (a romaji letter that waits for the next key shows full-width), and once Space converted it.
 pub const IME_STEPS: [&str; 5] = ["ｎ", "に", "にｈ", "にほ", "にほｎ"];
 pub const IME_COMPOSING: &str = IME_STEPS[4];
 pub const IME_CONVERTED: &str = "日本";
 
-/// The IME conversion mode bits the reading needs (`IME_CMODE_NATIVE`,
-/// `IME_CMODE_KATAKANA`, `IME_CMODE_FULLSHAPE`) and their hiragana values:
-/// native and full-width, not katakana.
+/// The IME conversion mode bits the reading needs (`IME_CMODE_NATIVE`, `IME_CMODE_KATAKANA`, `IME_CMODE_FULLSHAPE`) and their hiragana values: native and full-width, not katakana.
 pub const CMODE_MASK: u32 = 0x1 | 0x2 | 0x8;
 pub const CMODE_HIRAGANA: u32 = 0x1 | 0x8;
 
-/// What a row types to read the console width PowerShell sees, after
-/// `tag`: ConPTY's view of a re-grid, which is what the shell lays its
-/// lines out by, not aterm's own count.
+/// What a row types to read the console width PowerShell sees, after `tag`: ConPTY's view of a re-grid, which is what the shell lays its lines out by, not aterm's own count.
 #[must_use]
 pub fn width_typed(tag: &str) -> String {
     format!("Write-Output ('{tag}' + [Console]::WindowWidth)\n")
 }
 
-/// The tags the resize, DPI change and monitor rows read the width under,
-/// each its own, so no row's echo is an earlier row's.
+/// The tags the resize, DPI change and monitor rows read the width under, each its own, so no row's echo is an earlier row's.
 pub const WIDTH_TAGS: [&str; 4] = ["W=", "DPI-", "RIGHT-", "LEFT-"];
 
-/// How far the resize row drags the window's right edge left, in pixels,
-/// from inside Windows' invisible resize border (GetWindowRect's right edge
-/// minus [`EDGE_IN`]).
+/// How far the resize row drags the window's right edge left, in pixels, from inside Windows' invisible resize border (GetWindowRect's right edge minus [`EDGE_IN`]).
 pub const DRAG: i32 = 180;
 pub const EDGE_IN: i32 = 4;
 
@@ -253,8 +196,6 @@ fn display_detail(d: &Display) -> String {
     )
 }
 
-// The VM's keyboard, tablet and screens
-
 fn qmp(l: &Layout, command: String) -> Result<(), String> {
     let answers = windows::qmp(l, &[command])?;
     match answers.first() {
@@ -332,8 +273,6 @@ fn shot(l: &Layout, path: &Path, device: Option<&str>) -> String {
     }
 }
 
-// One aterm-gui in the desktop
-
 struct Session<'a> {
     up: &'a Up,
     arch: Arch,
@@ -359,9 +298,6 @@ impl<'a> Session<'a> {
     fn launch(up: &'a Up, arch: Arch, n: u32, cpu: bool) -> Result<Session<'a>, String> {
         let dir = instance_dir(arch, n);
         let task = task_name(&format!("window-{}-{n}", arch.name()));
-        // A previous run's pid and exit files must be gone before this one
-        // starts: the helper removes the directory too, but only once its
-        // task runs, after this run may have read them.
         let cleared = up.ssh.run(&format!(
             "(if exist {dir} rmdir /s /q {dir}) & if exist {dir} (echo left)"
         ));
@@ -549,8 +485,7 @@ impl Dims {
     }
 }
 
-/// The machine `arch`'s process runs as (`ProcessMachineTypeInfo`'s
-/// `IMAGE_FILE_MACHINE_*`, as the desk helper prints it).
+/// The machine `arch`'s process runs as (`ProcessMachineTypeInfo`'s `IMAGE_FILE_MACHINE_*`, as the desk helper prints it).
 #[must_use]
 pub fn machine(arch: Arch) -> &'static str {
     match arch {
@@ -632,7 +567,6 @@ impl<'a> Watch<'a> {
         if !started.ok() {
             return Err(format!("its task did not start: {}", started.tail(5)));
         }
-        // Started is a running task, not yet a log: the helper compiles first.
         within("the watcher's log", || {
             let out = up.ssh.run(&format!("if exist {file} (echo yes)"));
             if out.text.trim() == "yes" {
@@ -664,8 +598,6 @@ impl<'a> Watch<'a> {
         }
     }
 }
-
-// The rows
 
 /// One row: its name, and a pass's detail or a failure's.
 type Row = (String, Result<String, String>);
@@ -708,8 +640,6 @@ impl Run<'_> {
     }
 
     fn shot(&self, what: &str, device: Option<&str>) -> String {
-        // The virtio-gpu's screen is what the guest last flushed to it: give
-        // the frame aterm just drew a moment to get there.
         std::thread::sleep(Duration::from_secs(1));
         shot(
             self.l(),
@@ -721,10 +651,7 @@ impl Run<'_> {
     }
 
     /// With `--cpu`, `detail` and then what [`Run::held`] says of the
-    /// window's pixels now; `detail` alone without it. A hold that fails
-    /// says how many frames aterm has presented and at what surface size
-    /// ([`presents`]), read once now and once a second later, which tells a
-    /// window aterm stopped presenting to from one it presents wrong.
+    /// window's pixels now; `detail` alone without it.
     fn and_held(&self, s: &Session<'_>, what: &str, detail: String) -> Result<String, String> {
         if !self.cpu {
             return Ok(detail);
@@ -743,14 +670,7 @@ impl Run<'_> {
     /// helper (`readback`, kept as `<arch>-window-cpu-<what>-window.ppm`):
     /// equal exactly when the frame is the client area's size, else the frame
     /// at `dims`' offset and each band pixel the frame's nearest, as the
-    /// Linux lane holds a window the window system sized. What the row's
-    /// detail says of it.
-    ///
-    /// Windows draws no window pixel outside the virtual screen: what the
-    /// readback finds there is what the window held when that pixel was last
-    /// on the screen, or white when it never was, not what aterm presented
-    /// since. So a client area that reaches past the screen's edge is held on
-    /// the part that is on it, and the detail names the part that is not.
+    /// Linux lane holds a window the window system sized.
     fn held(&self, s: &Session<'_>, what: &str) -> Result<String, String> {
         let stem = format!("{}-{}-{what}", self.arch.name(), self.tag());
         let image = s.ctl(&["image", &format!("{stem}-frame.png")])?;
@@ -884,19 +804,7 @@ impl Run<'_> {
     }
 
     /// What aterm presented while rows of its window were past the screen's
-    /// edge, painted once they come back. The window is lifted until its top
-    /// [`LIFT`] client rows are above the virtual screen's top edge; there
-    /// PowerShell clears the screen and prints [`EXPOSED_ECHO`] on those rows
-    /// ([`EXPOSED_TYPED`], sent through `aterm-ctl`), which Windows does not
-    /// draw, and the rows still on the screen are held. Then the window is
-    /// moved back down until all of it is on the screen and held whole:
-    /// Windows invalidates the rows that come back and erases them with the
-    /// class's theme brush, and aterm must paint them although its frame has
-    /// not changed since (`RedrawRequested` with the window owing a repaint,
-    /// then the presenter's copy of the update rectangle). Rows that only
-    /// moved, or that hold the theme's background, would come back right
-    /// without aterm: the erase paints the background, and a row drawn before
-    /// it went past the edge keeps its pixels.
+    /// edge, painted once they come back.
     fn exposed(&self, s: &Session<'_>, what: &str) -> Result<String, String> {
         let at = self.place(s, None)?;
         let ch = i32::try_from(at.client.1).map_err(|_| format!("{at:?}: no height"))?;
@@ -1080,15 +988,9 @@ impl Run<'_> {
 
     fn ime(&self, s: &Session<'_>) -> Result<String, String> {
         let watch = self.watch.then(|| Watch::start(self.up, self.arch, s.pid));
-        // What aterm holds is read before English is put back: the switch
-        // commits an open composition.
         let verdict = self
             .ime_steps(s)
             .map_err(|e| format!("{e}; {}", Self::holds(s)));
-        // The session's input language is shared by every window of it: a
-        // row that failed while Japanese was on puts English back, so the
-        // instances after it (the other arch's, a later run's) start where
-        // this one did.
         let restored = match &verdict {
             Ok(_) => String::new(),
             Err(_) => match self.to_layout(s, ENGLISH) {
@@ -1109,7 +1011,7 @@ impl Run<'_> {
 
     /// The window's keyboard layout made `want` (`0411`, `0409`): Win+Space,
     /// which steps through the session's two input languages, pressed only
-    /// when it is not `want` already. Whether it was pressed.
+    /// when it is not `want` already.
     fn to_layout(&self, s: &Session<'_>, want: &str) -> Result<bool, String> {
         if s.window()?.layout == want {
             return Ok(false);
@@ -1154,9 +1056,6 @@ impl Run<'_> {
                  {CMODE_MASK:#x}): the reading would not compose as `{IME_COMPOSING}`"
             ));
         }
-        // Key by key, each awaited in aterm's composition: a key the IME
-        // never got, or a composition the IME ended early, fails here with
-        // the key it happened at.
         for (c, want) in IME_READING.chars().zip(IME_STEPS) {
             type_text(self.l(), &c.to_string())?;
             Self::composing(
@@ -1304,8 +1203,6 @@ impl Run<'_> {
         let there = self.shot("second-monitor", None);
         let there = self.and_held(s, "second-monitor", there)?;
         chord(self.l(), &["meta_l", "shift", "left"])?;
-        // Windows gives a window that straddles two monitors the DPI of the
-        // one it overlaps most, which need not hold its centre.
         let (w3, d3) = within("Win+Shift+Left back to the scaled primary", || {
             let w = s.window()?;
             let d = s.dims()?;
@@ -1411,8 +1308,6 @@ fn arch_rows(
         rows.push(line);
         ok
     };
-    // One instance through every row; a row that fails ends it (the next
-    // rows need its state), and the rows after it are reported not run.
     println!(
         "windows: {} windowed aterm-gui in lane's desktop …",
         arch.name()
@@ -1447,7 +1342,6 @@ fn arch_rows(
             }
             s.end();
             if !failed {
-                // Launched on the monitor already at 150 %.
                 let at150 = Session::launch(up, arch, 2, ask.cpu).and_then(|s2| {
                     let verdict = run.launch(&s2, "1.50", 144).and_then(|d| {
                         let shot = run.shot("launch-150", Some(GPU_ID));
@@ -1523,7 +1417,6 @@ fn parse_args(args: &[String]) -> Result<Ask, Fail> {
 }
 
 /// `windows window [--arch A]... [--watch] [--cpu]`.
-///
 /// # Errors
 /// A usage error, or the lane could not be brought up (NOT RUN).
 pub fn cmd_window(args: &[String]) -> Res {
@@ -1570,8 +1463,6 @@ pub fn cmd_window(args: &[String]) -> Res {
         }
     }
     let cleanup = up.release();
-    // The tree the run built: the commit, `-dirty` when the checkout had
-    // changes (`windows::build_facts`).
     let tree = windows::build_facts(&repo)
         .into_iter()
         .find(|(k, _)| k == "ATERM_BUILD_GIT_COMMIT")
@@ -1623,7 +1514,6 @@ mod tests {
             .iter()
             .flat_map(|p| [p[0], p[1], p[2]])
             .collect();
-        // The last row past the edge, white.
         window[3 * w * 3..].fill(0xff);
         let place =
             desk::parse_place("readback client=3x4 at=10,7 screen=0,0,100,10").expect("a place");
@@ -1633,9 +1523,7 @@ mod tests {
         let (rgb, _, _) = crop(&window, w, 3, seen);
         assert_eq!((vw, vh), (3, 3));
         assert_eq!(compare_rgb(&rgba, vw, vh, &(rgb, vw, vh), 0..0), Ok(()));
-        // The whole client area is not held: the white row differs.
         assert!(compare_rgb(&frame, w, h, &(window.clone(), w, h), 0..0).is_err());
-        // A pixel wrong on the screen's part still fails.
         window[w * 3 + 1] ^= 1;
         let (rgb, _, _) = crop(&window, w, 3, seen);
         assert_eq!(
@@ -1671,16 +1559,11 @@ mod tests {
         {
             assert!(text.chars().all(|c| desk::qcodes(c).is_some()), "{text}");
         }
-        // The IME's echo holds what only the IME commits: no key types it.
         assert!(IME_ECHO.chars().any(|c| desk::qcodes(c).is_none()));
         let typed = format!("{IME_BEFORE}{IME_READING}{IME_AFTER}");
         assert!(!typed.contains(IME_ECHO));
-        // Without the IME the same keys print the reading, never the echo.
         assert!(format!("IME-{IME_READING}") != IME_ECHO);
-        // The exposure's line prints its echo; the line itself never holds it.
         assert!(!EXPOSED_TYPED.contains(EXPOSED_ECHO));
-        // A width's echo is its tag then digits, which no typed line holds,
-        // and no tag is another's start.
         for (tag, typed) in WIDTH_TAGS.iter().zip(&widths) {
             assert!(
                 !(0..10).any(|d| typed.contains(&format!("{tag}{d}"))),
@@ -1690,8 +1573,6 @@ mod tests {
                 assert!(other == *tag || !other.starts_with(tag), "{tag} {other}");
             }
         }
-        // A step per key of the reading, each the last one grown or turned
-        // into kana, never the conversion.
         assert_eq!(IME_STEPS.len(), IME_READING.chars().count());
         assert!(IME_STEPS.iter().all(|step| !step.contains(IME_CONVERTED)));
         assert!(IME_STEPS.windows(2).all(|w| w[0] != w[1]));

@@ -52,6 +52,7 @@ pub(crate) fn no_lock_modifiers() -> Modifiers {
 }
 
 /// Caps Lock from the kernel's HID system, the macOS lock-key source that never
+/// involves WindowServer.
 #[cfg(target_os = "macos")]
 mod hid_lock_state {
     use std::ffi::{c_char, c_int, c_void};
@@ -75,6 +76,7 @@ mod hid_lock_state {
 
     unsafe extern "C" {
         /// libSystem's own task port (`mach/mach_init.h`); declared here rather
+        /// than through `libc::mach_task_self`, which libc deprecates.
         static mach_task_self_: MachPort;
     }
     #[link(name = "IOKit", kind = "framework")]
@@ -135,6 +137,7 @@ mod hid_lock_state {
 }
 
 /// Windows: the live toggle state from user32 `GetKeyState` (the low bit is the
+/// toggled LED state for `VK_CAPITAL` / `VK_NUMLOCK`).
 #[cfg(windows)]
 #[must_use]
 fn lock_modifiers() -> Modifiers {
@@ -157,6 +160,8 @@ fn lock_modifiers() -> Modifiers {
 }
 
 /// Fallback for [`lock_modifiers`] (not macOS, not Windows): winit exposes no
+/// Caps/Num Lock LED state, so report none until a platform-specific source is
+/// wired.
 #[cfg(not(any(target_os = "macos", windows)))]
 #[must_use]
 fn lock_modifiers() -> Modifiers {
@@ -294,6 +299,8 @@ pub(crate) fn layout_text(
 }
 
 /// The character a chord on key `base` names when the layout typed `glyph`: when `glyph` is
+/// `base`'s letter in either case ([`same_letter`]), that letter in Shift's case (`shift`),
+/// never the lock's.
 #[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 fn chord_letter(glyph: char, base: char, shift: bool) -> char {
     if !same_letter(glyph, base) {
@@ -313,6 +320,8 @@ fn chord_letter(glyph: char, base: char, shift: bool) -> char {
 }
 
 /// Whether `a` and `b` are one character or one letter in two cases: by Unicode's default
+/// lowercase or uppercase, which between them also pair Turkish 'I' with 'ı', plus the
+/// Turkic dotted pair 'İ' and 'i', which neither default mapping takes to the other.
 #[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
 fn same_letter(a: char, b: char) -> bool {
     a == b
@@ -360,6 +369,7 @@ pub(crate) fn build_key_input(
 }
 
 /// A NumLock-on keypad digit pressed with Alt alone: one digit of a Windows Alt
+/// code (Alt, 0, 2, 3, 3 types `é`).
 #[cfg(any(windows, test))]
 fn windows_alt_code_digit(
     logical_key: &WinitKey,
@@ -382,6 +392,7 @@ fn windows_alt_code_digit(
 }
 
 /// Whether a press goes out as its text because a dead key changed what it
+/// types, which its key does not say:
 #[cfg(any(windows, test))]
 fn windows_text_commit(logical_key: &WinitKey, text: Option<&str>, mods: Modifiers) -> bool {
     let chord = Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER;
@@ -412,6 +423,7 @@ pub(crate) fn text_press_repeat(_ev: &KeyEvent, _mods: Modifiers) -> Option<Stri
 }
 
 /// [`text_press_repeat`]'s answer from the press's parts: the logical key's own
+/// character, which winit reports for the second of the two.
 #[cfg(any(windows, test))]
 fn windows_text_repeat(
     logical_key: &WinitKey,
@@ -429,6 +441,7 @@ fn windows_text_repeat(
 }
 
 /// The modifiers and layout text a Windows press carries, given the COMPOSED
+/// key ([`windows_key_input`]) and winit's text for the press.
 #[cfg(any(windows, test))]
 fn windows_composed_text(
     logical_key: &WinitKey,
@@ -474,10 +487,15 @@ fn key_without_modifiers(ev: &KeyEvent) -> WinitKey {
 }
 
 /// `VkKeyScanExW`'s shift-state bits for Ctrl+Alt, i.e. AltGr (`winuser.h`: 1 =
+/// Shift, 2 = Ctrl, 4 = Alt).
 #[cfg(any(windows, test))]
 const SHIFT_STATE_CTRL_ALT: u8 = 0b0000_0110;
 
 /// The Windows half of [`build_key_input`], pure so the layout cases are testable
+/// without a window: `logical_key` is the layout-composed key, `base_key`
+/// `key_without_modifiers()`, `base_layout` the physical key's US-QWERTY identity,
+/// and `layout_shift_state` answers `VkKeyScanExW`'s "which modifiers does this
+/// character need on the current layout?".
 #[must_use]
 #[cfg(any(windows, test))]
 fn windows_key_input(
@@ -504,6 +522,9 @@ fn windows_key_input(
 }
 
 /// Whether `logical_key` is a character the current layout composes with AltGr,
+/// proving the live Ctrl+Alt bits are AltGr's spelling rather than a chord: one
+/// non-control codepoint, not the key's own base identity, that `VkKeyScanExW` says
+/// needs Ctrl+Alt.
 #[cfg(any(windows, test))]
 fn altgr_composed(
     logical_key: &WinitKey,
@@ -522,6 +543,8 @@ fn altgr_composed(
 }
 
 /// `VkKeyScanExW`'s shift state for `c` on the calling thread's layout
+/// (`GetKeyboardLayout(0)`), or `None` when the layout cannot type it (the -1
+/// return), as for every non-BMP character (the API takes one UTF-16 unit).
 #[cfg(windows)]
 fn layout_shift_state(c: char) -> Option<u8> {
     #[cfg(test)]
@@ -565,6 +588,9 @@ pub(crate) mod recorded_layout_shift_state {
 }
 
 /// Recorded Windows key messages on German, French, US and US-International layouts and
+/// through Japanese and Korean input methods, replayed through winit's real key path
+/// (`aterm_window::platform::windows::recorded`) and then through `App::on_key` and the IME arms, down
+/// to the bytes the program reads.
 #[cfg(all(test, windows))]
 #[path = "keymap_win_replay_tests.rs"]
 mod win_replay_tests;
@@ -580,6 +606,7 @@ mod tests {
     }
 
     /// The bytes the shipping encode path writes for one standard-location press:
+    /// [`build_key_input`] into the engine's encoder.
     fn encode_press(
         logical: WinitKey,
         code: KeyCode,
@@ -594,6 +621,7 @@ mod tests {
     }
 
     /// The bytes the shipping encode path writes for one press, each row a
+    /// regression the rewrite fixed or kept:
     #[test]
     fn a_press_encodes_to_its_terminal_bytes() {
         let none = KeyboardMode::empty();
@@ -681,6 +709,7 @@ mod tests {
     }
 
     /// Shift+<symbol> encodes the shifted glyph: AppKit hands over the unshifted base
+    /// key ('2') plus SHIFT and the engine derives '@'.
     #[test]
     fn shift_symbol_encodes_shifted_glyph() {
         let ev = mac_press(KeyCode::Digit2, "@", "2", "@");
@@ -702,6 +731,7 @@ mod tests {
     }
 
     /// The Windows lock-state query (a real `GetKeyState` round-trip) returns only
+    /// the two lock bits.
     #[cfg(windows)]
     #[test]
     fn lock_modifiers_reports_only_lock_bits() {
@@ -713,6 +743,7 @@ mod tests {
     }
 
     /// `VkKeyScanExW`'s answers on the shipped de-DE (`00000407`) and US
+    /// (`00000409`) layout DLLs (1 = Shift, 2 = Ctrl, 4 = Alt, `None` = untypeable).
     fn de_de_shift_state(c: char) -> Option<u8> {
         match c {
             '{' | '[' | '@' | '€' | '}' | ']' | '\\' | '|' | '~' => Some(0b0000_0110),
@@ -731,6 +762,8 @@ mod tests {
     }
 
     /// AltGr spelled LCtrl+LAlt (which Windows accepts and compact/RDP keyboards
+    /// force) types the composed character, not a control byte: winit clears
+    /// Ctrl/Alt only for the right Alt.
     #[test]
     fn de_de_altgr_as_left_ctrl_alt_types_the_character() {
         for (composed, base, want) in [
@@ -768,6 +801,7 @@ mod tests {
     }
 
     /// The right-Alt spelling is winit's own path: it already cleared Ctrl/Alt
+    /// from `ModifiersState`, so the strip leaves the character alone.
     #[test]
     fn de_de_right_alt_altgr_is_unchanged() {
         let (key, mods, _) = windows_key_input(
@@ -783,6 +817,9 @@ mod tests {
     }
 
     /// A genuine Ctrl+Alt+letter chord keeps its modifiers and encodes ESC ^A, both
+    /// when the layout composes nothing (`ToUnicodeEx` returns 0 for Ctrl+Alt+A on US
+    /// and de-DE, so winit reports `Unidentified`) and when it hands back a plain
+    /// letter, which needs no modifiers and so never looks like AltGr.
     #[test]
     fn genuine_ctrl_alt_letter_still_encodes_a_control_sequence() {
         let unidentified = WinitKey::Unidentified(aterm_window::keyboard::NativeKey::Unidentified);
@@ -813,6 +850,8 @@ mod tests {
     }
 
     /// US-QWERTY is structurally out of reach of the strip: no character on it
+    /// needs Ctrl+Alt, so `VkKeyScanExW` never answers 6 and nothing is ever
+    /// stripped — including the '{' that US types with plain Shift.
     #[test]
     fn us_qwerty_is_unaffected() {
         let (_, mods, _) = windows_key_input(
@@ -851,6 +890,8 @@ mod tests {
     }
 
     /// The bytes a Windows press writes, from the pure halves of the Windows
+    /// [`build_key_input`]: `logical` is winit's composed key, `text` its text,
+    /// `locks` the lock bits `on_key` adds after the build.
     fn windows_bytes(
         logical: &str,
         text: &str,
@@ -875,6 +916,8 @@ mod tests {
     }
 
     /// The audit's `layout-shift-reapplied`: Windows hands the encoder the
+    /// glyph the layout already shifted, and the US Shift table shifted it
+    /// again.
     #[test]
     fn windows_non_us_shift_types_the_layouts_character() {
         let shift = Modifiers::SHIFT;
@@ -913,6 +956,8 @@ mod tests {
     }
 
     /// Caps Lock + Shift + a letter types lowercase on Windows (the layout
+    /// lookup applies both), and the encoder, which adds Caps Lock's bit after
+    /// the build, capitalised it again (the audit's `caps-shift-inverted`).
     #[test]
     fn windows_caps_lock_with_shift_types_lowercase() {
         let caps = Modifiers::CAPS_LOCK;
@@ -933,6 +978,8 @@ mod tests {
     }
 
     /// A chord keeps the composed glyph: the SHIFT that composed it is dropped
+    /// when the US table would shift the glyph again (de-DE Alt+Shift+7 is
+    /// `ESC /`, not `ESC ?`).
     #[test]
     fn windows_chords_keep_the_composed_glyph() {
         let alt_shift = Modifiers::ALT | Modifiers::SHIFT;
@@ -975,6 +1022,8 @@ mod tests {
     }
 
     /// The audit's `dead-key-noncomposing-lost`: US-International `'` then `s`
+    /// posts both characters, and winit reports the plain `s` as the key, so
+    /// `it's` typed `its`.
     #[test]
     fn windows_dead_key_that_did_not_compose_types_both_characters() {
         let none = Modifiers::empty();
@@ -993,6 +1042,8 @@ mod tests {
     }
 
     /// A dead key then Space types the accent (German `^` then Space is `^`,
+    /// US-International `'` then Space `'`): Windows posts it for the Space
+    /// press, which winit still names `Space`, and the key path typed a space.
     #[test]
     fn windows_dead_key_then_space_types_the_accent() {
         let space = WinitKey::Named(WinitNamed::Space);
@@ -1014,6 +1065,7 @@ mod tests {
     }
 
     /// A held key after a dead key that did not compose repeats the key's own
+    /// character, as Windows' repeat posts it (`'sss`, not `'s's's`).
     #[test]
     fn windows_dead_key_that_did_not_compose_repeats_the_key_alone() {
         let none = Modifiers::empty();
@@ -1034,6 +1086,7 @@ mod tests {
     }
 
     /// The audit's `alt-numpad-codes`: Alt + a NumLock-on keypad digit is one
+    /// digit of an Alt code, which Windows composes itself; it types nothing.
     #[test]
     fn windows_alt_code_digits_type_nothing() {
         use aterm_window::keyboard::{KeyLocation, NativeKey};
@@ -1074,6 +1127,7 @@ mod tests {
     }
 
     /// The whole Windows builder on real winit events: the same three cases as
+    /// the pure halves above, through `build_key_input` itself.
     #[cfg(windows)]
     #[test]
     fn windows_build_key_input_carries_the_layouts_text() {
@@ -1109,6 +1163,8 @@ mod tests {
     }
 
     /// The macOS lock-state query is a real IOKit HID round-trip (kernel only, see
+    /// `hid_lock_state`) and reports only Caps Lock, or nothing when the HID system
+    /// is unreachable (a sandbox).
     #[cfg(target_os = "macos")]
     #[test]
     fn lock_modifiers_reports_only_caps_lock_from_the_hid_system() {
@@ -1131,6 +1187,7 @@ mod tests {
     }
 
     /// A committed composition is encoded as ordinary text: ASCII to its bytes, CJK
+    /// to its UTF-8.
     #[test]
     fn commit_sends_committed_text() {
         assert_eq!(
@@ -1145,6 +1202,7 @@ mod tests {
     }
 
     /// C0, DEL and C1 (Unicode `Cc`) make a commit a paste, except a lone C0 or DEL
+    /// character (the key X11 commits while an XIM preedit is open).
     #[test]
     fn a_commit_is_a_paste_when_a_control_character_is_not_a_lone_key() {
         for paste in [
@@ -1175,6 +1233,8 @@ mod tests {
     }
 
     /// Under kitty report-all + associated text (+ event types, the mode a
+    /// full-protocol app negotiates) an IME commit is one key-0 event with every
+    /// codepoint colon-joined in the text field.
     #[test]
     fn commit_under_report_all_with_text_is_one_key0_event() {
         let mode = KeyboardMode::REPORT_ALL_KEYS_AS_ESC
@@ -1192,6 +1252,7 @@ mod tests {
     }
 
     /// Key-0 commits drop control-code codepoints; an all-control commit emits
+    /// nothing, never a payload-less `ESC[0;1;u`.
     #[test]
     fn commit_key0_filters_control_codepoints() {
         let mode = KeyboardMode::REPORT_ALL_KEYS_AS_ESC | KeyboardMode::REPORT_ASSOCIATED_TEXT;
@@ -1207,6 +1268,7 @@ mod tests {
     }
 
     /// REPORT_ALL_KEYS_AS_ESC without REPORT_ASSOCIATED_TEXT has no legal field in
+    /// which to carry the IME text.
     #[test]
     fn commit_under_report_all_without_text_is_one_keyless_event() {
         let mode = KeyboardMode::REPORT_ALL_KEYS_AS_ESC;
@@ -1221,7 +1283,7 @@ mod tests {
         );
     }
 
-    /// A real winit press for the seam. `location` is what says keypad, so
+    /// A real winit press for the seam.
     fn press_at(
         code: KeyCode,
         logical: WinitKey,
@@ -1249,6 +1311,7 @@ mod tests {
     }
 
     /// A physical KP_5 resolves to `Numpad5`: `5` in legacy mode, DECKPAM's `SS3 u`
+    /// and kitty's `CSI 57404 u` where those modes ask.
     #[test]
     fn numpad_digit_reaches_the_numpad_encoder() {
         use aterm_types::keyboard::NamedKey;
@@ -1265,6 +1328,8 @@ mod tests {
     }
 
     /// NumLock off with Shift held, xkb's keypad type yields the digit
+    /// (`Character("5")` at `Numpad`, SHIFT set), and it types `5`: on the keypad Shift
+    /// picks a level and, as in xterm, only cancels DECKPAM.
     #[test]
     fn shifted_keypad_digit_types_its_digit_never_the_main_rows_glyph() {
         use aterm_types::keyboard::NamedKey;
@@ -1298,6 +1363,8 @@ mod tests {
     }
 
     /// KP_Enter is NumpadEnter — CR in legacy mode, `SS3 M` under DECKPAM,
+    /// `CSI 57414 u` under kitty disambiguate — so an application can tell it
+    /// from Return.
     #[test]
     fn numpad_enter_is_distinguishable_from_enter() {
         use aterm_types::keyboard::NamedKey;
@@ -1319,6 +1386,7 @@ mod tests {
     }
 
     /// NumLock off, keypad 1 is KP_End: the main block's End bytes in legacy mode
+    /// (kitty's legacy fold) and its own `CSI 57424 u` under disambiguate.
     #[test]
     fn numlock_off_keypad_navigation_keeps_its_keypad_identity() {
         use aterm_types::keyboard::NamedKey;
@@ -1337,7 +1405,7 @@ mod tests {
         );
     }
 
-    /// The negative control: the main block is untouched. `5` above `R` stays
+    /// The negative control: the main block is untouched.
     #[test]
     fn main_row_digit_is_unchanged() {
         use aterm_types::keyboard::NamedKey;
@@ -1362,6 +1430,7 @@ mod tests {
     }
 
     /// A winit press whose modifier-supplement base key differs from `logical_key`,
+    /// as on every X11/Wayland keypad press.
     fn press_at_with_base(
         code: KeyCode,
         logical: WinitKey,
@@ -1384,6 +1453,8 @@ mod tests {
     }
 
     /// On X11/Wayland `key_without_modifiers()` is xkb's level-0 keysym, and the
+    /// keypad type holds the NumLock-off symbol there (`<KP1> { [ KP_End, KP_1 ] }`),
+    /// so a NumLock-on KP_1 has a level-0 `Named(End)`.
     #[test]
     fn numlock_on_keypad_digit_is_not_the_level_zero_keysym() {
         use aterm_types::keyboard::NamedKey;
@@ -1442,6 +1513,8 @@ mod tests {
     }
 
     /// The NumLock-off centre key, which no platform names (xkb's `KP_Begin` is
+    /// `Unidentified`, Windows says `Clear`), is settled by its physical code and
+    /// sends xterm's `CSI E` (`SS3 E` under DECKPAM), never a digit.
     #[test]
     fn numlock_off_keypad_centre_is_the_letter_form_never_a_digit() {
         use aterm_types::keyboard::NamedKey;
@@ -1467,6 +1540,8 @@ mod tests {
     }
 
     /// A press as AppKit builds it: `base` is `key_without_modifiers()`
+    /// (UCKeyTranslate with no modifiers), `logical` and `text` are
+    /// `-characters` under the live modifiers and lock state.
     fn mac_press(code: KeyCode, logical: &str, base: &str, text: &str) -> KeyEvent {
         KeyEvent::synthetic_for_test_with_base(
             PhysicalKey::Code(code),
@@ -1487,6 +1562,9 @@ mod tests {
     }
 
     /// Bug hunt 8: the window carries the layout's character only when the US
+    /// derivation from the unshifted key would type something else — so a US
+    /// press stays the event a controller builds — for a text press and, since
+    /// , a Ctrl or Alt chord.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn layout_text_rides_a_press_only_when_the_layout_differs() {
@@ -1586,6 +1664,8 @@ mod tests {
     }
 
     /// Caps Lock + A and Shift on a non-US layout type the layout's character, in
+    /// legacy mode and every kitty mode that keeps text as text; kitty's report-all
+    /// forms keep the layout's unshifted key as the key code.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn caps_lock_and_non_us_shift_type_the_layouts_character() {
@@ -1635,7 +1715,7 @@ mod tests {
         );
     }
 
-    /// A CHORD UNDER XKB'S CAPS LOCK TAKES SHIFT'S CASE. On X11 and
+    /// A CHORD UNDER XKB'S CAPS LOCK TAKES SHIFT'S CASE.
     #[cfg(target_os = "linux")]
     #[test]
     fn an_xkb_chord_under_caps_lock_takes_shifts_capital() {
@@ -1658,6 +1738,7 @@ mod tests {
     }
 
     /// Ctrl on a Cyrillic layout: the base key 'с' has no control byte, so the
+    /// physical key's US letter names it; kitty keeps reporting the layout's key.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn ctrl_on_a_cyrillic_layout_sends_the_control_byte() {

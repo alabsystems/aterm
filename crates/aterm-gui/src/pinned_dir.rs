@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use crate::durable::Flush;
 
 /// How a new private file is published: the flush that finishes its bytes, and
+/// whether its parent's entries are synced at once or left to the caller's batch
+/// barrier (a video recording's [`PinnedDir::sync`] before its marker).
 #[derive(Clone, Copy)]
 struct Publication {
     flush: Flush,
@@ -25,6 +27,7 @@ pub(crate) fn is_one_component(name: &OsStr) -> bool {
 }
 
 /// Refuse any name that is not one ordinary path component: the empty name, `.`, `..`, any
+/// separator (`/`, and `\` on Windows) and NUL.
 fn validate_component(name: &OsStr) -> io::Result<()> {
     let bytes = name.as_encoded_bytes();
     let separator = |byte: u8| byte == b'/' || (cfg!(windows) && byte == b'\\');
@@ -90,6 +93,7 @@ const REMOVE_MAX_ENTRIES: usize = 16_384;
 /// Descriptor allowance left beside an initial pinned chain by artifact admission.
 pub(crate) const PINNED_DIR_OPERATION_DESCRIPTOR_UNITS: usize = 8;
 /// A wire-published video prune can already own the fresh recording, index,
+/// marker, and candidate recording (four handles).
 const REMOVE_LIVE_FIXED_UNITS: usize = 4;
 const REMOVE_MAX_DEPTH: usize = PINNED_DIR_OPERATION_DESCRIPTOR_UNITS - REMOVE_LIVE_FIXED_UNITS - 1;
 
@@ -427,6 +431,7 @@ mod imp {
         }
 
         /// Atomically publish a fully written temporary file at a previously
+        /// absent final name.
         fn publish_as_new_with_hook(
             self,
             name: &OsStr,
@@ -1400,6 +1405,7 @@ mod imp {
     }
 
     /// Where the object behind `file` lives NOW, as a `\\?\` path — the name
+    /// it was opened by, so a hard link reports the link actually opened.
     fn final_path(file: &std::fs::File) -> io::Result<PathBuf> {
         use std::os::windows::ffi::OsStringExt as _;
         let mut buffer = vec![0_u16; 512];
@@ -1426,6 +1432,7 @@ mod imp {
     }
 
     /// Prove that `entry` — just opened by the path `<parent>\<name>` — is a
+    /// direct child of the directory `parent` retains.
     fn ensure_direct_child(parent: &std::fs::File, entry: &std::fs::File) -> io::Result<()> {
         let entry_path = final_path(entry)?;
         if entry_path.parent() != Some(final_path(parent)?.as_path()) {
@@ -1435,6 +1442,7 @@ mod imp {
     }
 
     /// Flush a retained directory's entries: `FlushFileBuffers`, Windows' only
+    /// flush, on the handle itself.
     fn flush_directory(directory: &std::fs::File) -> io::Result<()> {
         // SAFETY: `directory` owns a live handle for the duration of the call.
         if unsafe { FlushFileBuffers(directory.as_raw_handle().cast()) } == 0 {
@@ -1502,6 +1510,7 @@ mod imp {
     }
 
     /// Open a directory this process will write into (and flush: the
+    /// `GENERIC_WRITE` is what `FlushFileBuffers` needs).
     fn open_mutable_directory(path: &Path, share_delete: bool) -> io::Result<std::fs::File> {
         let share =
             FILE_SHARE_READ | FILE_SHARE_WRITE | if share_delete { FILE_SHARE_DELETE } else { 0 };
@@ -1544,6 +1553,9 @@ mod imp {
     }
 
     /// Open `<parent>\<name>` with DELETE for one rename or removal, and prove
+    /// it is BOTH the directory `expected` retains and, right now, a direct
+    /// child of the directory `parent` retains: the Unix `renameat`/`unlinkat`
+    /// relative to the parent's descriptor.
     fn open_child_for_mutation(
         parent: &std::fs::File,
         path: &Path,
@@ -1561,7 +1573,7 @@ mod imp {
         Ok(file)
     }
 
-    /// Open a retained read guard for an artifact. Unlike the write and directory guards it
+    /// Open a retained read guard for an artifact.
     fn open_regular_file_with_identity(path: &Path) -> io::Result<(std::fs::File, FileIdentity)> {
         let file = std::fs::OpenOptions::new()
             .access_mode(GENERIC_READ)
@@ -1854,6 +1866,8 @@ mod imp {
         }
 
         /// Open the directory at `path` — a name inside this one — and extend
+        /// the chain with it, once its handle is proven to sit in the
+        /// directory this chain retains.
         fn open_child_directory(&self, path: PathBuf) -> io::Result<Self> {
             let child = open_mutable_directory(&path, true)?;
             ensure_direct_child(self.leaf(), &child)?;
@@ -2457,6 +2471,7 @@ mod imp {
     }
 
     /// `SetFileInformationByHandle`'s answer: `Ok` for TRUE, else this thread's
+    /// last OS error, which the call set.
     fn set_information(succeeded: aterm_win32::core::BOOL) -> io::Result<()> {
         if succeeded == 0 {
             Err(io::Error::last_os_error())
@@ -2628,6 +2643,7 @@ mod shared_backend_contract_tests {
     }
 
     /// `remove_file_if_exists` removes a file; a directory on an artifact name survives it on
+    /// every backend.
     #[test]
     fn remove_file_if_exists_never_removes_a_directory() {
         let root = unique_dir("remove-file-is-file-only");
@@ -2685,6 +2701,8 @@ mod shared_backend_contract_tests {
     }
 
     /// A recording is pinned by its producer and, at the same time, by every
+    /// `video frames` reader; retention then renames it to a tombstone and
+    /// clears it through the capability it already holds.
     #[test]
     fn two_pins_of_one_directory_coexist_and_a_renamed_one_still_clears() {
         let root = unique_dir("two-pins-rename-clear");
@@ -2788,6 +2806,7 @@ mod windows_tests {
     };
 
     /// The `FILE_RENAME_INFO` payload carries a NUL terminator inside the request bytes at every
+    /// destination length.
     #[test]
     fn rename_payload_nul_terminates_its_destination_at_every_length() {
         let mut zero_slack_seen = 0usize;
@@ -2983,6 +3002,9 @@ mod windows_tests {
     }
 
     /// The Windows posture of a directory reached through `child`, stated in
+    /// code: it SHARES delete, so another opener may rename it (and every
+    /// retained chain through it then fails closed), but NTFS refuses to
+    /// rename any directory above a live handle, so its ancestors stay put.
     #[test]
     fn windows_child_pins_share_delete_but_pin_every_ancestor() {
         let root = unique_dir("windows-child-posture");
@@ -3015,6 +3037,9 @@ mod windows_tests {
     }
 
     /// A pathname open inside a `child` directory is trusted only once its
+    /// handle is proven to sit in the retained directory — by the path the
+    /// file was actually opened through, so a hard link placed inside cannot
+    /// vouch for the same file reached from outside.
     #[test]
     fn windows_direct_child_proof_follows_the_link_that_was_opened() {
         let root = unique_dir("windows-direct-child");
@@ -3040,6 +3065,8 @@ mod windows_tests {
     }
 
     /// A directory junction at `link`: unlike `symlink_dir` it needs no
+    /// privilege or Developer Mode, so the tests that use it run on every
+    /// host.
     fn junction(link: &std::path::Path, target: &std::path::Path) {
         let plain = |path: &std::path::Path| {
             let text = path.to_str().expect("test paths are UTF-8");
@@ -3063,6 +3090,8 @@ mod windows_tests {
     }
 
     /// REGRESSION: a recording is a `child` directory, which shares delete,
+    /// and between two frame writes nothing is open inside it — so another
+    /// process can rename it aside and put a junction in its place.
     #[test]
     fn windows_swapped_recording_is_neither_written_nor_read_through_the_swap() {
         use std::ffi::OsStr;
@@ -3146,6 +3175,8 @@ mod windows_tests {
     }
 
     /// A retention tombstone renamed under a junction'd parent name is never
+    /// cleared through the junction: the clear opens every entry where the
+    /// retained handle IS and proves it a direct child before removing it.
     #[test]
     fn windows_renamed_recording_clears_only_what_it_retains() {
         use std::ffi::OsStr;
@@ -3231,6 +3262,8 @@ mod tests {
     }
 
     /// An artifact's bytes are only ordered ahead of what follows (aterm-durable's
+    /// counting seam), never fully flushed: the requester is local and reads the
+    /// page cache, and no recovery reads them.
     #[test]
     fn an_artifacts_bytes_are_ordered_and_a_durable_write_stays_durable() {
         use aterm_durable::{Flush, seam::Recording};
@@ -3274,6 +3307,7 @@ mod tests {
     }
 
     /// `O_NOFOLLOW`, `unlinkat` and `renameat` govern only the final component, so `"link/"`,
+    /// `"link/."` and `"link//"` must be refused as names, never resolved through the symlink.
     #[test]
     fn a_trailing_separator_never_reaches_through_a_symlink() {
         use std::ffi::OsStr;
@@ -3319,6 +3353,8 @@ mod tests {
     }
 
     /// A same-uid actor can retarget a symlink between admission and confinement, so admission
+    /// runs against the exact resolved target, and the hard depth ceiling fires too, both before
+    /// any ancestor handle opens.
     #[test]
     fn deep_resolved_path_is_rejected_before_ancestor_chain_open() {
         let root = unique_dir("deep-resolved-budget");
@@ -3430,6 +3466,8 @@ mod tests {
     }
 
     /// A directory lock is an open file description of its own: two locks through one pin
+    /// exclude each other, and a lease released by `LOCK_UN` ([`HeldAdvisoryLock`]) is free at
+    /// once, even while a child forked under it has yet to exec.
     #[test]
     fn directory_lock_has_an_independent_unlock_lifetime() {
         use crate::native_document_host::HeldAdvisoryLock;

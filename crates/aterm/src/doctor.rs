@@ -424,7 +424,7 @@ impl Item for AiAccountsItem {
     fn probe(&self) -> aterm_converge::Probe {
         use aterm_agent::harness::{
             accounts,
-            accounts_sync::{FLEET_ROSTER_FILE, has_init_accounts_source},
+            accounts_sync::{FLEET_ROSTER_FILE, configured_source, has_init_accounts_source},
             cli::Env,
         };
         use aterm_converge::Probe;
@@ -448,9 +448,14 @@ impl Item for AiAccountsItem {
             .parent()
             .map(|p| p.join(FLEET_ROSTER_FILE))
             .unwrap_or_default();
+        let config_path = roster_path
+            .parent()
+            .map(|p| p.join("aterm.toml"))
+            .unwrap_or_else(|| std::path::PathBuf::from("aterm.toml"));
         if let Ok(raw) = accounts::Roster::load(&roster_path)
             && !raw.rows.is_empty()
             && fleet_path.is_file()
+            && configured_source(Some(&config_path), Some(&roster_path)).is_some()
         {
             let bound = store.bound(&raw, env.now).unwrap_or(raw);
             let enrolled = accounts::enrolled(&bound);

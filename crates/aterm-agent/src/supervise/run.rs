@@ -15,14 +15,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::approvals::{self, Ledger};
-use super::classify::{DEFAULT_PYTHON_ALLOW, Verdict, classify_command_with};
+use super::classify::DEFAULT_PYTHON_ALLOW;
 use super::config::Approve;
 use super::config::{Autopilot, SupervisorConfig};
 use super::fx::Fx;
 use super::journal::{CLEARED_MEMORY, CLEARED_TURN_END, Journal};
 use super::limit::{self, ResetSpec};
 use super::phase::{Phase, busy_signal, last_said_index, last_said_row, status_row};
-use super::policy::approval::{Decision, footer_mode};
+use super::policy::approval::{Decision, footer_mode, readings_read_only};
 use super::policy::exception::Exception;
 use super::policy::reset::{
     KeepWhy, ResetAsk, ResetEnd, ResetGo, ResetNo, ResetOffer, ResetOutcome, ResetWord,
@@ -762,6 +762,12 @@ const SETTLE_CAP: Duration = Duration::from_millis(1500);
 const FRAME_WAIT: Duration = Duration::from_secs(61);
 const FRAME_REREADS: u32 = 8;
 const WRITING_CAP: Duration = Duration::from_secs(3);
+/// How long an idle read its reader does not vouch for must stand, every read reading it,
+/// before it is a point: over twice the longest such read measured inside a turn (0.385 s).
+const NO_EVIDENCE_HOLD: Duration = Duration::from_secs(1);
+/// A hang detector for an idle read held while the program's own title says its run goes
+/// on: never a latency budget (the longest end-of-turn review measured took 4.4 s).
+const TITLE_HOLD: Duration = Duration::from_secs(60);
 const UNSCOPED_CAP: Duration = WRITING_CAP;
 const BOXED_BUSY_CAP: Duration = Duration::from_secs(2);
 const COMPACTED_RISE: u8 = 30;
@@ -1961,9 +1967,22 @@ pub struct Session<'a, C: Ctl> {
     host_passed: Option<String>,
     host_follows: Option<(String, u8, bool)>,
     box_first_seen: Option<(String, Instant)>,
+    countdown: Option<approval_loop::Countdown>,
+    episode: Option<approval_loop::Episode>,
+    /// The last read's person count (`Some(None)`: it carried none), the next episode's baseline.
+    last_read_count: Option<Option<u64>>,
+    #[cfg(test)]
+    deny_cap_off: bool,
+    #[cfg(test)]
+    touch_off: bool,
+    #[cfg(test)]
+    episode_per_box: bool,
+    #[cfg(test)]
+    last_box: Option<String>,
+    #[cfg(test)]
+    read_clock: Option<(Instant, u32)>,
     stepper: approval_loop::StepperTrack,
     box_proved: Option<String>,
-    box_seen: Option<(super::policy::box_command::BoxCommand, Instant)>,
     calls_spent: Vec<String>,
     agent_woke: Option<String>,
     draft_held: Option<super::policy::turn_end::Composer>,
@@ -2190,9 +2209,21 @@ impl<'a, C: Ctl> Session<'a, C> {
             agent_woke: None,
             draft_held: None,
             box_first_seen: None,
+            countdown: None,
+            episode: None,
+            last_read_count: None,
+            #[cfg(test)]
+            deny_cap_off: false,
+            #[cfg(test)]
+            touch_off: false,
+            #[cfg(test)]
+            episode_per_box: false,
+            #[cfg(test)]
+            last_box: None,
+            #[cfg(test)]
+            read_clock: None,
             stepper: approval_loop::StepperTrack::default(),
             box_proved: None,
-            box_seen: None,
             calls_spent: Vec::new(),
             claim: claim::Claim::Off,
             claim_said: Vec::new(),
@@ -2421,6 +2452,40 @@ impl<'a, C: Ctl> Session<'a, C> {
         self.setup.person_hold_wait = Some(wait);
     }
 
+    /// Lets a hold on a box outlast its countdown, the deny cap's negative control.
+    #[cfg(test)]
+    pub(crate) fn set_deny_cap_off(&mut self) {
+        self.deny_cap_off = true;
+        self.seeds_learned_state("the loop before the deny cap");
+    }
+
+    /// Reads no box episode as touched, the touch rule's negative control.
+    #[cfg(test)]
+    pub(crate) fn set_touch_off(&mut self) {
+        self.touch_off = true;
+        self.seeds_learned_state("the loop that reads no episode as touched");
+    }
+
+    /// Starts a box episode afresh at every changed box, the episode's negative control.
+    #[cfg(test)]
+    pub(crate) fn set_episode_per_box(&mut self) {
+        self.episode_per_box = true;
+        self.seeds_learned_state("the loop that starts an episode at every box");
+    }
+
+    /// Places each `text` read a second after the one before, the clock its countdowns tick on.
+    #[cfg(test)]
+    pub(crate) fn set_read_clock(&mut self) {
+        self.read_clock = Some((self.fx.mono(), 0));
+        self.seeds_learned_state("the reads' own clock (`set_read_clock`)");
+    }
+
+    #[cfg(test)]
+    fn read_clock_now(&self) -> Option<Instant> {
+        let (set, reads) = self.read_clock?;
+        Some(set + Duration::from_secs(u64::from(reads.saturating_sub(1))))
+    }
+
     /// Advances any active post-wake settle deadline to the current instant for tests.
     #[cfg(test)]
     pub(crate) fn pass_wake_settle(&mut self) {
@@ -2558,6 +2623,12 @@ impl<'a, C: Ctl> Session<'a, C> {
         self.renew_claim_if_due();
         if let Some(refused) = self.claim_refuses(args) {
             return Ok(refused);
+        }
+        #[cfg(test)]
+        if args.first() == Some(&"text")
+            && let Some((_, reads)) = self.read_clock.as_mut()
+        {
+            *reads = reads.saturating_add(1);
         }
         let mut full: Vec<&str> = Vec::with_capacity(args.len() + 1);
         if let Some(sid) = &self.setup.sid {
@@ -2750,8 +2821,22 @@ impl<'a, C: Ctl> Session<'a, C> {
         if super::fx::planted_clock_read() {
             let _ = self.fx.mono();
         }
+        let asked = self.fx.mono();
         let (screen, read_by) = self.read_once()?;
         self.fx.screen_read(&screen);
+        // Tests may put the reads on a clock of their own
+        // ([`Self::set_read_clock`]).
+        #[cfg(test)]
+        let asked = self.read_clock_now().unwrap_or(asked);
+        // The box's auto-deny countdown, placed at the instant the read was
+        // asked for: the vendor's deny, give or take a tick, believed once a
+        // later read sees it tick ([`approval_loop::Countdown`]); and the box
+        // episode, from the first read that shows a box to the first that
+        // shows none, its baseline the person count of the read before it
+        // ([`approval_loop::Episode`]).
+        self.keep_countdown(&screen.rows, asked);
+        self.keep_episode(&screen, self.last_read_count);
+        self.last_read_count = Some(screen.human_seq);
         if self.caps.await_agent.is_none() {
             self.caps.await_agent = Some(screen.generation.is_some());
         }
@@ -3120,6 +3205,27 @@ impl<'a, C: Ctl> Session<'a, C> {
         }
     }
 
+    /// Whether the program's own window title says its run goes on: one `title` read (the
+    /// OSC 0/2 title the program set, whatever is pinned over it, which `status`'s `subject=`
+    /// shows instead). `false` where the reader reads no titles (no read is made) and where
+    /// the host refuses the read.
+    fn title_says_running(&mut self, reader: &dyn ScreenReader) -> Result<bool, Fail> {
+        if reader.title_runs("").is_none() {
+            return Ok(false);
+        }
+        let r = self.call(&["title"])?;
+        if self.unserved(&r) {
+            return Err(Fail::Lost(format!("title failed: {}", r.stderr.trim())));
+        }
+        if !r.ok() {
+            return Ok(false);
+        }
+        let title = r.stdout.trim_end_matches(['\r', '\n']);
+        let title = title.strip_prefix("OK").unwrap_or(title);
+        let title = title.strip_prefix(' ').unwrap_or(title);
+        Ok(reader.title_runs(title) == Some(true))
+    }
+
     fn wait(&mut self, cond: &[&str], step: Duration) -> Result<Wait, Fail> {
         let ms = step.as_nanos().div_ceil(1_000_000).to_string();
         let mut args = vec!["await"];
@@ -3234,6 +3340,13 @@ impl<'a, C: Ctl> Session<'a, C> {
         };
         let mut background_since: Option<Instant> = None;
         let mut footer_seen = false;
+        // Since when every read has been idle (or a question) under the program's own title
+        // saying its run goes on ([`TITLE_HOLD`]); a busy read ends it.
+        let mut title_held: Option<Instant> = None;
+        // Since when every read has been idle with no evidence ([`NO_EVIDENCE_HOLD`]).
+        let mut unvouched_since: Option<Instant> = None;
+        // The next short settle's cap while that hold runs: its read lands as the hold ends.
+        let mut settle_cap = SETTLE_CAP;
         loop {
             // the refusal of its next wait ([`Self::call`]).
             if self.stopped() {
@@ -3250,7 +3363,8 @@ impl<'a, C: Ctl> Session<'a, C> {
                     unsettled = true;
                 }
                 Next::Settle => {
-                    self.wait(&["idle", SETTLE_MS], step.min(SETTLE_CAP))?;
+                    let cap = std::mem::replace(&mut settle_cap, SETTLE_CAP);
+                    self.wait(&["idle", SETTLE_MS], step.min(cap))?;
                     unsettled = true;
                 }
                 Next::Idle => {
@@ -3283,8 +3397,10 @@ impl<'a, C: Ctl> Session<'a, C> {
             if carried {
                 phase = Phase::Busy;
             }
+            let mut transcript_idle = false;
             if phase == Phase::Busy && !carried && self.transcript_wait_over(reader, &screen) {
                 phase = Phase::Idle;
+                transcript_idle = true;
             }
             if phase != Phase::Busy && !writing {
                 // `gone` settles on ([`aterm_core::terminal::GONE_SETTLE`]).
@@ -3298,12 +3414,65 @@ impl<'a, C: Ctl> Session<'a, C> {
                     footer_seen = false;
                     continue;
                 }
+                // An idle read its reader does not vouch for (a row nobody knows, a first
+                // frame, a menu) is a point only once it has stood NO_EVIDENCE_HOLD, every read
+                // between reading it too, or after the idle window held still (`settled`). Each
+                // settle in the hold is capped to land its read as the hold ends, so a standing
+                // one is told NO_EVIDENCE_HOLD after its first read, still or animated. Not for a
+                // read the transcript calls idle, nor while the `/usage` panel or a limit reset's
+                // step is owed (their screens are the loop's).
+                if phase == Phase::Idle
+                    && !settled
+                    && !transcript_idle
+                    && self.probe == UsageProbe::Idle
+                    && self.reset == ResetStep::Idle
+                    && !reader.phase_authoritative(&screen.rows, &phase)
+                    && self.fx.mono() < deadline
+                {
+                    let since = *unvouched_since.get_or_insert(self.fx.mono());
+                    let stood = self.fx.since(since);
+                    if stood < NO_EVIDENCE_HOLD {
+                        settle_cap = NO_EVIDENCE_HOLD.saturating_sub(stood).min(SETTLE_CAP);
+                        next = Next::Settle;
+                        footer_seen = false;
+                        continue;
+                    }
+                } else {
+                    unvouched_since = None;
+                }
+                // An idle or question read under the program's own running title (Muse Code's
+                // end-of-turn review: the reply whole, the screen still, only the title's
+                // spinner says the run goes on) is held, read again after the short settle,
+                // until the title rests, or until the hold has run TITLE_HOLD without a busy
+                // read, when it is taken as it stands. Nothing is typed into the review.
+                if matches!(phase, Phase::Idle | Phase::Question) && self.fx.mono() < deadline {
+                    match title_held {
+                        Some(at) if self.fx.since(at) >= TITLE_HOLD => {
+                            review.note(&format!(
+                                "NOTE seq={} the agent's title still said its run goes on {} s \
+                                 into the hold: its end read as the screen shows it",
+                                screen.seq,
+                                TITLE_HOLD.as_secs()
+                            ));
+                        }
+                        _ if self.title_says_running(reader)? => {
+                            title_held.get_or_insert(self.fx.mono());
+                            next = Next::Settle;
+                            footer_seen = false;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
                 return Ok(Turn {
                     phase,
                     screen,
                     timed_out: false,
                 });
             }
+            // A busy read, or one still writing: neither hold stood.
+            unvouched_since = None;
+            title_held = None;
             if writing {
                 phase = Phase::Busy;
             }
@@ -4569,7 +4738,7 @@ impl<'a, C: Ctl> Session<'a, C> {
         if busy {
             self.survey_held_busy(seq, act, opts, review)
         } else {
-            self.held_for_person(seq, act, true, opts, review)
+            self.held_for_person(seq, act, true, approval_loop::DenyClock::None, opts, review)
         }
     }
 
@@ -5949,7 +6118,11 @@ pub fn render_phase(turn: &Turn, reader: &dyn ScreenReader, python_allow: &[Stri
     match &turn.phase {
         Phase::Prompt => {
             if let Some((p, esc)) = phase_prompt(reader, rows) {
-                out.push_str(&render_prompt(&p, esc, python_allow));
+                let verdict = reader
+                    .prompt(rows)
+                    .filter(|v2| v2.kind == PromptKind::Bash)
+                    .map(|v2| readings_read_only(&v2.readings(), python_allow));
+                out.push_str(&render_prompt(&p, esc, verdict));
             }
             if let Some(token) = reader.prompt(rows).as_ref().and_then(prompt_box_token) {
                 out.push_str(&format!("box {token}\n"));
@@ -6053,11 +6226,9 @@ fn event_summary(turn: &Turn, python_allow: &[String]) -> String {
         return said_summary(reader, turn);
     };
     let classify = if p.kind == PromptKind::Bash {
-        let v = classify_command_with(&p.command, python_allow);
-        if v.read_only {
-            "read-only".to_string()
-        } else {
-            format!("not-read-only:{}", v.reason)
+        match readings_read_only(&p.readings(), python_allow) {
+            Ok(()) => "read-only".to_string(),
+            Err(why) => format!("not-read-only:{why}"),
         }
     } else {
         "-".to_string()
@@ -6323,7 +6494,12 @@ fn emit(out: &mut dyn Write, line: &str) -> Result<(), String> {
         .map_err(|e| format!("cannot write a line to stdout: {e}"))
 }
 
-fn render_prompt(p: &Prompt, esc: Option<&str>, python_allow: &[String]) -> String {
+/// A prompt's lines ([`render_phase`]). `verdict` is the read-only rule's
+/// verdict on a Bash box's command alone ([`readings_read_only`] over every
+/// reading of its rows), said as `classify read-only` or `classify
+/// not-read-only <reason>`; `None` on a Bash box is one whose rows were not
+/// read whole, which is no proof.
+fn render_prompt(p: &Prompt, esc: Option<&str>, verdict: Option<Result<(), String>>) -> String {
     let mut out = format!("kind {}\n", p.kind.name());
     if !p.command.is_empty() {
         out.push_str(&format!("command {}\n", p.command));
@@ -6335,11 +6511,10 @@ fn render_prompt(p: &Prompt, esc: Option<&str>, python_allow: &[String]) -> Stri
         out.push_str(&format!("note {note}\n"));
     }
     if p.kind == PromptKind::Bash {
-        let Verdict { read_only, reason } = classify_command_with(&p.command, python_allow);
-        if read_only {
-            out.push_str("classify read-only\n");
-        } else {
-            out.push_str(&format!("classify not-read-only {reason}\n"));
+        match verdict {
+            Some(Ok(())) => out.push_str("classify read-only\n"),
+            Some(Err(why)) => out.push_str(&format!("classify not-read-only {why}\n")),
+            None => out.push_str("classify not-read-only the box's command was not read whole\n"),
         }
     }
     for (n, text) in &p.options {
@@ -6410,7 +6585,7 @@ pub(crate) use approval_loop::whole_box_decision;
 #[path = "box_head.rs"]
 mod box_head;
 /// Re-exports approval box header search helpers for tape replay.
-pub(crate) use box_head::{SEARCH as HEAD_SEARCH, head_row, head_rows, joined_box};
+pub(crate) use box_head::{SEARCH as HEAD_SEARCH, head_row, head_rows, joined_box, same_box};
 #[path = "claim.rs"]
 mod claim;
 /// Re-exports the write-verb classifier for harness tape accounting.

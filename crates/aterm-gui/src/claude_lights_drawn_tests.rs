@@ -1,13 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE CHIP AS DRAWN (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.5.3
-//! and §12.5.6): `chrome`'s `autopilot` line says the chip's face
-//! now and its cells only as the last frame drew them — never a stale face
-//! for a pane that frame did not draw, never a chip a later band covers,
-//! never a face for a program with no footer. Driven on the real engine
-//! through the capture route's splices, and read against the frame's own
-//! cells and the accessibility tree's own nodes.
+//! THE CHIP AS DRAWN (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.5.3 and §12.5.6): `chrome`'s `autopilot` line says the chip's face now and its cells only as the last frame drew them — never a stale face for a pane that frame did not draw, never a chip a later band covers, never a face for a program with no footer.
 
 use std::time::Instant;
 
@@ -105,7 +99,7 @@ fn drawn(line: &str) -> Option<String> {
 
 /// The Autopilot chip of `session` as the last frame put it on the glass of
 /// window `wid`: the frame's own cells at the chip's hits, in column order,
-/// a wide glyph's right half left out. `None` where no hit of it stands.
+/// a wide glyph's right half left out.
 fn on_glass(app: &App, wid: WindowId, session: u64) -> Option<String> {
     let ws = &app.windows[&wid];
     let mut hits: Vec<(usize, usize)> = ws
@@ -140,10 +134,7 @@ fn node_label(app: &App, wid: WindowId, session: u64) -> Option<String> {
 /// the session's word moved, `face=` says the new face, `drawn=` the face
 /// the frame drew, cell for cell what the frame's glass holds, and
 /// `spoken=` what the chip's accessibility node says of it; after a frame
-/// all three say the new one. NEGATIVE CONTROLS: `drawn=` read from
-/// [`super::ChipFace::of`] (the face now) says `⤓ land` before any frame
-/// drew it; `spoken=` spoken from the face now says land while the node
-/// still says cruise; each fails the second block.
+/// all three say the new one.
 #[test]
 fn chrome_reads_the_chip_the_frame_drew() {
     let (mut app, wid, session, _reader, _host) = desk();
@@ -216,19 +207,12 @@ fn chrome_reads_the_chip_the_frame_drew() {
 /// second in front its line's `drawn=` is the frame's cells, while the first
 /// — its chip's face moved behind — says `drawn=- why=not-drawn spoken=-`
 /// and the new `face=`, before a frame (the frame that drew it is the last
-/// one) and after one. Brought back in front with no frame since, it still
-/// says not-drawn: the last frame drew the other tab. After a frame it says
-/// the new face. NEGATIVE CONTROLS: the pane's leaf looked up in its own
-/// tab's plan instead of the front tab's says the old `∞` while the tab is
-/// behind; a block read without `used` says `why=no-room` once the tab is
-/// back in front with no frame; one that prints the kept block whatever the
-/// last frame did (no `used`, no hit) says the old `∞` there.
+/// one) and after one.
 #[test]
 fn a_background_pane_names_no_drawn_chip() {
     let (mut app, wid, a, _reader, _host) = desk();
     assert_eq!(drawn(&line_of(&app, a)).as_deref(), Some("\u{221E}"));
 
-    // A second tab, in front, running a Claude Code of its own.
     let b = app.next_session_id;
     app.push_stub_tab(wid, crate::stub_session(b));
     assert_eq!(app.focused_session_id(wid), Some(b), "the new tab in front");
@@ -258,7 +242,6 @@ fn a_background_pane_names_no_drawn_chip() {
         "the front tab's drawn= is the frame's cells: {front}"
     );
 
-    // Back in front, no frame since: the last frame drew the other tab.
     app.switch_tab_in(wid, 0);
     assert_eq!(
         app.focused_session_id(wid),
@@ -284,8 +267,7 @@ fn a_background_pane_names_no_drawn_chip() {
 /// the footer (the link caption, the paste question) claims the rule's row
 /// in the window's chrome register; the pointer's, the keyboard's and the
 /// accessibility tree's readers of the hits drop the chip there, and
-/// `chrome` says `drawn=- why=not-drawn spoken=-` too. NEGATIVE CONTROL: the
-/// register ignored prints `drawn="∞"` for a chip nobody can see.
+/// `chrome` says `drawn=- why=not-drawn spoken=-` too.
 #[test]
 fn a_chip_a_band_covers_names_no_cells() {
     let (mut app, wid, session, _reader, _host) = desk();
@@ -297,7 +279,6 @@ fn a_chip_a_band_covers_names_no_cells() {
         .find(|h| h.session == session && h.chip == Some(super::Chip::Autopilot))
         .expect("the chip's hit")
         .term_row;
-    // What `claim_chrome_rows` records for a band over that row.
     app.windows
         .get_mut(&wid)
         .expect("window")
@@ -327,9 +308,6 @@ fn a_chip_a_band_covers_names_no_cells() {
 /// for the footer to take — the frame finds the rule (the keyboard's
 /// register, `footers`) and fits no block — says `drawn=- why=no-room`
 /// under a live host, whatever no frame has noted of the session's view.
-/// NEGATIVE CONTROLS: the register's clause dropped says `not-drawn` (the
-/// rule is on the glass); the host judged from a view no frame noted says
-/// `no-host`.
 #[test]
 fn a_rule_with_no_run_names_no_room() {
     let (mut app, wid, session, _reader) = app();
@@ -369,8 +347,7 @@ fn a_rule_with_no_run_names_no_room() {
 
 /// A SESSION CO-VIEWED IN TWO WINDOWS PRINTS A LINE IN EACH, TOLD APART BY
 /// `window=`: each window's line says the cells that window's last frame
-/// drew. NEGATIVE CONTROL: a line with no `window=` leaves the two lines
-/// one sid and nothing between them, and fails.
+/// drew.
 #[test]
 fn a_co_viewed_session_names_each_window() {
     let (mut app, wid, session, _reader, _host) = desk();
@@ -398,9 +375,7 @@ fn a_co_viewed_session_names_each_window() {
 }
 
 /// GEMINI CLI HAS NO FOOTER, SO NO CHIP: its line says `face=- drawn=-
-/// why=no-footer spoken=- description=-`, its mode notwithstanding. NEGATIVE CONTROL:
-/// `drawn_for` ignored prints its face (`face=cruise`); and the same pane
-/// running Claude Code prints one.
+/// why=no-footer spoken=- description=-`, its mode notwithstanding.
 #[test]
 fn the_chip_line_names_no_chip_for_gemini() {
     let (mut app, wid, session, _reader) = app();
@@ -417,7 +392,6 @@ fn the_chip_line_names_no_chip_for_gemini() {
             sid.as_str()
         )
     );
-    // Control: the same pane running Claude Code wears a face.
     claude(&app, session);
     frame(&mut app, wid);
     let line = line_of(&app, session);
@@ -457,17 +431,13 @@ fn node_description(app: &App, wid: WindowId, session: u64) -> Option<String> {
 /// `description="Needs you: <the need>. Carrying on."`; under `⤓ land` with
 /// a read hold, `spoken="Autopilot: land."` still (the painted word, WCAG
 /// 2.5.3) and a description that leads `Not landed yet.` and names the
-/// need in the hold, once; each the accessibility node's own. A worker's
-/// `▸` is said as a comma against the word before it. NEGATIVE CONTROL (as
-/// run): `drawn_chip_line` printing `description=-` whatever the node says
-/// fails the need's line.
+/// need in the hold, once; each the accessibility node's own.
 #[test]
 fn chrome_says_the_chips_description_as_its_node_does() {
     use crate::harness_glass::hold_tests::held;
     let (mut app, wid, session, _reader, _host) = desk();
     let line = line_of(&app, session);
     assert_eq!(token(&line, "description"), "-", "{line}");
-    // A need with the worker's own `▸`: said a comma against its word.
     need(
         &mut app,
         session,
@@ -530,7 +500,6 @@ fn chrome_says_the_chips_description_as_its_node_does() {
         node_description(&app, wid, session),
         "{line}"
     );
-    // The need taken down: the hold names one earlier in its reply.
     need(&mut app, session, None);
     let line = line_of(&app, session);
     assert!(
@@ -547,9 +516,7 @@ fn chrome_says_the_chips_description_as_its_node_does() {
 /// and under `⤓ land` with a read hold, the hold's title form right after
 /// the mode phrase — what the block read off the session's own glass and
 /// timeline, where the face tests hand `autopilot_title` its words
-/// themselves. NEGATIVE CONTROL (as run): the block's `read_words`
-/// answering `(None, None)` draws the title without the need and fails the
-/// first assert.
+/// themselves.
 #[test]
 fn the_hovered_title_on_the_glass_says_the_need_and_the_hold() {
     use super::super::gesture_tests::{footer_row, row_text};
@@ -625,9 +592,7 @@ fn a_shell_pane_prints_no_chip_line() {
 /// CELLS ONLY WHERE THE CHIP REACHED THE GLASS: a block the frame fitted
 /// and lent, and that came back, but whose chips the rule's write never took
 /// (no hit of them), says `no-room`; once the painter notes its hits, the
-/// cells. A pane whose session has no host says `no-host`. NEGATIVE
-/// CONTROL: the hit rule removed prints `∞` for the block the rule did not
-/// take, and fails the first half.
+/// cells.
 #[test]
 fn a_chip_the_rule_did_not_take_names_no_cells() {
     let blank = aterm_core::terminal::RenderCell {
@@ -654,7 +619,6 @@ fn a_chip_the_rule_did_not_take_names_no_cells() {
         "another leaf: not drawn"
     );
 
-    // The painter notes the chip's hits where the write took its row.
     let painted = w.fitted[0].block.as_ref().expect("the block is home");
     let cols = painted.cols.clone();
     for (span, chip) in cols {
@@ -675,7 +639,6 @@ fn a_chip_the_rule_did_not_take_names_no_cells() {
         "a band over row 22 hides it"
     );
 
-    // No host: the rule is drawn and no chip is (`face=unhosted`).
     let mut w = WindowLights::default();
     w.note_autopilot(8, None, AutopilotView::Unhosted, now);
     w.clear_hits();

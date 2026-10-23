@@ -1,30 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What a surface lets one run do (design §3.2): which classes an apply run applies,
-//! whether the run's process is a shell of its user's own account, and whether that user
-//! is at this Mac's console. And `--only`: the items a run keeps (§5, `aterm doctor
-//! --only`, `aterm init --only`).
+//! What a surface lets one run do (design §3.2).
 
 use crate::Item;
 use crate::model::{Class, Effect, Explain, Layer, Probe, Requires, StoodAside};
 
-/// The surface's half of a run (design §3.2): what its [`crate::Mode::Apply`] applies and
-/// which preconditions hold where it runs. An item of a class the surface does not apply
-/// is probed and planned, never applied. Where the process is not a shell of its user's
-/// own account ([`Requires::Account`]), every item is still probed, and a change one would
-/// make is `Blocked` ([`not_own_account`]): nothing is applied, refreshed or journaled. A
-/// [`Requires::Console`] item where the user is not at the console (or not in their own
-/// account) is not probed at all, and its row is `Blocked`.
+/// The surface's half of a run (design §3.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Scope {
     /// The classes an apply run applies.
     pub applies: &'static [Class],
     /// Whether the run's user owns `/dev/console`.
     pub at_console: bool,
-    /// Why the run's process is not a shell of its user's own account (root, a `$HOME`
-    /// that is not the account's home, a private state root:
-    /// `aterm_types::dirs::not_own_account`), or `None` in one.
+    /// Why the run's process is not a shell of its user's own account, or `None` in one.
     pub not_own_account: Option<&'static str>,
 }
 
@@ -42,18 +31,14 @@ impl Scope {
     /// The two repair classes: what bare `aterm doctor` and `aterm pkg repair` apply.
     pub const REPAIR_CLASSES: &'static [Class] = &[Class::Relay, Class::Asked];
 
-    /// Bare `aterm doctor`'s and `aterm pkg repair`'s scope in the account's own shell: the
-    /// two repair classes. Their items all run from any shell of the account
-    /// ([`Requires::Account`]); a surface states where it runs in
-    /// [`Scope::not_own_account`].
+    /// Bare `aterm doctor`'s and `aterm pkg repair`'s scope in the account's own shell.
     pub const REPAIR: Self = Self {
         applies: Self::REPAIR_CLASSES,
         at_console: true,
         not_own_account: None,
     };
 
-    /// Every class, at the console, in the account's own shell: what [`crate::run`] and
-    /// [`crate::run_with`] give, and what every surface had before scopes existed.
+    /// Every class, at the console, in the account's own shell.
     pub const EVERY: Self = Self {
         applies: Self::EVERY_CLASS,
         at_console: true,
@@ -67,8 +52,7 @@ impl Scope {
         self.applies.contains(&class)
     }
 
-    /// Whether an item that `requires` this may change anything here: an account item in
-    /// the account's own shell, a console item there and at the console.
+    /// Whether an item that `requires` this may change anything here.
     #[inline]
     #[must_use]
     pub const fn admits(self, requires: Requires) -> bool {
@@ -79,9 +63,8 @@ impl Scope {
     }
 }
 
-/// The line a [`Requires::Console`] item's row carries where the run's user is not at
-/// this Mac's console (design §3.2: base and develop items run over SSH; workstation items
-/// do not).
+/// The line a [`Requires::Console`] item's row carries where the run's user is not at this Mac's
+/// console (design §3.2: base and develop items run over SSH; workstation items do not).
 pub const NOT_AT_CONSOLE: &str = "run at this Mac's console: this login does not own it \
                                   (another user is logged in there, or this is a remote \
                                   shell)";
@@ -111,10 +94,7 @@ impl Layer {
     }
 }
 
-/// Whether the `--only` word `token` names a row: its family (`pkg`, `shell`), its layer
-/// (`base`), its id, or an id it is a prefix of up to a `.` or an `@` (`base.pkg` names
-/// `base.pkg.shims`, `base.shell.rc` names `base.shell.rc@.zshrc`). One rule for the items
-/// a run keeps ([`select`]) and for rows a surface read without an item.
+/// Whether the `--only` word `token` names a row.
 #[must_use]
 pub fn selects(token: &str, id: &str, family: &str, layer: Option<Layer>) -> bool {
     if token.is_empty() {
@@ -127,11 +107,10 @@ pub fn selects(token: &str, id: &str, family: &str, layer: Option<Layer>) -> boo
             .is_some_and(|rest| rest.is_empty() || rest.starts_with(['.', '@']))
 }
 
-/// The items `tokens` select ([`selects`]), in composition order, each with its `after`
-/// edges narrowed to the items kept (a run of `base.shell.rc` alone does not wait for
-/// the hooks item it left out, as machines' `--only <table>` never did), and the tokens
-/// that selected nothing, for the surface to refuse. No tokens keeps every item, as it
-/// is.
+/// The items `tokens` select ([`selects`]), in composition order, each with its `after` edges
+/// narrowed to the items kept (a run of `base.shell.rc` alone does not wait for the hooks item it
+/// left out, as machines' `--only <table>` never did), and the tokens that selected nothing, for
+/// the surface to refuse.
 #[must_use]
 pub fn select<'a>(
     items: Vec<Box<dyn Item + 'a>>,
@@ -168,12 +147,7 @@ pub fn select<'a>(
     (narrowed, unmatched)
 }
 
-/// `items` whose apply stands aside with `aside` instead of acting: each is probed as
-/// usual, one already as wanted reads `Ok`, and one that would change is `Blocked` with
-/// `aside` and changes nothing (design §3.2: `aterm init` over a store lock an install
-/// pass holds runs its base repair items this way, and exits 75 when they are all that is
-/// left; bare `aterm doctor` does too, and says so in a note). Nothing is refreshed, and
-/// no journal line is written for the change nobody makes.
+/// `items` whose apply stands aside with `aside` instead of acting.
 #[must_use]
 pub fn standing_aside<'a>(
     items: Vec<Box<dyn Item + 'a>>,
@@ -244,22 +218,17 @@ impl Item for Aside<'_> {
     }
 }
 
-/// `items` whose change cannot be made in this run for a reason no retry clears (a store
-/// lock that could not even be taken: an unwritable or symlinked prefix): each is probed as
-/// usual, one already as wanted reads `Ok`, and one that would change reads `Blocked` with
-/// what it would have changed and `why`, so its surface counts it as left undone (exit 1),
-/// never as standing aside (`standing_aside`, 75). Nothing is applied, refreshed or
-/// journaled.
+/// `items` whose change cannot be made in this run for a reason no retry clears (a store lock that
+/// could not even be taken: an unwritable or symlinked prefix): each is probed as usual, one
+/// already as wanted reads `Ok`, and one that would change reads `Blocked` with what it would have
+/// changed and `why`, so its surface counts it as left undone (exit 1), never as standing aside
+/// (`standing_aside`, 75).
 #[must_use]
 pub fn held_back<'a>(items: Vec<Box<dyn Item + 'a>>, why: &str) -> Vec<Box<dyn Item + 'a>> {
     hold(items, why, false)
 }
 
-/// `items` a run leaves as they are now: each made its change once and something changed it
-/// since (the person, in what is theirs), so a later run that was not asked to make it again
-/// does not. Each is probed as usual, one already as wanted reads `Ok`, and one that would
-/// change reads `NotApplicable` with what it reads now and `why`: nothing is wrong and
-/// nothing is to do. Nothing is applied, refreshed or journaled.
+/// `items` a run leaves as they are now.
 #[must_use]
 pub fn left_as_is<'a>(items: Vec<Box<dyn Item + 'a>>, why: &str) -> Vec<Box<dyn Item + 'a>> {
     hold(items, why, true)
@@ -740,7 +709,6 @@ mod tests {
                 assert!(rows[1].explain.is_some(), "{rows:?}");
             }
         }
-        // Nothing of the console item was read away from the console.
         let console = Placed::new("workstation.y", Class::Preference, Requires::Console);
         let probed = Arc::clone(&console.probed);
         let items: Vec<Box<dyn Item>> = vec![Box::new(console)];
@@ -772,7 +740,6 @@ mod tests {
         );
         assert_eq!(preference_applied.load(Ordering::SeqCst), 0);
         assert_eq!(relay_applied.load(Ordering::SeqCst), 1);
-        // Relay alone (an unattended lane) plans the asked item too.
         let relay_only = Scope {
             applies: &[Class::Relay],
             ..Scope::REPAIR
@@ -819,7 +786,6 @@ mod tests {
         assert!(!selects("shell", "base.pkg.shims", "pkg", base));
         assert!(!selects("workstation", "base.pkg.shims", "pkg", base));
         assert!(!selects("", "base.pkg.shims", "pkg", base));
-        // The layer word names a row through its layer, never through its spelling.
         assert!(selects("develop", "develop.checkout@~/aterm", "git", None));
         assert!(!selects("workstation", "base.pkg.shims", "pkg", None));
     }
@@ -860,7 +826,6 @@ mod tests {
             "the left-out hooks item is no edge"
         );
         assert_eq!(unmatched, ["nosuch"]);
-        // The narrowed run is runnable: its order no longer names the hooks item.
         let rows = crate::run(&kept, Mode::Plan, &mut NoJournal).unwrap();
         assert_eq!(rows[0].outcome, Outcome::Planned);
 
@@ -891,7 +856,6 @@ mod tests {
             probes: Mutex::new(vec![ok()]),
             ..Placed::new("base.shell.hooks", Class::Relay, Requires::Account)
         };
-        // What waits for an item that stood aside stands aside with it.
         let waits = Placed {
             after: vec!["base.pkg.shims".into()],
             ..Placed::new("base.pkg.exec-roots", Class::Relay, Requires::Account)
@@ -924,7 +888,6 @@ mod tests {
         );
         assert_eq!(would_probed.load(Ordering::SeqCst), 1);
         assert_eq!(would_applied.load(Ordering::SeqCst), 0, "nothing applied");
-        // Narrowed by `--only`, it still stands aside.
         let (kept, _) = select(items, &["base.pkg.shims".into()]);
         let rows = crate::run(&kept, Mode::Apply, &mut journal).unwrap();
         assert_eq!(rows[0].stood_aside, Some(lock), "{rows:?}");

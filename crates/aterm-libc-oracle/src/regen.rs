@@ -1,65 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-libc-oracle regen` — regenerate `crates/aterm-libc`'s four cell
-//! modules and the oracle's four conformance modules from measurements of the
-//! REFERENCE libc, then format them.
-//!
-//! Every value written is a fact about one platform's ABI, and a wrong one does
-//! not fail to compile: it passes the wrong flag to a syscall. So nothing is
-//! transcribed. Two ground truths, per cell:
-//!
-//! 1. the reference's rustdoc JSON for that triple ([`decls`]): constant values,
-//!    signatures, `link_name`s, field names and types, discriminants;
-//! 2. const-eval probes compiled for that triple ([`probe`]): sizes,
-//!    alignments, public-field offsets and the bytes of struct-valued
-//!    initialisers, measured even for a triple this box cannot execute.
-//!
-//! [`layout`] reproduces `repr(C)` and is held to every measured offset before
-//! it places the padding standing in for libc's private fields; [`shim`] writes
-//! the shim's cell modules and [`oracle`] the conformance modules, both from ONE
-//! declaration set ([`crate::closure`], the function the gate's shape phase also
-//! uses), and the oracle's coverage audit fails the run on any declaration the
-//! oracle does not check.
-//!
-//! The cell this box is native to is documented and probed under Trust; every
-//! other cell under a stock rustup toolchain (`--stock`, default `stable`, with
-//! each cross triple's std installed) — this crate's one STOCK EXCEPTION, since
-//! Trust ships std for its host only. Rustdoc dumps made elsewhere (on a box native
-//! to their cell) are used instead when `--docs` holds them, named
-//! `libc-0.2.186-<triple>.json`.
-//!
-//! The written files are formatted with `trustfmt`, so regeneration is
-//! idempotent and a `git diff` after it is a real divergence.
-//!
-//! # Regenerating
-//!
-//! ```sh
-//! targo --unverified run -q -p aterm-libc-oracle -- regen
-//! git diff crates/aterm-libc libc-oracle/conformance
-//! ```
-//!
-//! It needs the pinned Trust toolchain, the stock toolchain with the three
-//! triples this box is not native to (`rustup target add --toolchain stable
-//! x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu`,
-//! minus the host), and `libc 0.2.186` in the registry cache: every build is
-//! `--offline`, so a run without it exits 3 naming the one fetch to make
-//! (`targo fetch --manifest-path <work>/reference/Cargo.toml`). The scratch
-//! `<work>` is `libc-oracle/target.noindex/regen` unless `--work` names another.
-//! To document a cell on the box native to it instead, run `targo --unverified
-//! rustdoc -q -p libc --manifest-path <work>/reference/Cargo.toml --
-//! -Zunstable-options --output-format json` there and pass the resulting
-//! `target/doc/libc.json`, renamed, through `--docs`.
-//!
-//! Every cell is generated before any module is written, so a run that stops
-//! leaves the tree as it was.
-//!
-//! The item list, `libc-oracle/union.json`, only ever grows, and it is widened
-//! from the compiler rather than from a source scan: check the workspace for
-//! the cell with `--message-format short`, feed the log to `aterm-libc-oracle
-//! harvest --cell <key> --write <log>` ([`crate::harvest`]), regenerate, and
-//! repeat to a fixed point.
+//! `aterm-libc-oracle regen` — regenerate `crates/aterm-libc`'s four cell modules and the oracle's four conformance modules from measurements of the REFERENCE libc, then format them.
 
+//! each cross triple's std installed) — this crate's one STOCK EXCEPTION, since
+//! Trust ships std for its host only.
 pub mod behaviour;
 pub mod decls;
 pub mod handwritten;
@@ -150,8 +95,6 @@ impl Compiler<'_> {
     ) -> Command {
         let mut command = match self {
             Self::Trust(trust) => {
-                // From the crate, so the checkout's config applies; no
-                // `--target`, which would withhold it from host units.
                 let mut command = aterm_uds::spawnfd::command(&trust.targo);
                 command
                     .arg("--unverified")
@@ -162,8 +105,6 @@ impl Compiler<'_> {
                 command
             }
             Self::Stock(stock) => {
-                // From `/`, so no checkout config (its `-Z` tables) reaches a
-                // stock compiler; rustdoc's JSON is unstable there.
                 let mut command = aterm_uds::spawnfd::command(&stock.cargo);
                 command
                     .args(words)
@@ -235,9 +176,7 @@ impl Reference {
         })
     }
 
-    /// Run one offline cargo command for `cell` and read what it reported. A
-    /// full disk or a reference not yet downloaded is a stop that says nothing
-    /// about the cell.
+    /// Run one offline cargo command for `cell` and read what it reported.
     fn cargo(
         &self,
         compiler: &Compiler<'_>,
@@ -407,7 +346,6 @@ fn read_doc(path: &Path, cell: &Cell) -> Result<Doc, Stop> {
 }
 
 /// One cell's reference rustdoc: a supplied dump, else documented here.
-///
 /// # Errors
 /// When the dump cannot be read or made.
 fn reference_doc(
@@ -539,15 +477,9 @@ fn print_report(report: &CellReport, sink: &mut dyn Write) -> std::io::Result<()
     )
 }
 
-/// Regenerate every cell, then write and format the modules, then fail on any
-/// coverage gap. Every cell is generated before anything is written, so a run
-/// that stops on a cell leaves the tree as it was; the modules are written even
-/// when the audit fails, so the gap can be read in place.
-///
+/// Regenerate every cell, then write and format the modules, then fail on any coverage gap.
 /// # Errors
-/// [`Stop::CouldNotRun`] when a prerequisite is missing; [`Stop::Failed`]
-/// when the reference, the measurements, the layout engine or the audit
-/// refused, the reason named.
+/// [`Stop::CouldNotRun`] when a prerequisite is missing; [`Stop::Failed`] when the reference, the measurements, the layout engine or the audit refused, the reason named.
 pub fn regen(options: &Options, sink: &mut dyn Write) -> Result<Vec<PathBuf>, Stop> {
     let union = Union::load(&options.root)?;
     let toolchains = Toolchains::find(&options.root, &options.stock, &CELLS)?;
@@ -595,9 +527,7 @@ pub fn regen(options: &Options, sink: &mut dyn Write) -> Result<Vec<PathBuf>, St
     Ok(written)
 }
 
-/// One cell's reference rustdoc, for `harvest`: a supplied dump, else
-/// documented under that cell's compiler.
-///
+/// One cell's reference rustdoc, for `harvest`: a supplied dump, else documented under that cell's compiler.
 /// # Errors
 /// As [`regen`].
 pub fn reference_for(options: &Options, cell: &Cell) -> Result<Doc, Stop> {

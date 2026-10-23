@@ -46,15 +46,21 @@ use aterm_effects::pipeline::EffectsPipeline;
 use aterm_render::{RenderInput, Renderer, SpillBand, Theme};
 
 /// Histories at or below this many lines are rewrapped inline by `resize`, as in
+/// aterm-gui and aterm-wasm.
 const INLINE_REFLOW_MAX_LINES: usize = 20_000;
 
 /// Safety net for a host that never pumps: after this many `render` /
+/// `render_offscreen` calls with a stashed rewrap (~2 s at 60 fps), each frame
+/// runs one budgeted step.
 const REFLOW_PUMP_GRACE_RENDERS: u32 = 120;
 
 /// Safety net for a host that never renders or pumps: past this lazy-buffer
+/// backlog, every `process` call pumps one budgeted step, so the rewrap
+/// converges in short tasks.
 const REFLOW_BACKLOG_MAX_LINES: usize = 20_000;
 
 /// Default per-pump rewrap budget in input history lines (tunable via
+/// [`AtermGpuTerminal::pump_reflow_budget`]); a few milliseconds of work.
 const REFLOW_STEP_BUDGET_LINES: usize = 2_000;
 
 #[cfg(target_arch = "wasm32")]
@@ -65,6 +71,7 @@ use aterm_gpu::{GpuRenderer, GpuSurface, WindowGpu};
 
 std::thread_local! {
     /// Host-registered font blobs, copied across the JS/wasm boundary once per
+    /// module.
     static REGISTERED_FONTS: std::cell::RefCell<Vec<std::sync::Arc<Vec<u8>>>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -144,6 +151,7 @@ pub struct AtermGpuTerminal {
 }
 
 /// Frame-gate key: every input of a rendered frame that can change between two
+/// `render()` calls at stable dims/config.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct FrameGateKey {
     damage_epoch: u64,
@@ -155,12 +163,15 @@ struct FrameGateKey {
 #[derive(Default)]
 struct GpuDisplayRowCache {
     /// `(alt_screen, content_gen, display_offset, row)` the cached cells were
+    /// resolved at.
     key: Option<(bool, u64, usize, u16)>,
     /// `(grapheme, is_wide)` per display column of `key.row`.
     cells: Vec<(String, bool)>,
 }
 
 /// Keep the engine's implicit cells and OSC 110/111/112/117 reset baselines
+/// aligned with the renderer theme: frame refills take sparse row tails and
+/// selection colours from `Terminal`, so a renderer-only theme change is lost.
 #[inline]
 fn apply_terminal_theme_colors(term: &mut Terminal, fg: u32, bg: u32, cursor: u32, selection: u32) {
     let mut base = term.color_baseline();
@@ -179,6 +190,8 @@ struct GpuState {
 }
 
 /// Convert the GPU crate's typed swapchain failure into the string error
+/// exposed across the module boundary; target-neutral so native tests can prove a
+/// dropped present never becomes `Ok(())`.
 #[cfg(any(target_arch = "wasm32", test))]
 fn webgl_present_result(result: Result<(), SurfacePresentFailure>) -> Result<(), String> {
     result.map_err(|failure| format!("WebGL canvas present failed: {failure:?}"))
@@ -187,6 +200,8 @@ fn webgl_present_result(result: Result<(), SurfacePresentFailure>) -> Result<(),
 #[cfg(any(target_arch = "wasm32", test))]
 impl AtermGpuTerminal {
     /// The CPU face `init` builds the GPU renderer on: from the injected font
+    /// bytes at the live face's px, without system font discovery, carrying every
+    /// face and setting the host applied before init.
     fn gpu_face(&self) -> Result<Renderer, String> {
         let mut cpu = Renderer::from_bytes(&self.font_bytes, self.cpu.px(), self.theme)?;
         cpu.set_runtime_font_discovery(false);
@@ -224,6 +239,7 @@ impl AtermGpuTerminal {
 
 impl AtermGpuTerminal {
     /// Frame gate: run the two frame-boundary pumps, then decide whether this
+    /// tick draws.
     fn open_frame(&mut self) -> Option<FrameGateKey> {
         self.pump_reflow_on_render_tick();
         self.drain_compress_backlog_on_render();
@@ -246,7 +262,7 @@ impl AtermGpuTerminal {
         Some(key)
     }
 
-    /// Record the frame `build_frame` just produced as the one on glass. The
+    /// Record the frame `build_frame` just produced as the one on glass.
     #[inline]
     fn record_presented_frame(&mut self, key: FrameGateKey) {
         self.last_frame_key = Some(key);
@@ -254,6 +270,7 @@ impl AtermGpuTerminal {
     }
 
     /// Build one frame into the kept scratch; shared by `render`,
+    /// `render_offscreen` and the native `render_headless` seam.
     fn build_frame(&mut self) {
         let _ = self.band.undo(&mut self.frame_scratch, self.rows);
         self.refill_frame_scratch();
@@ -268,6 +285,9 @@ impl AtermGpuTerminal {
     }
 
     /// Refill every engine-owned frame channel and consume the frame's damage
+    /// session through the engine's one damage consumer,
+    /// [`Terminal::cell_frame_damage_scoped_into`]: only damaged rows re-resolve
+    /// under its continuity proof, else it refills fully.
     #[inline]
     fn refill_frame_scratch(&mut self) {
         let refill =
@@ -318,6 +338,8 @@ impl AtermGpuTerminal {
     }
 
     /// Size the live swapchain to the frame [`Self::build_frame`] composes:
+    /// the grid plus committed band rows at the renderer's pad and
+    /// head.
     fn size_swapchain(&mut self) {
         let Ok((w, h)) = self.checked_surface_size() else {
             return;
@@ -329,6 +351,8 @@ impl AtermGpuTerminal {
     }
 
     /// Read one `(grapheme, is_wide)` display cell through the single-slot row
+    /// cache, refreshed from [`Terminal::display_row_grapheme_cells`] only when the
+    /// key changes.
     fn with_display_row_cell<T>(
         &self,
         row: u16,
@@ -360,6 +384,7 @@ impl AtermGpuTerminal {
 }
 
 /// The renderer half of a theme install, which `theme_api` (shared with
+/// aterm-wasm) calls on whichever crate compiles it.
 impl AtermGpuTerminal {
     /// The CPU face: the GPU face wraps a copy of it and reads its floors, theme and opacity off it.
     #[inline]
@@ -883,6 +908,7 @@ impl AtermGpuTerminal {
     }
 
     /// Render-tick safety net (see `REFLOW_PUMP_GRACE_RENDERS`): after the grace
+    /// window, one budgeted step per frame.
     #[inline]
     fn pump_reflow_on_render_tick(&mut self) {
         if self.pending_reflow.is_none() {
@@ -897,6 +923,7 @@ impl AtermGpuTerminal {
     }
 
     /// Output safety net (see `REFLOW_BACKLOG_MAX_LINES`), called by `process`:
+    /// one budgeted step per call while staged output is past the cap.
     #[inline]
     fn pump_reflow_on_output(&mut self) {
         if self.pending_reflow.is_some() && self.term.lazy_backlog_len() > REFLOW_BACKLOG_MAX_LINES
@@ -1031,6 +1058,7 @@ impl BudgetedSearchResult {
 
 impl AtermGpuTerminal {
     /// Expand an OSC-8 hyperlink to the span of contiguous cells sharing its
+    /// link.
     fn osc8_span(&self, row: u16, col: u16) -> (u16, u16) {
         let same = |c: u16| -> bool {
             let id_here = self.term.hyperlink_id_at(row, col);
@@ -1202,6 +1230,8 @@ impl AtermGpuTerminal {
     }
 
     /// Shared GPU bring-up for `init` and `init_offscreen`: context and
+    /// pending canvas surface from `target`, then the renderer and swapchain
+    /// config.
     fn init_with_target(&mut self, target: aterm_gpu::web::CanvasTarget) -> Result<(), String> {
         let (w, h) = self.checked_surface_size()?;
         let (ctx, canvas_surface) = GpuContext::for_canvas(target)?;
@@ -1391,10 +1421,11 @@ mod tests {
 
     use super::*;
 
-    /// The bundled face, injected as a JS host would. Paste tests use it so a
+    /// The bundled face, injected as a JS host would.
     const BUNDLED_FACE: &[u8] = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
 
     /// A link's columns and text come from the cells it is drawn in, whatever
+    /// precedes it on the row: two ideographs, or two flag halves written out of order.
     #[test]
     fn a_link_after_wide_characters_is_read_from_its_cells() {
         let mut t = AtermGpuTerminal::new(4, 60, BUNDLED_FACE, 16.0, 0, 0, 0, 0)
@@ -1420,6 +1451,8 @@ mod tests {
     }
 
     /// `init` builds its GPU face from the host's current settings
+    /// (`gpu_face`), not the constructor's px: a `set_px` before `init`, or a
+    /// re-`init` after one, must draw at the size the cells were measured at.
     #[test]
     fn the_gpu_face_is_the_face_the_host_set() {
         let mut t = AtermGpuTerminal::new(8, 48, BUNDLED_FACE, 14.0, 0, 0, 0, 0)
@@ -1513,6 +1546,8 @@ mod tests {
     }
 
     /// The web export is the engine's paste formatter: sanitize-then-wrap makes
+    /// a planted `ESC[201~` (or 8-bit `0x9B 2 0 1 ~`) inert before the closing
+    /// guard, so it cannot end its own bracket.
     #[test]
     fn paste_export_wraps_only_sanitized_text_so_a_planted_terminator_stays_inert() {
         let mut t = AtermGpuTerminal::new(24, 80, BUNDLED_FACE, 14.0, 0, 0, 0, 0)
@@ -1563,6 +1598,8 @@ mod tests {
     }
 
     /// The `effects_api` mutators' `note_host_visual_change` bumps must be live:
+    /// an effects config change that fails to reopen the gate would serve a
+    /// stale frame.
     #[test]
     fn effects_config_mutators_bump_the_host_visual_generation() {
         let mut t = crate::system_font_terminal(6, 40, 14.0);
@@ -1626,6 +1663,7 @@ mod tests {
     }
 
     /// The frame gate, both sides: a settled tick skips the whole frame, and
+    /// every class of change the damage epoch cannot see reopens it.
     #[test]
     fn frame_gate_skips_settled_ticks_and_reopens_on_every_change_class() {
         let mut t = settled(8, 40);
@@ -1741,6 +1779,7 @@ mod tests {
     }
 
     /// Mutator audit: every `pub fn` that changes what a frame looks like must
+    /// bump `host_visual_gen`, or the gate serves a stale frame.
     #[test]
     fn every_visual_mutator_bumps_the_host_visual_generation() {
         let mut t = settled(8, 40);
@@ -1968,6 +2007,7 @@ mod tests {
     }
 
     /// `search_meta` agrees with `search` and carries the `incomplete` signal
+    /// `search` drops.
     #[test]
     fn search_meta_agrees_with_search_and_is_silent_on_empty_or_bad_input() {
         let mut t = crate::system_font_terminal(24, 80, 16.0);
@@ -1983,7 +2023,7 @@ mod tests {
         assert_eq!((bad.incomplete(), bad.match_count()), (false, 0));
     }
 
-    /// Reject an oversized frame before constructing or changing a grid. Existing
+    /// Reject an oversized frame before constructing or changing a grid.
     #[test]
     fn oversized_frames_are_refused_before_state_changes() {
         let new = |rows, cols| {
@@ -2089,6 +2129,7 @@ mod tests {
     }
 
     /// Shrinking retention invalidates the search index like any content
+    /// change, so a search never returns just-evicted absolute rows.
     #[test]
     fn retention_shrink_search_returns_no_evicted_rows() {
         let mut t = crate::system_font_terminal(5, 40, 16.0);
@@ -2104,6 +2145,7 @@ mod tests {
     }
 
     /// `set_scrollback_limit` is one total bound across ring + staged + store:
+    /// shrink evicts oldest immediately; grow widens the store share.
     #[test]
     fn set_scrollback_limit_governs_ring_retention() {
         let mut t = crate::system_font_terminal(5, 40, 16.0);
@@ -2131,6 +2173,8 @@ mod tests {
     }
 
     /// win32-input-mode is the host's to grant: conhost's `?9001h` changes
+    /// nothing until the embedder says a ConPTY is behind the terminal
+    /// (`set_win32_input_enabled`).
     #[test]
     fn a_conpty_host_opts_in_to_win32_input_records() {
         let mut t = crate::system_font_terminal(24, 80, 16.0);
@@ -2189,6 +2233,8 @@ mod tests {
     }
 
     /// `build_frame` re-resolves one row per echo with the damage-reading
+    /// effects on: the refill consumes the damage session and the effects
+    /// pipeline does not re-take it.
     #[test]
     fn build_frame_echo_refills_one_row_with_sparkle_and_rain_on() {
         let mut t = crate::system_font_terminal(8, 40, 16.0);
@@ -2213,6 +2259,8 @@ mod tests {
     }
 
     /// Every built frame's engine channels equal a full extraction across a
+    /// mutation stream with the damage-reading effects on, and both refill
+    /// arms are reached.
     #[test]
     fn build_frame_scoped_refill_matches_a_full_extraction_over_a_mutation_stream() {
         let mut t = crate::system_font_terminal(8, 40, 16.0);
@@ -2271,6 +2319,7 @@ mod tests {
     }
 
     /// Native stand-in for the effects render path (GPU init is wasm-only):
+    /// refill the snapshot, apply the effects pipeline, refresh the spill band.
     fn fill_frame(t: &mut AtermGpuTerminal) {
         t.refill_frame_scratch();
         let (cw, ch) = t.cpu.cell_size();
@@ -2309,6 +2358,8 @@ mod tests {
     }
 
     /// Spill band on the GPU engine's CPU face: the water jump splash on the
+    /// top row surfaces band bytes whose source-over composite onto the theme
+    /// bg equals the CPU face's composed band exactly.
     #[test]
     fn spill_exports_surface_band_content_on_the_cpu_face() {
         let mut t = crate::system_font_terminal(12, 40, 16.0);
@@ -2456,6 +2507,7 @@ mod tests {
     }
 
     /// `set_chrome` before GPU init sticks on the CPU face (init re-applies it
+    /// and sizes the swapchain to the padded frame); 0/0 restores exact-fit.
     #[test]
     fn set_chrome_sticks_pre_init_and_zero_restores() {
         let mut t = crate::system_font_terminal(24, 80, 16.0);
@@ -2471,6 +2523,8 @@ mod tests {
     }
 
     /// Two instances fed the same bytes and dt stream produce identical
+    /// `RenderInput`s (cells and every overlay channel), and turning everything
+    /// off restores the untouched-instance snapshot exactly.
     #[test]
     fn effects_snapshots_are_deterministic_and_restore_on_off() {
         let mut a = crate::system_font_terminal(24, 80, 16.0);
@@ -2522,6 +2576,7 @@ mod tests {
     }
 
     /// The word-separator setting reshapes double-click words, and clearing it
+    /// restores the default class-based word logic exactly.
     #[test]
     fn set_word_separators_reshapes_double_click_words() {
         let mut t = crate::system_font_terminal(24, 80, 16.0);
@@ -2534,6 +2589,8 @@ mod tests {
     }
 
     /// Swap the engine for one whose bulk history lives in the tiered store
+    /// (tiny ring → nearly all scroll-off spills to tiered) and feed `lines`
+    /// numbered lines short enough not to wrap at the test widths.
     fn install_tiered_history(t: &mut AtermGpuTerminal, rows: u16, cols: u16, lines: usize) {
         let sb = aterm_core::scrollback::Scrollback::new(64, 512, 64_000_000);
         t.term = Terminal::with_scrollback(rows, cols, 8, sb);
@@ -2788,6 +2845,8 @@ mod tests {
     }
 
     /// Budgeted search: resumed slices complete to the one-shot triplets, a
+    /// superseded cursor restarts, and empty-query / invalid-regex edges give
+    /// an empty complete result.
     #[test]
     fn search_budgeted_matches_one_shot_and_restarts_when_superseded() {
         let mut t = crate::system_font_terminal(6, 40, 16.0);

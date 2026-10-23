@@ -155,6 +155,8 @@ pub const LOCK_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits 
 ";
 
 /// Acquisition vocabulary: the method-call tokens that take a lock, and
+/// whether the acquisition can block (a `try_*` cannot, so it is never the
+/// waiting half of a deadlock).
 const ACQ_METHODS: &[(&str, bool)] = &[
     (".lock()", true),
     (".lock_or_recover()", true),
@@ -166,9 +168,13 @@ const ACQ_METHODS: &[(&str, bool)] = &[
 ];
 
 /// Result-of-lock adapters that pass the guard through: a chain of only these
+/// to the end of a `let` means the guard itself is bound (block-scoped), not a
+/// value read out of it (statement-scoped).
 const GUARD_ADAPTERS: &[&str] = &["unwrap", "expect", "unwrap_or_else", "map_err"];
 
 /// A fn that acquires a lock and returns the guard: its callers hold the lock
+/// with no `.lock()` token at the call site, so each registered helper call
+/// counts as a direct acquisition of the declared identity.
 struct GuardHelper {
     /// The fn name as called (`<symbol>(…)`).
     symbol: &'static str,
@@ -272,6 +278,8 @@ const GUARD_HELPERS: &[GuardHelper] = &[
 ];
 
 /// A fn that implements a standard acquisition method by delegating to the
+/// wrapped std primitive through a bare-`self` receiver (`impl MutexExt for
+/// Mutex<T> { fn lock_or_recover(&self) { self.lock() … } }`).
 struct VocabularyInterior {
     /// The implementing fn (must be one of [`STANDARD_METHOD_NAMES`]).
     symbol: &'static str,
@@ -291,6 +299,8 @@ const VOCABULARY_INTERIORS: &[VocabularyInterior] = &[VocabularyInterior {
 }];
 
 /// Lexical `std::fs::File` evidence for a `let` RHS: a local bound from one of
+/// these idioms is an OS file, so a later `.lock()`/`.try_lock()` on it is the
+/// advisory file lock (a cross-process rendezvous), not an in-process mutex.
 fn is_file_binding_rhs(line: &str) -> bool {
     line.contains("File::open(")
         || line.contains("File::create(")
@@ -301,6 +311,7 @@ fn is_file_binding_rhs(line: &str) -> bool {
 }
 
 /// Raw-pointer-producing method names: a zero-arg `.read()` on the direct
+/// result of one of these is `core::ptr::read`, not a lock.
 const RAW_PTR_METHODS: &[&str] = &[
     "add",
     "sub",
@@ -316,6 +327,8 @@ const RAW_PTR_METHODS: &[&str] = &[
 ];
 
 /// Lexical raw-pointer evidence for a `let` RHS: a local bound from one of
+/// these idioms is a raw pointer, so a later zero-arg `.read()` on it is
+/// `core::ptr::read`, not an RwLock acquisition.
 fn is_raw_ptr_binding_rhs(line: &str) -> bool {
     line.contains(".as_ptr()")
         || line.contains(".as_mut_ptr()")
@@ -326,6 +339,8 @@ fn is_raw_ptr_binding_rhs(line: &str) -> bool {
 }
 
 /// Propagated raw-pointer evidence: the RHS calls a raw-pointer-producing
+/// method on a receiver already proven a raw pointer (`let item = base.add(i)`
+/// with `base` in the ledger).
 fn rhs_extends_raw_ptr(line: &str, ptr_vars: &BTreeMap<String, (i32, String)>) -> bool {
     // Every `true` path needs `ptr_vars.contains_key(recv)`, and this runs on
     if ptr_vars.is_empty() {
@@ -348,6 +363,7 @@ fn rhs_extends_raw_ptr(line: &str, ptr_vars: &BTreeMap<String, (i32, String)>) -
 }
 
 /// Is `name` declared as a raw pointer (`*const`/`*mut`, possibly behind
+/// `&`/`&mut`) in the fn signature text?
 fn param_is_raw_ptr(sig: &str, name: &str) -> bool {
     let pat = format!("{name}: ");
     let mut from = 0;
@@ -398,6 +414,9 @@ fn match_paren_back(line: &str, close: usize) -> Option<usize> {
 }
 
 /// Raw-pointer evidence for the zero-arg `.read()` whose `.` sits at `dot`:
+/// `Some(evidence)` iff the receiver is lexically proven a raw pointer (a live
+/// raw-ptr `let` binding, a raw-ptr parameter, or the direct result of a
+/// [`RAW_PTR_METHODS`] call).
 fn raw_ptr_read_evidence(
     line: &str,
     dot: usize,
@@ -433,6 +452,7 @@ fn raw_ptr_read_evidence(
 }
 
 /// Method names the token vocabulary covers at call sites: a guard-returning
+/// method with one of these names needs no helper registration.
 const STANDARD_METHOD_NAMES: &[&str] = &[
     "lock",
     "lock_or_recover",
@@ -444,6 +464,7 @@ const STANDARD_METHOD_NAMES: &[&str] = &[
 ];
 
 /// The identity namespace of the aterm workspace crates, which carry no
+/// prefix; only vendored forks and absorbed crates do (`aterm_window::…`).
 const WORKSPACE_NS: Option<&'static str> = None;
 
 /// One lock-acquisition site.
@@ -461,22 +482,30 @@ struct AcqSite {
     /// The (trimmed, capped) statement text, for the diagnostics.
     excerpt: String,
     /// `Some(binding span)` when the receiver is lexically proven a
+    /// `std::fs::File` (see [`is_file_binding_rhs`]): the OS advisory file
+    /// lock, listed in its own category and excluded from the mutex graph.
     advisory: Option<String>,
     /// `Some(audit)` for a registered [`VocabularyInterior`] site; it keeps a
+    /// unique per-site node.
     vocab: Option<&'static str>,
     /// `Some(evidence)` when the receiver is proven a raw pointer (see
+    /// [`raw_ptr_read_evidence`]): `core::ptr::read`, listed in its own
+    /// category and excluded from the mutex graph.
     raw_ptr: Option<String>,
     /// `Some(namespace)` for a site in a scanned vendored crate: its identity
+    /// and UNKNOWN node are namespace-prefixed and its counts are summarized
+    /// per crate.
     namespace: Option<&'static str>,
 }
 
 impl AcqSite {
-    /// Does this site join the mutex order graph? File-advisory and
+    /// Does this site join the mutex order graph?
     fn graphed(&self) -> bool {
         self.advisory.is_none() && self.raw_ptr.is_none()
     }
 
     /// Graph node name: the identity (namespace-prefixed for vendored sites),
+    /// or a unique per-site node for vocabulary-interior and UNKNOWN sites.
     fn node(&self) -> String {
         if self.vocab.is_some() {
             return format!("callers-of(`{}`)@{}", self.fn_name, self.span);
@@ -490,6 +519,7 @@ impl AcqSite {
 }
 
 /// One witness for an `A -> B` edge: where A was being held, and where B was
+/// acquired (possibly via a one-hop call).
 struct EdgeWitness {
     hold_span: String,
     hold_fn: String,
@@ -655,12 +685,15 @@ pub(crate) fn unmasked_lines(text: &str, is_gate: &dyn Fn(&str) -> bool) -> Vec<
 }
 
 /// A logical statement line: rustfmt chain continuations (lines starting with
+/// `.`) joined onto their receiver line, so `self`↵`.store`↵`.read()` scans as
+/// `self.store.read()`.
 struct LogicalLine {
     text: String,
     lineno: usize,
 }
 
 /// Join a fn body's physical lines (already comment-stripped) into logical
+/// lines.
 fn logical_lines(body: &[String], start_line: usize) -> Vec<LogicalLine> {
     let mut out: Vec<LogicalLine> = Vec::new();
     for (i, raw) in body.iter().enumerate() {
@@ -683,7 +716,7 @@ fn logical_lines(body: &[String], start_line: usize) -> Vec<LogicalLine> {
     out
 }
 
-/// Self types an `impl` may not lend to a `self`-rooted lock identity. An
+/// Self types an `impl` may not lend to a `self`-rooted lock identity.
 const UNQUALIFIABLE_SELF_TYPES: &[&str] = &[
     "Arc",
     "Box",
@@ -703,15 +736,20 @@ const UNQUALIFIABLE_SELF_TYPES: &[&str] = &[
 ];
 
 /// How many physical lines an `impl` header may span before the scan gives up
+/// on finding its `{` (a wrapped generic list plus a where-clause; rustfmt
+/// keeps these short).
 const MAX_IMPL_HEADER_LINES: usize = 24;
 
 /// One `impl` block's line span and the self type it implements — the name a
+/// `self` receiver inside it borrows (`impl Foo`, `impl<T> Foo<T>`,
+/// `impl Trait for Foo` => `Foo`).
 struct ImplSpan {
     /// 1-based first line (the `impl` keyword).
     start: usize,
     /// 1-based last line (the block's closing brace).
     end: usize,
     /// `None` when the header names no type usable as a lock identity (see
+    /// [`impl_self_type`]).
     ty: Option<String>,
 }
 
@@ -721,6 +759,7 @@ fn is_ident_byte(b: u8) -> bool {
 }
 
 /// Byte offsets of every occurrence of the keyword `word` at nesting depth 0
+/// of `s` (bounded by non-identifier bytes on both sides).
 fn top_level_words(s: &str, word: &str) -> Vec<usize> {
     let bytes = s.as_bytes();
     let mut out = Vec::new();
@@ -752,6 +791,7 @@ fn top_level_words(s: &str, word: &str) -> Vec<usize> {
 }
 
 /// Byte offset of the `>` matching the `<` at byte 0 of `s`, if any (same
+/// `->` care as [`top_level_words`]).
 fn matching_angle(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut depth: i32 = 0;
@@ -777,6 +817,7 @@ fn matching_angle(s: &str) -> Option<usize> {
 }
 
 /// The comma-separated items of a generic parameter list, split at nesting
+/// depth 0.
 fn split_top_level(s: &str) -> Vec<&str> {
     let bytes = s.as_bytes();
     let mut out = Vec::new();
@@ -804,6 +845,7 @@ fn split_top_level(s: &str) -> Vec<&str> {
 }
 
 /// The base name of an impl's self type: `Foo<T>` => `Foo`;
+/// `std::sync::Mutex<T>` => `Mutex`; `&'a mut Foo` => `Foo`.
 fn base_type_name(ty: &str, params: &BTreeSet<&str>) -> Option<String> {
     let mut t = ty.trim();
     while let Some(rest) = t.strip_prefix('&') {
@@ -836,6 +878,7 @@ fn base_type_name(ty: &str, params: &BTreeSet<&str>) -> Option<String> {
 }
 
 /// The nameable self type of an `impl` header (text up to the block's `{`):
+/// `impl Foo` / `impl<T> Foo<T>` / `impl Trait for Foo` => `Foo`.
 fn impl_self_type(header: &str) -> Option<String> {
     let h = header.trim_start();
     let h = h.strip_prefix("unsafe ").unwrap_or(h).trim_start();
@@ -869,6 +912,7 @@ fn impl_self_type(header: &str) -> Option<String> {
 }
 
 /// Every `impl` block in a file, with its line span and self type, ended by
+/// the same closing-brace-at-item-indent rule as the fn segmenter.
 fn impl_spans(text: &str) -> Vec<ImplSpan> {
     let lines: Vec<&str> = text.lines().collect();
     let mut out = Vec::new();
@@ -931,6 +975,7 @@ struct RawAcq {
 }
 
 /// Where an acquisition sits, for the identity refinements that need more
+/// than the line itself.
 struct SiteCtx<'a> {
     /// The file's `impl` blocks (see [`impl_spans`]).
     impls: &'a [ImplSpan],
@@ -942,6 +987,7 @@ struct SiteCtx<'a> {
 
 impl SiteCtx<'_> {
     /// The self type of the innermost `impl` block covering this line, when it
+    /// is one this census may name.
     fn impl_ty(&self) -> Option<&str> {
         self.impls
             .iter()
@@ -952,6 +998,8 @@ impl SiteCtx<'_> {
 }
 
 /// The receiver chain ending at `dot` as a field path below `self`, when rooted
+/// there: `self.lock()` => `self`; `self.0.lock()` => `0`;
+/// `self.control.1.read()` => `control.1`.
 fn self_rooted_chain(line: &str, dot: usize) -> Option<String> {
     let bytes = line.as_bytes();
     let mut segs: Vec<&str> = Vec::new();
@@ -975,6 +1023,7 @@ fn self_rooted_chain(line: &str, dot: usize) -> Option<String> {
 }
 
 /// Resolve the lexical identity of the receiver whose final `.` sits at byte
+/// `dot`.
 fn resolve_receiver(line: &str, dot: usize, ctx: &SiteCtx<'_>) -> Option<String> {
     let dot = {
         let bytes = line.as_bytes();
@@ -1010,7 +1059,7 @@ fn resolve_receiver(line: &str, dot: usize, ctx: &SiteCtx<'_>) -> Option<String>
     Some(callee.to_string())
 }
 
-/// All acquisitions on one logical line, in byte order. Registered
+/// All acquisitions on one logical line, in byte order.
 fn acquisitions_on(line: &str, ctx: &SiteCtx<'_>) -> Vec<RawAcq> {
     let mut out = Vec::new();
     for h in GUARD_HELPERS {
@@ -1074,7 +1123,7 @@ fn match_paren(line: &str, open: usize) -> Option<usize> {
     None
 }
 
-/// Byte index just past the acquisition call's closing paren. Method tokens
+/// Byte index just past the acquisition call's closing paren.
 fn call_end(line: &str, acq: &RawAcq) -> usize {
     if acq.kind.starts_with('.') {
         acq.pos + acq.kind.len()
@@ -1085,6 +1134,7 @@ fn call_end(line: &str, acq: &RawAcq) -> usize {
 }
 
 /// Does the guard produced by this acquisition survive as the statement's
+/// final value?
 fn guard_is_final_value(line: &str, acq: &RawAcq) -> bool {
     let bytes = line.as_bytes();
     let mut i = call_end(line, acq);
@@ -1121,8 +1171,10 @@ fn guard_is_final_value(line: &str, acq: &RawAcq) -> bool {
 /// How a logical line binds the guards acquired on it.
 enum LineKind {
     /// `let <var> = …` / `let <pattern> = …` (var carried when plain-ident):
+    /// an acquisition that is the statement's final value is block-scoped.
     Let(Option<String>),
     /// `match … {` / `if let … {` / `while let … {`: scrutinee temporaries
+    /// (guards included) live for the whole construct.
     MatchLike,
     /// Anything else: acquisitions live for their own statement.
     Other,
@@ -1161,6 +1213,7 @@ fn classify_line(line: &str) -> LineKind {
 }
 
 /// Byte offset of a `let` statement's binding `=` — not a comparison or a
+/// compound assignment.
 fn binding_eq(line: &str) -> Option<usize> {
     const OPS: &[u8] = b"=!<>+-*/%&|^";
     let bytes = line.as_bytes();
@@ -1172,6 +1225,8 @@ fn binding_eq(line: &str) -> Option<usize> {
 }
 
 /// The identity a `let` binding aliases when its RHS is a pure path
+/// (`&self.spill`, `self.0`, `&QUEUE`): what that path would resolve to at an
+/// acquisition site, so an alias introduces no new identity.
 fn alias_target(line: &str, ctx: &SiteCtx<'_>) -> Option<String> {
     let eq = binding_eq(line)?;
     let mut path = line[eq + 1..].trim().trim_end_matches(';').trim_end();
@@ -1195,16 +1250,20 @@ type TrustedCall = (usize, String);
 type FieldRecvCall = (usize, String, String);
 
 /// Type and field declarations harvested from the workspace crates: the
+/// evidence deciding whether a `self.field.name(..)` hop can be followed.
 #[derive(Default)]
 struct FieldTypes {
     /// Every type name the corpus defines (`struct`/`enum`/`union`/`type` and
+    /// `trait`, which a `dyn`/`impl` field resolves through).
     defined: BTreeSet<String>,
     /// Field name -> every type identifier in its declared type
+    /// (`Arc<Shared>` -> {Arc, Shared}).
     field_tys: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl FieldTypes {
     /// Is `field`'s declared type defined in this corpus, asked from namespace
+    /// `at`?
     fn is_corpus_typed(&self, at: Option<&'static str>, field: &str) -> bool {
         at == WORKSPACE_NS
             && self
@@ -1280,6 +1339,7 @@ fn ident_prefix(s: &str) -> Option<&str> {
 }
 
 /// Simple parameter bindings shadow bare fn names even when their type is a
+/// generic, an `impl FnOnce`, or a fn pointer.
 fn parameter_bindings(sig: &str) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     let Some((_, rest)) = sig.split_once("fn ") else {
@@ -1315,6 +1375,7 @@ fn parameter_bindings(sig: &str) -> BTreeSet<String> {
 }
 
 /// One-hop call targets on `line`: `(trusted, field_receiver)`, the latter as
+/// `(field, callee)`.
 fn held_call_targets(line: &str) -> (Vec<TrustedCall>, Vec<FieldRecvCall>) {
     const KEYWORDS: &[&str] = &[
         "if", "while", "for", "match", "return", "fn", "loop", "unsafe", "move", "let", "else",
@@ -1377,10 +1438,11 @@ struct FnLockFacts {
     /// Repo-relative `file:line` of the definition.
     span: String,
     /// The identity namespace of the crate defining this fn ([`WORKSPACE_NS`]
+    /// for aterm crates).
     namespace: Option<&'static str>,
-    /// Does the signature return a `…Guard`? With a direct acquisition, this
+    /// Does the signature return a `…Guard`?
     returns_guard: bool,
-    /// Is the fn method-shaped (first parameter `self`)? Only a method may use
+    /// Is the fn method-shaped (first parameter `self`)?
     takes_self: bool,
     /// Indices into the global site table.
     acq: Vec<usize>,
@@ -1391,10 +1453,14 @@ struct FnLockFacts {
     /// Calls made while holding through a field receiver (`self.field.name(..)`).
     field_recv_calls: Vec<(usize, String, String, String)>,
     /// Bare calls to a parameter/local are callbacks whose target this walk
+    /// cannot resolve, not calls to an unrelated same-named corpus fn.
     binding_calls: Vec<(String, String)>,
 }
 
 /// Lexical guard-return detection over the signature region (def line to the
+/// line opening the body): a `->` whose return type has an identifier ending in
+/// `Guard`, so `-> GuardedInput` stays out and `Option<MutexGuard<'_, T>>` is
+/// caught.
 fn returns_guard(body: &[String]) -> bool {
     for line in body {
         if let Some(p) = line.rfind("->")
@@ -1409,13 +1475,15 @@ fn returns_guard(body: &[String]) -> bool {
     false
 }
 
-/// Does any Rust identifier in `ret` end with `Guard`? Splits on everything
+/// Does any Rust identifier in `ret` end with `Guard`?
 fn return_type_names_a_guard(ret: &str) -> bool {
     ret.split(|c: char| !(c.is_alphanumeric() || c == '_'))
         .any(|ident| ident.ends_with("Guard"))
 }
 
 /// Lexical method-shape detection over the signature region: does the first
+/// parameter bind `self` (`&self`, `&mut self`, `&'a self`, `self`,
+/// `mut self`, `self: Arc<Self>`)?
 fn takes_self(body: &[String]) -> bool {
     let mut sig = String::new();
     for line in body {
@@ -1456,10 +1524,12 @@ struct LiveGuard {
     /// Dies when a line's end-of-line brace depth drops below this.
     binding_depth: i32,
     /// `let … = <acquire> else { … }`: the guard binds only after the else
+    /// block (inside it the pattern did not match — nothing is held).
     active: bool,
 }
 
 /// A simple local name shadows bare fn lookup only after its initializer
+/// statement.
 struct LocalBinding {
     name: String,
     binding_depth: i32,
@@ -1471,8 +1541,11 @@ struct FileCtx<'a> {
     /// Repo-relative path, for the site spans.
     rel: &'a str,
     /// `Some(prefix)` in vendored-identity mode: every resolved identity is
+    /// prefixed `prefix::…` so foreign receiver names can never merge across
+    /// the namespace boundary.
     namespace: Option<&'static str>,
     /// The file's `impl` blocks: the header giving a `self` receiver its
+    /// identity sits above the fn.
     impls: &'a [ImplSpan],
 }
 
@@ -1732,7 +1805,7 @@ fn scan_fn(
     facts
 }
 
-/// Append the why + repair block for a lock-order cycle. `invert` names the
+/// Append the why + repair block for a lock-order cycle.
 fn append_cycle_repair(log: &mut String, invert: &str) {
     let _ = writeln!(
         log,
@@ -2530,7 +2603,7 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
     CensusOutcome::green(LOCKS, log, summary).with_floors(floors)
 }
 
-/// Iterative Tarjan strongly-connected components. Returns each SCC as a list
+/// Iterative Tarjan strongly-connected components.
 fn tarjan_sccs(adj: &[Vec<usize>]) -> Vec<Vec<usize>> {
     let n = adj.len();
     let mut index = vec![usize::MAX; n];
@@ -2587,6 +2660,7 @@ mod tests {
     use crate::scan_set::test_fixtures::synth_tree;
 
     /// The crate a registered `def_file` lives in (`crates/<name>/…`), the only
+    /// layout the synthetic workspace models.
     fn def_crate(def_file: &'static str) -> &'static str {
         def_file
             .strip_prefix("crates/")
@@ -2605,6 +2679,8 @@ mod tests {
     }
 
     /// Crates a synthetic tree must contain beyond the base fixture (aterm-gui
+    /// and aterm-types), read off the registry: the registry's checks read the
+    /// scanned corpus, so every crate holding a `def_file` must be scanned.
     fn synth_helper_crates() -> Vec<(&'static str, &'static str)> {
         let mut crates: Vec<(&'static str, &'static str)> = Vec::new();
         for krate in registered_def_files().map(def_crate) {
@@ -2619,6 +2695,9 @@ mod tests {
     }
 
     /// The registry, written out as the scanned corpus its checks expect:
+    /// every [`GUARD_HELPERS`] entry defined at its `def_file`, acquiring its
+    /// identity and returning the guard, and every [`VOCABULARY_INTERIORS`]
+    /// entry with its bare-`self` acquisition.
     fn synth_helper_files() -> Vec<(String, String)> {
         let mut files = crate::scan_set::test_fixtures::workspace_manifests(&synth_helper_crates());
         let mut sources: Vec<(String, String)> = Vec::new();
@@ -2672,6 +2751,7 @@ mod tests {
     }
 
     /// Like [`run_synth`] but with extra files planted anywhere in the tree
+    /// (vendored-identity-mode tests plant sources under `vendor/…/src`).
     fn run_synth_files(name: &str, gui_extra: &str, extra: &[(&str, &str)]) -> CensusOutcome {
         let mut files = synth_helper_files();
         files.push((
@@ -2690,6 +2770,7 @@ mod tests {
     }
 
     /// A site context outside any `impl` block, with no live aliases: the
+    /// walker's plain resolution, unrefined.
     fn bare_ctx(aliases: &BTreeMap<String, (i32, String)>) -> SiteCtx<'_> {
         SiteCtx {
             impls: &[],
@@ -2867,6 +2948,8 @@ mod tests {
     }
 
     /// Item-end shapes the masker must get right: literal braces, brace-less
+    /// items ending at a comma, wrapped signatures, and fail-open on an
+    /// unrecognized close.
     #[test]
     fn gated_items_end_at_their_own_shape_not_at_a_brace_count() {
         fn src(lines: &[&str]) -> String {
@@ -3581,6 +3664,8 @@ mod tests {
     }
 
     /// A guard-returning helper is one whose return type names a guard
+    /// identifier, not one containing the letters: `-> GuardedInput` is not
+    /// flagged, while a guard wrapped in anything still is.
     #[test]
     fn a_return_type_must_name_a_guard_not_merely_contain_the_letters() {
         assert!(

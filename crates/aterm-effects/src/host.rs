@@ -1,23 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The host contract: the plain data every host hands the effects driver for one frame, and
-//! the plain data it gets back (`docs/DESIGN-host-boundary-2026-08-30.md` §3). No platform
-//! types, and time only as [`aterm_time::Instant`], so one driver serves the native hosts and
-//! the JS hosts (`aterm-wasm`, `aterm-gpu-web`).
-//!
-//! The Kitty Log and entropy are values, not traits called inside the frame: the favourite is
-//! an input and sightings go back to the host to record; the seed is minted by the host
-//! (`aterm_uds::rand` natively, `crypto.getRandomValues` on the page).
+//! The host contract: the plain data every host hands the effects driver for one frame, and the plain data it gets back (`docs/DESIGN-host-boundary-2026-08-30.md` §3).
 
 pub use aterm_time::Instant;
 
 use aterm_core::terminal::{ShellState, Terminal};
 
-/// The host's tri-state presentability (the pipeline's `set_effects_visibility`
-/// as a type): `Focused` (full profile), `VisibleUnfocused` (calm cap and
-/// drain), `Hidden` (a hard cursor-coordinate boundary: the resident pet
-/// retires its coordinate space and returns as a fresh sighting).
+/// The host's tri-state presentability (the pipeline's `set_effects_visibility` as a type): `Focused` (full profile), `VisibleUnfocused` (calm cap and drain), `Hidden` (a hard cursor-coordinate boundary: the resident pet retires its coordinate space and returns as a fresh sighting).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Visibility {
     Focused,
@@ -25,20 +15,14 @@ pub enum Visibility {
     Hidden,
 }
 
-/// What kind of frame this is. A capture is one isolated frame: it never reads
-/// or spends the frame-over-frame diffs a present owns (output burst, wrap
-/// fact, completion latch, Execute level) and never sees a pointer, so it does
-/// not steal the next present's baseline.
+/// What kind of frame this is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CaptureMode {
     /// A drawn present: the live tick, and the diffs are read and spent.
     Present,
-    /// A capture on a surface that also presents (a windowed instance): the
-    /// live tick, so the capture shows the pet where the glass has it.
+    /// A capture on a surface that also presents (a windowed instance): the live tick, so the capture shows the pet where the glass has it.
     LiveCapture,
-    /// A windowless still ([`crate::kitty_pet::PetBrain::tick_static_capture`]):
-    /// never advances a walk, and the first still shows the resident at full
-    /// opacity rather than the `dt == 0` fade-in tick.
+    /// A windowless still ([`crate::kitty_pet::PetBrain::tick_static_capture`]): never advances a walk, and the first still shows the resident at full opacity rather than the `dt == 0` fade-in tick.
     StaticCapture,
 }
 
@@ -59,76 +43,51 @@ pub struct HostFrameInput {
     /// Native: the one `frame_started` read; web: `t0 + Σ advance(dt)`.
     pub now: Instant,
     pub visibility: Visibility,
-    /// Stable accessibility/focus policy: the only input that pins the resident at its
-    /// station. Never a load term.
+    /// Stable accessibility/focus policy: the only input that pins the resident at its station.
     pub reduced_motion: bool,
     /// Serious mode: every toy is retired outright.
     pub serious: bool,
-    /// The adaptive load-shed envelope `0..=1`. It attenuates trails and
-    /// flying heads; the full resident ignores it.
+    /// The adaptive load-shed envelope `0..=1`.
     pub shed_envelope: f32,
-    /// The load-shed latch is engaged: the resident keeps its motion but leaves the frame train
-    /// for the coarse [`RESIDENT_SHED_CADENCE`](crate::companion::RESIDENT_SHED_CADENCE).
+    /// The load-shed latch is engaged: the resident keeps its motion but leaves the frame train for the coarse [`RESIDENT_SHED_CADENCE`](crate::companion::RESIDENT_SHED_CADENCE).
     pub shed_active: bool,
-    /// The pointer in frame px, or `None` (it left the surface, or the host pushes pointer
-    /// events between frames). `Some` wins over the value stored through
-    /// `CompanionOwner::set_pointer`; `None` falls back to it. The native host passes
-    /// `last_cursor_px` every frame; the web host calls `note_pointer_px` and passes `None`.
+    /// The pointer in frame px, or `None` (it left the surface, or the host pushes pointer events between frames).
     pub pointer_px: Option<(f32, f32)>,
     pub capture: CaptureMode,
     pub geometry: FrameGeom,
 }
 
-/// Facts read from the [`Terminal`] once per frame under whatever lock the host holds, by one
-/// reader for every host. No text: typed witnesses enter only through each host's input path.
+/// Facts read from the [`Terminal`] once per frame under whatever lock the host holds, by one reader for every host.
 #[derive(Clone, Copy, Debug)]
 pub struct TerminalFacts {
-    /// The session the facts belong to. Every latch is keyed on it, so a tab or
-    /// pane switch re-baselines silently: never a wrap, a burst or a finished
-    /// command.
+    /// The session the facts belong to.
     pub session: u64,
-    /// The caret cell `(row, col)`, or `None` when the viewport is scrolled into history (a
-    /// coordinate-space boundary). A hidden caret (DECTCEM) is still a caret: progress bars,
-    /// pagers, editors and LLM consoles hide it and the pet keeps chasing it. A host with a
-    /// coherent `RenderInput` snapshot may substitute the snapshot's caret.
+    /// The caret cell `(row, col)`, or `None` when the viewport is scrolled into history (a coordinate-space boundary).
     pub caret: Option<(u16, u16)>,
     /// The emulator is painting the caret (DECTCEM shown).
     pub cursor_visible: bool,
-    /// The program's own account that the frame on screen is unfinished
-    /// ([`Terminal::sync_frame_unfinished`]), read under the caret's lock. A hidden caret on such
-    /// a frame is the program's write position ([`motion_caret`]), so the pet reads the last
-    /// finished frame's caret ([`crate::companion::CompanionOwner::prepare`]). A host that hands
-    /// the pet no hidden caret passes `false`.
+    /// The program's own account that the frame on screen is unfinished ([`Terminal::sync_frame_unfinished`]), read under the caret's lock.
     pub frame_unfinished: bool,
-    /// The terminal's count of synchronized-output closes
-    /// ([`Terminal::sync_end_seq`]), read under the same lock: a program
-    /// that brackets its frames moves it on with every frame it finishes.
-    /// [`Self::sync_end_caret`] identifies where that frame ended: output
-    /// after the close may already have moved the current caret elsewhere.
+    /// The terminal's count of synchronized-output closes ([`Terminal::sync_end_seq`]), read under the same lock: a program that brackets its frames moves it on with every frame it finishes.
     pub sync_end_seq: u64,
-    /// The latest close's cell on this screen/grid, read under the same lock
-    /// ([`Terminal::sync_end_caret`]); `None` after an invalidating boundary.
+    /// The latest close's cell on this screen/grid, read under the same lock ([`Terminal::sync_end_caret`]); `None` after an invalidating boundary.
     pub sync_end_caret: Option<(u16, u16)>,
     pub display_offset: i32,
     /// `display_offset == 0`: the viewport is at the live bottom.
     pub live_viewport: bool,
     pub content_seq: u64,
     pub wrap_serial: u64,
-    /// The host's content-scroll decision resolved to `Translate` this frame
-    /// (new scrollback rows).
+    /// The host's content-scroll decision resolved to `Translate` this frame (new scrollback rows).
     pub scrolled: bool,
     /// OSC 133/633 `C..D`: a command is executing.
     pub shell_executing: bool,
-    /// The most recent completed command: `(completed_command_seq, exit code,
-    /// exec duration ms)`. `None` before the first completion.
+    /// The most recent completed command: `(completed_command_seq, exit code, exec duration ms)`.
     pub cmd_done: Option<(u64, i32, Option<u64>)>,
     pub alt_screen: bool,
 }
 
 impl TerminalFacts {
-    /// Read every fact from the terminal in one pass. `scrolled` is the host's
-    /// own content-scroll decision (it owns the previous snapshot); the rest is
-    /// the emulator's.
+    /// Read every fact from the terminal in one pass.
     #[inline]
     #[must_use]
     pub fn read(term: &Terminal, session: u64, scrolled: bool) -> Self {
@@ -163,19 +122,7 @@ impl TerminalFacts {
     }
 }
 
-/// The caret the motion engines may judge: [`TerminalFacts::caret`] minus a hidden cursor that
-/// is not a caret.
-///
-/// A hidden caret is still a caret (a TUI hides it for its repaint), except on an unfinished
-/// frame, where it is the program's write position. A host shows such a frame only when its own
-/// hold (`SYNC_HOLD_CAP`, 150 ms) runs out or the terminal's `sync_timeout_ms` (1 s) clears the
-/// mode while the program is still writing; the mode level misses the second case, so the input
-/// is the program's account.
-///
-/// A hidden cursor on a blank row is no caret either (Claude Code's question dialog parks it at
-/// column 0 of the blank bottom row); a shown one there passes, as does a hidden one beside a
-/// styled blank (a self-drawn caret). [`hidden_caret_withheld`] reads both cases under the
-/// caret's lock.
+/// The caret the motion engines may judge: [`TerminalFacts::caret`] minus a hidden cursor that is not a caret.
 #[inline]
 #[must_use]
 pub const fn motion_caret(
@@ -190,33 +137,14 @@ pub const fn motion_caret(
     }
 }
 
-/// Whether a hidden caret on `term` is withheld from the motion engines ([`motion_caret`]'s
-/// third input): the frame is unfinished, or no cell of the cursor's row draws ink (a styled
-/// blank counts as ink). The row is walked only while the cursor is hidden.
+/// Whether a hidden caret on `term` is withheld from the motion engines ([`motion_caret`]'s third input): the frame is unfinished, or no cell of the cursor's row draws ink (a styled blank counts as ink).
 #[inline]
 #[must_use]
 pub fn hidden_caret_withheld(term: &Terminal) -> bool {
     term.sync_frame_unfinished() || (!term.cursor_visible() && cursor_row_empty(term))
 }
 
-/// The echo anchor the motion engines may judge: [`Terminal::print_anchor`] and
-/// the glyph its run ended on ([`Terminal::print_anchor_glyph`]), or neither
-/// where [`motion_caret`] withholds the caret for the same reason: a hidden
-/// cursor on a frame the program has not finished
-/// ([`Terminal::sync_frame_unfinished`]). Read under the same lock as the
-/// caret.
-///
-/// The anchor is the other half of a write position. On a frame the program
-/// left half-written behind a hidden cursor, its last print run ended wherever
-/// the write stopped, as the cursor did. Claude Code's echo reprints the text
-/// after the caret, so a torn echo's run ends at the line's end, where no key
-/// was typed. The hidden-caret lane would spend the key in flight there, and
-/// the key's own cell would never be laid. Withheld, the engine keeps its
-/// previous sample and the lane idles; the finished frame hands over the
-/// anchor its write ended on, beside the caret it shows. A drawn caret is the
-/// program's account of where it typed whatever the frame's state (an
-/// unfinished latch outlives a program that died mid-frame), so its anchor
-/// passes, as the caret does.
+/// The echo anchor the motion engines may judge: [`Terminal::print_anchor`] and the glyph its run ended on ([`Terminal::print_anchor_glyph`]), or neither where [`motion_caret`] withholds the caret for the same reason: a hidden cursor on a frame the program has not finished ([`Terminal::sync_frame_unfinished`]).
 #[inline]
 #[must_use]
 pub fn motion_print_anchor(term: &Terminal) -> (Option<(u16, u16, u64)>, Option<char>) {
@@ -236,7 +164,6 @@ fn cursor_row_empty(term: &Terminal) -> bool {
 
 /// Whether `cell` puts anything on the glass: a glyph, a background, or a
 /// decoration a space still shows (inverse, a line under, through or over it).
-/// A foreground colour, bold, dim, italic or blink on a space draws nothing.
 #[inline]
 fn draws_ink(cell: &aterm_core::grid::Cell) -> bool {
     use aterm_core::grid::CellFlags;
@@ -248,26 +175,19 @@ fn draws_ink(cell: &aterm_core::grid::Cell) -> bool {
         || flags.contains(CellFlags::COMPLEX)
         || !cell.colors().bg_is_default()
         || flags.intersects(shows_on_a_space)
-        // OVERLINE is SUPERSCRIPT | SUBSCRIPT: only both bits draw a line; a
-        // super- or subscripted space alone draws nothing.
         || flags.contains(CellFlags::OVERLINE)
 }
 
-/// The sing-along input to the custody law (which companion owns the frame): the host's
-/// verdicts over the pipeline's `KittySing` and `CursorCat`, resolved on each route that ticks
-/// the pet. The web passes zeros: no song, no flying head, the pet owns every frame.
+/// The sing-along input to the custody law (which companion owns the frame): the host's verdicts over the pipeline's `KittySing` and `CursorCat`, resolved on each route that ticks the pet.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SingFacts {
     /// The sing drive `0..=1` — the armed hold plus the whole wind-down.
     pub drive: f32,
-    /// The flying head's presentation alpha as the host resolved it (already
-    /// gated by its own owner and momentum), `0` when there is no head.
+    /// The flying head's presentation alpha as the host resolved it (already gated by its own owner and momentum), `0` when there is no head.
     pub flying_alpha: u8,
 }
 
-/// What a left press did. Crosses the wasm boundary as its `u8`; `Pass`
-/// means the host keeps routing (selection, mouse reporting), anything else
-/// means chrome won and the press is consumed.
+/// What a left press did.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PressOutcome {
@@ -275,8 +195,7 @@ pub enum PressOutcome {
     Pet = 1,
 }
 
-/// One scheduling verdict: `At` from `next_deadline_ms()`, else `Frames` while `is_active()`,
-/// else `Idle`. The pipeline tests read the two predicates through it.
+/// One scheduling verdict: `At` from `next_deadline_ms()`, else `Frames` while `is_active()`, else `Idle`.
 #[derive(Clone, Copy, Debug)]
 #[cfg(test)]
 pub enum Wake {
@@ -349,8 +268,7 @@ mod tests {
     }
 
     /// A hidden cursor on an unfinished frame is no motion caret, also after the terminal's
-    /// timeout force-clears the mode. A finished frame's hidden caret, an empty close+reopen and
-    /// a shown caret pass.
+    /// timeout force-clears the mode.
     #[test]
     fn a_hidden_cursor_on_an_unfinished_frame_is_no_caret_for_the_motion_engines() {
         use aterm_core::terminal::ClockReading;
@@ -361,7 +279,6 @@ mod tests {
             wall_ms: None,
         };
         term.process_at(b"\x1b[8;5H", at(0));
-        // Through the reader's own `frame_unfinished`, so the pet's fact is pinned too.
         let read = |term: &Terminal| {
             let f = TerminalFacts::read(term, 1, false);
             assert_eq!(f.frame_unfinished, term.sync_frame_unfinished());
@@ -372,13 +289,11 @@ mod tests {
         };
         assert_eq!(read(&term), (Some((7, 4)), Some((7, 4))), "a shown caret");
 
-        // Ink's repaint: open, hide, home, a transcript row part-written.
         term.process_at(b"\x1b[?2026h\x1b[?25l\x1b[H\r\x1b[2Btranscript", at(10));
         let (facts, motion) = read(&term);
         assert_eq!(facts, Some((2, 10)), "the pet still reads the cursor");
         assert_eq!(motion, None, "the write position is no caret");
 
-        // Past the terminal's 1 s timeout the mode is force-cleared mid-frame: still no caret.
         term.process_at(b"\r\x1b[3Bmore", at(1_200));
         assert!(
             !term.modes().synchronized_output(),
@@ -391,17 +306,12 @@ mod tests {
             "a timed-out frame's write position is no caret"
         );
 
-        // Shown inside the program's bracket: a program that does not hide.
         term.process_at(b"\x1b[?25h", at(1_210));
         assert_eq!(read(&term), (Some((5, 4)), Some((5, 4))));
 
-        // Hidden after the program closes: a finished frame's hidden caret
-        // keeps the single-pane window's reading.
         term.process_at(b"\x1b[?25l\x1b[8;1Hprompt\x1b[8;5H\x1b[?2026l", at(1_220));
         assert_eq!(read(&term), (Some((7, 4)), Some((7, 4))));
 
-        // Closed and reopened in one batch with nothing written since: the
-        // grid is the finished frame, and its hidden caret passes.
         term.process_at(
             b"\x1b[9;1Hrow\x1b[?2026h\x1b[9;2H\x1b[?2026l\x1b[?2026h",
             at(1_230),
@@ -409,16 +319,12 @@ mod tests {
         assert!(term.modes().synchronized_output());
         assert_eq!(read(&term), (Some((8, 1)), Some((8, 1))));
 
-        // History still withdraws the caret from everyone.
         assert_eq!(motion_caret(None, true, false), None);
     }
 
     /// Claude Code's mid-line echo torn before its parking CUP: the print run
     /// ends at the reprinted tail's end, a write position, so no anchor is
-    /// handed over. Controls: the finished echo's anchor passes, and so do the
-    /// anchor of a frame closed and reopened with nothing written and the
-    /// anchor beside a drawn caret on an unfinished frame (a program that died
-    /// mid-frame leaves the latch set under the shell's prompt).
+    /// handed over.
     #[test]
     fn an_unfinished_frames_print_anchor_is_no_echo_for_the_motion_engines() {
         let mut term = Terminal::new(10, 40);
@@ -430,8 +336,6 @@ mod tests {
         );
         assert_eq!(finished, (term.print_anchor(), term.print_anchor_glyph()));
 
-        // The Space's echo, cut before its park: the tail reprinted from the
-        // landing column, the caret still hidden.
         term.process(b"\x1b[?2026h\x1b[?25l\x1b[H\r\x1b[6C\x1b[7B the tail.");
         assert!(term.sync_frame_unfinished());
         assert!(
@@ -440,7 +344,6 @@ mod tests {
         );
         assert_eq!(motion_print_anchor(&term), (None, None), "a write position");
 
-        // The rest lands: the frame is finished and its anchor passes.
         term.process(b"\x1b[10;1H\x1b[8;7H\x1b[?25h\x1b[?2026l");
         let after = motion_print_anchor(&term);
         assert_eq!(after, (term.print_anchor(), term.print_anchor_glyph()));
@@ -450,11 +353,9 @@ mod tests {
                 .is_some_and(|(_, _, seq)| finished.0.is_some_and(|(_, _, s0)| seq > s0))
         );
 
-        // Reopened with nothing written: the grid is the finished frame.
         term.process(b"\x1b[?2026h");
         assert_eq!(motion_print_anchor(&term), after);
 
-        // Written into with the caret drawn: the anchor passes beside it.
         term.process(b"\x1b[9;1H$ ls");
         assert!(term.sync_frame_unfinished() && term.cursor_visible());
         let drawn = motion_print_anchor(&term);
@@ -463,7 +364,7 @@ mod tests {
     }
 
     /// Claude Code's question dialog parks its hidden cursor at column 0 of the blank bottom row:
-    /// no caret there. Hidden on the option's row, or shown on the blank row, it passes.
+    /// no caret there.
     #[test]
     fn a_hidden_cursor_on_a_blank_row_is_no_caret_for_the_motion_engines() {
         let mut term = Terminal::new(12, 40);
@@ -482,18 +383,14 @@ mod tests {
             "the option's row"
         );
 
-        // ↓ to `Chat about this`: parked on the blank bottom row.
         term.process(b"\x1b[12;1H");
         let (facts, motion) = read(&term);
         assert_eq!(facts, Some((11, 0)), "the pet still reads the cursor");
         assert_eq!(motion, None, "a hidden cursor on a blank row is no caret");
 
-        // Shown there, it is the caret.
         term.process(b"\x1b[?25h");
         assert_eq!(read(&term), (Some((11, 0)), Some((11, 0))));
 
-        // A blank row padded with invisibly styled spaces (dim, a foreground
-        // colour) still draws nothing: withheld.
         term.process(b"\x1b[?25l\x1b[12;1H\x1b[2m    \x1b[38;5;244m    \x1b[0m\x1b[12;1H");
         assert_eq!(read(&term).1, None, "invisible styling is no mark");
         term.process(b"\x1b[12;1H\x1b[73m    \x1b[74m    \x1b[0m\x1b[12;1H");
@@ -510,8 +407,6 @@ mod tests {
         );
         term.process(b"\x1b[12;1H\x1b[2K");
 
-        // Hidden again beside its own inverse-space caret: the row's one mark
-        // is styled, so the caret passes.
         term.process(b"\x1b[?25l\x1b[12;1H\x1b[7m \x1b[27m\x1b[12;1H");
         assert_eq!(read(&term), (Some((11, 0)), Some((11, 0))));
     }

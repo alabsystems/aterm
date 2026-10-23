@@ -9,6 +9,7 @@ use aterm_spec::derive::Model;
 use std::collections::BTreeMap;
 
 /// The replayed conversation, target and salt (its state file:
+/// `"salt":1790372998`, `"to":"2.1.283"`).
 const INCIDENT_SESSION: &str = "37dffac7-361e-46be-90c2-31589cb40b5c";
 const INCIDENT_SALT: u64 = 1_790_372_998;
 
@@ -33,6 +34,7 @@ fn version(s: &str) -> Version {
 }
 
 /// The facts of an idle Claude at an empty, settled composer — at its usage
+/// limit or not.
 fn idle(limited: bool) -> Facts {
     Facts {
         status: "idle".to_string(),
@@ -69,6 +71,8 @@ fn notice(marker: &str) -> String {
 }
 
 /// F2 over the replayed record: the ledger's markers are the ones this build mints from the
+/// salt; after four notices and a give-up the late READY (to any of the four) is heard and
+/// the restart taken, the owed release waiting behind it.
 #[test]
 fn the_incident_replays_to_a_restart_never_a_stall() {
     let to = version("2.1.283");
@@ -160,6 +164,7 @@ fn the_incident_replays_to_a_restart_never_a_stall() {
 }
 
 /// The owner's word holds a gave-up upgrade's late READY too, and a hold
+/// that ends an announcement releases the agent it asked (F3).
 #[test]
 fn the_owners_hold_releases_the_agent_and_forgets_its_answers() {
     let mut announced = St {
@@ -237,6 +242,9 @@ fn the_owners_hold_releases_the_agent_and_forgets_its_answers() {
 }
 
 /// The owner's `--now` is spent with the round it asked to move: an upgrade
+/// `--now` re-armed that gives up asking clears the word, so a late READY
+/// hours later restarts under the ordinary waits (a person at the tab holds
+/// the signal).
 #[test]
 fn a_give_up_spends_the_owners_now() {
     let now = READY_AT;
@@ -286,6 +294,7 @@ fn a_give_up_spends_the_owners_now() {
 }
 
 /// A limited Claude Code 2.1.280 tab as `text --json` sends it: the limit
+/// banner over an empty composer, the caret at column 2.
 #[cfg(unix)]
 fn limited_screen() -> String {
     let rule = "─".repeat(40);
@@ -304,6 +313,7 @@ fn draft_screen() -> String {
 }
 
 /// A stand-in agent in [`TAB`], its session file, and the upgrade record
+/// `st` filed for its conversation — the notice's fence naming it.
 #[cfg(unix)]
 struct Agent {
     child: aterm_uds::spawnfd::Child,
@@ -344,6 +354,7 @@ impl Agent {
     }
 
     /// [`Self::visit`], the agent its shell's foreground job for the first
+    /// `foreground` job reads and suspended after ([`Script`]).
     fn visit_with(&self, opts: &Opts, shell: u32, foreground: usize) -> Report {
         let table = vec![(shell, 1, "zsh".into())];
         let args = atpkg::caller_shell::process_args(self.sf.pid).expect("agent argv");
@@ -389,6 +400,8 @@ fn typed(asked: &std::sync::Mutex<Vec<String>>, words: &str) -> usize {
 }
 
 /// F1 through the real visit: a limited tab (the banner over an empty composer, the session
+/// file `idle`) is typed nothing: a pending upgrade waits `limited`, and so does one asked to
+/// its bound long ago, its clock restarted instead of a give-up.
 #[cfg(unix)]
 #[test]
 fn a_limited_tab_is_never_typed_into_and_never_given_up_on() {
@@ -455,6 +468,8 @@ fn a_limited_tab_is_never_typed_into_and_never_given_up_on() {
 }
 
 /// F3 through the real visit: a READY answer a person's draft held past the
+/// drain's bound is void; the agent, stopped for a restart that is not
+/// coming, is owed its release, which waits while the draft stands.
 #[cfg(unix)]
 #[test]
 fn a_voided_ready_owes_one_release_typed_once() {
@@ -540,6 +555,10 @@ fn a_voided_ready_owes_one_release_typed_once() {
 }
 
 /// F2 and F3 through the real visit, on the replayed record (gave up, four
+/// markers, the notice's fence on the agent): its READY to the last marker
+/// reaches the restart (a dry run says so and ends nothing); with no READY,
+/// the release is typed once and the markers forgotten; at the limit, the
+/// release waits (`wait:release:limited`) and nothing is typed.
 #[cfg(unix)]
 #[test]
 fn a_gave_up_record_restarts_on_a_late_ready_or_releases_its_agent() {
@@ -614,6 +633,10 @@ fn a_gave_up_record_restarts_on_a_late_ready_or_releases_its_agent() {
 }
 
 /// A stale status never reaches the signal nor strands the READY agent: with Claude Code's
+/// status left `busy` over an idle screen and nothing under the agent, the restart waits
+/// `status-stale` (the Drain step needs Claude's own `idle`: work inside the agent's process
+/// is no process under it), and once the READY has stood a whole [`upgrade::REASK_S`] the
+/// agent is asked again (`announced:2`).
 #[cfg(unix)]
 #[test]
 fn a_ready_agent_under_a_stale_status_is_never_signalled_and_is_asked_again() {
@@ -687,6 +710,8 @@ fn a_ready_agent_under_a_stale_status_is_never_signalled_and_is_asked_again() {
 }
 
 /// A late READY whose restart's gate waits keeps the gate's word, not the owed release's: the
+/// host owns the turn ends while the restart settles, and a draft under it is looked at every
+/// [`HOLD_LOOK`].
 #[cfg(unix)]
 #[test]
 fn a_late_ready_whose_restart_waits_keeps_its_gates_word() {
@@ -743,6 +768,7 @@ fn a_late_ready_whose_restart_waits_keeps_its_gates_word() {
 }
 
 /// A user row as Claude Code writes one on its own: `extra` fields beside
+/// the message (`"isMeta":true`), its content the JSON `content`.
 fn user_row(extra: &str, content: &str) -> String {
     format!(
         r#"{{"type":"user","isSidechain":false,{extra}"message":{{"role":"user","content":{content}}}}}"#
@@ -750,6 +776,10 @@ fn user_row(extra: &str, content: &str) -> String {
 }
 
 /// Who has directed the conversation since the agent's last answer
+/// ([`upgrade::directed_since_ready`]), over real user rows: a person's words, a `!` command,
+/// an Esc, a peer's message and a continuation are directions; the harness's own lines, tool
+/// results, `isMeta` rows, compaction summaries, task notifications and slash commands are
+/// not.
 #[test]
 fn a_direction_since_the_last_answer_is_a_turn_typed_by_someone_else() {
     let notice_row = user(&notice(LEDGER[0].1));
@@ -831,7 +861,7 @@ fn a_direction_since_the_last_answer_is_a_turn_typed_by_someone_else() {
     assert!(!directed(&[side, on_it]));
 }
 
-/// A release is typed only to the agent the notice reached. A restart past
+/// A release is typed only to the agent the notice reached.
 #[test]
 fn a_release_follows_only_the_process_the_notice_reached() {
     for phase in [Phase::Exiting { at_s: 10 }, Phase::Relaunched { at_s: 10 }] {
@@ -880,6 +910,8 @@ fn a_release_follows_only_the_process_the_notice_reached() {
 }
 
 /// Through the real visit, an owed release is dropped (ledgered once, nothing typed) where it
+/// is no longer this upgrade's: the process visited is not the one the notice reached, or
+/// someone has directed the conversation since.
 #[cfg(unix)]
 #[test]
 fn a_release_is_dropped_where_it_is_no_longer_the_upgrades() {
@@ -977,6 +1009,9 @@ fn a_release_is_dropped_where_it_is_no_longer_the_upgrades() {
 }
 
 /// A dropped release takes its gate's wait with it: a pending round owing `retargeted`, its
+/// last look's wait `release:attended`, visited with no build to move to while the notice's
+/// process no longer holds the conversation, drops the release (`release-dropped:other-process`)
+/// and clears the wait, so `--status` never says the line is still owed.
 #[cfg(unix)]
 #[test]
 fn a_dropped_release_leaves_no_owed_wait_behind() {
@@ -1061,6 +1096,7 @@ fn a_dropped_release_leaves_no_owed_wait_behind() {
 }
 
 /// F1 from the window: the loop's limit episode holds the upgrade's clocks ([`hold_clock`],
+/// called by the host as an episode opens and closes).
 #[test]
 fn a_limit_episode_holds_the_upgrades_clocks_for_the_window() {
     let dir = scratch("hold-clock");
@@ -1149,6 +1185,7 @@ fn a_limit_episode_holds_the_upgrades_clocks_for_the_window() {
 type S = BTreeMap<&'static str, i64>;
 
 /// The model's notices to its bound, and the real ones: a notice short of the
+/// bound is the one before the last (`MAX_ASKS - 1`), the bound the last.
 const MODEL_MAX_ASKS: i64 = 2;
 const T0: u64 = 1_790_377_339;
 
@@ -1194,6 +1231,7 @@ fn agent_file() -> SessionFile {
 }
 
 /// What holds the look a model state stands for, beyond an idle, settled
+/// session with an empty composer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Holds {
     /// Nothing: the reducer's own step.
@@ -1201,16 +1239,22 @@ enum Holds {
     /// A person's box, standing [`upgrade::HOLD_S`].
     Person,
     /// The agent's own background work, under a READY heard
+    /// [`upgrade::DRAIN_S`] ago.
     Background,
     /// The same at a break, the work inside the agent's own process (Claude's status `busy`,
+    /// nothing under it), judged as [`Holds::Background`].
     InProcess,
     /// The same work under the same READY, looked at from a break of it (`brk`,
+    /// [`upgrade::Facts::background_point`]), the step held to [`upgrade::break_step`].
     Break,
     /// The restart's signal is refused by the kernel, or a re-ask's plan
+    /// by the relaunch — the round abandoned.
     Refused,
 }
 
 /// A peer's message to the agent: the direction the model's `Direct`
+/// stands for (a person's words, an Esc and the supervisor's continuation
+/// read the same, [`upgrade::directed_since_ready`]).
 fn direction() -> String {
     user("[from s-d3346b29] v0.91.0 is out; the parser branch can wait")
 }
@@ -1221,11 +1265,14 @@ fn ready_row() -> String {
 }
 
 /// Whether the transcript a model state stands for may carry an earlier direction the agent
+/// answered with READY ([`real_of`]): wherever a READY may stand in the tail without being an
+/// answer the state denies.
 fn history_fits(s: &S) -> bool {
     s["ready"] == 1 || s["live"] == 0 || s["told"] == 1 || s["directed"] == 1
 }
 
 /// The record, facts, clock and transcript a model state stands for: the record of the agent
+/// the notice reached, the round's marker typed.
 fn real_of(s: &S, history: bool) -> (St, Facts, u64, Vec<String>) {
     let phase = match s["phase"] {
         0 => Phase::Pending,
@@ -1294,6 +1341,9 @@ fn real_of(s: &S, history: bool) -> (St, Facts, u64, Vec<String>) {
 }
 
 /// A record and a transcript projected onto the model's variables, from the
+/// record's raw state, not the driver's reading of it: `live`, the round's
+/// markers kept; `ready`, an answer to one of them ([`answered`]); `rest`, a
+/// stopped round's rest run out at `now` ([`St::failed_for`]).
 fn project(s: &S, st: &St, tail: &[String], now: u64) -> S {
     let mut p = s.clone();
     let (phase, asks) = match &st.phase {
@@ -1329,6 +1379,11 @@ struct Decided {
 }
 
 /// The real visit's decision at the look `s` stands for, under `holds`, over the transcript
+/// [`real_of`] writes (`history`: a direction answered with READY), in the driver's order and
+/// through its own code: the clock hold, the READY and its clock, the step (held to
+/// [`upgrade::break_step`] at a break) and its record transition, then the release where it
+/// is next ([`release_next`]): dropped where [`release_void`] says, else typed under
+/// [`upgrade::gate_release`] or the word that owes it.
 fn decide(s: &S, holds: Holds, history: bool) -> Option<Decided> {
     if holds == Holds::Break && !at_a_break(s) {
         return None;
@@ -1491,11 +1546,15 @@ fn decide(s: &S, holds: Holds, history: bool) -> Option<Decided> {
 }
 
 /// The states decided at a break ([`Holds::Break`]): a gave-up round holding a late READY to
+/// one of its markers, at a break of the agent's own work (`brk`).
 fn at_a_break(s: &S) -> bool {
     s["brk"] == 1 && s["phase"] == 2 && s["ready"] == 1 && s["live"] == 1
 }
 
 /// The upgrade's quiet word, nothing it would do for the agent at this look (the model's
+/// `Look`): its last word ([`After::Finished`]), a stopped round resting (`wait:failed`,
+/// looked at again but acting on nothing until the rest runs out), or a round held by a build
+/// that fails to start (`wait:build-fails`).
 fn quiet(word: &str) -> bool {
     word == "wait:failed"
         || word == format!("wait:{}", upgrade::BUILD_FAILS)
@@ -1503,6 +1562,7 @@ fn quiet(word: &str) -> bool {
 }
 
 /// The reducer's actions, the environment's aside; `Void` is a person's or
+/// the agent's own work's, `Abandon` a refusal's.
 const REDUCER: [&str; 8] = [
     "Announce",
     "GiveUp",
@@ -1534,6 +1594,10 @@ fn reachable(m: &Model) -> Vec<S> {
 }
 
 /// Whether `m` admits what the real visit decided at `s` under `holds`: at an idle look, the
+/// one reducer step the model's guards enable (or a wait where none is); held by a person or
+/// at a break, the void exactly where the model voids; held by the agent's own work, the
+/// re-ask or give-up over the READY where the model takes one, else its void; refused, the
+/// round abandoned.
 fn agrees(m: &Model, s: &S, holds: Holds, d: &Decided) -> bool {
     let lands = || {
         let mut t = s.clone();
@@ -1573,6 +1637,9 @@ fn agrees(m: &Model, s: &S, holds: Holds, d: &Decided) -> bool {
 }
 
 /// The conversation's own moves (`Direct`, `AgentReady`, `AgentGoesOn`) read by the real code:
+/// the row `action` writes, appended to the transcript `s` stands for, read back as the
+/// model's `ready` ([`answered`]) and as whether the release would be dropped there
+/// ([`release_void`], against the model's `DropRelease` guard).
 fn reads_as(m: &Model, s: &S, action: &str, history: bool) -> Option<bool> {
     let mut t = s.clone();
     if !m.fire(action, &mut t) {
@@ -1603,6 +1670,7 @@ fn reads_as(m: &Model, s: &S, action: &str, history: bool) -> Option<bool> {
 }
 
 /// The model with one defect switched on: the unfixed reducer (`Buggy`), and
+/// each other defect the model guards against.
 fn defective() -> Vec<(&'static str, Model)> {
     let model = harness_upgrade_never_strands_model();
     std::iter::once(("Buggy", aterm_spec::interp::with_buggy(&model, 1)))
@@ -1629,6 +1697,9 @@ fn defective() -> Vec<(&'static str, Model)> {
 }
 
 /// Tier-1: on every reachable state of `harness_upgrade_never_strands_model` the real code
+/// (reducer, gates, record transitions, the driver's READY, direction and release rules, and
+/// the window's reading of each word, [`after`]) takes the step the model's guards allow and
+/// lands where its actions land, under each [`Holds`].
 #[test]
 fn the_real_upgrade_conforms_to_the_never_strands_model() {
     let model = harness_upgrade_never_strands_model();
@@ -1766,6 +1837,9 @@ fn the_real_upgrade_conforms_to_the_never_strands_model() {
 }
 
 /// Every stop is stamped, and a re-arm is a new round ([`St::fail`], [`St::rearm`]): the
+/// give-up, a stop, a refused signal and a gave-up round's void each stamp the rest's start;
+/// the new round is pending with a fresh salt, its markers, stamp, saved prompt and spent
+/// `--now` gone (a skip kept), the owed release carried for its first notice to supersede.
 #[test]
 fn a_stop_is_stamped_and_a_rearm_is_a_new_round() {
     let mut st = St {
@@ -1841,6 +1915,9 @@ fn a_stop_is_stamped_and_a_rearm_is_a_new_round() {
 }
 
 /// A void begins the rest again by its stop's ladder: four declined rounds rest a day
+/// ([`upgrade::unanswered_rest_extension`]), and a late READY voided in that rest begins a
+/// day's rest again at the void, never the `4 × RETRY_S` cap of a stop repeated for another
+/// reason.
 #[test]
 fn a_void_begins_the_rest_again_by_the_ladder_of_its_stop() {
     const T: u64 = 1_790_000_000;
@@ -1872,6 +1949,7 @@ fn a_void_begins_the_rest_again_by_the_ladder_of_its_stop() {
 }
 
 /// A gave-up round whose late READY its own shell outlives: voided, the agent released, the
+/// round resting (`wait:failed`, looked at again).
 #[cfg(unix)]
 #[test]
 fn a_stopped_round_rests_then_a_new_one_asks_again_naming_what_runs() {

@@ -7,42 +7,7 @@
 // project in 2026 as one blocking thread over aterm-dbus: no executor, no
 // zbus, and a lost bus is logged and survived instead of unwrapped.
 
-//! The publisher thread: one per process, holding the session bus (to learn
-//! whether an assistive technology wants the tree, and where the
-//! accessibility bus is) and, while one does, the accessibility bus, where
-//! it answers calls and sends the tree's events.
-//!
-//! Windows talk to it through a channel and a wake socket; it waits on
-//! nothing but `poll(2)` over the wake socket and the two bus sockets. A bus
-//! that fails is not fatal to anything but itself: losing the accessibility
-//! bus drops the published trees and tells each window
-//! ([`crate::model::DeactivationHandler`]), and the publisher attaches again
-//! when at-spi2-core's status says so; losing the session bus ends the
-//! thread, and every window stays unpublished. Both are logged.
-//! accesskit_unix unwrapped either into a panic, after which no window of
-//! the process could be published again (docs/AUDIT-third-party-2026-10-15.md,
-//! unit a11y).
-//!
-//! A tree belongs to the attachment it was built for: each join of the
-//! accessibility bus has a number, and the registrations and events a
-//! window's tree queues carry it. Those of a bus that is gone are dropped
-//! unread, even when the publisher has already joined the next one, so a
-//! dead tree's node never shadows the live one at the same path.
-//!
-//! One thread does everything, in order. While it waits on at-spi2-core's
-//! `org.a11y.Bus` (a call, at most [`proxies::CALL`] with its write), or on
-//! the accessibility bus's handshake (at most [`WRITE`]; aterm-dbus's
-//! `HANDSHAKE_TIMEOUT` for the session bus's), the AT's calls wait too;
-//! accesskit_unix answered them on another task meanwhile. Any other write to
-//! either bus (a reply, an error, a signal) waits at most [`WRITE`] for its
-//! daemon to read ([`Buses::write_timeout`]): a dbus-daemon that stops reading
-//! (frozen, wedged) would otherwise stall the thread, and grow the windows'
-//! channel, for as long as it stayed stopped.
-//! An accessibility bus that takes no write in that time is left as a lost one
-//! is; a join that fails is tried again, after one second and then twice as
-//! long each time up to a minute ([`REJOIN_FIRST`], [`REJOIN_MAX`]), as well as
-//! whenever at-spi2-core's status changes, so a bus that resumes is rejoined
-//! although nothing on the session bus says so.
+//! AT-SPI publisher thread managing session and accessibility D-Bus connections.
 
 use std::io::{self, ErrorKind, Read as _, Write as _};
 use std::os::fd::{AsRawFd, RawFd};
@@ -61,20 +26,16 @@ use super::serve::{self, Objects};
 use super::{events, proxies};
 use crate::model::{ActionHandler, ActivationHandler, DeactivationHandler};
 
-/// How long a write to a bus may wait for its daemon to read it. A
-/// dbus-daemon reads each client as its messages come, so a write waits at
-/// all only once the socket's buffer holds what the daemon left unread; one
-/// that waits this long is a daemon that stopped.
+/// Maximum duration a bus write waits for its daemon to read.
 pub const WRITE: Duration = Duration::from_secs(5);
 
-/// The first wait before the publisher tries again to join an accessibility
-/// bus it could not join; each failure doubles it, up to [`REJOIN_MAX`].
+/// Initial backoff before retrying an accessibility bus join.
 pub(crate) const REJOIN_FIRST: Duration = Duration::from_secs(1);
 
-/// The longest wait between two attempts to join.
+/// Maximum backoff between attempts to join the accessibility bus.
 pub(crate) const REJOIN_MAX: Duration = Duration::from_secs(60);
 
-/// What the windows send the publisher thread.
+/// Messages sent from windows to the publisher thread.
 pub(crate) enum Msg {
     AddAdapter {
         id: usize,
@@ -135,7 +96,7 @@ impl std::fmt::Debug for Link {
 }
 
 impl Link {
-    /// Queues `msg` and wakes the thread. A thread that has ended drops it.
+    /// Queues `msg` and wakes the thread.
     pub(crate) fn send(&self, msg: Msg) {
         if self.tx.send(msg).is_ok()
             && let Some(wake) = &self.wake
@@ -145,14 +106,13 @@ impl Link {
         }
     }
 
-    /// The application: every window's tree hangs off its root.
+    /// The application root shared by all window trees.
     pub(crate) fn app(&self) -> &Arc<SharedLock<AppContext>> {
         &self.app
     }
 }
 
-/// How the publisher reaches its buses. [`SessionBuses`] is the desktop's;
-/// a test hands it buses of its own.
+/// How the publisher reaches its D-Bus connections.
 pub trait Buses: Send + 'static {
     /// The session bus, where at-spi2-core's `org.a11y.Bus` lives.
     ///
@@ -168,30 +128,23 @@ pub trait Buses: Send + 'static {
     /// When it cannot be reached.
     fn open(&mut self, address: &str) -> aterm_dbus::Result<Connection>;
 
-    /// An accessibility bus address that takes precedence over
-    /// `org.a11y.Bus.GetAddress`.
+    /// An accessibility bus address that overrides `org.a11y.Bus.GetAddress`.
     fn address_override(&self) -> Option<String> {
         None
     }
 
-    /// How long a write to either bus may wait for its daemon to read
-    /// ([`WRITE`]). `None` waits for as long as the daemon does: a test's
-    /// negative control, never the desktop's.
+    /// How long a write to either bus may wait for its daemon to read.
     fn write_timeout(&self) -> Option<Duration> {
         Some(WRITE)
     }
 
-    /// The wait before the first attempt to join the accessibility bus again
-    /// ([`REJOIN_FIRST`]); each failure doubles it, up to [`REJOIN_MAX`]. A test's
-    /// may be short.
+    /// The wait before the first attempt to join the accessibility bus again.
     fn rejoin_first(&self) -> Duration {
         REJOIN_FIRST
     }
 }
 
-/// The desktop's buses: the session bus from `DBUS_SESSION_BUS_ADDRESS`, and
-/// at-spi2-core's accessibility bus from `AT_SPI_BUS_ADDRESS` when that is
-/// set, as libatspi and accesskit_unix read it.
+/// Desktop session and AT-SPI accessibility buses.
 #[derive(Debug)]
 pub struct SessionBuses {
     /// How long a join's handshake may wait: [`WRITE`] (a test's is short).
@@ -231,8 +184,7 @@ impl Buses for SessionBuses {
     }
 }
 
-/// A running publisher: one thread, one application root, any number of
-/// windows ([`Publisher::adapter`]). Dropping the last handle ends the thread.
+/// A running AT-SPI publisher handle.
 #[derive(Clone, Debug)]
 pub struct Publisher {
     inner: Arc<Handle>,
@@ -250,8 +202,7 @@ impl Drop for Handle {
 }
 
 impl Publisher {
-    /// This process's publisher on the desktop's buses, started on first use
-    /// and named after the executable, as accesskit_unix named it.
+    /// Process-global publisher on the desktop buses, started on first use.
     pub fn global() -> &'static Publisher {
         static GLOBAL: OnceLock<Publisher> = OnceLock::new();
         GLOBAL.get_or_init(|| {
@@ -262,8 +213,7 @@ impl Publisher {
         })
     }
 
-    /// Starts a publisher on `buses` whose application root is named
-    /// `app_name`.
+    /// Starts a publisher on `buses` whose application root is named `app_name`.
     pub fn start(buses: impl Buses, app_name: Option<String>) -> Publisher {
         let (tx, rx) = mpsc::channel();
         let app = AppContext::new(app_name);
@@ -346,11 +296,9 @@ impl A11yBus {
                     name: window,
                     event,
                 } => Some(events::window_event(adapter, target, window, event)),
-                // The callback sends these as CacheAdd / CacheRemove.
                 Event::Cache(_) => None,
             },
             Change::CacheAdd { node } => {
-                // A node gone by now has nothing to add.
                 let item = node.cache_node().ok()?;
                 Some(events::cache_add(name, item))
             }
@@ -389,7 +337,7 @@ fn left(e: &BusError) -> bool {
     lost(e) || matches!(e, BusError::Timeout)
 }
 
-/// When to try joining the accessibility bus again, and the wait that set it.
+/// Next scheduled attempt to join the accessibility bus.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Rejoin {
     pub(super) at: Instant,
@@ -397,8 +345,7 @@ pub(super) struct Rejoin {
 }
 
 impl Rejoin {
-    /// The attempt after `last`'s: `first` ([`Buses::rejoin_first`]) from now, or
-    /// twice `last`'s wait, at most [`REJOIN_MAX`].
+    /// Compute the next rejoin backoff after `last`.
     pub(super) fn next(last: Option<Rejoin>, now: Instant, first: Duration) -> Option<Rejoin> {
         let after = last.map_or(first, |r| r.after.saturating_mul(2).min(REJOIN_MAX));
         now.checked_add(after).map(|at| Rejoin { at, after })
@@ -453,8 +400,6 @@ impl Worker {
                 || self.bus.as_ref().is_some_and(|b| b.conn.has_buffered());
             let mut fds = vec![self.wake.as_raw_fd(), self.session.as_raw_fd()];
             fds.extend(self.bus.as_ref().map(|b| b.conn.as_raw_fd()));
-            // Nothing buffered: wait for a socket, or for the next attempt
-            // to join when one is due.
             let timeout = if buffered {
                 Some(Duration::ZERO)
             } else {
@@ -489,8 +434,7 @@ impl Worker {
         }
     }
 
-    /// Asks `IsEnabled` and attaches or detaches to match. `Err` when the
-    /// session bus is gone.
+    /// Asks `IsEnabled` and attaches or detaches to match.
     fn refresh_status(&mut self) -> Result<(), ()> {
         let enabled = match proxies::is_enabled(&mut self.session) {
             Ok(enabled) => enabled,
@@ -502,9 +446,6 @@ impl Worker {
                 self.detach("the session bus closed");
                 return Err(());
             }
-            // An unanswered status says nothing of it. While the publisher
-            // waits to rejoin, the wait goes on, longer: clearing it would
-            // stop the attempts until at-spi2-core's next status signal.
             Err(e) if self.rejoin.is_some() => {
                 aterm_log::debug!(
                     "accessibility: org.a11y.Status.IsEnabled: {e}; trying again later"
@@ -555,8 +496,6 @@ impl Worker {
                         )
                     },
                 );
-                // The first failure is a warning; the ones after it, which
-                // the backoff spaces out, are its detail.
                 if self.rejoin.is_none() {
                     aterm_log::warn!(
                         "accessibility: cannot join the AT-SPI bus ({e}); trying again {again}"
@@ -577,7 +516,6 @@ impl Worker {
             "accessibility: publishing on the AT-SPI bus as {}",
             conn.unique_name()
         );
-        // 2^64 joins are never made; wrapping keeps the count total.
         self.epochs = self.epochs.wrapping_add(1);
         let epoch = self.epochs;
         self.bus = Some(A11yBus {
@@ -618,8 +556,6 @@ impl Worker {
             "the AT-SPI bus failed"
         };
         self.detach(why);
-        // One attempt now (a restarted launcher answers at once); otherwise
-        // the next status signal, or the backoff, brings it back.
         let _ = self.refresh_status();
     }
 
@@ -659,8 +595,6 @@ impl Worker {
                 None
             }
             Msg::RemoveAdapter { id } => {
-                // The entry holds the window's tree; dropping it reports the
-                // window gone (a queued ChildrenChanged).
                 self.adapters.retain(|entry| entry.id != id);
                 if let Some(bus) = &mut self.bus {
                     bus.objects.forget_adapter(id);
@@ -669,11 +603,6 @@ impl Worker {
             }
             Msg::Tree { epoch, change } => match &mut self.bus {
                 Some(bus) if bus.epoch == epoch => bus.apply(change),
-                // A tree of a bus that is gone: the window has dropped it,
-                // and its paths and events mean nothing on this bus. They
-                // can still be queued when a lost bus is rejoined in the same
-                // pass that found it lost; registered here, a dead node would
-                // shadow the live one at its path.
                 _ => None,
             },
         };
@@ -691,7 +620,7 @@ impl Worker {
     }
 
     /// Reads the session bus: answers calls, and re-reads the status when it
-    /// may have changed. `Err` when the session bus is gone.
+    /// may have changed.
     fn pump_session(&mut self) -> Result<(), ()> {
         let mut recheck = false;
         loop {
@@ -776,15 +705,12 @@ fn wait(fds: &[RawFd], timeout: Option<Duration>) -> io::Result<Vec<bool>> {
         })
         .collect();
     let count = libc::nfds_t::try_from(polls.len()).unwrap_or(libc::nfds_t::MAX);
-    // Whole milliseconds, rounded up so a wait never ends before it is due;
-    // a wait past `c_int`'s milliseconds is the longest poll takes.
     let millis = timeout.map_or(-1, |t| {
         let ms = t.as_micros().div_ceil(1000);
         libc::c_int::try_from(ms).unwrap_or(libc::c_int::MAX)
     });
     loop {
-        // SAFETY: `polls` is an initialised array of `count` pollfd records,
-        // alive and exclusively borrowed for the call.
+        // SAFETY: `polls` is an initialized array of `count` pollfd records alive for the call.
         let n = unsafe { libc::poll(polls.as_mut_ptr(), count, millis) };
         if n >= 0 {
             return Ok(polls.iter().map(|p| p.revents != 0).collect());

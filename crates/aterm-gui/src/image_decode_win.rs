@@ -1,39 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! WINDOWS' OWN IMAGE DECODER: the Windows Imaging Component (WIC) behind the
-//! wallpaper on Windows, for every format the first-party decoders do not read
-//! (`app_config::decode_wallpaper_portable`: PNG and JPEG). WIC ships BMP, GIF,
-//! TIFF, ICO and JPEG XR with the OS, and HEIC, WebP and AVIF wherever their
-//! Store codecs are installed: the Windows counterpart of the AppKit decoder on
-//! macOS, so a wallpaper the system can show is a wallpaper aterm can draw.
-//!
-//! **One table for the decoder and the picker.** [`decodable_extensions`] asks
-//! WIC which file extensions its installed decoders claim, and the wallpaper
-//! picker offers exactly those (with the first-party ones), so the picker can
-//! never offer a file the decoder refuses, nor hide one it reads.
-//!
-//! **The pixels.** The first frame, colour-managed into sRGB where the file
-//! carries a colour profile (an `IWICColorTransform` from the frame's own
-//! context to the EXIF sRGB one, as the macOS path converts rather than
-//! retags), then converted to straight 32bpp BGRA and copied out as RGBA8,
-//! top-down. Its size is checked against the caller's bound before any pixel
-//! is copied. A step that fails is the decode's refusal, named.
-//!
-//! **FFI style**: hand-rolled by-hand-vtable COM against the system's
-//! `windowscodecs` component, the house style of [`super::file_picker_win`]
-//! (no `windows`-crate feature for four interfaces; the owned pointer and the
-//! apartment are aterm-win32's). The vtables are
-//! transcribed from `wincodec.h` in COM inheritance order; every slot before a
-//! called one is declared, so offsets are load-bearing, and each table is
-//! truncated after the last slot this module calls.
+//! WINDOWS' OWN IMAGE DECODER.
 #![cfg(windows)]
 
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
 use crate::win_ffi::{Apartment, Com, Guid, StepError, check, co_create};
-
-// GUIDs and constants (wincodec.h)
 
 /// `CLSID_WICImagingFactory` {CACAF262-9370-4615-A13B-9F5539DA4C0A}: the
 /// factory every Windows since Vista registers (WICImagingFactory2 adds only
@@ -83,8 +56,6 @@ const EXIF_COLOR_SPACE_SRGB: u32 = 1;
 /// How many colour contexts a frame may carry that the decoder looks at.
 const MOST_COLOR_CONTEXTS: u32 = 8;
 
-// Vtables, in COM inheritance order (wincodec.h, objidl.h)
-
 type Raw = *mut c_void;
 type Out = *mut *mut c_void;
 
@@ -128,10 +99,8 @@ struct StreamVtbl {
     query_interface: unsafe extern "system" fn(Raw, *const Guid, Out) -> i32,
     add_ref: unsafe extern "system" fn(Raw) -> u32,
     release: unsafe extern "system" fn(Raw) -> u32,
-    // ISequentialStream
     read: unsafe extern "system" fn(Raw, *mut c_void, u32, *mut u32) -> i32,
     write: unsafe extern "system" fn(Raw, *const c_void, u32, *mut u32) -> i32,
-    // IStream
     seek: unsafe extern "system" fn(Raw, i64, u32, *mut u64) -> i32,
     set_size: unsafe extern "system" fn(Raw, u64) -> i32,
     copy_to: unsafe extern "system" fn(Raw, Raw, u64, *mut u64, *mut u64) -> i32,
@@ -141,7 +110,6 @@ struct StreamVtbl {
     unlock_region: unsafe extern "system" fn(Raw, u64, u64, u32) -> i32,
     stat: unsafe extern "system" fn(Raw, *mut c_void, u32) -> i32,
     clone: unsafe extern "system" fn(Raw, Out) -> i32,
-    // IWICStream
     initialize_from_istream: unsafe extern "system" fn(Raw, Raw) -> i32,
     initialize_from_filename: unsafe extern "system" fn(Raw, *const u16, u32) -> i32,
     initialize_from_memory: unsafe extern "system" fn(Raw, *const u8, u32) -> i32,
@@ -240,7 +208,6 @@ struct CodecInfoVtbl {
     query_interface: unsafe extern "system" fn(Raw, *const Guid, Out) -> i32,
     add_ref: unsafe extern "system" fn(Raw) -> u32,
     release: unsafe extern "system" fn(Raw) -> u32,
-    // IWICComponentInfo
     get_component_type: unsafe extern "system" fn(Raw, *mut i32) -> i32,
     get_clsid: unsafe extern "system" fn(Raw, *mut Guid) -> i32,
     get_signing_status: unsafe extern "system" fn(Raw, *mut u32) -> i32,
@@ -249,7 +216,6 @@ struct CodecInfoVtbl {
     get_version: unsafe extern "system" fn(Raw, u32, *mut u16, *mut u32) -> i32,
     get_spec_version: unsafe extern "system" fn(Raw, u32, *mut u16, *mut u32) -> i32,
     get_friendly_name: unsafe extern "system" fn(Raw, u32, *mut u16, *mut u32) -> i32,
-    // IWICBitmapCodecInfo
     get_container_format: unsafe extern "system" fn(Raw, *mut Guid) -> i32,
     get_pixel_formats: unsafe extern "system" fn(Raw, u32, *mut Guid, *mut u32) -> i32,
     get_color_management_version: unsafe extern "system" fn(Raw, u32, *mut u16, *mut u32) -> i32,
@@ -260,7 +226,6 @@ struct CodecInfoVtbl {
 }
 
 /// The vtable of the live interface `object`, viewed as `V`.
-///
 /// # Safety
 ///
 /// `object` must be a live interface pointer whose vtable begins with `V`'s
@@ -273,8 +238,8 @@ unsafe fn vtable<'a, V>(object: &'a Com) -> &'a V {
 /// Call a factory method that hands back one interface pointer, owned.
 fn created(hr: i32, out: *mut c_void, step: &'static str) -> Result<Com, StepError> {
     check(hr, step)?;
-    // SAFETY: every caller passes the out pointer of the factory method whose
-    // result is `hr`, which on success hands over one reference.
+    // SAFETY: every caller passes the out pointer of the factory method whose result is `hr`, which
+    // on success hands over one reference.
     unsafe { Com::from_raw(out) }.ok_or((step, 0))
 }
 
@@ -287,12 +252,7 @@ fn factory() -> Result<Com, StepError> {
     )
 }
 
-// The decoder
-
-/// Decode `bytes` (any format an installed WIC decoder reads) to straight
-/// sRGB RGBA8, top-down: `(rgba, width, height)`. Either side past
-/// `max_dimension` is refused before any pixel is copied. `Err` names why, in
-/// words the Wallpaper page shows.
+/// Decode `bytes` to straight sRGB RGBA8, top-down: ``.
 pub(crate) fn decode_rgba8(
     bytes: &[u8],
     max_dimension: usize,
@@ -322,9 +282,6 @@ fn decode(bytes: &[u8], len: u32, max_dimension: usize) -> Result<Decoded, StepE
     // SAFETY: `factory` is a live IWICImagingFactory.
     let fv = unsafe { vtable::<ImagingFactoryVtbl>(&factory) };
 
-    // The bytes as a stream. WIC reads them in place: `bytes` outlives the
-    // stream, the decoder and every source built on it (all dropped before
-    // this function returns).
     let mut out = std::ptr::null_mut();
     // SAFETY: a factory method with a valid out pointer.
     let stream = created(
@@ -332,8 +289,7 @@ fn decode(bytes: &[u8], len: u32, max_dimension: usize) -> Result<Decoded, StepE
         out,
         "CreateStream",
     )?;
-    // SAFETY: `stream` is a live IWICStream; the memory is `len` readable
-    // bytes that outlive it.
+    // SAFETY: `stream` is a live IWICStream; the memory is `len` readable bytes that outlive it.
     let sv = unsafe { vtable::<StreamVtbl>(&stream) };
     check(
         unsafe { (sv.initialize_from_memory)(stream.as_raw(), bytes.as_ptr(), len) },
@@ -380,8 +336,6 @@ fn decode(bytes: &[u8], len: u32, max_dimension: usize) -> Result<Decoded, StepE
         return Ok(Decoded::TooLarge);
     }
 
-    // Colour-managed into sRGB where the frame carries a profile; the frame
-    // as it is otherwise, or where the transform cannot be built or read.
     let managed =
         to_srgb(&factory, &frame).and_then(|managed| copy_rgba(&factory, &managed, w, h).ok());
     match managed {
@@ -402,8 +356,8 @@ fn copy_rgba(factory: &Com, source: &Com, w: usize, h: usize) -> Result<Decoded,
         out,
         "CreateFormatConverter",
     )?;
-    // SAFETY: `converter` is a live IWICFormatConverter; the source is a live
-    // bitmap source, the format a static GUID, no palette.
+    // SAFETY: `converter` is a live IWICFormatConverter; the source is a live bitmap source, the
+    // format a static GUID, no palette.
     let cv = unsafe { vtable::<FormatConverterVtbl>(&converter) };
     check(
         unsafe {
@@ -426,8 +380,7 @@ fn copy_rgba(factory: &Com, source: &Com, w: usize, h: usize) -> Result<Decoded,
         return Ok(Decoded::TooLarge);
     };
     let mut pixels = vec![0u8; size];
-    // SAFETY: the whole image (a null rect), into a buffer exactly
-    // `stride * height` bytes long.
+    // SAFETY: the whole image (a null rect), into a buffer exactly `stride * height` bytes long.
     check(
         unsafe {
             (cv.source.copy_pixels)(
@@ -466,7 +419,6 @@ fn to_srgb(factory: &Com, frame: &Com) -> Option<Com> {
         return None;
     }
     let count = count.min(MOST_COLOR_CONTEXTS);
-    // The array WIC fills: contexts made by the factory, owned here.
     let contexts = (0..count)
         .map(|_| {
             let mut out = std::ptr::null_mut();
@@ -481,8 +433,8 @@ fn to_srgb(factory: &Com, frame: &Com) -> Option<Com> {
         .collect::<Option<Vec<Com>>>()?;
     let mut raw: Vec<*mut c_void> = contexts.iter().map(|context| context.as_raw()).collect();
     let mut filled = 0u32;
-    // SAFETY: `raw` holds `count` live, uninitialised colour contexts that WIC
-    // initialises in place; it does not take ownership of them.
+    // SAFETY: `raw` holds `count` live, uninitialised colour contexts that WIC initialises in
+    // place; it does not take ownership of them.
     let hr =
         unsafe { (frv.get_color_contexts)(frame.as_raw(), count, raw.as_mut_ptr(), &mut filled) };
     if hr < 0 || filled == 0 {
@@ -509,9 +461,8 @@ fn to_srgb(factory: &Com, frame: &Com) -> Option<Com> {
         "CreateColorTransformer",
     )
     .ok()?;
-    // SAFETY: `transform` is a live IWICColorTransform; the frame, the
-    // frame's first context and the sRGB context are live; the format is a
-    // static GUID.
+    // SAFETY: `transform` is a live IWICColorTransform; the frame, the frame's first context and
+    // the sRGB context are live; the format is a static GUID.
     let tv = unsafe { vtable::<ColorTransformVtbl>(&transform) };
     let hr = unsafe {
         (tv.initialize)(
@@ -525,13 +476,9 @@ fn to_srgb(factory: &Com, frame: &Com) -> Option<Com> {
     (hr >= 0).then_some(transform)
 }
 
-// What the decoder reads
-
-/// THE FILE EXTENSIONS WIC'S INSTALLED DECODERS CLAIM, lower case and without
-/// their dot (`bmp`, `gif`, `tif`, `heic` where the HEIF codec is installed),
-/// each once: what [`decode_rgba8`] reads beyond the first-party decoders, and
-/// so what the wallpaper picker offers. Empty where WIC cannot be reached.
-/// Asked once: the codecs a running process can use do not change under it.
+/// THE FILE EXTENSIONS WIC'S INSTALLED DECODERS CLAIM, lower case and without their dot (`bmp`,
+/// `gif`, `tif`, `heic` where the HEIF codec is installed), each once: what [`decode_rgba8`] reads
+/// beyond the first-party decoders, and so what the wallpaper picker offers.
 pub(crate) fn decodable_extensions() -> &'static [String] {
     static EXTENSIONS: OnceLock<Vec<String>> = OnceLock::new();
     EXTENSIONS.get_or_init(|| match enumerate_extensions() {
@@ -568,8 +515,8 @@ fn enumerate_extensions() -> Result<Vec<String>, StepError> {
     loop {
         let mut item = std::ptr::null_mut();
         let mut fetched = 0u32;
-        // SAFETY: one element into a valid out pointer; S_FALSE (1) with none
-        // fetched ends the enumeration.
+        // SAFETY: one element into a valid out pointer; S_FALSE (1) with none fetched ends the
+        // enumeration.
         let hr = unsafe { (ev.next)(decoders.as_raw(), 1, &mut item, &mut fetched) };
         if hr < 0 || fetched == 0 || item.is_null() {
             break;
@@ -742,9 +689,7 @@ mod tests {
         v.extend_from_slice(&2835_i32.to_le_bytes());
         v.extend_from_slice(&0_u32.to_le_bytes());
         v.extend_from_slice(&0_u32.to_le_bytes());
-        // Bottom row first: blue, white, padding.
         v.extend_from_slice(&[255, 0, 0, 255, 255, 255, 0, 0]);
-        // Top row: red, green, padding.
         v.extend_from_slice(&[0, 0, 255, 0, 255, 0, 0, 0]);
         v
     }

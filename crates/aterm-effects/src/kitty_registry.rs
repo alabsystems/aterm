@@ -1,24 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Kitty Log vocabulary registry (docs/sparkle-words-v2-design.md §F4): the
-//! one source shared by the recorder (`word_decorations`), the persistent
-//! store's TOML keys (aterm-gui `kitty_log`) and the genome decode, in the
-//! shared registry idiom (`ALL` + `config_key()`).
-//!
-//! Aggregation key = `(KittyType, KittyMagic, primary LangId)`, never raw
-//! `Genome.magic` (which would grow the log without bound). The fallback cause
-//! is its own dimension ([`KittyShownAs`]).
+//! Kitty Log vocabulary registry and visual identity keys.
 
 use aterm_lexicon::LangSet;
 
 use crate::cat_glyphs_gen::{CatGlyphId, GLYPH_IDS, GLYPHS, GlyphKind};
 use crate::genome::{CatAge, CatMagic};
 
-/// The reusable visual identity of one collected cat, carried from the word
-/// renderer into the Kitty Log and back into the cursor companion: authored
-/// glyph ids plus integer palette/age axes, never pixels or a raw word/genome.
-/// [`crate::cat_baker::CatBaker`] is the only art cache.
+/// Visual identity of a collected or companion cat.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct KittyLook {
     /// Authored head or full-cat special.
@@ -43,22 +33,14 @@ impl Default for KittyLook {
 /// Salt for the launch kitty's genome namespace (`b"lnchKit\0"` as big-endian
 /// ASCII), apart from the word renderer's occurrence seeds.
 const LAUNCH_LOOK_SALT: u64 = 0x6C6E_6368_4B69_7400;
-
 /// Salt for the app kitties' genome namespace (`b"appKitt\0"` as big-endian
 /// ASCII), disjoint from [`LAUNCH_LOOK_SALT`] and the occurrence seeds.
 const APP_LOOK_SALT: u64 = 0x6170_704B_6974_7400;
-
 /// Launcher tokens transparent to app identity: the app is the token after them
 /// (leading `VAR=value` assignments and `-flags` are skipped too).
 const TRANSPARENT_PREFIXES: &[&str] = &["sudo", "env", "npx"];
 
-/// The first meaningful token of a shell commandline, basenamed and lowercased:
-/// the input to [`canonical_app_id`]. `None` when the commandline holds no
-/// identifiable program (empty, only assignments/flags).
-///
-/// A whitespace-token approximation, not a shell parser: quoting is not
-/// interpreted. Both `/` and `\` are path separators and a trailing `.exe` is
-/// stripped, so a tool yields the same id on every platform.
+/// Extract the first meaningful program token of a shell commandline, basenamed and lowercased.
 #[must_use]
 pub fn app_basename(commandline: &str) -> Option<String> {
     for token in commandline.split_whitespace() {
@@ -87,12 +69,10 @@ pub fn app_basename(commandline: &str) -> Option<String> {
     None
 }
 
-/// The canonical id every shell folds onto. At the prompt the pane wears the
-/// launch kitty, so the host treats this id as "no program claim".
+/// The canonical id every shell folds onto.
 pub const SHELL_APP_ID: &str = "shell";
 
-/// The canonical app id for a basename: every shell is [`SHELL_APP_ID`];
-/// anything else is its basename.
+/// The canonical app id for a basename: every shell is [`SHELL_APP_ID`]; anything else is its basename.
 #[inline]
 #[must_use]
 pub fn canonical_app_id(basename: &str) -> &str {
@@ -104,8 +84,7 @@ pub fn canonical_app_id(basename: &str) -> &str {
 
 /// Flagship breeds: hand-picked `(variant, coat, iris, age)` for the main apps,
 /// in distinct coat families (claude's coat 12 is the stop closest to
-/// terracotta). Everything else takes the [`APP_LOOK_SALT`] hash path in
-/// [`KittyLook::for_app`].
+/// terracotta).
 #[inline]
 fn flagship_look(app_id: &str) -> Option<KittyLook> {
     let (variant, coat, iris, age) = match app_id {
@@ -152,14 +131,7 @@ impl KittyLook {
             && self.age as u8 == other.age as u8
     }
 
-    /// The launch kitty: the base companion breed for the whole aterm process, worn at
-    /// the prompt in every window. Per-app kitties ([`Self::for_app`]) ride above it once
-    /// a program has held the pane past the host's tenure gate; a pinned favourite
-    /// outranks both.
-    ///
-    /// A pure function of the host-minted seed, so this crate stays clockless. Decoded
-    /// through the v4 genome, so it is always a head; accessories stay `None` (they mark
-    /// collected cats).
+    /// Derive the deterministic launch kitty breed from the host-minted seed.
     #[inline]
     #[must_use]
     pub const fn for_launch(seed: u64) -> Self {
@@ -175,13 +147,7 @@ impl KittyLook {
         .normalized()
     }
 
-    /// The app kitty: the deterministic breed for a canonical app id from
-    /// [`canonical_app_id`]; the host's tenure gate decides when it is worn.
-    ///
-    /// Flagships (`claude`/`codex`/`agy`) use the [`flagship_look`] tuples; every
-    /// other app derives its look from `form_hash` of the name (FNV-1a-64, salted
-    /// into its own namespace) through the v4 genome like [`Self::for_launch`].
-    /// Accessories stay `None`.
+    /// Derive the deterministic app kitty breed for a canonical app id.
     #[inline]
     #[must_use]
     pub fn for_app(app_id: &str) -> Self {
@@ -201,8 +167,6 @@ impl KittyLook {
     }
 
     /// Clamp untrusted persisted indices and restore a renderable composition.
-    /// An accessory is never a base glyph (corrupt ledgers degrade to the
-    /// default head), and full-cat specials wear no accessory.
     #[inline]
     #[must_use]
     pub const fn normalized(mut self) -> Self {
@@ -230,21 +194,12 @@ impl KittyLook {
     }
 }
 
-/// The sufficient-difference floor in [`coat_distance`] units (resolved-RGB
-/// Euclidean, 0–255 channels): below it a costume swap reads as noise and an
-/// arrival ceremony would announce nothing visible.
-///
-/// 40 is the knee of the live ramp: it demotes 22 of the 120 coat pairs (among them
-/// the dark-collapse pairs of coats {0,1,2,3} and the warm-ramp twins (6,7) … (11,12)),
-/// keeps ginger-vs-cream (12,13) at 59.8, and leaves the flagship trio (minimum 163.5,
-/// claude–agy) at 4×.
+/// Minimum [`coat_distance`] threshold for a visibly distinct costume swap.
 pub const SUFFICIENT_DIFFERENCE: f32 = 40.0;
 
 /// The precomputed [`coat_distance`] table: each cell is the min of the RGB
 /// distance between two `COAT_RAMP` stops and between the same stops after
 /// `cat_baker`'s dark-background lift (bands 0|4, floor `COAT_MIN_LUM_DARK_BG`).
-/// Precomputed because the lift is not const-evaluable;
-/// `coat_distance_table_is_pinned_to_the_live_lift` re-derives every cell.
 #[rustfmt::skip]
 const COAT_DISTANCE: [[f32; 16]; 16] = [
     [
@@ -327,14 +282,7 @@ const COAT_DISTANCE: [[f32; 16]; 16] = [
     ],
 ];
 
-/// How far apart two coat stops look on glass: the min over both background classes of
-/// the raw-ramp RGB distance and the distance after `cat_baker`'s dark-background lift,
-/// so "visibly different" holds where the coats are closest (the lift collapses 0–3).
-///
-/// No iris term: the walking pet culls `GlyphRole::Iris` below
-/// `pet_baker::FACE_DETAIL_MIN_H` (every 1× display), so its legible identity is
-/// its coat. Symmetric, zero on the diagonal; out-of-range indices clamp as
-/// [`KittyLook::normalized`] clamps `coat`.
+/// Minimum RGB distance between two coat stops across light and dark backgrounds.
 #[inline]
 #[must_use]
 pub const fn coat_distance(a: u8, b: u8) -> f32 {
@@ -343,8 +291,7 @@ pub const fn coat_distance(a: u8, b: u8) -> f32 {
     COAT_DISTANCE[ai][bi]
 }
 
-/// Stable semantic key for an authored glyph. Persist this rather than the Rust
-/// enum discriminant; contributor-added art may change roster ordinals.
+/// Stable semantic key for an authored glyph.
 #[inline]
 #[must_use]
 pub const fn glyph_key(id: CatGlyphId) -> &'static str {
@@ -385,9 +332,7 @@ pub fn age_from_key(key: &str) -> CatAge {
     }
 }
 
-/// The shown kitty type, the Kitty Log vocabulary. Every cat renders as
-/// [`KittyType::HeadPeek`]; the other variants are retired poses kept so old
-/// `kitty-log.toml` rows stay readable (rows key off [`KittyType::config_key`]).
+/// Shown kitty type in the Kitty Log vocabulary.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum KittyType {
     /// Head-only peek, the one type recorded.
@@ -430,8 +375,7 @@ impl KittyType {
     }
 }
 
-/// The magic dimension of the aggregation key: [`CatMagic`] plus the explicit
-/// ordinary bucket, so the log never stores raw `Genome.magic`.
+/// Magic dimension of the aggregation key.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum KittyMagic {
     /// The ordinary build (no magic-channel hit, or `feline.magic = false`).
@@ -481,8 +425,7 @@ impl KittyMagic {
     }
 }
 
-/// How the sighting rendered: the fallback cause as its own recorded dimension
-/// (§F4.1: four causes, never conflated).
+/// How the sighting rendered.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum KittyShownAs {
     /// The real cat graphic.
@@ -503,8 +446,7 @@ pub const TRAIT_EAR_NICK: u8 = 1 << 1;
 pub const TRAIT_BLAZE: u8 = 1 << 2;
 /// [`KittySighting::traits`] bit: the shy build.
 pub const TRAIT_SHY: u8 = 1 << 3;
-/// [`KittySighting::traits`] bit: a bow (1/32 of ordinary cats; accessories never
-/// appear on magic builds).
+/// [`KittySighting::traits`] bit: a bow (1/32 of ordinary cats).
 pub const TRAIT_BOW: u8 = 1 << 4;
 /// [`KittySighting::traits`] bit: sunglasses (1/256).
 pub const TRAIT_SUNGLASSES: u8 = 1 << 5;
@@ -513,10 +455,7 @@ pub const TRAIT_WITCH_HAT: u8 = 1 << 6;
 /// [`KittySighting::traits`] bit: a crown (1/1024).
 pub const TRAIT_CROWN: u8 = 1 << 7;
 
-/// Fold the accessory decode ([`genome::cat_accessory`]) into the sighting's
-/// traits byte; the Kitty Log persists it as four counters.
-///
-/// [`genome::cat_accessory`]: crate::genome::cat_accessory
+/// Fold the accessory decode into the sighting's traits byte.
 #[cfg(test)]
 pub const fn accessory_trait_bits(acc: Option<crate::genome::Accessory>) -> u8 {
     use crate::genome::Accessory;
@@ -529,9 +468,7 @@ pub const fn accessory_trait_bits(acc: Option<crate::genome::Accessory>) -> u8 {
     }
 }
 
-/// One recorded kitty sighting (§F4.2): everything the Kitty Log aggregates,
-/// clockless (the store timestamps at flush) and free of raw genome words.
-/// Recorded once per episode; drained via `WordDecorations::drain_kitty_sightings`.
+/// One recorded kitty sighting.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct KittySighting {
     /// The shown type; the recorder writes only [`KittyType::HeadPeek`].
@@ -540,17 +477,13 @@ pub struct KittySighting {
     pub magic: KittyMagic,
     /// How it rendered (cat vs the three fallback causes).
     pub shown_as: KittyShownAs,
-    /// Every language claiming the matched surface. LangIds are lexicon-build
-    /// scoped, so the store persists codes via `Lexicon::lang_code`.
+    /// Every language claiming the matched surface.
     pub langs: LangSet,
-    /// Displayed-trait bits (`TRAIT_*`). The recorder sets only `TRAIT_BOW` and
-    /// `TRAIT_CROWN`; the log keeps a counter per bit.
+    /// Displayed-trait bits (`TRAIT_*`).
     pub traits: u8,
-    /// The exact bounded visual identity that landed. The durable log persists
-    /// its semantic keys so the cursor companion can wear a collected look.
+    /// The exact bounded visual identity that landed.
     pub look: KittyLook,
-    /// The episode identity, the host's `(session, ident)` dedupe key; not
-    /// persisted (position-bearing).
+    /// The episode identity, the host's `(session, ident)` dedupe key.
     pub ident: u64,
 }
 

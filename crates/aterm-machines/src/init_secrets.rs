@@ -47,6 +47,7 @@ const UNCONFIGURED: &str =
     "no vault configured; run aterm init in a terminal, or aterm secrets join <url>";
 
 /// What an apply puts in place on a Mac whose vault is configured but whose subscriber does
+/// not run.
 const SUBSCRIBED: &str = "subscriber running (aterm secrets watch keeps ~/.secrets in sync)";
 
 /// What a Mac whose vault files are not all written is changed to.
@@ -80,18 +81,21 @@ pub trait SecretsOps: Send + Sync {
     /// What the vault at `source` answers now ([`aterm_secrets::client::look`]: one GET of a URL bounded by [`REACH_WAIT`], a read of a path): a vault, nothing (the network, or a server a later try may get past), or no vault there (no file at the path, a `404`, a login page).
     fn reachable(&self, source: &Source) -> Look;
 
-    /// Copy this Mac's vault files (`source.toml`, `state.toml`) into `into` before a join replaces them ([`aterm_secrets::client::keep_config`]): what the join's revert copies back to put this Mac in the vault it read.
+    /// Copy this Mac's vault files (`source.toml`, `state.toml`) into `into` before a join
+    /// replaces them, admitting only `replaces` under the snapshot's state lock: what the
+    /// join's revert copies back to put this Mac in the vault it read.
     /// # Errors
     /// A file could not be read or copied; the join is then not made.
-    fn keep(&self, into: &Path) -> aterm_secrets::Result<()>;
+    fn keep(&self, into: &Path, replaces: &Replaces) -> aterm_secrets::Result<()>;
 
-    /// Join the vault at `source` (a URL, `#<signer>` pin allowed, or a path).
+    /// Join the vault at `source.0` (a URL, `#<signer>` pin allowed, or a path), replacing
+    /// only the configuration `source.1` admits under the client's actual write lock.
     /// # Errors
     /// The join failed; the error names no value.
     fn join(
         &self,
         sys: &dyn System,
-        source: &str,
+        source: (&str, &Replaces),
         password: Option<&SecretBytes>,
         interactive: bool,
         wait: Duration,
@@ -153,6 +157,8 @@ impl LiveSecrets {
 }
 
 /// Wait up to `wait` for an admin to let this Mac in, as `client::join`'s own wait does
+/// (a long-poll of a URL, a pass every 5 s of a path), but ending as soon as this Mac reads as
+/// in.
 fn wait_for_approval(
     paths: &Paths,
     wait: Duration,
@@ -242,14 +248,21 @@ impl SecretsOps for LiveSecrets {
         aterm_secrets::client::look(source, REACH_WAIT)
     }
 
-    fn keep(&self, into: &Path) -> aterm_secrets::Result<()> {
-        aterm_secrets::client::keep_config(&self.paths(), into)
+    fn keep(&self, into: &Path, replaces: &Replaces) -> aterm_secrets::Result<()> {
+        match replaces {
+            Replaces::Any => aterm_secrets::client::keep_config(&self.paths(), into),
+            Replaces::Read(expected) => aterm_secrets::client::keep_config_if_unchanged(
+                &self.paths(),
+                into,
+                expected.as_ref(),
+            ),
+        }
     }
 
     fn join(
         &self,
         sys: &dyn System,
-        source: &str,
+        (source, replaces): (&str, &Replaces),
         password: Option<&SecretBytes>,
         interactive: bool,
         wait: Duration,
@@ -272,7 +285,13 @@ impl SecretsOps for LiveSecrets {
             requested: &queued,
             say: &say,
         };
-        match aterm_secrets::client::join(&paths, &options)? {
+        let outcome = match replaces {
+            Replaces::Any => aterm_secrets::client::join(&paths, &options),
+            Replaces::Read(expected) => {
+                aterm_secrets::client::join_if_unchanged(&paths, &options, expected.as_ref())
+            }
+        }?;
+        match outcome {
             JoinOutcome::Pending { code, host } => {
                 Ok(
                     wait_for_approval(&paths, wait, subscribed.get(), mistyped.as_deref(), &say)
@@ -551,11 +570,14 @@ fn is_url(source: &str) -> bool {
 }
 
 /// Whether `source` is what `aterm secrets join` takes: an `http://` or `https://` URL, an
+/// absolute path, or a `~/` path.
 fn plausible_source(source: &str) -> bool {
     is_url(source) || source.starts_with('/') || source.starts_with("~/")
 }
 
 /// `source` as a row shows it: a URL without query or fragment, or a generic label if
+/// it is not accepted by the HTTP parser; a path as typed; anything else not at all (a person may have
+/// pasted the wrong thing at the prompt).
 fn shown(source: &str) -> String {
     if !plausible_source(source) {
         return "(the answer at the prompt, not shown)".into();
@@ -571,17 +593,24 @@ fn shown(source: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Origin {
     /// This Mac had it configured: an apply only starts a subscriber that does not run, and
+    /// asks nobody anything.
     Configured,
     /// A person at the terminal is joining it (they named it, pressed Enter, or the ALab
+    /// vault answered), and gave its join password or none: the join may confirm a signer
+    /// and wait.
     Chosen,
     /// System State's plan named it ([`selected`]): an unattended pass joins it when this Mac
+    /// is not in it, and otherwise reads as [`Origin::Configured`] does.
     Selected,
 }
 
 /// What an apply is to do, as the last probe planned it: what its journal line's revert
+/// undoes ([`Vault`]'s `revert`), whether it needs the vault to answer, and all an apply
+/// makes: what changed since the probe is the next try's to plan and journal.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Planned {
     /// A join: this Mac's key (made when it has none), the source and state files, a request
+    /// in the vault's queue, the vault's files.
     join: bool,
     /// For a join: the vault configuration the probe read (`None`: none), the one the join
     /// replaces and its line's revert names. A vault configured in its place since (a join
@@ -592,12 +621,14 @@ struct Planned {
     /// The vault's files written again (a sync).
     files: bool,
     /// For a join from a vault this Mac reads: the probe's time, which names where that
+    /// vault's files are kept first ([`kept_dir`]).
     kept: Option<u64>,
     /// For a join: this Mac has no key, so the join makes one.
     key: bool,
 }
 
 /// Where a join made at `at` (seconds since the epoch) keeps the vault files it replaces,
+/// under the vault state directory `dir` (`~/.config/aterm/secrets`).
 fn kept_dir(dir: &Path, at: u64) -> PathBuf {
     dir.join(format!("before-join-{at}"))
 }
@@ -615,11 +646,13 @@ pub(crate) struct Vault {
     user: User,
     ops: Arc<dyn SecretsOps>,
     /// What [`SecretsOps::join`] is given: as typed, the ALab default, the configured
+    /// source, or the one System State's plan names.
     source: String,
     origin: Origin,
     /// How long a join waits for an approval.
     wait: Duration,
     /// The join password typed for a chosen URL, or System State's; taken by the apply's
+    /// join, and wiped with it once the join has used it.
     password: Mutex<Option<SecretBytes>>,
     /// Why the last apply stood aside: this Mac waits for an admin's approval.
     aside: Mutex<Option<String>>,
@@ -788,6 +821,8 @@ impl Vault {
     }
 
     /// Put the subscriber in place once the join request is queued, saying at once when that
+    /// fails: the person may stop the wait that follows, and the row saying it comes only at
+    /// the end.
     fn subscribe_queued(&self, installed: &OnceCell<Result<bool, String>>) -> bool {
         installed
             .get_or_init(|| {
@@ -804,12 +839,20 @@ impl Vault {
     }
 
     /// Join the item's source, then put the subscriber in place (as soon as the join request
+    /// is queued, so a Ctrl-C during the wait leaves a Mac that joins by itself).
     fn join(&self, sys: &dyn System, interactive: bool) -> Result<(), String> {
-        if let Some(at) = self.planned().kept {
+        let planned = self.planned();
+        let replaces = match self.origin {
+            Origin::Selected => Replaces::Read(planned.over),
+            Origin::Chosen | Origin::Configured => Replaces::Any,
+        };
+        if let Some(at) = planned.kept {
             let dir = Paths::for_home(Path::new(&self.user.home)).dir;
-            self.ops.keep(&kept_dir(&dir, at)).map_err(|why| {
-                format!("keeping the vault this Mac reads before the join: {why}")
-            })?;
+            self.ops
+                .keep(&kept_dir(&dir, at), &replaces)
+                .map_err(|why| {
+                    format!("keeping the vault this Mac reads before the join: {why}")
+                })?;
         }
         let installed: OnceCell<Result<bool, String>> = OnceCell::new();
         let requested = || self.subscribe_queued(&installed);
@@ -820,7 +863,7 @@ impl Vault {
             .take();
         let outcome = self.ops.join(
             sys,
-            &self.source,
+            (&self.source, &replaces),
             password.as_ref(),
             interactive,
             self.wait,
@@ -857,6 +900,7 @@ impl Vault {
     }
 
     /// The vault this Mac reads already: put the subscriber in place, and sync once when a
+    /// file it wrote is not as written, each as the probe planned.
     fn settle(&self) -> Result<(), String> {
         self.subscribe()?;
         let Ok(status) = self.ops.status() else {
@@ -890,6 +934,8 @@ impl Vault {
 }
 
 /// Why System State's setup installs no subscriber while this aterm runs from `exe`, a copy
+/// that goes away when it quits ([`SecretsOps::fleeting`]), and what lets the next try
+/// install it.
 fn fleeting_wait(exe: &Path) -> String {
     format!(
         "this aterm runs from {}, which goes away when it quits, so it cannot keep ~/.secrets in sync; move aterm to Applications and open it from there, and setup finishes this step",
@@ -906,6 +952,7 @@ fn source_text(source: &Source) -> String {
 }
 
 /// What an admin runs to let this Mac in, and how a mistyped join password for the vault at
+/// `source` is fixed ([`retype`]).
 fn approval(code: Option<&str>, source: &str) -> String {
     let approve = match code {
         Some(code) => format!(
@@ -920,6 +967,7 @@ fn approval(code: Option<&str>, source: &str) -> String {
 }
 
 /// How a mistyped join password for the vault at `source` is fixed: the join again, which
+/// asks for the password again and asks to join with its proof.
 fn retype(source: &str) -> Option<String> {
     if !is_url(source) {
         return None;
@@ -948,7 +996,7 @@ fn secrets(n: usize) -> String {
     }
 }
 
-/// Why the subscriber in `state` keeps nothing in sync, or `None` while it runs. A unit
+/// Why the subscriber in `state` keeps nothing in sync, or `None` while it runs.
 fn idle(state: &State) -> Option<&'static str> {
     match state {
         State::Installed { pid: Some(_), .. } => None,
@@ -957,7 +1005,7 @@ fn idle(state: &State) -> Option<&'static str> {
     }
 }
 
-/// What this Mac's vault state means for the item reading `source`. `unsynced`: why the
+/// What this Mac's vault state means for the item reading `source`.
 fn judge(status: &Status, source: &str, unsynced: Option<&str>, synced: bool) -> Probe {
     let name = status
         .config
@@ -1130,6 +1178,8 @@ impl Item for Vault {
     }
 
     /// The change the last probe planned: on a Mac whose vault is configured (or is the one
+    /// System State names), install (and so start) the subscriber, and sync once when a file
+    /// it wrote is not as written; otherwise join, then install the subscriber.
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
         self.set_aside(None);
         match self.origin {
@@ -1162,6 +1212,9 @@ impl Item for Vault {
     }
 
     /// How to undo what the planned apply does: the subscriber off; the files a join's
+    /// vault wrote removed (`aterm secrets ls` names them, until the state that lists them is
+    /// put back), and a file the vault's took the place of moved back; the vault this Mac read
+    /// before copied back and synced, or none forgotten, and a key the join made removed.
     fn revert(&self) -> Option<String> {
         const DIR: &str = "~/.config/aterm/secrets";
         let planned = self.planned();
@@ -1203,6 +1256,9 @@ impl Item for Vault {
     }
 
     /// A change that reads the vault (a join, or a sync with no subscriber to install) waits
+    /// for one to answer: while nothing does, or what answers holds no vault (no file at the
+    /// path, a `404`, a login page), nothing is journaled, no key is made and no source is
+    /// saved, and the row says what the next try waits for.
     fn stands_aside(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<StoodAside> {
         let planned = self.planned();
         if !(planned.join || (planned.files && !planned.subscribe)) {
@@ -1232,6 +1288,7 @@ impl Item for Vault {
 }
 
 /// A row with nothing to apply: no vault to join (not configured, skipped, no terminal), or
+/// a state that cannot be read.
 struct Note {
     user: User,
     probe: Probe,
@@ -1281,6 +1338,7 @@ mod tests {
     use std::collections::VecDeque;
 
     /// A vault whose state answers from a script (the last one sticks), and which records
+    /// every look for the ALab vault, join and subscriber install.
     #[derive(Default)]
     struct Scripted {
         statuses: Mutex<VecDeque<aterm_secrets::Result<Status>>>,
@@ -1289,7 +1347,10 @@ mod tests {
         probed: Mutex<Option<aterm_secrets::Result<ProbeOutcome>>>,
         outcome: Mutex<Option<aterm_secrets::Result<JoinOutcome>>>,
         /// The join queues a request (calls `requested`) before it ends, as `client::join`
+        /// does for a Mac not in yet.
         requests: Mutex<bool>,
+        /// The exact caller-read configuration handed to the copy and join boundaries.
+        replacement_reads: Mutex<Vec<Replaces>>,
         installed: Mutex<Option<aterm_secrets::Result<String>>>,
         probes: Mutex<u32>,
         joins: Mutex<Vec<(String, bool)>>,
@@ -1304,20 +1365,24 @@ mod tests {
         unwritten: Mutex<bool>,
         syncs: Mutex<u32>,
         /// What `reachable` answers (`None`: the vault answers): nothing answered, or no
+        /// vault there; and how many times it was asked.
         unreachable: Mutex<Option<String>>,
         absent: Mutex<Option<String>>,
         reached: Mutex<u32>,
         /// What this Mac's vault state and subscriber become while `reachable` is asked:
+        /// the subscriber, running beside the setup, applying a version or stopping.
         meanwhile: Mutex<Option<(Status, State)>>,
         /// Why `keep` fails (`None`: it keeps).
         unkept: Mutex<Option<String>>,
         /// A file the vault wrote is changed as the subscriber is installed.
         spoiled_by_install: Mutex<bool>,
         /// What `fleeting` answers: this aterm runs from a copy that goes away, and every
+        /// install is refused as `aterm_secrets::service::service_program` refuses it.
         fleeting: Mutex<Option<PathBuf>>,
         /// The wait each join was given.
         waits: Mutex<Vec<Duration>>,
         /// Every change in order (`join <source>`, `install`, `sync`), with the lines a
+        /// [`Lines`] journal records before them.
         log: Mutex<Vec<String>>,
         /// What `say` was given.
         said: Mutex<Vec<String>>,
@@ -1448,7 +1513,11 @@ mod tests {
             }
         }
 
-        fn keep(&self, into: &Path) -> aterm_secrets::Result<()> {
+        fn keep(&self, into: &Path, replaces: &Replaces) -> aterm_secrets::Result<()> {
+            self.replacement_reads
+                .lock()
+                .unwrap()
+                .push(replaces.clone());
             self.log
                 .lock()
                 .unwrap()
@@ -1462,12 +1531,16 @@ mod tests {
         fn join(
             &self,
             _sys: &dyn System,
-            source: &str,
+            (source, replaces): (&str, &Replaces),
             password: Option<&SecretBytes>,
             interactive: bool,
             wait: Duration,
             requested: &dyn Fn() -> bool,
         ) -> aterm_secrets::Result<JoinOutcome> {
+            self.replacement_reads
+                .lock()
+                .unwrap()
+                .push(replaces.clone());
             self.log.lock().unwrap().push(format!("join {source}"));
             self.waits.lock().unwrap().push(wait);
             self.joins
@@ -1529,6 +1602,8 @@ mod tests {
     }
 
     /// A journal that writes each line into the port's log ([`Scripted::log`]), so a test
+    /// reads the lines and the changes in the order they came; `refuse` refuses every line,
+    /// as a full disk or a held journal lock does.
     struct Lines {
         ops: Arc<Scripted>,
         refuse: bool,
@@ -1602,6 +1677,7 @@ mod tests {
     }
 
     /// A port whose person presses Ctrl-C at the prompt `stop`: the one answer the fake
+    /// cannot give by itself.
     struct StopsAt {
         inner: Fake,
         stop: &'static str,
@@ -1939,6 +2015,9 @@ mod tests {
     }
 
     /// On the ALab LAN the join password is the step's only question, so it is where a
+    /// person who wants this Mac out of the vault says so: `none` or `skip` there joins
+    /// nothing (no key, no source, no request, no subscriber), as at the vault prompt, and
+    /// leaves a row that needs nothing more of anyone.
     #[test]
     fn none_or_skip_at_the_password_prompt_joins_nothing() {
         for typed in ["none", "SKIP", " None "] {
@@ -2295,6 +2374,7 @@ mod tests {
     const SETUP_WAIT: Duration = Duration::from_secs(20);
 
     /// One unattended pass of System State's Secrets stage for `source` over `ops`,
+    /// journaling into the port's log (`refuse`: every line refused).
     fn setup_pass(
         ops: &Arc<Scripted>,
         source: &str,
@@ -2334,6 +2414,7 @@ mod tests {
     }
 
     /// Every change in `log` comes after exactly one journal line, the first event, whose
+    /// revert names how each change it covers is undone.
     fn journaled_first(log: &[String]) {
         let (line, changes) = log.split_first().expect("a line and its changes");
         assert!(line.starts_with("line init.secrets@alice: "), "{log:?}");
@@ -2360,6 +2441,8 @@ mod tests {
     }
 
     /// System State's Secrets stage changes nothing but through the engine: a line, with
+    /// the revert of what the apply does, is in the journal before the join, the subscriber
+    /// and the files.
     #[test]
     fn a_selected_vault_journals_each_change_before_it_is_made() {
         let source = aterm_secrets::ALAB_DEFAULT_URL;
@@ -2415,6 +2498,9 @@ mod tests {
     }
 
     /// System State's setup run from aterm's disk image joins as before but installs no
+    /// subscriber, whose job would name a program that goes away: the row waits (blocked,
+    /// not failed) and says to open aterm from Applications, beside an admin's approval when
+    /// the join waits for one.
     #[test]
     fn a_setup_from_a_disk_image_waits_to_be_opened_from_applications() {
         let source = aterm_secrets::ALAB_DEFAULT_URL;
@@ -2491,6 +2577,8 @@ mod tests {
     }
 
     /// The stage's entry journals into the account's converge journal (the one `aterm init`
+    /// and the doctor write), the line naming what the join replaces, what it makes and how
+    /// it is undone.
     #[test]
     fn the_setup_stage_journals_into_the_accounts_journal() {
         let sys = fake();
@@ -2529,6 +2617,7 @@ mod tests {
     }
 
     /// A journal that refuses the line refuses the change: no join, no subscriber, no file,
+    /// and the password is kept for the next try.
     #[test]
     fn a_refused_journal_line_refuses_the_selected_vaults_change() {
         let source = aterm_secrets::ALAB_DEFAULT_URL;
@@ -2568,6 +2657,9 @@ mod tests {
     }
 
     /// A vault that does not answer (the owner's Mac off the ALab LAN, 2026-10-22: "No
+    /// route to host" every minute) is never joined: each try stands aside on the network
+    /// before its line, so however often it is retried nothing is journaled, no key or
+    /// source is made, and the password waits for a try that reaches the vault.
     #[test]
     fn an_unreachable_selected_vault_stands_aside_with_nothing_journaled_or_made() {
         let source = aterm_secrets::ALAB_DEFAULT_URL;
@@ -2617,6 +2709,7 @@ mod tests {
     }
 
     /// A pending Mac is left to its subscriber, which finishes the join once an admin
+    /// approves it: no line, no change, no request again.
     #[test]
     fn a_pending_selected_vault_waits_and_a_new_password_asks_once_more() {
         let source = aterm_secrets::ALAB_DEFAULT_URL;
@@ -2661,6 +2754,8 @@ mod tests {
     }
 
     /// When the setup joins: this Mac reads another vault (or the same under a signer the
+    /// source's pin does not admit), lost its key to a signed vault, or was removed by an
+    /// admin.
     #[test]
     fn a_selected_vault_joins_only_when_this_mac_is_not_in_it() {
         let context = ctx(&[user("alice", 501)]);
@@ -2717,6 +2812,8 @@ mod tests {
     }
 
     /// A joined Mac whose files are not as written, its subscriber running, writes them
+    /// again only when the vault answers: off its network the sync stands aside before its
+    /// line, so nothing is journaled or written.
     #[test]
     fn an_unreachable_vault_stands_aside_from_a_sync_with_nothing_journaled() {
         let source = aterm_secrets::ALAB_DEFAULT_URL;
@@ -2741,6 +2838,8 @@ mod tests {
     }
 
     /// What answers at the source but holds no vault (a path vault whose key is unplugged,
+    /// a `404`, a login page) is stood aside from like a vault that does not answer: no line,
+    /// no key, no source, the password kept, and the row names what is missing.
     #[test]
     fn no_vault_at_the_source_stands_aside_before_a_line_or_a_key() {
         let source = "/Volumes/Keys/team.vault";
@@ -2782,6 +2881,8 @@ mod tests {
     }
 
     /// A join from another vault keeps that vault's files first, and its line says how to
+    /// put this Mac back in it (copy them back and sync), how to remove what the new vault
+    /// wrote, and, for a Mac without a key, the key the join makes.
     #[test]
     fn a_join_from_another_vault_keeps_it_and_its_line_puts_this_mac_back() {
         let source = aterm_secrets::ALAB_DEFAULT_URL;
@@ -2861,6 +2962,8 @@ mod tests {
     }
 
     /// An apply makes only what its line's revert covers, the probe's plan: what changed
+    /// while the vault was asked (the subscriber stopped, an admin removed this Mac) is the
+    /// next try's, under its own line.
     #[test]
     fn an_apply_makes_only_what_the_probe_planned_and_its_line_undoes() {
         let source = aterm_secrets::ALAB_DEFAULT_URL;
@@ -3027,9 +3130,31 @@ mod tests {
                 format!("join {source}")
             ]
         );
+        assert_eq!(
+            *ops.replacement_reads.lock().unwrap(),
+            vec![Replaces::Read(joined_elsewhere().config); 2],
+            "the snapshot and the actual join receive the same admitted configuration"
+        );
+
+        // A refusal at the actual client boundary leaves the password available and starts
+        // no subscriber or sync. The engine journals intent but runs no inverse on Err.
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
+        *ops.outcome.lock().unwrap() = Some(Err(aterm_secrets::Error::new(
+            "injected conditional join refusal",
+        )));
+        let mut held = Some(password());
+        let row = setup_pass_over(&ops, source, Replaces::Read(None), &mut held, false);
+        assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
+        assert!(held.is_some());
+        assert_eq!(ops.changes(), [format!("join {source}")]);
+        assert_eq!(
+            *ops.replacement_reads.lock().unwrap(),
+            [Replaces::Read(None)]
+        );
     }
 
     /// A typed source that is no vault source is not reported as offline (exit 69): it is
+    /// not looked for, and the join refuses it as typed.
     #[test]
     fn a_source_that_is_no_vault_source_is_not_called_offline() {
         let sys = fake();
@@ -3047,6 +3172,8 @@ mod tests {
     }
 
     /// `aterm init`'s join at a terminal waits for the network the same way: a vault that
+    /// does not answer is stood aside from before a key or a source is made (exit 69, not
+    /// 1).
     #[test]
     fn an_offline_join_at_the_terminal_stands_aside_before_anything_is_made() {
         let sys = fake();

@@ -1,25 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE NEEDS STORE (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.3
-//! items 3-4, §12.2.6): the window's host hears the worker's whole
-//! NEEDS YOU set from its loop (`IdleHost::needs_standing`), stores
-//! it on the session's timeline on the loop's own thread before the entry's
-//! `meta set` goes out (`Hooks::needs`, `store_needs`,
-//! `SessionTimeline::set_harness_needs`), keeps the set it replaces beside
-//! its own entry until that request lands (`ToldNeeds`), and wakes the
-//! window with a fact that carries nothing (`HarnessFact::Needs`) only where
-//! what a reader reads beside the entry standing moved. The words are read
-//! only beside the entry they were told with (`NeedFacts::told_needs`).
-//! Nothing is drawn from them yet.
-//!
-//! The host here is the real one (`HostHandle`, its `WorkerIdle`), its
-//! `needs` hook the live `store_needs` over a real headless App's store; the
-//! worker's body stands in for the loop and the server: it tells the set,
-//! then writes the entry as `meta set attention owner=needs kind=ask` does
-//! (`write_attention_kind`). Each test names its NEGATIVE CONTROL: the mutant
-//! it was run against, and what failed.
-
+//! Tests for `IdleHost::needs_standing`, `store_needs`, and `SessionTimeline::set_harness_needs`.
 use std::sync::mpsc;
 
 use aterm_types::needs::AttentionKind;
@@ -62,8 +44,7 @@ enum Step {
     /// (`IdleHost::needs_standing`).
     Tell(Vec<String>, String),
     /// The loop's `meta set attention owner=needs kind=ask <text>` reaches
-    /// the server, which writes it (`None`: its `unset`). Answered with what
-    /// the session's timeline held as it arrived.
+    /// the server, which writes it (`None`: its `unset`).
     Land(Option<String>),
 }
 
@@ -113,8 +94,6 @@ impl Desk {
                         body_ctx.timeline.lock().unwrap().harness_needs()
                     }
                     Ok(Step::Land(text)) => {
-                        // The server takes the request: what the timeline
-                        // holds now is what the publication it wakes reads.
                         let held = body_ctx.timeline.lock().unwrap().harness_needs();
                         let edit = text.as_deref().map_or(MetaEdit::Clear, MetaEdit::Set);
                         crate::session_timeline::write_attention_kind(
@@ -143,7 +122,6 @@ impl Desk {
         let fact_tx = Mutex::new(fact_tx);
         let mine = sid;
         h.fact = Arc::new(move |sid, fact| {
-            // The needs fact alone: a run's end also tells `Task(None)` and
             // `Pause(None)`, which other tests read.
             if sid == mine && fact == crate::HarnessFact::Needs {
                 let _ = fact_tx.lock().unwrap().send(fact);
@@ -201,17 +179,7 @@ fn needs_entry(facts: &crate::needs::NeedFacts) -> Option<&str> {
 /// carries it cut at 64 cells — and only then sends the entry's `meta set`;
 /// by the time the server takes that request the session's timeline already
 /// holds the whole set with the entry's exact text, so the first need facts
-/// read after the entry lands hold both, with no wake applied. That tell
-/// wakes nothing: no reader reads anything new until the entry lands, and
-/// its write wakes the window itself. A set that moves under the same entry
-/// (`[a, b]` to `[a, c]`: no `meta set` moves the server) is stored and
-/// woken for alone. At the take-down `(&[], "")` the store holds no set
-/// told last, the entry keeps its words until the `unset` lands, and the
-/// facts after it hold neither. NEGATIVE CONTROL (run as a mutant):
-/// `WorkerIdle::needs_standing` handing the set to the store from a thread
-/// of its own, after the call returns (words that travel only
-/// asynchronously), leaves the timeline empty as the request arrives and
-/// the first facts without the words.
+/// read after the entry lands hold both, with no wake applied.
 #[test]
 fn the_words_are_on_the_timeline_before_the_entry_lands() {
     let desk = Desk::new();
@@ -231,7 +199,6 @@ fn the_words_are_on_the_timeline_before_the_entry_lands() {
     assert_eq!(told.current(), Some(&held), "stored by the tell itself");
     assert_eq!(held.needs(), ab.as_slice(), "the set whole, need (a) uncut");
     assert_eq!(held.entry(), ENTRY_AB, "with the entry's exact text");
-    // The first facts after the entry landed: both, before any wake.
     let facts = desk.facts();
     assert_eq!(needs_entry(&facts), Some(ENTRY_AB), "{facts:?}");
     assert_eq!(facts.told_needs(), Some(ab.as_slice()), "{facts:?}");
@@ -241,18 +208,14 @@ fn the_words_are_on_the_timeline_before_the_entry_lands() {
         "a tell for an entry not yet standing wakes nothing: its request's write does"
     );
 
-    // The same entry, another set: stored and woken, with no request.
     let ac = set(&[NEED_A, NEED_C]);
     let told = desk.step(Step::Tell(ac.clone(), ENTRY_AB.to_string()));
     assert_eq!(told.current().map(HarnessNeeds::needs), Some(ac.as_slice()));
     assert_eq!(desk.facts().told_needs(), Some(ac.as_slice()));
     assert_eq!(desk.woken(), 1, "the window woken for the moved set");
-    // Told again as it stands: nothing moved, nothing woken.
     desk.step(Step::Tell(ac.clone(), ENTRY_AB.to_string()));
     assert_eq!(desk.woken(), 0, "the same set told again wakes nothing");
 
-    // The take-down: no set told last, the entry's words kept until the
-    // `unset` lands.
     let told = desk.step(Step::Tell(Vec::new(), String::new()));
     assert_eq!(told.current(), None, "the take-down holds no set told last");
     assert_eq!(
@@ -269,17 +232,7 @@ fn the_words_are_on_the_timeline_before_the_entry_lands() {
 /// THE ENTRY THAT STILL STANDS KEEPS ITS WORDS UNTIL IT GOES (§12.2.3 items
 /// 3-4, §12.2.11; the review of 2c): each tell comes just before its
 /// request, so between the tell and the server's write the entry standing
-/// is still the one the set it replaces was told with. Read there — by the
-/// needs wake's publication or any other — it keeps those words whole: at a
-/// set's change, at a request the connection lost (until the loop tells
-/// the standing set again), across a cap's refusal and its cut retry, and
-/// at the take-down until the `unset` lands. Each landing hands the reading
-/// to the new set at once. NEGATIVE CONTROLS (each run as a mutant): a
-/// store of one slot (`ToldNeeds::tell` keeping no outgoing set) reads
-/// `None` for the old entry in the first gap ("the entry that still stands
-/// keeps the words it was told with"); an outgoing slot that keeps the set
-/// told last whatever stands loses (b)'s words across the cap's retry ("a
-/// cap's retry keeps the standing entry's words").
+/// is still the one the set it replaces was told with.
 #[test]
 fn the_entry_that_still_stands_keeps_its_words_until_it_goes() {
     let desk = Desk::new();
@@ -305,7 +258,6 @@ fn the_entry_that_still_stands_keeps_its_words_until_it_goes() {
 
     desk.step(Step::Tell(ab.clone(), ENTRY_AB.to_string()));
     desk.step(Step::Land(Some(ENTRY_AB.to_string())));
-    // The next report names (b) alone: told, its `meta set` not landed.
     desk.step(Step::Tell(b.clone(), ENTRY_B.to_string()));
     let why = "the entry that still stands keeps the words it was told with";
     assert_eq!(read(why), expect(ENTRY_AB, &ab, why));
@@ -313,16 +265,13 @@ fn the_entry_that_still_stands_keeps_its_words_until_it_goes() {
     let why = "the landed entry reads its own set";
     assert_eq!(read(why), expect(ENTRY_B, &b, why));
 
-    // A request the connection lost: (a, b) told, never landed.
     desk.step(Step::Tell(ab.clone(), ENTRY_AB.to_string()));
     let why = "a lost request leaves the standing entry its words";
     assert_eq!(read(why), expect(ENTRY_B, &b, why));
-    // The loop tells the window the standing set again (2b's retell).
     desk.step(Step::Tell(b.clone(), ENTRY_B.to_string()));
     let why = "told again what stands";
     assert_eq!(read(why), expect(ENTRY_B, &b, why));
 
-    // A cap's refusal: (c) told and refused, then told again cut.
     desk.step(Step::Tell(c.clone(), ENTRY_C.to_string()));
     let why = "the refused request leaves the standing entry its words";
     assert_eq!(read(why), expect(ENTRY_B, &b, why));
@@ -333,7 +282,6 @@ fn the_entry_that_still_stands_keeps_its_words_until_it_goes() {
     let why = "the cut entry landed reads its set";
     assert_eq!(read(why), expect(ENTRY_C_CUT, &c, why));
 
-    // The take-down: told, its `unset` not yet landed.
     desk.step(Step::Tell(Vec::new(), String::new()));
     let why = "the entry that still stands at the take-down keeps its words";
     assert_eq!(read(why), expect(ENTRY_C_CUT, &c, why));
@@ -347,11 +295,7 @@ fn the_entry_that_still_stands_keeps_its_words_until_it_goes() {
 /// may never land, so the words are read beside the needs owner's entry
 /// they were told with and nowhere else — not beside the entry an earlier
 /// set left standing, nor another owner's entry of the same text, nor no
-/// entry. Both sides go through the server's presentation sanitizer (a told
-/// text's outer spaces; a stored text holding what the sanitizer removes).
-/// The take-down, and any empty set or entry, holds nothing. NEGATIVE
-/// CONTROL (run as a mutant): `words_for` that never reads the entry gives
-/// the words beside the entry an earlier set left.
+/// entry.
 #[test]
 fn a_told_set_is_read_only_while_its_entry_stands() {
     let ab = set(&[NEED_A, NEED_B]);
@@ -388,8 +332,6 @@ fn a_told_set_is_read_only_while_its_entry_stands() {
         None,
         "another owner's entry of the same text"
     );
-    // A stored text holding what the sanitizer removes (a restore of an
-    // older manifest) reads as the sanitizer leaves it.
     let hidden = ENTRY_AB.replacen(' ', " \u{200b}", 1);
     assert!(crate::session_timeline::metadata_has_forbidden_formatting(
         &hidden
@@ -399,7 +341,6 @@ fn a_told_set_is_read_only_while_its_entry_stands() {
         told.words_for(Some(&format!("{ENTRY_AB} "))),
         Some(ab.as_slice())
     );
-    // Nothing told stands for nothing.
     assert_eq!(HarnessNeeds::told(&[], ""), None, "the take-down");
     assert_eq!(HarnessNeeds::told(&[], ENTRY_AB), None, "no set");
     assert_eq!(HarnessNeeds::told(&ab, " "), None, "no entry");
@@ -409,18 +350,7 @@ fn a_told_set_is_read_only_while_its_entry_stands() {
 /// THE STORE FOLLOWS THE TELLS AND WAKES ONLY WHERE A READING MOVED
 /// (§12.2.3 item 3, §12.2.11): the live hook over a real store writes the
 /// session's timeline and says whether what a reader reads beside the needs
-/// entry standing moved. A set told for an entry not standing yet wakes
-/// nothing (its request's write will); the same set again moves nothing; a
-/// set that moves under the entry that stands wakes; a set told for another
-/// entry, the same set under a cut text (a cap's refusal told again) and
-/// the take-down (no set told last, not an empty set) wake nothing, the
-/// outgoing set read meanwhile; a set told for an entry someone else moved
-/// is stale until its own lands. A session the store does not hold stores
-/// nothing. NEGATIVE CONTROLS (each run as a mutant): `HarnessNeeds::told`
-/// keeping an empty set, so the take-down is stored as one, leaves a set
-/// told last ("the take-down holds no set told last"); waking wherever the
-/// store moved (the rule before the review) wakes for the first tell ("a
-/// set told for an entry not standing yet wakes nothing").
+/// entry standing moved.
 #[test]
 fn the_store_follows_the_tells_and_wakes_only_where_a_reading_moved() {
     let app = App::headless_for_test();
@@ -493,13 +423,7 @@ fn the_store_follows_the_tells_and_wakes_only_where_a_reading_moved() {
 /// A NEEDS FACT PUBLISHES THE NEED, AND THE OPEN PAGE ONCE (§12.2.3 item 3,
 /// §12.2.11): applied, it publishes the session's need — the one place the
 /// words are read — and the herald republishes Settings ▸ Harness where the
-/// verdict moved, once; no face moves. Here the needs entry stands in the
-/// session's meta with no wake applied yet, so the publication is seen to
-/// move the verdict. NEGATIVE CONTROLS (each run as a mutant): the arm
-/// without `refresh_presence_session` leaves the verdict unpublished ("the
-/// need published"); the arm that also calls `harness_screen_moved` (as
-/// built before the review) publishes the open page twice ("the open page
-/// published once").
+/// verdict moved, once; no face moves.
 #[test]
 fn a_needs_fact_publishes_the_need_and_the_open_page_once() {
     let mut app = App::headless_for_test();
@@ -547,7 +471,6 @@ fn a_needs_fact_publishes_the_need_and_the_open_page_once() {
         face,
         "no face moved"
     );
-    // A fact for a session this window does not hold moves nothing.
     app.apply_harness_fact("s-not-this-windows", crate::HarnessFact::Needs);
     assert_eq!(app.harness_screen.revision, revision + 1);
 }
@@ -555,8 +478,6 @@ fn a_needs_fact_publishes_the_need_and_the_open_page_once() {
 /// THE FACT STAYS COPY, AND NO BIGGER THAN MAIN'S (§12.0: "the wake does not
 /// grow"): `HarnessFact::Needs` carries nothing, so the enum is `Copy` and
 /// its size is what it was at `0f685152bc` (24 bytes on a 64-bit target).
-/// NEGATIVE CONTROL (run as a mutant): a variant beside `Needs` carrying
-/// three words (`NeedsWide([u64; 3])`) makes it 32 bytes.
 #[test]
 fn a_harness_fact_stays_copy_and_mains_size() {
     /// `size_of::<HarnessFact>()` at `0f685152bc`, before `Needs`.
@@ -577,9 +498,6 @@ fn a_harness_fact_stays_copy_and_mains_size() {
 /// the outgoing one while its own entry still stands — `stale` again where
 /// someone else moved the entry, and `-` after the take-down; `needs=`,
 /// `needs_n=` and `hold_by=` read by key as before (a downgrade parse).
-/// NEGATIVE CONTROL (run as a mutant): `needs_told_field` printing the count
-/// of the set told last whatever entry stands gives `needs_told=2` for the
-/// set not landed ("told, not landed").
 #[test]
 fn status_prints_the_told_set_for_the_entry_that_stands() {
     let app = App::headless_for_test();

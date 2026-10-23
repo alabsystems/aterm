@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// The usage tap times the wait at a usage wall, in the loop (accounts v2 S10a;
-// `tap_clock.rs`, `Session::tap_reset`, `Session::tap_edge`): the reset the
-// policy is handed, the jitter it is spread by, the ledger's rows, and the
-// wait decided again when the tap's reading comes. Each behaviour has its
-// negative control. Included from `turn_end_loop_tests.rs`, so its helpers and
-// `run_tests.rs`'s are in scope.
+// Usage-tap wait timing tests in the turn-end loop (included from `turn_end_loop_tests.rs`).
 
 use super::*;
 use crate::supervise::approvals::{RULE_TAP_RESET, RULE_WALL_WAIT};
@@ -17,14 +12,11 @@ use crate::supervise::tap_clock::{TapWindow, UsageWindow};
 /// What a [`TapHost`] answers: a reading, or none, for each window.
 type Answers = Vec<(UsageWindow, Option<TapWindow>)>;
 
-/// A host whose usage tap answers what the test sets ([`IdleHost::tap_window`]),
-/// one answer per window, every ask counted. It takes no step and owns no turn
 /// end. Its transcript is [`Self::tail`] (`None`: none to read).
 #[derive(Debug, Default)]
 struct TapHost {
     answers: std::sync::Mutex<Answers>,
     asks: std::sync::atomic::AtomicUsize,
-    /// The asks after which [`Self::later`] replaces the answers (the tap's
     /// run that comes while the loop waits).
     after: std::sync::atomic::AtomicUsize,
     later: std::sync::Mutex<Option<Answers>>,
@@ -104,8 +96,6 @@ fn reading(pct: u32, resets_at: i64, read_at: i64) -> Option<TapWindow> {
     })
 }
 
-/// The five-hour wall a turn ended on (Claude Code 2.1.296's notice, the
-/// countdown cancelled), its reset as `reset` words it — `None`: the notice
 /// cut before its reset, as a narrow pane cuts it.
 fn session_wall(reset: Option<&str>) -> Vec<String> {
     let notice = reset.map_or_else(
@@ -124,13 +114,12 @@ fn session_wall(reset: Option<&str>) -> Vec<String> {
     r
 }
 
-/// A session at [`TEST_NOW`] under `host`, the default clocks (150 s of
 /// grace, a minute of jitter), its ledger at `ledger`.
 fn tapped<'a>(m: &'a mut Mock, ledger: Option<PathBuf>) -> Session<'a, Mock> {
     let mut s = session(m, Some(SID.to_string()));
     s.set_clock(TEST_NOW, PDT);
+    s.set_mono_standing();
     s.set_zone_lookup(test_zones);
-    // As a loop's start opens it (`Session::watch`).
     s.ledger = crate::supervise::approvals::Ledger::open(
         ledger.as_deref(),
         Some(SID),
@@ -177,16 +166,14 @@ fn why(a: &TurnEndAction) -> &str {
     }
 }
 
-/// THE NOTICE CUT, THE TAP'S RESET: a five-hour wall whose notice names no
-/// reset is waited to the tap's — its reset plus the grace plus the session's
-/// jitter, the jitter its share of THAT reset — where the policy alone waits
-/// on its 30-minute back-off. The ledger's wall row carries the tap's reset
-/// for the loop that follows. NEGATIVE CONTROLS, each the back-off: no host;
-/// the host's tap reading nothing; a reading the tap wrote before the loop
-/// first read the wall; a full SEVEN-day window at a five-hour wall; a
 /// window under 100 %; and a Codex's wall, whose tap is never asked.
 #[test]
 fn a_cut_session_walls_wait_is_timed_by_the_taps_reset() {
+    use crate::supervise::fx::Fx;
+    use crate::supervise::tape::header::VERBATIM;
+    use crate::supervise::tape::host::ReplayHost;
+    use crate::supervise::tape::replay::ReplayCore;
+    use crate::supervise::tape::testing::TAPE_ID;
     let reset = TEST_NOW + 2 * 3600 + 17;
     let five = UsageWindow::FiveHour;
     let (dir, ledger) = ledger_at("tap-cut");
@@ -205,7 +192,6 @@ fn a_cut_session_walls_wait_is_timed_by_the_taps_reset() {
     assert_eq!(until_unix(&s, &a), reset + grace + share, "{a:?}");
     assert_eq!(why(&a), "usage-session resets");
     assert_eq!(host.asks(), 1, "one window asked, once");
-    // The reread for the books asks nothing and keeps the decision's reset.
     let again = s.turn_end_reread(&read_screen(session_wall(None)), &opts);
     assert_eq!(again.reset_at.map(|at| s.unix_of(at)), Some(reset));
     assert_eq!(host.asks(), 1);
@@ -219,7 +205,6 @@ fn a_cut_session_walls_wait_is_timed_by_the_taps_reset() {
     assert!(!rows.contains(RULE_TAP_RESET), "nothing disagreed: {rows}");
     let _ = std::fs::remove_dir_all(&dir);
 
-    // NEGATIVE CONTROLS: the back-off from the wall's first read.
     let backoff = i64::try_from(t.limit_backoff.last().unwrap().as_secs()).unwrap();
     let cases: Vec<(&str, Option<Answers>)> = vec![
         ("no host", None),
@@ -248,7 +233,6 @@ fn a_cut_session_walls_wait_is_timed_by_the_taps_reset() {
         assert_eq!(r.reset_at, None, "{case}");
         assert_eq!(until_unix(&s, &a), TEST_NOW + backoff, "{case}: {a:?}");
     }
-    // A Codex's usage wall: its tap is never asked.
     let host = TapHost::answering(&[(five, reading(100, reset, TEST_NOW))]);
     let mut m = Mock::new(vec![busy_screen()]);
     let mut s = tapped(&mut m, None);
@@ -262,13 +246,67 @@ fn a_cut_session_walls_wait_is_timed_by_the_taps_reset() {
         1,
     );
     assert_eq!((codex, host.asks()), (None, 0));
+    for doors in [Vec::new(), vec!["host.wants".to_owned()]] {
+        let core = ReplayCore::start(
+            vec![astream_effects::EffectRecord::Clock(
+                u64::try_from(TEST_NOW).unwrap() * 1_000_000_000,
+            )],
+            VERBATIM,
+            VERBATIM,
+            TAPE_ID,
+            None,
+        );
+        core.recorded_doors(doors);
+        let host = TapHost::answering(&[(five, reading(100, reset, TEST_NOW))]);
+        let opts = opts_with(&host);
+        let mut m = Mock::new(vec![busy_screen()]);
+        let mut s = tapped(&mut m, None);
+        s.fx = Fx::replay(Arc::clone(&core));
+        let seed = |s: &mut Session<'_, Mock>| {
+            s.seed_tap(
+                "an older wall".to_owned(),
+                aterm_phase::WallKind::UsageSession,
+                "You've hit your session limit",
+                reset,
+                TEST_NOW,
+            );
+        };
+        seed(&mut s);
+        assert_eq!(
+            s.tap_reset(
+                opts.idle_host.as_ref(),
+                aterm_phase::WallKind::UsageSession,
+                "You've hit your session limit",
+                None,
+                Program::Claude,
+                super::super::wall_confirm::Check::Decide,
+                1,
+            ),
+            None
+        );
+        assert!(s.wall_tap.is_none());
+        seed(&mut s);
+        s.turn_end_due = Some(Due {
+            at: Instant::now(),
+            unix_ms: TEST_NOW * 1000,
+            why: "the older loop's wall wait".to_owned(),
+            wait: WaitKind::Other,
+        });
+        assert!(!s.tap_edge(&opts, 1));
+        assert_eq!(host.asks(), 0);
+        assert_eq!(core.left(), 1, "the old loop's clock was not consumed");
+        assert!(core.diverged().is_none());
+    }
+    let core = ReplayCore::start(Vec::new(), VERBATIM, VERBATIM, TAPE_ID, None);
+    core.recorded_doors(vec!["host.tap_window".to_owned()]);
+    let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
+    let missing = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        IdleHost::tap_window(&replay, five)
+    }));
+    assert!(missing.is_err());
+    assert!(core.diverged().is_some());
 }
 
-/// THE NOTICE AND THE TAP TOGETHER: within six minutes of each other, the
-/// tap's reset (to the second) and no row; further apart, the LATER — the
-/// tap's or the notice's — and one `tap-reset@v1` ledger row for that pair,
-/// never a second one at the next read, never an alert. The tap's reading
-/// here comes after the first decision (its run after the wall was read),
 /// and the wall's first read is kept.
 #[test]
 fn the_notice_and_the_tap_take_the_taps_reset_or_the_later_with_a_ledger_row() {
@@ -301,7 +339,6 @@ fn the_notice_and_the_tap_take_the_taps_reset_or_the_later_with_a_ledger_row() {
         assert_eq!(waited, until_unix(&s, &again));
         (notice, waited - grace, share, taps.len(), rows)
     };
-    // Within the slack: the tap's, no row.
     let (notice, at, share, taps, rows) = run(45);
     assert_eq!(at, notice + 45 + share(notice + 45));
     assert_eq!(taps, 0, "{rows}");
@@ -311,7 +348,6 @@ fn the_notice_and_the_tap_take_the_taps_reset_or_the_later_with_a_ledger_row() {
         notice - limit::CLOCK_SLACK_S + share(notice - limit::CLOCK_SLACK_S)
     );
     assert_eq!(taps, 0, "at the slack");
-    // The tap later by 20 minutes: the tap's, one row.
     let (notice, at, share, taps, rows) = run(20 * 60);
     assert_eq!(at, notice + 20 * 60 + share(notice + 20 * 60));
     assert_eq!(taps, 1, "{rows}");
@@ -320,18 +356,11 @@ fn the_notice_and_the_tap_take_the_taps_reset_or_the_later_with_a_ledger_row() {
             && rows.contains("\"decision\":\"waiting\""),
         "{rows}"
     );
-    // The notice later by 20 minutes: the notice's, one row.
     let (notice, at, share, taps, rows) = run(-20 * 60);
     assert_eq!(at, notice + share(notice));
     assert_eq!(taps, 1, "{rows}");
 }
 
-/// NO RESET AT ALL, AND THE WINDOW ROLLED OVER: the notice cut, the tap's
-/// reading full but its reset already behind (read after it passed, before
-/// Claude Code dropped the window), so it times nothing and the back-off
-/// stands; its next run shows the window dropped (E1f: its run 1.4 s after
-/// the reset), and the wait ends there, plus the grace and the jitter.
-/// NEGATIVE CONTROL: a window that never read full, then dropped, ends
 /// nothing.
 #[test]
 fn a_tap_showing_the_window_rolled_over_ends_a_wait_with_no_reset() {
@@ -366,16 +395,10 @@ fn a_tap_showing_the_window_rolled_over_ends_a_wait_with_no_reset() {
     let (until, grace, _, span) = run(100);
     let share = i64::try_from(resume_jitter(SID, TEST_NOW + 2, span).as_secs()).unwrap();
     assert_eq!(until, TEST_NOW + 2 + grace + share);
-    // NEGATIVE CONTROL.
     let (until, _, backoff, _) = run(97);
     assert_eq!(until, TEST_NOW + backoff);
 }
 
-/// THE TAP'S READING COMES WHILE THE LOOP WAITS: the wall's first decision
-/// finds no reading since the wall was read (the tap's run 0.4 s after the
-/// 429 came before it) and waits on the back-off; the tap's next run, read at
-/// a step of that wait, decides the point again at once, and the journal's
-/// wait is the tap's reset plus the grace and the jitter — nothing typed.
 /// NEGATIVE CONTROL: a host whose tap never reads leaves the back-off.
 #[test]
 fn the_taps_reading_during_the_wait_decides_the_wall_again() {
@@ -435,7 +458,6 @@ fn the_taps_reading_during_the_wait_decides_the_wall_again() {
         waits.iter().any(|w| *w == stamp(reset + grace + share)),
         "decided again at the tap's reset: {waits:#?}"
     );
-    // NEGATIVE CONTROL.
     let (waits, typed, _) = run(false);
     assert_eq!(typed, 0);
     assert!(
@@ -444,9 +466,6 @@ fn the_taps_reading_during_the_wait_decides_the_wall_again() {
     );
 }
 
-/// The five-hour wall of [`session_wall`] (`resets 11:35am`) with the vendor's
-/// countdown armed under it, or — `cancelled` — Esc on that countdown: the
-/// cancel the last thing said, which the reader reads as an idle screen
 /// with no wall (the lab's screen on Claude Code 2.1.301).
 fn countdown_wall(cancelled: bool) -> Vec<String> {
     let mut r = rows(&[
@@ -469,10 +488,6 @@ fn countdown_wall(cancelled: bool) -> Vec<String> {
     r
 }
 
-/// The session's transcript at [`countdown_wall`]: the turn the five-hour
-/// limit answered (the vendor's notice row, its 429's `rate_limit`), written
-/// as the turn ended, in conversation `c-1` — what a Claude Code host reads,
-/// and what a limit whose notice left the screen is acted on by under a host
 /// (`TurnEndState`'s `limit-conversation-unread` holds one no read named).
 fn countdown_tail() -> String {
     let at = aterm_types::rfc3339::format_rfc3339(
@@ -493,26 +508,10 @@ fn countdown_tail() -> String {
         + "\n"
 }
 
-/// THE NOTICE LEFT, THEN THE TAP READ (the lab's run on Claude Code 2.1.301:
-/// Esc on the vendor's countdown, the tap's figures first on its 10-second
-/// refresh): the wall is read armed, then cancelled, which reads as no wall,
-/// and the policy waits on the reset the notice named plus the grace and the
-/// jitter; the tap's reading at a step of that wait decides the point again
-/// and the wait is the tap's reset plus the grace and the session's share of
-/// THAT reset — the cancel kept, never the countdown's ten minutes. Its
-/// books follow the reset waited to though no read shows the wall again:
-/// the ledger's `wall-wait@v1` row carries the tap's reset, a reset more
-/// than the slack past the notice's (the lab's 421 s) has its `tap-reset@v1`
-/// row, and a loop that takes the session over (an update, a restart) —
-/// which has no tap clock of its own — waits to the tap's reset, never the
-/// notice's minute, before which it would type into the standing limit.
-/// Both hosts read the session's transcript ([`countdown_tail`]), as a
-/// Claude Code's host does. NEGATIVE CONTROL: with no reading, the notice's
 /// reset stands, in the wait, the ledger and the loop that follows.
 #[test]
 fn a_left_walls_wait_is_retimed_by_the_tap_read_while_it_waits() {
     let five = UsageWindow::FiveHour;
-    // The notice's `11:35am`, as the loop places it.
     let n = TEST_NOW + 2 * 3600 + 40 * 60;
     let journal = |path: &Path| -> Vec<String> {
         let (records, _) = journal_records(path);
@@ -522,8 +521,6 @@ fn a_left_walls_wait_is_retimed_by_the_tap_read_while_it_waits() {
             .map(|r| r.summary)
             .collect()
     };
-    // `offset`: how far past the notice's minute the tap's reading names the
-    // reset; `None`, no reading at all.
     let run = |offset: Option<i64>| {
         let tag = offset.map_or_else(|| "none".to_string(), |o| o.to_string());
         let (ldir, ledger) = ledger_at(&format!("tap-left-{tag}"));
@@ -531,7 +528,6 @@ fn a_left_walls_wait_is_retimed_by_the_tap_read_while_it_waits() {
         let host = TapHost::reading_tail(&[(five, None)], Some(&tail));
         host.after.store(2, Ordering::SeqCst);
         if let Some(offset) = offset {
-            // The reading the tap writes once the loop has read the wall.
             *host.later.lock().unwrap() =
                 Some(vec![(five, reading(100, n + offset, TEST_NOW + 1))]);
         }
@@ -561,8 +557,6 @@ fn a_left_walls_wait_is_retimed_by_the_tap_read_while_it_waits() {
         let _ = std::fs::remove_dir_all(&dir);
         let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
         let open = crate::supervise::approvals::open_wall(&ledger, Some(SID));
-        // THE LOOP THAT TAKES OVER, on the cancelled screen, its host's tap
-        // reading nothing.
         let (dir, path) = journal_file(&format!("tap-left-next-{tag}"));
         let mut m = Mock::new(vec![countdown_wall(true)]);
         m.stall_sleep = Some(Duration::from_millis(5));
@@ -605,9 +599,6 @@ fn a_left_walls_wait_is_retimed_by_the_tap_read_while_it_waits() {
     for offset in [28, 421] {
         let (waits, typed, (notice, limit), rows, open, next, next_typed) = run(Some(offset));
         assert_eq!(notice, Some(n), "11:35am");
-        // The policy's limit is reset at the tap's reset from then on, for
-        // all that reads it (the vendor's word that it went on, the clock it
-        // binds), not only the wait.
         assert_eq!(limit, Some(n + offset), "{offset}: the limit's reset");
         assert_eq!(typed, 0, "{waits:#?}");
         assert!(
@@ -625,8 +616,6 @@ fn a_left_walls_wait_is_retimed_by_the_tap_read_while_it_waits() {
             Some(&resets(n + offset)),
             "{offset}: the tap's reset: {waits:#?}"
         );
-        // The books: the wall's row carries the reset waited to, the tap's,
-        // apart from the notice's placement.
         assert!(
             rows.contains(&format!(
                 "reset_unix={n}; reset=11:35am; kind=usage-session; tap_unix={};",
@@ -644,7 +633,6 @@ fn a_left_walls_wait_is_retimed_by_the_tap_read_while_it_waits() {
         } else {
             assert_eq!(taps(&rows), 0, "within the slack: {rows}");
         }
-        // The loop that takes over waits to the tap's reset, typing nothing.
         assert_eq!(next_typed, 0, "{next:#?}");
         assert_eq!(
             next.last(),
@@ -652,7 +640,6 @@ fn a_left_walls_wait_is_retimed_by_the_tap_read_while_it_waits() {
             "{offset}: the successor: {next:#?}"
         );
     }
-    // NEGATIVE CONTROL.
     let (waits, typed, (_, limit), rows, open, next, next_typed) = run(None);
     assert_eq!(typed, 0);
     assert_eq!(limit, Some(n), "the notice's reset");
@@ -664,17 +651,6 @@ fn a_left_walls_wait_is_retimed_by_the_tap_read_while_it_waits() {
     assert_eq!(next.last(), Some(&resets(n)), "{next:#?}");
 }
 
-/// A WALL MET AGAIN IS READ AFRESH BY THE TAP: the tap's clock is the wall's
-/// at one answer of it, kept from the loop's first read of that answer until
-/// a turn the loop saw run ends on the wall again, or the wall answers an act
-/// of the loop's — where the notice's reset is placed afresh too
-/// (`Session::wall_reset_at`). The cut five-hour wall the tap timed to `R`;
-/// past `R`, a turn runs and meets the same words (Claude Code's own
-/// continuation at the reset, another limit binding), the tap's run since
-/// showing the window rolled over: no reset is known, and the point waits
-/// the back-off — never the past `R`, acted on at once. So too where the
-/// wall answers the loop's own continuation typed past `R`: the stale `R` is
-/// no reset of that answer. NEGATIVE CONTROL: the wall read again with
 /// nothing between keeps `R`.
 #[test]
 fn a_wall_met_again_is_read_afresh_by_the_tap() {
@@ -682,14 +658,12 @@ fn a_wall_met_again_is_read_afresh_by_the_tap() {
     let reset = TEST_NOW + 2 * 3600;
     let later = reset + 3600;
     let rolled = reading(3, later + 4 * 3600, later);
-    // A turn that ran and met the same wall again.
     let host = TapHost::answering(&[(five, reading(100, reset, TEST_NOW))]);
     let opts = opts_with(&host);
     let mut m = Mock::new(vec![busy_screen()]);
     let mut s = tapped(&mut m, None);
     let (r, _) = decide(&mut s, session_wall(None), &opts);
     assert_eq!(r.reset_at.map(|at| s.unix_of(at)), Some(reset));
-    // NEGATIVE CONTROL: read again, nothing between.
     let (r, _) = decide(&mut s, session_wall(None), &opts);
     assert_eq!(r.reset_at.map(|at| s.unix_of(at)), Some(reset), "kept");
     s.set_clock(later, PDT);
@@ -704,7 +678,6 @@ fn a_wall_met_again_is_read_afresh_by_the_tap() {
         matches!(a, TurnEndAction::WaitUntil { .. }),
         "the back-off, not the past reset: {a:?}"
     );
-    // The wall answers the loop's own continuation.
     let host = TapHost::answering(&[(five, reading(100, reset, TEST_NOW))]);
     let opts = opts_with(&host);
     let mut m = Mock::new(vec![busy_screen()]);
@@ -723,12 +696,6 @@ fn a_wall_met_again_is_read_afresh_by_the_tap() {
     );
 }
 
-/// A SPEND LIMIT IS NOT THE TAP'S TO TIME: only usage credits lift it, or a
-/// reset its notice names (R-9), so a reset the tap read would change its
-/// act, not only its time — under `[harness] usage_credits = false` the
-/// escalation that types nothing, whichever way the tap's first run fell
-/// against the loop's first read. Its tap is never asked, and the act is the
-/// same with the five-hour window full. NEGATIVE CONTROL: the five-hour
 /// wall, the same reading, is timed by it.
 #[test]
 fn a_spend_wall_is_never_timed_by_the_tap() {
@@ -756,15 +723,12 @@ fn a_spend_wall_is_never_timed_by_the_tap() {
         matches!(&a, TurnEndAction::Escalate { reason } if reason.contains("only usage credits")),
         "{a:?}"
     );
-    // NEGATIVE CONTROL.
     let mut m = Mock::new(vec![busy_screen()]);
     let mut s = tapped(&mut m, None);
     let (r, _) = decide(&mut s, session_wall(None), &opts);
     assert_eq!(r.reset_at.map(|at| s.unix_of(at)), Some(reset));
 }
 
-/// A relaunched Claude Code's screen that draws no limit: its conversation
-/// redrawn under the vendor's own paragraph ([`weekly_standing`]'s transcript
 /// stands at the limit).
 fn standing_idle() -> Vec<String> {
     let mut r = rows(&[
@@ -781,7 +745,6 @@ fn standing_idle() -> Vec<String> {
     r
 }
 
-/// A host whose transcript stands at a weekly limit its row resets at
 /// `until`, the tap answering `answer` for the seven-day window.
 fn weekly_standing(until: i64, answer: Option<TapWindow>) -> Arc<TapHost> {
     let host = Arc::new(TapHost {
@@ -799,15 +762,9 @@ fn weekly_standing(until: i64, answer: Option<TapWindow>) -> Arc<TapHost> {
     host
 }
 
-/// A LIMIT ONLY THE TRANSCRIPT SHOWS, TIMED BY THE TAP: its notice's reset
-/// is its row's (`quotaLimits.resetsAt`), and the tap's reading is set
-/// against THAT, as against any notice's — the later of the two further
-/// apart than the slack, with its `tap-reset@v1` row — so the wait, the
-/// session's share of the reset and the wall's ledger row name one reset.
 /// NEGATIVE CONTROL: the tap reading nothing, all three name the row's.
 #[test]
 fn a_transcript_limit_is_timed_by_the_tap_against_its_rows_reset() {
-    // The row's reset, away from where its words would be placed.
     let until = TEST_NOW + 30 * 3600;
     let tap = until + 45 * 60;
     let idle = standing_idle();
@@ -844,7 +801,6 @@ fn a_transcript_limit_is_timed_by_the_tap_against_its_rows_reset() {
         rows.contains(&format!("notice_unix={until}; tap_unix={tap}")),
         "{rows}"
     );
-    // NEGATIVE CONTROL.
     let (at, jitter, waited, rows) = run(None);
     assert_eq!(at, Some(until));
     assert_eq!(jitter, share(until));
@@ -858,7 +814,6 @@ fn reset_of(s: &Session<'_, Mock>, r: &TurnEndReading) -> Option<i64> {
     r.reset_at.map(|at| s.unix_of(at))
 }
 
-/// THE FIRST LOOP AT A CUT five-hour wall, its tap answering `read`, its
 /// books in a ledger of their own (`tag`): the directory and the ledger.
 fn cut_wall_written(tag: &str, read: Option<TapWindow>) -> (PathBuf, PathBuf) {
     let (dir, ledger) = ledger_at(tag);
@@ -869,7 +824,6 @@ fn cut_wall_written(tag: &str, read: Option<TapWindow>) -> (PathBuf, PathBuf) {
     (dir, ledger)
 }
 
-/// THE LOOP THAT TAKES THE SESSION OVER from the books at `ledger`
 /// (`Session::seed_wall_memory`, as a loop's start seeds it).
 fn successor<'a>(m: &'a mut Mock, ledger: &Path) -> Session<'a, Mock> {
     let mut s = tapped(m, Some(ledger.to_path_buf()));
@@ -877,14 +831,6 @@ fn successor<'a>(m: &'a mut Mock, ledger: &Path) -> Session<'a, Mock> {
     s
 }
 
-/// A LOOP THAT TAKES THE SESSION OVER AT A CUT WALL THE TAP TIMED READS IT
-/// MET AGAIN AFRESH: the wall's row keeps the notice's placement (none, the
-/// notice cut) apart from the tap's reset `R` (`reset_unix=-`, `tap_unix=R`),
-/// so the successor — no tap clock of its own — waits to `R`, and past it,
-/// where the wall answers the successor's own continuation, no reset is
-/// known: the back-off, as in one loop
-/// ([`a_wall_met_again_is_read_afresh_by_the_tap`]), never the past `R`
-/// taken for the notice's and typed into again. NEGATIVE CONTROL: a first
 /// loop whose tap read nothing leaves the successor the back-off at once.
 #[test]
 fn a_successor_reads_a_cut_wall_met_again_afresh() {
@@ -911,7 +857,6 @@ fn a_successor_reads_a_cut_wall_met_again_afresh() {
     );
     drop(s);
     let _ = std::fs::remove_dir_all(&dir);
-    // NEGATIVE CONTROL.
     let (dir, ledger) = cut_wall_written("tap-next-cut-none", None);
     let mut m = Mock::new(vec![busy_screen()]);
     let mut s = successor(&mut m, &ledger);
@@ -929,10 +874,6 @@ fn a_successor_reads_a_cut_wall_met_again_afresh() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE SUCCESSOR'S OWN TAP AT A CUT WALL IS TAKEN ALONE: the notice named
-/// no reset, so the successor's own reading of one — 20 minutes past the
-/// reset the first loop's tap carried — is the reset waited to, set against
-/// nothing: no `tap-reset@v1` row names a notice's reset no notice named.
 /// NEGATIVE CONTROL: its tap reading nothing, the carried reset stands.
 #[test]
 fn a_successors_own_tap_reading_at_a_cut_wall_is_taken_alone() {
@@ -957,16 +898,10 @@ fn a_successors_own_tap_reading_at_a_cut_wall_is_taken_alone() {
         "no notice named one: {rows}"
     );
     assert_eq!(got, Some(reset + 1200));
-    // NEGATIVE CONTROL.
     let (got, _) = run(None);
     assert_eq!(got, Some(reset));
 }
 
-/// THE SUCCESSOR SETS ITS OWN TAP AGAINST THE NOTICE'S RESET, NOT THE ONE IT
-/// CARRIES: the notice's `11:35am` placed at `n`, the first loop's tap inside
-/// the slack (`n - 240`, waited to); the successor's own reading 500 s from
-/// `n` — further than the slack from the notice's reset, though inside it
-/// from the carried `n - 240` — waits to the later, the notice's, with its
 /// `tap-reset@v1` row. NEGATIVE CONTROL: no tap before, the same.
 #[test]
 fn a_successor_sets_its_own_tap_against_the_notices_reset() {
@@ -1007,16 +942,10 @@ fn a_successor_sets_its_own_tap_against_the_notices_reset() {
         rows.contains(&format!("notice_unix={n}; tap_unix={}", n - 500)),
         "{rows}"
     );
-    // NEGATIVE CONTROL.
     let (n, got, _) = run(None);
     assert_eq!(got, Some(n));
 }
 
-/// A SUCCESSOR AT A LIMIT ONLY THE TRANSCRIPT SHOWS WAITS TO THE TAP'S
-/// RESET OVER THE ROW'S: the row resets at `until`, the first loop's tap 45
-/// minutes later (the later, waited to); the relaunched process's tap reads
-/// nothing, and the successor waits to the tap's reset, never the row's
-/// earlier one, before which it would type into the standing limit.
 /// NEGATIVE CONTROL: a first loop whose tap read nothing, the row's.
 #[test]
 fn a_successor_waits_to_the_taps_reset_over_a_transcript_limits_row() {
@@ -1046,6 +975,5 @@ fn a_successor_waits_to_the_taps_reset_over_a_transcript_limits_row() {
         Some(tap),
         "the tap's, later"
     );
-    // NEGATIVE CONTROL.
     assert_eq!(run(None), Some(until), "the row's");
 }

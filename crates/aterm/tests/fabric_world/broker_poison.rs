@@ -1,41 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **A POISONED BROKER LOG IS CURED BY THE BROKER'S OWN EXIT, END TO END.**
-//!
-//! astream poisons a log whose full flush fails over records no full flush
-//! covers: every write is refused until the log is reopened, and only the
-//! process that holds it can reopen it (`aterm_link::broker_health`). These
-//! worlds run the broker as a real `aterm link broker --durability relaxed`
-//! PROCESS, guarded by the harness's secret, under a headless aterm and its
-//! real bridge child — the bus as `aterm fabric on` runs it, with this test
-//! playing the supervisor.
-//!
-//! The poison is astream's own, reached the way a weak tier reaches it: the
-//! broker fault seam (`$ATERM_LINK_BROKER_FAULT`, a dev build's only) fails
-//! every full flush (`InjectedFaults { sync }`, armed once) and adds one
-//! escalation rule naming one session's `note` lane, so traffic flows until
-//! a post there owes the broker a full flush of its own — which fails and
-//! poisons the log (astream's claim `broker.ordered-tier`: "the next open moves
-//! the generation (... on Relaxed everywhere)").
-//!
-//! * THE CURE: the broker exits 75 with one line naming astream's reason, the
-//!   test restarts it from the same argv as launchd's `KeepAlive` would (and
-//!   with the `XPC_SERVICE_NAME` launchd sets, so the line says the supervisor
-//!   reopens it), the log's generation moves (the run was recorded `Lossy`),
-//!   and the post the poison refused is delivered EXACTLY ONCE, as is the next.
-//! * THE NEGATIVE CONTROL: the seam's `stay` switches the exit off. The broker
-//!   serves on over its poisoned log, the posts stay refused, and the bridge
-//!   reads `fabric=stalled reason=poisoned` — not `connected` — inside the
-//!   one-minute hang detector.
-//! * THE ENDPOINT CLAMPS TOO: a reply queued and a verdict given while the
-//!   poisoned broker is down survive the generation move its restart makes —
-//!   the bridge tells this aterm where the log continues (bridge lane 3) —
-//!   and land once each, threaded to the ask; an answer naming an offset past
-//!   the fork is retired, never published.
-//!
-//! Every wait is an `until` over an observable state, a hang detector and never
-//! a budget; nothing here sleeps.
+//! End-to-end tests verifying that a poisoned broker log exits 75 and recovers on supervisor restart.
 
 #![cfg(unix)]
 
@@ -72,7 +38,6 @@ impl Supervised {
     /// The secret file beside the world's socket, mode 0600, and the seam.
     fn new(w: &World, fault: String) -> Self {
         use std::os::unix::fs::PermissionsExt;
-        // A mint secret is read from a directory only its owner can reach.
         std::fs::set_permissions(&w.tmp, std::fs::Permissions::from_mode(0o700))
             .expect("the world's directory is private");
         let secret = w.tmp.join("mint.secret");
@@ -87,8 +52,7 @@ impl Supervised {
     }
 
     /// Start `aterm link broker <sock> <log> --secret-file <secret>
-    /// --durability relaxed` and return it once it prints `listening`. The
-    /// same argv and environment every time, as a supervisor restarts a job.
+    /// --durability relaxed` and return it once it prints `listening`.
     fn start(&self, w: &World) -> BrokerProcess {
         let err = std::fs::OpenOptions::new()
             .create(true)
@@ -101,8 +65,6 @@ impl Supervised {
             .arg(&self.secret)
             .args(["--durability", "relaxed"])
             .env(FAULT_SEAM, &self.fault)
-            // What launchd tells the job it runs (its `Label`): this harness
-            // stands in for the `KeepAlive` job `aterm fabric on` installs.
             .env("XPC_SERVICE_NAME", aterm_link::enable::LABEL)
             .stdin(aterm_uds::spawnfd::Stdio::null())
             .stdout(aterm_uds::spawnfd::Stdio::piped())
@@ -135,8 +97,6 @@ impl Supervised {
     /// The log identity (`<id hex>.<generation>`) the broker's `n`-th banner
     /// names (the stderr line it writes once it serves), once it is there.
     fn identity(&self, n: usize) -> (String, u64) {
-        // WHOLE LINES ONLY: the broker may still be writing the banner when
-        // the file is read, and a line without its newline is not one yet.
         let banner = until("the broker's banner on broker.err", || {
             read(&self.err)
                 .split_inclusive('\n')
@@ -168,8 +128,7 @@ fn read(path: &Path) -> String {
 
 /// A directory of the test's own for the broker it serves, short enough for a
 /// socket's `sun_path` and held for the test's life (declared before the world,
-/// so it goes after it). The world's scratch is an exclusive directory the
-/// harness names when it boots, after `boot_at` needs this path.
+/// so it goes after it).
 fn sock_dir(tag: &str) -> aterm_tempfile::TempDir {
     aterm_tempfile::Builder::new()
         .prefix(&format!("atl-{tag}-"))
@@ -221,13 +180,9 @@ fn a_poisoned_log_exits_75_and_the_restarted_broker_lands_the_post_once() {
     let (id, generation) = sup.identity(0);
     w.wait_ready();
 
-    // TRAFFIC FLOWS: a post on a lane no rule escalates is acked on the page
-    // cache and lands, the armed fault notwithstanding (Relaxed flushes
-    // nothing of its own).
     w.post_landed(&a, &b, "note", "", "before the poison");
     assert_eq!(on_lane(&w, &b, "before the poison"), 1);
 
-    // THE POISON: the escalated post owes a full flush, which fails.
     post(&w, &b, &a, "refused by the poison");
     let status = until("the broker to exit over its poisoned log", || {
         broker.child.try_wait().ok().flatten()
@@ -248,8 +203,6 @@ fn a_poisoned_log_exits_75_and_the_restarted_broker_lands_the_post_once() {
         "the exit line is broker.err's last word and names astream's reason:\n{said}"
     );
 
-    // THE SUPERVISOR'S RESTART: the same argv and environment. `sync` is
-    // spent (its marker is beside the log), so this broker's flushes succeed.
     drop(broker);
     let _restarted = sup.start(&w);
     let (id_after, generation_after) = sup.identity(1);
@@ -260,14 +213,6 @@ fn a_poisoned_log_exits_75_and_the_restarted_broker_lands_the_post_once() {
         "the run was recorded Lossy, so the reopen moves the generation"
     );
 
-    // EXACTLY ONCE, end to end: the refused post is resent under its pinned
-    // sequence, and the lane holds it once (`on_lane == 1`). This counts
-    // copies; it does not see which branch fired. astream proves both
-    // (`broker.poisoned-refusal`): a same-boot reopen kept the held record and
-    // the resend dedups to it, and a record a power loss cut is appended once.
-    // That claim also names what neither this test nor astream reaches: a real
-    // device's failed flush that left the record's pages clean but unwritten,
-    // where a later power loss makes the next open refuse, loud, not silent.
     until("the refused post to land after the restart", || {
         (on_lane(&w, &a, "refused by the poison") > 0).then_some(())
     });
@@ -278,13 +223,9 @@ fn a_poisoned_log_exits_75_and_the_restarted_broker_lands_the_post_once() {
             .contains(" fabric=connected ")
             .then_some(())
     });
-    // And the next post, on the same escalated lane, lands once too.
     w.post_landed(&b, &a, "note", "", "after the restart");
     assert_eq!(on_lane(&w, &a, "after the restart"), 1);
     assert_eq!(on_lane(&w, &a, "refused by the poison"), 1, "still once");
-    // DELIVERED to the session, once each: the bridge hands a landed record to
-    // the endpoint after it reads it back off the bus, so the inbox is waited
-    // for, then counted.
     let texts = ["refused by the poison", "after the restart"];
     let needles: Vec<String> = texts
         .iter()
@@ -327,8 +268,6 @@ fn with_the_exit_switched_off_posts_stay_refused_and_the_link_reads_poisoned() {
     until("the broker to find its log poisoned and stay", || {
         read(&sup.err).contains("NOT exiting").then_some(())
     });
-    // A second post from the same sender queues behind the first and wakes
-    // the drain that resends it into the poisoned log.
     post(&w, &b, &a, "behind the refused one");
     let header = until("the bridge to read the link poisoned", || {
         let fs = w.verb("fabric status").header().to_string();
@@ -369,22 +308,6 @@ fn replies_to(w: &World, sid: &str, off: u64, kind: &str) -> Vec<String> {
 /// **A REPLY QUEUED AND A VERDICT GIVEN WHILE THE POISONED BROKER IS DOWN
 /// LAND ONCE IT IS BACK, THREADED TO THE ASK** — the lineage reaches the
 /// endpoint (bridge lane 3, `link log <id> continues=<f> was=<id>`).
-///
-/// @b asks @a on a lane no rule escalates, and the ask lands. The poison
-/// stops the broker, and while it is down @a decides the ask (`inbox seen
-/// <id> handled`, a receipt owed) and answers it (`re=<the ask>`), and
-/// queues a second answer naming an offset the log never reached. The
-/// supervisor's restart moves the log's generation (the run was recorded
-/// `Lossy`) and astream records where the two agree — every record, in the
-/// same boot — and the bridge tells this aterm so. So the answer and the
-/// receipt are published once each and reach @b threaded to its own ask
-/// (`re-id=`: @b's endpoint kept the landing of its post across the move
-/// too), and only the answer naming an offset at or past the fork is retired
-/// `log-replaced`, never published — the in-world control. Before lane 3 the
-/// endpoint forgot every offset at the move, so the answer and the receipt
-/// were retired as well (NEGATIVE CONTROL, run: this test against an
-/// endpoint that ignores `continues=` fails at the answer's hang detector),
-/// and the asker's bridge said `expired` for an ask that had been answered.
 #[test]
 fn a_reply_and_a_verdict_made_while_the_poisoned_broker_is_down_land_after_its_restart() {
     let tag = "poisrep";
@@ -397,11 +320,9 @@ fn a_reply_and_a_verdict_made_while_the_poisoned_broker_is_down_land_after_its_r
     let (id, generation) = sup.identity(0);
     w.wait_ready();
 
-    // THE ASK, on @a's `ask` lane, which no rule escalates: it lands.
     let (_, asked) = w.post_landed(&b, &a, "ask", "", "which branch?");
     let row = until("the ask to reach @a", || id_at_off(&w, &a, asked));
 
-    // THE POISON stops the broker.
     post(&w, &b, &a, "refused by the poison");
     let status = until("the broker to exit over its poisoned log", || {
         broker.child.try_wait().ok().flatten()
@@ -413,8 +334,6 @@ fn a_reply_and_a_verdict_made_while_the_poisoned_broker_is_down_land_after_its_r
         read(&sup.err)
     );
 
-    // WHILE IT IS DOWN: the verdict, the answer, and an answer naming an
-    // offset no record of the log has.
     let seen = w.verb(&format!("@{a} inbox seen {row} handled"));
     assert!(seen.ok(), "inbox seen {row} handled: {}", seen.header());
     let answer = w.verb(&format!("@{a} post to=@{b} kind=answer re={asked} on main"));
@@ -431,7 +350,6 @@ fn a_reply_and_a_verdict_made_while_the_poisoned_broker_is_down_land_after_its_r
         .and_then(|n| n.parse().ok())
         .unwrap_or_else(|| panic!("a post id: {}", stray.header()));
 
-    // THE RESTART moves the generation, and the bridge clamps at the fork.
     drop(broker);
     let _restarted = sup.start(&w);
     let (id_after, generation_after) = sup.identity(1);
@@ -459,8 +377,6 @@ fn a_reply_and_a_verdict_made_while_the_poisoned_broker_is_down_land_after_its_r
         "the bridge clamped a moved generation: {evs:#?}"
     );
 
-    // ONCE EACH, and the stray answer never: it named an offset at or past
-    // the fork, so the endpoint retired it at the move, before any drain.
     let text = aterm_link::pct::encode("on main");
     assert_eq!(on_kind_lane(&w, &b, "answer", &format!("text={text}")), 1);
     assert_eq!(

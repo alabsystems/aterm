@@ -76,6 +76,7 @@ impl Reply {
 struct SubArgs {
     sid: Option<String>,
     /// `answer --box TOKEN`: the question dialog's token the answer was
+    /// decided on (`drive phase`'s `box` line).
     box_token: Option<String>,
     allow_python: Vec<String>,
     /// `ledger --journal FILE`: the supervisor's journal it reads back.
@@ -89,6 +90,7 @@ struct SubArgs {
     /// `ledger --source anchor|log`: what places its times.
     source: Option<LedgerSource>,
     /// Positional words (the command text for `classify`, the answer for
+    /// `answer`).
     rest: Vec<String>,
 }
 
@@ -243,6 +245,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
 }
 
 /// What `phase` prints for one read of the screen: the phase and its detail,
+/// then `survey 0` while the session survey is open and `context <n>%` while
+/// the context reading is up ([`render_phase_and_survey`]), every line read by
+/// `reader` — the worker's own program's, as the turn's phase was.
 fn phase_reply(
     turn: &supervise::Turn,
     reader: &dyn aterm_phase::ScreenReader,
@@ -252,6 +257,8 @@ fn phase_reply(
 }
 
 /// Where a verb `aterm drive` no longer has went: the `aterm ctl` verb, or
+/// the window's own host, that does its work now (the design of 2026-10-15,
+/// `docs/DESIGN-sessions-as-subagents-2026-10-15.md` §7).
 fn gone_to(verb: &str) -> Option<&'static str> {
     Some(match verb {
         "prompt" => "`aterm ctl @<sid> turn '<text>'`",
@@ -342,6 +349,9 @@ fn run(opts: &Opts) -> Result<Reply, String> {
 }
 
 /// `aterm drive ledger`: read the worker's turn ledger, a supervisor's
+/// journal, this session's mail with it and the archive's reply sizes, and
+/// print the one timeline (`--format text|md|html`, `--out PATH` to write it
+/// instead of printing).
 fn ledger_verb(opts: &Opts, args: &[String]) -> Result<Reply, String> {
     let sub = parse_sub("ledger", args)?;
     no_positionals("ledger", &sub)?;
@@ -383,6 +393,7 @@ fn ledger_verb(opts: &Opts, args: &[String]) -> Result<Reply, String> {
 }
 
 /// Write `text` to `path`, created 0600 (a ledger carries what the manager
+/// typed and what the worker said), truncating what was there.
 fn write_private(path: &std::path::Path, text: &str) -> Result<(), String> {
     use std::io::Write as _;
 
@@ -414,6 +425,8 @@ fn journal_sid(path: Option<&std::path::Path>) -> Option<String> {
 }
 
 /// Where the aterm process hosting `sid` started the clock its `history`,
+/// `inbox` and `timeline` stamps count from: the birth time of its control
+/// socket, bound at startup.
 fn clock_anchor(sid: &str) -> Result<ClockAnchor, String> {
     let sessions = aterm_ctl::fleet_sessions().map_err(|e| format!("`ls` found nothing: {e}"))?;
     let pid = sessions
@@ -445,6 +458,9 @@ fn clock_anchor(sid: &str) -> Result<ClockAnchor, String> {
 }
 
 /// `aterm drive tape cat|show|stats FILE`: read a harness tape — its items one
+/// line each (`cat`; `--text`: the exact text form, which reads back to the
+/// same tape), each decision with the screen it judged, the act and the
+/// journal line (`show --decisions`), or what it cost (`stats`).
 fn tape_verb(args: &[String]) -> Reply {
     match tape_reply(args) {
         Ok((text, note)) => {
@@ -464,6 +480,9 @@ fn tape_verb(args: &[String]) -> Reply {
 }
 
 /// `aterm drive replay FILE [--until door=N]`: run the loop a harness tape
+/// recorded again, offline and exactly (`supervise::tape::replay`): the
+/// tape's own setup and policy, every value the recorded loop observed fed
+/// back in order, every request and output checked against the recorded one.
 fn replay_verb(args: &[String]) -> Reply {
     replay_reply(args).unwrap_or_else(|e| {
         eprintln!("aterm drive: replay: {e}");
@@ -573,6 +592,9 @@ fn replay_reply_with_limit(args: &[String], read_limit: u64) -> Result<Reply, St
 }
 
 /// The exit code of a `--shadow` batch from each tape's: 1 when a point on
+/// any tape is decided otherwise (the answer a batch is asked for), else 2
+/// when a tape did not shadow, else 3 when a point was not decided again,
+/// else 0 — every point on every tape decided again, and as recorded.
 fn worst_shadow_code(codes: &[u8]) -> u8 {
     [1, 2, 3]
         .into_iter()
@@ -581,6 +603,11 @@ fn worst_shadow_code(codes: &[u8]) -> u8 {
 }
 
 /// What `replay`'s arguments name: the tape (and, with `--shadow` or
+/// `--check`, more tapes — with `--check`, directories of them), how to
+/// replay it — strictly, or as a counterfactual under the candidate policy
+/// `--set`/`--policy` name — with `--why` the decision to explain and how to
+/// render it, with `--shadow` every decision decided again, and with
+/// `--check` every tape replayed as a corpus replays it.
 #[derive(Debug)]
 struct ReplayArgs {
     file: PathBuf,
@@ -594,6 +621,7 @@ struct ReplayArgs {
 const POLICY_INPUT_MAX: u64 = 1024 * 1024;
 
 /// `--policy FILE`: a whole `[harness]` table read by the owner's own reader
+/// (`SupervisorConfig::from_aterm_toml`).
 fn candidate_file(path: &str) -> Result<(String, supervise::SupervisorConfig), String> {
     candidate_file_with_limit(path, POLICY_INPUT_MAX)
 }
@@ -618,7 +646,7 @@ fn candidate_file_with_limit(
     Ok((path.to_string(), policy))
 }
 
-/// `replay`'s FILE and options, as its arguments name them. `--at` and
+/// `replay`'s FILE and options, as its arguments name them.
 fn replay_args(args: &[String]) -> Result<ReplayArgs, String> {
     const USAGE: &str = "replay FILE [--until door=N] | replay FILE --set k=v… | --policy FILE \
                          [--set k=v…] [--until door=N] | replay FILE… --shadow [--set k=v…] \
@@ -810,6 +838,9 @@ fn tape_reply_with_limit(
 }
 
 /// `aterm drive tape ls [@sid]`: the hosted tapes in `store`
+/// (`supervise::tape::store`), newest first — every session's, or `@sid`'s,
+/// and the kept ones beside them — one a line: its size, how long ago it
+/// was last written (by `now`), its path, and `kept` for a person's.
 fn store_ls(
     store: &std::path::Path,
     args: &[String],
@@ -844,6 +875,8 @@ fn store_ls(
 }
 
 /// `aterm drive tape forget FILE|@sid…`: remove hosted tapes from `store` —
+/// each FILE named, which must be a tape in the store, and every tape of each
+/// `@sid` (a person's kept ones are forgotten only by name).
 fn store_forget(store: &std::path::Path, args: &[String]) -> Result<String, String> {
     if args.is_empty() {
         return Err("tape forget needs a FILE or an @sid".to_string());
@@ -876,7 +909,7 @@ fn store_forget(store: &std::path::Path, args: &[String]) -> Result<String, Stri
         .collect())
 }
 
-/// Read only a regular file, judged on its open handle. The existing opener
+/// Read only a regular file, judged on its open handle.
 fn read_tape_bytes(path: &std::path::Path, limit: u64) -> std::io::Result<Vec<u8>> {
     read_regular_bytes(path, limit, "tape")
 }
@@ -901,6 +934,9 @@ fn read_regular_bytes(path: &std::path::Path, limit: u64, kind: &str) -> std::io
 }
 
 /// The owner's `[harness]` policy, read by [`SupervisorConfig::from_path`] from
+/// the window's aterm.toml ([`crate::harness::cli::default_config_path`]),
+/// notes on stderr: `answer` keeps its hands off a dialog a person keyed within
+/// the window's `human_grace_s`.
 fn harness_policy() -> SupervisorConfig {
     let (policy, notes) =
         SupervisorConfig::from_path(crate::harness::cli::default_config_path().as_deref());
@@ -922,6 +958,8 @@ mod tests {
     }
 
     /// `classify <cmd>`: the command is the positional text (joined), the
+    /// verdict is the exit code, `--allow-python` replaces the python globs,
+    /// and no command is a usage error.
     #[test]
     fn classify_parses_the_command_and_exits_on_the_verdict() {
         let r = classify_verb(&args(&["git status --short && git pull | tail"])).expect("ok");
@@ -968,6 +1006,7 @@ mod tests {
         assert_eq!(run(&o).expect("pure verb needs no host").code, 0);
     }
     /// `phase` ends with `context <n>%` while the context indicator is up
+    /// (after `survey 0` when the survey is open too).
     #[test]
     fn phase_ends_with_the_context_left() {
         let rule = "─".repeat(120);
@@ -1017,6 +1056,8 @@ mod tests {
     }
 
     /// `<verb> --help` is a request for help and never an action: every verb,
+    /// both spellings, lands on the side-effect-free `help` path, and an answer
+    /// that merely mentions the flag is still the answer.
     #[test]
     fn a_verb_followed_by_help_asks_for_help_and_never_acts() {
         for verb in ["classify", "phase", "answer", "ledger", "tape", "replay"] {
@@ -1043,6 +1084,8 @@ mod tests {
     }
 
     /// The one option is `--socket PATH`: one the drive no longer has
+    /// (`--dial`, `--timeout`, `--idle`, `--ready`) is refused before any verb
+    /// runs, and a missing socket path is a usage error.
     #[test]
     fn the_one_option_is_the_socket() {
         let o = parse(os(&["--sock", "/run/a.sock", "phase", "@s-1"])).expect("parses");
@@ -1060,6 +1103,8 @@ mod tests {
     }
 
     /// A verb the drive no longer has is refused before any host is reached,
+    /// naming where its work went; a word that never was a verb is refused as
+    /// unknown.
     #[test]
     fn a_removed_verb_is_refused_before_any_host() {
         for verb in [
@@ -1098,6 +1143,8 @@ mod tests {
     }
 
     /// Flags belong to their verbs: `--journal`, `--format`, `--out` and the
+    /// time `--since` to `ledger`, `--box` to `answer`; each refuses every
+    /// other verb by name.
     #[test]
     fn the_ledgers_flags_belong_to_it() {
         let sub = parse_sub(
@@ -1234,6 +1281,10 @@ mod tests {
     }
 
     /// `tape ls` lists the hosted store newest first, a session's alone with
+    /// `@sid` (the kept ones beside it), and says an empty store; `tape
+    /// forget` removes the tapes named — a FILE, or a session's every tape
+    /// but its kept ones — and refuses anything that is no tape in the store
+    /// before a tape goes.
     #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
     #[test]
     fn tape_ls_lists_the_store_and_forget_trims_it() {
@@ -1325,6 +1376,8 @@ mod tests {
     }
 
     /// `tape cat|show|stats` read only the file they are given: a usage
+    /// error and a tape that cannot be read are refused, exit 2; a tape
+    /// reads as its items, its text, its decisions or its stats.
     #[test]
     fn tape_reads_only_its_file_and_refuses_with_two() {
         use crate::supervise::tape::codec::{End, Item};
@@ -1374,6 +1427,9 @@ mod tests {
     }
 
     /// `replay FILE [--until door=N]` reads only the file it is given: a usage
+    /// error, a file that cannot be read and a tape no replay can stand on (no
+    /// header to rebuild a loop from) are refused, exit 2; `--until` takes an
+    /// effect's ordinal, `door=N` or `door=#N`.
     #[test]
     fn replay_reads_only_its_file_and_refuses_with_two() {
         use crate::supervise::tape::codec::{End, Item};
@@ -1438,6 +1494,11 @@ mod tests {
     }
 
     /// `replay FILE --why --at POINT [--format …]` is the replay's option,
+    /// never a verb of its own (`aterm drive why` is refused as any unknown
+    /// command): `--why` needs `--at`, `--at` and `--format` need `--why`,
+    /// `--why` names its own point and so takes no `--until`, and a point or
+    /// a format that does not read is refused — each exit 2 with nothing
+    /// printed.
     #[test]
     fn why_is_an_option_of_replay_and_refuses_with_two() {
         use crate::supervise::tape::codec::{End, Item};
@@ -1504,6 +1565,10 @@ mod tests {
     }
 
     /// THE COUNTERFACTUALS ARE OPTIONS OF `replay`, never verbs of their own
+    /// (`aterm drive shadow` is refused as any unknown command): `--set k=v`
+    /// and `--policy FILE` name a candidate policy (a counterfactual in acts
+    /// mode), `--shadow` decides every point again under it (or under the
+    /// recorded policy) and alone takes more than one FILE.
     #[test]
     fn counterfactuals_are_options_of_replay_and_refuse_with_two() {
         use crate::supervise::tape::codec::{End, Item};
@@ -1660,6 +1725,10 @@ mod tests {
     }
 
     /// A CORPUS CHECK IS AN OPTION OF REPLAY: `--check` names FILEs and DIRs
+    /// (a candidate beside them or none) and nothing else — a point, a shadow
+    /// or an `--until` refused, as is a check that finds no tape, each exit
+    /// 2; a tape that does not replay is said on its own line and counted,
+    /// never ending the check; and `check` is no verb.
     #[test]
     fn a_corpus_check_is_an_option_of_replay() {
         let dir = crate::supervise::ScratchDir::new("drive-replay", "check");
@@ -1720,6 +1789,10 @@ mod tests {
     }
 
     /// A replay reads its tape as the `tape` verbs do: a regular file at
+    /// most the read budget long — one byte over is refused, never replayed
+    /// as a shorter tape — and a directory or a FIFO refused at once (a FIFO
+    /// with no writer would park a blocking open for ever: the one-minute
+    /// wait below is the hang detector), each exit 2.
     #[cfg(unix)]
     #[test]
     fn replay_reads_its_tape_bounded_and_regular() {
@@ -1769,6 +1842,9 @@ mod tests {
     }
 
     /// A refusal quotes the tape — a header's section — and is said as every
+    /// printed tape field is ([`show::shown`]): a crafted tape's
+    /// escape sequences (a clipboard write, a title) reach the reader's
+    /// terminal as text, never as control bytes.
     #[test]
     fn a_replay_refusal_shows_the_tapes_control_bytes_as_text() {
         use crate::supervise::tape::codec::{End, Item};
@@ -1802,6 +1878,8 @@ mod tests {
     }
 
     /// A tape reader admits ordinary binary and text files, including a link
+    /// to one, at the exact input limit; an overflow is refused, never parsed
+    /// as a shorter tape.
     #[cfg(unix)]
     #[test]
     fn tape_file_reads_refuse_overflow_and_keep_regular_symlink_inputs() {

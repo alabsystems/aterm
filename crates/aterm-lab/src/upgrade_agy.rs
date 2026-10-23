@@ -1,70 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `agy-upgrade [tag] [--keep]`: AGY'S LIVE UPGRADE, LIVE — its quiet flow
-//! (`[harness] upgrade_ask = false`, the default, and the one flow agy takes)
-//! on the real agy (the lab's, launched by the seeded `agy` verb through the
-//! scratch store's twin) under a private headless aterm with the harness ON,
-//! against the stub's Gemini API. A lab of its own (`agy-upgrade-<pid>` unless
-//! a tag is given).
-//!
-//! THE SCRATCH STORE. The instance's package prefix (`<scratch
-//! home>/Library/Application Support/aterm/pkg`, never the owner's) gets a
-//! store laid as atpkg lays one: `store/agy/<build>/bin/agy` (an APFS clone of
-//! the lab's build), its `<build>.vendor` record and `.ready`, the
-//! `store/agy/current` link, and the `agents/agy` twin that exports
-//! `AGY_CLI_DISABLE_AUTO_UPDATE` and execs it. agy runs THROUGH THE TWIN, so
-//! the process maps the store build and the harness reads its version off
-//! that build's record. A LANDING is atpkg's file operations in its order: a
-//! newer build's tree (a clone of the same bytes: only the record says it is
-//! newer), its record naming a higher patch at that version's build id,
-//! `.ready`, `current` swapped by a rename, the twin rewritten by a rename to
-//! exec it — and then agy's OWN ACTIVATION NOTICE
-//! (`activation-notices/agy`, `atpkg::activation_notice::marker_name`),
-//! replaced by a rename (mode 0600), which the window's host watches for its
-//! agy sessions alone; its log line on it (`an activation notice for
-//! Antigravity CLI`) is read as the proof it noticed.
-//!
-//! 1. **Idle.** agy takes a turn (`remember the word …`); the build lands; the
-//!    agy must be restarted onto the new build ON THE SAME CONVERSATION: `ps`
-//!    argv names the new build's directory and `--conversation=<uuid>`, the new
-//!    process holds the conversation's presence lock (`lsof`), the ledger reads
-//!    `build-probe:starts` → `terminated` → `relaunched` → `done:resumed` and
-//!    NO `continued`, the stub gets no request until the lab's own next turn,
-//!    and that turn's request carries the word (the prior turns came back).
-//!    The probe — `<twin> --help` in `build_starts`' own form, null stdio in a
-//!    process group of its own, under the instance's `HOME` — must leave that
-//!    `HOME` without a `.gemini`.
-//! 2. **A background command task** (`run_command`, `WaitMsBeforeAsync` 500,
-//!    `sleep 40`, approved at agy's box): the build lands while it runs; the
-//!    agy must NOT be restarted while its shell runs, and must be once it
-//!    ended, onto the newer build, its conversation kept, nothing typed.
-//! 3. **A subagent working** (`invoke_subagent`, its model call held 40 s by
-//!    the stub): the same — not restarted while it works, restarted after it
-//!    went idle.
-//! 4. **A daemon task** (`run_command` with `IsDaemon`, which the summary row
-//!    never sees): the same.
-//! 5. **A busy agy** (stub mode `slow`): a build lands mid-turn; it must NOT be
-//!    restarted while the turn runs, and must be after it ended.
-//! 6. **A continuously driven agy** (`[harness] continue = true`, set live): a
-//!    turn of REAL WORK (the stub holding its answer past the loop's two
-//!    minutes of busy work, [`LONG_TURN_MS`]) and a build landed mid-turn: the
-//!    restart must take that turn's end — no turn reaches the stub between the
-//!    landing's turn and the `terminated` row — so an Autopilot loop that
-//!    continues at every turn end does not starve it.
-//!
-//! Phases 2 to 5 judge the restart against the work's end by one rule
-//! (`upgrade_muse::held_while`): the agy must still stand — alive, no
-//! `terminated` row — when the work is seen ended and a moment after, since a
-//! restart that killed the work would end it in that same moment (its
-//! processes go with agy, and its count leaves with agy's last frame); and
-//! the 40-second work of phases 2 to 4 must have run its course
-//! (`upgrade_muse::RAN_MS`) from when it was first seen.
-//!
-//! The held steps (`HOST … upgrade step=wait:<why>`) are printed per phase.
-//! Claude Code's and Muse Code's live upgrades are judged by their own checks:
-//! nothing of them runs here. Exit 0 when every phase holds, 1 when one does
-//! not, 3 could not run.
+//! `agy-upgrade [tag] [--keep]`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -85,16 +22,13 @@ use crate::{Fail, LAB, Res};
 /// The word the first turn asks agy to remember.
 pub const WORD: &str = "HERON-7070";
 
-/// How long phase 6's stub holds its answer: past the turn-end policy's two
-/// minutes of busy work (`TurnEndTiming::min_work`), so the turn is real work
-/// and the loop continues it at once.
+/// How long phase 6's stub holds its answer.
 pub const LONG_TURN_MS: i64 = 130_000;
 
 /// How long the stub holds phase 3's subagent's model call.
 pub const SUBAGENT_HOLD_MS: i64 = 40_000;
 
-/// The host's line on agy's own activation notice (`harness_host`'s
-/// activation wake, agy's product name).
+/// The host's line on agy's own activation notice.
 pub const NOTICED: &str = "an activation notice for Antigravity CLI";
 
 /// The words agy's command box asks with (`Run this command?`).
@@ -104,9 +38,7 @@ fn could_not(m: &str) -> Fail {
     Fail::exit(3, format!("agy-upgrade: COULD NOT RUN: {m}"))
 }
 
-/// The store build id of a plain version `x.y.z` (atpkg's
-/// `vendor_direct::version`: `10^18 + x·10^12 + y·10^6 + z`, each below
-/// `10^6`). `None` for any other spelling.
+/// The store build id of a plain version `x.y.z`.
 #[must_use]
 pub fn plain_build_id(version: &str) -> Option<u64> {
     let num = |s: &str| -> Option<u64> {
@@ -168,7 +100,7 @@ impl Store {
 
     /// LAND build `version` as atpkg lands one (the module's order): its
     /// tree, its record and `.ready`, `current` swapped, the twin rewritten,
-    /// and agy's activation notice published. Its program.
+    /// and agy's activation notice published.
     fn land(&self, version: &str) -> Result<PathBuf, String> {
         let id = plain_build_id(version).ok_or("no build id")?;
         let bin = self.store().join(id.to_string()).join("bin/agy");
@@ -192,7 +124,6 @@ impl Store {
         std::os::unix::fs::symlink(id.to_string(), &tmp).map_err(|e| format!("current: {e}"))?;
         let current = store.join("current");
         std::fs::rename(&tmp, &current).map_err(|e| format!("current: {e}"))?;
-        // The swap took: the link resolves to this build's directory.
         let resolved = std::fs::canonicalize(&current).map_err(|e| format!("current: {e}"))?;
         let build = bin
             .parent()
@@ -301,7 +232,6 @@ fn moved_onto(
     let Some((pid, _, words)) = found else {
         return Ok(None);
     };
-    // The quiet carry is the next idle point's: its `done:` row.
     let _ = wait_for(60, || {
         ledger(run, since)
             .iter()
@@ -374,7 +304,6 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         run.aterm
     );
     let mut failed = Vec::new();
-    // ---- the scratch store, as atpkg lays it, and the shell's environment
     let source_record = source
         .parent()
         .and_then(Path::parent)
@@ -420,7 +349,6 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         store.twin().display()
     );
 
-    // ---- launch through the twin, by the seeded verb, one turn
     let mut through = run.clone();
     through.agy_bin = store.twin().to_string_lossy().into_owned();
     crate::gemini::launch(
@@ -465,7 +393,6 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
     let home_gemini = run.w.join("home/.gemini");
     let probed_home_before = home_gemini.exists();
 
-    // ---- 1. idle: restarted onto the new build, its conversation kept, nothing typed
     let turns_before = main_turns(&run);
     let t1 = now_ms();
     store
@@ -495,7 +422,6 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         return Ok(false);
     };
     show_moved(&m1, ids[1], "");
-    // An observation window for a continuation that must never come.
     stop::sleep(Duration::from_secs(5))?;
     let silent = main_turns(&run) == turns_before;
     let probed = row_at(&m1.rows, "build-probe:starts").is_some();
@@ -528,7 +454,6 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
     door.await_idle(2000, 60)?;
     let mut pid = m1.pid;
 
-    // ---- 2. a background command task: held while it runs, restarted once it ended
     crate::verbs::set_tool(
         &run,
         r#"{"name":"run_command","input":{"CommandLine":"sleep 40; echo LAB-BG-DONE","Cwd":"@PROJ@","WaitMsBeforeAsync":500,"toolAction":"Running background sleep","toolSummary":"Background sleep"}}"#,
@@ -575,7 +500,6 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
     pid = m2.pid;
     door.await_idle(2000, 90)?;
 
-    // ---- 3. a subagent working: held while it works, restarted once it went idle
     crate::verbs::set_tool(
         &run,
         &format!(
@@ -625,7 +549,6 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
     pid = m3.pid;
     door.await_idle(2000, 90)?;
 
-    // ---- 4. a daemon task (the summary row blind to it): the same
     crate::verbs::set_tool(
         &run,
         r#"{"name":"run_command","input":{"CommandLine":"sleep 40","Cwd":"@PROJ@","IsDaemon":true,"WaitMsBeforeAsync":500,"toolAction":"Running daemon sleep","toolSummary":"Daemon sleep"}}"#,
@@ -670,7 +593,6 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
     pid = m4.pid;
     door.await_idle(2000, 90)?;
 
-    // ---- 5. busy: not restarted mid-turn, restarted after it
     crate::verbs::set_mode(&run, "slow")?;
     crate::verbs::turn(&door, "a slow turn")?;
     let busy = door.seen("esc to cancel", 30)?;
@@ -708,9 +630,7 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
     };
     pid = m5.pid;
 
-    // ---- 6. continue on: the restart takes the turn end the loop would continue at
     crate::verbs::set_harness(&run, &[("continue".to_string(), "true".to_string())])?;
-    // The host reads the policy anew and its worker hands over to one under it.
     stop::sleep(Duration::from_secs(5))?;
     door.await_idle(2000, 90)?;
     crate::verbs::set_custom_mode(
@@ -804,9 +724,6 @@ pub fn cmd_agy_upgrade(args: &[String]) -> Res {
     let mut u = crate::lab::UpOpts::from_env();
     u.trust = true;
     u.lifeline = !keep;
-    // No turn-end continuation of the supervisor's until phase 6 turns it on:
-    // nothing but the upgrade's own acts is judged, and the quiet flow types
-    // nothing.
     u.harness_keys = format!("{}\ncontinue = false", u.harness_keys);
     if let Err(f) = crate::lab::up(&tag, &u) {
         if let Some(m) = &f.msg {
@@ -836,8 +753,6 @@ mod tests {
 
     /// The build id atpkg lays a plain version under, as its store holds them
     /// (the scratch-agents copy's `1000001000004000000` is `1.4.0`).
-    /// NEGATIVE CONTROLS: a revision form, a leading zero, a component past
-    /// its range, a fourth component.
     #[test]
     fn a_plain_versions_build_id_is_atpkgs() {
         assert_eq!(plain_build_id("1.4.0"), Some(1_000_001_000_004_000_000));

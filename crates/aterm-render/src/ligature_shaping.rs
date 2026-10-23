@@ -207,6 +207,7 @@ impl<'a> RowShaper<'a> {
     }
 
     /// Shape `run` in the order given, which is logical: [`plan_row_runs`] has already put
+    /// a backwards right-to-left stretch back in written order.
     fn shape_buffer(&mut self, run: &str, scratch: &mut UnicodeBuffer) -> GlyphBuffer {
         let mut buffer = std::mem::take(scratch);
         buffer.push_str(run);
@@ -342,7 +343,7 @@ pub fn font_advertises_feature(rb_bytes: &[u8], index: u32, tag: [u8; 4]) -> boo
     aterm_font::Face::parse(rb_bytes, index).is_ok_and(|face| face_gsub_has(&face, |t| t == tag))
 }
 
-/// Whether the face's `GSUB` feature list holds a tag `hit` accepts. LINEAR: FeatureList
+/// Whether the face's `GSUB` feature list holds a tag `hit` accepts.
 fn face_gsub_has(face: &aterm_font::Face<'_>, hit: impl Fn([u8; 4]) -> bool) -> bool {
     face.tables()
         .gsub
@@ -401,6 +402,8 @@ pub fn plan_row_runs<S, F, R>(
 }
 
 /// The piece of the coalesced run `[start, end)` that begins at `start`: where
+/// it ends, and whether it is a right-to-left stretch to shape reversed
+/// ([`logical_rtl_stretch`]).
 fn next_piece(cells: &[RenderCell], order: &[u16], start: usize, end: usize) -> (usize, bool) {
     if order.is_empty() {
         return (end, false);
@@ -416,6 +419,8 @@ fn next_piece(cells: &[RenderCell], order: &[u16], start: usize, end: usize) -> 
 }
 
 /// Whether the cells from `start` (before `end`) open a stretch of right-to-left letters
+/// (bidi class R or AL) that `order` lays out backwards, each painted one column left of
+/// its logical successor, and if so where the stretch ends.
 fn logical_rtl_stretch(
     cells: &[RenderCell],
     order: &[u16],
@@ -450,6 +455,7 @@ fn logical_rtl_stretch(
 }
 
 /// Shape the cells `[start, end)` of one coalesced run as one piece and write
+/// its columns of `out`.
 #[allow(clippy::too_many_arguments)]
 fn plan_piece<F, R>(
     cells: &[RenderCell],
@@ -615,6 +621,8 @@ mod tests {
     }
 
     /// The feature list: the base `liga`/`calt` pair first (on when ligatures
+    /// are on, zeroed when off), then every user feature in order with its
+    /// exact value.
     #[test]
     fn build_feature_list_puts_the_base_pair_first_then_user_features() {
         let user = [FontFeature::new(*b"cv01", 2), FontFeature::new(*b"liga", 0)];
@@ -642,6 +650,7 @@ mod tests {
     }
 
     /// The engine form mirrors the first-party list entry for entry, in order (order is
+    /// precedence).
     #[test]
     fn engine_features_mirror_the_list_over_the_whole_run() {
         let list = build_feature_list(
@@ -736,6 +745,7 @@ mod tests {
     }
 
     /// A pane edge starts a new run without excluding its first cell, so a right pane that
+    /// begins with `=>` still ligates.
     #[test]
     fn run_boundary_preserves_right_pane_initial_ligature() {
         let cells = [cell('x'), cell('x'), cell('='), cell('>')];
@@ -768,6 +778,8 @@ mod tests {
     }
 
     /// Plan one row of `text` (every cell shapeable, one style) with the
+    /// bidi map `order`, through a shaper that gives the `i`th character of
+    /// each piece it is handed glyph `100 + i`.
     fn plan_pieces(text: &str, order: &[u16]) -> (Vec<String>, Vec<ColumnGlyph>) {
         let cells: Vec<RenderCell> = text.chars().map(cell).collect();
         let shapeable = vec![true; cells.len()];
@@ -800,6 +812,8 @@ mod tests {
     }
 
     /// A stretch of right-to-left letters the bidi reorder painted backwards is shaped in
+    /// logical order, and each glyph goes back to the column its letter is painted at; the
+    /// left-to-right operator after it is shaped as the row holds it.
     #[test]
     fn a_backwards_rtl_stretch_is_shaped_in_logical_order() {
         let visual = "\u{627}\u{628}\u{62D}\u{631}\u{645}==";
@@ -814,6 +828,8 @@ mod tests {
     }
 
     /// Neutrals at a right-to-left level keep the order the grid shows: in logical `אב==גד`
+    /// the operator sits between two Hebrew words, so the reorder paints the whole token
+    /// backwards (`דג==בא`), but only the letters are shaped reversed.
     #[test]
     fn rtl_level_neutrals_keep_the_painted_order() {
         let (seen, out) = plan_pieces("\u{5D3}\u{5D2}==\u{5D1}\u{5D0}", &[5, 4, 3, 2, 1, 0]);
@@ -822,6 +838,7 @@ mod tests {
     }
 
     /// A `Collapsed` result expands to `n` `LigatedSlice` columns; columns outside the run
+    /// stay `PerCell`.
     #[test]
     fn plan_row_runs_expands_collapsed_to_slices() {
         let cells = [
@@ -886,6 +903,7 @@ mod tests {
     }
 
     /// The `extract_cell_slice` tiles reassemble the wide raster byte-exactly, for left
+    /// bearings of both signs.
     #[test]
     fn extract_cell_slice_reassembles_wide_raster() {
         let (raster_w, height, cell_w) = (23usize, 4usize, 8usize);

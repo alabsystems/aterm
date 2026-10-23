@@ -505,6 +505,10 @@ pub fn not_current(state: &str) -> Option<(&'static str, &str)> {
 }
 
 /// Whether an `error:` row's reason is a refusal (atpkg declining bytes or a document it
+/// could not trust) as its writers spell one at the head of the reason: the vendor lane's
+/// `<program> [<version>] refused: <why>` (recorded by `record_vendor_status`), the flow's
+/// `manifest refused: `, `artifact row refused: ` and `the signed row for <program> was
+/// refused: `, and a stage's `stage: signer refused: `.
 fn is_refusal(reason: &str) -> bool {
     const HEADS: [&str; 3] = [
         "manifest refused: ",
@@ -535,6 +539,8 @@ mod tests {
     use super::*;
 
     /// The first `; ` of a held row is the seam between the failure and the retry, even
+    /// when the failure's own words carry one (a signer's free text): the pending stub
+    /// splits there, and a seam inside the failure would print half of it as the retry.
     #[test]
     fn a_held_rows_first_seam_is_between_the_failure_and_the_retry() {
         let how = "retried when the pin changes; now: aterm pkg install claude";
@@ -556,6 +562,7 @@ mod tests {
     }
 
     /// A row's source and why it is not current are read off the canonical spellings, so the
+    /// package log, the Activity list and the program rows say what `doctor` says.
     #[test]
     fn a_rows_source_and_why_it_is_not_current_come_from_its_canonical_words() {
         assert_eq!(
@@ -684,6 +691,7 @@ mod tests {
     }
 
     /// A vendor build's SHADOWED rows name its version, never its 19-digit store id, and
+    /// the machine-wide one reads back as that id.
     #[test]
     fn a_vendor_shadow_row_names_the_version_and_reads_back_the_build() {
         let build = crate::vendor_direct::Version::parse("2.1.280")
@@ -719,6 +727,7 @@ mod tests {
     }
 
     /// The agent programs' shell-local shadow row (2026-09-16) is a managed row, and NOT a
+    /// `SHADOWED by` row to the parser, because it is one shell's state, not the machine's.
     #[test]
     fn the_agent_shadow_row_is_never_the_machine_state() {
         let agents = Path::new("/Users//dev/Library/Application Support/aterm/pkg/agents");
@@ -784,6 +793,8 @@ mod tests {
     }
 
     /// Doctor prefix-matches its faults (`error:`, `unavailable:`, `blocked:`, `aborted:`,
+    /// `tombstoned:`); no canonical spelling may start with one, or a normal row would read
+    /// as a problem.
     #[test]
     fn no_canonical_state_reads_as_a_doctor_fault() {
         for s in [

@@ -1,20 +1,13 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
 //! Keyboard mode derivation from terminal state.
-//!
-//! Provides a bridge-agnostic conversion from `Terminal` accessors
-//! (`TerminalModes`, `KittyKeyboardFlags`, `XtermKeyboardState`) into
-//! `aterm_types::keyboard::KeyboardMode`.
 
 use aterm_types::keyboard::KeyboardMode;
 
 use super::{KittyKeyboardFlags, Terminal, TerminalModes, XtermKeyboardState};
 
-/// Derive `KeyboardMode` from terminal modes, Kitty flags and xterm state:
-/// `aterm_types::keyboard::TermMode::from_keyboard_state` (the single source of
-/// the keyboard projection) plus the legacy-encoding modes it does not cover.
+/// Derive `KeyboardMode` from terminal modes, Kitty flags and xterm state.
 #[inline]
 #[must_use]
 pub(crate) fn keyboard_mode_from_state(
@@ -30,15 +23,9 @@ pub(crate) fn keyboard_mode_from_state(
         xterm,
     )
     .to_keyboard_mode();
-    // DECBKM (mode 67) is outside the TermMode projection.
     if modes.backarrow_sends_bs {
         km.insert(KeyboardMode::BACKARROW_SENDS_BS);
     }
-    // xterm private modes 1035/1036/1039, modeled so the empty mode keeps the
-    // default encoding:
-    //   - 1039 altSendsEscape: negative flag, reset suppresses the Alt ESC.
-    //   - 1036 metaSendsEscape: positive flag, set adds the Meta ESC.
-    //   - 1035 numLock: negative flag, reset strips the NumLock modifier.
     if !modes.alt_send_escape {
         km.insert(KeyboardMode::ALT_NO_ESC);
     }
@@ -48,15 +35,8 @@ pub(crate) fn keyboard_mode_from_state(
     if !modes.special_modifiers {
         km.insert(KeyboardMode::NO_SPECIAL_MODIFIERS);
     }
-    // ConPTY win32-input-mode (DEC 9001), only where the host says a console
-    // host is there (`win32_input_active`). Never in the kitty flag word and not
-    // gated on `kitty_keyboard_enabled`: conhost asked for it and reads the
-    // bytes, so in the encoder it outranks a kitty push (see
-    // `KeyboardMode::WIN32_INPUT`).
     if modes.win32_input_active() {
         km.insert(KeyboardMode::WIN32_INPUT);
-        // Which host asked: OpenConsole reads KP_Begin and F13-F20 from records
-        // where conhost keeps their legacy bytes (`KeyboardMode::OPENCONSOLE_HOST`).
         if modes.win32_input_openconsole {
             km.insert(KeyboardMode::OPENCONSOLE_HOST);
         }
@@ -64,16 +44,7 @@ pub(crate) fn keyboard_mode_from_state(
     km
 }
 
-/// The xterm modifyOtherKeys / formatOtherKeys state (XTMODKEYS / XTFMTKEYS) a
-/// session offers: `xterm` itself, or the defaults behind a Windows console
-/// host ([`TerminalModes::win32_input_enabled`]). conhost reads the key bytes
-/// and has no `CSI 27 ; m ; c ~` or `CSI c ; m u` dialect, so under a native
-/// console program's `CSI > 4 ; 2 m` every Ctrl, Alt and Shift character chord
-/// reached it as nothing (measured 2026-10-18 under OpenConsole and the inbox
-/// conhost: PSReadLine lost Shift+A, Ctrl+A/E/K and Alt+B, and the level
-/// outlived the program). There the family is refused as the kitty protocol is:
-/// setters are ignored, a query reads level 0, and a level negotiated before
-/// the host said so stops reaching the encoder.
+/// The xterm modifyOtherKeys / formatOtherKeys state (XTMODKEYS / XTFMTKEYS) a session offers.
 #[inline]
 pub(crate) const fn offered_xterm_keyboard(
     modes: &TerminalModes,
@@ -88,15 +59,9 @@ pub(crate) const fn offered_xterm_keyboard(
 
 impl Terminal {
     /// Get the keyboard encoding mode flags for this terminal.
-    ///
-    /// Returns a bridge-agnostic `KeyboardMode` that can be passed directly
-    /// to `aterm_types::keyboard::encode_key*` functions.
     #[inline]
     #[must_use]
     pub fn keyboard_mode(&self) -> KeyboardMode {
-        // Capability off ⇒ derive as if the protocol is unsupported: no kitty
-        // bits even if flags were negotiated before the host disabled it. The
-        // xterm modifier family goes the same way behind a console host.
         let kitty = if self.modes().kitty_keyboard_enabled {
             self.kitty_keyboard_flags()
         } else {
@@ -106,10 +71,7 @@ impl Terminal {
         keyboard_mode_from_state(self.modes(), kitty, xterm)
     }
 
-    /// Whether the kitty keyboard protocol's `REPORT_ALL_KEYS_AS_ESC` (0b1000)
-    /// enhancement is active: every key reaches the application as a CSI-u
-    /// report, so it never receives echoing text. A narrow read-only projection
-    /// of [`Self::keyboard_mode`], with the same capability-off gating.
+    /// Whether the kitty keyboard protocol's `REPORT_ALL_KEYS_AS_ESC` (0b1000) enhancement is active.
     #[inline]
     #[must_use]
     pub fn kitty_report_all_keys(&self) -> bool {
@@ -117,15 +79,7 @@ impl Terminal {
             .contains(KeyboardMode::REPORT_ALL_KEYS_AS_ESC)
     }
 
-    /// Whether the active Kitty keyboard mode reports functional keys that have
-    /// no legacy escape form (the Menu key `57363`, F13-F35, the media cluster).
-    /// Legacy modes encode them to zero bytes; only `DISAMBIGUATE_ESC_CODES` and
-    /// `REPORT_ALL_KEYS_AS_ESC` route a bare `Key::Named` press through the CSI-u
-    /// encoder (`should_encode_kitty_event`).
-    ///
-    /// For chrome deference: a host gesture must not claim a key the front
-    /// application negotiated for, and may take one nobody receives. A read-only
-    /// projection of [`Self::keyboard_mode`]; it never feeds an encoder.
+    /// Whether the active Kitty keyboard mode reports functional keys that have no legacy escape form (the Menu key `57363`, F13-F35, the media cluster).
     #[inline]
     #[must_use]
     pub fn kitty_reports_functional_keys(&self) -> bool {
@@ -133,17 +87,7 @@ impl Terminal {
             .intersects(KeyboardMode::DISAMBIGUATE_ESC_CODES | KeyboardMode::REPORT_ALL_KEYS_AS_ESC)
     }
 
-    /// Whether the active keyboard mode sends a control chord (Ctrl plus a
-    /// letter, which the legacy encoder sends as its C0 byte: Ctrl-A is `SOH`)
-    /// as an escape sequence instead: a Kitty mode that reports functional keys
-    /// (`CSI 97;5u`) or xterm's modifyOtherKeys at level 2 (`CSI 27;5;97~`).
-    /// Level 1 leaves an unambiguous chord as its byte.
-    ///
-    /// For the typing predictor: Ctrl-A and Ctrl-E are line-edge keys only as
-    /// `SOH` and `ENQ`, and a line editor that cannot decode the escaped form
-    /// beeps or inserts it (`aterm_predict::KeySample::escaped_chords`,
-    /// R-KITTY). A read-only projection of [`Self::keyboard_mode`], bound to
-    /// the encoder by its test; it never feeds an encoder.
+    /// Whether the active keyboard mode sends Ctrl-letter chords as escape sequences rather than C0 bytes.
     #[inline]
     #[must_use]
     pub fn control_chords_escaped(&self) -> bool {
@@ -152,12 +96,7 @@ impl Terminal {
             || mode.xterm_modify_other_keys_level() >= 2
     }
 
-    /// Whether the active Kitty keyboard mode makes predictive local echo unsafe:
-    /// `REPORT_ALL_KEYS_AS_ESC` routes even plain text through CSI-u, and
-    /// `REPORT_EVENT_TYPES` marks an application-owned composer (Codex on the
-    /// main screen repaints its own input line, so guesses would duplicate its
-    /// text until the predictor timeout). A narrow read-only projection for
-    /// display-side callers.
+    /// Whether the active Kitty keyboard mode makes predictive local echo unsafe.
     #[inline]
     #[must_use]
     pub fn kitty_suppresses_predictive_echo(&self) -> bool {
@@ -168,8 +107,7 @@ impl Terminal {
 
 #[cfg(test)]
 mod shift_enter_e2e_tests {
-    //! Shift+Enter end to end: drive the negotiation an app performs, then check
-    //! the derived `KeyboardMode` and the bytes the encoder emits.
+    //! Shift+Enter end to end.
     use crate::terminal::Terminal;
     use aterm_types::keyboard::{
         Key, KeyEventType, KeyboardMode, Modifiers, NamedKey, encode_key_with_layout,
@@ -188,10 +126,6 @@ mod shift_enter_e2e_tests {
     #[test]
     fn legacy_shift_enter_is_lf_aterm_imposes_newline() {
         let term = Terminal::new(24, 80);
-        // aterm's input policy forces a usable Shift+Enter even with no protocol and
-        // no faked identity: plain Enter is CR, Shift+Enter is LF (0x0a) — Claude /
-        // readline / vim read LF as insert-newline. Ctrl+Enter stays CR; Alt+Enter is
-        // Meta-Enter (ESC CR).
         assert_eq!(enc_enter(&term, Modifiers::empty()), vec![0x0d]);
         assert_eq!(enc_enter(&term, Modifiers::SHIFT), vec![0x0a]);
         assert_eq!(enc_enter(&term, Modifiers::CTRL), vec![0x0d]);
@@ -201,21 +135,18 @@ mod shift_enter_e2e_tests {
     #[test]
     fn push_disambiguate_then_shift_enter_is_csi_u() {
         let mut term = Terminal::new(24, 80);
-        // Exactly what a kitty-aware app sends to turn on the protocol.
         term.process(b"\x1b[>1u");
         assert!(
             term.keyboard_mode()
                 .contains(KeyboardMode::DISAMBIGUATE_ESC_CODES),
             "push must enable disambiguate in the derived keyboard mode"
         );
-        // Plain Enter still legacy CR; Shift+Enter becomes a distinct CSI-u report.
         assert_eq!(enc_enter(&term, Modifiers::empty()), vec![0x0d]);
         assert_eq!(
             enc_enter(&term, Modifiers::SHIFT),
             b"\x1b[13;2u",
             "Shift+Enter under disambiguate must be ESC[13;2u — what Claude reads as a newline"
         );
-        // And the query now reports the active flag.
         term.process(b"\x1b[?u");
         assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?1u");
     }
@@ -223,8 +154,6 @@ mod shift_enter_e2e_tests {
     #[test]
     fn codex_report_event_types_suppresses_predictive_echo() {
         let mut term = Terminal::new(24, 80);
-        // Codex's observed main-screen composer mode: disambiguate + event types +
-        // alternate keys, but notably not REPORT_ALL_KEYS_AS_ESC.
         term.process(b"\x1b[>7u");
         let mode = term.keyboard_mode();
         assert!(mode.contains(KeyboardMode::REPORT_EVENT_TYPES));
@@ -234,16 +163,13 @@ mod shift_enter_e2e_tests {
             "an app-owned Codex composer must never receive terminal ghost glyphs"
         );
 
-        // Disambiguation alone is also used by line-echoing shells and must remain
-        // eligible for conservative Adaptive prediction.
         term.process(b"\x1b[=1u");
         assert!(!term.kitty_suppresses_predictive_echo());
     }
 
     /// `kitty_reports_functional_keys` is true in exactly the modes where a key
     /// with no legacy form (the Menu key, `57363`) reaches the app, else host
-    /// chrome steals a negotiated key or refuses one nobody receives. Pinned
-    /// against the encoder, not a re-read of the flags.
+    /// chrome steals a negotiated key or refuses one nobody receives.
     #[test]
     fn functional_key_reporting_tracks_what_the_encoder_actually_emits() {
         let menu = |term: &Terminal| {
@@ -255,7 +181,6 @@ mod shift_enter_e2e_tests {
                 None,
             )
         };
-        // Baseline: no negotiation ⇒ the Menu key encodes to nothing at all.
         let term = Terminal::new(24, 80);
         assert!(!term.kitty_reports_functional_keys());
         assert!(
@@ -263,7 +188,6 @@ mod shift_enter_e2e_tests {
             "legacy has no sequence for the Menu key"
         );
 
-        // Disambiguate (`CSI > 1 u`) is the weakest flag that turns it on.
         let mut term = Terminal::new(24, 80);
         term.process(b"\x1b[>1u");
         assert!(term.kitty_reports_functional_keys());
@@ -273,14 +197,11 @@ mod shift_enter_e2e_tests {
             "…and the app really does receive 57363"
         );
 
-        // Report-all is the strongest and also reports it.
         let mut term = Terminal::new(24, 80);
         term.process(b"\x1b[>8u");
         assert!(term.kitty_reports_functional_keys());
         assert!(term.kitty_report_all_keys());
 
-        // Event types alone (`CSI > 2 u`) do not: a bare press still takes the
-        // legacy path, so the app never sees the key and chrome may claim it.
         let mut term = Terminal::new(24, 80);
         term.process(b"\x1b[>2u");
         assert!(!term.kitty_reports_functional_keys());
@@ -293,7 +214,7 @@ mod shift_enter_e2e_tests {
     #[test]
     fn modify_other_keys_level2_distinguishes_shift_enter() {
         let mut term = Terminal::new(24, 80);
-        term.process(b"\x1b[>4;2m"); // xterm modifyOtherKeys level 2
+        term.process(b"\x1b[>4;2m");
         assert_eq!(
             enc_enter(&term, Modifiers::SHIFT),
             b"\x1b[27;2;13~",
@@ -303,8 +224,6 @@ mod shift_enter_e2e_tests {
 
     #[test]
     fn push_flags_over_255_are_masked_not_saturated() {
-        // kitty computes `val & 0x7f`: `CSI > 256 u` means flags 0, never
-        // "saturate to 255 and enable every enhancement".
         let mut term = Terminal::new(24, 80);
         term.process(b"\x1b[>256u");
         term.process(b"\x1b[?u");
@@ -313,8 +232,7 @@ mod shift_enter_e2e_tests {
             b"\x1b[?0u",
             "undefined high bits must be masked out of the pushed flags"
         );
-        // Same rule for CSI = flags u.
-        term.process(b"\x1b[=257;1u"); // 257 & 0b1_1111 = 1
+        term.process(b"\x1b[=257;1u");
         term.process(b"\x1b[?u");
         assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?1u");
     }
@@ -322,20 +240,16 @@ mod shift_enter_e2e_tests {
     #[test]
     fn decstr_resets_only_the_current_screens_kitty_state() {
         let mut term = Terminal::new(24, 80);
-        // Negotiate on the main screen, then enter the alt screen (which has
-        // its own flags/stack per the spec) and soft-reset there.
         term.process(b"\x1b[>1u");
-        term.process(b"\x1b[?1049h"); // enter alt screen
-        term.process(b"\x1b[>2u"); // alt-screen flags
-        term.process(b"\x1b[!p"); // DECSTR
+        term.process(b"\x1b[?1049h");
+        term.process(b"\x1b[>2u");
+        term.process(b"\x1b[!p");
         term.process(b"\x1b[?u");
         assert_eq!(
             term.take_response().unwrap_or_default(),
             b"\x1b[?0u",
             "DECSTR must clear the ACTIVE screen's kitty flags"
         );
-        // Leaving the alt screen must restore the main screen's negotiation —
-        // the soft reset happened on the alternate screen only.
         term.process(b"\x1b[?1049l");
         term.process(b"\x1b[?u");
         assert_eq!(
@@ -344,11 +258,6 @@ mod shift_enter_e2e_tests {
             "the inactive (main) screen's kitty state must survive an alt-screen DECSTR"
         );
     }
-
-    // ConPTY win32-input-mode (DEC 9001). conhost sends `CSI ? 9001 h` at every
-    // ConPTY start; without it a legacy Shift+Enter LF reaches PSReadLine as
-    // Ctrl+Enter (InsertLineAbove), and Ctrl+Enter is indistinguishable from
-    // Enter. These walk the negotiation and pin the bytes conhost receives.
 
     /// A session behind a console host: the posture aterm-gui applies to a
     /// ConPTY session (`spawn::apply_pty_keyboard_posture`).
@@ -374,23 +283,16 @@ mod shift_enter_e2e_tests {
             !mode.intersects(KeyboardMode::KITTY_PROTOCOL_FLAGS),
             "9001 must not masquerade as a kitty negotiation"
         );
-        // …and the lock-free word the GUI's input seam actually encodes from
-        // carries it too (published at the end of the `process()` batch).
         assert!(
             term.mode_mirror()
                 .keyboard_mode()
                 .contains(KeyboardMode::WIN32_INPUT)
         );
 
-        // Shift+Enter: SHIFT_PRESSED, UnicodeChar CR, the record a physical
-        // Shift+Enter carries under Windows Terminal (`ReadKey` → Enter+Shift
-        // CHAR=13, PSReadLine → AddLine), not aterm's Unix Shift+Enter LF policy.
         assert_eq!(
             enc_enter(&term, Modifiers::SHIFT),
             win32_enter_pair(13, 0x10)
         );
-        // Ctrl+Enter / Ctrl+Shift+Enter: LEFT_CTRL_PRESSED, UnicodeChar LF —
-        // Windows' own translation of a native Ctrl+Enter, Shift or not.
         assert_eq!(
             enc_enter(&term, Modifiers::CTRL),
             win32_enter_pair(10, 0x08)
@@ -399,12 +301,9 @@ mod shift_enter_e2e_tests {
             enc_enter(&term, Modifiers::CTRL | Modifiers::SHIFT),
             win32_enter_pair(10, 0x18)
         );
-        // Plain Enter stays CR and Alt+Enter stays Meta-Enter: both work through
-        // conhost's legacy translation.
         assert_eq!(enc_enter(&term, Modifiers::empty()), vec![0x0d]);
         assert_eq!(enc_enter(&term, Modifiers::ALT), vec![0x1b, 0x0d]);
 
-        // DECRST 9001 restores the legacy policy byte for byte.
         term.process(b"\x1b[?9001l");
         assert!(!term.keyboard_mode().contains(KeyboardMode::WIN32_INPUT));
         assert_eq!(enc_enter(&term, Modifiers::SHIFT), vec![0x0a]);
@@ -413,9 +312,6 @@ mod shift_enter_e2e_tests {
 
     #[test]
     fn conpty_9001_release_of_an_enter_chord_emits_no_second_key_up() {
-        // The pair already carries its key-up; the GUI's Release event for the
-        // same chord must therefore encode to nothing (the seam treats an empty
-        // encoding as a faithful no-op).
         let mut term = conpty_term();
         term.process(b"\x1b[?9001h");
         for mods in [
@@ -441,16 +337,12 @@ mod shift_enter_e2e_tests {
     fn conpty_9001_never_leaks_into_the_kitty_query_or_the_kitty_stack() {
         let mut term = conpty_term();
         term.process(b"\x1b[?9001h");
-        // The progressive-enhancement query still says "nothing negotiated".
         term.process(b"\x1b[?u");
         assert_eq!(
             term.take_response().unwrap_or_default(),
             b"\x1b[?0u",
             "9001 is a host negotiation, not a kitty flag: the app must read ?0u"
         );
-        // An app that then pushes kitty flags (conhost forwards the push) gets
-        // its flags, but conhost is still the reader and drops a `CSI 13;2 u`
-        // written back, so the chord stays a record; plain Enter is untouched.
         term.process(b"\x1b[>1u");
         term.process(b"\x1b[?u");
         assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?1u");
@@ -463,8 +355,6 @@ mod shift_enter_e2e_tests {
             win32_enter_pair(13, 0x10)
         );
         assert_eq!(enc_enter(&term, Modifiers::empty()), vec![0x0d]);
-        // Pop the app's flags: 9001 is still set — the pop never touched it,
-        // because it never held it — and the record is unchanged.
         term.process(b"\x1b[<u");
         term.process(b"\x1b[?u");
         assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?0u");
@@ -495,10 +385,6 @@ mod shift_enter_e2e_tests {
 
     #[test]
     fn conpty_9001_sends_escape_as_a_record_so_it_survives_the_first_chord() {
-        // conhost stops flushing a lone ESC once it has read one win32 record
-        // (aterm's first Shift+Enter), after which Escape never reaches
-        // `ReadKey` in that tab. Walk the negotiation and pin the bytes conhost
-        // receives, through the lock-free word the GUI seam encodes from.
         let key = |term: &Terminal, key: Key, mods: Modifiers| {
             encode_key_with_layout(
                 &key,
@@ -515,7 +401,6 @@ mod shift_enter_e2e_tests {
             key(&term, esc(), Modifiers::empty()),
             b"\x1b[27;1;27;1;0;1_\x1b[27;1;27;0;0;1_"
         );
-        // Ctrl+[ and Alt+[ dangle the same way and go the same way.
         assert_eq!(
             key(&term, Key::Character('['), Modifiers::CTRL),
             b"\x1b[219;26;27;1;8;1_\x1b[219;26;27;0;8;1_"
@@ -524,20 +409,14 @@ mod shift_enter_e2e_tests {
             key(&term, Key::Character('['), Modifiers::ALT),
             b"\x1b[219;26;91;1;2;1_\x1b[219;26;91;0;2;1_"
         );
-        // Alt+a still reads as Alt+A after the switch: legacy bytes.
         assert_eq!(key(&term, Key::Character('a'), Modifiers::ALT), b"\x1ba");
-        // DECRST 9001 restores the legacy ESC byte for byte.
         term.process(b"\x1b[?9001l");
         assert_eq!(key(&term, esc(), Modifiers::empty()), b"\x1b");
         assert_eq!(key(&term, Key::Character('['), Modifiers::ALT), b"\x1b[");
     }
 
     /// DEC 9001 is a negotiation with a Windows console host, and only a
-    /// session a host put behind ConPTY has one. Anywhere else the request is
-    /// program output (`cat` of a file holding `ESC [ ? 9001 h`), and it must
-    /// change nothing: Escape, Ctrl+[ and the Enter chords keep their own
-    /// bytes for whatever reads the tab next, and DECRQM answers as a terminal
-    /// without the mode.
+    /// session a host put behind ConPTY has one.
     #[test]
     fn program_output_cannot_turn_on_win32_records_without_a_console_host() {
         let key = |term: &Terminal, key: Key, mods: Modifiers| {
@@ -570,9 +449,7 @@ mod shift_enter_e2e_tests {
     }
 
     /// The console-host posture is a function of the resize seam policy, both
-    /// ways. Under `ConPty` conhost's 9001 takes and `CSI ? u` goes unanswered.
-    /// Under `Native` the reverse holds even for an engine restored from a
-    /// ConPTY checkpoint that carried the capability and the live mode.
+    /// ways.
     #[test]
     fn the_console_host_posture_follows_the_resize_policy_both_ways() {
         use crate::grid::ResizePolicy;
@@ -636,7 +513,6 @@ mod shift_enter_e2e_tests {
         term.set_win32_input_openconsole(false);
         assert_eq!(oc(&term), (false, false));
         assert!(term.keyboard_mode().contains(KeyboardMode::WIN32_INPUT));
-        // Without a console host the bit is inert.
         let mut native = Terminal::new(24, 80);
         native.set_win32_input_openconsole(true);
         native.process(b"\x1b[?9001h");
@@ -649,8 +525,7 @@ mod kitty_capability_toggle_tests {
     //! `set_kitty_keyboard_enabled(false)` must make the terminal behave as if
     //! the kitty protocol is unsupported (the ConPTY embedder posture): no
     //! `CSI ? u` reply, push/set/pop consumed-and-ignored, no kitty bits in the
-    //! derived keyboard mode, legacy key encoding throughout. Default-on
-    //! behavior is locked by `shift_enter_e2e_tests` above.
+    //! derived keyboard mode, legacy key encoding throughout.
     use super::shift_enter_e2e_tests::enc_enter;
     use crate::terminal::Terminal;
     use aterm_types::keyboard::{KeyboardMode, Modifiers};
@@ -678,7 +553,6 @@ mod kitty_capability_toggle_tests {
     fn disabled_negotiation_is_consumed_and_ignored() {
         let mut term = Terminal::new(24, 80);
         term.set_kitty_keyboard_enabled(false);
-        // Push, set, then pop — the full negotiation an app might attempt.
         term.process(b"\x1b[>1u");
         term.process(b"\x1b[=31;1u");
         term.process(b"\x1b[<u");
@@ -691,18 +565,14 @@ mod kitty_capability_toggle_tests {
             !term.keyboard_mode().intersects(KITTY_BITS),
             "keyboard_mode must carry no kitty bits while disabled"
         );
-        // Nothing was forwarded to the grid as text: the sequences are consumed
-        // like any unrecognized CSI (cursor still at origin, row empty).
         let cursor = term.cursor();
         assert_eq!((cursor.row, cursor.col), (0, 0), "sequence leaked to grid");
-        // Encoding stays legacy: Shift+Enter is aterm's LF policy, not CSI-u.
         assert_eq!(enc_enter(&term, Modifiers::empty()), vec![0x0d]);
         assert_eq!(
             enc_enter(&term, Modifiers::SHIFT),
             vec![0x0a],
             "negotiation attempted while disabled must leave encoding legacy"
         );
-        // And the query still gets no reply afterwards.
         term.process(b"\x1b[?u");
         assert_eq!(term.take_response(), None);
     }
@@ -710,7 +580,7 @@ mod kitty_capability_toggle_tests {
     #[test]
     fn disabling_after_negotiation_drops_kitty_bits_and_reenabling_restores() {
         let mut term = Terminal::new(24, 80);
-        term.process(b"\x1b[>1u"); // negotiated while supported
+        term.process(b"\x1b[>1u");
         assert!(
             term.keyboard_mode()
                 .contains(KeyboardMode::DISAMBIGUATE_ESC_CODES)
@@ -721,7 +591,6 @@ mod kitty_capability_toggle_tests {
             "already-negotiated flags must stop reaching keyboard_mode once disabled"
         );
         assert_eq!(enc_enter(&term, Modifiers::SHIFT), vec![0x0a]);
-        // The toggle gates capability, it does not destroy negotiated state.
         term.set_kitty_keyboard_enabled(true);
         assert_eq!(enc_enter(&term, Modifiers::SHIFT), b"\x1b[13;2u");
     }
@@ -730,7 +599,7 @@ mod kitty_capability_toggle_tests {
     fn disabled_survives_ris() {
         let mut term = Terminal::new(24, 80);
         term.set_kitty_keyboard_enabled(false);
-        term.process(b"\x1bc"); // RIS: a program cannot re-enable the capability
+        term.process(b"\x1bc");
         assert!(!term.is_kitty_keyboard_enabled());
         term.process(b"\x1b[?u");
         assert_eq!(term.take_response(), None);
@@ -744,7 +613,7 @@ mod console_host_modify_other_keys_tests {
     //! and conhost, which reads the key bytes, has no reader for the
     //! `CSI 27 ; m ; c ~` chords it would ask for: PSReadLine got nothing for
     //! Shift+A, Ctrl+A/E/K or Alt+B until the level was reset (measured
-    //! 2026-10-18). The session refuses the family as it refuses kitty's.
+    //! 2026-10-18).
     use crate::grid::ResizePolicy;
     use crate::terminal::Terminal;
     use crate::terminal::program_evidence;
@@ -787,7 +656,6 @@ mod console_host_modify_other_keys_tests {
     fn session(policy: ResizePolicy) -> Terminal {
         let mut term = Terminal::new(24, 80);
         term.set_console_host_posture(policy);
-        // conhost's own request at every ConPTY start; ignored elsewhere.
         term.process(b"\x1b[?9001h");
         term
     }
@@ -803,7 +671,6 @@ mod console_host_modify_other_keys_tests {
         assert_eq!(untouched[0], [0x01], "control: legacy Ctrl+A is ^A");
         assert_eq!(untouched[3], b"A", "control: legacy Shift+A is A");
 
-        // Control: off a console host the request takes, and the chords change.
         let mut native = session(ResizePolicy::Native);
         native.process(b"\x1b[>4;2m");
         assert_eq!(mok_query(&mut native), b"\x1b[>4;2m");
@@ -823,8 +690,6 @@ mod console_host_modify_other_keys_tests {
             0,
             "`ctl modes` reads the level the encoder uses"
         );
-        // Refused, so neither evidence of a program holding the terminal nor
-        // anything for a handback to undo.
         assert_eq!(
             term.take_evidence_asserted()
                 & (program_evidence::MODIFY_OTHER_KEYS | program_evidence::FORMAT_OTHER_KEYS),
@@ -842,7 +707,6 @@ mod console_host_modify_other_keys_tests {
         term.process(b"\x1b[?9001h");
         assert_eq!(chords(&term), chords(&session(ResizePolicy::ConPty)));
         assert_eq!(mok_query(&mut term), b"\x1b[>4;0m");
-        // The posture gates the capability; it does not destroy the negotiation.
         term.set_console_host_posture(ResizePolicy::Native);
         assert_eq!(chords(&term), negotiated);
     }
@@ -850,9 +714,7 @@ mod console_host_modify_other_keys_tests {
 
 #[cfg(test)]
 mod control_chord_tests {
-    //! `control_chords_escaped` is the encoder's own answer: for every mode a
-    //! program can negotiate, Ctrl-A and Ctrl-E encode as `SOH` and `ENQ`
-    //! exactly when it is false.
+    //! `control_chords_escaped` is the encoder's own answer.
     use crate::terminal::Terminal;
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers, encode_key_with_layout};
 
@@ -869,9 +731,7 @@ mod control_chord_tests {
 
     /// The legacy encoder, Kitty's two modes that report functional keys, its
     /// modes that do not, and modifyOtherKeys at each level: escaped exactly
-    /// where the encoder escapes (`CSI 97;5u`, `CSI 27;5;97~`). NEGATIVE
-    /// CONTROLS: Kitty's REPORT_EVENT_TYPES alone and modifyOtherKeys level 1
-    /// leave the chord its byte, and read false.
+    /// where the encoder escapes (`CSI 97;5u`, `CSI 27;5;97~`).
     #[test]
     fn control_chords_escaped_is_what_the_encoder_sends() {
         let negotiations: [(&str, &[u8], bool); 7] = [

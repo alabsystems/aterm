@@ -601,6 +601,14 @@ pub trait System: Sync {
         None
     }
 
+    /// The app bundle this process runs from (`/Users//bob/Applications/aterm.app`),
+    /// canonical, or `None` outside a bundle or when it cannot be read: which copy of aterm
+    /// is this account's when there are two. [`Live`] reads its executable's path; the
+    /// test arm answers what the test set; the default `None`.
+    fn running_app(&self) -> Option<PathBuf> {
+        None
+    }
+
     /// Open the converge journal for the account this system acts as.
     fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + '_>, String> {
         Err("this system keeps no converge journal".into())
@@ -1364,6 +1372,13 @@ impl System for Live {
         self.full_disk_access
     }
 
+    fn running_app(&self) -> Option<PathBuf> {
+        let exe = self.canonicalize(&self.agent_exe).ok()?;
+        exe.ancestors()
+            .find(|dir| dir.extension().is_some_and(|ext| ext == "app"))
+            .map(Path::to_path_buf)
+    }
+
     fn own_uuid(&self) -> Option<String> {
         let ran = self
             .run(&Cmd::new("/usr/sbin/ioreg").args(["-rd1", "-c", "IOPlatformExpertDevice"]))
@@ -1542,6 +1557,8 @@ mod fake {
         /// What [`System::full_disk_access`] answers: `None`, not measured, unless a test
         /// grants it.
         pub full_disk_access: Option<bool>,
+        /// What [`System::running_app`] answers: `None` unless a test names a bundle.
+        pub running_app: Option<PathBuf>,
     }
 
     #[derive(Clone)]
@@ -2184,6 +2201,10 @@ mod fake {
 
         fn full_disk_access(&self) -> Option<bool> {
             self.full_disk_access
+        }
+
+        fn running_app(&self) -> Option<PathBuf> {
+            self.running_app.clone()
         }
 
         fn run_tty(&self, cmd: &Cmd) -> Result<Option<i32>, RunFailed> {

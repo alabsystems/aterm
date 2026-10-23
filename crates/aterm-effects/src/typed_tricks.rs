@@ -12,6 +12,7 @@ use aterm_time::{Duration, Instant};
 pub const PHRASE_GAP: Duration = Duration::from_millis(1500);
 
 /// The token window, in characters: exactly the longest surface the
+/// vocabulary can hold, so a token that overflows it could never have matched.
 const TOKEN_CHARS: usize = TrickLexicon::MAX_SURFACE_CHARS;
 
 /// Bytes behind one inline word: every character is at most four.
@@ -20,9 +21,11 @@ const WORD_BYTES: usize = TOKEN_CHARS * 4;
 const _: () = assert!(WORD_BYTES <= u8::MAX as usize);
 
 /// Characters of the delimiter run left of the caret that are remembered, so
+/// Backspace inside the run knows what it ends with.
 const GAP_WINDOW: usize = 8;
 
 /// Dirty sessions remembered across switches (least recently left is
+/// forgotten first, and a forgotten session reads as new).
 const SESSION_MEMORY: usize = 8;
 
 /// What the listener heard; at most one per fed press.
@@ -118,7 +121,7 @@ impl TrickFeed<'_> {
     };
 }
 
-/// A word held inline: at most [`TOKEN_CHARS`] characters, no heap. `Copy`, so
+/// A word held inline: at most [`TOKEN_CHARS`] characters, no heap.
 #[derive(Clone, Copy)]
 struct Word {
     bytes: [u8; WORD_BYTES],
@@ -132,6 +135,7 @@ impl Word {
     };
 
     /// Only whole characters go in and out, so the prefix is valid UTF-8; the
+    /// checked conversion runs at boundaries only.
     #[inline]
     const fn as_str(&self) -> &str {
         let len = self.len as usize;
@@ -146,6 +150,7 @@ impl Word {
     }
 
     /// `false` (and nothing written) when the character does not fit — which
+    /// the caller's character count already rules out.
     #[inline]
     fn push(&mut self, c: char) -> bool {
         let start = usize::from(self.len);
@@ -194,10 +199,12 @@ enum Kind {
     /// Anything else: the line is code.
     Code,
     /// A control character or a zero-width scalar outside a word (ZWJ, a
+    /// variation selector, a newline inside a commit).
     Alien,
 }
 
 /// Uses the lexicon's own predicates, so a typed line segments exactly as the
+/// vocabulary was segmented at load.
 #[inline]
 fn kind_of(c: char) -> Kind {
     if c == ' ' {
@@ -223,15 +230,19 @@ fn kind_of(c: char) -> Kind {
 }
 
 /// A character of a script written without spaces between words: the
+/// vocabulary's no-space set minus Hangul, which is in that set only to be
+/// looked up raw (Korean writes its spaces).
 #[inline]
 const fn is_unspaced_script(c: char) -> bool {
     is_no_space_script(c) && !matches!(c as u32, 0x1100..=0x11FF | 0xAC00..=0xD7AF)
 }
 
 /// The shortest name a glued run may hold: a lone ideograph is a syllable of
+/// prose far more often than a name (`猫爪` is a claw).
 const GLUED_NAME_CHARS: usize = 2;
 
 /// The glued reading of a token that is no vocabulary word (module docs): the
+/// trick it asks for and every cut that reads it so.
 fn glued(lexicon: &TrickLexicon, token: &str, scratch: &mut String) -> Option<(Trick, Cuts)> {
     let mut chars = 0usize;
     for c in token.chars() {
@@ -299,6 +310,7 @@ enum Verdict {
         cuts: Cuts,
         word_chars: u32,
         /// `line_chars` when the word's last character went in; characters typed
+        /// since are `line_chars - end_at`.
         end_at: u32,
         addressed: bool,
     },
@@ -308,6 +320,7 @@ enum Verdict {
 }
 
 /// The owned twin of [`TrickEvent`]: what one step produced, before the word
+/// is borrowed out.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Outcome {
     Fire {
@@ -322,6 +335,7 @@ enum Outcome {
 }
 
 /// Fold the outcomes of one press (an IME commit's characters; Enter's closing
+/// token and Enter) into the one event a press reports.
 #[inline]
 const fn fold(acc: Option<Outcome>, next: Option<Outcome>) -> Option<Outcome> {
     match (acc, next) {
@@ -340,7 +354,7 @@ const fn fold(acc: Option<Outcome>, next: Option<Outcome>) -> Option<Outcome> {
     }
 }
 
-/// [`TrickEvent::Fire::back_chars`]. `since_end`: characters typed after the
+/// [`TrickEvent::Fire::back_chars`].
 #[inline]
 const fn back_chars(since_end: u32, fed: u32, word_chars: u32) -> u16 {
     let distance = if fed <= since_end {
@@ -355,28 +369,31 @@ const fn back_chars(since_end: u32, fed: u32, word_chars: u32) -> u16 {
     }
 }
 
-/// Everything a line reset clears. `Copy`: the boundary snapshot is one of
+/// Everything a line reset clears.
 #[derive(Clone, Copy, Debug)]
 struct Line {
-    /// The open token, raw as typed. Holds the first [`TOKEN_CHARS`] characters;
+    /// The open token, raw as typed.
     token: Word,
     token_chars: u32,
     /// The delimiter run left of the open token (or of the caret), first
+    /// [`GAP_WINDOW`] characters; `gap_chars` counts all of it.
     gap: [char; GAP_WINDOW],
     gap_chars: u32,
     /// The last delimiter typed; `None` at the start of the line.
     left: Option<char>,
     /// Characters typed on this line while unpoisoned, as Backspace gives them
+    /// back (marks past the token window are uncounted; see `step`).
     line_chars: u32,
     /// Every token so far was pet vocabulary and no code has appeared.
     pure: bool,
-    /// The line holds something the listener did not see. Only a reset lifts
+    /// The line holds something the listener did not see.
     poisoned: bool,
     /// At least one vocabulary word has closed on this (pure) line.
     any_word: bool,
     /// The line has named the pet.
     vocative_seen: bool,
     /// An address word waiting for the pet to be named: the addressed fire
+    /// the name will deliver.
     held: Option<Verdict>,
     /// A verdict parked at a stop, waiting for the next open edge.
     tail: Option<Verdict>,
@@ -431,6 +448,7 @@ pub struct TrickListener {
     /// Where that word's command lies in it.
     cuts: Cuts,
     /// The vocabulary's fold buffer — the one heap allocation here, grown to
+    /// the longest token looked up and then reused.
     scratch: String,
 }
 
@@ -944,7 +962,7 @@ impl TrickListener {
         }
     }
 
-    /// Snapshot the line, then take the open token off it. The snapshot is the
+    /// Snapshot the line, then take the open token off it.
     #[inline]
     const fn end_token(&mut self) -> (Word, u32) {
         let token = (self.line.token, self.line.token_chars);
@@ -1160,7 +1178,7 @@ impl TrickListener {
         }
     }
 
-    /// The line is not pet talk. Nothing on it fires from here on, and a live
+    /// The line is not pet talk.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1221,6 +1239,7 @@ impl TrickListener {
     }
 
     /// Take one cluster off the open token, as an editor's Backspace does:
+    /// trailing zero-width scalars go with their base.
     #[inline]
     fn pop_cluster(&mut self) -> u32 {
         if self.line.token_chars as usize > TOKEN_CHARS {
@@ -1274,6 +1293,8 @@ mod tests {
     use super::*;
 
     /// A small hermetic vocabulary, so these tests pin the listener rather than
+    /// the shipped word lists (tests against shipped English say so in their
+    /// names).
     const VOCAB: &str = r#"
 [[trick]]
 id      = "sit"
@@ -1426,7 +1447,7 @@ words = ["请"]
 cjk   = true
 "#;
 
-    /// One keystroke of the rig's clock: a brisk typist. Five of them (a
+    /// One keystroke of the rig's clock: a brisk typist.
     const KEY_GAP: Duration = Duration::from_millis(80);
 
     /// What the rig saw, owned (an event borrows the listener).
@@ -1454,6 +1475,7 @@ cjk   = true
     }
 
     /// Logs the event, and a fire's command surfaces into `commands`: each a
+    /// non-empty prefix or suffix of the fired word, in every test.
     fn record(seen: &mut Vec<Seen>, commands: &mut Vec<Vec<String>>, feed: TrickFeed<'_>) {
         match feed.event {
             Some(TrickEvent::Fire {
@@ -1484,7 +1506,7 @@ cjk   = true
         }
     }
 
-    /// A listener, a vocabulary, an injected clock and a log. It hands over the
+    /// A listener, a vocabulary, an injected clock and a log.
     struct Rig {
         listener: TrickListener,
         lexicon: TrickLexicon,
@@ -1572,6 +1594,7 @@ cjk   = true
         }
 
         /// A typed script: `␣` is the Space key, `⏎` Enter, `⌫` Backspace,
+        /// anything else a typed character.
         fn run(&mut self, script: &str) -> &mut Rig {
             for c in script.chars() {
                 match c {
@@ -1595,6 +1618,7 @@ cjk   = true
         }
 
         /// The line's verdict as the pet would live it: some fire ended
+        /// final (addressed, confirmed, or tentative and never revoked).
         fn something_stuck(&self) -> bool {
             let mut stuck = false;
             let mut tentative = false;
@@ -2942,6 +2966,8 @@ cjk   = true
     }
 
     /// The owner's examples, each two-word phrase said once, and `good night
+    /// kitty` as one final sleep (never the praise), against the shipped
+    /// English word lists rather than the fixture vocabulary.
     #[test]
     fn the_shipped_english_answers_the_owners_examples() {
         let mut rig = Rig::shipped_english();
@@ -2976,6 +3002,7 @@ cjk   = true
     }
 
     /// Ordinary prose, shell and REPL lines, each typed character by character
+    /// and submitted.
     const ORDINARY_LINES: &[&str] = &[
         "roll back the last commit",
         "jump to line 40",
@@ -3072,7 +3099,7 @@ cjk   = true
         }
     }
 
-    /// The same lines against the shipped English. Which survive depends on the
+    /// The same lines against the shipped English.
     #[test]
     fn under_the_shipped_english_a_fire_is_final_only_on_an_all_vocabulary_prefix() {
         let shipped = TrickLexicon::shared_en();
@@ -3131,6 +3158,7 @@ cjk   = true
     }
 
     /// Letters that spell vocabulary, every kind of punctuation, no-space
+    /// scripts, zero-width marks, a four-byte letter and a fold that expands.
     const ALPHABET: &[char] = &[
         's', 'i', 't', 'k', 'y', 'g', 'o', 'd', 'n', 'a', 'p', 'l', 'u', 'm', 'j', 'S', 'T', ' ',
         ' ', ' ', ' ', '\u{3000}', '.', '!', '?', ',', '…', '。', '！', '、', ':', ';', '/', '-',
@@ -3200,6 +3228,7 @@ cjk   = true
     }
 
     /// A test-sized line editor that knows only text, so it can check what the
+    /// listener believes about the line.
     #[derive(Default)]
     struct Editor {
         line: Vec<char>,
@@ -3224,6 +3253,7 @@ cjk   = true
         }
 
         /// The line's words as a reader splits them: at whitespace and fullwidth
+        /// stops, each allowed trailing sentence punctuation.
         fn roles(&self, lexicon: &TrickLexicon) -> Vec<Option<TrickRole>> {
             let text: String = self.line.iter().collect();
             let mut scratch = String::new();
@@ -3246,6 +3276,7 @@ cjk   = true
         }
 
         /// The fired word stands where the event says it does — `back_chars`
+        /// left of the caret at the end of the line — as a whole word.
         fn assert_word_at(&self, word: &str, back_chars: u16) {
             let word: Vec<char> = word.chars().collect();
             let line = &self.line;
@@ -3259,6 +3290,7 @@ cjk   = true
         }
 
         /// The same for a word heard inside a commit: the caret stood before the
+        /// whole commit, so the word may lie on either side of it.
         fn assert_word_near(&self, caret: usize, word: &str, back_chars: u16) {
             let word: Vec<char> = word.chars().collect();
             assert!(!word.is_empty());
@@ -3282,7 +3314,7 @@ cjk   = true
         }
     }
 
-    /// One word as a reader takes it. A run that is no word reads as its
+    /// One word as a reader takes it.
     fn read(lexicon: &TrickLexicon, word: &str, scratch: &mut String) -> Option<TrickRole> {
         if let Some(role) = lexicon.classify(word, scratch) {
             return Some(role);
@@ -3315,6 +3347,7 @@ cjk   = true
     }
 
     /// The events of one closing press (a character, or Enter when
+    /// `closer = None`), judged against the line as it stood.
     fn judge(rig: &Rig, before: usize, editor: &Editor, closer: Option<char>, judging: bool) {
         let heard = &rig.seen[before..];
         if heard.iter().all(|seen| *seen == Seen::Revoke) {
@@ -3364,6 +3397,8 @@ cjk   = true
     }
 
     /// The event of an IME commit, judged against the text before it and the
+    /// commit: whatever it fired was licensed at a boundary inside it, with
+    /// only pet talk to its left.
     fn judge_commit(rig: &Rig, before: usize, editor: &Editor, commit: &[char], judging: bool) {
         let heard = &rig.seen[before..];
         if heard.iter().all(|seen| *seen == Seen::Revoke) {

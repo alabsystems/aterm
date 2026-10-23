@@ -2,59 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-// The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro
-// under them (crates/aterm-spec-anchor/anchor_rules.rs).
 #![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 
-//! # aterm-core
-//!
-//! Terminal emulation core.
-//!
-//! - [`terminal`]: the terminal emulation state machine
-//! - [`config`]: runtime configuration and hot-reload types
-//! - [`render`]: the engine-owned render snapshot a renderer consumes
-//! - [`search`]: trigram-indexed search (logic in `aterm-search`)
-//! - [`shell_integration`]: shell integration injection
-//! - [`bell`]: bell presentation state machines
-//! - [`fault`]: deterministic fault injection for fail-closed-path tests
-//! - [`grapheme`], [`grid`], [`selection`], [`scrollback`]: re-exports of the `aterm-grapheme`,
-//!   `aterm-grid`, `aterm-selection` and `aterm-scrollback` crates
-//!
-//! - **Derived models** (`ty_model!`) for key invariants: `crates/aterm-models-core`
-//!   (the alternate-screen round trip, `tests/conformance_altscreen.rs`)
-//! - **Fuzz-shaped tests** are modules of the `core_suite` integration binary
-//!   (`tests/fuzz_process_never_panics.rs`, `tests/fuzz_alt_screen.rs`).
-//!   The workspace's `cargo-fuzz` targets are `crates/aterm-font/fuzz`,
-//!   `crates/aterm-zstd/fuzz` and `crates/aterm-dbus/fuzz`.
-//!
-//! ## Components
-//!
-//! - [`terminal`] - Terminal emulation state machine
-//! - [`config`] - Terminal configuration and hot-reload types
-//! - [`render`] - The engine-owned render snapshot a renderer consumes
-//! - [`search`] - Trigram-indexed search (core logic in `aterm-search`)
-//! - [`shell_integration`] - Shell integration injection (zsh, bash, fish)
-//! - [`bell`] - Bell presentation state machines
-//! - [`fault`] - Deterministic fault injection for fail-closed-path testing
-//! - [`grapheme`], [`grid`], [`selection`], [`scrollback`] - re-exports of the
-//!   `aterm-grapheme`, `aterm-grid`, `aterm-selection` and `aterm-scrollback` crates
-//!
-//! Semantic state (perception, regions, highlighting) is not an engine
-//! primitive; consumers such as `aterm-observe` and `aterm-agent` read it over
-//! the engine.
-//!
-//! Internal: `parser` (`aterm-parser`), `domain` value types, `sixel` (decodes
-//! a sixel DCS into an inline image; DA1 advertises code 4) and `vt_level`.
+//! Terminal emulation core: VT state machine, render snapshots, search, and configuration.
 
 #![warn(missing_docs)]
 #![warn(clippy::pedantic)]
-// Test code is exempt from strict clippy; production code is held to all + pedantic.
 #![cfg_attr(test, allow(clippy::all, clippy::pedantic))]
 #![allow(
     unexpected_cfgs,
     reason = "a verification cfg added behind a feature gate must not trip the workspace lint"
 )]
-// Crate-wide style policy.
 #![allow(
     clippy::must_use_candidate,
     reason = "not all functions need #[must_use]"
@@ -87,7 +45,6 @@
     clippy::items_after_statements,
     reason = "helper fns near usage site aids readability"
 )]
-// Documentation lints, relaxed crate-wide.
 #![allow(
     clippy::missing_panics_doc,
     reason = "documentation coverage is incremental"
@@ -104,7 +61,6 @@
     clippy::missing_fields_in_debug,
     reason = "large structs omit fields for readability"
 )]
-// High-count style lints kept crate-wide.
 #![allow(
     clippy::explicit_iter_loop,
     reason = "for x in vec.iter() can be clearer than for x in &vec"
@@ -118,8 +74,7 @@
     reason = "FFI match-and-return pattern clearer than let-else"
 )]
 
-/// Bell presentation state: the flash/beep decisions behind a host's BEL handling. The engine
-/// fires [`terminal::Terminal::set_bell_callback`]; the host feeds these state machines.
+/// Bell presentation state machines for visual flash and audio alert decisions.
 pub mod bell;
 pub mod config;
 pub(crate) mod domain;
@@ -131,10 +86,7 @@ pub mod grid;
 pub(crate) use aterm_parser as parser;
 /// Text selection and smart semantic selection (re-exported from `aterm-selection`).
 pub use aterm_selection as selection;
-/// The engine-owned render snapshot: [`render::RenderInput`] is the `Terminal`-free value a
-/// renderer consumes for one frame, built by [`terminal::Terminal::cell_frame_into`]. It lives
-/// here so the engine emits it without a dependency cycle; `aterm_render::render_api`
-/// re-exports it.
+/// Engine-owned [`render::RenderInput`] snapshot consumed by renderers.
 pub mod render;
 /// The fx-layer primitive, re-exported from [`render`] beside `GlowQuad`.
 mod render_fx;

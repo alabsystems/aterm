@@ -2,50 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! The screen reader's panic fence on the window's own threads.
-//!
-//! The window reads agent sessions' screens with `aterm_phase` (and the
-//! `aterm_agent` harness readers built on it) on threads whose panic takes every
-//! session in every window with it. Every such call site reads through [`guarded`]:
-//!
-//! * the published agent verdict ([`crate::presence::agent_verdict_guarded`],
-//!   from `session_status`'s sweep — the main thread);
-//! * the Claude Code footer (`crate::claude_footer`: the composer's frame
-//!   (`aterm_phase::phase::FrameReach`), `footer::mode_row_under`, and
-//!   `footer::launch_card` while a process's model or effort is unnamed), read on the
-//!   main thread at each rebuild of a pane's text that changes a row it read;
-//! * the Claude Code lights (`crate::claude_lights`: `lights::reading_under` with the
-//!   footer's reading, and `lights::read_screen` at a toggle, on the main thread),
-//!   which the footer also reads, with `upgrade::composer_is_empty`, every frame
-//!   while a live upgrade's note stands for the pane.
-//!
-//! The readers are pure functions over whatever rows the pane shows, and
-//! `aterm-phase`'s panic sweep (`tests/panic_sweep.rs`) is evidence about the
-//! screens it holds, not a proof about the next one. A panic becomes the caller's
-//! own no-verdict answer:
-//!
-//! * the agent verdict degrades to `unknown` (never `prompt`: nothing is
-//!   pressed or announced off a screen the reader could not read);
-//! * the footer paints no row (the vendor's own row stays) — a panic in the
-//!   upgrade note's composer read drops only the note, the facts still
-//!   paint — and the lights keep what they last showed, take no toggle step,
-//!   and refuse a toggle (`NotShown`) — no keystroke leaves off an unread
-//!   screen.
-//!
-//! The release profile unwinds (`Cargo.toml` `[profile.release]`), so the catch
-//! holds in the shipped binary. The panic hook (`logging.rs`, and the wrapper
-//! [`guarded`] installs once) hands a panic raised inside the fence to [`absorb`]
-//! instead of filing `crash-<pid>.log`: a screen that panics the reader is redrawn
-//! every frame, and a crash report per frame would flood the disk. [`warn_once`] logs
-//! one warn per session per panic location, with the screen's shape (one glyph class
-//! per row, no text), enough to build a reproducing fixture.
-//!
-//! One caller that is no screen reader shares the fence for its hook half: the crash
-//! restore's replay of a dead window's region (`crash_restore::restore_offered`), whose
-//! panic costs one recovered session its screen (the META rung). Filed as
-//! `crash-<pid>.log`, that caught panic would be what this launch's crash scan
-//! (`logging::take_crash_evidence`, which runs after the keeper's boot) shows as the DEAD
-//! window's crash, and the dead window's own report would be renamed unseen. It logs its
-//! one warn itself.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -68,9 +24,7 @@ std::thread_local! {
     static CAUGHT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-/// The panic hook's question: a panic on a thread inside [`guarded`] is the fence's,
-/// so its location is recorded for [`guarded`] and `true` tells the hook to file
-/// nothing (no crash report, no stderr). Anything else is `false`.
+/// The panic hook's question.
 pub(crate) fn absorb(info: &PanicHookInfo<'_>) -> bool {
     if DEPTH.with(Cell::get) == 0 {
         return false;
@@ -130,9 +84,8 @@ pub(crate) fn guarded<T>(read: impl FnOnce() -> T) -> Result<T, ReaderPanic> {
     })
 }
 
-/// [`guarded`] for a caller with no answer of its own to degrade to: the
-/// value, or — on a panic, warned once per `session` per location
-/// ([`warn_once`], `what` naming the caller) — `None`.
+/// [`guarded`] for a caller with no answer of its own to degrade to: the value, or — on a panic,
+/// warned once per `session` per location ([`warn_once`], `what` naming the caller) — `None`.
 pub(crate) fn read_or_none<T>(
     session: impl std::fmt::Display,
     what: &str,
@@ -156,10 +109,7 @@ const WARN_CAP: usize = 256;
 /// The (session, location) pairs already warned about.
 static WARNED: Mutex<Option<HashSet<(String, String)>>> = Mutex::new(None);
 
-/// Log ONE warn for `p` per `session` per panic location — `what` names the
-/// caller (`agent verdict`), `rows` the screen
-/// (only its [`screen_shape`] is logged, never its text). Whether this call
-/// logged.
+/// Log ONE warn for `p` per `session` per panic location.
 pub(crate) fn warn_once(session: &str, what: &str, p: &ReaderPanic, rows: &[String]) -> bool {
     let mut warned = WARNED.lock().unwrap_or_else(PoisonError::into_inner);
     let warned = warned.get_or_insert_with(HashSet::new);
@@ -192,10 +142,7 @@ pub(crate) fn warn_once(session: &str, what: &str, p: &ReaderPanic, rows: &[Stri
     true
 }
 
-/// The screen's shape, one glyph class per row and no text: `_` blank, `-`
-/// a rule (`─`/`╌`), `|` a bar-led row, `#` a numbered option (`❯ 1. …`,
-/// `  2. …`), `>` a caret-led row, `?` a row ending in `?`, `x` any other
-/// text. At most 80 rows (the last 80), so the warn stays one line.
+/// The screen's shape, one glyph class per row and no text.
 pub(crate) fn screen_shape(rows: &[String]) -> String {
     let from = rows.len().saturating_sub(80);
     rows[from..]
@@ -249,7 +196,6 @@ mod tests {
         let s = guarded(|| -> () { panic!("{}", String::from("formatted")) }).unwrap_err();
         assert_eq!(s.message, "formatted");
         assert_eq!(DEPTH.with(Cell::get), 0, "the fence is left after a panic");
-        // Nested: an inner fence's panic leaves the outer one standing.
         let outer = guarded(|| guarded(|| -> () { panic!("inner") }).unwrap_err());
         assert_eq!(outer.expect("the outer read returns").message, "inner");
         assert_eq!(DEPTH.with(Cell::get), 0);

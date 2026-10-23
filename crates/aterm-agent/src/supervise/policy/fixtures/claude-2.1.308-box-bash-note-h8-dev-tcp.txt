@@ -1,0 +1,50 @@
+# claude-code 2.1.308 · MEASURED 2026-10-22, `aterm ctl text` of a private headless aterm (144x50, aterm 0.115.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the Bash box over `Probe h8`: a read from a network device alone (one tool call scripted into the lab's stub, manual mode)
+
+❯ toolstart
+
+⏺ Bash(awk 'NR<3' README.md && cd sub && git status)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Cogitated for 0s · done 3:34 PM
+
+❯ toolstart
+
+⏺ Bash(awk 'NR<3' README.md | sed 's/a/b/w out.txt')
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Crunched for 0s · done 3:34 PM
+
+❯ toolstart
+
+⏺ Bash(awk 'NR<3' README.md; rm -rf $X)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Churned for 0s · done 3:35 PM
+
+❯ toolstart
+
+  Read 1 file (ctrl+o to expand)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Churned for 0s · done 3:35 PM
+
+❯ toolstart
+
+⏺ Reading 1 file… (ctrl+o to expand)
+  ⎿  $ cat < /dev/tcp/127.0.0.1/9
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Tip: auto mode handles these prompts for you — choose "switch to auto mode" below
+ Probe h8
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ cat < /dev/tcp/127.0.0.1/9
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Redirect involving /dev/tcp or /dev/udp opens a network connection
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and switch to auto mode · auto mode handles these prompts for you
+   3. No
+
+ Esc to cancel · Tab to amend

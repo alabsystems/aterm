@@ -1,27 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE BUILD-CACHE RULE: where `targo` puts a workspace's build intermediates.
-//!
-//! On macOS atpkg's `targo`/`targo-tippy` shims (and `cargo` in an aterm tab) hand a
-//! command that builds a build directory Spotlight skips ([`decide`]): an `--unverified`
-//! build, the lint or `clean` into Cargo's default target gets
-//! `<cache><workspace>/.cargo-build` under `~/Library/Caches/aterm/cargo-build.noindex`
-//! (binaries stay in `target/`); a build into a target directory the caller chose, and
-//! Trust's verified lane (`targo trust`), get `<target>/build.noindex`. Only a caller who
-//! chose the build directory itself keeps cargo's layout. atpkg binds the rule to this
-//! process (`atpkg::build_cache::with_build_dir_here`) and renders it in `sh` for the
-//! shim; `aterm-verify` binds it for the children it starts, so a verify run and a plain
-//! `targo` build share one cache.
-//!
-//! EVERY BUILD DIRECTORY A TOOL OF THIS REPOSITORY CHOOSES IS NAMED `*.noindex`
-//! ([`NOINDEX`]). On macOS Spotlight (`mds_stores`) indexes every file a check run
-//! writes into a plain folder; a folder named `*.noindex` is skipped with everything
-//! under it, while a `.metadata_never_index` file inside a plain folder is not honoured
-//! (its files are indexed within seconds). A tool that pins a build to a target directory
-//! of its own keeps the intermediates in `<target>/build.noindex` too
-//! ([`target_build_dir`]), so only the artifacts cargo uplifts (`<target>/<profile>/aterm`)
-//! land in the plain folder.
+//! Build-cache placement for `targo` ([`decide`], [`NOINDEX`], [`target_build_dir`]).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -32,8 +12,7 @@ pub const CACHE_UNDER_HOME: &str = "Library/Caches/aterm/cargo-build.noindex";
 /// The last component of every workspace's build directory under the cache.
 pub const LEAF: &str = ".cargo-build";
 
-/// The suffix of every build directory a tool of this repository chooses: Spotlight
-/// skips a folder so named with all it holds (the module doc has the measurement).
+/// The suffix of every build directory a tool of this repository chooses.
 pub const NOINDEX: &str = ".noindex";
 
 /// `name` named for Spotlight to skip: `tippy` is `tippy.noindex`.
@@ -42,12 +21,10 @@ pub fn noindex(name: &str) -> String {
     format!("{name}{NOINDEX}")
 }
 
-/// Where under a target directory that is not the cache a build's intermediates go
-/// ([`BuildDir::Target`], [`target_build_dir`]).
+/// Leaf directory for build intermediates under a custom target ([`BuildDir::Target`]).
 pub const TARGET_BUILD_LEAF: &str = "build.noindex";
 
-/// The subcommands that get a build directory: those that build, and `clean`, which
-/// must see the same layout to remove it.
+/// The subcommands that get a build directory.
 pub const BUILD_VERBS: &[&str] = &[
     "build", "b", "check", "c", "test", "t", "run", "r", "bench", "doc", "d", "rustc", "rustdoc",
     "clippy", "tippy", "fix", "clean",
@@ -67,9 +44,7 @@ pub fn build_dir(root: &Path, workspace: &Path) -> PathBuf {
     PathBuf::from(s).join(LEAF)
 }
 
-/// The `--config` value both entry points pass, as a TOML literal string. `None` for a
-/// root that string cannot hold (a `'` or a control character) or that Cargo would read
-/// as a template (a `{` or `}`); the shim refuses the same roots.
+/// The `--config` value both entry points pass, as a TOML literal string.
 #[must_use]
 pub fn config_value(root: &Path) -> Option<String> {
     let root = root.to_str()?;
@@ -85,18 +60,15 @@ pub fn config_value(root: &Path) -> Option<String> {
 /// Which tool reads the command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
-    /// Trust's `targo` (or Trust's own `cargo`, which is the same program): a build names
-    /// its lane, `--unverified` or `trust` (Trust refuses a bare `targo build`).
+    /// Trust's `targo` (or Trust's own `cargo`, which is the same program).
     Targo,
     /// `targo-tippy`, the lint: every argument is its own, and it takes no lane.
     Tippy,
-    /// An upstream `cargo`: it has no lane flag, and a leading `+<toolchain>` is rustup's
-    /// and stays first.
+    /// An upstream `cargo`.
     Cargo,
 }
 
-/// What [`decide`] reads of the machine, injected so every rule is tested without
-/// touching the real one.
+/// What [`decide`] reads of the machine.
 pub struct Machine<'a> {
     /// `$HOME`.
     pub home: Option<&'a Path>,
@@ -104,16 +76,13 @@ pub struct Machine<'a> {
     pub cwd: Option<&'a Path>,
     /// One environment variable.
     pub env: &'a dyn Fn(&str) -> Option<OsString>,
-    /// A config file's text: `Ok(None)` when there is no such file, `Err` when one exists
-    /// and cannot be read.
+    /// A config file's text.
     pub read: &'a dyn Fn(&Path) -> Result<Option<String>, ()>,
-    /// Whether this process may write the directory (`access(2)`, which a sandbox's
-    /// denial answers too); `None` when it is not a directory.
+    /// Whether this process may write the directory (`access(2)`).
     pub writable: &'a dyn Fn(&Path) -> Option<bool>,
 }
 
-/// The environment variable that carries a build directory to `targo trust`
-/// ([`BuildDir::TrustEnv`]).
+/// Environment variable carrying the build directory to `targo trust` ([`BuildDir::TrustEnv`]).
 pub const BUILD_DIR_ENV: &str = "CARGO_BUILD_BUILD_DIR";
 
 /// Where [`decide`] puts a command's build intermediates.
@@ -121,31 +90,13 @@ pub const BUILD_DIR_ENV: &str = "CARGO_BUILD_BUILD_DIR";
 pub enum BuildDir {
     /// The shared cache, `<cache><workspace>/.cargo-build`: this `--config` value first.
     Cache(String),
-    /// `<target>/build.noindex` under the target directory the command builds into — the
-    /// one it chose, else Cargo's `{workspace-root}/target` — when the cache is not for it:
-    /// this `--config` value first.
+    /// `<target>/build.noindex` under the target directory the command builds into.
     Target(String),
-    /// The same folder for Trust's `targo trust`, whose cargo reads no `--config` (measured:
-    /// its intermediates stayed in `<target>/debug`): this directory as [`BUILD_DIR_ENV`]
-    /// on its exec, which its builds inherit.
+    /// Build directory passed to `targo trust` via [`BUILD_DIR_ENV`].
     TrustEnv(String),
 }
 
-/// THE RULE, as a pure function of the command line and the machine. `None` keeps the
-/// command as typed: it builds nothing, it is outside `$HOME` or reached through a link,
-/// or it chose its own build directory (`CARGO_BUILD_BUILD_DIR`, even empty; a cargo
-/// config in the working directory's ancestors or `CARGO_HOME` naming `build-dir`; a
-/// `--config` naming either directory; `-C`). Otherwise an `--unverified` build, the lint
-/// (an alias whose first word is a building verb, as a cargo config in the working
-/// directory's ancestors or `CARGO_HOME` defines it, counts as one: `targo --unverified
-/// verify` is `run -p aterm-verify`) or `clean` into Cargo's default target directory gets
-/// the shared cache
-/// ([`BuildDir::Cache`]); one into a target directory it chose (`--target-dir`, then
-/// `CARGO_TARGET_DIR`, then `CARGO_BUILD_TARGET_DIR`, relative to the working directory),
-/// `targo trust`, and any build where the cache cannot be written get `<target>/
-/// build.noindex` instead ([`BuildDir::Target`], [`BuildDir::TrustEnv`]) — unless that
-/// target already lies in a `*.noindex` folder, or is the default while a config names
-/// `target-dir`. atpkg's shim block is the same rule in `sh`.
+/// Decide the build-cache placement ([`BuildDir::Cache`], [`BuildDir::Target`]).
 #[must_use]
 pub fn decide(args: &[String], tool: Tool, m: &Machine<'_>) -> Option<BuildDir> {
     let home = m
@@ -157,8 +108,6 @@ pub fn decide(args: &[String], tool: Tool, m: &Machine<'_>) -> Option<BuildDir> 
     if !cwd.starts_with(home) || cwd == home || cwd.starts_with(&root) || has_brace(cwd) {
         return None;
     }
-    // A `$PWD` that is not the real folder reached it through a link: the shim sees only
-    // `$PWD`, so both halves leave it alone.
     if (m.env)("PWD").is_some_and(|p| Path::new(&p) != cwd) {
         return None;
     }
@@ -224,8 +173,7 @@ pub fn decide(args: &[String], tool: Tool, m: &Machine<'_>) -> Option<BuildDir> 
     Some(line.place(format!("{target}/{TARGET_BUILD_LEAF}")))
 }
 
-/// `args` with the `--config` [`decide`] adds, or `None` when it adds none: the command
-/// keeps its layout, or it is `targo trust`, whose folder goes in the environment.
+/// `args` with the `--config` [`decide`] adds, or `None` when it adds none.
 #[must_use]
 pub fn with_build_dir(args: &[String], tool: Tool, m: &Machine<'_>) -> Option<Vec<String>> {
     let (BuildDir::Cache(value) | BuildDir::Target(value)) = decide(args, tool, m)? else {
@@ -257,8 +205,7 @@ fn in_noindex(p: &Path) -> bool {
     })
 }
 
-/// Whether a path holds a `{` or `}`, which Cargo would read as a template once
-/// `{workspace-root}` is expanded.
+/// Whether a path holds a `{` or `}`.
 fn has_brace(p: &Path) -> bool {
     p.as_os_str()
         .as_encoded_bytes()
@@ -268,8 +215,7 @@ fn has_brace(p: &Path) -> bool {
 
 /// What the verb and flags half of the rule reads of a command line.
 struct Line {
-    /// An `--unverified` build (any build, for an upstream cargo), the lint or `clean`:
-    /// the shared cache is for it.
+    /// An `--unverified` build, the lint or `clean`: the shared cache is for it.
     cache: bool,
     /// `targo trust`, which takes its build directory from the environment.
     trust: bool,
@@ -280,9 +226,7 @@ struct Line {
 }
 
 impl Line {
-    /// A building verb, or one an alias may make one (for `targo`, `--unverified …` or
-    /// `trust`; `clean` and the lint take no lane), with nothing before `--` that names its
-    /// own build directory; `None` otherwise.
+    /// A building verb, or one an alias may make one.
     fn read(args: &[String], tool: Tool, home: &Path, root: &Path) -> Option<Self> {
         let config_ok = |v: &str| v.contains('=') && !names_a_dir(v);
         let manifest_ok = |v: &str| {
@@ -361,12 +305,7 @@ fn names_a_dir(s: &str) -> bool {
     s.contains("target-dir") || s.contains("build-dir")
 }
 
-/// What `dir/config.toml` or `dir/config` says on lines that are not comments: whether a
-/// line names a build or a target directory, and whether it defines the alias asked for
-/// as a build. A file that exists and cannot be read names both directories. Read line by
-/// line, as the shim reads it: an alias is `<name> = …` under `[alias]` or `alias.<name> =
-/// …` anywhere, and builds when the first word of its value (a string or an array) is a
-/// building verb.
+/// What `dir/config.toml` or `dir/config` says on lines that are not comments.
 #[derive(Default)]
 struct Named {
     build: bool,
@@ -408,8 +347,7 @@ fn config_scan(dir: &Path, alias: Option<&str>, m: &Machine<'_>) -> Named {
     named
 }
 
-/// Whether the line `x` (leading blanks gone) defines `verb` as an alias whose first word
-/// is a building verb.
+/// Whether the line `x` defines `verb` as an alias whose first word is a building verb.
 fn alias_builds(x: &str, verb: &str, in_alias: bool) -> bool {
     let rest = match x.strip_prefix("alias.").and_then(|r| r.strip_prefix(verb)) {
         Some(rest) => rest,
@@ -432,8 +370,7 @@ fn alias_builds(x: &str, verb: &str, in_alias: bool) -> bool {
     BUILD_VERBS.contains(&&value[..end])
 }
 
-/// Whether `dir/config.toml` or `dir/config` holds a line `names` holds that is not a
-/// comment. A file that exists and cannot be read counts as one.
+/// Whether `dir/config.toml` or `dir/config` holds a line `names` holds that is not a comment.
 fn config_names(dir: &Path, m: &Machine<'_>, names: fn(&str) -> bool) -> bool {
     ["config.toml", "config"]
         .iter()
@@ -446,10 +383,7 @@ fn config_names(dir: &Path, m: &Machine<'_>, names: fn(&str) -> bool) -> bool {
         })
 }
 
-/// Whether a cargo config a build in `m.cwd` reads holds a line `names` holds that is not a
-/// comment: `.cargo/config.toml` or `.cargo/config` in the working directory or an ancestor,
-/// then in `CARGO_HOME`, else `$HOME/.cargo`. A file that exists and cannot be read counts,
-/// and so does an unknown working directory, so a caller that backs off on a yes fails safe.
+/// Whether any active Cargo config contains a non-comment line matching `names`.
 #[must_use]
 pub fn configs_name(m: &Machine<'_>, names: fn(&str) -> bool) -> bool {
     let Some(cwd) = m.cwd else {
@@ -468,19 +402,7 @@ pub fn configs_name(m: &Machine<'_>, names: fn(&str) -> bool) -> bool {
     cargo_home.is_some_and(|h| config_names(&h, m, names))
 }
 
-/// THE FALLBACK: the `--config` value that keeps the intermediates of a build a tool
-/// pinned to `target` (deps, incremental, fingerprints, build scripts) in
-/// `<target>/build.noindex` ([`TARGET_BUILD_LEAF`]), out of Spotlight, while cargo still
-/// uplifts the artifacts (`<target>/debug/aterm`, `examples/`) to `<target>/<profile>/`.
-/// For a build a tool pins to `target` itself, as `aterm-verify` does where the shared
-/// cache is not for its run.
-///
-/// `None` leaves cargo's layout alone: the caller chose a build directory
-/// (`CARGO_BUILD_BUILD_DIR` set, even empty, or a cargo config in the working directory's
-/// ancestors or in `CARGO_HOME`, else `$HOME/.cargo`, naming `build-dir` on a line that
-/// is not a comment, or one that cannot be read), the working directory is unknown, or
-/// `target` is not absolute or is a path the TOML literal cannot hold or Cargo would
-/// read as a template ([`config_value`]'s refusals).
+/// Fallback `--config` value placing intermediates in `<target>/build.noindex` ([`config_value`]).
 #[must_use]
 pub fn target_build_dir(target: &Path, m: &Machine<'_>) -> Option<String> {
     if !target.is_absolute()
@@ -500,8 +422,7 @@ pub fn target_build_dir(target: &Path, m: &Machine<'_>) -> Option<String> {
     Some(format!("build.build-dir='{dir}'"))
 }
 
-/// [`Machine::read`] on the real filesystem: a regular file (followed, as Cargo does)
-/// read whole; anything else is no file.
+/// [`Machine::read`] on the real filesystem: a regular file read whole; anything else is no file.
 ///
 /// # Errors
 /// A file that exists and cannot be read, which [`decide`] counts as a choice.
@@ -571,8 +492,6 @@ mod tests {
             decide("/w/repo/target", w, &[], &[]).as_deref(),
             Some("build.build-dir='/w/repo/target/build.noindex'")
         );
-        // A config naming only the target directory is not a build-dir choice: the
-        // tool's CARGO_TARGET_DIR outranks it anyway.
         assert!(
             decide(
                 "/t",
@@ -582,7 +501,6 @@ mod tests {
             )
             .is_some()
         );
-        // A commented line is no choice either.
         assert!(
             decide(
                 "/t",
@@ -631,7 +549,6 @@ mod tests {
         ] {
             assert_eq!(got, None, "{why}");
         }
-        // CARGO_HOME moves the home config the rule reads: ~/.cargo is then not read.
         assert!(
             decide(
                 "/t",

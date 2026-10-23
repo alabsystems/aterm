@@ -1,40 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FAKE MODEL OF THE CODEX-ALAB PROOF ([`crate::codex_alab_proof`]): what
-//! the lab answers each Responses request of a leg with, pure, so every
-//! answer is a unit test before it is a live one.
-//!
-//! A request belongs to the leg its first `LEG-<name>` user text names
-//! ([`leg_of`]), and is at the STEP its last user text says ([`step_of`]):
-//! the person's own prompt, or the act codex-alab typed, told by aterm's own
-//! words — the texts `harness policy` hands codex-alab (Autopilot Cruise /
-//! Autopilot Land, the codex-alab contract's §3): Cruise's continuation
-//! ([`CONTINUE_TEXT`]), its defend-and-find-more prompt ([`DONE_CHECK`]),
-//! Land's instruction ([`LAND`]), its nudge ([`LAND_NUDGE`], counted over the
-//! conversation) and its answer ([`LAND_ANSWER`]). A word an older codex-alab
-//! typed instead (its retired done check) is a step of its own, so the
-//! negative control is answered too, never hung.
-//!
-//! The legs' replies are chosen to READ as each leg needs under the readers
-//! codex-alab ported from aterm verbatim (`says_done`, `classify_said`,
-//! `needs_you`, `clean_defense`): the tests below hold each reply to aterm's
-//! own copy of those readers, with a negative control beside each.
-//!
-//! PACE: codex-alab backs off after a short turn (less than two minutes of
-//! work: 2, 4, 8 … minutes, the back-off ladder aterm's `TurnEndTiming` has)
-//! and offers no knob for it (its `Timing` is fixed in the package), so a
-//! leg that must see acts one after another holds its answer past that line
-//! ([`SLOW_TURN`]): a turn of real work, after which the next act is typed at
-//! once (after `human_grace_s`).
-//!
-//! THE EXCHANGE LEGS (`exchange`, `control`): the same message
-//! ([`PERSON_ASKS`]) typed into each codex's composer — the first by a person
-//! (aterm's development seam `send|key as=person`), the second as a control
-//! write — answered alike: a plain reply ([`EXCHANGE_REPLY`]) held a turn of
-//! real work, so the act after it is due at once and the answer is still
-//! well inside a person's own exchange (aterm's and codex-alab's
-//! `EXCHANGE_WORK`). Only whose hand opened the turn tells the two apart.
+//! Pure fake Responses model for `codex-alab` proof legs.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -51,177 +18,142 @@ use crate::pyjson::J;
 #[path = "codex_alab_policy_model.rs"]
 pub mod policy;
 
-/// `[harness]`'s continuation as older aterm builds spelled it, which an
-/// older codex-alab may still type; aterm's Cruise continuation
-/// ([`CONTINUE_TEXT`]) carries the same words.
+/// Legacy continuation substring shared with [`CONTINUE_TEXT`].
 pub const KEEP_GOING: &str = "keep going";
 
-/// The words of the done check older codex-alab builds typed (before FOREVER
-/// CRUISE), so the negative control's acts are answered and named.
+/// Legacy done-check prefix recognized for negative-control classification.
 pub const RETIRED_CHECK: &str = "If the task is finished and verified";
 
-/// The head of the repository's suffix aterm's words carry where the probe
-/// found work no remote main has (aterm's `repo_work_suffix`, codex-alab's
-/// `repo_suffix`): the tag says the act named it (`repo:nudge1+repo`).
+/// Prefix of the dirty-repository suffix appended to Land nudges.
 pub const REPO_SUFFIX_HEAD: &str = "Your repository still holds work no remote main has";
 
-/// What a person types into the reland leg's codex after its landing: a turn
-/// of someone else's, which reopens the landed task.
+/// Prompt text typed by a person to reopen a landed task.
 pub const REOPEN: &str = "REOPEN";
 
-/// A turn of real work: past codex-alab's two-minute line (its `min_work`),
-/// so the act after it is not backed off.
+/// Turn duration exceeding `codex-alab`'s two-minute `min_work` threshold.
 pub const SLOW_TURN: Duration = Duration::from_secs(130);
 
-/// How long the hold leg's first answer is held: the hold lands meanwhile,
-/// and the turn is real work, so without the hold its continuation would
-/// come at once.
+/// Duration for which the hold leg's first response is held.
 pub const HOLD_FIRST_TURN: Duration = SLOW_TURN;
 
-/// How long the carry leg's first answer is held: never before the kill that
-/// ends that turn (the leg kills it as soon as it is relaunchable), however
-/// long the legs checked before it wait. Against a package that fails them,
-/// their hang detectors reached the carry leg 1346 s in, past the 600 s this
-/// held at first, so an hour. A held answer is a detached thread, so it never
-/// keeps the lab from exiting.
+/// Duration for which the carry leg's first response is held before SIGKILL.
 pub const CARRY_FIRST_TURN: Duration = Duration::from_secs(3600);
 
-/// How long the repository leg holds its answer to the first nudge that
-/// names the repository's work: the lab commits the file meanwhile (never
-/// pushing it), as the worker would, so the reply's defense meets a commit
-/// the remote main lacks. Long enough for the legs checked before it: the
-/// reply is a done claim, so its length moves no back-off.
+/// Duration for which the repository leg holds its response while committing.
 pub const REPO_COMMIT_HOLD: Duration = Duration::from_secs(60);
 
-/// How long the repository leg holds its answer to the second nudge: the lab
-/// pushes the commit meanwhile, so the reply's defense meets a clean one.
+/// Duration for which the repository leg holds its response while pushing.
 pub const REPO_PUSH_HOLD: Duration = Duration::from_secs(20);
 
-/// How long the NEEDS YOU leg holds its answer to the act typed while its
-/// need stands: a read after the act's request still finds the need up.
+/// Duration for which the `NEEDS YOU` leg holds its response while the need stands.
 pub const NEEDS_HOLD: Duration = Duration::from_secs(10);
 
-/// How long the usage leg's 429 says the window lasts.
+/// Usage-limit window duration in seconds reported by the 429 fixture.
 pub const RESETS_IN_S: i64 = 5;
 
-/// The nudges the Land leg is typed before its clean defense: four, past the
-/// two an older Land stopped after and past any bound under four (FOREVER
-/// LAND has none; no finite run proves there is none at all).
+/// Number of Land nudges issued before the model returns a clean defense.
 pub const NUDGES_BEFORE_DEFENSE: usize = 4;
 
-/// The first leg's reply: the retired token alone, a done claim and nothing
-/// more (Autopilot Cruise: it ends nothing).
+/// First-leg reply claiming completion with the retired done token.
 pub const FIRST_DONE: &str = "Hello from the lab model. Nothing else to do.\n\nATERM-TASK-DONE";
 
-/// A Cruise leg's answer to the defend-and-find-more prompt: a defense that
-/// would land under Land, owed only the next prompt under Cruise.
+/// Cruise leg reply to the defend-and-find-more prompt.
 pub const CRUISE_DEFENSE: &str = "Looked again.\n\nNothing left: the greeting was the whole task.";
 
-/// The plain step a continuation leg's first turn ends on.
+/// Plain intermediate reply for the continuation leg's first turn.
 pub const STEP_ONE: &str = "Here is step one of the plan. I will continue when asked.";
 
-/// A continued turn that claims done with the retired token.
+/// Continuation leg reply claiming completion with the retired done token.
 pub const CONTINUED_DONE: &str = "Continued as asked. All done.\n\nATERM-TASK-DONE";
 
-/// The carried turn's reply after the crash relaunch: a done claim.
+/// Carry leg reply after crash relaunch.
 pub const CARRIED_DONE: &str = "Carried on after the relaunch. All done.\n\nATERM-TASK-DONE";
 
-/// The need the NEEDS YOU leg names.
+/// `NEEDS YOU` requirement text used by the needs leg.
 pub const NEED: &str = "the signing credential to publish the release";
 
-/// The NEEDS YOU leg's first report: work done, one need, nothing asked.
+/// Initial report for the `NEEDS YOU` leg naming [`NEED`].
 pub const NEEDS_REPORT: &str = "Built the release candidate and ran its checks.\n\nNEEDS YOU: the \
                                 signing credential to publish the release";
 
-/// The NEEDS YOU leg's report to the act typed while its need stands: work
-/// carried on, NO `NEEDS YOU:` line at all, which leaves the need standing (a
-/// report that names none withdraws none).
+/// Follow-up report for the `NEEDS YOU` leg with no `NEEDS YOU:` line.
 pub const NEEDS_PLAIN: &str = "Carried on: the changelog is updated and the docs are next.";
 
-/// The NEEDS YOU leg's report after that: carried on, and the need withdrawn.
+/// Final report for the `NEEDS YOU` leg withdrawing the need (`NEEDS YOU: nothing`).
 pub const NEEDS_CLEARED: &str = "Carried on without it: the changelog and the docs are \
                                  updated.\n\nNEEDS YOU: nothing";
 
-/// The Land leg's replies of real work ([`land_reply`]): work in hand, no
-/// defense, no done claim and nothing asked.
+/// In-progress replies for the Land leg before its defense.
 pub const LAND_PROGRESS: [&str; 2] = [
     "Committed the change; the push to origin/main is still running.",
     "The push finished; checking that origin/main has every commit.",
 ];
 
-/// A Land defense that is NOT clean by its need: `Nothing left:`, and a
-/// `NEEDS YOU:` line naming one.
+/// Unclean Land defense that still carries a standing `NEEDS YOU:` line.
 pub const NEEDS_DEFENSE: &str = "Checked origin/main.\n\nNothing left: all of the work is on \
                                  origin/main.\nNEEDS YOU: the release credential to tag it";
 
-/// A Land defense that is NOT clean by Land's strict reading of open work (a
-/// part left for later), its need withdrawn so nothing else keeps it open.
+/// Unclean Land defense that mentions work left for later.
 pub const OPEN_DEFENSE: &str = "Checked origin/main again.\n\nNothing left: all of the work is \
                                 on origin/main; the docs fix is for later.\nNEEDS YOU: nothing";
 
-/// The Land legs' clean defense, in a folder that is no repository.
+/// Clean Land defense for a non-repository workspace.
 pub const LAND_DEFENSE: &str = "Checked origin/main once more.\n\nNothing left: all of the work is \
                                 on origin/main.\nNEEDS YOU: nothing";
 
-/// The repository leg's first report: the file written, not committed.
+/// Initial repository-leg report after writing an uncommitted file.
 pub const REPO_WROTE: &str = "Wrote notes.txt with the release notes.";
 
-/// The repository leg's defense at the instruction's yield: clean words over
-/// a repository that still holds the uncommitted file.
+/// Repository-leg defense while uncommitted changes remain.
 pub const REPO_DEFENSE: &str = "The notes are written.\n\nNothing left: everything is on \
                                 origin/main.";
 
-/// The repository leg's defense once the lab committed the file, its commit
-/// not pushed: clean words over a commit the remote main lacks.
+/// Repository-leg defense while an unpushed commit remains.
 pub const REPO_COMMITTED: &str = "Committed notes.txt.\n\nNothing left: everything is on \
                                   origin/main.";
 
-/// The repository leg's defense once the lab pushed the commit.
+/// Clean repository-leg defense after pushing to `origin/main`.
 pub const REPO_PUSHED: &str = "Committed notes.txt and pushed it to origin/main.\n\nNothing left: \
                                everything is on origin/main.";
 
-/// The question leg's reply after its overlay was answered: a question in
-/// prose, which Land answers with its own words.
+/// Prose question returned by the question leg after its overlay is answered.
 pub const QUESTION_PROSE: &str = "Postgres is set up locally. Should I push the schema to \
                                   origin/main now?";
 
-/// The question leg's reply to Land's answer.
+/// Question-leg reply after receiving Land's answer.
 pub const QUESTION_LANDED_WORDS: &str = "Pushed the schema to origin/main.";
 
-/// What the exchange legs' message asks, after its `LEG-<name>`: a person's
-/// question, with no `?` in it (a key some composers read as their own).
+/// User question text shared by the `exchange` and `control` legs.
 pub const PERSON_ASKS: &str = "tell me what this repository holds so far";
 
-/// The exchange legs' reply: plain — no done claim, no question, no need —
-/// so the control's turn is owed Cruise's continuation (`continue@v1`), and
-/// the person's is left to them by nothing but whose hand opened it.
+/// Plain reply returned for the `exchange` and `control` legs.
 pub const EXCHANGE_REPLY: &str = "The repository holds a README and one heading in it.";
 
-/// What step a request is at: what its last user text is.
+/// Conversation step classified from a request's last user text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
-    /// A person's prompt (the leg's launch prompt, or a later one).
+    /// Initial or subsequent person prompt.
     Person,
-    /// The person's turn after a landing ([`REOPEN`]).
+    /// Person turn reopening a landed task ([`REOPEN`]).
     Reopen,
-    /// Cruise's continuation (`continue@v1`, the carry-on, the usage resume).
+    /// Cruise continuation prompt (`continue@v1`).
     Continue,
-    /// Cruise's defend-and-find-more prompt (`continue-done-check@v1`).
+    /// Cruise defend-and-find-more prompt (`continue-done-check@v1`).
     Defend,
-    /// An older codex-alab's done check.
+    /// Legacy `codex-alab` done-check prompt.
     RetiredCheck,
-    /// Land's instruction (`land@v1`).
+    /// Land instruction (`land@v1`).
     Land,
-    /// Land's nudge (`land-nudge@v1`), the n-th of the conversation.
+    /// `n`-th Land nudge (`land-nudge@v1`) in the conversation.
     Nudge(usize),
-    /// Land's answer to a question (`land-answer@v1`).
+    /// Land answer to a prose question (`land-answer@v1`).
     LandAnswer,
-    /// Anything else codex-alab typed (a Cruise answer, a wall's words).
+    /// Any other harness-typed prompt.
     Other,
 }
 
 impl Step {
-    /// The step's name in the model's log tag.
+    /// Returns the step tag used in model log entries.
     #[must_use]
     pub fn name(self) -> String {
         match self {
@@ -249,8 +181,7 @@ fn user_texts(body: &J) -> Vec<String> {
         .collect()
 }
 
-/// The leg a request belongs to: the `LEG-<name>` its first such user text
-/// names.
+/// Extracts the `<name>` from the first `LEG-<name>` user text in `body`.
 #[must_use]
 pub fn leg_of(body: &J) -> Option<String> {
     user_texts(body).iter().find_map(|text| {
@@ -263,8 +194,7 @@ pub fn leg_of(body: &J) -> Option<String> {
     })
 }
 
-/// The step a request is at ([`Step`]): its last user text, read for aterm's
-/// words. A nudge is counted over the whole conversation the request carries.
+/// Classifies the [`Step`] of `body` from its user texts.
 #[must_use]
 pub fn step_of(body: &J) -> Step {
     let texts = user_texts(body);
@@ -296,8 +226,7 @@ pub fn step_of(body: &J) -> Step {
     Step::Other
 }
 
-/// How many texts follow the leg's prompt in a request (this request's own
-/// last one included): 1 at the first act typed after it.
+/// Returns the number of user texts following the initial `LEG-` prompt.
 #[must_use]
 pub fn texts_after_prompt(body: &J) -> usize {
     let texts = user_texts(body);
@@ -307,13 +236,7 @@ pub fn texts_after_prompt(body: &J) -> usize {
         .map_or(0, |at| texts.len() - at - 1)
 }
 
-/// The Land leg's reply to its `n`-th land act (0 the instruction, `n` the
-/// n-th nudge) and how long it is held: a turn of real work (so the next act
-/// is not backed off), a defense with a need, another, a defense naming open
-/// work, and at the [`NUDGES_BEFORE_DEFENSE`]-th nudge the clean defense. A
-/// done claim lengthens codex-alab's short streak whatever it worked, so each
-/// unclean defense follows real work: its nudge is backed off two minutes,
-/// never four.
+/// Returns the Land leg's `(reply_text, hold_duration)` for land act `n`.
 #[must_use]
 pub fn land_reply(n: usize) -> (&'static str, Duration) {
     match n {
@@ -378,10 +301,7 @@ fn approval_call() -> J {
     )
 }
 
-/// What the fake model answers (module header). A structured side request
-/// (the thread's title) is answered with JSON that fits its schema. The tag
-/// is `<leg>:<step>`, with the needs ack named where the act carried it
-/// (`needs:continue+ack`).
+/// Computes the fake model's [`Answered`] response for `body`.
 #[must_use]
 pub fn answer(body: &J) -> Answered {
     let leg = leg_of(body).unwrap_or_else(|| "-".to_string());
@@ -557,7 +477,6 @@ mod tests {
             step_of(&body(&[p, LAND, "REOPEN look again"], None)),
             Step::Reopen
         );
-        // NEGATIVE CONTROL: a text that is none of aterm's words is no act.
         assert_eq!(step_of(&body(&[p, "please continue"], None)), Step::Other);
     }
 
@@ -574,7 +493,6 @@ mod tests {
             says_done(Some(CRUISE_DEFENSE)) && clean_defense(Some(CRUISE_DEFENSE)),
             "the Cruise defense would land under Land: Cruise must still go on"
         );
-        // The continuation leg: a plain step, then a done claim.
         let t1 = answer(&body(&["LEG-continue Write a plan"], None));
         assert_eq!(
             (t1.tag.as_str(), t1.delay),
@@ -584,7 +502,6 @@ mod tests {
         let after = answer(&body(&["LEG-continue Write a plan", CONTINUE_TEXT], None));
         assert_eq!(after.tag, "continue:continue");
         assert!(says_done(Some(CONTINUED_DONE)));
-        // NEGATIVE CONTROL: an unnamed request is a plain done claim, never a wall.
         let plain = answer(&body(&["hello"], None));
         assert_eq!((plain.status, plain.tag.as_str()), (200, "-:other"));
     }
@@ -616,7 +533,6 @@ mod tests {
             "the plain report names no need and withdraws none: the need stands"
         );
         assert_eq!(classify_said(Some(NEEDS_PLAIN)), Said::Plain);
-        // The act after it: the need withdrawn.
         let later = answer(&body(
             &[
                 "LEG-needs Build",
@@ -631,8 +547,6 @@ mod tests {
         );
         assert!(text_of(&later).contains("NEEDS YOU: nothing"));
         assert!(needs_you(NEEDS_CLEARED).is_empty() && says_no_needs(NEEDS_CLEARED));
-        // NEGATIVE CONTROL: a continuation without the ack is named so, and it
-        // is still the first act after the prompt (the plain report).
         let bare = answer(&body(&["<env>", "LEG-needs Build", CONTINUE_TEXT], None));
         assert_eq!(bare.tag, "needs:continue");
         assert!(text_of(&bare).contains(NEEDS_PLAIN));
@@ -659,8 +573,6 @@ mod tests {
             assert_eq!((land_reply(n).1, a.delay), (a.delay, a.delay));
             said.push(text_of(&a));
         }
-        // Only the reply to the last nudge is clean: every one before it,
-        // defense or not, is owed the next nudge.
         for n in 0..NUDGES_BEFORE_DEFENSE {
             let (text, hold) = land_reply(n);
             assert!(!clean_defense(Some(text)), "reply {n}: {text}");
@@ -672,7 +584,6 @@ mod tests {
         let (last, _) = land_reply(NUDGES_BEFORE_DEFENSE);
         assert!(clean_defense(Some(last)) && last == LAND_DEFENSE);
         assert!(said[NUDGES_BEFORE_DEFENSE - 1].contains("Nothing left:"));
-        // The unclean defenses: each IS a defense, unclean for one reason.
         assert!(says_done(Some(NEEDS_DEFENSE)) && needs::defense_line(NEEDS_DEFENSE).is_some());
         assert!(!needs_you(NEEDS_DEFENSE).is_empty(), "a need keeps it open");
         assert!(says_done(Some(OPEN_DEFENSE)) && needs::defense_line(OPEN_DEFENSE).is_some());
@@ -680,7 +591,6 @@ mod tests {
             needs_you(OPEN_DEFENSE).is_empty() && says_no_needs(OPEN_DEFENSE),
             "no need: only the open work keeps it open"
         );
-        // NEGATIVE CONTROL: the same defense without its open words lands.
         assert!(clean_defense(Some(
             "Checked origin/main again.\n\nNothing left: all of the work is on origin/main.\nNEEDS YOU: nothing"
         )));
@@ -695,15 +605,12 @@ mod tests {
             SLOW_TURN > Duration::from_secs(120),
             "past codex-alab's min_work"
         );
-        // NEGATIVE CONTROLS: a defense with a need, or with open work, lands nothing.
         assert!(!clean_defense(Some(
             "Nothing left: all of the work is on origin/main.\nNEEDS YOU: the release credential"
         )));
         assert!(!clean_defense(Some(
             "Nothing left: all of the work is on origin/main, but the docs fix is not pushed."
         )));
-        // Land's strict reading: a place that is no landing reads open, so
-        // the defense names the remote main and nothing vaguer.
         assert!(!clean_defense(Some(
             "Verified on the remote.\n\nNothing left: all of the work is on origin/main."
         )));
@@ -776,7 +683,6 @@ mod tests {
             ("repo:nudge2+repo", REPO_PUSH_HOLD)
         );
         assert!(text_of(&pushed).contains("pushed it to origin/main"));
-        // NEGATIVE CONTROL: a bare nudge names none.
         let bare = answer(&body(&[p, LAND, LAND_NUDGE], None));
         assert_eq!(bare.tag, "repo:nudge1");
         assert!(clean_defense(Some(REPO_PUSHED)));
@@ -803,7 +709,6 @@ mod tests {
         assert!(!says_done(Some(QUESTION_PROSE)), "a question, not a claim");
         let landed = answer(&body(&["LEG-question Set up", LAND_ANSWER], None));
         assert_eq!(landed.tag, "question:land-answer");
-        // NEGATIVE CONTROL: the approval leg calls once, and only at its prompt.
         let call = answer(&body(&["LEG-approval Run the build."], None));
         assert_eq!(call.tag, "approval:call");
         assert!(text_of(&call).contains("require_escalated"));
@@ -851,8 +756,6 @@ mod tests {
     /// THE EXCHANGE LEGS are answered alike: the same plain reply, held the
     /// same turn of real work, so only whose hand opened the turn can tell
     /// the person's exchange (left to them) from the control's (continued).
-    /// NEGATIVE CONTROLS: a question in the reply would choose an act of its
-    /// own, and an act typed into the person's exchange is answered and named.
     #[test]
     fn the_exchange_legs_answer_alike_a_plain_turn_of_real_work() {
         use aterm_agent::supervise::policy::turn_end::EXCHANGE_WORK;
@@ -888,14 +791,11 @@ mod tests {
             ("control:continue", Duration::ZERO)
         );
         assert!(says_done(Some(CONTINUED_DONE)), "a claim Cruise defends");
-        // NEGATIVE CONTROL: an act typed into the person's exchange is
-        // answered at once and named, never hung.
         let typed = answer(&body(&[&asks("exchange"), CONTINUE_TEXT], None));
         assert_eq!(
             (typed.tag.as_str(), typed.delay),
             ("exchange:continue", Duration::ZERO)
         );
-        // NEGATIVE CONTROL: the same reply asking something is no plain reply.
         assert_ne!(
             classify_said(Some(
                 "The repository holds a README and one heading in it. Should I add a parser?"

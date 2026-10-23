@@ -1,22 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro
-// under them (crates/aterm-spec-anchor/anchor_rules.rs).
 #![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 
-//! The single PTY spawn and IO seam: every raw PTY primitive (Unix pty pair, `fork`,
-//! `execve`, `read`/`write`, `TIOCSWINSZ`, the queue probes [`input_queue_len`],
-//! [`output_queue_len`] and [`flush_input_queue`]; Windows ConPTY) lives here, so the
-//! frontend holds no unsafe PTY code and a child is spawned in one place.
-//!
-//! The master is a raw `i32`, shared by the input, reader and control-socket threads.
-//! On Unix it is the PTY master fd (`src/unix.rs`); on Windows (`src/windows/`) an
-//! opaque, always non-negative key into a process-global registry that owns the
-//! HANDLEs. Public signatures match on both; Windows adds [`OwnedMaster`],
-//! [`close_master`] and [`exit_code`] for what `OwnedFd`/`waitpid` cover on Unix.
+//! The single PTY spawn and IO seam.
 
-// Registers the `trust` tool namespace for `trust::skip` under the Trust verifier.
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
 #![cfg_attr(
@@ -27,13 +15,7 @@
     )
 )]
 
-/// A spawned shell: the PTY master and the child's pid. The child is a session and
-/// process-group leader, so a `SIGHUP` to `pid` tears the job tree down. The frontend
-/// hangs the child up first so the reader's blocking `read(master)` gets EOF, then
-/// closes the master: on macOS `close(master)` wedges while a reader sits in `read`.
-///
-/// Windows: `master` is the opaque ConPTY registry key and `pid` the process id;
-/// [`hangup`] closes the pseudoconsole.
+/// A spawned shell.
 #[derive(Debug, Clone, Copy)]
 pub struct SpawnedShell {
     /// The PTY master fd.
@@ -46,20 +28,9 @@ pub struct SpawnedShell {
 /// started from a gnome-terminal, kitty, Konsole, … tab, these name that terminal's
 /// window, pane or control socket, so in aterm's shell they point at the wrong
 /// terminal (`$WINDOWID` tools act on the outer window, `kitty @` drives the outer
-/// kitty, Ubuntu's `vte-2.91.sh` runs a VTE prompt hook at every prompt). aterm's own
-/// identity is `TERM_PROGRAM` and its kin, which a window's spawn sets in `env_add`;
-/// these are the other side of that, stripped by [`build_child_env`] only on a spawn
-/// that sets it. A spawn that does not (the passthrough session of an `aterm` typed at
-/// a prompt, which models no screen) runs inside the outer terminal, which really is
-/// the shell's terminal there, so they pass through.
-///
-/// Only names the terminal itself sets per window or session: a user's configuration
-/// variable (`KITTY_CONFIG_DIRECTORY`, `WEZTERM_CONFIG_FILE`) and a multiplexer's
-/// (`TMUX`, `STY`, which aterm's integration reads) pass through.
+/// kitty, Ubuntu's `vte-2.91.sh` runs a VTE prompt hook at every prompt).
 const FOREIGN_TERMINAL_VARS: &[&str] = &[
-    // X11 terminals (xterm, urxvt, kitty, alacritty): the terminal's X window id.
     "WINDOWID",
-    // VTE (gnome-terminal, Tilix, Terminator, xfce4-terminal, Ptyxis).
     "VTE_VERSION",
     "GNOME_TERMINAL_SCREEN",
     "GNOME_TERMINAL_SERVICE",
@@ -67,35 +38,27 @@ const FOREIGN_TERMINAL_VARS: &[&str] = &[
     "TERMINATOR_UUID",
     "TERMINATOR_DBUS_NAME",
     "TERMINATOR_DBUS_PATH",
-    // kitty.
     "KITTY_WINDOW_ID",
     "KITTY_PID",
     "KITTY_LISTEN_ON",
     "KITTY_PUBLIC_KEY",
-    // Alacritty.
     "ALACRITTY_WINDOW_ID",
     "ALACRITTY_SOCKET",
     "ALACRITTY_LOG",
-    // WezTerm.
     "WEZTERM_PANE",
     "WEZTERM_UNIX_SOCKET",
     "WEZTERM_EXECUTABLE",
     "WEZTERM_EXECUTABLE_DIR",
-    // Ghostty: its shell integration keys off these.
     "GHOSTTY_RESOURCES_DIR",
     "GHOSTTY_BIN_DIR",
     "GHOSTTY_SHELL_FEATURES",
-    // iTerm2 and Terminal.app.
     "ITERM_SESSION_ID",
     "ITERM_PROFILE",
     "LC_TERMINAL",
     "LC_TERMINAL_VERSION",
     "TERM_SESSION_ID",
-    // Windows Terminal.
     "WT_SESSION",
     "WT_PROFILE_ID",
-    // The outer terminal's foreground/background colours (rxvt, Konsole, iTerm2),
-    // which vim and others read as aterm's.
     "COLORFGBG",
 ];
 
@@ -104,9 +67,7 @@ const FOREIGN_TERMINAL_VARS: &[&str] = &[
 const FOREIGN_TERMINAL_PREFIXES: &[&str] = &["KONSOLE_"];
 
 /// Whether `key` is another terminal's identity variable ([`FOREIGN_TERMINAL_VARS`],
-/// [`FOREIGN_TERMINAL_PREFIXES`]). Like [`aterm_types::domain::is_ai_env_key`], a
-/// non-Unicode key is read by its lossy spelling and the match ignores ASCII case on
-/// Windows only.
+/// [`FOREIGN_TERMINAL_PREFIXES`]).
 #[must_use]
 fn is_foreign_terminal_key(key: &std::ffi::OsStr) -> bool {
     let key = key.to_string_lossy();
@@ -128,11 +89,6 @@ fn is_foreign_terminal_key(key: &std::ffi::OsStr) -> bool {
 /// Whether `key` hands the child a descriptor by number, which no child of aterm's
 /// has: `WAYLAND_SOCKET`, the compositor connection a launcher passes down, which
 /// libwayland takes as its connection without falling back to `WAYLAND_DISPLAY`.
-/// Every descriptor above stdio is close-on-exec in the child (`unix::InheritStrip`),
-/// so in the shell the number names nothing, or a file opened since, and every Wayland
-/// client run from it fails to connect. aterm's own connection takes the variable out
-/// of aterm's environment as it opens, but a Linux window whose display answers forks
-/// session 0 before that (LINUX-6), so no spawn passes it on.
 #[must_use]
 fn is_inherited_descriptor_key(key: &std::ffi::OsStr) -> bool {
     key == "WAYLAND_SOCKET"
@@ -142,19 +98,12 @@ fn is_inherited_descriptor_key(key: &std::ffi::OsStr) -> bool {
 /// ([`aterm_types::domain::is_ai_env_key`]: AI-tool vars and the recursion-provisioning
 /// identity vars; case-insensitive on Windows only) and every descriptor handed down by
 /// number ([`is_inherited_descriptor_key`]), then `env_add` on top, overriding or
-/// appending. When `env_add` claims the terminal (it sets `TERM_PROGRAM`, as a window's
-/// spawn does), every other terminal's identity variable ([`is_foreign_terminal_key`])
-/// is dropped as well; without that claim the shell runs in the outer terminal and
-/// keeps them. Built in the parent before the fork, so the child allocates nothing.
-// Skip: `inherited` is a caller-chosen iterator, so `next` is open-trait dispatch the
-// verifier cannot follow; the deny-list logic is unit-tested.
+/// appending.
 #[cfg_attr(trust_verify, trust::skip)]
 fn build_child_env(
     inherited: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
     env_add: &[(String, String)],
 ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
-    // Plain loops, not adapters: closure bodies are absent callees for the Trust
-    // panic-freedom verifier. They keep encounter order and replace the first match.
     let mut claims_terminal = false;
     for (k, _) in env_add {
         if k == "TERM_PROGRAM" {
@@ -188,9 +137,7 @@ fn build_child_env(
     env_pairs
 }
 
-/// The refusal of a spawn whose argument `index` (from 0, as the caller gave `list`)
-/// holds a NUL byte. Such an argument cannot reach the program whole, and dropping or
-/// cutting it would shift the command, so nothing is spawned.
+/// The refusal of a spawn whose argument `index` (from 0, as the caller gave `list`) holds a NUL byte.
 pub(crate) fn argv_nul_refusal(list: &str, index: usize) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
@@ -201,9 +148,7 @@ pub(crate) fn argv_nul_refusal(list: &str, index: usize) -> std::io::Error {
     )
 }
 
-/// The refusal of a spawn whose program, `what` (the configured shell and where it was
-/// set), holds a NUL byte: the OS would read the name only up to it and run a different
-/// program, so nothing is spawned.
+/// The refusal of a spawn whose program, `what` (the configured shell and where it was set), holds a NUL byte.
 pub(crate) fn program_nul_refusal(what: &str) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
@@ -214,33 +159,19 @@ pub(crate) fn program_nul_refusal(what: &str) -> std::io::Error {
     )
 }
 
-/// What the line discipline does with the next byte typed into a PTY: the `c_lflag`
-/// bits that decide who echoes a keypress, and the `ISIG` characters ([`TtySignals`]),
-/// read by [`tty_echo`] at the press.
-///
-/// | `echo` | `canonical` | who is at the slave                                    | who echoes  |
-/// |--------|-------------|--------------------------------------------------------|-------------|
-/// | true   | true        | a cooked prompt, `sleep`, `cat`                        | the kernel  |
-/// | false  | true        | `read -s`, `sudo`, `ssh`'s passphrase, `getpass`       | nobody      |
-/// | false  | false       | a raw TUI (vim, less), readline at rest, `read -s -n`  | the program |
-/// | true   | false       | `read -n 3`, a cbreak program that leaves ECHO on      | the kernel  |
-///
-/// Only the second row swallows input; a raw program draws its own echo, and a
-/// readline prompt sits in raw mode between keys.
+/// What the line discipline does with the next byte typed into a PTY.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TtyEcho {
-    /// `ECHO` is set: the line discipline echoes input it processes.
+    /// `ECHO` is set.
     pub echo: bool,
-    /// `ICANON` is set: line-at-a-time input, so echo is the kernel's job.
+    /// `ICANON` is set.
     pub canonical: bool,
-    /// The signal characters while `ISIG` is set; `None` when it is clear
-    /// (raw mode), where every byte is queued for the program to read.
+    /// The signal characters while `ISIG` is set.
     pub signals: Option<TtySignals>,
 }
 
 impl TtyEcho {
-    /// The press reaches the program but never the screen (canonical no-echo, iTerm2's
-    /// password mode). A raw-mode program echoes for itself, so it is `false`.
+    /// The press reaches the program but never the screen (canonical no-echo, iTerm2's password mode).
     #[inline]
     #[must_use]
     pub const fn swallows_input(self) -> bool {
@@ -261,8 +192,7 @@ impl TtyEcho {
         self.echo && self.canonical
     }
 
-    /// Whether writing `byte` into this line discipline triggers a terminal signal
-    /// (`ISIG` enabled and `byte` matches `VINTR`, `VQUIT`, or `VSUSP`).
+    /// Whether writing `byte` into this line discipline triggers a terminal signal (`ISIG` enabled and `byte` matches `VINTR`, `VQUIT`, or `VSUSP`).
     #[inline]
     #[must_use]
     pub const fn intercepts_signal_byte(self, byte: u8) -> bool {
@@ -273,12 +203,7 @@ impl TtyEcho {
     }
 }
 
-/// The slave's signal characters (`c_cc[VINTR]`, `c_cc[VQUIT]`, `c_cc[VSUSP]`), read
-/// while `ISIG` is set. The line discipline turns each into a signal for the
-/// foreground group as it is written: the byte never enters the input queue, and
-/// (unless `NOFLSH`) the queue is flushed. With `ISIG` off they queue like any byte. A
-/// remapped `VINTR` moves the signal with it. `None` is a disabled character
-/// (`_POSIX_VDISABLE`: 0xff on macOS, NUL on Linux).
+/// The slave's signal characters (`c_cc[VINTR]`, `c_cc[VQUIT]`, `c_cc[VSUSP]`), read while `ISIG` is set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TtySignals {
     /// `VINTR` (SIGINT; `^C` by default).
@@ -333,8 +258,7 @@ impl TtySignals {
         matches!(self.susp, Some(b) if b == byte)
     }
 
-    /// Whether `byte`, written into the PTY, is turned into a signal rather
-    /// than queued.
+    /// Whether `byte`, written into the PTY, is turned into a signal rather than queued.
     #[inline]
     #[must_use]
     pub const fn signals(self, byte: u8) -> bool {
@@ -342,37 +266,19 @@ impl TtySignals {
     }
 }
 
-/// Which process a session's shell pid named when the session took it; every
-/// pid-addressed signal at teardown re-verifies it first.
-///
-/// A shell adopted across a seamless update has launchd as its parent, so its pid is
-/// freed when it exits; if the pane stays open and the pid is reissued, a teardown
-/// `killpg(pid, …)` would hit an unrelated group (`getpgid(pid) == pid` holds for any
-/// group leader). So the session records the process start time while the pid is
-/// provably the shell ([`record_spawned_shell`], [`record_adopted_shell`]), and
-/// [`ShellIdentity::verify`] compares it with the kernel's current answer. With nothing
-/// proven, teardown signals only the terminal's foreground group ([`hangup_shell`]).
-///
-/// A value, not a capability: the check is always against the kernel, which no caller
-/// can forge.
+/// Which process a session's shell pid named when the session took it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShellIdentity {
     /// The shell's pid, also its process-group and session id.
     pub pid: i32,
-    /// The start time recorded when the session took the shell, in a per-platform unit
-    /// (microseconds since the epoch on macOS, clock ticks since boot on Linux). `None`
-    /// when it could not be recorded.
+    /// Session start time in platform units (microseconds since epoch on macOS, clock ticks since boot on Linux).
     pub birth: Option<u64>,
-    /// The shell is this process's own child (a fresh spawn). Until it is reaped its
-    /// pid cannot be reissued, so an unreaped-child answer from `waitid(WNOWAIT)` is
-    /// proof, and the only one once the shell is a zombie (libproc reports no start
-    /// time for a zombie).
+    /// The shell is this process's own child (a fresh spawn).
     pub own_child: bool,
 }
 
 impl ShellIdentity {
-    /// An identity from recorded parts (production records through
-    /// [`record_spawned_shell`] / [`record_adopted_shell`]).
+    /// An identity from recorded parts (production records through [`record_spawned_shell`] / [`record_adopted_shell`]).
     #[inline]
     #[must_use]
     pub const fn from_parts(pid: i32, birth: Option<u64>, own_child: bool) -> Self {
@@ -383,9 +289,7 @@ impl ShellIdentity {
         }
     }
 
-    /// Nothing recorded, nothing ever proven: [`Self::verify`] is `false` for
-    /// every pid, so teardown never signals by pid. Stub sessions (pid `-1`)
-    /// carry this.
+    /// Nothing recorded, nothing ever proven.
     #[inline]
     #[must_use]
     pub const fn unproven(pid: i32) -> Self {
@@ -417,11 +321,9 @@ impl ShellIdentity {
 /// What [`hangup_shell`] signalled, so tests observe teardown's choice directly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShellHangup {
-    /// The recorded shell was verified and its process group got `SIGHUP`
-    /// (`docs/DESIGN-pty-keeper-2026-09-26.md` F3).
+    /// The recorded shell was verified and its process group got `SIGHUP` (`docs/DESIGN-pty-keeper-2026-09-26.md` F3).
     Shell(i32),
-    /// The shell could not be verified; the terminal's foreground process group
-    /// (`tcgetpgrp(master)`) got `SIGHUP` instead.
+    /// The shell could not be verified.
     Foreground(i32),
     /// Neither: nothing was signalled.
     Nothing,
@@ -447,10 +349,6 @@ impl ShellHangup {
 }
 
 /// How a spawned child ended, as far as the platform can say.
-///
-/// [`collect_exit_status`] never blocks, so "not yet exited" and "not ours to reap"
-/// both answer `None`. An adopted session (a child of the previous aterm) never yields
-/// a status: treat `None` as unknown, never as success.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChildExit {
     /// Normal termination with this status code.
@@ -507,8 +405,7 @@ impl SpawnedShell {
     }
 }
 
-/// Clamp a requested PTY window dimension (`cols` or `rows`) to at least `1` cell,
-/// substituting `fallback` (or `1` if `fallback == 0`) when `cells == 0`.
+/// Clamp a PTY window dimension (`cols` or `rows`) to at least `1` cell, using `fallback` when `cells == 0`.
 #[inline]
 #[must_use]
 pub const fn clamp_winsize_cells(cells: u16, fallback: u16) -> u16 {
@@ -548,21 +445,15 @@ pub const fn decode_winsize_le(bytes: [u8; 8]) -> (u16, u16, u16, u16) {
     (cols, rows, xpixel, ypixel)
 }
 
-/// Declares the calling thread `QOS_CLASS_USER_INTERACTIVE` (macOS; a no-op elsewhere,
-/// Windows included), for a worker holding a lock the UI thread contends (the sink's spill
-/// drainer) or a harness that must run at the app's render QoS. A safe wrapper for
-/// `forbid(unsafe_code)` callers.
+/// Promote the calling thread to `QOS_CLASS_USER_INTERACTIVE` on macOS (no-op elsewhere).
 pub fn declare_interactive_thread() {
     #[cfg(target_os = "macos")]
-    // SAFETY: sets this thread's own QoS class; takes no pointers and mutates no
-    // shared state, so there is nothing for another thread to observe.
+    // SAFETY: sets this thread's own QoS class.
     unsafe {
         libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
     }
 }
 
-// The console host a Windows pseudoconsole runs in (aterm.toml `conpty`): the
-// types on every platform, the no-op parity of the window's calls off Windows.
 mod console_host;
 pub use console_host::{ConsoleHostChoice, ConsoleHostKind, ConsoleHostReport};
 #[cfg(unix)]
@@ -578,8 +469,6 @@ pub use unix_shell::{
     ShellOrigin, fallback_shell, login_shell, select_shell_with_origin, shell_cannot_start,
     shell_env_for_child,
 };
-// Releasing a writer blocked in a synchronous input write (the ConPTY backend's
-// sever and stop); platform-free, so the unix suite runs it.
 #[cfg(any(windows, test))]
 mod input_release;
 #[cfg(windows)]
@@ -587,9 +476,6 @@ mod windows;
 #[cfg(windows)]
 pub use windows::*;
 
-// Tests fork outside `InheritStrip::prepare` (raw `fork`s, a `setsid` stand-in's
-// `pre_exec`) while sibling threads call libnotify, and a child can die inside `fork()`
-// (4 in 160 loaded runs). So libnotify's once-gate is passed at image load.
 #[cfg(all(test, target_os = "macos"))]
 aterm_uds::pass_libnotify_gate_at_load!();
 
@@ -630,7 +516,6 @@ mod tests {
             keys.contains(&"PATH".to_string()),
             "PATH must pass through to the child"
         );
-        // `env_add` overrides the inherited TERM, which appears exactly once.
         let terms: Vec<&OsString> = out
             .iter()
             .filter(|(k, _)| k == &os("TERM"))
@@ -692,11 +577,7 @@ mod tests {
     /// aterm launched with its compositor connection handed down (`WAYLAND_SOCKET`): no
     /// shell gets the variable, with or without the terminal claimed, since the
     /// descriptor it names is closed in every child, and a Wayland client run from the
-    /// shell would take that number as its connection; `WAYLAND_DISPLAY` reaches it. A
-    /// Linux window whose display answers forks session 0 before its own connection
-    /// takes the variable out of aterm's environment (LINUX-6).
-    ///
-    /// NEGATIVE CONTROL: without the filter, the variable reaches both shells.
+    /// shell would take that number as its connection; `WAYLAND_DISPLAY` reaches it.
     #[test]
     fn build_child_env_drops_a_compositor_connection_handed_down_by_number() {
         use std::ffi::OsString;
@@ -842,11 +723,6 @@ mod tests {
         }
     }
 
-    // Windows env names are case-insensitive, so any casing of a denied key is denied:
-    // the prefixes (`ANTHROPIC_`, `CLAUDE`, `CURSOR_`) and an exact name, the retired
-    // update token (a secret, so a leak costs the most). The exact name was
-    // `ATERM_CONTAINMENT_MODE` until that knob left `ENV_DENY_VARS`; denied in no case
-    // since, it stood for nothing about case.
     #[cfg(windows)]
     #[test]
     fn build_child_env_denies_mixed_case_keys_on_windows() {
@@ -871,7 +747,6 @@ mod tests {
         );
     }
 
-    // Unix env names are case-sensitive: lowercase `anthropic_api_key` is another variable.
     #[cfg(unix)]
     #[test]
     fn build_child_env_stays_case_sensitive_on_unix() {

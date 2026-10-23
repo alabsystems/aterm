@@ -4,6 +4,7 @@
 #![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 
 /// `eprintln!` that cannot panic, for every stderr line this crate writes at
+/// runtime.
 macro_rules! stderr_line {
     ($($arg:tt)*) => {{
         use ::std::io::Write as _;
@@ -13,6 +14,7 @@ macro_rules! stderr_line {
 pub(crate) use stderr_line;
 
 /// The window's `--verbose` flag, handed down by the host at launch: the surface
+/// notes (present mode, EDR swapchain, the scRGB fallbacks) print only under it.
 static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Records the host's `--verbose` launch flag.
@@ -67,6 +69,10 @@ pub use renderer::{
 pub use renderer::{
     EFFECT_PIPELINE_COUNT, EFFECT_PIPELINE_NAMES, EFFECT_PIPELINES, EffectPipeline,
 };
+/// A window's own presenter, which the GL arm posts frames through where a
+/// window surface would stall the window system.
+#[cfg(target_os = "linux")]
+pub use renderer::{FrameDraw, FrameSink};
 /// Per-frame GPU execution timing (`gpu_time`).
 pub mod gpu_time;
 /// Present-to-glass latency measurement (`present_glass`).
@@ -89,10 +95,13 @@ pub mod tray_card_ring;
 static VISUAL_SWAPCHAIN_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 /// Whether a request was withdrawn this run (GPU init failed, the first
+/// composition configure failed, or the device was lost), so the "caption
+/// only" diagnostic can say so rather than suggest a restart.
 #[cfg(windows)]
 static VISUAL_SWAPCHAIN_WITHDRAWN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 /// Whether [`GpuContext::new`] actually built the visual path (requested and
+/// the compiled Windows backend, today wgpu's DX12, won adapter selection).
 #[cfg(windows)]
 static VISUAL_SWAPCHAIN_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -178,10 +187,13 @@ pub struct GpuContext {
     #[cfg(wgpu_arm)]
     pub(crate) adapter: wgpu::Adapter,
     /// Set by wgpu's device-lost callback (driver install or update, TDR reset,
+    /// eGPU unplug, `device.destroy()`).
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The driver's message from that callback (set once, only when non-empty),
+    /// read back by [`Self::device_loss_reason`] for the frontend's one line.
     device_loss_msg: std::sync::Arc<std::sync::OnceLock<String>>,
     /// The Metal loss latch, wired once at construct so `device_lost()` (and
+    /// `recover_from_gpu_loss`) consumes Metal loss through the same seam.
     #[cfg(target_os = "macos")]
     metal_loss: std::sync::OnceLock<std::sync::Arc<metal::loss::LossLatch>>,
     /// Whether this instance uses the Windows DirectComposition visual swapchain.
@@ -195,6 +207,8 @@ pub struct GpuContext {
 }
 
 /// Row alignment required by `copy_texture_to_buffer`, also the frame byte
+/// contract the Metal readback reproduces; checked against wgpu's constant
+/// where wgpu compiles.
 const ALIGN: usize = 256;
 #[cfg(wgpu_arm)]
 const _: () = assert!(ALIGN == wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize);
@@ -237,10 +251,13 @@ fn parse_gpu_power(v: &str) -> Option<wgpu::PowerPreference> {
 }
 
 /// One context made at a time in a process ([`GpuContext::one_at_a_time`]):
+/// its instance, adapter and device.
 #[cfg(wgpu_arm)]
 static GPU_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// `wgpu::Instance::new`, under a name of its own: the lock-order census
+/// resolves a call held under [`GPU_INIT`] by callee name, and a bare `new`
+/// there reads as `GpuContext::new` re-taking the lock.
 #[cfg(wgpu_arm)]
 fn fresh_instance(desc: wgpu::InstanceDescriptor) -> wgpu::Instance {
     wgpu::Instance::new(desc)
@@ -265,7 +282,7 @@ pub(crate) fn instance_descriptor(backends: wgpu::Backends) -> wgpu::InstanceDes
     desc
 }
 
-/// The Vulkan cell's instance flags: the build's, less `DEBUG`. `DEBUG` labels
+/// The Vulkan cell's instance flags: the build's, less `DEBUG`.
 #[inline]
 #[cfg(all(wgpu_arm, unix, not(target_vendor = "apple")))]
 fn vulkan_instance_flags(flags: wgpu::InstanceFlags) -> wgpu::InstanceFlags {
@@ -273,6 +290,7 @@ fn vulkan_instance_flags(flags: wgpu::InstanceFlags) -> wgpu::InstanceFlags {
 }
 
 /// GPU selection development seams ([`aterm_types::dev_seam!`]; shipped
+/// binaries read none of them):
 #[inline]
 #[cfg(wgpu_arm)]
 const fn default_backends() -> wgpu::Backends {
@@ -322,10 +340,11 @@ fn power_preference_from_env() -> wgpu::PowerPreference {
 }
 
 /// The suballocator block floor in MiB: the smallest driver heap wgpu-hal's
+/// allocator creates for the first resource of a memory type.
 #[cfg(wgpu_arm)]
 const MEMBLOCK_FLOOR_MIB: u64 = 16;
 
-/// The block-size ceiling in MiB. The block size doubles per additional live
+/// The block-size ceiling in MiB.
 #[cfg(wgpu_arm)]
 const MEMBLOCK_CEILING_MIB: u64 = 128;
 
@@ -348,10 +367,13 @@ pub(crate) const fn terminal_memory_hints() -> wgpu::MemoryHints {
 }
 
 /// The view-descriptor heap aterm asks a DX12 device for, in descriptors
+/// (`wgpu::Limits::max_non_sampler_bindings`).
 #[cfg(wgpu_arm)]
 const TERMINAL_VIEW_DESCRIPTORS: u32 = 16_384;
 
 /// The optional features aterm asks of an adapter offering `available`:
+/// timestamp queries when offered (the `gpu_time` clock, idle unless a sink
+/// listens), nothing else.
 #[inline]
 #[cfg(wgpu_arm)]
 fn terminal_device_features(available: wgpu::Features) -> wgpu::Features {
@@ -359,6 +381,8 @@ fn terminal_device_features(available: wgpu::Features) -> wgpu::Features {
 }
 
 /// The device limits aterm asks of an adapter on `backend`: wgpu's defaults,
+/// with a DX12 view-descriptor heap sized for a terminal
+/// ([`TERMINAL_VIEW_DESCRIPTORS`]).
 #[inline]
 #[cfg(wgpu_arm)]
 fn terminal_device_limits(backend: wgpu::Backend) -> wgpu::Limits {
@@ -372,6 +396,9 @@ fn terminal_device_limits(backend: wgpu::Backend) -> wgpu::Limits {
 }
 
 /// The instance flags aterm asks for over `backends`: `flags`, less
+/// indirect-call validation on a DX12 instance, which is the Windows build's
+/// ([`default_backends`]) and no other's, and on a GL one, which no build
+/// asks for but the GL arm's wgpu oracle (`gl_replay_tests`).
 #[inline]
 #[cfg(wgpu_arm)]
 fn terminal_instance_flags(
@@ -607,6 +634,7 @@ impl GpuContext {
     }
 
     /// Clamp a texture dimension to `1..=max_texture_dimension_2d`, the
+    /// `GpuContext` equivalent of [`GpuRenderer::clamp_fb_dim`].
     #[inline]
     #[cfg(wgpu_arm)]
     fn clamp_tex_dim(&self, d: u32) -> u32 {
@@ -766,6 +794,8 @@ mod device_request_tests {
     use super::*;
 
     /// The one optional feature aterm asks for is timestamp queries (the
+    /// `gpu_time` clock), and only from an adapter that offers them: a request
+    /// for a feature the adapter lacks fails the whole device.
     #[test]
     fn only_timestamp_queries_are_requested_and_only_when_offered() {
         assert_eq!(
@@ -781,6 +811,8 @@ mod device_request_tests {
     }
 
     /// The DX12 view-descriptor heap is the one device limit aterm moves off
+    /// wgpu's defaults, and only for a DX12 adapter: every other limit, and
+    /// every other backend's whole request, is wgpu's default.
     #[test]
     fn only_a_dx12_device_moves_off_the_default_limits() {
         let defaults = wgpu::Limits::default();
@@ -810,6 +842,8 @@ mod device_request_tests {
     }
 
     /// Indirect-call validation is dropped from a DX12 instance and a GL one,
+    /// and nothing else moves; every other instance keeps the flags it was
+    /// given.
     #[test]
     fn indirect_call_validation_is_dropped_on_dx12_and_gl_instances_only() {
         let indirect = wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL;
@@ -847,6 +881,7 @@ mod device_request_tests {
 }
 
 /// `GpuContext::offscreen_texture` bounds its own extent: `clamp_tex_dim`
+/// floors to 1 and caps at `max_texture_dimension_2d`.
 #[cfg(all(test, wgpu_arm))]
 mod offscreen_extent_tests {
     #[test]
@@ -872,6 +907,8 @@ mod offscreen_extent_tests {
 }
 
 /// The device `GpuContext::new` builds carries the limits its backend is asked
+/// for (`terminal_device_limits`), and on DX12 its view-descriptor heap
+/// recycles.
 #[cfg(all(test, wgpu_arm))]
 mod device_limits_tests {
     use super::{GpuContext, TERMINAL_VIEW_DESCRIPTORS, terminal_device_limits};
@@ -882,6 +919,8 @@ mod device_limits_tests {
     }
 
     /// The request reaches the device: a DX12 device holds the terminal-sized
+    /// heap, every other device wgpu's default limits (macOS's oracle lane
+    /// runs on Metal, so this is where it shows its request is unchanged).
     #[test]
     fn the_device_carries_the_limits_its_backend_is_asked_for() {
         let ctx = context();
@@ -896,6 +935,7 @@ mod device_limits_tests {
     }
 
     /// The heap's sizing leans on one property, checked here rather than
+    /// assumed: a DROPPED bind group gives its descriptors back.
     #[cfg(windows)]
     #[test]
     fn a_dropped_bind_group_returns_its_view_descriptors() {
@@ -964,11 +1004,13 @@ mod device_limits_tests {
 }
 
 /// Fail-soft: the latch-withdrawal decision a failed window-surface attach
+/// drives (`surface_attach_fallback`).
 #[cfg(test)]
 mod surface_attach_fallback_tests {
     use super::{SurfaceAttachFallback as F, surface_attach_fallback};
 
     /// `RebuildOpaque` iff visual and no other GPU window; other windows
+    /// dominate.
     #[test]
     fn rebuild_iff_visual_and_alone() {
         let rows = [

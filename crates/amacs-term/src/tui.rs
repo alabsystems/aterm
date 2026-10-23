@@ -1,44 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The terminal face (design §5.4, §5.7; slice T3): `amacs FILE` over ssh,
-//! in tmux or screen, in any terminal that is not an aterm window, and with
-//! `-nw`, edits in the terminal itself, with the engine the native view runs
-//! and its terminal keymap ([`Profile::Terminal`]: `C-s` is isearch).
-//!
-//! One loop: wait on the terminal (its bytes and the signal wake, which
-//! [`DevTty`] polls together), decode, hand each key to the engine
-//! ([`EditorWorkspace::handle_input`]), carry out what it asks
-//! ([`EditorEffect`]), then draw the frame ([`crate::render`]) as the cells
-//! that changed. A file is read and written only through amacs-files, with
-//! the GUI's admission rules: the realpath, the size limit, UTF-8 only, a
-//! regular file, its byte order mark and CRLF kept, a file that does not exist
-//! yet admitted empty and created by its first save, and an atomic save that
-//! refuses when the disk changed since the read. A second `C-x C-s` straight
-//! after that refusal overwrites the disk's version; `M-x revert-buffer`
-//! takes it instead.
-//!
-//! `C-x C-c` (and `C-x k`) closes the file, asking `Save FILE? (y, n, q)`
-//! when it has unsaved changes; `C-c C-c` saves and closes, `C-c C-k` closes
-//! without saving and ends the run with status 1, as the native face's done
-//! and abort do (design §6.5). Several files are edited one after another,
-//! sharing the kill ring and nothing else. `C-z` stops the process as a
-//! shell's job control expects, and a resize, or the continue after a stop,
-//! repaints at the terminal's size. A kill also goes to the terminal's
-//! clipboard as an OSC 52 write (never a read), when that is on.
-//!
-//! The terminal is put back exactly however the run ends: on return, a
-//! panic, SIGTERM or a hangup ([`DevTty`]'s guard, slice T2). There is no
-//! draft journal yet (slice T5), so a TUI that is killed loses unsaved edits.
-//!
-//! The loop runs on any [`Tty`], so its tests drive it headless on an
-//! in-memory terminal (`tests/tui_loop.rs`).
-//!
-//! The rules small enough to prove are scalar fns with Trust contracts
-//! ([`saves_on`], [`discards_on`], [`cancels_on`], [`fits_osc52`]), each
-//! `ensures` citing a Clean theorem about the compiled body (SPECS.md).
-//!
-//! [`DevTty`]: aterm_tty::tty::DevTty
+//! The terminal face (design §5.4, §5.7; slice T3).
 
 use std::collections::VecDeque;
 use std::io;
@@ -75,17 +38,11 @@ use crate::client::{self, Target};
 use crate::decide;
 use crate::render;
 
-/// The kitty keyboard flags the face pushes: disambiguate (1) and report
-/// alternate keys (4), which keep an input method's composition safe (D-20).
+/// The kitty keyboard flags the face pushes.
 pub const KITTY_FLAGS: u8 = 1 | 4;
 
-/// The most text one OSC 52 write carries: aterm's own cap on what a
-/// program may put on its clipboard (64 KiB of decoded text). A longer kill
-/// stays in the kill ring only.
+/// The most text one OSC 52 write carries.
 pub const OSC52_LIMIT: usize = 64 * 1024;
-// `fits_osc52`'s clause and theorem spell the limit as the literal 64 KiB, and
-// no landing check runs the Trust lane that would reject them once the
-// constant moved: an ordinary build fails here instead.
 const _: () = assert!(OSC52_LIMIT == 65_536);
 
 /// How many lines one wheel notch scrolls.
@@ -100,19 +57,16 @@ const HINT: &str = "C-x C-s saves · C-x C-c exits · C-g cancels";
 /// terminal back on a panic (`crates/aterm/tests/amacs_pty.rs`).
 const INJECT_PANIC_SEAM: &str = "ATERM_AMACS_INJECT_PANIC";
 
-/// The settings the face runs with. `[amacs]` (design §9) fills them once
-/// the config parser lands (slice C1); until then they are its defaults.
+/// The settings the face runs with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Options {
-    /// `[amacs] osc52`: a kill also goes to the terminal's clipboard.
+    /// `[amacs] osc52`.
     pub osc52: bool,
-    /// `[amacs] mouse`: a press sets point, a drag the region, the wheel
-    /// scrolls.
+    /// `[amacs] mouse`.
     pub mouse: bool,
     /// The program the edit is for (`for=`), named on the modeline.
     pub for_word: Option<String>,
-    /// aterm's `ambiguous_width`: how wide an East Asian ambiguous character
-    /// is drawn.
+    /// aterm's `ambiguous_width`.
     pub ambiguous: AmbiguousWidth,
 }
 
@@ -127,8 +81,7 @@ impl Default for Options {
     }
 }
 
-/// How a run of the face ended: its exit status, and the lines to say on
-/// stderr once the terminal is put back (without the `amacs: ` lead).
+/// How a run of the face ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Outcome {
     pub status: u8,
@@ -138,19 +91,13 @@ pub struct Outcome {
 /// How one file's edit ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Close {
-    /// The file was closed (`C-x C-c`, `C-x k`), saved or not as the person
-    /// answered: the run goes on to the next file.
+    /// The file was closed (`C-x C-c`, `C-x k`), saved or not as the person answered.
     Closed,
     /// `C-c C-c`: saved, then closed.
     Finished,
-    /// `C-c C-k`: closed without saving; the run ends with status 1.
+    /// `C-c C-k`: closed without saving.
     Aborted,
-    /// A read found the terminal's end (EOF, or EIO with SIGHUP ignored, as
-    /// under `nohup`). The kernel's SIGHUP itself never gets here: under
-    /// [`DevTty`] it ends the process as SIGHUP does, the terminal put back
-    /// first, with nothing said.
-    ///
-    /// [`DevTty`]: aterm_tty::tty::DevTty
+    /// A read found the terminal's end (EOF, or EIO with SIGHUP ignored, as under `nohup`).
     Hangup,
 }
 
@@ -167,13 +114,8 @@ impl Close {
     }
 }
 
-// The answers to `Save FILE? (y, n, q)`, read as Emacs's `save-some-buffers`
-// reads them, from the byte a key types (`answer_byte`). Trust's kernel
-// import takes scalars only, so each class is its own bool fn.
-
 trust_contract_fn! {
-    /// The keys that answer "save it": `y`, `Y`, SPC and `!`. Proved for
-    /// every byte.
+    /// The keys that answer "save it".
     #[must_use]
     pub fn saves_on(byte: u8) -> bool
     clauses [ensures result == (byte == 32 || (byte == 33 || (byte == 89 || byte == 121))) by saves_on_is_the_class]
@@ -183,8 +125,7 @@ trust_contract_fn! {
 }
 
 trust_contract_fn! {
-    /// The keys that answer "close it without saving": `n`, `N` and DEL.
-    /// Proved for every byte.
+    /// The keys that answer "close it without saving".
     #[must_use]
     pub fn discards_on(byte: u8) -> bool
     clauses [ensures result == (byte == 78 || (byte == 110 || byte == 127)) by discards_on_is_the_class]
@@ -194,8 +135,7 @@ trust_contract_fn! {
 }
 
 trust_contract_fn! {
-    /// The keys that take the question back and go on editing: `q`, `Q`,
-    /// ESC and `C-g`. Proved for every byte.
+    /// The keys that take the question back and go on editing.
     #[must_use]
     pub fn cancels_on(byte: u8) -> bool
     clauses [ensures result == (byte == 7 || (byte == 27 || (byte == 81 || byte == 113))) by cancels_on_is_the_class]
@@ -205,9 +145,7 @@ trust_contract_fn! {
 }
 
 trust_contract_fn! {
-    /// Whether a kill of `len` bytes goes to the terminal's clipboard: at
-    /// most [`OSC52_LIMIT`], the most aterm takes from one OSC 52 write.
-    /// Proved for every length.
+    /// Whether a kill of `len` bytes goes to the terminal's clipboard.
     #[must_use]
     pub fn fits_osc52(len: usize) -> bool
     clauses [ensures result == (len <= 65536) by fits_osc52_is_the_limit]
@@ -216,9 +154,6 @@ trust_contract_fn! {
     }
 }
 
-// Specs `save-answer-classes` and `osc52-limit` (SPECS.md): each class is
-// exactly its bytes, and the limit is aterm's 64 KiB, kernel-checked against
-// the compiled bodies. The three classes are disjoint by their statements.
 verify_island! {
     clean {
         theorem saves_on_is_the_class (b : UInt8) :
@@ -258,9 +193,7 @@ fn answer_byte(key: &Key, mods: Modifiers, text: Option<char>) -> Option<u8> {
     }
 }
 
-/// The editor in a terminal: the engine's workspace (one kill ring for
-/// every file of the run), the terminal's capabilities, the decoder and what
-/// the terminal shows.
+/// The editor in a terminal.
 pub struct Tui {
     workspace: EditorWorkspace,
     write: WriteCap,
@@ -410,9 +343,7 @@ fn line_column_offset(text: &str, line: u32, column: Option<u32>) -> usize {
     start.saturating_add(within)
 }
 
-/// Why the file host refused to read `path` to open it (or to load it from
-/// disk again), in the save words (`amacs_files::save_words`) aterm says
-/// too: never the host's stage or the system's error text.
+/// Why the file host refused to read `path` to open it (or to load it from disk again), in the save words (`amacs_files::save_words`) aterm says too.
 pub(crate) fn host_error(path: &Path, error: &DocumentHostError) -> String {
     save_words::words(Speaker::Amacs, path, &Failure::Open(error))
 }
@@ -458,8 +389,7 @@ fn osc52(text: &str) -> Option<Vec<u8>> {
 }
 
 impl Tui {
-    /// A face that edits with `write`, the run's one buffer-write capability
-    /// (minted by the launcher, `aterm_cli::amacs_launch`).
+    /// A face that edits with `write`, the run's one buffer-write capability (minted by the launcher, `aterm_cli::amacs_launch`).
     #[must_use]
     pub fn new(write: WriteCap, options: Options) -> Self {
         Self {
@@ -483,8 +413,6 @@ impl Tui {
     }
 
     /// Edit each of `targets` in turn on `tty`, and put the terminal back.
-    /// A file that cannot be opened ends the run with status 1, as an abort
-    /// does; the rest are not opened.
     pub fn edit<T: Tty + ?Sized>(&mut self, tty: &mut T, targets: &[Target]) -> Outcome {
         let mut said = Vec::new();
         let mut status = 0;
@@ -524,11 +452,9 @@ impl Tui {
         Outcome { status, said }
     }
 
-    /// Open `target` as amacs-files admits a document: its realpath, the
-    /// size limit, UTF-8, a regular file, a missing one as empty.
+    /// Open `target` as amacs-files admits a document.
     ///
     /// # Errors
-    ///
     /// Why the file cannot be edited, worded for a person.
     pub fn open(&mut self, target: &Target) -> Result<Buffer, String> {
         let named = |why: String| format!("{}: {why}", target.path.display());
@@ -554,12 +480,6 @@ impl Tui {
         persistence
             .register(document, granted.grant.id, granted.observed, &granted.text)
             .map_err(|_| named("it is already open in this run".to_string()))?;
-        // Each file has a store of its own, and a store numbers its documents
-        // from one, so this file's id is the one every earlier file of the run
-        // had. What the workspace keeps by document (the undo history, the
-        // global marks, the yank and commit records) is that earlier file's:
-        // dropped here, or an undo here would replay its edits on this text.
-        // The kill ring is the run's, and stays.
         self.workspace.forget(document);
         let view_id = DocumentViewId(self.next_view);
         self.next_view = self.next_view.saturating_add(1);
@@ -581,7 +501,6 @@ impl Tui {
         let synced = store
             .snapshot(document)
             .map_or(Seq(0), |snapshot| snapshot.seq);
-        // M-q fills to the language's column: 72 in a commit message.
         self.workspace.options.fill_column = language.fill_column();
         self.asking = None;
         self.status = Some(if missing {
@@ -607,13 +526,9 @@ impl Tui {
         })
     }
 
-    /// Edit `buffer` until it is closed or the terminal hangs up, entering
-    /// the screen first if this is the run's first file. A run that ended in
-    /// a hangup may be run again on a terminal that has more to read: the
-    /// file is where it was, an open question still asked.
+    /// Edit `buffer` until it is closed or the terminal hangs up, entering the screen first if this is the run's first file.
     ///
     /// # Errors
-    ///
     /// The terminal's OS error.
     pub fn run<T: Tty + ?Sized>(&mut self, tty: &mut T, buffer: &mut Buffer) -> io::Result<Close> {
         if !self.started {
@@ -649,8 +564,7 @@ impl Tui {
     }
 
     /// Enter the screen: ask the terminal what it can do, then set the modes
-    /// the face uses, each put back however the run ends. Returns the
-    /// signals that arrived during the probe, for the loop to handle.
+    /// the face uses, each put back however the run ends.
     fn start<T: Tty + ?Sized>(&mut self, tty: &mut T) -> io::Result<Signals> {
         self.size = tty.size()?;
         let probed = probe::probe(tty, &mut self.decoder)?;
@@ -663,9 +577,6 @@ impl Tui {
         if self.options.mouse {
             tty.enable(Mode::Mouse)?;
         }
-        // A terminal that does not know 2004 ignores the request; one that
-        // does but answered no DECRQM still brackets its pastes, so each
-        // inserts as one transaction instead of being typed.
         tty.enable(Mode::Paste)?;
         if self.caps.focus {
             tty.enable(Mode::Focus)?;
@@ -679,12 +590,9 @@ impl Tui {
         Ok(probed.signals)
     }
 
-    /// Put back every mode the screen was entered with, in the one order
-    /// every restore uses (the drawing state first, the alternate screen
-    /// last). [`Self::edit`] ends with it.
+    /// Put back every mode the screen was entered with, in the one order every restore uses (the drawing state first, the alternate screen last).
     ///
     /// # Errors
-    ///
     /// The terminal's OS error.
     pub fn finish<T: Tty + ?Sized>(&mut self, tty: &mut T) -> io::Result<()> {
         if !std::mem::take(&mut self.started) {
@@ -768,9 +676,6 @@ impl Tui {
             // A stop asked from outside (`kill -TSTP`): stop as C-z does.
             return self.suspend(tty, buffer);
         }
-        // A continue is also the end of a stop this process did not make
-        // (SIGSTOP, then `fg`), during which the window may have changed size:
-        // read like a resize.
         if signals.contains(Signals::WINCH) || signals.contains(Signals::CONT) {
             self.refit(tty, buffer)?;
         }
@@ -779,15 +684,10 @@ impl Tui {
 
     /// `suspend-frame` (`C-z`, or a SIGTSTP from outside): the shell gets the
     /// terminal back until `fg`, then the whole frame is drawn again, once,
-    /// at the size the terminal has then. A resize while stopped sent its
-    /// SIGWINCH to the shell, which had the terminal, so nothing else says
-    /// the size changed.
+    /// at the size the terminal has then.
     fn suspend<T: Tty + ?Sized>(&mut self, tty: &mut T, buffer: &mut Buffer) -> io::Result<()> {
         loop {
             tty.suspend()?;
-            // The SIGCONT that continued the process is pending: taken with
-            // the stop, so it draws no second frame. A stop that arrived
-            // meanwhile stops again.
             if !tty.take_signals()?.contains(Signals::TSTP) {
                 break;
             }
@@ -873,7 +773,6 @@ impl Tui {
             {
                 let byte = match self.rows.get(usize::from(row)) {
                     Some(drawn) => drawn.byte_at(col),
-                    // Below the last line: its end.
                     None => self
                         .rows
                         .last()
@@ -901,8 +800,6 @@ impl Tui {
         buffer: &mut Buffer,
         input: EditorInput,
     ) -> io::Result<Option<Close>> {
-        // Emacs clears the echo area at the next key; a focus change is no
-        // key, and leaves an offer to overwrite standing.
         let pressed = !matches!(input, EditorInput::Focus(_));
         if pressed {
             self.status = None;
@@ -922,8 +819,6 @@ impl Tui {
             .effects
             .iter()
             .any(|effect| matches!(effect, EditorEffect::SaveDocument { .. }));
-        // "C-x C-s again" means the next command: anything else between
-        // takes the offer back.
         if pressed && !saving && !buffer.view.chord_pending() {
             buffer.overwrite = false;
         }
@@ -1029,10 +924,6 @@ impl Tui {
 
     /// Save `buffer` to its file, atomically, refusing when the disk changed
     /// since it was read (unless this save takes up the offer to overwrite).
-    /// Answers whether the file now holds the buffer. A save that does not
-    /// land says why in the save words aterm says too
-    /// ([`amacs_files::save_words`]), never a step's name, a reducer's state
-    /// or the system's error text.
     fn save(&mut self, buffer: &mut Buffer) -> bool {
         let name = buffer.name.clone();
         let path = buffer.path.clone();
@@ -1051,8 +942,6 @@ impl Tui {
             self.status = Some(format!("Could not save {name}: {why}"));
             return false;
         }
-        // A save whose preflight found the same bytes under a new identity
-        // rebinds and is offered again at once: one retry.
         for _ in 0..2 {
             let Some(snapshot) = buffer.store.snapshot(buffer.document) else {
                 self.status = Some(format!("Could not save {name}: the buffer is gone"));
@@ -1167,8 +1056,6 @@ impl Tui {
         let (layout, echo) = self.layout(buffer);
         let text = buffer.text();
         let lines = lines_of(&text, buffer.starts.as_deref());
-        // An echo area that grew or shrank changes the rows the buffer has:
-        // a new count reveals the caret, as a resize does.
         buffer
             .view
             .reconcile_viewport_with(&lines, usize::from(layout.body));
@@ -1279,9 +1166,7 @@ fn reload(buffer: &mut Buffer) -> Result<(), String> {
     Ok(())
 }
 
-/// The terminal face over `/dev/tty`, to its exit status: what
-/// [`crate::run_client`] runs when the edit is this terminal's. `why`, when
-/// given, is why the aterm window did not take the files, said first.
+/// The terminal face over `/dev/tty`, to its exit status.
 #[must_use]
 pub fn run_tui(
     write: WriteCap,
@@ -1309,7 +1194,6 @@ pub fn run_tui(
         tui.inject_panic = aterm_types::dev_seam!(INJECT_PANIC_SEAM)
             .and_then(|seam| seam.to_str().and_then(|seam| seam.chars().next()));
         let outcome = tui.edit(&mut tty, targets);
-        // The terminal is put back before anything is said on it.
         drop(tty);
         for line in &outcome.said {
             client::say(&mut stderr, line);
@@ -1318,7 +1202,6 @@ pub fn run_tui(
     }
     #[cfg(not(unix))]
     {
-        // The Windows console (slice T4) is not built yet.
         let _ = (write, targets, options);
         client::say(
             &mut stderr,

@@ -1,9 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The agy quiet flow's pure half over the rows, database answers and
-//! messages agy 1.4.0 wrote in the lab (2026-10-17 and 2026-10-18): each
-//! guard positive and negative.
+//! Unit tests for the pure `agy` quiet-upgrade eligibility checks.
 
 use super::*;
 

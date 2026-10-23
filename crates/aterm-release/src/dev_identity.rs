@@ -1,38 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The self-signed "aterm dev" code-signing identity `ship dev-app` signs with
-//! (`ship dev-app identity` makes it), so a dev bundle's macOS privacy grants survive a
-//! rebuild: tccd keys a grant to the code's designated requirement, an ad-hoc one is a
-//! bare `cdhash` (the exact bytes), and a certificate-backed one names
-//! `identifier "com.aterm.aterm.dev" and certificate leaf = H"<sha1>"`, no bytes
-//! (docs/DESIGN-macos-tcc-prompts-2026-08-30.md §3.1 and S6 have the measurements).
-//!
-//! The rules, each load-bearing:
-//! * The identity lives in a keychain of its own, `~/Library/Keychains/aterm-dev.keychain-db`,
-//!   put on the user's search list: codesign finds identities nowhere else.
-//! * That keychain's password is EMPTY and it never auto-locks. A key in any keychain
-//!   under `~/Library/Keychains` carries a `partition_id` ACL entry on which codesign
-//!   raises the key-access dialog; `set-key-partition-list -k <password>` cures it, and
-//!   an empty password lets the cure (and every unlock) run with nothing typed. The cost:
-//!   any process of this user can sign with the key and so keep a dev bundle's grants
-//!   across rebuilds — no wider than the unhardened dev bundle already allows, wider
-//!   than ad hoc.
-//! * The empty password is the ownership proof: a keychain is LOCKED and then opened
-//!   with "" before anything is imported into it or it is deleted (an unlocked keychain
-//!   accepts any password). Our own keychain can refuse a bare unlock; lock-and-reopen
-//!   once heals it, so arming tries that before it calls a keychain foreign.
-//! * The login and default keychains are never locked, opened, created or deleted,
-//!   however a path spells them ([`protected`]): a locked login keychain sets every app
-//!   on the machine prompting.
-//! * No trust setting: `add-trusted-cert` raises an authorization dialog, and codesign
-//!   signs with an untrusted self-signed leaf. So identities are listed WITHOUT `-v`,
-//!   which calls such a leaf "not valid".
-//! * `/usr/bin/openssl` (LibreSSL), pinned: an OpenSSL 3 first on PATH writes a PKCS#12
-//!   `security import` cannot read.
-//! * Every tool call runs under a one-minute hang detector ([`Bounded`]): `security`
-//!   and codesign wait on securityd/trustd, which can stop answering, and then never
-//!   return.
+//! The self-signed "aterm dev" code-signing identity `ship dev-app` signs with (`ship dev-app identity` makes it), so a dev bundle's macOS privacy grants survive a rebuild: tccd keys a grant to the code's designated requirement, an ad-hoc one is a bare `cdhash` (the exact bytes), and a certificate-backed one names `identifier "com.aterm.aterm.dev" and certificate leaf = H"<sha1>"`, no bytes (docs/DESIGN-macos-tcc-prompts-2026-08-30.md §3.1 and S6 have the measurements).
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -54,8 +23,7 @@ pub const NAME: &str = "aterm dev";
 /// fresh `identity` makes another.
 const DAYS: &str = "3650";
 
-/// The one hang detector every tool call runs under: an honest call answers in
-/// well under a second.
+/// The one hang detector every tool call runs under: an honest call answers in well under a second.
 pub const WAIT: Duration = Duration::from_secs(60);
 
 /// A begun keychain is deleted under this shorter bound once the service stopped
@@ -79,14 +47,12 @@ pub fn default_keychain(home: &Path) -> PathBuf {
 /// How a tool child runs: [`Bounded`] in the product, a scripted stand-in in tests.
 pub trait Run {
     /// `cmd`'s output, if it finishes within `wait`.
-    ///
     /// # Errors
     /// [`RunError`]: it could not start, or did not finish in time.
     fn run(&self, cmd: &mut Command, wait: Duration) -> Result<Output, RunError>;
 }
 
-/// [`aterm_uds::deadline::output_until`]: the child leads its own group, killed
-/// (`SIGKILL`) at the deadline.
+/// [`aterm_uds::deadline::output_until`]: the child leads its own group, killed (`SIGKILL`) at the deadline.
 pub struct Bounded;
 
 impl Run for Bounded {
@@ -154,9 +120,7 @@ fn identity_hashes(listing: &str) -> Vec<String> {
 }
 
 /// The search list to write so `keychain` is on it: `None` when it is already there,
-/// else every entry read back, in order, with `keychain` last. An EMPTY read is a
-/// refusal, never a list of one: `list-keychains -s` replaces the list, and writing
-/// `keychain` alone would drop login from it.
+/// else every entry read back, in order, with `keychain` last.
 fn search_list_with(current: &[PathBuf], keychain: &Path) -> Result<Option<Vec<PathBuf>>, String> {
     if current.iter().any(|entry| entry == keychain) {
         return Ok(None);
@@ -174,8 +138,7 @@ fn search_list_with(current: &[PathBuf], keychain: &Path) -> Result<Option<Vec<P
 }
 
 /// `path` with a symlink in its LAST component followed, link by link (a relative
-/// target read from the link's own directory). `None` past 32 links or on a link that
-/// cannot be read: what it names cannot be known.
+/// target read from the link's own directory).
 fn follow(path: &Path) -> Option<PathBuf> {
     let mut path = path.to_path_buf();
     for _ in 0..=32 {
@@ -227,10 +190,7 @@ fn folded(path: &Path) -> String {
     path.to_string_lossy().to_ascii_lowercase()
 }
 
-/// Whether `path` is a login or default keychain, every compare case-folded: by its
-/// basename or the one a symlink in its last component names, by the path `named`
-/// (what `security` answers for the login and default keychains) holds, or as the same
-/// file as one of those. A link that cannot be followed counts as protected.
+/// Whether `path` is a login or default keychain, every compare case-folded: by its basename or the one a symlink in its last component names, by the path `named` (what `security` answers for the login and default keychains) holds, or as the same file as one of those.
 #[must_use]
 pub fn protected(path: &Path, named: &[PathBuf]) -> bool {
     let Some(real) = follow(path) else {
@@ -372,14 +332,9 @@ impl Keychain<'_> {
     }
 }
 
-/// Unlock the default identity's keychain for a build and return the identity's SHA-1
-/// (what codesign signs with: unambiguous even if another keychain holds the name).
-/// `Ok(None)`: there is no keychain, so the build signs ad hoc.
-///
+/// Unlock the default identity's keychain for a build and return the identity's SHA-1 (what codesign signs with: unambiguous even if another keychain holds the name).
 /// # Errors
-/// The keychain EXISTS and cannot be used now (foreign, protected, empty, off the search
-/// list, or its service did not answer), with the reason: a build stops on that rather
-/// than sign ad hoc and orphan the grants the identity keeps.
+/// The keychain EXISTS and cannot be used now (foreign, protected, empty, off the search list, or its service did not answer), with the reason: a build stops on that rather than sign ad hoc and orphan the grants the identity keeps.
 pub fn arm(
     keychain: &Path,
     manage_search_list: bool,
@@ -423,14 +378,9 @@ pub fn arm(
     }
 }
 
-/// Make the "aterm dev" identity in `keychain` (idempotent), partition its key for
-/// codesign, put the keychain on the search list when `manage_search_list`, and prove it
-/// by signing a scratch bundle. A keychain this run began is deleted again when the
-/// service stops answering before the identity is usable.
-///
+/// Make the "aterm dev" identity in `keychain` (idempotent), partition its key for codesign, put the keychain on the search list when `manage_search_list`, and prove it by signing a scratch bundle.
 /// # Errors
-/// Any refusal ([`protected`], not ours, a tool that failed), or the service did not
-/// answer — said in one line.
+/// Any refusal ([`protected`], not ours, a tool that failed), or the service did not answer — said in one line.
 pub fn create(keychain: &Path, manage_search_list: bool, run: &dyn Run) -> Result<(), String> {
     let k = Keychain {
         path: keychain,
@@ -502,8 +452,6 @@ fn create_steps(
             "create-keychain",
         )?;
     }
-    // No -l, no -u: neither lock-on-sleep nor a timeout (a fresh keychain locks after
-    // 300 s, and a locked one prompts).
     k.security_ok(
         &[&"set-keychain-settings", &k.path],
         "set-keychain-settings",
@@ -520,8 +468,6 @@ fn create_steps(
         None => {
             let (p12, password) = generate(k, scratch.path())?;
             println!("==> importing into {}", k.path.display());
-            // -T: the two tools named in the key's ACL; the partition list below is
-            // the other half.
             k.security_ok(
                 &[
                     &"import", &p12, &"-k", &k.path, &"-P", &password, &"-T", &CODESIGN, &"-T",
@@ -543,7 +489,6 @@ fn create_steps(
             hash
         }
     };
-    // Every run: idempotent, and the one step that decides whether codesign asks.
     k.security_ok(
         &[
             &"set-key-partition-list",
@@ -632,8 +577,6 @@ fn generate(k: &Keychain<'_>, dir: &Path) -> Result<(PathBuf, String), Stop> {
         )?,
         "req",
     )?;
-    // `security import` takes the wrapping passphrase only as -P (its alternative is a
-    // GUI sheet); it guards a file in a 0700 directory for one command.
     let rand = ok(k.call(OPENSSL, &[&"rand", &"-hex", &"16"], WAIT)?, "rand")?;
     let password = String::from_utf8_lossy(&rand.stdout).trim().to_string();
     if password.is_empty() {
@@ -666,8 +609,6 @@ fn generate(k: &Keychain<'_>, dir: &Path) -> Result<(PathBuf, String), Stop> {
 
 /// Sign a scratch bundle with the dev bundle id by hash, as `ship dev-app` signs, and
 /// read it back: it must verify `--strict` and its requirement must name THIS leaf.
-/// Signing is the only check that means anything: `find-identity -v` calls the leaf
-/// not valid.
 fn self_check(k: &Keychain<'_>, hash: &str, dir: &Path) -> Result<(), Stop> {
     let app = dir.join("probe.app");
     let macos = app.join("Contents/MacOS");
@@ -738,9 +679,7 @@ fn names_leaf(codesign_output: &str, hash: &str) -> bool {
         })
 }
 
-/// Delete `keychain` and its identity, only when it opens with the empty password; no
-/// keychain is nothing to do.
-///
+/// Delete `keychain` and its identity, only when it opens with the empty password; no keychain is nothing to do.
 /// # Errors
 /// Refused ([`protected`], not ours), or the service did not answer.
 pub fn remove(keychain: &Path, run: &dyn Run) -> Result<(), String> {
@@ -760,7 +699,6 @@ pub fn remove(keychain: &Path, run: &dyn Run) -> Result<(), String> {
         k.refuse_protected()?;
         k.open_locked()?;
         asked = true;
-        // delete-keychain drops the file AND its search-list entry.
         k.security_ok(&[&"delete-keychain", &k.path], "delete-keychain")?;
         Ok(())
     })();
@@ -821,10 +759,7 @@ impl Drop for PrivateDir {
     }
 }
 
-/// A stand-in for the tools [`Run`] starts: a small model of macOS's keychains (files,
-/// passwords, lock state, identities, the user's search list) behind `security`, and
-/// scripted `openssl`, `codesign`, `lsregister` and `--version` answers. Every call is
-/// logged, and nothing reaches a real tool.
+/// A stand-in for the tools [`Run`] starts: a small model of macOS's keychains (files, passwords, lock state, identities, the user's search list) behind `security`, and scripted `openssl`, `codesign`, `lsregister` and `--version` answers.
 #[cfg(test)]
 pub(crate) mod fake {
     use super::*;
@@ -1073,7 +1008,6 @@ mod tests {
 
     fn scratch() -> (aterm_tempfile::TempDir, PathBuf) {
         let dir = aterm_tempfile::tempdir().expect("scratch dir");
-        // Resolved: the guard compares resolved paths, and the temp root is a link.
         let path = std::fs::canonicalize(dir.path()).expect("canonical scratch");
         (dir, path)
     }
@@ -1141,12 +1075,10 @@ mod tests {
         let argv = |words: &[&str]| -> Vec<Vec<String>> {
             vec![words.iter().map(|w| (*w).to_string()).collect()]
         };
-        // No -l, no -u: the keychain never locks on sleep or after a timeout.
         assert_eq!(
             fake.calls("security", "set-keychain-settings"),
             argv(&["security", "set-keychain-settings", &shown])
         );
-        // The key's partition list names codesign, set with the empty password.
         assert_eq!(
             fake.calls("security", "set-key-partition-list"),
             argv(&[
@@ -1325,7 +1257,7 @@ mod tests {
     /// The guard's other half: the file `security` names for the login or default
     /// keychain, seen through a hard link, a symlink, a relative chain, `..` and another
     /// case — and, with no file there, through another case and a dangling link — but
-    /// never in a sibling. Login names are protected in any case, file or not.
+    /// never in a sibling.
     #[test]
     fn the_guard_sees_one_keychain_through_every_spelling() {
         let (_dir, g) = scratch();
@@ -1507,7 +1439,7 @@ mod tests {
 
     /// The certificate the real /usr/bin/openssl makes from [`request_config`] is a
     /// code-signing leaf: CN "aterm dev", the code-signing EKU, digitalSignature and
-    /// CA:false. No keychain is touched.
+    /// CA:false.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_certificate_is_a_code_signing_leaf() {

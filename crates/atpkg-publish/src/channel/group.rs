@@ -1,30 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `atpkg-publish publish-group rustc --seal <dir> [--dry-run | --upload]`: the trust
-//! bundle and its siblings (trust-ir, trust-cg, trust-vc) from one sealed toolchain, as one
-//! act: pack, sign, upload, index.
-//!
-//! [`preflight`] collects every refusal before anything runs:
-//!
-//! * the seal: bin/trustc, bin/targo and lib/, one commit and a host from `-Vv`; not inside
-//!   the atpkg store, not a live `build/*/stage2`; every [`crate::programs::TRUST_EXPOSES`]
-//!   tool present; room beside the output;
-//! * its SEED-MINT receipt (`atpkg::lineage::seed_mint_refusals`, unless the switch is
-//!   dormant) and, to publish, the re-pin on the trust repo's origin main
-//!   ([`super::seed`]) and both owners' tokens;
-//! * the trust build and every sibling's (`rev-list --count`, skipping tags published on
-//!   either owner when the compiler moved) against the floor, the verified head's pin for
-//!   that target (`pin` on [`crate::programs::PIN_TRIPLE`], else that target's overlay):
-//!   below is always refused, equal only with `--force-same-build` and never when the
-//!   compiler moved. Staging or publishing without a readable floor is refused.
-//!
-//! Then it packs the bundle ([`crate::api::BundlePacker`]); re-checks each sibling (same
-//! commit, still clean, a build no lower than judged, still above the floor) before any
-//! packs and again before its own ([`crate::api::Packer`] with the seal's toolchain); and
-//! publishes one index ([`crate::api::Indexer`]) whose delta is the four builds (`pin` on
-//! the pin triple, a `pin_by_target` overlay elsewhere). Every other pin is carried from
-//! the verified head.
+//! `atpkg-publish publish-group rustc`: coherent packing, signing, upload, and indexing of the `trust` bundle and its siblings.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -54,8 +31,7 @@ pub const BUNDLE: &str = "trust";
 pub enum Mode {
     /// Preflight and the plan; packs nothing, writes nothing to any host.
     DryRun,
-    /// Pack and sign locally (unsigned on a keyless box), index locally; nothing
-    /// uploaded.
+    /// Pack and sign locally (unsigned on a keyless box), index locally; nothing uploaded.
     Stage,
     /// Every step with its uploads.
     Upload,
@@ -64,8 +40,7 @@ pub enum Mode {
 /// One group publish.
 #[derive(Clone, Debug)]
 pub struct GroupRequest {
-    /// The sealed toolchain (bin/ + lib/), or a staged copy of one carrying the trust-wp
-    /// drivers.
+    /// Sealed toolchain directory (`bin/` + `lib/`).
     pub seal: PathBuf,
     /// The trust checkout the seal's commit is counted in.
     pub trust_repo: PathBuf,
@@ -77,18 +52,15 @@ pub struct GroupRequest {
     pub force_same_build: bool,
     /// Pack from a live `build/*/stage2` on purpose.
     pub allow_build_tree_seal: bool,
-    /// Where the packs and the index go; `None` is
-    /// `<state>/rustc-group/trust-<commit>`.
+    /// Output directory (`None` defaults to `<state>/rustc-group/trust-<commit>`).
     pub out: Option<PathBuf>,
 }
 
-/// What the preflight reads off the seal that only running it can tell, and the receipt
-/// switch — behind a trait so the group's tests answer for them.
+/// Probes the sealed toolchain and lineage switch for preflight.
 pub trait SealProbe {
     /// `<seal>/bin/trustc -Vv`'s stdout.
     ///
     /// # Errors
-    ///
     /// Why it did not answer.
     fn trustc_vv(&self, seal: &Path) -> std::result::Result<String, String>;
 
@@ -183,15 +155,13 @@ pub struct Preflight {
 }
 
 impl Preflight {
-    /// Whether this cut carries a newer trust build than the channel pins — and so each
-    /// sibling takes the first build number not yet published.
+    /// Returns whether this cut carries a newer trust build than the channel pins.
     #[must_use]
     pub fn compiler_moved(&self) -> bool {
         matches!((self.trust_build, self.public_trust_pin), (Some(b), Some(p)) if b > p)
     }
 
-    /// The pin the index step compares `program`'s new build with: `pin` when the seal's
-    /// target owns it, else that target's overlay cell.
+    /// Returns the floor pin for `program` on the seal's target.
     #[must_use]
     pub fn floor_pin(&self, program: &str) -> Option<u64> {
         let floor = self.floor.as_ref()?;
@@ -222,10 +192,7 @@ impl Preflight {
         }
     }
 
-    /// Why the index step would refuse `program` packed at `build`, or `None`: below the
-    /// floor's pin always; equal unless forced, and never when the compiler moved (then
-    /// an equal number means the published-tag probe answered wrong, and packing would
-    /// put new bytes under a published number).
+    /// Returns why the index step would refuse `program` packed at `build`, or `None`.
     #[must_use]
     pub fn floor_refusal(&self, program: &str, build: u64, force: bool) -> Option<String> {
         let p = self.floor_pin(program)?;
@@ -314,17 +281,10 @@ fn tree_bytes(dir: &Path) -> u64 {
     total
 }
 
-/// The build step 2 packs `program` under, one function so the formula judged is the
-/// formula packed: the checkout's revision count, and when the compiler moved, the first
-/// number at or above it with no `atpkg-<program>-<n>` release on either owner.
-///
-/// The staging owner's repos are private, and GitHub answers 404 for a private repo to an
-/// identity that cannot see it, so its tags are read from its release list, and a repo
-/// that does not list is a refusal, never "no tag taken".
+/// Computes the build number step 2 packs `program` under, skipping published tags when `compiler_moved`.
 ///
 /// # Errors
-///
-/// When git gives no count, an owner cannot be asked, or the staging repo is not visible.
+/// Returns an error if git fails, a host cannot be queried, or the staging repo is not visible.
 pub fn pack_build(ctx: &Ctx, program: &str, dir: &Path, compiler_moved: bool) -> Result<u64> {
     let mut b = crate::git::rev_count(dir, "HEAD")?;
     if !compiler_moved {
@@ -380,7 +340,6 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
     let seal = &req.seal;
     let upload = req.mode == Mode::Upload;
 
-    // The seal.
     let exec = |p: &Path| {
         #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt as _;
@@ -451,7 +410,6 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
         .components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect();
-    // `*/build/*/stage2`: a `stage2` with a `build` directory anywhere above its parent.
     let live = comps.len() >= 3
         && comps[comps.len() - 1] == "stage2"
         && comps[..comps.len() - 2].iter().any(|c| c == "build");
@@ -492,7 +450,6 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
         }
     }
 
-    // The trust repo, for the build number that names the seal's commit.
     match crate::git::run(&req.trust_repo, &["rev-parse", "--is-inside-work-tree"]) {
         Ok(_) if !pf.seal_commit.is_empty() => {
             let object = format!("{}^{{commit}}", pf.seal_commit);
@@ -517,7 +474,6 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
         )),
     }
 
-    // The seed pin.
     let receipt_path = seal.join(atpkg::lineage::SEED_MINT_FILE);
     let receipt = std::fs::read_to_string(&receipt_path).ok();
     if !pf.seal_commit.is_empty() {
@@ -557,14 +513,11 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
         }
     }
 
-    // The floor: the verified channel head, its horizon ignored (a lapsed head still pins
-    // what it pins). Packing without one judges nothing and skips no published tag.
     let floor = Scratch::new("floor").and_then(|scratch| {
         quad::fetch_head_with(ctx, &ctx.index_slug(), scratch.path(), Freshness::Ignore)
     });
     match floor {
         Ok((n, q)) => {
-            // The packs this group drives sign under the generation this head elects.
             crate::artifact::sign::elect_from_head(ctx, &q);
             if let Some(c) = q.index.channels.first() {
                 pf.public_trust_pin = c.pin.get(BUNDLE).copied();
@@ -587,7 +540,6 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
         )),
     }
 
-    // The trust build against the floor.
     if let (Some(b), Some(p)) = (pf.trust_build, pf.floor_pin(BUNDLE)) {
         let (label, scope) = (pf.label(), pf.scope());
         if b < p {
@@ -606,7 +558,6 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
         }
     }
 
-    // The siblings: present, clean, and packing a build the floor does not already cover.
     let moved = pf.compiler_moved();
     for program in siblings() {
         let dir = checkout_of(ctx, req, program);
@@ -664,7 +615,6 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
         }
     }
 
-    // Identity and tokens, by mode.
     if upload {
         if !pf.have_key {
             pf.problems.push(format!(
@@ -696,7 +646,6 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
         ));
     }
 
-    // Room: one staged copy of the sysroot plus its tarball, beside the output.
     let out = out_dir(ctx, req, &pf);
     let mut probe_at = out.as_path();
     while !probe_at.exists() {
@@ -742,14 +691,10 @@ pub struct GroupOutcome {
     pub out: PathBuf,
 }
 
-/// The preflight's judgment of `program`, taken again now (peer sessions reset and switch
-/// shared checkouts while the bundle packs): the checkout is at the judged commit and
-/// clean, the build step 2 would pack is no lower than judged (a lower one can be a
-/// published number), and it still passes the floor.
+/// Re-verifies `program`'s checkout commit, cleanliness, and floor clearance before packing.
 ///
 /// # Errors
-///
-/// A refusal naming what moved; nothing of `program` is packed after one.
+/// Returns a refusal if the checkout moved, became dirty, or no longer clears the floor.
 pub fn recheck(ctx: &Ctx, pf: &Preflight, program: &str, force: bool) -> Result<u64> {
     let judged = pf
         .judged
@@ -790,21 +735,16 @@ pub fn recheck(ctx: &Ctx, pf: &Preflight, program: &str, force: bool) -> Result<
     Ok(build)
 }
 
-/// The group publish, its transcript in `log`.
+/// Runs the group publish and writes its transcript to `log`.
 ///
 /// # Errors
-///
-/// Every preflight problem, at once; a re-check that no longer holds; whatever a pack or
-/// the index refuses.
+/// Returns an error if preflight, re-check, packing, or indexing fails.
 pub fn publish_group(
     ctx: &Ctx,
     req: &GroupRequest,
     parts: &Parts<'_>,
     log: &mut Log,
 ) -> Result<GroupOutcome> {
-    // One trust repo for the whole publish: the packers read the receipt switch from
-    // `ctx.trust_repo`, so a `--trust-repo` that reached only the preflight would judge the
-    // seal under one switch and pack it under another.
     let ctx = &Ctx {
         trust_repo: req.trust_repo.clone(),
         ..ctx.clone()
@@ -946,8 +886,6 @@ pub fn publish_group(
     builds.insert(BUNDLE.to_string(), bundle.build);
 
     log.say("2/3 packing the siblings with the seal's toolchain");
-    // Every sibling before any packs (one that moved must not strand the others' packs),
-    // then each again just before its own (the packs before it take minutes).
     for program in pf.judged.keys() {
         recheck(ctx, &pf, program, req.force_same_build)?;
     }
@@ -1068,12 +1006,9 @@ fn write_ready(
     std::fs::write(&path, text).map_err(|e| Error::io(format!("write {}", path.display()), &e))
 }
 
-/// `atpkg-publish publish-group rustc --seal <dir> [--trust-repo DIR] [--checkout
-/// NAME=DIR]… [--out DIR] [--dry-run | --upload] [--force-same-build]
-/// [--allow-build-tree-seal]`.
+/// Parses `atpkg-publish publish-group` CLI arguments into a [`GroupRequest`].
 ///
 /// # Errors
-///
 /// A usage error for a bad command line.
 pub fn parse_request(ctx: &Ctx, args: &[String]) -> Result<GroupRequest> {
     let Some((group, rest)) = args.split_first() else {
@@ -1141,10 +1076,9 @@ pub fn parse_request(ctx: &Ctx, args: &[String]) -> Result<GroupRequest> {
     Ok(req)
 }
 
-/// `atpkg-publish publish-group …`.
+/// Entry point for `atpkg-publish publish-group …`.
 ///
 /// # Errors
-///
 /// A usage error for a bad command line.
 pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     let req = parse_request(ctx, args)?;

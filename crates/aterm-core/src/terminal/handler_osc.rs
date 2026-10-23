@@ -68,6 +68,8 @@ impl TerminalHandler<'_> {
     }
 
     /// OSC 7501 (`state=<word>:app=codex[:kind=<k>]`, `state=clear`): the
+    /// program's own state report, kept as one value for the host to show
+    /// and log as a claim ([`super::program_state`]).
     #[inline]
     fn handle_osc_7501(&mut self, params: &[&[u8]]) {
         let [_, body] = params else {
@@ -161,6 +163,8 @@ impl TerminalHandler<'_> {
     }
 
     /// What an OSC 7 whose URI is `uri` (split at its literal semicolons)
+    /// does to the reported cwd, or `None` when it leaves it unchanged (a
+    /// non-file:// URI, an unstorable path).
     fn osc_7_report(uri: &[&[u8]]) -> Option<super::shell::CwdReport> {
         let uri_bytes = uri.join(&b';');
         let uri = std::str::from_utf8(&uri_bytes).unwrap_or_default();
@@ -181,7 +185,7 @@ impl TerminalHandler<'_> {
         self.store_reported_cwd(report.path.as_deref(), report.host.as_deref());
     }
 
-    /// Parse a file:// URI into (host, path). The path is percent-decoded; the
+    /// Parse a file:// URI into (host, path).
     fn parse_file_uri(uri: &str) -> Option<(Option<String>, String)> {
         let rest = uri.strip_prefix("file://")?;
         let path_start = rest.find('/')?;
@@ -284,7 +288,7 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Handle OSC 52 clipboard query (Pd = "?"). Needs both a host-minted query
+    /// Handle OSC 52 clipboard query (Pd = "?").
     fn handle_osc_52_query(
         &mut self,
         cap: &super::response_capability::ResponseCapability,
@@ -318,7 +322,7 @@ impl TerminalHandler<'_> {
         self.send_response(cap, response.as_bytes());
     }
 
-    /// Handle OSC 52 clipboard clear (empty Pd). Gated by the same
+    /// Handle OSC 52 clipboard clear (empty Pd).
     fn handle_osc_52_clear(&mut self, selections: &[ClipboardSelection]) {
         let Some(token) = self
             .clipboard_auth
@@ -329,7 +333,7 @@ impl TerminalHandler<'_> {
         super::clipboard_auth::invoke_clear(&mut self.clipboard.callback, token, selections);
     }
 
-    /// Handle OSC 52 clipboard set (Pd = base64 data). Without a host-minted
+    /// Handle OSC 52 clipboard set (Pd = base64 data).
     fn handle_osc_52_set(&mut self, selections: &[ClipboardSelection], data: &[u8]) {
         let Some(token) = self
             .clipboard_auth
@@ -616,6 +620,9 @@ mod tests {
     }
 
     /// The host an OSC 7 names is stored beside the path it qualifies, so an
+    /// embedder can tell a remote shell's directory from its own: `localhost`
+    /// and an empty host name none, a clear and the shell's own `633;P;Cwd=`
+    /// drop it, a RIS keeps it with its cwd, and a refused report leaves both.
     #[test]
     fn osc_7_keeps_the_host_it_names_beside_the_path() {
         let mut term = Terminal::new(24, 80);
@@ -654,6 +661,9 @@ mod tests {
     }
 
     /// Every stored report gets the next number, so an embedder that noted
+    /// which group was in front at report `n` knows the next report by its
+    /// own: a re-report of the very same cwd and host is a new number, a RIS
+    /// keeps the count, and a refused report takes none.
     #[test]
     fn every_stored_cwd_report_has_its_own_number() {
         let mut term = Terminal::new(24, 80);
@@ -727,6 +737,7 @@ mod tests {
     }
 
     /// A `%00` decodes to `\0`, which no directory contains: the report is ignored
+    /// like an over-long one (prior cwd kept, nothing queued).
     #[test]
     fn osc_7_cwd_with_a_nul_byte_is_ignored() {
         let mut term = Terminal::new(24, 80);
@@ -959,6 +970,7 @@ mod tests {
     }
 
     /// Every clipboard within the decoded cap is answered under the `standard()`
+    /// profile: the response budgets must allow for base64 (~1.34x the cap).
     #[test]
     fn osc52_query_answers_every_clipboard_it_admits() {
         for len in [
@@ -995,6 +1007,7 @@ mod tests {
     }
 
     /// A clipboard above the cap is still refused, so the test above cannot pass
+    /// for a handler that answers anything.
     #[test]
     fn osc52_query_still_refuses_a_clipboard_over_the_cap() {
         let mut term = Terminal::new(24, 80);

@@ -273,12 +273,15 @@ impl TerminalHandler<'_> {
     }
 
     /// Record the main grid's absolute row counter as this batch parks it (smcup), before the
+    /// swap, for the epilogue's re-pin: output earlier in the batch already advanced it, and
+    /// the re-pin must include that advance.
     #[inline]
     const fn park_main_row_counter(&mut self) {
         self.transient.alt_park_main_row_counter = Some(self.grid.absolute_row_counter());
     }
 
     /// Take the parked reading position off a grid swapped back in mid-batch and hand it to
+    /// the epilogue's re-pin.
     fn flatten_restored_display_offset(&mut self) {
         self.transient.alt_screen_left_in_batch = true;
         let restored = self.grid.display_offset();
@@ -335,7 +338,7 @@ impl TerminalHandler<'_> {
         self.send_held_size_report();
     }
 
-    /// Point `grid`'s BCE template at the current pen's background. A buffer
+    /// Point `grid`'s BCE template at the current pen's background.
     #[inline]
     const fn sync_bce_template(style: &mut CurrentStyle, grid: &mut Grid) {
         style.update_cached_colors();
@@ -346,13 +349,15 @@ impl TerminalHandler<'_> {
     }
 
     /// Count a whole-screen replacement for the resize journal's readers
+    /// (`Terminal::screen_replaced_count`): the screen the app painted before it
+    /// is gone, so a displacement a resize left on it is gone too.
     #[inline]
     fn note_screen_replaced(&mut self) {
         self.transient.screen_replaced = self.transient.screen_replaced.wrapping_add(1);
         self.transient.render_debt = crate::terminal::RenderDebt::default();
     }
 
-    /// Copy the scroll region and horizontal margins from one grid to another. In xterm they
+    /// Copy the scroll region and horizontal margins from one grid to another.
     #[inline]
     const fn copy_margins(from: &Grid, to: &mut Grid) {
         let region = from.scroll_region();
@@ -558,6 +563,9 @@ impl TerminalHandler<'_> {
     }
 
     /// Whether the `?1049l` about to run leaves the alternate screen of an app that died on it
+    /// while its console host was asked to leave it (`TransientState::dead_alt_screen`, a
+    /// prompt under the host policy or `Terminal::expect_host_alt_screen_leave`): that is the
+    /// host's forwarded switch, and it takes the mark.
     #[inline]
     fn take_dead_alt_screen(&mut self) -> bool {
         let dead = self.modes.alternate_screen
@@ -569,6 +577,11 @@ impl TerminalHandler<'_> {
     }
 
     /// Reset the modes a dead full-screen app owned, which its own exit would
+    /// have reset and the exits above carry over: its input modes
+    /// (`release_dead_app_input`), scroll region and horizontal margins (shell
+    /// output would never reach the scrollback), and an open 2026 window, the
+    /// program's own frame included after the timeout cleared the mode
+    /// (`Terminal::sync_frame_unfinished`).
     fn release_dead_app_modes(&mut self) {
         self.grid.reset_scroll_region();
         self.modes.left_right_margin_mode = false;
@@ -599,12 +612,16 @@ impl TerminalHandler<'_> {
     }
 
     /// Whether DEC 2048's enable-time size report waits instead of going out at once:
+    /// behind a Windows console host (the `ResizePolicy::ConPty` posture) with the
+    /// primary screen up.
     #[inline]
     const fn hold_size_report(&self) -> bool {
         self.modes.win32_input_enabled && !self.modes.alternate_screen
     }
 
     /// The alternate screen came up: a size report held at the enable
+    /// ([`Self::hold_size_report`]) goes out now, at the size the screen has, while
+    /// the mode is still on.
     #[inline]
     fn send_held_size_report(&mut self) {
         if std::mem::take(&mut self.transient.size_report_held) && self.modes.in_band_size_reports {
@@ -654,6 +671,7 @@ impl TerminalHandler<'_> {
     }
 
     /// Scroll every used screen row (down to the last non-blank one) into the
+    /// scrollback, leaving the screen blank and the cursor where it was.
     fn scroll_screen_into_scrollback(&mut self) {
         let region = self.grid.scroll_region();
         if region.top != 0 || region.bottom + 1 != self.grid.rows() {
@@ -799,7 +817,7 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Restore cursor position, style and modes from a snapshot (if any). With origin mode
+    /// Restore cursor position, style and modes from a snapshot (if any).
     fn restore_cursor_snapshot(&mut self, state: Option<SavedCursorState>) {
         let Some(state) = state else {
             self.modes.origin_mode = false;
@@ -977,6 +995,7 @@ impl TerminalHandler<'_> {
     }
 
     /// Parse a VT420 rectangle `Pt;Pl;Pb;Pr` (1-indexed, 0 or absent is the default: the whole
+    /// area) into 0-indexed absolute `(top, left, bottom, right)`.
     fn parse_rect_coords(&self, params: &[u16]) -> Option<(u16, u16, u16, u16)> {
         let rows = self.grid.rows();
         let cols = self.grid.cols();
@@ -1093,7 +1112,7 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Split a DECRARA `Pm` list into (single-bit flags to XOR, reverse-underline). Underline
+    /// Split a DECRARA `Pm` list into (single-bit flags to XOR, reverse-underline).
     fn sgr_params_to_reverse_flags(sgr_params: &[u16]) -> (CellFlags, bool) {
         let mut toggle = CellFlags::empty();
         let mut toggle_underline = false;
@@ -1162,6 +1181,7 @@ impl TerminalHandler<'_> {
     }
 
     /// The DECCARA subset of SGR (bold, dim, italic, underline, blink, inverse, hidden,
+    /// strikethrough and their resets) as `(flags_to_set, flags_to_clear)`.
     fn sgr_params_to_flags(sgr_params: &[u16]) -> (CellFlags, CellFlags) {
         let mut flags_to_set = CellFlags::empty();
         let mut flags_to_clear = CellFlags::empty();
@@ -1253,6 +1273,8 @@ mod cursor_damage_scope_tests {
     use crate::terminal::Terminal;
 
     /// A cursor-only change damages the cursor cell: something (a bare DECTCEM must not be
+    /// swallowed by the frontend's redraw early-out), but not everything (TUIs bracket every
+    /// repaint in `?25l … ?25h`).
     #[test]
     fn a_cursor_only_change_damages_the_cursor_cell_not_the_whole_grid() {
         for (name, setup, seq) in [
@@ -1290,6 +1312,7 @@ mod cursor_damage_scope_tests {
     }
 
     /// Every alt-screen exit mode leaves the restored grid fully damaged and advances the
+    /// damage epoch.
     #[test]
     fn leaving_the_alternate_screen_marks_the_restored_grid_fully_damaged() {
         for (enter, exit) in [
@@ -1319,6 +1342,7 @@ mod cursor_damage_scope_tests {
     }
 
     /// Control: a change that repaints every cell (reverse video, bidi direction) still marks
+    /// the whole grid.
     #[test]
     fn a_whole_screen_change_still_marks_the_whole_grid() {
         let mut term = Terminal::new(24, 80);
@@ -1360,6 +1384,7 @@ mod decbkm_tests {
 }
 
 /// Mode 2027 is permanently reset, since the print path does not keep each UAX #29 cluster
+/// in one cell; Neovim 0.11+ sets it only on a reply of 2.
 #[cfg(test)]
 mod grapheme_cluster_mode_tests {
     use crate::terminal::Terminal;
@@ -1475,6 +1500,7 @@ mod win32_input_mode_tests {
     use aterm_types::keyboard::KeyboardMode;
 
     /// A session behind a console host: the posture aterm-gui applies to a
+    /// ConPTY session (`spawn::apply_pty_keyboard_posture`).
     fn conpty_term() -> Terminal {
         let mut term = Terminal::new(24, 80);
         term.set_win32_input_enabled(true);
@@ -1711,6 +1737,7 @@ mod conhost_left_alt_screen_tests {
     }
 
     /// conhost's repaint of its primary buffer after `?1049l`: frozen at the
+    /// dead pager's start, so it knows nothing typed since.
     fn stale_primary_repaint() -> Vec<u8> {
         let mut read = b"\x1b[?25l\x1b[H".to_vec();
         for row in ["history 1", "history 2", "PS> less file"] {
@@ -1722,6 +1749,7 @@ mod conhost_left_alt_screen_tests {
     }
 
     /// A pager killed on the alternate screen, the prompt's recovery, and two
+    /// commands typed after it — under conhost (`?9001h`) or not.
     fn recovered_with_two_commands(conhost: bool) -> Terminal {
         let mut term = Terminal::new(ROWS, 40);
         if conhost {
@@ -1836,6 +1864,7 @@ mod conhost_left_alt_screen_tests {
     }
 
     /// Without a console host a program's `?9001h` is just output: the recovery still leaves
+    /// the unix way (the 1049 exit restores the saved cursor, the primary rows stay).
     #[test]
     fn a_programs_9001_does_not_fake_a_console_host_for_the_recovery() {
         let mut term = Terminal::new(ROWS, 40);
@@ -1851,6 +1880,8 @@ mod conhost_left_alt_screen_tests {
     }
 
     /// A pager that filled the screen after a short history, killed, then the
+    /// shell's prompt: conhost scrolled its alternate buffer for the prompt, so
+    /// its cursor is on the bottom row, far below the row `?1049h` saved.
     fn recovered_on_the_bottom_row(conhost: bool) -> Terminal {
         let mut term = Terminal::new(ROWS, 40);
         if conhost {
@@ -1960,6 +1991,8 @@ mod conhost_left_alt_screen_tests {
 }
 
 /// `?1049l` on the primary screen moves nothing (see `exit_alternate_screen`:
+/// xterm restores the DECSC slot there, Alacritty and WezTerm ignore it, and
+/// aterm's own orphaned-screen recovery makes the restore dangerous).
 #[cfg(test)]
 mod stray_1049_reset_tests {
     use crate::grid::CellFlags;
@@ -1987,6 +2020,8 @@ mod stray_1049_reset_tests {
     }
 
     /// The contrast: leaving a screen `?1049h` entered is DECRC from the slot
+    /// that set filled (xterm's one `CursorRestore`), not only the cursor the
+    /// main grid kept.
     #[test]
     fn a_1049l_from_the_alternate_screen_restores_the_slot_as_decrc_does() {
         type Between = fn(&mut Terminal);
@@ -2044,6 +2079,9 @@ mod stray_1049_reset_tests {
     }
 
     /// The case that rules out xterm's restore: a full-screen app dies on the
+    /// alternate screen, the shell's prompt mark leaves it for the app
+    /// (restoring the slot its `?1049h` saved, which DECRC must keep), output
+    /// and prompts follow, and then the user types `tput rmcup`.
     #[test]
     fn a_rmcup_after_the_orphaned_screen_recovery_keeps_the_cursor() {
         let mut term = Terminal::new(8, 30);
@@ -2107,6 +2145,8 @@ mod stray_1049_reset_tests {
 }
 
 /// The BCE template across `?47`/`?1047` switches: the pen stays, so the
+/// buffer swapped in must erase and scroll with the current background
+/// (xterm's `ClearCells`/`ScrnClearLines` read the one colour pair).
 #[cfg(test)]
 mod alt_switch_bce_tests {
     use crate::terminal::Terminal;
@@ -2144,6 +2184,8 @@ mod alt_switch_bce_tests {
     }
 
     /// An OSC 8 link a program left open does not outlive its screen: every
+    /// switch, either way, closes it, so the next glyph on the other screen
+    /// carries no link.
     #[test]
     fn an_open_link_ends_at_every_screen_switch() {
         for (on, switch) in [
@@ -2367,6 +2409,7 @@ mod mode_and_query_agreement_tests {
     }
 
     /// DEC mode 12 is the cursor style's blink bit: the renderer blinks only `Blinking*`
+    /// styles, and `CSI ? 12 $ p` answers the same fact.
     #[test]
     fn mode_12_moves_the_cursor_the_user_sees_and_reports_it() {
         let mut term = Terminal::new(24, 80);
@@ -2426,6 +2469,7 @@ mod mode_and_query_agreement_tests {
     }
 
     /// Replay the recovered mode-12 request with the current explicit ConPTY
+    /// capability: mode 12 must not replace the configured or DECSCUSR style.
     #[test]
     fn mode_12_under_conhost_keeps_the_configured_cursor() {
         const VIM_START: &[u8] = b"\x1b[?1049h\x1b[?12h\x1b[?12l";
@@ -2491,6 +2535,7 @@ mod mode_and_query_agreement_tests {
     }
 
     /// Every mode DECRQM can report is one XTSAVE/XTRESTORE can carry: the two
+    /// tables (`query_dec_mode`, `handle_decrqm`) must agree.
     #[test]
     fn xtsave_covers_every_mode_decrqm_reports() {
         const REPORTED: &[u16] = &[

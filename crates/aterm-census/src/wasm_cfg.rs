@@ -2,14 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! What a `cfg` predicate is on the one target the wasm renderer modules build
-//! for, `wasm32-unknown-unknown`, in a shipped (non-test) build: true, false,
-//! or unknown. Unknown is everything the target does not settle — a feature,
-//! `debug_assertions` (the modules ship dev and release builds), a custom cfg
-//! (`trust_verify`, `docsrs`), a target feature — so the wasm-process census
-//! leaves out of its scan only what is FALSE there: a dependency edge no
-//! wasm32 build links, an item no wasm32 build compiles, a file no wasm32
-//! build loads.
+//! What a `cfg` predicate is on the one target the wasm renderer modules build for.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -36,7 +29,6 @@ impl Truth {
 /// The target triple the wasm modules build for.
 const TRIPLE: &str = "wasm32-unknown-unknown";
 
-/// The target's `name = "value"` cfgs: each name has exactly this value on
 /// wasm32-unknown-unknown, so any other value is false.
 const KEYED: &[(&str, &str)] = &[
     ("target_arch", "wasm32"),
@@ -48,11 +40,7 @@ const KEYED: &[(&str, &str)] = &[
     ("target_endian", "little"),
 ];
 
-/// `pred` (a `cfg` predicate, without its `cfg(..)` wrapper) on
-/// wasm32-unknown-unknown in a shipped build: `test`, `unix` and `windows`
-/// are false; [`KEYED`] names compare against the target's values;
-/// `all`/`any`/`not` combine three-valued; anything else, or a predicate this
-/// reader cannot parse, is [`Truth::Unknown`].
+/// `pred` (a `cfg` predicate.
 pub(crate) fn on_wasm32(pred: &str) -> Truth {
     let pred = pred.trim();
     if let Some(inner) = call(pred, "not") {
@@ -110,9 +98,7 @@ fn call<'a>(pred: &'a str, head: &str) -> Option<&'a str> {
         .strip_suffix(')')
 }
 
-/// Whether a `[target.<key>.dependencies]` table can link into a wasm32
-/// build: a `cfg(..)` key unless its predicate is false there, a bare triple
-/// only when it is the wasm32 one.
+/// Whether a `[target.<key>.dependencies]` table can link into a wasm32 build.
 pub(crate) fn target_links_on_wasm32(key: &str) -> bool {
     match call(key.trim(), "cfg") {
         Some(pred) => on_wasm32(pred) != Truth::False,
@@ -120,9 +106,7 @@ pub(crate) fn target_links_on_wasm32(key: &str) -> bool {
     }
 }
 
-/// Whether an attribute line (trimmed) proves its item absent from every
-/// shipped wasm32 build: `#[test]`, or a one-line `#[cfg(<pred>)]` whose
-/// predicate is false there. Any other attribute keeps the item.
+/// Whether an attribute line (trimmed) proves its item absent from every shipped wasm32 build.
 pub(crate) fn attr_never_on_wasm32(attr: &str) -> bool {
     if attr == "#[test]" {
         return true;
@@ -132,17 +116,14 @@ pub(crate) fn attr_never_on_wasm32(attr: &str) -> bool {
         .is_some_and(|pred| on_wasm32(pred) == Truth::False)
 }
 
-/// One crate's `src` files no shipped wasm32 build loads
-/// ([`unloaded_on_wasm32`]).
+/// One crate's `src` files no shipped wasm32 build loads ([`unloaded_on_wasm32`]).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Unloaded {
-    /// The files every loader of which (a `mod` declaration, an
-    /// `include!`) is false on wasm32 or sits in such a file, sorted.
+    /// The files every loader of which is false on wasm32 or sits in such a file, sorted.
     pub(crate) files: BTreeSet<PathBuf>,
     /// The false loaders that cut them off, in file order.
     pub(crate) cuts: Vec<Cut>,
-    /// Why no file is left out though a declaration is false on wasm32: a
-    /// loader this reader cannot place.
+    /// Why no file is left out though a declaration is false on wasm32.
     pub(crate) unplaced: Option<String>,
 }
 
@@ -154,12 +135,10 @@ pub(crate) struct Cut {
     pub(crate) line: usize,
     /// The loader as written (`mod metal;`).
     pub(crate) loader: String,
-    /// The attribute that masks it (`#[cfg(target_os = "macos")]`), or
-    /// "a gated item" when the item around it is the masked one.
+    /// The attribute that masks it (`#[cfg(target_os = "macos")]`).
     pub(crate) gate: String,
 }
 
-/// One loader of a file: a `mod <name>;` declaration (no body) or an
 /// `include!("<path>")`.
 struct ModDecl<'a> {
     from: &'a Path,
@@ -185,21 +164,7 @@ enum IncludeArg<'a> {
     Unknown,
 }
 
-/// The files of one crate's `src` tree (`files`: every `*.rs` in it, with its
-/// text) that no shipped wasm32-unknown-unknown build compiles: every loader
-/// that could load one — a `mod <name>;` declaration, an `include!` — is
-/// false there (masked by [`attr_never_on_wasm32`], as
-/// [`crate::lock_order::unmasked_lines`] masks it) or sits in such a file.
-/// A loader's file is found as rustc finds it: an `include!` or a `#[path]`
-/// relative to its file's directory; else `<owner>/<name>.rs` or
-/// `<owner>/<name>/mod.rs`, the owner being a mod-rs file's directory
-/// (`lib.rs`, `main.rs`, `mod.rs`) or `<dir>/<stem>`; a file a `#[path]`
-/// loads, or one of `roots`, is read both ways. `roots` (the crate's
-/// targets) are never left out. A file no loader names stays in. A loader
-/// this reader cannot place — a live `mod <name>;` inside an inline module or
-/// a block, a live `include!` of anything but a plain path or an `OUT_DIR`
-/// file, a `mod` in an included file, a `path` chosen by `cfg_attr` or not a
-/// plain string — leaves every file in, and says why.
+/// The files of one crate's `src` tree (`files`.
 pub(crate) fn unloaded_on_wasm32(
     files: &BTreeMap<PathBuf, String>,
     roots: &BTreeSet<PathBuf>,
@@ -215,9 +180,6 @@ pub(crate) fn unloaded_on_wasm32(
         let scope_code = crate::lex::blank_non_code(text);
         let mut depth = 0isize;
         for (i, (raw, scope_line)) in lines.iter().zip(scope_code.lines()).enumerate() {
-            // Rust does not require nested declarations to be indented. Read
-            // braces from the whole-file lexer so comments and multi-line
-            // literals cannot end their surrounding item early.
             let nested = depth != 0;
             for b in scope_line.bytes() {
                 match b {
@@ -239,7 +201,6 @@ pub(crate) fn unloaded_on_wasm32(
                         live,
                     }),
                     IncludeArg::OutDir => {}
-                    // A masked one loads nothing.
                     IncludeArg::Unknown if live => {
                         cannot(
                             file,
@@ -255,9 +216,6 @@ pub(crate) fn unloaded_on_wasm32(
                 ModLine::None | ModLine::InlineOpen => continue,
                 ModLine::Unplaced => {
                     // A compact inline module (`mod outer { mod live; }`) or
-                    // another declaration on this line can still load a file.
-                    // Do not infer absence from loaders we cannot place; this
-                    // also keeps unknown module spellings in.
                     if live {
                         cannot(file, i, "declares a module this line-reader cannot place");
                     }
@@ -285,9 +243,6 @@ pub(crate) fn unloaded_on_wasm32(
                 }
             }
             if nested || raw.starts_with(char::is_whitespace) {
-                // Inside an inline module or a block: its file hangs off a
-                // directory this line-reader does not track. A masked one
-                // loads nothing; a live one could load any file.
                 if live {
                     cannot(file, i, "declares a module inside another item");
                 }
@@ -304,8 +259,6 @@ pub(crate) fn unloaded_on_wasm32(
         }
     }
     let dir = |f: &Path| f.parent().map_or_else(PathBuf::new, Path::to_path_buf);
-    // An included file is text in its includer's module: a `mod` in it hangs
-    // off that module's directory, which this reader does not follow.
     let included: BTreeSet<PathBuf> = decls
         .iter()
         .filter(|d| d.include)
@@ -357,7 +310,6 @@ pub(crate) fn unloaded_on_wasm32(
             .filter(|t| files.contains_key(t))
             .collect()
     };
-    // Each file's loaders: (declaring file, live).
     let mut loaders: BTreeMap<PathBuf, Vec<(&Path, bool)>> = BTreeMap::new();
     let mut decl_targets = Vec::with_capacity(decls.len());
     for d in &decls {
@@ -367,8 +319,6 @@ pub(crate) fn unloaded_on_wasm32(
         }
         decl_targets.push(ts);
     }
-    // Least fixpoint: a file is out once every loader is false or sits in a
-    // file already out.
     let mut out: BTreeSet<PathBuf> = BTreeSet::new();
     loop {
         let before = out.len();
@@ -391,8 +341,6 @@ pub(crate) fn unloaded_on_wasm32(
         }
         let text = &files[d.from];
         let lines: Vec<&str> = text.lines().collect();
-        // Its own gate above it, else the gate of the masked item it sits in:
-        // the nearest masked gate line above, indented less than it.
         let own = lines[..d.line]
             .iter()
             .rev()
@@ -430,16 +378,12 @@ enum ModLine<'a> {
     None,
     /// A body-less `[pub[(..)]] mod [r#]<name>;` declaration.
     File(&'a str),
-    /// An inline module header (`[pub[(..)]] mod [r#]<name> {` or `{}`): its
-    /// body lines are scanned on their own, and any `mod` inside it is caught
     /// there.
     InlineOpen,
-    /// A `mod` token in any other form (`mod outer { mod live; }`, a `mod`
     /// sharing a line with another item).
     Unplaced,
 }
 
-/// Classify a line (`raw`, with its comments stripped and literals masked in
 /// `code`) for [`unloaded_on_wasm32`].
 fn mod_line<'a>(raw: &'a str, code: &str) -> ModLine<'a> {
     if !code
@@ -581,11 +525,8 @@ mod tests {
             "not(feature = \"x\")",
             "all(target_arch = \"wasm32\", feature = \"x\")",
             "any(windows, feature = \"x\")",
-            // Rust decodes these to wasm32; this reader does not decode
-            // escapes, so it must keep them unknown rather than call them false.
             r#"target_arch = "wasm\u{33}2""#,
             r#"target_arch = "wasm\x33\x32""#,
-            // Not a predicate this reader parses.
             "not(unix, windows)",
             "target_os = macos",
             "",
@@ -622,7 +563,6 @@ mod tests {
         assert!(!attr_never_on_wasm32("#[cfg(windows)] fn f() {}"));
     }
 
-    /// A crate's `src` tree from (path under `src/`, text) pairs, rooted at
     /// `/c/src`, and its default roots.
     fn src_tree(files: &[(&str, &str)]) -> (BTreeMap<PathBuf, String>, BTreeSet<PathBuf>) {
         let map = files
@@ -639,12 +579,6 @@ mod tests {
             .collect()
     }
 
-    /// A MODULE ONLY A FALSE GATE LOADS IS NO WASM32 FILE: a macOS-only
-    /// `mod metal;` leaves out `metal/mod.rs` and, through it, the file its
-    /// own (ungated) `mod worker;` loads; a non-mod-rs file's `#[cfg(windows)]
-    /// mod b;` leaves out `a/b.rs`. CONTROLS: a feature-gated module (the
-    /// target does not settle it), a plain one and its children, a sibling
-    /// beside a cut one, and a file a false `#[path]` and a live `mod` both
     /// load all stay in.
     #[test]
     fn a_module_only_a_false_gate_loads_is_no_wasm32_file() {
@@ -697,10 +631,6 @@ mod tests {
         );
     }
 
-    /// A root is never left out, even when a false declaration names it
-    /// (a `main.rs` beside a custom lib root, `src/lib2.rs`), and a root that
-    /// is not a mod-rs file loads its children from beside it, as rustc
-    /// reads a crate root: `inner.rs`, which a false declaration also names,
     /// stays in by the root's live one.
     #[test]
     fn a_crate_root_is_never_left_out() {
@@ -717,10 +647,6 @@ mod tests {
         assert!(got.files.is_empty(), "{got:?}");
     }
 
-    /// A loader this reader cannot place leaves every file in, and says
-    /// why: a live `mod` inside an inline module, a live `include!` of a
-    /// computed path, a `cfg_attr` path, a `path` it cannot read. CONTROL:
-    /// the same tree without it leaves the gated module out; a masked
     /// inline loader is no loader.
     #[test]
     fn a_module_tree_this_reader_cannot_place_leaves_every_file_in() {
@@ -788,11 +714,6 @@ mod tests {
         }
     }
 
-    /// AN `include!` IS A LOADER: a file only a false `include!` splices in
-    /// is out (and so is the file only it declares, through it: here none,
-    /// since a `mod` in an included file is not placed); a file a live
-    /// `include!` splices in stays in though a false `mod` names it too; an
-    /// `OUT_DIR` include names no `src` file. A `mod` declared in an
     /// included file leaves every file in.
     #[test]
     fn an_include_is_a_loader_like_a_mod() {

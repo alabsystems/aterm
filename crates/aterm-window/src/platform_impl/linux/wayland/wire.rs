@@ -4,24 +4,7 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-//! The objects the Wayland backend makes for itself, and the one ordered inbox every event
-//! the backend hears reaches (docs/AUDIT-third-party-2026-10-15.md, LW.7).
-//!
-//! A listener runs while the loop dispatches its queue, with no access to the loop's state:
-//! it decodes the event into a [`Wire`] and appends it to the [`Inbox`], and the loop applies
-//! the inbox to its state right after the dispatch, in arrival order. The backend's own
-//! objects record here through [`Owned::listened`]; aterm-wayland's seats, selection devices
-//! and selection sources, and its outputs at each `done`, record here too, through the sinks
-//! the inbox makes for them. One queue dispatches one event at a time, in the order the
-//! compositor sent them, so one inbox for every object keeps the order sctk's handlers saw on
-//! its one queue: a key before
-//! the input method's commit that followed it, the keyboard's focus before the text input's
-//! `enter`, a pointer's motion before the preferred scale that came after it, a window's
-//! preferred scale before the configure that follows it (the initial size is scaled by it), a
-//! toplevel's states before the surface's configure that closes them.
-//!
-//! An event that needs an answer within the dispatch is answered by its listener:
-//! `xdg_surface.configure` is acked there, before the loop sees it, as sctk acked it.
+//! Owned Wayland proxy wrapper and ordered event inbox for the Wayland backend.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -33,9 +16,7 @@ use aterm_wayland::sink::Sink;
 
 use super::{WaylandSelection, WindowId};
 
-/// An object this backend made, with its listener: dropping it destroys the object (its
-/// destructor request, or the proxy alone for an object the protocol ends by an event), then
-/// frees the listener, so the listener never outlives the object's events.
+/// Owned Wayland proxy and optional listener destroyed together on drop.
 pub(crate) struct Owned {
     proxy: Proxy,
     destroy: unsafe fn(Proxy),
@@ -52,13 +33,10 @@ impl Owned {
         Owned { proxy, destroy, listener: None }
     }
 
-    /// Own `proxy` and record its events in `inbox`: `decode` turns one (the object, its
-    /// opcode and arguments) into a [`Wire`], or `None` for one the backend ignores. `decode`
-    /// runs inside the dispatch and may answer the event with a request on the object.
+    /// Owns `proxy` and records its decoded events in `inbox`.
     ///
     /// # Safety
-    /// As [`Owned::new`], and the object has no listener yet. `decode` must not leave a
-    /// descriptor argument unclosed (none of the objects this backend listens to sends one).
+    /// As [`Owned::new`], and `proxy` must have no listener yet.
     pub(crate) unsafe fn listened(
         proxy: Proxy,
         destroy: unsafe fn(Proxy),
@@ -66,8 +44,7 @@ impl Owned {
         decode: impl Fn(Proxy, u32, &[EventArg<'_>]) -> Option<Wire> + Send + 'static,
     ) -> Owned {
         let inbox = inbox.clone();
-        // SAFETY: the caller's contract; the listener is freed after the object is destroyed
-        // (Drop).
+        // SAFETY: caller guarantees `proxy` is valid; listener is freed after proxy destruction.
         let listener = unsafe {
             proxy.listen(move |object, opcode, args| {
                 if let Some(wire) = decode(object, opcode, args) {
@@ -85,8 +62,7 @@ impl Owned {
         Owned { proxy, destroy, listener }
     }
 
-    /// Own `proxy` and hand its events to `handler`, which runs inside the dispatch and records
-    /// nothing in the inbox (a `wl_buffer`'s `release`, which only its owner reads).
+    /// Owns `proxy` and dispatches its events to `handler`.
     ///
     /// # Safety
     /// As [`Owned::listened`].
@@ -95,8 +71,7 @@ impl Owned {
         destroy: unsafe fn(Proxy),
         handler: impl Fn(Proxy, u32, &[EventArg<'_>]) + Send + 'static,
     ) -> Owned {
-        // SAFETY: the caller's contract; the listener is freed after the object is destroyed
-        // (Drop).
+        // SAFETY: caller guarantees `proxy` is valid; listener is freed after proxy destruction.
         let listener =
             unsafe { proxy.listen(move |object, opcode, args| handler(object, opcode, args)) };
         let listener = match listener {
@@ -129,8 +104,7 @@ impl std::fmt::Debug for Owned {
     }
 }
 
-/// The events the backend's own objects heard, in arrival order. Cloned into every listener;
-/// its lock is a leaf of the process's lock graph (only its own two methods run under it).
+/// Ordered event queue shared across Wayland object listeners.
 #[derive(Clone, Default)]
 pub(crate) struct Inbox {
     wire_book: Arc<Mutex<Vec<Wire>>>,
@@ -141,7 +115,6 @@ impl Inbox {
         self.wire_book.lock().unwrap_or_else(PoisonError::into_inner).push(wire);
     }
 
-    /// A sink for one of aterm-wayland's objects: each event it hears is recorded here as
     /// `wire` makes it, in the order the dispatch heard it among every other object's.
     fn sink<T: 'static>(&self, wire: impl Fn(T) -> Wire + Send + Sync + 'static) -> Sink<T> {
         let inbox = self.clone();
@@ -163,8 +136,7 @@ impl Inbox {
         self.sink(move |event| Wire::Drag { seat, event })
     }
 
-    /// The sink the clipboard's source number `source`, offered for `selection`, records what
-    /// the compositor asks of it in.
+    /// Returns a sink for clipboard selection source `source` events.
     pub(crate) fn source_sink(
         &self,
         selection: WaylandSelection,
@@ -198,8 +170,7 @@ pub(crate) enum Wire {
     Seat(Input),
     /// A drag over the seat's data device.
     Drag { seat: u32, event: DragEvent },
-    /// A request to one of the clipboard's sources: `source` is the number the clipboard gave
-    /// it, so a replaced source's requests are not served as the current one's.
+    /// A request to clipboard source `source` for `selection`.
     Source { selection: WaylandSelection, source: u64, event: SourceEvent },
 }
 
@@ -319,12 +290,6 @@ mod tests {
         }
     }
 
-    /// One dispatch, as the listeners hear it: the seat's keyboard focus and then the text
-    /// input's `enter` (Mutter's order); BackSpace (evdev 14) and then the input method's commit
-    /// of "，"; a pointer motion and then the window's new preferred scale; an output's `done`;
-    /// a drop and then the seat's capabilities; a source's cancel. The seat's, the output's, the
-    /// drag's and the source's go through the sinks aterm-wayland's objects are given; the text
-    /// input's and the scale's are the backend's own listeners' (`Owned::listened` pushes what
     /// they decode).
     fn dispatch(own: &Inbox, sinks: &Sinks) {
         use aterm_wayland::seat::KeyboardEvent;
@@ -365,15 +330,9 @@ mod tests {
     fn every_object_s_events_are_applied_in_the_order_they_were_dispatched() {
         let inbox = Inbox::default();
         dispatch(&inbox, &Sinks::of(&inbox));
-        // What `WinitState::drain` applies, in its order.
         let applied: Vec<&str> = inbox.take().iter().map(label).collect();
         assert_eq!(applied, AS_DISPATCHED);
 
-        // The negative control: the same dispatch with the seats', the drags', the sources' and
-        // the outputs' events kept in books of their own, taken after the backend's own in that
-        // order (the drain before LW.7's review, which read the outputs last), is applied out of
-        // order: the text input's `enter` before the focus it followed, the commit before the
-        // key, the scale before the motion, the output after the drop.
         let own = Inbox::default();
         let books: [Inbox; 4] = Default::default();
         let [seats, drags, sources, outputs] = &books;

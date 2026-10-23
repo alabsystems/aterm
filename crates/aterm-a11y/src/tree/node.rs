@@ -208,7 +208,7 @@ impl<'a> Node<'a> {
     }
 
     #[inline]
-    pub(crate) fn raw_bounds(&self) -> Option<Rect> {
+    pub(crate) const fn raw_bounds(&self) -> Option<Rect> {
         self.data().bounds()
     }
 
@@ -288,17 +288,17 @@ impl<'a> Node<'a> {
     }
 
     #[inline]
-    pub(crate) fn role(&self) -> Role {
+    pub(crate) const fn role(&self) -> Role {
         self.data().role()
     }
 
     #[inline]
-    pub(crate) fn is_disabled(&self) -> bool {
+    pub(crate) const fn is_disabled(&self) -> bool {
         self.data().is_disabled()
     }
 
     #[inline]
-    pub(crate) fn is_offscreen(&self) -> bool {
+    pub(crate) const fn is_offscreen(&self) -> bool {
         self.data().is_offscreen()
     }
 
@@ -315,27 +315,27 @@ impl<'a> Node<'a> {
     }
 
     #[inline]
-    pub(crate) fn toggled(&self) -> Option<Toggled> {
+    pub(crate) const fn toggled(&self) -> Option<Toggled> {
         self.data().toggled()
     }
 
     #[inline]
-    pub(crate) fn numeric_value(&self) -> Option<f64> {
+    pub(crate) const fn numeric_value(&self) -> Option<f64> {
         self.data().numeric_value()
     }
 
     #[inline]
-    pub(crate) fn min_numeric_value(&self) -> Option<f64> {
+    pub(crate) const fn min_numeric_value(&self) -> Option<f64> {
         self.data().min_numeric_value()
     }
 
     #[inline]
-    pub(crate) fn max_numeric_value(&self) -> Option<f64> {
+    pub(crate) const fn max_numeric_value(&self) -> Option<f64> {
         self.data().max_numeric_value()
     }
 
     #[inline]
-    pub(crate) fn numeric_value_step(&self) -> Option<f64> {
+    pub(crate) const fn numeric_value_step(&self) -> Option<f64> {
         self.data().numeric_value_step()
     }
 
@@ -355,7 +355,7 @@ impl<'a> Node<'a> {
     }
 
     #[inline]
-    pub(crate) fn is_text_input(&self) -> bool {
+    pub(crate) const fn is_text_input(&self) -> bool {
         matches!(
             self.role(),
             Role::TextInput | Role::MultilineTextInput | Role::SearchInput
@@ -369,7 +369,7 @@ impl<'a> Node<'a> {
 
     /// The orientation a list box and a tab list have by their role.
     #[inline]
-    pub(crate) fn orientation(&self) -> Option<Orientation> {
+    pub(crate) const fn orientation(&self) -> Option<Orientation> {
         match self.role() {
             Role::ListBox => Some(Orientation::Vertical),
             Role::TabList => Some(Orientation::Horizontal),
@@ -392,12 +392,15 @@ impl<'a> Node<'a> {
     // does nothing. This stance is a departure from Chromium.
 
     #[inline]
-    pub(crate) fn is_clickable(&self, parent_filter: &impl Fn(&Node) -> FilterResult) -> bool {
+    pub(crate) const fn is_clickable(
+        &self,
+        parent_filter: &impl Fn(&Node) -> FilterResult,
+    ) -> bool {
         self.supports_action(Action::Click, parent_filter)
     }
 
     #[inline]
-    pub(crate) fn is_selectable(&self) -> bool {
+    pub(crate) const fn is_selectable(&self) -> bool {
         // It's selectable if it has the attribute, whether it's true or false.
         self.is_selected().is_some() && !self.is_disabled()
     }
@@ -406,7 +409,7 @@ impl<'a> Node<'a> {
     /// the filtered parent for actions it grants its children; aterm's model
     /// has no such grants, so `_parent_filter` decides nothing.)
     #[inline]
-    pub(crate) fn supports_action(
+    pub(crate) const fn supports_action(
         &self,
         action: Action,
         _parent_filter: &impl Fn(&Node) -> FilterResult,
@@ -416,7 +419,7 @@ impl<'a> Node<'a> {
 }
 
 /// What may name a control that has no label of its own: a label child.
-fn descendant_label_filter(node: &Node) -> FilterResult {
+const fn descendant_label_filter(node: &Node) -> FilterResult {
     match node.role() {
         Role::Label => FilterResult::Include,
         _ => FilterResult::ExcludeSubtree,
@@ -515,7 +518,7 @@ impl<'a> Node<'a> {
     }
 
     #[inline]
-    pub(crate) fn is_read_only_supported(&self) -> bool {
+    pub(crate) const fn is_read_only_supported(&self) -> bool {
         self.is_text_input()
             || matches!(
                 self.role(),
@@ -524,7 +527,7 @@ impl<'a> Node<'a> {
     }
 
     #[inline]
-    pub(crate) fn should_have_read_only_state_by_default(&self) -> bool {
+    pub(crate) const fn should_have_read_only_state_by_default(&self) -> bool {
         matches!(
             self.role(),
             Role::Document | Role::List | Role::ProgressIndicator | Role::Meter | Role::Grid
@@ -538,12 +541,12 @@ impl<'a> Node<'a> {
     }
 
     #[inline]
-    pub(crate) fn is_selected(&self) -> Option<bool> {
+    pub(crate) const fn is_selected(&self) -> Option<bool> {
         self.data().is_selected()
     }
 
     #[inline]
-    pub(crate) fn is_item_like(&self) -> bool {
+    pub(crate) const fn is_item_like(&self) -> bool {
         matches!(
             self.role(),
             Role::MenuItem | Role::MenuItemRadio | Role::ListBoxOption | Role::Tab
@@ -551,7 +554,7 @@ impl<'a> Node<'a> {
     }
 
     #[inline]
-    pub(crate) fn is_container_with_selectable_children(&self) -> bool {
+    pub(crate) const fn is_container_with_selectable_children(&self) -> bool {
         matches!(self.role(), Role::ListBox | Role::Menu | Role::TabList)
     }
 

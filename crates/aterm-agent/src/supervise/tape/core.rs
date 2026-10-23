@@ -45,6 +45,8 @@ pub(crate) fn unwound_in_of(text: &str) -> Option<(String, Vec<u8>)> {
 }
 
 /// How many screens the recorder remembers the records of
+/// ([`TapeCore::screen_read`]): a decision judges a screen read in the
+/// same look, or one carried from the look before.
 const SCREENS: usize = 64;
 
 /// A value a round trip returns, as a tape holds it: what a recorder writes ([`Self::to_tape`]) and what a replay or a reader of the tape reads back ([`Self::from_tape`]).
@@ -82,6 +84,7 @@ impl TapeValue for () {
 }
 
 /// A control request's reply, or the transport's error
+/// ([`codec::ctl_reply`]).
 impl TapeValue for Result<CtlReply, String> {
     fn to_tape(&self) -> Vec<u8> {
         codec::ctl_reply(self)
@@ -93,6 +96,7 @@ impl TapeValue for Result<CtlReply, String> {
 }
 
 /// A line written where the loop's own failure ends it (a printed line, a
+/// notes line): nothing for done, else `1` and the error the loop ends on.
 impl TapeValue for Result<(), String> {
     fn to_tape(&self) -> Vec<u8> {
         match self {
@@ -119,6 +123,8 @@ impl TapeValue for Result<(), String> {
 }
 
 /// A write's outcome: nothing for done, else its error's kind
+/// ([`codec::KINDS`]); the error's text is not kept (no write the loop
+/// asks reads it).
 impl TapeValue for io::Result<()> {
     fn to_tape(&self) -> Vec<u8> {
         match self {
@@ -172,6 +178,8 @@ impl TapeValue for Option<i64> {
 }
 
 /// The machine's count of its sleep ([`SleepStamp`]): its milliseconds and,
+/// after a space, the boot's id in the kernel's spelling ([`Boot::text`]);
+/// nothing for none.
 impl TapeValue for Option<SleepStamp> {
     fn to_tape(&self) -> Vec<u8> {
         self.as_ref().map_or_else(Vec::new, |s| {
@@ -206,6 +214,7 @@ impl TapeValue for Option<SleepStamp> {
 }
 
 /// Two times or none (the machine's last sleep: when it slept and woke, unix
+/// ms): their decimal texts, a space between; nothing for none.
 impl TapeValue for Option<(i64, i64)> {
     fn to_tape(&self) -> Vec<u8> {
         self.map_or_else(Vec::new, |(a, b)| format!("{a} {b}").into_bytes())
@@ -257,6 +266,9 @@ pub(crate) struct TapeCore {
     /// The run's roots: every path is taped under one ([`Roots::encode`]).
     roots: Mutex<Roots>,
     /// The seed of the worker's digest on this tape (an xxh64 of the tape's
+    /// id): a policy probe names the worker by its digest under it
+    /// (`WorkerEnv::digest`), so the same worker reads as another digest on
+    /// another tape, and no digest is compared across tapes.
     seed: u64,
 }
 
@@ -282,6 +294,7 @@ struct Recorder {
 }
 
 /// A screen the loop parsed: its sequence and generation, and the ordinal of
+/// the round trip it came in.
 #[derive(Debug)]
 struct Screened {
     seq: u64,
@@ -317,6 +330,9 @@ impl Screens {
 }
 
 /// What the seam's two ends share: the value staged for the seam to tape
+/// (the seam draws a clock or a file from its backend, which here only hands
+/// back what the door already read), the stamp the next round trip or flag
+/// carries, and the writer the records stream into.
 struct Stage {
     writer: TapeWriter,
     mono: u64,
@@ -324,12 +340,14 @@ struct Stage {
     file: Option<io::Result<Vec<u8>>>,
     stamp: Option<Stamp>,
     /// Effects taped so far: the next one's ordinal (0-based, as
+    /// [`Mark::Truncated`] counts them).
     effects: u64,
     /// The ordinal of the last round trip taped.
     last_exchange: Option<u64>,
 }
 
 /// The seam's backend: it reads nothing of its own, and hands the seam the
+/// value the door staged.
 struct Handed(Arc<Mutex<Stage>>);
 
 impl RealEffects for Handed {
@@ -356,6 +374,7 @@ impl RealEffects for Handed {
 }
 
 /// The seam's sink: each record, stamped where it carries a stamp, appended
+/// to the writer.
 struct Streamed(Arc<Mutex<Stage>>);
 
 impl RecordSink for Streamed {
@@ -483,6 +502,7 @@ impl TapeCore {
     }
 
     /// `inner` was reached inside the outer door's live call: said once a
+    /// pair, and a failed assertion in this crate's tests.
     fn nested(&self, inner: &str) {
         let outer = self.outer.lock_or_recover().clone();
         {
@@ -730,6 +750,8 @@ pub(crate) fn holds_instant(text: &str) -> bool {
 }
 
 /// How this build's std writes an `Instant` in `Debug`
+/// ([`instants_as_offsets`]): `head`, the seconds, `mid`, the nanoseconds,
+/// `tail` — `Instant { tv_sec: `, `, tv_nsec: `, ` }` on unix today.
 struct InstantForm {
     head: String,
     mid: String,
@@ -740,6 +762,7 @@ struct InstantForm {
 
 impl InstantForm {
     /// The form, from `origin`'s own `Debug`; `None` unless it has exactly
+    /// that shape and an instant a known span on reads as that span.
     fn learn(origin: Instant) -> Option<Self> {
         const SPAN: Duration = Duration::new(1, 500_000_001);
         let written = format!("{origin:?}");
@@ -779,6 +802,7 @@ impl InstantForm {
     }
 
     /// The instant `text` begins with in this form: its length in `text`
+    /// and its nanoseconds on the clock.
     fn read(&self, text: &str) -> Option<(usize, i128)> {
         let rest = text.strip_prefix(&self.head)?;
         let (secs, rest) = number(rest)?;
@@ -794,6 +818,7 @@ impl InstantForm {
 }
 
 /// The decimal number `text` begins with (a `-` before it allowed), and the
+/// text after it.
 fn number(text: &str) -> Option<(i128, &str)> {
     let digits = text.strip_prefix('-').unwrap_or(text);
     let len = digits.bytes().take_while(u8::is_ascii_digit).count();

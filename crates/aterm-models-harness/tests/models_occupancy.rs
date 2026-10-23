@@ -4,13 +4,17 @@
 //! Tier-0 of `OccupancyDoor` (`docs/DESIGN-harness-occupancy-2026-10-20.md` §7, as the red-team
 //! corrects it): proved at `Buggy = 0` in each autopilot (`Mode`, Cruise committed, Off
 //! and Land its scenarios) and caught at `Buggy = 1`, each law broken by the mutant written to
-//! break it with every other mutant removed, the liveness audited as the non-vacuity sweep audits
-//! it, and walked along the paths the design names: a nudge at a hold of age, the upgrade's notice
-//! first, a wake over the notice under Land, the K Entry, a hold that outlasts its breaks and a
-//! harness line's answer, and a crash between the intent row and the line. Tier-1 is
+//! break it with every other mutant removed, and walked along the paths the design names: a
+//! nudge at a hold of age, the upgrade's notice first, a wake over the notice under Land, the K
+//! Entry, a hold that outlasts its breaks and a harness line's answer, and a crash between the
+//! intent row and the line. Tier-1 is
 //! `aterm-agent/tests/conformance_occupancy.rs`.
+//!
+//! The non-vacuity sweep over the three configurations and the audit of `TheDueIsToldOrRaised`
+//! are `aterm-models`' `non_vacuity` (the model and its liveness register themselves), not
+//! repeated here.
 
-use aterm_models_harness::{occupancy_door_liveness, occupancy_door_model};
+use aterm_models_harness::occupancy_door_model;
 use aterm_spec::derive::Model;
 use aterm_spec::walk::walk;
 use aterm_spec::{interp, verify};
@@ -102,20 +106,6 @@ fn each_mutant_breaks_its_own_law_alone() {
     for inv in model.invariants.iter().filter(|inv| inv.name != "LooksBox") {
         assert!(laws.contains(&inv.name), "{} has its own mutant", inv.name);
     }
-}
-
-/// The non-vacuity sweep over the model's three configurations, and the liveness audit, as
-/// `aterm-models`' `non_vacuity` runs them: each law caught, the bound unbroken, each dead
-/// action an audited negative control, `TheDueIsToldOrRaised` proved with `Sample` and
-/// `SampleLast` its only (and load-bearing) fairness, and each of its two mutants breaking it
-/// alone.
-#[test]
-fn occupancy_door_is_non_vacuous_and_live() {
-    let configs = [under(1), under(0), under(2)];
-    let faults = verify::sweep_faults(&configs);
-    assert!(faults.is_empty(), "{faults:#?}");
-    verify::audit_liveness(&occupancy_door_model(), &occupancy_door_liveness())
-        .expect("TheDueIsToldOrRaised holds, is minimal and is caught");
 }
 
 /// A NUDGE: a hold comes of age at a break, the nudge opens, its intent row goes before its one

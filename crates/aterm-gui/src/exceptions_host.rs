@@ -20,11 +20,13 @@ use crate::message_reporters;
 use crate::messages_host::wall_stamp_now;
 
 /// How long a rating survey the loop cannot close stands before it earns a digest line: an hour,
+/// the supervisor's named horizon, since the card blocks nothing the worker does.
 const SURVEY_ENTRY_AFTER: Duration = Horizon::SUPERVISOR_RESTARTS.duration();
 
 #[cfg(test)]
 thread_local! {
     /// How often the digest announced a change (the menu-bar item and Settings follow): a test
+    /// seam, since a headless App has neither.
     static DIGEST_MOVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -37,20 +39,27 @@ pub(crate) struct Ripening {
 }
 
 /// How long a restarted supervisor must run without failing again before the failure is taken
+/// to be over ([`App::settle_supervisors`]): its pause and this.
 const SUPERVISOR_STEADY: Duration = Duration::from_secs(30 * 60);
 
 /// Settle window (`10m`) before the resume family hands its full state to the digest.
 pub(crate) const RESUME_SETTLE: Duration = Duration::from_secs(10 * 60);
 
 /// The `host_noted` marks that this process recorded a short volume, one per form of its line:
+/// the passes' ([`HostNote::DiskLow`]) and the one opened while cleanup is off by fault
+/// ([`HostNote::DiskLowCleanupOff`]).
 const DISK_NOTED: &str = "disk";
 const DISK_CLEANUP_OFF_NOTED: &str = "disk:cleanup-off";
 
 /// The `host_noted` marks of the usage tap's line ([`HostNote::UsageTap`]): one per tab whose tap
+/// stands silent, and the day it was last raised.
 const USAGE_TAP_NOTED: &str = "usage-tap:";
 const USAGE_TAP_DAY: &str = "usage-tap-day:";
 
 /// When this process first looked at its exceptions, and whether it has since ended the
+/// supervisor lines an earlier process left open that nothing has told of
+/// ([`App::sweep_adopted_supervisor_lines`]): once per process, at the first sweep after the
+/// steady time (no wake of its own: the window sweeps at every event).
 static LOOKING_SINCE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 static ADOPTED_SWEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -75,6 +84,7 @@ pub(crate) struct NoticeStory {
     /// Wall-clock timestamp (unix ms) of the story's latest notice or ask end.
     pub(crate) last: u64,
     /// The notices of this story the owner read (folded or dismissed) whose
+    /// rows a later notice replaced, by key, at the wall clock of the read.
     read: std::collections::BTreeMap<String, u64>,
 }
 
@@ -83,11 +93,13 @@ pub(crate) const NOTICE_STORY_SPAN: Duration = aterm_messages::need::STANDING_QU
 
 impl NoticeStory {
     /// Whether the story goes on at wall `unix_ms`: its row still on the
+    /// glass (`live`), or its last word inside [`NOTICE_STORY_SPAN`].
     fn goes_on(&self, live: bool, unix_ms: u64) -> bool {
         live || unix_ms < self.last.saturating_add(span_ms(NOTICE_STORY_SPAN))
     }
 
     /// Whether `key` is a notice the owner read in this story, still quiet at
+    /// wall `unix_ms` ([`aterm_messages::need::STANDING_QUIET`] from its read).
     fn keeps_quiet(&self, key: &str, unix_ms: u64) -> bool {
         self.read.get(key).is_some_and(|&read| {
             unix_ms < read.saturating_add(span_ms(aterm_messages::need::STANDING_QUIET))
@@ -212,6 +224,8 @@ impl App {
     }
 
     /// A supervisor that failed past its budget is over once a run started after its latest
+    /// failure has outlived it by [`SUPERVISOR_STEADY`] past the pause: its line is withdrawn, or
+    /// never shown.
     fn settle_supervisors(&mut self, now: Instant) {
         if self.supervisor_failing.is_empty() {
             return;
@@ -723,6 +737,14 @@ impl App {
     }
 
     /// A tab's relaunch says something about itself ([`RelaunchSay`]): a record
+    /// for a relaunch that keeps failing — and, where no command is named for
+    /// the tab's mark, one line of the digest at once, save for the harness's
+    /// own restart, whose record's own row speaks
+    /// (`harness_host::failing_names_command`); else, for a
+    /// cause only a person clears, a line once it has gone on for an hour —
+    /// and for the owner's own limit; for an agent that cannot be brought
+    /// back, a record and, where no command can be named for the tab's mark,
+    /// one line of the digest.
     fn note_relaunch(&mut self, sid: &str, said: RelaunchSay) {
         let [blocked, gone, lost] = message_reporters::relaunch_keys(sid);
         let spot = self.upgrade_spot(sid);
@@ -843,6 +865,9 @@ impl App {
     }
 
     /// A tab's resume loop needs the owner now and nothing of the loop's says
+    /// so ([`message_reporters::resume_ask`]): its standing ask is posted —
+    /// the same words are a duplicate, new ones restate it in place — and
+    /// this process marks the tab as one it holds an ask for.
     fn raise_resume_ask(
         &mut self,
         sid: &str,
@@ -926,6 +951,8 @@ impl App {
     }
 
     /// The row or record tab `sid`'s notices are told in now: the story this
+    /// process holds, else the newest ask of the tab an earlier process
+    /// carried here.
     fn notice_story_head(&self, sid: &str) -> Option<aterm_messages::MessageId> {
         if let Some(story) = self.resume_stories.get(sid) {
             return Some(story.head);
@@ -944,6 +971,11 @@ impl App {
     }
 
     /// Tab `sid`'s lost login is back ([`HostNote::LoginBack`]): the story its
+    /// notices told ends fixed, as one row — a row still on the glass resolves
+    /// `Ok` in its declared fix words, a record whose row already left
+    /// (withdrawn as the agent went back to work, or read) is closed fixed in
+    /// them ([`aterm_messages::MessageCenter::fix_record`]) — and the next
+    /// loss is a story of its own, news even where the owner read this one.
     fn close_notice_story(&mut self, sid: &str) {
         let Some(story) = self.resume_stories.remove(sid) else {
             return;
@@ -967,6 +999,11 @@ impl App {
     }
 
     /// Tab `sid`'s usage or model limit ended with no sign-in that took
+    /// ([`HostNote::LimitOver`]): the story its notices told ends UNFIXED —
+    /// its row, if one still stands, is the loop's to withdraw as its point
+    /// moves on, and its record keeps the words it ended in — so a login back
+    /// told later (a lost login's, an account move's) fixes nothing of it,
+    /// and the tab's next notice is a story of its own.
     fn end_notice_story(&mut self, sid: &str) {
         if self.resume_stories.remove(sid).is_some() {
             aterm_log::info!("harness @{sid}: the limit ended by itself; its notice reads unfixed");
@@ -974,6 +1011,8 @@ impl App {
     }
 
     /// Withdraws tab `sid`'s live asks ([`message_reporters::notice_ask_key`]
+    /// under its [`message_reporters::resume_ask_key`]) but the one keyed
+    /// `keep`, claiming no outcome.
     fn withdraw_resume_asks(&mut self, sid: &str, keep: Option<&str>) {
         let base = message_reporters::resume_ask_key(sid);
         let left: Vec<aterm_messages::MessageId> = self
@@ -993,6 +1032,8 @@ impl App {
     }
 
     /// The tab's ask is over (the loop's point no longer holds it, or the loop
+    /// ended): its row is withdrawn, claiming no outcome — the loop says the
+    /// point moved on, not that the owner's step was taken.
     fn end_resume_ask(&mut self, sid: &str) {
         let ended = self.host_noted.remove(&resume_asked_key(sid));
         self.withdraw_resume_asks(sid, None);
@@ -1002,6 +1043,7 @@ impl App {
     }
 
     /// Withdraw the asks an earlier process carried here that no loop of this one tells of, at the
+    /// resume family's settle ([`RESUME_SETTLE`]), as the digest's lines end then.
     fn sweep_resume_asks(&mut self) {
         let held: Vec<String> = self
             .host_noted
@@ -1218,7 +1260,7 @@ impl App {
             .map(|handle| handle.sid.as_str().to_string())
     }
 
-    /// Whether `session`'s render epoch `epoch` is still open and at risk. A gone session answers
+    /// Whether `session`'s render epoch `epoch` is still open and at risk.
     fn render_epoch_still_off(&self, session: u64, epoch: u64) -> bool {
         let Some(found) = self.pool.get(session) else {
             return false;
@@ -1254,6 +1296,12 @@ impl App {
     }
 
     /// The entry as a checked message, or `None` (and ONE `aterm.log` error
+    /// naming the key, said again only once its words have passed or its
+    /// fault has changed: a level family restates at every look) when its
+    /// words fail the rule: an owner is never shown words the rule refuses,
+    /// and the roster test
+    /// (`host_exceptions_tests::every_host_entry_passes_the_door_and_the_caps`)
+    /// fails in a test run first.
     fn checked_entry(&mut self, entry: &Entry) -> Option<Message> {
         let key = entry.key();
         match entry.message() {
@@ -1328,6 +1376,8 @@ impl App {
 }
 
 /// The 1-based line of `text` where `table` begins, for the editor the entry
+/// opens: its first header (`[table]`, `[table.sub]`, `[[table.sub]]`), or,
+/// above every header, its first key (`table.key = …`, `table = { … }`).
 fn table_line(text: &str, table: &str) -> Option<u32> {
     let names = |rest: &str, ends: &[char]| {
         rest.strip_prefix(table)
@@ -1354,17 +1404,21 @@ fn relaunch_told_key(sid: &str) -> String {
 const RESUME_ASKED: &str = "resume-ask:";
 
 /// The `host_noted` key that says this process holds a tab's resume ask
+/// ([`App::raise_resume_ask`]).
 fn resume_asked_key(sid: &str) -> String {
     format!("{RESUME_ASKED}{sid}")
 }
 
 /// Whether `key` is one of a tab's asks, whose own key is `base`
+/// ([`message_reporters::resume_ask_key`]): that key, or a notice's under it
+/// ([`message_reporters::notice_ask_key`]).
 fn is_tab_ask_key(key: &str, base: &str) -> bool {
     key.strip_prefix(base)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
 }
 
 /// Whether `key` is a `harness.supervisor.<subject>.not-back|gone|lost|
+/// not-restored` key: a tab's relaunch line.
 fn is_relaunch_key(key: &str) -> bool {
     key.strip_prefix(&Family::Supervisor.prefix())
         .and_then(|rest| rest.rsplit_once('.'))
@@ -1397,6 +1451,8 @@ mod tests {
     }
 
     /// The host's word that what a restore carries of a tab's agent moved owes
+    /// the crash journal a capture at once, inside the write interval, and
+    /// says nothing.
     #[cfg(unix)]
     #[test]
     fn an_agent_publication_owes_the_crash_journal_a_capture() {
@@ -1435,6 +1491,9 @@ mod tests {
     }
 
     /// The digest costs the terminal nothing (the Row Law, clause 1): post,
+    /// restate, family pass, clear, dismiss — the band's re-grid counter, the
+    /// committed row count and the window's chrome rows do not move once, in a
+    /// real `App` (presence owns no row to re-grid).
     #[test]
     fn a_digest_costs_no_regrid() {
         let mut app = App::headless_for_test();
@@ -1462,6 +1521,9 @@ mod tests {
     }
 
     /// A dismiss click never waits on a writer that does not answer: the
+    /// record's flush is bounded (law L5), so with the messages log's thread
+    /// wedged the owner's `Dismiss all` and the per-entry `Dismiss` still
+    /// file and return.
     #[test]
     fn a_dismissal_returns_though_the_log_writer_never_answers() {
         let mut app = App::headless_for_test();
@@ -1480,6 +1542,8 @@ mod tests {
     }
 
     /// A script's dismissal moves the surfaces (`aterm ctl notice dismiss review`
+    /// and `dismiss <id>` file through the engine): the menu-bar item and
+    /// Settings follow the same call, and the log is flushed before the reply.
     #[test]
     fn a_scripted_dismissal_moves_the_surfaces() {
         use super::DIGEST_MOVES;
@@ -1522,6 +1586,7 @@ mod tests {
     }
 
     /// At Commit the successor folds the parent's log tail in: a `Dismiss all` the parent made
+    /// after this process loaded the file holds here, and the surfaces move.
     #[cfg(unix)]
     #[test]
     fn the_successor_folds_in_what_the_parent_filed() {
@@ -1559,6 +1624,7 @@ mod tests {
     }
 
     /// The owner's dismissal is on disk before the call returns and holds after
+    /// the same facts are asserted again (the next look, the next process).
     #[test]
     fn a_dismissal_holds_when_the_reporter_asserts_the_fact_again() {
         let mut app = App::headless_for_test();
@@ -1572,6 +1638,8 @@ mod tests {
     }
 
     /// A reporter that words an entry against the rule shows the owner nothing:
+    /// the entry is recorded in `aterm.log`, not posted (the roster test fails
+    /// in a test run first).
     #[test]
     fn an_entry_that_breaks_the_rule_is_never_shown() {
         let mut app = App::headless_for_test();
@@ -1588,6 +1656,7 @@ mod tests {
     }
 
     /// One producer, one mode: the host refuses the wrong call, so a pass over the upgrade's rows
+    /// never ends the fact its host raised by event.
     #[test]
     fn a_level_family_is_never_raised_by_event_and_an_event_family_is_never_swept() {
         let mut app = App::headless_for_test();
@@ -1617,6 +1686,8 @@ mod tests {
     }
 
     /// The digest's own clock: the upgrade's looks are sent only when its rows change, so an entry
+    /// its reporter stopped naming in one change still ends: `messages_deadline` tells the loop
+    /// when to come back and `settle_messages` ends it.
     #[test]
     fn an_entry_its_reporter_stopped_naming_ends_without_a_second_look() {
         use std::time::{Duration, Instant};
@@ -1638,6 +1709,8 @@ mod tests {
     }
 
     /// A wording fault never ends a fact: a pass that still names the key keeps the open entry in
+    /// the words it was shown in and starts no clock, so a settle past `RESOLVE_AFTER` leaves it
+    /// open.
     #[test]
     fn a_refused_restatement_leaves_its_entry_open() {
         use aterm_messages::need::RESOLVE_AFTER;
@@ -1677,6 +1750,8 @@ mod tests {
     }
 
     /// The page and the wire read one digest: an open entry reads the same words in Settings and
+    /// in `aterm ctl messages need=later live`, the menu bar counts it, and plain `live` does not
+    /// list it.
     #[test]
     fn the_surfaces_read_one_digest() {
         let mut app = App::headless_for_test();
@@ -1707,6 +1782,9 @@ mod tests {
     }
 
     /// The page's own dismiss buttons: every open entry offers `Dismiss` (files
+    /// that one) and, with two or more open, the first offers `Dismiss all`;
+    /// each press is flushed to the log; a settled entry offers neither; a
+    /// stale press is `Gone`.
     #[test]
     fn the_page_dismisses_one_entry_or_all_of_them() {
         use crate::native_app::MessageActOutcome;
@@ -1774,6 +1852,7 @@ mod tests {
     }
 
     /// The rule's counter is said in `aterm.log` from every posting path, once per change: here a
+    /// plain post the door records.
     #[test]
     fn the_rules_counter_is_said_once_per_change() {
         use aterm_messages::need::{Ask, Reason, StandingWhy, Then};

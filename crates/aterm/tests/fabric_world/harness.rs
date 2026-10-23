@@ -322,7 +322,7 @@ pub fn node_grants(node: &str) -> Vec<String> {
 /// THE INHERITED IDENTITY MUST BE STRIPPED, and this is not hygiene — it is the difference between a two-node test and a one-node test wearing two hats.
 pub fn prepare_gui_environment(cmd: &mut Command) {
     for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("ATERM_") {
+        if stripped(&name) {
             cmd.env_remove(&name);
         }
     }
@@ -1605,12 +1605,20 @@ pub fn scratch_spawnfd<'a>(
     tmp: &Path,
 ) -> &'a mut aterm_uds::spawnfd::Command {
     for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("ATERM_") {
+        if stripped(&name) {
             cmd.env_remove(&name);
         }
     }
     cmd.env(STALE_HORIZON.0, STALE_HORIZON.1.as_millis().to_string());
     cmd.envs(scratch_cli_env(tmp))
+}
+
+/// An inherited variable a launch removes: every `ATERM_*` but the verify run's mark, which is
+/// no authority and stays, so the run that started this test can find what it launched
+/// (`aterm_uds::process::VERIFY_RUN_VAR`).
+fn stripped(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.starts_with("ATERM_") && name != aterm_uds::process::VERIFY_RUN_VAR
 }
 
 fn scratch_cli_env(tmp: &Path) -> [(&'static str, PathBuf); 3] {

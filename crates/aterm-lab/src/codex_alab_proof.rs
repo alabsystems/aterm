@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `codex-alab-proof [--package DIR] [--aterm PATH] [--keep]`: the codex-alab native harness, end to end (its contract, `alab/CONTRACT.md` §9.3, and Autopilot Cruise / Land, the owner's its §5 ports), against the REAL package in a private headless aterm sandboxed to one loopback port where the lab answers as the model ([`crate::codex_rig`], [`crate::codex_alab_model`]): no key, no account, no byte off the machine, nothing of the owner's touched.
+//! `codex-alab-proof`: the codex-alab native harness, end to end (its contract, `alab/CONTRACT.md` §9.3, and Autopilot Cruise / Land, the owner's its §5 ports), against the REAL package in a private headless aterm sandboxed to one loopback port where the lab answers as the model ([`crate::codex_rig`], [`crate::codex_alab_model`]): no key, no account, no byte off the machine, nothing of the owner's touched. `--upgrade-package` selects another package for the handoff; `--upgrade-only` runs only that lane.
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -20,6 +20,8 @@ use crate::codex_rig;
 
 #[path = "codex_alab_policy_proof.rs"]
 mod policy_proof;
+#[path = "codex_alab_upgrade_proof.rs"]
+mod upgrade_proof;
 use crate::forever::pct_decode;
 use crate::instance::{self, Instance, Launch, World};
 use crate::pyjson::J;
@@ -31,6 +33,7 @@ use crate::{Fail, LAB, Res};
 const LANDED: &str = "landed@v1";
 
 /// The act older codex-alab builds recorded where the retired token ended
+/// the task: nothing records it now.
 const FINISHED: &str = "finished@v1";
 
 /// Cruise's defend-and-find-more prompt's act.
@@ -40,9 +43,15 @@ const DEFEND: &str = "continue-done-check@v1";
 const FLEET: &str = "lab";
 
 /// The one-line nudge the removed `aterm drive task` typed into a worker
+/// (`DESIGN-sessions-as-subagents-2026-10-15.md` §7): nothing types it now,
+/// so the Autopilot Off step holds the screen and the ledger to its absence.
 const NUDGE: &str = "Inbox: task @";
 
 /// The proof's own bus (the Autopilot Off step's mail): a guarded broker the
+/// lab starts outside the jail on a Unix socket in the scratch, under a mint
+/// secret only the scratch holds, and the node ring the instance's bridge
+/// attaches with (THE ring `aterm fabric on` mints,
+/// `aterm_link::enable::node_grants`).
 struct Fabric {
     broker: Option<aterm_uds::spawnfd::Child>,
     /// The `[fabric]` table the instance's `aterm.toml` gets.
@@ -51,6 +60,7 @@ struct Fabric {
 
 impl Fabric {
     /// Lay the bus out under `dir` and start its broker with `aterm`'s own
+    /// `link broker`.
     fn start(aterm: &Path, dir: &Path) -> Result<Fabric, String> {
         use std::os::unix::fs::PermissionsExt as _;
         let state = dir.join("state");
@@ -259,10 +269,12 @@ struct Leg {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Folder {
     /// A fresh repository holding one untracked file (`git init`, a
+    /// `README.md`), as every leg had before the Land legs.
     Scratch,
     /// No repository at all: Land's probe finds nothing.
     Plain,
     /// A repository whose `main` is pushed to a local bare `origin`
+    /// (`origin/HEAD` naming it), then one uncommitted file (`notes.txt`).
     Origin,
 }
 
@@ -270,6 +282,7 @@ enum Folder {
 const NOTES: &str = "notes.txt";
 
 /// Whether a `meta` reply's attention entries hold the worker's NEEDS YOU
+/// (`attention_kinds=` naming `ask:needs`, pct-encoded or not).
 fn needs_raised(meta: &str) -> bool {
     field(meta, "attention_kinds")
         .map(|k| pct_decode(&k))
@@ -277,6 +290,13 @@ fn needs_raised(meta: &str) -> bool {
 }
 
 /// Whether a `log kinds=act` reply holds the act mark a self-claim's `act`
+/// writes for `holder`: `<seq> mark <node> act
+/// word=<w> rule=<act, @.> holder=<holder> harness_act=<act>`, the word
+/// map's ([`aterm_agent::harness::acts::self_claim_act`]; `word=unknown`
+/// and no `rule=` for an act it has no word for), its holder the proven
+/// claim's, which the server read, and the act whole (host tier: the
+/// owner's `log` prints both), as the timeline's `harness-act act=<act>
+/// holder=<holder>` row says it.
 fn acted_in_log(log: &str, act: &str, holder: &str) -> bool {
     let worded = aterm_agent::harness::acts::self_claim_act(act);
     let word = worded.as_ref().map_or("unknown", |(w, _)| *w);
@@ -297,7 +317,27 @@ fn task_face(status: &str) -> String {
     field(status, "task").unwrap_or_else(|| "-".to_string())
 }
 
+/// Where a Land leg stood just before the live upgrade
+/// ([`Proof::landed_before_upgrade`]): its codex-alab's proven pid, its
+/// record's `execGeneration` and the resumes its journal names, or what was
+/// read when its face never read `landed` beside a proven claim.
+type Baseline = Result<(i32, i64, usize), String>;
+
+/// Each leg with what was read of it: `Err` with what was read when it never settled.
+type LegReadings<'l, T> = Vec<(&'l Leg, Result<T, String>)>;
+
+/// Each of `legs` with what `read` says of it, in order: none left out, so a
+/// leg `read` could not settle is still judged (a FAIL), never dropped.
+fn landed_baselines<'l, T>(
+    legs: &[&'l Leg],
+    mut read: impl FnMut(&Leg) -> Result<Result<T, String>, Stopped>,
+) -> Result<LegReadings<'l, T>, Stopped> {
+    legs.iter().map(|leg| Ok((*leg, read(leg)?))).collect()
+}
+
 /// What a session's codex-alab rollout tap last answered, as `status` says
+/// it (`rollout=<word> rollout_asks=<n>`): the answer's word and how many
+/// asks it answered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TapSaid {
     word: String,
@@ -313,20 +353,26 @@ fn tap_said(status: &str) -> Option<TapSaid> {
 }
 
 /// THE TAP'S FENCE: how many asks past a look the tap answers before every
+/// write it would make about what the rollout held at that look is in the
+/// log.
 const FENCE_ASKS: u64 = 2;
 
 /// What reading past the fence found ([`past_the_fence`]).
 #[derive(Debug, PartialEq, Eq)]
 enum Fenced<T> {
     /// The tap answered [`FENCE_ASKS`] asks past the first look: its answer
+    /// at the first look, its answer then, and the read made then.
     Past { from: TapSaid, to: TapSaid, got: T },
     /// No `status` line named a tap answer.
     NoTap,
     /// The tap answered too few asks past the first look before the hang
+    /// detector ran out: its answer at that look, and its last.
     Stuck { from: TapSaid, to: TapSaid },
 }
 
 /// READ PAST THE FENCE (pure over its hands): `look` at the tap's answer,
+/// `wait` (a hang detector, never a latency budget) until it answered
+/// [`FENCE_ASKS`] more, and only then `read`.
 fn past_the_fence<T>(
     mut look: impl FnMut() -> Option<TapSaid>,
     read: impl FnOnce() -> T,
@@ -353,6 +399,9 @@ fn past_the_fence<T>(
 }
 
 /// THE ROLLOUT LEG'S VERDICT (pure), on the log read past the fence: on a
+/// measured build the tap said `bound` and the log holds a turn from the
+/// rollout (`src=transcript`); on any other the tap said `unmeasured` and
+/// the log holds none.
 fn rollout_holds(measured: bool, said: &TapSaid, turns: &[String]) -> bool {
     let from_rollout = turns
         .iter()
@@ -377,6 +426,7 @@ fn nudges_seen(tags: &[String]) -> Vec<usize> {
 }
 
 /// The `land-nudge@v1` acts of a timeline's acts before its first
+/// `landed@v1` (all of them where none landed).
 fn nudges_before_landing(acts: &[String]) -> usize {
     acts.iter()
         .take_while(|a| *a != LANDED)
@@ -385,6 +435,7 @@ fn nudges_before_landing(acts: &[String]) -> usize {
 }
 
 /// The time (unix ms) of the first model request of `rows` whose tag starts
+/// with `tag`.
 fn first_at(rows: &[J], tag: &str) -> Option<i64> {
     rows.iter()
         .find(|r| {
@@ -428,12 +479,15 @@ fn int_of(row: &J, k: &str) -> i64 {
 const MIN_WORK_MS: i64 = 120_000;
 
 /// The hang detector past a done claim's back-off before the Cruise check
+/// counts its act missing.
 const CLAIM_SLACK_MS: i64 = 90_000;
 
 /// How long a landed leg is watched for an act that must not come: past the
+/// 120 s a codex-alab that went on would wait after one short defense.
 const LANDED_QUIET: Duration = Duration::from_secs(150);
 
 /// The back-off before the act after `short` short turns in a row: 2, 4, 8 …
+/// minutes, an hour at most (codex-alab's `Timing`, aterm's `TurnEndTiming`).
 fn backoff_ms(short: u32) -> i64 {
     if short == 0 {
         0
@@ -451,6 +505,11 @@ struct Claims {
 }
 
 /// Each reply of `rows` (one leg's model log, in order) that says done
+/// (aterm's `says_done`) and what came next: the defend prompt
+/// (`<leg>:defend…`) meets it; any other request, or none past the claim's
+/// back-off (after `short` short replies in a row, a done claim short
+/// whatever it worked and real work ending the run; a hang detector past
+/// it), leaves it unmet; none before then is pending.
 fn claims_of(leg: &str, rows: &[J], now_ms: i64) -> Claims {
     let defend = format!("{leg}:defend");
     let mut claims = Claims::default();
@@ -489,18 +548,27 @@ fn claims_of(leg: &str, rows: &[J], now_ms: i64) -> Claims {
 }
 
 /// How long past the reply to the person's own turn the exchange leg is
+/// watched for an act that must not come: after a turn of real work
+/// codex-alab types the next act at once (after `human_grace_s`), as the
+/// control leg shows, so a minute is decisive; the judge holds it past the
+/// control's measured latency too ([`left_to_person`]).
 const EXCHANGE_QUIET: Duration = Duration::from_secs(60);
 
 /// The hang detector past the control's reply for its continuation: typed at
+/// once after a turn of real work, it is late past this.
 const CONTROL_ACT_MS: i64 = 120_000;
 
 /// The continued reply's token must not trigger another request in this
+/// window, starting at its server-finished-writing witness.
 const CONTINUE_QUIET: Duration = Duration::from_secs(15);
 
 /// codex-alab's journal words for a point it leaves to a person (its
+/// decider's note, `<thread>: nothing (a person's own exchange: theirs to
+/// answer)`): the rule aterm journals as `left-to-person@v1` ([`RULE_LEFT`]).
 const EXCHANGE_WORDS: &str = "a person's own exchange";
 
 /// Attach only an unambiguous successful write witness for this exact
+/// request.
 fn with_replies(mut rows: Vec<J>, replies: &[J]) -> Vec<J> {
     for i in 0..rows.len() {
         let row = &rows[i];
@@ -550,6 +618,7 @@ fn with_replies(mut rows: Vec<J>, replies: &[J]) -> Vec<J> {
 }
 
 /// The reply to a leg's typed turn (`<leg>:person`): its successful HTTP
+/// write witness on the run's monotonic clock, and subsequent requests.
 fn person_reply<'a>(leg: &str, rows: &'a [J]) -> Option<(i64, &'a [J])> {
     let head = format!("{leg}:person");
     let at = rows
@@ -567,6 +636,7 @@ fn written_reply(row: &J) -> Option<i64> {
 }
 
 /// A matched successful server-write witness, read on the same monotonic
+/// clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ReplyWrite {
     request_id: i64,
@@ -612,6 +682,9 @@ fn continued_quiet(rows: &[J], reply: Option<ReplyWrite>, now_ms: i64) -> Result
 }
 
 /// THE CONTROL'S VERDICT: its turn, typed as a control write, is codex-alab's
+/// to go on with — the request after its reply is Cruise's continuation
+/// (`<leg>:continue`), asked within [`CONTROL_ACT_MS`] of the reply, and the
+/// first act on its timeline is `continue@v1`.
 fn continued_after(leg: &str, rows: &[J], acts: &[String]) -> Result<i64, String> {
     let Some((reply, after)) = person_reply(leg, rows) else {
         return Err("its turn never reached the model".to_string());
@@ -645,6 +718,10 @@ fn continued_after(leg: &str, rows: &[J], acts: &[String]) -> Result<i64, String
 }
 
 /// The acts of a leg's timeline that typed into its session: all of them but
+/// the two codex-alab records with `meta set harness_act` and never types —
+/// the point it left to a person's own exchange (`left-to-person@v1`,
+/// [`RULE_LEFT`]), so aterm's face reads `theirs`, and its live upgrade's
+/// re-exec onto a new build at rest (`upgrade@v1`, [`RULE_UPGRADE`]).
 fn typed_acts(acts: &[String]) -> Vec<String> {
     acts.iter()
         .filter(|a| *a != RULE_LEFT && *a != RULE_UPGRADE)
@@ -653,6 +730,8 @@ fn typed_acts(acts: &[String]) -> Vec<String> {
 }
 
 /// How many times a leg's codex-alab journal says a thread was resumed
+/// (`<thread>: resumed (task=…)`): once per image that took a conversation
+/// up again, a live upgrade's re-exec among them.
 fn resumes(journal: &str) -> usize {
     journal
         .lines()
@@ -662,6 +741,9 @@ fn resumes(journal: &str) -> usize {
 }
 
 /// THE FIRST DECISION AFTER A RESUME: the first line of a leg's codex-alab
+/// journal after its resume number `n + 1` ([`resumes`] counted `n` before
+/// it) that says what the image did at the point — `nothing (…)`, a `wait`
+/// for an act, or an act — from its target on, on one line.
 fn decided_after_resume(journal: &str, n: usize) -> Option<String> {
     let mut seen = 0;
     for line in journal.lines() {
@@ -683,6 +765,11 @@ fn decided_after_resume(journal: &str, n: usize) -> Option<String> {
 }
 
 /// THE PERSON'S EXCHANGE, LEFT TO THEM: nothing asked of the model after the
+/// reply to their turn and no typed act on the leg's timeline
+/// ([`typed_acts`]), watched at least
+/// [`EXCHANGE_QUIET`] past the reply and longer than the control's
+/// continuation took after its own (`control_ms`), so the same path showed
+/// its act inside a window this one outlasted.
 fn left_to_person(
     leg: &str,
     rows: &[J],
@@ -725,6 +812,8 @@ fn left_to_person(
 }
 
 /// The line of a leg's codex-alab journal naming the rule it left a point to
+/// a person by — codex-alab's words ([`EXCHANGE_WORDS`]) or aterm's id
+/// ([`RULE_LEFT`]) — from its target on, on one line.
 fn exchange_rule(journal: &str) -> Option<String> {
     let line = journal
         .lines()
@@ -736,6 +825,7 @@ fn exchange_rule(journal: &str) -> Option<String> {
 }
 
 /// The acts a leg's codex-alab journal says it typed (`act <rule>: typed …`),
+/// in order.
 fn journal_typed(journal: &str) -> Vec<String> {
     journal
         .lines()
@@ -753,6 +843,7 @@ fn journal_typed(journal: &str) -> Vec<String> {
 }
 
 /// A codex-alab record's `execGeneration`: how many re-execs its process has
+/// made (0 before the first).
 fn exec_generation(record: &J) -> i64 {
     record
         .get("execGeneration")
@@ -761,6 +852,8 @@ fn exec_generation(record: &J) -> i64 {
 }
 
 /// A person's gesture as a `status` line names it: how long ago
+/// (`human_ms=`, `None` for `-`: none since the session started) and how
+/// many (`human_seq=`, 0 before the first).
 fn person_hand(status: &str) -> (Option<u64>, u64) {
     (
         field(status, "human_ms").and_then(|v| v.parse().ok()),
@@ -771,10 +864,12 @@ fn person_hand(status: &str) -> (Option<u64>, u64) {
 }
 
 /// What the lab typed into an exchange leg's codex, and what aterm said of
+/// it around the turn.
 struct Typed {
     /// When the Enter that took the draft went in (unix ms).
     pressed_ms: i64,
     /// `status` read before the message was typed, once the draft stood in
+    /// the composer (before its Enter), and after its Enter.
     before: String,
     sent: String,
     after: String,
@@ -782,6 +877,7 @@ struct Typed {
 
 impl Typed {
     /// THE ENTER STAMPED A PERSON'S GESTURE: `human_ms` set and `human_seq`
+    /// past its count once the draft stood ([`Self::sent`]).
     fn enter_stamped(&self) -> (bool, [u64; 3]) {
         let (_, before) = person_hand(&self.before);
         let (_, sent) = person_hand(&self.sent);
@@ -790,6 +886,7 @@ impl Typed {
     }
 
     /// THE WRITE STAMPED NO GESTURE: a control write's message and Enter,
+    /// `human_ms` unset and `human_seq` where it stood before the message.
     fn stamped_nothing(&self) -> bool {
         let (_, was) = person_hand(&self.before);
         let (ms, seq) = person_hand(&self.after);
@@ -905,6 +1002,7 @@ impl Proof {
     }
 
     /// Every `step` until `ok` holds, at most `limit`: a hang detector, never
+    /// a latency budget.
     fn wait_for(
         limit: Duration,
         step: Duration,
@@ -923,6 +1021,7 @@ impl Proof {
     }
 
     /// `git <args>` in `dir`, as the lab's own hand (outside the jail): the
+    /// scratch HOME, a lab identity, no signing.
     fn git(&self, dir: &Path, args: &[&str]) -> Result<String, String> {
         let out = aterm_uds::spawnfd::command("/usr/bin/git")
             .env_clear()
@@ -979,6 +1078,10 @@ impl Proof {
     }
 
     /// The leg's world (its `CODEX_HOME` and its folder, laid out as `folder`
+    /// says), its tab, its Autopilot word where one is given (set on the tab
+    /// before codex starts there, as the chip's write), and the launch line
+    /// typed at the tab's shell as a person types it, its prompt naming the
+    /// leg.
     fn spawn_leg(
         &mut self,
         name: &'static str,
@@ -991,6 +1094,7 @@ impl Proof {
     }
 
     /// [`Self::spawn_leg`], or with no `prompt` a `codex` started bare, at its
+    /// composer, where the leg's turn is typed later ([`Self::type_exchange`]).
     fn start_leg(
         &mut self,
         name: &'static str,
@@ -1125,6 +1229,7 @@ impl Proof {
     }
 
     /// The model's first request of `leg` tagged `<leg>:<step>…` within
+    /// `limit`: a hang detector, never a budget.
     fn await_tag(&self, leg: &Leg, step: &str, limit: Duration) -> Result<bool, Stopped> {
         let head = format!("{}:{step}", leg.name);
         Self::wait_for(limit, Duration::from_millis(250), || {
@@ -1132,7 +1237,7 @@ impl Proof {
         })
     }
 
-    /// Read a successful write of this request's whole response. Its server
+    /// Read a successful write of this request's whole response.
     fn await_reply(
         &self,
         leg: &Leg,
@@ -1161,6 +1266,8 @@ impl Proof {
     }
 
     /// [`Self::await_tag`] with its hang detector anchored at unix ms `by_ms`
+    /// (read off the run's own clock marks, never when the lab looked): no
+    /// wait at all once it has passed.
     fn tag_by(&self, leg: &Leg, step: &str, by_ms: i64) -> Result<bool, Stopped> {
         let head = format!("{}:{step}", leg.name);
         loop {
@@ -1280,6 +1387,7 @@ impl Proof {
     }
 
     /// The NEEDS YOU leg's last report, `NEEDS YOU: nothing`, after the plain
+    /// one (its act backed off four minutes): it takes the need down.
     fn needs_cleared(&mut self, leg: &Leg) -> Result<(), Stopped> {
         let reported = Self::wait_for(Duration::from_secs(420), Duration::from_secs(1), || {
             self.requests("needs")
@@ -1385,6 +1493,7 @@ impl Proof {
     }
 
     /// The build the leg's own rollout names (its `session_meta`'s
+    /// `cli_version`), read off the leg's scratch `CODEX_HOME`.
     fn rollout_build(leg: &Leg) -> Option<String> {
         let rollouts = aterm_agent::harness::codex_rollout::rollouts_by_write(&leg.home);
         let (path, _) = rollouts.last()?;
@@ -1397,6 +1506,9 @@ impl Proof {
     }
 
     /// THE ROLLOUT TAP, LIVE:
+    /// each done leg's tab logs turns from its codex-alab's own
+    /// rollout when the build that rollout names is one the session log
+    /// measured, and none when not.
     fn rollout_leg(&mut self, legs: &[&Leg]) -> Result<(), Stopped> {
         use aterm_agent::harness::codex_steps::CODEX_MEASURED_BUILDS;
         for leg in legs {
@@ -1641,6 +1753,8 @@ impl Proof {
     }
 
     /// The reland leg's landing and the quiet after it, past the back-off a
+    /// codex-alab that went on would wait; then a person's turn reopens it
+    /// (module header).
     fn reland_landed(&mut self, leg: &Leg) -> Result<bool, Stopped> {
         let land = self.await_act(leg, "land@v1", Duration::from_secs(300))?;
         let landed = self.await_act(leg, LANDED, Duration::from_secs(120))?;
@@ -1711,6 +1825,7 @@ impl Proof {
     }
 
     /// After the person's turn of real work, codex-alab acts again: a new
+    /// episode's `land@v1`, whose clean defense lands again.
     fn reland_again(&mut self, leg: &Leg) -> Result<(), Stopped> {
         let reopen_at = first_at(&self.requests("reland"), "reland:reopen");
         let mut acts = Vec::new();
@@ -1752,6 +1867,7 @@ impl Proof {
     }
 
     /// The first request of `leg` whose tag starts with `head`: its tag and
+    /// the tail of its text.
     fn request_named(&self, leg: &str, head: &str) -> (String, String) {
         self.requests(leg)
             .iter()
@@ -1761,6 +1877,7 @@ impl Proof {
     }
 
     /// A clean defense over a repository that still holds work: the file
+    /// untracked (module header).
     fn repo_leg(&mut self, leg: &Leg) -> Result<(), Stopped> {
         let land = self.await_act(leg, "land@v1", Duration::from_secs(300))?;
         let defended = self.await_tag(leg, "land", Duration::from_secs(60))?;
@@ -1806,6 +1923,7 @@ impl Proof {
     }
 
     /// The repository leg after its commit: the clean defense is NOT landed
+    /// over the commit the remote main lacks; pushed, the next one lands.
     fn repo_pushed(&mut self, leg: &Leg) -> Result<(), Stopped> {
         let nudged = self.await_tag(leg, "nudge2", REPO_COMMIT_HOLD + Duration::from_secs(360))?;
         let ended = self.has_any(leg, &[LANDED]);
@@ -1857,6 +1975,7 @@ impl Proof {
     }
 
     /// The Land legs at the run's end: nothing after their landing (an
+    /// observation: how long since says what a later act would have needed).
     fn landed_stay_quiet(&mut self, legs: &[&Leg]) {
         for leg in legs {
             let acts = self.acts(&leg.sid);
@@ -1884,6 +2003,8 @@ impl Proof {
     }
 
     /// Autopilot Cruise, over every Cruise leg's whole run (module header):
+    /// nothing finished or landed, and each done claim met by the defend
+    /// prompt, by the model's own log ([`claims_of`]).
     fn cruise_rests_never(&mut self, cruise: &[&Leg]) {
         let ended: Vec<String> = cruise
             .iter()
@@ -1921,6 +2042,7 @@ impl Proof {
     }
 
     /// `SIGKILL` the codex-alab `pid` of `leg`; the crash rule's relaunch
+    /// proven again (a new pid).
     fn crash_once(&mut self, leg: &Leg, pid: i32, label: &str) -> Result<Option<i32>, Stopped> {
         let _ = crate::sys::kill(pid, libc::SIGKILL);
         println!("    {label}: SIGKILL {pid}");
@@ -1988,11 +2110,13 @@ impl Proof {
     }
 
     /// The leg's codex-alab journal ([`journal_path`]: every process of the
+    /// leg appending to one file).
     fn codex_log(leg: &Leg) -> String {
         std::fs::read_to_string(journal_path(&leg.home)).unwrap_or_default()
     }
 
     /// The instance's harness upgrade ledger (`aterm harness ledger upgrade
+    /// --json` under the scratch HOME, as the owner reads it), row by row.
     fn upgrade_ledger(&self) -> Vec<J> {
         let out = aterm_uds::spawnfd::command(&self.inst.aterm)
             .env_clear()
@@ -2008,6 +2132,9 @@ impl Proof {
     }
 
     /// THE CARRY-ON AFTER A CRASH RELAUNCH (module header): `SIGKILL` the
+    /// leg's codex-alab mid-turn, once its crash is relaunchable; the
+    /// relaunched one carries the turn on by itself only when its launch probe
+    /// saw aterm's relaunch lease.
     fn carry_leg(&mut self, leg: &Leg, pid: Option<i32>) -> Result<(), Stopped> {
         let Some(pid1) = pid else {
             self.check("carry: no proven codex-alab to end", false);
@@ -2117,6 +2244,21 @@ impl Proof {
     }
 
     fn upgrade_leg(&mut self, leg: &Leg, pkg_b: &Path) -> Result<(), Stopped> {
+        self.upgrade_leg_with_limits(
+            leg,
+            pkg_b,
+            Duration::from_secs(150),
+            Duration::from_secs(90),
+        )
+    }
+
+    fn upgrade_leg_with_limits(
+        &mut self,
+        leg: &Leg,
+        pkg_b: &Path,
+        moved_limit: Duration,
+        claim_limit: Duration,
+    ) -> Result<(), Stopped> {
         let Some(pid) = self.proven_pid(&leg.sid) else {
             self.check("upgrade: no proven codex-alab to move", false);
             return Ok(());
@@ -2126,13 +2268,13 @@ impl Proof {
         let linked = self.link(pkg_b);
         self.check(
             &format!(
-                "upgrade: the package re-linked to its copy ({})",
+                "upgrade: the package re-linked to its replacement ({})",
                 linked.as_ref().err().map_or("ok", String::as_str)
             ),
             linked.is_ok(),
         );
         let b = std::fs::canonicalize(pkg_b).unwrap_or_else(|_| pkg_b.to_path_buf());
-        let moved = Self::wait_for(Duration::from_secs(150), Duration::from_secs(1), || {
+        let moved = Self::wait_for(moved_limit, Duration::from_secs(1), || {
             Self::record(leg, pid).is_some_and(|r| {
                 generation(&r) > before
                     && r.get("exe")
@@ -2143,10 +2285,10 @@ impl Proof {
         })?;
         let acts = self.acts(&leg.sid);
         self.check(
-            "upgrade: the running codex-alab re-exec'd onto the re-linked build (upgrade@v1, execGeneration up, exe the copy's)",
+            "upgrade: the running codex-alab re-exec'd onto the re-linked build (upgrade@v1, execGeneration up, exe the replacement's)",
             moved && acts.iter().any(|a| a == "upgrade@v1"),
         );
-        let reproven = Self::wait_for(Duration::from_secs(90), Duration::from_secs(1), || {
+        let reproven = Self::wait_for(claim_limit, Duration::from_secs(1), || {
             self.proven_pid(&leg.sid) == Some(pid)
         })?;
         self.check("upgrade: the new image proved its claim again", reproven);
@@ -2154,6 +2296,7 @@ impl Proof {
     }
 
     /// The instance's bridge is connected to the lab's broker
+    /// (`fabric status state=connected`): a hang detector, never a budget.
     fn bus_up(&mut self) -> Result<bool, Stopped> {
         let mut last = String::new();
         let up = Self::wait_for(Duration::from_secs(120), Duration::from_millis(500), || {
@@ -2168,6 +2311,7 @@ impl Proof {
     }
 
     /// THE AUTOPILOT OFF STEP's start (module header): Off while the leg's
+    /// first turn, real work, runs; codex-alab gives its claim back.
     fn autopilot_off(&mut self, leg: &Leg) -> Result<Option<i64>, Stopped> {
         let name = leg.name;
         let off = self.on(&leg.sid, &["meta", "set", "autopilot", "off"]);
@@ -2199,6 +2343,8 @@ impl Proof {
     }
 
     /// THE AUTOPILOT OFF STEP (module header): the turn ends inside Off, an
+    /// act due at once, and nothing is typed; the mail goes alone; On, the
+    /// claim comes back and the act that fell due goes.
     fn autopilot_off_leg(
         &mut self,
         leg: &Leg,
@@ -2290,6 +2436,11 @@ impl Proof {
     }
 
     /// THE EXCHANGE LEGS' TURN (module header): the message (`LEG-<leg>`
+    /// and [`PERSON_ASKS`]) typed into the leg's codex composer and sent with
+    /// Enter — as a PERSON types it where `as_person`, through aterm's
+    /// development seam `send|key as=person` (a person's gesture through the
+    /// window's own input seam, which stamps `status human_ms=`), else as a
+    /// control write (`send`, `key`).
     fn type_exchange(&mut self, leg: &Leg, as_person: bool) -> Result<Option<Typed>, Stopped> {
         let name = leg.name;
         let text = format!("LEG-{name} {PERSON_ASKS}");
@@ -2391,6 +2542,10 @@ impl Proof {
     }
 
     /// The exchange legs' turns typed (module header), and what aterm's
+    /// `status` said of each hand: the person's Enter stamped `human_ms` and
+    /// moved `human_seq` past the send's own stamp ([`Typed::enter_stamped`];
+    /// else no person's Enter reached the session, and the exchange's checks
+    /// say nothing of a person's exchange); the control's stamped nothing.
     fn type_exchanges(
         &mut self,
         person: &Leg,
@@ -2428,6 +2583,8 @@ impl Proof {
     }
 
     /// A PERSON'S OWN EXCHANGE, judged (module header): the control's turn
+    /// continued, the person's left to them — nothing typed, the rule named
+    /// in its journal, aterm's face `theirs`.
     fn exchange_leg(
         &mut self,
         person: &Leg,
@@ -2553,6 +2710,8 @@ impl Proof {
     }
 
     /// Where the person's exchange's codex-alab stood before the live
+    /// upgrade ([`Self::exchange_stays_left`]): its proven pid, its record's
+    /// `execGeneration`, and the resumes its journal names ([`resumes`]).
     fn exchange_before_upgrade(&self, person: &Leg) -> Option<(i32, i64, usize)> {
         let pid = self.proven_pid(&person.sid)?;
         let generation = Self::record(person, pid).map_or(0, |r| exec_generation(&r));
@@ -2560,6 +2719,10 @@ impl Proof {
     }
 
     /// THE PERSON'S EXCHANGE AT THE RUN'S END, past the live upgrade: the
+    /// re-link moves every running codex-alab, the exchange's too (`was`,
+    /// [`Self::exchange_before_upgrade`]), and the image it re-execs into
+    /// resumes the conversation and decides its point again, the person's
+    /// own exchange; it must leave it to them as the image before did.
     fn exchange_stays_left(
         &mut self,
         person: &Leg,
@@ -2646,20 +2809,67 @@ impl Proof {
         Ok(())
     }
 
-    /// The Land legs whose face reads `landed` before the live upgrade
-    fn landed_before_upgrade<'l>(&self, legs: &[&'l Leg]) -> Vec<(&'l Leg, (i32, i64, usize))> {
-        legs.iter()
-            .filter(|leg| task_face(&self.status(&leg.sid)) == "landed")
-            .filter_map(|leg| self.exchange_before_upgrade(leg).map(|was| (*leg, was)))
-            .collect()
+    /// Every Land leg as it stood before the live upgrade
+    /// ([`Self::landed_stand_past_upgrade`]): where its codex-alab stood
+    /// ([`Self::exchange_before_upgrade`]'s triple) once its face reads
+    /// `landed` beside a proven claim, or what was read when it never did
+    /// within a hang detector (a face and a claim are briefly unread around a
+    /// re-exec). No leg is left out ([`landed_baselines`]): one the run
+    /// could not read before the upgrade is a FAIL past it, never a check
+    /// that silently did not run (parity-5 review, R2: reland's dropped out
+    /// and the run still printed PASS).
+    fn landed_before_upgrade<'l>(
+        &self,
+        legs: &[&'l Leg],
+    ) -> Result<Vec<(&'l Leg, Baseline)>, Stopped> {
+        landed_baselines(legs, |leg| {
+            let mut read = Err(String::new());
+            Self::wait_for(Duration::from_secs(60), Duration::from_secs(1), || {
+                read = self.landed_baseline(leg);
+                read.is_ok()
+            })?;
+            Ok(read)
+        })
+    }
+
+    /// One Land leg's [`Baseline`] now.
+    fn landed_baseline(&self, leg: &Leg) -> Baseline {
+        let face = task_face(&self.status(&leg.sid));
+        match (face == "landed")
+            .then(|| self.exchange_before_upgrade(leg))
+            .flatten()
+        {
+            Some(was) => Ok(was),
+            None => Err(format!(
+                "status task={face}; proven: {:?}",
+                self.proven_pid(&leg.sid)
+            )),
+        }
     }
 
     /// A LANDING STANDS PAST THE LIVE UPGRADE (Autopilot Land: the
-    fn landed_stand_past_upgrade(
-        &mut self,
-        landed: &[(&Leg, (i32, i64, usize))],
-    ) -> Result<(), Stopped> {
-        for (leg, (pid, generation, resumed)) in landed {
+    /// re-exec carries it, and `upgrade@v1` tells no face): each landed leg's
+    /// codex-alab is re-exec'd by the re-link, its new image resumes the
+    /// conversation, and aterm's face for the tab still reads `landed`, with
+    /// no act typed after its landing. Hang detectors: the re-exec (its
+    /// record's `execGeneration` up), the new image's first decision, and a
+    /// face told otherwise in between coming back.
+    fn landed_stand_past_upgrade(&mut self, landed: &[(&Leg, Baseline)]) -> Result<(), Stopped> {
+        for (leg, baseline) in landed {
+            let (pid, generation, resumed) = match baseline {
+                Ok(was) => was,
+                Err(read) => {
+                    self.check(
+                        &format!(
+                            "{}: aterm's task face still reads landed past the upgrade (before \
+                             it, no landed face beside a proven codex-alab within 60 s: {read})",
+                            leg.name
+                        ),
+                        false,
+                    );
+                    continue;
+                }
+            };
             let mut now_at = *generation;
             let moved = Self::wait_for(Duration::from_secs(150), Duration::from_secs(1), || {
                 now_at = Self::record(leg, *pid).map_or(now_at, |r| exec_generation(&r));
@@ -2736,6 +2946,7 @@ fn sh_quote(s: &str) -> String {
 }
 
 /// The folder of a leg's `CODEX_HOME` its codex writes its TUI log to
+/// (`log_dir`), the leg's codex-alab journal.
 const JOURNAL_DIR: &str = "journal";
 
 /// The codex-alab journal of the leg whose `CODEX_HOME` is `home`.
@@ -2744,6 +2955,8 @@ fn journal_path(home: &Path) -> PathBuf {
 }
 
 /// A leg's `config.toml`: the lab's model provider, Codex's own updater,
+/// analytics, feedback and telemetry off, the TUI's file log in its home
+/// ([`JOURNAL_DIR`]), and the project trusted as spelled and as resolved.
 fn codex_config(port: u16, proj: &Path, home: &Path, extra: &str) -> String {
     let p = proj.to_string_lossy();
     let mut trusted = vec![p.to_string()];
@@ -2770,7 +2983,8 @@ fn codex_config(port: u16, proj: &Path, home: &Path, extra: &str) -> String {
     )
 }
 
-/// `codex-alab-proof [--package DIR] [--aterm PATH] [--keep] [--policy-only]`.
+/// `codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--keep]
+/// [--policy-only|--upgrade-only]`.
 /// # Errors
 /// Usage, a run that could not start, or an interrupt.
 pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
@@ -2778,8 +2992,15 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
     let mut a = args.to_vec();
     let keep = instance::take_flag(&mut a, "--keep");
     let policy_only = instance::take_flag(&mut a, "--policy-only");
+    let upgrade_only = instance::take_flag(&mut a, "--upgrade-only");
     let aterm = instance::take_value(&mut a, "--aterm")?;
     let given = instance::take_value(&mut a, "--package")?;
+    let upgrade_given = instance::take_value(&mut a, "--upgrade-package")?;
+    if policy_only && (upgrade_only || upgrade_given.is_some()) {
+        return Err(Fail::usage(
+            "codex-alab-proof: --policy-only cannot be combined with upgrade options",
+        ));
+    }
     if let Some(extra) = a.first() {
         return Err(Fail::usage(format!(
             "codex-alab-proof: unexpected '{extra}' ({LAB} help)"
@@ -2789,6 +3010,11 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
     let aterm = instance::resolve_aterm(aterm).map_err(not_run)?;
     let home = crate::paths::paths().need_store_home().map_err(not_run)?;
     let pkg = package(given.as_deref(), home).map_err(not_run)?;
+    let upgrade_pkg = upgrade_given
+        .as_deref()
+        .map(|given| package(Some(given), home))
+        .transpose()
+        .map_err(not_run)?;
     let build =
         std::fs::read_to_string(pkg.join(aterm_agent::harness::codex_alab::ALAB_BUILD_JSON))
             .ok()
@@ -2806,6 +3032,11 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
         pkg.display(),
         aterm.display()
     );
+    if let Some(upgrade_pkg) = &upgrade_pkg {
+        upgrade_proof::describe_package(upgrade_pkg)?;
+    } else if upgrade_only {
+        println!("upgrade target: the same package bytes at another private path");
+    }
     let mut world = World::new(
         "agents_auto_prime = false\n[update]\nenabled = false\nauto_apply = false\n\
          [packages]\nenabled = false\n[machine]\nuniversal_control = \"leave\"\n\
@@ -2857,10 +3088,13 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
             .map_err(|e| format!("codex-alab-proof: cannot name the bridge: {e}"))?;
     }
     let (pkg_a, pkg_b) = (s.join("pkg-a"), s.join("pkg-b"));
-    for to in [&pkg_a, &pkg_b] {
+    for (from, to) in [
+        (&pkg, &pkg_a),
+        (upgrade_pkg.as_ref().unwrap_or(&pkg), &pkg_b),
+    ] {
         let cloned = aterm_uds::spawnfd::command("/bin/cp")
             .arg("-cR")
-            .arg(&pkg)
+            .arg(from)
             .arg(to)
             .stdin(Stdio::null())
             .status()
@@ -2868,7 +3102,7 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
         if !cloned {
             return Err(Fail::die(format!(
                 "codex-alab-proof: cannot copy {} to {}",
-                pkg.display(),
+                from.display(),
                 to.display()
             )));
         }
@@ -2920,7 +3154,9 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
         fails: Vec::new(),
         fabric,
     };
-    let outcome = if policy_only {
+    let outcome = if upgrade_only {
+        upgrade_proof::legs(&mut proof, &pkg_a, &pkg_b)
+    } else if policy_only {
         policy_proof::legs(&mut proof, &pkg_a)
     } else {
         legs(&mut proof, &pkg_a, &pkg_b)
@@ -3125,7 +3361,7 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
         &first, &needs, &cont, &approval, &hold, &off, &usage, &carry, &exchange, &control,
     ]);
     let exchange_was = proof.exchange_before_upgrade(&exchange);
-    let landed_was = proof.landed_before_upgrade(&[&land, &reland, &repo]);
+    let landed_was = proof.landed_before_upgrade(&[&land, &reland, &repo])?;
     let t = Instant::now();
     proof.upgrade_leg(&cont, pkg_b)?;
     timed(proof, "upgrade", t);
@@ -3148,6 +3384,7 @@ mod tests {
     use super::*;
 
     /// What a child under the profile `profile` (none: unsandboxed) reaches:
+    /// for each attempt of [`FENCE_SCRIPT`], `ok` or `no`.
     fn reached(profile: &str, tag: &str, a: &Path, s: &Path, w: &Path) -> Vec<String> {
         let mut cmd = aterm_uds::spawnfd::command("/usr/bin/sandbox-exec");
         cmd.args(["-p", profile, "/bin/sh", "-c", FENCE_SCRIPT])
@@ -3178,6 +3415,8 @@ mod tests {
     }
 
     /// Each attempt a line: a write into the account's home, into the scratch
+    /// `HOME`, a read of each one's `.ssh`, of the account's package store, of
+    /// a plain file of the account's home, and a write into the proof's scratch.
     const FENCE_SCRIPT: &str = r#"try() { if "$@" >/dev/null 2>&1; then echo ok; else echo no; fi; }
 try sh -c 'echo x > "$1/new-$2"' _ "$A" "$TAG"
 try sh -c 'echo x > "$1/new-$2"' _ "$S" "$TAG"
@@ -3189,6 +3428,12 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
 "#;
 
     /// THE PROOF'S SANDBOX FENCES THE OWNER'S HOMES, APPLIED: a child under
+    /// the profile [`policy`] makes from the lab's facts with a fake account
+    /// home (handed in through [`crate::paths::Paths::resolve_with`]) and a
+    /// scratch `HOME` writes into neither home and reads neither's `.ssh` nor
+    /// the account's package store, while it reads a plain file of the account
+    /// (the aterm under test lives in a checkout there) and writes the proof's
+    /// scratch.
     #[test]
     fn the_proofs_sandbox_fences_the_account_home_and_a_scratch_home() {
         let top = aterm_tempfile::Builder::new()
@@ -3237,6 +3482,8 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
     }
 
     /// THE CARRY LEG'S HOLDER CHECK FROM THE SESSION LOG (phase 6, 6F-7):
+    /// the act mark `harness-turn@v1` writes names its holder, as the
+    /// timeline's row does.
     #[test]
     fn the_relaunched_holders_act_is_read_from_the_log() {
         let mark = "OK log ep=3\n41 mark t2 act word=dispatch rule=harness-turn.v1 \
@@ -3273,6 +3520,8 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
     }
 
     /// THE VERDICT READERS, on the lines aterm answers: the needs entry by
+    /// its kind and owner, the task face, the nudges the model was asked at,
+    /// a request's time by its tag.
     #[test]
     fn the_verdicts_read_aterm_s_own_lines() {
         let raised = "OK title=- attention=Codex%20needs%20you attention_owner=needs \
@@ -3339,6 +3588,7 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
     }
 
     /// A successful write of this exact reply must be observed before the
+    /// quiet clock starts.
     #[test]
     fn a_continuation_is_quiet_through_its_own_reply_window() {
         let row = |id: i64, at: i64, tag: &str| {
@@ -3405,6 +3655,8 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
     }
 
     /// THE CRUISE CHECK'S READER ([`claims_of`]): a done claim met by the
+    /// defend prompt, pending inside its back-off, unmet by another act or by
+    /// nothing past it.
     #[test]
     fn a_done_claim_is_met_only_by_the_defend_prompt_within_its_back_off() {
         let row = |t: i64, tag: &str, said: &str, hold: i64| {
@@ -3466,6 +3718,9 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
     }
 
     /// A LEG'S JOURNAL OUTLIVES EACH OF ITS PROCESSES: the file
+    /// [`Proof::codex_log`] reads is the one the leg's config logs to, and it
+    /// is not `<CODEX_HOME>/log/codex-tui.log`, the file codex removes at every
+    /// start.
     #[test]
     fn a_legs_journal_is_the_file_its_config_logs_to_and_no_start_removes_it() {
         let home = Path::new("/s/legs/exchange/codex-home");
@@ -3484,6 +3739,8 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
     }
 
     /// THE EXCHANGE LEGS' JUDGES ([`continued_after`], [`left_to_person`]):
+    /// the control continued at once after its reply, the person's exchange
+    /// quiet past the same reply for a minute and past the control's latency.
     #[test]
     fn a_person_s_exchange_is_left_only_beside_a_control_that_was_continued() {
         let row = |t: i64, tag: &str, hold: i64| {
@@ -3600,6 +3857,9 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
     }
 
     /// THE JOURNAL AND THE HAND ([`exchange_rule`], [`journal_typed`],
+    /// [`person_hand`]): the line naming the rule codex-alab left a point to
+    /// a person by, the acts it says it typed, and `status`'s person's
+    /// gesture.
     #[test]
     fn the_journal_names_the_rule_and_status_the_hand() {
         let left = "2026-10-21T10:00:00.000Z DEBUG codex_alab_autopilot: 019a-thread: nothing (a \
@@ -3636,6 +3896,9 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
     }
 
     /// THE PERSON'S ENTER IS JUDGED PAST THE SEND'S OWN STAMP
+    /// ([`Typed::enter_stamped`]): `send as=person` stamps the person's
+    /// clock itself, so the Enter is the person's only where `human_seq`
+    /// moved past its count once the draft stood.
     #[test]
     fn the_persons_enter_is_judged_past_the_sends_own_stamp() {
         let typed = |before: &str, sent: &str, after: &str| Typed {
@@ -3679,7 +3942,47 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
         );
     }
 
+    /// NO LAND LEG DROPS OUT OF THE PAST-UPGRADE CHECK (parity-5 review,
+    /// R2): every leg named comes back, in order, with what was read of it,
+    /// so a leg whose face never read `landed` beside a proven claim before
+    /// the upgrade is judged (a FAIL past it) rather than left out while the
+    /// run prints PASS. NEGATIVE CONTROL: a leg that settled keeps its
+    /// reading. A stop while reading stops the whole read.
+    #[test]
+    fn no_land_leg_drops_out_of_the_past_upgrade_check() {
+        let leg = |name: &'static str| Leg {
+            name,
+            sid: format!("s-{name}"),
+            home: PathBuf::from("/nonexistent/home"),
+            proj: PathBuf::from("/nonexistent/proj"),
+        };
+        let (land, reland, repo) = (leg("land"), leg("reland"), leg("repo"));
+        let read = landed_baselines(&[&land, &reland, &repo], |leg| {
+            Ok(if leg.name == "reland" {
+                Err("status task=-; proven: None".to_string())
+            } else {
+                Ok(leg.name.len())
+            })
+        });
+        let Ok(read) = read else {
+            panic!("no stop was asked for");
+        };
+        let names: Vec<&str> = read.iter().map(|(leg, _)| leg.name).collect();
+        assert_eq!(names, ["land", "reland", "repo"], "none left out");
+        assert_eq!(read[0].1, Ok(4));
+        assert_eq!(read[1].1, Err("status task=-; proven: None".to_string()));
+        assert_eq!(read[2].1, Ok(4));
+        let stopped = landed_baselines(&[&land, &reland], |_| {
+            Err::<Result<(), String>, _>(Stopped(2))
+        });
+        assert!(stopped.is_err(), "a stop ends the read");
+    }
+
     /// THE NEW IMAGE'S FIRST DECISION ([`resumes`], [`decided_after_resume`]):
+    /// a live upgrade's re-exec resumes the conversation, and its first
+    /// decision is the first deciding line after that resume — past a
+    /// `passive` line of an image not yet proven again, never one of the
+    /// image before.
     #[test]
     fn a_resumed_images_first_decision_is_read_after_its_resume() {
         let before = "2026-10-21T10:00:00.000Z DEBUG codex_alab_autopilot: 019a: resumed \
@@ -3756,6 +4059,10 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
     }
 
     /// A tap stand-in for [`past_the_fence`]: each look after the first
+    /// answers one more ask, and the planted write (a turn from the
+    /// rollout, `src=transcript`) lands with the ask numbered `late`, before
+    /// that ask is counted, as the host counts it; `stuck` answers none past
+    /// the first look.
     struct Script {
         word: &'static str,
         asks: std::cell::Cell<u64>,
@@ -3808,6 +4115,11 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
     }
 
     /// THE ROLLOUT LEG READS PAST THE TAP'S FENCE (B5c): the log is read
+    /// only once the tap answered two asks past the first look, so a turn
+    /// from the rollout that a tap writes late (with the second ask: the
+    /// last that could still hold what the rollout held at the look) fails
+    /// the unmeasured verdict, and the same tap with no late write passes
+    /// it.
     #[test]
     fn the_rollout_leg_reads_past_the_taps_fence() {
         let verdict = |measured: bool, script: &Script| match past_the_fence(

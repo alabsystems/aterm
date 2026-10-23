@@ -4,37 +4,7 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/wayland/window/state.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-//! Modified by the aterm project in 2026; see the repository NOTICE.
-//!
-//! The state of the window, which is shared with the event-loop.
-//!
-//! LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, LW.5): the window has
-//! no client-side frame. Upstream drew one (sctk-adwaita's, or sctk's `FallbackFrame`) as
-//! subsurfaces around the surface whenever the compositor settled on client-side decorations;
-//! here the application draws its own header inside the surface and drives the frame's
-//! gestures through `drag_window`, `drag_resize_window` and `show_window_menu`. The window
-//! geometry is the whole surface, and the negotiated mode is [`WindowState::client_decorations`].
-//!
-//! LOCAL PATCH (aterm), 2026-10-20 (docs/AUDIT-third-party-2026-10-15.md, L-HEADER-LW7,
-//! lw5-button-layout-shadow): sctk-adwaita's shadow margin is back around a client-decorated
-//! window ([`super::frame::ShadowFrame`], the border parts `crate::frame_shadow` paints, as
-//! subsurfaces): shown while the application draws its own header and the window is neither
-//! maximized nor fullscreen, redrawn on each configure, scale and theme that moves it. The window
-//! geometry stays the whole surface, so the shadow is outside it, as it was.
-//!
-//! LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, LW.7 with winit-core
-//! WC.8): the window's objects (its `wl_surface`, `xdg_surface`, `xdg_toplevel`, toplevel
-//! decoration, viewport and fractional scale) are first-party `aterm-wayland` proxies this state
-//! owns, and the configure is the backend's own [`WindowConfigure`], assembled from the events
-//! in the order sctk's `WindowConfigure` was. CUT with sctk, each with no aterm caller: custom
-//! cursor images (`set_cursor(Cursor::Custom)` keeps the named cursor and says so), cursor grabs
-//! and `set_cursor_position` (no `zwp_pointer_constraints_v1`: `NotSupported`), and the
-//! `wayland-kwin-blur` feature (`set_blur` says blur is unavailable, as it did without it).
-//!
-//! LOCAL PATCH (aterm), 2026-10-21 (docs/AUDIT-third-party-2026-10-15.md, WC.8): those stubs are
-//! gone too, with the `Window` calls that reached them (`Cursor::Custom`, `set_cursor_grab`,
-//! `set_cursor_position`, `set_cursor_visible`) now Windows-only: the window shows its named
-//! cursor, always.
+//! Wayland window state shared with the event loop.
 
 use std::ffi::CString;
 use std::num::NonZeroU32;
@@ -64,11 +34,10 @@ use crate::window::{CursorIcon, ImePurpose, ResizeDirection, Theme};
 
 use super::frame::{FrameGlobals, ShadowFrame};
 
-// Minimum window inner size.
 const MIN_WINDOW_SIZE: LogicalSize<u32> = LogicalSize::new(2, 1);
 
 aterm_types::bitflags! {
-    /// The `xdg_toplevel.state` values a configure carried (sctk's `WindowState`).
+    /// `xdg_toplevel.state` flags carried by a configure event.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct XdgWindowState: u16 {
         const MAXIMIZED = 1 << 0;
@@ -88,8 +57,7 @@ aterm_types::bitflags! {
 }
 
 impl XdgWindowState {
-    /// The states a configure's array names; values this backend does not know (version 7's
-    /// constrained edges) are left out, as sctk left them.
+    /// Parses `xdg_toplevel.state` flags from wire values, ignoring unknown states.
     pub fn from_wire(states: &[u32]) -> XdgWindowState {
         use xdg_toplevel::state;
         states.iter().fold(XdgWindowState::empty(), |mut acc, value| {
@@ -112,7 +80,7 @@ impl XdgWindowState {
 }
 
 aterm_types::bitflags! {
-    /// What the compositor can do for the window (`xdg_toplevel.wm_capabilities`).
+    /// Compositor capabilities advertised via `xdg_toplevel.wm_capabilities`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct WindowManagerCapabilities: u16 {
         const WINDOW_MENU = 1 << 0;
@@ -123,7 +91,7 @@ aterm_types::bitflags! {
 }
 
 impl WindowManagerCapabilities {
-    /// The capabilities an event's array names; unknown values are left out.
+    /// Parses compositor capabilities from wire values, ignoring unknown capabilities.
     pub fn from_wire(capabilities: &[u32]) -> WindowManagerCapabilities {
         use xdg_toplevel::wm_capabilities as cap;
         capabilities.iter().fold(WindowManagerCapabilities::empty(), |mut acc, value| {
@@ -140,26 +108,24 @@ impl WindowManagerCapabilities {
     }
 }
 
-/// Who draws the window's frame, as the configure says.
+/// Window decoration mode reported by a configure event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecorationMode {
     Client,
     Server,
 }
 
-/// A configure: the compositor's suggestion, as sctk 0.19.2's `WindowConfigure` assembled it.
-/// Each event updates the window's pending one; `xdg_surface.configure` hands a copy to the
-/// window, and the pending one carries on (a later configure changes only what it says).
+/// Pending or applied compositor configure state.
 #[derive(Debug, Clone)]
 pub struct WindowConfigure {
-    /// The suggested size; `None` leaves it to the window.
+    /// Suggested surface size, or `None` when left to the client.
     pub new_size: (Option<NonZeroU32>, Option<NonZeroU32>),
-    /// The compositor's bounds for the window (xdg-shell version 4).
+    /// Compositor bounds for the window (`xdg-shell` v4).
     pub suggested_bounds: Option<(u32, u32)>,
-    /// Client until the decoration's configure says otherwise.
+    /// Negotiated decoration mode.
     pub decoration_mode: DecorationMode,
     pub state: XdgWindowState,
-    /// Every capability until a `wm_capabilities` event (version 5) says which.
+    /// Advertised window manager capabilities.
     pub capabilities: WindowManagerCapabilities,
 }
 
@@ -197,33 +163,30 @@ impl WindowConfigure {
     }
 }
 
-/// The window's objects, in the order they are destroyed (sctk's: the decoration, the
-/// toplevel, the xdg surface, then the surface).
+/// Wayland protocol objects owned by the window in destruction order.
 pub(crate) struct WindowObjects {
     pub(crate) attention_token: Option<Owned>,
     pub(crate) viewport: Option<Owned>,
     pub(crate) fractional_scale: Option<Owned>,
-    /// Held for its life alone (WC.8: the mode is asked for once, at creation).
+    /// Optional `zxdg_toplevel_decoration_v1` handle.
     pub(crate) _decoration: Option<Owned>,
     pub(crate) toplevel: Owned,
     pub(crate) xdg_surface: Owned,
     pub(crate) surface: Owned,
 }
 
-/// The state of the window which is being updated from the [`WinitState`].
-///
-/// [`WinitState`]: crate::platform_impl::wayland::state::WinitState
+/// Wayland window state updated from `WinitState`.
 pub struct WindowState {
     /// The seats, for the serials and the seat a move, a resize or a menu names.
     seats: Arc<Seats>,
 
-    /// The configure being assembled from the events since the last one.
+    /// Configure state being assembled from events since the last configure.
     pub(crate) pending_configure: WindowConfigure,
 
-    /// The last received configure.
+    /// Last applied configure event.
     pub last_configure: Option<WindowConfigure>,
 
-    /// The pointers observed on the window.
+    /// Pointers currently observed on the window.
     pub pointers: Vec<Weak<WinitPointer>>,
 
     /// The named cursor the window shows.
@@ -232,8 +195,6 @@ pub struct WindowState {
     /// Theme variant.
     theme: Option<Theme>,
 
-    // NOTE: we can't use simple counter, since it's racy when seat getting destroyed and new
-    // is created, since add/removed stuff could be delivered a bit out of order.
     /// Seats that has keyboard focus on that window.
     seat_focus: FxHashSet<u32>,
 
@@ -249,7 +210,7 @@ pub struct WindowState {
     /// The text inputs observed on the window.
     text_inputs: Vec<Weak<TextInput>>,
 
-    /// The outputs the surface is on, as it entered them.
+    /// Outputs the surface currently overlaps.
     pub(crate) outputs: Vec<Output>,
 
     /// The inner size of the window: the whole surface, since the window has no client-side
@@ -260,16 +221,13 @@ pub struct WindowState {
     min_inner_size: LogicalSize<u32>,
     resize_increments: Option<LogicalSize<u32>>,
 
-    /// The size of the window when no states were applied to it. The primary use for it
-    /// is to fallback to original window size, before it was maximized, if the compositor
-    /// sends `None` for the new size in the configure.
+    /// The size of the window when no states were applied to it.
     stateless_size: LogicalSize<u32>,
 
-    /// Initial window size provided by the user. Removed on the first
-    /// configure.
+    /// Initial window size provided by the user.
     initial_size: Option<Size>,
 
-    /// Whether an attention request waits for its activation token.
+    /// Whether an attention request awaits its activation token.
     pub(crate) attention_requested: bool,
 
     /// The shadow margin's border parts, made at the first client-decorated configure; destroyed
@@ -279,11 +237,10 @@ pub struct WindowState {
     /// The globals the frame is made from; `None` without a `wl_subcompositor`.
     frame_globals: Option<FrameGlobals>,
 
-    /// The window's objects; destroyed before their global and connection keepalives.
+    /// Protocol objects owned by the window.
     pub(crate) objects: WindowObjects,
 
-    /// Globals this window can still use after the event loop is gone. They drop
-    /// after its objects, so xdg_wm_base outlives every child surface.
+    /// Globals this window can still use after the event loop is gone.
     compositor: Arc<Owned>,
     _shell: Arc<Shell>,
 
@@ -293,7 +250,7 @@ pub struct WindowState {
 }
 
 impl WindowState {
-    /// Create new window state over `objects`.
+    /// Creates a new [`WindowState`] over `objects`.
     pub(crate) fn new(
         compositor: Arc<Owned>,
         shell: Arc<Shell>,
@@ -331,13 +288,13 @@ impl WindowState {
         }
     }
 
-    /// The window's `wl_surface`.
+    /// Returns the window's `wl_surface` proxy.
     #[inline]
     pub(crate) fn surface(&self) -> Proxy {
         self.objects.surface.proxy()
     }
 
-    /// The window's `xdg_toplevel`.
+    /// Returns the window's `xdg_toplevel` proxy.
     #[inline]
     pub(crate) fn xdg_toplevel(&self) -> Proxy {
         self.objects.toplevel.proxy()
@@ -349,8 +306,6 @@ impl WindowState {
     }
 
     pub fn configure(&mut self, configure: WindowConfigure) -> bool {
-        // NOTE: when using fractional scaling or wl_compositor@v6 the scaling
-        // should be delivered before the first configure, thus apply it to
         // properly scale the physical sizes provided by the users.
         if let Some(initial_size) = self.initial_size.take() {
             self.size = initial_size.to_logical(self.scale_factor());
@@ -359,15 +314,12 @@ impl WindowState {
 
         let stateless = Self::is_stateless(&configure);
 
-        // LOCAL PATCH (aterm), LW.5: no frame borders to subtract; the configure's size is the
-        // surface's.
         let (mut new_size, constrain) = match configure.new_size {
             (Some(width), Some(height)) => ((width.get(), height.get()).into(), false),
             _ if stateless => (self.stateless_size, true),
             _ => (self.size, true),
         };
 
-        // Apply configure bounds only when compositor let the user decide what size to pick.
         if constrain {
             let bounds = self.inner_size_bounds(&configure);
             new_size.width =
@@ -378,28 +330,12 @@ impl WindowState {
                 .unwrap_or(new_size.height);
         }
 
-        // Apply size increments.
-        //
-        // We conditionally apply increments to avoid conflicts with the compositor's layout rules:
-        // 1. If the window is floating (constrain == true), we snap to increments to ensure the
-        //    app's grid alignment.
-        // 2. If the user is interactively resizing (is_resizing), we snap the size to provide
-        //    feedback.
-        //
-        // However, we MUST NOT snap if the compositor enforces a specific size (constrain == false,
-        // or states like Maximized/Tiled). Snapping in these cases (e.g. corner tiling) would
-        // shrink the window below the allocated area, creating visible gaps between valid
-        // windows or screen edges.
         if (constrain || configure.is_resizing())
             && !configure.is_maximized()
             && !configure.is_fullscreen()
             && !configure.is_tiled()
         {
             if let Some(increments) = self.resize_increments {
-                // We use min size as a base size for the increments, similar to how X11 does it.
-                //
-                // This ensures that we can always reach the min size and the increments are
-                // calculated from it.
                 let (delta_width, delta_height) = (
                     new_size.width.saturating_sub(self.min_inner_size.width),
                     new_size.height.saturating_sub(self.min_inner_size.height),
@@ -417,9 +353,6 @@ impl WindowState {
         let new_state = configure.state;
         let old_state = self.last_configure.as_ref().map(|configure| configure.state);
 
-        // LOCAL PATCH (aterm), LW.5: a change of decoration mode or of the compositor's
-        // capabilities also counts, so the application hears it (as a `Resized`, possibly of
-        // the same size) and re-reads `client_decorations` before it draws its header again.
         let decorations_moved = self.last_configure.as_ref().is_some_and(|last| {
             last.decoration_mode != configure.decoration_mode
                 || last.capabilities != configure.capabilities
@@ -431,10 +364,8 @@ impl WindowState {
                         .difference(XdgWindowState::ACTIVATED | XdgWindowState::SUSPENDED)
                         .is_empty()
                 })
-                // NOTE: `None` is present for the initial configure, thus we must always resize.
                 .unwrap_or(true);
 
-        // NOTE: Set the configure before doing a resize, since we query it during it.
         self.last_configure = Some(configure);
 
         let resized = if state_change_requires_resize || new_size != self.inner_size() {
@@ -443,7 +374,6 @@ impl WindowState {
         } else {
             false
         };
-        // The frame follows focus too, which resizes nothing.
         self.refresh_frame();
         resized
     }
@@ -464,11 +394,10 @@ impl WindowState {
         !(configure.is_maximized() || configure.is_fullscreen() || configure.is_tiled())
     }
 
-    /// Start interacting drag resize.
+    /// Starts an interactive drag resize in `direction`.
     pub fn drag_resize_window(&self, direction: ResizeDirection) -> Result<(), ExternalError> {
         let xdg_toplevel = self.xdg_toplevel();
 
-        // TODO(kchibisov) handle touch serials.
         self.apply_on_pointer(|pointer| {
             self.seats.with_seat(pointer.seat(), |seat| {
                 let serial = seat.pointer_button_serial.unwrap_or_default();
@@ -482,10 +411,9 @@ impl WindowState {
         Ok(())
     }
 
-    /// Start the window drag.
+    /// Starts an interactive window move.
     pub fn drag_window(&self) -> Result<(), ExternalError> {
         let xdg_toplevel = self.xdg_toplevel();
-        // TODO(kchibisov) handle touch serials.
         self.apply_on_pointer(|pointer| {
             self.seats.with_seat(pointer.seat(), |seat| {
                 let serial = seat.pointer_button_serial.unwrap_or_default();
@@ -497,36 +425,31 @@ impl WindowState {
         Ok(())
     }
 
-    /// Whether the window is focused by any seat.
+    /// Returns whether the window is focused by any seat.
     #[inline]
     pub fn has_focus(&self) -> bool {
         !self.seat_focus.is_empty()
     }
 
-    /// Whether the IME is allowed.
+    /// Returns whether IME input is enabled.
     #[inline]
     pub fn ime_allowed(&self) -> bool {
         self.ime_allowed
     }
 
-    /// Get the size of the window.
+    /// Returns the logical inner size of the window.
     #[inline]
     pub fn inner_size(&self) -> LogicalSize<u32> {
         self.size
     }
 
-    /// Whether the window received initial configure event from the compositor.
+    /// Returns whether the window has received its initial configure event.
     #[inline]
     pub fn is_configured(&self) -> bool {
         self.last_configure.is_some()
     }
 
-    /// Whether the window system decorates the window: the compositor granted server-side
-    /// decorations (and, before the first configure, the request for them stands).
-    ///
-    /// LOCAL PATCH (aterm), LW.5: `false` under client-side decorations, where upstream answered
-    /// `true` while its own frame showed. This backend draws none, so a window in client mode is
-    /// undecorated until the application draws its own ([`Self::client_decorations`]).
+    /// Returns whether the compositor provides server-side decorations.
     #[inline]
     pub fn is_decorated(&self) -> bool {
         match self.last_configure.as_ref() {
@@ -535,11 +458,7 @@ impl WindowState {
         }
     }
 
-    /// The decorations the application must draw: `Some` once the compositor's configure has
-    /// settled on client-side decorations (it offers no xdg-decoration manager, or chose client
-    /// mode) while decorations are asked for, with what the compositor can do for the header's
-    /// buttons and menu; `None` under server-side decorations, with decorations off, and before
-    /// the first configure. A change arrives as a `Resized` (see [`Self::configure`]).
+    /// Returns the client-side decorations the application should draw, if settled on CSD.
     pub fn client_decorations(&self) -> Option<ClientDecorations> {
         let configure = self.last_configure.as_ref()?;
         if configure.decoration_mode != DecorationMode::Client {
@@ -557,37 +476,35 @@ impl WindowState {
         })
     }
 
-    /// Get the outer size of the window: the inner size, as the window has no frame of its own.
+    /// Returns the logical outer size of the window.
     #[inline]
     pub fn outer_size(&self) -> LogicalSize<u32> {
         self.size
     }
 
-    /// Register pointer on the top-level.
+    /// Registers a pointer that entered the surface.
     pub fn pointer_entered(&mut self, added: Weak<WinitPointer>) {
         self.pointers.push(added);
         self.reload_cursor_style();
     }
 
-    /// Pointer has left the top-level.
+    /// Removes a pointer that left the surface.
     pub fn pointer_left(&mut self, removed: &Weak<WinitPointer>) {
         self.pointers.retain(|pointer| pointer.strong_count() > 0 && !pointer.ptr_eq(removed));
     }
 
-    /// Reload the cursor style on the given window.
+    /// Applies the selected cursor icon to all active pointers.
     pub fn reload_cursor_style(&mut self) {
         self.set_cursor(self.selected_cursor);
     }
 
-    /// Reissue the opaque-region hint to the compositor: the whole surface (WC.8: no window
-    /// is transparent).
+    /// Updates the full-surface opaque region hint on the compositor.
     pub fn reload_transparency_hint(&self) {
         let surface = self.surface();
 
         // SAFETY: the live compositor.
         if let Some(region) = unsafe { wl_compositor::create_region(self.compositor.proxy()) } {
-            // SAFETY: the region made above, destroyed once here: the surface copies its
-            // contents at `set_opaque_region` (it is double-buffered state, not a reference).
+            // SAFETY: the region made above, destroyed once here after the surface copies it.
             unsafe {
                 wl_region::add(region, 0, 0, i32::MAX, i32::MAX);
                 wl_surface::set_opaque_region(surface, Some(region));
@@ -598,7 +515,7 @@ impl WindowState {
         }
     }
 
-    /// Try to resize the window when the user can do so.
+    /// Resizes the window to `inner_size` and returns the new physical size.
     pub fn request_inner_size(&mut self, inner_size: Size) -> PhysicalSize<u32> {
         if self.last_configure.as_ref().map(Self::is_stateless).unwrap_or(true) {
             self.resize(inner_size.to_logical(self.scale_factor()))
@@ -611,17 +528,12 @@ impl WindowState {
     fn resize(&mut self, inner_size: LogicalSize<u32>) {
         self.size = inner_size;
 
-        // Update the stateless size.
         if Some(true) == self.last_configure.as_ref().map(Self::is_stateless) {
             self.stateless_size = inner_size;
         }
 
-        // Reload the hint.
         self.reload_transparency_hint();
 
-        // Set the window geometry: the whole surface. The frame's shadow parts lie outside
-        // it (subsurfaces at negative and past-the-size places), so they never count as the
-        // window.
         // SAFETY: this window's live xdg_surface.
         unsafe {
             xdg_surface::set_window_geometry(
@@ -633,7 +545,6 @@ impl WindowState {
             )
         };
 
-        // Update the target viewport, this is used if and only if fractional scaling is in use.
         if let Some(viewport) = self.objects.viewport.as_ref() {
             // SAFETY: this window's live viewport.
             unsafe {
@@ -663,7 +574,6 @@ impl WindowState {
         Some(Look {
             width: self.size.width,
             height: self.size.height,
-            // sctk-adwaita's integer scale: the window's, rounded up.
             scale: self.scale_factor.clamp(0.1, 64.).ceil() as u32,
             active,
             dark: self.theme == Some(Theme::Dark),
@@ -671,8 +581,7 @@ impl WindowState {
         })
     }
 
-    /// Show the shadow margin as the window now has it: its parts made at the first look, then
-    /// redrawn whenever the look moves (they apply with the window's next commit).
+    /// Updates or hides the client-side shadow margin subsurfaces.
     pub(crate) fn refresh_frame(&mut self) {
         let look = self.frame_look();
         if self.frame.is_none() {
@@ -687,21 +596,18 @@ impl WindowState {
         }
     }
 
-    /// The border part whose surface is `surface`, if it is one of this window's.
+    /// Returns the shadow border [`Part`] corresponding to `surface`, if any.
     pub(crate) fn frame_part(&self, surface: WindowId) -> Option<Part> {
         self.frame.as_ref()?.part_of(surface)
     }
 
-    /// Which way a press at (`x`, `y`) on `part` resizes the window; `None` where its frame is
-    /// hidden (WC.8: every window is resizable).
+    /// Maps a pointer position `(x, y)` on shadow border `part` to a [`ResizeDirection`].
     pub(crate) fn frame_direction(&self, part: Part, x: f64, y: f64) -> Option<ResizeDirection> {
         let look = self.frame.as_ref()?.shown()?;
         Some(frame_shadow::direction(part, x, y, look.width, look.height))
     }
 
-    /// Start an interactive resize by `direction` from `seat`'s pointer press `serial` (the
-    /// frame's parts are no surface of the window's, so the window's own pointers do not hold
-    /// it).
+    /// Starts an interactive resize in `direction` triggered from `seat` at `serial`.
     pub(crate) fn resize_from_seat(&self, seat: u32, serial: u32, direction: ResizeDirection) {
         let xdg_toplevel = self.xdg_toplevel();
         self.seats.with_seat(seat, |seat| {
@@ -712,13 +618,13 @@ impl WindowState {
         });
     }
 
-    /// Get the scale factor of the window.
+    /// Returns the current scale factor of the window.
     #[inline]
     pub fn scale_factor(&self) -> f64 {
         self.scale_factor
     }
 
-    /// Set the cursor icon.
+    /// Sets the window cursor icon.
     pub fn set_cursor(&mut self, cursor_icon: CursorIcon) {
         self.selected_cursor = cursor_icon;
 
@@ -729,16 +635,13 @@ impl WindowState {
         })
     }
 
-    /// Set the resize increments of the window.
+    /// Sets the window resize increments.
     pub fn set_resize_increments(&mut self, increments: Option<LogicalSize<u32>>) {
         self.resize_increments = increments;
-        // NOTE: We don't update the window size here, because it will be done on the next resize
-        // or configure event.
     }
 
-    /// Set maximum inner window size.
+    /// Sets the minimum inner window size.
     pub fn set_min_inner_size(&mut self, size: Option<LogicalSize<u32>>) {
-        // Ensure that the window has the right minimum size.
         let mut size = size.unwrap_or(MIN_WINDOW_SIZE);
         size.width = size.width.max(MIN_WINDOW_SIZE.width);
         size.height = size.height.max(MIN_WINDOW_SIZE.height);
@@ -750,8 +653,7 @@ impl WindowState {
         };
     }
 
-    /// Record the preferred theme. LW.5: there is no frame to recolour; the value is only
-    /// answered back by [`Self::theme`].
+    /// Records the preferred window theme.
     pub fn set_theme(&mut self, theme: Option<Theme>) -> bool {
         self.theme = theme;
         let shown = self.frame.as_ref().and_then(ShadowFrame::shown);
@@ -759,7 +661,7 @@ impl WindowState {
         shown != self.frame.as_ref().and_then(ShadowFrame::shown)
     }
 
-    /// The preferred theme the window was given.
+    /// Returns the preferred window theme.
     #[inline]
     pub fn theme(&self) -> Option<Theme> {
         self.theme
@@ -767,7 +669,6 @@ impl WindowState {
 
     pub fn show_window_menu(&self, position: LogicalPosition<u32>) {
         let xdg_toplevel = self.xdg_toplevel();
-        // TODO(kchibisov) handle touch serials.
         self.apply_on_pointer(|pointer| {
             self.seats.with_seat(pointer.seat(), |seat| {
                 let serial = seat.pointer_button_serial.unwrap_or_default();
@@ -785,19 +686,19 @@ impl WindowState {
         });
     }
 
-    /// Add seat focus for the window.
+    /// Records keyboard focus from `seat`.
     #[inline]
     pub fn add_seat_focus(&mut self, seat: u32) {
         self.seat_focus.insert(seat);
     }
 
-    /// Remove seat focus from the window.
+    /// Removes keyboard focus for `seat`.
     #[inline]
     pub fn remove_seat_focus(&mut self, seat: u32) {
         self.seat_focus.remove(&seat);
     }
 
-    /// Returns `true` if the requested state was applied.
+    /// Sets whether IME input is enabled, returning `true` if the state changed.
     pub fn set_ime_allowed(&mut self, allowed: bool) -> bool {
         self.ime_allowed = allowed;
 
@@ -816,11 +717,8 @@ impl WindowState {
         applied
     }
 
-    /// Set the IME position.
+    /// Updates the IME cursor rectangle.
     pub fn set_ime_cursor_area(&self, position: LogicalPosition<u32>, size: LogicalSize<u32>) {
-        // FIXME: This won't fly unless user will have a way to request IME window per seat, since
-        // the ime windows will be overlapping, but winit doesn't expose API to specify for
-        // which seat we're setting IME position.
         let (x, y) = (position.x as i32, position.y as i32);
         let (width, height) = (size.width as i32, size.height as i32);
         for text_input in self.text_inputs.iter().filter_map(Weak::upgrade) {
@@ -832,7 +730,7 @@ impl WindowState {
         }
     }
 
-    /// Set the IME purpose.
+    /// Sets the IME content purpose.
     pub fn set_ime_purpose(&mut self, purpose: ImePurpose) {
         self.ime_purpose = purpose;
 
@@ -842,17 +740,16 @@ impl WindowState {
         }
     }
 
-    /// Get the IME purpose.
+    /// Returns the current IME content purpose.
     pub fn ime_purpose(&self) -> ImePurpose {
         self.ime_purpose
     }
 
-    /// Set the scale factor for the given window.
+    /// Updates the window scale factor.
     #[inline]
     pub fn set_scale_factor(&mut self, scale_factor: f64) {
         self.scale_factor = scale_factor;
 
-        // NOTE: When fractional scaling is not used update the buffer scale.
         let surface = self.surface();
         // SAFETY: this window's live surface; `set_buffer_scale` is version 3's.
         if self.objects.fractional_scale.is_none() && unsafe { surface.version() } >= 3 {
@@ -863,11 +760,8 @@ impl WindowState {
         self.refresh_frame();
     }
 
-    /// Set the window title to a new value.
-    ///
-    /// This will automatically truncate the title to something meaningful.
+    /// Sets the window title, truncating at 1024 bytes.
     pub fn set_title(&mut self, mut title: String) {
-        // Truncate the title to at most 1024 bytes, so that it does not blow up the protocol
         // messages
         if title.len() > 1024 {
             let mut new_len = 1024;
@@ -881,19 +775,19 @@ impl WindowState {
         unsafe { xdg_toplevel::set_title(self.xdg_toplevel(), &protocol_string(&title)) };
     }
 
-    /// Set the window's app id (`xdg_toplevel.set_app_id`).
+    /// Sets the window `xdg_toplevel` application ID.
     pub fn set_app_id(&self, app_id: &str) {
         // SAFETY: this window's live toplevel.
         unsafe { xdg_toplevel::set_app_id(self.xdg_toplevel(), &protocol_string(app_id)) };
     }
 
-    /// The text inputs observed on the window (`retire_tests`).
+    /// Returns the text inputs observed on this window.
     #[cfg(test)]
     pub(crate) fn text_inputs(&self) -> &[Weak<TextInput>] {
         &self.text_inputs
     }
 
-    /// Register text input on the top-level.
+    /// Registers a text input that entered the window.
     #[inline]
     pub fn text_input_entered(&mut self, text_input: &Arc<TextInput>) {
         let weak = Arc::downgrade(text_input);
@@ -902,7 +796,7 @@ impl WindowState {
         }
     }
 
-    /// The text input left the top-level.
+    /// Removes a text input that left the window.
     #[inline]
     pub fn text_input_left(&mut self, text_input: &Arc<TextInput>) {
         let weak = Arc::downgrade(text_input);
@@ -910,8 +804,7 @@ impl WindowState {
     }
 }
 
-/// A Rust string as a protocol string: up to its first NUL, which a protocol string cannot
-/// carry (wayland-client would have refused the whole string).
+/// Converts `s` into a NUL-terminated [`CString`], truncating at the first interior NUL.
 pub(crate) fn protocol_string(s: &str) -> CString {
     let end = s.find('\0').unwrap_or(s.len());
     CString::new(&s[..end]).unwrap_or_default()
@@ -956,7 +849,6 @@ mod tests {
             WindowManagerCapabilities::from_wire(&[cap::MINIMIZE, cap::WINDOW_MENU, 9]),
             WindowManagerCapabilities::MINIMIZE | WindowManagerCapabilities::WINDOW_MENU
         );
-        // Before a `wm_capabilities` event every capability is assumed, as sctk assumed it.
         assert!(WindowConfigure::default().capabilities.is_all());
     }
 

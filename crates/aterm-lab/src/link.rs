@@ -1,79 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A LINK WITH A ROUND TRIP: a PTY relay that holds every chunk for half a
-//! round trip each way, so a tab's shell answers a key as a shell over a slow
-//! link does (`predict-live`, [`crate::predict_live`]).
-//!
-//! ```text
-//! aterm's PTY  <-- rtt/2 -->  this relay  <-- rtt/2 -->  an inner PTY  <-->  the shell
-//! ```
-//!
-//! WHY. aterm's predictor shows a key's effect before its echo only on a link
-//! it has MEASURED as slow (`Adaptive` opens at 20 ms), from the press to the
-//! echo it credits. A local shell answers in a millisecond, so nothing is ever
-//! predicted on glass there; ssh to a far host is a link nobody controls. This
-//! relay is the honest middle: the shell is a real zsh or bash, the bytes are
-//! the bytes it writes, and the only change is time. Each chunk read from one
-//! side is written to the other `rtt/2` later, in the order read, whole: a link
-//! with a fixed latency, no jitter and no loss. Its outer side is raw (no echo,
-//! no line discipline), as ssh's is, so the program behind it echoes for itself.
-//!
-//! THE NAME. aterm integrates a tab's shell by the program it spawns
-//! (`ShellType::detect` reads the file name): the relay is this program copied
-//! under the shell's own name (`zsh`, `bash`), and aterm's `shell` setting
-//! names the copy, so the shell behind it gets aterm's integration (zsh's
-//! `ZDOTDIR`, bash's `--rcfile` argument, the nonce that signs its prompt
-//! marks) exactly as a shell aterm spawned itself does. The relay passes the
-//! arguments and the environment through, starts `/bin/<name>` (or
-//! `LAB_LINK_EXEC`) with the `argv[0]` it was given (`-zsh`, a login shell),
-//! and takes its own settings from the environment, removed before the shell
-//! starts:
-//!
-//! * `LAB_LINK_RTT_MS`: the round trip, in milliseconds (default 100);
-//! * `LAB_LINK_TAKE`: a directory; each relay appends a TAKE of the far end's
-//!   own view to `<dir>/<pid>.take`, ptyrec's line (`<t_ns> I <hex>` when the
-//!   shell is handed input, `<t_ns> O <hex>` when it writes, and `<t_ns> W
-//!   <rows>x<cols>` for the window it is told, at the start and at every
-//!   resize), so a reader can tell which output a key caused (what the shell
-//!   wrote after it read the key and before it read the next) and replay the
-//!   far end's own screen;
-//! * `LAB_LINK_EXEC`: the shell to start, when not `/bin/<name>`.
-//!
-//! `aterm-lab link [--rtt MS] [--take FILE] -- command [args…]` is the same
-//! relay run by hand.
+//! Fixed-latency PTY relay (`aterm-lab link`) that delays chunks by `rtt/2` in each direction.
 
 use crate::sys::{self, WinSize};
 use std::collections::VecDeque;
 use std::io::Write as _;
 use std::time::{Duration, Instant};
 
-/// The settings a relay takes from its environment ([`Settings::from_env`]).
+/// Environment variable setting the round-trip latency in milliseconds.
 pub const ENV_RTT: &str = "LAB_LINK_RTT_MS";
+/// Environment variable naming the directory for `<pid>.take` recordings.
 pub const ENV_TAKE: &str = "LAB_LINK_TAKE";
+/// Environment variable overriding the shell binary launched by the relay.
 pub const ENV_EXEC: &str = "LAB_LINK_EXEC";
 
 /// The round trip when none is named.
 const DEFAULT_RTT_MS: u64 = 100;
 
-/// What one relay does.
+/// Configuration for a latency-injecting PTY relay.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
-    /// The round trip: each way holds a chunk half of it.
+    /// Round-trip delay split equally across both directions.
     pub rtt: Duration,
-    /// The take file, when one is kept.
+    /// Optional path to the `.take` recording file.
     pub take: Option<String>,
 }
 
 impl Settings {
-    /// Half the round trip: how long each chunk is held, each way.
+    /// One-way delay (`rtt / 2`).
     #[must_use]
     pub fn one_way(&self) -> Duration {
         self.rtt / 2
     }
 
-    /// The settings of a relay started as a shell, from `get` (the
-    /// environment): the round trip, and a take in `<dir>/<pid>.take`.
+    /// Reads relay settings from environment lookup `get` for process `pid`.
     ///
     /// # Errors
     /// `LAB_LINK_RTT_MS` is not a whole number of milliseconds.
@@ -94,16 +55,14 @@ impl Settings {
     }
 }
 
-/// The shell a relay named `name` (`-zsh`, `bash`) starts: `LAB_LINK_EXEC`
-/// when set, else `/bin/<name>` without a login dash.
+/// Resolves the shell executable for `name`, using `exec` (`LAB_LINK_EXEC`) when non-empty.
 #[must_use]
 pub fn shell_for(name: &str, exec: Option<String>) -> String {
     exec.filter(|e| !e.is_empty())
         .unwrap_or_else(|| format!("/bin/{}", name.trim_start_matches('-')))
 }
 
-/// `[--rtt MS] [--take FILE] -- command [args…]` → (the settings, the
-/// command); `None` when the grammar is not met.
+/// Parses `[--rtt MS] [--take FILE] -- command [args…]`.
 #[must_use]
 pub fn parse_args(args: &[String]) -> Option<(Settings, &[String])> {
     let mut settings = Settings {
@@ -129,8 +88,7 @@ pub fn parse_args(args: &[String]) -> Option<(Settings, &[String])> {
     }
 }
 
-/// One way of the link: chunks in the order read, each due `one_way` after it
-/// was read. Time is handed in, so a test steps it.
+/// One direction of the relay queue holding chunks for `one_way`.
 #[derive(Debug, Default)]
 pub struct Way {
     one_way: Duration,
@@ -138,6 +96,7 @@ pub struct Way {
 }
 
 impl Way {
+    /// Creates a queue with delay `one_way`.
     #[must_use]
     pub fn new(one_way: Duration) -> Way {
         Way {
@@ -146,20 +105,20 @@ impl Way {
         }
     }
 
-    /// A chunk read at `now`.
+    /// Enqueues `bytes` read at `now`.
     pub fn push(&mut self, now: Instant, bytes: &[u8]) {
         if !bytes.is_empty() {
             self.queue.push_back((now + self.one_way, bytes.to_vec()));
         }
     }
 
-    /// When the oldest chunk is due, if any is held.
+    /// Returns the deadline of the oldest queued chunk, if any.
     #[must_use]
     pub fn next_due(&self) -> Option<Instant> {
         self.queue.front().map(|(due, _)| *due)
     }
 
-    /// The oldest chunk, once it is due at `now`.
+    /// Pops the oldest chunk if due at `now`.
     pub fn pop_due(&mut self, now: Instant) -> Option<Vec<u8>> {
         if self.next_due().is_some_and(|due| due <= now) {
             self.queue.pop_front().map(|(_, bytes)| bytes)
@@ -168,16 +127,14 @@ impl Way {
         }
     }
 
-    /// Whether nothing is held.
+    /// Returns whether no chunks are queued.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
 }
 
-/// The `poll` timeout until the earlier of `a` and `b`, in whole
-/// milliseconds rounded up (a chunk is never written early), `0` when one is
-/// already due, `-1` (wait for a descriptor) when neither is held.
+/// Computes the `poll` timeout in milliseconds until the earlier of `a` and `b`.
 #[must_use]
 pub fn wait_ms(now: Instant, a: Option<Instant>, b: Option<Instant>) -> i32 {
     let Some(due) = [a, b].into_iter().flatten().min() else {
@@ -223,8 +180,7 @@ impl Take {
     }
 }
 
-/// The relay started under a shell's name (`zsh`, `-zsh`, `bash`, `-bash`):
-/// `argv[0]` is `name`, `args` the shell's own arguments.
+/// Runs the relay when invoked under a shell `argv[0]` (`zsh`, `-zsh`, `bash`, `-bash`).
 #[must_use]
 pub fn as_shell(name: &str, args: &[String]) -> i32 {
     let get = |k: &str| std::env::var(k).ok();
@@ -241,7 +197,7 @@ pub fn as_shell(name: &str, args: &[String]) -> i32 {
     relay(&settings, Some(name), &command)
 }
 
-/// `aterm-lab link [--rtt MS] [--take FILE] -- command [args…]`.
+/// Entry point for `aterm-lab link [--rtt MS] [--take FILE] -- command [args…]`.
 #[must_use]
 pub fn main(args: &[String]) -> i32 {
     let Some((settings, command)) = parse_args(args) else {
@@ -287,7 +243,6 @@ fn relay(settings: &Settings, arg0: Option<&str>, command: &[String]) -> i32 {
         let (a, b, c) = (slave.try_clone()?, slave.try_clone()?, slave.try_clone()?);
         let exe = std::env::current_exe()?;
         let mut cmd = aterm_uds::spawnfd::command(exe);
-        // named for the CLI: under a shell's name this program is the relay again
         cmd.arg0("aterm-lab").arg("ctty");
         if let Some(name) = arg0 {
             cmd.arg("--arg0").arg(name);
@@ -333,7 +288,6 @@ fn relay(settings: &Settings, arg0: Option<&str>, command: &[String]) -> i32 {
                 input_open = false;
             }
         }
-        // The program is gone and what it wrote has crossed: done.
         if !output_open && outward.is_empty() {
             break;
         }
@@ -361,8 +315,6 @@ fn relay(settings: &Settings, arg0: Option<&str>, command: &[String]) -> i32 {
                     libc::SIGCHLD => {
                         if let Ok(Some(st)) = child.try_wait() {
                             status = Some(st);
-                            // What it wrote last is still queued: read it all,
-                            // held like the rest, then the master is done.
                             loop {
                                 let mut fds = [sys::pollfd(master)];
                                 if sys::poll(&mut fds, 0).unwrap_or(0) == 0 {
@@ -379,7 +331,6 @@ fn relay(settings: &Settings, arg0: Option<&str>, command: &[String]) -> i32 {
                             output_open = false;
                         }
                     }
-                    // TERM, HUP, INT: leave now
                     _ => {
                         output_open = false;
                         input_open = false;

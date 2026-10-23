@@ -373,6 +373,7 @@ mod tests {
     type Motion = fn(&mut Grid);
 
     /// One cursor motion from a start position under an optional DECSTBM region
+    /// and DECLRMM margins, and where it must land.
     struct Case {
         name: &'static str,
         size: (u16, u16),
@@ -419,6 +420,11 @@ mod tests {
     }
 
     /// EVERY CURSOR MOTION LANDS WHERE XTERM PUTS IT: absolute moves clamp to
+    /// the screen; CUU/CUD clamp on the margin they cross toward (even from
+    /// outside the region), VPR on the screen edge; CUF/CUB and CR honour
+    /// DECLRMM margins only in margin mode and only from inside them; LF/RI
+    /// scroll at the region edge and move freely outside it; and each motion
+    /// that consumes the pending wrap clears it.
     #[test]
     fn every_motion_lands_where_xterm_puts_it() {
         let cases = [
@@ -792,6 +798,9 @@ mod tests {
     }
 
     /// The four arms: DECLRMM off; on with the cursor on the right margin
+    /// inside the rectangle (the margins reach the last column, or stop short
+    /// of it); on with the cursor right of the margins, parked on the screen's
+    /// last column.
     const MARGIN_ARMS: [MarginArm; 4] = [
         MarginArm {
             mode: false,
@@ -820,6 +829,7 @@ mod tests {
     ];
 
     /// A 4x10 grid for `arm`, with a marker `q` at (`row`, 3), inside every
+    /// arm's rectangle, and a pending wrap at (`row`, `arm.col`).
     fn margin_arm_grid(row: u16, arm: MarginArm) -> Grid {
         let mut grid = Grid::new(4, 10);
         grid.set_cursor(row, 3);
@@ -834,6 +844,8 @@ mod tests {
     }
 
     /// At the top margin too: xterm's `RevIndex` scrolls, then `CursorUp(0)`
+    /// resets the wrap (outside the margins it is `CursorUp(1)`, which the
+    /// margin stops).
     #[test]
     fn reverse_line_feed_at_the_top_margin_clears_pending_wrap() {
         for arm in MARGIN_ARMS {
@@ -855,6 +867,8 @@ mod tests {
     }
 
     /// LF/IND at the bottom margin, the mirror image: xterm's `xtermIndex` is
+    /// `CursorDown` (by 0 to the margin, then `xtermScroll`; by 1 outside the
+    /// margins, which the margin stops), and `CursorDown` resets the wrap.
     #[test]
     fn line_feed_at_the_bottom_margin_clears_pending_wrap() {
         for arm in MARGIN_ARMS {
@@ -876,6 +890,7 @@ mod tests {
     }
 
     /// A one-row screen's region is that row, and a reverse index there
+    /// scrolls it out (xterm `RevScroll` clamps to one line and clears it).
     #[test]
     fn reverse_line_feed_on_a_one_row_screen_blanks_the_row() {
         let mut grid = Grid::new(1, 10);
@@ -886,6 +901,9 @@ mod tests {
     }
 
     /// The same under DECLRMM margins: an index either way on a one-row
+    /// screen blanks the margin rectangle of its row and nothing outside it,
+    /// as the full-width ops blank the whole row (the margined scrolls used to
+    /// return early on `top == bottom` and leave the row standing).
     #[test]
     fn an_index_on_a_one_row_screen_blanks_the_margin_rectangle() {
         for reverse in [false, true] {

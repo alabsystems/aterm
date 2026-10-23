@@ -17,7 +17,7 @@ use super::ffi::{self, HANDLE, Handle};
 use crate::console_host::policy::{self, AutoSource, HostState, OpenConsoleExe, Origin};
 use crate::{ConsoleHostChoice, ConsoleHostReport};
 
-/// The process's console-host state. Starts at the inbox host: an embedder
+/// The process's console-host state.
 static HOST: Mutex<HostState> = Mutex::new(HostState::new());
 
 /// Set the console host every LATER spawn in this process uses (the window calls it with aterm.toml's `conpty` at launch and on every reload).
@@ -105,6 +105,8 @@ pub(crate) fn is_gui_image(path: &Path) -> bool {
 }
 
 /// The image path of the process behind `process`, read and nothing else: for
+/// a program started through an app execution alias, the packaged program it
+/// named.
 fn image_of(process: HANDLE) -> Option<PathBuf> {
     let mut buf = vec![0u16; 1024];
     let mut len = buf.len() as u32;
@@ -124,11 +126,13 @@ pub fn preview_console_host(choice: &ConsoleHostChoice) -> ConsoleHostReport {
 }
 
 /// Resolve an opted-in choice to the OpenConsole it names, or say why the
+/// inbox host.
 fn resolve(choice: &ConsoleHostChoice) -> Result<OpenConsoleExe, String> {
     resolve_as(choice, true)
 }
 
 /// [`resolve`], copying Windows Terminal's OpenConsole.exe out of its package
+/// only when `copy` (a preview names the copy without making it).
 fn resolve_as(choice: &ConsoleHostChoice, copy: bool) -> Result<OpenConsoleExe, String> {
     let exe_dir = || {
         std::env::current_exe()
@@ -198,6 +202,9 @@ const WINDOWS_TERMINAL_FAMILIES: &[&str] = &[
 ];
 
 /// The first installed Windows Terminal package (stable, then Preview, then
+/// Canary) whose folder holds OpenConsole.exe, as (full name, file), asked of
+/// the package manager (appmodel.h), never by listing `WindowsApps`, which an
+/// ordinary user cannot.
 fn windows_terminal_openconsole() -> Option<(String, PathBuf)> {
     WINDOWS_TERMINAL_FAMILIES.iter().find_map(|family| {
         packages_of(family).into_iter().find_map(|full_name| {
@@ -515,6 +522,7 @@ pub(crate) fn start_client(
 }
 
 /// OpenConsole's command line: the quoted path, then `policy::host_arguments`
+/// (the five stable arguments), NUL-terminated.
 fn host_command_line(exe: &Path, size: ffi::COORD, signal: HANDLE, server: HANDLE) -> Vec<u16> {
     let mut line: Vec<u16> = vec![u16::from(b'"')];
     line.extend(exe.as_os_str().encode_wide());
@@ -526,6 +534,7 @@ fn host_command_line(exe: &Path, size: ffi::COORD, signal: HANDLE, server: HANDL
 }
 
 /// Wait for the host's first output byte (left in the pipe for the session
+/// reader).
 fn await_first_output(host: HANDLE, client: HANDLE, out_read: HANDLE, window: Duration) -> Health {
     let start = Instant::now();
     let failed = |why: String, sticky: bool| Health::Failed { why, sticky };

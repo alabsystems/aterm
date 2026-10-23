@@ -1,28 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The routing socket's interface list (`sysctl {CTL_NET, PF_ROUTE, 0, 0,
-//! NET_RT_IFLIST2, 0}`), decoded from bytes: Darwin's 64-bit interface
-//! counters, which [`crate::net_links`] reads on macOS.
-//!
-//! The answer is a run of routing messages, each led by its length,
-//! version and type. An `RTM_IFINFO2` message is a `struct if_msghdr2`
-//! (`net/if.h`) whose `ifm_data` is a `struct if_data64` (`net/if_var.h`,
-//! under `#pragma pack(4)`), followed, when `ifm_addrs` has `RTA_IFP`, by
-//! the interface's link-level address: a `struct sockaddr_dl`
-//! (`net/if_dl.h`) that holds its name. The address messages after each
-//! interface are skipped. The first-party `libc` declares none of these, so
-//! they are declared here; every size, offset and constant is a row of
-//! [`SDK_ROWS`], which `tests/iflist_sdk.rs` compiles as `_Static_assert`s
-//! against the SDK for `arm64` and `x86_64` (with a negative control). The
-//! decoder is pure and tested on every host from bytes the tests write.
-//!
-//! Not `getifaddrs`: its `AF_LINK` entries carry the 32-bit `struct
-//! if_data`, whose byte counters wrap every 4 GiB (every 34 s at 1 Gb/s).
-//! Not `if_indextoname` for the names: libc answers it by listing every
-//! interface, about 20 µs a name on the owner's M5 Max (512 µs for 24
-//! interfaces, against 33 µs for the whole list), while the message already
-//! carries the name.
+//! The routing socket's interface list (`sysctl {CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0}`), decoded from bytes: Darwin's 64-bit interface counters, which [`crate::net_links`] reads on macOS.
 
 use crate::machine::{
     LinkCounters, LinkKind, LinkReading, MAX_LINKS, kind_by_name, never_the_machines,
@@ -32,16 +11,13 @@ use crate::machine::{
 pub const CTL_NET: i32 = 4;
 /// `PF_ROUTE` (`sys/socket.h`).
 pub const PF_ROUTE: i32 = 17;
-/// `NET_RT_IFLIST2` (`sys/socket.h`): the interface list with 64-bit
-/// counters.
+/// `NET_RT_IFLIST2` (`sys/socket.h`): the interface list with 64-bit counters.
 pub const NET_RT_IFLIST2: i32 = 6;
-/// `RTM_VERSION` (`net/route.h`): the message format decoded here; a
-/// message of another version is skipped.
+/// `RTM_VERSION` (`net/route.h`): the message format decoded here; a message of another version is skipped.
 pub const RTM_VERSION: u8 = 5;
 /// `RTM_IFINFO2` (`net/route.h`): an interface's `if_msghdr2`.
 pub const RTM_IFINFO2: u8 = 0x12;
-/// `RTA_IFP` (`net/route.h`): the message carries the interface's
-/// link-level address.
+/// `RTA_IFP` (`net/route.h`): the message carries the interface's link-level address.
 pub const RTA_IFP: i32 = 0x10;
 /// `AF_LINK` (`sys/socket.h`).
 pub const AF_LINK: u8 = 18;
@@ -51,8 +27,7 @@ pub const IFF_UP: i32 = 0x1;
 pub const IFF_LOOPBACK: i32 = 0x8;
 /// `IFF_RUNNING` (`net/if.h`).
 pub const IFF_RUNNING: i32 = 0x40;
-/// `SIOCGIFFUNCTIONALTYPE` (`sys/sockio.h`, `_IOWR('i', 173, struct
-/// ifreq)`): an interface's functional type, asked on any socket.
+/// `SIOCGIFFUNCTIONALTYPE` (`sys/sockio.h`, `_IOWR('i', 173, struct ifreq)`): an interface's functional type, asked on any socket.
 pub const SIOCGIFFUNCTIONALTYPE: u64 = 0xC020_69AD;
 /// `IFRTYPE_FUNCTIONAL_WIRED` (`net/if.h`).
 pub const IFRTYPE_FUNCTIONAL_WIRED: u32 = 2;
@@ -121,8 +96,7 @@ const _: () = assert!(std::mem::offset_of!(IfMsghdr2, ifm_data) == 32);
 const _: () = assert!(std::mem::offset_of!(IfData64, ifi_baudrate) == 16);
 const _: () = assert!(std::mem::offset_of!(IfData64, ifi_ibytes) == 64);
 
-/// `struct ifreq` as `SIOCGIFFUNCTIONALTYPE` reads it: the name, then the
-/// union's `ifru_functional_type`; 32 bytes, as the ioctl's size says.
+/// `struct ifreq` as `SIOCGIFFUNCTIONALTYPE` reads it: the name, then the union's `ifru_functional_type`; 32 bytes, as the ioctl's size says.
 #[repr(C, align(8))]
 #[derive(Clone, Copy)]
 pub(crate) struct IfReqFunctional {
@@ -140,10 +114,7 @@ pub const DL_NLEN_AT: usize = 5;
 /// `offsetof(struct sockaddr_dl, sdl_data)`: the name, then the address.
 pub const DL_DATA_AT: usize = 8;
 
-/// Every layout row and constant above, as the C expression the SDK must
-/// agree with: `tests/iflist_sdk.rs` asserts each on `arm64` and `x86_64`.
-/// The sizes and offsets are the Rust declarations' own (`size_of`,
-/// `offset_of!`), so a field declared in the wrong place fails there.
+/// Every layout row and constant above, as the C expression the SDK must agree with: `tests/iflist_sdk.rs` asserts each on `arm64` and `x86_64`.
 #[cfg(target_os = "macos")]
 pub const SDK_ROWS: &[(&str, i64)] = &[
     ("CTL_NET", CTL_NET as i64),
@@ -255,9 +226,7 @@ pub const SDK_ROWS: &[(&str, i64)] = &[
 #[cfg(target_os = "macos")]
 const DATA: usize = std::mem::offset_of!(IfMsghdr2, ifm_data);
 
-/// The interface name a `struct sockaddr_dl` holds: `sdl_data`'s first
-/// `sdl_nlen` bytes, held within `sdl_len` and `bytes`; `None` for another
-/// family, an empty name, or one that does not fit. PURE.
+/// The interface name a `struct sockaddr_dl` holds: `sdl_data`'s first `sdl_nlen` bytes, held within `sdl_len` and `bytes`; `None` for another family, an empty name, or one that does not fit.
 #[must_use]
 pub fn dl_name(bytes: &[u8]) -> Option<String> {
     let len = usize::from(*bytes.first()?).min(bytes.len());
@@ -269,12 +238,7 @@ pub fn dl_name(bytes: &[u8]) -> Option<String> {
     (!name.is_empty()).then(|| String::from_utf8_lossy(name).into_owned())
 }
 
-/// A functional type (`SIOCGIFFUNCTIONALTYPE`) as a [`LinkKind`]: wired,
-/// Wi-Fi infrastructure and cellular name theirs; `IFRTYPE_FUNCTIONAL_UNKNOWN`
-/// (0) is `unknown`'s; every other type (loopback, AWDL, intcoproc,
-/// companion link, management) is other. The type is the driver's own
-/// claim, which a tunnel or bridge can make too: [`link_kind`] decides
-/// which links it is asked of. PURE.
+/// A functional type (`SIOCGIFFUNCTIONALTYPE`) as a [`LinkKind`]: wired, Wi-Fi infrastructure and cellular name theirs; `IFRTYPE_FUNCTIONAL_UNKNOWN` (0) is `unknown`'s; every other type (loopback, AWDL, intcoproc, companion link, management) is other.
 #[must_use]
 pub fn kind_of_functional(functional: u32, unknown: LinkKind) -> LinkKind {
     match functional {
@@ -286,14 +250,7 @@ pub fn kind_of_functional(functional: u32, unknown: LinkKind) -> LinkKind {
     }
 }
 
-/// The kind of the macOS link `name`: [`LinkKind::Other`], without asking,
-/// for a name [`crate::counts_toward_machine`] refuses by prefix (a
-/// loopback, tunnel, bridge, peer-to-peer or companion radio, coprocessor
-/// or guest link), since macOS reports `utun`, `bridge` and `anpi` links as
-/// wired and `llw` and `ap` links as Wi-Fi; else the functional type
-/// `functional` asks for ([`kind_of_functional`]), and the name's
-/// ([`kind_by_name`]) where it answers none or unknown. PURE but for
-/// `functional`, called at most once.
+/// The kind of the macOS link `name`: [`LinkKind::Other`], without asking, for a name [`crate::counts_toward_machine`] refuses by prefix (a loopback, tunnel, bridge, peer-to-peer or companion radio, coprocessor or guest link), since macOS reports `utun`, `bridge` and `anpi` links as wired and `llw` and `ap` links as Wi-Fi; else the functional type `functional` asks for ([`kind_of_functional`]), and the name's ([`kind_by_name`]) where it answers none or unknown.
 #[must_use]
 pub fn link_kind(name: &str, functional: impl FnOnce() -> Option<u32>) -> LinkKind {
     if never_the_machines(name) {
@@ -315,17 +272,7 @@ pub(crate) enum Asked {
     Failed,
 }
 
-/// A kernel answer of unknown size read by `ask` into `buf`, the caller's
-/// scratch: `ask(Some(buf))` fills `buf`, `ask(None)` names the size the
-/// answer needs now. First into the whole of `buf`, made at least `first`
-/// bytes (a scratch an earlier read grew is offered whole, up to `cap`);
-/// where that is too small, into what the kernel then asks for and a
-/// quarter more (the answer can grow between the two asks), at least twice
-/// the last size, three tries at most and never past `cap`. The answer is
-/// `buf[..n]` for the `n` returned, and `buf` keeps the size it was last
-/// offered at, so a caller that keeps it reads again without allocating
-/// (see [`crate::net_links_into`]). `None` on any other failure. PURE but
-/// for `ask`.
+/// A kernel answer of unknown size read by `ask` into `buf`, the caller's scratch: `ask(Some(buf))` fills `buf`, `ask(None)` names the size the answer needs now.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn read_growing(
     first: usize,
@@ -362,7 +309,7 @@ pub(crate) fn read_growing(
 /// rate where it is not zero, the send-queue drop count (a signed 32-bit
 /// `int` in the kernel, the one 32-bit counter) read unsigned, so it wraps
 /// at 2³² rather than reading zero past 2³¹; the kind is the name's
-/// ([`kind_by_name`]) and `physical` is unknown. PURE.
+/// ([`kind_by_name`]) and `physical` is unknown.
 fn link_of(h: &IfMsghdr2, name: String) -> LinkReading {
     let d = h.ifm_data;
     let up = IFF_UP | IFF_RUNNING;
@@ -389,13 +336,7 @@ fn link_of(h: &IfMsghdr2, name: String) -> LinkReading {
     }
 }
 
-/// Every interface in a `NET_RT_IFLIST2` answer, in the kernel's order, at
-/// most [`MAX_LINKS`]. A message shorter than its own 4-byte lead, or one
-/// that runs past `buf`, ends the walk; a message of another version or
-/// type, or an `RTM_IFINFO2` shorter than [`MSGHDR2_SIZE`], is skipped. An
-/// interface whose message carries no name reads `""` (the macOS arm then
-/// asks `if_indextoname`). The kind is the name's and `physical` is `None`
-/// ([`link_of`]). PURE.
+/// Every interface in a `NET_RT_IFLIST2` answer, in the kernel's order, at most [`MAX_LINKS`].
 #[must_use]
 pub fn links_of(buf: &[u8]) -> Vec<LinkReading> {
     let mut out = Vec::new();
@@ -412,9 +353,7 @@ pub fn links_of(buf: &[u8]) -> Vec<LinkReading> {
         if msg[2] != RTM_VERSION || msg[3] != RTM_IFINFO2 || len < MSGHDR2_SIZE {
             continue;
         }
-        // SAFETY: `msg` holds at least `MSGHDR2_SIZE` bytes, the size of
-        // `IfMsghdr2`, which is integers only (no padding, every bit
-        // pattern a value); the read is unaligned.
+        // SAFETY: `msg` holds at least `MSGHDR2_SIZE` bytes, the size of `IfMsghdr2`, which is integers only (no padding, every bit pattern a value); the read is unaligned.
         let h: IfMsghdr2 = unsafe { std::ptr::read_unaligned(msg.as_ptr().cast()) };
         let name = if h.ifm_addrs & RTA_IFP != 0 {
             dl_name(&msg[MSGHDR2_SIZE..])
@@ -620,7 +559,6 @@ mod tests {
         sdl[DL_NLEN_AT] = 6;
         put(&mut sdl, DL_DATA_AT, b"bridge");
         assert_eq!(dl_name(&sdl).as_deref(), Some("bridge"));
-        // Another family, an empty name, a name past `sdl_len`.
         let mut inet = sdl.clone();
         inet[DL_FAMILY_AT] = 2;
         assert_eq!(dl_name(&inet), None);
@@ -651,7 +589,6 @@ mod tests {
     /// (the live M5 Max read wired for `utun4`, `bridge0` and `anpi0`–`2`,
     /// Wi-Fi for `llw0` and `ap1`); every other link takes its functional
     /// type, and its name's kind where the ask answers none or unknown.
-    /// NEGATIVE CONTROL: an excluded name whose type would be asked panics.
     #[test]
     fn a_refused_links_kind_is_other_and_the_rest_take_their_functional_type() {
         let never = || -> Option<u32> { panic!("an excluded link's type is never asked") };
@@ -717,8 +654,7 @@ mod tests {
     /// The interface list's buffer: the first size where it fits; where it
     /// is too small, what the kernel then asks for and a quarter more, at
     /// least twice the last size, three tries; the answer cut to what the
-    /// kernel wrote. NEGATIVE CONTROLS: a size past the cap, a list that
-    /// outgrows every try, and a failed ask of either kind are `None`.
+    /// kernel wrote.
     #[test]
     fn the_interface_lists_buffer_grows_to_what_the_kernel_asks_for() {
         assert_eq!(
@@ -779,7 +715,7 @@ mod tests {
     /// A scratch the caller keeps is offered whole: the read after one that
     /// grew it asks no size and allocates nothing, and the answer is what
     /// the kernel wrote, inside a scratch that keeps the size it was
-    /// offered at. A scratch longer than the cap is offered the cap.
+    /// offered at.
     #[test]
     fn a_kept_scratch_is_offered_whole_and_read_again_in_place() {
         let mut scratch = Vec::new();

@@ -38,6 +38,7 @@ unsafe extern "C" {
 }
 
 /// `$HOME` as a home, or `None`: an empty or relative value (which would make every path
+/// cwd-relative) falls through to the passwd lookup like an unset one.
 #[cfg(unix)]
 fn home_from_env(value: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     value.map(PathBuf::from).filter(|home| home.is_absolute())
@@ -47,6 +48,7 @@ fn home_from_env(value: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
 pub const PASSWD_FILE_SEAM: &str = "ATERM_PASSWD_FILE";
 
 /// The home directory for `uid` from `/etc/passwd`, read as bytes: the format needs no UTF-8
+/// decode, and a stray legacy byte in another user's GECOS field cannot fail the lookup.
 #[cfg(unix)]
 fn passwd_home_dir(uid: u32) -> Option<PathBuf> {
     let contents = std::fs::read(passwd_file()).ok()?;
@@ -54,6 +56,7 @@ fn passwd_home_dir(uid: u32) -> Option<PathBuf> {
 }
 
 /// The account file [`passwd_home_dir`] reads: `/etc/passwd`, or in a development build
+/// the file [`PASSWD_FILE_SEAM`] names when it is set.
 #[cfg(unix)]
 fn passwd_file() -> PathBuf {
     crate::dev_seam!(PASSWD_FILE_SEAM).map_or_else(|| PathBuf::from("/etc/passwd"), PathBuf::from)
@@ -132,6 +135,8 @@ pub fn test_root() -> Option<&'static std::path::Path> {
 }
 
 /// The state root an instance was given in place of the per-user one: the
+/// development seam `$ATERM_STATE_HOME` ([`crate::dev_seam!`]), else a test
+/// binary's `<root>/state` ([`test_root`]).
 fn state_override() -> Option<PathBuf> {
     match crate::dev_seam!("ATERM_STATE_HOME") {
         Some(root) => Some(PathBuf::from(root)),
@@ -306,6 +311,7 @@ pub fn account_state_dir() -> Option<PathBuf> {
 }
 
 /// [`account_state_dir`] with every live read but the private state root's, which is
+/// `private`: the uid, the account record's home and [`state_dir`].
 fn account_state_dir_as(private: bool) -> Option<PathBuf> {
     #[cfg(unix)]
     let (root, root_home) = if aterm_uds::peer::our_uid() == 0 {
@@ -446,6 +452,8 @@ mod tests {
     use super::*;
 
     /// The account's own shell is the one whose `$HOME` is the account record's home (as
+    /// written or as resolved), not root and not under a private state root; each other
+    /// case names itself.
     #[cfg(unix)]
     #[test]
     fn the_accounts_own_shell_is_its_home_not_root_and_no_private_root() {
@@ -473,7 +481,7 @@ mod tests {
         );
     }
 
-    /// An item's journal goes where its account is. A test's `aterm doctor` or `atpkg
+    /// An item's journal goes where its account is.
     #[cfg(unix)]
     #[test]
     fn the_journal_root_is_the_state_root_the_items_act_on_and_roots_own_under_sudo() {
@@ -565,6 +573,7 @@ mod tests {
     }
 
     /// The aterm.toml rule: a set `XDG_CONFIG_HOME` wins everywhere, then `%APPDATA%` on
+    /// Windows, else `HOME/.config` (macOS included); an empty value is unset.
     #[test]
     fn aterm_config_path_follows_the_one_rule_the_window_loads_by() {
         let xdg = OsStr::new("/xdg");
@@ -617,6 +626,7 @@ mod tests {
     }
 
     /// The config directory: on every row of the XDG / APPDATA-only / HOME-only / none matrix
+    /// it is the folder holding `aterm.toml`, and the themes folder sits beside that file.
     #[test]
     fn the_themes_folder_sits_beside_aterm_toml_on_every_row_of_the_matrix() {
         let xdg = OsStr::new("/xdg");
@@ -690,6 +700,7 @@ mod tests {
     }
 
     /// The state root: an absolute override wins, a relative one is refused, and otherwise the
+    /// platform default applies.
     #[test]
     fn state_dir_honours_an_absolute_override_and_refuses_a_relative_one() {
         let platform = StatePlatform {
@@ -742,6 +753,8 @@ mod tests {
     }
 
     /// The log directory: macOS `~/Library/Logs/aterm`, other Unix the XDG state dir's
+    /// `aterm/logs` (a relative XDG value falls through to home), under an absolute override
+    /// root, and `None` for a relative override or nothing to resolve from.
     #[test]
     fn logs_dir_follows_each_platforms_convention() {
         let platform = StatePlatform {
@@ -788,6 +801,7 @@ mod tests {
     }
 
     /// The data root: an absolute state-home seam is the root itself, a relative one is
+    /// refused, and unset it is the OS data dir's `aterm` on each platform arm.
     #[test]
     fn aterm_data_dir_follows_the_state_home_seam_and_else_the_os_data_dir() {
         let platform = DataPlatform {
@@ -861,6 +875,8 @@ mod tests {
     }
 
     /// In a Cargo test binary every aterm folder this module resolves lies under
+    /// the binary's own root unless the test named one, so no test reads or writes
+    /// the person's state, logs or config.
     #[cfg(not(target_family = "wasm"))]
     #[test]
     fn test_binary_folders_lie_under_its_own_root() {

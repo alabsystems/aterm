@@ -1,39 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! SHADOW: `aterm drive replay FILE… --shadow [--set k=v…|--policy FILE]` —
-//! every decision a harness tape recorded, decided again by THIS build under a
-//! CANDIDATE policy, point by point (the replay plan's §5.2). Where acts mode
-//! ([`super::acts`]) runs the loop on to the first act the candidate takes
-//! otherwise and stops, the shadow asks every recorded point the same
-//! question — "what would the candidate have decided HERE, on what the
-//! recorded loop saw?" — so a policy change's every effect on a run is
-//! listed, not only its first.
-//!
-//! * **An approval or a question** is decided again on ANY build, with no
-//!   loop run: on the facts its mark carries, the screen it judged and the
-//!   looks the tape holds before it (a keyed probe asking astream-effects'
-//!   `KeyedIndex` of the tape, built once when the tape is opened and shared
-//!   by every box's probe: a look is one lookup) — the very re-decision
-//!   `--why` makes ([`super::explain::Book::explain`]), under the candidate
-//!   instead of the header's policy. What it needed and the tape did not
-//!   hold is named under `needs:`.
-//! * **A turn end** decides on the turn-end fold, built over the whole run,
-//!   which only re-running the loop rebuilds: on the build that recorded the
-//!   tape a STRICT replay drives the loop, and at each turn end the candidate
-//!   decides again beside the loop on the fold and the reading the recorded
-//!   decision was made on (`run::turn_end_loop`'s `ShadowPoint`), the loop
-//!   going on with its own. On another build each turn end is listed with
-//!   why it is not decided again.
-//!
-//! **TAINT.** Every row after the first that differs is labelled TAINT: had
-//! the candidate run, it would have acted otherwise there, the worker would
-//! have drawn something else, and every later screen on the tape is one the
-//! candidate would not have seen. A shadow never says what it would have
-//! seen instead (the plan's §11: no model, no inference).
-//!
-//! Only the tape is read; nothing is written; a reply's text is printed as
-//! every field of a tape is ([`super::show::shown`]).
+//! SHADOW: `aterm drive replay FILE… --shadow [--set k=v…|--policy FILE]`.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -48,8 +16,7 @@ use super::show::{self, shown};
 /// One recorded decision and the candidate's on the same point.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShadowRow {
-    /// The mark's door: `decide.approval`, `decide.question`,
-    /// `decide.turn_end`.
+    /// The mark's door: `decide.approval`, `decide.question`, `decide.turn_end`.
     pub door: String,
     /// The mark's ordinal (`#N` in `tape cat`).
     pub mark: u64,
@@ -61,11 +28,9 @@ pub struct ShadowRow {
     /// The candidate's, where it was decided again.
     pub candidate_rule: Option<String>,
     pub candidate: Option<String>,
-    /// Whether the candidate decided otherwise; `None` where it was not
-    /// decided again ([`Self::note`] says why).
+    /// Whether the candidate decided otherwise; `None` where it was not decided again.
     pub differs: Option<bool>,
-    /// After the first row that differs: what the candidate would have seen
-    /// here is not on the tape.
+    /// After the first row that differs.
     pub taint: bool,
     /// What the re-decision needed and the tape did not hold.
     pub needs: Vec<String>,
@@ -94,12 +59,10 @@ impl Shadow {
         self.rows.iter().filter(|r| r.differs == Some(true)).count()
     }
 
-    /// The exit code `aterm drive replay --shadow` ends with: 1 when the
-    /// candidate decides a point otherwise; else 3 when a point was not
-    /// decided again (a turn end on another build, one the strict replay
-    /// never reached, a box no decision came of): what the candidate would
-    /// decide there the tape cannot say; else 0 — every point decided again,
-    /// and as recorded.
+    /// The exit code `aterm drive replay --shadow` ends with: 1 when the candidate decides a point
+    /// otherwise; else 3 when a point was not decided again (a turn end on another build, one the
+    /// strict replay never reached, a box no decision came of): what the candidate would decide
+    /// there the tape cannot say; else 0 — every point decided again, and as recorded.
     #[must_use]
     pub fn code(&self) -> u8 {
         if self.differs() > 0 {
@@ -111,8 +74,7 @@ impl Shadow {
         }
     }
 
-    /// The shadow as text: a heading, a line per decision (both sides, and
-    /// whether they differ), what each needed, and the BOUND line.
+    /// The shadow as text: a heading, a line per decision, what each needed, and the BOUND line.
     #[must_use]
     pub fn render(&self) -> String {
         let mut out = String::new();
@@ -180,12 +142,9 @@ impl Shadow {
 }
 
 /// The SHADOW of the tape `bytes` under `candidate` ([module docs](self)).
-///
 /// # Errors
-///
-/// A tape that does not read, one with no decision, a header this build
-/// cannot read (the candidate is made from the policy it carries), a
-/// candidate the policy's reader refuses.
+/// A tape that does not read, one with no decision, a header this build cannot read (the candidate
+/// is made from the policy it carries), a candidate the policy's reader refuses.
 pub fn shadow(bytes: &[u8], candidate: &Candidate) -> Result<Shadow, String> {
     let tape = show::open(bytes, false)?;
     let book = Book::open(&tape);

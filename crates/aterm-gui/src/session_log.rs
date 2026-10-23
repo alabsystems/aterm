@@ -614,8 +614,7 @@ impl SessionLog {
         self.log.continue_rows(carried);
     }
 
-    /// The last timeline row id this log issued, or the count it was continued at (read by the seamless update's id ceiling, as its callers are compiled: unix, and tests).
-    #[cfg(any(unix, test))]
+    /// The last timeline row id this log issued, or the count it was continued at (the seamless update's id ceiling; the view's head).
     pub(crate) fn row_head(&self) -> u64 {
         self.log.row_head()
     }
@@ -1554,13 +1553,21 @@ impl SessionLog {
         std::mem::take(&mut self.burst_rows)
     }
 
+    /// The `human` rows the burst marks owe the timeline, not taken (the timeline's debug cross-check).
+    #[cfg(debug_assertions)]
+    pub(crate) fn burst_rows_owed(&self) -> u32 {
+        self.burst_rows
+    }
+
     /// [`Self::person_input`] for a gesture no count names (a test's, or a log no store bound): delivered whole, as one that reached the program, `burst` its own.
     #[cfg(test)]
     pub(crate) fn human_input(&mut self, burst: bool, at: Stamp) {
         let c = self.person.as_ref().map(|p| p.counts()).unwrap_or_default();
         self.person_seen = self.person_seen.max(c.seq);
         self.reached_seen = self.reached_seen.max(c.reached);
-        let _ = self.deliver_person(true, true, (burst, false), true, c.seq, at);
+        let marked = self.deliver_person(true, true, (burst, false), true, c.seq, at);
+        // Its mark owes the timeline its `human` row, as every burst's does.
+        self.burst_rows += u32::from(marked);
     }
 
     fn deliver_person(
@@ -2520,7 +2527,7 @@ mod closed;
 pub(crate) use closed::ClosedSource;
 #[cfg(test)]
 pub(crate) use closed::{CLOSED_INDEX_CAP, CLOSED_SKELETONS, SKELETONS_BUILT};
-pub(crate) use closed::{ClosedKeep, ClosedLog, ClosedLogs};
+pub(crate) use closed::{ClosedExit, ClosedKeep, ClosedLog, ClosedLogs};
 
 #[path = "session_log_transcript.rs"]
 pub(crate) mod transcript;

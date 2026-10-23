@@ -719,7 +719,7 @@ fn a_rest_on_the_decks_header_opens_how_to_read() {
 }
 
 /// T-G12 through the App (Stats Deck v2 §12): the window's tree holds the
-/// deck's group, seven meters each said in its row's sentence for the
+/// deck's group, six meters each said in its row's sentence for the
 /// window's front tab and a group of one meter a core; an open lens is a
 /// group named "<Name> close-up" whose wells are named by their headings,
 /// the first well of a lens that takes the keys taking focus (the keyboard
@@ -739,15 +739,7 @@ fn the_tree_reads_the_deck_and_its_lens() {
     let names: Vec<&str> = group.meters.iter().map(|m| m.name.as_str()).collect();
     assert_eq!(
         names,
-        [
-            "CPU",
-            "GPU",
-            "Memory",
-            "Disk",
-            "Network",
-            "Tokens",
-            "Processes"
-        ]
+        ["CPU", "GPU", "Memory", "Disk", "Network", "Processes"]
     );
     assert_eq!(group.meters[0].words, r.sentence(Instrument::Cpu));
     assert_eq!(group.meters[2].words, r.sentence(Instrument::Memory));

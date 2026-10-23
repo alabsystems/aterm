@@ -85,7 +85,9 @@ fn run(tty: Tty, args: &[&str], reply: &[u8]) -> Seen {
     let slave = pty.slave.try_clone().expect("a slave copy");
     let mut command = aterm_uds::spawnfd::command(env!("CARGO_BIN_EXE_aterm-ctl"));
     for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("ATERM_") {
+        let name = key.to_string_lossy();
+        // The verify run's mark is no authority and stays (`VERIFY_RUN_VAR`).
+        if name.starts_with("ATERM_") && name != aterm_uds::process::VERIFY_RUN_VAR {
             command.env_remove(key);
         }
     }

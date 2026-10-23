@@ -2,25 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! THE WALK: a resumable cursor over one root, advanced in time slices.
-//!
-//! [`Walk::begin`] tests the root's spellings with [`refuse`] before any
-//! syscall, then opens it one component at a time from `/` with `O_NOFOLLOW`
-//! (so no link anywhere on the way is followed) and checks its volume
-//! (`fstatfs`: never remote or removable). [`Walk::diskwalk_slice`] then lists
-//! and descends until the injected clock says the slice is spent: the clock is
-//! read after every listing call and every child open, and the slice ends at
-//! the first such boundary at or past [`Policy::slice`] (design §10.5 rule 10:
-//! per-entry cost varies about 20×, so slices are bounded by time, not count).
-//!
-//! The cursor is the stack of open directories (at most [`Policy::max_depth`]
-//! deep), each with its level buffer, its listing's offset (held by its
-//! descriptor) and the child directories still to enter. [`Walker`] owns the
-//! generation: each start mints a new one and a superseded generation's
-//! [`Ticket`] never resumes anything (the BudgetedWalk model,
-//! `aterm_models_misc::budgeted_walk_model`).
-//!
-//! Directory records reach readers by message (the host copies the tree out);
-//! the walk holds no lock and owes no cleanup anything waits on.
 
 #[cfg(unix)]
 use std::collections::HashMap;
@@ -40,8 +21,7 @@ pub const SLICE: Duration = Duration::from_millis(4);
 /// The deepest a cursor goes; deeper folders are `too deep` rows.
 pub const MAX_DEPTH: u16 = 128;
 
-/// A root to walk: the spelling the kernel names (opened), and the one a
-/// shell or a person gave when it differs (tested too).
+/// A root to walk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootSpec {
     /// The canonical spelling.
@@ -70,8 +50,7 @@ pub struct Policy {
     pub mounts: Table,
     /// Read each file's private (unshared-clone) size: about 2.5× the cost.
     pub private: bool,
-    /// Keep a `(dev, inode)` map of multiply linked files for the walk's
-    /// first-seen and shared-out figures ([`LinkTotals`]).
+    /// Keep a `` map of multiply linked files for the walk's first-seen and shared-out figures.
     pub links_out: bool,
     /// A slice's budget.
     pub slice: Duration,
@@ -82,10 +61,9 @@ pub struct Policy {
 }
 
 impl Policy {
-    /// The default policy: 4 ms slices, 128 levels, no private sizes, no
-    /// link map, the native lister.
+    /// The default policy.
     #[must_use]
-    pub fn new(deny: Deny, mounts: Table) -> Self {
+    pub const fn new(deny: Deny, mounts: Table) -> Self {
         Self {
             deny,
             mounts,
@@ -119,8 +97,7 @@ pub struct LinkTotals {
     pub alloc_first_seen: u64,
     /// The allocation of inodes with a link outside the root.
     pub shared_out: u64,
-    /// What deleting the tree could free at most (clones aside):
-    /// `alloc_first_seen − shared_out`.
+    /// What deleting the tree could free at most (clones aside): `alloc_first_seen − shared_out`.
     pub frees_at_most: u64,
     /// Multiply linked inodes seen.
     pub linked_inodes: u64,
@@ -175,12 +152,8 @@ impl std::fmt::Debug for Walk {
 }
 
 impl Walk {
-    /// Test `root` with [`refuse`], open it fd-relative from `/` following
-    /// no link, check its volume, and stand at its first listing. No entry is
-    /// read yet.
-    ///
+    /// Test `root` with [`refuse`].
     /// # Errors
-    ///
     /// The [`Refusal`] the path test, the open or the volume check gave.
     pub fn begin(root: &RootSpec, policy: &Policy) -> Result<Walk, Refusal> {
         let canon = crate::refuse::canonical(&root.path).ok_or(Refusal::Relative)?;
@@ -203,12 +176,8 @@ impl Walk {
         }
     }
 
-    /// One slice: list and descend until the injected clock reads
-    /// [`Policy::slice`] past the slice's start, checked after every listing
-    /// call and every child open.
-    // COST: UNBOUNDED(entries) — one call's batch is bounded (16 KiB), but a
-    // directory of a million entries is a million `statx`es on Linux; the
-    // walker thread runs it, never the event loop (aterm-census --mainloop).
+    /// One slice: list and descend within [`Policy::slice`].
+    // COST: UNBOUNDED(entries) — one call's batch is bounded (16 KiB).
     pub fn diskwalk_slice(&mut self, now: &mut dyn FnMut() -> Instant) -> Step {
         match self.status {
             Status::Done => return Step::Done,
@@ -245,8 +214,7 @@ impl Walk {
         }
     }
 
-    /// Stop: every open directory is closed now, and the walk answers
-    /// [`Step::Cancelled`] from here on. What it recorded stays readable.
+    /// Stop: every open directory is closed now.
     pub fn cancel(&mut self) {
         if self.status == Status::Walking {
             self.status = Status::Cancelled;
@@ -309,8 +277,7 @@ impl Walk {
         self.root_dev
     }
 
-    /// Everything listed so far, summed (a lower bound while walking; the
-    /// root's subtree once done).
+    /// Everything listed so far, summed.
     #[must_use]
     pub fn partial(&self) -> Sums {
         if self.status == Status::Done {
@@ -376,9 +343,7 @@ pub enum Sliced {
     Stale,
 }
 
-/// One walk in flight, its generation and whether its host owes it a slice
-/// (`armed`). A start supersedes the walk in flight; a superseded ticket
-/// never resumes; a cancel leaves nothing armed.
+/// One walk in flight, its generation and whether its host owes it a slice (`armed`).
 #[derive(Debug, Default)]
 pub struct Walker {
     minted: u64,
@@ -393,11 +358,8 @@ impl Walker {
         Self::default()
     }
 
-    /// Begin walking `root`, superseding the walk in flight (its ticket goes
-    /// stale), and arm. A refused root changes nothing.
-    ///
+    /// Begin walking `root`, superseding the walk in flight (its ticket goes stale), and arm.
     /// # Errors
-    ///
     /// The [`Refusal`] [`Walk::begin`] gave.
     #[cfg_attr(
         any(test, debug_assertions),
@@ -418,9 +380,7 @@ impl Walker {
         })
     }
 
-    /// One slice of the walk `ticket` names. A superseded ticket walks
-    /// nothing ([`Sliced::Stale`]); a walk that ended answers its end again
-    /// and walks nothing. The walk's end disarms.
+    /// One slice of the walk `ticket` names.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -496,8 +456,7 @@ impl Walker {
         Sliced::Step(step)
     }
 
-    /// Cancel the walk in flight: its directories close and nothing stays
-    /// armed. What it recorded stays readable.
+    /// Cancel the walk in flight: its directories close and nothing stays armed.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -546,7 +505,7 @@ impl Walker {
     }
 
     /// Take the walk out (its ticket goes stale; nothing stays armed).
-    pub fn take(&mut self) -> Option<Walk> {
+    pub const fn take(&mut self) -> Option<Walk> {
         self.armed = false;
         self.walk.take()
     }
@@ -565,15 +524,10 @@ pub struct SizeFull {
     pub links: Option<LinkTotals>,
 }
 
-/// A whole walk in one call for a one-shot survey (design §10.7): slices until
-/// the end or until `budget` has passed on `now`. A root that is a regular
-/// file answers its own allocation.
-///
+/// A whole walk in one call for a one-shot survey (design §10.7).
 /// # Errors
-///
 /// The [`Refusal`] the root earned.
-// COST: UNBOUNDED(entries) — a whole walk; the harness's survey and the CLI
-// call it on their own threads, never the event loop.
+// COST: UNBOUNDED(entries) — a whole walk; the harness's survey and the CLI call it on their own.
 pub fn diskwalk_size_full(
     root: &RootSpec,
     policy: &Policy,
@@ -649,7 +603,7 @@ fn file_root(root: &RootSpec, policy: &Policy) -> Result<SizeFull, Refusal> {
 
 /// An open's errno as a refusal.
 #[cfg(unix)]
-pub(crate) fn errno_refusal(errno: i32) -> Refusal {
+pub(crate) const fn errno_refusal(errno: i32) -> Refusal {
     match errno {
         libc::ENOENT => Refusal::Gone,
         libc::ELOOP => Refusal::Link,
@@ -665,8 +619,7 @@ pub struct LevelRow {
     pub name: std::ffi::OsString,
     /// A directory.
     pub dir: bool,
-    /// A directory's direct entry count, where the platform reads it without
-    /// listing (macOS).
+    /// A directory's direct entry count, where the platform reads it without listing (macOS).
     pub direct_entries: Option<u32>,
     /// A file's allocation.
     pub alloc: u64,
@@ -676,14 +629,9 @@ pub struct LevelRow {
     pub mount_boundary: bool,
 }
 
-/// A too-broad root's one-level listing (design §10.4 "broad roots"): names,
-/// kinds and direct entry counts, nothing walked. A protected child is named
-/// from the listing and never stat'ed; a remote mount point is never asked.
-///
+/// A too-broad root's one-level listing: names, kinds and direct entry counts, nothing walked.
 /// # Errors
-///
-/// The [`Refusal`] the root earned (anything but [`Refusal::TooBroad`], which
-/// is what this listing is for).
+/// The [`Refusal`] the root earned.
 pub fn list_one_level(root: &RootSpec, policy: &Policy) -> Result<Vec<LevelRow>, Refusal> {
     let canon = crate::refuse::canonical(&root.path).ok_or(Refusal::Relative)?;
     match refuse(
@@ -705,13 +653,8 @@ pub fn list_one_level(root: &RootSpec, policy: &Policy) -> Result<Vec<LevelRow>,
     }
 }
 
-/// One directory's direct entry count without listing it where the platform
-/// can (macOS `ATTR_DIR_ENTRYCOUNT`, 3–20 µs), else by listing its names: the
-/// slow tier's look at a build profile directory outside every root
-/// (design §10.8).
-///
+/// One directory's direct entry count without listing it where the platform can.
 /// # Errors
-///
 /// The [`Refusal`] the path earned.
 pub fn entry_count_of(path: &Path, policy: &Policy) -> Result<u32, Refusal> {
     let canon = crate::refuse::canonical(path).ok_or(Refusal::Relative)?;
@@ -787,8 +730,7 @@ pub(crate) mod imp {
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
-    /// Open `path` one component at a time from `/`, each with `O_NOFOLLOW`
-    /// relative to its parent: no link anywhere on the way is followed.
+    /// Open `path` one component at a time from `/`, each with `O_NOFOLLOW` relative to its parent.
     pub(super) fn open_chain(path: &Path) -> Result<OwnedFd, Refusal> {
         let mut fd = open_slash()?;
         for c in path.components() {
@@ -801,8 +743,7 @@ pub(crate) mod imp {
         Ok(fd)
     }
 
-    /// [`open_chain`], then the volume test on the open descriptor: what a
-    /// marker look ([`crate::look`]) opens.
+    /// [`open_chain`], then the volume test on the open descriptor: what a marker look opens.
     pub(crate) fn open_checked(path: &Path) -> Result<OwnedFd, Refusal> {
         let fd = open_chain(path)?;
         if let Some(why) = volume_refusal_of(&fd) {
@@ -815,8 +756,6 @@ pub(crate) mod imp {
     fn open_child(parent: &OwnedFd, name: &OsStr) -> Result<OwnedFd, Refusal> {
         aterm_dirfd::openat(parent, name, dir_flags(), Mode::empty()).map_err(|e| {
             match e.raw_os_error() {
-                // `O_NOFOLLOW | O_DIRECTORY` on a link answers either; tell
-                // them apart with one no-follow stat of the name.
                 libc::ENOTDIR | libc::ELOOP => link_or_file(parent, name),
                 errno => errno_refusal(errno),
             }
@@ -914,9 +853,7 @@ pub(crate) mod imp {
         None
     }
 
-    /// `fstat` of an open descriptor: (dev, ino, allocated bytes, flags). Every cast reads a
-    /// field through its `libc` alias (`dev_t`, `ino_t`, `blkcnt_t`), which clippy leaves alone
-    /// on every platform, so no cast lint is expected here.
+    /// `fstat` of an open descriptor: (dev, ino, allocated bytes, flags).
     fn fstat_of(fd: &OwnedFd) -> Result<(u64, u64, u64, u32), Refusal> {
         // SAFETY: `stat` is integers: all-zero is a value.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -1121,8 +1058,7 @@ pub(crate) mod imp {
     }
 
     impl Walk {
-        /// One unit of work on the cursor's top directory: a listing call, a
-        /// child open, or folding a finished directory into its parent.
+        /// One unit of work on the cursor's top directory.
         pub(super) fn unit(&mut self) -> Unit {
             let Walk {
                 stack,
@@ -1207,7 +1143,6 @@ pub(crate) mod imp {
                     }
                     other => {
                         // A different device (the open crossed a mount), or a
-                        // refusal; an opened descriptor closes here.
                         let why = other.err();
                         let r = tree.rec_mut(child);
                         match why {
@@ -1233,7 +1168,6 @@ pub(crate) mod imp {
                 Next::Nothing => {}
                 Next::Push(frame) => {
                     // Its parent's listing gave the count `ATTR_DIR_ENTRYCOUNT`
-                    // read; its own listing counts again from zero.
                     let r = tree.rec_mut(frame.dir);
                     r.direct_entries = 0;
                     r.direct_exec = 0;
@@ -1271,7 +1205,6 @@ pub(crate) mod imp {
             }
             let os = OsStr::from_bytes(name).to_os_string();
             let child = canon.join(&os);
-            // Named from the listing alone: a protected child is never stat'ed.
             if let Some(why) = policy.deny.denies(&child) {
                 rows.push(LevelRow {
                     name: os,

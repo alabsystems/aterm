@@ -1,45 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! HarnessModelSwitch, Tier-1: the live upgrade's model switch, driven from every
-//! reachable state of the derived model in every configuration of its constants and
-//! projected back onto it.
-//!
-//! Driven: the model's `Visit` is the real `upgrade_models::model_read_step`, the read
-//! `upgrade_drive::model_judge` wraps for the drive's visit, the host's pre-filter and a
-//! riding restart: its early return, `live_model_at` over a real tail, the settle step
-//! (`ModelRecord::settle`), the model rule (`model_due`), the ride's guard (`ride_bar`;
-//! the model's `phase > 0 && ann == 1`), the cache's coldness (`last_answer_at`) and the
-//! due clock (`ModelRecord::due_clock`), in that order; then `model_to` (with the ladder,
-//! `model_moves_now`) as `visit_models` and `riding_model_in` call it. The relaunches
-//! are the real record write before the line (`ModelRecord::asked`), its take-back when
-//! the line is not typed (`ModelRecord::take_back`, the model's `Refused`), the line's
-//! model (`upgrade_models::line_model`; the model's `flag = 2` is a dropped `--model`
-//! the record marks failed) and what the new process runs (`live_model_at`).
-//!
-//! Transcribed, not driven (a change there passes this bind): the I/O of `model_judge`
-//! and `model_read_kept`; the offer (`upgrade_models::offered`; the model's `tgt` stands
-//! for its two shapes and none); `visit_models`' carried model (`St::carried_model`),
-//! its drop of a barred ride (`ride_dropped`: the model's `ann = 0`),
-//! `St::release_unridden` and the `build_restart` it hands `model_to`; the pre-filter
-//! `model_wants_a_look`; `St::for_target`, `St::give_up`, `St::unsent` and the READY
-//! handshake; `relaunch::relaunch`'s ask, the sites' call of `line_model`
-//! (`relaunch::plan` through `upgrade_drive::line_model_of`) and `relaunch::with_model`
-//! (a model replaces the launch's `--model`, an empty one drops it, none keeps it); and
-//! which view (managed or native) a session is judged by — the model has one.
-//!
-//! Negative controls: a transcription of `model_read_step` ([`Parts`]), shown equal to
-//! the real function on every state, then with one part at a time in a defect shape;
-//! the relaunch bind has its own. A decision answering the other way disagrees on every
-//! state.
-//!
-//! Not modelled: the offer is only every seed model, `claude-opus-5` alone, or nothing
-//! (so the only move is into `claude-opus-5-5`); a person never relaunches by hand;
-//! `--now` never re-arms a gave-up upgrade; a restart for another reason is modelled
-//! only outside an announcement, and always lands; a `/model` chosen since the launch
-//! (`hand_model_in`) is not modelled; a person's own launch with an id the record marks
-//! failed is never made; the clock never steps back. `[1m]` spellings, aliases and
-//! times within each clock band are exercised by the concretizations, not the model.
+//! Tier-1 conformance and negative-control suite for `HarnessModelSwitch`.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, PoisonError};
@@ -215,12 +177,9 @@ fn concretize(m: &Model, s: &Vars, k: usize, variant: usize) -> Inputs {
         // A relaunch dropped this harness's failed ask: no `--model` at all.
         None
     } else if constant(m, "PersonFlag") == 1 {
-        // A person's own id: one the list ranks lower, or does not name —
-        // never the one this harness asks for.
         let flags = [F51, O5, SONNET];
         Some(flags[pick(k + 2, variant, flags.len())].to_string())
     } else if constant(m, "PersonFlag") == 2 {
-        // A person's family alias, which only the build resolves.
         let aliases = ["fable", "opus"];
         Some(aliases[pick(k + 2, variant, aliases.len())].to_string())
     } else {
@@ -233,7 +192,6 @@ fn concretize(m: &Model, s: &Vars, k: usize, variant: usize) -> Inputs {
         let d = [None, Some("opus"), Some(O55)];
         d[pick(k + 3, variant, d.len())].map(str::to_string)
     };
-    // Seconds within each clock band: its edges.
     let set_age = match (s["set"], s["sage"]) {
         (1, 0) => [0, MODEL_SETTLE_S - 1][pick(k + 4, variant, 2)],
         (1, _) => [MODEL_SETTLE_S, 10 * MODEL_SETTLE_S][pick(k + 4, variant, 2)],
@@ -278,8 +236,6 @@ fn concretize(m: &Model, s: &Vars, k: usize, variant: usize) -> Inputs {
         due_to,
         due_since,
     };
-    // The transcript: its last answer, as old as the cache is warm or cold
-    // (the band's edges), and a `/model` result after it when `cmd`.
     let age = if s["cold"] == 1 {
         [CACHE_COLD_S, 5 * CACHE_COLD_S][pick(k + 7, variant, 2)]
     } else {
@@ -288,7 +244,6 @@ fn concretize(m: &Model, s: &Vars, k: usize, variant: usize) -> Inputs {
     let at = NOW - age;
     let mut started = [Some(VISIT_STARTED), None][pick(k + 8, variant, 2)];
     let tail = match (id_of(s["live"]), s["cmd"]) {
-        // Only a synthetic row: an answer's time, and no model.
         (None, _) => answer("<synthetic>", at),
         (Some(id), 1) => {
             let display = if pick(k + 9, variant, 2) == 1 {
@@ -298,8 +253,6 @@ fn concretize(m: &Model, s: &Vars, k: usize, variant: usize) -> Inputs {
             };
             format!("{}\n{}", answer(O5, at), set_model(&display, at))
         }
-        // The relaunched process has not answered yet: what runs is its
-        // launch flag, the transcript's last answer the process before it.
         (Some(O55), _) if s["flag"] == 1 && variant == 1 => {
             started = Some(at + 1);
             answer(O5, at)
@@ -323,10 +276,7 @@ fn concretize(m: &Model, s: &Vars, k: usize, variant: usize) -> Inputs {
     }
 }
 
-/// The record projected back onto the model's record variables of `s`. A
-/// record the model cannot hold (another model asked for or due, a clock that
-/// names no model) projects to a value no model state has, so it is a
-/// disagreement, never a silent match.
+/// The record projected back onto the model's record variables of `s`.
 fn with_record(s: &Vars, rec: &ModelRecord) -> Vars {
     let mut v = s.clone();
     let base = |m: &str| m.strip_suffix("[1m]").unwrap_or(m).to_string();
@@ -484,9 +434,7 @@ struct ReadOut {
 }
 
 /// A visit's read from its inputs: `model_read_step`, or its transcription, the
-/// round's `model_list` carried. Its parameter binds exactly the fields its memo key
-/// holds ([`ReadKey`]) and leaves `build` and `announced` to [`decide`], so a read
-/// that comes to need either names it here, beside the key.
+/// round's `model_list` carried.
 fn read(
     v: &Visitor<'_>,
     Inputs {
@@ -556,8 +504,7 @@ fn visit(v: &Visitor<'_>, i: &Inputs) -> Visited {
 }
 
 /// Exactly what [`read`] is handed of a visit's inputs: the fields its parameter
-/// binds. Not `build` or `announced`, which only [`decide`] reads; the list, the
-/// catalog and the clock are the same at every visit.
+/// binds.
 #[derive(PartialEq, Eq, Hash)]
 struct ReadKey {
     tail: String,
@@ -581,8 +528,6 @@ struct ReadKey {
 }
 
 fn read_key(i: &Inputs) -> ReadKey {
-    // Destructured whole, both: a field added to either must be placed in
-    // the key or named unread here before this compiles.
     let Inputs {
         tail,
         started,
@@ -628,9 +573,7 @@ fn read_key(i: &Inputs) -> ReadKey {
 
 /// Every read key met in this process, numbered in the order first met: a
 /// concretization's read is named by its number ([`Space::slots`]), and each
-/// visitor keeps the read it made at that number ([`Visits`]). One table for
-/// the process, so a number means one key whichever test or configuration
-/// asks.
+/// visitor keeps the read it made at that number ([`Visits`]).
 static KEYS: LazyLock<Mutex<HashMap<ReadKey, usize>>> = LazyLock::new(Mutex::default);
 
 /// The relaunch bind's actions, in the order it checks them.
@@ -683,8 +626,6 @@ impl Space {
             .map(|(k, s)| [0, 1].map(|variant| concretize(&m, s, k, variant)))
             .collect();
         let slots = {
-            // A test that failed elsewhere never leaves the table half
-            // written (an insert is whole or absent), so its poison is moot.
             let mut keys = KEYS.lock().unwrap_or_else(PoisonError::into_inner);
             inputs
                 .iter()
@@ -706,12 +647,7 @@ impl Space {
     }
 }
 
-/// A visitor and every read it has made, by its key's number ([`KEYS`]). A read is a
-/// function of its key alone (every part is pure; the clock is [`NOW`]), so one read
-/// serves every state and configuration that concretizes to that key; [`decide`],
-/// which also reads `build` and `announced`, runs at every visit. The transcript
-/// parses inside the reads dominate the bind's cost: ~62,000 concretizations share
-/// ~15,000 keys.
+/// A visitor and every read it has made, by its key's number ([`KEYS`]).
 struct Visits<'a> {
     by: Visitor<'a>,
     reads: Vec<Option<ReadOut>>,
@@ -740,7 +676,7 @@ impl<'a> Visits<'a> {
 /// `v`, projected back and checked against the model's `Visit` — the verdict
 /// against the model's rule, the ride's guard against its ride branch (`ann`
 /// cleared where it bars), the ladder against its guard, the riding model
-/// against `Ride`. Returns every disagreement.
+/// against `Ride`.
 fn visit_disagreements(space: &Space, v: &mut Visits<'_>) -> Vec<String> {
     let ladder: &Ladder = match &v.by {
         Visitor::Real => &models::model_moves_now,
@@ -762,7 +698,6 @@ fn visit_disagreements(space: &Space, v: &mut Visits<'_>) -> Vec<String> {
             let mut after = with_record(s, &got.record);
             after.insert("fresh", 1);
             after.insert("mto", index_of(got.model_to.as_deref()));
-            // A barred ride: the round forgets the model.
             if got.ride_barred.is_some() {
                 after.insert("ann", 0);
             }
@@ -772,15 +707,12 @@ fn visit_disagreements(space: &Space, v: &mut Visits<'_>) -> Vec<String> {
                 ));
                 continue;
             }
-            // The rule's verdict is the model's: due on a model it could read.
             let due =
                 matches!(&got.verdict, ModelVerdict::Due { to, .. } if index_of(Some(to)) == 1);
             let model_due = want["due"] == 1 && want["live"] > 0;
             if due != model_due {
                 bad.push(format!("the rule said {:?} at {s:?}", got.verdict));
             }
-            // The cache and the ladder are the model's guard, wherever a move
-            // is due.
             if due {
                 let moves = ladder(got.cold, i.build, got.due_for_s).is_some();
                 let guard = want["cold"] == 1 || i.build || want["dover"] == 1;
@@ -791,8 +723,6 @@ fn visit_disagreements(space: &Space, v: &mut Visits<'_>) -> Vec<String> {
                     ));
                 }
             }
-            // A restart made for another reason carries exactly the due move
-            // (the model's `Ride`).
             if index_of(got.riding.as_deref()) != i64::from(model_due) {
                 bad.push(format!("the riding model is {:?} at {s:?}", got.riding));
             }
@@ -803,7 +733,7 @@ fn visit_disagreements(space: &Space, v: &mut Visits<'_>) -> Vec<String> {
 
 /// A transcript tail that names `s`'s live model the way the real code reads
 /// it: its last answer, a `/model` result newer than that answer (`cmd`), or
-/// (unread) only a synthetic row. Every row predates [`STARTED`].
+/// (unread) only a synthetic row.
 fn tail_of(s: &Vars) -> Vec<String> {
     match (id_of(s["live"]), s["cmd"]) {
         (None, _) => vec![answer("<synthetic>", NOW - 100)],
@@ -845,9 +775,6 @@ fn relaunch_disagreements(
                 }
             };
             let i = &space.inputs[k][1];
-            // The model the relaunch asks for: the upgrade's `model_list`
-            // (announced, or a gave-up upgrade's late READY), the due one a
-            // restart made for another reason carries, or none riding it.
             let asks = match action {
                 "Ride" => Some(O55),
                 "Restart" => None,
@@ -863,22 +790,12 @@ fn relaunch_disagreements(
             }
             let mut after = with_record(s, &record);
             if action != "Refused" {
-                // The launch's own flag on the process: this harness's (the
-                // list's id, as it writes it), none once a relaunch dropped
-                // it, or the person's (`claude-fable-5-1` in the model — an
-                // alias or another model there is a visit's variant only, not
-                // a relaunch's).
                 let on_line = match s["flag"] {
                     1 => Some(O55),
                     0 if constant(m, "PersonFlag") == 1 => Some(F51),
-                    // A person's alias: only the build resolves it, so what
-                    // runs is read off the transcript.
                     0 if constant(m, "PersonFlag") == 2 => Some("fable"),
                     _ => None,
                 };
-                // The line: the model it asks for (over the record as the visit
-                // left it, before the ask), then `relaunch::with_model` as written —
-                // an empty one drops every `--model`, none keeps the launch's.
                 let launch = match line(asks, on_line, &i.record).as_deref() {
                     Some("") => None,
                     Some(model) => Some(model.to_string()),
@@ -886,7 +803,6 @@ fn relaunch_disagreements(
                 };
                 let mut tail = tail_of(s);
                 if action == "RelaunchRunsOther" {
-                    // The new process answered, on another model.
                     tail.push(format!(
                         r#"{{"type":"assistant","isSidechain":false,"timestamp":"{}","message":{{"model":"{O5}"}}}}"#,
                         rfc3339_utc(i64::try_from(STARTED + 10).expect("small"))
@@ -903,9 +819,6 @@ fn relaunch_disagreements(
                     "cmd",
                     i64::from(live.as_ref().is_some_and(|l| l.by_command)),
                 );
-                // This harness's `--model` on the new line, else none where a
-                // line of its own once replaced the person's (`2`), else the
-                // launch's own flags (`0`).
                 let ours = launch
                     .as_deref()
                     .is_some_and(|l| l.strip_suffix("[1m]").unwrap_or(l) == O55);
@@ -952,15 +865,11 @@ fn shipped_line(asks: Option<&str>, launch: Option<&str>, r: &ModelRecord) -> Op
 
 #[test]
 fn upgrade_model_switch_is_the_models_on_every_reachable_state() {
-    // Each visitor's reads are shared by every configuration ([`Visits`]).
     let mut real = Visits::new(Visitor::Real);
     let mut copy = Visits::new(Visitor::Copy(shipped()));
     for (default_fable, person_flag, build) in CONFIGS {
         let space = Space::new(configured(default_fable, person_flag, build));
         let states = &space.states;
-        // A person's launch alias keeps everything, so its space is the one with
-        // nothing ever asked for. A barred ride ends where it was found and a refused
-        // signal leaves no ask, so the smallest other space is ~2700 states.
         let floor = if person_flag == 2 { 100 } else { 2500 };
         assert!(
             states.len() > floor,
@@ -975,7 +884,6 @@ fn upgrade_model_switch_is_the_models_on_every_reachable_state() {
             wrong.len(),
             wrong.first()
         );
-        // The controls' harness is the shipped function, part for part.
         for (k, s) in states.iter().enumerate() {
             for variant in 0..2 {
                 let (i, slot) = (&space.inputs[k][variant], space.slots[k][variant]);
@@ -1010,8 +918,7 @@ fn upgrade_model_switch_is_the_models_on_every_reachable_state() {
 }
 
 /// A `model_to` that answers the other way disagrees with the model on every state
-/// and both concretizations. A sample goes through every installed tier: accepted as
-/// the real code produced it, refused with the decision flipped.
+/// and both concretizations.
 #[test]
 fn upgrade_model_switch_refuses_the_opposite_decision() {
     let space = Space::new(configured(0, 0, 0));
@@ -1125,8 +1032,6 @@ fn upgrade_model_switch_binds_catch_every_pre_fix_shape() {
     fn base(m: &str) -> String {
         m.strip_suffix("[1m]").unwrap_or(m).to_string()
     }
-    // A rule without memory: a person's choice read only off the launch flag
-    // and a `/model` newer than the last answer.
     let no_memory = |list: &Priority,
                      live: Option<&LiveModel>,
                      offered: &[String],
@@ -1137,8 +1042,6 @@ fn upgrade_model_switch_binds_catch_every_pre_fix_shape() {
         rec.human.clear();
         models::model_due(list, live, offered, launch, None, &rec)
     };
-    // The failed record not read: a model the relaunch did not take is asked
-    // for again.
     let no_failed = |list: &Priority,
                      live: Option<&LiveModel>,
                      offered: &[String],
@@ -1149,7 +1052,6 @@ fn upgrade_model_switch_binds_catch_every_pre_fix_shape() {
         rec.failed.clear();
         models::model_due(list, live, offered, launch, default, &rec)
     };
-    // An off-list model's missing rank read as ranked last.
     let off_list_last = |list: &Priority,
                          live: Option<&LiveModel>,
                          offered: &[String],
@@ -1164,7 +1066,6 @@ fn upgrade_model_switch_binds_catch_every_pre_fix_shape() {
         }
         models::model_due(&list, live, offered, launch, default, rec)
     };
-    // A ladder that moves on a cold cache only.
     let cold_only = |cold: bool, _build: bool, _due: u64| cold.then_some("cache-cold");
     let cold_only_to =
         |announced: Option<&str>, v: &ModelVerdict, cold: bool, _build: bool, _due: u64| {
@@ -1173,12 +1074,10 @@ fn upgrade_model_switch_binds_catch_every_pre_fix_shape() {
                 _ => None,
             })
         };
-    // A decision re-taken at every visit.
     let retaken =
         |_announced: Option<&str>, v: &ModelVerdict, cold: bool, build: bool, due: u64| {
             models::model_to(None, v, cold, build, due)
         };
-    // A clock an unreadable visit restarts.
     let unknown_clears = |r: &mut ModelRecord, v: &ModelVerdict, now: u64| {
         let v = match v {
             ModelVerdict::Keep("model-unknown") => &ModelVerdict::Keep("model-current"),
@@ -1186,9 +1085,6 @@ fn upgrade_model_switch_binds_catch_every_pre_fix_shape() {
         };
         r.due_clock(v, now)
     };
-    // A settle step that never records a failure (the ask stays pending),
-    // one that never records an application, and one whose failed arm does
-    // not read `applied`.
     let never_fails = |r: &mut ModelRecord, live: Option<&LiveModel>, _now: u64| {
         let at = r.set_at;
         r.settle(live, at)
@@ -1204,7 +1100,6 @@ fn upgrade_model_switch_binds_catch_every_pre_fix_shape() {
         let asked = r.set.clone();
         let out = r.settle(live, now);
         let verified = out.verified.is_some();
-        // What it verified now stays verified; the earlier ones come back.
         r.applied = applied
             .into_iter()
             .chain(verified.then_some(asked))
@@ -1212,8 +1107,6 @@ fn upgrade_model_switch_binds_catch_every_pre_fix_shape() {
         out
     };
 
-    // The ride's guard with one law missing at a time: (a) the record not read,
-    // (b) a person's choice not read, (c) an off-list model read as ranked last.
     let ride_no_record = |carried: &str,
                           list: &Priority,
                           live: Option<&LiveModel>,
@@ -1355,7 +1248,6 @@ fn upgrade_model_switch_binds_catch_every_pre_fix_shape() {
             },
         ),
     ];
-    // The committed configuration catches every one.
     let space = Space::new(configured(0, 0, 0));
     for (name, parts) in controls {
         let wrong = visit_disagreements(&space, &mut Visits::new(Visitor::Copy(parts)));
@@ -1368,7 +1260,6 @@ fn upgrade_model_switch_binds_catch_every_pre_fix_shape() {
         );
     }
 
-    // The relaunch bind's own.
     let no_ask = |_r: &mut ModelRecord, _model: &str, _now: u64| {};
     let ask_untimed = |r: &mut ModelRecord, model: &str, _now: u64| {
         model.clone_into(&mut r.set);
@@ -1380,8 +1271,6 @@ fn upgrade_model_switch_binds_catch_every_pre_fix_shape() {
     let flag_ignored = |t: &str, b: Option<&Baked>, _l: Option<&str>, s: Option<u64>| {
         models::live_model_at(t, b, None, s)
     };
-    // A line that keeps the launch's `--model` when it asks for none, even this
-    // harness's own ask recorded failed.
     let keeps_every_flag =
         |asks: Option<&str>, _l: Option<&str>, _r: &ModelRecord| asks.map(str::to_owned);
     let relaunch_controls: [(&str, &Ask, &Refuse, &Line, &LiveAt); 6] = [

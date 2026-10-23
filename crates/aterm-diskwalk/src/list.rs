@@ -58,7 +58,7 @@ pub(crate) struct EntryRef<'a> {
 #[cfg(unix)]
 impl EntryRef<'_> {
     /// An entry the lister knows only by name and a failure.
-    pub(crate) fn failed(name: &[u8], errno: i32) -> EntryRef<'_> {
+    pub(crate) const fn failed(name: &[u8], errno: i32) -> EntryRef<'_> {
         EntryRef {
             name,
             kind: Kind::Other,
@@ -357,7 +357,7 @@ pub(crate) mod bulk {
             self.buf
         }
 
-        fn attrs(&self) -> AttrList {
+        const fn attrs(&self) -> AttrList {
             AttrList {
                 bitmapcount: ATTR_BIT_MAP_COUNT,
                 reserved: 0,
@@ -833,7 +833,7 @@ pub(crate) mod portable {
     }
 
     impl Portable {
-        pub(crate) fn new(skip: Vec<OsString>, buf: Vec<u8>) -> Self {
+        pub(crate) const fn new(skip: Vec<OsString>, buf: Vec<u8>) -> Self {
             Self {
                 dir: None,
                 skip,

@@ -1,86 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! CLAUDE CODE'S AGENTS PANEL — the rows Claude Code 2.1.304 draws under the
-//! composer's footer row while background agents or workflows run (`● main`,
-//! `◯ general-purpose  <activity>  10h 9m 42s · ↓ 613.6k tokens`, `◯ sweep
-//! ▰▰▰▰▰▱▱▱  3/4 · 4h10m · ↓ 1.0m tokens`), read ONE ROW AT A TIME as pure
-//! functions: [`parse_row`] names the row's kind and the pane columns of its
-//! parts, its `pointer` the row the person has selected or hovers. The
-//! panel as a whole — where it starts under the footer, where it stops — is
-//! placed by its one locator, `aterm_agent::harness::footer::agents_panel_under`,
-//! which pushes each parsed row into an [`AgentsPanel`] (fixed arrays: `Copy`,
-//! nothing allocated).
-//!
-//! WHAT IS READ, AND FROM WHERE. Read in the 2.1.304 bundle (the managed store
-//! build, 2026-10-19; its panel `TQ`, main row `bie`, agent row `vie`, idle
-//! summary `Cie`, workflow row `BB`, status parts `PHe`), and its main and
-//! agent rows MEASURED on that build in the lab the same day
-//! (`fixtures/claude-2.1.304-agents-panel*.txt`: the blank under the footer,
-//! `⏺ main`, `◯ general-purpose  bling probe … 7s · ↓ 6.2k tokens`, and the
-//! `❯ ` of a selected row, main's or the agent's, while the footer row says
-//! `↑/↓ to select` or `Enter to view · x to stop`). Its workflow, nested,
-//! worded, `↓ N more` and idle-summary rows are not yet seen on a screen of
-//! that build: the tests build them from the bundle's grammar and say so,
-//! beside the older builds' captures (`fixtures/wait_bg.out`, `wait_bg2.out`,
-//! `claude-goal-active-suggestion.txt`):
-//!
-//! * THE CONTAINER is a column with `marginTop: 1` (the blank row under the
-//!   footer; older builds drew none) and `paddingRight: 2`: the main row, at
-//!   most five task rows (`tQ = 5`), a `  ↓ N more` row (or a lone space when
-//!   the window is at its end), then the workflow rows. Claude repaints it
-//!   every 1000 ms while any row is active.
-//! * EVERY ROW opens on a two-cell prefix — `❯ ` ([`POINTER`]) while selected
-//!   or hovered, else two spaces — then, on a nested agent, `"  " × (depth −
-//!   1)` and `├ ` or `└ ` ([`TREE`]), then the bullet and a space. The bullet
-//!   is `⏺` (`●` off macOS) on the transcript being VIEWED, `◯` on every
-//!   other row ([`BULLETS`]; `○` is accepted beside them), `⏸` on a workflow
-//!   paused on a rate limit ([`PAUSED`]). The glyph never says running or
-//!   done: Claude says that by the bullet's COLOUR alone (success, error,
-//!   warning), which a reader of text cannot see — the host compares the
-//!   cells.
-//! * THE MAIN ROW is the bullet and ` main` ([`anchor`] `panel.main`), with
-//!   `↑ N more` at its right when task rows are scrolled above the window.
-//! * AN AGENT ROW is its name (the registered name, else the agent type, at
-//!   most 28 cells, padded, ` (+N)` after it for hidden descendants), two
-//!   spaces, its activity (the progress summary, else the description,
-//!   truncated with `…`), at least one space, and its status right-aligned:
-//!   `elapsed · ↓ N tokens`, then ` · N queued`. The elapsed time is
-//!   `formatDuration` (`Ns`, `Mm Ss`, `Hh Mm Ss`, `Dd Hh Mm`) or a word:
-//!   `awaiting approval`, `idle`, `waiting`; the count is `formatNumber`
-//!   (`999`, `613.6k`, `1.0m`) after `↓` (the agent has used a tool) or `↑`.
-//!   A row a `subagentStatusLine` decorates draws its command's output in
-//!   place of the name and status: it parses as an agent row with no status.
-//!   The status's link slot is empty in 2.1.304 (its builder returns
-//!   nothing) and is not read.
-//! * AN IDLE SUMMARY ROW is `N idle agent` / `N idle agents`.
-//! * A WORKFLOW ROW is its name, two spaces, its progress bar (`▰` filled in
-//!   the default ink, `▱` empty and dim, 20, 12 or 8 cells, or `█`/`░` under
-//!   Ghostty: [`BAR_FILL`], [`BAR_EMPTY`]; filled = ⌊done·W/total⌋), two
-//!   spaces, then segments joined ` · `: `done/total`, `formatBarElapsed`
-//!   (`Ns`, `MmSSs`, `HhMMm`, `DdHHh`), `↓ N tokens` (or a bare `↓ N` in a
-//!   narrow row), and the `⚠ Large workflow · /workflows to stop` warning.
-//!   Builds before 2.1.301 drew `done/total agents done` and a
-//!   `formatDuration` elapsed, with the description before it and often no
-//!   bar ([`PROGRESS_OLD`]); both are read.
-//!
-//! COLUMNS. Every [`Span`] is in PANE COLUMNS, counted with the caller's
-//! [`Width`]: the GUI's pane text holds one char per cell (a wide glyph's
-//! right half is its own space), so it passes [`one_cell`]; text whose wide
-//! glyphs stand alone passes `aterm_grapheme::char_width` (this crate links
-//! nothing, so the width table comes from the caller).
-//!
-//! WHAT IS NOT DONE HERE. Nothing decides a row's colour, nor whether an
-//! agent is stuck: the fold over successive readings is the harness's
-//! (`aterm_agent::harness::agents`).
+//! CLAUDE CODE'S AGENTS PANEL.
 
-/// The pointer `❯ ` a selected or hovered row opens with, in column 0
-/// (`figures.pointer`).
+/// The pointer `❯ ` a selected or hovered row opens with, in column 0 (`figures.pointer`).
 pub const POINTER: char = '\u{276F}';
 
-/// The bullets of the panel's rows: `◯` (`figures.circle`) on a row not
-/// viewed, `⏺` (macOS) or `●` on the transcript viewed, and `○`, accepted as
-/// a hollow one.
+/// The bullets of the panel's rows.
 pub const BULLETS: [char; 4] = ['\u{25EF}', '\u{25CB}', '\u{23FA}', '\u{25CF}'];
 
 /// A workflow paused on a rate limit draws `⏸` for its bullet.
@@ -89,15 +15,13 @@ pub const PAUSED: char = '\u{23F8}';
 /// The tree connectors before a nested agent's bullet (`├`, `└`).
 pub const TREE: [char; 2] = ['\u{251C}', '\u{2514}'];
 
-/// The progress bar's filled cell: `▰`, or `█` under Ghostty (whose
-/// geometric shapes bleed ink).
+/// The progress bar's filled cell.
 pub const BAR_FILL: [char; 2] = ['\u{25B0}', '\u{2588}'];
 
-/// The progress bar's empty cell: `▱`, or `░` under Ghostty.
+/// The progress bar's empty cell.
 pub const BAR_EMPTY: [char; 2] = ['\u{25B1}', '\u{2591}'];
 
-/// The arrow before a token count once the agent has used a tool (`↓`), and
-/// the one before it until then (`↑`) — the same pair the `more` rows use.
+/// The arrow before a token count once the agent has used a tool (`↓`), and the one before it until then (`↑`).
 pub const ARROW_DOWN: char = '\u{2193}';
 /// See [`ARROW_DOWN`].
 pub const ARROW_UP: char = '\u{2191}';
@@ -105,23 +29,16 @@ pub const ARROW_UP: char = '\u{2191}';
 /// The warning sign before `Large workflow`.
 pub const WARNING: char = '\u{26A0}';
 
-/// The words builds before 2.1.301 drew after a workflow's `done/total`
-/// (`1/4 agents done`). No store binary of 2.1.301, 2.1.302, 2.1.303 or
-/// 2.1.304 holds either (grepped 2026-10-19); the captures that show them
-/// (`fixtures/wait_bg.out`, `claude-goal-active-suggestion.txt`) recorded no
-/// version, so they are no anchor row of any build.
+/// The words builds before 2.1.301 drew after a workflow's `done/total` (`1/4 agents done`).
 pub const PROGRESS_OLD: [&str; 2] = [" agents done", " agent done"];
 
-/// The most rows an [`AgentsPanel`] holds: the main row, five task rows, the
-/// `↓ N more` row and nine workflow rows. Rows past it are not read.
+/// The most rows an [`AgentsPanel`] holds.
 pub const PANEL_ROWS_MAX: usize = 16;
 
-/// How many pane columns a char takes, as the caller's text counts them
-/// ([`one_cell`], or `aterm_grapheme::char_width`).
+/// How many pane columns a char takes, as the caller's text counts them ([`one_cell`], or `aterm_grapheme::char_width`).
 pub type Width = fn(char) -> usize;
 
-/// One column per char: the GUI's pane text, which holds one char per cell
-/// (a wide glyph's right half is a space of its own).
+/// One column per char.
 #[must_use]
 pub fn one_cell(_: char) -> usize {
     1
@@ -172,13 +89,13 @@ pub enum RowKind {
     Agent,
     /// A dynamic workflow.
     Workflow,
-    /// `◯ N idle agents`: idle teammates folded into one row.
+    /// `◯ N idle agents`.
     IdleSummary,
-    /// `  ↓ N more`: task rows scrolled under the window.
+    /// ` ↓ N more`: task rows scrolled under the window.
     More,
 }
 
-/// The bullet's glyph — never its colour, which the text does not carry.
+/// The bullet's glyph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Bullet {
     /// `◯` / `○`: a row not viewed.
@@ -192,11 +109,9 @@ pub enum Bullet {
 /// A row's elapsed time as drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Elapsed {
-    /// A clock: `ms` as drawn, which moves in steps of `res_ms` (`1000` up to
-    /// a day of `formatDuration` and an hour of `formatBarElapsed`, then a
-    /// minute, then an hour for the bar's days).
+    /// Elapsed `ms` as drawn, quantized to `res_ms`.
     Clock { ms: u64, res_ms: u32 },
-    /// `awaiting approval`: a teammate's plan waits on its lead.
+    /// `awaiting approval`.
     AwaitingApproval,
     /// `idle`: a teammate idle, or a finished agent whose result was read.
     Idle,
@@ -220,8 +135,7 @@ impl Elapsed {
 pub struct Tokens {
     /// The count the text says (`613.6k` = 613 600).
     pub count: u64,
-    /// The step the text moves in: `1` under a thousand, `100` in `k`,
-    /// `100 000` in `m`, `100 000 000` in `b`.
+    /// The step the text moves in.
     pub quantum: u64,
     /// `↓`: the agent has used a tool (`↑` before that).
     pub used_tools: bool,
@@ -246,12 +160,10 @@ pub struct Progress {
     pub total: u32,
 }
 
-/// One panel row as [`parse_row`] reads it: its kind and the pane columns of
-/// its parts.
+/// One panel row as [`parse_row`] reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PanelRow {
-    /// The pane row, as [`AgentsPanel::push`] placed it (`0` from
-    /// [`parse_row`] alone).
+    /// The pane row, as [`AgentsPanel::push`] placed it (`0` from [`parse_row`] alone).
     pub row: u16,
     pub kind: RowKind,
     /// The `❯` cell of a selected or hovered row.
@@ -262,28 +174,25 @@ pub struct PanelRow {
     pub connector: Option<Span>,
     /// The bullet and its glyph (none on a `↓ N more` row).
     pub bullet: Option<(Span, Bullet)>,
-    /// The name (`main`; an agent's or workflow's name, its ` (+N)` left
-    /// out; the idle summary's words; the `more` row's words).
+    /// The name (`main`; an agent's or workflow's name, its ` (+N)` left out; the idle summary's words; the `more` row's words).
     pub name: Span,
-    /// A hash of the name's text: what a fold matches a row by.
+    /// A hash of the name's text.
     pub name_hash: u64,
     /// The `N` of a name's ` (+N)` (hidden descendants), else `0`.
     pub descendants: u16,
-    /// The activity text between the name and the status (an old
-    /// workflow's description), where any is drawn.
+    /// The activity text between the name and the status (an old workflow's description), where any is drawn.
     pub activity: Option<Span>,
     /// A hash of the activity's text (`0` with none).
     pub activity_hash: u64,
     pub elapsed: Option<(Span, Elapsed)>,
     pub tokens: Option<(Span, Tokens)>,
-    /// ` · N queued`: messages queued for an agent.
+    /// ` · N queued`.
     pub queued: Option<(Span, u16)>,
     pub progress: Option<(Span, Progress)>,
     pub bar: Option<Bar>,
     /// `⚠ Large workflow…`.
     pub warning: Option<Span>,
-    /// `↑ N more` on the main row, `↓ N more` on the more row; the idle
-    /// summary's `N` too.
+    /// `↑ N more` on the main row, `↓ N more` on the more row.
     pub count: Option<(Span, u16)>,
 }
 
@@ -309,9 +218,7 @@ impl PanelRow {
         count: None,
     };
 
-    /// The status: the columns from the first of its parts (elapsed, tokens,
-    /// queued, progress, warning) to the last. `None` where none was read —
-    /// a decorated row, or one a narrow pane cut.
+    /// The status: the columns from the first of its parts (elapsed, tokens, queued, progress, warning) to the last.
     #[must_use]
     pub fn status(&self) -> Option<Span> {
         [
@@ -326,16 +233,14 @@ impl PanelRow {
         .reduce(Span::to)
     }
 
-    /// An agent's or workflow's row: one a fold tracks.
+    /// An agent's or workflow's row.
     #[must_use]
     pub fn is_task(&self) -> bool {
         matches!(self.kind, RowKind::Agent | RowKind::Workflow)
     }
 }
 
-/// The panel as one locator placed it: at most [`PANEL_ROWS_MAX`] rows, top
-/// down. `Copy` and allocation-free, so a host can keep it beside its other
-/// readings of a pane.
+/// The panel as one locator placed it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AgentsPanel {
     len: u8,
@@ -361,8 +266,7 @@ impl AgentsPanel {
         &self.rows[..usize::from(self.len)]
     }
 
-    /// Add `parsed` as pane row `row`; `false` (and nothing added) once
-    /// [`PANEL_ROWS_MAX`] rows are held.
+    /// Add `parsed` as pane row `row`.
     pub fn push(&mut self, row: u16, parsed: PanelRow) -> bool {
         let Some(slot) = self.rows.get_mut(usize::from(self.len)) else {
             return false;
@@ -416,7 +320,7 @@ impl Cols<'_> {
     }
 }
 
-/// FNV-1a over `text`'s bytes: the stable hash a fold matches rows by.
+/// FNV-1a over `text`'s bytes.
 #[must_use]
 pub const fn text_hash(text: &str) -> u64 {
     let b = text.as_bytes();
@@ -430,14 +334,12 @@ pub const fn text_hash(text: &str) -> u64 {
     h
 }
 
-/// Read one row of the agents panel (module docs): `None` for any row that
-/// is none of the panel's shapes.
+/// Read one row of the agents panel (module docs).
 #[must_use]
 pub fn parse_row(row: &str, width: Width) -> Option<PanelRow> {
     let cols = Cols { row, width };
     let end = crate::text::trim_end(row).len();
     let text = &row[..end];
-    // The prefix: `❯ ` or two spaces.
     let (pointer, after_prefix) = if let Some(rest) = text.strip_prefix(POINTER) {
         (true, rest.strip_prefix(' ')?)
     } else {
@@ -451,7 +353,6 @@ pub fn parse_row(row: &str, width: Width) -> Option<PanelRow> {
     if !pointer && let Some(more) = more_row(row, at, end, cols) {
         return Some(more);
     }
-    // The tree: pairs of spaces, then a connector and a space.
     let mut pairs = 0u8;
     while row[at..end].starts_with("  ") {
         pairs = pairs.saturating_add(1);
@@ -469,7 +370,6 @@ pub fn parse_row(row: &str, width: Width) -> Option<PanelRow> {
     } else if pairs > 0 {
         return None;
     }
-    // The bullet and its space.
     let glyph = row[at..end].chars().next()?;
     let bullet = match glyph {
         '\u{25EF}' | '\u{25CB}' => Bullet::Hollow,
@@ -518,7 +418,6 @@ fn more_row(row: &str, at: usize, end: usize, cols: Cols<'_>) -> Option<PanelRow
 
 /// The main row's body: `main`, alone or with `↑ N more` at the right.
 fn main_row(row: &str, body: usize, end: usize, cols: Cols<'_>, out: PanelRow) -> Option<PanelRow> {
-    // The bullet's space is the anchor's own (` main`).
     let word = &crate::anchors::anchor_text("panel.main")[1..];
     let rest = row[body..end].strip_prefix(word)?;
     let name_end = body + word.len();
@@ -787,7 +686,6 @@ fn bar_run(text: &str, width: Width) -> Option<(u8, u8, usize, bool)> {
         cells += width(c);
         len = at + c.len_utf8();
     }
-    // 20, 12 or 8 cells in 2.1.304; any width a later build picks between.
     if !(4..=40).contains(&cells) {
         return None;
     }
@@ -816,7 +714,6 @@ fn task_row(
     bullet: Bullet,
     out: PanelRow,
 ) -> Option<PanelRow> {
-    // The name runs to its padding's two spaces (or the row's end).
     let name_end = crate::text::find(&row[body..end], "  ").map_or(end, |k| body + k);
     let mut name_text = &row[body..name_end];
     let mut descendants = 0u16;
@@ -842,7 +739,6 @@ fn task_row(
         }
         return Some(task);
     }
-    // A workflow's bar, right after the name's padding.
     let mut seg_from = tail;
     if let Some((filled, cells, len, blocks)) = bar_run(&row[tail..end], cols.width) {
         task.kind = RowKind::Workflow;
@@ -861,14 +757,9 @@ fn task_row(
         }
         seg_from = after + 2;
     }
-    // The segments, right to left: split at ` · ` while the piece after it
-    // reads as one; the piece left over ends in the first segment, after
-    // the activity.
     let mut segs: [(usize, usize, Seg); SEGMENTS_MAX] = [(0, 0, Seg::Warning); SEGMENTS_MAX];
     let mut n = 0;
     let mut seg_end = end;
-    // `⚠ Large workflow · /workflows to stop`: one segment across its own
-    // separator, always after the segments it warns of.
     let stop = crate::anchors::anchor_text("panel.workflows_stop");
     if let Some(head) = row[seg_from..seg_end]
         .strip_suffix(stop)
@@ -893,8 +784,6 @@ fn task_row(
         n += 1;
         seg_end = seg_from + k;
     }
-    // The leftmost piece: its longest suffix that reads as a segment, at a
-    // word's start; what is before it is the activity.
     let mut activity_end = seg_end;
     if n < SEGMENTS_MAX && seg_end > seg_from {
         let piece = &row[seg_from..seg_end];
@@ -907,8 +796,6 @@ fn task_row(
             n += 1;
             activity_end = seg_from + k;
         } else if n > 0 {
-            // A ` · ` piece read as a segment, but nothing before it does:
-            // the row is no status this reader knows.
             return Some(PanelRow {
                 kind: if task.bar.is_some() || bullet == Bullet::Paused {
                     RowKind::Workflow
@@ -926,8 +813,6 @@ fn task_row(
     }
     let segs = &mut segs[..n];
     segs.reverse();
-    // Which grammar the segments are: a workflow's (a bar, a paused bullet,
-    // a progress segment or a bar-only elapsed) or an agent's.
     let bar_only = segs.iter().any(|s| {
         matches!(
             s.2,
@@ -972,8 +857,6 @@ fn task_row(
             }
         }
     } else {
-        // No status this reader knows (a decorated row, a cut one): the
-        // whole tail is the row's text.
         task.activity = Some(cols.span(tail, end));
         task.activity_hash = text_hash(&row[tail..end]);
     }

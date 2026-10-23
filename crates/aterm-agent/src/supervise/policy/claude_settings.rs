@@ -28,6 +28,7 @@ pub const MANAGED_DIR: Option<&str> = None;
 const MANAGED_FILE: &str = "managed-settings.json";
 
 /// The managed settings' drop-in directory beside the managed file: every
+/// `*.json` in it is a managed settings document too.
 const DROP_INS: &str = "managed-settings.d";
 
 /// Where macOS keeps managed preference domains.
@@ -40,6 +41,7 @@ const MANAGED_PREFERENCES_FILE: &str = "com.anthropic.claudecode.plist";
 const MAX_SETTINGS_BYTES: u64 = 1 << 20;
 
 /// The most drop-ins one managed directory is read for; past it the directory
+/// is reported unread.
 const MAX_DROP_INS: usize = 64;
 
 /// One document of the chain.
@@ -184,6 +186,9 @@ fn flag_values<'a>(argv: &'a [String], flag: &'a str) -> impl Iterator<Item = &'
 }
 
 /// Whether Claude Code reads the user's `cowork_settings.json` in place of
+/// its `settings.json`: the agent's `CLAUDE_CODE_USE_COWORK_PLUGINS` true as
+/// Claude Code reads a flag variable (`1`, `true`, `yes` or `on`, in any
+/// case, white space trimmed).
 fn cowork(worker: &WorkerEnv) -> bool {
     worker
         .var("CLAUDE_CODE_USE_COWORK_PLUGINS")
@@ -363,6 +368,8 @@ pub fn hook_may_match(matcher: Option<&str>, tool: &str) -> bool {
 }
 
 /// The main worktree of the repository `dir` is in: the directory holding its
+/// `.git` directory, or for a linked worktree the one its `.git` file's
+/// `gitdir:` and that git directory's `commondir` lead to.
 fn main_worktree(dir: &Path, fence: Option<&Path>) -> Result<Option<PathBuf>, String> {
     let small = |path: &Path| -> Result<Option<String>, String> {
         Ok(match opens(fence, path) {
@@ -395,6 +402,7 @@ fn main_worktree(dir: &Path, fence: Option<&Path>) -> Result<Option<PathBuf>, St
 }
 
 /// The `*.json` files of a managed drop-in directory, sorted: none where the
+/// directory is not there, `Err` where it is there but cannot be listed.
 fn drop_ins(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -414,6 +422,11 @@ fn drop_ins(dir: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 /// Whether the chain opens `path`, the one gate of every open it makes
+/// ([`read_settings_in`], [`main_worktree`]): `Ok(false)` where nothing is
+/// there (a `stat`); `Err`, saying so, where it is there inside a
+/// file-provider domain of the home `fence` names
+/// (`footer::under_file_provider_domain`), which is then never opened (module
+/// doc, "The file-provider fence"); else `Ok(true)`.
 fn opens(fence: Option<&Path>, path: &Path) -> Result<bool, &'static str> {
     if let Err(e) = std::fs::symlink_metadata(path)
         && e.kind() == std::io::ErrorKind::NotFound
@@ -429,6 +442,9 @@ fn opens(fence: Option<&Path>, path: &Path) -> Result<bool, &'static str> {
 }
 
 /// A settings file's text: `Ok(None)` where there is none, `Err` naming why
+/// where one is there but cannot be read whole: not a regular file (a planted
+/// FIFO is never opened to block on), larger than [`MAX_SETTINGS_BYTES`],
+/// unreadable, or fenced ([`opens`]).
 fn read_settings_in(fence: Option<&Path>, path: &Path) -> Result<Option<String>, String> {
     if !opens(fence, path).map_err(|why| format!("lie in {why}"))? {
         return Ok(None);

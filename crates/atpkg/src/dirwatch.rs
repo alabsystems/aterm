@@ -1,57 +1,13 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A blocking watch over directories and files, for a thread that sleeps until
-//! something it reads may have moved: a kqueue of vnode filters on macOS, an
-//! inotify instance on Linux, and none elsewhere ([`Watcher::new`] answers
-//! `Unsupported`; nothing names a watch on Windows).
-//!
-//! One [`Watcher`] holds any number of watches, each named by the [`WatchId`]
-//! its `add_*` returned:
-//!
-//! * [`Watcher::add_dir`]: an entry created in, renamed into or out of, or
-//!   removed from the directory, and the directory itself moved or removed
-//!   (kqueue `NOTE_WRITE | NOTE_DELETE | NOTE_RENAME`; inotify `IN_CREATE`,
-//!   `IN_DELETE`, `IN_MOVED_FROM`, `IN_MOVED_TO`, `IN_DELETE_SELF`,
-//!   `IN_MOVE_SELF`). A file written in place inside it is NOT an entry
-//!   change: neither kernel reports it on the directory.
-//! * [`Watcher::add_file`]: the file written or extended in place, and the
-//!   file itself moved or removed (kqueue `NOTE_WRITE | NOTE_EXTEND |
-//!   NOTE_DELETE | NOTE_RENAME`; inotify `IN_MODIFY`, `IN_CLOSE_WRITE`,
-//!   `IN_DELETE_SELF`, `IN_MOVE_SELF`).
-//!
-//! Neither follows a symlink at the watched path, and each refuses the other's
-//! kind: a watch is on the object the caller named, never on what a link
-//! points at.
-//!
-//! [`Watcher::wait`] blocks until a watch fired, the timeout passed, or
-//! another thread called [`Watcher::wake`] (a kqueue `EVFILT_USER` trigger,
-//! an eventfd write), and returns the watches that fired, each once. A wake
-//! given before the wait is kept for it, so a thread told to stop between two
-//! waits still stops. Registration RETAINS what follows it: a change after
-//! `add_*` returns is reported by the next `wait`, however late that wait
-//! starts, because the kernel queues it. A change BEFORE the registration is
-//! not, so a caller that must miss nothing registers first and then reads.
-//! A watch is a hint, never the fact: the caller reads what it watches afresh
-//! after every wake.
-//!
-//! The watcher is `Sync`: one thread may wait while another adds and removes
-//! watches. An id is never reused, so an event a wait returns for a watch that
-//! was removed meanwhile names no live watch, and the caller drops it.
-//!
-//! A watch whose object is removed fires once more and is then GONE
-//! ([`Watcher::is_gone`]): it never fires again, even when a new object takes
-//! the same path, and, on Linux, the same inode number (ext4 hands a removed
-//! directory's number to the next one made), so a caller that keeps a watch
-//! by its object's `(dev, ino)` asks the kernel as well whether it still
-//! holds it.
+//! A blocking watch over directories and files, for a thread that sleeps until something it reads may have moved: a kqueue of vnode filters on macOS, an inotify instance on Linux, and none elsewhere ([`Watcher::new`] answers `Unsupported`; nothing names a watch on Windows).
 
 use std::io;
 use std::path::Path;
 use std::time::Duration;
 
 /// One watch of a [`Watcher`]: what [`Watcher::wait`] names when it fired.
-/// Never reused within its watcher.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WatchId(u64);
 
@@ -68,59 +24,39 @@ impl std::fmt::Debug for Watcher {
 
 impl Watcher {
     /// A watcher with no watches.
-    ///
     /// # Errors
-    ///
-    /// The kernel refused the queue (`EMFILE`), or this platform has no arm
-    /// (`Unsupported`).
+    /// The kernel refused the queue (`EMFILE`), or this platform has no arm (`Unsupported`).
     pub fn new() -> io::Result<Self> {
         imp::Watcher::new().map(|imp| Self { imp })
     }
 
     /// Watch the directory `dir`'s entries and the directory itself.
-    ///
     /// # Errors
-    ///
     /// `dir` cannot be opened or watched, is a symlink, or is not a directory.
     pub fn add_dir(&self, dir: &Path) -> io::Result<WatchId> {
         self.imp.add(dir, Kind::Dir)
     }
 
     /// Watch the regular file `file`'s contents and the file itself.
-    ///
     /// # Errors
-    ///
-    /// `file` cannot be opened or watched, is a symlink, or is not a regular
-    /// file.
+    /// `file` cannot be opened or watched, is a symlink, or is not a regular file.
     pub fn add_file(&self, file: &Path) -> io::Result<WatchId> {
         self.imp.add(file, Kind::File)
     }
 
-    /// Stop watch `id`. An id that names no live watch is ignored. On Linux
-    /// the instance stays open, so a later close does not pay for dropping
-    /// its watches.
+    /// Stop watch `id`.
     pub fn remove(&self, id: WatchId) {
         self.imp.remove(id);
     }
 
-    /// Whether watch `id` will never fire again: its object was removed
-    /// (kqueue `NOTE_DELETE` or `NOTE_REVOKE`; inotify `IN_IGNORED`, which
-    /// follows `IN_DELETE_SELF` and an unmount), the kernel's queue overflowed
-    /// so such an edge may have been lost, or the id names no watch (never
-    /// added, or removed). Known from what a [`Self::wait`] read: an edge the
-    /// kernel queued but no wait has read yet is not seen here, and that wait
-    /// returns the id. A watch moved with its object stays live.
+    /// Whether watch `id` will never fire again: its object was removed (kqueue `NOTE_DELETE` or `NOTE_REVOKE`; inotify `IN_IGNORED`, which follows `IN_DELETE_SELF` and an unmount), the kernel's queue overflowed so such an edge may have been lost, or the id names no watch (never added, or removed).
     #[must_use]
     pub fn is_gone(&self, id: WatchId) -> bool {
         self.imp.is_gone(id)
     }
 
-    /// Block until a watch fires, `timeout` passes (`None`: no timeout), or
-    /// [`Self::wake`] is called; the watches that fired, each once, in id
-    /// order. Empty after a timeout or a wake.
-    ///
+    /// Block until a watch fires, `timeout` passes (`None`: no timeout), or [`Self::wake`] is called; the watches that fired, each once, in id order.
     /// # Errors
-    ///
     /// The kernel queue failed; the watcher is then of no further use.
     pub fn wait(&self, timeout: Option<Duration>) -> io::Result<Vec<WatchId>> {
         let mut ids = self.imp.wait(timeout)?;
@@ -129,11 +65,8 @@ impl Watcher {
         Ok(ids)
     }
 
-    /// End a [`Self::wait`] now, from any thread; given while no wait runs, it
-    /// ends the next one at once.
-    ///
+    /// End a [`Self::wait`] now, from any thread; given while no wait runs, it ends the next one at once.
     /// # Errors
-    ///
     /// The kernel refused the trigger.
     pub fn wake(&self) -> io::Result<()> {
         self.imp.wake()
@@ -165,8 +98,7 @@ mod imp {
 
     use super::{Kind, WatchId};
 
-    /// The `EVFILT_USER` identifier [`Watcher::wake`] triggers. User events
-    /// have their own identifier space, apart from descriptors.
+    /// The `EVFILT_USER` identifier [`Watcher::wake`] triggers.
     const BELL: libc::uintptr_t = 0;
 
     /// How many events one `kevent` call collects.
@@ -246,8 +178,6 @@ mod imp {
         pub(super) fn add(&self, path: &Path, kind: Kind) -> io::Result<WatchId> {
             use std::os::unix::fs::OpenOptionsExt as _;
 
-            // `O_NOFOLLOW` refuses a symlink; `O_NONBLOCK` keeps a FIFO
-            // planted at a file's path from parking the open.
             let file = std::fs::OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
@@ -269,8 +199,6 @@ mod imp {
             };
             let fd = OwnedFd::from(file);
             let id = WatchId(self.next.fetch_add(1, Ordering::Relaxed));
-            // Held across the registration: a wait that reads this watch's
-            // removal marks it only once it is recorded.
             let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
             self.change(
                 fd.as_raw_fd() as libc::uintptr_t,
@@ -292,7 +220,6 @@ mod imp {
         }
 
         pub(super) fn remove(&self, id: WatchId) {
-            // Dropped after the lock: the close removes the knote.
             let open = self
                 .open
                 .lock()
@@ -313,8 +240,7 @@ mod imp {
                         tv_nsec: libc::c_long::from(left.subsec_nanos()),
                     }
                 });
-                // SAFETY: the timeout (if any) and the output slots live for
-                // this call; BATCH slots are writable.
+                // SAFETY: the timeout (if any) and the output slots live for this call; BATCH slots are writable.
                 let rc = unsafe {
                     libc::kevent(
                         self.kq.as_raw_fd(),
@@ -349,7 +275,6 @@ mod imp {
                         .unwrap_or_else(|p| p.into_inner())
                         .get_mut(&id)
                 {
-                    // The knote stays on the removed vnode and never fires
                     // again; a new object at the path is another vnode.
                     open.gone = true;
                 }
@@ -376,17 +301,13 @@ mod imp {
 
     use super::{Kind, WatchId};
 
-    // `<linux/inotify.h>` bits aterm-libc's cells do not declare (the cells
-    // carry only the names the workspace's harvest asked for; their values
-    // are the kernel ABI's on every Linux architecture).
     const IN_MODIFY: u32 = 0x0000_0002;
     const IN_CLOSE_WRITE: u32 = 0x0000_0008;
     const IN_Q_OVERFLOW: u32 = 0x0000_4000;
     const IN_IGNORED: u32 = 0x0000_8000;
 
     /// The directory edges the macOS arm's `NOTE_WRITE`, `NOTE_DELETE` and
-    /// `NOTE_RENAME` report. `IN_ONLYDIR | IN_DONT_FOLLOW` refuses a symlink
-    /// or a non-directory, as that arm's `O_NOFOLLOW` open and kind check do.
+    /// `NOTE_RENAME` report.
     const DIR_MASK: u32 = libc::IN_CREATE
         | libc::IN_DELETE
         | libc::IN_MOVED_FROM
@@ -462,7 +383,6 @@ mod imp {
             let mask = match kind {
                 Kind::Dir => DIR_MASK,
                 Kind::File => {
-                    // `IN_DONT_FOLLOW` would watch a symlink itself rather
                     // than refuse it; the kind is checked on the link.
                     if !std::fs::symlink_metadata(path)?.is_file() {
                         return Err(io::Error::from(io::ErrorKind::InvalidInput));
@@ -471,8 +391,6 @@ mod imp {
                 }
             };
             let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())?;
-            // Held across the registration: a wait that reads this watch's
-            // first event maps it only once the descriptor is recorded.
             let mut wds = self.wds.lock().unwrap_or_else(|p| p.into_inner());
             // SAFETY: `cpath` is NUL-terminated and outlives the call.
             let wd =
@@ -504,9 +422,7 @@ mod imp {
             ids.retain(|other| *other != id);
             if ids.is_empty() {
                 wds.ids.remove(&wd);
-                // SAFETY: `wd` was returned for this descriptor, which is
-                // open. A watch the kernel dropped meanwhile answers EINVAL,
-                // which leaves nothing to undo.
+                // SAFETY: `wd` was returned for this descriptor, which is open.
                 unsafe { libc::inotify_rm_watch(self.inotify.as_raw_fd(), wd) };
             }
         }
@@ -527,8 +443,6 @@ mod imp {
             ];
             loop {
                 let ms = deadline.map_or(-1, |at| {
-                    // Rounded up: a sub-millisecond remainder must not turn
-                    // into a zero-timeout spin.
                     let left = at.saturating_duration_since(Instant::now());
                     libc::c_int::try_from(left.as_nanos().div_ceil(1_000_000))
                         .unwrap_or(libc::c_int::MAX)
@@ -545,8 +459,6 @@ mod imp {
             }
             if fds[1].revents & libc::POLLIN != 0 {
                 let mut count = [0u8; 8];
-                // The count is reset by the read; a racing second wake is
-                // read here too, and either way this wait ends.
                 let _ = (&self.bell).read(&mut count);
             }
             let mut ids = Vec::new();
@@ -561,7 +473,6 @@ mod imp {
 
         /// Read every queued event, naming the watches they are for.
         fn drain(&self, ids: &mut Vec<WatchId>) -> io::Result<()> {
-            // Large enough for one event with the longest name (NAME_MAX).
             let mut buf = [0u8; 4096];
             loop {
                 let got = match (&self.inotify).read(&mut buf) {
@@ -586,8 +497,6 @@ mod imp {
                     let len = usize::try_from(u32::from_ne_bytes(word(12))).unwrap_or(usize::MAX);
                     at = at.saturating_add(HEAD).saturating_add(len);
                     if mask & IN_Q_OVERFLOW != 0 {
-                        // Events were lost: every watch may have fired, and
-                        // may have been taken off.
                         let all: Vec<WatchId> = wds.of_id.keys().copied().collect();
                         ids.extend(&all);
                         wds.gone.extend(all);
@@ -597,9 +506,6 @@ mod imp {
                         ids.extend(of_wd.iter().copied());
                     }
                     if mask & IN_IGNORED != 0 {
-                        // The kernel took the watch off (its object went):
-                        // its ids stay known, so their removal is quiet, and
-                        // are gone, though a later watch may get this
                         // descriptor's number.
                         if let Some(of_wd) = wds.ids.remove(&wd) {
                             wds.gone.extend(of_wd);
@@ -614,7 +520,6 @@ mod imp {
 
             match (&self.bell).write(&1u64.to_ne_bytes()) {
                 Ok(_) => Ok(()),
-                // The counter is full: a wake is already pending.
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
                 Err(e) => Err(e),
             }
@@ -664,15 +569,12 @@ mod imp {
 mod tests {
     use super::*;
 
-    /// No wait: whatever the kernel queued, now. Every edge these tests make
-    /// is queued by the syscall that makes it, so a zero-timeout wait after
-    /// that syscall returns sees it, and one that sees nothing proves nothing
-    /// was queued.
+    /// No wait: whatever the kernel queued, now.
     const NOW: Option<Duration> = Some(Duration::ZERO);
 
     /// An entry renamed into one watched directory names that directory's
     /// watch and not another's; a removal and the directory's own removal
-    /// name it too. NEGATIVE CONTROL: before the edge, nothing is queued.
+    /// name it too.
     #[test]
     fn a_directory_entry_names_its_watch_alone() {
         let root = crate::testdir::dir("atpkg-dirwatch-dir-");
@@ -687,7 +589,6 @@ mod tests {
             watcher.wait(NOW).unwrap().is_empty(),
             "CONTROL: nothing yet"
         );
-        // Staged outside both: only the rename into `a` is an edge of theirs.
         std::fs::write(root.join("staged"), b"x").unwrap();
         std::fs::rename(root.join("staged"), a.join("row")).unwrap();
         assert_eq!(watcher.wait(NOW).unwrap(), [wa]);
@@ -699,7 +600,7 @@ mod tests {
 
     /// A file written in place names the file's watch and NOT its directory's:
     /// the edge a directory watch alone misses (Claude Code creates its
-    /// registry row, then writes it). Extending it again names it again.
+    /// registry row, then writes it).
     #[test]
     fn a_file_written_in_place_names_the_file_and_not_its_directory() {
         use std::io::Write as _;
@@ -740,8 +641,7 @@ mod tests {
     }
 
     /// A removed watch names nothing, the watcher's others still do, and its
-    /// id is never handed out again. NEGATIVE CONTROL: the same edge with the
-    /// watch kept names it.
+    /// id is never handed out again.
     #[test]
     fn a_removed_watch_names_nothing() {
         let root = crate::testdir::dir("atpkg-dirwatch-removed-");
@@ -765,8 +665,7 @@ mod tests {
     /// A watch whose object is removed fires once and is then gone, and
     /// stays gone when the path is made again (another object, which on Linux
     /// may carry the old inode number); a removed watch, and an id never
-    /// handed out, are gone too. NEGATIVE CONTROL: a watch that fired for an
-    /// entry while its own object stayed is not gone.
+    /// handed out, are gone too.
     #[test]
     fn a_watch_whose_object_is_removed_is_gone() {
         let root = crate::testdir::dir("atpkg-dirwatch-gone-");
@@ -824,7 +723,6 @@ mod tests {
     #[test]
     fn a_wake_ends_the_wait() {
         let watcher = std::sync::Arc::new(Watcher::new().unwrap());
-        // A wait with no timeout on its own thread; its answer on the channel.
         let waiting = || {
             let (tx, rx) = std::sync::mpsc::channel();
             let watcher = std::sync::Arc::clone(&watcher);
@@ -837,7 +735,6 @@ mod tests {
             .expect("a wake given before the wait ends it");
         assert!(kept.is_empty());
         let rx = waiting();
-        // The wake may land before that thread waits: kept, it ends that wait.
         watcher.wake().unwrap();
         let woke = rx
             .recv_timeout(aterm_spec::wait::MUST_HAPPEN)

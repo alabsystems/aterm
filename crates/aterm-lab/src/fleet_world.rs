@@ -1,29 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The machines of `fleet-sim`: N private headless aterms on this Mac, each a
-//! scratch world of its own, and everything the simulation asks of them.
-//!
-//! EACH INSTANCE is `<base>/mNN/` (`<base>` a fresh `/tmp/af.XXXXXX`): its
-//! `home/`, `cfg/` (`XDG_CONFIG_HOME`, its aterm.toml with every automatic
-//! lane off and the harness off, as the live tests' `launch_isolation`
-//! writes it), `run/` (`XDG_RUNTIME_DIR`, its control socket
-//! `run/aterm/aterm.sock`, where `aterm ctl`'s discovery finds it), `state/`
-//! (`ATERM_STATE_HOME`: its fleet key, node and book), `cache/`, `data/`,
-//! `tmp/`. Under `/tmp`, not the caller's scratch directory: a Unix socket
-//! path must stay under 104 bytes, and `/tmp/af.XXXXXX/mNN/run/aterm/aterm.sock`
-//! is 39. It is launched `env -i` (nothing of the caller's aterm or agents
-//! reaches it), through `/bin/sh -c 'ulimit -n 256 && exec "$@"'` (a soft and
-//! hard descriptor limit of 256, a Dock-launched app's soft limit, which the
-//! fleet listener sizes its slots by), `--headless --no-reroute --control-sock
-//! …`, in a session of its own with no controlling terminal, its stdin the far
-//! end of a lifeline this process holds (`aterm_uds::lifeline`): however this
-//! process ends, the instance reads end of file and quits. Updates and
-//! packages are off; `[fabric]` is never configured, so no broker starts.
-//!
-//! EVERY PROCESS IT STARTS IS ENDED BY PID ([`World`]'s drop: each instance and
-//! every descendant it had, TERM then KILL, a stopped one continued first) and
-//! the base is removed; nothing is ever ended by name.
+//! Private headless `aterm` worlds for `fleet-sim`.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -33,18 +11,15 @@ use aterm_uds::spawnfd::{Command, Stdio};
 use crate::procs::{self, alive};
 use crate::stop;
 
-/// A wait for something that MUST happen (AGENTS.md): a hang detector, never
-/// a latency budget.
+/// One-minute hang detector for operations that must complete.
 pub const HANG: Duration = Duration::from_secs(60);
 
-/// The descriptor limit (soft and hard) of every instance and of the reader:
-/// a Dock-launched app's soft limit, which the fleet listener sizes its slots
-/// by.
+/// Soft and hard file descriptor limit for each simulated instance and reader.
 pub const NOFILE: usize = 256;
 
-/// The geometry of every instance.
+/// Terminal columns for each simulated instance.
 pub const COLUMNS: u16 = 100;
-/// The geometry of every instance.
+/// Terminal lines for each simulated instance.
 pub const LINES: u16 = 30;
 
 /// The aterm.toml every instance starts with: the live tests' isolation table
@@ -112,8 +87,7 @@ pub struct Inst {
     pub port: u16,
     /// The instance's pid (the launcher shell exec'd into it).
     pub pid: i32,
-    /// Every descendant seen before the instance was killed, with its start
-    /// time: the teardown signals one only while that pid still names it.
+    /// Recorded `(pid, start_time)` pairs of descendants for teardown.
     pub seen: Vec<(i32, String)>,
     /// Its sessions, the boot session first.
     pub sessions: Vec<Sess>,
@@ -150,9 +124,7 @@ impl Inst {
         self.sessions.first().map_or("", |s| s.sid.as_str())
     }
 
-    /// Note every descendant the instance has now, with its start time, so
-    /// the teardown still ends them once the instance itself is gone (a
-    /// killed aterm's sessions are orphans no tree walk finds).
+    /// Records current descendant PIDs and start times so teardown can clean up orphans.
     pub fn note_descendants(&mut self) {
         for pid in procs::descendants(self.pid) {
             let started = procs::start_time(pid);
@@ -163,9 +135,7 @@ impl Inst {
     }
 }
 
-/// `program` run under a soft and hard descriptor limit of [`NOFILE`]:
-/// `/bin/sh -c 'ulimit -n 256 && exec "$@"' <name> <program> …`. The shell
-/// execs, so the pid spawned is the program's own.
+/// Builds a command that execs `program` under a soft and hard descriptor limit of [`NOFILE`].
 #[must_use]
 pub fn limited(name: &str, program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
@@ -191,8 +161,7 @@ pub struct Out {
 pub struct World {
     /// `/tmp/af.XXXXXX`.
     pub base: PathBuf,
-    /// `<base>/bin`: `aterm` (a link to the aterm under test), and this
-    /// program's copy under the fixtures' names.
+    /// `<base>/bin` directory holding `aterm` and fixture symlinks.
     pub bin: PathBuf,
     /// The aterm under test.
     pub aterm: PathBuf,
@@ -202,8 +171,7 @@ pub struct World {
     pub keep: bool,
 }
 
-/// The environment of a world rooted at `root`, as an instance and every
-/// client of it get it: nothing inherited.
+/// Returns the isolated environment variables for an instance world rooted at `root`.
 #[must_use]
 pub fn world_env(root: &Path, bin: &Path) -> Vec<(String, String)> {
     let p = crate::paths::paths();
@@ -229,8 +197,7 @@ pub fn world_env(root: &Path, bin: &Path) -> Vec<(String, String)> {
     ]
 }
 
-/// Make the private directories of a world at `root` and its aterm.toml
-/// ([`CONFIG`], the audible bell off: [`crate::instance::bell_off`]).
+/// Creates the private directory layout and `aterm.toml` for a world at `root`.
 ///
 /// # Errors
 /// A directory or the config could not be made.
@@ -258,8 +225,7 @@ pub fn make_world(root: &Path) -> std::io::Result<()> {
     )
 }
 
-/// N free loopback ports, held together while they are picked so none
-/// repeats, then let go for the instances to bind.
+/// Allocates `n` distinct ephemeral loopback TCP ports.
 ///
 /// # Errors
 /// A bind failed.
@@ -284,11 +250,6 @@ impl World {
         let bin = base.join("bin");
         let me = &crate::paths::paths().exe;
         let made = std::fs::create_dir_all(&bin).and_then(|()| {
-            // The fixtures are THIS program under other names: a SYMLINK to
-            // it, never a copy — a copied Mach-O binary is SIGKILLed on exec
-            // on Apple Silicon (its signature no longer covers the file).
-            // argv[0] is then the link's name (`claude`, `build-loop`), which
-            // `main` dispatches on; the link resolves to the one real inode.
             for name in ["claude", "build-loop"] {
                 std::os::unix::fs::symlink(me, bin.join(name))?;
             }
@@ -311,12 +272,10 @@ impl World {
         self.base.join(format!("m{i:02}"))
     }
 
-    /// Start instance `i` on fleet port `port` (its world made first); the
-    /// instance, once its control socket listens.
+    /// Starts instance `i` on fleet port `port` and waits until its control socket listens.
     ///
     /// # Errors
-    /// Its world could not be made, it could not start, it died, or its
-    /// socket did not listen within the hang detector.
+    /// Returns an error if the world cannot be created, the instance fails to start, or its socket does not listen within [`HANG`].
     pub fn start(&self, i: usize, port: u16) -> Result<Inst, String> {
         let root = self.root_of(i);
         make_world(&root).map_err(|e| format!("m{i:02}: cannot make its world: {e}"))?;
@@ -378,12 +337,6 @@ impl World {
             }
             stop::sleep(Duration::from_millis(50)).map_err(|_| "interrupted".to_string())?;
         }
-        // The instance must have taken its private state root: ATERM_STATE_HOME
-        // is a dev seam (a debug build has it, an optimized build needs
-        // `--features dev-seams`). Without it the state falls under the
-        // scratch HOME, never the owner's, but the fleet key and book the
-        // simulation reads would not be where it reads them: refused here,
-        // with the remedy, as `up` refuses it.
         let logs = inst.state().join("logs");
         let end = Instant::now() + HANG;
         while !logs.is_dir() {
@@ -399,8 +352,7 @@ impl World {
         Ok(inst)
     }
 
-    /// `aterm <args>` in instance world `root`'s environment, `stdin` given
-    /// (or none); its output once it exits.
+    /// Runs `aterm <args>` in instance world `root`'s environment with optional `stdin`.
     #[must_use]
     pub fn aterm_in(&self, root: &Path, args: &[&str], stdin: Option<&str>) -> Out {
         let mut cmd = aterm_uds::spawnfd::command(&self.aterm);
@@ -480,13 +432,9 @@ impl World {
         ))
     }
 
-    /// End everything: every instance and every descendant it had, by pid —
-    /// a stopped one continued first, TERM, then KILL for whatever is left —
-    /// and remove the base unless `--keep`.
+    /// Terminates all instances and descendants by PID and removes `<base>` unless `--keep`.
     pub fn teardown(&mut self) {
         let table = procs::table();
-        // Each descendant with its start time: a pid the system has given to
-        // another process since is never signalled.
         let mut every: Vec<(i32, String)> = Vec::new();
         for inst in &self.insts {
             if inst.stopped {
@@ -499,8 +447,6 @@ impl World {
             }
             every.extend(inst.seen.iter().cloned());
         }
-        // A killed instance's pid was reaped and may name another process
-        // now: it is never signalled again (its noted descendants are, above).
         for inst in self.insts.iter().filter(|i| !i.killed) {
             if alive(inst.pid) {
                 let _ = crate::sys::kill(inst.pid, libc::SIGTERM);
@@ -521,7 +467,6 @@ impl World {
         }
         self.insts.clear();
         if !self.keep && self.base.to_string_lossy().starts_with("/tmp/af.") {
-            // A shell writes its history as it goes: removed until gone, bounded.
             for _ in 0..40 {
                 if std::fs::remove_dir_all(&self.base).is_ok() || !self.base.exists() {
                     break;
@@ -538,8 +483,7 @@ impl Drop for World {
     }
 }
 
-/// `cmd` run to its end with `stdin` written (or none) and both outputs read
-/// into memory.
+/// Runs `cmd` to completion with optional `stdin` and captures stdout and stderr.
 #[must_use]
 pub fn finish(cmd: &mut Command, stdin: Option<&str>) -> Out {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -608,8 +552,7 @@ pub fn rss_kib(pids: &[i32]) -> std::collections::BTreeMap<i32, u64> {
     map
 }
 
-/// Each of `pids`' physical footprint in KiB ([`crate::sys::phys_footprint`]);
-/// a pid that is gone is absent.
+/// Returns each PID's physical footprint in KiB ([`crate::sys::phys_footprint`]).
 #[must_use]
 pub fn footprint_kib(pids: &[i32]) -> std::collections::BTreeMap<i32, u64> {
     pids.iter()
@@ -617,9 +560,7 @@ pub fn footprint_kib(pids: &[i32]) -> std::collections::BTreeMap<i32, u64> {
         .collect()
 }
 
-/// `vmmap --summary`'s `Malloc Large (empty)` row (its own spelling of
-/// each size: `197.9M`): large blocks the process freed that its allocator
-/// still holds.
+/// `vmmap --summary` `Malloc Large (empty)` row values.
 #[derive(Clone, Debug)]
 pub struct LargeEmpty {
     /// Its virtual size.
@@ -630,8 +571,7 @@ pub struct LargeEmpty {
     pub dirty: String,
 }
 
-/// `vmmap --summary <pid>`'s `Malloc Large (empty)` row; `None` when vmmap
-/// says nothing of it.
+/// Reads the `Malloc Large (empty)` row from `vmmap --summary <pid>`, if present.
 #[must_use]
 pub fn malloc_large_empty(pid: i32) -> Option<LargeEmpty> {
     let out = aterm_uds::spawnfd::command("/usr/bin/vmmap")
@@ -651,9 +591,7 @@ pub fn malloc_large_empty(pid: i32) -> Option<LargeEmpty> {
     })
 }
 
-/// Each of `pids`' open DESCRIPTORS as `lsof -n -P -a -p <pids> -d 0-65535`
-/// lists them (numbered descriptors only: no `cwd`, `txt` or mapped file,
-/// which hold no descriptor), one call; a pid with none listed is absent.
+/// Counts open numbered file descriptors for each PID in `pids` via `lsof`.
 #[must_use]
 pub fn open_fds(pids: &[i32]) -> std::collections::BTreeMap<i32, usize> {
     let list: Vec<String> = pids.iter().map(i32::to_string).collect();

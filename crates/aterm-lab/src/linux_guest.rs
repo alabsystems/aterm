@@ -569,6 +569,7 @@ pub struct Unit {
 pub const UNIT_PREFIX: &str = "aterm-lane-";
 
 /// The X display numbers the lane takes: high, so a person's own session
+/// never holds them.
 const XVFB_DISPLAY: &str = ":91";
 const XWAYLAND_DISPLAY: &str = ":92";
 
@@ -1430,6 +1431,7 @@ mod tests {
     }
 
     /// The host's web2 goes to the guest at its own path, its words as the step's
+    /// input; a host without one lays nothing there, and those gates say so.
     #[test]
     fn the_guest_gets_the_hosts_web2_at_its_own_path() {
         let plan = provision_plan(Some("aa\naal\n".into()));
@@ -1534,6 +1536,9 @@ mod tests {
     }
 
     /// Every weston the lane starts reads a `weston.ini` its screen writes
+    /// first, in the proof and in the baseline, so none starts with its
+    /// shell's fade over the pixels a row holds; a screen with no weston
+    /// writes none.
     #[test]
     fn every_weston_reads_the_ini_its_screen_writes() {
         let rt = "/run/user/501";
@@ -1619,6 +1624,8 @@ mod tests {
     }
 
     /// The baseline's `us intl` goes on the X server it names as soon as that
+    /// server listens: under weston's x11 backend before weston, which reads
+    /// the keymap once as it starts.
     #[test]
     fn the_baseline_keymap_follows_the_x_server_it_sets() {
         let rt = "/run/user/501";
@@ -1676,6 +1683,8 @@ mod tests {
     }
 
     /// The clipboard's second client: its owner is a lane unit, so the
+    /// teardown after each display stops it however the row ended, and the
+    /// text reaches xclip as an argument, never as shell source.
     #[test]
     fn the_clipboard_owner_is_a_lane_unit_on_the_display() {
         let owner = clipboard_owner(":91", Selection::Clipboard, "A'B");

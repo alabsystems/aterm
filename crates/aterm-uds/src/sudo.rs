@@ -1,36 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The kernel facts a `sudo` askpass relay stands on, and a scrubbed
-//! [`Secret`] for the password in flight (`docs/DESIGN-sudo-askpass-2026-10-15.md`).
-//!
-//! Claude Code's Bash tool has no controlling terminal, so `sudo` there asks
-//! its askpass helper instead of a tty. aterm answers that request only when
-//! the kernel shows the asking process is a child of Apple's `/usr/bin/sudo`.
-//! This module reads those facts (macOS only; every other platform refuses),
-//! and nothing here ever presents UI or runs a child.
-//!
-//! Two sides use it. The HELPER (`aterm-ctl`'s `askpass` role) attests its own
-//! parent before it will dial aterm; the SERVER (`aterm-gui`'s `askpass` verb)
-//! attests the connecting peer's parent before it will raise a sheet. The
-//! facts an unprivileged process can read about a setuid-root `sudo` (euid 0,
-//! ruid ours), measured 2026-10-15: `proc_pidpath`, `PROC_PIDT_SHORTBSDINFO`
-//! (ppid/uid/ruid) and `csops` all work; `PROC_PIDTBSDINFO`, `KERN_PROCARGS2`
-//! and sudo's fd table are refused. None of these proves `sudo` is the only
-//! reader of the helper's stdout — that residual is stated in the design §4.
+//! Kernel parent attestation and scrubbed [`Secret`] for the `sudo` askpass relay.
 
-/// A password in flight, held off the agent's reach: heap-backed (so a move
-/// copies a pointer, not the bytes), scrubbed with `write_volatile` on drop,
-/// `Debug`-redacted, and never `Serialize`/`Clone`. Modelled on
-/// `atpkg-keys`'s master-secret discipline.
+/// A password in flight, held off the agent's reach.
 pub struct Secret {
     bytes: Box<[u8]>,
     len: usize,
 }
 
 impl Secret {
-    /// At most 1023 bytes (what `sudo` reads), the rest dropped. CR, LF and
-    /// NUL are refused by the callers before this, never here.
+    /// At most 1023 bytes (what `sudo` reads), the rest dropped.
     #[must_use]
     pub fn from_bytes(src: &[u8]) -> Self {
         let len = src.len().min(1023);
@@ -39,8 +19,7 @@ impl Secret {
         Self { bytes, len }
     }
 
-    /// Decode directly into owned scrubbed storage. Malformed, oversized, or
-    /// line-cutting values refuse without leaving an ordinary plaintext Vec.
+    /// Decode directly into owned scrubbed storage.
     #[must_use]
     pub fn decode_hex(hex: &[u8]) -> Option<Self> {
         if !hex.len().is_multiple_of(2) || hex.len() > 2046 {
@@ -59,8 +38,6 @@ impl Secret {
     }
 
     /// Encode the secure field's UTF-16 directly into scrubbed UTF-8 storage.
-    /// Refuse invalid surrogates, line-cutting characters, and more than sudo's
-    /// 1023 bytes; a password is never silently truncated.
     #[must_use]
     pub fn from_utf16(units: &[u16]) -> Option<Self> {
         let mut secret = Self::from_bytes(&[]);
@@ -118,8 +95,7 @@ const fn hex_digit(byte: u8) -> Option<u8> {
     }
 }
 
-/// Direct storage for AppKit's secure UTF-16 field extraction. Moves copy
-/// only its pointer; every allocated unit is scrubbed on all exits.
+/// Direct storage for AppKit's secure UTF-16 field extraction.
 pub struct SecretUtf16 {
     units: Box<[u16]>,
 }
@@ -147,17 +123,14 @@ impl SecretUtf16 {
 impl Drop for SecretUtf16 {
     fn drop(&mut self) {
         for unit in &mut self.units {
-            // SAFETY: each unit is live, aligned, writable owned storage.
+            // SAFETY: Each unit is live, aligned, writable owned storage.
             unsafe { std::ptr::write_volatile(unit, 0) };
         }
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
     }
 }
 
-/// One bounded askpass wire line, including its newline. Its maximum holds
-/// the 18-byte success prefix, 2046 hex bytes, and LF. Encoded passwords are
-/// secrets too: this buffer never formats them through an ordinary String,
-/// and scrubs its entire allocation on every return/error/unwind path.
+/// One bounded askpass wire line, including its newline.
 pub struct WireBuffer {
     bytes: Box<[u8]>,
     len: usize,
@@ -214,10 +187,7 @@ impl WireBuffer {
         &self.bytes[..self.len]
     }
 
-    /// Read exactly one bounded LF-terminated line directly into guarded
-    /// storage. The caller supplies the I/O deadline; no BufReader or ordinary
-    /// String/Vec receives the reply. Incomplete lines and bytes following LF
-    /// in the same read refuse, rather than guessing a password from a partial response.
+    /// Read exactly one bounded LF-terminated line directly into guarded storage.
     ///
     /// # Errors
     /// I/O failure, missing LF, multiple frames, or an oversized line.
@@ -256,7 +226,7 @@ impl WireBuffer {
 impl Drop for WireBuffer {
     fn drop(&mut self) {
         for byte in &mut self.bytes {
-            // SAFETY: each byte is live, writable owned storage.
+            // SAFETY: Each byte is live, writable owned storage.
             unsafe { std::ptr::write_volatile(byte, 0) };
         }
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
@@ -269,11 +239,8 @@ impl std::fmt::Debug for WireBuffer {
     }
 }
 
-/// Why a `sudo` attestation refused — a short, secret-free reason that is safe
-/// to surface to the agent through `sudo`'s stderr or an `ERR askpass` line.
+/// Why a `sudo` attestation refused.
 pub type AttestError = String;
-
-// macOS
 
 #[cfg(target_vendor = "apple")]
 mod imp {
@@ -281,9 +248,6 @@ mod imp {
 
     use super::AttestError;
 
-    // libproc / libsystem exports, declared here because the first-party `libc`
-    // carries none of them and aterm-uds takes no `libc` dependency (the whole
-    // transport stays auditable). All are `libSystem`; none takes a `$`-suffix.
     unsafe extern "C" {
         fn getppid() -> i32;
         fn getuid() -> u32;
@@ -296,8 +260,7 @@ mod imp {
             buffer: *mut core::ffi::c_void,
             buffersize: i32,
         ) -> i32;
-        /// `int csops(pid_t, unsigned int ops, void *useraddr, size_t usersize)`
-        /// — xnu `bsd/sys/codesign.h`; no SDK header declares it.
+        /// `int csops(pid_t, unsigned int ops, void *useraddr, size_t usersize)`.
         fn csops(pid: i32, ops: u32, useraddr: *mut core::ffi::c_void, usersize: usize) -> i32;
     }
 
@@ -307,15 +270,12 @@ mod imp {
     const PROX_FDTYPE_PIPE: u32 = 6;
     const PROC_PIDPATHINFO_MAXSIZE: usize = 4096;
 
-    // csops ops and status bits (`bsd/sys/codesign.h`).
     const CS_OPS_STATUS: u32 = 0;
     const CS_OPS_IDENTITY: u32 = 11;
     const CS_VALID: u32 = 0x0000_0001;
     const CS_PLATFORM_BINARY: u32 = 0x0400_0000;
 
-    /// `struct proc_bsdshortinfo` (`sys/proc_info.h`): 64 bytes on both Darwin
-    /// ABIs. Read as bytes at measured offsets, so this leaf crate declares no
-    /// C struct.
+    /// `struct proc_bsdshortinfo` (`sys/proc_info.h`): 64 bytes on both Darwin ABIs.
     #[derive(Clone, Copy)]
     pub(super) struct ShortInfo {
         pub ppid: u32,
@@ -342,9 +302,6 @@ mod imp {
             return None;
         }
         let u32_at = |off: usize| u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap());
-        // Offsets: pbsi_pid(0) pbsi_ppid(4) pbsi_pgid(8) pbsi_status(12)
-        // pbsi_comm[16](16) pbsi_flags(32) pbsi_uid(36) pbsi_gid(40)
-        // pbsi_ruid(44) pbsi_rgid(48) …
         if u32_at(0) != pid as u32 {
             return None;
         }
@@ -361,8 +318,7 @@ mod imp {
             return None;
         }
         let mut buf = [0u8; PROC_PIDPATHINFO_MAXSIZE];
-        // SAFETY: `buf` is MAX writable bytes; libproc writes at most that many
-        // and returns the length, or <= 0 on failure.
+        // SAFETY: `buf` is MAX writable bytes.
         let n = unsafe { proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
         let n = usize::try_from(n)
             .ok()
@@ -385,16 +341,10 @@ mod imp {
         r == 0 && (status & CS_VALID) != 0 && (status & CS_PLATFORM_BINARY) != 0
     }
 
-    /// Best-effort: `pid`'s code-signing identity contains `needle`. The
-    /// `CS_OPS_IDENTITY` buffer carries a short header before the C string, so
-    /// this searches the whole buffer for the identity bytes rather than
-    /// parsing a header whose layout is not in any SDK. A miss (short buffer,
-    /// refusal, identity absent) is `false`, and the caller treats it as a
-    /// bonus signal, never as the whole proof.
+    /// Best-effort: `pid`'s code-signing identity contains `needle`.
     fn cs_identity_contains(pid: i32, needle: &[u8]) -> bool {
         let mut buf = [0u8; 256];
-        // SAFETY: `buf` is 256 writable bytes, the size passed. csops fills at
-        // most that many and leaves the rest as the zeros we set.
+        // SAFETY: `buf` is 256 writable bytes, the size passed.
         let r = unsafe { csops(pid, CS_OPS_IDENTITY, buf.as_mut_ptr().cast(), buf.len()) };
         if r != 0 {
             return false;
@@ -402,12 +352,9 @@ mod imp {
         buf.windows(needle.len()).any(|w| w == needle)
     }
 
-    /// The attested facts of a genuine `sudo` at `pid`: Apple's `/usr/bin/sudo`,
-    /// a valid platform binary, euid 0 and real uid ours. Returns the error
-    /// reason (never the bytes read) on any miss. The identity check is a bonus
-    /// only, so a csops-identity quirk never refuses a real `sudo`.
+    /// The attested facts of a genuine `sudo` at `pid`.
     pub(super) fn attest_sudo(pid: i32) -> Result<(), AttestError> {
-        // SAFETY: a plain syscall with no arguments.
+        // SAFETY: A plain syscall with no arguments.
         let our_uid = unsafe { getuid() };
         attest(
             short_info(pid),
@@ -415,15 +362,11 @@ mod imp {
             || exe_path(pid),
             || cs_platform_valid(pid),
         )?;
-        // A bonus positive signal; its absence does not refuse (the triad
-        // checked above is the proof).
         let _ = cs_identity_contains(pid, b"com.apple.sudo");
         Ok(())
     }
 
-    /// [`attest_sudo`]'s rule over the facts read for one pid: `info` its short BSD info,
-    /// `our_uid` this process's real uid, `exe` and `platform_valid` its executable and its
-    /// code signing, each read only once every fact before it admitted the pid. Pure.
+    /// [`attest_sudo`]'s rule over the facts read for one pid.
     pub(super) fn attest(
         info: Option<ShortInfo>,
         our_uid: u32,
@@ -449,29 +392,18 @@ mod imp {
     }
 
     pub(super) fn parent_pid() -> i32 {
-        // SAFETY: a plain syscall with no arguments.
+        // SAFETY: A plain syscall with no arguments.
         unsafe { getppid() }
     }
 
-    /// Whether this process's fd 1 is an ANONYMOUS pipe (`PROX_FDTYPE_PIPE`),
-    /// not a regular file or a named FIFO. `sudo` dups a `pipe2` read end onto
-    /// the helper's fd 1, so a genuine helper always sees a pipe; a redirect to
-    /// a file is refused. A named FIFO reads as a vnode, so it too is refused.
-    /// `Err` with a reason on anything else.
-    ///
-    /// Reads `PROC_PIDLISTFDS` for our own pid and finds fd 1's type. If the
-    /// listing cannot be read at all, that is itself a refusal — the design
-    /// prefers failing closed here.
+    /// Whether this process's fd 1 is an ANONYMOUS pipe (`PROX_FDTYPE_PIPE`).
     pub(super) fn stdout_is_anon_pipe() -> Result<(), AttestError> {
-        // SAFETY: a plain syscall with no arguments.
+        // SAFETY: A plain syscall with no arguments.
         fd_one_is_anon_pipe(unsafe { getpid() })
     }
 
-    /// [`stdout_is_anon_pipe`]'s read of `me`'s live fd table: this process's own, but in the
-    /// tests, which ask a child's.
+    /// [`stdout_is_anon_pipe`]'s read of `me`'s live fd table.
     pub(super) fn fd_one_is_anon_pipe(me: i32) -> Result<(), AttestError> {
-        // Size the fd listing, then read it (bounded to a sane ceiling).
-        // SAFETY: a null buffer and zero size asks proc_pidinfo for the size.
         let need = unsafe { proc_pidinfo(me, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
         let need = usize::try_from(need).ok().filter(|&n| n > 0 && n < 1 << 20);
         let Some(need) = need else {
@@ -488,10 +420,8 @@ mod imp {
         stdout_record_is_anon_pipe(&buf[..got])
     }
 
-    /// [`stdout_is_anon_pipe`]'s rule over the `PROC_PIDLISTFDS` table it read: fd 1's
-    /// record names an anonymous pipe. Pure.
+    /// [`stdout_is_anon_pipe`]'s rule over the `PROC_PIDLISTFDS` table it read.
     pub(super) fn stdout_record_is_anon_pipe(table: &[u8]) -> Result<(), AttestError> {
-        // `struct proc_fdinfo { int32_t proc_fd; uint32_t proc_fdtype; }` = 8.
         const FDINFO: usize = 8;
         for rec in table.as_chunks::<FDINFO>().0 {
             let fd = i32::from_ne_bytes(rec[0..4].try_into().unwrap());
@@ -521,8 +451,7 @@ pub fn parent_pid() -> i32 {
     }
 }
 
-/// The executable the kernel records for `pid`, or `None` (gone, unreadable,
-/// or off macOS).
+/// The executable the kernel records for `pid`, or `None` (gone, unreadable, or off macOS).
 #[must_use]
 pub fn exe_path(pid: i32) -> Option<std::path::PathBuf> {
     #[cfg(target_vendor = "apple")]
@@ -550,8 +479,7 @@ pub fn parent_of(pid: i32) -> Option<i32> {
     }
 }
 
-/// Attest that `pid` is Apple's `/usr/bin/sudo` running as root with our real
-/// uid (module docs). `Err(reason)` on any miss; off macOS always `Err`.
+/// Attest that `pid` is Apple's `/usr/bin/sudo` running as root with our real uid (module docs).
 ///
 /// # Errors
 /// A short, secret-free reason safe to surface to the agent.
@@ -567,8 +495,7 @@ pub fn attest_sudo(pid: i32) -> Result<(), AttestError> {
     }
 }
 
-/// Whether this process's fd 1 is an anonymous pipe (module docs). `Err` with a
-/// reason otherwise; off macOS always `Err`.
+/// Whether this process's fd 1 is an anonymous pipe (module docs).
 ///
 /// # Errors
 /// A short, secret-free reason.

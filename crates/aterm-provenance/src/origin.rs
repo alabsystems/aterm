@@ -20,6 +20,8 @@ mod sealed {
 /// let pty = Provenance::<_, Pty>::from_pty(b"rm -rf /".to_vec());
 /// # let _ = pty;
 /// ```
+/// use aterm_provenance::{Provenance, Pty};
+/// // Control: the one origin, constructed the one way.
 ///
 /// ```compile_fail,E0277
 /// use aterm_provenance::Origin;
@@ -27,6 +29,8 @@ mod sealed {
 /// struct Host;
 /// impl Origin for Host {}
 /// ```
+/// use aterm_provenance::{Provenance, Pty};
+/// // Control: the one origin, constructed the one way.
 pub trait Origin: sealed::Sealed + 'static + Copy {}
 
 /// PTY origin marker. Bytes from the shell — the primary adversary surface.

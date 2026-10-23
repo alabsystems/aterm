@@ -23,9 +23,14 @@ use crate::spec::Spec;
 use crate::stats;
 
 /// How often the tally file is read while the bench waits for the bridge's
+/// idle write.
 const TALLY_POLL: Duration = Duration::from_millis(1);
 
 /// THE PACED SUB-PHASE'S GAP between one round's reply and the next round's
+/// post ([`Spec::paced`]): past the bridge's idle backstop (5 ms,
+/// `IDLE_ACK_GRACE`), so each round finds the loop parked on its mailbox with
+/// nothing owed — a request and its reply on an idle node, where the
+/// back-to-back rounds measure a busy one.
 const PACE: Duration = Duration::from_millis(20);
 
 /// One round, as the bench saw it.
@@ -55,15 +60,20 @@ struct Raw {
     start: Tally,
     end: Tally,
     /// The broker's flushes between those two tallies
+    /// ([`Broker::flush_counts`], read right after each: between two round
+    /// trips, never inside one).
     flushes: FlushCounts,
     /// The broker's retention ticks between the same two tallies ([`Ticks`]).
     ticks: Ticks,
     /// THE PACED SUB-PHASE, after the back-to-back rounds' last tally
+    /// ([`Spec::paced`], [`PACE`] apart): its rounds, and the tally past its
+    /// last reply (its window runs from `end`).
     paced: Vec<Round>,
     paced_end: Option<Tally>,
 }
 
 /// One round on `ctl`: A posts `ping-<i>` to B, B's wait answers, B posts
+/// `pong-<i>` back, A's wait answers.
 fn one_round(
     ctl: &mut Ctl,
     clock: Clock,
@@ -94,6 +104,8 @@ fn one_round(
 }
 
 /// The tally in `text` (the file's contents, if it could be read) when it is
+/// bridge `pid`'s and its cursor has committed through `off`; why not
+/// otherwise.
 fn covering(text: Option<&str>, pid: i32, off: u64) -> Result<Tally, String> {
     let tally = Tally::parse(text.ok_or("no tally written yet")?)?;
     if i64::from(tally.pid) != i64::from(pid) {
@@ -150,6 +162,7 @@ fn woke_with(ctl: &mut Ctl, clock: Clock, sid: &str, since: &mut u64, text: &str
 }
 
 /// The rounds: `warmup` first, then `pingpong` measured, back to back, on the
+/// world whose broker is `broker`.
 fn rounds(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &str) -> Raw {
     let path = w.state.join(wait_tally::FILE);
     let pid = w.bridge_pid();
@@ -209,13 +222,21 @@ fn rounds(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &st
 }
 
 /// Where an answer's record sits against the commit of the delivery it
+/// answers, on the stopped log ([`behind`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Order {
     /// The commit is before the answer's record: the bridge committed the
+    /// delivery, then published the answer.
     After,
     /// The answer's record is before the commit, and the commit covers it as
+    /// well: the bridge had delivered the answer too by the time it committed,
+    /// so one commit covered both deliveries — a FOLD, one commit fewer than
+    /// the two a round trip otherwise has.
     Folded,
     /// The answer's record is before the commit, and the commit's cursor stops
+    /// short of it: the bridge published the answer ahead of the commit but
+    /// committed only the delivery, so the answer's own delivery has a commit
+    /// of its own, later.
     Ahead,
 }
 
@@ -224,10 +245,14 @@ enum Order {
 struct Behind {
     order: Order,
     /// The answer's wait for that commit, in ms: from its post `OK` to the
+    /// commit acked, 0 when it was acked before the post.
     wait: Option<f64>,
 }
 
 /// [`Behind`] for the answer at offset `answer`, posted `OK` at `answer_ok`,
+/// to the delivery at offset `delivered`, off the stopped log `recs` (`group`
+/// is the inbox group) and the moments `landed` stamps on its offsets; `None`
+/// when no commit in the log covers the delivery.
 fn behind(
     recs: &[census::Rec],
     group: &str,
@@ -255,6 +280,8 @@ fn behind(
 }
 
 /// One direction's answers ([`behind`]): how many sat in each [`Order`]
+/// against the commit of the delivery they answer, and the waits of those
+/// recorded after it.
 #[derive(Debug, Default)]
 struct Answers {
     after: usize,
@@ -275,6 +302,7 @@ impl Answers {
 }
 
 /// The report's sentence on where the answers sat against the commits of the
+/// deliveries they answer, over `n` round trips (`n` pongs, `n - 1` pings).
 fn order_line(pongs: &Answers, pings: &Answers, n: usize) -> String {
     let mut line = format!(
         "The commit of the delivery a message answers landed before that message's own record \
@@ -297,7 +325,7 @@ fn order_line(pongs: &Answers, pings: &Answers, n: usize) -> String {
     line
 }
 
-/// `part` as a share of `whole`, rounded: `None` for an empty whole. Pure
+/// `part` as a share of `whole`, rounded: `None` for an empty whole.
 fn share(part: f64, whole: f64) -> Option<f64> {
     (whole > 0.0).then(|| stats::round3(part / whole))
 }
@@ -308,6 +336,7 @@ fn ns_ms(ns: u64) -> f64 {
 }
 
 /// The table of what the loop waited on: count and time, in all and per round
+/// trip.
 fn waits_rows(d: &Tally, n: usize) -> Vec<String> {
     let per = |v: f64| {
         if n == 0 {
@@ -350,6 +379,10 @@ fn waits_rows(d: &Tally, n: usize) -> Vec<String> {
 }
 
 /// The band at and past which a span is counted as a TAIL in the v=2 table:
+/// 2^20 ns (1.05 ms), past any quiet verb-lane round trip or state-dir write
+/// this bench has seen, and 2^23 ns (8.39 ms), past a quiet volume's whole
+/// horizon full flush (5-7 ms, `docs/measured/flush-wait-2026-10-21.md`), so
+/// what is counted there met one under load or waited out more than one.
 const TAIL_1MS: usize = 11;
 const TAIL_8MS: usize = 14;
 
@@ -385,6 +418,7 @@ fn describe(row: TallyRow) -> &'static str {
 }
 
 /// A row's largest in a window, in ms: exact when the window saw the
+/// process's largest, else bounded by its top band ([`Hist::top`]).
 fn largest(h: &Hist) -> String {
     if h.max > 0 {
         return format!("{:.3}", ns_ms(h.max));
@@ -397,6 +431,10 @@ fn largest(h: &Hist) -> String {
 }
 
 /// THE V=2 TABLE: every timed row of the window's tally difference `d` over
+/// `n` round trips — count and time, in all and per round trip, the tail
+/// past 1.05 and 8.39 ms ([`TAIL_1MS`], [`TAIL_8MS`]) and the largest — the
+/// rows that partition the loop's time marked, and the outbox peeks' post
+/// counts as a sentence of their own.
 fn tally_rows(d: &Tally, n: usize) -> Vec<String> {
     let per = |v: f64| {
         if n == 0 {
@@ -447,6 +485,11 @@ fn tally_rows(d: &Tally, n: usize) -> Vec<String> {
 }
 
 /// WHERE THE LOOP'S TIME WENT over the window `d`, per round trip and
+/// largest first: each row that partitions it ([`TallyRow::partitions`]) but
+/// the park, then THE REST of its working time — the bridge's own clock
+/// between the two tallies ([`Tally::at_ns`]) less the park and those rows:
+/// wall time outside the measured spans, including scheduling delays and
+/// instrumentation overhead — and last the park.
 fn attribution(d: &Tally, n: usize) -> Vec<(String, f64)> {
     if n == 0 {
         return Vec::new();
@@ -482,6 +525,8 @@ fn attribution_rows(d: &Tally, n: usize, rt: Option<f64>) -> Vec<String> {
 }
 
 /// The window's v=2 rows for the report's JSON: each timed row's count, ms,
+/// per round trip, its bands and its largest; the peeks' counts; the bridge's
+/// own clock; and the attribution with its shares of `rt`.
 fn tally_json(d: &Tally, n: usize, rt: Option<f64>) -> Value {
     let per = |v: f64| (n > 0).then(|| stats::round3(v / n as f64));
     let mut rows = aterm_json::Map::new();
@@ -523,6 +568,8 @@ fn tally_json(d: &Tally, n: usize, rt: Option<f64>) -> Value {
 }
 
 /// The table of the broker's flushes over the window, `n` round trips (two
+/// delivered messages each): each kind's count, per delivered message and per
+/// round trip.
 fn flushes_rows(f: FlushCounts, n: usize) -> Vec<String> {
     let per = |v: u64, by: usize| {
         if by == 0 {
@@ -544,6 +591,7 @@ fn flushes_rows(f: FlushCounts, n: usize) -> Vec<String> {
 }
 
 /// The window's flushes for the report's JSON: [`flushes_json`] per delivered
+/// message (two a round trip), and the same per round trip.
 fn flushes_rt_json(f: FlushCounts, n: usize) -> Value {
     let per = |v: u64| (n > 0).then(|| stats::round3(v as f64 / n as f64));
     let mut out = flushes_json(f, 2 * n);
@@ -556,6 +604,8 @@ fn flushes_rt_json(f: FlushCounts, n: usize) -> Value {
 }
 
 /// THE PACED SUB-PHASE'S REPORT ([`Spec::paced`]): its round trips and legs,
+/// and the loop's v=2 rows over its window, from the back-to-back rounds'
+/// last tally to the tally past its last reply.
 fn paced_report(raw: &Raw) -> (Value, Vec<String>) {
     let Some(end) = raw.paced_end else {
         return (Value::Null, Vec::new());
@@ -1117,6 +1167,9 @@ mod tests {
     }
 
     /// THE V=2 TABLE: a row per timed step, its tail past 1.05 and 8.39 ms
+    /// from its bands, its largest exact when the window saw it and bounded by
+    /// its top band otherwise; the peeks' posts as a sentence, its empty peeks
+    /// counted from band 0.
     #[test]
     fn the_v2_table_reads_each_step_per_round_trip_with_its_tail() {
         use super::*;
@@ -1205,6 +1258,9 @@ mod tests {
     }
 
     /// THE ATTRIBUTION: the partitioning rows but the park, largest first,
+    /// then the REST of the loop's working time (its clock less the park and
+    /// those rows), then the park — per round trip, each a share of the round
+    /// trip's mean.
     #[test]
     fn the_attribution_partitions_the_loops_clock_largest_first() {
         use super::*;
@@ -1274,6 +1330,10 @@ mod tests {
     }
 
     /// THE FLUSHES READ PER MESSAGE AND PER ROUND TRIP, the message column
+    /// over twice the round trips: an ordered window of 200 round trips with
+    /// 600 barriers (a ping, a pong and a commit's batch each), 4 horizon full
+    /// flushes and one skipped is 1.500 barriers a message and 3.000 a round
+    /// trip.
     #[test]
     fn the_flushes_table_reads_per_message_and_per_round_trip() {
         use super::*;

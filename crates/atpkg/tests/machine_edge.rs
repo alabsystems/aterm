@@ -1,21 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `[machine]` settings at the REAL process edge: an update pass
-//! applies them only when the `[machine]` table changed since the last apply, and never
-//! under a private state root (ruling 409) nor when the window that spawned it says it runs
-//! under one (ruling 410's lead), and their own verb applies them every time: a host
-//! preference written at the dispatch edge of every update/seed/install pass is not that
-//! edge's work (and the $HOME walk that once rode with it cost seconds).
-//!
-//! The observable is the synthetic-home refusal line: this child's `HOME` is a temp
-//! directory, so an apply that is ATTEMPTED prints `atpkg: machine settings not applied —
-//! …` (and touches nothing on the real machine), and one that is not attempted prints
-//! nothing about the machine at all.
-//! macOS only — elsewhere there is nothing to apply and nothing is ever printed.
-//!
-//! NEVER THE REAL STORE: `HOME` is a temp directory, `XDG_CONFIG_HOME` an absent one, and
-//! the registry an empty local directory, so the pass finds an empty store and exits 0.
+//! Process-edge tests for `[machine]` settings application during update passes.
 
 #![cfg(target_os = "macos")]
 
@@ -49,7 +35,6 @@ impl Fixture {
         self.stdout_under(args, None)
     }
 
-    /// `state_home`: the development seam `ATERM_STATE_HOME` a private instance runs under
     /// (ruling 409), set — never inherited.
     fn stdout_under(&self, args: &[&str], state_home: Option<&std::path::Path>) -> Vec<String> {
         let out = self.run(args, state_home);
@@ -62,7 +47,6 @@ impl Fixture {
         Self::lines(&out.stdout)
     }
 
-    /// The dev `atpkg` over this fixture, however it ends. Its working directory is the
     /// fixture's, so a relative seam names nothing outside it.
     fn run(&self, args: &[&str], state_home: Option<&std::path::Path>) -> std::process::Output {
         let mut cmd = self.command(args);
@@ -72,7 +56,6 @@ impl Fixture {
         cmd.output().expect("run the dev atpkg")
     }
 
-    /// The dev `atpkg` with `args` over this fixture, as the owner's process (no private
     /// state root), stdin closed.
     fn command(&self, args: &[&str]) -> aterm_uds::spawnfd::Command {
         let mut cmd = aterm_uds::spawnfd::command(env!("CARGO_BIN_EXE_atpkg"));
@@ -110,7 +93,6 @@ impl Fixture {
     }
 }
 
-/// Never applied: the pass carries the table (the first pass on a machine configures it).
 /// Applied and unchanged: the pass says nothing about the machine. The verb: every time.
 #[test]
 fn an_update_pass_applies_the_machine_settings_only_when_the_table_changed() {
@@ -137,16 +119,6 @@ fn an_update_pass_applies_the_machine_settings_only_when_the_table_changed() {
     );
 }
 
-/// A PASS UNDER A PRIVATE STATE ROOT CARRIES NO `[machine]` EDIT (ruling 409). The prefix
-/// is shared with the owner, and `machine.applied` there is the owner's record, so a
-/// development build given its own `ATERM_STATE_HOME` would read its own table as an edit
-/// and apply it to the owner's Mac. Here the table was never applied — the case that makes
-/// the owner's pass attempt it (the test above) — and the private pass attempts nothing,
-/// records nothing, and leaves the edit for the owner's next pass. The typed verb still
-/// applies (here, to the synthetic home's refusal: nothing on the real machine).
-///
-/// A RELATIVE OR EMPTY SEAM COUNTS (ruling 410): it resolves no root, but the process asked
-/// for one of its own. Each value is driven here, so a helper that let only an absolute
 /// path count — the natural "consistency with `aterm_data_dir`" edit — fails this test.
 #[test]
 fn a_pass_under_a_private_state_root_carries_no_machine_edit() {
@@ -177,13 +149,6 @@ fn a_pass_under_a_private_state_root_carries_no_machine_edit() {
     );
 }
 
-/// A PASS THE PRIVATE WINDOW LEADS WITH ITS FLAG CARRIES NO `[machine]` EDIT, WHATEVER THE
-/// CHILD'S BUILD (ruling 410). The window's passes run the `atpkg` beside it, which in a
-/// development tree is a separate build that may compile no seam: there the inherited
-/// `ATERM_STATE_HOME` reads as unset. So the window puts
-/// [`atpkg::cli::PRIVATE_STATE_ROOT_FLAG`] ahead of the verb, and the child honours it with
-/// the seam unset — the seam-less child's view — over a never-applied table, the case that
-/// makes the owner's pass attempt the apply. The flag is stripped before the verb reads its
 /// operands (the pass exits 0), and the owner's next pass still carries the table.
 #[test]
 fn a_pass_led_by_the_private_flag_carries_no_machine_edit_with_the_seam_unset() {
@@ -213,12 +178,6 @@ fn a_pass_led_by_the_private_flag_carries_no_machine_edit_with_the_seam_unset() 
     );
 }
 
-/// AN `atpkg` THAT DOES NOT KNOW THE LEAD REFUSES IT BEFORE ITS MACHINE EDGE (ruling 410).
-/// Every `atpkg` reads its first word as the verb, and the `[machine]` edge is asked only
-/// for a pass verb, so a word it does not know ahead of the verb is an unknown verb: exit 2,
-/// nothing on stdout, no store lock, no `[machine]` apply. That is what an `atpkg` built
-/// before the flag does with the private window's lead — it fails the pass loudly instead
-/// of applying the instance's table to the owner's Mac. Driven here with a word this build
 /// does not know either, over the never-applied table.
 #[test]
 fn an_unknown_word_ahead_of_the_verb_is_refused_before_the_machine_edge() {
@@ -232,15 +191,6 @@ fn an_unknown_word_ahead_of_the_verb_is_refused_before_the_machine_edge() {
     );
 }
 
-/// A PASS THE STORE LOCK TURNS AWAY STILL CARRIES THE EDIT, AND HAS SAID SO WHEN IT EXITS —
-/// AND ITS LOCK ATTEMPT NEVER WAITED FOR THAT EDIT. The edge's apply needs no store lock, so
-/// it runs BESIDE the pass, on a thread started before the lock is asked for, and the pass
-/// joins it before it returns — a refused pass too. Here the test holds the store lock, so
-/// the `update` is refused at once (exit 75), and holds the edge's apply up where it opens
-/// the `[machine]` queue: a FIFO stands at `machine.lock`, and its open waits for a reader,
-/// as an apply waits on a wedged `defaults`. The refusal reaches stderr while the edge is
-/// held; once a reader lets it go, the pass exits with the never-applied table's apply
-/// attempted on stdout (its synthetic-home refusal). Negative control: an edge applied in
 /// line, in front of the lock attempt, holds the refusal back with it.
 #[test]
 fn a_pass_the_store_lock_refuses_still_carries_the_machine_edit() {
@@ -279,7 +229,6 @@ fn a_pass_the_store_lock_refuses_still_carries_the_machine_edit() {
             let _ = line_tx.send(line);
         }
     });
-    // A hang detector, not a latency budget: the refusal must come while the edge is held.
     let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut said = Vec::new();
     let refused_while_held = loop {
@@ -289,7 +238,6 @@ fn a_pass_the_store_lock_refuses_still_carries_the_machine_edit() {
             Err(_) => break false,
         }
     };
-    // A reader at the FIFO ends the edge's open.
     let release = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
@@ -326,12 +274,6 @@ fn a_pass_the_store_lock_refuses_still_carries_the_machine_edit() {
     );
 }
 
-/// A PASS EDGE DOES NOT WAIT OUT ANOTHER `[machine]` APPLY. On a first launch the window's
-/// own `machine apply` holds `machine.lock` while the seed's edge would carry the same
-/// never-applied table: the edge leaves it to that apply — and an edit it read too early to
-/// the next pass's edge — so the seed exits while the queue is still held. An edge that
-/// queued behind it held the seed, and the install the window starts behind it, until the
-/// window's `defaults` writes were done. Here the test holds the queue for the seed's whole
 /// life: the seed exits under the hang detector, and attempted nothing.
 #[test]
 fn a_pass_edge_does_not_wait_out_another_machine_apply() {

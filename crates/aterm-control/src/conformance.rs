@@ -97,10 +97,12 @@ pub fn run_selection_state<H: SessionHost>(host: &H, sid: u64) -> Vec<Outcome> {
 }
 
 /// Snapshots session `sid`'s selection and puts it back when dropped, so the
+/// suite can run against a live session with a known selection state.
 struct SelectionRestore<'h, H: SessionHost> {
     host: &'h H,
     sid: u64,
     /// `None` when the host does not resolve `sid`: nothing was read, so nothing
+    /// is written back.
     saved: Option<TextSelection>,
 }
 
@@ -192,6 +194,7 @@ pub fn check_screen_witness<H: SessionHost>(host: &H, sid: u64, witness: &str) -
 }
 
 /// How many live rows carry anything at all — the failure detail for a missing
+/// witness, and 0 for a host that does not serve `sid`.
 fn non_blank_rows<H: SessionHost>(host: &H, sid: u64) -> usize {
     host.with_terminal(sid, |t: &Terminal| {
         (0..i32::from(t.rows()))
@@ -366,6 +369,7 @@ pub fn check_resolve<H: SessionHost>(host: &H, sid: u64) -> Outcome {
 }
 
 /// A sid no roster row carries, so `resolve`'s fail-closed arm cannot accidentally
+/// name a real neighbour session and read its miss as a lie.
 fn unrostered_sid<H: SessionHost>(host: &H, sid: u64) -> u64 {
     let roster = host.sessions();
     let mut candidate = sid.wrapping_add(1);
@@ -376,6 +380,7 @@ fn unrostered_sid<H: SessionHost>(host: &H, sid: u64) -> u64 {
 }
 
 /// A sid this host does not serve (not the same as "unrostered"), as
+/// [`check_unserved_sid`] needs.
 fn unserved_sid<H: SessionHost>(host: &H, sid: u64) -> Option<u64> {
     let roster = host.sessions();
     let serves = |c: u64| host.with_terminal(c, |_: &Terminal| ()).is_some();
@@ -463,6 +468,8 @@ pub fn check_selection<H: SessionHost>(host: &H, sid: u64) -> Outcome {
 }
 
 /// The first live-screen row with non-blank text, and the text `select line`
+/// selects there: the only content a check can select and read back without
+/// writing.
 fn first_text_row<H: SessionHost>(host: &H, sid: u64) -> Option<(i32, String)> {
     host.with_terminal(sid, |t: &Terminal| {
         (0..i32::from(t.rows())).find_map(|row| {
@@ -536,6 +543,7 @@ fn block_count(reply: &str) -> Option<usize> {
 }
 
 /// Shared change counter + condvar: the producer bumps and broadcasts, a
+/// [`MemoryWait`] parks on a value newer than the one it registered at.
 #[cfg(test)]
 type ChangeSignal = Arc<(Mutex<u64>, Condvar)>;
 
@@ -544,6 +552,7 @@ type ChangeSignal = Arc<(Mutex<u64>, Condvar)>;
 pub struct MemoryHost {
     sid: u64,
     /// The stable fabric id this host rosters `sid` under — the `s-<20 hex>` shape
+    /// a real session mints, derived from `sid` so a check can predict it.
     id: String,
     term: Arc<Mutex<Terminal>>,
     clipboard: Mutex<Option<String>>,
@@ -622,6 +631,7 @@ impl MemoryHost {
 }
 
 /// A registration on [`MemoryHost`]'s change counter, holding the value it saw
+/// at registration so a bump in the register→recheck gap is not lost.
 #[cfg(test)]
 struct MemoryWait {
     changed: ChangeSignal,
@@ -718,6 +728,7 @@ mod tests {
     use super::*;
 
     /// The clipboard-less host answers `ERR unsupported` for `copy` — the
+    /// capability flag is load-bearing, not decorative.
     #[test]
     fn a_host_without_a_clipboard_refuses_copy() {
         let host = MemoryHost::without_clipboard(7);
@@ -728,6 +739,7 @@ mod tests {
     }
 
     /// A sid the host does not resolve is refused by every verb, rather than
+    /// answered with whatever session the host does have.
     #[test]
     fn an_unresolved_sid_is_refused() {
         let host = MemoryHost::new(7);
@@ -745,6 +757,8 @@ mod tests {
     }
 
     /// `blocks --json` gives where the shell's `133;B` put the input's start
+    /// (the column after the prompt), whatever was typed after it, which tells
+    /// typeahead from the prompt.
     #[test]
     fn blocks_json_says_the_column_the_input_starts_at() {
         let host = MemoryHost::new(7);
@@ -762,6 +776,11 @@ mod tests {
     }
 
     /// `blocks --json` carries a cwd (OSC 7) and a command line (OSC 633 E)
+    /// that a program chose, and a person may read the reply raw on a
+    /// terminal: no character a terminal acts on or reorders text around
+    /// (C0, DEL, C1, bidi, U+2028/9) reaches the reply's bytes — each is a
+    /// `\uXXXX` escape — and a JSON reader still decodes both fields to exactly
+    /// what the program sent.
     #[test]
     fn blocks_json_escapes_what_a_terminal_acts_on_and_decodes_back() {
         let host = MemoryHost::new(0);
@@ -801,6 +820,7 @@ mod tests {
     }
 
     /// The verbs are wired to the host's real terminal and clipboard: drive a
+    /// selection over live content, read it back, and copy it.
     #[test]
     fn select_reads_back_and_copies_live_content() {
         let host = MemoryHost::new(0);
@@ -814,6 +834,7 @@ mod tests {
     }
 
     /// `wait` parks on the host's change signal and reports the completion that
+    /// lands while it is parked — the event-driven path, not a poll.
     #[test]
     fn wait_reports_a_completion_that_lands_while_parked() {
         let host = MemoryHost::new(0);
@@ -839,6 +860,7 @@ mod tests {
     }
 
     /// `wait <ms>` reads its `<ms>` strictly: a tail that is not a whole number of
+    /// milliseconds is the usage line.
     #[test]
     fn a_wait_ms_that_is_not_a_number_is_the_usage_line() {
         let host = MemoryHost::new(0);
@@ -866,6 +888,7 @@ mod tests {
     }
 
     /// `blocks`/`blocktext` over real OSC-133 content, so `check_blocks` sees a
+    /// non-empty block list.
     #[test]
     fn the_block_checks_hold_on_a_populated_session() {
         let host = MemoryHost::new(0);
@@ -883,9 +906,13 @@ mod tests {
     }
 
     /// A block's cwd reaches the wire through [`SessionHost::native_cwd`] in
+    /// both `blocks` forms: the default prints the engine's RFC 8089 path
+    /// verbatim; a host may name paths its own way (the Windows GUI prints
+    /// `C:\Users\x` for pwsh's `file:///C:/Users//x`).
     #[test]
     fn a_block_cwd_is_printed_through_the_hosts_native_cwd() {
         /// [`MemoryHost`] with only the path naming changed, marked so the
+        /// assertion cannot pass by coincidence on any platform.
         struct Renaming(MemoryHost);
         impl SessionHost for Renaming {
             fn capabilities(&self) -> HostCapabilities {

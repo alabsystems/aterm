@@ -1,47 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The per-edge, op-scoped, fail-closed authority table (design §7.1, A.6).
-//!
-//! An [`Edge`] is one directed `src → dst` authority for one [`Op`]. A cycle
-//! `A → B → A` is two independent rows; a self-loop `A → A` is the one row
-//! `(A, A, op)`. [`decide_edge`] is a point lookup, never a reachability walk, so no
-//! graph shape can accumulate authority transitively.
+//! Per-edge, operation-scoped, fail-closed session authority table.
 
 use std::collections::HashMap;
 
 use crate::id::{LaunchNonce, SessionId};
 use crate::{from_hex, hex};
 
-/// The operation an edge authorizes. Split so a `WriteInput` edge cannot signal
-/// and a `ReadScreen` edge cannot write (design §7.2).
+/// Operation authorized by a session [`Edge`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Op {
-    /// Read the rendered surface (screen/cells/blocks/scrollback/search/image/
-    /// timeline). The least-power edge.
+    /// Read the rendered terminal surface.
     ReadScreen,
-    /// Inject input: the full human vocabulary (keys, mouse, wheel, selection,
-    /// paste, resize, focus), all converging on the one `App::input` seam.
+    /// Inject input events (keys, mouse, paste, resize, focus).
     WriteInput,
-    /// Signal the destination's foreground process group (a human's Ctrl-C is a
-    /// byte, not this out-of-band signal).
+    /// Send an out-of-band signal to the destination's foreground process group.
     Signal,
-    /// Rewrite the destination's durable configuration (`settings set|unset` →
-    /// `aterm.toml`). Separate from `WriteInput` so an input edge cannot flip a
-    /// default-off security knob (allow_osc52_query/window_ops/…). Not
-    /// provisioned to child edges.
+    /// Modify the destination's durable configuration.
     ConfigWrite,
-    /// Copy the destination's selection onto the system clipboard (the `copy`
-    /// exfiltration boundary). Separate from `ReadScreen` because writing the OS
-    /// pasteboard leaves the process. Not provisioned to child edges.
+    /// Copy the destination's selection to the system clipboard.
     ClipboardWrite,
-    /// Feed bytes derived from a read of an untrusted node back as input (the
-    /// semantic-cycle path); off by default (§7.6).
+    /// Feed bytes derived from reading an untrusted node back as input.
     DeriveLoop,
 }
 
 impl Op {
-    /// The stable wire token (e.g. for the ctl `grant <src> <op>` verb).
+    /// Returns the wire token for this operation.
     #[must_use]
     #[inline]
     pub const fn as_str(self) -> &'static str {
@@ -55,7 +40,7 @@ impl Op {
         }
     }
 
-    /// Parse the wire token. Unknown strings return `None` (fail closed).
+    /// Parses an [`Op`] from its wire token.
     #[must_use]
     #[inline]
     pub fn parse(s: &str) -> Option<Op> {
@@ -70,21 +55,21 @@ impl Op {
         }
     }
 
-    /// Whether `self` is part of the standard human-seat vocabulary (`ReadScreen`, `WriteInput`, `Signal`).
+    /// Returns whether `self` is part of the standard human-seat vocabulary.
     #[must_use]
     #[inline]
     pub const fn is_human_seat_op(self) -> bool {
         matches!(self, Op::ReadScreen | Op::WriteInput | Op::Signal)
     }
 
-    /// Whether `self` is an elevated authority never minted by [`ConnectionKind`].
+    /// Returns whether `self` is an elevated authority not minted by [`ConnectionKind`].
     #[must_use]
     #[inline]
     pub const fn is_elevated_op(self) -> bool {
         matches!(self, Op::ConfigWrite | Op::ClipboardWrite | Op::DeriveLoop)
     }
 
-    /// Whether `self` mutates or signals the destination session (`!ReadScreen`).
+    /// Returns whether `self` mutates or signals the destination session.
     #[must_use]
     #[inline]
     pub const fn mutates_destination(self) -> bool {
@@ -92,27 +77,19 @@ impl Op {
     }
 }
 
-/// The connection vocabulary the UX and wire mint in, deliberately smaller than
-/// [`Op`]. **Push** is the full human seat: keystrokes plus the Ctrl-C-class
-/// signal ([`Op::WriteInput`] + [`Op::Signal`], never one without the other).
-/// **Pull** is the rendered screen as a human reads it ([`Op::ReadScreen`]). No
-/// kind spells `ConfigWrite`/`ClipboardWrite`/`DeriveLoop`, so a connection
-/// cannot mint those greater authorities: unrepresentable, not merely unchecked.
+/// High-level connection direction minting standard human-seat [`Op`]s.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ConnectionKind {
-    /// Read the destination's rendered surface: what a human at that terminal
-    /// sees, and nothing more.
+    /// Read the destination's rendered surface (`ReadScreen`).
     Pull,
-    /// Drive the destination as a human would sit at it: inject input and
-    /// signal its foreground process group.
+    /// Inject input and signal the destination (`WriteInput` and `Signal`).
     Push,
-    /// Both directions of authority over the destination: pull + push.
+    /// Both `Pull` and `Push` authority.
     Both,
 }
 
 impl ConnectionKind {
-    /// The exact ops this kind mints; [`EdgeTable::grant_connection`] draws only
-    /// from these.
+    /// Returns the slice of [`Op`]s granted by this connection kind.
     #[must_use]
     #[inline]
     pub const fn ops(&self) -> &'static [Op] {
@@ -123,7 +100,7 @@ impl ConnectionKind {
         }
     }
 
-    /// Number of [`Op`]s granted by this connection kind (`1`, `2`, or `3`).
+    /// Returns the number of [`Op`]s granted by this connection kind.
     #[must_use]
     #[inline]
     pub const fn op_count(self) -> usize {
@@ -134,21 +111,21 @@ impl ConnectionKind {
         }
     }
 
-    /// Whether this connection kind includes read-screen (`Pull` or `Both`).
+    /// Returns whether this connection kind includes `ReadScreen`.
     #[must_use]
     #[inline]
     pub const fn includes_pull(self) -> bool {
         matches!(self, ConnectionKind::Pull | ConnectionKind::Both)
     }
 
-    /// Whether this connection kind includes write-input + signal (`Push` or `Both`).
+    /// Returns whether this connection kind includes `WriteInput` and `Signal`.
     #[must_use]
     #[inline]
     pub const fn includes_push(self) -> bool {
         matches!(self, ConnectionKind::Push | ConnectionKind::Both)
     }
 
-    /// Whether this connection kind grants `op`.
+    /// Returns whether this connection kind grants `op`.
     #[must_use]
     #[inline]
     pub const fn grants_op(self, op: Op) -> bool {
@@ -160,8 +137,7 @@ impl ConnectionKind {
     }
 }
 
-/// A directed authority edge `src → dst` for one [`Op`]: a labelled row, with no
-/// graph object and no traversal.
+/// Directed authority edge `src → dst` for a single [`Op`].
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Edge {
     pub src: SessionId,
@@ -169,29 +145,26 @@ pub struct Edge {
     pub op: Op,
 }
 
-/// An unforgeable per-edge bearer secret (design §7.1): 32 random bytes recorded
-/// in the destination's [`EdgeTable`] and presented by the source on every `ctl`
-/// connect. Not the per-instance token: holding `(A, B, WriteInput)` confers
-/// nothing toward `(B, A, *)`. Redacted in `Debug`; never logged in the clear.
+/// Unforgeable 32-byte per-edge bearer secret.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EdgeToken([u8; 32]);
 
 impl EdgeToken {
-    /// Wrap raw token bytes (e.g. a token the launcher provisioned out-of-band).
+    /// Wraps raw 32-byte token bytes.
     #[must_use]
     #[inline]
     pub const fn from_bytes(b: [u8; 32]) -> Self {
         Self(b)
     }
 
-    /// The raw token bytes.
+    /// Returns the raw 32-byte token bytes.
     #[must_use]
     #[inline]
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 
-    /// Mint a fresh random token from the OS CSPRNG.
+    /// Mints a random token from the OS CSPRNG.
     #[must_use]
     pub fn generate() -> Self {
         let mut b = [0u8; 32];
@@ -199,13 +172,13 @@ impl EdgeToken {
         Self(b)
     }
 
-    /// Lowercase-hex (64 chars), the `TOKEN <hex>` handshake form.
+    /// Encodes the token as 64 lowercase hex characters.
     #[must_use]
     pub fn to_hex(&self) -> String {
         hex(&self.0)
     }
 
-    /// Parse from the 64-char hex handshake form.
+    /// Parses a token from a 64-character hex string.
     #[must_use]
     pub fn from_hex(s: &str) -> Option<Self> {
         let mut b = [0u8; 32];
@@ -213,7 +186,7 @@ impl EdgeToken {
         Some(Self(b))
     }
 
-    /// Constant-time equality, for any comparison outside the table lookup.
+    /// Compares two tokens in constant time.
     #[must_use]
     pub fn ct_eq(&self, other: &Self) -> bool {
         crate::ct_eq(&self.0, &other.0)
@@ -236,17 +209,14 @@ struct EdgeEntry {
     nonce: LaunchNonce,
 }
 
-/// The destination-side table mapping each presented [`EdgeToken`] to the
-/// `(src, dst, op, launch-nonce)` it authorizes. Empty by default; an absent
-/// token means no authority (fail closed). Storing `dst` per row keeps it correct
-/// if one process serves several sessions.
+/// Destination-side table mapping each [`EdgeToken`] to its authorized `(src, dst, op, nonce)`.
 #[derive(Default)]
 pub struct EdgeTable {
     rows: HashMap<EdgeToken, EdgeEntry>,
 }
 
 impl EdgeTable {
-    /// A fresh, empty table: no authority.
+    /// Creates an empty [`EdgeTable`].
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -254,12 +224,7 @@ impl EdgeTable {
         }
     }
 
-    /// Mint and record a new edge, returning the bearer token the source
-    /// presents. `nonce` is the destination's current launch nonce, so the edge
-    /// fails closed across a restart.
-    // Skip: `HashMap::insert` can formally panic on capacity overflow, unreachable at
-    // one row per owner-requested grant; the key's derived Hash/Eq is panic-free.
-    // Audited-alloc class; verify-only.
+    /// Mints and records a new edge, returning its bearer token.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn grant(
         &mut self,
@@ -281,12 +246,7 @@ impl EdgeTable {
         token
     }
 
-    /// Mint one edge per op of `kind` from `src` into this (the destination's)
-    /// table, returning the `(op, token)` pairs to deliver to the source. This is
-    /// the one connection mint path (the `connect` verb and the UI). Ops come only
-    /// from [`ConnectionKind::ops`]; there is no raw-op parameter. A self-loop
-    /// (`src == dst`) is refused (empty `Vec`, nothing minted) so a
-    /// connection-to-self never becomes authority by accident.
+    /// Mints one edge per operation of `kind` from `src` to `dst`.
     #[must_use]
     pub fn grant_connection(
         &mut self,
@@ -304,10 +264,7 @@ impl EdgeTable {
             .collect()
     }
 
-    /// Record a pre-minted token (e.g. one the launcher provisioned under the
-    /// `control_auth` file discipline). Returns `false` and records nothing if the
-    /// token exists: minting never overwrites a live edge.
-    // Skip: same audited `HashMap::insert` alloc class as `grant` above.
+    /// Records a pre-minted token, returning `false` if the token already exists.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn insert(
         &mut self,
@@ -332,30 +289,18 @@ impl EdgeTable {
         true
     }
 
-    /// Remove an edge. Returns `true` if it existed (the basis for `revoke`).
-    // Skip: `HashMap::remove` does not allocate and the key's Hash/Eq is
-    // panic-free, but keyed-op totality is unproved; audited like `grant`.
+    /// Removes the edge for `token`, returning `true` if it was present.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn revoke(&mut self, token: &EdgeToken) -> bool {
         self.rows.remove(token).is_some()
     }
 
-    /// Remove every row whose src is `src` (any op) and return the count: the
-    /// source-death sweep. Required for safety: a destination restart fails
-    /// closed via its nonce, but a dead source's tokens stay live against a
-    /// running destination, and tokens are deliberately non-enumerable
-    /// ([`EdgeTable::edges`]), so nothing else could revoke them.
+    /// Removes all edges from `src` and returns the number removed.
     pub fn revoke_src(&mut self, src: &SessionId) -> usize {
         self.revoke_src_ops(src, None)
     }
 
-    /// [`EdgeTable::revoke_src`] with an op filter: remove rows whose src is
-    /// `src` and whose op is in `ops` (`None` = any op). This lets the
-    /// `disconnect … kind=` verb revoke exactly the push half and keep pull, for
-    /// rows whose token was never recorded.
-    // Skip: `HashMap::retain` does not allocate; the closure is panic-free
-    // (derived Hash/Eq, `SessionId` equality, slice `contains`). Same tier as
-    // `revoke`. `saturating_sub` is exact since retain never grows the map.
+    /// Removes edges from `src` matching `ops` (`None` removes all ops) and returns the count.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn revoke_src_ops(&mut self, src: &SessionId, ops: Option<&[Op]>) -> usize {
         let before = self.rows.len();
@@ -364,10 +309,7 @@ impl EdgeTable {
         before.saturating_sub(self.rows.len())
     }
 
-    /// Resolve a presented token to the op it authorizes, if it is a live edge
-    /// whose dst and launch nonce match `dst`/`nonce`; `None` on any miss or
-    /// mismatch. The `ctl` auth handshake uses it to scope a connection to one
-    /// op. Same predicate as [`decide_edge`], returning the op instead of taking it.
+    /// Returns the authorized [`Op`] if `token` matches `dst` and `current_nonce`.
     #[must_use]
     pub fn authorize(
         &self,
@@ -383,24 +325,19 @@ impl EdgeTable {
         }
     }
 
-    /// Retain only grants for `op` in this table. Hosts can retire write
-    /// authority while sharing the same read grants with closed-log readers
-    /// and already-resolved revokers; no row moves to a second table.
-    // Skip: `HashMap::retain` does not allocate and the derived Op equality
-    // is panic-free. Same audited tier as `revoke_src_ops`.
+    /// Retains only grants for `op` in this table.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn keep_only(&mut self, op: Op) {
         self.rows.retain(|_, e| e.op == op);
     }
 
-    /// The source bound to a token, for audit (`who injected into whom`).
+    /// Returns the source session bound to `token`.
     #[must_use]
     pub fn src_of(&self, token: &EdgeToken) -> Option<&SessionId> {
         self.rows.get(token).map(|e| &e.src)
     }
 
-    /// The `(src, dst, op)` bound to a token, which the audit seam records
-    /// before [`EdgeTable::revoke`] deletes the row. Exposes no token.
+    /// Returns the [`Edge`] bound to `token`.
     #[must_use]
     pub fn edge_of(&self, token: &EdgeToken) -> Option<Edge> {
         self.rows.get(token).map(|e| Edge {
@@ -410,9 +347,7 @@ impl EdgeTable {
         })
     }
 
-    /// Every live edge as `(src, dst, op)`, for the `edges`/`grants` control
-    /// verb. The bearer token is deliberately omitted: enumerating the table must
-    /// never leak a capability. Order is arbitrary; callers sort.
+    /// Returns all live edges as `(src, dst, op)` records.
     #[must_use]
     pub fn edges(&self) -> Vec<Edge> {
         self.rows
@@ -425,14 +360,14 @@ impl EdgeTable {
             .collect()
     }
 
-    /// Number of live edges.
+    /// Returns the number of live edges.
     #[must_use]
     #[inline]
     pub fn len(&self) -> usize {
         self.rows.len()
     }
 
-    /// Whether the table holds no edges.
+    /// Returns whether the table contains no edges.
     #[must_use]
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -440,17 +375,17 @@ impl EdgeTable {
     }
 }
 
-/// The decision [`decide_edge`] returns.
+/// Authorization verdict returned by [`decide_edge`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EdgeDecision {
-    /// The edge is authorized for this exact `(token, dst, op, nonce)`.
+    /// The edge is authorized for the exact `(token, dst, op, nonce)`.
     Permit,
-    /// Default. Any miss or mismatch denies — fail closed.
+    /// Authorization denied (fail closed).
     Deny,
 }
 
 impl EdgeDecision {
-    /// Whether the decision permits the action.
+    /// Returns whether the decision is [`EdgeDecision::Permit`].
     #[must_use]
     #[inline]
     pub const fn is_permitted(self) -> bool {
@@ -458,14 +393,7 @@ impl EdgeDecision {
     }
 }
 
-/// Total, fail-closed, per-call authority gate (design §7.1). Default `Deny`.
-///
-/// Permits iff the presented token is recorded and its op `== op`, its dst
-/// `== dst`, and its recorded launch nonce matches `nonce` (the target has not
-/// restarted under the same name/pid). Any miss or mismatch denies.
-///
-/// Never traverses the graph: each edge is an independent row, and holding one
-/// token says nothing about any other.
+/// Evaluates whether `token` authorizes `op` on `dst` at `current_nonce`.
 #[must_use]
 pub fn decide_edge(
     table: &EdgeTable,
@@ -544,7 +472,6 @@ mod tests {
             EdgeDecision::Permit
         );
 
-        // Wrong op denies (a write token cannot read or signal).
         assert_eq!(
             decide_edge(&tbl, &tok, &b, Op::ReadScreen, &nonce),
             EdgeDecision::Deny
@@ -554,20 +481,17 @@ mod tests {
             EdgeDecision::Deny
         );
 
-        // Wrong dst denies (a token minted for B cannot drive A).
         assert_eq!(
             decide_edge(&tbl, &tok, &a, Op::WriteInput, &nonce),
             EdgeDecision::Deny
         );
 
-        // Wrong nonce denies (target restarted -> fail closed).
         let restarted = LaunchNonce::from_bytes([9u8; 16]);
         assert_eq!(
             decide_edge(&tbl, &tok, &b, Op::WriteInput, &restarted),
             EdgeDecision::Deny
         );
 
-        // Unknown token denies (default fail-closed).
         assert_eq!(
             decide_edge(&tbl, &EdgeToken::generate(), &b, Op::WriteInput, &nonce),
             EdgeDecision::Deny
@@ -593,9 +517,7 @@ mod tests {
         let (a, b, nonce) = ids();
         let mut tbl = EdgeTable::new();
         let tok = tbl.grant(a, b.clone(), Op::ReadScreen, nonce);
-        // A live edge resolves to its op (what the ctl handshake scopes the conn to).
         assert_eq!(tbl.authorize(&tok, &b, &nonce), Some(Op::ReadScreen));
-        // Wrong dst / restarted nonce / unknown token all fail closed.
         assert_eq!(tbl.authorize(&tok, &SessionId::new("s-x"), &nonce), None);
         assert_eq!(
             tbl.authorize(&tok, &b, &LaunchNonce::from_bytes([0u8; 16])),
@@ -615,7 +537,6 @@ mod tests {
         let mut got = tbl.edges();
         assert_eq!(got.len(), 2, "both granted edges enumerate");
         got.sort_by_key(|e| e.op.as_str());
-        // An Edge carries only (src, dst, op), so no token is reachable through it.
         assert_eq!(
             got[0],
             Edge {
@@ -643,8 +564,6 @@ mod tests {
         let (a, b, nonce) = ids();
         let mut tbl = EdgeTable::new();
         let tok = tbl.grant(a.clone(), b.clone(), Op::Signal, nonce);
-        // A live token resolves to its (src, dst, op), the triple the audit seam
-        // records before `revoke` deletes the row.
         assert_eq!(
             tbl.edge_of(&tok),
             Some(Edge {
@@ -653,7 +572,6 @@ mod tests {
                 op: Op::Signal
             })
         );
-        // An unknown (or revoked) token resolves to nothing — fail closed.
         assert_eq!(tbl.edge_of(&EdgeToken::generate()), None);
         tbl.revoke(&tok);
         assert_eq!(tbl.edge_of(&tok), None);
@@ -666,23 +584,18 @@ mod tests {
         let na = LaunchNonce::from_bytes([1u8; 16]);
         let nb = LaunchNonce::from_bytes([2u8; 16]);
 
-        // A cycle A->B->A is two independent rows, in two tables (one per dst).
-        let mut tbl_b = EdgeTable::new(); // edges whose dst is B
-        let mut tbl_a = EdgeTable::new(); // edges whose dst is A
+        let mut tbl_b = EdgeTable::new();
+        let mut tbl_a = EdgeTable::new();
         let tok_ab = tbl_b.grant(a.clone(), b.clone(), Op::WriteInput, nb);
         let tok_ba = tbl_a.grant(b.clone(), a.clone(), Op::WriteInput, na);
 
-        // Each token only works for its own (dst, nonce); holding one says nothing
-        // about the other direction.
         assert!(decide_edge(&tbl_b, &tok_ab, &b, Op::WriteInput, &nb).is_permitted());
         assert!(decide_edge(&tbl_a, &tok_ba, &a, Op::WriteInput, &na).is_permitted());
-        // tok_ab presented against A's table (the reverse edge) -> Deny.
         assert_eq!(
             decide_edge(&tbl_a, &tok_ab, &a, Op::WriteInput, &na),
             EdgeDecision::Deny
         );
 
-        // A self-loop A->A is the single row (A,A,op): one grant, permits A driving A.
         let mut tbl_self = EdgeTable::new();
         let tok_aa = tbl_self.grant(a.clone(), a.clone(), Op::WriteInput, na);
         assert!(decide_edge(&tbl_self, &tok_aa, &a, Op::WriteInput, &na).is_permitted());
@@ -697,8 +610,6 @@ mod tests {
         let t2 = tbl.grant(a.clone(), b.clone(), Op::WriteInput, nonce);
         let t3 = tbl.grant(c.clone(), b.clone(), Op::WriteInput, nonce);
 
-        // Sweeping A drops BOTH of A's rows (any op) and counts them; C's row
-        // — same dst, different src — survives untouched.
         assert_eq!(tbl.revoke_src(&a), 2);
         assert_eq!(
             decide_edge(&tbl, &t1, &b, Op::ReadScreen, &nonce),
@@ -724,7 +635,6 @@ mod tests {
         let sig = tbl.grant(a.clone(), b.clone(), Op::Signal, nonce);
         let other = tbl.grant(c.clone(), b.clone(), Op::WriteInput, nonce);
 
-        // The push half (write-input + signal) sweeps; pull survives.
         assert_eq!(
             tbl.revoke_src_ops(&a, Some(&[Op::WriteInput, Op::Signal])),
             2
@@ -738,10 +648,8 @@ mod tests {
             decide_edge(&tbl, &sig, &b, Op::Signal, &nonce),
             EdgeDecision::Deny
         );
-        // A different source's row of a filtered op is untouched.
         assert!(decide_edge(&tbl, &other, &b, Op::WriteInput, &nonce).is_permitted());
 
-        // A filter matching nothing removes nothing; `None` is the bare sweep.
         assert_eq!(tbl.revoke_src_ops(&a, Some(&[Op::Signal])), 0);
         assert_eq!(tbl.revoke_src_ops(&a, None), 1);
         assert_eq!(tbl.len(), 1, "only the foreign source's row remains");
@@ -755,7 +663,6 @@ mod tests {
             ConnectionKind::Both.ops(),
             [Op::ReadScreen, Op::WriteInput, Op::Signal]
         );
-        // The greater authorities are unreachable through any kind.
         for kind in [
             ConnectionKind::Pull,
             ConnectionKind::Push,
@@ -815,7 +722,6 @@ mod tests {
             assert!(decide_edge(&tbl, tok, &b, *op, &nonce).is_permitted());
         }
 
-        // Source death sweeps the whole connection; every token now denies.
         assert_eq!(tbl.revoke_src(&a), 2);
         for (op, tok) in &minted {
             assert_eq!(decide_edge(&tbl, tok, &b, *op, &nonce), EdgeDecision::Deny);

@@ -26,6 +26,7 @@ pub(crate) enum ChromeSurface {
 
 impl ChromeSurface {
     /// The title's grapheme cap on this surface — `None` where the surface
+    /// fits the label itself.
     const fn title_cap(self) -> Option<usize> {
         match self {
             Self::TabStrip => None,
@@ -142,6 +143,8 @@ impl LabelCache {
 }
 
 /// True when the chrome sanitizer and the surface's grapheme cap (`title_cap`,
+/// `None` for the strip) pass `title` through byte-identical, so the label may
+/// keep it as-is.
 fn title_is_presentation_clean(title: &str, title_cap: Option<usize>) -> bool {
     title_cap.is_none_or(|max_graphemes| title.len() <= max_graphemes)
         && !title.starts_with(' ')
@@ -263,6 +266,9 @@ mod tests {
     use aterm_grapheme::GraphemeClusters as _;
 
     /// A SNAPSHOT OF AN AGENT'S TITLE DROPS ITS SPINNER FRAME (the Together
+    /// run's D7: `⠦ Add tested calculator functions | proj-codex` on the
+    /// Settings ▸ Harness row, drawn as a blank indent): every braille frame
+    /// and every circle or corner frame, generally — not one glyph.
     #[test]
     fn a_titles_leading_spinner_frame_is_dropped_and_nothing_else() {
         let subject = "Add tested calculator functions | proj-codex";
@@ -340,7 +346,7 @@ mod tests {
         );
     }
 
-    /// THE DEEP-SIBLINGS DEFECT, at the presenter. The strip's label used to
+    /// THE DEEP-SIBLINGS DEFECT, at the presenter.
     #[test]
     fn the_strip_surface_presents_the_whole_title_and_the_window_surface_the_capped_one() {
         let cache = LabelCache::default();
@@ -405,6 +411,8 @@ mod tests {
     }
 
     /// The per-frame contract: an unchanged title is a cache hit on each
+    /// surface, the two surfaces never evict each other, a title change
+    /// presents exactly once, and retirement drops the session's slots.
     #[test]
     fn labels_cache_per_session_and_surface_until_the_title_changes() {
         let cache = LabelCache::default();
@@ -443,6 +451,8 @@ mod tests {
     }
 
     /// The clean-title fast path must be indistinguishable from the full
+    /// sanitize/grapheme presentation on BOTH surfaces, and must reject every
+    /// title the sanitizer — or the surface's cap — would actually rewrite.
     #[test]
     fn clean_title_fast_path_matches_full_presentation() {
         let cache = LabelCache::default();
@@ -508,6 +518,7 @@ mod tests {
     }
 
     /// A strip label on its way to a surface that paints it WHOLE takes the
+    /// cap there by the middle cut; a label within it is borrowed.
     #[test]
     fn a_capped_label_borrows_within_the_cap_and_middle_cuts_past_it() {
         let x = |n: usize| "x".repeat(n);

@@ -44,6 +44,7 @@ pub(crate) const SOCK_FILE: &str = control_socket::LATEST_SOCK_FILE;
 pub(crate) const IMAGES_DIR: &str = "images";
 
 /// Server-auto-named captures live below this private child, separated from
+/// caller-explicit filenames so retention can never delete an explicit target.
 const AUTO_IMAGES_DIR: &str = "auto";
 
 /// Subdirectory for video introspection recordings.
@@ -106,10 +107,14 @@ pub(crate) fn enter_low_nofile_test_child(spare_descriptors: usize) -> bool {
 }
 
 /// One conservative filesystem-wide lock excludes concurrent explicit image
+/// writes in the shared `images/` namespace.
 const CAPTURE_LOCK_DIR: &str = ".capture-locks";
 const CAPTURE_NAMESPACE_LEASE_FILE: &str = "explicit";
 
 /// How long an explicit capture waits for the previous reply's retention guard before it
+/// refuses: long enough that overlapping drivers queue (a guard is released at its client's
+/// acknowledgement), short enough that a stuck holder is reported rather than hanging the
+/// control thread.
 const CAPTURE_NAMESPACE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Stable, collision-resistant identity for this server process instance.
@@ -145,9 +150,10 @@ pub(crate) fn automatic_capture_name(stem: &str) -> String {
 pub(crate) struct ArtifactPathLease {
     key: Option<PathBuf>,
     os_lock: Option<crate::native_document_host::HeldAdvisoryLock>,
-    /// Capability local to this lease. It shares the lease owner's admitted
+    /// Capability local to this lease.
     video_sweep: Option<VideoRetentionSweep>,
     /// Automatic-image namespace GC is armed by both the target and its wire
+    /// lease.
     _deferred_cleanup: Option<std::sync::Arc<DeferredImageCleanup>>,
 }
 
@@ -237,7 +243,7 @@ fn artifact_path_leases() -> &'static (
     })
 }
 
-/// Serialize each bounded retention census with its mutations. Per-artifact
+/// Serialize each bounded retention census with its mutations.
 fn retention_sweep_gate() -> &'static std::sync::Mutex<()> {
     static GATE: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     GATE.get_or_init(|| std::sync::Mutex::new(()))
@@ -260,16 +266,19 @@ struct VideoLeaseIdentity {
 struct ArtifactLeaseState {
     count: usize,
     /// Values, not retained handles: every descriptor remains owned by an
+    /// admitted producer/reader lease.
     video_identity: Option<VideoLeaseIdentity>,
     /// Set at the marker visibility boundary or after a reader's final closed
+    /// identity validation.
     video_sweep_requested: bool,
     /// A count-zero entry remains present while its capability-bound sweep runs.
     sweeping: bool,
-    /// Reserved when this distinct video key first enters the registry. The
+    /// Reserved when this distinct video key first enters the registry.
     video_retention: Option<crate::control::VideoRetentionPermit>,
 }
 
 /// One reserved place in the cleanup queue, shared by every clone of the task
+/// that carries it (a panic's recovery copy) and given back when the last goes.
 #[derive(Clone, Debug)]
 struct ArtifactCleanupQueuePermit {
     _slot: std::sync::Arc<crate::budget::Slot>,
@@ -401,6 +410,7 @@ enum ArtifactCleanupTask {
     #[cfg(test)]
     Barrier(std::sync::mpsc::SyncSender<()>),
     /// Parks the worker between two rendezvous on the barrier — see
+    /// [`hold_artifact_cleanup_for_test`].
     #[cfg(all(test, unix))]
     Hold(std::sync::Arc<std::sync::Barrier>),
     #[cfg(test)]
@@ -491,8 +501,10 @@ struct VideoRetentionTask {
     root: Option<crate::pinned_dir::PinnedDir>,
     fresh: std::ffi::OsString,
     /// Last so the retained directory chain closes before its reservation is
+    /// made available to another distinct artifact key.
     admission: Option<crate::control::VideoRetentionPermit>,
     /// Last so every retained descriptor and its admission token are released
+    /// before the registry wakes a waiter, including during panic unwinding.
     _completion: VideoRetentionCompletion,
 }
 
@@ -605,6 +617,7 @@ fn pending_dead_namespace_sweeps()
 }
 
 /// Coalesce repeated capture-time GC requests and hand the actual directory
+/// census to the single bounded cleanup worker.
 fn schedule_dead_instance_namespace_sweep(
     root: &Path,
     current: &str,
@@ -1168,6 +1181,7 @@ pub(crate) fn acquire_capture_name_lease_with_wait(
 }
 
 /// Retain an already-published recording while a `video frames` reply is read,
+/// queued, written, consumed, and acknowledged.
 fn join_video_artifact_state(
     state: &mut ArtifactLeaseState,
     identity: VideoLeaseIdentity,
@@ -1443,6 +1457,7 @@ fn metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
 }
 
 /// Test-only: a point between one of this module's checks and the re-check
+/// that repeats it before the use.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RaceWindow {
@@ -1579,6 +1594,7 @@ pub(crate) fn decide_instance_namespace_sweep(
 }
 
 /// Open one namespace's real, direct-child lock file without following a
+/// symlink/reparse point.
 fn open_private_namespace_lock(
     namespace: &Path,
     file_name: &std::ffi::OsStr,
@@ -1669,12 +1685,12 @@ fn open_private_namespace_lock(
     Ok(file)
 }
 
-/// Open the launch-identity lease. Unlike the PID embedded in the namespace
+/// Open the launch-identity lease.
 fn open_instance_lease(namespace: &Path, create: bool) -> std::io::Result<std::fs::File> {
     open_private_namespace_lock(namespace, std::ffi::OsStr::new(INSTANCE_LEASE_FILE), create)
 }
 
-/// Hold the current launch's lease until process exit. A process can have both
+/// Hold the current launch's lease until process exit.
 fn hold_current_instance_lease(namespace: &Path) -> std::io::Result<()> {
     type Held = crate::native_document_host::HeldAdvisoryLock;
     static LEASES: std::sync::OnceLock<std::sync::Mutex<Vec<(PathBuf, Held)>>> =
@@ -1699,7 +1715,7 @@ fn hold_current_instance_lease(namespace: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Remove only namespaces proven abandoned. New namespaces carry an advisory
+/// Remove only namespaces proven abandoned.
 const DEAD_INSTANCE_SCAN_LIMIT: usize = 256;
 const DEAD_INSTANCE_DELETE_LIMIT: usize = 16_384;
 const DEAD_INSTANCE_TOMBSTONE_PREFIX: &str = ".instance-prune-";
@@ -1736,6 +1752,7 @@ struct DeadNamespaceSweep {
     entries: std::fs::ReadDir,
     current: String,
     /// Retained across continuation batches, so requeueing cannot exceed the
+    /// bounded population admitted before the first scan.
     _queue: ArtifactCleanupQueuePermit,
     /// Last so both retained directory handles close before the cleanup slot.
     _admission: crate::control::ArtifactCleanupPermit,
@@ -1775,12 +1792,13 @@ impl DeadNamespaceSweep {
         })
     }
 
-    /// Consume one bounded slice of a persistent directory cursor. Returning
+    /// Consume one bounded slice of a persistent directory cursor.
     fn run_batch(&mut self, pid_alive: impl FnMut(u32) -> bool) -> bool {
         self.run_batch_with_hook(DEAD_INSTANCE_DELETE_LIMIT, pid_alive, || {})
     }
 
     /// [`Self::run_batch`] with its delete budget given and a hook run just
+    /// before each namespace's lease probe.
     fn run_batch_with_hook(
         &mut self,
         delete_limit: usize,
@@ -1939,6 +1957,8 @@ pub(crate) struct ConfinedVideoDir {
     published: bool,
     batch_synced: std::cell::Cell<bool>,
     /// Last field: natural destruction first closes recording/root handles and
+    /// runs `_retention_lease`; only then may coalesced tombstone/namespace GC
+    /// wake.
     deferred_cleanup: DeferredVideoCleanup,
 }
 
@@ -1951,7 +1971,7 @@ fn fresh_video_tombstone_name() -> std::ffi::OsString {
 struct PendingVideoTombstoneSweep {
     root: PathBuf,
     expected_root: crate::pinned_dir::PinnedDirIdentity,
-    /// A tombstone arrived after the current persistent cursor began. Restart
+    /// A tombstone arrived after the current persistent cursor began.
     dirty: bool,
 }
 
@@ -2011,6 +2031,7 @@ struct VideoTombstoneSweep {
     restart_required: bool,
     _queue: ArtifactCleanupQueuePermit,
     /// Last so the retained cursor/root close before the best-effort descriptor
+    /// slot becomes visible to another cursor.
     _admission: crate::control::ArtifactCleanupPermit,
 }
 
@@ -2041,7 +2062,7 @@ impl VideoTombstoneSweep {
         })
     }
 
-    /// Consume one bounded slice. `true` means this cursor reached EOF or its
+    /// Consume one bounded slice.
     fn run_batch(&mut self) -> bool {
         self.run_batch_within(VIDEO_PRUNE_WORK_LIMIT)
     }
@@ -2410,6 +2431,9 @@ pub(crate) fn confine_video_dir_with_admission(
 }
 
 /// The tests' confinement, against a budget set of its own at the shipping
+/// caps ([`crate::control::ArtifactBudgets::shipping`]): no sibling test's
+/// recordings hold its cleanup-queue places, so its admission is never refused
+/// for capacity.
 #[must_use]
 #[cfg(test)]
 fn confine_video_dir_for_instance(sock_dir: &Path, instance: &str) -> Option<ConfinedVideoDir> {
@@ -2667,10 +2691,12 @@ pub(crate) fn cleanup_failed_automatic_image(target: &ConfinedImage) {
     }
 }
 
-/// Recordings kept on disk, including the one just created. Each can hold a full frame
+/// Recordings kept on disk, including the one just created.
 const VIDEO_KEEP: usize = 8;
 
 /// Video retention (`prune_video_dirs`) deletes completed recordings beyond [`VIDEO_KEEP`],
+/// never `fresh`, oldest first: server-named `rec-<sequence>-<collision>` names sort in
+/// creation order within a namespace.
 const VIDEO_PRUNE_WORK_LIMIT: usize = 64 * 1024 * 1024;
 const VIDEO_PRUNE_SCAN_LIMIT: usize = 512;
 const VIDEO_PRUNE_DELETE_ENTRY_LIMIT: usize = 16_384;
@@ -2679,6 +2705,7 @@ const VIDEO_FILE_OPEN_WORK: usize = 4 * 1024;
 const VIDEO_DELETE_WORK: usize = 4 * 1024;
 
 /// One shared retention allowance covers directory scans, file probes, renames and deletes
+/// across a whole sweep, so a crowded namespace cannot multiply retention work.
 #[derive(Debug)]
 struct VideoPruneWork {
     remaining: usize,
@@ -3059,6 +3086,8 @@ pub(crate) fn sweep_stale_instances(dir: &Path) {
 }
 
 /// [`control_socket::STALE_SOCK_MIN_AGE_SECS`] — the day a zero-length socket
+/// file must have sat untouched before the launch sweep probes it — as the
+/// `Duration` the filesystem half works in.
 #[cfg(any(windows, test))]
 const STALE_SOCK_MIN_AGE: std::time::Duration =
     std::time::Duration::from_secs(control_socket::STALE_SOCK_MIN_AGE_SECS);
@@ -3361,8 +3390,9 @@ pub(crate) struct ConfinedImage {
     /// Validated single-component filename.
     pub file_name: std::ffi::OsString,
     /// Every absolute ancestor plus the exact output directory, retained from
+    /// confinement until the encode worker commits or refuses the reply.
     pinned: Option<crate::pinned_dir::PinnedDir>,
-    /// Last field. The target and its path lease share this kick, so stale
+    /// Last field.
     deferred_cleanup: Option<std::sync::Arc<DeferredImageCleanup>>,
 }
 
@@ -3460,6 +3490,7 @@ pub(crate) fn confine_image_path(sock_dir: &Path, requested: &str) -> Option<Con
 }
 
 /// Resolve a caller-supplied `image` path inside the socket directory's `images/` subdir,
+/// independently of later resource admission.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -3603,6 +3634,7 @@ mod tests {
     }
 
     /// `socket_is_live` is true for a bound listener and false for an absent or stale socket,
+    /// so the bind gate removes stale files but never unlinks a live listener.
     #[test]
     fn socket_is_live_true_for_bound_false_for_stale() {
         if !crate::test_alone::alone() {
@@ -3653,6 +3685,8 @@ mod tests {
     }
 
     /// The teardown dial is close-on-exec and non-blocking: a post-condition pin, not a test
+    /// of atomicity (Linux flags the socket inside `socket(2)`; Darwin, with no
+    /// `SOCK_CLOEXEC`, keeps the `fcntl` pair and its microsecond window).
     #[cfg(unix)]
     #[test]
     fn the_teardown_dial_is_close_on_exec_and_non_blocking() {
@@ -3711,6 +3745,7 @@ mod tests {
     }
 
     /// The `sun_path` limit is counted in bytes; an explicit path over it is refused by name
+    /// ([`SocketResolution::PathTooLong`]) before any bind or probe.
     #[test]
     fn sun_path_limit_is_enforced_byte_wise() {
         assert!(sun_path_ok(&"a".repeat(MAX_SUN_PATH)), "at the limit binds");
@@ -3727,6 +3762,7 @@ mod tests {
     }
 
     /// Each way the launch can end up socketless is its own named outcome,
+    /// and each bindable plan pairs the socket with its own token.
     #[test]
     fn the_socket_plan_names_every_refusal() {
         use SocketDirective::{Disabled, Explicit, PerInstance};
@@ -3781,6 +3817,9 @@ mod tests {
     }
 
     /// The best-effort cleanup queue admits exactly its limit
+    /// ([`crate::control::ARTIFACT_CLEANUP_QUEUE_LIMIT`]), a permit's clones (a
+    /// panic's recovery copy) hold one place between them, and the place is
+    /// admitted again once the last of them drops.
     #[test]
     fn the_cleanup_queue_admits_exactly_its_limit_and_a_freed_place_again() {
         let budgets = crate::control::ArtifactBudgets::shipping();
@@ -3811,6 +3850,7 @@ mod tests {
     }
 
     /// `AUTH <token>` and `TOKEN <token> [verb]` admit the exact token only
+    /// (a trailing CR tolerated); anything else is denied.
     #[test]
     fn auth_line_admits_only_the_exact_token() {
         let tok = "a".repeat(64);
@@ -3860,6 +3900,8 @@ mod tests {
     }
 
     /// SEC-3: our own loosened directory is forced back to exactly `0700`
+    /// (special bits too), and a directory that is not ours is REFUSED, even
+    /// one already `0700`: a chmod cannot change its owner.
     #[test]
     #[cfg(unix)]
     fn ensure_private_dir_hardens_ours_and_refuses_a_strangers() {
@@ -3939,6 +3981,8 @@ mod tests {
     }
 
     /// Windows twin of the Unix roundtrip and symlink tests: `create_new` refuses any
+    /// pre-existing object at the path, and `provision_token`'s unlink-first still lets a
+    /// rotation replace our own stale token.
     #[test]
     #[cfg(windows)]
     fn provision_token_roundtrips_and_create_new_refuses_preexisting() {
@@ -4317,6 +4361,8 @@ mod tests {
     }
 
     /// Another process's hold on the shared image namespace (its own open file description
+    /// of the directory) gets the same bounded wait as this process's own, and past it the
+    /// refusal says why.
     #[test]
     #[cfg(unix)]
     fn another_processs_namespace_lock_is_waited_for_then_named() {
@@ -4603,6 +4649,9 @@ mod tests {
     }
 
     /// Windows: a same-process pair is the same user, so the pid gate
+    /// (`SIO_AF_UNIX_GETPEERPID` + token-user compare) passes it — and where
+    /// the ioctl exists it names this process: the negative control that the pid is the
+    /// peer's and not a stand-in.
     #[test]
     #[cfg(windows)]
     fn peer_check_passes_a_same_user_peer_on_windows() {
@@ -4676,7 +4725,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The launch sweep against a real directory. With the day margin only the dead pid's
+    /// The launch sweep against a real directory.
     #[test]
     fn launch_sweep_removes_only_aged_empty_socks_nobody_listens_on() {
         use std::time::{Duration, SystemTime};
@@ -4856,6 +4905,7 @@ mod tests {
     }
 
     /// Holds a path immutable (`chflags uchg`, as any same-uid actor can), so
+    /// no unlink or rename of it succeeds until this drops, unwinding included.
     #[cfg(target_os = "macos")]
     struct Immutable(std::ffi::CString);
 
@@ -5453,7 +5503,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Automatic-image namespace GC owns another retained directory chain. It
+    /// Automatic-image namespace GC owns another retained directory chain.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn automatic_image_gc_waits_for_final_capability_under_low_nofile() {
@@ -5520,7 +5570,7 @@ mod tests {
         );
     }
 
-    /// Scanning keeps names, not one open directory per recording. Run the
+    /// Scanning keeps names, not one open directory per recording.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn video_prune_directory_handles_stay_bounded() {
@@ -5747,6 +5797,7 @@ mod tests {
     }
 
     /// A child name is judged raw: `"x/"` cannot reach through the dangling link `x` and make
+    /// (and chmod) a directory outside `parent`.
     #[test]
     #[cfg(unix)]
     fn a_direct_child_name_with_a_trailing_slash_makes_nothing_outside() {
@@ -6029,6 +6080,9 @@ mod tests {
     }
 
     /// The sweep lets go of a dead instance's lease by `LOCK_UN` on every way out, here the
+    /// `continue` after the identity re-check that follows the take: a lease released by the
+    /// close alone stays locked in a child forked under the sweep until it execs, and the next
+    /// sweep reads the dead instance as live.
     #[cfg(unix)]
     #[test]
     fn a_dead_instances_lease_is_free_while_a_child_forked_under_the_sweep_has_yet_to_exec() {
@@ -6155,6 +6209,7 @@ mod tests {
     }
 
     /// Run the shipped worker loop, `artifact_cleanup_worker`, over a private queue seeded
+    /// with `tasks` and an already-closed wake channel, and return once that loop does.
     fn drain_private_cleanup_worker(tasks: Vec<ArtifactCleanupTask>) {
         let (video_sender, video_receiver) = std::sync::mpsc::channel::<VideoRetentionTask>();
         let (best_effort, best_effort_receiver) = std::sync::mpsc::channel();
@@ -6261,6 +6316,7 @@ mod tests {
     }
 
     /// A video producer's deferred cleanup asks for a tombstone sweep only when
+    /// its abort left a tombstone; a published recording's asks for none.
     #[test]
     fn only_an_armed_video_cleanup_asks_for_a_tombstone_sweep() {
         let temp = aterm_tempfile::tempdir().unwrap();
@@ -6325,6 +6381,7 @@ mod tests {
     }
 
     /// The automatic-image sweep prunes only the directory it was armed for:
+    /// a replacement standing at the same path is not its to prune.
     #[test]
     fn the_automatic_image_sweep_prunes_only_the_directory_it_was_armed_for() {
         let temp = aterm_tempfile::tempdir().unwrap();
@@ -6400,6 +6457,7 @@ mod tests {
     }
 
     /// The tombstone sweep removes `.prune-*` entries only, and only under the
+    /// root it was armed for.
     #[test]
     fn the_video_tombstone_sweep_removes_only_tombstones_of_its_own_root() {
         let temp = aterm_tempfile::tempdir().unwrap();
@@ -6831,6 +6889,7 @@ mod tests {
 }
 
 /// The artifact machines' environment actions and Buggy mutants, each waived where its
+/// Tier-1 (`artifact_transaction_conformance`) binds it.
 #[cfg(any(test, debug_assertions))]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "SnapshotGenerationCommit",
@@ -7025,6 +7084,7 @@ mod tests {
 fn artifact_environment_and_mutant_waivers() {}
 
 /// `ExactInstanceRetention` environment actions, each waived where its Tier-1
+/// (`instance_retention_conformance`) binds it.
 #[cfg(any(test, debug_assertions))]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "ExactInstanceRetention",

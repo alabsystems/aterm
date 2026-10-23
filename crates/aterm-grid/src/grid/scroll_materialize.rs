@@ -255,6 +255,7 @@ impl<'a> Iterator for StoredUnits<'a> {
 }
 
 /// Where a stored line's [`CellAttrs::OPENS_CELL`] marks cut its walk, read
+/// off the attribute runs for non-decreasing unit starts in O(runs) in all.
 struct CellOpenings<'a> {
     runs: &'a [aterm_rle::Run<CellAttrs>],
     /// The run the next search resumes at, and the character it starts on.
@@ -275,6 +276,7 @@ impl<'a> CellOpenings<'a> {
     }
 
     /// How many characters the unit starting at character `start` may take:
+    /// up to the next character after it that opens a cell.
     fn limit(&mut self, start: usize) -> usize {
         let from = start.saturating_add(1);
         if self.next < from {
@@ -332,6 +334,7 @@ impl<'a> StoredCells<'a> {
     }
 
     /// Step over the printable ASCII cells at the walk's position at once,
+    /// returning the first one's byte, its column and the count.
     fn ascii_run(&mut self) -> Option<(usize, u16, u16)> {
         if !self.ascii_runs {
             return None;
@@ -453,6 +456,7 @@ pub(in crate::grid) fn materialize_from_row_extras(
 }
 
 /// One cell of a ring-tier row as the ring fast path draws it (see
+/// [`RingCells`]).
 struct RingCell<'w> {
     /// The cell's first column.
     col: u16,
@@ -478,6 +482,9 @@ struct RingCell<'w> {
 struct Declined;
 
 /// The walk over a ring-tier row's cells that the ring fast path draws: each
+/// non-spacer cell as one grapheme unit at its own column, as wide as the
+/// round trip would place it, or [`Declined`] where the round trip draws the
+/// row otherwise.
 struct RingCells<'a> {
     /// The row's cells up to its length.
     cells: &'a [crate::Cell],
@@ -496,6 +503,8 @@ struct RingCells<'a> {
 
 impl<'a> RingCells<'a> {
     /// The walk over `row`, or `None` for a row wider than `cols`: the round
+    /// trip clips it, which this path does not model (rare: both come from one
+    /// grid).
     fn new(row: &'a Row, extras: &'a ScrolledRowExtras, cols: u16) -> Option<Self> {
         let len = usize::from(row.written_len());
         if len > usize::from(cols) {
@@ -636,9 +645,10 @@ impl<'a> RingCells<'a> {
 }
 
 /// Byte ceiling for one grapheme unit read from a stored `Line`
+/// ([`advance_grapheme_unit_wide`]).
 const MAX_GRAPHEME_UNIT_BYTES: usize = 256;
 
-/// A Fitzpatrick emoji skin-tone modifier (U+1F3FB..=U+1F3FF). Mirrors the
+/// A Fitzpatrick emoji skin-tone modifier (U+1F3FB..=U+1F3FF).
 #[inline]
 const fn is_skin_tone_modifier(c: char) -> bool {
     matches!(c, '\u{1F3FB}'..='\u{1F3FF}')
@@ -682,6 +692,8 @@ pub(crate) fn advance_grapheme_unit_wide(text: &str, byte_idx: &mut usize) -> Gr
 }
 
 /// [`advance_grapheme_unit_wide`] taking at most `max_chars` (at least 1)
+/// characters: a stored line's walk ends a unit before a character that opens
+/// a cell ([`StoredUnits`]).
 fn advance_grapheme_unit_within(
     text: &str,
     byte_idx: &mut usize,
@@ -825,6 +837,7 @@ fn advance_grapheme_unit_scan(text: &str, byte_idx: &mut usize, max_chars: usize
 }
 
 /// Place a cell (complex, wide, or normal) into the materialized row and return
+/// the column after it.
 #[allow(clippy::too_many_arguments)]
 fn place_cell(
     row: &mut MaterializedRow,
@@ -966,6 +979,9 @@ fn store_rgb_extras(
 }
 
 /// Restore a line's hyperlinks onto the cells of its first `filled` columns
+/// ([`filled_span_cols`]), with column writes bounded to O(cols): a legitimate
+/// line's spans are disjoint, and a crafted one with many overlapping
+/// full-width spans would otherwise cost O(spans × cols) on the render path.
 fn restore_hyperlinks(extras: &mut FxHashMap<u16, CellExtra>, line: &Line, filled: u16) {
     if let Some(spans) = line.hyperlinks() {
         restore_hyperlink_spans(extras, spans, filled);
@@ -973,6 +989,8 @@ fn restore_hyperlinks(extras: &mut FxHashMap<u16, CellExtra>, line: &Line, fille
 }
 
 /// The body of [`restore_hyperlinks`] over spans from either source (a `Line`'s
+/// copy or a ring row's stored vector), shared so the two materialization paths
+/// cannot drift on the overlap budget or the end-column bound.
 fn restore_hyperlink_spans(
     extras: &mut FxHashMap<u16, CellExtra>,
     spans: &[HyperlinkSpan],
@@ -998,6 +1016,9 @@ pub(super) fn filled_span_cols(start_col: u16, end_col: u16, filled: u16) -> cor
 }
 
 /// Restore a line's SGR 58 underline colours on its first `filled` columns
+/// under [`restore_hyperlinks`]' budget; `set_underline_color_u32` re-derives
+/// the RGB-or-indexed form so an indexed colour resolves against the live
+/// palette.
 fn restore_underline_colors(extras: &mut FxHashMap<u16, CellExtra>, line: &Line, filled: u16) {
     if let Some(spans) = line.underline_colors() {
         restore_underline_color_spans(extras, spans, filled);
@@ -1005,6 +1026,7 @@ fn restore_underline_colors(extras: &mut FxHashMap<u16, CellExtra>, line: &Line,
 }
 
 /// The body of [`restore_underline_colors`] over spans from either source,
+/// shared as [`restore_hyperlink_spans`] is.
 fn restore_underline_color_spans(
     extras: &mut FxHashMap<u16, CellExtra>,
     spans: &[UnderlineColorSpan],
@@ -1026,6 +1048,9 @@ fn restore_underline_color_spans(
 }
 
 /// Restore a line's inline images as the per-cell [`ImageRef`](crate::ImageRef)s
+/// a live image cell has, so a scrolled-back picture takes the on-screen draw
+/// path; every restored cell shares the one payload `Arc` the renderer's decode
+/// cache keys on.
 fn restore_images(extras: &mut FxHashMap<u16, CellExtra>, line: &Line, cols: u16) {
     if let Some(spans) = line.images() {
         restore_image_spans(extras, spans, cols);
@@ -1033,6 +1058,7 @@ fn restore_images(extras: &mut FxHashMap<u16, CellExtra>, line: &Line, cols: u16
 }
 
 /// The body of [`restore_images`] over spans from either source, shared as
+/// [`restore_hyperlink_spans`] is.
 fn restore_image_spans(extras: &mut FxHashMap<u16, CellExtra>, spans: &[ImageSpan], cols: u16) {
     let mut budget = usize::from(cols) * crate::extra::MAX_IMAGE_LAYERS;
     'restore: for span in spans {
@@ -1068,6 +1094,9 @@ mod ascii_fast_path_tests {
     }
 
     /// The search walk's ASCII runs are exactly the cells the per-cell walk
+    /// lays the line out in, on lines mixing printable ASCII with joining
+    /// marks, controls, wide, folding and ZWJ-joined characters, at every row
+    /// width, with and without a stored wide bit.
     #[test]
     fn the_search_walk_lays_a_line_out_as_materialize_does() {
         use aterm_rle::Rle;
@@ -1132,6 +1161,9 @@ mod ascii_fast_path_tests {
     }
 
     /// The printable-ASCII fast path returns exactly what the general scan
+    /// does, for every ASCII first char against every ASCII, a sample of
+    /// joining and wide second chars, and the end of the text, each followed by
+    /// a tail that would join if the scan reached it.
     #[test]
     fn ascii_fast_path_matches_the_scan() {
         for c in (0u8..0x80).map(char::from) {

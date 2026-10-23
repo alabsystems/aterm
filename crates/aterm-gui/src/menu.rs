@@ -2007,8 +2007,9 @@ impl VersionFacts<'static> {
 #[must_use]
 pub(crate) fn version_signature(facts: VersionFacts<'_>, rung: VersionRung) -> Option<String> {
     if facts.release {
+        let majmin = facts.version.strip_suffix(".0").unwrap_or(facts.version);
         return match rung {
-            VersionRung::Full => Some(format!("v{}", facts.version)),
+            VersionRung::Full => Some(format!("v{majmin}")),
             VersionRung::Short => None,
         };
     }
@@ -4074,7 +4075,7 @@ mod tests {
         let release = facts(true, "1576", "25a5963a4c21");
         assert_eq!(
             version_signature(release, VersionRung::Full).as_deref(),
-            Some("v0.101.0")
+            Some("v0.101")
         );
         assert_eq!(
             version_signature(release, VersionRung::Short),
@@ -4163,7 +4164,7 @@ mod tests {
         };
         assert_eq!(
             strip_version_text(release, VersionRung::Full).as_deref(),
-            Some("v0.106.0")
+            Some("v0.106")
         );
         assert_eq!(strip_version_text(release, VersionRung::Short), None);
     }

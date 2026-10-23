@@ -1,30 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The storage cells the `metrics` ledgers are built from. Each instrument is
-//! one kind of statistic with its own write rule, `const`-constructible so a
-//! ledger can be a `static`, and written with relaxed lock-free atomics: these
-//! are diagnostics, never used for synchronization (the one exception,
-//! [`Counter::inc_release`], is named for it).
-//!
-//! [`window_ledger!`] declares a ledger of instruments whose `reset` is
-//! generated over every field, so a field cannot be added and left out of
-//! `metrics reset`. State that must survive a reset (a gauge, a latch, a
-//! last-writer reading) is not an instrument and lives outside every window
-//! ledger, where nothing can reset it.
+//! The storage cells the `metrics` ledgers are built from.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// A window statistic: [`Self::reset`] returns it to what it held before its
-/// first sample. Implemented by every instrument, by arrays of them, and by
-/// every [`window_ledger!`] as the reset of each of its fields.
+/// A window statistic: [`Self::reset`] returns it to what it held before its first sample.
 pub(crate) trait Windowed {
     fn reset(&self);
 
     /// Hand every cell under `path` to `f`, named by its field path (tests).
-    /// A composite instrument ([`Peak`], [`MaxBy`], [`Dist`]) hands over its
-    /// parts, each named `path#part`: a published field reads one part, so a
-    /// part is what a test pokes and reads alone.
     #[cfg(test)]
     fn visit(&self, path: &str, f: &mut dyn FnMut(&str, &dyn Probe));
 }
@@ -32,16 +17,13 @@ pub(crate) trait Windowed {
 /// A test's handle on one cell: an instrument, or one part of a composite.
 #[cfg(test)]
 pub(crate) trait Probe {
-    /// Write a sample no published value already holds: [`POKE`] where the
-    /// cell holds a number, the first label past the empty one where it holds
-    /// a label, `true` where it holds a flag.
+    /// Write a sample no published value already holds: [`POKE`] where the cell holds a number, the first label past the empty one where it holds a label, `true` where it holds a flag.
     fn poke(&self);
 
     /// Whether it is in its reset state.
     fn is_empty(&self) -> bool;
 
-    /// Whether a published field reads it. A [`Stamp`] only opens a slice
-    /// that another instrument books, so it is reset but never published.
+    /// Whether a published field reads it.
     fn observes(&self) -> bool {
         true
     }
@@ -99,21 +81,7 @@ impl<T: Windowed, const N: usize> Windowed for [T; N] {
     }
 }
 
-/// Declare a ledger: a struct of [`Windowed`] fields with a `const fn new`
-/// and a [`Windowed`] impl whose `reset` resets every field, in declaration
-/// order. A field is built by its type's `new()`, or by the expression after
-/// `=` (an array of instruments). Attributes before `struct` and before each
-/// field (docs) pass through.
-///
-/// ```text
-/// window_ledger! {
-///     /// The redraw path's window statistics.
-///     pub(crate) struct RedrawLedger {
-///         pub(crate) attempts: Counter,
-///         pub(crate) term_wait: [Histogram; 2] = [const { Histogram::new() }; 2],
-///     }
-/// }
-/// ```
+/// Declare a ledger: a struct of [`Windowed`] fields with a `const fn new` and a [`Windowed`] impl whose `reset` resets every field, in declaration order.
 macro_rules! window_ledger {
     (
         $(#[$meta:meta])*
@@ -184,8 +152,7 @@ impl Counter {
         self.0.fetch_add(n, Ordering::Relaxed);
     }
 
-    /// [`Self::inc`] with Release: what the writer stored before it is
-    /// visible to a reader whose [`Self::get_acquire`] sees the new count.
+    /// [`Self::inc`] with Release: what the writer stored before it is visible to a reader whose [`Self::get_acquire`] sees the new count.
     pub(crate) fn inc_release(&self) {
         self.0.fetch_add(1, Ordering::Release);
     }
@@ -283,8 +250,7 @@ impl Probe for LastFlag {
     }
 }
 
-/// The most recent label of the window, as its `label_enum!` index; index 0
-/// (each table's empty label) until one lands.
+/// The most recent label of the window, as its `label_enum!` index; index 0 (each table's empty label) until one lands.
 pub(crate) struct LastLabel(AtomicU64);
 
 impl LastLabel {
@@ -326,10 +292,7 @@ impl Max {
         Self(AtomicU64::new(0))
     }
 
-    /// Fold `v` in; whether it raised the max. A sample at or under the max
-    /// costs one load and no read-modify-write, so the per-turn and per-frame
-    /// maxima that almost never move stay off the cache line's exclusive
-    /// state.
+    /// Fold `v` in; whether it raised the max.
     pub(crate) fn record(&self, v: u64) -> bool {
         v > self.0.load(Ordering::Relaxed) && self.0.fetch_max(v, Ordering::Relaxed) < v
     }
@@ -369,8 +332,7 @@ impl Peak {
         }
     }
 
-    /// Book `v` as the last sample and fold it into the max; whether it
-    /// raised the max.
+    /// Book `v` as the last sample and fold it into the max; whether it raised the max.
     pub(crate) fn record(&self, v: u64) -> bool {
         self.last.set(v);
         self.max.record(v)
@@ -404,9 +366,7 @@ impl Windowed for Peak {
     }
 }
 
-/// The worst sample of the window, the label index of what produced it, and
-/// when (`now_ns`). Single writer: the sample that raises the max writes its
-/// own producer and instant, so no CAS is needed.
+/// The worst sample of the window, the label index of what produced it, and when (`now_ns`).
 pub(crate) struct MaxBy {
     max: Max,
     by: LastLabel,
@@ -473,13 +433,7 @@ const H_MIN_SHIFT: u32 = 16;
 const H_OCTAVES: usize = 20;
 const H_BUCKETS: usize = (1 << H_SUB_BITS) * (H_OCTAVES + 1);
 
-/// Lock-free fixed-bucket log-linear histogram. Writers `fetch_add` one
-/// bucket per sample (Relaxed — diagnostics, same contract as the scalars);
-/// readers copy the buckets once ([`Histogram::copy_out`]). There is no
-/// separate sample count: `n` is the sum of the copied buckets, so a count can
-/// never run ahead of the buckets it describes. Percentiles report the bucket
-/// UPPER edge, so a published figure errs conservative (never better than
-/// reality).
+/// Lock-free fixed-bucket log-linear histogram.
 pub(crate) struct Histogram {
     buckets: [AtomicU64; H_BUCKETS],
 }
@@ -495,7 +449,7 @@ impl Histogram {
         if v_ns < (1 << H_MIN_SHIFT) {
             return (v_ns >> (H_MIN_SHIFT - H_SUB_BITS)) as usize;
         }
-        let msb = 63 - v_ns.leading_zeros(); // v_ns >= 2^16 here, so msb >= 16
+        let msb = 63 - v_ns.leading_zeros();
         let octave = (msb - H_MIN_SHIFT + 1) as usize;
         let sub = ((v_ns >> (msb - H_SUB_BITS)) & ((1 << H_SUB_BITS) - 1)) as usize;
         ((octave << H_SUB_BITS) + sub).min(H_BUCKETS - 1)
@@ -510,7 +464,7 @@ impl Histogram {
         if idx < (1 << H_SUB_BITS) {
             return (i + 1) << (H_MIN_SHIFT - H_SUB_BITS);
         }
-        let octave = i >> H_SUB_BITS; // >= 1
+        let octave = i >> H_SUB_BITS;
         let sub = i & (sub_count - 1);
         let msb = H_MIN_SHIFT + u32::try_from(octave).unwrap_or(u32::MAX) - 1;
         (1u64 << msb) + ((sub + 1) << (msb - H_SUB_BITS))
@@ -526,11 +480,7 @@ impl Histogram {
         }
     }
 
-    /// One copy of the buckets. Every `n_*` and quantile a reply publishes for
-    /// this distribution comes from the same copy, so they describe one
-    /// multiset. A copy racing writers or a reset is still self-consistent; it
-    /// differs from the live state by at most the samples in flight. (Named
-    /// apart from `read`, which the lock-order census takes for an `RwLock`.)
+    /// One copy of the buckets.
     #[must_use]
     pub(crate) fn copy_out(&self) -> HistCopy {
         HistCopy::from_counts(std::array::from_fn(|i| {
@@ -571,16 +521,12 @@ impl HistCopy {
         self.n
     }
 
-    /// The value at quantile `q` (0 < q ≤ 1), as the containing bucket's upper
-    /// edge in ns — conservative by construction. `None` iff `n == 0`. The
-    /// target rank never exceeds `n`, the sum of the buckets walked, so the walk
-    /// always ends inside a populated bucket.
+    /// The value at quantile `q` (0 < q ≤ 1), as the containing bucket's upper edge in ns — conservative by construction.
     #[must_use]
     pub(crate) fn percentile(&self, q: f64) -> Option<u64> {
         if self.n == 0 {
             return None;
         }
-        // ceil(q * n), clamped to [1, n]: p50 of one sample is that sample.
         let target = ((q * self.n as f64).ceil() as u64).clamp(1, self.n);
         let mut seen = 0u64;
         self.counts
@@ -593,8 +539,7 @@ impl HistCopy {
     }
 }
 
-/// A distribution with its last and worst sample: every sample lands in all
-/// three, so a published max and its percentiles describe the same samples.
+/// A distribution with its last and worst sample: every sample lands in all three, so a published max and its percentiles describe the same samples.
 pub(crate) struct Dist {
     hist: Histogram,
     peak: Peak,
@@ -656,8 +601,7 @@ impl<const N: usize> Tally<N> {
         Self([const { AtomicU64::new(0) }; N])
     }
 
-    /// Count one under `index`. An index past the table counts nothing
-    /// rather than panic the writer.
+    /// Count one under `index`.
     pub(crate) fn inc(&self, index: usize) {
         if let Some(slot) = self.0.get(index) {
             slot.fetch_add(1, Ordering::Relaxed);
@@ -672,10 +616,7 @@ impl<const N: usize> Tally<N> {
             .map_or(0, |slot| slot.load(Ordering::Relaxed))
     }
 
-    /// `(label, count)` for each nonzero count, in the order `labels` names
-    /// the `(index, label)` pairs: the shape every sparse per-label field
-    /// publishes, so a healthy instance prints a pair or two and a sick one
-    /// puts its culprit first in sight.
+    /// `(label, count)` for each nonzero count, in the order `labels` names the `(index, label)` pairs: the shape every sparse per-label field publishes, so a healthy instance prints a pair or two and a sick one puts its culprit first in sight.
     #[must_use]
     pub(crate) fn sparse(
         &self,
@@ -710,13 +651,7 @@ impl<const N: usize> Probe for Tally<N> {
     }
 }
 
-/// A count kept as a running total someone else owns, published as the part
-/// since the reset: `reset` rebases instead of zeroing, because the total is
-/// not ours to clear. A total that can restart (the renderer's own counters,
-/// stored after each present with [`Baselined::set_total`]) reads 0 while it is
-/// below the base, until it passes it. A total that never restarts (a process
-/// counter, sampled with [`Baselined::raise_total`]) only rises, so a stale
-/// sample stored late cannot lower the total a reset rebases on.
+/// A count kept as a running total someone else owns, published as the part since the reset: `reset` rebases instead of zeroing, because the total is not ours to clear.
 pub(crate) struct Baselined {
     total: AtomicU64,
     base: AtomicU64,
@@ -734,8 +669,7 @@ impl Baselined {
         self.total.store(total, Ordering::Relaxed);
     }
 
-    /// Store `total` unless the total already holds a higher one: for a total
-    /// that never restarts, where a lower sample is an older one.
+    /// Store `total` unless the total already holds a higher one: for a total that never restarts, where a lower sample is an older one.
     pub(crate) fn raise_total(&self, total: u64) {
         self.total.fetch_max(total, Ordering::Relaxed);
     }
@@ -764,11 +698,7 @@ impl Probe for Baselined {
     }
 }
 
-/// The opening edge of a slice still waiting for its close (`now_ns`; 0 =
-/// none). Keep-oldest: a burst of openings measures from the first, so the
-/// slice is the whole span the thing waited. Not an observation itself: the
-/// close books the slice into another instrument. `reset` drops an open edge,
-/// so a fresh window never books a wait that began before it.
+/// The opening edge of a slice still waiting for its close (`now_ns`; 0 = none).
 pub(crate) struct Stamp(AtomicU64);
 
 impl Stamp {
@@ -822,8 +752,6 @@ mod tests {
     fn bucket_index_is_monotone_and_edges_contain_values() {
         let mut last_idx = 0usize;
         let mut v = 1u64;
-        // Sweep the FAITHFUL range only (< 2^36); beyond it values clamp into
-        // the top bucket and containment intentionally stops holding.
         while v < (1u64 << 36) {
             let idx = Histogram::index(v);
             assert!(
@@ -842,7 +770,7 @@ mod tests {
                 );
             }
             last_idx = idx;
-            v = v.saturating_mul(2) - v / 3; // dense-ish sweep, hits odd offsets
+            v = v.saturating_mul(2) - v / 3;
         }
         assert_eq!(
             Histogram::index(u64::MAX),
@@ -861,7 +789,6 @@ mod tests {
             None,
             "empty histogram has no percentile"
         );
-        // 1..=1000 µs, one sample each: true p50=500µs, p99=990µs.
         for us in 1..=1000u64 {
             h.record(us * 1000);
         }
@@ -878,7 +805,6 @@ mod tests {
                 "p{q} {got} more than 25% above true {true_ns} — bucket too coarse"
             );
         }
-        // p at the extremes: clamped, never panics, single-sample sanity.
         let one = Histogram::new();
         one.record(7_777);
         let one = one.copy_out();
@@ -901,14 +827,11 @@ mod tests {
 
     /// Whatever bucket vector a copy holds (a racing reset can leave any
     /// subset of buckets zeroed), every quantile lands in a populated bucket,
-    /// because `n` is the sum of exactly those buckets. Before `n` was derived,
-    /// a count that ran ahead of its buckets walked off the end and published
-    /// the top edge, 2^36 ns.
+    /// because `n` is the sum of exactly those buckets.
     #[test]
     fn every_quantile_of_a_copy_lies_inside_its_populated_buckets() {
         let mut state = 0x9E37_79B9_7F4A_7C15_u64;
         let mut next = move || {
-            // xorshift64: deterministic, so a failure reproduces.
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
@@ -936,8 +859,6 @@ mod tests {
                 );
             }
         }
-        // Negative controls: no samples, no quantile; samples only in bucket 0
-        // put p99 at bucket 0's edge, never the top bucket's.
         assert_eq!(HistCopy::from_counts([0; H_BUCKETS]).percentile(0.99), None);
         let mut low = [0u64; H_BUCKETS];
         low[0] = 50;
@@ -962,8 +883,7 @@ mod tests {
     }
 
     /// A stamp keeps its OLDEST opening until a close takes it, and a close
-    /// with nothing open takes nothing. The control: after the take, a later
-    /// opening is the one kept.
+    /// with nothing open takes nothing.
     #[test]
     fn a_stamp_keeps_the_oldest_opening_until_it_is_taken() {
         let stamp = Stamp::new();

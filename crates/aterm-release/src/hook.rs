@@ -1,29 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `ship hook <name>`: the publication engine's hooks. The engine finds each hook by its
-//! path in publish/ and runs it; each of those files is one line that runs the verb here
-//! with the caller's Trust targo, so every rule lives in this crate.
-//!
-//! * `pre-promote` — `pub promote`, after its gates and before anything public moves,
-//!   from the repository root with the operator's environment and `PUB_SOURCE_COMMIT`:
-//!   would a real cut of that commit pass its pre-claim gates (`ship check --commit
-//!   <it> --cut`)? Asked by the commit's OWN cutter, never by this working tree's, which
-//!   may hold another branch: under `ship release` the running release's binary
-//!   (`ATERM_RELEASE_CUTTER`, no worktree, no build), else one built in a throwaway
-//!   worktree of the commit. Non-zero refuses the promote.
-//! * `post-promote` — `pub promote`, once public main is pushed: `ship site`, whose
-//!   promote-time run defers to the cut.
-//! * `transforms` — `pub stage`, over the export ([`crate::transforms`]): the rules of
-//!   `CAPTURED_COMMIT`, the commit exported — run here when this cutter's source is that
-//!   commit's, else by that commit's own cutter, built in a throwaway worktree of it.
-//!
-//! WHAT A HOOK NEEDS. A hook file runs `targo --unverified ship hook …` from the
-//! engine's working directory, the repository root, so the first cutter to run is
-//! compiled from ROOT's WORKING TREE: a checkout on a branch without `ship hook`, or one
-//! that does not compile, refuses the promote or the stage (exit 101 or 2) before any
-//! rule runs. Every rule that must be the attested commit's then asks that commit's own
-//! cutter, as above.
+//! `ship hook <name>`: the publication engine's hooks.
 
 use std::ffi::OsStr;
 use std::io::Write;
@@ -54,8 +32,6 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     match args.first().map(String::as_str) {
         Some("pre-promote") if rest.is_empty() => {
             // A signal is recorded, never fatal: the commit's cutter (in this process
-            // group, so a terminal's Ctrl-C reaches it too) ends, the worktree goes, and
-            // the hook exits as the signal would have it.
             crate::interrupt::install();
             let facts = PrePromote::from_process();
             let mut check = |asked: Asked<'_>, full: &str| {
@@ -137,8 +113,7 @@ pub struct PrePromote {
     pub version: Option<String>,
     /// `CARGO_TARGET_DIR`: the build goes in its `pre-promote.noindex` directory.
     pub target: Option<PathBuf>,
-    /// `ATERM_RELEASE_CUTTER`: the running release's own cutter, which `ship release`
-    /// hands `pub publish` — it answers, and nothing is built.
+    /// `ATERM_RELEASE_CUTTER`.
     pub cutter: Option<PathBuf>,
     /// Environment for every git child (a test isolates git from this machine's).
     pub git_env: Vec<(String, String)>,
@@ -168,8 +143,7 @@ pub enum Asked<'a> {
     Built { tree: &'a Path, target: &'a Path },
 }
 
-/// The commit's own check for the full sha, asked as [`Asked`] says: its exit code, or
-/// why it could not run.
+/// The commit's own check for the full sha, asked as [`Asked`] says.
 pub type Check<'a> = dyn FnMut(Asked<'_>, &str) -> Result<i32, String> + 'a;
 
 /// A finished child's exit code, a signal's as a shell reports it (128 + the signal).
@@ -185,8 +159,7 @@ fn exit_code(
     Ok(status.code().unwrap_or(128 + by_signal))
 }
 
-/// The running release's `cutter` asked `args` from `root`, as from the operator's shell:
-/// of the `inherited` variable names, none the `ship` alias handed this process reaches it.
+/// The running release's `cutter` asked `args` from `root`, as from the operator's shell.
 #[must_use]
 pub fn running_cutter_command(
     cutter: &Path,
@@ -217,8 +190,6 @@ fn executable_file(path: &Path) -> bool {
     }
 }
 
-/// `targo --unverified ship <args>` in a commit's worktree `tree`, building into `target`,
-/// with `envs` set — the Trust targo of `$TRUST_STAGE2_BIN` when the caller pinned one,
 /// else the one on PATH: its exit code, a signal's as a shell reports it.
 fn own_cutter(
     tree: &Path,
@@ -239,9 +210,7 @@ fn own_cutter(
     )
 }
 
-/// [`own_cutter`]'s command, run as from the operator's shell: of the `inherited`
-/// variable names, none the `ship` alias handed this process
-/// (`release_steps::launcher_env`: `CARGO`, `CARGO_PKG_*`, `TARGO_*`, …) reaches it.
+/// [`own_cutter`]'s command, run as from the operator's shell.
 #[must_use]
 pub fn cutter_command(
     targo: &Path,
@@ -301,11 +270,6 @@ fn commit_of(root: &Path, env: &[(String, String)], rev: &str) -> Option<String>
     .filter(|s| !s.is_empty())
 }
 
-/// Where a commit's own cutter builds in its throwaway worktree: `pre-promote.noindex`
-/// under `CARGO_TARGET_DIR` (relative to `root`), else under `root`'s target directory.
-/// Its own directory, because cargo would hand the checkout's next `ship` the cutter a
-/// worktree linked into a directory they share (which the cutter then refuses as
-/// compiled elsewhere); the registry dependencies stay warm from one publish to the next.
 /// Named `*.noindex` so Spotlight skips the build with all it holds.
 fn worktree_target(root: &Path, target: Option<&Path>) -> PathBuf {
     let base = match target {
@@ -322,7 +286,6 @@ fn toplevel(cwd: &Path, env: &[(String, String)]) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// A commit's worktree in a private scratch directory, its submodules at the gitlinks
 /// the commit records; removed on drop, worktree and all, whatever ended its use.
 struct Worktree {
     root: PathBuf,
@@ -371,8 +334,6 @@ impl Worktree {
 
 impl Drop for Worktree {
     fn drop(&mut self) {
-        // --force: a worktree holding submodules is otherwise refused removal; this one
-        // is ours and holds nothing anyone wrote
         let tree = self.tree.to_string_lossy().into_owned();
         let _ = git(
             &self.root,
@@ -384,12 +345,7 @@ impl Drop for Worktree {
     }
 }
 
-/// Would a real cut of the engine's commit pass its pre-claim gates? `check` answers as
-/// the running release's cutter ([`PrePromote::cutter`]) when one is named, else in a
-/// worktree of exactly that commit, its submodules at the gitlinks it records. Exit: the
-/// check's own (0 yes, 1 a gate refuses), or 2 when it could not be asked — no commit
-/// named, none such here, a named cutter that is no executable file, no worktree or
-/// submodules — refusing rather than checking some other code.
+/// Would a real cut of the engine's commit pass its pre-claim gates? `check` answers as.
 pub fn pre_promote(
     facts: &PrePromote,
     cwd: &Path,
@@ -483,9 +439,7 @@ pub fn pre_promote(
     }
 }
 
-/// Set by a `transforms` run that hands the export to the captured commit's own cutter,
-/// to that commit's sha: that cutter IS the commit's code, so if it still finds its
-/// source differs it refuses rather than hand the export on again.
+/// Set by a `transforms` run that hands the export to the captured commit's own cutter.
 pub const DELEGATED: &str = "ATERM_HOOK_TRANSFORMS_DELEGATED";
 
 /// What the engine hands `transforms`, and where this cutter came from.
@@ -505,7 +459,6 @@ pub struct Transforms {
 
 impl Transforms {
     /// The engine's facts in this process's environment; the source is this crate's.
-    ///
     /// # Errors
     /// `ROOT` or `EXPORT` unset.
     pub fn from_process() -> Result<Self, String> {
@@ -520,13 +473,7 @@ impl Transforms {
     }
 }
 
-/// Why the checkout at `source` is not `full`'s source: any tracked difference,
-/// additional local file, or unreadable/uninitialized submodule. The whole
-/// tree is compared rather than a list of crates: path dependencies, build
-/// scripts, includes, workspace settings and toolchain/config inputs all
-/// influence the cutter. Ignored inputs count too. An extra build artifact
-/// can conservatively delegate to the fresh captured checkout; its shared
-/// target is outside that checkout, so it cannot cause delegation there.
+/// Why the checkout at `source` is not `full`'s source.
 #[must_use]
 pub fn source_differs(source: &Path, env: &[(String, String)], full: &str) -> Option<String> {
     let short = &full[..full.len().min(12)];
@@ -535,8 +482,6 @@ pub fn source_differs(source: &Path, env: &[(String, String)], full: &str) -> Op
     };
     let mut pending = vec![(top, full.to_string())];
     while let Some((tree, revision)) = pending.pop() {
-        // Check each gitlink against the revision its parent records too:
-        // a nested submodule's ignore setting cannot hide its local code.
         match git_output(
             &tree,
             env,
@@ -564,9 +509,6 @@ pub fn source_differs(source: &Path, env: &[(String, String)], full: &str) -> Op
                 ));
             }
         }
-        // No --exclude-standard: ignored files can supply include! source or
-        // Cargo configuration. Condense whole extra directories, including a
-        // target cache, instead of listing every generated object in them.
         let Some(list) = git(
             &tree,
             env,
@@ -591,9 +533,6 @@ pub fn source_differs(source: &Path, env: &[(String, String)], full: &str) -> Op
                     .join(" ")
             ));
         }
-        // Git's superproject diff includes tracked submodule changes but
-        // ignores their ignored files. Walk the gitlinks too, including
-        // nested ones, without inheriting a submodule.ignore configuration.
         let Some(index) = git(&tree, env, &["ls-files", "--stage", "-z"]) else {
             return Some(format!("{} cannot list its gitlinks", tree.display()));
         };
@@ -618,19 +557,13 @@ pub fn source_differs(source: &Path, env: &[(String, String)], full: &str) -> Op
     None
 }
 
-/// The commit's own cutter, run in its worktree `tree` for the full sha, building into
-/// `target`: its exit code, or why it could not run.
+/// The commit's own cutter, run in its worktree `tree` for the full sha, building into `target`.
 pub type There<'a> = dyn FnMut(&Path, &str, &Path) -> Result<i32, String> + 'a;
 
 /// The rewrites over a commit's export, run here.
 pub type Here<'a> = dyn FnMut(&crate::transforms::Inputs) -> Result<Vec<String>, String> + 'a;
 
-/// THE EXPORT IS REWRITTEN BY THE EXPORTED COMMIT'S OWN RULES. The engine sources the
-/// captured commit's transforms.sh from ROOT, whose working tree is not bound to that
-/// commit (another branch, edits, `pub stage --commit <sha>`), so this cutter runs the
-/// rules itself (`here`) only when its entire source tree is the commit's;
-/// otherwise the commit's own cutter does, built in a throwaway worktree of it
-/// (`there`). Exit: 0 rewritten, 1 refused or failed — the line says which.
+/// THE EXPORT IS REWRITTEN BY THE EXPORTED COMMIT'S OWN RULES.
 pub fn transforms(
     facts: &Transforms,
     here: &mut Here<'_>,

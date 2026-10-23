@@ -3340,6 +3340,9 @@ fn cmd_run(rest: &[String]) -> ExitCode {
             plan => return settle_selfupdate(&layout, plan),
         }
     }
+    let stripped_nh = crate::yolo::strip_no_harness(tool, args);
+    let no_harness = stripped_nh.is_some();
+    let args = stripped_nh.as_deref().unwrap_or(args);
     let expanded: Vec<String>;
     let args: &[String] = match crate::yolo::decide(tool, args) {
         crate::yolo::Launch::Flag(args) => {
@@ -3363,6 +3366,9 @@ fn cmd_run(rest: &[String]) -> ExitCode {
     let mut command = std::process::Command::new(&target);
     aterm_uds::spawn::set_flags(&mut command, 0);
     command.args(args).env("PATH", child_path);
+    if no_harness {
+        command.env(crate::yolo::NO_HARNESS_ENV, "1");
+    }
     for (name, value) in env.entries() {
         command.env(name, value);
     }

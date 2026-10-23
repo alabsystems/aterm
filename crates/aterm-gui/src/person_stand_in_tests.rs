@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE SEAMS (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.5.2, the 5a
-//! tests of §12.5.6), on a headless App: a development build's stand-in for
-//! the person — `person look <window>`, which reaches the one looking rule
-//! alone and arms no timer, and `person menubar press <at>`, which clicks a
-//! menu-bar row by the path `chrome` prints and goes where a click goes —
-//! and `status`'s `end= end_seen= end_cheered=`, two facts kept apart.
+//! THE SEAMS (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.5.2, the 5a tests of §12.5.6), on a headless App: a development build's stand-in for the person — `person look <window>`, which reaches the one looking rule alone and arms no timer, and `person menubar press <at>`, which clicks a menu-bar row by the path `chrome` prints and goes where a click goes — and `status`'s `end= end_seen= end_cheered=`, two facts kept apart.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -51,8 +46,7 @@ fn claim(app: &App, session: u64) {
 
 /// A headless App, as the lab's is: session 0 runs Claude Code under Land,
 /// claimed by this host, in window 0's first tab, a second tab in front,
-/// window 0 frontmost and on no screen — nobody can look at it. Its sid,
-/// and the host.
+/// window 0 frontmost and on no screen — nobody can look at it.
 fn desk() -> (App, String, TestHost) {
     let mut app = App::headless_for_test();
     let host = host();
@@ -144,11 +138,7 @@ fn look(app: &mut App, window: Option<u64>) -> Result<String, String> {
 
 /// THE VERB'S WORDS, AND WHO MAY SAY THEM (§12.5.2): an armed debug build
 /// reads `look <n>`, `look off` and `menubar press <at>`; anything else is
-/// the usage line. NEGATIVE CONTROLS: unarmed (no `ATERM_DEBUG_PERSON_INVOKE=1`
-/// at launch) every form is `denied`, the person's own; a build without the
-/// stand-in (release) refuses every form before that, and never asks whether
-/// the stand-in is armed (as run, a parse that reads the arming before the
-/// build fails "a release build reads no arming").
+/// the usage line.
 #[test]
 fn the_person_verb_reads_its_forms_and_refuses_unarmed_and_in_release() {
     let armed = |rest: &str| parse_person(rest, true, || true);
@@ -178,7 +168,6 @@ fn the_person_verb_reads_its_forms_and_refuses_unarmed_and_in_release() {
         let refusal = armed(junk).expect_err(junk);
         assert!(refusal.starts_with("usage: person "), "{junk:?}: {refusal}");
     }
-    // NEGATIVE CONTROLS: unarmed, then a release build.
     for rest in ["look 0", "look off", "menubar press 0", "junk"] {
         assert_eq!(
             parse_person(rest, true, || false),
@@ -199,14 +188,7 @@ fn the_person_verb_reads_its_forms_and_refuses_unarmed_and_in_release() {
 /// unseen landing on window 0's first tab, with the second in front: `person
 /// look 0` leaves its `•`, its Done for you row and `❯•`; once the first tab
 /// comes to the front it is seen, and the mark, the row and `❯•` go; with the
-/// look standing, a landing in the front tab is seen as it lands. NEGATIVE
-/// CONTROLS: before the look, the same tab switch sees nothing (a headless
-/// window is looked at by nobody); after `person look off` a new front-tab
-/// landing stands unseen; a window the instance has not is refused, and
-/// nothing is seen. (As run: a look that marks the window's sessions seen
-/// itself fails "a look sees the front tab alone"; the stand-in's arm taken
-/// out of `window_looked_at` fails "seen by the one rule"; a stand-in that
-/// lights the window as on screen fails "nobody looks: it stands".)
+/// look standing, a landing in the front tab is seen as it lands.
 #[test]
 fn a_stand_in_look_sees_the_front_tabs_end_by_the_one_rule() {
     let (mut app, sid, _host) = desk();
@@ -215,14 +197,12 @@ fn a_stand_in_look_sees_the_front_tabs_end_by_the_one_rule() {
     assert_eq!(marks(&app)[0], ChipLevel::Done);
     assert_eq!(app.status_glance().done.len(), 1);
     assert_eq!(app.status_glance().button_title(), "\u{276f}\u{2022}");
-    // NEGATIVE CONTROL: no look, and the tab comes to the front unseen.
     app.switch_tab_in(WindowId(0), 0);
     assert!(app.end_unseen(0), "a headless window: nobody looks");
     app.switch_tab_in(WindowId(0), 1);
     assert_eq!(look(&mut app, Some(9)), Err("no window 9".to_string()));
     assert!(app.end_unseen(0), "a refused look sees nothing");
 
-    // The look, the second tab in front: the end behind it stands.
     assert_eq!(
         look(&mut app, Some(0)),
         Ok("person look window=0".to_string())
@@ -232,7 +212,6 @@ fn a_stand_in_look_sees_the_front_tabs_end_by_the_one_rule() {
     assert_eq!(app.status_glance().done.len(), 1, "the row stands");
     assert_eq!(app.status_glance().button_title(), "\u{276f}\u{2022}");
 
-    // The first tab to the front: the one rule sees it.
     app.take_status_rebuild();
     app.switch_tab_in(WindowId(0), 0);
     assert!(!app.end_unseen(0), "seen by the one rule");
@@ -242,11 +221,9 @@ fn a_stand_in_look_sees_the_front_tabs_end_by_the_one_rule() {
     assert_eq!(g.button_title(), "\u{276f}", "and `❯•`");
     assert_eq!(marks(&app)[0], ChipLevel::Off);
 
-    // The look standing: a front-tab landing is seen as it lands.
     end_after(&mut app, &sid, 40 * SEC);
     assert!(!app.end_unseen(0), "seen as it lands where someone looks");
 
-    // NEGATIVE CONTROL: the look taken back, a new front-tab landing stands.
     assert_eq!(look(&mut app, None), Ok("person look off".to_string()));
     end_after(&mut app, &sid, 40 * SEC);
     assert!(app.end_unseen(0), "nobody looks: it stands");
@@ -258,15 +235,10 @@ fn a_stand_in_look_sees_the_front_tabs_end_by_the_one_rule() {
 /// stands (the front tab wears no `•`: the Done for you row and `❯•` say
 /// it); `person look 0`, with no tab switch or landing after, sees it then,
 /// and the row and `❯•` go, the glance told.
-/// NEGATIVE CONTROLS: the same front tab before the look stands unseen (a
-/// headless window is looked at by nobody); as run, a look that names the
-/// window but runs no rule (`person_look` without its `note_done_seen`)
-/// fails "seen at once".
 #[test]
 fn a_stand_in_look_sees_the_front_tab_at_once() {
     let (mut app, sid, _host) = desk();
     end_after(&mut app, &sid, 45 * SEC);
-    // NEGATIVE CONTROL: in front, nobody looking.
     app.switch_tab_in(WindowId(0), 0);
     assert!(app.end_unseen(0), "in front, nobody looks: it stands");
     assert_eq!(app.status_glance().done.len(), 1);
@@ -289,16 +261,11 @@ fn a_stand_in_look_sees_the_front_tab_at_once() {
 /// window in front, `person look 0` and a tab switch in window 0 bring its
 /// landed tab to window 0's front, and its end stands; once window 1 closes
 /// and window 0 is the frontmost again, the same tab switch sees it.
-/// NEGATIVE CONTROLS: a real window 0 on a screen behind window 1 is looked
-/// at by nobody either (the rule the stand-in follows); as run, a stand-in
-/// that answers for the named window before the frontmost test fails "a
-/// look at a window behind sees nothing".
 #[test]
 fn a_look_at_a_window_behind_sees_nothing() {
     let (mut app, sid, _host) = desk();
     end_after(&mut app, &sid, 45 * SEC);
     assert!(app.end_unseen(0), "PRECONDITION: a background end stands");
-    // A second window, in front, showing the stub tab's session.
     let w1 = app
         .open_active_session_in_new_window_logical()
         .expect("a second window");
@@ -307,7 +274,6 @@ fn a_look_at_a_window_behind_sees_nothing() {
         Some(w1),
         "PRECONDITION: window 1 in front"
     );
-    // NEGATIVE CONTROL: window 0 on a screen, but behind: nobody sees it.
     app.windows
         .get_mut(&WindowId(0))
         .expect("window 0")
@@ -320,7 +286,6 @@ fn a_look_at_a_window_behind_sees_nothing() {
         .expect("window 0")
         .band_on_screen_for_test = false;
 
-    // The stand-in looks at window 0 while window 1 is in front.
     assert_eq!(
         look(&mut app, Some(0)),
         Ok("person look window=0".to_string())
@@ -329,7 +294,6 @@ fn a_look_at_a_window_behind_sees_nothing() {
     assert!(app.end_unseen(0), "a look at a window behind sees nothing");
     assert_eq!(app.status_glance().done.len(), 1, "the row stands");
 
-    // Window 1 goes; window 0 is the frontmost, and the look sees it.
     let _ = app.close_window_logical(w1);
     assert_eq!(
         app.frontmost_window,
@@ -446,8 +410,7 @@ mod card {
         });
     }
 
-    /// One frame through the capture route's order (`App::render_image`'s
-    /// terminal arm): words, the strip, then the footer's splice.
+    /// One frame through the capture route's order (`App::render_image`'s terminal arm): words, the strip, then the footer's splice.
     pub(super) fn frame(app: &mut App, wid: WindowId) {
         app.capture_words(wid, std::time::Instant::now());
         let (plan, route) = app.active_visible_frame_layout(wid).expect("a layout");
@@ -455,8 +418,7 @@ mod card {
         app.splice_claude_footer(wid, &plan, route);
     }
 
-    /// A headless window 120 columns wide, its front session (returned) a
-    /// Claude Code whose launch card is on its screen.
+    /// A headless window 120 columns wide, its front session (returned) a Claude Code whose launch card is on its screen.
     pub(super) fn glass() -> (App, u64) {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -472,11 +434,7 @@ mod card {
 /// card on show and a pill standing in window 0, `person look 0` moves none
 /// of the wakes that read whether a window is on screen — the card's, the
 /// band's motion, the band's own, presence's (the pill's age), the harness
-/// glass's — nor `session_on_screen`. PRECONDITION, in-test: each of those
-/// readers is live — the same window on a screen arms the card's frame and
-/// the band's motion. NEGATIVE CONTROL (as run): a stand-in routed through
-/// `messages_host::band_on_screen` arms the card's deadline
-/// (`claude_card.rs`'s `claude_card_deadline`) and fails this test.
+/// glass's — nor `session_on_screen`.
 #[test]
 fn a_stand_in_look_arms_no_timer() {
     let wid = WindowId(0);
@@ -484,7 +442,6 @@ fn a_stand_in_look_arms_no_timer() {
     let host = host();
     app.harness = Some(host.0.clone());
     claim(&app, session);
-    // A pill: an ask on a second tab, the card's tab back in front.
     let other = app.next_session_id;
     app.push_stub_tab(wid, crate::stub_session(other));
     app.pool
@@ -497,7 +454,6 @@ fn a_stand_in_look_arms_no_timer() {
         .attention = Some("approve the deploy?".to_string());
     app.refresh_presence_session(other);
     app.switch_tab_in(wid, 0);
-    // A live row on the band.
     app.announce_toolchain_pass("installing 10 ALab program(s)", true);
     app.prepare_band_motion(wid, Instant::now());
     card::frame(&mut app, wid);
@@ -525,7 +481,6 @@ fn a_stand_in_look_arms_no_timer() {
         Ok("person look window=0".to_string())
     );
     assert_eq!(wakes(&app), before, "the look armed nothing");
-    // PRECONDITION: the readers are live; on a screen they would arm.
     app.windows
         .get_mut(&wid)
         .expect("window 0")
@@ -557,12 +512,7 @@ fn row_after(app: &App, head: &str) -> (String, crate::status_item::MenuAt) {
 /// `chrome` prints, pressed by its path, posts the row's action as the
 /// AppKit relay posts a click; that wake's dispatch brings the landed tab
 /// to the front and its end is seen, and the row and `❯•` go — a click's Go
-/// is a look by its own act (§11.4.3, item 4), look or not. A worker's Read
-/// Result row, pressed, opens its result and marks its done seen. NEGATIVE
-/// CONTROLS: the press's reply alone, its wake not delivered, sees nothing
-/// (as run, a press that answers `OK` without posting the wake fails this
-/// test); an information line's path is `not an action`, a path past the
-/// menu is `no row at …`, and neither posts anything.
+/// is a look by its own act (§11.4.3, item 4), look or not.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_stand_in_press_goes_where_a_click_goes() {
@@ -583,7 +533,6 @@ fn a_stand_in_press_goes_where_a_click_goes() {
         }),
         Ok(format!("pressed {label}"))
     );
-    // NEGATIVE CONTROL: the reply is no click; the wake is.
     assert!(app.end_unseen(0), "nothing ran before the wake");
     assert_eq!(posted.len(), 1, "one click posted: {posted:?}");
     for wake in posted {
@@ -602,7 +551,6 @@ fn a_stand_in_press_goes_where_a_click_goes() {
     assert!(g.done.is_empty(), "the row goes: {:?}", g.done);
     assert_eq!(g.button_title(), "\u{276f}");
 
-    // NEGATIVE CONTROLS: an information line, a path past the menu.
     let lines = app.status_item_chrome_lines();
     let info = lines
         .iter()
@@ -628,7 +576,6 @@ fn a_stand_in_press_goes_where_a_click_goes() {
     );
     assert!(posted.is_empty(), "nothing posted: {posted:?}");
 
-    // A worker's Read Result.
     let ctx = app.pool.get(0).expect("session 0").ctx.clone();
     let dir = aterm_tempfile::Builder::new()
         .prefix("aterm-person-press-")
@@ -688,13 +635,7 @@ fn a_stand_in_press_goes_where_a_click_goes() {
 /// `end=- end_seen=- end_cheered=-`; a background landing, `end=<the unix
 /// second its face moved there> end_seen=0 end_cheered=0`; cheered by a pet
 /// and not yet looked at, `end_seen=0 end_cheered=1`; looked at,
-/// `end_seen=1`. Under `task=`'s rule: this host's claim ended, the end
-/// still on the glass, `task=-` and the end's three `-`; a session this
-/// window tells no face of prints `-` too. The old fields read by key as
-/// before (a downgrade parse: a reader of `pause=` and `task_state=` skips
-/// the new keys). NEGATIVE CONTROLS (as run): both read from `seen` fails
-/// the cheered row; the end printed whatever the claim fails "no claim, no
-/// end told".
+/// `end_seen=1`.
 #[test]
 fn status_says_the_end_seen_and_cheered_apart() {
     let (mut app, sid, _host) = desk();
@@ -727,7 +668,6 @@ fn status_says_the_end_seen_and_cheered_apart() {
         (at.clone(), zero.clone(), zero.clone()),
         "{line}"
     );
-    // The downgrade parse: the fields around them read as before.
     assert_eq!(field(&line, "task").as_deref(), Some("landed"), "{line}");
     assert_eq!(field(&line, "pause").as_deref(), Some("-"), "{line}");
     assert!(field(&line, "task_state").is_some(), "{line}");
@@ -735,7 +675,6 @@ fn status_says_the_end_seen_and_cheered_apart() {
         line.contains(" land_since=- end="),
         "right after `pause=` and Land's hold (slice 3c): {line}"
     );
-    // Cheered, never seen: the headless case.
     let serial = app.harness_glass[&0].end().expect("an end").serial;
     assert!(
         app.harness_glass
@@ -748,11 +687,9 @@ fn status_says_the_end_seen_and_cheered_apart() {
         (at.clone(), zero.clone(), one.clone()),
         "cheered apart from seen"
     );
-    // Looked at.
     assert!(look(&mut app, Some(0)).is_ok());
     app.switch_tab_in(WindowId(0), 0);
     assert_eq!(ends(&status(&app)), (at, one.clone(), one), "seen");
-    // Under `task=`'s rule: the claim ended, the end still on the glass.
     let ctx = app.pool.get(0).expect("session 0").ctx.clone();
     assert!(
         crate::session_timeline::release_supervisor(
@@ -774,7 +711,6 @@ fn status_says_the_end_seen_and_cheered_apart() {
         (dash(), dash(), dash()),
         "no claim, no end told: {line}"
     );
-    // A session this window tells nothing of: the stub tab.
     let other = app.next_session_id - 1;
     assert_eq!(
         ends(&app.session_status_record(other).expect("status")),
@@ -788,7 +724,6 @@ fn status_says_the_end_seen_and_cheered_apart() {
 /// here replays it, and `status` says `end_seen=0 end_cheered=1` for it
 /// unseen: `end_cheered=1` is that the end's cheer is spent, by a pet's
 /// frame or by the carry, not that a pet in this process cheered it.
-/// NEGATIVE CONTROL (as run): a carried end put in uncheered fails "spent".
 #[test]
 fn status_says_a_carried_ends_cheer_is_spent() {
     let (mut app, _sid, _host) = desk();

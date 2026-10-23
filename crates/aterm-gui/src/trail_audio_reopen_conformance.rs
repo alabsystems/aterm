@@ -1,40 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TIER-1 CONFORMANCE of the derived `TrailAudioReopenLadder` machine
-//! (`aterm_models_misc::trail_audio_reopen_ladder_model`) to the shipping
-//! reopen ladder in `trail_audio.rs` (D5).
-//!
-//! * The schedule (`RetryState`, `reopen_after_fault`) is pure, so it is driven
-//!   exhaustively on a fabricated clock, with the shipping `REOPEN_BACKOFF` and
-//!   with the model's two-step budget. Every real step must be a model
-//!   successor, the model's guards must agree with the real predicates
-//!   (`ready`, the healthy window) in every visited configuration, and the run
-//!   must visit every model state, so the binding is two-way.
-//! * The call sites (`worker_loop`, where the ladder is spent, reset and
-//!   reported) run on a worker thread with a scripted output, and the trace of
-//!   the worker's own atomics at every platform call is validated against the
-//!   model; a reset on a successful open is visible only here. The traces cover
-//!   all three fault sites: a failed open, a failed push, and the housekeeping
-//!   tick that finds a played device's callback stalled (`Service::Reopen`).
-//!   Every fault is charged except the one re-push `worker_loop` makes into a
-//!   fresh device for the cue that discovered the fault (the pushed cue's index
-//!   rides in the trace). The same trace binds the busy stamp (`busy_stale`: an
-//!   open is judged at `OPEN_WEDGE_AFTER_MS`, a push or tick at
-//!   `WEDGE_AFTER_MS`) and the wire word (`host_state`: `failed` never appears
-//!   with budget left). A run ends by closing the channel and joining the
-//!   worker, so its final state is read, never sampled after a sleep.
-//!
-//! Negative controls, so a pass is never vacuous: each [`Mutation`] and a
-//! schedule whose first reopen waits are rejected by the schedule half;
-//! doctored traces (reset on open, a terminal open fault), a worker that stops
-//! charging push faults and an uncharged tick fault are rejected by the trace
-//! validator. The trace validator does not observe time, so a healthy window
-//! measured from the fault rather than the first delivery
-//! (`RetryState::delivered`) is refused by the schedule half and by
-//! `plays-once-then-stalls`'s terminal assertion.
-//!
-//! A child module of `trail_audio`, so it drives the private ladder directly.
+//! Tier-1 conformance tests for `TrailAudioReopenLadder` ([`Mutation`]).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -68,9 +35,7 @@ fn model_for(schedule: &[Duration]) -> Model {
     )
 }
 
-/// Every state reachable from `from` by the three clock actions — time the
-/// harness does not narrate step by step (one real clock jump can cross
-/// several model clocks at once).
+/// Every state reachable from `from` by the three clock actions.
 fn time_closure(m: &Model, from: &BTreeSet<Key>) -> BTreeSet<Key> {
     let mut seen = from.clone();
     let mut queue: VecDeque<Key> = from.iter().cloned().collect();
@@ -102,8 +67,6 @@ fn reachable(m: &Model) -> BTreeSet<Key> {
     seen
 }
 
-// Half 1: the schedule, exhaustively, on a fabricated clock.
-
 /// A defect the schedule harness replays as a negative control.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Mutation {
@@ -115,20 +78,11 @@ enum Mutation {
     ResetOnOpen,
     /// Any delivery resets the ladder, healthy window or not.
     EagerReset,
-    /// The healthy window measured from the fault, so the backoff wait counts
-    /// as play.
+    /// The healthy window measured from the fault, so the backoff wait counts as play.
     ResetFromFault,
 }
 
-/// One real configuration of the ladder: the real `RetryState`, whether the
-/// worker holds a device, whether it has exited, the fabricated clock, and the
-/// spec-side ghosts the code does not keep: the count of reopens since a device
-/// last played through a healthy window (kept apart from `attempts` so the
-/// code's counter can be checked against it), when the last reopen was
-/// scheduled (the `stale` clock), and the `evidence` record (whether a reopen
-/// is outstanding and when the device first delivered after it), kept apart
-/// from the code's `played_since` so the model's `ResetOnlyOnPlayedWindow`
-/// checks the code's reset against an independent witness.
+/// One real configuration of the ladder.
 struct Ladder<'a> {
     retry: RetryState<'a>,
     device: bool,
@@ -210,8 +164,7 @@ impl<'a> Ladder<'a> {
         .collect()
     }
 
-    /// A canonical key for the real configuration: the projection plus the
-    /// clock offsets the next steps depend on.
+    /// A canonical key for the real configuration.
     fn config_key(&self) -> (Key, [Option<Duration>; 4]) {
         (
             key(&self.project()),
@@ -228,16 +181,11 @@ impl<'a> Ladder<'a> {
         )
     }
 
-    /// Whether the environment can produce `action` here, read off the real
-    /// predicates. Compared against the model's own `action_enabled`.
+    /// Whether the environment can produce `action` here, read off the real predicates.
     fn possible(&self, action: &str) -> bool {
         match action {
-            // A cue reaches a worker holding no device.
             "Cue" => !self.device,
-            // A delivery attempt; it only resets anything with a device.
             "CueSounds" => true,
-            // A fault is observed only when the worker touches the platform:
-            // it holds a device, or it is allowed to attempt an open.
             "DeviceFaults" => !self.failed && (self.device || self.retry.ready(self.now)),
             "BackoffElapses" => self.waiting(),
             "StaleElapses" => !self.stale(),
@@ -251,7 +199,6 @@ impl<'a> Ladder<'a> {
         let budget = self.retry.backoff.len() as i64;
         match action {
             "Cue" => {
-                // Sealed ingress and the backoff window both drop the cue.
                 if !self.failed && self.retry.ready(self.now) {
                     self.device = true;
                     if self.mutation == Mutation::ResetOnOpen {
@@ -263,8 +210,6 @@ impl<'a> Ladder<'a> {
             }
             "CueSounds" => {
                 if self.device {
-                    // The spec's reset law reads its own record, taken
-                    // before this delivery is noted.
                     let played_through = self.evidence() == 2;
                     if self.outstanding && self.first_delivery.is_none() {
                         self.first_delivery = Some(self.now);
@@ -320,8 +265,7 @@ impl<'a> Ladder<'a> {
     }
 }
 
-/// Explore every real configuration the schedule can reach; check each step
-/// against the model. `Ok(visited projections)` or the first refusal.
+/// Explore every real configuration the schedule can reach; check each step against the model.
 fn explore_schedule(schedule: &[Duration], mutation: Mutation) -> Result<BTreeSet<Key>, String> {
     let m = model_for(schedule);
     let actions: Vec<&str> = m.actions.iter().map(|a| a.name).collect();
@@ -342,9 +286,6 @@ fn explore_schedule(schedule: &[Duration], mutation: Mutation) -> Result<BTreeSe
     while let Some(real) = queue.pop_front() {
         let pre = real.project();
         for &action in &actions {
-            // The model's guard must be exactly the real environment's
-            // possibility — a guard that disagrees with `ready` or the
-            // healthy window is a guard the code does not have.
             if m.action_enabled(action, &pre) != real.possible(action) {
                 return Err(format!(
                     "{action}: model enabled={} but the real ladder says {} at {pre:?}",
@@ -379,13 +320,9 @@ fn explore_schedule(schedule: &[Duration], mutation: Mutation) -> Result<BTreeSe
     Ok(visited)
 }
 
-/// The schedule conforms, at the shipping budget with the shipping schedule and
 /// at the model's two-step budget, and the run reaches every state the model can.
 #[test]
 fn the_reopen_schedule_conforms_exhaustively() {
-    // The schedule's shape is a model premise, so pin it on the shipping
-    // constant: the first reopen is immediate, every later one waits
-    // strictly longer, so the last wait is the longest step — the window.
     assert_eq!(REOPEN_BACKOFF.len(), usize::from(REOPEN_BUDGET));
     assert!(REOPEN_BACKOFF[0].is_zero());
     assert!(REOPEN_BACKOFF.windows(2).all(|w| w[0] < w[1]));
@@ -417,16 +354,11 @@ fn the_schedule_conformance_rejects_every_replayed_defect() {
             .expect_err("a replayed defect must be rejected");
         eprintln!("{mutation:?} rejected: {err}");
     }
-    // A schedule whose first reopen waits breaks the model's premise that a
-    // transient fault costs the next key nothing.
     let slow_first = [Duration::from_millis(50), Duration::ZERO];
     assert!(explore_schedule(&slow_first, Mutation::None).is_err());
 }
 
-// Half 2: the call sites, through a real `worker_loop` and a scripted output.
-
-/// The shipping schedule's length, compressed to milliseconds so the ladder
-/// is exercised rather than slept through.
+/// Compressed reopen schedule for exercising the ladder in tests.
 const FAST: [Duration; REOPEN_BUDGET as usize] = [
     Duration::ZERO,
     Duration::from_millis(1),
@@ -444,13 +376,11 @@ enum Event {
     /// A push, with the index of the cue it carried.
     PushSounded(usize),
     PushFaulted(usize),
-    /// The housekeeping tick found the callback stalled or faulted
-    /// (`Service::Reopen`) — the fault site between keys.
+    /// The housekeeping tick found the callback stalled or faulted (`Service::Reopen`).
     TickFaulted,
 }
 
-/// The worker's own atomics, read at a platform call (so: the state after
-/// everything the worker decided before it).
+/// Snapshot of the worker's atomics read at a platform call.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Snapshot {
     reopens_left: u8,
@@ -519,14 +449,9 @@ impl AudioWorkerOutput for ScriptedOutput {
 
     fn on_tick(&mut self) -> Service {
         if self.running && self.probe.tick_faults {
-            // The stall watchdog's verdict, taken at the production site
-            // (`worker_loop`'s housekeeping arm): the device played and its
-            // callback has since gone quiet.
             self.probe.record(self.probe.snapshot(), Event::TickFaulted);
             return Service::Reopen;
         }
-        // Park at once: a parked worker takes the blocking `recv` arm, so
-        // the trace is exactly the cue path.
         self.running = false;
         Service::Paused
     }
@@ -536,8 +461,7 @@ impl AudioWorkerOutput for ScriptedOutput {
     }
 }
 
-/// Cue `n`: its index rides in the hue, so a push record names the cue it
-/// carried and the one uncharged re-push can be told from any other fault.
+/// Cue `n`: its index rides in the hue.
 fn cue(n: usize) -> Cue {
     SoundEvent {
         style: GlowStyle::Water,
@@ -563,14 +487,11 @@ fn cue_index(ev: SoundEvent) -> usize {
 enum Pace {
     /// A fixed gap between cues.
     Gap(Duration),
-    /// After each cue, wait (bounded) until the worker has either reported
-    /// a tick fault, dropped the cue, or failed — so every device is
-    /// discovered dead by the housekeeping tick and never by a second push.
+    /// Wait after each cue until the worker reports a tick fault, drops the cue, or fails.
     UntilTickFault,
 }
 
-/// A scripted device: `(open succeeds?, push sounds?, a running device's
-/// housekeeping tick reports it stalled?)`.
+/// A scripted device.
 type Script = (fn(usize) -> bool, fn(usize, usize) -> bool, bool);
 
 /// A finished run: the trace and the worker's final word.
@@ -579,11 +500,7 @@ struct Run {
     last: Snapshot,
 }
 
-/// Drive a real `worker_loop` with a scripted output: `cues` cues paced by
-/// `pace`, then (optionally) one more after `rest`. The run ends by closing
-/// the channel and joining the worker, which drains every queued cue before
-/// it sees the disconnect, so `last` is the worker's final state, not a
-/// sample after a sleep.
+/// Drive a real `worker_loop` with a scripted output.
 fn run_worker(
     (open_ok, push_ok, tick_faults): Script,
     cues: usize,
@@ -691,14 +608,11 @@ fn run_worker(
     }
 }
 
-/// Where the worker may make an uncharged platform call: only inside the
-/// one re-push that follows a charged push fault (`worker_loop`'s
-/// `Delivery::Reopen` arm), and only for that same cue.
+/// Where the worker may make an uncharged platform call.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum Repush {
     None,
-    /// Directly after a charged push fault of cue `k`: the re-open may fail
-    /// uncharged (the next cue's open carries that fault).
+    /// Directly after a charged push fault of cue `k`.
     Fresh(usize),
     /// The re-open of cue `k` succeeded: its push may fault uncharged.
     Opened(usize),
@@ -713,13 +627,9 @@ enum Rules {
     AnyPushUncharged,
 }
 
-/// Validate a worker trace against the model: there must be a model path —
-/// the labelled actions in order, with unnarrated time and dropped cues
-/// between them — whose states agree with every snapshot.
+/// Validate a worker trace against the model: there must be a model path.
 fn validate(m: &Model, trace: &[Record], last: Snapshot, rules: Rules) -> Result<(), String> {
     let budget = m.consts.iter().find(|c| c.0 == "Budget").expect("Budget").1;
-    // Unnarrated steps: time, and a cue the backoff window or sealed ingress
-    // swallowed (a `Cue` that leaves the state as it was).
     let settle = |frontier: &BTreeSet<Key>| -> BTreeSet<Key> {
         let mut seen = time_closure(m, frontier);
         loop {
@@ -766,7 +676,6 @@ fn validate(m: &Model, trace: &[Record], last: Snapshot, rules: Rules) -> Result
                 }
                 matched = true;
                 let s: State = k.clone().into_iter().collect();
-                // `(model action or "" for an uncharged call, repush after)`.
                 let steps: Vec<(&str, Repush)> = match event {
                     Event::OpenOk => vec![(
                         "Cue",
@@ -790,7 +699,6 @@ fn validate(m: &Model, trace: &[Record], last: Snapshot, rules: Rules) -> Result
                         }
                         v
                     }
-                    // The housekeeping reopen re-pushes nothing.
                     Event::TickFaulted => vec![("DeviceFaults", Repush::None)],
                 };
                 for (action, after) in steps {
@@ -839,15 +747,11 @@ fn assert_trace_facts(label: &str, run: &Run) {
     for &(snap, event) in &run.trace {
         let base = snap.busy & !BUSY_OPENING;
         match event {
-            // A device open is stamped as an open, so a slow one is not a
-            // wedge until OPEN_WEDGE_AFTER_MS…
             Event::OpenOk | Event::OpenFailed => {
                 assert_ne!(snap.busy & BUSY_OPENING, 0, "{label}: open unstamped");
                 assert!(busy_stale(snap.busy, base + WEDGE_AFTER_MS).is_none());
                 assert!(busy_stale(snap.busy, base + OPEN_WEDGE_AFTER_MS).is_some());
             }
-            // …while a steady-state push, or the housekeeping tick, is judged
-            // at WEDGE_AFTER_MS.
             Event::PushSounded(_) | Event::PushFaulted(_) | Event::TickFaulted => {
                 assert_ne!(snap.busy, 0, "{label}: platform call unstamped");
                 assert_eq!(snap.busy & BUSY_OPENING, 0, "{label}: stamped as open");
@@ -855,7 +759,6 @@ fn assert_trace_facts(label: &str, run: &Run) {
             }
         }
     }
-    // The wire never says `failed` while the budget has reopens left.
     for snap in run.trace.iter().map(|r| r.0).chain([run.last]) {
         if wire(snap) == HostState::Failed {
             assert_eq!(snap.reopens_left, 0, "{label}: failed with budget left");
@@ -872,8 +775,7 @@ fn open_never(_: usize) -> bool {
 fn open_after_two(n: usize) -> bool {
     n >= 2
 }
-/// Only the first device ever opens: the re-open after its first fault
-/// fails, inside the re-push.
+/// Only the first device ever opens: the re-open after its first fault fails, inside the re-push.
 fn open_first_only(n: usize) -> bool {
     n == 0
 }
@@ -887,8 +789,7 @@ fn push_never(_: usize, _: usize) -> bool {
 fn push_stalls_once(n: usize, _: usize) -> bool {
     n != 1
 }
-/// Every device plays exactly one block and then stalls: the shape the
-/// healthy window exists to see through.
+/// Every device plays exactly one block and then stalls.
 fn push_plays_once(_: usize, here: usize) -> bool {
     here == 0
 }
@@ -896,8 +797,6 @@ fn push_plays_once(_: usize, here: usize) -> bool {
 /// `(label, script, cues, pace, rest before one last cue)`.
 type Scenario = (&'static str, Script, usize, Pace, Option<Duration>);
 
-/// The call sites conform: eight scripted devices through the real
-/// `worker_loop`, each trace a path of the model, including a device found dead
 /// by the housekeeping tick and a re-open that fails inside the re-push.
 #[test]
 fn the_worker_loop_traces_conform_to_the_reopen_ladder() {
@@ -981,7 +880,6 @@ fn the_worker_loop_traces_conform_to_the_reopen_ladder() {
             }
             _ => assert_ne!(run.last.state, STATE_FAILED, "{label}"),
         }
-        // The two paths these scenarios exist for were really taken.
         match label {
             "plays-once-then-stalls-by-tick" => {
                 let ticks = run
@@ -1006,8 +904,6 @@ fn the_worker_loop_traces_conform_to_the_reopen_ladder() {
     }
 }
 
-/// Negative controls for the call-site half: doctored traces of the replayed
-/// defects, and a worker that stops charging its faults, are rejected by the
 /// validator that accepts the real ones.
 #[test]
 fn the_trace_validator_rejects_the_replayed_defects() {
@@ -1016,8 +912,6 @@ fn the_trace_validator_rejects_the_replayed_defects() {
     let real = run_worker((open_always, push_never, false), 60, gap, None);
     validate(&m, &real.trace, real.last, Rules::Exact).expect("the real trace conforms");
 
-    // Reset on open: the snapshot at every push after a reopen shows a full
-    // budget.
     let mut reset_on_open = real.trace.clone();
     let mut after_open = false;
     for (snap, event) in &mut reset_on_open {
@@ -1029,8 +923,6 @@ fn the_trace_validator_rejects_the_replayed_defects() {
     assert_ne!(reset_on_open, real.trace, "the doctoring changed something");
     assert!(validate(&m, &reset_on_open, real.last, Rules::Exact).is_err());
 
-    // A terminal open fault: one failed open, and the worker is failed with the
-    // whole budget unspent.
     let dormant = Snapshot {
         reopens_left: REOPEN_BUDGET,
         state: STATE_DORMANT,
@@ -1041,9 +933,6 @@ fn the_trace_validator_rejects_the_replayed_defects() {
         ..dormant
     };
     assert!(validate(&m, &[(dormant, Event::OpenFailed)], terminal, Rules::Exact).is_err());
-    // …and the same trace with the budget honestly spent by one is accepted
-    // as far as it goes, so the rejection above is about the law, not the
-    // shape of the trace.
     let reopening = Snapshot {
         reopens_left: REOPEN_BUDGET - 1,
         state: super::STATE_REOPENING,
@@ -1052,9 +941,6 @@ fn the_trace_validator_rejects_the_replayed_defects() {
     validate(&m, &[(dormant, Event::OpenFailed)], reopening, Rules::Exact)
         .expect("one reopen spent");
 
-    // A worker that stops charging push faults (it keeps the dead device and
-    // drops cues): one open, then every push faults with the budget full. The
-    // lenient rule accepts it; the exact rule refuses it at the first fault.
     let pushing = Snapshot {
         reopens_left: REOPEN_BUDGET,
         state: super::STATE_RUNNING,
@@ -1070,7 +956,6 @@ fn the_trace_validator_rejects_the_replayed_defects() {
         .expect_err("an uncharged fault outside the re-push must be rejected");
     eprintln!("swallowed push faults rejected: {err}");
 
-    // …and a tick fault that is not charged is refused the same way.
     let by_tick = run_worker(
         (open_always, push_always, true),
         400,

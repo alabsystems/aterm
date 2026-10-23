@@ -4,12 +4,6 @@
 // Derived from winit 0.30.13 src/cursor.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// LOCAL PATCH (aterm), 2026-10-16 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 5):
-// custom cursors are API no aterm crate uses. The macOS backend no longer implements them, nor
-// (2026-10-21, WC.8) the Linux module, so everything here but `Cursor` and its `Icon` variant is
-// `#[cfg(windows_platform)]`; the Windows carve deletes the rest with its half. The
-// `OnlyCursorImage` handle the Wayland backend alone kept a cursor image in left with WC.8.
-
 #[cfg(windows_platform)]
 use core::fmt;
 #[cfg(windows_platform)]
@@ -58,39 +52,6 @@ impl From<CustomCursor> for Cursor {
 }
 
 /// Use a custom image as a cursor (mouse pointer).
-///
-/// Is guaranteed to be cheap to clone.
-///
-/// ## Platform-specific
-///
-/// **Web**: Some browsers have limits on cursor sizes usually at 128x128.
-///
-/// # Example
-///
-/// ```no_run
-/// # use aterm_window::event_loop::ActiveEventLoop;
-/// # use aterm_window::window::Window;
-/// # fn scope(event_loop: &ActiveEventLoop, window: &Window) {
-/// use aterm_window::window::CustomCursor;
-///
-/// let w = 10;
-/// let h = 10;
-/// let rgba = vec![255; (w * h * 4) as usize];
-///
-/// #[cfg(not(target_family = "wasm"))]
-/// let source = CustomCursor::from_rgba(rgba, w, h, w / 2, h / 2).unwrap();
-///
-/// #[cfg(target_family = "wasm")]
-/// let source = {
-///     use aterm_window::platform::web::CustomCursorExtWebSys;
-///     CustomCursor::from_url(String::from("http://localhost:3000/cursor.png"), 0, 0)
-/// };
-///
-/// let custom_cursor = event_loop.create_custom_cursor(source);
-///
-/// window.set_cursor(custom_cursor.clone());
-/// # }
-/// ```
 #[cfg(windows_platform)]
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct CustomCursor {
@@ -101,8 +62,6 @@ pub struct CustomCursor {
 #[cfg(windows_platform)]
 impl CustomCursor {
     /// Creates a new cursor from an rgba buffer.
-    ///
-    /// The alpha channel is assumed to be **not** premultiplied.
     pub fn from_rgba(
         rgba: impl Into<Vec<u8>>,
         width: u16,
@@ -132,8 +91,6 @@ impl CustomCursor {
 }
 
 /// Source for [`CustomCursor`].
-///
-/// See [`CustomCursor`] for more details.
 #[cfg(windows_platform)]
 #[derive(Debug)]
 pub struct CustomCursorSource {
@@ -144,15 +101,12 @@ pub struct CustomCursorSource {
 #[cfg(windows_platform)]
 #[derive(Debug, Clone)]
 pub enum BadImage {
-    /// Produced when the image dimensions are larger than [`MAX_CURSOR_SIZE`]. This doesn't
-    /// guarantee that the cursor will work, but should avoid many platform and device specific
-    /// limits.
+    /// Produced when the image dimensions are larger than [`MAX_CURSOR_SIZE`].
     TooLarge { width: u16, height: u16 },
     /// Produced when the length of the `rgba` argument isn't divisible by 4, thus `rgba` can't be
     /// safely interpreted as 32bpp RGBA pixels.
     ByteCountNotDivisibleBy4 { byte_count: usize },
     /// Produced when the number of pixels (`rgba.len() / 4`) isn't equal to `width * height`.
-    /// At least one of your arguments is incorrect.
     DimensionsVsPixelCount { width: u16, height: u16, width_x_height: u64, pixel_count: u64 },
     /// Produced when the hotspot is outside the image bounds
     HotspotOutOfBounds { width: u16, height: u16, hotspot_x: u16, hotspot_y: u16 },

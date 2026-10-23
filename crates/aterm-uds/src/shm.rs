@@ -22,6 +22,7 @@ pub const MAX_LEN: usize = 64 * 1024 * 1024;
 /// The name's fixed head; [`NAME_RANDOM`] base32 characters follow it.
 const NAME_HEAD: &str = "/atrj.";
 /// Random base32 characters in a name: 125 bits, and with the head 31 bytes, macOS's
+/// `PSHMNAMLEN`.
 const NAME_RANDOM: usize = 25;
 /// How many fresh names [`Region::create`] tries when one already exists.
 const NAME_TRIES: usize = 8;
@@ -68,7 +69,7 @@ pub struct Region {
 // SAFETY: the mapping is process-wide memory not bound to a specific thread.
 unsafe impl Send for Region {}
 
-/// `Region` must never be `Sync` (module doc). If it were, both impls below would apply and the
+/// `Region` must never be `Sync` (module doc).
 trait AmbiguousIfSync<A> {
     fn named() {}
 }
@@ -419,6 +420,8 @@ mod tests {
     const LEN: usize = 2 * PAGE;
 
     /// The creator writes; a read-only mapping of the custody descriptor reads every byte and
+    /// word back, and refuses every store; the custody descriptor is read-only, close-on-exec
+    /// and exactly the region's size.
     #[test]
     fn a_region_maps_back_read_only_from_its_custody_descriptor() {
         // SAFETY: fixture keeps custody local without concurrent writes or truncation.
@@ -461,6 +464,8 @@ mod tests {
     }
 
     /// `map_readonly` refuses a writable descriptor, a size other than the offer's, and a length
+    /// that is no region's; a region is refused at a length that is not a whole number of
+    /// pages.
     #[test]
     fn map_readonly_refuses_a_writable_descriptor_and_a_wrong_size() {
         // SAFETY: private writable descriptor is only inspected and refused below.
@@ -526,6 +531,8 @@ mod tests {
     }
 
     /// Copies at every offset and length across word edges leave exactly the bytes a `Vec` would
+    /// hold, and the restorer's read-only mapping reads every span back the same, as do its
+    /// words (relaxed loads and a fence, on `PROT_READ` pages).
     #[test]
     fn copies_across_word_edges_are_plain_memory() {
         // SAFETY: custody is never reopened or mutated; all writes go through `region`.

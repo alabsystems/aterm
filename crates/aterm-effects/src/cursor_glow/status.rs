@@ -83,6 +83,7 @@ impl AdmissionRecord {
 pub const ADMISSION_LOG_CAP: usize = 32;
 
 /// The fixed-size drop-oldest ring behind [`CursorGlow::admission_log`],
+/// resident in the engine (one slot write per observed move).
 #[derive(Default)]
 pub(super) struct AdmissionLog {
     pub(super) records: [Option<AdmissionRecord>; ADMISSION_LOG_CAP],
@@ -91,6 +92,7 @@ pub(super) struct AdmissionLog {
     /// Total records ever pushed; stamps each record's `seq`.
     pub(super) seq: u64,
     /// Cumulative tally: fast typing overwrites the 32-slot ring quickly, so
+    /// "was any move ever licensed on this window" needs a counter.
     pub(super) tally: AdmissionTally,
 }
 
@@ -542,6 +544,7 @@ impl CursorGlow {
     pub const DECLINE_HIDDEN_RELOCATION: &'static str = "hidden-relocation";
 
     /// Record a licensed verdict in the diagnosis ring under the named licence
+    /// class (`AdmissionRecord::LICENCE_*`).
     pub(super) fn log_licensed_as(
         &mut self,
         at: Instant,
@@ -639,6 +642,8 @@ impl CursorGlow {
     }
 
     /// The text lines the host's row probe shows this frame: the cursor's row
+    /// and each probed row flanking it ([`Self::observe_neighbor_rows`]), as
+    /// the column span from the row's first glyph to one past its last.
     pub(super) fn probed_text_spans(&self) -> TextSpans {
         let mut spans = TextSpans::default();
         let Some(m) = self.row_prev_meta.as_ref() else {
@@ -681,6 +686,9 @@ impl CursorGlow {
     }
 
     /// The under-ink stream the caret's bodies draw their light-ground ink
+    /// into after this frame's tick (`CursorFx::tick`: the comet's coma, the
+    /// light rod, the typing glow), so every host's `glow_under` carries them
+    /// with no host change.
     #[inline]
     pub(crate) const fn under_sink(&mut self) -> &mut Vec<GlowQuad> {
         &mut self.under_out
@@ -726,6 +734,9 @@ impl CursorGlow {
     }
 
     /// The colour of a seated caret stop (`v2_stop`), spelled as
+    /// `rk::ribbon::Ribbon::head_rgb` spells the live one, through the same
+    /// `rk::ribbon::caret_ink`: the authored stop at the reflected walk on
+    /// dark, that stop's caret ink on the page on light.
     #[inline]
     pub(super) fn v2_caret_stop_rgb(t: f32, cfg: &rk::Config) -> u32 {
         rk::ribbon::caret_ink(crate::spectrum::spectrum(rk::ribbon::walk_arc(t)), cfg)
@@ -795,6 +806,8 @@ impl CursorGlow {
 }
 
 /// The probed text lines of one frame ([`CursorGlow::probed_text_spans`]): up
+/// to three rows, each `(row, first column, one past the last)`, and which
+/// rows the probe read at all (blank or not).
 #[derive(Clone, Copy, Default)]
 pub(crate) struct TextSpans {
     rows: [Option<(i32, i32, i32)>; 3],
@@ -803,6 +816,9 @@ pub(crate) struct TextSpans {
 
 impl TextSpans {
     /// Whether grid cell `(row, col)` lies on a probed line of text: a
+    /// glyph, or a blank between two of a line's glyphs (a mark in the gap
+    /// between words reads as punctuation, a hyphen or a middle dot, as
+    /// surely as one over a letter reads as noise).
     #[inline]
     pub(super) const fn covers_cell(&self, row: i32, col: i32) -> bool {
         let mut i = 0;
@@ -820,12 +836,14 @@ impl TextSpans {
     }
 
     /// Each probed line of text as `(row, first, end)`: the column span from
+    /// its first glyph to one past its last.
     #[inline]
     pub(super) fn lines(&self) -> impl Iterator<Item = (i32, i32, i32)> + '_ {
         self.rows.iter().flatten().copied()
     }
 
     /// Whether the probe read grid row `row` this frame, so a cell of it off
+    /// every line ([`Self::covers_cell`]) is known blank rather than unknown.
     #[inline]
     pub(super) const fn reads_row(&self, row: i32) -> bool {
         matches!(self.read[0], Some(r) if r == row)
@@ -835,18 +853,24 @@ impl TextSpans {
 }
 
 /// The text of the rows the frame presents where the streak may run, read
+/// from the frame's own cells ([`CursorGlow::observe_frame_text`]): rows
+/// `lo..lo + rows.len()`, each the column span from its first glyph to one
+/// past its last (`None` for a blank row), for the frame stamped `at`.
 #[derive(Default)]
 pub(crate) struct FrameText {
     pub(super) at: Option<Instant>,
     pub(super) lo: i32,
     pub(super) rows: Vec<Option<(i32, i32)>>,
     /// Each read row's cells' ink and ground (`0x00RRGGBB`; no ink for a
+    /// blank cell; `None` for a column the row does not carry), `cols` a
+    /// row, row-major as `rows`: what a letter there is drawn in and on.
     pub(super) pairs: Vec<Option<(Option<u32>, u32)>>,
     pub(super) cols: usize,
 }
 
 impl FrameText {
     /// The ink (`None` for a blank cell) and ground of cell `(row, col)` in
+    /// the frame's own cells, or `None` for a cell the frame did not read.
     #[inline]
     pub(crate) const fn pair(&self, row: i32, col: i32) -> Option<(Option<u32>, u32)> {
         let i = row - self.lo;
@@ -860,6 +884,8 @@ impl FrameText {
 }
 
 /// What a frame shows of text where the streak runs: the row probe's lines,
+/// and for a row the probe did not read, that row's text in the frame's own
+/// cells ([`FrameText`]).
 #[derive(Clone, Copy)]
 pub(crate) struct TextView<'a> {
     pub(crate) spans: TextSpans,
@@ -869,6 +895,7 @@ pub(crate) struct TextView<'a> {
 
 impl<'a> TextView<'a> {
     /// The probe's lines and the frame's rows `frame` (`None` for a frame
+    /// that handed none).
     #[inline]
     pub(crate) const fn new(spans: TextSpans, frame: Option<&'a FrameText>) -> Self {
         match frame {
@@ -886,6 +913,7 @@ impl<'a> TextView<'a> {
     }
 
     /// The frame's own read of `row`: `Some(span)` for a row it read
+    /// (`span` `None` when blank), `None` for a row it did not.
     #[inline]
     const fn frame_row(&self, row: i32) -> Option<Option<(i32, i32)>> {
         let i = row - self.lo;
@@ -903,6 +931,8 @@ impl<'a> TextView<'a> {
     }
 
     /// The text line of a row the probe did not read but the frame's cells
+    /// did: `Some(Some((first, end)))` for a row with glyphs, `Some(None)`
+    /// for a blank one, `None` where neither read it.
     #[inline]
     pub(crate) const fn frame_line(&self, row: i32) -> Option<Option<(i32, i32)>> {
         if self.spans.reads_row(row) {
@@ -912,6 +942,7 @@ impl<'a> TextView<'a> {
     }
 
     /// Whether grid cell `(row, col)` lies on a line of text the frame
+    /// shows (a glyph, or a blank between two of a line's glyphs).
     #[inline]
     pub(crate) const fn covers_cell(&self, row: i32, col: i32) -> bool {
         if self.spans.reads_row(row) {
@@ -924,6 +955,7 @@ impl<'a> TextView<'a> {
     }
 
     /// Whether the frame shows grid row `row` blank: read (by the probe or
+    /// the frame's own cells) and holding no glyph.
     #[inline]
     pub(crate) const fn row_is_blank(&self, row: i32) -> bool {
         if self.spans.reads_row(row) {
@@ -943,6 +975,8 @@ impl<'a> TextView<'a> {
     }
 
     /// Whether the dark streak treats cell `(row, col)` as text: a cell on
+    /// a line of text, or one on a row nobody read (so the full beam lands
+    /// only where the frame showed air).
     #[inline]
     pub(crate) const fn over_text(&self, row: i32, col: i32) -> bool {
         !self.knows_row(row) || self.covers_cell(row, col)

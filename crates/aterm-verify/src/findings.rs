@@ -109,6 +109,55 @@ pub fn rerun_env(cmd: &Cmd, test_threads: Option<u32>) -> Vec<(OsString, OsStrin
     env
 }
 
+/// The one line a stage group's survivors add to the receipt
+/// (`docs/DESIGN-leftover-processes-2026-10-16.md` §8.1.2): what the run ended by pid, and
+/// what it named and left. `ended` and `named` are exe words, each shown by [`tally_words`];
+/// `partial` says the group's listing filled its buffer, so more may be left than it names.
+/// The run reports and ends now but does not turn red yet (§11 Q4).
+#[must_use]
+pub fn survivor_line(stage: &str, ended: &[String], named: &[String], partial: bool) -> String {
+    let total = ended.len() + named.len();
+    let mut parts = Vec::new();
+    if !ended.is_empty() {
+        parts.push(format!("{}, ended", tally_words(ended)));
+    }
+    if !named.is_empty() {
+        parts.push(format!(
+            "{} other named: {}",
+            named.len(),
+            tally_words(named)
+        ));
+    }
+    if partial {
+        parts.push(
+            "its group's listing was partial, so it may have left processes not named here"
+                .to_owned(),
+        );
+    }
+    let head = if total == 0 {
+        format!("stage {stage}")
+    } else {
+        format!("stage {stage} left {total} processes in its group")
+    };
+    format!("{head}: {}", parts.join("; "))
+}
+
+/// `word ×n` for each distinct word, most frequent first: `aterm ×7, ssh-agent ×1`.
+#[must_use]
+pub fn tally_words(words: &[String]) -> String {
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for w in words {
+        *counts.entry(w.as_str()).or_default() += 1;
+    }
+    let mut pairs: Vec<(&str, usize)> = counts.into_iter().collect();
+    pairs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    pairs
+        .iter()
+        .map(|(w, n)| format!("{w} \u{d7}{n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The row as one finding: its label, and the lines of its output that say
 /// what went wrong ([`excerpt`]).
 #[must_use]

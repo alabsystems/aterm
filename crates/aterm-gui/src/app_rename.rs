@@ -1,28 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Inline session rename: the GUI face of the user pin (`meta set title`), the top rung of the
-//! tab-label chain ([`crate::app_tabs::resolved_terminal_title_rung`]). Double-clicking a tab
-//! (or Window ▸ Rename Session…, the `rename_session` keybinding, the tab context menu) opens
-//! an editor over it; Return commits, Escape cancels, and an empty commit clears the pin so
-//! the label falls back down the chain.
-//!
-//! macOS presents a real `NSTextField` over the chip and AppKit owns its characters; elsewhere
-//! the in-grid strip paints the field and this state owns them. [`RenameSurface`] records
-//! which is on screen, and an edit nothing can present is refused rather than stored (an
-//! invisible modal would swallow commands).
-//!
-//! The pin is session metadata and a tab can hold several split sessions, so every entry point
-//! edits the tab's focused pane's session, and the edit is keyed on that session id: tabs close
-//! and reorder while events are queued, and the strip re-stamps a chip's tab id per position.
-//!
-//! `App::commit_session_rename` writes through
-//! [`crate::session_timeline::write_session_meta`] (the `meta` verb's validation, atomicity
-//! and `changed` gate), then runs the chrome refresh directly (the record wakes the
-//! session's watchers): posting `Wake::MetaChanged` would run the refresh twice.
-//!
-//! A pin is not synchronously durable: the restore manifest is written on graceful,
-//! non-headless shutdown, so a crash between a rename and a quit loses it.
+//! Inline session rename: the GUI face of the user pin (`meta set title`), the top rung of the tab-label chain ([`crate::app_tabs::resolved_terminal_title_rung`]).
 
 use crate::app_search::{SearchEdit, apply_field_edit};
 use crate::platform::AppRt;
@@ -30,51 +9,39 @@ use crate::session_timeline::{MetaEdit, MetaField, MetaWriteError, write_session
 use crate::tab_model::TabId;
 use crate::{App, WindowId};
 
-/// Which surface presents a live edit, and so who owns the text: the macOS `NSTextField`'s
-/// field editor, or this state for the in-grid field [`crate::tab_bar`] paints. The state says
-/// which rather than letting consumers re-derive it from the platform, so a command never
-/// reads the wrong text.
+/// Which surface presents a live edit, and so who owns the text: the macOS `NSTextField`'s field editor, or this state for the in-grid field [`crate::tab_bar`] paints.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RenameSurface {
-    /// The macOS strip's `NSTextField` overlay. `text`/`cursor` hold only the seed; the live
-    /// text is in AppKit, read back with `rename_editor_text`.
+    /// The macOS strip's `NSTextField` overlay.
     Native,
-    /// The cell-drawn field the in-grid strip paints over the tab's title; `text`/`cursor` are
-    /// the field.
+    /// The cell-drawn field the in-grid strip paints over the tab's title; `text`/`cursor` are the field.
     InGrid,
 }
 
 /// A live inline rename on one window's tab strip.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TabRenameEdit {
-    /// The session whose value is edited, resolved once at begin from the tab's focused pane;
-    /// the only thing a commit applies to.
+    /// The session whose value is edited, resolved once at begin from the tab's focused pane; the only thing a commit applies to.
     pub session: u64,
-    /// The tab the editor is painted over, for positioning only: how the native editor
-    /// follows a reorder and learns its tab closed. Never a commit target.
+    /// The tab the editor is painted over, for positioning only: how the native editor follows a reorder and learns its tab closed.
     pub tab: TabId,
     /// Which editor is on screen, set at begin from what presented and never re-derived.
     pub surface: RenameSurface,
-    /// The metadata field the commit writes: the title pin (Rename Session…, the double-click)
-    /// or the role (Window ▸ Set Role…). Fixed at begin.
+    /// The metadata field the commit writes: the title pin (Rename Session…, the double-click) or the role (Window ▸ Set Role…).
     pub field: MetaField,
-    /// The in-grid field's text: seeded from the stored value (empty when unset), changed only
-    /// through [`crate::app_search::apply_field_edit`], the find bar's reducer.
+    /// The in-grid field's text: seeded from the stored value (empty when unset), changed only through [`crate::app_search::apply_field_edit`], the find bar's reducer.
     pub text: String,
     /// Caret position in [`Self::text`], a byte offset on a char boundary.
     pub cursor: usize,
 }
 
 impl App {
-    /// The session being renamed in `window`, or `None` when no editor is open: whether keys
-    /// and commands belong to a text field rather than the terminal.
+    /// The session being renamed in `window`, or `None` when no editor is open: whether keys and commands belong to a text field rather than the terminal.
     pub(crate) fn rename_edit_session(&self, window: WindowId) -> Option<u64> {
         Some(self.windows.get(&window)?.rename_edit.as_ref()?.session)
     }
 
-    /// The live edit on `window` when the in-grid strip presents it: the gate every
-    /// own-rendered path (key routing, strip paint, strip clicks) asks, so none acts on a
-    /// macOS field whose text it does not own.
+    /// The live edit on `window` when the in-grid strip presents it: the gate every own-rendered path (key routing, strip paint, strip clicks) asks, so none acts on a macOS field whose text it does not own.
     pub(crate) fn inline_rename_edit(&self, window: WindowId) -> Option<&TabRenameEdit> {
         self.windows
             .get(&window)?
@@ -83,8 +50,7 @@ impl App {
             .filter(|edit| edit.surface == RenameSurface::InGrid)
     }
 
-    /// The window with a live inline rename, if any: the menu dispatch asks before letting a
-    /// key equivalent reach the terminal.
+    /// The window with a live inline rename, if any: the menu dispatch asks before letting a key equivalent reach the terminal.
     pub(crate) fn any_rename_edit(&self) -> Option<WindowId> {
         self.windows
             .iter()
@@ -92,11 +58,7 @@ impl App {
             .map(|(wid, _)| *wid)
     }
 
-    /// The front window's live edit, if it has one. A menu command belongs to the front
-    /// window, and AppKit does not end field editing when a window stops being key, so an
-    /// editor left open in a background window must not swallow the front's ⌘C or be
-    /// committed by its ⌘W. `focus_order`'s last entry is the front; before any OS focus event
-    /// (headless, tests) any live edit counts.
+    /// The front window's live edit, if it has one.
     pub(crate) fn front_rename_edit(&self) -> Option<WindowId> {
         match self.focus_order.last().copied() {
             Some(front) => self
@@ -108,9 +70,7 @@ impl App {
         }
     }
 
-    /// Whether `window` can present an inline rename editor: macOS has a native field;
-    /// elsewhere the tab strip paints it, so `tab_strip_rows = 0` leaves nowhere to put it.
-    /// Surfaces grey the command out on `false`.
+    /// Whether `window` can present an inline rename editor: macOS has a native field; elsewhere the tab strip paints it, so `tab_strip_rows = 0` leaves nowhere to put it.
     pub(crate) fn can_rename_session(&self, window: WindowId) -> bool {
         if self.tab_strip_enabled() {
             return true;
@@ -120,22 +80,12 @@ impl App {
             .is_some_and(|handle| self.apprt.can_present_tab_rename(handle))
     }
 
-    /// Open the inline pin editor over `tab` of `window`, editing that tab's focused pane's
-    /// session. Returns whether an edit is now live.
-    ///
-    /// The seed is the pin itself (empty when unpinned), never the chip's presented label, so a
-    /// first Return cannot pin an OSC-derived title as if the user typed it; the resolved label
-    /// is the placeholder, so an empty field visibly means "fall back to that".
-    ///
-    /// A second begin is idempotent for the same session, chip and field, and otherwise
-    /// settles (commits) the live edit before opening the new one.
+    /// Open the inline pin editor over `tab` of `window`, editing that tab's focused pane's session.
     pub(crate) fn begin_session_rename(&mut self, window: WindowId, tab: TabId) -> bool {
         self.begin_session_meta_edit(window, tab, MetaField::Title)
     }
 
-    /// [`Self::begin_session_rename`] for any presentation field: seeded with the field's
-    /// stored value, placeheld with the resolved label (title) or the field's name (role),
-    /// and writing that field on commit.
+    /// [`Self::begin_session_rename`] for any presentation field: seeded with the field's stored value, placeheld with the resolved label (title) or the field's name (role), and writing that field on commit.
     pub(crate) fn begin_session_meta_edit(
         &mut self,
         window: WindowId,
@@ -147,8 +97,6 @@ impl App {
             return false;
         };
         let Some(session) = self.tab_terminal_session(window, index) else {
-            // A native whole tab owns no session. The menu and palette rows are greyed for
-            // it; the double-click path can still land here.
             aterm_log::info!("rename dropped: tab {tab} has no terminal session");
             return false;
         };
@@ -157,15 +105,9 @@ impl App {
             .get(&window)
             .and_then(|ws| ws.rename_edit.as_ref())
             .map(|edit| (edit.session, edit.tab, edit.field));
-        // Same session, chip and field: nothing to do, so a repeat double-click does not
-        // reopen the field under the caret. Compared whole so a session shown on another tab
-        // re-presents (the editor moves) and a Set Role… over an open rename settles it first.
         if live == Some((session, tab, field)) {
             return true;
         }
-        // Replacing a different live edit settles (commits) it, like every other way of
-        // leaving the field. Settling also tears the old editor down, so the platform never
-        // holds two fields and the old one cannot post a late commit.
         if live.is_some() {
             self.settle_rename_edit(window);
         }
@@ -186,12 +128,8 @@ impl App {
                 .get(index)
                 .cloned()
                 .unwrap_or_default(),
-            // The role has no label chain to fall back down: an empty field
-            // means "no role", and the placeholder says which field this is.
             _ => field.wire_name().to_string(),
         };
-        // The native editor first, where it exists; the in-grid strip only when it is on
-        // screen (`tab_strip_rows > 0`).
         let native = match self._toolbars.get(&window) {
             Some(handle) => self
                 .apprt
@@ -203,8 +141,6 @@ impl App {
         } else if self.tab_strip_enabled() {
             RenameSurface::InGrid
         } else {
-            // Nothing would paint this edit: keeping the state would be an invisible modal
-            // that swallows commands and nothing can end (headless included).
             aterm_log::info!(
                 "rename dropped: no editor surface on this window (session {session}); \
                  the in-grid strip is off (tab_strip_rows = 0) and no native editor presented"
@@ -224,19 +160,16 @@ impl App {
         } else {
             return false;
         }
-        // The in-grid field is strip paint: it needs the repaint AppKit gives the native one.
         self.request_rename_repaint(window);
         true
     }
 
-    /// Open the editor over `window`'s active tab, the subject every entry point outside the
-    /// tab context uses (menu bar, palette, `invoke`, keybinding).
+    /// Open the editor over `window`'s active tab, the subject every entry point outside the tab context uses (menu bar, palette, `invoke`, keybinding).
     pub(crate) fn begin_active_session_rename(&mut self, window: WindowId) -> bool {
         self.begin_active_session_meta_edit(window, MetaField::Title)
     }
 
-    /// [`Self::begin_active_session_rename`] for any field (Window ▸ Set Role… passes
-    /// `MetaField::Role`).
+    /// [`Self::begin_active_session_rename`] for any field (Window ▸ Set Role… passes `MetaField::Role`).
     pub(crate) fn begin_active_session_meta_edit(
         &mut self,
         window: WindowId,
@@ -252,8 +185,7 @@ impl App {
         self.begin_session_meta_edit(window, tab, field)
     }
 
-    /// Tear down `window`'s editor (platform and state) without writing: the unconditional
-    /// half of every ending (Escape, a commit, a vanished tab, a superseding edit).
+    /// Tear down `window`'s editor (platform and state) without writing: the unconditional half of every ending (Escape, a commit, a vanished tab, a superseding edit).
     pub(crate) fn end_session_rename_editor(&mut self, window: WindowId) {
         let had_edit = self
             .windows
@@ -269,15 +201,12 @@ impl App {
                 .get(&window)
                 .and_then(|ws| ws.os_window.as_ref())
         {
-            // The editor was painted, so its removal repaints even when nothing was
             // written (Escape, a no-op commit).
             w.request_redraw();
         }
     }
 
-    /// Ask `window` to repaint: the in-grid field is drawn into the tab strip, so every
-    /// keystroke needs a frame. The strip's caches see the edit through
-    /// [`crate::App::tab_strip_fingerprint_from_parts`], which hashes it.
+    /// Ask `window` to repaint: the in-grid field is drawn into the tab strip, so every keystroke needs a frame.
     pub(crate) fn request_rename_repaint(&mut self, window: WindowId) {
         if let Some(w) = self
             .windows
@@ -288,13 +217,7 @@ impl App {
         }
     }
 
-    /// Settle the live edit on `window`: end it the way leaving a field does, keeping what was
-    /// typed (the Finder/Xcode rule the macOS editor follows at `controlTextDidEndEditing:`).
-    /// A menu-bar command, a tab context-menu command, a click on another chip and a click
-    /// outside the strip all come here; Escape and a vanished tab are the only cancels.
-    ///
-    /// The text comes from its owner: AppKit's field editor for a native edit, the state for an
-    /// in-grid one. A native edit with no readable field ends without writing.
+    /// Settle the live edit on `window`: end it the way leaving a field does, keeping what was typed (the Finder/Xcode rule the macOS editor follows at `controlTextDidEndEditing:`).
     pub(crate) fn settle_rename_edit(&mut self, window: WindowId) {
         let Some((session, surface, text)) = self
             .windows
@@ -317,9 +240,7 @@ impl App {
         }
     }
 
-    /// Apply one field edit to `window`'s in-grid rename field and repaint. Returns whether an
-    /// in-grid edit was live. The reducer is the find bar's ([`apply_field_edit`]), so the two
-    /// fields agree on caret motion, word kills and char boundaries.
+    /// Apply one field edit to `window`'s in-grid rename field and repaint.
     pub(crate) fn rename_field_edit(&mut self, window: WindowId, edit: SearchEdit) -> bool {
         let Some(ws) = self.windows.get_mut(&window) else {
             return false;
@@ -331,12 +252,7 @@ impl App {
         else {
             return false;
         };
-        // A caret move repaints too: the caret is a painted reverse-video cell.
         apply_field_edit(&mut state.text, &mut state.cursor, edit);
-        // Canonicalize as the user types, as the macOS field editor does
-        // (`controlTextDidChange:`): the field holds only values the store accepts, so a full
-        // field simply stops taking more. Compared trimmed, like the native one, so a space
-        // typed mid-word does not move the caret.
         let canonical =
             crate::session_timeline::sanitize_presentation_line(&state.text, state.field.cap());
         if state.text.trim() != canonical {
@@ -350,12 +266,7 @@ impl App {
         true
     }
 
-    /// Paste the clipboard into `window`'s in-grid rename field (one line; the reducer strips
-    /// control characters). The field owns the keystroke, so nothing reaches the shell.
-    ///
-    /// On X11 only an own-selection read is instant; a foreign owner needs a
-    /// `ConvertSelection` round-trip that can park the loop for ~1 s, so this synchronous path
-    /// does not paste from a foreign owner. The `⌘V` is swallowed either way.
+    /// Paste the clipboard into `window`'s in-grid rename field (one line; the reducer strips control characters).
     pub(crate) fn rename_paste_in(&mut self, window: WindowId) -> bool {
         #[cfg(target_os = "linux")]
         let text = crate::control::pbpaste_owned();
@@ -367,8 +278,7 @@ impl App {
         self.rename_field_edit(window, SearchEdit::Insert(text))
     }
 
-    /// Cancel the live edit iff it is still the one `session` named. A cancel for
-    /// a stale session is dropped: the editor it belonged to is already gone.
+    /// Cancel the live edit iff it is still the one `session` named.
     pub(crate) fn cancel_session_rename(&mut self, window: WindowId, session: u64) {
         if self.rename_edit_session(window) != Some(session) {
             return;
@@ -377,18 +287,11 @@ impl App {
     }
 
     /// Commit the live edit: tear the editor down, then write the pin.
-    ///
-    /// Empty or whitespace-only `text` clears the pin with [`MetaEdit::Clear`], never
-    /// `Set("")`: both store `None`, but only `Clear` records the documented `-` marker.
-    ///
-    /// A commit that lost a race (the tab closed mid-edit, another edit replaced this one) is
-    /// dropped instead of landing on the wrong session.
     pub(crate) fn commit_session_rename(&mut self, window: WindowId, session: u64, text: &str) {
         if self.rename_edit_session(window) != Some(session) {
             aterm_log::info!("rename commit dropped: session {session} is no longer being edited");
             return;
         }
-        // Read the field before teardown, so a Set Role… commit never lands on the title.
         let field = self
             .windows
             .get(&window)
@@ -398,7 +301,6 @@ impl App {
         match self.write_session_meta_field(session, field, text) {
             Ok(_) => {}
             Err(error) => {
-                // Both editors canonicalize as the user types, so only a scripted `invoke`
                 // can reach this.
                 aterm_log::info!("rename refused for session {session}: {error:?}");
             }
@@ -406,12 +308,6 @@ impl App {
     }
 
     /// Write one session's title pin (empty clears it) and refresh what it invalidates.
-    /// Returns whether the stored value moved.
-    ///
-    /// The GUI twin of the control socket's `meta` arm over the same typed API:
-    /// `write_session_meta` validates, stores and records, and returns with every guard
-    /// released, which matters because the refresh re-takes `ctx.meta` per tab on this thread
-    /// and `std::sync::Mutex` is not reentrant. The fan-out runs only on an actual change.
     #[cfg(test)]
     pub(crate) fn write_session_title_pin(
         &mut self,
@@ -421,14 +317,7 @@ impl App {
         self.write_session_meta_field(session, MetaField::Title, text)
     }
 
-    /// [`Self::write_session_title_pin`] for any presentation field. A write
-    /// that moved one renames the session where its label is read: the
-    /// workers' Team chips and strip marks of a manager
-    /// ([`Self::rebuild_teams`]) and a needs pill naming it
-    /// ([`Self::reproject_pill_of`]); a ROLE write additionally refreshes its
-    /// presence and the operator status item — the same fan-out the
-    /// `Wake::MetaChanged` arm runs for a wire `meta set`, called directly for
-    /// the reason the title path gives above.
+    /// [`Self::write_session_title_pin`] for any presentation field.
     pub(crate) fn write_session_meta_field(
         &mut self,
         session: u64,
@@ -444,11 +333,8 @@ impl App {
         } else {
             MetaEdit::Set(text)
         };
-        // The window's own editor: the person's.
         let changed = write_session_meta(&ctx, field, edit, aterm_slog::Actor::Human)?;
         if changed {
-            // The record landed under the meta guard, so the chrome cache's `high_id` gate
-            // moved and the tooltip and context menu recompose with the label.
             self.refresh_meta_dependent_chrome(session);
             self.rebuild_teams();
             if field != MetaField::Title {
@@ -484,7 +370,7 @@ mod tests {
     fn a_commit_pins_the_title_and_closes_the_editor() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        app.tab_strip_rows = 1; // the in-grid strip is the editor's surface
+        app.tab_strip_rows = 1;
         assert!(app.begin_active_session_rename(wid));
         assert_eq!(app.rename_edit_session(wid), Some(0));
 
@@ -509,7 +395,6 @@ mod tests {
         assert!(app.begin_session_rename(wid, first));
         app.rename_field_edit(wid, crate::app_search::SearchEdit::Insert("x".to_string()));
 
-        // Re-opening over the same chip is a no-op, so the replace needs a second tab.
         app.push_stub_tab(wid, crate::stub_session(1));
         let second = app.windows[&wid].tab_set.tabs()[1].id;
         assert!(app.begin_session_rename(wid, second));
@@ -530,7 +415,7 @@ mod tests {
     fn a_cancel_writes_nothing_and_leaves_an_existing_pin_alone() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        app.tab_strip_rows = 1; // the in-grid strip is the editor's surface
+        app.tab_strip_rows = 1;
         assert!(app.begin_active_session_rename(wid));
         app.commit_session_rename(wid, 0, "first");
         assert_eq!(pin(&app, 0).as_deref(), Some("first"));
@@ -552,8 +437,7 @@ mod tests {
     fn an_empty_commit_clears_the_pin_and_the_ladder_falls_back() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        app.tab_strip_rows = 1; // the in-grid strip is the editor's surface
-        // The real OSC 2 path, so the fallback rung is live.
+        app.tab_strip_rows = 1;
         crate::term_lock(&app.pool.get(0).expect("session 0").term)
             .process(b"\x1b]2;vim src/main.rs\x07");
         assert!(app.begin_active_session_rename(wid));
@@ -580,11 +464,10 @@ mod tests {
     fn a_close_during_the_edit_drops_the_commit_instead_of_retargeting() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        app.tab_strip_rows = 1; // the in-grid strip is the editor's surface
+        app.tab_strip_rows = 1;
         let tab = app.windows[&wid].tab_set.active_id().expect("a tab");
         assert!(app.begin_session_rename(wid, tab));
 
-        // The strip sees its edited tab gone and cancels; the queued commit lands after.
         app.cancel_session_rename(wid, 0);
         app.commit_session_rename(wid, 0, "ghost");
         assert_eq!(
@@ -594,7 +477,6 @@ mod tests {
         );
         assert!(meta_events(&app, 0).is_empty());
 
-        // And the stale tab id never resolves to a different tab.
         app.windows.get_mut(&wid).unwrap().rename_edit = None;
         let gone = crate::tab_model::TabId::from_stored(u64::MAX);
         assert!(!app.begin_session_rename(wid, gone));
@@ -609,7 +491,7 @@ mod tests {
         use crate::menu::MenuAction;
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        app.tab_strip_rows = 1; // the in-grid strip is the editor's surface
+        app.tab_strip_rows = 1;
         assert!(app.begin_active_session_rename(wid));
 
         assert!(
@@ -669,10 +551,8 @@ mod tests {
         );
         assert_eq!(app.rename_edit_session(wid), None, "and nothing is stored");
 
-        // The divert path is clear: the next command runs.
         assert!(!app.divert_menu_action_around_rename(MenuAction::CloseTab));
 
-        // With the strip on, the same call succeeds: the refusal is about presentation.
         app.tab_strip_rows = 1;
         assert!(app.can_rename_session(wid), "a visible strip is a surface");
         assert!(app.begin_active_session_rename(wid));
@@ -699,7 +579,6 @@ mod tests {
             app.inline_rename_edit(wid).map(|edit| edit.text.as_str()),
             Some("build agent")
         );
-        // A caret motion and a delete, through the shared field reducer.
         let key = |named: NamedKey| InputEvent::Key {
             key: Key::Named(named),
             mods: Modifiers::empty(),
@@ -799,7 +678,6 @@ mod tests {
         let typed = fingerprint(&mut app);
         assert_ne!(opened, typed, "a typed character repaints the strip");
 
-        // A caret move is painted state too.
         app.rename_field_edit(wid, SearchEdit::MoveStart);
         assert_ne!(typed, fingerprint(&mut app), "the caret is painted state");
     }

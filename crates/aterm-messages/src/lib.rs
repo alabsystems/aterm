@@ -2,52 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm-messages`: one band, one model, one log.
-//!
-//! The platform-neutral engine behind aterm's message system
-//! (docs/DESIGN-unified-messages-2026-09-21.md): the message model, the glass policy
-//! (which rows are on the band, in what order, for how long), the single-row width law,
-//! the tagged log ring and its line codec, the wire grammars and the seamless-handoff
-//! carry. It emits layouts in cells ([`glass::Presentation`]); the host paints them,
-//! appends the log lines it drains, and performs the plain-data [`model::Intent`]s a
-//! press returns.
-//!
-//! # Contract
-//!
-//! * **Clockless.** Every method that reads time takes `now: Instant` ([`Instant`] is
-//!   `aterm_time::Instant`), so the engine is deterministic and runs on wasm.
-//! * **No platform.** No `std::fs`, threads, sockets or theme: [`paint`] lays out the
-//!   band's structure (character, ink slot and ground per cell) and [`ink`] resolves it
-//!   over a plain-RGB palette derived from a theme's background, foreground and cursor.
-//! * **Bounded.** [`MAX_LIVE`] unretired messages, [`LOG_CAP`] ring records,
-//!   [`PENDING_PERSIST_CAP`] undrained persist lines; every string is sanitized and
-//!   capped at ingress, so a hostile reporter cannot grow the process or forge a row.
-//! * **Constants, not knobs.** Every hold, cap and floor is a `const`.
-//!
-//! # Indicators and motion
-//!
-//! A row's indicator is its meter's state: a fill draws the bar, [`Meter::busy`] the
-//! comet, neither draws nothing. The meter spans the whole row, laid under the words and
-//! mapped by the host onto the window's pixels, gutters included, so it costs the words
-//! no room. The host reads one motion frame at a time ([`MessageCenter::motion`]) and
-//! wakes at [`MessageCenter::motion_deadline`] on the [`ANIM_FRAME`] grid. A frame
-//! carries fractions of the row ([`animate::Surface`]), never a pixel, and never enters
-//! the center: it bumps no revision, re-grids nothing and never arms
-//! [`MessageCenter::deadline`]. A host runs all of it through one driver, [`drive`],
-//! injecting the clock, the afford, the freeze and each view's look.
-//!
-//! # The rest of the chrome
-//!
-//! The window's needs border, its titlebar pill and the tab marks are [`presence`]: they
-//! draw the host's published need verdict, what only a host knows comes in through
-//! [`presence::Host`], and sequencing is [`presence::drive`] over the host's
-//! [`presence::drive::Desk`]. Presence owns no chrome row. The strip and the band share
-//! one window's grid, and [`chrome`] is the floor across them: after any rise, the band's
-//! quiet fall does not re-grid the window back inside [`chrome::CHROME_REGROW_SETTLE`].
-//! The host hands the floor in ([`drive::Commit::floor`]).
-//!
-//! [`page`] builds the Settings ▸ Messages page's model over the center
-//! ([`page::MessagesState::of`]); host facts come in through [`page::Host`], and the host
-//! lays the page out and paints it.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -111,18 +65,13 @@ pub use wire::{
     WireGate, WireIndicator,
 };
 
-// Constants.
-
 /// Visible band rows, including the overflow row.
 pub const MAX_ROWS: u16 = 3;
-/// Unretired messages (glass + queue). Past it a post evicts.
+/// Unretired messages (glass + queue).
 pub(crate) const MAX_LIVE: usize = 64;
-/// Records in the in-memory log ring: what Settings ▸ Messages shows and what
-/// a launch's replay of the disk tail keeps. Once `WIRE_LOG_SHARE` of a full
-/// ring's records are wire-owned, the oldest retired wire record goes first.
-/// Disk retention is the host's (`aterm-gui`'s `messages_store`), in bytes.
+/// Records in the in-memory log ring.
 pub const LOG_CAP: usize = 512;
-/// Undrained persist lines. Past it the oldest is dropped and counted.
+/// Undrained persist lines.
 pub(crate) const PENDING_PERSIST_CAP: usize = 1024;
 /// Title cap in chars, after sanitize; one line.
 pub const TITLE_CAP: usize = 120;
@@ -146,14 +95,11 @@ pub const TITLE_COL: usize = 3;
 pub(crate) const BEFORE_CAPSULES: usize = 2;
 /// Cells between capsules.
 pub(crate) const CAPSULE_GAP: usize = 1;
-/// Below this many cells the excerpt is dropped, never stubbed, unless its
-/// whole lead clause fits (`behind for 7 h`, `text::lead_clause`).
+/// Below this many cells the excerpt is dropped, never stubbed, unless its whole lead clause fits.
 pub(crate) const DETAIL_FLOOR: usize = 20;
-/// The cells a title elides to and no further, in whole words (its first
-/// word where none fits them); capsules never drop.
+/// The cells a title elides to and no further, in whole words; capsules never drop.
 pub(crate) const TITLE_MIN: usize = 12;
-/// The joint between a detail's pieces, the one every words builder writes;
-/// [`text::shape_detail`] sheds pieces at it.
+/// The joint between a detail's pieces, the one every words builder writes.
 pub const PIECE_SEP: &str = " \u{00b7} ";
 
 /// A Success row's default hold.
@@ -169,7 +115,6 @@ pub const HOLD_STAGED_MANUAL: Duration = Duration::from_mins(1);
 /// A decision row's hold.
 pub const HOLD_ASK: Duration = Duration::from_mins(10);
 /// A route row after Open Settings: a terse restate of the question's row.
-/// The route stays behind Details and on Settings ▸ Messages.
 pub const HOLD_ROUTE: Duration = Duration::from_secs(15);
 /// A failed gesture's hold.
 pub const HOLD_GESTURE: Duration = Duration::from_secs(12);
@@ -186,27 +131,15 @@ pub const SHRINK_QUIET: Duration = Duration::from_millis(1500);
 /// A queued row folds unseen after `max(hold, this)`.
 pub(crate) const OVERFLOW_PATIENCE_MIN: Duration = Duration::from_mins(1);
 
-// ---- Attention and motion --------------------------------------------------
-
-/// A row that would appear and fold inside this costs two re-grids for
-/// nothing: a progress row posted with `reveal_after(PROGRESS_GRACE)` reaches
-/// the glass only if its work lasts this long.
+/// A row that would appear and fold inside this costs two re-grids for nothing.
 pub const PROGRESS_GRACE: Duration = Duration::from_secs(2);
 /// The one frame grid every motion phase is read on — the host's 30 fps cap.
 pub const ANIM_FRAME: Duration = Duration::from_millis(33);
-/// One comet's crossing of the whole row: its head enters at the window's left
-/// edge and the crossing ends as its tail clears the right edge
-/// ([`COMET_PERMILLE`] more than the row). The next comet enters as this one
-/// leaves, so the row is never empty for longer than a frame.
+/// One comet's crossing of the whole row.
 pub const COMET_PERIOD: Duration = Duration::from_secs(3);
-/// The comet's length in permille of the row, soft leading edge included: a
-/// tail rising as the square of its length toward the hot head, then the
-/// leading edge falling to the track over [`COMET_LEAD_PERMILLE`]. A quarter
-/// keeps the head's steepest stretch under two levels a pixel at 80 columns.
+/// The comet's length in permille of the row, soft leading edge included.
 pub const COMET_PERMILLE: u32 = 250;
-/// The comet's soft leading edge in permille of the row: the head's tone falls
-/// to the track over this, ahead of the head. Drawn to the pixel it is a
-/// straight ramp; two levels a pixel at 80 columns needs about this much.
+/// The comet's soft leading edge in permille of the row.
 pub(crate) const COMET_LEAD_PERMILLE: u32 = 80;
 /// The comet's hot head, lifted toward the glint (0–255).
 pub(crate) const COMET_HEAD_LIFT: u8 = 150;
@@ -216,62 +149,45 @@ pub const GLINT_PERIOD: Duration = Duration::from_secs(4);
 pub const GLINT_TRAVEL: Duration = Duration::from_millis(1600);
 /// The first glint, after the motion epoch.
 pub const GLINT_DELAY: Duration = Duration::from_millis(1200);
-/// The glint's radius in permille of the row (a raised-cosine lift about six
-/// percent of the row wide), at least [`GLINT_MIN_HALF_CELLS`] half cells so a
-/// narrow window's glint is never a one-column smudge.
+/// The glint's radius in permille of the row.
 pub(crate) const GLINT_RADIUS_PERMILLE: u32 = 30;
-/// The glint's least radius in half cells of the row (a lift at least one and
-/// a half cells wide).
+/// The glint's least radius in half cells of the row (a lift at least one and a half cells wide).
 pub(crate) const GLINT_MIN_HALF_CELLS: u32 = 3;
-/// The glint's peak lift (0–255): the host's glint ink is itself one
-/// perceptual step, so the peak reaches it whole.
+/// The glint's peak lift (0–255).
 pub(crate) const GLINT_PEAK: u8 = 255;
 /// A data jump in a determinate fill glides over at least this long…
 pub const FILL_GLIDE: Duration = Duration::from_millis(180);
-/// …plus this much per percentage point it travels, so a big jump does not
-/// hop many cells a frame…
+/// …plus this much per percentage point it travels, so a big jump does not hop many cells a frame…
 pub const FILL_GLIDE_PER_POINT: Duration = Duration::from_millis(7);
 /// …and never longer than this.
 pub const FILL_GLIDE_MAX: Duration = Duration::from_millis(600);
-/// The display's frame period a host that does not say otherwise is assumed
-/// to have (60 Hz): glides and echoes are read on it while they are in
-/// flight ([`MessageCenter::set_refresh`]).
+/// The display's frame period a host that does not say otherwise is assumed to have (60 Hz).
 pub const REFRESH_DEFAULT: Duration = Duration::from_micros(16_667);
-/// A Complete echo's one conclusive sweep: a glint about four cells wide (at
-/// 80 columns) crossing the whole row once, at twice the glint's pace.
+/// A Complete echo's one conclusive sweep.
 pub const ECHO_SWEEP: Duration = Duration::from_millis(800);
 /// The sweep's radius in permille of the row.
 pub const ECHO_SWEEP_PERMILLE: u32 = 25;
 /// An echo's fade.
 pub(crate) const ECHO_FADE: Duration = Duration::from_millis(250);
-/// A Fault echo's cross-fade from the fill to the warn wash: premultiplied,
-/// never through another hue.
+/// A Fault echo's cross-fade from the fill to the warn wash.
 pub const ECHO_FAULT_CROSS: Duration = Duration::from_millis(120);
 /// A Fault echo's warn wash holds until this far in, then fades.
 pub const ECHO_FAULT_FLASH: Duration = Duration::from_millis(350);
-/// A busy row's Fault: its comet, frozen where it failed, drains to the track
-/// over this.
+/// A busy row's Fault: its comet, frozen where it failed, drains to the track over this.
 pub const ECHO_DRAIN: Duration = Duration::from_millis(80);
 /// Heavy-load words show after the declared load lasted this long.
 pub const LOAD_AFTER: Duration = Duration::from_secs(5);
 /// A byte stream that has not advanced for this long reads "stalled".
 pub const STALL_AFTER: Duration = Duration::from_secs(10);
-/// A count (steps or items) reads "stalled" after this many of its own mean
-/// gaps without an advance, never before [`STALL_AFTER`]: one item may take
-/// long, so a count's patience is its own pace.
+/// A count (steps or items) reads "stalled" after this many of its own mean gaps.
 pub(crate) const COUNT_STALL_GAPS: u32 = 4;
-/// A row ending its reveal grace whose work projects to end within this is
-/// held back: a row shown for under a second and then its echo is the flash
-/// the grace exists to prevent.
+/// A row ending its reveal grace whose work projects to end within this is held back.
 pub const REVEAL_MIN_LEFT: Duration = Duration::from_millis(1500);
-/// …for at most this long past its grace: a projection that keeps saying
-/// "almost done" and is wrong still reaches the glass.
+/// …for at most this long past its grace.
 pub const REVEAL_DEFER_MAX: Duration = Duration::from_secs(2);
 /// How often a held-back reveal is looked at again.
 pub(crate) const REVEAL_RECHECK: Duration = Duration::from_millis(250);
-/// A latched ETA whose completion instant has passed with nothing new stands
-/// at `<5 s left` for at most this long (or a fifth of the latched estimate,
-/// if longer), then goes blank.
+/// How long an overdue latched ETA stands at `<5 s left`.
 pub(crate) const ETA_OVERDUE_MIN: Duration = Duration::from_secs(5);
 /// A busy row shows its elapsed time from here on.
 pub const ELAPSED_AFTER: Duration = Duration::from_secs(10);
@@ -289,65 +205,42 @@ pub(crate) const STABLE_SPAN: Duration = Duration::from_secs(4);
 pub(crate) const STABLE_MIN: Duration = Duration::from_secs(2);
 /// The projection ring's cap.
 pub(crate) const PROJECTIONS_CAP: usize = 16;
-/// The percent slot: two cells of gap, then the percent right-aligned in four
-/// (`"  100%"`).
+/// The percent slot: two cells of gap, then the percent right-aligned in four (`"  100%"`).
 pub(crate) const PCT_W: usize = 6;
 /// The elapsed slot, labelled: `"for 59 min"`, never a bare `0:41` clock.
 pub(crate) const ELAPSED_W: usize = 10;
-/// The elapsed slot's short form where the long one does not fit: `"for 59m"`,
-/// `"for 999h"`, changing at the same instants.
+/// The elapsed slot's short form where the long one does not fit.
 pub(crate) const ELAPSED_SHORT_W: usize = 8;
-/// The ETA slot: `"59 min left"` or `"stalled"`; `left` already says it is an
-/// estimate, so no `~`.
+/// The ETA slot: `"59 min left"` or `"stalled"`; `left` already says it is an estimate, so no `~`.
 pub(crate) const ETA_W: usize = 11;
-/// The ETA slot's short form where the long one does not fit: `"59m left"`,
-/// `"<5s left"` or `"stalled"`, changing at the same instants.
+/// The ETA slot's short form where the long one does not fit.
 pub(crate) const ETA_SHORT_W: usize = 8;
 /// The ETA slot's word for a byte stream that stopped (painted in warn).
 pub const STALLED_WORD: &str = "stalled";
-/// A Fault echo's word in the row's time slot (painted in warn, like a
-/// stall): the failure is said, not only tinted.
+/// A Fault echo's word in the row's time slot: the failure is said, not only tinted.
 pub const FAILED_WORD: &str = "failed";
-/// A Complete echo's word in the row's time slot when its title has no past
-/// tense ([`Message::finished_words`] is `None`): the ✓ alone beside
-/// `Uploading the backup` would read as still going.
+/// A Complete echo's word in the row's time slot when its title has no past tense.
 pub const DONE_WORD: &str = "done";
-// ---- The wire's `notice` verb ----------------------------------------------
 
-/// A wire progress row's staleness cap: an abandoned row fades (`Stale`, a
-/// Vanish echo) this long after its last line; a live script re-sends its line
-/// (an identical line costs nothing painted and re-arms the cap).
+/// A wire progress row's staleness cap.
 pub(crate) const STALE_WIRE: Duration = Duration::from_mins(2);
-/// The most wire rows live at once: the glass's [`MAX_ROWS`], overflow row
-/// included, so everything one script has in flight is on the glass. A
-/// restate or a same-key supersede does not count against it.
+/// The most wire rows live at once.
 pub(crate) const WIRE_LIVE_CAP: usize = MAX_ROWS as usize;
-/// The most wire entries open in the digest at once (`notice later`): a third of
-/// [`need::DIGEST_CAP`], so the tools that file there leave aterm's own facts
-/// most of the list. A repeat, a restatement or a dismissed key's quiet does not
-/// count against it, and a wire entry is never filed into a full digest, so none
-/// evicts one of aterm's.
+/// The most wire entries open in the digest at once (`notice later`).
 pub(crate) const WIRE_LATER_CAP: usize = 4;
-/// New wire messages — rows and records, each a log line — per trailing
-/// [`WIRE_MINT_WINDOW`].
+/// New wire messages — rows and records, each a log line — per trailing [`WIRE_MINT_WINDOW`].
 pub(crate) const WIRE_MINTS_PER_WINDOW: usize = 60;
-/// The title and detail bytes those mints may carry per window: each is
-/// written to `messages.log` twice (Posted and Retired), so a flood of
-/// full-detail records cannot rotate aterm's own lines out of the file.
+/// The title and detail bytes those mints may carry per window.
 pub(crate) const WIRE_BYTES_PER_WINDOW: usize = 16 * 1024;
-/// `notice act` presses per [`WIRE_MINT_WINDOW`]: each repaints, may open a
-/// window and logs a line.
+/// `notice act` presses per [`WIRE_MINT_WINDOW`]: each repaints, may open a window and logs a line.
 pub(crate) const WIRE_PRESSES_PER_WINDOW: usize = 10;
-/// The most wire-owned records the log ring keeps once full: past it a new
-/// record evicts the oldest retired wire record, so a script can never push
-/// aterm's own history out of the ring.
+/// The most wire-owned records the log ring keeps once full.
 pub(crate) const WIRE_LOG_SHARE: usize = 128;
 /// That window.
 pub(crate) const WIRE_MINT_WINDOW: Duration = Duration::from_mins(1);
 /// The least gap between two paints a wire line causes: one motion frame.
 pub const WIRE_PAINT_GAP: Duration = ANIM_FRAME;
-/// The wire's key namespace: `notice` can only name a key under it, so it can
-/// never restate, end, supersede or record over a host row.
+/// The wire's key namespace.
 pub const WIRE_KEY_PREFIX: &str = "wire.";
 /// A wire key's longest spelling after [`WIRE_KEY_PREFIX`].
 pub(crate) const WIRE_KEY_MAX: usize = 40;
@@ -370,8 +263,6 @@ const _: () = assert!(
         && ELAPSED_SHORT_W < ELAPSED_W
 );
 
-// An error earns a longer read than a warning; an unseen row's patience is
-// at least an Info row's hold; the width law's floors sit under its caps.
 const _: () = assert!(
     HOLD_ERROR.as_millis() > HOLD_WARN.as_millis()
         && OVERFLOW_PATIENCE_MIN.as_millis() >= HOLD_INFO.as_millis()

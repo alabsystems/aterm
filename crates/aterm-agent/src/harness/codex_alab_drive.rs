@@ -29,6 +29,7 @@ pub(super) trait AlabKernel: Kernel {
     /// Every file `pid` holds open through a descriptor, `None` when unreadable.
     fn open_files(&self, pid: u32) -> Option<Vec<PathBuf>>;
     /// The conversation writer's kernel advisory lock, independently of other processes'
+    /// descriptor tables.
     fn writer_owner(&self, file: &Path) -> aterm_uds::ownerlock::Owner;
     /// Whether `shell`'s group holds its terminal again (`pgid == tpgid`).
     fn shell_has_terminal(&self, shell: u32) -> bool;
@@ -37,10 +38,19 @@ pub(super) trait AlabKernel: Kernel {
     /// `pid`'s working directory.
     fn cwd(&self, pid: u32) -> Option<String>;
     /// Whether `pid` is still the foreground group of `tab` by the host's own
+    /// roster ([`process_in_tab`]): asked right before every typed act.
     fn in_tab(&self, c: &mut Client, pid: u32, tab: &str) -> bool;
     /// `pid`'s kernel start as the record reader spells it
+    /// ([`super::super::restart_stamp::kernel_start`]), `None` where it
+    /// cannot be read (off Apple a `ps` that failed: unknown, never an end):
+    /// the identity [`Self::first_frame`] reads under.
     fn birth(&self, pid: u32) -> Option<String>;
     /// THE RELAUNCHED CODEX-ALAB UP, as aterm reads it ([`hold_to_first_idle`]):
+    /// `tab`'s `status` names `pid` as its proven self-claim
+    /// ([`super::super::self_claimed::proven_pid`]), made only after its launch
+    /// probe read the tab, and that process, born `birth`, names its TUI's frame
+    /// in its own record read live ([`super::super::self_claimed::read_first_frame`]):
+    /// at rest (its first idle) or a turn under way.
     fn first_frame(
         &self,
         c: &mut Client,
@@ -133,6 +143,7 @@ pub(super) fn canonical(p: &Path) -> PathBuf {
 }
 
 /// The Codex records' per-tab prefix ([`Agent::record_prefix`]), `codex-`:
+/// placed at compile time, which fails where Codex keys none.
 const PREFIX: &str = match Agent::Codex.record_prefix() {
     Some(prefix) => prefix,
     None => panic!("a Codex record is keyed by its tab"),
@@ -356,6 +367,7 @@ pub(super) const EXIT_WAIT: Duration = Duration::from_secs(30);
 pub(super) const ADOPT_WAIT: Duration = Duration::from_secs(30);
 
 /// The relaunch of a crashed codex-alab: once the TUI is gone and the shell has its prompt
+/// back, type its record's line ([`relaunch_held`]) under the harness's hand on the tab.
 fn relaunch(opts: &Opts, r: Report, st: &mut St, c: &mut Client, k: &dyn AlabKernel) -> Report {
     let mut hand = Hand::take_or_none(c, &st.tab);
     let r = relaunch_held(opts, r, st, c, &mut hand, k);
@@ -366,6 +378,8 @@ fn relaunch(opts: &Opts, r: Report, st: &mut St, c: &mut Client, k: &dyn AlabKer
 }
 
 /// [`relaunch`] with the harness's `hand` on the tab ([`Hand`]) through every wait, the typed
+/// line, and until the new TUI leads the tab and reaches its first idle ([`await_held`],
+/// [`hold_to_first_idle`]).
 fn relaunch_held(
     opts: &Opts,
     r: Report,
@@ -469,6 +483,7 @@ fn await_new(opts: &Opts, r: Report, st: &mut St, c: &mut Client, k: &dyn AlabKe
 }
 
 /// [`await_new`] with the harness's `hand` on the tab, kept through the wait; its caller gives
+/// it back.
 fn await_held(
     opts: &Opts,
     mut r: Report,
@@ -527,6 +542,7 @@ fn await_held(
 /// How [`hold_to_first_idle`] ended, as the ledger's `done:resumed` row says it.
 const HELD_TO_FIRST_IDLE: &str = "the hand held to its first idle";
 /// The hold ended at a turn already under way
+/// ([`super::super::self_claimed::FirstFrame::Turn`]).
 const HELD_TO_A_TURN: &str = "the hand held until it was up, a turn already under way";
 /// The relaunched process ended, or its pid is another process's now.
 const HELD_TO_ITS_END: &str = "the hand given back: it ended before its first idle";
@@ -536,6 +552,14 @@ const HELD_TO_THE_BOUND: &str = "the hand given back at its bound, before its fi
 const HELD_TO_A_LAPSE: &str = "the hand lapsed to another driver before its first idle";
 
 /// THE HAND IS HELD TO THE RELAUNCHED PROCESS'S FIRST IDLE (the contract §5,
+/// carry-on): aterm's relaunch lease (`hand=lease:aterm-harness@<pid>`),
+/// taken before the line is typed, stands until the new codex-alab is up as
+/// aterm reads it ([`AlabKernel::first_frame`]: its proven self-claim, which
+/// codex-alab makes only after its launch probe read the tab, and its own
+/// record naming its TUI's frame — at rest, its first idle, or a turn already
+/// under way, whose own acts wait for this lease), the process gone, or
+/// [`super::super::Timings::alab_first_idle`] (the launch probe's window),
+/// whichever comes first; its caller then gives it back.
 fn hold_to_first_idle(
     opts: &Opts,
     c: &mut Client,

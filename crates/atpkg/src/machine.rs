@@ -1,33 +1,11 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Machine settings `aterm pkg machine apply` applies per the doctor's findings: the policy
-//! half (what to do given what `defaults` answered), kept pure and behind a port so no test
-//! touches the real `com.apple.universalcontrol` domain. A pass applies them only after an
-//! edit to the `[machine]` table ([`changed_since_applied`]); a launch, once a day
-//! ([`launch_apply_due`]).
-//!
-//! Universal Control is macOS's cursor/keyboard roaming between Macs and iPads on the same
-//! Apple account. A fresh machine sits at the OS default with neither key set; the keys,
-//! their polarity and the switch's cost are measured in
-//! `docs/measured/macos-doctor-universal-control-2026-09-06.md`. The switch is per-host and
-//! per-user (`defaults -currentHost`), no sudo, and one pasted line reverts it:
-//! [`UNIVERSAL_CONTROL_REVERT`].
-//!
-//! Rosetta 2 is Apple's x86_64 translator. On an Apple-silicon Mac the apply installs it
-//! when it is missing ([`apply_rosetta`]), so every ALab Mac has it the way it has the
-//! toolset: `softwareupdate --install-rosetta --agree-to-license`, run as the user, which
-//! needs no administrator (docs/DESIGN-machines-2026-10-16.md; measured
-//! 2026-10-18 and 2026-10-21). `[machine] rosetta = false` turns it off; elsewhere it is
-//! inert ([`ROSETTA_APPLIES`]).
+//! Machine settings `aterm pkg machine apply` applies per the doctor's findings: the policy half (what to do given what `defaults` answered), kept pure and behind a port so no test touches the real `com.apple.universalcontrol` domain.
 
 use crate::config::UniversalControlPolicy;
 
-/// The one-line revert every surface that mentions the change prints (the window's
-/// `appstatus` ledger entry, doctor, this pass's log). The pass writes both per-host keys
-/// (`platform::universal_control_disable`), so the revert deletes both: `Disable` is the
-/// feature, `DisableMagicEdges` the screen-edge hand-off. Joined by `;`, not `&&`:
-/// `defaults delete` exits 1 on an absent key, and the second delete must still run.
+/// The one-line revert every surface that mentions the change prints (the window's `appstatus` ledger entry, doctor, this pass's log).
 pub const UNIVERSAL_CONTROL_REVERT: &str = "defaults -currentHost delete \
     com.apple.universalcontrol Disable; defaults -currentHost delete \
     com.apple.universalcontrol DisableMagicEdges";
@@ -35,17 +13,7 @@ pub const UNIVERSAL_CONTROL_REVERT: &str = "defaults -currentHost delete \
 /// The `machine-settings:` entry for a Universal Control change (contract string).
 pub const UNIVERSAL_CONTROL_ENTRY: &str = "universal-control disabled";
 
-/// What one `defaults -currentHost read` answered about one key: the converge engine's
-/// tri-state read (docs/DESIGN-init-system-2026-10-20.md §3.1), which the machines
-/// families keep too.
-///
-/// ABSENT AND UNUSABLE ARE NOT THE SAME ANSWER (2026-09-15). Both used to arrive as
-/// `None`, so a `defaults` that could not be run, was killed at its deadline, or
-/// answered something this module does not understand was reported to the user as the
-/// OS DEFAULT: "the cursor roams to other Macs and iPads", with Apply offered as if the
-/// machine had been measured. It had not been. A key that is absent is a measurement —
-/// `defaults` exits 1 with empty output to say "does not exist", which IS the OS
-/// default — and anything else is the absence of one: [`Read::Unusable`], with why.
+/// What one `defaults -currentHost read` answered about one key: the converge engine's tri-state read (docs/DESIGN-init-system-2026-10-20.md §3.1), which the machines families keep too.
 pub use aterm_converge::Read;
 
 /// Universal Control's two per-host switches, as read.
@@ -55,9 +23,7 @@ pub struct UniversalControlState {
     pub disable: Option<bool>,
     /// `DisableMagicEdges`: `Some(true)` = no screen-edge hand-off.
     pub magic_edges: Option<bool>,
-    /// Both keys were actually MEASURED — a value, or a documented absence. `false`
-    /// when either read was [`Read::Unusable`], and then neither `Option` above may
-    /// be read as "the OS default".
+    /// Both keys were actually MEASURED — a value, or a documented absence.
     pub measured: bool,
 }
 
@@ -85,31 +51,25 @@ impl UniversalControlState {
 const DAILY_OFF: &str = "aterm turns it off once a day, at the first window or terminal session";
 
 impl UniversalControlState {
-    /// Fully disabled: both keys true. One key alone is a half state the pass completes
-    /// rather than reports as done.
+    /// Fully disabled: both keys true.
     #[must_use]
     pub fn disabled(&self) -> bool {
         self.disable == Some(true) && self.magic_edges == Some(true)
     }
 
-    /// The doctor's words for this state (macOS only; the caller decides whether to
-    /// print). `ok` when disabled — with the revert, so the line is never a dead end —
-    /// `warn` when the pass is about to change it, `ok` when the policy says leave.
+    /// The doctor's words for this state (macOS only; the caller decides whether to print).
     #[must_use]
     pub fn doctor_line(&self, policy: UniversalControlPolicy) -> String {
         crate::doctor::spelled(&self.doctor_row(policy))
     }
 
-    /// [`Self::doctor_line`] as the typed row `aterm pkg doctor`'s
-    /// `base.machine.universal-control` item reports.
+    /// [`Self::doctor_line`] as the typed row `aterm pkg doctor`'s `base.machine.universal-control` item reports.
     #[must_use]
     pub fn doctor_row(&self, policy: UniversalControlPolicy) -> crate::doctor::Row {
         self.row(policy, true)
     }
 
-    /// [`Self::doctor_line`] without its `now:` action: the state alone, for a read whose
-    /// own verdict names the action (bare `aterm pkg machine`), so one screen never names
-    /// `aterm pkg machine apply` twice.
+    /// [`Self::doctor_line`] without its `now:` action: the state alone, for a read whose own verdict names the action (bare `aterm pkg machine`), so one screen never names `aterm pkg machine apply` twice.
     #[must_use]
     pub fn state_line(&self, policy: UniversalControlPolicy) -> String {
         crate::doctor::spelled(&self.row(policy, false))
@@ -123,8 +83,6 @@ impl UniversalControlState {
             ""
         };
         if !self.measured {
-            // Never "the OS default": nothing was measured, and the remedy is the same
-            // either way, so say what is true and what happens next.
             return match policy {
                 UniversalControlPolicy::Off => Row {
                     level: Level::Warn,
@@ -142,9 +100,6 @@ impl UniversalControlState {
             };
         }
         if self.disabled() {
-            // The revert alone does not hold: under the default policy the next daily apply
-            // disables it again, so the line names the setting that makes it stick before the
-            // revert command (byte-identical: [`UNIVERSAL_CONTROL_REVERT`] is a contract).
             let keep = match policy {
                 UniversalControlPolicy::Off => "set [machine] universal_control = \"leave\" and ",
                 UniversalControlPolicy::Leave => "",
@@ -157,7 +112,6 @@ impl UniversalControlState {
                 ),
             };
         }
-        // A half-disabled host is not at the OS default: one key set is a state someone made.
         let posture = if self.partial() {
             format!("half disabled{}", self.partial_note())
         } else {
@@ -182,8 +136,7 @@ impl UniversalControlState {
         }
     }
 
-    /// Exactly one of the two keys is set: a state no default has and no complete pass
-    /// leaves.
+    /// Exactly one of the two keys is set: a state no default has and no complete pass leaves.
     #[must_use]
     pub fn partial(&self) -> bool {
         !self.disabled() && (self.disable == Some(true) || self.magic_edges == Some(true))
@@ -199,10 +152,7 @@ impl UniversalControlState {
     }
 }
 
-/// `defaults read`'s rendering of a boolean, as bytes: `1`/`0`, `true`/`false`,
-/// `YES`/`NO` (any case), surrounded by whitespace. Anything else — a dict, a string —
-/// is `None`: not a switch this module understands, so never "set". Byte-based: it reads
-/// a subprocess's raw stdout.
+/// `defaults read`'s rendering of a boolean, as bytes: `1`/`0`, `true`/`false`, `YES`/`NO` (any case), surrounded by whitespace.
 #[must_use]
 #[cfg(any(target_os = "macos", test))]
 pub fn parse_defaults_bool(stdout: &[u8]) -> Option<bool> {
@@ -222,8 +172,7 @@ pub fn parse_defaults_bool(stdout: &[u8]) -> Option<bool> {
     }
 }
 
-/// The port to the real `defaults` domain — one read, one write — so the policy is
-/// testable against a fake and the tests never touch the machine.
+/// The port to the real `defaults` domain — one read, one write — so the policy is testable against a fake and the tests never touch the machine.
 pub trait UniversalControlPort {
     /// `[Disable, DisableMagicEdges]` as [`crate::platform::universal_control_state`].
     fn state(&self) -> [Read<bool>; 2];
@@ -263,9 +212,7 @@ pub enum UniversalControlOutcome {
     WriteFailed,
 }
 
-/// Apply `policy` through `port`: `Disabled` only when this pass changed something, which
-/// is what the `machine-settings:` marker reports. Idempotent: a disabled host reads
-/// `AlreadyDisabled` on every later pass and the marker stays silent.
+/// Apply `policy` through `port`: `Disabled` only when this pass changed something, which is what the `machine-settings:` marker reports.
 #[must_use]
 pub fn apply_universal_control(
     policy: UniversalControlPolicy,
@@ -280,7 +227,6 @@ pub fn apply_universal_control(
     if !port.disable() {
         return UniversalControlOutcome::WriteFailed;
     }
-    // Read back: a write that did not land is not a change to announce.
     if universal_control_state(port).disabled() {
         UniversalControlOutcome::Disabled
     } else {
@@ -288,27 +234,16 @@ pub fn apply_universal_control(
     }
 }
 
-// Rosetta 2: one probe (a stat), one install (`softwareupdate`'s Rosetta verb, as the user).
-
-/// The file whose presence says Rosetta 2 is installed: its runtime, an arm64 Mach-O that
-/// the install lays in `/Library/Apple/usr/libexec/oah/` (with the `runtime`,
-/// `debugserver` and `translate_tool` links) beside `RosettaLinux`, which a Mac without
-/// Rosetta 2 already holds. Measured on macOS 27.0.1, 2026-10-17 and 2026-10-21: before the
-/// install the directory held `RosettaLinux` alone. Read by a `stat`, so the probe runs no
-/// x86_64 code and reaches no WindowServer.
+/// The file whose presence says Rosetta 2 is installed: its runtime, an arm64 Mach-O that the install lays in `/Library/Apple/usr/libexec/oah/` (with the `runtime`, `debugserver` and `translate_tool` links) beside `RosettaLinux`, which a Mac without Rosetta 2 already holds.
 pub const ROSETTA_RUNTIME: &str = "/Library/Apple/usr/libexec/oah/libRosettaRuntime";
 
-/// Whether this build runs where Rosetta 2 can be missing: macOS on Apple silicon. An Intel
-/// Mac runs x86_64 natively and other systems have no Rosetta, so there `[machine] rosetta`
-/// reads nothing and installs nothing.
+/// Whether this build runs where Rosetta 2 can be missing: macOS on Apple silicon.
 pub const ROSETTA_APPLIES: bool = cfg!(all(target_os = "macos", target_arch = "aarch64"));
 
 /// The `machine-settings:` entry for a Rosetta 2 install (contract string).
 pub const ROSETTA_ENTRY: &str = "rosetta installed";
 
-/// How long the install may take before it is killed and reported as failed. Measured
-/// 2026-10-21: about a second from the package macOS 27 keeps on disk
-/// (`/Library/Updates/Rosetta/OnDemand`); a Mac that has to download it first takes longer.
+/// How long the install may take before it is killed and reported as failed.
 pub const ROSETTA_INSTALL_WITHIN: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Rosetta 2 as read.
@@ -318,7 +253,7 @@ pub enum RosettaPosture {
     Present,
     /// `stat` said it is not there: the install is next.
     Missing,
-    /// `stat` could not say either way. Never "missing": nothing is installed on it.
+    /// `stat` could not say either way.
     Unknown,
     /// Not macOS on Apple silicon ([`ROSETTA_APPLIES`]): nothing was read.
     NotApplicable,
@@ -346,9 +281,7 @@ impl RosettaPosture {
         })
     }
 
-    /// The doctor's row for this posture under `[machine] rosetta = wanted`, or `None` where
-    /// Rosetta 2 does not apply. `warn` only when the apply would install it; its next step
-    /// is the Remedy the caller attaches (`aterm pkg machine apply`).
+    /// The doctor's row for this posture under `[machine] rosetta = wanted`, or `None` where Rosetta 2 does not apply.
     #[must_use]
     pub fn doctor_row(self, wanted: bool) -> Option<crate::doctor::Row> {
         use crate::doctor::{Level, Row};
@@ -382,19 +315,15 @@ impl RosettaPosture {
     }
 }
 
-/// The port to the real machine — one probe, one install — so the policy is testable
-/// against a fake and no test runs `softwareupdate`.
+/// The port to the real machine — one probe, one install — so the policy is testable against a fake and no test runs `softwareupdate`.
 pub trait RosettaPort {
-    /// Whether [`ROSETTA_RUNTIME`] is there: `Ok(false)` only when `stat` said it is not,
-    /// `Err(why)` when it could not say.
+    /// Whether [`ROSETTA_RUNTIME`] is there: `Ok(false)` only when `stat` said it is not, `Err(why)` when it could not say.
     fn present(&self) -> Result<bool, String>;
-    /// Run the install once; `Err(why)` unless it exited 0 within
-    /// [`ROSETTA_INSTALL_WITHIN`].
+    /// Run the install once; `Err(why)` unless it exited 0 within [`ROSETTA_INSTALL_WITHIN`].
     fn install(&self) -> Result<(), String>;
 }
 
-/// The real port: a `stat` of [`ROSETTA_RUNTIME`] and `/usr/sbin/softwareupdate
-/// --install-rosetta --agree-to-license` ([`crate::platform::rosetta_install`]).
+/// The real port: a `stat` of [`ROSETTA_RUNTIME`] and `/usr/sbin/softwareupdate --install-rosetta --agree-to-license` ([`crate::platform::rosetta_install`]).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemRosetta;
 
@@ -434,14 +363,11 @@ pub enum RosettaOutcome {
     AlreadyPresent,
     /// Installed by this pass and read back — the `machine-settings:` entry.
     Installed,
-    /// Nothing changed, and why: the probe could not say, the install failed, or it exited
-    /// 0 and the runtime is still not there.
+    /// Nothing changed, and why: the probe could not say, the install failed, or it exited 0 and the runtime is still not there.
     Failed(String),
 }
 
-/// Install Rosetta 2 through `port` where it applies and `[machine] rosetta` wants it:
-/// `Installed` only when this pass ran the install and the runtime then reads present.
-/// Idempotent: an installed Mac reads `AlreadyPresent` on every later pass, and nothing runs.
+/// Install Rosetta 2 through `port` where it applies and `[machine] rosetta` wants it: `Installed` only when this pass ran the install and the runtime then reads present.
 #[must_use]
 pub fn apply_rosetta(wanted: bool, port: &dyn RosettaPort) -> RosettaOutcome {
     apply_rosetta_on(ROSETTA_APPLIES, wanted, port)
@@ -455,7 +381,6 @@ fn apply_rosetta_on(applies: bool, wanted: bool, port: &dyn RosettaPort) -> Rose
     match port.present() {
         Ok(true) => return RosettaOutcome::AlreadyPresent,
         Ok(false) => {}
-        // An unproven read acts on nothing: a runtime that could not be checked may be there.
         Err(why) => {
             return RosettaOutcome::Failed(format!(
                 "{ROSETTA_RUNTIME} could not be checked ({why}), so nothing was installed"
@@ -465,7 +390,6 @@ fn apply_rosetta_on(applies: bool, wanted: bool, port: &dyn RosettaPort) -> Rose
     if let Err(why) = port.install() {
         return RosettaOutcome::Failed(why);
     }
-    // Read back: an install that did not land is not a change to announce.
     match port.present() {
         Ok(true) => RosettaOutcome::Installed,
         Ok(false) => RosettaOutcome::Failed(format!(
@@ -477,22 +401,16 @@ fn apply_rosetta_on(applies: bool, wanted: bool, port: &dyn RosettaPort) -> Rose
     }
 }
 
-// The read verb's state: one byte-stable line the window parses, and the one pure verdict
-// both the CLI's `next —` line and the window's Apply button derive from.
-
-/// Universal Control, as the two per-host keys read — the coarse posture a report
-/// names, derived from [`UniversalControlState`] and nothing else.
+/// Universal Control, as the two per-host keys read — the coarse posture a report names, derived from [`UniversalControlState`] and nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UcPosture {
     /// Both keys true: the pass's wanted state.
     Disabled,
     /// Neither key set: the OS default — the cursor roams.
     Default,
-    /// Exactly one of the two set: a half state the pass completes rather than reports
-    /// as done.
+    /// Exactly one of the two set: a half state the pass completes rather than reports as done.
     Partial,
-    /// A key read as something this module does not treat as a switch, or the read
-    /// could not be made. Never "off".
+    /// A key read as something this module does not treat as a switch, or the read could not be made.
     Unknown,
 }
 
@@ -520,13 +438,9 @@ impl UcPosture {
 }
 
 impl UniversalControlState {
-    /// The coarse posture: `Unknown` when either read measured nothing; otherwise both keys
-    /// true is `Disabled`, one is `Partial`, and neither is the OS default (an absent key is
-    /// the ordinary state of a machine that never turned the feature off).
+    /// The coarse posture: `Unknown` when either read measured nothing; otherwise both keys true is `Disabled`, one is `Partial`, and neither is the OS default (an absent key is the ordinary state of a machine that never turned the feature off).
     #[must_use]
     pub fn posture(&self) -> UcPosture {
-        // An UNMEASURED read is `Unknown`, which is the variant's whole purpose: before
-        // this, a `defaults` that would not run reported the OS default and Settings
         // told the user the cursor roams, on no evidence.
         if !self.measured {
             return UcPosture::Unknown;
@@ -539,16 +453,14 @@ impl UniversalControlState {
     }
 }
 
-/// Whether this process's home is the account's — the synthetic-home rule the apply
-/// path enforces (`defaults` writes the account's per-host domain and ignores `$HOME`).
+/// Whether this process's home is the account's — the synthetic-home rule the apply path enforces (`defaults` writes the account's per-host domain and ignores `$HOME`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HomePosture {
     /// `$HOME` is the account home: the settings apply here.
     Account,
     /// `$HOME` is somewhere else: a synthetic machine, nothing is applied.
     Mismatch,
-    /// The account home could not be resolved, so `$HOME` cannot be proven to be it:
-    /// nothing is applied.
+    /// The account home could not be resolved, so `$HOME` cannot be proven to be it: nothing is applied.
     Unresolved,
 }
 
@@ -573,10 +485,7 @@ impl HomePosture {
     }
 }
 
-/// What bare `atpkg machine` measured — the whole of it, as one record. Printed as the
-/// [`MACHINE_STATE_MARKER`](crate::cli::MACHINE_STATE_MARKER) line and parsed back by
-/// the window through [`parse_machine_state`], so the two cannot disagree about a
-/// field's spelling.
+/// What bare `atpkg machine` measured — the whole of it, as one record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineState {
     /// The two keys' posture.
@@ -585,31 +494,22 @@ pub struct MachineState {
     pub policy: UniversalControlPolicy,
     /// The synthetic-home rule's answer.
     pub home: HomePosture,
-    /// The config file exists and does not parse, so the opt-out could not be read and
-    /// nothing may be applied ([`crate::config::MachineConfig::unreadable`]). Optional in
-    /// the record; absent is `false`.
+    /// The config file exists and does not parse, so the opt-out could not be read and nothing may be applied ([`crate::config::MachineConfig::unreadable`]).
     pub config_unreadable: bool,
-    /// Rosetta 2 as read ([`rosetta_posture`]). Optional in the record: an atpkg from
-    /// before the setting prints none, read as `NotApplicable`, so no window offers an
-    /// install it cannot see.
+    /// Rosetta 2 as read ([`rosetta_posture`]).
     pub rosetta: RosettaPosture,
-    /// `[machine] rosetta`, resolved. Optional in the record; absent is the default, `true`.
+    /// `[machine] rosetta`, resolved.
     pub rosetta_wanted: bool,
 }
 
 impl MachineState {
-    /// Whether an apply would change this machine: the CLI's `next —` line and the window's
-    /// Apply button both read it, so the two cannot drift. Nothing is next when nothing may
-    /// be applied (a synthetic home, a config whose opt-out could not be read), or when
-    /// neither [`Self::universal_control_next`] nor [`Self::rosetta_next`] holds.
+    /// Whether an apply would change this machine: the CLI's `next —` line and the window's Apply button both read it, so the two cannot drift.
     #[must_use]
     pub fn next(&self) -> bool {
         self.universal_control_next() || self.rosetta_next()
     }
 
-    /// Whether an apply would turn Universal Control off: an apply may run here, the policy
-    /// is off, and it is not already off; an unreadable posture is applied again, never
-    /// skipped.
+    /// Whether an apply would turn Universal Control off: an apply may run here, the policy is off, and it is not already off; an unreadable posture is applied again, never skipped.
     #[must_use]
     pub fn universal_control_next(&self) -> bool {
         self.applies_here()
@@ -617,9 +517,7 @@ impl MachineState {
             && !matches!(self.universal_control, UcPosture::Disabled)
     }
 
-    /// Whether an apply would install Rosetta 2: an apply may run here, `[machine] rosetta`
-    /// wants it, and it read missing. An unreadable runtime is not missing: the apply acts
-    /// on no unproven read ([`apply_rosetta`]).
+    /// Whether an apply would install Rosetta 2: an apply may run here, `[machine] rosetta` wants it, and it read missing.
     #[must_use]
     pub fn rosetta_next(&self) -> bool {
         self.applies_here() && self.rosetta_wanted && self.rosetta == RosettaPosture::Missing
@@ -631,8 +529,7 @@ impl MachineState {
     }
 }
 
-/// The marker body, `key=value` pairs joined by `; ` — the same shape as the
-/// `machine-settings:` body, so one reader handles both.
+/// The marker body, `key=value` pairs joined by `; ` — the same shape as the `machine-settings:` body, so one reader handles both.
 #[must_use]
 pub fn machine_state_line(s: &MachineState) -> String {
     format!(
@@ -652,11 +549,7 @@ pub fn machine_state_line(s: &MachineState) -> String {
     }
 }
 
-/// Parse a [`machine_state_line`] body. The Universal Control fields and `home` are
-/// required, order free, unknown keys ignored (a newer atpkg may add one); a missing or
-/// malformed required field is `None`, never a default: a window must not guess a posture.
-/// The Rosetta fields are optional (an older atpkg prints none: `NotApplicable`, wanted),
-/// and a malformed one is `None` too.
+/// Parse a [`machine_state_line`] body.
 #[must_use]
 pub fn parse_machine_state(body: &str) -> Option<MachineState> {
     let mut uc = None;
@@ -688,7 +581,6 @@ pub fn parse_machine_state(body: &str) -> Option<MachineState> {
                     _ => None,
                 }
             }
-            // Optional: absent means readable.
             "config" => config_unreadable = v == "unreadable",
             _ => {}
         }
@@ -703,11 +595,7 @@ pub fn parse_machine_state(body: &str) -> Option<MachineState> {
     })
 }
 
-/// The `[machine]` table as one stable text, what [`record_applied`] keeps and
-/// [`changed_since_applied`] compares, spelled from the table as written (the raw
-/// `Option`s), so an edit is a change even when it lands on a default. v3 added `rosetta`:
-/// a stamp an older atpkg wrote reads as changed, so the next pass applies once more and
-/// installs Rosetta 2 where it is missing.
+/// The `[machine]` table as one stable text, what [`record_applied`] keeps and [`changed_since_applied`] compares, spelled from the table as written (the raw `Option`s), so an edit is a change even when it lands on a default. v3 added `rosetta`: a stamp an older atpkg wrote reads as changed, so the next pass applies once more and installs Rosetta 2 where it is missing.
 #[must_use]
 pub fn applied_fingerprint(cfg: &crate::config::MachineConfig) -> String {
     format!(
@@ -722,8 +610,7 @@ pub fn applied_stamp_path(layout: &crate::store::Layout) -> std::path::PathBuf {
     layout.prefix.join("machine.applied")
 }
 
-/// Whether `cfg` differs from the table the last apply recorded — an absent or unreadable
-/// stamp counts as changed, so a machine that never applied them does at its next pass.
+/// Whether `cfg` differs from the table the last apply recorded — an absent or unreadable stamp counts as changed, so a machine that never applied them does at its next pass.
 #[must_use]
 pub fn changed_since_applied(
     layout: &crate::store::Layout,
@@ -733,16 +620,12 @@ pub fn changed_since_applied(
         .map_or(true, |had| had != applied_fingerprint(cfg))
 }
 
-/// Forget the applied table, so the next pass applies it again: what an apply that did not
-/// finish (a failed `defaults` write) leaves. Passes carry only a changed table, so
-/// otherwise only the next day's launch apply ([`launch_apply_due`]) would retry. Best-effort.
+/// Forget the applied table, so the next pass applies it again: what an apply that did not finish (a failed `defaults` write) leaves.
 pub fn forget_applied(layout: &crate::store::Layout) {
     let _ = std::fs::remove_file(applied_stamp_path(layout));
 }
 
-/// Record `cfg` as the applied table: temp + rename, only when the bytes differ, and only
-/// where the prefix already exists (a pass or the apply queue creates it; a stamp never
-/// does). Best-effort — a stamp that did not land means the next pass applies once more.
+/// Record `cfg` as the applied table: temp + rename, only when the bytes differ, and only where the prefix already exists (a pass or the apply queue creates it; a stamp never does).
 pub fn record_applied(layout: &crate::store::Layout, cfg: &crate::config::MachineConfig) {
     let path = applied_stamp_path(layout);
     let text = applied_fingerprint(cfg);
@@ -760,8 +643,7 @@ pub fn record_applied(layout: &crate::store::Layout, cfg: &crate::config::Machin
 /// How often a launch runs `aterm pkg machine apply` on its own: once a day.
 pub const LAUNCH_APPLY_EVERY_SECS: u64 = 24 * 60 * 60;
 
-/// The one line a launch logs when it skips the day's apply under a private state root
-/// ([`LaunchApply::PrivateStateRoot`]).
+/// The one line a launch logs when it skips the day's apply under a private state root ([`LaunchApply::PrivateStateRoot`]).
 pub const PRIVATE_STATE_ROOT_SKIP: &str = "atpkg machine apply: skipped at launch \u{2014} \
      this process runs under a private state root (ATERM_STATE_HOME), and the [machine] \
      settings are this Mac's; the day's slot is left unclaimed, and `aterm pkg machine apply` \
@@ -774,16 +656,12 @@ pub enum LaunchApply {
     Due,
     /// Another launch holds the day's slot: nothing runs.
     NotDue,
-    /// This process runs under a private state root
-    /// (`aterm_types::dirs::runs_under_private_state_root`): nothing runs, and the slot
-    /// was never claimed, so the day's apply stays the owner's ([`PRIVATE_STATE_ROOT_SKIP`]).
+    /// This process runs under a private state root (`aterm_types::dirs::runs_under_private_state_root`): nothing runs, and the slot was never claimed, so the day's apply stays the owner's ([`PRIVATE_STATE_ROOT_SKIP`]).
     PrivateStateRoot,
 }
 
 impl LaunchApply {
-    /// Whether the launch runs the apply. A skip under a private state root first hands its
-    /// line to `say`, which the callers log at info in their own log: not `packages.log`,
-    /// which records passes, nor `crate::notice::say`, which logs at warn.
+    /// Whether the launch runs the apply.
     pub fn runs(self, say: impl FnOnce(&'static str)) -> bool {
         match self {
             Self::Due => true,
@@ -796,17 +674,7 @@ impl LaunchApply {
     }
 }
 
-/// Whether this launch runs the day's `aterm pkg machine apply`: it claims the one daily
-/// slot in `machine-apply.stamp` ([`aterm_update_core::pkg_check::claim`]). A terminal
-/// session and a window both claim it here, so their `defaults` writes run once a day
-/// between them; an edit to `[machine]` rides the next pass ([`changed_since_applied`]) and
-/// Settings' Apply Now runs at once, unclaimed.
-///
-/// Under a private state root it stands aside before the claim: a development build with
-/// its own `ATERM_STATE_HOME` keeps the owner's `$HOME` and so shares this prefix, and would
-/// otherwise take the owner's slot and apply its own `[machine]` table to the owner's Mac.
-/// The seam is read here and the half that takes the answer injected is private, so no
-/// launch lane can claim without asking.
+/// Whether this launch runs the day's `aterm pkg machine apply`: it claims the one daily slot in `machine-apply.stamp` ([`aterm_update_core::pkg_check::claim`]).
 #[must_use]
 pub fn launch_apply_due(layout: &crate::store::Layout, now_unix: i64) -> LaunchApply {
     launch_apply_decision(
@@ -853,8 +721,6 @@ mod tests {
         };
         let now = 1_790_000_000_i64;
         let day = i64::try_from(LAUNCH_APPLY_EVERY_SECS).unwrap();
-        // The owner's process: no private state root (injected — the live answer is the
-        // environment's, which this test must not depend on).
         let due = |at| launch_apply_decision(&layout, at, false);
         assert_eq!(due(now), LaunchApply::Due);
         assert_eq!(due(now + 60), LaunchApply::NotDue);
@@ -884,10 +750,8 @@ mod tests {
             !layout.machine_apply_stamp().exists(),
             "the skip precedes the claim: no stamp"
         );
-        // The owner's launch, the same second: the slot is still there to take.
         assert_eq!(launch_apply_decision(&layout, now, false), LaunchApply::Due);
         assert!(layout.machine_apply_stamp().is_file());
-        // And a private launch after the owner's claim still skips, not "not due".
         assert_eq!(
             launch_apply_decision(&layout, now + 1, true),
             LaunchApply::PrivateStateRoot
@@ -903,8 +767,7 @@ mod tests {
     }
 
     /// A never-applied table reads changed; recording it makes it unchanged (and a second
-    /// record writes nothing); an edit, even onto a default, reads changed again. No
-    /// prefix, no stamp: a stamp never creates the store.
+    /// record writes nothing); an edit, even onto a default, reads changed again.
     #[test]
     fn the_applied_table_is_recorded_and_an_edit_reads_as_changed() {
         let p = std::env::temp_dir().join(format!("atpkg-machine-applied-{}", std::process::id()));
@@ -930,7 +793,6 @@ mod tests {
             stamp,
             "unchanged: not rewritten"
         );
-        // An apply that did not finish forgets it: the next pass applies again.
         forget_applied(&layout);
         assert!(
             changed_since_applied(&layout, &default),
@@ -945,8 +807,6 @@ mod tests {
             changed_since_applied(&layout, &spelled_default),
             "spelling out a default is an edit too"
         );
-        // The Rosetta switch is in the table too: turning it off is an edit, and so is
-        // turning it back on, so the next pass installs it again.
         let no_rosetta = crate::config::parse_machine("[machine]\nrosetta = false\n");
         assert!(changed_since_applied(&layout, &no_rosetta), "rosetta off");
         record_applied(&layout, &no_rosetta);
@@ -956,7 +816,6 @@ mod tests {
             changed_since_applied(&layout, &rosetta_on),
             "rosetta back on"
         );
-        // A stamp an older atpkg wrote (v2, no rosetta key) reads as changed.
         std::fs::write(
             applied_stamp_path(&layout),
             "atpkg-machine-applied v2\nuniversal_control=None\nunreadable=false\n",
@@ -1023,9 +882,6 @@ mod tests {
         assert_eq!(parse_defaults_bool(b"truee"), None);
     }
 
-    // The policy over the fake: the OS default is disabled once, a disabled host is left alone,
-    // a half state is completed, `leave` never reads or writes, and a failed write is not
-    // announced.
     #[test]
     fn the_pass_disables_once_and_never_touches_a_disabled_host_or_a_leave_policy() {
         if !cfg!(target_os = "macos") {
@@ -1044,27 +900,23 @@ mod tests {
         );
         assert_eq!(fake.writes.get(), 1);
         assert!(universal_control_state(&fake).disabled());
-        // Idempotent: the next pass changes nothing and says nothing.
         assert_eq!(
             apply_universal_control(UniversalControlPolicy::Off, &fake),
             UniversalControlOutcome::AlreadyDisabled
         );
         assert_eq!(fake.writes.get(), 1);
-        // A half state completes.
         let half = Fake::at(Some(true), None);
         assert!(!universal_control_state(&half).disabled());
         assert_eq!(
             apply_universal_control(UniversalControlPolicy::Off, &half),
             UniversalControlOutcome::Disabled
         );
-        // `leave` is inert whatever the state.
         let leave = Fake::at(None, None);
         assert_eq!(
             apply_universal_control(UniversalControlPolicy::Leave, &leave),
             UniversalControlOutcome::NotApplicable
         );
         assert_eq!(leave.writes.get(), 0);
-        // A write that fails is not a change.
         let mut broken = Fake::at(Some(false), Some(false));
         broken.write_ok = false;
         assert_eq!(
@@ -1119,12 +971,10 @@ mod tests {
         assert!(parse_machine_state("universal-control=disabled; policy=off").is_none());
         assert!(parse_machine_state(&full.replace("home=account", "home=elsewhere")).is_none());
         assert!(parse_machine_state("").is_none());
-        // A record from an atpkg before the Rosetta setting: not applicable, never missing.
         let older = parse_machine_state(full).unwrap();
         assert_eq!(older.rosetta, RosettaPosture::NotApplicable);
         assert!(older.rosetta_wanted);
         assert!(!older.rosetta_next());
-        // A Rosetta field that is there and malformed is no record, as for every other.
         assert!(parse_machine_state(&format!("{full}; rosetta=installed")).is_none());
         assert!(parse_machine_state(&format!("{full}; rosetta-policy=yes")).is_none());
         assert_eq!(
@@ -1149,9 +999,6 @@ mod tests {
         assert_eq!(at(Some(false), Some(true)).posture(), UcPosture::Partial);
         assert_eq!(at(None, None).posture(), UcPosture::Default);
         assert_eq!(at(Some(false), Some(false)).posture(), UcPosture::Default);
-        // From the reads: both keys absent is the MEASURED OS default, one key set is a
-        // half state, and a read that did not happen (the default value) is never the
-        // OS default.
         let read = UniversalControlState::from_reads([Read::Absent, Read::Absent]);
         assert!(read.measured);
         assert_eq!(read.posture(), UcPosture::Default);
@@ -1162,7 +1009,6 @@ mod tests {
         let unread = UniversalControlState::default();
         assert!(!unread.measured);
         assert_eq!(unread.posture(), UcPosture::Unknown);
-        // Nor is a read that answered nothing usable, beside an absent key or a set one.
         for other in [Read::Absent, Read::Value(true)] {
             let unusable = Read::Unusable("defaults passed its deadline".into());
             for reads in [[unusable.clone(), other.clone()], [other.clone(), unusable]] {
@@ -1197,7 +1043,6 @@ mod tests {
             "an unreadable posture is re-applied, never skipped"
         );
         assert!(!at(Default, Leave).next(), "policy leave");
-        // The record's own refusals: a synthetic home, and a config that does not parse.
         let s = at(Default, Off);
         assert!(
             !MachineState {
@@ -1221,8 +1066,6 @@ mod tests {
         let line = machine_state_line(&flagged);
         assert!(line.ends_with("; config=unreadable"), "{line}");
         assert_eq!(parse_machine_state(&line), Some(flagged));
-        // Rosetta 2 missing is next on its own, with Universal Control already off; under
-        // `rosetta = false`, unread, or not applicable it is not, and the refusals hold.
         let missing = MachineState {
             rosetta: RosettaPosture::Missing,
             ..at(Disabled, Off)
@@ -1268,7 +1111,6 @@ mod tests {
             }
             .next()
         );
-        // Both left: next, and each half says so.
         let both = MachineState {
             universal_control: Default,
             ..missing
@@ -1337,13 +1179,11 @@ mod tests {
         );
         assert_eq!(mac.installs.get(), 1);
         assert_eq!(rosetta_posture_on(true, &mac), RosettaPosture::Present);
-        // Idempotent: the next pass runs nothing and says nothing.
         assert_eq!(
             apply_rosetta_on(true, true, &mac),
             RosettaOutcome::AlreadyPresent
         );
         assert_eq!(mac.installs.get(), 1);
-        // The opt-out and a Mac it does not apply to: nothing read, nothing run.
         for (applies, wanted) in [(true, false), (false, true), (false, false)] {
             let mac = FakeRosetta {
                 probe_fails: true,
@@ -1359,7 +1199,6 @@ mod tests {
             rosetta_posture_on(false, &FakeRosetta::missing()),
             RosettaPosture::NotApplicable
         );
-        // An unread probe installs nothing.
         let unread = FakeRosetta {
             probe_fails: true,
             ..FakeRosetta::missing()
@@ -1370,7 +1209,6 @@ mod tests {
             RosettaOutcome::Failed(why) if why.contains("could not be checked")
         ));
         assert_eq!(unread.installs.get(), 0);
-        // A failed install says why; one that exits 0 and lays nothing is no change.
         let refused = FakeRosetta {
             install_ok: false,
             ..FakeRosetta::missing()
@@ -1388,7 +1226,6 @@ mod tests {
             RosettaOutcome::Failed(why) if why.contains("still not there")
         ));
         assert_eq!(hollow.installs.get(), 1);
-        // The public door is the compiled answer to where it applies.
         let mac = FakeRosetta::missing();
         let expected = if ROSETTA_APPLIES {
             RosettaOutcome::Installed

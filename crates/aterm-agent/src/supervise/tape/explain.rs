@@ -18,7 +18,7 @@ use crate::supervise::policy::box_facts::BoxFacts;
 use crate::supervise::policy::probe::{KeyedProbe, TapeIndex};
 use crate::supervise::policy::trace::{self, Outcome, TraceStep};
 use crate::supervise::run::{
-    HEAD_SEARCH, WorkerSource, head_row, head_rows, joined_box, whole_box_decision,
+    HEAD_SEARCH, WorkerSource, head_row, head_rows, joined_box, same_box, whole_box_decision,
 };
 use crate::supervise::screen::{Screen, parse_text_json};
 use crate::supervise::{CtlReply, SupervisorConfig};
@@ -210,6 +210,7 @@ fn effects(tape: &Tape) -> (Vec<EffectRecord>, Vec<usize>) {
 }
 
 /// The wall time (Unix ms) at each item: the last `Clock` record or stamp at
+/// or before it.
 fn wall_times(tape: &Tape) -> Vec<Option<i64>> {
     let mut last = None;
     tape.items
@@ -229,6 +230,10 @@ fn wall_times(tape: &Tape) -> Vec<Option<i64>> {
 }
 
 /// The local clock, as [`why`]'s `offset_at` reads it: each instant's local
+/// time by its own offset, asked once per quarter hour of the tape (every
+/// zone's offset changes on one), so a tape recorded across a change of
+/// daylight saving reads each side as it was, and one recorded in another
+/// season reads by its own offsets, never today's.
 struct Zone<'a> {
     offset_at: &'a dyn Fn(i64) -> Option<i64>,
     read: std::collections::BTreeMap<i64, i64>,
@@ -243,6 +248,7 @@ impl<'a> Zone<'a> {
     }
 
     /// The Unix second `unix` on the local clock, in seconds since its
+    /// 1970-01-01 00:00.
     fn local(&mut self, unix: i64) -> Result<i64, String> {
         let quarter = unix.div_euclid(900);
         let offset = match self.read.get(&quarter) {
@@ -264,6 +270,9 @@ impl<'a> Zone<'a> {
 }
 
 /// The local instant (seconds since the local 1970-01-01 00:00) a point
+/// named by a local time stands for: `secs` into the local day `day`, or
+/// with no day named, into the one day of the tape's run — from its first
+/// wall reading to its last — that time falls within.
 fn local_target(
     walls: &[Option<i64>],
     day: Option<i64>,
@@ -378,6 +387,7 @@ pub(crate) struct Book<'t> {
     tape: &'t Tape,
     pub(crate) decisions: Vec<show::Decision>,
     /// Its effects by ordinal, and their keyed index: built once, here, and
+    /// shared by the keyed probe of every decision decided again on the tape.
     index: Arc<TapeIndex>,
     /// Each effect's item index, by ordinal (ascending).
     item_of: Vec<usize>,
@@ -554,6 +564,7 @@ fn screen_of(item: &Item) -> Option<Screen> {
 }
 
 /// An approval's or a question's decision made again from its mark's facts
+/// ([module docs](self)), into `why`.
 fn box_trace(
     why: &mut Why,
     header: &Header,
@@ -717,6 +728,9 @@ fn box_trace(
 }
 
 /// What a header this build decoded does not give the run's own, each
+/// supplied by this build (`Header::supplied`: a key a build before it did
+/// not write, a policy value an inexact header's reader refused, the
+/// inexactness itself), as a need of a decision made again under it.
 fn supplied(header: &Header) -> impl Iterator<Item = String> + '_ {
     header
         .supplied
@@ -725,12 +739,15 @@ fn supplied(header: &Header) -> impl Iterator<Item = String> + '_ {
 }
 
 /// What the loop made of a box whose head is off the screen
+/// (`run::box_head`), as the tape's replies say ([`head_of`]).
 enum Head {
     /// No history searched: the box was decided on the screen's rows.
     NotRead,
     /// Searched, and the join did not prove itself: decided on the cut.
     Cut,
     /// Joined: the rows from the box's top rule to the screen's foot and
+    /// their reading, and the records the join came through (the search, the
+    /// first and last `line` read, the screen read again).
     Joined {
         rows: Vec<String>,
         reading: Box<aterm_phase::Reading>,
@@ -743,6 +760,12 @@ enum Head {
 }
 
 /// The loop's join of a box's head (`Session::box_from_history`) rebuilt
+/// from the control round trips strictly between the judged screen's record
+/// and the mark: the search for the box's top rule, a `line` read of each
+/// row it names, the screen read again by the request that read the judged
+/// one — each reply read by the loop's own reader of it
+/// (`run::head_rows`, `run::head_row`, `run::joined_box`), so the join is
+/// the loop's, never a second copy of its rule.
 fn head_of(
     records: &[EffectRecord],
     screen_record: u64,
@@ -843,7 +866,7 @@ fn head_of(
     else {
         return unknown(format!("the screen read again (#{reread}) does not read"));
     };
-    if now.generation != screen.generation || now.rows != screen.rows {
+    if !same_box(&now.rows, &screen.rows) {
         return Head::Cut;
     }
     match joined_box(&head, &screen.rows, prompt, screen.cursor_col) {
@@ -859,6 +882,7 @@ fn head_of(
 }
 
 /// A turn end's trace, from a strict replay of the tape to its mark on the
+/// build that recorded it ([module docs](self)), into `why`.
 fn turn_end_trace(why: &mut Why, bytes: &[u8], header: &Header) {
     if header.build != why.explained_by {
         why.trace_note = Some(format!(
@@ -901,6 +925,7 @@ fn turn_end_trace(why: &mut Why, bytes: &[u8], header: &Header) {
 }
 
 /// The latest record at or before `mark` that crossed `door` (a control
+/// request's first word naming the verb, for the control lane): its ordinal.
 fn last_at(records: &[EffectRecord], mark: u64, door: &str, verb: Option<&str>) -> Option<u64> {
     let upto = records
         .len()
@@ -923,6 +948,7 @@ fn last_at(records: &[EffectRecord], mark: u64, door: &str, verb: Option<&str>) 
 }
 
 /// `facts`, each with the door it came through ([`Fact::door`]): the latest
+/// read of it among the first `mark` records, or the loop's own memory.
 fn facts_with_doors(
     facts: &BoxFacts,
     header: &Header,
@@ -1153,6 +1179,7 @@ fn heading(why: &Why) -> String {
 }
 
 /// The verdict line: what was decided, by which rule, and whether this build
+/// agrees.
 fn verdict(why: &Why) -> String {
     let mut out = format!(
         "recorded: rule={} {}",

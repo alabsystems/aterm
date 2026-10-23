@@ -31,7 +31,9 @@ fn run_verb(verb: &str, args: &[&str], reply: &[u8]) -> Output {
     listener.set_nonblocking(true).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_aterm-ctl"));
     for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("ATERM_") {
+        let name = key.to_string_lossy();
+        // The verify run's mark is no authority and stays (`VERIFY_RUN_VAR`).
+        if name.starts_with("ATERM_") && name != aterm_uds::process::VERIFY_RUN_VAR {
             command.env_remove(key);
         }
     }

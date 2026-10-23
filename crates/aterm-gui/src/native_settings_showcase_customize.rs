@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Settings ▸ Themes' CUSTOMIZE SHEET: it stands in the chooser's place
-//! while open. The five colour overrides (the registry's own rows, each with
-//! its Reset), the sixteen palette slots with the open slot's editor, and
-//! "Save as theme…" — every edit through the page's ordinary draft and patch
-//! lane, and the demo draws the drafts as they are typed.
+//! Settings ▸ Themes' CUSTOMIZE SHEET: it stands in the chooser's place while open.
 
 use super::*;
 
@@ -44,9 +40,7 @@ pub(super) fn with_heading(
     )
 }
 
-/// A sheet section's caption over all its rows, as one column of fixed
-/// children (the shape a list splits row by row, its caption the head every
-/// screen of it repeats).
+/// A sheet section's caption over all its rows, as one column of fixed children (the shape a list splits row by row, its caption the head every screen of it repeats).
 pub(super) fn with_heading_rows(
     key: &str,
     heading: &str,
@@ -77,9 +71,7 @@ pub(super) fn with_heading_rows(
     )
 }
 
-/// The height of every row of the sheet: a colour row, the palette's
-/// editor and tools, Save as theme. The chooser's filter is as tall, so the
-/// sheet keeps the panel's rhythm when it takes the chooser's place.
+/// The height of every row of the sheet: a colour row, the palette's editor and tools, Save as theme.
 pub(super) fn sheet_row_height() -> f32 {
     32.0_f32.max(28.0 * settings_text_scale())
 }
@@ -90,8 +82,6 @@ pub(super) fn sheet_row_height() -> f32 {
 /// force, beside the colour's chip at its end, which is the well that opens
 /// the picker ([`with_colour_well`]).
 fn colour_field_widths() -> (f32, f32) {
-    // A colour's hex beside its chip; "Automatic" names no colour, so the
-    // well at its end is an empty one the text stops short of.
     let chip = crate::native_ui::TEXT_FIELD_SWATCH_SIZE + crate::native_ui::TEXT_FIELD_SWATCH_GAP;
     let empty_well =
         crate::native_ui::TEXT_FIELD_END_BUTTON + crate::native_ui::TEXT_FIELD_END_BUTTON_GAP;
@@ -109,9 +99,7 @@ const COLOUR_ROW_GAP: f32 = 6.0;
 
 /// THE COLOUR WELL: the chip at a colour row's field's end (the colour in
 /// force, [`crate::native_ui::TextFieldSpec::swatch`]) made a button laid
-/// over it, the same size, so it costs the row's name no width. It opens the
-/// colour picker under the row (the same picker every colour row opens:
-/// `settings/color-open/<key>`), and closes it again.
+/// over it, the same size, so it costs the row's name no width.
 fn with_colour_well(
     state: &SettingsViewState,
     key: &str,
@@ -128,10 +116,6 @@ fn with_colour_well(
     } else {
         format!("Choose the {lower} color")
     };
-    // The well wears the chip the field draws under it, so a hover or a
-    // press never hides the colour; with no colour to show (the selected
-    // text left automatic) it wears the colours mark instead, so it is
-    // still there to see and press.
     let mut spec = ButtonSpec::new(label).visual_label("");
     spec.chip = shown;
     if shown.is_none() {
@@ -162,8 +146,6 @@ fn with_colour_well(
     )
     .layout(Layout::default().width(Length::Fill).height(Length::Fill))
     .paint_only();
-    // Where the field paints its chip: its padding in from the end, centred
-    // down it.
     let end = UiNode::new(
         format!("settings/showcase/well/{key}/end"),
         UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
@@ -205,22 +187,7 @@ fn colour_label_width() -> f32 {
         + 1.0
 }
 
-/// The least column the colour rows hold on one line in
-/// ([`customize_row`]): the widest name, the field at its least, and Reset's
-/// place. In a column narrower than this the name and the field cannot share
-/// a line whole (fitted, it painted "Backgrou…" in a UI face wider than the
-/// one the sheet's width was drawn in), so the panel is as wide where the
-/// demo beside it keeps its least ([`super::view`]'s panel width), and where
-/// it is not, each row names its colour over its field.
-///
-/// THE SAME WHATEVER IS SET: every row keeps Reset's place, its icon there
-/// only while the row's colour is the person's own, so setting a colour or
-/// resetting the last one shows or hides an icon in place and nothing else.
-/// (With Reset's place kept only while some colour was set, the first set
-/// and the last reset changed the sheet's width or every row's form: at the
-/// default window the rows went from one line to two, the list from four
-/// rows to three, and the Selection row's colour well came under the Reset
-/// just pressed.)
+/// The least column the colour rows hold on one line in ([`customize_row`]): the widest name, the field at its least, and Reset's place.
 pub(super) fn colour_rows_least_column() -> f32 {
     colour_label_width()
         + COLOUR_ROW_GAP
@@ -231,10 +198,7 @@ pub(super) fn colour_rows_least_column() -> f32 {
 
 /// The line a colour row's name takes over its field where the two do not
 /// share one ([`customize_row`]): a form's label, in the caption type
-/// ([`COLOUR_NAME_TYPE`]). So two such rows under the COLORS caption are
-/// four chooser rows tall (128pt), the sheet's list beside the demo on a
-/// 24-line window with the sidebar's heading over it: a taller name's line
-/// left one row on each screen there.
+/// ([`COLOUR_NAME_TYPE`]).
 fn colour_name_height() -> f32 {
     14.0_f32.max(13.0 * settings_text_scale())
 }
@@ -246,10 +210,7 @@ const COLOUR_NAME_TYPE: (SemanticRole, StyleRef) = (SemanticRole::Status, StyleR
 /// The gap between a colour row's name and the field under it.
 const COLOUR_NAME_GAP: f32 = 2.0;
 
-/// Whether the colour rows of a sheet whose rows take `column_width` while
-/// its list scrolls share one line each ([`colour_rows_least_column`]).
-/// Measured at that width whether or not the list scrolls, so the form
-/// never changes with what the sheet holds.
+/// Whether the colour rows of a sheet whose rows take `column_width` while its list scrolls share one line each ([`colour_rows_least_column`]).
 pub(super) fn colour_rows_on_one_line(column_width: f32) -> bool {
     column_width + 0.01 >= colour_rows_least_column()
 }
@@ -288,14 +249,7 @@ fn colour_row_label(key: &str) -> Option<&'static str> {
     })
 }
 
-/// One colour override of the Customize sheet on one line: its name, the
-/// registry's own field (the draft, patch and undo lane of every Settings
-/// field) showing the colour in force, and Reset's place, its icon there
-/// while the person sets the colour, so the fields stay in one column. Where
-/// the column is too narrow for the three on one line whole (`one_line`
-/// false, [`colour_rows_on_one_line`]: the short page's chooser, whose
-/// width the sheet keeps there), the name is a form's label over the field
-/// and Reset, which take the column's width: never a cut name.
+/// One colour override of the Customize sheet on one line: its name, the registry's own field (the draft, patch and undo lane of every Settings field) showing the colour in force, and Reset's place, its icon there while the person sets the colour, so the fields stay in one column.
 pub(super) fn customize_row(
     state: &SettingsViewState,
     key: &str,
@@ -305,7 +259,6 @@ pub(super) fn customize_row(
     let index = state.field_index_of(key)?;
     let field = state.legacy.fields.get(index)?;
     let name = colour_row_label(key)?;
-    // Under its name the field takes the column, less Reset's place.
     let field_width = if one_line {
         colour_field_width(column_width)
     } else {
@@ -326,9 +279,6 @@ pub(super) fn customize_row(
     let explicit = state.is_explicit(key);
     let editing = state.editing_field.as_deref() == Some(key);
     let shown = theme_colour_of(state, key);
-    // The colour in force: the field's own chip where its words name one,
-    // else the theme's. The field wears it at its end, and the well over it
-    // opens the picker.
     let well_color = match &control.content {
         UiContent::TextField(text) => text.spec.swatch.or(shown),
         _ => shown,
@@ -336,16 +286,7 @@ pub(super) fn customize_row(
     if let UiContent::TextField(text) = &mut control.content {
         text.spec.label = format!("{name} color");
         text.spec.swatch = well_color;
-        // No colour, no chip: the text still stops short of the empty well.
         text.spec.end_button = well_color.is_none();
-        // A colour left to the theme shows the theme's hex in the quiet
-        // placeholder ink: the value in force, and plainly not the
-        // person's own. The spoken value still says "Theme (default)". The
-        // keyboard on the field keeps that hex until a key is typed, which
-        // replaces it: the field's own placeholder, "Theme (default)", was
-        // fitted to a field this narrow as "Theme…" beside the caret. (The
-        // hex is no draft: one would be the person's colour to keep or
-        // carry, and Return on it would pin the theme's colour as theirs.)
         if !explicit {
             if !editing {
                 text.spec.visual_value = Some(String::new());
@@ -376,8 +317,6 @@ pub(super) fn customize_row(
     }
     let gap = COLOUR_ROW_GAP;
     let tail = RESET_ICON_WIDTH + gap;
-    // On one line the name leads the row; else it is a label over the
-    // field and Reset, the column's width.
     let (role, style) = if one_line {
         (SemanticRole::Text, StyleRef::Primary)
     } else {
@@ -400,7 +339,6 @@ pub(super) fn customize_row(
     .layout(Layout::default().width(Length::Fill).height(Length::Fill))
     .paint_only();
     let well = with_colour_well(state, key, name, control, (field_width, height), well_color);
-    // The field and Reset: on one line after the name, else under it.
     let (mut children, label) = if one_line {
         (vec![label, well], None)
     } else {
@@ -441,8 +379,6 @@ pub(super) fn customize_row(
         format!("settings/row/{index}/{key}"),
         UiContent::Group(GroupSpec::new(format!("{name} color"))),
     );
-    // As wide as the list's row (less the thumb's gutter it pads in while
-    // the sheet scrolls), so every row's field ends on the same edge.
     let (row, height) = match label {
         None => {
             let row = row
@@ -481,7 +417,6 @@ pub(super) fn customize_row(
         }
     };
     let mut out = vec![(row, height)];
-    // A refused value says why under its row, as a field page does.
     if let Some(error) = state.field_errors.get(key) {
         let note = caption_height();
         out.push((
@@ -550,8 +485,7 @@ const CHIP_GAP: f32 = 6.0;
 
 /// How many chips a row of the palette holds in a column `column_width`
 /// wide: the eight of a half (normal, bright) where they keep
-/// [`CHIP_PITCH_LEAST`], else four, a half over two rows. (At 72x24 eight a
-/// row were 15.2pt targets 21.2pt apart, a 7pt sliver of colour in each.)
+/// [`CHIP_PITCH_LEAST`], else four, a half over two rows.
 fn chips_per_row(column_width: f32) -> usize {
     if (column_width + CHIP_GAP) / 8.0 + 0.01 >= CHIP_PITCH_LEAST {
         8
@@ -560,9 +494,7 @@ fn chips_per_row(column_width: f32) -> usize {
     }
 }
 
-/// The palette: sixteen chips (normal over bright, eight to a row, or four
-/// where eight would stand closer than [`CHIP_PITCH_LEAST`]), the open
-/// slot's editor, and Reset palette.
+/// The palette: sixteen chips (normal over bright, eight to a row, or four where eight would stand closer than [`CHIP_PITCH_LEAST`]), the open slot's editor, and Reset palette.
 pub(super) fn palette_blocks(
     state: &SettingsViewState,
     column_width: f32,
@@ -576,8 +508,6 @@ pub(super) fn palette_blocks(
             .map(|index| {
                 let key = format!("{PALETTE_PREFIX}{index}");
                 let hex = hex_of(colors[index]);
-                // A slot the person tuned (the `palette` list reaches it, or
-                // `palette_overrides` sets it) says so, and wears a dot.
                 let changed = state.slot_on_list(index)
                     || state
                         .raw_values
@@ -605,9 +535,6 @@ pub(super) fn palette_blocks(
                             focused: focused(state, &key),
                             ..ControlState::default()
                         })
-                        // The slot being edited wears the selected chip's
-                        // accent rim and wash; a Secondary button's selected
-                        // state is all but hidden under its swatch.
                         .style(if selected {
                             StyleRef::Navigation
                         } else {
@@ -621,8 +548,6 @@ pub(super) fn palette_blocks(
                     UiContent::Custom(AuditedCustomNode {
                         audit_id: crate::native_ui::THEME_SWATCH_AUDIT,
                         role: SemanticRole::Group,
-                        // The swatch paints no words: its button above says
-                        // the slot and its hex.
                         label: String::new(),
                         value: Some(if changed {
                             format!("{hex} changed")
@@ -674,8 +599,6 @@ pub(super) fn palette_blocks(
     };
     let rows = 16 / per_row;
     let mut controls = Vec::new();
-    // The open slot's field takes a row of its own over the buttons: the
-    // sheet's column is too narrow for both.
     let mut field = None;
     if let Some(SlotEditor { index, input, .. }) = state.showcase.slot.as_ref() {
         let swatch = aterm_types::scheme::parse_hex(input.value().trim())
@@ -702,8 +625,6 @@ pub(super) fn palette_blocks(
         ));
         controls.push(button(
             PALETTE_SLOT_CLOSE,
-            // Not "Done": that is the sheet's own button in the strip, and
-            // the spoken name starts with the word on screen.
             "Close the palette color editor",
             "Close",
             StyleRef::Quiet,
@@ -711,9 +632,6 @@ pub(super) fn palette_blocks(
             Some(hug_width("Close")),
         ));
     } else {
-        // The hint shows only whole: where the column cuts it, the chips
-        // (each a labelled button) say enough, and Reset palette keeps its
-        // place at the row's end.
         let room = column_width - hug_width("Reset palette") - 6.0;
         let fitted = fit_text(PALETTE_HINT, SemanticRole::Text, StyleRef::Quiet, room);
         let hint = UiNode::new(
@@ -745,9 +663,6 @@ pub(super) fn palette_blocks(
         },
         Some(hug_width("Reset palette")),
     );
-    // Reset palette closes the tools row where it fits whole beside the
-    // slot's own buttons, else it takes a row of its own: a cut label is
-    // never the answer to a narrow column.
     let fixed: f32 = controls
         .iter()
         .chain([&reset_all])
@@ -765,7 +680,6 @@ pub(super) fn palette_blocks(
             UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
         )
         .layout(Layout::default().width(Length::Fill).height(Length::Fill));
-        // Reset palette keeps the row's end, as it does beside the hint.
         reset_row = Some(control_row(
             "settings/showcase/palette-reset-row",
             "Reset palette",
@@ -778,13 +692,6 @@ pub(super) fn palette_blocks(
         control_row("settings/showcase/palette-tools", "Palette color", controls);
     let mut blocks = Vec::new();
     match field {
-        // NO SLOT OPEN: the chips' rows and the tools row are the section's
-        // rows under its caption, each a stop of the list, so no stop of the
-        // sheet is more than a caption over a row, and a screen beside the
-        // demo, which draws only whole stops, ends less than that short of
-        // its foot. (As one 118pt stop, a 128pt list's last screen was "Save
-        // as theme…" alone over 96pt of blank, and at 80x24 a screen showed
-        // two colour rows over a 96pt hole.)
         None => blocks.push(with_heading_rows(
             "settings/showcase/palette-section",
             "PALETTE",
@@ -794,10 +701,6 @@ pub(super) fn palette_blocks(
                 .collect(),
             column_width,
         )),
-        // Four chips to a row: the open slot's row and its editor are one
-        // stop among the others, the editor under the chip it edits, so
-        // choosing a chip never opens its editor on a screen not shown, and
-        // that stop is no taller than eight to a row made it.
         Some(field) if rows > 2 => {
             let open = state
                 .showcase
@@ -841,9 +744,6 @@ pub(super) fn palette_blocks(
                 column_width,
             ));
         }
-        // The swatches and their editor are one block, so they page
-        // together: choosing a swatch never opens its editor on a page not
-        // shown.
         Some(field) => {
             let grid_height = 2.0 * chip_height + 4.0;
             let grid = UiNode::new(
@@ -881,9 +781,6 @@ pub(super) fn palette_blocks(
             ));
         }
     }
-    // The colour picker for the open slot is the block right after it, a
-    // stop of its own no taller than the list: a pick is the slot's draft,
-    // as a typed hex is.
     blocks.extend(palette_slot_picker(
         state,
         column_width,
@@ -972,8 +869,6 @@ fn save_blocks(state: &SettingsViewState, column_width: f32) -> Vec<(UiNode, f32
         },
         Some(hug_width("Cancel")),
     );
-    // The name keeps a field wide enough to read it: in a narrow column it
-    // takes a row of its own over Save and Cancel.
     let buttons_width = hug_width("Save") + hug_width("Cancel") + 12.0;
     let mut blocks = if column_width - buttons_width < SAVE_NAME_MIN_WIDTH {
         let spacer = UiNode::new(
@@ -1010,7 +905,6 @@ fn save_blocks(state: &SettingsViewState, column_width: f32) -> Vec<(UiNode, f32
             height,
         ));
     }
-    // "Include type settings" only while there is type to include.
     if state.save_type_in_force() && !state.save_typography().is_empty() {
         let switch_width = 52.0 * settings_text_scale().min(1.4);
         let include_type = UiNode::new(
@@ -1032,7 +926,6 @@ fn save_blocks(state: &SettingsViewState, column_width: f32) -> Vec<(UiNode, f32
                     focused: focused(state, SHOWCASE_SAVE_TYPE),
                     ..ControlState::default()
                 })
-                // A plain switch: its words are the label beside it.
                 .style(StyleRef::Quiet),
             ),
         )
@@ -1041,8 +934,6 @@ fn save_blocks(state: &SettingsViewState, column_width: f32) -> Vec<(UiNode, f32
                 .width(Length::Fixed(switch_width))
                 .height(Length::Fill),
         );
-        // The switch's own words, drawn beside it: a plain switch paints
-        // none.
         blocks.push(control_row(
             "settings/showcase/save-type-row",
             "Include type settings",
@@ -1069,13 +960,7 @@ fn colour_picker_room() -> f32 {
     sheet_row_height() * 7.0
 }
 
-/// The least list the sheet keeps, `column_width` wide: COLORS over one
-/// whole colour row (a screen that starts in the section repeats its
-/// caption), and an open picker, a colour row's or the palette slot's, whole
-/// in its least form on a screen of its own ([`sheet_blocks`]). The page gives
-/// up demo rows for it as it does for the chooser's least, so no screen of
-/// the sheet is a caption over a cut row, and no open picker is cut by the
-/// list's edge.
+/// The least list the sheet keeps, `column_width` wide: COLORS over one whole colour row (a screen that starts in the section repeats its caption), and an open picker, a colour row's or the palette slot's, whole in its least form on a screen of its own ([`sheet_blocks`]).
 pub(super) fn sheet_list_least(state: &SettingsViewState, column_width: f32) -> f32 {
     let captioned_row =
         caption_height() + 4.0 + colour_row_height(colour_rows_on_one_line(column_width));
@@ -1089,11 +974,7 @@ pub(super) fn sheet_list_least(state: &SettingsViewState, column_width: f32) -> 
     captioned_row.max(colour_picker).max(slot_picker)
 }
 
-/// The sheet's blocks, in order: the colour rows under COLORS (each on one
-/// line, or its name over its field, as `one_line` says), the palette under
-/// PALETTE, then Save as theme, for a list `room` tall: an open colour
-/// picker is sized so its block is one stop of it, with the row (or the
-/// palette slot) it sets.
+/// The sheet's blocks, in order: the colour rows under COLORS (each on one line, or its name over its field, as `one_line` says), the palette under PALETTE, then Save as theme, for a list `room` tall: an open colour picker is sized so its block is one stop of it, with the row (or the palette slot) it sets.
 pub(super) fn sheet_blocks(
     state: &SettingsViewState,
     column_width: f32,
@@ -1104,12 +985,6 @@ pub(super) fn sheet_blocks(
     let picker = |key: &str, room: f32| {
         color_picker_node(state, key, SettingsWidth::Compact, column_width, room)
     };
-    // COLORS is one section of its rows under its caption, listed row by
-    // row ([`ListItem::of`] makes it a split card), so a screen that starts
-    // inside it repeats COLORS over its first row there. The open colour
-    // picker is the row right under its colour row, sized so the caption,
-    // the row and the wheel it sets share one screen of the list, or, where
-    // they cannot, so the caption and the picker are one whole screen.
     let caption = caption_height() + 4.0;
     let under = room - caption;
     let captioned = state
@@ -1140,9 +1015,6 @@ pub(super) fn sheet_blocks(
             ));
         }
     } else {
-        // A list too short for the caption over the open picker (80x24):
-        // the caption heads the first row alone and every row, and the
-        // picker, is a block of its own, so the picker is one whole screen.
         let mut first = true;
         for key in SHOWCASE_COLOR_KEYS {
             let Some(row) = customize_row(state, key, column_width, one_line) else {
@@ -1169,11 +1041,7 @@ pub(super) fn sheet_blocks(
     blocks
 }
 
-/// The text contrast the person's colors leave the theme of the side the
-/// page does not show, while the theme follows the system — where that is
-/// under 3:1 and the theme alone is not, so these edits did it: (the words
-/// the sheet shows, what a reader hears). Those colors draw on that side's
-/// theme too, out of sight until the system's appearance changes.
+/// The text contrast the person's colors leave the theme of the side the page does not show, while the theme follows the system — where that is under 3:1 and the theme alone is not, so these edits did it: (the words the sheet shows, what a reader hears).
 pub(super) fn other_side_contrast(state: &SettingsViewState) -> Option<(String, String)> {
     if prefs::theme_mode(state.raw_value(prefs::EDIT_THEME).as_deref())
         != prefs::ThemeMode::FollowSystem

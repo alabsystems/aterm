@@ -43,14 +43,17 @@ mod macos {
     use super::{FAIL, NOT_RUN, PASS};
 
     /// Long enough for macOS to launch its `NSApplication`, hand back a window
+    /// and run every stage; past it the drive reports NOT RUN.
     const BUDGET: Duration = Duration::from_secs(60);
 
     /// `NSDragOperationCopy`, the value `draggingEntered:` must answer for a
+    /// pasteboard carrying filenames.
     const NS_DRAG_OPERATION_COPY: usize = 1;
     /// `NSDragOperationNone`, for a pasteboard carrying none.
     const NS_DRAG_OPERATION_NONE: usize = 0;
 
     /// `NSEventTypeKeyUp` and `NSEventModifierFlagCommand`, spelled here so the
+    /// driver's expectation is not the port's constant.
     const NS_EVENT_TYPE_KEY_UP: usize = 11;
     const NS_EVENT_MODIFIER_FLAG_COMMAND: usize = 1 << 20;
 
@@ -166,6 +169,7 @@ mod macos {
     }
 
     /// `-[NSScreen backingScaleFactor]` for `+[NSScreen mainScreen]`, read without
+    /// the port.
     fn main_screen_backing_scale() -> Option<f64> {
         // SAFETY: `+mainScreen` is `@16#0:8`.
         unsafe {
@@ -206,6 +210,7 @@ mod macos {
     }
 
     /// `(the Method handle, its IMP, its registered type encoding)` for an
+    /// instance method, read straight from libobjc.
     fn live_method(cls: *mut std::ffi::c_void, sel: Sel) -> Option<(usize, usize, String)> {
         // SAFETY: `cls` is a live class and `sel` is an interned selector.
         unsafe {
@@ -285,6 +290,7 @@ mod macos {
     }
 
     /// `+[NSProcessInfo processInfo].processName`, which the About, Hide and Quit
+    /// titles are built from.
     fn process_name() -> String {
         // SAFETY: `+processInfo` and `-processName` return a live `NSString`.
         unsafe {
@@ -295,6 +301,7 @@ mod macos {
     }
 
     /// A pasteboard carrying `NSFilenamesPboardType` and a dragging-info stub that
+    /// answers it, as `(info, pasteboard)`, both +1 and owned by the caller.
     fn dragging_info(paths: &[&str]) -> Option<(Obj, Obj)> {
         // SAFETY: documented Foundation and AppKit selectors called on live objects.
         unsafe {
@@ -355,6 +362,7 @@ mod macos {
 
     aterm_objc::declare_class! {
         /// The smallest object that answers `-draggingPasteboard`, the only thing
+        /// `draggingEntered:` and `performDragOperation:` ask of their sender.
         pub(super) struct ATermDragInfo: NSObject {
             const NAME: &str = "ATermObjcWindowDriveDragInfo";
             type Ivars = Id;
@@ -404,6 +412,8 @@ mod macos {
 
     impl Driver {
         /// The `WinitWindowDelegate` AppKit is holding and its `NSWindow`, reached
+        /// without the port: the window's content view, its window, that window's
+        /// `-delegate`.
         fn pair(&self) -> Option<(Id, Id)> {
             let view = self.ns_view();
             if view.is_null() {
@@ -512,6 +522,7 @@ mod macos {
         }
 
         /// `-setTitle:`/`-title`: the `NSString` round trip, and the one path where a
+        /// +1 string is handed to a copying setter.
         fn stage_title(&mut self, ns: Id) {
             println!("\n[1] title — setTitle: / title, through NSString");
             for t in ["objc-window-drive", "ünïcødé ⌘ 日本語", ""] {
@@ -527,6 +538,7 @@ mod macos {
         }
 
         /// The style mask the window was built with, read off AppKit's own `-styleMask`
+        /// rather than the port's state.
         fn stage_style_mask(&mut self, ns: Id) {
             println!("\n[2] style mask — the mask the window was built with");
             const TITLED: usize = 1 << 0;
@@ -544,6 +556,7 @@ mod macos {
         }
 
         /// `-setFrameOrigin:`, `-frame`, `-contentRectForFrameRect:` and
+        /// `-setContentSize:`: the struct-passing sends an ABI mistake corrupts silently.
         fn stage_geometry(&mut self) {
             use aterm_window::dpi::{PhysicalPosition, PhysicalSize};
             println!("\n[3] geometry — position and size round trips");
@@ -583,6 +596,7 @@ mod macos {
         }
 
         /// `-setContentMinSize:` and the clamp that follows: the send whose effect is a
+        /// resize the caller did not ask for.
         fn stage_size_limits(&mut self) {
             use aterm_window::dpi::PhysicalSize;
             println!("\n[4] size limits — min clamps the current size");
@@ -611,6 +625,7 @@ mod macos {
         }
 
         /// `-makeKeyAndOrderFront:`, `-orderOut:`, `-isVisible`,
+        /// `-isMiniaturized` and the `Focused` events the delegate queues.
         fn stage_visibility_and_focus(&mut self) {
             println!("\n[5] visibility and focus");
             self.w().set_visible(true);
@@ -647,6 +662,8 @@ mod macos {
         }
 
         /// `+appearanceNamed:`, `-setAppearance:`, `-appearance` and
+        /// `-bestMatchFromAppearancesWithNames:`: the round trip that decides light
+        /// vs dark.
         fn stage_theme(&mut self) {
             println!("\n[6] theme — appearanceNamed:/setAppearance:/bestMatch…");
             self.w().set_theme(Some(Theme::Dark));
@@ -670,6 +687,8 @@ mod macos {
         }
 
         /// `draggingEntered:` returns an eight-byte `NSDragOperation`, not a one-byte
+        /// `BOOL`: `NSDragOperationCopy` (1) for a pasteboard with filenames and
+        /// `NSDragOperationNone` (0) for one without.
         fn stage_drag_and_drop(&mut self, delegate: Id) {
             println!("\n[7] drag and drop — draggingEntered: returns NSDragOperation");
             let Some((info, _pb)) = dragging_info(&["/tmp/aterm-drive-a", "/tmp/aterm-drive-b"])
@@ -706,6 +725,7 @@ mod macos {
         }
 
         /// `windowShouldClose:` must answer NO and queue `CloseRequested` — the
+        /// inversion that would make the window uncloseable or unstoppable.
         fn stage_close(&mut self, delegate: Id, ns: Id) {
             println!("\n[8] close — windowShouldClose: answers NO and queues CloseRequested");
             let before = self.close_requested;
@@ -722,6 +742,7 @@ mod macos {
         }
 
         /// The fullscreen state machine, entering; the exit is a pump later (see
+        /// [`Self::stage_fullscreen_exit`]).
         fn stage_fullscreen_enter(&mut self) {
             use aterm_window::window::Fullscreen;
             println!("\n[9] fullscreen — entering");
@@ -734,7 +755,7 @@ mod macos {
             );
         }
 
-        /// The fullscreen state machine, leaving. `set_fullscreen(None)` right after
+        /// The fullscreen state machine, leaving.
         fn stage_fullscreen_exit(&mut self) {
             println!("\n[10] fullscreen — leaving");
             let before = self.w().fullscreen().is_some();
@@ -756,7 +777,7 @@ mod macos {
             );
         }
 
-        /// `aterm_objc::weak` against the objects it exists for. `aterm-objc`'s
+        /// `aterm_objc::weak` against the objects it exists for.
         fn stage_weak_references(&mut self, delegate: Id, ns: Id) {
             println!(
                 "\n[11] weak references — objc_initWeak/loadWeak/storeWeak/copyWeak/destroyWeak"
@@ -844,6 +865,9 @@ mod macos {
         }
 
         /// The nil-on-dealloc half, and the memcpy hazard, against a standalone
+        /// `NSView`: AppKit holds references to the window's installed view, but a
+        /// free-standing `[[NSView alloc] initWithFrame:]` has exactly one owner, so
+        /// releasing it really runs `-dealloc`.
         fn stage_weak_dealloc(&mut self) {
             let observed = autoreleasepool(|_| {
                 // SAFETY: `+alloc` and `-initWithFrame:` return a +1 `NSView`.
@@ -915,6 +939,7 @@ mod macos {
         }
 
         /// The default application menu (`crates/aterm-window`'s `menu.rs`), read back
+        /// off `[NSApp mainMenu]`.
         fn stage_default_menu(&mut self) {
             println!("\n[12] default menu — winit's menu.rs, off [NSApp mainMenu]");
             let name = process_name();
@@ -1116,6 +1141,7 @@ mod macos {
         }
 
         /// The `-sendEvent:` swizzle (`crates/aterm-window`'s `app.rs`, through
+        /// `aterm_objc::swizzle`).
         fn stage_send_event_swizzle(&mut self) {
             println!("\n[14] -sendEvent: swizzle — winit's app.rs, off the runtime's own tables");
             // SAFETY: `+sharedApplication` is `@16#0:8`.

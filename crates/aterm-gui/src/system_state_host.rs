@@ -319,6 +319,31 @@ impl App {
         self.publish_system_state_with_notice(status, |app| app.present_system_state_indicator());
     }
 
+    /// The vault lines' press (`Intent::ReviewVaultSync`): System State opened or focused in
+    /// `wid`, its review preset where [`crate::system_state::SystemStateApp::preset_vault_sync`]
+    /// allows. A tab opened just now takes setup's last read first, so the preset lands on
+    /// this Mac's own plan and vault. The press is the person's own, so an offer it brings to
+    /// the front stops its countdown, as a click in it would.
+    pub(crate) fn review_vault_sync_in_window(&mut self, wid: crate::WindowId) -> bool {
+        if !self.open_system_state_tab_in_window(wid) {
+            return false;
+        }
+        self.interact_system_state(wid);
+        let unread = self
+            .native_runtime
+            .instance_by_kind(AppKind::SystemState)
+            .and_then(|instance| self.native_runtime.app(instance))
+            .is_some_and(|app| matches!(app, NativeApp::SystemState(state) if state.unread()));
+        if unread && self.system_state_host.latest_status.plan.is_some() {
+            self.publish_system_state(self.system_state_host.latest_status.clone());
+        }
+        if self.native_runtime.preset_system_state_vault_sync() {
+            self.refresh_system_state_tab_indicators();
+            self.request_redraw_all_windows();
+        }
+        true
+    }
+
     /// The non-modal attention surface: an existing System State tab's
     /// indicator. It never opens a dialog, steals focus, or blocks a
     /// window; with no such tab the notice stays deferred.
@@ -1111,6 +1136,238 @@ mod tests {
                 .value,
             crate::native_ui::SemanticValue::Bool(false)
         );
+    }
+
+    /// Setup's read of a Mac with the vault and repositories rows off, on its own vault.
+    fn vault_read() -> Plan {
+        use aterm_types::macos_setup::Setting;
+        let mut read = Plan::default();
+        read.selection.set(Setting::Secrets, false);
+        read.selection.set(Setting::Repositories, false);
+        read.vault_url = "https://vault.example/v1/team".into();
+        read
+    }
+
+    fn reviewed(app: &App) -> Plan {
+        let instance = app
+            .native_runtime
+            .instance_by_kind(AppKind::SystemState)
+            .unwrap();
+        let Some(NativeApp::SystemState(state)) = app.native_runtime.app(instance) else {
+            panic!("system state")
+        };
+        state.reviewed_plan()
+    }
+
+    /// What the press says when the review it opened shows the vault sync's rows, and when not.
+    const SET: &str = "Opened System State with the vault row on and the Mac settings rows off";
+    const CHECK: &str = "Opened System State; check its vault and Mac settings rows before Apply";
+
+    fn performed(feedback: &str) -> crate::native_app::MessageActOutcome {
+        crate::native_app::MessageActOutcome::Performed {
+            feedback: feedback.into(),
+        }
+    }
+
+    /// `plan` is [`vault_read`] set for the sync, and nothing was applied.
+    fn assert_synced(app: &mut App, plan: &Plan) {
+        use aterm_types::macos_setup::Setting;
+        for setting in Setting::ALL {
+            let on = !setting.is_workstation() && setting != Setting::Repositories;
+            assert_eq!(plan.selection.contains(setting), on, "{setting:?}");
+        }
+        assert_eq!(plan.vault_url, vault_read().vault_url);
+        assert!(
+            app.native_runtime.take_system_state_action().is_none()
+                && app.system_state_host.pending_apply.is_none(),
+            "never an Apply"
+        );
+    }
+
+    /// The failed join's digest line pressed from `wid`, as Settings ▸ Messages presses it.
+    fn press_vault_line(
+        app: &mut App,
+        wid: crate::WindowId,
+    ) -> crate::native_app::MessageActOutcome {
+        let entry = crate::secrets_join::failed_entry("the vault refused");
+        app.except(&entry);
+        let line = app
+            .messages
+            .digest()
+            .entries
+            .into_iter()
+            .find(|line| line.key == entry.key())
+            .unwrap();
+        assert_eq!(
+            line.actions.first(),
+            Some(&aterm_messages::Intent::ReviewVaultSync)
+        );
+        app.perform_message_act(wid, line.id.raw(), 0)
+    }
+
+    /// THE VAULT LINE'S PRESS OPENS SYSTEM STATE SET FOR THE SYNC, in the window it came
+    /// from: a tab opened just now takes setup's last read, then the vault row goes on and
+    /// the Mac settings rows off; the other rows and the vault field stay as read, nothing
+    /// is applied, and a later read leaves the preset alone.
+    #[test]
+    fn the_vault_lines_press_opens_system_state_set_for_the_sync_in_its_window() {
+        let mut app = App::headless_for_test();
+        let first = crate::WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
+        let second = app.detach_active_tab_logical().unwrap();
+        app.frontmost_window = Some(first);
+        let first_tab = app.windows[&first].tab_set.active_id();
+        app.publish_system_state(SetupStatus {
+            plan: Some(vault_read()),
+            ..SetupStatus::default()
+        });
+        assert_eq!(
+            app.native_runtime.instance_by_kind(AppKind::SystemState),
+            None
+        );
+
+        assert_eq!(press_vault_line(&mut app, second), performed(SET));
+        let (instance, _) = app.active_native_view(second).unwrap();
+        assert_eq!(
+            app.native_runtime.app(instance).map(NativeApp::kind),
+            Some(AppKind::SystemState)
+        );
+        assert_eq!(app.windows[&first].tab_set.active_id(), first_tab);
+        let plan = reviewed(&app);
+        assert_synced(&mut app, &plan);
+        assert_eq!(press_vault_line(&mut app, second), performed(SET), "again");
+        app.publish_system_state(SetupStatus {
+            plan: Some(vault_read()),
+            ..SetupStatus::default()
+        });
+        assert_eq!(reviewed(&app), plan, "a later read keeps the preset");
+    }
+
+    /// THE PRESS NEVER ANSWERS THE LINE: the button is a navigation beside the step, so the
+    /// line stays in the digest after it, and raised again it is not held back as answered.
+    #[test]
+    fn the_vault_lines_press_leaves_the_line_up() {
+        let mut app = App::headless_for_test();
+        let entry = crate::secrets_join::failed_entry("the vault refused");
+        let up = |app: &App| {
+            app.messages
+                .digest()
+                .entries
+                .iter()
+                .any(|line| line.key == entry.key())
+        };
+        let _ = press_vault_line(&mut app, crate::WindowId(0));
+        assert!(up(&app), "pressed");
+        app.except(&entry);
+        assert!(up(&app), "raised again");
+    }
+
+    /// A PRESS BEFORE SETUP'S FIRST READ PRESETS THAT READ: the tab waits for it (a preset
+    /// would hold the default vault against it) and says to check the rows, and the read lands
+    /// set for the sync over this Mac's own plan and vault.
+    #[test]
+    fn the_vault_lines_press_before_setups_first_read_presets_that_read() {
+        let mut app = App::headless_for_test();
+        assert_eq!(
+            press_vault_line(&mut app, crate::WindowId(0)),
+            performed(CHECK)
+        );
+        assert_eq!(reviewed(&app), Plan::default(), "no read yet");
+        app.publish_system_state(SetupStatus {
+            plan: Some(vault_read()),
+            ..SetupStatus::default()
+        });
+        let plan = reviewed(&app);
+        assert_synced(&mut app, &plan);
+    }
+
+    /// A REVIEW THE PERSON EDITED IS ONLY SHOWN: the press brings System State to the front
+    /// with their rows, vault and password as they left them, and says to check the rows.
+    #[test]
+    fn the_vault_lines_press_only_shows_an_edited_review() {
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let window = app.windows.get_mut(&wid).unwrap();
+        window.rows = 90;
+        window.cols = 160;
+        assert!(app.open_system_state_tab());
+        let review = app.active_native_view(wid).unwrap();
+        app.publish_system_state(SetupStatus {
+            plan: Some(vault_read()),
+            ..SetupStatus::default()
+        });
+        edit_review(&mut app, wid, review.1, "http://reviewed.local/v1/team");
+        let edited = reviewed(&app);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
+        assert_ne!(app.active_native_view(wid), Some(review));
+
+        assert_eq!(press_vault_line(&mut app, wid), performed(CHECK));
+        assert_eq!(app.active_native_view(wid), Some(review));
+        assert_eq!(reviewed(&app), edited);
+        assert_review(
+            &mut app,
+            wid,
+            review.1,
+            "http://reviewed.local/v1/team",
+            false,
+        );
+    }
+
+    /// A REVIEW A RUN OR AN OFFER HOLDS IS ONLY SHOWN: setup's own pass, an Apply awaiting
+    /// its receipt and a first-run offer each keep the plan they hold, the press says to check
+    /// the rows, and the offer it brings to the front waits for the person instead of applying
+    /// itself when its countdown would end.
+    #[test]
+    fn the_vault_lines_press_changes_nothing_held_by_a_run_or_an_offer() {
+        let read = || SetupStatus {
+            plan: Some(vault_read()),
+            ..SetupStatus::default()
+        };
+        let wid = crate::WindowId(0);
+        let mut app = App::headless_for_test();
+        assert!(app.open_system_state_tab());
+        app.publish_system_state(read());
+        app.publish_system_state(SetupStatus {
+            busy: true,
+            ..read()
+        });
+        assert_eq!(press_vault_line(&mut app, wid), performed(CHECK));
+        assert_eq!(reviewed(&app), vault_read(), "setup's own pass");
+
+        let mut app = App::headless_for_test();
+        assert!(app.open_system_state_tab());
+        let (_, view) = app.active_native_view(wid).unwrap();
+        app.publish_system_state(read());
+        let _receipt = queue_review(&mut app, wid, view);
+        assert!(app.system_state_host.pending_apply.is_some());
+        assert_eq!(press_vault_line(&mut app, wid), performed(CHECK));
+        assert_eq!(
+            reviewed(&app),
+            vault_read(),
+            "an Apply awaiting its receipt"
+        );
+
+        let mut app = App::headless_for_test();
+        assert!(app.open_system_state_tab());
+        let (send, _receive) = mpsc::channel();
+        let request = Request::new(vault_read(), send);
+        app.attach_system_state_offer(request.clone());
+        app.publish_system_state(SetupStatus {
+            plan: Some(Plan::default()),
+            ..SetupStatus::default()
+        });
+        let start = Instant::now();
+        app.native_runtime.tick_system_state(start, true);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
+        assert_eq!(press_vault_line(&mut app, wid), performed(CHECK));
+        assert_eq!(reviewed(&app), vault_read(), "a first-run offer");
+        app.native_runtime
+            .tick_system_state(start + Duration::from_secs(31), true);
+        assert!(
+            app.native_runtime.take_system_state_action().is_none(),
+            "the offer waits for the person"
+        );
+        assert!(request.pending());
     }
 
     #[test]

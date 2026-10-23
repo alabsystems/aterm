@@ -11,16 +11,21 @@ use crate::runtime::{Id, Obj};
 #[link(name = "objc")]
 unsafe extern "C" {
     /// `id objc_initWeak(id *location, id value)` — register `location` in
+    /// `value`'s weak table and store `value` through it.
     fn objc_initWeak(location: *mut Id, value: Id) -> Id;
     /// `id objc_loadWeakRetained(id *location)` — the object at +1, or nil,
+    /// retained under the runtime's weak lock.
     fn objc_loadWeakRetained(location: *mut Id) -> Id;
     /// `id objc_loadWeak(id *location)` — the object autoreleased (+0), or nil.
     fn objc_loadWeak(location: *mut Id) -> Id;
     /// `id objc_storeWeak(id *location, id value)` — re-point an initialised
+    /// slot: unregister it from its old target, register it with `value`.
     fn objc_storeWeak(location: *mut Id, value: Id) -> Id;
     /// `void objc_destroyWeak(id *location)` — unregister an initialised slot,
+    /// leaving it uninitialised.
     fn objc_destroyWeak(location: *mut Id);
     /// `void objc_copyWeak(id *to, id *from)` — register `to` at whatever
+    /// `from` names.
     fn objc_copyWeak(to: *mut Id, from: *mut Id);
 }
 
@@ -192,6 +197,7 @@ impl WeakObj {
 
 impl Drop for WeakObj {
     /// Unregisters the address before the `Box` frees it; otherwise the runtime
+    /// would write `nil` into freed memory when the target deallocates.
     fn drop(&mut self) {
         // SAFETY: the slot was initialised by every constructor of this type and is destroyed exactly once, here, before the `Box` is freed.
         unsafe { self.slot.destroy() };

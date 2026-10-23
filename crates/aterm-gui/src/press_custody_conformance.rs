@@ -38,8 +38,10 @@ pub(crate) fn project_press_custody(term: &Terminal) -> [i64; 3] {
 }
 
 /// One fixture's running abstract state: the observed projection plus the trace
+/// bookkeeping the model's shadow variables need.
 struct Press {
     /// `(prev_owner, prev_offset, prev_selection)` — the harness's own projection of
+    /// the pre-state, re-read from the real terminal at every step.
     shadow: (i64, i64, i64),
     /// The tag of the transition the engine last recorded.
     last_event: i64,
@@ -68,6 +70,7 @@ impl Press {
     }
 
     /// Record what the step just fired: the model writes the pre-state into the
+    /// `prev_*` shadows and stamps `last_event` from the recorded transition.
     fn fired(&mut self, prev: [i64; 7], recorded: CustodyTransition) {
         self.shadow = (prev[0], prev[1], prev[2]);
         self.last_event = recorded.last_event();
@@ -107,6 +110,7 @@ fn validate_transition(action: &str, prev: [i64; 7], next: [i64; 7]) -> (bool, S
 }
 
 /// Clear the custody record so the step that follows must write one (claim 1): a seam
+/// that stopped recording cannot pass on the previous step's tag.
 fn arm(term: &Arc<Mutex<Terminal>>) {
     let _ = term_lock(term).take_custody_transition();
 }
@@ -159,6 +163,7 @@ fn step(
 }
 
 /// A terminal with `history` scrollback lines fed through `Terminal::process`, and the
+/// viewport at live.
 fn engine_fixture(rows: u16, history: usize) -> Terminal {
     let mut term = Terminal::new(rows, 20);
     term.set_scrollback_line_limit(Some(history + 8));
@@ -178,6 +183,7 @@ fn engine_fixture(rows: u16, history: usize) -> Terminal {
 }
 
 /// Arm a completed selection over live-screen rows `first..=last`, in the coordinates
+/// `App::begin_selection` computes (viewport row minus `display_offset`).
 fn arm_selection(term: &mut Terminal, first: i32, last: i32) {
     let sel = term.text_selection_mut();
     sel.start_selection(first, 0, SelectionSide::Left, SelectionType::Simple);
@@ -187,6 +193,7 @@ fn arm_selection(term: &mut Terminal, first: i32, last: i32) {
 }
 
 /// `OutputDamagesTheSelectedRows`: one batch that both replaces the rows the selection
+/// sits on and scrolls a line in, driven from both ownerships.
 fn damaged_rows_case(validated: &mut usize, ev: &mut StepEvidence) {
     const DAMAGE: &[u8] = b"\x1b[1;1H\x1b[Knew text\x1b[6;1H\r\n";
 
@@ -322,7 +329,7 @@ fn in_place_and_unattributed_takes(validated: &mut usize, ev: &mut StepEvidence)
     }
 }
 
-/// Back toward live without typing. A one-row scroll down that stops short of the tail
+/// Back toward live without typing.
 fn toward_live_seams(validated: &mut usize, ev: &mut StepEvidence) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -420,6 +427,8 @@ fn toward_live_seams(validated: &mut usize, ev: &mut StepEvidence) {
 }
 
 /// The GUI half: one real `App` and terminal, nine validated transitions through the
+/// real scroll, gesture and press seams (the downward gestures are in
+/// [`toward_live_seams`]).
 fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -598,6 +607,7 @@ fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
 }
 
 /// Seams that bring a selection into existence with no drag around them: Select All (a
+/// menu command) and a double-click's press.
 fn silent_select_seams(validated: &mut usize, ev: &mut StepEvidence) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -649,7 +659,7 @@ fn silent_select_seams(validated: &mut usize, ev: &mut StepEvidence) {
     );
 }
 
-/// The wheel, driven through both of `input_wheel`'s motion routes. The recorder lives
+/// The wheel, driven through both of `input_wheel`'s motion routes.
 fn wheel_seams(validated: &mut usize, ev: &mut StepEvidence) {
     for (focused, what) in [
         (
@@ -718,6 +728,7 @@ fn wheel_seams(validated: &mut usize, ev: &mut StepEvidence) {
 }
 
 /// The output half: real `Terminal::process` batches, each on its own fixture so the
+/// bounded offset never has to saturate.
 fn output_batches(validated: &mut usize, ev: &mut StepEvidence) {
     {
         let term = Arc::new(Mutex::new(engine_fixture(6, 4)));

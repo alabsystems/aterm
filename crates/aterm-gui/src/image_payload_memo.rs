@@ -1,39 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE IMAGE PAYLOAD MEMO: the base64 of an inline image is encoded once per
-//! image, not once per frame that shows it.
-//!
-//! The styled frame (`screen`, `subscribe … cells`) and `image read` carry
-//! every on-screen image's bytes as base64, up to about 5.6 MB an image under
-//! the F4 cap ([`MAX_IMAGE_PAYLOAD_BYTES`]). An [`ImageData`] is immutable once
-//! placed and shared by `Arc`, so its encoding is a function of its identity.
-//! A frame change that left a picture in place used to encode it again.
-//!
-//! KEYED BY IDENTITY, PINNED BY A `Weak`. An entry is keyed by
-//! [`Arc::as_ptr`] and holds a `Weak` of the image. The `Weak` keeps the
-//! allocation, and so the address, from being reused by another image while
-//! the entry lives, without keeping the bytes alive. A reader holds the image
-//! it asks about, so a key match is that image (the renderer's `ImageCache`
-//! pins the same way). An image that has been freed leaves the memo at the
-//! next batch.
-//!
-//! RETENTION. The memo is bounded by bytes ([`MEMO_BYTES`]). A batch is one
-//! frame's images, or one `image read`'s. The entries a batch uses are never
-//! evicted while it runs: room for a new entry comes from entries no batch has
-//! used since this one began, least recently used first, and a payload that
-//! would not fit even with all of those gone is served without being kept,
-//! evicting nothing. A frame visits its images in one order every time, so a
-//! frame with more images than fit keeps the ones it reaches first and encodes
-//! only the rest. Evicting least-recently-used entries regardless would evict
-//! each image before the next frame reused it, and the memo would never hit.
-//! A payload over the F4 cap is never kept: it is `truncated` and costs
-//! nothing to produce. Dropped entries are freed with the memo's lock
-//! released.
-//!
-//! NOT A FIELD OF `ImageData`. A `OnceLock` there would keep the base64 for
-//! the image's whole life, scrollback included, outside every image budget,
-//! and would put this control-wire encoding into the vocabulary crate.
+//! Bounded process-wide memo for base64-encoded inline image wire payloads.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
@@ -53,15 +21,12 @@ const ENTRY_BYTES: usize = std::mem::size_of::<(usize, Entry)>();
 
 static MEMO: LazyLock<PayloadMemo> = LazyLock::new(|| PayloadMemo::with_budget(MEMO_BYTES));
 
-/// The wire payload of each of `images`, in order, through the process's
-/// memo. `images` are distinct, as `distinct_images` and `image read` collect
-/// them.
+/// Returns the wire payloads for `images` in order, served from or added to the process memo.
 pub(crate) fn image_payloads(images: &[&Arc<ImageData>]) -> Vec<ImagePayload> {
     MEMO.payloads_of(images)
 }
 
-/// One image's wire payload: its format word and the base64 of its bytes, or
-/// `truncated` and no payload past the F4 cap. A clone shares the base64.
+/// Wire payload for an inline image: format name and optional base64 data.
 #[derive(Clone, Debug)]
 pub(crate) struct ImagePayload {
     format: &'static str,
@@ -89,9 +54,6 @@ impl ImagePayload {
         }
         #[cfg(test)]
         crate::work_counts::image_encoded();
-        // `base64::encode` fails only above `aterm_codec::MAX_INPUT_LEN` (64
-        // MiB), past the cap checked above. Were it to fail, the image is
-        // reported like the cap path rather than panicking.
         match aterm_codec::base64::encode(&img.bytes) {
             Ok(b64) => ImagePayload {
                 format,
@@ -204,7 +166,6 @@ impl PayloadMemo {
             }
             number
         };
-        // Dropped entries' base64 is freed with the lock released.
         drop(freed);
         Batch {
             number,
@@ -301,9 +262,6 @@ impl Entries {
     ) {
         let key = key(img);
         if let Some(entry) = self.by_image.get_mut(&key) {
-            // A concurrent batch encoded it first. An older batch's entry may
-            // be in this batch's eviction order; this batch uses it now, so it
-            // leaves that order and its charge leaves the order's bytes.
             if entry.used < batch
                 && let Some(evictable) = evictable
                 && let Some(at) = evictable.order.iter().position(|&(_, k)| k == key)
@@ -318,7 +276,6 @@ impl Entries {
         if self.bytes + charge > budget {
             let evictable = evictable.get_or_insert_with(|| self.evictable_by(batch));
             if self.bytes.saturating_sub(evictable.bytes) + charge > budget {
-                // Evicting every older entry would still leave no room.
                 return;
             }
             while self.bytes + charge > budget {
@@ -454,15 +411,12 @@ mod tests {
             assert!(memo.charged_bytes() <= budget, "within the budget");
         }
 
-        // A payload that cannot fit even with every older entry gone evicts
-        // nothing.
         let big = image(7, 2 * len);
         memo.payloads_of(&[&images[0], &big]);
         assert_eq!(take_images_encoded(), 1);
         assert!(memo.holds_entry(&images[1]), "the older entry stays");
         assert!(!memo.holds_entry(&big), "and the big payload is not kept");
 
-        // A frame of new images takes the room the old frame no longer uses.
         let next = [image(4, len), image(5, len)];
         let next_refs: Vec<&Arc<ImageData>> = next.iter().collect();
         memo.payloads_of(&next_refs);

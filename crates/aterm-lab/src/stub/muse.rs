@@ -1,38 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The stub's Meta model API, as Muse Code (Meta's `muse`, measured on
-//! 1.4.10-R6427.1) speaks it once `--base-url http://127.0.0.1:<port>` names
-//! the stub and `META_API_KEY` holds the lab's fixed fake key (the Codex
-//! provider's, [`super::LAB_CODEX_KEY`], sent as a bearer token and logged as
-//! `auth=key`).
-//!
-//! Routes: `GET /muse-code/models`, the catalog ([`catalog`]: one model,
-//! [`MODEL`], whose `metadata` is keyed `muse-code`; a model without that
-//! key is dropped, and an empty catalog stops the TUI with `model catalog
-//! has no visible models`), answered in every mode; and `POST /responses`,
-//! the OpenAI Responses API with `stream: true`. Its tools come as ONE
-//! `{"type": "namespace", "name": "muse", "tools": […]}` entry (`bash`,
-//! `write_file`, `edit_file`, `request_user_input`, …), and a call answers
-//! with the bare name and `"namespace": "muse"`; the tool's result comes
-//! back as a `function_call_output` input item of the next request.
-//!
-//! The stream (`Sse`): every event carries its `sequence_number`; it opens
-//! with `response.created` and `response.in_progress`, announces, fills and
-//! closes each item (`output_item.added`, `content_part.added`,
-//! `output_text.delta` × N, `output_text.done`, `content_part.done`,
-//! `output_item.done`; a call's `function_call_arguments.delta` and `.done`),
-//! and ends with `response.completed`, which lists the items and the usage.
-//!
-//! Who asks (the `x-tbh-agent-role` header): `main` is the turn, answered by
-//! the lab's modes as a Codex request is (`Stub::responses`, `kind=muse`);
-//! `tool` there calls the script's tools ([`tool_turn`]) and answers the last
-//! result with `Tool call done. Result: <its output>` ([`last_tool_output`]).
-//! Every other role is a SIDE call (`kind=muse-side`), answered in every mode
-//! so a wall and a custom mode's `times` are spent on the turn alone
-//! ([`side_answer`]): a `reminder:*` agent gets its one strict tool,
-//! `submit_reminder_decision` with `decision: "none"`; `prompt-hint` the text
-//! `NONE` (it asks for a tip's id or `NONE`); any other role the text `ok`.
+//! Stub Meta model API (`/muse-code/models` and `/responses`) for Muse Code lab runs.
 
 use std::io;
 use std::time::Duration;
@@ -42,12 +11,10 @@ use super::{call_input, call_name, closed, est_tokens, item_text, rand_hex, scri
 use crate::pyjson::{COMPACT, J};
 use crate::util::one_line;
 
-/// The one model the stub's catalog names: the TUI's footer shows it.
+/// Model identifier advertised by the stub catalog.
 pub const MODEL: &str = "lab-stub";
 
-/// The catalog `GET /muse-code/models` answers: an OpenAI-style list of one
-/// model whose `metadata` is keyed `muse-code` (Muse Code's own wire shape;
-/// its `ModelCatalogResponse` is the cache it keeps, not what it reads).
+/// Returns the `GET /muse-code/models` catalog payload.
 #[must_use]
 pub fn catalog() -> J {
     let strs = |v: &[&str]| J::Arr(v.iter().map(|s| J::s(*s)).collect());
@@ -85,8 +52,7 @@ pub fn catalog() -> J {
     ])
 }
 
-/// The log's `kind=` of a Muse Code turn, from what [`analyse_responses`]
-/// read: `muse`, `muse-json` (a structured side request), or `opaque`.
+/// Classifies a Muse Code request's `RInfo` into `muse`, `muse-json`, or `opaque`.
 #[must_use]
 pub fn kind_of(info: &RInfo) -> &'static str {
     match info.kind {
@@ -96,8 +62,7 @@ pub fn kind_of(info: &RInfo) -> &'static str {
     }
 }
 
-/// The names of the tools a request offers, a namespace's inner tools by
-/// their bare names (`bash`, `submit_reminder_decision`).
+/// Extracts bare tool names offered in a Responses request body.
 #[must_use]
 pub fn tool_names(body: &[u8]) -> Vec<String> {
     let Ok(j) = J::parse_bytes(body) else {
@@ -138,12 +103,7 @@ fn is_result(it: &J) -> bool {
     )
 }
 
-/// What the `tool` mode answers a Muse Code turn: the script's next call,
-/// done once the last call's result is in, or `None` when no person's
-/// message holding `toolstart` was sent. The step is the number of results
-/// after the last such message, read off the request (Muse Code sends the
-/// whole conversation each time), so the stub keeps no state. A call with a
-/// `when` (a Claude Code subagent's) has no Muse Code counterpart and is skipped.
+/// Computes the next scripted [`ToolTurn`] for a Muse Code `tool`-mode request.
 #[must_use]
 pub fn tool_turn(body: &[u8], script: &J) -> Option<ToolTurn> {
     let j = J::parse_bytes(body).ok()?;
@@ -167,11 +127,7 @@ pub fn tool_turn(body: &[u8], script: &J) -> Option<ToolTurn> {
     })
 }
 
-/// Whether a Responses request's conversation carries a tool's result back:
-/// a result item anywhere in its input — after its last person's message, or
-/// before one (the next prompt, a retry's error turn after an empty reply) —
-/// so a scripted call is made once a conversation
-/// ([`super::scripted_call`]), never again at each retry.
+/// Returns whether a Responses request body contains any `function_call_output` item.
 #[must_use]
 pub fn results_answered(body: &[u8]) -> bool {
     let Ok(j) = J::parse_bytes(body) else {
@@ -184,8 +140,7 @@ pub fn results_answered(body: &[u8]) -> bool {
         .any(is_result)
 }
 
-/// The last tool result a request carries, on one line (at most 200
-/// characters): what the person's answer to a box came back as.
+/// Extracts the last `function_call_output` text from `body` (single line, up to 200 chars).
 #[must_use]
 pub fn last_tool_output(body: &[u8]) -> Option<String> {
     let j = J::parse_bytes(body).ok()?;
@@ -199,7 +154,7 @@ pub fn last_tool_output(body: &[u8]) -> Option<String> {
     Some(one_line(&text, 200))
 }
 
-/// How a side call is answered ([module docs](self)).
+/// Canned response for a non-`main` side call.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Side {
     /// A text reply.
@@ -208,7 +163,7 @@ pub enum Side {
     Call(&'static str, J),
 }
 
-/// The answer to a side call of `role` that offers `tools`.
+/// Returns the canned [`Side`] response for a side call of `role` offering `tools`.
 #[must_use]
 pub fn side_answer(role: &str, tools: &[String]) -> Side {
     if role == "prompt-hint" {
@@ -231,8 +186,7 @@ pub fn side_answer(role: &str, tools: &[String]) -> Side {
     Side::Text("ok")
 }
 
-/// The `x-tbh-agent-role` of a request, as the log may carry it (letters,
-/// digits, `:`, `_`, `-`; at most 40), `main` when it names none.
+/// Normalizes the `x-tbh-agent-role` header value (defaulting to `"main"`).
 #[must_use]
 pub fn role_of(header: Option<&str>) -> String {
     let r: String = header
@@ -312,7 +266,6 @@ impl Sse {
     }
 
     /// `response.created` and `response.in_progress`.
-    ///
     /// # Errors
     /// The client went away.
     fn start(&mut self, out: &mut Out<'_>) -> io::Result<()> {
@@ -324,7 +277,6 @@ impl Sse {
     }
 
     /// One `final_answer` message item streamed as `deltas`, `pace` seconds apart.
-    ///
     /// # Errors
     /// The client went away.
     fn text(&mut self, out: &mut Out<'_>, deltas: &[String], pace: f64) -> io::Result<()> {
@@ -401,7 +353,6 @@ impl Sse {
     }
 
     /// One `function_call` item: the tool's bare `name` in the `muse` namespace, its arguments `args`.
-    ///
     /// # Errors
     /// The client went away.
     fn call(&mut self, out: &mut Out<'_>, name: &str, args: &J) -> io::Result<()> {
@@ -457,7 +408,6 @@ impl Sse {
     }
 
     /// `response.completed` with the usage, and the end of the stream.
-    ///
     /// # Errors
     /// The client went away.
     fn finish(&mut self, out: &mut Out<'_>, in_tok: i64, out_tok: i64) -> io::Result<()> {
@@ -467,7 +417,6 @@ impl Sse {
     }
 
     /// `response.failed` with `code`, and the end of the stream.
-    ///
     /// # Errors
     /// The client went away.
     fn failed(&mut self, out: &mut Out<'_>, code: &str, message: &str) -> io::Result<()> {
@@ -479,9 +428,7 @@ impl Sse {
 }
 
 impl Stub {
-    /// `POST /responses`: a turn (`x-tbh-agent-role: main`, or none) is
-    /// answered by the lab's modes ([`Stub::responses`] in Muse Code's
-    /// dialect), any other role as a side call in every mode ([`side_answer`]).
+    /// Handles `POST /responses` for Muse Code main and side calls.
     pub(super) fn muse(
         &self,
         method: &str,
@@ -542,7 +489,7 @@ impl Stub {
         Ok(())
     }
 
-    /// `GET /muse-code/models`: the [`catalog`], in every mode.
+    /// Handles `GET /muse-code/models`.
     pub(super) fn muse_models(
         &self,
         method: &str,
@@ -557,7 +504,7 @@ impl Stub {
         Ok(())
     }
 
-    /// A text reply in Muse Code's stream (the turn's answer, `ok`, `slow`, a custom mode's text).
+    /// Streams a text reply in Muse Code's Responses SSE format.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn muse_text(
         &self,
@@ -596,7 +543,7 @@ impl Stub {
         Ok(())
     }
 
-    /// The `tool` mode's call in Muse Code's stream.
+    /// Streams a `tool`-mode function call in Muse Code's Responses SSE format.
     pub(super) fn muse_call(
         &self,
         (method, path, blen, mode): (&str, &str, usize, &str),
@@ -622,7 +569,7 @@ impl Stub {
         Ok(())
     }
 
-    /// A `response.failed` with `code` in Muse Code's stream.
+    /// Streams a `response.failed` event in Muse Code's Responses SSE format.
     pub(super) fn muse_failed(
         &self,
         (method, path, blen, mode): (&str, &str, usize, &str),

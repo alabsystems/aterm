@@ -2,11 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Deterministic, non-web Markdown document model for native tab views.
-//!
-//! This is intentionally a document AST and navigation layer, not HTML. Every block and
-//! link retains a UTF-8 source range so outline, preview, source editor, accessibility,
-//! and restore all speak the same coordinates. Rendering lowers these nodes through the
-//! native semantic UI tree.
 
 use std::{borrow::Cow, ops::Range};
 
@@ -16,25 +11,14 @@ pub struct MarkdownDocument {
     pub outline: Vec<HeadingRef>,
     pub links: Vec<MarkdownLink>,
     pub images: Vec<MarkdownImage>,
-    /// Ordered semantic inline annotations. Unlike the block presentation text,
-    /// these retain both the complete authored syntax range and the inner
-    /// content range, making source navigation stable across reflow and theme
-    /// changes without retaining an HTML tree.
+    /// Ordered semantic inline annotations.
     pub inline_runs: Vec<MarkdownInlineRun>,
-    /// Styled spans of each PROSE block's display text (heading, paragraph, list
-    /// item, quote), keyed by block index: disjoint byte ranges in that block's
-    /// `text`, in order, produced by the same lowering pass that produced the
-    /// text ([`lower_inline_text_styled`]) — so a span can never land on the
-    /// wrong occurrence of a repeated word. Paint-only; see [`Self::block_styles`].
+    /// Styled spans of each prose block's display text (heading, paragraph, list item, quote).
     block_styles: std::collections::BTreeMap<usize, Vec<(Range<usize>, InlineStyle)>>,
     anchors: std::collections::BTreeMap<String, usize>,
-    /// Exact UTF-8 byte length of the canonical source used to build this
-    /// projection. Reader selection remains source-addressed even though block
-    /// text is lowered into a presentation-friendly form.
+    /// Exact UTF-8 byte length of the canonical source used to build this projection.
     pub source_len: usize,
-    /// Canonical UTF-8 byte offset of every physical source line.  Source-mode
-    /// navigation uses this parsed projection instead of retaining a second
-    /// copy of the document or asking paint to inspect host-owned bytes.
+    /// Canonical UTF-8 byte offset of every physical source line.
     pub source_line_starts: Vec<usize>,
 }
 
@@ -118,11 +102,9 @@ pub struct MarkdownImage {
 pub struct MarkdownInlineRun {
     pub kind: MarkdownInlineKind,
     pub text: String,
-    /// Complete authored syntax, including delimiters/destination where one
-    /// exists. This is the range selected by an inline-object action.
+    /// Complete authored syntax, including delimiters/destination where one exists.
     pub source: Range<usize>,
-    /// Source bytes that produced the visible text. Consumers use this smaller
-    /// range for caret/source-map projection.
+    /// Source bytes that produced the visible text.
     pub content_source: Range<usize>,
 }
 
@@ -166,9 +148,7 @@ pub enum MarkdownImageAction {
     Denied { message: &'static str },
 }
 
-/// Pure image-policy reducer. It has no ambient filesystem/network authority:
-/// a relative local image becomes a source-selection action, while a bounded
-/// HTTP(S) image may leave the process only after the activating user gesture.
+/// Pure image-policy reducer.
 pub fn reduce_image_action(image: &MarkdownImage, user_initiated: bool) -> MarkdownImageAction {
     if image.remote {
         let safe = image.source_uri.len() <= 2_048
@@ -208,9 +188,7 @@ pub fn reduce_image_action(image: &MarkdownImage, user_initiated: bool) -> Markd
     }
 }
 
-/// One exact, renderer-independent reading position. `source_anchor` identifies
-/// the canonical block/source line while `visual_row` retains progress through
-/// a block that wraps to more than one viewport row.
+/// One exact, renderer-independent reading position.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MarkdownLocation {
     pub source_anchor: usize,
@@ -227,8 +205,7 @@ impl MarkdownLocation {
     }
 }
 
-/// Per-view history. Entries are source/visual-row anchors rather than pixel
-/// offsets, so reparse and resize retain meaning.
+/// Per-view history.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarkdownHistory {
     entries: Vec<MarkdownLocation>,
@@ -316,9 +293,6 @@ impl MarkdownHistory {
 }
 
 pub fn parse(source: &str) -> MarkdownDocument {
-    // Comments are presentation metadata, not reader content. The masked
-    // projection has exactly the same byte length as `source`, so every block,
-    // link, selection, and history coordinate remains a canonical source byte.
     let presentation_source = mask_html_comments(source);
     let display_source = presentation_source.as_ref();
     let lines = source_lines(display_source);
@@ -575,9 +549,6 @@ pub fn semantic_text(document: &MarkdownDocument) -> String {
 }
 
 /// Build the bounded semantic reading projection and its stable source map.
-/// Block segments guarantee total coverage; nested inline segments refine the
-/// exact authored range for styled/link/image content without invalidating the
-/// coarser mapping used by assistive technology.
 #[cfg(any(test, debug_assertions))]
 pub fn semantic_projection(document: &MarkdownDocument) -> MarkdownSemanticProjection {
     let mut out = String::new();
@@ -639,8 +610,7 @@ pub fn semantic_projection(document: &MarkdownDocument) -> MarkdownSemanticProje
     }
 }
 
-/// How one span of a block's DISPLAY text is styled — the flattened union of the
-/// inline runs that cover it (a `***strong emphasis***` span is both).
+/// How one span of a block's display text is styled.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct InlineStyle {
     pub strong: bool,
@@ -669,11 +639,7 @@ impl InlineStyle {
 }
 
 impl MarkdownDocument {
-    /// The styled spans of block `index`'s display text, clipped to its first
-    /// `len` bytes — the part of the painter's bounded copy that is the block's
-    /// own text (`native_app::bounded_markdown_block_paint`), never the `…` a cut
-    /// appends — empty for a block with no inline markup and for code, tables and
-    /// rules.
+    /// The styled spans of block `index`'s display text, clipped to its first `len` bytes.
     pub fn block_styles(&self, index: usize, len: usize) -> Vec<(Range<usize>, InlineStyle)> {
         self.block_styles
             .get(&index)
@@ -709,9 +675,7 @@ pub fn block_at_source(document: &MarkdownDocument, source_offset: usize) -> Opt
         .checked_sub(1)
 }
 
-/// Heading owning the current source anchor. This is O(log n) and is shared by
-/// the wide outline, compact status, and command projection so they cannot
-/// disagree about the active section.
+/// Heading owning the current source anchor.
 #[inline]
 pub fn heading_at_source(document: &MarkdownDocument, source_offset: usize) -> Option<usize> {
     let next = document
@@ -720,8 +684,7 @@ pub fn heading_at_source(document: &MarkdownDocument, source_offset: usize) -> O
     next.checked_sub(1)
 }
 
-/// Resolve a parsed local `#anchor` without interpreting a path or touching the
-/// filesystem. Heading ids are parser-owned and deterministic.
+/// Resolve a parsed local `#anchor` without interpreting a path or touching the filesystem.
 #[inline]
 pub fn local_anchor(document: &MarkdownDocument, destination: &str) -> Option<usize> {
     let id = destination.strip_prefix('#')?;
@@ -731,9 +694,7 @@ pub fn local_anchor(document: &MarkdownDocument, destination: &str) -> Option<us
     document.anchors.get(id).copied()
 }
 
-/// Produce a bounded, active-centered outline window. Building a frame or
-/// command palette is therefore independent of an adversarial document's total
-/// heading count.
+/// Produce a bounded, active-centered outline window.
 pub fn outline_window(
     document: &MarkdownDocument,
     source_anchor: usize,
@@ -761,13 +722,10 @@ pub struct VisibleBlock {
     pub total_visual_rows: usize,
 }
 
-/// Exterior rhythm between reader cards/runs. The estimator already reserves
-/// at least this much trailing space per block; the app shell moves that slice
-/// outside the painted rect, so scroll geometry and total height stay exact.
+/// Exterior rhythm between reader cards/runs.
 pub const VISUAL_BLOCK_GAP: f32 = 4.0;
 
-/// Bounded block layout around a stable source anchor. `total_height` is an estimate
-/// suitable for a scrollbar; navigation/restoration continues to use source offsets.
+/// Bounded block layout around a stable source anchor.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct VirtualBlockLayout {
     pub blocks: Vec<VisibleBlock>,
@@ -784,8 +742,6 @@ pub struct MarkdownSourceWindow {
 }
 
 /// Source-reader window whose first row is the exact requested source line.
-/// Because the window starts on that line, repeated page moves make monotonic
-/// progress through even a single enormous fenced block.
 pub fn source_window_from_anchor(
     source: &str,
     anchor: usize,
@@ -817,9 +773,7 @@ pub fn source_window_from_anchor(
     }
 }
 
-/// Lay out only the viewport plus a bounded lookahead. Work is proportional to the
-/// visible block count, not total document length. The anchor block begins at y=0;
-/// callers keep a small per-view intra-block offset for smooth scrolling.
+/// Lay out only the viewport plus a bounded lookahead.
 pub fn layout_visible_blocks(
     document: &MarkdownDocument,
     source_anchor: usize,
@@ -834,12 +788,6 @@ pub fn layout_visible_blocks(
     let sample_start = anchor_index.saturating_sub(32);
     let sample_end = sample_start.saturating_add(64).min(document.blocks.len());
     let sample = &document.blocks[sample_start..sample_end];
-    // Measuring a block is O(its text) — the estimator decodes up to 128 KiB of
-    // chars per call — and the mean sample straddles the anchor, so it measures
-    // exactly the blocks the visible loop below is about to measure again.
-    // Retain the sample's heights instead of discarding them: the estimator is
-    // a pure function of (block, width) and the width is fixed for this call,
-    // so a retained height is bit-identical to the recomputed one.
     let sample_heights = sample
         .iter()
         .map(|block| estimated_block_height(block, viewport_width))
@@ -864,8 +812,6 @@ pub fn layout_visible_blocks(
     for (index, block) in document.blocks.iter().enumerate().skip(start) {
         let row = if index == anchor_index { visual_row } else { 0 };
         let full_height = measured_height(index, block);
-        // The row count is derived from the height this block already has, so
-        // the block's text is decoded once per layout rather than twice.
         let total_visual_rows = block_visual_rows_for_height(block, full_height);
         let skipped = row as f32 * block_visual_row_height(block);
         let height = (full_height - skipped).max(VISUAL_BLOCK_GAP + 1.0);
@@ -889,17 +835,13 @@ pub fn layout_visible_blocks(
     }
 }
 
-/// Number of reader rows in one block at the current measure. This is the
-/// canonical unit for wheel/page navigation and the typed Markdown painter's
-/// `visual_row` window.
+/// Number of reader rows in one block at the current measure.
 #[inline]
 pub fn block_visual_rows(block: &MarkdownBlock, viewport_width: f32) -> usize {
     block_visual_rows_for_height(block, estimated_block_height(block, viewport_width))
 }
 
-/// The same row count from a height the caller has already measured. Splitting
-/// the arithmetic out keeps `estimated_block_height` — an O(block text) decode —
-/// to one call per block per layout pass; the arithmetic itself is unchanged.
+/// The same row count from a height the caller has already measured.
 #[inline]
 fn block_visual_rows_for_height(block: &MarkdownBlock, height: f32) -> usize {
     let padding = block_visual_padding(block);
@@ -943,9 +885,7 @@ const fn block_visual_padding(block: &MarkdownBlock) -> f32 {
     }
 }
 
-/// Move by exact visual rows, crossing block boundaries without collapsing a
-/// tall block to a single step. Work is bounded by the requested row delta plus
-/// crossed empty blocks; host input clamps ordinary wheel deltas.
+/// Move by exact visual rows.
 pub fn move_visual_rows(
     document: &MarkdownDocument,
     location: MarkdownLocation,
@@ -955,12 +895,6 @@ pub fn move_visual_rows(
     if document.blocks.is_empty() {
         return MarkdownLocation::default();
     }
-    // One measurement slot for the block the traversal is standing on. Each
-    // step revisits it: the entry clamp measures the starting block that the
-    // loop then measures again, and the forward arm re-measures the block it
-    // has just filled before stepping off it. `block_visual_rows` is O(block
-    // text), and the row count for a given (block, width) never changes inside
-    // one traversal, so the retained value is the identical number.
     let mut measured: Option<(usize, usize)> = None;
     let mut visual_rows_of = |index: usize| -> usize {
         if let Some((cached_index, rows)) = measured
@@ -1016,8 +950,7 @@ pub fn move_visual_rows(
     MarkdownLocation::new(source_anchor_for_visual_row(document, block, row), row)
 }
 
-/// Move an exact number of physical source lines using the parser-owned line
-/// index. This is the source-mode equivalent of [`move_visual_rows`].
+/// Move an exact number of physical source lines using the parser-owned line index.
 pub fn move_source_lines(document: &MarkdownDocument, source_anchor: usize, delta: isize) -> usize {
     if document.source_line_starts.is_empty() {
         return 0;
@@ -1064,13 +997,7 @@ pub fn move_block_anchor(document: &MarkdownDocument, source_anchor: usize, delt
     document.blocks[target].source().start
 }
 
-/// THE COLUMNS A CHAR TAKES in the reader's wrap and in its estimate of a
-/// block's rows, which measure a line in a face's average advance: one, and
-/// two for a wide char (a CJK ideograph, kana, Hangul, a fullwidth form, an
-/// emoji, [`aterm_grapheme::char_width`]), which draws about twice an
-/// average Latin advance. Counted as one, a Japanese paragraph's rows were
-/// laid out nearly twice the column's width and painted past it, and its
-/// block was reserved half the rows it painted.
+/// Columns a character takes in the reader's wrap and block-row estimate.
 #[must_use]
 #[inline]
 pub fn reader_columns(c: char) -> usize {
@@ -1085,9 +1012,7 @@ fn text_columns(text: &str, limit: usize) -> usize {
 
 /// The rows a code block's first `limit` chars take at `chars_per_line` columns
 /// ([`estimated_block_height`]): a row per line, and a wide char that would end
-/// past a row starts the next, as the reader's wrap lays it. A function of its
-/// own: with this loop inline, the Trust verifier's inventory of
-/// `estimated_block_height` came out incomplete and its float checks unproved.
+/// past a row starts the next, as the reader's wrap lays it.
 fn code_visual_lines(code: &str, chars_per_line: usize, limit: usize) -> usize {
     let mut visual_lines = 1usize;
     let mut column = 0usize;
@@ -1158,10 +1083,6 @@ fn estimated_block_height(block: &MarkdownBlock, viewport_width: f32) -> f32 {
         }
         MarkdownBlock::ThematicBreak { .. } => return 28.0,
     };
-    // The retained UI heading faces are materially wider than body/mono text.
-    // A single body-width divisor clipped wrapped H1/H2 rows in real pixels;
-    // use a conservative per-style average so virtualization reserves every
-    // painted line even when the exact active face is unusually wide.
     let chars_per_line = (measure / average_advance).max(8.0) as usize;
     let lines = text_len.div_ceil(chars_per_line).max(1);
     lines as f32 * line_height + vertical_padding
@@ -1222,11 +1143,6 @@ fn source_lines(source: &str) -> Vec<SourceLine<'_>> {
 }
 
 /// Hide HTML comments without moving a single canonical source byte.
-///
-/// The reader is deliberately not an HTML renderer. Comments therefore act as
-/// non-rendering Markdown metadata, while identical bytes inside inline/fenced
-/// code remain authored code. Replacing every non-newline comment byte with an
-/// ASCII space keeps the projection valid UTF-8 and preserves all ranges.
 fn mask_html_comments(source: &str) -> Cow<'_, str> {
     let mut masked = None::<Vec<u8>>;
     let mut in_comment = false;
@@ -1326,27 +1242,16 @@ fn is_backslash_escaped(bytes: &[u8], index: usize) -> bool {
 }
 
 /// Lower inline Markdown into the authored reader text without changing the
-/// canonical source. This produces the one flat reading text (what semantics,
-/// accessibility and copy read); the painter styles spans of it that
-/// [`lower_inline_text_styled`] records as it lowers. It removes syntax that should never be
-/// visible in a reading surface. Every scanner is linear
-/// within its recursion level and nesting is capped, so malformed input remains
-/// bounded and round-trips literally instead of triggering backtracking.
+/// canonical source.
 fn lower_inline_text(source: &str) -> String {
     normalize_display_whitespace(&lower_inline_segment(source, 0))
 }
 
-/// [`lower_inline_text`] plus the STYLED spans of the text it returns — the
-/// ranges each recognized construct (strong, emphasis, strikethrough, inline
-/// code, link) emitted, recorded by the same pass that emits them, then carried
-/// through the whitespace normalization and flattened into disjoint, merged,
-/// ordered spans.
+/// [`lower_inline_text`] plus the styled spans of the text it returns.
 pub fn lower_inline_text_styled(source: &str) -> (String, Vec<(Range<usize>, InlineStyle)>) {
     let mut raw = String::with_capacity(source.len());
     let mut spans = Vec::new();
     lower_segment_into(source, 0, InlineStyle::default(), &mut raw, &mut spans);
-    // Normalize exactly as `normalize_display_whitespace`, keeping a map from
-    // every raw byte offset (and the end) to its normalized offset.
     let mut text = String::with_capacity(raw.len());
     let mut map = Vec::with_capacity(raw.len() + 1);
     let mut pending_space = false;
@@ -1408,10 +1313,7 @@ fn lower_inline_segment(source: &str, depth: usize) -> String {
     out
 }
 
-/// The lowering pass, appending to `out`. Each recognized construct records the
-/// range of `out` it emitted with its style merged over the enclosing `style`
-/// (nested constructs record their own, stronger spans); `lower_inline_text`
-/// discards them, `lower_inline_text_styled` keeps them.
+/// The lowering pass, appending to `out`.
 fn lower_segment_into(
     source: &str,
     depth: usize,
@@ -1436,8 +1338,6 @@ fn lower_segment_into(
             continue;
         }
 
-        // Exact-length code-span delimiters preserve every Markdown-looking
-        // byte inside. Whitespace follows CommonMark's single-line projection.
         if bytes[index] == b'`' {
             let ticks = ascii_run(bytes, index, b'`');
             if let Some(close) = find_exact_run(bytes, index + ticks, b'`', ticks) {
@@ -1475,9 +1375,6 @@ fn lower_segment_into(
             continue;
         }
 
-        // Inline links/images present their recursively lowered label or alt
-        // text. Destination bytes remain in the typed link metadata and exact
-        // source selection, but do not clutter the reading projection.
         let image = bytes[index] == b'!' && bytes.get(index + 1) == Some(&b'[');
         let label_open = if image { index + 1 } else { index };
         if bytes.get(label_open) == Some(&b'[')
@@ -1486,7 +1383,6 @@ fn lower_segment_into(
             && let Some(destination_close) =
                 find_balanced_close(source, label_close + 1, b'(', b')')
         {
-            // An image's alt text reads as plain text; a link's label is styled.
             let inner = if image {
                 style
             } else {
@@ -1510,8 +1406,6 @@ fn lower_segment_into(
             continue;
         }
 
-        // Paired emphasis/strong/strike delimiters disappear; unmatched math
-        // stars and intraword underscores remain literal.
         if matches!(bytes[index], b'*' | b'_' | b'~') {
             let marker = bytes[index];
             let run = ascii_run(bytes, index, marker);
@@ -1532,7 +1426,6 @@ fn lower_segment_into(
                 } else if run >= 2 {
                     InlineStyle {
                         strong: true,
-                        // `***x***` is strong AND emphasis.
                         emphasis: run == 3,
                         ..InlineStyle::default()
                     }
@@ -1554,8 +1447,6 @@ fn lower_segment_into(
             continue;
         }
 
-        // Raw inline HTML is not executable in this non-web reader. Autolinks
-        // retain their useful destination; ordinary tags disappear.
         if bytes[index] == b'<'
             && let Some(relative) = source[index + 1..].find('>')
         {
@@ -2208,8 +2099,6 @@ mod tests {
             reduce_image_action(&document.images[1], true),
             MarkdownImageAction::OpenRemote { .. }
         ));
-        // Negative control: treating every non-remote string as local would
-        // grant a path escape. The real reducer must reject this exact mutant.
         assert!(matches!(
             reduce_image_action(&document.images[2], true),
             MarkdownImageAction::Denied { .. }
@@ -2405,10 +2294,6 @@ mod tests {
         drive_history(&model, &mut real, "Forward", RealHistory::forward);
         drive_history(&model, &mut real, "Duplicate", RealHistory::duplicate);
 
-        // The cursor's two edges, driven on the real history: at the newest
-        // entry `forward` stays put, and at the oldest `back` does. Stepping past
-        // either (the off-by-one `next > len`, or `checked_sub(1)` taking the
-        // cursor to `None` with entries left) is neither admitted nor safe.
         let at_newest = real.project(&model);
         assert!(!real.history.can_forward());
         real.history.forward();
@@ -2434,8 +2319,6 @@ mod tests {
         assert_eq!(admits(&model, &at_oldest, &off_oldest), None);
         assert!(!model.check_invariant("EmptyIffNoCursor", &off_oldest));
 
-        // Negative control 1: an append beyond capacity is neither admitted by
-        // the real model nor able to satisfy its named bound.
         let mut unbounded = before_full_visit.clone();
         unbounded.insert("len", 4);
         unbounded.insert("cursor", 4);
@@ -2444,8 +2327,6 @@ mod tests {
         assert_eq!(admits(&model, &before_full_visit, &unbounded), None);
         assert!(!model.check_invariant("HistoryBounded", &unbounded));
 
-        // Negative control 2: keeping the abandoned future after a branch
-        // violates the transition-specific length witness.
         let mut untrimmed = before_branch.clone();
         untrimmed.insert("len", 3);
         untrimmed.insert("cursor", 3);
@@ -2500,9 +2381,7 @@ mod tests {
     /// wrap lays it on two ([`reader_columns`]): a Japanese paragraph and a
     /// heading are estimated the rows of Latin text of twice their chars, at
     /// every width, and a code line no fewer (a wide char that would end
-    /// past a line starts the next). NEGATIVE CONTROL: counted a column a
-    /// char, each was reserved the rows of Latin text its own length, half
-    /// the rows it paints.
+    /// past a line starts the next).
     #[test]
     fn a_wide_char_reserves_two_columns_of_a_blocks_rows() {
         let cjk = "設定ファイルを読み込めませんでした".repeat(12);
@@ -2599,9 +2478,6 @@ mod tests {
             assert!(model.check_invariant("ExactIntraBlockProgress", &state));
         }
 
-        // Negative control: the old block-only reducer treated one wheel row as
-        // a complete four-row block. It is neither admitted by the shipping
-        // model nor able to satisfy the exact-progress invariant.
         let before = model.init_state();
         let mut skipped = before.clone();
         skipped.insert("actual_row", 4);

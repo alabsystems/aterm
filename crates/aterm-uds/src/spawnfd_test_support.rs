@@ -2,15 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Test-only raw spawns for descriptor-inheritance tests (`#[cfg(test)]`).
-//!
-//! Because Trust's `std::process::Command` strips non-stdio descriptors by
-//! default, tests use these helpers so the negative control and strip-only paths
-//! do not depend on `std::process::Command`:
-//!
-//! * [`leaky_status`] and [`leaky_output`]: on Darwin, `posix_spawn` with no
-//!   attributes (no `POSIX_SPAWN_CLOEXEC_DEFAULT`); elsewhere, `fork` + `execve`
-//!   with no strip.
-//! * [`stripped_status`]: `fork`, [`InheritStrip::apply`], then `execve`.
 
 use super::{InheritStrip, pass_libnotify_gate, waitpid};
 /// Every crate's shell probe of a descriptor, which this crate's tests call from here.
@@ -31,10 +22,7 @@ pub(crate) struct LeakyOutput {
     pub(crate) stdout: Vec<u8>,
 }
 
-/// Run `program` (an absolute path) with `args`, DELIBERATELY LEAKY: the
-/// child inherits every descriptor this process holds without close-on-exec,
-/// and this process's stdio. Waits for it to exit.
-///
+/// Run `program` (an absolute path) with `args`, DELIBERATELY LEAKY.
 /// # Errors
 /// A NUL in the program or an argument, or the spawn's own failure.
 pub(crate) fn leaky_status(program: &str, args: &[impl AsRef<OsStr>]) -> io::Result<ExitStatus> {
@@ -42,9 +30,7 @@ pub(crate) fn leaky_status(program: &str, args: &[impl AsRef<OsStr>]) -> io::Res
     reap(leaky_spawn(&image, None)?)
 }
 
-/// [`leaky_status`] with the child's stdout captured and its stderr on
-/// `/dev/null`.
-///
+/// [`leaky_status`] with the child's stdout captured and its stderr on `/dev/null`.
 /// # Errors
 /// As [`leaky_status`], or a failed read of the captured stdout.
 pub(crate) fn leaky_output(program: &str, args: &[impl AsRef<OsStr>]) -> io::Result<LeakyOutput> {
@@ -62,14 +48,10 @@ pub(crate) fn leaky_output(program: &str, args: &[impl AsRef<OsStr>]) -> io::Res
     Ok(LeakyOutput { status, stdout })
 }
 
-/// Run `program` (an absolute path) with `args` through `fork`, then
-/// [`InheritStrip::apply`] in the child, then `execve`. Nothing of std's spawn
-/// is involved, so what reaches the child is what the strip let through.
-/// Waits for it to exit.
-///
+/// Run `program` (an absolute path) with `args` through `fork`, then [`InheritStrip::apply`] in the
+/// child, then `execve`.
 /// # Errors
-/// A NUL in the program or an argument, a failed `fork`, or the errno of a
-/// failed `execve`.
+/// A NUL in the program or an argument, a failed `fork`, or the errno of a failed `execve`.
 pub(crate) fn stripped_status(program: &str, args: &[impl AsRef<OsStr>]) -> io::Result<ExitStatus> {
     let image = Image::new(program, args)?;
     reap(fork_exec(&image, None, Some(InheritStrip::prepare()))?)
@@ -122,18 +104,14 @@ impl Image {
     }
 }
 
-/// Put a 60 s read timeout — a hang detector, not a latency budget — on
-/// `near` WHILE ITS PEER IS STILL OPEN. Darwin refuses any socket option on a
-/// socket whose peer has gone (`EINVAL`), so a timeout set after the child
-/// holding the far end has exec'd or exited fails whenever the child is
-/// quick: the intermittent `stripped spawn: ... Invalid argument`.
+/// Put a 60 s read timeout.
 pub(crate) fn bound_read(near: &UnixStream) -> io::Result<()> {
     near.set_read_timeout(Some(Duration::from_secs(60)))
 }
 
-/// Run `round` while a background thread repeatedly stats `/dev/fd/{number}`
-/// until [`Looker::probe`] observes `races` `EBADF` races (Darwin's `/dev/fd/N`
-/// shares a single vnode across lookups; see [`super::descriptor_metadata`]).
+/// Run `round` while a background thread repeatedly stats `/dev/fd/{number}` until
+/// [`Looker::probe`] observes `races` `EBADF` races (Darwin's `/dev/fd/N` shares a single vnode
+/// across lookups; see [`super::descriptor_metadata`]).
 #[cfg(test)]
 #[cfg(target_vendor = "apple")]
 #[track_caller]
@@ -181,8 +159,8 @@ pub(crate) struct Looker {
 
 #[cfg(target_vendor = "apple")]
 impl Looker {
-    /// `stat` the contended number by its `/dev/fd` path, which the caller holds open
-    /// now, counting a failure as a race.
+    /// `stat` the contended number by its `/dev/fd` path, which the caller holds open now, counting
+    /// a failure as a race.
     pub(crate) fn probe(&self) {
         if std::fs::metadata(&self.path).is_err() {
             self.raced.set(self.raced.get() + 1);
@@ -236,10 +214,8 @@ fn leaky_spawn(image: &Image, out: Option<(RawFd, RawFd)>) -> io::Result<i32> {
         return Err(io::Error::from_raw_os_error(rc));
     }
     let mut pid = 0;
-    // SAFETY: `actions` was initialised above and is destroyed once, below; the
-    // program, `argv` and `envp` are C strings and NULL-terminated arrays of
-    // them that outlive the call. A NULL attribute object is posix_spawn's
-    // documented "no attributes".
+    // SAFETY: `actions` was initialised above and is destroyed once, below; the program, `argv` and
+    // `envp` are C strings and NULL-terminated arrays of them that outlive the call.
     let rc = unsafe {
         let mut rc = 0;
         if let Some((stdout, stderr)) = out {
@@ -285,10 +261,6 @@ unsafe extern "C" {
 /// `fork`; in the child, `strip` when one is given, `out`'s two descriptors
 /// at 1 and 2 when given, then `execve`. Without a strip the child inherits
 /// every descriptor this process holds without close-on-exec at the fork.
-///
-/// A failed `execve` comes back as its errno, read from a close-on-exec
-/// status pipe (EOF means the exec took). A child that died before its exec
-/// therefore never reads as a probe's exit code.
 fn fork_exec(
     image: &Image,
     out: Option<(RawFd, RawFd)>,
@@ -296,20 +268,14 @@ fn fork_exec(
 ) -> io::Result<i32> {
     let argv = Image::pointers(&image.argv);
     let envp = Image::pointers(&image.envp);
-    // Both ends close-on-exec, as std makes every socket it returns.
     let (mut status_rd, status_wr) = UnixStream::pair()?;
     bound_read(&status_rd)?;
     let report = status_wr.as_raw_fd();
-    // Darwin: a fork must not catch libnotify's once-gate half taken, or the
-    // child dies inside `fork()` (see `pass_libnotify_gate`). `prepare`
-    // passes it for a stripped spawn; this passes it for the leaky one too.
     pass_libnotify_gate();
     // SAFETY: `fork` takes no arguments; the child branch never returns.
     let pid = unsafe { fork() };
     if pid == 0 {
-        // SAFETY: the forked child. Async-signal-safe calls only (`fcntl` in
-        // the strip, `dup2`, `execve`, `write`, `_exit`), on memory this
-        // process prepared before the fork; nothing is allocated.
+        // SAFETY: the forked child.
         unsafe {
             if let Some(strip) = strip {
                 strip.apply();
@@ -339,7 +305,6 @@ fn fork_exec(
 }
 
 /// Report this child's errno on the status pipe and exit.
-///
 /// # Safety
 /// Only in the forked child.
 unsafe fn fail(report: RawFd) -> ! {

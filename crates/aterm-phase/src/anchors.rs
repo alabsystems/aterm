@@ -83,6 +83,13 @@ pub const ANCHORS: &[Anchor] = &[
         "2.1.282",
     ),
     lit("box.reason_hook", "Hook ", "2.1.282"),
+    // Claude Code's `no-rule-match` note on a Bash box (2.1.308's bundle): no allow rule matched
+    // and its own checks did not clear the command (aterm-agent's `no-rule-read-only`).
+    lit(
+        "box.note_no_rule",
+        "This command requires approval",
+        "2.1.284",
+    ),
     lit("box.reason_remote_hook", "A hook ", "2.1.282"),
     lit(
         "box.reason_remote_confirm",
@@ -1070,6 +1077,29 @@ pub const MUSE_ANCHORS: &[Anchor] = &[
     lit("muse.tool.saved_memory", "Saved memory", "1.4.10-R6427.1"),
     lit("muse.tool.read_goal", "Read goal", "1.4.10-R6427.1"),
     composed("muse.tool.used", "Used tool", "1.4.10-R6427.1"),
+    lit("muse.tool.fetched", "Fetched", "1.4.10-R6427.1"),
+    lit(
+        "muse.tool.invalid_work",
+        "Invalid work ID",
+        "1.4.10-R6427.1",
+    ),
+    lit("muse.queued", "Queued input · ↑ to edit", "1.4.10-R6427.1"),
+    lit(
+        "muse.footer.steering",
+        "steering the running turn",
+        "1.4.10-R6427.1",
+    ),
+    lit(
+        "muse.footer.queued",
+        "queued for the next turn",
+        "1.4.10-R6427.1",
+    ),
+    lit(
+        "muse.footer.replacing",
+        "replacing the running turn",
+        "1.4.10-R6427.1",
+    ),
+    lit("muse.title.spinner", "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏", "1.4.10-R6427.1"),
     lit(
         "muse.wall.key",
         "your API key from META_API_KEY was rejected — update or unset it",
@@ -1524,6 +1554,8 @@ mod tests {
     }
 
     /// The canary's version is the store record's, read through a `current`
+    /// link, and the build is never started: its stand-in would leave a
+    /// mark if it ran.
     #[cfg(unix)]
     #[test]
     fn the_canary_reads_the_build_record_and_never_runs_the_build() {
@@ -1574,6 +1606,8 @@ mod tests {
     }
 
     /// [`newer_than`] orders versions by number, part by part, never by
+    /// text: `2.1.300` is newer than `2.1.30` and `2.1.299`, a longer
+    /// version newer than its own prefix, a revision after its version.
     #[test]
     fn newer_than_orders_versions_by_number() {
         for (a, b) in [
@@ -1593,6 +1627,8 @@ mod tests {
     }
 
     /// The transcript's keys are their own table, read by [`anchor`] and
+    /// [`anchor_text`] like any other, and every one is a literal the
+    /// canary looks for.
     #[test]
     fn the_transcript_keys_are_literals_the_lookups_read() {
         for a in TRANSCRIPT_KEYS {
@@ -1617,6 +1653,10 @@ mod tests {
     }
 
     /// MUSE CODE'S VERSION IS READ WITH ITS REVISION: `muse --version` prints
+    /// `Muse Code 1.4.9 (1.4.9-R6297.1)` (measured), and the build is the
+    /// revision its anchors carry — read as the dotted `1.4.9` alone, every
+    /// anchor of the build it was measured on would be "newer than the build"
+    /// and owed by none.
     #[test]
     fn a_muse_version_is_read_with_its_revision() {
         assert_eq!(
@@ -1651,12 +1691,15 @@ mod tests {
     }
 
     /// Where the lab's Codex rollouts are committed, reduced (`aterm-agent`'s
+    /// step testdata, session log 5G, 6D-3a): `<stem>.jsonl` and its legs,
+    /// `<stem>-<leg>.jsonl`, the stem [`rollout_reduction_stem`]'s.
     const ROLLOUTS: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../aterm-agent/src/harness/testdata/steps"
     );
 
     /// The committed rollout reductions of `build`, joined, each checked to
+    /// open with the reducer's own line naming that build.
     fn committed_rollouts(build: &str) -> Vec<u8> {
         let stem = rollout_reduction_stem(build);
         let leg = format!("{stem}-");
@@ -1681,6 +1724,8 @@ mod tests {
     }
 
     /// every rollout key is a literal the committed rollout of
+    /// the build it names (`since`) shows, quoted — a JSON key or a closed
+    /// word — never a guess; and the lookups read it like any anchor.
     #[test]
     fn every_rollout_key_is_in_its_committed_rollout() {
         let quoted = |a: &Anchor| -> Vec<u8> { format!("\"{}\"", a.text).into_bytes() };
@@ -1734,9 +1779,13 @@ mod tests {
     const ALAB_BUILD: &str = "0.164.0-dev.12521+g3d3eb12d8";
 
     /// The forever-port codex-alab build the lab measured (B5c), whose
+    /// rollouts spell every key of the steps they show as 0.163.0 did.
     const FOREVER_BUILD: &str = "0.164.0-dev.12672+g089291d37";
 
     /// THE NAME RULE (6D-3a): a vendor build's reductions are
+    /// `codex-<build>`, an ALab build's `codex-alab-<release>`, its commit
+    /// left to the reducer's own line; each committed reduction is of the
+    /// build its own line names.
     #[test]
     fn a_rollout_reduction_is_named_by_its_build() {
         assert_eq!(rollout_reduction_stem("0.163.0"), "codex-0.163.0");
@@ -1775,6 +1824,8 @@ mod tests {
     }
 
     /// THE RESET'S TEMPLATES ARE ITS ANCHORS' WORDS, WHOLE: each is built
+    /// from the rows the readers match by, none is empty or another's, and
+    /// a text that spells them all holds every one.
     #[test]
     fn the_reset_templates_are_built_from_the_readers_rows() {
         type Templates = Vec<(&'static str, Vec<String>)>;
@@ -1857,6 +1908,8 @@ mod tests {
     }
 
     /// The bundle finder on a stand-in package: the version its
+    /// `package.json` names and every `.js` file of the script's directory,
+    /// found through a link.
     #[cfg(unix)]
     #[test]
     fn the_gemini_canary_reads_the_bundle_its_script_resolves_into() {

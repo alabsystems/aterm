@@ -216,6 +216,7 @@ pub const fn decode_bidi_run_le(bytes: [u8; 16]) -> (u32, u32, u32, u32) {
 }
 
 /// O(1) lookup table for ASCII `0x00..=0x7F` (`Bidi_Class`), matching
+/// `tables::BIDI_CLASS_RANGES` without a binary search on every ASCII cell.
 const ASCII_BIDI_CLASS: [BidiClass; 128] = {
     let mut table = [L; 128];
     let mut u = 0usize;
@@ -590,6 +591,9 @@ pub fn cell_levels(
 }
 
 /// Steps 1 and 2 of the cell reorder, shared by
+/// [`reorder_cells_with_classes_into`] and [`cell_levels`] so the two cannot
+/// fold a row differently: fold the cells into logical characters, then
+/// resolve each character's level into `s.levels`.
 fn fold_cells_and_resolve(
     cell_classes: &[BidiClass],
     cell_brackets: &[Bracket],
@@ -676,6 +680,7 @@ pub fn reorder_from_levels_into(levels: &[u8], order_out: &mut Vec<usize>) {
 }
 
 /// L2 within each paragraph of the line: a line that holds a `B` is two
+/// paragraphs, each reordered on its own and kept in logical sequence.
 fn reorder_paragraphs_into(classes: &[BidiClass], levels: &[u8], order_out: &mut Vec<usize>) {
     order_out.clear();
     order_out.extend(0..levels.len());
@@ -758,6 +763,7 @@ struct StatusEntry {
 }
 
 /// Resolve `classes` (and their brackets) into `levels` — P1 splits at `B`,
+/// then each paragraph runs X1–L1.
 fn resolve_into(
     classes: &[BidiClass],
     brackets: &[Bracket],
@@ -783,6 +789,8 @@ fn resolve_into(
 }
 
 /// BD9: `matching[i]` is the index of the PDI matching the isolate initiator at
+/// `i` (or `n` when it has none), and for a matched PDI the index of its
+/// initiator; `usize::MAX` elsewhere.
 fn match_isolates(classes: &[BidiClass], matching: &mut Vec<usize>) {
     let n = classes.len();
     matching.clear();
@@ -812,6 +820,7 @@ fn match_isolates(classes: &[BidiClass], matching: &mut Vec<usize>) {
 }
 
 /// P2/P3 over `classes[..]`, skipping isolated content: 1 when the first strong
+/// character is R/AL, else 0.
 fn first_strong_level(
     classes: &[BidiClass],
     matching: &[usize],
@@ -1103,6 +1112,7 @@ fn set<T: Copy>(slice: &mut [T], i: usize, value: T) {
 }
 
 /// W1–W7, N0, N1/N2 over one isolating run sequence (`seq` holds its kept
+/// characters' indices in order).
 fn resolve_sequence(
     seq: &[usize],
     classes: &[BidiClass],
@@ -1356,6 +1366,9 @@ mod tests {
     }
 
     /// `cell_levels` folds the row as the reorder does: a Hebrew run is odd, an
+    /// LTR word and the blank between them even, and a wide glyph's
+    /// continuation cell carries its lead's level (here an `L` glyph inside an
+    /// RTL paragraph, level 2, and the paragraph's RTL letter, level 1).
     #[test]
     fn cell_levels_marks_rtl_cells_and_pairs_wide_glyphs() {
         let cc = chars("ab \u{05D0}\u{05D1}");
@@ -1468,6 +1481,9 @@ mod tests {
     }
 
     /// L4 on a reordered row: brackets enclosing right-to-left text at a
+    /// right-to-left level are RTL cells, the same brackets around an RTL word
+    /// in a left-to-right context are not, and a wide continuation answers as
+    /// its lead.
     #[test]
     fn cell_is_rtl_follows_resolved_levels() {
         let rtl_brackets = chars("\u{627}(\u{628})\u{62C}");
@@ -1517,6 +1533,9 @@ mod generated {
     use aterm_spec::rng::XorShift;
 
     /// A representative bidi alphabet exercising every resolved class: LTR letters,
+    /// European numbers/separators/terminators, Hebrew (R), Arabic (AL) +
+    /// Arabic-Indic digits (AN), common separators, neutrals, whitespace, and the
+    /// directional marks.
     const ALPHABET: &[char] = &[
         'a', 'Z', '5', '0', '+', '-', '$', '%', ',', '.', ':', '/', ' ', '\t', '\n', '!', '(', ')',
         '\u{05D0}', '\u{05D1}', '\u{05EA}', '\u{0627}', '\u{0628}', '\u{0660}', '\u{0669}',
@@ -1541,6 +1560,7 @@ mod generated {
     }
 
     /// The visual order is always a permutation of 0..n, for any input and base
+    /// — the load-bearing safety property (no cell dropped or duplicated).
     #[test]
     fn reorder_is_always_a_permutation() {
         for line in lines() {
@@ -1554,6 +1574,8 @@ mod generated {
     }
 
     /// Levels match the input length and never fall below their PARAGRAPH's
+    /// base level (explicit embeddings and I1/I2 only raise; L1 resets to
+    /// base).
     #[test]
     fn levels_well_formed() {
         for line in lines() {
@@ -1589,6 +1611,8 @@ mod generated {
     }
 
     /// The class-taking entry points, and the `_into` companion with one
+    /// Scratch reused across bases, are byte-identical to the char-taking
+    /// entry points (the dedup the bridge depends on).
     #[test]
     fn class_taking_and_into_variants_match_char_taking() {
         let mut scratch = Scratch::default();

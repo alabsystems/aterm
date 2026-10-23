@@ -161,7 +161,7 @@ pub fn try_cast_slice<A: Pod, B: Pod>(src: &[A]) -> Result<&[B], PodCastError> {
 /// View a single `Pod` value as its raw bytes.
 #[inline]
 #[must_use]
-pub fn bytes_of<T: Pod>(value: &T) -> &[u8] {
+pub const fn bytes_of<T: Pod>(value: &T) -> &[u8] {
     let ptr = core::ptr::from_ref(value).cast::<u8>();
     if ptr.is_null() {
         // the pointer cast; behavior is unchanged.
@@ -380,6 +380,7 @@ mod tests {
     }
 
     /// The static literals in `panic_cast_failed!` must stay byte-identical
+    /// to `"<op> failed: "` + the `Display` text of the error variant.
     #[test]
     fn exact_panic_message_matches_display() {
         let slop = panic_message(|| {

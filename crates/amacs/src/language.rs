@@ -1,33 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The closed language table that replaces Emacs's major modes (design §2.1;
-//! slice L1).
-//!
-//! A [`Language`] is one of eight fixed values. Each gives a fill column, a
-//! comment syntax, an indent rule and a line-break rule, a line lexer and
-//! diagnostics, and nothing else: no hooks and no code at runtime.
-//! [`GitCommit`](Language::GitCommit) is the first-class case, because amacs
-//! is everyone's commit editor.
-//!
-//! The lexers are line-local. [`Language::lex_line`] reads one line and the
-//! small [`LexState`] the line above left (an open string, comment, fence,
-//! here-document or diff hunk, and Rust's bracket nesting), and returns the
-//! line's spans and the state for the next line. One pass reads each byte a
-//! bounded number of times, so a line costs O(its length) and never more.
-//! [`LexCache`] keeps a document's lines lexed across edits: it re-lexes the
-//! edited lines and then only the lines whose starting state changed.
-//!
-//! There is no tree-sitter and no language server. Diagnostics from tools
-//! arrive over `doc diag` (slice A6); the ones here are the commit-message
-//! and rebase-todo rules git users expect from their editor.
+//! The closed language table that replaces Emacs's major modes (design §2.1; slice L1).
 
 use std::ops::Range;
-
-// The contract macros, `trust_contract_fn!` and `verify_island!`, are the
-// crate's, defined in lib.rs before every module. Each clause here cites a
-// theorem over `trust_import_amacs__language__<module>__<fn>`; SPECS.md lists
-// every contract.
 
 mod diff;
 mod git;
@@ -49,61 +25,50 @@ pub enum Language {
     Shell,
     /// A unified diff or a patch mail.
     Diff,
-    /// A message git asks for: `COMMIT_EDITMSG`, `MERGE_MSG`, `TAG_EDITMSG`
-    /// and `SQUASH_MSG`.
+    /// A message git asks for: `COMMIT_EDITMSG`, `MERGE_MSG`, `TAG_EDITMSG` and `SQUASH_MSG`.
     GitCommit,
     /// The todo list of `git rebase -i`.
     GitRebaseTodo,
 }
 
-/// What a span of a line is, for a face to colour. A face maps each class to
-/// one of its theme's roles; text in no span is plain.
+/// What a span of a line is, for a face to colour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SyntaxClass {
     Keyword,
     String,
     Comment,
     Number,
-    /// A heading or a title line: a Markdown heading, a TOML table header, a
-    /// diff hunk header, a commit summary.
+    /// A heading or a title line: a Markdown heading, a TOML table header, a diff hunk header, a commit summary.
     Heading,
     Punct,
     /// A line a diff adds.
     Added,
     /// A line a diff removes.
     Removed,
-    /// Text about the text: attributes and macros, lifetimes, variables,
-    /// fences and link targets, diff file headers.
+    /// Text about the text: attributes and macros, lifetimes, variables, fences and link targets, diff file headers.
     Meta,
 }
 
-/// One classified run of a line. `range` is in bytes of that line and lies on
-/// char boundaries; a line's spans are sorted, disjoint and never empty.
+/// One classified run of a line.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Span {
     pub range: Range<usize>,
     pub class: SyntaxClass,
 }
 
-/// What a line starts inside of, as the line above left it. Small and `Copy`:
-/// at most an open construct, a bracket depth, 32 bits of nesting and a
-/// commit message's phase. [`LexState::START`] is the state of a document's
-/// first line.
+/// What a line starts inside of, as the line above left it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct LexState {
     mode: Mode,
     /// Bracket nesting at the start of the line (Rust and TOML).
     depth: u16,
-    /// One bit per bracket depth below 32. Rust: the bracket at that depth is
-    /// the first one its line left open, so it adds one indent level. TOML:
-    /// the bracket at that depth is an inline table's `{`, not an array's `[`.
+    /// One bit per bracket depth below 32.
     levels: u32,
     /// Where a commit message is (GitCommit only).
     commit: CommitPhase,
 }
 
-/// The open construct a line starts inside of. Its meaning is the lexing
-/// language's own; a state is never carried from one language to another.
+/// The open construct a line starts inside of.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 enum Mode {
     /// Nothing open: ordinary text or code.
@@ -152,16 +117,14 @@ impl LexState {
         commit: CommitPhase::Summary,
     };
 
-    /// The bracket nesting (`(`, `[`, `{`) the line starts at, in Rust and
-    /// TOML; zero in the other languages.
+    /// The bracket nesting (`(`, ``, `{`) the line starts at, in Rust and TOML; zero in the other languages.
     #[inline]
     #[must_use]
     pub const fn depth(self) -> u16 {
         self.depth
     }
 
-    /// Whether the line starts inside a string, a comment or a fenced block
-    /// rather than in code or prose.
+    /// Whether the line starts inside a string, a comment or a fenced block rather than in code or prose.
     #[inline]
     #[must_use]
     pub const fn in_literal(self) -> bool {
@@ -179,8 +142,7 @@ impl LexState {
     }
 }
 
-/// A language's comment delimiters, for comment-dwim (slice S8). Each
-/// delimiter carries the one space it is written with.
+/// A language's comment delimiters, for comment-dwim (slice S8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommentSyntax {
     /// What starts a comment that runs to the end of the line (`"// "`).
@@ -189,9 +151,7 @@ pub struct CommentSyntax {
     pub block: Option<(&'static str, &'static str)>,
 }
 
-/// How indentation is written: an indent level is `width` columns, tab stops
-/// are every `width` columns, and `tabs` writes whole stops as tabs. The
-/// editor's `tab_width` and `indent_tabs` options (design §9) are these two.
+/// How indentation is written: an indent level is `width` columns, tab stops are every `width` columns, and `tabs` writes whole stops as tabs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IndentStyle {
     pub width: usize,
@@ -204,8 +164,7 @@ impl Default for IndentStyle {
     }
 }
 
-/// The most columns of indentation [`IndentStyle::render`] writes: a deeper
-/// computed indent is clamped, so an absurd width cannot allocate megabytes.
+/// The most columns of indentation [`IndentStyle::render`] writes: a deeper computed indent is clamped, so an absurd width cannot allocate megabytes.
 pub const MAX_INDENT_COLUMNS: usize = 1024;
 
 impl IndentStyle {
@@ -215,12 +174,9 @@ impl IndentStyle {
         tabs: false,
     };
 
-    /// The whitespace that indents a line to `columns` (at most
-    /// [`MAX_INDENT_COLUMNS`]).
+    /// The whitespace that indents a line to `columns` (at most [`MAX_INDENT_COLUMNS`]).
     pub fn render(self, columns: usize) -> String {
         let columns = indent_columns_cap(columns);
-        // Called directly, not through a method, so the prover carries the
-        // contract's `result >= 1` to the divisor below.
         let width = tab_stop(self.width);
         if !self.tabs {
             return " ".repeat(columns);
@@ -230,8 +186,7 @@ impl IndentStyle {
         out
     }
 
-    /// The display columns of `line`'s leading blanks, a tab advancing to the
-    /// next stop.
+    /// The display columns of `line`'s leading blanks, a tab advancing to the next stop.
     pub fn columns_of(self, line: &str) -> usize {
         self.columns_through(line, leading_blanks(line))
     }
@@ -252,8 +207,6 @@ impl IndentStyle {
 
     /// The column a tab at `columns` advances to: the next tab stop.
     fn next_stop(self, columns: usize) -> usize {
-        // Outside the loop above: inside it, the prover does not carry
-        // `tab_stop`'s `result >= 1` to the remainder.
         let width = tab_stop(self.width);
         columns.saturating_add(width.saturating_sub(columns % width))
     }
@@ -261,8 +214,7 @@ impl IndentStyle {
 
 trust_contract_fn! {
     /// The tab stop an indent `width` gives: the width itself, or 1 for a
-    /// width of 0, so a column can always be divided by it. A select, not
-    /// `width.max(1)`: Trust kernel-imports a select, and E6 refuses calls.
+    /// width of 0, so a column can always be divided by it.
     fn tab_stop(width: usize) -> usize
     clauses [ensures result >= 1 by tab_stop_is_never_zero
              ensures width < 1 || result == width by tab_stop_keeps_a_nonzero_width]
@@ -271,10 +223,6 @@ trust_contract_fn! {
     }
 }
 
-// Specs `tab-stop-nonzero` and `tab-stop-identity` (SPECS.md), kernel-checked
-// against the compiled body. On this target Trust reads a `usize` as a
-// `UInt64`; each proof is the one case split the body makes (TR2's
-// `projected_column_limit` proofs are the pattern).
 verify_island! {
     clean {
         theorem tab_stop_is_never_zero (width : UInt64) :
@@ -298,8 +246,7 @@ verify_island! {
 }
 
 trust_contract_fn! {
-    /// `columns` of indentation, capped at [`MAX_INDENT_COLUMNS`] (1024). A
-    /// select, not `columns.min(…)`, for the same reason as [`tab_stop`].
+    /// `columns` of indentation, capped at [`MAX_INDENT_COLUMNS`] (1024).
     fn indent_columns_cap(columns: usize) -> usize
     clauses [ensures result <= 1024 by indent_columns_cap_is_at_most_the_cap
              ensures columns > 1024 || result == columns by indent_columns_cap_keeps_a_value_within_it]
@@ -312,8 +259,6 @@ trust_contract_fn! {
     }
 }
 
-// Specs `indent-cap-bound` and `indent-cap-identity` (SPECS.md),
-// kernel-checked against the compiled body, as `tab_stop`'s are.
 verify_island! {
     clean {
         theorem indent_columns_cap_is_at_most_the_cap (columns : UInt64) :
@@ -337,18 +282,11 @@ verify_island! {
 }
 
 /// What a line break does to the line it splits ([`Language::line_break`]).
-///
-/// The editor replaces the bytes from `keep` in `before` to `skip` into
-/// `after` (the end of the line above and the start of the line below) with
-/// `"\n"` and then `prefix`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LineBreak {
-    /// How many bytes of `before` stay on the line above: all of it but its
-    /// trailing blanks, all of it inside a string, and less when the break
-    /// ends a list or a quote (the empty item's marker goes).
+    /// How many bytes of `before` stay on the line above: all of it but its trailing blanks, all of it inside a string, and less when the break ends a list or a quote (the empty item's marker goes).
     pub keep: usize,
-    /// How many bytes at the start of `after` go: its leading blanks, which
-    /// `prefix` stands in for (none inside a string).
+    /// How many bytes at the start of `after` go: its leading blanks, which `prefix` stands in for (none inside a string).
     pub skip: usize,
     /// What the new line starts with, before the rest of `after`.
     pub prefix: String,
@@ -394,8 +332,7 @@ impl DiagKind {
     }
 }
 
-/// One finding about a document. `range` is in bytes of the whole text and
-/// lies on char boundaries; `line` is its 0-based line.
+/// One finding about a document.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Diag {
     pub range: Range<usize>,
@@ -457,13 +394,6 @@ impl Language {
     }
 
     /// The language of the file at `path` whose first line is `first_line`.
-    ///
-    /// `path` may be a path or a URI path; only its last component is read.
-    /// The names git gives the files it asks for decide first
-    /// (`COMMIT_EDITMSG`, `MERGE_MSG`, `TAG_EDITMSG`, `SQUASH_MSG` and
-    /// `git-rebase-todo`), then a few well-known file names (`Cargo.lock`,
-    /// `.bashrc`), then the extension, then the first line: a shebang naming
-    /// a shell (or `cargo`), or the start of a diff or a patch mail.
     pub fn detect(path: &str, first_line: &str) -> Self {
         let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
         by_file_name(name)
@@ -472,8 +402,7 @@ impl Language {
             .unwrap_or(Self::Plain)
     }
 
-    /// The column fill wraps at by default: 72 for a commit message, as git's
-    /// own tools wrap it, and Emacs's 70 for everything else.
+    /// The column fill wraps at by default: 72 for a commit message, as git's own tools wrap it, and Emacs's 70 for everything else.
     pub const fn fill_column(self) -> usize {
         match self {
             Self::GitCommit => 72,
@@ -481,8 +410,7 @@ impl Language {
         }
     }
 
-    /// The summary limit [`diagnostics`](Self::diagnostics) applies: 50 for a
-    /// commit message, none for the rest.
+    /// The summary limit [`diagnostics`](Self::diagnostics) applies: 50 for a commit message, none for the rest.
     pub const fn summary_limit(self) -> Option<usize> {
         match self {
             Self::GitCommit => Some(SUMMARY_LIMIT),
@@ -490,7 +418,7 @@ impl Language {
         }
     }
 
-    /// The language's comment delimiters. A diff and plain text have none.
+    /// The language's comment delimiters.
     pub const fn comment(self) -> CommentSyntax {
         let (line, block) = match self {
             Self::Plain | Self::Diff => (None, None),
@@ -501,9 +429,7 @@ impl Language {
         CommentSyntax { line, block }
     }
 
-    /// Lex one line (without its `\n`) that starts in `state`. Returns the
-    /// line's spans and the state the next line starts in. The work is one
-    /// pass over the line's bytes, each read a bounded number of times.
+    /// Lex one line (without its `\n`) that starts in `state`.
     pub fn lex_line(self, state: LexState, line: &str) -> (Vec<Span>, LexState) {
         let mut out = Spans::default();
         let next = self.lex_into(state, line, &mut out);
@@ -524,13 +450,6 @@ impl Language {
     }
 
     /// The column `line`'s text should start at, for indent-for-tab-command.
-    ///
-    /// `state` is the state `line` starts in (from [`LexCache::state_at`]),
-    /// and `previous` is the nearest line above it that is not blank. Rust
-    /// indents by bracket depth: one level for each line above that left a
-    /// bracket open, one fewer for each bracket `line` itself starts by
-    /// closing. Markdown indents a line under a list item to the item's
-    /// text. The others keep the indentation of the line above.
     pub fn indent_column(
         self,
         state: LexState,
@@ -546,25 +465,7 @@ impl Language {
         }
     }
 
-    /// What a line break between `before` and `after` does: what stays of
-    /// the line above, and what the new line starts with.
-    ///
-    /// `before` is the text of the line up to the break and `state` the state
-    /// that line starts in; `after` is the rest of the line, which moves to
-    /// the new line. Inside a string the break adds and removes nothing.
-    /// Otherwise the blanks around the break go, and the new line starts
-    /// with:
-    ///
-    /// - in Rust, the indent of the bracket depth at the break (one level
-    ///   fewer when `after` starts with a closer), or inside a block comment
-    ///   the indentation of `before`;
-    /// - in Markdown, the next list marker (`- `, `3. `, `- [ ] `) after an
-    ///   item with text, and the quote markers (`> `) of a quoted line. An
-    ///   item with no text ends its list and a quote line with no text ends
-    ///   the quote: their marker is taken off the line above;
-    /// - in every other language, the indentation of `before`.
-    ///
-    /// No language continues a comment leader (`// `, `# `): fill does that.
+    /// What a line break between `before` and `after` does: what stays of the line above, and what the new line starts with.
     pub fn line_break(
         self,
         state: LexState,
@@ -593,10 +494,7 @@ impl Language {
         }
     }
 
-    /// The prefix fill-paragraph keeps on each line of the paragraph whose
-    /// first line is `line`: a comment leader (`    /// `, `# `), a Markdown
-    /// quote (`> `), the hanging indent of a list item (`- ` on the first
-    /// line, two spaces after it), or the line's own indentation.
+    /// The prefix fill-paragraph keeps on each line of the paragraph whose first line is `line`: a comment leader (`    /// `, `# `), a Markdown quote (`> `), the hanging indent of a list item (`- ` on the first line, two spaces after it), or the line's own indentation.
     pub fn fill_prefix(self, line: &str, style: IndentStyle) -> FillPrefix {
         let item = match self {
             Self::Markdown | Self::GitCommit => markdown::hanging_indent(line, style),
@@ -621,15 +519,11 @@ impl Language {
     }
 
     /// The language's findings about `text`, with the default summary limit.
-    /// A commit message reports a summary over 50 characters and a line after
-    /// the summary that is not blank; a rebase todo reports each command git
-    /// does not know. The other languages report nothing.
     pub fn diagnostics(self, text: &str) -> Vec<Diag> {
         self.diagnostics_with(text, SUMMARY_LIMIT)
     }
 
-    /// [`diagnostics`](Self::diagnostics) with a configured summary limit
-    /// (`[amacs.language.git-commit] summary_limit`).
+    /// [`diagnostics`](Self::diagnostics) with a configured summary limit (`[amacs.language.git-commit] summary_limit`).
     pub fn diagnostics_with(self, text: &str, summary_limit: usize) -> Vec<Diag> {
         match self {
             Self::GitCommit => git::commit_diagnostics(text, summary_limit),
@@ -685,8 +579,7 @@ fn by_first_line(line: &str) -> Option<Language> {
     (line.starts_with("diff --git ") || patch_mail).then_some(Language::Diff)
 }
 
-/// The language a `#!` line's interpreter writes. `env` is looked through,
-/// with its options and assignments (`#!/usr/bin/env -S bash -e`).
+/// The language a `#!` line's interpreter writes.
 fn shebang(command: &str) -> Option<Language> {
     let mut words = command.split_ascii_whitespace();
     let mut program = words.next()?.rsplit('/').next()?;
@@ -740,7 +633,6 @@ trust_contract_fn! {
     }
 }
 
-// Spec `line-space-set` (SPECS.md), kernel-checked against the compiled body.
 verify_island! {
     clean {
         theorem line_space_is_exactly_the_blanks (byte : UInt8) :
@@ -752,8 +644,7 @@ verify_island! {
 
 /// `value` with the decimal digit `byte` (`b'0'` to `b'9'`) appended, or
 /// `u32::MAX` once `value` is past [`decimal_room`]'s bound: a run of digits
-/// read this way saturates and never wraps. The diff lexer's hunk counts and
-/// Markdown's list numbers read through it.
+/// read this way saturates and never wraps.
 fn decimal_push(value: u32, byte: u8) -> u32 {
     let digit = u32::from(byte.saturating_sub(b'0')).min(9);
     if decimal_room(value) {
@@ -786,12 +677,6 @@ trust_contract_fn! {
     }
 }
 
-// Specs `decimal-room-bound` and `decimal-append-step` (SPECS.md),
-// kernel-checked against the compiled bodies. The two closed facts are the
-// bound's arithmetic: at 429,496,728 the largest next value, `… * 10 + 9`, is
-// at most `u32::MAX`, and one more would pass it. E6 imports a select and a
-// wrapping chain each, but not a select with a wrapping arm, so the guard and
-// the step are two contracts.
 verify_island! {
     clean {
         theorem decimal_room_is_the_bound (value : UInt32) :
@@ -845,8 +730,7 @@ thread_local! {
     static BYTE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// A forward reader over one line's bytes. Every lexer reads through it, and
-/// a read never goes past the line, so a lexer's position only moves forward.
+/// A forward reader over one line's bytes.
 struct Cursor<'a> {
     line: &'a str,
     pos: usize,
@@ -921,9 +805,7 @@ impl<'a> Cursor<'a> {
             .all(|(ahead, &byte)| self.nth(ahead) == Some(byte))
     }
 
-    /// Step past continuation bytes, onto the next char boundary. A lexer
-    /// that stops on a count rather than on an ASCII byte ends here, so its
-    /// span never splits a character.
+    /// Step past continuation bytes, onto the next char boundary.
     fn skip_to_boundary(&mut self) {
         while self.peek().is_some_and(|byte| (0x80..0xC0).contains(&byte)) {
             self.bump();
@@ -954,14 +836,6 @@ struct LexedLine {
 }
 
 /// A document's lines, lexed, kept current across edits.
-///
-/// Lines are split on `\n`, as the editor counts them: an empty document is
-/// one line, and text after the last line break is a line. [`splice`]
-/// re-lexes the edited lines, then the lines after them only while their
-/// starting state differs from the one they had; the first line whose state
-/// matches, and every line after it, lexes exactly as before, so it stops.
-///
-/// [`splice`]: LexCache::splice
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LexCache {
     language: Language,
@@ -1005,20 +879,12 @@ impl LexCache {
         self.lines.get(line).map_or(&[], |lexed| &lexed.spans)
     }
 
-    /// The state `line` starts in; for a line past the end, the state after
-    /// the last line.
+    /// The state `line` starts in; for a line past the end, the state after the last line.
     pub fn state_at(&self, line: usize) -> LexState {
         self.lines.get(line).map_or(self.end, |lexed| lexed.start)
     }
 
-    /// Bring the cache up to date with `text` after an edit replaced lines
-    /// `first .. first + removed` of the old text with lines
-    /// `first .. first + inserted` of `text`. An edit inside one line is
-    /// `(line, 1, 1)`; one that joins two lines is `(line, 2, 1)`. Returns
-    /// how many lines it lexed.
-    ///
-    /// Finding line `first` in `text` is a byte search; lexing touches only
-    /// the inserted lines and the lines whose starting state changed.
+    /// Bring the cache up to date with `text` after an edit replaced lines `first .. first + removed` of the old text with lines `first .. first + inserted` of `text`.
     pub fn splice(&mut self, text: &str, first: usize, removed: usize, inserted: usize) -> usize {
         let first = first.min(self.lines.len());
         let removed = removed.min(self.lines.len().saturating_sub(first));
@@ -1030,8 +896,6 @@ impl LexCache {
                 .map(|(at, _)| at.saturating_add(1)),
         };
         let Some(offset) = offset else {
-            // `text` has fewer lines than the edit's first: the numbers do
-            // not describe it, so lex it whole.
             *self = Self::new(self.language, text);
             return self.lines.len();
         };
@@ -1066,8 +930,6 @@ impl LexCache {
             index = index.saturating_add(1);
             lexed = lexed.saturating_add(1);
         }
-        // The edit reached the last line: the cache now ends where `text`
-        // does.
         self.lines.truncate(index);
         for line in lines {
             let (spans, next) = self.language.lex_line(state, line);

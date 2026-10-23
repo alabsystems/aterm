@@ -4,24 +4,11 @@
 // Derived from winit 0.30.13 src/monitor.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-//! Types useful for interacting with a user's monitors.
-//!
-//! If you want to get basic information about a monitor, you can use the
-//! [`MonitorHandle`] type. This is retrieved from one of the following
-//! methods, which return an iterator of [`MonitorHandle`]:
-//! - [`ActiveEventLoop::available_monitors`][crate::event_loop::ActiveEventLoop::available_monitors].
-//! - [`Window::available_monitors`][crate::window::Window::available_monitors].
+//! Types for querying monitor resolution, position, scale factor, and refresh rate.
 use crate::dpi::{PhysicalPosition, PhysicalSize};
 use crate::platform_impl;
 
-// LOCAL PATCH (aterm), 2026-10-16 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 5):
-// video modes serve only exclusive fullscreen, which no aterm crate asks for. The macOS backend
-// no longer implements either, nor (2026-10-21, WC.8) the Linux module, so `VideoModeHandle`
-// and `video_modes` are `#[cfg(windows_platform)]` until the Windows carve deletes them.
-
 /// Describes a fullscreen video mode of a monitor.
-///
-/// Can be acquired with [`MonitorHandle::video_modes`].
 #[cfg(windows_platform)]
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct VideoModeHandle {
@@ -66,14 +53,7 @@ impl VideoModeHandle {
         self.video_mode.size()
     }
 
-    /// Returns the bit depth of this video mode, as in how many bits you have
-    /// available per color. This is generally 24 bits or 32 bits on modern
-    /// systems, depending on whether the alpha channel is counted or not.
-    ///
-    /// ## Platform-specific
-    ///
-    /// - **Wayland / Orbital:** Always returns 32.
-    /// - **iOS:** Always returns 32.
+    /// Returns the bit depth of this video mode.
     #[inline]
     pub fn bit_depth(&self) -> u16 {
         self.video_mode.bit_depth()
@@ -85,8 +65,7 @@ impl VideoModeHandle {
         self.video_mode.refresh_rate_millihertz()
     }
 
-    /// Returns the monitor that this video mode is valid for. Each monitor has
-    /// a separate set of valid video modes.
+    /// Returns the monitor that this video mode is valid for.
     #[inline]
     pub fn monitor(&self) -> MonitorHandle {
         MonitorHandle { inner: self.video_mode.monitor() }
@@ -108,21 +87,13 @@ impl std::fmt::Display for VideoModeHandle {
 }
 
 /// Handle to a monitor.
-///
-/// Allows you to retrieve information about a given monitor and can be used in [`Window`] creation.
-///
-/// [`Window`]: crate::window::Window
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MonitorHandle {
     pub(crate) inner: platform_impl::MonitorHandle,
 }
 
 impl MonitorHandle {
-    /// Returns a human-readable name of the monitor.
-    ///
-    /// Returns `None` if the monitor doesn't exist anymore.
-    ///
-    /// Not built on X11 or Wayland (WC.8: no aterm crate asks there).
+    /// Returns a human-readable name of the monitor, or `None` if unavailable.
     #[cfg(any(macos_platform, windows_platform))]
     #[inline]
     pub fn name(&self) -> Option<String> {
@@ -135,47 +106,25 @@ impl MonitorHandle {
         self.inner.size()
     }
 
-    /// Returns the top-left corner position of the monitor relative to the larger full
-    /// screen area.
+    /// Returns the top-left corner position of the monitor in physical coordinates.
     #[inline]
     pub fn position(&self) -> PhysicalPosition<i32> {
         self.inner.position()
     }
 
-    /// The monitor refresh rate used by the system.
-    ///
-    /// Return `Some` if succeed, or `None` if failed, which usually happens when the monitor
-    /// the window is on is removed.
-    ///
-    /// When using exclusive fullscreen (not on macOS), the refresh rate of the video mode that
-    /// was used to enter fullscreen should be used instead.
+    /// Returns the monitor refresh rate in millihertz, if available.
     #[inline]
     pub fn refresh_rate_millihertz(&self) -> Option<u32> {
         self.inner.refresh_rate_millihertz()
     }
 
-    /// Returns the scale factor of the underlying monitor. To map logical pixels to physical
-    /// pixels and vice versa, use [`Window::scale_factor`].
-    ///
-    /// See the [`dpi`](crate::dpi) module for more information.
-    ///
-    /// ## Platform-specific
-    ///
-    /// - **X11:** Can be overridden using the `WINIT_X11_SCALE_FACTOR` environment variable.
-    /// - **Wayland:** May differ from [`Window::scale_factor`].
-    /// - **Android:** Always returns 1.0.
-    ///
-    /// [`Window::scale_factor`]: crate::window::Window::scale_factor
+    /// Returns the scale factor of the underlying monitor.
     #[inline]
     pub fn scale_factor(&self) -> f64 {
         self.inner.scale_factor()
     }
 
     /// Returns all fullscreen video modes supported by this monitor.
-    ///
-    /// ## Platform-specific
-    ///
-    /// - **Web:** Always returns an empty iterator
     #[cfg(windows_platform)]
     #[inline]
     pub fn video_modes(&self) -> impl Iterator<Item = VideoModeHandle> {

@@ -10,10 +10,11 @@ use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::Duration;
 
-/// Names the test the child was started for. Set only on that child, so a
+/// Names the test the child was started for.
 const ALONE: &str = "ATERM_TEST_ALONE";
 
 /// How long the child may run before it is named wedged and SIGKILLed: a hang
+/// detector, never a latency budget.
 const CHILD_HANG: Duration = Duration::from_secs(5 * 60);
 
 /// The calling test's name, as libtest gives it to `--exact`.
@@ -146,6 +147,7 @@ fn is_var(var: &str) -> String {
 }
 
 /// What this process holds at `fd`, as the kernel names it: `fstat`'s file
+/// type, device, inode and (for a device) device number, plus the access mode.
 #[cfg(unix)]
 fn descriptor(fd: RawFd) -> Result<String, String> {
     let mut info = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -231,6 +233,7 @@ pub(crate) fn handed(var: &str) -> OwnedFd {
 }
 
 /// Where a stand-in's output goes: two files in a scratch directory of its
+/// own, read once it exited.
 struct Output {
     scratch: aterm_tempfile::TempDir,
 }
@@ -427,6 +430,7 @@ impl Ran {
     }
 
     /// What the child's one test said when it ended COULD NOT RUN: the rest of
+    /// its line that opens with [`aterm_spec::host::COULD_NOT_RUN`].
     fn could_not_run(&self) -> Option<&str> {
         if self.status.is_none_or(|status| status.success()) {
             return None;
@@ -478,6 +482,8 @@ mod tests {
     const ROLE: &str = "ATERM_TEST_ALONE_READIED_THEN_ENDED";
 
     /// A stand-in that readied the caller and then ended, both between the
+    /// wait's first look at `ready` and its look at the stand-ins, readied it:
+    /// the wait asks `ready` again before it judges the end.
     #[test]
     fn a_stand_in_that_readied_then_ended_between_two_looks_readied() {
         if std::env::var_os(ROLE).is_some() {

@@ -1,37 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The supervisor: what a manager agent needs to keep a worker (a Claude Code,
-//! Codex, agy, Muse Code or Gemini CLI session in another aterm tab) moving
-//! without rubber-stamping it. Each is read by its own grammar
-//! (`aterm_phase::Program::reader`), Gemini CLI by its screen under `node`,
-//! the name its process runs as, and answered by the keys it measured
-//! (`aterm_phase::Program::supervisable`): Muse Code's boxes and question by
-//! the cursor and Enter, its typed text submitted only once its echo held
-//! still. No press or typed line ever answers an agent's sign-in menu, whose
-//! options open a browser.
-//!
-//! * [`classify::classify_command`]: is this shell line read-only?
-//! * [`policy::approval::decide`]: which option, if any, to press on an approval
-//!   box, under which rule and behind which guard ([`policy`]); a question dialog
-//!   goes to [`policy::question::answer_question`], under `[harness]
-//!   answer_questions` and `question_priority` ([`QuestionPriority`]).
-//! * [`prompt::parse_prompt`]: the approval box on the screen, parsed.
-//! * [`phase::worker_phase`]: busy / prompt / limited / idle / question, from one
-//!   read; [`phase::survey_open`]: the session survey; [`phase::context_left`]:
-//!   context left before auto-compact.
-//! * [`run::Session`]: the loop over the control verbs that the window's host
-//!   runs on every agent session ([`run::Session::run_hosted`]), and that
-//!   `aterm drive phase` and `answer` read and type through.
-//! * [`report`]: what the worker said since the manager's turn, with the rows a
-//!   fullscreen app scrolled off.
-//! * [`limit`]: when a limit notice says it resets, as a Unix time.
-//! * [`tap_clock`]: the usage tap's reading of the walled process, which times
-//!   the continuation at a usage wall where it names the reset (`[harness]
-//!   usage_tap`).
-//! * [`occupancy`]: what the harness measures of a session's wait on its own background work
-//!   (the hold's clock), under `[harness] occupancy`; [`facts`]: which measured episodes a
-//!   session has been told.
+//! The supervisor: what a manager agent needs to keep a worker moving without rubber-stamping it.
 
 pub mod approvals;
 pub mod background;
@@ -41,8 +11,6 @@ pub mod config;
 pub mod facts;
 pub(crate) mod fx;
 pub mod ladder;
-// The phase reader and the prompt parser live in `aterm-phase` (the server's
-// agent verdict is read by the same reader), re-exported here.
 pub use aterm_phase::{phase, prompt};
 pub mod journal;
 pub mod ledger;
@@ -84,12 +52,7 @@ pub use run::{
 };
 pub use transport::{Endpoint, RelayCtl};
 
-/// A scratch path of one call's own, for a test:
-/// `<tmp>/aterm-<kind>-<tag>-<pid>-<n>`, `<n>` a per-process call count.
-///
-/// Unique by construction: tests run on parallel threads of one process, and a
-/// shared tag would let one test's clean-up delete another's files. Nothing is
-/// created here.
+/// A scratch path of one call's own, for a test.
 #[cfg(test)]
 pub(crate) fn test_scratch_path(kind: &str, tag: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -98,10 +61,7 @@ pub(crate) fn test_scratch_path(kind: &str, tag: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("aterm-{kind}-{tag}-{}-{n}", std::process::id()))
 }
 
-/// `path` canonicalized, for a test: every link resolved, as the policy's probes
-/// see it. Windows names a canonical path `\\?\C:\…`, which git takes for no
-/// path (a `GIT_CONFIG_GLOBAL`, an `include.path`, a submodule's URL); there it
-/// is the drive path it stands for.
+/// `path` canonicalized, for a test: every link resolved, as the policy's probes see it.
 #[cfg(test)]
 pub(crate) fn test_canonical(path: &std::path::Path) -> std::path::PathBuf {
     let real = std::fs::canonicalize(path).expect("canonical");
@@ -113,13 +73,8 @@ pub(crate) fn test_canonical(path: &std::path::Path) -> std::path::PathBuf {
     drive.unwrap_or(real)
 }
 
-/// A scratch directory of one call's own, created, and removed on drop (the guard
-/// form of [`test_scratch_path`]), so a failing or early-returning test leaves
-/// nothing behind. Dereferences to its path.
-///
-/// Under `/tmp` on unix rather than `$TMPDIR`: it holds stand-in instances'
-/// control sockets, and a unix-socket path must fit in 104 bytes, which macOS's
-/// 49-byte per-user temp dir plus a unique name can exceed.
+/// A scratch directory of one call's own, created, and removed on drop (the guard form of
+/// [`test_scratch_path`]), so a failing or early-returning test leaves nothing behind.
 #[cfg(test)]
 pub(crate) struct ScratchDir(aterm_tempfile::TempDir);
 

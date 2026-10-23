@@ -1,10 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The codex-alab path over a stand-in aterm instance on a real socket (every request
-//! recorded, nothing typed anywhere) and a scripted kernel: a crashed codex-alab whose shell
-//! is back at its prompt, and the relaunch that appears under it when its line is typed. Then
-//! the run's snapshot, and the prune bound to `HarnessUpgradeStateCollection`.
+//! The codex-alab path over a stand-in aterm instance on a real socket (every request recorded, nothing typed anywhere) and a scripted kernel.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -138,7 +135,6 @@ fn instance(dir: &Path, w: World) -> (String, crate::harness::FakeInstanceLog) {
                 .collect::<Vec<_>>()
                 .join("\n"),
             "line" => "OK % ".to_string(),
-            // The server's hard lease: the harness's hand on the tab.
             "lease" if line.contains(" acquire ") => "OK lease acquired".to_string(),
             "lease" => "OK lease released".to_string(),
             "turn" => {
@@ -155,9 +151,7 @@ fn instance(dir: &Path, w: World) -> (String, crate::harness::FakeInstanceLog) {
 /// The scripted kernel: [`TUI`] crashed out of [`SHELL`], whose group has the terminal back;
 /// the relaunch [`NEW`] appears under the shell, holding the thread's lock, once its line is
 /// typed, and is up at the `up_at`th look with the frame it names (never: `None`), or ends after
-/// `ends_at` looks; its kernel start reads `births` read by read, then [`NEW_BIRTH`]. Each look
-/// is marked in the stand-in's request log (`kernel first-frame <n> <idle|turn|->`), between the
-/// requests it falls between. For a run's snapshot, [`TUI`]'s image and open files.
+/// `ends_at` looks; its kernel start reads `births` read by read, then [`NEW_BIRTH`].
 struct Crashed {
     relaunched: Arc<AtomicBool>,
     lock: PathBuf,
@@ -458,7 +452,7 @@ impl Rig {
 const TYPES_OR_READS: [&str; 7] = ["turn", "key", "send", "paste", "feed", "text", "cell"];
 
 /// A jail that refuses other processes' descriptor tables makes the all-process census
-/// unknown. The conversation's own kernel lock still gives an authoritative free answer.
+/// unknown.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_free_writer_lock_needs_no_read_of_unrelated_process_descriptors() {
@@ -498,7 +492,6 @@ fn a_free_writer_lock_needs_no_read_of_unrelated_process_descriptors() {
 }
 
 /// A free kernel lock admits exactly the resume line; a held or unknown answer does not.
-/// Ownership is read again before typing, so an intervening change never gets a line.
 #[test]
 fn the_writer_lock_must_be_proven_free_at_both_relaunch_checks() {
     use aterm_uds::ownerlock::Owner::{Dead, Live, Unknown};
@@ -536,7 +529,7 @@ fn the_writer_lock_must_be_proven_free_at_both_relaunch_checks() {
 /// A crash relaunch held by a person at the prompt waits with nothing typed and no witness
 /// recorded; carried at the next decision, its line goes in under the captured `CODEX_HOME`
 /// alias, the witness is recorded once the line landed, and the relaunch is done once the new
-/// TUI leads the tab. A third decision types nothing (`ended:handled`).
+/// TUI leads the tab.
 #[test]
 fn a_self_claimed_relaunch_records_its_witness_after_a_deferred_carry() {
     let rig = Rig::new("self-claim-carry", &["zsh: killed     codex"]);
@@ -578,8 +571,7 @@ fn a_self_claimed_relaunch_records_its_witness_after_a_deferred_carry() {
 }
 
 /// The line carries the `CODEX_HOME` the crashed process's own environment had, verbatim:
-/// unset, a path, or set empty. The validated line is the one the copy's record names, checked
-/// against the live process by `self_claimed::validate`.
+/// unset, a path, or set empty.
 #[test]
 fn a_self_claimed_crash_relaunch_keeps_the_captured_home_environment() {
     for case in ["unset", "path", "empty"] {
@@ -646,9 +638,7 @@ fn a_self_claimed_crash_relaunch_keeps_the_captured_home_environment() {
 
 /// CODEX-ALAB CARRIES ON BY ITSELF (the contract §5): once its line is in and the new TUI leads
 /// the tab, the relaunch is done, though the tab shows an idle Codex at an empty composer: no
-/// continuation is typed, no key pressed, and the screen is not read again. Under a window's
-/// worker (`hand_back`) too, which adopts nothing and leaves nothing in flight for its
-/// continuation step. The log is the stand-in's every request, the line's own `turn` among them.
+/// continuation is typed, no key pressed, and the screen is not read again.
 #[test]
 fn the_crash_relaunch_types_nothing_after_the_new_tui_leads_the_tab() {
     for hand_back in [false, true] {
@@ -757,9 +747,7 @@ impl Rig {
 /// reads at its first idle (here its third look), never as its TUI first leads the tab, so
 /// its launch probe — its first `status`, read as it starts — sees
 /// `hand=lease:aterm-harness@<aterm>`, and the ledger says so; still `done:resumed`, nothing
-/// typed and no screen read meanwhile. NEGATIVE CONTROL: the hold's bound at zero — the
-/// give-back as the new TUI leads the tab, the carve's (3999d9adc6) — shows in the same log as
-/// the release before the first idle, which the check refuses.
+/// typed and no screen read meanwhile.
 #[test]
 fn the_relaunch_hand_is_held_to_the_relaunched_processs_first_idle() {
     for (bound, held) in [(None, true), (Some(Duration::ZERO), false)] {
@@ -791,8 +779,7 @@ fn the_relaunch_hand_is_held_to_the_relaunched_processs_first_idle() {
 /// (its launch probe has read) and its frame in a turn or a box — a person's turn, or a carry-on
 /// that went before a later step took the hand — is past its first idle, and codex-alab's own
 /// acts in that turn wait for this very lease (the contract §5, `hand=-` before every act), so
-/// the hand goes back at that look. NEGATIVE CONTROL: a look that finds no frame named holds
-/// on, to the bound.
+/// the hand goes back at that look.
 #[test]
 fn a_turn_already_under_way_ends_the_relaunch_hold_at_once() {
     for (up, looks_once, said) in [
@@ -814,9 +801,7 @@ fn a_turn_already_under_way_ends_the_relaunch_hold_at_once() {
 /// AN UNREAD KERNEL START IS UNKNOWN, NEVER THE RELAUNCHED PROCESS'S END: off Apple the start
 /// is a `ps`, which can fail once; read as an end, the hand went back while codex-alab still
 /// ran (or was never held at all, when the first read failed), and its launch probe could read
-/// `hand=-`. Here the first two reads fail: the hold still runs to the first idle. NEGATIVE
-/// CONTROL: another start of the same pid (the process gone, its pid another's) ends the hold
-/// at that read, looked at no more.
+/// `hand=-`.
 #[test]
 fn an_unread_kernel_start_never_ends_the_relaunch_hold() {
     let other = "Thu Oct 16 08:00:10 2026".to_string();
@@ -851,8 +836,7 @@ fn an_unread_kernel_start_never_ends_the_relaunch_hold() {
 /// The hold ends with the relaunched process: one that ends before its first idle (the proof's
 /// second crash, killed as soon as its claim is proven) has the hand given back at its end,
 /// looked at no more, and the relaunch is still `done:resumed` (its own exit is its own
-/// copy's to decide, `relaunch::outcome`). NEGATIVE CONTROL: one that neither ends nor idles
-/// is looked at until the hold's bound.
+/// copy's to decide, `relaunch::outcome`).
 #[test]
 fn the_relaunch_hand_goes_back_when_the_relaunched_process_ends_before_its_first_idle() {
     for ends_at in [Some(2), None] {
@@ -888,8 +872,7 @@ fn the_relaunch_hand_goes_back_when_the_relaunched_process_ends_before_its_first
 
 /// THE COPY NAMES THE THREAD, NEVER THE SCREEN: the shell shows an exit hint naming another
 /// conversation (as an older Codex's exit in the same tab leaves it), and the relaunch resumes
-/// the record's own. Negative control: the hint on that screen names the other thread, and the
-/// thread the record holds is not it.
+/// the record's own.
 #[test]
 fn an_exit_hint_naming_another_thread_is_not_read() {
     let hint = [
@@ -913,8 +896,7 @@ fn an_exit_hint_naming_another_thread_is_not_read() {
 }
 
 /// A codex-alab's run read while it runs: the thread its writer lock names (embedded), else
-/// its launch's `resume <id>`, else none; never the vendor daemon's word. Negative controls:
-/// two locks are ambiguous, and a face of the binary that is no TUI is no run.
+/// its launch's `resume <id>`, else none; never the vendor daemon's word.
 #[test]
 fn a_codex_alab_run_names_its_lock_or_its_resumed_thread() {
     let mut rig = Rig::new("alab-snapshot", &[]);
@@ -987,8 +969,6 @@ impl Crashed {
     }
 }
 
-// ---------------------------------------------------------------- the prune
-
 /// Opts for a prune over `dir`'s state, nothing live about it.
 fn prune_opts(dir: &Path) -> Opts {
     Opts {
@@ -1053,8 +1033,7 @@ fn registry(dir: &Path, live: &[&str]) -> PathBuf {
 
 /// A record's projection onto `HarnessUpgradeStateCollection`, from what the
 /// test set up (never from the code under test): its tab alive or proven
-/// gone, its round's stage, whether its week has passed. `aged` stays at its
-/// initial 0: `Prune`'s guard never reads it.
+/// gone, its round's stage, whether its week has passed.
 fn collection_state(
     model: &aterm_spec::derive::Model,
     tab_lives: bool,
@@ -1079,8 +1058,7 @@ fn collection_state(
 /// One pass's decision on one record held to `Prune`'s guard, both ways: a
 /// removal the model does not allow breaks safety, and a record the model
 /// lets go that a pass with a clean reading kept breaks the prune's weak
-/// fairness (every such pass takes it). After a removal every invariant
-/// holds.
+/// fairness (every such pass takes it).
 fn collection_conforms(
     model: &aterm_spec::derive::Model,
     before: &aterm_spec::interp::State,
@@ -1110,16 +1088,12 @@ fn collection_conforms(
 }
 
 /// Tier-1: the real `prune`, reading the real registry over records on disk, bound to the
-/// derived `HarnessUpgradeStateCollection`. A closed tab's settled record goes once it has sat
-/// a week (done, failed, or pending with no word of the owner's), and nothing else does.
-/// Negative controls: a live tab's record (the host's own, or one only the registry names) and
-/// a restart in flight survive however old; the model's `PruneLiveTab` member would take the
-/// live one; and the Claude-only `prune_states` is caught keeping a record the model lets go.
+/// derived `HarnessUpgradeStateCollection`.
 #[test]
 #[allow(clippy::too_many_lines)]
 fn the_prune_collects_a_closed_tabs_settled_codex_record_and_nothing_else() {
-    const HERE: &str = "s-0a0a0a0a0a0a"; // the host's own live tab
-    const THERE: &str = "s-0b0b0b0b0b0b"; // another window's: the registry alone names it
+    const HERE: &str = "s-0a0a0a0a0a0a";
+    const THERE: &str = "s-0b0b0b0b0b0b";
     let old = super::super::STATE_KEEP_S + 3_600;
     let model = aterm_models_harness::harness_upgrade_state_collection_model();
     let dir = scratch("codex-prune");
@@ -1127,7 +1101,6 @@ fn the_prune_collects_a_closed_tabs_settled_codex_record_and_nothing_else() {
     let graph = registry(&dir, &[HERE, THERE]);
     let known_live = vec![HERE.to_string()];
 
-    // (tab, its tab lives, phase, the owner's word, sat a week, removed?)
     let skip = || Request::Skip("0.158.0".to_string());
     let failed = |why: &str| Phase::Failed(why.to_string());
     let none = || Request::None;
@@ -1151,10 +1124,6 @@ fn the_prune_collects_a_closed_tabs_settled_codex_record_and_nothing_else() {
             filed(&opts, tab, phase.clone(), request.clone(), ago)
         })
         .collect();
-    // Beside them, outside the model's projection and never the Codex
-    // prune's: a Claude record filed under a Codex name, a Codex record whose
-    // name and tab disagree, a Claude conversation's record, and a file that
-    // is no record.
     let done = |agent: Agent, tab: &str| St {
         agent,
         tab: tab.to_string(),
@@ -1185,10 +1154,6 @@ fn the_prune_collects_a_closed_tabs_settled_codex_record_and_nothing_else() {
     std::fs::write(&models, "{}").expect("models");
     let now = now_s();
 
-    // Nothing proves a tab gone, so nothing goes: a pass that knows no live
-    // tab, a registry missing a tab the pass knows is live (another runtime
-    // directory), no registry at all, a dry run, and a break of the agent's
-    // background work, whatever they read.
     let unvouched = ["s-0c0c0c0c0c0c".to_string()];
     prune(&opts, now, registry_life(Some(&graph), &[]));
     prune(&opts, now, registry_life(Some(&graph), &unvouched));
@@ -1222,8 +1187,6 @@ fn the_prune_collects_a_closed_tabs_settled_codex_record_and_nothing_else() {
         "a registry that misses a live tab vouches for nothing"
     );
 
-    // The Claude-only prune keeps a closed tab's settled week-old Codex
-    // record, which the model lets go.
     super::super::prune_states(&opts, &[], now);
     let dead_done = collection_state(&model, false, &Phase::Done, &Request::None, true);
     assert!(paths[0].exists(), "the Claude lane passes Codex records by");
@@ -1231,11 +1194,7 @@ fn the_prune_collects_a_closed_tabs_settled_codex_record_and_nothing_else() {
         collection_conforms(&model, &dead_done, !paths[0].exists()).is_err(),
         "the bind catches the lane that kept it for ever"
     );
-    // (It took the settled Claude records: those are its own.)
     assert!(!strangers[0].exists() && !strangers[2].exists());
-    // So the Claude record under a Codex name the Codex pass must pass by is
-    // filed again here, after the Claude lane took the first: settled, a week
-    // old, its tab proven gone, everything but a Codex record.
     let claude_under_codex = filed_as(
         &opts,
         &key("s-dead0000000c"),
@@ -1243,7 +1202,6 @@ fn the_prune_collects_a_closed_tabs_settled_codex_record_and_nothing_else() {
         old,
     );
 
-    // The pass.
     let befores: Vec<_> = cases
         .iter()
         .map(|(_, lives, phase, request, week_old, _)| {
@@ -1274,8 +1232,6 @@ fn the_prune_collects_a_closed_tabs_settled_codex_record_and_nothing_else() {
         "a file that is no record is not the prune's"
     );
 
-    // Negative controls: the live tabs' records and the restarts in flight
-    // survive, and the model's `PruneLiveTab` member would take a live one.
     assert!(
         paths[3].exists() && paths[4].exists(),
         "live tabs' records stay"
@@ -1292,9 +1248,7 @@ fn the_prune_collects_a_closed_tabs_settled_codex_record_and_nothing_else() {
 
 /// A registry speaks only for its own state root: the prune reads the
 /// rendezvous registry only when it and the state root are both the person's
-/// defaults or both private. A private runtime directory over the default
-/// state root (a private instance with the person's `$HOME` and no state root
-/// of its own) reads none of the person's tabs and would call each one gone.
+/// defaults or both private.
 #[test]
 fn a_registry_vouches_only_for_a_state_root_of_its_own_kind() {
     for (private_registry, private_state, vouches) in [
@@ -1313,9 +1267,7 @@ fn a_registry_vouches_only_for_a_state_root_of_its_own_kind() {
 
 /// THE RETIRED LANE'S LEFTOVERS GO ONCE A WEEK OLD ([`prune_retired`]): a daemon's pin stamp
 /// (its directory too, once empty) and a tab's goal-pause record, neither of which anything
-/// writes any more. Negative controls: the same files a day old stay, a file beside them of
-/// another name stays (and keeps its directory), and a dry run or a background break removes
-/// nothing.
+/// writes any more.
 #[test]
 fn the_retired_lanes_pin_stamps_and_goal_records_go_once_a_week_old() {
     let dir = scratch("retired-leftovers");

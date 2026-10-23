@@ -1,31 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The C toolchain: a prerequisite atpkg detects and never ships
-//! (`docs/DESIGN-clt-prerequisite-2026-08-31.md`).
-//!
-//! A Trust build compiles C in build scripts (`zstd`, `ring`) and links through `cc`, so a
-//! machine without a C compiler fails its first `targo build`. A C toolchain is a machine
-//! capability atpkg cannot version, pin, gc or uninstall (and Apple's may not be
-//! redistributed): it is probed, reported in `doctor` and after the default set, and never
-//! installed here.
-//!
-//! The probe never raises Apple's install dialog. On macOS `/usr/bin/cc` is a libxcselect
-//! shim that, with no developer tools, requests an install and blocks until a human answers.
-//! A `cc` in the shim directory runs only once the active developer directory (read off
-//! `/var/db/xcode_select_link`, no process) holds a `clang` and a bounded `xcrun --find cc`
-//! names a compiler. Any other `cc` answers a bounded `--version`. `$CC` is not consulted:
-//! rustc does not use it for linking.
-//!
-//! A compiler that answers must then build: the `cc` a build would run compiles and links a
-//! one-line `#include <stdio.h>` program in a fresh `0700` directory under the temp root,
-//! bounded, and is `Ready` only when it exits 0 and wrote a non-empty program. The program
-//! is never executed (the wrong question under Rosetta or a cross toolchain). This catches a
-//! gcc without libc headers, a developer directory whose SDK is gone, a refusing linker:
-//! each `Broken`, naming the first stderr line. A temp root that refuses the directory is
-//! `Unproven`, never `Broken`. On macOS the build goes through the shim `cc`, not the
-//! resolved clang: the shim supplies the SDK (a bare CLT clang cannot find `stdio.h`), and
-//! it is what rustc and `cc-rs` run.
+//! The C toolchain: a prerequisite atpkg detects and never ships.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -34,15 +10,12 @@ use std::time::Duration;
 /// What the probe found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CcVerdict {
-    /// The `cc` a build would run compiled and linked the probe program. `driver` names
-    /// that compiler: on macOS the one the shim forwards to (`xcrun --find cc`, e.g.
-    /// `…/CommandLineTools/usr/bin/cc`), elsewhere the `cc` found on `PATH`.
+    /// The `cc` a build would run compiled and linked the probe program.
     Ready {
         /// The compiler that built the probe program.
         driver: PathBuf,
     },
-    /// macOS: `cc` is the libxcselect shim and no developer directory holds a `clang`,
-    /// so running it would only raise Apple's install dialog.
+    /// macOS: `cc` is the libxcselect shim and no developer directory holds a `clang`.
     NoDeveloperDir,
     /// No `cc` on `PATH` at all.
     NoDriver,
@@ -58,22 +31,19 @@ pub enum CcVerdict {
         /// The compiler that was asked.
         driver: PathBuf,
     },
-    /// The compiler answered, but the build probe could not run (no private directory
-    /// under the temp root, or its source could not be written) — unknown, not broken.
+    /// The compiler answered, but the build probe could not run — unknown, not broken.
     Unproven {
         /// The compiler that answered.
         driver: PathBuf,
         /// Why the build probe could not run.
         why: String,
     },
-    /// A target where a `cc` test is the wrong question (Windows: rustc owns MSVC
-    /// discovery).
+    /// A target where a `cc` test is the wrong question (Windows: rustc owns MSVC discovery).
     NotProbed,
 }
 
 impl CcVerdict {
-    /// Whether this verdict means a Trust build cannot compile here (an answer, not an
-    /// unknown).
+    /// Whether this verdict means a Trust build cannot compile here (an answer, not an unknown).
     #[must_use]
     pub fn blocks_builds(&self) -> bool {
         matches!(
@@ -82,12 +52,7 @@ impl CcVerdict {
         )
     }
 
-    /// The one command that fixes this verdict, when there is one: installing a toolchain
-    /// fixes a missing one. A compiler that cannot build names its own cause ([`Self::line`]);
-    /// off macOS that is most often missing libc headers, which the install supplies, while
-    /// on macOS the refusing compiler is already installed (an unaccepted Xcode license, a
-    /// PATH-first `cc` with no SDK) and installing the tools again would not change it. `None`
-    /// for every verdict that does not block builds.
+    /// The one command that fixes this verdict, when there is one.
     #[must_use]
     pub fn fix(&self) -> Option<&'static str> {
         match self {
@@ -142,11 +107,7 @@ impl CcVerdict {
     }
 }
 
-/// The act that installs a C toolchain on this platform. On macOS it is `base.clt`
-/// (docs/DESIGN-init-system-2026-10-20.md §4.2): `aterm init --only base.clt` installs
-/// Apple's Command Line Tools through the machines agent's root path, with one password
-/// prompt in the terminal, where `xcode-select --install` raises a dialog on the desktop
-/// and waits on whoever is there.
+/// The act that installs a C toolchain on this platform.
 #[must_use]
 pub fn act() -> &'static str {
     if cfg!(target_os = "macos") {
@@ -162,25 +123,18 @@ pub fn act() -> &'static str {
 /// How long one compiler probe may take.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Where the probe looks beyond `PATH`, injected so a test can fake the shim directory and
-/// the developer-directory link.
+/// Where the probe looks beyond `PATH`.
 #[derive(Clone, Debug)]
 pub struct CcHost {
-    /// The directory whose `cc` is the libxcselect install shim — `/usr/bin` on macOS,
-    /// `None` elsewhere (no such shim).
+    /// The directory whose `cc` is the libxcselect install shim.
     pub shim_dir: Option<PathBuf>,
-    /// The symlink naming the active developer directory (`xcode-select -s`), read
-    /// without spawning anything.
+    /// The symlink naming the active developer directory, read without spawning anything.
     pub xcode_select_link: PathBuf,
-    /// The developer directory when the link is absent: where the Command Line Tools
-    /// install.
+    /// The developer directory when the link is absent: where the Command Line Tools install.
     pub default_developer_dir: PathBuf,
-    /// How long each compiler probe may take: [`PROBE_TIMEOUT`] on this machine. Tests widen
-    /// it for a just-written script (its first exec waits on the system's code assessment)
-    /// and narrow it for a wedged compiler.
+    /// How long each compiler probe may take: [`PROBE_TIMEOUT`] on this machine.
     pub bound: Duration,
-    /// Where the build probe makes its private directory: the system temp directory on
-    /// this machine.
+    /// Where the build probe makes its private directory.
     pub tmp_root: PathBuf,
 }
 
@@ -220,7 +174,6 @@ pub fn probe_with(path_var: Option<&OsStr>, host: &CcHost) -> CcVerdict {
         Ok(Located::Shim(cc)) => cc,
         Err(verdict) => return verdict,
     };
-    // `xcrun --find cc` names the tool the shim forwards to.
     let shim_dir = cc.parent().unwrap_or(Path::new("/usr/bin"));
     match ask(&shim_dir.join("xcrun"), &cc, &["--find", "cc"], host.bound) {
         CcVerdict::Ready { driver } => build_probe(&cc, driver, path_var, host),
@@ -228,13 +181,7 @@ pub fn probe_with(path_var: Option<&OsStr>, host: &CcHost) -> CcVerdict {
     }
 }
 
-/// Whether a C toolchain is installed here, read without running anything: `Some(false)`
-/// exactly where [`probe_with`] answers [`CcVerdict::NoDriver`] or
-/// [`CcVerdict::NoDeveloperDir`] (what installing one fixes, [`CcVerdict::fix`]),
-/// `Some(true)` where it would go on to ask a compiler, `None` where it probes nothing
-/// (Windows). A few `stat`s and one `readlink`: what the seed reads at every launch to end
-/// the window's missing-toolchain entry once the tools are in place, without the build
-/// probe's compile.
+/// Whether a C toolchain is installed here, read without running anything.
 #[must_use]
 pub fn installed_with(path_var: Option<&OsStr>, host: &CcHost) -> Option<bool> {
     (!cfg!(windows)).then(|| locate(path_var, host).is_ok())
@@ -248,9 +195,6 @@ enum Located {
     Shim(PathBuf),
 }
 
-/// The read-only half of [`probe_with`]: the first `cc` on `path_var`, and for the install
-/// shim whether the active developer directory (the link, else the default) holds a
-/// `clang`; [`CcVerdict::NoDriver`] or [`CcVerdict::NoDeveloperDir`] when the probe stops
 /// there. Nothing is spawned.
 fn locate(path_var: Option<&OsStr>, host: &CcHost) -> Result<Located, CcVerdict> {
     let Some(cc) = path_var.and_then(|path| {
@@ -268,8 +212,6 @@ fn locate(path_var: Option<&OsStr>, host: &CcHost) -> Result<Located, CcVerdict>
     if !is_shim {
         return Ok(Located::Plain(cc));
     }
-    // The shim: `xcrun` is asked only when the developer directory holds a clang, and the
-    // shim runs only once `xcrun` names a compiler.
     let developer_dir = std::fs::read_link(&host.xcode_select_link)
         .unwrap_or_else(|_| host.default_developer_dir.clone());
     let holds_clang = [
@@ -285,12 +227,9 @@ fn locate(path_var: Option<&OsStr>, host: &CcHost) -> Result<Located, CcVerdict>
     }
 }
 
-/// The build probe's program: the include proves the headers (the SDK on macOS, libc's on
 /// Linux) resolve.
 const PROBE_SOURCE: &str = "#include <stdio.h>\nint main(void) { return 0; }\n";
 
-/// Make `cc` compile and link [`PROBE_SOURCE`] in a private directory under
-/// `host.tmp_root`, within `host.bound`: `Ready { driver: resolved }` only when it exits 0
 /// and wrote a non-empty program, which is never run. The directory is always removed.
 fn build_probe(cc: &Path, resolved: PathBuf, path_var: Option<&OsStr>, host: &CcHost) -> CcVerdict {
     let nanos = aterm_time::since_epoch().map_or(0, |d| d.as_nanos());
@@ -344,8 +283,6 @@ fn build_probe(cc: &Path, resolved: PathBuf, path_var: Option<&OsStr>, host: &Cc
 
 /// Create `dir`, readable by this user only; an existing path is an error, never reused.
 pub(crate) fn private_dir(dir: &Path) -> std::io::Result<()> {
-    // One builder per cfg arm: a shared `let mut` mutated only on unix is `unused_mut`
-    // elsewhere.
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt as _;
@@ -382,7 +319,6 @@ fn first_stderr_line(out: &std::process::Output) -> String {
         )
 }
 
-/// Run `bin args…` within `bound` as a verdict about `driver`: exit 0 is Ready (naming the
 /// path `xcrun` printed, if any), any other exit is Broken with the first stderr line.
 fn ask(bin: &Path, driver: &Path, args: &[&str], bound: Duration) -> CcVerdict {
     let mut cmd = aterm_uds::spawnfd::command(bin);
@@ -444,12 +380,9 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    /// The bound for a probe whose script must answer: a just-written file's first exec
-    /// waits on the system's code assessment, which a loaded machine stretches past
     /// [`PROBE_TIMEOUT`]. These cases test reading the answer, not the bound.
     const ANSWER: Duration = Duration::from_secs(120);
 
-    /// No shim directory: every `cc` is a plain compiler; the build probe works under
     /// `<root>/tmp`.
     fn plain_host(root: &Path) -> CcHost {
         let tmp_root = root.join("tmp");
@@ -463,7 +396,6 @@ mod tests {
         }
     }
 
-    /// A fake `cc` that answers `--version` and, asked `-o <out> <src>`, builds: it writes
     /// `<out>` as a runnable script that would leave `<ran>` behind if anything ran it.
     fn building_cc(path: &Path, ran: &Path) {
         script(
@@ -488,7 +420,6 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// No `cc` is NoDriver, one that answers is Ready, one that refuses is Broken with its
     /// first stderr line; NoDriver and Broken block builds.
     #[test]
     fn a_plain_cc_is_asked_its_version_on_the_path_it_is_handed() {
@@ -527,7 +458,6 @@ mod tests {
             }
         );
         assert!(verdict.blocks_builds());
-        // A directory named `cc`, or a file nobody may run, is not a compiler.
         let odd = root.join("odd");
         std::fs::create_dir_all(odd.join("cc")).unwrap();
         assert_eq!(
@@ -537,8 +467,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The shim never runs without a compiler behind it: with no clang in the developer
-    /// directory nothing is spawned; with one, `xcrun --find cc` answers first and the shim
     /// is only asked to build the probe. The verdict names what `xcrun` resolved.
     #[test]
     fn the_install_shim_runs_only_behind_a_resolved_compiler() {
@@ -546,7 +474,6 @@ mod tests {
         let shim = root.join("usr-bin");
         let ran = root.join("ran");
         let xcrun_ran = root.join("xcrun-ran");
-        // The shim records its argv, then builds like a compiler.
         script(
             &shim.join("cc"),
             &format!(
@@ -579,7 +506,6 @@ mod tests {
         assert!(!ran.exists(), "the shim was spawned");
         assert!(!xcrun_ran.exists(), "xcrun was spawned");
 
-        // With a clang: xcrun is asked which cc, then the shim builds.
         script(&clang_dir.join("usr/bin/clang"), "exit 0");
         assert_eq!(
             probe_with(Some(shim.as_os_str()), &host),
@@ -607,7 +533,6 @@ mod tests {
         );
         std::fs::remove_file(&ran).unwrap();
 
-        // `xcode-select -s` names an Xcode.app with no clang: nothing runs.
         let xcode = root.join("Xcode.app/Contents/Developer");
         std::fs::create_dir_all(&xcode).unwrap();
         std::os::unix::fs::symlink(&xcode, &host.xcode_select_link).unwrap();
@@ -619,8 +544,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// [`installed_with`] is the probe's read-only half: `Some(false)` exactly where the probe
-    /// stops at NoDriver or NoDeveloperDir, `Some(true)` where it would ask a compiler, and
     /// it spawns nothing on either path.
     #[test]
     fn installed_is_false_exactly_where_the_probe_finds_nothing_to_ask() {
@@ -654,7 +577,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A compiler that answers `--version` but cannot build is Broken, with its first stderr
     /// line.
     #[test]
     fn a_compiler_that_cannot_build_a_program_is_broken_not_ready() {
@@ -676,7 +598,6 @@ mod tests {
         assert!(verdict.blocks_builds());
         assert!(leftovers(&host.tmp_root).is_empty());
 
-        // Success without an artifact is not proof.
         let liar = root.join("liar");
         script(
             &liar.join("cc"),
@@ -689,7 +610,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// On macOS the install is `base.clt`, one password prompt in a terminal, never Apple's
     /// desktop dialog (design init-system A15).
     #[test]
     fn the_macos_install_is_base_clt() {
@@ -698,7 +618,6 @@ mod tests {
         }
     }
 
-    /// A missing toolchain is told to install one; a refusing compiler on macOS is told to fix
     /// what it reports, never the install.
     #[test]
     fn a_refusing_compiler_is_not_told_to_install_what_it_is() {
@@ -769,11 +688,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A compiler that hangs is unknown, not broken, and the probe returns inside its
-    /// bound. The compiler is a
-    /// driver that forks the real work, as `cc` forks `cc1`: the bound's kill ends the
-    /// driver and leaves its ten-minute `sleep` holding the probe's pipes. The probe's
-    /// return is held to a minute's hang detector, never a latency budget: a probe that
     /// ignores its bound, or drains those pipes after the kill, waits out all ten.
     #[test]
     fn a_wedged_compiler_is_unanswered_not_broken() {
@@ -784,8 +698,6 @@ mod tests {
             &dir.join("cc"),
             &format!("sleep 600 & echo $! > '{}'; wait", pid_file.display()),
         );
-        // Half a second, not less: the new driver may pay the first-exec assessment, and a
-        // bound that fires before it forks `sleep` skips the orphaned-pipe case.
         let bound = Duration::from_millis(500);
         let host = CcHost {
             bound,
@@ -794,7 +706,6 @@ mod tests {
         let started = std::time::Instant::now();
         let verdict = probe_with(Some(dir.as_os_str()), &host);
         let took = started.elapsed();
-        // End the orphaned `sleep` so no run leaves it holding a pipe for ten minutes.
         if let Some(pid) = std::fs::read_to_string(&pid_file)
             .ok()
             .and_then(|pid| pid.trim().parse::<libc::pid_t>().ok())

@@ -74,6 +74,7 @@ pub fn resolve_deco_metrics(
 }
 
 /// Clamp a `(top, thickness)` band into the cell: thickness into `[1, cell_h]` first, then
+/// top into `[0, cell_h - thickness]`, which guarantees `top + thickness <= cell_h`.
 #[inline]
 const fn clamp_band(top: i64, thickness: i64, cell_h: usize) -> (usize, usize) {
     const fn nonnegative(value: i64) -> usize {

@@ -660,12 +660,14 @@ struct Region {
     range: Range<usize>,
     insert: String,
     /// The line an insert hangs on (its bytes with its end-of-line), which
+    /// no other op may change.
     holds: Option<Range<usize>>,
     /// No nonempty insertion may follow this open final line at EOF.
     opens_tail: bool,
 }
 
 /// Resolve op number `op` (from 1) against the pre-text: its regions, or why
+/// it does not apply.
 fn resolve_op(
     op: usize,
     script_op: &Op,
@@ -768,6 +770,7 @@ fn resolve_op(
 }
 
 /// A patch hunk: its old lines must be the text's, at the header's line
+/// (mapped through `base=`, or moved by up to `near=`).
 fn resolve_hunk(
     op: usize,
     hunk: &PatchHunk,
@@ -886,13 +889,15 @@ fn hunk_conflict(op: usize, hunk: &PatchHunk, lines: &Lines<'_>, first: usize) -
 }
 
 /// The shifts a `near=` search tries from line `from` of a text of `count`
+/// lines, nearest first: up to `near=`, and only those that can still land
+/// in the text.
 fn near_shifts(options: &PlanOptions<'_>, from: usize, count: usize) -> RangeInclusive<usize> {
     let nearest = from.saturating_sub(count).max(1);
     let furthest = options.near.unwrap_or(0).min(from.max(count));
     nearest..=furthest
 }
 
-/// Map lines `first..=last` through `base=`, when given. `want` is what the
+/// Map lines `first..=last` through `base=`, when given.
 fn map_base(
     op: usize,
     first: usize,
@@ -918,6 +923,8 @@ fn map_base(
 }
 
 /// Find the lines an op's anchors name: their lines (mapped through `base=`)
+/// when both h6s match there, else the one shift within `near=` where both
+/// do.
 fn locate(
     op: usize,
     first: Anchor,
@@ -998,6 +1005,8 @@ fn terminated(body: &[String], eol: &str) -> String {
 }
 
 /// Body lines after a last line without an end-of-line: the end-of-line
+/// first, which that line gets, and none after the last body line, so the
+/// text still ends without one.
 fn opened(body: &[String], eol: &str) -> String {
     let mut out = eol.to_string();
     out.push_str(&body.join(eol));
@@ -1005,6 +1014,7 @@ fn opened(body: &[String], eol: &str) -> String {
 }
 
 /// Where a substitute's old lines occur in the text, leftmost first and
+/// never overlapping.
 fn find_old(lines: &Lines<'_>, old: &[String]) -> Vec<Range<usize>> {
     let text = lines.text();
     let Some((head, rest)) = old.split_first() else {
@@ -1067,13 +1077,14 @@ fn find_old(lines: &Lines<'_>, old: &[String]) -> Vec<Range<usize>> {
 }
 
 /// The changes of the ops admitted so far, which never overlap one another,
+/// so each check is one probe of an ordered map.
 #[derive(Default)]
 struct Admitted {
     /// Changes that remove or replace bytes: start -> end.
     changes: BTreeMap<usize, usize>,
     /// Where inserts go.
     points: BTreeSet<usize>,
-    /// The lines inserts hang on: start -> end. Whole lines of one text, so
+    /// The lines inserts hang on: start -> end.
     held: BTreeMap<usize, usize>,
     /// A prior open final line. A later insertion here would follow it.
     open_tail: Option<usize>,
@@ -1081,6 +1092,8 @@ struct Admitted {
 
 impl Admitted {
     /// Admit op `op`'s regions, or refuse it as an overlap when one of them
+    /// meets an earlier op's: a shared byte, an insert strictly inside a
+    /// change, or a change to a line an insert hangs on.
     fn admit(&mut self, op: usize, regions: &[Region]) -> Result<(), ScriptError> {
         if regions.iter().any(|region| self.meets(region)) {
             return Err(ScriptError::Overlap { op });
@@ -1124,6 +1137,7 @@ impl Admitted {
 }
 
 /// Whether a range of `ranges` (disjoint, start -> end) that starts before
+/// `before` ends after `after`.
 fn reaches_past(ranges: &BTreeMap<usize, usize>, before: usize, after: usize) -> bool {
     ranges
         .range(..before)
@@ -1132,6 +1146,7 @@ fn reaches_past(ranges: &BTreeMap<usize, usize>, before: usize, after: usize) ->
 }
 
 /// The plan of resolved, non-overlapping regions: the edits sorted by
+/// position, equal positions in script order.
 fn plan_of(mut regions: Vec<Region>) -> Plan {
     regions.sort_by_key(|region| (region.range.start, region.range.end, region.op));
     let mut hunks = Vec::with_capacity(regions.len());
@@ -1159,6 +1174,7 @@ fn plan_of(mut regions: Vec<Region>) -> Plan {
 }
 
 /// The script's lines, numbered from 1 by index + 1: split at `\n`, one `\r`
+/// before it dropped, no empty line after a final `\n`.
 fn script_lines(input: &str) -> Vec<&str> {
     let mut lines: Vec<&str> = input
         .split('\n')
@@ -1178,6 +1194,7 @@ fn words_of(line: &str) -> Vec<&str> {
 }
 
 /// Split `words` at the body opener `<<WORD` (or `<<` then `WORD`): the
+/// words before, the delimiter, the words after.
 fn heredoc<'w>(words: &[&'w str]) -> Result<(Vec<&'w str>, &'w str, Vec<&'w str>), String> {
     let at = words
         .iter()
@@ -1217,6 +1234,7 @@ fn unquote(word: &str) -> &str {
 }
 
 /// The body after the opener on line `opened`: the lines up to the one that
+/// is exactly `word`, which ends it.
 fn take_body(
     lines: &[&str],
     at: &mut usize,
@@ -1278,6 +1296,7 @@ fn parse_place(words: &[&str]) -> Result<Place, String> {
 }
 
 /// `substitute <<W1`, its body, `with <<W2`, its body, and an optional
+/// `all` or `nth=<k>` (on either opener line or on the line after).
 fn parse_substitute(
     lines: &[&str],
     at: &mut usize,
@@ -1388,6 +1407,7 @@ fn hunk_header(line: &str) -> Result<(usize, usize, usize), String> {
 }
 
 /// An exact marker belongs to the immediately preceding hunk line, which
+/// must already be the last line on every side that marker names.
 fn mark_no_newline(
     hunk: &mut PatchHunk,
     old_count: usize,
@@ -2292,6 +2312,8 @@ mod tests {
     }
 
     /// The acceptance loop an agent runs: read, copy tokens out of the
+    /// printed rows as text, write a script, apply it against the read's
+    /// `seq=`.
     #[test]
     fn anchors_copied_from_a_read_apply_as_is() {
         use crate::protocol::read::{DOC_READ_CAP, LineRange, format_lines};
@@ -2406,6 +2428,7 @@ mod tests {
             }
 
             /// Lines 1-3: the target at `at`, fillers elsewhere; line 4
+            /// holds the substitute's matches, out of op 1's reach.
             fn text(&self) -> String {
                 let mut text = String::new();
                 for line in 1..=LINES {
@@ -2441,6 +2464,7 @@ mod tests {
             }
 
             /// The model's state once its setup actions chose this scenario,
+            /// reached through the model's own transitions.
             fn start(&self, model: &Model) -> State {
                 let mut state = model.init_state();
                 let mut fire = |action: &str, times: usize| {
@@ -2463,6 +2487,7 @@ mod tests {
         }
 
         /// How many of the script's ops show in `text`: op 1's `ONE` on
+        /// line `landed`, op 2's `Y`s (as many as it replaced).
         fn applied_in(text: &str, landed: usize, replaced: usize) -> i64 {
             let lines = Lines::of(text);
             let one = landed > 0 && lines.content(landed) == Some("ONE");
@@ -2471,6 +2496,7 @@ mod tests {
         }
 
         /// What a resolver did with op 1: the line it landed on, or a
+        /// refusal.
         type Resolve =
             fn(&Script, usize, &str, &PlanOptions<'_>) -> Result<Vec<Region>, ScriptError>;
 
@@ -2484,6 +2510,8 @@ mod tests {
         }
 
         /// One run of a planner (the real one, or a rig) over a scenario,
+        /// as the model's states (the start, then one state per step) and
+        /// the text the caller holds at the end.
         fn run(
             model: &Model,
             scenario: &Scenario,
@@ -2640,6 +2668,7 @@ mod tests {
         }
 
         /// OffByOne: checks the h6 of the line after the anchor's, and
+        /// lands on the anchor's line.
         fn off_by_one_resolve(
             script: &Script,
             op: usize,
@@ -2663,6 +2692,7 @@ mod tests {
         }
 
         /// FirstMatchWins: a unique substitute takes the first of several
+        /// matches.
         fn first_match_resolve(
             script: &Script,
             op: usize,

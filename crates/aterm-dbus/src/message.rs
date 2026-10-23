@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! D-Bus messages: the 12-byte fixed header, the header fields (`a(yv)`), and
-//! the body, framed by the lengths the header carries.
-//!
-//! [`Message::encode`] writes the fields in zbus 5's order (path, interface,
-//! member, error name, reply serial, destination, sender, signature), so what
-//! aterm-dbus sends is byte-identical to what zbus sends for the same message
-//! (`tests/recorded/zbus-5.16.0-messages.tsv`). [`Message::decode`] accepts the
-//! fields in any order, ignores unknown ones as the specification requires,
-//! and refuses a repeated or mistyped one and code 0, which the specification
-//! names INVALID (libdbus refuses it too).
+//! D-Bus message framing, encoding, and decoding.
 
 use crate::error::{Error, Result};
 use crate::names;
@@ -50,8 +41,7 @@ const SENDER: u8 = 7;
 const SIGNATURE: u8 = 8;
 const UNIX_FDS: u8 = 9;
 
-/// One message. The fields are public; [`Message::encode`] holds them to the
-/// specification, so a hand-built message cannot reach the wire malformed.
+/// A D-Bus message with header fields and body values.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Message {
     pub endian: Endian,
@@ -81,7 +71,7 @@ fn name(valid: fn(&str) -> bool, text: &str, what: &'static str) -> Result<Strin
 }
 
 impl Message {
-    fn new(kind: Kind) -> Self {
+    const fn new(kind: Kind) -> Self {
         Self {
             endian: Endian::NATIVE,
             kind,
@@ -121,12 +111,11 @@ impl Message {
         Ok(m)
     }
 
-    /// A signal `interface.member` from the object at `path`, to whoever
-    /// matches it.
+    /// Builds a signal message for `interface.member` from `path`.
     ///
     /// # Errors
     ///
-    /// As [`Message::method_call`].
+    /// [`Error::Invalid`] for a name or path the specification forbids.
     pub fn signal(path: &str, interface: &str, member: &str) -> Result<Self> {
         let mut m = Self::new(Kind::Signal);
         m.path = Some(ObjectPath::new(path)?);
@@ -135,8 +124,7 @@ impl Message {
         Ok(m)
     }
 
-    /// The reply to `call`, addressed to its sender, in its byte order (as zbus
-    /// builds one).
+    /// Builds a reply to `call` addressed to its sender in its byte order.
     #[must_use]
     pub fn method_return(call: &Message) -> Self {
         let mut m = Self::new(Kind::MethodReturn);
@@ -216,12 +204,11 @@ impl Message {
         required(self).map_err(Error::Invalid)
     }
 
-    /// The bytes on the wire.
+    /// Encodes the message into wire bytes.
     ///
     /// # Errors
     ///
-    /// [`Error::Invalid`] for a message the specification forbids: serial 0, a
-    /// required field missing, an invalid name, a body over the limits.
+    /// Returns [`Error::Invalid`] if serial is 0, a required field is missing, or a limit fails.
     pub fn encode(&self) -> Result<Vec<u8>> {
         self.check()?;
         let signature = self.signature();
@@ -277,13 +264,11 @@ impl Message {
         Ok(w.buf)
     }
 
-    /// Parses exactly one message.
+    /// Parses one D-Bus message from `bytes`.
     ///
     /// # Errors
     ///
-    /// [`Error::Malformed`] for bytes that break the specification,
-    /// [`Error::Unsupported`] for an unknown message type or attached unix
-    /// descriptors.
+    /// Returns [`Error::Malformed`] or [`Error::Unsupported`] if decoding fails.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let total = frame_len(bytes)?.ok_or(Error::malformed(
             "shorter than a message header",
@@ -377,7 +362,7 @@ impl Message {
 }
 
 /// The fields each message type must carry.
-fn required(m: &Message) -> std::result::Result<(), &'static str> {
+const fn required(m: &Message) -> std::result::Result<(), &'static str> {
     let missing = match m.kind {
         Kind::MethodCall if m.path.is_none() || m.member.is_none() => {
             "method call without a path or member"
@@ -400,17 +385,15 @@ fn required(m: &Message) -> std::result::Result<(), &'static str> {
 #[cfg_attr(trust_verify, trust::requires(fields <= 67108864))]
 #[cfg_attr(trust_verify, trust::ensures(result >= 16 && result % 8 == 0))]
 #[inline]
-fn header_len(fields: usize) -> usize {
+const fn header_len(fields: usize) -> usize {
     pad_to(16 + fields, 8)
 }
 
-/// How many bytes the message starting at `head` occupies, once its first 16
-/// bytes are in: `None` until then.
+/// Returns the total wire length of the message at `head`, or `None` if fewer than 16 bytes.
 ///
 /// # Errors
 ///
-/// [`Error::Malformed`] for an unknown byte order or lengths past the
-/// specification's limits: the stream cannot be resynchronised after that.
+/// Returns [`Error::Malformed`] for an unknown byte order or lengths exceeding protocol limits.
 pub fn frame_len(head: &[u8]) -> Result<Option<usize>> {
     let Some(fixed) = head.first_chunk::<16>() else {
         return Ok(None);
@@ -521,8 +504,6 @@ mod tests {
 
     #[test]
     fn decode_refuses_repeated_mistyped_and_missing_fields() {
-        // A hand-built header: fields as (code, signature, value) through the
-        // writer, so only the field set differs from a valid message.
         let build = |fields: &[(u8, Value)], kind: Kind| {
             let mut w = Writer::new(Endian::Little, 0);
             w.buf.extend_from_slice(&[b'l', kind as u8, 0, 1]);
@@ -607,7 +588,6 @@ mod tests {
             Kind::MethodReturn,
         );
         assert!(Message::decode(&no_fds).is_ok());
-        // A body the signature field does not describe.
         let mut body = build(
             &[
                 (REPLY_SERIAL, Value::U32(1)),

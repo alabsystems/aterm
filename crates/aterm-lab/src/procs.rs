@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The lab's processes: spawning a detached one (its own session, no
-//! controlling terminal), knowing whether one still lives (reaping our own
-//! children, so an ended one is never a zombie that reads alive), and the
-//! process tree under an instance.
+//! Detached process spawning, child reaping, and jail process-tree inspection.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -35,9 +32,7 @@ fn children() -> &'static Mutex<HashMap<i32, Kept>> {
     C.get_or_init(Mutex::default)
 }
 
-/// Keep `child`, forked by a std `Command` (one that hands a descriptor
-/// above stdio, [`crate::lab::launch_ready`]), so [`alive`] reaps it once it
-/// ends. Its pid.
+/// Registers a child forked by `std::process::Command` so [`alive`] reaps it on exit.
 pub fn keep_forked(child: std::process::Child) -> i32 {
     let pid = i32::try_from(child.id()).unwrap_or(0);
     children()
@@ -47,10 +42,10 @@ pub fn keep_forked(child: std::process::Child) -> i32 {
     pid
 }
 
-/// Start `cmd` and keep its handle, so [`alive`] reaps it once it ends. Its pid.
+/// Spawns `cmd` and registers its handle so [`alive`] reaps it on exit.
 ///
 /// # Errors
-/// The spawn failed.
+/// Returns an error if spawning `cmd` fails.
 pub fn spawn_kept(cmd: &mut Command) -> std::io::Result<i32> {
     let child = cmd.spawn()?;
     let pid = i32::try_from(child.id()).unwrap_or(0);
@@ -61,8 +56,7 @@ pub fn spawn_kept(cmd: &mut Command) -> std::io::Result<i32> {
     Ok(pid)
 }
 
-/// Whether `pid` lives (never 0 or 1). A child of ours that has exited is
-/// reaped here and reads dead.
+/// Returns whether `pid` is alive, reaping any exited child started by this process.
 #[must_use]
 pub fn alive(pid: i32) -> bool {
     if pid <= 1 {
@@ -79,23 +73,18 @@ pub fn alive(pid: i32) -> bool {
     crate::sys::alive(pid)
 }
 
-/// Wait up to `limit` for `pid` to end, on the kernel's exit event (a
-/// kqueue `EVFILT_PROC` watch, so no thread and no polling); a child of ours
-/// is reaped once it has. Whether it ended.
+/// Waits up to `limit` for `pid` to exit and be reaped.
 #[must_use]
 pub fn wait_gone(pid: i32, limit: Duration) -> bool {
     if !alive(pid) {
         return true;
     }
-    // registered while it lives; `None` means it ended in between, or is
-    // ending ([`ended_within`])
     let Some(w) = u32::try_from(pid)
         .ok()
         .and_then(aterm_uds::exitwatch::ExitWatch::watch)
     else {
         return ended_within(pid, limit);
     };
-    // a child of ours that ended before the watch was registered is reaped here
     if !alive(pid) {
         return true;
     }
@@ -106,14 +95,7 @@ pub fn wait_gone(pid: i32, limit: Duration) -> bool {
 }
 
 /// [`wait_gone`]'s answer once its watch fired or ran out (`exited`: the
-/// kernel's exit event came): whether `pid` ended. The exit event can come
-/// before a child of ours is a zombie its parent can reap, so where it came
-/// a child of ours is looked at again until it is reaped, within `limit`
-/// ([`ended_within`]): with one read of [`alive`] there, the wait said the
-/// child had ended while it still read alive, and it was left unreaped
-/// (`a_wait_that_runs_out_leaves_the_child_to_a_later_one` failed so once
-/// in a full run, 2026-10-22, the review of `b9/resid4-lab`). Without the
-/// event, `alive` reaps an ended child of ours, so none is left a zombie.
+/// kernel's exit event came): whether `pid` ended.
 fn settled(pid: i32, exited: bool, limit: Duration) -> bool {
     if exited {
         let _ = ended_within(pid, limit);
@@ -127,9 +109,7 @@ fn settled(pid: i32, exited: bool, limit: Duration) -> bool {
 /// on its way out that still answers `kill(pid, 0)` and is not a zombie yet,
 /// so one read of [`alive`] took a SIGKILLed child of ours for alive (the
 /// merge contract's run of 2026-10-17, under load:
-/// `a_wait_that_runs_out_leaves_the_child_to_a_later_one`). A child of ours is
-/// looked at again until it is reaped, within `limit`; any other `pid` is read
-/// once.
+/// `a_wait_that_runs_out_leaves_the_child_to_a_later_one`).
 fn ended_within(pid: i32, limit: Duration) -> bool {
     let deadline = std::time::Instant::now() + limit;
     loop {
@@ -147,7 +127,7 @@ fn ended_within(pid: i32, limit: Duration) -> bool {
     }
 }
 
-/// `pid ppid` of every process (one `ps` snapshot).
+/// Returns `(pid, ppid)` pairs from a `ps` snapshot.
 #[must_use]
 pub fn table() -> Vec<(i32, i32)> {
     let Ok(out) = aterm_uds::spawnfd::command("/bin/ps")
@@ -165,8 +145,7 @@ pub fn table() -> Vec<(i32, i32)> {
         .collect()
 }
 
-/// Every descendant of `root` in `table`, children before their parents
-/// (nothing for 0, 1 or less: that would be every process).
+/// Returns all descendants of `root` in `table`, children before parents.
 #[must_use]
 pub fn descendants_in(table: &[(i32, i32)], root: i32) -> Vec<i32> {
     if root <= 1 {
@@ -190,13 +169,13 @@ pub fn descendants_in(table: &[(i32, i32)], root: i32) -> Vec<i32> {
     out
 }
 
-/// Every descendant of `root` now.
+/// Returns all current descendants of `root`.
 #[must_use]
 pub fn descendants(root: i32) -> Vec<i32> {
     descendants_in(&table(), root)
 }
 
-/// `ps -o command= -p <pid>`: the command line, or empty.
+/// Returns `ps -o command= -p <pid>`, or an empty string.
 #[must_use]
 pub fn command_line(pid: i32) -> String {
     aterm_uds::spawnfd::command("/bin/ps")
@@ -206,8 +185,7 @@ pub fn command_line(pid: i32) -> String {
         .unwrap_or_default()
 }
 
-/// `ps -o stat= -p <pid>`: the process's state (`T…` stopped, `S…`
-/// sleeping); `None` when it is gone or `ps` gave nothing.
+/// Returns `ps -o stat= -p <pid>`, or `None` if the process is gone.
 #[must_use]
 pub fn state_of(pid: i32) -> Option<String> {
     aterm_uds::spawnfd::command("/bin/ps")
@@ -218,7 +196,7 @@ pub fn state_of(pid: i32) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// The tty a process holds (`??` for none).
+/// Returns the controlling TTY of `pid` (`??` if none).
 #[must_use]
 pub fn tty_of(pid: i32) -> String {
     aterm_uds::spawnfd::command("/bin/ps")
@@ -228,9 +206,7 @@ pub fn tty_of(pid: i32) -> String {
         .unwrap_or_default()
 }
 
-/// `ps -o lstart= -p <pid>`: when the process started, as `ps` prints it
-/// (with its pid, a process's identity: a pid the system has given to
-/// another process since has another start time). Empty when it is gone.
+/// Returns `ps -o lstart= -p <pid>`.
 #[must_use]
 pub fn start_time(pid: i32) -> String {
     if pid <= 1 {
@@ -243,16 +219,13 @@ pub fn start_time(pid: i32) -> String {
         .unwrap_or_default()
 }
 
-/// `<run>/jailed.pids`: each process the lab started in the jail outside the
-/// instance's tree (`codex-run`, the agents' `--version`, the selftests'
-/// controls), as `pid TAB start time`. The run directory is written from
-/// outside the jail only.
+/// Returns the path to `<run_dir>/jailed.pids`.
 #[must_use]
 pub fn jailed_file(run_dir: &Path) -> PathBuf {
     run_dir.join("jailed.pids")
 }
 
-/// Append a jailed root to [`jailed_file`] as it starts.
+/// Appends a jailed root `pid` to [`jailed_file`].
 pub fn record_jailed(run_dir: &Path, pid: i32) {
     use std::io::Write as _;
     let line = format!("{pid}\t{}\n", start_time(pid));
@@ -265,8 +238,7 @@ pub fn record_jailed(run_dir: &Path, pid: i32) {
     }
 }
 
-/// The pids of [`jailed_file`] that are still the process the lab started
-/// (`all`: every pid it names, live or not).
+/// Reads jailed root PIDs from [`jailed_file`] (`all` includes exited PIDs).
 #[must_use]
 pub fn jailed_roots(run_dir: &Path, all: bool) -> Vec<i32> {
     let text = std::fs::read_to_string(jailed_file(run_dir)).unwrap_or_default();
@@ -279,12 +251,7 @@ pub fn jailed_roots(run_dir: &Path, all: bool) -> Vec<i32> {
         .collect()
 }
 
-/// Every live process in the lab's jail, the stub's among them, without
-/// repeats. Found by the jail itself ([`crate::sys::jail_pids`] of its mark):
-/// an orphan launchd adopted when its parent exited, a process in a session of
-/// its own, one that cleared its environment. The ppid walk from the instance
-/// and the live roots of [`jailed_file`] stays beside it (an older lab's
-/// `env.sh` names no mark).
+/// Returns all live PIDs currently inside the lab's jail.
 #[must_use]
 pub fn jail_members(run: &crate::run::Run) -> Vec<i32> {
     let mut out: Vec<i32> = Vec::new();
@@ -309,7 +276,7 @@ pub fn jail_members(run: &crate::run::Run) -> Vec<i32> {
     out
 }
 
-/// The live pids of the lab's processes but the stub.
+/// Returns all live PIDs of the lab's processes except the stub.
 #[must_use]
 pub fn lab_tree(run: &crate::run::Run) -> Vec<i32> {
     jail_members(run)
@@ -318,10 +285,7 @@ pub fn lab_tree(run: &crate::run::Run) -> Vec<i32> {
         .collect()
 }
 
-/// The pids the kernel's refusals of this lab may name: the stub, the
-/// instance, every member of the jail now, every pid [`jailed_file`] ever
-/// named and every member the witness saw (`members.txt`); each names the pid
-/// of its day.
+/// Returns all PIDs that have belonged to this lab run.
 #[must_use]
 pub fn lab_pids_ever(run: &crate::run::Run) -> Vec<i32> {
     let mut v = vec![run.instance_pid, run.stub_pid];
@@ -338,12 +302,10 @@ pub fn lab_pids_ever(run: &crate::run::Run) -> Vec<i32> {
     v
 }
 
-/// The lab's egress witness is running (by its pid and its command line):
-/// nothing more is started in the jail without it, since a dead witness sees
-/// nothing and says so to no one.
+/// Verifies that the lab's egress witness is still running.
 ///
 /// # Errors
-/// The witness is not running.
+/// Returns an error if the witness process is missing or exited.
 pub fn need_witness(run: &crate::run::Run) -> Result<(), String> {
     let line = format!(
         "{} sampler {}",
@@ -365,26 +327,21 @@ pub fn need_witness(run: &crate::run::Run) -> Result<(), String> {
     ))
 }
 
-/// What [`jailed`] does with the program's output.
+/// Output handling mode for [`jailed`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JailOut {
-    /// Standard output captured, standard error dropped.
+    /// Capture stdout and discard stderr.
     Capture,
-    /// Standard output and standard error captured, in that order.
+    /// Capture both stdout and stderr.
     CaptureAll,
-    /// Both on this process's own.
+    /// Inherit both stdout and stderr from this process.
     Inherit,
 }
 
-/// `argv` in the lab's jail, from `dir`, in a session of its own, stdin
-/// `/dev/null`, with an environment of `PATH=/usr/bin:/bin`,
-/// `xcrun_nocache=1` and `vars` (a later one wins), where the egress witness
-/// watches it and anything it leaves behind (the jail's mark); its pid and
-/// start time go into [`jailed_file`] as it starts. Its exit status, and its
-/// standard output when captured.
+/// Runs `argv` inside the lab's jail from `dir` with `envs` and `out` handling.
 ///
 /// # Errors
-/// The witness is not running, or the program could not start.
+/// Returns an error if the witness is down, spawning fails, or waiting times out.
 pub fn jailed(
     run: &crate::run::Run,
     dir: &Path,
@@ -455,9 +412,7 @@ mod tests {
 
     /// A child the kernel would not watch, killed and on its way out, is
     /// waited for until it is reaped ([`ended_within`]): one read of `alive`
-    /// right after the SIGKILL can still find it running. NEGATIVE CONTROLS: a
-    /// child that lives is ours still when the wait runs out, and a process
-    /// that is no child of ours is read once.
+    /// right after the SIGKILL can still find it running.
     #[test]
     fn a_killed_child_the_kernel_will_not_watch_is_waited_for_until_reaped() {
         let pid = spawn_kept(aterm_uds::spawnfd::command("/bin/sleep").arg("600")).unwrap();
@@ -480,9 +435,7 @@ mod tests {
     /// ([`settled`]): told its exit came while the child still runs (as the
     /// kernel's event can come before the child is a zombie its parent can
     /// reap), the wait reaps it once it ends, so it never reads alive after
-    /// the wait said it ended. NEGATIVE CONTROLS: with no exit event, a live
-    /// child is no ended one; a process that is no child of ours is read
-    /// once, and the event's word stands.
+    /// the wait said it ended.
     #[test]
     fn an_exit_the_watch_saw_is_waited_on_until_the_child_is_reaped() {
         let long = spawn_kept(aterm_uds::spawnfd::command("/bin/sleep").arg("600")).unwrap();

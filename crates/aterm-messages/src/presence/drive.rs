@@ -1,21 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The presence driver: the sequencing every host shares. It folds a
-//! session's facts into its slot, projects every window showing it — the
-//! window's MOST PRESSING session ([`Desk::pressing_session`]) lights its
-//! border and pill, whichever tab or pane it is in — takes a told story,
-//! moves a story watermark on a person's key, and computes the one deadline
-//! the host's timer arms ([`deadline`]) and the tick that timer runs.
-//!
-//! PRESENCE NEVER RE-GRIDS A PANE (owner surfaces, 2026-10-16 §5): there is
-//! no chrome row here to commit, so nothing a refresh does can resize a PTY.
-//! The border is an overlay and the pill lives in the titlebar.
-//!
-//! Nothing here reads a clock, owns a timer or knows a window system: what
-//! only a host can do comes in through [`Desk`], and the per-session state is
-//! [`Table`]. A quiet desktop arms no deadline.
-
+//! Presence driver sequencing session facts, window projections ([`Desk::pressing_session`]), story watermarks, and timer [`deadline`]s.
 use std::collections::HashMap;
 
 use super::pill::{Pill, PillAct, PillKind};
@@ -25,18 +11,13 @@ use super::{
 };
 use crate::Instant;
 
-/// The longest need text a pill carries, in cells: the words clip at the
-/// painter's width before this. Public so a host that composes a need's
-/// words with a tail of its own (`aterm-gui`'s `presence::need_fact`, a
-/// harness's `(1 more need)`) clips them before this cut, which then never
-/// falls inside the tail.
+/// Maximum need text length in cells carried by a pill.
 pub const PILL_WHAT_CELLS: usize = 96;
 
 /// The longest tab label a pill carries, in cells.
 const PILL_LABEL_CELLS: usize = 32;
 
-/// The per-session slots, keyed by the host's local session id, and when
-/// each session's `ttl=` supervisor claim lapses.
+/// Per-session presence slots and supervisor claim deadlines.
 #[derive(Debug)]
 pub struct Table<V: Host> {
     slots: HashMap<u64, Slot<V>>,
@@ -56,22 +37,20 @@ impl<V: Host> Default for Table<V> {
 }
 
 impl<V: Host> Table<V> {
-    /// The session's slot, once any refresh has touched it.
+    /// Returns `session`'s slot if it has been refreshed.
     #[must_use]
     pub fn slot(&self, session: u64) -> Option<&Slot<V>> {
         self.slots.get(&session)
     }
 
-    /// Fold one refresh's facts into `session`'s slot (minted at `now` on
-    /// its first refresh): `true` when anything the views read moved — and
-    /// always on the slot's first sight, so a fresh session is projected.
+    /// Folds `facts` into `session`'s slot and returns whether any view-visible state changed.
     pub fn absorb(&mut self, session: u64, facts: Facts<V>, now: Instant) -> bool {
         let slot = self.slots.entry(session).or_insert_with(|| Slot::new(now));
         let first = slot.agent_seq_seen.is_none() && slot.shell.is_none();
         slot.absorb(facts, now) || first
     }
 
-    /// Forget `session`: its slot and its supervisor claim.
+    /// Removes `session`'s slot and supervisor claim.
     pub fn retire(&mut self, session: u64) {
         self.slots.remove(&session);
         self.supervisor_until.remove(&session);
@@ -103,25 +82,7 @@ impl<V: Host> Table<V> {
             .collect()
     }
 
-    /// The earliest lease or supervisor lapse, never before `now`. A
-    /// supervisor's is the later of the lapse last read into the table and
-    /// the claim's live one (`live`, [`Desk::supervisor_lapse`]): a renewal
-    /// is no change (`meta set supervisor` by the holder it names posts no
-    /// wake), so a deadline held at the lapse read before it woke the loop
-    /// once a lease only to find the claim renewed — every 70 to 90 s for
-    /// each supervised tab of a quiet desktop (the Together run, 2026-10-16).
-    /// One whose holder died fires at its last renewal's lapse, and the tick
-    /// re-reads it from the table's copy, which is never later.
-    ///
-    /// Read live AT EACH TURN of the host's loop, which is when it folds this
-    /// deadline: a renewal moves the armed timer only at the next turn after
-    /// it. aterm's own harness turns the loop every step (its `status` read
-    /// of the tab, every 20 s, well inside a lease), so a claim it keeps
-    /// renewed never fires. A holder that renews with no turn between two
-    /// renewals still has its timer fire once a lease, at the lapse last
-    /// read; the tick finds the claim renewed (the host's lapse re-checks the
-    /// live expiry), lapses nothing, and re-arms — one wake that renders
-    /// nothing.
+    /// The earliest lease or supervisor lapse, never before `now`.
     fn deadline(&self, now: Instant, live: impl Fn(u64) -> Option<Instant>) -> Option<Instant> {
         let leases = self.slots.values().filter_map(|slot| slot.lease_until);
         let supervisors = self
@@ -132,117 +93,96 @@ impl<V: Host> Table<V> {
     }
 }
 
-/// One terminal session a window shows ([`Desk::shown`]): in which tab, and
-/// whether that tab is the window's front one.
+/// Terminal session shown in a window ([`Desk::shown`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Shown {
-    /// The session's local id.
+    /// Local session identifier.
     pub session: u64,
-    /// Its tab's index in the window, 0-based.
+    /// Zero-based tab index in the window.
     pub tab: usize,
-    /// That tab is the window's front tab.
+    /// Whether the tab is the window's active tab.
     pub front_tab: bool,
 }
 
-/// A window's most pressing session ([`Desk::pressing_session`]).
+/// Most pressing session in a window ([`Desk::pressing_session`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pressing {
-    /// The session.
+    /// Local session identifier.
     pub session: u64,
-    /// Its tab's index, 0-based.
+    /// Zero-based tab index in the window.
     pub tab: usize,
-    /// Its tab is the window's front tab.
+    /// Whether the tab is the window's active tab.
     pub front_tab: bool,
-    /// How many other sessions the window shows need the person.
+    /// Count of other sessions in the window that also need the user.
     pub more: usize,
 }
 
-/// What the presence driver asks of its host (the macOS App): every method is
-/// a read of its state or one effect on it, and none decides anything the
-/// driver decides.
+/// Host interface for the presence driver.
 pub trait Desk {
-    /// The host's presence seam.
+    /// Host presence seam type.
     type V: Host;
-    /// A window's id.
+    /// Window identifier type.
     type Win: Copy + Eq;
 
-    /// The host's clock, read where a refresh starts.
+    /// Returns the host's current clock instant.
     fn clock(&self) -> Instant;
-    /// The per-session state.
+    /// Returns a shared reference to the session [`Table`].
     fn table(&self) -> &Table<Self::V>;
-    /// The per-session state, to change.
+    /// Returns a mutable reference to the session [`Table`].
     fn table_mut(&mut self) -> &mut Table<Self::V>;
-    /// Visit every window's view, in the host's window order.
+    /// Visits every window's [`View`] in host window order.
     fn each_view(&self, f: &mut dyn FnMut(Self::Win, &View));
-    /// One window's view.
+    /// Returns the [`View`] for window `w`.
     fn view_of(&self, w: Self::Win) -> Option<&View>;
-    /// One window's view, to change.
+    /// Returns a mutable [`View`] for window `w`.
     fn view_of_mut(&mut self, w: Self::Win) -> Option<&mut View>;
-    /// The session a window shows in front (its focused tab's focused pane).
+    /// Returns the active front session of window `w`.
     fn front_session(&self, w: Self::Win) -> Option<u64>;
-    /// Every terminal session `w` shows, any tab, any pane, in tab order.
+    /// Returns all terminal sessions shown in window `w` in tab order.
     fn shown(&self, w: Self::Win) -> Vec<Shown>;
-    /// Every window showing `session`: in front first, then in any tab.
+    /// Returns all windows showing `session`, with front-showing windows first.
     fn windows_showing(&self, session: u64) -> Vec<Self::Win>;
-    /// Whether the host still holds `session`.
+    /// Returns whether the host still holds `session`.
     fn holds_session(&self, session: u64) -> bool;
-    /// Read `session`'s facts (`None`: the host no longer holds it). The
-    /// need in them is the host's PUBLISHED verdict, which
-    /// [`Self::herald`] has just published.
+    /// Reads current [`Facts`] for `session`, or `None` if no longer held.
     fn sense(&self, session: u64) -> Option<Facts<Self::V>>;
-    /// When `session`'s `ttl=` supervisor claim lapses on this clock, if it
-    /// has one. Read at every refresh and by every [`deadline`] (once per
-    /// supervised session): one leaf read, no lock held across it.
+    /// Returns when `session`'s `ttl=` supervisor claim lapses.
     fn supervisor_lapse(&self, session: u64, now: Instant) -> Option<Instant>;
-    /// Whether someone can see `w`'s pill (a window on screen, not occluded,
-    /// minimized or headless): its age arms a deadline only then.
+    /// Returns whether window `w`'s pill is visible on screen.
     fn pill_visible(&self, w: Self::Win) -> bool;
-    /// The View menu's switch: needs shown in windows (`[presence] rim`).
-    /// Off, no border and no pill; the marks and the wire stay.
+    /// Returns whether window borders and pills are enabled (`[presence] rim`).
     fn needs_shown(&self) -> bool;
-    /// The tab label the host gives `session` (its role, else its user
-    /// title, else its program's title).
+    /// Returns the tab label for `session`.
     fn label_of(&self, session: u64) -> String;
-    /// Whether the host's restart act would be carried for `session` now.
+    /// Returns whether the restart action is offered for `session`.
     fn restart_offered(&self, session: u64) -> bool;
-    /// `session`'s global id, as `chrome` prints it.
+    /// Returns `session`'s global identifier for `chrome` output.
     fn sid_of(&self, session: u64) -> Option<String>;
-    /// When the host owes a notification its rate limit allows (`now` when
-    /// one is owed already).
+    /// Returns when the next rate-limited notification is due.
     fn herald_deadline(&self, now: Instant) -> Option<Instant>;
-    /// Called as `w` is re-projected, before its view changes: the host's
-    /// per-window side channel (the macOS host publishes the front window's
-    /// hold for its menu's synchronous validation).
+    /// Notifies the host before window `w` is re-projected.
     fn projecting(&mut self, w: Self::Win);
-    /// Ask for a repaint of `w`.
+    /// Requests a repaint of window `w`.
     fn request_redraw(&self, w: Self::Win);
-    /// Re-stamp the tab chips (and push the pill) of these windows.
+    /// Re-stamps tab chips and updates pills for `windows`.
     fn restamp_chips(&mut self, windows: Vec<Self::Win>);
-    /// Push these windows' pills alone, whose age moved and nothing else: no
-    /// chip is re-stamped and no strip re-planned while the pill keeps its
-    /// width ([`super::PillWords::room`]). Returns the windows whose own frame
-    /// draws the pill (an in-grid strip carries it): only their view's seed
-    /// moves and only they repaint, so a pill the titlebar draws re-presents
-    /// no frame.
+    /// Updates pills whose age changed and returns windows needing a chip restamp.
     fn push_pill(&mut self, windows: Vec<Self::Win>) -> Vec<Self::Win>;
-    /// Publish `session`'s need and let the herald look at it (it dedups by
-    /// transition).
+    /// Publishes `session`'s need to the notification herald.
     fn herald(&mut self, session: u64);
-    /// Post every owed notification the rate limit now allows.
+    /// Posts any owed notifications permitted by the rate limit at `now`.
     fn herald_owed(&mut self, now: Instant);
-    /// Remove and record `session`'s lapsed supervisor claim.
+    /// Removes and records `session`'s lapsed supervisor claim.
     fn lapse_supervisor(&mut self, session: u64);
-    /// Forget a session the host no longer holds (its slot, claim and
-    /// herald memory).
+    /// Forgets a closed session's slot, claim, and herald state.
     fn forget(&mut self, session: u64);
 
-    /// THE WINDOW'S MOST PRESSING SESSION ([`pressing`] over [`Self::shown`]).
+    /// Returns the most pressing session in window `w` ([`pressing`] over [`Self::shown`]).
     fn pressing_session(&self, w: Self::Win) -> Option<Pressing> {
         pressing(self.table(), &self.shown(w), self.front_session(w))
     }
 
-    /// The window's next need after `named` ([`next_need`] over
-    /// [`Self::shown`]): where the pill's `+N` opens the host's Overview.
+    /// Returns the next needing session in window `w` after `named` ([`next_need`] over [`Self::shown`]).
     fn next_need_after(&self, w: Self::Win, named: u64) -> Option<u64> {
         next_need(self.table(), &self.shown(w), self.front_session(w), named)
     }
@@ -250,8 +190,7 @@ pub trait Desk {
 
 /// The sessions `shown` that need the person, most pressing first by the
 /// need alone — a stuck need before a decide one, then the oldest, then tab
-/// order — each once, at its first place. No front-session term: this is the
-/// order the pill's `+N` walks, which must not reorder as it moves the front.
+/// order — each once, at its first place.
 fn needing_order<V: Host>(table: &Table<V>, shown: &[Shown]) -> Vec<u64> {
     let mut needing: Vec<(Shown, &Slot<V>)> = Vec::new();
     for s in shown {
@@ -275,12 +214,7 @@ const fn rank(severity: Option<NeedSeverity>) -> u8 {
     }
 }
 
-/// WHERE THE PILL'S `+N` POINTS: the window's next need after the one in
-/// front — the front session where it needs the person, else `named` (the
-/// session the pill names) — in [`needing_order`], wrapping round, so each
-/// call lands on another of the window's needs and calls walk them all; the
-/// host opens its Overview there. `None` when no other session needs
-/// anything.
+/// Returns the next needing session in `shown` after `named`.
 #[must_use]
 pub fn next_need<V: Host>(
     table: &Table<V>,
@@ -289,17 +223,21 @@ pub fn next_need<V: Host>(
     named: u64,
 ) -> Option<u64> {
     let order = needing_order(table, shown);
-    let here = front.filter(|f| order.contains(f)).unwrap_or(named);
+    let here = front
+        .filter(|f| {
+            order.contains(f)
+                && table
+                    .slot(*f)
+                    .and_then(|slot| slot.need.as_ref())
+                    .is_some_and(|need| need.show_pill)
+        })
+        .unwrap_or(named);
     let at = order.iter().position(|s| *s == here)?;
     let next = order[(at + 1) % order.len()];
     (next != here).then_some(next)
 }
 
-/// The most pressing of the sessions `shown`: a stuck need before a decide
-/// one; within a severity the front session (`front`) first, then the
-/// oldest need ([`Slot::need_since`]), then tab order. `more` counts the
-/// other sessions with a need. `None` when none of them needs anything. A
-/// session shown twice counts once, at its first place.
+/// Returns the most pressing session among `shown`.
 #[must_use]
 pub fn pressing<V: Host>(
     table: &Table<V>,
@@ -343,14 +281,9 @@ fn windows<D: Desk>(d: &D) -> Vec<D::Win> {
     out
 }
 
-/// A fact about `session` changed: publish its need, re-read it, fold it in,
-/// and project every window that shows it.
+/// Refreshes `session`'s facts and re-projects every window showing it.
 pub fn refresh_session<D: Desk>(d: &mut D, session: u64) {
     let now = d.clock();
-    // Read at every refresh — a `meta set supervisor` that changes the
-    // claim refreshes — so a cleared claim drops the deadline. A renewal
-    // refreshes nothing; the deadline reads its lapse live
-    // ([`Table::deadline`]).
     match d.supervisor_lapse(session, now) {
         Some(at) => {
             d.table_mut().supervisor_until.insert(session, at);
@@ -359,8 +292,6 @@ pub fn refresh_session<D: Desk>(d: &mut D, session: u64) {
             d.table_mut().supervisor_until.remove(&session);
         }
     }
-    // The need is published here, before the facts read it back; the human
-    // channel rides the same change rate and dedups by transition itself.
     d.herald(session);
     let Some(facts) = d.sense(session) else {
         return;
@@ -372,14 +303,10 @@ pub fn refresh_session<D: Desk>(d: &mut D, session: u64) {
     for w in &windows {
         project_window(d, *w);
     }
-    // The chips, and the pill the strip carries: every strip showing the
-    // session re-stamps.
     d.restamp_chips(windows);
 }
 
-/// What `w` shows: the border, the session it is lit for and the pill. The
-/// most pressing need first; with none, the person's own hold on the front
-/// session; else nothing. The View switch off shows nothing.
+/// What `w` shows: the border, the session it is lit for and the pill.
 fn compose<D: Desk>(d: &D, w: D::Win) -> (Rim, Option<u64>, Option<Pill>) {
     if !d.needs_shown() {
         return (Rim::None, None, None);
@@ -388,20 +315,40 @@ fn compose<D: Desk>(d: &D, w: D::Win) -> (Rim, Option<u64>, Option<Pill>) {
         && let Some(slot) = d.table().slot(p.session)
         && let Some(need) = slot.need.as_ref()
     {
+        let rim = Rim::of(need.severity);
+        let session = p.session;
+        let more = p.more;
+        let p = if need.show_pill {
+            p
+        } else {
+            let shown: Vec<_> = d
+                .shown(w)
+                .into_iter()
+                .filter(|s| {
+                    d.table()
+                        .slot(s.session)
+                        .and_then(|slot| slot.need.as_ref())
+                        .is_some_and(|need| need.show_pill)
+                })
+                .collect();
+            let Some(p) = pressing(d.table(), &shown, d.front_session(w)) else {
+                return (rim, Some(session), None);
+            };
+            p
+        };
+        let Some(slot) = d.table().slot(p.session) else {
+            return (rim, Some(session), None);
+        };
+        let Some(need) = slot.need.as_ref() else {
+            return (rim, Some(session), None);
+        };
         let severity = need.severity;
-        // A stall's one remedy, only on the tab in front: a background tab's
-        // pill goes there first. A frozen program's is the restart, offered
-        // where the host would carry it; a stopped job's is no restart (the
-        // act answers `not-stalled` for it) but the stall's own words'
-        // `signal cont`, which every host with job control carries.
         let act = match need.cause {
             _ if !p.front_tab || severity != NeedSeverity::Stuck => None,
             StopCause::Frozen if d.restart_offered(p.session) => Some(PillAct::Restart),
             StopCause::Suspended => Some(PillAct::Resume),
             StopCause::Frozen | StopCause::Wall => None,
         };
-        // The session in front is named already; any other — a background
-        // tab, or another pane of the tab in front — by its label.
         let label = if p.front_tab && d.front_session(w) == Some(p.session) {
             String::new()
         } else {
@@ -413,13 +360,11 @@ fn compose<D: Desk>(d: &D, w: D::Win) -> (Rim, Option<u64>, Option<Pill>) {
             label,
             tab: (!p.front_tab).then_some(p.tab + 1),
             what: pill_text::<D::V>(&need.what, PILL_WHAT_CELLS),
-            // Only a background tab's pill prints its age, so only its age
-            // arms a tick ([`deadline`]): the tab in front is in view.
             since: (!p.front_tab).then_some(slot.need_since),
             act,
-            more: p.more,
+            more,
         };
-        return (Rim::of(severity), Some(p.session), Some(pill));
+        return (rim, Some(session), Some(pill));
     }
     if let Some(front) = d.front_session(w)
         && d.table()
@@ -455,15 +400,14 @@ fn project_window<D: Desk>(d: &mut D, w: D::Win) -> bool {
     moved
 }
 
-/// Re-project `w` (a tab switch, a focus change, a restore): its border and
-/// pill follow, and its strip re-stamps where they moved.
+/// Re-projects window `w` and restamps its tab chips if needed.
 pub fn refresh_window<D: Desk>(d: &mut D, w: D::Win) {
     if project_window(d, w) {
         d.restamp_chips(vec![w]);
     }
 }
 
-/// Every window: the tab-switch / focus-change / restore funnel.
+/// Re-projects all windows.
 pub fn refresh_all<D: Desk>(d: &mut D) {
     let moved: Vec<D::Win> = windows(d)
         .into_iter()
@@ -474,11 +418,7 @@ pub fn refresh_all<D: Desk>(d: &mut D) {
     }
 }
 
-/// A person's key (or press) in `w` while `session` was its front: if the
-/// session is calm, its story is read here (the watermark moves to its
-/// newest point), which `status level=story` reads. Never on focus alone,
-/// never on a timer, never while anything is still happening. Nothing on
-/// the glass moves: the story has no row.
+/// Records human interaction with `session` in window `w` and advances its story watermark if calm.
 pub fn human_acted_on<D: Desk>(d: &mut D, w: D::Win, session: u64) {
     let Some(seq) = d
         .table()
@@ -493,16 +433,14 @@ pub fn human_acted_on<D: Desk>(d: &mut D, w: D::Win, session: u64) {
     }
 }
 
-/// [`human_acted_on`] for `w`'s front session.
+/// Calls [`human_acted_on`] for window `w`'s front session.
 pub fn human_acted<D: Desk>(d: &mut D, w: D::Win) {
     if let Some(session) = d.front_session(w) {
         human_acted_on(d, w, session);
     }
 }
 
-/// A told story point landed for `session` (`aterm ctl story`): the slot is
-/// brought current first, then the point is noted (`status story=`). `None`
-/// for a session the host no longer holds; else the point's seq.
+/// Records a told story verb for `session` and returns its sequence number.
 pub fn tell<D: Desk>(d: &mut D, session: u64, verb: StoryVerb) -> Option<u64> {
     if !d.holds_session(session) {
         return None;
@@ -512,10 +450,7 @@ pub fn tell<D: Desk>(d: &mut D, session: u64, verb: StoryVerb) -> Option<u64> {
     Some(d.table_mut().tell(session, verb, now))
 }
 
-/// The one instant the host's timer arms: a visible pill's next age figure
-/// (one never ticked is due now), a cooperative lease's or a supervisor
-/// claim's lapse, and the host's owed notification. `None` on a quiet
-/// desktop.
+/// Returns the earliest timer deadline across visible pills, leases, supervisors, and the herald.
 pub fn deadline<D: Desk>(d: &D, now: Instant) -> Option<Instant> {
     let mut deadline: Option<Instant> = None;
     let mut fold = |x: Instant| {
@@ -524,13 +459,11 @@ pub fn deadline<D: Desk>(d: &D, now: Instant) -> Option<Instant> {
         }
     };
     d.each_view(&mut |w, v| {
-        // An occluded, minimized or headless window's pill is read by
         // nobody, so its age arms nothing (`chrome` composes it at the read).
         if v.pill.as_ref().is_some_and(|p| p.since.is_some()) && d.pill_visible(w) {
             fold(v.pill_due.map_or(now, |x| x.max(now)));
         }
     });
-    // Neither a lease's lapse nor a supervisor's posts a wake of its own.
     if let Some(x) = d
         .table()
         .deadline(now, |session| d.supervisor_lapse(session, now))
@@ -543,11 +476,7 @@ pub fn deadline<D: Desk>(d: &D, now: Instant) -> Option<Instant> {
     deadline
 }
 
-/// The timer's tick at `now`: a lapsed supervisor claim is removed and its
-/// session re-read, owed notifications the rate limit allows are posted, a
-/// lapsed cooperative lease is re-read, and every visible pill whose age
-/// figure moved is pushed alone ([`Desk::push_pill`]). Returns the windows
-/// that need a repaint: those whose own frame draws the pill.
+/// Processes timer expirations at `now` and returns windows whose views changed.
 pub fn tick<D: Desk>(d: &mut D, now: Instant) -> Vec<D::Win> {
     let mut out = Vec::new();
     for session in d.table().lapsed_supervisors(now) {
@@ -556,14 +485,11 @@ pub fn tick<D: Desk>(d: &mut D, now: Instant) -> Vec<D::Win> {
             continue;
         }
         d.lapse_supervisor(session);
-        // Re-reads the claim: a lapsed one is gone (the deadline with it), a
-        // renewed one re-arms at its new expiry.
         refresh_session(d, session);
     }
     d.herald_owed(now);
     for session in d.table().lapsed_leases(now) {
         if !d.holds_session(session) {
-            // Dropped rather than re-armed every tick.
             d.forget(session);
             continue;
         }
@@ -593,8 +519,6 @@ pub fn tick<D: Desk>(d: &mut D, now: Instant) -> Vec<D::Win> {
         }
     }
     if !aged.is_empty() {
-        // The age moved and nothing else: the pill alone is pushed, and only
-        // a frame that draws it (the in-grid strip's) moves its key.
         for w in d.push_pill(aged) {
             if let Some(v) = d.view_of_mut(w) {
                 v.seed = v.seed.wrapping_add(1).max(1);
@@ -605,10 +529,6 @@ pub fn tick<D: Desk>(d: &mut D, now: Instant) -> Vec<D::Win> {
     out
 }
 
-// The wire strings: what the `status` and `chrome` verbs print of presence,
-// composed here so every host prints the same bytes. The percent codec stays
-// the host's ([`Host::pct_encode`]).
-
 /// The highest story watermark any window holds for `session` (0: no window
 /// has read its story).
 fn read_mark<D: Desk>(d: &D, session: u64) -> u64 {
@@ -617,10 +537,7 @@ fn read_mark<D: Desk>(d: &D, session: u64) -> u64 {
     mark
 }
 
-/// A session's level as `status level=` reports it: read against the highest
-/// watermark any window holds for the session, so a story read in any window
-/// is read whichever tab is in front now. [`Level::Quiet`] for a session no
-/// refresh has touched.
+/// Returns `session`'s [`Level`] against the highest story watermark across all windows.
 #[must_use]
 pub fn session_level<D: Desk>(d: &D, session: u64) -> Level {
     d.table()
@@ -628,11 +545,7 @@ pub fn session_level<D: Desk>(d: &D, session: u64) -> Level {
         .map_or(Level::Quiet, |slot| slot.level(read_mark(d, session)))
 }
 
-/// The additive presence `status` fields: `hand=<token> hand_pid=<pid|->
-/// level=<level> story=<n> why=<causes>` ([`Slot::why`]), plain reads of the
-/// slot the refreshes keep current; `hand=- hand_pid=- level=quiet story=0
-/// why=-` for a session no refresh has touched yet. `hand_pid=` is the
-/// kernel-attested pid of a drive lease's taker ([`Hand::pid_wire`]).
+/// Formats the presence fields (`hand=`, `hand_pid=`, `level=`, `story=`, `why=`) for `status`.
 #[must_use]
 pub fn status_tail<D: Desk>(d: &D, session: u64) -> String {
     let level = session_level(d, session).wire();
@@ -648,12 +561,7 @@ pub fn status_tail<D: Desk>(d: &D, session: u64) -> String {
     }
 }
 
-/// `chrome`'s presence line for the host's front window `front`: `presence
-/// rim=<none|stuck|decide|yours> pressing=<@sid|-> pill="<the pill's
-/// sentence>"`, what the person sees. The pill is composed at the read (its
-/// age as of now) and printed whole, unclipped; `"` and `\` are escaped so
-/// the line stays one parseable record. No window, or a quiet one, prints
-/// `rim=none pressing=- pill=""`.
+/// Formats the `presence` line for `chrome` on the front window.
 #[must_use]
 pub fn chrome_line<D: Desk>(d: &D, front: Option<D::Win>) -> String {
     let now = d.clock();

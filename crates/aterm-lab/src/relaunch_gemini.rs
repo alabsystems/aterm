@@ -1,62 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `gemini-relaunch [tag] [--keep]`: THE GEMINI CLI LANE, LIVE — the real
-//! Gemini CLI (Homebrew's, typed by name as a person types it: `gemini`
-//! resolves through a lab wrapper to `/opt/homebrew/bin/gemini`, so the parent
-//! is `node /opt/homebrew/bin/gemini`) under a private headless aterm with the
-//! harness ON and `[harness] relaunch` at its default, against the stub's
-//! Gemini API. A lab of its own (`gemini-relaunch-<pid>` unless a tag is given;
-//! the headless-restore seam on, so a desk is kept as a window keeps one). The
-//! tab's shell gets the environment the lab's launcher gives Gemini CLI but its
-//! `HOME` (the scratch home's): each launch is typed `HOME=<gemini-home>
-//! gemini`, so the relaunch line carries the `HOME` it ran under. Every step
-//! reads what it judges off the real thing: the processes under the instance
-//! (the parent node and its child), the project's session files, the shell's
-//! command blocks (`blocks --json`), the host's own log and the upgrade
-//! ledger's rows, and the stub's request dumps.
-//!
-//! 1. **The child killed.** Gemini CLI takes a turn (`remember the word
-//!    HERON-5150`); once the crash journal names its session, its CHILD is
-//!    SIGKILLed (the parent exits `1`). It must come back in the tab resuming
-//!    the SAME session (`gemini --resume <uuid>`, the shell's own `gemini`,
-//!    never a node or Cellar path), in its project, and the harness's
-//!    continuation must reach the stub with the earlier turn in the same
-//!    request.
-//! 2. **The parent killed.** The relaunched Gemini CLI's PARENT is SIGKILLed
-//!    (its relaunch line's block `137`): its child is orphaned, and must be
-//!    gone once the relaunch's line was typed (the orphan reads no terminal
-//!    its shell holds and ends at the line's first byte, measured), and the
-//!    session must come back again, the stub seeing its turn.
-//! 3. **A clean `/quit`** of it (block `0`): the host's own decision
-//!    (`step=ended:graceful-exit`) is read, and nothing is relaunched.
-//! 4. **A resume Gemini CLI refuses is typed once.** A fresh Gemini CLI takes
-//!    a turn; the shell's `gemini` is pointed at a wrapper that runs it from
-//!    another directory (a resume there finds no session of the project:
-//!    `42`), and its child is SIGKILLed. The host's line must be typed once,
-//!    its block must say `42`, the host must decide `refused:resume-refused`
-//!    and tell Gemini CLI's own line, and nothing may be typed again for 75 s
-//!    more.
-//! 5. **Two Gemini CLIs started together**, in two tabs of their own in the
-//!    project, their lines sent back to back: one's child is SIGKILLed, and
-//!    the host must decide `refused:no-witness` (no file tells which header
-//!    is whose), nothing typed — the person told it could not tell.
-//! 6. **The history-loss hazard (G5).** In a tab of its own, a Gemini CLI
-//!    takes a turn and quits; once the minute has turned, it is resumed and
-//!    quit, and resumed again (its duplicate now the session's newest file,
-//!    holding no turn), and that one's child is SIGKILLed: the host must
-//!    decide `refused:history-unsafe`, nothing typed, and tell the person its
-//!    own resume would bring the session back without its turn — its
-//!    Messages line never saying to resume it.
-//! 7. **Restore after a crash.** aterm is SIGKILLed while a Gemini CLI runs
-//!    (a fresh one, its turn taken); the next launch on the same state reopens
-//!    the tab, and Gemini CLI must come back there on its session, its
-//!    continuation saying aterm ended, the earlier turn in the request.
-//! 8. **Restore after a quit** (`invoke Quit`), the same way.
-//!
-//! The report names each fact as read. Exit 0 when every phase holds (an
-//! UNOBSERVED phase is said as such, and named on the last line), 1 when one
-//! does not, 3 could not run.
+//! Live Gemini CLI relaunch lab (`gemini-relaunch [tag] [--keep]`).
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -74,8 +19,7 @@ use crate::stop;
 use crate::util::{now_ms, shell_quote as q};
 use crate::{Fail, LAB, Res};
 
-/// The words each phase's turn asks Gemini CLI to remember: a request after a
-/// relaunch carries one only where the session came back with its turns.
+/// The words each phase's turn asks Gemini CLI to remember.
 pub const WORD: &str = "HERON-5150";
 /// Phase 4's.
 pub const WORD2: &str = "PLOVER-2214";
@@ -84,8 +28,7 @@ pub const WORD3: &str = "GANNET-7702";
 /// Phases 7 and 8's.
 pub const WORD4: &str = "AVOCET-3391";
 
-/// The harness's continuation as Gemini CLI is typed it after a crash
-/// (`relaunch::resumed_prompt_as`, its product name).
+/// Continuation prompt typed to Gemini CLI after a crash (`relaunch::resumed_prompt_as`).
 pub const CONTINUED_CRASH: &str = "[aterm harness] Relaunched: Gemini CLI exited";
 
 /// …and after aterm's own end.
@@ -104,9 +47,7 @@ pub fn is_script(w: &str) -> bool {
     w.ends_with("/gemini") || w.ends_with("/@google/gemini-cli/bundle/gemini.js")
 }
 
-/// A Gemini CLI PARENT's words after its script, from its command line
-/// (`node <script> [args]`); `None` for its child (`node
-/// --max-old-space-size=… <script>`) and every other process.
+/// A Gemini CLI PARENT's words after its script, from its command line (`node <script> [args]`).
 #[must_use]
 pub fn parent_words(cmd: &str) -> Option<Vec<String>> {
     let mut it = cmd.split_whitespace();
@@ -115,8 +56,7 @@ pub fn parent_words(cmd: &str) -> Option<Vec<String>> {
     (node.ends_with("/node") && is_script(script)).then(|| it.map(str::to_string).collect())
 }
 
-/// The session a Gemini CLI's words resume (`--resume`/`-r <uuid>`, any
-/// spelling).
+/// The session a Gemini CLI's words resume (`--resume`/`-r <uuid>`, any spelling).
 #[must_use]
 pub fn resumed(words: &[String]) -> Option<&str> {
     let mut found = None;
@@ -152,8 +92,7 @@ fn child_of(pid: i32) -> Option<i32> {
         .map(|(child, _)| child)
 }
 
-/// A Gemini CLI parent resuming `session` under the instance other than every
-/// pid of `not`.
+/// A Gemini CLI parent resuming `session` under the instance other than every pid of `not`.
 fn resuming(run: &Run, session: &str, not: &[i32]) -> Option<(i32, Vec<String>)> {
     parents(run)
         .into_iter()
@@ -165,9 +104,7 @@ fn gemini_home(run: &Run) -> PathBuf {
     run.w.join(Agent::Gemini.home())
 }
 
-/// Every session header under the scratch home's project directories
-/// (`.gemini/tmp/*/chats/session-*.jsonl`): `(session, startTime)`, each read
-/// through no link (the jailed CLI writes them).
+/// Read `(session, startTime)` headers under `.gemini/tmp/*/chats/session-*.jsonl`.
 fn headers(run: &Run) -> Vec<(String, String)> {
     let tmp = gemini_home(run).join(".gemini/tmp");
     let mut out = Vec::new();
@@ -202,8 +139,7 @@ pub fn header_lines(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The session of the newest header begun at or after `since` (an ISO stamp's
-/// prefix compare: the CLI's stamps are all `…Z` of one width).
+/// Session of the newest header begun at or after `since`.
 fn newest_session(run: &Run, since: &str) -> Option<String> {
     headers(run)
         .into_iter()
@@ -212,8 +148,7 @@ fn newest_session(run: &Run, since: &str) -> Option<String> {
         .map(|(s, _)| s)
 }
 
-/// When `session`'s first header was begun (its `startTime`): the UTC minute
-/// its turn-holding file is named for.
+/// When `session`'s first header was begun (its `startTime`).
 fn session_begun(run: &Run, session: &str) -> Option<String> {
     headers(run)
         .into_iter()
@@ -233,11 +168,7 @@ fn iso_now() -> String {
     )
 }
 
-/// The shell environment a Gemini CLI reaches the stub with, as the lab's
-/// launcher gives it ([`crate::gemini::launcher`]: no proxy, the fake key, the
-/// stub's base URL, no browser) but its `HOME`, which each launch line names
-/// and the relaunch line carries from the process; `PATH` leads with the lab's
-/// `gemini` wrapper.
+/// Shell environment for Gemini CLI against the stub ([`crate::gemini::launcher`]).
 #[must_use]
 pub fn shell_exports(run: &Run) -> String {
     let w = run.w.to_string_lossy();
@@ -270,9 +201,7 @@ pub fn shell_exports(run: &Run) -> String {
     s
 }
 
-/// The lab's `gemini` wrapper: `exec` the PATH script (the parent's argv
-/// names it), from `elsewhere` where given (a resume from another project's
-/// directory finds no session: `42`).
+/// The lab's `gemini` wrapper.
 #[must_use]
 pub fn wrapper(elsewhere: Option<&str>) -> String {
     let cd = elsewhere.map_or_else(String::new, |d| format!("cd {} || exit 1\n", q(d)));
@@ -281,8 +210,7 @@ pub fn wrapper(elsewhere: Option<&str>) -> String {
     )
 }
 
-/// The line a launch types: the scratch `HOME` Gemini CLI is seeded under,
-/// then `gemini` by name.
+/// The line a launch types: the scratch `HOME` Gemini CLI is seeded under, then `gemini` by name.
 fn launch_line(run: &Run, args: &[&str]) -> String {
     let mut line = format!("HOME={} gemini", q(&gemini_home(run).to_string_lossy()));
     for a in args {
@@ -292,8 +220,7 @@ fn launch_line(run: &Run, args: &[&str]) -> String {
     line
 }
 
-/// Put the wrapper at `<run>/gbin/gemini`, out of the jail's reach (the run
-/// directory is read-only to it); `down` removes it.
+/// Put the wrapper at `<run>/gbin/gemini`, out of the jail's reach; `down` removes it.
 fn put_wrapper(run: &Run, elsewhere: Option<&str>) -> Result<(), Fail> {
     crate::sys::put(
         &run.run.join("gbin/gemini"),
@@ -341,8 +268,7 @@ fn type_line(door: &Door<'_>, sid: Option<&str>, line: &str) -> Result<(), Fail>
     Ok(())
 }
 
-/// Launch Gemini CLI by name in a tab with `args`; its parent's pid once it
-/// draws its composer (`Type your message`).
+/// Launch Gemini CLI by name in a tab with `args`.
 fn launch(
     run: &Run,
     door: &Door<'_>,
@@ -402,8 +328,7 @@ fn decided(run: &Run, t: i64, secs: u64, needles: &[&str]) -> Result<Option<Stri
     }))
 }
 
-/// One `gemini-relaunch` run on the lab `tag`, which `cmd_gemini_relaunch`
-/// brought up.
+/// One `gemini-relaunch` run on the lab `tag`, which `cmd_gemini_relaunch` brought up.
 #[allow(clippy::too_many_lines)]
 fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
     let mut run = Run::load(tag)?;
@@ -420,11 +345,8 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
     );
     let mut failed = Vec::new();
     let unseen: Vec<String> = Vec::new();
-    // The tab's agent is Gemini CLI from now on: the turn verb reads its
-    // composer by its reader (`Run::agent`), as `lab gemini` records it.
     run.agent = Agent::Gemini.name().into();
     run.save();
-    // ---- the shell's environment, its `gemini`, the seeds
     put_wrapper(&run, None)?;
     crate::gemini::seed(&run, Agent::Gemini, &crate::gemini::Launch::default())?;
     let rc = run.w.join("home/.zshrc");
@@ -438,7 +360,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
     type_line(&door, None, &format!(". {}", q(&rc.to_string_lossy())))?;
     stop::sleep(Duration::from_millis(500))?;
 
-    // ---- 1. its child killed: resumed on its session in its project
     let t_launch = iso_now();
     let pid1 = launch(&run, &door, None, &[], &[])?;
     turn(&run, &door, None, &format!("remember the word {WORD}"))?;
@@ -505,7 +426,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
         &mut failed,
     );
 
-    // ---- 2. the resumed one's parent killed: the orphan waited out, resumed again
     let _ = door.ctl(&["await", "idle", "2000", "timeout=60000"]);
     let Some(child2) = child_of(pid2) else {
         return Err(could_not("the relaunched parent has no child"));
@@ -538,7 +458,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
         return Ok(Verdict::Failed);
     };
 
-    // ---- 3. a clean /quit: left
     let _ = door.ctl(&["await", "idle", "2000", "timeout=60000"]);
     stop::sleep(Duration::from_secs(3))?;
     let t3 = now_ms();
@@ -576,7 +495,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
         &mut failed,
     );
 
-    // ---- 4. a resume Gemini CLI refuses is typed once
     let known4 = [pid1, pid2, pid3];
     let t_launch4 = iso_now();
     let pid4 = launch(&run, &door, None, &known4, &[])?;
@@ -633,17 +551,14 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
     );
     put_wrapper(&run, None)?;
 
-    // ---- 5. two started together: no witness, told
     let Some(proj) = project.clone() else {
         return Ok(Verdict::Failed);
     };
     let together = beside(&run, &door, &proj, &mut failed)?;
     println!("  together  {together}");
 
-    // ---- 6. the G5 hazard: the pre-check refuses, told
     hazard(&run, &door, &proj, &mut failed)?;
 
-    // ---- 7. restore after aterm crashed
     let mut known: Vec<i32> = vec![pid1, pid2, pid3, pid4];
     let t_launch7 = iso_now();
     let pid7 = launch(&run, &door, None, &known, &[])?;
@@ -689,7 +604,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
     };
     known.push(pid8);
 
-    // ---- 8. restore after aterm was quit
     let door = Door::new(&run)?;
     let _ = door.ctl(&["await", "idle", "2000", "timeout=60000"]);
     let pid_row = format!("pid = {pid8}");
@@ -764,8 +678,7 @@ fn open_tab(run: &Run, door: &Door<'_>, proj: &str) -> Result<String, Fail> {
     Ok(sid)
 }
 
-/// Phase 5: two Gemini CLIs started together, each in a tab of its own; one's
-/// child SIGKILLed. Both tabs are closed again.
+/// Phase 5: two Gemini CLIs started together, each in a tab of its own; one's child SIGKILLed.
 fn beside(
     run: &Run,
     door: &Door<'_>,
@@ -798,8 +711,6 @@ fn beside(
     }
     stop::sleep(Duration::from_secs(5))?;
     let starts: Vec<String> = pair.iter().map(|p| crate::procs::start_time(*p)).collect();
-    // Which parent leads which tab: by its working tty's foreground is
-    // unread here; the first started's child is killed, whichever tab it is.
     let victim = pair[0];
     let other = pair[1];
     let child = child_of(victim).ok_or_else(|| could_not("a parent of the pair has no child"))?;
@@ -854,9 +765,7 @@ fn send_when_free_in(door: &Door<'_>, sid: &str, text: &str) -> Result<bool, Fai
     Ok(false)
 }
 
-/// The details of the Messages lines posted since `ms` for `tab`'s agent that
-/// cannot be brought back (`harness.supervisor.<tab>.lost` or `.gone`), read
-/// off the instance's `messages.log`, oldest first.
+/// Details of `.lost`/`.gone` Messages lines for `tab` since `ms`.
 fn supervisor_lines(run: &Run, tab: &str, ms: i64) -> Vec<String> {
     let field = |line: &str, name: &str| -> Option<String> {
         line.split('\t')
@@ -885,8 +794,7 @@ fn minute(iso: &str) -> String {
     iso.get(..16).unwrap_or(iso).to_string()
 }
 
-/// Phase 6, the G5 hazard, in a tab of its own: a turn, quit; once the minute
-/// has turned, a resume quit and a resume whose child is SIGKILLed.
+/// Phase 6, the G5 hazard, in a tab of its own: a turn, quit.
 #[allow(clippy::too_many_lines)]
 fn hazard(run: &Run, door: &Door<'_>, proj: &str, failed: &mut Vec<String>) -> Result<(), Fail> {
     let tab = open_tab(run, door, proj)?;
@@ -900,11 +808,6 @@ fn hazard(run: &Run, door: &Door<'_>, proj: &str, failed: &mut Vec<String>) -> R
     if !crate::procs::wait_gone(first, Duration::from_secs(20)) {
         return Err(could_not("the hazard's first Gemini CLI never quit"));
     }
-    // The duplicate a resume writes is named by its launch minute: once that
-    // differs from the turn-holding file's, the second resume leaves its own
-    // newest (measured). That file's minute is its header's, never the
-    // moment before the launch was typed (a minute can turn between them:
-    // `b7gfx2`, whose resumes all shared the file and kept the turn).
     let begun = session_begun(run, &session)
         .ok_or_else(|| could_not("no header of the hazard's session"))?;
     let launched_in = minute(&begun);
@@ -918,8 +821,6 @@ fn hazard(run: &Run, door: &Door<'_>, proj: &str, failed: &mut Vec<String>) -> R
         return Err(could_not("the hazard's first resume never quit"));
     }
     let resume2 = launch(run, door, sid, &[first, resume1], &["--resume", &session])?;
-    // Its header written (542-1108 ms after its child started, measured), and
-    // the host's snapshot read since.
     stop::sleep(Duration::from_secs(4))?;
     let child = child_of(resume2).ok_or_else(|| could_not("the second resume has no child"))?;
     let before = newest_dump(run);
@@ -941,8 +842,6 @@ fn hazard(run: &Run, door: &Door<'_>, proj: &str, failed: &mut Vec<String>) -> R
     let continued = request_with(run, before, &[CONTINUED_CRASH]);
     let again = resuming(run, &session, &[first, resume1, resume2]);
     let told = host_said(run, t, &["without some of its turns"]);
-    // The Messages line for the tab says its own step, never to resume the
-    // session (a resume now loads the empty copy).
     let lines = wait_for(10, || {
         let lines = supervisor_lines(run, &tab, t);
         (!lines.is_empty()).then_some(lines)
@@ -1007,8 +906,6 @@ pub fn cmd_gemini_relaunch(args: &[String]) -> Res {
     u.restore = true;
     u.trust = true;
     u.lifeline = !keep;
-    // No turn-end continuation of the supervisor's between the phases: the
-    // relaunch's own carry-on is what is judged.
     u.harness_keys = format!("{}\ncontinue = false", u.harness_keys);
     if let Err(f) = crate::lab::up(&tag, &u) {
         if let Some(m) = &f.msg {
@@ -1041,8 +938,7 @@ mod tests {
     }
 
     /// A Gemini CLI parent is read by its node and its script, typed by name
-    /// or by path. NEGATIVE CONTROLS: its child (a node flag first), another
-    /// node program.
+    /// or by path.
     #[test]
     fn a_gemini_parent_is_read_by_its_node_and_its_script() {
         assert_eq!(
@@ -1068,7 +964,6 @@ mod tests {
     }
 
     /// A Gemini CLI's words name the session it resumes, any spelling.
-    /// NEGATIVE CONTROLS: a plain launch, an `-i` prompt.
     #[test]
     fn a_relaunched_gemini_names_the_session_it_resumes() {
         assert_eq!(resumed(&words("--model x --resume s1")), Some("s1"));
@@ -1077,8 +972,7 @@ mod tests {
         assert_eq!(resumed(&words("-i --resume")), None);
     }
 
-    /// The headers of a session file, its duplicate appended too. NEGATIVE
-    /// CONTROLS: a message and a `$set` are no headers.
+    /// The headers of a session file, its duplicate appended too.
     #[test]
     fn a_session_files_headers_are_read() {
         let text = r#"{"sessionId":"s1","projectHash":"h","startTime":"2026-10-18T07:00:00.000Z","lastUpdated":"x","kind":"main"}

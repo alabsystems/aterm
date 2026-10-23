@@ -20,6 +20,8 @@ pub enum BreakKind {
 
 impl BreakKind {
     /// Whether this break keeps whole words: a space, or a character of a
+    /// script whose every character is a word's worth (a cut there reads
+    /// as words, never as a word cut short).
     #[must_use]
     #[inline]
     /// Whether this break preserves whole words (`Space` or `Ideographic`).
@@ -29,6 +31,7 @@ impl BreakKind {
 }
 
 /// A place a line may break: the next line would start at byte `at` of the
+/// text (never 0 and never the text's end), after a break of `kind`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Line-break opportunity at byte offset `at` (never `0` or `text.len()`).
 pub struct LineBreak {
@@ -46,10 +49,13 @@ enum Class {
     /// A character of a script written without spaces (UAX #14 `ID`).
     Ideographic,
     /// CJK closing punctuation and the characters that may not start a line
+    /// (UAX #14 `CL`, `CP`, `NS`, `EX` and their fullwidth `IS`): no break
+    /// before it.
     Closing,
     /// CJK opening punctuation (UAX #14 `OP`): no break after it.
     Opening,
     /// A hyphen or a slash: a word of prose may break after it, a path
+    /// before it.
     Joint,
     /// Anything else: a letter, a digit, Latin punctuation.
     Other,
@@ -164,6 +170,7 @@ const fn is_opening(c: char) -> bool {
 }
 
 /// A character of a script written without spaces between its words, or
+/// CJK punctuation and symbols (UAX #14 `ID`, and the fullwidth forms).
 #[inline]
 const fn is_ideographic(c: char) -> bool {
     matches!(
@@ -191,6 +198,7 @@ const fn is_ideographic(c: char) -> bool {
 }
 
 /// White space that is glue: a no-break space keeps its neighbours on one
+/// line.
 #[inline]
 const fn is_glue(c: char) -> bool {
     matches!(c, '\u{00A0}' | '\u{2007}' | '\u{202F}')
@@ -216,6 +224,9 @@ fn class_of(c: char) -> Class {
 }
 
 /// WHETHER `token` — a run of text between spaces — NEVER STARTS A LINE,
+/// even after a space: it is nothing but closing punctuation or slashes
+/// (UAX #14 LB13: `]`, `)`, `!`, `?`, `;`, `:`, `,`, `.`, `/`), which goes
+/// with the word before it ("GPU /" / "RAM /", never "GPU" / "/ RAM /").
 #[must_use]
 #[inline]
 /// Whether `token` consists solely of closing/no-start characters and never starts a line.
@@ -227,12 +238,14 @@ pub fn never_starts_a_line(token: &str) -> bool {
 }
 
 /// Whether `c` is CJK: an ideograph, kana, Hangul or the CJK and fullwidth
+/// punctuation that goes with them.
 #[inline]
 const fn is_cjk(c: char) -> bool {
     is_ideographic(c)
 }
 
 /// HOW A RUN OF TEXT BETWEEN SPACES READS ([`token_kind`]): what decides
+/// where it may break inside itself, and whether a hyphen may be put in it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Classification of a whitespace-delimited token ([`token_kind`]).
 pub enum TokenKind {
@@ -285,6 +298,7 @@ const fn closes_a_word(c: char) -> bool {
 }
 
 /// Whether a run of letters is written as prose writes a word: all lower
+/// case, all upper case, or capitalized.
 fn cased_as_prose(run: &str) -> bool {
     let mut chars = run.chars();
     let Some(first) = chars.next() else {
@@ -299,6 +313,7 @@ fn cased_as_prose(run: &str) -> bool {
 }
 
 /// HOW `token` — a run of text with no breaking space in it — READS
+/// ([`TokenKind`]): a word of prose, or an identifier.
 #[must_use]
 /// Classify a non-whitespace `token` as [`TokenKind::Word`] or [`TokenKind::Identifier`].
 pub fn token_kind(token: &str) -> TokenKind {
@@ -323,6 +338,7 @@ pub fn token_kind(token: &str) -> TokenKind {
 }
 
 /// A grapheme as line breaking reads it: where it starts, its first
+/// character and that character's class.
 #[derive(Clone, Copy)]
 struct Cluster {
     at: usize,
@@ -331,6 +347,7 @@ struct Cluster {
 }
 
 /// A run of text between breaking white space, as [`line_breaks`] reads
+/// it: how it reads, and the clusters it spans (`start..end`).
 #[derive(Clone, Copy)]
 struct Token {
     kind: TokenKind,
@@ -339,6 +356,7 @@ struct Token {
 }
 
 /// `text`'s graphemes ([`Cluster`]) and, for each, the token it is part of
+/// (`None` for white space).
 fn clusters(text: &str) -> (Vec<Cluster>, Vec<Option<Token>>) {
     let clusters: Vec<Cluster> = text
         .grapheme_indices()
@@ -377,6 +395,8 @@ fn clusters(text: &str) -> (Vec<Cluster>, Vec<Option<Token>>) {
 }
 
 /// Whether a path may break before a `/` (or a Windows path's `\`) that
+/// follows `c`: after a folder's name, never after the `~`, `.` or `:` that
+/// leads a path, nor inside a run of slashes.
 #[inline]
 fn ends_a_folder(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '_' | ')' | ']' | '}' | '\'' | '"' | '%' | '*')
@@ -389,6 +409,7 @@ const fn is_path_separator(c: char) -> bool {
 }
 
 /// The Joint break before cluster `index` of `token`, if a line may break
+/// there ([`line_breaks`]).
 fn joint_before(clusters: &[Cluster], index: usize, token: Token) -> bool {
     let Token { kind, start, end } = token;
     let cur = clusters[index].first;
@@ -419,6 +440,9 @@ fn joint_before(clusters: &[Cluster], index: usize, token: Token) -> bool {
 }
 
 /// EVERY PLACE `text` MAY BREAK, in order ([`LineBreak`]): after each run
+/// of white space, between CJK characters and beside them (kinsoku kept),
+/// inside a word of prose after a hyphen or a slash, and inside a path
+/// before a slash ([`BreakKind::Joint`]).
 #[must_use]
 /// Return all [`LineBreak`] opportunities in `text` in ascending byte order.
 pub fn line_breaks(text: &str) -> Vec<LineBreak> {
@@ -473,6 +497,19 @@ pub fn line_breaks(text: &str) -> Vec<LineBreak> {
 }
 
 /// Where an identifier wider than a whole line may break inside itself
+/// ([`break_inside`]): BEFORE its own joints — a `.`, `_`, `+`, `@`, `#`,
+/// `~`, `?`, `&`, `=`, `,` or a separator after a letter or a digit — so
+/// the next line starts with it and no line ends in one that could read as
+/// an end of sentence (`alab` / `.systems`, the Chicago Manual's rule for a
+/// URL); at a hyphen between two letters or digits, BEFORE it in a path, a
+/// host, a file's name or an address (one with a `/`, a `\\`, an `@` or a
+/// dot a letter follows: the Chicago Manual's rule for a URL, which never
+/// ends a line in one of its own hyphens, where it reads as one a break
+/// put in — `ai` / `-fleet.toml`, `/75d5bccd` / `-9c38`, where `ai-` /
+/// `fleet.toml` read as "aifleet.toml"), and AFTER it in a name or a
+/// compound (UAX #14 LB21: `OpenAI-` / `compatible`, `MacBook-` /
+/// `Pro-M4`, which a line starting with its hyphen made read as a flag);
+/// and after a `:` that a letter or a digit follows (`host:` / `22`).
 fn identifier_joints(token: &str) -> (Vec<usize>, Vec<usize>) {
     let chars: Vec<(usize, char)> = token.char_indices().collect();
     let url_like = chars.iter().enumerate().any(|(index, (_, c))| {
@@ -519,6 +556,9 @@ fn identifier_joints(token: &str) -> (Vec<usize>, Vec<usize>) {
 }
 
 /// A PIECE WIDER THAN A WHOLE LINE, BROKEN INSIDE ITSELF where a typesetter
+/// would break it: the lines `text[piece]` takes in a box `fits` measures,
+/// each `(the byte of text it starts at, what it paints)`, every line but
+/// the last as full as the box holds.
 #[must_use]
 /// Break an overwide piece into lines of at most `budget` cells, hyphenating prose words when needed.
 pub fn break_inside(
@@ -546,6 +586,9 @@ pub fn break_inside(
 }
 
 /// THE FIRST PART OF A PIECE NO WHOLE LINE HOLDS THAT THE LINE IT WOULD
+/// START ON STILL HOLDS, as a typesetter fills a line before it breaks a
+/// word: `fits_here` measures the part on that line (its words, and what
+/// joins the piece to them), `fits_line` a whole line.
 #[must_use]
 /// Split off the longest prefix of `piece` that fits in `first_budget` when followed by a line of `next_budget`.
 pub fn break_into_line(
@@ -575,6 +618,7 @@ pub fn break_into_line(
 }
 
 /// A piece too wide for a line, as [`break_inside`] reads it: the run of
+/// text between spaces it is part of, and the places it may break.
 struct Inside<'a> {
     text: &'a str,
     mark: &'a str,
@@ -582,8 +626,12 @@ struct Inside<'a> {
     /// Where the piece's own word ends: before what a wrap glued on (" ·").
     word_end: usize,
     /// Whether the piece's word is prose ([`TokenKind::Word`]), which a
+    /// break marks.
     word: bool,
     /// The places it may break, in tiers tried in turn, each with whether
+    /// it takes the mark: a word's syllables; an identifier's joints, then
+    /// the points between a number's digits, then the syllables of its runs
+    /// of letters, with none.
     tiers: Vec<Vec<(usize, bool)>>,
     /// Every one of them, in order.
     points: Vec<usize>,
@@ -652,6 +700,7 @@ impl<'a> Inside<'a> {
     }
 
     /// The furthest place after `start` of the first tier with one where a
+    /// line from `start` fits.
     fn point(&self, start: usize, fits: &dyn Fn(&str) -> bool) -> Option<(usize, bool)> {
         self.tiers.iter().find_map(|tier| {
             tier.iter()
@@ -663,6 +712,9 @@ impl<'a> Inside<'a> {
     }
 
     /// The furthest character after `start` a line from `start` holds, its
+    /// mark included (a word's), one at least — leaving three characters of
+    /// the word, up to its next break, for the next line where this line
+    /// keeps more than three.
     fn anywhere(&self, start: usize, fits: &dyn Fn(&str) -> bool) -> (usize, bool) {
         let count = |from: usize, to: usize| {
             self.boundaries
@@ -704,6 +756,8 @@ impl<'a> Inside<'a> {
 }
 
 /// The places `text` may break that keep whole words
+/// ([`BreakKind::is_word_boundary`]): its spaces, and between CJK
+/// characters.
 #[must_use]
 /// Return word-boundary [`LineBreak`]s in `text` ([`BreakKind::is_word_boundary`]).
 pub fn word_breaks(text: &str) -> Vec<LineBreak> {
@@ -713,6 +767,8 @@ pub fn word_breaks(text: &str) -> Vec<LineBreak> {
 }
 
 /// A piece of a line of text between two places it may break
+/// ([`pieces`]): what a greedy wrap lays on a line whole, or carries to the
+/// next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// A slice of text between two break opportunities ([`pieces`]).
 pub struct Piece<'a> {
@@ -725,6 +781,9 @@ pub struct Piece<'a> {
 }
 
 /// `text` CUT AT EVERY PLACE A LINE OF IT MAY BREAK OF A KIND `keep` TAKES
+/// ([`line_breaks`]), in order, white space trimmed and empty pieces
+/// dropped: the one cut every greedy word wrap of aterm's chrome lays its
+/// lines from.
 #[must_use]
 /// Split `text` at every [`LineBreak`] accepted by `keep`.
 pub fn pieces<'a>(text: &'a str, keep: fn(BreakKind) -> bool) -> Vec<Piece<'a>> {
@@ -753,6 +812,8 @@ pub fn pieces<'a>(text: &'a str, keep: fn(BreakKind) -> bool) -> Vec<Piece<'a>> 
 }
 
 /// Whether a line may break after `c` as after white space: white space
+/// that is not a no-break space ([`line_breaks`]' glue, U+00A0, U+2007,
+/// U+202F).
 #[must_use]
 #[inline]
 /// Whether `c` is breaking whitespace (whitespace other than no-break spaces).
@@ -765,6 +826,7 @@ mod tests {
     use super::*;
 
     /// `text` cut at each break of the kinds `keep` takes: its pieces, white
+    /// space trimmed.
     fn pieces(text: &str, keep: fn(BreakKind) -> bool) -> Vec<&str> {
         let mut out = Vec::new();
         let mut from = 0;
@@ -781,6 +843,7 @@ mod tests {
     }
 
     /// LATIN TEXT BREAKS AT ITS SPACES, and inside a word of prose after a
+    /// hyphen or a slash between its letters; never at a no-break space.
     #[test]
     fn latin_breaks_at_spaces_and_inside_prose_words() {
         assert_eq!(
@@ -801,6 +864,10 @@ mod tests {
     }
 
     /// A PATH BREAKS BEFORE ITS FOLDERS' SLASHES, never after one, so no
+    /// line ends in a separator; a URL also after its `://`; and nothing
+    /// else inside an identifier is a place to break: a run of joints at a
+    /// word's start (`/private`, `-e`, `--columns`), a hyphen before a digit
+    /// (`lab-42`) or between a host's or a triple's parts.
     #[test]
     fn a_path_breaks_before_its_slashes_and_an_identifier_nowhere_else() {
         assert_eq!(
@@ -856,6 +923,7 @@ mod tests {
     }
 
     /// `text` broken inside itself in a box `width` characters wide
+    /// ([`break_inside`]), every line's start checked against its text.
     fn inside(text: &str, mark: &str, width: usize) -> Vec<String> {
         let fits = |line: &str| line.chars().count() <= width;
         break_inside(text, 0..text.len(), mark, &fits)
@@ -872,6 +940,11 @@ mod tests {
     }
 
     /// A PIECE WIDER THAN A WHOLE LINE BREAKS WHERE A TYPESETTER WOULD: a
+    /// word at its syllables with a hyphen, as full as each line holds; an
+    /// identifier before its own joints with no mark, a number kept whole;
+    /// and only where neither fits at a character (a word with its hyphen,
+    /// an identifier with none), three of the word's characters carried to
+    /// the next line, never a lone letter.
     #[test]
     fn a_piece_wider_than_its_line_breaks_where_a_typesetter_would() {
         assert_eq!(inside("Brightness", "-", 8), ["Bright-", "ness"]);
@@ -936,6 +1009,9 @@ mod tests {
         assert_eq!(inside("cursor_style", "", 7), ["cursor", "_style"]);
     }
     /// CJK BREAKS BETWEEN ITS CHARACTERS, KINSOKU KEPT: closing punctuation
+    /// and the characters that may not start a line stay with the
+    /// character before them, opening punctuation with the one after it,
+    /// and a kana's voicing mark with its kana.
     #[test]
     fn cjk_breaks_between_characters_with_kinsoku() {
         assert_eq!(
@@ -956,6 +1032,10 @@ mod tests {
     }
 
     /// THE PIECES A WRAP LAYS ITS LINES FROM: Latin text of words and spaces
+    /// cuts as `split_whitespace` does, each piece after the first spaced; a
+    /// CJK run cuts between its characters, kinsoku kept, nothing between
+    /// them; a hyphenated word is whole unless the wrap takes its joints; and
+    /// each piece is the slice of the text at its own byte.
     #[test]
     fn pieces_are_what_a_wrap_lays_down() {
         fn words(text: &str, keep: fn(BreakKind) -> bool) -> Vec<(bool, &str)> {
@@ -1007,6 +1087,7 @@ mod tests {
     }
 
     /// A CUT THAT KEEPS WHOLE WORDS takes spaces and CJK characters, never a
+    /// hyphen or a slash inside a word.
     #[test]
     fn word_breaks_are_spaces_and_cjk() {
         let words = |text: &str| -> Vec<usize> {

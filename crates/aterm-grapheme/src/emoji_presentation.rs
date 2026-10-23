@@ -2,24 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The Unicode `Emoji_Presentation` property: whether a bare code point (no
-//! variation selector) defaults to emoji (colour, wide) or text (monochrome,
-//! narrow) presentation.
-//!
-//! Terminals gate colour-vs-mono font selection on this property (Ghostty's
-//! `CodepointResolver.zig`, iTerm2's `emojiWithDefaultEmojiPresentation`).
-//! Per UTS #51, `Emoji_Presentation=No` defaults to text even when
-//! `Emoji=Yes` (e.g. U+23FA ⏺) and goes colour only with VS16 (U+FE0F); a
-//! colour glyph existing in the emoji font is not sufficient.
-//!
-//! [`crate::is_emoji_char`] answers the broader "emoji-ish block" question used
-//! for width clustering; the two sets differ on purpose.
+//! Unicode `Emoji_Presentation` property lookup ([`crate::is_emoji_char`]).
 
-/// `Emoji_Presentation=Yes` ranges, inclusive `(lo, hi)`, sorted and disjoint.
-///
-/// Source: Unicode 16.0.0 `emoji-data.txt`, the same UCD version as the
-/// tables in [`crate::tables`], range-merged and checked against that file, every
-/// code point, by `tests/emoji_data.rs`. Re-extract from the matching UCD release to update.
+/// `Emoji_Presentation=Yes` ranges, inclusive `(lo, hi)`, sorted and disjoint ([`crate::tables`]).
 static EMOJI_PRESENTATION: &[(u32, u32)] = &[
     (0x231A, 0x231B),
     (0x23E9, 0x23EC),
@@ -103,14 +88,7 @@ static EMOJI_PRESENTATION: &[(u32, u32)] = &[
     (0x1FAF0, 0x1FAF8),
 ];
 
-/// `Emoji=Yes` ranges that are `Emoji_Presentation=No`, inclusive `(lo, hi)`,
-/// sorted and disjoint: the emoji that default to TEXT and turn emoji with VS16.
-///
-/// Source: Unicode 16.0.0 `emoji-data.txt` (`Emoji` minus `Emoji_Presentation`),
-/// the same UCD version as [`EMOJI_PRESENTATION`]. These are exactly the
-/// text-default bases of `emoji-variation-sequences.txt`; every other base it
-/// lists is `Emoji_Presentation=Yes`, already wide. `tests/emoji_data.rs` checks
-/// both tables against the UCD file, every code point.
+/// `Emoji=Yes` ranges that are `Emoji_Presentation=No`, inclusive `(lo, hi)`, sorted and disjoint.
 static TEXT_DEFAULT_EMOJI: &[(u32, u32)] = &[
     (0x0023, 0x0023),
     (0x002A, 0x002A),
@@ -236,8 +214,6 @@ static TEXT_DEFAULT_EMOJI: &[(u32, u32)] = &[
 /// Whether `cp` falls in one of `table`'s sorted, disjoint inclusive ranges.
 #[inline]
 pub(crate) fn in_ranges(table: &[(u32, u32)], cp: u32) -> bool {
-    // Sorted and disjoint, so a single binary search by range settles
-    // membership: find the range whose `lo <= cp`, then check `cp <= hi`.
     table
         .binary_search_by(|&(lo, hi)| {
             if cp < lo {
@@ -251,38 +227,14 @@ pub(crate) fn in_ranges(table: &[(u32, u32)], cp: u32) -> bool {
         .is_ok()
 }
 
-/// Whether `c` has the Unicode `Emoji_Presentation` property, i.e. a bare
-/// occurrence (no following VS16) defaults to emoji presentation.
-///
-/// `true`: the colour face is the right default (🚀 ☔ ✨ ⭐). `false`: text is
-/// the default even if the colour font has a glyph (⏺ ⏸ ⏹ are `Emoji=Yes`,
-/// `Emoji_Presentation=No` and need VS16).
-///
-/// REQUIRES: nothing (total over all `char`).
-/// ENSURES: returns `true` iff `c`'s scalar value is in the Unicode
-/// `Emoji_Presentation=Yes` set.
+/// Whether `c` has the Unicode `Emoji_Presentation` property, i.e.
 #[must_use]
 #[inline]
 pub fn is_emoji_presentation(c: char) -> bool {
     in_ranges(EMOJI_PRESENTATION, c as u32)
 }
 
-/// Whether VS16 (U+FE0F) makes `c` an emoji: `c` is `Emoji=Yes` but defaults
-/// to text (`Emoji_Presentation=No`), so it is one cell bare and two with VS16
-/// (`⬆️ ❤️ ©️ 1️⃣`). VS16 after anything else (`a️`, `✓️`) is an unsanctioned
-/// variation sequence and changes nothing; Unicode defines no emoji
-/// presentation for it.
-///
-/// The one rule for VS16 width: the live write path (`aterm-core`
-/// `widen_previous_cell_for_vs16`), the scrollback materialization/reflow paths
-/// (`aterm-grid`), the column walker ([`crate::GridColumns`]) and
-/// [`crate::grapheme_display_width`] all ask it, so a program that counts
-/// `⬆️` as two cells (`wcwidth`, `string-width`) finds its cursor where the grid
-/// put it, live or scrolled back.
-///
-/// REQUIRES: nothing (total over all `char`).
-/// ENSURES: `true` iff `c` is `Emoji=Yes` and `Emoji_Presentation=No` in
-/// Unicode 16.0.0.
+/// Whether VS16 (U+FE0F) makes `c` an emoji.
 #[must_use]
 #[inline]
 pub fn is_vs16_emoji_capable(c: char) -> bool {

@@ -256,12 +256,12 @@ impl StepAudit {
     }
 }
 
-/// The function half of an entry id (`"<machine>::<action> @ <fn>"`). A window observes functions,
+/// The function half of an entry id (`"<machine>::<action> @ <fn>"`).
 fn fn_of(entry_id: &'static str) -> &'static str {
     entry_id.rsplit_once(" @ ").map_or(entry_id, |(_, f)| f)
 }
 
-/// Cross `machine`'s linked anchors with a per-step ledger. `machine` is resolved with
+/// Cross `machine`'s linked anchors with a per-step ledger.
 #[cfg_attr(trust_verify, trust::skip)]
 fn audit_steps(machine: &str, steps: &[StepRecord]) -> StepAudit {
     let linked: Vec<&'static RefinementAnchor> = refinements()
@@ -271,6 +271,8 @@ fn audit_steps(machine: &str, steps: &[StepRecord]) -> StepAudit {
 }
 
 /// The pure half of [`audit_steps`]: set algebra over an explicit anchor list, so the
+/// derivations can be exercised on synthetic ledgers rather than only on whatever the
+/// test binary happened to link.
 #[cfg_attr(trust_verify, trust::skip)]
 #[allow(clippy::too_many_lines)]
 fn audit_steps_of(
@@ -655,6 +657,8 @@ struct AnchorObligationSpec<'a> {
 }
 
 /// The Ob.4 ("machine exists") and Ob.1 ("action exists") arm for one anchor: push a
+/// [`ClosureViolation`] when `resolved` is `None`, else when `target` does not resolve in the
+/// module's action set.
 fn check_anchor_obligations(
     violations: &mut Vec<ClosureViolation>,
     resolved: Option<&ModuleActionIndex>,
@@ -816,7 +820,7 @@ pub fn check_closure(modules: &[SpecModule]) -> ClosureReport {
 mod tests {
     use super::*;
 
-    /// A synthetic anchor. `entry_id` is spelled exactly as the `#[refines]` macro
+    /// A synthetic anchor.
     fn synth(
         action: &'static str,
         method: &'static str,
@@ -846,6 +850,7 @@ mod tests {
     }
 
     /// The within-window move `stray` catches: an anchor moved onto a function whose entry
+    /// pattern is wider than the action it now claims.
     #[test]
     fn a_move_inside_one_window_is_caught_when_the_new_site_is_wider() {
         let moved = vec![
@@ -913,6 +918,8 @@ mod tests {
     }
 
     /// A worker's window reaches its owner only by take and merge: nothing crosses threads
+    /// otherwise, a taken window is closed and empty, and a closed window neither hands its record
+    /// over nor takes a merge.
     #[test]
     fn a_workers_window_reaches_its_owner_only_by_take_and_merge() {
         assert!(reset_entered_anchors(), "the owner's window opens");

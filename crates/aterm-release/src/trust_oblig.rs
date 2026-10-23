@@ -1,25 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Per obligation: the record `ship trust run --obligations` keeps beside each check's log
-//! (`<spec>.log.oblig.tsv`, [`Record`]), so two runs can be held side by side function by
-//! function, not by a library's count (a count hides a loss behind a gain). A floor that
-//! falls cites it: the proved obligations that left with their code, every other function's
-//! as before.
-//!
-//! The obligations come from `report.ndjson` ([`REPORT_SCHEMA`], written by `targo trust
-//! check --report-dir`), never the terminal log: its rows name no function (two functions
-//! can print identical rows with opposite verdicts), drop columns, and print the standard
-//! library's paths one way under the seal and another under a scratch stage2. A report runs
-//! to about 150 KB an obligation, so the lane ([`write_record`]) reduces it at once to a
-//! [`Record`], whose counts must be the report footer's, and deletes it. [`reduce`]
-//! normalises each obligation's function, file ([`Obligation::file`]) and anchor
-//! ([`anchor_of`]).
-//!
-//! Never the report's `obligation_id` (`vc:<fn>:<category>:<ordinal>`): any added or
-//! dropped obligation renumbers its function's ordinals. Never
-//! `target/trust-cache/verification.json`: it holds results from before the publication
-//! boundary.
+//! Per-obligation Trust verification records ([`Record`], [`REPORT_SCHEMA`], [`write_record`],
+//! [`reduce`], [`Obligation::file`], [`anchor_of`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -40,8 +23,7 @@ pub const NO_LOCATION: &str = "@none";
 /// What the record of `<spec>.log` is called, beside it.
 pub const RECORD_SUFFIX: &str = ".oblig.tsv";
 
-/// The standard library's crates, as a toolchain prints their sources: under
-/// `library/` in a checkout of trust, remapped to `<crate>/src/…` in a seal.
+/// The standard library's crates, as a toolchain prints their sources.
 const SYSROOT: &[&str] = &[
     "alloc",
     "core",
@@ -63,8 +45,7 @@ const SYSROOT: &[&str] = &[
     "rustc-std-workspace-std",
 ];
 
-/// Where an obligation is, as the report gives it: 1-based lines, 0-based character (not
-/// byte) columns, the end exclusive.
+/// Where an obligation is, as the report gives it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Span {
     pub l0: u32,
@@ -103,22 +84,7 @@ impl Obligation {
     }
 }
 
-// The record, `<spec>.log.oblig.tsv`
-
-/// One check's obligations, as the lane recorded them beside its log —
-/// tab-separated lines:
-///
-/// ```text
-/// # aterm trust obligations 1
-/// package    <the library>
-/// unit       <the report's cargo-target(…) unit>
-/// functions  <function records read>
-/// total      <obligations>
-/// proved     <obligations proved>
-/// o  <function> <kind> <file> <l0> <c0> <l1> <c1> <status> <anchor> <description>
-/// …
-/// end        <obligations>
-/// ```
+/// One check's obligations, as the lane recorded them beside its log — tab-separated lines:.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Record {
     pub package: String,
@@ -176,8 +142,7 @@ fn valid_function(s: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
-/// A kind: `[a-z0-9_:-]+`, and no `transport:` row (a check whose results did
-/// not reach targo).
+/// A kind: `[a-z0-9_:-]+`, and no `transport:` row (a check whose results did not reach targo).
 fn valid_kind(s: &str) -> std::result::Result<(), String> {
     if s.is_empty()
         || !s
@@ -197,8 +162,7 @@ fn valid_kind(s: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
-/// A normalised file: `@sysroot/…`, `@registry/…`, [`NO_LOCATION`], or
-/// repo-relative with no `.`, `..` or empty component.
+/// Normalized file path (`@sysroot/…`, `@registry/…`, [`NO_LOCATION`], or repo-relative).
 fn valid_file(s: &str) -> std::result::Result<(), String> {
     if s == NO_LOCATION {
         return Ok(());
@@ -223,11 +187,7 @@ fn valid_file(s: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
-/// A relative file a report printed, its `..` folded away: the compiler prints a
-/// `#[path]` mount from its crate's directory (aterm-gpu-web's lib mounts
-/// `crates/aterm-gpu-web/src/../../aterm-wasm/src/effects_api.rs`), and the file is
-/// named where it lives. `None` for one that climbs above where it starts or holds an
-/// empty or `.` component.
+/// A relative file a report printed, its `..` folded away.
 fn fold_parents(raw: &str) -> Option<String> {
     let mut kept: Vec<&str> = Vec::new();
     for c in raw.split('/') {
@@ -242,8 +202,7 @@ fn fold_parents(raw: &str) -> Option<String> {
     Some(kept.join("/"))
 }
 
-/// A span whose end is not before its start, on lines from 1 — or, for an
-/// obligation with no location, none (`0:0-0:0`).
+/// A span whose end is not before its start, on lines from 1.
 fn valid_span(s: Span, file: &str) -> std::result::Result<(), String> {
     let none = Span {
         l0: 0,
@@ -275,11 +234,7 @@ fn valid_status(s: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
-// The reduction: report.ndjson -> the record ([`write_record`])
-
-/// One line of `report.ndjson`, only what the record keeps: serde skips the
-/// rest (the proof and transport evidence are most of each line) unread into
-/// memory.
+/// One line of `report.ndjson`, only what the record keeps.
 #[derive(Deserialize)]
 struct RawRecord {
     record_type: String,
@@ -345,9 +300,7 @@ struct Sources<'a> {
     repo: &'a Path,
     /// The repository as the file system names it (cargo may print either).
     repo_real: Option<PathBuf>,
-    /// Repo-relative directories a relative path may be relative to: the
-    /// check's manifest's directory and its ancestors, deepest first (a fork
-    /// prints paths relative to its own workspace's root), then the root.
+    /// Repo-relative directories a relative path may be relative to.
     bases: Vec<String>,
     lines: BTreeMap<String, Vec<String>>,
 }
@@ -386,8 +339,7 @@ impl<'a> Sources<'a> {
         })
     }
 
-    /// The normalised name of a file a report printed, and whether it is in
-    /// the checkout.
+    /// The normalised name of a file a report printed, and whether it is in the checkout.
     fn resolve(&self, raw: &str) -> std::result::Result<(String, bool), String> {
         if raw.is_empty() || raw.chars().any(char::is_control) {
             return Err(format!("a location in no file (`{}`)", one_line(raw)));
@@ -465,8 +417,7 @@ impl<'a> Sources<'a> {
     }
 }
 
-/// `…/library/<sysroot crate>/<rest>` -> `<sysroot crate>/<rest>`, at the
-/// last `library/` that names one.
+/// `…/library/<sysroot crate>/<rest>` -> `<sysroot crate>/<rest>`.
 fn sysroot_tail(raw: &str) -> Option<&str> {
     let mut found = None;
     let mut from = 0;
@@ -493,10 +444,7 @@ fn collapse(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// The anchor: the source text of an in-tree span. On one line the span's characters; over
-/// several, the first line's from the start column and the last's to the end column, joined
-/// ` … `; whitespace collapsed; over 100 characters, its first 80, `…#` and 12 hex of the
-/// whole text's sha256.
+/// The anchor: the source text of an in-tree span.
 ///
 /// # Errors
 /// A span past its file's lines or a line's characters.
@@ -539,15 +487,7 @@ pub fn anchor_of(lines: &[String], s: Span) -> std::result::Result<String, Strin
     Ok(text)
 }
 
-/// Reads `report.ndjson` into the check's [`Record`] ([`write_record`] runs it after each
-/// check of the lane), or says why not, and the check keeps no record.
-///
-/// It refuses what the record could not vouch for: a line that is not a record, a header
-/// not first or of another schema or package, a record type it does not read (transport),
-/// a function outside the unit or reported twice (same-name methods of two impl blocks
-/// report distinct paths such as `W::<u8>::inc`), a kind, status, path or span of no form
-/// it knows or past its source, counts that are not the rows', and a report with no footer
-/// (cut short).
+/// Read `report.ndjson` into the check's [`Record`] ([`write_record`]).
 ///
 /// # Errors
 /// Why there is no record, in one line.
@@ -708,8 +648,7 @@ pub fn reduce(
     Ok(rec)
 }
 
-/// A description as the record keeps it: whitespace collapsed (a record row
-/// is one line of tab-separated fields), `-` for none.
+/// A description as the record keeps it: whitespace collapsed, `-` for none.
 fn kept_desc(d: &str) -> String {
     let d = collapse(d);
     if d.is_empty() { "-".into() } else { d }
@@ -745,7 +684,6 @@ fn obligation(
         l1: loc.line_end,
         c1: loc.col_end,
     };
-    // A reported location is held to the ordinary rule, whatever it names.
     valid_span(span, "")?;
     let (file, in_tree) = src.resolve(&loc.file)?;
     let anchor = if in_tree {
@@ -780,7 +718,6 @@ pub struct ReduceArgs {
 /// # Errors
 /// Why the check's report gives no record it can vouch for.
 pub fn write_record(args: &ReduceArgs) -> std::result::Result<Record, String> {
-    // A record an earlier run left must not read as this one's.
     let _ = fs::remove_file(&args.out);
     reduce(
         &args.report,
@@ -817,7 +754,6 @@ mod tests {
         .iter()
         .map(|s| (*s).to_string())
         .collect();
-        // Column 32 counts characters; its byte offset is 36.
         let one = Span {
             l0: 2,
             c0: 32,
@@ -895,7 +831,6 @@ mod tests {
             s.resolve("src/lib.rs").unwrap(),
             ("src/lib.rs".into(), true)
         );
-        // The seal's remapped standard library, and a scratch stage2's.
         assert_eq!(
             s.resolve("alloc/src/macros.rs").unwrap(),
             ("@sysroot/alloc/src/macros.rs".into(), false)
@@ -919,7 +854,6 @@ mod tests {
         );
         let abs = format!("{}/src/lib.rs", repo.display());
         assert_eq!(s.resolve(&abs).unwrap(), ("src/lib.rs".into(), true));
-        // A fork's paths, relative to its own workspace's root.
         let fork = Sources::new(repo, Some("vendor/w/crates/f/Cargo.toml")).unwrap();
         assert_eq!(
             fork.resolve("crates/f/src/lib.rs").unwrap(),
@@ -929,8 +863,6 @@ mod tests {
             fork.resolve("src/lib.rs").unwrap(),
             ("vendor/w/crates/f/src/lib.rs".into(), true)
         );
-        // A `#[path]` mount, printed from the mounting crate's directory: named where
-        // the file lives, in the workspace and in a fork's.
         assert_eq!(
             s.resolve("vendor/w/crates/f/src/../../f/src/lib.rs")
                 .unwrap(),
@@ -940,7 +872,6 @@ mod tests {
             fork.resolve("crates/f/src/../../f/src/lib.rs").unwrap(),
             ("vendor/w/crates/f/src/lib.rs".into(), true)
         );
-        // Of no known form: refused.
         for bad in [
             "/opt/elsewhere/x.rs",
             "src/missing.rs",
@@ -1069,7 +1000,6 @@ mod tests {
         let z = &rec.rows[2];
         assert_eq!(z.file, "@sysroot/alloc/src/macros.rs");
         assert_eq!(z.anchor, "-");
-        // The record keeps the description as reported.
         assert!(z.desc.ends_with("(count `_7`)"), "{}", z.desc);
         let text = rec.to_text();
         let unit = format!("unit\t{}", rec.unit);
@@ -1103,7 +1033,6 @@ mod tests {
             ]
         );
         assert_eq!(lines.last().copied(), Some("end\t3"));
-        // An obligation the report gives no location is at `@none`, spanning nothing.
         let none = probe_report().replacen(
             r#""location":{"file":"src/lib.rs","line_start":3,"col_start":4,"line_end":3,"col_end":9},"#,
             "",

@@ -47,7 +47,7 @@ impl MarksState {
     reason = "independent per-channel authority bits (fg, bg, cursor) plus an unrelated rendering flag, not a state machine"
 )]
 pub(super) struct ColorState {
-    /// Maps 256 indexed colors to RGB values (OSC 4). Private to `grouped_state`
+    /// Maps 256 indexed colors to RGB values (OSC 4).
     palette: ColorPalette,
     /// Cached nonzero FxHash digest of `palette` (`0` = uncached).
     palette_hash: std::sync::atomic::AtomicU64,

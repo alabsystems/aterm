@@ -36,6 +36,7 @@ pub enum Body {
     /// The flying head ([`crate::kitty_cursor`]): `rainbow kitty flying` and the bare `nyan` / `rainbow` aliases.
     Flying {
         /// The caret cell the head escorts this frame (`CompanionDuty::FlyingHead { cell }`),
+        /// so seat and snap-to resolve against one cell.
         cell: (u16, u16),
     },
     /// No companion this frame; the previous body keeps whatever exit its own animator gives it.
@@ -306,20 +307,25 @@ where
 }
 
 /// Cells before the caret in which ink makes the caret's line one being
+/// written ([`placement`] step 3): wider than the mirror seat, so the last
+/// keys' glyphs still unechoed do not read as blank glass.
 const WRITTEN_REACH: u16 = 8;
 
 /// What the ink probe said about the cells a span would cover, less the caret
+/// cell, which needs no probe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Probe {
     /// Every probed cell answered `Some(false)`.
     Clear,
     /// Some probed cell answered `Some(true)`, or answered `None` beside cells
+    /// that could be probed.
     Inked,
     /// Every cell answered `None`: the host has no ink information.
     Blind,
 }
 
 /// One span's census: whether it covers the caret cell (arithmetic), and what
+/// the probe said about the rest of it.
 #[derive(Clone, Copy, Debug)]
 struct Census {
     covers_caret: bool,
@@ -335,6 +341,7 @@ impl Census {
 }
 
 /// Census the cells a body `w` px wide with its left edge at `x` px covers on
+/// `row`.
 #[inline]
 fn census<F>(x: i32, w: i32, row: u16, caret: (u16, u16), cols: u16, cw: i32, ink: &F) -> Census
 where
@@ -382,6 +389,7 @@ where
 }
 
 /// The inclusive cell columns a body `w` px wide at `x` px covers, clamped
+/// into `0..cols`.
 #[inline]
 const fn cell_span(x: i32, w: i32, cw: i32, cols: u16) -> (u16, u16) {
     let last_col = cols.saturating_sub(1) as i32;
@@ -404,7 +412,7 @@ const fn cell_span(x: i32, w: i32, cw: i32, cols: u16) -> (u16, u16) {
     (first as u16, last as u16)
 }
 
-/// Build the [`Seat`] for a resolved `x`/`y`. `col` is read off the final `x`
+/// Build the [`Seat`] for a resolved `x`/`y`.
 #[inline]
 const fn seat(
     query: &SeatQuery,
@@ -543,7 +551,7 @@ impl PetOffer {
     }
 }
 
-/// `at + ms`, saturating. The module's one ms-to-`Instant` conversion, so nothing rounds to
+/// `at + ms`, saturating.
 #[inline]
 fn add_ms(at: Instant, ms: f32) -> Instant {
     at.checked_add(std::time::Duration::from_secs_f32(ms / 1000.0))
@@ -578,6 +586,7 @@ mod tests {
     }
 
     /// The shipped seat as a fixture: `kitty_cursor_footprint`'s ¾-cell lead,
+    /// right-margin clamp and boundary rise, bob 0.
     fn footprint(caret: (u16, u16), cols: u16) -> CatFootprint {
         let grid_w = i32::from(cols) * CW;
         let cursor_right = (i32::from(caret.1) + 1) * CW;
@@ -599,6 +608,8 @@ mod tests {
     }
 
     /// The head at a line's end, typed up to the margin: the line is written
+    /// up to the cells the mirror seat would cover, which are blank (spaces, or
+    /// keys whose echo has not landed), and the row above is blank.
     #[test]
     fn at_the_line_s_end_the_head_rises_once_and_stays() {
         let walk = |held: bool, margin: bool| -> Vec<(u16, u16, Side)> {
@@ -700,6 +711,7 @@ mod tests {
     }
 
     /// L-A: the router names one body, the host duty's, and a frame whose body
+    /// is already claimed draws nothing.
     #[test]
     fn a_claimed_frame_draws_no_second_body() {
         for (duty, want) in [
@@ -723,6 +735,8 @@ mod tests {
     }
 
     /// D13: the flying head takes the meteor whole; the pet is offered the
+    /// arrival edge and nothing else (no teleport, spine impulse or retiming,
+    /// and no router-held cadence for the pet's own latch).
     #[test]
     fn the_pet_is_offered_the_meteor_edge_but_keeps_its_own_pounce() {
         let t0 = Instant::now();
@@ -770,6 +784,9 @@ mod tests {
     }
 
     /// L-D: whatever the caret column and ink, the seat never covers the caret
+    /// cell or an avoidable inked cell, keeps the shipped seat on blank glass
+    /// wherever it clears the caret, yields behind where the margin clamp makes
+    /// it intrude, and carries one position.
     #[test]
     fn the_flying_head_never_covers_the_cell_the_caret_is_typing_into() {
         let caret_row = 7_u16;
@@ -862,6 +879,9 @@ mod tests {
     }
 
     /// Seat steps 3 and 4: a fully inked row lifts the body into the sky; a
+    /// fully inked sky draws over the words there; a top-row caret stays on its
+    /// row without covering the caret; a grid too narrow for either side falls
+    /// back to the shipped footprint.
     #[test]
     fn a_crowded_line_yields_to_the_sky_then_draws_over_the_words() {
         let all_ink = |_r: u16, _c: u16| Some(true);
@@ -911,6 +931,8 @@ mod tests {
     }
 
     /// A blind host (every probe `None`) keeps the shipped seat wherever it clears the caret and
+    /// never gets the sky or an over-ink verdict; at the right margin it takes the mirror seat,
+    /// and where neither side clears, the shipped footprint.
     #[test]
     fn an_ink_blind_host_keeps_the_shipped_seat_but_never_the_caret_cell() {
         let blind_probe = |_r: u16, _c: u16| -> Option<bool> { None };

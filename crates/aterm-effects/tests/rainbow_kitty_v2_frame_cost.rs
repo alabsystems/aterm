@@ -1,36 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Rainbow Kitty v2 frame-cost gate (`docs/design/RAINBOW-KITTY-V2.md` §18, §21).
-//!
-//! Drives the v2 [`Engine`] alone, and `CursorGlow` (style `RainbowKitty`, v2 through the real
-//! seam), through the §21 and §27 gestures at 120 Hz and asserts:
-//!
-//! * zero allocation on every steady tick after warm-up and through the idle run-out (a
-//!   counting global allocator); through the seam, every eighth measured frame withholds one
-//!   row the witness asked for;
-//! * idle → zero: after the last key, `next_change_deadline == None`,
-//!   `needs_frame_cadence == false`, `fingerprint == 0` and a tick writes nothing;
-//! * the stream caps (`MAX_QUADS` 16 384, `MAX_HALOS` 512) on every tick.
-//!
-//! `benches/rainbow_kitty_v2_frame_cost.rs` mounts this file and holds §18's CPU budget
-//! (p50 ≤ 0.4 ms, p90 ≤ 0.6 ms per tick) for the engine alone and through the seam.
-//!
-//! ```sh
-//! # the deterministic laws, every run:
-//! targo --unverified test -p aterm-effects --test effects_suite -- rainbow_kitty_v2_frame_cost:: --nocapture
-//! # the CPU budget gate, release only:
-//! targo --unverified bench -p aterm-effects --bench rainbow_kitty_v2_frame_cost
-//! # on a host with no §18 measurement on record, scale the two budgets (nothing else; the
-//! # knob is shared with benches/cursor_bench.rs, see `common::budget_scale`):
-//! RK_FRAME_COST_BUDGET_SCALE=2 targo --unverified bench -p aterm-effects \
-//!     --bench rainbow_kitty_v2_frame_cost
-//! ```
-//!
-//! The suite's allocator (`alloc_count`) counts only the thread that switched it
-//! on, while a driver call is on its stack, and keeps its tally on that thread
-//! too, so the laws' twelve (scenario x engine) cells run on
-//! [`common::par_map`]'s pool, beside every other test of `effects_suite`.
+//! Rainbow Kitty v2 120 Hz frame-cost and zero-allocation gate.
 
 use std::time::{Duration, Instant};
 
@@ -41,8 +12,6 @@ use aterm_effects::rainbow_kitty::{
     CaretSeam, Config, Dir, Engine, Event, Frame, Licence, TypedClass, witness::WITNESS_ROWS,
 };
 use aterm_render::{BeamVertex, GlowQuad, RainHalo};
-
-// The fixture: one geometry, one config, both engines.
 
 const HZ: u64 = 120;
 
@@ -100,8 +69,6 @@ fn glow_config() -> GlowConfig {
 /// The row every scenario types on.
 const ROW: u16 = 12;
 
-// The script: one vocabulary, replayed to both engines.
-
 /// One host gesture.
 #[derive(Clone, Copy, Debug)]
 enum Action {
@@ -113,13 +80,10 @@ enum Action {
     Backspace,
     /// A row-band move the host replays before the tick (the band path): screen
     /// rows `top..=bottom` moved by `delta` (Codex's inline viewport sliding
-    /// down per streamed line, its transcript archiving up). The caret rides
-    /// its band (`band_pos`) as the host sees it on the next present.
+    /// down per streamed line, its transcript archiving up).
     BandMove(u16, u16, i16),
     /// A sing-along bar (§27): `n` stars fanned from the caret, with the
-    /// shockwave ring on every fourth. The one hand-off that stages a `Sow`
-    /// without being a cursor event, so it checks the `SOW_SCRATCH`
-    /// reservation.
+    /// shockwave ring on every fourth.
     Party(u8, bool),
 }
 
@@ -130,7 +94,7 @@ struct Step {
     action: Action,
 }
 
-/// One §21 scenario.
+/// Scripted 120 Hz cursor-glow scenario.
 pub(crate) struct Scenario {
     pub(crate) name: &'static str,
     start: (u16, u16),
@@ -183,7 +147,6 @@ fn burst_with_nav_meteor() -> Scenario {
     let mut tick = 0usize;
     while tick < ticks {
         if tick.is_multiple_of(ticks_in_ms(500)) {
-            // Ctrl-E-shaped hop of 40 cells, whichever way fits the row.
             let dcol = if col + 40 < 180 { 40 } else { -40 };
             col += dcol;
             steps.push(Step {
@@ -265,11 +228,7 @@ fn held_backspace() -> Scenario {
 }
 
 /// §27, Codex: 12 cps prose into the composer while the program streams an
-/// answer. Phase A (~1.5 s): the inline viewport (from the row above the caret
-/// to the bottom) slides down one row per streamed line every 120 ms and the
-/// caret rides it from [`ROW`] to the penultimate row. Phase B: the composer is
-/// pinned at the bottom and each streamed line archives rows `0..=caret−2` up
-/// one row every 30 ms; the caret stands still.
+/// answer.
 fn codex_streaming_12cps() -> Scenario {
     let ticks = ticks_in_ms(3_000);
     let bottom = geometry().rows as u16 - 1;
@@ -280,7 +239,6 @@ fn codex_streaming_12cps() -> Scenario {
     let mut row = ROW;
     let mut prose = PROSE.chars().cycle();
     for tick in 0..ticks {
-        // The host replays the batch before the tick's typed echo is judged,
         // so a band move on a key's tick is pushed first.
         if tick > 0 && tick < phase_b_from && tick.is_multiple_of(line_a) && row + 1 < bottom {
             steps.push(Step {
@@ -312,12 +270,9 @@ fn codex_streaming_12cps() -> Scenario {
 
 /// §27: a held key at key-repeat cadence (which arms the sing-along) with a bar
 /// on every bar boundary, the ring on every fourth, the fan widening as
-/// `kitty_sing::bar_fan` does. The busiest frame a party lands on: the held key
-/// has filled the sky toward its cap, so the bar's `Sow` is staged beside a
-/// full shed.
+/// `kitty_sing::bar_fan` does.
 fn sing_along_bars() -> Scenario {
     let ticks = ticks_in_ms(3_000);
-    // A 30 ms auto-repeat, and a bar every 1.6 s (4 beats at SING_BPM).
     let repeat_ticks = ticks_in_ms(30).max(1);
     let bar_ticks = ticks_in_ms(1_600).max(1);
     let mut steps: Vec<Step> = (0..)
@@ -364,12 +319,7 @@ pub(crate) fn scenarios() -> Vec<Scenario> {
     .collect()
 }
 
-/// `RK_FRAME_COST_ONLY="<engines>:<scenario substring>"` narrows a run to one
-/// cell of the table for a profiler (`engines` a `+`-joined subset of `v2`, the
-/// engine alone, and `v2s`, through `CursorGlow`'s seam);
-/// `RK_FRAME_COST_REPEAT=n` repeats each measurement so a sampler can attach.
-/// Neither changes what is asserted (`RK_FRAME_COST_BUDGET_SCALE` does; see
-/// `common::budget_scale`).
+/// Returns whether engine `tag` is selected by `RK_FRAME_COST_ONLY`.
 pub(crate) fn engine_selected(tag: &str) -> bool {
     let only = std::env::var("RK_FRAME_COST_ONLY").unwrap_or_default();
     let engines = only.split(':').next().unwrap_or("");
@@ -383,8 +333,6 @@ fn repeat() -> usize {
         .unwrap_or(1)
         .max(1)
 }
-
-// The drivers: v2's Engine alone, and v2 behind CursorGlow's seam.
 
 /// What one tick wrote.
 #[derive(Clone, Copy, Debug, Default)]
@@ -425,7 +373,7 @@ trait Driver {
     /// The streams the last tick wrote: `(under, out, halos)`.
     fn streams(&self) -> (&[GlowQuad], &[GlowQuad], &[RainHalo]);
     /// Rows handed to the content witness over this driver's life, the
-    /// non-vacuity check for the seam. Zero for a driver with no host seam.
+    /// non-vacuity check for the seam.
     fn witness_feeds(&self) -> u64 {
         0
     }
@@ -439,7 +387,7 @@ trait Driver {
 }
 
 /// An FNV-1a fold over every emitted field, timed separately in `run` to price
-/// a per-frame content hash. The engine's own `fingerprint` is liveness only.
+/// a per-frame content hash.
 fn replica_fingerprint(under: &[GlowQuad], out: &[GlowQuad], halos: &[RainHalo]) -> u64 {
     if under.is_empty() && out.is_empty() && halos.is_empty() {
         return 0;
@@ -488,15 +436,10 @@ impl V2 {
         let geom = geometry();
         let mut eng = Engine::new();
         eng.set_engaged(true);
-        // §5.4: no sky star is born over an unprobed row. Blank rows either side
-        // of the typing row make the sky the worst case, as a host probing the
-        // caret row and both neighbours reports.
         let blank = vec![false; geom.cols];
         for r in [ROW - 1, ROW, ROW + 1] {
             eng.probe_mut().probe_row(i32::from(r), &blank);
         }
-        // `Frame`'s streams are host scratch (§17.1, §18) held at the stream
-        // caps; reserving them here makes any allocation a producer's.
         Self {
             eng,
             cfg: Config::from_glow(&glow_config(), false),
@@ -570,7 +513,6 @@ impl Driver for V2 {
                     self.geom.origin_y,
                 );
                 caret.0 = band_pos(caret.0, top, bottom, delta);
-                // The host re-probes the caret's rows before the next deal.
                 for r in [caret.0.saturating_sub(1), caret.0, caret.0 + 1] {
                     self.eng.probe_mut().probe_row(i32::from(r), &self.blank);
                 }
@@ -579,8 +521,6 @@ impl Driver for V2 {
     }
 
     fn tick(&mut self, now: Instant, _caret: (u16, u16)) -> Wrote {
-        // The host clears its scratch every frame (`CursorGlow::tick` does
-        // `out.clear()`); the engine appends.
         self.under.clear();
         self.out.clear();
         self.halos.clear();
@@ -597,8 +537,6 @@ impl Driver for V2 {
         };
         self.eng.tick(now, self.geom, &self.cfg, &mut fr);
         let fp = fr.fp;
-        // A host takes the impulse every frame; leaving it pending would be
-        // a different steady state from the shipping one.
         let _ = self.eng.take_companion_impulse();
         Wrote {
             under: self.under.len(),
@@ -626,8 +564,7 @@ impl Driver for V2 {
 }
 
 /// `CursorGlow` in the `RainbowKitty` style, v2 through the real seam in `CursorGlow::tick`: the
-/// cost of a typed key to the host. This harness supplies no glyph probes, so the seam run has
-/// no sky stars; its cost is a floor, not a substitute for the `V2` driver.
+/// cost of a typed key to the host.
 struct Host {
     glow: CursorGlow,
     cfg: GlowConfig,
@@ -635,16 +572,13 @@ struct Host {
     quads: Vec<GlowQuad>,
     last_fp: u64,
     /// The content witness's row as the frame hold hands it over, fed before
-    /// each tick. Every column holds a glyph that never moves: the witness's
-    /// worst case (every ribbon cell arms a record, walked each frame) with
-    /// nothing retiring (`tests/abandoned_ribbon.rs` covers retirement).
+    /// each tick.
     witness_row: Vec<char>,
     witness_feeds: u64,
     /// After warm-up, every [`WITHHOLD_EVERY`]th frame withholds one asked-for
     /// row (the first that is not the caret's, as the composed host drops its
     /// second read), so the walk scans the records beside it
-    /// (`Witness::find_deferred_runs`). Warm-up withholds nothing, so only
-    /// scratch reserved up front keeps these frames from allocating.
+    /// (`Witness::find_deferred_runs`).
     withhold: bool,
     frames: u64,
     withheld_frames: u64,
@@ -689,15 +623,11 @@ impl Driver for Host {
                 self.glow.note_band_move(top, bottom, delta);
                 caret.0 = band_pos(caret.0, top, bottom, delta);
             }
-            // The seam run does not replay the bar; the `V2` driver prices it.
             Action::Party(..) => {}
         }
     }
 
     fn tick(&mut self, now: Instant, caret: (u16, u16)) -> Wrote {
-        // The frame hold's witness feed in order: the caret row rides the probe
-        // the host holds, then the rows the ribbon names. The engine consumes
-        // them inside the tick below.
         {
             self.frames += 1;
             let withhold = self.withhold && self.frames.is_multiple_of(WITHHOLD_EVERY);
@@ -763,8 +693,6 @@ impl Driver for Host {
     }
 }
 
-// The run.
-
 /// Idle run-out ceiling after the last gesture; every v2 life is shorter
 /// (meteor `T + FLIGHT_OFF_GLASS_MS`, star ≤ 460 ms, the ribbon swoosh
 /// `SWOOSH_TOTAL_S`).
@@ -795,7 +723,7 @@ struct IdleTimes {
     wrote_nothing_after: bool,
 }
 
-/// What one measured pass produced.
+/// Frame-cost and allocation metrics from one measured pass.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Report {
     us: Vec<u64>,
@@ -853,9 +781,7 @@ impl Report {
     }
 }
 
-/// One pass of the script through `d` from `t0`. `measured` turns on timers and
-/// the allocation counter. Returns the report and the instant the pass ended
-/// (idle included).
+/// One pass of the script through `d` from `t0`.
 fn run(d: &mut dyn Driver, sc: &Scenario, t0: Instant, measured: bool) -> (Report, Instant) {
     let mut rep = Report::default();
     let n_measured = sc.ticks.saturating_sub(sc.measure_from);
@@ -925,7 +851,6 @@ fn run(d: &mut dyn Driver, sc: &Scenario, t0: Instant, measured: bool) -> (Repor
             );
         }
     }
-    // Idle run-out: keep ticking with no gestures until every law holds.
     let last = t0 + period() * sc.last_event_tick() as u32;
     let idle_ticks = ticks_in_ms(IDLE_CEILING_MS);
     let mut zero_seen = false;
@@ -975,10 +900,7 @@ fn run(d: &mut dyn Driver, sc: &Scenario, t0: Instant, measured: bool) -> (Repor
     (rep, now)
 }
 
-/// Warm-up passes before the measured one, at most. The cold pass grows every
-/// demand-grown pool and a second can still grow the ribbon, so the gate
-/// measures after a pass that allocated nothing: a failure is a per-frame
-/// allocation, not one-time growth.
+/// Warm-up passes before the measured one, at most.
 const WARMUP_PASSES_MAX: usize = 3;
 
 /// Warm the driver until a whole pass (script + idle run-out) allocates
@@ -1006,9 +928,7 @@ fn measure(d: &mut dyn Driver, sc: &Scenario) -> Report {
     rep
 }
 
-/// One table cell: `"v2"` (the engine alone) or `"v2s"` (through the seam)
-/// driven through `sc`, the driver built on this thread so its warm-up and
-/// measured pass share one allocator tally.
+/// Warms and measures engine `tag` (`"v2"` or `"v2s"`) on scenario `sc`.
 pub(crate) fn measure_cell(tag: &str, sc: &Scenario) -> Report {
     match tag {
         "v2" => measure(&mut V2::new(), sc),
@@ -1085,11 +1005,9 @@ fn print_allocs(sc: &Scenario, r: &Report) {
     }
 }
 
-// The gates.
-
 /// §18's deterministic laws, every run: zero allocation on every steady and
 /// idle frame, idle → exactly zero within [`IDLE_CEILING_MS`], the stream caps,
-/// and a live fixture. Timing printed here is informational.
+/// and a live fixture.
 #[test]
 fn rainbow_kitty_v2_steady_frames_allocate_nothing_and_idle_to_exactly_zero() {
     assert_counter_is_per_thread();
@@ -1099,9 +1017,6 @@ fn rainbow_kitty_v2_steady_frames_allocate_nothing_and_idle_to_exactly_zero() {
         "release build"
     };
     print_header(mode);
-    // The cells are independent replays on a scripted clock and the tally is
-    // per thread, so they run on the pool; rows print and laws are judged in
-    // scenario order afterwards.
     let scs = scenarios();
     let cells: Vec<(usize, &str)> = (0..scs.len())
         .flat_map(|i| ["v2", "v2s"].map(|tag| (i, tag)))

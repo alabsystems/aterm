@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CARRIED END ACROSS A SEAMLESS UPDATE (`docs/DESIGN-harness-autopilot-
-//! 2026-10-15.md` §11.2.3, item 8; §11.2.5 "The carry"): the park
-//! stamps each supervised session's end and its task's work on its manifest
-//! record (`SessionRecord::autopilot_end`, `App::end_carry_rows`); the
-//! successor seeds the end's face and time onto the timeline before the
-//! session is registered (`spawn::seed_adopted_end`), and spends the rest at
-//! the session's first publication (`App::adopt_end_carry`). The carried end
-//! is the menu bar's Done for you row it was before the update (§11.4: its
-//! word and its instant, `statusitem … done=`), and it comes in cheered: the
-//! successor's kitty never cheers it (§11.3.4).
-
+//! Tests for carrying supervised session ends and task work across a seamless update (`SessionRecord::autopilot_end`, `App::adopt_end_carry`).
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -261,13 +251,12 @@ fn cheers_at(app: &mut App, tab: usize, t: &mut Instant) -> bool {
 
 /// A quiet, close-on-exec PTY master for every session of `app`, as the
 /// park needs them (a stub's `-1` master reads as activity): each session
-/// owns a duplicate of one pair. Returns the descriptors [`release`] closes.
+/// owns a duplicate of one pair.
 fn quiet(app: &mut App) -> Vec<i32> {
     let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
     let mut fds = vec![slave, master];
     for pooled in app.pool.sessions.values_mut() {
-        // SAFETY: `master` is the test's open PTY master; `F_DUPFD_CLOEXEC`
-        // returns a new descriptor, close-on-exec from birth.
+        // SAFETY: `master` is the test's open PTY master; `F_DUPFD_CLOEXEC` duplicates it.
         let dup = unsafe { libc::fcntl(master, libc::F_DUPFD_CLOEXEC, 0) };
         assert!(dup >= 0, "dup the quiet master");
         pooled.session.master = dup;
@@ -282,7 +271,7 @@ fn release(app: &mut App, fds: Vec<i32>) {
         pooled.session.master = -1;
     }
     for fd in fds {
-        // SAFETY: closing a test-owned descriptor exactly once.
+        // SAFETY: Closes a test-owned file descriptor once.
         unsafe { libc::close(fd) };
     }
 }
@@ -347,7 +336,6 @@ fn adopted(id: u64, rec: &SessionRecord) -> crate::Session {
 /// this host's own supervisor — the intake mapping each record's row by sid
 /// (`seamless::end_carry_of`, as the real intake does) — and each
 /// adopted session's first publication (`App::refresh_presence_session`).
-/// The App and the adopted sessions' local ids, in record order.
 fn successor(records: &[SessionRecord], host: &crate::harness_host::HostHandle) -> (App, Vec<u64>) {
     let mut app = desk(host);
     app.end_carry = crate::seamless::end_carry_of(records);
@@ -367,42 +355,7 @@ fn successor(records: &[SessionRecord], host: &crate::harness_host::HostHandle) 
 }
 
 /// AN UNSEEN END AND THE TASK'S WORK CROSS A SEAMLESS UPDATE (§11.2.5 "The
-/// carry"). The parent: two Claude Code sessions under the desk's default
-/// Land with no user field of their own, behind a shell in front of a
-/// window someone looks at. The FINISHED one opened its task, worked 45 s,
-/// and its landing at 17:42 (yesterday) is an end nobody looked at: its tab
-/// wears the `•`. The WORKING one is 25 s into its task. The real park (the
-/// prelaunched lane's) stamps both rows, and the successor reads them back
-/// off the wire:
-///
-/// * the finished tab wears the `•` before its loop is back, and keeps it
-///   after the loop restates its landing from "unknown" — which is no end
-///   and counts nothing — and the restated landing keeps 17:42: the chip's
-///   face clock, its title and the page's state line;
-/// * the working session's loop restates open, its agent works 10 s more,
-///   and its landing is an END: 35 s since the task opened, not 10;
-/// * the finished session's end is the Done for you row it was before the
-///   update (§11.4): `landed`, aged from 17:42:37.123 — the end's instant,
-///   neither its own minute nor the successor's restate — before and after
-///   the loop restates the landing, and `chrome`'s `statusitem` counts it
-///   (`done=1`);
-/// * it came in cheered (§11.3.4): the successor's pet, shown its tab, owes
-///   no cheer for it.
-///
-/// NEGATIVE CONTROLS, in-test: the same successor fed the same manifest
-/// unstamped (as a build before the carry parks it) — no `•`, no Done for
-/// you row, the restated landing stamped at the restate, and 10 s then
-/// landed is no end; and the working session's end, told in the successor, which its
-/// pet cheers on sight. As run (each
-/// fails this test): the spend gated by the restore's user-meta seed's
-/// early return (`App::seed_restored_user_meta`: every user field `None`, so
-/// nothing is spent for a session that follows the default, the review's
-/// R6); the work not carried (`AbBook::carry_work` adding nothing, as a
-/// zeroing at "unknown" would); the timeline's seed dropped; the carried
-/// end put in uncheered (`SessionGlass::carry_end` with `cheered: 0`: the
-/// room's `landed` hands its serial to the pet); the park carrying the
-/// end's own minute, not the timeline's instant (`App::end_carry_rows`);
-/// the row's instant read off the end's minute (`end_wall_ms(end, None)`).
+/// carry").
 #[test]
 fn an_unseen_end_and_the_tasks_work_cross_a_seamless_update() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -410,7 +363,6 @@ fn an_unseen_end_and_the_tasks_work_cross_a_seamless_update() {
     let wid = WindowId(0);
     let at_1742 = yesterday_1742();
 
-    // THE PARENT.
     let mut parent = desk(&host);
     let working = parent.next_session_id;
     parent.push_stub_tab(wid, crate::stub_session(working));
@@ -422,8 +374,6 @@ fn an_unseen_end_and_the_tasks_work_cross_a_seamless_update() {
     let (finished_sid, working_sid) = (sid(&parent, 0), sid(&parent, working));
     tell(&mut parent, &finished_sid, Some(TaskFace::Open));
     work(&mut parent, 0, 45 * SEC);
-    // The landing, at 17:42:37.123: told with that time (a noted face's
-    // stamp, the test's way to place the move), from open — an end.
     parent.apply_harness_fact(
         &finished_sid,
         HarnessFact::TaskNoted(TaskFace::Landed, at_1742),
@@ -443,7 +393,6 @@ fn an_unseen_end_and_the_tasks_work_cross_a_seamless_update() {
     tell(&mut parent, &working_sid, Some(TaskFace::Open));
     work(&mut parent, working, 25 * SEC);
 
-    // THE PARK, the prelaunched lane's own.
     let read = park(&mut parent);
     let record = |sid: &str| record_of(&read, sid);
     let records = [record(&finished_sid), record(&working_sid)];
@@ -452,10 +401,6 @@ fn an_unseen_end_and_the_tasks_work_cross_a_seamless_update() {
         Some(format!("end=landed@{at_1742} seen=0 worked=0").as_str()),
         "the end, unseen, at its own time"
     );
-    // The ledger clock is the wall clock plus the test's advance, so the
-    // busy stretch is the 25 s advanced and the real milliseconds between
-    // its two publishes; under 30 s, the end after the update still needs
-    // its 10 s.
     let worked: u64 = records[1]
         .autopilot_end
         .as_deref()
@@ -469,7 +414,6 @@ fn an_unseen_end_and_the_tasks_work_cross_a_seamless_update() {
         "a shell carries no key"
     );
 
-    // THE SUCCESSOR.
     let (mut next, ids) = successor(&records, &host);
     let (finished, working) = (ids[0], ids[1]);
     assert_eq!(
@@ -482,7 +426,6 @@ fn an_unseen_end_and_the_tasks_work_cross_a_seamless_update() {
         line.contains(r#"states=[["selected"], ["done"], []]"#),
         "{line}"
     );
-    // Its Done for you row, as it stood: landed, the end's own instant.
     let carried = done_row(&next, finished).expect("the Done for you row crossed");
     assert_eq!(
         (carried.landed, carried.since_unix_ms),
@@ -491,10 +434,7 @@ fn an_unseen_end_and_the_tasks_work_cross_a_seamless_update() {
     );
     let line = next.status_item_chrome_line();
     assert!(line.contains(" done=1 "), "{line}");
-    // It came in cheered: no pet is handed it.
     assert_eq!(uncheered(&next, finished), None, "a carried end is cheered");
-    // The loop's start restates the landing from "unknown": no end, no
-    // count, and its clock is the end's own.
     tell(&mut next, &finished_sid, Some(TaskFace::Landed));
     let stamp = crate::harness_glass::Stamp::at(at_1742.div_euclid(1000));
     assert_eq!(next.chip_glass(finished).task, Some(TaskFace::Landed));
@@ -515,8 +455,6 @@ fn an_unseen_end_and_the_tasks_work_cross_a_seamless_update() {
         Some(row.since_unix_ms),
         "the restated landing keeps the row's instant"
     );
-    // The working session: 10 s more after the update, then landed — an
-    // end.
     tell(&mut next, &working_sid, Some(TaskFace::Open));
     work(&mut next, working, 10 * SEC);
     tell(&mut next, &working_sid, Some(TaskFace::Landed));
@@ -528,8 +466,6 @@ fn an_unseen_end_and_the_tasks_work_cross_a_seamless_update() {
     assert_eq!(landings(&next), 1, "counted under Land");
     let line = next.status_item_chrome_line();
     assert!(line.contains(" done=2 "), "{line}");
-    // THE KITTY: shown the carried end's tab, it cheers nothing; shown the
-    // end told here (CONTROL), it cheers.
     let mut t = Instant::now();
     with_the_pet(&mut next, &mut t);
     assert!(
@@ -552,7 +488,6 @@ fn an_unseen_end_and_the_tasks_work_cross_a_seamless_update() {
         "{line}"
     );
 
-    // NEGATIVE CONTROL: the same manifest, unstamped.
     let unstamped: Vec<SessionRecord> = records
         .iter()
         .cloned()
@@ -588,8 +523,6 @@ fn an_unseen_end_and_the_tasks_work_cross_a_seamless_update() {
     work(&mut bare, working, 10 * SEC);
     tell(&mut bare, &working_sid, Some(TaskFace::Landed));
     assert_eq!(marks(&bare), [ChipLevel::Off; 3], "CONTROL: 10 s, no end");
-    // The book counts the landing (`harness_task::is_an_end` has no work
-    // floor); the end, which has (`is_a_task_end`), is not told.
     assert_eq!(
         bare.harness_glass.get(&working).and_then(|g| g.end()),
         None,
@@ -605,9 +538,6 @@ fn an_unseen_end_and_the_tasks_work_cross_a_seamless_update() {
 /// crosses seen; one whose loop has already restated another face (open:
 /// it moved on) is dropped, fail-closed, and its work kept; one the loop
 /// moves on from after the spend is cleared with its `•` (one re-stamp).
-/// A row that does not read carries nothing. NEGATIVE CONTROL: the same
-/// unseen end behind the front tab wears the `•`; as run, a spend with no
-/// judgement at once marks the looked-at tab once it goes behind.
 #[test]
 fn a_carried_end_is_judged_at_once_and_never_outlives_its_work() {
     let host = idle_host();
@@ -626,11 +556,9 @@ fn a_carried_end_is_judged_at_once_and_never_outlives_its_work() {
     let unseen = format!("end=landed@{at} seen=0 worked=0");
     let fresh_sid = || aterm_session::SessionId::generate().as_str().to_string();
 
-    // CONTROL: behind the front tab, it marks.
     let (behind, _) = successor(&[record(&fresh_sid(), &unseen)], &host);
     assert_eq!(marks(&behind), [ChipLevel::Off, ChipLevel::Done]);
 
-    // In the front tab of a window someone looks at: seen at once.
     let mut front = desk(&host);
     let rec = record(&fresh_sid(), &unseen);
     front.end_carry = crate::seamless::end_carry_of(std::slice::from_ref(&rec));
@@ -645,7 +573,6 @@ fn a_carried_end_is_judged_at_once_and_never_outlives_its_work() {
     front.switch_tab_in(WindowId(0), 0);
     assert_eq!(marks(&front), [ChipLevel::Off, ChipLevel::Off]);
 
-    // Seen before the update: crosses seen.
     let (seen, _) = successor(
         &[record(
             &fresh_sid(),
@@ -655,7 +582,6 @@ fn a_carried_end_is_judged_at_once_and_never_outlives_its_work() {
     );
     assert_eq!(marks(&seen), [ChipLevel::Off, ChipLevel::Off]);
 
-    // The loop moved on before the first publication: dropped, work kept.
     let mut moved = desk(&host);
     let rec = record(
         &fresh_sid(),
@@ -680,7 +606,6 @@ fn a_carried_end_is_judged_at_once_and_never_outlives_its_work() {
         "the work is the task's, kept"
     );
 
-    // Spent, then the loop moves on: cleared with its `•`, once.
     let (mut after, ids) = successor(&[record(&fresh_sid(), &unseen)], &host);
     let sid_after = sid(&after, ids[0]);
     assert_eq!(marks(&after), [ChipLevel::Off, ChipLevel::Done]);
@@ -693,7 +618,6 @@ fn a_carried_end_is_judged_at_once_and_never_outlives_its_work() {
         "taken down once"
     );
 
-    // A row that does not read carries nothing.
     let (bad, _) = successor(&[record(&fresh_sid(), "end=landed seen=0")], &host);
     assert_eq!(marks(&bad), [ChipLevel::Off, ChipLevel::Off]);
     host.shutdown_and_join();
@@ -702,13 +626,7 @@ fn a_carried_end_is_judged_at_once_and_never_outlives_its_work() {
 /// A LANDING WITHDRAWN BEFORE THE SPEND BRINGS NO END BACK (the review of
 /// `c5af3a7507`): the loop's start restates the seeded landing (it takes
 /// the carried 17:42 back), then WITHDRAWS it — `open`, then a new landing,
-/// both before the session's first publication. The landing the timeline
-/// now holds is another, at its own time, and no end (from `open` with no
-/// work); the spend holds the restated face to the seeded face AND time
-/// (`CarriedEnd::told`), so the carried end is dropped. NEGATIVE CONTROL,
-/// in-test: the same row restated once, unwithdrawn, is spent (`•`); as
-/// run, the spend comparing the face's kind alone brings the 17:42 end
-/// back.
+/// both before the session's first publication.
 #[test]
 fn a_landing_withdrawn_before_the_spend_brings_no_end_back() {
     let host = idle_host();
@@ -755,7 +673,6 @@ fn a_landing_withdrawn_before_the_spend_brings_no_end_back() {
             "PRECONDITION: whose landing the timeline holds"
         );
         assert!(!app.end_unseen(id), "PRECONDITION: no end of its own");
-        // The first publication spends the carry.
         app.refresh_presence_session(id);
         (app, id)
     };

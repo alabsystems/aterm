@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `ship site` end to end over the fixtures: the public repo cloned over `file://`, a
-//! site checkout with a bare origin to push to, and a fixture [`World`] standing in for
-//! `gh`, the release download host, the live site, the engine's stock wasm32 build and
-//! `wasm-opt`, the site's deploy script and `firebase` — so nothing here reaches a
-//! network or the live site. The engine's own steps run for real: the fixture build
-//! hands back aterm-wasm-abi's committed toy module, which `verify glue`'s generator
-//! binds in process. Each test reads what the sync left behind: the pages' parsed
-//! hrefs, notes and attributes, the engine pair, the site repo's commits, and the typed
-//! calls the world saw.
+//! `ship site` end to end over the fixtures.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -47,7 +39,7 @@ fn fixture(rel: &str) -> PathBuf {
 }
 
 /// `case` over each of `cases`, all at once: the cases of one test that share nothing (each
-/// its own lab and world). The first case to fail fails the test with its own panic.
+/// its own lab and world).
 fn at_once<T: Send>(cases: impl IntoIterator<Item = T>, case: impl Fn(T) + Sync) {
     std::thread::scope(|scope| {
         let case = &case;
@@ -359,7 +351,6 @@ impl World for Fake {
         let path = url
             .strip_prefix(ORIGIN)
             .ok_or_else(|| format!("unreachable host: {url}"))?;
-        // Firebase Hosting: a file as itself, else its clean-URL .html form
         let rel = match path.trim_start_matches('/') {
             "" => "index.html".to_string(),
             p if self.live.join(p).is_file() => p.to_string(),
@@ -375,7 +366,6 @@ impl World for Fake {
         rustflags: &[String],
         _out: &mut dyn std::io::Write,
     ) -> Result<Vec<u8>, String> {
-        // asked: recorded before anything can fail, so no build asked is ever missed
         let head = self.git.output(clone, &["rev-parse", "HEAD"]);
         let commit = String::from_utf8_lossy(&head.stdout).trim().to_string();
         self.calls.push(Call::Build {
@@ -384,7 +374,6 @@ impl World for Fake {
             rustflags: rustflags.to_vec(),
             sources: clone.canonicalize().unwrap_or_else(|_| clone.to_path_buf()),
         });
-        // the stock build's contract: a clean checkout of aterm in, the module out
         if !clone.join("crates/aterm-wasm").is_dir() {
             return Err(format!("no aterm checkout at {}", clone.display()));
         }
@@ -396,7 +385,6 @@ impl World for Fake {
             EngineFault::NoDescriptor => b"\0asm\x01\0\0\0".to_vec(),
             _ => toy_module(),
         };
-        // each commit's module is its own, so each commit's pair is
         module.extend(custom_section("fixture-commit", commit.as_bytes()));
         if self.engine == EngineFault::LeaksHome {
             let panic = format!("{}/crates/aterm-wasm/src/lib.rs", self.home.display());
@@ -540,8 +528,6 @@ impl Lab {
         std::fs::create_dir_all(lab.root.join("home")).unwrap();
         lab.publish(changelog);
         lab.make_site();
-        // One pack per repository, not a loose object (and its fan-out directory) per object:
-        // every other test lays this tree down and removes it.
         let src = lab.root.join(format!("public-src-{}", lab.generation));
         for repo in [&src, &lab.public_git, &lab.site_root, &lab.origin] {
             lab.git
@@ -563,17 +549,9 @@ impl Lab {
                 ("HOME".into(), home.to_string_lossy().into_owned()),
                 ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
                 ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
-                // Nor a person's global ignore or attributes file, which git finds under
-                // `$XDG_CONFIG_HOME` before `HOME` ([`aterm_uds::fixture_git::hermetic`]).
                 ("XDG_CONFIG_HOME".into(), "/dev/null".into()),
                 ("GIT_TERMINAL_PROMPT".into(), "0".into()),
-                // No template: no repository here or cloned by the sync carries sample
-                // hooks, a description or info/exclude, which every test lays down and
-                // removes and nothing reads.
                 ("GIT_TEMPLATE_DIR".into(), String::new()),
-                // Nor does a commit, fetch, pull or push here or in the sync start a `git
-                // maintenance run --auto`, which does nothing in a repository this small
-                // (158 of this module's 2,178 git processes).
                 ("GIT_CONFIG_COUNT".into(), "1".into()),
                 ("GIT_CONFIG_KEY_0".into(), "maintenance.auto".into()),
                 ("GIT_CONFIG_VALUE_0".into(), "false".into()),
@@ -677,8 +655,6 @@ impl Lab {
                 &self.origin.to_string_lossy(),
             ],
         );
-        // A push's receive-pack reads no `GIT_CONFIG_COUNT` (git clears it for the remote
-        // side): the origin's own config keeps it from starting a maintenance run.
         crate::ledger::testing::config(&self.origin, &[]);
         self.git.ok(
             &self.site_root,
@@ -834,7 +810,7 @@ fn refused(ended: Result<Outcome, Failure>, out: &str, kind: Refusal) -> String 
 /// at its true size; the engine is rebuilt from the promoted commit on the wasm32 pin,
 /// bound, optimised and installed as one pair named by its module's hash;
 /// `/releases` and the sitemap follow; ONE commit of exactly the owned files is pushed,
-/// deployed once and verified live. A re-run then has nothing to do.
+/// deployed once and verified live.
 #[test]
 fn a_release_sync_rewrites_rebuilds_commits_pushes_deploys_and_verifies() {
     let lab = Lab::new();
@@ -862,7 +838,6 @@ fn a_release_sync_rewrites_rebuilds_commits_pushes_deploys_and_verifies() {
         1,
         "the Register button is left alone"
     );
-    // the Linux tarball of the newest release that carries one, on /aterm and /terminal only
     for name in ["aterm.html", "terminal.html"] {
         assert_eq!(
             pages::attribute_values(&lab.page(name), "data-href-linux-x86_64"),
@@ -872,8 +847,6 @@ fn a_release_sync_rewrites_rebuilds_commits_pushes_deploys_and_verifies() {
     assert!(pages::attribute_values(&lab.page("index.html"), "data-href-linux-x86_64").is_empty());
     let aterm = lab.page("aterm.html");
     assert!(aterm.contains("<a href=\"/releases\">release notes</a>"));
-    // /install.sh is the public commit's installer, byte for byte; a checksum-only
-    // tarball is no build the installer installs, so no page offers the command
     assert_eq!(lab.page("install.sh"), read(&installer()));
     for name in PAGES_WITH_PICKS {
         for attr in ["data-install-linux-x86_64", "data-install-linux-aarch64"] {
@@ -888,8 +861,6 @@ fn a_release_sync_rewrites_rebuilds_commits_pushes_deploys_and_verifies() {
         "{out}"
     );
 
-    // the engine: built once, from the promoted commit, on the wasm32 pin, +simd128, the
-    // clone (as cargo names its sources) and the builder's home remapped; optimised once
     assert_eq!(world.builds(), [(lab.public_sha.clone(), PIN.to_string())]);
     let home = lab.root.join("home");
     let Some(Call::Build {
@@ -909,8 +880,6 @@ fn a_release_sync_rewrites_rebuilds_commits_pushes_deploys_and_verifies() {
         &format!("--remap-path-prefix={}=/build", home.display())
     );
     assert_eq!(world.count(|c| *c == Call::Optimise), 1);
-    // ...installed as one pair: the bound module after wasm-opt, named by its own hash,
-    // its glue loading exactly it, behind engine.js; the old pair gone
     let term = lab.site.join("public/assets/term");
     assert_eq!(read(&term.join("ENGINE_SOURCE")).trim(), lab.public_sha);
     let (h, js, wasm) = installed_pair(&term);
@@ -923,7 +892,6 @@ fn a_release_sync_rewrites_rebuilds_commits_pushes_deploys_and_verifies() {
         "the shipped module is the optimised one"
     );
     assert!(wasm.windows(40).any(|w| w == lab.public_sha.as_bytes()));
-    // the glue is the generator's for the module built, its module URL alone renamed
     let mut built = toy_module();
     built.extend(custom_section("fixture-commit", lab.public_sha.as_bytes()));
     let generated = aterm_verify::wasm_glue::glue(&built, "aterm_wasm", Flavor::Web).unwrap();
@@ -949,8 +917,6 @@ fn a_release_sync_rewrites_rebuilds_commits_pushes_deploys_and_verifies() {
         "the old pair is gone"
     );
 
-    // /releases: the reviewed bytes; the stylesheet; the sitemap — today for each page that
-    // changed and for /terminal's rebuilt engine, /releases added, the rest untouched
     assert_eq!(
         lab.page("releases.html"),
         read(&fixture("releases.golden.html"))
@@ -967,8 +933,6 @@ fn a_release_sync_rewrites_rebuilds_commits_pushes_deploys_and_verifies() {
         ]
     );
 
-    // one commit, of exactly the owned files that changed, by the configured identity,
-    // saying the promoted version is not cut yet; pushed; nothing left over
     assert_eq!(lab.commits(), 2);
     assert_eq!(lab.head(), lab.origin_main());
     assert_eq!(
@@ -1035,21 +999,18 @@ fn a_release_sync_rewrites_rebuilds_commits_pushes_deploys_and_verifies() {
     assert_eq!(lab.status(), "");
     assert_eq!(world.deploys(), std::slice::from_ref(&lab.site));
     assert!(!lab.owed_marker().exists(), "shipped: nothing is owed");
-    // GitHub was only read: the world has no write, and every read was a gh api GET
     assert!(
         world
             .calls
             .iter()
             .all(|c| !matches!(c, Call::Gh(p) if !p.starts_with("repos/")))
     );
-    // nothing reached past the live site and the download host
     assert!(world.calls.iter().all(|c| match c {
         Call::Live(u) => u.starts_with(ORIGIN),
         Call::Download(u) => u.starts_with("file://") || u.starts_with("https://github.com/"),
         _ => true,
     }));
 
-    // a re-run: ENGINE_SOURCE skips the rebuild, nothing to commit, no deploy, still verified
     world.calls.clear();
     let (ended, out) = lab.run(&mut world);
     assert_eq!(ended, Ok(Outcome::Synced { deployed: false }), "{out}");
@@ -1238,9 +1199,7 @@ fn no_usable_site_checkout_touches_nothing() {
 }
 
 /// A MISSING OR EXPIRED FIREBASE LOGIN is not a failure of the release: committed and
-/// pushed, not deployed, and owed. An unrelated deploy failure is not laundered into
-/// one: the login is asked (with the account deploy.sh pins), and only a login that
-/// cannot list projects either makes an unrecognised failure a login one.
+/// pushed, not deployed, and owed.
 #[test]
 fn a_missing_firebase_login_commits_and_pushes_but_never_hides_a_real_failure() {
     at_once(
@@ -1331,9 +1290,7 @@ fn no_deploy_commits_and_pushes_only() {
 
 /// AN INTERRUPT STARTS NOTHING FURTHER: a SIGTERM that arrives while the push runs lets
 /// the push finish, and then no deploy, login probe or live check starts — the sync
-/// says so, the commit is owed, and the next run deploys it. One that arrives during
-/// the clone stops the sync there, said as an interrupt whatever the step it stopped
-/// said, with nothing built, committed or deployed.
+/// says so, the commit is owed, and the next run deploys it.
 #[test]
 fn an_interrupt_starts_nothing_further() {
     let lab = Lab::new();
@@ -1395,8 +1352,7 @@ fn an_interrupt_starts_nothing_further() {
 /// AN INTERRUPTED SYNC'S OWN FILES ARE PUT BACK, a person's never are: a sync stopped
 /// after it wrote (and staged) the owned files but before its commit leaves them dirty
 /// and itself in flight; the next run, with no commit of ours owed, restores them from
-/// HEAD and finishes the job. The same files dirty with nothing in flight, with a commit
-/// still owed, or under --dry-run are refused and left as they are.
+/// HEAD and finishes the job.
 #[test]
 fn an_interrupted_syncs_own_files_are_put_back_and_a_persons_are_refused() {
     let lab = Lab::new();
@@ -1419,13 +1375,11 @@ fn an_interrupted_syncs_own_files_are_put_back_and_a_persons_are_refused() {
     assert!(in_flight.is_file(), "and it is in flight");
     let left = lab.status();
 
-    // a commit of ours still owed: refused, nothing touched
     std::fs::write(lab.owed_marker(), "0123456789\n").unwrap();
     let mut world = lab.fake("releases-fat.json");
     let _ = refused(lab.run(&mut world).0, "", Refusal::DirtyOwed);
     assert_eq!(lab.status(), left);
     std::fs::remove_file(lab.owed_marker()).unwrap();
-    // a dry run changes nothing, so it cannot put them back either
     let dry = Options {
         dry_run: true,
         ..Options::default()
@@ -1441,7 +1395,6 @@ fn an_interrupted_syncs_own_files_are_put_back_and_a_persons_are_refused() {
     assert_eq!(lab.status(), "");
     assert!(!in_flight.exists(), "nothing in flight once committed");
 
-    // the same kind of edit with nothing in flight is a person's: refused, kept
     let path = lab.site.join("public/index.html");
     std::fs::write(&path, read(&path) + "<!-- wip -->\n").unwrap();
     let mut world = lab.fake("releases-fat.json");
@@ -1507,7 +1460,6 @@ fn a_live_site_that_cannot_be_fetched_is_unchecked_never_synced() {
         after.note.contains("could NOT be verified live"),
         "{after:?}"
     );
-    // nothing changed and the live site still unreadable: the same, undeployed
     let (ended, out) = lab.run(&mut world);
     assert_eq!(
         ended,
@@ -1851,8 +1803,7 @@ fn an_engine_that_cannot_ship_fails_the_sync_and_writes_nothing() {
 
 /// THE PROMOTE-TIME RUN DEFERS TO THE CUT: the engine's hook carries PUB_STAGING_COMMIT and
 /// no `--latest`, before the version has a release — nothing is asked, built, committed or
-/// deployed (a dry run too). `--latest` beside the same facts syncs, and so does a hand
-/// run naming a commit without them.
+/// deployed (a dry run too).
 #[test]
 fn the_promote_time_run_defers_to_the_cut() {
     let lab = Lab::new();
@@ -1889,8 +1840,7 @@ fn the_promote_time_run_defers_to_the_cut() {
 
 /// ORIGIN HAS IT BEFORE ANYTHING IS DEPLOYED: a refused push or a failed pull stops the run
 /// before deploy.sh with the sync commit kept here, and the next run finishes the job —
-/// pushing the leftover and deploying it. Local commits touching nothing of the sync's
-/// are the site repo's own: neither pushed nor deployed on their account.
+/// pushing the leftover and deploying it.
 #[test]
 fn a_failed_push_deploys_nothing_and_the_next_run_finishes_the_job() {
     let lab = Lab::new();
@@ -1913,7 +1863,6 @@ fn a_failed_push_deploys_nothing_and_the_next_run_finishes_the_job() {
     assert_eq!(lab.head(), lab.origin_main());
     assert_eq!(world.deploys().len(), 1);
 
-    // a local commit of the site repo's own: not pushed, nothing deployed on its account
     std::fs::write(lab.site.join("NOTES.md"), "local notes\n").unwrap();
     lab.git
         .commit_all(&lab.site_root, "site: local notes, not the sync's");
@@ -1929,7 +1878,6 @@ fn a_failed_push_deploys_nothing_and_the_next_run_finishes_the_job() {
     );
     assert!(world.deploys().is_empty());
 
-    // --no-deploy promises the push too, so a refused push fails it as well
     let lab = Lab::new();
     lab.refuse_pushes(true);
     let mut world = lab.fake("releases-fat.json");
@@ -1942,17 +1890,13 @@ fn a_failed_push_deploys_nothing_and_the_next_run_finishes_the_job() {
 }
 
 /// A FAILED PULL is as fatal and as early, leaves no rebase behind, and its remedy leads to
-/// a deploy: following it (a pull by hand, no push) the re-run pushes and deploys. An
-/// operator who pushes by hand anyway is still deployed — the commit is owed until a
-/// deploy ships it — and once shipped nothing is owed: a live site that then differs is
-/// reported, never redeployed on a guess.
+/// a deploy: following it (a pull by hand, no push) the re-run pushes and deploys.
 #[test]
 fn a_failed_pull_and_its_remedy_end_in_a_deploy_and_an_owed_commit_is_shipped_once() {
     let latest = Options {
         latest: true,
         ..Options::default()
     };
-    // the remedy as said: pull by hand, re-run
     let lab = Lab::new();
     let origin = lab.origin.to_string_lossy().into_owned();
     let nowhere = lab
@@ -1990,7 +1934,6 @@ fn a_failed_pull_and_its_remedy_end_in_a_deploy_and_an_owed_commit_is_shipped_on
     deployed(&ended, &out);
     assert_eq!(lab.head(), lab.origin_main());
 
-    // the operator who pushes by hand anyway
     let lab = Lab::new();
     lab.git
         .ok(&lab.site_root, &["remote", "set-url", "origin", &nowhere]);
@@ -2017,12 +1960,10 @@ fn a_failed_pull_and_its_remedy_end_in_a_deploy_and_an_owed_commit_is_shipped_on
             .ok(&lab.site_root, &["status", "--porcelain", "--ignored"]),
         ""
     );
-    // shipped: nothing owed, no second deploy
     world.calls.clear();
     let (ended, out) = lab.run(&mut world);
     assert_eq!(ended, Ok(Outcome::Synced { deployed: false }), "{out}");
     assert!(world.deploys().is_empty());
-    // nothing owed and the live site differs: reported, not redeployed
     std::fs::write(lab.live.join("assets/term/engine.js"), "stale\n").unwrap();
     let (ended, out) = lab.run(&mut world);
     assert!(
@@ -2064,8 +2005,7 @@ fn an_undeployed_sync_commit_is_deployed_by_the_next_run() {
 
 /// THE INTEL MARK: the chosen release's record of running its x86_64 slice, and how much
 /// of the pinned toolset the index publishes per Mac architecture (read from the download
-/// host), reach the committed `/aterm` and `/terminal` anchors and are compared live. With
-/// no index release the facts are unknown and the pages carry no level — never a stale one.
+/// host), reach the committed `/aterm` and `/terminal` anchors and are compared live.
 #[test]
 fn the_intel_mark_and_the_toolchain_facts_reach_the_committed_pages() {
     let lab = Lab::new();

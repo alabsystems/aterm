@@ -100,6 +100,7 @@ pub fn reviewed_forks(root: &Path) -> Result<Vec<ReviewedFork>, String> {
 }
 
 /// `s` for the life of the process, once per distinct string: the lock-order
+/// census carries namespaces as `&'static str`, and the ledger names a handful.
 fn intern(s: &str) -> &'static str {
     static NAMES: std::sync::OnceLock<std::sync::Mutex<BTreeSet<&'static str>>> =
         std::sync::OnceLock::new();
@@ -167,6 +168,7 @@ pub enum PatchTargetKind {
 }
 
 /// Evidence that `path` is third-party source this repository redistributes,
+/// from the repository's own records rather than the directory's location.
 fn redistribution_evidence(root: &std::path::Path, path: &str) -> Option<String> {
     if let Some(name) = retained_license(root, path) {
         return Some(format!(
@@ -282,6 +284,7 @@ enum Value {
     Array(Vec<Value>),
     Table(Vec<(String, Value)>),
     /// Anything else (numbers, …): a hard error wherever a dependency-bearing
+    /// section is interpreted (rendered via Debug in those diagnostics).
     #[expect(
         dead_code,
         reason = "read only through the derived Debug in error paths"
@@ -290,6 +293,7 @@ enum Value {
 }
 
 /// Strip a line comment (`# …`) that sits outside any basic string on this
+/// physical line.
 fn strip_comment(line: &str) -> &str {
     let bytes = line.as_bytes();
     let mut in_str = false;
@@ -326,6 +330,7 @@ fn depth_delta(line: &str) -> i32 {
 }
 
 /// Parse one value starting at `s` (already trimmed); returns the value and
+/// the unconsumed rest.
 fn parse_value(s: &str) -> Result<(Value, &str), String> {
     let s = s.trim_start();
     let bytes = s.as_bytes();
@@ -405,7 +410,7 @@ struct Doc {
     sections: Vec<(String, Vec<(String, Value)>)>,
 }
 
-/// Parse a manifest into sections and entries. Multi-line values are joined by
+/// Parse a manifest into sections and entries.
 fn parse_doc(text: &str, file: &str) -> Result<Doc, String> {
     let mut sections: Vec<(String, Vec<(String, Value)>)> = vec![(String::new(), Vec::new())];
     let mut lines = text.lines().enumerate().peekable();
@@ -467,8 +472,10 @@ fn parse_doc(text: &str, file: &str) -> Result<Doc, String> {
 /// One dependency edge as declared.
 struct DepEdge {
     /// The dependency key: what features name (`dep:<key>`, `<key>/feat`) and
+    /// what `workspace = true` looks up in the root table.
     key: String,
     /// The package behind the key when `package = "…"` renames it; the key
+    /// is the package name otherwise.
     package: Option<String>,
     /// `path = "…"` (relative to the declaring crate dir), if any.
     path: Option<String>,
@@ -478,6 +485,8 @@ struct DepEdge {
     default_features: bool,
     features: Vec<String>,
     /// The `[target.<key>.dependencies]` table's key (a quoted `cfg(..)`,
+    /// unquoted, or a triple) when the edge is target-gated; `None` in a
+    /// plain `[dependencies]` table.
     target: Option<String>,
 }
 
@@ -490,10 +499,12 @@ struct Manifest {
 }
 
 /// Is this section header a normal-dependency section (followed), a dev/build
+/// one (excluded), or something else?
 enum SectionKind {
     NormalDeps,
     ExcludedDeps,
     /// `[dependencies.<name>]` (or a `[target.….dependencies.<name>]`): one
+    /// normal dependency, whose entries are its spec.
     NormalDep(String),
     /// The same one-table form of a dev- or build-dependency: excluded.
     ExcludedDep,
@@ -555,6 +566,8 @@ fn dependency_section(h: &str) -> Option<SectionKind> {
 }
 
 /// A section header split at its `target.<cfg or triple>.` prefix: the
+/// target key (unquoted) and the rest; no key for a header without the
+/// prefix.
 fn split_target(h: &str) -> Option<(Option<&str>, &str)> {
     let Some(target) = h.strip_prefix("target.") else {
         return Some((None, h));
@@ -573,6 +586,7 @@ fn split_target(h: &str) -> Option<(Option<&str>, &str)> {
 }
 
 /// Interpret one `key = value` entry of a dependency section as a [`DepEdge`],
+/// including the dotted `name.workspace = true` form.
 fn dep_edge(key: &str, value: &Value, file: &str) -> Result<DepEdge, String> {
     // Dotted form: `aterm-log.workspace = true`.
     if let Some(name) = key.strip_suffix(".workspace") {
@@ -916,6 +930,7 @@ pub(crate) fn shipped_feature_enablers(
 }
 
 /// Lexically normalize `base/rel` ("crates/aterm-gui" + "../aterm-buffer" =>
+/// "crates/aterm-buffer").
 fn normalize_rel(base: &str, rel: &str) -> Result<String, String> {
     let mut parts: Vec<&str> = if base.is_empty() {
         Vec::new()
@@ -939,6 +954,7 @@ fn normalize_rel(base: &str, rel: &str) -> Result<String, String> {
 }
 
 /// A `[workspace.dependencies]` entry the members inherit via
+/// `workspace = true`.
 struct WsSpec {
     /// Repo-relative crate dir, if this is a path dep.
     dir: Option<String>,
@@ -949,10 +965,12 @@ struct WsSpec {
 struct RootTables {
     ws_deps: BTreeMap<String, WsSpec>,
     /// `[patch.*]` entries with a `path` redirect: row key -> (the package it
+    /// replaces, repo-relative path).
     patches: BTreeMap<String, (String, String)>,
 }
 
 /// A `[patch]` row's spec with a `package = "…"` rename taken out, and the
+/// package it replaces (the row key when there is none).
 fn patch_row(key: &str, value: &Value) -> (String, Value) {
     let Value::Table(pairs) = value else {
         return (key.to_string(), value.clone());
@@ -1031,10 +1049,12 @@ struct Activation {
     /// Optional dep keys activated (`dep:x`, implicit `x`, strong `x/f`).
     active_optional: BTreeSet<String>,
     /// Per-dep feature requests from `x/f` / `x?/f` items (weak requests are
+    /// consumed only for deps that end up included, as in cargo).
     dep_requests: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// Expand a crate's requested features (plus `default` when enabled) through
+/// its feature table.
 fn expand_features(
     m: &Manifest,
     dir: &str,
@@ -1417,6 +1437,9 @@ pub fn derive_linked_scan_set(
 }
 
 /// One [`ABSORBED_CRATES`] row resolved for the walker: every platform-slice
+/// path must exist, and the crate's source leaves `scan_dirs` (it is a member,
+/// so the closure walk may have reached it), scanned namespaced instead, never
+/// twice.
 fn scan_absorbed(
     root: &Path,
     row: &AbsorbedCrate,
@@ -1664,6 +1687,7 @@ mod tests {
     use crate::scan_set::test_fixtures::synth_tree;
 
     /// Base fixture + a src/lib.rs for every crate dir mentioned, so the
+    /// drift guard is satisfied.
     fn with_src(mut files: Vec<(String, String)>) -> Vec<(String, String)> {
         let dirs: Vec<String> = files
             .iter()
@@ -1704,6 +1728,8 @@ mod tests {
     }
 
     /// The fixture tree with `dep` (a workspace dependency on the absorbed
+    /// crate, by path) in the root table and aterm-gui's dependencies, so the
+    /// closure walk reaches the crate as a member.
     fn reaching_absorbed(dep: &str, path: &str) -> Vec<(String, String)> {
         let mut files = test_fixtures::workspace_manifests(&[]);
         for (rel, contents) in files.iter_mut() {
@@ -1724,6 +1750,7 @@ mod tests {
     }
 
     /// Assert `set` scans the absorbed crate namespaced under `package`, with
+    /// its slices, and never also as a plain member.
     fn assert_scanned_namespaced(set: &ScanSet, row: &AbsorbedCrate, package: &str) {
         assert_eq!(
             set.absorbed,
@@ -1745,6 +1772,8 @@ mod tests {
     }
 
     /// An absorbed crate renamed off its upstream name is in no patch row; it
+    /// is found by its row's path and scanned namespaced, with its slices, and
+    /// never also as a plain member, even when the closure reaches it.
     #[test]
     fn a_renamed_absorbed_member_is_scanned_namespaced_not_as_a_member() {
         let row = &ABSORBED_CRATES[0];
@@ -1755,6 +1784,7 @@ mod tests {
     }
 
     /// An absorbed crate still patched in under its upstream name is scanned
+    /// the same way, found by its patch row.
     #[test]
     fn an_absorbed_patch_target_is_scanned_namespaced_not_as_a_member() {
         let row = &ABSORBED_CRATES[0];
@@ -1775,6 +1805,7 @@ mod tests {
     }
 
     /// An absorbed target with no ABSORBED_CRATES row, and a row whose crate
+    /// lost an absorption record (here its NOTICE line), both stop the census.
     #[test]
     fn the_absorbed_registry_is_fail_closed_both_ways() {
         let absorbed = &ABSORBED_CRATES[0];
@@ -1818,6 +1849,7 @@ mod tests {
     }
 
     /// A `[patch]` entry pointing at a workspace member is first-party: it is
+    /// recorded, owes no review row, and a review row for it is refused.
     #[test]
     fn a_first_party_patch_target_is_recorded_and_never_review_registered() {
         let mut files = test_fixtures::workspace_manifests(&[("aterm-shim", "")]);
@@ -1835,6 +1867,7 @@ mod tests {
     }
 
     /// A renamed patch row (cargo's form for two version lines of one package)
+    /// is recorded under the package it replaces, not its key.
     #[test]
     fn a_renamed_patch_row_is_recorded_under_the_package_it_replaces() {
         let mut files = test_fixtures::workspace_manifests(&[("aterm-shim-052", "")]);
@@ -1853,6 +1886,7 @@ mod tests {
     }
 
     /// A patch path under neither `vendor/` nor `crates/` is unclassifiable
+    /// and stops the census.
     #[test]
     fn a_patch_target_outside_vendor_and_crates_fails_closed() {
         let mut files = test_fixtures::workspace_manifests(&[]);
@@ -1873,6 +1907,7 @@ mod tests {
     }
 
     /// A first-party patch target that has been mis-filed in the vendored
+    /// registry is a false provenance claim, and is refused by name.
     #[test]
     fn a_review_row_for_a_first_party_patch_target_is_refused() {
         let (package, path, _) = test_fixtures::FIXTURE_FORK;
@@ -1894,6 +1929,7 @@ mod tests {
     }
 
     /// Under `crates/`, a retained upstream license file or a NOTICE line alone
+    /// marks a half-recorded redistribution: refused, naming the evidence.
     #[test]
     fn a_redistribution_under_crates_is_refused_not_called_first_party() {
         let root = synth_tree(
@@ -1929,6 +1965,7 @@ mod tests {
     }
 
     /// Negative control: a crate with no retained license file and no NOTICE
+    /// line classifies FirstParty.
     #[test]
     fn a_genuine_first_party_crate_is_not_mistaken_for_a_redistribution() {
         let root = synth_tree(
@@ -2031,6 +2068,9 @@ mod tests {
     }
 
     /// A process built for one target links a target table only where its
+    /// key can link there: [`derive_linked_scan_set`] leaves out the crate
+    /// only such an edge reaches and lists the edge, in both table forms and
+    /// for a bare triple, and follows the tables the filter admits.
     #[test]
     fn a_target_table_the_target_cannot_link_is_left_out_of_its_closure() {
         let mut files = test_fixtures::workspace_manifests(&[(
@@ -2099,6 +2139,9 @@ mod tests {
     }
 
     /// Cargo's one-table-per-dependency form, as a normalized manifest writes
+    /// it (the absorbed winit's): a normal dep and a quoted-cfg target dep in
+    /// that form are followed, a dev dep stays out, and a renamed registry dep
+    /// is understood (and not walked).
     #[test]
     fn the_one_table_dependency_form_is_followed_like_the_inline_one() {
         let mut files = test_fixtures::workspace_manifests(&[(
@@ -2151,6 +2194,8 @@ mod tests {
     }
 
     /// A renamed path dependency, as the workspace `serde` row is
+    /// (`package = "aterm-serde"`): the walk follows its path, and features
+    /// name its key, as cargo resolves them.
     #[test]
     fn a_renamed_path_dependency_is_walked_by_path_and_activated_by_key() {
         let manifests = |gui_feature: &str| {
@@ -2310,6 +2355,7 @@ mod tests {
     }
 
     /// The review is read off the real ledger, and every shape it accepts or
+    /// refuses is the one `aterm_forge::policy` writes.
     #[test]
     fn the_review_set_is_the_fork_ledger() {
         let repo = test_fixtures::repo_root();

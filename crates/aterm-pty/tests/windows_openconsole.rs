@@ -1,23 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The console-host lane end to end: a tab spawned under `conpty = "auto"`
-//! runs in OpenConsole when this machine has one (a bundled copy, or the
-//! installed Windows Terminal's) and passes a child's VT through verbatim; a
-//! host that cannot start falls back to the Windows console host and the tab
-//! still opens; the default (`conpty` unset) is the OpenConsole beside the
-//! binary and never Windows Terminal's; `conpty = "inbox"` is the Windows
-//! console host.
-//!
-//! Its own test binary on purpose: the host choice is PROCESS-global
-//! (`aterm_pty::set_console_host`), and the other Windows suites expect the
-//! inbox host every embedder starts with. Within this binary the tests take
-//! [`HOST_LOCK`], so no two of them change the choice under each other.
-//!
-//! No test here waits on a clock for the child: each child holds its console
-//! open on a line read until the test has seen what it came for and types
-//! Enter, so its output is never raced by its own exit. Every wait is a
-//! one-minute hang detector.
+//! The console-host lane end to end: a tab spawned under `conpty = "auto"` runs in OpenConsole when this machine has one (a bundled copy, or the installed Windows Terminal's) and passes a child's VT through verbatim; a host that cannot start falls back to the Windows console host and the tab still opens; the default (`conpty` unset) is the OpenConsole beside the binary and never Windows Terminal's; `conpty = "inbox"` is the Windows console host.
 
 #![cfg(windows)]
 
@@ -162,9 +146,7 @@ fn front_door_beside() -> bool {
 /// The console clients a shipped tab runs from the `aterm.exe` beside it, run
 /// for one test from this crate's `aterm-pty-console-client`, which serves the
 /// same `serve_console_client`, then from nothing again, so the other tests
-/// keep the client-less process they expect. Never from an `aterm.exe` in
-/// `deps`: that is whichever build of `aterm` last ran in the target, and an
-/// older one does not know a newer client's flag.
+/// keep the client-less process they expect.
 struct ConsoleClients;
 
 impl ConsoleClients {
@@ -212,11 +194,6 @@ const SGR58: &[u8] = b"\x1b[58;2;255;0;0m\x1b[4mSEMI-RGB\x1b[59m\x1b[24m-END";
 const SGR58_SCRIPT: &str =
     "$e=[char]27; [Console]::Out.Write(\"$e[58;2;255;0;0m$e[4mSEMI-RGB$e[59m$e[24m-END\")";
 
-// `auto`: the host this machine resolves decides what the tab must show. With
-// an OpenConsole to launch, the child's SGR 58 arrives byte for byte and the
-// session says OpenConsole; with none, the tab opens under the inbox host, the
-// session says Inbox, and the log is handed the reason once. Either way the
-// branch taken is ASSERTED, never skipped.
 #[test]
 fn auto_runs_the_tab_in_openconsole_or_says_why_not() {
     let _serial = HOST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -253,9 +230,6 @@ fn auto_runs_the_tab_in_openconsole_or_says_why_not() {
     tab.wait_eof();
 }
 
-// A configured host that is not a console host starts, writes no VT and is
-// refused by the health check: the tab opens under the inbox host all the
-// same, the log hears why once, and the choice stays refused for later tabs.
 #[test]
 fn a_configured_host_that_does_not_start_falls_back_to_the_inbox_host() {
     let _serial = HOST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -286,7 +260,6 @@ fn a_configured_host_that_does_not_start_falls_back_to_the_inbox_host() {
     tab.enter();
     tab.wait_eof();
 
-    // A second tab takes the inbox host straight away and logs nothing new.
     let again = spawn_powershell("[Console]::Out.Write('AGAIN')");
     again.wait_for(b"AGAIN");
     assert_eq!(
@@ -298,8 +271,6 @@ fn a_configured_host_that_does_not_start_falls_back_to_the_inbox_host() {
     again.wait_eof();
 }
 
-// `conpty = "inbox"` is the Windows console host, with no note: the inbox
-// host was asked for, so nothing failed.
 #[test]
 fn inbox_is_the_windows_console_host_and_logs_nothing() {
     let _serial = HOST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -321,12 +292,6 @@ fn inbox_is_the_windows_console_host_and_logs_nothing() {
     tab.wait_eof();
 }
 
-// The default (aterm.toml with no `conpty`) is the OpenConsole beside this
-// binary: with one there (a bundle's layout) the tab runs in it; with none (a
-// bare test binary) the tab runs in the Windows console host, the log hears
-// why once, and Windows Terminal's host is NOT taken, as `auto` would. The
-// branch taken is ASSERTED, never skipped, and the doctor's probe, which
-// starts the host, names the same one.
 #[test]
 fn the_default_is_the_bundled_host_and_never_windows_terminals() {
     let _serial = HOST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -371,12 +336,6 @@ fn the_default_is_the_bundled_host_and_never_windows_terminals() {
     tab.wait_eof();
 }
 
-// The resync client, end to end: with an app's alternate screen up in the
-// host, `resync_alt_screen` starts a second client in the same pseudoconsole
-// and the host FORWARDS its `?1049l`, the bytes the terminal then leaves its
-// own alternate screen on, ahead of the app's next output. With no client
-// image beside the process it starts nothing and says so, and the screen
-// stays up. An inbox session refuses: its host repaints instead of forwarding.
 #[test]
 fn the_resync_client_makes_openconsole_forward_the_leave() {
     let _serial = HOST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -415,7 +374,6 @@ fn the_resync_client_makes_openconsole_forward_the_leave() {
             tab.enter();
         }
     }
-    // The helper's own closing line read.
     tab.enter();
     tab.wait_eof();
 }
@@ -446,13 +404,6 @@ fn mode_after(bytes: &[u8], key: &str) -> Option<u32> {
     u32::from_str_radix(hex, 16).ok()
 }
 
-// The resync client touches the screen and nothing else: the input mode the
-// tab's program set reads the same after the host has left its alternate
-// screen. The console's input mode is shared by every client of the tab, and
-// the first client, `cmd.exe /c set /p`, turned processed, line and
-// echo input back on as it started (0x288 read 0x28f), so a Ctrl+C at an ssh
-// prompt became a CTRL_C_EVENT that ended ssh. The negative control is that
-// client: this test fails with it.
 #[test]
 fn the_resync_client_leaves_the_console_input_mode_alone() {
     let _serial = HOST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -492,7 +443,6 @@ fn the_resync_client_leaves_the_console_input_mode_alone() {
             tab.enter();
         }
     }
-    // The helper's own closing line read.
     tab.enter();
     tab.wait_eof();
 }
@@ -514,10 +464,6 @@ fn prompt_on_the_alternate_screen(mode: u32) -> String {
     )
 }
 
-// The leave's carry under a real OpenConsole: the client writes it right after
-// the switch, in the same write, for a raw reader whose cursor is still the one
-// the carry was made for, and leaves it out for a cursor that moved since and for
-// a reader in line mode (whose read the switch ends: cmd.exe prompts again).
 #[test]
 fn the_resync_client_carries_the_prompt_only_for_a_raw_reader_at_its_cursor() {
     let _serial = HOST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -559,19 +505,11 @@ fn the_resync_client_carries_the_prompt_only_for_a_raw_reader_at_its_cursor() {
                 tab.enter();
             }
         }
-        // The helper's own closing line read.
         tab.enter();
         tab.wait_eof();
     }
 }
 
-// A GUI-subsystem program never connects to its console, so a console host
-// never answers it: the tab neither waits for an answer nor ends the program
-// and starts it again on the Windows console host, and holds nothing against
-// the host. The program runs once, nothing is noted, and the next console tab
-// gets the host `auto` resolved. The first health check ran it
-// twice (the first copy killed at 250 ms) and turned OpenConsole off for every
-// later tab.
 #[test]
 fn a_gui_program_runs_once_and_keeps_openconsole_for_later_tabs() {
     let _serial = HOST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -605,9 +543,6 @@ fn a_gui_program_runs_once_and_keeps_openconsole_for_later_tabs() {
     tab.wait_eof();
 }
 
-// `--show-config`'s preview names the host a tab under that choice gets, as the
-// process's own resolution does, and leaves the process's choice alone: a tab
-// spawned after previewing `auto` under the inbox choice is still inbox.
 #[test]
 fn the_preview_names_the_host_and_leaves_the_choice_alone() {
     let _serial = HOST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -633,8 +568,6 @@ fn the_preview_names_the_host_and_leaves_the_choice_alone() {
     }
 }
 
-// An inbox session never runs the client, whatever the machine has, and a key
-// no session has is not found.
 #[test]
 fn an_inbox_session_refuses_the_resync() {
     let _serial = HOST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -653,15 +586,6 @@ fn an_inbox_session_refuses_the_resync() {
     tab.wait_eof();
 }
 
-// `auto` keeps a program of the MSYS2/Cygwin runtime on the Windows console
-// host when no guard client can run (no `aterm.exe` beside this test binary):
-// under OpenConsole the runtime's post-resize drop would take a real key
-// (`console_host::policy::runs_a_posix_runtime` has the numbers). With one
-// beside it (a build of `aterm` in the same target puts one in `deps`, and an
-// app folder has one) the guard runs and the program takes the host `auto`
-// resolved; the branch taken is asserted. The runtime is recognised by its
-// DLL, so a copy of cmd.exe beside an `msys-2.0.dll` stands in for Git Bash
-// here; the same program beside no runtime takes the host `auto` resolved.
 #[test]
 fn auto_keeps_msys2_runtime_programs_on_the_inbox_host() {
     let _serial = HOST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -682,7 +606,6 @@ fn auto_keeps_msys2_runtime_programs_on_the_inbox_host() {
     std::fs::copy(&cmd, native.join("cmd.exe")).unwrap();
     std::fs::write(msys.join("msys-2.0.dll"), b"").unwrap();
 
-    // `set /p` holds the console on a line read until the test types Enter.
     let under_msys = msys.join("cmd.exe").display().to_string();
     let tab = Tab::spawn(&[&under_msys, "/d", "/c", "echo MSYS-STANDIN& set /p _="]);
     tab.wait_for(b"MSYS-STANDIN");

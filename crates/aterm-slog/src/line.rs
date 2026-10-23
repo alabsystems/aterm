@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The line encoding (design §3.2): one record per line of `k=v` tokens,
-//! values percent-encoded with the control wire's escape, at most
-//! [`MAX_RECORD_BYTES`] per record; the `v=2` bus body uses the same tokens.
-//!
-//! ```text
-//! 412 open t17 turn par=r3 by=human src=screen conf=strong t=1760545012345
-//! v=2 t=1760545012345 ep=2 seq=412 ms=97 op=open node=t17 k=turn par=r3 by=human src=screen conf=strong
-//! ```
-//!
-//! [`encode`] at a [`Tier`] emits only keys at or below it ([`FIELDS`]), so
-//! `Tier::Wire` can never carry an H or C key. [`decode`] is lossless for
-//! the keys it knows, skips tokens it does not, and maps an unknown word to
-//! `unknown`.
+//! The line encoding (design §3.2).
 
 use std::fmt::Write as _;
 
@@ -23,7 +11,7 @@ use crate::field::{BoundedText, BoundedToken, Cap, FIELDS, Fields, Key, Tier, Va
 use crate::rec::Rec;
 use crate::vocab::{Actor, Conf, Kind, Node, Op, ShortId, Src, lookup_or_unknown};
 
-/// The longest encoded record; a larger one is refused (§3.2).
+/// The longest encoded record.
 pub const MAX_RECORD_BYTES: usize = 512;
 
 /// Why a record was not encoded.
@@ -31,10 +19,7 @@ pub const MAX_RECORD_BYTES: usize = 512;
 pub enum EncodeError {
     /// The encoding would take this many bytes, over [`MAX_RECORD_BYTES`].
     TooLarge(usize),
-    /// A record the bus mirror does not carry ([`Rec::is_bus_class`]): a
-    /// mail mark, a tool step, a verdict. The second wall behind the class
-    /// itself ([`encode_mirror`]), so a producer that misclassifies a record
-    /// still cannot put its wire-tier `kind=`, `dir=` or `inbox=` on the bus.
+    /// A record the bus mirror does not carry ([`Rec::is_bus_class`]).
     NotBusClass,
 }
 
@@ -58,19 +43,14 @@ pub enum DecodeError {
 /// `rec` as one log line, carrying only the fields at or below `tier`.
 ///
 /// # Errors
-///
 /// [`EncodeError::TooLarge`] when the line would pass [`MAX_RECORD_BYTES`].
 pub fn encode(rec: &Rec, tier: Tier) -> Result<String, EncodeError> {
     encode_with_table(rec, tier, FIELDS)
 }
 
-/// [`encode`] reading tiers from `table` instead of [`FIELDS`]: the seam the
-/// tier leak test's negative control uses (it marks one H key as W and
-/// watches the leak appear). A key `table` does not list is treated as
-/// content and emitted only at [`Tier::Content`].
+/// [`encode`] reading tiers from `table` instead of [`FIELDS`].
 ///
 /// # Errors
-///
 /// As [`encode`].
 pub fn encode_with_table(
     rec: &Rec,
@@ -104,12 +84,9 @@ pub fn encode_with_table(
     checked(out)
 }
 
-/// `rec` as a `v=2` bus body (§3.2): the same tokens in `k=v` form, with the
-/// session's epoch and, when given, its turn-class counter `ms`. The bus
-/// never carries an H or C key, so `tier` is held at [`Tier::WireMeta`].
+/// `rec` as a `v=2` bus body (§3.2).
 ///
 /// # Errors
-///
 /// As [`encode`].
 pub fn encode_bus(rec: &Rec, tier: Tier, ep: u32, ms: Option<u64>) -> Result<String, EncodeError> {
     let tier = tier.min(Tier::WireMeta);
@@ -137,18 +114,10 @@ pub fn encode_bus(rec: &Rec, tier: Tier, ep: u32, ms: Option<u64>) -> Result<Str
     checked(out)
 }
 
-/// `rec` as the bus mirror's `v=2` body (§5.5, phase 4): [`encode_bus`] for
-/// a record of the bus class only, with an edge's actor written as its
-/// stable alias. `alias` maps a session's sid to the token the
-/// bus shows for it (`e<8 hex>`, a keyed hash only this node can make), so
-/// two records by one edge still name one actor and the sid stays local;
-/// `None` writes `by=-`. No other actor is rewritten: `human ctl harness
-/// bridge aterm vendor` name a connection's class, not a session.
+/// `rec` as the bus mirror's `v=2` body (§5.5, phase 4).
 ///
 /// # Errors
-///
-/// [`EncodeError::NotBusClass`] for a record the mirror does not carry, and
-/// otherwise as [`encode`].
+/// [`EncodeError::NotBusClass`] for a record the mirror does not carry, and otherwise as [`encode`].
 pub fn encode_mirror(
     rec: &Rec,
     tier: Tier,
@@ -169,11 +138,9 @@ pub fn encode_mirror(
     }
 }
 
-/// The bytes a record takes at `tier` (what the ring's byte budget counts),
-/// or the refusal.
+/// The bytes a record takes at `tier` (what the ring's byte budget counts), or the refusal.
 ///
 /// # Errors
-///
 /// As [`encode`].
 pub fn encoded_size(rec: &Rec, tier: Tier) -> Result<usize, EncodeError> {
     encode(rec, tier).map(|s| s.len())
@@ -226,8 +193,7 @@ pub(crate) fn push_val(out: &mut String, val: &Val) {
     }
 }
 
-/// The value `raw` decodes to for `key`, or `None` when it does not have the
-/// key's shape (the token is then skipped).
+/// The value `raw` decodes to for `key`, or `None` when it does not have the key's shape (the token is then skipped).
 pub(crate) fn decode_val(key: Key, raw: &str) -> Option<Val> {
     match key.cap() {
         Cap::Word(list) => Some(Val::Word(lookup_or_unknown(list, raw))),
@@ -252,9 +218,7 @@ fn decode_field(f: &mut Fields, k: &str, v: &str) {
 /// One log line back to its record.
 ///
 /// # Errors
-///
-/// A [`DecodeError`] for a line with no seq, an unknown operation, no node
-/// id or no kind, or one longer than [`MAX_RECORD_BYTES`].
+/// A [`DecodeError`] for a line with no seq, an unknown operation, no node id or no kind, or one longer than [`MAX_RECORD_BYTES`].
 pub fn decode(line: &str) -> Result<Rec, DecodeError> {
     if line.len() > MAX_RECORD_BYTES {
         return Err(DecodeError::TooLong);
@@ -295,10 +259,7 @@ pub fn decode(line: &str) -> Result<Rec, DecodeError> {
     Ok(rec)
 }
 
-/// A decoded bus body: the record and the session's epoch and turn-class
-/// counter. A body this build cannot place ([`decode_bus`]: an `op=` word or
-/// a `node=` id it does not know) holds a mark of kind `unknown` on the
-/// session, which no bus class holds.
+/// A decoded bus body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BusRec {
     /// The session's epoch (`ep=`).
@@ -312,10 +273,7 @@ pub struct BusRec {
 impl BusRec {
     /// THE RECORD OF A BODY THIS BUILD CANNOT PLACE ([`decode_bus`]): a mark
     /// of kind `unknown` on the session, its node and parent unread and its
-    /// fields dropped. No bus class holds it ([`Rec::is_bus_class`]), so a
-    /// reader folds nothing of it and still holds its `ms`
-    /// (`aterm_slog::bus::BusSpace::offer`); its `t`, `by`, `src` and `conf`
-    /// are the body's.
+    /// fields dropped.
     fn unplaced(mut self) -> BusRec {
         self.rec.op = Op::Mark;
         self.rec.node = Node::SESSION;
@@ -328,23 +286,8 @@ impl BusRec {
 
 /// A `v=2` bus body back to its record.
 ///
-/// UNKNOWN WORDS ARE NOT LOSS (§3.4: new keys and words never change `v`): a
-/// fleet runs mixed builds, and a newer writer may name an operation or a
-/// node level this build does not know. A body whose `seq` reads and whose
-/// `op=` word, or (its operation known) whose `node=` id, this build does
-/// not know decodes to a record it cannot place — a mark of kind `unknown`
-/// on the session, its fields dropped, which no bus class holds — with its
-/// `ep`, `seq` and `ms`: a reader holds that `ms` and folds nothing of it,
-/// as it does a record of a kind it does not know. Unknown keys are skipped
-/// and unknown words of a known key read `unknown`, as [`decode`] reads them.
-///
 /// # Errors
-///
-/// [`DecodeError::Opaque`] for a body of another version (a reader keeps it
-/// opaque, §3.4); [`DecodeError::Seq`], [`DecodeError::Op`],
-/// [`DecodeError::Node`] or [`DecodeError::Kind`] for a body with no seq, no
-/// operation, no node or no kind; [`DecodeError::TooLong`] past
-/// [`MAX_RECORD_BYTES`].
+/// [`DecodeError::Opaque`] for a body of another version (a reader keeps it opaque, §3.4).
 pub fn decode_bus(body: &str) -> Result<BusRec, DecodeError> {
     if body.len() > MAX_RECORD_BYTES {
         return Err(DecodeError::TooLong);
@@ -390,8 +333,6 @@ pub fn decode_bus(body: &str) -> Result<BusRec, DecodeError> {
         }
     }
     out.rec.seq = seq.ok_or(DecodeError::Seq)?;
-    // A word this build does not know is a record it cannot place, never
-    // a body that is not there (the doc).
     let Some(op) = op.ok_or(DecodeError::Op)? else {
         return Ok(out.unplaced());
     };

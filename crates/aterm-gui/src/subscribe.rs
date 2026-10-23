@@ -561,8 +561,38 @@ fn drain_title_event(
     }
 }
 
-/// Scan the target's event timeline past `last_id` and push each record kind [`timeline_wire_kind`] carries as `EVENT <sid> <kind>[ <payload>]`, the payload being the record's own pre-encoded tail (`meta`'s is `field=<f> value=<pct|->`).
+/// Scan the target's event timeline past `last_id` and push each record kind [`timeline_wire_kind`] carries as `EVENT <sid> <kind>[ <payload>]`, the payload being the record's own pre-encoded tail (`meta`'s is `field=<f> value=<pct|->`). It reads the session log's view: a row id past the watermark the log issued and no longer holds is said first as `GAP <sid> events-dropped=<n>`.
 pub(crate) fn drain_timeline_events(
+    tl: &crate::session_timeline::SessionTimeline,
+    sid: &str,
+    last_id: Option<u64>,
+    out: &mut String,
+) -> Option<u64> {
+    let hi = match tl.view_head() {
+        None => return last_id,
+        Some(hi) if last_id.is_some_and(|a| hi <= a) => return Some(hi),
+        Some(hi) => hi,
+    };
+    let view = tl.view_since(last_id);
+    if view.lost > 0 {
+        out.push_str(&format!("GAP {sid} events-dropped={}\n", view.lost));
+    }
+    for e in &view.rows {
+        let Some(kind) = timeline_wire_kind(e.kind) else {
+            continue;
+        };
+        if e.payload.is_empty() {
+            out.push_str(&format!("EVENT {sid} {kind}\n"));
+        } else {
+            out.push_str(&format!("EVENT {sid} {kind} {}\n", e.payload));
+        }
+    }
+    Some(hi)
+}
+
+/// The ring's digest as it read before the view: what the tests that hold the view's reader to it compare.
+#[cfg(test)]
+pub(crate) fn drain_ring_events(
     tl: &crate::session_timeline::SessionTimeline,
     sid: &str,
     last_id: Option<u64>,
@@ -581,8 +611,6 @@ pub(crate) fn drain_timeline_events(
         out.push_str(&format!("GAP {sid} events-dropped={missed}\n"));
     }
     for e in tl.since(last_id) {
-        #[cfg(test)]
-        crate::work_counts::retained_record_touched();
         let Some(kind) = timeline_wire_kind(e.kind) else {
             continue;
         };
@@ -1681,7 +1709,7 @@ fn initial_timeline_watermarks(
         return (None, 0);
     }
     let tl = timeline.lock().unwrap_or_else(|p| p.into_inner());
-    (tl.high_id(), tl.resizes().high_row())
+    (tl.view_head(), tl.resizes().high_row())
 }
 
 fn pick_adoptions(
@@ -1930,7 +1958,7 @@ pub(crate) mod digest_fixture {
                         if j % 8 == 0 {
                             t.record_raw_meta_change("field=role value=lead".to_string());
                         } else {
-                            t.record("state-change", "state=alive".to_string());
+                            let _ = t.record_hand_row("state-change", "state=alive".to_string());
                         }
                     }
                 }
@@ -1958,10 +1986,14 @@ pub(crate) mod digest_fixture {
             bytes
         }
 
-        pub(crate) fn retained(&self) -> (usize, usize, usize) {
+        /// The first target's blocks, turns, and its timeline view's rows with the row ids its log no longer holds.
+        pub(crate) fn retained(&self) -> (usize, usize, usize, u64) {
             let fixture_term = &self.terms[0];
             let fixture_turns = &self.turns[0];
-            let fixture_timeline = &self.timelines[0];
+            let view = self.timelines[0]
+                .lock()
+                .expect("fixture timeline")
+                .view_since(None);
             (
                 fixture_term
                     .lock()
@@ -1969,8 +2001,19 @@ pub(crate) mod digest_fixture {
                     .all_blocks()
                     .count(),
                 fixture_turns.lock().expect("fixture ledger").len(),
-                fixture_timeline.lock().expect("fixture timeline").len(),
+                view.rows.len(),
+                view.lost,
             )
+        }
+
+        /// One new `meta-change` row on every target's timeline.
+        pub(crate) fn land_row(&mut self) {
+            for tl in &self.timelines {
+                let _ = tl
+                    .lock()
+                    .expect("fixture timeline")
+                    .record_raw_meta_change("field=role value=lead".to_string());
+            }
         }
 
         pub(crate) fn land_turn(&mut self) {
@@ -3519,7 +3562,7 @@ mod tests {
         timeline
             .lock()
             .unwrap()
-            .record("spawned", "state=alive".to_string());
+            .record_hand_row("spawned", "state=alive".to_string());
         timeline
             .lock()
             .unwrap()
@@ -3548,7 +3591,7 @@ mod tests {
         timeline
             .lock()
             .unwrap()
-            .record("state-change", "state=exited".to_string());
+            .record_hand_row("state-change", "state=exited".to_string());
         let mut out = String::new();
         let wm = drain_timeline_events(&timeline.lock().unwrap(), "7", wm, &mut out);
         assert_eq!(
@@ -3560,10 +3603,49 @@ mod tests {
         let wm2 = drain_timeline_events(&timeline.lock().unwrap(), "7", wm, &mut out);
         assert!(out.is_empty());
         assert_eq!(wm2, Some(4));
-        timeline.lock().unwrap().record("human", String::new());
+        timeline
+            .lock()
+            .unwrap()
+            .record_hand_row("human", String::new());
         let mut out = String::new();
         drain_timeline_events(&timeline.lock().unwrap(), "7", wm2, &mut out);
         assert_eq!(out, "EVENT 7 human\n");
+    }
+
+    #[test]
+    fn the_events_seed_is_the_views_head() {
+        let timeline = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::session_timeline::SessionTimeline::for_test(),
+        ));
+        let _ = timeline
+            .lock()
+            .unwrap()
+            .record_hand_row("spawned", "state=alive".to_string());
+        {
+            let mut g = timeline.lock().unwrap();
+            let at = g.slog().now();
+            g.slog_mut().human_input(true, at);
+            assert_eq!(
+                g.slog().burst_rows_owed(),
+                1,
+                "PRECONDITION: the ring owes the row"
+            );
+        }
+        let (seeded, _) = initial_timeline_watermarks(
+            &timeline,
+            TargetStreams {
+                events: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(seeded, Some(2), "seeded at the view's head, past the burst");
+        let mut out = String::new();
+        let wm = drain_timeline_events(&timeline.lock().unwrap(), "7", seeded, &mut out);
+        assert!(
+            out.is_empty(),
+            "no replay of the burst before the watch: {out}"
+        );
+        assert_eq!(wm, Some(2));
     }
 
     #[test]
@@ -3609,7 +3691,7 @@ mod tests {
         timeline
             .lock()
             .unwrap()
-            .record("spawned", "state=alive".to_string());
+            .record_hand_row("spawned", "state=alive".to_string());
         let (seeded, _) = initial_timeline_watermarks(
             &timeline,
             TargetStreams {
@@ -3621,23 +3703,28 @@ mod tests {
         timeline
             .lock()
             .unwrap()
-            .record("topic", "add t since=head".to_string());
+            .record_hand_row("topic", "add t since=head".to_string());
         let mut out = String::new();
         let wm = drain_timeline_events(&timeline.lock().unwrap(), "7", seeded, &mut out);
         assert_eq!(out, "EVENT 7 topic add t since=head\n");
         assert_eq!(wm, Some(2));
-        for i in 0..(TIMELINE_CAP + 5) {
+        let flood = aterm_slog::MAX_RECORDS + 5;
+        for i in 0..flood {
             timeline
                 .lock()
                 .unwrap()
-                .record("topic", format!("drop t{i}"));
+                .record_hand_row("topic", format!("drop t{i}"));
         }
-        let (low, high) = {
+        // The oracle is the log's own rows, not the digest's reading of them.
+        let (low, held, high) = {
             let tl = timeline.lock().unwrap();
-            (tl.since(None).next().unwrap().id, tl.high_id().unwrap())
+            let log = tl.slog().log();
+            let low = log.rows().next().map(|r| r.id).expect("rows held");
+            (low, log.rows().count(), log.row_head())
         };
-        assert_eq!(high, 2 + TIMELINE_CAP as u64 + 5);
-        assert_eq!(low, high - TIMELINE_CAP as u64 + 1);
+        assert_eq!(high, 2 + flood as u64);
+        assert!(low > 3, "the log evicted the oldest rows");
+        assert!(held > TIMELINE_CAP, "it holds more than the ring did");
         let mut out = String::new();
         let wm = drain_timeline_events(&timeline.lock().unwrap(), "7", wm, &mut out);
         let missed = low - 2 - 1;
@@ -3648,7 +3735,7 @@ mod tests {
         );
         assert_eq!(
             out.matches("EVENT 7 topic drop").count(),
-            TIMELINE_CAP,
+            held,
             "every retained row follows the GAP"
         );
         assert_eq!(wm, Some(high));
@@ -3799,7 +3886,9 @@ mod tests {
 
     #[test]
     fn a_lifted_timeline_hold_is_drained_on_the_next_pass_with_no_ring() {
-        use crate::session_timeline::TIMELINE_CAP;
+        // Past the session log's record bound (the view's), so its
+        // batch evicts rows past the watch's watermark.
+        const FLOOD: usize = aterm_slog::MAX_RECORDS;
         let streams = TargetStreams {
             events: true,
             ..Default::default()
@@ -3835,7 +3924,7 @@ mod tests {
             );
             let held = HeldHere::on(&["timeline"]);
             record(&watches[0], "x=lost".to_string());
-            for i in 0..TIMELINE_CAP {
+            for i in 0..FLOOD {
                 record(&watches[0], format!("x={i}"));
             }
             assert_eq!(
@@ -3853,8 +3942,25 @@ mod tests {
         };
 
         let (_sub, mut watches) = held_past_the_ring();
-        let mut want = String::from("GAP 9 events-dropped=1\n");
-        for i in 0..TIMELINE_CAP {
+        // The oracle is the log's own rows: past the seed's id, the ids it no
+        // longer holds are the GAP, then every row it holds, `x=<i>` at id
+        // seed + 2 + i.
+        let (seed, low) = {
+            let tl = watches[0]
+                .src
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let log = tl.slog().log();
+            let low = log.rows().next().map(|r| r.id).expect("rows held");
+            (
+                log.row_head() - u64::try_from(FLOOD).expect("a count") - 1,
+                low,
+            )
+        };
+        assert!(low > seed + 1, "the log evicted past the seed");
+        let mut want = format!("GAP 9 events-dropped={}\n", low - seed - 1);
+        for i in (low - seed - 2)..u64::try_from(FLOOD).expect("a count") {
             want.push_str(&format!("EVENT 9 meta x={i}\n"));
         }
         let got = pass(&mut watches);
@@ -3990,7 +4096,7 @@ mod tests {
         }
     }
 
-    fn stalled_wire(n: usize) -> String {
+    fn stalled_wire(n: usize) -> (String, usize) {
         const HANDSHAKE: &str = "OK subscribe 1\n";
         let pushed = std::thread::spawn(move || {
             let store = crate::session_store::new_store();
@@ -4034,25 +4140,45 @@ mod tests {
                 &mut sink,
                 peer,
             );
-            String::from_utf8(sink.wire).expect("text frames are UTF-8")
+            // The stall's rows the session log no longer holds, read off the
+            // log itself (the view's loss): the oracle for the GAP.
+            let held = {
+                let tl = timeline.lock().unwrap_or_else(|p| p.into_inner());
+                tl.slog()
+                    .log()
+                    .rows()
+                    .filter(|r| {
+                        crate::session_timeline_view::rows_of(r.rec)
+                            .iter()
+                            .any(|(_, p)| p.contains("x=s"))
+                    })
+                    .count()
+            };
+            (
+                String::from_utf8(sink.wire).expect("text frames are UTF-8"),
+                n - held,
+            )
         });
-        let wire = crate::test_socket::join_after_hang_up(
+        let (wire, lost) = crate::test_socket::join_after_hang_up(
             pushed,
             "the stalled reader to take its last record and hang up",
         );
-        wire.strip_prefix(HANDSHAKE)
-            .expect("the handshake comes first")
-            .to_string()
+        (
+            wire.strip_prefix(HANDSHAKE)
+                .expect("the handshake comes first")
+                .to_string(),
+            lost,
+        )
     }
 
     #[test]
     fn a_stalled_readers_records_come_after_the_stall_or_in_its_gap() {
-        use crate::session_timeline::TIMELINE_CAP;
         let stalled = |range: std::ops::Range<usize>| -> String {
             range.map(|i| format!("EVENT 9 meta x=s{i}\n")).collect()
         };
         let before = "EVENT 9 meta x=before\n";
-        let within = stalled_wire(3);
+        let (within, lost) = stalled_wire(3);
+        assert_eq!(lost, 0, "within the log's bound");
         assert!(
             within.starts_with(before),
             "x=before is recorded inside the handshake write, so the push loop must seed its \
@@ -4063,11 +4189,15 @@ mod tests {
             format!("{before}{}", stalled(0..3)),
             "within the ring: every record made in the stall, after it"
         );
-        let n = TIMELINE_CAP + 5;
+        // Past the session log's record bound (the view's): its batch
+        // evicts the oldest of the stall's rows.
+        let n = aterm_slog::MAX_RECORDS + 5;
+        let (wire, lost) = stalled_wire(n);
+        assert!(lost > 0, "the log evicted some of the stall's rows");
         assert_eq!(
-            stalled_wire(n),
-            format!("{before}GAP 9 events-dropped=5\n{}", stalled(5..n)),
-            "past the ring: the five it evicted counted, the rest pushed"
+            wire,
+            format!("{before}GAP 9 events-dropped={lost}\n{}", stalled(lost..n)),
+            "past the log's bound: the rows it evicted counted, the rest pushed"
         );
     }
 

@@ -202,21 +202,23 @@ fn a_steady_title_gate_walks_no_tab() {
 }
 
 /// The subscribe idle wake: an `events` digest whose ledgers are saturated
-/// (1000 shell blocks, 512 turn records, 512 timeline events per target)
-/// touches no retained record on a wake where nothing happened.
+/// (1000 shell blocks, 512 turn records, and a timeline view whose log has
+/// evicted rows, per target) touches no retained record on a wake where
+/// nothing happened.
 #[test]
 fn an_idle_events_wake_touches_no_retained_record() {
     use crate::subscribe::digest_fixture::DigestFixture;
     const TARGETS: usize = 4;
     let mut f = DigestFixture::build(TARGETS, 2 * 1000, 2 * crate::turn_ledger::LEDGER_CAP, {
-        2 * crate::session_timeline::TIMELINE_CAP
+        aterm_slog::MAX_RECORDS + crate::session_timeline::TIMELINE_CAP
     });
-    let (blocks, turns, timeline) = f.retained();
+    let (blocks, turns, rows, lost) = f.retained();
     assert!(
         blocks >= 1000
             && turns == crate::turn_ledger::LEDGER_CAP
-            && timeline == crate::session_timeline::TIMELINE_CAP,
-        "the fixture must saturate every ledger: {blocks}/{turns}/{timeline}"
+            && rows >= crate::session_timeline::TIMELINE_CAP
+            && lost > 0,
+        "the fixture must saturate every ledger and the view: {blocks}/{turns}/{rows}/{lost}"
     );
     let _ = work_counts::take_retained_records_touched();
     for woke in [false, true, false, false] {
@@ -238,6 +240,15 @@ fn an_idle_events_wake_touches_no_retained_record() {
         (TARGETS..=TARGETS * per_target_bound).contains(&touched),
         "a wake with one new turn per target touched {touched} records (bound \
          {per_target_bound} per target)"
+    );
+
+    // Control: one new timeline row per target, read from the view's newest row down.
+    f.land_row();
+    assert!(f.wake(true) > 0, "a wake after a new row emits");
+    let touched = work_counts::take_retained_records_touched();
+    assert!(
+        (TARGETS..=TARGETS * per_target_bound).contains(&touched),
+        "a wake with one new row per target touched {touched} records"
     );
 }
 

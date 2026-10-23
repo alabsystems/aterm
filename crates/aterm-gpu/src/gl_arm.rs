@@ -1,26 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The GL arm's renderer side (Linux, docs/AUDIT-third-party-2026-10-15.md
-//! GW.4, and the browser, wasm-platform WP.8), the twin of the armed Metal path in `renderer.rs`: the arm's
-//! resident state ([`GlArmLive`]: device, programs by table row, the uniform
-//! block, instance streams, glyph and decoration atlases) and the encode tail
-//! [`encode_tail`] that `encode_frame` forks into once the shared instance
-//! building is done.
-//!
-//! An armed renderer (`GpuRenderer::arm_gl`; armed at construction on Linux
-//! and wasm32)
-//! draws every frame here: readbacks, presents (`gl_present.rs`) and the
-//! taps. In a build that also carries the wgpu arm (Linux's `--features
-//! wgpu-oracle` lane, where wgpu is the oracle) a frame that fails on GL falls
-//! through to the wgpu tail by name; in the shipped Linux build it is a lost frame the
-//! device-loss poll owns.
-//!
-//! GL is synchronous to the CPU for buffer and texture updates (the driver
-//! orders a write after every draw already issued that reads the object), so
-//! the arm needs none of the Metal arm's frame-slot rings for correctness.
-//! The fx palette keeps a ring of three textures all the same: a rewrite of a
-//! texture a draw in flight samples makes the driver copy or wait.
+//! Resident GL renderer state and frame-encode tail.
 
 use super::*;
 use crate::device_layer::{
@@ -59,9 +40,7 @@ struct GlStream {
     cap: usize,
 }
 
-/// One resident atlas texture with the structural key and shelf write state
-/// it was uploaded under (the Metal arm's `ArmAtlas` law: re-mint on a new
-/// key, upload only the appended row band on an advanced `write_gen`).
+/// Resident atlas texture with structural key and shelf write state.
 pub(crate) struct GlArmAtlas {
     tex: GlTexture,
     key: (u32, u32, u64),
@@ -69,8 +48,7 @@ pub(crate) struct GlArmAtlas {
     uploaded_py: u32,
 }
 
-/// The GL arm's resident state, minted lazily at the first armed frame (or at
-/// a window's attach, on the window system's display).
+/// The GL arm's resident state.
 pub(crate) struct GlArmLive {
     pub(crate) dev: GlDevice,
     /// Programs by table row, built on first use.
@@ -86,24 +64,19 @@ pub(crate) struct GlArmLive {
     uniform: GlBuffer,
     uniform_key: Option<(u32, u32, u32)>,
     streams: [Option<GlStream>; STREAM_COUNT],
-    /// Glyph (mono, colour) and decoration coverage. Sprite textures live with
-    /// their source (`SpriteTex::gl_atlas`).
+    /// Glyph (mono, colour) and decoration coverage.
     atlases: [Option<GlArmAtlas>; DRAW_ATLAS_COUNT],
     /// The fx atlases (`fx_gpu::FxAtlasKind` order), synced from the
     /// renderer's append-only `FxAtlas`.
     fx_tex: [Option<fx_gpu::FxArmTex>; 2],
     /// The fx palette ring: one RGBA8 texture (1024 entries a row) per slot,
-    /// written in turn. The driver orders a write after the draws that read
-    /// the old texels, but a write into a texture an in-flight draw samples
-    /// makes it copy or wait; a ring of three never writes the texture the
-    /// last two frames bound.
+    /// written in turn.
     fx_palettes: [Option<GlTexture>; fx_gpu::FX_PALETTE_RING],
     fx_palette_next: usize,
 }
 
 impl GlArmLive {
-    /// A GL device with the frame's fixed resources: on the window system's
-    /// display when `ws` names one (window surfaces need it), else headless.
+    /// A GL device with the frame's fixed resources.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn new(ws: Option<crate::gl::device::WindowSystem>) -> Result<Self, String> {
         Self::on(match ws {
@@ -114,7 +87,6 @@ impl GlArmLive {
 
     /// The frame's fixed resources on `dev`.
     pub(crate) fn on(dev: GlDevice) -> Result<Self, String> {
-        // Minted through the device layer, as the Metal arm mints.
         let nearest = DeviceHandle::Gl(&dev)
             .try_create_sampler("aterm-gpu gl nearest", SamplerKind::NearestClamp)?
             .into_gl();
@@ -141,7 +113,7 @@ impl GlArmLive {
 
     /// Bring both fx atlases up to date with `atlas` (re-minted on a new
     /// generation or another context, else the log's tail appended in place)
-    /// when the frame draws fx or prefetches. The texel bytes uploaded.
+    /// when the frame draws fx or prefetches.
     fn sync_fx(&mut self, atlas: &fx_gpu::FxAtlas, drawing: bool) -> Result<u64, String> {
         let mut bytes = 0;
         for kind in [fx_gpu::FxAtlasKind::R8, fx_gpu::FxAtlasKind::Rgba] {
@@ -170,8 +142,7 @@ impl GlArmLive {
         self.fx_palettes = std::array::from_fn(|_| None);
     }
 
-    /// Write the frame's palette into the ring's next texture. The slot
-    /// written.
+    /// Write the frame's palette into the ring's next texture.
     fn upload_fx_palette(&mut self, words: &[u32]) -> Result<usize, String> {
         let slot = self.fx_palette_next;
         self.fx_palette_next = (slot + 1) % fx_gpu::FX_PALETTE_RING;
@@ -261,7 +232,6 @@ impl GlArmLive {
             TexelFormat::R8Unorm => 1,
             _ => 4,
         };
-        // In usize: a 32768-square RGBA atlas (NVIDIA's ceiling) is 4 GiB.
         let row_bytes = tw as usize * bpp as usize;
         let full = row_bytes.saturating_mul(th as usize);
         if bytes.len() > full || (row_bytes > 0 && !bytes.len().is_multiple_of(row_bytes)) {
@@ -300,10 +270,7 @@ impl GlArmLive {
     }
 }
 
-/// The offscreen storage of a device's format plan: the native plan
-/// (`Rgba8Unorm` with its sRGB alias, both views on one `SRGB8_ALPHA8`
-/// texture) where the device has the sRGB view extensions, else the
-/// downlevel plan's sRGB texture.
+/// The offscreen storage of a device's format plan.
 #[inline]
 pub(crate) fn offscreen_format(dev: &GlDevice) -> (TexelFormat, Option<TexelFormat>) {
     if dev.caps().srgb_views {
@@ -313,9 +280,7 @@ pub(crate) fn offscreen_format(dev: &GlDevice) -> (TexelFormat, Option<TexelForm
     }
 }
 
-/// Write `words` into `tex` (`FX_PALETTE_ROW` entries a row, entry `j` at
-/// `(j % row, j / row)`), re-minted at a power-of-two row count when it is
-/// absent, too short or on another context.
+/// Write `words` into `tex` (`FX_PALETTE_ROW` entries per row).
 pub(crate) fn write_fx_palette(
     dev: &GlDevice,
     tex: &mut Option<GlTexture>,
@@ -359,8 +324,7 @@ pub(crate) struct GlTailIn<'a> {
     pub(crate) fx: &'a fx_gpu::FxGpu,
 }
 
-/// What the tail drew: the pass count, pass 0's load, the scissor and the
-/// CPU time staging the instance streams.
+/// What the GL encode tail drew.
 pub(crate) struct GlTailOut {
     pub(crate) passes: usize,
     pub(crate) stage_ns: u64,
@@ -375,11 +339,7 @@ pub(crate) struct GlTailOut {
     pub(crate) fx_staged: bool,
 }
 
-/// The GL encode tail: stage the instance streams, build the plan, resolve it
-/// through a [`GlFrameRig`] over the arm's residency and run the shared
-/// `run_frame_plan` on the GL encoder. `plan` is the renderer's plan buffer,
-/// rebuilt here. `Err` names why the frame could not draw on GL; the caller
-/// falls through to the wgpu tail.
+/// Stage instance streams, build the frame plan, and execute it on the GL encoder.
 pub(crate) fn encode_tail(
     live: &mut GlArmLive,
     win: &mut WindowGpu,
@@ -387,9 +347,6 @@ pub(crate) fn encode_tail(
     t: GlTailIn<'_>,
 ) -> Result<GlTailOut, String> {
     let (w, h) = t.dims;
-    // 1. Stage the streams: `Some` count iff the stream uploaded. The fx
-    //    residency first: without both atlases and the palette no fx stream
-    //    is staged (fail closed, by name).
     let stage_started = aterm_time::Instant::now();
     let drawing = t.inst.fx_instances() > 0;
     let (fx_atlas_bytes, fx_palette) = match live.sync_fx(&t.fx.atlas, drawing).and_then(|b| {
@@ -419,9 +376,6 @@ pub(crate) fn encode_tail(
         }
     }
     let stage_ns = u64::try_from(stage_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    // 2. The plan. The image plane's CPU-side texels are retained at build
-    //    time while armed (`ImagePlane::gl_texels`); a plane built before
-    //    arming withholds its draws by name rather than draw stale texels.
     let image_plane = win
         .image_plane
         .as_ref()
@@ -446,7 +400,6 @@ pub(crate) fn encode_tail(
             ablation: t.ablation,
         },
     );
-    // 3. The offscreen, reused at the same dims.
     let recreate = win
         .gl_offscreen
         .as_ref()
@@ -456,7 +409,6 @@ pub(crate) fn encode_tail(
         let tex = live.dev.texture_2d(format, w, h, alias)?;
         win.gl_offscreen = Some(GlOffscreen { tex, w, h });
     }
-    // 4. Load and scissor, shared with the other arms.
     let (load0, scissor) = frame_load_and_scissor(
         t.scope,
         recreate,
@@ -472,7 +424,6 @@ pub(crate) fn encode_tail(
         scissor.map(|(sx, sy, sw, sh)| [sx, sy, sx + sw, sy + sh]),
         (w, h),
     );
-    // 5. Residency: the uniform block, a program per drawn row, the atlases.
     live.ensure_uniform(w, h, t.text_blend)?;
     let mut uniform_binding: Option<u32> = None;
     for item in plan.iter() {
@@ -488,8 +439,6 @@ pub(crate) fn encode_tail(
         }
         live.ensure_pipeline(row)?;
     }
-    // The sprites' textures on this device, held for the frame (a sprite's
-    // upload is per device; see `SpriteTex::gl_atlas`).
     let mut sprites: [Option<Arc<GlTexture>>; DRAW_ATLAS_COUNT] = std::array::from_fn(|_| None);
     for item in plan.iter() {
         let Some(a) = item.atlas else { continue };
@@ -534,7 +483,6 @@ pub(crate) fn encode_tail(
                 sprites[a as usize] = Some(sprite.gl_atlas(&live.dev)?);
                 continue;
             }
-            // Synced with the palette in step 1.
             DrawAtlas::Fx => continue,
             DrawAtlas::Image => {
                 let p = win
@@ -567,7 +515,6 @@ pub(crate) fn encode_tail(
             bytes,
         )?;
     }
-    // 6. The rig, borrowed from the residency, and the shared walk.
     let live = &*live;
     let off = &win.gl_offscreen.as_ref().expect("ensured above").tex;
     let rig = GlFrameRig {
@@ -644,18 +591,14 @@ impl SpriteTex {
 }
 
 impl GpuRenderer {
-    /// Arm the GL arm for this renderer's readback frames. Staged: until the
-    /// Linux flip a renderer is unarmed unless a test arms it; presents stay on
-    /// wgpu either way.
+    /// Arm the GL arm for this renderer's readback frames.
     #[doc(hidden)]
     #[inline]
     pub const fn arm_gl(&mut self) {
         self.gl_armed = true;
     }
 
-    /// Disarm the GL arm, for a suite that reads the wgpu offscreen or drives
-    /// wgpu-typed seams (the Linux twin of `disarm_metal_for_oracle`). Only a
-    /// build carrying the oracle arm has it.
+    /// Disarm the GL arm for oracle comparisons.
     #[doc(hidden)]
     #[cfg(wgpu_arm)]
     #[inline]
@@ -670,9 +613,7 @@ impl GpuRenderer {
         self.last_frame_arm_gl
     }
 
-    /// Mint the GL arm on first use; `false` (with the cause kept) disarms.
-    /// In a browser the arm lives on the canvas's context, the one the
-    /// context was made for.
+    /// Mint the GL arm on first use; `false` disarms.
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn gl_arm_ready(&mut self) -> bool {
         if !self.gl_armed {
@@ -695,12 +636,7 @@ impl GpuRenderer {
         }
     }
 
-    /// Mint the GL arm on first use; `false` (with the cause kept) disarms.
-    ///
-    /// Once a window has attached (`gl_window_system`), the arm lives on that
-    /// window system's display; an arm minted headless before it is dropped
-    /// and minted again there (its window resources re-mint on their next
-    /// use, each checking its device).
+    /// Mint the GL arm on first use; `false` disarms.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn gl_arm_ready(&mut self) -> bool {
         if !self.gl_armed {
@@ -715,10 +651,6 @@ impl GpuRenderer {
         }
         match GlArmLive::new(want) {
             Ok(live) => {
-                // The context's facts came from a headless probe, whose
-                // device can be another GPU than the window system's (a
-                // hybrid laptop): the device that renders answers them from
-                // its mint on. The oracle build's facts are wgpu's.
                 #[cfg(not(wgpu_arm))]
                 {
                     let caps = live.dev.caps();
@@ -753,8 +685,7 @@ impl GpuRenderer {
         crate::device_layer::gl_try_read_back(&live.dev, &off.tex, width, height)
     }
 
-    /// The sub-row glide on the GL offscreen (the readback path): the band
-    /// shift, then the incoming-row apron over the exposed strip.
+    /// Shift the GL offscreen band for sub-row glide and paint the apron strip.
     pub(crate) fn gl_shift_offscreen_band(&mut self, win: &mut WindowGpu, input: &RenderInput) {
         let Some(h) = win.gl_offscreen.as_ref().map(|o| o.h) else {
             return;
@@ -770,12 +701,7 @@ impl GpuRenderer {
         self.gl_shift_offscreen_band_px(win, y0, y1, i64::from(input.scroll_frac_px), apron);
     }
 
-    /// Shift `[y0, y1)` of the GL offscreen by the signed `delta` device pixels
-    /// (positive = up): the shared `BandShift` plan as two staged copies through
-    /// the resident scratch, then `apron`'s rows over the exposed strip. Shared
-    /// by the sub-row glide and the whole-row scroll rescue
-    /// (`shift_offscreen_rows`), as `shift_offscreen_band_px` is on the wgpu
-    /// arm. A failure leaves the band unshifted with one named note.
+    /// Shift `[y0, y1)` of the GL offscreen by signed `delta` device pixels.
     pub(crate) fn gl_shift_offscreen_band_px(
         &mut self,
         win: &mut WindowGpu,
@@ -870,13 +796,11 @@ impl GpuRenderer {
                 "armed scroll shift failed ({e}); band left unshifted"
             ));
         }
-        // The shift moves the offscreen outside any scissor.
         note_offscreen_written(win, None, (w, h));
     }
 }
 
-/// The armed window's resident settings card on the GL arm, the twin of
-/// `MetalTrayCard`: re-uploaded only when the card's bytes change.
+/// The armed window's resident settings card on the GL arm.
 pub(crate) struct GlTrayCard {
     pub(crate) tex: GlTexture,
     pub(crate) w: u32,
@@ -905,10 +829,7 @@ impl GpuRenderer {
         Ok(buf)
     }
 
-    /// Armed arm of `composite_bloom_in_place`: the glow extract into a
-    /// half-resolution target, then the screen composite back onto the
-    /// offscreen's Unorm view under the same scissor, fx clip and written-rect
-    /// footprint as the wgpu and Metal arms.
+    /// Composite bloom onto the GL offscreen in place.
     pub(crate) fn gl_composite_bloom_in_place(
         &mut self,
         win: &mut WindowGpu,
@@ -956,8 +877,6 @@ impl GpuRenderer {
                 _pad: [0.0; 3],
             }),
         )?;
-        // The composite scissor: `encode_bloom_halo`'s spelling, clip and
-        // collapse arms included (the Metal arm's twin).
         let clip = input.fx_clip.map(|(cx0, cy0, cx1, cy1)| {
             [
                 u32::from(cx0),
@@ -1039,9 +958,7 @@ impl GpuRenderer {
                 composite(&mut frame, Some((sx0, sy0, sx1 - sx0, sy1 - sy0)))?;
                 Some([sx0, sy0, sx1, sy1])
             }
-            // An empty pane intersection paints nothing: the empty footprint.
             (Some(_), Some(_)) => Some([0, 0, 0, 0]),
-            // Collapse fallback: the unscissored draw covers the whole target.
             (Some(_), None) | (None, _) => {
                 composite(&mut frame, None)?;
                 None
@@ -1052,8 +969,7 @@ impl GpuRenderer {
         Ok(())
     }
 
-    /// Armed arm of `shimmer_offscreen_in_place`: stage-copy the sample rect,
-    /// then the scissored refract in place on the GL offscreen.
+    /// Apply shimmer refraction onto the GL offscreen in place.
     pub(crate) fn gl_shimmer_in_place(
         &mut self,
         win: &mut WindowGpu,
@@ -1135,8 +1051,7 @@ impl GpuRenderer {
         Ok(())
     }
 
-    /// Armed arm of `draw_tray_into_offscreen`: the resident card composites
-    /// straight-alpha source-over onto the GL offscreen's Unorm view.
+    /// Composite the resident tray card onto the GL offscreen.
     pub(crate) fn gl_tray_into_offscreen(
         &mut self,
         win: &mut WindowGpu,
@@ -1151,7 +1066,6 @@ impl GpuRenderer {
             .as_ref()
             .map(|o| (o.w, o.h))
             .ok_or("armed frame lacks its GL offscreen")?;
-        // The card composites outside any encode scissor.
         note_offscreen_written(win, None, (fw, fh));
         let live = self.gl_arm.as_mut().ok_or("the GL arm is not minted")?;
         live.ensure_pipeline(Pipeline::Tray)?;
@@ -1215,9 +1129,7 @@ mod tests {
 
     /// The frame palette's texture is the layout `cell.glsl`'s `fx_ink` reads:
     /// entry `j` at `(j % FX_PALETTE_ROW, j / FX_PALETTE_ROW)`, holding the
-    /// word's little-endian bytes, over whole rows and a partial last row. A
-    /// palette that fits reuses the texture; a longer one re-mints it at a
-    /// power-of-two row count.
+    /// word's little-endian bytes, over whole rows and a partial last row.
     #[test]
     fn the_fx_palette_texture_holds_entry_j_at_its_texel() {
         let dev = crate::gl::test_device();

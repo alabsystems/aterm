@@ -14,6 +14,7 @@ use crate::store::Layout;
 pub const HOOK_BASENAME: &str = "00-atpkg";
 
 /// The environment variables whose union (any one non-empty) says a process runs inside an
+/// aterm session, where the managed agent programs lead.
 pub const AGENTS_MARKERS: &[&str] = &["ATERM_AGENTS_DIR", "ATERM_CHILD", "ATERM_SESSION_ID"];
 
 /// [`AGENTS_MARKERS`] formatted as a single POSIX parameter expansion word.
@@ -177,16 +178,19 @@ pub(crate) fn hook_is_current(dest: &Path, content: &str) -> bool {
 }
 
 /// What stood at a hook's destination before this pass replaced it, so the publish phase
+/// can be undone as a whole.
 enum Prev {
     /// Nothing did: an unwind takes the file this pass laid back out.
     Absent,
     /// The previous pass's hook — a regular file — moved aside to this path.
     Saved(std::path::PathBuf),
     /// Something that is not a regular file (a directory, a link, a device), left where it
+    /// is: the rename that follows fails on it, and an unwind has nothing to put back.
     Foreign,
 }
 
 /// Move the regular file standing at `dest` out of the way, so a later failure in the
+/// publish loop can put it back.
 fn move_aside(dest: &Path) -> Prev {
     let meta = match fs::symlink_metadata(dest) {
         Ok(meta) => meta,
@@ -208,6 +212,7 @@ fn move_aside(dest: &Path) -> Prev {
 }
 
 /// Put back what stood at `dest` before this pass replaced it — or take out the file it laid
+/// where nothing stood.
 fn restore_prev(dest: &Path, prev: Prev) {
     match prev {
         Prev::Absent => {
@@ -387,12 +392,19 @@ pub(crate) fn store_aliases_absent(exe: &Path) -> Vec<std::path::PathBuf> {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum HookPass {
     /// `~/.aterm` and `~/.aterm/shell.d` were hardened and the hook files are on disk as
+    /// rendered — written, or already byte-identical and left alone ([`write_hooks`]).
     Rewritten(Vec<(&'static str, RcOutcome)>),
     /// The directories were hardened, a hook file could not be written, and the rc step was
+    /// skipped: a block naming a missing hook sources nothing and no later pass rewrites it.
     HooksNotWritten,
     /// `$HOME` is unknown, or `~/.aterm` / `~/.aterm/shell.d` could not be made the
+    /// user's own `0700` directory ([`ensure_private_dir`] refuses a symlink, a foreign
+    /// owner or a group/other-writable mode): nothing was touched, no rc was read.
     NotHardened,
     /// The unattended pass ran from an app bundle that is not the release `aterm.app` (a dev
+    /// bundle from `ship dev-app`, a renamed copy) and wrote nothing: the shell hooks, rc
+    /// blocks and command links are the release's to lay ([`in_release_bundle`]), and a
+    /// stale dev bundle would lay stale hooks.
     NotReleaseBundle,
 }
 
@@ -415,16 +427,23 @@ pub enum RcOutcome {
     /// atpkg's block was appended to an rc that had never carried it.
     Appended,
     /// The login shell's rc did not exist, and atpkg created it holding only its block
+    /// ([`login_rc`]); no other rc is ever created.
     Created,
     /// atpkg's block was laid again in an rc the user had deleted it from (recorded in
+    /// `RC_LEDGER`, no marker present), or the login shell's rc atpkg created was made again
+    /// after the user deleted the file.
     RelaidOverOptOut,
     /// The user had deleted atpkg's block (or the login shell's rc atpkg created) and this
+    /// pass left it exactly as it was.
     OptOutKept,
     /// The rc resolves under a folder macOS guards with a consent dialog, so it was not
+    /// even opened (the consent fence in `ensure_rc_sources_hooks`).
     ConsentFenced,
     /// The rc exists but is not something atpkg edits: a dangling link, not a regular
+    /// file, or not UTF-8.
     Unreadable,
     /// The rewrite was attempted and failed; the rc is unchanged (the rc or its directory
+    /// refused the write, or the temp could not be created exclusively beside it).
     WriteFailed,
 }
 
@@ -453,6 +472,7 @@ pub(crate) enum RcWiring {
 }
 
 /// The pass, the rc it may create read from `home` by `creates` ([`account_login_rc`], or
+/// none).
 fn refresh_with(
     layout: &Layout,
     wiring: RcWiring,
@@ -472,6 +492,9 @@ fn refresh_with(
 }
 
 /// The development seam ([`aterm_types::dev_seam!`]) naming the login shell (a path, as the
+/// account record spells it) a development build reads in place of the account record's:
+/// a test's `chsh`, so a spawned pass can be given a login shell its host account does not
+/// have.
 pub const LOGIN_SHELL_SEAM: &str = "ATPKG_LOGIN_SHELL";
 
 /// The account's login shell from the system account record.
@@ -524,9 +547,11 @@ pub fn login_rc(shell: &str, home: &Path, xdg_config: Option<&Path>) -> Option<&
 }
 
 /// Whether the hooks pass completes a store's argv0 aliases ([`heal_store_aliases`]): off
+/// macOS only.
 pub(crate) const HEALS_STORE: bool = cfg!(unix) && !cfg!(target_os = "macos");
 
 /// [`refresh_with`] as the executable at `exe` (canonical) runs it, for the account whose
+/// home is `home`, healing a store when `heals_store` ([`HEALS_STORE`]).
 fn refresh_as(
     layout: &Layout,
     wiring: RcWiring,
@@ -583,6 +608,9 @@ pub(crate) fn canonical(path: &Path) -> Option<std::path::PathBuf> {
 }
 
 /// [`pass_at`] as the executable at `exe` runs it: the unattended pass
+/// ([`RcWiring::HonorOptOut`]) from a bundle that is not the release `aterm.app` writes
+/// nothing ([`HookPass::NotReleaseBundle`]); the asked-for pass ([`RcWiring::Rewire`],
+/// `atpkg repair`) runs from anywhere.
 fn pass_as(
     layout: &Layout,
     home: &Path,
@@ -649,12 +677,14 @@ fn refresh_at(
 }
 
 /// The markers bounding atpkg's block in a user's shell rc, so the block is found, refreshed
+/// and removed exactly, never matched by content.
 #[cfg(unix)]
 pub(crate) const RC_BEGIN: &str = "# >>> atpkg shell integration >>>";
 #[cfg(unix)]
 pub(crate) const RC_END: &str = "# <<< atpkg shell integration <<<";
 
 /// The rc files atpkg wires: each row is a path relative to `$HOME` and the `shell.d` hook
+/// it sources.
 #[cfg(unix)]
 pub(crate) const RC_FILES: [(&str, &str); 4] = [
     (".zshrc", "00-atpkg.zsh"),
@@ -673,6 +703,7 @@ fn rc_ledger_path(home: &Path) -> std::path::PathBuf {
 }
 
 /// The recorded rc paths; empty when the ledger is absent or unreadable, which is what a
+/// fresh home is.
 #[cfg(unix)]
 fn read_rc_ledger(home: &Path) -> std::collections::BTreeSet<String> {
     fs::read_to_string(rc_ledger_path(home))
@@ -686,7 +717,7 @@ fn read_rc_ledger(home: &Path) -> std::collections::BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// Record `real` as wired, best-effort (0600, temp + rename). Already recorded means no
+/// Record `real` as wired, best-effort (0600, temp + rename).
 #[cfg(unix)]
 fn record_rc_wired(home: &Path, real: &Path, ledger: &mut std::collections::BTreeSet<String>) {
     let entry = real.to_string_lossy().into_owned();
@@ -818,6 +849,8 @@ fn rc_block(home: &Path, hook: &str) -> String {
 }
 
 /// Where the absent login rc `rc` would be created: its directory resolved (a `~/.config`
+/// that is a link counts as its target) and the file name joined on, so the consent fence
+/// and the ledger read the path the file will have.
 #[cfg(unix)]
 fn login_rc_target(home: &Path, rc: &str) -> Option<std::path::PathBuf> {
     let path = home.join(rc);
@@ -827,6 +860,7 @@ fn login_rc_target(home: &Path, rc: &str) -> Option<std::path::PathBuf> {
 }
 
 /// What a pass does about the absent login rc `rc` ([`login_rc`]); `None` when it can be
+/// neither created nor reported (its directory is missing).
 #[cfg(unix)]
 fn create_login_rc(
     home: &Path,
@@ -883,6 +917,8 @@ pub(crate) fn absent_login_rc(home: &Path, rc: &str) -> Option<RcState> {
 }
 
 /// The bash login profiles `tools/install.sh`'s `path_block_rc_target` can elect that atpkg
+/// has no row for, relative to `$HOME`: login bash reads the first of `~/.bash_profile`,
+/// `~/.bash_login`, `~/.profile` that exists, and these are the fall-through.
 #[cfg(unix)]
 pub(crate) const INSTALL_SH_PROFILES: [&str; 2] = [".bash_login", ".profile"];
 
@@ -893,16 +929,21 @@ pub(crate) enum RcState {
     /// The rc carries atpkg's marker block ([`RC_BEGIN`]).
     Wired,
     /// The rc sources `~/.aterm/shell.d` through a line that is NOT this block: the PATH
+    /// block `aterm pkg shell-setup --path` writes ([`crate::selfsetup::PATH_BLOCK_START`]),
+    /// or a line the user wrote.
     SourcedElsewhere,
     /// atpkg wired this rc once ([`RC_LEDGER`]) and the block is gone: the user opted out.
     OptedOut,
     /// The rc exists, no [`RC_LEDGER`] entry records atpkg wiring it, and nothing else
+    /// sources `shell.d` from it: no pass has run since it appeared.
     Unwired,
     /// The rc resolves under a folder macOS guards with a consent dialog, so no pass opens it
+    /// ([`ensure_rc_sources_hooks`]'s consent fence), and neither does this report.
     ConsentFenced,
 }
 
 /// How [`rc_wiring`] resolves one rc: the steps [`ensure_rc_sources_hooks`] takes before it
+/// would write, so the report never describes a file the pass would treat differently.
 #[cfg(unix)]
 enum RcRead {
     /// The resolved target and its contents.
@@ -971,6 +1012,8 @@ pub(crate) fn rc_files_read() -> impl Iterator<Item = &'static str> {
 }
 
 /// Whether `rc` sources `~/.aterm/shell.d` through a line other than atpkg's block: any
+/// non-comment line naming a path under `/.aterm/shell.d/`, as `tools/install.sh`'s
+/// `wire_shell_path` writes or a user may by hand.
 #[cfg(unix)]
 fn sources_shell_d(rc: &str) -> bool {
     rc.lines()
@@ -979,6 +1022,7 @@ fn sources_shell_d(rc: &str) -> bool {
 }
 
 /// Put `aterm`, `atpkg` and `amacs` in `~/.local/bin` when we are running from an app
+/// bundle ([`COMMAND_LINKS`]).
 #[cfg(unix)]
 fn ensure_command_links(home: &Path) {
     let Ok(exe) = std::env::current_exe() else {
@@ -991,6 +1035,9 @@ fn ensure_command_links(home: &Path) {
 }
 
 /// Whether `path` lies inside a release-named `aterm.app` bundle's `Contents/MacOS`: the one
+/// spelling of "ours" for the unattended writers of shared user state, both for an existing
+/// command link's target and for the executable that writes the links
+/// ([`ensure_command_links`]) or, unattended, the shell hooks ([`refresh`]).
 fn in_release_bundle(path: &Path) -> bool {
     path.to_string_lossy()
         .contains("/aterm.app/Contents/MacOS/")
@@ -1041,6 +1088,9 @@ pub(crate) fn ensure_command_links_from(home: &Path, exe: &Path) {
 }
 
 /// What the command-link pass does at `link` for its `target` (`name` one of
+/// [`COMMAND_LINKS`]), `aterm_settled` whether `~/.local/bin/aterm` names this bundle's
+/// `aterm` once the pass has written it: `None` leaves it; `Some(None)` lays a link where
+/// nothing stands; `Some(Some(old))` re-points a link to `old`.
 #[cfg(unix)]
 fn link_act(
     link: &Path,
@@ -1104,10 +1154,13 @@ pub(crate) fn command_link_check(exe: &Path) -> Result<&Path, &'static str> {
 }
 
 /// Names an older install may have left in `~/.local/bin` that no pass links:
+/// `aterm ctl` replaces `aterm-ctl`.
 #[cfg(unix)]
 const RETIRED_COMMANDS: [&str; 1] = ["aterm-ctl"];
 
 /// The names this platform's install links into `~/.local/bin`: on macOS the app lays each
+/// of [`COMMAND_LINKS`]; elsewhere `tools/install.sh` lays `aterm` alone, and there only when
+/// `ATERM_BIN_DIR` does not name another folder.
 #[cfg(all(unix, target_os = "macos"))]
 const INSTALLED_COMMANDS: &[&str] = &COMMAND_LINKS;
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -1148,6 +1201,9 @@ fn installed_app_dirs(home: Option<std::path::PathBuf>) -> [Option<std::path::Pa
 }
 
 /// The `atpkg` of the first `aterm.app` in `apps_dirs` that would do the job: its folder
+/// resolved (a link onto a mounted volume would refuse it), and the `atpkg` name kept,
+/// since in the bundle it is an alias link to `aterm` and the one binary picks its tool by
+/// that name.
 #[cfg(all(unix, target_os = "macos"))]
 fn installed_app_atpkg(apps_dirs: &[Option<std::path::PathBuf>]) -> Option<std::path::PathBuf> {
     apps_dirs
@@ -1264,6 +1320,7 @@ pub(crate) fn move_aside_copied_commands_at(
 }
 
 /// Give the file at `from` the name `aside`, then put a link to `link_to` at `from` (or leave
+/// nothing there).
 #[cfg(unix)]
 fn rename_file_aside(from: &Path, aside: &Path, link_to: Option<&Path>) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt as _;
@@ -1351,11 +1408,13 @@ pub(crate) fn fish_quote(p: &Path) -> String {
 }
 
 /// Render `bin_dir` for a single-quoted PowerShell string literal: only the single quote is
+/// special there (doubled to escape), so a Windows path's backslashes pass through literally.
 fn ps_quote(bin_dir: &Path) -> String {
     bin_dir.to_string_lossy().replace('\'', "''")
 }
 
 /// Write `content` to `dest` atomically (temp `0600` + rename), so a reader never sees a
+/// half-written hook.
 #[cfg(unix)]
 fn atomic_write(dest: &Path, content: &str) -> io::Result<()> {
     let tmp = stage_hook(dest, content)?;
@@ -1365,6 +1424,7 @@ fn atomic_write(dest: &Path, content: &str) -> io::Result<()> {
 }
 
 /// Write `content` to `dest`'s temp sibling, born `0600` and hardened, and hand back the
+/// temp path for the caller to rename into place.
 fn stage_hook(dest: &Path, content: &str) -> io::Result<std::path::PathBuf> {
     let name = dest
         .file_name()
@@ -1395,6 +1455,7 @@ mod tests {
     use std::path::PathBuf;
 
     /// The four files `write_hooks` lays are exactly what `hook_for_shell` names per shell,
+    /// and `hook_file` answers only for a hook that exists as a regular file.
     #[cfg(unix)]
     #[test]
     fn hook_for_shell_and_hook_file_read_the_files_write_hooks_lays() {
@@ -1488,6 +1549,8 @@ mod tests {
     }
 
     /// The opt-out the block documents lasts: a recorded rc without the block is left alone
+    /// by every unattended pass, `repair` ([`refresh_rewiring_rc`]) writes it back, and after
+    /// that the block can be deleted for good again.
     #[cfg(unix)]
     #[test]
     fn a_deleted_rc_block_stays_deleted_and_repair_is_the_way_back() {
@@ -1545,6 +1608,7 @@ mod tests {
     }
 
     /// The one file a pass creates (design init-system §4.2): the login shell's absent rc,
+    /// holding only the block, private, recorded.
     #[cfg(unix)]
     #[test]
     fn the_login_shell_s_absent_rc_is_created_and_no_other_shell_gains_one() {
@@ -1604,6 +1668,7 @@ mod tests {
     }
 
     /// The login rc is selfsetup's `rc_target` election, and only a file atpkg wires: a
+    /// shell it does not know, and an election that picks a file no row names, get nothing.
     #[cfg(unix)]
     #[test]
     fn the_login_rc_is_the_rc_target_election_s_and_only_a_row() {
@@ -1635,6 +1700,7 @@ mod tests {
     }
 
     /// The created rc keeps the consent fence: a login rc whose directory resolves under a
+    /// guarded folder is neither created nor opened, and a missing directory is never made.
     #[cfg(unix)]
     #[test]
     fn a_login_rc_under_a_guarded_folder_or_with_no_directory_is_not_created() {
@@ -1659,6 +1725,7 @@ mod tests {
     }
 
     /// A machine wired before the ledger existed opts out on its first deletion: a pass
+    /// records an rc it finds already wired, rewriting nothing.
     #[cfg(unix)]
     #[test]
     fn an_rc_wired_before_the_ledger_existed_is_recorded_by_the_next_pass() {
@@ -1699,6 +1766,8 @@ mod tests {
     }
 
     /// The `shell` a real-shell test here runs, as `aterm_spec::host::test_shell` finds
+    /// it (the resolver aterm-shell-integration's live tests use too), or `None` with
+    /// `shell` added to `absent`.
     #[cfg(unix)]
     fn real_shell<'a>(shell: &'a str, absent: &mut Vec<&'a str>) -> Option<PathBuf> {
         let found = aterm_spec::host::test_shell(shell);
@@ -1792,6 +1861,7 @@ mod tests {
     }
 
     /// The block's line leaves `$?` = 0 when the hook is missing, replayed in the real shells
+    /// over a `shell.d` that holds no hook.
     #[cfg(unix)]
     #[test]
     fn the_rc_line_is_status_neutral_when_the_hook_is_missing() {
@@ -1852,6 +1922,7 @@ mod tests {
     }
 
     /// A pass whose hook write failed wires no rc: a block naming a missing hook sources
+    /// nothing and is never rewritten.
     #[cfg(unix)]
     #[test]
     fn a_failed_hook_write_wires_no_rc_block() {
@@ -1887,6 +1958,7 @@ mod tests {
     }
 
     /// A symlinked rc (stow, yadm/chezmoi, home-manager) gets the block written through the
+    /// link and stays a link with its mode; a dangling link is left alone.
     #[cfg(unix)]
     #[test]
     fn rc_wiring_writes_through_a_symlinked_rc_and_keeps_it_a_link_and_its_mode() {
@@ -1966,6 +2038,8 @@ mod tests {
     }
 
     /// A bash login shell reads `~/.bash_profile`, not `~/.bashrc`: a home with
+    /// `.bash_profile` gets the block, sourcing the same `00-atpkg.bash`; a home with both
+    /// gets it in both; and `.bashrc` is never invented beside a lone `.bash_profile`.
     #[cfg(unix)]
     #[test]
     fn rc_wiring_reaches_a_bash_login_shell_through_an_existing_bash_profile() {
@@ -2009,6 +2083,8 @@ mod tests {
     }
 
     /// The consent fence: an rc that resolves under a protected root (through a symlinked rc,
+    /// or a symlinked parent of a regular rc) is left exactly as it was, while an rc beside
+    /// it that resolves somewhere ordinary is still wired.
     #[cfg(unix)]
     #[test]
     fn rc_wiring_never_opens_an_rc_that_resolves_under_a_protected_folder() {
@@ -2057,6 +2133,7 @@ mod tests {
     }
 
     /// The same fence for the command links: a `~/.local` linked under a protected root is
+    /// refused.
     #[cfg(unix)]
     #[test]
     fn command_links_stay_out_of_a_protected_local_bin() {
@@ -2079,6 +2156,9 @@ mod tests {
     }
 
     /// The PATH names are the release bundle's to write: from the dev bundle nothing is
+    /// planted and a release link is left alone; from the release bundle an absent link is
+    /// planted, a link into an older release location is repointed, and a link
+    /// `ship dev-app` aimed at the dev bundle is left alone.
     #[cfg(unix)]
     #[test]
     fn command_links_are_written_only_from_the_release_bundle() {
@@ -2151,6 +2231,7 @@ mod tests {
     }
 
     /// `amacs` JOINS THE COMMAND LINKS (`docs/DESIGN-amacs-2026-10-19.md` §8.1), owned as
+    /// `aterm` is.
     #[cfg(unix)]
     #[test]
     fn command_links_lay_amacs_on_macos() {
@@ -2247,7 +2328,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// THE STORE SELF-HEAL (`docs/DESIGN-amacs-2026-10-19.md` §8.1). A store install.sh laid
+    /// THE STORE SELF-HEAL (`docs/DESIGN-amacs-2026-10-19.md` §8.1).
     #[cfg(unix)]
     #[test]
     fn store_aliases_self_heal_lays_missing_and_never_replaces_a_file() {
@@ -2321,6 +2402,8 @@ mod tests {
     }
 
     /// THE HOOKS PASS RUNS THE HEAL, AND FIRST: through the pass every caller takes
+    /// ([`refresh_as`], which `refresh` and `refresh_rewiring_rc` reach), a store's missing
+    /// alias is laid even with no $HOME, where the pass then hardens and writes nothing.
     #[cfg(unix)]
     #[test]
     fn the_hooks_pass_heals_a_store_before_it_needs_a_home() {
@@ -2364,6 +2447,7 @@ mod tests {
     }
 
     /// A copied binary at a link path stays until the owner asks: the unattended pass leaves
+    /// it byte-identical and [`copied_command_links`] names it for `doctor`.
     #[cfg(unix)]
     #[test]
     fn a_copied_command_is_left_alone_unattended_and_moved_aside_only_by_repair() {
@@ -2461,6 +2545,7 @@ mod tests {
     }
 
     /// A move that cannot finish changes nothing: with the temporary link's name taken by a
+    /// directory, the file keeps its name and no second name is left behind.
     #[cfg(unix)]
     #[test]
     fn a_move_aside_that_cannot_finish_changes_nothing() {
@@ -2489,6 +2574,7 @@ mod tests {
     }
 
     /// A retired name is moved with nothing linked in its place; when its old name cannot be
+    /// removed (a read-only folder), the second name is dropped and the file stays put.
     #[cfg(unix)]
     #[test]
     fn a_retired_name_that_cannot_leave_its_folder_stays_put() {
@@ -2532,6 +2618,8 @@ mod tests {
     }
 
     /// The remedy for a copied command on macOS names the installed app's own `atpkg`:
+    /// the alias, from the first app it would act from (never a translocated one), quoted
+    /// as one shell word.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_remedy_names_the_installed_app_it_would_act_from() {
@@ -2584,6 +2672,7 @@ mod tests {
     }
 
     /// The links are laid only from a bundle that stays: not a translocated copy and
+    /// not one run from a mounted disk image or removable disk.
     #[cfg(all(unix, target_os = "macos"))]
     #[test]
     fn links_come_only_from_a_bundle_that_stays_and_the_remedy_is_one_word() {
@@ -2603,6 +2692,8 @@ mod tests {
     }
 
     /// The shell hooks are the release bundle's to lay unattended: from a dev bundle the
+    /// unattended pass writes nothing, from the release bundle it writes, and `repair` writes
+    /// from either.
     #[cfg(unix)]
     #[test]
     fn an_unattended_hooks_pass_from_a_dev_bundle_writes_nothing() {
@@ -2746,6 +2837,7 @@ mod tests {
     }
 
     /// The four hooks move as a set, or not at all: a staging failure on the third publishes
+    /// none.
     #[cfg(unix)]
     #[test]
     fn a_failed_hook_write_replaces_none_of_the_dialects() {
@@ -2779,6 +2871,7 @@ mod tests {
     }
 
     /// No temp is left behind on any error arm, here a failed rename onto a directory after
+    /// the temp was written and hardened.
     #[cfg(unix)]
     #[test]
     fn a_hook_write_that_fails_leaves_no_temp_behind() {
@@ -2809,6 +2902,8 @@ mod tests {
     }
 
     /// The publish phase moves as a set too: when the last dialect's rename fails, the three
+    /// already published over a previous pass's hooks are all put back, and neither a temp
+    /// nor a saved predecessor is left.
     #[cfg(unix)]
     #[test]
     fn a_failed_publish_puts_back_every_dialect_it_had_already_replaced() {
@@ -2889,6 +2984,9 @@ mod tests {
     }
 
     /// The fish quoter judged by fish: the hook body, rendered for a bin, agents and
+    /// reroute dir under a path holding every character fish's double quotes treat
+    /// specially (`\\`, `"`, `$`) and the ones they do not (a backtick, a space), is
+    /// sourced by a real fish, which must name each directory byte for byte.
     #[cfg(unix)]
     #[test]
     fn the_fish_hook_names_a_hostile_path_verbatim_in_a_real_fish() {
@@ -3062,6 +3160,7 @@ mod tests {
     }
 
     /// A hook that is already current is never rewritten (same inode), while one whose bytes
+    /// or mode drifted is.
     #[cfg(unix)]
     #[test]
     fn write_hooks_leaves_identical_hooks_untouched() {
@@ -3103,7 +3202,7 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
-    /// THE MEASURED FAILURE, REPLAYED IN REAL SHELLS (module doc). The inherited PATH is the
+    /// THE MEASURED FAILURE, REPLAYED IN REAL SHELLS (module doc).
     #[cfg(unix)]
     #[test]
     fn every_hook_dialect_orders_path_in_its_real_shell() {

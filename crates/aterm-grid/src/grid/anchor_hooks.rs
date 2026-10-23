@@ -2,13 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The grid's side of the holder fence: its span anchors
-//! ([`AnchorSet`](crate::AnchorSet)) applied at the row-motion choke points,
-//! and the row reads the fence makes (a row's fingerprint for a seal, on
-//! the screen or in the ring's history, and the one ink predicate the lay
-//! taint and the lend share).
-//!
-//! Every hook returns on one branch while no anchor lives.
+//! Grid span-anchor hooks and row fingerprinting ([`AnchorSet`](crate::AnchorSet)).
 
 use aterm_hash::FxHasher;
 use std::hash::Hasher;
@@ -34,9 +28,7 @@ impl Grid {
         &mut self.storage.cursor_state.presentation.anchors
     }
 
-    /// Install a restored set (a checkpoint's): its rows were keyed under
-    /// absolute row counter `counter`, so a grid that numbers its rows
-    /// otherwise marks them lost, and one below the oldest row clamps to it.
+    /// Install a restored set (a checkpoint's).
     pub fn install_anchors(&mut self, set: AnchorSet, counter: u64) {
         self.storage.presentation.anchors = set;
         if self.storage.absolute_row_counter != counter {
@@ -45,10 +37,7 @@ impl Grid {
         self.anchors_clamp_to_oldest();
     }
 
-    /// Screen rows `top..=bottom` moved by `delta`: carry the anchors in that
-    /// band (see [`AnchorSet`](crate::AnchorSet)). The screen's absolute base
-    /// is read here, before or after the move alike: a band move adds nothing
-    /// to history.
+    /// Screen rows `top..=bottom` moved by `delta` ([`AnchorSet`]).
     #[inline]
     pub(crate) fn anchors_band_move(&mut self, top: u16, bottom: u16, delta: i64) {
         if self.storage.presentation.anchors.is_empty() {
@@ -67,8 +56,7 @@ impl Grid {
         self.storage.presentation.anchors.splice(at, inserted);
     }
 
-    /// History was discarded (ED 3, `clear_scrollback`): an anchor in it
-    /// clamps to the oldest row left, so a span wholly in it empties.
+    /// History was discarded (ED 3, `clear_scrollback`).
     #[inline]
     pub(crate) fn anchors_clamp_to_oldest(&mut self) {
         if self.storage.presentation.anchors.is_empty() {
@@ -78,8 +66,7 @@ impl Grid {
         self.storage.presentation.anchors.clamp_below(oldest);
     }
 
-    /// Rows moved in a way no anchor rule describes: a rectangle shifted or
-    /// copied across rows (a margined IL/DL or region scroll, DECCRA).
+    /// Rows moved in a way no anchor rule describes.
     #[inline]
     pub(crate) fn lose_anchors(&mut self) {
         self.storage.presentation.anchors.lose();
@@ -91,16 +78,13 @@ impl Grid {
         self.storage.presentation.anchors.lose_renumbered();
     }
 
-    /// History came back onto the screen under its keys (a rows-grow reveal):
-    /// a seal's history rows are writable again.
+    /// History came back onto the screen under its keys (a rows-grow reveal).
     #[inline]
     pub(crate) fn note_rows_rekeyed(&mut self) {
         self.storage.presentation.anchors.note_rekeyed();
     }
 
-    /// [`Self::invalidate_host_coordinates`] for an alt-screen swap: the band
-    /// record is poisoned as for any swap, but this grid's rows did not move,
-    /// so its anchors stay where they are.
+    /// [`Self::invalidate_host_coordinates`] for an alt-screen swap.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -118,18 +102,14 @@ impl Grid {
         }
     }
 
-    /// [`Self::invalidate_host_coordinates`] for a move that keeps every
-    /// retained row's absolute key (a rows-only top-demote: the rows cross
-    /// into history under the keys they had).
+    /// [`Self::invalidate_host_coordinates`] for a move preserving retained rows' absolute keys.
     #[inline]
     pub(crate) fn invalidate_host_coordinates_keeping_rows(&mut self) {
         self.storage.coordinates_invalidated = true;
         self.storage.presentation.poison_row_band_moves();
     }
 
-    /// The live row at absolute `row` (ignoring the reader's scroll): on the
-    /// screen, or in the ring's history. `None` past the screen and for
-    /// history in the tiered store or the lazy buffer.
+    /// The live row at absolute `row` (ignoring the reader's scroll).
     #[must_use]
     pub(crate) fn live_row_at_absolute(&self, row: u64) -> Option<&Row> {
         let base = self.visible_to_absolute(0);
@@ -148,13 +128,7 @@ impl Grid {
         self.storage.ring_history_row(ring - back)
     }
 
-    /// A fingerprint of live screen row `screen_row` (ignoring the reader's
-    /// scroll): every cell's character, colours and flags, the extras behind
-    /// them (a cluster, combining marks, true colours, an underline colour, a
-    /// link, the image tiles over it, wherever the screen keeps each), and the
-    /// row's wrap and size. Equality of these resolved values is subject to a
-    /// 64-bit collision. `None` past the screen or when a required
-    /// complex/RGB overflow value cannot be resolved.
+    /// A fingerprint of live screen row `screen_row` (ignoring the reader's scroll).
     #[must_use]
     pub fn live_row_fingerprint(&self, screen_row: u16) -> Option<u64> {
         let row = self.storage.row_at_screen(screen_row)?;
@@ -206,11 +180,7 @@ impl Grid {
         })
     }
 
-    /// [`Self::live_row_fingerprint`] of the live row at absolute `row`, on
-    /// the screen or in the ring's history: a row that scrolled off keeps its
-    /// value, its extras read where the scroll moved them, through the same
-    /// column cursors the history's line serializer reads them with. `None`
-    /// past the screen and for history the ring no longer holds.
+    /// [`Self::live_row_fingerprint`] of the live row at absolute `row` on screen or in history.
     #[must_use]
     pub fn row_fingerprint_at_absolute(&self, row: u64) -> Option<u64> {
         let base = self.visible_to_absolute(0);
@@ -240,7 +210,6 @@ impl Grid {
             {
                 return None;
             }
-            // Spans are sorted and disjoint: skip those that ended.
             while extras
                 .hyperlinks
                 .get(link)
@@ -248,7 +217,6 @@ impl Grid {
             {
                 link += 1;
             }
-            // Image layers may overlap, and a row holds a few runs at most.
             let mut tiles: Vec<Tile> = extras
                 .images
                 .iter()
@@ -283,11 +251,7 @@ impl Grid {
         })
     }
 
-    /// Whether anything is drawn on the live screen from `(screen_row, col)`
-    /// onward: on that row from `col`, and on every row below. Drawn is
-    /// anything an erased default cell on a single-size row does not show
-    /// ([`cell_inked`], an image over a cell, a double-size row). The holder
-    /// fence's lay taint (O(screen), once per drawer cut).
+    /// Whether anything is drawn on the live screen from `(screen_row, col)` onward.
     #[must_use]
     pub fn has_ink_from(&self, screen_row: u16, col: u16) -> bool {
         let start = if knob(FenceKnob::LayTaintSkipsCursorRow) {
@@ -299,11 +263,7 @@ impl Grid {
             .any(|r| self.screen_row_inked(r, if r == screen_row { col } else { 0 }))
     }
 
-    /// Whether live screen row `screen_row` shows anything from column `from`
-    /// on. A double-size row does, blank or not: whatever is drawn on it
-    /// later shows at its size. A scan that starts on a wide glyph's spacer
-    /// does not read its lead: a cursor there stands past column 0, so the
-    /// lay is the next row.
+    /// Whether live screen row `screen_row` shows anything from column `from` on.
     pub(super) fn screen_row_inked(&self, screen_row: u16, from: u16) -> bool {
         let Some(row) = self.storage.row_at_screen(screen_row) else {
             return false;
@@ -316,8 +276,6 @@ impl Grid {
             .zip(0u16..)
             .skip(usize::from(from))
             .any(|(cell, col)| {
-                // A genuine spacer shows its lead's glyph and colours; only
-                // its own extras (an image tile) are its.
                 let extra = || {
                     cell.has_extras()
                         .then(|| self.storage.cell_extra(screen_row, col))
@@ -331,8 +289,7 @@ impl Grid {
             })
     }
 
-    /// [`Self::screen_row_inked`] of the screen row at absolute `row`, from
-    /// its first column; `false` off the screen.
+    /// [`Self::screen_row_inked`] of the screen row at absolute `row`, from its first column.
     pub(super) fn absolute_row_inked(&self, row: u64) -> bool {
         row.checked_sub(self.visible_to_absolute(0))
             .and_then(|r| u16::try_from(r).ok())
@@ -340,18 +297,11 @@ impl Grid {
     }
 }
 
-/// The flags that draw on a blank cell: a reversed space shows its foreground
-/// colour, an underline or a strikethrough its stroke. (An overline is the
-/// superscript and subscript bits together.)
+/// The flags that draw on a blank cell.
 const DRAWN_ON_BLANK: CellFlags =
     CellFlags(CellFlags::INVERSE.0 | CellFlags::ALL_UNDERLINES.0 | CellFlags::STRIKETHROUGH.0);
 
-/// Whether `cell` (with `extra`, its extras map entry) shows anything an
-/// erased default cell does not: a glyph other than a space, a background
-/// other than the default, a flag that draws on a blank, an overline, or what
-/// its extra paints (an image tile, a combining mark, a link's stroke).
-/// Bold, dim, italic, blink, hidden and a foreground colour draw nothing on a
-/// space. The one ink predicate of the fence's lay taint and the lend.
+/// Whether `cell` (with its `extra` entry) renders anything non-blank.
 #[must_use]
 pub(super) fn cell_inked(cell: &Cell, extra: Option<&CellExtra>) -> bool {
     let flags = cell.flags();
@@ -365,11 +315,7 @@ pub(super) fn cell_inked(cell: &Cell, extra: Option<&CellExtra>) -> bool {
         })
 }
 
-/// A row's fingerprint: its wrap and size, every cell's character, colours
-/// and flags, and what `extra` hashes at every physical column. A spacer's
-/// glyph and colours belong to its lead, but its image layers are its own.
-/// Visiting spacers also advances history's column-keyed cursors past their
-/// entries. `extra` sees the columns in ascending order.
+/// A row's fingerprint.
 fn fingerprint(
     row: &Row,
     mut extra: impl FnMut(u16, &Cell, bool, &mut FxHasher) -> Option<()>,
@@ -381,23 +327,19 @@ fn fingerprint(
         h.write_u16(cell.char_data());
         h.write_u32(cell.colors().0);
         h.write_u16(cell.flags().bits());
-        // Dense complex/RGB rings do not require HAS_EXTRAS. Bit 10 alone
-        // also denotes a protected glyph, so only the row can name a spacer.
         extra(col, cell, row.is_cell_wide_continuation(col), &mut h)?;
     }
     Some(h.finish())
 }
 
-/// A cell's cluster as one tier keeps it: the whole text, or a base scalar
-/// (the screen's dense ring for a lone non-BMP scalar).
+/// A cell's cluster as one tier keeps it.
 enum Cluster<'a> {
     None,
     Text(&'a str),
     Base(char),
 }
 
-/// One image layer over a cell: its paint order, the shared payload's address
-/// (the screen and its history hold the same `Arc`) and its footprint tile.
+/// One image layer over a cell.
 type Tile = ((i32, u32, u32), usize, u16, u16);
 
 /// A cell's extras resolved from whichever tier holds them.
@@ -412,10 +354,7 @@ struct Payload<'a> {
     link: Option<(&'a str, Option<&'a str>)>,
 }
 
-/// Hash a cell's extras in one form whichever tier holds them. A genuine
-/// spacer contributes only its own image layers. Keep those layers in paint
-/// order, including Kitty's per-image and per-placement serials; equal-key
-/// ties retain the reader's order, as the renderer does.
+/// Hash a cell's extras in one form whichever tier holds them.
 fn hash_extras(h: &mut FxHasher, payload: &Payload<'_>, tiles: &mut [Tile], spacer: bool) {
     if !spacer {
         match payload.cluster {
@@ -592,8 +531,6 @@ mod tests {
             "a background is ink"
         );
 
-        // An image tile over a blank cell (an image writes no glyph), on a
-        // row below the cursor and on its own row from the cursor's column.
         let picture = image(1, 2);
         let mut g = Grid::with_scrollback(4, 10, 100);
         g.set_cell_image(3, 4, tile(&picture, 0));
@@ -601,7 +538,6 @@ mod tests {
         assert!(g.has_ink_from(3, 4), "an image at the cursor");
         assert!(!g.has_ink_from(3, 5), "nothing right of it");
 
-        // A combining mark on a space, a linked space.
         let mut g = Grid::with_scrollback(4, 10, 100);
         g.set_cursor(2, 0);
         g.write_char(' ');
@@ -612,7 +548,6 @@ mod tests {
             .set_hyperlink(Some(std::sync::Arc::from("https://example.com")));
         assert!(g.has_ink_from(1, 0), "a linked space");
 
-        // An image tile on a wide glyph's spacer is the spacer's own.
         let mut g = Grid::with_scrollback(4, 10, 100);
         g.set_cursor(2, 0);
         assert!(g.write_wide_char_at_cursor_packed_ecols(
@@ -666,9 +601,6 @@ mod tests {
         assert!(g.visible_to_absolute(0) > absolute, "the row is history");
         assert_eq!(g.row_fingerprint_at_absolute(absolute), on_screen);
 
-        // A genuine wide continuation owns an image independently of its
-        // lead. Replace an existing tile: HAS_EXTRAS and all raw cells stay
-        // the same, so the payload read itself must notice the replacement.
         let mut g = Grid::with_scrollback(4, 10, 100);
         assert!(g.write_wide_char_at_cursor_packed_ecols(
             '界',
@@ -697,9 +629,6 @@ mod tests {
         g.line_feed();
         assert_eq!(g.row_fingerprint_at_absolute(absolute), Some(replaced));
 
-        // Two placements of one shared image overlap at a cell. Putting
-        // the older placement again gives it a fresh serial and draws its
-        // tile last; the Arc/tile multiset and raw cells have not changed.
         let tagged = |cell_col, serial| crate::ImageRef {
             kitty: Some(crate::KittyPlacementTag {
                 image_id: 7,
@@ -753,7 +682,6 @@ mod tests {
         assert_ne!(a, g.live_row_fingerprint(0).unwrap());
         assert_eq!(g.live_row_fingerprint(9), None);
 
-        // Actual fast writes keep the codepoint outside the extras map.
         let mut g = Grid::with_scrollback(4, 10, 100);
         g.write_emoji_autowrap_fast(
             '😀',
@@ -770,7 +698,6 @@ mod tests {
         );
         assert_ne!(g.live_row_fingerprint(0), Some(first), "ring glyph changed");
 
-        // RGB-only bulk/BCE writes also resolve through a dense ring.
         let colors = crate::PackedColors::DEFAULT.with_rgb_fg().with_rgb_bg();
         g.set_cursor(1, 0);
         g.write_char_at_cursor_packed('x', colors, crate::CellFlags::empty());
@@ -838,8 +765,7 @@ mod tests {
         assert_eq!(g.row_fingerprint_at_absolute(absolute), None);
     }
 
-    /// A grid with `history` lines scrolled into history and the screen full
-    /// of numbered lines, the cursor on the last row.
+    /// Grid with `history` lines scrolled off and numbered lines on screen.
     fn numbered(rows: u16, history: usize) -> Grid {
         let mut g = Grid::with_scrollback(rows, 10, 1000);
         for n in 0..history + usize::from(rows) {
@@ -872,7 +798,6 @@ mod tests {
         assert_eq!(g.anchors().row(below_cursor), Some(base + 3));
         assert!(!g.anchors().lost());
 
-        // A span ending before the inserted band owns none of its new blanks.
         let mut g = numbered(4, 0);
         let base = g.visible_to_absolute(0);
         let before = g.anchors_mut().place(base, AnchorRole::Start).unwrap();
@@ -910,7 +835,6 @@ mod tests {
     fn the_archival_scroll_splices_and_an_end_at_the_boundary_stays() {
         let mut g = numbered(8, 2);
         let base = g.visible_to_absolute(0);
-        // The transcript is rows 0..=5, the footer rows 6..=7.
         let end = g.anchors_mut().place(base + 6, AnchorRole::End).unwrap();
         let footer = g.anchors_mut().place(base + 6, AnchorRole::Start).unwrap();
         let inside = g.anchors_mut().place(base + 3, AnchorRole::Start).unwrap();
@@ -979,8 +903,6 @@ mod tests {
         let mut g = numbered(8, 4);
         let base = g.visible_to_absolute(0);
         let id = g.anchors_mut().place(base + 2, AnchorRole::Start).unwrap();
-        // Shrink (the cursor's at the bottom: the top rows demote into
-        // history), then grow (they come back).
         g.resize(5, 10);
         assert_eq!(g.anchors().row(id), Some(base + 2));
         let epoch = g.anchors().seal_epoch();

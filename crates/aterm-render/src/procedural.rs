@@ -207,17 +207,20 @@ fn paw(px: f32, py: f32, fw: f32, fh: f32) -> f32 {
 }
 
 /// The Singularity nova's per-cell Over darkening mask (Sparkle Words v2 §6.1): a soft
+/// radial shadow, coverage `1` at the cell centre falling quadratically to `0` at `r`.
 fn ring_arc(px: f32, py: f32, cx: f32, cy: f32, r: f32) -> f32 {
     let d2 = ((px - cx).powi(2) + (py - cy).powi(2)) / (r * r).max(1e-6);
     (1.0 - d2).clamp(0.0, 1.0)
 }
 
 /// The super nova's light-background eclipse veil (Sparkle Words v3 §3.3): a full-cell
+/// square whose coverage is the pixel centre's distance to the nearest cell border,
+/// clamped to `0..=1`, so it fills the cell with a ~1 px fringe like [`disc`]'s.
 fn soft_square(px: f32, py: f32, fw: f32, fh: f32) -> f32 {
     px.min(fw - px).min(py.min(fh - py)).clamp(0.0, 1.0)
 }
 
-/// A coverage canvas: `w * h` bytes. The hard painters ([`Canvas::set`],
+/// A coverage canvas: `w * h` bytes.
 struct Canvas {
     w: usize,
     h: usize,
@@ -225,6 +228,8 @@ struct Canvas {
 }
 
 /// Subsamples per pixel axis for the AA families: 4× supersampling, box
+/// filter (a pixel's coverage is the fraction of its 4×4 subsample grid the
+/// shape contains, rounded to 8 bits).
 const SS: usize = 4;
 
 impl Canvas {
@@ -253,6 +258,8 @@ impl Canvas {
     }
 
     /// Paint an anti-aliased shape: `inside(px, py)` is evaluated at the 4×4
+    /// subsample centres of every pixel (cell coordinates, y down) and
+    /// box-filtered to 8-bit coverage.
     fn paint_aa(&mut self, inside: impl Fn(f32, f32) -> bool) {
         for y in 0..self.h {
             for x in 0..self.w {
@@ -276,6 +283,7 @@ impl Canvas {
     }
 
     /// Force the border rows and columns to hard 0/255 (majority wins): the seam-tiling
+    /// law.
     fn harden_edges(&mut self) {
         let (w, h) = (self.w, self.h);
         let mut harden = |i: usize| {
@@ -293,6 +301,7 @@ impl Canvas {
 }
 
 /// A centred stroke of thickness `t` across extent `e`: the half-open span
+/// `[(e - t) / 2, (e - t) / 2 + t)`, the module's placement rule.
 #[inline]
 const fn span(e: usize, t: usize) -> (usize, usize) {
     let t = if t < e { t } else { e };
@@ -307,6 +316,7 @@ const fn eighth(k: u32, e: usize) -> usize {
 }
 
 /// Per-cell stroke geometry, all derived from the module's single rounding
+/// rule so every glyph (and every neighbouring cell) agrees on positions.
 struct Metrics {
     w: usize,
     h: usize,
@@ -380,6 +390,9 @@ const L: Arm = Arm::Light;
 const H: Arm = Arm::Heavy;
 
 /// `[up, down, left, right]` arm weights for the solid light/heavy glyphs:
+/// U+2500–254B (the dashed slots 2504–250B hold their solid equivalents;
+/// `draw_box` intercepts those before this table is consulted) and the half
+/// lines / weight transitions U+2574–257F.
 #[inline]
 const fn arms(cp: u32) -> [Arm; 4] {
     #[rustfmt::skip]
@@ -511,6 +524,8 @@ fn draw_box(c: &mut Canvas, m: &Metrics, cp: u32) {
 }
 
 /// Solid junctions: each present arm is a stroke from its cell edge through
+/// the light centre span, so any combination joins solidly (the heavy span
+/// contains the light span, and every arm reaches past the centre).
 fn draw_arms(c: &mut Canvas, m: &Metrics, up: Arm, down: Arm, left: Arm, right: Arm) {
     if let Some(t) = up.thickness(m) {
         let (x0, x1) = span(m.w, t);
@@ -531,6 +546,8 @@ fn draw_arms(c: &mut Canvas, m: &Metrics, up: Arm, down: Arm, left: Arm, right: 
 }
 
 /// Horizontal dashed line: `n` dashes, each centred in its `w/n` segment with
+/// a `max(1, seg/3)` gap split across the segment ends (so the gaps stay
+/// inside the cell — dashes are the one family that must NOT touch the seam).
 fn dash_h(c: &mut Canvas, m: &Metrics, n: usize, t: usize) {
     let (y0, y1) = span(m.h, t);
     for i in 0..n {
@@ -562,7 +579,7 @@ fn dash_v(c: &mut Canvas, m: &Metrics, n: usize, t: usize) {
     }
 }
 
-/// Double-line glyphs U+2550–256C. Rails sit at the outer thirds of the heavy
+/// Double-line glyphs U+2550–256C.
 fn draw_double(c: &mut Canvas, m: &Metrics, cp: u32) {
     let t = m.light;
     let (w, h) = (m.w, m.h);
@@ -736,6 +753,8 @@ fn draw_double(c: &mut Canvas, m: &Metrics, cp: u32) {
 }
 
 /// Light arcs U+256D–2570: the two straight half-arms of the matching corner,
+/// joined by a quarter circle whose radius is the largest that fits between
+/// the centre cross and the cell edges.
 fn draw_arc(c: &mut Canvas, m: &Metrics, cp: u32) {
     let t = m.light as f32;
     let vmid = (m.vl0 + m.vl1) as f32 / 2.0;
@@ -774,7 +793,7 @@ fn draw_arc(c: &mut Canvas, m: &Metrics, cp: u32) {
     }
 }
 
-/// Light diagonals U+2571–2573, corner to corner. A subsample is lit when it
+/// Light diagonals U+2571–2573, corner to corner.
 fn draw_diag(c: &mut Canvas, m: &Metrics, fwd: bool, back: bool) {
     let (wf, hf) = (m.w as f32, m.h as f32);
     let half = (m.light as f32 / 2.0).max(0.6);
@@ -808,6 +827,7 @@ fn draw_block(c: &mut Canvas, cp: u32) {
 }
 
 /// The shade dithers: 1 = ░ 25% (even x and even y), 2 = ▒ 50% checkerboard, 3 = ▓ 75%
+/// (all but odd/odd).
 fn shade(c: &mut Canvas, level: u8, phase_x: usize, phase_y: usize) {
     for y in 0..c.h {
         for x in 0..c.w {
@@ -825,6 +845,8 @@ fn shade(c: &mut Canvas, level: u8, phase_x: usize, phase_y: usize) {
 }
 
 /// Quadrant blocks U+2596–259F: each lit quadrant is a half-by-half rect
+/// anchored to its own corner and sized `eighth(4, ..)` (round half up), so
+/// unions never leave an interior seam.
 fn quadrants(c: &mut Canvas, cp: u32) {
     let bits: u8 = match cp {
         0x2596 => 0b0100,
@@ -855,7 +877,7 @@ fn quadrants(c: &mut Canvas, cp: u32) {
     }
 }
 
-/// Distance from `(px, py)` to the segment `(ax, ay)..(bx, by)`. The Powerline chevron
+/// Distance from `(px, py)` to the segment `(ax, ay)..(bx, by)`.
 fn seg_dist(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
     let (dx, dy) = (bx - ax, by - ay);
     let len2 = dx * dx + dy * dy;
@@ -869,6 +891,9 @@ fn seg_dist(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
 }
 
 /// Powerline separators U+E0B0–E0BF, full-bleed so they tile with the adjacent
+/// segment's background: E0B0/E0B2 solid right/left triangles, E0B1/E0B3 their chevron
+/// outlines, E0B4/E0B6 solid rounded (half-ellipse) caps, E0B5/E0B7 their outlines,
+/// E0B8–E0BF the corner triangles and their hypotenuse outlines.
 fn draw_powerline(c: &mut Canvas, cp: u32) {
     let (w, h) = (c.w, c.h);
     let (wf, hf) = (w as f32, h as f32);
@@ -918,7 +943,7 @@ fn draw_powerline(c: &mut Canvas, cp: u32) {
     });
 }
 
-/// Block sextants U+1FB00–1FB3B: a 2×3 grid of filled sub-cells. The 60 code points map
+/// Block sextants U+1FB00–1FB3B: a 2×3 grid of filled sub-cells.
 fn draw_sextant(c: &mut Canvas, cp: u32) {
     let k = cp - 0x1FB00;
     let mask = k + 1 + u32::from(k >= 20) + u32::from(k >= 40);
@@ -947,6 +972,8 @@ fn draw_sextant(c: &mut Canvas, cp: u32) {
 }
 
 /// Unicode 16 block octants U+1CD00–1CDE5, indexed by `cp - 0x1CD00`: the
+/// 2×4 fill mask of each, bit `n - 1` for octant `n` (1 upper-left, 2
+/// upper-right, 3/4 the second row, 5/6 the third, 7/8 the bottom row).
 const OCTANT_MASKS: [u8; 230] = [
     0x04, 0x06, 0x07, 0x08, 0x09, 0x0B, 0x0C, 0x0D, 0x0E, 0x10, 0x11, 0x12, 0x13, 0x15, 0x16, 0x17,
     0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
@@ -965,7 +992,7 @@ const OCTANT_MASKS: [u8; 230] = [
     0xF7, 0xF8, 0xF9, 0xFB, 0xFD, 0xFE,
 ];
 
-/// Draw one octant mask. The column split is `eighth(4, w)`, the sextants'
+/// Draw one octant mask.
 fn draw_octant(c: &mut Canvas, mask: u8) {
     let (w, h) = (c.w, c.h);
     let xs = [0, eighth(4, w), w];
@@ -979,6 +1006,7 @@ fn draw_octant(c: &mut Canvas, mask: u8) {
 }
 
 /// Block diagonal wedges + triangular blocks U+1FB3C–1FB6F (Symbols for
+/// Legacy Computing), supersampled.
 fn draw_wedge(c: &mut Canvas, cp: u32) {
     let (wf, hf) = (c.w as f32, c.h as f32);
     if cp >= 0x1FB68 {
@@ -1071,6 +1099,9 @@ fn draw_wedge(c: &mut Canvas, cp: u32) {
 }
 
 /// Legacy eighth blocks U+1FB70–1FB8B (Symbols for Legacy Computing): hard 0/255 fills
+/// on the same `eighth` rule as U+2580–259F, so they seam with the classic eighth
+/// blocks: one-eighth bars 2..7 (1 and 8 live at U+258F/2595 and U+2594/2581), the
+/// edge pairs, the 1-3-5-8 scanline set, and the upper/right k-eighths fills.
 fn draw_legacy_block(c: &mut Canvas, cp: u32) {
     let (w, h) = (c.w, c.h);
     match cp {
@@ -1121,6 +1152,8 @@ fn draw_legacy_block(c: &mut Canvas, cp: u32) {
 }
 
 /// Braille U+2800–28FF: bit `n` of `cp - 0x2800` lights dot `n+1` in the
+/// standard 2x4 layout (dots 1-3 left column top-down, 4-6 right column,
+/// 7/8 the bottom pair).
 fn draw_braille(c: &mut Canvas, cp: u32) {
     let bits = cp - 0x2800;
     let (w, h) = (c.w, c.h);
@@ -1160,6 +1193,8 @@ mod tests {
     use super::*;
 
     /// The Singularity darkening mask is a soft radial shadow: full at the centre,
+    /// monotone falloff, centre-symmetric, and empty corners so neighbouring stamps
+    /// fuse without box seams.
     #[test]
     fn ring_arc_is_a_soft_radial_shadow() {
         let (w, h) = (16usize, 18usize);
@@ -1185,6 +1220,7 @@ mod tests {
     }
 
     /// The super nova veil is a full-cell soft square: interior texels saturate and
+    /// the one-texel border ring is a partial, non-zero fringe.
     #[test]
     fn shade_is_a_full_cell_soft_square() {
         let (w, h) = (16usize, 18usize);
@@ -1208,6 +1244,7 @@ mod tests {
     }
 
     /// Cell sizes exercised by the invariants below: odd/even mixes, squat,
+    /// tall, and degenerate-tiny.
     const SIZES: &[(usize, usize)] = &[
         (1, 1),
         (2, 2),
@@ -1231,6 +1268,8 @@ mod tests {
     }
 
     /// Every glyph at every size is cell-sized; orthogonal families are hard 0/255
+    /// throughout, [`antialiased`] ones on their cell-edge texels
+    /// (`tests/procedural_aa_edges.rs` covers the whole size lattice).
     #[test]
     fn every_glyph_is_cell_sized_and_hard_where_required() {
         for &(w, h) in SIZES {
@@ -1302,6 +1341,7 @@ mod tests {
     }
 
     /// The heavy stroke span exactly contains the light span on both axes —
+    /// the parity property the module's rounding rule promises.
     #[test]
     fn heavy_span_contains_light_span_centred() {
         for &(w, h) in SIZES {
@@ -1322,6 +1362,7 @@ mod tests {
     }
 
     /// ▀/▄ and ▌/▐ cover the whole cell between them (overlap allowed on odd
+    /// extents, gaps never) — the half-block tiling rule.
     #[test]
     fn complementary_halves_leave_no_gap() {
         for &(w, h) in SIZES {
@@ -1341,6 +1382,7 @@ mod tests {
     }
 
     /// Braille dots land in their compartments: dot 1 is top-left, dot 8 is
+    /// bottom-right, and they never bleed across the column midline.
     #[test]
     fn braille_dot_positions() {
         let (w, h): (usize, usize) = (10, 20);
@@ -1383,6 +1425,7 @@ mod tests {
     }
 
     /// Sextants are covered, hard 0/255, inked and distinct; U+1FB00 fills only the
+    /// upper-left sub-cell.
     #[test]
     fn sextants_fill_the_2x3_grid() {
         let (w, h) = (12, 24);
@@ -1409,6 +1452,8 @@ mod tests {
     }
 
     /// Octants: all 230 are covered, hard 0/255, distinct, and exactly their
+    /// mask: at every lattice size the eight sub-rects tile the cell with no
+    /// gap or overlap, and each glyph is the union of its mask's sub-rects.
     #[test]
     fn octants_fill_the_2x4_grid_exactly() {
         assert_eq!(OCTANT_MASKS.len(), 0x1CDE5 - 0x1CD00 + 1);
@@ -1450,6 +1495,8 @@ mod tests {
     }
 
     /// Octants seam with the blocks that share their splits: the octant
+    /// unions Unicode encodes elsewhere draw the very pixels of ▀, ▌, ▘ and
+    /// the upper quarter / three-quarter blocks.
     #[test]
     fn octant_splits_match_the_blocks_they_extend() {
         for &(w, h) in SIZES {
@@ -1473,6 +1520,9 @@ mod tests {
     }
 
     /// Powerline separators are covered, anti-aliased with hard cell edges,
+    /// and shaped: a SOLID right triangle (E0B0) is widest at the vertical
+    /// middle and empty at the edges, fills the apex column at mid-height, and
+    /// is the EXACT byte mirror of the solid left triangle (E0B2).
     #[test]
     fn powerline_separators_are_shaped() {
         let (w, h) = (12, 24);
@@ -1517,6 +1567,8 @@ mod tests {
     }
 
     /// The chevron outline's stroke width is perpendicular, not horizontal: on squat
+    /// cells every interior row carries a full stroke of ink and consecutive rows
+    /// overlap (no beading).
     #[test]
     fn chevron_outline_width_is_perpendicular_not_horizontal() {
         for (w, h) in [(20usize, 8usize), (16, 10), (12, 24), (9, 19)] {
@@ -1550,6 +1602,8 @@ mod tests {
     }
 
     /// Each wedge and its complement (same diagonal, opposite corner) sum to full
+    /// coverage (≥ 254: one rounding LSB); also spot-checks orientation and the quarter
+    /// triangles.
     #[test]
     fn wedge_pairs_tile_and_orient() {
         let pairs: Vec<(u32, u32)> = (0x1FB3C..=0x1FB51).zip(0x1FB52..=0x1FB67).collect();
@@ -1587,6 +1641,7 @@ mod tests {
     }
 
     /// Legacy eighth blocks (U+1FB70–1FB8B) are hard 0/255 on the same `eighth`
+    /// boundaries as U+2580–259F.
     #[test]
     fn legacy_eighth_blocks_are_hard_and_aligned() {
         let (w, h) = (16, 32);

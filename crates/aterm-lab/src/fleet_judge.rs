@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What `fleet-sim` holds a fleet read to, judged on its text alone (pure, so
-//! the judges are unit-tested on typed data): the survey's rendered text
-//! (`aterm ctl survey --fleet`) and its JSON (`--json`), against what the
-//! simulation knows it made — which instance answers with which pid on which
-//! port, and which session runs what.
+//! What `fleet-sim` holds a fleet read to, judged on its text alone (pure, so the judges are unit-tested on typed data): the survey's rendered text (`aterm ctl survey --fleet`) and its JSON (`--json`), against what the simulation knows it made — which instance answers with which pid on which port, and which session runs what.
 
 use std::collections::BTreeMap;
 
@@ -104,8 +100,7 @@ pub fn header_pids(text: &str) -> Vec<i32> {
         .collect()
 }
 
-/// The block of `text` whose header names `pid` — its header and every line
-/// under it, to the next header — when exactly one does.
+/// The block of `text` whose header names `pid` — its header and every line under it, to the next header — when exactly one does.
 #[must_use]
 pub fn block_text(text: &str, pid: i32) -> Option<String> {
     let found: Vec<Block<'_>> = blocks(text)
@@ -125,8 +120,7 @@ pub fn block_text(text: &str, pid: i32) -> Option<String> {
     }
 }
 
-/// The headers of `text` that say the machine at `127.0.0.1:<port>` did not
-/// answer (`== 127.0.0.1:<port> did not answer: <reason> …`).
+/// The headers of `text` that say the machine at `127.0.0.1:<port>` did not answer (`== 127.0.0.1:<port> did not answer: <reason> …`).
 #[must_use]
 pub fn unanswered_rows(text: &str, port: u16) -> Vec<String> {
     let head = format!("== 127.0.0.1:{port} did not answer: ");
@@ -138,8 +132,7 @@ pub fn unanswered_rows(text: &str, port: u16) -> Vec<String> {
         .collect()
 }
 
-/// The characters a terminal would act on (`aterm_codec::tty::is_active`)
-/// that `text` holds raw, but for the line breaks between its lines.
+/// The characters a terminal would act on (`aterm_codec::tty::is_active`) that `text` holds raw, but for the line breaks between its lines.
 #[must_use]
 pub fn raw_active(text: &str) -> Vec<char> {
     text.chars()
@@ -152,8 +145,7 @@ struct Seen {
     /// The client's rank of it ([`ranks`]); `None` when the json gave none.
     rank: Option<u8>,
     /// Its place among its block's Claude sessions in the text's order: the
-    /// round of the client's round robin it is in. `None` for one the client
-    /// keeps first across the read (`aterm_ctl::survey_urgent`).
+    /// round of the client's round robin it is in.
     round: Option<usize>,
     /// Whether its `asked:` and its `said:` show.
     asked: bool,
@@ -170,37 +162,7 @@ impl Seen {
     }
 }
 
-/// THE HEALTHY FLEET READ's text: within `budget` characters; one header per
-/// instance, each naming its host (the local machine's name, a peer's
-/// `fleet 127.0.0.1:<port>`) and none more, none unanswered; each session on
-/// a line of its block naming its program (and agent word), with content
-/// (` | ` and what follows) from a content-level machine, or — when the
-/// budget cut — counted on its block's `+N` line, the shells folded before
-/// any agent; the excerpt lines (`asked:`, `said:`) of every Claude session;
-/// and `host` the local host name.
-///
-/// A READ THE BUDGET CUT (its closing line says so) is held to the END USE —
-/// a Claude Code reading a lab's Macs: to the order the client fills a
-/// tight read in, by its own rank (`ranks`, [`ranks`]) — the sessions it
-/// keeps first across the read (asking, stalled) with both excerpt lines
-/// before any other shows a word, then a ROUND ROBIN over the machines,
-/// every machine's first other Claude session with both before any
-/// machine's second shows a
-/// word, and in a round every one's `said:` before any one's `asked:` — so
-/// the closing line never passes the check alone; to the budget USED, to
-/// within one excerpt line; and to every cut MARKED: each Claude session
-/// short of an excerpt marked on its line, every marked one short, and the
-/// closing line's counts those of the marks and of the `+N` lines. With
-/// `every_top` (a fleet the size of the end use), each machine's most
-/// pressing Claude session must also keep its words: all of them when it
-/// asks or is stalled, else its last words (`said:`, where it stands). The
-/// round robin's rounds count every Claude session of a block, so a machine
-/// whose first asks keeps its second's words for the round of every
-/// machine's second. Either way the
-/// excerpts are held to how the client NARROWS them ([`judge_narrowing`]),
-/// and each Claude session's cut `said:` to the end it keeps: a finished
-/// turn's (its agent idle) its end, where its report's result is, any other
-/// its head.
+/// THE HEALTHY FLEET READ's text: within `budget` characters; one header per instance, each naming its host (the local machine's name, a peer's `fleet 127.0.0.1:<port>`) and none more, none unanswered; each session on a line of its block naming its program (and agent word), with content (` | ` and what follows) from a content-level machine, or — when the budget cut — counted on its block's `+N` line, the shells folded before any agent; the excerpt lines (`asked:`, `said:`) of every Claude session; and `host` the local host name.
 #[must_use]
 pub fn judge_text(
     text: &str,
@@ -237,8 +199,6 @@ pub fn judge_text(
         blocks.len() == want.len(),
         format!("{} blocks for {} instances", blocks.len(), want.len()),
     ));
-    // The client's closing line when its budget left anything out (excerpts,
-    // sessions, or, as a last resort, whole lines).
     let closing = text
         .lines()
         .find(|l| l.starts_with(aterm_ctl::LEFT_OUT_LEAD) || l.contains(" more lines past the "));
@@ -249,16 +209,11 @@ pub fn judge_text(
     let mut twice = Vec::new();
     let mut wrong_rows = Vec::new();
     let mut no_content = Vec::new();
-    // Sessions not listed, against what each block's `+N` line counts; and
-    // whether an agent's line went while a shell's was listed.
     let (mut unlisted, mut folded, mut agent_folded, mut shell_listed) =
         (0usize, 0usize, false, false);
     let mut unfolded = Vec::new();
-    // Each Claude session, in the text's order; each machine's first.
     let mut claude: Vec<Seen> = Vec::new();
     let mut firsts: Vec<(usize, Option<usize>)> = Vec::new();
-    // Each Claude session's cut `said:` that kept the wrong end, and how many
-    // finished turns' kept theirs.
     let (mut wrong_end, mut ends_kept) = (Vec::new(), 0usize);
     for w in want {
         let found: Vec<&Block<'_>> = blocks
@@ -286,9 +241,6 @@ pub fn judge_text(
         if !names || !block.header.ends_with(" trust=screen") {
             misnamed.push(block.header.to_owned());
         }
-        // Its facts whole: the session count, and the state counts where a
-        // session is busy or asking — what a reader summarising the fleet
-        // acts on, never what a long name cuts.
         let facts = block
             .header
             .split_once(&format!(" · {} sessions", w.sessions.len()))
@@ -310,7 +262,6 @@ pub fn judge_text(
             .sum();
         folded += counted;
         let mut here = 0usize;
-        // This block's Claude sessions, by where their lines stand.
         let mut seen: Vec<(usize, Seen)> = Vec::new();
         for s in &w.sessions {
             let at = block
@@ -333,8 +284,6 @@ pub fn judge_text(
             let shows = match (s.program.as_str(), s.agent.as_str()) {
                 ("zsh", "-") => rest.starts_with(" zsh idle"),
                 (program, "-") => rest.starts_with(&format!(" running {program}")),
-                // An agent at a box the client ranks asking reads `asking`
-                // (the client's own word, by the client's own rank).
                 (program, agent) => {
                     let word = ranks
                         .get(&s.sid)
@@ -374,8 +323,6 @@ pub fn judge_text(
                 }
             }
         }
-        // The round robin's rounds count the block's sessions in the order
-        // it shows them, the ones kept first across the read too.
         seen.sort_by_key(|(at, _)| *at);
         if !seen.is_empty() {
             firsts.push((w.i, Some(claude.len())));
@@ -474,8 +421,6 @@ pub fn judge_text(
         },
     ));
     if every_top {
-        // Its words: all of them for one the client keeps first (asking,
-        // stalled), its last words for any other — where it stands.
         let short: Vec<String> = firsts
             .iter()
             .filter_map(|&(i, at)| {
@@ -517,13 +462,6 @@ pub fn judge_text(
                 said.0, said.1
             ),
         ));
-        // The client stops before the first unit of its fill order that does
-        // not fit, and no unit costs more than one excerpt line at the floor
-        // (161 characters with its newline, as the client draws a cut one):
-        // a session line is shorter, even with the closing line's first
-        // `(excerpts cut)` clause it can bring, and every other change a
-        // unit makes to the closing line or a `+N` line shortens them. So
-        // less than one excerpt line is left.
         let room = budget.saturating_sub(chars);
         checks.push(Check::new(
             "the budget is used, to within one excerpt line",
@@ -607,14 +545,7 @@ fn is_cut(line: &str) -> bool {
             .is_some_and(|(_, words)| words.starts_with('…'))
 }
 
-/// THE NARROWING: the client cuts every excerpt it cuts to ONE width, the
-/// WIDEST at which the read fits. Every cut line is that many characters (the
-/// client cuts each to exactly its width), no fewer than
-/// [`aterm_ctl::EXCERPT_CHARS`]; a read the budget cut further (`budget_cut`,
-/// its closing line) has its excerpts at exactly that floor; and a read cut
-/// only by narrowing must be over the budget at one character wider — each
-/// cut line one character longer, the rest as they are — unless it is at
-/// [`aterm_ctl::EXCERPT_WIDE_CHARS`] already. A read with nothing cut holds.
+/// THE NARROWING: the client cuts every excerpt it cuts to ONE width, the WIDEST at which the read fits.
 #[must_use]
 pub fn judge_narrowing(text: &str, budget: usize, budget_cut: bool) -> Check {
     const NAME: &str = "the excerpts narrowed alike, as wide as the budget lets them";
@@ -663,11 +594,7 @@ pub fn judge_narrowing(text: &str, budget: usize, budget_cut: bool) -> Check {
     )
 }
 
-/// THE ESCAPING: nothing a session wrote reaches the reader raw. No character
-/// a terminal acts on is in `text` but its line breaks; and each of
-/// `hostile` — the escaped forms of what was injected (`trust\=human`,
-/// `\x1b[31m`, `\u{202e}`, …) — is there, while `forbidden` (the raw forged
-/// label, `trust=human`) is not.
+/// THE ESCAPING: nothing a session wrote reaches the reader raw.
 #[must_use]
 pub fn judge_escaped(text: &str, escaped: &[&str], forbidden: &[&str]) -> Check {
     let raw = raw_active(text);
@@ -693,9 +620,7 @@ pub fn judge_escaped(text: &str, escaped: &[&str], forbidden: &[&str]) -> Check 
     )
 }
 
-/// Every session's rank in a `survey --json` read, by sid: the client's own
-/// ([`aterm_ctl::survey_rank`] over the record's string members), which
-/// [`judge_text`] holds a cut read's excerpts to.
+/// Every session's rank in a `survey --json` read, by sid: the client's own ([`aterm_ctl::survey_rank`] over the record's string members), which [`judge_text`] holds a cut read's excerpts to.
 #[must_use]
 pub fn ranks(json: &str) -> BTreeMap<String, u8> {
     let parsed: Option<Value> = aterm_json::from_str(json).ok();
@@ -737,10 +662,7 @@ pub const CONTENT_KEYS: &[&str] = &[
     "rows",
 ];
 
-/// THE HEALTHY FLEET READ's JSON: an array of one object per instance, the
-/// peers marked `"fleet":true`, every one at `level` content, every session
-/// the simulation made with its program and agent word, a Claude session's
-/// `prompt` and `said`, a shell's `cwd`; and no raw active character.
+/// THE HEALTHY FLEET READ's JSON: an array of one object per instance, the peers marked `"fleet":true`, every one at `level` content, every session the simulation made with its program and agent word, a Claude session's `prompt` and `said`, a shell's `cwd`; and no raw active character.
 #[must_use]
 pub fn judge_json(json: &str, want: &[WantInstance]) -> Vec<Check> {
     let mut checks = Vec::new();
@@ -824,10 +746,7 @@ pub fn judge_json(json: &str, want: &[WantInstance]) -> Vec<Check> {
     checks
 }
 
-/// A FACTS-ONLY machine in a fleet read's JSON: the instance at `pid` answers
-/// at `level` facts, no row carries a content field, `attention` is `1` or
-/// `-`, and none of `secrets` (a title a person typed, words a session
-/// wrote) appears anywhere in the reply.
+/// A FACTS-ONLY machine in a fleet read's JSON: the instance at `pid` answers at `level` facts, no row carries a content field, `attention` is `1` or `-`, and none of `secrets` (a title a person typed, words a session wrote) appears anywhere in the reply.
 #[must_use]
 pub fn judge_facts_only(json: &str, pid: i32, secrets: &[&str]) -> Check {
     let parsed: Result<Value, _> = aterm_json::from_str(json);
@@ -888,10 +807,7 @@ pub fn judge_facts_only(json: &str, pid: i32, secrets: &[&str]) -> Check {
     )
 }
 
-/// THE FAULT READ's text: the stopped machine's and the killed machine's ONE
-/// row each, with their reasons (`connected, but no fleet handshake within
-/// …` and `nothing listens on 127.0.0.1:<port>`), and every other machine's
-/// block.
+/// THE FAULT READ's text: the stopped machine's and the killed machine's ONE row each, with their reasons (`connected, but no fleet handshake within …` and `nothing listens on 127.0.0.1:<port>`), and every other machine's block.
 #[must_use]
 pub fn judge_faults(
     text: &str,
@@ -1012,8 +928,6 @@ s-ccc running build-loop | build-loop 1 | /tmp/af.x/m01/home
             ],
             "{checks:#?}"
         );
-        // A header cut before its state counts (as a 100-character cap once
-        // cut every peer's) fails the counts check alone.
         let cut = GOOD.replace(
             "· 2 sessions (1 busy) trust=screen",
             "· 2 sessions… trust=screen",
@@ -1045,10 +959,7 @@ s-ccc running build-loop | build-loop 1 | /tmp/af.x/m01/home
     /// shows a word; in the round robin, the first session whole before the
     /// second shows a word, and every `said:` of a round before any `asked:`;
     /// each session short of an excerpt marked, the closing line counting the
-    /// marks; the budget used to within one excerpt line. CONTROLS: the
-    /// reverse cut, a session the json gave no rank, a mark missing, a second
-    /// session's word ahead of the first's, and a budget left half unused
-    /// each fail.
+    /// marks; the budget used to within one excerpt line.
     #[test]
     fn a_cut_read_is_held_to_the_order_the_client_fills_in() {
         let mut want = want();
@@ -1075,7 +986,6 @@ s-ccc running build-loop | build-loop 1 | /tmp/af.x/m01/home
                  said: Shall I?\ns-eee claude idle 9s | /tmp/af.x/m01/home\n    asked: Sum it\n    \
                  said: It is 42\ns-ccc running build-loop",
             );
-        // The client's mark, after the session's state, before its content.
         let mark = |text: &str, sid: &str| {
             text.lines()
                 .map(|l| match l.split_once(" | ") {
@@ -1086,8 +996,6 @@ s-ccc running build-loop | build-loop 1 | /tmp/af.x/m01/home
                 })
                 .collect::<String>()
         };
-        // The read as the client closes it: its closing line counting
-        // `marked` lines, and a budget it uses all but a few characters of.
         let cut = |text: &str, marked: usize| {
             let what = if marked == 1 {
                 "1 session's".to_owned()
@@ -1119,10 +1027,8 @@ s-ccc running build-loop | build-loop 1 | /tmp/af.x/m01/home
             "every cut is marked, and the closing line counts the marks and the +N lines";
         let none: Vec<String> = Vec::new();
         assert_eq!(failed(&both, &ranks, 0), none, "whole: every excerpt");
-        // The idle session's asked went: the last of the order.
         let idle_short = cut(&mark(&both.replace("    asked: Sum it\n", ""), "s-eee"), 1);
         assert_eq!(failed(&idle_short, &ranks, 10), none, "{idle_short}");
-        // Every round-robin excerpt gone, the asking one's kept: as filled.
         let asking_kept = cut(
             &mark(
                 &mark(
@@ -1136,9 +1042,6 @@ s-ccc running build-loop | build-loop 1 | /tmp/af.x/m01/home
             2,
         );
         assert_eq!(failed(&asking_kept, &ranks, 10), none, "{asking_kept}");
-        // A session the json gave no rank cannot be judged: it fails, and so
-        // does its row, whose word (`asking` for a box the client ranks
-        // asking, else the server's) is the client's rank's.
         assert_eq!(
             failed(&asking_kept, &BTreeMap::new(), 10),
             [
@@ -1146,8 +1049,6 @@ s-ccc running build-loop | build-loop 1 | /tmp/af.x/m01/home
                 ORDER
             ]
         );
-        // THE VACUOUS PASS a closing line once gave: the asking session's
-        // excerpts gone while the busy one's stayed is no cut the client makes.
         let reverse = cut(
             &mark(
                 &both.replace("    asked: Delete it?\n    said: Shall I?\n", ""),
@@ -1156,7 +1057,6 @@ s-ccc running build-loop | build-loop 1 | /tmp/af.x/m01/home
             1,
         );
         assert_eq!(failed(&reverse, &ranks, 10), [ORDER], "{reverse}");
-        // The second of the round robin keeps a word the first lost.
         let second_first = cut(
             &mark(
                 &both.replace("    asked: Fix the flaky test\n", ""),
@@ -1169,11 +1069,8 @@ s-ccc running build-loop | build-loop 1 | /tmp/af.x/m01/home
             failed(&second_first, &ranks, 10).contains(&ORDER.to_owned()),
             "{second_first}"
         );
-        // An unmarked cut fails the marks.
         let unmarked = cut(&both.replace("    asked: Sum it\n", ""), 1);
         assert_eq!(failed(&unmarked, &ranks, 10), [MARKS], "{unmarked}");
-        // One excerpt line left (161 characters): one more would have fitted,
-        // as a fill that stopped a unit early leaves it.
         assert_eq!(
             failed(&idle_short, &ranks, aterm_ctl::EXCERPT_CHARS + 1),
             ["the budget is used, to within one excerpt line"]
@@ -1182,8 +1079,7 @@ s-ccc running build-loop | build-loop 1 | /tmp/af.x/m01/home
     }
 
     /// IN A ROUND OF THE ROUND ROBIN every machine's session shows its
-    /// `said:` before any shows its `asked:`. CONTROL: an `asked:` while a
-    /// session of the same round lacks its `said:` fails.
+    /// `said:` before any shows its `asked:`.
     #[test]
     fn in_a_round_every_said_comes_before_any_asked() {
         let seen = |asked: bool, said: bool| Seen {
@@ -1213,10 +1109,7 @@ s-ccc running build-loop | build-loop 1 | /tmp/af.x/m01/home
 
     /// THE NARROWING IS HELD TO THE CLIENT'S RULE: every cut line one width, no
     /// narrower than the floor, and the widest that fits — one character wider
-    /// is over the budget. CONTROLS: the same read where one wider would fit
-    /// (a client that cut to the floor while a wider width fit) fails; two
-    /// widths fail; a width under the floor fails; a read the budget cut past
-    /// narrowing must sit at the floor; a read with nothing cut holds.
+    /// is over the budget.
     #[test]
     fn the_narrowing_is_held_to_the_widest_width_that_fits() {
         let at = |width: usize| {
@@ -1233,7 +1126,6 @@ s-bbb claude busy 4s
         };
         let text = at(200);
         let chars = text.chars().count();
-        // Two lines cut: one character wider is `chars + 2`.
         assert!(
             judge_narrowing(&text, chars + 1, false).ok,
             "one wider is over"
@@ -1259,8 +1151,7 @@ s-bbb claude busy 4s
     }
 
     /// A FINISHED TURN'S CUT `said:` KEEPS ITS END, any other its head, as the
-    /// client cuts them. CONTROLS: a busy turn's said cut keeping its end, and
-    /// an idle one's cut keeping its head, each fail.
+    /// client cuts them.
     #[test]
     fn a_finished_turns_cut_said_keeps_its_end() {
         let named = |text: &str, want: &[WantInstance]| {
@@ -1316,7 +1207,6 @@ s-aaa zsh idle | ~
         assert!(checks.iter().all(|c| c.ok), "{checks:#?}");
         let checks = judge_faults(text, 1, 7103, 7102);
         assert!(checks.iter().filter(|c| !c.ok).count() == 2, "{checks:#?}");
-        // Only the answered block names a pid; a refusal row names its port.
         assert_eq!(header_pids(text), [100]);
         assert_eq!(unanswered_rows(text, 7103).len(), 1);
         assert!(unanswered_rows(text, 7104).is_empty());
@@ -1340,7 +1230,6 @@ s-aaa zsh idle | ~
         assert!(checks.iter().all(|c| c.ok), "{checks:#?}");
         let checks = judge_json(&json.replace(r#""said":"s""#, r#""said":"-""#), &want());
         assert!(checks.iter().any(|c| !c.ok), "{checks:#?}");
-        // Each session's rank is the client's, read from its record.
         let ranks = ranks(json);
         assert_eq!(ranks.get("s-bbb"), ranked().get("s-bbb"));
         assert!(ranks["s-bbb"] < ranks["s-ccc"] && ranks["s-ccc"] < ranks["s-aaa"]);

@@ -1,71 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 for `SupervisorLand` (aterm-models-harness `supervisor_land_model`):
-//! the real turn-end decider (`decide_turn_end`, with its `TurnEndState`)
-//! driven under Autopilot LAND along every reachable state of the model —
-//! Autopilot Land: land everything into the remote main, no exceptions, and
-//! only then go quiet.
-//!
-//! The policy's `Instruction`, `Nudge`, `Answer` and `WallAct` are the
-//! decider's own acts on the real ladder's clock (`land@v1`, `land-nudge@v1`,
-//! `land-answer@v1`, the 529's retry), recorded with `acted`; a yield is the
-//! next point observed after a live turn read with the act's message on it
-//! (`took`): progress, a question (short), a `529 Overloaded` wall, the
-//! retired `ATERM-TASK-DONE` line, a clean `Nothing left:` defense, the same
-//! over a repository the host's probe finds work no remote main has in, the
-//! same with a `NEEDS YOU:` line, or a defense that names work not merged.
-//! Someone else's turn is a point with real work (a 12-minute job, never a
-//! person's exchange): progress, a clean defense, or a wall; a person's own
-//! exchange is their quick message, their keystroke inside the turn,
-//! answered. `OtherTurnRuns` is a live read of someone else's turn,
-//! `BackoffDue` the clock moved past the back-off the decider waits on,
-//! `SeedLanded` a new loop's read of a task record that says landed
-//! (`seed_task_done`).
-//!
-//! At every state the decider types the instruction, the nudge (its suffixes
-//! naming the open work a defense named and the repository's work, exactly
-//! where the model's `said` and `dirty` say so), the land answer and the
-//! wall's act exactly where the model enables them, waits exactly where the
-//! model's `BackoffDue` is the only way on, and does nothing on a landed task,
-//! a person's exchange or while someone else's turn runs — never at any other
-//! free point; its landing, its person's exchange, its episode's instruction,
-//! its needs, its open work, its repository's work and its streak are the
-//! model's; a landed record is taken on wherever the model's `SeedLanded` is
-//! enabled, and never at a wall.
-//!
-//! THE TASK'S FACE (the Autopilot design's §9.4.2): the projection also holds
-//! the face the real teller told its host — the loop's discipline,
-//! [`TurnEndState::face_moved`] asked after each point folded in and after
-//! each live read of someone else's turn ([`TurnEndState::took`]) — which
-//! must be the model's `told`, and the real [`TaskFace::of`] and
-//! [`TurnEndState::other_turn`], which must be the model's face and `other`,
-//! at every step.
-//!
-//! WHY LAND STILL HOLDS (the Autopilot design's §12.3.3): the projection
-//! holds the hold the real teller told its host too — the loop's one teller
-//! (`Session::tell_hold`: [`TurnEndState::held_moved`] asked after each
-//! point folded in, each live read of someone else's turn, each act's
-//! ledger row, and the loop's start) — as the model's `hold` (none, a hold
-//! unread, a hold read) and `hlegs` (its legs, the engine's own bits:
-//! NEEDS 1, REPO 2, OPEN 4, DEFENSE 8), which `TheHostIsToldWhatHoldsTheLanding`
-//! holds to the state: none where no hold stands, read exactly where a land
-//! act's yield was judged with no turn of someone else's since, and then the
-//! yield's own legs.
-//!
-//! Negative controls: three tellers each fail the walk — one told on the
-//! journal's `DONE`/`LEFT` notes alone, one told at points alone, and one
-//! that says landed for any done task; and where the `Buggy = 1` model goes
-//! quiet after two nudges, holds a point a need stands at, lands on the
-//! retired token, over a dirty repository or over a need, nudges a landed
-//! task, takes a landed record on at a wall, or tells nothing at the live
-//! read, the real decider and its state say otherwise. Three tellers of the
-//! hold each fail the walk too — one that tells the face and never the hold,
-//! one told at points alone (never at a live read), and one never told at
-//! an act's row — and the model's own mutant, `StaleHold = 1` (a yield
-//! tells the face and leaves the hold as it was), is refuted by
-//! `TheHostIsToldWhatHoldsTheLanding` alone, as is `Buggy = 2`, the dial
-//! `aterm-models`' sweep turns it on by.
+//! Tier-1 for `SupervisorLand` (aterm-models-harness `supervisor_land_model`): the real turn-end decider (`decide_turn_end`, with its `TurnEndState`) driven under Autopilot LAND along every reachable state of the model — Autopilot Land: land everything into the remote main, no exceptions, and only then go quiet.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -388,8 +324,6 @@ impl Real {
                 });
             }
         }
-        // The hold is told where the face is (`Session::tell_face`), by this
-        // walk's teller of it.
         let tells = match self.hold_teller {
             HoldTeller::Loop | HoldTeller::NotAtActs => true,
             HoldTeller::AtPointsOnly => !busy,
@@ -595,8 +529,6 @@ fn mirror(action: &str, before: &State, real: &mut Real) {
         ),
         "YieldDefenseNeeds" => real.yields(NEEDS, plain, LONG),
         "YieldOpenDefense" => real.yields(OPEN_DEFENSE, plain, LONG),
-        // A live read of someone else's turn: no act of the policy's
-        // awaited.
         "OtherTurnRuns" => {
             real.st.took();
             real.at.busy = true;
@@ -693,8 +625,6 @@ fn walk_all(
             .or_default() += 1;
         if st["pending"] == 0 {
             projects(&real.st, &st);
-            // A landed record is taken on wherever the model's seed is
-            // enabled, and never at a wall.
             if m.action_enabled("SeedLanded", &st) {
                 assert!(real.st.clone().seed_task_done(), "refused at {st:?}");
             }
@@ -714,8 +644,6 @@ fn walk_all(
             {
                 assert_eq!(*text, nudge(&st, &real.st), "the nudge at {st:?}");
             }
-            // Autopilot Land: never silent at a free point of a task not
-            // landed, not a person's and not running someone else's turn.
             if st["landed"] == 0 && st["left"] == 0 && st["other"] == 0 {
                 assert_ne!(got, Verdict::Nothing, "a silent point at {st:?}");
             }
@@ -728,7 +656,6 @@ fn walk_all(
             }
             let mut r = real.clone();
             mirror(action.name, &st, &mut r);
-            // Along EVERY transition, not only at a state's first visit.
             faces(&r, &next)?;
             holds(&r, &next)?;
             queue.push_back((next, r));
@@ -739,8 +666,6 @@ fn walk_all(
 
 #[test]
 fn tier1_the_real_decider_lands_only_on_a_clean_defense_and_never_goes_quiet() {
-    // The readers the walk's words stand on: a clean defense, and what each
-    // other reply is.
     assert!(clean_defense(Some(DEFENSE)));
     assert!(!clean_defense(Some(NEEDS)) && !clean_defense(Some(OPEN_DEFENSE)));
     assert!(!clean_defense(Some(TOKEN)) && says_done(Some(TOKEN)));
@@ -774,10 +699,6 @@ fn tier1_the_buggy_model_and_three_tellers_are_refuted() {
     let buggy = aterm_spec::interp::with_buggy(&m, 1);
     let base = Instant::now() + Duration::from_secs(3600);
 
-    // THE FACE TOLD: a teller told on the journal's `DONE`/`LEFT` notes
-    // alone, one told at points alone, and one that says landed for any done
-    // task each fail the walk — the first two at someone else's live read
-    // after a landing, the third at a person's own exchange.
     for teller in [
         Teller::OnEndNotes,
         Teller::AtPointsOnly,
@@ -786,8 +707,6 @@ fn tier1_the_buggy_model_and_three_tellers_are_refuted() {
         let missed = walk_all(&m, teller, HoldTeller::Loop).expect_err("a face teller passed");
         assert!(missed.starts_with(&format!("{teller:?} told ")), "{missed}");
     }
-    // …and the `Buggy` model that tells nothing at that read is caught by
-    // `TheHostIsToldTheTasksFace`, which the model proper holds there.
     let path = ["Instruction", "YieldDefense", "OtherTurnRuns"];
     let mut right = m.init_state();
     let mut wrong = buggy.init_state();
@@ -798,10 +717,6 @@ fn tier1_the_buggy_model_and_three_tellers_are_refuted() {
     assert!(m.check_invariant("TheHostIsToldTheTasksFace", &right));
     assert!(!buggy.check_invariant("TheHostIsToldTheTasksFace", &wrong));
 
-    // THE LANDING THAT WENT QUIET (the retired `LAND_NUDGES = 2`): after the
-    // instruction and two nudges answered with a defense naming open work,
-    // the Buggy model goes quiet; the real decider nudges a third time, and
-    // a tenth.
     let mut path = vec!["Instruction", "YieldOpenDefense", "BackoffDue"];
     for _ in 0..2 {
         path.extend(["Nudge", "YieldOpenDefense", "BackoffDue"]);
@@ -822,9 +737,6 @@ fn tier1_the_buggy_model_and_three_tellers_are_refuted() {
     assert_eq!(real.st.land_episode(), (true, 9));
     assert_eq!(verdict(&real.clone().decide()), Verdict::Nudge);
 
-    // A NEED THAT HOLDS THE POINT: the Buggy model waits on the person; the
-    // real decider nudges past the back-off the defense earned, the need's
-    // ack beside it.
     let path = ["Instruction", "YieldDefenseNeeds", "BackoffDue"];
     let (st, real) = walk(&m, &path, base);
     let mut b = st.clone();
@@ -840,10 +752,6 @@ fn tier1_the_buggy_model_and_three_tellers_are_refuted() {
         "{a:?}"
     );
 
-    // LANDED NOT BY A CLEAN DEFENSE: at the instruction's yield the Buggy
-    // model lands on the retired token, on a defense over a repository with
-    // work no remote main has, and on a defense naming a need; the real
-    // state lands on none of them, and the decider nudges.
     for yielded in ["YieldClaim", "YieldDefenseDirty", "YieldDefenseNeeds"] {
         let mut b = buggy.init_state();
         for action in ["Instruction", yielded] {
@@ -858,9 +766,6 @@ fn tier1_the_buggy_model_and_three_tellers_are_refuted() {
         assert!(!real.st.landed() && !real.st.task_done(), "{yielded}");
         assert_eq!(verdict(&real.clone().decide()), Verdict::Nudge, "{yielded}");
     }
-    // …while the clean defense lands it, and the decider types nothing more
-    // — even through a wall that cut the land act, its retry delivering it
-    // again.
     for path in [
         &["Instruction", "YieldDefense"][..],
         &["Instruction", "YieldWall", "WallAct", "YieldDefense"][..],
@@ -874,8 +779,6 @@ fn tier1_the_buggy_model_and_three_tellers_are_refuted() {
         );
     }
 
-    // A LANDED TASK NUDGED (landed at the wall's retry, no back-off run):
-    // the Buggy model types into it; the real decider types nothing.
     let (st, real) = walk(
         &m,
         &["Instruction", "YieldWall", "WallAct", "YieldDefense"],
@@ -886,8 +789,6 @@ fn tier1_the_buggy_model_and_three_tellers_are_refuted() {
     assert!(!buggy.check_invariant("NeverTypeIntoALandedTask", &b));
     assert_eq!(verdict(&real.clone().decide()), Verdict::Nothing);
 
-    // A LANDED RECORD AT A WALL: the Buggy model takes it on there, the wall
-    // stranded; the real state refuses it, and the decider retries.
     let (st, mut real) = walk(&m, &["OtherTurnWall"], base);
     let mut b = st.clone();
     assert!(buggy.fire("SeedLanded", &mut b), "{st:?}");
@@ -905,22 +806,11 @@ fn tier1_the_buggy_model_and_three_tellers_are_refuted() {
 /// run); read, with the yield's own legs, from a land act's yield that did
 /// not land — and every hold the model can tell is told somewhere on the
 /// walk.
-///
-/// NEGATIVE CONTROLS: a teller that tells the face and never the hold, one
-/// told at points alone (never at a live read: beside `fold_point`'s call,
-/// not inside `tell_face`), and one never told at an act's ledger row each
-/// fail the walk; and the model's own mutant, `StaleHold = 1`, is refuted
-/// by `TheHostIsToldWhatHoldsTheLanding` alone, every other law holding —
-/// and so is `Buggy = 2`, the dial that turns it on in `aterm-models`'
-/// `non_vacuity` sweep (which turns `Buggy` alone), so the sweep sees the
-/// hold's law broken by a mutant of its own.
 #[test]
 fn tier1_the_real_teller_tells_what_holds_the_landing() {
     let m = supervisor_land_model();
     let seen = walk_all(&m, Teller::Loop, HoldTeller::Loop)
         .unwrap_or_else(|e| panic!("the hold told: {e}"));
-    // None; unread; read with each yield's legs: no defense (a claim, work,
-    // a question), open work, the repository's, a need.
     for hold in [
         "hold=0 hlegs=0",
         "hold=1 hlegs=0",
@@ -932,7 +822,6 @@ fn tier1_the_real_teller_tells_what_holds_the_landing() {
         assert!(seen.contains_key(hold), "{hold} never told: {seen:?}");
     }
 
-    // THE TELLERS THAT MISS A MOVE: each fails the walk on the hold.
     for teller in [
         HoldTeller::Never,
         HoldTeller::AtPointsOnly,
@@ -945,8 +834,6 @@ fn tier1_the_real_teller_tells_what_holds_the_landing() {
         );
     }
 
-    // THE MODEL'S MUTANT: a yield tells the face and leaves the hold as it
-    // was. The face law holds; only the hold's law refutes it.
     assert!(
         aterm_spec::interp::violated_invariants(&m).is_empty(),
         "the model proper breaks a law"
@@ -965,7 +852,6 @@ fn tier1_the_real_teller_tells_what_holds_the_landing() {
         BTreeSet::from(["TheHostIsToldWhatHoldsTheLanding"]),
         "the sweep's own dial"
     );
-    // …first where the instruction's yield names open work: told unread.
     let mut st = stale.init_state();
     for action in ["Instruction", "YieldOpenDefense"] {
         assert!(stale.fire(action, &mut st), "{action} at {st:?}");

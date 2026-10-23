@@ -19,6 +19,15 @@
 //! # fn assert_deserializable<T: for<'de> serde::Deserialize<'de>>() {}
 //! # assert_deserializable::<Value>();
 //! ```
+//! # extern crate aterm_serde as serde;
+//! #[derive(aterm_serde_derive::Deserialize)]
+//! #[serde(untagged)]
+//! enum Value {
+//!     Number(u32),
+//!     Text(String),
+//! }
+//! # fn assert_deserializable<T: for<'de> serde::Deserialize<'de>>() {}
+//! # assert_deserializable::<Value>();
 
 use aterm_macro_support::{q, q_spanned};
 use proc_macro::{Ident, Literal, TokenStream};

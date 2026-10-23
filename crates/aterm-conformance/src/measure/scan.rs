@@ -248,6 +248,7 @@ pub fn saturated_hue_degrees(rgb: Rgb) -> Option<f64> {
 }
 
 /// HSV hue in `[0, 1)`, computed as Python's `colorsys.rgb_to_hsv` does it so
+/// the calibrated bucket edges stay where they were measured.
 fn hsv_hue([r, g, b]: Rgb) -> f64 {
     let (r, g, b) = (
         f64::from(r) / 255.0,
@@ -426,6 +427,7 @@ fn bounds(w: usize, members: &[usize]) -> (i64, i64, i64, i64) {
 }
 
 /// One object's band pixels under the height cap, or `None` when it is refused
+/// as too tall.
 fn count_band_object(
     w: usize,
     members: &[usize],

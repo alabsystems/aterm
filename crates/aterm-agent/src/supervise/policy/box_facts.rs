@@ -1,45 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FACTS A BOX WAS DECIDED ON: everything the approval policy's context
-//! ([`ApprovalCtx`]) holds that the loop LEARNED — by a control read, a
-//! look through a probe, or its own memory of the session — as opposed to
-//! what the owner's policy and the supervisor's own process say.
-//!
-//! The loop's `approval_ctx` used to be one effectful function that read the
-//! session and wrote the context field by field, so a decision's context
-//! could be had only by running the loop to it. It is two now: the loop
-//! gathers [`BoxFacts`] (the effectful part: the session's directory, its
-//! footer, the worker, its shell, its owner's ask rules, the dialog's own
-//! memory …), and [`ApprovalCtx::from`] builds the context from the policy,
-//! the process's inputs and those facts — a pure function, the one the loop
-//! decides through. A diagnostic reader can rebuild the context without
-//! running the loop, then decide from the facts its mark carries
-//! ([`BoxFacts::to_json`]), the header's policy and process inputs, and a
-//! probe answering from the tape (`aterm drive replay --why`, `tape::explain`).
-//!
-//! **On a tape** the facts are a JSON object in the decision's mark
-//! (`decide.approval`, `decide.question`), written by the recorder only:
-//! captured filesystem paths as the run's roots write them (`@home/…`).
-//! `OwnerAsk.source` is retained display text, outside that path projection.
-//! The worker is the DIGEST and pid the tape knows it by — never a variable of its
-//! environment ([`super::probe`]'s privacy line) — the shell's startup, the
-//! owner's asks and the Bash tool's directories as the derived answers their
-//! probes give.
-//!
-//! **Read by a later build**, every field is optional: a field the writing
-//! build had not grown reads at its default, and is NAMED in what the read
-//! says the decision needs ([`BoxFacts::from_json`]'s second value), so a
-//! diagnostic reader can name the facts a re-decision lacked, rather
-//! than present a default as what the recorded run knew. A field this build
-//! does not know is ignored.
+//! Session facts gathered before deciding an approval or question box.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use super::approval::{ApprovalCtx, QuestionPriority};
-use super::box_command::BoxCommand;
 use super::claude_settings::OwnerAsk;
 use super::git_config::WorkerEnv;
 use super::probe::{Answer, AskWire, ShellWire};
@@ -47,82 +15,63 @@ use super::shell_startup::ShellStartup;
 use crate::supervise::config::SupervisorConfig;
 use crate::supervise::run::ApprovalEnv;
 
-/// What the loop learned about a box before deciding it ([module docs](self)).
+/// Session and probe facts gathered by the loop before deciding a box.
 #[derive(Debug, Clone, Default)]
 pub struct BoxFacts {
-    /// The session's foreground program as `status program=` named it: the
-    /// reader the box was read with (`None`: the screen named it).
+    /// Foreground program name from `status program=`, or `None` if read from screen.
     pub program: Option<String>,
-    /// The session's working directory (`meta cwd=`); `None`: unknown.
+    /// Session working directory (`meta cwd=`), or `None` if unknown.
     pub cwd: Option<PathBuf>,
-    /// The one folder the session's own starter trusted for it (`meta
-    /// trusted_cwd=`, [`ApprovalCtx::trusted_cwd`]); `None`: none.
+    /// Folder trusted for this session by its starter (`meta trusted_cwd=`).
     pub trusted_cwd: Option<PathBuf>,
-    /// The agent a worker's spawn started on this session (`meta worker=`,
-    /// [`ApprovalCtx::worker_agent`]); `None`: no spawn's worker.
+    /// Agent started by a worker spawn on this session (`meta worker=`).
     pub worker_agent: Option<aterm_phase::Program>,
-    /// The footer last read names bypass mode.
+    /// Whether the last read footer names bypass mode.
     pub bypass: bool,
-    /// A limit reset was passed over at this dialog's mount.
+    /// Whether a limit reset was passed over at this dialog's mount.
     pub limit_reset_passed: bool,
-    /// Gemini CLI's usage-limit dialog is due its `Keep trying`: its named
-    /// reset, the grace and the loop's back-off have passed, or, naming none,
-    /// its ladder's rung ([`ApprovalCtx::limit_retry`]).
+    /// Whether Gemini CLI's usage-limit dialog is due its `Keep trying` retry.
     pub limit_retry: bool,
-    /// The worker, where it was read (a box that may run git, a Bash box, a
-    /// box an ask rule may have sent), or why it could not be; `None`: not
-    /// read.
+    /// Worker environment where read, or why it could not be read.
     pub worker: Option<Result<WorkerEnv, String>>,
-    /// Where the worker's Bash tool may stand beyond the cwd.
+    /// Additional directories where the worker's Bash tool may stand.
     pub shell_cwds: Vec<PathBuf>,
-    /// What the Bash tool's shell starts with, where read; `None`: not read.
+    /// Bash tool shell startup configuration where read.
     pub shell: Option<Result<ShellStartup, String>>,
-    /// The ask rules and hooks of the agent's own settings, where read.
+    /// Ask rules and hooks from the agent's settings where read.
     pub owner_asks: Option<Result<Vec<OwnerAsk>, String>>,
-    /// The pane's width in cells (`0`: the widest row).
+    /// Pane width in cells (`0` uses the widest row).
     pub screen_cols: u16,
-    /// The pane's height in rows (`0`: the count of rows read).
+    /// Pane height in rows (`0` uses the count of rows read).
     pub screen_rows: usize,
-    /// How a question dialog is answered, for a question only.
+    /// Question answering configuration when the dialog is a question.
     pub question: Option<QuestionFacts>,
-    /// A tool candidate from the agent's transcript.
+    /// Tool candidate from the agent's transcript.
     pub box_call: Option<String>,
-    /// The agent transcript's one pending Bash call, or why none was taken
-    /// ([`ApprovalCtx::box_command`]); `None`: not read.
-    pub box_command: Option<Result<BoxCommand, String>>,
-    /// The `/login` picker is behind the loop's own `/login`
-    /// ([`ApprovalCtx::login_carry`]).
+    /// Whether the `/login` picker is behind the loop's own `/login`.
     pub login_carry: bool,
-    /// The `/login` picker is behind the loop's own `/login`, and the login
-    /// came back in another tab since ([`ApprovalCtx::login_back`]).
+    /// Whether the login came back in another tab while `/login` was carried.
     pub login_back: bool,
-    /// The `/login` picker is behind the loop's own `/login`, and a renewal
-    /// the tab follows replaced the login it signs in
-    /// ([`ApprovalCtx::login_renewed`]).
+    /// Whether a followed renewal replaced the login while `/login` was carried.
     pub login_renewed: bool,
-    /// The method the session's login already is, as its host read it
-    /// ([`ApprovalCtx::login_method`]), for the picker of the loop's own
-    /// `/login` only; `None`: not read, or nothing says.
+    /// Existing login method read by the host for the loop's own `/login` picker.
     pub login_method: Option<aterm_phase::LoginMethod>,
 }
 
-/// How a question dialog was to be answered, as the session's word, the
-/// table and the loop's memory of the dialog said.
+/// How a question dialog is to be answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuestionFacts {
-    /// It is answered at all.
+    /// Whether the question is answered at all.
     pub answer: bool,
-    /// By which priority (the recommended option where a text priority's
-    /// fences are missing).
+    /// Priority used to answer the question.
     pub priority: QuestionPriority,
-    /// The priority whose text the loop wrote into its free-text row.
+    /// Priority whose text the loop wrote into the free-text row.
     pub own: Option<QuestionPriority>,
-    /// The loop already fell back to the recommended option on this tab.
+    /// Whether the loop already fell back to the recommended option on this tab.
     pub fell_back: bool,
 }
 
-/// Every field a mark's facts may carry: what a read that lacks one says the
-/// decision needs ([`BoxFacts::from_json`]).
+/// Every field name carried by serialized `BoxFacts`.
 pub const FIELDS: &[&str] = &[
     "program",
     "cwd",
@@ -139,7 +88,6 @@ pub const FIELDS: &[&str] = &[
     "screen_rows",
     "question",
     "box_call",
-    "box_command",
     "login_carry",
     "login_back",
     "login_renewed",
@@ -147,14 +95,7 @@ pub const FIELDS: &[&str] = &[
 ];
 
 impl ApprovalCtx {
-    /// THE CONTEXT A BOX IS DECIDED IN, built from the owner's policy
-    /// `config`, the supervisor's process inputs `env`, the `python3` globs
-    /// the classifier reads as reads (`allow`), and what the loop learned of
-    /// the box (`facts`) — the pure half of the loop's context
-    /// ([module docs](self)): the loop decides through it, and a reader of a
-    /// tape decides again through it from the facts a mark carries. `probe`
-    /// is how the decision looks at the machine (the loop's door, or a probe
-    /// answering from a tape).
+    /// Builds an [`ApprovalCtx`] from supervisor policy, process environment, and [`BoxFacts`].
     #[must_use]
     pub fn from(
         config: &SupervisorConfig,
@@ -174,13 +115,9 @@ impl ApprovalCtx {
         ctx.set_trust_roots(&config.trust_roots, env.uid);
         ctx.trusted_cwd.clone_from(&facts.trusted_cwd);
         ctx.worker_agent = facts.worker_agent;
-        // A safe rule a withdrawn key took away (`config::Withheld`): its roots.
         if config.withheld.rm_breaker {
             ctx.scratch_roots.clear();
         }
-        // An unproven rm breaker is approved with a warning under `safe`
-        // unless the owner asked for it (`rm_breaker_ask`), or the withdrawn
-        // `rm_breaker = false` said no rm is answered at all.
         ctx.rm_breaker_warn = !config.rm_breaker_ask && !config.withheld.rm_breaker;
         if config.withheld.read_outside_cwd {
             ctx.read_roots.clear();
@@ -191,15 +128,9 @@ impl ApprovalCtx {
         ctx.model_fallback = config.model_fallback.is_some();
         ctx.limit_wait = config.limit_wait;
         ctx.autocompact_offer = config.autocompact_offer;
-        // The grant row's rule, under `[harness] limit_reset` — and never
-        // again at a dialog mount the reset was passed over for.
         ctx.limit_reset = config.limit_reset && !facts.limit_reset_passed;
         ctx.reset_kinds.clone_from(&config.limit_reset_kinds);
-        // Gemini CLI's `Keep trying`, past the reset its dialog names: the
-        // loop's clock, a fact of the box.
         ctx.limit_retry = facts.limit_retry;
-        // A credits consent, under `[harness] usage_credits` alone: policy,
-        // no fact of the box.
         ctx.usage_credits = config.usage_credits;
         ctx.python_allow = allow.to_vec();
         if let Some(worker) = &facts.worker {
@@ -223,7 +154,6 @@ impl ApprovalCtx {
             }
         }
         ctx.box_call = facts.box_call.clone();
-        ctx.box_command = facts.box_command.clone();
         ctx.login_carry = facts.login_carry;
         ctx.login_back = facts.login_back;
         ctx.login_renewed = facts.login_renewed;
@@ -231,8 +161,6 @@ impl ApprovalCtx {
         ctx
     }
 }
-
-// -- the facts on a tape ------------------------------------------------------
 
 /// The facts as a mark holds them: every field optional ([module docs](self)).
 #[derive(Serialize, Deserialize, Default)]
@@ -253,18 +181,10 @@ struct Wire {
     screen_rows: u64,
     question: Option<QuestionWire>,
     box_call: Option<String>,
-    box_command: Option<Answer<CommandWire>>,
     login_carry: bool,
     login_back: bool,
     login_renewed: bool,
     login_method: Option<String>,
-}
-
-/// The transcript's pending Bash call as a tape holds it: its id and command.
-#[derive(Serialize, Deserialize)]
-struct CommandWire {
-    id: String,
-    command: String,
 }
 
 /// The worker as a tape knows it: its digest (sixteen hex digits) and pid.
@@ -283,11 +203,7 @@ struct QuestionWire {
 }
 
 impl BoxFacts {
-    /// The facts as a decision's mark holds them ([module docs](self)): each
-    /// captured filesystem path as `path` writes it (the run's roots), the
-    /// worker by its digest under the tape's `seed` and its pid. Path bytes use
-    /// the existing lossy UTF-8 text convention, so arbitrary Unix byte paths
-    /// may not round-trip.
+    /// Serializes these facts to JSON for a decision mark using `path` and `seed`.
     #[must_use]
     pub fn to_json(&self, seed: u64, path: &dyn Fn(&Path) -> Vec<u8>) -> String {
         let text = |p: &Path| String::from_utf8_lossy(&path(p)).into_owned();
@@ -324,33 +240,19 @@ impl BoxFacts {
                 fell_back: q.fell_back,
             }),
             box_call: self.box_call.clone(),
-            box_command: self.box_command.as_ref().map(|c| match c {
-                Ok(c) => Answer::Ok(CommandWire {
-                    id: c.id.clone(),
-                    command: c.command.clone(),
-                }),
-                Err(why) => Answer::Err(why.clone()),
-            }),
             login_carry: self.login_carry,
             login_back: self.login_back,
             login_renewed: self.login_renewed,
             login_method: self.login_method.map(|m| m.word().to_string()),
         };
-        // The wire holds strings, numbers, booleans and lists of them, which
-        // always serialize.
         aterm_json::to_string(&wire).unwrap_or_default()
     }
 
-    /// A mark's facts read back, recorded filesystem path text decoded by
-    /// `roots_decode` (the tape's roots): the facts, and the fields not carried —
-    /// read at their defaults, which a re-decision NEEDS and did not have
-    /// ([module docs](self)).
+    /// Deserializes [`BoxFacts`] from JSON, returning the facts and any omitted field names.
     ///
     /// # Errors
     ///
-    /// Text that is no JSON object, or a field whose value this build cannot
-    /// read (a worker's digest that is not hex, a priority it does not
-    /// know, a path under a root the header does not name).
+    /// Returns an error if `text` is not a valid JSON object or a field value cannot be decoded.
     pub fn from_json(
         text: &str,
         roots_decode: &dyn Fn(&[u8]) -> Result<PathBuf, String>,
@@ -432,13 +334,6 @@ impl BoxFacts {
                 })
                 .transpose()?,
             box_call: wire.box_call,
-            box_command: wire.box_command.map(|c| match c {
-                Answer::Ok(c) => Ok(BoxCommand {
-                    id: c.id,
-                    command: c.command,
-                }),
-                Answer::Err(why) => Err(why),
-            }),
             login_carry: wire.login_carry,
             login_back: wire.login_back,
             login_renewed: wire.login_renewed,

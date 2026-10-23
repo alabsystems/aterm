@@ -1,27 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The platform I/O a program's output asks aterm for (an OSC 52 query's pasteboard read; a
-//! Kitty `t=f`/`t=t`/`t=s` transmission's file or shared-memory read), done by the session's PTY
-//! reader before it takes the terminal lock, never inside `Terminal::process()`.
-//!
-//! The engine asks for both through host callbacks inside `process()`, under the terminal lock.
-//! A pasteboard read can block on a Universal Clipboard fetch or a busy lazy provider, a file
-//! read on an evicted iCloud file or a stalled SMB/NFS volume; holding the lock that long stops
-//! the redraw in every window. Both are opt-in (`allow_osc52_query`, `allow_kitty_file_transfer`).
-//!
-//! [`Prefetch::reads`] scans each slice (with the unfinished tail of the one before) for complete
-//! OSC 52 queries and non-direct Kitty transmissions, does each read the session admits
-//! ([`Flags`], read under the previous hold), and keeps the results on the reader's thread until
-//! the slice is fed; the callbacks only take a result ([`take_clipboard_query`],
-//! [`take_kitty_medium`]). A read the scan did not do (a terminator it does not read, such as an
-//! 8-bit ST in C1 mode; a file named across chunks; the slice right after a session first admits
-//! a query) is answered as a failed read (no reply, a refused image), never done under the lock.
-//!
-//! What a slice's reads hold is bounded: the pasteboard is read once per slice however many
-//! queries share it, and media reads stop at the command that finds [`READ_BUDGET`] already
-//! held. The slice is cut there ([`Burst::covered`]); the rest is the next slice's, read once
-//! this one is fed and its media dropped.
+//! Unlocked PTY-reader prefetch for OSC 52 queries and Kitty file/shm transfers
+//! ([`Prefetch::reads`], [`Flags`], [`take_clipboard_query`], [`take_kitty_medium`],
+//! [`READ_BUDGET`], [`Burst::covered`]).
 
 use std::cell::RefCell;
 
@@ -35,17 +17,13 @@ const SUB: u8 = 0x1a;
 /// The 8-bit string terminator, which ends an APC whatever the C1 mode.
 const ST8: u8 = 0x9c;
 
-/// The longest unfinished candidate carried from one slice to the next: a
-/// Kitty command naming a file is a few hundred bytes, an OSC 52 query a dozen.
+/// The longest unfinished candidate carried from one slice to the next.
 const CARRY_MAX: usize = 16 * 1024;
 
-/// What the media one slice's reads hold may reach before they stop: one
-/// largest medium (`spawn::MAX_KITTY_MEDIUM_BYTES`). The read that reaches it
-/// is the slice's last, so a slice never holds two largest media's worth.
+/// What the media one slice's reads hold may reach before they stop.
 const READ_BUDGET: usize = crate::spawn::MAX_KITTY_MEDIUM_BYTES as usize;
 
-/// What one session admits, read by its reader under each term-lock hold for
-/// the slice after it ([`Flags::of`]). With neither, a slice is not scanned.
+/// What one session admits, updated under each term-lock hold ([`Flags::of`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Flags {
     clipboard_query: bool,
@@ -53,9 +31,7 @@ struct Flags {
 }
 
 impl Flags {
-    /// The session's flags now. On Linux a query is answered only from aterm's
-    /// own selection, a read that never blocks (`spawn::install_clipboard`), so
-    /// there is nothing to fetch for it.
+    /// The session's flags now.
     fn of(t: &Terminal) -> Self {
         Self {
             clipboard_query: cfg!(not(target_os = "linux")) && t.clipboard_query_admitted(),
@@ -75,17 +51,14 @@ enum Request {
     Kitty(KittyMedium, String),
 }
 
-/// What this thread fetched for the slice it is feeding, and the unfinished
-/// candidate the last slice ended in.
+/// What this thread fetched for the slice it is feeding.
 #[derive(Default)]
 struct Fetched {
-    /// The pasteboard as read for this slice's queries, and how many of them
-    /// have yet to take it.
+    /// The pasteboard as read for this slice's queries, and how many of them have yet to take it.
     clipboard: Option<String>,
     queries: usize,
     kitty: Vec<(KittyMedium, String, Option<Vec<u8>>)>,
-    /// The media the engine took ([`take_kitty_medium`]) and whether their read
-    /// returned bytes: consumed once the slice is fed ([`Burst`]'s drop).
+    /// Media taken by [`take_kitty_medium`], consumed when [`Burst`] drops.
     taken: Vec<(KittyMedium, String, bool)>,
     carry: Vec<u8>,
 }
@@ -94,17 +67,14 @@ thread_local! {
     static FETCHED: RefCell<Fetched> = RefCell::new(Fetched::default());
 }
 
-/// A PTY reader's side of the prefetch: what its session admits, read under
-/// each hold for the slice after it, and once, briefly, before the first.
+/// A PTY reader's side of the prefetch.
 #[derive(Default)]
 pub(crate) struct Prefetch {
     flags: Option<Flags>,
 }
 
 impl Prefetch {
-    /// Do the reads `slice` asks for that the session admits, before the hold
-    /// that feeds it. The hold feeds `slice[..covered]` ([`Burst::covered`]);
-    /// the rest is the next slice.
+    /// Prefetch the reads `slice` asks for that the session admits ([`Burst::covered`]).
     pub(crate) fn reads(&mut self, term: &std::sync::Mutex<Terminal>, slice: &[u8]) -> Burst {
         let flags = *self
             .flags
@@ -118,22 +88,14 @@ impl Prefetch {
     }
 }
 
-/// The reads one slice asked for, held until it has been fed: dropping it
-/// discards whatever the engine did not take, and consumes the `t=t` files and
-/// `t=s` objects it did (`spawn::consume_kitty_medium`), after the hold. A medium
-/// the engine refused before asking for it (a size it does not load, its resolver
-/// gone with a reload, a string past its budget) is left where the program put
-/// it: before (2026-10-14), the read consumed it.
+/// The reads one slice asked for, held until it has been fed.
 pub(crate) struct Burst {
     covered: usize,
     consume: fn(KittyMedium, &str, bool),
 }
 
 impl Burst {
-    /// Do the reads `slice` asks for that `flags` admits, before any term-lock
-    /// hold, through the platform: the pasteboard (`control::pbpaste`, an empty
-    /// one read as an empty answer) and the Kitty medium readers
-    /// (`spawn::read_kitty_medium`).
+    /// Do the reads `slice` asks for that `flags` admits.
     fn begin(slice: &[u8], flags: Flags) -> Self {
         Self::begin_with(
             slice,
@@ -144,8 +106,7 @@ impl Burst {
         )
     }
 
-    /// [`Self::begin`] with the readers, and what consumes a taken medium, as
-    /// parameters.
+    /// [`Self::begin`] with the readers, and what consumes a taken medium, as parameters.
     fn begin_with(
         slice: &[u8],
         flags: Flags,
@@ -195,11 +156,6 @@ impl Burst {
                 }
             }
             match cut {
-                // The slice ends before the command the budget stopped at. A
-                // read came before it, so it begins at or past the carry's end
-                // (the carry holds one escape's start and none of its end);
-                // where it begins right there, the slice takes its ESC and
-                // carries it, so every slice feeds at least one byte.
                 Some(at) => {
                     let end = at.max(carried + 1);
                     fetched.carry = region[at..end].to_vec();
@@ -218,9 +174,7 @@ impl Burst {
         Self { covered, consume }
     }
 
-    /// How much of the slice its reads cover, from its start: the bytes the
-    /// hold feeds. All of it, unless the media reads stopped at
-    /// [`READ_BUDGET`].
+    /// Prefix length of the slice covered by its reads ([`READ_BUDGET`]).
     pub(crate) const fn covered(&self) -> usize {
         self.covered
     }
@@ -243,9 +197,7 @@ impl Drop for Burst {
     }
 }
 
-/// The OSC 52 query callback's answer: the pasteboard as read for the slice
-/// being fed on this thread, for as many queries as the scan found in it, or
-/// `None` (no reply) when none was read.
+/// The OSC 52 query callback's answer.
 #[cfg(any(not(target_os = "linux"), test))]
 pub(crate) fn take_clipboard_query() -> Option<String> {
     FETCHED.with(|cell| {
@@ -259,9 +211,7 @@ pub(crate) fn take_clipboard_query() -> Option<String> {
     })
 }
 
-/// The Kitty medium resolver: the bytes read for `(medium, name)` in the slice
-/// being fed on this thread, or `None` (the image refused) when none were. A
-/// medium taken is consumed once the slice is fed ([`Burst`]).
+/// Take the prefetched Kitty medium `(medium, name)` for the slice being fed ([`Burst`]).
 pub(crate) fn take_kitty_medium(medium: KittyMedium, name: &str) -> Option<Vec<u8>> {
     FETCHED.with(|cell| {
         let mut fetched = cell.try_borrow_mut().ok()?;
@@ -275,14 +225,7 @@ pub(crate) fn take_kitty_medium(medium: KittyMedium, name: &str) -> Option<Vec<u
     })
 }
 
-/// Every complete request in `region`, in order, with where its escape
-/// begins, and where an unfinished one that could still become a request
-/// begins.
-///
-/// It reads the strings as the parser does: `ESC ]` opens an OSC, which BEL or
-/// ESC ends and dispatches; `ESC _` opens an APC, which ESC or the 8-bit ST
-/// ends and dispatches; CAN and SUB cancel either. An ESC always ends the
-/// string it falls in and starts an escape.
+/// Every complete request in `region`.
 fn scan(region: &[u8]) -> (Vec<(usize, Request)>, Option<usize>) {
     let mut requests = Vec::new();
     let mut i = 0;
@@ -326,15 +269,12 @@ fn scan(region: &[u8]) -> (Vec<(usize, Request)>, Option<usize>) {
                 requests.push((at, request));
             }
         }
-        // Resume at the terminator: an ESC there begins the next escape.
         i = body_at + len + usize::from(body_rest[len] != ESC);
     }
     (requests, None)
 }
 
-/// A whole OSC body that the engine answers as a clipboard query: `52`, a
-/// selection list naming at least one selection (or none, which is the
-/// clipboard), and `?` as its data.
+/// A whole OSC body that the engine answers as a clipboard query.
 fn is_osc52_query(body: &[u8]) -> bool {
     let mut fields = body.split(|&b| b == b';');
     fields.next() == Some(b"52")
@@ -347,8 +287,7 @@ fn is_osc52_query(body: &[u8]) -> bool {
         && fields.next() == Some(b"?")
 }
 
-/// Whether an OSC body cut off by the end of a burst could still become an
-/// OSC 52 query.
+/// Whether an OSC body cut off by the end of a burst could still become an OSC 52 query.
 fn could_be_osc52_query(body: &[u8]) -> bool {
     let mut fields = body.split(|&b| b == b';');
     let command = fields.next().unwrap_or_default();
@@ -359,8 +298,7 @@ fn could_be_osc52_query(body: &[u8]) -> bool {
     }
 }
 
-/// A whole APC body the engine resolves through the host: a Kitty transmit or
-/// frame (whose data it reads) on a non-direct medium, in one command.
+/// A whole APC body the engine resolves through the host.
 fn kitty_medium_request(body: &[u8]) -> Option<Request> {
     let command = parse_kitty_command(body)?;
     let reads = matches!(
@@ -374,8 +312,6 @@ fn kitty_medium_request(body: &[u8]) -> Option<Request> {
     (!name.is_empty()).then_some(Request::Kitty(command.medium, name))
 }
 
-/// Feed `bytes` to `term` as the PTY reader feeds a burst: slice by slice,
-/// each slice's reads first, with the terminal unlocked, then the hold that
 /// processes what they cover.
 #[cfg(test)]
 pub(crate) fn feed_as_reader(term: &std::sync::Mutex<Terminal>, bytes: &[u8]) {
@@ -395,8 +331,6 @@ pub(crate) fn feed_as_reader(term: &std::sync::Mutex<Terminal>, bytes: &[u8]) {
 mod tests {
     use super::*;
 
-    /// The reads one slice makes through counting readers, and what the
-    /// engine can take of them: (pasteboard reads, queries answered, medium
     /// reads by name).
     fn reads(slice: &[u8], flags: Flags) -> (usize, usize, Vec<String>) {
         let mut pasteboard = 0;
@@ -425,7 +359,6 @@ mod tests {
         kitty_media: true,
     };
 
-    /// A Kitty command naming `path` (base64 in its payload, as the protocol
     /// carries it), ST-terminated.
     fn file(control: &str, path: &str) -> Vec<u8> {
         let mut apc = format!("\x1b_G{control};").into_bytes();
@@ -438,9 +371,6 @@ mod tests {
         apc
     }
 
-    /// A slice is read for exactly the requests the engine sends the host (an OSC 52 query, BEL-
-    /// or ST-terminated, with one pasteboard read for all of a slice's queries; a Kitty transmit
-    /// naming a file, whole or cut across two slices) and for nothing else: an OSC 52 set, a
     /// canceled query, a Kitty query or chunked load, or anything the session does not admit.
     #[test]
     fn a_burst_is_read_for_the_requests_the_engine_will_make() {
@@ -455,7 +385,6 @@ mod tests {
         assert_eq!(reads(&ignored, ALL), (0, 0, vec![]));
         assert_eq!(reads(&burst, Flags::default()), (0, 0, vec![]));
 
-        // Cut anywhere, the second half completes what the first began.
         for cut in 1..burst.len() {
             let (head, tail) = burst.split_at(cut);
             let first = reads(head, ALL);
@@ -478,11 +407,6 @@ mod tests {
         CONSUMED.with(|consumed| consumed.borrow_mut().push((name.to_string(), read)));
     }
 
-    /// A MEDIUM IS CONSUMED ONLY ONCE THE ENGINE TOOK IT, AFTER THE SLICE IS
-    /// FED: of the `t=t` files read for a slice, the one the
-    /// engine asks for is consumed, with whether its read returned bytes, when
-    /// the burst drops (after the hold), never at the read or under the hold;
-    /// the one it never asks for (a raw transmission declaring no size, which
     /// the engine refuses before resolving) is not consumed at all.
     #[test]
     fn only_a_medium_the_engine_took_is_consumed_after_the_slice() {
@@ -521,8 +445,6 @@ mod tests {
     /// The largest medium a read returns.
     const LARGEST: usize = crate::spawn::MAX_KITTY_MEDIUM_BYTES as usize;
 
-    /// Feed `parts` (the PTY's reads) slice by slice as the reader does, each
-    /// medium read returning [`LARGEST`] bytes: the names read, in order, and
     /// the most one slice's reads held.
     fn feed_largest(parts: &[&[u8]]) -> (Vec<String>, usize) {
         let mut names = Vec::new();
@@ -550,9 +472,6 @@ mod tests {
         (names, most)
     }
 
-    /// A burst of short `t=f` commands, each naming a largest-size file, is read slice by slice:
-    /// no slice holds more than two largest media, and each command is read once, in order,
-    /// however the PTY's reads cut the burst, including right before an ESC that ends one
     /// command and begins the next.
     #[test]
     fn a_slice_holds_at_most_two_largest_media_and_reads_each_once() {
@@ -565,7 +484,6 @@ mod tests {
         assert_eq!(read, names);
         assert!(most <= 2 * LARGEST, "one slice held {most} bytes of media");
 
-        // Commands each ended by the next one's ESC, cut at every byte.
         let short = &names[..4];
         let mut adjacent: Vec<u8> = short
             .iter()

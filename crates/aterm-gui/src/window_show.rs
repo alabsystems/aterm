@@ -301,6 +301,7 @@ impl crate::App {
     }
 
     /// [`Self::settle_carried_window_show`]'s body; `may_stack` is whether this
+    /// caller may apply the stack.
     fn settle_carried_window_show_as(&mut self, may_stack: bool) -> Vec<ShowOp<WindowId>> {
         if self.carried_window_show.is_none() {
             return Vec::new();
@@ -430,6 +431,7 @@ impl crate::App {
     }
 
     /// Stage 2: re-enter the carried full screens once it is safe — the stack
+    /// is on glass, the process owns every window, and aterm is the active app.
     fn enter_carried_fullscreen_if_due(&mut self) -> Vec<ShowOp<WindowId>> {
         let Some(carried) = self.carried_window_show.as_ref() else {
             return Vec::new();
@@ -467,7 +469,7 @@ impl crate::App {
             .is_some_and(|carried| carried.fullscreen_pending(window))
     }
 
-    /// Perform one operation on the window's OS window. A window with none — a
+    /// Perform one operation on the window's OS window.
     fn perform_show_op(&self, op: ShowOp<WindowId>) {
         let (ShowOp::Minimize(window) | ShowOp::Raise(window) | ShowOp::EnterFullScreen(window)) =
             op;
@@ -504,6 +506,7 @@ mod tests {
     }
 
     /// The MRU is the stack: the most recently focused window is rank 0, and
+    /// a window closed since it was focused is not ranked at all.
     #[test]
     fn stacking_ranks_follow_the_focus_mru() {
         let ranks = stacking_ranks(&[1_u64, 2, 3], &[9, 1, 3, 2]);
@@ -511,6 +514,8 @@ mod tests {
     }
 
     /// A window that never gained focus sits in front of every window that did
+    /// (its reveal ordered it front and nothing has reordered since), newest
+    /// first — the successor that restored while the user was elsewhere.
     #[test]
     fn never_focused_windows_rank_in_front_newest_first() {
         let ranks = stacking_ranks(&[1_u64, 2, 3, 4], &[2, 1]);
@@ -549,6 +554,8 @@ mod tests {
     }
 
     /// A carried full screen this process has not re-entered yet (aterm has
+    /// not been in front since the update) is still captured AS full screen,
+    /// so a second update does not forget it.
     #[test]
     fn a_pending_full_screen_is_captured_as_full_screen() {
         let probe = ShowProbe {
@@ -582,6 +589,8 @@ mod tests {
     }
 
     /// Three windows created in manifest order 1, 2, 3 (so the reveals left 3
+    /// key and in front), while the carried stack was 2 in front and key, then
+    /// 1, then 3: the plan raises back to front with the key window last.
     #[test]
     fn the_stack_is_raised_back_to_front_with_the_key_window_last() {
         let windows = [
@@ -601,6 +610,7 @@ mod tests {
     }
 
     /// The key flag outranks the stack when the two disagree (a window the app
+    /// keyed without a focus event): the key window is raised last either way.
     #[test]
     fn the_key_flag_outranks_the_stack() {
         let windows = [(1_u64, show(0, false)), (2, show(1, true))];
@@ -610,6 +620,8 @@ mod tests {
     }
 
     /// One window: its reveal already made it key and front, so there is
+    /// nothing to raise — a single-window update performs no extra AppKit call
+    /// unless it has to minimize or re-enter full screen, and records no carry.
     #[test]
     fn a_single_window_raises_nothing() {
         let plan = plan(&[(1_u64, show(0, true))], ShowLane::Handoff);
@@ -625,6 +637,7 @@ mod tests {
     }
 
     /// Minimized windows are minimized FIRST, never raised, never keyed; the
+    /// key moves to the frontmost window still on screen.
     #[test]
     fn minimized_windows_are_minimized_first_and_never_keyed() {
         let mut minimized_key = show(0, true);
@@ -644,6 +657,8 @@ mod tests {
     }
 
     /// The update lane reproduces the outgoing process exactly, even with
+    /// every window minimized; a cold launch the user started shows the
+    /// frontmost one instead.
     #[test]
     fn a_cold_launch_never_restores_every_window_minimized() {
         let mut back = show(1, false);
@@ -666,6 +681,8 @@ mod tests {
     }
 
     /// Full screen is re-entered back to front with the key window LAST, so
+    /// the user ends in the Space they were in; a minimized window is never
+    /// full-screened (AppKit cannot hold both).
     #[test]
     fn full_screen_is_re_entered_with_the_key_window_last() {
         let mut key = show(0, true);
@@ -685,6 +702,8 @@ mod tests {
     }
 
     /// A hand-edited or partial manifest is data: windows without a rank go
+    /// behind the ranked ones, ties keep manifest order, and a second `key`
+    /// loses to the first.
     #[test]
     fn gaps_ties_and_duplicate_keys_are_tolerated() {
         let unranked = WindowShow {
@@ -717,6 +736,9 @@ mod tests {
     }
 
     /// Stage 1 on the update lane: nothing moves while a carried window is
+    /// still waiting for its first present, then the stack goes on back to
+    /// front with the key window last, and the MRU and the front become that
+    /// stack — the rebuild had left window 2 in front, the carried key was 1.
     #[test]
     fn the_stack_waits_for_the_reveal_then_seeds_the_mru_and_the_front() {
         let (mut app, [w0, w1, w2]) = three_windows();
@@ -763,6 +785,7 @@ mod tests {
     }
 
     /// Window 2 was carried minimized, but every carried window is on glass
+    /// from its reveal until the stack, and the reveal left window 2 key.
     #[test]
     fn keys_typed_into_a_window_carried_minimized_keep_it_out_of_the_dock() {
         let windows = |[w0, w1, w2]: [WindowId; 3]| {
@@ -826,6 +849,7 @@ mod tests {
     }
 
     /// A carried window the user closed before its stage runs is dropped from
+    /// the plan — never raised, never keyed — and the rest still goes on.
     #[test]
     fn a_closed_window_is_dropped_from_the_carry() {
         let (mut app, [w0, w1, w2]) = three_windows();
@@ -847,6 +871,7 @@ mod tests {
     }
 
     /// A headless instance records no carry, and a headless capture records no
+    /// show state, so its layout wire omits `[windows.show]`.
     #[test]
     fn a_headless_app_carries_and_captures_nothing() {
         let (mut app, [w0, w1, _]) = three_windows();

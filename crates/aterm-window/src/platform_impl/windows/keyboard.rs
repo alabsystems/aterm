@@ -80,7 +80,7 @@ impl KeyEventBuilder {
         self.alt_code.lock().unwrap().key_down(vkey, alt, ctrl);
     }
 
-    /// LOCAL PATCH (aterm): a WM_CHAR no key-down claimed. `true` when it belongs to an Alt
+    /// LOCAL PATCH (aterm): a WM_CHAR no key-down claimed.
     fn alt_code_char(&self, hwnd: HWND, unit: u16) -> bool {
         if !self.alt_code.lock().unwrap().push(unit) {
             return false;
@@ -450,7 +450,7 @@ impl KeyEventBuilder {
     }
 }
 
-/// LOCAL PATCH (aterm): Windows' Alt-code entry. Alt held, a code typed on the NumLock-on
+/// LOCAL PATCH (aterm): Windows' Alt-code entry.
 #[derive(Default)]
 struct AltCode {
     armed: bool,
@@ -776,6 +776,7 @@ fn get_kbd_state() -> [u8; 256] {
 }
 
 /// Gets the current keyboard state regardless of whether the corresponding keyboard events have
+/// been removed from the event queue.
 #[allow(clippy::uninit_assumed_init)]
 fn get_async_kbd_state() -> [u8; 256] {
     #[cfg(any(test, debug_assertions))]
@@ -1123,6 +1124,7 @@ mod alt_code_tests {
     };
 
     /// Alt, 0, 2, 3, 3 on the keypad, then Alt's release posts `é` as one WM_CHAR: the
+    /// code takes it and hands it over whole, once.
     #[test]
     fn an_alt_code_hands_over_its_character() {
         let mut code = AltCode::default();
@@ -1146,6 +1148,7 @@ mod alt_code_tests {
     }
 
     /// Nothing arms without Alt, Ctrl+Alt (AltGr) does not, and a key that is not a
+    /// modifier disarms: those WM_CHARs stay upstream's (an IME's, or nobody's).
     #[test]
     fn only_alt_and_a_keypad_digit_arm_it() {
         let mut code = AltCode::default();

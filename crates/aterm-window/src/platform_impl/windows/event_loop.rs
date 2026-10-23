@@ -104,6 +104,12 @@ use super::window::set_skip_taskbar;
 use super::SelectedCursor;
 
 /// some backends like macos uses an uninhabited `Never` type,
+/// on windows, `UserEvent`s are also dispatched through the
+/// WNDPROC callback, and due to the re-entrant nature of the
+/// callback, recursively delivered events must be queued in a
+/// buffer, the current implementation put this queue in
+/// `EventLoopRunner`, which is shared between the event pumping
+/// loop and the callback.
 pub(crate) struct UserEventPlaceholder;
 
 pub(crate) struct WindowData {
@@ -118,9 +124,13 @@ pub(crate) struct WindowData {
 }
 
 /// `WM_SIZE`'s `wParam` for a minimize (the vendored windows-sys carries only
+/// `SIZE_MAXIMIZED`).
 const SIZE_MINIMIZED: u32 = 1;
 
 /// aterm: the `Occluded` edge one `WM_SIZE` makes, given whether the window was
+/// minimized at the last one (`was`, updated here): `Some(true)` as it minimizes,
+/// `Some(false)` as it comes back (restored or maximized), `None` for every other
+/// resize.
 fn minimize_edge(was: &Cell<bool>, wparam: WPARAM) -> Option<bool> {
     let minimized = wparam == SIZE_MINIMIZED as usize;
     (was.replace(minimized) != minimized).then_some(minimized)
@@ -137,6 +147,7 @@ mod minimize_edge_tests {
     const SIZE_RESTORED: u32 = 0;
 
     /// A minimize and its return are one edge each; the resize steps of a drag
+    /// and a maximize of a shown window are none.
     #[test]
     fn only_the_edges_of_a_minimize_are_occlusion() {
         let was = Cell::new(false);
@@ -522,6 +533,8 @@ fn main_thread_id() -> u32 {
 }
 
 /// Returns the minimum `Option<Duration>`, taking into account that `None`
+/// equates to an infinite timeout, not a zero timeout (so can't just use
+/// `Option::min`)
 fn min_timeout(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
     a.map_or(b, |a_timeout| b.map_or(Some(a_timeout), |b_timeout| Some(a_timeout.min(b_timeout))))
 }
@@ -676,7 +689,7 @@ impl EventLoopThreadExecutor {
         self.thread_id == cur_thread_id
     }
 
-    /// Executes a function in the event loop thread. If we're already in the event loop thread,
+    /// Executes a function in the event loop thread.
     pub(super) fn execute_in_thread<F>(&self, mut function: F)
     where
         F: FnMut() + Send + 'static,
@@ -775,6 +788,7 @@ const SIZE_MOVE_PUMP_TIMER_ID: usize = 0x4154_524d;
 static THREAD_EVENT_TARGET_WINDOW_CLASS: Lazy<Vec<u16>> =
     Lazy::new(|| util::encode_wide("Winit Thread Event Target"));
 /// When the taskbar is created, it registers a message with the "TaskbarCreated" string and then
+/// broadcasts this message to all top-level windows <https://docs.microsoft.com/en-us/windows/win32/shell/taskbar#taskbar-creation-notification>
 pub(crate) static TASKBAR_CREATED: LazyMessageId = LazyMessageId::new("TaskbarCreated\0");
 
 fn create_event_target_window() -> HWND {
@@ -835,12 +849,14 @@ fn insert_event_target_window_data(
 }
 
 /// Capture mouse input, allowing `window` to receive mouse events when the cursor is outside of
+/// the window.
 unsafe fn capture_mouse(window: HWND, window_state: &mut WindowState) {
     window_state.mouse.capture_count += 1;
     unsafe { SetCapture(window) };
 }
 
 /// Release mouse input, stopping windows on this thread from receiving mouse input when the cursor
+/// is outside the window.
 unsafe fn release_mouse(mut window_state: MutexGuard<'_, WindowState>) {
     window_state.mouse.capture_count = window_state.mouse.capture_count.saturating_sub(1);
     if window_state.mouse.capture_count == 0 {
@@ -905,6 +921,7 @@ unsafe fn lose_active_focus(window: HWND, userdata: &WindowData) {
 }
 
 /// Any window whose callback is configured to this function will have its events propagated
+/// through the events loop of the thread the window was created in.
 pub(super) unsafe extern "system" fn public_window_callback(
     window: HWND,
     msg: u32,

@@ -153,7 +153,7 @@ pub struct MessagesState {
 impl MessagesState {
     /// Empty projection at revision 0.
     #[must_use]
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
             revision: 0,
             now_unix_ms: 0,
@@ -624,6 +624,7 @@ pub fn tag_words(tag: &str) -> Cow<'_, str> {
 }
 
 /// A script's own tag as a chip's words: capitalized like every chip beside it (`search`
+/// → `Search`), a two-letter tag an initialism (`ci` → `CI`).
 fn script_tag_words(tag: &str) -> Cow<'_, str> {
     let mut chars = tag.chars();
     let words = match chars.next() {
@@ -655,6 +656,8 @@ pub(crate) fn span_words(ms: u64) -> String {
 }
 
 /// Whether pressing `intent` from the page would still do the thing
+/// ([`MessageActionView::still_actionable`]): the facts are the host's, the rule is this
+/// match, and the press re-validates it.
 fn still_actionable(intent: &Intent, live: bool, host: &impl Host) -> bool {
     match intent {
         Intent::AgentUpgrade { tab, to, word } => host.upgrade_takes(tab, to, *word),
@@ -670,7 +673,8 @@ fn still_actionable(intent: &Intent, live: bool, host: &impl Host) -> bool {
         | Intent::OpenConfigEditor { .. }
         | Intent::OpenSystemPane { .. }
         | Intent::OpenLink { .. }
-        | Intent::NewWindow => host.performs_navigation(),
+        | Intent::NewWindow
+        | Intent::ReviewVaultSync => host.performs_navigation(),
     }
 }
 
@@ -685,6 +689,8 @@ pub(crate) fn cut_off_mark(glyph: Glyph, severity: Severity, state: &str) -> Gly
 }
 
 /// The LATER record that tells `rec`'s story on, when there is one: the
+/// record it was replaced by ([`Retired::Superseded`]), which stands for it on
+/// the page.
 fn told_on_by(log: &crate::log::MessageLog, rec: &LogRecord) -> Option<MessageId> {
     let Some(Retired::Superseded { by }) = rec.retired() else {
         return None;
@@ -694,6 +700,8 @@ fn told_on_by(log: &crate::log::MessageLog, rec: &LogRecord) -> Option<MessageId
 }
 
 /// Whether `intent` is a word for a tab whose upgrade this host does not have at all
+/// ([`Host::upgrade_stands`]): its session ended here or its move is over, so the word is
+/// moot.
 fn session_gone(intent: &Intent, host: &impl Host) -> bool {
     match intent {
         Intent::AgentUpgrade { tab, .. } => !host.upgrade_stands(tab),
@@ -701,7 +709,9 @@ fn session_gone(intent: &Intent, host: &impl Host) -> bool {
     }
 }
 
-/// Formats user-facing feedback after `intent` was performed or refused.
+/// Formats user-facing feedback after `intent` was performed or refused; `applies` is an
+/// Install now press that installs here, or a System State press whose review shows the vault
+/// sync's rows.
 #[must_use]
 #[allow(
     clippy::match_same_arms,
@@ -736,6 +746,13 @@ pub fn act_feedback(intent: &Intent, performed: bool, applies: bool) -> String {
         (Intent::EndRecovered, false) => "The reattached sessions had already ended".to_string(),
         (Intent::StopPaste { .. }, true) => "Stopped the paste".to_string(),
         (Intent::StopPaste { .. }, false) => "The paste had already finished".to_string(),
+        (Intent::ReviewVaultSync, true) if applies => {
+            "Opened System State with the vault row on and the Mac settings rows off".to_string()
+        }
+        (Intent::ReviewVaultSync, true) => {
+            "Opened System State; check its vault and Mac settings rows before Apply".to_string()
+        }
+        (Intent::ReviewVaultSync, false) => "Could not open System State".to_string(),
         (Intent::ShowTab { tab, .. }, true) => format!("Showed tab {tab}"),
         (Intent::ShowTab { .. }, false) => "That tab is gone".to_string(),
         (Intent::ShowSession { .. }, true) => "Showed session".to_string(),
@@ -766,7 +783,7 @@ impl MessagesFilter {
 
     /// Whether neither filter is active.
     #[must_use]
-    pub fn is_all(&self) -> bool {
+    pub const fn is_all(&self) -> bool {
         self.tag.is_none() && !self.warn_only
     }
 }
@@ -970,6 +987,7 @@ pub fn wire_lines(state: &MessagesState, filter: &MessagesFilter) -> Vec<String>
 }
 
 /// [`wire_lines`]' `page` line: the head, over the `shown` entries `filter`
+/// admits, then the chrome.
 fn page_line(state: &MessagesState, filter: &MessagesFilter, shown: usize) -> String {
     let total = state.entries.len();
     let tag = filter.tag.as_deref();
@@ -1011,6 +1029,7 @@ fn page_line(state: &MessagesState, filter: &MessagesFilter, shown: usize) -> St
 }
 
 /// [`wire_lines`]' `entry` line for one admitted entry, its lead column's
+/// words on `clock`.
 fn entry_line(state: &MessagesState, clock: MessagesClock, entry: &MessageView) -> String {
     let (sentence, technical) = entry.sentence_and_technical();
     Line::new("entry")
@@ -1042,6 +1061,7 @@ fn entry_line(state: &MessagesState, clock: MessagesClock, entry: &MessageView) 
 }
 
 /// One line of [`wire_lines`]' grammar as it is built: the kind word, then
+/// each field.
 struct Line(String);
 
 impl Line {

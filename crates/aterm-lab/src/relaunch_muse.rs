@@ -1,67 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `muse-relaunch [tag] [--keep]`: THE MUSE CODE LANE, LIVE — the real Muse
-//! Code (the lab's, by path) under a private headless aterm with the harness
-//! ON and `[harness] relaunch` at its default, against the stub's Meta model
-//! API. A lab of its own (`muse-relaunch-<pid>` unless a tag is given; the
-//! headless-restore seam on, so a desk is kept as a window keeps one). The
-//! instance's package prefix (`<scratch home>/Library/Application
-//! Support/aterm/pkg`) gets an `agents/muse` twin that execs the lab's build,
-//! as atpkg lays one: the relaunch types the managed twin, never the store
-//! path the process ran. The tab's shell gets the environment the lab's
-//! launcher gives Muse Code but its `XDG_DATA_HOME` and `XDG_CONFIG_HOME`
-//! (the scratch HOME's own defaults), so a relaunched Muse reaches the stub
-//! as a person's does from their shell. Every step reads what it judges off
-//! the real thing: the processes under the instance, the session's
-//! `.session.lock` (whose body names its holder's pid), the shell's command
-//! blocks (`blocks --json`), the upgrade ledger's rows and the stub's request
-//! dumps.
-//!
-//! 1. **Crash.** Muse Code is launched (`--trust-workspace`) and takes a turn
-//!    (`remember the word PELICAN-7731`); once the crash journal names its
-//!    session, it is SIGKILLed. It must come back in the tab resuming the
-//!    SAME session, the typed line naming the twin (never the store path),
-//!    the relaunched process in the session's workspace, and the harness's
-//!    continuation must reach the stub with the earlier turn in the same
-//!    request (the stub sees the prior turns).
-//! 2. **A resumed Muse's crash (X1).** The relaunched (RESUMED) Muse is
-//!    SIGKILLed: the shell block of its relaunch line must say 137, and it
-//!    must be relaunched again.
-//! 3. **A clean `/exit`** of the relaunched Muse at idle: its block says 0,
-//!    the host's own decision on it (`step=ended:graceful-exit` in the
-//!    instance's log, which comes after the crash back-off's step — 60 s by
-//!    this third exit — so it is waited for, up to 130 s) is read, and
-//!    nothing is relaunched.
-//! 4. **A person's refused start**, once the host has decided phase 3 (its
-//!    worker is parked until then and would never look at it): the lab's
-//!    launcher with `resume <unknown uuid>` exits 1 (`retained session not
-//!    found`), nothing is relaunched, and the host decides it by the lane's
-//!    refusal table (`refused-start`, or its exit read `refused`). A start
-//!    that short-lived may end before the host reads it: where no host line
-//!    names its exit, or the host says `nothing-recorded` (no snapshot, so
-//!    the table never ran), the phase says UNOBSERVED, never ok; any other
-//!    decision fails it.
-//! 5. **A relaunch Muse refuses is typed once.** A fresh Muse in the tab
-//!    takes a turn on a session of its own; its `session.jsonl` is moved
-//!    aside and it is SIGKILLed. The host's relaunch line must be typed once,
-//!    its block must say 1 (Muse refused the resume), the host must decide
-//!    `step=refused:resume-refused`, and nothing may be typed again for
-//!    75 s more (past the back-off's step).
-//! 6. **From another directory.** The session is resumed by hand in a
-//!    subshell from the project while the tab's shell sits in a subdirectory,
-//!    then SIGKILLed: the relaunch line must `cd` to the session's workspace
-//!    first, and the relaunched Muse run there.
-//! 7. **Restore after a crash.** aterm is SIGKILLed while that Muse runs;
-//!    the next launch on the same state reopens the tab, and the Muse must
-//!    come back there on the same session, its continuation saying aterm
-//!    ended, the earlier turn in the request.
-//! 8. **Restore after a quit.** aterm is quit (`invoke Quit`) while the
-//!    restored Muse runs; the next launch brings it back the same way.
-//!
-//! The report names each fact as read. Exit 0 when every phase holds (an
-//! UNOBSERVED phase is said as such, and named on the last line), 1 when
-//! one does not, 3 could not run.
+//! Live `muse-relaunch` lab lane exercising Muse Code crash/exit/restore relaunch behavior.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -77,28 +17,26 @@ use crate::stop;
 use crate::util::now_ms;
 use crate::{Fail, LAB, Res};
 
-/// The word the first turn asks Muse Code to remember: the request after a
-/// relaunch carries it only where the session came back with its turns.
+/// Marker word remembered in the initial phase-1 turn.
 pub const WORD: &str = "PELICAN-7731";
 
-/// The word the fresh Muse of phase 5 is asked to remember.
+/// Marker word remembered by the fresh Muse session in phase 5.
 pub const WORD2: &str = "OSPREY-2208";
 
-/// A well-formed session id no session has: `resume` refuses it, exit 1.
+/// Well-formed session UUID that no session holds.
 pub const UNKNOWN: &str = "0badbeef-0000-4000-8000-000000000000";
 
-/// The harness's continuation as Muse Code is typed it, after a crash
-/// (`relaunch::resumed_prompt_as`).
+/// Harness continuation prompt prefix typed after a process crash.
 pub const CONTINUED_CRASH: &str = "[aterm harness] Relaunched: Muse Code exited";
 
-/// …and after aterm's own end.
+/// Harness continuation prompt substring typed after `aterm` itself exited.
 pub const CONTINUED_HOST: &str = "aterm ended while this session ran";
 
 fn could_not(m: &str) -> Fail {
     Fail::exit(3, format!("muse-relaunch: COULD NOT RUN: {m}"))
 }
 
-/// The session a Muse's words resume (the word after `resume`).
+/// Returns the session ID following `resume` in `words`.
 #[must_use]
 pub fn resumed(words: &[String]) -> Option<&str> {
     let at = words.iter().position(|w| w == "resume")?;
@@ -110,7 +48,7 @@ fn muses(run: &Run) -> Vec<(i32, Vec<String>)> {
     crate::relaunch_check::running(run, &run.muse_bin)
 }
 
-/// The pid a `.session.lock` body names (`pid=<pid>`).
+/// Parses `pid=<pid>` from a `.session.lock` body.
 #[must_use]
 pub fn lock_pid(body: &str) -> Option<i64> {
     body.lines()
@@ -151,9 +89,7 @@ fn session_of(run: &Run, pid: i32) -> Option<String> {
     })
 }
 
-/// The shell environment a relaunched Muse Code reaches the stub with, as
-/// the lab's launcher gives it Muse Code (`crate::muse::launcher`) but its
-/// data and config homes, which the relaunch line carries from the process.
+/// Shell `export` commands configuring a relaunched Muse Code to reach the stub.
 #[must_use]
 pub fn shell_exports(run: &Run) -> String {
     use crate::util::shell_quote as q;
@@ -195,7 +131,7 @@ pub fn shell_exports(run: &Run) -> String {
     s
 }
 
-/// atpkg's twin for the lab's build: `exec '<build>' "$@"`.
+/// Returns the `atpkg` shim script that execs `bin`.
 #[must_use]
 pub fn twin_script(bin: &str) -> String {
     format!(
@@ -214,7 +150,7 @@ fn workspace_of(run: &Run, session: &str) -> Option<String> {
     workspace_in(&log)
 }
 
-/// The newest `"workspace_root":"<dir>"` a session log names.
+/// Returns the newest `"workspace_root"` path recorded in `log`.
 #[must_use]
 pub fn workspace_in(log: &str) -> Option<String> {
     let key = "\"workspace_root\":\"";
@@ -245,7 +181,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
     );
     let mut failed = Vec::new();
     let mut unseen = Vec::new();
-    // ---- the twin, and the shell's environment
     let pkg = run.w.join("home/Library/Application Support/aterm/pkg");
     let twin = pkg.join("agents/muse");
     crate::sys::put(
@@ -268,7 +203,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
     stop::sleep(Duration::from_millis(500))?;
     println!("  twin      {} -> {}", twin.display(), run.muse_bin);
 
-    // ---- 1. a crash, relaunched on its session in its workspace
     crate::muse::launch(
         &run,
         &crate::muse::Launch {
@@ -339,9 +273,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
         words.join(" ")
     );
     let continued = wait_for(120, || request_with(&run, before, &[CONTINUED_CRASH, WORD]))?;
-    // The ledger is read once the continuation came: the relaunch's step
-    // writes its `relaunched` row after its typed line returns, which can be
-    // after the new process is already seen.
     let typed = restore::ledger_since(&run, t_crash);
     for row in &typed {
         println!("  typed     {row}");
@@ -365,7 +296,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
         &mut failed,
     );
 
-    // ---- 2. the resumed Muse crashes: its block's word, and again relaunched
     door.await_idle(2000, 60)?;
     let before = newest_dump(&run);
     let t2 = now_ms();
@@ -394,7 +324,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
         return Ok(Verdict::Failed);
     };
 
-    // ---- 3. a clean /exit is not relaunched: the host's own decision read
     door.await_idle(2000, 60)?;
     stop::sleep(Duration::from_secs(2))?;
     let t3 = now_ms();
@@ -402,8 +331,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
     let gone = crate::procs::wait_gone(pid3, Duration::from_secs(20));
     stop::sleep(Duration::from_secs(2))?;
     let clean_exit = exit_of(&door, &relaunch_line);
-    // The host decides after the crash back-off's step (60 s by this third
-    // exit): a one-minute hang detector past it.
     let decided3 = wait_for(130, || {
         host_said(&run, t3, &["step=ended:graceful-exit", "step=adopted"])
     })?;
@@ -434,7 +361,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
         &mut failed,
     );
 
-    // ---- 4. a person's refused start is never retried (the host free now)
     let t4 = now_ms();
     crate::muse::launch(
         &run,
@@ -447,10 +373,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
     stop::sleep(Duration::from_secs(4))?;
     let refused_exit = exit_of(&door, "muse.sh");
     let said_refused = door.out(&["text"]).contains("retained session not found");
-    // An observation window, not a wait for something that must happen: a
-    // start this short may end before the host attaches to it. The first
-    // line that decides it: the exit table's own `refused` read, or a
-    // decision.
     let host4 = wait_for(30, || {
         host_said(
             &run,
@@ -464,9 +386,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
             ],
         )
     })?;
-    // Decided by the lane's refusal table, or by nothing read while it ran
-    // (`nothing-recorded`: no snapshot, so no table was asked) — or by
-    // anything else, which is wrong.
     let refused4 = host4
         .as_deref()
         .is_some_and(|l| l.contains("refused-start") || l.contains("read at the exit: refused"));
@@ -502,7 +421,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
         said(false, what4, &mut failed);
     }
 
-    // ---- 5. a relaunch Muse refuses is typed once, never again
     let known5 = [pid1, pid2, pid3];
     crate::muse::launch(
         &run,
@@ -561,7 +479,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
     let line5 = format!("'resume' '{session2}'");
     let refused_line = exit_of(&door, &line5);
     let rows5 = relaunch_rows(&run, t5);
-    // Past the back-off's next step: nothing is typed again.
     stop::sleep(Duration::from_secs(75))?;
     let rows5_later = relaunch_rows(&run, t5);
     let decided_word = decided5
@@ -589,7 +506,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
         let _ = std::fs::rename(log.with_file_name("session.jsonl.aside"), log);
     }
 
-    // ---- 6. a crash relaunched from a shell elsewhere: the line `cd`s first
     let Some(proj) = workspace.clone() else {
         return Ok(Verdict::Failed);
     };
@@ -642,7 +558,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
     let pid5 = back.as_ref().map(|(p, _)| *p);
     let cwd5 = pid5.and_then(cwd_of);
     let continued5 = wait_for(120, || request_with(&run, before, &[CONTINUED_CRASH, WORD]))?;
-    // Read once the continuation came, as phase 1's.
     let typed5 = restore::ledger_since(&run, t5);
     for row in &typed5 {
         println!("  typed     {row}");
@@ -664,7 +579,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
         return Ok(Verdict::Failed);
     };
 
-    // ---- 7. restore: aterm crashes while it runs, the reopened tab brings it back
     door.await_idle(2000, 60)?;
     let pid_row = format!("pid = {pid5}");
     let journal = wait_for(30, || {
@@ -706,7 +620,6 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
         return Ok(Verdict::Failed);
     };
 
-    // ---- 8. restore: aterm is quit while it runs, the reopened tab brings it back
     let door = Door::new(&run)?;
     door.await_idle(2000, 60)?;
     let pid_row = format!("pid = {pid7}");
@@ -754,7 +667,7 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
     }
 }
 
-/// `muse-relaunch [tag] [--keep]`.
+/// Entry point for `muse-relaunch [tag] [--keep]`.
 pub fn cmd_muse_relaunch(args: &[String]) -> Res {
     let usage = |m: &str| Fail::usage(format!("muse-relaunch: {m}"));
     let mut tag = None;
@@ -786,8 +699,6 @@ pub fn cmd_muse_relaunch(args: &[String]) -> Res {
     u.restore = true;
     u.trust = true;
     u.lifeline = !keep;
-    // No turn-end continuation of the supervisor's between the phases: the
-    // relaunch's own carry-on is what is judged.
     u.harness_keys = format!("{}\ncontinue = false", u.harness_keys);
     if let Err(f) = crate::lab::up(&tag, &u) {
         if let Some(m) = &f.msg {
@@ -821,8 +732,7 @@ mod tests {
     }
 
     /// A Muse's command line is read by its program's path, spaces and all;
-    /// the session it resumes off its words. NEGATIVE CONTROLS: another
-    /// program, a path that only begins like the build's, a plain launch.
+    /// the session it resumes off its words.
     #[test]
     fn a_relaunched_muse_names_the_session_it_resumes() {
         let bin = "/Users//u/Library/Application Support/aterm/pkg/store/muse/2001004010006427002/bin/muse";

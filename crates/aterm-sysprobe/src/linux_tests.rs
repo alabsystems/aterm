@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Linux arm's readers on fixture trees: each test writes the files a
-//! kernel would show under `/proc` and `/sys` (in the kernel's own formats:
-//! an Alder Lake laptop's hybrid PMUs, an RK3588 board's and a phone SoC's
-//! `cpu_capacity`, a systemd session's and a container's cgroup v2 files,
-//! an x86 laptop's thermal zones and throttle counters, an amdgpu and an
-//! i915 card) into a scratch root and reads it with the code a Linux build
-//! runs on `/`.
+//! The Linux arm's readers on fixture trees.
 
 use std::path::Path;
 
@@ -43,9 +37,7 @@ fn names(layout: &crate::CpuLayout) -> Vec<(&str, Vec<u16>)> {
 }
 
 /// An Alder Lake laptop (i7-1260P: 4 P-cores with SMT, 8 E-cores): the
-/// kernel's hybrid PMUs split the present cores, P first. The plain `cpu`
-/// PMU of a non-hybrid part and the `cpu_core` PMU's other files are not
-/// read as levels.
+/// kernel's hybrid PMUs split the present cores, P first.
 #[test]
 fn a_hybrid_intel_laptop_is_split_by_its_pmus() {
     let root = tree(&[
@@ -69,8 +61,7 @@ fn a_hybrid_intel_laptop_is_split_by_its_pmus() {
 /// The same laptop with a core taken offline (`echo 0 > cpuN/online`): the
 /// PMUs list only online cores, so they partition the online ones, and each
 /// offline core keeps its place beside its nearest online neighbour, a P
-/// core among the P cores and an E core among the E cores. NEGATIVE
-/// CONTROL: an online core no PMU lists still falls through to one cluster.
+/// core among the P cores and an E core among the E cores.
 #[test]
 fn a_hybrid_laptop_with_an_offline_core_keeps_its_split() {
     let root = tree(&[
@@ -97,9 +88,7 @@ fn a_hybrid_laptop_with_an_offline_core_keeps_its_split() {
     assert_eq!(names(&one), [("CPU", present.clone())]);
 }
 
-/// ARM boards name no level; `cpu_capacity` ranks them. An RK3588 (four
-/// Cortex-A55 at 414, four A76 at 1024) reads two levels, fastest first; a
-/// phone SoC's three (160, 498, 1024) reads Performance, Mid, Efficiency.
+/// ARM boards name no level; `cpu_capacity` ranks them.
 #[test]
 fn an_arm_board_is_split_by_cpu_capacity() {
     let mut files = vec![(
@@ -149,10 +138,7 @@ fn an_arm_board_is_split_by_cpu_capacity() {
     );
 }
 
-/// A machine whose cores are alike is one `"CPU"` cluster. NEGATIVE
-/// CONTROLS: equal capacities; a capacity missing for one core; PMUs that
-/// overlap or leave a present core out; a single PMU. Each falls through to
-/// the next rule, never to a half-placed layout.
+/// A machine whose cores are alike is one `"CPU"` cluster.
 #[test]
 fn alike_cores_and_inconsistent_sources_are_one_cpu_cluster() {
     let present: Vec<u16> = (0..4).collect();
@@ -173,13 +159,11 @@ fn alike_cores_and_inconsistent_sources_are_one_cpu_cluster() {
         &[pmu("cpu_core", &[0, 1, 2, 3])],
         &[]
     )));
-    // Overlapping PMUs fall through to the capacities, which still rank.
     let ranked = [(0, 1024), (1, 1024), (2, 400), (3, 400)];
     assert_eq!(
         names(&linux::layout_from(&present, None, &overlap, &ranked)),
         [("Performance", vec![0, 1]), ("Efficiency", vec![2, 3])]
     );
-    // A root with no sysfs reads `available_parallelism` cores as one.
     let empty = tree(&[]);
     let layout = Root::new(empty.path()).cpu_layout();
     assert_eq!(layout.clusters.len(), 1);
@@ -208,9 +192,7 @@ full avg10=0.00 avg60=0.03 avg300=0.01 total=345678
 ";
 
 /// PSI's ten-second averages and the level they map to: warn at lmkd's 7 %
-/// partial stall, critical at systemd-oomd's 60 % full stall. NEGATIVE
-/// CONTROLS: a file without its `full` line (the `cpu` file before 5.13), a
-/// malformed average, and a root without the file (`not_enabled:psi`).
+/// partial stall, critical at systemd-oomd's 60 % full stall.
 #[test]
 fn psi_gives_its_averages_and_the_pressure_level() {
     let p = linux::psi(PSI_QUIET).expect("a PSI file");
@@ -315,10 +297,7 @@ fn cgroup_files_parse_into_limits() {
 }
 
 /// The capacity is the tightest limit on the cgroup's path: a 2-core quota
-/// on its slice and a 4 GiB memory limit two levels up. Inside a container
-/// the namespace's root carries the limit. NEGATIVE CONTROLS: cgroup v1, a
-/// v2 path without the unified hierarchy mounted, and no limit anywhere are
-/// the host's.
+/// on its slice and a 4 GiB memory limit two levels up.
 #[test]
 fn the_capacity_is_the_tightest_cgroup_limit_on_the_path() {
     let root = tree(&[
@@ -392,7 +371,6 @@ fn zone(temp_c: i64, trips: &[(TripKind, i64)]) -> Zone {
 }
 
 /// The heuristic level from trip points and the throttle counters.
-/// NEGATIVE CONTROL: no trip point and no counter is `absent`, never `none`.
 #[test]
 fn the_throttle_level_reads_trip_points_and_counters() {
     use TripKind::{Critical, Hot, Passive};
@@ -425,8 +403,7 @@ fn the_throttle_level_reads_trip_points_and_counters() {
 
 /// The reader on a laptop's tree: zones with trips (an active trip and a
 /// disabled 0 °C trip left out), and the counters, whose rise between two
-/// readings is a throttle. NEGATIVE CONTROL: a virtual machine's empty tree
-/// is `absent`.
+/// readings is a throttle.
 #[test]
 fn the_throttle_reader_sees_zones_and_a_rise_in_the_counters() {
     let root = tree(&[
@@ -516,18 +493,7 @@ fn the_throttle_reader_sees_zones_and_a_rise_in_the_counters() {
     );
 }
 
-/// The GPU from DRM sysfs, never waking a card or holding one awake. An
-/// awake amdgpu card answers its busy percent only where the read cannot
-/// move its runtime PM (forbidden `on`, runtime PM `unsupported`, or the
-/// boot display), and is then picked over an i915 iGPU that cannot answer;
-/// a hybrid laptop's awake dGPU (`auto`, not the boot display) is not read.
-/// A suspended card is asleep and its busy file is not believed, and it
-/// stands for the GPU only when every card sleeps: beside an awake iGPU
-/// nobody can read, the GPU is unknown, never 0 %. i915 needs
-/// `CAP_PERFMON`, a fixture root's NVIDIA card is never read (its NVML arm
-/// is inert), and a virtual GPU has no figure. A firmware framebuffer, a
-/// connector and a render node are no GPU. NEGATIVE CONTROL: no card at
-/// all is `None`.
+/// The GPU from DRM sysfs, never waking a card or holding one awake.
 #[test]
 fn the_gpu_reads_drm_sysfs_without_waking_a_sleeping_card() {
     let root = tree(&[
@@ -556,15 +522,11 @@ fn the_gpu_reads_drm_sysfs_without_waking_a_sleeping_card() {
         ("sys/class/drm/version", "drm 1.1.0 20060810\n"),
     ]);
     let read = || Root::new(root.path()).gpu().expect("a GPU");
-    // A hybrid laptop's awake dGPU under runtime PM is not read: the iGPU,
-    // which cannot answer, is the reading, with its reason.
     let g = read();
     assert_eq!(
         (g.device_pct, g.name.as_deref(), g.unread),
         (None, Some("i915"), Some(Why::NeedsPrivilege("cap_perfmon")))
     );
-    // Where the read cannot move its runtime PM, the dGPU answers and is
-    // picked over the iGPU.
     for (file, text) in [
         ("power/control", "on\n"),
         ("power/runtime_status", "unsupported\n"),
@@ -596,7 +558,6 @@ fn the_gpu_reads_drm_sysfs_without_waking_a_sleeping_card() {
     assert!(linux::pm_settled("active", "on", "0"));
     assert!(!linux::pm_settled("active", "auto", "0"));
 
-    // The dGPU sleeps beside an awake iGPU nobody can read: unknown, not 0.
     write(
         root.path(),
         "sys/class/drm/card1/device/power/runtime_status",
@@ -616,7 +577,6 @@ fn the_gpu_reads_drm_sysfs_without_waking_a_sleeping_card() {
         crate::caps::gpu_cap(Some(&g)),
         Cap::No(Why::NeedsPrivilege("cap_perfmon"))
     );
-    // Every card asleep: known idle, and the busy file is not believed.
     write(
         root.path(),
         "sys/class/drm/card0/device/power/runtime_status",
@@ -661,7 +621,7 @@ fn the_gpu_reads_drm_sysfs_without_waking_a_sleeping_card() {
 
 /// An NVIDIA card as this desk's DGX Spark shows it (GB10, driver 580): the
 /// proprietary driver's DRM device, its PCI slot, runtime PM `auto` on the
-/// boot display. `card0` is the firmware framebuffer the board boots on.
+/// boot display.
 fn nvidia_card(control: &str, boot_vga: &str) -> aterm_tempfile::TempDir {
     tree(&[
         (
@@ -696,12 +656,7 @@ fn nvml_never(slot: &str) -> Result<u8, Why> {
 /// A fixture NVIDIA card reads through its root's injected arm, by its PCI
 /// slot name, with the amdgpu card's power rule: only where the read
 /// cannot move runtime PM (the boot display, PM forbidden `on`, or PM
-/// `unsupported`). Each NVML failure is the arm's `Why`, never a 0 %, and
-/// a figure past 100 is 100. A hybrid laptop's NVIDIA dGPU (`auto`, not the
-/// boot display) and a suspended one never reach the arm (`nvml_never`
-/// panics), and a card without a PCI slot is not read. NEGATIVE CONTROL: a
-/// fixture root without an arm never reads one, even on this desk's own
-/// slot, where the real NVML would answer.
+/// `unsupported`).
 #[test]
 fn an_nvidia_card_reads_through_the_roots_nvml_arm() {
     let gpu = |root: &aterm_tempfile::TempDir, arm: linux::NvidiaBusy| {
@@ -737,8 +692,6 @@ fn an_nvidia_card_reads_through_the_roots_nvml_arm() {
         assert_eq!(crate::caps::gpu_cap(Some(&g)), Cap::No(why));
     }
 
-    // A hybrid laptop's dGPU under runtime PM is never asked; where PM
-    // cannot move, it is.
     let laptop = nvidia_card("auto\n", "0\n");
     assert_eq!(gpu(&laptop, nvml_never), nvidia(None, Some(Why::NotRead)));
     write(
@@ -758,7 +711,6 @@ fn an_nvidia_card_reads_through_the_roots_nvml_arm() {
         "unsupported\n",
     );
     assert_eq!(gpu(&laptop, nvml_42), nvidia(Some(42), None));
-    // Suspended, even on the boot display: asleep, and not asked.
     for (file, text) in [
         ("power/runtime_status", "suspended\n"),
         ("boot_vga", "1\n"),
@@ -776,8 +728,6 @@ fn an_nvidia_card_reads_through_the_roots_nvml_arm() {
         );
     }
 
-    // The laptop's awake iGPU beside its NVIDIA dGPU under runtime PM: the
-    // dGPU is not asked, and the iGPU says why it cannot answer.
     let hybrid = nvidia_card("auto\n", "0\n");
     write(
         hybrid.path(),
@@ -798,7 +748,6 @@ fn an_nvidia_card_reads_through_the_roots_nvml_arm() {
             Some(Why::NeedsPrivilege("cap_perfmon"))
         )
     );
-    // With its PM forbidden, the dGPU answers and is picked over the iGPU.
     write(
         hybrid.path(),
         "sys/class/drm/card1/device/power/control",
@@ -806,7 +755,6 @@ fn an_nvidia_card_reads_through_the_roots_nvml_arm() {
     );
     assert_eq!(gpu(&hybrid, nvml_42), nvidia(Some(42), None));
 
-    // A card without a PCI slot (a platform device) is not read.
     let platform = tree(&[
         ("sys/class/drm/card0/device/uevent", "DRIVER=nvidia\n"),
         (
@@ -817,8 +765,6 @@ fn an_nvidia_card_reads_through_the_roots_nvml_arm() {
     ]);
     assert_eq!(gpu(&platform, nvml_never), nvidia(None, Some(Why::NotRead)));
 
-    // A fixture root's own arm is inert: this desk's slot, settled, reads
-    // nothing, though the system root's NVML would answer for it.
     let g = Root::new(spark.path()).gpu().expect("a GPU");
     assert_eq!(
         (g.device_pct, g.unread),
@@ -828,8 +774,7 @@ fn an_nvidia_card_reads_through_the_roots_nvml_arm() {
     assert_eq!(linux::no_nvml("000f:01:00.0"), Err(Why::NotRead));
 }
 
-/// `status`'s anonymous memory, resident and swapped. NEGATIVE CONTROL: a
-/// kernel thread's status has no `RssAnon`.
+/// `status`'s anonymous memory, resident and swapped.
 #[test]
 fn a_status_file_gives_anonymous_memory_resident_and_swapped() {
     let status = "Name:\tclaude\nState:\tS (sleeping)\nPPid:\t4100\nVmRSS:\t  412000 kB\n\
@@ -848,8 +793,7 @@ fn a_status_file_gives_anonymous_memory_resident_and_swapped() {
 /// parentheses), CPU time at the clock rate, memory from `status` with
 /// `statm` for a kernel thread, and what the stuck-process engine forms
 /// job units from (state, group, session leadership, a terminal, the
-/// owner). A name that is not a pid and a process whose `stat` is cut are
-/// left out.
+/// owner).
 #[test]
 fn the_sweep_reads_a_fixture_proc() {
     let root = tree(&[
@@ -936,10 +880,7 @@ fn the_sweep_reads_a_fixture_proc() {
 
 /// A user in thousands of supplementary groups has a `status` whose
 /// `Groups:` line pushes the memory lines past one stack buffer: the
-/// footprint still counts the swapped pages after it. A status past
-/// [`linux::STATUS_CAP`] is no footprint, never a short one, and `statm`'s
-/// resident size (another measure) does not stand in. NEGATIVE CONTROL: the
-/// same process with a short status reads the same footprint.
+/// footprint still counts the swapped pages after it.
 #[test]
 fn a_long_groups_line_never_cuts_the_footprint() {
     let status = |groups: usize| {
@@ -1006,7 +947,6 @@ fn the_capability_report_says_what_each_tree_can_give() {
             "105000\n",
         ),
         ("sys/class/drm/card0/device/uevent", "DRIVER=amdgpu\n"),
-        // An APU: its GPU drives the display, so reading it wakes nothing.
         ("sys/class/drm/card0/device/boot_vga", "1\n"),
         ("sys/class/drm/card0/device/gpu_busy_percent", "3\n"),
     ]);
@@ -1056,8 +996,7 @@ fn the_capability_report_says_what_each_tree_can_give() {
 }
 
 /// The machine words: the first CPU's model (x86 `model name`, an ARM
-/// board's `Model`) and the OS's pretty name, unquoted. NEGATIVE CONTROLS:
-/// a cpuinfo with neither key and an empty `PRETTY_NAME` read nothing.
+/// board's `Model`) and the OS's pretty name, unquoted.
 #[test]
 fn machine_words_are_the_first_cpu_model_and_the_os_pretty_name() {
     let cpuinfo = "processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Intel(R) Xeon(R) CPU\n";

@@ -1,67 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cryptographic digests for aterm: SHA-256, HMAC-SHA256, HKDF-SHA256 and a
-//! constant-time compare — every one of them astream-digest's, re-exported.
-//!
-//! Covers [`Sha256::new`], [`Sha256::digest`], `update` and `finalize`; HMAC's
-//! `new_from_slice` / `update` / `finalize` / `verify_slice`, and
-//! [`hmac_sha256_parts`] for a MAC over a list of parts; HKDF's
-//! [`hkdf_extract`] and [`hkdf_expand_32`]; and constant-time slice comparison
-//! ([`ct_eq`]).
-//!
-//! # Exported types
-//!
-//! - [`Sha256`] -- FIPS 180-4 SHA-256, streaming or one-shot
-//! - [`HmacSha256`] -- RFC 2104 HMAC keyed with SHA-256
-//! - [`hmac_sha256_parts`] -- the same MAC over the concatenation of parts
-//! - [`hkdf_extract`], [`hkdf_expand_32`] -- RFC 5869 HKDF-SHA256, wiping the
-//!   key blocks they key with
-//! - [`ct_eq`] -- constant-time byte-slice comparison
-//! - [`InvalidLength`], [`MacError`] -- API-compatible error types
-//!
-//! ONE HASH, ONE MAC. This crate began as aterm's own SHA-256 and HMAC; astream-digest
-//! was ported from it with its tests and became the hash under astream-cap's
-//! capability tags and producer ids, then the one HMAC under them, astream-aead's
-//! handshake and this crate alike (`digest.hmac-one-construction`). A copy here was a
-//! second transcription of FIPS 180-4 or RFC 2104 that nothing held to the first, so
-//! a fix or a proof had to land twice; the SHA-256 went first (729d4b049c), and the
-//! HMAC, its `ct_eq` and aterm-net's private HKDF followed. What is left of this crate
-//! is the name aterm's crates import and the two envelope headers below. The MAC's
-//! tests, its RFC 4231 vectors, its length sweeps and its `hmac-*`, `hkdf-*` and
-//! `ct-eq-*` spec rows live beside the one copy (`vendor/astream/crates/astream-digest`);
-//! the `sha256-*` rows and `opaque-debug`'s `Sha256` half stay in this crate's
-//! `SPECS.md`, describing astream's SHA-256, until astream-digest's `SPECS.md` takes
-//! them too.
-//!
-//! No SIMD, SHA-NI, assembly or `unsafe`: this hashes release manifests and
-//! capability tokens, not bulk traffic. atpkg's bulk content (archive digests and
-//! the extract fold) runs on ring's hardware SHA-256 (`atpkg::tree::BulkSha256`).
-//!
-//! # Example
-//!
-//! ```rust
-//! use aterm_digest::{HmacSha256, Sha256};
-//!
-//! // One-shot.
-//! let d = Sha256::digest(b"abc");
-//! assert_eq!(d[0], 0xba);
-//!
-//! // Streaming.
-//! let mut h = Sha256::new();
-//! h.update(b"a");
-//! h.update(b"bc");
-//! assert_eq!(h.finalize(), d);
-//!
-//! // Keyed authentication; verification is constant time.
-//! let mut mac = HmacSha256::new_from_slice(b"key").expect("any key length");
-//! mac.update(b"message");
-//! let tag = mac.finalize();
-//!
-//! let mut check = HmacSha256::new_from_slice(b"key").expect("any key length");
-//! check.update(b"message");
-//! assert!(check.verify_slice(&tag).is_ok());
-//! ```
+//! Cryptographic digests for aterm ([`Sha256`], [`Sha256::new`], [`Sha256::digest`],
+//! [`HmacSha256`], [`hmac_sha256_parts`], [`hkdf_extract`], [`hkdf_expand_32`], [`ct_eq`],
+//! [`InvalidLength`], [`MacError`]).
 
 #![forbid(unsafe_code)]
 
@@ -105,10 +47,7 @@ pub const fn encode_digest_envelope_wire(
     ]
 }
 
-/// Decode a 16-byte SHA-256 digest envelope header produced by
-/// [`encode_digest_envelope_wire`].
-///
-/// Rejects envelopes whose `tag_len` is zero or exceeds 32 bytes.
+/// Decode a 16-byte SHA-256 digest envelope header produced by [`encode_digest_envelope_wire`].
 #[inline]
 #[must_use]
 pub const fn decode_digest_envelope_wire(bytes: &[u8]) -> Option<(u8, u8, u16, u64)> {
@@ -135,8 +74,7 @@ pub const fn decode_digest_envelope_wire(bytes: &[u8]) -> Option<(u8, u8, u16, u
     Some((alg_id, tag_len, flags, payload_len))
 }
 
-/// Encode a 16-byte HMAC-SHA256 prefix header (`"HMAC"` + `key_len: u32` +
-/// 8-byte `tag_prefix: u64`).
+/// Encode a 16-byte HMAC-SHA256 prefix header.
 #[inline]
 #[must_use]
 pub const fn encode_hmac_prefix_wire(
@@ -163,8 +101,7 @@ pub const fn encode_hmac_prefix_wire(
     ]
 }
 
-/// Decode a 16-byte HMAC-SHA256 prefix header produced by
-/// [`encode_hmac_prefix_wire`].
+/// Decode a 16-byte HMAC-SHA256 prefix header produced by [`encode_hmac_prefix_wire`].
 #[inline]
 #[must_use]
 pub const fn decode_hmac_prefix_wire(bytes: &[u8]) -> Option<(u32, u64)> {

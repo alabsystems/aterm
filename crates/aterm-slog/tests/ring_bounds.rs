@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The ring's bounds and cursor contract (§5.1): both bounds hold over far
-//! more appends than the ring keeps, every eviction is counted exactly, and
-//! a reader is told exactly what it lost.
+//! Ring buffer capacity, byte-bound eviction, and cursor gap tests.
 
 use aterm_slog::{
     Conf, Cursor, Fields, Gap, GapWhy, Key, Kind, Limits, Log, MAX_BYTES, MAX_RECORDS, Mark, Read,
@@ -24,8 +22,6 @@ fn many_appends_stay_within_both_bounds_and_count_every_eviction() {
     let mut bytes_bound_hit = false;
     let mut count_bound_hit = false;
     for i in 0..30_000u64 {
-        // Mostly small marks, with runs of large ones so the byte bound,
-        // not the count, is what evicts for a while.
         let big = (i / 5_000) % 2 == 1;
         let n = if big {
             150 + rng.below(100)
@@ -35,9 +31,6 @@ fn many_appends_stay_within_both_bounds_and_count_every_eviction() {
         let f = Fields::new()
             .text(Key::Text, &"n".repeat(n as usize))
             .unwrap_or_default();
-        // Observations (src=meta), not claims: a claim's share of the ring
-        // is its quarter (`tests/mark_quota.rs`), and this is the ring's
-        // own bound.
         log.mark(
             Mark::new(Kind::Note, Src::Meta, Conf::Strong).fields(f),
             at(i),
@@ -85,7 +78,6 @@ fn cursors_are_exclusive_monotone_and_resumable() {
         }
         assert_eq!(seen, (1..=40).collect::<Vec<u64>>(), "page {page}");
     }
-    // Repeating a read is safe: the same cursor, the same records.
     let a = log.read(Cursor::new(3, 10), 5);
     let b = log.read(Cursor::new(3, 10), 5);
     assert_eq!(a, b);
@@ -109,7 +101,6 @@ fn a_handoff_resets_old_cursors() {
         new.mark(Mark::new(Kind::Bell, Src::Engine, Conf::Exact), at(21 + i))
             .expect("fits");
     }
-    // seq 10 exists in the new log, but the cursor is of epoch 4.
     let read = new.read(cursor, 100);
     assert_eq!(read.gap.map(|g| g.why), Some(GapWhy::Reset));
     let first = read.recs.first().expect("the new epoch from its start");
@@ -118,7 +109,6 @@ fn a_handoff_resets_old_cursors() {
     assert_eq!(first.f.get_u(Key::Epoch), Some(5));
     assert_eq!(read.next, Cursor::new(5, 13));
     assert_eq!(new.state().ep, 5);
-    // A cursor ahead of the head is foreign too.
     assert_eq!(
         new.read(Cursor::new(5, 99), 1).gap.map(|g| g.why),
         Some(GapWhy::Reset)
@@ -143,8 +133,7 @@ fn shared(r: &SharedRead<'_>) -> String {
 /// on its oldest record, inside it, at its head, ahead of it and of another
 /// epoch, at page sizes 0, 1, 3 and unbounded, both reads answer the same
 /// gap, records and next cursor, and each shared record is the very record
-/// the borrowed read points at. NEGATIVE CONTROL: an evicting append
-/// between the two reads makes them differ, so each reads the live ring.
+/// the borrowed read points at.
 #[test]
 fn read_shared_equals_read() {
     let empty = Log::with_limits(2, Limits::new(8, 1 << 20).expect("limits"));
@@ -173,7 +162,6 @@ fn read_shared_equals_read() {
         }
     }
 
-    // NEGATIVE CONTROL.
     let cursor = Cursor::new(2, 12);
     let before = borrowed(&log.read(cursor, usize::MAX));
     log.mark(Mark::new(Kind::Bell, Src::Engine, Conf::Exact), at(20))
@@ -185,9 +173,7 @@ fn read_shared_equals_read() {
 /// §2.2, `log_seq`): the successor's seqs start past the predecessor's last
 /// plus the overlap's reserve, above every seq the predecessor wrote while it
 /// went on to its Commit, and a cursor of the old epoch is reset (what it
-/// held past its cursor is gone, uncounted). A reader of the new epoch from 0
-/// is told no loss: the log accounts for nothing before its first seq.
-/// NEGATIVE CONTROL: with nothing carried (`next_seq` 1) the seqs collide.
+/// held past its cursor is gone, uncounted).
 #[test]
 fn an_uncarried_update_continues_seq_and_resets_older_cursors() {
     let mut old = Log::new(4);
@@ -197,7 +183,6 @@ fn an_uncarried_update_continues_seq_and_resets_older_cursors() {
     }
     let reserve = 100;
     let carried = old.last_seq() + reserve;
-    // The predecessor goes on writing until its Commit, within the reserve.
     for i in 0..5 {
         old.mark(Mark::new(Kind::Bell, Src::Engine, Conf::Exact), at(10 + i))
             .expect("fits");
@@ -232,8 +217,6 @@ fn an_uncarried_update_continues_seq_and_resets_older_cursors() {
     );
 }
 
-// ---- level-aware eviction (§5.1, phase 2A) ---------------------------------
-
 use aterm_slog::{
     Actor, Amend, Close, EvictClass, Node, Open, Out, RunOut, SessionOut, StepOut, TurnOut,
     low_water,
@@ -254,11 +237,7 @@ fn verdict(log: &mut Log, run: Node, word: &str, ms: u64) {
 }
 
 /// THE CRITIC'S CASE: an agent run open for 1000 turns of five verdict marks
-/// each (the marks hang from the RUN, not the turn). The marks of a closed
-/// turn are history (older than its close), so they go first; the newest
-/// turns keep both their open records (with `by=` and `ledger=`) and their
-/// closes. NEGATIVE CONTROL: the newest marks, written after the last close,
-/// are current and stay too.
+/// each (the marks hang from the RUN, not the turn).
 #[test]
 fn an_agents_verdict_marks_go_before_its_newest_turns() {
     let mut log = Log::new(1);
@@ -289,14 +268,10 @@ fn an_agents_verdict_marks_go_before_its_newest_turns() {
         .expect("the turn closes");
         turns.push(t);
     }
-    // Two marks after the last close: the present.
     verdict(&mut log, run, "busy", ms + 10);
     verdict(&mut log, run, "idle", ms + 20);
     assert!(log.lost() > 0, "the ring evicted");
     let live = |pred: &dyn Fn(&aterm_slog::Rec) -> bool| log.window().filter(|r| pred(r)).count();
-    // Hundreds of the newest turns keep both records: under the run's marks'
-    // weight a ring that kept "detail of an open node" would hold marks and
-    // no turns.
     let whole = turns
         .iter()
         .rev()
@@ -319,7 +294,6 @@ fn an_agents_verdict_marks_go_before_its_newest_turns() {
         live(&|r| r.k == Kind::Agent) < live(&|r| r.node.lvl == aterm_slog::Lvl::Turn),
         "the closed turns' marks went first"
     );
-    // The run's open record is pinned.
     assert!(
         log.window()
             .any(|r| r.node == run && r.op == aterm_slog::Op::Open)
@@ -410,18 +384,12 @@ fn level_aware_eviction_keeps_the_open_path_and_every_rollup() {
             }
         }
     }
-    // A reader from the start is told exactly what it will never see.
     let read = log.read(Cursor::new(1, 0), usize::MAX);
     assert_eq!(read.gap.map(|g| g.lost), Some(log.lost()));
     assert_eq!(read.recs.len(), log.len());
 }
 
-/// THE POLICY ORDER, by what a ring keeps. Closes under half: as a busy
-/// open turn's marks push the ring past its bound, the batch takes the closed
-/// turn's detail, then the opens of closed commands and turns, then the open
-/// turn's OLDEST detail, and every close stays. NEGATIVE CONTROL: with the
-/// closes over half the record bound, the batch takes closes before any of
-/// the open turn's detail, down to half.
+/// THE POLICY ORDER, by what a ring keeps.
 #[test]
 fn eviction_takes_classes_in_policy_order() {
     let build = |cmds: u64| {
@@ -470,7 +438,6 @@ fn eviction_takes_classes_in_policy_order() {
             .count()
     };
 
-    // Ten commands: eleven closes, under half of 64.
     let (mut log, t1, t2) = build(10);
     assert_eq!(log.lost(), 0, "PRECONDITION: all of it fits");
     let first_t2 = log
@@ -510,7 +477,6 @@ fn eviction_takes_classes_in_policy_order() {
         "the session, r1 and t2 opens stay"
     );
 
-    // NEGATIVE CONTROL: forty commands, their closes over half of 64.
     let (mut log, _, t2) = build(40);
     assert!(closes(&log) * 2 > 64, "PRECONDITION: closes over half");
     let first = log
@@ -563,8 +529,7 @@ fn a_contiguous_loss_reads_as_slice_one_did() {
 
 /// Interleaved evictions and update overlaps: a reader is told exactly the
 /// records this log held and lost in what it read, the overlaps said as
-/// `why=handoff` and never counted. CONTROL: counting the overlaps would
-/// change every count the reader is told.
+/// `why=handoff` and never counted.
 #[test]
 fn a_reader_across_interleaved_holes_is_told_exactly_what_it_lost() {
     let mut log = Log::with_limits(1, Limits::new(8, 1 << 20).expect("limits"));
@@ -593,7 +558,6 @@ fn a_reader_across_interleaved_holes_is_told_exactly_what_it_lost() {
         held - log.len() as u64,
         "every loss counted once"
     );
-    // Pull a page at a time from the start: the told losses add up exactly.
     for page in [1usize, 2, 3, 100] {
         let (mut cur, mut told, mut got, mut handoffs) = (Cursor::new(1, 0), 0u64, 0u64, 0);
         loop {
@@ -718,8 +682,6 @@ fn an_evicted_record_counts_into_its_nearest_open_node() {
 
 /// The host's budget lowers what one ring holds, level-aware, and never
 /// below its open path; raised again, the ring keeps what it had and grows.
-/// The floor, `pinned_bytes`, is the bytes of exactly the records no eviction
-/// takes: all of a ring of only opens, or of a session's open and close.
 #[test]
 fn set_byte_budget_evicts_level_aware_and_never_below_the_open_path() {
     let mut log = Log::new(1);
@@ -813,9 +775,7 @@ fn the_newest_record_and_the_close_above_it_stay() {
 
 /// 65 carried updates (one overlap each) with the session's open record
 /// pinned at seq 1: past [`aterm_slog::MAX_HOLES`] the log forgets the oldest
-/// overlap and accounts only for seqs after it. No count ever runs negative:
-/// a reader of an earlier epoch behind that point is reset, and a reader of
-/// the current one is told only what the log accounts for.
+/// overlap and accounts only for seqs after it.
 #[test]
 fn sixty_five_overlaps_never_miscount() {
     let mut log = Log::with_limits(1, Limits::new(16, 1 << 20).expect("limits"));
@@ -851,7 +811,6 @@ fn sixty_five_overlaps_never_miscount() {
         read.recs.iter().any(|r| r.seq == 1),
         "the pinned open is returned"
     );
-    // A cursor of an earlier epoch behind the accounting floor is reset.
     let mut later = log.clone();
     later.skip_to(later.last_seq() + 2);
     let read = log.read(Cursor::new(0, 2), 4);
@@ -887,9 +846,6 @@ fn passed_step(log: &mut Log, turn: Node, ms: u64) -> Node {
 /// records gone too, is placed by nothing the log still holds, and its amend
 /// is refused rather than indexed under an unknown parent (it was classed
 /// closed detail, its loss the session's, its turn's close unsheltered).
-/// NEGATIVE CONTROL: a never-evicting log, driven alike, still indexes the
-/// old step, so the refused amend is the one an evicting log could only
-/// have guessed at.
 #[test]
 fn an_amend_of_a_closed_node_hangs_where_it_did_or_is_refused() {
     let drive = |limits: Limits| -> (Log, Node, Node, Node) {
@@ -906,7 +862,6 @@ fn an_amend_of_a_closed_node_hangs_where_it_did_or_is_refused() {
             passed_step(&mut log, turn, 100 + 2 * i);
         }
         let recent = passed_step(&mut log, turn, 1_000);
-        // Detail under the open turn pushes the steps' records out.
         for i in 0..40 {
             log.mark(
                 Mark::new(Kind::Bell, Src::Engine, Conf::Exact).at(turn),
@@ -958,8 +913,6 @@ fn an_amend_of_a_closed_node_hangs_where_it_did_or_is_refused() {
         "a step the log no longer places is not guessed at"
     );
 
-    // NEGATIVE CONTROL: without eviction the old step is still indexed, and
-    // its amend hangs under its turn.
     let (mut whole, turn, old, _) = drive(Limits::new(4096, 1 << 22).expect("limits"));
     assert_eq!(whole.lost(), 0);
     assert_eq!(whole.parent_of(old), Some(turn));
@@ -968,14 +921,7 @@ fn an_amend_of_a_closed_node_hangs_where_it_did_or_is_refused() {
 
 /// AN AMEND RE-INDEXES THE WHOLE CLOSED CHAIN IT HANGS FROM: a step closed
 /// under a turn that closed too (both still among the last closes the log
-/// remembers, the run above them open), every record of both evicted. The
-/// amend puts the step back under its turn AND the turn back under its run,
-/// so when the amend is evicted in turn its loss counts into the run, the
-/// nearest open ancestor, and not into the session's rollup (a re-index of
-/// the step alone leaves its turn unknown, which ends the walk at the
-/// session). Every loss of the drive counts into the run or the open turn.
-/// NEGATIVE CONTROL: a never-evicting log, driven alike, still indexes the
-/// step under the turn under the run, the chain the amend rebuilt.
+/// remembers, the run above them open), every record of both evicted.
 #[test]
 fn an_amend_of_a_closed_node_reindexes_its_closed_ancestors_too() {
     let drive = |limits: Limits| -> (Log, Node, Node, Node, Node) {
@@ -994,8 +940,6 @@ fn an_amend_of_a_closed_node_reindexes_its_closed_ancestors_too() {
             at(4),
         )
         .expect("the turn closes");
-        // 30 more closed turns: the step's and its turn's closes stay among
-        // the last 64 closes.
         for i in 0..30 {
             let t = log
                 .open(
@@ -1016,7 +960,6 @@ fn an_amend_of_a_closed_node_reindexes_its_closed_ancestors_too() {
                 at(500),
             )
             .expect("the open turn");
-        // Detail under the open turn pushes the old records out.
         for i in 0..40 {
             log.mark(
                 Mark::new(Kind::Bell, Src::Engine, Conf::Exact).at(now),
@@ -1061,7 +1004,6 @@ fn an_amend_of_a_closed_node_reindexes_its_closed_ancestors_too() {
         "every loss counts into an open node, none into the session"
     );
 
-    // NEGATIVE CONTROL: without eviction the chain is still indexed.
     let (whole, run, first, step, _) = drive(Limits::new(4096, 1 << 22).expect("limits"));
     assert_eq!(whole.lost(), 0);
     assert!(whole.node_view(step).is_some() && whole.node_view(first).is_some());
@@ -1073,11 +1015,7 @@ fn an_amend_of_a_closed_node_reindexes_its_closed_ancestors_too() {
 /// a turn closed long ago (its run closed too) resolves its nearest open
 /// ancestor from the open path and the last closes alone (rule),
 /// never from the node index, which keeps the old turn only while a record
-/// of it lives. Two logs driven alike, one evicting and one not, write the
-/// same open. NEGATIVE CONTROL: their indexes differ about the old turn
-/// (the never-evicting one still walks it up to the session, the evicting
-/// one cannot), so a rule that read the index placed the step apart: under
-/// the session in one, under the open step in the other.
+/// of it lives.
 #[test]
 fn an_open_under_a_closed_node_hangs_the_same_whatever_was_evicted() {
     let drive = |limits: Limits| -> (Log, Node) {
@@ -1095,8 +1033,6 @@ fn an_open_under_a_closed_node_hangs_the_same_whatever_was_evicted() {
             at(2),
         )
         .expect("the run and its turn close");
-        // 65 commands after them: their closes push both out of the last
-        // closes the log remembers.
         for i in 0..65 {
             let r = log
                 .open(
@@ -1111,7 +1047,6 @@ fn an_open_under_a_closed_node_hangs_the_same_whatever_was_evicted() {
             )
             .expect("it ends");
         }
-        // Another agent, mid-turn, a step open.
         let run = log
             .open(Open::new(Kind::Agent, Src::Status, Conf::Strong), at(500))
             .expect("run");
@@ -1140,7 +1075,6 @@ fn an_open_under_a_closed_node_hangs_the_same_whatever_was_evicted() {
         aterm_slog::encode(r, aterm_slog::Tier::Content).expect("fits")
     };
     assert_eq!(open(&small), open(&big), "the same parent either way");
-    // NEGATIVE CONTROL: the logs disagree about the old turn's index entry.
     assert!(small.node_view(first).is_none(), "evicted, forgotten");
     assert!(big.node_view(first).is_some(), "still indexed");
 }

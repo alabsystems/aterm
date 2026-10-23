@@ -3,27 +3,6 @@
 // Author: Andrew Yates
 
 //! The key a full-history search is answered under, and the plan one search follows.
-//!
-//! An index keyed by absolute row holds for one generation of the active grid's content and
-//! one frame of its coordinates. [`SearchKey`] reads both in one terminal-lock hold, and
-//! every check a search makes against the terminal (the cache hit, the incremental refresh,
-//! the tear check of each chunked copy, the verdict at the end of a query) compares two
-//! captured keys through one of its verdicts, so no check can leave a field out and the
-//! width a soft-wrapped line is laid out in is never read in a different hold from the rows.
-//!
-//! A [`SearchPlan`] carries one search from the hold that captured its key
-//! ([`Terminal::search_plan`]) through the chunked copy of its rows
-//! ([`Terminal::read_search_chunk`]) and the build off the lock ([`SearchPlan::build`]) to
-//! the hold that checks the key again and keeps the index ([`Terminal::finish_search`]);
-//! search_index.rs says why the steps are apart.
-//!
-//! There are two verdicts because a reader needs two different promises:
-//!
-//! - [`SearchKey::same_frame`]: every absolute row still names the line it named and every
-//!   column is measured as it was. Output that only appends or rewrites lines keeps the
-//!   frame, so rows an index reported stay valid identifiers.
-//! - [`SearchKey::same_generation`]: the same frame and the same content, so an index built
-//!   under one key is the index of the other and may be served from a cache.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -37,27 +16,20 @@ use crate::search::{
     max_cached_for_retained,
 };
 
-/// One terminal's search generation and coordinate frame, read in one lock hold
-/// ([`SearchKey::capture`]).
+/// One terminal's search generation and coordinate frame, read in one lock hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SearchKey {
-    /// The alternate screen was active. The two grids keep separate content counters, so
-    /// a swap landing on an equal `content_seq` is still another grid.
+    /// Whether the alternate screen was active.
     pub alt: bool,
-    /// [`Terminal::content_seq`]: every content mutation moves it, a viewport scroll does
-    /// not.
+    /// [`Terminal::content_seq`] content mutation counter.
     pub content_seq: u64,
-    /// `Grid::history_renumber_epoch()`: the mutations that slide every retained row's
-    /// absolute key at once, which `content_seq` may not see (a Kitty `CSI +T` unscroll, a
-    /// rewrap of history, an attach of older history).
+    /// `Grid::history_renumber_epoch()` retained-row renumbering counter.
     pub renumber_epoch: u64,
-    /// [`Terminal::absolute_row_revision`]: a protected-footer splice renumbers rows
-    /// piecewise.
+    /// [`Terminal::absolute_row_revision`] piecewise row-renumbering counter.
     pub row_revision: u64,
-    /// The `ambiguous_width` policy every column (and a joined line's padding) is measured
-    /// under. A live switch moves no content counter.
+    /// Active [`AmbiguousWidth`] column measurement policy.
     pub ambiguous: AmbiguousWidth,
-    /// Grid width: the stride the columns of a soft-wrapped line run through.
+    /// Grid width in columns.
     pub cols: u16,
     /// `Grid::oldest_absolute_row()`.
     pub oldest: u64,
@@ -65,17 +37,14 @@ pub struct SearchKey {
     pub scrollback: usize,
     /// Visible rows.
     pub rows: u16,
-    /// Lines the index retains: the caller's depth cap, floored at
-    /// `max_cached_for_retained(rows)`, at least the visible rows, so the window always
-    /// holds the whole screen.
+    /// Maximum lines the index retains (floored at `max_cached_for_retained(rows)`).
     pub max_lines: usize,
 }
 
 /// The absolute rows a search over a [`SearchKey`] reads, in the index's line numbering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SearchWindow {
-    /// Absolute row of the top visible row. Rows from here down may still be edited in
-    /// place; the rows above are history, which only output appended below them moves.
+    /// Absolute row of the top visible row.
     pub visible_base: usize,
     /// Oldest absolute row the index retains.
     pub retained_base: usize,
@@ -88,8 +57,7 @@ pub struct SearchWindow {
 }
 
 impl SearchWindow {
-    /// How many of the newest lines the search reads when the depth cap leaves older
-    /// history unread, `None` when it reads every retained line.
+    /// Newest line count when the depth cap skips older history, or `None` when reading all.
     #[must_use]
     #[inline]
     pub const fn searched_lines(&self) -> Option<usize> {
@@ -102,8 +70,7 @@ impl SearchWindow {
 }
 
 impl SearchKey {
-    /// The key of `t` as it stands, for an index that retains `depth_cap` lines (floored
-    /// as [`SearchKey::max_lines`] says).
+    /// Captures the key of `t` for an index retaining `depth_cap` lines.
     #[must_use]
     #[inline]
     pub fn capture(t: &Terminal, depth_cap: usize) -> Self {
@@ -123,10 +90,7 @@ impl SearchKey {
         }
     }
 
-    /// Rows and columns read under `self` mean the same under `now`: the same grid, no
-    /// renumbering of absolute rows, the same width and the same ambiguous-width policy.
-    /// Content that moved without any of those (output appended, a line rewritten) keeps
-    /// the frame: an absolute row stays put when output scrolls it into history.
+    /// Whether rows and columns read under `self` keep the same coordinate frame under `now`.
     #[must_use]
     #[inline]
     pub fn same_frame(&self, now: &Self) -> bool {
@@ -137,8 +101,7 @@ impl SearchKey {
             && self.ambiguous == now.ambiguous
     }
 
-    /// An index built under `self` is the index of `now`: the same frame, the same content
-    /// and the same depth. The cache hit and the consistency of a finished query.
+    /// Whether an index built under `self` matches the frame, content, and depth of `now`.
     #[must_use]
     #[inline]
     pub fn same_generation(&self, now: &Self) -> bool {
@@ -147,14 +110,7 @@ impl SearchKey {
             && self.max_lines == now.max_lines
     }
 
-    /// An index built under `prev` may be brought up to `self` by re-reading rows from
-    /// `prev`'s visible base down, instead of being rebuilt. That re-read leaves every
-    /// older row under the key it was indexed at, which is sound exactly while those keys
-    /// name the same lines: the same frame (the epoch is the grid's own report that it slid
-    /// the absolute rows; a new width or policy re-measures every line), the same depth,
-    /// and a window that did not retreat. Retention only advances `retained_base` (the
-    /// oldest rows leave, the survivors keep their keys), so a retreat can only be a slide
-    /// nothing reported.
+    /// Whether an index built under `prev` can be incrementally refreshed to `self`.
     #[must_use]
     #[inline]
     pub fn refreshable_from(&self, prev: &Self) -> bool {
@@ -165,8 +121,7 @@ impl SearchKey {
             && was.indexed_end <= is.indexed_end
     }
 
-    /// The rows a search under this key reads: the newest `max_lines` of the retained
-    /// history and screen.
+    /// The newest `max_lines` rows of retained history and screen read under this key.
     #[must_use]
     #[inline]
     pub fn window(&self) -> SearchWindow {
@@ -193,12 +148,9 @@ impl SearchKey {
 /// How an index lays out a soft-wrapped run of grid rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchLayout {
-    /// One indexed line per grid row. The budgeted search slices rows this way, and a web
-    /// host paints each hit on the row it reports.
+    /// One indexed line per grid row.
     Physical,
-    /// Each soft-wrap run joined into the one line the reader sees
-    /// ([`join_wrapped_rows`](super::join_wrapped_rows)), keyed at the row it starts on; the
-    /// plan's [`WrapFrame`] carries hits back to the grid's rows.
+    /// Each soft-wrap run joined into a single logical line keyed at its starting row.
     Logical,
 }
 
@@ -207,23 +159,13 @@ pub enum SearchLayout {
 pub struct SearchRequest {
     /// Lines the index retains, floored as [`SearchKey::max_lines`] says.
     pub depth_cap: usize,
-    /// How soft-wrapped rows are indexed. Part of the slot's key: an index of one layout
-    /// never answers a request for the other.
+    /// How soft-wrapped rows are indexed.
     pub layout: SearchLayout,
-    /// The caller's physical find anchor `(row, col)`, carried into the plan's
-    /// [`WrapFrame`] in the hold that captures the key.
+    /// Optional physical find anchor `(row, col)`.
     pub anchor: Option<(usize, usize)>,
 }
 
 /// One search, from the hold that captured its key to the hold that finishes it.
-///
-/// Made by [`Terminal::search_plan`]: either the terminal's slot answers it
-/// ([`SearchPlan::is_hit`]), or its rows are copied by [`Terminal::read_search_chunk`], each
-/// call one bounded hold, while [`SearchPlan::rows_to_read`] is not zero, and indexed off the
-/// lock by [`SearchPlan::build`]. A plan dropped before [`Terminal::finish_search`] leaves the slot
-/// without the index it took to refresh; the next search builds its window again. A building
-/// plan carries what its hold took out of the slot and did not use, so that is freed with the
-/// plan, off the lock, and never in the hold.
 pub struct SearchPlan {
     pub(super) request: SearchRequest,
     pub(super) key: SearchKey,
@@ -343,9 +285,7 @@ impl SearchPlan {
         matches!(self.kind, PlanKind::Hit { .. })
     }
 
-    /// Rows still to copy before [`SearchPlan::build`]: the window on a cold build, the
-    /// rows that may have changed on a refresh, none on a hit. Until a refresh's first
-    /// chunk names its rows, the window's rows are their bound.
+    /// Rows remaining to copy before [`SearchPlan::build`].
     #[must_use]
     #[inline]
     pub fn rows_to_read(&self) -> usize {
@@ -356,12 +296,7 @@ impl SearchPlan {
         }
     }
 
-    /// The index this search queries: the slot's on a hit, else the copied rows indexed
-    /// here, off the terminal's lock. A refresh takes its base over when no query still
-    /// reads it, and copies it otherwise; a copy that stopped short of its rows, a refresh
-    /// no chunk read among them, is built but counted torn, so it is never kept. What the
-    /// plan's hold displaced from the slot is freed here first, before the new index is
-    /// allocated.
+    /// Builds or reuses the search index off the terminal lock.
     #[must_use]
     pub fn build(self) -> BuiltSearch {
         let unread = self.rows_to_read();
@@ -445,9 +380,7 @@ impl BuiltSearch {
         &self.index
     }
 
-    /// One query, in physical coordinates, with the match the request's anchor selects
-    /// ([`query_search_index_narrowing`]): a literal query narrows from, and leaves, the
-    /// frames the slot keeps beside this index.
+    /// Runs one query in physical coordinates using incremental narrowing frames.
     #[inline]
     pub fn query(
         &mut self,
@@ -474,12 +407,9 @@ impl BuiltSearch {
 /// How a finished search stands against the terminal ([`Terminal::finish_search`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SearchVerdict {
-    /// The index is the terminal's at the key, now as when the search began: no hold saw
-    /// another generation, and the final one sees the key's ([`SearchKey::same_generation`]).
+    /// Whether the index matches the terminal's generation from start to finish.
     pub consistent: bool,
-    /// Every row the search reports still names the line it named: no hold saw another
-    /// frame ([`SearchKey::same_frame`]). Output alone keeps it: absolute rows stay put as
-    /// lines scroll into history.
+    /// Whether every reported row kept the same coordinate frame throughout the search.
     pub frame_stable: bool,
 }
 
@@ -512,8 +442,6 @@ mod tests {
         let k = key();
         assert!(k.same_frame(&k) && k.same_generation(&k) && k.refreshable_from(&k));
         assert_eq!(k.ambiguous, AmbiguousWidth::Single, "precondition");
-        // Frame fields: rows no longer name the lines they did, so neither verdict holds
-        // and no refresh may carry the old keys forward.
         for (field, frame) in [
             ("alt", moved(k, |k| k.alt = !k.alt)),
             ("renumber_epoch", moved(k, |k| k.renumber_epoch += 1)),
@@ -528,17 +456,14 @@ mod tests {
             assert!(!k.same_generation(&frame), "{field}");
             assert!(!frame.refreshable_from(&k), "{field}");
         }
-        // Output moved the content: the frame holds and a refresh may bring the index up.
         let output = moved(k, |k| k.content_seq += 1);
         assert!(k.same_frame(&output));
         assert!(!k.same_generation(&output));
         assert!(output.refreshable_from(&k));
-        // Another depth: the frame holds, but the index retains other lines.
         let deeper = moved(k, |k| k.max_lines += 1);
         assert!(k.same_frame(&deeper));
         assert!(!k.same_generation(&deeper));
         assert!(!deeper.refreshable_from(&k));
-        // The window may advance (retention, appended output) but never retreat.
         let advanced = moved(k, |k| {
             k.oldest += 3;
             k.content_seq += 1;

@@ -70,6 +70,8 @@ pub fn decide(mode: ContainmentMode) -> SpawnDecision {
 }
 
 /// [`decide`] with the platform's sandbox capability and the `$HOME` the
+/// profile is scoped under as arguments, so the fail-closed arm is testable on
+/// the one platform that has a sandbox, and the unresolved-home arm anywhere.
 fn decide_on(mode: ContainmentMode, sandbox_available: bool, home: Option<&str>) -> SpawnDecision {
     let process_cap = ContainmentPolicy::process(mode);
     let denies_network = ContainmentPolicy::network(mode) == NetworkCapability::None;
@@ -133,7 +135,7 @@ fn decide_on(mode: ContainmentMode, sandbox_available: bool, home: Option<&str>)
 
 /// Summary string describing the enforced sandbox posture for `home_scoped`.
 #[must_use]
-pub fn applied_posture(home_scoped: bool) -> &'static str {
+pub const fn applied_posture(home_scoped: bool) -> &'static str {
     if home_scoped {
         "OS sandbox applied: no network; no debugger attach (no task port but a process's own); no mach service lookup but user and group queries (launchd answers by its own policy); writes only to temp dirs and shell history; no access to credential stores or private data under $HOME"
     } else {
@@ -248,6 +250,8 @@ mod tests {
     }
 
     /// `home_scoped` is decided by whether the home resolved, not by whether a
+    /// sandbox applies: a sandboxed spawn with no home carries neither the
+    /// credential denies nor the claim.
     #[test]
     fn home_scoped_follows_the_home_not_the_sandbox() {
         let secret = |profile: &str| {
@@ -281,6 +285,7 @@ mod tests {
     }
 
     /// Build the sandbox-exec argv the launcher builds: `sandbox-exec -p <sbpl>
+    /// <prog> <args...>`. Mirrors the wrap done in `aterm-pty::spawn_shell`.
     #[cfg(target_os = "macos")]
     fn sandbox_wrap(sbpl: &str, prog: &str, args: &[&str]) -> aterm_uds::spawnfd::Command {
         let mut cmd = aterm_uds::spawnfd::command(crate::sbpl::SANDBOX_EXEC_PATH);
@@ -289,6 +294,8 @@ mod tests {
     }
 
     /// Proof 1 (network), hermetic: a loopback TCP listener in this process; a
+    /// probe (`/usr/bin/nc`) connects without the sandbox and fails with the
+    /// actuator's `sandbox-exec -p '(deny network*)'` wrap.
     #[cfg(target_os = "macos")]
     #[test]
     fn enforcement_proof_network_deny_blocks_loopback_connect() {
@@ -349,6 +356,7 @@ mod tests {
     }
 
     /// Proof 2 (EPERM): the same wrap with a file-read-deny profile over a real
+    /// temp file, so the denial surfaces as "Operation not permitted".
     #[cfg(target_os = "macos")]
     #[test]
     fn enforcement_proof_file_read_deny_yields_operation_not_permitted() {
@@ -403,6 +411,8 @@ mod tests {
     }
 
     /// Proof 3 (shell compatibility): an ordinary command pipeline under the
+    /// exact `Containment` profile the actuator produces (scoped under the real
+    /// `$HOME`) exits 0 with the expected output.
     #[cfg(target_os = "macos")]
     #[test]
     fn shell_compat_full_containment_profile_keeps_a_normal_shell_working() {
@@ -442,6 +452,9 @@ mod tests {
     }
 
     /// Proof 4 (targeted secret deny): under the exact `Containment` profile,
+    /// (a) a probe file inside `$HOME/.aws` is not readable (EPERM), and (b)
+    /// `/etc/hosts` still is, so the deny targets the secret set rather than
+    /// the filesystem.
     #[cfg(target_os = "macos")]
     #[test]
     fn secret_deny_full_containment_profile_blocks_secret_but_allows_nonsecret() {
@@ -538,6 +551,7 @@ mod tests {
     }
 
     /// Open `path` for append (creating it if absent, writing nothing) under
+    /// `profile`, returning whether the open succeeded.
     #[cfg(target_os = "macos")]
     fn sandboxed_append_ok(profile: &str, path: &std::path::Path) -> bool {
         sandboxed_sh_ok(profile, &format!(": >> '{}'", path.display()))
@@ -554,6 +568,13 @@ mod tests {
     }
 
     /// Proof 5 (write confinement, full generated Containment profile): a
+    /// contained shell cannot plant anything that later runs outside the sandbox:
+    /// creating a file in `$HOME`, appending to `~/.zshrc`, or dropping a file in
+    /// `~/Library/LaunchAgents` (creating that directory, where it does not exist
+    /// yet) or into the user cache directory beside `$TMPDIR` all fail, while
+    /// the temp roots stay writable (the history allowance
+    /// has its own proof, 5b, over a scratch `$HOME`, since whether the real
+    /// one's history file gets it depends on what that file is).
     #[cfg(target_os = "macos")]
     #[test]
     fn enforcement_proof_containment_confines_writes() {
@@ -637,6 +658,7 @@ mod tests {
     }
 
     /// A scratch `$HOME` under the test binary's target directory, outside
+    /// every [`crate::sbpl::WRITABLE_ROOTS`] entry.
     #[cfg(target_os = "macos")]
     fn scratch_home_outside_writable_roots(tag: &str) -> std::path::PathBuf {
         let refuse = |why: String| -> ! {
@@ -662,6 +684,7 @@ mod tests {
     }
 
     /// Proof 5b (history, over a scratch `$HOME`): the history allowance works
+    /// and cannot become a write anywhere else.
     #[cfg(target_os = "macos")]
     #[test]
     fn enforcement_proof_history_allowance_widens_nothing() {
@@ -759,6 +782,7 @@ mod tests {
     }
 
     /// Proof 6 (login shell): the user's own login shell, rc files and all,
+    /// exits 0 under the full Containment profile (`$SHELL -lic`).
     #[cfg(target_os = "macos")]
     #[test]
     fn shell_compat_login_shell_runs_under_containment() {
@@ -788,6 +812,8 @@ mod tests {
     const TASK_PORT_TARGET: &str = "ATERM_TASK_PORT_PROBE_TARGET";
 
     /// The child half of PROOF 7 under a profile: asks for its own control port and
+    /// for the target's control, read, inspect and name ports, and prints the
+    /// `kern_return_t`s (`self=<c> target=<c>/<r>/<i>/<n>`).
     #[cfg(target_os = "macos")]
     fn task_port_probe_child(target: libc::pid_t) {
         type ForPid = unsafe extern "C" fn(
@@ -841,6 +867,8 @@ mod tests {
     }
 
     /// Proof 7 (task ports, full generated Containment profile): a contained
+    /// process cannot take any task port (control, read, inspect, or name) of a
+    /// process outside the sandbox, while keeping its own.
     #[cfg(target_os = "macos")]
     #[test]
     fn enforcement_proof_task_ports_stay_outside() {
@@ -964,10 +992,12 @@ mod tests {
     const LOOKUP_PROBE: &str = "ATERM_MACH_LOOKUP_PROBE";
 
     /// What `bootstrap_look_up` answers when the sandbox refuses the lookup
+    /// (`BOOTSTRAP_NOT_PRIVILEGED`).
     #[cfg(target_os = "macos")]
     const REFUSED: &str = "1100";
 
     /// Launch Services' daemon and its open/open-URL endpoints, the Apple Events
+    /// daemon, and the `ServiceManagement` daemon behind `SMAppService`/`SMJobBless`.
     #[cfg(target_os = "macos")]
     const LAUNCH_BROKERS: &[&str] = &[
         "com.apple.coreservices.launchservicesd",
@@ -990,6 +1020,8 @@ mod tests {
     ];
 
     /// The child half of PROOFS 8 and 10 under a profile: asks bootstrap for a send
+    /// right to each name in [`LOOKUP_PROBE`] and prints the `kern_return_t`s
+    /// in that order (`LOOKUPS <kr>/<kr>/…`).
     #[cfg(target_os = "macos")]
     fn mach_lookup_probe_child(names: &str) {
         unsafe extern "C" {
@@ -1023,6 +1055,7 @@ mod tests {
     }
 
     /// Each of `names` looked up by [`mach_lookup_probe_child`] under `profile`,
+    /// as `(name, kern_return_t)`.
     #[cfg(target_os = "macos")]
     fn lookups<'n>(profile: &str, names: &[&'n str]) -> Vec<(&'n str, String)> {
         let exe = std::env::current_exe().expect("this test binary");
@@ -1070,6 +1103,8 @@ mod tests {
     }
 
     /// Proof 8 (launch brokers): under the full Containment profile, a contained
+    /// process gets no port to Launch Services, the Apple Events daemon, or the
+    /// `ServiceManagement` daemon because the allowlist does not name them.
     #[cfg(target_os = "macos")]
     #[test]
     fn enforcement_proof_launch_brokers_denied() {
@@ -1093,6 +1128,8 @@ mod tests {
     }
 
     /// Proof 10 (deny-by-default mach-lookup): a sample of daemons that act for
+    /// their caller ([`CALLER_ACTING_DAEMONS`]) is refused (`kr` 1100) while every
+    /// [`crate::sbpl::MACH_LOOKUP_ALLOWLIST`] name remains reachable (`kr` 0).
     #[cfg(target_os = "macos")]
     #[test]
     fn enforcement_proof_mach_lookup_denied_by_default() {
@@ -1131,6 +1168,10 @@ mod tests {
     const PREFERENCE_PROBE: &str = "ATERM_PREFERENCE_WRITE_PROBE";
 
     /// The child half of PROOF 9 under a profile: asks the sandbox, for this
+    /// process, whether it may write a user preference domain — the question
+    /// the preferences daemon asks before it writes `~/Library/Preferences` on
+    /// a caller's behalf — and prints the answer (`PREFERENCE_WRITE <rc>`, 0 =
+    /// allowed).
     #[cfg(target_os = "macos")]
     fn preference_write_probe_child() {
         /// `SANDBOX_FILTER_PREFERENCE_DOMAIN` from `<sandbox/private.h>`.
@@ -1156,6 +1197,8 @@ mod tests {
     }
 
     /// Proof 9 (preference writes): `cfprefsd` writes `~/Library/Preferences`
+    /// outside the sandbox on behalf of callers, so under the Containment profile
+    /// the sandbox must refuse `user-preference-write`.
     #[cfg(target_os = "macos")]
     #[test]
     fn enforcement_proof_preference_writes_denied() {
@@ -1208,10 +1251,12 @@ mod tests {
     }
 
     /// A hang detector for one contained tool, never a latency budget: each
+    /// answers in about a second, a `targo` build included.
     #[cfg(target_os = "macos")]
     const TOOL_HANG: std::time::Duration = std::time::Duration::from_secs(180);
 
     /// `program`'s first line of output, run unsandboxed — the CONTROL a
+    /// contained run is compared with.
     #[cfg(target_os = "macos")]
     fn unsandboxed_line(program: &str, args: &[&str]) -> Option<String> {
         let out = aterm_uds::deadline::output_until(
@@ -1240,6 +1285,8 @@ mod tests {
     }
 
     /// Proof 11 (tool set): common development tools work under the full
+    /// Containment profile with only [`crate::sbpl::MACH_LOOKUP_ALLOWLIST`]
+    /// allowed, running in a scratch directory under `$TMPDIR`.
     #[cfg(target_os = "macos")]
     #[test]
     fn shell_compat_tool_set_runs_under_containment() {
@@ -1473,6 +1520,10 @@ mod tests {
     }
 
     /// Proof 12 (`open` and `osascript`): `open -W` of a background-only scratch
+    /// app whose executable writes a marker outside the writable roots fails and
+    /// writes nothing, and `osascript` sending Finder an Apple Event in raw four-char
+    /// codes (`«class pnam» of «class sdsk»`, compiled without Finder's dictionary)
+    /// gets no answer.
     #[cfg(target_os = "macos")]
     #[test]
     fn enforcement_proof_open_and_osascript_stay_refused() {

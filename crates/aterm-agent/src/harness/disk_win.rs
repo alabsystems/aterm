@@ -1,24 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE DISK WATCH'S WINDOWS CALLS, in one auditable file: what std does not
-//! say of an open file (the clusters it holds) and does not do to one (mark it
-//! with an attribute `CreateFileW` drops; delete it through the very handle
-//! that was judged). Every call on a file takes a handle std
-//! opened — never a path, which could name another file by the time it is
-//! resolved again — and each is declared here, dependency-free (std links
-//! `kernel32`; `advapi32` is the system's own), as the crate's
-//! other Win32 calls are. Beside them, where the system keeps its own
-//! folders (`System32`, `ProgramData`), as the system says, never as the
-//! environment a process was handed says: what the in-use scan's
-//! platform-service rule places an unreadable process's image in.
+//! THE DISK WATCH'S WINDOWS CALLS, in one auditable file: what std does not say of an open file (the clusters it holds) and does not do to one (mark it with an attribute `CreateFileW` drops; delete it through the very handle that was judged).
 
 use std::io;
 use std::os::windows::io::AsRawHandle as _;
 
 /// `FILE_STANDARD_INFO`: the clusters a file holds (`AllocationSize`) beside
-/// its length (`EndOfFile`). Two `LARGE_INTEGER`s, a `DWORD` and two
-/// `BOOLEAN`s, padded to 24 bytes.
+/// its length (`EndOfFile`).
 #[repr(C)]
 #[derive(Default)]
 struct FileStandardInfo {
@@ -71,14 +60,11 @@ pub(crate) const DELETE: u32 = 0x0001_0000;
 pub(crate) const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
 /// `FILE_FLAG_OPEN_REPARSE_POINT`: open a link (any reparse point) as itself.
 pub(crate) const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-/// `FILE_ATTRIBUTE_COMPRESSED`: written data is compressed (a folder: what is
-/// created in it is).
+/// `FILE_ATTRIBUTE_COMPRESSED`: written data is compressed (a folder: what is created in it is).
 pub(crate) const FILE_ATTRIBUTE_COMPRESSED: u32 = 0x0000_0800;
 /// `FILE_ATTRIBUTE_NOT_CONTENT_INDEXED`: Windows Search leaves it alone.
 pub(crate) const FILE_ATTRIBUTE_NOT_CONTENT_INDEXED: u32 = 0x0000_2000;
-/// The attributes of a file whose length overstates the clusters it holds:
-/// sparse, compressed, offline, or a cloud placeholder recalled on open or
-/// on access.
+/// The attributes of a file whose length overstates the clusters it holds: sparse, compressed, offline, or a cloud placeholder recalled on open or on access.
 pub(crate) const FILE_ATTRIBUTES_THIN: u32 =
     0x0000_0200 | FILE_ATTRIBUTE_COMPRESSED | 0x0000_1000 | 0x0004_0000 | 0x0040_0000;
 
@@ -98,19 +84,12 @@ unsafe extern "system" {
     ) -> i32;
 }
 
-/// The bytes of disk the open `file` holds: its allocation, which for a
-/// compressed or sparse file is what it really holds, not its length
-/// (measured 2026-10-19 on NTFS: 3 MiB of one byte value held 3 MiB plain,
-/// 192 KiB in a compressed folder, 0 sparse — the same figures
-/// `GetCompressedFileSizeW` reads by path).
-///
+/// The bytes of disk the open `file` holds: its allocation, which for a compressed or sparse file is what it really holds, not its length (measured 2026-10-19 on NTFS: 3 MiB of one byte value held 3 MiB plain, 192 KiB in a compressed folder, 0 sparse — the same figures `GetCompressedFileSizeW` reads by path).
 /// # Errors
-///
 /// The query failed.
 pub(crate) fn allocated(file: &std::fs::File) -> io::Result<u64> {
     let mut info = FileStandardInfo::default();
-    // SAFETY: the handle is `file`'s own, open for the whole call; `info` is a
-    // writable `FILE_STANDARD_INFO` of the size passed, which the call fills.
+    // SAFETY: the handle is `file`'s own, open for the whole call; `info` is a writable `FILE_STANDARD_INFO` of the size passed, which the call fills.
     let ok = unsafe {
         GetFileInformationByHandleEx(
             file.as_raw_handle(),
@@ -125,12 +104,8 @@ pub(crate) fn allocated(file: &std::fs::File) -> io::Result<u64> {
     Ok(u64::try_from(info.allocation_size).unwrap_or(0))
 }
 
-/// Add `attributes` to the open `file`'s (opened for writing), its times left
-/// as they are: `CreateFileW` takes only a few attributes at creation and
-/// drops the rest (`NOT_CONTENT_INDEXED` among them), so they are set here.
-///
+/// Add `attributes` to the open `file`'s (opened for writing), its times left as they are: `CreateFileW` takes only a few attributes at creation and drops the rest (`NOT_CONTENT_INDEXED` among them), so they are set here.
 /// # Errors
-///
 /// The attributes could not be read or set.
 pub(crate) fn add_attributes(file: &std::fs::File, attributes: u32) -> io::Result<()> {
     use std::os::windows::fs::MetadataExt as _;
@@ -138,9 +113,7 @@ pub(crate) fn add_attributes(file: &std::fs::File, attributes: u32) -> io::Resul
         file_attributes: file.metadata()?.file_attributes() | attributes,
         ..FileBasicInfo::default()
     };
-    // SAFETY: the handle is `file`'s own, open for the whole call; `info` is a
-    // readable `FILE_BASIC_INFO` of the size passed, whose zero times leave
-    // the file's own unchanged.
+    // SAFETY: the handle is `file`'s own, open for the whole call; `info` is a readable `FILE_BASIC_INFO` of the size passed, whose zero times leave the file's own unchanged.
     let ok = unsafe {
         SetFileInformationByHandle(
             file.as_raw_handle(),
@@ -155,14 +128,8 @@ pub(crate) fn add_attributes(file: &std::fs::File, attributes: u32) -> io::Resul
     Ok(())
 }
 
-/// Delete the file open as `file` (opened with [`DELETE`] access) THROUGH ITS
-/// HANDLE: the name goes at once (a POSIX delete; its clusters free when the
-/// last handle closes), whatever its read-only bit; where the volume has no
-/// POSIX delete, the classic mark, which deletes it when the last handle
-/// closes. Nothing is resolved by name, so it is the file that was judged.
-///
+/// Delete the file open as `file` (opened with [`DELETE`] access) THROUGH ITS HANDLE: the name goes at once (a POSIX delete; its clusters free when the last handle closes), whatever its read-only bit; where the volume has no POSIX delete, the classic mark, which deletes it when the last handle closes.
 /// # Errors
-///
 /// Both dispositions were refused.
 pub(crate) fn delete_open(file: &std::fs::File) -> io::Result<()> {
     let ex = FileDispositionInfoEx {
@@ -170,8 +137,7 @@ pub(crate) fn delete_open(file: &std::fs::File) -> io::Result<()> {
             | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
             | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
     };
-    // SAFETY: the handle is `file`'s own, open for the whole call; `ex` is a
-    // readable `FILE_DISPOSITION_INFO_EX` of the size passed.
+    // SAFETY: the handle is `file`'s own, open for the whole call; `ex` is a readable `FILE_DISPOSITION_INFO_EX` of the size passed.
     let ok = unsafe {
         SetFileInformationByHandle(
             file.as_raw_handle(),
@@ -235,19 +201,13 @@ unsafe extern "system" {
     ) -> i32;
 }
 
-/// The system's own directory (`%SystemRoot%\System32`) as the SYSTEM says
-/// it (`GetSystemDirectoryW`), never as an environment variable a process
-/// was handed: what the platform-service rule places an image in
-/// (`discover::platform_service`). `None` where it could not be read.
+/// The system's own directory (`%SystemRoot%\System32`) as the SYSTEM says it (`GetSystemDirectoryW`), never as an environment variable a process was handed: what the platform-service rule places an image in (`discover::platform_service`).
 pub(crate) fn system_directory() -> Option<std::path::PathBuf> {
     use std::os::windows::ffi::OsStringExt as _;
     let mut buffer = vec![0u16; 260];
     loop {
         let size = u32::try_from(buffer.len()).ok()?;
-        // SAFETY: `buffer` is writable for `size` UTF-16 units for the whole
-        // call, which writes at most that many (its terminator included) and
-        // answers the units written, or the size it needs when they do not
-        // fit, or 0 on failure.
+        // SAFETY: `buffer` is writable for `size` UTF-16 units for the whole call, which writes at most that many (its terminator included) and answers the units written, or the size it needs when they do not fit, or 0 on failure.
         let n = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), size) } as usize;
         if n == 0 {
             return None;
@@ -263,15 +223,7 @@ pub(crate) fn system_directory() -> Option<std::path::PathBuf> {
     }
 }
 
-/// The machine's shared program data folder (`%ProgramData%`) as the
-/// SYSTEM records it, never as an environment variable a process was handed:
-/// where Microsoft Defender's platform runs from
-/// (`discover::platform_service`). The record is the `ProfileList` key's
-/// `ProgramData` value, read as stored (`%SystemDrive%\ProgramData`) and
-/// expanded only from the system's own directory ([`expand_system`]) — the
-/// shell's `SHGetKnownFolderPath(FOLDERID_ProgramData)` expands the record
-/// from the caller's environment, so a process handed another `SystemDrive`
-/// read a folder of that drive's. `None` where it could not be read.
+/// The machine's shared program data folder (`%ProgramData%`) as the SYSTEM records it, never as an environment variable a process was handed: where Microsoft Defender's platform runs from (`discover::platform_service`).
 pub(crate) fn program_data() -> Option<std::path::PathBuf> {
     use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
     let wide = |s: &str| -> Vec<u16> { std::ffi::OsStr::new(s).encode_wide().chain([0]).collect() };
@@ -279,11 +231,7 @@ pub(crate) fn program_data() -> Option<std::path::PathBuf> {
     let mut buffer = vec![0u16; 260];
     let stored = loop {
         let mut bytes = u32::try_from(buffer.len() * 2).ok()?;
-        // SAFETY: `key` and `value` are NUL-terminated UTF-16 strings that
-        // outlive the call; the predefined key needs no open or close;
-        // `buffer` is writable for `bytes` bytes, which the call writes at
-        // most (a string value's terminator included) and then sets to the
-        // bytes written, or on `ERROR_MORE_DATA` to the bytes it needs.
+        // SAFETY: `key` and `value` are NUL-terminated UTF-16 strings that outlive the call; the predefined key needs no open or close; `buffer` is writable for `bytes` bytes, which the call writes at most (a string value's terminator included) and then sets to the bytes written, or on `ERROR_MORE_DATA` to the bytes it needs.
         let status = unsafe {
             RegGetValueW(
                 HKEY_LOCAL_MACHINE,
@@ -313,9 +261,7 @@ pub(crate) fn program_data() -> Option<std::path::PathBuf> {
 /// `stored` (a folder the registry records, `%SystemDrive%\ProgramData`) with
 /// its variables expanded from the system's own directory `system`
 /// (`C:\WINDOWS\system32`) alone: `%SystemDrive%` is its drive, `%SystemRoot%`
-/// and `%windir%` the folder above it, in any case. `None` for any other
-/// variable (only the environment could name it), a `%` left open, or a
-/// result that is not an absolute path.
+/// and `%windir%` the folder above it, in any case.
 fn expand_system(stored: &str, system: &std::path::Path) -> Option<std::path::PathBuf> {
     let system = system.to_str()?;
     let root = system.rsplit_once('\\')?.0;
@@ -377,16 +323,8 @@ unsafe extern "system" {
     ) -> i32;
 }
 
-/// TEST FIXTURE: give the open `file` (a file, or an EMPTY folder, opened
-/// for writing as itself) a reparse point that is NO LINK
-/// ([`FOREIGN_REPARSE_TAG`]) — what a cloud placeholder is to std, made
-/// without a privilege (measured 2026-10-19: a plain account sets one; std
-/// then reads the file as `is_file`, not `is_symlink`, attributes `0x420`,
-/// and an open that does not ask for the point itself fails with
-/// `ERROR_CANT_ACCESS_FILE`).
-///
+/// TEST FIXTURE: give the open `file` (a file, or an EMPTY folder, opened for writing as itself) a reparse point that is NO LINK ([`FOREIGN_REPARSE_TAG`]) — what a cloud placeholder is to std, made without a privilege (measured 2026-10-19: a plain account sets one; std then reads the file as `is_file`, not `is_symlink`, attributes `0x420`, and an open that does not ask for the point itself fails with `ERROR_CANT_ACCESS_FILE`).
 /// # Errors
-///
 /// The file system refused the reparse point.
 #[cfg(test)]
 pub(crate) fn set_foreign_reparse_point(file: &std::fs::File) -> io::Result<()> {
@@ -397,10 +335,7 @@ pub(crate) fn set_foreign_reparse_point(file: &std::fs::File) -> io::Result<()> 
         guid: [0x11; 16],
     };
     let mut returned: u32 = 0;
-    // SAFETY: the handle is `file`'s own, open for the whole call; `header`
-    // is a readable `REPARSE_GUID_DATA_BUFFER` header of the size passed
-    // (no data follows: its length says 0); no output buffer is passed; the
-    // call is synchronous (no `OVERLAPPED`) and writes only `returned`.
+    // SAFETY: the handle is `file`'s own, open for the whole call; `header` is a readable `REPARSE_GUID_DATA_BUFFER` header of the size passed (no data follows: its length says 0); no output buffer is passed; the call is synchronous (no `OVERLAPPED`) and writes only `returned`.
     let ok = unsafe {
         DeviceIoControl(
             file.as_raw_handle(),
@@ -444,9 +379,7 @@ mod tests {
     /// The registry's record of a system folder is expanded from the system
     /// directory alone: `%SystemDrive%` is its drive and `%SystemRoot%` /
     /// `%windir%` the folder above it, in any case; a record with no variable
-    /// is read as written. NEGATIVE CONTROLS: a variable only the environment
-    /// names, a `%` left open, and a result that is not absolute are no
-    /// folder.
+    /// is read as written.
     #[test]
     fn a_stored_folder_is_expanded_from_the_system_directory_alone() {
         let system = std::path::Path::new(r"D:\WINDOWS\system32");
@@ -491,14 +424,7 @@ mod tests {
     /// The system's folders do not follow the environment a process was
     /// handed: a child of this test whose `SystemRoot`, `windir`,
     /// `SystemDrive`, `ProgramData` and `ALLUSERSPROFILE` all name a scratch
-    /// folder reads the very folders this process reads. The scratch folder
-    /// holds decoy `System32` and `ProgramData` folders, so a reader that
-    /// follows the environment answers a folder that is there: the shell's
-    /// `SHGetKnownFolderPath(FOLDERID_ProgramData)`, which this replaced,
-    /// answered the decoy (it expands `%SystemDrive%` from the caller's
-    /// environment). NEGATIVE CONTROL: the child reads its own `ProgramData`
-    /// variable back as the scratch folder, so the environment it was handed
-    /// is the one it ran under.
+    /// folder reads the very folders this process reads.
     #[test]
     fn the_system_folders_ignore_the_environment() {
         let text = |p: Option<std::path::PathBuf>| {

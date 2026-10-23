@@ -45,6 +45,7 @@ pub enum Subject {
 }
 
 /// A word a subject may carry: what every program and seam name is, and nothing that could
+/// read as a separator or a path.
 fn is_word(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
@@ -206,6 +207,7 @@ impl From<io::Error> for LeaseError {
 }
 
 /// `<prefix>/leases`, made if absent — private (`0700`) on Unix, since a lease names the
+/// holder's working directory.
 fn ensure_dir(prefix: &Path) -> io::Result<PathBuf> {
     let d = dir(prefix);
     match std::fs::symlink_metadata(&d) {
@@ -234,6 +236,7 @@ fn ensure_dir(prefix: &Path) -> io::Result<PathBuf> {
 }
 
 /// Open (creating) a lease-directory file for locking: `0600`, never truncated — a lock
+/// file is a rendezvous, not data.
 fn open_rendezvous(path: &Path) -> io::Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -246,6 +249,7 @@ fn open_rendezvous(path: &Path) -> io::Result<File> {
 }
 
 /// The "who" line a holder writes: the first line of `who`, cut on a character boundary
+/// short of [`WHO_MAX`] so a reader's bounded read takes it whole.
 fn who_line(who: &str) -> String {
     let first = who.lines().next().unwrap_or_default();
     let limit = usize::try_from(WHO_MAX).map_or(0, |max| max.saturating_sub(1));
@@ -432,6 +436,7 @@ impl Holders {
 }
 
 /// Test one holder's file: `Ok(Some(who))` live, `Ok(None)` a dead holder's (removed when
+/// `reap`), `Err` when it could not be tested.
 fn probe_file(path: &Path, reap: bool) -> io::Result<Option<String>> {
     let mut file: std::fs::File = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -653,6 +658,7 @@ pub fn sweep(prefix: &Path, exists: &dyn Fn(&Subject) -> bool) {
 }
 
 /// [`sweep`]'s arm for a `.taking` file (`laying` is its name without the suffix): reaped
+/// only while its subject's gate is held EXCLUSIVE.
 fn reap_taking(prefix: &Path, laying: &str, path: &Path) {
     let stem = laying
         .split_once(HOLDER_SEP)
@@ -681,6 +687,7 @@ mod tests {
     use super::*;
 
     /// A scratch prefix, removed when the test ends however it ends: the
+    /// directory goes when its `TempDir`, held only to be dropped, does.
     struct Prefix(
         PathBuf,
         #[allow(dead_code, reason = "held for its drop")] aterm_tempfile::TempDir,
@@ -769,6 +776,7 @@ mod tests {
     }
 
     /// A live lease is seen with its holder's words; dropping it frees the subject, and a
+    /// read never writes.
     #[test]
     fn a_lease_is_held_until_dropped() {
         let p = prefix("held");
@@ -798,6 +806,7 @@ mod tests {
     }
 
     /// A holder that died without dropping (its lock released by the kernel, its file left
+    /// behind) holds nothing: a reader reads it free, and the reclaimer reaps the file.
     #[test]
     fn a_dead_holders_file_holds_nothing_and_is_reaped() {
         let p = prefix("dead");
@@ -817,6 +826,7 @@ mod tests {
     }
 
     /// The race the gate exists for: while a reclaim holds it, a holder waits (and gives up
+    /// at its bound); while a holder holds a lease, a reclaim keeps the subject.
     #[test]
     fn the_gate_orders_a_holder_against_a_reclaim() {
         let p = prefix("gate");
@@ -841,6 +851,7 @@ mod tests {
     }
 
     /// The sweep takes dead holders' files, `.taking` debris and the gates of subjects that
+    /// are gone — and nothing a live holder or a live subject owns.
     #[test]
     fn the_sweep_takes_only_the_dead() {
         let p = prefix("sweep");
@@ -872,6 +883,9 @@ mod tests {
     }
 
     /// A holder MID-LAY — its subject's gate held shared, its `.taking` created and not yet
+    /// locked, the instant between `take`'s `create_new` and its `try_lock` — is not reaped
+    /// by a sweep: the file is a live holder's, and reaping it failed that holder's rename,
+    /// so its run went on without a lease.
     #[test]
     fn the_sweep_never_takes_a_lease_being_laid() {
         let p = prefix("sweep-laying");

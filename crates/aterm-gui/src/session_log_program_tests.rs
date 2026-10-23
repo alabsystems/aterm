@@ -1,18 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE PROGRAM MARKS (T24's
-//! reversal): each move of what the program in front says about itself
-//! (OSC 7501) that the status sweep's gate shows is a `program` mark in the
-//! session's log, written through its run's bucket ([`PROGRAM_BURST`], then
-//! one each [`PROGRAM_REFILL_MS`]), and a move that finds the bucket empty is
-//! coalesced, never dropped: the newest state is written once a token frees,
-//! with `coalesced=` the states it replaced. Driven by explicit calls on
-//! hand-set clocks (the sweep's tick is [`SessionLog::program_tick`]).
-//!
-//! NEGATIVE CONTROLS (scratch, 6F-4's commit): a bucket that drops the
-//! newest move ends the burst on a stale state; no bucket at all writes
-//! some 14,400 marks in the flapping hour.
+//! Session log `program` mark tests ([`PROGRAM_BURST`], [`PROGRAM_REFILL_MS`],
+//! [`SessionLog::program_tick`]).
 
 use std::time::{Duration, Instant};
 
@@ -49,8 +39,7 @@ fn tick(tl: &std::sync::Mutex<SessionTimeline>) {
 /// [`PROGRAM_BURST`] are written at once, the rest coalesce into the run's
 /// one pending state, which the same second's sweep cannot write and the
 /// next second's does: `log kinds=program` ends on `state=done
-/// coalesced=29`. Nothing is written twice, the ring holds every row, and
-/// no program mark is bus class (it stays on this host).
+/// coalesced=29`.
 #[test]
 fn a_burst_of_50_moves_ends_on_its_newest_state_coalesced() {
     let (tl, hand) = opened();
@@ -101,7 +90,6 @@ fn a_burst_of_50_moves_ends_on_its_newest_state_coalesced() {
         "local: no program mark is the bus mirror's"
     );
     drop(g);
-    // Nothing pending: another second writes nothing.
     hand.set(7_000);
     tick(&tl);
     assert_eq!(program_lines(&tl).len(), PROGRAM_BURST as usize + 1);
@@ -151,7 +139,6 @@ fn a_program_flapping_at_4_hz_for_an_hour_stays_within_its_bucket_and_share() {
 /// in front reports `working` then `done` through the real status sweep,
 /// the log holds one `program state=done` mark, the gate counts one turn
 /// end and presence one story point for it, however many sweeps follow.
-/// NEGATIVE CONTROL: a second turn (`working`, `done`) is counted again.
 #[test]
 fn presence_counts_a_program_done_once_beside_its_mark() {
     const WORKING: &[u8] = b"\x1b]7501;state=working:app=codex\x1b\\";
@@ -200,7 +187,6 @@ fn presence_counts_a_program_done_once_beside_its_mark() {
     assert_eq!(dones(), 1, "one done mark");
     assert_eq!(app.session_status.program_turn_ends(session), 1);
     assert_eq!(story(&app), before + 1, "one story point for the done");
-    // NEGATIVE CONTROL: a second turn is a second end.
     crate::term_lock(&term).process(WORKING);
     sweep(&mut app);
     crate::term_lock(&term).process(DONE);
@@ -241,8 +227,7 @@ fn codex_run(tl: &std::sync::Mutex<SessionTimeline>) -> String {
 /// THE NEWEST IS NEVER DROPPED AT A SESSION'S CLOSE (U44): a burst that
 /// leaves `done` pending, then the session closes in the same second (no
 /// token): the pending state is written on its run, `coalesced=` counted,
-/// before the session's close. NEGATIVE CONTROL (scratch): `close_session`
-/// without its flush loses the `done`, and this fails.
+/// before the session's close.
 #[test]
 fn a_pending_state_is_written_before_the_session_closes() {
     let (tl, hand) = opened();
@@ -281,8 +266,7 @@ fn a_pending_state_is_written_before_the_session_closes() {
 /// THE NEWEST IS NEVER DROPPED ACROSS AN UPDATE (U44): a burst that leaves
 /// `done` pending, then the handoff worker takes the log in the same second:
 /// the pending state is written before the fence, so the carry's lines hold
-/// it (the successor's bucket starts full and empty). NEGATIVE CONTROL
-/// (scratch): `carry_source` without its flush carries no `done`.
+/// it (the successor's bucket starts full and empty).
 #[test]
 fn a_pending_state_is_written_before_the_carry() {
     let (tl, hand) = opened();
@@ -308,9 +292,7 @@ fn a_pending_state_is_written_before_the_carry() {
 /// THE NEWEST IS NEVER DROPPED AT A RUN CHANGE (U44): moves with no run
 /// open fill the session's bucket and leave `working` pending; a codex run
 /// comes to the front in the same second, and its first move first writes
-/// the session's pending state on `-`, then its own on its run. NEGATIVE
-/// CONTROL (scratch): a run change that starts the new bucket without
-/// writing the old one's pending state loses the `working`.
+/// the session's pending state on `-`, then its own on its run.
 #[test]
 fn a_run_change_writes_the_last_runs_pending_state_first() {
     let (tl, hand) = opened();
@@ -335,12 +317,7 @@ fn a_run_change_writes_the_last_runs_pending_state_first() {
 /// WHERE A PROGRAM MARK LANDS ONCE ITS RUN CLOSES (the module doc): a codex
 /// run in front leaves `done` pending, beside it a run the producers do not
 /// hold is open with a turn under it (the deepest open node); the front
-/// moves back to the shell, which closes the codex run. Its pending `done`
-/// is written on it before its close, and the cleared report the gate then
-/// shows (`state=none`) is the session's (`-`, the shell holds no run):
-/// no program mark lands on the deepest open node. NEGATIVE CONTROL
-/// (scratch): `close_node` without `settle_program` writes the `done` after
-/// the close, on `-`, and this fails.
+/// moves back to the shell, which closes the codex run.
 #[test]
 fn a_runs_pending_state_is_written_on_it_before_it_closes() {
     let (tl, hand) = opened();
@@ -400,9 +377,7 @@ fn a_runs_pending_state_is_written_on_it_before_it_closes() {
 
 /// A RUN THE LOG CLOSED BEHIND THE PRODUCERS' BACK (no `close_node`): its
 /// pending state, written at the next tick, is the session's (`-`), never
-/// the deepest open node's. NEGATIVE CONTROL (scratch): writing at the
-/// bucket's run unfiltered lets [`aterm_slog::Log::mark`] hang it on the
-/// open turn beside it, and this fails.
+/// the deepest open node's.
 #[test]
 fn a_pending_state_whose_run_is_gone_is_the_sessions() {
     let (tl, hand) = opened();
@@ -461,10 +436,7 @@ fn a_pending_state_whose_run_is_gone_is_the_sessions() {
 /// THE STATUS SWEEP'S TICK WRITES A COALESCED STATE (the production
 /// wiring, U17): a codex in front reports 30 moves, one a sweep, all in one
 /// hand-set second of its log's clock, ending `done`; the bucket writes the
-/// first [`PROGRAM_BURST`] and holds the rest. The program then goes quiet,
-/// and the next sweep, a second later, writes the held `done` with
-/// `coalesced=`. NEGATIVE CONTROL (scratch): the sweep without its
-/// `program_tick` leaves the `done` unwritten, and this fails.
+/// first [`PROGRAM_BURST`] and holds the rest.
 #[test]
 fn the_status_sweep_writes_a_held_state_once_a_token_frees() {
     let mut app = App::headless_for_test();

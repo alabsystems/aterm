@@ -1,55 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Sub-row scroll translate: the display-only vertical shift that turns the scroll
-//! kinematics' fractional residual into pixel motion.
-//!
-//! `aterm-gui`'s `scroll_motion` banks a signed residual `scroll_frac_px ∈ (-cell_h,
-//! cell_h)` below every whole-row scroll (the glide's fractional part, or the
-//! elastic-overscroll displacement at a history end). At present time this module
-//! shifts the terminal-content pixel band by it: up for a positive residual (the
-//! incoming row appears at the bottom), down for a negative one (the bounce exposes a
-//! strip at the top). Glyph rasters are untouched; the translate is an integer memmove
-//! of rendered pixels, so text stays raster-exact while it moves.
-//!
-//! # Chrome stays pinned
-//!
-//! The windowed compose path splices non-terminal chrome into the SAME
-//! `RenderInput` rows as terminal content: the tab strip is PREPENDED at the top
-//! (`app_render::prepend_strip_rows`), transient bars can occupy an edge row, and
-//! split-pane dividers sit between panes. Those rows must stay PINNED while the
-//! grid glides underneath them. So the translate
-//! is confined to the grid pixel band `[y0, y1)` derived from the frame's
-//! `[grid_top_row, grid_bot_row)` partition ([`grid_band_px`]); every pixel
-//! OUTSIDE that band is left byte-for-byte identical. That structural confinement
-//! is exactly [`translate_grid_band_in_place`]'s contract and is proven below
-//! (`matches_out_of_place`, against a reference that writes only the band) —
-//! the M1b chrome-invariance theorem.
-//!
-//! # The exposed strip
-//!
-//! 1. **Identity at `frac == 0`.** A zero residual moves nothing: the present
-//!    buffer is byte-identical to the untranslated frame — so a frame at
-//!    `scroll_frac_px == 0` equals the same viewport reached by a whole-row jump
-//!    (`matches_out_of_place` at `frac == 0`). This is the raster-invariance
-//!    PROVE bullet.
-//! 2. **Chrome invariance.** For ANY `frac`, every pixel with a row index outside
-//!    `[y0, y1)` is byte-identical to the input; only the grid band is rewritten
-//!    (`matches_out_of_place`): a row shifts IFF it is in the grid band.
-//! 3. **Band derivation.** [`grid_band_px`] reproduces the renderer's own row→px
-//!    mapping (`pad + row*cell_h`) and clamps to the framebuffer, so the band is
-//!    exactly the terminal-content rows' pixels (`band_matches_row_mapping`).
-//!
-//! Known limits: the incoming row is rastered in isolation, so a neighbour's glyph
-//! overshoot across the seam, a selection reaching the row and an inline image on it
-//! appear only when the row lands; a wallpaper frame keeps the placeholder (its
-//! backdrop is frame-fixed).
+//! Sub-row scroll translation and incoming-strip painting for rendered grid bands.
 
-/// The terminal-content pixel band `[y0, y1)` for grid rows `[grid_top_row,
-/// grid_bot_row)`, row `r` starting at `pad + r * cell_h` (the renderer passes
-/// `grid_top()` as `pad`), clamped to the framebuffer height `h`. Empty (`y0 >= y1`)
-/// when there is no grid to translate: `grid_bot_row <= grid_top_row` (including the
-/// no-partition default `grid_bot_row == 0`) or a band below the frame.
+/// Returns the terminal-content pixel band `[y0, y1)` for grid rows `[grid_top_row, grid_bot_row)`, clamped to `h`.
 #[must_use]
 #[inline]
 pub const fn grid_band_px(
@@ -69,19 +23,7 @@ pub const fn grid_band_px(
     (y0, y1)
 }
 
-/// Shift the rows of the grid band `[y0, y1)` of `buf` (`w`-wide, row-major) by
-/// `frac_px` device pixels in place; rows outside the band are never touched.
-///
-/// * Positive shifts up (the glide residual, or the bounce past the live bottom): row
-///   `dy` takes `dy + frac` while that is in the band; the bottom `frac` rows are the
-///   exposed strip.
-/// * Negative shifts down (the bounce past the history top): row `dy` takes
-///   `dy - |frac|`; the top `|frac|` rows are exposed.
-///
-/// The exposed strip keeps the band's own pixels as a placeholder until
-/// [`paint_incoming_strip`] covers it (up-glide only); `|frac| >= band_h` exposes the
-/// whole band. Each direction is one `copy_within` (memmove), so overlap is safe
-/// (`matches_out_of_place`). `frac_px == 0` is a no-op.
+/// Shifts the rows of the grid band `[y0, y1)` of `buf` (`w`-wide, row-major) by `frac_px` device pixels in place.
 #[inline]
 pub fn translate_grid_band_in_place(buf: &mut [u32], w: usize, y0: usize, y1: usize, frac_px: i64) {
     if w == 0 || y0 >= y1 || frac_px == 0 {
@@ -89,8 +31,6 @@ pub fn translate_grid_band_in_place(buf: &mut [u32], w: usize, y0: usize, y1: us
     }
     let band_h = y1 - y0;
     let mag = frac_px.unsigned_abs() as usize;
-    // The number of destination rows that pull from a still-in-band source; the
-    // remaining `min(mag, band_h)` rows at the exposed edge are the placeholder.
     let moved = band_h.saturating_sub(mag);
     if moved == 0 {
         return;
@@ -104,15 +44,7 @@ pub fn translate_grid_band_in_place(buf: &mut [u32], w: usize, y0: usize, y1: us
     }
 }
 
-/// Whether a frame owes the incoming-row strip, the one predicate both backends use:
-///
-/// * a positive residual (the top bounce exposes rubber-band gap, not a row);
-/// * a present apron, or the live bottom (`display_offset == 0`), where the strip is
-///   painted blank; an absent apron above the bottom (a reordered BiDi row) keeps the
-///   placeholder;
-/// * a band reaching the frame's last row (`grid_bot_row == rows`): under bottom chrome
-///   inside the frame (a find bar) the row below the band is not the engine's apron;
-/// * no wallpaper (its frame-fixed backdrop would be wrong on a row rastered alone).
+/// Returns whether a frame should paint the incoming-row strip at the bottom of the grid band.
 #[must_use]
 #[inline]
 pub const fn incoming_row_applies(input: &aterm_core::render::RenderInput) -> bool {
@@ -122,9 +54,7 @@ pub const fn incoming_row_applies(input: &aterm_core::render::RenderInput) -> bo
         && input.wallpaper.is_none()
 }
 
-/// The incoming-row strip `(dst_y, rows)` for band `[y0, y1)` shifted by `frac_px`: the
-/// band's bottom `frac` rows. `None` for a non-positive residual, an empty band, or
-/// `frac >= band_h` (nothing moved, so no seam; the GPU's `band_shift_ops` agrees).
+/// Returns the incoming-row strip `(dst_y, rows)` for band `[y0, y1)` shifted up by `frac_px`.
 #[must_use]
 #[inline]
 pub const fn incoming_strip(y0: usize, y1: usize, frac_px: i64) -> Option<(usize, usize)> {
@@ -141,12 +71,7 @@ pub const fn incoming_strip(y0: usize, y1: usize, frac_px: i64) -> Option<(usize
     Some((y1 - n, n))
 }
 
-/// After [`translate_grid_band_in_place`] shifted `[y0, y1)` of `buf` up by `frac_px`,
-/// copy row `i` of `apron` (the incoming row's `w`-wide raster, top row first) onto
-/// framebuffer row `y1 - frac + i`, for as many rows as [`incoming_strip`] owes and
-/// `apron` holds; a short apron fills the strip's top rows and leaves the rest as the
-/// placeholder. Writes only inside the strip. Returns the rows painted (`0` for a
-/// bounce, frac 0, an empty band or an empty apron).
+/// Copies the incoming-row raster `apron` into the bottom strip of `[y0, y1)` exposed by `frac_px`, returning rows painted.
 #[inline]
 pub fn paint_incoming_strip(
     buf: &mut [u32],
@@ -177,7 +102,6 @@ mod tests {
     //! M1b PROVE bullets, always-on layer (real pixel buffers): the
     //! grid-vs-chrome partition and, by lattice/exhaustive tests, the band
     //! derivation (`pad + r*cell_h`).
-
     use super::*;
 
     /// A framebuffer whose pixels encode (row, col), so any stray move shows.
@@ -200,8 +124,6 @@ mod tests {
         let mag = frac.unsigned_abs() as usize;
         let moved = (y1 - y0).saturating_sub(mag);
         for i in 0..moved {
-            // UP: dst = y0+i pulls from below (dst+mag); DOWN: dst pulls from above
-            // (dst-mag). Reading only `src`, iteration order is irrelevant here.
             let (dst, s) = if frac > 0 {
                 (y0 + i, y0 + i + mag)
             } else {
@@ -246,8 +168,6 @@ mod tests {
         let mut down = base.clone();
         translate_grid_band_in_place(&mut down, w, y0, y1, -(mag as i64));
         assert_ne!(up, down, "opposite signs produce opposite shifts");
-        // UP: interior dst row y0 shows source y0+mag; the bottom `mag` rows are the
-        // exposed placeholder (unchanged from base).
         assert_eq!(
             up[y0 * w..y0 * w + w],
             base[(y0 + mag) * w..(y0 + mag) * w + w]
@@ -259,8 +179,6 @@ mod tests {
                 "up: bottom strip exposed"
             );
         }
-        // DOWN: interior dst row y1-1 shows source y1-1-mag; the top `mag` rows are
-        // the exposed placeholder (unchanged from base).
         assert_eq!(
             down[(y1 - 1) * w..(y1 - 1) * w + w],
             base[(y1 - 1 - mag) * w..(y1 - 1 - mag) * w + w]
@@ -311,8 +229,6 @@ mod tests {
         let (w, h) = (5usize, 20usize);
         let base = checkerboard(w, h);
         let (y0, y1, cell_h) = (2usize, 17usize, 6usize);
-        // The apron: a recognisable one-row raster (`cell_h` rows) whose pixels
-        // cannot collide with the checkerboard (a distinct high byte).
         let apron: Vec<u32> = (0..w * cell_h)
             .map(|i| 0x0A00_0000 | ((i / w) as u32) << 8 | (i % w) as u32)
             .collect();
@@ -346,8 +262,6 @@ mod tests {
                 }
             }
         }
-        // A short apron is top-aligned: its rows meet the band's bottom row at
-        // `y1 - frac`, and the rest of the strip keeps the placeholder.
         let mut painted = base.clone();
         translate_grid_band_in_place(&mut painted, w, y0, y1, 4);
         let placeholder = painted.clone();
@@ -359,7 +273,6 @@ mod tests {
             &placeholder[(y1 - 2) * w..y1 * w],
             "the unfilled remainder of the strip keeps the placeholder"
         );
-        // Nothing owed: a bounce, frac 0, an empty apron.
         for (frac, ap) in [(-3i64, &apron[..]), (0, &apron[..]), (3, &apron[..0])] {
             let mut buf = base.clone();
             translate_grid_band_in_place(&mut buf, w, y0, y1, frac);
@@ -390,12 +303,10 @@ mod tests {
                 }
             }
         }
-        // Non-vacuity: a normal partition yields a genuine, in-frame band.
         assert_eq!(
             grid_band_px(4, 16, 1, 25, 4 + 26 * 16),
             (4 + 16, 4 + 25 * 16)
         );
-        // No-band default (grid_bot_row == 0) ⇒ empty.
         let (a, b) = grid_band_px(4, 16, 0, 0, 500);
         assert!(a >= b, "grid_bot_row==0 is the no-translate default");
     }

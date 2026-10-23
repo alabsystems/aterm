@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FOOTER'S FACTS, CLICKED, END TO END (`crate::claude_facts`): a real
-//! engine drawing Claude Code's bottom block, one frame through the capture
-//! route's splices, the pointer moved to the pixel of the fact the painter
-//! RECORDED, a real press — and the bytes the session's PTY sink received.
-//! It drives the lights' gesture rig (`claude_lights::gesture_tests`).
+//! THE FOOTER'S FACTS, CLICKED, END TO END (`crate::claude_facts`).
 
 use std::sync::Arc;
 
@@ -119,7 +115,6 @@ fn the_spans_land_on_the_written_tail_edit() {
         assert_eq!(hit.restores, FactMask::default());
         assert_eq!(hit.session, session);
     }
-    // With a block: Autopilot and the plan light at the left end.
     let _host = host(&mut app);
     draw_claude(&app, session, PLAN);
     frame(&mut app, wid);
@@ -135,11 +130,6 @@ fn the_spans_land_on_the_written_tail_edit() {
         assert_eq!(glyphs(&app, wid, &hit), set, "{fact:?}, with a block");
         assert!(hit.cols.0 > chips_end, "{fact:?} past the chips");
     }
-    // A side channel lands under the model's first cell on the frame the
-    // splice paints again (its rows and their rule run kept): the facts'
-    // edit is skipped. It lands on the vendor's row, as a refill brings it:
-    // the footer's write is undone first, since the undo refuses a span
-    // holding a mark it did not publish and would leave the footer there.
     let model = fact_hit(&app, wid, Fact::Model);
     let ws = app.windows.get_mut(&wid).expect("window");
     assert!(
@@ -156,7 +146,6 @@ fn the_spans_land_on_the_written_tail_edit() {
         lights.fact_hits
     );
     assert!(!lights.hits.is_empty(), "the chips' own edit took");
-    // CONTROL: the next clean frame records them again.
     frame(&mut app, wid);
     assert_eq!(app.windows[&wid].claude_lights.fact_hits.len(), SET.len());
 }
@@ -199,14 +188,12 @@ fn a_click_on_the_branch_greys_it_off_and_a_click_on_off_brings_it_back() {
         app.windows[&wid].input_scratch.cells[row][fact_hit(&app, wid, Fact::Path).cols.1 - 1];
     assert!(value.bold, "CONTROL: a value is bold");
     assert_ne!(value.fg, rule_cell.fg, "CONTROL: and lifted from the gray");
-    // Under the pointer still, the stub is lit: lifted and underlined.
     let lit = o(&app);
     assert_eq!(
         (lit.fg, lit.underline),
         (value.fg, UnderlineStyle::Single),
         "the hovered stub is lit"
     );
-    // The pointer off it: Claude's rule gray, not bold.
     let (x, y) = px_of(&app, wid, (row, 2));
     app.on_cursor_moved(wid, x, y);
     frame(&mut app, wid);
@@ -228,7 +215,6 @@ fn a_click_on_the_branch_greys_it_off_and_a_click_on_off_brings_it_back() {
     assert!(pty(&mut reader, 0).is_empty(), "nothing reached the PTY");
     assert_eq!(human_seq(&app, session), human, "no person's gesture");
 
-    // CONTROL: between two facts, and the rule's own glyphs.
     let (path, branch) = (
         fact_hit(&app, wid, Fact::Path),
         fact_hit(&app, wid, Fact::Branch),
@@ -305,7 +291,6 @@ fn a_click_on_the_context_greys_it_off_and_a_click_on_its_stub_brings_it_back() 
             .copied()
             .expect("the fact's glyph")
     };
-    // The pointer off it first: a shown value is lifted from the gray.
     let (x, y) = px_of(&app, wid, (row, 2));
     app.on_cursor_moved(wid, x, y);
     frame(&mut app, wid);
@@ -440,7 +425,6 @@ fn hovering_a_fact_moves_no_fact() {
     assert!(lit(Fact::Branch), "the hovered fact is lit");
     assert!(!lit(Fact::Path) && !lit(Fact::Model), "no other");
 
-    // With a block: the title in its slot, the facts where they were.
     let _host = host(&mut app);
     draw_claude(&app, session, PLAN);
     frame(&mut app, wid);
@@ -452,7 +436,6 @@ fn hovering_a_fact_moves_no_fact() {
     assert_eq!(app.windows[&wid].claude_lights.fact_hits, hits);
     let text = row_text(&app, wid, row);
     assert!(text.contains("click: hide"), "the title: {text:?}");
-    // A path's title names the absolute directory.
     let path = fact_hit(&app, wid, Fact::Path);
     let (x, y) = px_of(&app, wid, (path.frame_row, path.cols.0));
     app.on_cursor_moved(wid, x, y);
@@ -636,7 +619,6 @@ fn ctrl_shift_tab_walks_the_chips_then_the_facts_that_fit() {
     }
     tap(&mut app, wid, NamedKey::Escape, KeyCode::Escape, "\u{1b}");
     assert_eq!(app.windows[&wid].claude_lights.selected, None);
-    // Narrow: what the glass gives up is never selected.
     assert!(app.apply_term_resize(wid, 24, 44));
     draw_claude(&app, session, PLAN);
     frame(&mut app, wid);
@@ -744,7 +726,6 @@ fn facts_are_buttons_named_in_words() {
             session
         )
     );
-    // Hidden: the stub's node says so.
     click_fact(&mut app, wid, Fact::Branch);
     frame(&mut app, wid);
     let nodes = app.claude_chips_a11y(wid);
@@ -773,7 +754,6 @@ fn a_reader_press_is_the_click() {
     frame(&mut app, wid);
     app.press_claude_chip_for_reader(wid, session, HarnessChip::Branch);
     assert_eq!(app.fact_mask(session), FactMask::default());
-    // The usage is not on this glass: its press is nothing.
     app.press_claude_chip_for_reader(wid, session, HarnessChip::Usage);
     assert_eq!(app.fact_mask(session), FactMask::default());
     assert!(pty(&mut reader, 0).is_empty());

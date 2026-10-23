@@ -82,6 +82,8 @@ pub struct TextSelection {
     /// End anchor (updated on mouse move).
     end: SelectionAnchor,
     /// Whether an endpoint was CLAMPED to the history floor because its content
+    /// was evicted from scrollback — the selection still names real text, but
+    /// less of it than the user picked.
     truncated: bool,
 }
 
@@ -184,6 +186,8 @@ impl TextSelection {
     }
 
     /// Clamp an endpoint evicted below `min_row` (the deepest retained row,
+    /// including tiered history) onto `min_row`, or clear and return `false`
+    /// when both endpoints are below `min_row`.
     fn clamp_head_to_min_row(&mut self, min_row: i32) -> bool {
         if self.state == SelectionState::None {
             return true;

@@ -2,16 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Process-owned reducer for the native Software Update route.
-//!
-//! The updater crate does a manual check, download, verification and staging as one blocking
-//! [`aterm_update::check_now`]. This reducer keeps that operation single-flight while exposing
-//! the logical `Checking -> Available -> Downloading -> Staged` transitions. The host owns
-//! threads and process replacement; this type owns acceptance, generations, publication,
-//! close-preflight binding and the at-most-once re-exec decision.
-//!
-//! A Settings view never owns this value: one lives on `App`, worker results are delivered
-//! here, and the returned [`UpdaterSnapshot::revision`] is broadcast to every Settings
-//! subscriber.
 
 use std::fmt;
 
@@ -19,20 +9,15 @@ const MAX_SHORT_TEXT_BYTES: usize = 512;
 const MAX_MESSAGE_BYTES: usize = 8 * 1024;
 const MAX_CHANGELOG_BYTES: usize = 256 * 1024;
 
-/// Whether THIS copy can replace itself, as far as anything has OBSERVED. A surface
-/// compiled before the first read must claim neither answer: "Applies next launch",
-/// an enabled Update to Latest Now and "can't update itself" are each a fact about
-/// the copy that only a read of its bundle establishes.
+/// Whether THIS copy can replace itself, as far as anything has OBSERVED.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum UpdateInstallability {
-    /// Nothing has read it yet: the launch could not tell, and no reconcile has
-    /// landed.
+    /// Nothing has read it yet.
     #[default]
     Unobserved,
     /// A read found a bundle the updater can replace.
     Installable,
-    /// A read (or the launch's own path) found none: a disk image, a translocated
-    /// download, a bare binary, a dev-marked build, or a platform with no updater.
+    /// A read (or the launch's own path) found none.
     NotInstallable,
 }
 
@@ -46,13 +31,13 @@ impl UpdateInstallability {
         }
     }
 
-    /// A read found a replaceable bundle — the only state that may claim one.
+    /// A read found a replaceable bundle.
     #[must_use]
     pub(crate) fn is_installable(self) -> bool {
         self == Self::Installable
     }
 
-    /// A read found NO replaceable bundle — the only state that may say so.
+    /// A read found NO replaceable bundle.
     #[must_use]
     pub(crate) fn cannot_install(self) -> bool {
         self == Self::NotInstallable
@@ -79,8 +64,7 @@ pub(crate) enum UpdaterWorkKind {
     Download,
 }
 
-/// Exact identity of updater work. A completion is accepted only when this whole value equals
-/// the active ticket; an operation number alone never suffices.
+/// Exact identity of updater work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct UpdaterWorkTicket {
     generation: u64,
@@ -89,11 +73,6 @@ pub(crate) struct UpdaterWorkTicket {
 }
 
 /// Field-for-field, bounded host projection of [`aterm_update::UpdateStatus`].
-///
-/// Built only from `aterm_update::check_now`'s value (or the durable `aterm_update::status`
-/// reader). There `staged_build` comes from `ready.toml`, published only after download,
-/// integrity and authenticity checks, bundle verification and atomic staging; apply
-/// re-verifies the staged bundle to close the time-of-check/time-of-use gap.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DurableUpdateStatus {
     /// Native host context is separate from enrollment/installation facts.
@@ -108,42 +87,23 @@ pub(crate) struct DurableUpdateStatus {
     pub(crate) changelog: Option<String>,
     pub(crate) outcome: String,
     pub(crate) failing_checks: u32,
-    /// The health ledger's verdict that the streak is persistent (at least the updater's
-    /// `PERSISTENT_AFTER` consecutive failures of one class): "this Mac cannot update until X
-    /// is fixed", not "one check blipped", carried so the app can show it.
+    /// The health ledger's verdict that the streak is persistent (at least the updater's `PERSISTENT_AFTER` consecutive failures of one class).
     pub(crate) failing_persistent: bool,
-    /// The most recent failing class the ledger recorded (`network` / `pipeline` / `manifest`
-    /// / `stage` / `apply`), empty when not failing; not necessarily the one that escalated.
+    /// The most recent failing class the ledger recorded (`network` / `pipeline` / `manifest` / `stage` / `apply`), empty when not failing.
     pub(crate) failing_kind: String,
-    /// Consecutive apply failures: the signal for "the staged build will not start", which
-    /// `failing_kind` cannot give (an escalated apply lane whose last failure was a network
-    /// blip records `network`).
+    /// Consecutive apply failures.
     pub(crate) failing_applies: u32,
-    /// Why the applies in [`Self::failing_applies`] failed: the ledger's `last_apply_error`,
-    /// which `aterm ctl update status` prints as `apply_failure=`, so a surface can say what
-    /// went wrong, not only how often. Read from `aterm_update::apply_lane_report` on the
-    /// worker that reads the status, never on the event loop.
+    /// Why the applies in [`Self::failing_applies`] failed.
     pub(crate) apply_failure: String,
-    /// The build [`Self::apply_failure`] was trying to reach (0 when unknown), with
-    /// [`Self::apply_failures_for_target`] the consecutive attempts on that exact artifact
-    /// (the ledger's `last_apply_failure_target_build` / `apply_failures_for_target`).
-    /// [`Self::failing_applies`] cannot say whether this build was tried: it is bound to the
-    /// running build, so a fresh stage inherits the count and reason of the one it replaced.
+    /// Target build of [`Self::apply_failure`] (0 when unknown), paired with [`Self::apply_failures_for_target`].
     pub(crate) apply_failure_build: u64,
     /// See [`Self::apply_failure_build`].
     pub(crate) apply_failures_for_target: u32,
-    /// This launch has a bundle the updater could REPLACE. `Some(false)` for a run
-    /// from the mounted DMG, a Gatekeeper-translocated copy, or a dev-marked install —
-    /// states in which no check thread ever starts, so every ledger field is the
-    /// pristine default of a machine that structurally cannot update. `None` where
-    /// nothing read it: a worker that failed before its read observed no bundle.
+    /// This launch has a bundle the updater could REPLACE.
     pub(crate) installable: Option<bool>,
-    /// The stranded verdict ([`aterm_update::UpdateStatus::channel_unreadable`]): checks
-    /// complete but the release channel cannot be read, with zero ledger failures, so
-    /// `failing_persistent` never carries it.
+    /// The stranded verdict ([`aterm_update::UpdateStatus::channel_unreadable`]).
     pub(crate) channel_unreadable: bool,
-    /// When the last check completed (Unix seconds; `aterm_update::UpdateStatus::updated_at`),
-    /// `None` before any: Settings ▸ Software Update's "Checked 12 min ago".
+    /// When the last check completed (Unix seconds; `aterm_update::UpdateStatus::updated_at`), `None` before any.
     pub(crate) checked_at: Option<i64>,
 }
 
@@ -159,9 +119,7 @@ pub(crate) struct StagedUpdate {
 }
 
 impl StagedUpdate {
-    /// Whether this stage is an installed-bundle activation rather than a download: its
-    /// identity is [`installed_activation_digest`] over its build and sealed commit, and its
-    /// backing is the bundle at the running executable's path, not a `ready.toml` marker.
+    /// Whether this stage is an installed-bundle activation rather than a download.
     #[must_use]
     pub(crate) fn is_installed_activation(&self) -> bool {
         self.commit.as_deref().is_some_and(|commit| {
@@ -170,20 +128,7 @@ impl StagedUpdate {
     }
 }
 
-/// The activation identity. When the bundle at this process's path is already a newer build
-/// (the release cutter writing into the bundle it launched from, a new `.app` dragged over
-/// the old, a sibling aterm's swap), there is no DMG to name, but every latch, budget and
-/// ticket here keys on an artifact digest. So the activation is an artifact: a 64-hex digest,
-/// domain-separated over the sealed build and commit, that no real DMG digest can collide
-/// with. It flows through the same stage, apply and returned machinery as a download; the
-/// places that differ (reconciliation, backed by the installed bundle rather than
-/// `ready.toml`, and the handoff, which verifies the bundle under the executable and binds no
-/// expected artifact for the successor) ask [`StagedUpdate::is_installed_activation`] /
-/// [`ApplyAttemptTicket::is_installed_activation`].
-///
-/// A bundle newer than the process is a staged update whose swap already happened; the
-/// seamless handoff takes it over without losing a shell, where a relaunch prompt would
-/// leave it inert until someone noticed.
+/// The activation identity.
 #[must_use]
 pub(crate) fn installed_activation_digest(build: u64, commit: &str) -> String {
     use aterm_digest::Sha256;
@@ -196,15 +141,11 @@ pub(crate) fn installed_activation_digest(build: u64, commit: &str) -> String {
 }
 
 /// The outcome for a newer build installed under the executable whose version this reducer
-/// does not hold: word for word the App's `INSTALLED_ACTIVATES_IN_PLACE`. It promises no
-/// timing: the switch runs by itself only where a retry is scheduled, else on Install.
+/// does not hold: word for word the App's `INSTALLED_ACTIVATES_IN_PLACE`.
 const INSTALLED_SWITCHES_IN_PLACE: &str =
     "The update is installed; switching to it keeps your shells running";
 
-/// Compare one durable marker to an already-canonical artifact identity, as hex values, not
-/// spellings: `staged_from_status` lowercases imported identities while the marker reader
-/// keeps its source text, so a valid uppercase marker would otherwise be imported and then
-/// retired.
+/// Compare one durable marker to an already-canonical artifact identity, as hex values, not spellings.
 #[must_use]
 pub(crate) fn durable_artifact_identity_matches(
     durable_build: Option<u64>,
@@ -233,8 +174,7 @@ pub(crate) fn durable_artifact_identity_matches(
         && exact_hex(durable_dmg_sha256, Some(expected_dmg_sha256), 32)
 }
 
-/// Worker-collected identity of the canonical installed bundle and the exact
-/// pre-swap trial artifact. Build-only evidence must never authorize a relaunch.
+/// Worker-collected identity of the canonical installed bundle and the exact pre-swap trial artifact.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InstalledUpdate {
     pub(crate) build: u64,
@@ -243,9 +183,7 @@ pub(crate) struct InstalledUpdate {
     pub(crate) version: Option<String>,
     pub(crate) receipt_build: Option<u64>,
     pub(crate) receipt_dmg_sha256: Option<String>,
-    /// Launches the boot sentinel has counted against a trial of this build (0 when none is
-    /// armed), read on the updater facts worker. A structural latch reads it before spending a
-    /// launch: past the sentinel's threshold, the launch is the one that reverts it.
+    /// Launches the boot sentinel has counted against a trial of this build (0 when none is armed), read on the updater facts worker.
     pub(crate) trial_launches: u32,
 }
 
@@ -261,9 +199,7 @@ impl InstalledUpdate {
                 .is_some_and(|trial| trial.eq_ignore_ascii_case(dmg_sha256))
     }
 
-    /// Whether this installed bundle backs an activation of `(build, commit)`: it is that
-    /// sealed identity and strictly newer than the running process. The activation's
-    /// counterpart of `proves_artifact`; the bundle is the artifact, so no receipt is involved.
+    /// Whether this installed bundle backs an activation of `(build, commit)`.
     #[must_use]
     pub(crate) fn backs_activation(&self, running_build: u64, build: u64, commit: &str) -> bool {
         self.build == build
@@ -271,17 +207,13 @@ impl InstalledUpdate {
             && aterm_update::commit_matches(&self.commit, commit)
     }
 
-    /// The activation stage this installed bundle would present, when it is newer than
-    /// the running build: the sealed identity as a [`StagedUpdate`] whose digest is the
-    /// [`installed_activation_digest`]. `None` when the bundle is not newer.
+    /// The activation stage this installed bundle would present, when it is newer than the running build.
     #[must_use]
     pub(crate) fn activation_stage(
         &self,
         running_build: u64,
         generation: u64,
     ) -> Option<StagedUpdate> {
-        // The import's identity rule (`staged_from_status`): a bundle whose sealed commit is
-        // unusable is no activation and must not retire a download it can never replace.
         (self.build > running_build && usable_commit_identity(&self.commit)).then(|| {
             let commit = self.commit.trim().to_ascii_lowercase();
             StagedUpdate {
@@ -301,8 +233,7 @@ impl InstalledUpdate {
     }
 }
 
-/// Immutable service projection that UI, tab attention, accessibility and inspection all
-/// consume.
+/// Immutable service projection that UI, tab attention, accessibility and inspection all consume.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UpdaterSnapshot {
     pub(crate) linux_host: bool,
@@ -322,9 +253,7 @@ pub(crate) struct UpdaterSnapshot {
     pub(crate) acknowledged_attention_revision: Option<u64>,
     pub(crate) ignored_completions: u64,
     pub(crate) reexec_count: u64,
-    /// The ledger's persistent-failure verdict as of the last reduced check: the update screen
-    /// headlines it, and the Settings tab's attention badge lights for it as for a staged
-    /// build. Cleared when a check reduces to staged or up-to-date.
+    /// The ledger's persistent-failure verdict as of the last reduced check.
     pub(crate) failing_persistent: bool,
     /// The failing class behind `failing_persistent` (empty otherwise).
     pub(crate) failing_kind: String,
@@ -336,9 +265,7 @@ pub(crate) struct UpdaterSnapshot {
     pub(crate) apply_failure_build: u64,
     /// See [`Self::apply_failure_build`].
     pub(crate) apply_failures_for_target: u32,
-    /// Whether this copy can replace itself, as far as a read has OBSERVED
-    /// ([`DurableUpdateStatus::installable`]); [`UpdateInstallability::Unobserved`]
-    /// until one has.
+    /// Whether this copy can replace itself, as far as a read has OBSERVED ([`DurableUpdateStatus::installable`]).
     pub(crate) installable: UpdateInstallability,
     /// See [`DurableUpdateStatus::channel_unreadable`].
     pub(crate) channel_unreadable: bool,
@@ -359,7 +286,7 @@ impl UpdaterSnapshot {
 pub(crate) enum CheckStart {
     /// The host must spawn exactly one `aterm_update::check_now` worker for this ticket.
     Start(UpdaterWorkTicket),
-    /// Work is already running; subscribe to revisions rather than spawning another job.
+    /// Work is already running.
     Joined(UpdaterWorkTicket),
     Rejected(CheckBlock),
 }
@@ -388,20 +315,16 @@ pub(crate) enum CheckCompletion {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ApplyMode {
-    /// Background policy: exact stage authority plus a short terminal-idle epoch before
-    /// readers may park.
+    /// Background policy.
     Automatic,
-    /// Background policy whose bounded idle-preference window has closed: every gate still
-    /// applies and only the idle wait is dropped, so a never-quiet machine still updates. No
-    /// person asked, so wording and the retry budget treat it as background work.
+    /// Background policy whose bounded idle-preference window has closed.
     AutomaticPastGrace,
-    /// Explicit user/control apply: bypasses only the idle delay, never safety.
+    /// Explicit user/control apply.
     Immediate,
 }
 
 impl ApplyMode {
-    /// Whether this attempt came from background policy rather than a person; both automatic
-    /// lanes share the retry budget and the non-disruptive surfacing.
+    /// Whether this attempt came from background policy rather than a person.
     #[must_use]
     pub(crate) fn is_automatic(self) -> bool {
         matches!(self, Self::Automatic | Self::AutomaticPastGrace)
@@ -432,8 +355,7 @@ pub(crate) enum ClosePreflight {
     Blocked(Vec<String>),
 }
 
-/// A linear host command: neither `Clone` nor `Copy`, and executing it consumes it. The
-/// reducer issues at most one for an accepted artifact.
+/// A linear host command.
 #[must_use = "an authorized updater re-exec command must be executed or explicitly dropped"]
 pub(crate) struct ReexecCommand {
     build: u64,
@@ -445,7 +367,6 @@ pub(crate) struct ReexecCommand {
 }
 
 /// Identity retained by the old process while it attempts the authorized handoff.
-/// A failure may re-arm only the exact staged artifact that minted this ticket.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ApplyAttemptTicket {
     generation: u64,
@@ -488,8 +409,7 @@ impl ReexecCommand {
 }
 
 impl ApplyAttemptTicket {
-    /// Test-only exact-artifact ticket for exercising the App-side completion path without
-    /// the whole reducer.
+    /// Test-only exact-artifact ticket for exercising the App-side completion path without the whole reducer.
     #[cfg(test)]
     pub(crate) fn for_test(build: u64, commit: &str, dmg_sha256: &str) -> Self {
         Self {
@@ -507,15 +427,12 @@ impl ApplyAttemptTicket {
         self.artifact_build
     }
 
-    /// Test-only: make this ticket the current apply, so `abort_apply` admits it and the
-    /// completion path itself is tested, not only its policy helpers.
+    /// Test-only: make this ticket the current apply, so `abort_apply` admits it and the completion path itself is tested, not only its policy helpers.
     #[cfg(test)]
     pub(crate) fn make_current_apply_for_test(&self, service: &mut NativeUpdaterService) {
         service.snapshot.generation = self.generation;
         service.snapshot.phase = UpdaterPhase::Applying;
         service.snapshot.reexec_count = 1;
-        // A production ticket is minted from the staged entry, so a staged build keeps its
-        // version.
         let version = service
             .snapshot
             .staged
@@ -544,8 +461,7 @@ impl ApplyAttemptTicket {
         &self.artifact_commit
     }
 
-    /// Whether this attempt activates the installed bundle at the executable's path (see
-    /// [`installed_activation_digest`]) rather than swapping in a staged download.
+    /// Whether this attempt activates the installed bundle ([`installed_activation_digest`]) instead of swapping a staged download.
     #[must_use]
     #[cfg(any(unix, test))]
     pub(crate) fn is_installed_activation(&self) -> bool {
@@ -566,8 +482,7 @@ pub(crate) enum ApplyDecision {
 pub(crate) enum ReturnedApplyDisposition {
     /// The exact verified artifact still exists durably and was re-armed.
     Rearmed,
-    /// The staged marker was consumed and this build (or a newer one) is installed at the
-    /// canonical app path; the App imports it as an activation stage and applies it in place.
+    /// The staged marker was consumed and this build (or a newer one) is installed at the canonical app path.
     InstalledNeedsRelaunch { build: u64 },
     /// The attempted artifact is no longer authoritative and was retired in memory.
     Retired,
@@ -575,8 +490,7 @@ pub(crate) enum ReturnedApplyDisposition {
     Ignored,
 }
 
-/// One atomic projection of the durable updater state observed after a replacement attempt
-/// returned, grouped so a stage identity is never paired with another observation's receipt.
+/// Atomic projection of durable updater state observed after a replacement attempt returned.
 #[derive(Clone, Copy, Debug)]
 #[cfg(any(unix, test))]
 pub(crate) struct ReturnedApplyFacts<'a> {
@@ -614,8 +528,7 @@ pub(crate) enum DurableStageDisposition {
     Retired,
 }
 
-/// Scalar projection Tier-1 binds to `native_updater_model`; it excludes presentation-only
-/// revision data.
+/// Scalar projection Tier-1 binds to `native_updater_model`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct UpdaterModelState {
     pub(crate) phase: u8,
@@ -658,7 +571,6 @@ impl UpdaterTransitionAction {
             Self::RetryCheck => Some("RetryCheck"),
             Self::CheckAvailable => Some("CheckAvailable"),
             Self::CheckFailed => Some("CheckFailed"),
-            // Disabled-state reconciliation is modeled separately; it is not CheckFailed.
             Self::Disable => None,
             Self::StartDownload => Some("StartDownload"),
             Self::CompleteDownload => Some("CompleteDownload"),
@@ -679,7 +591,7 @@ pub(crate) struct UpdaterTransition {
     pub(crate) after: UpdaterModelState,
 }
 
-/// Process-global updater state.  It contains no view/window identity by design.
+/// Process-global updater state.
 pub(crate) struct NativeUpdaterService {
     snapshot: UpdaterSnapshot,
     next_operation: u64,
@@ -725,9 +637,6 @@ impl NativeUpdaterService {
                 apply_failure: String::new(),
                 apply_failure_build: 0,
                 apply_failures_for_target: 0,
-                // No updater on this platform is an observation the build makes;
-                // whether a copy that has one can replace itself is the reconcile's
-                // to read ([`Self::seed_installability`] takes what the launch knows).
                 installable: if enabled {
                     UpdateInstallability::Unobserved
                 } else {
@@ -837,7 +746,6 @@ impl NativeUpdaterService {
                 return CheckStart::Rejected(CheckBlock::UpdateAlreadyStaged);
             }
             UpdaterPhase::Applying => return CheckStart::Rejected(CheckBlock::Applying),
-            // Available/Downloading are atomic microstates for the combined updater API.
             UpdaterPhase::Checking | UpdaterPhase::Available | UpdaterPhase::Downloading => {
                 return CheckStart::Rejected(CheckBlock::GenerationExhausted);
             }
@@ -868,10 +776,7 @@ impl NativeUpdaterService {
         CheckStart::Start(ticket)
     }
 
-    /// What the launch itself established about this copy before any read: a disk
-    /// image, a translocated download, a bare binary or a dev-marked build cannot
-    /// replace itself, so those never show a neutral flash. Anything else stays
-    /// [`UpdateInstallability::Unobserved`] for the reconcile to read.
+    /// What the launch itself established about this copy before any read.
     #[must_use]
     pub(crate) fn seed_installability(mut self, seed: UpdateInstallability) -> Self {
         if self.snapshot.installable == UpdateInstallability::Unobserved {
@@ -880,9 +785,7 @@ impl NativeUpdaterService {
         self
     }
 
-    /// Record a read of this copy's installability ([`DurableUpdateStatus::
-    /// installable`], or the bundle probe a reconcile makes when the ledger cannot be
-    /// read). Returns whether it changed — the caller republishes on `true`.
+    /// Record this copy's installability ([`DurableUpdateStatus::installable`] or bundle probe).
     pub(crate) fn note_installability(&mut self, installable: bool) -> bool {
         let observed = UpdateInstallability::observed(installable);
         if !self.snapshot.enabled || self.snapshot.installable == observed {
@@ -893,9 +796,7 @@ impl NativeUpdaterService {
         true
     }
 
-    /// Take a newer "last check completed" time from a reconcile (background checks write
-    /// only the ledger). Never moves backwards; returns whether it changed, and the caller
-    /// republishes on `true`.
+    /// Take a newer "last check completed" time from a reconcile (background checks write only the ledger).
     pub(crate) fn note_checked_at(&mut self, checked_at: Option<i64>) -> bool {
         match checked_at {
             Some(at) if self.snapshot.checked_at.is_none_or(|held| at > held) => {
@@ -907,10 +808,7 @@ impl NativeUpdaterService {
         }
     }
 
-    /// Absorb the ledger's failure verdict from a reconcile that imports no stage (the
-    /// exact-match early path, or a held stage that refuses a new check): otherwise only
-    /// `finish_check` writes `failing_persistent`, and an apply-class streak builds while a
-    /// stage is held. Badges the false-to-true edge as `finish_check` does.
+    /// Absorb the ledger's failure verdict from a reconcile that imports no stage (the exact-match early path, or a held stage that refuses a new check).
     pub(crate) fn absorb_failure_state(&mut self, status: &DurableUpdateStatus) -> bool {
         if !self.snapshot.enabled || !status.enabled {
             return false;
@@ -921,8 +819,6 @@ impl NativeUpdaterService {
         } else {
             String::new()
         };
-        // The apply reason moves with the apply count: a streak can keep its count while its
-        // cause changes (`TimedOut` to `ChildDied`).
         let apply_failure = bounded(status.apply_failure.clone(), MAX_SHORT_TEXT_BYTES);
         if self.snapshot.failing_persistent == now_persistent
             && self.snapshot.failing_kind == kind
@@ -934,13 +830,6 @@ impl NativeUpdaterService {
         {
             return false;
         }
-        // A reconcile must not erase a failure it is merely older than: these facts were read
-        // on a worker, `note_apply_failure` writes the same fields on the main thread, and
-        // nothing orders the two. A stale read and a genuine reset both look like "no
-        // failure", so the discriminator is direction for one target: within a process the
-        // artifact-scoped count only climbs (a success `exec`s this process away). A report
-        // that lowers it for the same target is stale, and only its apply-lane fields are
-        // held back; its check-lane fields are still fresh.
         let stale_apply_lane = status.apply_failure_build == self.snapshot.apply_failure_build
             && status.apply_failures_for_target < self.snapshot.apply_failures_for_target;
         let was_persistent = self.snapshot.failing_persistent;
@@ -962,11 +851,7 @@ impl NativeUpdaterService {
         true
     }
 
-    /// Absorb an apply failure the host just wrote, without waiting for a disk re-read: the
-    /// ledger write happens on the event loop (`App::record_apply_outcome_in_ledger`), but
-    /// worker observations, the only other way apply facts arrive, can be read before it.
-    /// `recorded` is read back inside the lock scope that wrote it, so it agrees with the
-    /// file. Returns whether anything changed; the caller republishes on `true`.
+    /// Absorb an apply failure the host just wrote, without waiting for a disk re-read.
     pub(crate) fn note_apply_failure(
         &mut self,
         recorded: &aterm_update::RecordedApplyFailure,
@@ -1021,8 +906,6 @@ impl NativeUpdaterService {
         self.snapshot.enabled = status.enabled;
         self.snapshot.linux_host = status.linux_host || status.linux.is_some();
         self.snapshot.linux = bounded_linux_status(status.linux.clone());
-        // The persistent-failure verdict rides every reduced check, so the update screen does
-        // not say "You're up to date" while the ledger says this Mac cannot update.
         let was_persistent = self.snapshot.failing_persistent;
         self.snapshot.failing_persistent = status.enabled && status.failing_persistent;
         self.snapshot.failing_kind = if self.snapshot.failing_persistent {
@@ -1037,8 +920,6 @@ impl NativeUpdaterService {
         if let Some(installable) = status.installable {
             self.snapshot.installable = UpdateInstallability::observed(installable);
         }
-        // Likewise the stranded verdict, which records zero ledger failures, so
-        // `failing_persistent` alone can never say it.
         self.snapshot.channel_unreadable = status.enabled && status.channel_unreadable;
         if status.checked_at.is_some() {
             self.snapshot.checked_at = status.checked_at;
@@ -1059,8 +940,6 @@ impl NativeUpdaterService {
         } else if let Some(artifact) =
             staged_from_status(self.snapshot.current_build, ticket.generation, &status)
         {
-            // `check_now` does availability, download, verify and stage in one worker; record
-            // the logical transitions explicitly for inspection and Tier-1.
             let before_available = self.model_state();
             self.snapshot.active = None;
             self.snapshot.phase = UpdaterPhase::Available;
@@ -1099,8 +978,6 @@ impl NativeUpdaterService {
         if self.snapshot.phase == UpdaterPhase::Staged {
             self.snapshot.attention_revision = Some(self.snapshot.revision);
         }
-        // A newly persistent failure badges like a staged build; a continuing streak does not
-        // re-badge on every check.
         if self.snapshot.failing_persistent && !was_persistent {
             self.snapshot.attention_revision = Some(self.snapshot.revision);
         }
@@ -1120,10 +997,7 @@ impl NativeUpdaterService {
         true
     }
 
-    /// Retire a staged download so an installed-bundle activation can be imported instead:
-    /// once the bundle under the executable is newer than the process, a swap-apply cannot
-    /// proceed (its rollback-source proof needs the installed bundle to be the running build).
-    /// `false` unless a non-activation stage is held in `Staged`.
+    /// Retire a staged download so an installed-bundle activation can be imported instead.
     pub(crate) fn retire_stage_for_activation(&mut self) -> bool {
         self.last_transitions.clear();
         let Some(staged) = self.snapshot.staged.as_ref() else {
@@ -1181,8 +1055,7 @@ impl NativeUpdaterService {
         ApplyPreflightStart::Inspect(ticket)
     }
 
-    /// Consume a matching close-preflight result and, only when safe, mint the one-shot
-    /// command that authorizes the existing seamless apply/re-exec path.
+    /// Consume a matching close-preflight result and, only when safe, mint the one-shot command that authorizes the existing seamless apply/re-exec path.
     pub(crate) fn finish_apply_preflight(
         &mut self,
         ticket: ApplyPreflightTicket,
@@ -1255,8 +1128,7 @@ impl NativeUpdaterService {
         }
     }
 
-    /// The outcome sentence for a build already installed at the canonical app path, which
-    /// the App imports as an activation stage. Names the installed version when it was read.
+    /// The outcome sentence for a build already installed at the canonical app path, which the App imports as an activation stage.
     #[must_use]
     pub(crate) fn installed_activation_outcome(version: Option<&str>) -> String {
         match version.map(str::trim).filter(|version| !version.is_empty()) {
@@ -1268,16 +1140,13 @@ impl NativeUpdaterService {
         }
     }
 
-    /// The outcome sentence for a physical apply attempt that returned safely:
-    /// the stage is still ready and the lane's budget decides the retry.
+    /// The outcome sentence for a physical apply attempt that returned safely.
     #[must_use]
     pub(crate) fn apply_attempt_stopped_outcome(message: &str) -> String {
         format!("The update is still ready; the install stopped: {message}")
     }
 
-    /// Re-arm an authorized artifact when process replacement left this process alive. The
-    /// generation-bound ticket keeps a late failure from reviving a superseded artifact;
-    /// `reexec_count` counts accepted replacements, so it resets and the stage stays retryable.
+    /// Re-arm an authorized artifact when process replacement left this process alive.
     pub(crate) fn abort_apply(
         &mut self,
         ticket: &ApplyAttemptTicket,
@@ -1305,9 +1174,7 @@ impl NativeUpdaterService {
         true
     }
 
-    /// Reconcile a returned process-replacement attempt against disk state: a same-build
-    /// durable marker re-arms (`AbortApply`); a missing or changed one retires the stage, and
-    /// the host imports any different durable stage as a new generation.
+    /// Reconcile a returned process-replacement attempt against disk state.
     #[cfg(any(unix, test))]
     pub(crate) fn finish_returned_apply(
         &mut self,
@@ -1319,11 +1186,6 @@ impl NativeUpdaterService {
             self.last_transitions.clear();
             return ReturnedApplyDisposition::Ignored;
         }
-        // A returned activation attempt: the installed bundle is the artifact. While it still
-        // backs the ticket the stage is re-armed like a durable download (the App's automatic
-        // budget decides how often); once the bundle is observed to have moved on, retire. A
-        // failed bundle probe (`None`) is unknown, as in `reconcile_durable_stage`. Re-arming
-        // authorizes nothing: the next attempt needs its own preflight and verification.
         if ticket.is_installed_activation() {
             let backed = self.snapshot.enabled
                 && facts.installed.is_none_or(|installed| {
@@ -1416,8 +1278,7 @@ impl NativeUpdaterService {
         })
     }
 
-    /// Retire a non-applying in-memory stage when another process changed or consumed its
-    /// durable marker (a missing marker can mean the build is already installed).
+    /// Retire a non-applying in-memory stage when another process changed or consumed its durable marker.
     pub(crate) fn reconcile_durable_stage(
         &mut self,
         durable_enabled: bool,
@@ -1434,20 +1295,7 @@ impl NativeUpdaterService {
             return DurableStageDisposition::Unchanged;
         }
 
-        // An activation stage is backed by the installed bundle, not `ready.toml`: it stays
-        // while the bundle under the executable is that build and newer than the process;
-        // otherwise it retires and the next observation imports what is there.
         if staged.is_installed_activation() {
-            // ABSENCE OF EVIDENCE IS NOT EVIDENCE THE BUNDLE CHANGED. `installed`
-            // is `None` whenever the facts worker could not PROVE the bundle this
-            // pass — the installed-facts probe fails closed, and its `spctl` probe
-            // rides a 30 s ceiling that a captive portal or half-open network
-            // reaches routinely. Retiring on that observation threw away a
-            // perfectly good activation, and nothing re-announced it: the check
-            // thread's watch latches one announcement per build and the download
-            // lane is silent while a stage covers the release, so the update sat
-            // lost until the next relaunch (2026-08-19 audit). Keep the
-            // stage; retire only when the bundle is OBSERVED and no longer backs it.
             let Some(installed) = installed else {
                 return DurableStageDisposition::Unchanged;
             };
@@ -1574,8 +1422,7 @@ impl NativeUpdaterService {
     }
 }
 
-/// A commit string that can serve as a stage identity: 7..=40 hex digits. Shared by the
-/// durable-status import and the activation import so the two never disagree.
+/// A commit string that can serve as a stage identity.
 #[must_use]
 pub(crate) fn usable_commit_identity(commit: &str) -> bool {
     let commit = commit.trim();
@@ -1599,9 +1446,7 @@ fn bounded_linux_status(
     })
 }
 
-/// The build of the verified download a durable observation names, when strictly newer than
-/// `running_build`: exactly what [`staged_from_status`] would accept and never an activation,
-/// so a structural latch counts as a newer release only bytes the reducer would stage.
+/// The build of the verified download a durable observation names, when strictly newer than `running_build`.
 #[must_use]
 pub(crate) fn verified_download_build(
     running_build: u64,
@@ -1630,13 +1475,6 @@ fn staged_from_status(
         .map(str::trim)
         .filter(|digest| aterm_codec::hex::is_hex(digest, 64))?
         .to_ascii_lowercase();
-    // A download stage's commit is the manifest's full 40-char sha; nothing shorter mints
-    // stage authority. An activation carries the bundle's sealed `ATermGitCommit`, a 12-char
-    // short sha, and its digest is `installed_activation_digest(build, commit)`, which binds
-    // exactly that commit. So: 40 hex for a download, 7..=40 hex when the digest is the
-    // activation digest over that commit. Downstream comparisons are prefix-tolerant at >= 7
-    // (`commit_matches`, `seamless::normalize_commit`), and an activation can only re-exec
-    // the bundle already installed and verified under this executable.
     let commit = status
         .staged_commit
         .as_deref()
@@ -1712,7 +1550,6 @@ mod tests {
         );
         assert_eq!(service.snapshot().apply_failures_for_target, 1);
 
-        // The stale reconcile: same target, a count read before the write.
         let mut stale = status(Some(11));
         stale.apply_failure_build = 11;
         stale.apply_failures_for_target = 0;
@@ -1908,8 +1745,6 @@ mod tests {
         assert_eq!(service.snapshot().phase, UpdaterPhase::Applying);
     }
 
-    // ── The activation lane (an installed bundle newer than the process) ──────
-
     /// A durable status shaped the way the App imports an installed-bundle
     /// activation: the sealed identity under `installed_activation_digest`.
     fn activation_status(build: u64) -> DurableUpdateStatus {
@@ -1950,8 +1785,6 @@ mod tests {
         assert!(!usable_commit_identity(&"a".repeat(41)));
         assert!(!usable_commit_identity("unknown"));
         assert!(!usable_commit_identity("248091d23ab0-dirty"));
-        // A download marker (a real DMG digest) with a short sha still mints nothing: the
-        // short-sha allowance is bound to the activation digest alone.
         let mut download = DurableUpdateStatus {
             linux_host: false,
             linux: None,
@@ -1991,7 +1824,6 @@ mod tests {
             .expect("a short-sha bundle newer than the process is an activation");
         assert_eq!(stage.commit.as_deref(), Some("248091d23ab0"), "lowercased");
         assert!(stage.is_installed_activation());
-        // …and the durable import accepts exactly what the activation constructed.
         let status = DurableUpdateStatus {
             linux_host: false,
             linux: None,
@@ -2017,8 +1849,6 @@ mod tests {
         let imported = staged_from_status(11, 0, &status).expect("the import must accept it");
         assert_eq!(imported.commit, stage.commit);
         assert_eq!(imported.dmg_sha256, stage.dmg_sha256);
-        // A bundle sealing an unusable commit is not an activation at all — it must
-        // never retire a download it cannot replace.
         let stub = InstalledUpdate {
             commit: "unknown".to_string(),
             ..installed
@@ -2030,9 +1860,6 @@ mod tests {
     /// session to a build older than the one that wrote its records: a download staged
     /// there and an installed bundle there mint no stage and back no activation, and the
     /// one same-image hop (the QA seam, a launch-record renewal) runs this very build.
-    /// U6 (a quiet restart's record read by a build
-    /// that predates `quiet`) and U13 (a successor that predates the timeline id carry)
-    /// both need such a hop. NEGATIVE CONTROL: one build newer is a stage both ways.
     #[test]
     fn no_update_authority_names_a_build_at_or_below_the_running_one() {
         let running = 11;
@@ -2157,8 +1984,6 @@ mod tests {
             "no durable marker is needed; the bundle is the backing"
         );
         assert_eq!(service.snapshot().phase, UpdaterPhase::Staged);
-        // A different (also newer) build under the executable: this activation is
-        // stale — retire, and let the next observation import the real one.
         let moved_on = installed(12, TEST_COMMIT, None, None);
         assert_eq!(
             service.reconcile_durable_stage(true, None, None, None, Some(&moved_on)),
@@ -2170,15 +1995,12 @@ mod tests {
             service.last_transitions()[0].action,
             UpdaterTransitionAction::RetireStage
         );
-        // Rolled back under us (no longer newer): retire too.
         stage_activation(&mut service, 11);
         let rolled_back = installed(10, TEST_COMMIT, None, None);
         assert_eq!(
             service.reconcile_durable_stage(true, None, None, None, Some(&rolled_back)),
             DurableStageDisposition::Retired
         );
-        // No observation at all is not "the bundle changed": the facts worker fails closed,
-        // so the stage is kept and re-judged next pass.
         stage_activation(&mut service, 11);
         assert_eq!(
             service.reconcile_durable_stage(true, None, None, None, None),
@@ -2188,7 +2010,6 @@ mod tests {
             service.snapshot().staged.is_some(),
             "an unobservable bundle must not throw the activation away"
         );
-        // …and once the bundle is observed and no longer backs it, it retires.
         let moved_on = installed(12, TEST_COMMIT, None, None);
         assert_eq!(
             service.reconcile_durable_stage(true, None, None, None, Some(&moved_on)),
@@ -2244,8 +2065,6 @@ mod tests {
                             ReturnedApplyDisposition::Rearmed
                         }
                     );
-                    // The completion consumes the old authority even when its
-                    // stage survives. A duplicate cannot spend the retry budget.
                     assert_eq!(
                         service.finish_returned_apply(
                             &attempt,
@@ -2288,7 +2107,6 @@ mod tests {
                     assert!(service.active_apply.is_none());
                 }
                 if returned && observation.is_none() {
-                    // Negative control: retiring on an unknown observation is rejected.
                     let mut historical = after;
                     historical.insert("retained", 0);
                     assert!(!model.successors("Reduce", &before).contains(&historical));
@@ -2644,7 +2462,7 @@ mod tests {
     /// NOTHING READ, NOTHING CLAIMED (s-16): a fresh service has observed nothing
     /// about whether this copy can replace itself, so it is neither installable nor
     /// not; a check's read says which, and a platform with no updater knows at
-    /// construction. A worker failure that read nothing leaves it unobserved.
+    /// construction.
     #[test]
     fn installability_is_unobserved_until_a_read_says() {
         let fresh = NativeUpdaterService::new(10, "1.0.10", true);
@@ -2661,7 +2479,6 @@ mod tests {
         );
         for (read, want) in [
             (Some(false), UpdateInstallability::NotInstallable),
-            // NEGATIVE CONTROL: a read that found a bundle says so.
             (Some(true), UpdateInstallability::Installable),
             (None, UpdateInstallability::Unobserved),
         ] {
@@ -2672,7 +2489,6 @@ mod tests {
             let _ = service.finish_check(ticket, checked);
             assert_eq!(service.snapshot().installable, want, "{read:?}");
         }
-        // The launch's own path seeds only what it knows; a read still decides.
         let mut seeded = NativeUpdaterService::new(10, "1.0.10", true)
             .seed_installability(UpdateInstallability::NotInstallable);
         assert_eq!(

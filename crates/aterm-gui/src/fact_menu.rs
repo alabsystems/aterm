@@ -86,6 +86,40 @@ use crate::claude_lights::{Clock, Fact, FactNotice, GlassAt};
 use crate::claude_slash::Slash;
 use crate::{App, WindowId};
 
+/// An admitted roster label, kept with the menu action rather than a row's
+/// position. The roster's bounded ASCII grammar lets actions remain `Copy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct AccountLabel {
+    bytes: [u8; aterm_agent::harness::accounts::LABEL_MAX],
+    len: u8,
+}
+
+impl AccountLabel {
+    fn new(label: &str) -> Option<Self> {
+        if aterm_agent::harness::accounts::label_refusal(label).is_some() {
+            return None;
+        }
+        let mut bytes = [0; aterm_agent::harness::accounts::LABEL_MAX];
+        bytes[..label.len()].copy_from_slice(label.as_bytes());
+        Some(Self {
+            bytes,
+            len: u8::try_from(label.len()).ok()?,
+        })
+    }
+
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..usize::from(self.len)])
+            .expect("an admitted account label is ASCII")
+    }
+
+    fn row(
+        self,
+        roster: &aterm_agent::harness::accounts::Roster,
+    ) -> Option<&aterm_agent::harness::accounts::Row> {
+        roster.row(self.as_str())
+    }
+}
+
 /// What a fact menu's row does when chosen. Only [`FactAct::Type`] types,
 /// and only Claude's own command, through `App::press_slash`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -104,10 +138,12 @@ pub(crate) enum FactAct {
     Show(FactKind),
     /// Type Claude's own command (`crate::claude_slash`).
     Type(Slash),
-    /// Switch/pin onto the roster account at this index.
-    UseAccount(usize),
+    /// Switch/pin onto the account named by the displayed roster row.
+    UseAccount(AccountLabel),
     /// Unpin and return to automatic account rotation (dedicated → pool).
     AutoRotate,
+    /// Open a tab at the account settings directory (`~/.aterm`).
+    AccountSettings,
 }
 
 impl FactAct {
@@ -122,8 +158,9 @@ impl FactAct {
             Self::Hide(kind) => format!("hide/{}", Fact::of(kind).key()),
             Self::Show(kind) => format!("show/{}", Fact::of(kind).key()),
             Self::Type(slash) => format!("type/{}", slash.key()),
-            Self::UseAccount(idx) => format!("use/{idx}"),
+            Self::UseAccount(label) => format!("use/{}", label.as_str()),
             Self::AutoRotate => "auto-rotate".to_string(),
+            Self::AccountSettings => "account-settings".to_string(),
         }
     }
 }
@@ -131,6 +168,8 @@ impl FactAct {
 /// One account row in [`Fact::Account`]'s pulldown menu.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AccountMenuRow {
+    /// The canonical identity, independent of the formatted label and row order.
+    pub(crate) account: AccountLabel,
     /// The row's label on the card (`m27 · dedicated · 0% left (limited)`).
     pub(crate) label: String,
     /// Whether this account is currently active (`●` at the right edge).
@@ -197,6 +236,10 @@ pub(crate) struct FactMenuFacts {
     /// resolver published beside the facts (`claude_footer::FactSide`).
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) repo_root: Option<PathBuf>,
+    /// Folder / worktree / temp disk hygiene notes for [`Fact::Path`] (`repo_work::RepoHygiene`).
+    pub(crate) folder_hygiene: Vec<String>,
+    /// Repository hygiene & drift notes for [`Fact::Branch`] (`repo_work::RepoHygiene`).
+    pub(crate) git_hygiene: Vec<String>,
     /// The top-effort key's row: `Some(true)` offers to turn it on,
     /// `Some(false)` off (the ENGINE's top rule shows its tag); `None`, no
     /// row (Claude Code 2.1.303 or older, the key latched off by Claude's
@@ -284,12 +327,18 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
         }
         Fact::Path => {
             out.push(MenuRow::Note(format!("\u{2302}  {}", value(&facts.path))));
+            for line in &facts.folder_hygiene {
+                out.push(MenuRow::Note(line.clone()));
+            }
             let here = facts.cwd.is_some();
             out.push(item(fact, "+", "New tab here", FactAct::NewTabHere, here));
             out.push(item(fact, "\u{29c9}", "Copy path", FactAct::CopyPath, here));
         }
         Fact::Branch => {
             out.push(MenuRow::Note(format!("\u{2387}  {}", value(&facts.branch))));
+            for line in &facts.git_hygiene {
+                out.push(MenuRow::Note(line.clone()));
+            }
             out.push(item(
                 fact,
                 "\u{29c9}",
@@ -307,13 +356,20 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                 ));
             }
         }
-        // The context's menu is its value and the Hide or Show row alone.
         Fact::Context => {
             out.push(MenuRow::Note(format!(
                 "{}  {}",
                 aterm_agent::harness::footer::CONTEXT_MARK,
                 value(&facts.context)
             )));
+            note(&mut out);
+            out.push(item(
+                fact,
+                "\u{22ef}",
+                "Compact context\u{2026}  /compact",
+                FactAct::Type(Slash::Compact),
+                typed,
+            ));
         }
         Fact::Account => {
             if let Some(sub) = &facts.subscription {
@@ -342,15 +398,23 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                     enabled: true,
                     checked: false,
                 });
+                out.push(MenuRow::Item {
+                    glyph: "\u{22ef}",
+                    label: "Account settings\u{2026}".to_string(),
+                    spoken: "Account settings".to_string(),
+                    act: MenuAct::Fact(fact, FactAct::AccountSettings),
+                    enabled: true,
+                    checked: false,
+                });
                 return out;
             }
             out.push(MenuRow::Rule);
-            for (idx, acct) in facts.accounts.iter().enumerate() {
+            for acct in &facts.accounts {
                 out.push(MenuRow::Item {
                     glyph: "\u{2386}",
                     label: acct.label.clone(),
                     spoken: acct.label.clone(),
-                    act: MenuAct::Fact(fact, FactAct::UseAccount(idx)),
+                    act: MenuAct::Fact(fact, FactAct::UseAccount(acct.account)),
                     enabled: acct.enabled,
                     checked: acct.active,
                 });
@@ -363,6 +427,14 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                 act: MenuAct::Fact(fact, FactAct::AutoRotate),
                 enabled: true,
                 checked: facts.auto_rotate,
+            });
+            out.push(MenuRow::Item {
+                glyph: "\u{22ef}",
+                label: "Account settings\u{2026}".to_string(),
+                spoken: "Account settings".to_string(),
+                act: MenuAct::Fact(fact, FactAct::AccountSettings),
+                enabled: true,
+                checked: false,
             });
             return out;
         }
@@ -609,6 +681,28 @@ fn build_account_menu_rows(
         None => (roster, accounts::State::default()),
     };
     let enrolled = accounts::enrolled(&roster);
+    account_menu_rows_from(
+        &roster,
+        &state,
+        &enrolled,
+        session_account,
+        session_email,
+        session_pct_left,
+        now,
+    )
+}
+
+#[must_use]
+pub(crate) fn account_menu_rows_from(
+    roster: &aterm_agent::harness::accounts::Roster,
+    state: &aterm_agent::harness::accounts::State,
+    enrolled: &std::collections::BTreeSet<String>,
+    session_account: Option<&str>,
+    session_email: Option<&str>,
+    session_pct_left: Option<u32>,
+    now: i64,
+) -> (Vec<AccountMenuRow>, bool) {
+    use aterm_agent::harness::accounts;
     let active_label = session_account.or(state.active.as_deref()).or_else(|| {
         session_email.and_then(|email| {
             roster
@@ -624,8 +718,11 @@ fn build_account_menu_rows(
     });
     let mut rows = Vec::with_capacity(roster.rows.len());
     for row in &roster.rows {
+        let Some(account) = AccountLabel::new(&row.label) else {
+            continue;
+        };
         let is_enrolled = row.dir.is_none() || enrolled.contains(&row.label);
-        let cond = accounts::condition(row, &state, is_enrolled, now);
+        let cond = accounts::condition(row, state, is_enrolled, now);
         let is_active = active_label == Some(row.label.as_str());
         let pct_left = if matches!(cond, accounts::Condition::Limited { .. }) {
             Some(0)
@@ -666,19 +763,29 @@ fn build_account_menu_rows(
             accounts::Class::Dedicated => "dedicated",
             accounts::Class::Shared => "pool",
         };
-        let avail = match (cond, pct_left) {
-            (accounts::Condition::Limited { .. }, _) | (_, Some(0)) => {
+        let has_email = row.email.is_some();
+        let avail = match (cond, pct_left, has_email) {
+            (accounts::Condition::Limited { .. }, _, _) | (_, Some(0), _) => {
                 "0% left (limited)".to_string()
             }
-            (accounts::Condition::SignedOut, _) => "signed out".to_string(),
-            (accounts::Condition::NotEnrolled, Some(pct)) => format!("{pct}% left (auto-login)"),
-            (_, Some(pct)) => format!("{pct}% left"),
-            (_, None) => cond.as_str().to_string(),
+            (accounts::Condition::SignedOut, _, true) => "signed out (auto-login)".to_string(),
+            (accounts::Condition::SignedOut, _, false) => "signed out".to_string(),
+            (accounts::Condition::NotEnrolled, Some(pct), true) => {
+                format!("{pct}% left (auto-login)")
+            }
+            (accounts::Condition::NotEnrolled, _, false) => "not enrolled".to_string(),
+            (_, Some(pct), _) => format!("{pct}% left"),
+            (_, None, _) => cond.as_str().to_string(),
         };
+        let enabled = !matches!(
+            cond,
+            accounts::Condition::SignedOut | accounts::Condition::NotEnrolled
+        ) || has_email;
         rows.push(AccountMenuRow {
+            account,
             label: format!("{} \u{b7} {class_word} \u{b7} {avail}", row.label),
             active: is_active,
-            enabled: cond != accounts::Condition::SignedOut || row.email.is_some(),
+            enabled,
         });
     }
     (rows, !state.pinned)
@@ -775,6 +882,21 @@ impl App {
                 session_email.as_deref(),
                 session_pct,
             );
+        }
+        if matches!(fact, Fact::Path | Fact::Branch)
+            && !cfg!(test)
+            && let Some(dir) = out.repo_root.as_deref().or(out.cwd.as_deref())
+            && let Some(hygiene) = aterm_agent::harness::repo_work::probe_hygiene(
+                dir,
+                aterm_primer::home_dir().as_deref(),
+                std::time::Duration::from_millis(500),
+            )
+        {
+            if fact == Fact::Path {
+                out.folder_hygiene = hygiene.folder_notes();
+            } else {
+                out.git_hygiene = hygiene.notes();
+            }
         }
         // The key's row says what a choice does from the ENGINE's top rule
         // as it is now: off while Claude draws its tag, else on.
@@ -1048,7 +1170,7 @@ impl App {
                 let off = self.fact_mask(session).with(kind, hide);
                 self.set_fact_mask(session, off);
             }
-            FactAct::UseAccount(idx) => {
+            FactAct::UseAccount(label) => {
                 use aterm_agent::harness::accounts;
                 let now = aterm_time::unix_secs()
                     .and_then(|n| i64::try_from(n).ok())
@@ -1062,39 +1184,47 @@ impl App {
                         .ok()
                         .unwrap_or_default();
                     let roster = store.bound(&raw, now).unwrap_or(raw);
-                    if let Some(row) = roster.rows.get(idx).cloned() {
+                    if let Some(row) = label.row(&roster).cloned() {
                         let enrolled = accounts::enrolled(&roster);
                         let is_enrolled = row.dir.is_none() || enrolled.contains(&row.label);
                         let mut note = None;
-                        if is_enrolled {
-                            let _ = store.transact_within(
-                                &accounts::LOCK_LADDER,
-                                now,
-                                &mut note,
-                                |state| {
+                        let pinned = is_enrolled
+                            && store
+                                .transact_within(&accounts::LOCK_LADDER, now, &mut note, |state| {
                                     accounts::pin(state, &roster, &enrolled, &row.label, now)
                                         .map(|ev| vec![ev])
-                                },
-                            );
-                        } else if let (crate::harness_host::AccountsUpkeep::Live, Some(home)) = (
-                            crate::harness_host::live_accounts_upkeep(),
-                            aterm_primer::home_dir(),
-                        ) {
+                                })
+                                .is_ok();
+                        if !pinned
+                            && row.email.is_some()
+                            && let (crate::harness_host::AccountsUpkeep::Live, Some(home)) = (
+                                crate::harness_host::live_accounts_upkeep(),
+                                aterm_primer::home_dir(),
+                            )
+                            && let Ok(request) = store.request_pin(&row.label, now)
+                        {
                             // A sign-in only an instance run as its account's own starts: never
                             // a test's, whose upkeep is inert by construction.
-                            let target_label = row.label.clone();
-                            let _ = std::thread::Builder::new()
+                            let worker_request = request.clone();
+                            let started = std::thread::Builder::new()
                                 .name("aterm-acct-renew".to_string())
                                 .spawn(move || {
-                                    aterm_agent::harness::accounts_sync::auto_renew_account_by_label(
+                                    let worker_store = accounts::Store::at(&state_dir);
+                                    let started = aterm_agent::harness::accounts_sync::auto_renew_account_by_label(
                                         &home,
                                         &state_dir,
                                         &roster_path,
-                                        &target_label,
-                                        true,
+                                        worker_request.clone(),
                                         now,
                                     );
+                                    if !started {
+                                        let now_done = aterm_agent::supervise::limit::unix_now().max(now);
+                                        let _ = worker_store.cancel_pin_request(&worker_request, now_done);
+                                    }
                                 });
+                            if started.is_err() {
+                                let _ = store.cancel_pin_request(&request, now);
+                            }
                         }
                         self.redraw_claude_footer(session);
                     }
@@ -1120,8 +1250,29 @@ impl App {
                         .name("aterm-acct-rotate".to_string())
                         .spawn(move || {
                             upkeep.make(aterm_agent::harness::accounts_sync::UpkeepStep::Both);
+                            if matches!(upkeep, crate::harness_host::AccountsUpkeep::Live)
+                                && let (Some(home), Some(roster_path)) =
+                                    (aterm_primer::home_dir(), accounts::default_roster_path())
+                            {
+                                let _ = aterm_agent::harness::accounts_sync::auto_renew_next_account_interactive(
+                                    &home,
+                                    &state_dir,
+                                    &roster_path,
+                                    now,
+                                );
+                            }
                         });
                     self.redraw_claude_footer(session);
+                }
+            }
+            FactAct::AccountSettings => {
+                if let Some(at) = aterm_agent::harness::accounts::default_roster_path()
+                    .and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()))
+                {
+                    #[cfg(test)]
+                    NEW_TABS_ASKED.with(|asked| asked.borrow_mut().push(at.clone()));
+                    self.open_tab_in_cwd(wid, Some(&at));
+                    self.note_fact_notice(wid, session, FactNotice::NewTab);
                 }
             }
             // Chosen with the menu open ([`Self::choose_fact_type`]).

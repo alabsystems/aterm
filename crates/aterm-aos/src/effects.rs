@@ -291,7 +291,7 @@ impl<F: FnMut(&EffectRequest) -> Vec<u8>> RecordingPort<F> {
 
     /// A recorder whose first record is `seq` `first_seq` (a log continuation).
     #[inline]
-    pub fn starting_at(first_seq: u64, sink: F) -> Self {
+    pub const fn starting_at(first_seq: u64, sink: F) -> Self {
         RecordingPort {
             sink,
             records: Vec::new(),

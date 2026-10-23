@@ -1,49 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE HOST'S DOOR ON A TAPE: what crosses when the loop asks the window's
-//! host ([`crate::supervise::IdleHost`]) — the two hosts the trait's macro
-//! implements it for (`supervise::run::host_door`), and the tape form of
-//! every argument and answer.
-//!
-//! * [`TapedHost`]: a recording run's host. Each call is forwarded to the
-//!   window's host and crosses the run's door (`Fx`) on the way: a query as
-//!   a round trip at `host.<name>` — the arguments out, the answer back, the
-//!   LIVE answer returned to the loop (never one decoded from the tape, so a
-//!   codec cannot change what the loop saw) — and a notification as an
-//!   output at `host.<name>`, said before the host is told (a host that
-//!   panics there leaves the door it died at on the tape: `Fx::host_tell`).
-//!   A call that is an ACT on the session (marked `act` in the trait's
-//!   method list, [`super::doors::is_host_act`]: the host's step at an idle
-//!   point, a restart, a reset taken, a probe claimed) closes the tape's
-//!   frame after it, as a control act does.
-//! * [`ReplayHost`]: a replay's host. It holds no host at all: every query is
-//!   answered by the tape's record at its door, every notification compared
-//!   with the recorded one, and a call the recorded loop did not make is the
-//!   replay's divergence where it is made.
-//!
-//! **Arguments** ([`TapeArg`]) are compared by their `Debug` text, `name=`
-//! before each, a line each ([`request`]): no codec to keep beside each type,
-//! and a type opts in by name ([`tape_arg_debug!`]), so an argument of a new
-//! type does not build until someone has looked at what its `Debug` says. No
-//! argument holds an `Instant` (whose `Debug` is this process's raw clock and
-//! would make every replay diverge): in this crate's tests a request that
-//! holds one is a failed assertion.
-//!
-//! **Answers** ([`HostReply`]) are written as JSON through small mirrors of
-//! their types — the probes' idiom (`policy::probe`) — so the tape's text form
-//! reads as what the host said, and a word on the tape is a word written here
-//! (`notice`, `not-due`), never a Rust variant's name that a rename would
-//! silently change. Three answers hold an `Instant` — [`Reach`]'s `since`, an
-//! [`AccountAdvice::Wait`]'s `until`, `wants_at` — and those are written as
-//! signed nanoseconds from the tape's origin and read back onto the replay's
-//! own origin ([`offset_ns`], [`instant_at`]), so the replayed loop sees the
-//! same span between the host's instant and every clock read it makes. A
-//! byte this build did not write is a `CodecError`, never a guess.
-//!
-//! The replay plan's §4.6 had the return types derive the workspace's serde;
-//! the mirrors were chosen instead for the reason above (the probes made the
-//! same choice), and they keep serde off the policy's own types.
+//! THE HOST'S DOOR ON A TAPE: what crosses when the loop asks the window's host ([`crate::supervise::IdleHost`]) — the two hosts the trait's macro implements it for (`supervise::run::host_door`), and the tape form of every argument and answer.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -78,12 +36,7 @@ use crate::supervise::run::{
 };
 use crate::supervise::tap_clock::{TapWindow, UsageWindow};
 
-// -- the two hosts ------------------------------------------------------------
-
-/// A RECORDING run's host ([module docs](self)): `inner`, the window's own
-/// (or a test's), asked through the run's door. `H` is the trait object it
-/// wraps — `dyn IdleHost` for the loop, a test's planted trait for the
-/// macro's own check.
+/// A RECORDING run's host ([module docs](self)): `inner`, the window's own (or a test's), asked through the run's door.
 pub(crate) struct TapedHost<H: ?Sized> {
     inner: Arc<H>,
     fx: Fx,
@@ -100,9 +53,7 @@ impl<H: ?Sized> TapedHost<H> {
         &self.inner
     }
 
-    /// A QUERY at `door`: `live` asks the host, and its answer — the live one
-    /// — comes back, taped with `request`. An `act` (a method the trait's
-    /// list marks so) closes the frame after it.
+    /// A QUERY at `door`: `live` asks the host, and its answer — the live one — comes back, taped with `request`.
     pub(crate) fn ask<A: HostReply>(
         &self,
         door: &'static str,
@@ -117,9 +68,7 @@ impl<H: ?Sized> TapedHost<H> {
         answer
     }
 
-    /// A NOTIFICATION at `door`, said with `request`, then told to the host
-    /// by `live` (`Fx::host_tell`: a host that panics there leaves the door
-    /// it died at on the tape). An `act` closes the frame after it.
+    /// A NOTIFICATION at `door`, said with `request`, then told to the host by `live` (`Fx::host_tell`: a host that panics there leaves the door it died at on the tape).
     pub(crate) fn tell(
         &self,
         door: &'static str,
@@ -142,8 +91,7 @@ impl<H: ?Sized + fmt::Debug> fmt::Debug for TapedHost<H> {
     }
 }
 
-/// A REPLAY's host ([module docs](self)): no host behind it, every answer
-/// the tape's.
+/// A REPLAY's host ([module docs](self)): no host behind it, every answer the tape's.
 #[derive(Debug)]
 pub(crate) struct ReplayHost {
     fx: Fx,
@@ -151,11 +99,8 @@ pub(crate) struct ReplayHost {
 
 impl ReplayHost {
     /// The host of a replay whose door is `fx`.
-    ///
     /// # Panics
-    ///
-    /// `fx` does not replay: a host with nothing behind it over a door that
-    /// would call its live world has nothing to call.
+    /// `fx` does not replay: a host with nothing behind it over a door that would call its live world has nothing to call.
     pub(crate) fn new(fx: Fx) -> Self {
         assert!(
             fx.replaying(),
@@ -179,10 +124,7 @@ impl ReplayHost {
     }
 }
 
-// -- arguments ----------------------------------------------------------------
-
-/// An argument a host's call is taped with: its `Debug` text, compared as it
-/// is ([module docs](self)).
+/// An argument a host's call is taped with: its `Debug` text, compared as it is ([module docs](self)).
 pub(crate) trait TapeArg: fmt::Debug {}
 
 impl<T: TapeArg + ?Sized> TapeArg for &T {}
@@ -193,8 +135,7 @@ impl<A: TapeArg, B: TapeArg> TapeArg for (A, B) {}
 /// element's in order, so a set told otherwise compares otherwise.
 impl<T: TapeArg> TapeArg for [T] {}
 
-/// Each type an argument of the host's may be, opted in by name: its `Debug`
-/// is the text a tape compares, and holds no `Instant`.
+/// Each type an argument of the host's may be, opted in by name: its `Debug` is the text a tape compares, and holds no `Instant`.
 macro_rules! tape_arg_debug {
     ($($t:ty),* $(,)?) => {
         $(impl TapeArg for $t {})*
@@ -213,8 +154,6 @@ tape_arg_debug!(
     WaitPlan,
     Act,
     TaskFace,
-    // `land_held`'s hold: `Copy`, no `Instant`, its open words printed as
-    // the strict reading spelled them (`OpenWord`'s `Debug`).
     LandHeld,
     Guard,
     StuckSurvey,
@@ -230,16 +169,13 @@ tape_arg_debug!(
     UsageWindow,
 );
 
-/// A call's request as a tape holds it: `name=<Debug>` for each argument, a
-/// line each, in the signature's order; nothing for a call with none.
+/// A call's request as a tape holds it: `name=<Debug>` for each argument, a line each, in the signature's order; nothing for a call with none.
 pub(crate) fn request(args: &[(&str, &dyn TapeArg)]) -> Vec<u8> {
     let text = args
         .iter()
         .map(|(name, arg)| format!("{name}={arg:?}"))
         .collect::<Vec<_>>()
         .join("\n");
-    // This crate's tests hold every argument to it: a raw `Instant` in a
-    // request would make every replay of the run diverge there.
     #[cfg(test)]
     assert!(
         !super::core::holds_instant(&text),
@@ -248,25 +184,17 @@ pub(crate) fn request(args: &[(&str, &dyn TapeArg)]) -> Vec<u8> {
     text.into_bytes()
 }
 
-// -- answers ------------------------------------------------------------------
-
-/// An answer of the host's, as a tape holds it: what [`TapedHost`] writes and
-/// [`ReplayHost`] reads back, with the tape's origin to place an `Instant` by
-/// ([module docs](self)).
+/// An answer of the host's, as a tape holds it: what [`TapedHost`] writes and [`ReplayHost`] reads back, with the tape's origin to place an `Instant` by ([module docs](self)).
 pub(crate) trait HostReply: Sized {
     /// The answer's bytes on the tape, its instants from `origin`.
     fn put(&self, origin: Instant) -> Vec<u8>;
 
     /// The answer [`Self::put`] wrote, its instants placed from `origin`.
-    ///
     /// # Errors
-    ///
     /// Bytes [`Self::put`] did not write.
     fn take(bytes: &[u8], origin: Instant) -> Result<Self, CodecError>;
 
-    /// The answer a replay gives at a door the recording build did not have
-    /// ([`TapeValue::absent`]); `None`: such a door diverges, as any door
-    /// the tape does not hold.
+    /// The answer a replay gives at a door the recording build did not have ([`TapeValue::absent`]); `None`: such a door diverges, as any door the tape does not hold.
     fn absent() -> Option<Self> {
         None
     }
@@ -293,8 +221,7 @@ fn bad(why: &'static str) -> CodecError {
     CodecError { at: 0, why }
 }
 
-/// `value` as JSON bytes. The mirrors hold strings, numbers, booleans and
-/// options of them, which always serialize.
+/// `value` as JSON bytes.
 fn json<T: Serialize>(value: &T) -> Vec<u8> {
     aterm_json::to_vec(value).unwrap_or_default()
 }
@@ -305,12 +232,6 @@ fn of_json<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, CodecError> 
 }
 
 /// `at` as signed nanoseconds from `origin` (saturated past ±292 years).
-///
-/// Both spans are taken, each at least zero, and the one that is not zero is
-/// the offset: Windows' `Instant` reads an instant within one tick of its
-/// counter BEFORE another as no span at all (not as one that is earlier), so
-/// asking only `at - origin` would record an instant just before the origin
-/// as the origin itself.
 pub(crate) fn offset_ns(origin: Instant, at: Instant) -> i64 {
     let after = at.saturating_duration_since(origin);
     let before = origin.saturating_duration_since(at);
@@ -322,9 +243,7 @@ pub(crate) fn offset_ns(origin: Instant, at: Instant) -> i64 {
 }
 
 /// The instant `ns` nanoseconds from `origin` ([`offset_ns`] read back).
-///
 /// # Errors
-///
 /// An offset this process's clock cannot hold.
 pub(crate) fn instant_at(origin: Instant, ns: i64) -> Result<Instant, CodecError> {
     let span = Duration::from_nanos(ns.unsigned_abs());
@@ -515,11 +434,7 @@ enum RosterWire {
     /// other ready, read so.
     Row(Option<(String, bool)>),
     /// The same, with the other row ready to run now
-    /// ([`RosterWord::Row`]'s `ready`). `held`: what holds the tab at the
-    /// limit ([`held_word`]); none, nothing does — and a tape written before
-    /// it was kept holds none, read so (its one reader, the notice's `{why}`
-    /// beside a ready row, tells no hold as the earlier limit, as that
-    /// build did).
+    /// ([`RosterWord::Row`]'s `ready`).
     Ready {
         next: Option<(String, bool)>,
         ready: String,
@@ -962,8 +877,7 @@ impl TapeValue for Option<LastTurn> {
     }
 }
 
-/// [`RepoWork`] as a tape holds it. A tape recorded before the probe read
-/// the remote's default branch holds no `unlanded` or `main_ref`: none known.
+/// [`RepoWork`] as a tape holds it.
 #[derive(Serialize, Deserialize)]
 struct RepoWorkWire {
     repo: String,
@@ -1094,9 +1008,7 @@ impl TapeValue for Option<AgentMemory> {
     }
 }
 
-/// `transcript`'s answer as a tape holds it: the file and its tail. A path
-/// that is not UTF-8 has no JSON form, so its answer is one a replay cannot
-/// take, and says so.
+/// `transcript`'s answer as a tape holds it: the file and its tail.
 #[derive(Serialize, Deserialize)]
 struct TranscriptWire {
     path: PathBuf,
@@ -1133,22 +1045,6 @@ impl TapeValue for Result<(), ProbeNo> {
 }
 
 /// [`ResetWord`] as a tape holds it.
-///
-/// A RESET STEP TAPED BEFORE THE CLAUDE CODE 2.1.304 PORT DOES NOT REPLAY,
-/// on purpose: the step reads one vendor build's wording, and no reset tape
-/// from a real wall exists to keep. Its requests are compared byte for byte
-/// before its answer is read, and they changed shape: [`ResetAsk`]'s kind
-/// is no longer optional (`kind: Full`, where an earlier build wrote `kind:
-/// Some(Full)` or none), and [`ResetEnd`]'s
-/// offer carries its kind (`ResetOffer { kind, left, use_by }`, where it
-/// wrote `(left, use_by)`); the loop's own `RESET … used (<kindResets>
-/// left)` line is new too; and a dialog in 2.1.287–2.1.303's words reads as
-/// no grant row to this build, so its replay presses the wait row where the
-/// tape took the reset. Such a replay diverges at the first of these. An
-/// answer of the earlier shape — a go or a spend with no kind — is refused
-/// here as every byte this build did not write is, never read with a kind
-/// guessed: where the requests before it matched (an end that carried no
-/// offer), the replay diverges at that answer instead.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum ResetWordWire {

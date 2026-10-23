@@ -65,6 +65,7 @@ impl Class {
 pub struct LangId(pub u16);
 
 /// The reserved id for an empty or `"unknown"` `lang` code, and the overflow bucket once every
+/// real [`LangSet`] slot is taken; the language table never grows into it.
 const UNKNOWN_LANG: LangId = LangId((LangSet::CAPACITY - 1) as u16);
 
 /// Interned species identifier for [`Class::Animal`] surfaces, in first-appearance TOML order: [`Lexicon::species_code`] resolves it to the TOML `species` id, the renderer's sprite key.
@@ -273,6 +274,8 @@ impl FormId {
     }
 
     /// Exact table keys use variant 0 of the low byte; the possessive and clitic fallbacks of
+    /// [`Lexicon::classify_token_into`] use a nonzero code, keeping `kitty`, `kitty's` and each
+    /// prefix form distinct without a probabilistic token hash.
     #[inline]
     const fn exact(base: u64) -> Self {
         Self(base << 8)
@@ -328,6 +331,8 @@ impl std::fmt::Display for LexError {
 impl std::error::Error for LexError {}
 
 /// Renders a value's `Debug` output through `Display`, so `.to_string()` yields the `{:?}` text
+/// without expanding a std format macro (whose hardened unsafe op the verifier cannot discharge)
+/// into the caller.
 struct DebugText<T: std::fmt::Debug>(T);
 
 impl<T: std::fmt::Debug> std::fmt::Display for DebugText<T> {
@@ -337,6 +342,8 @@ impl<T: std::fmt::Debug> std::fmt::Display for DebugText<T> {
 }
 
 /// One `[[entry]]` of the embedded `data/lexicon.toml`, decoded by the build
+/// script through the run-time shapes ([`RawEntry`]) and kept as it reads there,
+/// without its reviewer `notes`.
 struct BuiltinEntry {
     class: &'static str,
     lang: &'static str,
@@ -352,6 +359,8 @@ struct BuiltinEntry {
 include!(concat!(env!("OUT_DIR"), "/builtin_lexicon.rs"));
 
 /// The embedded documents' rows, as decoding `data/lexicon.toml` and
+/// `data/exceptions.toml` would give them: the build script decoded them, so a
+/// launch parses no TOML for the builtin lexicon.
 fn builtin_rows() -> (RawLexicon, RawExceptions) {
     let owned = |list: &[&str]| -> Vec<String> { list.iter().map(|s| (*s).to_owned()).collect() };
     let entry = BUILTIN_ENTRIES
@@ -381,36 +390,45 @@ fn builtin_rows() -> (RawLexicon, RawExceptions) {
     (RawLexicon { entry }, RawExceptions { exception })
 }
 
-/// Cap on surface forms materialized across all entries in [`Lexicon::build`]. The builtin makes
+/// Cap on surface forms materialized across all entries in [`Lexicon::build`].
 const MAX_TOTAL_SURFACES: usize = 1 << 20;
 
 /// Longest no-space surface, in characters, that [`Lexicon::build`] compiles: the bound on the
+/// maximal-run probe window ([`Lexicon::max_cjk`]).
 const MAX_CJK_SURFACE_CHARS: usize = 32;
 
 /// A compiled lexicon: folded surface forms mapped to their decoration class, plus the CJK compound tables.
 #[derive(Debug, Clone)]
 pub struct Lexicon {
     /// Folded whole-word surface → (class, claiming languages), for
+    /// whitespace-delimited scripts.
     spaced: FxHashMap<String, LexiconHit>,
     /// Raw CJK compound → (class, claiming languages), for no-space scripts
+    /// (matched by maximal run).
     cjk_forms: FxHashMap<String, LexiconHit>,
     /// Raw CJK compounds that contain a surface but are not that word (山猫 lynx, 猫車
+    /// wheelbarrow, カメラ), suppressed during the maximal-run match.
     cjk_exceptions: FxHashSet<String>,
     /// Longest CJK key (chars), bounding the maximal-run search window.
     max_cjk: usize,
     /// First character of every [`Self::cjk_forms`] key and [`Self::cjk_exceptions`] member → the
+    /// length in chars of the longest surface starting with it, built by [`note_cjk_head`] from
+    /// the finished tables.
     cjk_heads: FxHashMap<char, usize>,
     /// Interned language codes, in first-appearance TOML order ([`LangId`] `i`
+    /// ⇔ `langs[i]`).
     langs: Vec<String>,
     /// Interned [`Class::Animal`] species ids, in first-appearance TOML order
+    /// ([`SpeciesId`] `i` ⇔ `species[i]`).
     species: Vec<String>,
     /// Data problems found during build; see [`Self::conflicts`].
     conflicts: Vec<String>,
     /// Folded surfaces from user config (override TOML, `extra_words`, custom specs): the scanner's
+    /// short-word emphasis guard exempts them, so a short custom word ("gg") still matches.
     user_surfaces: FxHashSet<String>,
 }
 
-/// Compiled value stored behind an exact surface key. `form_id` is assigned
+/// Compiled value stored behind an exact surface key.
 #[derive(Clone, Copy, Debug)]
 struct LexiconHit {
     class: Class,
@@ -419,6 +437,8 @@ struct LexiconHit {
     ambiguous: bool,
     species: Option<SpeciesId>,
     /// The marks-required gate: every claiming surface lost diacritics in folding into a
+    /// bare-ASCII key, which plain ASCII text spells as something else (Vietnamese `đm` → `dm`, as
+    /// in `dmg`; Spanish `coño` → `cono` in `conoid`).
     marks_required: bool,
 }
 
@@ -441,6 +461,7 @@ impl Langs {
         self.all || self.set.contains(lang)
     }
     /// Report every configured code the loaded data never names: it un-gates nothing (`"DA"`,
+    /// `"da-DK"`, `"dk"`, `"ALL"`), and the person who set it must be told.
     fn note_unknown(&self, known: &FxHashSet<String>, conflicts: &mut Vec<String>) {
         for lang in &self.listed {
             if lang == "all" || known.contains(lang) {
@@ -846,7 +867,7 @@ impl Lexicon {
             .map(|hit| hit.class)
     }
 
-    /// [`classify_token`](Self::classify_token) into caller scratch, returning the whole hit. On
+    /// [`classify_token`](Self::classify_token) into caller scratch, returning the whole hit.
     fn classify_token_into(
         &self,
         token: &str,
@@ -1120,7 +1141,7 @@ enum CjkHit {
     Exception,
 }
 
-/// Intern `code` into `table` (first-appearance order). Empty / `"unknown"`
+/// Intern `code` into `table` (first-appearance order).
 fn intern_lang(table: &mut Vec<String>, code: &str) -> LangId {
     let code = code.trim();
     if code.is_empty() || code == "unknown" {
@@ -1137,7 +1158,7 @@ fn intern_lang(table: &mut Vec<String>, code: &str) -> LangId {
     LangId((table.len() - 1) as u16)
 }
 
-/// Intern an animal `species` id into `table` (first-appearance order). A plain index table with
+/// Intern an animal `species` id into `table` (first-appearance order).
 fn intern_species(table: &mut Vec<String>, code: &str) -> SpeciesId {
     if let Some(i) = table.iter().position(|s| s == code) {
         return SpeciesId(i as u16);
@@ -1149,7 +1170,7 @@ fn intern_species(table: &mut Vec<String>, code: &str) -> SpeciesId {
     table.push(code.to_string());
     SpeciesId(i as u16)
 }
-/// Cross-class homograph precedence: `profanity > feline > canine > animal > emphasis`. A surface
+/// Cross-class homograph precedence: `profanity > feline > canine > animal > emphasis`.
 #[inline]
 const fn class_rank(class: Class) -> u8 {
     match class {
@@ -1162,6 +1183,8 @@ const fn class_rank(class: Class) -> u8 {
 }
 
 /// A surface's precedence-in-progress record: [`LexiconHit`] minus the
+/// [`FormId`], which is assigned only after every class collision has settled
+/// ([`finalize_hits`]).
 #[derive(Clone, Copy, Debug)]
 struct PendingHit {
     class: Class,
@@ -1172,6 +1195,8 @@ struct PendingHit {
 }
 
 /// Report a no-space surface [`Lexicon::build`] dropped for exceeding
+/// [`MAX_CJK_SURFACE_CHARS`]: from an entry of language `lang`, or from the
+/// exception list (`None`).
 fn push_overlong_surface_conflict(conflicts: &mut Vec<String>, len: usize, lang: Option<&str>) {
     let mut msg = String::from("no-space surface of ");
     msg.push_str(&len.to_string());
@@ -1190,6 +1215,7 @@ fn push_overlong_surface_conflict(conflicts: &mut Vec<String>, len: usize, lang:
 }
 
 /// Record `surface`'s first character in the CJK prefilter, keeping the longest surface length
+/// (chars) seen for it.
 fn note_cjk_head(heads: &mut FxHashMap<char, usize>, surface: &str) {
     let mut it = surface.chars();
     let Some(first) = it.next() else {
@@ -1203,6 +1229,10 @@ fn note_cjk_head(heads: &mut FxHashMap<char, usize>, surface: &str) {
 }
 
 /// Insert a surface, resolving collisions: a higher-ranked class REPLACES the
+/// entry and keeps ONLY its own languages (the surface is displayed as the
+/// winning class, so only that class's claimants may be attributed); the SAME
+/// class UNIONS the language sets (`kucing` = id ∪ ms ∪ jv); a lower-ranked
+/// class is dropped entirely, languages included.
 fn insert_class(
     map: &mut FxHashMap<String, PendingHit>,
     key: String,
@@ -1241,6 +1271,7 @@ fn insert_class(
 }
 
 /// Freeze a precedence-resolved surface table, giving each exact key a deterministic,
+/// collision-free ID.
 fn finalize_hits(
     map: FxHashMap<String, PendingHit>,
     next_form_id: &mut u64,
@@ -1283,7 +1314,7 @@ pub fn is_no_space_surface(s: &str) -> bool {
     !s.is_empty() && s.chars().all(fold::is_no_space_script)
 }
 
-/// FNV-1a over the key's UTF-8 bytes — the [`Match::form_hash`] source. Kept
+/// FNV-1a over the key's UTF-8 bytes — the [`Match::form_hash`] source.
 #[inline]
 fn fnv1a64(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -1295,6 +1326,8 @@ fn fnv1a64(s: &str) -> u64 {
 }
 
 /// Maximal run of token characters starting at `i`, treating an apostrophe or
+/// hyphen between two token characters as an interior joiner (so `cat's` and
+/// `cat-like` are single tokens).
 #[inline]
 fn token_end(chars: &[char], i: usize) -> usize {
     let n = chars.len();
@@ -1326,6 +1359,7 @@ pub const fn is_interior_joiner(c: char) -> bool {
 }
 
 /// True if `s` is a single whole-word token: it begins and ends with a token
+/// character and contains only token characters and interior joiners.
 fn is_matchable_token(s: &str) -> bool {
     let chars: Vec<char> = s.chars().collect();
     let (Some(&first), Some(&last)) = (chars.first(), chars.last()) else {
@@ -1351,6 +1385,7 @@ fn is_matchable_token(s: &str) -> bool {
 }
 
 /// True if the character just LEFT of the token at `i` puts it in a code/path
+/// context.
 #[inline]
 fn left_suppresses(chars: &[char], i: usize) -> bool {
     if i == 0 {
@@ -1365,6 +1400,7 @@ fn left_suppresses(chars: &[char], i: usize) -> bool {
 }
 
 /// True if the character just RIGHT of the token ending at `j` puts it in a
+/// code/path context.
 #[inline]
 fn right_suppresses(chars: &[char], j: usize) -> bool {
     let n = chars.len();
@@ -1398,6 +1434,8 @@ mod tests {
     }
 
     /// Every surface the maximal-run scan can match is reachable through `cjk_heads` at a stored
+    /// length no shorter than its own, over both tables and each language set that changes which
+    /// entries load.
     #[test]
     fn cjk_prefilter_admits_every_surface_it_gates() {
         for langs in [&["en"][..], &["all"][..], &["ja", "th"][..]] {
@@ -1443,6 +1481,8 @@ mod tests {
     }
 
     /// Language-collision regression: Romanian `fut` / `futu` must remain
+    /// recognizable in Romanian/all-language configurations, but every scan
+    /// reports them as cursor-deferrable collisions.
     #[test]
     fn romanian_fut_forms_are_ambiguous_in_ro_and_all_but_not_default_english() {
         let en = Lexicon::with_languages(&["en"]);

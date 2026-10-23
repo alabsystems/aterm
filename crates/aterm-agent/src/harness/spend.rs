@@ -48,7 +48,7 @@ pub const MAX_SEEN: usize = 400_000;
 /// `unpriced` and `unattributed` suppress a capacity past this share.
 pub const SHARE_MAX: f64 = 0.01;
 
-/// At most every retained bucket of one message. A model change or aggregate
+/// At most every retained bucket of one message.
 const MAX_CONTRIBUTIONS: usize = (HORIZON_S / BUCKET_S) as usize + 1;
 
 /// How much one read call asks the kernel for.
@@ -84,6 +84,7 @@ impl Rates {
     }
 
     /// Dollars for `t` at these rates, or `None` when a class with tokens has
+    /// no rate.
     fn usd(&self, t: &TokenUsage) -> Option<f64> {
         let per = |tokens: u64, price: Option<f64>| match (tokens, price) {
             (0, _) => Some(0.0),
@@ -464,6 +465,14 @@ impl Tally {
 }
 
 /// Whether a row's usage asks for something the table does not price: any
+/// `speed` but `standard` (fast mode), any `inference_geo` but `global` or
+/// `not_available` (US-only inference lists at 1.1×), any `service_tier` but
+/// `standard`, a web search, or any `iterations` entry but a plain
+/// `message`: an advisor's (`advisor_message`, which Claude Code prices at
+/// the advisor's model on top of the message's own usage; its tokens are not
+/// in that usage, so the fold does not count them) or a server-side
+/// fallback's (`fallback_message`: the declined primary attempt and the
+/// fallback model's, two models in one message).
 fn approx(usage: &Map) -> bool {
     let word = |key: &str| usage.get(key).and_then(Value::as_str);
     word("speed").is_some_and(|w| w != "standard")
@@ -485,6 +494,7 @@ fn approx(usage: &Map) -> bool {
 }
 
 /// The catalog family of a model id (`claude-fable-5-1` → `fable`), the one
+/// rule `upgrade_models` reads ids by.
 fn family_of(model: &str) -> Option<String> {
     super::upgrade_models::family_version(model).map(|(family, _)| family)
 }
@@ -494,7 +504,7 @@ fn family_of(model: &str) -> Option<String> {
 struct Cursor {
     /// The file folded (device, inode); `None` before its first read.
     identity: Option<(u64, u64)>,
-    /// Bytes folded: every complete line, and a long line's bytes skipped. A
+    /// Bytes folded: every complete line, and a long line's bytes skipped.
     offset: u64,
     /// The byte at `offset - 1` when it was read.
     boundary: Option<u8>,
@@ -510,6 +520,7 @@ struct Cursor {
 }
 
 /// A message a transcript's cursor holds: what its later rows are folded
+/// against.
 #[derive(Debug, Clone, PartialEq)]
 struct Held {
     /// FNV-1a/64 of its `message.id`.
@@ -518,7 +529,7 @@ struct Held {
     tokens: TokenUsage,
     /// A row of it was [`approx`], and the message was counted so.
     approx: bool,
-    /// Sorted (bucket, actual aggregate model key) contributions. None means
+    /// Sorted (bucket, actual aggregate model key) contributions.
     contributions: Option<Vec<Contribution>>,
 }
 
@@ -532,7 +543,7 @@ struct Contribution {
 }
 
 impl Held {
-    /// Invalidate only this message's actual earlier contributions. Its tokens
+    /// Invalidate only this message's actual earlier contributions.
     fn unprice(&mut self, buckets: &mut Buckets) {
         if let Some(parts) = self.contributions.as_mut() {
             for part in parts {
@@ -564,7 +575,7 @@ impl Held {
         }
     }
 
-    /// A table may also price a longer request lower. Remove the difference
+    /// A table may also price a longer request lower.
     fn reduce_price(&mut self, buckets: &mut Buckets, mut amount: f64) {
         if let Some(parts) = self.contributions.as_mut() {
             for part in parts.iter_mut().rev() {
@@ -633,6 +644,7 @@ impl Held {
 
 impl Cursor {
     /// Start the file over from its first byte: it changed other than by an
+    /// append.
     fn restart(&mut self) {
         *self = Self {
             ids: std::mem::take(&mut self.ids),
@@ -647,6 +659,7 @@ impl Cursor {
     }
 
     /// Whether the file `meta` describes is the one the last read left, read
+    /// to its end: nothing to read.
     fn unchanged(&self, meta: &std::fs::Metadata) -> bool {
         self.end
             && identity_of(meta).is_none_or(|id| self.identity == Some(id))
@@ -656,6 +669,8 @@ impl Cursor {
 }
 
 /// The identity `meta` carries, where the platform keeps one in a file's
+/// metadata (Unix); `None` elsewhere, where only an open file tells it
+/// ([`super::session_usage::open_identity`], read by [`advance`]).
 #[cfg(unix)]
 fn identity_of(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt as _;
@@ -749,6 +764,8 @@ pub struct Spend {
     files: BTreeMap<String, Cursor>,
     buckets: Buckets,
     /// Every message id counted in the horizon (FNV-1a/64 of `message.id`),
+    /// with the hour its message was served: a message one transcript
+    /// repeats from another counts once in the home.
     seen: HashMap<u64, i64>,
 }
 
@@ -914,6 +931,7 @@ impl Spend {
 }
 
 /// Where one fold's rows go: the table and clock they are priced and placed
+/// by, the buckets, the home's counted ids and the report.
 struct Sink<'a> {
     prices: &'a PriceTable,
     now: i64,
@@ -935,6 +953,7 @@ impl Sink<'_> {
 }
 
 /// One message's tally (`messages` 1), or what a later row of it added (0),
+/// `approx` when it made the message approximate.
 fn tally(messages: u64, tokens: TokenUsage, usd: Option<f64>, approx: bool) -> Tally {
     Tally {
         messages,
@@ -958,6 +977,7 @@ fn add(buckets: &mut Buckets, at: i64, model: &str, t: Tally) {
 }
 
 /// Add `t` under `model`, or under [`OTHER_MODEL`] once [`MAX_MODELS`] are
+/// held — where it is unpriced: the bucket no longer says which model it was.
 fn merge_model(into: &mut BTreeMap<String, Tally>, model: &str, t: &Tally) {
     if into.contains_key(model) || into.len() < MAX_MODELS {
         into.entry(model.to_owned()).or_default().absorb(t);
@@ -972,12 +992,15 @@ fn merge_model(into: &mut BTreeMap<String, Tally>, model: &str, t: &Tally) {
 }
 
 /// Trim a file the fold read to its end, the only files it is called on: a
+/// quiet one keeps no message ids, one still being written the newest
+/// [`IDS_KEPT`].
 fn quiet(cursor: &mut Cursor, meta: &std::fs::Metadata, now: i64) {
     let quiet = cursor.end && mtime_ns(meta) / 1_000_000_000 <= now.saturating_sub(QUIET_S);
     cursor.let_go(if quiet { 0 } else { IDS_KEPT });
 }
 
 /// Read what one transcript appended since its cursor, within `left` bytes,
+/// and fold every line it completes.
 fn advance(
     cursor: &mut Cursor,
     path: &Path,
@@ -1074,6 +1097,8 @@ fn advance(
 }
 
 /// Fold one complete line: an assistant row with usage, served (not an API
+/// error), timed, inside the horizon, counted once in the home per
+/// `message.id`, at its largest counts within its file.
 fn fold_row(bytes: &[u8], cursor: &mut Cursor, sink: &mut Sink<'_>) {
     let report = &mut *sink.report;
     let Ok(line) = std::str::from_utf8(bytes) else {
@@ -1216,6 +1241,9 @@ struct Walk {
 }
 
 /// Every regular `*.jsonl` under `projects` (links not followed), at most
+/// [`MAX_DEPTH`] directories down and [`MAX_WALK_ENTRIES`] entries in all,
+/// modified at or after `since`, listed before the fold's deadline
+/// ([`Limits::until`]): a walk stopped by either is cut.
 fn walk(projects: &Path, since: i64, limits: &Limits) -> Walk {
     let mut out = Walk {
         files: Vec::new(),
@@ -1374,6 +1402,8 @@ pub struct Reading {
 
 impl Reading {
     /// The fraction used and the half-width of what it may be, at the
+    /// resolution actually seen: whole percents until a tenth was
+    /// (`tenths_seen`).
     fn point(&self, tenths_seen: bool) -> (f64, f64) {
         let pct = f64::from(self.pct_x10) / 10.0;
         match self.kind {
@@ -1385,6 +1415,7 @@ impl Reading {
     }
 
     /// Too small a figure for a ratio: under 5 whole percents, or under 1%
+    /// once tenths are seen.
     fn low(&self, tenths_seen: bool) -> bool {
         match self.kind {
             ReadingKind::Wall => false,

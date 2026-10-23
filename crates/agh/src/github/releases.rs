@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Releases (design §11): lists, ids, tags, latest, newest, assets and downloads. Every method
-//! called as WriterRead first runs the push check, in the same call and never memoized.
+//! Repository release listing, lookup, and asset download operations.
 
 use crate::client::{Accept, Github};
 use crate::download::{self, Downloaded, Expect, Sink};
@@ -15,8 +14,7 @@ use crate::path;
 use crate::policy::{Access, RouteTarget};
 use crate::slug::Slug;
 
-/// `/repos/{o}/{r}/releases/tags/{tag}`, the tag's `/` kept: the one by-tag path, which
-/// `published_by_tag` and the release wait both read.
+/// Returns `/repos/{o}/{r}/releases/tags/{tag}` with `/` in `tag` preserved.
 pub(crate) fn tag_path(slug: &Slug, tag: &str) -> String {
     format!("{}/releases/tags/{}", repo_root(slug), path::ref_path(tag))
 }
@@ -71,7 +69,7 @@ impl<'a> Releases<'a> {
     }
 
     /// The push check (plan §4.6.20): under WriterRead, `GET /repos/{o}/{r}` as the writer, which
-    /// must hold `push`. Nothing under any other access.
+    /// must hold `push`.
     fn push_check(&self) -> Result<()> {
         if !self.writer() {
             return Ok(());
@@ -95,8 +93,7 @@ impl<'a> Releases<'a> {
     }
 
     /// A 404 after the push check passed: the identity has push, so the thing is absent, not
-    /// hidden. Only a `--no-probe` call leaves it NotVisible; it becomes NotFound here, its why
-    /// naming `what` and the check (the client's why said the repository was not checked).
+    /// hidden.
     fn absent_after_check(&self, what: &str, error: Error) -> Error {
         self.absent_as(error, || {
             format!(
@@ -140,9 +137,7 @@ impl<'a> Releases<'a> {
         format!("{}/releases", repo_root(&self.slug))
     }
 
-    /// Every release, newest first by `(created_at, id)`, drafts dropped under Read, then
-    /// `opts.limit` (`End::Limited` only when items were cut from a whole walk; a walk capped
-    /// under `partial` stays `Capped`).
+    /// Lists releases newest first by `(created_at, id)`, dropping drafts under Read.
     ///
     /// # Errors
     ///
@@ -203,10 +198,7 @@ impl<'a> Releases<'a> {
     ///
     /// # Errors
     ///
-    /// Usage, before any request, for a tag `path::bad_tag` refuses: empty, with an empty
-    /// part (which a slash-merging server reads as another tag) or a `.` or `..` part (which
-    /// a server that normalised the path would resolve off this repository's route); no git
-    /// tag is any of these. NotFound when no published release has it.
+    /// Usage if `path::bad_tag` refuses `tag`; NotFound when no published release matches.
     pub fn published_by_tag(&self, tag: &str) -> Result<ReleaseObject> {
         path::refuse_bad_tag(tag).map_err(|e| e.with_repo(self.slug.to_string()))?;
         self.push_check()?;
@@ -218,8 +210,7 @@ impl<'a> Releases<'a> {
         self.release_at(Absent::Why(&why), path)
     }
 
-    /// Every release with this tag, drafts included, read as the writer (WriterRead,
-    /// `ListOpts::CAS`) whatever this resource's access says.
+    /// Returns all releases with `tag` (including drafts) read under WriterRead.
     ///
     /// # Errors
     ///
@@ -267,9 +258,7 @@ impl<'a> Releases<'a> {
         self.latest_id_checked()
     }
 
-    /// `latest_id`, once the push check has run: a verb that already read this repository
-    /// under this routing (its listing or its release) reads the pointer as the same identity,
-    /// one request, with no second push check (the latest release is never a draft).
+    /// Returns `latest_id` without a second push check.
     ///
     /// # Errors
     ///
@@ -282,8 +271,7 @@ impl<'a> Releases<'a> {
         }
     }
 
-    /// The newest published release passing the filters: `list` under Read with
-    /// `ListOpts::STANDARD`, the maximum by `(created_at, id)`.
+    /// Returns the newest published release matching the filters.
     ///
     /// # Errors
     ///
@@ -336,14 +324,12 @@ impl<'a> Releases<'a> {
     }
 }
 
-/// `GET /repos/{o}/{r}/releases/assets/{id}` with Accept Json, under `how` and with no push
-/// check: `Releases::asset`, and the download's bracket recheck.
+/// Fetches `/repos/{o}/{r}/releases/assets/{id}` with Accept Json and no push check.
 pub(crate) fn asset_object(gh: &Github, slug: &Slug, how: &How, id: u64) -> Result<AssetObject> {
     asset_object_counted(gh, slug, how, id).map(|(asset, _)| asset)
 }
 
-/// `asset_object`, with the requests its answer took (retries, the probe and a move
-/// included), which the download's bracket recheck adds to its own count.
+/// Fetches `asset_object` along with its total request count.
 pub(crate) fn asset_object_counted(
     gh: &Github,
     slug: &Slug,

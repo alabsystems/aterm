@@ -1,38 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The closed vocabularies of a record (design §3.3): operations, levels,
-//! node ids, kinds, sources, confidences, actors, and the word lists of every
-//! word-valued key. Words are only ever added; a reader maps a word it does
-//! not know to `unknown` ([`UNKNOWN`]).
+//! Closed wire vocabularies for `aterm-slog` operations, levels, node IDs, kinds, sources, confidences, and actors.
 
 use std::fmt;
 
-/// The word a reader puts in place of a word it does not know.
+/// Fallback token substituted for unrecognized vocabulary words.
 pub const UNKNOWN: &str = "unknown";
 
-/// What a record does to its node.
+/// Record operation on a log node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Op {
-    /// A node begins.
+    /// Node begins.
     Open,
-    /// A node ends (exactly once), carrying its rollup.
+    /// Node ends with its rollup.
     Close,
-    /// A point fact attached to an open node.
+    /// Point fact attached to an open node.
     Mark,
-    /// A more reliable source refines a node.
+    /// Higher-confidence refinement of a node.
     Amend,
-    /// Records were lost; the count is exact.
+    /// Exact count of lost records.
     Gap,
-    /// A snapshot of the open path (a later phase writes it).
+    /// Snapshot of the open ancestor path.
     Snap,
 }
 
 impl Op {
-    /// Every operation, in wire order.
+    /// All operations in wire order.
     pub const ALL: [Op; 6] = [Op::Open, Op::Close, Op::Mark, Op::Amend, Op::Gap, Op::Snap];
 
-    /// The wire word.
+    /// Wire token for this operation.
     #[inline]
     #[must_use]
     pub const fn word(self) -> &'static str {
@@ -46,15 +43,14 @@ impl Op {
         }
     }
 
-    /// The operation a wire word names, or `None`: a line whose operation is
-    /// unknown is not a record a reader can place.
+    /// Parse an [`Op`] from its wire token.
     #[must_use]
     pub fn from_word(word: &str) -> Option<Op> {
         Op::ALL.into_iter().find(|op| op.word() == word)
     }
 }
 
-/// A level of the hierarchy (§2.1), outermost first.
+/// Hierarchy level (`n`, `-`, `r<n>`, `t<n>`, `p<n>`), outermost first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Lvl {
     /// The instance's own node log (`n`).
@@ -81,8 +77,7 @@ impl Lvl {
     }
 }
 
-/// A node id: a level letter and a number, never reused while the session id
-/// lives (§2.2). The session is `-` and the instance `n`.
+/// Hierarchy node identifier pairing a [`Lvl`] and ordinal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Node {
     /// The node's level.
@@ -92,25 +87,25 @@ pub struct Node {
 }
 
 impl Node {
-    /// The session node, `-`.
+    /// Session root node (`-`).
     pub const SESSION: Node = Node {
         lvl: Lvl::Session,
         n: 0,
     };
-    /// The instance node, `n`.
+    /// Instance root node (`n`).
     pub const INSTANCE: Node = Node {
         lvl: Lvl::Instance,
         n: 0,
     };
 
-    /// A numbered node of `lvl`.
+    /// Construct a numbered node at `lvl`.
     #[inline]
     #[must_use]
     pub const fn new(lvl: Lvl, n: u32) -> Node {
         Node { lvl, n }
     }
 
-    /// The node a wire id names (`-`, `n`, `r3`, `t17`, `p204`), or `None`.
+    /// Parse a wire node ID (`-`, `n`, `r3`, `t17`, `p204`).
     #[must_use]
     pub fn parse(s: &str) -> Option<Node> {
         match s {
@@ -147,9 +142,7 @@ impl fmt::Display for Node {
 /// Declares the closed `Kind` enum and its word table in one place.
 macro_rules! kinds {
     ($($variant:ident => $word:literal,)*) => {
-        /// A record's kind: the node's kind for open, close and amend, the
-        /// mark's kind for a mark (§2.1, §3.3). Closed per (level, op)
-        /// ([`Kind::fits`]).
+        /// Closed node or mark kind.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
         pub enum Kind {
             $(#[doc = concat!("`", $word, "`")] $variant,)*
@@ -158,10 +151,10 @@ macro_rules! kinds {
         }
 
         impl Kind {
-            /// Every known kind.
+            /// All known [`Kind`] variants.
             pub const ALL: &'static [Kind] = &[$(Kind::$variant,)*];
 
-            /// The wire word.
+            /// Wire token for this kind.
             #[must_use]
             pub const fn word(self) -> &'static str {
                 match self {
@@ -223,29 +216,9 @@ kinds! {
     Config => "config",
     Gap => "gap",
     Snap => "snap",
-    // Phase 3B, appended so no kind moves: a run's view of one of its
-    // sources (`source field=transcript state=on|partial|off skipped= dropped=`),
-    // and a post the broker landed (`mail-landed inbox= off=`: a
-    // mark is no node, so the post's `mail` mark cannot be amended, plan §1
-    // item 5). A reader without them maps either to `unknown`.
     Source => "source",
     MailLanded => "mail-landed",
-    // Phase 5, appended so no kind moves: a worker's
-    // task moved (`task rev= state= attention= why= code=`, the fact of the
-    // timeline's `task-change` row: closed words and counters only). Local:
-    // never bus class, journaled with the rest of its session's log (D3, on
-    // by default), no brief line. A reader without it maps it to `unknown`.
     Task => "task",
-    // Phase 6 (plan item U2), appended
-    // so no kind moves: the facts the timeline ring held and the log did not,
-    // each a mark its ring row's writer writes in the same hold (6F-4, 6F-5,
-    // 6F-9). A session's state (`state state=`), a harness policy's
-    // generation (`policy gen=`), a topic added or dropped (`topic`, its name
-    // a fingerprint below the content tier, U11), a lost bridge's advisory
-    // (`advisory origin= gen=`), the program's own OSC 7501 report (`program
-    // state= ask=`, U17), a mail fetch (`mail-fetch off=`, U15), and a move of
-    // what the person is shown (`shown`, U26). Local: none is bus class, and
-    // none is a `brief` line. A reader without them maps each to `unknown`.
     State => "state",
     Policy => "policy",
     Topic => "topic",
@@ -253,10 +226,18 @@ kinds! {
     Program => "program",
     MailFetch => "mail-fetch",
     Shown => "shown",
+    // Appended so no kind moves: a timeline row the log
+    // holds as its row alone (`row row=<kind> row_text=<payload>`), a fact
+    // no other mark names, which the timeline, read from the log, prints
+    // as its ring did: a job's verdict moved (`job-change`), a
+    // warm spare adopted, a dev build's measurement rows. Its writer writes
+    // it in the ring row's hold. Local: no bus class, no `brief` line, and
+    // the fold reads none. A reader without it maps it to `unknown`.
+    Row => "row",
 }
 
 impl Kind {
-    /// The kind a wire word names; an unknown word is [`Kind::Unknown`].
+    /// Parse a [`Kind`] from its wire token, mapping unknown tokens to [`Kind::Unknown`].
     #[must_use]
     pub fn from_word(word: &str) -> Kind {
         Kind::ALL
@@ -266,8 +247,7 @@ impl Kind {
             .unwrap_or(Kind::Unknown)
     }
 
-    /// The level a node of this kind lives at, for a node kind; `None` for
-    /// a mark, gap or snap kind.
+    /// Hierarchy level for a node kind, or `None` for mark/gap/snap kinds.
     #[inline]
     #[must_use]
     pub const fn node_level(self) -> Option<Lvl> {
@@ -288,8 +268,7 @@ impl Kind {
         }
     }
 
-    /// A mark's kind (§3.3's mark list). `agent` and `start` are node kinds
-    /// too.
+    /// Whether this kind is valid on a [`Op::Mark`] record.
     #[inline]
     #[must_use]
     pub const fn is_mark(self) -> bool {
@@ -338,11 +317,11 @@ impl Kind {
                 | Kind::Program
                 | Kind::MailFetch
                 | Kind::Shown
+                | Kind::Row
         )
     }
 
-    /// Whether a record of `op` on a node of `lvl` may carry this kind: the
-    /// per-(level, op) closure of the vocabulary.
+    /// Whether this kind is valid for operation `op` at level `lvl`.
     #[must_use]
     pub fn fits(self, op: Op, lvl: Lvl) -> bool {
         match op {
@@ -354,7 +333,7 @@ impl Kind {
     }
 }
 
-/// Where a record's fact was observed (§3.3).
+/// Observation source for a log record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Src {
     /// OSC 133 / 633 shell integration.
@@ -386,7 +365,7 @@ pub enum Src {
 }
 
 impl Src {
-    /// Every known source.
+    /// All known [`Src`] variants.
     pub const ALL: [Src; 12] = [
         Src::Shell,
         Src::Status,
@@ -402,7 +381,7 @@ impl Src {
         Src::Hook,
     ];
 
-    /// The wire word.
+    /// Wire token for this source.
     #[inline]
     #[must_use]
     pub const fn word(self) -> &'static str {
@@ -423,7 +402,7 @@ impl Src {
         }
     }
 
-    /// The source a wire word names; unknown is [`Src::Unknown`].
+    /// Parse a [`Src`] from its wire token, mapping unknown tokens to [`Src::Unknown`].
     #[must_use]
     pub fn from_word(word: &str) -> Src {
         Src::ALL
@@ -433,9 +412,7 @@ impl Src {
     }
 }
 
-/// How sure the source is (§3.3, §3.7). Ordinal by [`Conf::rank`]: a claim
-/// ranks below every observation, so the confidence law never lets a claim
-/// override one.
+/// Confidence level of a log record (`Exact`, `Strong`, `Heuristic`, `Claim`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Conf {
     /// Read off a record that says so (a transcript, an exit status).
@@ -451,10 +428,10 @@ pub enum Conf {
 }
 
 impl Conf {
-    /// Every known confidence.
+    /// All known [`Conf`] variants.
     pub const ALL: [Conf; 4] = [Conf::Exact, Conf::Strong, Conf::Heuristic, Conf::Claim];
 
-    /// The wire word.
+    /// Wire token for this confidence.
     #[inline]
     #[must_use]
     pub const fn word(self) -> &'static str {
@@ -467,7 +444,7 @@ impl Conf {
         }
     }
 
-    /// The confidence a wire word names; unknown is [`Conf::Unknown`].
+    /// Parse a [`Conf`] from its wire token, mapping unknown tokens to [`Conf::Unknown`].
     #[must_use]
     pub fn from_word(word: &str) -> Conf {
         Conf::ALL
@@ -476,8 +453,7 @@ impl Conf {
             .unwrap_or(Conf::Unknown)
     }
 
-    /// The order the confidence law compares by: unknown < claim <
-    /// heuristic < strong < exact.
+    /// Ordinal rank (`unknown < claim < heuristic < strong < exact`).
     #[inline]
     #[must_use]
     pub const fn rank(self) -> u8 {
@@ -490,8 +466,7 @@ impl Conf {
         }
     }
 
-    /// The reliability suffix `brief` prints (§7.4): `!` exact, `+` strong,
-    /// `~` heuristic, `?` claim (and unknown).
+    /// Single-character reliability suffix printed by `brief` (`!`, `+`, `~`, `?`).
     #[inline]
     #[must_use]
     pub const fn suffix(self) -> char {
@@ -504,9 +479,7 @@ impl Conf {
     }
 }
 
-/// A short opaque id: a session id, a node or record reference, an offset
-/// (`@88231`), a generation. ASCII `[A-Za-z0-9._:@-]`, 1 to 40 bytes, held
-/// inline.
+/// Fixed-capacity ASCII identifier (`[A-Za-z0-9._:@-]`, up to 40 bytes).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ShortId {
     bytes: [u8; ShortId::MAX],
@@ -514,11 +487,10 @@ pub struct ShortId {
 }
 
 impl ShortId {
-    /// The longest id.
+    /// Maximum byte length of a [`ShortId`].
     pub const MAX: usize = 40;
 
-    /// `s` as an id, or `None` when it is empty, too long or holds a byte
-    /// outside the id alphabet.
+    /// Validate and construct a [`ShortId`] from `s`.
     #[must_use]
     pub fn new(s: &str) -> Option<ShortId> {
         let raw = s.as_bytes();
@@ -533,7 +505,7 @@ impl ShortId {
         })
     }
 
-    /// The id's text.
+    /// Identifier as a string slice.
     #[must_use]
     pub fn as_str(&self) -> &str {
         // Every byte passed `is_id_byte` (ASCII), so this never fails.
@@ -558,31 +530,24 @@ impl fmt::Display for ShortId {
     }
 }
 
-/// The words of the actors a connection's class names (§2.5):
-/// never a session's. An [`Actor::Sid`] holding one of them is not one
-/// ([`Actor::sid`] makes it [`Actor::Nobody`], and [`Actor::word`] prints such
-/// a value as `-`), so no record, carry line or fold snapshot ever turns a
-/// name someone chose into one of these actors when it is read back
-/// ([`Actor::from_word`] maps each word only to its own actor).
+/// Reserved connection-class actor tokens that cannot be used as session IDs.
 pub const RESERVED_ACTOR_WORDS: &[&str] =
     &["human", "ctl", "harness", "bridge", "aterm", "vendor", "-"];
 
-/// Whether `word` is one of [`RESERVED_ACTOR_WORDS`].
+/// Whether `word` is in [`RESERVED_ACTOR_WORDS`].
 #[must_use]
 pub fn is_reserved_actor_word(word: &str) -> bool {
     RESERVED_ACTOR_WORDS.contains(&word)
 }
 
-/// Who a record is attributed to (§2.5). The server sets it from the
-/// connection, never from a parameter.
+/// Attributed actor for a log record, derived from the connection class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Actor {
     /// The window's input path.
     Human,
     /// Any other Owner client: whoever presents the instance token — the
     /// owner's own `aterm ctl`, and equally ANY process running inside an
-    /// aterm session (the supervised agent itself among them). Owner class,
-    /// but never proven to be the owner ([`Actor::is_proven`]).
+    /// aterm session (the supervised agent itself among them).
     Ctl,
     /// The in-GUI harness.
     Harness,
@@ -599,10 +564,7 @@ pub enum Actor {
 }
 
 impl Actor {
-    /// The wire word (`human ctl harness bridge aterm vendor <sid> -`). A
-    /// [`Actor::Sid`] whose text is a reserved word ([`RESERVED_ACTOR_WORDS`])
-    /// prints `-`: it was never that actor, and nothing that reads the word
-    /// back may take it for one.
+    /// Wire token for this actor.
     #[must_use]
     pub fn word(&self) -> &str {
         match self {
@@ -618,9 +580,7 @@ impl Actor {
         }
     }
 
-    /// A session as an actor: [`Actor::Sid`], or [`Actor::Nobody`] for a
-    /// reserved word ([`RESERVED_ACTOR_WORDS`]). The one way a host turns a
-    /// session's name into an actor.
+    /// Construct [`Actor::Sid`], mapping reserved actor words to [`Actor::Nobody`].
     #[must_use]
     pub fn sid(id: ShortId) -> Actor {
         if is_reserved_actor_word(id.as_str()) {
@@ -630,9 +590,7 @@ impl Actor {
         }
     }
 
-    /// The actor a wire word names: a known word (each only its own actor),
-    /// else a sid-shaped token, else `-`. A reserved word never decodes to
-    /// [`Actor::Sid`].
+    /// Parse an [`Actor`] from its wire token.
     #[must_use]
     pub fn from_word(word: &str) -> Actor {
         match word {
@@ -647,44 +605,28 @@ impl Actor {
         }
     }
 
-    /// The owner class: the person at the window and an Owner client
-    /// (`ctl`). Which of them may lift another author's need is
-    /// [`Actor::overrides`].
+    /// Whether this actor belongs to the owner class (`Human` or `Ctl`).
     #[inline]
     #[must_use]
     pub const fn is_owner(&self) -> bool {
         matches!(self, Actor::Human | Actor::Ctl)
     }
 
-    /// A claim's TRUSTED author (design §7.3): the
-    /// harness or the owner class. Their newest verdict and label are kept
-    /// beside the newest of any author, so no other author displaces them,
-    /// and a label reaches `brief` and the clause only from one of them.
+    /// Whether this actor is trusted to author claims (`Harness`, `Human`, or `Ctl`).
     #[inline]
     #[must_use]
     pub const fn is_trusted(&self) -> bool {
         matches!(self, Actor::Harness | Actor::Human | Actor::Ctl)
     }
 
-    /// A PROVEN trusted author: one whose connection proves it distinct
-    /// from every process inside a session — the harness (an in-memory
-    /// token) and the person at the window. `ctl` is not one: the instance
-    /// token is every in-session client's, the supervised agent's included,
-    /// so the AI a harness judges writes as `ctl`. A proven author's newest
-    /// verdict and label are kept in a slot of their own, which no `ctl`
-    /// claim displaces, and only a proven author or the person lifts a need
-    /// one raised ([`Actor::overrides`]).
+    /// Whether this actor's connection proves it is outside any session (`Harness` or `Human`).
     #[inline]
     #[must_use]
     pub const fn is_proven(&self) -> bool {
         matches!(self, Actor::Harness | Actor::Human)
     }
 
-    /// Whether a `clear` from `self` lifts a need `raiser` raised, beside
-    /// the raiser's own (THE CLEAR RULE's authority, `fold::clear_lifts`):
-    /// the person lifts any; an Owner client (`ctl`) lifts any but a proven
-    /// author's ([`Actor::is_proven`]), so the agent a harness supervises
-    /// cannot lift the harness's need; no other author lifts another's.
+    /// Whether a `clear` from `self` can lift a need raised by `raiser`.
     #[inline]
     #[must_use]
     pub const fn overrides(&self, raiser: &Actor) -> bool {
@@ -696,13 +638,7 @@ impl Actor {
     }
 }
 
-// Word lists. Each is the closed vocabulary of a word-valued key.
-
-/// The approval box kinds: `aterm_phase::PromptKind::name()`'s words, and
-/// Bash with the read-only verdict `prompt_detail` writes (§3.3), and the
-/// words of kinds the reader no longer names, kept so an older log still
-/// decodes (`rate-nudge`, `model-pick`, `goal-resume`: Codex's boxes, whose
-/// reader was retired on 2026-10-16).
+/// Closed `box=` approval prompt kind vocabulary.
 pub const BOX_WORDS: &[&str] = &[
     "bash",
     "bash:read-only",
@@ -737,7 +673,7 @@ pub const BOX_WORDS: &[&str] = &[
     "other",
 ];
 
-/// The bare wall kinds: `aterm_phase::WallKind::name()`'s words.
+/// Closed bare wall-kind vocabulary.
 pub const WALL_WORDS: &[&str] = &[
     "usage-session",
     "usage-weekly",
@@ -750,14 +686,12 @@ pub const WALL_WORDS: &[&str] = &[
     "memory",
 ];
 
-/// Tool step classes (§3.3). The table mapping vendor tool names to them
-/// lives in the harness's transcript reader, never here.
+/// Closed `cls=` tool step class vocabulary.
 pub const CLS_WORDS: &[&str] = &[
     "shell", "edit", "write", "read", "search", "web", "agent", "plan", "mcp", "other",
 ];
 
-/// Every `out=` word: run, turn, step and session outcomes (§3.3; the
-/// session's are `ExitReason`'s tokens and `gone`).
+/// Closed `out=` outcome vocabulary.
 pub const OUT_WORDS: &[&str] = &[
     "ok",
     "fail",
@@ -791,8 +725,7 @@ pub const OUT_WORDS: &[&str] = &[
     "app-quit",
 ];
 
-/// Every need word (§3.3), `approval:<kind>` carrying the box kind without
-/// Bash's read-only verdict.
+/// Closed need vocabulary (`need` and `clear` marks).
 pub const NEED_WORDS: &[&str] = &[
     "approval:bash",
     "approval:edit",
@@ -840,9 +773,6 @@ pub const NEED_WORDS: &[&str] = &[
     "decision",
     "help",
     "unknown",
-    // Phase 6, appended: the printed need words
-    // (`aterm_types::needs::NeedWord`, `status needs=`) a `shown` mark names
-    // (`question` is above). No need shown is no `need=`, never a word.
     "frozen",
     "stopped",
     "stalled",
@@ -853,10 +783,8 @@ pub const NEED_WORDS: &[&str] = &[
     "approval",
 ];
 
-/// The `word=` vocabulary: the agent verdict words, `act` words, `verdict`
-/// words and need words a `need`/`clear` mark names.
+/// Closed `word=` vocabulary across agent verdicts, acts, and needs.
 pub const WORD_WORDS: &[&str] = &[
-    // agent verdict
     "busy",
     "prompt",
     "question",
@@ -874,7 +802,6 @@ pub const WORD_WORDS: &[&str] = &[
     "wall:overloaded",
     "wall:memory",
     "wall:unresponsive",
-    // act
     "approve",
     "deny",
     "answer",
@@ -883,11 +810,7 @@ pub const WORD_WORDS: &[&str] = &[
     "escalate",
     "interrupt",
     "dispatch",
-    // a self-supervising agent's landing (`aterm_agent::harness::acts::
-    // self_claim_act`: codex-alab's `landed@v1`, Autopilot Land), written only
-    // beside its `harness-act` row, never by `mark`
     "landed",
-    // verdict
     "on-track",
     "off-track",
     "blocked",
@@ -895,7 +818,6 @@ pub const WORD_WORDS: &[&str] = &[
     "failed",
     "needs-human",
     "unsure",
-    // needs a mark raises or clears
     "review",
     "decision",
     "help",
@@ -903,8 +825,6 @@ pub const WORD_WORDS: &[&str] = &[
     "failure",
     "unresponsive",
     "exited",
-    // story: the closed set `aterm ctl story <verb>` tells
-    // (`aterm_messages::presence::StoryVerb::TOLD_WORDS`; phase 3B)
     "approved",
     "dismissed",
     "reconnected",
@@ -913,13 +833,12 @@ pub const WORD_WORDS: &[&str] = &[
     "compacted",
     "warned",
     "chose",
-    // an inbox receipt's verdict (`aterm_types::fabric_grammar::VERDICTS`)
     "handled",
     "refused",
     "deferred",
 ];
 
-/// Why records were lost (`gap why=`).
+/// Closed `gap why=` loss-reason vocabulary.
 pub const WHY_WORDS: &[&str] = &[
     "handoff",
     "crash",
@@ -929,10 +848,6 @@ pub const WHY_WORDS: &[&str] = &[
     "unread",
     "dropped",
     "unknown",
-    // phase 5 (5C-1): what moved a worker's task (`task why=`), the closed
-    // `aterm-gui` task vocabulary, held by `task_record`'s tests (T16).
-    // `landed` is Autopilot Land's one `done` reason; `marker` and `done-check`
-    // stay so an older build's lines still read.
     "landed",
     "marker",
     "done-check",
@@ -942,35 +857,25 @@ pub const WHY_WORDS: &[&str] = &[
     "held",
     "turn",
     "moved",
-    // phase 6: why a person's `human` mark was written
-    // when it is not the ring's burst row: the first input after delivered
-    // mail (`mail`, the 5D-4 latch's mark), or the burst's own (`burst`).
     "mail",
     "burst",
-    // phase 6 (6F-6): why a post landed nowhere (`mail-landed why=`, the
-    // ring's `post-landed off=- reason=`): not carried across an update, or
-    // its offset on a bus log since replaced.
     "not-carried",
     "log-replaced",
 ];
 
-/// The input verbs an `input` mark names.
+/// Closed `input verb=` vocabulary.
 pub const VERB_WORDS: &[&str] = &["send", "key", "paste", "feed", "turn", "unknown"];
 
-/// What a control input says it means for the box it dismisses (`key`/`send
-/// act=`): [`crate::ActWord`]'s words, in its order.
+/// Closed `act=` control-input action vocabulary.
 pub const ACT_WORDS: &[&str] = &["approve", "deny", "answer"];
 
-/// Whose count an input mark's `dropped=` is when it is not the mark's
-/// author's own (`pool=`): the mark
-/// limiter's shared pool ([`crate::Owed::Shared`]).
+/// Closed `pool=` rate-limiter pool vocabulary.
 pub const POOL_WORDS: &[&str] = &["shared"];
 
-/// A mail's direction.
+/// Closed `mail dir=` direction vocabulary.
 pub const DIR_WORDS: &[&str] = &["in", "out", "unknown"];
 
-/// A mail's kind: every kind `deliver` accepts
-/// (`aterm_types::fabric_grammar::KINDS`, held by `vocab_mirror.rs`).
+/// Closed `mail kind=` vocabulary.
 pub const MAIL_KIND_WORDS: &[&str] = &[
     "task",
     "ask",
@@ -984,12 +889,12 @@ pub const MAIL_KIND_WORDS: &[&str] = &[
     "undeliverable",
 ];
 
-/// The phases a `status` mark names (the status classifier's words).
+/// Closed `status phase=` vocabulary.
 pub const PHASE_WORDS: &[&str] = &[
     "idle", "running", "waiting", "prompt", "exited", "unknown", "starting", "quiet",
 ];
 
-/// Shell-integration, progress, render and source states.
+/// Closed `state=` vocabulary for shell, progress, render, and source marks.
 pub const STATE_WORDS: &[&str] = &[
     "on",
     "off",
@@ -1000,27 +905,17 @@ pub const STATE_WORDS: &[&str] = &[
     "indeterminate",
     "none",
     "unknown",
-    // phase 3B: a degraded shell integration (`ShellIntegrationPosture`), and
-    // the resize ledger's render verdicts
     "degraded",
     "desync-risk",
     "healed",
     "unjudged",
-    // phase 5 (5C-1): a worker's task state (`task state=`), the closed
-    // `aterm-gui` task states, held by `task_record`'s tests (T16)
     "working",
     "done",
     "exited",
     "stalled",
-    // phase 5 (5J-2): the fabric link's states (`link state=` on the node
-    // log), `aterm_gui_fabric::fabric_state`'s words; `stalled` is above
     "connected",
     "disconnected",
     "absent",
-    // phase 6 (6F-2): a session's lifecycle state (`state state=`, the
-    // timeline's `state-change` row: `SessionState::as_str` and `closed`), and
-    // the program's own report (`program state=`, OSC 7501's words; `working`,
-    // `done` and `error` are above)
     "spawning",
     "alive",
     "closed",
@@ -1028,69 +923,51 @@ pub const STATE_WORDS: &[&str] = &[
     "blocked",
 ];
 
-/// A hold's origin (`advisory origin=`, `hold origin=`):
-/// the slots `aterm_gui_fabric::Holds` keeps, `person`, `remote`, `fleet`
-/// and `local`.
+/// Closed `origin=` hold-origin vocabulary.
 pub const ORIGIN_WORDS: &[&str] = &["person", "remote", "fleet", "local"];
 
-/// What a program's `blocked` report waits on (`program ask=`, OSC 7501's
-/// `kind=`): `kind=` is the mail kind's key.
+/// Closed `program ask=` blocked-reason vocabulary.
 pub const ASK_WORDS: &[&str] = &["permission", "question", "auth"];
 
-/// How a session's topic opt-ins moved (`topic change=`):
-/// the two moves `topic add` and `topic drop` make. Not `op=`: that is the
-/// record's own token in `log --json`.
+/// Closed `topic change=` vocabulary.
 pub const CHANGE_WORDS: &[&str] = &["add", "drop"];
 
-/// Whether a resize run's geometry came back (`render net=`):
-/// the resize ledger's `net=` words.
+/// Closed `render net=` geometry delta vocabulary.
 pub const NET_WORDS: &[&str] = &["zero", "changed"];
 
-/// The class of program a render epoch judged (`render class=`):
-/// `aterm-gui`'s `resize_epoch::ProgramClass` words.
+/// Closed `render class=` program-class vocabulary.
 pub const CLASS_WORDS: &[&str] = &["agent", "learned", "unknown"];
 
-/// How a shown need is shown (`shown sev=`):
-/// `aterm_types::needs::Severity`'s words. No need shown is no `sev=`.
+/// Closed `shown sev=` severity vocabulary.
 pub const SEV_WORDS: &[&str] = &["stuck", "decide"];
 
-/// Whose hold the person is shown (`shown held=`):
-/// `aterm_types::needs::HoldWord`'s words (`hold_by=`). No hold is no
-/// `held=`. Not `origin=`: that is a hold's slot, `fleet` among them.
+/// Closed `shown held=` hold-owner vocabulary.
 pub const HELD_WORDS: &[&str] = &["person", "remote", "local", "bridge"];
 
-/// What healed a render epoch (`render healed_by=`):
-/// `aterm-gui`'s `resize_epoch::EpochBy` words, an open epoch's `-` aside.
-/// Not `by=`: that is the record's actor.
+/// Closed `render healed_by=` vocabulary.
 pub const HEALED_BY_WORDS: &[&str] = &["app", "undo", "nudge"];
 
-/// Where a manual reset came from (`modes source=`):
-/// `aterm-gui`'s `manual_reset::ResetSource` words, the `reset` verb's and
-/// the menu's.
+/// Closed `modes source=` manual-reset source vocabulary.
 pub const SOURCE_WORDS: &[&str] = &["ctl", "menu"];
 
-/// How the previous run of this instance ended (`start prev_end=` on the
-/// node log, 5J): `aterm_update::recovery_ledger::EndClass`'s row tokens, a
-/// caught signal as `signal` with its number in `code=`, and `-` while the
-/// recovery ledger has not been read (a launch that never reads it, a plain
-/// headless or dev one, keeps `-`; a lab desk reads its private root's own).
+/// Closed `start prev_end=` previous-run exit classification vocabulary.
 pub const END_WORDS: &[&str] = &[
     "clean", "handoff", "killed", "signal", "panic", "running", "unknown", "none", "-",
 ];
 
-/// What a `cause=` names (`cause_k=`): mail by its offset, or a record.
+/// Closed `cause_k=` cause kind vocabulary.
 pub const CAUSE_WORDS: &[&str] = &["mail", "rec", "unknown"];
 
-/// How a duration was measured: `dur=wall` across an update.
+/// Closed `dur=` duration clock basis vocabulary.
 pub const DUR_WORDS: &[&str] = &["mono", "wall", "unknown"];
 
-/// The static word `word` names in `list`, or `None`.
+/// Look up `word` in static vocabulary `list`.
 #[must_use]
 pub fn lookup(list: &'static [&'static str], word: &str) -> Option<&'static str> {
     list.iter().copied().find(|w| *w == word)
 }
 
-/// The static word `word` names in `list`, or [`UNKNOWN`].
+/// Look up `word` in `list`, returning [`UNKNOWN`] when absent.
 #[must_use]
 pub fn lookup_or_unknown(list: &'static [&'static str], word: &str) -> &'static str {
     lookup(list, word).unwrap_or(UNKNOWN)

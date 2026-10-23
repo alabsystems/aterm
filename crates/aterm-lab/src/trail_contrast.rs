@@ -1,60 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `trail-contrast <png>`: the WCAG contrast of the cells of an aterm capture,
-//! as JSON. Every check of a cursor trail's legibility, caret or demo is
-//! measured with this probe and the frames [`crate::trail_gallery`] takes, so
-//! results compare across changes. The frame is decoded by the workspace's own
-//! PNG crate (`aterm_png`: every colour type and depth, interlaced or not).
-//!
-//! THE GRID. A cell's box is `origin + (col * cw, row * ch)`, sized `cw x ch`.
-//! It comes from `--origin X,Y --cell WxH`, or from a `dims` reply (`--dims
-//! FILE`): origin = (pad, head + pad_top), cell = (cell_w, cell_h). A reply
-//! with chrome rows, offsets or bands is refused, since the origin is then not
-//! known; pass `--origin` for such a frame.
-//!
-//! THE CELLS. `--find TEXT` measures each glyph of every occurrence of TEXT in
-//! the frame's screen text; `--cells ROW:COL[-COL]` and `--row ROW` name cells
-//! directly. With none of them, every non-blank glyph of the screen text is
-//! measured. The caret's own cell, and the `--newest N` glyph cells left of it
-//! on its row (default 3; a blank cell or a space ends the run), are always
-//! reported when the caret is known. A glyph's cells are counted with the
-//! terminal grid's own width table (`aterm_grapheme::char_width`).
-//!
-//! SIDECARS. `trail-gallery` writes, beside `<stem>.<frame>.png`:
-//! `<stem>.dims.txt` (the `dims` reply), `<stem>.<frame>.cursor.txt`
-//! (`cursor`), `<stem>.<frame>.text.txt` (`text`) and
-//! `<stem>.<frame>.clean.png` (`image clean`: the same frame with every cursor
-//! effect suppressed). They are read when present; `--dims`, `--text`,
-//! `--cursor`, `--clean` and `--caret` name other files or override them.
-//!
-//! THE MEASURE. With a clean twin, a glyph's ink is the median colour of the
-//! pixels that are glyph core in the clean frame (at least [`CORE_SHARE`] of
-//! the way from the clean ground to the clean glyph's extreme, in luminance),
-//! and its ground is the median colour of the pixels that are pure ground in
-//! the clean frame; both are read from the measured frame, so a halo or a
-//! ribbon under the glyph counts against it. `clean_contrast` is the same
-//! measure on the clean frame, the glyph's own legibility with no effect
-//! drawn. Without a twin, the ground is the cell's median colour and the ink
-//! its fourth most contrasting pixel (robust to three stray spark pixels);
-//! that `extreme` method is coarser and says so in `method`. A cell whose
-//! clean (or measured) extreme is under [`BLANK_BELOW`] against its ground
-//! holds no glyph: `blank`.
-//!
-//! THE CARET is the cursor cell's pixels that differ from the page colour (the
-//! frame's most common colour, or `--page RRGGBB`): their median colour, how
-//! much of the cell they cover, and that colour's contrast against the page.
-//! `diff_vs_clean` counts the pixels (any channel off by more than
-//! [`DIFF_DELTA`]) the effects changed outside the caret cell, and their
-//! bounding box.
-//!
-//! The report is the JSON of `tools/visual-judge/trail-contrast.py`, which
-//! this verb replaces, key for key: one line per key, one per measured cell.
-//!
-//! EXIT: 0; 1 when a threshold fails (`--min` for the selected cells,
-//! `--newest-min` for the glyphs left of the caret, `--caret-min` for the
-//! caret against the page), each failure named in `failures`; 2 on a usage,
-//! file or decoding error.
+//! `trail-contrast <png>`: the WCAG contrast of the cells of an aterm capture, as JSON.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -65,8 +12,7 @@ use crate::paths::from_caller;
 use crate::pyjson::{J, Style};
 use crate::{Fail, Res};
 
-/// A glyph's core: at least this share of the way from the clean ground to
-/// the clean glyph's extreme, in luminance.
+/// A glyph's core: at least this share of the way from the clean ground to the clean glyph's extreme, in luminance.
 pub const CORE_SHARE: f64 = 0.70;
 /// A cell whose extreme is under this ratio against its ground holds no glyph.
 pub const BLANK_BELOW: f64 = 1.5;
@@ -150,8 +96,7 @@ fn parse_hex(text: &str) -> Result<Rgb, String> {
     Ok([ch(0)?, ch(2)?, ch(4)?])
 }
 
-/// `x` rounded to `places` decimals as Python's `round` does: the correctly
-/// rounded decimal, read back.
+/// `x` rounded to `places` decimals as Python's `round` does: the correctly rounded decimal, read back.
 #[must_use]
 pub fn round_to(x: f64, places: usize) -> f64 {
     format!("{x:.places$}").parse().unwrap_or(x)
@@ -205,7 +150,7 @@ pub struct Image {
     px: Vec<Rgb>,
 }
 
-/// A pixel box: `[x0, x1) x [y0, y1)`.
+/// A pixel box: `x0, x1) x y0, y1)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PxBox {
     pub x0: i64,
@@ -222,7 +167,6 @@ impl PxBox {
 
 impl Image {
     /// Read and decode the PNG at `path`.
-    ///
     /// # Errors
     /// The file cannot be read, is not a PNG, or does not decode.
     pub fn read(path: &Path) -> Result<Image, String> {
@@ -232,7 +176,6 @@ impl Image {
     }
 
     /// Decode PNG `bytes` (named `path` in messages).
-    ///
     /// # Errors
     /// Not a PNG, or one `aterm_png` refuses.
     pub fn decode(path: &Path, bytes: &[u8]) -> Result<Image, String> {
@@ -260,7 +203,6 @@ impl Image {
     }
 
     /// A frame from its colours, row-major.
-    ///
     /// # Panics
     /// `px` does not hold `width * height` colours.
     #[cfg(test)]
@@ -342,10 +284,8 @@ impl Grid {
 }
 
 /// The grid a `dims` reply (`OK <rows> <cols> <px_w> <px_h> key=value…`) names.
-///
 /// # Errors
-/// Not a dims reply, a field missing, or chrome, offsets or bands that leave
-/// the origin unknown.
+/// Not a dims reply, a field missing, or chrome, offsets or bands that leave the origin unknown.
 pub fn grid_from_dims(text: &str) -> Result<Grid, String> {
     let tokens: Vec<&str> = text.split_whitespace().collect();
     let not_dims = || {
@@ -503,7 +443,6 @@ fn measure_cell(
     let Some(clean) = clean else {
         let bed = median(&pixels).unwrap_or_default();
         let mut ranked: Vec<(f64, Rgb)> = pixels.iter().map(|&p| (contrast(p, bed), p)).collect();
-        // Stable and descending, so equals keep their order (Python's `sorted(reverse=True)`).
         ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
         let ink = ranked[3.min(ranked.len() - 1)].1;
         let ratio = contrast(ink, bed);
@@ -535,7 +474,6 @@ fn measure_cell(
         }
     }
     let core_px = i64::try_from(ink.len()).unwrap_or(i64::MAX);
-    // The extreme pixel is core and the ground is the box's mode: neither set is empty.
     let (ink, bed) = (
         median(&ink).unwrap_or_default(),
         median(&bed).unwrap_or_default(),
@@ -561,7 +499,6 @@ fn measure_caret(frame: &Image, grid: &Grid, row: i64, col: i64, page: Rgb) -> J
         .copied()
         .filter(|&p| contrast(p, page) >= CARET_DIFF)
         .collect();
-    // A cell's pixel count is far below 2^52: the division is exact enough.
     let coverage = lit.len() as f64 / pixels.len().max(1) as f64;
     let mut out = J::obj([
         ("row", J::Int(row)),
@@ -587,8 +524,7 @@ fn measure_caret(frame: &Image, grid: &Grid, row: i64, col: i64, page: Rgb) -> J
     out
 }
 
-/// The pixels the effects changed (a channel off by more than [`DIFF_DELTA`]),
-/// and those of them outside the caret's box with their bounding box.
+/// The pixels the effects changed (a channel off by more than [`DIFF_DELTA`]), and those of them outside the caret's box with their bounding box.
 #[must_use]
 pub fn diff_vs_clean(frame: &Image, clean: &Image, caret: Option<PxBox>) -> J {
     let (mut total, mut outside) = (0i64, 0i64);
@@ -623,8 +559,7 @@ pub fn diff_vs_clean(frame: &Image, clean: &Image, caret: Option<PxBox>) -> J {
     ])
 }
 
-/// `<stem>.<frame>.png` -> `<stem>.<frame><suffix>` (`per_frame`), else
-/// `<stem><suffix>`; only when that file exists.
+/// `<stem>.<frame>.png` -> `<stem>.<frame><suffix>` (`per_frame`), else `<stem><suffix>`; only when that file exists.
 #[must_use]
 pub fn sidecar(png: &Path, suffix: &str, per_frame: bool) -> Option<PathBuf> {
     let name = png.file_name()?.to_str()?;
@@ -689,10 +624,8 @@ fn number<T: std::str::FromStr>(flag: &str, v: &str, kind: &str) -> Result<T, Fa
 }
 
 /// Read `trail-contrast`'s arguments.
-///
 /// # Errors
-/// A usage error (exit 2): an unknown option, a flag with no or a malformed
-/// value, no frame or more than one.
+/// A usage error (exit 2): an unknown option, a flag with no or a malformed value, no frame or more than one.
 pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
     let mut a = args.to_vec();
     let find = take_values(&mut a, "--find")?;
@@ -757,10 +690,8 @@ struct Target {
 }
 
 /// The report for `a`, and whether a threshold failed.
-///
 /// # Errors
-/// A file that cannot be read or decoded, a grid that does not fit the frame,
-/// or a selector the frame cannot answer.
+/// A file that cannot be read or decoded, a grid that does not fit the frame, or a selector the frame cannot answer.
 pub fn report(a: &Args) -> Result<J, String> {
     let png = PathBuf::from(from_caller(&a.png));
     let frame = Image::read(&png)?;
@@ -841,8 +772,6 @@ pub fn report(a: &Args) -> Result<J, String> {
         .iter()
         .map(|g| ((g.row, g.col), (g.ch, g.width)))
         .collect();
-    // The right halves of wide glyphs. A cell that is neither a glyph nor one of
-    // these is blank: the `text` reply trims each line's trailing spaces.
     let wide_tails: HashSet<(i64, i64)> = glyphs
         .iter()
         .filter(|g| g.width == 2)
@@ -861,7 +790,6 @@ pub fn report(a: &Args) -> Result<J, String> {
         match path {
             None => None,
             Some(p) => {
-                // `OK <row> <col> <visible> <shape>`
                 let reply = read_text(&p)?;
                 let words: Vec<&str> = reply.split_whitespace().collect();
                 if words.len() >= 3 && words[0] == "OK" {
@@ -1049,7 +977,6 @@ pub fn report(a: &Args) -> Result<J, String> {
         let want = usize::try_from(a.newest.max(0)).unwrap_or(0);
         while at >= 0 && newest.len() < want {
             if wide_tails.contains(&(row, at)) {
-                // The right half of a wide glyph: measure from its left cell.
                 at -= 1;
                 continue;
             }
@@ -1126,9 +1053,7 @@ fn compact(v: &J) -> String {
     })
 }
 
-/// The report as JSON with one line per key and one per measured cell, so it
-/// reads, diffs and greps: the report and its caret open up, cell lists put
-/// one cell on a line, and everything else is written compact.
+/// The report as JSON with one line per key and one per measured cell, so it reads, diffs and greps: the report and its caret open up, cell lists put one cell on a line, and everything else is written compact.
 #[must_use]
 pub fn render(v: &J, depth: usize) -> String {
     let indent = " ".repeat(depth + 1);
@@ -1158,7 +1083,6 @@ pub fn render(v: &J, depth: usize) -> String {
 }
 
 /// `trail-contrast`: print the report; exit 1 when a threshold failed.
-///
 /// # Errors
 /// A usage, file or decoding error (exit 2).
 pub fn cmd_trail_contrast(args: &[String]) -> Res {

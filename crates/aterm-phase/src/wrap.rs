@@ -1,52 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Rejoining single logical lines that Ink (`wrap-ansi`) wrapped across
-//! multiple terminal rows in narrow panes.
-//!
-//! Ink word-wraps lines onto continuation rows starting at the same text
-//! column as the first row (e.g. dialog titles, key-hint footers, option
-//! labels, usage-limit banners and countdowns, `⎿` notices, `⏺` paragraphs,
-//! status lines, and side-by-side survey option boxes).
-//!
-//! * [`continues`] / [`continues_exactly`] / [`lead`] test whether a row is
-//!   the wrapped continuation of the row above it given the available box
-//!   [`room`].
-//! * [`line_end`] and [`line_start`] walk forward or backward across
-//!   continuation rows; [`rejoined`] joins them with single spaces.
-//! * [`run_end`] bounds multi-span lines (such as shimmering status verbs)
-//!   that Ink breaks at span boundaries before a row is full.
-//! * [`rows_in`] counts how many rows `wrap-ansi` (`hard: true, trim: false`)
-//!   uses for a line at a given width.
-//! * [`rejoined_cells`] rejoins side-by-side flex boxes wrapped within their
-//!   own column ranges.
-//!
-//! ## Limits
-//!
-//! Geometry alone cannot distinguish a wrapped continuation from an
-//! independent line drawn at the same column immediately below a full row,
-//! nor can [`rejoined`] avoid inserting a space when a single word wider
-//! than the box was hard-broken across rows. Callers therefore bound what
-//! they extract using the text's grammar (e.g. `time_after`, `title_line`,
-//! `status_line_end`).
+//! Rejoining single logical lines that Ink (`wrap-ansi`) wrapped across multiple terminal rows in narrow panes.
 
 use crate::phase::leading_spaces;
 use crate::question::cells;
 
-/// Whether row `below` is the rest of a line Ink wrapped, the line's text on
-/// the row above it being `above` (trimmed), drawn from column `col` in a box
-/// `room` cells wide ([`room`]): `below` starts at `col`, both are words —
-/// no rule, frame or block glyph (U+2500–U+259F), so a composer's rule under
-/// a footer is never its wrap — and `above` is too full to take `below`'s
-/// first word, with two cells of slack, as the question dialog's measured
-/// labels wrap ([`crate::question`]).
+/// Whether row `below` is the rest of a line Ink wrapped, the line's text on the row above it being `above` (trimmed), drawn from column `col` in a box `room` cells wide ([`room`]): `below` starts at `col`, both are words — no rule, frame or block glyph (U+2500–U+259F), so a composer's rule under a footer is never its wrap — and `above` is too full to take `below`'s first word, with two cells of slack, as the question dialog's measured labels wrap ([`crate::question`]).
 pub(crate) fn continues(above: &str, col: usize, below: &str, room: usize) -> bool {
     wraps_with(above, 0, col, below, room, 2)
 }
 
-/// [`continues`] with zero slack: tests whether `above` (plus `lead` leading
-/// space cells from [`lead`]) had no room in `room` cells for `below`'s
-/// first word and its preceding space.
+/// [`continues`] with zero slack: tests whether `above` (plus `lead` leading space cells from [`lead`]) had no room in `room` cells for `below`'s first word and its preceding space.
 pub(crate) fn continues_exactly(
     above: &str,
     lead: usize,
@@ -57,14 +22,7 @@ pub(crate) fn continues_exactly(
     wraps_with(above, lead, col, below, room, 0)
 }
 
-/// Leading space cells `wrap-ansi` (`trim: false, hard: true`) consumed on a
-/// row before its drawn text: `1` when the row above (`above` cells
-/// including its own lead) filled or exceeded `room`, else `0`.
-///
-/// When a row fills `room` exactly, `wrap-ansi` places the inter-word space
-/// at the start of the next row, and Ink's renderer (`Vb`) strips that
-/// leading space before drawing at the line's column — so the space is not
-/// drawn but still reduces the row's effective capacity by 1 cell.
+/// Leading space cells `wrap-ansi` (`trim: false, hard: true`) consumed on a row before its drawn text: `1` when the row above (`above` cells including its own lead) filled or exceeded `room`, else `0`.
 pub(crate) fn lead(above: usize, room: usize) -> usize {
     usize::from(above >= room)
 }
@@ -93,18 +51,12 @@ fn wraps_with(
     lead + cells(above) + 1 + word + slack > room
 }
 
-/// The room a line drawn from column `col` of a pane `width` cells wide has
-/// in a box as wide as the pane less `col` on each side: a footer's, a
-/// banner's, a `⎿` notice's (whose box ends at the pane's edge: the rule
-/// reads such a row full a little early).
+/// The room a line drawn from column `col` of a pane `width` cells wide has in a box as wide as the pane less `col` on each side: a footer's, a banner's, a `⎿` notice's (whose box ends at the pane's edge: the rule reads such a row full a little early).
 pub(crate) fn room(col: usize, width: usize) -> usize {
     width.saturating_sub(2 * col)
 }
 
-/// The last row of the line row `first` opens, its text there `head`
-/// (trimmed) from column `col`, in a pane `width` cells wide ([`room`]): each
-/// row after it, short of row `until`, that [`continues`] the row above it.
-/// `first` itself when none does.
+/// The last row of the line row `first` opens, its text there `head` (trimmed) from column `col`, in a pane `width` cells wide ([`room`]): each row after it, short of row `until`, that [`continues`] the row above it.
 pub(crate) fn line_end(
     rows: &[String],
     first: usize,
@@ -123,10 +75,7 @@ pub(crate) fn line_end(
     end
 }
 
-/// Walk backward from `last` across rows that [`continues`] joins at
-/// `last`'s [`text_column`], stopping at the row that opens the paragraph or
-/// list item (a bullet/marker prefix before `text_column`) or where
-/// [`continues`] ceases to hold.
+/// Walk backward from `last` across rows that [`continues`] joins at `last`'s [`text_column`], stopping at the row that opens the paragraph or list item (a bullet/marker prefix before `text_column`) or where [`continues`] ceases to hold.
 #[must_use]
 pub fn line_start(rows: &[String], last: usize, width: usize) -> usize {
     let Some(row) = rows.get(last) else {
@@ -184,10 +133,7 @@ fn text_column(row: &str) -> usize {
     lead + mark.chars().count() + 1 + leading_spaces(after)
 }
 
-/// Last row of a multi-span line (such as a shimmering status verb) that Ink
-/// may break at span boundaries before a row is full: walks non-blank rows
-/// after `first` (up to `until`) that start at `col` and contain no box/rule
-/// glyphs.
+/// Last row of a multi-span line (such as a shimmering status verb) that Ink may break at span boundaries before a row is full: walks non-blank rows after `first` (up to `until`) that start at `col` and contain no box/rule glyphs.
 pub(crate) fn run_end(rows: &[String], first: usize, col: usize, until: usize) -> usize {
     let until = until.min(rows.len());
     let drawn = |t: &str| t.chars().any(|c| ('\u{2500}'..='\u{259F}').contains(&c));
@@ -202,9 +148,7 @@ pub(crate) fn run_end(rows: &[String], first: usize, col: usize, until: usize) -
     end
 }
 
-/// Count the rows `wrap-ansi` (`hard: true, trim: false`) uses to wrap
-/// `line` into `room` cells, accounting for the leading space cell consumed
-/// after an exactly-full row and hard breaks on words wider than `room`.
+/// Count the rows `wrap-ansi` (`hard: true, trim: false`) uses to wrap `line` into `room` cells, accounting for the leading space cell consumed after an exactly-full row and hard breaks on words wider than `room`.
 pub(crate) fn rows_in(line: &str, room: usize) -> usize {
     let room = room.max(1);
     let (mut rows, mut used) = (1, 0);
@@ -238,9 +182,7 @@ pub(crate) fn rows_in(line: &str, room: usize) -> usize {
     rows
 }
 
-/// Rows `run`, one line Ink wrapped, as that line: the first row's indent,
-/// then each row's text, joined with one space (Ink's word wrap breaks at a
-/// space and draws none at either end of a row).
+/// Rows `run`, one line Ink wrapped, as that line: the first row's indent, then each row's text, joined with one space (Ink's word wrap breaks at a space and draws none at either end of a row).
 pub(crate) fn rejoined(run: &[String]) -> String {
     let mut out = " ".repeat(leading_spaces(&run[0]));
     for (k, r) in run.iter().enumerate() {
@@ -252,19 +194,13 @@ pub(crate) fn rejoined(run: &[String]) -> String {
     out
 }
 
-/// Rejoin a side-by-side flex row of boxes (`starts[k]..starts[k+1]`, last
-/// to `width`) whose text wrapped within each box. Joins wrapped rows with a
-/// space, or without a space when the row above filled its box width
-/// (hard-broken word). Returns `None` if any continuation row has text left
-/// of `starts[0]` or indented past a box's start column.
+/// Rejoin a side-by-side flex row of boxes (`starts[k]..starts[k+1]`, last to `width`) whose text wrapped within each box.
 pub(crate) fn rejoined_cells(
     run: &[String],
     starts: &[usize],
     width: usize,
 ) -> Option<Vec<String>> {
     let (&first, rest) = starts.split_first()?;
-    // Starts are strictly increasing. Clamp the final end to its own start
-    // when the pane is narrower, keeping every box width nonnegative.
     let last_start = *rest.last().unwrap_or(&first);
     let ends: Vec<usize> = rest
         .iter()
@@ -285,9 +221,6 @@ pub(crate) fn rejoined_cells(
             if text.is_empty() {
                 continue;
             }
-            // A box's own row starts at its column; the first row may hold a
-            // box's text that ran into the next box (`1: Bad2:`), never one
-            // under it.
             if k > 0 && leading_spaces(text) > 0 {
                 return None;
             }
@@ -326,11 +259,8 @@ mod tests {
         assert_eq!(rows_in(overloaded, 24), 8);
         assert_eq!(rows_in(at_34, 70), 2);
         assert_eq!(rows_in(overloaded, 70), 3);
-        // The exactly full row: `to` would fit in the 16 cells after
-        // `10:51am · esc` but for the space wrap-ansi keeps at the row's start.
         assert_eq!(rows_in("automatically at 10:51am · esc to", 16), 3);
         assert_eq!(rows_in("automatically 10:51am · esc to", 16), 2);
-        // One word, and nothing.
         assert_eq!(rows_in("e-limit-options", 16), 1);
         assert_eq!(rows_in("", 16), 1);
     }
@@ -360,7 +290,6 @@ mod tests {
                     .to_vec()
             )
         );
-        // One row is its boxes as drawn.
         assert_eq!(
             rejoined_cells(&at_34[..1], &[2, 10, 18, 26], 34),
             Some(
@@ -369,10 +298,6 @@ mod tests {
                     .to_vec()
             )
         );
-        // A degenerate screen whose last box key sits PAST a short pane rule
-        // (an adversarial child: keys at 2,8,14,20 under a width-10 rule) must
-        // not underflow the box-local width `end - starts[b]`; the last box
-        // reads empty and nothing panics.
         assert_eq!(
             rejoined_cells(&at_26, &[2, 8, 14, 20], 10),
             Some(
@@ -381,7 +306,6 @@ mod tests {
                     .to_vec()
             )
         );
-        // NEGATIVE CONTROLS.
         let inside = rows(&[
             "  1: Bad  2: Fine 3: Good 0:",
             "                           Dismiss",

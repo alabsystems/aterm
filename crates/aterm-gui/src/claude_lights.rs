@@ -4564,6 +4564,7 @@ mod tests {
     }
 
     /// A panicking reader folds nothing in (the lights keep what they showed; a cycle in
+    /// flight takes no step) and a toggle's own reading is refused, so nothing is pressed.
     #[test]
     fn a_reader_panic_folds_nothing_in_and_types_nothing() {
         let now = Instant::now();
@@ -4607,6 +4608,7 @@ mod tests {
     }
 
     /// THE LIGHT, DEVIATIONS ONLY: at rest — bypass or auto — no light is
+    /// drawn, and with no harness host the block is EMPTY.
     #[test]
     fn only_deviations_are_drawn_and_the_block_keeps_what_it_saw() {
         let now = Instant::now();
@@ -4673,6 +4675,10 @@ mod tests {
     }
 
     /// THE AUTOPILOT CHIP SAYS ITS VIEW (design §2.3): `∞` alone in the
+    /// footer's accent, `⤓ land` amber (the auto pill's hue), `○ off` and,
+    /// with the master switch off, `⊘ off` dim — a word-less chip with no
+    /// trailing space — each titled as the design's table says, short to
+    /// what it names.
     #[test]
     fn the_autopilot_chip_says_its_view_in_its_ink() {
         let now = Instant::now();
@@ -4766,6 +4772,13 @@ mod tests {
     }
 
     /// THE TITLE'S INK (owner, 2026-10-19: "make the hover text for the
+    /// autopilot button a bit easier to read (lighter)"): on each signature
+    /// theme's own ink and ground, every cell of a chip's title — Autopilot's
+    /// hovered whole, short and leaner forms, and a light's refusal — is laid
+    /// in [`title_ink`], which reads at least WCAG AA's 4.5:1 on the ground,
+    /// above the footer facts' values (Claude's dark rule gray, rgb 136,
+    /// lifted a third toward the ink: on a light theme the darker, so the
+    /// stricter, of Claude's grays) and below the conversation's text.
     #[test]
     fn a_chips_title_reads_above_the_facts_and_below_the_text() {
         use crate::chrome_band::contrast;
@@ -4834,6 +4847,9 @@ mod tests {
     }
 
     /// THE TEAM CHIP (owner surfaces §5, S9): drawn right of the light for a
+    /// worker, a manager or the person's hold, harness host or none; a rule
+    /// short of room gives up the light, then Team, Autopilot last — one
+    /// order, every chip a narrower rule draws one a wider drew.
     #[test]
     fn the_team_chip_is_drawn_for_a_team_and_given_up_before_autopilot() {
         let now = Instant::now();
@@ -4893,6 +4909,10 @@ mod tests {
     }
 
     /// THE TEAM CHIP PROMISES ONLY WHAT ITS PRESS DOES (§5): a face whose
+    /// press acts ([`TeamFace::act`]) titles that act after what it is — a
+    /// manager's opens the Overview at it; a face whose press does nothing,
+    /// a worker whose manager is not here, titles what it is and no more
+    /// (its whole title is its short one).
     #[test]
     fn a_team_chip_whose_press_does_nothing_promises_no_act() {
         let now = Instant::now();
@@ -4932,6 +4952,8 @@ mod tests {
     }
 
     /// A RULE SHORT OF ROOM gives up the keyboard's reveal first, then the
+    /// light, and Autopilot — the mark that says the session is wrapped —
+    /// last, and nothing where not even `∞` fits.
     #[test]
     fn a_narrow_rule_gives_up_the_reveal_the_light_then_autopilot() {
         let now = Instant::now();
@@ -5035,6 +5057,7 @@ mod tests {
     }
 
     /// The keyboard selection reveals the light at rest and marks it: in
+    /// bypass, the chip names the mode.
     #[test]
     fn the_keyboard_selection_reveals_the_light_at_rest() {
         let now = Instant::now();
@@ -5074,7 +5097,7 @@ mod tests {
     }
 }
 
-/// The lights' gestures, end to end, in process. The control socket cannot drive them
+/// The lights' gestures, end to end, in process.
 #[cfg(all(test, unix))]
 mod gesture_tests {
     use std::io::{ErrorKind, Read};
@@ -5130,6 +5153,7 @@ mod gesture_tests {
     pub(super) const PGID: i32 = 4242;
 
     /// Close the private PTY observer for real, so the next write through the session's sink
+    /// fails.
     fn hang_up(app: &App, session: u64, reader: UnixStream) {
         let sink = app.pool.get(session).expect("session").ctx.sink.clone();
         drop(reader);
@@ -5151,6 +5175,7 @@ mod gesture_tests {
     }
 
     /// A headless App whose one session writes its PTY input to a private
+    /// socket (the `pointer_license_tests` fixture's observer).
     pub(super) fn app() -> (App, WindowId, u64, UnixStream) {
         let (reader, writer) = UnixStream::pair().expect("private PTY observer");
         reader.set_nonblocking(true).expect("nonblocking observer");
@@ -5161,6 +5186,8 @@ mod gesture_tests {
     }
 
     /// The window's harness host in a test, which the harness's chips are drawn for: one that
+    /// supervises nothing (`Acts` inert, no sessions), shut down when the guard drops, a
+    /// failing test's included.
     pub(super) struct Hosted(crate::harness_host::HostHandle);
 
     impl Drop for Hosted {
@@ -5170,6 +5197,7 @@ mod gesture_tests {
     }
 
     /// Give `app` a harness host ([`Hosted`]): its posture reads `On`, the
+    /// table's default Autopilot (cruise).
     pub(super) fn host(app: &mut App) -> Hosted {
         let host = crate::harness_host::HostHandle::for_supervised_test(
             Vec::new(),
@@ -5180,6 +5208,7 @@ mod gesture_tests {
     }
 
     /// `ctrl+shift+tab`, as a person presses it (macOS: elsewhere the chord
+    /// is aterm's `prev_tab`).
     #[cfg(target_os = "macos")]
     pub(super) fn chord(app: &mut App, wid: WindowId) {
         use aterm_window::keyboard::{KeyCode, ModifiersState, NamedKey};
@@ -5190,6 +5219,7 @@ mod gesture_tests {
     }
 
     /// [`app`] in a 120-column pane: room for a light's whole title beside the whole facts;
+    /// a narrower rule gives a hover's or selection's title up first (`footer::fit_rule`).
     pub(super) fn wide_app() -> (App, WindowId, u64, UnixStream) {
         let (mut app, wid, session, reader) = app();
         assert!(app.apply_term_resize(wid, 24, 120));
@@ -5197,6 +5227,9 @@ mod gesture_tests {
     }
 
     /// [`wide_app`] at 160 columns: room for Autopilot's whole hovered title
+    /// — v1's words and the menu's line (`· right-click: more`, §9.3.2) —
+    /// beside the whole facts, which at 120 columns take its room, so the
+    /// hover there shows the short form.
     pub(super) fn wider_app() -> (App, WindowId, u64, UnixStream) {
         let (mut app, wid, session, reader) = app();
         assert!(app.apply_term_resize(wid, 24, 160));
@@ -5214,11 +5247,13 @@ mod gesture_tests {
         "\u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main \u{2500}";
 
     /// The facts the resolver publishes for the session's Claude Code
+    /// process; without them no footer, and no light, is painted.
     pub(super) fn publish_facts(app: &App, session: u64) {
         publish_facts_at(app, session, "~/aterm");
     }
 
     /// [`publish_facts`] with the working directory `path` as the footer
+    /// shows it (`~/aterm`; a directory outside HOME whole).
     pub(super) fn publish_facts_at(app: &App, session: u64, path: &str) {
         let entry = app.pool.get(session).expect("session");
         let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -5242,6 +5277,9 @@ mod gesture_tests {
     }
 
     /// Claude Code's bottom block on the 24-row engine (80 columns unless a test widened
+    /// it, [`wide_app`]): a transcript row, the composer between its two pane-wide rules
+    /// with an empty draft and the cursor at its caret (row 21, column 2), and `mode` on
+    /// the last row, with bracketed paste on, as Claude Code always has it.
     pub(super) fn draw_claude(app: &App, session: u64, mode: &str) {
         let rule = "\u{2500}".repeat(cols(app, session));
         let screen = format!(
@@ -5252,16 +5290,19 @@ mod gesture_tests {
     }
 
     /// The frame row of the pane's footer: the composer's bottom rule, which
+    /// the facts and the lights are written into.
     pub(super) fn footer_row(app: &App, wid: WindowId) -> usize {
         app.windows[&wid].input_scratch.cells.len() - usize::from(app.windows[&wid].rows) + 22
     }
 
     /// The frame row of Claude's own mode row (the pane's last row), which
+    /// the footer never writes.
     fn mode_row(app: &App, wid: WindowId) -> usize {
         footer_row(app, wid) + 1
     }
 
     /// Claude answers a press: the mode row reads `mode`, the cursor back at
+    /// the caret.
     fn redraw_mode_row(app: &App, session: u64, mode: &str) {
         feed(
             app,
@@ -5271,6 +5312,7 @@ mod gesture_tests {
     }
 
     /// One frame through the capture route's splices (the terminal arm of
+    /// `App::render_image`): extract, the strip, then the footer.
     pub(super) fn frame(app: &mut App, wid: WindowId) {
         let prepared = app.prepare_terminal_capture_grid_with_cursor_fx_and_plan_outcome(
             wid,
@@ -5290,6 +5332,7 @@ mod gesture_tests {
     }
 
     /// Where the painter put `chip` this frame: (frame row, frame column) of
+    /// its first cell.
     pub(super) fn hit(app: &App, wid: WindowId, chip: impl Into<Chip>) -> (usize, usize) {
         let chip = chip.into();
         let h = app.windows[&wid]
@@ -5321,6 +5364,8 @@ mod gesture_tests {
     }
 
     /// The window pixel at the centre of frame cell `(row, col)` — the
+    /// inverse of `App::frame_cell_at`, which the hit test reads, and checked
+    /// against it so a geometry slip fails here rather than as a missed click.
     pub(super) fn px_of(app: &App, wid: WindowId, (row, col): (usize, usize)) -> (f64, f64) {
         let (cw, ch) = app.win_cell_size(wid);
         let (ox, oy) = app.frame_origin(wid);
@@ -5335,6 +5380,7 @@ mod gesture_tests {
     }
 
     /// What the session's PTY received: up to a minute for `want` bytes, and
+    /// every byte already written past them.
     pub(super) fn pty(reader: &mut UnixStream, want: usize) -> Vec<u8> {
         let mut got = Vec::new();
         let mut buf = [0u8; 256];
@@ -5356,6 +5402,9 @@ mod gesture_tests {
     }
 
     /// THE CHIP NEVER TOUCHES OTHER INK (main's 35d8c4ca7, a real render on
+    /// 2.1.284, 2026-09-28): in auto mode Claude right-aligns `◐ medium ·
+    /// /effort` on its mode row, and chips then drawn on that row beside it
+    /// glued onto it.
     #[test]
     fn the_effort_tail_stays_on_claudes_row_and_every_chip_stands_clear_in_the_rule() {
         use aterm_phase::prompt::fixtures::{FOOTER_AUTO_EFFORT_HINT_MEASURED, screen};
@@ -5416,6 +5465,8 @@ mod gesture_tests {
     }
 
     /// A click on the mode light in manual mode sends exactly one shift+tab; the light shows
+    /// `◐` until Claude answers, each non-expected answer is pressed through from the wake
+    /// (never the frame), and bypass resolves it.
     #[test]
     fn a_click_on_the_mode_light_presses_forward_to_bypass_and_reads_each_answer_back() {
         for tracking in [false, true] {
@@ -5532,6 +5583,7 @@ mod gesture_tests {
     }
 
     /// Auto is as expected as bypass: in auto mode no mode chip is drawn at all, and a
+    /// toggle of the mode light (the keyboard's Return on a revealed chip) presses nothing.
     #[test]
     fn auto_mode_draws_no_mode_chip_and_is_never_left() {
         let (mut app, wid, session, mut reader) = app();
@@ -5557,6 +5609,14 @@ mod gesture_tests {
     }
 
     /// AT REST NO LIGHT IS DRAWN (owner, 2026-09-27: "I don't want to show
+    /// the state of parameters that I always expect to be on") — ONLY THE
+    /// HARNESS'S MARK (owner, 2026-10-15: "I need some visual indicator that
+    /// the claude code session is being wrapped"): bypass or auto, a host —
+    /// the rule carries `∞` (cruise, the table's default, in the footer's
+    /// accent) at its left and the facts at its right, nothing else to hit,
+    /// the rule known to be on the glass (the keyboard's way to the lights);
+    /// and Claude's own row under it, its pill and hint, is exactly as Claude
+    /// drew it (owner, 2026-09-28).
     #[test]
     fn at_rest_the_rule_carries_the_facts_and_the_harness_chips_alone() {
         for hosted in [true, false] {
@@ -5611,6 +5671,11 @@ mod gesture_tests {
     }
 
     /// THE KEYBOARD REACHES EVERY CHIP AT REST (macOS): with no light drawn,
+    /// `ctrl+shift+tab` walks the row in its order — Autopilot, always
+    /// revealable where a host draws it, then the known light, the expected
+    /// mode `⏵⏵ bypass`, revealed — each selection painted on the glass and
+    /// typing nothing; Return on the expected mode presses nothing; the
+    /// reveal goes with the selection, and Autopilot stays.
     #[cfg(target_os = "macos")]
     #[test]
     fn ctrl_shift_tab_reveals_the_lights_at_rest() {
@@ -5668,6 +5733,8 @@ mod gesture_tests {
     }
 
     /// The keyboard route (macOS): the chord selects the focused pane's light and types
+    /// nothing (again, it goes on to the facts the glass shows, and round to the light);
+    /// Return toggles it with one shift+tab, not the Return, and lets go.
     #[cfg(target_os = "macos")]
     #[test]
     fn ctrl_shift_tab_selects_a_light_and_return_toggles_it() {
@@ -5775,6 +5842,7 @@ mod gesture_tests {
     }
 
     /// In the default 80-column pane a pending toggle's transient title gives way first
+    /// (`footer::fit_rule`), never pushing the lights or the facts out; its chip does not move.
     #[test]
     fn a_pending_mode_toggle_keeps_its_lights_in_an_80_column_pane() {
         let (mut app, wid, session, mut reader) = app();
@@ -5810,6 +5878,8 @@ mod gesture_tests {
     }
 
     /// In the default 80-column pane a stop's title too long to show whole comes as the
+    /// reason alone beside the chip, taking the branch's and path's room, never the model's
+    /// or effort's (`footer::fit_rule`); at 120 columns it comes whole beside the facts.
     #[test]
     fn a_stop_too_long_to_title_in_full_says_the_reason_alone() {
         for cols in [80_u16, 120] {
@@ -5859,6 +5929,8 @@ mod gesture_tests {
     }
 
     /// A light selected with ctrl+shift+tab is let go by any mouse press, so clicking to
+    /// another pane and back leaves no selection armed to take the next Return: Return
+    /// submits Claude's prompt.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_mouse_press_lets_a_keyboard_selection_go() {
@@ -5932,6 +6004,8 @@ mod gesture_tests {
     }
 
     /// Check the drive just done (`since` taken before it) gave the press its own full
+    /// `SETTLE_MS`, then push the deadline a minute out, so a slow machine tests the answer
+    /// and not the deadline ([`past_deadline`] covers that).
     fn press_not_due(app: &mut App, wid: WindowId, session: u64, since: Instant) {
         let p = app
             .windows
@@ -5948,6 +6022,8 @@ mod gesture_tests {
     }
 
     /// The return runs without frames (a background tab, an occluded window): each press is
+    /// decided from the engine by the wake alone, manual → accept edits → plan → bypass, and
+    /// only the click stamps the person clock.
     #[test]
     fn a_mode_return_finishes_from_the_engine_with_no_frames() {
         let (mut app, wid, session, mut reader) = app();
@@ -5995,6 +6071,9 @@ mod gesture_tests {
     }
 
     /// The mode return's model state, read off the genuine App: the pill, the turn in
+    /// flight and the covering box from the engine; the phase, the start, the press count,
+    /// whether the last press is unanswered and whether a stop is named from the session's
+    /// lights.
     pub(super) fn project_mode_return(
         app: &App,
         wid: WindowId,
@@ -6067,6 +6146,8 @@ mod gesture_tests {
     }
 
     /// Fire `action` on the model, then check the App's projected state is a transition the
+    /// model allows, and that `historical` (a buggy post-state, where given) is one it does
+    /// not: the negative control, so a pass is never vacuous.
     fn check_mode_return_transition(
         app: &App,
         wid: WindowId,
@@ -6109,6 +6190,7 @@ mod gesture_tests {
     }
 
     /// Tier-1: the genuine click, drain and expiry against `claude_mode_return_model`, from
+    /// manual and from don't ask to bypass.
     #[test]
     fn the_mode_return_conforms_to_its_model() {
         const DONT_ASK: &str = "  \u{23F5}\u{23F5} don't ask on (shift+tab to cycle)";
@@ -6169,6 +6251,7 @@ mod gesture_tests {
     }
 
     /// Tier-1: Claude answered before a stalled loop next drained the footer, but that
+    /// press's deadline had elapsed.
     #[test]
     fn an_overdue_mode_answer_sends_no_late_follow_up_key() {
         let (mut app, wid, session, mut reader) = app();
@@ -6218,6 +6301,7 @@ mod gesture_tests {
     const BUSY_ACCEPT_ROW: &str = "  \u{23F5}\u{23F5} accept edits on \u{00B7} esc to interrupt";
 
     /// Tier-1, the stops: every way a started return ends short of bypass or auto names its
+    /// mode.
     #[test]
     fn the_mode_returns_stops_conform_to_its_model_and_are_named() {
         let model = aterm_models_gui::claude_mode_return_model();
@@ -6349,6 +6433,7 @@ mod gesture_tests {
     }
 
     /// Claude Code's bottom block drawn `cols` wide — [`draw_claude`] for a
+    /// window resized narrower.
     #[cfg(target_os = "macos")]
     fn draw_claude_cols(app: &App, session: u64, mode: &str, cols: usize) {
         let rule = "\u{2500}".repeat(cols);
@@ -6360,6 +6445,8 @@ mod gesture_tests {
     }
 
     /// NO SELECTION NOBODY CAN SEE (the review of 2026-09-27): the keyboard
+    /// selects only a chip the pane has ROOM for, the reveal giving way
+    /// first.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_keyboard_never_selects_a_chip_the_pane_has_no_room_for() {
@@ -6474,6 +6561,9 @@ mod gesture_tests {
     }
 
     /// The Autopilot chip, clicked (design §2.3): cruise → land → off → cruise, each click
+    /// writing the session's own word in-process (the word `meta set autopilot` writes) and
+    /// the next frame's chip saying it, read back with no `◐` left: `∞` in the footer's
+    /// accent, `⤓ land` amber, `○ off` dim.
     #[test]
     fn a_click_on_autopilot_cycles_its_word_and_types_nothing() {
         let (mut app, wid, session, mut reader) = wider_app();
@@ -6546,6 +6636,7 @@ mod gesture_tests {
     }
 
     /// Quick clicks count: the window's own write reads back at once, so a second click
+    /// before any frame has drawn the first steps again, and Cruise → Land → Off gets Off.
     #[test]
     fn two_quick_clicks_on_the_autopilot_chip_each_step() {
         let (mut app, wid, session, mut reader) = app();
@@ -6583,6 +6674,10 @@ mod gesture_tests {
     }
 
     /// THE BLANK BETWEEN TWO CHIPS IS THEIRS: in
+    /// `∞ ⏸ plan` a click on the blank cell between two chips, in a pane
+    /// that tracks the mouse, sends NOTHING to the PTY — no press or release
+    /// report — writes no word, opens no Settings and toggles no light, and
+    /// the pointer there hovers no chip.
     #[test]
     fn a_click_between_two_chips_does_nothing_and_reaches_no_program() {
         use crate::native_settings::SettingsRoute;
@@ -6627,6 +6722,9 @@ mod gesture_tests {
     }
 
     /// The hand only where a press acts: over a chip the pointer is a hand; over the blank
+    /// between two (the chips' own glass, where a press does nothing) the arrow, never the
+    /// hand nor the grid's I-beam, on the motion path and on the re-resolve a modifier asks
+    /// for (`App::update_hover_cursor`) alike.
     #[test]
     fn the_pointer_is_a_hand_over_a_chip_and_the_arrow_between_two() {
         let (mut app, wid, session, mut reader) = app();
@@ -6661,6 +6759,10 @@ mod gesture_tests {
     }
 
     /// THE OPEN MENU OWNS THE POINTER (the cross-track review of
+    /// 2026-10-19): with the Autopilot menu up, a modifier's re-resolve
+    /// (`App::update_hover_cursor`) finds no chip under a pointer that
+    /// rests on one beside the card — the menu's motion arm owns the
+    /// cursor, as the tab menu's does.
     #[test]
     fn a_modifier_under_an_open_menu_lights_no_chip() {
         let (mut app, wid, session, _reader) = app();
@@ -6693,6 +6795,9 @@ mod gesture_tests {
     }
 
     /// Every button on the chips' glass is theirs: a middle or right press on a chip, or on
+    /// the blank between two, reaches no program (no press or release report in a pane that
+    /// tracks the mouse, no paste under `right_click = "copy_paste"` with nothing tracking)
+    /// and acts on no chip: a left press is the chips' click.
     #[test]
     fn a_middle_or_right_press_on_the_chips_reaches_no_program() {
         use crate::native_settings::SettingsRoute;
@@ -6756,6 +6861,12 @@ mod gesture_tests {
     }
 
     /// A CLICK ON THE CHIPS IS A CLICK AWAY FROM AN OPEN RENAME (the review
+    /// of 2026-10-15): with the in-grid strip's rename field open on
+    /// Claude's tab and a name typed into it, a click on `⊘ off` (Autopilot
+    /// under the master switch off, which turns the switch on and opens
+    /// nothing) commits the name — as View ▸ Coding Agent Harness… and a
+    /// click on the grid do — so no key meant for something else lands in
+    /// the tab's name.
     #[test]
     fn a_click_on_the_chips_commits_an_open_in_grid_rename() {
         use crate::app_rename::RenameSurface;
@@ -6846,6 +6957,24 @@ mod gesture_tests {
     }
 
     /// THE HOVERED TITLE OFFERS THE MENU WHERE IT FITS, and WORDS
+    /// WHEREVER THEY FIT, AND THE CLICKS AFTER THEM (design §9.2.1, §9.3.2)
+    /// :
+    /// walked over every pane
+    /// width from 60 to 170 columns, Claude Code's rule under the pointer on
+    /// the Autopilot chip shows the WHOLE title (v1's words, then `·
+    /// right-click: more`) beside the whole facts, else V1'S WORDS
+    /// (`autopilot: cruise — <Cruise's sentence> · click: land`, the leaner
+    /// form without the menu's line; the sentence from
+    /// `autopilot::MODE_WORDS`), else THE PHRASE WITH BOTH
+    /// CLICKS (`autopilot: cruise · click: land · right-click: more`), else
+    /// THE PHRASE WITH THE CLICK (`autopilot: cruise · click: land`), else
+    /// the SHORT form (`autopilot: cruise`), else no title — in that order as
+    /// the pane narrows, never back; v1's words stand from exactly the 20
+    /// columns fewer that the menu's line takes, so every pane where v1's
+    /// whole title fit still shows it, and the clicks from the cells the
+    /// explanation gave up; the facts are whole wherever a title is drawn (a
+    /// transient title gives way first); and the chip stays the menu's
+    /// target at every width it is drawn.
     #[test]
     fn the_hovered_title_offers_the_menu_where_it_fits_and_is_short_where_not() {
         let v1 = &AutopilotView::Cruise.title();
@@ -6964,6 +7093,8 @@ mod gesture_tests {
     }
 
     /// The record the harness switch's refused write posted for `key`
+    /// (`message_reporters::harness_switch_not_saved`): a headless test's
+    /// config lane refuses every write at once, so this is the write made.
     fn switch_write_said(app: &App, key: &str) -> Option<String> {
         let want = format!("harness.switch-save.{key}");
         app.messages
@@ -6974,6 +7105,14 @@ mod gesture_tests {
     }
 
     /// THE MASTER SWITCH OFF (`[harness] enabled = false`, design §2.1): the
+    /// chip says `⊘ off`, dim, titled with where it is switched, and a click
+    /// turns the master switch on instead of cycling, as the top rule's `on`
+    /// does (owner, 2026-10-20: "remove the harness settings button in the
+    /// UX"; review of k2/harnesson): `harness.enabled = true` is
+    /// written on the config lane, the switch says `◐ turning on` until the
+    /// write lands or is refused (here, at once: it was armed and let go),
+    /// no word is written (a session ON never lifts a global off), nothing
+    /// reaches the PTY, and nothing opens.
     #[test]
     fn under_the_master_switch_off_the_autopilot_chip_turns_it_on() {
         use crate::native_settings::SettingsRoute;
@@ -7053,6 +7192,12 @@ mod gesture_tests {
     }
 
     /// THE OFF CHIP TURNS THE AGENT'S SWITCH ON (§10.2.1; owner, 2026-10-20:
+    /// "remove the harness settings button in the UX"; review of
+    /// k2/harnesson): under Claude Code's own switch off, a click
+    /// on `⊘ off` writes `harness.claude.enabled = true` — not the master's,
+    /// no word — and lands no page: with Settings ▸ Harness open in another
+    /// tab at its top, the page stays there and Claude's tab stays in front
+    /// (on main the click raised the page and landed it on SUPERVISION).
     #[test]
     fn under_the_agents_switch_off_the_autopilot_chip_turns_it_on() {
         use crate::harness_screen::HarnessFocus;
@@ -7122,6 +7267,9 @@ mod gesture_tests {
     }
 
     /// AN OFF SESSION STILL SAYS SO (design §2.3): Off is the harness's
+    /// hands off, not its chip gone — `○ off`, dim, drawn at rest whether
+    /// the session's own word says it or the table's default does
+    /// (`[harness] autopilot = "off"`).
     #[test]
     fn an_off_session_still_draws_its_chip() {
         for own in [true, false] {
@@ -7154,6 +7302,11 @@ mod gesture_tests {
     }
 
     /// A NARROW RULE GIVES THE CHIPS UP BEFORE THE MODEL (design §2.3: "a
+    /// narrow rule gives them up after every fact but the model"; no row is
+    /// added): narrowing the pane column by column from 80, the path and
+    /// the branch go while every chip stays — no width shows either without
+    /// them — and the chips then go down the ladder (`Keep`), never back up
+    /// it while the model is drawn, the model still drawn where no chip is.
     #[test]
     fn a_narrow_rule_gives_the_chips_up_before_the_model() {
         /// What the rule showed at one width.
@@ -7171,6 +7324,8 @@ mod gesture_tests {
             text: String,
         }
         /// The chips a narrowing rule draws, rung by rung (`Keep::LADDER`
+        /// past the reveal), the light where a pill shows: every chip, the
+        /// light given up, then Autopilot.
         const LADDER: [(bool, bool); 3] = [(true, true), (true, false), (false, false)];
         const PLAN_SHORT: &str = "  \u{23F8} plan mode on";
         const ACCEPT_SHORT: &str = "  \u{23F5}\u{23F5} accept edits on";
@@ -7278,6 +7433,9 @@ mod gesture_tests {
     }
 
     /// RETURN ACTS ON A SELECTED HARNESS CHIP (macOS): `ctrl+shift+tab`
+    /// selects Autopilot, and Return steps its word — cruise to land — with
+    /// NOTHING sent to the PTY (the Return is the chip's, not Claude's) and
+    /// no person stamped; the selection lets go.
     #[cfg(target_os = "macos")]
     #[test]
     fn return_on_a_selected_autopilot_chip_cycles_it() {

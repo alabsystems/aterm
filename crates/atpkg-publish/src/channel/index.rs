@@ -246,6 +246,8 @@ pub fn parse_yank(s: &str, accept_eq: bool) -> Result<Yank> {
 }
 
 /// Why a new yank's version names nothing its program's client can hold, if it does: a
+/// version (or a vendor build id) binds only a vendor-direct program, in that program's
+/// own grammar (`VendorSpec::revision_versions`), which is all `Policy::is_yanked` matches.
 fn version_mismatch(y: &Yank) -> Option<String> {
     use atpkg::vendor_direct::{Version, is_vendor_build, spec};
     let (p, version) = match y {
@@ -282,6 +284,9 @@ fn vendor_pin(p: &str) -> Error {
 }
 
 /// Admit `--pin <p>=<b>` of an ALab-built agent program `def` (its
+/// [`programs::alab_package`] row): `b` is inside the client's ALab store window, and a pin
+/// that switches the block from another repo (the live index's legacy row names `aterm`)
+/// names a NEW build above the head's pin, which is that other repo's build.
 fn admit_alab_pin(
     def: &programs::ProgramDef,
     b: Build,
@@ -1133,7 +1138,7 @@ pub fn publish_with(ctx: &Ctx, request: &IndexRequest, log: &mut Log) -> Result<
     })
 }
 
-/// Read the verified baseline without touching the output. The caller owns `head_dir`
+/// Read the verified baseline without touching the output.
 fn read_baseline(
     ctx: &Ctx,
     request: &IndexRequest,
@@ -1192,7 +1197,7 @@ fn read_baseline(
     })
 }
 
-/// Emit and self-verify the quad while the caller holds the output lock. A prior
+/// Emit and self-verify the quad while the caller holds the output lock.
 fn write_quad(
     ctx: &Ctx,
     plan: &Plan,
@@ -1238,6 +1243,7 @@ fn write_quad(
 }
 
 /// Make the packs public before the index, and keep the output locked through the
+/// compare-and-swap and the final anonymous download-host confirmation.
 fn publish_quad(
     ctx: &Ctx,
     request: &IndexRequest,
@@ -1304,6 +1310,7 @@ fn publish_quad(
 }
 
 /// The release notes every index release carries: what it is, first, because these tags
+/// interleave with the app's.
 fn notes(plan: &Plan) -> String {
     format!(
         "Machine-readable package index for the aterm toolchain — not an app release. For \
@@ -1438,6 +1445,7 @@ fn darwin_targets(pkg: &atpkg::PkgManifest) -> BTreeSet<String> {
 }
 
 /// A manifest pair read where a client reads it (the public owner's download host), else
+/// from the staging owner, and verified under `quad`.
 fn read_manifest(
     ctx: &Ctx,
     quad: &VerifiedQuad,
@@ -1479,6 +1487,7 @@ fn read_manifest(
 }
 
 /// A pin may not silently drop a darwin target: clients on a target the previous pin
+/// served would stay on that build with nothing said.
 fn triple_gate(
     ctx: &Ctx,
     plan: &Plan,

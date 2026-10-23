@@ -1,16 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A lane's durable state: the index and pins it last processed (the downgrade floors; the
-//! pins stamped with the targets they were resolved for), pack attempts and the BLOCKED
-//! latch, the run-started stamp (a lock held past 12 h is a stalled run, said and
-//! notified), and the single-instance lock — the kernel's (`aterm_update_core::FileLock`),
-//! so a killed run leaves nothing to reclaim and a busy lock means another run covers this
-//! one (exit 0).
-//!
-//! The paths are the shell lanes', so existing floors carry over: the Apple lane under
-//! `<state>/alab/`, the Linux lane at `<state>/` itself. Seen-state is written only after
-//! a run decided.
+//! A lane's durable state.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -47,8 +38,7 @@ pub struct LaneState {
     pub index_seen: PathBuf,
     /// The pins floor.
     pub pins_seen: PathBuf,
-    /// The single-instance lock (shared with `lane install`, which holds it while it
-    /// swaps the snapshot).
+    /// The single-instance lock.
     pub lock: PathBuf,
     /// The lane's log.
     pub log: PathBuf,
@@ -100,9 +90,7 @@ impl LaneState {
     }
 
     /// Create the lane's directory.
-    ///
     /// # Errors
-    ///
     /// A could-not-run naming it.
     pub fn ensure(&self) -> Result<()> {
         std::fs::create_dir_all(&self.dir)
@@ -110,9 +98,7 @@ impl LaneState {
     }
 
     /// Take the single-instance lock without waiting.
-    ///
     /// # Errors
-    ///
     /// A could-not-run when the lock file cannot be opened.
     pub fn try_lock(&self) -> Result<Lock> {
         if let Some(parent) = self.lock.parent() {
@@ -131,14 +117,12 @@ impl LaneState {
         let _ = std::fs::write(&self.started, format!("{now_unix}\n"));
     }
 
-    /// The run that held the lock ended: a lock held next by `lane install` or a person's
-    /// dry run is never read as this run, stalled.
+    /// The run that held the lock ended.
     pub fn clear_started(&self) {
         let _ = std::fs::remove_file(&self.started);
     }
 
-    /// When a busy lock's holder started, if that is longer ago than
-    /// [`STALLED_AFTER_SECS`].
+    /// When a busy lock's holder started, if that is longer ago than [`STALLED_AFTER_SECS`].
     #[must_use]
     pub fn stalled_since(&self, now_unix: i64) -> Option<i64> {
         let started = i64::try_from(read_number(&self.started).ok().flatten()?).ok()?;
@@ -146,7 +130,6 @@ impl LaneState {
     }
 
     /// The index this lane last processed (0 when it never ran).
-    ///
     /// # Errors
     ///
     /// A refusal when the record is not a number — a floor that cannot be read is never
@@ -156,9 +139,7 @@ impl LaneState {
     }
 
     /// Refuse an index head below the one this lane last processed.
-    ///
     /// # Errors
-    ///
     /// The downgrade refusal.
     pub fn check_index(&self, head: u64) -> Result<()> {
         let seen = self.index_seen()?;
@@ -173,14 +154,8 @@ impl LaneState {
         Ok(())
     }
 
-    /// Hold `pins` (resolved for `targets`) to the pins this lane last saw: a pin that fell
-    /// refuses the run; a program that left the channel is warned about. A record resolved
-    /// for other targets skips the gate for this run, with a warning, and this run's
-    /// [`LaneState::record`] re-stamps it. An unstamped Apple-lane record (the shell lane's)
-    /// reads as stamped for the Apple targets.
-    ///
+    /// Hold `pins` (resolved for `targets`) to the pins this lane last saw.
     /// # Errors
-    ///
     /// The pin-downgrade refusal; a refusal for an unreadable record.
     pub fn check_pins(
         &self,
@@ -238,11 +213,8 @@ impl LaneState {
         Ok(())
     }
 
-    /// Record the floors this run leaves: the index it processed (or published) and the
-    /// pins, stamped with the targets they were resolved for.
-    ///
+    /// Record the floors this run leaves.
     /// # Errors
-    ///
     /// A could-not-run naming the file.
     pub fn record(
         &self,

@@ -1,23 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **Two nodes on one broker**: what A3 proved on one node, proved again
-//! with the two peers in DIFFERENT `aterm` processes with different node
-//! identities, on one guarded broker's Unix socket ([`Fleet`]). Nothing
-//! here is a mock — the endpoints are shipped `aterm`s, the bridges are
-//! shipped `aterm link serve` children they launched over inherited
-//! socketpairs, and the broker enforces capabilities on every attach.
-//!
-//! What these need is two NODES, which one [`harness::World`] cannot be: a
-//! bare `@s-<sid>` resolved from the roster and pinned, a second claimant
-//! for a pinned sid (§6.1's `ERR ambiguous`), and an observer that
-//! advertises sessions it does not host (§11.2). The fabric is one machine's
-//! bus, and these are two aterms on one machine.
-//!
-//! ## No sleeps as synchronisation
-//!
-//! Every wait is `until <observable state>`: a record on the log, a field in a
-//! reply, a process's own output. The bound is a HANG DETECTOR.
+//! Two-node fabric integration tests on a shared broker ([`Fleet`], [`harness::World`]).
 
 #![cfg(unix)]
 
@@ -29,10 +13,6 @@ use harness::{DEADLINE, FLEET, Fleet, until, until_within};
 
 /// Wait for a last-value row to carry `what`, over the fleet's one shared read
 /// connection ([`Fleet::read`]).
-///
-/// `budget` is stated by the caller, because the two classes of wait here are
-/// not the same: most rows are published by the arrival that caused them, and a
-/// few by the bridge's periodic backstop (see [`harness::until_within`]).
 fn row_says(fleet: &Fleet, subject: &str, what: &str, budget: Duration) {
     until_within(budget, &format!("{subject} to say {what}"), || {
         fleet.row(subject).filter(|x| x.contains(what)).map(|_| ())
@@ -40,15 +20,6 @@ fn row_says(fleet: &Fleet, subject: &str, what: &str, budget: Duration) {
 }
 
 /// **The whole A3 flow, across two nodes — and `ls` sees both.**
-///
-/// A's session posts to B's session by its bare `@s-<sid>`; A's bridge has
-/// never heard of that sid, so it resolves it the way §6.1 says — from the
-/// roster, pinned on first sight — publishes under its own bound cap, and B's
-/// bridge picks it off its own durable group and delivers it. B answers `re=`
-/// the offset A was told, and A's inbox resolves that back to A's own post id.
-///
-/// The offsets are the broker's, so the correlation id nobody can forge is the
-/// same one across two nodes as it was across two sessions.
 #[test]
 fn a_post_crosses_two_nodes_and_ls_sees_both() {
     let mut fleet = Fleet::boot("cross");
@@ -60,13 +31,6 @@ fn a_post_crosses_two_nodes_and_ls_sees_both() {
     let (sid_b, _) = b.session();
     assert_ne!(a.node, b.node, "two nodes, two identities");
 
-    // `ls` FIRST, before any traffic: the roster is presence, not history.
-    // Both nodes' sessions must be listed by ONE `Last` round trip from a
-    // process that hosts nothing (§7). §7'S ROW IS `<node> <host> <sid> …`, so
-    // the node and the session are the FIRST and THIRD columns with the host
-    // between them — a session row has no `host=` of its own and prints `-`
-    // there (`cli.rs`'s module header says which columns have no writer yet
-    // and why).
     let names = |out: &str, node: &str, sid: &str| {
         out.lines().any(|l| {
             let c: Vec<&str> = l.split_whitespace().collect();
@@ -83,7 +47,6 @@ fn a_post_crosses_two_nodes_and_ls_sees_both() {
             "ls lost a node's own presence row:\n{listing}"
         );
     }
-    // §7's column set, not one of `ls`'s own.
     for column in [
         "state=",
         "inc=",
@@ -98,8 +61,6 @@ fn a_post_crosses_two_nodes_and_ls_sees_both() {
     ] {
         assert!(listing.contains(column), "ls dropped {column}:\n{listing}");
     }
-    // A session row carries its live generation (`gen=` is a known body field, not
-    // an unknown token).
     for sid in [&sid_a, &sid_b] {
         let row = listing
             .lines()
@@ -115,7 +76,6 @@ fn a_post_crosses_two_nodes_and_ls_sees_both() {
         );
     }
 
-    // The post: `--wait` answers the broker offset the record landed at.
     let reply = a.verb(&format!(
         "@{sid_a} post to=@{sid_b} kind=ask --wait A5 hello"
     ));
@@ -143,7 +103,6 @@ fn a_post_crosses_two_nodes_and_ls_sees_both() {
     assert!(row.contains("trust=agent"), "{row}");
     assert!(row.contains(&format!("off={off}")), "{row}");
 
-    // The answer, back the other way, correlated by the offset A was told.
     let id: u64 = row
         .split_whitespace()
         .nth(1)
@@ -166,14 +125,6 @@ fn a_post_crosses_two_nodes_and_ls_sees_both() {
     );
     assert!(id > 0);
 
-    // AND A SECOND BARE POST. The first one's walk asked A's bridge for its
-    // live presence view (`aterm_link::presence_view`), and this one is routed
-    // through it if it is up — one read of what landed since — or by the walk
-    // if it is not. Nothing out here can tell which: the claim is only that
-    // the route is the same either way. That the view goes live under a node's
-    // own ring on a guarded broker, and that its confirming read passes the
-    // guard, is proved where the view can be seen: aterm-link's
-    // `the_presence_view_goes_live_under_a_nodes_ring_on_a_guarded_broker`.
     let again = a.verb(&format!(
         "@{sid_a} post to=@{sid_b} kind=note --wait A5 again"
     ));
@@ -196,13 +147,6 @@ fn a_post_crosses_two_nodes_and_ls_sees_both() {
 
 /// Two nodes advertising one sid: `post` answers `ERR ambiguous` and delivers
 /// nothing.
-///
-/// §6.1: a node's cap covers its whole `pub/<n>/` subtree, so a rogue node can
-/// publish a presence row for a sid it does not host, and pinning stops that from
-/// becoming a route into the rogue's read lane. Sids are minted by their hosting
-/// instance, so the rogue is staged as the design says it arises: a third node id
-/// with its own minted cap publishes a presence row for B's session. A's bridge pins
-/// `sid → B` on the first post; the second claimant then contests the pinned sid.
 #[test]
 fn two_nodes_advertising_one_sid_make_post_answer_err_ambiguous() {
     let mut fleet = Fleet::boot("ambig");
@@ -213,13 +157,9 @@ fn two_nodes_advertising_one_sid_make_post_answer_err_ambiguous() {
     let (sid_a, _) = a.session();
     let (sid_b, _) = b.session();
 
-    // Node readiness precedes publication of its session roster. Bare-SID
-    // routing needs B's session advertisement, so wait for that observable
-    // before submitting a post that must not be retried after it lands.
     let presence = format!("/f/{FLEET}/pub/{}/{sid_b}/presence", b.node);
     row_says(&fleet, &presence, "state=live", DEADLINE);
 
-    // One good post first, pinning `sid_b → B`.
     let first = a.verb(&format!(
         "@{sid_a} post to=@{sid_b} kind=note --wait pinning"
     ));
@@ -228,15 +168,11 @@ fn two_nodes_advertising_one_sid_make_post_answer_err_ambiguous() {
         let pins = std::fs::read_to_string(a.state.join("pins")).ok()?;
         pins.contains(&format!("{sid_b} {}", b.node)).then_some(())
     });
-    // Synchronise on the delivery, not the publish: `post --wait` answers once the
-    // record is on the log, and B's delivery is a separate hop.
     let delivered_before = until("the pinning post to land at B", || {
         let rows = b.inbox(&sid_b);
         (!rows.is_empty()).then_some(rows.len())
     });
 
-    // The rogue: a node id with no bridge, holding a real minted cap over its own
-    // subtree, publishing a presence row for a session it does not host.
     let rogue = "n-00000000deadbeef".to_string();
     let cap_path = fleet.cap_file("rogue", &[format!("rw,p={rogue}:/f/{FLEET}/pub/{rogue}/>")]);
     let caps = aterm_link::bridge::read_cap_file(cap_path.to_string_lossy().as_ref())
@@ -260,7 +196,6 @@ fn two_nodes_advertising_one_sid_make_post_answer_err_ambiguous() {
         )
         .expect("the rogue publishes its claim");
 
-    // The second post: the bridge sees two claimants for a pinned sid and refuses.
     let second = a.verb(&format!(
         "@{sid_a} post to=@{sid_b} kind=note --wait contested"
     ));
@@ -270,8 +205,6 @@ fn two_nodes_advertising_one_sid_make_post_answer_err_ambiguous() {
         second.header(),
         a.log_tail()
     );
-    // The `ev` record is published after the endpoint's retirement that wakes
-    // `post --wait`, so wait on it.
     until("the refusal to reach the node's own digest", || {
         a.ev(&fleet)
             .iter()
@@ -279,7 +212,6 @@ fn two_nodes_advertising_one_sid_make_post_answer_err_ambiguous() {
             .then_some(())
     });
 
-    // Nothing was delivered, to the rogue's lane or to B's.
     assert_eq!(
         b.inbox(&sid_b).len(),
         delivered_before,
@@ -297,18 +229,6 @@ fn two_nodes_advertising_one_sid_make_post_answer_err_ambiguous() {
 }
 
 /// Observer mode delivers nothing, and never makes a session ambiguous.
-///
-/// A hand-started `aterm link serve --sock … --token-file …` holds an ordinary
-/// Owner token, so it is not the bridge: §11.2 gives it "presence and `ev` only,
-/// no delivery, no hold".
-///
-/// The second half is the interaction that needs two nodes. An observer
-/// publishes presence rows for sessions it WATCHES and does not host. §6.1
-/// routes a bare `@s-<sid>` only when exactly one node advertises it.
-/// Unmarked, opening a read-only observer would therefore make every session
-/// it could see ambiguous across the bus — a working fabric broken by a tool
-/// that writes nothing. The rows carry `observer=1` and the resolver skips
-/// them, so this test posts across the nodes WITH an observer running.
 #[test]
 fn an_observer_delivers_nothing_and_never_makes_a_session_ambiguous() {
     let mut fleet = Fleet::boot("obs");
@@ -319,7 +239,6 @@ fn an_observer_delivers_nothing_and_never_makes_a_session_ambiguous() {
     let (sid_a, _) = a.session();
     let (sid_b, _) = b.session();
 
-    // The observer is its own node: its own id, its own caps, its own state dir.
     let watcher = "n-0000000000005ee5".to_string();
     let state = fleet.tmp.join("watch");
     std::fs::create_dir_all(&state).expect("observer state dir");
@@ -330,8 +249,6 @@ fn an_observer_delivers_nothing_and_never_makes_a_session_ambiguous() {
     let log = fleet.tmp.join("watch.log");
     let out = std::fs::File::create(&log).expect("observer log");
     let err = out.try_clone().expect("observer log clone");
-    // `spawnfd`'s: the observer holds its stdio and nothing else of this
-    // process, not another test thread's pipe for as long as it serves.
     let mut observer = aterm_uds::spawnfd::command(harness::aterm_to_launch());
     let child = harness::scratch_spawnfd(&mut observer, &fleet.tmp)
         .args(["link", "serve", "--fleet", FLEET, "--broker", &fleet.sock])
@@ -350,8 +267,6 @@ fn an_observer_delivers_nothing_and_never_makes_a_session_ambiguous() {
         .stderr(err)
         .spawn()
         .expect("hand-start an observer");
-    // Killed on every exit path, panics included: nothing here is supervised,
-    // so a leaked observer would outlive the test and keep publishing.
     struct Reaper(aterm_uds::spawnfd::Child);
     impl Drop for Reaper {
         fn drop(&mut self) {
@@ -361,14 +276,12 @@ fn an_observer_delivers_nothing_and_never_makes_a_session_ambiguous() {
     }
     let _reaper = Reaper(child);
 
-    // It announces itself.
     until("the observer to announce itself", || {
         std::fs::read_to_string(&log)
             .ok()?
             .contains("OBSERVER MODE")
             .then_some(())
     });
-    // It publishes presence — and marks the sessions it does not host.
     let observer_row = format!("/f/{FLEET}/pub/{watcher}/{sid_b}/presence");
     row_says(&fleet, &observer_row, "observer=1", DEADLINE);
     let listing = fleet.ls();
@@ -382,7 +295,6 @@ fn an_observer_delivers_nothing_and_never_makes_a_session_ambiguous() {
         "ls must show the observer for what it is:\n{listing}"
     );
 
-    // It delivers nothing: a message on its own lane is recorded undeliverable.
     let mut god = fleet.god();
     let lane = format!("/f/{FLEET}/in/{watcher}/{sid_b}/h-andrew/note");
     god.publish(7_300, 1, &lane, b"v=1 t=1 text=hello")
@@ -400,8 +312,6 @@ fn an_observer_delivers_nothing_and_never_makes_a_session_ambiguous() {
         b.inbox(&sid_b)
     );
 
-    // AND THE BUS STILL ROUTES. The observer advertises B's session under its
-    // own node id; if that counted, this post would be `ERR ambiguous`.
     let reply = a.verb(&format!(
         "@{sid_a} post to=@{sid_b} kind=note --wait through"
     ));

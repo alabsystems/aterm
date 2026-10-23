@@ -34,6 +34,7 @@ impl ClockReading {
 }
 
 /// Whether one retained splice accounts for the whole monotonic-row advance of
+/// a [`Terminal::process_at`] batch.
 #[inline]
 const fn splice_accounts_for_batch_row_advance(before: u64, after: u64, inserted: u64) -> bool {
     match after.checked_sub(before) {
@@ -235,6 +236,7 @@ impl Terminal {
     }
 
     /// RIS side effects the handler cannot reach, run after the parser and
+    /// before `post_process`.
     #[inline]
     fn finish_ris_batch(&mut self) {
         self.secure_keyboard_entry = false;
@@ -444,7 +446,7 @@ impl Terminal {
     }
 }
 
-/// Exhaustive destructure of every `Terminal` field: a compile-time guard. A new field fails to
+/// Exhaustive destructure of every `Terminal` field: a compile-time guard.
 const fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
     let Terminal {
         grid: _,
@@ -524,6 +526,7 @@ mod tests {
     use std::time::Duration;
 
     /// The RIS clear of the parked slot (`finish_ris_batch`), pinned one batch before any
+    /// restore.
     #[test]
     fn ris_empties_the_parked_selection_slot_in_the_batch_that_resets() {
         use crate::selection::{SelectionSide, SelectionType};
@@ -554,6 +557,9 @@ mod tests {
     }
 
     /// The same batch from the main screen, where the RIS clear of the live slot
+    /// matters: `\x1bc\x1b[?1049h` is an ordinary enter at `post_process`, so the
+    /// park would take the pre-RIS live selection, and the reset's `All` on the
+    /// main grid is not drained by a batch that ends on alt.
     #[test]
     fn ris_then_enter_from_main_parks_nothing() {
         use crate::selection::{SelectionSide, SelectionType};
@@ -581,6 +587,7 @@ mod tests {
     }
 
     /// RIS followed by bytes the PTY read cut mid-sequence: the tail survives
+    /// into the next `process` call.
     fn ris_then_split_tail(profiling: bool, first: &[u8], second: &[u8]) -> Terminal {
         let mut t = Terminal::new(24, 80);
         t.transient.pipeline_timestamps.profiling_enabled = profiling;
@@ -647,6 +654,8 @@ mod tests {
     }
 
     /// Negative control for piecewise selection recovery: the retained splice
+    /// must explain the entire counter advance, so one unreported ordinary
+    /// scroll rejects the projection (and trips the debug assertion).
     #[test]
     fn selection_splice_must_account_for_the_entire_batch_row_advance() {
         let before = 40;
@@ -673,6 +682,8 @@ mod tests {
     }
 
     /// A full-screen scroll is one uniform row of motion whatever history does:
+    /// none retained (zero capacity), history saturated (eviction keeps the
+    /// count flat), or the alt screen (no history at all).
     #[test]
     fn content_scroll_state_tracks_uniform_scroll_independent_of_history() {
         for (case, ring, setup) in [
@@ -770,6 +781,9 @@ mod tests {
     }
 
     /// The host-coordinate epoch still bumps on every alt switch spelling: the
+    /// switch sites call `invalidate_host_coordinates`, which keeps
+    /// `coordinates_invalidated` (the `ContentScrollState::invalidation_epoch`
+    /// contract) without `SelectionDamage::All`.
     #[test]
     fn every_alt_screen_switch_advances_the_host_coordinate_epoch_exactly_once() {
         let mut term = TerminalBuilder::new()
@@ -800,6 +814,9 @@ mod tests {
     }
 
     /// An erase rewrites cells in place and moves nothing, so it invalidates no host-cached grid
+    /// coordinate (`moves_coordinates` in `damage_selection_visible_rows_ext`): a prompt
+    /// redraw's bare `ESC[J` must not bump `invalidation_epoch`, on which consumers discard
+    /// coordinate-bound state.
     #[test]
     fn an_erase_rewrites_cells_in_place_and_invalidates_no_host_coordinate() {
         for spelling in [
@@ -864,6 +881,10 @@ mod tests {
     }
 
     /// ED 3 (the `clear` command's leading `ESC[3J`) evicts history and moves no live
+    /// coordinate: `erase_scrollback` keeps the visible rows as the new ring, so
+    /// `visible_to_absolute(i)` names the same row before and after and only
+    /// `oldest_absolute_row()` rises (renumbering history is the Kitty unscroll's
+    /// `history_renumber_epoch`).
     #[test]
     fn discarding_scrollback_evicts_history_and_moves_no_live_coordinate() {
         use crate::selection::{SelectionSide, SelectionType};
@@ -1016,6 +1037,11 @@ mod tests {
     }
 
     /// A Codex Enter (`ESC[?2026h ESC[12;1H ESC[J` then `ESC[12;57r ESC[12;1H
+    /// (ESC M)x5 ESC[r ESC[1;16r ESC[11;1H \r\n`) on a 57x151 terminal is one
+    /// explained epoch step whose single band is the 0-based region `[11..=56]`
+    /// moved down five rows: the reverse indices compose, the ED is inert, and the
+    /// trailing LF starts above the `[0..=15]` region's bottom so it scrolls
+    /// nothing.
     #[test]
     fn a_codex_enter_batch_is_one_composed_band_batch() {
         let mut term = TerminalBuilder::new()
@@ -1054,6 +1080,9 @@ mod tests {
     }
 
     /// A Codex streamed line with the viewport at the bottom (`ESC[1;52r ESC[52;1H
+    /// \r\n`) is the top-anchored archival scroll: one explained epoch step whose
+    /// band is `[0..=51]` moved up one row while footer rows 52..=56 stay, and one
+    /// line enters history.
     #[test]
     fn a_codex_phase_b_line_is_an_explained_top_anchored_band() {
         let mut term = TerminalBuilder::new()
@@ -1086,6 +1115,8 @@ mod tests {
     }
 
     /// Every coordinate move the band record cannot describe still bumps the
+    /// epoch and is not counted as a band batch: a margined (DECLRMM) SU, RIS, an
+    /// alt-screen switch.
     #[test]
     fn a_poisoned_or_mixed_batch_advances_the_epoch_without_a_band_batch() {
         let mut term = TerminalBuilder::new()
@@ -1129,6 +1160,8 @@ mod tests {
     }
 
     /// While the user is scrolled back, live output (e.g. `tail -f`) does not
+    /// yank the viewport: display_offset is re-pinned by the lines entering
+    /// scrollback so the same content stays in view.
     #[test]
     fn scrolled_back_viewport_pins_during_live_output() {
         let mut term = TerminalBuilder::new()
@@ -1173,6 +1206,8 @@ mod tests {
     }
 
     /// The close counter alone cannot authorize a close+immediate-reopen
+    /// present: once the new episode has accepted output, the grid holds a prefix
+    /// of the next frame.
     #[test]
     fn sync_open_dirty_tracks_the_current_episode_only() {
         let clock = super::ClockReading::now();
@@ -1215,6 +1250,7 @@ mod tests {
     }
 
     /// Every parser action family that can commit presented state feeds the
+    /// conservative dirty bit.
     #[test]
     fn sync_open_dirty_covers_parser_action_families() {
         let clock = super::ClockReading::now();
@@ -1241,6 +1277,8 @@ mod tests {
     }
 
     /// The timeout force-clear ends the mode so a crashed app cannot freeze the screen, but the
+    /// partial frame is still on the grid: `sync_frame_unfinished` stays set until the
+    /// program's own `?2026l`, DECSTR or RIS.
     #[test]
     fn sync_frame_unfinished_is_the_programs_account_and_survives_the_timeout() {
         let mut term = Terminal::new(24, 80);
@@ -1292,6 +1330,9 @@ mod tests {
     }
 
     /// A program that dies mid-frame leaves its bracket open by its own
+    /// account, and the shell's prompt after it ends that frame: on the main
+    /// screen once the timeout cleared the mode, and leaving an orphaned
+    /// alternate screen at any age.
     #[test]
     fn a_prompt_after_a_dead_programs_frame_ends_it() {
         let prompt = b"\x1b]133;A\x07$ ";
@@ -1339,6 +1380,8 @@ mod tests {
     }
 
     /// A forward-dated start (clock skew, e.g. checkpoint restore) neither
+    /// panics in the deadline math nor wedges the terminal: once the deadline is
+    /// behind `now`, sync output still disables.
     #[test]
     fn sync_output_survives_forward_dated_start_without_panic() {
         let mut term = Terminal::new(24, 80);
@@ -1361,6 +1404,7 @@ mod tests {
     }
 
     /// Repaint-blink epoch, positive: the per-keystroke pattern
+    /// `?2026h ?25l redraw ?25h ?2026l` bumps the epoch exactly once per burst.
     #[test]
     fn repaint_blink_epoch_bumps_once_per_claude_burst() {
         let mut term = Terminal::new(24, 80);
@@ -1380,6 +1424,7 @@ mod tests {
     }
 
     /// Repaint-blink epoch, negative: a DECTCEM hide outside a synchronized
+    /// update (ConPTY's per-echo hide, vim-style drawing) never bumps.
     #[test]
     fn bare_hide_and_vim_style_output_never_bump_the_blink_epoch() {
         let mut term = Terminal::new(24, 80);
@@ -1408,6 +1453,8 @@ mod tests {
     }
 
     /// `process_at` is a pure function of `(bytes, ClockReading)`: the bell
+    /// throttle, the mode-2026 timeout and OSC 133 mark timestamps observe the
+    /// injected reading.
     #[test]
     fn process_at_is_deterministic_under_injected_clock() {
         use super::ClockReading;

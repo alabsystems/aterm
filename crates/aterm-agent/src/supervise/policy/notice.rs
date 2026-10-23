@@ -87,15 +87,21 @@ const EXPIRED: &str = "Claude Code's login expired, so it cannot answer prompts.
 const TYPE_LOGIN: &str = "Type /login in the tab and sign in again.";
 
 /// [`TYPE_LOGIN`] where the session's login is the roster row `{label}`: the
+/// sign-in must be that row's account, or two rows of the roster become one
+/// account.
 const TYPE_LOGIN_AS: &str = "Sign in to {label}: type /login in the tab.";
 
 /// What follows a sign-in made in the tab: Claude Code sends the prompt the
+/// login swallowed again by itself, and aterm presses the success Enter.
 const CONTINUES: &str = "The session continues by itself once you are signed in.";
 
 /// What closes a sign-in aterm opened that nobody needs any more: Esc IN THE
+/// TAB the band's title names — never `this tab`, which on the window's band
+/// reads as whichever tab is in front (module docs).
 const ESC_SIGN_IN: &str = "Press Esc in the tab to close its sign-in.";
 
 /// What follows a renewal: the relaunch onto the login renewed for the
+/// roster row `{label}`, with the wall's continuation.
 const MOVES: &str = "aterm then restarts the tab on the login renewed for {label}.";
 
 /// What a `{why}` says where `/login` was not typed ([`LOGIN_NOT_RUN`]): the owner's `retry_api_errors = false` (named without the key, whose `retry` the message engine refuses in a reason).
@@ -385,30 +391,48 @@ pub const LIMIT_SIGN_IN: NoticeText = NoticeText {
 };
 
 /// What a weekly limit on a roster row asks of nobody: a sign-in in the tab,
+/// which would sign another account into the row's own login (the review's
+/// acct-1).
 const LIMIT_HAPPENED_ROW: &str =
     "Claude Code hit this account's usage limit, and the next listed account is not signed in.";
 
 /// What follows the sign-in of the roster row `{label}` by name: the waiting
+/// tab is decided again at the accounts' news, and moves.
 const LIMIT_MOVES: &str = "Once {label} is signed in, aterm switches this tab to it by itself.";
 
 /// [`LIMIT_MOVES`] where the limit's reset is known: the tab continues past
+/// it if nobody signs the row in (`it`: the row the line before names, so
+/// the sentence holds the reset at any label's length).
 const LIMIT_MOVES_RESET: &str =
     "The tab moves to it once signed in, else continues after the reset {reset}.";
 
 /// What follows a usage limit where aterm cannot tell which account is next
+/// ([`LIMIT_UNREAD`]), its reset known: aterm continues the tab past it
+/// (`resume_limits`).
 const LIMIT_RESUMES: &str = "aterm continues the tab by itself after the reset {reset}.";
 
 /// [`LIMIT_MOVES`] where the roster holds the tab at its limit even once
+/// `{label}` is ready (`super::turn_end::HeldBy`): no switch follows the
+/// sign-in by itself, and the notice that follows it names the step that
+/// moves the tab ([`LIMIT_USE`]).
 const LIMIT_NEXT: &str = "Once {label} is signed in, aterm names the next step to move the tab.";
 
 /// What follows a step after which aterm names another, the limit's reset
+/// known (`resume_limits` on): BOTH OUTCOMES, EACH WITH ITS CONDITION — the
+/// step taken, aterm names the next one; not taken, the tab resumes at the
+/// reset.
 const LIMIT_NEXT_RESET: &str =
     "If you do, aterm names the next step, and if not, the tab resumes {reset}.";
 
 /// What follows a step after which aterm names the one that moves the tab to
+/// another account, whichever that is: the account [`LIMIT_ROSTER`] asks to
+/// be added (`accounts add` prints the line that signs it in, and once it is
+/// ready the tab moves, or the notice that follows names what does), or the
+/// lines of aterm.toml [`LIMIT_STAY_HELD`] asks to be set.
 const LIMIT_NEXT_ANY: &str = "aterm then names the next step to move this tab to another account.";
 
 /// What follows a usage limit's notice where aterm continues nothing
+/// past the limit's reset: the owner's `resume_limits = false`.
 const LIMIT_NOT_RESUMED: &str =
     "aterm does not continue this tab after the limit resets, as resume_limits is off.";
 
@@ -645,6 +669,11 @@ pub const LIMIT_UNREAD: NoticeText = NoticeText {
 };
 
 /// What follows [`LIMIT_ROSTER_KEPT`]'s step: `accounts add` prints the line
+/// that signs the account in, and once it is signed in the point is decided
+/// again on the accounts' news (`crate::supervise::run`'s `account_edge`,
+/// heard where the decision read the roster and did nothing), whose notice
+/// names the line of aterm.toml that lets the tab switch ([`LIMIT_STAY`],
+/// [`LIMIT_STAY_HELD`]); and nothing resumes the tab at the reset.
 const LIMIT_NEXT_KEPT: &str =
     "aterm then names the next step, and with resume_limits off, no reset resumes the tab.";
 

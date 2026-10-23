@@ -3,20 +3,10 @@
 // Author: Andrew Yates
 
 //! Shared selection types for terminal text selection.
-//!
-//! These types are used by both `aterm-core` (TLA+-verified text selection state machine)
-//! and `aterm-alacritty-bridge` (Alacritty-compatible selection tracking). Extracting them
-//! here eliminates duplicate definitions and manual conversion functions.
 
 use std::cmp::Ordering;
 
 /// Type of selection being performed.
-///
-/// All four types are standard across terminal implementations:
-/// - Simple: character-by-character drag selection
-/// - Block: rectangular/column selection (Alt+drag)
-/// - Semantic: word/URL boundary selection (double-click)
-/// - Lines: full-line selection (triple-click)
 #[non_exhaustive]
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Default)]
 pub enum SelectionType {
@@ -25,16 +15,13 @@ pub enum SelectionType {
     Simple,
     /// Rectangular block selection (Alt + click + drag).
     Block,
-    /// Semantic selection — words, URLs, etc. (double-click).
+    /// Semantic selection — words, URLs, etc.
     Semantic,
     /// Full line selection (triple-click).
     Lines,
 }
 
 /// Which side of a cell a selection anchor is on.
-///
-/// This determines whether a half-selected cell at a boundary is included.
-/// Left means before the character; Right means after it.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 #[non_exhaustive]
 pub enum SelectionSide {
@@ -64,13 +51,6 @@ impl Ord for SelectionSide {
 }
 
 /// Check if a cell at `(row, col)` is within a linear (non-block) selection.
-///
-/// The selection spans from `(start_row, start_col)` to `(end_row, end_col)` in
-/// normalized (reading-order) coordinates. This is the shared containment predicate
-/// used by both core and bridge selection implementations.
-///
-/// Column parameters use `usize` so both core (`u16` columns, promoted via `.into()`)
-/// and bridge (`usize` columns) can call without narrowing casts.
 #[inline]
 #[must_use]
 pub const fn selection_contains_linear(
@@ -96,13 +76,6 @@ pub const fn selection_contains_linear(
 }
 
 /// Check if a cell at `(row, col)` is within a block (rectangular) selection.
-///
-/// Block selections include all cells whose row is between the min and max of
-/// `start_row` and `end_row` AND whose column is between the min and max of
-/// `start_col` and `end_col`.
-///
-/// Column parameters use `usize` so both core (`u16` columns, promoted via `.into()`)
-/// and bridge (`usize` columns) can call without narrowing casts.
 #[inline]
 #[must_use]
 pub const fn selection_contains_block(
@@ -127,26 +100,6 @@ pub const fn selection_contains_block(
 }
 
 /// The inclusive column span of the ONE glyph that occupies `col`.
-///
-/// A double-width glyph — a CJK ideograph, an emoji, a ZWJ sequence — owns TWO
-/// cells: a lead cell carrying the whole cluster's text and a blank continuation
-/// cell carrying none. Nothing downstream of the selection can represent half of
-/// one. The text extractors emit the entire cluster from the lead and nothing
-/// from the continuation, so an edge that divides the pair paints one half a
-/// column wide while the clipboard receives the whole character — what you see
-/// stops being what you get, at both edges and in both drag directions.
-///
-/// So a glyph is INDIVISIBLE to a selection: it is selected iff either of its
-/// cells is. Both sides of that promise widen their edges through here — the
-/// highlight predicate (`TextSelection::contains_cell`) tests the pair, and the
-/// copy's column walk (`visible_row_bounds_to_string`) starts at the lead and
-/// stops at the continuation — so the painted run and the copied run are the
-/// same run by construction rather than by two rules that happen to agree today.
-///
-/// `is_wide_lead` means the cell at `col` is the LEFT half; `is_wide_continuation`
-/// means it is the RIGHT half. A cell can be neither (single width, `(col, col)`)
-/// but never both; a continuation wins if a caller passes both, matching the
-/// order the renderer resolves its own flags in.
 #[inline]
 #[must_use]
 pub const fn glyph_cell_span(
@@ -155,8 +108,6 @@ pub const fn glyph_cell_span(
     is_wide_continuation: bool,
 ) -> (u16, u16) {
     if is_wide_continuation {
-        // Saturating, not `col - 1`: a continuation at column 0 has no lead to
-        // back up to (a wide glyph cannot start left of the row), so it stands
         // alone rather than wrapping to u16::MAX and selecting the far edge.
         (col.saturating_sub(1), col)
     } else if is_wide_lead {
@@ -173,13 +124,8 @@ mod tests {
     #[test]
     fn both_halves_of_a_wide_glyph_name_the_same_pair_of_columns() {
         assert_eq!(glyph_cell_span(7, false, false), (7, 7));
-        // Whichever half a selection edge lands on, the widened span is the same
-        // — that identity is what makes the highlight and the copy agree.
         assert_eq!(glyph_cell_span(4, true, false), (4, 5));
         assert_eq!(glyph_cell_span(5, false, true), (4, 5));
-        // A continuation at column 0 has no lead behind it, and a lead at the
-        // last representable column has no continuation ahead: both stand alone
-        // rather than wrapping to the opposite edge of the row.
         assert_eq!(glyph_cell_span(0, false, true), (0, 0));
         assert_eq!(glyph_cell_span(u16::MAX, true, false), (u16::MAX, u16::MAX));
     }

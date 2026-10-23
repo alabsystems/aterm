@@ -396,7 +396,7 @@ pub enum Verdict {
     },
 }
 
-/// Fold one more reading into `found`. A [`Verdict::Stock`] ends the search (the
+/// Fold one more reading into `found`.
 fn fold(found: &mut Verdict, next: Verdict) -> bool {
     match next {
         Verdict::Stock(_) => {
@@ -465,6 +465,7 @@ pub fn file_beside(dir: &str, name: &str, cwd: Option<&Path>, home: Option<&Path
 }
 
 /// The directory of a path-form command word, trailing `/` included
+/// (`build/x/bin/rustc` → `build/x/bin/`), or `None` for a bare name.
 fn dir_of(word: &str) -> Option<&str> {
     word.rfind('/').map(|at| &word[..=at])
 }
@@ -495,6 +496,10 @@ fn check_at(command: &str, depth: usize, beside: Beside<'_>) -> Verdict {
 }
 
 /// The verdict for text nested deeper than [`MAX_DEPTH`], which is not parsed: the
+/// first stock tool name in it — a run of the characters a name is made of, so
+/// `/x/cargo`, `"rustc"` and `$(cargo` all count — is a hit marked
+/// [`Hit::unread`], whether or not it stands at command position (text past the
+/// cap cannot say).
 fn unread(text: &str) -> Verdict {
     let Some(name) = text
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
@@ -512,7 +517,7 @@ fn unread(text: &str) -> Verdict {
     })
 }
 
-/// Remove heredoc bodies — text fed to a command on stdin, not commands. The
+/// Remove heredoc bodies — text fed to a command on stdin, not commands.
 fn strip_heredocs(cmd: &str) -> (String, Vec<String>) {
     let lines: Vec<&str> = cmd.split('\n').collect();
     let mut out: Vec<&str> = Vec::with_capacity(lines.len());
@@ -547,6 +552,7 @@ fn strip_heredocs(cmd: &str) -> (String, Vec<String>) {
 }
 
 /// The heredoc operators on one line, outside quotes (quote state carried
+/// across lines in `quote`): `(terminator, <<- form, delimiter quoted)`.
 fn heredoc_operators(line: &str, quote: &mut Option<char>) -> Vec<(String, bool, bool)> {
     let b: Vec<char> = line.chars().collect();
     let mut found = Vec::new();
@@ -612,6 +618,8 @@ fn heredoc_operators(line: &str, quote: &mut Option<char>) -> Vec<(String, bool,
 }
 
 /// The heredoc delimiter word starting at `b[j]`: `(delimiter, quoted, end)` —
+/// the word with its quotes and backslashes removed, whether any part of it was
+/// quoted, and the index just past it.
 fn heredoc_word(b: &[char], mut j: usize) -> (String, bool, usize) {
     let mut term = String::new();
     let mut quoted = false;
@@ -646,6 +654,8 @@ fn heredoc_word(b: &[char], mut j: usize) -> (String, bool, usize) {
 }
 
 /// Split into simple-command segments, quote-aware, the way the shell reads
+/// them; the text of every `$(…)` and backtick substitution (read even inside
+/// double quotes, where the shell runs them too) is returned separately.
 fn split_commands(cmd: &str) -> (Vec<String>, Vec<String>) {
     let b: Vec<char> = cmd.chars().collect();
     let n = b.len();
@@ -818,6 +828,7 @@ fn is_case_header(cur: &str) -> bool {
 }
 
 /// Whether the word `word` starts at `b[i]` and ends there too (a separator,
+/// whitespace or the end follows it).
 fn starts_word(b: &[char], i: usize, word: &str) -> bool {
     let w: Vec<char> = word.chars().collect();
     b.get(i..i + w.len()).is_some_and(|s| s == w.as_slice())
@@ -826,6 +837,7 @@ fn starts_word(b: &[char], i: usize, word: &str) -> bool {
 }
 
 /// The index just past the `close` matching the `open` at `b[at]` (nesting
+/// counted), or the end of the text when it is unbalanced.
 const fn matching_close(b: &[char], at: usize, open: char, close: char) -> usize {
     let mut depth = 0usize;
     let mut j = at;
@@ -844,6 +856,7 @@ const fn matching_close(b: &[char], at: usize, open: char, close: char) -> usize
 }
 
 /// POSIX word splitting (quotes removed, backslashes resolved), as
+/// `shlex.split(posix=True)`.
 fn words(segment: &str) -> Option<Vec<String>> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -920,7 +933,7 @@ fn is_assignment(word: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Prefix words that run the command after them. The value-taking options of
+/// Prefix words that run the command after them.
 fn wrapper_options(word: &str) -> Option<&'static [&'static str]> {
     Some(match word {
         "nohup" | "builtin" | "noglob" | "then" | "do" | "else" | "elif" | "if" | "while"
@@ -955,7 +968,7 @@ fn wrapper_options(word: &str) -> Option<&'static [&'static str]> {
     })
 }
 
-/// Why a segment is (or is not) a stock Rust tool. An unterminated quote is
+/// Why a segment is (or is not) a stock Rust tool.
 fn offending(segment: &str, depth: usize, beside: Beside<'_>) -> Verdict {
     words(segment).map_or(Verdict::Clean, |words| {
         offending_words(&words, depth, beside)
@@ -963,6 +976,7 @@ fn offending(segment: &str, depth: usize, beside: Beside<'_>) -> Verdict {
 }
 
 /// How many words a leading redirection occupies: `2>/dev/null` is one, `> out`
+/// is two (the operator, then its file).
 fn redirection_words(word: &str) -> Option<usize> {
     let op = word.trim_start_matches(|c: char| c.is_ascii_digit());
     let op = op.strip_prefix('&').unwrap_or(op);
@@ -1026,6 +1040,7 @@ fn offending_words(words: &[String], depth: usize, beside: Beside<'_>) -> Verdic
 }
 
 /// The verdict for the command word at `words[i]` (every prefix word already
+/// skipped) and the arguments after it.
 fn tool_verdict(words: &[String], i: usize, depth: usize, beside: Beside<'_>) -> Verdict {
     let Some(head_word) = words.get(i) else {
         return Verdict::Clean;
@@ -1126,6 +1141,8 @@ fn tool_verdict(words: &[String], i: usize, depth: usize, beside: Beside<'_>) ->
 }
 
 /// Whether `name` is a Trust toolchain's compatibility name for its own compiler
+/// or doc tool ([`COMPAT_TWINS`] without `cargo`): run from that toolchain — by
+/// path beside its twin, or by a Trust rustup channel — it is the Trust tool.
 fn is_trust_alias(name: &str) -> bool {
     name != "cargo" && COMPAT_TWINS.iter().any(|(compat, _)| *compat == name)
 }
@@ -1190,6 +1207,8 @@ fn find_exec(rest: &[String], depth: usize, beside: Beside<'_>) -> Verdict {
 pub const REFUSAL_COMMAND_CAP: usize = 240;
 
 /// `text` as one line of at most [`REFUSAL_COMMAND_CAP`] bytes: every control
+/// character (a newline inside a quoted argument, a tab) folded to a space, cut
+/// on a character boundary with `…` when it was longer.
 fn one_command_line(text: &str) -> String {
     let folded: String = text
         .chars()

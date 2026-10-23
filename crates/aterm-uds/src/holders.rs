@@ -27,10 +27,37 @@ impl HolderScan {
 /// Scan live same-UID processes except `skip` for descriptors matching `rdev`.
 ///
 /// # Errors
+/// The process listing itself failing; `Unsupported` off macOS.
 ///
 /// Returns an error if the process listing fails.
 pub fn scan_rdev_holders(rdev: u64, skip: &[u32]) -> io::Result<HolderScan> {
     Ok(scan_holders_of(&[rdev], skip)?.pop().unwrap_or_default())
+}
+
+/// The `st_rdev` of the master of the PTY whose slave is `slave` (a process's controlling
+/// terminal, `e_tdev`), for a scan that asks whether a live process still holds that
+/// terminal's master. Darwin numbers a PTY's two ends with one minor, and every master's major
+/// is `/dev/ptmx`'s (measured on Darwin 27: master 15/4, slave `/dev/ttys004` 16/4, `/dev/ptmx`
+/// 15/n). `None` when `/dev/ptmx` cannot be read, and off macOS. A `slave` that is no PTY maps
+/// to a number no master or some unrelated master has, so a scan of it proves nothing for
+/// that terminal either way.
+#[cfg(target_vendor = "apple")]
+#[must_use]
+pub fn pty_master_rdev(slave: u64) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    // Darwin's 32-bit `dev_t`: the major in the top 8 bits, the minor in the low 24.
+    // `MetadataExt` widens it with its sign, so only the low 32 bits are read.
+    const DEV: u64 = 0xffff_ffff;
+    const MINOR: u64 = 0x00ff_ffff;
+    let ptmx = std::fs::metadata("/dev/ptmx").ok()?.rdev() & DEV;
+    Some((ptmx & !MINOR) | (slave & MINOR))
+}
+
+/// See the macOS twin.
+#[cfg(not(target_vendor = "apple"))]
+#[must_use]
+pub fn pty_master_rdev(_slave: u64) -> Option<u64> {
+    None
 }
 
 /// Scan live same-UID processes except `skip` for each device in `rdevs`.
@@ -48,6 +75,7 @@ pub fn scan_holders_of(rdevs: &[u64], skip: &[u32]) -> io::Result<Vec<HolderScan
 /// Scan live same-UID processes except `skip` for descriptors open on `path`.
 ///
 /// # Errors
+/// `path` cannot be read (`stat`), or the process listing fails; `Unsupported` off macOS.
 ///
 /// Returns an error if `path` cannot be stat'd or the process listing fails.
 #[cfg(target_vendor = "apple")]
@@ -68,6 +96,7 @@ pub fn scan_file_holders(path: &std::path::Path, skip: &[u32]) -> io::Result<Hol
 /// Scan live same-UID processes except `skip` for descriptors open on `path`.
 ///
 /// # Errors
+/// Always `Unsupported`.
 ///
 /// Returns `Unsupported` on platforms without a holder scan.
 #[cfg(not(target_vendor = "apple"))]
@@ -79,6 +108,7 @@ pub fn scan_file_holders(_path: &std::path::Path, _skip: &[u32]) -> io::Result<H
 }
 
 /// One walk of this uid's processes except `skip`: for each of `wanted`, in order, who holds a
+/// descriptor whose vnode answers it as `lookup` reads it.
 #[cfg(target_vendor = "apple")]
 fn scan(wanted: &[u128], lookup: Lookup, skip: &[u32]) -> io::Result<Vec<HolderScan>> {
     let mut scans = vec![HolderScan::default(); wanted.len()];
@@ -104,6 +134,7 @@ fn scan(wanted: &[u128], lookup: Lookup, skip: &[u32]) -> io::Result<Vec<HolderS
 /// Scan live same-UID processes except `skip` for each device in `rdevs`.
 ///
 /// # Errors
+/// Always `Unsupported`.
 ///
 /// Returns `Unsupported` on platforms without a holder scan.
 #[cfg(not(target_vendor = "apple"))]
@@ -159,6 +190,7 @@ enum TableRead {
     /// No descriptor for it.
     Clear,
     /// The process has exited (`ESRCH`), before the listing's read or during
+    /// the descriptors' reads: every descriptor it had is closed.
     Exited,
     /// Unknown: the table was refused, or a read failed otherwise.
     Unreadable,
@@ -169,12 +201,15 @@ enum TableRead {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Failed {
     /// `ESRCH`: no such process; it has exited (a zombie's descriptors are
+    /// closed at its exit) or been reaped.
     Exited,
     /// `EBADF`, reading one descriptor: closed since the listing, or its
+    /// number reused by something that is no vnode.
     Closed,
     /// `ENOENT`, reading one descriptor or a working directory: its vnode is dead (revoked, or
+    /// its volume force-unmounted) and names no file, device or path (the module docs).
     Dead,
-    /// `EPERM`: the kernel will not tell this process. Reading one descriptor, it refuses
+    /// `EPERM`: the kernel will not tell this process.
     Refused,
     /// Anything else (`EACCES`, or a failure that set no `errno`).
     Other,
@@ -186,6 +221,8 @@ impl Failed {
     const EPERM: i32 = 1;
     const EBADF: i32 = 9;
     /// A descriptor's or a working directory's read's answer for a dead
+    /// vnode, and `proc_pidpath`'s for a process whose executable has been
+    /// unlinked since its exec (a rebuilt binary, a replaced app).
     const ENOENT: i32 = 2;
 
     fn of(errno: i32) -> Self {
@@ -199,6 +236,7 @@ impl Failed {
     }
 
     /// The failure the last libproc call on this thread reported (its
+    /// `errno`, cleared before the call by [`clear_errno`]).
     fn last() -> Self {
         let failed = Self::of(errno());
         #[cfg(any(test, debug_assertions))]
@@ -208,6 +246,7 @@ impl Failed {
 }
 
 /// What a vnode descriptor names: the file's device and inode, and the device a character
+/// special file stands for.
 #[cfg(target_vendor = "apple")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Vnode {
@@ -247,12 +286,15 @@ struct Lookup {
 #[cfg(target_vendor = "apple")]
 impl Lookup {
     /// A device by its `st_rdev`, read with the descriptor's path
+    /// (`PROC_PIDFDVNODEPATHINFO`): the keeper's read, whose path lookup also
+    /// says a dead vnode is dead (`ENOENT`).
     const BY_RDEV: Self = Self {
         flavor: ffi::PROC_PIDFDVNODEPATHINFO,
         size: ffi::VNODE_PATH_SIZE,
         key: Vnode::rdev_key,
     };
     /// A file by its device and inode, read without the path
+    /// (`PROC_PIDFDVNODEINFO`), which the match does not need.
     const BY_FILE: Self = Self {
         flavor: ffi::PROC_PIDFDVNODEINFO,
         size: ffi::VNODE_FD_SIZE,
@@ -261,6 +303,8 @@ impl Lookup {
 }
 
 /// What `pid`'s descriptor table says of each key in `wanted`, in order, each vnode
+/// descriptor read as `lookup` reads it, from one listing and one read per vnode
+/// descriptor.
 #[cfg(target_vendor = "apple")]
 #[cfg_attr(trust_verify, trust::skip)]
 fn read_table(pid: u32, wanted: &[u128], lookup: Lookup) -> Vec<TableRead> {
@@ -280,7 +324,7 @@ fn read_table(pid: u32, wanted: &[u128], lookup: Lookup) -> Vec<TableRead> {
     read_listed_table(wanted, lookup, fds, |fd| vnode_of(pid, fd, lookup))
 }
 
-/// Fold a listed table's vnode reads. Keeping the fold separate from libproc
+/// Fold a listed table's vnode reads.
 #[cfg(target_vendor = "apple")]
 fn read_listed_table(
     wanted: &[u128],
@@ -396,8 +440,9 @@ pub const SDK_ROWS: &[(&str, i64)] = &[
     ),
 ];
 
+// `process::kin` lists a process group through this `proc_listpids` too.
 #[cfg(target_vendor = "apple")]
-mod ffi {
+pub(crate) mod ffi {
     pub const PROC_UID_ONLY: u32 = 4;
     pub const PROC_PIDLISTFDS: i32 = 1;
     pub const PROC_PIDFDVNODEPATHINFO: i32 = 2;
@@ -534,6 +579,7 @@ pub fn uid_pids() -> io::Result<Vec<u32>> {
 }
 
 /// This process's token-user SID and the session manager's process listing: the
+/// Windows [`uid_pids`] listing.
 #[cfg(windows)]
 mod win_pids {
     use super::io;
@@ -550,6 +596,7 @@ mod win_pids {
     const WTS_PROCESS_INFO_LEVEL1: u32 = 1;
 
     /// This process's token-user SID, as the `TOKEN_USER` bytes that back it
+    /// (the SID is a pointer into them, so they are returned and kept alive).
     fn own_sid() -> io::Result<(Vec<u8>, *const core::ffi::c_void)> {
         let mut token: ffi::RawHandle = 0;
         // SAFETY: `GetCurrentProcess` is a pseudo-handle and `token` is a live out-pointer.
@@ -634,7 +681,7 @@ pub fn uid_pids() -> io::Result<Vec<u32>> {
     ))
 }
 
-/// `pid`'s descriptors, each `(fd, type)`. An empty table is an answer: libproc returns 0 for
+/// `pid`'s descriptors, each `(fd, type)`.
 #[cfg(target_vendor = "apple")]
 fn list_fds(pid: i32) -> Result<Vec<(i32, u32)>, Failed> {
     clear_errno();
@@ -733,6 +780,7 @@ pub fn pshm_sizes_of(pid: u32) -> io::Result<Vec<u64>> {
 }
 
 /// `pid`'s descriptor `fd`'s shared-memory size, or `None` when it is no shm descriptor (or is
+/// gone).
 #[cfg(target_vendor = "apple")]
 #[cfg_attr(trust_verify, trust::skip)]
 fn pshm_size(pid: i32, fd: i32) -> Option<u64> {
@@ -789,6 +837,9 @@ pub use paths::{
 };
 
 /// Test seams: run a closure between one table's listing and the reads of its descriptors (to
+/// make a race certain), read a dead vnode as unknown (for a negative control), and read a
+/// process's working directory as a dead vnode (a scratch folder standing in for a volume
+/// force-unmounted under it).
 #[cfg(all(any(test, debug_assertions), target_vendor = "apple"))]
 mod hook {
     use std::cell::Cell;
@@ -871,10 +922,15 @@ mod tests {
     }
 
     /// The floors the descriptors below are duplicated to: under 256, macOS's
+    /// default soft `RLIMIT_NOFILE` (`F_DUPFD_CLOEXEC` at or above the soft
+    /// limit fails `EINVAL`), and above `pspawn`'s 200, so no sibling test's
+    /// duplicate lands on either.
     const LOW: i32 = 210;
     const HIGH: i32 = 240;
 
     /// `fd` duplicated, close-on-exec, to the lowest free number at or above
+    /// `at` (the allocator hands every other open the lowest free number, so
+    /// no other thread's descriptor takes that one once it closes).
     fn dup_at(fd: &std::os::fd::OwnedFd, at: i32) -> std::os::fd::OwnedFd {
         use std::os::fd::{AsRawFd as _, FromRawFd as _};
         const F_DUPFD_CLOEXEC: i32 = 67;
@@ -890,9 +946,11 @@ mod tests {
     }
 
     /// XNU's kernel-private `EREDRIVEOPEN`: a `/dev/ptmx` open that lost the race for a pty
+    /// minor to another opener in any process.
     const EREDRIVEOPEN: i32 = -6;
 
     /// A fresh PTY master (a device no other process holds) at the lowest free number at or
+    /// above `at`, and its rdev.
     pub(super) fn a_master_at(at: i32) -> (std::os::fd::OwnedFd, u64) {
         use std::os::fd::FromRawFd as _;
         const O_RDWR: i32 = 2;
@@ -928,6 +986,7 @@ mod tests {
     }
 
     /// A descriptor closed between the listing and its read (`EBADF`) is not held and does not
+    /// make the table unknown.
     #[test]
     fn a_descriptor_closed_between_the_listing_and_its_read_is_not_held() {
         use std::os::fd::AsRawFd as _;
@@ -1017,6 +1076,7 @@ mod tests {
     }
 
     /// A `sleep` whose stdin is `/dev/null`, once the kernel shows it holding the device, and
+    /// that device's rdev.
     fn a_holder_of_dev_null() -> (crate::spawnfd::Child, u64) {
         let rdev = std::fs::metadata("/dev/null").expect("stat").rdev();
         let child = crate::spawnfd::command("/bin/sleep")
@@ -1036,6 +1096,7 @@ mod tests {
     }
 
     /// SIGKILL `pid` and return once the kernel reports its exit: it is a
+    /// zombie then, until its parent (this test) reaps it.
     pub(super) fn kill_unreaped(pid: u32) {
         let watch = ExitWatch::watch(pid).expect("watch the child");
         // SAFETY: sends `SIGKILL` to the child process spawned by this test.
@@ -1048,6 +1109,7 @@ mod tests {
     }
 
     /// An exited process holds nothing: a killed, unreaped child (a zombie in
+    /// the listing) is a non-holder, never unreadable.
     #[test]
     fn an_exited_process_still_listed_holds_nothing() {
         let (mut child, rdev) = a_holder_of_dev_null();
@@ -1070,6 +1132,7 @@ mod tests {
     }
 
     /// A process that exits between the listing and the reads of its
+    /// descriptors holds nothing: its descriptor reads answer `ESRCH`.
     #[test]
     fn a_process_that_exits_after_its_listing_holds_nothing() {
         let (mut child, rdev) = a_holder_of_dev_null();
@@ -1094,6 +1157,8 @@ mod tests {
     }
 
     /// A child holding `/dev/null` (a character device with a real rdev,
+    /// unlike a regular file) is found by its rdev, and a scan that skips that
+    /// child does not report it.
     #[test]
     fn the_scan_finds_a_child_holding_a_character_device() {
         let rdev = std::fs::metadata("/dev/null").expect("stat").rdev();
@@ -1129,6 +1194,8 @@ mod tests {
     }
 
     /// Asked about several devices at once (a child's `/dev/null`, our fresh PTY master asked
+    /// twice, a device nobody holds), each answer in order is the one a scan for that device
+    /// alone gives; `skip` holds for all of them; no device asked answers nothing.
     #[test]
     fn one_walk_answers_for_every_device_asked() {
         let me = std::process::id();
@@ -1183,6 +1250,9 @@ mod tests {
     }
 
     /// libproc's `pshm_fdinfo` is the size and layout the reader assumes: a region's read-only
+    /// custody descriptor and a writable twin both read back as shm of the size they were made,
+    /// at two sizes (so the offset reads the size, not a constant); a vnode, a socket and a pipe
+    /// are no shm.
     #[test]
     fn a_shared_memory_descriptor_is_named_with_its_size_and_nothing_else_is() {
         use std::os::fd::AsFd as _;
@@ -1206,6 +1276,8 @@ mod tests {
     }
 
     /// The kernel's table names a process's shared-memory descriptors with their sizes: a region
+    /// held shows (its custody descriptor; the creator's mapping is no descriptor), and once its
+    /// descriptor closes it is gone.
     #[test]
     fn a_process_s_shared_memory_descriptors_are_listed_with_their_sizes() {
         let len = 13 * crate::shm::PAGE;

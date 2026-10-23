@@ -445,7 +445,7 @@ fn validate_reason(update: bool, reason: Option<&str>) -> Result<Option<String>,
     Ok(Some(r.to_string()))
 }
 
-fn verdict(ceiling: u64, live: Option<u64>) -> Verdict {
+const fn verdict(ceiling: u64, live: Option<u64>) -> Verdict {
     match live {
         None => Verdict::Unmeasured,
         Some(v) if v < ceiling => Verdict::Under(ceiling - v),

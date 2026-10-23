@@ -1,30 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A report's rows as the worker draws them: blocks, each opened by
-//! a head row, so `report --final` and `report --messages` can print what the
-//! worker said without what its tools did.
-//!
-//! Claude Code's head row (the grammar every program's report is read by),
-//! found by
-//! what it starts with:
-//! * `❯` in column 0, then whitespace: the user's turn ([`BlockKind::User`]);
-//! * `⏺` (or `●`; never the session survey) in column 0: a tool row
-//!   ([`BlockKind::Tool`]) when it is a call ([`is_tool_call`]), one of Claude
-//!   Code's notices (`NOTICE_HEADS`), or a head whose `⎿` output is on the next
-//!   row and which does not end like a sentence; else the worker's message
-//!   ([`BlockKind::Message`]);
-//! * a shell-mode command in column 0 (`! cmd`, or `❯ !cmd`): a tool row, never the user's
-//!   turn;
-//! * a spinner glyph in column 0: a done row ending a turn
-//!   ([`BlockKind::Done`]) or a status row still in flight
-//!   ([`BlockKind::Status`]);
-//! * two spaces, then a collapsed tool group (`Ran 3 shell commands`, `Read 1
-//!   file, ran 2 shell commands`; [`BlockKind::Summary`]).
-//!
-//! Every other row belongs to the block above it. Rows above the first head
-//! are a block of their own: the worker's words when indented two columns
-//! like a message's, a tool's output otherwise.
+//! Splits worker report rows into semantic blocks for `report --final` and `report --messages`.
 
 use super::phase::{is_done_row, is_glyph_row, is_survey, is_tool_call};
 
@@ -61,8 +38,7 @@ pub enum View {
     All,
     /// `--final`: the worker's last message block, then the done row after it.
     Final,
-    /// `--messages`: every user and message block and every done row — no
-    /// tool row, and no `⎿` output under any row.
+    /// `--messages`: every user and message block and every done row, without tool output.
     Messages,
 }
 
@@ -121,8 +97,7 @@ const GROUP_VERBS: &[&str] = &[
     "fetching",
 ];
 
-/// Split `rows`, read by Claude Code's grammar, into blocks, in order; every
-/// row is in exactly one.
+/// Splits `rows` into ordered semantic [`Block`]s.
 pub fn blocks(rows: &[String]) -> Vec<Block> {
     let mut out: Vec<Block> = Vec::new();
     let mut open: Option<Block> = None;
@@ -154,8 +129,6 @@ pub fn blocks(rows: &[String]) -> Vec<Block> {
             ..b
         });
     }
-    // The rows above the first head: the worker's words when they open like a
-    // message's wrapped rows do.
     if let Some(first) = out.first_mut()
         && head_kind(rows, first.start).is_none()
         && rows[first.start..first.end]
@@ -238,7 +211,6 @@ fn is_group_row(row: &str) -> bool {
     let text = text
         .strip_suffix("(ctrl+o to expand)")
         .map_or(text, str::trim_end);
-    // A group still running ticks: `Running 3 shell commands · 9m 13s…`.
     let text = match text.strip_suffix('…').and_then(|t| t.rsplit_once(" · ")) {
         Some((head, _)) => head,
         None => text,
@@ -309,13 +281,7 @@ fn trimmed(rows: Vec<String>) -> Vec<String> {
     rows[start..end].to_vec()
 }
 
-/// The rows a view keeps, in order, the rows read by Claude Code's grammar
-/// ([`blocks`]). `All` is `rows` unchanged. `Final` is the last message block
-/// (its gutter output, if any, dropped) and, when a done block follows it, a
-/// blank row and that block's done row — the first after it,
-/// the one that ended the turn. `Messages` is every user and message block
-/// (their gutter output dropped) and every done block's done row, one blank
-/// row between. Nothing kept is an empty list.
+/// Filters `rows` according to `view`.
 pub fn view_rows(rows: &[String], view: View) -> Vec<String> {
     let all = blocks(rows);
     let body = |b: &Block| trimmed(without_gutter(&rows[b.start..b.end]));
@@ -425,12 +391,10 @@ mod tests {
             let r = rows(&["⏺ Two things:", row]);
             assert_eq!(blocks(&r).len(), 1, "{row:?}");
         }
-        // `⏺ Seed 5 (240 vars…` has a space before its `(`: prose.
         assert_eq!(
             kinds(&["⏺ Seed 5 (240 vars, 1,128 clauses) is the sensitive case."]),
             [(BlockKind::Message, 0)]
         );
-        // A message ending like a sentence keeps its kind over a `⎿` row.
         assert_eq!(
             kinds(&["⏺ Reading the ghost-key site first.", "  ⎿  Read 40 lines"]),
             [(BlockKind::Message, 0)]
@@ -490,7 +454,6 @@ mod tests {
             ])
         );
         assert_eq!(view_rows(&r, View::All), r);
-        // Nothing said: nothing kept.
         let tools = rows(&["⏺ Bash(ls)", "  ⎿  a", "  Ran 1 shell command"]);
         assert!(view_rows(&tools, View::Final).is_empty());
         assert!(view_rows(&tools, View::Messages).is_empty());

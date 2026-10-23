@@ -1,13 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Argv for a relaunch of this binary: pure list surgery, compiled on every platform because
-//! every platform relaunches aterm (the GUI's cold-exec and seamless handoffs, the Windows
-//! successor spawn).
+//! Argv construction for relaunching the binary across platforms.
 
-/// Forward this process's argv to a successor minus the leading `--window` pins earlier boot
-/// swaps prepended (verbatim forwarding would grow one per swap). Only the leading run goes,
-/// so a user's later `--window` survives and the operation is a fixed point.
+/// Forward this process's argv to a successor minus leading `--window` pins.
 pub fn reexec_forwarded_args(
     args: impl Iterator<Item = std::ffi::OsString>,
 ) -> Vec<std::ffi::OsString> {
@@ -24,31 +20,14 @@ pub fn reexec_forwarded_args(
 }
 
 /// Whether a forwarded argv (pins stripped) is a windowing verb's
-/// (`aterm new-window|new-tab|split-pane …`). The router runs a verb's window in the same
-/// process (`window_verb` → `run_window`), keeping the verb as argv, and a verb is the only
-/// bare word a running window's argv can start with: the window parser refuses any other.
+/// (`aterm new-window|new-tab|split-pane …`).
 fn starts_with_a_verb(forwarded: &[std::ffi::OsString]) -> bool {
     forwarded
         .first()
         .is_some_and(|first| !first.to_string_lossy().starts_with('-'))
 }
 
-/// The argv of the boot swap's re-exec (the same launch, not yet served, on the new build):
-/// one leading `--window` pin, then [`reexec_forwarded_args`].
-///
-/// The one-binary router picks window or session from argv and whether stdin is a
-/// terminal, before anything else runs. A window started as `aterm --window` from a
-/// shell keeps that shell's terminal on stdin, so a successor forwarded only the
-/// stripped list — which drops the `--window` the person typed along with any
-/// earlier swap's pins — would come up as a terminal session in the launching terminal.
-/// Pinning here keeps the lane a window, and
-/// stays a fixed point: however many relaunches the process rides, one pin.
-///
-/// A verb's launch is forwarded as the verb, unpinned. The router
-/// dispatches a verb above the mode fork, so `new-window -d ~/proj` routes itself to
-/// the window it asked for, at a terminal or not; behind a pin it would fall through to
-/// the window parser, which refuses the bare word and exits 2. The launch is not served
-/// yet here, so its directory rides along with it.
+/// The argv of the boot swap's re-exec: one leading `--window` pin unless launched with a verb.
 pub fn window_successor_args(
     args: impl Iterator<Item = std::ffi::OsString>,
 ) -> Vec<std::ffi::OsString> {
@@ -73,51 +52,10 @@ const LIFELINE_FLAG: &str = "--lifeline-fd";
 /// instance writes one byte to once its control socket listens (aterm-gui's `--ready-fd`).
 const READY_FLAG: &str = "--ready-fd";
 
-/// The environment variable that marks a launch as an update's relaunch of a
-/// window already running: set by both GUI successor
-/// lanes — the cold `exec` and the seamless launch — on the image they start, and
-/// inherited from there by its boot swap's re-exec and a crash-loop revert's.
-/// Never present on a person's launch: the window's entry reads and clears it
-/// before any session spawns, so no shell and no window opened from one inherits
-/// it.
-///
-/// The relaunched window's first session (its bootstrap) then skips the launch's `-e` command,
-/// which the window already ran; every later tab and split runs it. Its consumer is always
-/// this build or a newer one, so no build that could misread it sees it.
+/// Environment variable marking an update's relaunch of an already-running window.
 pub const RELAUNCH_OF_RUNNING_ENV: &str = "ATERM_RELAUNCH_OF_RUNNING";
 
-/// The argv of a running window's update successor — the GUI's cold `exec` and its
-/// seamless launch: exactly one `--window` pin, then the
-/// launch's own argv — how this window runs (`--headless`, `--control-sock`,
-/// `--columns`, `-d`, `-e <cmd>`, …) — less what its launch ASKED FOR once and a
-/// successor must not be told again:
-///
-/// * NO WINDOWING VERB. `aterm new-window|new-tab|split-pane` keeps the verb as the
-///   window's own argv; behind the pin it reaches the window parser, which exits 2 on
-///   the bare word. Forwarded unpinned (as the boot swap does) it would run the
-///   routing policy again, and under `attach` hand a tab to a running instance — the
-///   outgoing one included — and exit. The verb and its operands go; the successor is a
-///   plain window whose desk the handoff (or the quit layout) carries.
-/// * NO STALE LIFELINE. `--lifeline-fd <n>` names a descriptor the first image has
-///   already moved to a private close-on-exec copy (`aterm_uds::lifeline::adopt`), so
-///   the successor would be told to adopt `/dev/null` or a closed number and exit 2.
-///   `lifeline_fd` is the descriptor the caller hands the successor instead (the cold
-///   `exec` keeps one open across it); `None` drops the flag.
-/// * NO STALE READY SIGNAL. `--ready-fd <n>` names the pipe the first image already
-///   wrote and closed when its socket listened; the successor would be told a closed
-///   number, or another descriptor that took it. The flag and its number go.
-///
-/// THE `-e` COMMAND STAYS: it is not only the first tab's — the window's
-/// session factory runs it for EVERY tab and split it opens, so a successor cut at
-/// `-e` would open `$SHELL` where `aterm --window -e tmux`, or a harness's
-/// `--headless -e claude` then `ctl new-tab`, had opened the command. What must not
-/// happen again is the FIRST session running it (a deploy script re-run at every
-/// update), and that is the successor's to know: the caller marks it with
-/// [`RELAUNCH_OF_RUNNING_ENV`]. Everything from the payload boundary the router's own
-/// scan uses (`-e`, `--command`, `--`) on is forwarded verbatim, as the payload's own.
-///
-/// Same token scan as the router (no flag's value is read as a flag's name), and a
-/// fixed point over its own output given the same `lifeline_fd`.
+/// The argv of a running window's update successor.
 pub fn running_window_successor_args(
     args: impl Iterator<Item = std::ffi::OsString>,
     lifeline_fd: Option<i32>,
@@ -177,7 +115,7 @@ mod tests {
 
     /// The boot swap's re-exec of a verb's launch is the verb,
     /// unpinned — the router routes it to the window it asked for, where a pin sends
-    /// the bare word to the window parser's exit 2. Every other launch keeps its pin.
+    /// the bare word to the window parser's exit 2.
     #[test]
     fn the_boot_swap_forwards_a_verbs_launch_as_the_verb() {
         for verb in [
@@ -207,7 +145,6 @@ mod tests {
     /// windowing verb nor a stale lifeline number.
     #[test]
     fn a_running_windows_successor_carries_its_flags_and_not_its_launch() {
-        // A verb-started window is a plain window's successor.
         for verb in [
             args(&["new-window"]),
             args(&["new-window", "-d", "/tmp"]),
@@ -220,10 +157,6 @@ mod tests {
                 "{verb:?}"
             );
         }
-        // The `-e` payload rides along verbatim — every later tab of
-        // the window runs it — and nothing inside it is read as the window's flag
-        // (the successor is marked instead, `RELAUNCH_OF_RUNNING_ENV`, so its
-        // first session does not run it again).
         let payload = args(&[
             "--window",
             "--hold",
@@ -251,7 +184,6 @@ mod tests {
             ),
             args(&["--window", "--lifeline-fd", "9", "--", "sh", "-c", "true"])
         );
-        // The stale lifeline number goes; the caller's descriptor replaces it.
         let lifelined = args(&[
             "--headless",
             "--lifeline-fd",
@@ -280,7 +212,6 @@ mod tests {
             handed,
             "a fixed point"
         );
-        // The ready signal was the first image's to give: it goes, with its number.
         let readied = args(&["--headless", "--ready-fd", "5", "--columns", "80"]);
         let told = running_window_successor_args(readied.into_iter(), None);
         assert_eq!(told, args(&["--window", "--headless", "--columns", "80"]));
@@ -289,7 +220,6 @@ mod tests {
             told,
             "a fixed point"
         );
-        // Everything a window runs with rides along.
         let flags = args(&["--headless", "--columns", "80", "--cpu", "--font", "Menlo"]);
         assert_eq!(
             running_window_successor_args(flags.clone().into_iter(), None),

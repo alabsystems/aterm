@@ -20,6 +20,7 @@ pub(crate) struct Desk {
     dir: aterm_tempfile::TempDir,
     logs: aterm_tempfile::TempDir,
     /// Pids of already-reaped processes, made as first needed: run `k` of a replay is named for
+    /// the `k`th, so no two runs of one replay share a pid.
     pids: Vec<u32>,
 }
 
@@ -75,6 +76,7 @@ pub(crate) struct Rig {
     /// The run's crash marker while it exists, and its lock while the run lives.
     marker: Option<(PathBuf, Option<OwnedFd>)>,
     /// Before every claim, a windowed launch that does not claim reads every
+    /// run's evidence first.
     consumed_first: bool,
     /// How many of those reads found evidence to consume.
     consumed: usize,
@@ -134,6 +136,7 @@ impl Rig {
     }
 
     /// The replay is over: its owner and its marker's descriptor go, as when
+    /// a rig drops, and its desk comes back emptied for the next.
     fn finish(self) -> Desk {
         let Rig {
             desk,
@@ -159,6 +162,7 @@ impl Rig {
     }
 
     /// The run starts: its crash marker (empty, locked, the app's) is armed before its journal
+    /// and named for the same start (`JournalId::of_this_run`).
     fn boot(&mut self, probation: bool, second: bool) {
         let armed = markers::arm(self.logs(), self.id.pid, self.id.nanos, MarkerOwner::App)
             .expect("marker armed");
@@ -172,6 +176,9 @@ impl Rig {
     }
 
     /// The successor's commit (`release_committed_readers`, then `Lane::adopt_predecessor` at
+    /// its wake): a new run, its marker armed as `boot` arms one, takes the handed-off image
+    /// over onto its own journal by the real `JournalOwner::adopt`; only then do its readers run
+    /// on the live sessions.
     fn adopt(&mut self) {
         let parent = self.id;
         let mut id = JournalId::now(self.desk.pid(self.runs));
@@ -236,6 +243,7 @@ impl Rig {
     }
 
     /// The quit's first step: the real `restore::write_quit_to`, stamped with
+    /// this run's journal id as the quit stamps it.
     fn write_quit_layout(&mut self) {
         crate::restore::write_quit_to(
             &self.dir().join(SESSION),
@@ -246,6 +254,8 @@ impl Rig {
     }
 
     /// The quit's `session.toml` as a later launch reads it before claiming (`main_entry` via
+    /// `restore::take` and `JournalId::parse_stem`), but read, not taken, so a forbidden claim
+    /// run anyway leaves it for the next.
     fn quit_layout(&self) -> QuitLayout {
         let path = self.dir().join(SESSION);
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -264,7 +274,7 @@ impl Rig {
         .holding(&crate::restore::quit_also_of(&text))
     }
 
-    /// A later launch's real claim. On the consumed pass, a windowed launch that does not claim
+    /// A later launch's real claim.
     fn claim(&mut self) {
         if self.consumed_first {
             let killed =
@@ -406,6 +416,9 @@ const ENDS: &[&[&str]] = &[
 ];
 
 /// EVERY STEP OF THE MODEL, EACH ONCE: breadth first from the initial
+/// state, every reachable state by the shortest schedule that reaches it,
+/// and that schedule extended by every action enabled there (`fire`d, the
+/// canonical successor), with every one of [`ENDS`] beside them.
 fn transition_cover(
     model: &aterm_spec::derive::Model,
     actions: &[&'static str],
@@ -435,7 +448,7 @@ fn transition_cover(
     cover.iter().filter(|s| !longer(s)).cloned().collect()
 }
 
-/// Replay `schedule` on the real owner and claim on `desk` (handed back emptied). With
+/// Replay `schedule` on the real owner and claim on `desk` (handed back emptied).
 fn replay(
     desk: Desk,
     schedule: &[&'static str],
@@ -468,6 +481,11 @@ fn replay(
 }
 
 /// The shipping owner and claim refine `CrashJournalClaim` on every step the
+/// model can take from every state it reaches ([`transition_cover`]) — each
+/// schedule replayed twice, the second time with every claim's
+/// evidence read (and renamed `.seen`) first by a launch that does not claim —
+/// every state they reach satisfies every invariant, and between them they
+/// reach EVERY state the model can reach.
 #[test]
 fn the_real_journal_conforms_to_the_model() {
     let model = crash_journal_claim_model();
@@ -580,6 +598,8 @@ fn the_real_journal_conforms_to_the_model() {
 }
 
 /// Negative control: `Buggy = 1` disagrees with the real steps at a write (the real publish is
+/// one rename), at a claim blind to the quit layout's run, and at the claim of a running
+/// window's journal (its owner's lock is held), so a pass of the committed model is not vacuous.
 #[test]
 fn the_defects_reject_the_real_steps() {
     let buggy = interp::with_buggy(&crash_journal_claim_model(), 1);

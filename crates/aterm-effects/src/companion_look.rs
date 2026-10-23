@@ -1,28 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Program cats with tenure: each major app gets its own cursor kitty, but a
-//! program must earn the cursor before the cat changes.
-//!
-//! 1. The base cat is the launch kitty (`App::launch_kitty`, minted once per
-//!    process by `aterm-gui`'s `launch_kitty.rs`); the prompt wears it.
-//! 2. While the focused pane's shell block is `Executing`, its OSC 633;E
-//!    commandline names a program (`app_basename` → `canonical_app_id` →
-//!    `KittyLook::for_app`). That claim is worn only after holding for
-//!    [`TENURE`], and released only after the pane has been back at the prompt
-//!    for [`RELEASE`]. Every other block state claims nothing.
-//! 3. The switch is soft: the flying kitty swaps only between appearances
-//!    (`kitty_cursor::set_look`), and the walking pet lets the old cat run off
-//!    while the new one fades up (`kitty_pet::ARRIVE_IN`).
-//! 4. The per-window roster on [`KittyTenure`] decides how loudly: a cat worn
-//!    within [`HOMECOMING`] comes home quietly; a stranger gets the full arrival
-//!    ceremony, spaced (never denied) by [`HELLO_FLOOR`]. The render seam
-//!    performs and commits it ([`KittyTenure::commit_hello`]), so a hello nobody
-//!    saw is never spent.
-//!
-//! [`LookPolicy`] holds one window's [`ProgramClaim`] cache, [`KittyTenure`] gate
-//! and last rung on the injected clock; the precedence law is
-//! [`companion_precedence`].
+//! Program cats with tenure: each major app gets its own cursor kitty, but a program must earn the cursor before the cat changes.
 
 use aterm_time::Instant;
 use std::time::Duration;
@@ -33,29 +12,19 @@ use crate::companion::CompanionRung;
 use crate::kitty_pet::PetArrival;
 use crate::kitty_registry::{KittyLook, SHELL_APP_ID, app_basename, canonical_app_id};
 
-/// How long a program must hold the focused pane, unbroken, before its cat takes
-/// the cursor, so quick commands finish first.
+/// How long a program must hold the focused pane, unbroken, before its cat takes the cursor, so quick commands finish first.
 pub const TENURE: Duration = Duration::from_secs(5);
 
-/// How long the pane must be back at the prompt before the worn program cat is
-/// released to the base cat. Longer than [`TENURE`]: leaving a program is where a
-/// bounce hurts most (exit-and-relaunch, a shell errand). A move to another
-/// program takes that program's [`TENURE`] instead.
+/// How long the pane must be back at the prompt before the worn program cat is released to the base cat.
 pub const RELEASE: Duration = Duration::from_secs(15);
 
-/// A program cat this window wore within this span comes home quietly; one absent
-/// longer is owed a fresh arrival. The stamp refreshes on every wear. Matches
-/// aterm-gui `kitty_log`'s `RING_TTL`.
+/// A program cat this window wore within this span comes home quietly; one absent longer is owed a fresh arrival.
 pub const HOMECOMING: Duration = Duration::from_secs(600);
 
-/// The minimum spacing between two performed ceremonies, equal to [`RELEASE`]
-/// (3× [`TENURE`]), so a 5 s alternation can never chain hellos. It spaces a
-/// stranger, never denies one: a floored stranger keeps its debt and collects
-/// on a later landing.
+/// The minimum spacing between two performed ceremonies, equal to [`RELEASE`] (3× [`TENURE`]), so a 5 s alternation can never chain hellos.
 pub const HELLO_FLOOR: Duration = Duration::from_secs(15);
 
-/// The roster's depth: one person's open tools in one window (typically 2–5)
-/// with headroom.
+/// The roster's depth: one person's open tools in one window (typically 2–5) with headroom.
 pub const HOMECOMING_SLOTS: usize = 8;
 
 /// One program whose cat this window has worn.
@@ -64,13 +33,11 @@ struct Homecoming {
     id: String,
     /// Last worn — the recency clock. Refreshed by every landing of this id.
     at: Instant,
-    /// Whether the owed hello was performed. An ungreeted slot is an unpaid debt
-    /// and is never evicted.
+    /// Whether the owed hello was performed.
     greeted: bool,
 }
 
-/// The resolved program identity of one pane. `look` is a pure function of `id`,
-/// cached so the render rung never re-hashes per frame.
+/// The resolved program identity of one pane.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppIdentity {
     /// Canonical app id (`"claude"`, `"vim"`, a basename).
@@ -81,10 +48,7 @@ pub struct AppIdentity {
     pub look: KittyLook,
 }
 
-/// Per-window cache of the focused pane's raw program claim, keyed by
-/// `(session, block id, block state, commandline present)` so a commandline is
-/// parsed only on a transition. The last component covers an OSC 633;E that lands
-/// after 133;C already made the block `Executing`.
+/// Per-window cache of the focused pane's raw program claim, keyed by `(session, block id, block state, commandline present)` so a commandline is parsed only on a transition.
 #[derive(Default)]
 pub struct ProgramClaim {
     key: Option<(u64, u64, BlockState, bool)>,
@@ -92,8 +56,7 @@ pub struct ProgramClaim {
 }
 
 impl ProgramClaim {
-    /// `session`'s raw program claim from its current shell block, re-derived only
-    /// when the key moves.
+    /// `session`'s raw program claim from its current shell block, re-derived only when the key moves.
     #[inline]
     pub fn resolve(&mut self, session: u64, block: Option<&OutputBlock>) -> Option<&AppIdentity> {
         let key = block.map(|b| (session, b.id, b.state, b.commandline.is_some()));
@@ -109,8 +72,6 @@ impl ProgramClaim {
 #[inline]
 fn derive_identity(block: &OutputBlock) -> Option<AppIdentity> {
     match block.state {
-        // No parseable commandline (no OSC 633;E, a bare Enter) and a nested
-        // shell both claim nothing: the prompt, at any depth, wears the base cat.
         BlockState::Executing => {
             let basename = app_basename(block.commandline.as_deref().unwrap_or(""))?;
             let id = canonical_app_id(&basename);
@@ -121,37 +82,25 @@ fn derive_identity(block: &OutputBlock) -> Option<AppIdentity> {
             let look = KittyLook::for_app(&id);
             Some(AppIdentity { id, basename, look })
         }
-        // The prompt, a finished command, or any future state: no claim.
         _ => None,
     }
 }
 
-/// The tenure gate: turns the focused pane's raw, flapping program claim into the
-/// slow one the cat wears.
-///   * `worn` is the claim on glass (`None` = the base cat);
-///   * `candidate` is the latest raw claim that differs from `worn`, and since
-///     when; a raw claim equal to `worn` clears it, a new one restarts it;
-///   * a candidate that holds for its dwell ([`TENURE`] to a program, [`RELEASE`]
-///     to the base cat) becomes `worn`.
+/// The tenure gate: turns the focused pane's raw, flapping program claim into the slow one the cat wears.
 #[derive(Default)]
 pub struct KittyTenure {
     worn: Option<AppIdentity>,
     candidate: Option<(Option<AppIdentity>, Instant)>,
-    /// The cats this window has worn, LRU by `at`. Expiry is lazy (at landings),
-    /// so the roster arms no timer.
+    /// The cats this window has worn, LRU by `at`.
     roster: [Option<Homecoming>; HOMECOMING_SLOTS],
-    /// Stamped only by [`Self::commit_hello`]. The roster's `at` refreshes on
-    /// every wear, so alternation starves the ceremony on purpose.
+    /// Stamped only by [`Self::commit_hello`].
     last_hello: Option<Instant>,
     /// How loudly the last landing arrives: the full ceremony only for a stranger.
-    /// Sticky until the next landing, [`Self::commit_hello`] or
-    /// [`Self::note_non_program_verdict`].
     arrival: PetArrival,
 }
 
 impl KittyTenure {
-    /// Feed this frame's raw claim; returns the claim on glass. Idempotent for a
-    /// stable input at a stable time, so re-observing is harmless.
+    /// Feed this frame's raw claim; returns the claim on glass.
     #[inline]
     pub fn observe(&mut self, raw: Option<&AppIdentity>, now: Instant) -> Option<&AppIdentity> {
         if raw == self.worn.as_ref() {
@@ -177,8 +126,7 @@ impl KittyTenure {
         self.worn.as_ref()
     }
 
-    /// When the pending candidate earns its tenure, for the host's wake deadline;
-    /// `None` while nothing is pending, so the gate never pins the event loop.
+    /// When the pending candidate earns its tenure, for the host's wake deadline; `None` while nothing is pending, so the gate never pins the event loop.
     #[inline]
     pub fn deadline(&self) -> Option<Instant> {
         self.candidate
@@ -186,10 +134,7 @@ impl KittyTenure {
             .map(|(cand, since)| *since + dwell_for(cand.as_ref()))
     }
 
-    /// Called by the host's wake handler when [`Self::deadline`] is due, present
-    /// or not: lands the pending candidate and disarms, returning whether the look
-    /// moved. A window off the terminal route never re-observes, so this keeps an
-    /// armed deadline from spinning the event loop.
+    /// Called by the host's wake handler when [`Self::deadline`] is due, present or not: lands the pending candidate and disarms, returning whether the look moved.
     #[inline]
     pub fn poll(&mut self, now: Instant) -> bool {
         match self.candidate.take() {
@@ -197,8 +142,6 @@ impl KittyTenure {
                 if now.saturating_duration_since(since) >= dwell_for(cand.as_ref()) =>
             {
                 let moved = cand != self.worn;
-                // Land even when not `moved`: a re-land refreshes the roster stamp
-                // and re-rules `arrival` as the observe path would.
                 self.land(cand, now);
                 moved
             }
@@ -214,11 +157,6 @@ impl KittyTenure {
     ///   * base cat (`None`): always quiet (the pet is born wearing it);
     ///   * roster hit: refresh `at`; quiet if greeted, else [`Self::floor`];
     ///   * stranger: insert (LRU among greeted slots) and ask [`Self::floor`].
-    ///
-    /// Lazy expiry runs only here, evicts only greeted slots older than
-    /// [`HOMECOMING`], and skips the landing id: a continuously worn cat never
-    /// re-lands, so its stamp can be stale at its own next landing, and expiring
-    /// it then would award a spurious ceremony.
     #[inline]
     fn land(&mut self, cand: Option<AppIdentity>, now: Instant) {
         self.worn = cand;
@@ -246,7 +184,6 @@ impl KittyTenure {
                 self.arrival = if insert_lru(&mut self.roster, &id.id, now) {
                     self.floor(now)
                 } else {
-                    // Every slot holds a debt: refuse the insert rather than
                     // drop one. The only way a stranger's hello is lost.
                     PetArrival::Quiet
                 };
@@ -274,10 +211,7 @@ impl KittyTenure {
         self.arrival
     }
 
-    /// Called by the render seam only when a ceremony was performed on glass
-    /// (`companion_verdict` also runs for unfocused windows). Marks the worn id
-    /// `greeted`, stamps `last_hello` and resets the latch, so a pair the
-    /// flying-kitty latch re-delivers cannot replay the ceremony.
+    /// Called by the render seam only when a ceremony was performed on glass (`companion_verdict` also runs for unfocused windows).
     #[inline]
     pub fn commit_hello(&mut self, now: Instant) {
         if let Some(id) = self.worn.as_ref()
@@ -289,9 +223,7 @@ impl KittyTenure {
         self.arrival = PetArrival::Quiet;
     }
 
-    /// Reset the arrival latch when a non-program rung wins. Unpinning a favourite
-    /// can reveal an already-worn program cat, which must not then perform a
-    /// ceremony authorised minutes ago. The roster and `last_hello` are kept.
+    /// Reset the arrival latch when a non-program rung wins.
     #[inline]
     pub const fn note_non_program_verdict(&mut self) {
         self.arrival = PetArrival::Quiet;
@@ -299,7 +231,7 @@ impl KittyTenure {
 }
 
 /// Insert a stranger: an empty slot first, else evict the LRU among greeted slots
-/// only. `false` (nothing inserted) when every slot holds an ungreeted debt.
+/// only.
 #[inline]
 fn insert_lru(roster: &mut [Option<Homecoming>; HOMECOMING_SLOTS], id: &str, now: Instant) -> bool {
     let slot = roster.iter().position(|s| s.is_none()).or_else(|| {
@@ -330,14 +262,7 @@ const fn dwell_for(candidate: Option<&AppIdentity>) -> Duration {
     if candidate.is_some() { TENURE } else { RELEASE }
 }
 
-/// The companion precedence law, stated only here (every dressing surface goes
-/// through [`LookPolicy::verdict`]):
-///
-///   favourite > program (with tenure) > launch kitty
-///
-/// A pinned favourite is the user's choice (and how a liked launch kitty is kept
-/// across launches); `app` is the claim after [`KittyTenure`], never the raw block
-/// state. Returns the winning look and its [`CompanionRung`].
+/// The companion precedence law, stated only here (every dressing surface goes through [`LookPolicy::verdict`]):
 #[inline]
 #[must_use]
 pub const fn companion_precedence(
@@ -354,8 +279,7 @@ pub const fn companion_precedence(
     }
 }
 
-/// One window's look policy: the focused pane's claim cache, the tenure gate and
-/// the rung that won the last verdict.
+/// One window's look policy: the focused pane's claim cache, the tenure gate and the rung that won the last verdict.
 pub struct LookPolicy {
     claim: ProgramClaim,
     tenure: KittyTenure,
@@ -375,17 +299,13 @@ impl Default for LookPolicy {
 }
 
 impl LookPolicy {
-    /// The focused pane's raw program claim, read off `block` (the pane's
-    /// current block, else its last) under the host's terminal lock.
+    /// The focused pane's raw program claim, read off `block` (the pane's current block, else its last) under the host's terminal lock.
     #[inline]
     pub fn claim(&mut self, session: u64, block: Option<&OutputBlock>) -> Option<AppIdentity> {
         self.claim.resolve(session, block).cloned()
     }
 
-    /// The companion verdict: `raw` (the focused pane's claim) through the tenure
-    /// gate, then [`companion_precedence`]. Records the winning rung; a non-program
-    /// win resets the gate's arrival latch. Idempotent for a stable claim at a
-    /// stable time, so a re-resolve in the same frame lands nothing new.
+    /// The companion verdict: `raw` (the focused pane's claim) through the tenure gate, then [`companion_precedence`].
     #[inline]
     pub fn verdict(
         &mut self,
@@ -453,7 +373,6 @@ mod tests {
         let mut gate = KittyTenure::default();
         let claude = ident("claude");
         let t0 = Instant::now();
-        // Well inside TENURE, so no observation pair spans a full tenure.
         let beat = TENURE / 8;
 
         for k in 0..3u32 {
@@ -487,7 +406,6 @@ mod tests {
             "and the real gate is still on the base cat"
         );
 
-        // Negative control: a steady claim does land at TENURE.
         let mut steady = KittyTenure::default();
         assert!(steady.observe(Some(&claude), t0).is_none());
         assert_eq!(
@@ -592,7 +510,6 @@ mod tests {
         let claude = ident("claude");
         assert!(gate.observe(None, t0).is_none(), "fresh: the base cat");
 
-        // A quick command: `ls` for 300 ms, then home.
         let ls = ident("ls");
         assert!(gate.observe(Some(&ls), t0).is_none());
         assert!(
@@ -606,7 +523,6 @@ mod tests {
         );
         assert!(gate.deadline().is_none(), "home again: nothing pending");
 
-        // claude: seen, then held.
         let t1 = t0 + Duration::from_secs(1);
         assert!(
             gate.observe(Some(&claude), t1).is_none(),
@@ -641,7 +557,6 @@ mod tests {
         gate.observe(Some(&claude), t0);
         assert!(gate.observe(Some(&claude), t0 + TENURE).is_some());
 
-        // Exit to the prompt: still the claude cat, release pending.
         let t_exit = t0 + Duration::from_secs(60);
         assert_eq!(
             gate.observe(None, t_exit).map(|i| i.id.as_str()),
@@ -649,7 +564,6 @@ mod tests {
             "the cat lingers at the prompt"
         );
         assert_eq!(gate.deadline(), Some(t_exit + RELEASE));
-        // Relaunch inside the window: home again, nothing lands, no bounce.
         assert_eq!(
             gate.observe(Some(&claude), t_exit + Duration::from_secs(4))
                 .map(|i| i.id.as_str()),
@@ -660,7 +574,6 @@ mod tests {
             "the round trip came home: disarmed"
         );
 
-        // A settled return to the prompt releases the cat.
         let t_exit2 = t_exit + Duration::from_secs(120);
         assert!(gate.observe(None, t_exit2).is_some(), "lingering…");
         assert!(
@@ -698,14 +611,11 @@ mod tests {
             "idempotent once landed"
         );
 
-        // The linger's release, likewise, lands at the wake without a present…
         let t1 = t0 + Duration::from_secs(60);
         gate.observe(None, t1);
         assert!(gate.poll(t1 + RELEASE), "release lands at its deadline");
         assert!(gate.worn().is_none() && gate.deadline().is_none());
 
-        // …and a claim that moved on meanwhile is corrected by the next observe:
-        // vim was seen once, poll landed it blind, but the pane is at the prompt.
         let vim = ident("vim");
         let t2 = t1 + Duration::from_secs(120);
         gate.observe(Some(&vim), t2);
@@ -744,7 +654,6 @@ mod tests {
             gate.observe(Some(&vim), t1).map(|i| i.id.as_str()),
             Some("claude")
         );
-        // A stray `git` claim 2 s in restarts the candidate clock…
         let t2 = t1 + Duration::from_secs(2);
         gate.observe(Some(&git), t2);
         assert_eq!(
@@ -752,7 +661,6 @@ mod tests {
             Some(t2 + TENURE),
             "the clock restarted on git"
         );
-        // …and vim again 1 s later restarts it once more.
         let t3 = t2 + Duration::from_secs(1);
         gate.observe(Some(&vim), t3);
         assert_eq!(gate.deadline(), Some(t3 + TENURE));
@@ -799,7 +707,6 @@ mod tests {
         let mut via_observe = KittyTenure::default();
         let mut via_poll = KittyTenure::default();
 
-        // The stranger's arrival, landed by each path.
         via_observe.observe(Some(&claude), t0);
         via_observe.observe(Some(&claude), t0 + TENURE);
         via_poll.observe(Some(&claude), t0);
@@ -810,7 +717,6 @@ mod tests {
         via_observe.commit_hello(t0 + TENURE);
         via_poll.commit_hello(t0 + TENURE);
 
-        // The release to the base cat, landed by each path: quiet.
         let t1 = t0 + Duration::from_secs(60);
         via_observe.observe(None, t1);
         via_observe.observe(None, t1 + RELEASE);
@@ -821,7 +727,6 @@ mod tests {
             assert_eq!(gate.arrival(), PetArrival::Quiet, "{name}: home is quiet");
         }
 
-        // The return within HOMECOMING, landed by each path: a homecoming.
         let t2 = t1 + RELEASE + Duration::from_secs(10);
         via_observe.observe(Some(&claude), t2);
         via_observe.observe(Some(&claude), t2 + TENURE);
@@ -850,7 +755,6 @@ mod tests {
         assert_eq!(gate.arrival(), PetArrival::Ceremony);
         gate.commit_hello(t0);
 
-        // A second stranger 5 s later: floored, debt held.
         let t1 = t0 + Duration::from_secs(5);
         gate.land(Some(ident("claude")), t1);
         assert_eq!(gate.arrival(), PetArrival::Quiet, "spaced by the floor");
@@ -860,7 +764,6 @@ mod tests {
             "the debt is owed, not spent"
         );
 
-        // Back once the floor is clear: the held debt is collected.
         let t2 = t0 + HELLO_FLOOR + Duration::from_secs(1);
         gate.land(Some(ident("claude")), t2);
         assert_eq!(
@@ -876,17 +779,14 @@ mod tests {
     fn an_ungreeted_slot_is_never_evicted() {
         let t0 = Instant::now();
         let mut gate = KittyTenure::default();
-        // One greeted cat…
         gate.land(Some(ident("vim")), t0);
         gate.commit_hello(t0);
-        // …then seven strangers, authorised but never performed (debts).
         for n in 0..7u64 {
             gate.land(
                 Some(ident(&format!("tool{n}"))),
                 t0 + Duration::from_secs(20 + 20 * n),
             );
         }
-        // The ninth id must evict the greeted vim, never a debt.
         let t_full = t0 + Duration::from_secs(200);
         gate.land(Some(ident("htop")), t_full);
         assert!(
@@ -903,7 +803,6 @@ mod tests {
                 "{id}: an unpaid debt pins its slot"
             );
         }
-        // All eight slots now hold debts: a tenth id is refused, quietly.
         let t_refused = t_full + Duration::from_secs(60);
         gate.land(Some(ident("git")), t_refused);
         assert_eq!(
@@ -926,14 +825,12 @@ mod tests {
         assert_eq!(gate.arrival(), PetArrival::Quiet, "born home");
         gate.land(Some(ident("claude")), t0 + Duration::from_secs(5));
         assert_eq!(gate.arrival(), PetArrival::Ceremony);
-        // Uncommitted ceremony: the fall to the prompt is quiet regardless.
         gate.land(None, t0 + Duration::from_secs(40));
         assert_eq!(
             gate.arrival(),
             PetArrival::Quiet,
             "the prompt is always home"
         );
-        // …and an hour later, still quiet: home never expires.
         gate.land(None, t0 + Duration::from_secs(3600));
         assert_eq!(gate.arrival(), PetArrival::Quiet);
     }
@@ -947,13 +844,10 @@ mod tests {
         gate.land(Some(ident("claude")), t0);
         gate.commit_hello(t0);
 
-        // 20 min worn with no landings, then a settled prompt errand (a quiet
-        // landing that runs no expiry).
         let t_errand = t0 + Duration::from_secs(1200);
         gate.land(None, t_errand);
         assert_eq!(gate.arrival(), PetArrival::Quiet);
 
-        // Relaunch: the stale stamp is the landing id's, so expiry skips it.
         let t_back = t_errand + Duration::from_secs(30);
         gate.land(Some(ident("claude")), t_back);
         assert_eq!(

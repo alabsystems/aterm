@@ -111,30 +111,42 @@ pub struct EraseMark {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Spine {
     /// The canonical metric (`crate::typing_momentum`), the raw 0..1 leaky
+    /// integrator, gained only in [`Spine::target`]; consumers want
+    /// [`Spine::disp`].
     momentum: TypingMomentum,
-    /// The eased display value the art reads. Advanced only in
+    /// The eased display value the art reads.
     disp: f32,
     /// The resume memory: the follower's recent peak, forgetting on
+    /// [`DISP_PEAK_HALF_LIFE_S`].
     disp_peak: f32,
     /// The lay/flow clock in dimensionless sweeps, modulo [`PHASE_RING`].
     phase: f32,
     /// The last [`Spine::update`] stamp; `None` means never ticked, so the first
+    /// update only latches the clock.
     at: Option<Instant>,
     /// Latched on the tick a rise past [`DISP_SLAM_RISE`] is first seen and held
+    /// until the follower is within [`DISP_SNAP_ZERO`] of its target (or the
+    /// target falls below it).
     slamming: bool,
-    /// The pending [`EraseMark`], if the last edge was a Backspace. Cleared by
+    /// The pending [`EraseMark`], if the last edge was a Backspace.
     mark: Option<EraseMark>,
     /// The flow run: keys typed at [`FLOW_KEY_DISP`] or above with no delete
+    /// since it began.
     run: u32,
     /// The run's high-water mark, kept across exits.
     best: u32,
     /// The birth price the previous typed key was born at, the other half of
+    /// the surge's `Δ` ([`Spine::surge`]).
     prev_birth: f32,
     /// The last key's own rise over `prev_birth`, latched at its edge so the
+    /// tick that births the key reads that key's number.
     key_rise: f32,
     /// The last [`Spine::drive`] with a live floor; the combo is frozen for
+    /// [`FLOW_FREEZE_S`] after it.
     driven_at: Option<Instant>,
     /// The hot-resume door: a green long command's stamp, living
+    /// [`VERDICT_WINDOW_S`], which floors one birth at [`VERDICT_BIRTH_DISP`]
+    /// and is spent by it ([`Spine::note_keys`]).
     verdict: Option<Instant>,
 }
 
@@ -247,6 +259,7 @@ impl Spine {
     }
 
     /// The one site of the gain: what the follower chases at `now`, the raw
+    /// metric times [`METRIC_GAIN`], clamped to 0..1.
     #[inline]
     fn target(&self, now: Instant) -> f32 {
         (self.momentum.value(now) * METRIC_GAIN).clamp(0.0, 1.0)
@@ -427,6 +440,8 @@ mod tests {
     }
 
     /// Hot resume: after a green command the first key inside
+    /// [`VERDICT_WINDOW_S`] is born at full momentum, one key spends it, and an
+    /// unused door closes by itself.
     #[test]
     fn the_first_key_after_a_long_green_run_is_born_hot() {
         let t = Instant::now();
@@ -468,6 +483,8 @@ mod tests {
     }
 
     /// Hold the follower's target at `target` across ticks: `drive` re-pins the
+    /// raw metric at `target / METRIC_GAIN` each tick, so the analytic
+    /// first-order solution is exact.
     fn held(s: &mut Spine, from: Instant, to: Instant, step: Duration, target: f32) {
         let floor = target / METRIC_GAIN;
         let mut t = from;
@@ -483,6 +500,8 @@ mod tests {
     }
 
     /// A rise past [`DISP_SLAM_RISE`] takes the faster ease and keeps it until
+    /// the rise is reached, so the hand-over does not depend on which frame saw
+    /// the gap drop (T7).
     #[test]
     fn a_big_rise_slams_faster_than_it_attacks_and_the_slam_is_latched() {
         let t0 = Instant::now();
@@ -527,6 +546,7 @@ mod tests {
     }
 
     /// T6: after typing stops the follower and resume memory reach exactly zero
+    /// and `at_rest` latches.
     #[test]
     fn idle_drains_to_exactly_zero() {
         let t0 = Instant::now();
@@ -585,6 +605,7 @@ mod tests {
     }
 
     /// The resume memory floors birth pricing only: after a pause the birth
+    /// spine is above the honest spine, which the floor does not touch.
     #[test]
     fn resume_floors_births_without_touching_the_honest_spine() {
         let t0 = Instant::now();
@@ -613,6 +634,8 @@ mod tests {
     }
 
     /// T7: the same history at the same `now` gives the same number at 60 and
+    /// 120 Hz, to float rounding under a held target and well under a percent
+    /// under a decaying one.
     #[test]
     fn the_follower_is_frame_rate_independent() {
         let t0 = Instant::now();
@@ -650,6 +673,8 @@ mod tests {
     }
 
     /// The gain's mechanics: under a metric pinned at 0.5 the follower settles on
+    /// `0.5 · METRIC_GAIN`; under 0.9 on the ceiling; [`Spine::momentum`]
+    /// reports 0.5 and 0.9 (raw) either way.
     #[test]
     fn the_follower_settles_on_the_gained_metric_and_reports_the_raw_one() {
         let t0 = Instant::now();
@@ -676,6 +701,9 @@ mod tests {
     }
 
     /// The erase mark's arithmetic: the first delete's birth spine is kept across
+    /// the run, the count climbs, a third delete is no longer a mend, a typed key
+    /// or a kill clears it, a stale run restarts at one, and the follower reads
+    /// the same with and without the mark.
     #[test]
     fn a_backspace_leaves_a_mark_that_counts_the_run_and_a_typed_key_closes_it() {
         let t0 = Instant::now();
@@ -767,6 +795,8 @@ mod tests {
     }
 
     /// Type `n` keys at `period` through the spine the way the engine does —
+    /// the key's edge, then the frame's tick — on a 120 Hz train, and return
+    /// the [`Flow`] after each key.
     fn typing(s: &mut Spine, t0: Instant, n: u32, period: Duration) -> Vec<(Duration, Flow)> {
         let tick = Duration::from_micros(8_333);
         let mut out = Vec::new();
@@ -789,6 +819,8 @@ mod tests {
     }
 
     /// A held key cannot farm the combo ([`FLOW_FREEZE_S`]): an armed sing-along
+    /// drives the spine up, and its keys neither climb nor break the run; the
+    /// hand's earned run is where it left it when the celebration lifts.
     #[test]
     fn a_held_key_cannot_farm_the_combo() {
         let t0 = Instant::now();
@@ -826,6 +858,7 @@ mod tests {
     }
 
     /// The lay/flow clock advances only while the spine is lit, and wraps on
+    /// the exact shared ring.
     #[test]
     fn the_phase_clock_rides_the_spine_and_stays_on_its_ring() {
         let t0 = Instant::now();

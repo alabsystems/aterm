@@ -19,6 +19,7 @@ use aterm_vitals::jobs::{
 use aterm_vitals::model::TabRoot;
 
 /// The engine's fast cadence (§11.3): also the floor between passes, so a
+/// 2 Hz lens does not double the detailed reads.
 const FAST_MS: u64 = 2_000;
 
 /// The engine, its reader and the last view, on the probe thread.
@@ -176,6 +177,8 @@ fn background_call_live(r: &JobRow) -> bool {
 }
 
 /// The canary's plain form of a row: the process it names (the waiting one
+/// for a wait, else the leader) and that process's name, the group, the
+/// agent's task id, the quiet age and a Tier B naming's word.
 fn background_call(r: &JobRow) -> BackgroundCall {
     BackgroundCall {
         pid: r.wait.as_ref().map_or(r.leader.0, |w| w.leaf),
@@ -188,6 +191,9 @@ fn background_call(r: &JobRow) -> BackgroundCall {
 }
 
 /// How long until the next pass after one whose demand was `demand`: the
+/// engine's interval, never under [`FAST_MS`]; an idle engine (no job, or
+/// only waits for the person) looks again at the fast cadence, since a job
+/// can start at any keystroke.
 fn next_pass_ms(demand: Demand) -> u64 {
     demand.every_ms().unwrap_or(FAST_MS).max(FAST_MS)
 }
@@ -204,6 +210,8 @@ pub(crate) fn windowless_after(view: &JobsView) -> Option<Duration> {
 }
 
 /// The engine's tabs from the host's request: its session key, the number
+/// the person sees (`Tab 2` is 2), its shell, and its terminal mode word
+/// where `ttys` holds a current one.
 fn job_tabs(tabs: &[TabRoot], ttys: &[(u64, TtyMode)]) -> Vec<JobTab> {
     tabs.iter()
         .map(|t| JobTab {
@@ -373,6 +381,9 @@ pub(crate) mod tests {
     use super::*;
 
     /// The engine's cadence, and with no window the reading's: while a live
+    /// agent call stands, the engine's demand (2 s fast, 30 s slow); an idle
+    /// engine, an exited call or jobs that are no agent's ask nothing before
+    /// the disk watch's next look.
     #[test]
     fn the_engine_is_asked_again_at_its_own_cadence_never_faster_than_two_seconds() {
         assert_eq!(next_pass_ms(Demand::Fast), 2_000);
@@ -411,6 +422,7 @@ pub(crate) mod tests {
     }
 
     /// An agent's call in tab `tab` read `no_progress` (or not), by `consumer`,
+    /// quiet `min` minutes, naming process `pid` (`exe`).
     pub(crate) fn call_row(
         tab: u64,
         consumer: Consumer,
@@ -438,6 +450,12 @@ pub(crate) mod tests {
     }
 
     /// THE CANARY'S EVIDENCE IS THIS SESSION'S BACKGROUND CALL THAT MADE NO
+    /// PROGRESS, the one quiet longest: of tab 4's rows (session `s-hung`),
+    /// an agent call of no known consumer at 20 minutes and a background one
+    /// at 31 minutes waiting in process 27098, the 31-minute one, named by
+    /// its waiting process; never a foreground call, a person's job or
+    /// another session's call, however long their quiet, and an exited call
+    /// does not count.
     #[test]
     fn the_board_names_this_sessions_background_call_quiet_longest() {
         use aterm_vitals::jobs::{NamedRow, Standing, TierB, Wait, WaitName};
@@ -516,6 +534,7 @@ pub(crate) mod tests {
     }
 
     /// Each tab keeps its key, number and shell, and takes the terminal word
+    /// handed for its key.
     #[test]
     fn a_tab_keeps_its_session_key_shell_and_number_and_its_own_terminal_word() {
         let root = |key, label: &str| TabRoot {
@@ -538,6 +557,7 @@ pub(crate) mod tests {
     }
 
     /// The pass on this host's real process table: this test process stands
+    /// in for a tab's shell.
     #[test]
     fn a_pass_over_the_live_table_yields_a_view_and_keeps_it_between_passes() {
         let Some(sweep) = aterm_sysprobe::processes() else {
@@ -570,6 +590,8 @@ pub(crate) mod tests {
     }
 
     /// AN EDGE'S READING LOOKS (the loop paces edges on its own clock): one
+    /// asked inside the pass's cadence runs the engine anyway, so the job it
+    /// was asked for is seen now.
     #[test]
     fn an_edges_reading_inside_the_cadence_runs_the_engine() {
         let Some(sweep) = aterm_sysprobe::processes() else {
@@ -598,6 +620,7 @@ pub(crate) mod tests {
     }
 
     /// A view speaks for now for a minute; a PARKED one (demand idle) for as
+    /// long as its reader runs.
     #[test]
     fn a_parked_view_speaks_for_now_while_its_reader_runs() {
         let parked = JobsView::default();

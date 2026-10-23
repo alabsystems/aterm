@@ -1,42 +1,26 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Developer ID gate: `/usr/bin/codesign --verify --strict` under a designated
-//! requirement that pins Apple's anchor, the Developer ID chain and one Team ID.
-//!
-//! One requirement text for the app updater's bundle check and atpkg's staged agent binaries,
-//! so they cannot disagree about what "signed by team X" means. The spawn is bounded
-//! (`aterm_uds::deadline::output_until`) and fails closed: a timeout, a spawn failure or a
-//! non-zero exit is never a pass.
+//! Developer ID signature verification via `/usr/bin/codesign --verify --strict`.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use aterm_uds::deadline::{RunError, output_until};
 
-/// Absolute, so no `PATH` entry can stand in for Apple's tool.
+/// Absolute path to Apple's `codesign` tool.
 pub const CODESIGN: &str = "/usr/bin/codesign";
 
-/// The ceiling on one verification when the caller brings no deadline of its own — and
-/// the floor [`verify_timeout_for`] scales up from.
+/// Base verification timeout and floor for [`verify_timeout_for`].
 pub const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The slowest read rate a size-scaled verification ([`verify_timeout_for`]) is given time
-/// for. `--verify --strict` hashes every page, so its time is read time, and under the
-/// window's background QoS clamp (which codesign inherits) those reads are throttled behind
-/// the rest of the disk: at load ~90 a 238 MB binary took 1.98 s unclamped and 453 s clamped.
-/// No deadline covers a saturated machine; this one covers a moderately busy one, and the
-/// caller defers what it cannot cover (atpkg's `StageError::VerifyDeferred`), never fails it.
+/// Minimum assumed read rate in bytes per second for [`verify_timeout_for`].
 pub const VERIFY_MIN_BYTES_PER_SEC: u64 = 2 * 1024 * 1024;
 
-/// The most time [`verify_timeout_for`] gives one file, however large: a verification
-/// holds the store lock, and one that has not finished in ten minutes is deferred to the
-/// next pass rather than waited on.
+/// Maximum timeout [`verify_timeout_for`] grants a single file.
 pub const VERIFY_TIMEOUT_MAX: Duration = Duration::from_secs(600);
 
-/// The deadline one verification of a `len`-byte file is given: [`VERIFY_TIMEOUT`] plus one
-/// second per [`VERIFY_MIN_BYTES_PER_SEC`], capped at [`VERIFY_TIMEOUT_MAX`]. A 238 MB binary
-/// gets 143 s.
+/// Returns the verification timeout for a `len`-byte file, capped at [`VERIFY_TIMEOUT_MAX`].
 #[must_use]
 pub fn verify_timeout_for(len: u64) -> Duration {
     VERIFY_TIMEOUT
@@ -51,22 +35,17 @@ const STDERR_KEEP: usize = 64 * 1024;
 /// Why a Developer ID verification did not pass.
 #[derive(Debug)]
 pub enum CodesignError {
-    /// The team id is empty or not ASCII alphanumeric; refused before it can reach the
-    /// requirement text (a `"` there would rewrite the requirement).
+    /// Team ID is empty or not ASCII alphanumeric.
     InvalidTeam(String),
-    /// Not macOS: there is no codesign here, so no platform anchor to check.
+    /// Not macOS.
     Unsupported,
-    /// codesign could not be started.
+    /// `codesign` could not be started.
     Spawn(std::io::Error),
-    /// Waiting for codesign failed.
+    /// Waiting for `codesign` failed.
     Wait(std::io::Error),
-    /// codesign did not finish by the deadline; it was killed and reaped. Never a pass and
-    /// never a verdict on the bytes: the app updater refuses the update, atpkg defers the
-    /// program to its next pass (`StageError::VerifyDeferred`).
+    /// `codesign` did not finish before the deadline and was killed.
     TimedOut,
-    /// codesign ran and refused. `code` is its exit status (`None` when a signal ended
-    /// it): 1 is a signature that does not verify, 3 a valid signature that fails the
-    /// requirement, 2 bad arguments. `stderr` is its diagnostic, untrimmed.
+    /// `codesign` ran and exited non-zero (`code` is `None` when killed by a signal).
     Refused { code: Option<i32>, stderr: String },
 }
 
@@ -96,12 +75,7 @@ impl std::error::Error for CodesignError {}
 
 /// codesign's words (Security.framework's `errSecCS…` strings) for a signature fault in the
 /// bytes it read; exit 1 also reports an unreadable file or an internal failure, which are not
-/// verdicts. The bundle-level lines (a changed, added or removed sealed resource, a stray file
-/// in the bundle root, `bundle format unrecognized…` for an `.app` with no or an empty
-/// `Info.plist`) are what `--deep --strict` prints for an ad hoc signed `.app`, so tampering
-/// with the app updater's staged bundle stays a verdict. `invalid destination for symbolic
-/// link in bundle` was measured (2026-10-01) on a bundle signed with a symlink pointing out
-/// of it: where the bundle's own bytes lead does not change on a retry.
+/// verdicts.
 const SIGNATURE_FAULTS: [&str; 12] = [
     "code object is not signed at all",
     "invalid signature (code or signature have been modified)",
@@ -119,10 +93,7 @@ const SIGNATURE_FAULTS: [&str; 12] = [
 
 /// codesign's words for a failure to read or run, as the `<path>: <fault>` first line of an
 /// exit-1 refusal: facts about this machine, never about the bytes
-/// ([`CodesignError::judged_nothing_at`]). `No such file or directory` is not one (measured
-/// 2026-10-01): it is codesign's whole word for a dangling symlink added to a sealed
-/// bundle, a verdict; a bundle path that is not there at all fails closed with it at no
-/// cost.
+/// ([`CodesignError::judged_nothing_at`]).
 const MACHINE_FAULTS: [&str; 7] = [
     "Permission denied",
     "internal error in Code Signing subsystem",
@@ -134,10 +105,7 @@ const MACHINE_FAULTS: [&str; 7] = [
 ];
 
 impl CodesignError {
-    /// Whether this is codesign's verdict on the bytes — a valid signature that fails the
-    /// requirement (exit 3), or exit 1 naming a signature fault ([`SIGNATURE_FAULTS`]) —
-    /// rather than a failure to judge them: an unreadable file, an internal error, a
-    /// signal, a timeout. Only a verdict is stable enough to remember.
+    /// Returns whether this error is a definitive signature verdict on the bytes (exit 3 or a signature fault on exit 1).
     #[must_use]
     pub fn is_verdict(&self) -> bool {
         match self {
@@ -153,21 +121,7 @@ impl CodesignError {
         }
     }
 
-    /// Whether codesign, run on `verified`, ran and knowably judged nothing: a signal ended
-    /// it, or exit 1 whose first non-empty line is exactly `<verified>: <fault>` for a
-    /// failure to read or run ([`MACHINE_FAULTS`]), naming no signature fault. Narrower
-    /// than `!is_verdict()` on purpose: a refusal in words neither list holds stays a
-    /// refusal of the bytes, so a caller that discards or asks a person on a refusal keeps
-    /// doing so for tampering it has not been taught.
-    ///
-    /// Anchored on the caller's path, not on a line's shape: every other line codesign
-    /// writes names a path the bundle chose. Its `--verbose` progress lines
-    /// (`--prepared:<nested>`) come before its verdict, a later line names a file, and a
-    /// nested name may hold a newline that splits its own line (measured 2026-10-01: a
-    /// helper named `h: Permission denied`, or `h\nX: Permission denied`, made a tampered
-    /// bundle's refusal read as a machine fault). A stderr long enough to have been cut to
-    /// its tail ([`STDERR_KEEP`], and more in a caller that keeps more) starts with a
-    /// fragment the bundle chose, so it judged something; a real fault is one line.
+    /// Returns whether `codesign` on `verified` terminated by signal or failed on a known machine read/run fault without judging the bytes.
     #[must_use]
     pub fn judged_nothing_at(&self, verified: &Path) -> bool {
         match self {
@@ -189,11 +143,7 @@ impl CodesignError {
     }
 }
 
-/// Apple's Developer ID designated requirement, pinned to `team`. The leading `=` makes
-/// `-R` read it as requirement source rather than a file name. The two marker OIDs are
-/// the Developer ID intermediate CA (`…6.2.6`) and the Developer ID Application leaf
-/// (`…6.1.13`); `anchor apple generic` requires the chain to end at Apple's root, so a
-/// self-signed certificate that merely claims the team's OU cannot pass.
+/// Builds Apple's Developer ID designated requirement string pinned to `team`.
 ///
 /// # Errors
 /// [`CodesignError::InvalidTeam`] for an empty or non-alphanumeric `team`.
@@ -215,12 +165,10 @@ fn verify_developer_id(path: &Path, team: &str, deep: bool) -> Result<(), Codesi
     verify_developer_id_until(path, team, deep, Instant::now() + VERIFY_TIMEOUT)
 }
 
-/// Verify that `path` is signed with a Developer ID of `team`, finished by `deadline`.
-/// `deep` also verifies nested code (a bundle); a single Mach-O needs none.
+/// Verifies that `path` is signed with a Developer ID of `team` before `deadline`.
 ///
 /// # Errors
-/// [`CodesignError::InvalidTeam`] before anything runs; [`CodesignError::Unsupported`]
-/// off macOS; otherwise the spawn, wait, timeout or refusal, each a rejection.
+/// Returns [`CodesignError`] on invalid team, unsupported OS, spawn/wait error, timeout, or signature refusal.
 pub fn verify_developer_id_until(
     path: &Path,
     team: &str,
@@ -231,13 +179,10 @@ pub fn verify_developer_id_until(
     developer_id_verdict(output_until(&mut cmd, deadline))
 }
 
-/// The codesign run [`verify_developer_id_until`] makes, for a caller that runs it
-/// beside other helpers (`aterm_uds::deadline::outputs_until`) and judges the run with
-/// [`developer_id_verdict`].
+/// Builds the `codesign` command used by [`verify_developer_id_until`].
 ///
 /// # Errors
-/// [`CodesignError::InvalidTeam`] before anything is built; [`CodesignError::Unsupported`]
-/// off macOS.
+/// [`CodesignError::InvalidTeam`] before anything is built; [`CodesignError::Unsupported`] off macOS.
 pub fn developer_id_command(
     path: &Path,
     team: &str,
@@ -257,10 +202,10 @@ pub fn developer_id_command(
     Ok(cmd)
 }
 
-/// What one run of [`developer_id_command`] says: a pass only for a clean exit.
+/// Evaluates the output of [`developer_id_command`].
 ///
 /// # Errors
-/// The spawn, wait, timeout or refusal, each a rejection.
+/// Returns [`CodesignError`] on spawn/wait error, timeout, or non-zero exit.
 pub fn developer_id_verdict(
     run: Result<std::process::Output, RunError>,
 ) -> Result<(), CodesignError> {
@@ -372,10 +317,7 @@ mod tests {
     }
 
     /// A signal, and exit 1 whose first line names only a failure to read or run on the
-    /// verified path, judged nothing. Negative controls: unlisted words, a machine fault
-    /// beside a signature fault, one on a later line or another path (a name the bundle
-    /// chose), `No such file or directory` (a dangling symlink in a sealed bundle), a
-    /// stderr cut to its tail, and exit 2 or 3.
+    /// verified path, judged nothing.
     #[test]
     fn only_a_known_machine_fault_or_a_signal_judged_nothing() {
         let refused = |code: Option<i32>, stderr: &str| CodesignError::Refused {
@@ -394,8 +336,6 @@ mod tests {
                 "{stderr:?}"
             );
         }
-        // Measured: `--verbose=2` progress lines naming nested helpers the bundle called
-        // `h: Permission denied` and `h\nX: Permission denied`, before the verdict.
         let progress = [
             (
                 "/x/N1.app",
@@ -411,7 +351,6 @@ mod tests {
                  /x/C.app: nested code is modified or invalid\n"
                     .to_string(),
             ),
-            // A tail cut where a helper's name put the verified path's fault line.
             (
                 "/x/A.app",
                 format!(
@@ -485,7 +424,6 @@ mod tests {
         assert!(unsigned.is_verdict(), "{unsigned}");
 
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
-        // Root reads a mode-000 file, and then the premise does not hold.
         let premise = std::fs::read(&file).is_err();
         let unreadable = verify_developer_id(&file, "Q6L2SF6YDW", false).unwrap_err();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();

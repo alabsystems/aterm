@@ -1,30 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE HOLDER IMAGE THROUGH THE REAL READER (card engine §3.4-§3.6, §7 "A,
-//! identity and edges"): `attach_reader_inner`, the gather and parse pipeline
-//! every session runs, on a real pseudo-terminal whose slave the test writes
-//! as the shell and its programs. The foreground group (`fg_probe`) and each
-//! group's image (`edge_image`) are scripted per master and per group, as
-//! `cwd_report_reader_tests` scripts the probe; the parse stage's hold hook
-//! (`holder_image::hold_hook`) records, from inside each term-lock hold, the
-//! token the session's timeline held then.
-//!
-//! I1: every hold that parses a byte of image T finds T on the timeline. The
-//! binds here are the sampled group edge (a launch typed at a prompt), the
-//! byte-driven arm's `exec` in place after a signed C (at once, or after any
-//! number of output batches), and its Launcher re-read (atpkg's shim
-//! `exec`ing the store build), across a re-attached reader too. Each has a
-//! negative control that must break it: publishing after the hold, the arm
-//! off, the C cut off. The image published is the one the gather read at the
-//! edge, and the publication's own wake is posted before the edge's hold.
-//!
-//! The kernel edges (§3.3, macOS's arm): with a scripted process watch
-//! injected through `SessionFactory::proc_watch`, a launch's fork and `exec`s
-//! posted to it are heard by the gather's own poll before any byte, each a
-//! byte-free edge whose hold already finds its image published and, for the
-//! drawer, the engine fence's span laid, before Claude Code's first byte is
-//! read. Publishing after the hold breaks it.
+//! Holder image timeline publication tests across the gather and parse pipeline.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -264,8 +241,7 @@ impl Rig {
             app.session_factory.proc_watch = scripted_watch;
         }
         let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-        // SAFETY: a zeroed termios is a valid out-slot for tcgetattr, then
-        // cfmakeraw/tcsetattr on the test-owned slave fd.
+        // SAFETY: A zeroed termios is a valid out-slot for tcgetattr, then cfmakeraw/tcsetattr.
         unsafe {
             let mut tio: libc::termios = std::mem::zeroed();
             assert_eq!(libc::tcgetattr(slave, &mut tio), 0, "tcgetattr");
@@ -302,9 +278,7 @@ impl Rig {
         rig
     }
 
-    /// Attach the real reader and wait for its gather. Each `Wake::Output`
-    /// is recorded and handled at once (the latch cleared, as the UI's pass
-    /// does), so every chunk's wake posts.
+    /// Attach the real reader and wait for its gather.
     fn start_reader(&mut self) {
         let (ready_tx, ready_rx) = mpsc::channel::<()>();
         let (id, wakes) = (self.id, Arc::clone(&self.wakes));
@@ -355,14 +329,13 @@ impl Rig {
     }
 
     /// Write `bytes` then `marker` as the holder `fg`, and wait until the
-    /// engine has parsed the marker. A CAN between them ends any sequence
-    /// `bytes` left open, so the marker prints.
+    /// engine has parsed the marker.
     fn write(&self, fg: i32, bytes: &[u8], marker: &str) {
         set_fg(self.session.master, fg);
         let all = [bytes, b"\x18", marker.as_bytes()].concat();
         let mut sent = 0;
         while sent < all.len() {
-            // SAFETY: a bounded write of a live slice to the test-owned slave.
+            // SAFETY: Bounded write of a live slice to the test-owned slave.
             let wrote =
                 unsafe { libc::write(self.slave, all[sent..].as_ptr().cast(), all.len() - sent) };
             assert!(wrote > 0, "write {marker}");
@@ -482,8 +455,7 @@ fn first_hold_of(holds: &[hold_hook::Hold], first: &[u8]) -> Option<usize> {
 }
 
 /// A launch typed at a signing shell's prompt: the shell runs `claude`, the
-/// job takes the terminal and writes its launch card. Returns the holds, the
-/// job image's token, and the rig (still attached).
+/// job takes the terminal and writes its launch card.
 fn launch(id: u64, shell: i32, job: i32, knobs: Knobs) -> (Rig, u64) {
     set_image(shell, zsh(shell));
     let claude = store_claude(job, 7_000 + u64::from(job.cast_unsigned()));
@@ -503,9 +475,7 @@ fn launch(id: u64, shell: i32, job: i32, knobs: Knobs) -> (Rig, u64) {
 /// THE BUILD BEFORE THE BYTES (I1), through the real reader: the gather reads
 /// the job's image at the sampled edge, and the parse stage publishes it
 /// before the hold of the slice that starts at the cut, so the hold that
-/// parses Claude Code's first byte already finds its token. Publication also
-/// queues the session in the App's edged inbox and records the dev rows; an
-/// edge between two images no card cares about publishes nothing.
+/// parses Claude Code's first byte already finds its token.
 #[test]
 fn the_holder_image_is_published_before_the_hold_of_its_first_byte() {
     let (rig, token) = launch(9301, 5100, 5200, SHIPPING);
@@ -517,8 +487,6 @@ fn the_holder_image_is_published_before_the_hold_of_its_first_byte() {
     );
     assert_eq!(rig.rows("holder-edge"), 1);
     assert_eq!(rig.rows("holder-image"), 1);
-    // The job exits and the shell takes the terminal back: leaving a drawer
-    // publishes the shell's image; a later `ls` edge publishes nothing.
     rig.write(5100, &prompt(), "<p2>");
     assert_eq!(rig.holder_token(), zsh(5100).token);
     set_image(
@@ -560,13 +528,11 @@ fn control_publishing_after_the_hold_breaks_i1() {
 }
 
 /// `exec claude` at a signing shell's prompt: the shell's own image changes
-/// in place, and no foreground group moves. Returns whether the hold that
-/// parsed the new image's first bytes found its token.
+/// in place, and no foreground group moves.
 fn exec_in_place(id: u64, shell: i32, knobs: Knobs) -> (Vec<String>, Option<u64>, Rig) {
     set_image(shell, zsh(shell));
     let rig = Rig::attach(id, shell, knobs);
     rig.write(shell, &prompt(), "<p1>");
-    // The `exec` happened by the time its first bytes are read.
     let claude = store_claude(shell, 9_000 + u64::from(shell.cast_unsigned()));
     let token = claude.token.expect("a tracked image");
     set_image(shell, claude);
@@ -622,8 +588,6 @@ fn control_without_the_arm_or_its_cut_the_exec_is_missed() {
         !violations.is_empty(),
         "no cut: the re-read is one hold late"
     );
-    // Late, not never: when the PTY hands the write over in more than one
-    // read, the next batch's first slice still re-reads the image.
     assert!(
         published.is_none() || published == store_claude(5700, 9_000 + 5700).token,
         "{published:?}"
@@ -634,10 +598,7 @@ fn control_without_the_arm_or_its_cut_the_exec_is_missed() {
 /// reader finds already in front (`aterm -e claude`, a restored or handed
 /// over reader) is published as found, a Group edge as the arm's cut is, so
 /// a registry row that came for its group before its image stays that
-/// image's (`SessionTimeline::offer_holder_image`). CONTROL
-/// (`an_exec_after_a_signed_c_is_an_exec_edge_before_its_first_byte`): a
-/// re-read that finds a new image of a group the arm read before is an Exec
-/// edge. Mutation-checked: an arm that calls every read an Exec fails this.
+/// image's (`SessionTimeline::offer_holder_image`).
 #[test]
 fn the_arms_first_read_of_a_group_is_a_group_edge() {
     let shell = 7900;
@@ -663,7 +624,6 @@ fn the_arms_first_read_of_a_group_is_a_group_edge() {
 /// THE LAUNCHER RE-READ (§3.6): the sampled edge finds atpkg's shim before
 /// its `exec` (a Launcher, published); the shim `exec`s the store build in
 /// place, and the next batch's first slice re-reads it before its hold.
-/// Returns the I1 violations for the store image's first bytes.
 fn shim_then_store(id: u64, shell: i32, job: i32, knobs: Knobs) -> Vec<String> {
     set_image(shell, zsh(shell));
     set_image(job, launcher(job, 11));
@@ -701,8 +661,7 @@ fn control_without_the_arm_a_launchers_exec_is_missed() {
 /// C2, THE READ AT THE EDGE: the image the gather read at the sampled edge
 /// rides the batch to the cut, so a parse stage that reaches the cut after
 /// the image changed (here: every later read of the job answers another
-/// build) still publishes the image of the edge. The mutant that re-reads at
-/// the cut publishes the later build and breaks the bind.
+/// build) still publishes the image of the edge.
 #[test]
 fn the_image_published_is_the_one_read_at_the_edge() {
     let (shell, job) = (6200, 6300);
@@ -851,7 +810,7 @@ fn a_reattached_reader_keeps_rereading_a_published_launcher() {
 /// the terminal, the job `exec`s atpkg's shim (a Group edge, read at the
 /// event), and the shim `exec`s the store build in place (an Exec edge), each
 /// heard before any byte and sent byte-free; then Claude Code writes its
-/// launch card. Returns the holds and the store image's token.
+/// launch card.
 fn kernel_launch(id: u64, shell: i32, job: i32, knobs: Knobs) -> (Vec<hold_hook::Hold>, u64) {
     set_image(shell, zsh(shell));
     let rig = Rig::attach(id, shell, knobs);
@@ -964,9 +923,7 @@ fn assert_laid_past(holds: &[hold_hook::Hold], unowned: &[u8], token: u64) {
 /// THE TWO OFFSETS THROUGH THE READER (§3.3 as built): an `exec` heard after
 /// bytes of its batch were read cuts where no `exec` can have preceded (here
 /// the batch's start: no poll proved a later offset to the cutter) and lays
-/// the new drawer's span where it was heard. The bytes between are no
-/// holder's: the cut opens no mark, and the lay opens the drawer's before the
-/// next byte.
+/// the new drawer's span where it was heard.
 #[test]
 fn an_exec_heard_inside_a_batch_lays_the_drawer_where_it_was_heard() {
     const ID: u64 = 9315;
@@ -978,7 +935,6 @@ fn an_exec_heard_inside_a_batch_lays_the_drawer_where_it_was_heard() {
     let token = store.token.expect("a tracked image");
     let script = rig.script();
     let posted = script.clone();
-    // The shell `exec`s Claude Code in place after the batch's first read.
     hold_hook::on_next_read(ID, move || {
         set_image(SHELL, store);
         posted.post(&[ProcEvent::Exec {
@@ -1011,7 +967,6 @@ fn a_sampled_edge_that_absorbs_its_leaders_exec_lays_at_the_batch_end() {
     let script = rig.script();
     let posted = script.clone();
     let master = rig.session.master;
-    // At the batch-end sample: the job holds the terminal and has `exec`ed.
     arm_probe(master, move || {
         set_fg(master, JOB);
         posted.post(&[ProcEvent::Exec {
@@ -1034,10 +989,7 @@ fn a_sampled_edge_that_absorbs_its_leaders_exec_lays_at_the_batch_end() {
 
 /// K11 (§3.6): beside a process watch the byte arm neither scans a batch for
 /// signed C ends nor re-reads the holder after one, since an `exec` in place
-/// is the watch's to hear. With none posted, the `exec claude` a watchless
-/// reader finds by its re-read
-/// (`an_exec_after_a_signed_c_is_an_exec_edge_before_its_first_byte`) is read
-/// nowhere and publishes nothing, and its C ends no slice.
+/// is the watch's to hear.
 #[test]
 fn a_watch_turns_the_byte_arms_c_cuts_and_rereads_off() {
     for (id, shell, knobs) in [(9317, 7700, KERNEL), (9318, 7800, SHIPPING)] {

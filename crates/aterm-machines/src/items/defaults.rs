@@ -2,39 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! `defaults` reads and writes, and the raw `[[defaults]]` rows (design §5.1).
-//!
-//! [`Pref`] is the one preference item the families built on `defaults` share (the
-//! consumer catalog, Setup Assistant, Software Update and the raw rows). Its read is
-//! `defaults [-currentHost] export <domain> -`, run as the preference's user (design
-//! §3.5), or as root for a system domain, and parsed by [`crate::plist::parse_domain`].
-//! A failed or unparsable export reads [`Read::Unusable`] and is never taken for the
-//! default, and so does a key whose value this crate cannot hold.
-//!
-//! On macOS 27 `defaults export` prints an empty `<dict/>` and exits 0 both for a domain
-//! that does not exist and for one the reader may not read (measured in the 27.0 VM: the
-//! admin's export of the root-only `/Library/Preferences/com.apple.apsd` prints `<dict/>`;
-//! `plutil` on the same file says "you don't have permission to view it"). A missing key
-//! in a domain that printed keys reads [`Read::Absent`]. An empty system domain reads
-//! `Absent` only when its plist does not exist or `plutil` reads it as empty; otherwise
-//! it is `Unusable`. A user or host domain is read as the user it belongs to, so a file
-//! that user may not read is one their own programs may not read either; an empty export
-//! of one is still not told apart from a missing domain. One such domain is measured: an
-//! App-Sandboxed app's own domain lives in its container, which macOS guards as data from
-//! other apps, so a reader whose responsible app holds no Full Disk Access gets an empty
-//! export and the person a warning ([`CONTAINED`]). Those domains, and a path into any app's
-//! container or group container, are read and written only by a pass whose responsible app
-//! holds the grant ([`withheld`]): the Widgets row, the doctor's own reads, writes, rollback
-//! and Restore, and a raw `[[defaults]]` row alike, by name or by a path, which has no `..`
-//! ([`expand_rows`] refuses one with it, for every scope).
-//!
-//! Writes go through `defaults` too, never behind cfprefsd's back. A per-user write runs
-//! as that user: run as root, even with `HOME` pointing at the user's home, `defaults`
-//! writes root's own domain in `/var/root/Library/Preferences` (measured in the VM). A
-//! system plist is read and written only below directories that root owns and that no one
-//! else may write but the wheel or admin group, and never through a link. cfprefsd itself
-//! still writes it as root by name, so in a directory the admin group may write
-//! (`/Library/Application Support/CrashReporter`) a member of admin could swap the name
-//! between this check and that write.
 
 use super::{Ctx, Item};
 use crate::baseline::fill_str;
@@ -55,18 +22,7 @@ pub const LAUNCHCTL: &str = "/bin/launchctl";
 /// Reads a system plist file directly when `defaults export` printed an empty domain.
 pub const PLUTIL: &str = "/usr/bin/plutil";
 
-/// The preference domains macOS keeps in an App-Sandboxed app's container
-/// (`~/Library/Containers/<id>/Data/Library/Preferences`), each with its app's name. macOS
-/// guards a container as data from other apps (`kTCCServiceSystemPolicyAppDataDetailed`,
-/// which does not allow prompting). Measured 2026-10-22 in a macOS 27.0 VM, a fresh account
-/// and a dev build of aterm: aterm's child `defaults export com.apple.notificationcenterui -`
-/// was denied (tccd: responsible aterm, accessing `/usr/bin/defaults`, requesting
-/// `sandboxd`), printed an empty domain (181 bytes; `defaults read … widgets`: domain not
-/// found), and macOS showed the person a notice that aterm was prevented from accessing data
-/// from other apps (a dialog on 26.6); over SSH, whose `sshd-keygen-wrapper` holds Full Disk
-/// Access, it printed all 8053 bytes. Once aterm was granted Full Disk Access, the same read
-/// printed all of it with no relaunch: the grant lifts even a denial macOS already recorded.
-/// `com.apple.WindowManager` raised no such request.
+/// Preference domains stored in an App-Sandboxed container (`~/Library/Containers/<id>/Data/Library/Preferences`), paired with app names.
 pub const CONTAINED: [(&str, &str); 1] =
     [("com.apple.notificationcenterui", "Notification Center")];
 
@@ -75,10 +31,7 @@ pub const CONTAINED: [(&str, &str); 1] =
 /// into any app's container or group container (`…/Library/Containers/<id>/…`,
 /// `…/Library/Group Containers/<id>/…`: the roots macOS guards as data from other apps,
 /// `aterm_containment::sbpl::APP_DATA_ROOTS`, matched without regard to case as the volume
-/// names them), by its [`CONTAINED`] name, else by its id. The match is lexical, so a path
-/// that reaches a container through `..` is not one: [`expand_rows`] refuses `..` in a
-/// domain. Only a container's is measured for `defaults`; a group container is gated alike
-/// by the App Data model (docs/DESIGN-macos-tcc-prompts-2026-08-30.md §1.6d), not measured.
+/// names them), by its [`CONTAINED`] name, else by its id.
 fn container_of(domain: &str) -> Option<&str> {
     if let Some((_, app)) = CONTAINED
         .iter()
@@ -106,21 +59,13 @@ fn container_of(domain: &str) -> Option<&str> {
     })
 }
 
-/// Whether `domain` is in another app's sandbox container: one of [`CONTAINED`], or a path
-/// into an app's container or group container ([`container_of`]).
+/// Whether `domain` is in another app's sandbox container.
 #[must_use]
 pub fn contained(domain: &str) -> bool {
     container_of(domain).is_some()
 }
 
-/// Why a process whose Full Disk Access is `full_disk_access`
-/// ([`crate::model::HostFacts::full_disk_access`]) leaves `domain` alone, neither read nor
-/// written: it is in another app's container ([`contained`]: one of [`CONTAINED`], by name or
-/// by a path into it, or a path into any app's container or group container) and the grant
-/// is not known to be held. `None`: it may touch it. The
-/// grant is the one macOS checks: that of the app responsible for the process running the
-/// pass (aterm for System State and a command in an aterm tab, the terminal for one run
-/// elsewhere, `sshd-keygen-wrapper` for one over SSH), measured once per run.
+/// Why a process with `full_disk_access` ([`crate::model::HostFacts::full_disk_access`]) leaves `domain` unread and unwritten.
 #[must_use]
 pub fn withheld(domain: &str, full_disk_access: Option<bool>) -> Option<String> {
     if full_disk_access == Some(true) {
@@ -137,7 +82,7 @@ pub fn withheld(domain: &str, full_disk_access: Option<bool>) -> Option<String> 
 }
 
 /// `launchctl print gui/<uid>`'s exit when the user has no GUI session (27.0 VM: "Could
-/// not find domain for user gui: 599"). A usage error exits 64.
+/// not find domain for user gui: 599").
 const NO_SESSION: i32 = 112;
 /// The groups a directory above a system plist may be writable by: wheel, and admin (stock
 /// macOS's `/Library/Application Support/CrashReporter` is `root:admin 0775`).
@@ -160,14 +105,11 @@ pub enum Scope {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Row {
-    /// The domain (`com.apple.dock`, `NSGlobalDomain`; for `user`, also a plist path without
-    /// `.plist`) or, for `system`, a domain under `/Library/Preferences` or an absolute plist
-    /// path without `.plist`; never with a `..`.
+    /// Preference domain or plist path without `.plist` (under `/Library/Preferences` when `system`).
     pub domain: String,
     /// The key.
     pub key: String,
-    /// The wanted value: a TOML boolean, integer, float, string, array or table, or a
-    /// UTC date-time (`2026-10-16T22:40:34Z`) for a plist `<date>`.
+    /// The wanted value.
     pub value: aterm_toml::Value,
     /// Where it lives.
     pub scope: Scope,
@@ -176,17 +118,16 @@ pub struct Row {
     pub restart: Option<String>,
 }
 
-/// One preference key: its domain, its key, and whose it is.
+/// One preference key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
-    /// The domain as `defaults` takes it: a name (`com.apple.dock`, `-g`), or for a
-    /// system preference an absolute path without `.plist`.
+    /// The domain as `defaults` takes it.
     pub domain: String,
     /// The key.
     pub key: String,
     /// Where it lives.
     pub scope: Scope,
-    /// The account a user or host preference belongs to; `None` for a system one.
+    /// The account a user or host preference belongs to.
     pub user: Option<User>,
 }
 
@@ -211,8 +152,7 @@ impl Target {
         }
     }
 
-    /// The system preference `key` of `domain`: a name under `/Library/Preferences` or
-    /// an absolute path, with or without `.plist`.
+    /// The system preference `key` of `domain`.
     #[must_use]
     pub fn system(domain: &str, key: &str) -> Self {
         let path = if domain.starts_with('/') {
@@ -240,15 +180,13 @@ impl Target {
         }
     }
 
-    /// `defaults [-currentHost] export <domain> -`: the whole domain as XML.
+    /// `defaults [-currentHost] export <domain> -`.
     #[must_use]
     pub fn export_cmd(&self) -> Cmd {
         self.tool().args(["export", self.domain.as_str(), "-"])
     }
 
-    /// The `defaults write` that stores `value`. Scalars use the typed flags; a real goes
-    /// as a `<real>` fragment, since `-float` stores a 32-bit float, and data, dates,
-    /// arrays and dictionaries go as fragments.
+    /// The `defaults write` that stores `value`.
     #[must_use]
     pub fn write_cmd(&self, value: &PValue) -> Cmd {
         let cmd = self
@@ -256,8 +194,6 @@ impl Target {
             .args(["write", self.domain.as_str(), self.key.as_str()]);
         match value {
             PValue::Bool(b) => cmd.args(["-bool", if *b { "true" } else { "false" }]),
-            // `-int` was measured with a positive value; a negative one goes as the
-            // `<integer>` fragment the VM read back.
             PValue::Int(i) if *i >= 0 => cmd.arg("-int").arg(i.to_string()),
             PValue::Str(s) => cmd.arg("-string").arg(s.as_str()),
             other => cmd.arg(plist::fragment(other)),
@@ -277,9 +213,7 @@ impl Target {
         (self.scope == Scope::System).then(|| PathBuf::from(format!("{}.plist", self.domain)))
     }
 
-    /// Every key of the target's domain. For a system domain the plist is checked first
-    /// ([`system_file`]), and an empty export of one whose file exists is checked against
-    /// the file ([`confirm_empty`]).
+    /// Every key of the target's domain.
     ///
     /// # Errors
     /// One line when the domain cannot be read, or an empty answer cannot be trusted.
@@ -322,14 +256,10 @@ impl Target {
     }
 }
 
-/// The entries of the dictionary `export` (a `defaults … export <domain> -`) prints. macOS
-/// 27's export prints `<dict/>` and exits 0 for a domain that does not exist and for one
-/// the reader may not read alike, so an empty answer alone is not "nothing set":
-/// [`Target::entries`] checks a system domain's.
+/// The entries of the dictionary `export` (a `defaults … export <domain> -`) prints.
 ///
 /// # Errors
-/// One line when the export did not run, failed, or printed something other than a
-/// dictionary.
+/// One line when the export did not run, failed, or printed something other than a dictionary.
 pub fn read_domain(sys: &dyn System, export: &Cmd) -> Result<Entries, String> {
     let ran = sys
         .run(export)
@@ -340,9 +270,7 @@ pub fn read_domain(sys: &dyn System, export: &Cmd) -> Result<Entries, String> {
     plist::parse_domain(&ran.stdout).map_err(|why| format!("{}: {why}", export.display()))
 }
 
-/// Refuse a system plist `path` a root read or write could be redirected from: `path` must
-/// be absolute with no `..`, and each directory above it that exists must be a directory,
-/// not a link, owned by root and writable by no one but root and the wheel or admin group.
+/// Refuse a system plist `path` a root read or write could be redirected from.
 ///
 /// # Errors
 /// One line naming the directory, or the path, that fails.
@@ -356,7 +284,6 @@ pub fn check_system_path(sys: &dyn System, path: &Path) -> Result<(), String> {
     for dir in path.ancestors().skip(1) {
         let s = match sys.stat(dir) {
             Ok(s) => s,
-            // Not there yet: the directories above it decide.
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => return Err(format!("{} cannot be checked: {e}", dir.display())),
         };
@@ -381,9 +308,7 @@ pub fn check_system_path(sys: &dyn System, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Check a system plist `path` before root reads or writes it: the directories above it
-/// ([`check_system_path`]), then the file, which must be a regular file when it exists.
-/// Returns its `lstat`, or `None` when there is no file.
+/// Check a system plist `path` before root reads or writes it.
 ///
 /// # Errors
 /// One line saying what fails.
@@ -392,16 +317,12 @@ pub fn system_file(sys: &dyn System, path: &Path) -> Result<Option<Stat>, String
     match sys.stat(path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("{} cannot be checked: {e}", path.display())),
-        // A root read or write through a link would reach wherever the link points.
         Ok(s) if s.symlink || s.dir => Err(format!("{} is not a regular file", path.display())),
         Ok(s) => Ok(Some(s)),
     }
 }
 
 /// Accept an empty export of the system domain whose plist `path` exists only if `plutil`
-/// reads that file as an empty dictionary. `defaults export` prints the same `<dict/>`
-/// for a domain the reader may not read, and `plutil` says why it cannot.
-///
 /// # Errors
 /// One line when the file is unreadable or not empty.
 fn confirm_empty(sys: &dyn System, path: &Path, export: &Cmd) -> Result<(), String> {
@@ -431,7 +352,7 @@ fn confirm_empty(sys: &dyn System, path: &Path, export: &Cmd) -> Result<(), Stri
     }
 }
 
-/// What a read renders as in a report: the value, or `absent`.
+/// What a read renders as in a report.
 #[must_use]
 pub fn render(read: &Read<PValue>) -> String {
     match read {
@@ -451,7 +372,7 @@ pub enum Want {
 }
 
 impl Want {
-    /// Whether `read` already satisfies this; `Err` when the read cannot tell.
+    /// Whether `read` already satisfies this.
     ///
     /// # Errors
     /// The read's reason when it was [`Read::Unusable`].
@@ -474,8 +395,7 @@ impl std::fmt::Display for Want {
     }
 }
 
-/// One preference item: a key that should hold a value (or nothing), read, written and
-/// read back through `defaults` as its owner.
+/// One preference item.
 #[derive(Debug)]
 pub struct Pref {
     family: &'static str,
@@ -496,8 +416,7 @@ pub struct Pref {
 }
 
 impl Pref {
-    /// A preference item. Its effect starts as `Login` for a user or host key and `Now`
-    /// for a system one; [`Pref::restart`] makes it `Relaunch`.
+    /// A preference item.
     #[must_use]
     pub fn new(
         family: &'static str,
@@ -614,7 +533,6 @@ impl Item for Pref {
             Want::Value(v) => self.target.write_cmd(v),
             Want::Unset => self.target.delete_cmd(),
         };
-        // Checked again here: the probe that planned this ran a while ago.
         let kept = match self.target.plist_path() {
             None => None,
             Some(path) => system_file(sys, &path)
@@ -624,7 +542,6 @@ impl Item for Pref {
         let ran = sys
             .run(&cmd)
             .map_err(|e| format!("{}: {e}", cmd.display()))?;
-        // Deleting a key that is already gone leaves what was wanted.
         let gone = self.want == Want::Unset
             && (ran.err().contains("Could not find key") || ran.err().contains("not found"));
         if !ran.success() && !gone {
@@ -653,8 +570,7 @@ impl Item for Pref {
     }
 }
 
-/// The command that puts `target` back to `before`, saying which kind of revert it is:
-/// the write of the value the probe read, or the delete of a key that was not set.
+/// The command that puts `target` back to `before`, saying which kind of revert it is.
 #[must_use]
 pub fn revert_line(
     target: &Target,
@@ -678,16 +594,10 @@ pub fn revert_line(
 }
 
 /// Put a system preference file's owner and mode back as they were before `defaults`
-/// wrote it. cfprefsd rewrites the file whole: in the 27.0 VM a write to
-/// `/Library/Application Support/CrashReporter/DiagnosticMessagesHistory` turned it from
-/// `root:admin 0664` into `root:wheel 0600`. That directory is `root:admin 0775`, so the
-/// owner and mode go through one descriptor ([`System::set_owner_and_mode`]), never a
-/// path a member of admin could swap for a link to another file in between; the
-/// permission bits never include setuid, setgid or sticky.
+/// wrote it.
 fn keep_owner_and_mode(sys: &dyn System, path: &Path, was: Stat) -> Result<(), String> {
     let mode = was.mode & 0o777;
     match sys.set_owner_and_mode(path, was.uid, was.gid, mode) {
-        // A delete that emptied the domain may take the file with it.
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!(
             "written, but restoring {}'s owner {}:{} and mode {mode:o} failed: {e}",
@@ -699,8 +609,7 @@ fn keep_owner_and_mode(sys: &dyn System, path: &Path, was: Stat) -> Result<(), S
     }
 }
 
-/// Relaunch `process` in `user`'s login session, if there is one. Without a session the
-/// preference is read at the next login, so nothing is relaunched.
+/// Relaunch `process` in `user`'s login session, if there is one.
 ///
 /// # Errors
 /// One line when the session check or the relaunch did not work.
@@ -710,7 +619,6 @@ pub fn relaunch(sys: &dyn System, user: &User, process: &str) -> Result<(), Stri
         .arg(format!("gui/{}", user.uid));
     match sys.run(&session) {
         Ok(ran) if ran.success() => {}
-        // "Could not find domain for user gui: <uid>": nobody is logged in.
         Ok(ran) if ran.status == Some(NO_SESSION) => return Ok(()),
         Ok(ran) => {
             return Err(format!(
@@ -726,7 +634,6 @@ pub fn relaunch(sys: &dyn System, user: &User, process: &str) -> Result<(), Stri
         .as_user(user)
         .in_session();
     match sys.run(&kill) {
-        // 1: "No matching processes belonging to you were found": nothing to relaunch.
         Ok(ran) if ran.success() || ran.status == Some(1) => Ok(()),
         Ok(ran) => Err(format!(
             "written, but {}: {}",
@@ -737,8 +644,7 @@ pub fn relaunch(sys: &dyn System, user: &User, process: &str) -> Result<(), Stri
     }
 }
 
-/// An item whose precondition is missing, so it only ever probes [`Probe::Blocked`]: a
-/// row that cannot be built on this host is reported rather than dropped.
+/// An item whose precondition is missing, so it only ever probes [`Probe::Blocked`].
 #[derive(Debug, Clone)]
 pub struct Unmet {
     /// The family.
@@ -775,8 +681,7 @@ impl Item for Unmet {
     }
 }
 
-/// A TOML value as the property-list value `defaults` stores, with `{key}` placeholders
-/// in its strings filled from `vars`.
+/// A TOML value as the property-list value `defaults` stores, with `{key}` placeholders in its strings filled from `vars`.
 ///
 /// # Errors
 /// One line for a date-time a plist `<date>` cannot hold (anything but UTC to the second).
@@ -820,8 +725,7 @@ fn plain_process_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-'))
 }
 
-/// The items `rows` ask for: one per user in `ctx.users` for a user or host row (with
-/// `{user}` filled in its domain, key and strings), one for a system row.
+/// The items `rows` ask for.
 ///
 /// # Errors
 /// One line naming the row that cannot be expanded.
@@ -859,9 +763,6 @@ pub fn expand_rows(rows: &[Row], ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String
                 let target = Target::system(&row.domain, &row.key);
                 let title = format!("{} = {want} (system)", target.describe());
                 let id = format!("defaults.system.{}.{}", row.domain, row.key);
-                // Gated on the file the row resolves to: a name is one under
-                // /Library/Preferences, never a container, and a path into one waits for the
-                // grant as a user row's does.
                 if let Some(why) = withheld(&target.domain, ctx.facts.full_disk_access) {
                     items.push(Box::new(Unmet {
                         family: "defaults",
@@ -878,8 +779,6 @@ pub fn expand_rows(rows: &[Row], ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String
                     let vars = [("user", user.name.as_str())];
                     let domain = fill_str(&row.domain, &vars);
                     let key = fill_str(&row.key, &vars);
-                    // A `..` would reach another app's container by a path the gate below,
-                    // which reads the path as written, does not see as one.
                     if Path::new(&domain)
                         .components()
                         .any(|c| c == Component::ParentDir)
@@ -903,8 +802,6 @@ pub fn expand_rows(rows: &[Row], ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String
                     };
                     let title = format!("{} = {want} for {}", target.describe(), user.name);
                     let id = format!("defaults.{byhost}{domain}.{key}@{}", user.name);
-                    // Another app's container is neither read nor written without the
-                    // grant, by this row as by the Widgets row: the row is reported, blocked.
                     if let Some(why) = withheld(&domain, ctx.facts.full_disk_access) {
                         items.push(Box::new(Unmet {
                             family: "defaults",
@@ -1248,7 +1145,6 @@ pub(crate) mod tests {
     fn a_system_write_runs_as_root_and_puts_the_files_owner_and_mode_back() {
         let sys = Fake::root();
         let path = "/Library/Application Support/CrashReporter/DiagnosticMessagesHistory.plist";
-        // The VM's file before the write: root:admin 0664.
         sys.stat_of(
             path,
             Stat {
@@ -1261,7 +1157,6 @@ pub(crate) mod tests {
             },
         );
         let export_key = "/usr/bin/defaults export '/Library/Application Support/CrashReporter/DiagnosticMessagesHistory' -";
-        // What the VM's export printed (as root) before the write: no AutoSubmit.
         let before = "<dict>\n\t<key>LastCleanupCalled</key>\n\t<date>2026-10-16T23:02:33Z</date>\n\t<key>LastFullSubmissionCalled</key>\n\t<date>2026-10-16T22:41:38Z</date>\n</dict>";
         sys.on(export_key, export(before));
         sys.on(
@@ -1307,8 +1202,6 @@ pub(crate) mod tests {
 
     #[test]
     fn an_empty_export_of_a_system_domain_whose_file_exists_is_read_from_the_file() {
-        // `defaults export` prints `<dict/>` for an unreadable domain as for a missing one
-        // (the 27.0 VM's admin, exporting the root-only com.apple.apsd).
         let path = "/Library/Preferences/com.apple.apsd.plist";
         let export_key = "/usr/bin/defaults export /Library/Preferences/com.apple.apsd -";
         let plutil = format!("/usr/bin/plutil -convert xml1 -o - {path}");
@@ -1328,7 +1221,6 @@ pub(crate) mod tests {
             Read::Unusable(why) => assert!(why.contains("permission to view it"), "{why}"),
             other => panic!("an unreadable domain read {other:?}"),
         }
-        // An Unset want is never satisfied by an unreadable domain.
         let pref = Pref::new(
             "defaults",
             "x".into(),
@@ -1359,7 +1251,6 @@ pub(crate) mod tests {
             other => panic!("{other:?}"),
         }
 
-        // No file at all: the domain does not exist, and plutil is not asked.
         let sys = Fake::root();
         sys.on(export_key, missing());
         assert_eq!(target.read(&sys), Read::Absent);
@@ -1370,7 +1261,6 @@ pub(crate) mod tests {
     fn a_key_whose_value_this_crate_cannot_hold_is_unusable_and_its_neighbours_read() {
         let admin = user("admin", 501);
         let sys = Fake::root();
-        // As `com.apple.ncprefs` holds it on a 27.0.1 Mac.
         sys.on(
             "admin$ /usr/bin/defaults export com.apple.ncprefs -",
             export("<dict>\n\t<key>big</key>\n\t<integer>9223372036854775815</integer>\n\t<key>k</key>\n\t<integer>3</integer>\n</dict>"),
@@ -1410,7 +1300,6 @@ pub(crate) mod tests {
             }
             assert!(sys.calls().is_empty(), "{dir_path}: {:?}", sys.calls());
         }
-        // Stock macOS's CrashReporter directory: root-owned, writable by admin.
         let sys = Fake::root();
         sys.stat_of(
             "/Library/Application Support/CrashReporter",
@@ -1459,7 +1348,6 @@ pub(crate) mod tests {
         assert!(
             matches!(pref.probe(&sys, &ctx(&[])), Probe::Unusable { why } if why.contains("not a regular file"))
         );
-        // The apply checks again, for a link planted after the probe.
         let err = pref.apply(&sys, &ctx(&[])).unwrap_err();
         assert!(err.starts_with("not written: "), "{err}");
         assert!(sys.calls().is_empty(), "{:?}", sys.calls());
@@ -1517,7 +1405,6 @@ pub(crate) mod tests {
         let admin = user("admin", 501);
         let sys = Fake::root();
         script_airdrop(&sys);
-        // What the VM's launchctl answered for a uid with no GUI session.
         sys.on(
             "/bin/launchctl print gui/501",
             Ran::exit(112, "Bad request.\nCould not find domain for user gui: 501"),
@@ -1546,7 +1433,6 @@ pub(crate) mod tests {
         let admin = user("admin", 501);
         let sys = Fake::root();
         script_airdrop(&sys);
-        // 64 is launchctl's usage error (the VM's `launchctl print gui/abc`).
         sys.on(
             "/bin/launchctl print gui/501",
             Ran::exit(64, "Unrecognized target specifier."),
@@ -1603,7 +1489,6 @@ pub(crate) mod tests {
         assert_eq!(rows[0].outcome, Outcome::Deferred);
         assert!(rows[0].why.as_deref().unwrap().contains("at the console"));
         assert!(!sys.calls().iter().any(|c| c.contains(" write ")));
-        // Someone else at the console, or nobody: it goes ahead.
         let mut other = busy.clone();
         other.console = Some(user("bob", 502));
         let rows = run(&one(sharingd(&admin)), &sys, &other, Mode::Plan);
@@ -1754,8 +1639,6 @@ scope = "user"
 
     #[test]
     fn the_live_tool_reads_a_system_domain_it_may_not_read_as_unusable_not_absent() {
-        // Read only: `defaults export` and `plutil` of a root-only plist (root:wheel 0600
-        // on macOS 27), run by a test that is not root. Its export prints `<dict/>`.
         let path = Path::new("/Library/Preferences/com.apple.apsd.plist");
         let live = crate::port::Live::new();
         let denied = matches!(
@@ -1778,8 +1661,6 @@ scope = "user"
 
     /// Only a grant known to be held opens another app's container: refused and not
     /// measured both leave it alone, and a domain outside a container is never withheld.
-    /// Negative control: treating an unmeasured grant as held hands the row a read that
-    /// macOS answers with its warning and an empty domain.
     #[test]
     fn a_container_domain_is_withheld_unless_full_disk_access_is_known_held() {
         for unknown in [None, Some(false)] {
@@ -1795,7 +1676,6 @@ scope = "user"
             assert!(!contained(open), "{open}");
         }
         assert!(contained("com.apple.notificationcenterui"));
-        // A group container, as macOS spells it and in another case.
         for path in [
             "/Users//alice/Library/Group Containers/ABCDE12345.group.example/Library/Preferences/ABCDE12345.group.example",
             "/Users//alice/Library/group containers/ABCDE12345.group.example/Library/Preferences/ABCDE12345.group.example",
@@ -1811,11 +1691,7 @@ scope = "user"
     /// a group container (in any case), or names Notification Center's domain in another
     /// case: without a grant known held (not measured, or refused) its item is
     /// a blocked row under its usual id that runs nothing, apply included; with it, the row
-    /// reads its domain. A row on an open domain, by name or path, is never gated. Negative
-    /// controls: the granted arm's probe exports each container; matching the container's
-    /// name alone (as the gate did) exports the path rows without the grant, matching
-    /// `Library/Containers` alone, or `Group Containers` in its own case only, the group
-    /// container's, and matching the name in its own case only the other-case row.
+    /// reads its domain.
     #[test]
     fn a_raw_row_on_another_apps_container_is_read_and_written_only_with_the_grant() {
         const NC_PATH: &str = "/Users//alice/Library/Containers/com.apple.notificationcenterui/Data/Library/Preferences/com.apple.notificationcenterui";
@@ -1865,7 +1741,6 @@ value = true
 scope = "user"
 "#);
         let alice = user("alice", 501);
-        // As the fake shows a command: an argument with a space in single quotes.
         let export = |domain: &str| {
             let shown = if domain.contains(' ') {
                 format!("'{domain}'")
@@ -1917,9 +1792,7 @@ scope = "user"
     /// A user row whose domain reaches a path through `..` is refused, whatever the grant,
     /// as a system row's is: the gate reads a path as written, and a `..` through
     /// another directory reaches another app's container by a spelling it does not see as
-    /// one (the kernel resolves the `..`, through a symbolic link as it is). Negative control:
-    /// without the refusal each row expands, the first into a read of Notification Center's
-    /// container without the grant, since the gate does not see that path as one.
+    /// one (the kernel resolves the `..`, through a symbolic link as it is).
     #[test]
     fn a_user_domain_that_climbs_with_dotdot_is_refused_whatever_the_grant() {
         let alice = user("alice", 501);
@@ -1946,8 +1819,7 @@ scope = "user"
     /// container is, without a grant known held, a blocked row that runs nothing (no stat of
     /// its directories, no export), and with the grant it reads its file; one that names
     /// Notification Center's domain resolves under /Library/Preferences, no container, and
-    /// is never gated. Negative control: without the system arm's gate, the container row
-    /// probes its path without the grant.
+    /// is never gated.
     #[test]
     fn a_system_row_is_gated_on_the_file_it_resolves_to() {
         let rows = row(r#"

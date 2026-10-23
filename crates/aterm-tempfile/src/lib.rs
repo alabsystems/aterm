@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Generate a temporary name component from the pid, a process-wide counter
+/// and OS randomness.
 #[cfg_attr(trust_verify, trust::skip)]
 fn unique_name(prefix: &str) -> String {
     let pid = std::process::id();
@@ -126,6 +127,7 @@ fn os_random_u64() -> u64 {
 }
 
 /// The name seed to use when the OS CSPRNG is unavailable: a nanosecond wall
+/// clock.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn no_csprng_fallback() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
@@ -138,6 +140,7 @@ fn no_csprng_fallback() -> u64 {
 }
 
 /// `wasm32-unknown-unknown` arm of [`no_csprng_fallback`], the one target
+/// where the clock arm above cannot be used.
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 fn no_csprng_fallback() -> u64 {
     static SEED: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
@@ -196,7 +199,7 @@ where
     f()
 }
 
-/// Two-argument sibling of [`call0`]; see there for why this exists. The Unix
+/// Two-argument sibling of [`call0`]; see there for why this exists.
 #[cfg(unix)]
 fn call2<F, A, B, T>(f: F, a: A, b: B) -> T
 where
@@ -374,6 +377,7 @@ pub fn stand_in(path: &Path, body: &str) -> io::Result<()> {
 }
 
 /// Hard-link the shared copy of `body` at `tmp`, laying it first when it is
+/// absent or not `body`.
 #[cfg(all(
     target_os = "macos",
     any(test, debug_assertions, feature = "test-support")
@@ -414,6 +418,8 @@ fn link_shared(tmp: &Path, dir: &Path, body: &[u8]) -> io::Result<()> {
 }
 
 /// Whether `file` is a regular file holding exactly `body`, mode 0555, owned by
+/// whoever owns `dir`: what was checked is the inode itself, which only its
+/// owner can change.
 #[cfg(all(
     target_os = "macos",
     any(test, debug_assertions, feature = "test-support")
@@ -458,7 +464,7 @@ fn write_read_only(path: &Path, body: &[u8]) -> io::Result<()> {
     written
 }
 
-/// 64-bit FNV-1a: names the shared copy. A collision costs a rewrite, never a
+/// 64-bit FNV-1a: names the shared copy.
 #[cfg(all(
     target_os = "macos",
     any(test, debug_assertions, feature = "test-support")
@@ -550,6 +556,8 @@ mod tests {
     }
 
     /// One body, one read-only inode (on macOS); another body, its own; a shared
+    /// copy whose mode or bytes changed is replaced, not linked; a body laid
+    /// again where it lies leaves nothing beside it.
     #[cfg(unix)]
     #[test]
     fn stand_ins_share_one_read_only_inode_per_body() {
@@ -621,6 +629,7 @@ mod tests {
     }
 
     /// On Windows the OS RNG (BCryptGenRandom) must actually work: two
+    /// consecutive 8-byte reads succeed and produce different values.
     #[cfg(windows)]
     #[test]
     fn windows_os_random_succeeds_and_differs() {

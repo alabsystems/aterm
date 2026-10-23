@@ -1,46 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Background reads of SIBLING aterm instances on this Mac for the menu-bar
-//! status item (`docs/DESIGN-owner-surfaces-2026-10-16.md` §3): enumerate the
-//! live control sockets the shared control-socket dir knows about, ask each
-//! peer `survey facts` — whose rows carry every session's PUBLISHED need
-//! (`needs=`), so a sibling's verdict travels in that one read and is never
-//! re-guessed here — and post the summarized rows back to the event loop as
-//! [`Wake::SiblingScan`]. [`raise_sibling`] dials one sibling's `raise <sid>`,
-//! which selects that exact tab there.
-//!
-//! WHEN. At the status item's install and at every open of its menu, and
-//! then on a cadence of its own — every [`RESCAN_KNOWN`] while the last scan
-//! found a sibling, every [`RESCAN_NONE`] while it found none — so a
-//! sibling need that arises between two opens counts on the badge, and one
-//! resolved, or whose sibling quit, leaves it within seconds. Every scan is
-//! stamped ([`SiblingInstance::scanned_ms`]), and the glance counts a need
-//! only from a young one (`status_item::SIBLING_FRESH`). One cadence at a
-//! time: each request takes it over ([`CADENCE`]), and a scan still
-//! sleeping for an older one ends when it wakes.
-//!
-//! House rules (the `config_watcher` discipline): never on the UI thread;
-//! self-terminating when the loop is gone; and every peer is bounded by a
-//! REAL wall-clock budget — the socket timeout is re-armed with the budget's
-//! remainder before every read/write, so a drip-feeding peer cannot stretch
-//! per-syscall idle timeouts into an unbounded capture (each line is also
-//! byte-capped, and the reply's line count is refused outright over its cap).
-//! The scan-in-flight flag clears on EVERY exit path via a drop guard.
-//!
-//! Trust posture: a graph entry is same-uid-writable, so a dialed socket path
-//! is untrusted. Dialing it presents only THAT PEER's own token (read from
-//! beside its socket, the `aterm-ctl` discovery contract) — no authority of
-//! ours crosses — and everything read back is bounded, so out-of-dir
-//! explicit-`--control-sock` instances are summarized just like
-//! `aterm-ctl instances` lists them. (Contrast `resolve_sibling`, which
-//! CONFINES paths because it relays a client's bytes onward.)
-//!
-//! A sibling whose rows carry no `needs=` runs an older aterm: its sessions
-//! are counted under This Mac and none of its rows is a need — the fleet's
-//! rule for an older peer (§12), so an older build's guess never lights the
-//! badge.
-
+//! Background sibling instance scanner (`survey facts` -> [`Wake::SiblingScan`]) and [`raise_sibling`] dialer.
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -54,8 +15,7 @@ use crate::Wake;
 use crate::status_item::{SiblingInstance, SiblingNeed};
 
 /// Per-peer WALL-CLOCK budget covering the whole dial (connect, auth, the
-/// survey). Every read/write re-arms the socket timeout with the remainder,
-/// so this is a hard bound, not a per-syscall idle window.
+/// survey).
 const PEER_BUDGET: Duration = Duration::from_secs(2);
 /// Hard cap on one reply line — a facts row is a few hundred bytes; a
 /// newline-less flood hits this long before the budget matters.
@@ -73,18 +33,12 @@ static SCAN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// so one cadence runs however many opens requested scans.
 static CADENCE: AtomicU64 = AtomicU64::new(0);
 
-/// How soon the scan runs again while the last one found a sibling: a need
-/// there counts on the badge within this, and leaves it within this of
-/// being resolved.
+/// Rescan interval when the previous scan found a live sibling.
 pub(crate) const RESCAN_KNOWN: Duration = Duration::from_secs(15);
-/// How soon it runs again while the last one found none: a sibling started
-/// since is found within this (a read of the socket directory alone).
+/// Rescan interval when the previous scan found no siblings.
 pub(crate) const RESCAN_NONE: Duration = Duration::from_secs(60);
 
-/// Kick a background sibling scan on thread `aterm-sibling-scan`; the result
-/// arrives as [`Wake::SiblingScan`], and the thread then keeps the cadence
-/// (module doc) until a later request takes it over or the loop is gone.
-/// Coalesces while one is already running.
+/// Starts or coalesces a background sibling scan sending [`Wake::SiblingScan`].
 pub(crate) fn request_scan(proxy: EventLoopProxy<Wake>) {
     if SCAN_IN_FLIGHT.swap(true, Ordering::AcqRel) {
         return;
@@ -106,14 +60,12 @@ pub(crate) fn request_scan(proxy: EventLoopProxy<Wake>) {
                     let _clear = ClearInFlight;
                     let rows = scan_siblings();
                     let known = !rows.is_empty();
-                    // Loop gone (shutdown) ⇒ the send fails and that is the end.
                     if proxy.send_event(Wake::SiblingScan(rows)).is_err() {
                         return;
                     }
                     known
                 };
                 std::thread::sleep(if known { RESCAN_KNOWN } else { RESCAN_NONE });
-                // A later request carries the cadence; or a scan runs now.
                 if CADENCE.load(Ordering::Acquire) != ticket
                     || SCAN_IN_FLIGHT.swap(true, Ordering::AcqRel)
                 {
@@ -126,13 +78,7 @@ pub(crate) fn request_scan(proxy: EventLoopProxy<Wake>) {
     }
 }
 
-/// Raise session `sid` of the sibling at `sock` (pid `pid`) on a thread of
-/// its own: `raise <sid>` selects that exact tab there and raises its window.
-/// Whatever it answered, [`Wake::SiblingRaised`] then brings the sibling's
-/// process forward (`App::apprt.activate_instance`, main thread): a window
-/// another app raises stays behind the active app, and a sibling that
-/// refused or did not answer is at least raised as a process. macOS only:
-/// its one caller is the status item's dispatch.
+/// Dials `raise <sid>` on the sibling at `sock` (`pid`) on a background thread.
 #[cfg(target_os = "macos")]
 pub(crate) fn raise_sibling(proxy: EventLoopProxy<Wake>, pid: u32, sock: String, sid: String) {
     let _ = std::thread::Builder::new()
@@ -177,11 +123,7 @@ fn scan_siblings() -> Vec<SiblingInstance> {
     rows
 }
 
-/// How many sibling instances run for this user — the control sockets
-/// [`sibling_targets`] finds, whose pid is a live process — this one not
-/// counted: the survey's `instances=`, so a fleet reader, which reads this
-/// instance alone, says the others were not read. A socket that names no
-/// pid, or a gone one, is none. A directory read, no dial.
+/// Counts live sibling `aterm` instances for the current user.
 pub(crate) fn live_siblings() -> usize {
     sibling_targets()
         .into_iter()
@@ -199,8 +141,6 @@ fn sibling_targets() -> Vec<(u32, String)> {
     let own_pid = std::process::id();
     let mut seen: HashSet<String> = HashSet::new();
     let remember = |seen: &mut HashSet<String>, sock: &str| -> bool {
-        // Canonical-path dedup (macOS aliases /var to /private/var) doubling
-        // as self-exclusion: `self_sock_path` is already canonical.
         let key = std::fs::canonicalize(sock)
             .map_or_else(|_| sock.to_string(), |p| p.to_string_lossy().into_owned());
         if self_sock.as_deref() == Some(key.as_str()) {
@@ -210,7 +150,6 @@ fn sibling_targets() -> Vec<(u32, String)> {
     };
 
     let mut targets: Vec<(u32, String)> = Vec::new();
-    // Pass 1: per-instance sockets named aterm-<pid>.sock in the shared dir.
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
@@ -226,11 +165,6 @@ fn sibling_targets() -> Vec<(u32, String)> {
             }
         }
     }
-    // Pass 2: instances on an explicit `--control-sock`, via graph/<sid> entries —
-    // these live OUTSIDE the shared dir by definition (that is the whole point
-    // of the pass), so the path is accepted un-confined, absolute-only: the
-    // `aterm-ctl instances` contract. Safe because the dial presents only the
-    // target's own beside-the-socket token and bounded reads (module doc).
     if let Ok(entries) = std::fs::read_dir(dir.join("graph")) {
         for e in entries.flatten() {
             let Ok(body) = std::fs::read_to_string(e.path()) else {
@@ -255,9 +189,7 @@ fn sibling_targets() -> Vec<(u32, String)> {
 }
 
 /// One `session …` row of a `survey facts` reply, read by key: the session
-/// counted, and its need where the row publishes one. `None` for a line that
-/// is no session row, and for an `exited` session — the LOCAL glance counts
-/// only the live, so the sibling summary counts by the same rule.
+/// counted, and its need where the row publishes one.
 fn parse_session_row(line: &str) -> Option<(Option<SiblingNeed>, bool)> {
     let rest = line
         .trim_end_matches(['\r', '\n'])
@@ -273,25 +205,16 @@ fn parse_session_row(line: &str) -> Option<(Option<SiblingNeed>, bool)> {
     }
     let sid = field("sid")?;
     let Some(needs) = field("needs") else {
-        // `needs=-` (nothing needed) reads `None` above too: tell it from a
-        // row with no such key, an older aterm's.
         let published = rest.split(' ').any(|tok| tok.starts_with("needs="));
         return Some((None, published));
     };
     let Some(word) = NeedWord::parse(&needs) else {
-        // A word this build does not know: a newer aterm's, never guessed.
+        // Unknown need word from a newer build.
         return Some((None, true));
     };
     let label = field("role")
         .or_else(|| field("program"))
         .unwrap_or_else(|| crate::presence::short_sid(&sid));
-    // A stall's age is its task's; a wall's or a box's the agent
-    // publication's. An ask's is neither: the row carries no age of the ask,
-    // and the agent's would date a fresh ask by an idle agent's hours, so it
-    // has none (it shows no age and sorts last). A frozen or stopped program
-    // dates by the agent publication only where it is an identified agent,
-    // whose verdict the stall sets; a plain program's `agent_ms` is its
-    // session's age, so its freeze has none.
     let agent = field("program_kind").as_deref() == Some("agent");
     let age_ms = match word {
         NeedWord::Stalled => field("task_ms"),
@@ -327,14 +250,9 @@ fn arm(stream: &aterm_uds::CtlStream, deadline: Instant) -> Option<()> {
     Some(())
 }
 
-/// Dial one sibling and read its `survey facts`. A refusal, budget exhaustion
-/// or malformed frame skips the peer silently (the `run_discovery` posture).
-/// Its live sessions are counted; its needs are the rows' published `needs=`,
-/// none at all where its rows publish none (an older aterm, module doc).
+/// Dial one sibling and read its `survey facts`.
 fn summarize_peer(pid: u32, sock: &str) -> Option<SiblingInstance> {
     let deadline = Instant::now() + PEER_BUDGET;
-    // The sibling's token, read once the connect succeeded: the listener's
-    // that took it, never one its update's successor refuses.
     let (stream, token) = aterm_ctl::connect_then_read_token(sock).ok()?;
     let token = token.ok()?;
     arm(&stream, deadline)?;
@@ -346,7 +264,6 @@ fn summarize_peer(pid: u32, sock: &str) -> Option<SiblingInstance> {
     let header = read_bounded_line(&stream, &mut reader, deadline)?;
     let count: usize = header.trim_end().strip_prefix("OK ")?.parse().ok()?;
     if count > MAX_SESSIONS_PER_PEER + 1 {
-        // Refuse, never clamp: reading fewer lines than the peer sent would
         // leave the leftovers desyncing every later reply on this stream.
         return None;
     }
@@ -400,9 +317,7 @@ mod tests {
     /// (else its program) as the label, and the age of the fact it stands on
     /// (none for an ask, whose row carries only the agent publication's);
     /// `needs=-` is a counted session needing nothing; an exited session and
-    /// a line that is no session row are not counted. A row with no `needs=`
-    /// key is an older aterm's (NEGATIVE CONTROL: its sessions count, and its
-    /// attention is no need).
+    /// a line that is no session row are not counted.
     #[test]
     fn survey_facts_rows_carry_the_published_need() {
         let (need, published) = parse_session_row(
@@ -435,8 +350,6 @@ mod tests {
         )
         .expect("a live row");
         assert_eq!(need.expect("its need").age_ms, None, "an ask has no age");
-        // A plain program's freeze has no age: its `agent_ms` is the
-        // session's (the frozen agent above keeps its own).
         let (need, _) = parse_session_row(
             "session local=10 sid=s-sleep state=alive program=sleep program_kind=program \
              agent=- agent_ms=240912 needs=frozen hold_by=-",
@@ -466,9 +379,7 @@ mod tests {
 
     /// A scripted sibling over a real Unix socket serving AUTH and `survey
     /// facts` — the whole dial in ONE read: its live sessions are counted,
-    /// its published needs travel, an exited row is not counted. NEGATIVE
-    /// CONTROL: an older sibling whose rows carry no `needs=` counts its
-    /// sessions and raises no need, whatever attention it carries.
+    /// its published needs travel, an exited row is not counted.
     #[cfg(unix)]
     #[test]
     fn summarize_peer_reads_a_scripted_sibling() {
@@ -477,8 +388,6 @@ mod tests {
             let scratch = crate::test_scratch::short_dir("the peer's socket");
             let dir = scratch.path();
             let sock = dir.join("peer.sock");
-            // The sibling token read beside the socket (non-pid name ⇒
-            // aterm.token).
             std::fs::write(dir.join("aterm.token"), "feedbeef\n").unwrap();
             let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
             let reply = format!(
@@ -499,10 +408,6 @@ mod tests {
                 assert_eq!(line, "survey facts\n");
                 let mut w = conn.try_clone().unwrap();
                 w.write_all(reply.as_bytes()).unwrap();
-                // Held open until the client hangs up, as a live sibling
-                // holds it: macOS refuses a socket option on a socket whose
-                // peer has closed, and the client re-arms its timeout before
-                // every line.
                 line.clear();
                 assert_eq!(reader.read_line(&mut line).unwrap(), 0, "{line:?}");
             });

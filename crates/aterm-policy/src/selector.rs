@@ -2,44 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Sequence selector parser and matcher.
-//!
-//! A [`SequenceSelector`] is the parsed form of a rule's `sequence` string,
-//! e.g. `"OSC 4;*;?"` → `SequenceSelector { function: Osc, major: Some(4),
-//! params: [Wildcard, Literal("?")] }`. Selectors describe *patterns* that
-//! match against concrete [`DispatchedSequence`] values produced at the
-//! handler boundary.
-//!
-//! # Grammar
-//!
-//! ```text
-//! selector   := catch_all | function_selector
-//! catch_all  := "*" | "response any"
-//! function_selector
-//!            := function_kind major ( separator param )* suffix?
-//! function_kind
-//!            := "OSC" | "CSI" | "DCS"
-//! major      := unsigned-int | "*"
-//! separator  := ";" | " "
-//! param      := unsigned-int | "?" | "*" | token
-//! suffix     := " " ident           // e.g. "set", "query", or the CSI final byte
-//! ```
-//!
-//! Named aliases like `"OSC 52 set"` and `"response any"` are expanded first
-//! (see the [`aliases`] table). Aliases always resolve to a canonical selector
-//! form so the matcher does not have to know about them.
-//!
-//! # Matching
-//!
-//! Selector parameters are matched position-by-position against the
-//! dispatched parameters. A `Wildcard` matches any single parameter (but
-//! must be present). A `Literal` matches by string equality. When the
-//! selector's parameter list is shorter than the dispatched list, the
-//! selector only matches the prefix — this gives `"OSC 4"` (no params)
-//! "match any OSC 4" semantics.
-//!
-//! `*` is the universal matcher. `response any` parses to the same selector;
-//! the distinction is documentation only (see the alias table).
+//! Sequence selector parser and matcher
+//! ([`SequenceSelector`], [`DispatchedSequence`], [`aliases`]).
 
 use core::fmt;
 
@@ -48,30 +12,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::aliases;
 
-// Function kind
-
-/// Top-level function classifier used by [`SequenceSelector`] and
-/// [`DispatchedSequence`].
-///
-/// These variants mirror the three escape-sequence families covered by the
-/// policy engine. CSI is treated as a single bucket even though the final
-/// byte is significant — the byte is carried as the `suffix` field so both
-/// `CSI t` (any `t`) and `CSI 20 t` (parameter `20`, final `t`) can be
-/// expressed.
+/// Top-level function classifier used by [`SequenceSelector`] and [`DispatchedSequence`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "toml", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "toml", serde(rename_all = "UPPERCASE"))]
 #[non_exhaustive]
 pub enum FunctionKind {
-    /// OSC (Operating System Command) — `ESC ]`.
+    /// OSC (Operating System Command).
     Osc,
-    /// CSI (Control Sequence Introducer) — `ESC [`.
+    /// CSI (Control Sequence Introducer).
     Csi,
-    /// DCS (Device Control String) — `ESC P`.
+    /// DCS (Device Control String).
     Dcs,
-    /// Catch-all — universal matcher (`*` / `response any`). Used only in
-    /// [`SequenceSelector`]; a dispatched sequence is never tagged
-    /// `Wildcard`.
+    /// Catch-all — universal matcher (`*` / `response any`).
     Wildcard,
 }
 
@@ -86,30 +39,21 @@ impl fmt::Display for FunctionKind {
     }
 }
 
-// Param
-
 /// One parameter position in a [`SequenceSelector`].
-///
-/// Kept small so matching stays trivially total (no regex or range matchers).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SelectorParam {
     /// Match any non-empty parameter at this position.
     Wildcard,
-    /// Match by string equality. Numeric parameters are compared as their
-    /// decimal string form (`"20"`, not `20u32`) — this keeps the matcher
-    /// closed under a single comparison strategy.
+    /// Match by string equality.
     Literal(String),
     /// Match the literal `"?"` query marker (OSC 4 / OSC 52 query).
     Query,
     /// Match the literal "not-`?`" complement used by set-path aliases.
-    /// Present when `"OSC 4 set"` expanded to `"OSC 4;*;<not-question>"`.
     NotQuery,
 }
 
 impl SelectorParam {
     /// Returns `true` if this selector parameter matches `actual`.
-    ///
-    /// Totality: every input combination is decidable without panicking.
     #[must_use]
     #[inline]
     pub fn matches(&self, actual: &str) -> bool {
@@ -122,32 +66,14 @@ impl SelectorParam {
     }
 }
 
-// SequenceSelector
-
 /// A compiled pattern matched against a [`DispatchedSequence`].
-///
-/// Produced by [`SequenceSelector::parse`] when the engine is built; the
-/// string in [`crate::Rule::sequence`] is kept as written so a policy
-/// round-trips through TOML losslessly. Parsing is pure.
-///
-/// # Canonical forms
-///
-/// * `"*"` → `SequenceSelector::catch_all()`
-/// * `"response any"` → `SequenceSelector::catch_all()`
-/// * `"OSC 4"` → function=Osc, major=Some(4), params=[]
-/// * `"OSC 4;*;?"` → function=Osc, major=Some(4), params=[Wildcard, Query]
-/// * `"CSI 20 t"` → function=Csi, major=Some(20), suffix=Some("t"), params=[]
-/// * `"CSI t"` → function=Csi, major=None, suffix=Some("t"), params=[]
-/// * `"DCS 2000p"` → function=Dcs, major=None, suffix=Some("2000p"), params=[]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SequenceSelector {
     /// Top-level function family.
     pub function: FunctionKind,
-    /// Primary code (e.g. OSC 4 → `Some(4)`; OSC catch-all within a family
-    /// → `None`).
+    /// Primary code (e.g. OSC 4 → `Some(4)`; OSC catch-all within a family → `None`).
     pub major: Option<u32>,
-    /// Optional trailing token — the CSI final byte (`"t"`) or the DCS
-    /// intermediate string (`"2000p"`). `None` for OSC.
+    /// Optional trailing token.
     pub suffix: Option<String>,
     /// Per-position parameter matchers.
     pub params: Vec<SelectorParam>,
@@ -168,36 +94,14 @@ impl SequenceSelector {
 
     /// Parse a selector string (TOML form) into a compiled selector.
     ///
-    /// Aliases in [`aliases::ALIAS_TABLE`] are expanded first. Unknown
-    /// aliases are treated as raw selectors — the parser does not reject
-    /// unfamiliar tokens, it just fails to find a non-trivial structure,
-    /// which means the selector will never match (fail-closed at the
-    /// matcher level).
-    ///
     /// # Errors
-    ///
-    /// Returns [`SelectorParseError`] if the input cannot be classified as
-    /// a catch-all or a function-major selector. The engine keeps such a rule
-    /// but never matches it.
+    /// Returns [`SelectorParseError`] if the input cannot be classified as a catch-all.
     #[inline]
     pub fn parse(src: &str) -> Result<Self, SelectorParseError> {
         parse_compiled(expand_alias(src))
     }
 
     /// Returns `true` if this selector matches `seq`.
-    ///
-    /// Matching rules:
-    ///
-    /// 1. `FunctionKind::Wildcard` matches any sequence regardless of family.
-    /// 2. Otherwise the function must match exactly.
-    /// 3. If `major` is `Some`, the sequence's major must equal it.
-    ///    `None` is the major-level wildcard (e.g. `"CSI t"`).
-    /// 4. If `suffix` is `Some`, the sequence's suffix must equal it.
-    ///    `None` matches any suffix.
-    /// 5. `params` are matched position-by-position. The selector may be
-    ///    shorter than the sequence; extra sequence parameters are ignored.
-    ///    The selector may not be longer than the sequence — that is an
-    ///    explicit non-match.
     #[must_use]
     pub fn matches(&self, seq: &DispatchedSequence) -> bool {
         if self.function == FunctionKind::Wildcard {
@@ -227,9 +131,7 @@ impl SequenceSelector {
         true
     }
 
-    /// The decision-tree bucket key for this selector. Selectors with the
-    /// same key share a bucket in the compiled engine (see
-    /// [`crate::engine`]).
+    /// The decision-tree bucket key for this selector.
     #[must_use]
     #[inline]
     pub const fn bucket_key(&self) -> BucketKey {
@@ -240,30 +142,16 @@ impl SequenceSelector {
     }
 }
 
-// Dispatched sequence
-
 /// A concrete escape sequence ready for policy evaluation.
-///
-/// Built by the handler at dispatch time. Parameters are the raw text tokens
-/// (OSC argument strings split by `;`, CSI numeric parameters as their
-/// decimal string form). The `suffix` field carries CSI final bytes and DCS
-/// intermediate strings.
-///
-/// Holds `String`s rather than raw bytes so selectors match by string
-/// equality.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DispatchedSequence {
     /// Function family.
     pub function: FunctionKind,
-    /// Primary parameter. `None` is valid only when the dispatched sequence
-    /// has no numeric prefix (rare — e.g. `ESC P 2000 p`, where the whole
-    /// thing is the suffix).
+    /// Primary parameter.
     pub major: Option<u32>,
-    /// Trailing token: CSI final byte, or DCS intermediate+final (e.g.
-    /// `"2000p"`).
+    /// Trailing token: CSI final byte, or DCS intermediate+final (e.g. `"2000p"`).
     pub suffix: Option<String>,
-    /// Remaining parameters (after `major`), in dispatch order, as raw
-    /// string tokens.
+    /// Remaining parameters (after `major`), in dispatch order, as raw string tokens.
     pub params: Vec<String>,
 }
 
@@ -280,8 +168,7 @@ impl DispatchedSequence {
         }
     }
 
-    /// Convenience constructor for CSI sequences. `final_byte` is the CSI
-    /// dispatch byte (e.g. `'t'`).
+    /// Convenience constructor for CSI sequences.
     #[must_use]
     #[inline]
     pub fn csi(
@@ -297,9 +184,7 @@ impl DispatchedSequence {
         }
     }
 
-    /// Convenience constructor for DCS sequences. The `intermediate_final`
-    /// string carries the intermediate bytes plus the final byte, e.g.
-    /// `"2000p"`.
+    /// Convenience constructor for DCS sequences.
     #[must_use]
     #[inline]
     pub fn dcs(intermediate_final: impl Into<String>) -> Self {
@@ -312,13 +197,7 @@ impl DispatchedSequence {
     }
 }
 
-// Bucket key for precompiled decision tree
-
 /// Decision-tree bucket key used by the precompiled engine table.
-///
-/// Selectors with the same `(function, major)` share a bucket. Rules inside
-/// the bucket are walked in declared order. Wildcard selectors bucket under
-/// `(Wildcard, None)` and are consulted last as the catch-all tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BucketKey {
     /// Function family.
@@ -327,9 +206,7 @@ pub struct BucketKey {
     pub major: Option<u32>,
 }
 
-// Parsing
-
-/// Selector parser error. A rule whose selector fails to parse never matches.
+/// Selector parser error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SelectorParseError {
@@ -337,8 +214,7 @@ pub enum SelectorParseError {
     Empty,
     /// The first token was not a recognized function kind.
     UnknownFunction(String),
-    /// The major code (e.g. the `4` in `"OSC 4"`) failed to parse as a
-    /// non-negative integer.
+    /// The major code (e.g. the `4` in `"OSC 4"`) failed to parse as a non-negative integer.
     BadMajor(String),
 }
 
@@ -355,11 +231,6 @@ impl fmt::Display for SelectorParseError {
 impl std::error::Error for SelectorParseError {}
 
 /// Expand a named alias to its canonical selector form.
-///
-/// Aliases are documented in [`aliases::ALIAS_TABLE`]; this function
-/// translates the human-readable form to the concrete selector syntax the
-/// parser recognizes. Unknown aliases pass through unchanged so the caller's
-/// parser sees the original string.
 pub(crate) fn expand_alias(src: &str) -> &str {
     let trimmed = src.trim();
     match trimmed {
@@ -370,8 +241,6 @@ pub(crate) fn expand_alias(src: &str) -> &str {
         "OSC 21 set named" => "OSC 21;<named>",
         "OSC 21 set indexed" => "OSC 21;<indexed>",
         "response any" | "*" => "*",
-        // A table alias with no translation above parses as the catch-all;
-        // the rule's own origin gate and response still apply.
         _ if aliases::lookup(trimmed).is_some() => "*",
         _ => src,
     }
@@ -386,8 +255,6 @@ fn parse_compiled(src: &str) -> Result<SequenceSelector, SelectorParseError> {
         return Ok(SequenceSelector::catch_all());
     }
 
-    // Split on whitespace for the "function major [rest]" prefix, then
-    // tokenize the rest on `;`.
     let mut head = trimmed.splitn(3, ' ');
     let fn_tok = head.next().unwrap_or("").trim();
     let major_tok = head.next().unwrap_or("").trim();
@@ -417,8 +284,6 @@ fn parse_function_body(
 }
 
 fn parse_osc_body(major_tok: &str, rest: &str) -> Result<SequenceSelector, SelectorParseError> {
-    // `major_tok` may itself carry `;params` when the caller wrote
-    // `"OSC 4;*;?"` (all in one word). Split if necessary.
     let (major_str, leftover) = split_major(major_tok);
     let major = parse_major_or_wildcard(major_str)?;
 
@@ -432,9 +297,6 @@ fn parse_osc_body(major_tok: &str, rest: &str) -> Result<SequenceSelector, Selec
 }
 
 fn parse_csi_body(major_tok: &str, rest: &str) -> Result<SequenceSelector, SelectorParseError> {
-    // CSI can be `"CSI t"` (major_tok == "t", rest == "") or
-    // `"CSI 20 t"` (major_tok == "20", rest == "t") or
-    // `"CSI ? h"` (major_tok == "?", rest == "h").
     let (major, suffix) = if is_csi_final_byte(major_tok) && rest.is_empty() {
         (None, Some(major_tok.to_owned()))
     } else if major_tok == "*" {
@@ -454,9 +316,6 @@ fn parse_csi_body(major_tok: &str, rest: &str) -> Result<SequenceSelector, Selec
 }
 
 fn parse_dcs_body(major_tok: &str, rest: &str) -> Result<SequenceSelector, SelectorParseError> {
-    // DCS in the design is always `"DCS <intermediate><final>"`, e.g.
-    // `"DCS 2000p"` — a single token after DCS. Accept both
-    // `"DCS 2000p"` (major_tok=2000p, rest="") and `"DCS 2000 p"` (major_tok=2000, rest=p).
     let suffix = if rest.is_empty() {
         Some(major_tok.to_owned())
     } else {
@@ -486,7 +345,6 @@ fn collect_osc_params(leftover: Option<&str>, rest: &str) -> Vec<SelectorParam> 
         push_params(&mut out, l);
     }
     if !rest.is_empty() {
-        // Rest may itself be `;param;param` or `param;param`.
         let trimmed = rest.trim_start_matches(';');
         push_params(&mut out, trimmed);
     }
@@ -528,7 +386,6 @@ fn parse_major_or_wildcard(tok: &str) -> Result<Option<u32>, SelectorParseError>
 
 #[inline]
 const fn is_csi_final_byte(tok: &str) -> bool {
-    // A CSI final byte is a single printable non-digit character.
     matches!(
         tok.as_bytes(),
         [b'A'..=b'Z' | b'a'..=b'z' | b'@' | b'`' | b'~' | b'^']
@@ -544,8 +401,6 @@ fn non_empty_string(s: &str) -> Option<String> {
         Some(trimmed.to_owned())
     }
 }
-
-// Tests
 
 #[cfg(test)]
 mod tests {
@@ -602,19 +457,15 @@ mod tests {
         let csi =
             |major: u32, final_byte: char| DispatchedSequence::csi(Some(major), final_byte, []);
         for (selector, sequence, matches) in [
-            // The catch-all matches everything (`*` parses to `catch_all()`).
             ("*", osc(4, &[]), true),
             ("*", csi(20, 't'), true),
             ("*", DispatchedSequence::dcs("2000p"), true),
-            // OSC 52 set is a clipboard write, never a query; query is the query.
             ("OSC 52 set", osc(52, &["c", "SGVsbG8="]), true),
             ("OSC 52 set", osc(52, &["c", "?"]), false),
             ("OSC 52 query", osc(52, &["c", "?"]), true),
-            // A bare OSC 4 matches any OSC 4, but not OSC 5.
             ("OSC 4", osc(4, &["3", "?"]), true),
             ("OSC 4", osc(4, &["5", "red"]), true),
             ("OSC 4", osc(5, &[]), false),
-            // A final-only CSI selector matches any CSI with that final.
             ("CSI t", csi(20, 't'), true),
             ("CSI t", csi(1, 't'), true),
             ("CSI t", csi(1, 'h'), false),
@@ -622,8 +473,6 @@ mod tests {
             ("CSI 20 t", csi(21, 't'), false),
             ("DCS 2000p", DispatchedSequence::dcs("2000p"), true),
             ("DCS 2000p", DispatchedSequence::dcs("1000p"), false),
-            // A selector longer than the sequence never matches; a shorter one
-            // matches as a prefix.
             ("OSC 4;*;?", osc(4, &["3"]), false),
             ("OSC 4;*", osc(4, &["3", "anything"]), true),
         ] {

@@ -1097,10 +1097,12 @@ fn a_persons_input_marks_its_burst_and_attributes_the_turn() {
         .filter(|l| l.contains(" human "))
         .collect();
     assert_eq!(humans.len(), 1, "one mark per burst: {got:?}");
+    // Seq 4: a test build's `holder-named` dev row (the agent named) is a
+    // `row` mark, one record before it.
     assert_eq!(
         *humans[0],
         format!(
-            "3 mark - human by=human src=input conf=strong t={}",
+            "4 mark - human by=human src=input conf=strong t={}",
             WALL0 + 100
         )
     );
@@ -5453,22 +5455,36 @@ fn closed_log(marks: usize) -> Log {
     g.slog().log().clone()
 }
 
+/// Close `n`'s slot (roster seq `n + 1`, local `n`) linked into `index`, then `log`'s part attached as `keep` says: how many skeletons the two freed.
+fn link_closed(index: &mut ClosedLogs, log: &Log, n: u64, keep: ClosedKeep) -> usize {
+    let sid = aterm_session::SessionId::new(format!("s-closed-{n}"));
+    let linked = index.link(ClosedExit {
+        seq: n + 1,
+        t_ms: n,
+        sid: sid.clone(),
+        local_id: n,
+        reason: ExitReason::UiClose,
+        exit_code: None,
+        actor: ExitActor::Human,
+    });
+    let kept = ClosedLog::kept_from(
+        log,
+        sid,
+        Default::default(),
+        0,
+        aterm_session::LaunchNonce::generate(),
+        keep,
+    );
+    linked.len() + index.keep_closed(n + 1, kept).len()
+}
+
 #[test]
 fn the_index_keeps_512_summaries_and_the_newest_32_skeletons() {
     let log = closed_log(40);
     let mut index = ClosedLogs::default();
     let mut freed = 0;
     for n in 0..=CLOSED_INDEX_CAP as u64 {
-        let entry = ClosedLog::kept_from(
-            &log,
-            aterm_session::SessionId::new(format!("s-closed-{n}")),
-            n,
-            Default::default(),
-            0,
-            aterm_session::LaunchNonce::generate(),
-            crate::session_log::ClosedKeep::Skeleton,
-        );
-        freed += index.link(entry).len();
+        freed += link_closed(&mut index, &log, n, ClosedKeep::Skeleton);
     }
     let newest = CLOSED_INDEX_CAP as u64;
     assert_eq!(index.counts(), (CLOSED_INDEX_CAP, CLOSED_SKELETONS));
@@ -5507,16 +5523,7 @@ fn a_closed_summary_is_at_most_a_kilobyte_and_answers_log_and_brief() {
     assert!(log.lost() > 0, "PRECONDITION: a full ring");
     let mut index = ClosedLogs::default();
     for n in 0..=CLOSED_SKELETONS as u64 {
-        let entry = ClosedLog::kept_from(
-            &log,
-            aterm_session::SessionId::new(format!("s-closed-{n}")),
-            n,
-            Default::default(),
-            0,
-            aterm_session::LaunchNonce::generate(),
-            crate::session_log::ClosedKeep::Skeleton,
-        );
-        drop(index.link(entry));
+        let _ = link_closed(&mut index, &log, n, ClosedKeep::Skeleton);
     }
     let oldest = index.by_local(0).expect("held");
     let ClosedSource::Summary(text) = oldest.source() else {
@@ -5656,13 +5663,14 @@ fn a_window_close_builds_only_what_the_closed_index_keeps() {
             .unwrap()
             .closed_logs()
             .by_local(last)
-            .is_none(),
-        "the app's last close links no entry"
+            .is_some_and(|e| matches!(e.source(), ClosedSource::Summary(_))),
+        "the app's last close links its summary"
     );
+    // Its slot is the newest, so the 33rd-newest's skeleton goes.
     assert_eq!(
         app.store.read().unwrap().closed_logs().counts(),
-        (40, CLOSED_SKELETONS),
-        "the app's last close builds no entry"
+        (41, CLOSED_SKELETONS - 1),
+        "the app's last close builds no skeleton"
     );
     for of in [1, 2, CLOSED_SKELETONS] {
         assert!((0..of).all(|i| ClosedKeep::in_batch(i, of) == ClosedKeep::Skeleton));

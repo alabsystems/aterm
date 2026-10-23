@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use aterm_session::SessionId;
 
 /// The directory the re-key files live in: `<control dir>/rekey`, created
+/// `0700`.
 fn dir() -> Option<PathBuf> {
     crate::control_auth::private_subdir("rekey")
 }
@@ -302,6 +303,7 @@ pub(crate) mod typed {
     }
 
     /// One issued typed re-key: its file, and the key to settle it by (`None`
+    /// for an upgrade of a healthy shell, which authorized nothing).
     struct Issued {
         serial: u64,
         path: PathBuf,
@@ -320,26 +322,32 @@ pub(crate) mod typed {
     /// What an issue writes, decided from the engine under one lock.
     enum Plan {
         /// A degraded shell: a fresh key, authorized as one it has not taken (and the
+        /// upgrade's lines, when it is behind).
         Heal,
         /// A healthy shell that is behind: the key it already signs with, never moved, and
+        /// the upgrade's lines.
         UpgradeOnly([u8; 32]),
     }
 
     /// The typed re-keys issued and not yet settled, by session: at most one
+    /// each.
     static ISSUED: Mutex<BTreeMap<String, Issued>> = Mutex::new(BTreeMap::new());
 
     /// This process's typed re-key numbers: each file's name is its own.
     static SERIAL: AtomicU64 = AtomicU64::new(1);
 
-    /// One issue at a time. [`issue_in`] is a sequence (settle the previous key,
+    /// One issue at a time.
     static ISSUING: Mutex<()> = Mutex::new(());
 
     /// Whether the shell of `engine` is behind: the last revision it signed is not this
+    /// build's.
     fn behind(engine: &Terminal) -> bool {
         engine.shell_integration_rev() != Some(crate::shell_body::own_rev())
     }
 
     /// What `term`'s shell may be issued, and whether the upgrade's lines go with it
+    /// (`upgrading` and the shell is [`behind`]): a heal when degraded, an upgrade-only file
+    /// when healthy and upgrading, else why not.
     fn plan(term: &Mutex<Terminal>, upgrading: bool) -> Result<(Plan, bool), Refusal> {
         let engine = crate::term_lock(term);
         let upgrading = upgrading && behind(&engine);
@@ -478,6 +486,7 @@ pub(crate) mod typed {
     }
 
     /// Remove `<sid>.<n>` files no live key names: left by a window that exited
+    /// before its expiry settled them.
     fn sweep_leftovers(dir: &Path, sid: &SessionId) {
         let prefix = format!("{}.", sid.as_str());
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -564,6 +573,7 @@ mod tests {
     }
 
     /// The key lands 0600 with its newline, replacing a stale key, and a planted
+    /// symlink at the path is replaced without writing through it.
     #[test]
     fn delivery_is_private_exclusive_and_never_through_a_symlink() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -606,6 +616,8 @@ mod tests {
     }
 
     /// A command cycle (prompt, command line, start) signed with `id`
+    /// (`";id=<hex>"`, or `""` for none); `status detail=` reads the running
+    /// command from it, so it shows whether marks reach the engine.
     fn cycle(id: &str) -> String {
         format!(
             "\x1b]133;A{id}\x07$ \x1b]633;E;claude --resume{id}\x07\x1b]133;B{id}\x07\
@@ -614,6 +626,7 @@ mod tests {
     }
 
     /// The carry of a parent that lost the shell's nonce: the requirement
+    /// crosses in `modes`, the nonce does not.
     fn carry_without_nonce() -> aterm_core::terminal::TerminalCheckpoint {
         let mut parent = Terminal::new(24, 80);
         parent.set_require_shell_integration_nonce(true);
@@ -631,6 +644,7 @@ mod tests {
     }
 
     /// A session with the channel, adopted with its nonce requirement and no nonce (or no
+    /// screen), gets a key in its file from `spawn::hydrate_adopted_engine`.
     #[test]
     fn the_adoption_rekeys_a_degraded_shell_that_has_the_channel() {
         let dir = scratch("rk-heal");
@@ -685,6 +699,8 @@ mod tests {
     }
 
     /// Under an overlap handoff the old key stays in the file through an abandoned
+    /// attempt, and the Commit writes the new one, which the engine (authorized at
+    /// adoption) verifies.
     #[test]
     fn an_uncommitted_adoption_holds_its_key_until_the_commit() {
         let dir = scratch("rk-deferred");
@@ -734,6 +750,9 @@ mod tests {
     }
 
     /// Negative controls: a shell without the channel gets no file and stays
+    /// `degraded`; a channel whose file cannot be written authorizes nothing and
+    /// stays `degraded`; a session whose nonce did cross is `on` with nothing
+    /// written.
     #[test]
     fn the_adoption_writes_no_key_where_none_is_wanted_or_deliverable() {
         let dir = scratch("rk-controls");
@@ -795,6 +814,7 @@ mod tests {
     }
 
     /// An adopted shell whose nonce did not cross the update, from a build with
+    /// no re-key channel: `integration=degraded`.
     fn lost_nonce_engine() -> Mutex<Terminal> {
         let mut t = Terminal::new(24, 80);
         t.restore_checkpoint(&carry_without_nonce());
@@ -811,6 +831,7 @@ mod tests {
     }
 
     /// A degraded tab gets a private one-use `<sid>.<n>` file beside the channel's `<sid>`,
+    /// holding a fresh key.
     #[test]
     fn a_typed_rekey_heals_a_degraded_tab_from_its_first_signed_mark() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -853,6 +874,8 @@ mod tests {
     }
 
     /// A healthy tab is refused (a re-key would move a working shell off its
+    /// key), as are one with no integration and one whose channel key already
+    /// waits for its next prompt, each with nothing written.
     #[test]
     fn a_typed_rekey_is_refused_where_nothing_is_lost() {
         let dir = scratch("rk-typed-refused");
@@ -892,6 +915,8 @@ mod tests {
     }
 
     /// A healthy shell that is behind (signing no revision, or an older build's) is issued
+    /// the key it already signs with plus this build's folder and pointer path; nothing on
+    /// the engine changes.
     #[test]
     fn a_shell_behind_this_build_is_issued_the_upgrade_healthy_or_not() {
         use aterm_core::shell_integration::hex_encode;
@@ -996,6 +1021,7 @@ mod tests {
     }
 
     /// A key whose line never ran is taken back with its file, so a mark signed with it is
+    /// dropped.
     #[test]
     fn a_typed_rekey_whose_line_never_ran_is_taken_back() {
         let dir = scratch("rk-typed-withdraw");
@@ -1053,6 +1079,9 @@ mod tests {
     }
 
     /// Leftovers of a window that exited first are swept by the next typed
+    /// re-key of the same session (a stale `<sid>.<n>` file, and a symlink at
+    /// such a name, removed without writing its target); the channel's own file
+    /// and another session's are left alone.
     #[test]
     fn a_typed_rekey_sweeps_what_a_dead_window_left_and_nothing_else() {
         let dir = scratch("rk-typed-sweep");
@@ -1083,6 +1112,8 @@ mod tests {
     }
 
     /// Two issues of one tab at once leave nothing standing: both are issued
+    /// (the second settling the first), and once the waiting one is settled no
+    /// file holds a key the engine would verify.
     #[test]
     fn two_issues_at_once_leave_no_key_in_a_file() {
         use std::sync::{Arc, Barrier};

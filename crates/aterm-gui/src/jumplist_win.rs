@@ -41,6 +41,7 @@ const IID_IOBJECT_COLLECTION: Guid = Guid {
     data4: [0x92, 0x8A, 0xD4, 0xCD, 0x63, 0x23, 0x02, 0x95],
 };
 /// `IID_IObjectArray` {92CA9DCD-5622-4BBA-A805-5E9F541BD8C9}: the riid for `BeginList`'s
+/// removed-destinations out-param.
 const IID_IOBJECT_ARRAY: Guid = Guid {
     data1: 0x92CA_9DCD,
     data2: 0x5622,
@@ -77,6 +78,7 @@ struct PropertyKey {
 }
 
 /// `PKEY_Title` ({F29F85E0-4FF9-1068-AB91-08002B27B3D9}, 2): the text the jump-list row
+/// displays.
 const PKEY_TITLE: PropertyKey = PropertyKey {
     fmtid: Guid {
         data1: 0xF29F_85E0,
@@ -90,6 +92,7 @@ const PKEY_TITLE: PropertyKey = PropertyKey {
 const VT_LPWSTR: u16 = 31;
 
 /// A shape-only `PROPVARIANT`: 24 bytes on x64 (8-byte header, 16-byte union); the callee
+/// never reads past its own `sizeof`, so the over-size on x86 is harmless.
 #[repr(C)]
 struct PropVariant {
     vt: u16,
@@ -161,7 +164,7 @@ struct IObjectCollection {
     vtbl: *const IObjectCollectionVtbl,
 }
 
-/// `IShellLinkW` (shobjidl_core.h). The setters a row needs and
+/// `IShellLinkW` (shobjidl_core.h).
 #[repr(C)]
 struct IShellLinkWVtbl {
     query_interface:
@@ -285,6 +288,9 @@ pub(crate) fn install() {
 }
 
 /// Whether this process may commit the owner's jump list: a window of the
+/// WINDOWED image ([`install`] says why), and never a private window — a
+/// development build under its own `ATERM_STATE_HOME`, which stands in for
+/// nobody (`aterm_types::dirs::runs_under_private_state_root`).
 fn owns_the_jump_list(image: crate::ImageSubsystem, private_state_root: bool) -> bool {
     image == crate::ImageSubsystem::Windowed && !private_state_root
 }
@@ -309,6 +315,7 @@ struct Worker {
 
 impl Worker {
     /// Fold `notes` (directories, oldest first) into the file and commit the
+    /// list if the rows it shows changed.
     fn refresh(&mut self, notes: &[String]) -> bool {
         let (exe, attach) = (self.exe.clone(), self.attach);
         self.refresh_with(
@@ -323,6 +330,8 @@ impl Worker {
     }
 
     /// [`Self::refresh`] with its outside facts injected, so the tests can
+    /// drive it: whether Windows keeps recent items ([`recents_tracked`]),
+    /// whether a directory exists, and the commit ([`build`]).
     fn refresh_with(
         &mut self,
         notes: &[String],
@@ -405,9 +414,11 @@ impl Worker {
 }
 
 /// `E_ACCESSDENIED`: what `AppendCategory` answers while the owner has turned
+/// recent items off (the shell's half of [`recents_tracked`]).
 const E_ACCESSDENIED: i32 = 0x8007_0005_u32 as i32;
 
 /// Write `text` to `file` through a sibling and a rename, so a reader (another
+/// aterm's worker) sees the old list or the new one, never half of one.
 fn write_replacing(file: &std::path::Path, text: &str) {
     let Some(dir) = file.parent() else {
         return;
@@ -435,6 +446,7 @@ unsafe extern "system" {
 }
 
 /// Spelled as `win_ffi::HKEY_CURRENT_USER` is (the registry recognizes a
+/// predefined key by its low 32 bits).
 const HKEY_LOCAL_MACHINE: isize = 0x8000_0002u32 as isize;
 /// `RRF_RT_REG_DWORD`: a value of another type reads as absent.
 const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
@@ -461,6 +473,9 @@ fn reg_dword(root: isize, subkey: &str, value: &str) -> Option<u32> {
 }
 
 /// Whether Windows keeps recent items for this user: Settings ▸
+/// Personalization ▸ Start ▸ "Show recently opened items in Start, Jump Lists
+/// and File Explorer" (`Explorer\Advanced\Start_TrackDocs`, absent = on) and
+/// the `NoRecentDocsHistory` policy (user or machine, absent = allowed).
 fn recents_tracked() -> bool {
     const ADVANCED: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced";
     const POLICY: &str = r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer";
@@ -472,6 +487,7 @@ fn recents_tracked() -> bool {
 }
 
 /// The executable a jump-list row launches: the windowed front door, an image that routes
+/// `new-tab` / `new-window` / `split-pane` and that the shell starts without a console.
 fn front_door_exe(
     current: &std::path::Path,
     is_file: impl Fn(&std::path::Path) -> bool,
@@ -508,6 +524,8 @@ struct Built {
 }
 
 /// Commit the jump list for `aumid`: a Recent category of `recents` (newest
+/// first, less any row the owner removed, cut to the shell's slot count), then
+/// the tasks.
 unsafe fn build(
     aumid: &str,
     exe: &[u16],
@@ -534,6 +552,7 @@ unsafe fn build(
 }
 
 /// One `BeginList` … `CommitList` transaction ([`build`]); appends the removed
+/// rows' directories to `removed` and returns the Recent rows it committed.
 unsafe fn build_once(
     aumid: &str,
     exe: &[u16],
@@ -644,6 +663,7 @@ unsafe fn build_once(
 }
 
 /// Remove `aumid`'s committed jump list (`ICustomDestinationList::DeleteList`):
+/// the live read-back's clean-up of its test identity.
 #[cfg(debug_assertions)]
 unsafe fn delete_list(aumid: &str) -> Result<(), StepError> {
     let hr = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
@@ -663,6 +683,8 @@ unsafe fn delete_list(aumid: &str) -> Result<(), StepError> {
 }
 
 /// The directories of the rows in `removed` (`BeginList`'s removed
+/// destinations): each `IShellLinkW`'s working directory, which [`recent_row`]
+/// sets to the row's directory.
 unsafe fn removed_dirs(removed: &Com) -> Vec<String> {
     let array = removed.as_raw().cast::<IObjectCollection>();
     let array_vt = unsafe { &*(*array).vtbl };
@@ -699,6 +721,8 @@ unsafe fn removed_dirs(removed: &Com) -> Vec<String> {
 }
 
 /// The icon Explorer gives a directory (`HKCR\Directory\DefaultIcon` is
+/// `%SystemRoot%\System32\shell32.dll,3`), NUL-terminated; `None` when that DLL
+/// is not where Windows keeps it.
 fn folder_icon() -> Option<Vec<u16>> {
     let dll = std::path::PathBuf::from(std::env::var_os("SystemRoot")?)
         .join("System32")
@@ -715,6 +739,9 @@ fn folder_icon() -> Option<Vec<u16>> {
 const FOLDER_ICON_INDEX: i32 = 3;
 
 /// One Recent row: `exe new-window -d "<dir>"` (the window verb, as the "New
+/// Window" task uses — [`crate::jumplist_recent::row_arguments`]), started in
+/// `dir`, with the folder icon, `title` as its text and the full path as its
+/// tooltip.
 unsafe fn recent_row(exe: &[u16], dir: &str, title: &str) -> Result<Com, StepError> {
     let folder = folder_icon();
     let icon = folder
@@ -733,11 +760,15 @@ unsafe fn recent_row(exe: &[u16], dir: &str, title: &str) -> Result<Com, StepErr
 }
 
 /// One task entry: an in-memory `IShellLinkW` running `exe` ([`front_door_exe`]) with `args`
+/// (a front-door verb), with the exe's own icon (index 0) and its row text set through the
+/// link's property store ([`PKEY_TITLE`]).
 unsafe fn task(exe: &[u16], args: &str, title: &str, tooltip: &str) -> Result<Com, StepError> {
     unsafe { link(exe, args, title, tooltip, (exe, 0), None) }
 }
 
 /// The one `IShellLinkW` builder behind [`task`] and [`recent_row`]: `exe`
+/// run with `args`, `icon` (a NUL-terminated file and its index), `tooltip`
+/// as the hover text, `title` as the row text, and `working_dir` when given.
 unsafe fn link(
     exe: &[u16],
     args: &str,
@@ -816,6 +847,7 @@ mod tests {
     }
 
     /// The shipped layout: whichever image commits the list, every row names the windowed
+    /// `aterm-gui.exe` (a row naming the console image flashes a console on every click).
     #[test]
     fn a_row_names_the_windowed_image_whoever_commits_the_list() {
         let dir = install_dir();
@@ -839,6 +871,8 @@ mod tests {
     }
 
     /// A build tree: the row names `aterm-windowed.exe`, never the thin dev `aterm-gui.exe`
+    /// (no router: `new-window` is `unknown command` there); without it the console
+    /// `aterm.exe` still routes the verb.
     #[test]
     fn a_build_tree_row_skips_the_thin_dev_bin() {
         let dir = PathBuf::from(r"C:\src\aterm\target\debug");
@@ -859,6 +893,8 @@ mod tests {
     }
 
     /// Only the windowed image commits the owner's list, and a private window
+    /// (its own `ATERM_STATE_HOME`) never does: its rows would launch a scratch
+    /// build and its empty Recent file would empty the owner's Recent rows.
     #[test]
     fn a_private_window_and_the_console_image_leave_the_list_alone() {
         use super::owns_the_jump_list;
@@ -895,6 +931,8 @@ mod tests {
     }
 
     /// Notes reach the file newest first; the list is committed only when the
+    /// rows it would show change; a row the owner removed leaves the file; a
+    /// shell that takes no list at all stops the worker.
     #[test]
     fn the_worker_commits_only_when_the_rows_change() {
         let scratch = aterm_tempfile::tempdir().expect("scratch");
@@ -941,6 +979,7 @@ mod tests {
     }
 
     /// A shell that shows fewer rows than asked (a short
+    /// `JumpListItems_Maximum`) is not a change: the same ask commits once.
     #[test]
     fn the_shells_slot_cut_does_not_recommit_the_same_rows() {
         let scratch = aterm_tempfile::tempdir().expect("scratch");
@@ -967,6 +1006,8 @@ mod tests {
     }
 
     /// With Windows' recent items off, the file goes and no Recent row is
+    /// committed; the shell's own refusal (`E_ACCESSDENIED`) does the same, and
+    /// holds until the switch is seen off and on again.
     #[test]
     fn recent_items_off_keeps_nothing() {
         let scratch = aterm_tempfile::tempdir().expect("scratch");
@@ -1015,6 +1056,7 @@ mod acceptance {
     use std::path::{Path, PathBuf};
 
     /// The identity the live read-back commits under: never aterm's own
+    /// ([`crate::win32::AUMID`]), so the owner's jump list is never touched.
     const TEST_AUMID: &str = "Aterm.Test.JumpListReadBack";
 
     /// The real shell, end to end, under [`TEST_AUMID`]: [`super::build`]
@@ -1119,6 +1161,11 @@ mod acceptance {
     }
 
     /// A reader for the shell's `.customDestinations-ms` store, enough to read
+    /// back what [`crate::jumplist_win::build`] committed: a version-2 header and a category
+    /// count, then per category its type (0 a custom category with a counted
+    /// UTF-16 name, 2 the tasks), its entry count, each entry a
+    /// `CLSID_ShellLink` tag and an MS-SHLLINK stream, and a `0xBABFFBAB`
+    /// footer.
     mod read_back {
         use std::collections::HashMap;
         use std::path::{Path, PathBuf};
@@ -1139,6 +1186,7 @@ mod acceptance {
             pub(super) arguments: Option<String>,
             pub(super) icon: Option<String>,
             /// The extra data blocks, raw: the property store among them keeps
+            /// `PKEY_Title`.
             pub(super) extra: Vec<u8>,
         }
 
@@ -1262,6 +1310,8 @@ mod acceptance {
         }
 
         /// One MS-SHLLINK stream: the header (`LinkFlags` says which parts
+        /// follow), the ID list, the link info, the strings and the extra data
+        /// blocks up to the terminal one.
         fn link(at: &mut Cursor<'_>) -> Option<Entry> {
             const HEADER: usize = 0x4C;
             if at.u32()? != HEADER as u32 {

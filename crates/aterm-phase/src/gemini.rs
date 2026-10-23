@@ -10,6 +10,7 @@ use crate::text::blank;
 use crate::wall::{ApiCause, Placement, Wall, WallKind};
 
 /// The spinner's frames: braille patterns (`⠧`, `⠴`, `⠼`, `⠏` measured), the
+/// blank one aside.
 const SPINNER: std::ops::RangeInclusive<char> = '\u{2801}'..='\u{28FF}';
 
 /// The spinner row (`is_spinner_row`) as the wire's regex: a frame in column 1 (column 0 with the UI details hidden), a blank, a word — what [`crate::reader::GeminiReader`]'s busy guard waits on to leave.
@@ -18,6 +19,9 @@ pub(crate) fn busy_guard() -> String {
 }
 
 /// The status row while a turn runs: ` ⠧ Thinking... (esc to cancel, 3s)` —
+/// a blank, a braille frame in column 1, a blank, then the words; with the UI
+/// details hidden the frame stands in column 0 (`⠋ Lab stub thinking (esc to
+/// cancel, 1s)`, measured).
 fn is_spinner_row(row: &str) -> bool {
     let mut c = row.chars().peekable();
     if c.peek() == Some(&' ') {
@@ -40,6 +44,7 @@ fn run_of(row: &str, glyph: &str) -> Option<usize> {
 }
 
 /// The composer's caret (module header): `>`, `*` while YOLO is on, `!` in
+/// shell mode.
 const CARET: u8 = b'>';
 const CARET_YOLO: u8 = b'*';
 const CARET_SHELL: u8 = b'!';
@@ -56,11 +61,13 @@ fn caret_glyph(row: &str) -> Option<u8> {
 }
 
 /// The composer's first row: its caret in column 1 ([`CARET`],
+/// [`CARET_YOLO`], [`CARET_SHELL`]).
 fn is_caret_row(row: &str) -> bool {
     caret_glyph(row).is_some_and(|g| [CARET, CARET_YOLO, CARET_SHELL].contains(&g))
 }
 
 /// A sent message's first row in the transcript: `>`, or `$` for a command
+/// sent from shell mode.
 fn is_sent_row(row: &str) -> bool {
     caret_glyph(row).is_some_and(|g| [CARET, CARET_SENT_SHELL].contains(&g))
 }
@@ -74,10 +81,13 @@ fn is_band_text(row: &str) -> bool {
 #[derive(Debug, Clone, Copy)]
 struct Frame {
     /// The status row: right above the live zone's rule, or right above the
+    /// band with the UI details hidden (no rule).
     status: Option<usize>,
     /// The live zone's first row: the status row, else the band's top.
     live: usize,
     /// The live zone's `─` rule over the band ([`frame_at`]'s, as wide as
+    /// the band); `None` with the UI details hidden at the default approval
+    /// mode, which draws no rule ([`details_hidden_frame`]).
     rule: Option<usize>,
     caret: usize,
     /// The caret's glyph ([`CARET`], [`CARET_YOLO`], [`CARET_SHELL`]).
@@ -85,13 +95,22 @@ struct Frame {
     /// The band's bottom row (`▀`).
     bottom: usize,
     /// Rows other than the footer are drawn under the band: the command
+    /// menu, or a list this grammar has not measured.
     menu: bool,
 }
 
 /// How many rows may stand between the rule and the band: the approval
+/// mode's, with the context summary (`1 GEMINI.md file`) on its right in a
+/// wide pane; in a narrow one (under 80 columns, bundle: `isNarrowWidth`)
+/// the mode, a blank and the summary
+/// on rows of its own, which wraps (measured at 72 columns: three rows,
+/// one summary row).
 const UNDER_RULE_ROWS: usize = 4;
 
 /// The composer ([`Frame`]): the last band of the pane's width — `▄`, a
+/// caret row and the rows its draft wrapped onto, `▀` — whose `─` rule of the
+/// same width stands at most [`UNDER_RULE_ROWS`] rows above it, with no band
+/// row between them.
 fn frame(rows: &[String]) -> Option<Frame> {
     (1..rows.len())
         .rev()
@@ -101,6 +120,9 @@ fn frame(rows: &[String]) -> Option<Frame> {
 }
 
 /// The composer with the UI details hidden (module header): the band that
+/// is the LAST thing drawn — every row under its `▀` blank, so no box and no
+/// menu stands there — with a status row right above its `▄`: the spinner, a
+/// shortcut hint ([`status_words`]), a mode alone, or a blank row.
 fn details_hidden_frame(rows: &[String]) -> Option<Frame> {
     let bottom = rows.iter().rposition(|r| !blank(r))?;
     let width = run_of(&rows[bottom], BAND_BOTTOM)?;
@@ -166,6 +188,8 @@ fn frame_at(rows: &[String], top: usize) -> Option<Frame> {
 }
 
 /// The text a caret row holds: what follows ` > `, and NOTHING when that is
+/// the placeholder (module header) — a person who typed two blanks and then
+/// its words is the one draft read as empty.
 fn caret_text(row: &str) -> &str {
     let text = crate::text::trim_end(row).get(3..).unwrap_or("");
     if text.strip_prefix("  ") == Some(const { anchor_text("gemini.composer.placeholder") }) {
@@ -236,14 +260,17 @@ enum Status {
     /// ` ⠧ … (esc to cancel, 3s)`: a turn runs.
     Spinner,
     /// `? for shortcuts` alone, on the right (`press tab twice for more`
+    /// with the UI details hidden): the composer empty and idle.
     Shortcuts,
     /// Nothing: a draft is held, or the composer is empty and idle where no
+    /// hint is drawn (a narrow pane, `ui.showShortcutsHint = false`).
     Blank,
     /// Words this grammar has not measured (a tip), or no status row.
     Other,
 }
 
 /// The approval modes the status row names at its left with the UI details
+/// hidden (`● YOLO`, bundle: `modeContentObj`).
 const MODES: [&str; 3] = [
     anchor_text("gemini.mode.yolo"),
     anchor_text("gemini.mode.auto_edit"),
@@ -251,6 +278,8 @@ const MODES: [&str; 3] = [
 ];
 
 /// A status row's words, a mode at its left (`● YOLO`, with the UI details
+/// hidden) taken off: `press tab twice for more` from `● YOLO … press tab
+/// twice for more`, nothing from `● YOLO` alone.
 fn status_words(row: &str) -> &str {
     let t = crate::text::trim(row);
     t.strip_prefix("● ")
@@ -280,6 +309,7 @@ fn status_kind(row: &str) -> Status {
 }
 
 /// A row that may be the status row of the composer with the UI details
+/// hidden: anything but words this grammar has not measured.
 fn is_status_row(row: &str) -> bool {
     status_kind(row) != Status::Other
 }
@@ -289,6 +319,8 @@ fn status_of(rows: &[String], f: Frame) -> Status {
 }
 
 /// The end of the last message a person sent above row `end`: a `▀` row
+/// under a band whose first row is a sent message's ([`is_sent_row`]: a
+/// command sent from shell mode is the person's too).
 fn last_user(rows: &[String], end: usize) -> Option<usize> {
     (1..end.min(rows.len())).rev().find(|&i| {
         run_of(&rows[i], BAND_BOTTOM).is_some() && {
@@ -302,6 +334,7 @@ fn last_user(rows: &[String], end: usize) -> Option<usize> {
 }
 
 /// The transcript's rows under the last message a person sent and above the
+/// status row, while no turn runs: what the last turn ended on.
 fn ended_on(rows: &[String]) -> Option<(usize, usize)> {
     let f = frame(rows)?;
     let end = f.status?;
@@ -313,6 +346,8 @@ fn ended_on(rows: &[String]) -> Option<(usize, usize)> {
 }
 
 /// The first words of Gemini CLI's notices about the folder's trust (bundle:
+/// the trust level's `Note: This folder is still trusted because …` warning,
+/// the startup's untrusted-folder info, the agent loader's feedback).
 const TRUST_NOTICES: [&str; 3] = [
     anchor_text("gemini.notice.still_trusted"),
     anchor_text("gemini.notice.untrusted"),
@@ -320,6 +355,10 @@ const TRUST_NOTICES: [&str; 3] = [
 ];
 
 /// THE END OF WHAT A TURN ENDED ON, above Gemini CLI's trust notices (module
+/// header): walking up from row `end` (the status row) to row `from`, each
+/// block of rows that is one notice — a `⚠ ` or `ℹ ` head in column 0 whose
+/// words, with the rows it wrapped onto two columns in, begin with one of
+/// [`TRUST_NOTICES`] — and the blank rows around it are left out.
 fn trust_notices_above(rows: &[String], from: usize, end: usize) -> usize {
     let mut end = end;
     loop {
@@ -404,6 +443,7 @@ pub fn message_drawn(rows: &[String]) -> bool {
 }
 
 /// A compact tool row (`  ✓  WriteFile  lab-write.txt → Accepted (+2, -0)`):
+/// a tool's status glyph two columns in and two blanks after it.
 fn is_tool_row(row: &str) -> bool {
     leading_spaces(row) == 2
         && ["✓  ", "✕  ", "⊷  ", "?  "]
@@ -458,6 +498,8 @@ pub fn turn_opened_by(rows: &[String]) -> Option<String> {
 }
 
 /// The turn [`turn_said_before`] reads: whether the band of the message that
+/// opened it is on `rows` ([`turn_whole`]), and the words of its other
+/// replies, oldest first.
 fn turn_before(rows: &[String]) -> Option<(bool, Vec<String>)> {
     let (from, end) = ended_on(rows)?;
     let head = said_reply(rows)?.0?;
@@ -482,6 +524,7 @@ fn turn_before(rows: &[String]) -> Option<(bool, Vec<String>)> {
 }
 
 /// The reply [`said_tail`] reads, as `(its head's row where it is on the
+/// rows, its words)`.
 fn said_reply(rows: &[String]) -> Option<(Option<usize>, String)> {
     let (from, end) = ended_on(rows)?;
     if from == 0 && rows[..end].iter().any(|r| is_banner_row(r)) {
@@ -522,9 +565,15 @@ pub fn interrupted(rows: &[String]) -> bool {
 }
 
 /// The reason Google gives a key that is no key (`400 INVALID_ARGUMENT`,
+/// `ErrorInfo.reason`, measured from the lab's stub of its answer): the
+/// server's word, not the CLI's, so no anchor.
 const KEY_INVALID: &str = "API_KEY_INVALID";
 
 /// The wall an API error row names, read off its text with every blank
+/// taken out (the JSON it quotes wraps mid-token): a 401, or a key Google
+/// says is invalid, is the login; anything else is an API error by its
+/// status — retried by the CLI on a 429 and a 5xx, so never ending a turn
+/// there unless a person stopped it.
 fn error_kind(message: &str) -> WallKind {
     let squeezed: String = message.chars().filter(|c| !c.is_whitespace()).collect();
     let code = squeezed.find("\"code\":").and_then(|at| {
@@ -628,6 +677,7 @@ fn border(row: &str, col: usize, open: char, close: char) -> Option<usize> {
 }
 
 /// A row inside a box of `width` at column `col`: the text between its two
+/// `│`, the blank after the left one stripped, the padding at its right.
 fn inside(row: &str, col: usize, width: usize) -> Option<&str> {
     if leading_spaces(row) != col {
         return None;
@@ -710,11 +760,14 @@ fn role_of(kind: PromptKind, label: &str) -> Role {
 }
 
 /// The question dialog's tab row, drawn under its title when it asks more
+/// than one question (module header): `← □ Colour │ □ Size │ ≡ Review →`.
 fn is_tab_row(text: &str) -> bool {
     text.starts_with("← ") && text.ends_with(" →") && text.contains(" │ ")
 }
 
 /// The first row of the model-fallback dialog (module header, bundle:
+/// `ProQuotaDialog`) other than the usage limit's: a model the key cannot
+/// reach, a model it does not know, or the service's demand.
 fn is_fallback_head(text: &str) -> bool {
     text.starts_with(const { anchor_text("gemini.fallback.no_access") })
         || (text.starts_with("Model \"")
@@ -723,6 +776,7 @@ fn is_fallback_head(text: &str) -> bool {
 }
 
 /// The sandbox-expansion box's question: `To run [Shell], allow access to
+/// the following?`.
 fn is_expansion_ask(text: &str) -> bool {
     text.strip_prefix(const { anchor_text("gemini.box.expansion.head") })
         .is_some_and(|rest| rest.starts_with(" ["))
@@ -730,11 +784,17 @@ fn is_expansion_ask(text: &str) -> bool {
 }
 
 /// A row the sandbox-expansion box draws under its question: `• Network: All
+/// Urls`, `• Write: <paths>`, `• Read: <paths>`.
 fn is_expansion_row(text: &str) -> bool {
     text.starts_with("• ")
 }
 
 /// The box's kind and the row of its question (module header's table): the
+/// question dialog and the usage-limit dialog by their title, the trust
+/// dialog by its question, an approval box by the question over its options
+/// and the tool its title names; the model-fallback dialog by its first row,
+/// the MCP, fetch and sandbox-expansion boxes by their questions (kind
+/// [`PromptKind::Other`], their question row kept).
 fn kind_of(texts: &[(usize, &str)], first_option: Option<usize>) -> (PromptKind, Option<usize>) {
     let over = |r: usize| first_option.is_none_or(|f| r < f);
     let title = texts.iter().find(|(_, t)| !t.is_empty());
@@ -809,6 +869,8 @@ fn kind_of(texts: &[(usize, &str)], first_option: Option<usize>) -> (PromptKind,
 }
 
 /// The Esc a box offers: the option marked ` (esc)` (an approval box's
+/// refusal: it refuses the call), else its hint row's `Esc to cancel` (the
+/// question dialog: it leaves the question unanswered).
 fn cancel_of(options: &[Opt], hint: Option<&str>) -> Option<Cancel> {
     if let Some(o) = options.iter().find(|o| o.label.ends_with(" (esc)")) {
         return Some(Cancel {
@@ -967,6 +1029,9 @@ pub fn prompt(rows: &[String]) -> Option<PromptV2> {
 }
 
 /// The rows over the live zone that starts at row `live`, less the queue of
+/// messages the composer draws at its top (module header: `Queued (press ↑
+/// to edit):` two columns in, each message four in): what a box kept over
+/// the composer is the last thing of.
 fn over_the_queue(rows: &[String], live: usize) -> &[String] {
     let over = &rows[..live.min(rows.len())];
     let queued = over.iter().rposition(|r| {
@@ -985,6 +1050,12 @@ fn over_the_queue(rows: &[String], live: usize) -> &[String] {
 }
 
 /// The box drawn over the composer `f` with `ui.collapseDrawerDuringApproval
+/// = false` (module header): the last thing over its live zone, a queue of
+/// messages under it aside, read whole as [`read_box`] reads a box, with an
+/// option under the cursor (a box still pending, never a finished tool's
+/// box in the transcript) — and every option [`Role::Other`]: the composer
+/// under it has the keys (measured: a digit is typed into it, Enter queues
+/// its text), so no option is chosen by any key this harness sends.
 fn kept_box(rows: &[String], f: Frame) -> Option<PromptV2> {
     let mut p = read_box(over_the_queue(rows, f.live))?;
     if !p.options.iter().any(|o| o.focused) {

@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-
 use super::*;
 use crate::machine;
 
@@ -40,7 +39,6 @@ fn vmstat_sums_swap_in_and_out() {
 
 /// A `stat` line's group is its fifth field, counted from the command
 /// name's LAST `)`, so a name holding spaces and parentheses cannot move it.
-/// NEGATIVE CONTROLS: a line cut before the group, and one with no name.
 #[test]
 fn a_stat_line_gives_its_group_past_any_command_name() {
     assert_eq!(
@@ -62,7 +60,6 @@ fn a_stat_line_gives_its_group_past_any_command_name() {
 
 /// A `children` text names each pid its space closes, so a text cut at the
 /// cap drops its torn last pid instead of naming a shorter one.
-/// NEGATIVE CONTROLS: the torn pid, an empty text and a word that is no pid.
 #[test]
 fn a_children_text_names_only_the_pids_its_spaces_close() {
     assert_eq!(linux::children("812 9001 7 "), vec![812, 9001, 7]);
@@ -87,13 +84,11 @@ fn the_auxiliary_vector_gives_the_page_size() {
 
 #[test]
 fn every_proc_read_is_bounded_to_4_kib() {
-    // Reading an endless device stops at a single 4 KiB buffer.
     #[cfg(unix)]
     {
         let zero = read_bounded(Path::new("/dev/zero")).expect("/dev/zero opens");
         assert_eq!(zero.len(), READ_CAP);
     }
-    // A long file is cut at the cap; a short one is read whole.
     let dir = std::env::temp_dir().join(format!("aterm-sysprobe-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let long = dir.join("long");
@@ -108,8 +103,6 @@ fn every_proc_read_is_bounded_to_4_kib() {
     assert_eq!(read_bounded(&short).as_deref(), Some(MEMINFO));
     assert_eq!(read_bounded(&dir.join("absent")), None);
     std::fs::remove_dir_all(&dir).unwrap();
-    // A text cut mid-line at the cap loses the torn line, never parses half
-    // a number: `pswpout 34` of `pswpout 3400` is not read as 34.
     let torn = &VMSTAT[..VMSTAT.find("pswpout 34").unwrap() + "pswpout 34".len()];
     assert_eq!(linux::swap_pages(torn), None);
 }
@@ -126,8 +119,6 @@ fn kernel_pressure_levels_map_to_memory_levels() {
 #[test]
 fn memory_in_use_is_counted_from_the_vm_pages() {
     let page = 16_384;
-    // 358 721 anonymous (internal) pages, 4 509 purgeable, 118 941 wired,
-    // 46 669 occupied by the compressor.
     let used = used_mib_of(358_721, 4_509, 118_941, 46_669, page).unwrap();
     assert_eq!(used, (358_721 - 4_509 + 118_941 + 46_669) * 16 / 1024);
     assert!((7_000..9_000).contains(&used), "{used} MiB");
@@ -141,8 +132,6 @@ fn memory_in_use_is_counted_from_the_vm_pages() {
 
 /// Memory AVAILABLE is free + inactive + purgeable pages (what the memory
 /// ceiling moves with), never more than the machine where that is known.
-/// NEGATIVE CONTROLS: a zero page size is unknown; a sum past the machine
-/// (a purgeable page on the inactive queue, counted twice) is capped.
 #[test]
 fn memory_available_is_free_inactive_and_purgeable_pages() {
     let page = 16_384;
@@ -157,8 +146,7 @@ fn memory_available_is_free_inactive_and_purgeable_pages() {
 }
 
 /// A process's working directory and executable are read from the OS: this
-/// test's own are what the process says they are. NEGATIVE CONTROL: a pid
-/// that cannot exist reads as nothing, never as some directory or program.
+/// test's own are what the process says they are.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_processs_working_directory_and_executable_are_its_own() {
@@ -182,7 +170,6 @@ fn a_processs_working_directory_and_executable_are_its_own() {
 
 /// `group_memory` sums member footprints within the target process group,
 /// excluding children placed in their own group (`process_group(0)`).
-/// NEGATIVE CONTROLS: non-existent pid and pid 0 return `None`.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_groups_memory_is_its_own_members_footprint() {
@@ -218,7 +205,7 @@ fn a_groups_memory_is_its_own_members_footprint() {
     let own = crate::group_memory(apart_pid);
     let ours = crate::group_memory(beside.id());
     for mut child in [apart, beside] {
-        let _ = child.kill(); // SIGKILL
+        let _ = child.kill();
         let _ = child.wait();
     }
     let own = own.expect("the child's own group");
@@ -231,8 +218,7 @@ fn a_groups_memory_is_its_own_members_footprint() {
 }
 
 /// The production census adapter requires a positive, complete leader-only
-/// answer. Empty, failed, misaligned, full and overlong replies cannot prove
-/// that no other process belongs to the group.
+/// answer.
 #[cfg(target_os = "macos")]
 #[test]
 fn only_a_complete_group_census_admits_its_leader() {
@@ -325,7 +311,6 @@ fn the_machines_memory_and_pressure_are_read_on_this_host() {
     let mib = crate::physical_memory_mib().expect("hw.memsize");
     assert!(mib >= 4 * 1024, "{mib} MiB");
     assert!(crate::memory_pressure().is_some());
-    // What is available and in use, each within the machine.
     let now = crate::machine_memory().expect("HOST_VM_INFO64");
     assert!(now.available_mib <= mib, "{now:?} of {mib} MiB");
     assert!(
@@ -413,10 +398,7 @@ fn mac_table() -> volumes::Table {
 
 /// A firmlinked path is read in its data-volume spelling: `~` is on the data
 /// volume, not on the sealed root, and a path under `/System/Volumes/Data`
-/// stays there. The longest prefix wins, component by component (`/Volumes/
-/// Recoveryx` is not on `/Volumes/Recovery`). NEGATIVE CONTROL: with no
-/// firmlinks the same `~` reads as the root's.
-// Unix-only: the table holds `/` mount points, no path Windows reads as absolute.
+/// stays there.
 #[cfg(unix)]
 #[test]
 fn a_path_finds_its_mount_through_the_firmlinks() {
@@ -451,7 +433,6 @@ fn a_path_finds_its_mount_through_the_firmlinks() {
 /// `mounts_under` finds a mount at or under a directory in either spelling,
 /// and nothing above or beside it; a relative directory is answered with
 /// every mount (nothing ruled out on a path nobody can place).
-// Unix-only: the table holds `/` mount points, no path Windows reads as absolute.
 #[cfg(unix)]
 #[test]
 fn mounts_under_sees_a_mount_inside_a_directory_in_either_spelling() {
@@ -473,9 +454,7 @@ fn mounts_under_sees_a_mount_inside_a_directory_in_either_spelling() {
 /// The mountinfo parser: `\040` decoded, the optional fields skipped up to
 /// `-`, `ro` read, an autofs mount automounted and a network one not local,
 /// udisks' media folders removable, and a torn last line dropped — which,
-/// like a read cut at the cap, makes the table incomplete. NEGATIVE CONTROL:
-/// the same text whole is complete.
-// Unix-only: the table holds `/` mount points, no path Windows reads as absolute.
+/// like a read cut at the cap, makes the table incomplete.
 #[cfg(unix)]
 #[test]
 fn the_mountinfo_parser_reads_escapes_and_marks_a_cut_table() {
@@ -539,7 +518,6 @@ fn an_apfs_source_names_its_container() {
     }
 }
 
-// Unix-only: the table holds `/` mount points, no path Windows reads as absolute.
 #[cfg(unix)]
 #[test]
 fn the_firmlinks_file_is_read_line_by_line() {
@@ -560,8 +538,7 @@ fn the_firmlinks_file_is_read_line_by_line() {
 }
 
 /// The live read, on this test's own temp directory's volume: a syscall, not
-/// WindowServer. The table lists the mount; its size is at least its free
-/// figure, both above zero; free inodes are counted.
+/// WindowServer.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_volume_reads_its_size_free_space_and_inodes() {
@@ -611,10 +588,7 @@ btime 1729339200
 ";
 
 /// Each `cpuN` line is core N: system takes irq + softirq, idle takes
-/// iowait, steal and guest are left out. A core the kernel left out (offline)
-/// reads zero in its place; four columns (an old kernel) are enough.
-/// NEGATIVE CONTROLS: three columns, a word for a number, an id past
-/// `MAX_CPUS`, and a text with no core line read as nothing.
+/// iowait, steal and guest are left out.
 #[test]
 fn proc_stat_gives_every_cores_ticks_by_id() {
     let cores = linux::proc_stat_cores(PROC_STAT, false).expect("four cores");
@@ -658,8 +632,7 @@ fn proc_stat_gives_every_cores_ticks_by_id() {
 
 /// A read cut at its cap is whole only when the core lines are known to
 /// have ended: a whole line that is not a core's was read, or the torn tail
-/// begins one (`intr`, whose line is the long one). A cut inside the core
-/// lines, or exactly after one, might hide more cores: nothing.
+/// begins one (`intr`, whose line is the long one).
 #[test]
 fn a_cut_proc_stat_is_read_only_past_its_core_lines() {
     let intr = PROC_STAT.find("intr").unwrap();
@@ -695,9 +668,7 @@ fn a_cut_proc_stat_is_read_only_past_its_core_lines() {
 }
 
 /// The Linux reader on a fixture root: `<root>/proc/stat` read into its own
-/// buffer and padded to the present count. A file whose core lines run past
-/// `STAT_CAP` is refused, not read short. NEGATIVE CONTROL: a root with no
-/// `proc/stat`.
+/// buffer and padded to the present count.
 #[test]
 fn the_stat_reader_reads_a_fixture_root_and_refuses_a_cut_core_list() {
     let root = aterm_tempfile::tempdir().expect("scratch root");
@@ -748,8 +719,6 @@ fn a_buffered_read_stops_at_its_buffer_and_says_whether_it_was_cut() {
 }
 
 /// A kernel CPU list: ranges and singles, ascending and distinct.
-/// NEGATIVE CONTROLS: empty, a word, a range that runs backwards, an id past
-/// the cap.
 #[test]
 fn a_cpu_list_reads_its_ranges() {
     assert_eq!(
@@ -802,7 +771,6 @@ Committed_AS:   19000000 kB
     assert_eq!((m.total, m.free), (k(16_318_756), k(812_344)));
     assert_eq!(m.app, k(8_400_000));
     assert_eq!(m.shared, Some(k(500_000)));
-    // The slab the kernel can reclaim is cache, as `free(1)` counts it.
     assert_eq!(m.wired, k(150_000 + 20_000 + 60_000));
     assert_eq!(m.file_backed, k(3_310_000 - 500_000 + 204_800 + 250_000));
     assert_eq!(
@@ -838,13 +806,11 @@ Committed_AS:   19000000 kB
         k(3_310_000 + 204_800),
         "no Shmem: nothing taken out"
     );
-    // No `Slab`: its two halves, split the same way.
     let halves = "MemTotal: 100 kB\nMemFree: 10 kB\nSReclaimable: 3 kB\nSUnreclaim: 4 kB\n";
     assert_eq!(
         linux::memory_detail(halves).map(|m| (m.wired, m.file_backed)),
         Some((k(4), k(3)))
     );
-    // A kernel too old to split its slab: all of it is the kernel's.
     let whole = "MemTotal: 100 kB\nMemFree: 10 kB\nSlab: 9 kB\n";
     assert_eq!(
         linux::memory_detail(whole).map(|m| (m.wired, m.file_backed)),
@@ -899,9 +865,7 @@ fn partitions(layout: &CpuLayout, n: u16) -> bool {
 
 /// The clusters come from the levels, fastest first, and their cores from
 /// the device tree: the M5's Super cores are 6–9 and its Efficiency cores
-/// 0–5. Where the L2 sizes cannot tell the levels apart, `cluster-type`
-/// does. NEGATIVE CONTROL: a device tree that puts the fast cores FIRST is
-/// believed over the convention, so the map is read, not assumed.
+/// 0–5.
 #[test]
 fn the_cluster_layout_is_read_from_the_device_tree() {
     let (levels, cpus) = m5();
@@ -953,8 +917,7 @@ fn the_cluster_layout_is_read_from_the_device_tree() {
 
 /// Where the device tree cannot be read or does not add up, the convention
 /// places the slowest level at the lowest ids; with no levels (or levels
-/// that do not sum to the core count) there is one `"CPU"` cluster. Every
-/// answer places every logical id exactly once.
+/// that do not sum to the core count) there is one `"CPU"` cluster.
 #[test]
 fn a_device_tree_that_does_not_add_up_falls_back_to_the_convention() {
     let (levels, cpus) = m5();
@@ -1125,8 +1088,6 @@ fn a_volumes_figures_are_held_in_order() {
 }
 
 /// A path becomes a C string in a caller's buffer, never past it.
-/// NEGATIVE CONTROLS: an interior NUL, and a path with no room for its
-/// terminator.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_path_is_a_c_string_in_its_buffer() {
@@ -1143,8 +1104,7 @@ fn a_path_is_a_c_string_in_its_buffer() {
 }
 
 /// `host_processor_info`'s array is runs of four 32-bit counters (user,
-/// system, idle, nice), read unsigned. NEGATIVE CONTROL: an array shorter
-/// than its count.
+/// system, idle, nice), read unsigned.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_processor_array_reads_four_counters_per_core() {
@@ -1180,9 +1140,7 @@ fn device_tree_data_reads_little_endian() {
 }
 
 /// Live: every logical core is read, as many as the layout places and
-/// `hw.logicalcpu` counts, and a second read runs no counter backwards. On a
-/// Mac with more than one perflevel the layout came from the device tree,
-/// not the convention.
+/// `hw.logicalcpu` counts, and a second read runs no counter backwards.
 #[cfg(target_os = "macos")]
 #[test]
 fn every_core_is_read_on_this_host_and_its_ticks_only_grow() {
@@ -1219,9 +1177,7 @@ fn every_core_is_read_on_this_host_and_its_ticks_only_grow() {
     }
 }
 
-/// Live: memory by page class on this host. Each physical class is within
-/// physical memory, and wired + active + inactive + speculative + free +
-/// compressed is within 10% of it (the rest is memory the VM never manages).
+/// Live: memory by page class on this host.
 #[cfg(target_os = "macos")]
 #[test]
 fn memory_by_page_class_reads_on_this_host_and_adds_up() {
@@ -1257,9 +1213,7 @@ fn memory_by_page_class_reads_on_this_host_and_adds_up() {
     assert!(m.pressure.is_some());
 }
 
-/// Live: the GPU on this host. An Apple silicon Mac always has its
-/// accelerator, with a name and a core count; each percentage is at most
-/// 100.
+/// Live: the GPU on this host.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_gpu_reads_on_this_host_in_whole_percent() {
@@ -1300,10 +1254,7 @@ fn an_nvml_failure_says_why() {
 /// Live: this host's NVIDIA card, where it has one and the driver's
 /// `libnvidia-ml.so.1`, reads a whole percent from the real NVML by its PCI
 /// slot, and, where its runtime PM cannot move, through the system root's
-/// GPU reader too. The figures and the two reads' costs are printed (the
-/// first read opens and initialises NVML unless another test of this
-/// process already has). SKIP where there is no NVIDIA card, no library, or
-/// a card under runtime PM, which NVML would wake.
+/// GPU reader too.
 #[cfg(target_os = "linux")]
 #[test]
 fn nvml_reads_the_nvidia_card_on_this_host() {
@@ -1353,7 +1304,7 @@ fn nvml_reads_the_nvidia_card_on_this_host() {
 }
 
 /// Live: the root volume's figures are in order and name their mount and
-/// type. NEGATIVE CONTROLS: a path that does not exist, and one with a NUL.
+/// type.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn the_root_volume_reads_on_this_host() {
@@ -1373,7 +1324,6 @@ fn the_root_volume_reads_on_this_host() {
 
 /// Compile-time check that [`QuietErrors`] implements neither `Send` nor
 /// `Sync` (since the thread error mode it sets and restores is thread-local).
-/// If `QuietErrors` implemented either, `check::<QuietErrors>()` would fail with E0283.
 #[test]
 fn a_quiet_guard_cannot_leave_its_thread() {
     /// Answered through `()` by every type, and through a marker by a type
@@ -1402,9 +1352,7 @@ fn link(name: &str, physical: Option<bool>) -> LinkReading {
 
 /// The machine's own links: on macOS (no device fact) the up, running
 /// `en*` and `pdp_ip*` links; on Linux (a device fact) the up, running
-/// links a device backs. NEGATIVE CONTROLS: every tunnel, bridge,
-/// peer-to-peer radio and virtual prefix, a loopback, a link that is not
-/// running, and a Linux link with no device, whatever its name.
+/// links a device backs.
 #[test]
 fn only_the_machines_own_links_count_toward_its_traffic() {
     for name in ["en0", "en7", "pdp_ip0", "pdp_ip3"] {
@@ -1469,9 +1417,7 @@ wlan0:7 8 9 10 0 0 0 0 11 12 13 14 0 0 0 0
   torn: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16";
 
 /// `/proc/net/dev`: each interface's received and sent counters, the header
-/// lines skipped, a name with no space after its colon read. NEGATIVE
-/// CONTROLS: a short line, a counter that does not parse, a name with `/`
-/// and a torn last line are left out.
+/// lines skipped, a name with no space after its colon read.
 #[test]
 fn proc_net_dev_gives_each_interfaces_counters() {
     let rows = linux::net_dev(NET_DEV);
@@ -1502,9 +1448,7 @@ fn proc_net_dev_gives_each_interfaces_counters() {
 
 /// sysfs's link facts: hex flags, up only with `IFF_UP` and an `operstate`
 /// of `up` or `unknown`, a speed in Mb/s as bits per second, and the kind
-/// from `wireless`, the name and `device`. NEGATIVE CONTROLS: a speed of
-/// `-1` or `0`, garbage, a link administratively down, an `operstate` of
-/// `down` or `dormant`.
+/// from `wireless`, the name and `device`.
 #[test]
 fn sysfs_link_facts_read_flags_state_speed_and_kind() {
     assert_eq!(linux::hex_flags("0x1003\n"), Some(0x1003));
@@ -1524,15 +1468,13 @@ fn sysfs_link_facts_read_flags_state_speed_and_kind() {
     assert_eq!(linux::sys_kind("wwan0", false, true), LinkKind::Cellular);
     assert_eq!(linux::sys_kind("enp3s0", false, true), LinkKind::Wired);
     assert_eq!(linux::sys_kind("docker0", false, false), LinkKind::Other);
-    // A refused name is other whatever sysfs says, as on macOS.
     assert_eq!(linux::sys_kind("ap0", true, true), LinkKind::Other);
     assert_eq!(linux::sys_kind("bridge0", false, true), LinkKind::Other);
 }
 
 /// The Linux link reader on a fixture root: each `/proc/net/dev` row joined
 /// to its sysfs facts, a link with no sysfs directory read as not up with
-/// no device. Only the physical, running links count toward the machine.
-/// NEGATIVE CONTROL: a root with no `proc/net/dev`.
+/// no device.
 #[test]
 fn the_link_reader_reads_a_fixture_root() {
     let root = aterm_tempfile::tempdir().expect("scratch root");
@@ -1637,8 +1579,7 @@ fn the_link_reader_reads_a_fixture_root() {
 /// The link reader's scratch: made [`linux::NET_DEV_CAP`] long where it is
 /// shorter and read again in place by the next reading, whose answer is
 /// what it read now, not what an earlier, longer file left in it; a longer
-/// scratch is kept whole. Each answer matches a reading with a buffer of
-/// its own.
+/// scratch is kept whole.
 #[test]
 fn the_link_readers_scratch_is_read_again_in_place() {
     let fixture = |dev: &str| {
@@ -1695,9 +1636,7 @@ fn the_link_readers_scratch_is_read_again_in_place() {
 }
 
 /// `/proc/loadavg`'s total: the count after the `/` of its fourth field,
-/// from a whole first line. NEGATIVE CONTROLS: a torn line (whose total
-/// may have been cut short), a field that is not two counts, and a total
-/// of zero read nothing; so does a root with no file.
+/// from a whole first line.
 #[test]
 fn the_load_average_file_gives_every_thread_on_the_machine() {
     assert_eq!(
@@ -1731,11 +1670,7 @@ fn the_load_average_file_gives_every_thread_on_the_machine() {
 /// The macOS pid listing: offered the size ask's room and a quarter more,
 /// never past [`machine::MAX_PIDS`], and counted only when it listed some
 /// pids and did not fill its room; one uid's listing of none counts zero
-/// where `errno` stayed clear. NEGATIVE CONTROLS: a failed size ask offers
-/// nothing; a listing of every pid that listed none (libproc answers zero
-/// for a failure), a uid's that listed none and set `errno`, and one that
-/// filled its room (perhaps cut) are no count. Run on every host (the
-/// helpers are compiled for tests everywhere).
+/// where `errno` stayed clear.
 #[test]
 fn a_pid_listing_counts_only_what_it_listed_within_its_room() {
     assert_eq!(machine::pid_room(920), Some(1150));
@@ -1754,8 +1689,7 @@ fn a_pid_listing_counts_only_what_it_listed_within_its_room() {
 }
 
 /// Two ceilings: the smaller of the known; an unlimited soft limit is no
-/// ceiling. Run on every host (the helpers are compiled for tests
-/// everywhere, as `volume_of` is).
+/// ceiling.
 #[test]
 fn the_smaller_known_ceiling_wins_and_infinity_is_none() {
     assert_eq!(machine::smaller(Some(10_666), Some(4_000)), Some(4_000));
@@ -1766,9 +1700,7 @@ fn the_smaller_known_ceiling_wins_and_infinity_is_none() {
     assert_eq!(machine::rlimit_ceiling(u64::MAX, u64::MAX), None);
 }
 
-/// Live: the process table's ceilings on this host. The machine's is known
-/// and positive; one user's, where known, is no larger (macOS clamps
-/// `kern.maxprocperuid` to `kern.maxproc`).
+/// Live: the process table's ceilings on this host.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn the_process_tables_ceilings_read_on_this_host() {
@@ -1789,11 +1721,7 @@ fn the_load_average_reads_on_this_host() {
     assert!(load.iter().all(|l| l.is_finite() && *l >= 0.0), "{load:?}");
 }
 
-/// Live: this Mac's interfaces. Each has a name and a distinct index; the
-/// loopback `lo0` is up, a loopback, and not the machine's traffic; every
-/// link the machine filter refuses by name (a tunnel, a bridge, a
-/// peer-to-peer or coprocessor link) reads other, whatever its functional
-/// type.
+/// Live: this Mac's interfaces.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_network_links_read_a_structurally_valid_snapshot_on_this_host() {
@@ -1819,8 +1747,7 @@ fn the_network_links_read_a_structurally_valid_snapshot_on_this_host() {
 }
 
 /// The capability words agents read (`aterm ctl sys caps`): one word per
-/// answer, and the reason when unavailable. A NEGATIVE CONTROL: a platform
-/// with no arm says so on every row.
+/// answer, and the reason when unavailable.
 #[test]
 fn capability_words_are_one_word_each() {
     use crate::{Cap, CapSource, Caps, Why};
@@ -1872,8 +1799,7 @@ fn this_hosts_capability_report_names_its_os() {
     }
 }
 
-/// Level names by count, and clusters by rank, fastest first. NEGATIVE
-/// CONTROLS: no ids is no layout; one rank is one `"CPU"` cluster.
+/// Level names by count, and clusters by rank, fastest first.
 #[test]
 fn levels_are_named_by_count_and_ranked_fastest_first() {
     assert!(crate::level_names(0).is_empty());

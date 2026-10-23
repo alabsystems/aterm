@@ -1,25 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **`fabric=` tells the truth about the BROKER LINK, without a heartbeat.**
-//!
-//! The bridge owns the broker link — the dial, every ack — and reports it to
-//! the endpoint over its own verb lane (`link up rtt=` / `link down reason=`)
-//! on change and on a 2x move of the round trip, never on a clock.
-//!
-//! Four worlds, each against a REAL headless aterm and a REAL bridge child:
-//!
-//! * a broker that is killed under a connected bridge → `stalled`, a parked
-//!   `post --wait` refused without sitting out its wait, and `connected` again
-//!   when the broker is restarted on the same socket — with the queued post
-//!   delivered by the reconnected bridge;
-//! * a `--broker` path nothing listens on → `stalled reason=no-socket`, and
-//!   never `connected`;
-//! * a stub that ACCEPTS the connection and never acks → `stalled
-//!   reason=no-ack`, never `connected`.
-//!
-//! Every wait is an `until` over what the instance PUBLISHES; the measured
-//! numbers are printed so a run's output is the evidence.
+//! Broker link-state reporting and reconnect tests against a live headless instance.
 
 use crate::harness;
 
@@ -47,12 +29,6 @@ fn boot_sid(w: &World) -> String {
     })
 }
 
-/// **A KILLED BROKER IS `stalled`, A PARKED WAIT IS REFUSED, AND A RESTART IS
-/// `connected` AGAIN.**
-///
-/// The broker is the harness's own, so "killed" is its handle's `shutdown` —
-/// which force-closes every live connection, exactly what a `kill -9` of a
-/// `link broker` process does to its peers — and "restarted" is a new `Broker`
 /// on the same log and the same socket path.
 #[test]
 fn a_killed_broker_stalls_the_fabric_and_a_restart_reconnects() {
@@ -60,10 +36,6 @@ fn a_killed_broker_stalls_the_fabric_and_a_restart_reconnects() {
     w.wait_ready();
     let sid = boot_sid(&w);
 
-    // CONNECTED CARRIES A ROUND TRIP. The first `link up` carries the
-    // attach's last acked exchange (the bridge reports nothing `up` until its
-    // attach completed), so the number is a real round trip on this machine —
-    // printed as the measurement the commit records.
     let s = status(&w);
     assert!(s.contains(" fabric=connected "), "{s}");
     let rtt: u64 = kv(&s, "fabric_rtt_ms")
@@ -78,15 +50,12 @@ fn a_killed_broker_stalls_the_fabric_and_a_restart_reconnects() {
     assert_eq!(kv(&fs, "state"), Some("connected"), "{fs}");
     assert_eq!(kv(&fs, "reason"), Some("-"), "{fs}");
     assert_eq!(kv(&fs, "rtt_ms"), Some(rtt.to_string().as_str()), "{fs}");
-    // AND THE BRIDGE SAID WHAT IT IS: a real bridge's `hello` taken by a real
-    // endpoint of the same tree — one lane, one build, no line refused.
     let lane = aterm_types::control_verbs::BRIDGE_LANE.to_string();
     assert_eq!(kv(&fs, "bridge_lane"), Some(lane.as_str()), "{fs}");
     assert!(kv(&fs, "build").is_some(), "{fs}");
     assert_eq!(kv(&fs, "bridge_build"), kv(&fs, "build"), "{fs}");
     assert_eq!(kv(&fs, "lane_faults"), Some("0"), "{fs}");
 
-    // KILL IT.
     if let Some(mut h) = w.handle.take() {
         h.shutdown();
     }
@@ -94,25 +63,16 @@ fn a_killed_broker_stalls_the_fabric_and_a_restart_reconnects() {
     until("fabric=stalled", || {
         status(&w).contains(" fabric=stalled ").then_some(())
     });
-    // The reason is the reader's EOF or the redial that followed it — the
-    // socket file is gone with the broker, so the redial says `no-socket`.
     let fs = fabric_status(&w);
     assert_eq!(kv(&fs, "state"), Some("stalled"), "{fs}");
     assert!(
         matches!(kv(&fs, "reason"), Some("closed" | "no-socket" | "refused")),
         "{fs}"
     );
-    // The last rtt is history and stays; the age keeps growing.
     assert_eq!(kv(&fs, "rtt_ms"), Some(rtt.to_string().as_str()), "{fs}");
     let s = status(&w);
     assert!(s.contains(&format!(" fabric_rtt_ms={rtt} ")), "{s}");
 
-    // A WAIT ON A STALLED FABRIC IS REFUSED, not sat out, and the post stays
-    // queued. How promptly is aterm-gui's in-process
-    // `the_link_is_the_bridges_to_report_and_stalled_refuses_a_wait_at_once`.
-    // Here the wait asked is five minutes and the answer is held to the
-    // harness's DEADLINE, a minute's hang detector (AGENTS.md): only a wait
-    // that was sat out reaches it.
     const WAIT: Duration = Duration::from_secs(300);
     let asked = Instant::now();
     let reply = w
@@ -144,7 +104,6 @@ fn a_killed_broker_stalls_the_fabric_and_a_restart_reconnects() {
         "the refused post is still queued"
     );
 
-    // RESTART IT on the same socket, and the bridge comes back on its own.
     let broker = Broker::open_guarded(&w.broker_log, SECRET.to_vec()).expect("reopen the log");
     let handle = broker
         .serve(&w.broker_sock)
@@ -154,12 +113,8 @@ fn a_killed_broker_stalls_the_fabric_and_a_restart_reconnects() {
     until("fabric=connected after the restart", || {
         status(&w).contains(" fabric=connected ").then_some(())
     });
-    // ...and the post it refused to wait on is delivered by the reconnected
-    // bridge: to itself, through the broker, into its own inbox. (A hang
-    // detector: the loop leaves the moment the row lands.)
     let landed_by = Instant::now() + harness::DEADLINE;
     loop {
-        // The endpoint pct-encodes the space and leaves `?` as it is.
         if w.inbox(&sid)
             .iter()
             .any(|r| r.contains(" kind=note ") && r.contains("text=still%20there?"))
@@ -185,7 +140,6 @@ fn a_killed_broker_stalls_the_fabric_and_a_restart_reconnects() {
     );
 }
 
-/// **A SOCKET PATH NOTHING LISTENS ON IS `stalled reason=no-socket`, AND NEVER
 /// `connected`.**
 #[test]
 fn a_broker_path_nothing_listens_on_is_stalled_and_never_connected() {
@@ -219,20 +173,14 @@ fn a_broker_path_nothing_listens_on_is_stalled_and_never_connected() {
     );
 }
 
-/// **A BROKER THAT ACCEPTS AND NEVER ACKS IS `stalled reason=no-ack`.** Before
-/// the ack deadline existed this bridge parked in its first `attach` for the
 /// life of the process, reporting nothing; the endpoint said `connected`.
 #[test]
 fn a_broker_that_accepts_but_never_acks_is_stalled_no_ack() {
-    // NOT under the world's own scratch: that directory is made as the world
-    // boots, and the stub must be listening before then, or the bridge's dial
-    // reads `no-socket`, a different test.
     let dir = format!("/tmp/atl-stub13-{}", std::process::id());
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("stub dir");
     let stub = format!("{dir}/s.sock");
     let listener = UnixListener::bind(&stub).expect("bind the stub");
-    // Accept everything, read everything, answer nothing.
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { return };
@@ -243,9 +191,6 @@ fn a_broker_that_accepts_but_never_acks_is_stalled_no_ack() {
         }
     });
 
-    // The verdict is the deadline PASSING, so its length decides nothing here:
-    // a quarter second (`aterm-link`'s `ACK_DEADLINE_SEAM`), not the production
-    // five the wait below used to sit out.
     let w = World::boot_at(
         "r13-stub",
         &[],
@@ -271,11 +216,6 @@ fn a_broker_that_accepts_but_never_acks_is_stalled_no_ack() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// **A BRIDGE THAT CANNOT FINISH ITS ATTACH NEVER READS `connected`, AND
-/// WRITES NO RECORD.** Its cap is the node ring minus `ro:/f/<F>/fleet/>`, so
-/// the broker refuses the standing-halt read the bridge cannot attach without.
-/// The halt is read before anything is published and no ack is reported `up`
-/// until the attach completed: `stalled reason=read`, an empty node face, and
 /// a `post --wait` refused at once.
 #[test]
 fn review_a_bridge_that_cannot_finish_its_attach_never_reads_connected() {
@@ -288,8 +228,6 @@ fn review_a_bridge_that_cannot_finish_its_attach_never_reads_connected() {
     });
     let sid = boot_sid(&w);
     let booted = Instant::now();
-    // A hang detector (nothing bounds `stalled_in`; it is printed as the
-    // measurement), so the harness's minute rather than one back-off tick.
     let stalled_in = until("fabric=stalled reason=read", || {
         let fs = fabric_status(&w);
         (kv(&fs, "state") == Some("stalled") && kv(&fs, "reason") == Some("read"))
@@ -299,8 +237,6 @@ fn review_a_bridge_that_cannot_finish_its_attach_never_reads_connected() {
         "MEASURED refused halt read -> stalled reason=read: {} ms after boot",
         stalled_in.as_millis()
     );
-    // It never published anything — not even the first attempt's presence:
-    // the node's face on the bus is empty.
     let mut god = w.god();
     let (rows, _) = god
         .last(&format!("/f/{FLEET}/pub/{}/>", w.node), "", 8)
@@ -317,16 +253,6 @@ fn review_a_bridge_that_cannot_finish_its_attach_never_reads_connected() {
     );
 }
 
-/// **A RENEWED CAP IS ATTACHED AT THE NEXT REDIAL, BY THE SAME BRIDGE**
-/// (audit 16). The node's ring is minted already lapsed (`exp=1`, 1970), so
-/// the guarded broker refuses its attach AS EXPIRED and the bridge reads
-/// `stalled reason=expired` — not the `attach` of a cap the broker does not
-/// take at all, whose remedy is another mint, not a renewal — redialling
-/// under its back-off. A renewed ring written over
-/// `node.cap` by rename — as `aterm fabric on` installs a re-minted one — is
-/// all it takes: the bridge reads the file again before its next dial and
-/// comes up `connected`, with the same pid. A bridge that read its cap only
-/// at start (the negative control: the code before this) redials the lapsed
 /// ring until it is killed, and the wait below fails at its hang detector.
 #[test]
 fn a_renewed_cap_is_attached_at_the_next_redial_without_a_restart() {

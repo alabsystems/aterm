@@ -15,6 +15,8 @@ use super::{MAX_COMMANDLINE_BYTES, MAX_CWD_PATH_BYTES};
 pub(super) const INPUT_START_ATTESTATION: &[u8] = b"aterm_input=start";
 
 /// The most startup roots one START record names: a fish's sysconf folder and
+/// its vendor conf.d folders (one per `$XDG_DATA_DIRS` entry, its user data
+/// folder's and its build's).
 const MAX_START_ROOTS: usize = 32;
 
 impl TerminalHandler<'_> {
@@ -29,6 +31,7 @@ impl TerminalHandler<'_> {
     }
 
     /// Mark A (prompt start): open a mark, close the previous block, open a new
+    /// one.
     fn shell_prompt_start(&mut self, row: u64, col: u16) {
         let mut mark = CommandMark::new(row, col);
         mark.prompt_time_ms = self.transient.process_wall_ms;
@@ -81,7 +84,7 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Shell mark C: Command execution starting. Counted
+    /// Shell mark C: Command execution starting.
     fn shell_execution_start(&mut self, row: u64) {
         self.shell.started_seq = self.shell.started_seq.saturating_add(1);
         if let Some(ref mut mark) = self.shell.current_mark {
@@ -137,6 +140,8 @@ impl TerminalHandler<'_> {
     }
 
     /// Dispatch the A/B/C/D marks OSC 133 and 633 share, enforcing A→B→C→D: A
+    /// from any phase, B only after A, C after B, D after C; an out-of-order mark
+    /// is ignored.
     fn dispatch_shell_mark(&mut self, cmd: char, row: u64, col: u16, params: &[&[u8]]) -> bool {
         use super::grouped_state::ShellIntegrationPhase;
 
@@ -209,7 +214,7 @@ impl TerminalHandler<'_> {
             }
     }
 
-    /// Gate OSC 133/633 on the capability nonce. With
+    /// Gate OSC 133/633 on the capability nonce.
     #[inline]
     fn shell_nonce_gate_ok(&mut self, command: u32, params: &[&[u8]]) -> bool {
         if !self.modes.require_shell_integration_nonce {
@@ -227,6 +232,10 @@ impl TerminalHandler<'_> {
     }
 
     /// A shell prompt (OSC 133/633 `A`) on the alternate screen means the
+    /// full-screen app the shell ran died without its `?1049l` (conhost never
+    /// sends it for a client it outlived; neither does a SIGKILLed pager on
+    /// unix), so leave the alt screen, archiving its content, before the prompt
+    /// is placed.
     fn prompt_leaves_orphaned_alt_screen(&mut self, params: &[&[u8]]) {
         if params.get(1).and_then(|p| p.first()) != Some(&b'A') {
             return;
@@ -346,6 +355,7 @@ impl TerminalHandler<'_> {
     }
 
     /// OSC 633 `P;AtermIntegration=<rev>`: which integration body the shell runs
+    /// (`status integration_rev=`).
     #[inline]
     const fn record_integration_rev(&mut self, value: &str) {
         if !self.modes.require_shell_integration_nonce
@@ -359,6 +369,9 @@ impl TerminalHandler<'_> {
     }
 
     /// OSC 633 `P` keys of the warm spare (`docs/DESIGN-warm-spare-2026-10-16.md`
+    /// §4): `AtermSpare=parked`, and the START record's `AtermStartRc=`,
+    /// `AtermStartRoots=` (fish's), `AtermStartFlags=` and
+    /// `AtermStart=cold|spare`, which completes it.
     fn record_spare_mark(&mut self, key: &str, value: &str) -> bool {
         use crate::shell_integration::{
             SPARE_KEY, START_FLAGS_KEY, START_KEY, START_RC_KEY, START_ROOTS_KEY,
@@ -428,6 +441,9 @@ impl TerminalHandler<'_> {
     }
 
     /// A START record's other startup roots (`AtermStartRoots=`): absolute
+    /// paths, escaped as the rc folder is (a raw space too) and joined by the
+    /// escape `\x00` (no path holds a NUL), at most [`MAX_START_ROOTS`] of
+    /// them, each within [`MAX_CWD_PATH_BYTES`]; anything else names none.
     fn parse_start_roots(value: &str) -> Option<Vec<String>> {
         if value.is_empty() || value.len() > MAX_START_ROOTS * MAX_CWD_PATH_BYTES {
             return None;
@@ -444,6 +460,7 @@ impl TerminalHandler<'_> {
     }
 
     /// Unescape VS Code's command-line format: `\\` is a backslash and `\xAB`
+    /// the byte 0xAB (shells escape `;` and every byte <= 0x20 this way).
     fn unescape_vscode_string(s: &str) -> String {
         let mut result = String::with_capacity(s.len());
         let mut chars = s.chars().peekable();
@@ -555,6 +572,7 @@ mod prompt_on_alt_screen_tests {
     use crate::terminal::Terminal;
 
     /// Eight lines of history, a marked `less` command, and the pager stuck on
+    /// the alt screen.
     fn stuck_pager() -> Terminal {
         let mut term = Terminal::new(5, 40);
         term.set_alt_archive_enabled(true);
@@ -1024,6 +1042,7 @@ mod spare_mark_tests {
     }
 
     /// fish's startup roots (`AtermStartRoots=`): escaped absolute folders
+    /// joined by `\x00`, kept with the record that follows.
     #[test]
     fn a_start_record_carries_the_startup_roots_it_names() {
         let id = id();
@@ -1094,6 +1113,7 @@ mod reported_cwd_tests {
     }
 
     /// A gated terminal whose shell reported `/home/me` and drew its prompt,
+    /// signing every mark with `KEY`.
     fn gated_at_first_prompt() -> Terminal {
         let mut t = Terminal::new(6, 60);
         t.authorize_shell_integration(KEY);
@@ -1106,6 +1126,7 @@ mod reported_cwd_tests {
     }
 
     /// [`gated_at_first_prompt`] after the shell ran one command it marked
+    /// with `C` (`true`), and drew its prompt again.
     fn at_prompt() -> Terminal {
         let mut t = gated_at_first_prompt();
         t.process(b"true\r\n");
@@ -1120,6 +1141,8 @@ mod reported_cwd_tests {
     }
 
     /// The shell's own report as every integration sends it: the `AtermCwd`
+    /// property it signs with `KEY`, then the same URI as its OSC 7, which
+    /// carries no nonce.
     fn own_report(path: &str) -> Vec<u8> {
         format!(
             "\x1b]633;P;AtermCwd=file://host{path};id={}\x07\x1b]7;file://host{path}\x07",
@@ -1156,6 +1179,8 @@ mod reported_cwd_tests {
     }
 
     /// A stray report while the prompt is idle (a background job's output, or
+    /// the user's own prompt text) sets nothing: the folder stays the shell's
+    /// own.
     #[test]
     fn a_stray_report_at_the_idle_prompt_sets_no_folder() {
         let mut t = at_prompt();
@@ -1181,6 +1206,8 @@ mod reported_cwd_tests {
     }
 
     /// A shell that changes folder at its prompt (fish's Alt-Left, a widget that
+    /// runs `cd` and redraws) reports it immediately before the redrawn
+    /// prompt's `A`, which commits it, and the prompt's mark records it.
     #[test]
     fn a_folder_change_at_the_prompt_lands_with_the_redrawn_prompt() {
         let mut t = at_prompt();
@@ -1193,6 +1220,8 @@ mod reported_cwd_tests {
     }
 
     /// A program the shell runs reports at once: a remote shell over ssh (its
+    /// own marks are unsigned and dropped), a nested shell with its own
+    /// integration, `cd` inside a script.
     #[test]
     fn a_report_while_a_command_runs_or_after_it_ends_lands_at_once() {
         let mut t = at_prompt();
@@ -1219,6 +1248,7 @@ mod reported_cwd_tests {
     }
 
     /// With no authenticated shell (the nonce gate off), marks are anyone's, so
+    /// they say nothing about who speaks: every report lands at once.
     #[test]
     fn without_the_nonce_gate_every_report_lands_at_once() {
         let mut t = Terminal::new(6, 60);
@@ -1228,6 +1258,8 @@ mod reported_cwd_tests {
     }
 
     /// The shell's signed `633;P;Cwd=` is its own word: it lands at once at the
+    /// idle prompt, and a stray report held before it does not override it at
+    /// the next `A`.
     #[test]
     fn a_signed_cwd_property_lands_at_once_over_a_stray_report() {
         let mut t = at_prompt();
@@ -1245,6 +1277,9 @@ mod reported_cwd_tests {
     }
 
     /// A shell that has marked no command with `C` gives no phase in which it
+    /// runs nothing: PowerShell without PSReadLine skips `C` by design
+    /// (`aterm_shell_integration.ps1`), so a program it starts (ssh, a nested
+    /// shell) speaks while the phase still reads its prompt.
     #[test]
     fn a_shell_that_marks_no_command_holds_no_report() {
         let mut t = gated_at_first_prompt();
@@ -1261,6 +1296,9 @@ mod reported_cwd_tests {
     }
 
     /// A successor whose handoff carried no nonce keeps the gate but accepts
+    /// none of the shell's marks (posture `Degraded`), so the phase it carried
+    /// is the predecessor's last word, not the shell's now: every report lands
+    /// at once, the shell's own and a remote shell's alike.
     #[test]
     fn a_degraded_successor_holds_no_report() {
         use crate::terminal::ShellIntegrationPosture;
@@ -1310,6 +1348,7 @@ mod reported_cwd_tests {
     }
 
     /// A pending OSC 7 belongs to this engine's old prompt, not the shell state
+    /// a public in-place restore installs.
     #[test]
     fn an_in_place_restore_drops_the_previous_prompts_held_cwd() {
         let mut ordinary = at_prompt();
@@ -1363,6 +1402,8 @@ mod reported_cwd_tests {
     }
 
     /// The shell's own report (the `AtermCwd` it signs, then its OSC 7) is its
+    /// word at any phase, and one report queues one event, none when the folder
+    /// is unchanged.
     #[test]
     fn the_shells_own_report_lands_at_once_with_no_nonce_in_its_uri() {
         let mut t = signing_at_prompt();
@@ -1391,6 +1432,8 @@ mod reported_cwd_tests {
     }
 
     /// A stray between the shell's report and its `A`: the
+    /// shell reports its cwd and then prints its prompt start, and a background
+    /// job's report lands between the two.
     #[test]
     fn a_stray_between_the_shells_signed_report_and_its_prompt_sets_nothing() {
         let mut t = signing_at_prompt();
@@ -1422,6 +1465,8 @@ mod reported_cwd_tests {
     }
 
     /// A program a key binding starts: it runs with no `C`
+    /// (a zsh widget, a bash `bind -x`, a fish binding), but it holds the
+    /// terminal's foreground, which the host says.
     #[test]
     fn a_key_bound_programs_report_lands_while_it_holds_the_foreground() {
         let mut t = signing_at_prompt();
@@ -1457,6 +1502,10 @@ mod reported_cwd_tests {
     }
 
     /// A program the shell keeps in its own process group (PowerShell runs
+    /// every program there, so one a PSReadLine key handler starts holds no
+    /// foreground of its own; ConPTY has no foreground group at all): the
+    /// host's program probe says whether one the shell started since its prompt
+    /// began runs.
     #[test]
     fn a_program_the_probe_sees_since_the_prompt_reports_its_cwd() {
         use std::sync::Arc;
@@ -1494,6 +1543,11 @@ mod reported_cwd_tests {
     }
 
     /// A shell that stops sending `C` (PowerShell after `Import-Module
+    /// PSReadLine -Force` replaced aterm's readline shim): its next `D` comes
+    /// while its marks
+    /// say it sat at its prompt, which says it ran a command it did not mark,
+    /// and from there on its reports land at once, until a `C` says it marks
+    /// what it runs again.
     #[test]
     fn a_shell_that_stops_marking_commands_holds_no_report_once_it_says_so() {
         let mut t = signing_at_prompt();
@@ -1531,6 +1585,12 @@ mod reported_cwd_tests {
     }
 
     /// What the prompt left pending rides a checkpoint: a
+    /// report held at the prompt of a shell that does not sign its own lands at
+    /// the successor's next `A`; a shell's signing goes on being read (a stray
+    /// before its `A` is dropped there too); a shell that stopped marking
+    /// commands is still read so; and the cwd a key-bound program's report
+    /// replaced comes back when the successor's host says it left the
+    /// foreground.
     #[test]
     fn what_the_prompt_left_pending_survives_a_checkpoint() {
         fn carried(t: &Terminal) -> Vec<Terminal> {
@@ -1626,6 +1686,8 @@ mod dead_screen_carry_tests {
 
     impl Tab {
         /// A tab whose primary screen used `used` rows (`out 0` ...), then an app
+        /// on the alternate screen that drew `app` and died there, and the shell's
+        /// next prompt `prompt` drawn on the dead screen.
         fn killed(used: u16, app: &[u8], prompt: &[u8]) -> Self {
             let mut ours = Terminal::new(ROWS, 40);
             ours.set_host_resyncs_alt_screen(true);
@@ -1651,6 +1713,7 @@ mod dead_screen_carry_tests {
         }
 
         /// The host's leave: its client writes `?1049l` and, with `carry`, what
+        /// ours composed; the host draws it and forwards it to ours.
         fn leave(&mut self, carry: bool) -> bool {
             let text = self.ours.dead_alt_screen_carry();
             let mut bytes = b"\x1b[?1049l".to_vec();
@@ -1681,6 +1744,7 @@ mod dead_screen_carry_tests {
         }
 
         /// Both screens show the same rows, history and cursor, off the
+        /// alternate screen.
         fn in_step(&self) -> Vec<String> {
             let (a, b) = (self.ours.cursor(), self.host.cursor());
             assert_eq!(Self::rows(&self.ours), Self::rows(&self.host));

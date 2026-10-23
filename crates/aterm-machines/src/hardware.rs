@@ -1,32 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What a Mac is, in the words its name carries: the model's marketing name, the chip,
-//! the memory and the internal disk, read from macOS's own tools, and the description
-//! `[names]` fills `{hardware}` with (`MacBook Pro M4 Max 36GB 1TB`, design §5.1).
-//!
-//! Each fact is read the cheapest way that gives System Information's answer. Ten runs
-//! each, median, on a MacBook Air (Mac17,4, macOS 27.0.1) and in the macOS 27.0 VM:
-//! `system_profiler SPHardwareDataType -json` 189 ms (VM 191 ms) and `diskutil info -plist /`
-//! 208 ms (VM 111 ms), against 12 to 18 ms (VM 9 to 17 ms) for each of `sysctl -n
-//! hw.memsize`, `sysctl -n machdep.cpu.brand_string` and `ioreg -p IODeviceTree -r -n product
-//! -d 1`, most of which is starting a process (`/usr/bin/true`: 8 ms in the VM). The three
-//! answer what system_profiler does: `hw.memsize` 34359738368 is its `physical_memory` "32
-//! GB", the brand string "Apple M5" its `chip_type`, the device tree's `product-name`
-//! "MacBook Air (15-inch, M5)" carries its `machine_name` "MacBook Air".
-//!
-//! The disk is the Mac's own internal disk, not the startup volume's container: a split SSD
-//! (Boot Camp, a second APFS container) or a Mac started up from an external disk would name
-//! the container's size. `ioreg -r -c IOBlockStorageDevice -d 3 -l -w 0` lists each block
-//! storage device with its whole medium; twenty runs each, median: 25 to 33 ms on the Air
-//! (`/usr/bin/true` 3 ms there that day), 13 ms in the VM, against `diskutil list -plist
-//! internal physical` 41 to 42 ms (VM 48 ms) and `diskutil info -plist disk0` 117 ms (VM 74
-//! ms), which answer the same bytes: the Air's SSD is 4002222325760 (its startup container
-//! 3996276899840), the VM's disk 90000003072 (container 84107001856). See [`internal_disk`]
-//! for which disk names a Mac with several, or none.
-//!
-//! A fact a tool did not give stays empty in [`HostFacts`], and [`describe`] then says which
-//! is missing rather than describing the Mac without it.
+//! Mac hardware discovery ([`internal_disk`], [`HostFacts`], [`describe`]).
 
 use crate::model::HostFacts;
 use crate::port::Cmd;
@@ -46,16 +21,13 @@ pub fn brand_cmd() -> Cmd {
     Cmd::new("/usr/sbin/sysctl").args(["-n", "machdep.cpu.brand_string"])
 }
 
-/// The device tree's `product` node, whose `product-name` is the marketing name on Apple
-/// silicon (an Intel Mac has no such node).
+/// The device tree's `product` node, whose `product-name` is the marketing name on Apple silicon.
 #[must_use]
 pub fn product_cmd() -> Cmd {
     Cmd::new("/usr/sbin/ioreg").args(["-p", "IODeviceTree", "-r", "-n", "product", "-d", "1"])
 }
 
-/// `ioreg -r -c IOBlockStorageDevice -d 3 -l -w 0`: each block storage device (an SSD, a
-/// disk, a VM's virtual disk, a disk image), its driver and its whole medium, every object's
-/// properties shown.
+/// `ioreg -r -c IOBlockStorageDevice -d 3 -l -w 0`.
 #[must_use]
 pub fn disk_cmd() -> Cmd {
     Cmd::new("/usr/sbin/ioreg").args([
@@ -77,12 +49,6 @@ pub fn parse_memsize(text: &str) -> Option<u64> {
 }
 
 /// The processor `sysctl -n machdep.cpu.brand_string` names, and an Intel processor's speed.
-///
-/// Apple silicon answers the chip as System Information names it (`Apple M4 Max`; the VM
-/// `Apple M5 (Virtual)`), kept as it is. Intel's brand string
-/// (`Intel(R) Core(TM) i7-7920HQ CPU @ 3.10GHz`) becomes the family System Information
-/// shows, `Intel Core i7` (the marks dropped, each word cut at its model number, nothing
-/// from `CPU` on), and its speed `3.1 GHz`.
 #[must_use]
 pub fn parse_brand(text: &str) -> Option<(String, String)> {
     let brand = text.lines().next()?.trim();
@@ -124,8 +90,7 @@ fn decimal(digits: &str) -> Option<String> {
     ))
 }
 
-/// The `product-name` of `ioreg -p IODeviceTree -r -n product -d 1`
-/// (`"product-name" = <"MacBook Air (15-inch, M5)">`).
+/// Extract `product-name` from `ioreg -p IODeviceTree -r -n product -d 1`.
 #[must_use]
 pub fn parse_product_name(text: &str) -> Option<String> {
     text.lines().find_map(|l| {
@@ -135,11 +100,7 @@ pub fn parse_product_name(text: &str) -> Option<String> {
     })
 }
 
-/// The model's marketing name: `Virtual Machine` for a `VirtualMac` (whose device tree says
-/// `Apple Virtual Machine 1`), else the device tree's `product-name` up to its parenthesis
-/// (`MacBook Air (15-inch, M5)` is a `MacBook Air`), else, on an Intel Mac, the family its
-/// model identifier names (`MacBookPro14,3` is a `MacBook Pro`). `None` for an Apple silicon
-/// identifier (`Mac16,1`) with no product name: it names no family.
+/// The model's marketing name.
 #[must_use]
 pub fn model_name(hw_model: &str, product_name: Option<&str>) -> Option<String> {
     if hw_model.starts_with("VirtualMac") {
@@ -178,20 +139,7 @@ pub struct Disk {
     pub rotational: bool,
 }
 
-/// The Mac's internal disk in [`disk_cmd`]'s listing: the largest whole, non-removable
-/// medium (`"Whole" = Yes`, `"Removable" = No`) of a device whose `Protocol Characteristics`
-/// say `"Physical Interconnect Location"="Internal"`.
-///
-/// The internal disk names the Mac whatever it started up from: a Mac started from an
-/// external disk is still the Mac with its own SSD, and its name does not change with the
-/// startup disk. An external disk (`External`), a disk image (`Virtual Interface`, no
-/// location: the VM lists one) and a card in a built-in reader (an internal device whose
-/// medium is removable) are not the Mac's. With several internal disks the largest names
-/// it: on a Fusion Drive iMac that is the hard disk, the size Apple sold the Fusion Drive as
-/// (`1TB Fusion Drive`: a 1 TB disk beside a 32 GB SSD), and on a Mac Pro with drives added
-/// inside it is the largest of them, which may be one the owner added (the sum would name
-/// no size Apple sold or the owner bought, and the startup disk is the one thing the name
-/// does not follow). `None` when the Mac lists no internal disk.
+/// The Mac's internal disk in [`disk_cmd`]'s listing.
 #[must_use]
 pub fn internal_disk(text: &str) -> Option<Disk> {
     #[derive(Default)]
@@ -226,7 +174,6 @@ pub fn internal_disk(text: &str) -> Option<Disk> {
     let mut devices: Vec<Device> = Vec::new();
     let mut reading = Reading::Other;
     for line in text.lines() {
-        // A device starts each subtree at the first column; its driver and medium are drawn
         // under it (`  +-o`, `    +-o`), their properties behind `|` and spaces.
         if line.starts_with("+-o ") {
             devices.push(Device::default());
@@ -278,9 +225,7 @@ pub fn internal_disk(text: &str) -> Option<Disk> {
         .max_by_key(|d| d.bytes)
 }
 
-/// The sizes Apple sells a Mac's internal SSD in, in bytes as Apple counts them, and the
-/// least of that size, in thousandths, a disk reports and still reads as it
-/// ([`disk_size`]).
+/// Apple internal SSD capacities and minimum reported size ratios ([`disk_size`]).
 const SOLD: [(u64, &str, u128); 8] = [
     (128_000_000_000, "128GB", 940),
     (256_000_000_000, "256GB", 940),
@@ -293,22 +238,6 @@ const SOLD: [(u64, &str, u128); 8] = [
 ];
 
 /// A disk's size as Apple sells it, from the bytes `ioreg` reports for the whole disk.
-///
-/// Apple's SSDs report a size near the one on the box, under it for the small ones and just
-/// over it from a terabyte up: 128GB is 121332826112 bytes (94.8% of it), 256GB 251000193024
-/// (98.0%), 512GB 500277790720 (97.7%), 1TB 1000555581440, 2TB 2001111162880 and 4TB
-/// 4002222325760 (each 100.06%, the 4TB measured on the MacBook Air), 8TB 8001563222016
-/// (100.02%). Other drives are their decimal size and a little over (IDEMA: 1 TB is
-/// 1000204886016, 100.02%). So an SSD of 94% (under a terabyte) or 99.5% (from one up) to
-/// 100.1% of a size Apple sells is that size: the 128GB SSD keeps the lower bound where the
-/// startup container put it, and it still keeps out 120, 240 and 480 GB drives (93.8% of
-/// 128, 256 and 512 GB), at the cost of a third-party 250 or 500 GB SSD reading 256GB or
-/// 512GB; from a terabyte up, where every SSD that size reports just over it, the bound
-/// keeps out the 960 GB, 1.92, 3.84 and 7.68 TB drives of the same family (96%), which
-/// Apple never sold. A hard disk (`rotational`: Apple sold them only in decimal sizes, and
-/// a 500 GB disk is 97.7% of 512 GB too) and anything else is its measured size, in whole GB
-/// under a terabyte and tenths of a TB above (a VM's `90GB`, `1.5TB`, a 1 TB Fusion Drive's
-/// disk `1TB`, a 1.92 TB drive `1.9TB`).
 #[must_use]
 pub fn disk_size(bytes: u64, rotational: bool) -> String {
     let sold = SOLD.iter().find(|(size, _, least)| {
@@ -329,8 +258,7 @@ pub fn disk_size(bytes: u64, rotational: bool) -> String {
     }
 }
 
-/// Memory as Apple sells it: whole gibibytes, written `GB` (`hw.memsize` 34359738368 is
-/// `32GB`).
+/// Memory as Apple sells it: whole gibibytes, written `GB` (`hw.memsize` 34359738368 is `32GB`).
 #[must_use]
 pub fn memory_size(bytes: u64) -> String {
     const GIB: u64 = 1 << 30;
@@ -350,22 +278,19 @@ impl Description {
         self.parts.join(" ")
     }
 
-    /// Each part in a Local hostname's form (`MacBook-Pro`, `M4-Max`, `Intel-Core-i7-3-1GHz`),
-    /// in order, so a name too long for a DNS label drops whole parts from the right.
+    /// Each part in a Local hostname's form (`MacBook-Pro`).
     #[must_use]
     pub fn labels(&self) -> Vec<String> {
         self.parts.iter().map(|p| label_form(p)).collect()
     }
 
-    /// The parts, as a `hello` carries them to the controller (`MacBook Air`, `M5`, `32GB`,
-    /// `4TB`).
+    /// The parts, as a `hello` carries them to the controller (`MacBook Air`, `M5`, `32GB`, `4TB`).
     #[must_use]
     pub fn parts(&self) -> &[String] {
         &self.parts
     }
 
-    /// The description a `hello` carried ([`Description::parts`]); `None` when it carried
-    /// none (the Mac could not read a fact, or its agent is older than the field).
+    /// The description a `hello` carried ([`Description::parts`]); `None` when it carried none.
     #[must_use]
     pub fn from_parts(parts: &[String]) -> Option<Self> {
         (!parts.is_empty() && parts.iter().all(|p| !p.trim().is_empty())).then(|| Self {
@@ -376,13 +301,8 @@ impl Description {
 
 /// The description of the Mac `facts` were read on.
 ///
-/// The chip is named without `Apple ` and without a parenthesis (`M4 Max`; the VM's
-/// `Apple M5 (Virtual)` is `M5`, its model already says `Virtual Machine`), and an Intel
-/// processor with its speed (`Intel Core i7 3.1GHz`).
-///
 /// # Errors
-/// One line naming each fact the agent could not read; the Mac is never described
-/// without one.
+/// One line naming each fact the agent could not read; the Mac is never described without one.
 pub fn describe(facts: &HostFacts) -> Result<Description, String> {
     let mut missing: Vec<&str> = Vec::new();
     if facts.model_name.is_empty() {
@@ -420,17 +340,13 @@ pub fn describe(facts: &HostFacts) -> Result<Description, String> {
     })
 }
 
-/// `text` as macOS turns a Computer Name into a Local hostname: apostrophes dropped, every
-/// other character that is not an ASCII letter or digit a hyphen, runs of hyphens one, none
-/// at either end (`3.1GHz` is `3-1GHz`).
+/// `text` as macOS turns a Computer Name into a Local hostname.
 #[must_use]
 pub fn label_form(text: &str) -> String {
     label_form_keeping(text, "")
 }
 
-/// [`label_form`], with each `keep` in `text` kept as it is: [`PLACEHOLDER`] in a Local
-/// hostname the controller compares before the Mac fills it (`m1.lab-{hardware}` is
-/// `m1-lab-{hardware}`, and filled it is what `label_form` makes of the filled name).
+/// [`label_form`] with each `keep` in `text` (such as [`PLACEHOLDER`]) preserved.
 #[must_use]
 pub fn label_form_keeping(text: &str, keep: &str) -> String {
     let mut out = String::new();
@@ -527,8 +443,6 @@ pub(crate) mod tests {
             Some(("Apple M5".into(), String::new()))
         );
         assert_eq!(parse_memsize("34359738368\n"), Some(34_359_738_368));
-        // diskutil info -plist disk0 on the same Mac: TotalSize 4002222325760 (its startup
-        // container, disk0s2, 3996276899840).
         assert_eq!(
             internal_disk(AIR_DISKS),
             Some(Disk {
@@ -552,8 +466,6 @@ pub(crate) mod tests {
             model_name("VirtualMac2,1", parse_product_name(VM_PRODUCT).as_deref()).as_deref(),
             Some("Virtual Machine")
         );
-        // diskutil info -plist disk0 in the VM: TotalSize 90000003072 (tart's 90 GB; the
-        // startup container 84107001856). The disk image beside it is no disk of the Mac's.
         assert_eq!(
             internal_disk(VM_DISKS),
             Some(Disk {
@@ -571,7 +483,6 @@ pub(crate) mod tests {
         let d = describe(&vm).unwrap();
         assert_eq!(d.spaced(), "Virtual Machine M5 8GB 90GB");
         assert_eq!(d.labels(), ["Virtual-Machine", "M5", "8GB", "90GB"]);
-        // What a hello carries, and the description the controller reads back from it.
         assert_eq!(Description::from_parts(d.parts()), Some(d));
         assert_eq!(Description::from_parts(&[]), None);
         assert_eq!(Description::from_parts(&["M5".into(), " ".into()]), None);
@@ -579,7 +490,6 @@ pub(crate) mod tests {
 
     #[test]
     fn an_intel_processor_is_its_family_and_speed() {
-        // Intel's brand string for the i7-7920HQ (MacBookPro14,3, 2017), and the iMac Pro's.
         assert_eq!(
             parse_brand("Intel(R) Core(TM) i7-7920HQ CPU @ 3.10GHz\n"),
             Some(("Intel Core i7".into(), "3.1 GHz".into()))
@@ -614,9 +524,6 @@ pub(crate) mod tests {
 
     #[test]
     fn disks_read_as_the_size_apple_sells() {
-        // The whole SSD as ioreg (and diskutil's TotalSize) reports it: 4TB measured on the
-        // MacBook Air (Mac17,4); the others are the sizes System Information reports for
-        // Apple's 128GB to 8TB SSDs (SM0128G to AP8192), Intel and Apple silicon alike.
         for (bytes, sold) in [
             (121_332_826_112, "128GB"),
             (251_000_193_024, "256GB"),
@@ -625,16 +532,12 @@ pub(crate) mod tests {
             (2_001_111_162_880, "2TB"),
             (4_002_222_325_760, "4TB"),
             (8_001_563_222_016, "8TB"),
-            // Other SSDs at a size Apple sells (IDEMA's 256 GB, 1 TB, 2 TB).
             (256_060_514_304, "256GB"),
             (1_000_204_886_016, "1TB"),
             (2_000_398_934_016, "2TB"),
         ] {
             assert_eq!(disk_size(bytes, false), sold, "{bytes}");
         }
-        // Anything else is what it measures: the VM's disk, an odd drive, and SSDs of sizes
-        // Apple never sold, at 93.8% of one it did (IDEMA's 120, 240 and 480 GB) or 96% of
-        // one from a terabyte up (IDEMA's 960 GB, 1.92, 3.84 and 7.68 TB).
         for (bytes, measured) in [
             (90_000_003_072, "90GB"),
             (120_034_123_776, "120GB"),
@@ -649,8 +552,6 @@ pub(crate) mod tests {
         ] {
             assert_eq!(disk_size(bytes, false), measured, "{bytes}");
         }
-        // A hard disk is its decimal size: Apple's 500 GB and 1 TB disks (IDEMA), not the
-        // 512GB an SSD that size would be.
         assert_eq!(disk_size(500_107_862_016, true), "500GB");
         assert_eq!(disk_size(500_107_862_016, false), "512GB");
         assert_eq!(disk_size(1_000_204_886_016, true), "1TB");
@@ -680,8 +581,6 @@ pub(crate) mod tests {
 
     #[test]
     fn the_internal_disk_is_the_largest_fixed_one_and_never_an_external_or_removable_one() {
-        // A Fusion Drive iMac: a 32 GB SSD and a 1 TB hard disk, both internal. The disk
-        // names it, as Apple sold it: "1TB Fusion Drive".
         let fusion = format!(
             "{}{}",
             air_disk("Solid State", 32_000_000_000, "No", "Internal"),
@@ -696,7 +595,6 @@ pub(crate) mod tests {
             }
         );
         assert_eq!(disk_size(disk.bytes, disk.rotational), "1TB");
-        // Started up from an external disk: the internal SSD still names the Mac.
         let external_first = format!(
             "{}{AIR_DISKS}",
             air_disk("Solid State", 8_001_563_222_016, "No", "External")
@@ -705,13 +603,11 @@ pub(crate) mod tests {
             internal_disk(&external_first).unwrap().bytes,
             4_002_222_325_760
         );
-        // A card in a built-in reader is internal and removable: not the Mac's disk.
         let card = format!(
             "{AIR_DISKS}{}",
             air_disk("Solid State", 8_001_563_222_016, "Yes", "Internal")
         );
         assert_eq!(internal_disk(&card).unwrap().bytes, 4_002_222_325_760);
-        // No internal disk at all, or an answer that is no listing: unknown.
         assert_eq!(
             internal_disk(&air_disk("Solid State", 1, "No", "External")),
             None
@@ -733,7 +629,6 @@ pub(crate) mod tests {
             describe(&f).unwrap().spaced(),
             "MacBook Pro M4 Max 36GB 1TB"
         );
-        // An Apple silicon identifier alone names no family; a garbled answer is no fact.
         assert_eq!(model_name("Mac16,1", None), None);
         assert_eq!(parse_memsize("sysctl: unknown oid"), None);
         assert_eq!(parse_brand("\n"), None);
@@ -747,7 +642,6 @@ pub(crate) mod tests {
             "Manageds-Virtual-Machine"
         );
         assert_eq!(label_form(" -MacBook  Pro- "), "MacBook-Pro");
-        // An inventory name `--name` allows, compared before the Mac fills {hardware}.
         assert_eq!(label_form("lab_03.b"), "lab-03-b");
         assert_eq!(
             label_form_keeping("m1.lab_{hardware}.", PLACEHOLDER),

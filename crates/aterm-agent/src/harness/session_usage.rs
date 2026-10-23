@@ -16,6 +16,8 @@ use super::usage::{LimitNoticeRow, MAX_LINE_BYTES, ModelSpend, TranscriptUsage, 
 const READ_CHUNK: usize = 64 * 1024;
 
 /// A `pending` line buffer larger than this is released once the line it
+/// held is folded, so one long tool-result row does not pin its allocation
+/// through the rest of a read.
 const PENDING_KEEP: usize = 1024 * 1024;
 
 /// The most subagent transcripts one session's fold follows.
@@ -25,12 +27,18 @@ pub const MAX_SUBAGENT_FILES: usize = 2048;
 pub const QUIET_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// The most directory entries the subagent walk looks at, over all levels
+/// (the 551-file session used 1,111).
 const MAX_SUBAGENT_ENTRIES: usize = 16_384;
 
 /// How deep under `<session>/subagents/` the walk goes: the vendor nests a
+/// subagent's transcript under a subdirectory (`agentTranscriptSubdirs`) and
+/// a workflow's under `workflows/<run>/`.
 const MAX_SUBAGENT_DEPTH: usize = 4;
 
 /// How recently a directory may have changed, at the walk that stamped it, for
+/// its stamp to be RACY ([`DirSeen::racy`]): an entry made in the same tick of
+/// the file system's clock as the walk leaves the directory's stamp as the walk
+/// recorded it.
 const RACY_DIR: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The models `aterm harness usage` names; the rest are counted (`+2`).
@@ -92,6 +100,7 @@ pub(crate) fn open_identity(file: &std::fs::File, meta: &std::fs::Metadata) -> O
 fn handle_id(file: &std::fs::File) -> Option<FileId> {
     use std::os::windows::io::AsRawHandle as _;
     /// `BY_HANDLE_FILE_INFORMATION` (fileapi.h); each `FILETIME` is two
+    /// `DWORD`s.
     #[repr(C)]
     #[derive(Default)]
     struct Info {
@@ -159,14 +168,18 @@ pub struct Advance {
 pub struct TranscriptCursor {
     path: PathBuf,
     /// The file folded so far — a different one at the same path is a
+    /// rotation, and the fold starts over.
     identity: Option<FileId>,
     /// Bytes consumed: every complete line folded, plus `pending`.
     offset: u64,
     /// The byte at `offset - 1` when it was read: a file that no longer holds
+    /// it there was rewritten in place.
     boundary: Option<u8>,
     /// The torn last line: bytes after the last newline, not folded until
+    /// their newline is written.
     pending: Vec<u8>,
     /// The pending line passed [`MAX_LINE_BYTES`]: its bytes are discarded
+    /// up to its newline, and it is counted as skipped, never held.
     overflow: bool,
     fold: TranscriptUsage,
     /// The file as the last read found it: unchanged, it is not opened.
@@ -178,10 +191,13 @@ pub struct TranscriptCursor {
     /// Whether the last [`Self::advance`] could read the file.
     readable: bool,
     /// Its message ids were released ([`Self::release`]): only an append can be read on; any
+    /// other change leaves it `rewritten`.
     released: bool,
     /// Found rewritten after its ids were released: frozen, its totals
+    /// standing, counted unread from then on.
     rewritten: bool,
     /// A subagent's calls in flight ([`super::flight`]), fed the same lines
+    /// as `fold`; `None` for the main transcript.
     flight: Option<FlightFold>,
 }
 
@@ -215,6 +231,8 @@ impl TranscriptCursor {
     }
 
     /// What its calls in flight say ([`FileFlight::Unknown`] for the main
+    /// transcript, a file that could not be read at its last look, or one
+    /// found rewritten after its ids were released).
     fn file_flight(&self) -> FileFlight {
         match &self.flight {
             Some(fold) if self.readable && !self.rewritten => fold.flight(),
@@ -223,6 +241,7 @@ impl TranscriptCursor {
     }
 
     /// Release a finished file's message ids (its totals are all a view
+    /// needs).
     fn release(&mut self) {
         self.fold.shed_seen(0);
         self.released = true;
@@ -255,6 +274,7 @@ impl TranscriptCursor {
     }
 
     /// Whether the file `meta` describes is exactly the one the last read
+    /// left, read to its end: same size, mtime and inode.
     fn unchanged(&self, meta: &std::fs::Metadata) -> bool {
         let now = Stamp::of(meta);
         self.seen == Some(now) && self.offset >= now.len
@@ -377,7 +397,7 @@ impl TranscriptCursor {
         })
     }
 
-    /// Fold every line `bytes` completes; keep the torn tail pending. The
+    /// Fold every line `bytes` completes; keep the torn tail pending.
     fn consume(&mut self, mut bytes: &[u8], mut tap: Option<&mut StepFold>) {
         let mut end = self.offset;
         while let Some(nl) = bytes.iter().position(|&b| b == b'\n') {
@@ -463,17 +483,25 @@ impl Refresh {
 pub struct SessionUsage {
     main: TranscriptCursor,
     /// Every subagent file followed, at most [`MAX_SUBAGENT_FILES`]; each
+    /// has been read at least once.
     subagents: BTreeMap<PathBuf, TranscriptCursor>,
     /// Every directory the last walk looked at, with what `stat` said of it
+    /// (`None`: not there yet): a new subagent's file, a new workflow run's
+    /// directory, or `subagents/` itself appearing changes one.
     dirs_seen: Vec<DirSeen>,
     /// Whether the last refresh caught up (see [`Refresh::caught_up`]), and
+    /// whether it read anything: a fold behind that did not move on its last
+    /// read is not re-read until a file changes.
     caught_up: bool,
     progressed: bool,
     /// The most files followed ([`MAX_SUBAGENT_FILES`]; a test sets it low).
     cap: usize,
     /// The most directory entries one walk looks at
+    /// ([`MAX_SUBAGENT_ENTRIES`]; a test sets it low).
     walk_max: usize,
     /// What each followed agent's `meta.json` names it ([`AgentMeta`]): read
+    /// once, when its file is admitted, and again only while it is missing
+    /// (at most [`META_TRIES`] times, each when the file moved).
     metas: BTreeMap<PathBuf, AgentMeta>,
     /// Each workflow run's script ([`RunMeta`]), keyed by its run id.
     runs: BTreeMap<String, RunMeta>,
@@ -491,6 +519,7 @@ pub const META_TRIES: u8 = 4;
 const META_CAP: u64 = 16 * 1024;
 
 /// What a subagent's `meta.json` names it, as its panel row's name and
+/// activity would read it ([`Flyer::agent`]); `None` until read.
 #[derive(Debug, Clone, Default)]
 struct AgentMeta {
     flyer: Option<Flyer>,
@@ -498,6 +527,8 @@ struct AgentMeta {
 }
 
 /// A workflow run's script, `<session>/workflows/scripts/<slug>-<run>.js`:
+/// its slug and its mtime (the run's start, within 8 ms of the run's own
+/// `startTime`, measured); `None` until found.
 #[derive(Debug, Clone, Default)]
 struct RunMeta {
     found: Option<(String, i64)>,
@@ -505,6 +536,7 @@ struct RunMeta {
 }
 
 /// The workflow run a subagent file under `subagents` belongs to:
+/// `workflows/<run>/…`.
 fn run_of<'a>(subagents: &Path, path: &'a Path) -> Option<&'a str> {
     let mut parts = path.strip_prefix(subagents).ok()?.components();
     if parts.next()?.as_os_str() != "workflows" {
@@ -515,6 +547,8 @@ fn run_of<'a>(subagents: &Path, path: &'a Path) -> Option<&'a str> {
 }
 
 /// An agent's `meta.json` beside its transcript (`agent-<id>.jsonl` →
+/// `agent-<id>.meta.json`), read into what its panel row would say:
+/// `name ?? agentType`, and `description`.
 fn read_meta(path: &Path) -> Option<Flyer> {
     let stem = path.file_stem()?.to_str()?;
     let meta = path.with_file_name(format!("{stem}.meta.json"));
@@ -536,6 +570,7 @@ fn read_meta(path: &Path) -> Option<Flyer> {
 }
 
 /// The script of workflow run `run` in `scripts`: its slug and its mtime
+/// (unix ms).
 fn find_script(scripts: &Path, run: &str) -> Option<(String, i64)> {
     let suffix = format!("-{run}.js");
     let mut found = None;
@@ -558,6 +593,8 @@ fn find_script(scripts: &Path, run: &str) -> Option<(String, i64)> {
 }
 
 /// Advance one subagent cursor within the budget `left`: a file read to its
+/// end sheds its ids to [`FINISHED_IDS_KEPT`]; one that cannot be read now,
+/// or is found rewritten after its ids were released, is `unread`.
 fn advance_subagent(
     cursor: &mut TranscriptCursor,
     left: &mut u64,
@@ -724,6 +761,10 @@ impl SessionUsage {
     }
 
     /// Look for what names each followed agent and workflow run
+    /// ([`AgentMeta`], [`RunMeta`]) that is not yet known and has tries left:
+    /// one small read per agent, one listing of the scripts per run — a run
+    /// once a pass however many of its agents' files are followed, so a run
+    /// of many agents spends one of its tries a pass, as a lone agent does.
     fn learn(&mut self, subagents: &Path) {
         let scripts = subagents
             .parent()
@@ -978,6 +1019,9 @@ struct DirSeen {
     /// What `stat` said of it at the walk (`None`: not there).
     stamp: Option<Stamp>,
     /// The entries the walk read in it, kept only where its stamp was RACY: it
+    /// changed less than [`RACY_DIR`] before the walk (or after it, or its
+    /// time cannot be read), so an entry made since in the same clock tick
+    /// leaves the stamp as it is.
     racy: Option<usize>,
 }
 
@@ -994,6 +1038,7 @@ impl DirSeen {
     }
 
     /// Whether this directory changed since the walk: its stamp now, and where
+    /// the stamp was racy, whether its entry count changed.
     fn moved(&self) -> bool {
         let cap = self.racy.map_or(0, |n| n.saturating_add(1));
         dir_moved(self, stamp_of(&self.path), || {
@@ -1005,6 +1050,8 @@ impl DirSeen {
 }
 
 /// Whether `seen` moved, given its stamp `now` and a count of its entries now
+/// (asked only for a racy stamp): a stamp that differs, or a racy directory
+/// whose entries are not the walk's.
 fn dir_moved(seen: &DirSeen, now: Option<Stamp>, entries: impl FnOnce() -> Option<usize>) -> bool {
     now != seen.stamp || seen.racy.is_some_and(|n| entries() != Some(n))
 }
@@ -1014,12 +1061,14 @@ struct Listing {
     /// Every `agent-*.jsonl` regular file, with what `lstat` said of it.
     files: Vec<(PathBuf, std::fs::Metadata)>,
     /// Every directory looked at, with what `stat` said of it — the walk's
+    /// root among them even when it is not there (`None`).
     dirs: Vec<DirSeen>,
     /// The walk stopped at its entry bound.
     cut: bool,
 }
 
 /// The `agent-*.jsonl` files under `dir`, at most [`MAX_SUBAGENT_DEPTH`]
+/// levels down, each with its metadata, and the directories looked at.
 fn list_subagents(dir: &Path, max_entries: usize) -> Listing {
     let mut files = Vec::new();
     let mut dirs = Vec::new();
@@ -1122,6 +1171,8 @@ pub fn wall_of(
 }
 
 /// `unix` on the local clock (`offset` east of UTC), as the vendor prints a
+/// reset: `3pm`, `3:30pm`, and the date first when it is a day or more past
+/// `now` (`Oct 1 at 9am`).
 fn local_clock(unix: i64, offset: i64, now: i64) -> String {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -1252,6 +1303,7 @@ impl UsageFacts {
 }
 
 /// A model id's short name in `aterm harness usage`: its family (`claude-opus-5-5` → `opus`), or,
+/// when `family_shared`, the family with its version (`opus5.5`).
 fn model_label(id: &str, family_shared: bool) -> String {
     let family = model_short(id);
     let raw = if family_shared {
@@ -1273,6 +1325,9 @@ fn model_label(id: &str, family_shared: bool) -> String {
 }
 
 /// A model id as the API names the model, whatever route served it: a
+/// Bedrock id (`us.anthropic.claude-opus-4-1-20250805-v1:0`, or an ARN
+/// ending in one) loses everything up to `anthropic.` and its `-v1:0`
+/// revision, a Vertex id (`claude-opus-4-1@20250805`) its `@` date.
 fn model_of_route(id: &str) -> &str {
     const PROVIDER: &str = "anthropic.";
     let id = id

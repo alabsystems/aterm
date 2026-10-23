@@ -2,48 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! How each boundary type crosses: the lowering both sides agree on.
-//!
-//! A parameter crosses as two wasm words ([`FromAbi`], or [`RefFromAbi`] for
-//! `&str` and `&[T]`); the second word of a scalar is unused and the glue
-//! passes 0. A return crosses as one word plus, for some types, a `u32` the
-//! export leaves in the return slot ([`IntoAbi`], [`crate::mem::ret_slot`]).
-//! [`Describe`] names each type in the descriptor, and
-//! [`crate::descriptor::Ty::param_words`] / [`crate::descriptor::Ty::ret_word`]
-//! state the same lowering as a table the generator checks against the
-//! module; a test holds the table to these impls.
-//!
-//! | type | parameter words | return word, slot |
-//! |---|---|---|
-//! | `bool`, `u8`..`u32`, `i8`..`i32`, `usize`, `isize`, `char` | value (i32), 0 | value (i32) |
-//! | `u64`, `i64` | value (i64), 0 | value (i64) |
-//! | `f32`, `f64` | value, 0 | value |
-//! | `&str`, `String` | UTF-8 pointer, byte length | pointer; length |
-//! | `&[T]`, `Vec<T>` | pointer, element count | pointer; element count |
-//! | `Option<scalar>` | 1 or 0, value | value; 1 or 0 |
-//! | `Option<String>`, `Option<Vec<T>>` | pointer (0 = `None`), length | pointer (0 = `None`); length |
-//! | a JS object ([`crate::js`]) | its slot in the glue's object table, 0 | — |
-//! | an exported class | — | handle |
-//! | `Option<class>` | — | handle or 0 |
-//! | `Result<T, String>` | — | as `T`; `Err` throws the string |
-//! | `()` | — | nothing |
-//!
-//! A call that throws (an `Err`, an argument that is no value of its type, a
-//! misused handle) returns a zero word and leaves the throw in the return
-//! slot ([`crate::mem::set_thrown`]); the glue throws it once the export has
-//! returned.
-//!
-//! Every conversion is a plain function over words and the allocator in
-//! [`crate::mem`], so the native tests below drive each one through a model
-//! of the glue's half.
 
 use crate::descriptor::{TypeDesc, ValType, tag};
 
-/// A JS exception an export raises: left in the return slot as the export
-/// returns ([`crate::mem::set_thrown`]), and thrown by the glue.
+/// A JS exception an export raises: left in the return slot as the export returns ([`crate::mem::set_thrown`]), and thrown by the glue.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Thrown {
-    /// `throw new Error(msg)`: the boundary was misused (a freed or busy
-    /// handle, a bad argument), as wasm-bindgen's `throw_str` reports it.
+    /// `throw new Error(msg)`: the boundary was misused (a freed or busy handle, a bad argument), as wasm-bindgen's `throw_str` reports it.
     Error(String),
     /// `throw msg`: the export returned `Err(msg)`; JS catches the string.
     Value(String),
@@ -64,8 +29,7 @@ macro_rules! words {
 }
 words!(u32 => I32, i32 => I32, usize => I32, isize => I32, u64 => I64, i64 => I64, f32 => F32, f64 => F64);
 
-/// What an export returns as its wasm result: a [`Word`], or nothing. Its
-/// `Default` is what a call that threw returns.
+/// What an export returns as its wasm result: a [`Word`], or nothing.
 pub trait RetWord: Copy + Default {
     /// Its wasm type on `wasm32`, `None` for `()`.
     const RESULT: Option<ValType>;
@@ -93,24 +57,14 @@ pub trait FromAbi: Sized + Describe {
     type W1: Word;
 
     /// The value the glue lowered into `w0`, `w1`.
-    ///
     /// # Safety
-    /// The words are this type's lowering as the glue writes it (module
-    /// docs): a pointer and length name a live allocation of exactly that
-    /// many elements, made by [`crate::mem::alloc`] at the element's
-    /// alignment, which this call takes ownership of. A string's bytes are
-    /// UTF-8, as the glue's `TextEncoder` writes them; a release build does
-    /// not check that.
-    ///
+    /// The words are this type's lowering as the glue writes it (module docs): a pointer and length name a live allocation of exactly that many elements, made by [`crate::mem::alloc`] at the element's alignment, which this call takes ownership of.
     /// # Errors
-    /// [`Thrown::Error`] when the words are no value of the type (an invalid
-    /// `char`; in a debug build, a string that is not UTF-8). Ownership was
-    /// still taken.
+    /// [`Thrown::Error`] when the words are no value of the type (an invalid `char`; in a debug build, a string that is not UTF-8).
     unsafe fn from_abi(w0: Self::W0, w1: Self::W1) -> Result<Self, Thrown>;
 }
 
-/// A borrowed parameter type (`str`, `[T]`): the call borrows an owned
-/// anchor the conversion builds, dropped when the call returns.
+/// A borrowed parameter type (`str`, `[T]`): the call borrows an owned anchor the conversion builds, dropped when the call returns.
 pub trait RefFromAbi: Describe {
     /// What the borrow is taken from.
     type Anchor: core::ops::Deref<Target = Self>;
@@ -120,10 +74,8 @@ pub trait RefFromAbi: Describe {
     type W1: Word;
 
     /// The anchor for the words the glue lowered.
-    ///
     /// # Safety
     /// As [`FromAbi::from_abi`].
-    ///
     /// # Errors
     /// As [`FromAbi::from_abi`].
     unsafe fn ref_from_abi(w0: Self::W0, w1: Self::W1) -> Result<Self::Anchor, Thrown>;
@@ -134,9 +86,7 @@ pub trait IntoAbi: Describe {
     /// The wasm result.
     type Ret: RetWord;
 
-    /// The result word and the value for the return slot (0 when the type
-    /// does not use it). A buffer's ownership passes to the glue.
-    ///
+    /// The result word and the value for the return slot (0 when the type does not use it).
     /// # Errors
     /// [`Thrown::Value`] for `Err` of a `Result`.
     fn into_abi(self) -> Result<(Self::Ret, u32), Thrown>;
@@ -150,10 +100,8 @@ pub trait OptFromAbi: Sized + Describe {
     type W1: Word;
 
     /// `None` or the value for the words of `Option<Self>`.
-    ///
     /// # Safety
     /// As [`FromAbi::from_abi`].
-    ///
     /// # Errors
     /// As [`FromAbi::from_abi`].
     unsafe fn opt_from_abi(w0: Self::W0, w1: Self::W1) -> Result<Option<Self>, Thrown>;
@@ -165,7 +113,6 @@ pub trait OptIntoAbi: Sized + Describe {
     type Ret: RetWord;
 
     /// The result word and slot value for `Option<Self>`.
-    ///
     /// # Errors
     /// None today; the signature matches [`IntoAbi::into_abi`].
     fn opt_into_abi(v: Option<Self>) -> Result<(Self::Ret, u32), Thrown>;
@@ -234,8 +181,6 @@ macro_rules! scalars {
     )*};
 }
 
-// Narrow integers truncate what JS passed, as wasm-bindgen's `as` casts do;
-// JS has already wrapped the number to 32 bits.
 scalars! {
     bool, BOOL, u32, |w| Ok(w != 0), |v| u32::from(v);
     u8, U8, u32, |w| Ok(w as u8), |v| u32::from(v);
@@ -259,7 +204,6 @@ macro_rules! elems {
 elems!(u8, u16, u32, u64, i8, i16, i32, i64, f32, f64);
 
 /// Take ownership of the `len`-element buffer the glue wrote at `ptr`.
-///
 /// # Safety
 /// `FromAbi::from_abi`'s contract for a buffer of `T`.
 #[inline]
@@ -268,13 +212,11 @@ unsafe fn take_vec<T>(ptr: usize, len: usize) -> Vec<T> {
         // Nothing was allocated; `ptr` is the alignment.
         return Vec::new();
     }
-    // SAFETY: the caller's contract: a live allocation of exactly `len` `T`s
-    // at `T`'s alignment from the global allocator, now owned here.
+    // SAFETY: the caller's contract: a live allocation of exactly `len` `T`s at `T`'s alignment from the global allocator, now owned here.
     unsafe { Vec::from_raw_parts(ptr as *mut T, len, len) }
 }
 
-/// Hand a buffer to the glue: its pointer and element count. The glue frees
-/// it with `len * size_of::<T>()` bytes at `align_of::<T>()`.
+/// Hand a buffer to the glue: its pointer and element count.
 #[inline]
 fn give_vec<T>(v: Vec<T>) -> (usize, u32) {
     let b = v.into_boxed_slice();
@@ -284,18 +226,6 @@ fn give_vec<T>(v: Vec<T>) -> (usize, u32) {
 }
 
 /// A string argument's bytes as a `String`.
-///
-/// The glue writes every string argument with `TextEncoder`, whose output is
-/// well-formed UTF-8 by the Encoding Standard (a lone surrogate becomes
-/// U+FFFD), so a release build takes the bytes as they are, as wasm-bindgen
-/// 0.2.108 did (`from_utf8_unchecked`). Checking them again would be a second
-/// pass over every string the module is handed, `process_str`'s PTY chunks
-/// included, and would guard against nothing the boundary does not already
-/// trust the glue with: whoever writes these bytes holds the module's memory
-/// and names the pointer this call takes ownership of. A debug build checks,
-/// so a glue that broke the rule throws an `Error` in the replay and the
-/// toy's driver instead of handing the engine a malformed `str`.
-///
 /// # Safety
 /// `bytes` is UTF-8 ([`FromAbi::from_abi`]'s contract for a string).
 #[inline]
@@ -462,10 +392,10 @@ impl<T: IntoAbi, E: ThrowAbi> IntoAbi for Result<T, E> {
 
 #[cfg(test)]
 mod tests {
+
     //! Each type through a model of the glue: lower a JS value the way the
     //! generated glue does (allocate, write), run the Rust conversion, and
     //! lift the result the way the glue does (read the slot, copy, free).
-
     use super::*;
     use crate::descriptor::{Ty, decode_ty};
     use crate::mem;
@@ -506,8 +436,7 @@ mod tests {
 
     /// The trait impls lower each type to the words the generator's table
     /// says, so the export the macro writes has the signature the glue
-    /// calls. A type missing here would be a type the table and the impls
-    /// could disagree on unseen.
+    /// calls.
     #[test]
     fn the_impls_lower_as_the_table_says() {
         fn param<T: FromAbi>() {
@@ -572,7 +501,6 @@ mod tests {
 
     #[test]
     fn scalars_cross_as_wasm_bindgen_casts_them() {
-        // SAFETY (each from_abi below): scalars carry no memory.
         unsafe {
             assert_eq!(bool::from_abi(2, 0), Ok(true));
             assert_eq!(bool::from_abi(0, 0), Ok(false));
@@ -630,10 +558,8 @@ mod tests {
             assert_eq!(String::from_utf8(lift::<u8>(ptr, len)).unwrap(), text);
         }
         if cfg!(debug_assertions) {
-            // Only a debug build checks what the glue wrote (`utf8`).
             let (ptr, len) = pass(&[0xffu8, 0xfe]);
-            // SAFETY: as above, but for the bytes, which a debug build
-            // checks rather than trusts; ownership is taken even on the error.
+            // SAFETY: as above, but for the bytes, which a debug build checks rather than trusts; ownership is taken even on the error.
             assert_eq!(
                 unsafe { String::from_abi(ptr, len) },
                 Err(Thrown::Error("a string argument is not UTF-8".into()))

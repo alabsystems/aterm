@@ -3727,25 +3727,65 @@ mod shell_exit_tests {
         assert_eq!(code, Some(3), "and the status was left for its owner");
     }
 
-    /// A park while the gather waits for its shell's retirement ([`super::SHELL_RETIRE_HANG`]) ends the wait at once, inside the park's deadline, and leaves the shell running. The pause before the park only orders it after the gather's EOF read, so the park lands in the wait; a park that came first ends inside its deadline all the same.
+    /// A cancellation wake may precede the stop flag. Both exit paths must
+    /// send Wake even then, including when the exit watch is ready too.
     #[test]
-    fn a_park_ends_the_gathers_wait_for_its_shells_retirement() {
-        let app = App::headless_for_test();
-        let (mut session, slave, mut shell, _exits) = exit_rig(&app, 96);
-        aterm_pty::close_fd(slave);
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        // The park's deadline is the hang detector.
-        let parked = super::park_reader(
-            &mut session,
-            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
-        );
-        let running = shell.try_wait().expect("a look at the shell").is_none();
-        drop(shell.stdin.take());
-        let code = shell.wait().expect("its owner reaps it").code();
-        end_rig(session);
-        assert!(parked, "the park ended the gather's wait");
-        assert!(running, "and left the shell running");
-        assert_eq!(code, Some(3));
+    fn a_cancelled_retirement_wait_wakes_the_reader_without_posting_a_shell_exit() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        use super::{GatherMsg, ShellExit, ShellRetirement};
+
+        let pipe = || {
+            let (rd, wr) = aterm_pty::make_wake_pipe().expect("owned wake pipe");
+            // SAFETY: both fresh descriptors are transferred to one owner each.
+            unsafe { (OwnedFd::from_raw_fd(rd), OwnedFd::from_raw_fd(wr)) }
+        };
+        let (wake_rd, wake_wr) = pipe();
+        aterm_pty::wake(wake_wr.as_raw_fd());
+        for (watched, watch_ready) in [(false, false), (true, false), (true, true)] {
+            let (watch_rd, watch_wr) = pipe();
+            if watch_ready {
+                aterm_pty::wake(watch_wr.as_raw_fd());
+            }
+            let exit = ShellExit {
+                watch: watched.then_some(watch_rd),
+                // This process is not its own child; no shell is needed.
+                pid: std::process::id(),
+            };
+            let result = exit.await_retired_at_exit(wake_rd.as_raw_fd(), &NO_STOP);
+            assert_eq!(result, ShellRetirement::Cancelled);
+            assert!(!NO_STOP.load(std::sync::atomic::Ordering::Acquire));
+            for ending in [GatherMsg::Exited, GatherMsg::Eof] {
+                assert!(matches!(result.gather_message(ending), GatherMsg::Wake));
+            }
+        }
+        for watched in [false, true] {
+            let (watch_rd, _watch_wr) = pipe();
+            let exit = ShellExit {
+                watch: watched.then_some(watch_rd),
+                pid: std::process::id(),
+            };
+            assert_eq!(
+                exit.await_retired_at_exit(-1, &STOPPED),
+                ShellRetirement::Cancelled,
+                "the stop flag also cancels without a wake pipe"
+            );
+            assert_eq!(
+                exit.await_retired(std::time::Duration::ZERO, -1, &NO_STOP),
+                ShellRetirement::Unconfirmed,
+                "timeout or an unwaitable pid retains the existing exit policy"
+            );
+        }
+        for result in [ShellRetirement::Retired, ShellRetirement::Unconfirmed] {
+            assert!(matches!(
+                result.gather_message(GatherMsg::Exited),
+                GatherMsg::Exited
+            ));
+            assert!(matches!(
+                result.gather_message(GatherMsg::Eof),
+                GatherMsg::Eof
+            ));
+        }
     }
 
     #[test]
@@ -5635,6 +5675,28 @@ pub(crate) struct ShellExit {
     pid: u32,
 }
 
+/// Whether retirement was observed, remained unknown at the existing bound
+/// or error, or was cancelled by the reader's stop/wake.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShellRetirement {
+    Retired,
+    Unconfirmed,
+    Cancelled,
+}
+
+#[cfg(unix)]
+impl ShellRetirement {
+    /// Timeout/error still use the existing exit policy; cancellation never
+    /// authorizes the parser to post a shell exit.
+    fn gather_message(self, ending: GatherMsg) -> GatherMsg {
+        match self {
+            Self::Cancelled => GatherMsg::Wake,
+            Self::Retired | Self::Unconfirmed => ending,
+        }
+    }
+}
+
 #[cfg(unix)]
 impl ShellExit {
     /// The watch's descriptor, `-1` (which `poll` ignores) without one.
@@ -5644,23 +5706,32 @@ impl ShellExit {
             .map_or(-1, std::os::fd::AsRawFd::as_raw_fd)
     }
 
-    /// The gather's one wait for its shell's retirement before it reports the exit: [`Self::await_retired`] bounded by [`SHELL_RETIRE_HANG`], ended at once by the gather's stop.
-    fn await_retired_at_exit(&self, wake_rd: i32, stop: &AtomicBool) {
-        self.await_retired(SHELL_RETIRE_HANG, wake_rd, stop);
+    /// The gather's one wait before reporting the exit, bounded by
+    /// [`SHELL_RETIRE_HANG`]. Cancellation must instead wake the parser.
+    fn await_retired_at_exit(&self, wake_rd: i32, stop: &AtomicBool) -> ShellRetirement {
+        self.await_retired(SHELL_RETIRE_HANG, wake_rd, stop)
     }
 
-    /// Wait at most `within` for the shell to be retired (its watch fired, then a look that reaps nothing finds it collectable); a wake on `wake_rd` or `stop` raised ends it at once, `stop` read every [`RETIRE_STOP_LOOK`] while the watch is silent and there is no wake pipe (`wake_rd == -1`).
-    fn await_retired(&self, within: std::time::Duration, wake_rd: i32, stop: &AtomicBool) {
+    /// Wait at most `within` for retirement without reaping. Stop/wake returns
+    /// Cancelled, distinct from a collectable child or an unconfirmed timeout
+    /// or error. With no wake pipe, the silent watch reads the stop flag every
+    /// [`RETIRE_STOP_LOOK`].
+    fn await_retired(
+        &self,
+        within: std::time::Duration,
+        wake_rd: i32,
+        stop: &AtomicBool,
+    ) -> ShellRetirement {
         let deadline = Instant::now() + within;
         let stopped = || stop.load(Ordering::Acquire);
         if self.watch.is_some() {
             loop {
                 if stopped() {
-                    return;
+                    return ShellRetirement::Cancelled;
                 }
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
-                    return;
+                    return ShellRetirement::Unconfirmed;
                 }
                 let step = if wake_rd < 0 {
                     left.min(RETIRE_STOP_LOOK)
@@ -5684,21 +5755,25 @@ impl ShellExit {
                 // SAFETY: two live pollfds for the length of the call.
                 let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, ms) };
                 if rc < 0 {
-                    return;
+                    return ShellRetirement::Unconfirmed;
+                }
+                // park_reader writes the wake before raising the stop flag.
+                // Cancellation wins even if the shell watch became ready too.
+                if fds[1].revents != 0 || stopped() {
+                    return ShellRetirement::Cancelled;
                 }
                 if fds[0].revents != 0 {
                     break;
                 }
-                // The stop's wake.
-                if rc > 0 {
-                    return;
-                }
             }
         }
         let Ok(pid) = libc::pid_t::try_from(self.pid) else {
-            return;
+            return ShellRetirement::Unconfirmed;
         };
         loop {
+            if stopped() {
+                return ShellRetirement::Cancelled;
+            }
             // SAFETY: a zeroed `siginfo_t` out-param for a non-reaping peek.
             let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
             // SAFETY: `WNOWAIT` leaves the child waitable; `WNOHANG` never blocks.
@@ -5712,19 +5787,27 @@ impl ShellExit {
             };
             // SAFETY: `waitid` filled a `CLD_*` siginfo or, with nothing waitable under `WNOHANG`, left it zeroed.
             let collectable = rc == 0 && unsafe { info.si_pid() } == pid;
-            if rc != 0 || collectable || stopped() || Instant::now() >= deadline {
-                return;
-            }
+            let finished = rc != 0 || collectable || Instant::now() >= deadline;
             // A negative descriptor is ignored by `poll`, which then only naps.
             let mut wake = libc::pollfd {
                 fd: wake_rd,
                 events: libc::POLLIN,
                 revents: 0,
             };
-            let nap = libc::c_int::try_from(RETIRE_LOOK.as_millis()).unwrap_or(1);
+            let nap = if finished {
+                0
+            } else {
+                libc::c_int::try_from(RETIRE_LOOK.as_millis()).unwrap_or(1)
+            };
             // SAFETY: one live pollfd for the length of the call.
-            if unsafe { libc::poll(&mut wake, 1, nap) } > 0 {
-                return;
+            if unsafe { libc::poll(&mut wake, 1, nap) } > 0 || stopped() {
+                return ShellRetirement::Cancelled;
+            }
+            if collectable {
+                return ShellRetirement::Retired;
+            }
+            if finished {
+                return ShellRetirement::Unconfirmed;
             }
         }
     }
@@ -5808,7 +5891,7 @@ pub(crate) fn adopt_restored_holder(
         }
         let _ = timeline.offer_holder_image(image, crate::holder_image::EdgeKind::Group);
         if crate::holder_image::DEV_ROWS {
-            timeline.record(
+            timeline.record_row(
                 "holder-adopt",
                 format!(
                     "adoption={adoption:?} token={} exact={} pgid={pgid} {}",
@@ -5957,14 +6040,16 @@ fn spawn_pty_gather(
                             0 => {
                                 after_exit = None;
                                 exit_rd = -1;
-                                exit_reported = true;
-                                if let Some(exit) = &shell_exit {
-                                    exit.await_retired_at_exit(wake_rd, &stop);
-                                }
-                                if filled_tx.send(GatherMsg::Exited).is_err() {
-                                    // Distinct branch.
+                                let message =
+                                    shell_exit.as_ref().map_or(GatherMsg::Exited, |exit| {
+                                        exit.await_retired_at_exit(wake_rd, &stop)
+                                            .gather_message(GatherMsg::Exited)
+                                    });
+                                let cancelled = matches!(message, GatherMsg::Wake);
+                                if filled_tx.send(message).is_err() || cancelled {
                                     break;
                                 }
+                                exit_reported = true;
                                 continue;
                             }
                             n => aterm_pty::ReadOutcome::Data(n),
@@ -5997,14 +6082,15 @@ fn spawn_pty_gather(
                     }
                     aterm_pty::ReadOutcome::Eof => {
                         // exit it is about to make goes with this one.
-                        if !exit_reported && let Some(exit) = &shell_exit {
-                            exit.await_retired_at_exit(wake_rd, &stop);
-                        }
-                        let _ = filled_tx.send(if exit_reported {
+                        let message = if exit_reported {
                             GatherMsg::Wake
                         } else {
-                            GatherMsg::Eof
-                        });
+                            shell_exit.as_ref().map_or(GatherMsg::Eof, |exit| {
+                                exit.await_retired_at_exit(wake_rd, &stop)
+                                    .gather_message(GatherMsg::Eof)
+                            })
+                        };
+                        let _ = filled_tx.send(message);
                         break;
                     }
                     aterm_pty::ReadOutcome::Data(n) => {

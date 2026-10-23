@@ -1,29 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
-//! A row as search reads it: its text as written, the grid cells that text was read
-//! from, and whether it continues the row above.
-//!
-//! The search index reports a match in the cells that hold it ([`LineCells`]), not where a
-//! walk of the text would put it: the grid folds a character into the cell before it only
-//! when that cell is the one before the cursor as it arrives, so two flag halves written
-//! out of order (or brought together by a delete-character) stay two cells, and a VS16 base
-//! in a row's last column stays one cell wide. Every search over this terminal reads its
-//! rows here: the index slot's builds and refreshes and the GUI's index through
-//! [`Terminal::read_search_rows`], and the budgeted search.
-//!
-//! A history row's cells are the ones it is drawn in ([`history_line_text_cells`]): the
-//! walk of its stored line, which keeps apart the cells the grid drew apart.
-//! The stored walk costs one unit scan per grapheme (about 0.9 µs a row of 70 decomposed
-//! accents: +17% on a full build of such scrollback, within noise on ASCII, agent output
-//! and CJK); a full build runs only on a cold or invalidated index.
-//!
-//! Rows are addressed by absolute row, the search index's coordinate: history line `i`
-//! (0 = oldest retained) is `oldest_absolute_row() + i`, and live screen row `r` follows
-//! the history. Every reader here reads the live frame, never the viewport: a screen row's
-//! text and its soft-wrap flag come from the row on the screen whatever `display_offset`
-//! the viewport is scrolled back by.
+//! A row as search reads it.
 
 use std::borrow::Cow;
 
@@ -36,21 +14,15 @@ use crate::grid::{Grid, stored_line_cells};
 use crate::search::LineCells;
 
 /// How far back [`Terminal::logical_origin`] looks for the row a soft-wrap run starts
-/// on. A run this long is not a wrapped sentence, it is a file with no newlines catted
-/// into the grid, and the walk runs once per anchored search, so past this depth the
-/// callers take their bounded fallback (rebuild from the retained floor, leave the
-/// anchor physical) instead of a scan over the whole retained history.
+/// on.
 const MAX_LOGICAL_LINE_WALK: usize = 1024;
 
-/// Rows of the terminal as search reads them ([`Terminal::read_search_rows`]): one entry
-/// per row in each vector.
+/// Rows of the terminal as search reads them ([`Terminal::read_search_rows`]).
 #[derive(Debug, Default)]
 pub struct SearchRows {
-    /// Each row's text as written, trailing blanks kept: a live row's written cells, a
-    /// history row's stored line up to [`MAX_SCROLLBACK_LINE_SCAN_BYTES`].
+    /// Each row's text as written, trailing blanks kept.
     pub text: Vec<String>,
-    /// The cells each row's text was read from; a history row the read bound cut has
-    /// them marked truncated ([`LineCells::is_truncated`]).
+    /// The cells each row's text was read from.
     pub cells: Vec<LineCells>,
     /// Whether each row continues the row above it ([`Terminal::abs_row_continues`]).
     pub wrapped: Vec<bool>,
@@ -79,10 +51,9 @@ impl SearchRows {
 /// The text of an absolute row ([`Terminal::abs_row_text_within`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AbsRowText {
-    /// The row's text as written, combining marks and clusters intact, control
-    /// characters not yet collapsed.
+    /// The row's text as written, combining marks and clusters intact, control characters not yet collapsed.
     Text(String),
-    /// Older than `oldest_absolute_row()`: scrolled past the scrollback cap.
+    /// Older than `oldest_absolute_row()`.
     Evicted,
     /// Below the live screen's bottom row (no such row).
     OutOfRange,
@@ -90,11 +61,10 @@ pub enum AbsRowText {
     Unreadable,
 }
 
-/// Where an absolute row stands ([`Terminal::abs_row_at`]): what `cell abs=<n>` reads.
+/// Where an absolute row stands ([`Terminal::abs_row_at`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AbsRowAt {
-    /// In the retained history, `rev_idx` lines above the live screen (0 = the newest
-    /// scrolled-off line): [`Terminal::render_history_row_into`] resolves its cells.
+    /// In the retained history, `rev_idx` lines above the live screen (0 = the newest scrolled-off line).
     History {
         /// Lines above the live screen: 0 is the newest scrolled-off line.
         rev_idx: usize,
@@ -104,17 +74,14 @@ pub enum AbsRowAt {
         /// The live screen row, 0 at its top.
         row: usize,
     },
-    /// Older than `oldest_absolute_row()`: scrolled past the scrollback cap.
+    /// Older than `oldest_absolute_row()`.
     Evicted,
     /// Below the live screen's bottom row (no such row).
     OutOfRange,
 }
 
 impl Terminal {
-    /// [`written_line_text`](Self::written_line_text) with the grid cells its
-    /// text was read from: a visible row's live cells, or the cells a history
-    /// row is drawn in ([`history_line_text_cells`]). `None` when `row`
-    /// addresses no line.
+    /// [`written_line_text`](Self::written_line_text) with the grid cells its text was read from.
     #[must_use]
     pub fn written_line_cells(&self, row: i32) -> Option<(String, LineCells)> {
         if row < 0 {
@@ -128,19 +95,7 @@ impl Terminal {
         Some(visible_row_written(&self.grid, row))
     }
 
-    /// Append absolute rows `first..first + count` to `out`, exactly `count` of them:
-    /// each row's text and cells as [`written_line_cells`](Self::written_line_cells)
-    /// reads them and its soft-wrap flag as [`abs_row_continues`](Self::abs_row_continues)
-    /// answers, a row that is evicted, unreadable or past the screen's bottom reading as
-    /// an empty, unwrapped one.
-    ///
-    /// The history part is read through ONE dense walk ([`Grid::history_lines_from`]): one
-    /// decode per tiered segment, the text and the wrap flag taken from the same yielded
-    /// line, where the per-row readers pay a binary search, a block-cache probe and a
-    /// `Line` clone per tiered row. Rows stay keyed by position (an undecodable segment
-    /// yields one placeholder per line it spans), so every later row keeps its absolute
-    /// row. Text and flags come from the one frame the caller's hold of the terminal
-    /// sees, so a layout and its content never come from two frames.
+    /// Append absolute rows `first..first + count` to `out`, exactly `count` of them.
     pub fn read_search_rows(&self, first: u64, count: usize, out: &mut SearchRows) {
         let grid = &self.grid;
         let oldest = grid.oldest_absolute_row();
@@ -151,14 +106,11 @@ impl Terminal {
             usize::try_from(bound.min(end).saturating_sub(from)).unwrap_or(usize::MAX)
         };
         let mut abs = first;
-        // Rows scrolled past the cap.
         let evicted = rows_until(oldest, abs);
         for _ in 0..evicted {
             out.push(Default::default(), false);
         }
         abs = abs.saturating_add(u64::try_from(evicted).unwrap_or(u64::MAX));
-        // History, through the dense walk. The oldest retained row is never a
-        // continuation: its run's head is gone.
         let in_history = rows_until(history_end, abs);
         if in_history > 0 {
             let start = usize::try_from(abs - oldest).unwrap_or(usize::MAX);
@@ -170,8 +122,6 @@ impl Terminal {
             }
             abs = abs.saturating_add(u64::try_from(in_history).unwrap_or(u64::MAX));
         }
-        // The live screen, and anything past its bottom. Counted, not bounded by `end`,
-        // so exactly `count` rows are appended whatever saturates.
         for _ in evicted.saturating_add(in_history)..count {
             let row = abs
                 .checked_sub(history_end)
@@ -185,15 +135,7 @@ impl Terminal {
         }
     }
 
-    /// Whether absolute row `abs` is a soft-wrap continuation: the grid's destination
-    /// convention, where the row content flowed into carries the flag, so the first row
-    /// of a logical line reads `false`. The flag selection reads
-    /// ([`row_continues_previous`](Self::row_continues_previous)): a history row's stored
-    /// line, a screen row's live row whatever the viewport shows.
-    ///
-    /// A row outside the retained range, and the oldest retained row, are not
-    /// continuations: a run whose head has been evicted starts at the oldest row still
-    /// there, the only logical line the search index can honestly key.
+    /// Whether absolute row `abs` is a soft-wrap continuation.
     #[must_use]
     #[inline]
     pub fn abs_row_continues(&self, abs: u64) -> bool {
@@ -203,15 +145,7 @@ impl Terminal {
                 .is_some_and(|row| self.row_continues_previous(row))
     }
 
-    /// The absolute row the search index keys the logical line containing `abs` under:
-    /// the walk back over soft-wrap continuations ([`abs_row_continues`](Self::abs_row_continues))
-    /// to the row the run starts on, stopping at `floor` (the oldest row the index
-    /// retains).
-    ///
-    /// Every column the index reports is measured from THIS row's column 0, so a caller
-    /// holding a physical `(row, col)` point (a find anchor) comes through here before it
-    /// can address the index at all. `None` when the run reaches back further than
-    /// [`MAX_LOGICAL_LINE_WALK`] rows without meeting its head or the floor.
+    /// The absolute row the search index keys the logical line containing `abs` under.
     #[must_use]
     pub fn logical_origin(&self, abs: u64, floor: u64) -> Option<u64> {
         let mut origin = abs;
@@ -224,19 +158,14 @@ impl Terminal {
         None
     }
 
-    /// Whether absolute row `abs` carries the soft-wrap continuation flag, the oldest
-    /// retained row included ([`abs_row_continues`](Self::abs_row_continues) reads that
-    /// one as a line's start): what an index joined it as while older rows were still
-    /// retained.
+    /// Whether absolute row `abs` carries the soft-wrap continuation flag (including the oldest retained row, unlike [`abs_row_continues`](Self::abs_row_continues)).
     #[inline]
     pub(crate) fn abs_row_wrap_flag(&self, abs: u64) -> bool {
         self.abs_selection_row(abs)
             .is_some_and(|row| self.row_continues_previous(row))
     }
 
-    /// The exclusive end of the soft-wrap run absolute row `abs` belongs to: the first
-    /// row after `abs` that is not a continuation, walking no further than `stop`, and
-    /// `stop` when the run reaches it or runs on past [`MAX_LOGICAL_LINE_WALK`] rows.
+    /// The exclusive end of the soft-wrap run absolute row `abs` belongs to.
     pub(crate) fn logical_run_end(&self, abs: u64, stop: u64) -> u64 {
         let mut end = abs.saturating_add(1);
         for _ in 0..MAX_LOGICAL_LINE_WALK {
@@ -248,13 +177,7 @@ impl Terminal {
         stop
     }
 
-    /// Text of absolute row `abs` as written, trailing blanks kept: history line
-    /// `abs - oldest_absolute_row()` read up to `max_bytes` of its stored bytes
-    /// ([`MAX_SCROLLBACK_LINE_SCAN_BYTES`] as search reads it, `usize::MAX` to read it
-    /// whole), else live screen row `abs - oldest - scrollback_lines` through the
-    /// combining-aware [`written_line_text`](Self::written_line_text), so accents and ZWJ
-    /// clusters survive and find answers the same for a row on the screen and after it
-    /// scrolls into history.
+    /// Text of absolute row `abs` as written, trailing blanks kept.
     #[must_use]
     pub fn abs_row_text_within(&self, abs: u64, max_bytes: usize) -> AbsRowText {
         let grid = &self.grid;
@@ -284,10 +207,7 @@ impl Terminal {
         )
     }
 
-    /// Where absolute row `abs` (B-2's one coordinate space, `line`'s and `search`'s) stands:
-    /// a history row, by how far above the live screen, or a live screen row — the read
-    /// [`abs_row_text_within`](Self::abs_row_text_within) makes, for a reader of the row's
-    /// cells (`cell abs=<n>`).
+    /// Where absolute row `abs` (B-2's one coordinate space, `line`'s and `search`'s) stands.
     #[must_use]
     pub fn abs_row_at(&self, abs: u64) -> AbsRowAt {
         let grid = &self.grid;
@@ -310,11 +230,7 @@ impl Terminal {
         AbsRowAt::Screen { row }
     }
 
-    /// Text of absolute row `abs` as search reads it
-    /// ([`abs_row_text_within`](Self::abs_row_text_within) at
-    /// [`MAX_SCROLLBACK_LINE_SCAN_BYTES`]), so a snippet equals the line the match came
-    /// from. `None` when `abs` is evicted, unreadable or past the live screen. Feeds
-    /// `search_summary`'s snippet.
+    /// Text of absolute row `abs` as search reads it ([`abs_row_text_within`](Self::abs_row_text_within) at [`MAX_SCROLLBACK_LINE_SCAN_BYTES`]).
     #[must_use]
     #[inline]
     pub fn abs_row_text(&self, abs: u64) -> Option<String> {
@@ -334,9 +250,7 @@ impl Terminal {
     }
 }
 
-/// A history line read for search from the dense history walk
-/// (`Grid::history_lines_from`): its text and cells, or an empty row for a line
-/// the walk could not read, so later rows keep their absolute rows.
+/// A history line read for search from the dense history walk (`Grid::history_lines_from`).
 #[inline]
 pub(crate) fn history_row_for_search(
     grid: &Grid,
@@ -349,8 +263,7 @@ pub(crate) fn history_row_for_search(
 /// A history row whose stored line is `line`, as search reads it: its text as
 /// written, bounded by [`MAX_SCROLLBACK_LINE_SCAN_BYTES`] as
 /// [`Terminal::written_line_text`] reads it, with the cells that text is drawn
-/// in. A line the bound cuts has its cells marked ([`LineCells::mark_truncated`]),
-/// so the index counts it as a line it did not search to its end.
+/// in.
 #[inline]
 fn history_row_written(grid: &Grid, line: &Line) -> (String, LineCells) {
     let bytes = line.as_bytes();
@@ -362,20 +275,14 @@ fn history_row_written(grid: &Grid, line: &Line) -> (String, LineCells) {
     (text, cells)
 }
 
-/// The cells `text`, a read of a history row of `grid` whose stored line is `line`, is
-/// drawn in: the walk of the stored line ([`stored_line_cells`]), which lays the row out on
-/// every history tier, the ring's own fast path included, and keeps apart the cells the
-/// grid drew apart. Every reader of a history row's cells comes here (search, a
-/// double-click's window, a web host's word under a cell, a copy's columns), so a column
-/// names the cell drawn there.
+/// The cells `text`, a read of a history row of `grid` whose stored line is `line`, is drawn in.
 #[must_use]
 #[inline]
 pub(crate) fn history_line_text_cells(grid: &Grid, line: &Line, text: &str) -> LineCells {
     stored_line_text_cells(line, text, grid.cols())
 }
 
-/// The cells `text`, a read of stored history `line`, is drawn in on a row
-/// `cols` wide: the walk ([`stored_line_cells`]) the row is laid out by.
+/// The cells `text`, a read of stored history `line`, is drawn in on a row `cols` wide.
 #[inline]
 pub(crate) fn stored_line_text_cells(line: &Line, text: &str, cols: u16) -> LineCells {
     let mut cells = LineCells::new();
@@ -416,8 +323,6 @@ mod tests {
                 t.process(format!("live {i:03}\r\n").as_bytes());
             }
         }
-        // End on a run whose head has scrolled into history and whose seven rows'
-        // tail fills the screen: it straddles the history/screen edge.
         t.process(format!("edge {}", "e".repeat(250)).as_bytes());
         assert_eq!(
             t.grid()
@@ -436,7 +341,6 @@ mod tests {
     fn evicted_terminal() -> Terminal {
         let mut t = Terminal::new(4, 20);
         t.set_scrollback_line_limit(Some(9));
-        // Every line is two rows: a head and one continuation.
         for i in 0..30 {
             t.process(format!("row {i:02} {}\r\n", "r".repeat(30)).as_bytes());
         }
@@ -555,9 +459,6 @@ mod tests {
             wrapped[scrollback] && wrapped[total - 1],
             "the last run straddles the history/screen edge"
         );
-        // NEGATIVE CONTROL: a reader that skips the undecodable segment (the shape
-        // `ScrollbackIter` has) moves every later row onto its neighbour's coordinate,
-        // which the conformance above would catch.
         let skipping: Vec<String> = t
             .grid()
             .history_lines_from(0)
@@ -570,7 +471,6 @@ mod tests {
                 .expect("the second needle is read")
         };
         assert_eq!(after(&skipping) + corrupt, after(&text));
-        // Scrolled back inside the ring, and into the tiered history past it.
         assert_scroll_invariant(&mut t, &[2, 30]);
     }
 
@@ -589,8 +489,6 @@ mod tests {
     /// row reads the flag it reads at the live tail.
     #[test]
     fn scrolled_back_wrap_bits_are_live() {
-        // A ten-row ring over tiered history, and a screen of lines one, two and three
-        // rows long, so no shift of the flags lines them up again.
         let mut t = Terminal::with_scrollback(6, 20, 10, Scrollback::with_defaults());
         for i in 0..40 {
             t.process(format!("{i:02} {}\r\n", "x".repeat((i % 3) * 20)).as_bytes());
@@ -613,9 +511,6 @@ mod tests {
                 "precondition: scrolled back"
             );
             assert_eq!(read(&t), live, "scrolled back {offset}");
-            // NEGATIVE CONTROL: the viewport accessor maps through `display_offset`
-            // (or reads nothing past the ring), so a reader built on it reads other
-            // flags here.
             let viewport: Vec<bool> = (0..rows)
                 .map(|row| t.grid().row(row).is_some_and(Row::is_wrapped))
                 .collect();
@@ -635,7 +530,6 @@ mod tests {
         scrollback.push_line(Line::from_bytes(&line));
         let t = Terminal::with_grid(Grid::with_tiered_scrollback(4, 80, 1000, scrollback));
         let oldest = t.grid().oldest_absolute_row();
-        // NEGATIVE CONTROL: the stored line's own text runs past the bound.
         let stored = t.grid().get_history_line(0).expect("the line").to_string();
         assert_eq!(stored.len(), line.len());
 
@@ -653,7 +547,6 @@ mod tests {
             AbsRowText::Text(stored),
             "read whole when asked"
         );
-        // A row at the bound is read whole and not marked.
         rows = SearchRows::default();
         t.read_search_rows(oldest + 1, 1, &mut rows);
         assert!(

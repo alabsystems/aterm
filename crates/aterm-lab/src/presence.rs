@@ -1,59 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `presence-flap --window`: the windowed lane for chrome geometry under a
-//! driver. Run it after touching anything that can re-grid a window: the
-//! message band, the tab strip, the harness's fenced turns. (Presence owns no
-//! chrome row since the owner surfaces, 2026-10-16: the lane proves that a
-//! driver's turns and leases re-grid nothing, and its cross-source phase `X`
-//! now pairs the two chrome sources left, the message band and the tab strip.)
-//! It OPENS A WINDOW on the desktop of whoever runs it, so it runs only when
-//! `--window` says so, never from a check.
-//!
-//! The shape it guards: a chrome row a fenced turn raised and then folded
-//! re-gridded an alternate-screen tab 64 → 63 → 64 rows a millisecond apart.
-//! The shrink demotes the top row, the grow appends a blank one, and a program
-//! that repaints only when its SIGWINCH handler reads a CHANGED size (Node,
-//! so Claude Code) diffs onto the moved grid for good. The fix lives in the
-//! window, so only a windowed instance shows it holding;
-//! `crates/aterm/tests/render_desync_live_headless.rs` reproduces the desync
-//! headless.
-//!
-//! One private windowed aterm runs the lab's stand-in ([`standin_main`],
-//! Claude Code's shape on the alternate screen with Node's SIGWINCH rule;
-//! `ctrl n` makes it BUSY, `ctrl o` quiet), and the lane reads only that
-//! instance's socket:
-//!
-//! * `A`: five fence-refused turns (`turn if-gen=<stale>`): each refused
-//!   `reason=changed`, and no resize lands.
-//! * `H`: six harness-shaped turns from `level=quiet` (`if-gen=<current>
-//!   yield=0.2 idle=1`): each types, and no flap or render risk appears.
-//! * `B`: a short unfenced turn types, no flap.
-//! * `D`: a 2 s foreign drive lease re-grids nothing.
-//! * `T`: back-to-back fenced turns (`turn … one`, then `turn if-gen=<that>
-//!   … two`): the follow-up is never refused `reason=changed`.
-//! * `X`: cross-source chrome pairs with the stand-in busy (its size read 20 ms
-//!   late, a glyph every 5 ms), each schedule on one held connection: the tab
-//!   strip rising (`settings set tab_strip_rows 1`) just before the band's quiet
-//!   shrink (asked 350, 100 and 20 ms before it is due, judged as one sweep),
-//!   and a band row rising (`notice post`) just before the strip falls
-//!   (`settings unset tab_strip_rows`, the same write). Each shrink and the grow
-//!   that takes it back must land [`FLOOR_MS`] apart (ruling 414's
-//!   `RegrowFloor`), whichever source falls. The verdict is read off the
-//!   ledger's order, never the host's speed ([`measure`]): a pair under the
-//!   floor, or a rise nothing takes back within a minute, FAILS; a sweep whose
-//!   every rise landed after the fall it raced formed no pair and is NOT
-//!   MEASURED.
-//! * `END`: `status render=ok`, the `resizes` ledger with no new flap or risk,
-//!   `cast drift` clean and faithful, and the screen unshifted.
-//!
-//! Between steps the tab goes back to `level=quiet`: a foreign turn's settle is
-//! a story the presence folds only on a human keypress, so the lane presses one
-//! through the OS event queue (`hwkey x`) and waits out the typing momentum.
-//!
-//! macOS, a logged-in GUI session. Exit 0 every row passed, 1 a row failed, 2
-//! usage, 3 the lane could not run (no GUI session, no aterm), said on a
-//! `NOT RUN:` line, or a phase X sweep was not measured and nothing failed.
+//! `presence-flap --window`.
 
 use std::io::{BufRead as _, Write as _};
 use std::path::PathBuf;
@@ -64,8 +12,7 @@ use crate::screen::field;
 use crate::stop::{self, Stopped};
 use crate::{Fail, LAB, Res};
 
-/// `aterm_messages::chrome::CHROME_REGROW_SETTLE`: the least gap between a
-/// chrome shrink and the grow that takes it back.
+/// `aterm_messages::chrome::CHROME_REGROW_SETTLE`.
 pub const FLOOR_MS: u64 = 400;
 
 /// The steps, in the order they run.
@@ -75,12 +22,7 @@ pub const PHASES: [char; 6] = ['A', 'H', 'B', 'D', 'T', 'X'];
 pub const SCHEDULES: [&str; 2] = ["strip-rise-then-bandshrink", "band-rise-then-stripfall"];
 
 /// How long before the band's quiet shrink is due phase X asks the strip's rise
-/// (`strip-rise-then-bandshrink`): instants swept, not a budget. The write lands
-/// tens of ms after it is asked (over 120 ms at a load average of 100), so a
-/// lead may land after the shrink and pair nothing ([`Measured::Missed`]); the
-/// sweep is judged whole, and one that formed no pair is NOT MEASURED. 350 ms
-/// usually lands inside the floor before the shrink; 100 and 20 ms race the
-/// shrink itself.
+/// (`strip-rise-then-bandshrink`): instants swept, not a budget.
 const LEADS_MS: [u64; 3] = [350, 100, 20];
 
 /// How long a rise nothing has taken back is waited for before phase X calls its
@@ -91,7 +33,7 @@ fn sleep(secs: f64) -> Result<(), Stopped> {
     stop::sleep(Duration::from_secs_f64(secs))
 }
 
-/// One resize row of the ledger: its id, time and row counts.
+/// One resize row of the ledger.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Resize {
     pub id: u64,
@@ -114,8 +56,7 @@ pub fn parse_resize(line: &str) -> Option<Resize> {
     })
 }
 
-/// Each shrink paired with the grow that takes it back (the newest open
-/// shrink of the opposite sizes), as the gap between them in ms.
+/// Each shrink paired with the grow that takes it back (the newest open shrink of the opposite sizes), as the gap between them in ms.
 #[must_use]
 pub fn pair_gaps(rows: &[Resize]) -> Vec<u64> {
     let mut open: Vec<Resize> = Vec::new();
@@ -140,15 +81,13 @@ pub fn pair_gaps(rows: &[Resize]) -> Vec<u64> {
 pub enum Measured {
     /// Each shrink and the grow that took it back, ms apart.
     Pairs(Vec<u64>),
-    /// No pair formed because the schedule missed its instant: the fall landed
-    /// before the rise it raced, or no rise re-gridded the window. Not a finding.
+    /// No pair formed because the schedule missed its instant.
     Missed(String),
-    /// A rise re-gridded the window and nothing took it back: the fall was lost.
+    /// A rise re-gridded the window and nothing took it back.
     Stuck(String),
 }
 
-/// Reads one schedule's resize rows in the ledger's own order, so the verdict
-/// never rests on how fast the host ran the schedule.
+/// Reads one schedule's resize rows in the ledger's own order, so the verdict never rests on how fast the host ran the schedule.
 #[must_use]
 pub fn measure(rows: &[Resize]) -> Measured {
     let gaps = pair_gaps(rows);
@@ -180,20 +119,17 @@ pub fn measure(rows: &[Resize]) -> Measured {
 /// A phase X sweep's verdict.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
-    /// Every pair landed the floor apart; the closest, in ms.
+    /// Every pair landed the floor apart.
     Held(u64),
     /// The closest pair, in ms, is under the floor.
     Under(u64),
     /// A rise nothing took back.
     Stuck(String),
-    /// No run formed a pair: each one's miss.
+    /// No run formed a pair.
     NotMeasured(String),
 }
 
-/// Judges a sweep (one or more runs of a schedule) whole: every pair it formed
-/// must land the floor apart, and no rise may be left standing. The ledger
-/// stamps whole milliseconds, so a pair 1 ms short of the floor is its rounding,
-/// not a pair under it.
+/// Judges a sweep (one or more runs of a schedule) whole.
 #[must_use]
 pub fn judge_sweep(runs: &[Measured]) -> Verdict {
     let mut gaps = Vec::new();
@@ -349,7 +285,7 @@ impl Probe {
     }
 
     /// `resizes since=<last>`: its header and how many resize rows are new;
-    /// `last` moves past them. `show` prints the new resize and run rows.
+    /// `last` moves past them.
     fn read_resizes(&mut self, show: bool) -> (String, usize) {
         let since = format!("since={}", self.last);
         let r = self.ctl(&["resizes", &since]);
@@ -566,8 +502,7 @@ impl Probe {
             .collect()
     }
 
-    /// What the resize rows after `base` show, each row and pair printed. A rise
-    /// nothing has taken back yet is waited for, up to [`HANG`].
+    /// What the resize rows after `base` show, each row and pair printed.
     fn measured_since(&self, base: u64) -> Result<Measured, Stopped> {
         let deadline = Instant::now() + HANG;
         let mut rows = self.rows_since(base);
@@ -628,7 +563,6 @@ impl Probe {
             at.as_secs_f64() * 1000.0,
             t0.elapsed().as_secs_f64() * 1000.0
         );
-        // Past the floor and the ledger's run gap, before cleanup.
         sleep(2.5)?;
         let m = self.measured_since(base)?;
         let r = c.req("settings unset tab_strip_rows").unwrap_or_else(|e| e);
@@ -668,7 +602,6 @@ impl Probe {
                 .unwrap_or_else(|e| e);
             println!("      cleanup: dismiss {mid}: {r}");
         }
-        // The band's own quiet (1.5 s) and the floor after it.
         sleep(2.5)?;
         Ok(Ok(m))
     }
@@ -706,8 +639,6 @@ impl Probe {
         self.read_resizes(false);
         println!("      busy: {}", verdict(&self.ctl(&["ctrl", "n"])));
         sleep(0.5)?;
-        // A lead that lands after the shrink pairs nothing ([`LEADS_MS`]): the
-        // sweep is judged whole ([`judge_sweep`]).
         let mut swept = Ok(Vec::new());
         for lead_ms in LEADS_MS {
             println!(
@@ -829,9 +760,6 @@ const COLUMNS: u32 = 80;
 const LINES: u32 = 24;
 
 /// `presence-flap --window|--headless [--aterm PATH] [--client PATH] [--phases "A H B D T X"] [--trials N] [--keep]`.
-/// `--headless` runs the same steps without a window, to check the lane
-/// itself: what only a window shows (`hwkey`, the window's own chrome) is not
-/// judged there, so its rows say nothing about the window.
 ///
 /// # Errors
 /// Usage, a lane that could not run, or an interrupt.
@@ -855,7 +783,6 @@ pub fn cmd_presence_flap(args: &[String]) -> Res {
     }
     let phases = match named {
         Some(spec) => parse_phases(&spec).map_err(Fail::usage)?,
-        // A headless window's grid never re-grids for its chrome.
         None => PHASES.into_iter().filter(|&p| window || p != 'X').collect(),
     };
     if headless && phases.contains(&'X') {
@@ -959,7 +886,6 @@ pub fn cmd_presence_flap(args: &[String]) -> Res {
         );
         return finish(&p);
     }
-    // The window's own boot sizing and any first presence refresh finish.
     sleep(1.5)?;
     let pid = p.inst.pid;
     p.row(
@@ -997,16 +923,13 @@ pub fn cmd_presence_flap(args: &[String]) -> Res {
     finish(&p)
 }
 
-// ------------------------------------------------------------------ the stand-in
-
 /// How late a BUSY stand-in reads its size after a SIGWINCH.
 const LAG: Duration = Duration::from_millis(20);
 /// How often a BUSY stand-in writes its spinner glyph.
 const TICK: Duration = Duration::from_millis(5);
 const GLYPHS: [char; 4] = ['|', '/', '-', '\\'];
 
-/// Claude Code's shape on the alternate screen: transcript rows, a rule, the
-/// composer, a rule, three footer rows (`rows` × `cols`, `composer` typed).
+/// Claude Code's shape on the alternate screen.
 #[must_use]
 pub fn frame(rows: u16, cols: u16, composer: &str) -> String {
     let at = rows.saturating_sub(5);
@@ -1096,9 +1019,6 @@ impl Standin {
 }
 
 /// The stand-in's `main` (`aterm-lab presence-standin`, the tab's program).
-/// Printable keys echo into the composer, Enter clears it, `ctrl n` makes it
-/// BUSY (its size read 20 ms after the signal, a spinner glyph every 5 ms) and
-/// `ctrl o` quiet again; `q` or end of file ends it, never a core-dump signal.
 #[must_use]
 pub fn standin_main(_args: &[String]) -> i32 {
     let Ok(winch) = crate::sys::SignalPipe::install(&[libc::SIGWINCH]) else {
@@ -1200,14 +1120,11 @@ mod tests {
 
     #[test]
     fn a_shrink_pairs_with_the_grow_that_takes_it_back() {
-        // A strip rise at 100, the band's fall at 500: one pair, 400 ms.
         let rows = [rz(1, 100, 24, 23), rz(2, 500, 23, 24)];
         assert_eq!(pair_gaps(&rows), vec![400]);
         assert_eq!(measure(&rows), Measured::Pairs(vec![400]));
-        // A band rise then the strip's fall 6 ms later: a pair, under the floor.
         let rows = [rz(3, 1000, 23, 22), rz(4, 1006, 22, 23)];
         assert_eq!(pair_gaps(&rows), vec![6]);
-        // A grow before any shrink pairs with nothing.
         assert_eq!(
             pair_gaps(&[rz(5, 0, 23, 24), rz(6, 9, 24, 23)]),
             Vec::<u64>::new()
@@ -1217,13 +1134,11 @@ mod tests {
     #[test]
     fn a_sweep_fails_only_on_what_the_ledger_shows_wrong() {
         let held = Measured::Pairs(vec![401, 400]);
-        // The desk's 20 ms lead (2026-10-19): the band fell, then the strip rose.
         let missed = measure(&[rz(10, 118_022, 23, 24), rz(11, 118_047, 24, 23)]);
         assert!(
             matches!(&missed, Measured::Missed(why) if why.contains("25 ms after")),
             "{missed:?}"
         );
-        // Main before the strip's fall was floored: the band rose, the strip fell 38 ms later.
         let under = measure(&[rz(14, 27_325, 23, 22), rz(15, 27_363, 22, 23)]);
         assert_eq!(under, Measured::Pairs(vec![38]));
         let stuck = measure(&[rz(2, 103_312, 23, 22)]);
@@ -1240,7 +1155,6 @@ mod tests {
         );
         assert_eq!(judge_sweep(&[held.clone(), under]), Verdict::Under(38));
         assert!(matches!(judge_sweep(&[held, stuck]), Verdict::Stuck(_)));
-        // A sweep whose every rise came too late formed no pair: not measured, not failed.
         let none = measure(&[]);
         assert!(matches!(none, Measured::Missed(_)), "{none:?}");
         assert!(matches!(

@@ -1,27 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Windows arm's DECODERS (design `docs/DESIGN-system-awareness-2026-10-16.md`
-//! §5.4, §9.6, §16): pure functions over the bytes and numbers the Win32 and
-//! NT calls answer, compiled and tested on every platform. The private `win`
-//! module (64-bit Windows only) makes the calls and hands their buffers here.
-//!
-//! | call | decoder | into |
-//! |---|---|---|
-//! | `NtQuerySystemInformationEx(SystemProcessorPerformanceInformation)` | [`processor_times`] | [`crate::Probe::core_ticks`] |
-//! | `GetSystemCpuSetInformation` | [`cpu_sets`], [`layout_from_cpu_sets`] | [`crate::cpu_layout`], [`crate::withdrawn_cores`] |
-//! | `GlobalMemoryStatusEx`, `K32GetPerformanceInfo` | [`memory_detail_of`] | [`crate::memory_detail`] |
-//! | `K32GetPerformanceInfo` | [`PerformanceInformation64::process_count`] | [`crate::pid_counts`] |
-//! | `NtQuerySystemInformation(SystemPageFileInformation)` | [`page_files`] | swap |
-//! | `NtQuerySystemInformation(SystemProcessInformation)` | [`processes`] | [`crate::processes`] |
-//! | a path's spelling | [`drive_root`], [`drive_is_local`] | [`crate::volume`] |
-//!
-//! Every layout is the 64-bit one (`HANDLE`, `SIZE_T` and pointers 8
-//! bytes), which both Windows cells (x86_64 and aarch64) use; each struct
-//! below is transcribed from the Windows SDK (`winternl.h`, `winnt.h`,
-//! `psapi.h`, `sysinfoapi.h`) with its size and every offset a decoder reads
-//! asserted at compile time. Windows is little-endian on both, so fields are
-//! read as little-endian bytes, never through a cast pointer.
+//! The Windows arm's DECODERS (design `docs/DESIGN-system-awareness-2026-10-16.md` §5.4, §9.6, §16).
 
 use std::collections::HashMap;
 use std::mem::{offset_of, size_of};
@@ -31,10 +11,7 @@ use crate::machine::{Commit, layout_by_rank};
 use crate::procs::{MAX_PROCESSES, ProcessReading, Sweep};
 use crate::{CoreTicks, CpuLayout, MemoryDetail, MemoryLevel};
 
-/// `SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION` (`winternl.h`: `IdleTime`,
-/// `KernelTime`, `UserTime`, then `Reserved1[2]` — DPC and interrupt time —
-/// and `Reserved2`, the interrupt count), one per processor; times in 100 ns
-/// units, `KernelTime` including `IdleTime`.
+/// `SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION` (`winternl.h`), one per processor.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProcessorPerformance {
@@ -53,8 +30,7 @@ pub struct ProcessorPerformance {
 }
 const _: () = assert!(size_of::<ProcessorPerformance>() == 48);
 
-/// `UNICODE_STRING`, 64-bit: `Length` and `MaximumLength` in bytes, then the
-/// buffer's address.
+/// `UNICODE_STRING`, 64-bit.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UnicodeString64 {
@@ -68,15 +44,11 @@ pub struct UnicodeString64 {
 const _: () = assert!(size_of::<UnicodeString64>() == 16);
 const _: () = assert!(offset_of!(UnicodeString64, buffer) == 8);
 
-/// `SYSTEM_PROCESS_INFORMATION`, 64-bit (`winternl.h`, whose `Reserved1[48]`
-/// holds the private working set, hard faults, the thread high-water mark,
-/// cycle time, create time, user time and kernel time, in that order).
-/// `NumberOfThreads` `SYSTEM_THREAD_INFORMATION` records follow each entry;
-/// `next_entry_offset` skips them.
+/// 64-bit `SYSTEM_PROCESS_INFORMATION` (`winternl.h`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProcessInformation64 {
-    /// Bytes to the next entry; 0 on the last.
+    /// Bytes to the next entry.
     pub next_entry_offset: u32,
     /// Threads.
     pub number_of_threads: u32,
@@ -132,7 +104,7 @@ pub struct ProcessInformation64 {
     pub peak_pagefile_usage: u64,
     /// Private commit, bytes (named in pages, counted in bytes).
     pub private_page_count: u64,
-    /// I/O counters: read, write and other operations, then bytes.
+    /// I/O counters.
     pub io: [i64; 6],
 }
 const _: () = assert!(size_of::<ProcessInformation64>() == 256);
@@ -144,11 +116,11 @@ const _: () = assert!(offset_of!(ProcessInformation64, unique_process_id) == 80)
 const _: () = assert!(offset_of!(ProcessInformation64, inherited_from_unique_process_id) == 88);
 const _: () = assert!(offset_of!(ProcessInformation64, private_page_count) == 200);
 
-/// `SYSTEM_PAGEFILE_INFORMATION`, 64-bit: sizes in pages.
+/// `SYSTEM_PAGEFILE_INFORMATION`, 64-bit.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PageFileInformation64 {
-    /// Bytes to the next entry; 0 on the last.
+    /// Bytes to the next entry.
     pub next_entry_offset: u32,
     /// The page file's size, pages.
     pub total_size: u32,
@@ -161,14 +133,13 @@ pub struct PageFileInformation64 {
 }
 const _: () = assert!(size_of::<PageFileInformation64>() == 32);
 
-/// `SYSTEM_CPU_SET_INFORMATION` with its `CpuSet` arm (`winnt.h`); records
-/// are walked by their own `Size`.
+/// `SYSTEM_CPU_SET_INFORMATION` with its `CpuSet` arm (`winnt.h`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CpuSetInformation {
     /// This record's size, bytes.
     pub size: u32,
-    /// `CPU_SET_INFORMATION_TYPE`: 0 is `CpuSetInformation`.
+    /// `CPU_SET_INFORMATION_TYPE`.
     pub kind: u32,
     /// The CPU Set's id.
     pub id: u32,
@@ -182,11 +153,9 @@ pub struct CpuSetInformation {
     pub last_level_cache_index: u8,
     /// Its NUMA node.
     pub numa_node_index: u8,
-    /// Higher is faster and less efficient; 0 on every core of a
-    /// homogeneous machine.
+    /// Higher is faster and less efficient.
     pub efficiency_class: u8,
-    /// Bit 0 `Parked`, 1 `Allocated`, 2 `AllocatedToTargetProcess`, 3
-    /// `RealTime`.
+    /// Bit 0 `Parked`, 1 `Allocated`, 2 `AllocatedToTargetProcess`, 3 `RealTime`.
     pub all_flags: u8,
     /// `SchedulingClass` (a union with `Reserved`).
     pub reserved: u32,
@@ -199,8 +168,7 @@ const _: () = assert!(offset_of!(CpuSetInformation, logical_processor_index) == 
 const _: () = assert!(offset_of!(CpuSetInformation, efficiency_class) == 18);
 const _: () = assert!(offset_of!(CpuSetInformation, all_flags) == 19);
 
-/// `MEMORYSTATUSEX` (`sysinfoapi.h`); `length` must be set to its size
-/// before the call.
+/// `MEMORYSTATUSEX` (`sysinfoapi.h`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryStatusEx {
@@ -225,8 +193,7 @@ pub struct MemoryStatusEx {
 }
 const _: () = assert!(size_of::<MemoryStatusEx>() == 64);
 
-/// `PERFORMANCE_INFORMATION` (`psapi.h`), 64-bit: `SIZE_T` counts in pages
-/// of `page_size` bytes; `cb` must be set to its size before the call.
+/// `PERFORMANCE_INFORMATION` (`psapi.h`), 64-bit.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PerformanceInformation64 {
@@ -234,7 +201,7 @@ pub struct PerformanceInformation64 {
     pub cb: u32,
     /// Commit charge.
     pub commit_total: u64,
-    /// Commit limit: RAM plus page files.
+    /// Commit limit.
     pub commit_limit: u64,
     /// The highest commit charge since boot.
     pub commit_peak: u64,
@@ -286,11 +253,7 @@ fn hundred_ns(v: i64) -> u64 {
     u64::try_from(v).unwrap_or(0)
 }
 
-/// Every processor's ticks from one group's
-/// `SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION` array, in its order: `user` is
-/// user time, `system` kernel time less idle time (DPCs and interrupts are
-/// inside it), `idle` idle time, `nice` 0; 100 ns units. A trailing partial
-/// record is left out. PURE.
+/// Every processor's ticks from one group's `SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION` array, in its order.
 #[must_use]
 pub fn processor_times(bytes: &[u8]) -> Vec<CoreTicks> {
     let (records, _) = bytes.as_chunks::<{ size_of::<ProcessorPerformance>() }>();
@@ -323,10 +286,7 @@ pub struct CpuSet {
     pub parked: bool,
 }
 
-/// The CPU Sets in a `GetSystemCpuSetInformation` buffer, walked by each
-/// record's `Size`; a record of another type is skipped, and a size too small
-/// to hold the fields read (or one that runs past the buffer) ends the walk.
-/// PURE.
+/// The CPU Sets in a `GetSystemCpuSetInformation` buffer, walked by each record's `Size`.
 #[must_use]
 pub fn cpu_sets(bytes: &[u8]) -> Vec<CpuSet> {
     let need = offset_of!(CpuSetInformation, all_flags) + 1;
@@ -353,14 +313,7 @@ pub fn cpu_sets(bytes: &[u8]) -> Vec<CpuSet> {
     out
 }
 
-/// The layout and the parked cores from the CPU Sets and each processor
-/// group's width (`GetActiveProcessorCount`): logical id = the widths of
-/// the groups before the set's, plus its number in its group (the order
-/// [`crate::Probe::core_ticks`] reads them in). One cluster per efficiency
-/// class, highest first ([`crate::machine::layout_by_rank`]: "Performance"
-/// and "Efficiency" for two, one `"CPU"` cluster where every core has the
-/// same class). A set outside the groups' widths is left out; `None` for
-/// no sets. PURE.
+/// The layout and the parked cores from the CPU Sets and each processor group's width (`GetActiveProcessorCount`).
 #[must_use]
 pub fn layout_from_cpu_sets(sets: &[CpuSet], widths: &[u32]) -> Option<(CpuLayout, Vec<u16>)> {
     let mut offsets = Vec::with_capacity(widths.len());
@@ -392,9 +345,7 @@ pub fn layout_from_cpu_sets(sets: &[CpuSet], widths: &[u32]) -> Option<(CpuLayou
     layout_by_rank(&ranked).map(|layout| (layout, parked))
 }
 
-/// Swap `(in use, size)` in pages from a `SystemPageFileInformation` buffer:
-/// every page file summed. An empty buffer is no page file, `(0, 0)`. `None`
-/// for a record cut short or a `NextEntryOffset` past the buffer. PURE.
+/// Swap `(in use, size)` in pages from a `SystemPageFileInformation` buffer.
 #[must_use]
 pub fn page_files(bytes: &[u8]) -> Option<(u64, u64)> {
     let (mut used, mut total) = (0u64, 0u64);
@@ -425,16 +376,10 @@ pub fn page_files(bytes: &[u8]) -> Option<(u64, u64)> {
     Some((used, total))
 }
 
-/// The commit charge at or past this many thousandths of the limit is
-/// [`MemoryLevel::Warn`] (design §9.6: Windows runs out of commit while RAM
-/// is free).
+/// Commit-charge threshold in thousandths of the limit for [`MemoryLevel::Warn`].
 pub const COMMIT_WARN_PERMILLE: u64 = 900;
 
-/// The pressure level on Windows: warn when the commit charge reaches
-/// [`COMMIT_WARN_PERMILLE`] of its limit or the low-memory resource
-/// notification is set, else normal. Windows has no level that says the
-/// kernel is about to kill, so this never reads critical. `None` for a zero
-/// limit. PURE.
+/// The pressure level on Windows.
 #[must_use]
 pub fn commit_level(commit: &Commit, low_memory: bool) -> Option<MemoryLevel> {
     let permille = commit.permille()?;
@@ -445,28 +390,7 @@ pub fn commit_level(commit: &Commit, low_memory: bool) -> Option<MemoryLevel> {
     })
 }
 
-/// [`MemoryDetail`] from `GlobalMemoryStatusEx`, `K32GetPerformanceInfo`,
-/// the page files' `(in use, size)` in pages and the low-memory
-/// notification, in design §9.6's classes. Windows does not partition
-/// physical memory into these exactly ([`MemoryDetail::exact`] false; the
-/// standby list alone is published only to an administrator, through
-/// `SystemMemoryListInformation`), and the split of available memory into
-/// cache and free is an estimate:
-///
-/// | field | from |
-/// |---|---|
-/// | `total` | `ullTotalPhys` |
-/// | `file_backed` | the cache: `SystemCache` pages, at most what is available. `SystemCache` is the standby list plus the system cache's working set, which is in use, so this is an upper bound on the standby list (design §9.6's table takes it for the standby list alone) |
-/// | `free` | `ullAvailPhys` less that: a lower bound on the free and zeroed lists, short by the system cache's working set |
-/// | `wired` | the kernel's pools: `KernelPaged + KernelNonpaged` pages, at most what is in use |
-/// | `app` | in use (`ullTotalPhys − ullAvailPhys`) less the pools |
-/// | `swap_used`, `swap_total` | the page files' pages in use and size |
-/// | `commit` | `CommitTotal` against `CommitLimit`, exact |
-/// | `pressure` | [`commit_level`] |
-/// | `compressed`, `stored` | `None`: the compression store's size needs the `Memory Compression` process's working set, unverified for a non-admin reader |
-/// | `speculative`, `active`, `inactive`, `purgeable`, `shared` | `None` |
-///
-/// `None` for a zero page size or no physical memory. PURE.
+/// Build [`MemoryDetail`] from `GlobalMemoryStatusEx`, `K32GetPerformanceInfo`, page-file usage, and low-memory state.
 #[must_use]
 pub fn memory_detail_of(
     status: &MemoryStatusEx,
@@ -541,15 +465,7 @@ fn short_image_name(name: String) -> String {
     }
 }
 
-/// One sweep from a `SystemProcessInformation` buffer whose first byte is at
-/// address `base` (the image names point into it). Each process's parent
-/// (`InheritedFromUniqueProcessId`), CPU time (user plus kernel, 100 ns →
-/// ns), private commit (`PrivatePageCount`, bytes) and image name less
-/// `.exe`. The System Idle Process (pid 0), whose times are the cores' idle
-/// time, is left out. A parent link is cut (`ppid` 0) when the parent's pid
-/// now belongs to a process created after the child: Windows reuses pids,
-/// and the creator may have exited. At most [`MAX_PROCESSES`]; an entry cut
-/// short ends the walk. PURE.
+/// One sweep from a `SystemProcessInformation` buffer whose first byte is at address `base` (the image names point into it).
 #[must_use]
 pub fn processes(bytes: &[u8], base: u64) -> Sweep {
     const SIZE: usize = size_of::<ProcessInformation64>();
@@ -593,9 +509,6 @@ pub fn processes(bytes: &[u8], base: u64) -> Sweep {
                     disk_read: None,
                     disk_written: None,
                     name: short_image_name(name),
-                    // No process groups, Unix sessions or controlling
-                    // terminals on Windows; the run state is not in this
-                    // record (its threads' states are).
                     pgid: 0,
                     uid: None,
                     state: RunState::Unknown,
@@ -603,8 +516,6 @@ pub fn processes(bytes: &[u8], base: u64) -> Sweep {
                     has_tty: None,
                     runnable_ns: None,
                     peak_footprint: None,
-                    // One system call reads every process at once: the
-                    // caller stamps them all with its time.
                     read_at: None,
                     coalition: None,
                 },
@@ -632,12 +543,7 @@ pub fn processes(bytes: &[u8], base: u64) -> Sweep {
     Sweep { procs, truncated }
 }
 
-/// The drive letter a path names, from its spelling alone (uppercase): `C`
-/// for `C:\Users\x`, `c:/x` and `\\?\C:\x`. `None` for a UNC path
-/// (`\\server\share`, `\\?\UNC\…`), a volume GUID path, a device path
-/// (`\\.\…`), a drive-relative path (`C:x`) or a relative one: none of those
-/// is judged without asking the file system, and a network share must never
-/// be asked. PURE.
+/// The drive letter a path names, from its spelling alone (uppercase).
 #[must_use]
 pub fn drive_root(path: &str) -> Option<char> {
     let rest = path.strip_prefix(r"\\?\").unwrap_or(path);
@@ -655,10 +561,7 @@ pub const DRIVE_FIXED: u32 = 3;
 /// `GetDriveTypeW`'s `DRIVE_RAMDISK`.
 pub const DRIVE_RAMDISK: u32 = 6;
 
-/// Whether a `GetDriveTypeW` answer is a drive read for its free space: a
-/// fixed disk or a RAM disk. A network drive (`DRIVE_REMOTE`) can block, a
-/// removable or optical one can ask for its medium, and an unknown one is
-/// not judged. PURE.
+/// Whether a `GetDriveTypeW` answer is a drive read for its free space.
 #[must_use]
 pub const fn drive_is_local(kind: u32) -> bool {
     matches!(kind, DRIVE_FIXED | DRIVE_RAMDISK)

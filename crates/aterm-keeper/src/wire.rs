@@ -1,33 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The AKP1 wire (`docs/DESIGN-pty-keeper-2026-09-26.md` §5.2): fixed 8-byte headers read
-//! before any variable byte, bounded bodies, at most one descriptor per frame riding the header.
-//!
-//! ```text
-//! header  "AKP1" | kind u8 | flags u8 | body length u16be
-//! body    kind-specific, fixed fields first, every variable part length-first
-//! ```
-//!
-//! The growth rule: a frame may only grow. A reader takes the fields it knows from the front of a
-//! body and ignores the rest, so an older reader reads a newer writer's longer frame, and a body
-//! shorter than its kind's fixed fields is refused. Kinds are never renumbered; an unknown kind
-//! is refused by name.
-//!
-//! This module is pure bytes. The descriptor a REGISTER, an OFFER, a COMPANION or a COMPANION_OFFER
-//! carries travels beside the header (`fdpass`); the codec only says which kinds may carry one
-//! ([`Kind::carries_fd`]).
-//!
-//! The crash-restore journal (the crash-restore plan §5) grew the wire by the same rule: a window
-//! that journals says [`CAP_JOURNAL`] in its HELLO, a keeper that takes regions in custody says it
-//! in a trailing caps byte of its WELCOME, and only between two such peers does anything new flow
-//! (an OFFER's trailing `attempts` and `companions`, and the three companion kinds, 14 to 16). An
-//! older window's strict offer loop refuses any frame but an OFFER, and an older decoder refuses
-//! an unknown kind, so a COMPANION_OFFER sent to one would cost it its whole recovery.
-//!
-//! SYNC (17) grew it the same way: a keeper that answers one says [`CAP_SYNC`] in its WELCOME's
-//! caps, and a window sends SYNC only to such a keeper (an older one would refuse the kind and
-//! drop the connection, with every frame behind it).
+//! The AKP1 wire (`docs/DESIGN-pty-keeper-2026-09-26.md` §5.2): fixed 8-byte headers read before any variable byte, bounded bodies, at most one descriptor per frame riding the header.
 
 use crate::identity::IdentityPolicy;
 
@@ -37,13 +11,11 @@ pub const MAGIC: [u8; 4] = *b"AKP1";
 pub const HEADER_LEN: usize = 8;
 /// The protocol version this build speaks (in HELLO and WELCOME).
 pub const PROTO: u16 = 1;
-/// The largest opaque tag a record may carry (sid, owner, identity label,
-/// channel flags…), fixed at REGISTER: what changes after it rides META.
+/// The largest opaque tag a record may carry (sid, owner, identity label, channel flags…), fixed at REGISTER: what changes after it rides META.
 pub const MAX_TAG: usize = 1024;
 /// The largest opaque META (the Repaint rung's scalar state).
 pub const MAX_META: usize = 4096;
-/// The largest body any frame may declare: a header, a tag and a META, plus
-/// room to grow. A larger declared length is refused before a byte of it is read.
+/// The largest body any frame may declare: a header, a tag and a META, plus room to grow.
 pub const MAX_BODY: usize = 8192;
 /// The longest build/version string a HELLO or WELCOME carries.
 pub const MAX_LABEL: usize = 64;
@@ -55,26 +27,18 @@ pub const MAX_MARKER_DIR: usize = 1024;
 /// Header flag: this frame carries exactly one descriptor.
 pub const FLAG_FD: u8 = 0x01;
 
-/// HELLO capability bit: this peer sends BYE on its quit path (§5.4 row 2). A
-/// peer without it is judged as a pre-keeper build (row 3) when it ends.
+/// HELLO capability bit: this peer sends BYE on its quit path (§5.4 row 2).
 pub const CAP_SENDS_BYE: u8 = 0x01;
 /// HELLO capability bit: a window's link (re)connecting to register what it holds, not a launch.
-/// It is offered nothing and does not reset the relaunch brake; the boot HELLO omits it.
 pub const CAP_LINK: u8 = 0x02;
-/// HELLO capability bit (and WELCOME's trailing caps byte, from a keeper): this peer speaks the
-/// crash-restore journal's frames. A window that states it journals its sessions into read-only
-/// regions it registers beside their masters (COMPANION, COMPANION_RELEASE) and reads the regions
-/// it is offered (an OFFER's trailing `attempts` and `companions`, then COMPANION_OFFER). A keeper
-/// sends those only to a HELLO that stated it; a window sends its own only to a WELCOME that did.
+/// HELLO capability bit (and WELCOME's trailing caps byte, from a keeper): this peer speaks the crash-restore journal's frames.
 pub const CAP_JOURNAL: u8 = 0x04;
-/// WELCOME's trailing caps bit, from a keeper: it answers a SYNC with the same number once it has
-/// read every frame written before it on that connection. A window sends SYNC only to a keeper
-/// that states it.
+/// WELCOME's trailing caps bit, from a keeper: it answers a SYNC with the same number once it has read every frame written before it on that connection.
 pub const CAP_SYNC: u8 = 0x08;
 /// The one companion kind this build knows: a crash-restore journal region (`aterm-restore`).
 pub const COMPANION_JOURNAL: u8 = 1;
 
-/// The frame kinds. Numbers are the wire's and never change.
+/// The frame kinds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     /// W→K: protocol, peer class, capabilities, build.
@@ -103,17 +67,13 @@ pub enum Kind {
     Adopt = 12,
     /// K→W: a frame was refused (a reason code and the rdev it named).
     Refused = 13,
-    /// W→K, with a read-only POSIX shared-memory descriptor: the journal region of a master this
-    /// connection claims (the rdev, the kind, the region's length).
+    /// W→K, with a read-only POSIX shared-memory descriptor: the journal region of a master this connection claims (the rdev, the kind, the region's length).
     Companion = 14,
-    /// K→W', with a duplicate of the companion's descriptor: sent right after an OFFER that said
-    /// `companions = 1`, for that OFFER's master.
+    /// K→W', with a duplicate of the companion's descriptor: sent right after an OFFER that said `companions = 1`, for that OFFER's master.
     CompanionOffer = 15,
-    /// W→K: drop this claim's companion and end its poison window (a window with no journal for
-    /// the master: its region could not be made, or memory pressure shed it).
+    /// W→K: drop this claim's companion and end its poison window (a window with no journal for the master: its region could not be made, or memory pressure shed it).
     CompanionRelease = 16,
-    /// Either way: W→K a number; K→W the same number, written once the keeper has read every frame
-    /// written before it on the connection (a round trip, to a keeper that states [`CAP_SYNC`]).
+    /// Either way: W→K a number; K→W the same number, written once the keeper has read every frame written before it on the connection (a round trip, to a keeper that states [`CAP_SYNC`]).
     Sync = 17,
 }
 
@@ -144,9 +104,7 @@ impl Kind {
         })
     }
 
-    /// Whether frames of this kind carry exactly one descriptor. Every other
-    /// kind carries none, and a descriptor that arrives with one is a protocol
-    /// error (closed, and the connection dropped).
+    /// Whether frames of this kind carry exactly one descriptor.
     #[inline]
     #[must_use]
     pub const fn carries_fd(self) -> bool {
@@ -157,7 +115,7 @@ impl Kind {
     }
 }
 
-/// A codec refusal. Every one ends the connection that sent it.
+/// A codec refusal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WireError {
     /// The header does not open with `AKP1`.
@@ -166,8 +124,7 @@ pub enum WireError {
     UnknownKind(u8),
     /// A declared body longer than [`MAX_BODY`].
     TooLong(usize),
-    /// A body shorter than its kind's fixed fields, or a length-first part
-    /// running past the end.
+    /// A body shorter than its kind's fixed fields, or a length-first part running past the end.
     Short(Kind),
     /// A tag, META, label or status text over its bound.
     Oversize(Kind),
@@ -197,7 +154,6 @@ pub struct Header {
 }
 
 /// Encode a header for `kind` with a body of `len` bytes.
-///
 /// # Errors
 /// `TooLong` for a body over [`MAX_BODY`].
 pub fn encode_header(kind: Kind, len: usize) -> Result<[u8; HEADER_LEN], WireError> {
@@ -212,9 +168,7 @@ pub fn encode_header(kind: Kind, len: usize) -> Result<[u8; HEADER_LEN], WireErr
     ])
 }
 
-/// Decode a header, refusing a bad magic, an unknown kind, an overlong body
-/// and an FD flag that disagrees with the kind — before a body byte is read.
-///
+/// Decode a header, refusing a bad magic, an unknown kind, an overlong body and an FD flag that disagrees with the kind — before a body byte is read.
 /// # Errors
 /// See [`WireError`].
 pub fn decode_header(h: &[u8; HEADER_LEN]) -> Result<Header, WireError> {
@@ -240,8 +194,7 @@ pub struct Birth {
     pub micros: u32,
 }
 
-/// A registered master's fixed header: the fields the keeper reads. Everything else about a
-/// session rides the opaque tag and META, which it never decodes.
+/// A registered master's fixed header: the fields the keeper reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MasterHeader {
     /// The master's `st_rdev`: its identity across processes (F10).
@@ -257,17 +210,10 @@ pub struct MasterHeader {
 /// The encoded size of a [`MasterHeader`].
 pub const MASTER_HEADER_LEN: usize = 8 + 4 + 8 + 4 + 8;
 
-/// Where a window's crash marker is (§5.4 row 3's cross-check): its log directory and the start
-/// its marker is named with. The keeper takes no file name from the window: it builds
-/// `crash-marker-<pid>-<nanos>-<app|other|lab>.log` with the pid the kernel named for the
-/// connection, so a HELLO can point it at no file but that window's own marker. The window holds
-/// the marker's owner lock for its life and its exit path unlinks it (`aterm-gui`'s
-/// `crash_signal`), so after its death a missing marker says the exit path ran, and a marker
-/// whose lock is free says it did not.
+/// Where a window's crash marker is (§5.4 row 3's cross-check): its log directory and the start its marker is named with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarkerRef {
-    /// The window's start, nanoseconds since the epoch, as its marker's name
-    /// spells it.
+    /// The window's start, nanoseconds since the epoch, as its marker's name spells it.
     pub nanos: u64,
     /// The directory the marker lives in: an absolute path, as bytes.
     pub dir: Vec<u8>,
@@ -320,22 +266,16 @@ pub enum Frame {
         class: PeerClass,
         caps: u8,
         build: String,
-        /// The window's crash marker (appended: an older window's HELLO ends
-        /// before it, and an older keeper ignores it).
+        /// The window's crash marker (appended: an older window's HELLO ends before it, and an older keeper ignores it).
         marker: Option<MarkerRef>,
     },
     Welcome {
         proto: u16,
         offers: u16,
         version: String,
-        /// The identity the keeper requires of its peers; `None` when an older keeper's WELCOME
-        /// ends before it or the byte is unknown. A window that checks code registers nothing
-        /// with a keeper that does not state `Designated` (§5.7): a keeper at the same-uid floor
-        /// offers a crashed window's masters to any same-uid process.
+        /// The identity the keeper requires of its peers; `None` when an older keeper's WELCOME ends before it or the byte is unknown.
         identity: Option<IdentityPolicy>,
-        /// The keeper's capabilities ([`CAP_JOURNAL`]); `None` when an older keeper's WELCOME
-        /// ends before it. It follows the policy byte, which a keeper that states caps always
-        /// writes (as 0 when it has no policy to state).
+        /// The keeper's capabilities ([`CAP_JOURNAL`]); `None` when an older keeper's WELCOME ends before it.
         caps: Option<u8>,
     },
     Register {
@@ -357,9 +297,7 @@ pub enum Frame {
         header: MasterHeader,
         tag: Vec<u8>,
         meta: Vec<u8>,
-        /// The crash-restore journal's trailing fields, written only to a HELLO that stated
-        /// [`CAP_JOURNAL`]; `None` when the body ends before them (an older keeper's OFFER, or
-        /// one to a window that does not journal).
+        /// The crash-restore journal's trailing fields, written only to a HELLO that stated [`CAP_JOURNAL`]; `None` when the body ends before them (an older keeper's OFFER, or one to a window that does not journal).
         journal: Option<JournalOffer>,
     },
     Orphans {
@@ -374,15 +312,13 @@ pub enum Frame {
         code: RefuseCode,
         rdev: u64,
     },
-    /// The journal region of a master the sender claims; its read-only descriptor rides the
-    /// header.
+    /// The journal region of a master the sender claims; its read-only descriptor rides the header.
     Companion {
         rdev: u64,
         kind: u8,
         len: u64,
     },
-    /// The region offered with the OFFER of `rdev` just before it; a duplicate of its descriptor
-    /// rides the header.
+    /// The region offered with the OFFER of `rdev` just before it; a duplicate of its descriptor rides the header.
     CompanionOffer {
         rdev: u64,
         kind: u8,
@@ -393,8 +329,7 @@ pub enum Frame {
         rdev: u64,
         kind: u8,
     },
-    /// A round trip: the window's number, which the keeper writes back once it has read every
-    /// frame before it.
+    /// A round trip: the window's number, which the keeper writes back once it has read every frame before it.
     Sync {
         seq: u64,
     },
@@ -403,11 +338,7 @@ pub enum Frame {
 /// An OFFER's trailing crash-restore fields (the crash-restore plan §5).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct JournalOffer {
-    /// The keeper's poison brake: how many recovering windows died, since the offered region
-    /// was written, before their own COMPANION. At 0 the region is the dead reader's own and a
-    /// restore may replay its tail; at 1 it replays the keyframe alone (the tail may be what
-    /// killed the last window, which may also have read output the region never saw); from 2
-    /// the keeper offers no region.
+    /// The keeper's poison brake: how many recovering windows died, since the offered region was written, before their own COMPANION.
     pub attempts: u8,
     /// How many COMPANION_OFFERs follow this OFFER (0 or 1).
     pub companions: u8,
@@ -428,8 +359,7 @@ pub enum RefuseCode {
     WrongClass = 5,
     /// A REGISTER or COMPANION arrived without its descriptor.
     NoDescriptor = 6,
-    /// A COMPANION whose descriptor is not a read-only POSIX shared-memory object of the kind
-    /// and length it claims, within the keeper's bounds.
+    /// A COMPANION whose descriptor is not a read-only POSIX shared-memory object of the kind and length it claims, within the keeper's bounds.
     NotAJournal = 7,
     /// A COMPANION or COMPANION_RELEASE named a master the keeper holds no record of.
     NoSuchRecord = 8,
@@ -481,10 +411,8 @@ impl Frame {
     }
 
     /// Encode header + body.
-    ///
     /// # Errors
-    /// `Oversize` for a part over its bound, `TooLong` for a body over
-    /// [`MAX_BODY`].
+    /// `Oversize` for a part over its bound, `TooLong` for a body over [`MAX_BODY`].
     pub fn encode(&self) -> Result<Vec<u8>, WireError> {
         let kind = self.kind();
         let mut body = Vec::new();
@@ -515,8 +443,6 @@ impl Frame {
                 body.extend_from_slice(&proto.to_be_bytes());
                 body.extend_from_slice(&offers.to_be_bytes());
                 put_short(&mut body, version.as_bytes(), MAX_LABEL, kind)?;
-                // The policy byte goes whenever anything follows it: a reader takes the fields
-                // in order, and 0 names no policy.
                 if identity.is_some() || caps.is_some() {
                     body.push(identity.map_or(0, policy_byte));
                 }
@@ -580,9 +506,7 @@ impl Frame {
         Ok(out)
     }
 
-    /// Decode the body of a frame whose header was `header`. Fields past the
-    /// ones this build knows are ignored (the growth rule).
-    ///
+    /// Decode the body of a frame whose header was `header`.
     /// # Errors
     /// `Short` for a truncated body, `Oversize` for a part over its bound.
     pub fn decode(header: &Header, body: &[u8]) -> Result<Frame, WireError> {
@@ -598,11 +522,7 @@ impl Frame {
                 let class_byte = r.u8()?;
                 let caps = r.u8()?;
                 let build = r.short_str(MAX_LABEL)?;
-                // An unknown class is refused rather than defaulted: a class
-                // decides what the peer may do.
                 let class = PeerClass::from_byte(class_byte).ok_or(WireError::Short(kind))?;
-                // The marker, when the body goes on (the growth rule: a HELLO
-                // that ends here is an older window's).
                 let marker = if r.at < body.len() {
                     Some(MarkerRef {
                         nanos: r.u64()?,
@@ -623,14 +543,11 @@ impl Frame {
                 proto: r.u16()?,
                 offers: r.u16()?,
                 version: r.short_str(MAX_LABEL)?,
-                // The growth rule: a WELCOME that ends here is an older
-                // keeper's, which states no policy.
                 identity: if r.at < body.len() {
                     policy_from_byte(r.u8()?)
                 } else {
                     None
                 },
-                // …and one that ends after the policy byte, an older keeper's, states no caps.
                 caps: if r.at < body.len() {
                     Some(r.u8()?)
                 } else {
@@ -653,8 +570,6 @@ impl Frame {
                 header: r.master_header()?,
                 tag: r.long(MAX_TAG)?,
                 meta: r.long(MAX_META)?,
-                // The growth rule: an OFFER that ends here is an older keeper's, or one to a
-                // window that did not state CAP_JOURNAL.
                 journal: if r.at < body.len() {
                     Some(JournalOffer {
                         attempts: r.u8()?,
@@ -850,7 +765,6 @@ mod tests {
             identity: Some(IdentityPolicy::SameUid),
             caps: None,
         });
-        // A keeper that states caps but no policy this build names.
         round(Frame::Welcome {
             proto: PROTO,
             offers: 0,
@@ -858,7 +772,6 @@ mod tests {
             identity: None,
             caps: Some(0),
         });
-        // An older keeper's WELCOME: no policy byte.
         round(Frame::Welcome {
             proto: PROTO,
             offers: 0,
@@ -932,10 +845,7 @@ mod tests {
         Frame::decode(&decode_header(&h)?, &bytes[HEADER_LEN..])
     }
 
-    /// The crash-restore fields only grow the wire. A journal OFFER and a WELCOME stating caps
-    /// are the older frame plus trailing bytes, so an older window reads them as before (the
-    /// growth rule) and its strict offer loop still meets an OFFER; and the older frames, whose
-    /// bodies end before those fields, decode as stating none.
+    /// The crash-restore fields only grow the wire.
     #[test]
     fn the_journal_fields_only_grow_the_wire() {
         let offer = |journal| Frame::Offer {
@@ -954,8 +864,6 @@ mod tests {
         assert_eq!(&new[new.len() - 2..], [2, 0]);
         assert_eq!(decode_whole(&old), Ok(plain));
 
-        // An older keeper's WELCOME ends before the policy byte; a newer one's runs on to the
-        // caps after it, which an older window never reads.
         let welcome = |caps| Frame::Welcome {
             proto: PROTO,
             offers: 1,
@@ -970,7 +878,6 @@ mod tests {
         assert_eq!(new[new.len() - 1], CAP_JOURNAL);
         assert_eq!(decode_whole(&old), Ok(older));
 
-        // A body cut inside the trailing pair is refused, never read as half a field.
         let mut cut = Frame::Offer {
             header: header(),
             tag: Vec::new(),
@@ -1035,7 +942,6 @@ mod tests {
         let mut h = encode_header(Kind::Bye, 0).expect("header");
         h[6..8].copy_from_slice(&u16::try_from(MAX_BODY + 1).unwrap().to_be_bytes());
         assert_eq!(decode_header(&h), Err(WireError::TooLong(MAX_BODY + 1)));
-        // A descriptor flag on a kind that carries none, and none on one that does.
         let mut h = encode_header(Kind::Bye, 0).expect("header");
         h[5] = FLAG_FD;
         assert_eq!(decode_header(&h), Err(WireError::FdFlag(Kind::Bye)));
@@ -1054,7 +960,6 @@ mod tests {
             .encode(),
             Err(WireError::Oversize(Kind::Register))
         );
-        // A hand-built body declaring a META over the bound.
         let mut body = 9u64.to_be_bytes().to_vec();
         body.extend_from_slice(&u16::try_from(MAX_META + 1).unwrap().to_be_bytes());
         body.resize(body.len() + MAX_META + 1, 0);
@@ -1107,7 +1012,6 @@ mod tests {
         .encode()
         .expect("encode");
         let body = &old[HEADER_LEN..];
-        // Exactly the pre-marker layout: proto, class, caps, build.
         assert_eq!(body.len(), 2 + 1 + 1 + 1 + "0.97.0".len());
         let mut h = [0u8; HEADER_LEN];
         h.copy_from_slice(&old[..HEADER_LEN]);

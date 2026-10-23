@@ -1,53 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! LINEAGE — which compiler built a toolchain or a payload, decided by CONTENT and
-//! never by a name (owner order 2026-09-29: "NO STOCK RUST IN THE TOOLCHAIN FOR TRUST").
-//!
-//! Every name a stock toolchain can wear has been worn on this project. The genesis
-//! stage0 was a directory of POSIX shell scripts called `trustc` and `targo` that exec'd
-//! rustup's stable and renamed its `--version`; `ay` 8256 was packed by stock rustc
-//! 1.97.1; `trust-mc` 20065 shipped rustup's nightly `librustc_driver`, which
-//! the pack-time relocation had vendored because vendoring from `~/.rustup` was its design
-//! (stock-rust audit 2026-09-29: TP-3, TP-4, TP-7, M7). Nothing in the packing lanes
-//! looked at what the bytes were. This module does, in two independent halves:
-//!
-//! 1. **Compiler admission** ([`check_compiler`]). `trustc`, `targo` and the one
-//!    `librustc_driver` must be native objects (Mach-O or ELF; a `#!` script is a
-//!    wrapper around some other compiler), none may resolve into rustup's directory,
-//!    `~/.cargo` or Homebrew, `trustc -vV` must carry a Trust identity (`binary:
-//!    trustc`, a `trust:` line, a 40-hex `commit-hash`), and the three files' own bytes
-//!    must carry no other compiler's evidence (the payload scan below, run over them).
-//!    Then LINEAGE: the toolchain root carries either `LINEAGE` (written by the
-//!    producer's stamp, `atpkg-publish`'s `artifact::lineage::stamp_with`, inside a
-//!    signed bundle, after strip and relocate, naming the shipped bytes) or the trust
-//!    repo's pack-cut receipt `SEED-MINT` (`trust-seed-mint-v1`:
-//!    built from the committed stage0 pin, double-compiled byte-identically against
-//!    another compiler, re-pinned), checked against the ACTUAL bytes. A toolchain with
-//!    neither is refused, or — only under [`LineagePolicy::Dormant`], the switch the
-//!    lanes flip until the trust repo's first minted re-pin lands — admitted with its
-//!    lineage recorded as `unproven`.
-//! 2. **Payload scan** ([`scan_object`]; the producer's `artifact::lineage::scan_tree`
-//!    walks a staged tree with it). Every Mach-O, ELF, PE, wasm, rlib, rmeta and
-//!    static archive in a staged tree is read for compiler evidence, and any that names
-//!    a compiler other than the admitted one is refused: a `/rustc/<40-hex>/` std path
-//!    (stock std embeds its commit there; Trust's std embeds none — measured on the
-//!    7d5533b2 seal, store trust 9192 and the rustc-private sysroots), a crate-metadata
-//!    header, an LLVM producer or ELF `.comment` line, or a wasm `producers` entry
-//!    naming another commit, and any path into a rustup toolchain directory.
-//!    The scan refuses evidence; it never proves there is none. An object that names
-//!    no compiler passes it: measured 2026-10-01, rustup 1.97.1's `#![no_std]` `.o`
-//!    without debuginfo carries none, while its rlib is refused for its metadata and
-//!    producer. So the compiler admission decides who compiled a pack: the packers
-//!    build only with the admitted compiler, with `RUSTC` set to its sibling `trustc`.
-//!    The scan catches bytes that came from elsewhere and say so.
-//!
-//! A toolchain bootstrapped from a stock stage0 can pass the scan and still fail lineage.
-//!
-//! Version strings are matched only where a compiler writes them (a crate-metadata header,
-//! with any ` (<description>)` a distribution appends; `rustc version …`; a wasm `producers`
-//! `rustc` entry): Trust's own crate metadata quotes stock version strings in doc comments,
-//! so a bare substring match would refuse every Trust bundle.
+//! LINEAGE — which compiler built a toolchain or a payload, decided by CONTENT and never by a name (owner order 2026-09-29: "NO STOCK RUST IN THE TOOLCHAIN FOR TRUST").
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -66,12 +20,10 @@ pub const SEED_MINT_SCHEMA: &str = "trust-seed-mint-v1";
 
 /// The double-compile relations a receipt may record (the trust repo's D12):
 /// `lineage-disjoint` (a stock-lineage seed, the only diverse one), `same-lineage` (another
-/// Trust compiler) and `pin-ancestor` (an earlier pin). A `reproducibility-control` compares
-/// a compiler with itself and is refused.
+/// Trust compiler) and `pin-ancestor` (an earlier pin).
 const ACCEPTED_RELATIONS: [&str; 3] = ["lineage-disjoint", "same-lineage", "pin-ancestor"];
 
-/// The largest receipt read. A real SEED-MINT lists every stage2 file the double compile
-/// compared — thousands of lines, well under a megabyte.
+/// The largest receipt read.
 const RECEIPT_LIMIT: usize = 64 << 20;
 
 /// How long `trustc -vV` may take before the compiler counts as not answering.
@@ -82,8 +34,7 @@ const VERSION_PROBE: std::time::Duration = std::time::Duration::from_secs(60);
 pub enum LineagePolicy {
     /// No `LINEAGE` and no `SEED-MINT`: refused.
     Require,
-    /// No receipt: admitted, recorded as `unproven` and reported as not enforced. A receipt
-    /// that is present is still checked in full.
+    /// No receipt: admitted, recorded as `unproven` and reported as not enforced.
     Dormant,
 }
 
@@ -131,8 +82,7 @@ pub struct VersionInfo {
     pub trust: String,
 }
 
-/// A compiler admitted by content ([`admit_content`]): its identity and the digests of
-/// the three files that make it a compiler.
+/// A compiler admitted by content ([`admit_content`]): its identity and the digests of the three files that make it a compiler.
 #[derive(Debug, Clone)]
 pub struct CompilerContent {
     /// The canonical `bin/` directory.
@@ -161,8 +111,7 @@ pub struct Compiler {
 }
 
 impl Compiler {
-    /// The provenance key/value pairs the packers embed in a manifest's
-    /// `[artifact.provenance]`.
+    /// The provenance key/value pairs the packers embed in a manifest's `[artifact.provenance]`.
     #[must_use]
     pub fn record(&self) -> Vec<(&'static str, String)> {
         let c = &self.content;
@@ -192,11 +141,7 @@ impl Compiler {
     }
 }
 
-/// Where a stock toolchain lives, read off a canonical path: rustup's directory (and a system
-/// `RUSTUP_HOME`'s `/usr/local/rustup/toolchains/<name>`), `~/.cargo`, Homebrew; `None`
-/// anywhere else. A rustup `trust` channel is a link onto a sealed toolchain, so its canonical
-/// path is the seal and never lands here. Windows spells the same places with `\`
-/// (`%USERPROFILE%\.rustup\toolchains\…`), read here as `/`.
+/// Where a stock toolchain lives, read off a canonical path: rustup's directory (and a system `RUSTUP_HOME`'s `/usr/local/rustup/toolchains/<name>`), `~/.cargo`, Homebrew; `None` anywhere else.
 #[must_use]
 pub fn stock_location(path: &Path) -> Option<&'static str> {
     let mut s = path.to_string_lossy();
@@ -304,10 +249,7 @@ fn find_driver(root: &Path, refusals: &mut Vec<String>) -> Option<PathBuf> {
     }
 }
 
-/// Admit `trustc -vV`'s output: `binary: trustc`, a `trust:` line, a 40-hex
-/// `commit-hash`, `release:` and `host:`, and a first line that is a Trust
-/// self-report whose short hash is the commit's prefix.
-///
+/// Admit `trustc -vV`'s output: `binary: trustc`, a `trust:` line, a 40-hex `commit-hash`, `release:` and `host:`, and a first line that is a Trust self-report whose short hash is the commit's prefix.
 /// # Errors
 /// One line per missing or inconsistent field.
 pub fn parse_version_verbose(text: &str) -> Result<VersionInfo, Vec<String>> {
@@ -393,12 +335,9 @@ fn probe_version(trustc: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// The content half of [`check_compiler`]: location, head, identity and a clean scan of
-/// the compiler's own bytes.
-///
+/// The content half of [`check_compiler`]: location, head, identity and a clean scan of the compiler's own bytes.
 /// # Errors
-/// Every refusal found, one line each. A script or a stock location is refused before
-/// anything is executed.
+/// Every refusal found, one line each.
 pub fn admit_content(bin_dir: &Path) -> Result<CompilerContent, Vec<String>> {
     admit_content_with(bin_dir, &probe_version)
 }
@@ -482,9 +421,7 @@ pub fn admit_content_with(
     })
 }
 
-/// Admit the compiler at `bin_dir` by content ([`admit_content`]) and lineage
-/// ([`admit_lineage`]).
-///
+/// Admit the compiler at `bin_dir` by content ([`admit_content`]) and lineage ([`admit_lineage`]).
 /// # Errors
 /// Every refusal found, one line each.
 pub fn check_compiler(bin_dir: &Path, policy: LineagePolicy) -> Result<Compiler, Vec<String>> {
@@ -502,9 +439,7 @@ pub fn check_compiler_with(
     Ok(Compiler { content, lineage })
 }
 
-/// The lineage half: `LINEAGE`, else `SEED-MINT`, else [`LineageProof::Unproven`] under
-/// [`LineagePolicy::Dormant`] only.
-///
+/// The lineage half: `LINEAGE`, else `SEED-MINT`, else [`LineageProof::Unproven`] under [`LineagePolicy::Dormant`] only.
 /// # Errors
 /// Every refusal found, one line each.
 pub fn admit_lineage(
@@ -595,7 +530,6 @@ fn read_receipt(path: &Path) -> Option<Receipt> {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        // The first word, then the rest, trimmed.
         let pair = || {
             let v = value.trim_start();
             let (a, b) = v.split_once(char::is_whitespace).unwrap_or((v, ""));
@@ -624,11 +558,7 @@ fn inside(root: &Path, rel: &str) -> Option<PathBuf> {
         .then(|| root.join(rel))
 }
 
-/// The seal's SEED-MINT refusals, one line each; empty when `<seal>/SEED-MINT` is a
-/// double-compile-backed re-pin receipt of `commit` whose every compared file and link
-/// is in `<seal>` as compared — so it describes THIS seal. The one implementation:
-/// [`check_compiler_with`] applies it to a toolchain's own receipt, and `atpkg-publish
-/// publish-group` to the seal it is about to pack.
+/// The seal's SEED-MINT refusals, one line each; empty when `<seal>/SEED-MINT` is a double-compile-backed re-pin receipt of `commit` whose every compared file and link is in `<seal>` as compared — so it describes THIS seal.
 #[must_use]
 pub fn seed_mint_refusals(seal: &Path, commit: &str) -> Vec<String> {
     seed_mint_refusals_inner(seal, commit, true)
@@ -701,7 +631,6 @@ fn seed_mint_refusals_inner(seal: &Path, commit: &str, compare_files: bool) -> V
     if !compare_files {
         return out;
     }
-    // Every compared file and link, in the seal, as compared.
     let mut bad: Vec<&str> = Vec::new();
     for (want, rel) in &r.files {
         let got = inside(seal, rel)
@@ -737,7 +666,6 @@ fn seed_mint_refusals_inner(seal: &Path, commit: &str, compare_files: bool) -> V
 /// A `LINEAGE` record, checked against the compiler it sits beside: the record's commit
 /// is the compiler's, the SEED-MINT it names is the one in the tree (and a double-compile
 /// re-pin receipt of this commit), and every digest it names is the shipped bytes'.
-/// Returns the receipt digest and the relation.
 fn lineage_record_refusals(c: &CompilerContent) -> Result<(String, String), Vec<String>> {
     let Some(rec) = read_receipt(&c.root.join(LINEAGE_FILE)) else {
         return Err(vec![format!(
@@ -805,8 +733,6 @@ fn lineage_record_refusals(c: &CompilerContent) -> Result<(String, String), Vec<
     }
 }
 
-// The payload scan.
-
 /// One kind of compiler evidence found in a payload.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Evidence {
@@ -861,19 +787,14 @@ impl Finding {
     }
 }
 
-/// The evidence of any compiler but the one whose commit-hash is `admitted` in the object
-/// at `path`, read streamed: the client's payload scan of one file, which the producer's
-/// tree scan (`atpkg-publish`'s `artifact::lineage::scan_tree`) runs over every compiled
-/// object it packs, and [`admit_content`] over a compiler's own bytes.
-///
+/// The evidence of any compiler but the one whose commit-hash is `admitted` in the object at `path`, read streamed: the client's payload scan of one file, which the producer's tree scan (`atpkg-publish`'s `artifact::lineage::scan_tree`) runs over every compiled object it packs, and [`admit_content`] over a compiler's own bytes.
 /// # Errors
 /// The file cannot be read.
 pub fn scan_object(path: &Path, admitted: &str) -> std::io::Result<BTreeMap<Evidence, usize>> {
     scan_file(path, admitted, false).map(|(hits, _)| hits)
 }
 
-/// The sha256 of the receipt at `path` (a `SEED-MINT`), as a `LINEAGE` record names it:
-/// `None` when it is not a readable regular file of at most the receipt limit.
+/// The sha256 of the receipt at `path` (a `SEED-MINT`), as a `LINEAGE` record names it: `None` when it is not a readable regular file of at most the receipt limit.
 #[must_use]
 pub fn receipt_sha256(path: &Path) -> Option<String> {
     read_receipt(path).map(|r| r.sha256)
@@ -894,7 +815,6 @@ fn scan_file(
     hash: bool,
 ) -> std::io::Result<(BTreeMap<Evidence, usize>, Option<String>)> {
     let f = std::fs::File::open(path)?;
-    // A small file is read whole in one step, never into an 8 MiB buffer.
     let len = f.metadata()?.len();
     let chunk = usize::try_from(len).map_or(CHUNK, |n| n.saturating_add(1).clamp(TAIL * 2, CHUNK));
     scan_stream(f, admitted, hash, chunk)
@@ -941,7 +861,6 @@ fn scan_stream(
         if eof {
             break;
         }
-        // Keep two bytes of look-behind (`/.` before `rustup`) and the unscanned tail.
         let keep = end.saturating_sub(2);
         buf.drain(..keep);
         from = end - keep;
@@ -966,8 +885,7 @@ impl Matcher<'_> {
         !self.admitted.starts_with(short)
     }
 
-    /// Examine every anchor (`rust…`) starting in `[from, to)`. Bytes past `to` (up to
-    /// [`TAIL`]) and two before `from` are readable.
+    /// Examine every anchor (`rust…`) starting in `[from, to)`.
     fn scan(&mut self, buf: &[u8], from: usize, to: usize) {
         let mut i = from;
         while i < to {
@@ -986,7 +904,6 @@ impl Matcher<'_> {
             return;
         }
         let before = |n: usize| at.checked_sub(n).map(|k| buf[k]);
-        // `/rustc/<40-hex>/` — a std path.
         if before(1) == Some(b'/') && s.starts_with(b"rustc/") {
             if let Some(h) = s.get(6..46).filter(|h| is_lower_hex(h, 40))
                 && s.get(46) == Some(&b'/')
@@ -996,9 +913,6 @@ impl Matcher<'_> {
             }
             return;
         }
-        // `/.rustup/toolchains/<name>/`, or a system RUSTUP_HOME's
-        // `/rustup/toolchains/<name>/` (`/usr/local/rustup` on the Linux images) — a path
-        // into a rustup toolchain. Rooted at a directory boundary, so `myrustup/…` is not.
         if let Some(rest) = s.strip_prefix(b"rustup/toolchains/") {
             let rooted =
                 before(1) == Some(b'/') || (before(1) == Some(b'.') && before(2) == Some(b'/'));
@@ -1014,7 +928,6 @@ impl Matcher<'_> {
             }
             return;
         }
-        // A wasm `producers` entry: `\x05rustc` then a length-prefixed version.
         if before(1) == Some(5) && s.starts_with(b"rustc") && !s.starts_with(b"rustc ") {
             if let Some((len, n)) = leb128_forward(s.get(5..).unwrap_or_default())
                 && let Some(v) = s.get(5 + n..5 + n + len)
@@ -1031,7 +944,6 @@ impl Matcher<'_> {
         let Some(rest) = s.strip_prefix(b"rustc ") else {
             return;
         };
-        // `rustc version <V> (<h9> <date>)` — LLVM's producer, ELF's .comment.
         if let Some(v) = rest.strip_prefix(b"version ") {
             if let Some((used, short)) = parse_version(v)
                 && self.foreign(short)
@@ -1043,10 +955,6 @@ impl Matcher<'_> {
             }
             return;
         }
-        // A crate-metadata header: `rustc <V> (<h9> <date>)`, then the ` (<description>)` a
-        // distribution configures (Homebrew, Fedora …; bootstrap's `rust_version()`), the
-        // whole prefixed by its LEB128 length (`emit_str`). Both readings of the bytes
-        // before the anchor are tried: one length byte, or two.
         if let Some((used, short)) = parse_version(rest)
             && self.foreign(short)
         {
@@ -1071,8 +979,7 @@ impl Matcher<'_> {
 
 /// Whether the `len` bytes of `s` are a metadata header's version string whose parsed
 /// version spans the first `version`: exactly that, or that and one ` (<description>)` of
-/// printable bytes running to the end. A string that only starts with a version (prose
-/// quoting one, a build-info self-report) is not one.
+/// printable bytes running to the end.
 fn is_metadata_version(s: &[u8], version: usize, len: usize) -> bool {
     if len == version {
         return true;
@@ -1090,7 +997,7 @@ fn is_metadata_version(s: &[u8], version: usize, len: usize) -> bool {
 }
 
 /// An unsigned LEB128 length of at most two bytes at the start of `s`: the value and the
-/// bytes it took. (Every version string a compiler writes is far below 16 KiB.)
+/// bytes it took.
 fn leb128_forward(s: &[u8]) -> Option<(usize, usize)> {
     let lo = *s.first()?;
     if lo < 0x80 {
@@ -1101,9 +1008,7 @@ fn leb128_forward(s: &[u8]) -> Option<(usize, usize)> {
 }
 
 /// `<release> (<9-hex> <yyyy-mm-dd>)` at the start of `s`: the bytes it spans and the
-/// short hash. `<release>` is `N.N.N` with an optional pre-release of lowercase letters,
-/// digits and dots — every channel bootstrap's `release()` writes: `-nightly`, `-dev`,
-/// `-beta` and `-beta.<n>`.
+/// short hash.
 fn parse_version(s: &[u8]) -> Option<(usize, &[u8])> {
     let mut i = 0;
     for part in 0..3 {
@@ -1165,8 +1070,7 @@ fn is_lower_hex(s: &[u8], len: usize) -> bool {
 }
 
 /// The first `needle` in `hay`: eight bytes at a time (a zero-byte test over the XOR),
-/// then the tail. The word test has no false negatives, so a word it passes over holds
-/// no match.
+/// then the tail.
 fn find_byte(hay: &[u8], needle: u8) -> Option<usize> {
     const LO: u64 = 0x0101_0101_0101_0101;
     const HI: u64 = 0x8080_8080_8080_8080;

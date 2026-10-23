@@ -250,7 +250,7 @@ struct LazySessions<'a> {
 }
 
 impl<'a> LazySessions<'a> {
-    fn new(wire: &'a ConnWire) -> Self {
+    const fn new(wire: &'a ConnWire) -> Self {
         Self { wire, rows: None }
     }
 

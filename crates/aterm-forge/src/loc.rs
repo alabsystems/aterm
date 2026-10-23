@@ -1,27 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Per-package facts: how much source, how much `unsafe`, does it run code at
-//! build time, what licence, and is it ours.
-//!
-//! # What LOC means here
-//!
-//! Physical lines over every `*.rs` under the package's root directory,
-//! including its own tests, examples, benches and anything a published
-//! `.crate` carries outside `src/` (`loc_method = "rs-physical-all-files-v1"`):
-//! the source aterm would own if it vendored the package, not what reaches
-//! codegen. This is the number the budget ratchets.
-//!
-//! The walk descends into dot-directories (e.g. `smol_str-0.2.2/.github/ci.rs`
-//! ships in the `.crate`, so it counts). This is where forge diverges from
-//! [`aterm_census::collect_rs_files`], which skips dot-directories to avoid
-//! `.claude/worktrees` clones inside the checkout; package roots hold none.
-//!
-//! # Why `unsafe` is counted as tokens
-//!
-//! `\bunsafe\b`, not `unsafe {` blocks: macro-generated FFI (e.g.
-//! `extern_methods!`) emits `unsafe` without blocks. The word boundary keeps
-//! lint names like `unsafe_op_in_unsafe_fn` from counting.
+//! Per-package LOC, `unsafe` count, build-script, and license facts
+//! ([`aterm_census::collect_rs_files`]).
 
 use crate::model::{Cell, CellSurvey, Graph, PkgFacts, PkgId};
 use crate::resolve;
@@ -29,25 +10,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-/// Where a package's source lives, in precedence order: a workspace member, then its
-/// `[patch.crates-io]` target (both matched on name and version), then the registry checkout,
-/// then `crates/<name>`, then `printed` (the directory `cargo tree` disclosed).
-///
-/// Patch before registry: what compiles is the fork, and a registry-first lookup would make the
-/// committed numbers depend on the local CARGO_HOME (fork drift is [`crate::attest`]'s). Member
-/// before registry: a first-party patched-in crate (package `tracing` at `crates/aterm-tracing`)
-/// shares its name with the upstream it replaces.
+/// Where a package's source lives, in precedence order ([`crate::attest`]).
 pub fn package_dir(root: &Path, id: &PkgId, printed: Option<&Path>) -> Option<PathBuf> {
-    // Name and version: `[patch.crates-io]` cannot satisfy every requirement,
-    // so a second, registry-sourced copy of the same name can resolve. A
-    // name-only hit would bill that third-party package to the member and drop
-    // it from the third-party totals.
     if let Some(member) = workspace_members(root).get(&(id.name.clone(), id.version.clone())) {
         return Some(member.clone());
     }
-    // A patched package resolves to the path that compiles, readable from the repository on
-    // every machine. The patch table is the authority, not the `vendor/` directory name; name
-    // and version are matched for the reason above.
     if let Some(dir) = patch_targets(root).get(&(id.name.clone(), id.version.clone()))
         && dir.is_dir()
     {
@@ -59,9 +26,6 @@ pub fn package_dir(root: &Path, id: &PkgId, printed: Option<&Path>) -> Option<Pa
             return Some(candidate);
         }
     }
-    // No version-blind `vendor/<name>` fallback: every fork under `vendor/` is a patch target, so
-    // the only ids left are ones the version guard refused, i.e. registry copies that must stay
-    // third-party.
     let member = root.join("crates").join(&id.name);
     if member.is_dir() {
         return Some(member);
@@ -69,11 +33,7 @@ pub fn package_dir(root: &Path, id: &PkgId, printed: Option<&Path>) -> Option<Pa
     printed.filter(|p| p.is_dir()).map(Path::to_path_buf)
 }
 
-/// (package, version) → directory for every `[patch.crates-io]` target: the patch table, not
-/// the directory name, says where a patched package lives (`crates/aterm-*` or `vendor/*`). A
-/// renamed row names its package with `package = "…"` ([`crate::policy::patched_package`]), and
-/// two rows may patch two versions of one package, hence the version in the key. Memoized per
-/// root.
+/// (package, version) → directory for every `[patch.crates-io]` target.
 fn patch_targets(root: &Path) -> &'static MemberIndex {
     static CACHE: OnceLock<Mutex<BTreeMap<PathBuf, &'static MemberIndex>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
@@ -137,10 +97,7 @@ pub(crate) fn manifest_version(dir: &Path) -> Option<String> {
 /// (package name, version) → directory.
 type MemberIndex = BTreeMap<(String, String), PathBuf>;
 
-/// (package name, version) → directory for every package under `crates/`, keyed on the
-/// manifest name (`crates/aterm-tracing` is package `tracing`) and version (the two first-party
-/// `windows-sys` patch versions). Includes patch trees excluded from workspace membership.
-/// Memoized per root.
+/// Map `(package name, version)` to its directory for every package under `crates/`.
 fn workspace_members(root: &Path) -> &'static MemberIndex {
     static MEMBERS: OnceLock<Mutex<BTreeMap<PathBuf, &'static MemberIndex>>> = OnceLock::new();
     let cache = MEMBERS.get_or_init(|| Mutex::new(BTreeMap::new()));
@@ -149,8 +106,6 @@ fn workspace_members(root: &Path) -> &'static MemberIndex {
     {
         return hit;
     }
-    // Members mostly inherit `version.workspace = true`; patched-in facades
-    // state a literal. Resolve both so callers compare an exact version.
     let workspace_version = std::fs::read_to_string(root.join("Cargo.toml"))
         .ok()
         .and_then(|text| {
@@ -186,8 +141,7 @@ fn workspace_members(root: &Path) -> &'static MemberIndex {
     leaked
 }
 
-/// A member's literal `[package] version`, or `None` when it inherits
-/// (`version.workspace = true` parses as a table, not a string).
+/// Literal `[package] version` of a workspace member, or `None` when inherited.
 fn package_version(text: &str) -> Option<String> {
     text.parse::<aterm_toml::edit::DocumentMut>()
         .ok()
@@ -199,8 +153,7 @@ fn package_version(text: &str) -> Option<String> {
         })
 }
 
-/// `[package] name` out of a manifest, parsed like [`manifest_facts`]. Empty
-/// when the manifest states none (a virtual manifest).
+/// `[package] name` out of a manifest, parsed like [`manifest_facts`].
 fn package_name(text: &str) -> String {
     text.parse::<aterm_toml::edit::DocumentMut>()
         .ok()
@@ -213,8 +166,7 @@ fn package_name(text: &str) -> String {
         .unwrap_or_default()
 }
 
-/// `$CARGO_HOME/registry/src/index.crates.io-*`, discovered once. The hash
-/// suffix is globbed; all matches are searched.
+/// `$CARGO_HOME/registry/src/index.crates.io-*`, discovered once.
 fn registry_srcs() -> &'static [PathBuf] {
     static SRCS: OnceLock<Vec<PathBuf>> = OnceLock::new();
     SRCS.get_or_init(|| {
@@ -247,8 +199,7 @@ fn cargo_home() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".cargo"))
 }
 
-/// Facts for every node in one graph, measured at the directories `cargo tree`
-/// disclosed (`printed`).
+/// Measure facts for every node in `graph` using the `printed` directories from `cargo tree`.
 pub fn facts_with_paths(
     root: &Path,
     graph: &Graph,
@@ -264,12 +215,9 @@ pub fn facts_with_paths(
     out
 }
 
-/// Measure one package from scratch — no cache, for callers that need a fresh
-/// read after editing a fork.
+/// Measure one package from scratch.
 pub fn measure(root: &Path, id: &PkgId, printed: Option<&Path>) -> PkgFacts {
     let Some(dir) = package_dir(root, id, printed) else {
-        // Unresolvable means a registry package whose source was never
-        // unpacked: third-party, LOC unknown and reported as 0.
         return PkgFacts {
             is_third_party: true,
             ..PkgFacts::default()
@@ -294,15 +242,12 @@ pub fn measure(root: &Path, id: &PkgId, printed: Option<&Path>) -> PkgFacts {
         has_build_rs: dir.join("build.rs").is_file(),
         is_proc_macro,
         license,
-        // Decided by `crate::provenance`, not the path: `vendor/astream` is ours, the other
-        // `vendor/` trees are forks.
         is_third_party: !crate::provenance::is_first_party(root, &dir),
         root_dir: Some(dir),
     }
 }
 
-/// The process-wide memo: on-disk facts do not change while forge runs, and
-/// cells share most packages.
+/// The process-wide memo.
 fn cached_facts(root: &Path, id: &PkgId, printed: Option<&Path>) -> PkgFacts {
     static CACHE: OnceLock<Mutex<BTreeMap<(PathBuf, PkgId), PkgFacts>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
@@ -319,11 +264,7 @@ fn cached_facts(root: &Path, id: &PkgId, printed: Option<&Path>) -> PkgFacts {
     fresh
 }
 
-/// Graph plus facts for one cell, as `cargo` resolves it, printing the
-/// resolver's notes (the offline-retry note) to stderr as it goes: forge's
-/// own CLI verbs (`survey`, `blame`). A caller that returns a report (`forge
-/// budget`, and through it `verify forge`) takes [`survey_cell_logged`] and
-/// carries the notes in its report instead.
+/// Resolve the dependency graph and package facts for one cell (`survey`, `blame`).
 pub fn survey_cell(cargo: &resolve::Cargo, root: &Path, cell: &Cell) -> Result<CellSurvey, String> {
     let mut log = String::new();
     let out = survey_cell_logged(cargo, root, cell, &mut log);
@@ -349,8 +290,7 @@ pub fn survey_cell_logged(
     })
 }
 
-/// Every `*.rs` under `dir`, skipping `target/` and `.git`; dot-directories are
-/// included (see the module docs).
+/// Every `*.rs` under `dir`, skipping `target/` and `.git`.
 fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -372,8 +312,7 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Physical lines: every newline, plus a final line that lacks one. An empty
-/// file is 0 lines, which is why this is not `split('\n').count()`.
+/// Physical lines: every newline, plus a final line that lacks one.
 fn physical_lines(bytes: &[u8]) -> u64 {
     if bytes.is_empty() {
         return 0;
@@ -386,9 +325,7 @@ fn physical_lines(bytes: &[u8]) -> u64 {
     }
 }
 
-/// `\bunsafe\b` occurrences. Word-bounded on both sides, so
-/// `unsafe_op_in_unsafe_fn` contributes 0 and `unsafe {`, `unsafe fn`,
-/// `#[unsafe(no_mangle)]` and a bare `unsafe` at end of file each contribute 1.
+/// `\bunsafe\b` occurrences.
 fn count_unsafe(bytes: &[u8]) -> u64 {
     const WORD: &[u8] = b"unsafe";
     let mut count = 0u64;
@@ -409,13 +346,11 @@ fn count_unsafe(bytes: &[u8]) -> u64 {
     count
 }
 
-fn is_ident_byte(b: u8) -> bool {
+const fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// `package.license` and `[lib] proc-macro = true`, read with the policy file's
-/// comment-preserving parser. `license.workspace = true` yields an empty
-/// string.
+/// Read `package.license` and `[lib] proc-macro = true` from a manifest.
 fn manifest_facts(text: &str) -> (String, bool) {
     let Ok(doc) = text.parse::<aterm_toml::edit::DocumentMut>() else {
         return (String::new(), false);
@@ -445,7 +380,6 @@ mod tests {
         assert!(!pm);
         let (_, pm) = manifest_facts("[package]\nname = \"x\"\n[lib]\nproc-macro = true\n");
         assert!(pm);
-        // An inherited licence is reported as unknown, never invented.
         let (lic, _) = manifest_facts("[package]\nlicense.workspace = true\n");
         assert_eq!(lic, "");
         assert_eq!(manifest_facts("this is not toml ][").0, "");

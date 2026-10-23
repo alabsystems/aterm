@@ -1,50 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE ONE DEFINITION OF "THE SCREEN CHANGED": what the live screen a reader
-//! is served is a function of, read once under the term lock.
-//!
-//! Three readers ask it. The conditional `screen since=<etag>` read answers
-//! `unchanged` when [`FrameKey::etag`] is the one the poller holds, and the
-//! `subscribe` push asks one question per stream: `screen` of the
-//! [`TextKey`] (the visible text), `cells` of the whole [`FrameKey`] (when to
-//! re-read the styled frame, which is sent when its bytes changed). The push
-//! gate used to key every stream on `content_seq`, the alt flag and the render
-//! signature at once, so it missed each frame change that writes no content (a
-//! `C=1` Kitty placement, a VS15/VS16 width fix, an OSC 1337 mark, an image
-//! re-sent under its placeholder) while the conditional read caught them, and
-//! it re-sent the screen text on every caret move, selection drag and recolour.
-//! The third, a host's own hold of a session's terminal ([`crate::TermGuard`]),
-//! compares the [`FrameKey`] at its start and end to decide whether to wake
-//! those push streams, so a write the PTY reader did not make reaches them
-//! exactly when one of their questions could answer yes.
-//!
-//! Every field is read off the live screen; the viewport is not an input, so
-//! a person scrolling back through history moves neither key.
+//! Screen and styled-frame change keys (`TextKey` and `FrameKey`) for conditional reads and `subscribe` push streams.
 
 use aterm_core::terminal::Terminal;
 
 use crate::control::ScreenGen;
 
-/// Everything the live screen's TEXT is a function of: every row as
-/// [`crate::control::visible_row`] serves it, which is what the `text` verb,
-/// the screen's `hash=` and a `subscribe … screen` frame carry.
-///
-/// * The live grid: output reaches it only through `process`, and
-///   [`Terminal::screen_mutations`] moves on every non-empty batch. The host's
-///   own grid writers (resize, reset, clearing history) move the content seq,
-///   a reset the epoch.
-/// * The generation (`epoch`, `seq`): the seq repeats across an alt-screen
-///   exit and re-entry, the epoch never does.
-/// * The dimensions.
-/// * The terminal ([`Terminal::render_identity`], not its reusable address),
-///   so another terminal behind the same handle is another key. Identities
-///   start at 1, so the [`Default`] key (all zero) is no terminal's.
-///
-/// It is finer than the text: a caret move or an OSC colour change is a batch
-/// that moves `screen_mutations` and no glyph. A reader that must not resend
-/// unchanged text compares the text when this moves (the `screen` stream
-/// compares the screen's `hash=`).
+/// Fingerprint of everything the visible screen text depends on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) struct TextKey {
     identity: u64,
@@ -56,7 +19,7 @@ pub(crate) struct TextKey {
 }
 
 impl TextKey {
-    /// The key of `t` now. The caller holds its lock; O(1).
+    /// Read the current [`TextKey`] of `t` under its lock in O(1).
     pub(crate) fn read(t: &Terminal) -> TextKey {
         TextKey {
             identity: t.render_identity(),
@@ -69,29 +32,7 @@ impl TextKey {
     }
 }
 
-/// Everything the STYLED FRAME ([`crate::control::gather_styled_frame`]) is a
-/// function of. The argument goes read by read through the gather (the
-/// serializer reads only its snapshot); each read is folded by value, or
-/// reached only by writers that move a folded counter:
-///
-/// * The [`TextKey`]: the grid's glyphs, wide flags, links, decorations and
-///   image placements, and the Kitty image store, are output, which moves
-///   `screen_mutations`, as does every Kitty animation step. `content_seq`
-///   alone misses a VS15/VS16 width fix, an OSC 1337 mark, a `C=1` Kitty
-///   placement and a Kitty image re-sent or deleted under a placeholder.
-/// * The alt flag the frame reports.
-/// * By value through [`render_sig`]: the cursor, the selection and its
-///   colours, and everything a cell is coloured against
-///   ([`Terminal::presentation_fingerprint`]: palette, default colours,
-///   DECSCNM and the host style policy, which a config reload changes with no
-///   output and no seq while every bold and dim cell re-colours).
-/// * Each row's DEC line size, by the name the frame serializes.
-///
-/// It is finer than the frame (every batch of output moves `screen_mutations`,
-/// a title or a bell included); that costs one full frame read, never a wrong
-/// answer, and the push sends a re-read frame only when its bytes changed.
-/// `control_screen_etag_tests.rs` holds [`Self::etag`] to the frame over a
-/// corpus and a seeded walk, with incomplete etags as negative controls.
+/// Fingerprint of everything the styled `screen` frame depends on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct FrameKey {
     text: TextKey,
@@ -101,11 +42,8 @@ pub(crate) struct FrameKey {
 }
 
 impl FrameKey {
-    /// The key of `t` now. The caller holds its lock; O(rows) for the line
-    /// sizes, plus [`render_sig`].
+    /// Read the current [`FrameKey`] of `t` under its lock.
     pub(crate) fn read(t: &Terminal) -> FrameKey {
-        // One stable wire name per row (the names the frame serializes),
-        // delimited so two rows cannot alias by concatenation.
         let mut line_sizes = aterm_hash::Fnv1a64::new();
         for r in 0..t.rows() as usize {
             let size = crate::control::row_line_size(t, r);
@@ -120,17 +58,17 @@ impl FrameKey {
         }
     }
 
-    /// The text half: equal whenever the visible rows are.
+    /// Return the visible-text key subset.
     pub(crate) fn text(&self) -> TextKey {
         self.text
     }
 
-    /// The content seq the key was read at.
+    /// Content sequence number at the read.
     pub(crate) fn seq(&self) -> u64 {
         self.text.seq
     }
 
-    /// The screen generation the key was read at (`gen=` on the wire).
+    /// Screen generation (`gen=`) at the read.
     pub(crate) fn generation(&self) -> ScreenGen {
         ScreenGen {
             epoch: self.text.epoch,
@@ -138,10 +76,7 @@ impl FrameKey {
         }
     }
 
-    /// The `screen` frame's CONDITIONAL ETAG: every field of the key, and this
-    /// process, folded into one `u64`. The process salt keeps a token handed
-    /// out by another process (an earlier aterm, a peer instance) from
-    /// matching here.
+    /// Fold all frame-key fields and a per-process salt into a conditional `etag` `u64`.
     pub(crate) fn etag(&self) -> u64 {
         static PROCESS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let process = *PROCESS.get_or_init(|| {
@@ -175,14 +110,7 @@ impl FrameKey {
     }
 }
 
-/// A cheap fingerprint of the RENDER state that changes the styled output
-/// without advancing `content_seq`: the overlays — DECTCEM visibility, cursor
-/// position/style/colour, the side-adjusted selection kind and range, the
-/// selection colours — and everything a cell's colours are RESOLVED against,
-/// taken from aterm-core's own list ([`Terminal::presentation_fingerprint`]:
-/// the palette, the default colours, DECSCNM and the host style policy, which a
-/// config reload changes with no output and no seq). Bounded (one 256-entry
-/// palette pass + a few dynamics), and read only for a [`FrameKey`].
+/// Fingerprint render-state overlays that change styled output without advancing `content_seq`.
 pub(crate) fn render_sig(t: &Terminal) -> u64 {
     let mut h = aterm_hash::Fnv1a64::new();
     h.write_u8(u8::from(t.cursor_visible()));
@@ -190,7 +118,6 @@ pub(crate) fn render_sig(t: &Terminal) -> u64 {
     h.write(&cursor.row.to_le_bytes());
     h.write(&cursor.col.to_le_bytes());
     h.write(crate::control::cursor_style_name(t.cursor_style()).as_bytes());
-    // Delimit the variable-length style name from the next field.
     h.write_u8(0);
     for color in [
         t.cursor_color(),

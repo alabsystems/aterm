@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Proofs of the motion layer's deadlines and the ETA's honesty, driven
-//! only through the crate's public API at injected instants.
-//!
-//! The central tool is [`audit`]: it walks the host's loop — wake at each
-//! `motion_deadline`, prepare the frame there — and between two wakes looks
-//! at EVERY frame on the 33 ms grid for a change the deadline did not ask for.
-//! Such a change is a MISSED frame: the pixels on glass are stale until some
-//! unrelated wake repaints the window, and on an idle, unfocused window that
-//! may be never. A wake at which nothing drawable changed is a WASTED wake.
+//! Motion deadline and ETA tests driven through the public API at injected instants.
 
 use aterm_messages::progress::eta_words;
 use aterm_messages::text::char_width;
@@ -185,8 +177,6 @@ fn fed(start: u64) -> (MessageCenter, MessageId, Instant) {
     (c, id, t)
 }
 
-// ---- deadlines vs. what is drawn ---------------------------------------------
-
 /// The comet at `cols` in `look` for 75 s, its elapsed words included: the
 /// frames it missed, after its cadence is held to the look's pace.
 fn comet_walk(cols: usize, look: Look) -> Vec<String> {
@@ -224,8 +214,6 @@ fn comet_walk(cols: usize, look: Look) -> Vec<String> {
 /// still echo asks no frame at all.
 #[test]
 fn deadlines_never_miss_a_change_the_motion_draws() {
-    // The comet's twelve 75 s walks are most of this test: on every core,
-    // their misses in order.
     let comets: Vec<(usize, Look)> = [60usize, 80, 120]
         .into_iter()
         .flat_map(|cols| LOOKS.map(|look| (cols, look)))
@@ -235,8 +223,6 @@ fn deadlines_never_miss_a_change_the_motion_draws() {
             .into_iter()
             .flatten()
             .collect();
-    // The download at widths that lay out its ETA slot (the starved slot is
-    // pinned on its own, below).
     for start in [1_000_000u64, 40_000_000] {
         for cols in [80usize, 120] {
             for look in LOOKS {
@@ -252,7 +238,6 @@ fn deadlines_never_miss_a_change_the_motion_draws() {
             }
         }
     }
-    // A data glide.
     for look in LOOKS {
         let (mut c, id, last) = fed(1_000_000);
         let t = last + ms(100);
@@ -268,7 +253,6 @@ fn deadlines_never_miss_a_change_the_motion_draws() {
         let a = audit(&c, &p, look, t, t + ms(9000));
         missed.extend(a.missed.iter().map(|m| format!("glide: {m}")));
     }
-    // Every echo, for a bar and for a comet.
     for end in ["complete", "fault", "vanish"] {
         for indeterminate in [false, true] {
             for look in LOOKS {
@@ -364,8 +348,6 @@ fn a_stall_repaints_the_bar_even_where_the_eta_slot_starved() {
     assert!(missed.is_empty(), "missed:\n{}", missed.join("\n"));
 }
 
-// ---- the ETA --------------------------------------------------------------------
-
 /// A deterministic stream of readings from a small LCG: gaps of 50 ms–4 s,
 /// advances of 0–3 MB, the odd regression and change of total.
 fn stream(seed: u64, n: usize) -> Vec<(u64, Amount)> {
@@ -419,8 +401,6 @@ fn the_eta_never_speaks_from_too_little_and_never_goes_negative_or_absurd() {
         let (mut since, mut seen, mut prev_done) = (0u64, 0usize, None::<u64>);
         for (i, (at, a)) in readings.iter().enumerate() {
             let now = base + ms(*at);
-            // A regression starts the estimator over (so does a new series
-            // or unit, which a stream never changes).
             if prev_done.is_none_or(|p| a.done < p) {
                 since = *at;
                 seen = 0;
@@ -494,8 +474,6 @@ fn an_overdue_eta_stops_promising_under_five_seconds() {
     }
 }
 
-// ---- the elapsed clock -------------------------------------------------------
-
 /// The elapsed clock and its deadline agree to the frame, from the first
 /// word at `ELAPSED_AFTER`, in the still look — an unfocused window's only
 /// wake: no missed tick, no wasted one, the first exactly on the grid step
@@ -553,8 +531,6 @@ fn the_elapsed_clock_survives_a_same_activity_supersede() {
     let after = c.motion(&p, now + ms(35_000), Look::MOVING).rows[0]
         .readout
         .clone();
-    // The frame grid floors 35 s to 34.98 s: `for 34 s` is the running
-    // time (labelled, never a bare clock).
     assert_eq!(
         after.as_deref(),
         Some("for 34 s"),

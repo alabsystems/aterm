@@ -1,20 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The closed table of editor commands: their Emacs names (M-x ranks them
-//! for people, [`EditorCommand::from_name`] finds one exactly for machines),
-//! the authority each needs ([`EditorCommand::authority`]) and the arguments
-//! it prompts for ([`EditorCommand::prompts`]); an [`Invocation`] of one; the
-//! `C-u` argument a command takes; and the workspace's history of the
-//! commands it ran.
+//! Closed table of editor commands, authority classes, prompts, and command history.
 
 use super::workspace::EditorWorkspace;
 
 const COMMAND_HISTORY_LIMIT: usize = 200;
 const COMMAND_COMPLETION_LIMIT: usize = 8;
 
-/// The columns between tab stops: the same four-cell phase a tab character
-/// is drawn with ([`super::editor_grapheme_columns`]).
+/// Columns between tab stops.
 pub const TAB_STOP: usize = 4;
 
 /// A pending `C-u` argument: Emacs's raw prefix argument, waiting for the one
@@ -23,9 +17,7 @@ pub const TAB_STOP: usize = 4;
 pub(super) enum PrefixArgument {
     /// `C-u` alone, pressed n times: 4ⁿ.
     Raw(i64),
-    /// Decimal digits typed after `C-u` (`C-u 2`). While `open`, one more
-    /// digit extends the number; a `C-u` after the digits closes it, as
-    /// Emacs's `universal-argument-more` does, so a digit after that is text.
+    /// Decimal digits typed after `C-u` (`C-u 2`).
     Numeric { value: i64, open: bool },
 }
 
@@ -53,7 +45,7 @@ impl PrefixArgument {
     }
 
     /// The argument after one more decimal digit, or `None` once the number
-    /// is closed. The first digit replaces the raw 4ⁿ.
+    /// is closed.
     pub(super) fn after_digit(self, digit: u32) -> Option<Self> {
         let digit = i64::from(digit);
         match self {
@@ -120,10 +112,6 @@ trust_contract_fn! {
     }
 }
 
-// Specs `repeat-count-bounds` and `repeat-count-identity` (SPECS.md),
-// kernel-checked against the compiled body. Trust reads an `i64` as a
-// `BitVec 64` and orders it through `i64_order_key`, which flips the sign bit so the
-// signed order is `Nat`'s; the proofs are the two case splits the body makes.
 verify_island! {
     clean {
         def i64_order_key (v : BitVec 64) : Nat := Nat.xor (BitVec.toNat v) 9223372036854775808
@@ -196,9 +184,7 @@ pub enum EditorCommand {
     MoveWordForward,
     DeleteBackward,
     DeleteForward,
-    /// TAB: indent to the next tab stop. Until the Language table's indent
-    /// rules arrive (slice L1) it inserts spaces at each caret up to the next
-    /// multiple of [`TAB_STOP`] columns.
+    /// TAB: indent to the next tab stop.
     IndentForTab,
     SetMark,
     KillRegion,
@@ -267,12 +253,7 @@ pub enum EditorCommand {
     DigitArgument,
 }
 
-/// The authority a command needs (design §2.3). The workspace checks it
-/// before every command runs, whichever path ran it (a key, M-x, a button,
-/// a macro, an [`Invocation`]), against the classes the host grants the
-/// input being reduced ([`super::EditorWorkspace::granted`]): a person at
-/// the window holds every class, and a control client's gesture only Read,
-/// Edit and Save (`aterm-gui`'s `command_registry`).
+/// Authority class required to execute an editor command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CommandAuthority {
     /// Moves the caret, the view or the mark, or opens a minibuffer; the
@@ -295,7 +276,7 @@ pub enum CommandAuthority {
 }
 
 impl CommandAuthority {
-    /// Every class, the grant of a person at the window.
+    /// All authority classes, granted to interactive window input.
     pub const ALL: [Self; 6] = [
         Self::Read,
         Self::Edit,
@@ -305,8 +286,7 @@ impl CommandAuthority {
         Self::Spawn,
     ];
 
-    /// The class's name in a refusal (`kill-ring-save needs clipboard
-    /// authority`).
+    /// Returns the authority class name.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -320,9 +300,7 @@ impl CommandAuthority {
     }
 }
 
-/// One argument a command asks for in the minibuffer, in order
-/// ([`EditorCommand::prompts`]). A person types each answer; a machine
-/// passes them all in one [`Invocation`].
+/// Minibuffer argument prompt requested by an editor command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Prompt {
     /// `switch-to-buffer`: an open buffer's name or file URI.
@@ -344,10 +322,7 @@ impl Prompt {
     }
 }
 
-/// One run of a command with everything it takes: its numeric argument
-/// (`C-u 3`, `M-3`) and the answers to its prompts, in order. A person's keys
-/// build one a piece at a time; a machine hands over a whole one
-/// ([`EditorWorkspace::invoke`]).
+/// An editor command invocation with optional repeat count and prompt arguments.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Invocation {
     pub command: EditorCommand,
@@ -427,15 +402,12 @@ impl EditorCommand {
         Self::PlayMacro,
     ];
 
-    /// The command named exactly `name` (`"kill-buffer"`): no ranking, no
-    /// prefix, no case folding. M-x's fuzzy list is for people; this is for
-    /// machines, which must never run the nearest match to a typo.
+    /// Looks up a command by its exact Emacs name.
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|command| command.name() == name)
     }
 
-    /// The authority this command needs. One exhaustive match, so a new
-    /// command cannot compile without a decision.
+    /// Returns the authority class required by this command.
     pub const fn authority(self) -> CommandAuthority {
         use CommandAuthority as A;
         match self {
@@ -465,8 +437,6 @@ impl EditorCommand {
             | Self::SearchPrevious
             | Self::GotoLine
             | Self::SwitchBuffer
-            // Recording a macro changes nothing; playing one is an edit, and
-            // needs whatever its steps need too (`EditorWorkspace::authorities`).
             | Self::StartMacro
             | Self::EndMacro => A::Read,
             Self::DeleteBackward
@@ -486,24 +456,16 @@ impl EditorCommand {
             | Self::FillParagraph
             | Self::RevertBuffer
             | Self::PlayMacro => A::Edit,
-            // Closing a view saves its changed draft first, so every close is
-            // a save.
             Self::Save
             | Self::FinishEdit
             | Self::AbortEdit
             | Self::KillBuffer
             | Self::SaveBuffersKillTerminal => A::Save,
-            // M-w is the copy command: what it adds to the kill ring goes on
-            // the system clipboard ([`super::EditorEffect::KillToClipboard`]),
-            // as ⌘C's copy does. A kill's text goes there too, but only for an
-            // input granted Clipboard, so a kill needs no more than Edit and a
-            // control client's kills stay in the ring.
             Self::KillRingSave => A::Clipboard,
         }
     }
 
-    /// The arguments this command asks for, in order. A person answers each
-    /// in the minibuffer; a machine passes them in its [`Invocation`].
+    /// Returns the sequence of prompts required by this command.
     pub const fn prompts(self) -> &'static [Prompt] {
         match self {
             Self::SwitchBuffer => &[Prompt::BufferName],
@@ -578,9 +540,7 @@ pub enum EditorCompletionAction {
     Choose(usize),
 }
 
-/// Bounded prefix/fuzzy projection used by reducer, renderer, accessibility,
-/// touch actions, and introspection. Ranking never authorizes a command by
-/// itself: the result is still a typed `EditorCommand` from the closed table.
+/// Returns commands matching `query` by prefix or fuzzy ranking.
 pub fn command_completions(query: &str) -> Vec<EditorCommand> {
     let normalized = query.trim().to_ascii_lowercase();
     let mut ranked = EditorCommand::ALL
@@ -601,10 +561,7 @@ pub fn command_completions(query: &str) -> Vec<EditorCommand> {
 
 fn command_match_score(name: &str, query: &str) -> Option<(u8, usize, usize)> {
     if query.is_empty() {
-        // A blank M-x shows every command in the CURATED table order (Save
-        // first): the score must be constant so the `default_rank` tiebreak
-        // decides — a `name.len()` component here would instead surface the
-        // shortest names ("undo") ahead of the curation.
+        // Keep a constant score so blank queries stay in curated table order.
         return Some((5, 0, 0));
     }
     let hyphenated = query
@@ -616,10 +573,7 @@ fn command_match_score(name: &str, query: &str) -> Option<(u8, usize, usize)> {
         return Some((0, 0, name.len()));
     }
     if name.starts_with(&hyphenated) {
-        // Prefix matches tie as a CLASS and fall to the curated table order:
-        // ranking by the unmatched remainder would surface the shortest
-        // completion ("move-end-of-line") over the curation ("move-beginning-
-        // of-line" first).
+        // Prefix matches tie as a class and fall back to curated table order.
         return Some((1, 0, 0));
     }
     if let Some(position) = name.find(&hyphenated) {
@@ -630,8 +584,7 @@ fn command_match_score(name: &str, query: &str) -> Option<(u8, usize, usize)> {
         .filter(|character| character.is_ascii_alphanumeric())
         .collect::<Vec<_>>();
     if needle.is_empty() {
-        // Punctuation-only queries degenerate to the blank-query broad list:
-        // constant score, curated order (see above).
+        // Punctuation-only queries fall back to the curated blank-query order.
         return Some((5, 0, 0));
     }
     let mut matched = 0;
@@ -645,8 +598,6 @@ fn command_match_score(name: &str, query: &str) -> Option<(u8, usize, usize)> {
             first.get_or_insert(index);
             matched += 1;
             if matched == needle.len() {
-                // `index` is the position of the LAST matched character: the
-                // return runs in the very iteration that completed the needle.
                 let first = first.unwrap_or(0);
                 return Some((
                     3,
@@ -692,9 +643,7 @@ mod tests {
         }
     }
 
-    /// One C-u argument goes to exactly one command. Line motion, kill-line and
-    /// yank take it; a command with no use for it drops it, so it can never
-    /// multiply a later C-f. The HUD clears with it.
+    /// One C-u argument goes to exactly one command.
     #[test]
     fn universal_argument_is_consumed_once() {
         let text = (0..10)
@@ -714,9 +663,6 @@ mod tests {
                 .unwrap()
         };
 
-        // C-u 4 C-n moves four lines, and the C-f after it one character.
-        // The host sends the digit as text once C-u has resolved; it is the
-        // argument, never document text.
         press(&mut store, &mut workspace, &mut view, "C-u");
         workspace.insert_text(&mut store, &mut view, "4").unwrap();
         assert_eq!(
@@ -730,7 +676,6 @@ mod tests {
         assert_eq!(view.primary_selection().head, byte_of_line(&text, 4) + 1);
         assert_eq!(store.snapshot(document).unwrap().text.as_ref(), text);
 
-        // A bare C-u is four: C-u C-n moves four lines, then C-f one character.
         view.selections = vec![Selection::caret(0)];
         press(&mut store, &mut workspace, &mut view, "C-u");
         press(&mut store, &mut workspace, &mut view, "C-n");
@@ -738,9 +683,6 @@ mod tests {
         press(&mut store, &mut workspace, &mut view, "C-f");
         assert_eq!(view.primary_selection().head, byte_of_line(&text, 4) + 1);
 
-        // A command with no use for the argument drops it: C-u C-x C-s saves,
-        // and the C-f after it still moves one character. While C-x waits for
-        // its second key the HUD still names the argument.
         view.selections = vec![Selection::caret(0)];
         press(&mut store, &mut workspace, &mut view, "C-u");
         press(&mut store, &mut workspace, &mut view, "C-x");
@@ -755,8 +697,6 @@ mod tests {
         assert_eq!(view.primary_selection().head, 1);
         assert_eq!(view.prefix_hud, None);
 
-        // M-x forwards both a bare C-u and a typed number to the chosen
-        // command. Enter accepts it once; the following C-f has no argument.
         for (digits, count) in [(None, 4), (Some("2"), 2)] {
             view.selections = vec![Selection::caret(0)];
             press(&mut store, &mut workspace, &mut view, "C-u");
@@ -778,8 +718,6 @@ mod tests {
             assert_eq!(store.snapshot(document).unwrap().text.as_ref(), text);
         }
 
-        // A chosen command that does not use the argument drops it too. Save
-        // is only an effect here: no host save or filesystem action is run.
         view.selections = vec![Selection::caret(0)];
         press(&mut store, &mut workspace, &mut view, "C-u");
         press(&mut store, &mut workspace, &mut view, "M-x");
@@ -795,7 +733,6 @@ mod tests {
         assert_eq!(view.primary_selection().head, 1);
         assert_eq!(view.prefix_hud, None);
 
-        // Cancelling M-x cancels its argument, rather than passing it to C-f.
         view.selections = vec![Selection::caret(0)];
         press(&mut store, &mut workspace, &mut view, "C-u");
         press(&mut store, &mut workspace, &mut view, "M-x");
@@ -805,8 +742,6 @@ mod tests {
         assert_eq!(view.prefix_hud, None);
         assert_eq!(store.snapshot(document).unwrap().text.as_ref(), text);
 
-        // An undefined key ends the argument too, as in Emacs: C-u M-z, or
-        // C-u C-x z, is not bound, and the C-f after it moves one character.
         for keys in [&["M-z"][..], &["C-x", "z"][..]] {
             view.selections = vec![Selection::caret(0)];
             press(&mut store, &mut workspace, &mut view, "C-u");
@@ -826,8 +761,6 @@ mod tests {
             assert_eq!(view.primary_selection().head, 1, "after C-u {keys:?}");
         }
 
-        // C-u 2 C-k kills two whole lines, newlines included. A digit chord
-        // after C-u is the argument too.
         view.selections = vec![Selection::caret(0)];
         press(&mut store, &mut workspace, &mut view, "C-u");
         press(&mut store, &mut workspace, &mut view, "2");
@@ -839,8 +772,6 @@ mod tests {
             Some("line 0\nline 1\n")
         );
 
-        // Typed text takes no argument and drops it: C-u x inserts one x, and
-        // the C-f after it moves one character.
         workspace
             .execute(&mut store, &mut view, EditorCommand::UniversalArgument)
             .unwrap();
@@ -918,9 +849,7 @@ mod tests {
     }
 
     /// Every command has exactly the authority this table pins: a change to
-    /// one is a decision, made here on purpose. Moving, marking and
-    /// searching are Read; anything that changes text is Edit; saving or
-    /// closing a view is Save; copying out is Clipboard.
+    /// one is a decision, made here on purpose.
     #[test]
     fn authority_table_is_total_and_pinned() {
         use CommandAuthority::{Clipboard, Edit, Read, Save};
@@ -982,12 +911,10 @@ mod tests {
             .map(|command| (command.name(), command.authority()))
             .collect::<Vec<_>>();
         assert_eq!(table, pinned, "the table lists every command, in M-x order");
-        // No command needs Files or Spawn yet (S9 and P2 bring them).
         assert!(EditorCommand::ALL.iter().all(|command| !matches!(
             command.authority(),
             CommandAuthority::Files | CommandAuthority::Spawn
         )));
-        // Negative control: a table that moved one command is caught.
         let mut moved = table.clone();
         let copied = moved
             .iter_mut()
@@ -1101,7 +1028,6 @@ mod tests {
                 query: "other.md".to_string()
             }]
         );
-        // The wrong number of answers runs nothing.
         let effects = workspace
             .invoke(
                 &mut store,
@@ -1115,7 +1041,6 @@ mod tests {
                 "save-buffer takes 0 arguments, not 1".to_string()
             )]
         );
-        // No answers: the prompt asks, and its label names what it wants.
         workspace
             .invoke(
                 &mut store,
@@ -1143,7 +1068,6 @@ mod tests {
 
     /// `kill-buffer` (C-x k) asks which buffer, this one by default: Enter
     /// alone closes this view, and a name asks the host for that buffer.
-    /// Typing the answer never touches the document.
     #[test]
     fn kill_buffer_asks_and_defaults_to_this_buffer() {
         let (mut store, mut workspace, mut view, document) = editor("keep");
@@ -1170,7 +1094,6 @@ mod tests {
             }]
         );
         assert!(!view.minibuffer_active());
-        // C-g abandons the prompt.
         keys(&mut store, &mut workspace, &mut view, "C-x k C-g");
         assert!(!view.minibuffer_active());
         assert_eq!(text(&store, document), "keep");
@@ -1179,7 +1102,7 @@ mod tests {
 
     /// `save-buffers-kill-terminal` (C-x C-c) closes the view; `finish-edit`
     /// (C-c C-c, C-x #) and `abort-edit` (C-c C-k) ask the host to answer
-    /// the client waiting on the edit. None of them edits the text.
+    /// the client waiting on the edit.
     #[test]
     fn closing_keys_ask_the_host_to_close_the_view() {
         let (mut store, mut workspace, mut view, document) = editor("text");
@@ -1200,7 +1123,7 @@ mod tests {
 
     /// `beginning-of-buffer` (M-<) and `end-of-buffer` (M->) go to the ends
     /// and leave the mark where the caret was, so C-u C-SPC comes back; an
-    /// active region stretches instead. The GUI spellings (`M-S-,`) do too.
+    /// active region stretches instead.
     #[test]
     fn buffer_ends_leave_the_mark_behind() {
         let (mut store, mut workspace, mut view, _) = editor("alpha\nbeta\ngamma");
@@ -1213,7 +1136,6 @@ mod tests {
         assert_eq!(view.selections, [Selection::caret(7)]);
         keys(&mut store, &mut workspace, &mut view, "M-S-,");
         assert_eq!(view.selections, [Selection::caret(0)]);
-        // With the mark active the region stretches to the end.
         view.selections = vec![Selection::caret(7)];
         keys(&mut store, &mut workspace, &mut view, "C-Space M-<");
         assert_eq!(view.selections, [Selection { anchor: 7, head: 0 }]);
@@ -1245,14 +1167,12 @@ mod tests {
             keys(&mut store, &mut workspace, &mut view, "C-l");
             assert_eq!(top(&view), expected);
         }
-        // Another command in between starts the cycle over at the middle.
         keys(&mut store, &mut workspace, &mut view, "C-l C-f C-b C-l");
         assert_eq!(top(&view), 45);
         keys(&mut store, &mut workspace, &mut view, "C-u 0 C-l");
         assert_eq!(top(&view), 50);
         keys(&mut store, &mut workspace, &mut view, "C-u 3 C-l");
         assert_eq!(top(&view), 47);
-        // Near the end the view stops at its last full screen.
         view.selections = vec![Selection::caret(text.len())];
         keys(&mut store, &mut workspace, &mut view, "C-l C-l");
         assert_eq!(top(&view), 91);
@@ -1323,9 +1243,7 @@ mod tests {
 
     /// Every kill, and `kill-ring-save`, hands the kill ring's newest entry
     /// to the face for the system clipboard: the joined entry after a kill
-    /// that appends, and a macro's once, when it is done. An input without
-    /// Clipboard authority (a control client's) kills into the ring alone,
-    /// and nothing it killed reaches the clipboard later.
+    /// that appends, and a macro's once, when it is done.
     #[test]
     fn kills_reach_the_clipboard_only_with_clipboard_authority() {
         let clipboard = |effects: Vec<EditorEffect>| {
@@ -1375,8 +1293,7 @@ mod tests {
 
     /// A command runs only when the input carries every authority it needs,
     /// whichever path runs it: its key, M-x, an [`Invocation`] or a macro
-    /// that replays it. A refused command changes nothing and takes its
-    /// pending argument with it; a granted one beside it still runs.
+    /// that replays it.
     #[test]
     fn a_command_runs_only_with_the_authority_it_needs() {
         let refusal = || {
@@ -1386,7 +1303,6 @@ mod tests {
             )]
         };
         let (mut store, mut workspace, mut view, document) = editor("copy this text");
-        // A macro recorded while every class was granted.
         keys(
             &mut store,
             &mut workspace,
@@ -1407,7 +1323,6 @@ mod tests {
         );
         assert_eq!(view.prefix_argument, None);
         assert!(view.mark_active, "the region survives the refusal");
-        // M-x reaches the same check.
         keys(&mut store, &mut workspace, &mut view, "M-x");
         workspace
             .insert_text(&mut store, &mut view, "kill-ring-save")
@@ -1426,7 +1341,6 @@ mod tests {
                 .unwrap(),
             refusal()
         );
-        // The macro needs what its steps need.
         assert_eq!(
             workspace.authorities(EditorCommand::PlayMacro),
             [
@@ -1443,7 +1357,6 @@ mod tests {
             )]
         );
         assert!(workspace.kill_ring.is_empty());
-        // What the grant holds still runs.
         keys(&mut store, &mut workspace, &mut view, "C-w");
         assert_eq!(text(&store, document), "copy  text");
         workspace.granted = CommandAuthority::ALL.to_vec();
@@ -1483,7 +1396,6 @@ mod tests {
             }]
         );
         assert!(view.mark_active);
-        // C-g drops the region; the mark ring still has the mark at 4.
         keys(&mut store, &mut workspace, &mut view, "C-g C-e C-x C-x");
         assert_eq!(
             view.selections,
@@ -1512,7 +1424,6 @@ mod tests {
             workspace.kill_ring.front().map(String::as_str),
             Some("all\nof it")
         );
-        // The mark the caret left (at 5) moved with the kill.
         assert_eq!(
             workspace.global_mark_ring.front().map(|mark| mark.offset),
             Some(0)
@@ -1543,7 +1454,6 @@ mod tests {
             assert_eq!(view.selections, [Selection::caret(expected)]);
             assert!(!view.mark_active);
         }
-        // M-x pop-to-mark-command is the same command.
         workspace
             .execute(&mut store, &mut view, EditorCommand::PopMark)
             .unwrap();
@@ -1573,11 +1483,9 @@ mod tests {
             .unwrap();
         assert_eq!(text(&store, document), "a\n\n\n\n\n\nb");
         assert_eq!(view.selections, [Selection::caret(4)]);
-        // One undo takes a whole C-u 2 Enter back.
         keys(&mut store, &mut workspace, &mut view, "C-/");
         assert_eq!(text(&store, document), "a\n\n\n\nb");
 
-        // In a CRLF file the line breaks are CRLFs.
         let (mut store, mut workspace, mut view, document) = editor("ab\r\ncd\r\n");
         view.selections = vec![Selection::caret(1)];
         keys(&mut store, &mut workspace, &mut view, "C-o");
@@ -1593,11 +1501,9 @@ mod tests {
     /// A CRLF line's text ends before its `\r` (design §2.2 keeps the
     /// ending byte-exact): C-e, C-n and C-p stop there, C-k kills the text
     /// and then the whole CRLF, and C-t at the end swaps the two characters
-    /// before it. None of them parks a caret between `\r` and `\n`, where a
-    /// typed character would split the line ending.
+    /// before it.
     #[test]
     fn crlf_line_ends_stop_before_the_carriage_return() {
-        // a0 b1 c2 \r3 \n4 d5 \r6 \n7 e8 f9 g10
         let (mut store, mut workspace, mut view, document) = editor("abc\r\nd\r\nefg");
         keys(&mut store, &mut workspace, &mut view, "C-e");
         assert_eq!(view.selections, [Selection::caret(3)]);
@@ -1648,7 +1554,6 @@ mod tests {
             keys(&mut store, &mut workspace, &mut view, "C-t"),
             [EditorEffect::Status("Beginning of buffer".to_string())]
         );
-        // A combining mark moves with its base.
         let (mut store, mut workspace, mut view, document) = editor("e\u{301}x");
         view.selections = vec![Selection::caret(3)];
         keys(&mut store, &mut workspace, &mut view, "C-t");
@@ -1678,7 +1583,7 @@ mod tests {
 
     /// `fill-paragraph` (M-q) refills the paragraph at the caret to the fill
     /// column: a comment as a comment, a list item hanging under its text,
-    /// and the next paragraph left alone. The caret stays on its character.
+    /// and the next paragraph left alone.
     #[test]
     fn fill_paragraph_fills_to_the_fill_column() {
         let text = "Subject\n\nThe body of a commit message that someone typed as one very long line without any breaks.\n\nNext paragraph.\n";
@@ -1693,11 +1598,9 @@ mod tests {
             "Subject\n\nThe body of a commit message\nthat someone typed as one very\nlong line without any breaks.\n\nNext paragraph.\n"
         );
         assert_eq!(&filled[view.primary_selection().head..][..5], "meone");
-        // Filling again changes nothing.
         let seq = store.snapshot(document).unwrap().seq;
         keys(&mut store, &mut workspace, &mut view, "M-q");
         assert_eq!(store.snapshot(document).unwrap().seq, seq);
-        // One undo takes the fill back.
         keys(&mut store, &mut workspace, &mut view, "C-/");
         assert_eq!(text_of(&store, document), text);
 
@@ -1720,8 +1623,6 @@ mod tests {
             "- an item whose text\n  is long enough to\n  wrap\n- a second item\n"
         );
 
-        // A CRLF file's lines keep their CRLF: the `\r` is the line's
-        // ending, never a space between words, and the new breaks are CRLFs.
         let crlf = "aaa bbb\r\nccc ddd\r\n\r\nnext\r\n";
         let (mut store, mut workspace, mut view, document) = editor(crlf);
         keys(&mut store, &mut workspace, &mut view, "M-q");
@@ -1729,15 +1630,12 @@ mod tests {
         workspace.options.fill_column = 8;
         keys(&mut store, &mut workspace, &mut view, "M-q");
         assert_eq!(text_of(&store, document), crlf);
-        // A last line with no ending breaks as the document's first line
-        // does, and a stray `\r` at the very end is no word.
         let (mut store, mut workspace, mut view, document) = editor("x\r\n\r\nthree four\r");
         workspace.options.fill_column = 6;
         view.selections = vec![Selection::caret(6)];
         keys(&mut store, &mut workspace, &mut view, "M-q");
         assert_eq!(text_of(&store, document), "x\r\n\r\nthree\r\nfour\r");
 
-        // A blank line has no paragraph.
         let (mut store, mut workspace, mut view, _) = editor("a\n\nb");
         view.selections = vec![Selection::caret(2)];
         assert_eq!(
@@ -1800,7 +1698,6 @@ mod tests {
         keys(&mut store, &mut workspace, &mut view, "M-1 M-0 C-b");
         assert_eq!(view.primary_selection().head, 5);
         assert_eq!(view.prefix_hud, None);
-        // Run without a digit key, it has no digit to take.
         assert_eq!(
             workspace
                 .execute(&mut store, &mut view, EditorCommand::DigitArgument)

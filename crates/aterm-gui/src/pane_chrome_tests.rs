@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-
 use std::time::Duration;
 
 use super::*;
@@ -50,8 +49,7 @@ fn every_arm_set_has_its_light_box_glyph() {
 }
 
 /// The Fluent gap is the terminal's own ground with no glyph until the seam
-/// pass draws it: no seam-tone slab. NEGATIVE CONTROL: the Classic gap is the
-/// slab, ground and ink both the seam tone.
+/// pass draws it: no seam-tone slab.
 #[test]
 fn a_fluent_gap_is_the_terminal_ground_and_a_classic_one_the_slab() {
     let theme = Theme::default();
@@ -70,7 +68,7 @@ fn a_fluent_gap_is_the_terminal_ground_and_a_classic_one_the_slab() {
 /// Two panes side by side, each under its header: the gap column is one
 /// hairline from the grid's top to its bottom, in the seam ink (the focus ring
 /// is not a cell colour), on the header band's ground beside the header row
-/// and the terminal's below it. No pane cell is touched.
+/// and the terminal's below it.
 #[test]
 fn a_side_by_side_split_gets_one_seam_hairline() {
     let (rows, cols) = (5, 11);
@@ -92,9 +90,7 @@ fn a_side_by_side_split_gets_one_seam_hairline() {
     }
 }
 
-/// A tee: a full-height left pane beside a right column split in two. The
-/// hairlines join (`├`) where the horizontal gap meets the vertical one and
-/// run to the grid's right edge, all in the seam ink.
+/// A tee: a full-height left pane beside a right column split in two.
 #[test]
 fn a_tee_joins_its_hairlines() {
     let (rows, cols) = (7, 11);
@@ -105,7 +101,6 @@ fn a_tee_joins_its_hairlines() {
             cell_box(0, 6, 3, 5),
             cell_box(4, 6, 3, 5),
         ],
-        // The bottom-right pane's header faces the left pane's content.
         headers: vec![cell_box(4, 6, 1, 5)],
     };
     stamp_seam_lines(&mut dst, rows, cols, INKS, &layout, &[]);
@@ -133,13 +128,7 @@ fn covered(quads: &[GlowQuad]) -> std::collections::BTreeSet<(u16, u16)> {
         .collect()
 }
 
-/// THE FOCUS RING SAYS WHICH SIDE HAS FOCUS. Two panes side by side at the
-/// 9×23 Windows cell (hairline at the gap's pixel 4): the left pane focused
-/// puts one accent line at the gap's pixel 2, the right pane at pixel 6, each
-/// the whole allocation tall, two pixels from the text and one stroke from
-/// the hairline; nothing on the window's edges. NEGATIVE CONTROL: the two
-/// focus states draw different pixels (the 2026-10-18 build inked the shared
-/// hairline itself, the same pixels whichever pane had focus).
+/// THE FOCUS RING SAYS WHICH SIDE HAS FOCUS.
 #[test]
 fn the_ring_is_on_the_focused_panes_side_of_the_hairline() {
     let (rows, cols) = (30, 111);
@@ -194,7 +183,6 @@ fn the_ring_is_on_the_focused_panes_side_of_the_hairline() {
         covered(&right),
         "CONTROL: the ring moves with focus"
     );
-    // A lone pane borders no divider: no ring.
     assert!(ring_of(cell_box(0, 0, rows, cols)).is_empty());
 }
 
@@ -204,7 +192,6 @@ fn the_ring_is_on_the_focused_panes_side_of_the_hairline() {
 #[test]
 fn the_ring_turns_the_inner_corner_at_every_scale() {
     for (cw, ch, t) in [(9u32, 23u32, 1u32), (18, 46, 2)] {
-        // Top-left of a 2x2 grid of 9x40 panes: gaps at column 40, row 9.
         let mut out = Vec::new();
         push_focus_ring(
             &mut out,
@@ -243,17 +230,7 @@ fn the_ring_turns_the_inner_corner_at_every_scale() {
     }
 }
 
-/// THE RING MEETS THE HEADER'S RULE IN AN L. Two panes side by side, each
-/// under a header, either focused, at the 100%, 150% and 200% Windows cells:
-/// the ring's side line starts on the top row of the header's accent rule
-/// (`crate::pane_header::focus_rule_rows`) and runs to the grid's foot, and on
-/// the rule's rows the ring fills every pixel between that line and the
-/// pane's edge, where the rule itself begins, so the two strokes join; nothing
-/// of the ring stands above the rule or past the line. In a 2×2 grid a lower
-/// pane's header takes the place of the ring's top line. NEGATIVE CONTROL:
-/// without the header the ring runs up through the header row to its top and
-/// leaves the pixels between it and the pane's edge bare on the rule's rows
-/// (the 2026-10-18 judge's `focus-ring-header-corner-notch`: 2 px at 100%).
+/// THE RING MEETS THE HEADER'S RULE IN AN L.
 #[test]
 fn the_ring_meets_the_header_rule_in_an_l() {
     for (cw, ch) in [(9u32, 23u32), (13, 33), (14, 35), (18, 46)] {
@@ -263,7 +240,6 @@ fn the_ring_meets_the_header_rule_in_an_l() {
         let grid = (30, 111);
         let bottom = 30 * ch;
         let gap_x = 55 * cw;
-        // (allocation, the ring's line x, the pane's edge beside the gap)
         for (alloc, line_x, pane_edge) in [
             (cell_box(0, 0, 30, 55), gap_x + vl - 2 * t, gap_x),
             (cell_box(0, 56, 30, 55), gap_x + vl + 2 * t, gap_x + cw),
@@ -291,7 +267,6 @@ fn the_ring_meets_the_header_rule_in_an_l() {
                 px.iter().all(|&(x, _)| (lo..hi).contains(&x)),
                 "{what}: nothing past the line or into the pane"
             );
-            // CONTROL: the bare ring passes the rule with a notch.
             let old = covered_rects(&focus_ring_rects(bare(alloc), grid, (cw, ch)));
             assert!(old.contains(&(line_x, 0)), "{what}: CONTROL: from the top");
             let notch = (lo..hi).filter(|&x| !old.contains(&(x, at))).count();
@@ -300,7 +275,6 @@ fn the_ring_meets_the_header_rule_in_an_l() {
                 assert_eq!(notch, 2, "{what}: CONTROL: 2 px at 100%");
             }
         }
-        // A lower pane's header stands in for the ring's top line.
         let lower = FocusRing {
             alloc: cell_box(10, 56, 20, 55),
             header_row: Some(10),
@@ -345,9 +319,7 @@ fn a_retained_row_is_left_alone() {
 /// the gap column in the seam ink, inks no half-block, and rings the focused
 /// pane on its own side of the hairline, moving with focus and gone while the
 /// window is unfocused; Classic keeps its slab and ring
-/// (`app_render_active_pane_mark_compose_tests`). NEGATIVE CONTROL: the
-/// 2026-10-18 build inked the gap cells themselves in the ring colour while
-/// focused, so the divider read the same whichever pane had focus.
+/// (`app_render_active_pane_mark_compose_tests`).
 #[test]
 fn a_composed_fluent_split_has_a_hairline_gap_and_no_half_block() {
     with_split_chrome(SplitChrome::Fluent, || {
@@ -399,17 +371,10 @@ fn a_composed_fluent_split_has_a_hairline_gap_and_no_half_block() {
                 .copied()
                 .collect::<Vec<_>>()
         };
-        // The panes have headers: the ring starts on the focused header's
-        // rule (`the_ring_meets_the_header_rule_in_an_l`).
         let header = plan.leaves[1].header.map(CellBox::of).expect("headers");
         let lift = usize::from(app.chrome_rows(wid)) * ch;
         let (rule_at, rule_thick) = crate::pane_header::focus_rule_rows(ch as u32);
         let rule_top = lift + header.row * ch + rule_at as usize;
-        // The ring's vertical lines (a stroke wide), as pixel columns, read
-        // below the rule's rows: on them the L's fill between a line and its
-        // pane's edge is a stroke wide too in a cell seven strokes wide (the
-        // headless window's on macOS, where it read as a second line), and is
-        // no line.
         let below_rule = rule_top + rule_thick as usize;
         let ring_x = |app: &App| {
             ring_quads(app)
@@ -432,7 +397,6 @@ fn a_composed_fluent_split_has_a_hairline_gap_and_no_half_block() {
             "the focused (right) pane's side of the gap: {x} in {gap_x}..{}",
             gap_x + cw
         );
-        // Focus moves to the left pane: the ring crosses the hairline.
         let left_session = app
             .active_tree(wid)
             .expect("tree")
@@ -460,7 +424,6 @@ fn a_composed_fluent_split_has_a_hairline_gap_and_no_half_block() {
             "the focused (left) pane's side of the gap: {x} in {gap_x}..{}",
             gap_x + cw
         );
-        // Unfocused, the same gap is the plain seam and there is no ring.
         app.windows.get_mut(&wid).expect("window").focused = false;
         assert!(
             app.redraw_compose(
@@ -486,10 +449,7 @@ fn a_composed_fluent_split_has_a_hairline_gap_and_no_half_block() {
 /// A ROW OF PANE HEADERS IS ONE BAR ACROSS THE DIVIDER: in a composed Fluent
 /// split the gap cell of the header row wears the headers' own fill
 /// ([`SeamInks::band`], `crate::pane_header::header_colors`), whatever that
-/// fill is. NEGATIVE CONTROL: the tab strip's band tone, which the gap took
-/// before, is not the header's fill under the Fluent chrome, where the header
-/// sits on the pane's ground, so the gap stood in the header row as a grey
-/// notch.
+/// fill is.
 #[test]
 fn the_gap_between_two_headers_wears_their_fill() {
     with_split_chrome(SplitChrome::Fluent, || {
@@ -532,8 +492,6 @@ fn the_gap_between_two_headers_wears_their_fill() {
         assert_ne!(band, fill, "CONTROL: the band's tone is not the header's");
     });
 }
-
-// ---- Overlays ----------------------------------------------------------------------
 
 fn inputs() -> OverlayInputs {
     OverlayInputs {
@@ -606,8 +564,7 @@ fn max_alpha(quads: &[GlowQuad]) -> u8 {
 /// THE SCROLLBAR'S STATES: nothing at the live bottom; a scrolling pane's thumb
 /// at the active opacity, fading after the hold; a view parked in history keeps
 /// a quieter resting thumb; every quad in the window's right padding, none on a
-/// column of text. (The Fluent thin thumb paints each step at
-/// `scrollbar::rest_alpha`.)
+/// column of text.
 #[test]
 fn the_bar_is_hidden_live_active_while_scrolling_and_resting_while_parked() {
     let lit = |alpha: u8| scrollbar::rest_alpha(alpha, inputs().fluent);
@@ -619,7 +576,6 @@ fn the_bar_is_hidden_live_active_while_scrolling_and_resting_while_parked() {
     let (quads, fading) = frame(&mut overlay, &mut pill, &[pane(1, full, true, 0, 200)], t0);
     assert!(quads.is_empty() && !fading, "live and still: nothing");
 
-    // The view moves 20 lines up (history unchanged): the bar shows, active.
     let t1 = t0 + Duration::from_millis(16);
     let (quads, fading) = frame(&mut overlay, &mut pill, &[pane(1, full, true, 20, 200)], t1);
     assert!(fading, "a moving view fades");
@@ -633,13 +589,11 @@ fn the_bar_is_hidden_live_active_while_scrolling_and_resting_while_parked() {
         "in the padding, never over text: {quads:?}"
     );
 
-    // Long after the move: the parked view rests at the quieter opacity.
     let t2 = t1 + Duration::from_millis(5_000);
     let (quads, fading) = frame(&mut overlay, &mut pill, &[pane(1, full, true, 20, 200)], t2);
     assert!(!fading);
     assert_eq!(max_alpha(&quads), lit(scrollbar::ALPHA_REST));
 
-    // Output under the parked view moves offset and history together: no flash.
     let t3 = t2 + Duration::from_millis(16);
     let (quads, _) = frame(&mut overlay, &mut pill, &[pane(1, full, true, 25, 205)], t3);
     assert_eq!(
@@ -648,7 +602,6 @@ fn the_bar_is_hidden_live_active_while_scrolling_and_resting_while_parked() {
         "output is not reading"
     );
 
-    // Back to live: active, then nothing once it has faded.
     let t4 = t3 + Duration::from_millis(16);
     let (quads, _) = frame(&mut overlay, &mut pill, &[pane(1, full, true, 0, 205)], t4);
     assert_eq!(max_alpha(&quads), lit(scrollbar::ALPHA_ACTIVE));
@@ -658,15 +611,6 @@ fn the_bar_is_hidden_live_active_while_scrolling_and_resting_while_parked() {
 }
 
 /// THE RESTING THUMB IN A FLUENT GAP KEEPS A STROKE OF GROUND FROM THE RING.
-/// Two panes side by side, the left one parked in history (so its thumb rests
-/// in the divider gap), either pane focused, at the 100%, 150% and 200%
-/// Windows cells: the thumb is the thin indicator (`Metrics::fine`) over the
-/// hairline, opaque in the tone twice the resting opacity lays on the ground
-/// (so it is one tone over the line and the ground), and every ring pixel
-/// stands more than a stroke from every thumb pixel of its row, so at least a
-/// stroke of ground lies between them. NEGATIVE CONTROL: the same thumb
-/// centred on the line, as with no ring beside it, comes within a stroke of
-/// the ring on one side or the other at every scale (at 100% it touches it).
 #[test]
 fn a_resting_gap_thumb_keeps_a_stroke_of_ground_from_the_ring() {
     let ring_rgb = [0x50, 0xfa, 0x7b];
@@ -678,8 +622,6 @@ fn a_resting_gap_thumb_keeps_a_stroke_of_ground_from_the_ring() {
         let m = Metrics::for_cell(cw, ch);
         let line = 55 * cw + scrollbar::hairline_start(cw, m.stroke);
         let focused = |focus_left: bool| bare(if focus_left { left } else { right });
-        // The thumb's pixels, and what its body shows over the line, with
-        // or without the ring.
         let run = |focus_left: bool, ring: bool| {
             let mut overlay = PaneOverlay::default();
             let mut pill = crate::scroll_motion::PillFade::default();
@@ -718,7 +660,6 @@ fn a_resting_gap_thumb_keeps_a_stroke_of_ground_from_the_ring() {
                 .map(|q| (alpha, seen(q, INKS.line)));
             (covered(&thumb), body)
         };
-        // The ring's own pixels, wherever the thumb is.
         let ring_px = |focus_left: bool| {
             let mut out = Vec::new();
             push_focus_ring(
@@ -731,7 +672,6 @@ fn a_resting_gap_thumb_keeps_a_stroke_of_ground_from_the_ring() {
             );
             covered(&out)
         };
-        // The closest a thumb pixel comes to a ring pixel on the same row.
         let nearest = |ring: &std::collections::BTreeSet<(u16, u16)>,
                        thumb: &std::collections::BTreeSet<(u16, u16)>| {
             thumb
@@ -770,14 +710,7 @@ fn a_resting_gap_thumb_keeps_a_stroke_of_ground_from_the_ring() {
 
 /// ONE RESTING IDIOM IN A SPLIT (the Fluent chrome): two panes side by side,
 /// both parked in history, so the left pane's thumb rests in the divider gap
-/// and the right pane's in the window's padding. Both are the thin indicator
-/// at the same width showing the same tone on the ground, at 100% and 200%,
-/// and both widen under the pointer: the edge thumb to `Metrics::wide`, the
-/// gap thumb beside the focused pane's ring as far as the ring's far side
-/// lets it ([`scrollbar::wide_span`]). NEGATIVE CONTROL: the Classic chrome
-/// keeps its thin thumb at its own opacity in both places. (The 2026-10-18
-/// build drew a lit one-pixel line in the gap and a three-pixel pill at the
-/// plain opacity at the edge: the judge's `two-scrollbar-idioms-in-one-split`.)
+/// and the right pane's in the window's padding.
 #[test]
 fn a_split_rests_both_its_thumbs_in_one_idiom() {
     let (left, right) = (cell_box(0, 0, 30, 55), cell_box(0, 56, 30, 55));
@@ -793,8 +726,6 @@ fn a_split_rests_both_its_thumbs_in_one_idiom() {
             m,
         )
         .expect("gap lane");
-        // Each lane's thumb: (width, tone on the ground), with the pane
-        // `hover` under the pointer.
         let run = |fluent: bool, hover: Option<u64>| {
             let mut overlay = PaneOverlay {
                 hover,
@@ -826,9 +757,6 @@ fn a_split_rests_both_its_thumbs_in_one_idiom() {
                 | (u32::from(inputs.ring_rgb[1]) << 8)
                 | u32::from(inputs.ring_rgb[2]);
             let lane_of = |q: &GlowQuad| u32::from(q.x) >= edge.0;
-            // The thumb's body (its most opaque quads; the track under a
-            // widened thumb and the caps' rims are fainter): width, and what
-            // it shows on the ground.
             let thumb = |at_edge: bool| {
                 let quads: Vec<GlowQuad> = overlay
                     .pending
@@ -887,13 +815,7 @@ fn a_split_rests_both_its_thumbs_in_one_idiom() {
 
 /// THE WIDENED GAP THUMB LEAVES THE RING WHOLE (the Fluent chrome): two panes
 /// side by side, the left one parked in history and under the pointer, either
-/// pane focused, at the 100%, 150% and 200% Windows cells. No pixel of the
-/// widened thumb or its track lies on the ring's pixels, a stroke of ground
-/// lies between them on every row, and the thumb is one tone over the
-/// hairline. NEGATIVE CONTROL: with the ring left out of the overlays'
-/// inputs, the same widened bar is centred on the line and covers pixels the
-/// ring paints (the 2026-10-18 judge's `J4F-3-gap-thumb-hover-and-two-tone`:
-/// the ring turned #A2DFB1 under the thumb and #5BF682 under the track).
+/// pane focused, at the 100%, 150% and 200% Windows cells.
 #[test]
 fn a_hovered_gap_thumb_leaves_the_ring_whole() {
     let ring_rgb = [0x50, 0xfa, 0x7b];
@@ -902,7 +824,6 @@ fn a_hovered_gap_thumb_leaves_the_ring_whole() {
     for (cw, ch) in [(9u32, 23u32), (13, 33), (18, 46)] {
         let m = Metrics::for_cell(cw, ch);
         let focused = |focus_left: bool| bare(if focus_left { left } else { right });
-        // The bar's pixels and its thumb body's quads, the left pane hovered.
         let run = |focus_left: bool, ring: bool| {
             let mut overlay = PaneOverlay {
                 hover: Some(1),
@@ -959,9 +880,6 @@ fn a_hovered_gap_thumb_leaves_the_ring_whole() {
                 bar.is_disjoint(&ring),
                 "{cw} focus_left={focus_left}: the ring stays whole"
             );
-            // The ring's pixels by row, so each bar pixel meets only its own
-            // row's (test-run speed: a scan of the whole ring per bar pixel
-            // was nine tenths of this test).
             let mut ring_rows: std::collections::HashMap<u16, Vec<u16>> =
                 std::collections::HashMap::new();
             for &(rx, ry) in &ring {
@@ -1055,7 +973,6 @@ fn the_hovered_bar_widens_over_a_track() {
     });
     let (quads, _) = frame(&mut overlay, &mut pill, &[pane(1, full, true, 0, 200)], now);
     assert_eq!(max_alpha(&quads), scrollbar::ALPHA_DRAG);
-    // A drag whose pane has gone is dropped.
     let (_, _) = frame(&mut overlay, &mut pill, &[], now);
     assert!(overlay.drag.is_none() && overlay.hover.is_none());
 }
@@ -1162,14 +1079,12 @@ fn window_px(app: &App, wid: WindowId, gx: f64, gy: f64) -> (f64, f64) {
 
 /// THE POINTER: hovering the bar's gutter widens it; a press on the thumb
 /// grabs it and dragging up scrolls that pane into history; the release lets
-/// go; a press on the track above the thumb pages up. None of it reaches the
-/// grid as a selection.
+/// go; a press on the track above the thumb pages up.
 #[test]
 fn the_thumb_drags_its_pane_through_history_and_the_track_pages() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     app.config.scrollbar = Some(true);
-    // The Windows window padding, the gutter the bar draws in.
     app.windows.get_mut(&wid).expect("window").metrics.pad = 12;
     let session = app.front_terminal(wid).expect("front").session;
     let term = app.pool.get(session).expect("session").term.clone();
@@ -1205,7 +1120,6 @@ fn the_thumb_drags_its_pane_through_history_and_the_track_pages() {
         scrollbar::thumb(lane, facts.rect.rows as u32, facts.history, 0, m).expect("thumb");
     let x = f64::from(lane.right) - 3.0;
 
-    // Hover over the thumb.
     let (wx, wy) = window_px(&app, wid, x, f64::from(top + len / 2));
     assert!(
         app.scrollbar_pointer_motion(wid, wx, wy),
@@ -1213,7 +1127,6 @@ fn the_thumb_drags_its_pane_through_history_and_the_track_pages() {
     );
     assert_eq!(app.windows[&wid].pane_overlay.hover, Some(session));
 
-    // Grab and drag 200 px up.
     app.windows.get_mut(&wid).expect("window").last_cursor_px = (wx, wy);
     assert!(app.scrollbar_press(wid));
     assert!(app.windows[&wid].pane_overlay.drag.is_some());
@@ -1225,7 +1138,6 @@ fn the_thumb_drags_its_pane_through_history_and_the_track_pages() {
     assert!(app.windows[&wid].pane_overlay.drag.is_none());
     assert!(!app.windows[&wid].selecting, "no selection began");
 
-    // A press on the track above the (new) thumb pages up one screen less a line.
     refresh(&mut app);
     let before = crate::term_lock(&term).grid().display_offset();
     let (wx3, wy3) = window_px(&app, wid, x, f64::from(lane.top + 1));
@@ -1237,25 +1149,13 @@ fn the_thumb_drags_its_pane_through_history_and_the_track_pages() {
         (before + facts.rect.rows - 1).min(facts.history as usize)
     );
 
-    // Off the gutter: the grid's.
     let (wx4, wy4) = window_px(&app, wid, 10.0, f64::from(top));
     assert!(!app.scrollbar_pointer_motion(wid, wx4, wy4));
     assert_eq!(app.windows[&wid].pane_overlay.hover, None);
 }
 
 /// A RE-GRID LEAVES THE LAST FRAME'S BARS ANSWERING NOTHING: the bar laid and
-/// the pointer on its thumb. A font zoom re-grids the window — its cells grow,
-/// and the grid's right edge, where the bar is laid, with them — and until the
-/// next frame the pointer is read on the zoomed grid while the lane was laid
-/// with the last one's cell, inset and columns. Before that frame a motion
-/// there lights no bar and a press grabs none; the next frame lays the bar
-/// again at the zoomed grid's edge, where a motion lights it, and the pixel
-/// the old thumb was at is the grid's.
-///
-/// NEGATIVE CONTROLS: the zoom undone, the bar the frame laid answers the
-/// pointer; and the last frame's bar stamped as the zoomed grid's (no stamp,
-/// as before), the same motion lights it and a press grabs a thumb the zoomed
-/// grid lays nowhere under the pointer.
+/// the pointer on its thumb.
 #[test]
 fn a_regrid_leaves_the_last_frames_bars_answering_nothing() {
     let mut app = App::headless_for_test();
@@ -1275,7 +1175,6 @@ fn a_regrid_leaves_the_last_frames_bars_answering_nothing() {
         let plan = app.active_visible_leaf_plan(wid).expect("plan");
         app.refresh_pane_overlay_for_capture(wid, &plan, now);
     };
-    // The window pixel at the centre of the thumb the last frame laid.
     let thumb_px = |app: &App| {
         let inputs = app.windows[&wid].pane_overlay.inputs.expect("laid");
         let facts = app.windows[&wid].pane_overlay.facts()[0];
@@ -1318,17 +1217,13 @@ fn a_regrid_leaves_the_last_frames_bars_answering_nothing() {
     assert_eq!(laid, app.glass_grid(wid), "stamped with its grid");
     let (x, y) = thumb_px(&app);
 
-    // CONTROL: on the grid the bar was laid on, it answers.
     assert!(app.scrollbar_pointer_motion(wid, x, y), "CONTROL: lit");
     app.scrollbar_pointer_left(wid);
     assert!(press(&mut app, (x, y)), "CONTROL: its thumb grabbed");
 
-    // The zoom: no frame laid yet.
     let base = app.font_size;
     assert!(app.set_font_size_with(base + 4.0, |_| true));
     assert_ne!(app.glass_grid(wid), laid, "the zoom re-grids the window");
-    // CONTROL: the last bar stamped as the zoomed grid's, the stale lane
-    // answers the pointer.
     let zoomed = app.glass_grid(wid);
     set_laid(&mut app, zoomed);
     assert!(
@@ -1353,7 +1248,6 @@ fn a_regrid_leaves_the_last_frames_bars_answering_nothing() {
         "nor pages the pane"
     );
 
-    // The next frame lays the bar again on the zoomed grid.
     refresh(&mut app);
     assert_eq!(
         app.windows[&wid].pane_overlay.inputs.expect("laid").laid,
@@ -1373,10 +1267,7 @@ fn a_regrid_leaves_the_last_frames_bars_answering_nothing() {
 }
 
 /// THE ROW LAW (`docs/DESIGN-render-integrity-2026-09-28.md` §3, clause 1): the
-/// bar is a zero-row, zero-column surface. In a Fluent split, hovering an inner
-/// pane's bar in its divider gap, dragging that pane through history and
-/// letting go draws the bar (so the check judges something) and leaves every
-/// pane's grid and the window's grid exactly the size they were.
+/// bar is a zero-row, zero-column surface.
 #[test]
 fn the_bar_shows_hovers_and_drags_without_regridding_any_pane() {
     with_split_chrome(SplitChrome::Fluent, || {
@@ -1437,10 +1328,7 @@ fn the_bar_shows_hovers_and_drags_without_regridding_any_pane() {
         .expect("an inner lane");
         assert!(!lane.edge, "fixture: the left pane's bar is in the gap");
         let (top, len) = scrollbar::thumb(lane, r.rows as u32, facts.history, 0, m).expect("thumb");
-        // Through the window's own pointer handlers (what `CursorMoved` and
-        // `MouseInput` call), not the scrollbar's entry points.
         use aterm_window::event::{ElementState, MouseButton};
-        // On the resting thumb, centred on the divider's hairline.
         let (sx, sw) = scrollbar::span(lane, m.thin, m);
         let x = f64::from(sx) + f64::from(sw) / 2.0;
         let (wx, wy) = window_px(&app, wid, x, f64::from(top + len / 2));

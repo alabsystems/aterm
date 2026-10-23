@@ -10,9 +10,9 @@ use std::time::Duration;
 const HANG: Duration = Duration::from_secs(60);
 
 fn collect(stream: impl Read + Send + 'static) -> Result<Vec<u8>, CompleteOutputError> {
-    drain_stdout(stream)
+    drain_stdout(None, stream)
         .expect("the pure reader starts")
-        .collect(Instant::now() + HANG)
+        .collect(&Grace::at(Instant::now() + HANG))
 }
 
 /// A complete prefix followed by one injected read error (or one interrupted read first).
@@ -139,12 +139,12 @@ fn gated() -> (
 #[test]
 fn complete_stdout_refuses_a_still_open_stream_and_accepts_proven_completion() {
     let (input, entered, release, dropped) = gated();
-    let reader = drain_stdout(input).unwrap();
+    let reader = drain_stdout(None, input).unwrap();
     entered
         .recv_timeout(HANG)
         .expect("the reader reached the EOF gate");
     // The empty release channel proves no EOF is possible, regardless of scheduling.
-    let incomplete = reader.collect(Instant::now());
+    let incomplete = reader.collect(&Grace::at(Instant::now()));
     release.send(()).expect("release this owned reader");
     dropped
         .recv_timeout(HANG)
@@ -155,16 +155,65 @@ fn complete_stdout_refuses_a_still_open_stream_and_accepts_proven_completion() {
     ));
 
     let (input, entered, release, dropped) = gated();
-    let reader = drain_stdout(input).unwrap();
+    let reader = drain_stdout(None, input).unwrap();
     entered
         .recv_timeout(HANG)
         .expect("the second reader reached the gate");
     release.send(()).expect("permit actual EOF");
     assert_eq!(
-        reader.collect(Instant::now() + HANG).unwrap(),
+        reader.collect(&Grace::at(Instant::now() + HANG)).unwrap(),
         b"owned prefix"
     );
     dropped
         .recv_timeout(HANG)
         .expect("the completed reader released its input");
+}
+
+/// Stdout on a pipe no writer holds is complete past the grace, however late its reader
+/// runs; a reader still behind the grace on a held pipe is refused (above). Negative
+/// control: refusing at `by` whatever the pipe gives refuses this.
+#[cfg(unix)]
+#[test]
+fn complete_stdout_reads_a_pipe_no_writer_holds_to_its_end() {
+    use crate::deadline::tests::{Late, an_empty_group};
+    use std::io::Write as _;
+    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    writer.write_all(b"owned prefix").expect("write");
+    drop(writer);
+    let pipe = pipe_end(&reader);
+    let (release, held) = mpsc::channel();
+    let drain = drain_stdout(pipe, Late { held, reader }).expect("reader");
+    // An empty group: a child another test's thread forks meanwhile, holding a copy of the
+    // writer until its exec, is read past too.
+    let grace = Grace {
+        by: Instant::now(),
+        until: Instant::now() + HANG,
+        group: Some(an_empty_group()),
+    };
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = release.send(());
+    });
+    assert_eq!(drain.collect(&grace).unwrap(), b"owned prefix");
+}
+
+/// Stdout on a pipe only something outside the exited child's group holds is complete
+/// once that holder lets go, within the call's deadline. Negative control: refusing at
+/// `by` refuses this.
+#[cfg(unix)]
+#[test]
+fn complete_stdout_reads_a_pipe_held_outside_the_childs_group_until_it_lets_go() {
+    use crate::deadline::tests::{an_empty_group, lets_go};
+    use std::io::Write as _;
+    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    writer.write_all(b"one ").expect("write");
+    let pipe = pipe_end(&reader);
+    let drain = drain_stdout(pipe, reader).expect("reader");
+    let grace = Grace {
+        by: Instant::now(),
+        until: Instant::now() + HANG,
+        group: Some(an_empty_group()),
+    };
+    lets_go(writer, b"two");
+    assert_eq!(drain.collect(&grace).unwrap(), b"one two");
 }

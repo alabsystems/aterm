@@ -1,29 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The band's painter: its structure, decided in the engine so each host stays thin and a
-//! second host (the web) paints the same band.
-//!
-//! `paint` turns one [`Presentation`] under one [`BandMotion`] frame into one `RowPaint`
-//! per band row: which character goes in which cell, in which word-ink slot (`Ink`) or
-//! chip form (`ChipFace`), bold or not, with which drawn [`Icon`]; which columns lie on the
-//! fill's side, which cell the fill's edge splits, which cells a chip keeps for its own
-//! ground or ring; and every surface tone as a [`FineTone`] mapped onto the window's pixels
-//! through its [`Geometry`] ([`MeterSpan`]). Nothing here is a colour: the resolver maps
-//! each slot and tone onto a palette, and anything decided by an RGB value stays there (a
-//! glint drawn in the rail, the pastel edge line, a Fault wash's side hold, every floor).
-//!
-//! # The grammar
-//!
-//! Every cell starts `Face::Blank` (the label ink on the ground, never floored), then the
-//! row is written in one order (glyph, title, the ` · ` joint, excerpt, percent, elapsed
-//! and ETA slots, stats, load words, capsules), each write minting a fresh cell
-//! (`Cell::text_presentation` false but for the glyph's). A time slot clears its whole
-//! width to its ink. The band's measure is one `char` per cell, so a `Cell` carries no
-//! width. A host reads the band through `ink::paint_band`, which paints and resolves it,
-//! and keeps from this module only the [`Geometry`] (with [`Geometry::cell_at`] for its
-//! hit test), the [`Hover`], the drawn [`Icon`], the [`MeterSpan`] and the repaint key
-//! ([`band_fp`], [`BandKey`]).
+//! Band row painter mapping [`Presentation`] and [`BandMotion`] frames onto cells and pixel tones.
 
 use crate::animate::{Anim, BandMotion, FineTone, ROW, RowMotion, Surface, Tone};
 use crate::center::EchoKind;
@@ -31,23 +9,19 @@ use crate::glass::{CapsuleLayout, CapsuleRole, Presentation, RowKind, RowLayout}
 use crate::model::{ActionIndex, Severity};
 use crate::{FAILED_WORD, STALLED_WORD};
 
-/// Where a window's band cells sit on its glass, in device px: what maps a meter's fill
-/// onto the window's width rather than the grid's. Field order is part of the host's
-/// repaint key, which hashes this value.
+/// Window pixel geometry for mapping a band meter across the window width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Geometry {
-    /// The window's full width (the swapchain / softbuffer surface), px.
+    /// Full window width in pixels.
     pub win_w: usize,
-    /// Window x of column 0's left edge: the frame's left gutter plus the
-    /// leading remainder band.
+    /// Window x-coordinate of column 0's left edge.
     pub cells_x: usize,
-    /// One cell's width, px.
+    /// Width of one cell in pixels.
     pub cell_w: usize,
 }
 
 impl Geometry {
-    /// Unit cells and no gutters: the fill maps onto the columns alone. The
-    /// geometry of a caller that has no window (painter tests).
+    /// Geometry with unit cells and no gutters.
     #[inline]
     #[must_use]
     pub const fn cells_only(cols: usize) -> Self {
@@ -58,10 +32,7 @@ impl Geometry {
         }
     }
 
-    /// The cell column under pixel `x`, in the same space as [`Geometry::cells_x`] (the
-    /// host's hit test). A pixel left of column 0 (the leading gutter) is column 0, a zero
-    /// cell width counts as one pixel, and a pixel past the last column is not clamped:
-    /// the row's layout knows its width.
+    /// Cell column under window pixel `x`, saturating at the row ends.
     #[inline]
     #[must_use]
     pub const fn cell_at(self, x: usize) -> usize {
@@ -70,22 +41,17 @@ impl Geometry {
     }
 }
 
-/// Which window pixels a `cols`-wide metered row's column `x` stands for: its own cell,
-/// `[cells_x + x·cell_w, cells_x + (x+1)·cell_w)`, the first column also the gutter and
-/// remainder band before it and the last the ones after it, out to the window's edges. So
-/// the whole window is the meter: 0 % is an empty track, 100 % lights the window edge to
-/// edge, 50 % is its middle, and the one cell under the fill's edge takes
-/// `mix(track, fill, coverage)` of its span ([`Surface::span`]).
+/// Window-pixel mapping for a `cols`-wide metered row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MeterSpan {
-    /// The window the row is mapped onto.
+    /// Window geometry.
     pub geom: Geometry,
-    /// The row's width in columns.
+    /// Row width in columns.
     pub cols: usize,
 }
 
 impl MeterSpan {
-    /// Column `x`'s window-pixel span `[x0, x1)` (see the type doc).
+    /// Window-pixel span `[x0, x1)` for column `x` (including adjacent gutters at the ends).
     #[inline]
     #[must_use]
     pub(crate) fn px(self, x: usize) -> (u64, u64) {
@@ -100,7 +66,7 @@ impl MeterSpan {
         (x0 as u64, x1 as u64)
     }
 
-    /// The window's width the fractions are mapped onto.
+    /// Total window width in pixels.
     #[inline]
     #[must_use]
     pub(crate) fn win_w(self) -> u64 {
@@ -108,8 +74,7 @@ impl MeterSpan {
         g.win_w.max(g.cells_x + self.cols * g.cell_w.max(1)) as u64
     }
 
-    /// Column `x`'s tone on `surface`, in bytes (the tests' reading; the
-    /// painter reads [`MeterSpan::fine`]).
+    /// Byte-quantized [`Tone`] for column `x` on `surface`.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn tone(self, surface: &Surface, x: usize) -> Tone {
@@ -117,8 +82,7 @@ impl MeterSpan {
         surface.span(x0, x1, self.win_w())
     }
 
-    /// Column `x`'s tone on `surface` to 1/256 of a step: what a host mixes from, rounding
-    /// each cell's colour once.
+    /// Sub-step [`FineTone`] (1/256 step) for column `x` on `surface`.
     #[inline]
     #[must_use]
     pub fn fine(self, surface: &Surface, x: usize) -> FineTone {
@@ -127,9 +91,7 @@ impl MeterSpan {
     }
 }
 
-/// The width of a pastel fill's darker edge line on a window whose cells are `cell_w`
-/// pixels wide: about an eighth of a cell (one pixel on a 1x cell, two on a Retina one),
-/// never under one.
+/// Width in pixels of a pastel fill's darker edge line for cell width `cell_w`.
 #[inline]
 #[must_use]
 pub(crate) const fn edge_line_px(cell_w: usize) -> usize {
@@ -137,40 +99,28 @@ pub(crate) const fn edge_line_px(cell_w: usize) -> usize {
     if w > 1 { w } else { 1 }
 }
 
-/// What the pointer is on within one band row.
+/// Hovered element within a band row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HoverTarget {
-    /// The row body: a press opens Details, so the `Details ›` chip lights.
+    /// Row body (opens Details).
     Body,
-    /// One capsule, by its action.
+    /// Action capsule at the given index.
     Capsule(ActionIndex),
 }
 
-/// The per-window hover state a paint reads: which row, and what on it.
+/// Per-window band hover state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Hover {
-    /// The band row (0 = topmost), narrow on purpose — the band has three.
+    /// Band row index (0 = topmost).
     pub row: u8,
-    /// Body or capsule.
+    /// Hovered target within the row.
     pub target: HoverTarget,
 }
 
-/// What one view's painted band rows were built from, `(center fingerprint at cols, cols,
-/// inks key, hover, window geometry, motion fingerprint)`: the paint cache key of
-/// [`crate::drive::View::paint`], which reads the same terms [`band_fp`] folds. The inks
-/// key hashes the resolved `BandInks` and the forced-palette flag (a key on the theme
-/// alone would miss a High Contrast toggle); the motion term is
-/// [`BandMotion::fingerprint`].
+/// Cache key for painted band rows.
 pub type BandKey = (u64, usize, u64, Option<Hover>, Geometry, u64);
 
-/// The band's repaint term: the center's fingerprint at `cols`, the window's hover, the
-/// window geometry a full-width meter or a comet is mapped onto (a resize that keeps the
-/// column count still moves its lit cells) and the motion frame's fingerprint
-/// ([`BandMotion::fingerprint`]). Exactly `0` with no row committed, so an idle key is
-/// byte-identical to the no-band path; else nonzero, and moved by a hover change and by a
-/// motion frame that draws something new. The motion term is folded only when nonzero, so
-/// a motion-free band's key does not move with the clock. The geometry is hashed with the
-/// std hasher's fixed keys, so a key is the same number on every run.
+/// Repaint fingerprint combining `center_fp`, `hover`, `geom`, and `motion`.
 #[must_use]
 pub fn band_fp(center_fp: u64, hover: Option<Hover>, geom: Geometry, motion_fp: u64) -> u64 {
     if center_fp == 0 {
@@ -190,8 +140,6 @@ pub fn band_fp(center_fp: u64, hover: Option<Hover>, geom: Geometry, motion_fp: 
                 HoverTarget::Body => 0x100,
                 HoverTarget::Capsule(k) => 0x200 | u64::from(k.0),
             };
-            // The presence bit sits below the target: OR-ed into the target itself it
-            // would make Capsule(2j) and Capsule(2j+1) on one row the same key.
             (u64::from(row) << 16) | (t << 1) | 1
         }
     };
@@ -206,10 +154,7 @@ pub fn band_fp(center_fp: u64, hover: Option<Hover>, geom: Geometry, motion_fp: 
     fp | 1
 }
 
-/// One of the band's drawn icons: the renderer draws it in the cell's ink instead of a
-/// font's glyph, the character kept in the cell. A mirror of the renderer's own table
-/// (`aterm_core::render::BandIcon`, which this crate does not link); the host's parity test
-/// holds the two together over every `char`.
+/// Drawn vector icon replacing the glyph cell's font character.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Icon {
     /// `ℹ`.
@@ -241,8 +186,7 @@ pub enum Icon {
 }
 
 impl Icon {
-    /// The icon that stands in for `ch`, the band's glyph; `None` for any
-    /// character outside the band's closed set (it keeps its font glyph).
+    /// Drawn [`Icon`] corresponding to band glyph `ch`, if any.
     #[inline]
     #[must_use]
     pub const fn for_char(ch: char) -> Option<Self> {
@@ -265,9 +209,7 @@ impl Icon {
     }
 }
 
-/// A word's ink slot: which of the band's inks it wears before the host floors it against
-/// the ground under it. The choice of slot is the painter's (a warning's words, a stall,
-/// the overflow link's lit state); the host maps each slot 1:1 onto its palette.
+/// Semantic word-ink slot before contrast flooring.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Ink {
     /// The band's quiet ink: an excerpt, stats, elapsed words.
@@ -282,7 +224,7 @@ pub(crate) enum Ink {
     Accent,
 }
 
-/// How a chip with its own face is drawn.
+/// Visual style of a capsule chip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ChipForm {
     /// Its own fill: the band, the track or the accent.
@@ -294,7 +236,7 @@ pub(crate) enum ChipForm {
     Forced,
 }
 
-/// A chip cell's face: what the host resolves to its `(ink, fill)`.
+/// Capsule cell face parameters resolved by the host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ChipFace {
     /// The chip's role.
@@ -307,7 +249,7 @@ pub(crate) struct ChipFace {
     pub form: ChipForm,
 }
 
-/// What a cell's ink and ground resolve from.
+/// Cell ink and background source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Face {
     /// The band's label ink on the ground under the cell, never floored:
@@ -320,7 +262,7 @@ pub(crate) enum Face {
     Chip(ChipFace),
 }
 
-/// One painted cell.
+/// One painted band cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Cell {
     /// The character (one per cell: the band's measure).
@@ -342,8 +284,7 @@ impl Cell {
     };
 }
 
-/// Which ink a row's fill wears: the meter's, or `warn` on a Warn/Error row (under an
-/// OS-forced palette always the meter's, its highlight).
+/// Meter fill palette slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Fill {
     /// The meter ink (the cursor accent).
@@ -352,7 +293,7 @@ pub(crate) enum Fill {
     Warn,
 }
 
-/// The row's surface as its words' ink plan reads it.
+/// Surface kind used by the row's word-ink contrast plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum RowSurface {
     /// No surface: the band's own inks.
@@ -371,8 +312,7 @@ pub(crate) enum RowSurface {
     },
 }
 
-/// One column of a metered row: its span's mean tone (the lift as the
-/// surface has it) and whether it lies on the fill's side.
+/// Per-column mean [`FineTone`] and fill-side flag on a metered row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Column {
     /// The mean tone over the column's window pixels.
@@ -382,8 +322,7 @@ pub(crate) struct Column {
     pub on_fill: bool,
 }
 
-/// The one cell the fill's edge crosses: its glyph drawn in the fill side's ink left of
-/// `x` and its own right of it.
+/// Cell crossed by the meter fill edge and its split pixel coordinates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Split {
     /// The cell.
@@ -394,9 +333,7 @@ pub(crate) struct Split {
     pub under_px: usize,
 }
 
-/// A pastel fill's darker edge line: the window pixels `[first, end)` it is drawn over,
-/// and each pixel's share of it (the line's coverage of the pixel times the fill's own
-/// strength there, 0–1).
+/// Window pixel range and per-pixel coverage for a pastel fill's edge line.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct EdgeLine {
     /// First window pixel.
@@ -407,7 +344,7 @@ pub(crate) struct EdgeLine {
     pub coverage: Vec<(usize, f64)>,
 }
 
-/// One band row at one motion frame, before any colour.
+/// Painted band row at one motion frame prior to palette resolution.
 #[allow(
     clippy::struct_excessive_bools,
     reason = "independent facts of one row the resolver reads — forced palette, busy, drawn to the pixel — each set once by the painter"
@@ -449,8 +386,7 @@ pub(crate) struct RowPaint<'a> {
 }
 
 impl RowPaint<'_> {
-    /// Every window pixel's tone, left to right, and whether it lies on the
-    /// fill's side (a Fault's wash counts as fill) — the raster's pass.
+    /// Per-window-pixel `(FineTone, on_fill)` iterator across the row.
     pub(crate) fn pixels(&self) -> impl Iterator<Item = (FineTone, bool)> + '_ {
         let w = self.span.win_w();
         (0..w).map(move |xw| {
@@ -459,9 +395,7 @@ impl RowPaint<'_> {
         })
     }
 
-    /// The pastel edge line's pixels, where a bar drawn to the pixel ends
-    /// inside the row — the host draws it where its fill wears a palette
-    /// with an edge ink.
+    /// Pastel edge line pixel coverage when a pixel-drawn bar ends inside the row.
     #[must_use]
     pub(crate) fn edge_line(&self) -> Option<EdgeLine> {
         let q = self.surface.edge?;
@@ -470,7 +404,6 @@ impl RowPaint<'_> {
         }
         let unit = u64::from(ROW);
         let win_w = self.span.win_w();
-        // A share of one pixel, `v` of `unit`.
         let share = |v: u64| f64::from(u32::try_from(v).unwrap_or(u32::MAX)) / f64::from(ROW);
         let exact = u64::from(q) * win_w;
         let width = u64::try_from(edge_line_px(self.span.geom.cell_w)).unwrap_or(1) * unit;
@@ -488,8 +421,6 @@ impl RowPaint<'_> {
             if line == 0 || filled == 0 {
                 continue;
             }
-            // The fill's strength at this pixel: its coverage over the share
-            // of the pixel left of the edge.
             let t = self.surface.span_fine(p, p + 1, win_w);
             let strength = (f64::from(t.fill) / (255.0 * 256.0) / share(filled)).clamp(0.0, 1.0);
             if let Ok(px) = usize::try_from(p) {
@@ -518,11 +449,7 @@ static STILL: RowMotion = RowMotion {
     anim: Anim::None,
 };
 
-/// Paint every committed row of `p`, top to bottom, at one motion frame:
-/// `hover` lights the chip under the pointer (or the body's `Details ›`) on
-/// its row, `geom` maps each surface onto the window, and `forced` says an
-/// OS-forced palette is up (the host's High Contrast latch, read once per
-/// paint — never derived from the look).
+/// Paint all committed rows of `p` at `motion` for `geom` and `hover`.
 #[must_use]
 pub(crate) fn paint<'a>(
     p: &Presentation,
@@ -630,11 +557,6 @@ struct ChipRow {
 
 /// One chip over its `width` cells from `col`: the pad cells carry the fill (or, forced,
 /// the brackets), the text sits between them.
-///
-/// On a metered row a resting Secondary, every `Details ›` and every forced chip (High
-/// Contrast separates surfaces with borders) carry no fill of their own and ride the meter
-/// like words; a Primary is outlined where the row is drawn to the pixel and keeps a
-/// ground of its own elsewhere on a metered row. A lit chip keeps its hover fill.
 fn capsule(cells: &mut Cells, cap: &CapsuleLayout, lit: bool, row: ChipRow) -> Chip {
     if cap.width < 2 {
         return Chip::Rides;
@@ -672,7 +594,6 @@ fn capsule(cells: &mut Cells, cap: &CapsuleLayout, lit: bool, row: ChipRow) -> C
         form,
     });
     cells.put(cap.col, open, face);
-    // Every form sets a Primary's words bold, and no other chip's.
     cells.write(
         cap.col + 1,
         &cap.text,
@@ -702,10 +623,6 @@ fn paint_row<'a>(
 ) -> RowPaint<'a> {
     let overflow = matches!(l.kind, RowKind::Overflow { .. });
     let alarm = matches!(l.severity, Severity::Warn | Severity::Error);
-    // Success and Info share the title ink, Warn wears `warn` and Error `error`; the
-    // overflow row is a link, not a message, and reads in `label`, lifted to `value`
-    // while the pointer is on it. Under a forced palette every ink resolves to
-    // WINDOWTEXT, the glyph's too.
     let (word, accent) = if overflow && hover.is_some() {
         (Ink::Value, Ink::Value)
     } else if overflow {
@@ -726,14 +643,10 @@ fn paint_row<'a>(
         Fill::Warn
     };
     let busy = l.track.is_some();
-    // A busy row off a forced palette keeps its words' side under its comet.
     let comet_side = busy && !forced;
     let span = MeterSpan { geom, cols };
     let win_w = span.win_w();
-    // Every graded surface is drawn pixel by pixel; the flat look keeps whole-cell
-    // tones.
     let raster_ground = !surface.is_empty() && !surface.flat && cols > 0;
-    // The fill's edge in window pixels, and the one cell whose glyph it splits.
     let edge_px = surface
         .edge
         .filter(|_| raster_ground && !busy)
@@ -744,9 +657,6 @@ fn paint_row<'a>(
             x0 < e && e < x1
         })
     });
-    // A drawn icon spills into the blank cells beside its own: an edge anywhere in its
-    // three cells, on a boundary between them too, crosses the icon, so the icon's cell
-    // takes the split.
     let (gcol, gch) = l.glyph;
     let icon_split = edge_px
         .filter(|&e| {
@@ -763,7 +673,6 @@ fn paint_row<'a>(
                 let tone = span.fine(surface, x);
                 let on = match (split_col, edge_px) {
                     _ if busy || forced => tone.fill >= 128 << 8,
-                    // The split icon's own ink is the track's.
                     _ if icon_split == Some(x) => false,
                     (Some(s), _) => x < s,
                     (None, Some(e)) => span.px(x).1 <= e,
@@ -797,9 +706,6 @@ fn paint_row<'a>(
             ..
         }
     );
-    // The glyph cell: the engine's glyph for this frame (an echo's ✓ / ⚠, a Fault echo's
-    // ⚠ in warn whatever the row's severity was), else the row's own. Its character stays
-    // in the cell; the renderer draws its icon.
     let mut icon = None;
     if gcol < cols {
         let glyph = rm.glyph.unwrap_or(gch);
@@ -814,7 +720,6 @@ fn paint_row<'a>(
     let (tcol, title) = &l.title;
     cells.write(*tcol, title, Face::Word(word), !overflow);
     if let Some((dcol, d)) = &l.detail {
-        // The ` · ` joint occupies the three cells before the excerpt.
         cells.write(
             dcol.saturating_sub(2),
             "\u{00b7}",
@@ -838,8 +743,6 @@ fn paint_row<'a>(
     if let Some((scol, s)) = &l.stats {
         cells.write(*scol, s, Face::Word(Ink::Label), false);
     }
-    // The load words at the tail of the word cluster, with no joint: an empty
-    // reservation reads as track, never as a hole.
     if let Some((lcol, words)) = l.load {
         cells.write(lcol, words, Face::Word(Ink::Label), false);
     }
@@ -848,8 +751,6 @@ fn paint_row<'a>(
     let chip_row = ChipRow {
         forced,
         metered: columns.is_some(),
-        // A Primary on a metered row is outlined wherever the row is drawn to the pixel:
-        // the bar is the row's only solid accent.
         outline: raster_ground && !forced,
     };
     for cap in &l.capsules {
@@ -874,8 +775,6 @@ fn paint_row<'a>(
             if !owned.iter().any(|&s| within(col, s))
                 && !rings.iter().any(|&(a, b, _)| within(col, (a, b))) =>
         {
-            // The pixel the edge crosses goes to whichever side covers most
-            // of it: the crisp ink's line is at its pixel boundary.
             let exact = surface.edge.map_or(0, |q| u64::from(q) * win_w);
             let covered = exact % u64::from(ROW) * 2 >= u64::from(ROW);
             Some(Split {
@@ -1067,7 +966,6 @@ mod tests {
         cells.cells[0].text_presentation = true;
         cells.write(0, "a", Face::Word(Ink::Value), true);
         assert!(!cells.cells[0].text_presentation && cells.cells[0].bold);
-        // Clipped at the row's end.
         cells.slot((18, 6), "abcdef");
         cells.write(19, "xyz", Face::Blank, false);
         assert_eq!(cells.cells.len(), 20);
@@ -1157,8 +1055,6 @@ mod tests {
                     );
                     assert_eq!(r.rings.len(), usize::from(rings), "{look:?}");
                     assert_eq!(r.owned.len(), usize::from(!rings), "{look:?}");
-                    // Unringed (the flat look), it still wears the ring's
-                    // inside and the accent label.
                     assert!(matches!(
                         r.cells[primary.col + 1].face,
                         Face::Chip(ChipFace {
@@ -1170,7 +1066,6 @@ mod tests {
                 },
             );
         }
-        // A lit Secondary wears its own face.
         let hover = Some(Hover {
             row: 0,
             target: HoverTarget::Capsule(ActionIndex(1)),
@@ -1232,7 +1127,6 @@ mod tests {
                 }
             }
         }
-        // Non-vacuity: a sweep that met no split would pass on no assertion.
         assert!(seen > 0, "no paint in the sweep carried a split");
     }
 
@@ -1325,8 +1219,6 @@ mod tests {
         assert!(faded);
     }
 
-    // -- The mapping. -------------------------------------------------------
-
     /// Each column's lit coverage of a bar at `fill` on `g`: the fill channel
     /// of its window-pixel span's mean tone (0 track … 255 full).
     fn coverage(fill: u16, cols: usize, g: Geometry) -> Vec<u8> {
@@ -1389,11 +1281,7 @@ mod tests {
     }
 
     /// The meter maps the fill onto the window edge to edge, in whole cells smoothed by
-    /// tone coverage. On a 2000 px window (114 columns of 17 px, column 0 at x = 31): 0 ‰
-    /// lights nothing and 1000 ‰ every column; a started pass lights the first column, an
-    /// unfinished one never fills the last; the lit pixels (coverage × span) add up to
-    /// `fill · W` with at most one fractional cell; and no column runs backwards as the
-    /// fill grows.
+    /// tone coverage.
     #[test]
     fn the_meter_maps_the_fill_onto_the_window_edge_to_edge() {
         let g = Geometry {
@@ -1430,7 +1318,6 @@ mod tests {
         );
         assert!(unfinished[cols - 2] == 255);
         let half = coverage(500, cols, g);
-        // Column 57 starts at x = 31 + 57·17 = 1000: the window's middle.
         assert!(half[..57].iter().all(|&f| f == 255) && half[57..].iter().all(|&f| f == 0));
         let mut prev = vec![0u8; cols];
         for fill in 0..=1000u16 {
@@ -1458,15 +1345,11 @@ mod tests {
             );
             prev = cov;
         }
-        // Degenerate widths answer without a panic and inside the row.
         for cols in 1..4 {
             for fill in [0u16, 1, 499, 500, 999, 1000] {
                 assert_eq!(coverage(fill, cols, g).len(), cols);
             }
         }
-        // The window, not the grid: 10 % of a 400 px window is 40 px, still inside the
-        // left gutter that column 0's span carries (the grid's own mapping would light two
-        // columns).
         let wide_gutters = Geometry {
             win_w: 400,
             cells_x: 100,
@@ -1552,10 +1435,6 @@ mod tests {
                     let surface = crate::animate::comet(since, true);
                     seen.push(span.tone(&surface, 0).fill);
                 }
-                // The head is a peak, not a plateau: the first column's mean
-                // rises while the head crosses it and falls as the tail
-                // follows, never reaching the full fill (the column is wider
-                // than the head). Entering is the run up to that peak.
                 let first = seen.iter().position(|&f| f > 0).unwrap_or(seen.len());
                 let peak = (first..seen.len())
                     .max_by_key(|&k| seen[k])

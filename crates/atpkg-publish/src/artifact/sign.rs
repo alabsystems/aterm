@@ -1,19 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `atpkg-publish sign <pkg.toml>…`: the signing ceremony for manifests a keyless box
-//! staged unsigned. It re-checks what is about to be signed, signs the exact bytes with
-//! this machine's key, and verifies the pair with the client's own rule before saying
-//! "signed". An `unproven` row is signed only while the lineage receipt switch still reads
-//! dormant ([`super::lineage_switch`]).
-//!
-//! The packers sign through [`sign_checked`] too, so every signature this crate writes is
-//! one the client's chain has already accepted.
-//!
-//! The pair is verified under [`Authority`]: the newest master-verified roster on offer,
-//! the generation the next index ships. A machine that joined since the head can therefore
-//! sign before an index carries its entry, a channel's first publish can sign, and signing
-//! works offline from the installed roster.
+//! `atpkg-publish sign`: manifest signing and verification under [`Authority`]
+//! ([`sign_checked`], [`super::lineage_switch`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError};
@@ -42,14 +31,10 @@ impl Authority {
         self.roster.seq()
     }
 
-    /// Verify a `pkg-<program>-<build>.toml` under this generation with the client's rule
-    /// (any listed, unrevoked, unexpired machine; `TrustedIndex::verify_pkg` is the same
-    /// call on the roster that authorized its index), and parse it.
+    /// Verify and parse a package manifest under this generation's roster.
     ///
     /// # Errors
-    ///
-    /// A refusal when no live machine of this generation signed these bytes, or they do
-    /// not parse.
+    /// A refusal when no live machine of this generation signed these bytes, or they do not parse.
     pub fn verify_pkg(&self, pkg: &[u8], sig: &[u8]) -> Result<atpkg::PkgManifest> {
         let (verified, _) = self
             .roster
@@ -70,8 +55,7 @@ impl Authority {
     }
 }
 
-/// The channel head's roster pair, downloaded into `dir`: `Ok(None)` when the channel
-/// serves no index yet.
+/// The channel head's roster pair, downloaded into `dir`.
 fn head_roster(ctx: &Ctx, dir: &Path) -> std::result::Result<Option<PathBuf>, String> {
     let slug = ctx.index_slug();
     let n = match quad::head_build(ctx, &slug) {
@@ -85,14 +69,9 @@ fn head_roster(ctx: &Ctx, dir: &Path) -> std::result::Result<Option<PathBuf>, St
     Ok(Some(dir.join(QUAD_FILES[2])))
 }
 
-/// The newest master-verified roster pair among the channel head's, the aterm checkout's
-/// `dist/` and this machine's installed `~/.aterm/roster/` (the pair the next index
-/// ships). A revocation is a newer generation, so the head's outranks a stale local copy;
-/// an unreadable head is said, and the local pairs decide. Two different documents at the
-/// newest generation are a lineage fork, refused.
+/// The newest master-verified roster pair across the channel head and local copies.
 ///
 /// # Errors
-///
 /// A refusal for an empty anchor, no pair that verifies, or a fork.
 pub fn authority(ctx: &Ctx) -> Result<Authority> {
     if ctx.anchor.is_empty() {
@@ -134,10 +113,7 @@ fn local_candidates(ctx: &Ctx) -> Vec<(String, PathBuf)> {
     .collect()
 }
 
-/// Elect this context's generation ([`elected`]) from a channel head the caller already
-/// downloaded and verified (a lane's baseline, a group's floor), so none of its packs reads
-/// the head again. Nothing changes when one is elected already; an election that fails
-/// here is left to the first pack, which reads the head itself and refuses the same way.
+/// Elect this context's generation ([`elected`]) from an already-verified channel head.
 pub fn elect_from_head(ctx: &Ctx, head: &crate::quad::VerifiedQuad) {
     let mut slot = ctx.elected.lock().unwrap_or_else(PoisonError::into_inner);
     if slot.is_some() || ctx.anchor.is_empty() {
@@ -153,13 +129,9 @@ pub fn elect_from_head(ctx: &Ctx, head: &crate::quad::VerifiedQuad) {
     }
 }
 
-/// [`authority`], elected once per context and shared by its clones, so every pack of a
-/// lane or a group is verified under the one generation read for the first, without
-/// reading the channel head again. A failed election is not kept: the next asks again,
-/// and refuses the same way.
+/// Elect [`authority`] once per context and share it across clones.
 ///
 /// # Errors
-///
 /// [`authority`]'s.
 pub fn elected(ctx: &Ctx) -> Result<Arc<Authority>> {
     let mut slot = ctx.elected.lock().unwrap_or_else(PoisonError::into_inner);
@@ -171,9 +143,7 @@ pub fn elected(ctx: &Ctx) -> Result<Arc<Authority>> {
     Ok(fresh)
 }
 
-/// The election is the index's ([`newest_roster`]), so a package signature and the index
-/// that pins it are checked under the same roster; the elected pair is then admitted by
-/// the client's chain.
+/// The election is the index's ([`newest_roster`]).
 fn elect(ctx: &Ctx, candidates: &[(String, PathBuf)]) -> Result<Authority> {
     let paths: Vec<PathBuf> = candidates.iter().map(|(_, p)| p.clone()).collect();
     let pair = newest_roster(ctx, &paths, &mut Log::echo("atpkg-publish"))?;
@@ -202,12 +172,9 @@ pub fn sig_path(doc: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Sign `bytes` with `key` and verify the pair under `authority` with the client's rule,
-/// returning the signature and the parsed manifest. Nothing is written: a pair the
-/// client refuses never reaches the disk, and a signature already there is left alone.
+/// Sign `bytes` with `key` and verify the pair under `authority` with the client's rule.
 ///
 /// # Errors
-///
 /// The client's refusal (this machine is not on the roster, or is revoked).
 pub fn sign_checked(
     key: &MachineKey,
@@ -222,7 +189,6 @@ pub fn sign_checked(
 /// Write `<pkg>.sig`.
 ///
 /// # Errors
-///
 /// An I/O failure.
 pub fn write_sig(pkg: &Path, sig: &[u8]) -> Result<PathBuf> {
     let out = sig_path(pkg);
@@ -230,13 +196,9 @@ pub fn write_sig(pkg: &Path, sig: &[u8]) -> Result<PathBuf> {
     Ok(out)
 }
 
-/// An `unproven` row (a compiler with no receipt, admitted while the switch read dormant
-/// when the pack began) is signed or staged only while the switch still reads dormant: a
-/// bundle pack takes an hour, and the first mint may land in it. A live switch needs a
-/// receipt-carrying compiler; an unreadable one needs the checkout or the network fixed.
+/// Refuse `unproven` rows once the lineage receipt switch is live.
 ///
 /// # Errors
-///
 /// A refusal naming the remedy.
 pub fn unproven_gate(ctx: &Ctx, what: &str) -> Result<()> {
     let trust_repo = lineage_switch::default_trust_repo(ctx);
@@ -266,12 +228,9 @@ pub fn has_unproven_row(parsed: &atpkg::PkgManifest) -> bool {
     })
 }
 
-/// What the ceremony re-checks in a manifest it did not pack: every row carries a
-/// provenance record a pack would sign ([`pkgdoc::check_provenance`]), and the version is
-/// not a dirty tree's (a dirty pack is never published, so it is never signed).
+/// Re-check manifest provenance ([`pkgdoc::check_provenance`]) and version cleanliness.
 ///
 /// # Errors
-///
 /// A refusal naming the row or the version.
 pub fn check_signable(parsed: &atpkg::PkgManifest) -> Result<()> {
     if parsed.version.ends_with("-dirty") {
@@ -295,13 +254,10 @@ pub fn check_signable(parsed: &atpkg::PkgManifest) -> Result<()> {
     Ok(())
 }
 
-/// Sign every manifest named — the ceremony. Each is re-checked, signed, verified under
-/// the [`authority`], and only then has its `.sig` written.
+/// Sign every manifest named — the ceremony ([`authority`]).
 ///
 /// # Errors
-///
-/// The first manifest refused; the ones before it stay signed, and the refused one's
-/// directory is left as it was.
+/// Returns the first manifest refusal, leaving that manifest's directory unchanged.
 pub fn sign_all(ctx: &Ctx, pkgs: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let key = MachineKey::load(ctx, &ctx.identity.key)?;
     let authority = authority(ctx)?;
@@ -333,7 +289,6 @@ pub fn sign_all(ctx: &Ctx, pkgs: &[PathBuf]) -> Result<Vec<PathBuf>> {
 /// `atpkg-publish sign <pkg.toml>… [--trust-repo DIR]`.
 ///
 /// # Errors
-///
 /// A usage error for no manifest or an unknown flag; [`sign_all`]'s refusals.
 pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     let mut ctx = ctx.clone();

@@ -146,6 +146,7 @@ impl AgyKernel for Live {
 }
 
 /// The agy lane's per-tab record prefix ([`Agent::record_prefix`]), `agy-`:
+/// placed at compile time, which fails where agy keys none.
 const PREFIX: &str = match Agent::Agy.record_prefix() {
     Some(prefix) => prefix,
     None => panic!("the agy lane keys its records by tab"),
@@ -161,6 +162,10 @@ fn canonical(p: &Path) -> PathBuf {
 }
 
 /// THE MANAGED AGY A RELAUNCH TYPES: atpkg's twin (`<prefix>/agents/agy`,
+/// which exports `AGY_CLI_DISABLE_AUTO_UPDATE='true'` and then `exec`s an
+/// `agy` build), never the store build the crashed process ran (critic X3:
+/// typed, it pins that build and skips the twin's export, so agy's own
+/// updater would run).
 fn relaunch_program(program: &Path, twin: Option<PathBuf>) -> Result<PathBuf, &'static str> {
     if !ag::store_build(program) {
         return Ok(program.to_path_buf());
@@ -208,6 +213,7 @@ pub(super) fn carries_restart_onto(
 }
 
 /// What the files a live agy holds open say ([`witness`]): the conversation
+/// whose presence lock it holds, with that lock, and the crash file it holds.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Held {
     conversation: Option<(String, PathBuf)>,
@@ -215,6 +221,10 @@ struct Held {
 }
 
 /// THE CONVERSATION `pid` HOLDS, by the kernel and by agy's own lock: among
+/// the files `pid` holds open (`files`, `lsof`'s canonical paths), the
+/// presence locks under `config` ([`ag::lock_conversation`]); exactly one is
+/// its conversation, with that lock's path (`/clear` and `/resume` release
+/// the old one at once, measured).
 fn witness(config: &Path, files: &[PathBuf], pid: u32) -> Held {
     fn one<T: Clone>(found: &[T]) -> Option<T> {
         match found {
@@ -241,6 +251,11 @@ fn witness(config: &Path, files: &[PathBuf], pid: u32) -> Held {
 }
 
 /// WHETHER THE DEAD PROCESS'S CRASH FILE IS LEFT: the very file its snapshot
+/// saw it hold open (`crash`), else — none seen — any crash file of `pid`
+/// under `config` written no earlier than its start (`started_ms`, a second's
+/// slack; `0`: unread, and then none is believed: a dead pid's file a crash
+/// of an earlier process with the same number left is no witness of this
+/// one).
 fn crash_left(config: &Path, pid: u32, crash: Option<&Path>, started_ms: u64) -> bool {
     if let Some(file) = crash {
         return file.is_file();
@@ -264,6 +279,8 @@ fn crash_left(config: &Path, pid: u32, crash: Option<&Path>, started_ms: u64) ->
 }
 
 /// The config `args` and `argv` name ([`ag::config_dir`], canonical), and the
+/// home its relaunch carries ([`ag::relaunch_env`]: its `HOME` where that is
+/// another than `user_home`, the user's own).
 fn homes_of(
     args: &atpkg::caller_shell::ProcArgs,
     user_home: &Path,
@@ -276,6 +293,12 @@ fn homes_of(
 }
 
 /// THE WORD OF THE RELAUNCH LINE'S OWN COMMAND (its block `block`,
+/// [`St::line_block`], read right before the line was typed), once it ended
+/// ([`ag::line_exit_kind`], the crash file of the agy it started where one
+/// was found, [`St::relaunched_pid`]): agy refused the relaunch (`2`), or the
+/// shell could not run the line (`cd` failed, no program: refused too), or
+/// the relaunched agy ended by its own or someone's hand, or crashed, or
+/// ended with no witness.
 fn line_word(c: &mut Client, st: &St, k: &dyn AgyKernel) -> Option<ExitKind> {
     let status = line_status(c, &st.tab, st.line_block)?;
     if relaunched_lives(st, k) {
@@ -292,6 +315,8 @@ fn line_word(c: &mut Client, st: &St, k: &dyn AgyKernel) -> Option<ExitKind> {
 }
 
 /// Whether the agy the relaunch line started ([`St::relaunched_pid`]) still
+/// lives: alive, and the very process found (its kernel start, where read,
+/// [`St::relaunched_start`]), never another that took its number.
 fn relaunched_lives(st: &St, k: &dyn AgyKernel) -> bool {
     st.relaunched_pid != 0
         && k.alive(st.relaunched_pid)
@@ -301,6 +326,10 @@ fn relaunched_lives(st: &St, k: &dyn AgyKernel) -> bool {
 }
 
 /// WHETHER `st` IS THE RECORD OF AN EARLIER ATTEMPT AT THIS VERY EXIT THAT
+/// TYPED ITS LINE: the same tab's record (its key), naming `snap`'s process,
+/// its line typed ([`St::relaunched_at`]) after that process started (a
+/// record of an earlier process that had the same pid number was typed
+/// before it).
 fn typed_for_exit(st: &St, snap: &super::super::relaunch::Snapshot) -> bool {
     let started_ms = snap.agy().map_or(0, |run| run.started_ms);
     st.agent == Agent::Agy
@@ -362,6 +391,9 @@ pub(super) fn snapshot(
 }
 
 /// THE WORD THE EXIT OF `snap`'S AGY LEFT: its shell's exit status of the
+/// block it ran in ([`super::super::relaunch::AgyRun::block`]) and whether
+/// its crash file is left ([`crash_left`]), read by agy's table
+/// ([`ag::exit_kind`]); `None` while no status is drawn.
 fn shell_word(opts: &Opts, snap: &super::super::relaunch::Snapshot) -> Option<ExitKind> {
     let run = snap.agy()?;
     let status = connect(opts, &snap.tab)
@@ -399,6 +431,8 @@ pub(super) fn look_at_exit(
 }
 
 /// The dialect of `shell` from its executable, as the relaunch line is
+/// written for it ([`shell_dialect_of`]); `None` for a shell no line is
+/// written for, which [`plan`] waits on for ever.
 fn shell_dialect(shell: u32, k: &dyn AgyKernel) -> Option<Dialect> {
     shell_dialect_of(shell, k.args(shell))
 }
@@ -624,6 +658,8 @@ pub(super) fn after_exit_onto(
 }
 
 /// [`super::expired`] for an agy relaunch: its exit over [`STALE_S`] ago — or
+/// the last hand that held its line, whichever is later — and not relaunched,
+/// its shell gone, or relaunched and never come up.
 fn expired(st: &St, now: u64, k: &dyn AgyKernel) -> Option<(&'static str, String)> {
     match st.phase {
         Phase::Exiting { at_s }
@@ -647,16 +683,24 @@ fn expired(st: &St, now: u64, k: &dyn AgyKernel) -> Option<(&'static str, String
 }
 
 /// The presence lock of the conversation `st` relaunches, under the config it
+/// records.
 fn st_lock(st: &St) -> PathBuf {
     ag::presence_lock(Path::new(&st.agy_config), &st.thread)
 }
 
 /// WHETHER THE CONVERSATION `st` RELAUNCHES IS FREE: no live process holds
+/// its presence lock (a holder's `agy --conversation` would open it a second
+/// time, `Conversation already open`, holding no lock), no live agy names it
+/// in its argv, and no live agy holds its database with no presence lock
+/// ([`AgyKernel::lockless_openers`]): one opened on it while another held it
+/// — by `--conversation`, `-c`/`--continue` or an in-TUI `/resume` — holds no
+/// lock, even once that holder is gone, but holds that database (measured).
 fn conversation_free(st: &St, k: &dyn AgyKernel) -> bool {
     free_at(Path::new(&st.agy_config), &st_lock(st), &st.thread, k)
 }
 
 /// [`conversation_free`] of the conversation `conversation` under the config
+/// `config`, whose presence lock is `lock`.
 fn free_at(config: &Path, lock: &Path, conversation: &str, k: &dyn AgyKernel) -> bool {
     k.holders_of(lock).is_some_and(|h| h.is_empty())
         && k.agy_resuming(conversation).is_some_and(|p| p.is_empty())
@@ -708,6 +752,7 @@ pub(super) fn plan(opts: &Opts, st: &St, k: &dyn AgyKernel) -> Result<Plan, NoPl
 }
 
 /// Relaunch the agy `st` records at its tab's shell, the harness's hand on
+/// the tab through every wait and until the new TUI's first idle.
 fn relaunch(opts: &Opts, r: Report, st: &mut St, c: &mut Client, k: &dyn AgyKernel) -> Report {
     let mut hand = Hand::take_or_none(c, &st.tab);
     let r = relaunch_held(opts, r, st, c, &mut hand, k);
@@ -819,6 +864,8 @@ fn fail(opts: &Opts, r: Report, st: &mut St, why: &str, detail: &str) -> Report 
 }
 
 /// THE RELAUNCH LINE RAN AND ENDED with no relaunched agy found leading the
+/// tab ([`line_word`]'s `kind`): it never came up, or was gone before it was
+/// adopted.
 fn line_ended(opts: &Opts, r: Report, st: &mut St, kind: ExitKind) -> Report {
     let now = now_s();
     let (step, detail) = match kind {
@@ -858,6 +905,8 @@ fn line_ended(opts: &Opts, r: Report, st: &mut St, kind: ExitKind) -> Report {
 }
 
 /// Whether `pid` (argv `argv`) is the relaunch this lane typed: a child of
+/// the line's shell, not the exited TUI, an agy TUI resuming the recorded
+/// conversation.
 fn relaunched_by_us(pid: u32, argv: &[String], st: &St, k: &dyn AgyKernel) -> bool {
     pid != st.pid
         && matches!(st.phase, Phase::Relaunched { .. } | Phase::Exiting { .. })
@@ -867,6 +916,7 @@ fn relaunched_by_us(pid: u32, argv: &[String], st: &St, k: &dyn AgyKernel) -> bo
 }
 
 /// After the relaunch line: find the new TUI and carry on with it, or hand it
+/// back to its loop ([`adopt`]).
 fn await_new(opts: &Opts, r: Report, st: &mut St, c: &mut Client, k: &dyn AgyKernel) -> Report {
     let mut hand = Hand::take_or_none(c, &st.tab);
     let r = await_held(opts, r, st, c, &mut hand, k);
@@ -940,6 +990,7 @@ fn await_held(
 }
 
 /// The relaunched TUI `new`, on the record whatever becomes of it: once it is
+/// gone, an agy leaving the tab is that TUI, its exit its own.
 fn found<K: Kernel + ?Sized>(st: &mut St, new: u32, k: &K) {
     if st.relaunched_pid == 0 {
         st.relaunched_start = k.process_start(new).map(|s| squash(&s)).unwrap_or_default();
@@ -950,6 +1001,8 @@ fn found<K: Kernel + ?Sized>(st: &mut St, new: u32, k: &K) {
 }
 
 /// THE RELAUNCHED AGY STARTED A FRESH CONVERSATION: it runs, and it does not
+/// hold the conversation's presence lock, which `--conversation` takes at
+/// once (measured 0.49 s after the line's Enter).
 fn started_fresh(opts: &Opts, r: Report, st: &mut St, new: u32) -> Report {
     st.fail("started-fresh", now_s());
     let mut r = said(r, "refused:started-fresh");
@@ -968,6 +1021,7 @@ fn started_fresh(opts: &Opts, r: Report, st: &mut St, new: u32) -> Report {
 }
 
 /// Whether the relaunched agy `new` takes the conversation's presence lock
+/// within [`super::super::Timings::agy_lock`]; the hand kept meanwhile.
 fn takes_lock(
     opts: &Opts,
     st: &St,
@@ -986,6 +1040,11 @@ fn takes_lock(
 }
 
 /// Hand the relaunched agy back to its supervisor (`adopted`): the new TUI
+/// leads the tab by the host's own roster, HOLDS ITS CONVERSATION'S LOCK
+/// (else it started fresh: [`started_fresh`]), and the record stays in
+/// flight; at its loop's next idle point the relaunch primitive's
+/// continuation ([`super::super::relaunch::resume`]) types the carry-on
+/// ([`carry_on`]).
 fn adopt(
     opts: &Opts,
     mut r: Report,
@@ -1096,12 +1155,17 @@ fn carry_in_flight_with(
 }
 
 /// Whether agy's composer on `scr` is empty: its caret row holds nothing (a
+/// permission mode's hint, agy's only placeholder, is read as nothing by
+/// [`aterm_phase::agy::composer_draft`]) and no row under it holds a word.
 fn composer_empty(scr: &super::Screen) -> bool {
     aterm_phase::agy::composer_draft(&scr.rows)
         .is_some_and(|(_, lines)| lines.iter().all(|l| l.trim().is_empty()))
 }
 
 /// The last look before typing into agy's composer: a fresh read reading idle
+/// by its reader (no box, no turn running, its composer drawn, no exit
+/// pending) with the composer empty, and that read's generation, which the
+/// typed turn is fenced on.
 fn typing_fence(c: &mut Client, tab: &str) -> Result<Option<String>, &'static str> {
     let _ = turn_takes_gen(c);
     let Some(scr) = screen(c, tab) else {
@@ -1119,6 +1183,9 @@ fn typing_fence(c: &mut Client, tab: &str) -> Result<Option<String>, &'static st
 }
 
 /// Type `text` into agy's composer as one turn, fenced on `generation` and
+/// submitted under the composer's guard once the echo has held still
+/// (`idle=600`; agy submits an Enter in the text's own burst too, measured on
+/// 1.4.0, so the settle only proves the text landed whole).
 fn type_text(c: &mut Client, tab: &str, text: &str, generation: Option<&str>) -> Result<(), Typed> {
     let fence = generation
         .filter(|g| is_generation(g))
@@ -1135,6 +1202,10 @@ fn type_text(c: &mut Client, tab: &str, text: &str, generation: Option<&str>) ->
 }
 
 /// The relaunched TUI `new` is up: once its composer is drawn, its
+/// conversation's lock is held by it (else it started fresh:
+/// [`started_fresh`], nothing typed) and it reads idle and empty with no
+/// person at the tab, the continuation is typed (`continued`); a quiet
+/// relaunch types nothing.
 #[allow(clippy::too_many_arguments)]
 fn carry_on(
     opts: &Opts,
@@ -1269,6 +1340,8 @@ pub(super) fn sweep_prune(opts: &Opts, live_tabs: Option<&[LiveTab]>) {
 }
 
 /// [`prune`] with the tabs `known_live` proven live, the rendezvous registry
+/// read for the rest only where it can vouch for this state root
+/// ([`registry_graph`], [`registry_life`]).
 fn prune_known(opts: &Opts, known_live: Vec<String>) {
     let graph = registry_graph();
     prune(opts, now_s(), registry_life(graph.as_deref(), &known_live));

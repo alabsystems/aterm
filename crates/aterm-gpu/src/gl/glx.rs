@@ -50,6 +50,9 @@ pub(crate) struct GlxContext {
     robustness: Robustness,
     pbuffer: GLXDrawable,
     swap: SwapControl,
+    /// The server's GLX vendor (`glXQueryServerString`), which decides how a
+    /// window is posted (`surface`'s readback post).
+    vendor: String,
 }
 
 /// What the config choice reads of one config.
@@ -62,6 +65,10 @@ struct ConfigFacts {
 }
 
 /// The config a context and its windows share: on `visual`, exactly RGB888
+/// (the sizes `glXChooseFBConfig` matches are minimums, so 10-bit configs are
+/// listed too, whose back buffer would rescale every byte the stand-in
+/// carries), alpha 0 or 8, and single-sampled (GLES 3 refuses a blit into a
+/// multisampled back buffer); the first such in GLX's order.
 fn pick_config(configs: &[ConfigFacts], visual: u32) -> Option<usize> {
     configs.iter().position(|c| {
         c.visual == visual
@@ -77,6 +84,12 @@ fn has_ext(list: &str, ext: &str) -> bool {
 }
 
 /// The OpenGL ES 3.0 context's attribute lists (each 0-terminated) to try in
+/// order, with the robustness each makes: robust access and the context lost
+/// on a reset where GLX offers `GLX_ARB_create_context_robustness`, first
+/// with a video memory purge reported as a reset where it also offers
+/// `GLX_NV_robustness_video_memory_purge`; the plain context last, which a
+/// driver refusing the robust attributes (a robust ES profile is the
+/// driver's to grant) still makes.
 fn context_attempts(exts: &str) -> Vec<(Robustness, Vec<c_int>)> {
     let es30 = [
         ffi::GLX_CONTEXT_MAJOR_VERSION_ARB,
@@ -114,6 +127,8 @@ impl GlxContext {
     }
 
     /// [`Self::new`], as if GLX's extension list also named `also` (a test
+    /// offers the robustness extensions to a GLX that lists none, whose
+    /// driver may grant or refuse the attributes).
     fn offering(display: XDisplay, screen: c_int, also: &str) -> Result<Self, String> {
         let glx = Glx::get()?;
         let fns = &glx.fns;
@@ -244,6 +259,9 @@ impl GlxContext {
                 SwapControl::Absent
             }
         };
+        // SAFETY: a live display and one of its screens; the string is GLX's.
+        let vendor =
+            unsafe { ffi::c_string((fns.query_server_string)(display, screen, ffi::GLX_VENDOR)) };
         Ok(Self {
             glx,
             display,
@@ -253,6 +271,7 @@ impl GlxContext {
             robustness,
             pbuffer,
             swap,
+            vendor,
         })
     }
 
@@ -260,6 +279,12 @@ impl GlxContext {
     #[inline]
     pub(crate) const fn robustness(&self) -> Robustness {
         self.robustness
+    }
+
+    /// The server's GLX vendor (`NVIDIA Corporation`, `SGI` for Mesa's).
+    #[inline]
+    pub(crate) fn server_vendor(&self) -> &str {
+        &self.vendor
     }
 
     /// The GL (or GLX) function named `sym`, for the GL table; null when GLX has none.
@@ -427,6 +452,9 @@ mod tests {
     }
 
     /// The shared config is the first exactly-RGB888, single-sampled one on
+    /// the window's visual: a 10-bit config, a multisampled one and one on
+    /// another visual are each passed over even when GLX lists them first,
+    /// and a visual no config serves has none.
     #[test]
     fn the_shared_config_is_exactly_rgb888_single_sampled_on_the_visual() {
         let listed = [
@@ -448,6 +476,14 @@ mod tests {
     }
 
     /// The context's attribute lists, tried in order: where GLX offers
+    /// `GLX_ARB_create_context_robustness`, the first asks for robust access
+    /// (`GLX_CONTEXT_FLAGS_ARB` with the robust-access bit) and the context
+    /// lost on a reset (`GLX_LOSE_CONTEXT_ON_RESET_ARB`), with a video memory
+    /// purge reported as a reset ahead of it where GLX also offers
+    /// `GLX_NV_robustness_video_memory_purge` (NVIDIA's libGLX_nvidia
+    /// 580.159.03 offers both); the plain ES 3.0 list always comes last, and
+    /// alone where GLX offers no robustness (Mesa's GLX on the private
+    /// Xwayland test bed), or only the purge, which asks nothing without it.
     #[test]
     fn the_context_asks_for_robustness_where_glx_offers_it() {
         use Robustness::{LoseOnReset, LoseOnResetOrPurge, Plain};
@@ -504,6 +540,8 @@ mod tests {
     }
 
     /// The test's own Xlib: a window to post to and a pixel read back from it
+    /// (`XGetImage`), which is what the X server holds as the window's
+    /// content, the content a compositor shows.
     mod xlib {
         use std::ffi::{CStr, c_char, c_int, c_long, c_uint, c_ulong, c_void};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -637,6 +675,8 @@ mod tests {
     }
 
     /// The child's display and window: both closed when it drops, after the
+    /// surface and the device declared later, and the error handler it
+    /// replaced put back.
     struct Desk<'x> {
         x: &'x xlib::Xlib,
         dpy: xlib::Display,
@@ -654,6 +694,10 @@ mod tests {
 
     impl<'x> Desk<'x> {
         /// `$DISPLAY`'s X server, opened with [`xlib::count_errors`] as the
+        /// process's error handler (the first Xlib calls the process makes),
+        /// and a mapped `w` x `h` window on it: override-redirect (no window
+        /// manager frames or moves it) with no background (the server never
+        /// paints over a post).
         fn open(x: &'x xlib::Xlib, w: u32, h: u32) -> Self {
             use aterm_spec::host::could_not_run;
             use aterm_spec::wait::{MUST_HAPPEN, until_within};
@@ -728,6 +772,7 @@ mod tests {
         }
 
         /// The GL arm's device on this display; a server it cannot open one
+        /// on could not run the test.
         fn device(&self) -> GlDevice {
             GlDevice::on_window_system(self.window_system()).unwrap_or_else(|e| {
                 aterm_spec::host::could_not_run(format!("no GL device on $DISPLAY's X server: {e}"))
@@ -755,6 +800,7 @@ mod tests {
         }
 
         /// The window's pixel at (`px`, `py`) as the X server holds it, or
+        /// `None` when the server answers no image.
         fn pixel(&self, px: c_int, py: c_int) -> Option<[u8; 3]> {
             // SAFETY: a live display; the window is this display's.
             let img = unsafe {
@@ -812,6 +858,7 @@ mod tests {
     const CHILD: &str = "ATERM_GPU_GLX_CHILD";
 
     /// Run `body` as the test `name` in a child, and its stdout, which must
+    /// hold `done`.
     fn in_child(name: &str, done: &str, body: fn()) -> Option<String> {
         use std::io::Read as _;
 
@@ -882,12 +929,15 @@ mod tests {
     }
 
     /// What the child prints once its window held the posted colour, grown
+    /// too.
     const POSTED: &str = "GL-X11-POST: the window holds the posted colour, grown too";
 
     /// The frame background the posts fill past the answered size with
+    /// (`0xRRGGBB`), unlike the stand-in's colour and black.
     const FILL: u32 = 0x30_50_70;
 
     /// A frame the arm posts to an X11 window becomes that window's content:
+    /// the X server answers `XGetImage` with the colour the stand-in held.
     #[test]
     fn a_frame_posted_to_an_x11_window_is_its_content() {
         let Some(stdout) = in_child(
@@ -906,6 +956,9 @@ mod tests {
     }
 
     /// The child's work: an override-redirect window on `$DISPLAY`, a device
+    /// and a surface on it, a colour cleared into the stand-in and posted, and
+    /// the window's pixel read until it is that colour; then the window
+    /// doubled, posted again, and read past the stand-in.
     fn post_and_read_back() {
         use std::sync::atomic::Ordering;
 
@@ -924,7 +977,7 @@ mod tests {
             },
             dev.caps().renderer
         );
-        let mut surface = GlWindowSurface::create(&dev, desk.native(), w, h, Box::new(()))
+        let mut surface = GlWindowSurface::create(&dev, desk.native(), w, h, Box::new(()), None)
             .expect("a window surface");
         let name = std::ffi::CString::new(format!("_NET_WM_CM_S{}", desk.screen)).expect("a name");
         // SAFETY: a live display and a NUL-terminated name.
@@ -954,12 +1007,14 @@ mod tests {
             }
             cur.check("clear the stand-in").expect("no GL error");
         }
-        surface.present(&dev, FILL).expect("the first post");
+        surface.present(&dev, FILL, None).expect("the first post");
         let mut posts = 1_u32;
         let mut last = None;
         let held = within(MUST_HAPPEN, std::time::Duration::from_millis(10), || {
             if desk.drain().exposed {
-                surface.present(&dev, FILL).expect("the post on an expose");
+                surface
+                    .present(&dev, FILL, None)
+                    .expect("the post on an expose");
                 posts += 1;
             }
             last = desk.pixel(32, 24);
@@ -975,14 +1030,16 @@ mod tests {
         // SAFETY: a live display and its window.
         unsafe { (x.resize_window)(desk.dpy, desk.win, 2 * w, 2 * h) };
         surface
-            .present(&dev, FILL)
+            .present(&dev, FILL, None)
             .expect("the post past the stand-in");
         posts += 1;
         let past = [(100, 10), (10, 70), (100, 70)];
         let mut read = Vec::new();
         let covered = within(MUST_HAPPEN, std::time::Duration::from_millis(10), || {
             if desk.drain().exposed {
-                surface.present(&dev, FILL).expect("the post on an expose");
+                surface
+                    .present(&dev, FILL, None)
+                    .expect("the post on an expose");
                 posts += 1;
             }
             read = past.iter().map(|&(px, py)| desk.pixel(px, py)).collect();
@@ -999,7 +1056,7 @@ mod tests {
         // SAFETY: a live display and its window.
         unsafe { (x.resize_window)(desk.dpy, desk.win, 3 * w, 3 * h) };
         surface
-            .present(&dev, FILL)
+            .present(&dev, FILL, None)
             .expect("the post past the answered size");
         posts += 1;
         let fill = FILL.to_be_bytes();
@@ -1013,7 +1070,9 @@ mod tests {
         let mut read = Vec::new();
         let filled = within(MUST_HAPPEN, std::time::Duration::from_millis(10), || {
             if desk.drain().exposed {
-                surface.present(&dev, FILL).expect("the post on an expose");
+                surface
+                    .present(&dev, FILL, None)
+                    .expect("the post on an expose");
                 posts += 1;
             }
             read = points
@@ -1035,7 +1094,7 @@ mod tests {
         surface.asked_size = None;
         surface.asked_once.set(Some((128, 96)));
         surface
-            .present(&dev, FILL)
+            .present(&dev, FILL, None)
             .expect("the post whose answer lags once");
         posts += 1;
         let points = [(10, 10), (148, 134), (148, 10), (10, 134)];
@@ -1054,10 +1113,235 @@ mod tests {
         println!("{POSTED} ({posts} posts, {errors} X errors)");
     }
 
+    /// What the child prints once a post by readback held the stand-in.
+    const READ_BACK: &str =
+        "GL-X11-READBACK: the presenter got the stand-in's words, top row first";
+
+    /// A frame a presenter kept: its size, the rectangle the post drew, and
+    /// its words.
+    type KeptFrame = (u32, u32, [u32; 4], Vec<u32>);
+
+    /// A presenter that keeps every frame it is given, each drawn over a copy
+    /// of the last as a real presenter's store holds it (the whole frame
+    /// where the size moved), and attaches or not as `attach` says.
+    struct Kept {
+        attach: Result<(), String>,
+        frames: std::sync::Arc<std::sync::Mutex<Vec<KeptFrame>>>,
+    }
+
+    impl crate::FrameSink for Kept {
+        fn attach(&mut self) -> Result<(), String> {
+            self.attach.clone()
+        }
+
+        fn post(
+            &mut self,
+            width: u32,
+            height: u32,
+            damage: Option<[u32; 4]>,
+            draw: &mut crate::FrameDraw<'_>,
+        ) -> Result<(), String> {
+            let mut frames = self.frames.lock().expect("the kept frames");
+            let held = frames
+                .last()
+                .filter(|(w, h, ..)| (*w, *h) == (width, height))
+                .map(|(.., words)| words.clone());
+            let rect = damage
+                .filter(|_| held.is_some())
+                .unwrap_or([0, 0, width, height]);
+            let mut words = held.unwrap_or_else(|| vec![0; width as usize * height as usize]);
+            draw(&mut words, rect)?;
+            frames.push((width, height, rect, words));
+            Ok(())
+        }
+    }
+
+    /// A window posted by readback (`surface`'s module header: NVIDIA's GLX
+    /// under a compositing manager) has no `GLXWindow` and never swaps, and
+    /// its presenter gets the stand-in as `0x00RRGGBB` words, top row first:
+    /// with the stand-in's top half cleared to (51, 153, 255) and its bottom
+    /// half to (255, 102, 0), the first word reads `0x3399ff` and the last
+    /// `0xff6600`, read as `GL_BGRA_EXT` where the context offers it and as
+    /// `GL_RGBA` with red and blue swapped (`read_rgba`) alike. The negative
+    /// controls: a `GL_RGBA` read without the swap reads `0xff9933` first,
+    /// and rows read bottom first read `0xff6600` first. A post handed damage
+    /// reads back that rectangle alone: with the stand-in cleared whole to
+    /// (255, 204, 0), a post of the middle of its bottom half leaves the rest
+    /// of the frame as the last post left it, through either read (the
+    /// negative controls: a pack without the frame's row length packs the
+    /// rectangle's rows tight, so its last row keeps the last post's
+    /// `0xff6600`, and a `GL_RGBA` swap over whole rows turns the untouched
+    /// top half's `0x3399ff` into `0xff9933`). A presenter that cannot attach leaves the window its
+    /// `GLXWindow`. It runs in a child ([`in_child`]).
+    #[test]
+    fn a_frame_posted_by_readback_is_the_stand_in_s_words() {
+        in_child(
+            "a_frame_posted_by_readback_is_the_stand_in_s_words",
+            READ_BACK,
+            read_back_post,
+        );
+    }
+
+    /// The child's work: a window on `$DISPLAY`, a surface on it whose
+    /// presenter refuses to attach, then one whose presenter keeps the
+    /// frames, its stand-in cleared in two halves and posted.
+    fn read_back_post() {
+        let x = xlib::Xlib::open();
+        let (w, h) = (64_u32, 48_u32);
+        let desk = Desk::open(&x, w, h);
+        let dev = desk.device();
+        let frames = std::sync::Arc::default();
+        let kept = |attach| -> Option<Box<dyn crate::FrameSink>> {
+            Some(Box::new(Kept {
+                attach,
+                frames: std::sync::Arc::clone(&frames),
+            }))
+        };
+        let refused = GlWindowSurface::create(
+            &dev,
+            desk.native(),
+            w,
+            h,
+            Box::new(()),
+            kept(Err("no server to post to".to_owned())),
+        )
+        .expect("a window surface whose presenter refused");
+        assert!(
+            refused.glx_window().is_some(),
+            "a presenter that cannot attach leaves the window its GLXWindow"
+        );
+        drop(refused);
+        let mut surface =
+            GlWindowSurface::create(&dev, desk.native(), w, h, Box::new(()), kept(Ok(())))
+                .expect("a window surface posted by readback");
+        assert!(
+            surface.glx_window().is_none(),
+            "a window posted by readback has no GLXWindow"
+        );
+        assert!(!surface.synced(), "a post by readback swaps nothing");
+        // 0.2, 0.6, 1.0 and 1.0, 0.4, 0.0 in the stand-in's linear RGBA8.
+        let top = [0.2_f32, 0.6, 1.0, 1.0];
+        let bottom = [1.0_f32, 0.4, 0.0, 1.0];
+        let half = c_int::try_from(h / 2).expect("a small height");
+        let width = c_int::try_from(w).expect("a small width");
+        {
+            let standin = surface.standin(&dev).expect("the stand-in");
+            let cur = dev.enter().expect("enter");
+            let fbo = standin.fbo(&cur).expect("the stand-in's framebuffer");
+            let gl = cur.gl();
+            // SAFETY: the context is current; the stand-in's complete
+            // framebuffer; four floats for one colour attachment. The
+            // stand-in's row 0 is its top (`super` "Coordinates"), so the
+            // first scissor is its top half.
+            unsafe {
+                (gl.bind_framebuffer)(ffi::GL_FRAMEBUFFER, fbo);
+                (gl.enable)(ffi::GL_SCISSOR_TEST);
+                (gl.scissor)(0, 0, width, half);
+                (gl.clear_bufferfv)(ffi::GL_COLOR, 0, top.as_ptr());
+                (gl.scissor)(0, half, width, half);
+                (gl.clear_bufferfv)(ffi::GL_COLOR, 0, bottom.as_ptr());
+                (gl.disable)(ffi::GL_SCISSOR_TEST);
+            }
+            cur.check("clear the stand-in").expect("no GL error");
+        }
+        surface
+            .present(&dev, FILL, None)
+            .expect("the post by readback");
+        surface.read_rgba = true;
+        surface
+            .present(&dev, FILL, None)
+            .expect("the post by readback read as GL_RGBA");
+        {
+            let standin = surface.standin(&dev).expect("the stand-in");
+            let cur = dev.enter().expect("enter");
+            let fbo = standin.fbo(&cur).expect("the stand-in's framebuffer");
+            let gl = cur.gl();
+            // SAFETY: as above, unscissored.
+            unsafe {
+                (gl.bind_framebuffer)(ffi::GL_FRAMEBUFFER, fbo);
+                (gl.clear_bufferfv)(ffi::GL_COLOR, 0, [1.0_f32, 0.8, 0.0, 1.0].as_ptr());
+            }
+            cur.check("clear the stand-in").expect("no GL error");
+        }
+        // The middle of the bottom half, then the left of the top half.
+        let middle = [w / 4, h / 2, 3 * w / 4, h];
+        let corner = [0, 0, w / 4, h / 2];
+        surface.read_rgba = false;
+        surface
+            .present(&dev, FILL, Some(middle))
+            .expect("a damaged post");
+        surface.read_rgba = true;
+        surface
+            .present(&dev, FILL, Some(corner))
+            .expect("a damaged post read as GL_RGBA");
+        let frames = frames.lock().expect("the kept frames");
+        assert_eq!(frames.len(), 4, "the presenter got one frame a post");
+        let rgb = |word: &u32| word & 0x00ff_ffff;
+        let at = |words: &[u32], x: u32, y: u32| rgb(&words[(y * w + x) as usize]);
+        let (_, _, rect, words) = &frames[2];
+        assert_eq!(*rect, middle, "the post drew the rectangle it was handed");
+        assert_eq!(
+            [
+                at(words, w / 4, h / 2),
+                at(words, 3 * w / 4 - 1, h - 1),
+                at(words, w / 2, h / 2 + 1),
+            ],
+            [0x00ff_cc00; 3],
+            "the damaged rectangle is the stand-in's"
+        );
+        assert_eq!(
+            [
+                at(words, 0, h - 1),
+                at(words, 3 * w / 4, h / 2),
+                at(words, w / 2, h / 2 - 1),
+                at(words, 0, 0),
+            ],
+            [0x00ff_6600, 0x00ff_6600, 0x0033_99ff, 0x0033_99ff],
+            "past the damage the frame is the last post's"
+        );
+        let (_, _, rect, words) = &frames[3];
+        assert_eq!(*rect, corner, "the post drew the rectangle it was handed");
+        assert_eq!(
+            [at(words, 0, 0), at(words, w / 4 - 1, h / 2 - 1)],
+            [0x00ff_cc00; 2],
+            "the damaged corner is the stand-in's, swapped once"
+        );
+        assert_eq!(
+            [
+                at(words, w / 4, 0),
+                at(words, w - 1, h / 2 - 1),
+                at(words, w / 2, h - 1)
+            ],
+            [0x0033_99ff, 0x0033_99ff, 0x00ff_cc00],
+            "the swap touched the corner alone"
+        );
+        for ((fw, fh, _, words), read) in frames.iter().take(2).zip([
+            if dev.caps().bgra_read {
+                "GL_BGRA_EXT"
+            } else {
+                "GL_RGBA, swapped (no GL_BGRA_EXT)"
+            },
+            "GL_RGBA, swapped",
+        ]) {
+            assert_eq!((*fw, *fh), (w, h), "the frame is the stand-in's size");
+            assert_eq!(
+                (words.first().map(rgb), words.last().map(rgb)),
+                (Some(0x0033_99ff), Some(0x00ff_6600)),
+                "the first word is the top half's colour and the last the bottom half's, as \
+                 0x00RRGGBB (read through {read})"
+            );
+        }
+        println!("{READ_BACK} (GL_BGRA_EXT: {})", dev.caps().bgra_read);
+    }
+
     /// What the child prints once each context's reset strategy matched the
+    /// robustness it was made with.
     const ROBUST: &str = "GL-X11-ROBUST: each context's reset strategy is the one it was made with";
 
     /// A GLX context reports resets exactly where it was made to: the
+    /// driver's own answer (`GL_RESET_NOTIFICATION_STRATEGY`) is
+    /// `GL_LOSE_CONTEXT_ON_RESET` on a context the arm made robust, and not
+    /// on a plain one.
     #[test]
     fn a_glx_context_reports_resets_where_it_was_made_to() {
         let _ = in_child(
@@ -1068,6 +1352,7 @@ mod tests {
     }
 
     /// The child's work: the arm's own context and one offered robustness
+    /// by the test, each held to the driver's reset strategy.
     fn robust_contexts() {
         use std::sync::atomic::Ordering;
 
@@ -1120,6 +1405,7 @@ mod tests {
     }
 
     /// `ctx`'s `GL_RESET_NOTIFICATION_STRATEGY`, as the driver answers it on
+    /// its pbuffer; `None` where the context has no such query.
     fn reset_strategy(ctx: &GlxContext) -> Option<ffi::GLint> {
         // SAFETY: GLX's entry points for the two core GLES functions, whose registry signatures the casts name.
         let (get_error, get_integerv) = unsafe {
@@ -1146,9 +1432,13 @@ mod tests {
     }
 
     /// What the child prints once a refused GLX mint left the window system
+    /// with no device.
     const NO_EGL: &str = "GL-X11-NO-EGL: a refused GLX mint makes no EGL device";
 
     /// A GLX mint failure on an X11 window system makes no device, which
+    /// sends its windows to the CPU renderer, never to EGL's X11 platform:
+    /// NVIDIA's answers every swap with success and posts nothing on an Xorg
+    /// server its own driver runs (the black window of 2026-10-21).
     #[test]
     fn a_glx_mint_failure_on_x11_draws_on_the_cpu_not_egl() {
         let _ = in_child(
@@ -1188,6 +1478,11 @@ mod tests {
     const DRILL: &str = "GL-X11-DRILL: the drill latched at the present's reset check";
 
     /// The loss drill on a GLX device (`ATERM_GL_INJECT_LOSS`) runs the path
+    /// a real reset takes: its present binds the window through GLX, then
+    /// reads the reset status, where the drill's `GL_UNKNOWN_CONTEXT_RESET`
+    /// stands in for the driver's answer; the present fails naming it, the
+    /// device latches lost with it as the cause (what the frontend's
+    /// downgrade line prints), and refuses every later guard.
     #[test]
     fn the_loss_drill_on_glx_latches_at_the_present_s_reset_check() {
         let _ = in_child(
@@ -1217,19 +1512,20 @@ mod tests {
                 glx.robustness().reports_resets(),
                 "{which} device asks the driver for resets exactly where its context reports them"
             );
-            let mut surface = GlWindowSurface::create(&dev, desk.native(), w, h, Box::new(()))
-                .expect("a window surface");
+            let mut surface =
+                GlWindowSurface::create(&dev, desk.native(), w, h, Box::new(()), None)
+                    .expect("a window surface");
             surface.standin(&dev).expect("the stand-in");
             for _ in 0..2 {
                 surface
-                    .present(&dev, FILL)
+                    .present(&dev, FILL, None)
                     .expect("an undrilled present posts");
             }
             assert!(!dev.shared().lost(), "undrilled presents latch nothing");
             let what = dev.shared().inject_context_loss();
             assert!(what.contains("GL_UNKNOWN_CONTEXT_RESET"), "{what}");
             let err = surface
-                .present(&dev, FILL)
+                .present(&dev, FILL, None)
                 .expect_err("the drilled present fails")
                 .to_string();
             assert!(
@@ -1255,6 +1551,10 @@ mod tests {
     const REFUSED: &str = "GL-X11-BIND: a window GLX keeps refusing latches the device lost";
 
     /// A GLX window whose bind keeps failing latches the device lost at the
+    /// third present in a row, and not before: the window's `GLXWindow` is
+    /// destroyed behind the surface's back, so every later
+    /// `glXMakeContextCurrent` on it fails while the context still binds its
+    /// own pbuffer.
     #[test]
     fn a_window_glx_keeps_refusing_latches_the_device_lost() {
         let _ = in_child(
@@ -1273,17 +1573,17 @@ mod tests {
         let desk = Desk::open(&x, w, h);
         let dev = desk.device();
         let glx = dev.shared().glx().expect("an X11 device is GLX's");
-        let mut surface = GlWindowSurface::create(&dev, desk.native(), w, h, Box::new(()))
+        let mut surface = GlWindowSurface::create(&dev, desk.native(), w, h, Box::new(()), None)
             .expect("a window surface");
         surface.standin(&dev).expect("the stand-in");
         surface
-            .present(&dev, FILL)
+            .present(&dev, FILL, None)
             .expect("the window's first present posts");
         glx.destroy_window(surface.glx_window().expect("a GLX surface"));
         desk.sync();
         let mut seen = Vec::new();
         for n in 1..=3 {
-            let posted = surface.present(&dev, FILL);
+            let posted = surface.present(&dev, FILL, None);
             seen.push((posted.is_ok(), dev.shared().lost()));
             if let Err(e) = posted {
                 assert_eq!(

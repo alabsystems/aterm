@@ -33,7 +33,7 @@ pub(crate) struct TraceGuard {
 
 impl TraceGuard {
     #[inline]
-    pub(crate) fn new(module_path: &'static str, called_from_fn: &'static str) -> Self {
+    pub(crate) const fn new(module_path: &'static str, called_from_fn: &'static str) -> Self {
         trace!(target = module_path, "Triggered `{}`", called_from_fn);
         Self { module_path, called_from_fn }
     }

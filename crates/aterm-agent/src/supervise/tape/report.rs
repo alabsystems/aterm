@@ -1,60 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHAT A REPLAY SAYS ([`Report`]): how a strict replay of a harness tape
-//! ended, the first place it stopped reproducing the recorded run if it did,
-//! and what the replayed loop asked and printed — as values a test asserts
-//! on and a person reads, never as prose a test pins.
-//!
-//! **The verdicts** (the replay plan's §1, each with its exit code):
-//! * [`Verdict::Reproduced`] (0): every record was consumed, each request and
-//!   output was the recorded one, and the loop ended as the recorded loop
-//!   ended;
-//! * [`Verdict::Ended`] (0): the tape has no end — a run killed, or a tape
-//!   torn or capped — and everything up to where it stops reproduced;
-//! * [`Verdict::Reached`] (0): `--until door=N` stopped the replay after
-//!   effect `#N`, everything up to it reproduced;
-//! * [`Verdict::Diverged`] (1): the first [`Divergence`] — in a
-//!   counterfactual (acts mode, [`Mode::Acts`]) the first divergent ACT, both
-//!   sides said ([`Cause::ActDiffers`]), or the act the candidate went on
-//!   without ([`Cause::ActSkipped`]);
-//! * [`Verdict::Stale`] (3): a counterfactual asked a read (or a wait) its
-//!   segment of the tape never answered ([`Cause::Stale`]): what the
-//!   candidate would have seen there is not on the tape;
-//! * [`Verdict::Panicked`] (4): the recorded run panicked, and the replay
-//!   panicked with the same message once every record was consumed — or,
-//!   for a run that died inside a door's live call (a probe's body, the
-//!   transport), reached that door asking the very request the tape says it
-//!   died at, every record before it consumed.
-//!
-//! A tape that cannot be replayed at all — unreadable, damaged inside, of a
-//! newer format, a header this build cannot read, a loop this build does
-//! not replay — is no report: the driver refuses it (exit 2).
-//!
-//! **The divergence classes** (Design 1, the plan's §5.2), for the first
-//! divergence only — everything after it is not run:
-//! * [`Class::Decision`]: an ACT differs (a key, a send, a post, a badge, a
-//!   signal, a restart: `tape::ctl::is_act`), an act is asked where the tape
-//!   holds something else or the tape holds one where the loop asks
-//!   something else — or a DECISION'S MARK differs (`decide.*`: the policy
-//!   decided otherwise on the same screen, which is what an act differing
-//!   would follow from);
-//! * [`Class::Output`]: an output or a write differs while the doors agree —
-//!   a printed line, a journal or ledger row, a notes line, the ledger's
-//!   bound — or the loop ended otherwise than it did;
-//! * [`Class::Drift`]: anything else — a read asked in another order, a
-//!   clock read more or less often, a reply this build cannot decode, the
-//!   loop asking past the tape's end or ending with records left.
-//!
-//! Strict replay is for re-executing a run on the build that recorded it;
-//! on another build every divergence reads as "behaviour changed since the
-//! recording's build", which [`Report::render`] says beside both builds.
-//!
-//! A COUNTERFACTUAL's report ([`ActsReport`]) adds the candidate policy, the
-//! recorded and the candidate act at the first divergent one with the
-//! decision before each, the last screen the candidate read, how far it
-//! strayed from the tape ([`super::acts::ActsAccount`]) and the [`BOUND`]
-//! line: what no counterfactual can say.
+//! WHAT A REPLAY SAYS ([`Report`]): how a strict replay of a harness tape ended, the first place it stopped reproducing the recorded run if it did, and what the replayed loop asked and printed — as values a test asserts on and a person reads, never as prose a test pins.
 
 use std::fmt::Write as _;
 
@@ -68,15 +15,9 @@ pub enum Verdict {
         door: u64,
     },
     Diverged(Divergence),
-    /// A COUNTERFACTUAL (acts mode) asked a read its segment of the tape
-    /// never answered, and nothing before the cursor may stand for: the
-    /// tape cannot say what the candidate would have seen (exit 3).
+    /// A COUNTERFACTUAL (acts mode) asked a read its segment of the tape never answered, and nothing before the cursor may stand for: the tape cannot say what the candidate would have seen (exit 3).
     Stale(Divergence),
-    /// The recorded run unwound with `message`. `door`: it died inside that
-    /// door's live call (a probe's body, the transport), and the replay
-    /// reached the door asking the very request — a replay makes no live
-    /// call, so the panic itself is the tape's; `None`: it died above every
-    /// door, and the replay panicked with the same message.
+    /// The recorded run unwound with `message`.
     Panicked {
         message: String,
         door: Option<String>,
@@ -131,49 +72,33 @@ impl Class {
 /// What the first divergence was, as a value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cause {
-    /// astream's refusal at the door ([`astream_effects::ReplayDivergence`]):
-    /// a kind, path, door, request or output that is not the recorded one,
-    /// or a tape that ended under the loop.
+    /// astream's refusal at the door ([`astream_effects::ReplayDivergence`]): a kind, path, door, request or output that is not the recorded one, or a tape that ended under the loop.
     Refused(astream_effects::ReplayDivergence),
-    /// The recorded reply at `door` does not decode in this build: the
-    /// value's codec changed since the recording.
+    /// The recorded reply at `door` does not decode in this build: the value's codec changed since the recording.
     Undecodable { door: String, why: String },
-    /// The loop read flags that consume nothing this many times in a row
-    /// (the progress guard): it would never reach the next record.
+    /// The loop read flags that consume nothing this many times in a row (the progress guard): it would never reach the next record.
     NoProgress { reads: u64 },
     /// The loop returned with records left on the tape.
     EndedEarly { left: usize },
-    /// The loop ended otherwise than the recorded one: `recorded` is the
-    /// tape's end as it was said, `replayed` this replay's.
+    /// The loop ended otherwise than the recorded one: `recorded` is the tape's end as it was said, `replayed` this replay's.
     OtherEnd { recorded: String, replayed: String },
-    /// Something the recording made no record a replay can stand on — a
-    /// mail delivery received under a recorder.
+    /// Something the recording made no record a replay can stand on — a mail delivery received under a recorder.
     Unreplayable { why: String },
-    /// ACTS MODE: the candidate took another act than the segment's closing
-    /// one — `recorded` the act the tape holds there (`None`: the candidate
-    /// acted past the tape's last act), `asked` the candidate's (`None`: it
-    /// ended with the recorded act still to take).
+    /// ACTS MODE: the candidate took another act than the segment's closing one — `recorded` the act the tape holds there (`None`: the candidate acted past the tape's last act), `asked` the candidate's (`None`: it ended with the recorded act still to take).
     ActDiffers {
         recorded: Option<ActSide>,
         asked: Option<ActSide>,
     },
-    /// ACTS MODE: the candidate went on without the segment's closing act,
-    /// `recorded`: it waits `asked`, for what the recorded run waited for
-    /// (its timeout aside) only once it had taken that act — the act it
-    /// skipped, the first divergent one.
+    /// ACTS MODE: the candidate went on without the segment's closing act, `recorded`: it waits `asked`, for what the recorded run waited for (its timeout aside) only once it had taken that act — the act it skipped, the first divergent one.
     ActSkipped { recorded: ActSide, asked: ActSide },
-    /// ACTS MODE: the candidate asked a read (of the class `class`: a read, a
-    /// wait) its segment never answered — `request` as the tape writes it
-    /// (`STALE`).
+    /// ACTS MODE: the candidate asked a read (of the class `class`: a read, a wait) its segment never answered — `request` as the tape writes it (`STALE`).
     Stale {
         class: &'static str,
         request: String,
     },
 }
 
-/// One side of a divergent act: where it is on the tape (the candidate's has
-/// no place), its door and its words — a control request's, or a host
-/// call's arguments.
+/// One side of a divergent act: where it is on the tape (the candidate's has no place), its door and its words — a control request's, or a host call's arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActSide {
     pub at: Option<u64>,
@@ -209,8 +134,7 @@ pub enum Mode {
     /// Every record in order, on the recording's own policy.
     #[default]
     Strict,
-    /// A counterfactual: the acts held to the tape, the reads served from
-    /// their segment (`tape::acts`), under a candidate policy.
+    /// A counterfactual: the acts held to the tape, the reads served from their segment (`tape::acts`), under a candidate policy.
     Acts,
 }
 
@@ -223,20 +147,15 @@ pub struct ActsReport {
     pub account: super::acts::ActsAccount,
     /// The rows of the last screen the candidate read.
     pub last_screen: Option<Vec<String>>,
-    /// Where the candidate stopped short of the act the recorded run took
-    /// next — STALE, or stopped otherwise before it — that act, which no
-    /// cause names (a divergent or a skipped act names its own).
+    /// Where the candidate stopped short of the act the recorded run took next — STALE, or stopped otherwise before it — that act, which no cause names (a divergent or a skipped act names its own).
     pub recorded_next: Option<ActSide>,
-    /// Where the candidate did not take the act the recorded run took: the
-    /// decisions the recorded run made in that segment before it (its marks,
-    /// in order).
+    /// Where the candidate did not take the act the recorded run took: the decisions the recorded run made in that segment before it (its marks, in order).
     pub recorded_decisions: Vec<Decided>,
     /// The decisions the candidate made in its last segment, in order.
     pub candidate_decisions: Vec<Decided>,
 }
 
-/// What a counterfactual cannot say, said with every one (the replay plan's
-/// §11).
+/// What a counterfactual cannot say, said with every one (the replay plan's §11).
 pub const BOUND: &str = "BOUND: exact up to the first divergent act, and not past it: nothing \
                          re-drives the agent after an act the recording never took (no model, \
                          no inference); what lies below a door — the server, the window host's \
@@ -300,8 +219,7 @@ impl std::fmt::Display for Cause {
 /// The first place a replay stopped reproducing the recorded run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Divergence {
-    /// The effect's ordinal on the tape (`#N` in `tape cat`): the record the
-    /// loop could not take, or the one whose reply it could not read.
+    /// The effect's ordinal on the tape (`#N` in `tape cat`): the record the loop could not take, or the one whose reply it could not read.
     pub at: u64,
     /// The door the loop crossed there, when it crossed one.
     pub door: Option<String>,
@@ -323,23 +241,15 @@ pub struct Report {
     /// Effects consumed, and on the tape.
     pub consumed: usize,
     pub effects: usize,
-    /// Every control request the replayed loop asked on its own lane, word
-    /// by word, in order — the claim's renewals included.
+    /// Every control request the replayed loop asked on its own lane, word by word, in order — the claim's renewals included.
     pub requests: Vec<Vec<String>>,
     /// Every request on the teller's lane (`story`).
     pub told: Vec<Vec<String>>,
     /// Every line the replayed loop printed (its `out` door's lines).
     pub lines: Vec<String>,
-    /// How the replayed loop ended, as the tape says an end (`exit 1`; a
-    /// supervise's review under its exit code, `replay::supervise_end`),
-    /// when it returned.
+    /// How the replayed loop ended, as the tape says an end (`exit 1`; a supervise's review under its exit code, `replay::supervise_end`), when it returned.
     pub returned: Option<String>,
-    /// What this build supplied where the tape's header did not give it the
-    /// run's own (`tape::header::Header::supplied`): a key the header does
-    /// not say, read at this build's value; a retired policy key's reading;
-    /// and, for a policy the header marked inexact, each value it said that
-    /// the owner's reader refused (with the value read in its place) and the
-    /// inexactness itself.
+    /// What this build supplied where the tape's header did not give it the run's own (`tape::header::Header::supplied`): a key the header does not say, read at this build's value; a retired policy key's reading; and, for a policy the header marked inexact, each value it said that the owner's reader refused (with the value read in its place) and the inexactness itself.
     pub supplied: Vec<String>,
     /// How the tape's bytes ended, when not cleanly (a torn tail, a cap).
     pub tail: Option<String>,
@@ -356,8 +266,7 @@ impl Report {
         self.verdict.code()
     }
 
-    /// The report as text: the verdict line, then what the replay ran and
-    /// where it stopped.
+    /// The report as text: the verdict line, then what the replay ran and where it stopped.
     #[must_use]
     pub fn render(&self) -> String {
         let mut out = String::new();
@@ -368,8 +277,6 @@ impl Report {
                 if let Some(door) = &d.door {
                     let _ = write!(out, " ({})", super::show::shown(door));
                 }
-                // The cause quotes the tape (a request, a path, a reply's
-                // codec error, an end's text): shown, as every field is.
                 let _ = write!(
                     out,
                     ": {} — {}",
@@ -436,8 +343,6 @@ impl Report {
             self.lines.len()
         );
         if let Some(how) = &self.returned {
-            // A supervise's end carries its review, line for line under its
-            // exit code (`replay::supervise_end`).
             let mut lines = how.lines();
             let _ = writeln!(
                 out,
@@ -454,11 +359,6 @@ impl Report {
         for key in &self.supplied {
             let _ = writeln!(out, "  supplied by this build: {}", super::show::shown(key));
         }
-        // The ACTS among the requests — each key, send, post, badge, signal
-        // or restart the replayed loop asked on its lane
-        // (`tape::ctl::is_act`), in order: what reached the worker. Its reads,
-        // waits and the claim's renewals are counted above and never listed:
-        // a long run asks thousands; [`Self::requests`] holds every one.
         for words in &self.requests {
             let words: Vec<&str> = words.iter().map(String::as_str).collect();
             if super::ctl::is_act(&words) {

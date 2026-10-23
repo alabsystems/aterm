@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Every style on a light ground. Additive light cannot show on white, so
-//! each style draws in ink there, its body under the letters and inside the
-//! row it swept, in the shape its name promises.
+//! Cursor glow light-ground rendering tests.
 
 use super::*;
 
@@ -37,9 +35,7 @@ fn typed(c: &GlowConfig, keys: u16) -> (CursorGlow, Vec<GlowQuad>, Instant) {
 }
 
 /// The streak's body alone at `at` with the caret at `cur`, into fresh
-/// streams: its under-ink stream. Laser's crackle bolts, which the full tick
-/// also paints under the ink (and which may leave the row, as a strike
-/// does), are not the body, so they stay out of the row and band probes.
+/// streams: its under-ink stream.
 fn body(
     glow: &mut CursorGlow,
     c: &GlowConfig,
@@ -55,7 +51,7 @@ fn body(
 /// Nonzero one-pixel cells are a valid effects canvas too: a beam's
 /// under-ink body (the light ground's ink, the dark ground's bed) may round
 /// away, but must not panic or grow outside its row to meet a half-pixel
-/// minimum. Ordinary cells still draw on both grounds.
+/// minimum.
 #[test]
 fn light_beams_fit_one_pixel_high_cells_without_panicking() {
     for (height, dark) in [
@@ -89,8 +85,6 @@ fn light_beams_fit_one_pixel_high_cells_without_panicking() {
             let under = body(&mut glow, &c, g, now, (2, 10));
             let top = 2 * height as u16;
             let bottom = top + height as u16;
-            // On a dark ground a style's vivid rail lies in the leading under
-            // the row, at most a fifth of a cell deep; nothing else leaves it.
             let rail = if dark {
                 (height as f32 * 0.2).ceil() as u16
             } else {
@@ -126,8 +120,7 @@ fn ink_heights(under: &[GlowQuad]) -> std::collections::BTreeMap<u16, u16> {
 /// The beam family's body on a light ground is source-over ink in the
 /// under-ink stream (letters draw over it at full contrast) and never leaves
 /// the row it swept, so the lines above and below stay clean; the comet and
-/// the beam ink nothing over the letters. Negative control: a dark ground
-/// keeps the additive beam over the air around the run.
+/// the beam ink nothing over the letters.
 #[test]
 fn light_beam_bodies_are_ink_under_the_letters_inside_their_row() {
     let g = geom();
@@ -163,15 +156,11 @@ fn light_beam_bodies_are_ink_under_the_letters_inside_their_row() {
             "{style:?}: no additive light on a light ground"
         );
         if matches!(style, GlowStyle::Comet | GlowStyle::Beam) {
-            // Their body is their look: no dust is inked over the letters
-            // (the comet's ice glints are ink under them).
             assert!(
                 glow.halos().is_empty(),
                 "{style:?}: nothing over the letters"
             );
         }
-        // Negative control: the same typing on a dark ground lays additive
-        // light (over the air around the run, its bed under the letters).
         let (_, dark, _) = typed(&cfg(style, true), 6);
         assert!(
             dark.iter().any(|q| q.alpha == 0),
@@ -201,8 +190,6 @@ fn light_sparkles_and_embers_are_ink() {
 
 /// The comet and the beam no longer draw one shape in two colours on a light
 /// ground: the comet's ink swells toward the caret, the beam's tube is even.
-/// The comet is measured along its tail's spine band (its ice glints hang
-/// above and below the tail, off it).
 #[test]
 fn light_comet_tapers_and_light_beam_is_even() {
     let g = geom();
@@ -213,7 +200,6 @@ fn light_comet_tapers_and_light_beam_is_even() {
         let (mut glow, _, t) = typed(&c, 6);
         let under = body(&mut glow, &c, g, t, (2, 10));
         let heights = ink_heights(&under);
-        // Two cells behind the caret (col 10) and one cell behind it.
         let x = |col: u16| col * g.cw as u16 + g.cw as u16 / 2;
         let at = |col: u16| heights.get(&x(col)).copied().unwrap_or(0);
         let ink = |col: u16| {
@@ -261,8 +247,7 @@ fn column_darkness(under: &[GlowQuad], x: u16) -> std::collections::BTreeMap<u16
 /// darkest ink (within a quarter of its peak, above the dither) is a band at
 /// least a third of the row tall (a highlighter around the text), not a thin
 /// line along the row's middle, both while it is fresh and as it powers
-/// down. NEGATIVE CONTROL: Laser, whose hard thin
-/// line is its look, peaks in a band under a third of the row.
+/// down.
 #[test]
 fn light_beam_is_a_band_around_the_letters_never_a_strike() {
     let g = geom();
@@ -300,8 +285,6 @@ fn light_beam_is_a_band_around_the_letters_never_a_strike() {
 /// Lumen's look shows on a light ground as a tracer, not a lamp: soft ink
 /// under the letters behind the caret (the glow over the letters just typed
 /// and the tracer under the run), and nothing ahead of the caret's own cell.
-/// Negative control: the same glow centred on the caret (a lamp reaching a
-/// cell and a half either side) lays ink ahead of it.
 #[test]
 fn light_lumen_traces_behind_the_caret_and_not_ahead() {
     let g = geom();
@@ -315,7 +298,6 @@ fn light_lumen_traces_behind_the_caret_and_not_ahead() {
     assert!(behind > 0, "no ink behind the caret");
     assert_eq!(ahead, 0, "ink ahead of the caret's cell: {ahead} columns");
     assert!(glow.under_quads().iter().all(|q| q.alpha > 0));
-    // Control: a lamp around the caret reaches ahead of it.
     let mut lamp = Vec::new();
     push_ink_ellipse(
         &mut lamp,
@@ -341,8 +323,7 @@ fn light_lumen_traces_behind_the_caret_and_not_ahead() {
 /// the coma's radius from the caret's centre, and the head behind the caret is
 /// a dense round nucleus: the comet's ink over the newest letter's cell is
 /// markedly deeper than over the tail two cells back, while the newest
-/// letter keeps the light body's bar over it. Negative control: lumen's
-/// even tracer, judged the same way, shows no nucleus.
+/// letter keeps the light body's bar over it.
 #[test]
 fn the_light_comet_head_stays_in_the_caret_cell_and_wears_a_nucleus() {
     let g = tall_geom();
@@ -379,7 +360,6 @@ fn the_light_comet_head_stays_in_the_caret_cell_and_wears_a_nucleus() {
             "comet ink past the caret's leading edge ({lead}) and its coma ({coma}): {q:?}"
         );
     }
-    // The ink's depth over a cell: the darkest of its middle row on white.
     let depth = |ink: &[GlowQuad], col: u16| -> f32 {
         let mut glass = Glass::new(g, 0x00FF_FFFF);
         glass.add_quads(ink);
@@ -402,7 +382,6 @@ fn the_light_comet_head_stays_in_the_caret_cell_and_wears_a_nucleus() {
         lh < 1.3 * lt,
         "control: lumen's even tracer reads as a nucleus ({lh:.3} against {lt:.3})"
     );
-    // The newest letter keeps the light body's bar over the head.
     let mut lit = Glass::new(g, 0x00FF_FFFF);
     lit.add_quads(glow.under_quads());
     let (strokes, counters) = glyph(g, row, caret - 1);
@@ -465,9 +444,7 @@ fn light_grains_keep_off_the_block_caret() {
 /// stretch on the landing row: for the beam, sparkle and comet, a
 /// jump from the end of row 2 down to the start of row 5 leaves every under
 /// quad of the body inside row 5's band, and the rows it crossed (the output
-/// an Enter just printed) take no ink. Negative control: the laser's
-/// lightning strike, which keeps its whole path, does reach the rows the
-/// jump crossed, so the jump really spans them.
+/// an Enter just printed) take no ink.
 #[test]
 fn a_light_band_that_leaps_rows_stays_on_the_landing_row() {
     let g = geom();
@@ -517,19 +494,7 @@ fn a_light_band_that_leaps_rows_stays_on_the_landing_row() {
     );
 }
 
-/// OVER WIDE GLYPHS A LIGHT BAND KEEPS ITS SHAPE AND HUE, LIGHTER. A band
-/// fills a wide glyph's whole box (CJK, emoji), the gaps between its strokes
-/// included, where a Latin letter keeps paper above and below its x-height.
-/// Typing four wide glyphs from column 4 of row 2, with the host's row probe
-/// marking them, the beam, phaser and sparkle lay their band under the typed
-/// glyphs' cells (the sparkle's in its gold), the newest beside the caret
-/// included (the caret's cell past a wide glyph is held too, or the band's
-/// ramp up to it crossed that glyph), holding the paper there to
-/// what leaves the theme's text [`LIGHT_WIDE_BED_KEEP`] of its contrast, the
-/// row's top and bottom pixel rows stay paper (no rail, no hard-edged band
-/// at a cell's edge), and no veil is laid. Negative control: the same keys
-/// over a probe of narrow letters darken those cells past the keep for a
-/// style whose band is deeper than it (the beam's quiet tube is not).
+/// OVER WIDE GLYPHS A LIGHT BAND KEEPS ITS SHAPE AND HUE, LIGHTER.
 #[test]
 fn light_bands_over_wide_glyphs_keep_their_shape_and_hue_lighter() {
     let g = geom();
@@ -564,7 +529,6 @@ fn light_bands_over_wide_glyphs_keep_their_shape_and_hue_lighter() {
         }
         (c, glow.under_quads().to_vec(), glow.halos().to_vec())
     };
-    // The typed glyphs' cells, the newest one beside the caret included.
     let x0 = i32::from(start) * g.cw as i32;
     let x1 = i32::from(start + 2 * keys) * g.cw as i32;
     let (y0, y1) = (
@@ -575,8 +539,6 @@ fn light_bands_over_wide_glyphs_keep_their_shape_and_hue_lighter() {
         let (qx0, qx1) = (i32::from(q.x), i32::from(q.x) + i32::from(q.w));
         qx0 < x1 && qx1 > x0 && q.alpha.max(q.alpha2) > 0
     };
-    // The least contrast the text keeps over the typed cells' paper, and
-    // over the row's top and bottom pixel rows there.
     let reading = |c: &GlowConfig, under: &[GlowQuad]| {
         let mut glass = Glass::new(g, c.theme_bg);
         glass.add_quads(under);
@@ -639,8 +601,7 @@ fn light_bands_over_wide_glyphs_keep_their_shape_and_hue_lighter() {
 /// ON PAPER SPARKLE'S BAND STAYS GOLD AT THE HEAD: over a 24-key run on
 /// GitHub Light, every frame's band under the two newest letters is ink of
 /// the gold family (whatever hue its wheel has rolled to), so the bed behind
-/// the letter just typed never turns leaf-green or salmon. Negative control:
-/// the phaser's band over the same run, its spectrum, leaves the family.
+/// the letter just typed never turns leaf-green or salmon.
 #[test]
 fn the_light_sparkle_band_stays_gold_at_the_head() {
     let g = geom();
@@ -689,7 +650,7 @@ fn the_light_sparkle_band_stays_gold_at_the_head() {
 /// rises from the paper over its oldest cell and a half, so
 /// along its spine no pixel column steps by more than a fifth of the band's
 /// depth (a cut at the tail's end stepped from paper to the whole band in
-/// one column). Control: the band is there, deep in its middle.
+/// one column).
 #[test]
 fn a_light_bands_tail_fades_out() {
     let g = geom();

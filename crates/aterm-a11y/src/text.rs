@@ -667,7 +667,7 @@ impl<'a> Range<'a> {
         self.fix_start_bias();
     }
 
-    pub(crate) fn to_text_selection(self) -> TextSelection {
+    pub(crate) const fn to_text_selection(self) -> TextSelection {
         TextSelection {
             anchor: self.start.downgrade(),
             focus: self.end.downgrade(),

@@ -1,24 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Last-resort fontless symbol glyphs: the geometric shapes, media controls and check
-//! marks TUIs lean on, synthesized from the cell geometry when no face in the resolution
-//! chain covers them. A bare Linux host may have no face at all for U+23F5 `⏵`, which
-//! the Claude Code and Codex footers print.
-//!
-//! Unlike the parent module's box-drawing families, which pre-empt every font so borders
-//! tile seam-free, these are the last tier of [`crate::font_chain::resolve_chain`]
-//! ([`crate::font_chain::Tier::Synthetic`]): any real face that covers the code point
-//! wins, and only `.notdef` tofu is replaced. The `⎿` painter here is the exception,
-//! drawn by the pre-emptive family ([`draw_dentistry_bottom_right`]).
-//!
-//! Each glyph is a few primitives in a unit box (`u, v` in `0..=1`, `v` down) scaled to a
-//! centred square of side `min(span * cell_w, cell_h) * size`, where `span` is the
-//! glyph's cell count (2 for an emoji-presentation code point such as ⏩), so a wide
-//! symbol is centred across both cells. Shapes are supersampled like the Powerline
-//! separators ([`super::Canvas::paint_aa`]); strokes are a light box-drawing line thick
-//! (`min(w, h) / 8`, at least one pixel). `Renderer::rasterize` produces the bytes once
-//! and the CPU blit and the GPU atlas share that [`crate::GlyphImage`].
+//! Last-resort fontless symbol glyphs.
 
 use super::{Canvas, Metrics, eighth, seg_dist};
 
@@ -119,23 +102,19 @@ const fn weighted(size: Size, weight: f32, prims: &'static [Prim]) -> Spec {
     }
 }
 
-// Triangles, apex inset a hair so the AA fringe stays inside the box.
 const UP: &[(f32, f32)] = &[(0.5, 0.06), (1.0, 0.94), (0.0, 0.94)];
 const DOWN: &[(f32, f32)] = &[(0.0, 0.06), (1.0, 0.06), (0.5, 0.94)];
 const RIGHT: &[(f32, f32)] = &[(0.06, 0.0), (0.94, 0.5), (0.06, 1.0)];
 const LEFT: &[(f32, f32)] = &[(0.94, 0.0), (0.06, 0.5), (0.94, 1.0)];
-// ► ◄ — the flatter "pointer" triangles.
 const POINTER_R: &[(f32, f32)] = &[(0.0, 0.2), (1.0, 0.5), (0.0, 0.8)];
 const POINTER_L: &[(f32, f32)] = &[(1.0, 0.2), (0.0, 0.5), (1.0, 0.8)];
 const DIAMOND: &[(f32, f32)] = &[(0.5, 0.0), (1.0, 0.5), (0.5, 1.0), (0.0, 0.5)];
 const DIAMOND_INNER: &[(f32, f32)] = &[(0.5, 0.26), (0.74, 0.5), (0.5, 0.74), (0.26, 0.5)];
 const LOZENGE: &[(f32, f32)] = &[(0.5, 0.0), (0.82, 0.5), (0.5, 1.0), (0.18, 0.5)];
-// ◢◣◤◥ — the corner triangles fill half the box.
 const CORNER_LR: &[(f32, f32)] = &[(1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
 const CORNER_LL: &[(f32, f32)] = &[(0.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
 const CORNER_UL: &[(f32, f32)] = &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)];
 const CORNER_UR: &[(f32, f32)] = &[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)];
-// Media controls.
 const FF_A: &[(f32, f32)] = &[(0.0, 0.0), (0.5, 0.5), (0.0, 1.0)];
 const FF_B: &[(f32, f32)] = &[(0.5, 0.0), (1.0, 0.5), (0.5, 1.0)];
 const RW_A: &[(f32, f32)] = &[(1.0, 0.0), (0.5, 0.5), (1.0, 1.0)];
@@ -149,7 +128,6 @@ const NEXT_B: &[(f32, f32)] = &[(0.42, 0.1), (0.84, 0.5), (0.42, 0.9)];
 const PREV_A: &[(f32, f32)] = &[(1.0, 0.1), (0.58, 0.5), (1.0, 0.9)];
 const PREV_B: &[(f32, f32)] = &[(0.58, 0.1), (0.16, 0.5), (0.58, 0.9)];
 const PLAY_PAUSE: &[(f32, f32)] = &[(0.0, 0.1), (0.5, 0.5), (0.0, 0.9)];
-// Check marks and crosses.
 const CHECK: &[(f32, f32)] = &[(0.08, 0.55), (0.38, 0.86), (0.92, 0.12)];
 const X_A: &[(f32, f32)] = &[(0.15, 0.15), (0.85, 0.85)];
 const X_B: &[(f32, f32)] = &[(0.85, 0.15), (0.15, 0.85)];
@@ -166,19 +144,18 @@ use Size::{Full, Large, Medium, Small};
 #[inline]
 const fn lookup(cp: u32) -> Option<Spec> {
     let s = match cp {
-        // ---- Miscellaneous Technical: media controls ----------------------
-        0x23E9 => spec(Medium, &[Poly(FF_A), Poly(FF_B)]), // ⏩
-        0x23EA => spec(Medium, &[Poly(RW_A), Poly(RW_B)]), // ⏪
-        0x23EB => spec(Medium, &[Poly(UPUP_A), Poly(UPUP_B)]), // ⏫
-        0x23EC => spec(Medium, &[Poly(DNDN_A), Poly(DNDN_B)]), // ⏬
+        0x23E9 => spec(Medium, &[Poly(FF_A), Poly(FF_B)]),
+        0x23EA => spec(Medium, &[Poly(RW_A), Poly(RW_B)]),
+        0x23EB => spec(Medium, &[Poly(UPUP_A), Poly(UPUP_B)]),
+        0x23EC => spec(Medium, &[Poly(DNDN_A), Poly(DNDN_B)]),
         0x23ED => spec(
             Medium,
             &[Poly(NEXT_A), Poly(NEXT_B), Rect(0.86, 0.1, 1.0, 0.9)],
-        ), // ⏭
+        ),
         0x23EE => spec(
             Medium,
             &[Rect(0.0, 0.1, 0.14, 0.9), Poly(PREV_B), Poly(PREV_A)],
-        ), // ⏮
+        ),
         0x23EF => spec(
             Medium,
             &[
@@ -186,107 +163,99 @@ const fn lookup(cp: u32) -> Option<Spec> {
                 Rect(0.6, 0.1, 0.74, 0.9),
                 Rect(0.86, 0.1, 1.0, 0.9),
             ],
-        ), // ⏯
-        0x23F4 => spec(Medium, &[Poly(LEFT)]),             // ⏴
-        0x23F5 => spec(Medium, &[Poly(RIGHT)]),            // ⏵
-        0x23F6 => spec(Medium, &[Poly(UP)]),               // ⏶
-        0x23F7 => spec(Medium, &[Poly(DOWN)]),             // ⏷
+        ),
+        0x23F4 => spec(Medium, &[Poly(LEFT)]),
+        0x23F5 => spec(Medium, &[Poly(RIGHT)]),
+        0x23F6 => spec(Medium, &[Poly(UP)]),
+        0x23F7 => spec(Medium, &[Poly(DOWN)]),
         0x23F8 => spec(
             Medium,
             &[Rect(0.1, 0.0, 0.38, 1.0), Rect(0.62, 0.0, 0.9, 1.0)],
-        ), // ⏸
-        0x23F9 => spec(Medium, &[Rect(0.0, 0.0, 1.0, 1.0)]), // ⏹
-        0x23FA => spec(Medium, &[Disc(0.5, 0.5, 0.5)]),    // ⏺
-        // ---- Geometric Shapes ---------------------------------------------
-        0x25A0 => spec(Large, &[Rect(0.0, 0.0, 1.0, 1.0)]), // ■
-        0x25A1 | 0x25A2 => spec(Large, &[RectOutline(0.0, 0.0, 1.0, 1.0)]), // □ ▢
+        ),
+        0x23F9 => spec(Medium, &[Rect(0.0, 0.0, 1.0, 1.0)]),
+        0x23FA => spec(Medium, &[Disc(0.5, 0.5, 0.5)]),
+        0x25A0 => spec(Large, &[Rect(0.0, 0.0, 1.0, 1.0)]),
+        0x25A1 | 0x25A2 => spec(Large, &[RectOutline(0.0, 0.0, 1.0, 1.0)]),
         0x25A3 => spec(
             Large,
             &[RectOutline(0.0, 0.0, 1.0, 1.0), Rect(0.3, 0.3, 0.7, 0.7)],
-        ), // ▣
-        0x25AA => spec(Small, &[Rect(0.0, 0.0, 1.0, 1.0)]), // ▪
-        0x25AB => spec(Small, &[RectOutline(0.0, 0.0, 1.0, 1.0)]), // ▫
-        0x25AC => spec(Large, &[Rect(0.0, 0.3, 1.0, 0.7)]), // ▬
-        0x25AD => spec(Large, &[RectOutline(0.0, 0.3, 1.0, 0.7)]), // ▭
-        0x25AE => spec(Large, &[Rect(0.25, 0.0, 0.75, 1.0)]), // ▮
-        0x25AF => spec(Large, &[RectOutline(0.25, 0.0, 0.75, 1.0)]), // ▯
-        0x25B2 => spec(Large, &[Poly(UP)]),                 // ▲
-        0x25B3 => spec(Large, &[PolyOutline(UP)]),          // △
-        0x25B4 => spec(Small, &[Poly(UP)]),                 // ▴
-        0x25B5 => spec(Small, &[PolyOutline(UP)]),          // ▵
-        0x25B6 => spec(Large, &[Poly(RIGHT)]),              // ▶
-        0x25B7 => spec(Large, &[PolyOutline(RIGHT)]),       // ▷
-        0x25B8 => spec(Small, &[Poly(RIGHT)]),              // ▸
-        0x25B9 => spec(Small, &[PolyOutline(RIGHT)]),       // ▹
-        0x25BA => spec(Large, &[Poly(POINTER_R)]),          // ►
-        0x25BB => spec(Large, &[PolyOutline(POINTER_R)]),   // ▻
-        0x25BC => spec(Large, &[Poly(DOWN)]),               // ▼
-        0x25BD => spec(Large, &[PolyOutline(DOWN)]),        // ▽
-        0x25BE => spec(Small, &[Poly(DOWN)]),               // ▾
-        0x25BF => spec(Small, &[PolyOutline(DOWN)]),        // ▿
-        0x25C0 => spec(Large, &[Poly(LEFT)]),               // ◀
-        0x25C1 => spec(Large, &[PolyOutline(LEFT)]),        // ◁
-        0x25C2 => spec(Small, &[Poly(LEFT)]),               // ◂
-        0x25C3 => spec(Small, &[PolyOutline(LEFT)]),        // ◃
-        0x25C4 => spec(Large, &[Poly(POINTER_L)]),          // ◄
-        0x25C5 => spec(Large, &[PolyOutline(POINTER_L)]),   // ◅
-        0x25C6 => spec(Large, &[Poly(DIAMOND)]),            // ◆
-        0x25C7 => spec(Large, &[PolyOutline(DIAMOND)]),     // ◇
-        0x25C8 => spec(Large, &[PolyOutline(DIAMOND), Poly(DIAMOND_INNER)]), // ◈
-        0x25C9 => spec(Large, &[Ring(0.5, 0.5, 0.5), Disc(0.5, 0.5, 0.24)]), // ◉
-        0x25CA => spec(Large, &[PolyOutline(LOZENGE)]),     // ◊
-        0x25CB => spec(Large, &[Ring(0.5, 0.5, 0.5)]),      // ○
-        0x25CC => spec(Large, &[DottedRing(0.5, 0.5, 0.44, 8)]), // ◌
-        0x25CE => spec(Large, &[Ring(0.5, 0.5, 0.5), Ring(0.5, 0.5, 0.26)]), // ◎
-        0x25CF => spec(Large, &[Disc(0.5, 0.5, 0.5)]),      // ●
+        ),
+        0x25AA => spec(Small, &[Rect(0.0, 0.0, 1.0, 1.0)]),
+        0x25AB => spec(Small, &[RectOutline(0.0, 0.0, 1.0, 1.0)]),
+        0x25AC => spec(Large, &[Rect(0.0, 0.3, 1.0, 0.7)]),
+        0x25AD => spec(Large, &[RectOutline(0.0, 0.3, 1.0, 0.7)]),
+        0x25AE => spec(Large, &[Rect(0.25, 0.0, 0.75, 1.0)]),
+        0x25AF => spec(Large, &[RectOutline(0.25, 0.0, 0.75, 1.0)]),
+        0x25B2 => spec(Large, &[Poly(UP)]),
+        0x25B3 => spec(Large, &[PolyOutline(UP)]),
+        0x25B4 => spec(Small, &[Poly(UP)]),
+        0x25B5 => spec(Small, &[PolyOutline(UP)]),
+        0x25B6 => spec(Large, &[Poly(RIGHT)]),
+        0x25B7 => spec(Large, &[PolyOutline(RIGHT)]),
+        0x25B8 => spec(Small, &[Poly(RIGHT)]),
+        0x25B9 => spec(Small, &[PolyOutline(RIGHT)]),
+        0x25BA => spec(Large, &[Poly(POINTER_R)]),
+        0x25BB => spec(Large, &[PolyOutline(POINTER_R)]),
+        0x25BC => spec(Large, &[Poly(DOWN)]),
+        0x25BD => spec(Large, &[PolyOutline(DOWN)]),
+        0x25BE => spec(Small, &[Poly(DOWN)]),
+        0x25BF => spec(Small, &[PolyOutline(DOWN)]),
+        0x25C0 => spec(Large, &[Poly(LEFT)]),
+        0x25C1 => spec(Large, &[PolyOutline(LEFT)]),
+        0x25C2 => spec(Small, &[Poly(LEFT)]),
+        0x25C3 => spec(Small, &[PolyOutline(LEFT)]),
+        0x25C4 => spec(Large, &[Poly(POINTER_L)]),
+        0x25C5 => spec(Large, &[PolyOutline(POINTER_L)]),
+        0x25C6 => spec(Large, &[Poly(DIAMOND)]),
+        0x25C7 => spec(Large, &[PolyOutline(DIAMOND)]),
+        0x25C8 => spec(Large, &[PolyOutline(DIAMOND), Poly(DIAMOND_INNER)]),
+        0x25C9 => spec(Large, &[Ring(0.5, 0.5, 0.5), Disc(0.5, 0.5, 0.24)]),
+        0x25CA => spec(Large, &[PolyOutline(LOZENGE)]),
+        0x25CB => spec(Large, &[Ring(0.5, 0.5, 0.5)]),
+        0x25CC => spec(Large, &[DottedRing(0.5, 0.5, 0.44, 8)]),
+        0x25CE => spec(Large, &[Ring(0.5, 0.5, 0.5), Ring(0.5, 0.5, 0.26)]),
+        0x25CF => spec(Large, &[Disc(0.5, 0.5, 0.5)]),
         0x25D0 => spec(
             Large,
             &[Ring(0.5, 0.5, 0.5), HalfDisc(0.5, 0.5, 0.5, -1.0, 0.0)],
-        ), // ◐
+        ),
         0x25D1 => spec(
             Large,
             &[Ring(0.5, 0.5, 0.5), HalfDisc(0.5, 0.5, 0.5, 1.0, 0.0)],
-        ), // ◑
+        ),
         0x25D2 => spec(
             Large,
             &[Ring(0.5, 0.5, 0.5), HalfDisc(0.5, 0.5, 0.5, 0.0, 1.0)],
-        ), // ◒
+        ),
         0x25D3 => spec(
             Large,
             &[Ring(0.5, 0.5, 0.5), HalfDisc(0.5, 0.5, 0.5, 0.0, -1.0)],
-        ), // ◓
-        0x25E2 => spec(Full, &[Poly(CORNER_LR)]),           // ◢
-        0x25E3 => spec(Full, &[Poly(CORNER_LL)]),           // ◣
-        0x25E4 => spec(Full, &[Poly(CORNER_UL)]),           // ◤
-        0x25E5 => spec(Full, &[Poly(CORNER_UR)]),           // ◥
-        0x25E6 => spec(Small, &[Ring(0.5, 0.5, 0.5)]),      // ◦
-        0x25EF => spec(Full, &[Ring(0.5, 0.5, 0.5)]),       // ◯
-        0x25FB => spec(Medium, &[RectOutline(0.0, 0.0, 1.0, 1.0)]), // ◻
-        0x25FC => spec(Medium, &[Rect(0.0, 0.0, 1.0, 1.0)]), // ◼
-        0x25FD => spec(Small, &[RectOutline(0.0, 0.0, 1.0, 1.0)]), // ◽
-        0x25FE => spec(Small, &[Rect(0.0, 0.0, 1.0, 1.0)]), // ◾
-        // ---- Miscellaneous Symbols / Dingbats ------------------------------
-        0x26AA => spec(Medium, &[Ring(0.5, 0.5, 0.5)]), // ⚪
-        0x26AB => spec(Medium, &[Disc(0.5, 0.5, 0.5)]), // ⚫
-        0x2713 => spec(Large, &[Line(CHECK)]),          // ✓
-        0x2714 => heavy(Large, &[Line(CHECK)]),         // ✔
-        0x2715 => spec(Large, &[Line(X_A), Line(X_B)]), // ✕
-        0x2716 => heavy(Large, &[Line(X_A), Line(X_B)]), // ✖
-        0x2717 => spec(Large, &[Line(BALLOT_A), Line(BALLOT_B)]), // ✗
-        0x2718 => heavy(Large, &[Line(BALLOT_A), Line(BALLOT_B)]), // ✘
-        // Claude Code's spinner frames ([`is_spinner_star`]): strokes and
-        // petals solid enough, and inks close enough, that no frame dims
-        // the cycle. `✶` keeps a face's proportions: its notches reach in to
-        // 0.4 of its points (Iosevka Term's own `✶` is 0.40; DejaVu Sans
-        // Mono's, Segoe UI Symbol's and Noto Sans Symbols 2's 0.29-0.33).
-        0x2722 => spec(Full, &[Teardrops(4, 0.16)]), // ✢
-        0x2733 => weighted(Full, 1.3, &[Spokes(8)]), // ✳
-        0x2736 => spec(Full, &[Star(6, 0.4)]),       // ✶
-        0x273B => spec(Full, &[Teardrops(6, 0.13)]), // ✻
-        0x273D => spec(Full, &[Teardrops(6, 0.15)]), // ✽
-        // ---- Miscellaneous Symbols and Arrows ------------------------------
-        0x2B24 => spec(Full, &[Disc(0.5, 0.5, 0.5)]), // ⬤
-        0x2B58 => heavy(Large, &[Ring(0.5, 0.5, 0.5)]), // ⭘
+        ),
+        0x25E2 => spec(Full, &[Poly(CORNER_LR)]),
+        0x25E3 => spec(Full, &[Poly(CORNER_LL)]),
+        0x25E4 => spec(Full, &[Poly(CORNER_UL)]),
+        0x25E5 => spec(Full, &[Poly(CORNER_UR)]),
+        0x25E6 => spec(Small, &[Ring(0.5, 0.5, 0.5)]),
+        0x25EF => spec(Full, &[Ring(0.5, 0.5, 0.5)]),
+        0x25FB => spec(Medium, &[RectOutline(0.0, 0.0, 1.0, 1.0)]),
+        0x25FC => spec(Medium, &[Rect(0.0, 0.0, 1.0, 1.0)]),
+        0x25FD => spec(Small, &[RectOutline(0.0, 0.0, 1.0, 1.0)]),
+        0x25FE => spec(Small, &[Rect(0.0, 0.0, 1.0, 1.0)]),
+        0x26AA => spec(Medium, &[Ring(0.5, 0.5, 0.5)]),
+        0x26AB => spec(Medium, &[Disc(0.5, 0.5, 0.5)]),
+        0x2713 => spec(Large, &[Line(CHECK)]),
+        0x2714 => heavy(Large, &[Line(CHECK)]),
+        0x2715 => spec(Large, &[Line(X_A), Line(X_B)]),
+        0x2716 => heavy(Large, &[Line(X_A), Line(X_B)]),
+        0x2717 => spec(Large, &[Line(BALLOT_A), Line(BALLOT_B)]),
+        0x2718 => heavy(Large, &[Line(BALLOT_A), Line(BALLOT_B)]),
+        0x2722 => spec(Full, &[Teardrops(4, 0.16)]),
+        0x2733 => weighted(Full, 1.3, &[Spokes(8)]),
+        0x2736 => spec(Full, &[Star(6, 0.4)]),
+        0x273B => spec(Full, &[Teardrops(6, 0.13)]),
+        0x273D => spec(Full, &[Teardrops(6, 0.15)]),
+        0x2B24 => spec(Full, &[Disc(0.5, 0.5, 0.5)]),
+        0x2B58 => heavy(Large, &[Ring(0.5, 0.5, 0.5)]),
         _ => return None,
     };
     Some(s)
@@ -298,9 +267,7 @@ pub(super) const fn covers(ch: char) -> bool {
     lookup(ch as u32).is_some()
 }
 
-/// Row-major coverage for `ch` at `span * cell_w` × `cell_h` (`span` clamped
-/// to `1..=2`), or `None` when `ch` is not a symbol this module draws or the
-/// cell is degenerate.
+/// Row-major coverage for `ch` at `span * cell_w` × `cell_h` (`span` clamped to `1..=2`).
 pub(super) fn coverage(ch: char, cell_w: usize, cell_h: usize, span: usize) -> Option<Vec<u8>> {
     if cell_w == 0 || cell_h == 0 {
         return None;
@@ -317,9 +284,6 @@ fn draw(spec: Spec, cell_w: usize, cell_h: usize, span: usize) -> Vec<u8> {
     let side = wf.min(hf) * spec.size.scale();
     let (bx, by) = ((wf - side) / 2.0, (hf - side) / 2.0);
     let to_px = |(u, v): (f32, f32)| (bx + u * side, by + v * side);
-    // The parent module's light stroke (`min(w, h) / 8`), floored at one pixel
-    // so a tiny cell keeps a connected outline; measured on ONE cell even for a
-    // wide symbol, so ⚪ and ○ share a stroke weight.
     let stroke = (cell_w.min(cell_h) as f32 / 8.0).max(1.0) * spec.weight;
     for prim in spec.prims {
         match *prim {
@@ -406,8 +370,6 @@ fn draw(spec: Spec, cell_w: usize, cell_h: usize, span: usize) -> Vec<u8> {
                     dirs.iter().any(|&(dx, dy)| {
                         let along = vx * dx + vy * dy;
                         let (hx, hy) = (vx - dx * reach, vy - dy * reach);
-                        // The head, or the cone from the centre that widens
-                        // to it.
                         hx.hypot(hy) <= head
                             || ((0.0..=reach).contains(&along)
                                 && (vx * dy - vy * dx).abs() <= head * along / reach)
@@ -416,9 +378,6 @@ fn draw(spec: Spec, cell_w: usize, cell_h: usize, span: usize) -> Vec<u8> {
             }
             Star(n, inner) => {
                 let (cx, cy) = to_px((0.5, 0.5));
-                // The largest star whose points stay inside the cell: the
-                // points' radius over the widest and tallest of their
-                // directions (`cos 30°` and 1 for six standing on one).
                 let (sx, sy) = directions(n)
                     .iter()
                     .fold((0.0f32, 0.0f32), |(sx, sy), &(dx, dy)| {
@@ -427,8 +386,6 @@ fn draw(spec: Spec, cell_w: usize, cell_h: usize, span: usize) -> Vec<u8> {
                 let outer = (wf / 2.0 / sx).min(hf / 2.0 / sy) * spec.size.scale();
                 let inner = inner * outer;
                 let step = std::f32::consts::PI / n as f32;
-                // One edge, in the frame of the inner corner's direction:
-                // from the corner `(inner, 0)` out to the point.
                 let (tx, ty) = (outer * step.cos(), outer * step.sin());
                 c.paint_aa(|px, py| {
                     let (vx, vy) = (px - cx, py - cy);
@@ -436,13 +393,10 @@ fn draw(spec: Spec, cell_w: usize, cell_h: usize, span: usize) -> Vec<u8> {
                     if d <= inner {
                         return true;
                     }
-                    // The angle from the nearest inner corner: 0 there,
-                    // `step` at a point.
                     let a = ((vy.atan2(vx) + std::f32::consts::FRAC_PI_2).rem_euclid(2.0 * step)
                         - step)
                         .abs();
                     let (qx, qy) = (d * a.cos(), d * a.sin());
-                    // On the centre's side of the edge.
                     (tx - inner) * qy - ty * (qx - inner) >= 0.0
                 });
             }
@@ -473,17 +427,7 @@ fn directions(n: u32) -> Vec<(f32, f32)> {
         .collect()
 }
 
-/// Claude Code's spinner frames, `✢ ✳ ✶ ✻ ✽` (with `·`, which every text
-/// face draws, and the face's own `*`, or `✳` in Ghostty). A face's dingbats are
-/// pictures at text size: the Iosevka Term Semibold the Windows default
-/// draws them as x-height marks, and the DejaVu Sans Mono its chain then
-/// reached drew `✳`'s eight 1 px spokes and `✶`'s small star soft once
-/// fitted into the cell — 8.5% and 14% of their ink solid, about half the
-/// ink of `✻` and `✽` (measured 2026-10-18 at 9x23), so the spinner dimmed on
-/// those frames. These are drawn from the cell instead, wherever the primary
-/// yields them and the text is smaller than `bundled::SPINNER_STARS_CRISP_PX`
-/// (`Renderer::spinner_star_preempts`); everywhere else they are only the
-/// last resort for a host with no face for them.
+/// Claude Code's spinner frames, `✢ ✳ ✶ ✻ ✽`.
 #[inline]
 pub(crate) const fn is_spinner_star(ch: char) -> bool {
     matches!(
@@ -496,13 +440,7 @@ pub(crate) const fn is_spinner_star(ch: char) -> bool {
 pub(crate) const SPINNER_STARS: [char; 5] =
     ['\u{2722}', '\u{2733}', '\u{2736}', '\u{273B}', '\u{273D}'];
 
-/// U+23BF `⎿`, Claude Code's tool-output connector: a light vertical on the `│` columns
-/// from the top edge to the three-quarter line, then a light horizontal to the right
-/// edge, hard 0/255.
-///
-/// Drawn by the pre-emptive family ([`super::covers`]), not as a last-resort symbol,
-/// because a font's `⎿` cannot join the procedural `│` above it: Noto CJK, the only
-/// Linux face with U+23BF, draws a short L at the cell bottom and leaves a gap.
+/// U+23BF `⎿`, Claude Code's tool-output connector.
 pub(super) fn draw_dentistry_bottom_right(c: &mut Canvas) {
     let m = Metrics::new(c.w, c.h);
     let foot = eighth(6, m.h).clamp(m.light, m.h);
@@ -535,7 +473,6 @@ impl ConvexPoly {
                     return None;
                 }
                 let (mut nx, mut ny) = (ey / len, -ex / len);
-                // Orient AWAY from the centroid, so either winding works.
                 if (gx - ax) * nx + (gy - ay) * ny > 0.0 {
                     nx = -nx;
                     ny = -ny;
@@ -573,12 +510,7 @@ mod tests {
     /// zooms (11x29, 13x36), larger cells (14x34, 18x46) and the cells of
     /// other font sizes (8x17, 10x21), every frame reaches full ink, at
     /// least a quarter of its ink is solid, and the frames' ink sums are
-    /// within 1.5x of each other. (The fitted DejaVu Sans Mono glyphs were
-    /// 0-12% solid at 9x23, and `✳` and `✶` about half the ink of `✽`.) A
-    /// quarter, not more: in an even-width cell a centred upright point
-    /// straddles two texel columns, which leaves `✶`'s slender points 26%
-    /// solid at 8x17. A 7 px cell is too narrow for six spokes to stay
-    /// apart; there every frame still reaches full ink.
+    /// within 1.5x of each other.
     #[test]
     fn spinner_frames_are_solid_and_even() {
         let frames = ['\u{2722}', '\u{2733}', '\u{2736}', '\u{273B}', '\u{273D}'];
@@ -632,7 +564,6 @@ mod tests {
     /// points' radius from the cell centre.
     fn points_and_notches(mask: &[u8], w: usize, h: usize, reach: f32) -> (f32, f32) {
         let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
-        // Side points at the cell's edges (`Prim::Star`).
         let r = reach * (w as f32 / 2.0) / (std::f32::consts::PI / 6.0).cos();
         let along = |deg: f32| {
             let a = deg.to_radians();
@@ -643,14 +574,7 @@ mod tests {
         (points.fold(1.0, f32::min), notches.fold(0.0, f32::max))
     }
 
-    /// `✶` READS AS A SIX-POINTED STAR, NOT A HEXAGON. At 0.6 of its points'
-    /// radius each of its six points is at least half covered, and at 0.65
-    /// each notch between them is at most 15% covered, at the Windows
-    /// default's 1x, 1.25x and 1.5x cells (9x23, 11x29, 13x36) and at 7x15,
-    /// 8x17 and 10x21; its side points reach the cell's edges, so it
-    /// stands as tall against its width as a face's `✶`. Control: the
-    /// proportions it had (inner corners at 0.65 of the points) fill the
-    /// notches at least half — the hexagon with stub points the judges saw.
+    /// `✶` READS AS A SIX-POINTED STAR, NOT A HEXAGON.
     #[test]
     fn the_six_pointed_star_keeps_its_notches_open() {
         for (w, h) in [(9, 23), (11, 29), (13, 36), (7, 15), (8, 17), (10, 21)] {

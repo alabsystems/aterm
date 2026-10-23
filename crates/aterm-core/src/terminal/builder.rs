@@ -26,6 +26,7 @@ pub const TIERED_RING_CAP_DEFAULT: usize = 1_000;
 ///     .ring_buffer_size(10_000)
 ///     .build();
 /// ```
+/// use aterm_core::terminal::TerminalBuilder;
 #[derive(Debug)]
 pub struct TerminalBuilder {
     rows: u16,

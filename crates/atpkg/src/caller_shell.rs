@@ -4,6 +4,7 @@
 //! Caller shell detection and cross-platform process argv/environment inspection.
 
 /// The shell families this crate can name a remedy for, or hand a PATH line to; the
+/// parent's executable name is admitted only when it is one of these.
 const SHELLS: &[&str] = &[
     "zsh",
     "bash",
@@ -86,6 +87,7 @@ pub(crate) fn process_exe_name(pid: u32) -> Option<String> {
 }
 
 /// The basename of the file `/proc/<pid>/exe` points at, with procfs's " (deleted)"
+/// annotation removed.
 #[cfg(target_os = "linux")]
 fn linux_exe_link_name(pid: u32) -> Option<String> {
     let link = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
@@ -95,6 +97,7 @@ fn linux_exe_link_name(pid: u32) -> Option<String> {
 }
 
 /// `/proc/<pid>/comm`: the kernel's label for the thread group, the exec'd file's basename
+/// truncated to 15 bytes unless the process renamed itself.
 #[cfg(target_os = "linux")]
 fn linux_comm_name(pid: u32) -> Option<String> {
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
@@ -103,12 +106,15 @@ fn linux_comm_name(pid: u32) -> Option<String> {
 }
 
 /// `sysctl` `kern.procargs2` for `pid` ([`aterm_uds::procargs`]): the basename of the
+/// executable's path.
 #[cfg(target_os = "macos")]
 fn macos_exe_name(pid: u32) -> Option<String> {
     exe_name_of_procargs2(&aterm_uds::procargs::read(pid)?)
 }
 
 /// The basename of the exec path a `KERN_PROCARGS2` buffer leads with, read whether or not
+/// the buffer holds every argument word: an argv [`parse_procargs2`] refuses must not cost
+/// the caller its shell.
 #[cfg(any(target_os = "macos", test))]
 fn exe_name_of_procargs2(buf: &[u8]) -> Option<String> {
     let exec_path = aterm_uds::procargs::parse(buf)?.exec_path;
@@ -139,6 +145,9 @@ impl ProcArgs {
 }
 
 /// How a variable's name is compared ([`ProcArgs::env_var`]): on Windows each character
+/// folded as the system folds it (`aterm_sysprobe::paths::fold_case`,
+/// `RtlUpcaseUnicodeChar`'s one-unit-to-one simple uppercase, which
+/// `GetEnvironmentVariableW` compares by); elsewhere exactly.
 fn name_fold() -> fn(char) -> char {
     #[cfg(windows)]
     {
@@ -151,6 +160,7 @@ fn name_fold() -> fn(char) -> char {
 }
 
 /// The value of `kv` (`KEY=value`) when its name is `key`, the two compared character by
+/// character through `fold`: `key` whole, then the `=` that ends the name.
 fn env_value<'a>(kv: &'a str, key: &str, fold: fn(char) -> char) -> Option<&'a str> {
     let mut chars = kv.char_indices();
     for want in key.chars() {
@@ -203,6 +213,8 @@ pub fn process_args(pid: u32) -> Option<ProcArgs> {
 }
 
 /// A Windows command line split into `argv` as the Microsoft C runtime splits it — the
+/// UCRT's `parse_command_line`, its post-2008 rules, which Rust's std and Zig's (Bun's: the
+/// native `claude.exe`) follow too.
 #[cfg(any(windows, test))]
 fn split_command_line(line: &[u16], image: &[u16]) -> Vec<String> {
     const QUOTE: u16 = b'"' as u16;
@@ -277,6 +289,7 @@ fn split_command_line(line: &[u16], image: &[u16]) -> Vec<String> {
 }
 
 /// A Windows environment block (UTF-16) as its `KEY=value` strings: each ends in a NUL, and
+/// an empty one ends the block (a block whose first unit is a NUL holds none).
 #[cfg(any(windows, test))]
 fn split_environment(block: &[u16]) -> Option<Vec<String>> {
     let mut env = Vec::new();
@@ -291,7 +304,7 @@ fn split_environment(block: &[u16]) -> Option<Vec<String>> {
     }
 }
 
-/// `/proc/<pid>/cmdline` (or `environ`) as words. The kernel ends every word with a NUL,
+/// `/proc/<pid>/cmdline` (or `environ`) as words.
 #[cfg(any(test, target_os = "linux"))]
 fn split_nul_list(bytes: &[u8]) -> Vec<String> {
     if bytes.is_empty() {
@@ -321,6 +334,8 @@ mod tests {
     use super::*;
 
     /// The parent's shell wins over `$SHELL`; a non-shell parent falls back to it; a
+    /// login-shell `-` and a `.exe` are stripped; an unknown `$SHELL` still passes
+    /// through (the remedy's PATH-line arm names it).
     #[test]
     fn the_parent_shell_wins_and_the_login_shell_is_the_fallback() {
         assert_eq!(
@@ -360,6 +375,7 @@ mod tests {
     }
 
     /// Poll until `pid` answers `want`, bounded: `Command::spawn` does not promise the
+    /// child has exec'd (macOS's `posix_spawn` path returns first).
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn await_exec(pid: u32, want: &str) {
         let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
@@ -377,6 +393,7 @@ mod tests {
     }
 
     /// The pid reader names this test binary and a spawned `sleep` by executable, and
+    /// answers `None` for a pid nobody has.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn the_pid_reader_names_a_process_by_its_executable() {
@@ -404,6 +421,8 @@ mod tests {
     }
 
     /// End to end through a real shell: `sh`/`zsh`/`bash`/`fish -c` each spawn this test
+    /// binary to print what [`invoking_shell`] answers, with `$SHELL` pointed elsewhere; the
+    /// parent shell is what comes back.
     #[cfg(unix)]
     #[test]
     fn a_real_parent_shell_is_named_over_the_login_shell() {
@@ -470,6 +489,7 @@ mod tests {
     }
 
     /// The KERN_PROCARGS2 layout, built by hand: argc, the exec path, NUL padding, argv,
+    /// then the environment up to the first empty string.
     #[test]
     fn procargs2_parses_argv_and_env_and_refuses_a_short_buffer() {
         let mut buf = 3i32.to_ne_bytes().to_vec();
@@ -487,6 +507,8 @@ mod tests {
     }
 
     /// An argc past 65 535 is a real process (ARG_MAX admits more short words), so such a
+    /// buffer parses whole and names its executable; a count no buffer of its size can hold
+    /// is refused without reserving for it.
     #[test]
     fn procargs2_admits_an_argc_past_65535_and_bounds_it_by_the_buffer() {
         let n = 70_000_usize;
@@ -511,6 +533,7 @@ mod tests {
     }
 
     /// The exe name needs only the exec path: a buffer the whole-layout parser refuses
+    /// (cut inside its argument words) still names its executable.
     #[test]
     fn the_exe_name_reads_the_exec_path_alone() {
         let mut short = 5i32.to_ne_bytes().to_vec();
@@ -520,6 +543,7 @@ mod tests {
     }
 
     /// Linux's `/proc/<pid>/cmdline` keeps an empty argument, as the macOS parser does: only
+    /// the one trailing NUL is a terminator.
     #[test]
     fn a_nul_list_keeps_an_empty_word_and_drops_only_the_terminator() {
         let cmdline = b"claude\0--append-system-prompt\0\0--dangerously-skip-permissions\0";
@@ -555,6 +579,7 @@ mod tests {
     }
 
     /// A live process started with an empty argument reads it back in place (`/proc` on
+    /// Linux, `KERN_PROCARGS2` on macOS).
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn process_args_keeps_an_empty_argument_of_a_live_process() {
@@ -605,6 +630,11 @@ mod tests {
     }
 
     /// A WINDOWS COMMAND LINE SPLITS AS THE C RUNTIME SPLITS IT (the UCRT's post-2008
+    /// rules): the table of Microsoft's "Parsing C command-line arguments", the three lines
+    /// `claude.exe` 2.1.304 was measured reading (2026-10-20), where `CommandLineToArgvW`
+    /// reads otherwise, the program name's own rule (quotes toggle, nothing escapes), empty
+    /// and unclosed words, blanks, backslashes before anything but a quote, the NUL that ends
+    /// the line, and an empty line, which reads as the program's own path.
     #[test]
     fn a_windows_command_line_splits_as_the_c_runtime_splits_it() {
         let split = |line: &str| split_command_line(&wide(line), &wide(r"C:\x\prog.exe"));
@@ -646,6 +676,9 @@ mod tests {
     }
 
     /// A WINDOWS ENVIRONMENT BLOCK READS AS ITS STRINGS UP TO THE EMPTY ONE: the drive
+    /// letters' working directories (`=C:=C:\x`) are entries, found by their own names, and
+    /// a value may hold `=`; what follows the empty string is not read; a block that ends
+    /// before it is refused whole; a block that is only its end holds none.
     #[test]
     fn a_windows_environment_block_reads_whole_or_not_at_all() {
         let block = wide("=C:=C:\\work\0=D:=D:\\\0Path=C:\\bin;C:\\x\0K=v=w\0\0junk\0");
@@ -668,6 +701,8 @@ mod tests {
     }
 
     /// A VARIABLE IS FOUND BY ITS WHOLE NAME, AND ON WINDOWS BLIND TO CASE as the system
+    /// folds a name, one character to one (`ı` is `I`), the first such entry winning: a
+    /// prefix or a longer name is not the name.
     #[test]
     fn a_variable_is_found_by_its_whole_name_and_on_windows_blind_to_case() {
         let upper = |c: char| {
@@ -698,6 +733,7 @@ mod tests {
     }
 
     /// The probe half of [`process_args_reads_a_live_process_as_its_own_runtime_split_it`]:
+    /// this test binary, run as the child.
     #[cfg(windows)]
     const ARGS_PROBE_ENV: &str = "ATPKG_PROCESS_ARGS_PROBE";
 
@@ -718,6 +754,9 @@ mod tests {
     }
 
     /// Run as the child (with [`ARGS_PROBE_ENV`] set): print the argv this process's own
+    /// runtime split from its command line (Rust's std: the C runtime's post-2008 rules) and
+    /// its environment as std reads it (`GetEnvironmentStringsW`), then wait for stdin to
+    /// close, so the parent reads it alive.
     #[cfg(windows)]
     #[test]
     fn probe_prints_its_own_argv_and_environment_when_asked() {
@@ -736,6 +775,11 @@ mod tests {
     }
 
     /// A LIVE PROCESS READS BACK AS ITS OWN RUNTIME SPLIT IT, ITS ENVIRONMENT WHOLE: this test
+    /// binary, run as a child with each raw command line below (the C runtime's hard cases,
+    /// the three `claude.exe` was measured on), prints the argv and the environment its own
+    /// std read, and `process_args` of it — its process environment block, read from here —
+    /// names the same words, the same `KEY=value` strings in the same order, its image as
+    /// its exec path, and a variable set for it, found by its name in another case.
     #[cfg(windows)]
     #[test]
     fn process_args_reads_a_live_process_as_its_own_runtime_split_it() {
@@ -800,6 +844,10 @@ mod tests {
     }
 
     /// A 32-BIT PROCESS UNDER WOW64 IS READ THROUGH ITS OWN 32-BIT BLOCK, the one its
+    /// runtime writes: the system's 32-bit `cmd.exe` (`SysWOW64`), started with a quoted
+    /// word and a variable in a scratch folder, then `cd`ing into `sub` and `set`ting a
+    /// second variable itself, reads back its words, both variables, its image and `sub` as
+    /// its working directory.
     #[cfg(windows)]
     #[test]
     fn a_wow64_process_is_read_through_its_32_bit_block() {
@@ -875,6 +923,10 @@ mod tests {
     }
 
     /// A MEASUREMENT, run by hand (`-- --ignored --nocapture
+    /// process_args_of_every_process_of_this_account`), never a gate: every process of this
+    /// account read as `process_args` reads it, how many read and how long it took; each
+    /// that did not read named by its image; how far each environment block runs past its
+    /// end (`EnvironmentSize` against the empty string).
     #[cfg(windows)]
     #[test]
     #[ignore = "a measurement, run by hand"]

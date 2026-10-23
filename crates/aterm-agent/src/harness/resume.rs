@@ -1,24 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The resume command a person is told to run: `claude --resume <id>`, `<id>` the conversation
-//! this process holds, read from Claude Code's own record (`<claude dir>/sessions/<pid>.json`).
-//! Never `claude --continue`, which resumes the directory's newest conversation, a sibling tab's
-//! when several Claude Codes share a directory.
-//!
-//! [`command`] carries flags as the relaunch does; [`of_entry`] guards against pid reuse;
-//! [`shorter`] steps the line down to fit a budget, never cutting it (a cut id names no
-//! conversation, or another's). No Codex line is made here (the Codex screen lane's retirement,
-//! 2026-10-16): codex-alab comes back on the line aterm's copy of its own record validated, and
-//! a vendor `codex` is shown, never supervised.
-//!
-//! The command names its program as a person types it, whatever path the process ran from. It
-//! does not `cd`: `--resume` finds a conversation under the directory it was started in, the tab's
-//! shell's directory for every launch made from that shell. It does not carry the login a
-//! relaunch chose ([`SHELL_LOGIN_CLAUSE`]). It DOES carry the Claude home its agent ran under,
-//! where that is not the tab's shell's ([`with_env`], [`home_env`] LC-4): a home
-//! not carried resumes nothing — the shell's own finds no transcript of it, or meets the first-run
-//! screen — and every shorter form keeps it ([`shorter`]).
+//! The resume command a person is told to run.
 
 use std::path::Path;
 
@@ -27,32 +10,21 @@ use super::upgrade::{self, ArgvRefusal, Dialect};
 /// What follows a frozen agent's restart, as a remedy says it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum AfterRestart {
-    /// Nothing is known to resume it with — no record, another process's, or
-    /// a program with no such command: the remedy names no command.
+    /// Nothing is known to resume it with.
     #[default]
     Unknown,
     /// A person runs this line ([`command`]) once the restart has ended it.
     Command(String),
-    /// The host relaunches it on its own conversation once the restart has ended it (`[harness]
-    /// relaunch`): nothing to type ([`RELAUNCH_WORDS`]), and the remedy names the explicit restart
-    /// ([`restart_command`]), whose exit the host reads as the restart's. Said only where that
-    /// relaunch would come ([`super::relaunch::resumes_on_exit`]).
+    /// The host relaunches it on its own conversation once the restart has ended it (`[harness] relaunch`).
     Relaunch,
-    /// The host carries the explicit restart ([`restart_command`]) and brings back what it ends
-    /// ([`super::relaunch::carries_restart`]), but cannot promise how: a codex-alab whose
-    /// validated line has no shell to type it at yet. The remedy names only the restart.
+    /// The host carries the explicit restart ([`restart_command`], [`super::relaunch::carries_restart`]).
     Act,
 }
 
-/// What a remedy says in place of a command when the host relaunches the
-/// agent itself ([`AfterRestart::Relaunch`]).
+/// What a remedy says in place of a command when the host relaunches the agent itself ([`AfterRestart::Relaunch`]).
 pub const RELAUNCH_WORDS: &str = "aterm relaunches it on its conversation";
 
-/// The explicit restart a remedy names wherever the host relaunches the agent:
-/// `restart pid=<pid> if-stalled` (`pid` the leader the stall was published for; without it, the
-/// tab's foreground group), as `aterm ctl @<sid> restart …` when `sid` (`@` or not) is given. Its
-/// stamp is written before its signal, so the exit reads as the restart's, and it ends a program
-/// that lives through `SIGTERM`; a bare `signal term`'s exit reads as the agent's own.
+/// The explicit restart a remedy names wherever the host relaunches the agent.
 #[must_use]
 pub fn restart_command(sid: Option<&str>, pid: Option<u32>) -> String {
     let args = pid.map_or_else(
@@ -65,33 +37,13 @@ pub fn restart_command(sid: Option<&str>, pid: Option<u32>) -> String {
     }
 }
 
-/// The clause a remedy adds when it hands a person [`command`] for a session the harness relaunched
-/// under a login of its choosing (an account move, `docs/DESIGN-claude-accounts-2026-10-01.md` §6):
-/// typed at a prompt, the command runs under that shell's login. The command carries no
-/// environment, by decision:
-///
-/// * every surface that prints it has a hard budget (the tab's mark 200 bytes, a remedy's sentence
-///   90 characters) and steps down ([`shorter`]) rather than cut ([`never_cut`]); a login directory
-///   is up to [`super::accounts::DIR_MAX`] bytes, so the variable would be dropped first, exactly
-///   where it mattered;
-/// * the label is the only name an account has in anything aterm prints, and the variable's value
-///   is a directory under the person's home;
-/// * landing on the shell's login is no failure: the conversation resumes, and a Claude started by
-///   hand is decided again at its first turn end.
+/// Clause added when handing [`command`] for a session relaunched under an account move.
 pub const SHELL_LOGIN_CLAUSE: &str = ", under that shell's own Claude login";
 
-/// How a reason names the resume line after a restart:
-/// `<…>, then resume with <line><…>` — the memory wall's escalation
-/// (`supervise::policy::turn_end`'s `memory_restart`). [`never_cut`] finds
-/// the line by it.
+/// How a reason names the resume line after a restart.
 pub const THEN_RESUME_WITH: &str = ", then resume with ";
 
-/// `render(text)`, a renderer that may cut its input to fit a cap, with the
-/// resume line `text` names after [`THEN_RESUME_WITH`] kept whole or not at
-/// all: the first of `text`, `text` with each of the line's shorter forms
-/// ([`shorter`]), and `text` without the clause, whose rendering still holds
-/// its line whole. Text naming no such line is rendered as it is. A cut id
-/// names no conversation, or another's.
+/// Apply `render(text)` while keeping the resume command after [`THEN_RESUME_WITH`] whole or omitting it.
 #[must_use]
 pub fn never_cut(text: &str, render: impl Fn(&str) -> String) -> String {
     let Some((clause, line)) = named_line(text) else {
@@ -130,13 +82,7 @@ fn named_line(text: &str) -> Option<(std::ops::Range<usize>, &str)> {
     Some((at..start + end, &rest[..end]))
 }
 
-/// The line a person runs to resume `session_id` with the flags `argv` (`argv[0]` first) was
-/// launched with, carried as [`upgrade::rewrite_argv`] carries them. `None` for an id that is not
-/// one, a control character in a carried word, or a launch not resumable in place; an unknown flag
-/// ([`ArgvRefusal::UnknownFlag`]) gives the [`bare`] line.
-///
-/// A script launch (`node /…/claude …`, the managed twin's `#!/bin/sh`) has the script as
-/// `argv[1]`, and its flags start after it, as [`super::relaunch::launched`] reads them.
+/// Build the command to resume `session_id` with flags carried from `argv` via [`upgrade::rewrite_argv`].
 #[must_use]
 pub fn command(argv: &[String], session_id: &str) -> Option<String> {
     if !upgrade::is_session_id(session_id) {
@@ -170,21 +116,13 @@ fn typed(program: &str, words: &[String]) -> Option<String> {
     Some(line)
 }
 
-/// `claude --resume <session_id>`: the conversation alone, no carried flag.
-/// `None` for an id that is not one.
+/// `claude --resume <session_id>`.
 #[must_use]
 pub fn bare(session_id: &str) -> Option<String> {
     upgrade::is_session_id(session_id).then(|| format!("claude --resume {session_id}"))
 }
 
-/// `line` ([`command`]) with `env` in front of it: `NAME=value ` words, each
-/// value plain where it is `[A-Za-z0-9_./-]` and quoted otherwise, as the
-/// relaunch line writes them (`upgrade::relaunch_line_env`). What a told
-/// line carries is the Claude home its agent ran under ([`home_env`]) —
-/// never the login (see [`SHELL_LOGIN_CLAUSE`]): landing on the shell's
-/// login resumes the conversation, but a home not carried resumes nothing.
-/// `None` for a name that is not `[A-Z0-9_]+`, or a value with a control
-/// character.
+/// `line` ([`command`]) with `env` in front of it.
 #[must_use]
 pub fn with_env(env: &[(&str, &str)], line: &str) -> Option<String> {
     let mut out = String::new();
@@ -209,14 +147,7 @@ pub fn with_env(env: &[(&str, &str)], line: &str) -> Option<String> {
     Some(out)
 }
 
-/// THE CLAUDE HOME A TOLD LINE CARRIES for a process whose exec environment
-/// named `config` (its raw `CLAUDE_CONFIG_DIR`, set, empty or not) and whose
-/// records are in `claude_dir`, for a user whose home is `user_home`: the
-/// `CLAUDE_CONFIG_DIR` as it was given; and, with none, the `HOME` that
-/// holds its records' `.claude` where that is not the user's
-/// ([`super::upgrade_drive::homedir_holding`], the relaunch line's own rule,
-/// [`super::upgrade_drive::home_carried`]). Nothing for an agent under the
-/// user's own home: its line is the one it always was.
+/// Compute the `CLAUDE_CONFIG_DIR` prefix for a process given `config`, `claude_dir`, and `user_home`.
 #[must_use]
 pub fn home_env(
     user_home: &Path,
@@ -275,8 +206,7 @@ fn env_word_len(rest: &str) -> Option<usize> {
     None
 }
 
-/// The bare form of a line [`command`] made, [`bare`] of the id after its last `--resume`, the
-/// Claude home in front of it kept ([`with_env`]). `None` for any other text.
+/// The bare form of a line [`command`] made, [`bare`] of the id after its last `--resume`, the Claude home in front of it kept ([`with_env`]).
 #[must_use]
 pub fn bare_of(line: &str) -> Option<String> {
     let (env, line) = split_env(line);
@@ -284,10 +214,7 @@ pub fn bare_of(line: &str) -> Option<String> {
     bare(id).map(|bare| format!("{env}{bare}"))
 }
 
-/// The permission-mode form of a line [`command`] made: the line with only the flags that set its
-/// permission mode ([`upgrade::permission_argv`]). `None` for any other text and for a launch
-/// that set no permission mode. The words are read back as [`upgrade::quote`] wrote them, so a
-/// value that only looks like a permission flag is none.
+/// The permission-mode form of a line [`command`] made.
 #[must_use]
 pub fn mode_of(line: &str) -> Option<String> {
     let (env, line) = split_env(line);
@@ -301,11 +228,7 @@ pub fn mode_of(line: &str) -> Option<String> {
         .map(|mode| format!("{env}{mode}"))
 }
 
-/// The shorter forms of a line [`command`] made, in the order a surface whose
-/// budget cannot hold it steps down through them: its permission mode alone ([`mode_of`]), then the
-/// conversation alone ([`bare_of`]), each only where shorter than the one before and each keeping
-/// the home in front of the line ([`with_env`], a Codex's `CODEX_HOME`); none for any other text.
-/// The permission mode goes last: the bare line brings a session back in another permission mode.
+/// The shorter forms of a line [`command`] made, in the order a surface whose budget cannot hold it steps down through them.
 #[must_use]
 pub fn shorter(line: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -317,13 +240,7 @@ pub fn shorter(line: &str) -> Vec<String> {
     out
 }
 
-/// The resume line for the live Claude Code process whose registry `entry`
-/// (`<claude dir>/sessions/<pid>.json`, read by [`super::footer::session_of_pid`]) and own `argv`
-/// give, over the harness state root `state` ([`super::upgrade_drive::resume_command_kept`]).
-///
-/// When `started` (the process's kernel start, Unix seconds) is known, the entry's `procStart`
-/// must name that same second: a record left under a reused pid, or one with no `procStart`,
-/// fails. A wrong line here would be typed and resume another conversation.
+/// Build the resume line for a live Claude Code process from `entry`, `argv`, and harness `state` ([`super::upgrade_drive::resume_command_kept`]).
 #[must_use]
 pub fn of_entry(
     argv: &[String],
@@ -358,8 +275,7 @@ fn program_argv(argv: &[String]) -> &[String] {
 }
 
 /// Whether a word must be quoted for a POSIX shell (or fish): anything but
-/// the characters no shell treats specially. A flag, a model id, a UUID and
-/// a plain path need none, so the common line reads as a person would type it.
+/// the characters no shell treats specially.
 fn needs_quotes(word: &str) -> bool {
     word.is_empty()
         || !word

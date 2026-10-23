@@ -38,16 +38,21 @@ type Rows = HashMap<String, BTreeMap<String, u64>>;
 
 #[derive(Default)]
 struct ViewState {
-    /// Which open this content belongs to. A reader from another open writes
+    /// Which open this content belongs to.
     generation: u64,
     phase: Phase,
     /// The offset the view is EXACT up to: just past every record applied —
+    /// seed rows and tail alike — or the tail's cursor at its last mark, or
+    /// where a confirmation proved there was nothing to apply, whichever is
+    /// highest.
     reached: u64,
     /// The highest head the bus has told the view: each mark's, and each
+    /// confirmation's.
     head: u64,
     /// `sid -> node -> offset` of each live advertisement.
     rows: Rows,
     /// The reader's socket, once it has dialled: what a close or a reopen ends
+    /// it by.
     closer: Option<Arc<Closer>>,
 }
 
@@ -89,6 +94,7 @@ impl PresenceView {
     fn notify(&self) {}
 
     /// Forget everything held and start `phase` under a new generation,
+    /// hanging up the old reader's socket if it had one.
     fn reset(&self, phase: Phase) -> u64 {
         let mut s = self.lock();
         let generation = s.generation.wrapping_add(1);
@@ -283,6 +289,7 @@ pub fn confirmation(
 }
 
 /// Whether `subject` is a presence face of `sid` in `fleet` under any node:
+/// what the walk's `/f/<F>/pub/*/<sid>/presence` matches.
 fn names_sid(fleet: &str, subject: &str, sid: &str) -> bool {
     let segs: Vec<&str> = subject.split('/').collect();
     matches!(
@@ -292,6 +299,8 @@ fn names_sid(fleet: &str, subject: &str, sid: &str) -> bool {
 }
 
 /// `(node, sid)` of a SESSION's presence face in `fleet` —
+/// `["", "f", "<F>", "pub", "<node>", "<sid>", "presence"]`, the shape the
+/// walk's reader takes — or `None`.
 fn session_presence<'a>(fleet: &str, subject: &'a str) -> Option<(&'a str, &'a str)> {
     let segs: Vec<&str> = subject.split('/').collect();
     match segs.as_slice() {
@@ -305,6 +314,7 @@ fn session_presence<'a>(fleet: &str, subject: &'a str) -> Option<(&'a str, &'a s
 }
 
 /// Whether a presence row makes its node a routing candidate for its sid: the
+/// walk's rule, word for word.
 fn routable(raw: &[u8]) -> bool {
     let (body, _) = Body::decode(raw);
     body.unknown.get("observer").is_none_or(|v| v != "1")
@@ -366,7 +376,7 @@ where
         .map(drop)
 }
 
-/// [`spawn_reader`]'s body, once dialled. `Ok` for an end the view asked for
+/// [`spawn_reader`]'s body, once dialled.
 fn follow(
     mut conn: Conn,
     closer: &Closer,
@@ -438,6 +448,8 @@ mod tests {
     }
 
     /// **NOTHING IS ANSWERED UNTIL THE TAIL HAS CAUGHT UP PAST THE SEED, AND
+    /// EVERY ANSWER SAYS WHAT IT IS EXACT UP TO.** A seeding view, a closed one
+    /// and a dead one answer `None` — ask the bus — never an empty set.
     #[test]
     fn the_view_answers_only_while_live() {
         let view = PresenceView::default();
@@ -468,6 +480,8 @@ mod tests {
     }
 
     /// **NEWEST WINS ON OFFSET, ACROSS THE SEED'S SEAM.** The seed reports
+    /// `n-a` withdrawn at 50 (a later page, past the splice point at 40) and
+    /// `n-b` live at 30.
     #[test]
     fn a_row_never_loses_to_an_older_one() {
         let view = PresenceView::default();
@@ -491,6 +505,8 @@ mod tests {
     }
 
     /// **THE WALK'S RULE, ROW FOR ROW.** An observer's row, a row with no
+    /// `state=`, a node's own presence row, a person's, another fleet's and a
+    /// sid that is not a principal are no advertisement.
     #[test]
     fn only_a_hosting_nodes_live_row_advertises() {
         let view = PresenceView::default();
@@ -515,6 +531,8 @@ mod tests {
     }
 
     /// **A READER FROM ANOTHER OPEN WRITES NOTHING, AND IS TOLD TO STOP.** A
+    /// closed view's old reader, and a reopened view's previous one, apply
+    /// nothing, mark nothing and kill nothing.
     #[test]
     fn a_stale_reader_cannot_touch_the_view() {
         let view = PresenceView::default();
@@ -536,6 +554,10 @@ mod tests {
     }
 
     /// **A CLOSE OR A REOPEN HANGS UP THE SOCKET THE VIEW HOLDS, AND A READER
+    /// THAT DIALLED FOR AN OPEN THAT IS GONE IS NOT HELD.** The reader dials on
+    /// its own thread, so its open can be closed or replaced before it hands
+    /// its socket over: that hand-over is refused, and the reader hangs up
+    /// itself.
     #[cfg(unix)]
     #[test]
     fn a_close_hangs_up_the_socket_the_view_holds() {
@@ -578,6 +600,7 @@ mod tests {
     }
 
     /// **A CONFIRMATION ROUTES ONLY THROUGH TO THE HEAD, AND IS A MARK EITHER
+    /// WAY.** Read from 100 with the head at 200:
     #[test]
     fn a_confirmation_routes_only_through_to_the_head_and_is_a_mark_either_way() {
         let rec = |off: u64, subject: &str| (off, subject.to_string(), LIVE.to_vec());

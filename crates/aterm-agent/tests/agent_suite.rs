@@ -17,6 +17,9 @@
 //!
 //! One file: `targo --unverified test -p aterm-agent --test agent_suite -- <file>::`.
 
+#[cfg(test)]
+aterm_durable::plain_durable_flushes_in_tests!();
+
 mod common;
 mod conformance_account_key;
 mod conformance_disk_pass;

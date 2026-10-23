@@ -1,69 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A TAPE AS TEXT (the replay plan's §6.6): one record per line, every body
-//! line by line, that reads back to the very same items ([`parse`]).
-//!
-//! It is what `aterm drive tape cat --text` prints and what a tape kept in a
-//! corpus is stored as, so a person reads every screen before it is
-//! committed and a diff of two tapes reads as the change it is. So it is
-//! exact, not a summary: [`render`] then [`parse`] gives back the header and
-//! every item byte for byte — a body that is not UTF-8, a control character
-//! and a missing final newline included.
-//!
-//! ```text
-//! atape-text 1
-//! header
-//! | atape 1
-//! | tape=4f1c…
-//! exchange ctl stamp=20003000123,1789660520123
-//! > text
-//! > --json
-//! > tail=40
-//! < ok 0
-//! !
-//! | {"rows":[
-//! = "⏺ Done.",
-//! = "",
-//! = "❯ ",
-//! = ],"seq":41}
-//! |
-//! mono 20003000456
-//! emit journal
-//! | {"t":1789660520123,"line":"EVENT idle seq=41 …"}
-//! |
-//! ```
-//!
-//! * A HEAD line names the item and its fields, each one token: a name (a
-//!   door, a note's kind, a path) is escaped as a header value is
-//!   ([`super::header`]: `\\`, `\n`, `\r`, `\t`, `\xHH` for a control byte
-//!   or one that is not UTF-8) and a space in it as `\x20`, so no token holds
-//!   a space. A stamp, where the item carries one, is the last token:
-//!   `stamp=<mono ns since the origin>,<wall ms>`.
-//! * A BODY follows its head, one line per piece: the body split at every
-//!   newline, each piece escaped, behind its prefix (`|` for a body; `>` and
-//!   `<` for a round trip's request and reply) and one space — or the prefix
-//!   alone for an empty piece. A body of n newlines is n+1 lines, so its
-//!   final newline is the last, empty line `|`, and a body without one ends
-//!   on its text. A line behind `=` goes on with the piece before it, no
-//!   newline between (a screen's rows, below).
-//! * A CONTROL round trip (`ctl`, `teller`) is written as the words and the
-//!   reply it carries: one `>` line per word of the request (escaped whole);
-//!   `< ok <code>` with the stderr's pieces as `!` lines and the stdout's as
-//!   `|` lines, or `< err` with the transport error's pieces as `|` lines.
-//!   Bytes that are not a control request's (a tape made by hand) are
-//!   written as any other round trip's, with `raw` after the door.
-//! * A SCREEN — a control reply whose stdout carries a `"rows":[…]` array of
-//!   strings, a `text --json` read — is written ROW BY ROW: the stdout is
-//!   cut again before each row and before the `]` that closes them, and a
-//!   line that goes on from the line before it, with no newline between,
-//!   has `=` for its prefix. So a person reads a screen a row to a line
-//!   before it is committed to a corpus, and two tapes whose screens differ
-//!   in one row diff as that one line. A cut is only where a line begins, so
-//!   it is exact whatever it cuts: a reply this does not read row by row
-//!   (no array, space between its rows) is written as any other body.
-//! * Every other round trip writes its request's pieces as `>` lines and its
-//!   reply's as `<` lines.
+//! A TAPE AS TEXT (the replay plan's §6.6): one record per line, every body line by line, that reads back to the very same items ([`parse`]).
 
 use astream_effects::EffectRecord;
 
@@ -115,9 +53,7 @@ const GLUE: char = '=';
 
 /// `body`'s pieces, each behind `prefix`, and each piece cut again before
 /// every offset in `cuts` (ascending, none at a newline), the rest after a
-/// cut behind [`GLUE`]. Any cuts at all read back to the very same bytes:
-/// the lines hold every byte of `body` but the newlines the `prefix` lines
-/// stand for.
+/// cut behind [`GLUE`].
 fn pieces_cut(out: &mut String, prefix: char, body: &[u8], cuts: &[usize]) {
     let line = |out: &mut String, lead: char, piece: &[u8]| {
         out.push(lead);
@@ -147,10 +83,7 @@ fn pieces_cut(out: &mut String, prefix: char, body: &[u8], cuts: &[usize]) {
 
 /// Where a screen read's reply text is cut so that each of its rows is a
 /// line of its own ([module docs](self)): before each row of its
-/// `"rows":[…]` array and before the `]` that closes it. None for a text
-/// with no such array, or one this does not read row by row (an empty one,
-/// space between its rows, a row that is no string); a cut is only ever
-/// where a line begins, so a wrong one costs a line, never a byte.
+/// `"rows":[…]` array and before the `]` that closes it.
 fn row_cuts(text: &[u8]) -> Vec<usize> {
     const KEY: &[u8] = b"\"rows\":[";
     let Some(open) = text.windows(KEY.len()).position(|w| w == KEY) else {
@@ -163,7 +96,6 @@ fn row_cuts(text: &[u8]) -> Vec<usize> {
             return Vec::new();
         }
         cuts.push(at);
-        // The row's string, to the quote that ends it.
         at += 1;
         loop {
             match text.get(at) {
@@ -239,10 +171,6 @@ fn effect_text(out: &mut String, record: &EffectRecord, stamp: Option<Stamp>) {
             request,
             reply,
         } => {
-            // As words only where the words write the very same bytes back:
-            // a hand-made request in another spelling of the same words
-            // (a varint padded out) is written raw, so it reads back as it
-            // was.
             let control = is_control(door)
                 .then(|| {
                     codec::ctl_args(request)
@@ -301,17 +229,13 @@ fn effect_text(out: &mut String, record: &EffectRecord, stamp: Option<Stamp>) {
 }
 
 /// What [`render`] wrote, read back: the header and the items.
-///
 /// # Errors
-///
 /// Text [`render`] did not write, named with its line.
 pub fn parse(text: &str) -> Result<(Option<String>, Vec<Item>), String> {
     let mut lines = Lines {
         lines: text.split('\n').collect(),
         at: 0,
     };
-    // `render` ends every line with a newline: the split's last piece is
-    // the empty text after it.
     if lines.lines.last() == Some(&"") {
         lines.lines.pop();
     }
@@ -391,8 +315,7 @@ impl<'a> Lines<'a> {
     }
 
     /// A body behind `prefix`: its pieces joined by newlines, a [`GLUE`]
-    /// line's joined to the one before it with none. At least one piece:
-    /// every body is written as one.
+    /// line's joined to the one before it with none.
     fn bytes(&mut self, prefix: char) -> Result<Vec<u8>, String> {
         let mut body = self
             .piece(prefix)?

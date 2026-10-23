@@ -373,6 +373,7 @@ pub fn check_host(host: &Host) -> Result<(), String> {
 }
 
 /// A non-empty word of `[A-Za-z0-9._-]` that starts with neither `-` (an option to every
+/// tool) nor `.` (a hidden or parent path).
 fn plain_word(word: &str) -> bool {
     !word.is_empty()
         && !word.starts_with(['-', '.'])
@@ -382,6 +383,7 @@ fn plain_word(word: &str) -> bool {
 }
 
 /// A host name, IPv4 or IPv6 address (a `%zone` allowed): printable, no space, no `@`, and
+/// not starting with `-`, so `ssh` reads `user@address` as its destination.
 fn plain_address(address: &str) -> bool {
     !address.is_empty()
         && !address.starts_with('-')
@@ -553,6 +555,7 @@ fn set_str(table: &mut Table, key: &str, value: &str) {
 }
 
 /// Set `key` to `value`, keeping the old value's surroundings: the spacing after `=` and the
+/// comment at the end of its line.
 fn replace_value(table: &mut Table, key: &str, mut value: Value) {
     if let Some(old) = table.get(key).and_then(Item::as_value) {
         *value.decor_mut() = old.decor().clone();
@@ -622,6 +625,7 @@ pub fn retire_host(sys: &dyn System, paths: &Paths, uuid: &str) -> Result<(), St
 }
 
 /// The byte range of the `[[host]]` block with `uuid` in `text` (which `doc` was parsed
+/// from): from the start of its header's line to the end of the line its last value ends on.
 fn host_block(doc: &DocumentMut, text: &str, uuid: &str) -> Option<(usize, usize)> {
     let hosts = doc.get("host")?.as_array_of_tables()?;
     let table = hosts.iter().find(|t| {
@@ -1253,6 +1257,7 @@ user = \"labadmin\"
     }
 
     /// A selector means one host, even when another host uses that word in
+    /// a different field.
     #[test]
     fn a_selector_must_not_expand_an_ambiguous_word_into_other_hosts() {
         let unique = parse(HAND_EDITED).expect("ordinary inventory");

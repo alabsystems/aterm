@@ -1,48 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TRANSCRIPT STEPS REACH THE SESSION LOG (phase 3B, plan §2; addendum A13,
-//! A20): the glue between the footer
-//! resolver's step tap (`aterm_agent::harness::steps`, folded on the
-//! resolver thread from the transcript lines it already reads) and the agent
-//! run's turn tracker, whose [`aterm_slog::TurnTracker::transcript`] is the
-//! one writer of every transcript record (S2). A child module of
-//! `session_log`, so it reaches the agent run as the carry module does.
-//!
-//! - ARMING ([`SessionLog::transcript_arm`]). A tap is armed only while the
-//!   log holds an open agent run whose agent its [`Source`] reads (an
-//!   exhaustive match on the program, so a new agent answers here): Claude
-//!   Code's transcript, by the footer resolver's tap, and a codex-alab's
-//!   rollout, by the rollout tap (`crate::codex_rollout_tap`),
-//!   each handed the run's watermark and floor. A tap never applies to
-//!   another agent's run. A run with no watermark binds at the file's length
-//!   (S1): what the file held is history, said once by the tracker's
-//!   `source … skipped=` mark, never replayed (a rollout, fed from its first
-//!   byte for its copy, binds at 0 and makes the rows before the process's
-//!   start history by its floor).
-//! - APPLYING ([`apply_batch`]). At most [`CHUNK`] events a timeline hold,
-//!   the lock released between chunks (S16): the batch's leading binds
-//!   (and a latch's `off`) first, so its counts land on the file they are
-//!   of, then the overflow count (the oldest steps after the bind were the
-//!   ones dropped), then rows lost, then the rest of the steps in order,
-//!   then the screen's open wall judged against the chain's end (a
-//!   transcript's: a rollout's batch carries no end), and last the batch's
-//!   end ([`TxEvent::Flush`]: a loss counted and not yet said
-//!   is said once, S23, S27). A batch that finds no run to go to, or a run
-//!   that bound no file, disarms the tap, so the next read arms a fresh
-//!   one, bound at once.
-//! - THE HOLD, MEASURED (T31). Each chunk's hold is timed from the lock
-//!   taken to its release, a full chunk's apart from the last's (which
-//!   also judges, flushes and takes the wake), and read by `metrics
-//!   percentiles` (`tx_chunk_*`, `tx_last_*`).
-//! - THE WAKE (S12). The last hold takes the log's owed wake, which rings the
-//!   session's watchers under the timeline lock
-//!   ([`crate::session_timeline::SessionTimeline::slog_take_wake`]); the
-//!   resolver tells the loop only when it owes a settle tick or the clause
-//!   switch is on (`claude_footer::LogWake`).
-//!
-//! Nothing here holds text: a step is ids, a tool's name, class words and
-//! numbers (`aterm_agent::harness::steps::Step`), mapped field for field.
+//! TRANSCRIPT STEPS REACH THE SESSION LOG (phase 3B, plan §2; addendum A13, A20): the glue between the footer resolver's step tap (`aterm_agent::harness::steps`, folded on the resolver thread from the transcript lines it already reads) and the agent run's turn tracker, whose [`aterm_slog::TurnTracker::transcript`] is the one writer of every transcript record (S2).
 
 use std::sync::Mutex;
 
@@ -56,15 +15,10 @@ use aterm_slog::{
 use super::SessionLog;
 use crate::session_timeline::SessionTimeline;
 
-/// The most transcript events one timeline hold applies: a
-/// catch-up read of a long resumed conversation never makes the footer
-/// thread a long holder of the lock the composer and the sweep take.
+/// The most transcript events one timeline hold applies: a catch-up read of a long resumed conversation never makes the footer thread a long holder of the lock the composer and the sweep take.
 pub(crate) const CHUNK: usize = 32;
 
-/// What arming the tap takes from the log: the floor (wall ms: the latest of
-/// the join's floor, the adoption for a carried run, and the run's open in
-/// this log, so the tap's fold takes a row as live exactly when the tracker
-/// admits it) and the watermark the run's join holds.
+/// What arming the tap takes from the log: the floor (wall ms: the latest of the join's floor, the adoption for a carried run, and the run's open in this log, so the tap's fold takes a row as live exactly when the tracker admits it) and the watermark the run's join holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TapArm {
     /// The exact run this arm belongs to, including its log epoch.
@@ -75,8 +29,7 @@ pub(crate) struct TapArm {
     pub(crate) given: Option<StepMark>,
 }
 
-/// An open agent run's identity. Nodes are not reused within an epoch;
-/// the epoch also prevents a reset/adoption from admitting an old batch.
+/// An open agent run's identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TapRun {
     epoch: u32,
@@ -105,22 +58,7 @@ pub(crate) struct Applied {
     pub(crate) holds: usize,
 }
 
-/// WHAT THE ROLLOUT TAP ANSWERED (`status rollout= rollout_asks=`; session
-/// log 6D-3b's tap, its fence B5c): how many asks the session's rollout tap
-/// answered, each counted in a hold taken AFTER that ask's batch was
-/// applied (`crate::codex_rollout_tap`), and the last answer's word:
-/// `bound`, or why it bound nothing (a `codex_tap::Refusal`'s word,
-/// `unmeasured` among them; `stale` when the captured claim, record, run
-/// or sampled process image moved; `no-thread` if the tap cannot be made), or
-/// `stopped` once the sweep dropped the tap (the claimant gone from the
-/// front, the sweep off) until it asks again. The tap's thread answers its
-/// asks one at a time, in order, so a reader that saw `rollout_asks=<n>`
-/// and then sees `n + 2` knows an ask began after its first look and ended
-/// with every record it wrote already in the log: the fence after which no
-/// tap write about what the rollout held at that look can still land (the
-/// lab's rollout leg reads the log only past it). Held in memory only: ids
-/// and counts, never carried. A request that fails claim/run capture before
-/// queueing is not an answered ask and leaves the count unchanged.
+/// WHAT THE ROLLOUT TAP ANSWERED (`status rollout= rollout_asks=`; session log 6D-3b's tap, its fence B5c): how many asks the session's rollout tap answered, each counted in a hold taken AFTER that ask's batch was applied (`crate::codex_rollout_tap`), and the last answer's word: `bound`, or why it bound nothing (a `codex_tap::Refusal`'s word, `unmeasured` among them; `stale` when the captured claim, record, run or sampled process image moved; `no-thread` if the tap cannot be made), or `stopped` once the sweep dropped the tap (the claimant gone from the front, the sweep off) until it asks again.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TapAnswers {
     asks: u64,
@@ -134,7 +72,6 @@ pub(crate) struct TapAnswers {
 
 impl SessionLog {
     /// One ask the rollout tap answered, with its word ([`TapAnswers`]).
-    /// Called after the ask's batch was applied, never before.
     pub(crate) fn rollout_answered(&mut self, word: &'static str) {
         self.rollout.asks = self.rollout.asks.saturating_add(1);
         self.rollout.word = Some(word);
@@ -144,25 +81,20 @@ impl SessionLog {
         }
     }
 
-    /// The sweep dropped the session's tap ([`TapAnswers`]): a session the
-    /// tap answered says `stopped`, its count kept; one never asked stays
-    /// `-`.
+    /// The sweep dropped the session's tap ([`TapAnswers`]): a session the tap answered says `stopped`, its count kept; one never asked stays `-`.
     pub(crate) fn rollout_stopped(&mut self) {
         if self.rollout.word.is_some() {
             self.rollout.word = Some("stopped");
         }
     }
 
-    /// The log's last seq when the tap's count last moved (0 before it ever
-    /// moved): the order of an ask's records and its count, as the tap's
-    /// thread runs them.
+    /// The log's last seq when the tap's count last moved (0 before it ever moved): the order of an ask's records and its count, as the tap's thread runs them.
     #[cfg(test)]
     pub(crate) fn rollout_counted_at(&self) -> u64 {
         self.rollout.counted_at
     }
 
-    /// `status`'s `rollout=<word|-> rollout_asks=<n>` ([`TapAnswers`]): `-`
-    /// and `0` while the tap was never asked for this session.
+    /// `status`'s `rollout=<word|-> rollout_asks=<n>` ([`TapAnswers`]): `-` and `0` while the tap was never asked for this session.
     pub(crate) fn rollout_fields(&self) -> String {
         format!(
             "rollout={} rollout_asks={}",
@@ -214,9 +146,7 @@ fn slog_wall(k: aterm_phase::WallKind) -> Option<WallKind> {
 }
 
 /// The judge's answer for the screen's wall of the log's `kind`: the reader's
-/// kind of the same class. An API error's status is not in the log's word,
-/// and a 429 is a limit to the harness's classes: the judge confirms when
-/// either reading confirms, refutes only when both refute, else waits.
+/// kind of the same class.
 fn judge_screen(kind: WallKind, end: &End, opened_ms: u64) -> Judge {
     use aterm_phase::{ApiCause, WallKind as W};
     let one = |k: W| judge_wall(k, end, opened_ms);
@@ -266,14 +196,7 @@ enum Ready {
 }
 
 impl SessionLog {
-    /// THE TAP'S ARMING: the open agent run `source`'s tap reads, its
-    /// join's floor and watermark; `None` while the log holds none (the tap
-    /// stays unarmed, and nothing is folded for it). The floor is the
-    /// tracker's own admission rule (`TurnTracker::transcript`: no row older
-    /// than the join's floor or the run's open), so what the fold queues and
-    /// says once (the model) is what the log takes: a row written before
-    /// the run opened (`codex "prompt"`, a relaunch that carries a turn on)
-    /// is history to both.
+    /// THE TAP'S ARMING: the open agent run `source`'s tap reads, its join's floor and watermark; `None` while the log holds none (the tap stays unarmed, and nothing is folded for it).
     pub(crate) fn transcript_arm(&self, source: Source) -> Option<TapArm> {
         let a = self
             .agent
@@ -296,8 +219,7 @@ impl SessionLog {
         })
     }
 
-    /// What the transcript join of the run in front holds, when `source`'s
-    /// tap reads it.
+    /// What the transcript join of the run in front holds, when `source`'s tap reads it.
     pub(crate) fn transcript_view(&self, source: Source) -> Option<TxView> {
         self.agent
             .as_ref()
@@ -414,8 +336,6 @@ impl SessionLog {
                 };
                 self.transcript_event(source, ev, pos, state, now);
             }
-            // The fold latched off for the path: the source says `off`
-            // once, and nothing more applies from it.
             StepEvent::Off { .. } => {
                 self.transcript_event(source, TxEvent::Lost { n: 0 }, pos, TxState::Off, now);
             }
@@ -509,25 +429,16 @@ fn ordered(batch: &StepBatch) -> impl Iterator<Item = Item<'_>> {
         .chain(rest.iter().map(Item::Step))
 }
 
-/// Which hold of [`apply_batch`] a hold-time sample is of (
-/// `metrics percentiles`' `tx_chunk_*` and `tx_last_*`).
+/// Which hold of [`apply_batch`] a hold-time sample is of ( `metrics percentiles`' `tx_chunk_*` and `tx_last_*`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Hold {
     /// A full chunk: [`CHUNK`] events, with more of the batch to follow.
     Full,
-    /// The batch's last hold: what was left of it (at most [`CHUNK`]
-    /// events; none for a read that found no new rows, whose one hold is
-    /// still taken), then the wall's judge, the flush and the owed wake.
+    /// The batch's last hold: what was left of it (at most [`CHUNK`] events; none for a read that found no new rows, whose one hold is still taken), then the wall's judge, the flush and the owed wake.
     Last,
 }
 
-/// APPLY `source`'s `batch` to `timeline`'s session log (module docs): at most
-/// [`CHUNK`] events a hold, the lock released between chunks, the wall
-/// judged, the batch's unsaid loss said and the owed wake taken in the
-/// last. The caller notifies once every hold is released
-/// (`claude_footer::LogWake::after`). Each hold that applied a chunk is
-/// timed, from the lock taken to its release, into `metrics percentiles`
-/// (T31: the hold the composer and the sweep can wait behind).
+/// APPLY `source`'s `batch` to `timeline`'s session log (module docs): at most [`CHUNK`] events a hold, the lock released between chunks, the wall judged, the batch's unsaid loss said and the owed wake taken in the last.
 pub(crate) fn apply_batch(
     timeline: &Mutex<SessionTimeline>,
     source: Source,
@@ -544,9 +455,7 @@ pub(crate) fn apply_batch(
     )
 }
 
-/// [`apply_batch`] on the clock `now_ns` (monotonic nanoseconds), each
-/// chunk's hold handed to `book` with its kind ([`Hold`]). A batch no run
-/// takes applies no chunk and books nothing.
+/// [`apply_batch`] on the clock `now_ns` (monotonic nanoseconds), each chunk's hold handed to `book` with its kind ([`Hold`]).
 pub(crate) fn apply_batch_timed(
     timeline: &Mutex<SessionTimeline>,
     source: Source,
@@ -558,8 +467,7 @@ pub(crate) fn apply_batch_timed(
     apply_batch_guarded(timeline, source, batch, bound, None, now_ns, book)
 }
 
-/// A rollout batch remains owned by the queued claim, record and run at
-/// EVERY chunk, including the first hold after its off-lock file read.
+/// A rollout batch remains owned by the queued claim, record and run at EVERY chunk, including the first hold after its off-lock file read.
 pub(crate) fn apply_rollout_batch(
     ctx: &crate::SessionCtx,
     target: &crate::self_claim::RolloutTarget,
@@ -607,8 +515,6 @@ fn apply_batch_guarded(
         {
             applied.disarm = true;
             if applied.holds > 0 {
-                // Earlier chunks belong to the old owner, but still owe their
-                // notification if ownership moved between those bounded holds.
                 applied.settle = slog.wake();
                 applied.owed = g.slog_take_wake();
             }
@@ -622,9 +528,6 @@ fn apply_batch_guarded(
                 .steps
                 .iter()
                 .any(|s| matches!(s.ev, StepEvent::Bind { .. }));
-            // No run takes the steps, or a run that bound no file meets a
-            // tap bound for an earlier one: the tap goes, and the next arm
-            // binds afresh (S1). A tap with no file yet waits for one.
             if ready == Ready::NoRun || (ready == Ready::Unbound && !binds) {
                 applied.holds = 1;
                 applied.disarm = ready == Ready::NoRun || bound;
@@ -642,10 +545,8 @@ fn apply_batch_guarded(
         }
         if items.peek().is_some() {
             book(Hold::Full, now_ns().saturating_sub(taken));
-            // Released between chunks (S16).
             continue;
         }
-        // A rollout's batch carries no end: no Codex wall is judged by it.
         if source == Source::Transcript {
             slog.transcript_judge(&batch.end, now);
         }

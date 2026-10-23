@@ -10,12 +10,10 @@ use crate::app_config::Config;
 
 /// A headless launch runs the trial machinery but never presents, so it needs its own
 /// health checkpoint: the engine loop reached with the socket bound (or none configured).
-/// Without it the sentinel stays armed and a healthy build reverts.
 #[test]
 fn headless_confirms_boot_health_at_the_control_socket_boundary() {
     use std::sync::atomic::Ordering;
 
-    // `App::boot_health_guard_open`'s terms, with the retry due.
     fn would_dispatch(app: &App) -> bool {
         should_dispatch_boot_health_confirmation(
             app.headless,
@@ -39,15 +37,12 @@ fn headless_confirms_boot_health_at_the_control_socket_boundary() {
          cannot be what disarms the sentinel"
     );
 
-    // No socket configured (Disabled / NoDir / DirUnusable / PathTooLong): the run loop is
-    // the only boundary that exists, and it has been reached.
     assert!(app.sock_plan.is_none());
     assert!(
         would_dispatch(&app),
         "a socketless headless build must still confirm"
     );
 
-    // A configured-but-unbound socket is not yet a proof.
     app.sock_plan = Some(crate::control_auth::SocketPlan {
         sock_path: "/tmp/aterm-boot-health-test.sock".into(),
         token_path: std::path::PathBuf::from("/tmp/aterm-boot-health-test.token"),
@@ -65,7 +60,6 @@ fn headless_confirms_boot_health_at_the_control_socket_boundary() {
         "a bound control socket is the headless health proof"
     );
 
-    // The one-shot latch still governs headless: one confirmation per run.
     app.boot_health_confirmation_dispatched = true;
     assert!(
         !would_dispatch(&app),
@@ -74,8 +68,7 @@ fn headless_confirms_boot_health_at_the_control_socket_boundary() {
 }
 
 /// Boot health never folds a past deadline: a saturated dispatch moves the retry onto
-/// the backoff, and a retry the guard would refuse is not folded. Pins
-/// `note_boot_health_dispatch` and `boot_health_retry_deadline`.
+/// the backoff, and a retry the guard would refuse is not folded.
 #[test]
 fn boot_health_never_folds_a_past_deadline() {
     use std::time::{Duration, Instant};
@@ -92,7 +85,6 @@ fn boot_health_never_folds_a_past_deadline() {
         "an open guard folds the retry floored into the future"
     );
 
-    // A closed guard (an uncommitted handoff candidate proves no health).
     app.incoming_handoff_pending = true;
     assert_eq!(
         app.boot_health_retry_deadline(now),
@@ -101,7 +93,6 @@ fn boot_health_never_folds_a_past_deadline() {
     );
     app.incoming_handoff_pending = false;
 
-    // A saturated FIFO: the retry moves onto the backoff, which grows.
     app.note_boot_health_dispatch(crate::app_native::NativeUpdateDispatch::Saturated, now);
     assert_eq!(
         app.boot_health_confirmation_retry_at,
@@ -115,7 +106,6 @@ fn boot_health_never_folds_a_past_deadline() {
     );
     assert!(app.boot_health_retry_deadline(now).is_some_and(|d| d > now));
 
-    // Queued closes the latch; a failure answered after it keeps climbing.
     app.note_boot_health_dispatch(crate::app_native::NativeUpdateDispatch::Queued, now);
     assert!(app.boot_health_confirmation_dispatched);
     assert_eq!(app.boot_health_retry_deadline(now), None);
@@ -157,8 +147,6 @@ fn serious_mode_drains_fun_state_without_touching_functional_ui() {
         .cursor_mut()
         .trail
         .tick(Some((0, 0)), now, &trail_cfg, &mut emitted_trail);
-    // This synthetic four-cell hop is a generic authored landing, not a
-    // one-glyph echo (which the real classifier correctly re-anchors).
     ws.fx.cursor_mut().trail.note_synthetic_move(now);
     ws.fx.cursor_mut().trail.tick(
         Some((0, 4)),
@@ -245,15 +233,11 @@ fn serious_mode_drains_fun_state_without_touching_functional_ui() {
         .rain_quads
         .push(aterm_render::SpriteQuad::default());
 
-    // These states are functional presentation, not fun effects. Serious mode
-    // must not erase or demote any of them.
     ws.bell_flash.ring(now);
     let bell_deadline = ws.bell_flash.deadline();
     ws.next_blink = Some(blink_deadline);
     ws.scroll_frac_px = 7;
     ws.pill_shown = true;
-    // The typed wake is typing evidence: the serious-mode drain runs every turn and the
-    // status classifier reads `last_key_at`, so the drain must leave it alone.
     ws.focused = false;
     ws.last_key_at = Some(now);
 
@@ -307,8 +291,6 @@ fn serious_mode_drains_fun_state_without_touching_functional_ui() {
         "serious mode is not reduced motion; smooth functional UI remains enabled"
     );
 
-    // The typed wake survives the drain — and a second drain, which is what
-    // every serious-mode turn runs — yet schedules nothing.
     let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
     ws.drain_serious_effects();
     assert_eq!(
@@ -334,8 +316,7 @@ fn serious_mode_drains_fun_state_without_touching_functional_ui() {
 /// A resident under a load shed keeps its motion and leaves only the frame train: a moving pet
 /// is armed at its owner's coarse offer (`RESIDENT_SHED_CADENCE`) through the shed-free
 /// `pet_motion` gate, a settled one owes only its own next step no sooner than that cadence,
-/// and the latch clearing (on the envelope's recovery ramp) hands the train back. Negative
-/// control: a pet gate carrying the latch, as `cursor_cat_motion` does, arms nothing.
+/// and the latch clearing (on the envelope's recovery ramp) hands the train back.
 #[test]
 fn a_shed_resident_keeps_moving_on_its_coarse_offer_never_the_train() {
     use aterm_effects::companion::RESIDENT_SHED_CADENCE;
@@ -359,7 +340,6 @@ fn a_shed_resident_keeps_moving_on_its_coarse_offer_never_the_train() {
         "fixture: a resident running after a far caret claims the train"
     );
 
-    // The latch engages mid-run.
     now += Duration::from_millis(16);
     present(ws, now, 60, (1.0, true));
     assert!(
@@ -384,7 +364,6 @@ fn a_shed_resident_keeps_moving_on_its_coarse_offer_never_the_train() {
         "negative control: a pet gate carrying the latch strands the moving pet"
     );
 
-    // Presented on its offers alone, the resident arrives and settles.
     let mut settled = false;
     for _ in 0..400 {
         if !ws.fx.companion().brain().needs_frames() {
@@ -411,8 +390,6 @@ fn a_shed_resident_keeps_moving_on_its_coarse_offer_never_the_train() {
          no sooner than the shed cadence"
     );
 
-    // The latch clears; on the envelope's recovery ramp a caret move is
-    // already back on the train.
     now += Duration::from_millis(16);
     present(ws, now, 30, (0.4, false));
     assert!(
@@ -498,8 +475,6 @@ fn wake_expiry_preserves_exactly_one_cursor_effect_settle_present() {
     assert_eq!(settled["effect_active"], 0);
 }
 
-// The effect lane's wake census.
-
 use std::time::{Duration, Instant};
 
 /// One gesture of the confirmation capture's schedule.
@@ -513,8 +488,7 @@ enum LaneGesture {
 
 /// The capture's schedule, in ms from the first key: 35 keys at 70 ms, a 1.5 s pause, 9 keys
 /// at 35 ms, a 1 s pause, four Ctrl-A / Ctrl-E jumps 500 ms apart, four backspaces at 100 ms,
-/// Enter, then the tail the lane is judged on. The engine-side twin is
-/// `cursor_glow::tests::wake_census::census_schedule`.
+/// Enter, then the tail the lane is judged on.
 fn lane_census_schedule() -> Vec<(u64, LaneGesture)> {
     let mut s = Vec::new();
     let mut t = 0u64;
@@ -588,7 +562,6 @@ fn lane_wake_census() -> LaneCensus {
     let mut next_ev = 0usize;
     let mut out = Vec::new();
     let mut now = t0 - Duration::from_millis(50);
-    // Seed: one dark frame so both engines have a source cell.
     ws.fx
         .cursor_mut()
         .glow
@@ -638,9 +611,7 @@ fn lane_wake_census() -> LaneCensus {
             next_ev += 1;
         }
         ws.service_due_terminal_effect_tick(now);
-        // Arm A: the turn that requested this redraw.
         let a = charge(ws, now);
-        // The frame.
         ws.fx
             .cursor_mut()
             .glow
@@ -673,13 +644,10 @@ fn lane_wake_census() -> LaneCensus {
             &caret_cfg,
             &mut out,
         );
-        // Arm B: the turn after the redraw.
         let b = charge(ws, now);
         if now >= last_at {
             let since = now.saturating_duration_since(last_at).as_millis() as u64;
             census.tail_arms += u32::from(a) + u32::from(b);
-            // The park is the post-redraw decision: arm A judged the state
-            // before this frame; arm B is the level the loop sleeps on.
             if b {
                 census.park_ms = None;
             } else if census.park_ms.is_none() {
@@ -691,8 +659,7 @@ fn lane_wake_census() -> LaneCensus {
 }
 
 /// After the last key the glow's own lane parks within two seconds (the engine idles
-/// at ≤ 1.54 s). Measured on the glow alone: the rainbow caret's colour release is
-/// `the_settling_rainbow_caret_keeps_the_lane_to_its_last_step`'s.
+/// at ≤ 1.54 s).
 #[test]
 fn the_effect_lane_parks_within_two_seconds_of_the_last_key_under_v2() {
     let v2 = lane_wake_census();
@@ -703,16 +670,13 @@ fn the_effect_lane_parks_within_two_seconds_of_the_last_key_under_v2() {
         park <= 2_000,
         "the lane parked {park} ms after the last key"
     );
-    // And it does not wake again once parked: the tail's arms all precede
-    // the park (the census clears `park_ms` on any later arm).
     assert!(v2.tail_arms > 0, "the tail owed at least the swoosh");
 }
 
 /// The caret's colour release keeps the lane to its last step: with only the rainbow
 /// caret cooling, identical frames release the frame train, but the lane must stay
 /// armed until the caret releases, advance on every plan, and cost no more wakes than
-/// the frame train. Drives the real planner as the event loop does. The engine's twin
-/// test pins the per-step schedule.
+/// the frame train.
 #[test]
 fn the_settling_rainbow_caret_keeps_the_lane_to_its_last_step() {
     use aterm_effects::cursor_glow::Geom;
@@ -728,9 +692,6 @@ fn the_settling_rainbow_caret_keeps_the_lane_to_its_last_step() {
         win_h: 384,
         head: 0,
     };
-    // The host spine the caret is fed: the typing-momentum metric on its
-    // 2.0 s tau chased by the ribbon's 0.85 s display ease, and the
-    // cadence's 220 ms ignition heat beside it.
     let spine = |secs: f32| {
         let mut disp = 1.0_f32;
         let mut t = 0.0_f32;
@@ -752,7 +713,6 @@ fn the_settling_rainbow_caret_keeps_the_lane_to_its_last_step() {
     let t0 = Instant::now();
     let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
     ws.focused = true;
-    // A 120 Hz panel: the shipped effect lane.
     ws.frame_interval = Some(Duration::from_nanos(8_333_333));
     let interval = ws.effect_present_interval();
     let mut halo = Vec::new();
@@ -780,8 +740,6 @@ fn the_settling_rainbow_caret_keeps_the_lane_to_its_last_step() {
         );
     };
 
-    // Type, then rest, on the frame train until the fingerprint law lets
-    // go: the body has settled, the fill has not.
     let mut t = t0;
     loop {
         tick_caret(ws, t, &mut halo);
@@ -853,9 +811,7 @@ fn the_settling_rainbow_caret_keeps_the_lane_to_its_last_step() {
 /// with a steady cursor (no blink clock to repaint the window), identical frames
 /// release the frame train while the halo is still on glass, but the lane must stay
 /// armed, advance on every plan, and park only after a frame that drew nothing: no
-/// halo, no tint, not hot. Drives the real planner as the event loop does; the
-/// engine's twin (`a_cooling_glow_keeps_the_lane_until_its_last_frame_clears_the_halo`)
-/// pins the schedule. Prints the wakes against the frame train; nothing pins them.
+/// halo, no tint, not hot.
 #[test]
 fn the_settling_momentum_glow_keeps_the_lane_to_its_last_frame() {
     use aterm_effects::cursor_glow::Geom;
@@ -891,7 +847,6 @@ fn the_settling_momentum_glow_keeps_the_lane_to_its_last_frame() {
     let t0 = Instant::now();
     let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
     ws.focused = true;
-    // A 120 Hz panel: the shipped effect lane.
     ws.frame_interval = Some(Duration::from_nanos(8_333_333));
     let interval = ws.effect_present_interval();
     let mut halo = Vec::new();
@@ -907,8 +862,6 @@ fn the_settling_momentum_glow_keeps_the_lane_to_its_last_frame() {
             .tick(Some((4, col)), at, geom, &cfg, halo, &mut Vec::new())
     };
 
-    // 24 keys at 60 ms, each moving the caret, a frame after each; then rest
-    // on the frame train until the fingerprint law lets go.
     let mut t = t0;
     let mut col = 10u16;
     for k in 0..24u16 {
@@ -994,9 +947,6 @@ fn static_collection_hello_uses_cursor_effect_presentability() {
         ws.last_key_at = Some(now);
     }
 
-    // Raw focus leaves while the typed wake is live. The same synthetic
-    // focus pin that lets the hello paint must keep its bounded erase clock
-    // running; pausing here leaves the already-painted still frozen forever.
     app.on_focus(wid, false);
     let ws = app.windows.get(&wid).expect("test window");
     assert!(!ws.focused);
@@ -1010,16 +960,12 @@ fn static_collection_hello_uses_cursor_effect_presentability() {
         "the reduced-motion scheduler must fold that same typed wake"
     );
 
-    // The recording watcher is the other synthetic focus pin. Exercise the
-    // scheduler fold directly so this test stays device- and filesystem-free.
     let ws = app.windows.get(&wid).expect("test window");
     assert!(
         ws.static_cursor_cat_deadline(now, false, true).is_some(),
         "a recorded static hello also owns its bounded erase wake"
     );
 
-    // Synthetic focus does not resume state paused by a different presentation gate:
-    // focus loss may preserve a live hello, but re-admission stays with the renderer's fold.
     let mut paused = App::headless_for_test();
     {
         let ws = paused.windows.get_mut(&wid).expect("test window");
@@ -1075,7 +1021,6 @@ fn disabling_serious_mode_restores_latest_underlying_requests() {
         "headless stays device-free"
     );
 
-    // A preference edited while the overlay is active is the value restored.
     assert!(app.set_serious_mode(true));
     app.config.cursor_trail = Some(false);
     assert!(!app.set_serious_mode(false));
@@ -1089,9 +1034,7 @@ fn disabling_serious_mode_restores_latest_underlying_requests() {
 /// The bell tests' positive control: a windowed instance with every gate open
 /// (`bell_sound` ships on, serious mode off, a fresh lane) asks the fixture's
 /// counting `alert_sound` for exactly one sound per [`BELL_BEEP_INTERVAL`], and
-/// that bell burns the lane. So the zero counts the silenced-bell tests below
-/// assert are the gates at work, not a counter that never moves. The fixture's
-/// `alert_sound` only counts, so no test here plays a real alert sound.
+/// that bell burns the lane.
 #[test]
 fn a_windowed_bell_plays_one_alert_sound_per_lane() {
     let mut app = App::headless_for_test();
@@ -1116,16 +1059,11 @@ fn a_windowed_bell_plays_one_alert_sound_per_lane() {
 #[test]
 fn serious_mode_bell_never_consumes_the_audible_rate_limit_lane() {
     let mut app = App::headless_for_test();
-    // As a windowed instance: headless alone silences every bell
-    // (`a_headless_bell_never_reaches_the_alert_sound`), which would leave
-    // serious mode's own gate untested here.
     app.headless = false;
     assert!(app.set_serious_mode(true));
     let now = std::time::Instant::now();
     let before = crate::alert_sounds_on_this_thread();
 
-    // The headless fixture has no native view to flash: this pins only that a suppressed BEL
-    // never reaches or consumes the audible limiter.
     app.on_bell(WindowId(0), 0, now);
 
     assert_eq!(
@@ -1134,8 +1072,6 @@ fn serious_mode_bell_never_consumes_the_audible_rate_limit_lane() {
         "a serious-mode BEL plays no alert sound",
     );
     assert!(!app.set_serious_mode(false));
-    // The same instant the bell arrived at: a consumed token would refuse it
-    // however long the test took between the two calls.
     assert!(
         app.bell_beep.try_fire(now),
         "a serious-mode BEL must not consume the audible rate-limit lane"
@@ -1144,13 +1080,10 @@ fn serious_mode_bell_never_consumes_the_audible_rate_limit_lane() {
 
 /// `bell_sound = false` silences the audible BEL without consuming the
 /// [`BELL_BEEP_INTERVAL`] token (the `&&` order in `on_bell`), like the serious-mode
-/// twin. Non-vacuous: it first asserts the key ships on, and the positive control
-/// (`a_windowed_bell_plays_one_alert_sound_per_lane`) shows an open gate both
-/// sounds and burns the lane.
+/// twin.
 #[test]
 fn a_silenced_bell_never_consumes_the_audible_rate_limit_lane() {
     let mut app = App::headless_for_test();
-    // As a windowed instance, so `bell_sound` is what silences this bell.
     app.headless = false;
     assert!(
         app.config.bell_sound_or_default(),
@@ -1175,9 +1108,7 @@ fn a_silenced_bell_never_consumes_the_audible_rate_limit_lane() {
 /// A headless instance has no window, so its BEL never asks the OS for the
 /// alert sound: every other gate is open (the switch ships on, serious mode is
 /// off, the lane is fresh), yet no sound is requested and the lane's token is
-/// still there after the bell. Measured before this gate: headless lab
-/// instances, live tests and checks on the owner's Mac played the system alert
-/// sound for every BEL their scripted shells rang.
+/// still there after the bell.
 #[test]
 fn a_headless_bell_never_reaches_the_alert_sound() {
     let mut app = App::headless_for_test();
@@ -1216,10 +1147,6 @@ fn status_field<'a>(record: &'a str, key: &str) -> Option<&'a str> {
 /// WHICH TAB RANG (2026-10-22): a BEL is kept on the session whose program
 /// rang it — the program in front, as `status program=` names it, and what
 /// the gates made of its sound, the newest first — and `status` says so.
-/// NEGATIVE CONTROL: the other tab, which rang nothing, reads
-/// `bells=0 bells_sounded=0 last_bell=-`. Keeping it moves nothing the bell
-/// does: the alert sound is still the gates' (one sounded, the second inside
-/// its lane `limited`, the third `off` by `bell_sound = false`).
 #[test]
 fn a_bell_is_kept_on_the_tab_that_rang_it_and_on_no_other() {
     let mut app = App::headless_for_test();
@@ -1276,7 +1203,7 @@ fn a_bell_is_kept_on_the_tab_that_rang_it_and_on_no_other() {
 
 /// A headless instance's bell is kept as `headless` (it never sounds), and
 /// a serious-mode one as `serious`: the word names the gate that kept it
-/// quiet. NEGATIVE CONTROL: `bells_sounded=0` beside `bells=2`.
+/// quiet.
 #[test]
 fn a_quiet_bell_is_kept_with_the_gate_that_quieted_it() {
     let mut app = App::headless_for_test();
@@ -1380,71 +1307,57 @@ fn url_at(line: &str, col: usize) -> Option<String> {
 
 #[test]
 fn config_parsing() {
-    // Full config.
     let c: Config =
         aterm_toml::from_str("font_px = 24.0\ngpu = true\nscrollback_lines = 5000").unwrap();
     assert_eq!(c.font_px, Some(24.0));
     assert_eq!(c.gpu, Some(true));
     assert_eq!(c.scrollback_lines, Some(5000));
-    // scrollback maps into the engine config: N -> cap, 0 -> unlimited (None).
     assert_eq!(c.applied_terminal_config().scrollback_limit, Some(5000));
     let unlimited: Config = aterm_toml::from_str("scrollback_lines = 0").unwrap();
     assert_eq!(unlimited.applied_terminal_config().scrollback_limit, None);
-    // No engine-side keys -> the engine config an empty config has.
     assert_eq!(
         aterm_toml::from_str::<Config>("font_px = 18.0")
             .unwrap()
             .applied_terminal_config(),
         Config::default().applied_terminal_config()
     );
-    // Cursor: shape + blink -> CursorStyle variant.
     use aterm_core::terminal::CursorStyle;
     let c: Config = aterm_toml::from_str("cursor_style = \"bar\"\ncursor_blink = false").unwrap();
     assert_eq!(
         c.applied_terminal_config().cursor_style,
         CursorStyle::SteadyBar
     );
-    // Bad shape falls back (doesn't crash).
     let c: Config = aterm_toml::from_str("cursor_style = \"weird\"").unwrap();
     assert_eq!(
         c.applied_terminal_config().cursor_style,
         CursorStyle::BlinkingBlock
     );
-    // Partial config; unknown keys and tables are ignored (forward-compatible).
     let c: Config =
         aterm_toml::from_str("gpu = false\nfuture_key = \"x\"\n[unknown]\nk = 1").unwrap();
     assert_eq!(c.font_px, None);
     assert_eq!(c.gpu, Some(false));
-    // Empty → all defaults (None).
     let c: Config = aterm_toml::from_str("").unwrap();
     assert!(c.font_px.is_none() && c.gpu.is_none());
-    // Wrong type → parse error (load_config warns + falls back to defaults).
     assert!(aterm_toml::from_str::<Config>("font_px = \"big\"").is_err());
-    // Initial size.
     let c: Config = aterm_toml::from_str("columns = 120\nlines = 40").unwrap();
     assert_eq!((c.columns, c.lines), (Some(120), Some(40)));
-    // Search index depth: parses; `search_index_depth` maps None -> the engine
-    // default (100 000) and Some(n) -> n lines retained by the search index.
     use crate::app_config::search_index_depth;
     assert_eq!(
         search_index_depth(&Config::default()),
         aterm_core::search::DEFAULT_MAX_CACHED_LINES
-    ); // unset → engine default
+    );
     let c: Config = aterm_toml::from_str("search_history_lines = 50000").unwrap();
     assert_eq!(
         (c.search_history_lines, search_index_depth(&c)),
         (Some(50_000), 50_000)
     );
     let c: Config = aterm_toml::from_str("search_history_lines = 0").unwrap();
-    assert_eq!(search_index_depth(&c), 0); // 0 → clamped to >=1 line by set_search_max_lines
+    assert_eq!(search_index_depth(&c), 0);
     let c: Config = aterm_toml::from_str("search_history_lines = 5000000").unwrap();
-    assert_eq!(search_index_depth(&c), 5_000_000); // deep history, above the engine default
-    // Tab strip rows: parses as a u16; unset is None (the default and the clamp
-    // are `resolve_tab_strip_rows`'s).
+    assert_eq!(search_index_depth(&c), 5_000_000);
     let c: Config = aterm_toml::from_str("tab_strip_rows = 2").unwrap();
     assert_eq!(c.tab_strip_rows, Some(2));
-    assert_eq!(Config::default().tab_strip_rows, None); // unset
-    // Theme colours: hex parses; bad hex warns + is skipped (no crash).
+    assert_eq!(Config::default().tab_strip_rows, None);
     use aterm_types::scheme::parse_hex;
     assert_eq!(
         parse_hex("#FF8800"),
@@ -1455,7 +1368,6 @@ fn config_parsing() {
         aterm_core::terminal::Rgb::new(0x10, 0x20, 0x30).into()
     );
     assert!(parse_hex("#xyz").is_none() && parse_hex("#12345").is_none());
-    // Renderer theme from config: hex → Theme u32 (0x00RRGGBB).
     let c: Config = aterm_toml::from_str(
         "foreground = \"#102030\"\nbackground = \"#405060\"\nselection_color = \"#708090\"",
     )
@@ -1465,7 +1377,6 @@ fn config_parsing() {
         (th.fg, th.bg, th.selection),
         (0x0010_2030, 0x0040_5060, 0x0070_8090)
     );
-    // Unset → built-in defaults preserved.
     assert_eq!(
         Config::default().theme().selection,
         super::Theme::default().selection
@@ -1474,21 +1385,14 @@ fn config_parsing() {
 
 #[test]
 fn paste_confirm_flags_any_line_end_only_when_unbracketed() {
-    // Bracketed paste (modern shell default) is never flagged: the shell waits
-    // for the person's own Enter, trailing newline or not.
     assert!(!super::paste_needs_confirm("a\nb\nc", true));
     assert!(!super::paste_needs_confirm("make test\n", true));
-    // A single line with no line end does not run on its own: not flagged.
     assert!(!super::paste_needs_confirm("ls -la", false));
-    // Unbracketed, a trailing newline submits the line the moment it lands:
-    // one planted look-alike command is the pastejack, so it is flagged.
     assert!(super::paste_needs_confirm("make test\n", false));
-    assert!(super::paste_needs_confirm("make test\r\n", false)); // CRLF trailing
-    assert!(super::paste_needs_confirm("make test\r", false)); // lone CR trailing
-    // An embedded newline with bracketed paste off is flagged (pastejacking risk).
+    assert!(super::paste_needs_confirm("make test\r\n", false));
+    assert!(super::paste_needs_confirm("make test\r", false));
     assert!(super::paste_needs_confirm("ls\nrm -rf ~\n", false));
-    assert!(super::paste_needs_confirm("a\rb", false)); // embedded CR
-    // Default config: confirmation is on.
+    assert!(super::paste_needs_confirm("a\rb", false));
     assert!(Config::default().confirm_multiline_paste_or_default());
     assert!(
         !aterm_toml::from_str::<Config>("confirm_multiline_paste = false")
@@ -1505,8 +1409,6 @@ fn controls_prefs_projects_current_native_top_settings_tree() {
     use crate::app_introspect::AuxTarget;
     let mut app = crate::App::headless_for_test();
 
-    // A closed native tab has no visible route or controls; the first line stays
-    // `state open=…` for callers that only test open/closed.
     let closed = app.read_aux_controls(AuxTarget::Prefs);
     assert_eq!(closed[0], "state open=false");
     assert!(closed.iter().any(|line| line == "prefs fields=0"));
@@ -1597,10 +1499,8 @@ fn controls_prefs_projects_current_native_top_settings_tree() {
 /// hardcoded `on_key` matches unchanged.
 #[test]
 fn keybindings_table_parses() {
-    // Absent → empty map (the hardcoded path is reached unchanged).
     let kb = crate::keybinding::Keybindings::from_config(Config::default().keybindings.as_ref());
     assert!(kb.is_empty());
-    // A populated table resolves its chords to actions.
     let c: Config = aterm_toml::from_str(
         "[keybindings]\n\"cmd+shift+n\" = \"new_tab\"\n\"ctrl+a\" = \"find\"\n",
     )
@@ -1616,7 +1516,6 @@ fn keybindings_table_parses() {
         kb.lookup(&WK::Character(SmolStr::new("a")), MS::CONTROL),
         Some(crate::keybinding::Action::Find)
     );
-    // An unbound chord misses, so `on_key` falls through to the hardcoded match.
     assert_eq!(
         kb.lookup(&WK::Character(SmolStr::new("t")), MS::SUPER),
         None
@@ -1633,13 +1532,12 @@ fn theme_colors_reach_rendercell() {
         aterm_toml::from_str("foreground = \"#FF8800\"\nbackground = \"#102030\"").unwrap();
     let mut t = Terminal::new(4, 10);
     t.apply_config(&c.applied_terminal_config());
-    t.process(b"X"); // a default-styled glyph uses the configured theme colours
+    t.process(b"X");
     let cells = t.render_row(0);
     assert_eq!(cells[0].ch, 'X');
     assert_eq!(cells[0].fg, [0xFF, 0x88, 0x00]);
     assert_eq!(cells[0].bg, [0x10, 0x20, 0x30]);
 
-    // The palette: SGR fg = ANSI 1 (red) → palette index 1.
     let c: Config = aterm_toml::from_str("palette = [\"#000000\", \"#AB12CD\"]").unwrap();
     let mut t = Terminal::new(4, 10);
     t.apply_config(&c.applied_terminal_config());
@@ -1648,8 +1546,6 @@ fn theme_colors_reach_rendercell() {
     assert_eq!(cells[0].ch, 'R');
     assert_eq!(cells[0].fg, [0xAB, 0x12, 0xCD]);
 
-    // A palette entry over a named theme: Dracula's ansi[1] is #ff5555; slot 1
-    // overridden to pure green wins.
     let c: Config =
         aterm_toml::from_str("theme = \"Dracula\"\npalette = [\"#000000\", \"#00FF00\"]").unwrap();
     let mut t = Terminal::new(2, 4);
@@ -1665,19 +1561,14 @@ fn theme_colors_reach_rendercell() {
 }
 
 /// A named `theme` flows config → engine → rendered cells: it sets the default
-/// fg/bg and the full ANSI palette (incl. bold-to-bright), and the renderer Theme
-/// chrome. A per-key override still wins over the theme (last-wins precedence).
+/// fg/bg and the full ANSI palette (incl.
 #[test]
 fn named_theme_reaches_rendercell_and_chrome() {
     use aterm_core::terminal::Terminal;
-    // Dracula: fg #f8f8f2, bg #282a36; ansi[1]=#ff5555 (red), ansi[12]=#d6acff
-    // (bright blue, reached by bold-blue 1;34).
     let c: Config = aterm_toml::from_str("theme = \"Dracula\"").unwrap();
-    // Renderer chrome comes from the scheme.
     let th = c.theme();
     assert_eq!(th.fg, 0x00f8_f8f2, "theme fg reaches the renderer Theme");
     assert_eq!(th.bg, 0x0028_2a36, "theme bg reaches the renderer Theme");
-    // Engine default + palette reach rendered cells.
     let mut t = Terminal::new(4, 12);
     t.apply_config(&c.applied_terminal_config());
     t.process(b"A\x1b[31mR\x1b[0m\x1b[1;34mB");
@@ -1692,7 +1583,6 @@ fn named_theme_reaches_rendercell_and_chrome() {
         "bold SGR 34 → Dracula ansi[12] (bright)"
     );
 
-    // A per-key override beats the theme.
     let c2: Config = aterm_toml::from_str("theme = \"Dracula\"\nbackground = \"#102030\"").unwrap();
     assert_eq!(
         c2.theme().bg,
@@ -1729,26 +1619,16 @@ fn unknown_theme_falls_back_to_default() {
 fn font_px_precedence_flag_beats_config_beats_default() {
     use super::{FONT_PX, FONT_PX_MAX, FONT_PX_MIN};
     use crate::app_config::{font_px_is_explicit_with, resolve_font_px_with};
-    // The flag wins over config.
     assert_eq!(resolve_font_px_with(Some(24.0), Some(18.0)), 24.0);
-    // No flag → config wins over the built-in default.
     assert_eq!(resolve_font_px_with(None, Some(18.0)), 18.0);
-    // Neither → built-in default.
     assert_eq!(resolve_font_px_with(None, None), FONT_PX);
-    // Out-of-range values (flag and config) are filtered, falling to default.
     assert_eq!(resolve_font_px_with(Some(9999.0), None), FONT_PX);
     assert_eq!(resolve_font_px_with(None, Some(0.0)), FONT_PX);
-    // An out-of-range flag falls through to a valid config value, not the built-in
-    // default.
     assert_eq!(resolve_font_px_with(Some(9999.0), Some(18.0)), 18.0);
-    // Out-of-range flag and out-of-range config → default.
     assert_eq!(resolve_font_px_with(Some(9999.0), Some(9999.0)), FONT_PX);
-    // In-range bounds are honoured.
     assert_eq!(resolve_font_px_with(Some(6.0), None), FONT_PX_MIN);
     assert_eq!(resolve_font_px_with(None, Some(200.0)), FONT_PX_MAX);
 
-    // Explicitness uses the exact same admission law. Invalid authored
-    // values are diagnostics, not a hidden request to disable HiDPI auto-size.
     assert!(!font_px_is_explicit_with(None, None));
     assert!(!font_px_is_explicit_with(None, Some(0.0)));
     assert!(!font_px_is_explicit_with(Some(f32::NAN), Some(f32::NAN)));
@@ -1758,21 +1638,15 @@ fn font_px_precedence_flag_beats_config_beats_default() {
 
 /// The reload engine path re-themes a live terminal: applying a new `applied_terminal_config`
 /// recolours already-rendered default cells, and reverting the key reverts the colour, as
-/// `App::reload_config` does to every session via `apply_config`. The revert lands on the
-/// theme background, never spec-black.
+/// `App::reload_config` does to every session via `apply_config`.
 #[test]
 fn reload_retheme_then_revert_live_terminal() {
     use aterm_core::terminal::Terminal;
     let mut t = Terminal::new(4, 10);
     t.process(b"X");
-    // Apply a themed config (config → engine), then re-render: the default
-    // glyph picks up the new background, proving the live re-apply works.
     let themed: Config = aterm_toml::from_str("background = \"#203040\"").unwrap();
     t.apply_config(&themed.applied_terminal_config());
     assert_eq!(t.render_row(0)[0].bg, [0x20, 0x30, 0x40]);
-    // Reverting the key: `applied_terminal_config()` pins the engine default bg
-    // to the theme bg — so a default-styled cell reverts to the themed window
-    // background, not the engine's spec-default black.
     let empty: Config = aterm_toml::from_str("").unwrap();
     t.apply_config(&empty.applied_terminal_config());
     let theme_bg = {
@@ -1811,11 +1685,9 @@ fn find_matches_and_highlight() {
     term.lock().unwrap().process(b"Hello hello HELLO");
     let base_y = i64::try_from(term.lock().unwrap().grid().base_y()).unwrap();
 
-    // Case-insensitive by default: all three occurrences, in visual order.
     let results = search_full_history(&term, "hello", false, false).unwrap();
     let matches = map_matches(&results.results.matches, base_y);
     assert_eq!(matches, vec![(0, 0, 4), (0, 6, 10), (0, 12, 16)]);
-    // A miss is an empty set (not an error).
     assert!(
         search_full_history(&term, "xyz", false, false)
             .unwrap()
@@ -1824,7 +1696,6 @@ fn find_matches_and_highlight() {
             .is_empty()
     );
 
-    // The highlight round-trips: applying the first match as a selection selects it.
     let (r, c0, c1) = matches[0];
     let mut t = term.lock().unwrap();
     let sel = t.text_selection_mut();
@@ -1843,8 +1714,6 @@ fn search_wide_char_columns_are_display_cells() {
     use aterm_core::terminal::Terminal;
     use std::sync::{Arc, Mutex};
 
-    // "世界" = two double-width glyphs = 4 display columns; "hit" starts at cell 4,
-    // not char index 2.
     let term = Arc::new(Mutex::new(Terminal::new(4, 20)));
     term.lock().unwrap().process("世界hit".as_bytes());
     let base_y = i64::try_from(term.lock().unwrap().grid().base_y()).unwrap();
@@ -1856,7 +1725,6 @@ fn search_wide_char_columns_are_display_cells() {
         "match reported at DISPLAY cols 4..=6"
     );
 
-    // The mapped cell columns round-trip to the matched text on the real grid.
     let (r, c0, c1) = matches[0];
     let mut t = term.lock().unwrap();
     let sel = t.text_selection_mut();
@@ -1876,8 +1744,6 @@ fn a_hit_that_straddles_a_soft_wrap_is_found_once_at_the_row_it_starts_on() {
     use aterm_core::terminal::Terminal;
     use std::sync::{Arc, Mutex};
 
-    // 10 columns: "wrapmatch" starts at column 8 and finishes at column 6 of
-    // the wrapped row below it.
     let term = Arc::new(Mutex::new(Terminal::new(4, 10)));
     term.lock().unwrap().process(b"aaaaaaaawrapmatchbb");
     let base_y = i64::try_from(term.lock().unwrap().grid().base_y()).unwrap();
@@ -1890,8 +1756,6 @@ fn a_hit_that_straddles_a_soft_wrap_is_found_once_at_the_row_it_starts_on() {
         "one hit at row 0 col 8, ending 9 columns later — 7 of them on row 1"
     );
 
-    // Both halves round-trip through the selection the find bar arms: the far
-    // anchor is the end column divided by the width, so it lands on row 1.
     let (row, c0, c1) = matches[0];
     let cols = usize::from(term.lock().unwrap().grid().cols());
     let mut t = term.lock().unwrap();
@@ -1983,17 +1847,13 @@ fn a_vs16_base_left_narrow_in_the_last_column_keeps_the_runs_stride() {
 }
 
 /// The join pads a continued row back out to the grid's width before it appends the next
-/// one. Grid rows are read trimmed, so without that padding a run whose row ends in blanks
-/// would splice its neighbour's first column onto its last non-blank one, inventing a match
-/// that is not on the glass.
+/// one.
 #[test]
 fn a_soft_wrap_does_not_splice_a_match_across_the_blanks_at_a_row_end() {
     use crate::control::search_full_history;
     use aterm_core::terminal::Terminal;
     use std::sync::{Arc, Mutex};
 
-    // Column 9 of row 0 is blank; "gh" begins row 1. On the glass "fg" are
-    // not adjacent, so neither is a match for them.
     let term = Arc::new(Mutex::new(Terminal::new(4, 10)));
     term.lock().unwrap().process(b"abcdef   \x20gh");
     assert!(
@@ -2018,37 +1878,26 @@ fn a_soft_wrap_does_not_splice_a_match_across_the_blanks_at_a_row_end() {
 #[test]
 fn url_detection_in_text() {
     let line = "see (http://example.com/p?q=1). end";
-    // "http" starts at col 5; the URL spans into the query.
     assert_eq!(url_at(line, 5).as_deref(), Some("http://example.com/p?q=1"));
     assert_eq!(
         url_at(line, 12).as_deref(),
         Some("http://example.com/p?q=1")
     );
-    // Trailing `).` is trimmed, so the close-paren col is not in the URL.
     let close_paren = line.find(')').unwrap();
     assert_eq!(url_at(line, close_paren), None);
-    // Outside any URL.
     assert_eq!(url_at(line, 0), None);
     assert_eq!(url_at(line, 2), None);
-    // https + bare URL, whole-span membership.
     let bare = "https://a.b/c";
     assert_eq!(url_at(bare, 0).as_deref(), Some("https://a.b/c"));
     assert_eq!(
         url_at(bare, bare.len() - 1).as_deref(),
         Some("https://a.b/c")
     );
-    // Not a URL scheme.
     assert_eq!(url_at("ftp://x.y not-a-link", 0), None);
 }
 
 /// A detected URL is as long as what the row paints, and says when any of it is painted
-/// faintly. Concealed text (SGR 8) keeps its characters but paints in its background, so
-/// `google.com` followed by a hidden `.evil.example/login` opens `google.com`, the hidden cells
-/// open nothing, and a minimum-contrast floor does not reveal them. A tail even one step off
-/// its background (1.002:1 on `#111318`) is painted, so it stays in the URL, and below 3:1 it
-/// marks the URL faint (the run that earns the destination caption); at 3.05:1 it does not.
-/// With the floor on, a 1.11:1 URL (Dracula's palette black on its background) is read as the
-/// renderer lifts it: not faint.
+/// faintly.
 #[test]
 fn a_plain_url_is_as_long_as_its_ink_and_says_when_the_ink_is_faint() {
     let row_of = |bytes: &str| {
@@ -2072,10 +1921,10 @@ fn a_plain_url_is_as_long_as_its_ink_and_says_when_the_ink_is_faint() {
         assert_eq!(at(&hidden, 30, floor), None, "floor {floor}");
     }
     for (ink, faint) in [
-        ("\x1b[38;2;18;19;24m", true),   // 1.002:1
-        ("\x1b[38;2;40;43;50m", true),   // 1.31:1
-        ("\x1b[38;2;88;91;100m", true),  // 2.74:1
-        ("\x1b[38;2;95;98;108m", false), // 3.05:1
+        ("\x1b[38;2;18;19;24m", true),
+        ("\x1b[38;2;40;43;50m", true),
+        ("\x1b[38;2;88;91;100m", true),
+        ("\x1b[38;2;95;98;108m", false),
     ] {
         let tail = tail_in(ink);
         let whole = Some(("https://google.com.evil.example/login".to_string(), faint));
@@ -2093,7 +1942,6 @@ fn a_plain_url_is_as_long_as_its_ink_and_says_when_the_ink_is_faint() {
 
 #[test]
 fn safe_url_allowlist() {
-    // Allowed: http/https/mailto, case-insensitive.
     for ok in [
         "http://example.com",
         "https://example.com/path?q=1#frag",
@@ -2103,7 +1951,6 @@ fn safe_url_allowlist() {
     ] {
         assert!(is_safe_url(ok), "should allow: {ok:?}");
     }
-    // Rejected: filesystem, app/custom schemes, injection, empties.
     for bad in [
         "file:///etc/passwd",
         "x-apple-systempreferences:com.apple.preference",
@@ -2120,8 +1967,6 @@ fn safe_url_allowlist() {
     }
 }
 
-// Per-window metrics for mixed DPI.
-
 use super::{MetricsView, font_px_for_scale};
 
 /// `for_scale_padded` derives device px from the supplied logical pads with the same
@@ -2132,10 +1977,8 @@ fn metrics_view_for_scale_padded_honors_config_padding() {
     let v = MetricsView::for_scale_padded(super::FONT_PX, 2.0, 20.0, 5.0);
     assert_eq!((v.pad, v.pad_top), (40, 10));
     assert_eq!(v.font_px, font_px_for_scale(super::FONT_PX, 2.0));
-    // Top capped at the base pad even when mis-supplied above it.
     let v = MetricsView::for_scale_padded(super::FONT_PX, 1.0, 4.0, 9.0);
     assert_eq!((v.pad, v.pad_top), (4, 4));
-    // Defaults reproduce the pure derivation exactly, at every test scale.
     for &s in &[1.0f64, 1.25, 1.5, 2.0, 3.0] {
         assert_eq!(
             MetricsView::for_scale_padded(
@@ -2157,14 +2000,12 @@ fn metrics_view_for_scale_padded_honors_config_padding() {
 #[test]
 fn two_windows_mixed_dpi_each_resolve_their_own_cell_size() {
     use super::{App, MetricsView, WindowId};
-    let mut app = App::headless_for_test(); // window 0
-    // Window 0 = the 1× laptop.
+    let mut app = App::headless_for_test();
     let w0 = WindowId(0);
     if let Some(ws) = app.windows.get_mut(&w0) {
         ws.scale = 1.0;
         ws.metrics = MetricsView::for_scale(1.0);
     }
-    // Window 1 = the 2× external monitor.
     let w1 = WindowId(1);
     app.install_window_state(w1, super::stub_session(1), 24, 80);
     if let Some(ws) = app.windows.get_mut(&w1) {
@@ -2172,7 +2013,6 @@ fn two_windows_mixed_dpi_each_resolve_their_own_cell_size() {
         ws.metrics = MetricsView::for_scale(2.0);
     }
 
-    // Per-window pad is each window's own MetricsView pad (mixed-DPI, non-vacuous).
     assert_eq!(app.win_pad(w0), MetricsView::for_scale(1.0).pad);
     assert_eq!(app.win_pad(w1), MetricsView::for_scale(2.0).pad);
     assert_ne!(
@@ -2181,7 +2021,6 @@ fn two_windows_mixed_dpi_each_resolve_their_own_cell_size() {
         "1× and 2× pad must differ"
     );
 
-    // Per-window cell box: the 2× window's is strictly larger (bigger font_px).
     let (c0w, c0h) = app.win_cell_size(w0);
     let (c1w, c1h) = app.win_cell_size(w1);
     assert!(
@@ -2189,7 +2028,6 @@ fn two_windows_mixed_dpi_each_resolve_their_own_cell_size() {
         "2× cell box must exceed 1×: ({c0w},{c0h}) vs ({c1w},{c1h})"
     );
 
-    // Draw the 2× window: it activates its metrics on the shared renderer.
     app.apply_window_scale(w1);
     assert_eq!(
         app.win_cell_size(w1),
@@ -2200,7 +2038,6 @@ fn two_windows_mixed_dpi_each_resolve_their_own_cell_size() {
         (app.font_px - MetricsView::for_scale(2.0).font_px).abs() < 0.5,
         "the active font follows the 2× window"
     );
-    // Window 0's geometry is unperturbed while the renderer is at 2×.
     assert_eq!(
         app.win_cell_size(w0),
         (c0w, c0h),
@@ -2208,7 +2045,6 @@ fn two_windows_mixed_dpi_each_resolve_their_own_cell_size() {
     );
     assert_eq!(app.win_pad(w0), MetricsView::for_scale(1.0).pad);
 
-    // Now draw the 1× window; the 2× reads stay pinned in turn.
     app.apply_window_scale(w0);
     assert_eq!(
         app.win_cell_size(w0),
@@ -2224,10 +2060,7 @@ fn two_windows_mixed_dpi_each_resolve_their_own_cell_size() {
 
 /// A config reload that changes the font size re-resolves every window's per-window
 /// metric authority, so hit-test / IME / grid-sizing never read a stale size after the
-/// backend is rebuilt. A named size draws at each window's own scale, exactly as the
-/// default does: 15 is 15 device px on the 1× window and 30 on the 2× one. Negative
-/// control: the old pin drew a named size at the same device px in every window, half
-/// size on the 2× one.
+/// backend is rebuilt.
 #[test]
 fn reload_refreshes_every_window_metric_to_the_new_font_size() {
     use super::{App, MetricsView, WindowId};
@@ -2244,7 +2077,6 @@ fn reload_refreshes_every_window_metric_to_the_new_font_size() {
         ws.metrics = MetricsView::for_scale(2.0);
     }
 
-    // The size a reload of `font_px = 15` commits before `refresh_all_window_metrics`.
     app.font_size = 15.0;
     app.refresh_all_window_metrics();
     assert_eq!(app.windows[&w0].metrics.font_px, 15.0);
@@ -2264,7 +2096,6 @@ fn reload_refreshes_every_window_metric_to_the_new_font_size() {
         "a named size ⇒ the 2× window's cell box exceeds 1×"
     );
 
-    // Back to the default: each window returns to its own scale's default.
     app.font_size = super::FONT_PX;
     app.refresh_all_window_metrics();
     assert_eq!(app.windows[&w0].metrics, MetricsView::for_scale(1.0));
@@ -2277,7 +2108,7 @@ fn reload_refreshes_every_window_metric_to_the_new_font_size() {
 #[test]
 fn live_font_zoom_refreshes_per_window_metrics() {
     use super::{App, MetricsView, WindowId};
-    let mut app = App::headless_for_test(); // window 0, the default size at 1×
+    let mut app = App::headless_for_test();
     let w0 = WindowId(0);
     let w1 = WindowId(1);
     app.install_window_state(w1, super::stub_session(1), 24, 80);
@@ -2288,8 +2119,6 @@ fn live_font_zoom_refreshes_per_window_metrics() {
     let base = app.font_size;
     let (bw, bh) = app.win_cell_size(w0);
 
-    // Zoom IN. The per-window records must follow and the cell box must GROW (the
-    // stale-metrics bug kept it flat).
     app.set_font_size(base + 8.0);
     assert_eq!(app.font_size, base + 8.0);
     assert!(
@@ -2307,7 +2136,6 @@ fn live_font_zoom_refreshes_per_window_metrics() {
         "zooming in must GROW the window's cell box: ({bw},{bh}) -> ({zw},{zh})"
     );
 
-    // Zoom back out, below the base: the per-window cell box shrinks in lockstep.
     app.set_font_size(base - 2.0);
     assert!(
         (app.windows[&w0].metrics.font_px - (base - 2.0)).abs() < 0.5,
@@ -2320,9 +2148,7 @@ fn live_font_zoom_refreshes_per_window_metrics() {
     );
 }
 
-/// A renderer rebuild is fallible. The zoom transaction must not publish
-/// new App/window geometry while the old renderer remains live, or hit
-/// testing, PTY reflow and painted glyph cells disagree after the failure.
+/// A renderer rebuild is fallible.
 #[test]
 fn failed_live_font_zoom_rolls_back_font_authority_and_window_metrics() {
     use super::{App, WindowId};
@@ -2348,7 +2174,6 @@ fn zoom_surviving_a_reload_never_paints_a_frame_wider_than_the_window() {
     let mut app = App::headless_for_test();
     let w0 = WindowId(0);
     let win = PhysicalSize::new(1808u32, 1452u32);
-    // A 2×-display window state: per-window scale + metrics + a recorded raw size.
     if let Some(ws) = app.windows.get_mut(&w0) {
         ws.scale = 2.0;
         ws.metrics = MetricsView::for_scale(2.0);
@@ -2357,7 +2182,6 @@ fn zoom_surviving_a_reload_never_paints_a_frame_wider_than_the_window() {
     app.font_px = MetricsView::for_scale(2.0).font_px;
     app.on_resize(w0, win);
 
-    // The frame the compose would build: grid cols × the active cell box + pad.
     let frame_w = |app: &App| {
         let (cw, _, _) = app.backend.cell_geometry(app.font_px);
         let Some(ws) = app.windows.get(&w0) else {
@@ -2367,8 +2191,6 @@ fn zoom_surviving_a_reload_never_paints_a_frame_wider_than_the_window() {
     };
     assert!(frame_w(&app) <= win.width as usize, "baseline fits");
 
-    // Cmd-−: zoom out. (Headless: `rebuild_backend`'s re-grid loop skips
-    // windows with no OS surface, so re-grid explicitly like the windowed path.)
     app.set_font_size(app.font_size - 2.0 * super::FONT_ZOOM_STEP);
     app.on_resize(w0, win);
     let zoomed_px = app.font_px;
@@ -2376,18 +2198,14 @@ fn zoom_surviving_a_reload_never_paints_a_frame_wider_than_the_window() {
     assert_eq!(zoomed_px, font_px_for_scale(app.font_size, 2.0));
     assert!(frame_w(&app) <= win.width as usize, "zoomed-out grid fits");
 
-    // A reload that leaves the size alone refreshes the metrics at the same size,
-    // and the redraw-time re-tune finds nothing to change.
     app.refresh_all_window_metrics();
     app.apply_window_scale(w0);
     assert_eq!(app.font_px, zoomed_px, "the zoom survives the redraw");
     assert!(frame_w(&app) <= win.width as usize, "frame still fits");
 
-    // Back at the default size, the redraw-time re-tune must re-grid, so the frame
-    // never exceeds the glass.
     app.font_size = app.default_font_size;
-    app.refresh_all_window_metrics(); // metrics -> for_scale(2.0) ≠ zoomed px
-    app.apply_window_scale(w0); // flips the active px back to the default
+    app.refresh_all_window_metrics();
+    app.apply_window_scale(w0);
     assert!(
         (app.font_px - MetricsView::for_scale(2.0).font_px).abs() < 0.5,
         "the redraw re-tunes to the default at 2x"

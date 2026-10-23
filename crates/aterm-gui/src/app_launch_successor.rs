@@ -174,6 +174,7 @@ impl std::fmt::Display for LaunchError {
 }
 
 /// A launch request every field of which LaunchServices can express: valid UTF-8, no interior
+/// NUL, no duplicate environment key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LaunchRequest {
     bundle: String,
@@ -355,6 +356,7 @@ impl LaunchInFlight {
 }
 
 /// The pure half: everything that can be refused without asking the system
+/// anything (bar one filesystem stat, which is advisory).
 fn validate_request(
     bundle: &Path,
     arguments: &[OsString],
@@ -439,7 +441,7 @@ fn validate_request(
     })
 }
 
-/// What is wrong with an environment key, if anything. The faults are checked in order (empty,
+/// What is wrong with an environment key, if anything.
 fn env_key_fault(key: &str) -> Option<TextFault> {
     if key.is_empty() {
         Some(TextFault::Empty)
@@ -452,7 +454,7 @@ fn env_key_fault(key: &str) -> Option<TextFault> {
     }
 }
 
-/// Off macOS there is no LaunchServices and so no per-instance launchd job to be had. The
+/// Off macOS there is no LaunchServices and so no per-instance launchd job to be had.
 #[cfg(not(target_os = "macos"))]
 fn begin_launch_validated(
     request: &LaunchRequest,
@@ -617,6 +619,8 @@ fn begin_launch_validated(
 }
 
 /// Turn the completion's `processIdentifier` into a successor, or say why it is not one: `-1`
+/// (`NSRunningApplication`'s "unknown") is no pid, and this process's own pid means
+/// LaunchServices substituted the running instance.
 #[cfg(target_os = "macos")]
 fn admit_launched_pid(pid: i32, own_pid: i32) -> Result<LaunchedSuccessor, LaunchError> {
     if pid <= 0 {
@@ -629,6 +633,7 @@ fn admit_launched_pid(pid: i32, own_pid: i32) -> Result<LaunchedSuccessor, Launc
 }
 
 /// The completion's reading of an `NSRunningApplication`: its `processIdentifier` and whether
+/// LaunchServices already reports it `isTerminated`.
 #[cfg(target_os = "macos")]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -704,7 +709,7 @@ struct LaunchSlot {
 
 #[cfg(target_os = "macos")]
 impl LaunchSlot {
-    /// Record the first answer and wake the waiter. Later answers are dropped: AppKit calls a
+    /// Record the first answer and wake the waiter.
     fn deliver(&self, answer: Result<LaunchedSuccessor, LaunchError>) {
         let mut slot = self.answer.lock().unwrap_or_else(|p| p.into_inner());
         if slot.is_none() {
@@ -714,6 +719,7 @@ impl LaunchSlot {
     }
 
     /// Apply `read` to the answer in place, delivered or not, without taking it: the answer stays
+    /// for the one [`LaunchWatch::wait`] that consumes it.
     fn peek<T>(
         &self,
         read: impl FnOnce(Option<&Result<LaunchedSuccessor, LaunchError>>) -> T,
@@ -768,7 +774,7 @@ impl LaunchWatch {
         }
     }
 
-    /// Block until the launch is answered or `budget` is spent. The budget is measured from entry
+    /// Block until the launch is answered or `budget` is spent.
     fn wait(&self, budget: Duration) -> Result<LaunchedSuccessor, LaunchError> {
         let started = Instant::now();
         let mut slot = self.slot.answer.lock().unwrap_or_else(|p| p.into_inner());
@@ -791,7 +797,7 @@ impl LaunchWatch {
     }
 }
 
-/// How long is left of `budget` after `waited`, or `None` once it is spent. `None` rather than
+/// How long is left of `budget` after `waited`, or `None` once it is spent.
 #[cfg(target_os = "macos")]
 fn remaining_budget(budget: Duration, waited: Duration) -> Option<Duration> {
     budget.checked_sub(waited).filter(|left| !left.is_zero())
@@ -804,6 +810,7 @@ mod tests {
     use std::path::PathBuf;
 
     /// A real directory named `<something>.app`, which is all the pure
+    /// validation can ask of a bundle.
     fn scratch_bundle(name: &str) -> (aterm_tempfile::TempDir, PathBuf) {
         let root = aterm_tempfile::Builder::new()
             .prefix(&format!("aterm-launch-successor-{name}-"))
@@ -822,6 +829,9 @@ mod tests {
     }
 
     /// A bundle path is refused before anything is launched: relative
+    /// (LaunchServices resolves nothing against our working directory), not a
+    /// `.app` (checked before the filesystem, so the message names the wrong
+    /// kind of target rather than a missing file), or absent.
     #[test]
     fn a_malformed_bundle_path_is_refused() {
         for (path, want) in [
@@ -847,6 +857,7 @@ mod tests {
     }
 
     /// The request carries exactly the caller's keys: the environment merges, so this module
+    /// never takes on keeping `PATH`/`HOME`/`XPC_*` alive.
     #[test]
     fn a_well_formed_request_carries_exactly_the_keys_it_was_given() {
         let (_root, bundle) = scratch_bundle("well-formed");
@@ -875,7 +886,7 @@ mod tests {
         );
     }
 
-    /// An environment no shell could carry is refused. A NUL in a VALUE is
+    /// An environment no shell could carry is refused.
     #[test]
     fn a_malformed_environment_is_refused() {
         let (_root, bundle) = scratch_bundle("bad-env");
@@ -968,6 +979,7 @@ mod tests {
     }
 
     /// Off macOS the request is still validated — same refusals, same tests —
+    /// and only then is the platform refused.
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn off_macos_the_launcher_refuses_the_platform_and_not_the_request() {
@@ -1029,6 +1041,7 @@ mod tests {
         }
 
         /// No AppKit is touched for an impossible pid: activation at Commit is
+        /// aimed only at a corroborated candidate.
         #[test]
         fn activation_refuses_an_impossible_pid_without_touching_appkit() {
             assert!(!crate::app_launch_successor::activate_running(0));
@@ -1037,6 +1050,7 @@ mod tests {
         }
 
         /// A zero budget is a poll: it never parks, answers what is already delivered, and
+        /// reports `Timeout` at once otherwise.
         #[test]
         fn a_zero_budget_wait_is_a_poll_that_never_sleeps() {
             let parks = CONDVAR_PARKS.with(Cell::get);
@@ -1128,6 +1142,7 @@ mod tests {
         }
 
         /// Only an application LaunchServices already reports terminated, with no pid, reads as
+        /// death.
         #[test]
         fn only_a_terminated_application_with_no_pid_reads_as_death() {
             assert_eq!(
@@ -1169,6 +1184,7 @@ mod tests {
         }
 
         /// The pre-dial poll is a peek: the answer stays for the one `wait` that consumes it,
+        /// the corroboration after a dial.
         #[test]
         fn the_exit_peek_leaves_the_answer_for_the_corroboration() {
             let in_flight = crate::app_launch_successor::LaunchInFlight::scripted(None);

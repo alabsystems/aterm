@@ -410,6 +410,86 @@ impl Drop for X11Presenter {
     }
 }
 
+/// A window's X11 presenter as the GL arm's [`aterm_gpu::FrameSink`], which
+/// posts the window's frames through it where a `GLXWindow` would stall the
+/// X server at every resize (NVIDIA's GLX under a compositing manager;
+/// `aterm-gpu`'s `gl::surface`). The presenter is made when the arm attaches
+/// the sink, over MIT-SHM only: a frame a post sends whole on the wire
+/// would cost the socket more than the `GLXWindow` it replaces. The segment
+/// keeps the whole frame, so a post writes and sends only what changed: a
+/// keystroke's row, not a near-maximized window's 18 MB.
+pub(crate) struct X11FrameSink {
+    window: Arc<Window>,
+    presenter: Option<X11Presenter>,
+}
+
+impl X11FrameSink {
+    /// A sink for `window`, attached only if the GL arm asks.
+    pub(crate) fn new(window: Arc<Window>) -> Self {
+        Self {
+            window,
+            presenter: None,
+        }
+    }
+}
+
+impl aterm_gpu::FrameSink for X11FrameSink {
+    fn attach(&mut self) -> Result<(), String> {
+        let presenter = X11Presenter::new(Arc::clone(&self.window)).map_err(|e| e.to_string())?;
+        if !matches!(presenter.store, Store::Shm { .. }) {
+            return Err("the X server takes no MIT-SHM 1.2 segment from this client".to_owned());
+        }
+        self.presenter = Some(presenter);
+        Ok(())
+    }
+
+    fn post(
+        &mut self,
+        width: u32,
+        height: u32,
+        damage: Option<[u32; 4]>,
+        draw: &mut aterm_gpu::FrameDraw<'_>,
+    ) -> Result<(), String> {
+        let presenter = self
+            .presenter
+            .as_mut()
+            .ok_or("a post before the presenter attached")?;
+        let (Some(w), Some(h)) = (NonZeroU32::new(width), NonZeroU32::new(height)) else {
+            return Ok(());
+        };
+        presenter.resize(w, h).map_err(|e| e.to_string())?;
+        let rect = post_rect(damage, presenter.presented, (width, height));
+        let [x0, y0, x1, y1] = rect;
+        let (Some(rw), Some(rh)) = (
+            NonZeroU32::new(x1.saturating_sub(x0)),
+            NonZeroU32::new(y1.saturating_sub(y0)),
+        ) else {
+            return Ok(());
+        };
+        let mut frame = presenter.buffer_mut().map_err(|e| e.to_string())?;
+        draw(&mut frame, rect)?;
+        frame
+            .present_with_damage(&[DamageRect {
+                x: x0,
+                y: y0,
+                width: rw,
+                height: rh,
+            }])
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// The rectangle a post of a `width` x `height` frame draws and sends: its
+/// `damage` clamped to the frame where the segment holds the last post
+/// (`held`: one was made at this size), else the whole frame.
+fn post_rect(damage: Option<[u32; 4]>, held: bool, (width, height): (u32, u32)) -> [u32; 4] {
+    damage
+        .filter(|_| held)
+        .map_or([0, 0, width, height], |[x0, y0, x1, y1]| {
+            [x0.min(width), y0.min(height), x1.min(width), y1.min(height)]
+        })
+}
+
 /// One acquired X11 frame.
 pub(crate) struct X11Frame<'a> {
     p: &'a mut X11Presenter,
@@ -550,6 +630,29 @@ mod tests {
                 ],
             }],
         }
+    }
+
+    /// A post sends what changed only where the segment still holds the
+    /// last post; a fresh or resized one is sent whole.
+    #[test]
+    fn a_post_sends_its_damage_only_over_the_last_post() {
+        let damage = Some([10, 40, 900, 70]);
+        assert_eq!(
+            post_rect(damage, true, (800, 600)),
+            [10, 40, 800, 70],
+            "the damage, inside the frame"
+        );
+        assert_eq!(
+            post_rect(damage, false, (800, 600)),
+            [0, 0, 800, 600],
+            "a segment holding no post at this size is sent whole"
+        );
+        assert_eq!(post_rect(None, true, (800, 600)), [0, 0, 800, 600]);
+        assert_eq!(
+            post_rect(Some([0, 0, 0, 0]), true, (800, 600)),
+            [0, 0, 0, 0],
+            "nothing changed, nothing sent"
+        );
     }
 
     /// Formats, visuals and the observed window depth must describe one layout.

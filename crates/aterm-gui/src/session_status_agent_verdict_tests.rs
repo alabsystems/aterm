@@ -216,7 +216,6 @@ fn a_box_under_a_ticking_row_is_published_though_the_status_revision_never_moves
     );
     assert!(record.contains(" level=attention story="), "{record}");
     assert!(record.contains(" why=prompt "), "{record}");
-    // The move is on the timeline, so the events digest pushes it.
     let events: Vec<String> = app
         .pool
         .get(sid)
@@ -241,7 +240,6 @@ fn a_box_under_a_ticking_row_is_published_though_the_status_revision_never_moves
         )
     );
 
-    // The row keeps ticking: the zone is re-read, the verdict holds, nothing is re-published.
     let calls = crate::presence::classifier_calls();
     paint(&app, sid, &box_screen(2));
     let _ = app.observe_session_statuses(t);
@@ -252,7 +250,6 @@ fn a_box_under_a_ticking_row_is_published_though_the_status_revision_never_moves
         prompt.rev,
         "same verdict, same rev"
     );
-    // An unchanged screen costs no classification at all.
     let _ = app.observe_session_statuses(t);
     t += step;
     let _ = app.observe_session_statuses(t);
@@ -265,7 +262,7 @@ fn a_box_under_a_ticking_row_is_published_though_the_status_revision_never_moves
 
 /// `agent_gen=`/`agent_fp=` equal the `status gen=`/`hash=` of the screen the verdict was read
 /// from, and stay put when the screen moves without a sweep (the negative control: a press
-/// fences on `agent_gen`). A same-verdict re-read moves the stamp, not the rev.
+/// fences on `agent_gen`).
 #[test]
 fn the_verdict_carries_the_stamp_of_the_screen_it_was_read_from() {
     let field = |record: &str, key: &str| {
@@ -298,7 +295,6 @@ fn the_verdict_carries_the_stamp_of_the_screen_it_was_read_from() {
     );
     let rev = published(&app, sid).rev;
 
-    // The screen moves with no sweep: `status` reads the new screen, the verdict names its own.
     paint(&app, sid, &box_screen(2));
     let record = app.session_status_record(sid).expect("live");
     assert_ne!(
@@ -312,7 +308,6 @@ fn the_verdict_carries_the_stamp_of_the_screen_it_was_read_from() {
         "{record}"
     );
 
-    // The sweep re-reads it (same verdict): the stamp catches up, the rev stays.
     let _ = app.observe_session_statuses(t);
     let record = app.session_status_record(sid).expect("live");
     assert_eq!(
@@ -357,7 +352,6 @@ fn the_rate_floor_defers_a_read_and_arms_a_followup() {
         &None,
         t0 + super::AGENT_MIN_INTERVAL
     ));
-    // A resolution in flight keeps the follow-up armed over an unmoved screen.
     let t2 = t0 + super::AGENT_MIN_INTERVAL;
     let _ = obs.agent_observe(
         1,
@@ -601,18 +595,10 @@ fn group_change_after_unchanged_read_gets_immediate_followup() {
 /// A BLOCK READ CUT AT ITS CAP OWES ONE MORE LOOK WITHOUT DELAYING A
 /// HANDBACK'S: the session log's block read stopped at its cap in the same
 /// sweep that saw the foreground group hand an exited agent back to the
-/// shell. [`super::StatusObserver::owe_look`] keeps the handback's one
-/// immediate follow-up immediate (the sweep-level owed look is
-/// `a_burst_past_the_block_reads_cap_is_read_at_the_next_owed_look`).
-/// NEGATIVE CONTROL: owing it as output
-/// ([`super::StatusObserver::note_output`]) pushes the handback's look one
-/// interval on.
+/// shell.
 #[test]
 fn a_capped_block_read_owes_a_look_without_delaying_a_handback() {
     let interval = Duration::from_millis(50);
-    // The sweep that saw the group move after an unchanged read (as in
-    // `group_change_after_unchanged_read_gets_immediate_followup`), then
-    // `owe`; the wait until the follow-up it leaves.
     let handback_wait = |owe: &dyn Fn(&mut super::StatusObserver, Instant)| {
         let g = |seq| crate::control::ScreenGen { epoch: 0, seq };
         let frame = aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::END_OFFER);
@@ -684,7 +670,7 @@ fn a_capped_block_read_owes_a_look_without_delaying_a_handback() {
 /// THE REAL SWEEP: fifty commands finished between two sweeps; the first
 /// logs the oldest [`super::BLOCK_READ_MAX`] and owes the session a look no
 /// later than one observation interval on, at which the second logs the
-/// rest. Every command is a run, in order.
+/// rest.
 #[test]
 fn a_burst_past_the_block_reads_cap_is_read_at_the_next_owed_look() {
     let prompt = b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\";
@@ -730,15 +716,7 @@ fn a_burst_past_the_block_reads_cap_is_read_at_the_next_owed_look() {
 /// THE SWEEP'S CAPPED BLOCK READ OWES ITS LOOK WITHOUT DELAYING A GROUP
 /// MOVE'S, THROUGH THE REAL SWEEP, with no process and no PTY: the group in
 /// front is the injected probe's (`SessionFactory::fg_probe`), asked about a
-/// master no file holds. Seventy commands finished between two sweeps, so
-/// each of the next two block reads stops at [`super::BLOCK_READ_MAX`] with
-/// commands left. The second of those sweeps also sees the group move over an
-/// unchanged screen, which owes ONE immediate look
-/// ([`super::StatusObserver::agent_observe`]'s handback); the capped read's
-/// owed look ([`super::StatusObserver::owe_look`] at the sweep's call site)
-/// leaves it immediate. NEGATIVE CONTROL (the call site, by mutation): owing
-/// the capped read as output (`note_output(id, now)` in its place) pushes
-/// that look an observation interval on, and this test fails.
+/// master no file holds.
 #[test]
 fn the_sweeps_capped_read_leaves_a_group_moves_look_immediate() {
     thread_local! {
@@ -748,7 +726,6 @@ fn the_sweeps_capped_read_leaves_a_group_moves_look_immediate() {
     fn front(_master: i32) -> i32 {
         FRONT.with(std::cell::Cell::get)
     }
-    // Groups no process holds: past every pid the kernel issues.
     const SHELL: i32 = 2_000_000_001;
     const JOB: i32 = 2_000_000_002;
     let prompt = b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\";
@@ -756,9 +733,6 @@ fn the_sweeps_capped_read_leaves_a_group_moves_look_immediate() {
     app.session_factory.fg_probe = front;
     let shown = app.front_terminal(WindowId(0)).expect("a front terminal");
     let (session, term) = (shown.session, std::sync::Arc::clone(&shown.term));
-    // The sweep asks the probe only for a session with a master: an fd
-    // number no file holds (its shell pid stays the stub's, so teardown
-    // signals nothing).
     app.pool
         .sessions
         .get_mut(&session)
@@ -781,10 +755,8 @@ fn the_sweeps_capped_read_leaves_a_group_moves_look_immediate() {
         burst.extend_from_slice(prompt);
     }
     crate::term_lock(&term).process(&burst);
-    // The look that reads the new screen and the first cap's worth of blocks.
     let t1 = t0 + step;
     let _ = app.observe_session_statuses(t1);
-    // The shell hands its terminal to a job; the screen does not move.
     FRONT.with(|f| f.set(JOB));
     let t2 = t1 + step;
     let _ = app.observe_session_statuses(t2);
@@ -812,7 +784,7 @@ fn the_sweeps_capped_read_leaves_a_group_moves_look_immediate() {
 
 /// Output between looks is owed a look one interval after it (never before the next due
 /// instant), through [`super::StatusObserver::note_output`], and so is a look the lock refused
-/// ([`super::StatusObserver::note_skipped`]). Before the burst nothing is owed that soon.
+/// ([`super::StatusObserver::note_skipped`]).
 #[test]
 fn output_between_looks_is_owed_a_look_within_one_interval_of_it() {
     let g = |seq| crate::control::ScreenGen { epoch: 0, seq };
@@ -834,7 +806,6 @@ fn output_between_looks_is_owed_a_look_within_one_interval_of_it() {
     let _ = obs.observe(1, &ev, t0);
     assert!(obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &None, t0));
     let _ = obs.agent_observe(1, g(1), Some(rows), Cursor::Unknown, None, -1, false, t0);
-    // A look at the same screen: nothing moved, nothing owed by it.
     let t1 = t0 + interval;
     let _ = obs.observe(1, &ev, t1);
     assert!(!obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &None, t1));
@@ -844,7 +815,6 @@ fn output_between_looks_is_owed_a_look_within_one_interval_of_it() {
         obs.next_wake().is_none_or(|w| w > due),
         "NEGATIVE CONTROL: nothing owes a look at {due:?} yet"
     );
-    // A burst lands 10 ms later: not due, so no look, but one is owed one interval after it.
     let burst = t1 + Duration::from_millis(10);
     obs.note_output(1, burst);
     let owed = burst + interval;
@@ -853,7 +823,6 @@ fn output_between_looks_is_owed_a_look_within_one_interval_of_it() {
         "fixture: the burst's interval ends past the floor"
     );
     assert_eq!(obs.next_wake(), Some(owed), "a look once the burst paused");
-    // That look reads the new frame, and owes nothing more once it holds.
     let t2 = owed;
     let _ = obs.observe(1, &ev, t2);
     assert!(obs.agent_zone_wanted(1, g(2), Cursor::Unknown, &None, t2));
@@ -872,7 +841,6 @@ fn output_between_looks_is_owed_a_look_within_one_interval_of_it() {
     let _ = obs.agent_observe(1, g(2), None, Cursor::Unknown, None, -1, false, t3);
     let due = obs.sessions[&1].next_due;
     assert!(obs.next_wake().is_none_or(|w| w > due), "settled again");
-    // A look the lock refused owes the next one as well.
     obs.note_skipped(1, t3);
     assert_eq!(obs.next_wake(), Some(obs.sessions[&1].next_due));
 }
@@ -897,8 +865,6 @@ fn output_that_keeps_arriving_owes_no_look_before_it_pauses() {
             last_output: None,
         },
     };
-    // Settle past the FSM's first dwell and the first look's follow-up, so only the deadline
-    // output owes is left.
     let start = Instant::now();
     let _ = obs.observe(1, &ev, start);
     let _ = obs.agent_observe(
@@ -919,8 +885,6 @@ fn output_that_keeps_arriving_owes_no_look_before_it_pauses() {
         None,
         "fixture: a settled, unmoved session owes nothing"
     );
-    // Twelve output wakes ~6/s over an unmoved screen: `note_output`, then a sweep that looks
-    // only when the session is due.
     let mut at = t0;
     let mut looks = 0;
     for _ in 0..12 {
@@ -942,7 +906,6 @@ fn output_that_keeps_arriving_owes_no_look_before_it_pauses() {
         looks >= 5,
         "fixture: the output wakes' own sweeps looked ({looks})"
     );
-    // The last burst lands between looks and the output pauses: it is read within one interval.
     let last = at + gap;
     obs.note_output(1, last);
     assert!(
@@ -953,8 +916,7 @@ fn output_that_keeps_arriving_owes_no_look_before_it_pauses() {
 }
 
 /// The change gate hashes the live zone (`presence::live_zone`), not the grid's last 40 rows: an
-/// inline REPL's turn ending above them is classified `idle`. The same screen under a new
-/// generation re-derives nothing (the control).
+/// inline REPL's turn ending above them is classified `idle`.
 #[test]
 fn a_change_above_the_last_40_rows_of_an_inline_repl_is_classified() {
     use aterm_phase::prompt::fixtures::{INLINE_REPL_READY, screen};
@@ -1035,10 +997,7 @@ fn a_cursor_that_steps_into_the_box_is_read() {
 /// Conformance with the `ClaudeIdleAtComposer` model: in every reachable state, one
 /// `agent_observe` of each captured frame of the state's screen (under `program=claude`, with
 /// its measured cursor; `stale` is a relaunch under the previous run's box) publishes what the
-/// model's `Look` does, so `await agent idle` answers exactly where `Type` is enabled. Negative
-/// controls: `Buggy=1` (idle on the shell's rows and the half-drawn REPL) and `Buggy=2` (the box
-/// by its frame alone: idle on the relaunch's shell rows) disagree with the observer only where
-/// they say idle.
+/// model's `Look` does, so `await agent idle` answers exactly where `Type` is enabled.
 #[test]
 fn claude_is_published_idle_exactly_where_the_model_types() {
     use aterm_phase::prompt::fixtures::{
@@ -1050,7 +1009,6 @@ fn claude_is_published_idle_exactly_where_the_model_types() {
     let model = aterm_models_harness::claude_idle_at_composer_model();
     let old = aterm_spec::interp::with_buggy(&model, 1);
     let framed = aterm_spec::interp::with_buggy(&model, 2);
-    // `screens[stale][screen]`: every measured frame of each.
     let screens: [[Vec<&str>; 4]; 2] = [
         [
             vec![LAUNCH_BEFORE_REPL],
@@ -1095,7 +1053,6 @@ fn claude_is_published_idle_exactly_where_the_model_types() {
         step.publish.expect("the zone was classified").0
     };
     let measured = |text: &str| Cursor::At(cursor(text).map(|(row, _)| row));
-    // Every reachable state, breadth first.
     let mut seen = vec![model.init_state()];
     let mut next = 0;
     let mut looked = std::collections::BTreeSet::new();
@@ -1130,7 +1087,6 @@ fn claude_is_published_idle_exactly_where_the_model_types() {
                         disagreed[bug].insert((stale, at));
                     }
                 }
-                // The frame alone, the cursor not given: what `Buggy=2` models.
                 let by_frame = publish(text, Cursor::Unknown);
                 let theirs = framed.successors("Look", &state).remove(0)["published"];
                 assert_eq!(
@@ -1226,7 +1182,7 @@ fn a_group_that_left_is_never_judged_under_its_name() {
 
 /// A trust dialog drawn at the top of a pane whose last 40 rows stay blank passes the gate,
 /// which hashes the live zone ([`crate::presence::live_zone`]), and publishes a trust prompt;
-/// read again unchanged, it is not re-classified. Cursors are where Claude Code parks them.
+/// read again unchanged, it is not re-classified.
 #[test]
 fn a_dialog_above_a_blank_foot_passes_the_classifier_gate() {
     use aterm_phase::prompt::fixtures::{TRUST_FRESH_PANE, composer, rows, screen};
@@ -1267,7 +1223,7 @@ fn a_dialog_above_a_blank_foot_passes_the_classifier_gate() {
 
 /// `history_lost=` sums the history lines this session's update handoffs could not carry, and
 /// the loss posts a band row; an update that carried every line posts none.
-#[cfg(unix)] // App::settle_handoff_history is the unix handoff's
+#[cfg(unix)]
 #[test]
 fn the_status_record_counts_the_history_an_update_could_not_carry() {
     use crate::handoff_history::{ImportReport, record_reports};
@@ -1300,7 +1256,6 @@ fn the_status_record_counts_the_history_an_update_could_not_carry() {
         !app.has_live_message("Couldn't carry all scrollback"),
         "nothing was lost: no row"
     );
-    // The adoption's carried count, then an import that failed here.
     app.store.write().unwrap().add_history_lost(sid, 1200);
     let failed = [ImportReport {
         session: sid,
@@ -1330,7 +1285,7 @@ fn the_status_record_counts_the_history_an_update_could_not_carry() {
 }
 
 /// A live PATH reading lowers the carried frozen mark; frozen readings never raise it (one job
-/// reads `unconfirmed`, two read `frozen` as measured). With no reading the mark stands.
+/// reads `unconfirmed`, two read `frozen` as measured).
 #[test]
 fn a_measured_path_lowers_the_carried_frozen_mark_and_never_raises_it() {
     use crate::session_status::program::PathVerdict;
@@ -1362,7 +1317,6 @@ fn a_measured_path_lowers_the_carried_frozen_mark_and_never_raises_it() {
     assert!(record.contains(" path=live program=claude "), "{record}");
     assert!(record.contains(" path_evidence=measured:"), "{record}");
     assert!(record.contains(" copy=foreign upgrade=- "), "{record}");
-    // One job's frozen reading (a `PATH=` override reads so) is not the shell's: nothing raised.
     measure(&app, PathVerdict::Frozen);
     let _ = app.observe_session_statuses(t0 + Duration::from_millis(600));
     assert!(
@@ -1372,7 +1326,6 @@ fn a_measured_path_lowers_the_carried_frozen_mark_and_never_raises_it() {
     let record = app.session_status_record(sid).expect("live");
     assert!(record.contains(" path=live program=claude "), "{record}");
     assert!(record.contains(" path_evidence=unconfirmed:"), "{record}");
-    // A second job agreeing settles it as the shell's (`path=frozen`, measured), still unmarked.
     {
         let pooled = app.pool.get(sid).unwrap();
         let mut tl = pooled.ctx.timeline.lock().unwrap();
@@ -1410,8 +1363,6 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
         },
     );
 
-    // The request before the zone read (production creates the watch first, in
-    // `agent_zone_wanted`); either order keeps the deadline.
     assert!(observer.program_due(id, true, None, generation, t0));
     observer.note_program_request(id, pgid, t0);
     assert!(model.fire("Start", &mut modeled));
@@ -1434,7 +1385,6 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
     );
     assert_eq!(observer.next_wake(), Some(t0 + floor));
 
-    // The follow-up read sees the same frame; the unresolved name keeps its own deadline.
     observer.sessions.get_mut(&id).unwrap().next_due = t0 + floor * 2;
     observer.agent_observe(
         id,
@@ -1466,8 +1416,6 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
         modeled["attempts"]
     );
 
-    // The second miss waits 1 s, every later one 5 s; each resolution's follow-up is charged to
-    // the observation floor.
     observer.sessions.get_mut(&id).unwrap().next_due = first_retry + floor;
     observer.agent_observe(
         id,
@@ -1533,12 +1481,10 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
     );
     assert_eq!(observer.next_wake(), Some(second_retry + PROGRAM_RECHECK));
 
-    // A contended terminal skips a deadline: the past timer clamps to the charged observation.
     let late = second_retry + PROGRAM_RECHECK + Duration::from_secs(1);
     observer.note_skipped(id, late);
     assert_eq!(observer.next_wake(), Some(late + floor));
 
-    // A later name on the same frame identifies Claude and disarms every retry.
     let named_at = late + floor;
     let named = observer.agent_observe(
         id,
@@ -1568,8 +1514,6 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
         named_at + PROGRAM_RECHECK * 2
     ));
 
-    // The same group can exec again: once a name was known, the next miss starts at the fast
-    // 250 ms retry. A departed or retired group owns none.
     let newer = crate::control::ScreenGen { epoch: 0, seq: 2 };
     let exec_at = named_at + PROGRAM_RECHECK * 2;
     assert!(observer.program_due(id, false, Some("claude"), newer, exec_at));
@@ -1653,7 +1597,6 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
         !observer.agents[&id].name_confirmed,
         "the group-change sweep's old Claude name is not this group's answer"
     );
-    // The next sweep sees the transient shell name, not the launch sweep's stale one.
     let shell_at = t0 + floor;
     observer.agent_observe(
         id,
@@ -1707,8 +1650,6 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
     assert_eq!(modeled["confirm_armed"], 0);
     assert_eq!(observer.next_wake(), None, "stable sh stops polling");
 
-    // Claude execs at t=3 s and draws once: the 5 s screen-moved guard is still closed, so the
-    // deferred deadline is the only way to name the now-static program.
     let moved_at = t0 + Duration::from_secs(3);
     assert!(!observer.program_due(id, false, Some("sh"), later, moved_at));
     observer.agent_observe(
@@ -1787,7 +1728,6 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
     assert_eq!(modeled["confirm_armed"], 0);
     assert_eq!(observer.next_wake(), None);
 
-    // A later non-agent name can arm another deadline; leaving the group cancels it.
     let third = crate::control::ScreenGen { epoch: 0, seq: 3 };
     observer.agent_observe(
         id,
@@ -1818,7 +1758,7 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
     assert_eq!(observer.next_wake(), None);
 }
 /// A shell whose last line ends in `?` is no agent (`agent=-`, no attention); the same screen
-/// under `program=claude` is a question. Identity, not screen text, decides.
+/// under `program=claude` is a question.
 #[test]
 fn a_shell_ending_in_a_question_mark_is_not_an_agent() {
     let (mut app, sid) = app_with_stub();
@@ -1841,7 +1781,6 @@ fn a_shell_ending_in_a_question_mark_is_not_an_agent() {
     assert!(!record.contains("level=attention"), "{record}");
     assert!(record.contains(" why=- "), "{record}");
 
-    // The same screen under `program=claude` (published by hand: the stub has no PTY).
     {
         let pooled = app.pool.get(sid).unwrap();
         let mut tl = pooled.ctx.timeline.lock().unwrap();
@@ -1894,7 +1833,6 @@ fn an_adopted_session_with_its_carried_nonce_reads_its_command() {
     adopted.process(feed.as_bytes());
     assert_eq!(super::executing_detail(&adopted).as_deref(), Some("claude"));
 
-    // NEGATIVE CONTROL: the same adopt without the carried nonce drops every mark and says so.
     let mut uncarried = carried.clone();
     uncarried.shell_integration_nonce = None;
     let mut blind = Terminal::new(24, 80);
@@ -1929,12 +1867,11 @@ fn looking_at(app: &App, sessions: &[u64]) {
 
 /// A trust dialog whose title sits above the live zone is read whole (`trust`, not `other`),
 /// and a session the host supervises raises no verdict row: its box is the host's to answer or
-/// escalate. With no host supervising, the row is there.
+/// escalate.
 #[test]
 fn a_box_the_zone_cuts_is_read_whole_and_a_hosted_agent_raises_no_row() {
     let (mut app, sid) = app_with_stub();
     app.headless = false;
-    // The desktop notice is what these count (`desktop_alerts` is opt-in).
     app.config.desktop_alerts = Some(true);
     let fixture = aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::TRUST);
     let dialog = &fixture[8..=23];
@@ -1962,7 +1899,6 @@ fn a_box_the_zone_cuts_is_read_whole_and_a_hosted_agent_raises_no_row() {
         "{agent:?}"
     );
     let (hosted, bare) = {
-        // Copied out of the store's guard, as `App::publish_need` does.
         let handle = app.store.read().unwrap().by_local(sid).cloned();
         let handle = handle.as_ref().expect("the session");
         let now_us = crate::metrics::now_us();
@@ -1973,7 +1909,6 @@ fn a_box_the_zone_cuts_is_read_whole_and_a_hosted_agent_raises_no_row() {
     };
     assert!(hosted.supervised, "{hosted:?}");
     assert_eq!(crate::needs::of(&hosted).need, None);
-    // NEGATIVE CONTROL: no host supervising — the verdict's need.
     assert!(!bare.supervised);
     assert!(crate::needs::of(&bare).need.is_some());
 }
@@ -1981,11 +1916,7 @@ fn a_box_the_zone_cuts_is_read_whole_and_a_hosted_agent_raises_no_row() {
 /// ANOTHER HOLDER'S LIVE CLAIM IS NAMED APART FROM THIS HOST'S
 /// (`NeedFacts::other_supervisor`, the walls another holder's `meta set
 /// supervisor` claim retries, a manager session's or codex-alab's own):
-/// its claim makes the session supervised and names the loop. Either claim
-/// is a live claim (`NeedFacts::claim_live`, what the supervisor loop's
-/// `kind=wait` waits a wall out under). NEGATIVE CONTROLS: no claim names
-/// none and is no live claim, and this host's own claim names no other
-/// supervisor, its answer to a wall being `wall_answer`'s, never presumed.
+/// its claim makes the session supervised and names the loop.
 #[test]
 fn another_holders_claim_is_named_apart_from_this_hosts() {
     let (app, sid) = app_with_stub();
@@ -2024,13 +1955,11 @@ fn another_holders_claim_is_named_apart_from_this_hosts() {
 }
 
 /// On the rm box, the sweep publishes `agent=prompt` and the presence fan-out raises one menu
-/// row (tab, kind, command) and one notification. Re-classifying the same box posts nothing
-/// more; a new box while the person looks posts nothing but lists the row; headless posts none.
+/// row (tab, kind, command) and one notification.
 #[test]
 fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
     let (mut app, sid) = app_with_stub();
     app.headless = false;
-    // The desktop notice is what these count (`desktop_alerts` is opt-in).
     app.config.desktop_alerts = Some(true);
     {
         use crate::session_timeline::{MetaEdit, MetaField, write_session_meta};
@@ -2083,7 +2012,6 @@ fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
     );
     let rev = published(&app, sid).rev;
 
-    // The same box re-read (the ticking row moves the zone hash): same verdict, same rev.
     paint(&app, sid, &box_screen(2));
     sweep(&mut app, t);
     t += step;
@@ -2100,8 +2028,6 @@ fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
     );
     assert_eq!(app.status_glance().need_count(), 1);
 
-    // The box is answered and a new one comes up while the person looks at this tab: listed,
-    // not announced.
     paint(&app, sid, &busy_screen(9));
     sweep(&mut app, t);
     t += step;
@@ -2117,7 +2043,6 @@ fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
     );
     assert_eq!(app.status_glance().need_count(), 1);
 
-    // NEGATIVE CONTROL: a headless instance publishes the verdict and posts nothing.
     let (mut headless, hsid) = app_with_stub();
     assert!(headless.headless);
     looking_at(&headless, &[]);
@@ -2132,13 +2057,7 @@ fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
 }
 
 /// A SUPERVISOR THAT DIES (review major): its `ttl=` claim lapses with a
-/// box up and nothing writes — yet the human must hear. The presence
-/// timer wakes at the expiry, removes the claim with a `meta-change
-/// field=supervisor value=-` record (the `EVENT meta` push), and the box
-/// posts exactly one notice. NEGATIVE CONTROL: while the claim is live the
-/// same box posts nothing, and a tick a millisecond short of the expiry
-/// changes nothing. On the presence driver's clock (`set_presence_clock_for_test`), so no
-/// second of the claim is waited out.
+/// box up and nothing writes — yet the human must hear.
 #[test]
 fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
     use crate::app_presence::set_presence_clock_for_test;
@@ -2151,12 +2070,10 @@ fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
     }
     let (mut app, sid) = app_with_stub();
     app.headless = false;
-    // The desktop notice is what these count (`desktop_alerts` is opt-in).
     app.config.desktop_alerts = Some(true);
     let ctx = app.pool.get(sid).expect("pooled").ctx.clone();
     let _ = take_posts();
     looking_at(&app, &[]);
-    // A whole microsecond, so the claim's stamps and the driver's instants map exactly.
     let now_us = crate::metrics::us_at(Instant::now());
     let t0 = crate::metrics::instant_at_us(now_us).expect("in range");
     let _wall = Wall;
@@ -2168,7 +2085,6 @@ fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
         crate::session_timeline::claim_supervisor(&ctx, "sup", None, Some(expiry_us), now_us),
         Ok(true)
     );
-    // The `meta set` arm's `Wake::MetaChanged` refresh.
     app.refresh_presence_session(sid);
     let step = Duration::from_millis(300);
     let mut t = t0;
@@ -2180,7 +2096,6 @@ fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
     sweep(&mut app, t);
     assert_eq!(published(&app, sid).word, "prompt");
     assert!(take_posts().is_empty(), "NEGATIVE CONTROL: supervised");
-    // The wake the lapse arms: a millisecond past the expiry.
     let lapse =
         crate::metrics::instant_at_us(expiry_us).expect("in range") + Duration::from_millis(1);
     let deadline = app.presence_deadline(t).expect("armed");
@@ -2228,17 +2143,7 @@ fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
 /// Claude Code repaints for the new size — the screen's text changes at the
 /// sweep's read of the resized grid and again at its read of the repaint,
 /// and the program did nothing, so neither change is counted, nor the row's
-/// fold back after it. Counted, the stall's own row would end the stall
-/// (`working why=moved`), fold, and stall it again two minutes later, a fresh
-/// `stalled` to the manager's `await task` each time. A WIDTH change (the
-/// window dragged narrower, a pane split, the font zoomed) reflows the box,
-/// and the read of the reflowed grid parses it otherwise until the repaint:
-/// the verdict moves and moves back, `agent_rev` with it, and that is no move
-/// either. NEGATIVE CONTROLS: the stamp moved at every read (a count of every
-/// text change would have counted each) and the rev at the width's (a count
-/// of the rev would have counted both); the program's own change at the same
-/// grid past the settle is a text move, and a verdict it moves to — within a
-/// re-grid's settle and kept, or past it — is a verdict move.
+/// fold back after it.
 #[test]
 fn a_regrid_and_the_programs_repaint_are_no_text_move() {
     let (mut app, sid) = app_with_stub();
@@ -2248,10 +2153,6 @@ fn a_regrid_and_the_programs_repaint_are_no_text_move() {
         let _ = app.observe_session_statuses(*t);
         *t += step;
     };
-    // The program's repaint for the grid it now has: the screen cleared and
-    // the box drawn again at its foot (the transcript rows above it are not),
-    // its rule as wide as the grid and a bordered row too long for it
-    // word-wrapped inside its border.
     let repaint = |app: &App| {
         let pooled = app.pool.get(sid).expect("pooled");
         let mut term = crate::term_lock(&pooled.term);
@@ -2303,10 +2204,6 @@ fn a_regrid_and_the_programs_repaint_are_no_text_move() {
     assert_eq!(held.word, "prompt");
 
     let settle = crate::session_timeline::REGRID_SETTLE;
-    // The row is born (23 rows), then folds past the settle (24); then the
-    // window is dragged narrower and back: each time the tab re-gridded,
-    // read, then the program's repaint, read. Widening wraps nothing back,
-    // so there the repaint alone moves the text.
     for (rows, cols, reflows) in [
         (23, 120, true),
         (24, 120, true),
@@ -2347,8 +2244,6 @@ fn a_regrid_and_the_programs_repaint_are_no_text_move() {
         t += settle;
     }
 
-    // NEGATIVE CONTROLS: the program's own change at the same grid, once the
-    // settle is past, is a move of its text; the verdict it keeps is none.
     let before = fp(&app);
     paint(&app, sid, &box_screen(2));
     sweep(&mut app, &mut t);
@@ -2356,10 +2251,6 @@ fn a_regrid_and_the_programs_repaint_are_no_text_move() {
     let moved = published(&app, sid);
     assert_eq!(moved.text_moves, held.text_moves + 1, "the program moved");
     assert_eq!(moved.verdict_moves, held.verdict_moves, "its verdict stood");
-    // A verdict the program moves to within a re-grid's settle, and keeps,
-    // counts at the first read of the screen past the settle (`paint` draws
-    // at 120 columns again: the same burst; the paint after the settle moves
-    // the text, which is what has the sweep read it).
     regrid(&app, 24, 100);
     sweep(&mut app, &mut t);
     paint(&app, sid, &busy_screen(1));
@@ -2378,7 +2269,6 @@ fn a_regrid_and_the_programs_repaint_are_no_text_move() {
         held.verdict_moves + 1,
         "rested: the verdict is not the one before the re-grid"
     );
-    // And one it moves to past the settle counts at once.
     paint(&app, sid, &box_screen(3));
     sweep(&mut app, &mut t);
     let back = published(&app, sid);
@@ -2411,11 +2301,7 @@ fn feed(app: &App, sid: u64, bytes: &[u8]) {
 }
 
 /// THE AGENT VERDICT READS WHOLE FRAMES: the sweep never classifies the rows of a DEC 2026
-/// frame the program has not finished. Claude Code's measured split frame, its composer drawn
-/// and its busy footer not yet under it, holds the published `busy`, and the classifier is
-/// not called on it; the frame's close is read (busy), and the reply's real end is `idle`.
-/// NEGATIVE CONTROL (the defect): the same half frame's rows painted with no frame open are
-/// classified, and read `idle` mid-reply.
+/// frame the program has not finished.
 #[test]
 fn the_verdict_never_reads_an_unfinished_frame() {
     let (mut app, sid) = app_with_stub();
@@ -2464,7 +2350,6 @@ fn the_verdict_never_reads_an_unfinished_frame() {
     t += step;
     assert_eq!(published(&app, sid).word, "idle", "the reply's end");
 
-    // NEGATIVE CONTROL: the half frame's rows with no frame open, at a fresh tab.
     let (mut control, csid) = app_with_stub();
     {
         let pooled = control.pool.get(csid).expect("pooled");
@@ -2474,7 +2359,6 @@ fn the_verdict_never_reads_an_unfinished_frame() {
         for (i, row) in half_rows.iter().enumerate() {
             bytes.push_str(&format!("\x1b[{};1H{}", i + 1, row.trim_end()));
         }
-        // The cursor where the split read left it: the cut bottom rule's end.
         bytes.push_str("\x1b[50;110H");
         term.process(bytes.as_bytes());
         assert!(!term.sync_frame_unfinished());
@@ -2489,8 +2373,7 @@ fn the_verdict_never_reads_an_unfinished_frame() {
 
 /// The verdict's hold on an unfinished frame is bounded by the frame's hang detector: the same
 /// measured half frame, its run of reads ending inside unfinished frames begun FRAME_HANG
-/// before the sweep, is read as it stands. MUTANT (the hold on the frame's level alone, with
-/// no hang detector): the classifier is never called and the verdict never moves again.
+/// before the sweep, is read as it stands.
 #[test]
 fn the_verdict_reads_a_frame_past_its_hang_detector() {
     let (mut app, sid) = app_with_stub();

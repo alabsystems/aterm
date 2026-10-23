@@ -2,21 +2,11 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm caffeine [<cmd>]`: the front door's verb.
-//!
-//! The grammar ([`parse`]) and the text the verbs print ([`USAGE`], [`status_text`],
-//! [`until_word`]) are pure. A word the grammar does not know, any option, or an extra operand
-//! is one line on stderr and exit 2, before anything else runs, at a terminal and through a
-//! pipe alike; off macOS every command but help says so and exits 1.
-//!
-//! `start`, `on` and `off` return at once: the mug is its own launchd job
-//! ([`crate::launchd`]), which they bootstrap or kickstart. `serve` is what that job runs: it
-//! takes the one-mug lock ([`crate::instance`]), re-executes from its bundle copy
-//! ([`crate::code`]) handing the lock over, and runs the menu-bar app. `bridge` is what a mug
-//! that restarts onto an update while on starts, to keep the Mac awake until the new mug does.
 
 use std::ffi::OsString;
 use std::process::ExitCode;
 
+use crate::launchd::Startup;
 use crate::model::Mode;
 
 /// The usage text.
@@ -46,11 +36,16 @@ USAGE:
                refusals turn it off, not a fresh powerd assertion probe),
                until=<unix seconds>|forever|-, menu=running (with pid=) or
                stopped, and the running mug's job (else this build's):
-               startup=on|off, label=<launchd label>. These fields do not
-               confirm that a keep-awake activity is held.
+               startup=on|off|blocked|disabled, label=<launchd label>. These
+               fields do not confirm that a keep-awake activity is held.
     startup    Say whether this build's mug starts at every login; `on` or `off`
                sets it (a plist in ~/Library/LaunchAgents; `off` also removes
-               that of a build that is gone). The running mug stays.
+               that of a build that is gone). The running mug stays. `blocked`:
+               the plist is there, but aterm's switch under Background App
+               Activity (System Settings > General > Login Items & Extensions)
+               is off, so no login starts it; `on` fails until it is on.
+               `disabled`: launchd has the job disabled (`launchctl disable`),
+               so no login starts it; `on` lifts that.
     quit       Turn off and take the mug out of the menu bar. `own`: only this
                build's mug and its job; another build's is left as it is, on or off.
     serve      Run the mug in this process (what its launchd job runs).
@@ -90,12 +85,8 @@ pub enum Command {
 }
 
 /// Parse the words after `caffeine`.
-///
 /// # Errors
-///
-/// What is wrong, as the part of the error line after `aterm caffeine: `: an unknown command,
-/// any option (a word starting with `-`, help's aside), a span [`crate::model::parse_span`]
-/// refuses, a `startup` word other than `on` or `off`, or an extra operand.
+/// What is wrong, as the part of the error line after `aterm caffeine: `: an unknown command, any option (a word starting with `-`, help's aside), a span [`crate::model::parse_span`] refuses, a `startup` word other than `on` or `off`, or an extra operand.
 pub fn parse(args: &[OsString]) -> Result<Command, String> {
     let words: Vec<String> = args
         .iter()
@@ -156,8 +147,7 @@ pub fn usage_error(why: &str) -> String {
 /// What every command but help says off macOS.
 pub const MACOS_ONLY: &str = "aterm caffeine: macOS only";
 
-/// When `mode` ends, as `status` and `on` print it at `now`: `forever`, the deadline in Unix
-/// seconds, or `-` when off.
+/// When `mode` ends, as `status` and `on` print it at `now`: `forever`, the deadline in Unix seconds, or `-` when off.
 #[must_use]
 pub fn until_word(mode: Mode, now: u64) -> String {
     match mode.settled(now) {
@@ -167,24 +157,19 @@ pub fn until_word(mode: Mode, now: u64) -> String {
     }
 }
 
-/// `on`'s asynchronous acknowledgment: the request is saved and a mug was
-/// found or its start requested, not proof that its activity has begun.
+/// `on`'s asynchronous acknowledgment: the request is saved and a mug was found or its start requested, not proof that its activity has begun.
 #[must_use]
 pub fn on_line(mode: Mode, now: u64) -> String {
     format!("caffeine=requested until={}\n", until_word(mode, now))
 }
 
-/// `status`'s answer, one `key=value` per line: `caffeine=on|off`, `until=`
-/// ([`until_word`]), `menu=running` and `pid=<n>` or `menu=stopped`, `startup=on|off`,
-/// `label=<label>`. `caffeine=` and `until=` report the saved mode while a mug
-/// runs (`menu_pid`), off while none does. A known begin refusal publishes Off;
-/// this is saved request state, not an activity acknowledgment or powerd probe.
+/// `status`'s answer, one `key=value` per line: `caffeine=on|off`, `until=` ([`until_word`]), `menu=running` and `pid=<n>` or `menu=stopped`, `startup=on|off|blocked|disabled` ([`Startup::word`]), `label=<label>`.
 #[must_use]
 pub fn status_text(
     mode: Mode,
     now: u64,
     menu_pid: Option<u32>,
-    startup: bool,
+    startup: Startup,
     label: &str,
 ) -> String {
     let on_off = |on: bool| if on { "on" } else { "off" };
@@ -197,20 +182,22 @@ pub fn status_text(
         "caffeine={}\nuntil={}\n{menu}startup={}\nlabel={label}\n",
         on_off(mode.is_on(now)),
         until_word(mode, now),
-        on_off(startup),
+        startup.word(),
     )
 }
 
-/// `startup`'s answer: `startup=on|off`.
+/// `startup`'s answer: `startup=on|off|blocked|disabled` ([`Startup::word`]).
 #[must_use]
-pub fn startup_line(on: bool) -> String {
-    format!("startup={}\n", if on { "on" } else { "off" })
+pub fn startup_line(startup: Startup) -> String {
+    format!("startup={}\n", startup.word())
 }
 
-/// Whether the mug `quit own` finds is another build's, which it leaves running with its
-/// mode: the running `holder`'s label (none named yet counts as another's) is not `here`,
-/// or, with none running, the label the free lock still names (`named`: a mug between its
-/// runs, which launchd starts again) is another.
+/// What `startup on` says when Login Items' switch blocks the plist it wrote.
+pub const STARTUP_BLOCKED: &str = "Login Items has aterm's background activity off, so no \
+login starts the mug: turn aterm on under Background App Activity in System Settings > \
+General > Login Items & Extensions";
+
+/// Whether the mug `quit own` finds is another build's, which it leaves running with its mode: the running `holder`'s label (none named yet counts as another's) is not `here`, or, with none running, the label the free lock still names (`named`: a mug between its runs, which launchd starts again) is another.
 #[must_use]
 pub fn another_builds_mug(
     holder: Option<&crate::instance::Holder>,
@@ -223,8 +210,7 @@ pub fn another_builds_mug(
     }
 }
 
-/// The verb's entry: `args` are the words after `caffeine`, `version` the app version the
-/// about row prints.
+/// The verb's entry: `args` are the words after `caffeine`, `version` the app version the about row prints.
 #[must_use]
 pub fn main_entry(args: Vec<OsString>, version: &str) -> ExitCode {
     let command = match parse(&args) {
@@ -300,13 +286,11 @@ mod mac {
         label: String,
     }
 
-    /// The mug's files, when this process has the login's own roots. The mug is a launchd
-    /// job of the login, which reads the files under the login's home whatever `$HOME` this
-    /// shell has: a verb run with a scratch `$HOME` or a private state root
-    /// (`ATERM_STATE_HOME`, a test's) would start a real mug that never reads what it wrote,
-    /// and report on files that mug never writes, so it is refused. The homes are compared as
-    /// the directories they name (a link or firmlink to the same one is the same home); an
-    /// account home that cannot be read refuses nothing.
+    /// The mug's files, when this process has the login's own roots. The mug is a launchd job of
+    /// the login, which reads the files under the login's home whatever `$HOME` this shell has: a
+    /// verb run with a scratch `$HOME` or a private state root (`ATERM_STATE_HOME`, a test's) would
+    /// start a real mug that never reads what it wrote, and report on files that mug never writes,
+    /// so it is refused.
     fn login_paths() -> Result<Paths, String> {
         let paths = Paths::from_env().ok_or("no home directory")?;
         if aterm_types::dirs::runs_under_private_state_root() {
@@ -364,8 +348,8 @@ mod mac {
         Started,
     }
 
-    /// The mug holding the lock, when the process its pid names is one: a pid left behind by
-    /// a mug killed outright, now another process's, is no mug ([`instance::running_mug`]).
+    /// The mug holding the lock, when the process its pid names is one: a pid left behind by a mug
+    /// killed outright, now another process's, is no mug ([`instance::running_mug`]).
     fn running_mug(paths: &Paths) -> Option<instance::Holder> {
         instance::running_mug(&paths.lock_file(), &paths.code_dir())
     }
@@ -386,7 +370,6 @@ mod mac {
             Ok(here) => here,
             Err(why) => return fail(why),
         };
-        // A login plist of a build that is gone, before anything is started.
         launchd::prune_orphans(&here.paths);
         match ensure(&here) {
             Ok(Running::Already(pid)) => answer(&format!("caffeine=running pid={pid}\n")),
@@ -436,8 +419,6 @@ mod mac {
         };
         let mode = state::load(&here.paths.state_file(), now);
         let holder = running_mug(&here.paths);
-        // The running mug's job (the label it wrote beside its pid), whichever build asks;
-        // this build's when none runs.
         let label = holder
             .as_ref()
             .and_then(|holder| holder.label.as_deref())
@@ -446,14 +427,15 @@ mod mac {
             mode,
             now,
             holder.as_ref().map(|holder| holder.pid),
-            launchd::startup_enabled(&here.paths, label),
+            launchd::startup(&here.paths, label, &crate::macos::STARTUP_DOORS),
             label,
         );
         answer(&text)
     }
 
-    /// Enable at Startup for this build's job: the plist it writes runs this executable. (The
-    /// running mug's own menu row sets it for that mug's job.)
+    /// Enable at Startup for this build's job: the plist it writes runs this executable.
+    /// On also lifts launchd's disable of the job; one Login Items' switch blocks fails,
+    /// naming that switch.
     pub(super) fn startup(set: Option<bool>) -> ExitCode {
         let here = match here() {
             Ok(here) => here,
@@ -467,10 +449,19 @@ mod mac {
                 here.paths.startup_plist(&here.label).display()
             ));
         }
-        answer(&super::startup_line(launchd::startup_enabled(
-            &here.paths,
-            &here.label,
-        )))
+        let doors = crate::macos::STARTUP_DOORS;
+        let mut startup = launchd::startup(&here.paths, &here.label, &doors);
+        if set == Some(true) && startup == launchd::Startup::Disabled {
+            if let Err(e) = (doors.enable)(&here.label) {
+                return fail(e);
+            }
+            startup = launchd::startup(&here.paths, &here.label, &doors);
+        }
+        if set == Some(true) && startup == launchd::Startup::Blocked {
+            eprintln!("{VERB}: {}", super::STARTUP_BLOCKED);
+            return aterm_uds::stdout::answer_exit(VERB, &super::startup_line(startup), 1);
+        }
+        answer(&super::startup_line(startup))
     }
 
     /// Send `pid` SIGTERM (never pid 0 or 1, nor a negative group).
@@ -484,7 +475,6 @@ mod mac {
             return Ok(());
         }
         let e = std::io::Error::last_os_error();
-        // Gone between the look and the signal (it quit, or exited for an update): ended.
         if e.raw_os_error() == Some(libc::ESRCH) {
             Ok(())
         } else {
@@ -505,11 +495,6 @@ mod mac {
         let lock = here.paths.lock_file();
         let holder = running_mug(&here.paths);
         let named = instance::last_holder(&lock).and_then(|named| named.label);
-        // `quit own` (a scoped uninstall's) ends only this build's mug: one another build
-        // runs (another label in the lock, or none named yet) keeps running, its mode with it,
-        // and only this build's job is booted out. So does one the free lock still names:
-        // between its runs (a restart into an update leaves its label there, and launchd
-        // starts it again), or ended without letting go (a logout's signal).
         let other =
             own && super::another_builds_mug(holder.as_ref(), named.as_deref(), &here.label);
         if other {
@@ -523,23 +508,11 @@ mod mac {
             );
         }
         let holder = holder.filter(|_| !other);
-        // Off first, so a mug that comes back anyway comes back empty. A mode that already
-        // reads off (no file, an earlier boot's, a span run out) is left as it is: `quit`
-        // writes no state file where none was, and the self-uninstall sweep, which lists the
-        // mug's files before it asks for `quit`, finds none it did not list.
         let saved = if other || state::load(&here.paths.state_file(), now) == Mode::Off {
             Ok(())
         } else {
             set_mode(&here.paths, Mode::Off)
         };
-        // A job's mug is ended by launchd (`bootout`): its KeepAlive restarts one that dies
-        // of a signal. The jobs are the one the running mug names (the label it wrote beside
-        // its pid), else the one a mug that died without letting go left named in the lock
-        // (launchd may be holding it back between crashes), and this build's, whichever
-        // build runs `quit`. Each is booted out while loaded, with a process this instant or
-        // not, or it would start again after `quit`; a job whose state cannot be read fails
-        // `quit` as a failed bootout does, never falling through to a signal launchd answers
-        // by starting it again. Any other holder (one run by hand) gets the SIGTERM itself.
         let mut labels: Vec<String> = holder
             .as_ref()
             .and_then(|holder| holder.label.clone())
@@ -572,8 +545,6 @@ mod mac {
             }
             ended.push(pid);
         }
-        // `caffeine=quit` says the mug has ended, not that it was told to: the self-uninstall
-        // sweep takes the lock next, and a mug still leaving would keep its files.
         if let Err(pid) = instance::await_released(&lock, &ended, QUIT_WAIT) {
             return fail(format!(
                 "the mug (pid {pid}) still holds {} {} s after it was ended",
@@ -581,10 +552,6 @@ mod mac {
                 QUIT_WAIT.as_secs()
             ));
         }
-        // Also a copy left by a mug a logout or a restart ended, which removes none itself;
-        // not beside another build's mug, whose label the free lock keeps until it starts
-        // again (holding the lock to remove the copy would clear it, and the next `quit own`
-        // would take that mug for none). Its next start sweeps its old copy itself.
         if !other && here.paths.code_dir().exists() {
             discard_copy(&here.paths);
         }
@@ -595,11 +562,8 @@ mod mac {
         }
     }
 
-    /// Remove the ended mug's copy of the app, as a mug that quits from its menu does: once
-    /// an update retires the bundle it was cloned from, its blocks are its own. Done holding
-    /// the one-mug lock, so no mug starting now runs from what is removed (one that starts
-    /// meanwhile waits for the lock: [`hold`]); a lock another process holds by now (a mug
-    /// started since) keeps the copy.
+    /// Remove the ended mug's copy of the app, as a mug that quits from its menu does: once an
+    /// update retires the bundle it was cloned from, its blocks are its own.
     fn discard_copy(paths: &Paths) {
         let Ok(Some(held)) = Instance::try_hold(&paths.lock_file()) else {
             return;
@@ -610,11 +574,7 @@ mod mac {
         drop(held);
     }
 
-    /// The one stderr line of a `serve` that will not run, and exit 0: launchd's KeepAlive
-    /// starts the job again on any other status, and none of these refusals cures itself, so
-    /// it would only refuse again every throttle interval (a transient one waits for the next
-    /// start). No mug runs, so a bridge an update restart left in `paths` lets go now, not at
-    /// its bound; `None` only where the mug's files cannot be found at all.
+    /// The one stderr line of a `serve` that will not run, and exit 0: launchd's KeepAlive starts the job again on any other status, and none of these refusals cures itself, so it would only refuse again every throttle interval (a transient one waits for the next start).
     pub(super) fn refuse(paths: Option<&Paths>, why: impl std::fmt::Display) -> ExitCode {
         if let Some(paths) = paths {
             crate::macos::release_bridge(paths);
@@ -623,8 +583,8 @@ mod mac {
         ExitCode::SUCCESS
     }
 
-    /// Write the job this mug is beside its pid in the lock ([`Instance::set_label`]); a lock
-    /// left without it is read as the asking build's job.
+    /// Write the job this mug is beside its pid in the lock ([`Instance::set_label`]); a lock left
+    /// without it is read as the asking build's job.
     fn name_job(instance: &mut Instance, label: &str, lock: &Path) {
         if let Err(e) = instance.set_label(label) {
             eprintln!("{VERB}: serve: {}: {e}", lock.display());
@@ -638,7 +598,6 @@ mod mac {
         let code_dir = paths.code_dir();
         let lock = paths.lock_file();
         let (origin, instance) = if code::runs_from_copy(&code_dir) {
-            // First thing from a copy: its exec is over, so it may go once this mug ends.
             code::mark_ran(&code_dir);
             let Some(origin) = code::origin_exe(&code_dir) else {
                 return refuse(
@@ -674,11 +633,8 @@ mod mac {
             };
             let label = launchd::label_for(&origin);
             name_job(&mut instance, &label, &lock);
-            // Once per mug, by the lock's holder: a login plist of a build that is gone.
             launchd::prune_orphans(&paths);
             match code::prepare_copy(&origin, &code_dir, &label) {
-                // Returns only when the exec failed: never fall back to running AppKit from
-                // the bundle, which would take every open of the app.
                 Ok(Some(copy)) => {
                     let e = code::reexec_holding(&copy, &origin, &instance);
                     return refuse(
@@ -700,7 +656,6 @@ mod mac {
                 }
             }
         };
-        // Nothing the mug starts inherits the handover's variables.
         aterm_log::env::unset(code::ORIGIN_ENV);
         aterm_log::env::unset(instance::LOCK_FD_ENV);
         let label = launchd::label_for(&origin);
@@ -725,15 +680,8 @@ mod mac {
     /// How long [`hold`] waits out a lock held by something other than a running mug.
     const HOLD_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
 
-    /// Take the one-mug lock; `None` (said on stderr) when another mug holds it, or it cannot
-    /// be taken (a FIFO, a directory or a link at its name: [`refuse`]'s case).
-    ///
-    /// A refusal while no running mug holds it is tried again for up to [`HOLD_PATIENCE`]:
-    /// `status`, `start`, `on` and `quit` read the lock with `ownerlock::probe`, which holds a
-    /// free lock for an instant, and `quit` holds it while it removes an ended mug's copy, and
-    /// a `serve` that lands then must not leave as if a mug ran (it exits 0, so launchd would
-    /// not start it again). A mug that has the lock but has not yet written its pid is waited
-    /// on the same way, and then refused.
+    /// Take the one-mug lock; `None` (said on stderr) when another mug holds it, or it cannot be
+    /// taken (a FIFO, a directory or a link at its name: [`refuse`]'s case).
     fn hold(paths: &Paths) -> Option<Instance> {
         let lock = paths.lock_file();
         let code_dir = paths.code_dir();
@@ -843,7 +791,6 @@ mod tests {
         ] {
             assert_eq!(parsed(line), Ok(Command::Help), "{line:?}");
         }
-        // `help` is a command only in the first place.
         assert!(parsed("startup help").is_err());
     }
 
@@ -865,7 +812,6 @@ mod tests {
 
     #[test]
     fn unknown_words_and_extra_operands_are_refused() {
-        // Commands are lower case.
         for line in ["bogus", "ON"] {
             let why = parsed(line).expect_err(line);
             assert!(why.starts_with("unknown command "), "{line:?}: {why}");
@@ -933,29 +879,27 @@ mod tests {
     fn status_says_the_mode_the_mug_startup_and_label() {
         const NOW: u64 = 1_790_000_000;
         assert_eq!(
-            status_text(Mode::Off, NOW, None, false, "l.x"),
+            status_text(Mode::Off, NOW, None, Startup::Off, "l.x"),
             "caffeine=off\nuntil=-\nmenu=stopped\nstartup=off\nlabel=l.x\n"
         );
-        // A mode saved while no mug runs (a logout's SIGTERM saves nothing) holds nothing.
         assert_eq!(
-            status_text(Mode::Forever, NOW, None, true, "l.x"),
+            status_text(Mode::Forever, NOW, None, Startup::On, "l.x"),
             "caffeine=off\nuntil=-\nmenu=stopped\nstartup=on\nlabel=l.x\n"
         );
         assert_eq!(
-            status_text(Mode::Forever, NOW, Some(42), true, "l.x"),
-            "caffeine=on\nuntil=forever\nmenu=running\npid=42\nstartup=on\nlabel=l.x\n"
+            status_text(Mode::Forever, NOW, Some(42), Startup::Blocked, "l.x"),
+            "caffeine=on\nuntil=forever\nmenu=running\npid=42\nstartup=blocked\nlabel=l.x\n"
         );
         let timed = Mode::activate(Some(HOUR), NOW);
         assert_eq!(
-            status_text(timed, NOW, Some(7), false, "l.x"),
+            status_text(timed, NOW, Some(7), Startup::Off, "l.x"),
             format!(
                 "caffeine=on\nuntil={}\nmenu=running\npid=7\nstartup=off\nlabel=l.x\n",
                 NOW + HOUR
             )
         );
-        // A deadline that has passed is off.
         assert_eq!(
-            status_text(timed, NOW + HOUR, Some(7), false, "l.x"),
+            status_text(timed, NOW + HOUR, Some(7), Startup::Off, "l.x"),
             "caffeine=off\nuntil=-\nmenu=running\npid=7\nstartup=off\nlabel=l.x\n"
         );
     }
@@ -966,7 +910,6 @@ mod tests {
             pid: 7,
             label: label.map(str::to_owned),
         };
-        // Running: its own label is this build's; another's, or none named yet, is not.
         assert!(!another_builds_mug(
             Some(&running(Some("l.here"))),
             None,
@@ -978,16 +921,12 @@ mod tests {
             "l.here"
         ));
         assert!(another_builds_mug(Some(&running(None)), None, "l.here"));
-        // The running holder decides, whatever the lock named before it.
         assert!(!another_builds_mug(
             Some(&running(Some("l.here"))),
             Some("l.old"),
             "l.here"
         ));
-        // None running: a free lock still naming another build's job is that build's mug
-        // between runs (a restart into an update), so its mode is left as it is.
         assert!(another_builds_mug(None, Some("l.old"), "l.here"));
-        // NEGATIVE CONTROL: this build's own name, or none, is this build's to quit.
         assert!(!another_builds_mug(None, Some("l.here"), "l.here"));
         assert!(!another_builds_mug(None, None, "l.here"));
     }
@@ -1003,8 +942,10 @@ mod tests {
             on_line(Mode::activate(Some(60), NOW), NOW),
             format!("caffeine=requested until={}\n", NOW + 60)
         );
-        assert_eq!(startup_line(true), "startup=on\n");
-        assert_eq!(startup_line(false), "startup=off\n");
+        assert_eq!(startup_line(Startup::On), "startup=on\n");
+        assert_eq!(startup_line(Startup::Off), "startup=off\n");
+        assert_eq!(startup_line(Startup::Blocked), "startup=blocked\n");
+        assert_eq!(startup_line(Startup::Disabled), "startup=disabled\n");
         assert_eq!(until_word(Mode::Off, NOW), "-");
     }
 }

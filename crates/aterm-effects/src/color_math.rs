@@ -1,30 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Shared `0x00RRGGBB` color math: HSV round-trip, the sparkle-words v2 ink-pair
-//! hue nudge (docs/sparkle-words-v2-design.md §4.2/§4.3/§6.4/§6.5), and WCAG
-//! relative luminance. A leaf module, so its users need not depend on
-//! `word_decorations.rs`.
+//! Shared `0x00RRGGBB` color math.
 
-/// Rotate a `0x00RRGGBB` color's hue by the §4.2 nudge code (`0..=15` →
-/// `-18°..=+18°`), preserving saturation and value.
+/// Rotate a `0x00RRGGBB` color's hue by the §4.2 nudge code, preserving saturation and value.
 #[inline]
 pub fn hue_nudge(rgb: u32, code: u8) -> u32 {
     let (h, s, v) = rgb2hsv(rgb);
     hsv2rgb(h + (-18.0 + f32::from(code) * 2.4), s, v)
 }
 
-/// The hues a light page cannot show cleanly, in turns: deep orange through
-/// yellow to chartreuse. Deepened by lightness until it reads on paper
-/// (an ink under the letters, a caret on the page), a hue in this band turns
-/// brown, khaki or olive, so a spectrum laid on paper steps over it
-/// ([`light_spectrum_hue`]).
+/// The hues a light page cannot show cleanly, in turns: deep orange through yellow to chartreuse.
 pub const LIGHT_MUDDY_HUES: (f32, f32) = (36.0 / 360.0, 96.0 / 360.0);
 
-/// `hue` (turns) as a spectrum laid on a light page shows it: the wheel
-/// compressed so it steps over [`LIGHT_MUDDY_HUES`] (orange runs straight on
-/// into green), every other hue kept in order. A dark page shows the whole
-/// wheel; only the light arms call this.
+/// `hue` (turns) as a spectrum laid on a light page shows it.
 #[must_use]
 #[inline]
 pub fn light_spectrum_hue(hue: f32) -> f32 {
@@ -59,9 +48,7 @@ pub fn rgb2hsv(rgb: u32) -> (f32, f32, f32) {
     (h, s, max)
 }
 
-/// WCAG channel linearization times channel weight, per byte value. An exact
-/// cache of the scalar expression (same rounded `f32` multiplies, same add
-/// order); built at runtime because `powf` is not `const`.
+/// WCAG channel linearization times channel weight, per byte value.
 pub(crate) struct RelativeLuminanceTable {
     pub(crate) linear: [f32; 256],
     red: [f32; 256],
@@ -98,15 +85,13 @@ pub(crate) fn relative_luminance_with(table: &RelativeLuminanceTable, rgb: u32) 
         + table.blue[(rgb & 0xff) as usize]
 }
 
-/// WCAG relative luminance of a `0x00RRGGBB` colour. Same definition the
-/// renderer floors with, so the host can check final ink before rendering.
+/// WCAG relative luminance of a `0x00RRGGBB` colour.
 #[inline]
 pub fn relative_luminance(rgb: u32) -> f32 {
     relative_luminance_with(relative_luminance_table(), rgb)
 }
 
-/// WCAG contrast ratio (`>= 1`) between two `0x00RRGGBB` colours, on
-/// [`relative_luminance`].
+/// WCAG contrast ratio (`>= 1`) between two `0x00RRGGBB` colours, on [`relative_luminance`].
 #[must_use]
 #[inline]
 pub fn contrast_ratio(a: u32, b: u32) -> f32 {
@@ -118,27 +103,10 @@ pub fn contrast_ratio(a: u32, b: u32) -> f32 {
     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
-/// Floor `rgb`'s WCAG contrast against `ground` to at least `min` by moving
-/// its lightness alone, so the hue holds.
-///
-/// The colour moves toward the pole the ground contrasts with more (the
-/// choice `aterm_render::floor_fg_contrast` makes, so any `min` up to
-/// `sqrt(21) ≈ 4.58` is reachable on every ground):
-///
-/// * toward black it is SHADED: every channel scaled by one factor, which
-///   keeps hue and saturation exactly;
-/// * toward white it is first BRIGHTENED the same way, at constant hue and
-///   saturation, until its brightest channel reaches 255, and only past that
-///   tinted toward white.
-///
-/// It never blends toward another colour (a theme cursor, an accent), so an
-/// ember stays an ember and a violet stays violet. Bisected on the quantized
-/// colour along that monotone path, so the returned bytes clear `min`. An
-/// unreachable `min` returns the pole's end of the path.
+/// Floor `rgb`'s WCAG contrast against `ground` to at least `min` by moving its lightness alone.
 #[must_use]
 pub fn floor_contrast_keeping_hue(rgb: u32, ground: u32, min: f32) -> u32 {
     let rgb = rgb & 0x00FF_FFFF;
-    // A ratio of 1 or less (or NaN) asks for no floor.
     if min.partial_cmp(&1.0) != Some(std::cmp::Ordering::Greater) {
         return rgb;
     }
@@ -151,7 +119,6 @@ pub fn floor_contrast_keeping_hue(rgb: u32, ground: u32, min: f32) -> u32 {
     if meets(rgb) {
         return rgb;
     }
-    // contrast(black, g) = (L + 0.05) / 0.05 wins iff (L + 0.05)² >= 0.0525.
     let darken = (lg + 0.05) * (lg + 0.05) >= 0.05 * 1.05;
     let chan = |sh: u32| ((rgb >> sh) & 0xff) as f32;
     let (r, g, b) = (chan(16), chan(8), chan(0));
@@ -161,7 +128,6 @@ pub fn floor_contrast_keeping_hue(rgb: u32, ground: u32, min: f32) -> u32 {
         let q = |c: f32| (c.round().clamp(0.0, 255.0)) as u32;
         (q(r) << 16) | (q(g) << 8) | q(b)
     };
-    // One parameter `t` in 0..=1 walks the whole path, luminance monotone.
     let path = |t: f32| -> u32 {
         if darken {
             let s = 1.0 - t;
@@ -205,18 +171,7 @@ const CHROMA_FLOOR: f32 = 0.10;
 /// How far [`light_body_fill`] lowers value at full heat.
 const LIGHT_DEPTH_MAX: f32 = 0.40;
 
-/// A caret body's fill on a LIGHT page at `heat` `0..=1`: the hue
-/// concentrated instead of whitened.
-///
-/// On a dark page a body whitens as it heats; on a white one that sinks the
-/// caret into the page ("additive light cannot brighten a white ground").
-/// Here saturation climbs toward the pure hue (60% of the way at rest, all of
-/// it at full heat) and value falls by up to [`LIGHT_DEPTH_MAX`], so typing
-/// reads as the colour deepening, the light-theme law the rainbow body already
-/// follows ("a saturated hue just darkens"). Raising saturation first is what
-/// keeps a pastel style hue (sparkle gold, comet ice, storm violet) from going
-/// to mud when the page floor later lowers its value. A near-grey keeps its
-/// saturation.
+/// A caret body's fill on a LIGHT page at `heat` `0..=1`: the hue concentrated instead of whitened.
 #[must_use]
 #[inline]
 pub fn light_body_fill(rgb: u32, heat: f32) -> u32 {
@@ -234,13 +189,7 @@ pub fn light_body_fill(rgb: u32, heat: f32) -> u32 {
     hsv2rgb(h, s, v * (1.0 - LIGHT_DEPTH_MAX * heat))
 }
 
-/// A caret colour `rgb` charged by `k` `0..=1` on a LIGHT page, continuously
-/// from `rgb` itself at `k = 0`: its saturation climbs toward the pure hue
-/// and its value falls by up to [`LIGHT_DEPTH_MAX`], the same deepening
-/// [`light_body_fill`] gives a body at full heat, so a hot caret reads as
-/// its own colour concentrating, never as a warm tint mixed into it (blue
-/// and orange mix to grey, pink and orange to brown). A near-grey keeps its
-/// saturation.
+/// A caret colour `rgb` charged by `k` `0..=1` on a LIGHT page.
 #[must_use]
 #[inline]
 pub fn light_charge_in_hue(rgb: u32, k: f32) -> u32 {
@@ -261,17 +210,7 @@ pub fn light_charge_in_hue(rgb: u32, k: f32) -> u32 {
     hsv2rgb(h, s, v * (1.0 - LIGHT_DEPTH_MAX * k))
 }
 
-/// A caret body built on a PINNED cursor colour (a configured `cursor_color`
-/// or a program's OSC 12) at `charge` `0..=1`: exactly `pinned` at rest, and
-/// moving toward the body's own `styled` fill only as the body charges.
-///
-/// A pinned colour is the body's base and passes the page floor untouched,
-/// as the same cursor with effects off would (owner, 2026-08-29), so at rest
-/// the caret IS that cursor: no whitening frost, no deepening, no hue
-/// whisper. `settled` is the body's settle threshold (the charge at or under
-/// which it stops asking for frames): from there down the fill is `pinned`
-/// to the byte, and the move toward `styled` starts from it continuously. A
-/// non-finite charge reads as rest.
+/// A caret body built on a PINNED cursor colour.
 #[must_use]
 #[inline]
 pub fn wear_pinned(pinned: u32, styled: u32, charge: f32, settled: f32) -> u32 {
@@ -293,8 +232,7 @@ pub fn wear_pinned(pinned: u32, styled: u32, charge: f32, settled: f32) -> u32 {
     ch(16) | ch(8) | ch(0)
 }
 
-/// OKLab `[L, a, b]` of a `0x00RRGGBB` colour (Björn Ottosson's matrices), the
-/// uniform space a tint's distance from its page is weighed in.
+/// OKLab `[L, a, b]` of a `0x00RRGGBB` colour (Björn Ottosson's matrices), the uniform space.
 #[inline]
 pub(crate) fn oklab(rgb: u32) -> [f32; 3] {
     let linear = &relative_luminance_table().linear;
@@ -311,9 +249,7 @@ pub(crate) fn oklab(rgb: u32) -> [f32; 3] {
     ]
 }
 
-/// [`oklab`]'s inverse: the `0x00RRGGBB` colour of OKLab `[L, a, b]`, each
-/// linear channel clamped to `0..=1` (a colour past the sRGB gamut lands on
-/// its edge) before the sRGB transfer and the byte's rounding.
+/// [`oklab`]'s inverse.
 #[inline]
 pub(crate) fn oklab_to_rgb([l, a, b]: [f32; 3]) -> u32 {
     let l_ = l + 0.396_337_78 * a + 0.215_803_76 * b;
@@ -368,17 +304,16 @@ mod tests {
 
     /// The page floor clears the ratio on both poles, moves lightness alone
     /// (the HSV hue of the floored colour is the input's), and leaves a
-    /// colour that already clears it byte-identical. The grounds are the two
-    /// shipped default pages and white.
+    /// colour that already clears it byte-identical.
     #[test]
     fn the_page_floor_clears_the_ratio_and_keeps_the_hue() {
         for (rgb, ground) in [
-            (0x0051_0A00, 0x0011_1318), // the fire ember on the dark default
-            (0x000F_70B7, 0x0011_1318), // still water on the dark default
-            (0x00B4_8CFF, 0x00FF_FFFF), // storm violet on white
-            (0x00FF_D9A0, 0x00FF_FFFF), // sparkle gold on white
-            (0x009E_D6FF, 0x00FD_F6E3), // comet ice on Solarized light
-            (0x0000_00FF, 0x0011_1318), // a pure blue on the dark default
+            (0x0051_0A00, 0x0011_1318),
+            (0x000F_70B7, 0x0011_1318),
+            (0x00B4_8CFF, 0x00FF_FFFF),
+            (0x00FF_D9A0, 0x00FF_FFFF),
+            (0x009E_D6FF, 0x00FD_F6E3),
+            (0x0000_00FF, 0x0011_1318),
         ] {
             let before = contrast_ratio(rgb, ground);
             assert!(before < 4.5, "control: {rgb:06x} starts under the floor");
@@ -396,11 +331,9 @@ mod tests {
                 "{rgb:06x} → {floored:06x}: the hue moved {dh:.1}°"
             );
         }
-        // A colour that already clears the floor is returned as is.
         for (rgb, ground) in [(0x0009_69DA, 0x00FF_FFFF), (0x00FF_FFFF, 0x0011_1318)] {
             assert_eq!(floor_contrast_keeping_hue(rgb, ground, 4.5), rgb);
         }
-        // A ratio of 1 (or NaN) is no floor at all.
         assert_eq!(
             floor_contrast_keeping_hue(0x0011_1318, 0x0011_1318, 1.0),
             0x0011_1318

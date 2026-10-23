@@ -1820,6 +1820,10 @@ fn union_rect_opt(
 #[inline]
 fn note_offscreen_written(win: &mut WindowGpu, rect: Option<[u32; 4]>, dims: (u32, u32)) {
     win.offscreen_dirty_since_sync = union_rect_opt(win.offscreen_dirty_since_sync, rect, dims);
+    #[cfg(gl_arm)]
+    {
+        win.offscreen_dirty_since_post = union_rect_opt(win.offscreen_dirty_since_post, rect, dims);
+    }
 }
 
 #[inline]
@@ -4677,6 +4681,12 @@ pub struct WindowGpu {
     gl_apron_gen: u64,
     #[cfg(gl_arm)]
     gl_virtual_off: Option<crate::gl::resources::GlTexture>,
+    // What a readback post sends: the offscreen written since the last post
+    // and what it composed (`gl_present::post_damage`).
+    #[cfg(gl_arm)]
+    offscreen_dirty_since_post: Option<[u32; 4]>,
+    #[cfg(gl_arm)]
+    gl_posted: Option<gl_present::GlPosted>,
     #[cfg(target_os = "macos")]
     pub(crate) metal_present_off: Option<crate::metal::resources::SealedTexture>,
     #[cfg(all(target_os = "macos", test))]
@@ -5005,6 +5015,11 @@ impl WindowGpu {
     #[inline]
     pub fn invalidate_present(&mut self) {
         self.present_prev = None;
+        // The window system may hold none of the last post: the next is whole.
+        #[cfg(gl_arm)]
+        {
+            self.gl_posted = None;
+        }
         self.apron_scratch.invalidate();
         self.advance_resident_input_epoch();
     }
@@ -11209,7 +11224,7 @@ impl GpuRenderer {
         }
         #[cfg(all(not(wgpu_arm), gl_arm))]
         {
-            self.gl_create_window_surface(target, width, height)
+            self.gl_create_window_surface(target, width, height, None)
         }
         #[cfg(wgpu_arm)]
         {
@@ -11230,6 +11245,29 @@ impl GpuRenderer {
                 surf
             };
             Ok(surf)
+        }
+    }
+
+    /// [`Self::create_window_surface`], with `sink`, the frontend's presenter
+    /// for the window, which the GL arm posts the window's frames through where
+    /// a window surface would stall the window system ([`FrameSink`]); every
+    /// other window and arm leaves it unused.
+    #[cfg(target_os = "linux")]
+    pub fn create_window_surface_with_sink<W: WindowTarget>(
+        &mut self,
+        target: W,
+        width: u32,
+        height: u32,
+        sink: Box<dyn FrameSink>,
+    ) -> Result<GpuSurface, String> {
+        #[cfg(all(not(wgpu_arm), gl_arm))]
+        {
+            self.gl_create_window_surface(target, width, height, Some(sink))
+        }
+        #[cfg(not(all(not(wgpu_arm), gl_arm)))]
+        {
+            drop(sink);
+            self.create_window_surface(target, width, height)
         }
     }
 
@@ -20965,6 +21003,41 @@ impl<T> WindowTarget for T where
     T: aterm_types::native_window::HasNativeWindow + Send + Sync + 'static
 {
 }
+
+/// The frontend's own presenter for one window, which the GL arm posts the
+/// window's frames through instead of a window surface where the window
+/// system's GL stalls it (an X11 window on NVIDIA's GLX under a compositing
+/// manager: every resize of a window with a `GLXWindow` stalls the X server
+/// and the GPU for every client; `gl::surface`'s module header). Handed to
+/// [`GpuRenderer::create_window_surface_with_sink`], which uses it only there.
+#[cfg(target_os = "linux")]
+pub trait FrameSink: Send {
+    /// Get ready to post. `Err` says why it cannot, and the window is posted
+    /// through its window surface instead.
+    fn attach(&mut self) -> Result<(), String>;
+
+    /// Post one `width` x `height` frame: size the store, wait until the
+    /// window system has read the last post, have `draw` write a rectangle of
+    /// the frame into the store (`0x00RRGGBB` words, rows top first, `width`
+    /// words a row), and post that rectangle. `damage` (`[x0, y0, x1, y1]`,
+    /// half-open) is the part of the frame that differs from the last post,
+    /// `None` all of it; the sink widens it to the whole frame wherever its
+    /// store does not hold the last post (the first post, a new size), and
+    /// hands `draw` the rectangle it settled on. An empty one posts nothing.
+    /// `draw`'s `Err` posts nothing and is returned.
+    fn post(
+        &mut self,
+        width: u32,
+        height: u32,
+        damage: Option<[u32; 4]>,
+        draw: &mut FrameDraw<'_>,
+    ) -> Result<(), String>;
+}
+
+/// A [`FrameSink::post`]'s draw: write the rectangle (`[x0, y0, x1, y1]`,
+/// half-open) of the frame into the store's words.
+#[cfg(target_os = "linux")]
+pub type FrameDraw<'a> = dyn FnMut(&mut [u32], [u32; 4]) -> Result<(), String> + 'a;
 
 /// A window a GPU backend can attach a swapchain to.
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_arch = "wasm32")))]

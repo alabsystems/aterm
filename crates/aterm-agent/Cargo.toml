@@ -137,8 +137,9 @@ astream-effects = { path = "../../vendor/astream/crates/astream-effects" }
 # cordoned `unsafe` module is four Apple FFI calls (astream claim `os.cordon`):
 # `fcntl` for the barrier, `sysctlbyname` for the boot id, `poll` for a
 # socket's hang-up, and `signal` for the `SIGHUP` handler only astream's
-# revocation file installs, which aterm never does. This crate calls only the
-# boot readers, so on Apple it reaches `sysctlbyname` alone. Not a new
+# revocation file installs, which aterm never does. This crate calls the boot
+# readers and opens local account discovery files nonblocking, refusing final
+# symlinks on Unix. Not a new
 # edge where aterm ships its bus (Unix: aterm-link links it, and aterm-durable
 # on Apple); on Windows, where neither does, it is a new one, and a harmless
 # one: no dependencies, and no `unsafe` compiled there.

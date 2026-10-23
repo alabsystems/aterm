@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Reading a `targo test` child's log: which binaries ran and passed what,
-//! which failed tests it can account for (each with its binary's re-run spec),
-//! whether every failure was the machine refusing ([`COULD_NOT_RUN_SENTINEL`])
-//! and what each refusal said ([`refusal_reasons`]). Pure (`&str` in). A
-//! coloured log reads as a plain one.
+//! Reading a `targo test` child's log.
 
 /// cargo's test-binary header, with its verb dropped.
 pub(crate) fn header(line: &str) -> Option<String> {
@@ -27,11 +23,7 @@ pub const RAN_NO_TEST: &str = "cargo announced test binaries and not one printed
      gate's and started them in its place, or they exited before their harness; nothing was \
      decided about them";
 
-/// Did a `targo test` child's log announce test binaries — cargo's `Running`
-/// / `Doc-tests` headers — and then print not one libtest `test result:`
-/// line? Then whatever ran in the binaries' place ran no test
-/// ([`crate::ladder::Report::decide_test_child`]). A log with no header ran
-/// nothing to count, and one binary with a result is a run.
+/// Did a `targo test` child's log announce test binaries.
 #[must_use]
 pub fn ran_no_test(log: &str) -> bool {
     if log.contains('\x1b') {
@@ -40,17 +32,11 @@ pub fn ran_no_test(log: &str) -> bool {
     log.lines().any(|l| header(l).is_some()) && !log.lines().any(|l| l.starts_with("test result: "))
 }
 
-/// Why a test target of a selective `targo test` child that exited 0 decided
-/// nothing ([`passed_by_target`] gives it no passed test).
+/// Why a test target of a selective `targo test` child that exited 0 decided nothing ([`passed_by_target`] gives it no passed test).
 pub const PASSED_NONE: &str = "not one row passed: the filter selected none (a renamed \
      module, a lost `--ignored`), so it measured nothing";
 
-/// Each test binary of a `targo test` child's log, in log order: its cargo
-/// target (`tests/paint.rs`, `unittests src/lib.rs`) and the `N passed` of the
-/// last `test result:` line in its section, `None` when it printed none. The
-/// last line is the binary's own: a re-exec child's result prints before its
-/// parent's. Per binary, never summed, so one target that selected nothing
-/// is not hidden by another that passed.
+/// Each test binary of a `targo test` child's log, in log order.
 #[must_use]
 pub fn passed_by_target(log: &str) -> Vec<(String, Option<usize>)> {
     if log.contains('\x1b') {
@@ -74,9 +60,7 @@ pub fn passed_by_target(log: &str) -> Vec<(String, Option<usize>)> {
     out
 }
 
-/// Drop every CSI escape (`ESC [` … a final byte in `@`–`~`) and every other
-/// two-byte escape, so a coloured log reads exactly like a plain one. Only
-/// called when the log has an `ESC` in it.
+/// Drop every CSI escape (`ESC [` … a final byte in `@`–`~`) and every other two-byte escape, so a coloured log reads exactly like a plain one.
 pub(crate) fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -84,7 +68,6 @@ pub(crate) fn strip_ansi(s: &str) -> String {
         out.push_str(&rest[..at]);
         let after = &rest[at + 1..];
         rest = if let Some(body) = after.strip_prefix('[') {
-            // A CSI: parameters and intermediates, then one final byte.
             match body.find(|c: char| ('\x40'..='\x7e').contains(&c)) {
                 Some(end) => &body[end + 1..],
                 None => "",
@@ -98,48 +81,20 @@ pub(crate) fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// The path in a `Running <target> (<path>)` header — the binary to re-run.
+/// The path in a `Running <target> (<path>)` header.
 pub(crate) fn binary_path(header: &str) -> Option<&str> {
     header.rsplit_once(" (")?.1.strip_suffix(')')
 }
 
-/// The words a test prints when the machine refused it, not the tree: a
-/// headless boot the OS refused (`crates/aterm/tests/support/headless_boot.rs`),
-/// a host with no GPU adapter (`aterm-gpu`'s test helpers), a paint take its
-/// own instrument disowns as starved, or a paint or spin probe that decided
-/// nothing, among others. A red row under this sentinel says nothing about the
-/// code, so the run records it as COULD NOT RUN, never `FAIL`.
-///
-/// Producers print it verbatim in their panic message, most through
-/// `aterm_uds::host::could_not_run`: this is that crate's `COULD_NOT_RUN`, re-exported,
-/// so the producers' words and the reader's are one constant. A reworded producer turns
-/// its refusals into findings, which fails closed.
+/// The words a test prints when the machine refused it, not the tree.
 pub use aterm_uds::host::COULD_NOT_RUN as COULD_NOT_RUN_SENTINEL;
 
-/// The failed tests in a failed `targo test` child's log, when every failure
-/// carries [`COULD_NOT_RUN_SENTINEL`]; `None` when any does not, or when the
-/// log cannot account for every failure. A finding must never read as the
-/// machine's fault, so all of this must hold:
-///
-/// * at least one `---- <name> stdout ----` block, and every one carries the
-///   sentinel;
-/// * the names listed under the closing `failures:` are exactly the names that
-///   had a block, counted with multiplicity;
-/// * every binary cargo reported failed (`error: test failed, to rerun pass`)
-///   printed a `test result: FAILED.` line: a binary that died of a signal
-///   prints none, and a crash is a finding;
-/// * no binary exited other than libtest's 101 ([`abnormal_exit`]): one that
-///   printed its result and then died of a signal is a crash too.
-///
-/// A block is a position in the log, never a name: two binaries of one
-/// `--no-fail-fast` log can fail tests of the same bare name, one a refusal and
-/// one a real assertion.
+/// The failed tests in a failed `targo test` child's log, when every failure carries [`COULD_NOT_RUN_SENTINEL`].
 #[must_use]
 pub fn environment_refusals(log: &str) -> Option<Vec<String>> {
     if log.contains('\x1b') {
         return environment_refusals(&strip_ansi(log));
     }
-    // (name, refused) for each block, in log order.
     let mut blocks: Vec<(&str, bool)> = Vec::new();
     let mut listed: Vec<&str> = Vec::new();
     let mut current: Option<usize> = None;
@@ -202,11 +157,7 @@ pub fn environment_refusals(log: &str) -> Option<Vec<String>> {
         })
 }
 
-/// Why the tests in `names` decided nothing, as a COULD NOT RUN row says it:
-/// `who` (`every failing test`, `3 of its failing tests`) refused the machine,
-/// the first four named, and what the refusals in `log` said
-/// ([`refusal_reasons`]): what the host lacks and its fix, where the row's
-/// reader looks, not only in the log.
+/// Why the tests in `names` decided nothing, as a COULD NOT RUN row says it.
 #[must_use]
 pub fn refusal_reason(who: &str, names: &[String], log: &str) -> String {
     let shown: Vec<&str> = names.iter().take(4).map(String::as_str).collect();
@@ -231,11 +182,7 @@ pub fn refusal_reason(who: &str, names: &[String], log: &str) -> String {
     )
 }
 
-/// What the refusals in a log said: the rest of each line that carries
-/// [`COULD_NOT_RUN_SENTINEL`] (`… — <why>` or `…: <why>`), each distinct one
-/// once, in log order. A producer's `why` names what the host lacks and its
-/// fix, so a COULD NOT RUN row can say it ([`crate::exec::Run::environment_failure`]);
-/// it decides nothing ([`environment_refusals`] does).
+/// What the refusals in a log said.
 #[must_use]
 pub fn refusal_reasons(log: &str) -> Vec<String> {
     if log.contains('\x1b') {
@@ -259,27 +206,19 @@ pub fn refusal_reasons(log: &str) -> Vec<String> {
 /// One failed test, as a `--no-fail-fast` `targo test` log accounts for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FailedTest {
-    /// cargo's re-run spec for the binary that failed it — `-p atpkg --test
-    /// atpkg_suite`, `-p aterm-gui --lib`, `-p x --doc` — the text between the
-    /// backticks of its `error: test failed, to rerun pass` line. It names the
-    /// package and the target, which a `Running` header does not
-    /// (`tests/paint.rs` exists in more than one crate).
+    /// cargo's re-run spec for the binary that failed it.
     pub spec: String,
     /// The test's name as libtest listed it.
     pub name: String,
     /// Everything its `---- <name> stdout ----` block held.
     pub block: String,
-    /// The block carries [`COULD_NOT_RUN_SENTINEL`]: the machine refused this
-    /// test, so it decided nothing.
+    /// The block carries [`COULD_NOT_RUN_SENTINEL`].
     pub refused: bool,
 }
 
 /// cargo's word that a test binary did not exit with libtest's 101: the
 /// `Caused by:` under the re-run line, and the `process didn't exit
-/// successfully: … (signal: …)` under that. cargo prints neither for a plain
-/// failed test, so outside a test's own block either means the binary ended in
-/// something its `test result:` line does not account for (a teardown crash, a
-/// background thread's abort after the summary).
+/// successfully: … (signal: …)` under that.
 fn abnormal_exit(line: &str) -> bool {
     line.trim_end() == "Caused by:"
         || line
@@ -297,48 +236,19 @@ fn rerun_spec(line: &str) -> Option<&str> {
     (!spec.is_empty()).then_some(spec)
 }
 
-/// Every failed test in a failed `targo test` child's log, each with the
-/// binary that failed it ([`FailedTest::spec`]); `None` unless the log
-/// accounts for every failure, so a failure it cannot name is never dropped
-/// from a list a reader compares against another run's.
-///
-/// The accounting [`environment_refusals`] demands, and more:
-///
-/// * at least one `---- <name> stdout ----` block, each followed by the
-///   `error: test failed, to rerun pass` line of its binary (how a block gets
-///   its spec);
-/// * the names listed under the closing `failures:` are exactly the blocks'
-///   names, counted with multiplicity;
-/// * every binary cargo reported failed printed a `test result: FAILED.` line
-///   (a binary that died of a signal prints none, and a failed re-exec child
-///   prints a result with no re-run line of its own);
-/// * per binary, the names listed since the last re-run line are exactly the
-///   blocks read since it, and no `test result:` or re-run line arrives inside
-///   an open block: a test whose output quotes a nested cargo log (this crate's
-///   contract tests panic with fixture ladders) would otherwise have its block
-///   cut and credited to the nested spec;
-/// * once a `failures:` line closes a binary's blocks, only its listed names
-///   (four-space indented), blank lines and its `test result:` follow: a test
-///   whose message holds a `failures:` line would otherwise have its block
-///   closed there;
-/// * every binary exited with libtest's 101 ([`abnormal_exit`]).
+/// Every failed test in a failed `targo test` child's log, each with the binary that failed it ([`FailedTest::spec`]).
 #[must_use]
 pub fn failed_tests(log: &str) -> Option<Vec<FailedTest>> {
     if log.contains('\x1b') {
         return failed_tests(&strip_ansi(log));
     }
     let mut done: Vec<FailedTest> = Vec::new();
-    // Blocks read since the last re-run line: (name, text, refused).
     let mut pending: Vec<(String, String, bool)> = Vec::new();
     let mut listed: Vec<&str> = Vec::new();
-    // Names listed, and whether a `test result: FAILED.` came, since the last
-    // re-run line: one binary's accounting.
     let mut listed_here: Vec<&str> = Vec::new();
     let mut result_here = false;
     let mut current: Option<usize> = None;
     let mut in_list = false;
-    // A `failures:` line closed this binary's blocks: its closing list, up to
-    // its `test result:`.
     let mut closing = false;
     let (mut results, mut binaries) = (0usize, 0usize);
     for line in log.lines() {
@@ -376,18 +286,12 @@ pub fn failed_tests(log: &str) -> Option<Vec<FailedTest>> {
             }
             in_list = false;
         }
-        // Anything but the result after the closing list: the `failures:`
-        // that opened it was a line of a test's message, and the rest of that
-        // message fell outside every block.
         if closing && !line.starts_with("test result: ") {
             return None;
         }
-        // A result or a re-run line inside a test's own output is a nested
-        // log: which binary any block belongs to can no longer be told.
         if current.is_some() && (line.starts_with("test result: ") || rerun_spec(line).is_some()) {
             return None;
         }
-        // A binary that did not exit with libtest's 101.
         if current.is_none() && abnormal_exit(line) {
             return None;
         }
@@ -556,10 +460,7 @@ mod tests {
     /// A test that re-runs itself alone in a child (aterm-render's
     /// `alone::in_own_process`) re-raises the child's refusal with the child's
     /// why on its own sentinel line and the child's stderr below it: one
-    /// refusal, so the row gives that why once, in full, and no count. The
-    /// control is a re-raise that leads with its own context: a second reason,
-    /// and the row shows the wrapper's line, which names neither the lack nor
-    /// the fix.
+    /// refusal, so the row gives that why once, in full, and no count.
     #[test]
     fn a_reraised_refusal_is_one_reason_the_childs() {
         let name = "seal_maps_discovered_faces::the_seal_maps_every_discovered_face";
@@ -602,8 +503,7 @@ mod tests {
     }
 
     /// A refusal never launders a finding: whatever the sentinel cannot vouch
-    /// for keeps the whole child a finding. The control is the shared name
-    /// refused in both binaries, which is the machine's, named once.
+    /// for keeps the whole child a finding.
     #[test]
     fn a_refusal_never_launders_a_finding() {
         let finding = "thread 't' panicked at x.rs:1:1:\nassertion failed: service.ready()";
@@ -633,8 +533,6 @@ mod tests {
                 "a plain failure alone",
                 failed_binary("x", &[("t", "thread 't' panicked at x.rs:1:1:\nassert")]),
             ),
-            // Keyed by name, these read as the machine's (measured on the
-            // pre-fix function): a block is a position in the log, not a name.
             (
                 "a finding sharing a refusal's name in a later binary",
                 format!(
@@ -721,9 +619,7 @@ mod tests {
     }
 
     /// A log that cannot account for every failure itemizes nothing, so a
-    /// failure the list would miss is never dropped from a comparison. Each
-    /// case names the defect; the controls, the same blocks without it, are
-    /// itemized.
+    /// failure the list would miss is never dropped from a comparison.
     #[test]
     fn a_log_that_cannot_account_for_every_failure_itemizes_nothing() {
         let one = failed_binary("probe", &[("a", "\nboom")]);
@@ -752,8 +648,6 @@ mod tests {
             ),
             ("no failure", "running 0 tests\n".to_string()),
             ("an empty log", String::new()),
-            // A test quoting a nested cargo log: its result and re-run lines
-            // would cut the block short and credit it to the nested spec.
             (
                 "a quoted nested binary",
                 quotes(&format!(
@@ -768,9 +662,6 @@ mod tests {
                 ),
             ),
         ];
-        // A `failures:` line in a test's own message (an oracle listing the
-        // cases that disagreed) must not close its block, whichever block
-        // holds it and however its list is indented.
         for list in ["  case_07: got 3 want 4", "    case_07"] {
             let msg = format!(
                 "\nthread 'corpus' panicked at src/a.rs:1:1:\nthe corpus disagreed\nfailures:\n{list}"
@@ -784,9 +675,6 @@ mod tests {
                 failed_binary("oracle", &[("corpus", &msg), ("other", "\nboom")]),
             ));
         }
-        // A binary that printed its result and then died (a teardown crash):
-        // cargo's `Caused by:` under the re-run line leaves the log unaccounted,
-        // and no refusal either.
         let refusing = failed_binary("render", &[("t", &refused("a stale peer is alive"))]);
         assert!(environment_refusals(&refusing).is_some(), "{refusing}");
         for why in [

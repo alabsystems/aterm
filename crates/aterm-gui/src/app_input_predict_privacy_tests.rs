@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Predictive echo never paints a keystroke the program will not echo, nor a
-//! guess or a cursor where the echo will not land.
-//!
-//! Driven end to end on a headless App: presses go through [`App::input`] (the
-//! press path that arms guesses), the program's output goes into the focused
-//! pane's terminal, and the composed present (`redraw_compose`) reconciles and
-//! paints. Every press and every frame is stamped on the rig's own clock
-//! (`pin_input_clock`, the present's instant), never the wall clock: the echo
-//! latency the Adaptive gate measures is that clock moved forward, never slept,
-//! and no stall of the test thread ages a guess past its glitch window.
-//!
-//! Each scenario first shows the rig can paint a ghost (an echoing line on a
-//! slow link), so "the secret is not on glass" is not vacuous.
+//! Predictive echo never paints a keystroke the program will not echo.
 
 use crate::input::{InputEvent, Source};
 use crate::{App, WindowId, term_lock};
@@ -52,7 +40,7 @@ struct Rig {
     other: u64,
     bottom: usize,
     /// The rig's clock: the instant its next press is stamped and its next frame
-    /// presented. Only [`Self::present_after`] moves it.
+    /// presented.
     now: Instant,
 }
 
@@ -126,8 +114,7 @@ impl Rig {
         let _ = self.app.input(self.wid, ev, Source::Human);
     }
 
-    /// One presented frame at the rig's clock. The background pane is damaged so
-    /// a frame presents even when the focused pane did not change.
+    /// One presented frame at the rig's clock.
     fn present(&mut self) {
         self.present_after(Duration::ZERO);
     }
@@ -207,8 +194,7 @@ impl Rig {
 }
 
 /// A line the program ended (`read -n1`'s answer needs no Enter) scrolls the
-/// next prompt onto the same physical bottom row. The echo proof belongs to the
-/// line that scrolled away: the password typed at the new prompt is not painted.
+/// next prompt onto the same physical bottom row.
 #[test]
 fn a_prompt_scrolled_onto_the_echoing_row_does_not_inherit_its_proof() {
     let mut rig = Rig::new("adaptive");
@@ -216,7 +202,6 @@ fn a_prompt_scrolled_onto_the_echoing_row_does_not_inherit_its_proof() {
     rig.key(press(Key::Named(NamedKey::Enter), Modifiers::empty()));
     rig.feed("\r\nProceed? [y/N] ");
     rig.present_after(RTT);
-    // `read -n1`: the answer echoes and ends the line by itself.
     rig.type_echoed('y');
     rig.feed(&format!("\r\n{PROMPT}"));
     rig.present_after(RTT);
@@ -235,8 +220,7 @@ fn a_prompt_scrolled_onto_the_echoing_row_does_not_inherit_its_proof() {
 /// Over ssh no tty verdict reaches the host (the local pty is the ssh client's,
 /// raw), so a remote `read -n1 -p 'Proceed? '; read -s -p ' Password: '` is all
 /// one row: the answer echoes and proves the line, then the remote prints the
-/// password prompt beside it. That print moved the cursor without us; the
-/// password typed where it left the cursor must not be painted.
+/// password prompt beside it.
 #[test]
 fn a_prompt_printed_beside_an_echoed_answer_does_not_inherit_its_proof() {
     let mut rig = Rig::new("adaptive");
@@ -259,8 +243,7 @@ fn a_prompt_printed_beside_an_echoed_answer_does_not_inherit_its_proof() {
 
 /// A command submitted by a key other than a plain Enter — Shift+Enter (aterm
 /// sends LF, readline's accept-line), Ctrl+Enter (CR), Ctrl+J, Ctrl+M — and
-/// the password typed ahead of the prompt on a slow link. The submit is input
-/// the predictor did not model; what is typed after it has no echo proof.
+/// the password typed ahead of the prompt on a slow link.
 #[test]
 fn a_password_typed_ahead_after_any_submit_key_is_not_painted() {
     let submits: [(&str, InputEvent); 4] = [
@@ -279,7 +262,6 @@ fn a_password_typed_ahead_after_any_submit_key_is_not_painted() {
         let mut rig = Rig::new("adaptive");
         rig.type_command_on_a_slow_link("sudo");
         rig.key(submit);
-        // Typed ahead: the remote has not answered the submit yet.
         assert!(
             !rig.secret_is_painted('h'),
             "{label}: a password glyph typed after the submit was painted"
@@ -288,10 +270,7 @@ fn a_password_typed_ahead_after_any_submit_key_is_not_painted() {
 }
 
 /// A word typed ahead of its echo on a slow link (`echo foo`) keeps painting
-/// across an unmodelled line terminator, which cannot erase or move it. Any other
-/// unmodelled key may erase it (Ctrl+W, Ctrl+H, or a `[key_sequences]` remap the
-/// host cannot list); once the erase echoes, the cursor sits over a blank cell
-/// the reconcile cannot tell from "not echoed yet", so the guesses must go.
+/// across an unmodelled line terminator, which cannot erase or move it.
 #[test]
 fn a_typed_ahead_word_outlives_only_a_line_terminator() {
     fn typed_ahead_foo(rig: &mut Rig) -> (usize, usize) {
@@ -336,8 +315,6 @@ fn a_typed_ahead_word_outlives_only_a_line_terminator() {
         );
     }
 
-    // (label, the key, what the program echoes for "foo" and then the key, how
-    // many cells from the word's start the cursor ends)
     let kill_word = "foo\x08\x08\x08\x1b[K";
     let delete_char = "foo\x08 \x08";
     let erases: [(&str, InputEvent, &str, usize); 4] = [
@@ -364,8 +341,7 @@ fn a_typed_ahead_word_outlives_only_a_line_terminator() {
 /// Set the slave's local modes, as the program reading it would.
 #[cfg(unix)]
 fn set_lflag(slave: i32, edit: impl FnOnce(&mut libc::tcflag_t)) {
-    // SAFETY: `libc::termios` is plain integer fields plus a byte array;
-    // zeroed is a valid value, and `tcgetattr` fills it on the open slave.
+    // SAFETY: `libc::termios` is plain integer fields plus a byte array; zeroed is a valid value.
     let mut t: libc::termios = unsafe { std::mem::zeroed() };
     // SAFETY: `slave` is an open tty descriptor this test owns.
     assert_eq!(unsafe { libc::tcgetattr(slave, &mut t) }, 0, "tcgetattr");
@@ -380,14 +356,11 @@ fn set_lflag(slave: i32, edit: impl FnOnce(&mut libc::tcflag_t)) {
 
 /// A local prompt that reads in canonical mode with ECHO clear (`read -s`,
 /// `sudo`, `ssh`'s passphrase, `getpass`) will never echo the next byte, and
-/// the host reads exactly that off the pty at the key. No mode paints there —
-/// not `always`, and not `adaptive` on a line that already proved it echoes
-/// (`read -n1 -p 'Proceed? '; read -s -p ' Password: '` shares one row).
+/// the host reads exactly that off the pty at the key.
 #[cfg(unix)]
 #[test]
 fn a_tty_that_will_not_echo_is_never_predicted() {
     type Edit = fn(&mut libc::tcflag_t);
-    // `always`: the first keystroke paints unless the tty's verdict stops it.
     let cases: [(&str, Edit, bool); 3] = [
         ("cooked (the kernel echoes)", |_| {}, true),
         (
@@ -408,18 +381,13 @@ fn a_tty_that_will_not_echo_is_never_predicted() {
         assert_eq!(rig.secret_is_painted('h'), paints, "{label}");
         drop(rig);
         drop(sink);
-        // SAFETY: both fds are ours and open; the borrowed-fd sink did not
-        // close the master.
+        // SAFETY: both fds are ours and open; the borrowed-fd sink did not close the master.
         unsafe {
-            // The master first: a slave closed over output its master never read
-            // waits out the tty's drain (0.6 s on macOS).
             libc::close(master);
             libc::close(slave);
         }
     }
 
-    // `adaptive` on a slow link, one row: the shell line, `read -n1`'s echoed
-    // answer, then `read -s` on the same row.
     let (master, slave) = super::typed_kitty_summon_tests::pty_pair_with_lflag(|l| {
         *l &= !(libc::ECHO | libc::ICANON)
     });
@@ -429,10 +397,10 @@ fn a_tty_that_will_not_echo_is_never_predicted() {
     rig.key(press(Key::Named(NamedKey::Enter), Modifiers::empty()));
     rig.feed("\r\nProceed? ");
     rig.present_after(RTT);
-    set_lflag(slave, |l| *l = (*l | libc::ECHO) & !libc::ICANON); // read -n1
+    set_lflag(slave, |l| *l = (*l | libc::ECHO) & !libc::ICANON);
     rig.type_echoed('y');
     rig.feed(" Password: ");
-    set_lflag(slave, |l| *l = (*l | libc::ICANON) & !libc::ECHO); // read -s
+    set_lflag(slave, |l| *l = (*l | libc::ICANON) & !libc::ECHO);
     assert!(
         !rig.secret_is_painted('h'),
         "adaptive: a canonical no-echo read on an echo-proven row was painted"
@@ -441,20 +409,15 @@ fn a_tty_that_will_not_echo_is_never_predicted() {
     drop(sink);
     // SAFETY: as above.
     unsafe {
-        // The master first: a slave closed over output its master never read
-        // waits out the tty's drain (0.6 s on macOS).
         libc::close(master);
         libc::close(slave);
     }
 }
 
-// --- Where a guess is placed and where the cursor is drawn ---------------------
-
 /// Under `ambiguous_width = "wide"` the grid writes `é` two cells wide, so the
 /// press path tells the predictor (`set_ambiguous_width_double`, read off the
 /// focused terminal at the key) and `é` is declined like CJK rather than guessed
-/// one cell where its echo takes two. Under the narrow policy the same press is
-/// a guess (the control), so the wide refusal is the call's doing.
+/// one cell where its echo takes two.
 #[test]
 fn the_press_path_measures_a_glyph_with_the_terminals_ambiguous_width() {
     for wide in [false, true] {
@@ -478,10 +441,6 @@ fn the_press_path_measures_a_glyph_with_the_terminals_ambiguous_width() {
 }
 
 /// The composed present draws the cursor one past the newest guess it PAINTED.
-/// The program left `" 日"` after the prompt and the cursor back on the blank;
-/// `b` is guessed on the blank, `c` on `日`'s lead, which the painter refuses.
-/// One past `c` would be `日`'s right half, under a block cursor; the cursor goes
-/// one past `b` instead, onto the cell `c` will echo on.
 #[test]
 fn the_composed_cursor_never_covers_half_of_a_wide_glyph() {
     let mut rig = Rig::new("always");
@@ -524,10 +483,7 @@ fn the_composed_cursor_never_covers_half_of_a_wide_glyph() {
 
 /// Predictive editing on the press path: a bare `←` on a line that proved it
 /// echoes is handed to the predictor as an edit key (with the cursor row), not
-/// as input it does not model. The first is tracked dark (no motion of the line
-/// has echoed: a cooked tty echoes `^[[D`); once its echo lands, the second shows
-/// at once, as the composed cursor moved with no cell painted. With
-/// `predictive_echo_editing = false` the same arrow ends the epoch as before.
+/// as input it does not model.
 #[test]
 fn an_arrow_on_a_proven_line_shows_once_a_motion_has_echoed() {
     let mut rig = Rig::new("adaptive");
@@ -600,11 +556,7 @@ fn kitty_line_with_an_arrow_in_flight() -> Rig {
 
 /// A lock is no chord to the legacy encoder: `←` with Caps Lock or Num Lock on
 /// still sends `ESC [ D`, so on a proven line it is handed to the predictor as
-/// an edit key. Under Kitty DISAMBIGUATE it goes out with the lock in its
-/// modifier byte (`ESC [ 1 ; 65 D`, `ESC [ 1 ; 129 D`), which no line editor
-/// reads as a bare motion, so there it is input the predictor does not model (it
-/// retires what is in flight). Num Lock as much as Caps Lock: it is on by
-/// default on most Windows keyboards.
+/// an edit key.
 #[test]
 fn a_locked_arrow_is_an_edit_key_unless_kitty_reports_the_lock() {
     let left = |mods| press(Key::Named(NamedKey::ArrowLeft), mods);
@@ -629,9 +581,7 @@ fn a_locked_arrow_is_an_edit_key_unless_kitty_reports_the_lock() {
 /// The keypad's `←` (NumLock off) is the main block's to the legacy encoder
 /// (`encode_navigation_named_legacy` takes `NumpadArrowLeft` with `ArrowLeft`:
 /// `ESC [ D`, DECKPAM or not), so on a proven line it is an edit key and keeps
-/// a typed-ahead line on glass as the main block's does. Under Kitty
-/// DISAMBIGUATE it goes out as its own code (`CSI 57417 u`), which no line
-/// editor reads as a bare motion: input the predictor does not model.
+/// a typed-ahead line on glass as the main block's does.
 #[test]
 fn a_keypad_arrow_is_an_edit_key_unless_kitty_reports_the_keypad() {
     let keypad_left = || press(Key::Named(NamedKey::NumpadArrowLeft), Modifiers::empty());
@@ -654,8 +604,7 @@ fn a_keypad_arrow_is_an_edit_key_unless_kitty_reports_the_keypad() {
 /// An edit key at a local tty that will not echo (canonical, ECHO clear) is
 /// input the predictor does not model, as a glyph is there: the line it would
 /// be placed on proved itself before the echo went off, and the arrow's own
-/// effect is the program's. The control: with the echo on, the same `←` on the
-/// same proven line is an edit op.
+/// effect is the program's.
 #[cfg(unix)]
 #[test]
 fn an_edit_key_at_a_tty_that_will_not_echo_is_not_predicted() {
@@ -676,11 +625,8 @@ fn an_edit_key_at_a_tty_that_will_not_echo_is_not_predicted() {
         );
         drop(rig);
         drop(sink);
-        // SAFETY: both fds are ours and open; the borrowed-fd sink did not
-        // close the master.
+        // SAFETY: both fds are ours and open; the borrowed-fd sink did not close the master.
         unsafe {
-            // The master first: a slave closed over output its master never read
-            // waits out the tty's drain (0.6 s on macOS).
             libc::close(master);
             libc::close(slave);
         }

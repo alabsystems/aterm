@@ -1,24 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm-gui's [`SessionHost`]: a borrowed adapter over the `(term, proxy,
-//! watchers, …)` handles [`dispatch_session`](super::dispatch_session) has
-//! already resolved, so
-//! the verb bodies in `aterm-control` drive the real window with no extra
-//! ownership, allocation or lifetime.
-//!
-//! The terminal accessors go through [`term_lock`], which keeps the debug
-//! lock-hold tripwire on this side of the seam (its `#[track_caller]` location
-//! is this file).
-//!
-//! The fleet half (roster, selector resolution) needs the registry, and
-//! [`SessionHost::session_ended`] the target's `ctx`, which only the dispatcher
-//! holds and passes via [`GuiHost::with_fleet`], the only constructor in a
-//! non-test build. The `cfg(test)` [`GuiHost::new`] serves tests holding a bare
-//! `Terminal`; it declares `roster: false` rather than answering an empty roster
-//! that reads like an empty machine.
-//!
-//! aterm-gui's own `sessions`/`send`/`feed` verbs run their own paths.
+//! aterm-gui's [`SessionHost`]: a borrowed adapter over the `(term, proxy, watchers, …)` handles [`dispatch_session`](super::dispatch_session) has already resolved, so the verb bodies in `aterm-control` drive the real window with no extra ownership, allocation or lifetime.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -36,28 +19,23 @@ use crate::session_watch::{Subscription, Watchers};
 use crate::{SessionCtx, Wake, term_lock};
 
 pub(crate) struct GuiHost<'a> {
-    /// The one session this host serves. Every per-session method refuses any
-    /// other sid, so a sid the fleet-wide `resolve` hands out fails closed.
+    /// The one session this host serves.
     sid: u64,
     term: &'a Arc<Mutex<Terminal>>,
-    /// `None` when there is no event loop to nudge. Production passes `Some`;
-    /// tests run off the main thread, where no `EventLoopProxy` can be built.
+    /// `None` when there is no event loop to nudge.
     proxy: Option<&'a EventLoopProxy<Wake>>,
     /// The served session's watchers, which [`SessionHost::subscribe`] parks on.
     watchers: &'a Arc<Watchers>,
     /// The process registry, for the fleet answers ([`SessionHost::sessions`],
-    /// [`SessionHost::resolve`]). `None` only on [`GuiHost::new`], which reports
-    /// `roster: false`.
+    /// [`SessionHost::resolve`]).
     store: Option<&'a Store>,
     /// The resolved target's context, whose fabric endpoint says whether the
-    /// session has ended. `None` only on [`GuiHost::new`].
+    /// session has ended.
     ctx: Option<&'a SessionCtx>,
 }
 
 impl<'a> GuiHost<'a> {
-    /// A session-scoped host: serves `sid` only and declares that it keeps no
-    /// roster, so its empty `sessions()` is not read as "no sessions exist".
-    /// `cfg(test)` so the shipped binary cannot build one.
+    /// A session-scoped host: serves `sid` only and declares that it keeps no roster, so its empty `sessions()` is not read as "no sessions exist".
     #[cfg(test)]
     pub(crate) fn new(
         sid: u64,
@@ -75,10 +53,7 @@ impl<'a> GuiHost<'a> {
         }
     }
 
-    /// The shipped host: [`GuiHost::new`] plus the registry the roster/selector
-    /// verbs read and the resolved target's context, whose watchers it parks on.
-    /// Both are required so a fleet host cannot answer with an empty roster or
-    /// miss its session's end.
+    /// The shipped host: [`GuiHost::new`] plus the registry the roster/selector verbs read and the resolved target's context, whose watchers it parks on.
     pub(crate) fn with_fleet(
         sid: u64,
         term: &'a Arc<Mutex<Terminal>>,
@@ -103,9 +78,7 @@ impl<'a> GuiHost<'a> {
     }
 }
 
-/// A [`Subscription`] as a [`ChangeWait`]. Owning it in the box preserves the
-/// RAII deregistration: the slot on the session's list lives exactly as long
-/// as the handle.
+/// A [`Subscription`] as a [`ChangeWait`].
 struct SubscriberWait(Subscription);
 
 impl ChangeWait for SubscriberWait {
@@ -140,9 +113,7 @@ impl SessionHost for GuiHost<'_> {
     }
 
     /// The registry snapshot, cloned out before formatting so the store lock is
-    /// never held across a `Terminal` lock. Ascending by `local_id`
-    /// (`SessionStore::snapshot` sorts), the sid order the wire lists. Empty only
-    /// on a session-scoped host, which advertises `roster: false`.
+    /// never held across a `Terminal` lock.
     fn sessions(&self) -> Vec<SessionEntry> {
         let Some(store) = self.store else {
             return Vec::new();
@@ -181,8 +152,6 @@ impl SessionHost for GuiHost<'_> {
         g.by_selector(&selector.into()).map(|h| h.local_id)
     }
 
-    // `sessions`/`resolve` answer fleet-wide, so a caller can hold a sibling's
-    // sid; serving this session's engine for it would be a silent misroute.
     fn with_terminal<R>(&self, sid: u64, f: impl FnOnce(&Terminal) -> R) -> Option<R> {
         self.serves(sid).then(|| f(&term_lock(self.term)))
     }
@@ -192,11 +161,7 @@ impl SessionHost for GuiHost<'_> {
     }
 
     /// Ended once the registry reads the session `Exited` or its fabric
-    /// endpoint is closed. A parked `wait` re-checks this when the session's
-    /// watchers ring, so it reads what each ring's write published: an exit
-    /// rings from the registry's `Exited` write (its `state-change` record),
-    /// before the exit path closes the fabric, and a close's records ring
-    /// from the deregister, after the `Session`'s drop closed it.
+    /// endpoint is closed.
     fn session_ended(&self, sid: u64) -> bool {
         let Some(ctx) = self.ctx.filter(|_| self.serves(sid)) else {
             return false;
@@ -236,21 +201,13 @@ impl SessionHost for GuiHost<'_> {
 
     /// The GUI's one conversion ([`crate::cwd_native::native_path`]), so a
     /// block's `cwd=` names the directory exactly as `cwd`, `meta` and the tab
-    /// strip do. The identity off Windows.
+    /// strip do.
     fn native_cwd<'p>(&self, reported: &'p str) -> std::borrow::Cow<'p, str> {
         crate::cwd_native::native_path(reported)
     }
 }
 
 /// Runs `aterm-control`'s verb matrix against this host, not only `MemoryHost`.
-///
-/// The host under test is built with `proxy: None`: libtest runs tests off the
-/// main thread, where no `EventLoopProxy<Wake>` can be built. That is the only
-/// difference from the shipped host, and it touches two trait methods:
-/// [`SessionHost::request_redraw`] is a no-op and `capabilities().event_loop`
-/// reads false, so nothing here shows a `select` repainting a window.
-/// Everything else is the shipped path: the real engine, `term_lock`,
-/// `Subscription` change-wait, registry snapshot and clipboard.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,8 +219,7 @@ mod tests {
 
     /// What the shipped `GuiHost` claims, declared to the matrix so a host that
     /// dropped a facility cannot pass on the easy arm of each capability-gated
-    /// check. `event_loop` is false only because no test can mint an
-    /// `EventLoopProxy` (see the module doc).
+    /// check.
     const GUI_HOST_PROFILE: HostCapabilities = HostCapabilities {
         frame_source: true,
         event_loop: false,
@@ -337,8 +293,6 @@ mod tests {
         let handle = registered(0, &term);
         store.write().unwrap().register(handle.clone());
         let host = GuiHost::with_fleet(0, &term, None, &store, &handle.ctx);
-        // Equality, not the declared run's floor: a capability gained or lost
-        // must be restated in the profile.
         assert_eq!(host.capabilities(), GUI_HOST_PROFILE);
 
         assert_eq!(cmd_select(&host, 0, "0 0 0 4"), "OK\n");
@@ -358,8 +312,6 @@ mod tests {
     }
 
     /// The read-only subset (safe against a real window in use) writes nothing.
-    /// Witnessed with the session's text, since its shape checks alone pass on
-    /// an empty `Terminal`.
     #[test]
     fn the_read_only_subset_leaves_the_gui_host_untouched() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
@@ -394,7 +346,6 @@ mod tests {
         store.write().unwrap().register(sibling.clone());
         let host = GuiHost::with_fleet(0, &term, None, &store, &handle.ctx);
 
-        // The sibling IS resolvable — this host just does not serve it.
         assert_eq!(host.resolve(Selector::Local(1)), Some(1));
         assert_eq!(host.resolve(Selector::Id(sibling.sid.as_str())), Some(1));
         assert!(host.with_terminal(1, |t: &Terminal| t.rows()).is_none());
@@ -402,11 +353,8 @@ mod tests {
             host.with_terminal_mut(1, |t: &mut Terminal| t.text_selection_mut().clear())
                 .is_none()
         );
-        // …and the verbs on top of it answer the wire's fail-closed error.
         assert_eq!(cmd_selection(&host, 1), "ERR no such session\n");
         assert_eq!(cmd_select(&host, 1, "clear"), "ERR no such session\n");
-        // The served sid still works, so the refusal is the sid check and not a
-        // dead host.
         assert!(cmd_selection(&host, 0).starts_with("OK "));
     }
 
@@ -438,26 +386,18 @@ mod tests {
             assert!(json.contains(r#""cwd":"/C:/Users//m6-an""#), "{json}");
         }
 
-        // cmd's `633;P;Cwd=$P` is native already: idempotent.
         let (listed, _) = blocks_cwd(b"\x1b]633;P;Cwd=C:\\Windows\\Temp\x07");
         assert!(listed.contains(r" cwd=C:\Windows\Temp "), "{listed}");
 
-        // A WSL/SSH shell's POSIX cwd is nobody's drive path.
         let (listed, _) = blocks_cwd(b"\x1b]7;file:///home/user/proj\x07");
         assert!(listed.contains(" cwd=/home/user/proj "), "{listed}");
     }
 
-    /// A cmd block's cwd is the directory its command ran in. cmd reports its
-    /// cwd from the prompt (`633;P;Cwd=$P`) and the engine files it under the
-    /// block in progress, so the injection sends it after `133;A` opens the new
-    /// block (pinned by `aterm-shell-integration`'s
-    /// `test_prepare_cmd_wraps_the_prompt_with_marks_and_cwd`). The reverse
-    /// order labels a `cd` block with its destination.
+    /// A cmd block's cwd is the directory its command ran in.
     #[test]
     fn a_cmd_block_cwd_is_where_its_command_ran() {
         use aterm_control::selection::cmd_blocks;
         let cwds = |cwd_after_start: bool| {
-            // One rendered cmd prompt, as cmd writes it for `$e]…$e\`.
             let prompt = |dir: &str| {
                 let start = "\x1b]133;A\x1b\\";
                 let cwd = format!("\x1b]633;P;Cwd={dir}\x1b\\");
@@ -484,13 +424,11 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(cwds(true), [r"C:\Users\m6-an\aterm", r"C:\Windows\Temp"]);
-        // Negative control: the reverse order.
         assert_eq!(cwds(false), [r"C:\Windows\Temp", r"C:\Windows\Temp"]);
     }
 
     /// The roster is the registry's, ascending by sid, with each session's stable
-    /// id. A session-scoped host says `roster: false` and lists nothing, which is
-    /// not "no sessions exist".
+    /// id.
     #[test]
     fn the_roster_is_the_registry_and_an_absent_one_says_so() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
@@ -499,8 +437,6 @@ mod tests {
         let store = session_store::new_store();
         let handle = registered(0, &term);
         let sibling = registered(1, &sibling_term);
-        // Registered out of order: the wire's ascending listing is the store's
-        // doing, not the insertion order's.
         store.write().unwrap().register(sibling.clone());
         store.write().unwrap().register(handle.clone());
         let host = GuiHost::with_fleet(0, &term, None, &store, &handle.ctx);
@@ -517,7 +453,6 @@ mod tests {
         assert!(!scoped.capabilities().roster);
         assert!(scoped.sessions().is_empty());
         assert_eq!(scoped.resolve(Selector::Local(0)), None);
-        // Still serves its session: no index is not no session.
         assert!(cmd_selection(&scoped, 0).starts_with("OK "));
     }
 
@@ -551,8 +486,6 @@ mod tests {
                 answered.send(("wait", reply)).unwrap();
             })
         };
-        // Parked once its subscriber is registered, so the close (not an entry check)
-        // answers it.
         aterm_spec::wait::until_within(
             aterm_spec::wait::MUST_HAPPEN,
             "`wait` parks on the tab",
@@ -561,7 +494,6 @@ mod tests {
         app.close_session_by_id(id).expect("the tab closes");
         let mut replies = Vec::new();
         for _ in 0..2 {
-            // A hang detector, not a latency budget: the close is the event.
             replies.push(
                 answers
                     .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
@@ -629,7 +561,6 @@ mod tests {
         );
         let mut replies = Vec::new();
         for _ in 0..2 {
-            // A hang detector, not a latency budget: the exit is the event.
             replies.push(
                 answers
                     .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
@@ -649,13 +580,7 @@ mod tests {
         assert!(app.pool.get(id).is_some(), "the held pane stays");
     }
 
-    /// THE EXIT'S RING ENDS A PARKED `wait` BY ITSELF. The ring is the
-    /// registry's `Exited` write (its `state-change` record), and the exit
-    /// path closes the fabric only after it, so a `wait` that ring wakes must
-    /// answer from the state it published. Here the fabric never closes: the
-    /// state write alone answers `ERR exited`. A predicate on the fabric alone
-    /// finds the endpoint open, parks again, and nothing rings after an exit
-    /// under `--hold`.
+    /// THE EXIT'S RING ENDS A PARKED `wait` BY ITSELF.
     #[test]
     fn an_exited_state_alone_ends_a_parked_wait() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
@@ -680,7 +605,6 @@ mod tests {
             .write()
             .unwrap()
             .set_state(0, session_store::SessionState::Exited);
-        // A hang detector, not a latency budget: the exit is the event.
         assert_eq!(
             answer
                 .recv_timeout(aterm_spec::wait::MUST_HAPPEN)

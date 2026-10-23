@@ -3,24 +3,8 @@
 // Author: Andrew Yates
 
 //! OSC 133 / OSC 633 shell-integration capability-nonce authority.
-//!
-//! A file piped through the PTY can write a full OSC 133 A/B/C/D cycle (or the OSC 633
-//! variants) and forge prompt marks, exit statuses and prompt callbacks. So emissions can
-//! be required to carry a nonce committed out of band: the host generates a 32-byte CSPRNG
-//! nonce, installs it via [`super::Terminal::authorize_shell_integration`], and passes it to
-//! the shell (`ATERM_SHELL_NONCE`), whose preamble adds `id=<64-hex>` to every OSC 133/633
-//! sequence.
-//!
-//! With [`aterm_types::TerminalModes::require_shell_integration_nonce`] set, every A/B/C/D
-//! (and 633 E/F/G/H/P) without a matching `id=` is dropped: no callback, no state change,
-//! no response. `id=` may sit at any parameter index from 2 (OSC 633 sub-ops carry payload
-//! ahead of it); hex is case-insensitive and compared in constant time. The requirement
-//! defaults to off so third-party integrations keep working; hosts that ship a nonced
-//! preamble turn it on at session init.
 
-/// Host-side authorization state for the OSC 133/633 capability nonce. Handlers reach it
-/// only through the `shell_integration_auth` borrow slot, and use only
-/// [`ShellIntegrationAuth::verify_nonce`].
+/// Host-side authorization state for the OSC 133/633 capability nonce.
 #[derive(Default, Debug)]
 pub(crate) struct ShellIntegrationAuth {
     /// Host-authorized nonce, or `None` if not yet authorized.
@@ -76,8 +60,7 @@ impl ShellIntegrationAuth {
         self.typed_prior = None;
     }
 
-    /// [`Self::authorize`] for a nonce the shell has not taken yet (`awaiting_first_mark`):
-    /// it verifies marks now and is in use from the first mark that carries it.
+    /// [`Self::authorize`] for a nonce the shell has not taken yet (`awaiting_first_mark`).
     #[inline]
     pub(crate) const fn authorize_on_first_mark(&mut self, nonce: [u8; 32]) {
         self.nonce = Some(nonce);
@@ -85,9 +68,7 @@ impl ShellIntegrationAuth {
         self.typed_prior = None;
     }
 
-    /// [`Self::authorize_on_first_mark`] for a typed re-key, which can be taken back: the
-    /// authorization it replaces is kept (`typed_prior`) until the host settles the key. A
-    /// second typed re-key before the first is settled keeps the first one's prior.
+    /// [`Self::authorize_on_first_mark`] for a typed re-key, which can be taken back.
     #[inline]
     pub(crate) const fn authorize_rekey(&mut self, nonce: [u8; 32]) {
         let prior = match self.typed_prior.take() {
@@ -111,10 +92,8 @@ impl ShellIntegrationAuth {
             && self.nonce.as_ref().is_some_and(|n| n == nonce)
     }
 
-    /// Take back the typed re-key `nonce`, restoring the authorization it replaced, so a key
-    /// whose line never ran authorizes nothing. `false`, changing nothing, when `nonce` is
-    /// not the pending typed re-key: a mark already carried it (a working key is never
-    /// moved), another authorization replaced it, or it was settled.
+    /// Take back the typed re-key `nonce`, restoring the authorization it replaced, so a key whose
+    /// line never ran authorizes nothing.
     #[inline]
     pub(crate) fn withdraw_rekey(&mut self, nonce: &[u8; 32]) -> bool {
         if !self.rekey_pending(nonce) {
@@ -127,10 +106,7 @@ impl ShellIntegrationAuth {
         true
     }
 
-    /// Keep the typed re-key `nonce`: its file was consumed, so the shell holds the key, and
-    /// the authorization it replaced is forgotten. The key stays not-in-use until its first
-    /// mark, as after [`Self::authorize_on_first_mark`]. `false`, changing nothing, when
-    /// `nonce` is not the pending typed re-key.
+    /// Keep the typed re-key `nonce`.
     #[inline]
     pub(crate) fn settle_rekey(&mut self, nonce: &[u8; 32]) -> bool {
         if !self.rekey_pending(nonce) {
@@ -140,12 +116,7 @@ impl ShellIntegrationAuth {
         true
     }
 
-    /// The authorized nonce once the shell uses it: always for one set by [`Self::authorize`]
-    /// (at spawn or from a handoff carry), and for one set by
-    /// [`Self::authorize_on_first_mark`] only after a mark signed with it arrived. This is
-    /// what `status integration=` reports and what the handoff carry takes
-    /// ([`super::Terminal::checkpoint_carry`]), so a re-key the shell never took is not
-    /// carried.
+    /// The authorized nonce once the shell uses it.
     #[must_use]
     #[inline]
     pub(crate) const fn nonce_in_use(&self) -> Option<[u8; 32]> {
@@ -170,17 +141,13 @@ impl ShellIntegrationAuth {
         self.verified_count
     }
 
-    /// Verify a claimed nonce: `true` iff a nonce is authorized and the first `id=<hex>` in
-    /// `params` (split on `;`) from index 2 is 64 digits decoding to it (constant-time).
-    /// Otherwise count a drop and return `false`.
+    /// Verify a claimed nonce.
     pub(crate) fn verify_nonce(&mut self, params: &[&[u8]]) -> bool {
         let Some(expected) = self.nonce.as_ref() else {
             self.dropped_count = self.dropped_count.saturating_add(1);
             return false;
         };
 
-        // Params 0 and 1 are the command number and subcommand; the nonce may sit at any
-        // index from 2 (OSC 633 E/F/G/H/P carry payload ahead of it).
         let Some(claimed_hex) = find_nonce_hex(params) else {
             self.dropped_count = self.dropped_count.saturating_add(1);
             return false;
@@ -192,8 +159,6 @@ impl ShellIntegrationAuth {
         };
 
         if aterm_digest::ct_eq(&claimed, expected) {
-            // The shell has the key: a re-key it had not taken is in use now, and a typed
-            // one is past taking back.
             self.awaiting_first_mark = false;
             self.typed_prior = None;
             self.verified_count = self.verified_count.saturating_add(1);
@@ -205,10 +170,9 @@ impl ShellIntegrationAuth {
     }
 
     /// [`Self::verify_nonce`] behind the policy verdict `gate`
-    /// ([`super::policy_gates::PolicyState::shell_integration_gate`]): `Deny` (a rule with
-    /// a response other than `Execute`) drops and counts; `Allow` and `Fallback` (no policy
-    /// or no matching rule) still require a valid nonce. The probe is keyed per subcommand
-    /// ([`probe_subcommand`]), since a policy can name `"OSC 133;C"`.
+    /// ([`super::policy_gates::PolicyState::shell_integration_gate`]): `Deny` (a rule with a
+    /// response other than `Execute`) drops and counts; `Allow` and `Fallback` (no policy or no
+    /// matching rule) still require a valid nonce.
     #[inline]
     pub(super) fn verify_nonce_with_engine(
         &mut self,
@@ -226,9 +190,7 @@ impl ShellIntegrationAuth {
     }
 }
 
-/// The subcommand glyph the OSC 133/633 policy probe uses: `params[1]` when
-/// it is valid UTF-8, `"A"` otherwise (including when absent). Shared with
-/// [`super::policy_gates`] so the compiled table uses the same key.
+/// The subcommand glyph the OSC 133/633 policy probe uses.
 #[must_use]
 #[inline]
 pub(super) fn probe_subcommand<'a>(params: &'a [&'a [u8]]) -> &'a str {
@@ -239,8 +201,8 @@ pub(super) fn probe_subcommand<'a>(params: &'a [&'a [u8]]) -> &'a str {
 }
 
 /// The OSC 133 / OSC 633 policy probe (`command` `133` or `633`, `subcommand` from
-/// [`probe_subcommand`]): the one definition, shared by the compiled gate table and its
-/// live fallback.
+/// [`probe_subcommand`]): the one definition, shared by the compiled gate table and its live
+/// fallback.
 #[must_use]
 #[inline]
 pub(super) fn probe_shell_integration(

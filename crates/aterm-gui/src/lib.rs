@@ -15686,9 +15686,7 @@ impl App {
             .retain(|sid| pool.get(*sid).is_some());
         let cwd_changed = {
             let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
-            let before = timeline.high_id();
-            timeline.record_cwd_change(live_cwd.as_deref());
-            let cwd_moved = timeline.high_id() != before;
+            let cwd_moved = timeline.record_cwd_change(live_cwd.as_deref());
             let shown = crate::tab_label::informative(&live_title).to_string();
             let _ = timeline.record_title(&shown);
             let _ = timeline.slog_take_wake();
@@ -17130,6 +17128,29 @@ impl App {
         match ev {
             Wake::ProgramResolved { session } => {
                 self.session_status.note_program_answered(session);
+                let disable = self.pool.get(session).is_some_and(|entry| {
+                    let unset = entry
+                        .ctx
+                        .meta
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .autopilot_word()
+                        .is_none();
+                    unset
+                        && entry
+                            .ctx
+                            .timeline
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .leader_no_harness()
+                });
+                if disable {
+                    let _ = self.set_session_autopilot(
+                        session,
+                        Some(aterm_agent::supervise::Autopilot::Off),
+                        crate::autopilot::Surface::Border,
+                    );
+                }
             }
             Wake::QueuedKeyDelivered { session, at } => {
                 let now = Instant::now();

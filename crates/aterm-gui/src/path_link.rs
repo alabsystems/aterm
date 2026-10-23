@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 /// Sentinel char for a wide glyph's continuation cell in [`find_path_span`].
 pub(crate) const WIDE_CONTINUATION: char = '\0';
 
-/// The longest token read as a path, in cells. A citation longer than this
+/// The longest token read as a path, in cells.
 const MAX_TOKEN_CELLS: usize = 1024;
 
 /// Plain-text file citation span found in a row ([`find_path_span`]).
@@ -30,6 +30,7 @@ pub(crate) struct PathSpan {
 }
 
 /// Characters that end a path token: whitespace, the quotes and brackets a
+/// citation is wrapped in, and the pipes of a table.
 fn is_delimiter(ch: char) -> bool {
     ch.is_whitespace()
         || matches!(
@@ -52,6 +53,7 @@ fn positive(digits: &str) -> Option<u32> {
 }
 
 /// Split a token into `(path, line, col)`: `path:L[:C]` or `path#L<l>[C<c>]
+/// [-L<m>[C<n>]]`.
 fn split_suffix(token: &str) -> (&str, Option<u32>, Option<u32>) {
     if let Some(hash) = token.rfind("#L") {
         let frag = &token[hash + 2..];
@@ -78,6 +80,7 @@ fn split_suffix(token: &str) -> (&str, Option<u32>, Option<u32>) {
 }
 
 /// Whether `path` reads as a file path at all: it has a separator or an
+/// extension, and a letter or digit somewhere.
 fn looks_like_path(path: &str) -> bool {
     if path.is_empty() || !path.chars().any(char::is_alphanumeric) {
         return false;
@@ -156,6 +159,15 @@ pub(crate) enum PathRefusal {
 }
 
 /// Characters that may reorder, hide or impersonate text, by general rule
+/// rather than by list of known tricks: every control (general category `Cc`,
+/// [`char::is_control`]), every format character (`Cf`: the bidi marks,
+/// embeddings, overrides and isolates, the zero-width characters, the word
+/// joiner and invisible operators, the soft hyphen, the Arabic letter mark,
+/// the BOM, the tag characters, …), and every other code point Unicode says
+/// a renderer draws as nothing (`Default_Ignorable_Code_Point`: the
+/// combining grapheme joiner, the Hangul fillers, the Khmer inherent vowels,
+/// the Mongolian free variation selectors, the variation selectors and their
+/// supplement, and the unassigned rest of the tag plane).
 fn is_hostile_char(ch: char) -> bool {
     ch.is_control()
         || matches!(
@@ -372,6 +384,7 @@ impl PathTarget {
 }
 
 /// What the filesystem is asked about one citation: the printed path and the
+/// directories it is read against.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Question {
     raw: String,
@@ -390,9 +403,12 @@ impl Question {
 }
 
 /// What a look found: the canonical file and the caption's name for it (no
+/// line), or why it opens nothing.
 type Found = Result<(PathBuf, String), PathRefusal>;
 
 /// The look itself: [`resolve`], then the caption's name: the file where it
+/// really is (`~/…` under home, else in full), never relative to one of the
+/// session's directories, which the band does not show.
 fn look(question: &Question) -> Found {
     let path = resolve(&question.raw, &question.bases, question.home.as_deref())?;
     let name = display(&path, None, None, None, question.home.as_deref());
@@ -403,9 +419,11 @@ fn look(question: &Question) -> Found {
 pub(crate) const UI_WAIT: Duration = Duration::from_millis(25);
 
 /// How long a known answer is reused: a pointer resting on a citation while
+/// output streams asks once, not on every frame.
 const LOOK_FRESH: Duration = Duration::from_secs(2);
 
 /// Looks in flight at once, at most: a hung mount strands no more threads than
+/// this, and a citation asked past it is no link until one comes back.
 const LOOKS_IN_FLIGHT: usize = 4;
 
 /// Answers kept, at most; the stale ones go first.
@@ -554,7 +572,7 @@ pub(crate) fn display(
     with_line(text, line, col)
 }
 
-/// `path` as a person reads it. On Windows without the `\\?\` prefix
+/// `path` as a person reads it.
 fn plain_text(path: &Path) -> String {
     let text = path.to_string_lossy();
     if cfg!(windows) {

@@ -28,6 +28,12 @@ impl ReportedCwd for Terminal {
 }
 
 /// Whether a report naming `host` (`None`: it named none, or `localhost`)
+/// was made on THIS machine: one naming no host was, and so was one naming a
+/// host `names` calls this machine's ([`crate::tab_label::names_this_machine`]:
+/// its DNS name, in any case) or, on Windows, its NetBIOS name `netbios` —
+/// what aterm's PowerShell integration writes in its URI
+/// (`[Environment]::MachineName`: the DNS name upper-cased and cut to fifteen
+/// characters, so a longer DNS name is not it).
 fn reported_here(host: Option<&str>, names: impl Fn(&str) -> bool, netbios: Option<&str>) -> bool {
     host.is_none_or(|host| {
         names(host)
@@ -38,6 +44,10 @@ fn reported_here(host: Option<&str>, names: impl Fn(&str) -> bool, netbios: Opti
 }
 
 /// This machine's NetBIOS name, read from the OS
+/// ([`aterm_uds::process::netbios_host_name`]: the name
+/// `[Environment]::MachineName` answers, whatever this process's environment
+/// holds — a window started with an environment of its own may have no
+/// `%COMPUTERNAME%`), read once: it changes only at a restart.
 fn netbios_name() -> Option<&'static str> {
     #[cfg(windows)]
     {
@@ -99,6 +109,8 @@ pub(crate) fn native_path_reported(path: &str, here: impl FnOnce() -> bool) -> C
 }
 
 /// The drive letter and the rest (from its separator on, or empty) of an
+/// MSYS/Cygwin drive path — `/c/…` or `/cygdrive/c/…` — or `None` for any
+/// other string.
 #[cfg(windows)]
 fn msys_drive(path: &str) -> Option<(char, &str)> {
     let tail = path
@@ -255,6 +267,8 @@ mod tests {
     }
 
     /// THIS MACHINE BY ANY OF ITS NAMES: a report naming no host, its DNS
+    /// name (the names the strip knows) or — what aterm's PowerShell
+    /// integration writes — its NetBIOS name, in any case, is this machine's.
     #[test]
     fn a_report_is_this_machines_by_any_of_its_names() {
         use super::reported_here;

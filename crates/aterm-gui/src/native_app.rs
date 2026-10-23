@@ -275,6 +275,7 @@ impl EditHeader {
     }
 
     /// The done part's spoken label: its visible words first, as every
+    /// control's name holds what it paints.
     fn done_label(&self) -> String {
         match (self.waiter, self.for_word.as_deref()) {
             (EditWaiter::Waiting, Some(program)) => {
@@ -386,7 +387,7 @@ pub(crate) enum RecoveryCapability {
     Document {
         kind: AppKind,
         uri: String,
-        /// Preserve the privileged config-editor reducer on Retry. Treating
+        /// Preserve the privileged config-editor reducer on Retry.
         config_editor: bool,
     },
 }
@@ -1357,6 +1358,7 @@ mod recovery_tests {
     use aterm_spec::interp::{State, admits};
 
     /// A recovery page whose diagnostics span at least three pages at every target size,
+    /// with one unbroken token wider than the widest column so it hard-breaks mid-token.
     fn recovery(capability: Option<RecoveryCapability>) -> RecoveryApp {
         let mut metadata = (0..60)
             .map(|line| format!("diagnostic-{line:03}=bounded detail\n"))
@@ -1847,6 +1849,7 @@ pub(crate) enum TextInputEvent {
     Preedit {
         text: String,
         /// Platform caret/selection within `text`, in UTF-8 bytes (winit's
+        /// convention).
         selection: Option<std::ops::Range<usize>>,
     },
     Commit(String),
@@ -2228,6 +2231,9 @@ pub(crate) enum AppEffect {
         patch: ConfigPatch,
         reply: ReplyToken<ConfigPatchOutcome>,
         /// The view's own writes still on their way when it made this one,
+        /// to a key this one writes too: it shows their values and composed
+        /// this one over them, so its expectations are theirs
+        /// ([`UpdateCx::config_patch`]).
         follows: Vec<OperationId>,
     },
     ConfigUndo {
@@ -2565,6 +2571,7 @@ pub(crate) struct NativeRuntime {
     view_lifecycles: BTreeMap<ViewId, crate::front_content::ViewLifecycle>,
     service_generations: BTreeMap<ServiceId, u64>,
     /// Process-global failure/recovery projection for the config and theme
+    /// watcher.
     config_watch_status: crate::config_watcher::WatchStatusState,
     next_operation: u64,
 }
@@ -2774,6 +2781,22 @@ impl NativeRuntime {
         changed
     }
 
+    pub(crate) fn preset_system_state_vault_sync(&mut self) -> bool {
+        let preset =
+            self.update_system_state(crate::system_state::SystemStateApp::preset_vault_sync);
+        if preset {
+            self.retire_system_state_review();
+        }
+        preset
+    }
+
+    pub(crate) fn system_state_shows_vault_sync(&self) -> bool {
+        self.instances.values().any(|app| match app {
+            NativeApp::SystemState(state) => state.shows_vault_sync(),
+            _ => false,
+        })
+    }
+
     pub(crate) fn accept_system_state_apply(&mut self, plan: aterm_types::macos_setup::Plan) {
         if self.update_system_state(|state| state.apply_accepted(plan)) {
             self.retire_system_state_review();
@@ -2854,6 +2877,7 @@ impl NativeRuntime {
     }
 
     /// Every Settings view renders from the projection just published: each
+    /// one's content revision moves ([`AppViewState::touch`]).
     fn touch_settings_views(&mut self) {
         for state in self.views.values_mut() {
             if matches!(state, AppViewState::Settings(_)) {
@@ -3604,6 +3628,8 @@ impl NativeRuntime {
     }
 
     /// A reply token is one routing proof, not two unrelated live handles: owner and
+    /// sink identity/generation stay coupled so a result can never be redirected into
+    /// another live sink merely because both halves pass their own lifecycle checks.
     fn owner_matches_sink(owner: WorkOwner, sink: CompletionSink) -> bool {
         match (owner, sink) {
             (
@@ -5341,7 +5367,7 @@ fn markdown_range_from_action(action: &str) -> Option<std::ops::Range<usize>> {
     Some(start.parse().ok()?..end.parse().ok()?)
 }
 
-/// Resolve only the link rows intersecting a materialized source window. Links
+/// Resolve only the link rows intersecting a materialized source window.
 fn markdown_links_in_range(
     document: &crate::native_markdown::MarkdownDocument,
     source: std::ops::Range<usize>,
@@ -5457,6 +5483,7 @@ fn bounded_markdown_block_text(block: &crate::native_markdown::MarkdownBlock) ->
 }
 
 /// The reader's `command`-modifier chord for `key`, spelled the way this platform's
+/// keyboard reaches it.
 fn reader_command_chord(key: &str) -> String {
     let modifier = if cfg!(target_os = "macos") {
         "Cmd-"
@@ -5476,7 +5503,7 @@ fn bounded_markdown_text(text: &str, limit: usize) -> String {
     output
 }
 
-/// Bounded visual label projection. Unlike byte caps used for clipboard and
+/// Bounded visual label projection.
 fn bounded_markdown_label(text: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
@@ -5490,6 +5517,7 @@ fn bounded_markdown_label(text: &str, max_chars: usize) -> String {
 }
 
 /// Width for a centered Markdown toolbar label, measured with the UI face and type step
+/// `native_ui` paints, so labels do not ellipsize at accessibility text scales.
 fn markdown_toolbar_label_width(label: &str, minimum: f32, text_scale: f32) -> f32 {
     let scale = if text_scale.is_finite() && text_scale > 0.0 {
         text_scale.clamp(0.85, 2.0)
@@ -5501,7 +5529,7 @@ fn markdown_toolbar_label_width(label: &str, minimum: f32, text_scale: f32) -> f
         .max(minimum)
 }
 
-/// Filename-like chrome keeps both identity-bearing ends. A long document title
+/// Filename-like chrome keeps both identity-bearing ends.
 fn bounded_middle_label(text: &str, max_chars: usize) -> String {
     bounded_middle_label_from_graphemes(&text.graphemes().collect::<Vec<_>>(), max_chars)
 }
@@ -5525,6 +5553,7 @@ fn bounded_middle_label_from_graphemes(graphemes: &[&str], max_chars: usize) -> 
 }
 
 /// Fit filename-like chrome to a pixel budget with the face metrics used to paint it,
+/// keeping both identity-bearing ends.
 fn bounded_middle_label_to_width(text: &str, max_width: f32, px: f32) -> String {
     bounded_middle_label_to_width_for_face(text, max_width, px, crate::widget::TextFace::UiBold)
 }
@@ -5579,6 +5608,7 @@ pub(crate) struct EditorApp {
     config_analysis: Option<crate::native_config_language::ConfigAnalysis>,
     config_analysis_revision: u64,
     /// Exact source/environment generation admitted to the off-thread config analysis
+    /// lane.
     config_host_requested_revision: Option<(u64, u64)>,
     config_assist_cache: std::cell::RefCell<
         Vec<(
@@ -5591,6 +5621,7 @@ pub(crate) struct EditorApp {
 }
 
 /// `(document id, document seq, line-start index)`: the memo behind
+/// [`EditorApp::line_index`].
 type LineIndexMemo = Option<(u64, u64, Option<std::sync::Arc<[usize]>>)>;
 
 impl EditorApp {
@@ -6887,7 +6918,7 @@ fn command_palette_status(matches: usize, compact: bool) -> String {
     }
 }
 
-/// Scanning form: derives the caret's line by walking the document. Kept for
+/// Scanning form: derives the caret's line by walking the document.
 #[cfg(test)]
 fn editor_cursor_label(text: &str, view: &crate::native_editor::EditorBufferView) -> String {
     editor_cursor_label_with(&crate::native_editor::EditorLines::scanning(text), view)
@@ -7834,6 +7865,7 @@ mod markdown_reader_tests {
     }
 
     /// Page keys and the visible buttons move through the same reading body,
+    /// not the whole tab.
     #[test]
     fn markdown_page_keys_reach_the_rendered_button_targets_in_every_mode() {
         let paragraph = "A paragraph with enough words to wrap differently in a narrow reader, \
@@ -8085,6 +8117,11 @@ mod markdown_reader_tests {
     }
 
     /// The config editor's problem buttons compile at every width, each
+    /// named by the words it paints ("Prev Issue", "Prev", "!›"): the UI
+    /// compiler refuses a button whose painted words are not in its name
+    /// ([`crate::native_ui::visible_label_in_name`]), and the wide "Prev
+    /// Issue" / "Next Issue" were named "Previous config problem" and "Next
+    /// config problem", which no test compiled.
     #[test]
     fn config_problem_buttons_compile_at_every_width() {
         let source = "future_first_setting = 1\nfuture_second_setting = 2\n";
@@ -8180,6 +8217,8 @@ mod markdown_reader_tests {
     }
 
     /// The caret line is painted whole above the footer: caret reveal counts
+    /// only the rows shown whole, never the part row the footer cuts (or the
+    /// reveal-ahead row under it).
     #[test]
     fn the_caret_line_is_painted_whole_above_the_footer() {
         let mut source = String::new();
@@ -8227,6 +8266,8 @@ mod markdown_reader_tests {
     }
 
     /// A resting caret's help line is a panel of its own height with no row
+    /// under it (no "Nothing to suggest here"), so the file keeps that room;
+    /// how to open the list is said on the help line itself.
     #[test]
     fn resting_help_is_one_line_with_no_row_under_it() {
         let source = "gpu = true\n";
@@ -8274,6 +8315,9 @@ mod markdown_reader_tests {
     }
 
     /// The Manual's landing frame at a default 80x24 window (viewport 744x420), caret at
+    /// Ln 1 Col 1 with nothing typed or asked for: the help line shows but no suggestion
+    /// list, the edited file gets most of the height, and the config's error sits on a
+    /// painted row.
     #[test]
     fn manual_landing_paints_the_config_file_not_only_its_completion_list() {
         let mut source = String::from("theme = \"Draculla\"\nbidi = \"sidewayz\"\n");
@@ -8460,6 +8504,12 @@ mod markdown_reader_tests {
     }
 
     /// THE EDITOR TOOLBAR IS ONE MEASURED PLAN IN WHOLE WORDS: at every
+    /// width from a wide window to a phone-width one, with and without config
+    /// problems and a disk conflict's Reload, every button paints whole words
+    /// from the toolbar's own vocabulary at its own width (no "‹!", no "…",
+    /// no shared-slot squeeze); the rows the view draws are the rows the
+    /// metrics count; and the file's rect is the one the host sizes the caret
+    /// for.
     #[test]
     fn the_editor_toolbar_is_one_measured_plan_in_whole_words() {
         const WORDS: [&str; 11] = [

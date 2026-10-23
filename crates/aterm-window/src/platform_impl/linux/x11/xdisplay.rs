@@ -4,16 +4,6 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/xdisplay.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE. (Dropped the last-seen
-// server timestamp cache: its one reader was the deleted startup-notification flow. A broken
-// connection ends the event loop instead of the process: `install_io_error_exit_handler`.
-// The libraries, the XCB connection under Xlib's display and the resource database are
-// first-party `aterm-x11`'s, where upstream used x11-dl and x11rb:
-// docs/AUDIT-third-party-2026-10-15.md, LW.7. With no XSETTINGS manager there is no window
-// to watch, and none is asked for: upstream selected events on window 0 and took the
-// BadWindow, which the lane's X11 wire trace showed on every start, X11-TRACE. Where the server
-// has SYNC, it is initialised for the windows' resize sync counters, `sync_request.rs`.)
-
 use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::OsString;
@@ -36,8 +26,7 @@ use super::monitor::MonitorHandle;
 use super::util::CursorFollow;
 use super::{VoidCookie, X11Error};
 
-/// The XKEYBOARD extension's name; aterm-x11 encodes none of its requests (Xlib's
-/// `XkbSelectEvents` selects its events), so only its event base is looked up.
+/// The XKEYBOARD extension's name; aterm-x11 encodes none of its requests (Xlib's `XkbSelectEvents` selects its events), so only its event base is looked up.
 pub const XKB_EXTENSION_NAME: &[u8] = b"XKEYBOARD";
 
 /// A connection to an X server.
@@ -45,21 +34,14 @@ pub struct XConnection {
     pub xlib: &'static ffi::Xlib,
     pub xcursor: &'static ffi::Xcursor,
 
-    // TODO(notgull): I'd like to remove this, but apparently Xlib and Xinput2 are tied together
-    // for some reason.
     pub xinput2: &'static ffi::Xi,
 
     pub display: *mut ffi::Display,
 
     /// The XCB connection under the display, borrowed from Xlib.
-    ///
-    /// The `Option` ensures that we can drop it before we close the `Display`.
     xcb: Option<aterm_x11::Connection>,
 
     /// The atoms used by `winit`.
-    ///
-    /// This is a large structure, so I've elected to Box it to make accessing the fields of
-    /// this struct easier. Feel free to unbox it if you like kicking puppies.
     atoms: Box<Atoms>,
 
     /// The index of the default screen.
@@ -80,9 +62,7 @@ pub struct XConnection {
     /// XInput's major opcode.
     xinput_major: u8,
 
-    /// GLX's major opcode, where the server has GLX: an X error a GLX request raised is the GL
-    /// renderer's, which reads its failures from GLX's own answers, so the error handler keeps
-    /// it out of `latest_error`, where a later window call would take it for its own.
+    /// GLX's major opcode, where the server has GLX: an X error a GLX request raised is the GL renderer's, which reads its failures from GLX's own answers, so the error handler keeps it out of `latest_error`, where a later window call would take it for its own.
     pub glx_major: Option<u8>,
 
     /// SYNC's major opcode, where the server has SYNC 3.0 or later: each window then offers its
@@ -94,12 +74,10 @@ pub struct XConnection {
 
     pub latest_error: Mutex<Option<XError>>,
     pub cursor_cache: Mutex<HashMap<CursorIcon, ffi::Cursor>>,
-    /// The last resource id admitted for a DND conversion. The display outlives event loops:
-    /// a later loop must not reuse a requestor an earlier source still names.
+    /// The last resource id admitted for a DND conversion.
     dnd_requestor_high: AtomicU32,
 
-    /// How the cursors follow the resource database's theme and size
-    /// (`follow_cursor_settings`).
+    /// How the cursors follow the resource database's theme and size (`follow_cursor_settings`).
     pub(crate) cursor_follow: Mutex<CursorFollow>,
 }
 
@@ -110,7 +88,6 @@ pub type XErrorHandler = ffi::XErrorHandler;
 
 impl XConnection {
     pub fn new(error_handler: XErrorHandler) -> Result<XConnection, XNotSupported> {
-        // opening the libraries
         let xlib = ffi::xlib().map_err(aterm_x11::Error::Load)?;
         let xcursor = ffi::xcursor().map_err(aterm_x11::Error::Load)?;
         let xinput2 = ffi::xi().map_err(aterm_x11::Error::Load)?;
@@ -118,7 +95,6 @@ impl XConnection {
         unsafe { (xlib.XInitThreads)() };
         unsafe { (xlib.XSetErrorHandler)(error_handler) };
 
-        // calling XOpenDisplay
         let display = unsafe {
             let display = (xlib.XOpenDisplay)(ptr::null());
             if display.is_null() {
@@ -127,29 +103,19 @@ impl XConnection {
             display
         };
 
-        // SAFETY: `display` is the live display just opened, and the handlers
-        // only note the loss.
+        // SAFETY: `display` is the live display just opened, and the handlers only note the loss.
         unsafe { install_io_error_exit_handler(xlib, display) };
 
-        // The XCB connection under the display, which Xlib keeps open until
-        // `XCloseDisplay` (after this value is dropped: see `Drop`).
         // SAFETY: the display was just opened and outlives `xcb`.
         let xcb =
             unsafe { aterm_x11::Connection::from_xlib_display(NonNull::new_unchecked(display)) }
                 .map_err(|e| XNotSupported::XcbConversionError(Arc::new(e)))?;
 
-        // Get the default screen.
         let default_screen = unsafe { (xlib.XDefaultScreen)(display) } as usize;
 
-        // Load the database.
         let database =
             load_database(&xcb).map_err(|e| XNotSupported::XcbConversionError(Arc::new(e)))?;
 
-        // What the backend needs of the server, asked before anything uses it: RandR 1.3 or
-        // later (the monitors, their modes and scale), XInput 2 (every pointer, touch and
-        // focus event) and XKB (the keyboard). A server without one is refused here, by name,
-        // where upstream panicked further in (the Linux lane, 2026-10-20: under Xvfb's
-        // `-extension RANDR` aterm-gui died of "X server missing XRandR extension").
         let failed = |e: aterm_x11::Error| XNotSupported::XcbConversionError(Arc::new(e));
         let present = |name: &'static [u8]| -> Result<u8, XNotSupported> {
             match xcb.extension(name).map_err(failed)? {
@@ -166,8 +132,6 @@ impl XConnection {
             return Err(XNotSupported::MissingExtension(Requirement::RandR13));
         }
         let xinput_major = present(xinput::NAME)?;
-        // A server whose XInputExtension predates version 2 does not know XIQueryVersion and
-        // answers it with an X error (`Request`): it lacks XInput 2, which is what it says.
         let xi_version = match xcb
             .send(xinput::xi_query_version(xinput_major, 2, 3))
             .and_then(|cookie| cookie.reply())
@@ -190,7 +154,6 @@ impl XConnection {
             tracing::warn!("error setting XSETTINGS; Xft options won't reload automatically")
         }
 
-        // Fetch atoms.
         let atoms = Atoms::new(&xcb).map_err(|e| XNotSupported::XcbConversionError(Arc::new(e)))?;
 
         Ok(XConnection {
@@ -220,18 +183,12 @@ impl XConnection {
         xcb: &aterm_x11::Connection,
         default_screen: usize,
     ) -> Option<xproto::Atom> {
-        // Fetch the _XSETTINGS_S[screen number] atom.
         let name = format!("_XSETTINGS_S{default_screen}");
         let xsettings_screen =
             xcb.send(xproto::intern_atom(false, name.as_bytes())).ok()?.reply().ok()?.atom;
 
-        // Get PropertyNotify events from the XSETTINGS window.
-        // TODO: The XSETTINGS window here can change. In the future, listen for DestroyNotify on
-        // this window in order to accommodate for a changed window here.
         let selector_window =
             xcb.send(xproto::get_selection_owner(xsettings_screen)).ok()?.reply().ok()?.owner;
-        // No manager owns the selection (a bare X server, many window managers): nothing to
-        // watch. Selecting on window 0 would only earn a BadWindow.
         if selector_window == aterm_x11::proto::NONE {
             return None;
         }
@@ -247,16 +204,13 @@ impl XConnection {
         Some(xsettings_screen)
     }
 
-    /// Whether this connection to the X server is broken: Xlib found it so (its IO error
-    /// handlers ran, [`install_io_error_exit_handler`]) or libxcb has an error. Two loads, so
-    /// the event loop asks before each event it hands on.
+    /// Whether this connection to the X server is broken: Xlib found it so (its IO error handlers ran, [`install_io_error_exit_handler`]) or libxcb has an error.
     pub fn is_broken(&self) -> bool {
         IO_ERROR.load(Ordering::SeqCst)
             || self.xcb.as_ref().is_some_and(|xcb| xcb.status().is_err())
     }
 
-    /// How this connection ended ([`ConnectionEnd`]), `None` while it holds and the event
-    /// loop's poll saw its socket neither hang up nor fail (`hung_up`).
+    /// How this connection ended ([`ConnectionEnd`]), `None` while it holds and the event loop's poll saw its socket neither hang up nor fail (`hung_up`).
     pub fn connection_end(&self, hung_up: bool) -> Option<ConnectionEnd> {
         let status = self.xcb.as_ref().map_or(Ok(()), aterm_x11::Connection::status);
         ConnectionEnd::of(status, IO_ERROR.load(Ordering::SeqCst), hung_up, |seen| {
@@ -304,8 +258,7 @@ impl XConnection {
         self.xcb.as_ref().expect("xcb_connection somehow called after drop?")
     }
 
-    /// A conversion's never-reused requestor id on this display. Refuse a wrap or an allocator
-    /// returning an earlier id; remembering only the current drag would admit an old owner.
+    /// A conversion's never-reused requestor id on this display.
     pub(super) fn dnd_requestor_id(&self) -> Result<u32, X11Error> {
         let id = self.xcb_connection().generate_id()?;
         let mut high = self.dnd_requestor_high.load(Ordering::Relaxed);
@@ -326,9 +279,7 @@ impl XConnection {
         Ok(id)
     }
 
-    /// Exercise the real allocation refusal through the event-loop drop handler. While MAX
-    /// is installed no requestor id can be admitted, so restoring the prior admitted high
-    /// water is sound, including on unwind; no requestor is created or reused by the guard.
+    /// Exercise the real allocation refusal through the event-loop drop handler.
     #[cfg(test)]
     pub(super) fn with_dnd_requestors_refused<R>(&self, run: impl FnOnce() -> R) -> R {
         struct Restore<'a> {
@@ -406,8 +357,7 @@ impl fmt::Debug for XConnection {
 
 /// SYNC's major opcode, once Initialize (which the protocol asks for before any other SYNC
 /// request) has answered with version 3 or later, which has the counters; `None` where the
-/// server has no SYNC or an older one, or the requests fail. Nothing needs it to start: a window
-/// without a counter is one without the resize sync protocol.
+/// server has no SYNC or an older one, or the requests fail.
 fn sync_major(xcb: &aterm_x11::Connection) -> Option<u8> {
     let major = xcb.extension(sync::NAME).ok().flatten()?.major_opcode;
     let version = xcb.send(sync::initialize(major, 3, 1)).ok()?.reply().ok()?;
@@ -418,13 +368,9 @@ fn sync_major(xcb: &aterm_x11::Connection) -> Option<u8> {
 /// `resource_manager::new_from_default` reads its sources in: the `RESOURCE_MANAGER` property
 /// of the first screen's root window (what `xrdb` sets), else `~/.Xresources`, else
 /// `~/.Xdefaults`; then, merged after it, the file `$XENVIRONMENT` names, else
-/// `~/.Xdefaults-<hostname>`. A later entry of equal precedence wins, so each file's lines
-/// are appended in that order. A file's `#include "path"` lines are followed from its own
-/// directory, as x11rb followed them ([`Database::parse_file`]); the property's are not, its
-/// text being `xrdb`'s output, which cpp has already expanded.
+/// `~/.Xdefaults-<hostname>`.
 fn load_database(conn: &aterm_x11::Connection) -> Result<Database, X11Error> {
     let root = conn.setup().roots.first().map_or(0, |screen| screen.root);
-    // x11rb asks for at most 100,000,000 words of the property, as Xlib does.
     let reply = conn
         .send(xproto::get_property(
             false,
@@ -478,22 +424,14 @@ pub(crate) fn hostname() -> OsString {
 /// How a connection to the X server ended ([`XConnection::connection_end`]).
 #[derive(Debug)]
 pub enum ConnectionEnd {
-    /// Its transport failed: libxcb's `XCB_CONN_ERROR` (a read found end of file, or a read or
-    /// write on the socket failed), Xlib's IO error, or the event loop's poll saw the socket
-    /// hang up or fail. The server died, was killed or restarted; the error is what the socket
-    /// says of its end ([`socket_end`]).
+    /// Its transport failed: libxcb's `XCB_CONN_ERROR` (a read found end of file, or a read or write on the socket failed), Xlib's IO error, or the event loop's poll saw the socket hang up or fail.
     Transport(std::io::Error),
-    /// libxcb closed the connection for a reason of its own, the server still there (a request
-    /// longer than the server takes, memory, an answer that did not parse): its error.
+    /// libxcb closed the connection for a reason of its own, the server still there (a request longer than the server takes, memory, an answer that did not parse): its error.
     Closed(aterm_x11::Error),
 }
 
 impl ConnectionEnd {
-    /// The end of a connection whose libxcb `status` is this, whose Xlib has (`xlib_io_error`)
-    /// or has not found it broken, and whose socket the loop's poll saw hang up or fail
-    /// (`hung_up`); `None` while it holds. libxcb's word comes first: it is the one that read
-    /// and wrote the socket. A failed transport's error is `transport`'s, what the socket says,
-    /// told which of the three found it failed.
+    /// The end of a connection whose libxcb `status` is this, whose Xlib has (`xlib_io_error`) or has not found it broken, and whose socket the loop's poll saw hang up or fail (`hung_up`); `None` while it holds. libxcb's word comes first: it is the one that read and wrote the socket.
     pub(crate) fn of(
         status: Result<(), aterm_x11::Error>,
         xlib_io_error: bool,
@@ -513,14 +451,7 @@ impl ConnectionEnd {
     }
 }
 
-/// What the X server's socket says of its end, once its transport failed: a pending socket
-/// error (`SO_ERROR`; `ECONNRESET` when the server died with requests of ours unread and
-/// nothing has read the socket since), else what a peek finds: nothing at all is end of file,
-/// the server's side closed, and an error is that error. When the socket still holds unread
-/// bytes, or says nothing, the word of whichever found the transport failed (`seen`) stands.
-/// Xlib's `errno` is not used: it is whatever the last call left (with Xvfb killed under
-/// aterm-gui it named no connection's end in any lane run, 2026-10-17), and end of file sets
-/// none.
+/// What the X server's socket says of its end, once its transport failed: a pending socket error (`SO_ERROR`; `ECONNRESET` when the server died with requests of ours unread and nothing has read the socket since), else what a peek finds: nothing at all is end of file, the server's side closed, and an error is that error.
 pub(crate) fn socket_end(fd: std::os::raw::c_int, seen: &'static str) -> std::io::Error {
     let mut pending: std::os::raw::c_int = 0;
     let mut len = std::mem::size_of::<std::os::raw::c_int>() as libc::socklen_t;
@@ -538,8 +469,7 @@ pub(crate) fn socket_end(fd: std::os::raw::c_int, seen: &'static str) -> std::io
         return std::io::Error::from_raw_os_error(pending);
     }
     let mut byte = 0u8;
-    // SAFETY: one byte into a live local; a peek that does not block takes nothing off the
-    // socket.
+    // SAFETY: one byte into a live local; a peek that does not block takes nothing off the socket.
     let peeked = unsafe {
         libc::recv(fd, (&mut byte as *mut u8).cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT)
     };
@@ -560,41 +490,20 @@ pub(crate) fn socket_end(fd: std::os::raw::c_int, seen: &'static str) -> std::io
 static IO_ERROR: AtomicBool = AtomicBool::new(false);
 
 /// Make a broken connection end the event loop instead of the process.
-///
-/// When Xlib finds its connection broken (`_XIOError`) it calls the IO error
-/// handler and then the IO error EXIT handler. Both defaults end the process:
-/// the exit handler's is `exit(1)`, and Xlib's IO error handler, which prints
-/// `X connection to :0 broken (explicit kill or server shutdown).`, ends it
-/// before the exit handler runs (the Linux lane, libX11 1.8.7, 2026-10-17:
-/// with only the exit handler replaced, aterm-gui still printed that and
-/// exited 1 when Xvfb was killed). No application code runs after either, so
-/// a crashed or restarted X server ended aterm with nothing saved. libX11 1.7 (2020) added
-/// `XSetIOErrorExitHandler`, an optional row of aterm-x11's Xlib table. Where
-/// it exists, both handlers become ones that
-/// note the loss and return (as Mutter installs them for its Xwayland); Xlib
-/// then marks the display broken (`XlibDisplayIOError`), every later call on it
-/// returns at once, and the event loop ends with the connection's end
-/// ([`XConnection::connection_end`], `EventLoop::end_if_connection_lost`). A
-/// libX11 older than 1.7 has no exit handler: its defaults stay, and so does
-/// its `exit(1)`, for a returning IO error handler would end in it anyway.
-///
 /// # Safety
 /// `display` is a display `XOpenDisplay` returned and nothing has closed.
 unsafe fn install_io_error_exit_handler(xlib: &ffi::Xlib, display: *mut ffi::Display) {
     let Some(set) = xlib.XSetIOErrorExitHandler else {
         return;
     };
-    // SAFETY: `display` is live (the caller's contract), and `io_error_exit`
-    // has the handler's signature and ignores its user data.
+    // SAFETY: `display` is live (the caller's contract), and `io_error_exit` has the handler's signature and ignores its user data.
     unsafe { set(display, Some(io_error_exit), ptr::null_mut()) };
-    // SAFETY: `io_error` has `XIOErrorHandler`'s signature. The handler is
-    // process-wide; this process opens this one display.
+    // SAFETY: `io_error` has `XIOErrorHandler`'s signature.
     unsafe { (xlib.XSetIOErrorHandler)(Some(io_error)) };
 }
 
 /// The IO error handler: notes the loss and returns, where Xlib's own would
-/// `exit(1)`. Called by Xlib on whichever thread's call found the connection
-/// broken, before [`io_error_exit`].
+/// `exit(1)`.
 unsafe extern "C" fn io_error(_display: *mut ffi::Display) -> std::os::raw::c_int {
     note_io_error();
     0
@@ -647,7 +556,7 @@ pub enum XNotSupported {
     LibraryOpenError(aterm_x11::Error),
 
     /// Connecting to the X server with `XOpenDisplay` failed.
-    XOpenDisplayFailed, // TODO: add better message.
+    XOpenDisplayFailed,
 
     /// We encountered an error while converting the connection to XCB.
     XcbConversionError(Arc<dyn Error + Send + Sync + 'static>),
@@ -749,11 +658,7 @@ mod tests {
 
     use super::{socket_end, ConnectionEnd};
 
-    /// [`socket_end`] once a closed peer's close has reached `fd`. A child another test forks
-    /// while the peer is open holds a copy of it until its exec closes it (`SOCK_CLOEXEC`), and
-    /// only then does the close come here: one run in 40 of the crate's suite, beside
-    /// `gone_tests`' children, read the closed peer as live. A wait for what must happen, so a
-    /// one-minute hang detector.
+    /// [`socket_end`] once a closed peer's close has reached `fd`.
     fn once_closed(fd: std::os::raw::c_int) -> std::io::Error {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
@@ -779,8 +684,7 @@ mod tests {
     }
 
     /// Only a failed transport is the display's loss: libxcb's stream error,
-    /// Xlib's IO error, or a socket the poll saw hang up. libxcb's own close
-    /// is its error, and a connection nothing found broken has not ended.
+    /// Xlib's IO error, or a socket the poll saw hang up.
     #[test]
     fn only_a_failed_transport_is_the_end_of_the_server() {
         let transport = aterm_x11::Error::Connection(1);
@@ -796,7 +700,6 @@ mod tests {
                 Some(ConnectionEnd::Closed(aterm_x11::Error::Connection(4)))
             ));
         }
-        // Each witness is named: libxcb's first, then Xlib's, then the poll's.
         assert!(said(ended(Err(transport.clone()), true, true)).contains("XCB_CONN_ERROR"));
         assert!(said(ended(Ok(()), true, true)).contains("Xlib"));
         assert!(said(ended(Ok(()), false, true)).contains("poll"));
@@ -804,9 +707,7 @@ mod tests {
     }
 
     /// What the socket says of a dead server: end of file once it closed,
-    /// `ECONNRESET` when it closed on requests of ours it never read. A live
-    /// socket, or one still holding the server's last bytes, says nothing of
-    /// its own (the control: no end of file is made up).
+    /// `ECONNRESET` when it closed on requests of ours it never read.
     #[test]
     fn the_socket_says_how_the_server_went() {
         let (ours, server) = UnixStream::pair().expect("socketpair");

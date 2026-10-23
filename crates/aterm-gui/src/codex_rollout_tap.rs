@@ -1,45 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CODEX ROLLOUT TAP'S HOST (plan amendment A1):
-//! a codex-alab session's rollout steps reach its
-//! session log on one named thread of their own (`aterm-codex-rollout`), as
-//! a Claude Code transcript's reach it on the footer resolver's.
-//!
-//! - WHO IS TAPPED. The status sweep asks
-//!   (`SessionStatus::request_rollout_if_due`), at most every [`RECHECK`],
-//!   while the program in front is the one a proven self-claim speaks for
-//!   (`self_claim::fronts_claimant`) and that claim's copy of its record
-//!   names a thread (`self_claim::rollout_target`: the gate's claim half).
-//!   The build half is the tap's own (`aterm_agent::harness::codex_tap`):
-//!   the thread's rollout binds only on a build `CODEX_MEASURED_BUILDS`
-//!   names, and only while the claimant's image runs one it names too. A
-//!   vendor Codex is never tapped, nor an unmeasured build.
-//! - EACH ASK ([`read_once`]). One short hold of the timeline lock arms the
-//!   tap from the log's open Codex run (`SessionLog::transcript_arm`,
-//!   [`Source::Rollout`]): with none, the session's tap goes and nothing is
-//!   read. Then, no lock held, the claimant's process is looked at
-//!   ([`Image`]: its start and the build its image runs now, which a thread
-//!   resumed or re-exec'd onto another build never restates in its
-//!   rollout) and the tap reads on, at most `FOLD_BUDGET` bytes, its floor
-//!   the latest of the run's and the process's start, and only while that
-//!   build is a measured one; the batch is applied through the transcript glue
-//!   (`session_log::transcript::apply_batch`: chunked holds, every record
-//!   `src=transcript`), and the loop is woken as the footer resolver wakes
-//!   it (`claude_footer::LogWake`).
-//! - OWNERSHIP AT APPLY. Every job keeps its claim revision and exact run
-//!   (log epoch, node and group). The live claim and copied thread/home are
-//!   fenced at capture, dequeue and every apply chunk, in meta → copies →
-//!   timeline order. Process start/build reads stay off-lock, before and
-//!   after file IO; a failed look binds nothing. A queued stop is not the
-//!   authority that prevents an older job from entering a newer run.
-//! - A NEW IDENTITY (another pid or start, another thread or home) is a new
-//!   tap; a sweep switched off and the claimant gone from the front drop it
-//!   and say so (`status rollout=stopped`, [`stop_session`]), and a retired
-//!   session's goes with it ([`retire_session`]).
-//!
-//! Nothing is held here but the tap (ids and numbers), and
-//! nothing is logged but a refusal's word.
+//! Dedicated thread and cadence for tapping `codex-alab` rollout steps into the session log.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -55,28 +17,21 @@ use crate::self_claim::RolloutTarget;
 use crate::session_log::transcript::{Applied, Source, TapRun, apply_rollout_batch};
 use crate::session_timeline::SessionTimeline;
 
-/// How often a codex-alab session's rollout is read on while it is in
-/// front: one open and the bytes appended since the last read (the
-/// rollout's folder is looked in only while none is bound).
+/// Minimum interval between rollout reads while a `codex-alab` session is in front.
 pub(crate) const RECHECK: Duration = Duration::from_secs(1);
 
-/// What the status sweep does for one session at one look ([`due`]).
+/// Rollout action selected by the status sweep for one session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Ask {
-    /// Nothing: not due, or never asked and nothing to ask.
+    /// Not due, or nothing to request.
     Nothing,
-    /// Ask for the target's rollout to be read on ([`request_as`]).
+    /// Request a rollout read for the target.
     Read(RolloutTarget),
-    /// The claim behind the asks is gone: drop the session's tap
-    /// ([`stop_session`]), once.
+    /// Stop the session's tap once after its claim disappears.
     Stop,
 }
 
-/// THE CADENCE (pure; `SessionStatus::request_rollout_if_due`): with a
-/// `target` (a proven claimant in front whose copy names a thread), a read
-/// is asked at once and then at most every [`RECHECK`], `asked` keeping
-/// when; with none (the program in front moved, the claim or its copy
-/// gone), a session that was asked for is stopped once and forgotten.
+/// Returns the next rollout [`Ask`] for `session` at `now`.
 pub(crate) fn due(
     asked: &mut HashMap<u64, Instant>,
     session: u64,
@@ -100,25 +55,19 @@ pub(crate) fn due(
     Ask::Read(target)
 }
 
-/// What a tap reads of the claimant's process (module docs): injected, the
-/// kernel's in the app ([`Image::KERNEL`]) and stand-ins in tests, which
-/// have no such process.
+/// Process-inspection callbacks for the rollout claimant.
 #[derive(Clone, Copy)]
 pub(crate) struct Image {
-    /// The kernel identity named by the proof (unreadable is not a match).
+    /// Kernel start identity for `pid`.
     pub(crate) start: fn(u32) -> Option<String>,
-    /// The process's start, wall ms, where the kernel names it.
+    /// Process start timestamp in wall milliseconds.
     pub(crate) born_ms: fn(u32) -> Option<u64>,
-    /// The build its image runs now (its package's version, whole), when
-    /// that is an ALab build's.
+    /// Running ALab package version for `pid`.
     pub(crate) build: fn(u32) -> Option<String>,
 }
 
 impl Image {
-    /// The kernel's: the process's birth, and its image's package
-    /// (`proc_pidpath`, then `codex_alab::alab_build`). A syscall and a few
-    /// small file reads at each ask, on the tap's own thread, never under a
-    /// lock.
+    /// Live kernel callbacks for process birth and running ALab build.
     pub(crate) const KERNEL: Image = Image {
         start: aterm_agent::harness::restart_stamp::kernel_start,
         born_ms,
@@ -180,14 +129,12 @@ enum Command {
 /// The one thread rollouts are read on, started on first use.
 static TAP: Mutex<Option<Sender<Command>>> = Mutex::new(None);
 
-/// WHAT THE STATUS SWEEP DOES with one look's [`Ask`] for `session`
-/// (`SessionStatus::request_rollout_if_due`): read on ([`request_as`]),
-/// stop and say so ([`stop_session`]), or nothing.
+/// Dispatches `ask` for `session` using [`Image::KERNEL`].
 pub(crate) fn follow_ask(ask: Ask, session: u64, ctx: &Arc<crate::SessionCtx>, wake: &LogWake) {
     follow_ask_as(ask, session, ctx, wake, Image::KERNEL);
 }
 
-/// [`follow_ask`], the claimant's process looked at through `image`.
+/// Dispatches `ask` for `session` using `image`.
 pub(crate) fn follow_ask_as(
     ask: Ask,
     session: u64,
@@ -202,9 +149,7 @@ pub(crate) fn follow_ask_as(
     }
 }
 
-/// Read `target`'s rollout on into `ctx`'s captured session-log run, off-thread
-/// ([`read_once`]), the claimant's process looked at through `image`. If
-/// the thread cannot be started nothing is read.
+/// Queues an off-thread rollout read for `target` into `ctx`'s session log.
 pub(crate) fn request_as(
     session: u64,
     ctx: &Arc<crate::SessionCtx>,
@@ -218,8 +163,6 @@ pub(crate) fn request_as(
     let mut slot = TAP.lock().unwrap_or_else(PoisonError::into_inner);
     if slot.is_none() {
         let (tx, rx) = channel::<Command>();
-        // It takes the session timeline lock the UI thread contends, so the
-        // lock-holder floor applies.
         let spawned = crate::qos::spawn_lane_thread(
             "aterm-codex-rollout",
             crate::qos::Role::Responsive,
@@ -242,15 +185,12 @@ pub(crate) fn request_as(
     }
 }
 
-/// Drop `session`'s tap, the sweep off or the claimant gone from the front,
-/// and say so: once every ask sent before it is answered (the thread's queue
-/// is in order), `status rollout=` says `stopped` for a session the tap
-/// answered, its `rollout_asks=` kept ([`stop_tap`]).
+/// Drops `session`'s tap and marks `status rollout=stopped`.
 pub(crate) fn stop_session(session: u64, timeline: &Arc<Mutex<SessionTimeline>>) {
     send_stop(session, Some(Arc::clone(timeline)));
 }
 
-/// Drop a retired session's tap: nothing reads its status any more.
+/// Drops a retired session's tap.
 pub(crate) fn retire_session(session: u64) {
     send_stop(session, None);
 }
@@ -318,9 +258,7 @@ fn running_build(pid: u32) -> Option<String> {
 /// ONE ASK (module docs): arm, read on, apply, and then, in a hold of its
 /// own, count the ask answered with its word
 /// (`SessionLog::rollout_answered`, `status rollout= rollout_asks=`): every
-/// record the ask wrote is in the log before the count moves. What the
-/// applied batch did; `None` when no run takes the rollout's steps (its tap
-/// dropped) or the thread is no thread id.
+/// record the ask wrote is in the log before the count moves.
 fn read_once(taps: &mut Taps, job: &Job) -> Option<Applied> {
     read_once_after(taps, job, || {})
 }
@@ -404,8 +342,6 @@ fn read_on(
     };
     let batch = held.tap.take();
     after_read();
-    // Kernel reads stay off-lock. The claim/copy/run fence is checked AGAIN
-    // by the writer under every chunk's locks, after all off-lock IO.
     if (job.image.start)(job.target.pid).as_deref() != Some(job.target.start.as_str())
         || (job.image.build)(job.target.pid) != running
     {
@@ -420,15 +356,14 @@ fn read_on(
     (Some(applied), word)
 }
 
-/// The rollout thread's taps, for a test that asks by hand ([`read_once`]
-/// on this thread, the claimant looked at through a stand-in [`Image`]).
+/// Synchronous rollout tap harness for tests.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct Host(Taps);
 
 #[cfg(test)]
 impl Host {
-    /// One ask, as the rollout thread answers it.
+    /// Runs one rollout request and records its answer.
     pub(crate) fn ask(
         &mut self,
         session: u64,
@@ -453,8 +388,7 @@ impl Host {
         read_once_after(&mut self.0, &job, schedule.1)
     }
 
-    /// One ask's read and apply alone, as the rollout thread runs them
-    /// before it counts the ask ([`read_on`]): the answer's word.
+    /// Runs one rollout read/apply pass and returns the answer token.
     pub(crate) fn read_on(
         &mut self,
         session: u64,
@@ -486,10 +420,7 @@ mod tests {
     /// THE CADENCE: a proven claimant in front is asked for at once, then
     /// once per [`RECHECK`] however often the sweep looks; once no target
     /// stands (the program in front moved, the claim gone) its tap is
-    /// stopped once, and a target again is asked for at once. A session
-    /// never asked for is never stopped. NEGATIVE CONTROLS (scratch, the
-    /// unit's notes): a cadence that asks at every look, and a sweep that
-    /// forgets without stopping, each fail it.
+    /// stopped once, and a target again is asked for at once.
     #[test]
     fn a_claimant_is_asked_once_a_recheck_and_stopped_once_gone() {
         const THREAD: &str = "019a0000-0000-7000-8000-00000000000a";
@@ -508,7 +439,6 @@ mod tests {
                 "{ms}"
             );
         }
-        // Another session keeps its own cadence.
         assert_eq!(
             due(&mut asked, 8, Some(target(THREAD)), at(500)),
             Ask::Read(target(THREAD))
@@ -521,7 +451,6 @@ mod tests {
             due(&mut asked, 7, Some(target(THREAD)), at(1_400)),
             Ask::Nothing
         );
-        // Gone: stopped once.
         assert_eq!(due(&mut asked, 7, None, at(1_500)), Ask::Stop);
         assert_eq!(due(&mut asked, 7, None, at(1_600)), Ask::Nothing);
         assert_eq!(

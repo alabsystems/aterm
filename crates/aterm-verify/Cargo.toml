@@ -81,5 +81,11 @@ libc = { workspace = true }
 atpkg = { workspace = true }
 aterm-update-core = { workspace = true }
 
+[dev-dependencies]
+# Tier-1 of `EndByProof` (tests/conformance_end_by_proof.rs): the model and the interpreter
+# that drives it against the real `aterm_uds::process::end_proven`.
+aterm-models-misc = { workspace = true }
+aterm-spec = { workspace = true }
+
 [lints]
 workspace = true

@@ -1,52 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The ordered input log of one hosted task, from one checkpoint onward.
-//!
-//! # The law
-//!
-//! A log is the complete, ordered list of the inputs a task was delivered after its
-//! ancestor checkpoint: input `k` sits at cursor `first_cursor + k`. Only inputs whose step
-//! succeeded are in it (a refused input left the state untouched, so it is as if it never
-//! arrived). A log that cannot be complete — an input that could not be recorded, a host
-//! that broke the admit/advance protocol — is marked *broken*, and a broken log answers no
-//! range ([`RangeFault::Broken`]), so no repair can replay across the gap. The log is bounded
-//! (`max_events`): a full log refuses the push ([`LogFull`]) and its owner re-anchors at a
-//! fresh checkpoint rather than dropping anything.
-//!
-//! # The encoding
-//!
-//! A log is a run of `astream_wire::steps` records, each a CRC-32 frame around
-//! `STEP_VERSION | step u64 | len u32 | body`; the steps are dense from 0. Every body is
-//! `RECORD_VERSION: u8 | kind: u8 | rest`:
-//!
-//! * step 0 is the header (kind 0): [`LOG_MAGIC`] (whose last byte is the format), the task
-//!   identity, the log epoch, the first cursor, the ancestor checkpoint's digest, and the
-//!   broken flag;
-//! * steps `1..=n` are events (kind 1): one canonically encoded input each;
-//! * step `n + 1` is the seal (kind 2): the event count `n` and the digest of the whole log
-//!   (the trace digest of `[first_cursor, end_cursor)`, taken whatever the broken flag says).
-//!
-//! [`EventLog::decode`] keeps the longest intact prefix (astream's classifier):
-//!
-//! * a short or damaged **last** record with nothing whole after it is a torn tail: it is
-//!   dropped and **reported** ([`Tail::Torn`]), never silently;
-//! * bytes that end exactly at a record boundary with no seal as the last record are a cut
-//!   log: **reported** ([`Tail::Unsealed`]), never read as whole. Only the bytes of a whole
-//!   log, ending in a seal that names its event count and digest, decode [`Tail::Clean`];
-//! * a seal anywhere but last ([`LogFault::Kind`]), or one that names another count
-//!   ([`LogFault::SealCount`]) or digest ([`LogFault::SealDigest`]), is a fault;
-//! * damage followed by a whole record, a gap, a repeat or a reordered step is a fault, and
-//!   the log is refused ([`LogFault::Step`]), never truncated;
-//! * a record whose frame holds bytes past its body is refused ([`WireFault::Trailing`]), so
-//!   every log has exactly one encoding.
-//!
-//! The header's identity is checked against the identity the reader expects, and a mismatch
-//! names which artifact differs ([`IdentityMismatch`]); its ancestor against the digest of the
-//! checkpoint the reader holds beside it ([`LogFault::Ancestor`]), so a log never replays from
-//! a checkpoint it does not extend. The event count is checked against `max_events` before
-//! anything is allocated for the inputs. Decoding is a pure, panic-free function of the
-//! bytes.
+//! Ordered input log of a hosted task from a checkpoint onward ([`LOG_MAGIC`],
+//! [`EventLog::decode`], [`LogFull`], [`RangeFault::Broken`], [`IdentityMismatch`],
+//! [`Tail::Clean`], [`Tail::Torn`], [`Tail::Unsealed`], [`WireFault::Trailing`],
+//! [`LogFault::Kind`], [`LogFault::SealCount`], [`LogFault::SealDigest`],
+//! [`LogFault::Step`], [`LogFault::Ancestor`]).
 
 use core::fmt;
 
@@ -57,8 +16,7 @@ use crate::ident::{Digest, DigestBuilder, TaskIdentity, len_u64};
 use crate::task::Schema;
 use crate::wire::{Dec, Enc, WireFault};
 
-/// The header record's magic; its last byte is the format (2: the header names the ancestor
-/// checkpoint and the log ends in a seal).
+/// The header record's magic.
 pub const LOG_MAGIC: [u8; 8] = *b"AOSLOG\0\x02";
 
 /// Every record body starts with this version byte.
@@ -86,13 +44,11 @@ pub struct LogHeader {
     pub log_epoch: u64,
     /// The cursor of the first input (the ancestor checkpoint's input cursor).
     pub first_cursor: u64,
-    /// The ancestor checkpoint's digest (`Checkpoint::digest`): the state the first input is
-    /// applied to. A reader holds the log beside that checkpoint or refuses it.
+    /// The ancestor checkpoint's digest (`Checkpoint::digest`).
     pub ancestor: Digest,
 }
 
-/// Which artifact of two identities differs (the first, in the order task, code, contract,
-/// schema, profile).
+/// First artifact (`task`, `code`, `contract`, `schema`, `profile`) where two identities differ.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IdentityMismatch {
     /// The task differs.
@@ -151,8 +107,7 @@ impl fmt::Display for IdentityMismatch {
 
 impl std::error::Error for IdentityMismatch {}
 
-/// A push the log refused because it holds `limit` inputs (or its cursors would leave the
-/// `u64` range). The log is untouched.
+/// Push refused because the log holds `limit` inputs or cursors would overflow `u64`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LogFull {
     /// The most inputs the log holds.
@@ -171,28 +126,26 @@ impl fmt::Display for LogFull {
 
 impl std::error::Error for LogFull {}
 
-/// How a decoded log ended. Only [`Tail::Clean`] is a whole log.
+/// How a decoded log ended ([`Tail::Clean`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tail {
     /// The bytes ended exactly after a seal naming every event before it: the whole log.
     Clean,
-    /// A short or damaged last record, with nothing whole after it, was dropped. The seal may
-    /// have been in it: the events returned may be all of the log's, or a prefix.
+    /// A short or damaged last record, with nothing whole after it, was dropped.
     Torn {
         /// The byte offset where the dropped bytes start.
         at: usize,
         /// How many bytes were dropped.
         dropped: usize,
     },
-    /// The bytes ended exactly at a record boundary, but the last record is not a seal: the
-    /// log was cut after its `events`-th event, and how many followed is unknown.
+    /// The bytes ended exactly at a record boundary, but the last record is not a seal.
     Unsealed {
         /// The events the cut kept.
         events: usize,
     },
 }
 
-/// Why bytes are not a log this reader accepts. Nothing is returned from them.
+/// Why bytes are not a log this reader accepts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LogFault {
     /// The bytes do not start with an Aos log header.
@@ -201,8 +154,7 @@ pub enum LogFault {
     Format(u8),
     /// A record of another [`RECORD_VERSION`].
     RecordVersion(u8),
-    /// Damage followed by a whole record, a gap, a repeat or a reorder (astream's
-    /// `StepFault`, rendered).
+    /// Damage followed by a whole record, a gap, a repeat, or a reorder (`StepFault`).
     Step(String),
     /// No whole header record.
     MissingHeader,
@@ -236,16 +188,14 @@ pub enum LogFault {
         /// The digest of the decoded log.
         found: Digest,
     },
-    /// A record of a kind that cannot stand at step `at` (a header past step 0, a seal that
-    /// is not the last record, an unknown kind).
+    /// Record of a kind that cannot stand at step `at`.
     Kind {
         /// The step.
         at: u64,
         /// The kind byte found.
         kind: u8,
     },
-    /// Encoding only: a record at step `at` whose body of `len` bytes exceeds the `limit` a
-    /// step record can carry. Nothing was written.
+    /// Record at step `at` whose `len`-byte body exceeds the step record `limit`.
     TooLarge {
         /// The step.
         at: u64,
@@ -319,7 +269,7 @@ impl From<WireFault> for LogFault {
     }
 }
 
-/// Why a range of cursors cannot be read from a log. The log is untouched.
+/// Why a range of cursors cannot be read from a log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RangeFault {
     /// `from` is past `to`.
@@ -412,8 +362,7 @@ impl<S: Schema> EventLog<S> {
         }
     }
 
-    /// Appends an input and returns its cursor; [`LogFull`] (log untouched) when the log
-    /// holds `max_events` inputs or the cursor after it would leave the `u64` range.
+    /// Appends an input and returns its cursor ([`LogFull`]).
     pub fn push(&mut self, i: S::Input) -> Result<u64, LogFull> {
         let full = LogFull {
             limit: self.max_events,
@@ -422,7 +371,6 @@ impl<S: Schema> EventLog<S> {
             return Err(full);
         }
         let cursor = self.end_cursor();
-        // The end cursor after this input must still be representable.
         if cursor.checked_add(1).is_none() {
             return Err(full);
         }
@@ -436,9 +384,9 @@ impl<S: Schema> EventLog<S> {
         self.inputs.pop()
     }
 
-    /// Marks a recording break: some delivered input is missing. The first reason sticks.
+    /// Marks a recording break: some delivered input is missing.
     #[inline]
-    pub fn mark_broken(&mut self, why: &'static str) {
+    pub const fn mark_broken(&mut self, why: &'static str) {
         if self.broken.is_none() {
             self.broken = Some(why);
         }
@@ -512,7 +460,6 @@ impl<S: Schema> EventLog<S> {
         if to > end {
             return Err(RangeFault::PastEnd { to, end });
         }
-        // Both offsets are at most `len`, which is a `usize`.
         let lo = usize::try_from(from - first).map_err(|_| RangeFault::PastEnd { to, end })?;
         let hi = usize::try_from(to - first).map_err(|_| RangeFault::PastEnd { to, end })?;
         self.inputs
@@ -520,16 +467,13 @@ impl<S: Schema> EventLog<S> {
             .ok_or(RangeFault::PastEnd { to, end })
     }
 
-    /// The digest of the inputs at `[from, to)`: `Digest::of(b"aterm-aos-trace-v2\0",
-    /// [schema digest, identity digest, ancestor, log epoch, from, to, input…])`, each input
-    /// as its canonical encoding. Refused as [`EventLog::range`] refuses.
+    /// The digest of the inputs at `from..to` ([`EventLog::range`]).
     pub fn trace_digest(&self, schema: &S, from: u64, to: u64) -> Result<Digest, RangeFault> {
         let inputs = self.range(from, to)?;
         Ok(self.digest_inputs(schema, from, to, inputs))
     }
 
-    /// What the seal names: the trace digest of the whole log, whatever the broken flag says
-    /// (the flag is in the header record, under its own CRC).
+    /// What the seal names.
     fn seal_digest(&self, schema: &S) -> Digest {
         let (from, to) = (self.header.first_cursor, self.end_cursor());
         self.digest_inputs(schema, from, to, &self.inputs)
@@ -545,7 +489,6 @@ impl<S: Schema> EventLog<S> {
         b.part(&to.to_le_bytes());
         let mut e = Enc::new();
         for i in inputs {
-            // One encoder for the whole trace: each input is a new encoding in its room.
             e.clear();
             schema.encode_input(i, &mut e);
             b.part(e.as_bytes());
@@ -553,8 +496,7 @@ impl<S: Schema> EventLog<S> {
         b.finish()
     }
 
-    /// The log's bytes, ending in its seal; [`LogFault::TooLarge`] if one record would exceed
-    /// what a step record carries (nothing is returned then).
+    /// The log's bytes, ending in its seal ([`LogFault::TooLarge`]).
     pub fn encode(&self, schema: &S) -> Result<Vec<u8>, LogFault> {
         let mut out = Vec::new();
         let mut body = Enc::new();
@@ -585,10 +527,7 @@ impl<S: Schema> EventLog<S> {
         Ok(out)
     }
 
-    /// Reads a log recorded under `expect` that extends the checkpoint whose digest is
-    /// `ancestor`, accepting at most `max_events` events. Returns the log and how its bytes
-    /// ended: only [`Tail::Clean`] is the whole log; a torn tail is dropped and reported, and
-    /// a cut at a record boundary is reported [`Tail::Unsealed`].
+    /// Decode a log recorded under `expect` extending `ancestor`, up to `max_events` events.
     pub fn decode(
         schema: &S,
         bytes: &[u8],
@@ -630,8 +569,6 @@ impl<S: Schema> EventLog<S> {
                 found: header.ancestor,
             });
         }
-        // The seal can stand only last; a seal anywhere before it is refused as a record
-        // of the wrong kind when the events are read.
         let records = scan.steps.get(1..).unwrap_or(&[]);
         let (events, seal) = match records.split_last() {
             Some(((step, range), init))
@@ -668,7 +605,6 @@ impl<S: Schema> EventLog<S> {
             log.mark_broken(DECODED_BREAK);
         }
         let Some((step, range)) = seal else {
-            // No seal: a cut at a record boundary (or a torn seal, reported as torn).
             let tail = match tail {
                 Tail::Clean => Tail::Unsealed {
                     events: log.inputs.len(),
@@ -703,8 +639,7 @@ fn put_record(out: &mut Vec<u8>, step: u64, body: &[u8]) -> Result<(), LogFault>
     Ok(())
 }
 
-/// Every accepted record's frame must end exactly where its body ends: astream accepts
-/// payload bytes past a step's body (its CRC covers them), but an Aos log has one encoding.
+/// Every accepted record's frame must end exactly where its body ends.
 fn check_layout(
     steps: &[(u64, core::ops::Range<usize>)],
     valid_len: usize,
@@ -791,8 +726,6 @@ fn read_event<S: Schema>(schema: &S, step: u64, body: &[u8]) -> Result<S::Input,
     let rest = body.get(d.position()..).unwrap_or(&[]);
     let input = schema.decode_input(&mut d)?;
     d.finish()?;
-    // The schema's decoder must be canonical: the input re-encodes to the bytes it came
-    // from, so the trace digest of a decoded log is the digest of its bytes.
     let mut again = Enc::with_capacity(rest.len());
     schema.encode_input(&input, &mut again);
     if again.as_bytes() != rest {

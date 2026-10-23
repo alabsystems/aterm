@@ -1,38 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A WORKER STARTED THROUGH THE ONE `aterm` BINARY against a real `aterm
-//! --headless` (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §2.1):
-//! `aterm ctl @self spawn agent=claude raise=false -`, the task on stdin, opens
-//! a tab BEHIND the manager's running the ordinary login shell, marks the
-//! worker's task record `working from=<the manager>` before it answers, and at
-//! the shell's first prompt types the one line that starts `claude` with the
-//! task file's text as its argument — byte for byte, through every character
-//! a shell could read into it, at 60 KiB. The stand-in `claude` (the only one
-//! on the instance's PATH) writes its argv NUL-separated and exits, and the
-//! pane's shell draws its next prompt. Under zsh and under bash. The same for
-//! `agent=gemini`, `agent=agy` and `agent=muse`: each one's stand-in is
-//! started by its own first-prompt flag, the task one argument; Muse Code's
-//! trust flag rides because the shell stands in the folder the spawn
-//! trusted, and Gemini CLI gets a session id of its own and, in its
-//! environment, a trusted-folders file of its own naming that folder alone
-//! (never `--skip-trust`, which trusts every folder). A worker whose shell
-//! never draws a prompt is `stalled why=shell`, nothing typed.
-//!
-//! THE HARNESS IS ON, as a worker needs (`ERR unsupervised:` otherwise; the
-//! last test boots the isolation config's harness-off instance to prove it),
-//! with `relaunch = false` and `upgrade = false`: the stand-in is a `#!/bin/sh`
-//! script the window reads as `sh`, not Claude Code, and it exits at once, so
-//! nothing would be relaunched or upgraded; the two switches keep it so.
-//!
-//! Every wait that must end is a one-minute hang detector, never a latency
-//! budget. A machine that refuses the headless instance is COULD NOT RUN,
-//! never a pass ([`headless_boot::boot_with`]). ISOLATION: `support/launch_isolation.rs` and
-//! `support/headless_boot.rs`, plus the state seam (`ATERM_STATE_HOME`) and a
-//! PATH of the stand-in's folder and the system's alone, so no real `claude`
-//! can answer — in the tab's login shell too, after macOS's `path_helper`: the
-//! boot pins it and ends COULD NOT RUN unless that shell names `claude` by the
-//! stand-in's path ([`headless_boot::boot_with`]).
+//! A WORKER STARTED THROUGH THE ONE aterm BINARY against a real aterm --headless.
 
 #![cfg(unix)]
 
@@ -82,8 +51,6 @@ fn boot(tag: &str, shell: &str, harness: Option<&str>, rc: Option<(&str, &str)>)
                     .expect("write the config");
             }
             let bin = tmp.join("bin");
-            // Every worker agent's word names its stand-in, or the boot's
-            // guard ends the test COULD NOT RUN before anything is typed.
             for word in ["claude", "gemini", "agy", "muse"] {
                 headless_boot::standin(&bin.join(word), STANDIN);
             }
@@ -93,11 +60,7 @@ fn boot(tag: &str, shell: &str, harness: Option<&str>, rc: Option<(&str, &str)>)
                     "PATH",
                     format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display()),
                 )
-                // A development seam (a debug build): the state root, so the
-                // task file's path is known.
                 .env("ATERM_STATE_HOME", tmp.join("state"))
-                // A development seam too: a stalled worker's reason is the
-                // diagnosis a failed wait prints.
                 .env("ATERM_LOG", "info")
                 .args(["--lines", "24", "--columns", "100"]);
         },
@@ -118,7 +81,6 @@ fn spawn_as(
     cmd.env("ATERM_PARENT_SESSION_ID", manager)
         .current_dir(cwd)
         .stdin(Stdio::piped());
-    // Asked again while the instance has not yet accepted it, or answers it busy: nothing was sent.
     let out = headless_boot::until_served(|| {
         let mut child = cmd.spawn().expect("spawn aterm ctl");
         let mut stdin = child.stdin.take().expect("its stdin");
@@ -204,13 +166,11 @@ fn run_agent_worker(tag: &str, shell: &str, model: Option<&str>, word: &str) {
     assert!(ok, "spawn {agent_arg}: {stdout} {stderr}");
     let worker = sid_of(&stdout);
 
-    // The record stands before anything was waited for.
     let record = ctl_ok(&inst, &[&format!("@{worker}"), "task"]);
     assert!(
         record.starts_with(&format!("OK task rev=1 state=working from={manager} ")),
         "{record}"
     );
-    // A background tab: the manager's stays its window's active one.
     let roster = ctl_ok(&inst, &["sessions"]);
     let active = |sid: &str| {
         roster
@@ -224,8 +184,6 @@ fn run_agent_worker(tag: &str, shell: &str, model: Option<&str>, word: &str) {
         ("1".into(), "0".into()),
         "{roster}"
     );
-    // The folder it was started in is trusted for it alone, and the agent its
-    // spawn started is named.
     let meta = ctl_ok(&inst, &[&format!("@{worker}"), "meta"]);
     assert_eq!(field(&meta, "worker"), Some(word), "{meta}");
     let trusted = std::fs::canonicalize(&work).expect("canonical work folder");
@@ -241,9 +199,6 @@ fn run_agent_worker(tag: &str, shell: &str, model: Option<&str>, word: &str) {
         ),
         Some("-")
     );
-    // The newborn's own Autopilot word is Land, a spawn's default (FOREVER
-    // LAND: its task ends once all of its work is on the remote main
-    // branch); the manager's own word is untouched.
     assert_eq!(field(&meta, "autopilot"), Some("land"), "{meta}");
     assert_ne!(
         field(
@@ -254,10 +209,6 @@ fn run_agent_worker(tag: &str, shell: &str, model: Option<&str>, word: &str) {
         "the manager's word"
     );
 
-    // The task file: 0600 in a 0700 folder, the task, a blank line, one line
-    // of fact naming the manager. agy's holds no blank line (it draws one in
-    // a message as the gap that ends it), so its fact is the line under the
-    // task.
     let tasks = inst.tmp.join("state/tasks");
     let file = tasks.join(format!("{worker}-1.txt"));
     let home = inst.tmp.join("home");
@@ -278,10 +229,6 @@ fn run_agent_worker(tag: &str, shell: &str, model: Option<&str>, word: &str) {
     assert_eq!(fact.matches('\n').count(), 1, "one line of fact: {fact:?}");
     assert!(fact.ends_with('\n') && fact.contains(&manager), "{fact:?}");
 
-    // The argv: Muse Code's trust-for-this-run flag (the shell stands in the
-    // folder the spawn trusted), the model, Gemini CLI's own session id,
-    // then the file's text whole as one argument: after the end of options,
-    // or attached to the first-prompt flag.
     let argv = std::fs::read(&argv_file).expect("the argv");
     let argv: Vec<&[u8]> = argv.split(|b| *b == 0).collect();
     let whole = text.strip_suffix(b"\n").expect("the file ends its line");
@@ -310,9 +257,6 @@ fn run_agent_worker(tag: &str, shell: &str, model: Option<&str>, word: &str) {
     } else {
         assert_eq!(session, None, "{word}: no session id of the line's");
     }
-    // Gemini CLI's own trusted-folders file names the folder the spawn
-    // trusted and no other, 0600 beside the task file; no other agent's
-    // line names one.
     let trust = std::fs::read_to_string(home.join("trust.txt")).expect("the stand-in's trust");
     if word == "gemini" {
         let path = tasks.join(format!("{worker}-1.trust.json"));
@@ -344,8 +288,6 @@ fn run_agent_worker(tag: &str, shell: &str, model: Option<&str>, word: &str) {
     );
     assert!(!home.join("ran").exists(), "the shell ran the task's text");
 
-    // The pane outlives the agent: its line completed, and the shell drew its
-    // next prompt.
     until(&inst, &worker, "the shell's next prompt", || {
         let blocks = ctl_ok(&inst, &[&format!("@{worker}"), "blocks"]);
         let rows: Vec<&str> = blocks.lines().filter(|l| l.starts_with("block ")).collect();
@@ -393,7 +335,6 @@ fn a_muse_worker_runs_its_task_after_the_end_of_options() {
 /// With the window harness off nothing would finish a worker's task: `ERR
 /// unsupervised:` naming the switch, and nothing is spawned (the other
 /// switches that refuse it: `harness_host::worker_unsupervised`'s test).
-/// `agent=codex` is reserved, and an empty task never leaves the client.
 #[test]
 fn a_worker_is_refused_unsupervised_and_spawns_nothing() {
     let inst = boot("u", headless_boot::login_shell().path, None, None);
@@ -429,7 +370,6 @@ fn a_worker_is_refused_unsupervised_and_spawns_nothing() {
         "{stderr}"
     );
     assert_eq!(rows(), before, "nothing was spawned");
-    // A worker's spawn with no `-` is refused before anything is sent.
     let raw = ctl(&inst, &["spawn", "agent=claude"]);
     assert!(
         String::from_utf8_lossy(&raw.stderr).contains("end the request with -"),
@@ -440,9 +380,7 @@ fn a_worker_is_refused_unsupervised_and_spawns_nothing() {
 /// A worker whose shell ends before its first prompt — the person's rc file
 /// ends it (a worker's shell alone: the one `ATERM_TASK_FILE` names a task to)
 /// — has its task `stalled why=shell`, and nothing was typed: the stand-in
-/// never ran. Aimed at another session than its manager's, its `from=` is
-/// still the manager, the session that started it. Any shell's rc can end it:
-/// the host's ([`headless_boot::login_shell`]).
+/// never ran.
 #[test]
 fn a_worker_whose_shell_draws_no_prompt_is_stalled_and_nothing_is_typed() {
     let shell = headless_boot::login_shell();
@@ -464,8 +402,6 @@ fn a_worker_whose_shell_draws_no_prompt_is_stalled_and_nothing_is_typed() {
     );
     assert!(ok, "spawn agent=claude: {stdout} {stderr}");
     let worker = sid_of(&stdout);
-    // `working` from the reply on, and soon `stalled`: from= the manager
-    // either way.
     let record = ctl_ok(&inst, &[&format!("@{worker}"), "task"]);
     assert!(
         record.contains(&format!(" from={manager} ")),

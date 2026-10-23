@@ -19,6 +19,7 @@ use super::{AgyKernel, ag, carry_in_flight_with, key, ledger, plan, relaunch_hel
 pub(super) const SOURCE: &str = "agy-managed";
 
 /// The wait word of a step at the agent's background break: nothing ends an
+/// agy there (the restart is the next idle point's).
 const AT_BREAK: &str = "wait:break";
 
 /// Returns the foreground `agy` leader PID for `tab` from `tabs`.
@@ -44,6 +45,7 @@ pub(super) struct Move {
 }
 
 /// A store build's version as its record names it, only where the record
+/// and the build's directory agree ([`live::build_version`]).
 fn build_record(exe: &Path) -> Option<String> {
     let version = store_version(exe)?;
     let dir = exe.parent()?.parent()?.file_name()?.to_str()?;
@@ -131,6 +133,7 @@ pub(in super::super) fn upgrade_pass(opts: &Opts, live_tabs: Option<&[LiveTab]>)
 }
 
 /// The directory agy keeps a conversation's own files under
+/// (`<config>/brain/<uuid>/.system_generated`).
 fn generated(config: &Path, conversation: &str) -> PathBuf {
     config
         .join("brain")
@@ -139,9 +142,12 @@ fn generated(config: &Path, conversation: &str) -> PathBuf {
 }
 
 /// How much of a transcript the look reads from its end: this process's
+/// start must be in the window (else [`Open::Unproved`]).
 const TRANSCRIPT_BYTES: u64 = 32 << 20;
 
 /// The transcript's text as read — whole, or its last [`TRANSCRIPT_BYTES`]
+/// with the partial first line dropped (`true`) — or `None` where it cannot
+/// be read.
 fn transcript_tail(path: &Path) -> Option<(String, bool)> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path).ok()?;
@@ -216,15 +222,18 @@ pub(super) fn messages_look(config: &Path, conversation: &str, now_ms: u64) -> O
 }
 
 /// Apple's `sqlite3`, named absolutely (a platform binary): the one reader of
+/// agy's summary database, READ ONLY.
 const SQLITE3: &str = "/usr/bin/sqlite3";
 
 /// File name of `agy`'s conversation summary database.
 pub(super) const SUMMARIES: &str = "conversation_summaries.db";
 
 /// How long one read may take: it takes milliseconds (4 ms typical, 61 ms the
+/// most over 2 179 live reads); the bound is for a wedged process.
 const SUMMARY_WAIT: Duration = Duration::from_secs(5);
 
 /// The query: the conversation's own row and its subagents' (`conversation`
+/// a UUIDv4, checked by the caller, so no quote can be in it).
 fn summary_query(conversation: &str) -> String {
     format!(
         "SELECT conversation_id, status, not_fully_idle, parent_conversation_id FROM \
@@ -234,6 +243,10 @@ fn summary_query(conversation: &str) -> String {
 }
 
 /// One run of the reader over `target` (a private copy's path, or an
+/// immutable URI: [`aterm_uds::foreign_db::read`]):
+/// `-readonly`, no `~/.sqliterc` (`-init /dev/null`), `-safe` (no command that
+/// touches another file), `-nofollow`, one `|`-separated line per row, no
+/// header.
 fn run_reader(target: &str, sql: &str) -> Option<String> {
     let words = [
         "-init",
@@ -280,6 +293,7 @@ pub(super) fn screen_idle(rows: &[String]) -> bool {
 }
 
 /// Whether agy's composer on `rows` is empty: its caret row holds nothing (a
+/// permission mode's hint is nothing) and no row under it a word.
 fn composer_empty(rows: &[String]) -> bool {
     aterm_phase::agy::composer_draft(rows)
         .is_some_and(|(_, lines)| lines.iter().all(|l| l.trim().is_empty()))

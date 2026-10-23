@@ -2,16 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! The host-facing anatomy of a digest entry (an exception the owner looks at later).
-//!
-//! A reporter states one [`Entry`] instead of spelling the class ceremony
-//! ([`crate::need`]): which family speaks, the fact's identity, the glass-title `what`,
-//! why the owner is needed ([`Why`]), the one action ([`Then`], optionally with the
-//! button that does it), and how long a dismissal holds. [`Entry::message`] turns it
-//! into the checked [`Message`] (a [`crate::need::Need::Later`]) that
-//! [`crate::MessageCenter::sync_digest`] keeps equal to the family's whole answer.
-//! Everything a person reads is bounded here once, so a builder that runs past a cap or
-//! leans on "waiting" fails a roster test, not a long line in the menu bar. An entry is
-//! never a band row: the digest is a store beside the live set ([`crate::digest`]).
 
 use crate::model::{Intent, Message, Severity, Tag, tags};
 use crate::need::{Fingerprint, LaterAsk, Mover, Resurface, Then, Why};
@@ -19,102 +9,52 @@ use crate::text::glass_title_fault;
 
 /// Chars of an entry's `what`: a glass title (six words, no clause).
 pub const WHAT_CAP: usize = 48;
-/// Lines of volatile detail an entry may carry behind `Details ›` (holders,
-/// ages, the `--status` line): never part of the fact's identity or its
-/// one-line form.
+/// Lines of volatile detail an entry may carry behind `Details ›` (holders, ages, the `--status` line): never part of the fact's identity or its one-line form.
 pub const MORE_LINES: usize = 3;
 
-/// Which reporter speaks. A family owns a key prefix, so one family's pass
-/// ([`crate::MessageCenter::sync_digest`]) can end only its own entries.
-/// Declared in digest order after severity.
+/// Which reporter speaks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Family {
     /// Full Disk Access and the OS's questions about aterm.
     Privacy,
-    /// The updater (`update.review.<kind>`, a dev build's writes). Its stem is not the
-    /// health record's (`update.health.<kind>`): an exception and a record never share
-    /// a key, so a record posted under the fact's own key can neither stand in for the
-    /// entry nor be mistaken for its dismissal.
+    /// The updater (`update.review.<kind>`, a dev build's writes).
     Update,
-    /// The live agent upgrade's rows (`harness.upgrade.<kind>[.<tab>]`): a
-    /// level-triggered pass over its records, every look.
+    /// The live agent upgrade's rows (`harness.upgrade.<kind>[.<tab>]`): a level-triggered pass over its records, every look.
     Upgrade,
-    /// The upgrade's host (`harness.upgrade-host.<kind>`): a fact the host observes by
-    /// event (the state folder it cannot use). Its prefix is its own because the rows'
-    /// pass sweeps everything under `harness.upgrade.` and would end it
-    /// [`crate::need::RESOLVE_AFTER`] after it was raised.
+    /// The upgrade's host (`harness.upgrade-host.<kind>`): a fact the host observes by event (the state folder it cannot use).
     UpgradeHost,
     /// The resume loop's exceptions (`harness.resume.<kind>`).
     Resume,
     /// The supervisor that keeps failing (`harness.supervisor.<kind>`).
     Supervisor,
-    /// The Claude Code accounts as a whole (`harness.accounts.<kind>`): a fact
-    /// of the machine's roster, not of a tab (an account signed out, a roster
-    /// that is refused). Raised and cleared by the host's look, by event.
+    /// The Claude Code accounts as a whole (`harness.accounts.<kind>`): a fact of the machine's roster, not of a tab (an account signed out, a roster that is refused).
     Accounts,
-    /// The AI CLIs aterm manages (`ai.<cli>.<state>`,
-    /// docs/DESIGN-ai-connections-2026-10-16.md §7.3): a wanted CLI that needs
-    /// a person (signed out, not installed, a login due). A level-triggered
-    /// pass: the window's look states its whole answer every time.
+    /// The AI CLIs aterm manages (`ai.<cli>.<state>`, docs/DESIGN-ai-connections-2026-10-16.md §7.3): a wanted CLI that needs a person (signed out, not installed, a login due).
     Ai,
     /// The toolchain lane.
     Toolchain,
     /// The disk reclaim pass.
     Disk,
-    /// The render stream's repair that gave up (`render.<tab>.unrepaired`): a
-    /// tab the repaint could not put right, so its screen may be drawn a row
-    /// off. Raised at the give-up and cleared when the epoch heals, by event.
+    /// The render stream's repair that gave up (`render.<tab>.unrepaired`): a tab the repaint could not put right, so its screen may be drawn a row off.
     Render,
-    /// What a program in a tab asked the terminal for and the owner's own
-    /// configuration refused (`terminal.<cause>`): a palette set under an
-    /// explicit `allow_palette_reconfigure = false`. One line for every tab, since the
-    /// setting is one; raised by event at a session's first refusal.
+    /// What a program in a tab asked the terminal for and the owner's own configuration refused (`terminal.<cause>`): a palette set under an explicit `allow_palette_reconfigure = false`.
     Terminal,
-    /// Settings a removed feature left behind, where another feature now does
-    /// its work (`removed.<feature>.<cause>`): raised by a config load that
-    /// finds them and cleared by one that does not, by event. Its own prefix,
-    /// apart from the config band's (`config.`), which a clean reload resolves.
+    /// Settings a removed feature left behind, where another feature now does its work (`removed.<feature>.<cause>`): raised by a config load that finds them and cleared by one that does not, by event.
     Removed,
-    /// The tabs whose agent cannot reach its API (`harness.api-outage.<cause>`):
-    /// one fact for every tab the network keeps from it, never one per tab
-    /// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §2.2). A level family: the
-    /// need publication states its whole answer whenever a tab's verdict
-    /// enters or leaves the wait, so the outage ending sweeps it.
+    /// The tabs whose agent cannot reach its API (`harness.api-outage.<cause>`): one fact for every tab the network keeps from it, never one per tab (`docs/DESIGN-owner-surfaces-2026-10-16.md` §2.2).
     ApiOutage,
-    /// The tabs the person took over and has held for half an hour
-    /// (`harness.long-hold.<tab>.taken-over`): one entry per tab, since the
-    /// one act — Hand Back — is per tab. A level family: the window states its
-    /// whole answer whenever a person hold moves and at every look, so a Hand
-    /// Back sweeps its entry (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4).
+    /// The tabs the person took over and has held for half an hour (`harness.long-hold.<tab>.taken-over`): one entry per tab, since the one act — Hand Back — is per tab.
     LongHold,
-    /// The fleet this Mac cannot read (`fleet.unreadable.<cause>`): every
-    /// peer refused at once with no route, which on a Mac is local-network
-    /// privacy until the person allows aterm
-    /// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §3, S10). A level family:
-    /// the fleet glance states its whole answer at every read, so a read that
-    /// reaches a peer again sweeps it.
+    /// The fleet this Mac cannot read (`fleet.unreadable.<cause>`): every peer refused at once with no route, which on a Mac is local-network privacy until the person allows aterm (`docs/DESIGN-owner-surfaces-2026-10-16.md` §3, S10).
     FleetUnreadable,
-    /// The folders whose direct entry count makes everything that lists them
-    /// slow (`vitals.huge-dir.<folder>.entries`,
-    /// docs/DESIGN-system-awareness-2026-10-16.md §10.8). A level family: the
-    /// disk walker's raised set is its whole answer, raised at 100,000 entries
-    /// and kept until a count shows the folder under 75,000. Its stem is its
-    /// own, under `vitals.`, so the system view's other level producers (a
-    /// stuck job, memory, zombies, the disk's time to full, §11.11) each take a
-    /// sibling stem and no producer's pass sweeps another's entries.
+    /// The folders whose direct entry count makes everything that lists them slow (`vitals.huge-dir.<folder>.entries`, docs/DESIGN-system-awareness-2026-10-16.md §10.8).
     HugeDir,
-    /// The fabric bridge's own state dir (`fabric.state.<cause>`): files found
-    /// torn after an unclean stop in an earlier boot, which the first bridge
-    /// after it moved aside into the dir's quarantine
-    /// (`aterm_link::state::StateDir::set_aside_torn`). Raised
-    /// by event when a bridge says so (`link set-aside`); its stem is its own,
-    /// apart from the band's `fabric.hold` and `fabric.<verb>` rows.
+    /// The fabric bridge's own state dir (`fabric.state.<cause>`): files found torn after an unclean stop in an earlier boot, which the first bridge after it moved aside into the dir's quarantine (`aterm_link::state::StateDir::set_aside_torn`).
     FabricState,
 }
 
 impl Family {
-    /// The key stem: `Fingerprint::new(stem, subject, cause)` is an entry's
-    /// key, so `stem` + `.` is the prefix a family pass sweeps.
+    /// The key stem: `Fingerprint::new(stem, subject, cause)` is an entry's key, so `stem` + `.` is the prefix a family pass sweeps.
     #[inline]
     #[must_use]
     pub const fn stem(self) -> &'static str {
@@ -146,11 +86,7 @@ impl Family {
         format!("{}.", self.stem())
     }
 
-    /// How the family's one producer speaks. A [`Mode::Level`] family states its whole
-    /// answer every look (`sync_digest`: what it stops naming ends), so nothing else may
-    /// raise an entry under its prefix; a [`Mode::Event`] family raises and clears by
-    /// event (`post`, `clear_digest`) and is never swept. The host refuses the wrong
-    /// call (`App::except`, `App::except_replace`).
+    /// How the family's one producer speaks.
     #[inline]
     #[must_use]
     pub const fn mode(self) -> Mode {
@@ -231,16 +167,14 @@ pub enum Mode {
     Event,
 }
 
-/// Why an entry cannot be built as written. The host logs it once and the
-/// fact is recorded instead: an owner is never shown words that fail the rule.
+/// Why an entry cannot be built as written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EntryFault {
     /// The `what` is not a glass title.
     What(&'static str),
     /// The reason or the action fails the vocabulary ([`LaterAsk::fault`]).
     Ask(&'static str),
-    /// The navigation beside the action is a decline (`Not today`, `Skip
-    /// version`, `Not now`, `Details`): a decline is never an action.
+    /// The navigation beside the action is a decline (`Not today`, `Skip version`, `Not now`, `Details`): a decline is never an action.
     Decline,
 }
 
@@ -262,12 +196,7 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// An entry of `family`. The fact's identity is `(family, subject, cause)`:
-    /// `subject` names the place when the action is per place (a tab), or is empty when
-    /// one action serves every place; `cause` is a short lowercase word (`own-work`,
-    /// `needed`) and is the only thing that makes a fact new after a dismissal, never a
-    /// version, a pid, an age or a tab set. `what` is the glass-title subject; `why` says
-    /// why the owner and not the machine; `then` is the one action.
+    /// An entry of `family`.
     #[must_use]
     pub fn new(
         family: Family,
@@ -300,26 +229,21 @@ impl Entry {
         self
     }
 
-    /// How long a dismissal holds ([`Resurface::WAIT`] for a wait somebody
-    /// could have ended, [`Resurface::CHOICE`] for the owner's own choice).
+    /// How long a dismissal holds ([`Resurface::WAIT`] for a wait somebody could have ended, [`Resurface::CHOICE`] for the owner's own choice).
     #[must_use]
-    pub fn resurface(mut self, resurface: Resurface) -> Self {
+    pub const fn resurface(mut self, resurface: Resurface) -> Self {
         self.resurface = resurface;
         self
     }
 
-    /// A navigation drawn beside the sentence (`Show tab 1`): it takes the
-    /// owner to where the action is done. It is never the action itself, and a
-    /// decline is refused ([`EntryFault::Decline`]).
+    /// A navigation drawn beside the sentence (`Show tab 1`): it takes the owner to where the action is done.
     #[must_use]
     pub fn show(mut self, nav: Intent) -> Self {
         self.nav = Some(nav);
         self
     }
 
-    /// One line of volatile detail (holders, `--status`): behind `Details ›`,
-    /// at most [`MORE_LINES`], never in the entry's identity or its one-line
-    /// form.
+    /// One line of volatile detail (holders, `--status`): behind `Details ›`, at most [`MORE_LINES`], never in the entry's identity or its one-line form.
     #[must_use]
     pub fn more(mut self, line: impl AsRef<str>) -> Self {
         if self.more.len() < MORE_LINES {
@@ -328,20 +252,16 @@ impl Entry {
         self
     }
 
-    /// The one machine line `aterm.log` keeps when the entry is first raised
-    /// (`upgrade need=own-work tab=s-3e79 move=2.1.283->2.1.284 ...`): what a developer
-    /// greps, never shown to the owner.
+    /// The one machine line `aterm.log` keeps when the entry is first raised (`upgrade need=own-work tab=s-3e79 move=2.1.283->2.1.284 ...`): what a developer greps, never shown to the owner.
     #[must_use]
     pub fn log_line(mut self, line: impl AsRef<str>) -> Self {
         self.log_line = Some(line.as_ref().to_string());
         self
     }
 
-    /// Its words move only when its fact does (a count of the tabs it holds,
-    /// stated as they join and leave), so each restatement is shown at once
-    /// ([`LaterAsk::restated_at_once`]).
+    /// Its words move only when its fact does (a count of the tabs it holds, stated as they join and leave), so each restatement is shown at once ([`LaterAsk::restated_at_once`]).
     #[must_use]
-    pub fn restated_at_once(mut self) -> Self {
+    pub const fn restated_at_once(mut self) -> Self {
         self.at_once = true;
         self
     }
@@ -368,14 +288,9 @@ impl Entry {
             .to_string()
     }
 
-    /// The checked message: a [`crate::need::Need::Later`], glass-title
-    /// `what`, the reason and the action leading its detail, the action's
-    /// button (if any) first among the capsules and the navigation second.
-    ///
+    /// The checked message: a [`crate::need::Need::Later`], glass-title `what`, the reason and the action leading its detail, the action's button (if any) first among the capsules and the navigation second.
     /// # Errors
-    ///
-    /// [`EntryFault`] when the `what` is not a glass title, the reason or the
-    /// action fails the vocabulary, or the navigation is a decline.
+    /// [`EntryFault`] when the `what` is not a glass title, the reason or the action fails the vocabulary, or the navigation is a decline.
     pub fn message(&self) -> Result<Message, EntryFault> {
         if self.what.chars().count() > WHAT_CAP {
             return Err(EntryFault::What("a title over 48 characters"));
@@ -410,7 +325,7 @@ impl Entry {
 
     /// The button the action carries, if one press does it.
     #[must_use]
-    pub fn mover(&self) -> Option<&Mover> {
+    pub const fn mover(&self) -> Option<&Mover> {
         self.then.mover()
     }
 }

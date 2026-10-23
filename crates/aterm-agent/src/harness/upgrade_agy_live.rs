@@ -48,6 +48,7 @@ const SUBAGENTS_CREATED: &str = "Created the following subagents:";
 const SUBAGENTS_KILLED: &str = "Successfully killed";
 
 /// A tool call's argument as agy's transcript keeps it: each a JSON value
+/// written as a string (`"Action": "\"kill\""`, `"MaxIterations": "1"`).
 fn arg(call: &Value, name: &str) -> Option<Value> {
     let raw = call.get("args")?.get(name)?;
     match raw.as_str() {
@@ -74,6 +75,8 @@ fn started_task(content: &str) -> Option<&str> {
 }
 
 /// A cron's expression and prompt in a `RUNNING` row's description (`Task
+/// Description: Cron: */1 * * * *, Prompt: lab cron fired`); `None` for any
+/// other task.
 fn cron_of(content: &str) -> Option<(String, String)> {
     let line = content
         .lines()
@@ -83,6 +86,7 @@ fn cron_of(content: &str) -> Option<(String, String)> {
 }
 
 /// The id a `manage_task` kill's result row names cancelled (`Task "<id>"
+/// cancelled.`).
 fn cancelled_task(content: &str) -> Option<&str> {
     let rest = content.split_once("Task \"")?.1;
     let (id, tail) = rest.split_once('"')?;
@@ -99,6 +103,7 @@ fn sender(content: &str) -> Option<&str> {
 }
 
 /// The subagent a `SYSTEM_MESSAGE` row says went idle (`Subagent <id> has gone
+/// idle`).
 fn gone_idle(content: &str) -> Option<String> {
     let (head, _) = content.split_once(" has gone idle")?;
     let id = head.rsplit("Subagent ").next()?;
@@ -109,6 +114,7 @@ fn gone_idle(content: &str) -> Option<String> {
 #[derive(Debug)]
 struct Task {
     /// A cron's `MaxIterations` (its schedule call's), `Some(None)` for a cron
+    /// with none: it runs until it is cancelled.
     cron: Option<Option<u64>>,
     /// A cron's firings read so far.
     fired: u64,
@@ -281,6 +287,7 @@ pub struct Summary {
 pub struct Unreadable;
 
 /// A `numeric` boolean column as sqlite prints it (`0`/`1`, `false`/`true`);
+/// `None` for anything else.
 fn flag(text: &str) -> Option<bool> {
     match text.trim() {
         "0" | "false" => Some(false),
@@ -332,6 +339,7 @@ pub fn summary_gate(s: &Result<Option<Summary>, Unreadable>) -> Result<(), &'sta
 pub const WAKE_SETTLE_MS: u64 = 5_000;
 
 /// The priority of a message that wakes nothing (the restart notice, a
+/// cancelled task's end): it waits for the person's next message.
 const QUIET_PRIORITY: &str = "MESSAGE_PRIORITY_LOW";
 
 /// Single inbox message file metadata and contents.
@@ -421,6 +429,7 @@ pub fn gate(l: &Look) -> Result<(), &'static str> {
 }
 
 /// What a character of a word sits inside, innermost last in
+/// [`simple_commands`]' stack.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Nest {
     Single,
@@ -433,6 +442,9 @@ enum Nest {
 }
 
 /// The words of `line` (a command line as the shell's integration recorded
+/// it, as typed), one list per simple command: split at every blank and every
+/// `;`, `&`, `|`, `(`, `)`, `{`, `}` or newline that no quote, `$(…)`, `${…}`
+/// or backtick holds.
 fn simple_commands(line: &str) -> Vec<Vec<String>> {
     let mut commands: Vec<Vec<String>> = Vec::new();
     let mut current: Vec<String> = Vec::new();

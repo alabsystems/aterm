@@ -108,6 +108,7 @@ pub const RETIRED_HOOK_LINE: &str =
      that runs it";
 
 /// `aterm link hook …`, any arguments: exit 0, nothing on stdout, one stderr line
+/// ([`RETIRED_HOOK_LINE`]).
 fn retired_hook() -> ExitCode {
     use std::io::IsTerminal as _;
     let stdin = std::io::stdin();
@@ -185,6 +186,7 @@ pub(crate) struct Parsed {
 }
 
 /// One printed column as one safe token: printable ASCII, no whitespace, no escape sequence,
+/// `-` when empty.
 fn column(raw: &str) -> String {
     let mut safe = crate::pct::encode(&crate::pct::decode(raw));
     if safe.len() > crate::glance::ATTENTION_CAP {
@@ -199,9 +201,12 @@ fn column(raw: &str) -> String {
 }
 
 /// `pct::encode("…")` — the mark a truncated column ends with, spelled in the
+/// escape so a row stays printable ASCII.
 const ELLIPSIS: &str = "%E2%80%A6";
 
 /// `aterm-link ls` — every node's roster: `Last{/f/<F>/pub/*/*/presence}`, which
+/// is one bounded last-value walk and no filesystem scan, no `dial`, and no
+/// saved peer names.
 fn roster(cfg: &Config, attention_only: bool) -> std::io::Result<()> {
     let (mut client, _closer) = transport::connect(&cfg.broker, crate::fabric::IO_TIMEOUT)
         .map_err(|e| {
@@ -223,6 +228,7 @@ fn roster(cfg: &Config, attention_only: bool) -> std::io::Result<()> {
 }
 
 /// One roster line, and whether it is an escalation; split out of [`roster`] so §7's column
+/// set is testable without a broker.
 fn row(subject: &str, body: &crate::body::Body) -> (String, bool) {
     let segs: Vec<&str> = subject.split('/').collect();
     let node = column(segs.get(4).unwrap_or(&"-"));
@@ -687,6 +693,7 @@ fn signal_name(sig: i32) -> &'static str {
 }
 
 /// Block `SIGTERM`, `SIGINT` and `SIGHUP` on the main thread (before worker threads spawn)
+/// and unpark `main` when one arrives so astream flushes and marks the log `Closed`.
 #[cfg(unix)]
 fn take_stop_signals(main: std::thread::Thread) -> Option<StopSignal> {
     let taken = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
@@ -727,6 +734,7 @@ pub fn log_refusal_remedy(kind: std::io::ErrorKind, log: &str) -> Option<String>
 }
 
 /// `aterm link broker --repair <log>`: truncate `<log>` at its first corrupt record via
+/// `BrokerLog::open_repair` (`nothing to repair` if clean).
 fn repair_log(log: &str) -> ExitCode {
     match std::fs::metadata(log) {
         Ok(m) if m.is_file() => {}
@@ -768,9 +776,12 @@ fn repair_log(log: &str) -> ExitCode {
 }
 
 /// How often a serving broker looks at its executable: slow, because a
+/// replaced build can wait half a minute and the look is one `stat`.
 const EXE_WATCH: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A file's identity (device, inode, length, mtime), so a replaced executable (a new inode
+/// renamed over the path, or the same inode rewritten) is told from the one a process started
+/// from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileId {
     dev: u64,
@@ -802,6 +813,8 @@ impl FileId {
 }
 
 /// The running image, not a pathname an update may already have replaced: on Linux
+/// `/proc/self/exe`'s metadata; elsewhere `crate::fabric::running_image_inode`, which keeps the
+/// original inode when `current_exe` names another file.
 enum RunningImage {
     File(FileId),
     #[cfg(not(target_os = "linux"))]
@@ -840,7 +853,7 @@ impl RunningImage {
     }
 }
 
-/// The supervisor's invocation, without resolving its final symlink. Watching
+/// The supervisor's invocation, without resolving its final symlink.
 fn invocation_path(
     argv0: &std::ffi::OsStr,
     path: Option<&std::ffi::OsStr>,
@@ -881,6 +894,7 @@ impl ExeWatch {
 }
 
 /// Whether the broker's executable has been replaced, so it should exit for its supervisor to
+/// start the new build.
 fn replaced(start: &RunningImage, seen: Option<&FileId>, now: &std::io::Result<FileId>) -> bool {
     matches!(now, Ok(now) if !start.matches(now) && seen == Some(now))
 }
@@ -1036,6 +1050,7 @@ mod tests {
     }
 
     /// A replacement is a different file, settled over two looks (renamed over the path or
+    /// rewritten in place); the same file, or a gone or non-regular path, never is.
     #[test]
     fn a_broker_exits_only_for_a_settled_replacement_of_its_executable() {
         let dir = std::env::temp_dir().join(format!("atlink-exe-{}", std::process::id()));
@@ -1161,6 +1176,7 @@ mod tests {
     }
 
     /// **`ls` PRINTS §7's ROW.** The columns with no writer are asserted
+    /// PRESENT and `-` ("unknown"), and no body moves an operator's cursor.
     #[test]
     fn ls_prints_section_7s_columns_one_safe_token_each() {
         let (body, _) = crate::body::Body::decode(

@@ -344,6 +344,7 @@ pub fn run_provision(
 }
 
 /// The label of every open item, with the word it is counted under: what the closing
+/// verdict names.
 #[cfg(unix)]
 fn open_labels(checks: &[(&'static str, Check)]) -> Vec<String> {
     checks
@@ -358,6 +359,8 @@ fn open_labels(checks: &[(&'static str, Check)]) -> Vec<String> {
 }
 
 /// rustup's `trust` entry through atpkg's own seam pass (`aterm pkg repair`): a first
+/// attach where it is absent and trust is installed, a stale or dangling link re-pointed
+/// at atpkg's view, and anything it did not lay left alone with the one fix.
 #[cfg(unix)]
 fn seam(home: &Path, report: &mut dyn FnMut(&str)) {
     let xdg = std::env::var_os("XDG_CONFIG_HOME")
@@ -374,12 +377,13 @@ fn seam(home: &Path, report: &mut dyn FnMut(&str)) {
 }
 
 /// Everything the closing structure needs, gathered so the results print together, not
+/// under the mint's `=== NEXT ===` heading where they would read as instructions.
 #[cfg(unix)]
 struct Closing<'a> {
     id: &'a str,
     home: &'a str,
     check_only: bool,
-    /// The mint's own report, when this run minted. `None` on `--check` and on every
+    /// The mint's own report, when this run minted.
     report: Option<&'a atpkg_keys::provision::Report>,
     profile: Option<&'a Check>,
     authority: Option<String>,
@@ -485,6 +489,7 @@ fn cut_dry_run_next(profile_path: &Path) -> String {
 }
 
 /// One band header: a heading and nothing else on the line, at column 2, because column 0
+/// belongs only to the closing verdict.
 #[cfg(unix)]
 fn band(name: &str) {
     println!();
@@ -594,6 +599,9 @@ fn close(c: Closing<'_>) -> Result<()> {
 }
 
 /// The in-process join ceremony: the `preflight → verify_master → plan → write_pins →
+/// write_rest` sequence the `atpkg-keys` CLI runs, so its rules hold unchanged (the phrase
+/// from `/dev/tty` only, a mistype caught against the committed anchor before any write,
+/// `create_new` on the key file).
 #[cfg(unix)]
 fn mint(repo: &Path, id: &str, roster_path: &Path) -> Result<atpkg_keys::provision::Report> {
     use atpkg_keys::{master, provision as prov};
@@ -665,6 +673,7 @@ struct Candidate {
 }
 
 /// Verify-then-parse — the only admission path, same rule as every client: no
+/// unverified roster bytes are ever compared, installed, or trusted for a seq.
 #[cfg(unix)]
 fn admit_candidate(
     master_pubkeys: &[&str],
@@ -684,6 +693,8 @@ fn admit_candidate(
 }
 
 /// The pair already in `dist/`, admitted, or a hard error when local roster state exists
+/// that cannot be proven (a half pair, an orphan signature, a body that fails
+/// verification).
 #[cfg(unix)]
 fn read_local_candidate(roster_path: &Path) -> Result<Option<Candidate>> {
     let sig_path = machines::RosterDocument::signature_path(roster_path);
@@ -734,17 +745,19 @@ fn fetch_channel_candidate(slug: &str) -> std::result::Result<Candidate, String>
 }
 
 /// Marker prefix `fetch_channel_candidate` puts on the one failure that is NOT
+/// "cannot tell": the roster body answered a clean 404 — no roster published yet.
 #[cfg(unix)]
 const NO_CHANNEL_ROSTER: &str = "no roster on the channel";
 
 /// `https://github.com/<slug>/releases/latest/download/<asset>`: the anonymous asset path,
+/// not `gh`.
 #[cfg(unix)]
 fn release_asset_url(slug: &str, asset: &str) -> String {
     // github.com/{slug}/releases/latest/download/{asset}")
     format!("https://github.com/{slug}/releases/latest/download/{asset}")
 }
 
-/// One bounded anonymous download. The caps mirror the update client's roster limits
+/// One bounded anonymous download.
 #[cfg(unix)]
 fn curl_fetch(url: &str, cap: usize) -> std::result::Result<Vec<u8>, String> {
     let cap_s = cap.to_string();
@@ -777,6 +790,7 @@ fn curl_fetch(url: &str, cap: usize) -> std::result::Result<Vec<u8>, String> {
 }
 
 /// Newest generation wins between `dist/` and the channel; pure, so the rule is testable
+/// without a network.
 #[cfg(unix)]
 fn choose_candidate(
     roster_path: &Path,
@@ -844,12 +858,15 @@ fn choose_candidate(
 }
 
 /// Take the roster pair's writer lock (the same `flock`, on the same path, every
+/// `atpkg-keys` roster ceremony takes) and complete forward any redo transaction a dead
+/// run left committed.
 #[cfg(unix)]
 fn lock_roster_pair(roster_path: &Path) -> Result<atpkg_keys::provision::RosterLock> {
     atpkg_keys::provision::lock_roster(&utf8_path(roster_path)?).map_err(Error::new)
 }
 
 /// The pair a write is about to replace, read under its lock: the redo transaction's
+/// recorded predecessor and its compare-and-swap premise in one.
 #[cfg(unix)]
 fn pair_premise(roster_path: &Path) -> Result<Option<atpkg_keys::provision::RosterSnapshot>> {
     let sig_path = machines::RosterDocument::signature_path(roster_path);
@@ -880,6 +897,7 @@ fn install_pair(
 }
 
 /// The write itself, over bytes a caller has already proven (`install_pair` for an
+/// admitted candidate, [`keep_roster_pair`] for a pair `authorize_cut` accepted).
 #[cfg(unix)]
 fn write_pair(
     lock: &atpkg_keys::provision::RosterLock,
@@ -919,6 +937,7 @@ pub(crate) fn publish_proven_pair(
 }
 
 /// This machine's durable copy of the roster generation its key is named in: under
+/// `~/.aterm` beside the key, outside any checkout a `git clean` can sweep.
 #[cfg(unix)]
 fn kept_roster_path(home: &str) -> PathBuf {
     Path::new(home)
@@ -927,7 +946,7 @@ fn kept_roster_path(home: &str) -> PathBuf {
         .join(roster::ROSTER_ASSET)
 }
 
-/// Copy the pair `authorize_cut` just accepted into `~/.aterm/roster`. `Ok(true)` when a
+/// Copy the pair `authorize_cut` just accepted into `~/.aterm/roster`.
 #[cfg(unix)]
 fn keep_roster_pair(roster_path: &Path, kept_path: &Path) -> Result<bool> {
     let doc = machines::RosterDocument::read(roster_path)?;
@@ -957,6 +976,7 @@ fn keep_roster_pair(roster_path: &Path, kept_path: &Path) -> Result<bool> {
 }
 
 /// Restore `dist/` from the kept copy, only when dist/ holds neither half (a half or
+/// unverifiable dist/ pair stays `read_local_candidate`'s hard stop).
 #[cfg(unix)]
 fn restore_kept_pair(
     lock: &atpkg_keys::provision::RosterLock,
@@ -973,7 +993,7 @@ fn restore_kept_pair(
     Ok(true)
 }
 
-/// One audit line: proven, missing-with-remedy, or impossible on this host. A `Skip` is
+/// One audit line: proven, missing-with-remedy, or impossible on this host.
 #[cfg(unix)]
 #[derive(Debug)]
 enum Check {
@@ -983,22 +1003,26 @@ enum Check {
         fix: String,
     },
     /// Waiting on the operator (the certificate request is at Apple): a step to take, not a
+    /// fault to repair.
     Todo {
         what: String,
         next: String,
     },
     /// A gap only the owner can close: an account act no command here takes (Apple's
+    /// developer agreement).
     Owner {
         what: String,
         fix: String,
     },
     /// The check could not be asked (Apple's service did not answer at all): no
+    /// verdict either way.
     CouldNotRun(String),
     Skip(String),
 }
 
 #[cfg(unix)]
 /// One marker vocabulary, matching the words the summary counts in (`gaps()`: "gap",
+/// "waiting").
 #[cfg(unix)]
 fn print_check(label: &str, c: &Check) {
     match c {
@@ -1024,6 +1048,7 @@ fn print_check(label: &str, c: &Check) {
 }
 
 /// The Trust stage2 toolchain, proven by the probe a cut runs: resolve it, run
+/// `trustc --version`, then smoke-compile a probe through the native lane.
 #[cfg(unix)]
 fn toolchain_check(repo: &Path) -> (Check, Option<PathBuf>) {
     match gates::trustc_probe(repo) {
@@ -1079,6 +1104,7 @@ fn verifiers_check(bin: &Path) -> Check {
 
 #[cfg(unix)]
 /// The remedy for "the driver is there, its directory is not on PATH", shared by
+/// [`doc_tool_check`]'s two arms.
 fn path_persist_fix(dir: &Path) -> String {
     format!(
         "echo 'export PATH=\"{d}:$PATH\"' >> ~/.zshrc && exec zsh\n\
@@ -1089,6 +1115,9 @@ fn path_persist_fix(dir: &Path) -> String {
 }
 
 /// The rustup proxies the ONE build runs cargo through
+/// ([`crate::buildplan::release_rustup_shim_dir`]), asked exactly as the build asks: it
+/// refuses unless `cargo` and `rustup` there are real files of this user's, neither group-
+/// nor world-writable.
 #[cfg(unix)]
 fn rust_shim_check(home: &str) -> Check {
     match crate::buildplan::release_rustup_shim_dir(std::ffi::OsStr::new(home)) {
@@ -1106,7 +1135,7 @@ fn rust_shim_check(home: &str) -> Check {
     }
 }
 
-/// The doc-tool farm link, `~/.local/bin/trustdoc` symlinked at the live stage2. targo
+/// The doc-tool farm link, `~/.local/bin/trustdoc` symlinked at the live stage2.
 #[cfg(unix)]
 fn doc_tool_check(home: &str, check_only: bool) -> Check {
     let path_var = std::env::var_os("PATH").unwrap_or_default();
@@ -1173,6 +1202,7 @@ fn doc_tool_check(home: &str, check_only: bool) -> Check {
 }
 
 /// First executable `name` on `path`: the PATH walk cargo's bare-name `[build] rustdoc`
+/// resolves through, pure over the PATH value.
 #[cfg(unix)]
 fn resolve_on_path(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
     std::env::split_paths(path)
@@ -1190,6 +1220,7 @@ fn executable(p: &Path) -> bool {
 }
 
 /// Create `farm` → `target`, repairing only what is safely mechanical: nothing there, or a
+/// symlink whose follow fails with `NotFound`.
 #[cfg(unix)]
 fn link_farm(farm: &Path, target: &Path) -> std::result::Result<(), String> {
     match std::fs::symlink_metadata(farm) {
@@ -1228,6 +1259,8 @@ fn link_farm(farm: &Path, target: &Path) -> std::result::Result<(), String> {
 }
 
 /// The front door of every host lane (`targo --unverified ship …`, `targo --unverified
+/// test`, the cut's own build) is the stage2's `targo` beside its `trustc`; this row proves
+/// both answer `--version` from the resolved bin dir.
 #[cfg(unix)]
 fn front_door_check(bin: &Path) -> Check {
     front_door_verdict(bin, |tool| {
@@ -1243,7 +1276,7 @@ fn front_door_check(bin: &Path) -> Check {
     })
 }
 
-/// The front-door verdict, pure over the `--version` probe so both outcomes are tests. The
+/// The front-door verdict, pure over the `--version` probe so both outcomes are tests.
 #[cfg(unix)]
 fn front_door_verdict(
     bin: &Path,
@@ -1288,6 +1321,8 @@ fn front_door_verdict(
 
 /// The x86_64 compat slice of the universal binary rides upstream stable.
 /// STOCK EXCEPTION (Trust lacks an x86_64-apple-darwin std: `targo --unverified check
+/// --target x86_64-apple-darwin -p aterm` fails E0463, can't find crate for `std`); this
+/// row audits that stock lane, nothing else.
 #[cfg(unix)]
 fn x86_slice_check() -> Check {
     if !cfg!(target_os = "macos") {
@@ -1343,6 +1378,8 @@ fn apple_clt_check() -> Check {
 }
 
 /// This machine's own Developer ID identity, acquired rather than copied: [`crate::apple`]
+/// mints the keypair and CSR here and imports the certificate Apple issues, so no private
+/// key crosses a machine boundary.
 #[cfg(unix)]
 fn apple_identity_check(
     id: &str,
@@ -1381,6 +1418,7 @@ fn apple_identity_check(
 }
 
 /// Fail and Todo both block a cut: a machine still waiting on its certificate cannot
+/// publish, and must not consume an irreversible roster id on a half-finished audit.
 #[cfg(unix)]
 fn blockers(checks: &[(&'static str, Check)]) -> usize {
     let (fails, waiting) = tally(checks);
@@ -1388,6 +1426,7 @@ fn blockers(checks: &[(&'static str, Check)]) -> usize {
 }
 
 /// Faults and things merely waiting, counted apart: a `Todo`'s remedy is to wait, so the
+/// summary never calls it a fault.
 #[cfg(unix)]
 fn tally(checks: &[(&'static str, Check)]) -> (usize, usize) {
     let count = |f: fn(&Check) -> bool| checks.iter().filter(|(_, c)| f(c)).count();
@@ -1416,6 +1455,7 @@ fn gaps(fails: usize, waiting: usize) -> String {
 }
 
 /// `crate::apple::APPLE_LABEL`, spelled where the release reads it on every host
+/// (apple.rs is unix-only; a test holds the two equal).
 const APPLE_LABEL: &str = "apple id";
 
 /// One provisioning finding, as `ship release` reads it ([`audit`]).
@@ -1545,6 +1585,9 @@ pub fn audit(_repo: &std::path::Path, _id: &str) -> Vec<Finding> {
 }
 
 /// One [`Check`] as the release reads it, by its cause, never its label: an owner gap or a
+/// person's errand at Apple ([`Check::Todo`]) is the owner's, a [`Check::Fail`] (a file
+/// mode, a missing tool, a keychain) is the machine's, and an unanswered check is
+/// [`Audited::CouldNotRun`].
 #[cfg(unix)]
 fn audited(check: Check) -> Audited {
     match check {
@@ -1638,6 +1681,7 @@ pub fn ask_words(label: &str, what: &str) -> AskWords {
 }
 
 /// The cut's own admission gate, spelled once so the pre-Apple check and the post-mint
+/// bind cannot drift apart, refusal included.
 #[cfg(unix)]
 fn authorize(bytes: Vec<u8>, sig: &[u8], pubkey: &str) -> Result<roster::Attribution> {
     machines::authorize_cut(
@@ -1659,6 +1703,7 @@ fn authorize(bytes: Vec<u8>, sig: &[u8], pubkey: &str) -> Result<roster::Attribu
 }
 
 /// One numbered phase header, and the only place the plan is stated: `[3/5]` carries the
+/// position and the length while provision waits, sometimes for minutes.
 #[cfg(unix)]
 fn phase(n: usize, name: &str, what: &str) {
     println!();
@@ -1666,6 +1711,7 @@ fn phase(n: usize, name: &str, what: &str) {
 }
 
 /// Store the notarytool credential if it is absent, then live-check it either way: the
+/// acquisition is believed only once Apple has answered through it.
 #[cfg(unix)]
 fn notary_acquire(may_change: bool) -> Check {
     match notary_check() {
@@ -1684,6 +1730,7 @@ fn notary_acquire(may_change: bool) -> Check {
 }
 
 /// Live-tested, not presence-tested: `notarytool history` proves the stored credential
+/// authenticates against Apple.
 #[cfg(unix)]
 fn notary_check() -> Check {
     if !cfg!(target_os = "macos") {
@@ -1708,6 +1755,7 @@ fn notary_check() -> Check {
 }
 
 /// What `notarytool history` answered, as a verdict, every line of its output read (pure,
+/// so each answer Apple gives is a test).
 #[cfg(unix)]
 fn notary_verdict(profile: &str, success: bool, stdout: &str, stderr: &str) -> Check {
     if success {
@@ -1769,7 +1817,7 @@ fn notary_verdict(profile: &str, success: bool, stdout: &str, stderr: &str) -> C
     }
 }
 
-/// The credentials profile a Tier APPLE cut names on its command line. The cut has no
+/// The credentials profile a Tier APPLE cut names on its command line.
 #[cfg(unix)]
 fn profile_check(
     home: &str,
@@ -1890,6 +1938,9 @@ fn gh_check() -> Check {
 }
 
 /// What `gh auth status` answered, by its cause (pure, so each answer is a test): a
+/// missing or refused login is the owner's ([`Check::Owner`]); a `GITHUB_TOKEN`/`GH_TOKEN`
+/// in this shell (gh prefers it over its keyring) and a missing `gh` are this machine's;
+/// a network that did not answer is [`Check::CouldNotRun`].
 #[cfg(unix)]
 fn gh_verdict(ran: std::result::Result<(bool, String), String>) -> Check {
     let (ok, text) = match ran {
@@ -1940,6 +1991,7 @@ fn gh_verdict(ran: std::result::Result<(bool, String), String>) -> Check {
 }
 
 /// The channel repo is a different org than the dev remote, so `gh`'s default account
+/// cannot publish there; the cut threads a dedicated token from a file.
 #[cfg(unix)]
 fn channel_token_check(slug: &str, may_change: bool) -> Check {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1968,6 +2020,8 @@ fn channel_token_check(slug: &str, may_change: bool) -> Check {
 }
 
 /// The channel token's verdict, by its cause (pure, so each case is a test): none at all
+/// is the owner's to mint ([`Check::Owner`]); a file open to group or others is this
+/// machine's to `chmod` ([`Check::Fail`]).
 #[cfg(unix)]
 fn channel_token_verdict(
     where_it_lives: &str,
@@ -2036,6 +2090,8 @@ mod tests {
     use super::*;
 
     /// The audit's shim line is the build's own refusal: a symlinked cargo (how one
+    /// machine's rustup linked it) fails with the build's words, and the same proxy as a
+    /// hard link passes.
     #[cfg(unix)]
     #[test]
     fn a_symlinked_cargo_proxy_fails_the_audit_as_it_fails_the_build() {
@@ -2066,6 +2122,8 @@ mod tests {
     }
 
     /// notarytool's answers, every line read: Apple's agreement 403 is the owner's (never
+    /// `store-credentials`), a refused credential or missing keychain item is
+    /// `store-credentials`, and no answer is COULD NOT RUN.
     #[test]
     fn notary_answers_are_classified_by_every_line_they_carry() {
         let agreement = "Error: HTTP status code: 403. A required agreement is missing or has \
@@ -2129,6 +2187,7 @@ mod tests {
     }
 
     /// A gap is the owner's by its cause (a token to mint, a browser login, an Apple
+    /// agreement or password), never a file mode this machine fixes or a silent network.
     #[test]
     fn a_gap_is_the_owners_by_its_cause_not_its_label() {
         let at = "~/.secrets/gh_access_token_alabsystems";
@@ -2175,6 +2234,7 @@ mod tests {
     }
 
     /// Every ask the release can raise is one the wire stands: title, reason and step within
+    /// their caps, parsed by the wire itself.
     #[test]
     fn every_owner_ask_is_one_the_wire_stands() {
         for (label, what) in [
@@ -2214,6 +2274,7 @@ mod tests {
     use aterm_update_core::roster::{Machine, SUPPORTED_SCHEMA};
 
     /// A synthetic paper phrase, built at runtime so no phrase-shaped literal exists in
+    /// this file (the census guard `key-material` reads it).
     fn seed() -> atpkg_keys::master::MasterSeed {
         let phrase = "2".repeat(52);
         atpkg_keys::master::parse_master(&phrase)
@@ -2367,6 +2428,7 @@ mod tests {
     }
 
     /// A fresh Ed25519 keypair as base64 PKCS#8 (the shape `signing_key` carries) and the
+    /// public key it derives.
     #[cfg(target_os = "macos")]
     fn signing_key_b64() -> (String, String) {
         use ring::signature::KeyPair as _;
@@ -2381,6 +2443,7 @@ mod tests {
     }
 
     /// The audit refuses exactly what the cut refuses: each profile below is one the cut
+    /// rejects on its first line.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_profile_audit_refuses_what_the_cut_refuses() {
@@ -2474,6 +2537,7 @@ mod tests {
     }
 
     /// The authorized generation is kept outside the sweepable checkout, so a `git clean
+    /// -xdf` before the next cut cannot destroy the only copy.
     #[test]
     fn the_authorized_generation_is_kept_outside_the_sweepable_checkout() {
         let dir = std::env::temp_dir().join(format!("provision-keep-{}", std::process::id()));
@@ -2567,6 +2631,7 @@ mod tests {
     }
 
     /// The remedy for a stage2 missing its verifiers names the Trust checkout's
+    /// `bootstrap.toml`, never a home-folder path, and carries the from-source command.
     #[test]
     fn a_stage2_missing_its_verifiers_is_rebuilt_in_a_trust_checkout() {
         let bin = std::env::temp_dir().join(format!("provision-verifiers-{}", std::process::id()));
@@ -2673,6 +2738,7 @@ mod tests {
     }
 
     /// A death between phase 1's two renames converges forward: the next run's lock replays
+    /// the committed redo.
     #[test]
     fn a_death_between_the_phase_one_pair_renames_recovers_forward() {
         let dir =

@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The conditional `screen` read's promise, held over the host's changes as well as the
-//! program's: the etag moves whenever the frame would, or a poller is told `unchanged` about a
-//! stale picture. Output moves [`Terminal::screen_mutations`]; a config reload, a selection, a
-//! resize or a reset change the frame with no output and must reach the etag another way. A
-//! GUI scroll changes nothing the frame shows (the frame is the live screen), so it moves
-//! neither the frame nor the etag. So "frame moved ⇒ etag moved" is checked over a corpus whose
-//! every arm moves the frame, and over a seeded random walk in which two visited states may
-//! share an etag only if they share a frame.
-//!
-//! The negative control, `content_seq` alone, runs through the same corpus and walk and must be
-//! caught.
-//!
-//! A child of `control_query`, so it reads the private etag.
+//! Screen etag invalidation tests ([`Terminal::screen_mutations`]).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -43,8 +31,7 @@ fn served_etag(reply: &str) -> String {
     reply[at..at + 16].to_string()
 }
 
-/// Kitty graphics: transmit-and-display a 2x1-pixel RGBA image as image `id` over 2x1 cells,
-/// `C=1` (the cursor does not move), `q=2` (no reply).
+/// Kitty graphics.
 fn kitty_place(id: u32, fill: u8) -> Vec<u8> {
     let b64 = aterm_codec::base64::encode(&[fill; 8]).expect("encode");
     format!("\x1b_Ga=T,f=32,s=2,v=1,c=2,r=1,C=1,q=2,i={id};{b64}\x1b\\").into_bytes()
@@ -55,8 +42,7 @@ fn kitty_delete(id: u32) -> Vec<u8> {
     format!("\x1b_Ga=d,d=I,q=2,i={id}\x1b\\").into_bytes()
 }
 
-/// Kitty graphics: store image `id` (10x20 RGBA, one fill byte) without
-/// placing it (`a=t`).
+/// Kitty graphics: store image `id` (10x20 RGBA, one fill byte) without placing it (`a=t`).
 fn kitty_store(id: u32, fill: u8) -> Vec<u8> {
     let raw = vec![fill; 10 * 20 * 4];
     let b64 = aterm_codec::base64::encode(&raw).expect("encode");
@@ -74,36 +60,29 @@ fn kitty_placeholder(id: u8) -> Vec<u8> {
     ph
 }
 
-/// iTerm2 OSC 1337: an inline 3x1-cell image. The engine carries no codec, so
-/// the payload need not decode; the frame ships its bytes either way.
+/// iTerm2 OSC 1337: an inline 3x1-cell image.
 fn osc1337_image(payload: &[u8]) -> Vec<u8> {
     let b64 = aterm_codec::base64::encode(payload).expect("encode");
     format!("\x1b]1337;File=inline=1;width=3;height=1:{b64}\x07").into_bytes()
 }
 
-/// A terminal plus the host config it was last handed: the reload arms change one field of it
-/// and apply it the way the GUI's config reload does.
+/// A terminal plus the host config it was last handed.
 struct Rig {
     t: Terminal,
     config: TerminalConfig,
 }
 
-/// A bold palette-3 cell and a dim cell: the host style policy (`bold_is_bright`,
-/// `faint_opacity`) re-resolves exactly these two without writing the grid.
+/// A bold palette-3 cell and a dim cell.
 const BOLD_AND_DIM: &[u8] = b"\x1b[1;33mB\x1b[0m \x1b[2mD\x1b[0m";
 
 fn rig() -> Rig {
     let mut t = Terminal::new(6, 20);
-    // Kitty placeholders resolve against real cell metrics.
     t.set_cell_pixel_size(10, 20);
-    // OSC 4 SET is fail-closed behind this; set through the config, so a reload arm that
-    // re-applies it does not switch it off again.
     let config = TerminalConfig {
         allow_palette_reconfigure: true,
         ..TerminalConfig::default()
     };
     t.apply_config(&config);
-    // History, so the viewport has somewhere to scroll.
     for i in 0..10 {
         t.process(format!("history {i}\r\n").as_bytes());
     }
@@ -111,8 +90,7 @@ fn rig() -> Rig {
     Rig { t, config }
 }
 
-/// `inner` written at 1-based `(1, col)` with the cursor (and SGR) saved and
-/// restored around it, so the write moves nothing but the cell it lands on.
+/// `inner` written at 1-based `(1, col)` with the cursor (and SGR) saved and restored around it.
 fn at_top_left(r: &mut Rig, col: u16, inner: &str) {
     r.t.process(format!("\x1b7\x1b[1;{col}H{inner}\x1b8").as_bytes());
 }
@@ -125,13 +103,9 @@ fn glyph_at(r: &Rig, col: u16) -> String {
 
 type Step = (&'static str, fn(&mut Rig));
 
-/// Every arm must move the frame (checked per arm); the order builds the state later arms
-/// need. The host-only arms (config reload, selection, resize, host reset) feed no output, so
-/// only what the etag reads of the terminal's state can see them.
+/// Every arm must move the frame (checked per arm); the order builds the state later arms need.
 fn corpus() -> Vec<Step> {
     let steps: &[Step] = &[
-        // Host style policy, applied as a config reload does: resolved at render time, with no
-        // grid write, seq move or output. First, so the reload changes nothing else on screen.
         ("config reload: bold_is_bright", |r| {
             r.config.bold_is_bright = !r.config.bold_is_bright;
             r.t.apply_config(&r.config);
@@ -140,11 +114,6 @@ fn corpus() -> Vec<Step> {
             r.config.faint_opacity = 0.9;
             r.t.apply_config(&r.config);
         }),
-        // Host palette from a config reload: re-colours the bold cell (palette 3 now that bold
-        // is not bright) with no output. While no program colour differs from the config's,
-        // only the palette reaches the etag; later palette changes are OSC 4, which moves
-        // `screen_mutations` too. Entry 11 keeps its default, so making bold bright again
-        // later still re-colours that cell.
         ("config reload: custom_palette", |r| {
             let mut palette = aterm_types::ColorPalette::new();
             palette.set(3, aterm_types::Rgb::new(0x12, 0x9a, 0x6c));
@@ -152,8 +121,6 @@ fn corpus() -> Vec<Step> {
             r.t.apply_config(&r.config);
         }),
         ("write text", |r| r.t.process(b"hello")),
-        // The glyph a cell already holds, written over it: of everything the
-        // frame shows, only `seq` moves.
         ("rewrite a cell with the glyph it holds", |r| {
             let glyph = glyph_at(r, 1);
             at_top_left(r, 1, &glyph);
@@ -217,7 +184,6 @@ fn corpus() -> Vec<Step> {
         ("wide + combining write", |r| {
             r.t.process("界e\u{301}".as_bytes())
         }),
-        // Cursor saved and restored, so the line size is all that moves.
         ("DEC double width (ESC # 6)", |r| {
             r.t.process(b"\x1b7\x1b[2;1H\x1b#6\x1b8");
         }),
@@ -237,21 +203,16 @@ fn corpus() -> Vec<Step> {
             sel.complete_selection();
         }),
         ("clear the selection", |r| r.t.text_selection_mut().clear()),
-        // The style policy again, over a recoloured screen: this reload also re-asserts the
-        // config's colours, so it is not clean like the first two.
         ("config reload: faint_opacity back", |r| {
             r.config.faint_opacity = 0.5;
             r.t.apply_config(&r.config);
         }),
-        // The cursor goes where the image will land as its own arm, so the placement below
-        // moves the image and nothing else.
         ("cursor to where the image lands", |r| {
             r.t.process(b"\x1b[5;10H")
         }),
         ("kitty image placed, cursor unmoved (C=1)", |r| {
             r.t.process(&kitty_place(7, 0x00));
         }),
-        // Same id, same size, same cell, different pixels.
         ("kitty image replaced by a same-size one", |r| {
             r.t.process(&kitty_delete(7));
             r.t.process(&kitty_place(7, 0xff));
@@ -264,7 +225,6 @@ fn corpus() -> Vec<Step> {
             r.t.process(&kitty_store(5, 0));
             r.t.process(&kitty_placeholder(5));
         }),
-        // No cell written: the placeholder shows whatever image 5 is now.
         ("kitty image re-transmitted under its placeholder", |r| {
             r.t.process(&kitty_store(5, 0xff));
         }),
@@ -295,8 +255,7 @@ type Etag = fn(&Terminal) -> u64;
 
 /// What one pass of the corpus found, per etag under test.
 struct Pass {
-    /// Arms that did not move the frame (must stay empty: a dark arm is an
-    /// untested mutation class wearing a green test).
+    /// Arms that did not move the frame (must stay empty).
     dark: Vec<&'static str>,
     /// Per etag, the arms that moved the frame but not that etag.
     missed: Vec<Vec<&'static str>>,
@@ -316,8 +275,6 @@ fn run_corpus(etags: &[Etag]) -> Pass {
         let (f0, e0) = read(&rig.t);
         step(&mut rig);
         let (f1, e1) = read(&rig.t);
-        // A pure read: two reads of one state, one etag — or the conditional
-        // could never fire at all.
         assert_eq!(e1, read(&rig.t).1, "{name}: two reads, two etags");
         if f0 == f1 {
             pass.dark.push(name);
@@ -332,9 +289,6 @@ fn run_corpus(etags: &[Etag]) -> Pass {
     pass
 }
 
-/// A config reload of `bold_is_bright` or `faint_opacity` re-colours bold and dim cells while
-/// moving none of the counters the etag reads (no output, seq, generation or viewport; asserted
-/// as premises). Only `render_sig` carries it, so a poller holding the old etag gets the
 /// re-coloured frame.
 #[test]
 fn a_host_style_policy_reload_is_not_unchanged() {
@@ -447,10 +401,7 @@ struct Walk {
     collision: Option<String>,
 }
 
-/// A seeded random walk over VT fragments and host operations under `etag`, stopping at the
-/// first etag two different frames share: a token from any earlier state must not match a
-/// different frame now. Host operations feed no output, so the walk revisits etags (a reload
-/// toggled back, a scroll undone), the comparisons that matter.
+/// Run a seeded walk over VT fragments and host operations, returning the first etag collision.
 fn walk(etag: Etag) -> Walk {
     let mut seen: HashMap<u64, String> = HashMap::new();
     let (mut moved, mut revisits) = (0usize, 0usize);
@@ -485,11 +436,9 @@ fn walk(etag: Etag) -> Walk {
     }
 }
 
-/// The seeded walk's 800 steps over a fresh [`rig`], each handed to `visit`
-/// with its index and name once taken; `visit` answers whether to go on.
+/// Drive 800 seeded steps over a fresh [`rig`], calling `visit` after each step.
 fn walk_steps(mut visit: impl FnMut(usize, &'static str, &Rig) -> bool) {
     let mut rig = rig();
-    // xorshift64*: deterministic, no dependency, no clock.
     let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut next = move |n: usize| -> usize {
         state ^= state >> 12;
@@ -508,8 +457,6 @@ fn walk_steps(mut visit: impl FnMut(usize, &'static str, &Rig) -> bool) {
                 rig.t.process(&kitty_delete(3));
                 "kitty delete"
             }
-            // Image 3 stored and named by a placeholder cell at the cursor:
-            // text whose picture a viewport-mapped decode would lose.
             2 => {
                 rig.t
                     .process(&kitty_store(3, u8::try_from(next(256)).unwrap_or(0)));
@@ -580,10 +527,6 @@ fn walk_steps(mut visit: impl FnMut(usize, &'static str, &Rig) -> bool) {
     }
 }
 
-/// The shipped etag over the walk: no two visited frames share an etag, and
-/// the walk had reach — it moved the screen, and it came back to etags it had
-/// already handed out (a repeat etag is the case that matters). The negative
-/// control, `content_seq` alone, must be caught handing one etag to two
 /// frames, or the walk has no teeth.
 #[test]
 fn no_two_visited_states_share_an_etag_unless_they_share_a_frame() {
@@ -609,15 +552,6 @@ fn no_two_visited_states_share_an_etag_unless_they_share_a_frame() {
     );
 }
 
-/// THE PUBLISHED FRAME IS THE FRESH ONE. A session's slot, read over the
-/// seeded walk the way every reader reads it (a look, the keys compared under
-/// the hold, a miss built and published), serves at every step exactly what a
-/// fresh read of the same state builds: the text ([`screen_text`]), its hash
-/// ([`screen_hash`]), and the styled frame. A `cells` hold keeps the frame, as
-/// a `subscribe … cells` watch does. The walk must also HIT, on both halves,
-/// or nothing published was ever served. NEGATIVE CONTROL: a frame memo keyed
-/// on `content_seq` alone is caught serving a stale frame on the same walk (the
-/// text half's control is `frame_memo`'s alt re-entry test: over this walk the
 /// text never changes at an unchanged seq).
 #[test]
 fn the_published_frame_equals_a_fresh_read_over_the_walk() {
@@ -625,7 +559,6 @@ fn the_published_frame_equals_a_fresh_read_over_the_walk() {
     let _cells = FrameSlot::hold_cells(&slot);
     let (mut text_hits, mut frame_hits) = (0usize, 0usize);
     let mut last_text = None;
-    // The negative control: (seq, frame) as of its last build.
     let mut by_seq: Option<(u64, String)> = None;
     let mut stale = None;
     walk_steps(|step, what, rig| {
@@ -682,7 +615,6 @@ fn the_published_frame_equals_a_fresh_read_over_the_walk() {
     );
 }
 
-/// The shipped etag over the corpus misses no arm, and the negative control
 /// (`content_seq` alone) is caught, so the corpus has teeth.
 #[test]
 fn every_incomplete_etag_is_caught_missing_real_frame_changes() {
@@ -700,9 +632,7 @@ fn every_incomplete_etag_is_caught_missing_real_frame_changes() {
     );
 }
 
-/// What a VIEWPORT-relative read of the frame's rows would see: each row's DEC
-/// line size off the display-mapped grid, and each image placement off the
-/// viewport's image reader.
+/// What a VIEWPORT-relative read of the frame's rows would see.
 fn viewport_view(t: &Terminal) -> (Vec<&'static str>, Vec<(usize, usize)>) {
     let rows = t.rows();
     let line_sizes = (0..rows)
@@ -725,20 +655,6 @@ fn viewport_view(t: &Terminal) -> (Vec<&'static str>, Vec<(usize, usize)>) {
     (line_sizes, images)
 }
 
-/// A VIEWPORT SCROLL IS NOT A FRAME CHANGE. Every field of the frame is read
-/// off the live screen, so a person scrolling back through history moves
-/// neither the frame nor the etag, and a poller holding the etag is answered
-/// `unchanged`. The screen carries everything a viewport-relative read would
-/// move — an image on screen, a DEC double-width row, an image scrolled into
-/// history, a Kitty Unicode placeholder on the last row (whose viewport row,
-/// scrolled back, is history text, so a placeholder decoded through the
-/// viewport drops its image) — and the premises assert the viewport readers
-/// do see it move, so the frame standing still is the live read at work, not
-/// an empty screen.
-///
-/// NEGATIVE CONTROL: that premise, a viewport-relative read of the same
-/// screen ([`viewport_view`]), moves on every scroll; an etag folding the
-/// display offset cost every `screen since=` poller a full frame each time
 /// the person touched the wheel.
 #[test]
 fn a_viewport_scroll_moves_neither_the_frame_nor_the_etag() {
@@ -753,7 +669,6 @@ fn a_viewport_scroll_moves_neither_the_frame_nor_the_etag() {
     );
     for (name, scroll) in scrolls {
         let mut t = Terminal::new(6, 20);
-        // Kitty placeholders resolve against real cell metrics.
         t.set_cell_pixel_size(10, 20);
         t.process(&osc1337_image(b"scrolls-into-history"));
         for i in 0..10 {

@@ -1,93 +1,42 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! When to keyframe (the crash-restore plan §2.5): a pure state machine the parse
-//! thread runs and hands the time (milliseconds of a monotonic clock it reads itself).
-//!
-//! A keyframe rebases the tail, so the policy trades a keyframe's cost under the
-//! terminal lock (9 µs for a shell's visible screen, about 100 µs with a 512-line
-//! bridge) against how much a restore must replay and how fast the tail ring fills:
-//!
-//! | rule | trigger | rate |
-//! |---|---|---|
-//! | K1 quiescence | dirty, and no batch for 200 ms | once per burst; an idle session's tail is then empty, and its restore exact |
-//! | K2 periodic | dirty, and ≥ 1 s since the last keyframe | ≤ 1/s |
-//! | K3 tail pressure | the tail since the keyframe ≥ half the ring, ≥ 100 ms since the last keyframe | ≤ 10/s, the bridge capped at 256 lines |
-//! | K4 forced | a clear (ED3, RIS) pending, the config fingerprint changed, or the host renumbered the history with no output (an import attached older history) | rare, never rate-limited; after a clear's keyframe the writer settles the clear (`JournalWriter::settle_clear`) |
-//! | K5 deferred | the capture returned `None`: the parser holds a sequence no keyframe carries whole (a hooked DCS query, an over-cap OSC, an APC or a picture under way), or an OSC 133/633 mark whose nonce the carry would hold | retried at the next slice end, never on a quiet wait: the session parks |
-//! | K6 verified mark | the slice verified an OSC 133/633 mark | shares K3's ≤ 10/s budget; the marks are counted until a keyframe commits either way |
-//! | K7 regridded | a resize changed the width or grew the rows | shares K3's ≤ 10/s budget and bridge; K1 covers the end of a drag |
-//!
-//! K6 exists because a restore replays the tail into an engine that authorizes no
-//! nonce (a restored shell re-keys), where a verified mark would be dropped: a keyframe
-//! taken right after the mark's slice holds the mark's effect, so the tail almost never
-//! holds one for long. The marks are not the policy's to count: the parse thread counts
-//! every slice's verified marks (`JournalWriter::note_marks`) BEFORE that slice's append,
-//! and the next keyframe's commit clears the count. A writer that dies anywhere between
-//! the mark's append and that commit (the K6 keyframe's own encode and copy, a budget the
-//! gap left, a capture K5 deferred) therefore leaves the mark counted, and the restore
-//! says it was not exact rather than lose the prompt's state silently.
-//!
-//! K7 is not in the plan's table. A width change or a rows grow replayed from the tail
-//! depends on engine state no checkpoint carries (where the history sits, ring or store,
-//! and the rows a resize undo stashed), so the recovery counts one and the restore is not
-//! exact (`Losses::regrids_replayed`); the engine conformance test found both cases.
-//! Keyframing soon after such a resize keeps that window short without a keyframe per
-//! drag event: a window drag resizes about 60 times a second.
-//!
-//! The parse thread waits for its next batch with a 200 ms timeout ONLY while the
-//! session is [`dirty`](KeyframePolicy::dirty): an idle session wakes zero times. A
-//! deferred keyframe (K5) does not keep it waking: what refused the capture is the
-//! parser's state, which only new bytes (or a host reset, which arrives as bytes) can
-//! move, so retrying on a quiet wait would fail again five times a second, each try
-//! under the terminal lock, for as long as a program sat inside an unterminated query
-//! (`cat` of a binary holding `ESC P + q`, a program that crashed mid-query). So a
-//! deferral PARKS the session: it reads clean to the wait until the next slice or
-//! resize reaches the tail, whose end retries the keyframe. The tail it holds meanwhile
-//! is what a restore replays, and its unterminated sequence is counted
-//! (`Losses::swallowed`). A keyframe the slot refused for size is not parser-bound: its
-//! retry with no bridge ([`KeyframePolicy::keyframe_retry`]) waits for the next quiet.
+//! Crash-restore keyframe scheduling policy (`KeyframePolicy`).
 
-/// No batch for this long makes a dirty session quiescent (K1).
+/// Idle duration in milliseconds before a dirty session keyframes (`K1`).
 pub const QUIET_MS: u64 = 200;
-/// A dirty session keyframes at least this often (K2).
+/// Maximum interval in milliseconds between keyframes on a continuously active session (`K2`).
 pub const PERIOD_MS: u64 = 1_000;
-/// The least gap between two keyframes under tail pressure or for a mark (K3, K6).
+/// Minimum interval in milliseconds between keyframes under tail pressure or shell marks (`K3`, `K6`).
 pub const PRESSURE_GAP_MS: u64 = 100;
-/// The bridge a keyframe carries normally: about 100 µs under the lock.
+/// Default scrollback bridge line cap for normal keyframes.
 pub const BRIDGE_CAP: usize = 512;
-/// The bridge under tail pressure (K3): about 50 µs, at up to ten keyframes a second.
+/// Reduced scrollback bridge line cap under tail pressure (`K3`) or regrid (`K7`).
 pub const PRESSURE_BRIDGE_CAP: usize = 256;
 
-/// Why a keyframe is due.
+/// Reason a crash-restore keyframe is due.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
-    /// K1: the burst ended.
+    /// Session became quiescent after a burst (`K1`).
     Quiescence,
-    /// K2: a second of output since the last keyframe.
+    /// Periodic 1-second interval elapsed during continuous output (`K2`).
     Periodic,
-    /// K3: the tail since the keyframe filled half the ring.
+    /// Tail ring filled at least half its capacity since the last keyframe (`K3`).
     TailPressure,
-    /// K4: a clear (ED3, RIS) is pending. Once this keyframe commits, the parse thread
-    /// settles the clear (`JournalWriter::settle_clear`): the other slot, the newest
-    /// slot past its record and the tail lose every byte from before the clear.
+    /// Pending history clear (`ED3` / `RIS`) requires a forced keyframe (`K4`).
     Clear,
-    /// K4: the config fingerprint changed, which a replay must not cross.
+    /// Engine configuration fingerprint changed (`K4`).
     Forced,
-    /// K4: the host renumbered the history with no output to follow (an import attached
-    /// older history below it, which advances the fence's renumber epoch): the newest
-    /// keyframe names the old identity, under which the history ring, re-exported under the
-    /// new one, would never join again until the program next wrote.
+    /// Host renumbered scrollback history without new output (`K4`).
     Renumbered,
-    /// K6: the slice verified a shell-integration mark.
+    /// Slice verified an OSC 133/633 shell-integration mark (`K6`).
     Mark,
-    /// K7: a resize changed the width or grew the rows, which a replay does not reproduce
-    /// exactly.
+    /// Resize changed column width or grew row count (`K7`).
     Regrid,
 }
 
 impl Reason {
-    /// The bridge cap a keyframe for this reason is captured with.
+    /// Scrollback bridge line cap for this keyframe reason.
     #[inline]
     #[must_use]
     pub const fn bridge_cap(self) -> usize {
@@ -103,15 +52,14 @@ impl Reason {
     }
 }
 
-/// What the parse thread does after a slice or a quiet wait.
+/// Policy decision returned after a slice or quiet timeout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Decision {
-    /// A keyframe is due, for this reason (its bridge cap is
-    /// [`Reason::bridge_cap`]).
+    /// Due keyframe reason, if any.
     pub keyframe: Option<Reason>,
 }
 
-/// The keyframe policy of one session.
+/// Per-session crash-restore keyframe scheduling state machine.
 #[derive(Debug, Clone)]
 pub struct KeyframePolicy {
     /// The tail ring's capacity (K3 weighs the tail against half of it).
@@ -139,8 +87,7 @@ pub struct KeyframePolicy {
 }
 
 impl KeyframePolicy {
-    /// A policy for a tail ring of `tail_cap` bytes whose first keyframe was taken at
-    /// `now_ms` under config `config_fp`.
+    /// Create a policy for a tail ring of `tail_cap` bytes with an initial keyframe at `now_ms`.
     #[must_use]
     pub fn new(tail_cap: usize, now_ms: u64, config_fp: u64) -> Self {
         Self {
@@ -158,42 +105,32 @@ impl KeyframePolicy {
         }
     }
 
-    /// Whether the session has tail past its keyframe that a quiet wait can keyframe: the
-    /// parse thread then waits for its next batch with a [`QUIET_MS`] timeout, and
-    /// otherwise blocks. A session a K5 deferral parked is not dirty here, though its tail
-    /// is past its keyframe (module doc).
+    /// Whether unkeyframed tail data is awaiting a quiet timeout.
     #[inline]
     #[must_use]
     pub const fn dirty(&self) -> bool {
         self.dirty && !self.parked
     }
 
-    /// A clear (ED3, RIS) reset the history ring: the next slice end or quiet wait forces
-    /// a keyframe ([`Reason::Clear`]), after which the writer settles the clear.
+    /// Record a history clear (`ED3` / `RIS`) to force a keyframe.
     #[inline]
     pub const fn note_clear(&mut self) {
         self.clear_pending = true;
     }
 
-    /// The host renumbered the engine's history with no output (an import attached older
-    /// history): a keyframe is forced at the next slice end or quiet wait
-    /// ([`Reason::Renumbered`]).
+    /// Record a scrollback renumbering to force a keyframe.
     #[inline]
     pub const fn note_renumbered(&mut self) {
         self.renumbered = true;
     }
 
-    /// The host changed the engine-relevant config (stored as `config_fp`): a keyframe
-    /// is forced at the next slice end or quiet wait.
+    /// Update the engine configuration fingerprint, forcing a keyframe if changed.
     #[inline]
     pub const fn note_config(&mut self, config_fp: u64) {
         self.config_fp = config_fp;
     }
 
-    /// A resize reached the tail (the journal lane's nudge, or the catch-up before a
-    /// slice): the session is dirty from `now_ms`, so a quiet keyframe follows at the new
-    /// geometry; a resize that changed the width or grew the rows (`regridded`) makes a K7
-    /// keyframe due as soon as the pressure gap allows.
+    /// Record a terminal resize at `now_ms`, flagging a regrid keyframe when `regridded` is `true`.
     #[inline]
     pub const fn note_resize(&mut self, now_ms: u64, regridded: bool) {
         self.dirty = true;
@@ -210,8 +147,7 @@ impl KeyframePolicy {
         }
     }
 
-    /// A forced or deferred keyframe, which no rate applies to. A pending clear comes
-    /// first, so the keyframe its settle follows is never reported as another reason.
+    /// A forced or deferred keyframe, which no rate applies to.
     #[inline]
     const fn owed(&self) -> Option<Reason> {
         if self.clear_pending {
@@ -225,10 +161,8 @@ impl KeyframePolicy {
         }
     }
 
-    /// One slice was processed and appended at `now_ms`: `tail_since_keyframe` is the
-    /// writer's tail since its newest keyframe, `marks_verified` how far the slice moved
-    /// `Terminal::shell_marks_verified` (which the caller counted before the append).
-    pub fn after_slice(
+    /// Evaluate whether a keyframe is due after appending a slice at `now_ms`.
+    pub const fn after_slice(
         &mut self,
         now_ms: u64,
         tail_since_keyframe: u64,
@@ -257,9 +191,8 @@ impl KeyframePolicy {
         Decision { keyframe }
     }
 
-    /// The parse thread's wait for its next batch timed out at `now_ms` (it waits only
-    /// while [`dirty`](Self::dirty)).
-    pub fn on_quiet(&mut self, now_ms: u64) -> Decision {
+    /// Evaluate whether a keyframe is due when the quiet wait times out at `now_ms`.
+    pub const fn on_quiet(&mut self, now_ms: u64) -> Decision {
         let keyframe = if let Some(reason) = self.owed() {
             Some(reason)
         } else if self.dirty && now_ms.saturating_sub(self.last_batch_ms) >= QUIET_MS {
@@ -270,8 +203,7 @@ impl KeyframePolicy {
         Decision { keyframe }
     }
 
-    /// A keyframe was written at `now_ms`: the tail is rebased past everything so far,
-    /// and the clear and config it was forced for are settled.
+    /// Record that a keyframe was written at `now_ms`.
     #[inline]
     pub const fn keyframe_written(&mut self, now_ms: u64) {
         self.dirty = false;
@@ -284,22 +216,14 @@ impl KeyframePolicy {
         self.renumbered = false;
     }
 
-    /// The capture for `reason` returned `None` (K5: the parser holds a sequence no
-    /// keyframe carries whole, such as a hooked DCS query, an over-cap OSC or an APC under
-    /// way, or sits inside an OSC 133/633 mark whose nonce the carry would hold): it is
-    /// retried at the next slice end. The session PARKS until then: no quiet wait retries
-    /// it, as nothing but new bytes moves the parser (module doc). The marks the deferred
-    /// keyframe would have held stay counted until a later one commits.
+    /// Defer a keyframe whose capture returned `None` (`K5`) until the next slice.
     #[inline]
     pub const fn keyframe_deferred(&mut self, reason: Reason) {
         self.deferred = Some(reason);
         self.parked = true;
     }
 
-    /// The keyframe for `reason` was captured and not written for a cause the next try
-    /// can clear by itself (a slot too small for its bridge, which the writer drops for
-    /// the retry): it is retried at the next slice end or quiet wait, and the session
-    /// stays dirty.
+    /// Re-queue a captured keyframe that could not be written so the next quiet wait retries it.
     #[inline]
     pub const fn keyframe_retry(&mut self, reason: Reason) {
         self.deferred = Some(reason);
@@ -368,8 +292,7 @@ mod tests {
     }
 
     /// K4: a clear and a config change force a keyframe at once, whatever the rate;
-    /// the keyframe settles them. A clear pending beside a config change is reported as
-    /// the clear, whose keyframe the writer's settle must follow.
+    /// the keyframe settles them.
     #[test]
     fn a_clear_or_a_config_change_forces_a_keyframe() {
         let mut p = KeyframePolicy::new(CAP, 0, 7);
@@ -402,8 +325,7 @@ mod tests {
     /// K5: a deferred keyframe is retried at the next slice end until it is written, and
     /// meanwhile the session is parked: the parse thread's wait blocks instead of retrying
     /// on every quiet, since only new bytes move the parser out of what refused the
-    /// capture. A resize unparks it too. A keyframe the slot refused for size is retried
-    /// at the next quiet, unparked.
+    /// capture.
     #[test]
     fn a_deferred_keyframe_is_retried_at_the_next_slice_end() {
         let mut p = KeyframePolicy::new(CAP, 0, 7);

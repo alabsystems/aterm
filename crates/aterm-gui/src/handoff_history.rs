@@ -119,6 +119,7 @@ struct SidecarLines {
 }
 
 /// Verify and decode `take` lines (after `skip`) from a sidecar or crash-restore
+/// frame stream of exact byte length `len` and optional SHA-256 `sha`.
 fn read_sidecar(
     mut reader: impl std::io::Read,
     len: u64,
@@ -215,6 +216,7 @@ fn read_sidecar(
 }
 
 /// Create `path` afresh, owner-only, never through a symlink, never over
+/// anything already there.
 fn create_private_new(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -229,6 +231,7 @@ fn create_private_new(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// A file this module wrote and still owns: removed when dropped, unless it
+/// was handed on ([`Self::keep`]).
 struct OwnedFile(Option<PathBuf>);
 
 impl OwnedFile {
@@ -287,6 +290,7 @@ enum ExportEvent {
     /// Every first pass is complete, including held panes.
     Passed,
     /// The worker finished its last look for pause generation `u64` and holds no
+    /// terminal lock until resumed or stopped.
     Paused(u64),
     Done,
 }
@@ -511,6 +515,7 @@ impl HistoryExporter {
     }
 
     /// [`Self::start`] with the sidecars' aggregate bounded by `cap` — the
+    /// tests' way to reach the bound without writing a gigabyte.
     fn start_within(
         dir: PathBuf,
         sessions: ExportSessions,
@@ -587,6 +592,7 @@ impl HistoryExporter {
     }
 
     /// Take every event until `deadline`, the worker's `Done`, or `waiting`
+    /// says what it waits for has arrived.
     fn drain_while(&mut self, deadline: std::time::Instant, waiting: impl Fn(&Self) -> bool) {
         while !self.done && waiting(self) {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
@@ -732,12 +738,14 @@ pub(crate) fn park_wait(exporting: bool, held_for: Duration) -> Option<&'static 
     (exporting && held_for < EXPORT_PATIENCE).then_some("the scrollback export is still running")
 }
 
-/// A terminal's lock, taken on the export and import workers. A poisoned
+/// A terminal's lock, taken on the export and import workers.
 fn locked<T>(term: &Mutex<Terminal>, read: impl FnOnce(&mut Terminal) -> T) -> T {
     read(&mut crate::term_lock(term))
 }
 
 /// What the export worker is asked to stop for: `cancel` ends it, a non-zero
+/// `pause` generation parks it after one last look until it is resumed
+/// ([`HistoryExporter::ask_pause`]).
 #[derive(Clone, Copy)]
 struct Stop<'a> {
     cancel: &'a AtomicBool,
@@ -787,6 +795,7 @@ impl Aggregate {
     }
 
     /// Evict the largest held-pane exports from `held` when doing so makes `frame` fit
+    /// for a handed session's follow write.
     fn evict_for(&mut self, frame: u64, held: &mut Vec<OpenExport>) -> bool {
         let over = self.written.saturating_add(frame).saturating_sub(self.cap);
         if over == 0 {
@@ -930,6 +939,7 @@ impl Worker<'_> {
     }
 
     /// Run first passes for all remaining handed sessions; if paused mid-pass, drop
+    /// the partial file so it restarts cleanly on resume.
     fn handed_passes(&mut self) -> Result<bool, Gone> {
         let sessions = self.sessions;
         while let Some((local_id, term)) = sessions.handed.get(self.next) {
@@ -1010,6 +1020,8 @@ impl Worker<'_> {
     }
 
     /// One look at what landed past each cursor, `chunks` at most: the handed
+    /// sessions first, each able to take room back from the held panes, then
+    /// the held panes whose first pass is done; then the evicted are told.
     fn follow_tick(&mut self, chunks: usize, interruptible: bool) -> Result<(), Gone> {
         for export in &mut self.open {
             if interruptible && self.stop.requested() {
@@ -1037,6 +1049,7 @@ impl Worker<'_> {
     }
 
     /// Hand every open sidecar over, and tell each held pane whose first pass
+    /// did not finish (or never began) why it has none; then `Done`.
     fn close(mut self) -> Result<(), Gone> {
         let open = std::mem::take(&mut self.open);
         let held = std::mem::take(&mut self.open_held);
@@ -1055,6 +1068,7 @@ impl Worker<'_> {
 }
 
 /// One session's sidecar while it is being written: its fence (whose `end`
+/// is how far it has read), the open file, and the running length and hash.
 struct OpenExport {
     local_id: u64,
     term: Arc<Mutex<Terminal>>,
@@ -1065,17 +1079,23 @@ struct OpenExport {
     len: u64,
     hasher: aterm_digest::Sha256,
     /// Whether ticks still extend it: not once its fence moved, retention
+    /// passed it, or a bound was reached (its lines so far still cross, and
+    /// the join decides whether they still meet the park's).
     following: bool,
     /// A write that failed after the first pass: the file is no longer what
+    /// the hash says, so it cannot be named at all.
     broken: Option<String>,
     /// Lines written with their links dropped ([`strip_over_cap_links`]).
     links_dropped: u64,
     /// While its FIRST PASS runs: the fence the pass reads under, to its
+    /// `end`.
     pass: Option<HistoryFence>,
 }
 
 impl OpenExport {
     /// Append the next `lines` of the FIRST PASS as one frame, within the
+    /// sidecar's and the handoff's byte budgets, and charge it to `aggregate`;
+    /// the pass is done once the cursor reaches its fence's end.
     fn pass_append(
         &mut self,
         mut lines: Vec<Line>,
@@ -1134,6 +1154,8 @@ impl OpenExport {
     }
 
     /// One tick of FOLLOWING: take up to `chunks` chunks of the history that
+    /// landed past the cursor, while the fence the first pass was taken on
+    /// still holds.
     fn follow(
         &mut self,
         aggregate: &mut Aggregate,
@@ -1192,6 +1214,7 @@ impl OpenExport {
     }
 
     /// Write everything buffered through to the file, so a paused export's
+    /// [`Self::close`] has nothing left to do.
     fn flush(&mut self) {
         if self.broken.is_none()
             && let Err(error) = self.writer.flush()
@@ -1200,7 +1223,7 @@ impl OpenExport {
         }
     }
 
-    /// Close the sidecar: its event for the exporter. One whose first pass
+    /// Close the sidecar: its event for the exporter.
     fn close(mut self) -> ExportEvent {
         if self.pass.is_some() {
             return ExportEvent::NotExported {
@@ -1292,6 +1315,8 @@ fn open_export(
 }
 
 /// Export one HANDED session's fenced history to `path`: its whole FIRST
+/// PASS, given up the moment the attempt asks the worker to stop (`stalls`:
+/// the tests hold it where it is, [`ExportSessions::stalled`]).
 fn begin_export(
     path: &Path,
     local_id: u64,
@@ -1378,6 +1403,8 @@ pub(crate) struct InputWatch {
 
 impl InputWatch {
     /// Whether any input was sent to the session since the watch was taken:
+    /// a keystroke, a paste, a controller's `send` — never a report or an
+    /// engine reply.
     #[must_use]
     fn moved(&self) -> bool {
         self.input.input_sent() != self.at
@@ -1745,6 +1772,7 @@ enum CarrySource {
         sha: [u8; 32],
     },
     /// Crash-restore history ring chunks (`crash_restore`), decompressed on demand via
+    /// [`JournalFrames`] after `skip` leading lines.
     #[cfg(unix)]
     Journal {
         chunks: Vec<aterm_restore::HistoryChunk>,
@@ -1805,6 +1833,8 @@ impl HistoryCarry {
 }
 
 /// A crash restore's history ring chunks as one sidecar's bytes, for [`read_sidecar`]:
+/// the sidecar header at the ring's width, then each chunk's frame decompressed in turn,
+/// one at a time (only the frame being read is held decompressed).
 #[cfg(unix)]
 struct JournalFrames {
     chunks: std::collections::VecDeque<aterm_restore::HistoryChunk>,
@@ -2370,11 +2400,13 @@ pub(crate) fn run_imports(jobs: Vec<ImportJob>) -> Vec<ImportReport> {
 pub(crate) mod tests;
 
 /// Tier-1 bind for `NativeUpdateHistoryCarry`: every path of the machine on
+/// the real export, park, join, sidecar and import.
 #[cfg(all(test, unix))]
 #[path = "handoff_history_conformance.rs"]
 mod conformance;
 
 /// `NativeUpdateHistoryCarry` actions no shipping function performs, each waived where
+/// its Tier-1 (`conformance::the_real_history_carry_is_the_derived_machine`) binds it.
 #[cfg(all(any(test, debug_assertions), unix))]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "NativeUpdateHistoryCarry",

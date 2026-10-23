@@ -1,132 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The stub: a local stand-in for the Anthropic Messages API, the OpenAI
-//! Responses API and the Gemini API, so the REAL Claude Code, Codex, Gemini
-//! CLI, agy and Muse Code TUIs can be driven without spending anyone's tokens
-//! or touching anyone's login. Claude Code is pointed at it with
-//! `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>`, Codex with a model provider
-//! whose `base_url = "http://127.0.0.1:<port>/v1"` and `wire_api =
-//! "responses"` (`codex` writes one), Gemini CLI and agy with
-//! `GOOGLE_GEMINI_BASE_URL` ([`gemini`]), Muse Code with `--base-url
-//! http://127.0.0.1:<port>` ([`muse`]); it runs jailed, as `aterm-lab stub
-//! …`, started by `up`.
-//!
-//! Routes: `POST /v1/messages` (SSE when the request says `"stream": true`,
-//! else one JSON message); `POST /v1/messages/count_tokens`
-//! (`{"input_tokens": N}`); `POST /v1/responses` (Codex: the Responses API's
-//! SSE — `response.created`, `output_item.added`, `output_text.delta` × N,
-//! `output_text.done`, `output_item.done`, `response.completed` with usage —
-//! or the error a mode names in the shape Codex parses); `GET
-//! /backend-api/wham/accounts/check` (Codex's workspace discovery under a
-//! ChatGPT login: one personal account, the lab token's own; the TUI does not
-//! start without it); `GET /backend-api/wham/usage` (the account usage a
-//! ChatGPT login's TUI polls for its `/status` card and its limit status-line
-//! items: the `--headers-file` windows and credits in the backend's payload);
-//! `POST /oauth/token` (Codex's token refresh, which
-//! `CODEX_REFRESH_TOKEN_URL_OVERRIDE` points here: `<modes-dir>/refresh.json`
-//! when there is one, `{"status", "json"}`, else 401 `refresh_token_expired`);
-//! the claude.ai account routes `GET /api/oauth/usage`, `/api/oauth/profile`,
-//! `/api/claude_cli_profile` and `/api/claude_cli/bootstrap`, answered from
-//! `--account-file` ([`account`]); the Gemini API's `POST
-//! /v1beta/models/<model>:streamGenerateContent`, `:generateContent` and
-//! `:countTokens`, and `GET /v1beta/models` ([`gemini`]); Muse Code's `GET
-//! /muse-code/models` and `POST /responses` ([`muse`]); anything else a 404
-//! in Anthropic's error shape. Control (any method):
-//! `/__mode[?m=NAME]` reads or switches the mode, `/__status` the counters,
-//! `/__log[?n=N]` the last log lines, `/__reset` zeroes the counters and the
-//! one-shot budget, `/__note?t=TEXT` writes `NOTE TEXT` into the log (a
-//! scenario's marker). The mode can also be written into `--mode-file`
-//! (re-read when it changes).
-//!
-//! Modes: `ok` a short streamed reply; `long` three paragraphs;
-//! `numbered` a reply holding `1. 2. 3.` (Claude hides surveys under one);
-//! `overloaded` 529; `too-long` 400 `prompt is too long`; `compact-fails` a
-//! compaction request fails as too-long while ordinary turns succeed; `slow`
-//! one `tick N` a second for `--slow-seconds`; `rate-limit` 429 with
-//! `retry-after`; `limit:CLAIM:RESET` a SUBSCRIPTION usage limit (429 with the
-//! unified-limit headers until the unix second RESET, then `ok`; Claude Code
-//! reads them only on its subscriber path, `claude TAG --subscriber`); `401`,
-//! `500` and `bad-key` the walls every API answers in its own shape (Claude
-//! Code's `authentication_error` 401, `bad-key` the same, and `api_error` 500;
-//! Codex's and Muse Code's `invalid_api_key` 401, `bad-key` the same, and
-//! `server_error` 500 ([`responses_error`]); Google's
-//! `UNAUTHENTICATED` 401, `INTERNAL` 500 and the 400 `API_KEY_INVALID` a key
-//! that is no key gets);
-//! `bg[:SLEEP[:SLOW]]` the prompt `bgstart` runs `sleep SLEEP` as a BACKGROUND
-//! Bash task, its result gets a one-line end_turn and any other request (the
-//! wake) is answered slowly; `tool` the prompt `toolstart` calls what
-//! `--tool-file` holds (one call, or a list answered one per request; a call
-//! with `"when": "<text>"` belongs to the conversation — a subagent's, or a
-//! worker's whole session — whose FIRST prompt holds the text; a step
-//! `{"text": "…"}` with no `name` is a text reply that ends the turn, and the
-//! script goes on at the next request, a later user row's: a manager's
-//! background wake; `@SID:<k>@` in a call's input is the first session id,
-//! `s-<hex>`, of the conversation's k-th tool result, so a call can name the
-//! worker an earlier one started); any other name with
-//! `<modes-dir>/<name>.json` but `refresh` (the refresh's answer,
-//! [`not_custom`]) is a CUSTOM mode (`{"status", "headers", "json"|"body",
-//! "stream", "text", "delay_ms", "times", "auth", "replies"}`; `times`: the
-//! first N requests, then `ok`; `auth`: only a request that carried that lab
-//! credential gets it, the others are answered as `ok`; its `headers` go out
-//! on a streamed answer too; `replies`: `[{"when", "last", "after", "text"}, …]`, a
-//! turn's text picked by the words its conversation's user texts, its
-//! newest one and one before it hold, in every API, a side request answered
-//! as `ok` ([`scripted_reply`])).
-//!
-//! A Codex request (`/v1/responses`) is answered by the same modes: `ok`,
-//! `long`, `numbered` and `slow` as text; `overloaded` as a 503
-//! `server_is_overloaded`; `rate-limit` as a 429 `rate_limit_exceeded`; `401`
-//! as a 401 `invalid_api_key`; `500` as a 500 `server_error`
-//! ([`responses_error`]); `too-long` as a `response.failed` event with
-//! `context_length_exceeded`;
-//! `limit:CLAIM:RESET[:PLAN]` as Codex's usage limit, a 429 whose body is
-//! `{"error":{"type":"usage_limit_reached","resets_at":RESET,
-//! "limit_window_minutes":300|10080,"plan_type":PLAN}}` with the claim's
-//! window at 100% in the `x-codex-*` headers (`five_hour` the primary slot,
-//! `seven_day` the secondary; Muse Code draws its own usage wall from the same
-//! body); `tool` and `bg` as `ok`. A custom mode streams its `text` unless it
-//! says `"stream": false` or another status. A Muse Code turn (`/responses`)
-//! is answered the same way in Muse Code's own stream, and `tool` there calls
-//! the script's tools in its `muse` namespace ([`muse`]). A Gemini API turn is
-//! answered by them in Google's shapes, its side requests in every mode
-//! ([`gemini`]).
-//!
-//! `--headers-file` (re-read at every request): its flat entries (`ratelimits
-//! TAG …` writes them) are added to EVERY answer of both APIs, success and
-//! error — Codex's `x-codex-primary-used-percent` family and its credits
-//! headers; a value `"@NOW+N@"` is the unix second N seconds from when the
-//! answer is sent. Its `{"on200": {header: value}, "on429": {header: value}}`
-//! blocks (`headers TAG '<json>'` writes them) are extra headers on the 200
-//! and 429 answers to `/v1/messages` — the
-//! `anthropic-ratelimit-unified-*` figures a subscriber's Claude Code reads its
-//! usage from on every answer (no mode sends them on a 200). A value
-//! `"@SEQ:BASE:STEP@"` is `BASE + STEP*k`, `k` the number of 200 answers that
-//! carried on200 headers before this one (clamped to 0..1, four decimals), so
-//! the figures rise as the session works, from the first answer that carries
-//! them ([`rate_headers`]). Each verb changes only its own entries and keeps
-//! the other's ([`headers_file_with`]).
-//!
-//! Every request is logged to `--log` (method, path, status, body length, a
-//! one-line summary with
-//! `kind=main|aux|compact|quota|codex|codex-json|muse|muse-json|muse-side|muse-models`,
-//! and `gemini|gemini-json|gemini-aux` for the Gemini API); no header value,
-//! key or token is ever logged: a Codex or Gemini API request's credential is
-//! logged as the lab's own label for it (`auth=key`: the provider's fixed fake
-//! key; `auth=jwt:<label>`: a token the lab composed, whose payload names its
-//! label; `auth=gemini-key`: the fixed fake key of Gemini CLI and agy;
-//! `auth=none`; `auth=other(<n> chars)`; a Gemini API request with an
-//! `Authorization` header beside its key, both joined by `+`:
-//! [`gemini::credential_label`]). `--dump-dir` keeps the
-//! request bodies of every API (the newest [`DUMPS_KEPT`]): a turn of the
-//! conversation as `req-<n>.json`, a side call ([`is_side`]) as
-//! `side-<n>.json` ([`Stub::dump`]), so a reader of the turns
-//! ([`turn_dumps`]) never takes a side call's copy of the conversation for
-//! a turn.
-//! `--proxy-port` also runs a BLACK-HOLE proxy: it reads the request line a
-//! client sends its `HTTP(S)_PROXY`, logs it (`PROXY refused: CONNECT
-//! api.anthropic.com:443 …`), answers 502 at once and closes — a dead proxy
-//! that says what Claude Code tried to reach.
+//! The stub: a local stand-in for the Anthropic Messages API.
 
 use std::io::{self, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
@@ -179,9 +54,7 @@ pub struct Args {
     pub retry_after: String,
     /// A descriptor whose end of file ends the stub (`--lifeline-fd`): the lab's driver went away.
     pub lifeline_fd: Option<i32>,
-    /// A pipe's write end the stub writes one byte to, then closes, once it
-    /// listens and its port files are written (`--ready-fd`): the lab waits on
-    /// it instead of polling the files (`aterm_agent::ready`).
+    /// A pipe's write end the stub writes one byte to.
     pub ready_fd: Option<i32>,
 }
 
@@ -211,7 +84,6 @@ impl Default for Args {
 }
 
 /// Parse `aterm-lab stub` arguments.
-///
 /// # Errors
 /// An unknown flag, a missing value, or a number that does not parse.
 pub fn parse_args(argv: &[String]) -> Result<Args, String> {
@@ -272,8 +144,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args, String> {
     Ok(a)
 }
 
-/// How many request dumps the stub keeps, the newest: a lab of a dozen
-/// agents' conversations (`lab forever`) and their side calls stays whole.
+/// How many request dumps the stub keeps, the newest.
 pub const DUMPS_KEPT: u64 = 2000;
 
 /// The name a TURN's dump starts with: `req-<n>.json` ([`Stub::dump`]).
@@ -281,22 +152,7 @@ pub const TURN_DUMP: &str = "req-";
 /// The name a SIDE CALL's dump starts with: `side-<n>.json` ([`is_side`]).
 pub const SIDE_DUMP: &str = "side-";
 
-/// Whether a request of `kind` (the log's `kind=`) is a SIDE CALL: a request
-/// the program makes beside the conversation's turns, never one of them —
-/// Claude Code's `aux` (no tools: a title, a topic), `quota` (`max_tokens <=
-/// 1`) and `compact` (the conversation's summary); Codex's and Muse Code's
-/// structured requests (`codex-json`: the thread title; `muse-json`); every
-/// role of Muse Code's but `main` (`muse-side`: its reminder observers, the
-/// prompt hint, the away recap); Gemini CLI's `gemini-json` (its Auto
-/// model's router, its next-speaker and loop checks) and `gemini-aux`. A
-/// side call can carry the whole conversation — Muse Code's reminder
-/// observer renders it into ONE user text, `<main-agent-conversation
-/// format="model-conversation-xml/v1">` with each message on rows of its own
-/// (measured on 1.4.10-R6427.1, the lab's `r10-cv`, 2026-10-22: C4 read that
-/// text as the owner's words reaching the agent with a line break) — so a
-/// judge of the turns reads `req-<n>.json` alone ([`turn_dumps`]). A body
-/// the stub could not read (`opaque`) is kept as a turn: nothing says it is
-/// not one.
+/// Whether a request of `kind` (the log's `kind=`) is a SIDE CALL.
 #[must_use]
 pub fn is_side(kind: &str) -> bool {
     matches!(
@@ -312,9 +168,7 @@ pub fn is_side(kind: &str) -> bool {
     )
 }
 
-/// The stub's dumps of the conversations' TURNS in `dir` (`req-<n>.json`;
-/// a side call's `side-<n>.json` is none of them, [`is_side`]), `(n, path)`
-/// each, the newest first. Empty where `dir` cannot be read.
+/// The stub's dumps of the conversations' TURNS in `dir`, `` each, the newest first.
 #[must_use]
 pub fn turn_dumps(dir: &Path) -> Vec<(u64, PathBuf)> {
     let mut out: Vec<(u64, PathBuf)> = std::fs::read_dir(dir)
@@ -363,11 +217,8 @@ pub struct Stub {
     started: f64,
     state: Mutex<State>,
     log_lock: Mutex<()>,
-    /// The 200 answers to `/v1/messages` served so far that carried on200
     /// headers: the `k` of a `@SEQ@` header value.
     served_200: AtomicU32,
-    /// The request bodies dumped so far ([`Stub::dump`]): each dump takes
-    /// its index from here as it is written, so requests in flight together
     /// (a reply's delay and pace hold `record` back) never share one.
     dumped: AtomicU64,
 }
@@ -382,8 +233,7 @@ pub struct RateHeaders {
 }
 
 impl RateHeaders {
-    /// The log's ` RL200[…] RL429[…]` tail: each header without the unified-limit
-    /// prefix, in header-name order.
+    /// The log's ` RL200[…] RL429[…]` tail.
     #[must_use]
     pub fn summary(&self) -> String {
         let mut out = String::new();
@@ -403,10 +253,7 @@ impl RateHeaders {
     }
 }
 
-/// The headers `spec` (`{"on200": {…}, "on429": {…}}`) puts on the answer after
-/// `served` 200s that carried on200 headers. A value is its text, except
-/// `"@SEQ:BASE:STEP@"`: `BASE + STEP*served`, clamped to 0..1, with four
-/// decimals.
+/// The headers `spec` puts on the answer after `served` 200s that carried on200 headers.
 #[must_use]
 pub fn rate_headers(spec: &J, served: u32) -> RateHeaders {
     let side = |which: &str| -> Vec<(String, String)> {
@@ -471,16 +318,10 @@ const BUILTIN: &[&str] = &[
     "bad-key",
 ];
 
-/// The file in `<modes-dir>` that answers Codex's token refresh (`POST
 /// /oauth/token`), never a mode of the APIs.
 const REFRESH_FILE: &str = "refresh.json";
 
-/// Why `<modes-dir>/<name>.json` would never be served as the custom mode
-/// `name`, or `None` when it would: a built-in mode's name (its `:` arguments
-/// aside) is answered by that mode whatever a file of the name holds, and
-/// `refresh` is the file Codex's token refresh is answered from. Compared
-/// without case: the scratch sits on a case-insensitive volume (APFS), where
-/// `Refresh.json` IS `refresh.json`.
+/// Why `<modes-dir>/<name>.json` would never be served as the custom mode `name`.
 #[must_use]
 pub fn not_custom(name: &str) -> Option<&'static str> {
     let head = name.split(':').next().unwrap_or("");
@@ -520,8 +361,7 @@ pub fn est_tokens(raw_len: usize) -> i64 {
     i64::try_from(raw_len / 4).unwrap_or(i64::MAX).max(12)
 }
 
-/// A reply as a handful of text deltas: words, gathered until a delta holds 12
-/// characters, so the stream looks alive.
+/// A reply as a handful of text deltas.
 #[must_use]
 pub fn split_deltas(text: &str) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
@@ -575,20 +415,7 @@ pub fn text_of(content: Option<&J>) -> String {
     }
 }
 
-/// THE SCRIPTED REPLY OF A CUSTOM MODE (`"replies": [{"when", "last",
-/// "after", "text", "delay_ms", "pace_s"}, …]`, the per-turn script of
-/// `forever`): the first rule with a `text` whose `when` stands in one of the
-/// conversation's user texts `users` (in order, oldest first), whose `last`
-/// stands in the newest of them and whose `after` stands in one before the
-/// newest (a turn told apart from another of the same words by an act the
-/// conversation met earlier), each left out or empty matching any — its
-/// `text` the reply, its own `delay_ms` and `pace_s` (where it
-/// carries them) the spec's for that reply ([`with_reply`]: a conversation
-/// answered at once beside others paced). The stub keeps no state: a
-/// conversation's turn is told by what it holds (the scenario's word in its
-/// prompt, the harness's act it answers), so several tabs of one lab, each
-/// its own conversation, are scripted at once. `None` where the spec has no
-/// rules or none matches.
+/// THE SCRIPTED REPLY OF A CUSTOM MODE.
 #[must_use]
 pub fn scripted_reply<'a>(spec: &'a J, users: &[String]) -> Option<&'a J> {
     let rules = spec.get("replies").and_then(J::as_arr)?;
@@ -605,17 +432,13 @@ pub fn scripted_reply<'a>(spec: &'a J, users: &[String]) -> Option<&'a J> {
     })
 }
 
-/// Whether a custom spec scripts its replies ([`scripted_reply`]): such a
-/// spec answers a conversation's turns alone, and a side request (Claude
-/// Code's title, a structured check) is answered as `ok`.
+/// Whether a custom spec scripts its replies ([`scripted_reply`]).
 #[must_use]
 pub fn is_scripted(spec: &J) -> bool {
     spec.get("replies").is_some()
 }
 
-/// `spec` with its `text` the reply `users` pick ([`scripted_reply`]) — its
-/// `delay_ms` and `pace_s` the rule's own, where the rule carries them —
-/// else as it is.
+/// `spec` with its `text` the reply `users` pick ([`scripted_reply`]).
 #[must_use]
 pub fn with_reply(spec: J, users: &[String]) -> J {
     let Some(rule) = scripted_reply(&spec, users).cloned() else {
@@ -630,15 +453,7 @@ pub fn with_reply(spec: J, users: &[String]) -> J {
     spec
 }
 
-/// A SCRIPTED RULE'S TOOL CALL (`"tool": {"name", "input"}` on a rule of
-/// [`scripted_reply`], kept on the spec by [`with_reply`]): the call a turn's
-/// first request is answered with, before the request that carries the
-/// call's result back (`answered`, each API's reader: [`messages_answered`],
-/// [`gemini::results_answered`], [`muse::results_answered`], each true once
-/// any request of the conversation carries it) is answered with the rule's
-/// `text` — an empty one, and the turn ends on the tool's row. `None` where
-/// the spec holds no call, or its result is in: the call is made once a
-/// conversation.
+/// A SCRIPTED RULE'S TOOL CALL.
 #[must_use]
 pub fn scripted_call(spec: &J, answered: bool) -> Option<(String, J)> {
     let call = spec.get("tool").filter(|c| matches!(c, J::Obj(_)))?;
@@ -646,13 +461,7 @@ pub fn scripted_call(spec: &J, answered: bool) -> Option<(String, J)> {
     (!answered && !name.is_empty()).then(|| (name, call_input(call)))
 }
 
-/// Whether a Messages API request's conversation carries a tool's result
-/// back: a user message of it holds a `tool_result` block (Claude Code's
-/// answer to a call) — the newest, or one before a later message (the next
-/// prompt, a retry's user-role error turn after an empty reply), so a
-/// scripted call is made once a conversation ([`scripted_call`]), never again
-/// at each retry (agy's 2501 calls on Gemini's API before its reader read the
-/// whole conversation).
+/// Whether a Messages API request's conversation carries a tool's result back.
 #[must_use]
 pub fn messages_answered(body: &[u8]) -> bool {
     let Ok(j) = J::parse_bytes(body) else {
@@ -665,9 +474,7 @@ pub fn messages_answered(body: &[u8]) -> bool {
         .any(is_tool_result)
 }
 
-/// The user texts of a Messages API request, oldest first: each user
-/// message's text blocks ([`text_of`]); one that holds none (a tool result's)
-/// is left out.
+/// The user texts of a Messages API request, oldest first.
 #[must_use]
 pub fn message_users(body: &[u8]) -> Vec<String> {
     let Ok(j) = J::parse_bytes(body) else {
@@ -683,7 +490,6 @@ pub fn message_users(body: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// The facts of one `/v1/messages` request every answer logs: its request
 /// line, its body's length, the mode it is answered in, and what it asked.
 #[derive(Clone, Copy)]
 struct Turn<'a> {
@@ -721,7 +527,7 @@ pub struct Info {
     pub sys_chars: usize,
     /// The last user message's text.
     pub last_user: String,
-    /// `main`, `aux` (no tools), `compact` (a summary request), `quota` (`max_tokens <= 1`) or `opaque`.
+    /// `main`, `aux`, `compact`, `quota` or `opaque`.
     pub kind: &'static str,
     /// A compaction request.
     pub compact: bool,
@@ -795,21 +601,14 @@ pub fn analyse(body: &[u8]) -> Info {
     info
 }
 
-/// What the `tool` mode answers a request: the next scripted call or text,
-/// done once every step is answered, or `None` when no `toolstart` prompt was
-/// sent and no `when` step is this conversation's. The step is read off the
-/// request (each tool result, and each assistant reply with no tool use, is
-/// one step answered), so the stub keeps no state and a second prompt starts
-/// over.
+/// What the `tool` mode answers a request.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ToolTurn {
     /// Call this tool with this input (its `@SID:<k>@` filled); the step it is.
     Call(String, J, usize),
     /// Reply with this text and end the turn; the step it is.
     Say(String, usize),
-    /// Call these tools, in this order, in ONE assistant message (a step
-    /// `{"calls": [{"name", "input"}, …]}`: parallel tool calls, each input's
-    /// `@SID:<k>@` filled); the step it is.
+    /// Call these tools, in this order, in ONE assistant message; the step it is.
     Calls(Vec<(String, J)>, usize),
     /// Every step is answered.
     Done,
@@ -827,7 +626,6 @@ fn is_said(m: &J) -> bool {
         }
 }
 
-/// The text of every tool result in `msgs`, in order: a result's string, or
 /// its text blocks joined by newlines.
 fn tool_results(msgs: &[J]) -> Vec<String> {
     msgs.iter()
@@ -852,9 +650,7 @@ pub fn first_sid(text: &str) -> Option<&str> {
         })
 }
 
-/// `input` with every `@SID:<k>@` in its strings replaced by the first session
-/// id of `results[k-1]`; one with no such result, or none in it, is left as
-/// written, so the call that names it fails where it can be seen.
+/// `input` with every `@SID:<k>@` in its strings replaced by the first session id.
 #[must_use]
 pub fn fill_sids(input: &J, results: &[String]) -> J {
     match input {
@@ -905,11 +701,7 @@ fn call_input(c: &J) -> J {
         .unwrap_or(J::Obj(Vec::new()))
 }
 
-/// [`ToolTurn`] of a request body against a Claude Code script (one step or a
-/// list): a step is a call (an object with a name), several calls made in one
-/// message (an object with `calls`, a list of named calls; Claude Code answers
-/// them all in one request, so they are one step) or a reply that ends the
-/// turn (an object with a `text`).
+/// [`ToolTurn`] of a request body against a Claude Code script (one step or a list).
 #[must_use]
 pub fn tool_turn(body: &[u8], script: &J) -> Option<ToolTurn> {
     let j = J::parse_bytes(body).ok()?;
@@ -946,8 +738,6 @@ pub fn tool_turn(body: &[u8], script: &J) -> Option<ToolTurn> {
             )
         }
     };
-    // A conversation of its own (a subagent's, a worker's) opens with its prompt: its
-    // steps are the ones whose `when` that prompt carries, counted from its first request.
     let first = msgs
         .iter()
         .find(|m| m.get("role").and_then(J::as_str) == Some("user"))
@@ -985,7 +775,6 @@ pub fn tool_turn(body: &[u8], script: &J) -> Option<ToolTurn> {
         if is_tool_result(m) {
             step = step.map(|s| s + 1);
         }
-        // also when it rides in the message of an interrupted call's result
         if text_of(m.get("content")).contains("toolstart") {
             step = Some(0);
         }
@@ -997,8 +786,7 @@ pub fn tool_turn(body: &[u8], script: &J) -> Option<ToolTurn> {
     })
 }
 
-/// `limit:CLAIM:RESET[:PLAN]` → `(claim, reset unix seconds, plan)`; PLAN is
-/// Codex's `plan_type` (plus, pro, free, team, …), and Claude Code's answer has none.
+/// `limit:CLAIM:RESET[:PLAN]` → ``; PLAN is Codex's `plan_type`, and Claude Code's answer has none.
 #[must_use]
 pub fn limit_params(mode: &str) -> Option<(String, i64, Option<String>)> {
     let parts: Vec<&str> = mode.split(':').collect();
@@ -1029,8 +817,7 @@ pub fn limit_params(mode: &str) -> Option<(String, i64, Option<String>)> {
 /// The fixed fake key the lab gives Codex's lab provider (never a credential anywhere).
 pub const LAB_CODEX_KEY: &str = "lab-not-a-key";
 
-/// The payload of a token the lab composed (a JWT with a `"lab"` label), from
-/// an `Authorization` value: the lab's own fake login, never a credential.
+/// The payload of a token the lab composed (a JWT with a `"lab"` label).
 #[must_use]
 pub fn lab_claims(authorization: &str) -> Option<J> {
     let tok = authorization
@@ -1046,11 +833,7 @@ pub fn lab_claims(authorization: &str) -> Option<J> {
     Some(j)
 }
 
-/// Which lab credential a request carried, NEVER its value: `key`
-/// ([`LAB_CODEX_KEY`]), `gemini-key` ([`gemini::LAB_GEMINI_KEY`]),
-/// `jwt:<label>` (a token the lab composed), `oat` and
-/// `api-key` (Claude Code's fake claude.ai token and fake API key, both
-/// `…-LABLABLAB…`), `none`, or `other(<n> chars)`.
+/// Which lab credential a request carried, NEVER its value.
 #[must_use]
 pub fn auth_label(authorization: Option<&str>) -> String {
     let v = authorization.unwrap_or("");
@@ -1121,8 +904,7 @@ pub struct RInfo {
     pub schema: Option<J>,
 }
 
-/// The text of a Responses input item: its `content` string, or its
-/// `input_text`/`text` parts joined by newlines.
+/// The text of a Responses input item.
 #[must_use]
 pub fn item_text(it: &J) -> String {
     match it.get("content") {
@@ -1169,7 +951,6 @@ pub fn analyse_responses(body: &[u8]) -> RInfo {
         Some(J::Null) | None => 0,
         Some(other) => other.py().chars().count(),
     };
-    // Muse Code puts the runtime's `<system-reminder …>` notes in user items of their own: not what a person typed
     if let Some(t) = items
         .iter()
         .rev()
@@ -1187,9 +968,7 @@ pub fn analyse_responses(body: &[u8]) -> RInfo {
     info
 }
 
-/// The user texts of a Responses API request (Codex's, Muse Code's), oldest
-/// first: each user item's text ([`item_text`]), the runtime's
-/// `<system-reminder …>` notes and empty items left out.
+/// The user texts of a Responses API request (Codex's, Muse Code's), oldest first.
 #[must_use]
 pub fn responses_users(body: &[u8]) -> Vec<String> {
     let Ok(j) = J::parse_bytes(body) else {
@@ -1208,12 +987,7 @@ pub fn responses_users(body: &[u8]) -> Vec<String> {
 /// A wall's answer: its status, body and headers.
 pub type WallAnswer = (u16, J, Vec<(String, String)>);
 
-/// The error a wall mode answers a Responses API request with, in the shape
-/// Codex and Muse Code both read (`{"error": {"type", "code", "message"}}`):
-/// `overloaded` a 503 `server_is_overloaded`, `rate-limit` a 429
-/// `rate_limit_exceeded` with `retry-after`, `401` and `bad-key` an
-/// `invalid_api_key`, `500` a `server_error`; `None` for any other mode. Its
-/// status, body and headers.
+/// The error a wall mode answers a Responses API request with.
 #[must_use]
 pub fn responses_error(mode: &str, retry_after: &str) -> Option<WallAnswer> {
     let err = |pairs: Vec<(&str, J)>| {
@@ -1269,8 +1043,7 @@ pub fn responses_error(mode: &str, retry_after: &str) -> Option<WallAnswer> {
     })
 }
 
-/// A JSON text that fits a side request's schema: each string property `lab
-/// stub` (cut to its `maxLength`), else `{}`.
+/// A JSON text that fits a side request's schema: each string property `lab stub`, else `{}`.
 #[must_use]
 pub fn schema_answer(schema: Option<&J>) -> String {
     let mut out: Vec<(String, J)> = Vec::new();
@@ -1312,8 +1085,7 @@ pub fn usage_limit_body(claim: &str, reset: i64, plan: Option<&str>) -> J {
     J::obj([("error", err)])
 }
 
-/// The claim's window at 100% in Codex's header family: `five_hour` the
-/// primary slot (300 min), `seven_day` the secondary (10080 min); other claims add nothing.
+/// The claim's window at 100% in Codex's header family.
 #[must_use]
 pub fn usage_limit_headers(claim: &str, reset: i64) -> Vec<(String, String)> {
     let (slot, minutes) = match claim {
@@ -1331,17 +1103,10 @@ pub fn usage_limit_headers(claim: &str, reset: i64) -> Vec<(String, String)> {
     ]
 }
 
-/// The keys of a `--headers-file` that are [`rate_headers`]'s blocks (`headers`
-/// writes them); every other key is a flat entry ([`flat_headers`],
-/// `ratelimits` writes them).
+/// The keys of a `--headers-file` that are [`rate_headers`]'s blocks (`headers` writes them).
 pub const RATE_BLOCKS: [&str; 2] = ["on200", "on429"];
 
-/// The `--headers-file` a verb leaves: `old` (the file's text as it reads now;
-/// anything but a JSON object reads as no entry) with the verb's own entries
-/// replaced by `new`'s — the [`RATE_BLOCKS`] when `blocks` (`headers`), else
-/// the flat entries (`ratelimits`) — and the other verb's kept. One file
-/// serves both of the stub's readers, and each verb's figures stand while the
-/// other's change.
+/// The `--headers-file` a verb leaves.
 #[must_use]
 pub fn headers_file_with(old: &str, new: J, blocks: bool) -> J {
     let own = |k: &str| RATE_BLOCKS.contains(&k) == blocks;
@@ -1355,10 +1120,7 @@ pub fn headers_file_with(old: &str, new: J, blocks: bool) -> J {
     J::Obj(out)
 }
 
-/// The flat entries of a `--headers-file` (`ratelimits` writes them):
-/// `{name: value}` added to every API answer, `"@NOW+N@"` in a value the unix
-/// second N seconds from `now`. The `on200`/`on429` blocks are
-/// [`rate_headers`]'s, never a header.
+/// The flat entries of a `--headers-file` (`ratelimits` writes them).
 #[must_use]
 pub fn flat_headers(spec: &J, now: i64) -> Vec<(String, String)> {
     let J::Obj(m) = spec else {
@@ -1414,7 +1176,6 @@ fn merged(base: &[(String, String)], extra: &[(String, String)]) -> Vec<(String,
     out
 }
 
-/// A custom mode's `headers` (`{name: value}`, a value that is no string as its
 /// JSON text), on its answer of either API, streamed or not.
 fn spec_headers(spec: &J) -> Vec<(String, String)> {
     match spec.get("headers") {
@@ -1439,8 +1200,7 @@ pub fn bg_params(mode: &str, slow_seconds: i64) -> (i64, i64) {
     (num(1, 20), num(2, slow_seconds))
 }
 
-/// A mode name as `/__mode?m=` takes it: only `[A-Za-z0-9_.:-]`, at most 64,
-/// `ok` when nothing is left, and a `custom:` prefix dropped.
+/// A mode name as `/__mode?m=` takes it.
 #[must_use]
 pub fn clean_mode(m: &str) -> String {
     let kept: String = m
@@ -1504,7 +1264,6 @@ impl Request {
 }
 
 /// Read one request; `None` at a clean end of the connection.
-///
 /// # Errors
 /// A malformed request line or chunk, or the connection failing mid-request.
 pub fn read_request(r: &mut impl io::BufRead) -> io::Result<Option<Request>> {
@@ -1716,9 +1475,6 @@ impl Out<'_> {
         self.head(200, &h)
     }
 
-    /// The extra headers a `status` answer carries; a 200 that carries on200
-    /// headers counts toward `@SEQ@`, and no other answer does: a ramp starts
-    /// at its BASE on the first answer that carries it, however many were
     /// served before the file named it.
     fn rate_for(&self, status: u16) -> Vec<(String, String)> {
         let Some(rate) = &self.rate else {
@@ -1862,8 +1618,6 @@ impl Stub {
             })
     }
 
-    /// The custom spec this request gets, or `None` (then it is answered as
-    /// `ok`): a spec with `auth` applies only to a request that carried that
     /// lab credential, and a spec with `times` only to its first N requests.
     fn take_custom(&self, mode: &str, label: Option<&str>) -> Option<J> {
         let spec = self.custom_spec(mode)?;
@@ -1924,10 +1678,6 @@ impl Stub {
         }
     }
 
-    /// The request `body` of `kind` (the log's `kind=`) kept in the dump
-    /// directory: a turn as `req-<index>.json`, a side call ([`is_side`]) as
-    /// `side-<index>.json`, its index the next of [`Stub::dumped`] (one count
-    /// over both, so the two read in the order they came); only the newest
     /// [`DUMPS_KEPT`] stay.
     fn dump(&self, body: &[u8], kind: &str) {
         let Some(dir) = &self.args.dump_dir else {
@@ -1975,8 +1725,6 @@ impl Stub {
         let mode = self.mode();
         let blen = req.body.len();
         let auth = req.header("authorization");
-        // a Gemini API request's credentials: the API key in x-goog-api-key (or a `key` query, which neither CLI
-        // sends), and any Authorization header beside it
         let gemini_label = || {
             let key = req
                 .header("x-goog-api-key")
@@ -2271,7 +2019,6 @@ impl Stub {
             self.record(method, path, st, blen, &mode, &s);
             return Ok(());
         }
-        // ok / long / numbered / slow / compact-fails (an ordinary turn)
         let text = self.reply_text(kind, &mode, n);
         let (mut deltas, pace) = if mode == "slow" && kind != "quota" && kind != "compact" {
             (
@@ -2315,8 +2062,6 @@ impl Stub {
         Ok(())
     }
 
-    /// A Responses API turn: Codex's `/v1/responses`, or Muse Code's
-    /// `/responses` main turn (`dialect` says which stream answers it, and
     /// only Muse Code's calls the `tool` mode's script).
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn responses(
@@ -2374,9 +2119,6 @@ impl Stub {
                     let done = split_deltas(&format!("Tool call done. Result: {result}"));
                     return self.muse_text(facts, &info, &s, &done, 0.0, in_tok, &[], out);
                 }
-                // Its script holds named calls only (`script_calls`): a text
-                // step, or calls made in one message, is a Claude Code
-                // script's (`tool_turn`).
                 Some(ToolTurn::Say(..) | ToolTurn::Calls(..)) | None => {}
             }
         }
@@ -2431,7 +2173,6 @@ impl Stub {
                     out,
                 );
             }
-            // the shared custom answer reads only the request facts every API logs
             let msg_info = analyse(b"");
             let t = Turn {
                 method,
@@ -2521,7 +2262,6 @@ impl Stub {
         )
     }
 
-    /// A plain text reply as the Responses API's SSE: the event types
     /// codex-api reads, or Muse Code's own stream ([`Stub::muse_text`]).
     #[allow(clippy::too_many_arguments)]
     fn responses_stream(
@@ -2757,8 +2497,6 @@ impl Stub {
         Ok(())
     }
 
-    /// Codex's workspace discovery under a ChatGPT login (`chatgpt_base_url` is
-    /// the stub under `codex --chatgpt`): the TUI will not start without an
     /// answer. One personal account, the lab token's own.
     fn accounts_check(
         &self,
@@ -2788,8 +2526,6 @@ impl Stub {
             .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
             .take(40)
             .collect();
-        // Codex wants an HTTPS origin here ("workspace backend must use an HTTPS origin without credentials"), so
-        // the workspace's own backend is a name at example.com: its calls go to the black-hole proxy, never anywhere
         let entry = J::obj([
             ("id", J::s(acct.as_str())),
             (
@@ -2814,8 +2550,6 @@ impl Stub {
         Ok(())
     }
 
-    /// The account usage a ChatGPT login's TUI polls (its `/status` card's
-    /// limits and credits): the windows and credits the `--headers-file` sends
     /// on answers, in the backend's payload, and the plan the lab token names.
     fn wham_usage(
         &self,
@@ -2834,7 +2568,6 @@ impl Stub {
             .unwrap_or(J::Obj(Vec::new()));
         let window = |slot: &str| -> Option<(i64, J)> {
             let used = get(&format!("x-codex-{slot}-used-percent"))?;
-            // whole percent, as the backend reports it
             #[allow(clippy::cast_possible_truncation)]
             let pct = used.trim().parse::<f64>().unwrap_or(0.0) as i64;
             let mins: i64 = get(&format!("x-codex-{slot}-window-minutes"))
@@ -2917,8 +2650,6 @@ impl Stub {
         Ok(())
     }
 
-    /// A claude.ai account route: the `--account-file`'s body for it, its
-    /// instants expanded ([`account::expand`]), or a 404 when the file has none.
     /// The log names the route, the usage read and the credential's lab label.
     #[allow(clippy::too_many_arguments)]
     fn account(
@@ -2966,9 +2697,6 @@ impl Stub {
         Ok(())
     }
 
-    /// Codex's token refresh, pointed here by `CODEX_REFRESH_TOKEN_URL_OVERRIDE`.
-    /// The body holds the lab's fake refresh token: never logged or dumped.
-    /// `<modes-dir>/refresh.json` (`{"status", "json"}`) answers it, else a 401
     /// `refresh_token_expired` (what the token authority says of a login that has lapsed).
     fn oauth_token(
         &self,
@@ -3048,7 +2776,6 @@ impl Stub {
         ])
     }
 
-    /// A text reply as SSE: `deltas`, `pace` seconds apart.
     /// A streamed Messages answer, `extra` (a custom mode's `headers`) on its head.
     fn stream(
         &self,
@@ -3139,7 +2866,6 @@ impl Stub {
         self.stream_tools(t, summary, &[(name.to_string(), input.clone())], out)
     }
 
-    /// Tool uses in ONE assistant message as SSE, one content block each in
     /// order, each input split across two `input_json_delta`s.
     fn stream_tools(
         &self,
@@ -3225,12 +2951,10 @@ impl Stub {
         Ok(())
     }
 
-    /// The `bg` mode: `bgstart` → a background `sleep`; a tool result → a
     /// one-line end_turn; anything else (the wake) → a slow reply.
     fn bg(&self, t: &Turn<'_>, body: &[u8], summary: &str, out: &mut Out<'_>) -> io::Result<()> {
         let j = J::parse_bytes(body).unwrap_or(J::Obj(Vec::new()));
         let msgs = j.get("messages").and_then(J::as_arr).unwrap_or_default();
-        // Claude Code ends the list with a role "system" message: the turn is decided by the last USER message.
         let last = msgs
             .iter()
             .rev()
@@ -3337,7 +3061,6 @@ impl Stub {
             .windows(2)
             .position(|w| w == b"\r\n")
             .unwrap_or(data.len());
-        // latin-1: each byte one character, as the request line was read before
         let first: String = data[..end].iter().map(|&b| char::from(b)).collect();
         self.st().proxy_attempts += 1;
         self.log(&format!("PROXY refused: {}", one_line(&first, 120)));
@@ -3352,8 +3075,6 @@ fn write_port_file(path: &Path, port: u16) -> io::Result<()> {
 }
 
 /// Bind and start serving (threads); the ports are written to their files.
-/// The API port and the black-hole proxy's, when one runs.
-///
 /// # Errors
 /// A non-loopback host, or a bind that failed.
 pub fn start(args: Args) -> Result<(u16, Option<u16>), String> {
@@ -3410,9 +3131,7 @@ pub fn start(args: Args) -> Result<(u16, Option<u16>), String> {
     Ok((port, proxy_port))
 }
 
-/// One control call to a stub on loopback (`/__mode?m=…`, `/__note?t=…`): the
-/// body it answered. Nothing of the caller's steers it: no proxy, loopback only.
-///
+/// One control call to a stub on loopback (`/__mode?m=…`, `/__note?t=…`): the body it answered.
 /// # Errors
 /// The stub could not be reached, or did not answer 2xx.
 pub fn control(port: &str, path_and_query: &str) -> Result<String, String> {
@@ -3455,7 +3174,6 @@ pub fn main(argv: &[String]) -> i32 {
             return 2;
         }
     };
-    // the lab's driver holds the other end: its going (however it goes) ends the stub
     if let Some(fd) = args.lifeline_fd {
         match aterm_uds::lifeline::adopt(fd) {
             Ok(owned) => {
@@ -3489,8 +3207,6 @@ pub fn main(argv: &[String]) -> i32 {
     }
 }
 
-/// The stub's log once it holds every one of `wants`, or as it stands when
-/// `limit` is spent: the stub records a request after its answer is sent
 /// (`Stub::record`), so a reader that got the answer may be ahead of the line.
 #[cfg(test)]
 fn logged_with(log: &Path, wants: &[&str], limit: Duration) -> String {

@@ -1,50 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! LIVE: THE LAST QUIT'S WINDOWS OUTLIVE A LAUNCH THAT DIES INSIDE ITS EVENT LOOP'S
-//! BUILD (r6 sweep #7, START-1).
-//!
-//! A macOS window takes `session.toml` before its `NSApplication` build (LAG-11), and
-//! a single-use take there lost the quit's windows to a crash or a hang inside that
-//! build. The take is two-phase now (`aterm-gui`'s `restore::take_for_launch`): the
-//! launch renames the layout to a name tagged with its run and holds that file's lock,
-//! and removes it only once it keeps the desk itself (its crash journal's first
-//! image); a later launch takes a dead run's file again when that run left crash
-//! evidence, and never a live run's.
-//!
-//! Driven through the real binary, headless under the lab's desk seam
-//! (`ATERM_DEBUG_HEADLESS_RESTORE` under a private `ATERM_STATE_HOME`: a window's
-//! desk, so it takes, journals and restores as a window does), with the build held
-//! by `ATERM_DEBUG_LOOP_BUILD_HOLD=<path>` (`build_event_loop` creates `<path>.held`
-//! and waits for `<path>`). A seeding instance opens two tabs beside its boot tab and quits,
-//! leaving its layout (two of its tabs carry user titles, which the layout keeps).
-//! Then:
-//!
-//! * A boots with its build held and is SIGKILLed there — a hang's force quit, the
-//!   end that runs no handler at all (a fatal signal's banner reads the same to the
-//!   claim, `crash_journal::classify_death`; a SIGKILL leaves no crash report in
-//!   the person's DiagnosticReports). While A is held the layout is no longer
-//!   `session.toml` but A's take, and a launch L that boots meanwhile does NOT take
-//!   it: L comes up with its own tab alone and A's take still stands (a live run's
-//!   take is never taken). L quits, leaving its own one-tab layout.
-//! * B boots: it takes L's layout and A's again, and comes back with both folders'
-//!   tabs beside L's; once B's crash journal holds its desk, no take is left on disk.
-//!
-//! THE BRAKE: in a second world A is SIGKILLed inside its build as above, B boots
-//! with its build held too — A's take is B's now — and is SIGKILLed there as well;
-//! C comes back with its own tab alone, and no take is left: a layout that stops
-//! aterm comes back at most once more.
-//!
-//! NEGATIVE CONTROLS: with the single-use take (the code before this change) no take
-//! is on disk while A is held, so both worlds fail at their first take check; with
-//! those checks taken out, A's layout is gone with A and B comes back with L's tab
-//! alone ("B brings back the tabs A took"). With the brake taken out (a re-take
-//! judged as a first take), C comes back with A's tabs and the second world fails.
-//!
-//! Isolation is `support/launch_isolation.rs`'s (scratch HOME and XDG roots, a private
-//! control socket, every automatic lane off, `--no-reroute`). Every wait for something
-//! that must happen is a one-minute hang detector; each instance is killed by its own
-//! pid on drop.
+//! Live headless tests for two-phase `session.toml` restore take.
 
 #![cfg(unix)]
 
@@ -60,8 +17,7 @@ const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
 /// How often a wait asks again.
 const GAP: Duration = Duration::from_millis(25);
 
-/// The development seam that gives a headless instance a window's desk
-/// (`aterm-gui`'s `desk::HEADLESS_RESTORE_SEAM`).
+/// Seam giving a headless instance a window's desk (`aterm-gui`'s `desk::HEADLESS_RESTORE_SEAM`).
 const DESK_SEAM: &str = "ATERM_DEBUG_HEADLESS_RESTORE";
 
 /// The development seam that holds the boot inside `build_event_loop`.
@@ -84,8 +40,7 @@ impl World {
         self.0.path()
     }
 
-    /// The state root the desk seam's private-root check reads (`ATERM_STATE_HOME`):
-    /// `session.toml`, the takes and the crash journals live in it.
+    /// The state root the desk seam's private-root check reads (`ATERM_STATE_HOME`).
     fn state(&self) -> PathBuf {
         self.path().join("astate")
     }
@@ -108,8 +63,7 @@ impl World {
         names
     }
 
-    /// Whether a crash journal of the run `pid` is on disk: written once the
-    /// deferred restore has rebuilt the layout.
+    /// Whether a crash journal of the run `pid` is on disk.
     fn journal_of(&self, pid: u32) -> bool {
         let prefix = format!("journal-{pid}-");
         std::fs::read_dir(self.state()).is_ok_and(|entries| {
@@ -157,9 +111,7 @@ impl Proc {
         let _ = self.child.wait();
     }
 
-    /// Quit it as a person does (`invoke Quit`, which a headless instance takes
-    /// without a confirm) and wait for it to end. The reply is not read: the
-    /// instance may close the connection as it quits.
+    /// Quit the instance via `invoke Quit`.
     fn quit(mut self) {
         let _ = Ctl::connect(&self.sock).line("invoke Quit");
         let ended = aterm_spec::wait::within(HANG, GAP, || self.child.try_wait().ok().flatten());
@@ -167,9 +119,7 @@ impl Proc {
     }
 }
 
-/// Boot one lab-desk instance named `tag` in `world`. `held`: its boot is held
-/// inside the event loop's build, and this returns once it is there (the instance
-/// listens on no socket yet); else once its control socket listens.
+/// Boot one lab-desk instance named `tag` in `world`.
 fn boot(world: &World, tag: &str, held: bool) -> Proc {
     let root = world.path();
     let sock = root.join(format!("run/aterm/{tag}.sock"));
@@ -245,8 +195,7 @@ fn session_titles(proc: &Proc) -> Vec<String> {
     titles
 }
 
-/// Seed `world` with a quit layout: an instance opens two tabs beside its boot tab,
-/// titles them `qone` and `qtwo` (a user title, which the layout keeps), and quits.
+/// Seed `world` with a quit layout.
 fn seed(world: &World) {
     let q = boot(world, "q", false);
     {
@@ -279,9 +228,7 @@ fn holds_a_seeded_tab(titles: &[String]) -> bool {
     TITLES.iter().any(|title| titles.iter().any(|t| t == title))
 }
 
-/// Wait until `proc`'s crash journal is on disk — written once its deferred restore
-/// has rebuilt the layout, so its sessions are every one it restores — and return
-/// their titles.
+/// Wait until `proc`'s crash journal is on disk.
 fn restored_titles(world: &World, proc: &Proc) -> Vec<String> {
     let journaled =
         aterm_spec::wait::within(HANG, GAP, || world.journal_of(proc.pid()).then_some(()));
@@ -311,7 +258,6 @@ fn a_launch_killed_inside_its_event_loop_build_leaves_the_quit_layout_to_the_nex
         world.takes()
     );
 
-    // A LIVE RUN'S TAKE IS NEVER TAKEN: L boots while A is held inside its build.
     let l = boot(&world, "l", false);
     let l_titles = restored_titles(&world, &l);
     assert!(
@@ -325,7 +271,6 @@ fn a_launch_killed_inside_its_event_loop_build_leaves_the_quit_layout_to_the_nex
     );
     l.quit();
 
-    // A dies inside its build, with no handler run.
     a.kill();
 
     let b = boot(&world, "b", false);

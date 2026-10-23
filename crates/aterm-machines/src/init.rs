@@ -112,19 +112,13 @@ fn options(args: &[OsString]) -> Result<Options, String> {
     Ok(options)
 }
 
-/// The base layer `aterm init` runs before its own items (design §4.2, S5): the
-/// packages' repair items, composed by the front door (`crates/aterm`), which links the
-/// crate that defines them, and `base.clt` over atpkg's C toolchain probe. Base items
-/// require only the account, so they run over SSH too; the workstation items need this
-/// Mac's console.
+/// The base layer `aterm init` runs before its own items (design §4.2, S5).
 pub struct Base {
     /// The items, in run order.
     pub items: Vec<Box<dyn aterm_converge::Item>>,
-    /// What keeps them safe to apply (the store lock), held while they run and released
-    /// before `base.clt` and the workstation items.
+    /// What keeps them safe to apply (the store lock), held while they run and released before `base.clt` and the workstation items.
     pub held: Option<Box<dyn std::any::Any>>,
-    /// `base.clt` ([`crate::init_clt`]), run once the lock is released: its apply waits on
-    /// a person's password.
+    /// `base.clt` ([`crate::init_clt`]), run once the lock is released.
     pub clt: Option<crate::init_clt::CommandLineTools>,
 }
 
@@ -139,8 +133,7 @@ impl Base {
         }
     }
 
-    /// The `--only` words that name none of these items (`aterm_converge::selects`: an
-    /// id, a family, a layer), for the surface to refuse before anything is read.
+    /// Return `--only` selectors that match none of these items (`aterm_converge::selects`).
     #[must_use]
     pub fn unnamed(&self, only: &[String]) -> Vec<String> {
         only.iter()
@@ -156,8 +149,7 @@ impl Base {
             .collect()
     }
 
-    /// These items narrowed to `only` ([`aterm_converge::select`]); every item when it is
-    /// empty.
+    /// These items narrowed to `only` ([`aterm_converge::select`]).
     #[must_use]
     pub fn narrowed(self, only: &[String]) -> Self {
         if only.is_empty() {
@@ -172,12 +164,7 @@ impl Base {
     }
 }
 
-/// Run `aterm init`. Parsing and help precede every live probe, including HOME checks.
-/// `base` gives the base layer's items for a run that applies (`true`) or only reads.
-/// `full_disk_access` measures this process's Full Disk Access without a prompt
-/// (`aterm_containment::probe_fda`, which the front door links): asked once, for a run
-/// whose workstation items run, and handed to them through [`Live`]
-/// ([`System::full_disk_access`]).
+/// Run `aterm init`.
 pub fn main_entry(
     args: Vec<OsString>,
     base: &dyn Fn(bool) -> Base,
@@ -194,8 +181,6 @@ pub fn main_entry(
         print!("{USAGE}");
         return ExitCode::SUCCESS;
     }
-    // Every `--only` word names a base item, or nothing is read (the items are composed,
-    // not probed).
     let unnamed = base(false).unnamed(&options.only);
     if !unnamed.is_empty() {
         eprintln!(
@@ -209,7 +194,6 @@ pub fn main_entry(
         eprintln!("aterm init: run in your own macOS login and home directory");
         return ExitCode::FAILURE;
     }
-    // `--only` runs base items alone, which touch no other app's data: nothing to measure.
     let sys = Live::new().with_full_disk_access(if options.only.is_empty() {
         full_disk_access()
     } else {
@@ -221,8 +205,6 @@ pub fn main_entry(
         } else {
             Mode::Plan
         };
-        // `--only` runs base items alone: no setting of this login is read or asked about,
-        // and no keyboard list either.
         let (ctx, groups) = if options.only.is_empty() {
             let ctx = local_context(&sys)?;
             let groups = prepare_groups(&sys, &ctx, mode)?;
@@ -249,7 +231,6 @@ pub fn main_entry(
     let complete = complete(&rows, options.action);
     let code = status(&rows, options.action);
     if options.json {
-        // The one envelope every `--json` surface prints (`aterm pkg doctor --json` too).
         let mode = match options.action {
             Action::Apply => ReportMode::Apply,
             Action::Plan => ReportMode::Plan,
@@ -319,11 +300,7 @@ pub enum WorkstationGroup {
     InputActivation,
     /// The complete workstation profile, excluding optional repository setup.
     All,
-    /// Of the selected preference rows, only the keys in another app's sandbox container
-    /// ([`crate::items::defaults::CONTAINED`]) that a pass without Full Disk Access left
-    /// alone ([`crate::items::Item::withheld`]): the follow-up once the grant is held
-    /// ([`crate::init_preferences::withheld_items`]). The rows' other keys are not read, so
-    /// a person's change to them since stays theirs.
+    /// Filter selected preference rows to keys in another app's sandbox container ([`crate::items::defaults::CONTAINED`]) withheld without Full Disk Access ([`crate::items::Item::withheld`]).
     Withheld,
 }
 
@@ -352,8 +329,6 @@ impl WorkstationGroup {
 }
 
 /// Run the same workstation items used by `aterm init` for the console account.
-/// The caller decides plan/apply and, before applying, enforces its own isolated
-/// instance and first-launch policy. Plan only probes; it never opens either app.
 ///
 /// # Errors
 /// The console account or its required input facts cannot be resolved.
@@ -378,28 +353,25 @@ pub fn run_workstation_selected(
     prepare_workstation_selected(sys, group, selected)?.run(sys, mode)
 }
 
-/// A workstation pass whose before-images and apply share one resolved account
-/// and item set. This lets doctor save exact plist values before the first write.
+/// A workstation pass whose before-images and apply share one resolved account and item set.
 pub struct Workstation {
     ctx: Ctx,
     items: Vec<Box<dyn Item>>,
-    snapshots: Option<Vec<PreferenceSnapshot>>,
+    /// Each item's before-images, or why they could not be taken
+    /// ([`Workstation::preference_changes`]); `None` until a pass takes them.
+    snapshots: Option<Vec<Result<PreferenceSnapshot, String>>>,
     /// The items this pass leaves alone ([`Workstation::hold`]), by id.
     held: Vec<(String, Hold)>,
 }
 
 type PreferenceSnapshot = Vec<(Target, Read<PValue>)>;
 
-/// How a pass leaves an item alone ([`Workstation::hold`]). Either way an item that already
-/// reads as wanted stays `Ok`, and nothing of a held item is applied, refreshed or journaled.
+/// How a pass leaves an item alone ([`Workstation::hold`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hold {
-    /// Its change is not made in this pass: one that would change reads `Blocked`, naming
-    /// what it reads now and this line ([`aterm_converge::held_back`]).
+    /// Its change is not made in this pass.
     Back(String),
-    /// It made its change once and was changed since: one that would change reads
-    /// `NotApplicable`, naming what it reads now and this line, so nothing is wrong and
-    /// nothing is to do ([`aterm_converge::left_as_is`]).
+    /// It made its change once and was changed since.
     AsIs(String),
 }
 
@@ -408,13 +380,9 @@ pub enum Hold {
 pub struct WorkstationRun {
     /// The common probe/apply/read-back results.
     pub rows: Vec<ItemReport>,
-    /// Each item whose apply or refresh ran, in run order. A refused plan, a held item
-    /// and an apply that stood aside contribute nothing: none of them changed anything.
+    /// Each item whose apply or refresh ran, in run order.
     pub attempts: Vec<Attempt>,
-    /// The items that left keys in another app's container alone for want of Full Disk
-    /// Access ([`Item::withheld`]), by id, held or not: whatever their rows read, none is
-    /// done until a pass with the grant reaches those keys. A caller that records them for
-    /// that pass tells a held one apart by its hold: nothing of it ran.
+    /// The items that left keys in another app's container alone for want of Full Disk Access ([`Item::withheld`]), by id, held or not.
     pub withheld: Vec<String>,
 }
 
@@ -423,43 +391,46 @@ pub struct WorkstationRun {
 pub struct Attempt {
     /// The item's id, as its row has it.
     pub id: String,
-    /// Whether its read-back verified the change: the row ended `Ok`, `Changed` or
-    /// `NotApplicable`. An attempt that did not verify may still have changed the machine
-    /// (a write that failed after it took, a consumer that rewrote what was written).
+    /// Whether its read-back verified the change.
     pub verified: bool,
-    /// The before-images the snapshot guard admitted for it immediately before its
-    /// mutation, including a write that failed after partially taking effect. Empty
-    /// for an item with no preference keys and for a pass that took no snapshot.
+    /// The before-images the snapshot guard admitted for it immediately before its mutation, including a write that failed after partially taking effect.
     pub preferences: Vec<(Target, Read<PValue>)>,
 }
 
 impl Workstation {
     /// Typed before-images of precisely the preference keys this pass would change.
-    /// The pass checks these again immediately before each mutation; a changed
-    /// target or value requires a fresh snapshot instead of an unbacked write.
+    ///
+    /// An item whose before-images cannot be taken (its plan fails, or a value it would
+    /// replace reads unusable) changes nothing in this pass, its own row saying why, and the
+    /// other items still run: a Dock with no aterm to pin (none in `/Applications` or
+    /// `~/Applications`, or a dev build) leaves Caps Lock, scrolling and widgets to apply.
     ///
     /// # Errors
-    /// A preference cannot be read safely.
+    /// Two items would change the same key.
     pub fn preference_changes(&mut self, sys: &dyn System) -> Result<PreferenceSnapshot, String> {
         let mut changes = Vec::new();
         let mut snapshots = Vec::new();
         for item in &self.items {
-            // A held item changes nothing in this pass ([`Workstation::hold`]): no key of
             // it is backed up for, or activated after, a change nobody makes.
             if self.held.iter().any(|(id, _)| *id == item.id()) {
-                snapshots.push(Vec::new());
+                snapshots.push(Ok(Vec::new()));
                 continue;
             }
-            let snapshot = item.preference_changes(sys, &self.ctx)?;
-            for (target, read) in &snapshot {
+            let snapshot = item.preference_changes(sys, &self.ctx).and_then(|snapshot| {
+                if snapshot
+                    .iter()
+                    .any(|(_, read)| matches!(read, Read::Unusable(_)))
+                {
+                    Err("a value it would replace could not be read for recovery; left unchanged"
+                        .into())
+                } else {
+                    Ok(snapshot)
+                }
+            });
+            for (target, read) in snapshot.iter().flatten() {
                 if changes.iter().any(|(saved, _)| saved == target) {
                     return Err(
                         "workstation items overlap a preference key; no changes applied".into(),
-                    );
-                }
-                if matches!(read, Read::Unusable(_)) {
-                    return Err(
-                        "a workstation recovery value could not be read; no changes applied".into(),
                     );
                 }
                 changes.push((target.clone(), read.clone()));
@@ -478,29 +449,21 @@ impl Workstation {
         Ok(self.run_recording(sys, mode)?.rows)
     }
 
-    /// Run the shared engine and retain exactly which snapshotted items reached
-    /// mutation, including a write that failed after partially taking effect.
+    /// Run the shared engine and retain exactly which snapshotted items reached mutation, including a write that failed after partially taking effect.
     ///
     /// # Errors
     /// The journal cannot be resolved or the items' dependency order is invalid.
     pub fn run_recording(self, sys: &dyn System, mode: Mode) -> Result<WorkstationRun, String> {
-        // The journal of the account `sys` acts as: the items' own port.
         let mut journal = sys.journal()?;
         self.run_recording_with(sys, mode, journal.as_mut())
     }
 
-    /// Leave the items `held` names alone in this pass, each as its [`Hold`] says: nothing
-    /// of one is applied, refreshed, backed up ([`Workstation::preference_changes`]) or
-    /// journaled, and one that already reads as wanted stays `Ok`. Call it before
-    /// [`Workstation::preference_changes`]. An unattended caller names the items whose
-    /// own earlier attempt it will not repeat, so a retry on its timer is not the same
-    /// change, relaunch and rollback again.
+    /// Leave the items `held` names alone in this pass, each as its [`Hold`] says.
     pub fn hold(&mut self, held: &[(String, Hold)]) {
         self.held = held.to_vec();
     }
 
-    /// A pass over `items` at a context of no account and no host facts: for a caller's
-    /// tests of what it does with a pass's rows and attempts.
+    /// A pass over `items` at a context of no account and no host facts.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn of(items: Vec<Box<dyn Item>>) -> Self {
@@ -571,7 +534,6 @@ impl Workstation {
             .into_iter()
             .filter_map(|(id, preferences)| {
                 let row = rows.iter().find(|row| row.id == id)?;
-                // An apply that stood aside changed nothing (`Item::stood_aside`).
                 row.stood_aside.is_none().then_some(Attempt {
                     verified: matches!(
                         row.outcome,
@@ -590,13 +552,12 @@ impl Workstation {
     }
 }
 
-/// The shared item still owns its policy and mutation. This wrapper checks that the
-/// durable recovery record describes the values it is about to replace, and records which
-/// items reached mutation.
+/// The shared item still owns its policy and mutation.
 struct Guard {
     inner: Box<dyn Item>,
-    /// The before-images saved for recovery; `None` when the pass took no snapshot.
-    before: Option<PreferenceSnapshot>,
+    /// The before-images saved for recovery, or why the pass could not take them; `None`
+    /// when the pass took no snapshot.
+    before: Option<Result<PreferenceSnapshot, String>>,
     attempted: Arc<Mutex<Vec<(String, PreferenceSnapshot)>>>,
 }
 
@@ -605,6 +566,9 @@ impl Guard {
         let Some(before) = &self.before else {
             return Ok(());
         };
+        // No recovery record holds what this item would replace: it writes nothing, even
+        // when a later read of it succeeds.
+        let before = before.as_ref().map_err(Clone::clone)?;
         let current = self.inner.preference_changes(sys, ctx)?;
         if current.len() == before.len()
             && before.iter().all(|(target, before)| {
@@ -628,7 +592,10 @@ impl Guard {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if !attempted.iter().any(|(saved, _)| *saved == id) {
-            attempted.push((id, self.before.clone().unwrap_or_default()));
+            attempted.push((
+                id,
+                self.before.clone().and_then(Result::ok).unwrap_or_default(),
+            ));
         }
     }
 
@@ -743,7 +710,7 @@ pub fn prepare_workstation(
     prepare_workstation_selected(sys, group, Selection::all())
 }
 
-/// Prepare only the chosen rows. An empty group reads no host facts.
+/// Prepare only the chosen rows.
 ///
 /// # Errors
 /// The console account or required selected input facts cannot be resolved.
@@ -769,8 +736,6 @@ pub fn prepare_workstation_selected(
         });
     }
     let ctx = context_for_selected(sys, group, selected)?;
-    // Doctor and first launch run these items unscoped, so they need the console here;
-    // `aterm init` scopes them instead (`Requires::Console`).
     if ctx.console.is_none() {
         return Err("run as the user currently logged in at this Mac's console".into());
     }
@@ -783,8 +748,7 @@ pub fn prepare_workstation_selected(
     })
 }
 
-/// Resolve this login's console context for independent initial-setup stages,
-/// without inventorying keyboards or reading any preference/account service.
+/// Resolve this login's console context without inventorying keyboards or preference services.
 ///
 /// # Errors
 /// The login's console account cannot be established.
@@ -814,19 +778,10 @@ pub fn run_initial_spotlight(
     .run(sys, mode)
 }
 
-/// Apply System State's Secrets stage: the vault item `aterm init` converges
-/// ([`crate::init_secrets`]), for the vault the plan names (`source`), through the same
-/// probe/apply/read-back engine, every change journaled in the journal of the account
-/// `sys` acts as before it is made. Nobody is asked anything; the join waits up to `wait`
-/// for an approval, and replaces only the vault configuration `replaces` admits (the one
-/// the stage read when it chose to join). `password` is the join password the person typed
-/// in System State: it is given to the one join that needs it and comes back `None` once
-/// that join has queued its proof (or let this Mac in), and as it was when no join took it
-/// or the join failed, so an unattended retry neither loses it to the network nor sends it
-/// again.
+/// Apply System State's Secrets stage.
 ///
 /// # Errors
-/// The context names no one user, or the journal cannot be resolved; nothing was changed.
+/// The context names no one user, or the journal cannot be resolved.
 pub fn run_initial_secrets(
     sys: &dyn System,
     ctx: &Ctx,
@@ -922,8 +877,7 @@ fn workstation_items_selected(
 type Group = (Vec<Box<dyn Item>>, Place);
 
 /// Preparation can read optional profiles and ask vault questions before an item is
-/// probed. Away from the console, defer the whole workstation preparation as well as
-/// its applies: a broken local profile must not prevent the base repairs over SSH.
+/// probed.
 fn prepare_groups(sys: &dyn System, ctx: &Ctx, mode: Mode) -> Result<Vec<Group>, String> {
     if ctx.console.is_none() {
         return Ok(vec![(
@@ -931,13 +885,11 @@ fn prepare_groups(sys: &dyn System, ctx: &Ctx, mode: Mode) -> Result<Vec<Group>,
             workstation_place(Class::Person),
         )]);
     }
-    // Questions precede every change, including the base layer's.
     let secrets = crate::init_secrets::items(sys, ctx, crate::init_secrets::live(ctx)?, mode)?;
     groups(sys, ctx, secrets)
 }
 
 /// The optional workstation items cannot be enumerated without reading their inputs.
-/// Keep one honest blocked row until this login owns the console.
 struct WorkstationAtConsole;
 
 impl Item for WorkstationAtConsole {
@@ -962,10 +914,7 @@ impl Item for WorkstationAtConsole {
 
 /// What init converges after the base layer, in run order, each list with its place: all
 /// of it the workstation layer, which needs this Mac's console (design §3.2, §4.3): over
-/// SSH, or under another login's console, each is `Blocked` and nothing of it is read. The
-/// secrets vault's join (`secrets`, from `init_secrets::items`), the GitHub sign-in (whose
-/// keychain write needs the console session's unlocked keychain) and checkouts reach the
-/// network.
+/// SSH, or under another login's console, each is `Blocked` and nothing of it is read.
 fn groups(sys: &dyn System, ctx: &Ctx, secrets: Vec<Box<dyn Item>>) -> Result<Vec<Group>, String> {
     let place = workstation_place;
     Ok(vec![
@@ -978,11 +927,8 @@ fn groups(sys: &dyn System, ctx: &Ctx, secrets: Vec<Box<dyn Item>>) -> Result<Ve
             crate::init_trackpad::behavior_items(ctx)?,
             place(Class::Preference),
         ),
-        // rustup's profile and the rust-docs its toolchains hold: an act on the
-        // person's own toolchains that only a run they started makes (§3.2 `asked`).
         (crate::init_spotlight::items(ctx)?, place(Class::Asked)),
         (crate::init_accounts::items(ctx)?, place(Class::Preference)),
-        // Before GitHub: the vault carries the token files its profile may name.
         (secrets, place(Class::Install)),
         (crate::init_github::items(sys, ctx)?, place(Class::Install)),
     ])
@@ -998,9 +944,7 @@ fn workstation_place(class: Class) -> Place {
 }
 
 /// Run the `base` items, then `groups` against `sys`, each change journaled in `journal`
-/// before it is made. Every class applies; an item that needs the console runs only when
-/// this login holds it (`ctx.console`). What the base layer holds (the store lock) is
-/// released once its items have run: a workstation item can wait on a person.
+/// before it is made.
 fn run<'a>(
     sys: &'a dyn System,
     ctx: &'a Ctx,
@@ -1009,8 +953,6 @@ fn run<'a>(
     mode: Mode,
     journal: &mut dyn Journal,
 ) -> Result<Vec<ItemReport>, String> {
-    // The front gate has refused root and any other `$HOME` (`main_entry`, `context_for`):
-    // this is the account's own shell.
     let scope = aterm_converge::Scope {
         at_console: ctx.console.is_some(),
         ..aterm_converge::Scope::EVERY
@@ -1019,7 +961,6 @@ fn run<'a>(
     let mut rows = aterm_converge::run_scoped(&items, mode, scope, journal, &mut |_| {})
         .map_err(|refused| refused.to_string())?;
     drop(held);
-    // `base.clt` once the lock is gone: its apply waits on a person's password.
     if let Some(clt) = &clt {
         let bound = crate::engine::bind([(clt as &dyn Item, crate::init_clt::place())], sys, ctx);
         rows.extend(
@@ -1027,8 +968,6 @@ fn run<'a>(
                 .map_err(|refused| refused.to_string())?,
         );
     }
-    // No workstation item waits on a base item (they name none), so the two passes order
-    // as the one did.
     let bound = crate::engine::bind(
         groups.iter().flat_map(|(items, place)| {
             items.iter().map(move |item| (item.as_ref(), place.clone()))
@@ -1044,9 +983,6 @@ fn run<'a>(
 }
 
 /// Collect only what this setup uses, avoiding fleet, TCC database and unrelated app probes.
-/// Root is refused; another login holding the console (or none, over SSH) is not: the
-/// context then has no console user, so the workstation items are `Blocked` and the
-/// console session's keyboards are not read (design §3.2: `Requires::Console`).
 fn local_context(sys: &dyn System) -> Result<Ctx, String> {
     context_for(sys, WorkstationGroup::All)
 }
@@ -1073,8 +1009,6 @@ fn context_for_selected(
             sys.euid()
         ));
     }
-    // The console's owner: this login's, or another's (then nothing of the console
-    // session is read), or nobody's to read.
     let at_console = sys
         .stat(Path::new("/dev/console"))
         .is_ok_and(|console| console.uid == user.uid);
@@ -1087,8 +1021,6 @@ fn context_for_selected(
             .into(),
         console_user: at_console.then(|| user.name.clone()),
         users: vec![user.clone()],
-        // What the runner measured of this process, once, before the pass: whether the
-        // widgets item may touch Notification Center's container (`init_preferences`).
         full_disk_access: sys.full_disk_access(),
         ..HostFacts::default()
     };
@@ -1102,11 +1034,6 @@ fn context_for_selected(
             disrupt: true,
         });
     }
-    // Live keyboard inventory is deliberately not read here. Searching HID
-    // devices can stall behind the device/Bluetooth stack or its system UI,
-    // and startup must never wait on it. Caps Lock preferences for listed
-    // models still apply; live attached-keyboard activation is not part of
-    // this pass.
     Ok(Ctx {
         facts,
         users: vec![user.clone()],
@@ -1233,7 +1160,7 @@ mod tests {
     /// The widgets row reads only its own domains: with Full Disk Access, the Window
     /// Manager's and Notification Center's (three keys); without it (refused or not
     /// measured), the Window Manager's alone (two keys), and no command names Notification
-    /// Center's container. Negative control: the grant arm's export of that container.
+    /// Center's container.
     #[test]
     fn selected_widgets_do_not_read_keyboard_dock_trackpad_or_accounts() {
         let who = user("alice", 501);
@@ -1283,9 +1210,7 @@ mod tests {
 
     /// The local pass carries the Full Disk Access its runner measured
     /// ([`System::full_disk_access`]) into the items' context: `aterm init`, the doctor and
-    /// System State measure it once and hand it over through the port. Without it the
-    /// widgets row names the wait and never exports Notification Center's container.
-    /// Negative control: the same pass on a port that answers the grant exports it.
+    /// System State measure it once and hand it over through the port.
     #[test]
     fn the_runners_full_disk_access_reaches_the_widgets_row_through_the_port() {
         for full_disk_access in [None, Some(false), Some(true)] {
@@ -1350,8 +1275,7 @@ mod tests {
     /// keys in another app's container, under its row's id and reaching those keys alone:
     /// for the widgets and the Dock, one widgets item whose snapshot, plan and apply read
     /// Notification Center's widget list and no Window Manager or Dock key, and its run
-    /// withholds nothing with the grant. Negative control: the preferences group of the
-    /// same selection builds both rows and reads the Window Manager's keys.
+    /// withholds nothing with the grant.
     #[test]
     fn the_withheld_group_reaches_only_the_keys_a_pass_without_the_grant_left_alone() {
         assert_eq!(
@@ -1420,7 +1344,6 @@ mod tests {
             );
         }
 
-        // Without the grant the preferences group's run names the widgets row withheld.
         let sys = console(None);
         sys.on(
             "alice$ /usr/bin/defaults export com.apple.WindowManager -",
@@ -1434,7 +1357,6 @@ mod tests {
             .run_recording_with(&sys, Mode::Plan, &mut NoJournal)
             .unwrap();
         assert_eq!(run.withheld, ["init.widgets@alice"]);
-        // Negative control: the preferences group reads the rows' other keys.
         let sys = console(Some(true));
         sys.on(
             "alice$ /usr/bin/defaults export com.apple.WindowManager -",
@@ -1581,9 +1503,7 @@ mod tests {
 
     /// The workstation pass (`aterm doctor --apply`, a first launch's setup) journals each
     /// change in the journal of the system it runs on: the fake's files hold the changed
-    /// item's line, and the item already as wanted writes none. Negative control: the
-    /// journal this process would resolve for itself is never asked, so a mutant that
-    /// asks it leaves the fake's journal empty.
+    /// item's line, and the item already as wanted writes none.
     #[test]
     fn a_workstation_pass_journals_in_the_journal_of_the_system_it_runs_on() {
         let sys = Fake::root();
@@ -1618,8 +1538,9 @@ mod tests {
         applies: Arc<std::sync::atomic::AtomicU32>,
         refreshes: Arc<std::sync::atomic::AtomicU32>,
         aside: Option<aterm_converge::StoodAside>,
-        /// The preference keys it would change ([`Item::preference_changes`]).
-        keys: Vec<(Target, Read<PValue>)>,
+        /// The preference keys it would change, or why it cannot say
+        /// ([`Item::preference_changes`]).
+        keys: Result<Vec<(Target, Read<PValue>)>, String>,
     }
 
     impl Counted {
@@ -1642,7 +1563,7 @@ mod tests {
                 applies: Arc::clone(&counts[0]),
                 refreshes: Arc::clone(&counts[1]),
                 aside,
-                keys: Vec::new(),
+                keys: Ok(Vec::new()),
             });
             (item, counts)
         }
@@ -1684,14 +1605,13 @@ mod tests {
             _: &dyn System,
             _: &Ctx,
         ) -> Result<Vec<(Target, Read<PValue>)>, String> {
-            Ok(self.keys.clone())
+            self.keys.clone()
         }
     }
 
     /// A held item's keys are no before-images of the pass: nothing of it changes, so
     /// nothing of it is backed up for, or relaunched after, the pass, and a pass that
-    /// dies part way leaves no record naming a key nobody wrote. Negative control:
-    /// dropping the held skip of `Workstation::preference_changes` lists the Dock key.
+    /// dies part way leaves no record naming a key nobody wrote.
     #[test]
     fn a_held_item_has_no_before_images() {
         let alice = user("alice", 501);
@@ -1702,7 +1622,7 @@ mod tests {
                 applies: Arc::default(),
                 refreshes: Arc::default(),
                 aside: None,
-                keys: vec![(Target::user(domain, "k", &alice), Read::Absent)],
+                keys: Ok(vec![(Target::user(domain, "k", &alice), Read::Absent)]),
             }) as Box<dyn Item>
         };
         let mut pass = Workstation {
@@ -1725,6 +1645,86 @@ mod tests {
         );
     }
 
+    /// An item whose before-images cannot be taken (its plan fails, or a value it would
+    /// replace reads unusable) changes nothing and the other items still apply: one such
+    /// item once failed the whole pass. Its write stays refused when its probe passes
+    /// after the snapshot failed (what it read cleared in between), since no recovery
+    /// record holds what it would replace; the Dock's own case, whose probe fails as its
+    /// snapshot did, is `init_preferences`'
+    /// `a_dock_that_cannot_pin_aterm_leaves_the_other_desktop_rows_to_apply`. Negative
+    /// controls: `?` on the item's snapshot in `Workstation::preference_changes` fails the
+    /// pass; dropping the refused snapshot's error in `Guard::validate` applies both.
+    #[test]
+    fn an_item_without_before_images_changes_nothing_and_the_others_run() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let alice = user("alice", 501);
+        let item = |id: &'static str, keys| {
+            let applies = Arc::new(AtomicU32::new(0));
+            let item = Box::new(Counted {
+                id,
+                probes: Mutex::new(vec![change(), ok()]),
+                applies: Arc::clone(&applies),
+                refreshes: Arc::default(),
+                aside: None,
+                keys,
+            }) as Box<dyn Item>;
+            (item, applies)
+        };
+        let target = |domain: &str| Target::user(domain, "k", &alice);
+        let (cleared, cleared_applies) = item(
+            "init.test.cleared",
+            Err("plutil timed out; left untouched".into()),
+        );
+        let (unusable, unusable_applies) = item(
+            "init.test.unusable",
+            Ok(vec![(
+                target("com.apple.finder"),
+                Read::Unusable("cfprefsd timed out".into()),
+            )]),
+        );
+        let (widgets, widgets_applies) = item(
+            "init.test.widgets",
+            Ok(vec![(target("com.apple.WindowManager"), Read::Absent)]),
+        );
+        let mut pass = Workstation {
+            items: vec![cleared, unusable, widgets],
+            ctx: ctx(std::slice::from_ref(&alice)),
+            snapshots: None,
+            held: Vec::new(),
+        };
+        let sys = Fake::root();
+        let before = pass.preference_changes(&sys).unwrap();
+        let domains: Vec<&str> = before.iter().map(|(t, _)| t.domain.as_str()).collect();
+        assert_eq!(domains, ["com.apple.WindowManager"]);
+        let run = pass
+            .run_recording_with(&sys, Mode::Apply, &mut NoJournal)
+            .unwrap();
+        let outcome = |id: &str| {
+            let row = run.rows.iter().find(|row| row.id == id).unwrap();
+            (row.outcome, row.why.clone().unwrap_or_default())
+        };
+        let (cleared_outcome, cleared_why) = outcome("init.test.cleared");
+        assert_eq!(cleared_outcome, Outcome::Failed);
+        assert!(cleared_why.contains("plutil timed out"), "{cleared_why}");
+        let (unusable_outcome, unusable_why) = outcome("init.test.unusable");
+        assert_eq!(unusable_outcome, Outcome::Failed);
+        assert!(unusable_why.contains("read for recovery"), "{unusable_why}");
+        assert_eq!(outcome("init.test.widgets").0, Outcome::Changed);
+        assert_eq!(
+            cleared_applies.load(Ordering::SeqCst),
+            0,
+            "no unbacked write"
+        );
+        assert_eq!(
+            unusable_applies.load(Ordering::SeqCst),
+            0,
+            "no unbacked write"
+        );
+        assert_eq!(widgets_applies.load(Ordering::SeqCst), 1);
+        let attempts: Vec<&str> = run.attempts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(attempts, ["init.test.widgets"]);
+    }
+
     /// The ids of the fake's journal lines, in order.
     fn journaled_ids(sys: &Fake) -> Vec<String> {
         let text =
@@ -1741,8 +1741,7 @@ mod tests {
     /// as it is), naming what it reads now and the caller's line, and is neither applied,
     /// refreshed nor journaled, and one that already reads correct stays `Ok`, while the
     /// items not held run as before; only the items whose apply or refresh ran are
-    /// attempts, each saying whether it verified. Negative control: not wrapping a held
-    /// item in `run_recording_with` applies and journals it.
+    /// attempts, each saying whether it verified.
     #[test]
     fn a_held_item_changes_nothing_and_only_reached_items_are_attempts() {
         use std::sync::atomic::Ordering;
@@ -1822,8 +1821,7 @@ mod tests {
     /// An apply that stood aside (a permission not granted yet: the account sign-out
     /// without Accessibility) changed nothing, so it is no attempt: an unattended caller
     /// that holds what did not verify must not hold it, and retries it once the grant
-    /// lands. Negative control: dropping the `stood_aside` filter of `run_recording_with`
-    /// reports it an unverified attempt.
+    /// lands.
     #[test]
     fn an_apply_that_stood_aside_is_no_attempt() {
         let sys = Fake::root();
@@ -1859,8 +1857,6 @@ mod tests {
         let scratch = aterm_tempfile::tempdir().unwrap();
         let mut journal = FileJournal::under(scratch.path());
         let alice = at_console(user("alice", 501));
-        // Natural scrolling is saved off but still on in the session: init's trackpad item
-        // changes it, and its read-back reads off.
         let sys = Fake::root();
         sys.scroll_state(true);
         saved_off(&sys);
@@ -1911,8 +1907,7 @@ mod tests {
 
     /// WHAT THE BASE LAYER HOLDS (the store lock) IS RELEASED once its items have run,
     /// before the first workstation item is read: a workstation item can wait on a person,
-    /// or run `aterm pkg install` itself, and an install pass must not wait on it. The
-    /// base item still runs under it, and the rows keep the base layer first.
+    /// or run `aterm pkg install` itself, and an install pass must not wait on it.
     #[test]
     fn what_the_base_layer_holds_is_released_before_a_workstation_item_is_read() {
         use std::sync::Arc;
@@ -1998,8 +1993,6 @@ mod tests {
 
     #[test]
     fn init_journals_nothing_when_every_item_is_already_right() {
-        // The negative control: the same run with nothing to change, the trackpad's
-        // native refresh included, writes no line and makes no journal.
         let scratch = aterm_tempfile::tempdir().unwrap();
         let mut journal = FileJournal::under(scratch.path());
         let alice = at_console(user("alice", 501));
@@ -2069,7 +2062,6 @@ mod tests {
             "the GitHub sign-in and checkouts: {github:?}"
         );
         assert!(github.iter().all(|id| id.contains("github")), "{github:?}");
-        // rustup's profile and rust-docs: acts on the person's toolchains, asked by the run.
         let asked: Vec<String> = bound
             .iter()
             .filter(|b| b.class() == Class::Asked)
@@ -2224,7 +2216,6 @@ mod tests {
                 only: Vec::new(),
             }
         );
-        // `--only` takes a list, in either spelling, and refuses an empty one.
         assert_eq!(
             options(&[
                 "--only".into(),
@@ -2337,8 +2328,7 @@ mod tests {
     /// THE CONSOLE GATE IS PER ITEM (S5): with another uid at this Mac's console (or none,
     /// over SSH), init is not refused — a base item applies and is read back, and each
     /// workstation item is `Blocked` with nothing of the console session read (no
-    /// `defaults`, no `hidutil`, no accounts). The same items with this login at the
-    /// console apply both: the negative control.
+    /// `defaults`, no `hidutil`, no accounts).
     #[test]
     fn under_another_console_owner_a_base_item_applies_and_a_workstation_item_is_blocked() {
         let alice_at = |console_uid: u32| {
@@ -2369,8 +2359,6 @@ mod tests {
             );
             sys
         };
-        // Doctor's and first launch's workstation pass runs its items unscoped: away from
-        // the console it is refused, never run on a context without the console user.
         let refused = prepare_workstation(&alice_at(502), WorkstationGroup::Preferences)
             .err()
             .expect("refused away from the console");
@@ -2417,7 +2405,6 @@ mod tests {
                 assert_eq!(status(&rows, Action::Apply), 1);
             }
         }
-        // Root is still refused at the front gate.
         assert!(
             local_context(&Fake::root())
                 .unwrap_err()
@@ -2528,8 +2515,6 @@ mod tests {
         );
         sys.on("/usr/bin/uname -m", Ran::ok("arm64\n"));
         sys.on("/usr/bin/sw_vers -productVersion", Ran::ok("27.0\n"));
-        // No hidutil expectation is installed: startup must not search live
-        // devices or wait on the HID/Bluetooth stack to answer.
         let ctx = local_context(&sys).unwrap();
         assert!(ctx.facts.keyboards.is_empty());
         assert!(

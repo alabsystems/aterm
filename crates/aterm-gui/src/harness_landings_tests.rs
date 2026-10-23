@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! SETTINGS ▸ HARNESS COUNTS LANDINGS (design §12.4.1, §12.4.3 item 3, slice
-//! 4c): the Every row and its Cruise press tell a session landing from one
-//! landed or quiet by its chip's face; WHAT THE HARNESS DID counts Land's
-//! landings over its prompts and says, under Kept going, how many were a
-//! done claim checked; STATUS's today line and a row's day line lead with
-//! landings. Each test names its negative control, run by hand against the
-//! mutant it describes and recorded in the slice's commit.
+//! SETTINGS ▸ HARNESS COUNTS LANDINGS (design §12.4.1, §12.4.3 item 3, slice 4c).
 
 use super::*;
 use crate::claude_lights::ChipGlass;
@@ -65,8 +59,7 @@ fn seven() -> HarnessState {
     ])
 }
 
-/// Whether `words` say `part` as a whole part of a list (`, `-, `: `- or
-/// `; `-separated), so `1 landed` is never found inside `11 landed`.
+/// Whether words say part as a whole part of a list (, -, : - or ; -separated), so 1.
 pub(super) fn says(words: &str, part: &str) -> bool {
     words.split([':', ',', ';']).any(|said| said.trim() == part)
 }
@@ -74,12 +67,7 @@ pub(super) fn says(words: &str, part: &str) -> bool {
 /// THE EVERY ROW TELLS LANDING FROM LANDED (§12.4.6): a session under Land
 /// is counted by the face its chip wears — `landing` for `⤓ land` (its task
 /// open or unknown), `landed` for `✓ landed`, `quiet` for `⤓ quiet` — and a
-/// zero part is not said. A landing a loop under Cruise told keeps `∞` on
-/// the chip, so it is cruising. Read by its own parts: the rest of the line
-/// (the sessions, the timed, the off) is other features' words. NEGATIVE
-/// CONTROLS: counting modes (main's `landing`) gives `4 landing`; reading
-/// the glass's task face without the chip's fold counts the Cruise session
-/// `landed` (`2 landed`).
+/// zero part is not said.
 #[test]
 fn the_every_row_tells_landing_from_landed() {
     let every = seven().every_row().expect("seven sessions");
@@ -92,7 +80,6 @@ fn the_every_row_tells_landing_from_landed() {
     for part in ["2 landing", "1 landed", "1 quiet"] {
         assert!(says(&line, part), "{part}: {line}");
     }
-    // No landed and no quiet session: neither part is said.
     let plain = listing(vec![
         listed(1, AutopilotView::Cruise, None),
         listed(2, AutopilotView::Land, Some(TaskFace::Open)),
@@ -103,7 +90,6 @@ fn the_every_row_tells_landing_from_landed() {
         !line.contains("landed") && !line.contains("quiet"),
         "{line}"
     );
-    // All landed: no `landing` at all.
     let landed = listing(vec![
         listed(1, AutopilotView::Land, Some(TaskFace::Landed)),
         listed(2, AutopilotView::Land, Some(TaskFace::Landed)),
@@ -116,10 +102,7 @@ fn the_every_row_tells_landing_from_landed() {
 /// THE CRUISE PRESS TELLS LANDING FROM LANDED (§12.4.6): its description
 /// splits the sessions under Land it moves as the row does, so it never
 /// calls a landed session landing, and, where it moves nothing, says no
-/// session is under Land. What it moves is unchanged: every steered session
-/// under Land, whatever its face, and every timed Cruise. Read by its own
-/// parts, as the row is. NEGATIVE CONTROL: main's `cruise_landing` (every
-/// steered Land) describes `4 landing`.
+/// session is under Land.
 #[test]
 fn the_cruise_press_tells_landing_from_landed() {
     let state = seven();
@@ -148,8 +131,6 @@ fn the_cruise_press_tells_landing_from_landed() {
         every.moved(cruise),
         "each session it moves is said once"
     );
-    // A session the harness cannot steer is counted on the row, never in
-    // what the press moves.
     let mut unsteered = seven();
     unsteered.sessions[4].default = None;
     let every = unsteered.every_row().expect("seven sessions");
@@ -165,7 +146,6 @@ fn the_cruise_press_tells_landing_from_landed() {
     assert!(says(&description, "2 landing"), "{description}");
     assert!(says(&description, "1 quiet"), "{description}");
     assert!(!description.contains("landed"), "{description}");
-    // Nothing under Land and nothing timed: it moves nothing, and says why.
     let cruising = listing(vec![
         listed(1, AutopilotView::Cruise, None),
         listed(2, AutopilotView::Cruise, Some(TaskFace::Landed)),
@@ -175,7 +155,6 @@ fn the_cruise_press_tells_landing_from_landed() {
     let description = every.description(cruise);
     assert!(description.contains("under Land"), "{description}");
     assert!(!description.contains("landing"), "{description}");
-    // Only landed sessions: a press gives them Cruise, and says they landed.
     let landed = listing(vec![
         listed(1, AutopilotView::Land, Some(TaskFace::Landed)),
         listed(2, AutopilotView::Land, Some(TaskFace::Landed)),
@@ -221,9 +200,7 @@ fn at(rows: &[(String, String)], label: &str) -> Option<usize> {
 /// landings ([`HarnessStats::landed`], never its prompts), wherever the
 /// week had a land prompt or a landing — so it stands at `0` while a Land
 /// is still landing, and a landing moves a count, never a row — the
-/// week's, so a day with none yet keeps it. NEGATIVE CONTROLS: a week with
-/// neither (other acts only) shows no Landed row; a row read off today's
-/// window leaves a quiet day without the week's landings.
+/// week's, so a day with none yet keeps it.
 #[test]
 fn the_landed_row_stands_with_the_land_prompts() {
     let mut today = HarnessStats::new(0);
@@ -251,8 +228,6 @@ fn the_landed_row_stands_with_the_land_prompts() {
         at(&rows, LAND_PROMPTS.label),
         "right over the prompts: {rows:?}"
     );
-    // Prompts and no landing yet: the row stands at nought, where the
-    // landing will count.
     let (mut prompts_today, mut prompts_week) = (today.clone(), week.clone());
     prompts_today.landed = 0;
     prompts_week.landed = 0;
@@ -260,8 +235,6 @@ fn the_landed_row_stands_with_the_land_prompts() {
         words_of(&did(&read(&prompts_today, &prompts_week)), LANDED.label).as_deref(),
         Some("0 today \u{b7} 0 in 7 days")
     );
-    // A landing with no prompt in the window (its instruction typed before
-    // the week began): it still stands.
     let (mut landed_today, mut landed_week) = (today.clone(), week.clone());
     landed_today.land_prompts = 0;
     landed_week.land_prompts = 0;
@@ -269,20 +242,15 @@ fn the_landed_row_stands_with_the_land_prompts() {
         words_of(&did(&read(&landed_today, &landed_week)), LANDED.label).as_deref(),
         Some("1 today \u{b7} 3 in 7 days")
     );
-    // Nothing today, landings in the week: the row stands on the week's
-    // counts, so a day with no Land yet still shows the week's landings and
-    // midnight moves no row.
     let quiet_day = HarnessStats::new(0);
     assert_eq!(
         words_of(&did(&read(&quiet_day, &week)), LANDED.label).as_deref(),
         Some("0 today \u{b7} 3 in 7 days")
     );
-    // Nothing today, the week's prompts and no landing: it stands at nought.
     assert_eq!(
         words_of(&did(&read(&quiet_day, &prompts_week)), LANDED.label).as_deref(),
         Some("0 today \u{b7} 0 in 7 days")
     );
-    // NEGATIVE CONTROL: a week with neither has no Landed row.
     let (mut none_today, mut none_week) = (today, week);
     none_today.land_prompts = 0;
     none_today.landed = 0;
@@ -298,9 +266,7 @@ fn the_landed_row_stands_with_the_land_prompts() {
 /// going` and labelled as a part of it, read from the reading's acts by
 /// rule — Cruise's done check, and the challenges older builds typed at a
 /// done report instead, which the week still reads — never an ordinary
-/// continuation. Its label is not the one under Approved: each fact of a
-/// card is keyed by its label. NEGATIVE CONTROLS: a week with none shows no
-/// row; reading `continue-done-check@v1` alone gives `12` for `15`.
+/// continuation.
 #[test]
 fn the_done_check_row_stands_under_kept_going() {
     use aterm_agent::supervise::policy::turn_end::{
@@ -341,22 +307,18 @@ fn the_done_check_row_stands_under_kept_going() {
         at(&rows, UNPROVEN_OF_APPROVED).is_some(),
         "both parts stand: {rows:?}"
     );
-    // An older build's challenges to a done report are done claims checked.
     rule(&mut week, RULE_OPEN_ITEMS, 2);
     rule(&mut week, RULE_UNCOMMITTED, 1);
     assert_eq!(
         words_of(&did(&read(&today, &week)), DONE_CHECKED_OF_KEPT_GOING).as_deref(),
         Some("a done claim checked 4 today \u{b7} 15 in 7 days")
     );
-    // None today: the row says both windows.
     let mut quiet_today = today.clone();
     quiet_today.by_rule.remove(RULE_DONE_CHECK);
     assert_eq!(
         words_of(&did(&read(&quiet_today, &week)), DONE_CHECKED_OF_KEPT_GOING).as_deref(),
         Some("a done claim checked 0 today \u{b7} 15 in 7 days")
     );
-    // NEGATIVE CONTROL: a week with no done claim checked, only ordinary
-    // continuations, has no row.
     let mut plain = week.clone();
     for gone in [RULE_DONE_CHECK, RULE_OPEN_ITEMS, RULE_UNCOMMITTED] {
         plain.by_rule.remove(gone);
@@ -378,7 +340,7 @@ fn parts(line: &str) -> Vec<&str> {
 /// SESSIONS row's day line say a day's landings first, ahead of the acts
 /// that led to them (`2 landed today · 31 approved · 4 kept going`); the
 /// rest keep their order, and the day line's need still goes before every
-/// count. NEGATIVE CONTROL: a day with no landing keeps today's order.
+/// count.
 #[test]
 fn the_today_line_leads_with_landings() {
     let mut today = HarnessStats::new(0);
@@ -399,7 +361,6 @@ fn the_today_line_leads_with_landings() {
     };
     let line = day_line(&tally, Some(0)).expect("a day");
     assert_eq!(parts(&line)[0], "today: 1 landed", "{line}");
-    // A day that needed the person: the need first, then the landing.
     let needed = Tally {
         escalated: 1,
         ..tally.clone()
@@ -407,7 +368,6 @@ fn the_today_line_leads_with_landings() {
     let line = day_line(&needed, Some(0)).expect("a day");
     assert!(parts(&line)[0].starts_with("today: needed you"), "{line}");
     assert_eq!(parts(&line)[1], "1 landed", "{line}");
-    // The row's own day, as the reader forms it from the session's share.
     let mut shares = HarnessStats::per_session(0);
     shares.landed = 1;
     shares.approved = 31;
@@ -425,7 +385,6 @@ fn the_today_line_leads_with_landings() {
         .clone()
         .expect("its day");
     assert_eq!(parts(&line)[0], "today: 1 landed", "{line}");
-    // NEGATIVE CONTROL: no landing, today's order.
     today.landed = 0;
     let (hero, _) = read(&today, &HarnessStats::new(0))
         .today_lines()
@@ -444,13 +403,7 @@ fn the_today_line_leads_with_landings() {
 /// landing reaches the window as its task's face, never as an act — so,
 /// with Settings ▸ Harness on screen, a landing under Land (an end: from a
 /// face the window knew) marks the counts stale and owes a re-read on the
-/// glass's one deadline, as an act does. A landing restated from unknown (a
-/// loop's start over a landing it noted before) is no end and moves no
-/// count, so it owes nothing; nor does a landing a Cruise loop tells, or a
-/// codex-alab's own (a proven self-claim's), which no ledger aterm reads
-/// counts. NEGATIVE CONTROL: the republish alone (main's
-/// `App::harness_task_moved`) leaves the page fresh, saying `Landed 0 today`
-/// until Refresh.
+/// glass's one deadline, as an act does.
 #[test]
 fn a_landing_marks_the_open_page_newer_and_owes_a_reread() {
     let mut page = super::Page::open();
@@ -467,7 +420,6 @@ fn a_landing_marks_the_open_page_newer_and_owes_a_reread() {
         page.app
             .apply_harness_fact(&sid, crate::HarnessFact::Task(Some(face)));
     };
-    // Under Cruise, a loop that tells landed counts nothing.
     tell(&mut page, TaskFace::Open);
     tell(&mut page, TaskFace::Landed);
     assert!(!page.app.harness_screen.stats.stale, "Cruise's landed");
@@ -477,7 +429,6 @@ fn a_landing_marks_the_open_page_newer_and_owes_a_reread() {
         Some(Autopilot::Land),
         crate::autopilot::Surface::Chip
     ));
-    // A landing restated from unknown: no end.
     page.app
         .apply_harness_fact(&sid, crate::HarnessFact::Task(None));
     tell(&mut page, TaskFace::Landed);
@@ -505,8 +456,6 @@ fn a_landing_marks_the_open_page_newer_and_owes_a_reread() {
         "on the glass's one deadline"
     );
 
-    // A codex-alab's own landing under Land: an end the window counts in
-    // its A/B book, which no ledger the reading reads holds.
     let mut page = super::Page::open();
     let sid = page
         .app
@@ -534,8 +483,6 @@ fn a_landing_marks_the_open_page_newer_and_owes_a_reread() {
         Some(Autopilot::Land),
         crate::autopilot::Surface::Chip
     ));
-    // A self-claim's act queues its face in the hold that commits its row
-    // (`control_session`), and the wake is only the bell that drains it.
     let tell_self = |page: &mut super::Page, face: TaskFace| {
         ctx.timeline.lock().unwrap().queue_self_task(face);
         page.app

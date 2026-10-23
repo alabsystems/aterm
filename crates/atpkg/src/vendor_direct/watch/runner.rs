@@ -19,6 +19,7 @@ use crate::store::Layout;
 pub const SLICE: Duration = Duration::from_secs(5);
 
 /// How long a runner follows a pass it started before it looks at the heads again anyway:
+/// the pass's own bound on the store lock, and an hour for the install.
 const PASS_FOLLOW_LIMIT: Duration =
     Duration::from_secs(aterm_update_core::pkg_check::PASS_WAIT_LOCK_SECS + 60 * 60);
 
@@ -92,6 +93,7 @@ impl<F: FnMut() -> Gate + Send> Settings for F {
 pub struct LiveSettings {
     path: Option<PathBuf>,
     /// The file's `(mtime, length)` at the last read; `Some(None)` for an absent file,
+    /// `None` before the first read.
     seen: Option<Option<(Option<SystemTime>, u64)>>,
     gate: Gate,
 }
@@ -240,6 +242,7 @@ impl PassLauncher for DetachedPasses {
 }
 
 /// Start `exe args` detached — stdio on `/dev/null`, its own process group, and never
+/// this process's child — and follow it by its pid.
 #[cfg(unix)]
 fn spawn_detached(exe: &Path, args: &[OsString]) -> io::Result<Box<dyn RunningPass>> {
     Ok(Box::new(Detached {
@@ -247,7 +250,7 @@ fn spawn_detached(exe: &Path, args: &[OsString]) -> io::Result<Box<dyn RunningPa
     }))
 }
 
-/// [`spawn_detached`]'s detaching shell. The pid it reports is the pass's own: the
+/// [`spawn_detached`]'s detaching shell.
 #[cfg(unix)]
 fn detach(exe: &Path, args: &[OsString]) -> io::Result<u32> {
     let out = aterm_uds::spawnfd::command("/bin/sh")
@@ -273,6 +276,7 @@ fn detach(exe: &Path, args: &[OsString]) -> io::Result<u32> {
 }
 
 /// Windows has no zombie to fear and no re-parenting: the pass is an ordinary child, and
+/// its exit is read.
 #[cfg(not(unix))]
 fn spawn_detached(exe: &Path, args: &[OsString]) -> io::Result<Box<dyn RunningPass>> {
     let child = aterm_uds::spawnfd::command(exe)
@@ -285,7 +289,7 @@ fn spawn_detached(exe: &Path, args: &[OsString]) -> io::Result<Box<dyn RunningPa
     Ok(Box::new(Owned(child)))
 }
 
-/// A detached pass, followed by its pid ([`crate::progress::pid_alive`]). Its exit status
+/// A detached pass, followed by its pid ([`crate::progress::pid_alive`]).
 #[cfg(unix)]
 struct Detached {
     pid: u32,
@@ -315,7 +319,7 @@ impl RunningPass for Owned {
 /// Whether a held toolchain move is due at a Unix second ([`crate::quiet::due`]'s shape).
 type HeldDue = dyn FnMut(&Layout, i64) -> Option<crate::quiet::DueFlip> + Send;
 
-/// The store-scoped HEAD pair. The production function takes the index probe's
+/// The store-scoped HEAD pair.
 type IndexProbe = dyn Fn(&Layout, &mut dyn FnMut(u64)) -> crate::index_probe::Probe + Send + Sync;
 
 struct PendingIndex {
@@ -325,7 +329,7 @@ struct PendingIndex {
     near: Arc<AtomicU64>,
     done: Arc<AtomicBool>,
     completed_at: Arc<std::sync::OnceLock<Instant>>,
-    /// A near answer already handled by the runner. A higher far answer may
+    /// A near answer already handled by the runner.
     offered: u64,
 }
 
@@ -353,17 +357,21 @@ impl IndexAttempt {
 }
 
 /// One network worker at a time, paced from completion (the shared stamp's
+/// time), with a hint retained while a window owns the rendezvous.
 struct IndexWatch {
     probe: Arc<IndexProbe>,
     eligible: Arc<dyn Fn(&Layout) -> bool + Send + Sync>,
     pending: Option<PendingIndex>,
     /// A failed local work check is cheap to repeat at the next park slice;
+    /// it is not a completed network probe and must not start its cooldown.
     last_ineligible: Option<Duration>,
     last_completed: Option<Duration>,
     /// A sibling's fresh shared stamp can expire sooner (or, after an error,
+    /// later) than one more local thirty-second interval.
     shared_retry_at: Option<Duration>,
     ready: u64,
     /// An incomplete or untrusted release cannot run a full pass every HEAD
+    /// cooldown.
     last_attempt: Option<IndexAttempt>,
 }
 
@@ -505,6 +513,7 @@ impl IndexWatch {
 /// The pass a runner follows.
 struct Following {
     /// The program a moved head's pass updates; `None` for the whole pass a held toolchain
+    /// move asked for.
     program: Option<&'static str>,
     index_build: Option<u64>,
     pass: Box<dyn RunningPass>,
@@ -528,12 +537,13 @@ pub struct Runner {
     queue: VecDeque<&'static str>,
     following: Option<Following>,
     /// The re-check of a held toolchain move ([`crate::quiet::Recheck`]), and the instant
+    /// its monotonic clock counts from (the runner's [`Clock::mono`] rides on it).
     held: crate::quiet::Recheck,
     held_origin: Instant,
     /// Whether a held toolchain move is due at a Unix second ([`crate::quiet::due`]).
     held_due: Box<HeldDue>,
     index: IndexWatch,
-    /// One deadline for both update looks. A standing second tab waits a
+    /// One deadline for both update looks.
     admit_after: Duration,
 }
 
@@ -592,7 +602,7 @@ impl Runner {
         self
     }
 
-    /// Replace the store-scoped network probe for a deterministic test. Its
+    /// Replace the store-scoped network probe for a deterministic test.
     #[cfg(test)]
     fn with_index_probe(
         mut self,
@@ -707,7 +717,7 @@ impl Runner {
         }
     }
 
-    /// Look for a held toolchain move once per re-check interval. Re-admit through
+    /// Look for a held toolchain move once per re-check interval.
     fn check_held_move(&mut self, wall: SystemTime) -> bool {
         let now = self.held_origin + self.clock.mono();
         if !self.held.look_due(now) {
@@ -752,7 +762,7 @@ impl Runner {
         admitted
     }
 
-    /// Start only one HEAD pair for the seated session. Its near answer wakes
+    /// Start only one HEAD pair for the seated session.
     fn check_index(&mut self, wall: SystemTime) -> bool {
         let now = self.clock.mono();
         self.index.harvest(now);
@@ -847,6 +857,8 @@ impl Runner {
     }
 
     /// Automatic updates off: no head asked, no pass started, and the claim let go — a
+    /// round in flight is harvested first and never acted on; a pass already running is
+    /// still followed, so its end is reported.
     fn stand_down(&mut self, wall: SystemTime) {
         if self.on {
             (self.log)("vendor head watch: Automatic updates off \u{2014} standing down");
@@ -862,6 +874,7 @@ impl Runner {
     }
 
     /// Follow the pass in flight: `true` once none is — it ended and the watch was told,
+    /// or it outran [`PASS_FOLLOW_LIMIT`] and is left to finish on its own.
     fn follow(&mut self, wall: SystemTime) -> bool {
         let Some(following) = self.following.as_mut() else {
             return true;
@@ -940,6 +953,8 @@ impl Runner {
     }
 
     /// Harvest the round in flight — never start one: [`HeadWatch::check_pending`] with a
+    /// head pending only collects answers — and queue a moved head behind the pass that
+    /// is running, once.
     fn harvest(&mut self, wall: SystemTime) {
         let moved = self.watch.check_pending(&self.layout, wall, &self.get);
         self.flush_notes();
@@ -1011,6 +1026,7 @@ mod tests {
     const CLAUDE_HEAD: &str = "https://downloads.claude.ai/claude-code-releases/latest";
 
     /// The two clocks a test moves by hand: every park advances both by its slice, and a
+    /// sleep the next park takes moves the wall clock alone.
     #[derive(Clone, Default)]
     struct Time {
         wall_ms: Arc<AtomicU64>,
@@ -1034,6 +1050,7 @@ mod tests {
         }
 
         /// The machine sleeps through the next park: the wall clock moves, the monotonic
+        /// one does not.
         fn sleep_in_next_park(&self, by: Duration) {
             let ms = u64::try_from(by.as_millis()).unwrap();
             self.nap_ms.store(ms, Ordering::SeqCst);
@@ -1052,6 +1069,7 @@ mod tests {
         }
 
         /// A head in flight is waited for on the real clock until its worker's
+        /// completion notice is in — [`HANG`] is only a backstop — then the slice passes.
         fn park(&mut self, watch: &mut HeadWatch, slice: Duration) {
             self.0
                 .last_park_ms
@@ -1065,6 +1083,8 @@ mod tests {
     }
 
     /// Wait on the real clock until `watch`'s head in flight has its worker's completion
+    /// notice in ([`HANG`] is only a backstop): its check has read and written the shared
+    /// per-vendor state and let its lock go.
     fn await_round(watch: &mut HeadWatch) {
         let backstop = Instant::now() + HANG;
         while watch.has_pending()
@@ -1168,6 +1188,7 @@ mod tests {
     }
 
     /// A session runner over `l` on `time`, reading the vendors as `host`, with the gate
+    /// `on` reads.
     fn session(
         l: &Layout,
         time: &Time,
@@ -1213,6 +1234,8 @@ mod tests {
     }
 
     /// With no window open a terminal session watches the heads at the window's cadence; a
+    /// window that opens takes the watch over (the session asks nothing while it is up), and
+    /// when it closes the session watches again within a minute.
     #[test]
     fn a_session_watches_only_while_no_window_does() {
         for hosted in [true, false] {
@@ -1277,6 +1300,8 @@ mod tests {
     }
 
     /// A window that opens mid-round waits for the session's round, not for good: its check
+    /// is refused while the session's GET is in flight, with no GET of its own, and asked
+    /// again a slice later, when it takes the watch and the session stands by.
     #[test]
     fn a_window_opening_mid_round_waits_one_round_then_watches() {
         let l = layout("mid-round");
@@ -1322,6 +1347,8 @@ mod tests {
     }
 
     /// Two sessions on one store share the seat and only one ever asks; when the watcher
+    /// goes (its runner dropped, as the kernel releases a dead process's locks) the other
+    /// takes the seat within a minute and asks.
     #[test]
     fn one_session_watches_and_the_next_takes_the_seat_when_it_goes() {
         let l = layout("two-sessions");
@@ -1386,6 +1413,7 @@ mod tests {
     }
 
     /// A denied session can do no update work before its next admission, so it takes one
+    /// park for that minute, not twelve.
     #[test]
     fn a_denied_idle_session_parks_to_admission_and_reads_the_gate_first() {
         let l = layout("denied-idle-park");
@@ -1433,6 +1461,8 @@ mod tests {
     }
 
     /// A moved head gets one targeted pass, no head asked while it runs, its end reported:
+    /// a pass that reached the head is not offered again; one that ended short gets the one
+    /// short retry five minutes on, then the hourly lease.
     #[test]
     fn a_moved_head_runs_one_pass_and_its_end_is_reported() {
         let l = layout("moved");
@@ -1490,6 +1520,7 @@ mod tests {
     }
 
     /// A sleep that carries the wall clock an hour past a due head asks it after the
+    /// network's grace, not in the slice the machine woke in.
     #[test]
     fn a_wake_asks_the_heads_after_the_grace() {
         let l = layout("runner-wake");
@@ -1520,6 +1551,7 @@ mod tests {
     }
 
     /// Automatic updates off: the session asks nothing and lets the seat go (the report says
+    /// nobody watches); on again, it watches at once.
     #[test]
     fn the_switch_stands_the_session_down_and_frees_the_seat() {
         let l = layout("switch");
@@ -1553,6 +1585,7 @@ mod tests {
     }
 
     /// A runner on its own thread, on the real clocks, watches at once (the report names
+    /// this process), and stopped, it returns and frees the watch.
     #[test]
     fn a_stopped_host_frees_the_watch() {
         let l = layout("stop");
@@ -1590,6 +1623,7 @@ mod tests {
     }
 
     /// The stop signal unparks, so even a denied session's minute-long admission park ends
+    /// at once on shutdown.
     #[test]
     fn stop_unparks_a_denied_minute_wait() {
         struct NotifyingClock {
@@ -1655,6 +1689,10 @@ mod tests {
     }
 
     /// A pass started mid-round: the vendor whose head moved is handed back while its peer's
+    /// GET is in flight and its pass starts at once; the peer's answer is still harvested
+    /// when it lands (else the session would keep the exclusive rendezvous, refusing a
+    /// window, and the completion would cut every park short), and the peer's own moved
+    /// head runs when the first pass ends.
     #[test]
     fn a_pass_started_mid_round_still_harvests_the_round() {
         use super::super::BUSY_RETRY;
@@ -1769,6 +1807,8 @@ mod tests {
     }
 
     /// `[packages]`, live: an edit is read at the next look, a file that cannot be read
+    /// keeps the gate last read, and a missing file is the defaults (on, nothing
+    /// excluded).
     #[test]
     fn live_settings_hear_an_edit_and_keep_the_gate_through_an_unreadable_file() {
         let l = layout("live-settings");
@@ -1804,6 +1844,8 @@ mod tests {
     }
 
     /// With no window open the seated session looks at a held toolchain move by the
+    /// window's rule — two quiet looks a minute apart — and starts the whole pass once,
+    /// following it to its end with no head asked meanwhile.
     #[test]
     fn the_seated_session_wakes_a_held_toolchain_move_and_a_standing_one_does_not() {
         use crate::quiet::{Due, DueFlip};
@@ -1884,6 +1926,8 @@ mod tests {
     }
 
     /// Tier-1 for `AtpkgSessionIndexHandoff`: a near HEAD is offered while
+    /// the far HEAD is still blocked; another tab cannot ask it, and a window
+    /// that opens before the near answer takes the pass decision.
     #[test]
     fn a_seated_session_offers_a_near_index_once_after_window_handoff() {
         use aterm_models_atpkg::atpkg_session_index_handoff_model;
@@ -1980,6 +2024,7 @@ mod tests {
     }
 
     /// Tier-1 for `AtpkgSessionIndexEligibility`: an empty store gets cheap
+    /// local looks at park slices but sends no HEAD.
     #[test]
     fn an_empty_index_source_becomes_probe_eligible_on_the_next_slice() {
         use aterm_models_atpkg::atpkg_session_index_eligibility_model;
@@ -2075,6 +2120,8 @@ mod tests {
     }
 
     /// Tier-1 for `AtpkgIndexSharedHandoff`: a seated session that arrived
+    /// just before a sibling's stamp expires retries at that shared expiry,
+    /// without another full local interval or an early network request.
     #[test]
     fn a_suppressed_session_index_probe_uses_the_shared_expiry() {
         use aterm_models_atpkg::atpkg_index_shared_handoff_model;
@@ -2127,6 +2174,7 @@ mod tests {
     }
 
     /// A verified build is a terminal answer, including when a worker began
+    /// before another host raised the floor.
     #[test]
     fn verified_index_near_hint_starts_no_pass_and_probe_is_completion_paced() {
         use std::sync::mpsc;
@@ -2184,6 +2232,7 @@ mod tests {
     }
 
     /// A release one build newer than this session's recent pass bypasses its
+    /// own same-build spacing.
     #[test]
     fn a_higher_index_wakes_promptly_after_an_older_index_pass() {
         let l = layout("session-index-higher");
@@ -2224,6 +2273,7 @@ mod tests {
     }
 
     /// The same published asset can remain visible for hours while its roster
+    /// or artifacts are incomplete.
     #[test]
     fn a_same_index_uses_the_bounded_retry_ladder() {
         let model = aterm_models_atpkg::atpkg_session_index_retry_model();
@@ -2282,6 +2332,7 @@ mod tests {
     }
 
     /// A window can take the shared rendezvous between a session's vendor-head
+    /// rounds.
     #[test]
     fn a_window_arriving_after_a_session_round_owns_the_held_move_look() {
         use crate::quiet::{Due, DueFlip};
@@ -2348,6 +2399,9 @@ mod tests {
     }
 
     /// On a store with no vendor program to watch, the session's held-move look takes the
+    /// seat itself ([`HeadWatch::begin_session_update_look`]) — while the move is still
+    /// busy, so doctor names the session that will wake it — and wakes the whole pass once
+    /// it is due, with no head asked.
     #[test]
     fn a_held_move_takes_the_seat_on_a_store_with_no_vendor_program() {
         use crate::quiet::{Due, DueFlip};
@@ -2422,6 +2476,8 @@ mod tests {
     }
 
     /// Ends a fake pass and removes its prefix on every way out of a test that unwinds, a
+    /// failed assertion included: the pass is detached and loops until `go` stands or its
+    /// directory is gone.
     #[cfg(unix)]
     struct Release {
         go: PathBuf,
@@ -2437,10 +2493,13 @@ mod tests {
     }
 
     /// The most turns a fake pass's wait takes, 50 ms apart: ten minutes, far past any
+    /// test's [`HANG`].
     #[cfg(unix)]
     const FAKE_PASS_TURNS: u32 = 12_000;
 
     /// A fake `aterm` pass for the detached launch: `warm` exits at once (its first exec is
+    /// paid unbounded, [`warm`]); anything else writes `<pid> <spawner> <argv>` to `said`
+    /// beside it and waits for `go` there.
     #[cfg(unix)]
     fn fake_pass(owner: u32) -> String {
         format!(
@@ -2453,6 +2512,9 @@ mod tests {
     }
 
     /// Write [`fake_pass`] for `owner` as `dir/aterm`, and pay its first exec here,
+    /// unbounded: the first exec of a new file waits, at 0% CPU, until macOS `syspolicyd`
+    /// has assessed it (40 s measured for this script); a later exec of the same file costs
+    /// nothing (the manual.rs `run_once` rule).
     #[cfg(unix)]
     fn warm(dir: &Path, owner: u32) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2470,6 +2532,8 @@ mod tests {
     }
 
     /// A detached pass is not this process's child (a session reaping its shell never takes
+    /// the pass's exit for the shell's, and the pass outlives the session), names no
+    /// spawner, and is followed to its end by pid.
     #[cfg(unix)]
     #[test]
     fn a_detached_pass_is_nobodys_child_and_is_followed_to_its_end() {
@@ -2516,6 +2580,8 @@ mod tests {
     }
 
     /// The pid a runner follows is the pass's own behind the utility clamp: the launcher
+    /// execs the pass in place, so the detaching shell's `$!` is the pass's `$$`, in the
+    /// group the shell made and still marked detached.
     #[cfg(unix)]
     #[test]
     fn the_followed_pid_is_the_clamped_passs_own() {

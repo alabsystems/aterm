@@ -91,6 +91,7 @@ enum FaceChoice {
     /// The face at this index: a `name`-table match, or a compiled-in face.
     At(u32),
     /// The face nearest this style, chosen from the admitted bytes: a file
+    /// found by its file name or named by path (`crate::best_face`).
     Nearest(FaceTarget),
 }
 
@@ -133,9 +134,10 @@ struct Catalog {
     limits: Limits,
     files: Vec<PathBuf>,
     stats: Stats,
-    /// Bytes already read for a name-table probe. Reused as the immutable
+    /// Bytes already read for a name-table probe.
     bytes: HashMap<PathBuf, Arc<Vec<u8>>>,
     /// Every directory the walk asked `read_dir` of (roots, absent and unreadable ones
+    /// included) with the mtime seen then: the validity key of the [`system_font_files`] memo.
     visited: Vec<(PathBuf, Option<std::time::SystemTime>)>,
 }
 
@@ -574,11 +576,14 @@ fn resolve_and_admit_in_dirs(
 }
 
 /// The modification time of a directory, `None` when it does not exist or
+/// cannot be stat'ed — a value in its own right, so a root that appears later
+/// invalidates a memo taken while it was absent.
 fn dir_mtime(dir: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(dir).ok().and_then(|m| m.modified().ok())
 }
 
 /// One remembered walk: the roots it was asked for, every directory it
+/// visited with the mtime seen then, and the files it found.
 struct FontFilesMemo {
     roots: Vec<PathBuf>,
     visited: Vec<(PathBuf, Option<std::time::SystemTime>)>,
@@ -595,6 +600,7 @@ impl FontFilesMemo {
 }
 
 /// Remembered walks, keyed by root list: one in production (`font_search_dirs()`); tests walk
+/// private fixture roots and must not evict each other's or the real one.
 static FONT_FILES_MEMOS: std::sync::Mutex<Vec<Arc<FontFilesMemo>>> =
     std::sync::Mutex::new(Vec::new());
 const MAX_FONT_FILES_MEMOS: usize = 8;
@@ -630,7 +636,7 @@ fn memoized_font_files_walked(roots: &[PathBuf]) -> (Vec<PathBuf>, bool) {
     (inventory.files.clone(), walked)
 }
 
-/// [`memoized_font_files_walked`] returning the memo itself. Every walk is a
+/// [`memoized_font_files_walked`] returning the memo itself.
 fn memoized_font_inventory_walked(roots: &[PathBuf]) -> (Arc<FontFilesMemo>, bool) {
     let remembered = || {
         let memos = FONT_FILES_MEMOS
@@ -876,6 +882,8 @@ fn monospace_families_with_bundled(
 }
 
 /// The family and ligature support of the default face at `candidate`, a
+/// path or a bundled identity, when it loads: the regular face of a
+/// collection.
 fn automatic_face(candidate: &str) -> Option<(String, bool)> {
     use aterm_font::name_id::{FAMILY, TYPOGRAPHIC_FAMILY};
     let bytes = crate::read_resolved_font(candidate).ok()?;
@@ -892,6 +900,7 @@ fn automatic_face(candidate: &str) -> Option<(String, bool)> {
 }
 
 /// Fixed pitch with the Latin letters and digits terminal text needs, so a
+/// symbols-only monospace face is not offered as a terminal font.
 fn face_is_terminal_text(face: &aterm_font::Face<'_>) -> bool {
     let advance = |ch: char| {
         face.glyph_index(ch)
@@ -908,6 +917,9 @@ fn face_is_terminal_text(face: &aterm_font::Face<'_>) -> bool {
 }
 
 /// The face's family name: the typographic family where it has one (the
+/// whole family across weights), else the legacy family, under its public
+/// spelling (`.SF NS Mono` is `SF Mono`, [`crate::public_face_name`]); `None`
+/// for a hidden system face no public family stands for (`.LastResort`).
 fn face_family(face: &aterm_font::Face<'_>) -> Option<String> {
     use aterm_font::name_id::{FAMILY, TYPOGRAPHIC_FAMILY};
     face_name(face, TYPOGRAPHIC_FAMILY)
@@ -917,6 +929,7 @@ fn face_family(face: &aterm_font::Face<'_>) -> Option<String> {
 }
 
 /// The face's full name (`JetBrains Mono Bold`), else its PostScript name,
+/// under its public spelling: both are names the resolvers find this face by.
 fn face_full_name(face: &aterm_font::Face<'_>) -> Option<String> {
     use aterm_font::name_id::{FULL_NAME, POST_SCRIPT_NAME};
     face_name(face, FULL_NAME)
@@ -987,6 +1000,7 @@ mod tests {
     use super::*;
 
     /// The walk keeps no seen-set, so a search root nested inside another would list (and every
+    /// full-read consumer read) its fonts twice.
     #[test]
     fn search_dirs_are_never_nested_so_the_walk_visits_a_file_once() {
         let dirs = crate::font_search_dirs();
@@ -1005,6 +1019,7 @@ mod tests {
     const JETBRAINS: &[u8] = include_bytes!("../tests/fixtures/jetbrains-mono.ttf");
 
     /// The fixture face with its OS/2 weight class set to `weight`: a bold
+    /// sibling that names the same family.
     fn with_weight(weight: u16) -> Vec<u8> {
         let mut bytes = JETBRAINS.to_vec();
         let tables = usize::from(u16::from_be_bytes([bytes[4], bytes[5]]));
@@ -1019,6 +1034,8 @@ mod tests {
     }
 
     /// The picker's list comes from the same files and names the resolvers
+    /// use: an installed monospace family, its bold sibling by full name, a
+    /// colour emoji face by file name, and the default face's family.
     #[test]
     fn monospace_families_list_what_the_resolvers_find() {
         let root = fixture("families");
@@ -1044,6 +1061,8 @@ mod tests {
     }
 
     /// The fixture face renamed `name` wherever its `name` table says
+    /// "JetBrains Mono" (family, full and typographic names), padded with
+    /// spaces to the same length, which the name readers trim.
     fn with_family(name: &str) -> Vec<u8> {
         const FROM: &str = "JetBrains Mono";
         let padded = format!("{name:<14}");
@@ -1069,6 +1088,7 @@ mod tests {
     }
 
     /// A system face that hides its name (a leading dot) is offered only under
+    /// the public family it stands for: `.SF NS Mono` is SF Mono.
     #[test]
     fn a_hidden_system_face_is_listed_only_under_a_public_family() {
         let root = fixture("hidden");
@@ -1085,6 +1105,7 @@ mod tests {
     }
 
     /// Two files name the same family and the bold one sorts first: the
+    /// family resolves to its regular face.
     #[test]
     fn a_family_resolves_to_its_regular_face_not_the_first_file() {
         let root = fixture("regular-face");
@@ -1105,6 +1126,10 @@ mod tests {
     }
 
     /// A family installed as a variable face plus links that name its weights
+    /// (Ubuntu's `fonts-ubuntu`: `UbuntuMono-B.ttf` and `-R.ttf` link to
+    /// `UbuntuMono[wght].ttf`) resolves to the file itself: every one of them
+    /// is the regular default instance, and the link that sorts first named a
+    /// Bold file as the regular face.
     #[cfg(unix)]
     #[test]
     fn a_family_resolves_to_its_file_not_a_link_that_sorts_first() {
@@ -1291,7 +1316,7 @@ mod tests {
         (name, admitted.index)
     }
 
-    /// `PTMono.ttc`'s shape: Bold at face 0, Regular at face 1. A family is
+    /// `PTMono.ttc`'s shape: Bold at face 0, Regular at face 1.
     #[test]
     fn a_collection_resolves_each_request_to_its_own_face() {
         let collection = ttc_of(&[JB_BOLD, JB_REGULAR]);
@@ -1384,6 +1409,7 @@ mod tests {
     }
 
     /// The fixture face with its `GSUB` table record renamed, so the face
+    /// advertises no ligature feature (the record stays in tag order).
     fn without_gsub(bytes: &[u8]) -> Vec<u8> {
         let mut bytes = bytes.to_vec();
         let tables = usize::from(u16::from_be_bytes([bytes[4], bytes[5]]));
@@ -1396,6 +1422,8 @@ mod tests {
     }
 
     /// Every listed family records whether its regular face has programming
+    /// ligatures, so Settings can say the Ligatures switch does nothing for a
+    /// chosen family without them — not only for the automatic face.
     #[test]
     fn every_listed_family_records_its_ligatures() {
         let with = fixture("ligatures-with");
@@ -1423,6 +1451,8 @@ mod tests {
     }
 
     /// A name that sits in a file the remaining name-read budget cannot hold
+    /// is refused as "not found before discovery exhausted …": the generation
+    /// could not check it.
     #[test]
     fn a_name_beyond_the_remaining_budget_says_the_budget_ran_out() {
         let root = fixture("name-budget");
@@ -1485,6 +1515,8 @@ mod tests {
     }
 
     /// An unchanged tree is answered from the memo; a font added in a nested vendor directory
+    /// (the Linux layout, which a root-mtime key would miss) or an absent root appearing is a
+    /// miss.
     #[test]
     fn the_font_files_memo_is_revalidated_by_the_visited_directories_mtimes() {
         let root = fixture("memo");
@@ -1579,6 +1611,9 @@ mod tests {
     }
 
     /// A bundled family name yields to an installed face of that name (so a variable
+    /// `JetBrainsMono[wght].ttf` keeps its weight axis) and falls back to the compiled-in face
+    /// only when nothing installed answers; the `bundled:` identity always means the
+    /// compiled-in face.
     #[test]
     fn an_installed_face_wins_a_bundled_family_name_and_the_identity_never_yields() {
         if !crate::bundled::ACTIVE {
@@ -1622,6 +1657,9 @@ mod tests {
     }
 
     /// Settings' "Automatic (…)" names a bundled default by the family it is
+    /// selected by: on Windows `Iosevka Term Semibold`, whose own typographic
+    /// family (name ID 16) is `Iosevka Term` — the name of the lighter set
+    /// listed beside it — and which draws no ligatures.
     #[test]
     fn a_bundled_default_is_named_as_it_is_selected() {
         if crate::bundled::IOSEVKA_SEMIBOLD_ACTIVE {

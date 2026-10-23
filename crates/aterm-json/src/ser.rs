@@ -1,31 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `serde::Serializer` and the JSON writer under it.
-//!
-//! Output is compact — no spaces, no newlines — and byte-identical to
-//! `serde_json`'s, which matters because some of it is signed, some is hashed
-//! into a checkpoint fingerprint, and some is a request body a server reads.
-//!
-//! The two places where "valid JSON" leaves a choice, and the choice made:
-//!
-//! * **non-finite floats become `null`.** JSON has no NaN and no infinity;
-//!   refusing to serialize would turn a rendering glitch into a failed request,
-//!   so the value that IS representable is written, exactly as `serde_json`
-//!   does.
-//! * **only ASCII control characters are escaped.** A non-ASCII character is
-//!   written as UTF-8, not as a `\u` escape — again matching `serde_json`, and
-//!   the reason the output of the two is comparable byte for byte at all.
+//! Compact `serde::Serializer` and JSON writer matching `serde_json` byte-for-byte.
 
 use serde::{Serialize, ser};
 
 use crate::error::{Error, Result};
 
-/// Serialize `value` as compact JSON bytes.
+/// Serializes `value` as compact JSON bytes.
 ///
 /// # Errors
-/// Only from the `Serialize` impl itself — a map with a non-string key, or a
-/// type that reports its own failure.
+/// Returns an error if `value`'s `Serialize` implementation fails or uses a non-string map key.
 #[inline]
 pub fn to_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(128);
@@ -33,19 +18,17 @@ pub fn to_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Serialize `value` as a compact JSON string.
+/// Serializes `value` as a compact JSON string.
 ///
 /// # Errors
 /// As [`to_vec`].
 #[inline]
 pub fn to_string<T: Serialize + ?Sized>(value: &T) -> Result<String> {
     let bytes = to_vec(value)?;
-    // Every byte the writer emits is either ASCII or a byte of a `&str` it was
-    // handed, so the result is always UTF-8; the check keeps that local.
     String::from_utf8(bytes).map_err(|_| Error::message("serializer produced invalid UTF-8"))
 }
 
-/// Write `text` as a JSON string literal, quotes included.
+/// Writes `text` as a quoted JSON string literal.
 pub(crate) fn write_json_string(out: &mut Vec<u8>, text: &str) {
     out.push(b'"');
     let bytes = text.as_bytes();
@@ -66,7 +49,6 @@ pub(crate) fn write_json_string(out: &mut Vec<u8>, text: &str) {
             out.extend_from_slice(run);
         }
         if escape.is_empty() {
-            // Any other C0 control: the six-character form.
             out.extend_from_slice(b"\\u00");
             out.push(hex_nibble(byte >> 4));
             out.push(hex_nibble(byte & 0x0F));
@@ -83,15 +65,13 @@ pub(crate) fn write_json_string(out: &mut Vec<u8>, text: &str) {
 
 #[inline]
 fn hex_nibble(v: u8) -> u8 {
-    // `v <= 15` at every call (both arguments are masked or shifted), so the
     // lookup is in range; `get` keeps that local and the fallback is dead.
     *b"0123456789abcdef".get(v as usize).unwrap_or(&b'0')
 }
 
-/// Write an unsigned integer in decimal.
+/// Writes an unsigned integer in decimal.
 #[inline]
 pub(crate) fn write_u128(out: &mut Vec<u8>, value: u128) {
-    // u128 is at most 39 decimal digits.
     let mut buf = [0u8; 39];
     let mut v = value;
     let mut i = buf.len();
@@ -110,36 +90,18 @@ pub(crate) fn write_u128(out: &mut Vec<u8>, value: u128) {
     }
 }
 
-/// Write a signed integer in decimal.
+/// Writes a signed integer in decimal.
 #[inline]
 pub(crate) fn write_i128(out: &mut Vec<u8>, value: i128) {
     if value < 0 {
         out.push(b'-');
     }
-    // `unsigned_abs` is exact for i128::MIN, where negation would overflow.
     write_u128(out, value.unsigned_abs());
 }
 
 /// The shortest decimal digit string that reads back as `value`, and of those
 /// the closest, with the power of ten it is scaled by — what `ryu`, which
 /// `serde_json` formats with, produces.
-///
-/// Two facts from the standard library, each half right on its own:
-///
-/// * Rust's shortest formatter (`{:e}`) gets the LENGTH right — it is exactly
-///   shortest — but not always the closest digits of that length: for
-///   `0x42ea3c464c15f354` it emits `...29063` where the closest 17-digit
-///   decimal is `...29062`.
-/// * `{:.*e}` at an explicit precision gives the CLOSEST decimal of that
-///   length, but the closest is not always inside the rounding interval. At an
-///   exact power of two the interval is lopsided (the next double down is half
-///   as far as the next one up), so `2^-24`'s closest 16-digit decimal misses
-///   it while `...063` above it does not. Walking the precision up until the
-///   closest round-tripped therefore wrote 17 digits there, not ryu's 16.
-///
-/// So: the length from the shortest form, and the closest decimal of that
-/// length whenever it reads back — otherwise the shortest form's own digits,
-/// the only decimal of that length the interval holds.
 fn shortest_f64(value: f64) -> (String, i32) {
     let shortest = format!("{value:e}");
     let precision = split_exp(&shortest).0.len().saturating_sub(1);
@@ -173,19 +135,6 @@ fn split_exp(text: &str) -> (String, i32) {
 
 /// Lay the digits out the way `serde_json` lays them out, with `kk` the count
 /// of digits before the decimal point (`10^(kk-1) <= |v| < 10^kk`):
-///
-/// * `kk` inside `fixed_range` → fixed notation, gaining a `.0` when there is
-///   no fractional part (`1e15` is `1000000000000000.0`, never
-///   `1000000000000000`, which JSON would read back as an integer);
-/// * otherwise → `d.ddde±XX`, the exponent signed even when positive.
-///
-/// The range depends on the WIDTH, and asymmetrically so: `ryu`'s pretty
-/// printer switches to exponential above `kk = 16` for a double but above
-/// `kk = 13` for a single, and below `kk = -4` for a double but `kk = -5` for a
-/// single. Both boundaries were read off the reference rather than guessed
-/// (`1e15` is fixed and `1e16` is not; `1e12f32` is fixed and `1e13f32` is
-/// not), and `tests/json.rs` pins them over tens of thousands of random bit
-/// patterns in each width.
 fn write_layout(
     out: &mut Vec<u8>,
     negative: bool,
@@ -212,9 +161,6 @@ fn write_layout(
             }
             out.extend_from_slice(b".0");
         } else {
-            // `0 < kk < n`, so both halves are non-empty. Split the bytes:
-            // `str::split_at` could also panic off a char boundary, which the
-            // verifier cannot rule out.
             let split = kk.max(0) as usize;
             let digits = digits.as_bytes();
             let (head, tail) = digits.split_at(split.min(digits.len()));
@@ -239,19 +185,17 @@ fn write_layout(
 /// Write a non-finite or zero float, or report that neither applies.
 fn write_special(out: &mut Vec<u8>, finite: bool, zero: bool, negative: bool) -> bool {
     if !finite {
-        // JSON has no NaN and no infinity.
         out.extend_from_slice(b"null");
         return true;
     }
     if zero {
-        // Preserves the sign of negative zero, as `serde_json` does.
         out.extend_from_slice(if negative { b"-0.0" } else { b"0.0" });
         return true;
     }
     false
 }
 
-/// Write an `f64` exactly as `serde_json` writes one.
+/// Writes an `f64` matching `serde_json` formatting.
 pub(crate) fn write_f64(out: &mut Vec<u8>, value: f64) {
     if write_special(
         out,
@@ -265,7 +209,7 @@ pub(crate) fn write_f64(out: &mut Vec<u8>, value: f64) {
     write_layout(out, value.is_sign_negative(), &digits, exp10, -4..=16);
 }
 
-/// Write an `f32` exactly as `serde_json` writes one.
+/// Writes an `f32` matching `serde_json` formatting.
 pub(crate) fn write_f32(out: &mut Vec<u8>, value: f32) {
     if write_special(
         out,
@@ -279,7 +223,7 @@ pub(crate) fn write_f32(out: &mut Vec<u8>, value: f32) {
     write_layout(out, value.is_sign_negative(), &digits, exp10, -5..=13);
 }
 
-/// The compact JSON serializer.
+/// Compact JSON serializer.
 pub(crate) struct Serializer<'a> {
     pub(crate) out: &'a mut Vec<u8>,
 }
@@ -483,7 +427,7 @@ impl<'a> ser::Serializer for Serializer<'a> {
     }
 }
 
-/// How a compound value closes.
+/// Closing delimiter for a compound JSON value.
 pub(crate) enum Close {
     Array,
     Object,
@@ -491,7 +435,7 @@ pub(crate) enum Close {
     VariantObject,
 }
 
-/// The in-progress array/object writer shared by every compound `serde` trait.
+/// In-progress JSON array or object writer.
 pub(crate) struct Compound<'a> {
     out: &'a mut Vec<u8>,
     first: bool,
@@ -576,11 +520,6 @@ impl ser::SerializeMap for Compound<'_> {
 
     fn serialize_key<T: Serialize + ?Sized>(&mut self, key: &T) -> Result<()> {
         self.comma();
-        // A JSON object key is a string. Integers, `bool`s and chars are
-        // rendered AS strings (what `serde_json` does, so a `HashMap<u32, _>`
-        // still serializes), in the one spelling the key reader takes back;
-        // anything else is a type error rather than a document that no parser
-        // could read back.
         key.serialize(KeySerializer { out: self.out })
     }
 
@@ -626,8 +565,7 @@ impl ser::SerializeStructVariant for Compound<'_> {
 
 /// Serializer for object KEYS: strings, and the scalars with one obvious
 /// spelling as one (integers, `bool`, `char`, a unit variant's name), through
-/// any newtype. `de::Key`, through serde's `TextKeyDeserializer`, reads each
-/// back from exactly that text.
+/// any newtype.
 struct KeySerializer<'a> {
     out: &'a mut Vec<u8>,
 }

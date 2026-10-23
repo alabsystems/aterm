@@ -8,54 +8,7 @@
 // `allow_deprecated` are derived from serde_derive 1.0.228 src/dummy.rs and
 // src/deprecated.rs; the rest of it is aterm's.
 
-//! `#[derive(Serialize, Deserialize)]` for aterm-serde
-//! (docs/AUDIT-third-party-2026-10-15.md, SP.5).
-//!
-//! The generated code is upstream serde_derive's, so a model behaves the same:
-//! the same `Serializer`/`Deserializer` calls, the same `FIELDS` and
-//! `VARIANTS`, the same error text, and a struct written as a sequence is
-//! still taken positionally. The input is read with
-//! `aterm-macro-support`, on std `proc_macro`: no syn, proc-macro2 or quote.
-//!
-//! # The attribute set is closed
-//!
-//! The derive implements exactly the `#[serde(...)]` keys, positions and forms
-//! aterm's models write (docs/measured/third-party-2026-10-15/serde-attrs.tsv):
-//!
-//! | position | keys |
-//! |---|---|
-//! | container | `default`, `deny_unknown_fields`, `rename_all = "..."` (`lowercase`, `UPPERCASE`, `PascalCase`, `snake_case`, `kebab-case`), `tag = "..."`, `transparent`, `untagged` |
-//! | variant | `rename = "..."` |
-//! | field | `alias = "..."`, `default`, `default = "path"`, `deserialize_with = "path"`, `flatten`, `rename = "..."`, `skip`, `skip_serializing_if = "path"` |
-//!
-//! Any other key, or one of these in another position or form, is a compile
-//! error that names it. Widening the set is a change to this crate and to the
-//! inventory, made on purpose.
-//!
-//! # Where `serde` comes from
-//!
-//! The output names the crate as `::serde`, the name every dependent gives
-//! aterm-serde (the workspace row's `package = "aterm-serde"`). Upstream writes
-//! `extern crate serde`, which looks up a crate file by that name; `::serde`
-//! resolves through the extern prelude instead, so a crate that reaches
-//! aterm-serde under its own name can write `extern crate aterm_serde as serde;`
-//! at its root (aterm-serde's own test suite does) without the `crate`
-//! attribute, which is outside the set.
-//!
-//! ```
-//! # extern crate aterm_serde as serde;
-//! use aterm_serde_derive::{Deserialize, Serialize};
-//!
-//! #[derive(Serialize, Deserialize)]
-//! #[serde(rename_all = "snake_case", deny_unknown_fields)]
-//! struct Window {
-//!     #[serde(default, skip_serializing_if = "Option::is_none")]
-//!     title: Option<String>,
-//!     #[serde(rename = "cols", alias = "columns")]
-//!     width: u16,
-//! }
-//! # fn main() {}
-//! ```
+//! `#[derive(Serialize, Deserialize)]` proc macros for `aterm-serde`.
 
 #![allow(
     clippy::enum_variant_names,
@@ -102,8 +55,6 @@ fn expand(
     match derive(&input) {
         Ok(tokens) | Err(tokens) => {
             if tokens.is_empty() {
-                // `Errors::finish` never hands back an empty error list; an
-                // empty expansion would hide the derive silently.
                 Error::new(Span::call_site(), "the serde derive produced nothing")
                     .to_compile_error()
             } else {
@@ -132,8 +83,7 @@ pub(crate) fn wrap_in_const(code: &TokenStream) -> TokenStream {
     )
 }
 
-/// `#[allow(deprecated)]` when the item or a variant is deprecated or allows
-/// deprecated items, so the impl may name them.
+/// `#[allow(deprecated)]` when the item or a variant is deprecated or allows deprecated items.
 pub(crate) fn allow_deprecated(input: &DeriveInput) -> Option<TokenStream> {
     if should_allow_deprecated(input) {
         Some(q!("#[allow(deprecated)]"))
@@ -143,11 +93,6 @@ pub(crate) fn allow_deprecated(input: &DeriveInput) -> Option<TokenStream> {
 }
 
 /// Determine if an `#[allow(deprecated)]` should be added to the derived impl.
-///
-/// This should happen if the derive input or an enum variant it contains has
-/// one of:
-///   - `#[deprecated]`
-///   - `#[allow(deprecated)]`
 fn should_allow_deprecated(input: &DeriveInput) -> bool {
     if contains_deprecated(&input.attrs) {
         return true;
@@ -162,9 +107,7 @@ fn should_allow_deprecated(input: &DeriveInput) -> bool {
     false
 }
 
-/// Check whether the given attributes contains one of:
-///   - `#[deprecated]`
-///   - `#[allow(deprecated)]`
+/// Check whether the given attributes contains one of: - `#[deprecated]` - `#[allow(deprecated)]`.
 fn contains_deprecated(attrs: &[Attribute]) -> bool {
     for attr in attrs {
         if attr.is("deprecated") {

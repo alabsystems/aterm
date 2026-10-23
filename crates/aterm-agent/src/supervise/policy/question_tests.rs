@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The question answer over aterm-phase's fixtures of Claude Code's question
-//! dialog (live captures and hand-built shapes): which row is chosen, how the
-//! focus gets there, and every shape that is the person's.
+//! The question answer over aterm-phase's fixtures of Claude Code's question dialog (live captures and hand-built shapes): which row is chosen, how the focus gets there, and every shape that is the person's.
 
 use std::path::PathBuf;
 
@@ -141,8 +139,7 @@ fn no_marked_option_answers_option_one() {
 /// MCP server dialog for several's submit) is an option's WHOLE label
 /// ([`aterm_phase::prompt::kept_answer`]), never words in it: an agent's
 /// `Enable selected suites (Recommended)`, described `Enable selected suites
-/// in parallel.`, is answered. NEGATIVE CONTROL: an unmarked question whose
-/// option 1 is exactly `Enable selected` is a person's.
+/// in parallel.`, is answered.
 #[test]
 fn a_vendor_answer_is_kept_only_as_a_whole_label() {
     let rows: Vec<String> = screen(f::QUESTION_RECOMMENDED_SECOND)
@@ -174,8 +171,6 @@ fn a_vendor_answer_is_kept_only_as_a_whole_label() {
         .collect();
     let d = decide_rows(&rows);
     assert!(reason(&d).contains("`Enable selected`"), "{d:?}");
-    // The one-server dialog's `… all future …` answer is kept by its whole
-    // label, not by its words: an agent's option saying them is answered.
     let rows: Vec<String> = screen(f::QUESTION_RECOMMENDED_SECOND)
         .iter()
         .map(|r| {
@@ -193,14 +188,11 @@ fn a_vendor_answer_is_kept_only_as_a_whole_label() {
 /// A security alert's model switch stays on the current model (owner ruling):
 /// Claude Code's `Model switch` dialog, raised because the
 /// model's safeguards flagged a message, is answered with its `Stay on <model>`
-/// option — never auto-downgraded — instead of escalated. Its `1. Switch
-/// automatically` option would otherwise be `kept` for a person ([`kept`]).
+/// option — never auto-downgraded — instead of escalated.
 #[test]
 fn the_security_model_switch_stays_on_the_current_model() {
     let (_, d) = decided(f::QUESTION_MODEL_SWITCH_PREFERENCE);
     let (steps, target, _, subject, unproven) = answer(&d);
-    // The fixture opens with the focus on option 1, so Stay (option 2) is one
-    // row down.
     assert_eq!((steps, target), (1, AnswerTarget::Option(2)));
     assert!(subject.ends_with("→ Stay on Opus 5.5"), "{subject}");
     assert_eq!(
@@ -211,8 +203,7 @@ fn the_security_model_switch_stays_on_the_current_model() {
 
 /// The CONTROL: the same dialog with the alert's own words gone is no longer
 /// that dialog, so the stay rule does not fire and `1. Switch automatically`
-/// escalates to a person as before. This is the rule's scope: it answers only
-/// a safeguards alert, never another model-switch or preference question.
+/// escalates to a person as before.
 #[test]
 fn a_model_switch_without_the_alert_words_still_escalates() {
     let rows: Vec<String> = screen(f::QUESTION_MODEL_SWITCH_PREFERENCE)
@@ -231,12 +222,7 @@ fn a_model_switch_without_the_alert_words_still_escalates() {
 /// replaced by a plain one-off row with no `switch` and no `settles_later`
 /// grant, as a coincidental agent-posed `AskUserQuestion` that merely shares
 /// the `safeguards`/`flagged` wording and a lone `Stay on …` option would
-/// look. The stay rule keys on the real dialog's WHOLE shape — the
-/// `Stay on …` row paired with that settling `Switch automatically` sibling —
-/// so without the companion it does not fire: the question falls through to
-/// the baseline policy, which presses option 1 (nothing marked), never this
-/// rule's `Stay` press. This closes the silence-reads-as-success hole where a
-/// look-alike question was answered on the agent's behalf.
+/// look.
 #[test]
 fn a_lookalike_without_the_switch_companion_is_not_auto_stayed() {
     let rows: Vec<String> = screen(f::QUESTION_MODEL_SWITCH_PREFERENCE)
@@ -251,8 +237,6 @@ fn a_lookalike_without_the_switch_companion_is_not_auto_stayed() {
         .collect();
     let d = decide_rows(&rows);
     let (steps, target, _, _, unproven) = answer(&d);
-    // Baseline, not the stay rule: the focused first option, not the `Stay`
-    // option (option 2), and the baseline's journal line.
     assert_eq!((steps, target), (0, AnswerTarget::Option(1)), "{d:?}");
     assert_eq!(unproven, "no option is marked (Recommended): option 1");
 }
@@ -261,12 +245,7 @@ fn a_lookalike_without_the_switch_companion_is_not_auto_stayed() {
 /// kept (safeguards+flagged, the `Stay on …` option, the `Switch automatically`
 /// companion) but the question now names a destructive act — as an agent-posed
 /// look-alike can, since the agent authors every word and an `AskUserQuestion`
-/// renders through this same dialog. The stay rule must NOT auto-press: it
-/// returns `None` so the dialog reaches the baseline policy, whose
-/// destructive-word rule escalates a no-recommendation destructive question to
-/// a person. WITHOUT the guard this look-alike would be silently auto-stayed,
-/// skipping that human escalation. The genuine dialog names no destructive
-/// word, so its Stay press (the test above) is unaffected.
+/// renders through this same dialog.
 #[test]
 fn a_destructive_lookalike_is_escalated_not_auto_stayed() {
     let rows: Vec<String> = screen(f::QUESTION_MODEL_SWITCH_PREFERENCE)
@@ -290,8 +269,7 @@ fn a_wrapped_recommended_label_is_chosen() {
 }
 
 /// The free-text row focused (S1-03, pristine): the focus is moved up off it
-/// to the recommended option, and the journal says it was moved. Never the
-/// row itself.
+/// to the recommended option, and the journal says it was moved.
 #[test]
 fn focus_on_the_free_text_row_is_moved_up_never_answered() {
     let (_, d) = decided(f::QUESTION_FREE_TEXT_FOCUSED);
@@ -421,10 +399,7 @@ fn neither_type_something_nor_chat_is_ever_chosen() {
 }
 
 /// Multi-select: Enter toggles each recommended option in turn, then the
-/// button moves on; the focus goes where each needs to. The pure decision
-/// reads every check inside the recommended set as progress; the loop, which
-/// remembers its own toggles, hands a check it did not make over
-/// (`a_check_the_supervisor_did_not_make_hands_the_multiselect_over`).
+/// button moves on; the focus goes where each needs to.
 #[test]
 fn multiselect_toggles_each_recommended_then_advances() {
     let (_, d) = decided(f::QUESTION_MULTISELECT);
@@ -442,7 +417,7 @@ fn multiselect_toggles_each_recommended_then_advances() {
 }
 
 /// A checked option the recommendation does not name is a person's check:
-/// the question is theirs. Control: the unchecked dialog is answered.
+/// the question is theirs.
 #[test]
 fn multiselect_with_a_foreign_check_hands_over() {
     let rows = screen(f::QUESTION_MULTISELECT);
@@ -457,8 +432,7 @@ fn multiselect_with_a_foreign_check_hands_over() {
 }
 
 /// The preview form: the focus moved to the option, then Enter (a digit
-/// only moves the focus there, S4-03/04). A revisited tab whose option is
-/// ticked ` ✔` is a person's answer: escalated.
+/// only moves the focus there, S4-03/04).
 #[test]
 fn the_preview_form_is_focused_then_entered() {
     let (rows, d) = decided(f::QUESTION_PREVIEW);
@@ -500,9 +474,7 @@ fn the_review_tab_submits() {
 
 /// An unmarked question naming a destructive act is answered only by its one
 /// refusing option (`No`), else it is the person's; with a marked
-/// recommendation it is answered. Controls: a Yes/No naming nothing takes
-/// option 1; no refusal, two, or a "refusal" that names an act are the
-/// person's.
+/// recommendation it is answered.
 #[test]
 fn an_unmarked_destructive_question_is_answered_by_its_refusal_or_is_the_persons() {
     let rows = screen(f::QUESTION_DO_YOU_WANT_LIVE);
@@ -521,7 +493,6 @@ fn an_unmarked_destructive_question_is_answered_by_its_refusal_or_is_the_persons
         .collect();
     let (steps, target, ..) = answer(&decide_rows(&marked));
     assert_eq!((steps, target), (0, AnswerTarget::Option(1)));
-    // A refusal that names an act is no refusal; two refusals are no one.
     for pairs in [
         &[("Leave the schema as it is.", "Delete the backup instead.")][..],
         &[
@@ -545,8 +516,6 @@ fn an_unmarked_destructive_question_is_answered_by_its_refusal_or_is_the_persons
             "{to}"
         );
     }
-    // An inflected act on a description row, with no option that refuses it:
-    // the person's.
     let rows = screen(f::QUESTION_NO_RECOMMENDATION);
     assert!(matches!(decide_rows(&rows), Decision::Approve { .. }));
     let drops: Vec<String> = rows
@@ -558,9 +527,7 @@ fn an_unmarked_destructive_question_is_answered_by_its_refusal_or_is_the_persons
 }
 
 /// An unmarked question naming an act with no option that refuses it (`Hold
-/// everything` does not start `No`) is the person's. Control: the same labels
-/// on a question that names nothing are answered; with `No, hold everything`
-/// that one refusal is the answer.
+/// everything` does not start `No`) is the person's.
 #[test]
 fn the_incidents_unmarked_publish_question_is_escalated() {
     let incident = |refusal: &str| -> Vec<String> {
@@ -587,7 +554,6 @@ fn the_incidents_unmarked_publish_question_is_escalated() {
         "PRECONDITION: the edit landed, the cursor on option 1: {rows:#?}"
     );
     assert!(reason(&decide_rows(&rows)).contains("would deploy"));
-    // Control: the labels alone name no act.
     let neutral: Vec<String> = rows
         .iter()
         .map(|r| {
@@ -596,7 +562,6 @@ fn the_incidents_unmarked_publish_question_is_escalated() {
         })
         .collect();
     assert_eq!(answer(&decide_rows(&neutral)).1, AnswerTarget::Option(1));
-    // With one option that refuses, that option is the answer.
     let refused = incident("3. No, hold everything");
     assert_eq!(answer(&decide_rows(&refused)).1, AnswerTarget::Option(3));
 }
@@ -625,12 +590,7 @@ fn a_refusal_is_no_and_never_a_word_that_starts_with_it() {
 /// `(Recommended)` answer and Enter on it ([`Choice::Focus`]), guarded on
 /// the question's own row, never its head (whose clock ticks): from the
 /// first row it sits on, from `Blue` one up, from `None of the above` two up
-/// — never Enter on the person's own words. Unmarked, its first answer; an
-/// unmarked one that would delete, its one `No`; under `long-term` the
-/// word's text as its note ([`Choice::Note`], guarded on the question's own
-/// row; `muses_question_takes_the_text_as_a_note_and_its_review_is_sent`).
-/// NEGATIVE CONTROLS: the guard matches no head row; a cursor on no option is escalated (its
-/// reader gives such options no role).
+/// — never Enter on the person's own words.
 #[test]
 fn muses_question_is_answered_by_the_cursor_and_enter() {
     use aterm_phase::muse::fixtures as u;
@@ -784,7 +744,6 @@ fn answer_questions_is_independent_of_approve() {
             "{approve:?}: {d:?}"
         );
     }
-    // Negative control: full power still never answers one by itself.
     let d = decide_with(f::QUESTION_TABS_INCIDENT, Approve::All, false);
     assert!(matches!(d, Decision::Escalate { .. }), "{d:?}");
 }
@@ -808,8 +767,7 @@ fn a_cut_question_is_escalated() {
     );
 }
 
-/// No visible focus is no answer. aterm-phase reads such a dialog as
-/// unknown; the decider refuses it whichever way it arrives.
+/// No visible focus is no answer.
 #[test]
 fn no_visible_focus_is_never_answered() {
     let rows = screen(f::QUESTION_TABS_INCIDENT);
@@ -823,8 +781,6 @@ fn no_visible_focus_is_never_answered() {
     assert_ne!(rows, bare, "PRECONDITION: the focus was removed");
     assert!(matches!(decide_rows(&bare), Decision::Escalate { .. }));
 }
-
-// ---- Tier-1: the decider bound to `SupervisorQuestionAnswer` ------------
 
 type ModelState = std::collections::BTreeMap<&'static str, i64>;
 
@@ -933,7 +889,6 @@ fn drawn(tab: i64, tabs: i64, focus: i64, row: i64, typed: i64, on_chat: bool) -
 /// fresh read, the real [`answer_question`] over [`drawn`] presses Enter
 /// exactly where `HarnessEnter` is enabled, moves the focus up exactly where
 /// `HarnessMove` is, and hands the question over elsewhere ([`decision_of`]).
-/// Negative control: the typed-away state.
 #[test]
 fn tier1_the_question_decider_chooses_only_what_the_model_enables() {
     let model = aterm_models_harness::supervisor_question_answer_model();
@@ -987,9 +942,6 @@ fn tier1_the_question_decider_chooses_only_what_the_model_enables() {
     for v in [Verdict::Enter, Verdict::Up] {
         assert!(verdicts.contains(&(true, v)), "no {v:?} on the review");
     }
-    // Negative control: the typed-away read (a person's `2` in the field, the
-    // focus back on option 1), which a decider blind to the field's text
-    // would press Enter on.
     let typed_away = model
         .init_state()
         .into_iter()

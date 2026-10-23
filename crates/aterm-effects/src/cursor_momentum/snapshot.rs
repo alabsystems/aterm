@@ -539,7 +539,7 @@ const fn canonical_f32(
     Ok(bits)
 }
 
-/// Writes the fixed layout front to back. Each `put` takes a fixed-size
+/// Writes the fixed layout front to back.
 struct Writer<'a>(&'a mut [u8]);
 
 impl Writer<'_> {
@@ -565,6 +565,7 @@ impl Writer<'_> {
 }
 
 /// Reads the fixed layout front to back; a short read (unreachable after the
+/// length check) is a [`SnapshotRefusal::Length`], never a panic.
 struct Reader<'a>(&'a [u8]);
 
 impl Reader<'_> {

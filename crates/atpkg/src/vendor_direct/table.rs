@@ -168,6 +168,7 @@ const fn floor(major: u32, minor: u32, patch: u32) -> Version {
 }
 
 /// A compile-time revision-form version (`x.y.z-R<n>[.<s>]`); an out-of-range literal fails
+/// the build.
 const fn revision_floor(
     major: u32,
     minor: u32,
@@ -190,6 +191,8 @@ macro_rules! agy_manifests {
 }
 
 /// agy's head: the manifest for this client's own platform — the one agy's own updater
+/// obeys while a rollout is staged — chosen by the arms `cli::current_triple` reports
+/// under.
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 const AGY_HEAD: &str = concat!(agy_manifests!(), "darwin_arm64.json");
 #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
@@ -531,6 +534,9 @@ mod tests {
     use super::*;
 
     /// The warm never starts a turn: claude's is print mode over a stdin it never writes —
+    /// never `--bare` or `--init-only`, which skip or race the fetches it exists for — with
+    /// no transcript and no hooks; no warm argv carries a free operand, which print mode
+    /// would send as a prompt.
     #[test]
     fn the_warm_argv_refreshes_caches_and_never_prompts() {
         let claude = spec("claude").unwrap().warm.unwrap().argv;
@@ -551,6 +557,9 @@ mod tests {
     }
 
     /// THE ALIASES ARE THE ROW'S OWN: each `(name, target)` names one of the row's exposed
+    /// tools and a target it does not expose — a clone inside the program's own build, never
+    /// a shim into another program's — both admissible tool names; and no tool is exposed by
+    /// two rows, so every `bin/` name is one program's.
     #[test]
     fn every_alias_is_a_clone_inside_its_own_rows_build() {
         let mut seen = std::collections::BTreeSet::new();
@@ -593,6 +602,7 @@ mod tests {
     }
 
     /// The `anchor` key of a `.vendor` record an earlier client wrote: each spelling is
+    /// an on-disk contract, and a record whose anchor no longer parses is refused.
     #[test]
     fn anchors_spell_as_their_record_strings() {
         #[derive(Serialize, Deserialize)]
@@ -612,6 +622,7 @@ mod tests {
     }
 
     /// Each digest document keeps its own host pin: the codex release JSON is never read
+    /// from GitHub's storage, and only the SUMS may arrive through a redirect.
     #[test]
     fn digest_documents_are_pinned_per_document() {
         let codex = spec("codex").unwrap();

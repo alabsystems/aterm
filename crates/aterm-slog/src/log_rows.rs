@@ -1,58 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE TIMELINE'S ROWS: the records a host's
-//! timeline prints as rows, numbered densely, and the floor that keeps the
-//! newest of them.
-//!
-//! - **The rule.** A host that prints some records as timeline rows installs
-//!   its grammar's count ([`RowRule`]: how many rows a record stands for, 0
-//!   for none) with [`Log::keep_rows`]. From then on every record the log
-//!   appends ITSELF is flagged by it as it is appended: the writer's record
-//!   is its row, so no writer can write a row the view does not hold, nor
-//!   flag a record its grammar does not print. A record the log did not
-//!   append (a carried one, a journal's) is never a row: the rows are this
-//!   epoch's, as a host's ring, which no update carries, always was.
-//! - **Dense ids.** A flagged record takes the next ids from the log's row
-//!   counter, one per row it stands for (a session close that prints two
-//!   rows takes two), in append order, never reused while the counter lives.
-//!   The counter is the host's to carry across an update (its timeline id,
-//!   with its overlap reserve: [`Log::continue_rows`]); a log whose host
-//!   carries none (a crash adoption) counts from 1 in its new epoch, so a
-//!   row is named by its epoch and id, never by a start second. A row id the
-//!   log no longer holds is a hole a reader is told of
-//!   ([`Log::rows_lost_between`]).
-//! - **The row floor.** The newest flagged records, up to a quarter of the
-//!   ring's records and of its byte budget ([`row_floor`]), are taken by an
-//!   eviction batch only after every other record the batch may take: every
-//!   unflagged closed detail first (U14's rule), then the rest of the
-//!   policy's order. So a flood of commands, turns and verdict marks keeps
-//!   the newest rows the timeline promises. The mark quota and the program
-//!   share keep their own rules (a claim's quarter, a node's 64 program
-//!   marks): they take only their own records, flagged or not. The floor
-//!   yields to the journal (phase 2B, [`Log::note_journaled`]): while a
-//!   writer follows the log, the floor holds within the records it has
-//!   taken and within those it has not, so a burst between two of its
-//!   passes takes a floor row the journal holds before a record it has not
-//!   reached, and loses nothing the writer could still write (the row's id
-//!   is then a hole a reader is told of).
-//!
-//! RAM ONLY: a record's row id is no field, so no tier encodes it, and the
-//! carry and the journal write none (a successor's rows are its own).
+//! THE TIMELINE'S ROWS.
+
+use std::sync::Arc;
 
 use super::{Limits, Log, MAX_RECORDS, SEQ_LIMIT};
 use crate::rec::Rec;
 
-/// How many timeline rows a record stands for (0: none), as a host's
-/// grammar prints it: what [`Log::keep_rows`] installs.
+/// How many timeline rows a record stands for (0.
 pub type RowRule = fn(&Rec) -> u8;
 
-/// The most rows one record stands for (a session close: its reason's row
-/// and its last state's).
+/// The most rows one record stands for (a session close: its reason's row and its last state's).
 pub const ROW_SPAN_MAX: u8 = 2;
 
-/// The row floor at bounds `l`: a quarter of its records and of its bytes
-/// (a session's ring: 512 records, the timeline's own cap, and 64 KiB).
+/// The row floor at bounds `l`: a quarter of its records and of its bytes.
 #[must_use]
 pub const fn row_floor(l: Limits) -> Limits {
     Limits {
@@ -61,8 +23,7 @@ pub const fn row_floor(l: Limits) -> Limits {
     }
 }
 
-/// A record's place among the rows: the first row id it stands for in the
-/// low 62 bits, how many in the top two (0: not a row).
+/// A record's place among the rows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct RowTag(u64);
 
@@ -97,8 +58,7 @@ impl RowTag {
     }
 }
 
-/// One live row record: the ids it stands for, its process-clock reading
-/// (6F-1) and the record.
+/// One live row record: the ids it stands for, its process-clock reading (6F-1) and the record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Row<'a> {
     /// The first row id it stands for.
@@ -107,8 +67,9 @@ pub struct Row<'a> {
     pub span: u8,
     /// Its process-clock reading ([`Log::mono_of`]'s).
     pub mono: u64,
-    /// The record.
-    pub rec: &'a Rec,
+    /// The record, shared: a reader that formats it after its lock is
+    /// released clones the `Arc`, never the record.
+    pub rec: &'a Arc<Rec>,
 }
 
 /// The rows a log keeps: its host's rule, its counter and where it began.
@@ -118,11 +79,9 @@ pub(super) struct Rows {
     pub(super) rule: Option<RowRule>,
     /// The last row id issued (or carried in: the host's count).
     pub(super) head: u64,
-    /// The first id this log issued or will issue: one past the count it
-    /// was continued at.
+    /// The first id this log issued or will issue: one past the count it was continued at.
     pub(super) first: u64,
-    /// The first seq this log appended itself (0: none yet): a record
-    /// before it is carried, never a row.
+    /// The first seq this log appended itself: a record before it is carried, never a row.
     pub(super) own_from: u64,
 }
 
@@ -136,12 +95,7 @@ impl Rows {
 }
 
 impl Log {
-    /// KEEP ROWS: install the host's grammar `rule` and continue the row
-    /// counter at `carried` ([`Log::continue_rows`]). The records this log
-    /// appended itself before (a successor's first record, which its
-    /// constructor writes: `gap why=handoff`, a carry's `mark - handoff`)
-    /// are flagged now, in seq order, as if the rule had stood at their
-    /// append. Installing it again replaces the rule and flags nothing twice.
+    /// KEEP ROWS: install the host's grammar `rule` and continue the row counter at `carried`.
     pub fn keep_rows(&mut self, rule: RowRule, carried: u64) {
         self.rows.rule = Some(rule);
         self.continue_rows(carried);
@@ -166,16 +120,7 @@ impl Log {
         }
     }
 
-    /// Continue the row counter at `carried`: the next row this log issues
-    /// is above it. Never lowers the count; a count past [`SEQ_LIMIT`] (no
-    /// host's: a corrupt or foreign manifest) is none. Continued past its
-    /// head after this log issued ids, the ids between are never issued:
-    /// holes [`Log::rows_lost_between`] counts. Continued before it issued
-    /// any (a successor's, as a host continues it at its adoption), the ids
-    /// up to the count are below [`Log::row_first`]: no loss of this log's,
-    /// so a host whose reader holds the predecessor's id tells that jump
-    /// itself (aterm-gui's timeline view, as its ring's digest tells the
-    /// update's).
+    /// Continue the row counter at `carried`: the next row this log issues is above it.
     pub const fn continue_rows(&mut self, carried: u64) {
         if carried > SEQ_LIMIT || carried <= self.rows.head {
             return;
@@ -198,15 +143,13 @@ impl Log {
         self.rows.head
     }
 
-    /// The first row id this log issues (one past the count it was
-    /// continued at): a reader's id below it is another process's.
+    /// The first row id this log issues: a reader's id below it is another process's.
     #[must_use]
     pub const fn row_first(&self) -> u64 {
         self.rows.first
     }
 
-    /// How many row ids this log has passed: issued, or skipped by a count
-    /// continued past its head ([`Log::continue_rows`]).
+    /// How many row ids this log has passed: issued, or skipped by a count continued past its head.
     #[must_use]
     pub const fn rows_issued(&self) -> u64 {
         if self.rows.head >= self.rows.first {
@@ -226,10 +169,7 @@ impl Log {
         })
     }
 
-    /// The row ids in `(lo, hi]` this log issued and no longer holds
-    /// (evicted, or taken by the mark quota or the program share): the holes
-    /// a reader past `lo` crosses on its way to `hi`. An id this log never
-    /// issued (below [`Log::row_first`], or past its head) is no loss of its.
+    /// The row ids in `(lo, hi` this log issued and no longer holds.
     #[must_use]
     pub fn rows_lost_between(&self, lo: u64, hi: u64) -> u64 {
         let lo = lo.max(self.rows.first.saturating_sub(1));
@@ -248,8 +188,7 @@ impl Log {
         (hi - lo).saturating_sub(held)
     }
 
-    /// Note that `seq` is this log's own append, and flag it by the rule:
-    /// the row tag its entry takes.
+    /// Note that `seq` is this log's own append, and flag it by the rule.
     pub(super) fn tag_own(&mut self, rec: &Rec) -> RowTag {
         if self.rows.own_from == 0 {
             self.rows.own_from = rec.seq;
@@ -273,9 +212,7 @@ impl Log {
         Some(RowTag::new(id, span))
     }
 
-    /// THE ROW FLOOR's members, by ring position: the newest flagged
-    /// records, newest first, while they fit [`row_floor`] of the bounds
-    /// evictions keep to (a lowered byte budget lowers the floor with it).
+    /// THE ROW FLOOR's members, by ring position.
     pub(super) fn row_floor_members(&self) -> Vec<bool> {
         let mut floor = vec![false; self.ring.len()];
         if self.rows.rule.is_none() {
@@ -298,5 +235,4 @@ impl Log {
     }
 }
 
-// The floor of a session's ring is the timeline's own cap (512 rows).
 const _: () = assert!(row_floor(Limits::SESSION).records == MAX_RECORDS / 4);

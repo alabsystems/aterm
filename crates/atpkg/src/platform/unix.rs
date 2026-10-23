@@ -264,6 +264,9 @@ pub fn rosetta_present(runtime: &Path) -> Result<bool, String> {
 }
 
 /// The one Rosetta 2 install, program and arguments: `softwareupdate`'s Rosetta verb, which
+/// installs it as the user who runs it, with no administrator password and no dialog
+/// (measured 2026-10-18 and 2026-10-21 on macOS 27.0.1: uid 501, `installAuth=NO` in
+/// `/var/log/install.log`, exit 0).
 #[cfg(target_os = "macos")]
 const ROSETTA_INSTALL: [&str; 3] = [
     "/usr/sbin/softwareupdate",
@@ -316,12 +319,14 @@ pub fn rosetta_install(within: std::time::Duration) -> Result<(), String> {
 }
 
 /// [`bounded_stdout`], keeping the child's success bit: `defaults read` exits 1 with empty
+/// output for "this key is not set", an answer to tell apart from a read that did not run.
 #[cfg(target_os = "macos")]
 fn bounded_exit_and_stdout(cmd: &mut aterm_uds::spawnfd::Command) -> Option<(bool, Vec<u8>)> {
     bounded_stdout_inner(cmd, BOUNDED_CEILING)
 }
 
 /// Run `cmd` with a bounded wall clock ([`BOUNDED_CEILING`]); its stdout on a zero exit,
+/// `None` on a spawn failure, a non-zero exit or the deadline.
 #[cfg(target_os = "macos")]
 fn bounded_stdout(cmd: &mut aterm_uds::spawnfd::Command) -> Option<Vec<u8>> {
     match bounded_stdout_inner(cmd, BOUNDED_CEILING)? {
@@ -335,6 +340,8 @@ fn bounded_stdout(cmd: &mut aterm_uds::spawnfd::Command) -> Option<Vec<u8>> {
 const BOUNDED_CEILING: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The deadline behind [`bounded_stdout`]: `crate::doctor::output_bounded_within`, which
+/// kills the child at `ceiling` (`aterm_uds::reaper` collects it once it ends) and reads its
+/// stdout while it runs, never waiting on a process the child left behind holding the pipe.
 #[cfg(target_os = "macos")]
 fn bounded_stdout_inner(
     cmd: &mut aterm_uds::spawnfd::Command,
@@ -643,9 +650,11 @@ pub fn wait_standing_aside(
 }
 
 /// The child [`wait_standing_aside`] passes SIGTERM and SIGHUP on to; `0` while it waits on
+/// none.
 static FORWARD_TO: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 /// [`wait_standing_aside`]'s handler: the signal sent on to the child it waits on, or, with
+/// none (a handler outliving its wait), the default action.
 extern "C" fn forward_to_child(sig: libc::c_int) {
     let pid = FORWARD_TO.load(std::sync::atomic::Ordering::SeqCst);
     // SAFETY: `kill`, `signal` and `raise` are async-signal-safe.
@@ -695,6 +704,8 @@ mod tests {
     use super::*;
 
     /// The Rosetta 2 probe is a `stat`: a file is present; nothing there, a missing
+    /// parent, a parent that is a file, or a directory at the name is missing; a parent
+    /// the probe may not search is no answer at all.
     #[test]
     fn the_rosetta_probe_reads_a_file_and_never_guesses_an_unsearchable_one() {
         let root = crate::testdir::dir("atpkg-rosetta-probe-");
@@ -719,6 +730,8 @@ mod tests {
     }
 
     /// A shared directory already `0755` is not rewritten (a same-mode `chmod(2)` moves
+    /// `st_ctime`, which tippy's ancestor check reads); a drifted mode is forced to `0755`;
+    /// a symlink at the name is refused and its target left alone.
     #[test]
     fn a_shared_dir_already_0755_is_not_rewritten_and_a_drifted_one_is_forced() {
         let root = crate::testdir::dir("atpkg-shared-dir-");
@@ -761,7 +774,7 @@ mod tests {
         assert_eq!(named, 0o700, "the refused link's target was chmodded");
     }
 
-    /// `account_home()` resolves on the machine running the test. A `None` reads as a
+    /// `account_home()` resolves on the machine running the test.
     #[test]
     fn the_account_home_resolves_on_the_machine_running_this_test() {
         let account = account_home().expect(

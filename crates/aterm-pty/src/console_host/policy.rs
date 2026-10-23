@@ -45,8 +45,11 @@ pub(crate) struct HostState {
     resolved: Option<Result<OpenConsoleExe, String>>,
     unlogged: Option<String>,
     /// The Windows backend can start the resize guard's client (its
+    /// `console_guard`), so the bundled default and `auto` give MSYS2/Cygwin
+    /// programs OpenConsole too ([`Self::host_for_spawn`]).
     guarded: bool,
     /// Spawns in a row whose host said nothing to a client that was still
+    /// waiting ([`Self::note_silent_start`]); a host that speaks resets it.
     silent_starts: u32,
 }
 
@@ -81,7 +84,7 @@ impl HostState {
         self.unlogged.take()
     }
 
-    /// The resolution of the current choice, made now if none was. The first
+    /// The resolution of the current choice, made now if none was.
     fn resolution(
         &mut self,
         resolve: impl FnOnce(&ConsoleHostChoice) -> Result<OpenConsoleExe, String>,
@@ -162,6 +165,7 @@ impl HostState {
     }
 
     /// Whether `exe` is still what the current choice resolved to (a report on
+    /// a host a changed choice dropped changes nothing).
     fn is_current(&self, exe: &OpenConsoleExe) -> bool {
         matches!(&self.resolved, Some(Ok(current)) if current == exe)
     }
@@ -181,6 +185,8 @@ pub(crate) fn resolve_choice(
 }
 
 /// The choices under which a program of the MSYS2/Cygwin runtime keeps the
+/// inbox host when this process cannot guard its input under OpenConsole: the
+/// bundled default and `auto`, aterm's own picks.
 fn spares_posix_runtimes(choice: &ConsoleHostChoice) -> bool {
     matches!(choice, ConsoleHostChoice::Bundled | ConsoleHostChoice::Auto)
 }
@@ -257,6 +263,8 @@ pub(crate) fn report_guarded(
 }
 
 /// `1.24.11911.0` out of `Microsoft.WindowsTerminal_1.24.11911.0_x64__8wekyb3d8bbwe`
+/// (the package full name's second `_` field), or the whole name when it has
+/// no such field.
 fn package_version(full_name: &str) -> &str {
     full_name.split('_').nth(1).unwrap_or(full_name)
 }
@@ -354,6 +362,9 @@ pub(crate) fn copy_out(source: &Path, cache: &Path, package: &str) -> io::Result
 }
 
 /// Remove what [`copy_out`] wrote for every package but `keep`: in each other
+/// entry of `cache` that is a real directory (a link is never followed), its
+/// `OpenConsole.exe` and any `OpenConsole.exe.<pid>.partial`, then the
+/// directory itself if that emptied it.
 fn prune_other_packages(cache: &Path, keep: &str) {
     let Ok(entries) = std::fs::read_dir(cache) else {
         return;
@@ -392,6 +403,7 @@ mod tests {
     use super::*;
 
     /// A path under this host's filesystem root, so the same test reads the
+    /// same on Windows and off it.
     fn rooted(parts: &[&str]) -> PathBuf {
         let mut path = PathBuf::from(if cfg!(windows) { r"C:\" } else { "/" });
         for part in parts {

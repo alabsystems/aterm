@@ -77,7 +77,6 @@ fn trailing_sentence_punctuation_and_wrapping_brackets_are_not_the_path() {
         span_at("\"crates/x/y.toml\";", 4),
         some("crates/x/y.toml", None, None)
     );
-    // The trimmed punctuation is not part of the link either.
     assert_eq!(span_at("src/a.rs.", 8), None);
 }
 
@@ -93,9 +92,7 @@ fn github_style_line_fragments_name_the_first_line() {
         span_at("src/a.rs#L7C3", 0),
         some("src/a.rs", Some(7), Some(3))
     );
-    // A fragment that names no line is part of the name.
     assert_eq!(span_at("src/a.rs#Lx", 0), some("src/a.rs#Lx", None, None));
-    // Line zero is no line.
     assert_eq!(span_at("src/a.rs:0", 0), some("src/a.rs:0", None, None));
 }
 
@@ -121,7 +118,6 @@ fn unicode_names_and_wide_glyphs_stay_one_citation() {
     let row = "→ ünï/fïle.rs:3";
     let col = row.chars().position(|c| c == 'f').unwrap();
     assert_eq!(span_at(row, col), some("ünï/fïle.rs", Some(3), None));
-    // A wide glyph takes two columns: its continuation stays in the token.
     let mut cells = chars("x 文");
     cells.push(WIDE_CONTINUATION);
     cells.extend("件/a.rs:2".chars());
@@ -138,19 +134,14 @@ fn a_relative_citation_resolves_against_the_sessions_directories_in_order() {
     let s = Scratch::new();
     let other = aterm_tempfile::tempdir().unwrap();
     let other = std::fs::canonicalize(other.path()).unwrap();
-    // The agent's cwd first: there is no src/foo.rs in `other`, so the OSC 7
-    // directory answers.
     let found = resolve("src/foo.rs", &[other.clone(), s.root.clone()], None).unwrap();
     assert_eq!(found, s.root.join("src/foo.rs"));
-    // With both holding one, the first base wins.
     std::fs::create_dir_all(other.join("src")).unwrap();
     std::fs::write(other.join("src/foo.rs"), "x").unwrap();
     let found = resolve("src/foo.rs", &[other.clone(), s.root.clone()], None).unwrap();
     assert_eq!(found, other.join("src/foo.rs"));
-    // `./` and `..` are paths like any other.
     let found = resolve("./src/sub/../foo.rs", &s.bases(), None).unwrap();
     assert_eq!(found, s.root.join("src/foo.rs"));
-    // An absolute path ignores the bases; `~/` uses home.
     let abs = s.root.join("src/foo.rs");
     assert_eq!(resolve(abs.to_str().unwrap(), &[], None).unwrap(), abs);
     assert_eq!(
@@ -180,7 +171,6 @@ fn refusals_missing_directory_bundle_unreadable_control_and_no_base() {
         resolve("~other/x.rs", &b, Some(Path::new("/"))),
         Err(PathRefusal::Missing)
     );
-    // An .app bundle, and anything inside one.
     std::fs::create_dir_all(s.root.join("Evil.app/Contents")).unwrap();
     std::fs::write(s.root.join("Evil.app/Contents/Info.plist"), "x").unwrap();
     assert_eq!(resolve("Evil.app", &b, None), Err(PathRefusal::AppBundle));
@@ -188,21 +178,17 @@ fn refusals_missing_directory_bundle_unreadable_control_and_no_base() {
         resolve("Evil.app/Contents/Info.plist", &b, None),
         Err(PathRefusal::AppBundle)
     );
-    // Unreadable.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
         let locked = s.root.join("locked.rs");
         std::fs::write(&locked, "secret").unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-        // Root reads anything; the refusal is only observable for a user.
         if std::fs::File::open(&locked).is_err() {
             assert_eq!(resolve("locked.rs", &b, None), Err(PathRefusal::Unreadable));
         }
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
-    // Controls and bidi/format characters never resolve, even where a file
-    // of that name exists.
     for hostile in [
         "src/foo.rs\u{7}",
         "src/\u{202e}foo.rs",
@@ -280,8 +266,6 @@ fn every_control_format_and_default_ignorable_character_is_refused() {
     for ch in hostile {
         assert!(is_hostile_char(ch), "{:04x}", ch as u32);
         let name = format!("a{ch}b.rs");
-        // Best effort: a filesystem may refuse a name (NUL always), and the
-        // refusal must not depend on whether the file is there.
         let _ = std::fs::write(s.root.join(&name), "x");
         assert_eq!(
             resolve(&name, &b, None),
@@ -478,7 +462,6 @@ fn the_caption_names_the_file_where_it_is_never_relative_to_a_directory() {
         format!("~{}{}:12", std::path::MAIN_SEPARATOR, src_foo()),
         "under home"
     );
-    // Printed as a program prints a whole path (on Windows `C:\…`).
     let printed = format!("{}:3", plain_text(&file));
     let absolute = PathTarget::resolve(&span(&printed), &[PathBuf::from("/")], None).unwrap();
     assert_eq!(absolute.shown, printed);
@@ -572,7 +555,6 @@ fn a_cwd_report_stands_only_under_the_group_it_was_seen_under() {
         !report_stands(None, Some((3, shell)), shell),
         "a carried cwd"
     );
-    // First seen as the front moved: held to no group, it stands under none.
     for front in [shell, ssh, 0, -1] {
         assert!(
             !report_stands(Some(3), Some((3, 0)), front),
@@ -597,7 +579,6 @@ fn a_report_seen_as_the_front_moved_is_held_to_no_group() {
         Some((1, ssh)),
         "control: the ssh held still"
     );
-    // The remote shell's next report, first seen once the shell is back.
     tl.witness_cwd_report(Some(2), shell);
     assert_eq!(
         tl.cwd_witness(),
@@ -646,15 +627,12 @@ fn only_a_shell_alone_or_an_identified_agent_runs_here() {
             "{program} identified"
         );
     }
-    // A shell that shares its group, one an `exec` replaced, unreadable.
     for leader in [None, Some("ssh"), Some("tmux"), Some("docker")] {
         assert!(
             !runs_here(&front(Some("bash"), None), || leader.map(String::from)),
             "a bash whose group reads {leader:?}"
         );
     }
-    // The root shell in front while its integration runs a command; at its
-    // prompt (the control) it runs here, and a nested shell is not the root.
     let root = |running| Front {
         root: true,
         running,
@@ -731,7 +709,6 @@ fn a_look_not_back_in_time_is_no_link_yet_and_its_answer_is_kept() {
         target.shown,
         format!("{}:2", plain_text(&s.root.join("src/foo.rs")))
     );
-    // Text that refuses on its face is answered at once, with no look.
     let hostile = PathSpan {
         path: "src/\u{202e}foo.rs".to_string(),
         line: None,
@@ -874,13 +851,10 @@ fn no_path_link_ever_reaches_open_url_external() {
                 }
                 LinkAction::Nothing => {}
             }
-            // A refused OSC 8 scheme over the same cell opens nothing, and in
-            // particular not the citation beneath it.
             assert_eq!(
                 decide(Some("file:///etc/passwd".into()), path.clone()),
                 LinkAction::Nothing
             );
-            // With no URL at all, nothing a row holds becomes an OS open.
             assert!(!matches!(decide(None, path), LinkAction::External(_)));
         }
     }

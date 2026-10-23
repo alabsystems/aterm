@@ -2,15 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Tier-1 conformance for variable-font instantiation: the shipping
-//! `aterm_render::variation` policies are total, clamped, and consistently
-//! applied — and the system SF Mono rescues to Regular.
-//!
-//! macOS ships SF Mono as `SFNSMono.ttf`, a variable font whose `fvar` default
-//! instance is "SF NS Mono Light" (`wght` ≈ 294.67). The renderer instantiates
-//! the face at load — `Regular` named instance, else `wght=400` clamped — and
-//! routes the one resolved coordinate list to the CoreText descriptor, the run
-//! shaper, and the metrics derivation.
+//! Tier-1 conformance for variable-font instantiation: the shipping `aterm_render::variation` policies are total, clamped, and consistently applied — and the system SF Mono rescues to Regular.
 
 use aterm_render::variation::{self, VfAxis, WGHT_TAG, clamp_axis};
 
@@ -44,7 +36,7 @@ const REQUESTS: &[f32] = &[
 /// the bounds lattice (min <= def <= max, aterm-font's normalization) and
 /// every request including NaN/±∞, `clamp_axis` yields a finite value inside
 /// `[min, max]`, exactly the request whenever the request is already
-/// in-bounds. Exhaustive over the lattice.
+/// in-bounds.
 #[test]
 fn clamp_axis_total_and_exact() {
     let mut clamped_low = 0usize;
@@ -53,7 +45,8 @@ fn clamp_axis_total_and_exact() {
         for &def in BOUNDS {
             for &max in BOUNDS {
                 if !(min <= def && def <= max) {
-                    continue; // fvar axes are normalized at parse
+                    // fvar axes are normalized at parse
+                    continue;
                 }
                 let axis = VfAxis {
                     tag: WGHT_TAG,
@@ -88,7 +81,6 @@ fn clamp_axis_total_and_exact() {
             }
         }
     }
-    // NON-VACUITY: both clamp directions were genuinely exercised.
     assert!(clamped_low > 0 && clamped_high > 0, "vacuous lattice");
 }
 
@@ -139,12 +131,10 @@ fn resolve_default_coords_regular_else_wght400() {
             max: 28.0,
         },
     ];
-    // No Regular instance: wght -> 400 (the SF Mono rescue), opsz stays def.
     assert_eq!(
         variation::resolve_default_coords(&axes, None),
         vec![400.0, 13.0]
     );
-    // Regular instance present: its coords, clamped onto each axis.
     assert_eq!(
         variation::resolve_default_coords(&axes, Some(&[400.0, 14.0])),
         vec![400.0, 14.0]
@@ -154,12 +144,10 @@ fn resolve_default_coords_regular_else_wght400() {
         vec![700.0, 6.0],
         "a malformed Regular instance can never escape the axis bounds"
     );
-    // Wrong-arity instance: ignored, falls back to the wght rule.
     assert_eq!(
         variation::resolve_default_coords(&axes, Some(&[400.0])),
         vec![400.0, 13.0]
     );
-    // A wght axis whose range cannot reach 400 clamps to its max.
     let thin = [VfAxis {
         tag: WGHT_TAG,
         min: 100.0,
@@ -213,7 +201,6 @@ fn parse_variation_spec_grammar() {
         variation::parse_variation_spec(" wght = 450.5 "),
         Some((WGHT_TAG, 450.5))
     );
-    // Short tags are space-padded to 4 (the OpenType convention).
     assert_eq!(
         variation::parse_variation_spec("wd=1"),
         Some((u32::from_be_bytes(*b"wd  "), 1.0))
@@ -238,9 +225,7 @@ fn parse_variation_spec_grammar() {
 }
 
 /// The dark-nudge safety gate: permitted iff both advances are
-/// finite and agree within 0.25px. Exhaustive over an advance lattice
-/// spanning the tolerance boundary, plus the non-finite failed-measurement
-/// cases.
+/// finite and agree within 0.25px.
 #[test]
 fn dark_nudge_gate_is_a_checked_precondition() {
     let advs = [
@@ -265,13 +250,8 @@ fn dark_nudge_gate_is_a_checked_precondition() {
             if ok { permitted += 1 } else { rejected += 1 }
         }
     }
-    // NON-VACUITY: both verdicts genuinely reachable.
     assert!(permitted > 0 && rejected > 0);
-    // Boundary is INCLUSIVE at exactly 0.25px…
     assert!(variation::dark_nudge_permitted(7.25, 7.0));
-    // …and a failed measurement (NaN) can never pass: the gate is a
-    // precondition, not a heuristic (NaN comparisons would be false-y anyway,
-    // but the explicit finite check is what this pins).
     assert!(!variation::dark_nudge_permitted(f32::NAN, 7.0));
     assert!(!variation::dark_nudge_permitted(7.0, f32::NAN));
 }
@@ -293,8 +273,7 @@ fn variable_face() -> Vec<u8> {
 /// the CT descriptor and the shaper receive) is exactly the pure resolution
 /// of the probe, and the cell width equals the aterm-font advance measured
 /// at those same coords — i.e. metrics derivation consumed the identical
-/// list, not the default instance (which would desync the grid). Also pins
-/// the real-bold instance (wght 700 clamped).
+/// list, not the default instance (which would desync the grid).
 #[cfg(target_os = "macos")]
 #[test]
 fn renderer_binds_one_coord_list_everywhere() {
@@ -312,14 +291,12 @@ fn renderer_binds_one_coord_list_everywhere() {
         assert_eq!(*tag, axis.tag);
         assert!((v - e).abs() < 1e-3, "coord for {tag:#x}: {v} vs pure {e}");
     }
-    // Metrics received the SAME coords: cell_w == round(advance at coords).
     let m = variation::varied_metrics_px(&bytes, 0, coords, px).expect("varied metrics");
     assert_eq!(
         r.cell_size().0,
         (m.m_advance.round() as usize).max(1),
         "cell width must derive from the instantiated advance"
     );
-    // Real bold instance: wght pulled to 700 clamped, other axes unchanged.
     let bold = r
         .debug_vf_bold_coords()
         .expect("SFNSMono's wght axis reaches bold");
@@ -341,12 +318,12 @@ fn renderer_binds_one_coord_list_everywhere() {
 /// advances constant, so the gate PASSES): a dark theme gets `base + nudge`,
 /// a light theme gets the un-nudged base — and the cell geometry is
 /// IDENTICAL either way (the gate's grid-stability half), so a live theme
-/// flip provably cannot re-grid. Default `nudge = 0` leaves coords untouched.
+/// flip provably cannot re-grid.
 #[cfg(target_os = "macos")]
 #[test]
 fn dark_nudge_applies_gated_and_geometry_stable() {
     let bytes = sf_mono();
-    let dark = aterm_render::Theme::default(); // bg 0x111318 — dark
+    let dark = aterm_render::Theme::default();
     assert!(aterm_render::theme_is_dark(dark.bg));
     let light = aterm_render::Theme {
         bg: 0x00FF_FFFF,
@@ -361,7 +338,6 @@ fn dark_nudge_applies_gated_and_geometry_stable() {
     let base_cell = r.cell_size();
     let base_baseline = r.baseline();
 
-    // Nudge on, dark theme: wght rises by the nudge (clamped), geometry holds.
     assert!(r.set_font_variations(&[], 50.0), "nudge change must apply");
     let nudged_w = r.variation_coords().unwrap()[wi].1;
     let expect = clamp_axis(&probe.axes[wi], base_w + 50.0);
@@ -372,7 +348,6 @@ fn dark_nudge_applies_gated_and_geometry_stable() {
     assert_eq!(r.cell_size(), base_cell, "nudge may never change the grid");
     assert_eq!(r.baseline(), base_baseline);
 
-    // Theme flips to light: the nudge lifts, geometry still identical.
     r.set_theme(light);
     let light_w = r.variation_coords().unwrap()[wi].1;
     assert!(
@@ -382,11 +357,8 @@ fn dark_nudge_applies_gated_and_geometry_stable() {
     assert_eq!(r.cell_size(), base_cell);
     assert_eq!(r.baseline(), base_baseline);
 
-    // Nudge off again (coords are ALREADY un-nudged on the light theme, so
-    // the setter reports no raster change — the free-no-op contract).
     assert!(!r.set_font_variations(&[], 0.0));
     assert!((r.variation_coords().unwrap()[wi].1 - base_w).abs() < 1e-3);
-    // And flipping back to dark with the nudge OFF stays un-nudged.
     r.set_theme(dark);
     assert!((r.variation_coords().unwrap()[wi].1 - base_w).abs() < 1e-3);
 }
@@ -396,13 +368,10 @@ fn dark_nudge_applies_gated_and_geometry_stable() {
 /// ink than the fvar-default Light instance (pinned by steering the config
 /// request back to the axis default, which collapses `variation_coords` to
 /// `None`), and the real-bold instance carries more
-/// ink than Regular (replacing synthetic dilation). This is the end-to-end
-/// proof that `CTFontDescriptorCreateCopyWithVariation` genuinely reshapes
-/// the outlines — not just the metrics book-keeping.
+/// ink than Regular (replacing synthetic dilation).
 #[cfg(target_os = "macos")]
 #[test]
 fn sf_mono_ct_raster_ink_tracks_the_instance() {
-    // A developer who pins the portable rasterizer has no CoreText raster for
     // this test to read, by their own choice.
     if std::env::var_os("ATERM_RASTERIZER").is_some_and(|v| v == "portable" || v == "fontdue") {
         aterm_spec::host::could_not_run("ATERM_RASTERIZER pins the portable rasterizer here");
@@ -425,8 +394,6 @@ fn sf_mono_ct_raster_ink_tracks_the_instance() {
     let ink_regular = ink(&mut r, regular);
     let ink_bold = ink(&mut r, aterm_render::StyleBits::BOLD);
 
-    // Steer the request to the axis default (Light): coords == defaults ⇒
-    // `None` ⇒ the default-instance raster.
     let probe = variation::probe(&bytes, 0).expect("variable");
     let light: Vec<(u32, f32)> = probe.axes.iter().map(|a| (a.tag, a.def)).collect();
     let mut r_light = aterm_render::Renderer::from_bytes(&bytes, px, theme).expect("renderer");
@@ -453,7 +420,6 @@ fn sf_mono_ct_raster_ink_tracks_the_instance() {
 /// byte-identical default path.
 #[test]
 fn config_requests_apply_and_nonvariable_stays_default() {
-    // Non-variable: the bundled DejaVu Sans Mono.
     let dejavu = include_bytes!("../assets/DejaVuSansMono.ttf");
     let mut r = aterm_render::Renderer::from_bytes(dejavu, 24.0, aterm_render::Theme::default())
         .expect("embedded face builds");
@@ -465,7 +431,6 @@ fn config_requests_apply_and_nonvariable_stays_default() {
     );
     assert!(r.variation_coords().is_none());
 
-    // Variable: requests overlay the default resolution, clamped.
     let bytes = variable_face();
     let mut r = aterm_render::Renderer::from_bytes(&bytes, 24.0, aterm_render::Theme::default())
         .expect("renderer");
@@ -477,7 +442,6 @@ fn config_requests_apply_and_nonvariable_stays_default() {
         (w - clamp_axis(&probe.axes[wi], 510.0)).abs() < 1e-3,
         "font_weight request must land clamped, got {w}"
     );
-    // Same request again: a free no-op (hot-reload discipline).
     assert!(!r.set_font_variations(&[(WGHT_TAG, 510.0)], 0.0));
 }
 
@@ -489,7 +453,6 @@ fn config_requests_apply_and_nonvariable_stays_default() {
 /// instance's variations lingering.
 #[test]
 fn shaping_variation_cache_tracks_coords() {
-    // Non-variable primary: coords None ⇒ cache empty.
     let dejavu = include_bytes!("../assets/DejaVuSansMono.ttf");
     let r = aterm_render::Renderer::from_bytes(dejavu, 24.0, aterm_render::Theme::default())
         .expect("embedded face builds");
@@ -499,7 +462,6 @@ fn shaping_variation_cache_tracks_coords() {
         "non-VF: the shaping-variation cache must be empty"
     );
 
-    // Variable primary: coords Some ⇒ cache mirrors them 1:1.
     let bytes = variable_face();
     let mut r = aterm_render::Renderer::from_bytes(&bytes, 24.0, aterm_render::Theme::default())
         .expect("renderer");
@@ -512,9 +474,6 @@ fn shaping_variation_cache_tracks_coords() {
         "cache must mirror the resolved coords 1:1 after a coord change"
     );
 
-    // The smoking-gun transition: swap the primary to a NON-variable face.
-    // `refresh_variations` early-outs on None==None, so unless the cache is
-    // cleared eagerly it would keep the variable face's variations on DejaVu.
     r.set_primary_font(dejavu).expect("swap to embedded face");
     assert!(r.variation_coords().is_none(), "non-VF after swap");
     assert!(
@@ -526,18 +485,12 @@ fn shaping_variation_cache_tracks_coords() {
 /// A variable MONO face, checked in: Cascadia Mono 2407.24's variable build
 /// (`ttf/CascadiaMono.ttf` of the release's `CascadiaCode-2407.24.zip`, sha256
 /// `08026f61…59fa2`; `wght` 200..400..700, OFL-1.1 beside it in `assets/test/`),
-/// the face `font_family = "Cascadia Mono"` names on Windows 11. The other variable face in the tree
-/// (Cinzel, [`variable_face`]) is proportional: its bold widens past the
-/// dilation footprint this proof bounds. Checked in rather than borrowed from
-/// the host, so the proof runs the same on every host.
+/// the face `font_family = "Cascadia Mono"` names on Windows 11.
 #[cfg(not(target_os = "macos"))]
 const VARIABLE_MONO: &[u8] = include_bytes!("../assets/test/CascadiaMono-Variable.ttf");
 
 /// Synthetic BOLD as `apply_synthetic_style` performs it: a horizontal max-dilation
-/// by `e` px that widens the bitmap and leaves the advance alone. Reproduced here
-/// rather than reached through the crate, so the assertions below are statements
-/// about OBSERVABLE pixels — "the bold cell IS / IS NOT the dilation of the regular
-/// one" — that stay honest if the private helper is renamed or re-tuned.
+/// by `e` px that widens the bitmap and leaves the advance alone.
 #[cfg(not(target_os = "macos"))]
 fn dilate(cov: &[u8], w: usize, h: usize, e: usize) -> Vec<u8> {
     let nw = w + e;
@@ -561,16 +514,6 @@ fn dilate(cov: &[u8], w: usize, h: usize, e: usize) -> Vec<u8> {
 /// The portable twin of [`sf_mono_ct_raster_ink_tracks_the_instance`]: off macOS, a
 /// bold cell on a variable primary draws the real `wght`≈700 instance through
 /// [`variation::varied_glyph_raster`], not a synthetic dilation of the regular one.
-///
-/// Both the by-char arm (`vf_bold_mono_raster`) and the by-glyph-id arm that plain
-/// primary text takes must use `vf_bold_coords`; falling back to `embolden` (a
-/// horizontal max-dilation that keeps the advance) widens a 1px stem into the
-/// neighbouring column at small cell widths.
-///
-/// Byte equality against a freshly-instantiated reference raster is
-/// the proof (the stem LUT is the identity at the default `stem_gamma = 1.0`, so the
-/// renderer's coverage is that raster verbatim); the `assert_ne!` against the
-/// dilation then states the negative outright.
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn portable_bold_draws_the_real_instance_not_a_dilation() {
@@ -582,17 +525,12 @@ fn portable_bold_draws_the_real_instance_not_a_dilation() {
     let px = 16.0;
     let theme = aterm_render::Theme::default();
     let mut r = aterm_render::Renderer::from_bytes(&bytes, px, theme).expect("renderer");
-    // The reference below is the instance's OUTLINE raster, so the renderer
-    // draws unfitted: grid fitting (the Linux and Windows default) moves the
-    // bold `M` a pixel (8x12 at x 1 against the outline's 9x12 at x 0), and
-    // `windows_grid_fit::bold_stays_bold_when_grid_fitted` binds the fitted half.
     r.set_font_hinting("off");
     let bold_coords = r
         .debug_vf_bold_coords()
         .expect("a wght axis reaching 700 yields a bold instance")
         .to_vec();
 
-    // The regular key is id-addressed, so it hands us the primary gid for free.
     let reg = r.glyph_key('M');
     assert_eq!(reg.glyph_class, aterm_render::GlyphClass::MonoGid);
     let gid = reg.ch_or_id as u16;
@@ -600,10 +538,6 @@ fn portable_bold_draws_the_real_instance_not_a_dilation() {
         variation::varied_glyph_raster(&bytes, 0, &bold_coords, gid, px)
             .expect("the bold instance rasterizes");
 
-    // ARM 1 — by CHAR (`vf_bold_mono_raster`): a styled primary glyph is
-    // re-addressed by char so a real bold sibling FILE could serve it. This
-    // renderer was built `from_bytes`, so it has no primary path and hence no
-    // sibling — the instance is the only real bold available.
     let bold_char = r.glyph_key_styled('M', aterm_render::StyleBits::BOLD);
     assert_eq!(
         bold_char.glyph_class,
@@ -627,8 +561,6 @@ fn portable_bold_draws_the_real_instance_not_a_dilation() {
         "by-char bold must be the bold instance's coverage, byte for byte"
     );
 
-    // ARM 2 — by GLYPH ID, the arm plain primary text takes. `ligature_key` builds
-    // exactly the `mono_gid` + style key the row planner emits for a bold run.
     let bold_gid = r.ligature_key(gid, aterm_render::StyleBits::BOLD);
     let img_gid = r.glyph_image(bold_gid).clone();
     assert_eq!(
@@ -642,10 +574,6 @@ fn portable_bold_draws_the_real_instance_not_a_dilation() {
         "by-gid bold must be the bold instance's coverage, byte for byte"
     );
 
-    // The negative: bold must not BE the dilation, must not exceed its footprint
-    // (that widening under an unchanged advance is precisely the cell bleed), and
-    // must still be genuinely heavier than regular — a "real instance" that lost
-    // weight would be a different bug wearing this fix's clothes.
     let reg_img = r.glyph_image(reg).clone();
     let e = (px / 18.0).round().max(1.0) as usize;
     let synthetic = dilate(reg_img.bytes(), reg_img.width(), reg_img.height(), e);
@@ -672,11 +600,7 @@ fn portable_bold_draws_the_real_instance_not_a_dilation() {
 /// A face with no usable `wght` axis
 /// (Consolas, Courier New, the bundled DejaVu — most static fonts) has no bold
 /// instance to draw, so both arms must still fall through to the synthetic
-/// dilation. The contract is "use the real instance when one exists", never "assume
-/// one exists".
-///
-/// Pinned on the committed DejaVu so it runs on every host, and on both arms, since
-/// each has its own `vf_bold_*` early-out to get wrong.
+/// dilation.
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn nonvariable_bold_still_takes_the_synthetic_path() {

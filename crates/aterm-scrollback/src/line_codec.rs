@@ -493,6 +493,8 @@ impl Line {
     }
 
     /// Deserialize the v4 underline-colour section at `offset`: `[count:2]` then
+    /// `count` records `[start_col:2][end_col:2][color:4]`, `color` the packed
+    /// `0xTT_XXXXXX` form.
     #[cfg_attr(trust_verify, trust::skip)]
     fn deserialize_underline_colors(
         data: &[u8],

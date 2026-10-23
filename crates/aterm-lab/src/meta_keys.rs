@@ -1,64 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `meta-keys --window`: Option as Meta, end to end through aterm's own window,
-//! on the U.S., German and French layouts. It OPENS A WINDOW
-//! on the desktop of whoever runs it and SELECTS EACH LAYOUT for the login
-//! session while it runs, so it runs only when `--window` says so, never from a
-//! check.
-//!
-//! One private windowed aterm runs [`keydump_main`] in its tab, which prints the
-//! bytes each key press reaches the program as. The lane raises the window (`raise
-//! <sid>`, so the instance is the active app and its window key) and presses Option
-//! chords through `hwkey … shape=press`: each event is built from a CoreGraphics
-//! keyboard event, as a key press is, posted into the instance's own event queue, so
-//! AppKit's `sendEvent:`, the window's `keyDown:` and its input method see what they
-//! see for a physical key on the selected layout. Enter ends each case, pressed
-//! twice: an input method that composes takes the first Enter as its commit (a
-//! dead key left pending is committed by it, and the Enter itself goes nowhere),
-//! and the dump drops a case that is a lone Enter.
-//!
-//! A dead key composes in the input source the login session has selected, so
-//! each layout is selected for its rows ([`crate::input_sources`]: what was
-//! selected is recorded first, and put back, with every source the run enabled
-//! disabled again, on every exit path). Each layout's rows are DERIVED FROM THE
-//! LAYOUT ITSELF ([`rows`]): `UCKeyTranslate` over the input source's
-//! `kTISPropertyUnicodeKeyLayoutData` says which Option chords are dead keys,
-//! what a dead key and a letter compose, what Option and Shift type and what a
-//! key types bare. A physical key is named to `hwkey` by what the U.S. layout
-//! types on it, which is how `hwkey` names keys (`e` is key code 14).
-//!
-//! * `C` (the control, Meta off: `settings set option_as_meta false`): an Option
-//!   dead key and a letter compose, and an Option chord types the layout's
-//!   character. Only if the input method composed here does a Meta row's "no
-//!   composition" mean anything; the control runs before and after the Meta rows,
-//!   so the instance held the keyboard throughout.
-//! * `M` (Meta on, the default): each Option dead key, each Option chord the
-//!   control typed and a key whose own character is not ASCII go out as ESC and
-//!   the key's character without Option; Option+Shift as ESC and the layout's
-//!   Shift character; an Option dead key and a letter as ESC, the key and the
-//!   letter (no dead key left pending); and a dead key pressed without Option
-//!   still composes (Meta changes Option chords, not the layout). The one
-//!   exception: an Option chord whose character (a dead key's accent) is ASCII
-//!   that no key of the layout puts down without Option types that character
-//!   (German Option+L `@`, Option+N `~`; French Option+( `{`), the only way to it.
-//!   No U.S. chord is one.
-//!
-//! A person at the desk is never typed over. The lane switches a layout and
-//! raises the window only after the keyboard, mouse and trackpad have been idle
-//! for [`IDLE`] (the kernel's `HIDIdleTime`), and a case during which a person
-//! touched any of them, or whose `hwkey` says the window was not the key window
-//! of the active app (`key=0`), is NOT MEASURED, never judged: its bytes may be
-//! theirs, and an inactive app's input method composes nothing. A layout is
-//! selected only for its own rows ([`input_sources::in_turn`]): the person's own
-//! is back while the lane waits for the desk between two layouts, and at once
-//! after a case they touched, which also ends the layouts there.
-//!
-//! macOS, a logged-in GUI session. Exit 0 every row passed with the control
-//! composing and the input sources put back as they were, 1 a row failed (or the
-//! input sources did not come back), 2 usage, 3 not run or not measured (no GUI
-//! session, no aterm, a layout not installed, a person at the desk, or the control
-//! did not compose), said on a `NOT RUN:` line.
+//! `meta-keys --window`.
 
 use std::time::{Duration, Instant};
 
@@ -150,8 +93,7 @@ fn after_dead(k: &impl Keys, dead: u32, code: u16) -> Option<String> {
     k.press(code, 0, &mut d)
 }
 
-/// One case: the `hwkey` presses before its Enter, and the bytes the program must
-/// read for them (the Enter's `0d` left out).
+/// One case: the `hwkey` presses before its Enter, and the bytes the program must read for them (the Enter's `0d` left out).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Case {
     pub what: String,
@@ -159,7 +101,7 @@ pub struct Case {
     pub want: Vec<u8>,
 }
 
-/// A layout's rows: the control (Meta off) and the Meta rows.
+/// A layout's rows.
 #[derive(Debug, Default)]
 pub struct Rows {
     pub control: Vec<Case>,
@@ -190,19 +132,9 @@ fn push_meta(rows: &mut Rows, case: Case) {
     }
 }
 
-/// The rows of `layout`, derived from it: the keys named by what `us` (the U.S.
-/// layout) types on them, as `hwkey` names keys.
-///
-/// Meta mode sends an Option chord as ESC and the key, except one whose character
-/// (a dead key's accent) is printable ASCII that no key of the layout puts down
-/// without Option: that chord types its character, the only way to it (German
-/// Option+L `@`, Option+N `~`). The rows read that set off the layout themselves
-/// (`dead key then space` for an accent), apart from aterm's own reading
-/// (`aterm_window::platform::macos::option_only_character`, `UCKeyTranslate` with
-/// dead keys off), so the two check each other.
+/// The rows of `layout`, derived from it.
 #[must_use]
 pub fn rows(layout: &impl Keys, us: &impl Keys) -> Rows {
-    // (key code, the hwkey name, what the layout types bare)
     let keys: Vec<(u16, char, Typed)> = key_codes()
         .filter_map(|code| match typed(us, code, 0) {
             Typed::Char(n) if n.is_ascii_graphic() => Some((code, n, typed(layout, code, 0))),
@@ -210,24 +142,18 @@ pub fn rows(layout: &impl Keys, us: &impl Keys) -> Rows {
         })
         .collect();
     let accent = |dead: u32| after_dead(layout, dead, SPACE).unwrap_or_default();
-    // What a press puts down: its character, or a dead key's accent.
     let puts = |code: u16, mods: u32| match typed(layout, code, mods) {
         Typed::Char(c) => Some(c),
         Typed::Dead(d) => one_char(&accent(d)),
         Typed::Other => None,
     };
-    // Every character some key puts down without Option, bare or with Shift.
     let reach: std::collections::HashSet<char> = (0..128u16)
         .flat_map(|code| [puts(code, 0), puts(code, SHIFT)])
         .flatten()
         .collect();
-    // The character the Option chord on `code` (`mods`) types in Meta mode, when only
-    // Option reaches it.
     let only = |code: u16, mods: u32| {
         puts(code, mods).filter(|c| c.is_ascii_graphic() && !reach.contains(c))
     };
-    // The first key whose own character the dead-key state `dead` composes into one
-    // other, non-ASCII character: (its name, its character, the composition).
     let base = |dead: u32| {
         keys.iter().find_map(|&(code, n, bare)| {
             let Typed::Char(b) = bare else { return None };
@@ -237,9 +163,6 @@ pub fn rows(layout: &impl Keys, us: &impl Keys) -> Rows {
     };
     let mut rows = Rows::default();
 
-    // Each Option dead key goes out as ESC and the key's own character, or types its
-    // accent when only Option reaches that; the first that composes with a letter is
-    // the control's composition.
     let mut composed = None;
     for &(code, n, bare) in &keys {
         let (Typed::Dead(d), Typed::Char(b)) = (typed(layout, code, OPTION), bare) else {
@@ -293,10 +216,6 @@ pub fn rows(layout: &impl Keys, us: &impl Keys) -> Rows {
         );
     }
 
-    // An Option chord that types a character: the first non-ASCII one, the first
-    // ASCII one only Option reaches (German `@`) and the first ASCII one a key also
-    // types without Option. The control types each; Meta sends ESC and the key's own
-    // character, except for the one only Option reaches, which it types.
     for (ascii, alone) in [(false, false), (true, true), (true, false)] {
         let chord =
             keys.iter().find_map(
@@ -337,10 +256,6 @@ pub fn rows(layout: &impl Keys, us: &impl Keys) -> Rows {
         }
     }
 
-    // Option+Shift: ESC and the layout's Shift character, on the first key whose
-    // Shift character is no capital (and whose Option+Shift character a key also
-    // reaches without Option), preferring one where the U.S. layout's differs
-    // (German Shift+2 is `"`, which the U.S. table would make `@`).
     let shifted: Vec<(char, char, char, bool)> = keys
         .iter()
         .filter_map(
@@ -365,7 +280,6 @@ pub fn rows(layout: &impl Keys, us: &impl Keys) -> Rows {
         );
     }
 
-    // A key whose own character is not ASCII (German ö, French é).
     let foreign = keys.iter().find_map(|&(code, n, bare)| match bare {
         Typed::Char(b) if !b.is_ascii() && only(code, OPTION).is_none() => Some((n, b)),
         _ => None,
@@ -381,7 +295,6 @@ pub fn rows(layout: &impl Keys, us: &impl Keys) -> Rows {
         );
     }
 
-    // A dead key without Option (French ^, German ´) still composes with Meta on.
     let plain = keys.iter().find_map(|&(_, n, bare)| match bare {
         Typed::Dead(d) => base(d).map(|base| (n, accent(d), base)),
         _ => None,
@@ -403,7 +316,7 @@ fn sleep(secs: f64) -> Result<(), Stopped> {
     stop::sleep(Duration::from_secs_f64(secs))
 }
 
-/// `bytes` as the dump prints them: lowercase hex pairs, space-separated.
+/// `bytes` as the dump prints them.
 #[must_use]
 pub fn hex(bytes: &[u8]) -> String {
     bytes
@@ -413,8 +326,7 @@ pub fn hex(bytes: &[u8]) -> String {
         .join(" ")
 }
 
-/// The bytes case `n` read, off the screen `text`: the `#n: <hex…>` line, the
-/// Enter's trailing `0d` left out. `None` while that line is not on screen.
+/// The bytes case `n` read, off the screen `text`.
 #[must_use]
 pub fn case_bytes(text: &str, n: u32) -> Option<String> {
     let tag = format!("#{n}: ");
@@ -441,9 +353,7 @@ enum Outcome {
     Broken(String),
 }
 
-/// How long ago a person last touched a keyboard, mouse or trackpad: the
-/// kernel's `HIDIdleTime` (nanoseconds), read with `ioreg`, so nothing here
-/// reaches WindowServer. `None` when it cannot be read.
+/// How long ago a person last touched a keyboard, mouse or trackpad.
 pub(crate) fn hid_idle() -> Option<Duration> {
     let o = aterm_uds::spawnfd::command("/usr/sbin/ioreg")
         .args(["-c", "IOHIDSystem", "-r", "-d", "1", "-k", "HIDIdleTime"])
@@ -459,8 +369,7 @@ pub(crate) fn hid_idle() -> Option<Duration> {
 /// Wait until no person has touched the keyboard or pointer for [`IDLE`].
 ///
 /// # Errors
-/// `Ok(Err(why))`: the desk was never idle in [`IDLE_WAIT`], or the idle clock is
-/// unreadable.
+/// `Ok(Err(why))`.
 pub(crate) fn await_idle() -> Result<Result<(), String>, Stopped> {
     let asked = Instant::now();
     loop {
@@ -786,8 +695,7 @@ fn cmd_restore() -> Res {
     Ok(0)
 }
 
-/// `meta-keys --window [--layout ID]... [--aterm PATH] [--keep]`, or
-/// `meta-keys --restore`.
+/// `meta-keys --window [--layout ID]... [--aterm PATH] [--keep]`, or `meta-keys --restore`.
 ///
 /// # Errors
 /// Usage, a lane that could not run, or an interrupt.
@@ -835,7 +743,6 @@ pub fn cmd_meta_keys(args: &[String]) -> Res {
             "no GUI session (launchctl managername is not Aqua): the lane opens a window".into(),
         ));
     }
-    // Every layout's rows, derived before anything on the desk changes.
     let us = crate::sys::tis::Layout::of(US).map_err(not_run)?;
     let mut plans = Vec::new();
     for id in &layouts {
@@ -1022,9 +929,6 @@ pub fn cmd_meta_keys(args: &[String]) -> Res {
             ""
         }
     );
-    // A control row that did not compose says the Meta rows were not measured;
-    // only a Meta row's wrong bytes, a case that could not run or input sources
-    // that did not come back is a finding.
     Ok(if lane.findings > 0 {
         1
     } else if lane.uncontrolled > 0 || lane.unmeasured > 0 {
@@ -1034,11 +938,7 @@ pub fn cmd_meta_keys(args: &[String]) -> Res {
     })
 }
 
-// ------------------------------------------------------------------ the dump
-
-/// The dump's `main` (`aterm-lab key-dump`, the tab's program): raw mode, then one
-/// line per Enter, `#<n>: <hex of every byte read since the last Enter, the Enter
-/// included>`, a lone Enter dropped; end of file or `q` ends it.
+/// The dump's `main` (`aterm-lab key-dump`, the tab's program).
 #[must_use]
 pub fn keydump_main(_args: &[String]) -> i32 {
     let _raw = crate::sys::RawMode::enter(0);
@@ -1127,8 +1027,7 @@ mod tests {
         }
     }
 
-    /// The U.S. keys these tests use: a (0), 1 (18), 2 (19), [ (33), e (14),
-    /// u (32), ; (41) and b (11).
+    /// The U.S.
     fn us() -> Table {
         Table::default()
             .key(0, 0, "a")
@@ -1158,9 +1057,7 @@ mod tests {
         cases.iter().map(|c| c.what.as_str()).collect()
     }
 
-    /// On the U.S. layout the rows are the ones measured on 2026-10-19, read off
-    /// the layout: each Option dead key as ESC and its letter, the control's
-    /// composition and Option chord.
+    /// On the U.S.
     #[test]
     fn the_us_rows_come_from_the_us_layout() {
         let r = rows(&us(), &us());
@@ -1184,9 +1081,7 @@ mod tests {
         assert_eq!(r.meta[4].keys, ["1 mods=alt+shift"]);
     }
 
-    /// A French-shaped layout: a bare dead `^` on the U.S. `[` key, `é` on the `2`
-    /// key, `&` with Shift `1` on the `1` key, an Option dead key on `&`, and `{`
-    /// under Option on the U.S. `;` key.
+    /// A French-shaped layout: a bare dead `^` on the U.S.
     fn fr() -> Table {
         Table::default()
             .key(0, 0, "q")
@@ -1210,8 +1105,7 @@ mod tests {
             .after(4, 14, "ê")
     }
 
-    /// A foreign layout's rows press the U.S. names of its keys and want the
-    /// layout's own characters.
+    /// A foreign layout's rows press the U.S.
     #[test]
     fn a_foreign_layouts_rows_want_its_own_characters() {
         let r = rows(&fr(), &us());
@@ -1248,9 +1142,7 @@ mod tests {
         assert_eq!(r.meta[6].want, "ê".as_bytes());
     }
 
-    /// A German-shaped layout: `@` only under Option on the U.S. `l` key, the tilde
-    /// dead key (its `~` reached no other way) under Option on `n`, and `'` under
-    /// Option on the U.S. `\` key, whose Shift types `'` too.
+    /// A German-shaped layout: `@` only under Option on the U.S.
     fn de() -> Table {
         Table::default()
             .key(0, 0, "a")
@@ -1333,8 +1225,7 @@ mod tests {
         }
     }
 
-    /// A key the U.S. layout types nothing printable on cannot be named to
-    /// `hwkey`, so it makes no row.
+    /// A key the U.S.
     #[test]
     fn a_key_with_no_us_name_makes_no_row() {
         let only = Table::default().key(10, 0, "§").key(10, OPTION, "dead:1");

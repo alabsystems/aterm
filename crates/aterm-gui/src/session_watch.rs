@@ -18,14 +18,18 @@ use crate::turn_ledger::TurnLedger;
 #[derive(Default)]
 pub(crate) struct Watchers {
     /// `slots.len()`, stored under the `slots` lock and read without it, so a
+    /// producer on a list nobody watches takes no lock.
     count: AtomicUsize,
     /// How many of the slots are frame watchers' ([`Subscription::watch_frame`]),
+    /// stored like `count`: a hold of the session's terminal compares its frame
+    /// only while this is not 0.
     frames: AtomicUsize,
     /// The registered slots. A STRICT LEAF (see the module doc).
     slots: Mutex<Vec<Slot>>,
     /// How many holds of this list's rings stand ([`Self::hold_rings`]).
     holds: AtomicUsize,
     /// The rings the standing holds owe ([`OWED_ALL`], [`OWED_FRAME`]), rung
+    /// once by the last hold's release.
     owed: AtomicU8,
     /// How many records this list was rung for ([`Self::ring_record`]).
     records_rung: AtomicU64,
@@ -37,6 +41,8 @@ const OWED_ALL: u8 = 1;
 const OWED_FRAME: u8 = 2;
 
 /// One registration: its subscription's token, its dirty flag (see the module
+/// doc), the subscription's single-slot notify, and whether it reads the
+/// screen (a frame watcher's).
 struct Slot {
     token: u64,
     dirty: Arc<AtomicBool>,
@@ -91,7 +97,7 @@ impl Watchers {
         HeldRings(self.clone())
     }
 
-    /// Whether a hold stands, owing `ring` to its release when one does. The
+    /// Whether a hold stands, owing `ring` to its release when one does.
     fn owes(&self, ring: u8) -> bool {
         if self.holds.load(Ordering::SeqCst) == 0 {
             return false;
@@ -174,16 +180,18 @@ impl FrameWatchers for Watchers {
 }
 
 /// The source of subscription tokens: unique per process, so a subscription
+/// removes exactly its own slot from a list another subscription also watches.
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(0);
 
 /// Single-slot watcher notification handle registered across one or more [`Watchers`] lists.
 pub(crate) struct Subscription {
     token: u64,
-    /// The blocking end [`Self::wait`] parks on. It never reads a hang-up:
+    /// The blocking end [`Self::wait`] parks on.
     rx: Receiver<()>,
     /// The send end, cloned into each list [`Self::watch`] registers on.
     notify: SyncSender<()>,
     /// The lists this subscription is registered on, each with its
+    /// registration's dirty flag.
     watching: Vec<(Arc<Watchers>, Arc<AtomicBool>)>,
 }
 
@@ -219,6 +227,7 @@ impl Subscription {
     }
 
     /// Register on `watchers` once: a second registration returns the first
+    /// one's flag and keeps its kind.
     fn enlist(&mut self, watchers: &Arc<Watchers>, frame: bool) -> Arc<AtomicBool> {
         if let Some((_, dirty)) = self.watching.iter().find(|(w, _)| Arc::ptr_eq(w, watchers)) {
             return dirty.clone();
@@ -289,6 +298,7 @@ mod tests {
     use super::*;
 
     /// A ring wakes every subscription on its list and no other, and N rings
+    /// between two waits are one wake.
     #[test]
     fn a_ring_wakes_its_lists_watchers_once_and_no_others() {
         let (a, b) = (Arc::<Watchers>::default(), Arc::<Watchers>::default());
@@ -303,6 +313,7 @@ mod tests {
     }
 
     /// One subscription on two lists is woken by either, and leaves exactly the
+    /// list it unwatches; a drop leaves the rest.
     #[test]
     fn a_subscription_watches_many_lists_and_leaves_exactly_its_own() {
         let (a, b) = (Arc::<Watchers>::default(), Arc::<Watchers>::default());
@@ -325,7 +336,7 @@ mod tests {
         b.ring_watchers();
     }
 
-    /// A FULL SLOT NEVER LOSES A DIRTY FLAG. A ring into a slot that already
+    /// A FULL SLOT NEVER LOSES A DIRTY FLAG.
     #[test]
     fn a_full_slot_never_loses_a_dirty_flag() {
         let (a, b, c) = (
@@ -358,7 +369,7 @@ mod tests {
         );
     }
 
-    /// A HELD LIST RINGS ONCE, AT ITS LAST HOLD'S RELEASE. Rings made under a
+    /// A HELD LIST RINGS ONCE, AT ITS LAST HOLD'S RELEASE.
     #[test]
     fn a_held_list_rings_once_at_its_last_holds_release() {
         let list = Arc::<Watchers>::default();
@@ -410,6 +421,7 @@ mod tests {
     }
 
     /// A ring never blocks on a watcher that stopped reading: its slot holds
+    /// one pending wake and the rest are dropped.
     #[test]
     fn a_ring_never_blocks_on_a_watcher_that_stopped_reading() {
         let list = Arc::<Watchers>::default();
@@ -422,6 +434,9 @@ mod tests {
     }
 
     /// A RECORD WAKES ITS SESSION'S WATCHERS AND NO OTHER'S, AND IS COUNTED:
+    /// the timeline and the turn ledger of one [`Observed`] ring the list it
+    /// names as records, each stepping its record count once, and a plain ring
+    /// (the PTY reader's) steps no count.
     #[test]
     fn a_record_wakes_its_sessions_watchers_and_no_others() {
         let (one, two) = (Observed::default(), Observed::default());

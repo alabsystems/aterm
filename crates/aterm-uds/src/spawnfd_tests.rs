@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `spawnfd`'s tests. The ones that must own the descriptor table — a source on
-//! 3 or 4, an unflagged descriptor above 65,536, a thread racing the spawn — run
-//! in a fresh exec of this test binary (a staged child), started through the
-//! module's own strip, so its table holds stdio and nothing else and what it
-//! stages leaks into no sibling test's child.
+//! `spawnfd`'s tests.
 
 use super::*;
 use crate::host::could_not_run;
@@ -14,8 +10,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::time::Duration;
 
-/// Present in the environment means "you ARE the staged child": run the one
-/// scenario it names and let libtest's exit code carry the verdict back.
+/// Present in the environment means "you ARE the staged child".
 pub(super) const STAGE_ENV: &str = "ATERM_UDS_SPAWNFD_STAGE";
 
 /// The kernel's name for [`descriptor_bound`], for a skip line.
@@ -25,9 +20,7 @@ const BOUND_NAME: &str = if cfg!(target_vendor = "apple") {
     "the hard RLIMIT_NOFILE"
 };
 
-/// End the calling test COULD NOT RUN unless this host can hold a descriptor numbered
-/// `need` (its [`descriptor_bound`] lies above it), naming what the scenario needs and
-/// what this host gives.
+/// Skip the test as COULD NOT RUN unless [`descriptor_bound`] is above `need`.
 #[track_caller]
 pub(super) fn require_host_holds(need: RawFd, what: &str) {
     let bound = descriptor_bound();
@@ -38,8 +31,7 @@ pub(super) fn require_host_holds(need: RawFd, what: &str) {
     }
 }
 
-/// Raise the soft descriptor limit toward `request`, and end the calling test COULD NOT
-/// RUN when it cannot pass `floor`: the hard limit is the host's.
+/// Raise the soft descriptor limit toward `request`, and end the calling test COULD NOT RUN when it cannot pass `floor`.
 #[track_caller]
 pub(super) fn require_soft_limit(request: u64, floor: RawFd) {
     if raise_soft_limit(request) <= u64::try_from(floor).unwrap_or(0) {
@@ -50,8 +42,7 @@ pub(super) fn require_soft_limit(request: u64, floor: RawFd) {
 /// The binary translator this process runs under ([`crate::process::translator`]).
 pub(crate) use crate::process::translator;
 
-/// Why `std` is no oracle for a spawn that fails under Rosetta on Linux, for
-/// the line a test prints instead of the comparison ([`translator`]).
+/// Why `std` is no oracle for a spawn that fails under Rosetta on Linux, for the line a test prints instead of the comparison ([`translator`]).
 pub(super) const STD_SPAWN_MUTE: &str = "std's answer comes from glibc's posix_spawn, whose \
     child reports a failed exec or chdir through memory it shares with its parent \
     (clone with CLONE_VM|CLONE_VFORK); Rosetta runs that child in a copy, where the store \
@@ -60,7 +51,7 @@ pub(super) const STD_SPAWN_MUTE: &str = "std's answer comes from glibc's posix_s
 
 /// `fcntl(F_GETFD)` on `fd`, or -1 when the number is not open.
 pub(super) fn flags(fd: RawFd) -> i32 {
-    // SAFETY: `F_GETFD` reads one descriptor's flags; a closed number is -1.
+    // SAFETY: `F_GETFD` reads one descriptor's flags.
     unsafe { fcntl(fd, F_GETFD) }
 }
 
@@ -100,27 +91,19 @@ fn round_trip_probe(
 
 /// The numbers a stage that must find them free is started with held: 3 and 4,
 /// where the lanes land, and 5 to 8, where `std`'s exec-status pipe would.
-/// What a binary translator opens at the exec takes the lowest free numbers:
-/// Rosetta holds the binary it translates (`binfmt_misc`'s `O` flag hands it
-/// over), itself, and two AOT cache files on 3, 4, 6, and 7. [`run_staged_held`]'s
-/// launcher holds these across the exec so whatever the translator opens lands
-/// above them, and the staged child frees them ([`release_held`]) before staging.
 const HELD: std::ops::RangeInclusive<RawFd> = 3..=8;
 
 /// Present in a staged child's environment when its launcher holds [`HELD`].
 const HELD_ENV: &str = "ATERM_UDS_SPAWNFD_HELD";
 
-/// Re-run this test binary as the staged child for `test` / `stage`, through
-/// [`InheritStrip`] so it inherits stdio alone, and return its stdout.
+/// Re-run this test binary as the staged child for `test` / `stage`, through [`InheritStrip`] so it inherits stdio alone, and return its stdout.
 pub(super) fn run_staged(test: &str, stage: &str) -> String {
     let mut launch = std::process::Command::new(std::env::current_exe().expect("the test binary"));
     launch.args(["--exact", test, "--nocapture", "--test-threads=1"]);
     launch_staged(launch, stage)
 }
 
-/// [`run_staged`] with `SIGHUP` ignored across the exec, as `nohup` (or any
-/// launcher that ignores it) leaves a test run: a stage whose cases need a
-/// signal's default disposition must set it, never inherit it.
+/// [`run_staged`] with `SIGHUP` ignored across the exec, as `nohup` (or any launcher that ignores it) leaves a test run.
 pub(super) fn run_staged_hup_ignored(test: &str, stage: &str) -> String {
     let mut launch = std::process::Command::new("/bin/sh");
     launch
@@ -147,8 +130,7 @@ fn run_staged_held(test: &str, stage: &str) -> String {
 }
 
 /// Free [`HELD`] in a staged child whose launcher held them: each must still be
-/// the launcher's `/dev/null`, and is closed. A child launched without them
-/// ([`run_staged`]) is left as it is.
+/// the launcher's `/dev/null`, and is closed.
 fn release_held() {
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
     if std::env::var_os(HELD_ENV).is_none() {
@@ -159,8 +141,7 @@ fn release_held() {
         .rdev();
     for fd in HELD {
         assert_ne!(flags(fd), -1, "fd {fd}, which the launcher held, is closed");
-        // SAFETY: `fd` is open (just checked); the `File` is never dropped, so
-        // it only borrows the descriptor for one `fstat`.
+        // SAFETY: `fd` is open (just checked).
         let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
         let meta = file.metadata().expect("fstat a held descriptor");
         assert!(
@@ -177,8 +158,7 @@ fn release_held() {
 fn launch_staged(mut launch: std::process::Command, stage: &str) -> String {
     launch.env(STAGE_ENV, stage);
     let strip = InheritStrip::prepare();
-    // SAFETY: the closure runs between fork and exec and calls only
-    // `InheritStrip::apply`, which is async-signal-safe.
+    // SAFETY: the closure runs between fork and exec and calls only `InheritStrip::apply`, which is async-signal-safe.
     unsafe {
         launch.pre_exec(move || {
             strip.apply();
@@ -187,7 +167,6 @@ fn launch_staged(mut launch: std::process::Command, stage: &str) -> String {
     }
     let out = launch.output().expect("start the staged child");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    // A stage the host could not run ends this test the same way, with its words.
     if !out.status.success()
         && let Some(why) = String::from_utf8_lossy(&out.stderr).lines().find_map(|l| {
             l.split_once(crate::host::COULD_NOT_RUN)
@@ -205,10 +184,9 @@ fn launch_staged(mut launch: std::process::Command, stage: &str) -> String {
     stdout
 }
 
-/// Move `fd` to the lowest free number at or above `floor`, close-on-exec (as
-/// `UnixStream::pair()` hands its ends out), the original closed.
+/// Move `fd` to the lowest free number at or above `floor`, close-on-exec (as `UnixStream::pair()` hands its ends out), the original closed.
 pub(super) fn park(fd: OwnedFd, floor: RawFd) -> OwnedFd {
-    // SAFETY: `fd` is live; the copy is a fresh descriptor owned only here.
+    // SAFETY: `fd` is live.
     let copy = unsafe { fcntl(fd.as_raw_fd(), F_DUPFD_CLOEXEC, floor) };
     assert!(
         copy >= floor,
@@ -229,8 +207,7 @@ fn place(fd: OwnedFd, number: RawFd) -> OwnedFd {
         -1,
         "fd {number} is already open in the staged child"
     );
-    // SAFETY: `fd` is live, `number` free; `from_raw_fd` takes exactly the
-    // descriptor `dup2` created, after the original is dropped.
+    // SAFETY: `fd` is live, `number` free.
     unsafe {
         assert_eq!(dup2(fd.as_raw_fd(), number), number, "dup2 onto {number}");
         assert_ne!(fcntl(number, F_SETFD, FD_CLOEXEC), -1, "flag {number}");
@@ -239,13 +216,11 @@ fn place(fd: OwnedFd, number: RawFd) -> OwnedFd {
     }
 }
 
-/// An unflagged duplicate of `/dev/null` at the lowest free number at or above
-/// `floor`: the stand-in for a descriptor a framework opened without
-/// close-on-exec (such as Metal's shader cache).
+/// An unflagged duplicate of `/dev/null` at the lowest free number at or above `floor`.
 pub(super) fn unflagged_at_or_above(floor: RawFd) -> OwnedFd {
     const F_DUPFD: i32 = 0;
     let file = std::fs::File::open("/dev/null").expect("open /dev/null");
-    // SAFETY: `file` is live; `F_DUPFD` returns a fresh descriptor or -1.
+    // SAFETY: `file` is live.
     let fd = unsafe { fcntl(file.as_raw_fd(), F_DUPFD, floor) };
     assert!(
         fd >= floor,
@@ -283,14 +258,12 @@ fn set_soft_limit(soft: u64) -> u64 {
     // SAFETY: a live out-parameter.
     assert_eq!(unsafe { getrlimit(NOFILE, &mut limit) }, 0, "getrlimit");
     limit.cur = soft.min(limit.max);
-    // SAFETY: a live, initialised limit that keeps the hard one; moving the
-    // soft limit below the hard one needs no privilege.
+    // SAFETY: a live, initialised limit that keeps the hard one.
     assert_eq!(unsafe { setrlimit(NOFILE, &limit) }, 0, "setrlimit");
     limit.cur
 }
 
-/// Raise the soft limit to at least `want` (capped by the hard limit); the
-/// soft limit it ends at.
+/// Raise the soft limit to at least `want` (capped by the hard limit).
 pub(super) fn raise_soft_limit(want: u64) -> u64 {
     let mut limit = Rl { cur: 0, max: 0 };
     // SAFETY: a live out-parameter.
@@ -302,11 +275,7 @@ pub(super) fn raise_soft_limit(want: u64) -> u64 {
     }
 }
 
-// The lanes, end to end
-
-/// The lane child inherits its two lanes and nothing else above stdio. An
-/// unflagged descriptor of this process (from 64 up) must not reach it, while
-/// fds 3 and 4 still round-trip.
+/// The lane child inherits its two lanes and nothing else above stdio.
 #[test]
 fn the_two_fd_child_inherits_nothing_but_its_two_lanes() {
     let held = unflagged_at_or_above(64);
@@ -322,8 +291,6 @@ fn the_two_fd_child_inherits_nothing_but_its_two_lanes() {
     assert_eq!(got, "got:hello:clear");
 }
 
-// Lane placement: the collisions, staged in a fresh table
-
 /// Where the high stage puts the verb source: Darwin's `OPEN_MAX`, the first
 /// number a file action may not name.
 const HIGH_VERB: RawFd = 10_240;
@@ -333,25 +300,18 @@ fn staged_placement(which: &str) {
     release_held();
     let (near_verb, far_verb) = UnixStream::pair().expect("socketpair");
     let (near_push, far_push) = UnixStream::pair().expect("socketpair");
-    // Everything to 20 and up first, so 3..=6 are free to stage on.
     let near_verb = UnixStream::from(park(near_verb.into(), 20));
     let near_push = UnixStream::from(park(near_push.into(), 20));
     let far_verb = park(far_verb.into(), 20);
     let far_push = park(far_push.into(), 20);
     let (far_verb, far_push, want) = match which {
-        // A source on its own target: `adddup2(fd, fd)` keeps close-on-exec,
-        // so an unmoved source would arrive CLOSED.
         "verb" => (place(far_verb, BRIDGE_VERB_FD), far_push, (3, -1)),
         "push" => (far_verb, place(far_push, BRIDGE_PUSH_FD), (-1, 4)),
-        // Each source on the OTHER's target: placing either first clobbers
-        // the other unless both moved.
         "swapped" => (
             place(far_verb, BRIDGE_PUSH_FD),
             place(far_push, BRIDGE_VERB_FD),
             (4, 3),
         ),
-        // At or above Darwin's `OPEN_MAX`, where libc refuses a file action:
-        // `HIGH_VERB`, and 20 000 or the host's highest number below it.
         "high" => {
             let push = 20_000.min(descriptor_bound() - 1);
             let want = u64::try_from(push).unwrap();
@@ -367,7 +327,6 @@ fn staged_placement(which: &str) {
         }
         other => panic!("unknown stage {other:?}"),
     };
-    // THE STAGING IS THE TEST: assert it took.
     if want.0 >= 0 {
         assert_eq!(far_verb.as_raw_fd(), want.0);
     }
@@ -407,8 +366,7 @@ fn every_lane_source_reaches_its_number_wherever_it_started() {
 
 /// `off_the_targets` keeps a source already in range, and moves one at or
 /// above the file-action limit to a close-on-exec copy below it, closing the
-/// original. (Sources on 0..=4 need a table this process does not own; the
-/// staged test above drives them.)
+/// original.
 #[test]
 fn off_the_targets_moves_only_what_a_file_action_cannot_take() {
     let file = std::fs::File::open("/dev/null").expect("open /dev/null");
@@ -421,9 +379,6 @@ fn off_the_targets_moves_only_what_a_file_action_cannot_take() {
         "a source in range is left where it is"
     );
 
-    // Above the limit: `ACTION_FD_LIMIT + 7`, or the host's highest number
-    // when that is lower; a host with no number at or above the limit cannot
-    // hold such a source, and says so.
     #[cfg(target_vendor = "apple")]
     {
         require_host_holds(
@@ -448,8 +403,6 @@ fn off_the_targets_moves_only_what_a_file_action_cannot_take() {
         assert_eq!(flags(high_raw), -1, "the original is closed");
     }
 }
-
-// The handle: exec failures, reaping, kill
 
 fn lanes() -> (OwnedFd, OwnedFd) {
     let (_, a) = UnixStream::pair().expect("socketpair");
@@ -504,8 +457,7 @@ fn a_failed_exec_is_an_error_never_a_child() {
 }
 
 /// The handle reaps exactly once: a second `wait` answers from the first, and
-/// `kill` after the reap signals nobody. `try_wait` sees a running child as
-/// running, `kill` ends it, and `wait` reports the signal.
+/// `kill` after the reap signals nobody.
 #[test]
 fn the_child_handle_reaps_once_and_kills_only_its_own() {
     let (a, b) = lanes();
@@ -523,7 +475,6 @@ fn the_child_handle_reaps_once_and_kills_only_its_own() {
     done.kill()
         .expect("kill after the reap is Ok and signals nothing");
 
-    // A child that blocks reading a stdin this test holds open.
     let (held, stdin) = UnixStream::pair().expect("socketpair");
     let (a, b) = lanes();
     let mut cmd = LaneCommand::new("/bin/sh");
@@ -565,8 +516,7 @@ fn a_bare_name_is_searched_on_the_childs_path_and_the_environment_is_exact() {
 }
 
 /// A key named twice is set once, to its last value — what the `PATH` search
-/// used and what the child's block holds agree. `env`, found on that `PATH`,
-/// prints the block as it got it.
+/// used and what the child's block holds agree.
 #[test]
 fn a_key_named_twice_is_its_last_value_for_the_search_and_the_child_alike() {
     let (mut out, child_out) = UnixStream::pair().expect("socketpair");
@@ -617,7 +567,6 @@ fn the_search_passes_over_what_it_may_not_run_and_a_script_without_a_shebang_run
     cmd.arg("x")
         .env_exactly([("PATH", path.as_str())])
         .stdin(ChildStdio::Null);
-    // A failed spawn closes the far ends too, so this read ends either way.
     let spawned = spawn_with_two_fds(cmd, far_verb.into(), far_push.into());
     let mut got = String::new();
     near_push.read_to_string(&mut got).expect("read fd 4");
@@ -671,8 +620,6 @@ fn a_helper_spawned_without_lanes_holds_its_stdio_and_nothing_else() {
     assert_eq!(got.trim_end(), "end");
 }
 
-// Above 65,536, and racing the spawn
-
 /// A 65,536 ceiling below Darwin's `kern.maxfilesperproc`.
 const OLD_CAP: RawFd = 65_536;
 
@@ -681,8 +628,7 @@ const HEADROOM: RawFd = 8;
 
 /// The number the high stand-ins sit at: 70,000 (above [`OLD_CAP`], below
 /// 92,160, one Mac's `kern.maxfilesperproc`), or just under this host's
-/// maximum when that is lower. `None` when the host hands out no number above
-/// [`OLD_CAP`].
+/// maximum when that is lower.
 fn above_old_cap() -> Option<RawFd> {
     let fd = 70_000.min(descriptor_bound().saturating_sub(HEADROOM));
     (fd > OLD_CAP).then_some(fd)
@@ -753,9 +699,7 @@ fn staged_above_old_cap() {
     println!("STAGED above-old-cap ok fd={fd}");
 }
 
-/// An unflagged descriptor above 65,536 reaches neither child. Darwin allocates
-/// up to `kern.maxfilesperproc`; a stand-in at 70,000 must reach a leaky spawn
-/// (the control) and neither the lane spawn nor an [`InheritStrip`]ped one.
+/// An unflagged descriptor above 65,536 reaches neither child.
 #[test]
 fn an_unflagged_descriptor_above_the_old_cap_reaches_no_child() {
     const NAME: &str = "spawnfd::tests::an_unflagged_descriptor_above_the_old_cap_reaches_no_child";
@@ -799,10 +743,7 @@ fn race(stop: &std::sync::atomic::AtomicBool, high_soft: u64, high: Option<RawFd
 
 /// The shell probe a raced child runs: bit 1 for a racer descriptor in the low
 /// range, bit 2 at `high` (above the old cap, when staged), bit 4 for a missing
-/// lane, each read from the child's own table ([`test_support::sh_held_any`]). Not
-/// by `[ -e /dev/fd/N ]`, a path lookup that answered "absent" for a held lane
-/// whenever another process looked up `/dev/fd/3` or `/dev/fd/4` at that instant
-/// (`lost-lane=1` in 1 of 500 spawns, at load 75).
+/// lane, each read from the child's own table ([`test_support::sh_held_any`]).
 fn race_probe(high: Option<RawFd>) -> String {
     let above = high.map_or(String::new(), |hi| {
         format!(
@@ -844,10 +785,6 @@ fn staged_race() {
         let code = usize::try_from(status.code().unwrap_or(7)).unwrap_or(7) & 7;
         tally[code] += 1;
     }
-    // NON-VACUITY: the same race, with a deliberately leaky raw spawn (no
-    // strip, no `CLOEXEC_DEFAULT`, no `std`: `test_support`), must show the
-    // racer's descriptors at the spawn — or a clean tally above would say
-    // nothing. (Its probe sees no lanes, so bit 4 is always set.)
     let mut control = 0usize;
     for _ in 0..RACE_CONTROL_SPAWNS {
         let status = test_support::leaky_status("/bin/sh", &["-c", &probe]).expect("control spawn");
@@ -877,9 +814,7 @@ fn staged_race() {
     assert_eq!(lost_lane, 0, "a lane child lacked fd 3 or 4: {tally:?}");
 }
 
-/// Zero leaks under a racing thread over 500 spawns. A thread lowers and raises
-/// the soft limit and opens unflagged descriptors (at 2000 and above 65,536)
-/// while this one spawns. A leaky spawn under the same race is the control.
+/// Zero leaks under a racing thread over 500 spawns.
 #[test]
 fn no_descriptor_reaches_a_lane_child_while_another_thread_races_the_spawn() {
     const NAME: &str =
@@ -893,11 +828,7 @@ fn no_descriptor_reaches_a_lane_child_while_another_thread_races_the_spawn() {
     print!("{out}");
 }
 
-// The strip and its bound
-
-/// A stripped child inherits nothing above stdio. A descriptor this process
-/// holds without close-on-exec rides a leaky spawn (the control) and not a
-/// fork that runs the strip, while the child's stdio still arrives.
+/// A stripped child inherits nothing above stdio.
 #[test]
 fn a_stripped_child_inherits_nothing_above_stdio() {
     let held = unflagged_at_or_above(64);
@@ -1011,14 +942,10 @@ fn the_darwin_strip_lists_the_table_and_probes_only_past_a_full_listing() {
     assert!(out.contains("STAGED listing ok"), "{out}");
 }
 
-// libSystem's fork child handler
-
 /// libnotify's once-gate, read where libSystem keeps it: `_os_alloc_once_table`
 /// (exported by libsystem_kernel, `<os/alloc_once_private.h>`), one
 /// `{ once, ptr }` slot per library, libnotify's at index 0 — the `calibrate`
-/// stage below checks that index on the running macOS. 0 means no thread has
-/// entered the gate; once the call that entered it has returned, anything else
-/// means passed.
+/// stage below checks that index on the running macOS.
 #[cfg(target_vendor = "apple")]
 fn libnotify_gate() -> isize {
     use std::sync::atomic::{AtomicIsize, Ordering};
@@ -1030,8 +957,7 @@ fn libnotify_gate() -> isize {
     unsafe extern "C" {
         static _os_alloc_once_table: [AllocOnce; 1];
     }
-    // SAFETY: an exported libSystem table, read in place; `once` is the word
-    // `os_once` itself updates atomically, and slot 0 lies within the table.
+    // SAFETY: an exported libSystem table, read in place.
     unsafe { _os_alloc_once_table[0].once.load(Ordering::Acquire) }
 }
 
@@ -1046,9 +972,6 @@ fn staged_libnotify_gate(stage: &str) {
          untouched, else no step here can be seen passing it"
     );
     if stage == "libnotify-calibrate" {
-        // The rest of `prepare` leaves the word alone, and a libnotify call
-        // moves it: so the word is libnotify's gate, and what moves it in
-        // `prepare` is the libnotify call.
         let _ = descriptor_bound();
         assert_eq!(
             libnotify_gate(),
@@ -1079,8 +1002,7 @@ fn staged_libnotify_gate(stage: &str) {
 /// In a fresh process (a staged child), where nothing has touched libnotify,
 /// [`InheritStrip::prepare`] leaves its once-gate passed, so a fork after it
 /// finds libnotify's globals built whatever another thread is calling
-/// ([`pass_libnotify_gate`]). A calibration stage verifies that slot 0 is
-/// libnotify's gate and that only `pass_libnotify_gate` moves it.
+/// ([`pass_libnotify_gate`]).
 #[cfg(target_vendor = "apple")]
 #[test]
 fn preparing_a_fork_passes_the_libnotify_gate() {
@@ -1096,15 +1018,13 @@ fn preparing_a_fork_passes_the_libnotify_gate() {
 }
 
 /// The raw boundary's valid caller gives up its only owner before admission.
-/// Compile-only controls separately require an explicit unsafe call.
 #[test]
 fn adoption_takes_an_exclusively_owned_inherited_socket() {
     let (near, mut far) = UnixStream::pair().expect("socketpair");
     let fd = std::os::fd::IntoRawFd::into_raw_fd(near);
-    // SAFETY: this fixture alone holds the unowned raw number; the other end
-    // has a different descriptor, and nobody closes/replaces this one.
+    // SAFETY: this fixture alone holds the unowned raw number.
     assert_eq!(unsafe { fcntl(fd, F_SETFD, 0) }, 0);
-    // SAFETY: the owner was given up above; this call consumes it exactly once.
+    // SAFETY: the owner was given up above.
     let adopted = unsafe { adopt_inherited_socket(fd) }.expect("adopt inherited socket");
     assert_ne!(adopted.as_raw_fd(), fd, "the adoption is a copy");
     assert_ne!(flags(adopted.as_raw_fd()) & FD_CLOEXEC, 0);
@@ -1125,9 +1045,7 @@ const CONTENDED: RawFd = 1500;
 
 /// Adopting an inherited socket succeeds while another thread looks its number
 /// up on `/dev/fd` (which on Darwin causes a `/dev/fd` path lookup of the same
-/// number to fail with `EBADF`; see [`descriptor_metadata`]). Each round makes
-/// an inheritable socket at [`CONTENDED`] and adopts it under
-/// [`test_support::racing_lookups`].
+/// number to fail with `EBADF`; see [`descriptor_metadata`]).
 #[cfg(target_vendor = "apple")]
 #[test]
 fn an_inherited_socket_is_adopted_while_its_number_is_looked_up_elsewhere() {
@@ -1143,8 +1061,7 @@ fn an_inherited_socket_is_adopted_while_its_number_is_looked_up_elsewhere() {
         );
         drop(near);
         looker.probe();
-        // SAFETY: `fd` was just made here and has no other owner; nothing else
-        // in this process names it.
+        // SAFETY: `fd` was just made here and has no other owner.
         match unsafe { adopt_inherited_socket(fd) } {
             Ok(adopted) => drop(adopted),
             Err(e) => {
@@ -1164,7 +1081,6 @@ fn an_inherited_socket_is_adopted_while_its_number_is_looked_up_elsewhere() {
 
 /// The numbers [`the_shell_probe_reads_a_contended_number_exactly`] holds in its staged
 /// child: one the probe duplicates (below 10) and one it finds in the `/dev/fd` listing.
-/// No other test looks them up there.
 #[cfg(target_vendor = "apple")]
 const SHELL_PROBED: [RawFd; 2] = [7, 1700];
 
@@ -1195,14 +1111,13 @@ fn staged_shell_probe() {
         require_soft_limit(u64::try_from(absent).unwrap() + 1, absent);
         assert_eq!(flags(absent), -1, "fd {absent} is open in the staged child");
         let (near, _far) = UnixStream::pair().expect("socketpair");
-        // SAFETY: `dup2` onto a number this staged child does not hold (its table is
-        // stdio alone) makes a fresh, inheritable descriptor there.
+        // SAFETY: `dup2` onto a number this staged child does not hold (its table is stdio alone) makes a fresh, inheritable descriptor there.
         assert_eq!(
             unsafe { dup2(near.as_raw_fd(), held) },
             held,
             "dup2 to {held}"
         );
-        // SAFETY: just made here; nothing else owns it.
+        // SAFETY: just made here.
         let _held = unsafe { OwnedFd::from_raw_fd(held) };
         let script = format!(
             "m=0; i=0; while [ $i -lt {PER_ROUND} ]; do {} || m=$((m+1)); {} && m=$((m+1)); \
@@ -1230,7 +1145,6 @@ fn staged_shell_probe() {
     }
 }
 
-// Darwin's descriptor guards (`<sys/guarded.h>`; libSystem exports the call).
 #[cfg(target_vendor = "apple")]
 unsafe extern "C" {
     fn change_fdguard_np(
@@ -1244,10 +1158,7 @@ unsafe extern "C" {
 }
 
 /// Darwin kills a process that duplicates a descriptor guarded with `GUARD_DUP`
-/// (`EXC_GUARD`: `SIGKILL`), and a guard forces close-on-exec. Staged so a kill
-/// is the stage's failure: with a socket guarded against copies and closing
-/// held, adoption refuses it untouched (close-on-exec) and the lifeline sweep
-/// closes only the lifeline's copy without duplicating the guarded descriptor.
+/// (`EXC_GUARD`: `SIGKILL`), and a guard forces close-on-exec.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_descriptor_guarded_against_copies_is_read_never_copied() {
@@ -1268,8 +1179,7 @@ fn staged_guarded() {
     let (near, _far) = UnixStream::pair().expect("socketpair");
     let guarded = std::os::fd::IntoRawFd::into_raw_fd(near);
     let mut fdflags = 0;
-    // SAFETY: guards a descriptor this stage made and alone names (its owner given up
-    // above, so nothing closes it); every pointer is a live local.
+    // SAFETY: guards a descriptor this stage made and alone names (its owner given up above, so nothing closes it).
     let rc = unsafe {
         change_fdguard_np(
             guarded,
@@ -1281,8 +1191,7 @@ fn staged_guarded() {
         )
     };
     assert_eq!(rc, 0, "guard fd {guarded}: {}", io::Error::last_os_error());
-    // SAFETY: nothing else in this process names `guarded`, and a refusal leaves it as
-    // it is (taking it would close it: `GUARD_CLOSE` would end this stage).
+    // SAFETY: `guarded` is uniquely owned here, and refusal leaves it open.
     let refused = unsafe { adopt_inherited_socket(guarded) }
         .expect_err("a guarded socket is close-on-exec, never an inherited lane");
     assert_eq!(refused.kind(), io::ErrorKind::InvalidInput, "{refused}");
@@ -1292,7 +1201,6 @@ fn staged_guarded() {
         .tempdir()
         .expect("scratch");
     let (lifeline, far) = crate::lifeline::Lifeline::open(scratch.path()).expect("a lifeline");
-    // Its held end is a copy of the same node too: not this stage's.
     drop(lifeline);
     let far = OwnedFd::from(far);
     let copy = std::os::fd::IntoRawFd::into_raw_fd(far.try_clone().expect("copy"));
@@ -1305,8 +1213,7 @@ fn staged_guarded() {
 /// The lane spawn retries a program still open for writing, as [`Command`]
 /// does: Linux refuses the exec (`ETXTBSY`) while anything holds the file open
 /// for writing, the lane arm's child reports that on its status pipe, and the
-/// spawn pauses and retries once the writer lets go. A writer that stays is
-/// refused once the retry window passes.
+/// spawn pauses and retries once the writer lets go.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_lane_spawn_refused_as_text_busy_starts_once_the_writer_lets_go() {

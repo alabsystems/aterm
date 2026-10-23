@@ -376,6 +376,7 @@ fn default_protocol() -> String {
 }
 
 /// The retired `kind` spelling, and the split that replaced it — the message
+/// [`Reject::RetiredKind`] carries.
 const VENDOR_FETCH_RETIRED: &str = "kind = \"vendor-fetch\" is retired (it was never \
     published): a row now declares its payload SHAPE as kind = \"binary\" (or \
     \"app-bundle\" with payload = \"dmg\") and where the bytes come from as \
@@ -439,6 +440,7 @@ pub fn parse_pkg(verified: &VerifiedBytes) -> Result<PkgManifest, Reject> {
 }
 
 /// The `shim_env` list must be one a shim can honour ([`crate::shim_env::ShimEnv::admit`]),
+/// checked once at parse so no writer meets an entry it cannot embed.
 fn validate_shim_env(m: &PkgManifest) -> Result<(), Reject> {
     crate::shim_env::ShimEnv::admit(&m.shim_env)
         .map(|_| ())
@@ -446,6 +448,7 @@ fn validate_shim_env(m: &PkgManifest) -> Result<(), Reject> {
 }
 
 /// The row rules `serde` cannot express (`asset`/`sha256` are `serde`-optional, so a row of an
+/// unknown protocol can omit them and be refused by name at admission):
 fn validate_rows(m: &PkgManifest) -> Result<(), Reject> {
     for a in &m.artifacts {
         if a.kind == "vendor-fetch" {
@@ -459,7 +462,7 @@ fn validate_rows(m: &PkgManifest) -> Result<(), Reject> {
     Ok(())
 }
 
-/// Strict UTF-8 and `toml` deserialize over verified bytes. Invalid UTF-8 or any TOML or shape
+/// Strict UTF-8 and `toml` deserialize over verified bytes.
 fn parse_toml<T: serde::de::DeserializeOwned>(verified: &VerifiedBytes) -> Result<T, Reject> {
     let text = std::str::from_utf8(verified.as_slice()).map_err(|_| Reject::Malformed)?;
     aterm_toml::from_str(text).map_err(|_| Reject::Malformed)
@@ -476,6 +479,7 @@ mod tests {
     }
 
     /// A realistic index naming six programs (and not `dotfiles`, a private-config repo),
+    /// attributed to the test roster's machine.
     fn full_index() -> String {
         format!(
             r#"
@@ -531,6 +535,7 @@ trust_mc_rev = "0.67.0"
     }
 
     /// A per-program floor raises only the program it names; every other program keeps the
+    /// channel-wide one.
     #[test]
     fn a_per_program_min_build_floors_one_program_only() {
         let body = format!(
@@ -596,6 +601,8 @@ pin = {{ trust = 7100, nn = 108 }}
     }
 
     /// A per-target overlay changes only the target it names: that target sees the overlaid
+    /// build for a program `pin` also names (replace) and a program `pin` never named (add);
+    /// every other target sees `pin` as published.
     #[test]
     fn a_per_target_pin_overlays_its_own_target_and_no_other() {
         let mut body = full_index();
@@ -660,6 +667,8 @@ pin = {{ trust = 7100, nn = 108 }}
     }
 
     /// The builds clients resolve, over every triple an index names, are `pin` ∪ every
+    /// `pin_by_target` overlay: the set the public mirror's work list (`atpkg-publish mirror`)
+    /// must carry.
     #[test]
     fn the_builds_clients_resolve_are_pin_union_every_overlay() {
         use std::collections::BTreeSet;
@@ -754,6 +763,7 @@ pin = {{ trust = 7100, nn = 108 }}
     }
 
     /// The `https` row keys parse (all `serde(default)`), `links` is a map, and a row with no
+    /// `protocol` is `github-release`.
     #[test]
     fn parses_https_protocol_artifact_keys() {
         let body = r#"
@@ -804,6 +814,8 @@ links = { emacs = "Emacs.app/Contents/MacOS/Emacs" }
     }
 
     /// `shim_env` is validated at parse: the accepted shape reads back through
+    /// `PkgManifest::shim_env`, an absent key is no environment, and any refused entry refuses
+    /// the whole manifest as `Reject::ShimEnv` naming it, never `Malformed`.
     #[test]
     fn shim_env_is_signed_validated_and_refused_by_name() {
         let head = "schema = 2\nprogram = \"claude\"\nversion = \"2.1.231\"\n\
@@ -838,6 +850,7 @@ links = { emacs = "Emacs.app/Contents/MacOS/Emacs" }
     }
 
     /// The retired index-level `requires` still parses, whatever it names (a cycle, an unlisted
+    /// name), so the program naming it is refused by name rather than the whole index.
     #[test]
     fn the_retired_requires_parses_so_its_program_can_be_refused() {
         let body = full_index()
@@ -856,6 +869,7 @@ links = { emacs = "Emacs.app/Contents/MacOS/Emacs" }
     }
 
     /// The retired `kind = "vendor-fetch"` is refused at parse with the split spelled out
+    /// — never read as a binary, never as an https row, never silently Unknown.
     #[test]
     fn the_retired_vendor_fetch_kind_is_refused_naming_the_split() {
         let body = "schema = 2\nprogram = \"claude\"\nbuild_number = 1\n[[artifact]]\n\
@@ -876,6 +890,8 @@ links = { emacs = "Emacs.app/Contents/MacOS/Emacs" }
     }
 
     /// A row of a deleted protocol (`pkg`, `system-pm`) still parses, so admission refuses that
+    /// one program by name instead of the whole manifest being malformed; a release-shaped row
+    /// still fails closed without `asset`/`sha256`.
     #[test]
     fn deleted_protocol_rows_parse_and_release_rows_still_need_their_digests() {
         let body = r#"
@@ -949,6 +965,7 @@ provides = ["emacs"]
     }
 
     /// A row's gate is the one digest it sets, named by its algorithm; neither or both is no
+    /// digest.
     #[test]
     fn a_row_is_gated_by_the_one_digest_it_sets() {
         const AGY_SHA512: &str = "473a34b685d0a09d48790e8b86bc3e545dfab889fe0d8fc81cb7e1fdfc336fe7\
@@ -1000,6 +1017,7 @@ provides = ["emacs"]
     }
 
     /// A schema-1 index still parses (1 ≤ `SUPPORTED_SCHEMA`) but carries no attribution, so
+    /// the roster bind refuses it.
     #[test]
     fn a_schema_one_index_parses_but_carries_no_attribution() {
         let body = "schema = 1\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
@@ -1010,6 +1028,8 @@ provides = ["emacs"]
     }
 
     /// Each fails closed as `Malformed`, never a silent default: a missing `index_build`; a
+    /// duplicate `machine_id`, which a last-wins parser would let re-attribute the index; a
+    /// string `roster_seq`, which must not read as absent.
     #[test]
     fn malformed_indexes_fail_closed() {
         for (body, why) in [
@@ -1101,6 +1121,7 @@ build_seconds = 0
     }
 
     /// `[artifact.provenance]` rides per row, exactly as `atpkg-publish` writes it
+    /// (after the row's `[artifact.cost]`, with a merged row appended after it).
     #[test]
     fn provenance_rides_per_row() {
         let commit = "7d5533b2bb9c9417bc09c27f1acd9d0b808f8f15";

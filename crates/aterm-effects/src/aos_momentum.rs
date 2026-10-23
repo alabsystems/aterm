@@ -83,7 +83,7 @@ pub const RUN_MATCHES_INPUTS: &str = "RunMatchesInputs";
 /// The entry law: the state is one the engine can reach (its snapshot validates).
 pub const SNAPSHOT_VALID: &str = "momentum-glow.snapshot-valid";
 
-/// `t − epoch` in signed nanoseconds. Exact for every pair of instants a host can hold (an
+/// `t − epoch` in signed nanoseconds.
 #[inline]
 fn offset_of(epoch: Instant, t: Instant) -> i128 {
     if let Some(after) = t.checked_duration_since(epoch) {
@@ -455,12 +455,15 @@ const fn usize_u64(v: usize) -> u64 {
 }
 
 /// The length of one encoded quad: `row`, `x`, `y`, `w`, `h` as `u16`, then `color` (`u32`),
+/// `alpha` (`u8`), `color2` (`u32`) and `alpha2` (`u8`).
 const QUAD_LEN: usize = 20;
 
 /// The most a frame observation's encoding takes besides its quads: the tag, the optional
+/// fill (a tag and a `u32`), `hot`, `fp` and the two stream counts.
 const FRAME_HEAD_LEN: usize = 1 + 5 + 1 + 8 + 8 + 8;
 
 /// One quad's encoding: its nine fields in order, each little-endian, which is exactly what
+/// the nine field writes `e.u16(q.row)`, `e.u16(q.x)`, … `e.u8(q.alpha2)` append.
 const fn quad_bytes(q: &GlowQuad) -> [u8; QUAD_LEN] {
     let [r0, r1] = q.row.to_le_bytes();
     let [x0, x1] = q.x.to_le_bytes();
@@ -482,6 +485,8 @@ fn encode_quads(e: &mut Enc, quads: &[GlowQuad]) {
 }
 
 /// A frame observation's encoding from the frame and the quads it appended: the one encoder
+/// of [`MomentumObservation::Frame`], which the live host also calls on the quads in its own
+/// vectors, so its chain links the bytes a replay links without building the observation.
 fn encode_frame(e: &mut Enc, frame: &MomentumGlowFrame, out: &[GlowQuad], under: &[GlowQuad]) {
     e.u8(2);
     e.opt(frame.fill, |e, f| e.u32(f));
@@ -492,6 +497,7 @@ fn encode_frame(e: &mut Enc, frame: &MomentumGlowFrame, out: &[GlowQuad], under:
 }
 
 /// Room for a frame observation's encoding over `quads` quads: [`FRAME_HEAD_LEN`] and
+/// [`QUAD_LEN`] each.
 const fn frame_room(quads: usize) -> usize {
     FRAME_HEAD_LEN.saturating_add(QUAD_LEN.saturating_mul(quads))
 }
@@ -1028,6 +1034,7 @@ impl Code<MomentumSchema> for PrebuiltMomentum {
     }
 
     /// Total: an admission refusal is the observation [`MomentumObservation::Refused`], never
+    /// a [`StepRefusal`].
     fn step(
         &self,
         schema: &MomentumSchema,
@@ -1239,6 +1246,7 @@ impl Contract<MomentumSchema> for NoStrandedLight {
 }
 
 /// The live observation chain since the current ancestor checkpoint: what a replay of the
+/// log from that checkpoint must reproduce.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LiveChain {
     /// The log epoch and first cursor it folds from.
@@ -1248,6 +1256,7 @@ struct LiveChain {
 }
 
 /// The last delivered tick's frame and the quads it appended: the held overlay, with the
+/// caret it was drawn for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Held {
     frame: MomentumGlowFrame,
@@ -1262,6 +1271,8 @@ struct Held {
 
 impl Held {
     /// Whether a paused tick at (`cur`, `geom`, `cfg`) is shown this overlay: only while the
+    /// tick's own gates allow the glow (the engine's inert arms: off, no positive intensity,
+    /// no cursor, a degenerate geometry) and only for the caret it was drawn for.
     #[inline]
     fn shows(&self, cur: Option<(u16, u16)>, geom: &Geom, cfg: &MomentumGlowConfig) -> bool {
         cfg.enabled
@@ -1278,6 +1289,7 @@ impl Held {
 }
 
 /// Whether the glow is at rest: what `MomentumGlow::reset` leaves (its snapshot is the
+/// default's; `light_ink_memo` is a cache, design §2 item 7).
 #[inline]
 fn at_rest(s: &MomentumState, epoch: Instant) -> bool {
     s.glow.snapshot(epoch) == MomentumGlow::default().snapshot(epoch)
@@ -1292,14 +1304,18 @@ struct Hosted {
     /// The latest recorded query's time and the wake it was answered with.
     last_query: Option<(i128, Option<i128>)>,
     /// How many live inputs were recorded at the logical time instead of their own, earlier
+    /// one (the module docs' "Time").
     clamped: u64,
     /// The latest time among the keys queued in the current pause (within the horizon).
     queued_at: Option<i128>,
     /// The one encoder every live observation is encoded into before its chain link, cleared
+    /// for each: it keeps the room the largest recent frame took, and gives it back with the
+    /// held overlay's when a tick draws nothing (see [`Hosted::deliver`]).
     scratch: Enc,
 }
 
 /// Makes `v` hold exactly the quads of `from`, in the room it already has when that is
+/// enough: an overlay redrawn every frame is copied without an allocation per frame.
 fn refill(v: &mut Vec<GlowQuad>, from: &[GlowQuad]) {
     if from.is_empty() {
         *v = Vec::new();
@@ -1385,6 +1401,7 @@ impl Hosted {
     }
 
     /// The logical time of a live call the host stamped `now`: `max(floor, now − epoch)`
+    /// (the module docs' "Time"), and whether that moved it.
     #[inline]
     fn logical(&self, now: Instant) -> (i128, bool) {
         let at = offset_of(self.epoch(), now);
@@ -1402,11 +1419,14 @@ impl Hosted {
     }
 
     /// Folds one recorded input's observation into the live chain, restarting it when the
+    /// boundary has re-anchored (a new log epoch or first cursor).
     fn fold(&mut self, cursor: u64, obs: &MomentumObservation) {
         self.link(cursor, |schema, e| schema.encode_observation(obs, e));
     }
 
     /// [`Hosted::fold`] of the observation `encode` writes: the chain links the bytes it
+    /// appends to the host's one encoder, cleared first, so they are exactly what a fresh
+    /// encoder would hold.
     fn link(&mut self, cursor: u64, encode: impl FnOnce(&MomentumSchema, &mut Enc)) {
         let Some(log) = self.boundary.log() else {
             return;
@@ -1429,6 +1449,7 @@ impl Hosted {
     }
 
     /// The live observation chain since the current log's anchor: the empty chain until the
+    /// first input of a fresh log (an attach, a commit, a restore or a re-anchor) is folded.
     fn live_chain(&self) -> Digest {
         match self.boundary.log() {
             Some(log)
@@ -1441,6 +1462,7 @@ impl Hosted {
     }
 
     /// Folds what the boundary delivered itself (a queue, an overflowing input), whose
+    /// accepted inputs took consecutive cursors from `first`.
     fn fold_delivered(
         &mut self,
         first: u64,
@@ -1454,6 +1476,7 @@ impl Hosted {
     }
 
     /// One host call as one input: recorded and applied through the live code while running,
+    /// queued or skipped while paused.
     fn deliver(
         &mut self,
         ev: &MomentumEvent,
@@ -1541,6 +1564,8 @@ impl Hosted {
     }
 
     /// Whether a reset now changes nothing: running, the glow is at rest; paused, it is at
+    /// rest once the queue is delivered (the queue ends in a reset, or holds nothing and the
+    /// paused state is at rest).
     fn reset_changes_nothing(&self) -> bool {
         if self.boundary.is_paused() {
             match self.boundary.last_queued() {
@@ -1570,6 +1595,10 @@ impl Hosted {
 
 impl MomentumHost {
     /// A running attach whose live time at `now` is past the hosted horizon can admit no timed
+    /// input again (logical time never goes back, and every such input is refused `Horizon`),
+    /// so a hot glow would stay hot and undrawn for good: the attach ends here and the shipped
+    /// engine takes the state back whole, so the call that crossed the horizon already runs
+    /// on it.
     #[inline]
     fn expire_past_horizon(&mut self, now: Instant) {
         if let HostMode::Hosted(h) = &self.mode
@@ -1776,6 +1805,7 @@ impl MomentumHost {
     }
 
     /// Detaches and returns the engine (a pending update is rejected first: the queue goes to
+    /// the old pair once).
     fn take_glow(&mut self) -> MomentumGlow {
         match core::mem::replace(&mut self.mode, HostMode::Direct(MomentumGlow::default())) {
             HostMode::Direct(g) => g,

@@ -118,6 +118,7 @@ pub const CODEX_WORDS: &[&str] = &[
 ];
 
 /// The keys a Claude Code transcript names an id by (besides any
+/// UUID-shaped string).
 const CLAUDE_IDS: &[&str] = &[
     "uuid",
     "parentUuid",
@@ -939,6 +940,8 @@ pub fn reduce_with(source: &str, program: Program, rules: &dyn Rules) -> Result<
 }
 
 /// A file walked by its rule: its reduction with EVERY candidate closed word
+/// kept ([`Candidates`]), the pairs and where each sits, and what the walk
+/// counted.
 struct Walked {
     rows: Vec<Node>,
     pairs: Vec<(String, String)>,
@@ -948,6 +951,7 @@ struct Walked {
     notices: usize,
     shift: i64,
     /// The day count the source's own reduction header names, when the
+    /// source is a reduction ([`moved_before`]).
     before: Option<i64>,
     build: Option<String>,
 }
@@ -1057,6 +1061,8 @@ pub fn header(
 }
 
 /// The build a reduction's own `#` line for `program` names (`# <program>
+/// <build> · lab reduce (…`), a closed word; `None` for `-` and any other
+/// line.
 fn build_named(line: &str, program: Program) -> Option<String> {
     let rest = line.strip_prefix(&format!("# {} ", program.name()))?;
     let (build, _) = rest.split_once(" · lab reduce (")?;
@@ -1064,6 +1070,8 @@ fn build_named(line: &str, program: Program) -> Option<String> {
 }
 
 /// The day count of a reduction's own `#` line for `program` (this rule's
+/// [`header`], or an earlier rule's: `# <program> <build> · lab reduce (…`
+/// naming `times moved <n> days`); `None` for any other line.
 fn moved_before(line: &str, program: Program) -> Option<i64> {
     let rest = line.strip_prefix(&format!("# {} ", program.name()))?;
     let (_, tail) = rest.split_once(" · lab reduce (")?;
@@ -1073,6 +1081,10 @@ fn moved_before(line: &str, program: Program) -> Option<i64> {
 }
 
 /// Whether member `key` of the object that sits under `parent`, `key`
+/// being `depth` keys deep in a row and in content part `part`, opens a
+/// FREE subtree: one whose keys a tool, a person or a schema's author named
+/// and whose strings are what they said, so every key in it is renamed
+/// `k<n>` (an id remapped as that id) and every string emptied.
 fn opens_free(
     program: Program,
     parent: &str,
@@ -1103,6 +1115,7 @@ pub fn is_schema(v: &Node) -> bool {
 }
 
 /// What a row's walk carries: its type and, for a notice, the phrase its
+/// first text is written as.
 struct RowState {
     kind: Option<String>,
     /// A Codex row's `payload.type`.
@@ -1113,6 +1126,7 @@ struct RowState {
 
 impl RowState {
     /// A row's state; `learn`: for the first pass, which writes nothing,
+    /// so no notice's phrase is made.
     fn of(
         row: &Node,
         program: Program,
@@ -1167,21 +1181,27 @@ struct Walk<'r> {
     program: Program,
     rules: &'r dyn Rules,
     /// The first pass: it learns the file's ids ([`Walk::id`]) and writes
+    /// nothing.
     learn: bool,
     /// The ids the first pass learned: every string the rule remaps as an
+    /// id where it is a value.
     known: HashSet<String>,
     ids: HashMap<String, String>,
     names: HashMap<String, String>,
     keys: HashMap<String, String>,
     /// The last `k<n>` named, and the names the file already holds as keys
+    /// (the first pass collects them).
     next_key: usize,
     taken: HashSet<String>,
     shift: i64,
     year: i64,
     /// The row being walked, and the member and element indices from its
+    /// root down to where the walk is ([`Site::trail`]).
     row: usize,
     trail: Vec<usize>,
     /// THE CANDIDATES: each `(key, word)` pair the rule keeps a
+    /// word of ([`Treat::Word`] while it is a word), in the order the file
+    /// first names it, and every place one sits.
     pairs: Vec<(String, String)>,
     pair_of: HashMap<(String, String), usize>,
     sites: Vec<Site>,
@@ -1227,11 +1247,14 @@ impl<'r> Walk<'r> {
 
 impl Walk<'_> {
     /// Whether a key is an ID the file names: a UUID's shape, or a string
+    /// the rule remaps as an id where it is a value (the first pass learns
+    /// them all, [`Walk::known`]).
     fn is_id(&self, k: &str) -> bool {
         is_uuid(k) || self.known.contains(k) || self.ids.contains_key(k)
     }
 
     /// The first rebased date in a row, in file order, outside a FREE
+    /// subtree ([`opens_free`], [`is_schema`]).
     fn first_day(
         &self,
         v: &Node,
@@ -1399,6 +1422,7 @@ impl Walk<'_> {
     }
 
     /// A stamp with its date moved by the file's shift, the rest (its time
+    /// of day, fraction and zone, [`stamp_day`]) as written.
     fn time(&self, s: &str) -> String {
         match stamp_day(s) {
             Some((y, m, d)) => {
@@ -1410,6 +1434,8 @@ impl Walk<'_> {
     }
 
     /// An epoch number under a time key, moved by the file's shift (seconds
+    /// or milliseconds by its size; a fraction after the whole part kept as
+    /// written, Codex's `create_time`); any other number as written.
     fn epoch(&self, n: &str) -> String {
         if let Some((whole, fraction)) = n.split_once('.')
             && !whole.is_empty()
@@ -1437,6 +1463,9 @@ impl Walk<'_> {
     }
 
     /// A user row's text (or a local command's): the marker it opens with,
+    /// and nothing past it, but the canonical phrase of a local command's
+    /// output that reads as a full context (`wall_confirm`'s
+    /// `command_notice`) in its tags.
     fn lead(&self, s: &str) -> Result<String, String> {
         let t = s.trim_start();
         if t.trim_end() == COMPACT || t.strip_prefix(COMPACT).is_some_and(|r| r.starts_with(' ')) {
@@ -1460,6 +1489,9 @@ impl Walk<'_> {
     }
 
     /// A tool's name: the class table's names as written (Claude Code), a
+    /// vendor's word with no `__` (Codex: every name its 0.163.0 rollouts
+    /// called is a word, T9), else `tool<n>`,
+    /// an `mcp__` name keeping that prefix.
     fn tool(&mut self, s: &str) -> String {
         let kept = match self.program {
             Program::Claude => !s.starts_with("mcp__") && tool_class(s).0 != "other",
@@ -1482,6 +1514,8 @@ impl Walk<'_> {
     }
 
     /// A key: as written when it is an identifier outside a free subtree
+    /// (`free`: [`opens_free`], where a key is whatever a tool, a person or
+    /// a schema's author named), else `k<n>`, one to one.
     fn key(&mut self, k: &str, free: bool) -> String {
         if (!free && is_ident(k)) || is_key_name(k) {
             return k.to_string();
@@ -1502,6 +1536,7 @@ impl Walk<'_> {
 }
 
 /// The fingerprint and identity a reading binds its fold to: any, the same
+/// for every file read.
 const READ_FP: u64 = 0x5eed_0000_0000_0007;
 const READ_ID: Option<(u64, u64)> = Some((16_777_220, 7));
 
@@ -1734,6 +1769,7 @@ fn kind(e: &StepEvent) -> &'static str {
 }
 
 /// The step events of two folds agree: the same kinds and states, closed
+/// words and numbers, ids one to one.
 fn same_event(a: &StepEvent, b: &StepEvent, ids: &mut OneToOne) -> Result<(), String> {
     use StepEvent as E;
     match (a, b) {
@@ -1777,6 +1813,7 @@ fn same_event(a: &StepEvent, b: &StepEvent, ids: &mut OneToOne) -> Result<(), St
 }
 
 /// Two ends agree, the second's time `shift_ms` after the first's: the
+/// newest entry's class, the close, the wall and every class it confirms.
 fn same_end(a: &End, b: &End, shift_ms: i64) -> bool {
     let ms = |t: u64| i64::try_from(t).unwrap_or(i64::MAX);
     a.last == b.last
@@ -1787,6 +1824,7 @@ fn same_end(a: &End, b: &End, shift_ms: i64) -> bool {
 }
 
 /// Two spend rows agree, the second's turn stamped `shift_s` after the
+/// first's.
 fn same_spend(a: &SpendRow, b: &SpendRow, shift_s: i64) -> bool {
     match (a, b) {
         (SpendRow::Turn(x), SpendRow::Turn(y)) => {
@@ -1801,6 +1839,7 @@ fn same_spend(a: &SpendRow, b: &SpendRow, shift_s: i64) -> bool {
 }
 
 /// Two standing limits agree, the second's times `shift_s` after the
+/// first's and its row's id the first's one to one.
 fn same_standing(a: &Standing, b: &Standing, shift_s: i64, ids: &mut OneToOne) -> bool {
     let at = |t: Option<u64>| t.map(|t| i64::try_from(t).unwrap_or(i64::MAX));
     let moved = |x: Option<u64>, y: Option<u64>| at(x).map(|t| t.saturating_add(shift_s)) == at(y);
@@ -1843,6 +1882,7 @@ fn same_standing(a: &Standing, b: &Standing, shift_s: i64, ids: &mut OneToOne) -
 }
 
 /// Two rows' Codex limits readings agree, the second's times `shift_s`
+/// after the first's.
 fn same_limits(a: &[CodexLimits], b: &[CodexLimits], shift_s: i64) -> bool {
     a.len() == b.len()
         && a.iter().zip(b).all(|(x, y)| {
@@ -1985,6 +2025,8 @@ pub fn reads_as(a: &Readings, b: &Readings, shift_days: i64) -> Result<(), Strin
 }
 
 /// Where a candidate closed word sits: its row (0-based, among the file's
+/// rows), the member and element indices from the row's root down to it,
+/// and its pair ([`Candidates::pairs`]).
 #[derive(Clone, Debug)]
 struct Site {
     row: usize,
@@ -2087,6 +2129,7 @@ impl<'a> Candidates<'a> {
     }
 
     /// The reduction's rows with the pairs `keep` flags kept, and every
+    /// other pair's words emptied wherever they sit.
     fn lines(&self, keep: &[bool]) -> Vec<Cow<'_, str>> {
         let gone = |s: &&Site| !keep.get(s.pair).copied().unwrap_or(true);
         self.rows
@@ -2134,6 +2177,7 @@ impl<'a> Candidates<'a> {
 }
 
 /// THE CHOICE OF `n` CANDIDATE PAIRS BY A READING: `read` of the
+/// flags kept, which with every flag set is the reading to keep.
 fn choose<R: PartialEq>(n: usize, read: impl Fn(&[bool]) -> R) -> Vec<bool> {
     let all = vec![true; n];
     let base = read(&all);
@@ -2222,6 +2266,7 @@ pub fn cmd_reduce(args: &[String]) -> Res {
 }
 
 /// [`cmd_reduce`], reducing `by` ([`reduce`]): the verb's negative controls
+/// reduce by a rule that keeps what [`check_written`] refuses.
 fn reduce_verb(args: &[String], by: fn(&str, Program) -> Result<Reduction, String>) -> Res {
     let usage = || {
         Fail::usage(format!(

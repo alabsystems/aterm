@@ -50,6 +50,7 @@ pub struct LineMetrics {
 
 impl LineMetrics {
     /// Build from raw `hhea`/`OS/2` design units, computing `new_line_size` in
+    /// `i32` first so a tall face cannot overflow `i16`.
     #[inline]
     const fn new(ascent: i16, descent: i16, line_gap: i16) -> Self {
         let (a, d, g) = (ascent as i32, descent as i32, line_gap as i32);
@@ -494,6 +495,7 @@ impl Font {
     }
 
     /// Design-space ink box for `gid`: the precomputed `glyf` entry when there
+    /// is one, otherwise a face parse (the CFF path).
     fn design_bbox(&self, gid: u16) -> Option<[i16; 4]> {
         if gid >= self.glyph_count {
             return None;
@@ -509,6 +511,8 @@ impl Font {
 }
 
 /// The whole-pixel bitmap box `(xmin, ymin, width, height)` for a design-space ink box at
+/// `scale`: the same expression [`crate::variation::varied_glyph_raster_with_face`] sizes
+/// its coverage grid with, so [`Font::metrics`] and [`Font::rasterize`] agree on the box.
 #[inline]
 fn ink_box_px(bbox: [i16; 4], scale: f32) -> (i32, i32, usize, usize) {
     let x_min = (f32::from(bbox[0]) * scale).floor();
@@ -521,6 +525,8 @@ fn ink_box_px(bbox: [i16; 4], scale: f32) -> (i32, i32, usize, usize) {
 }
 
 /// [`Font::unicode_overrides`] for a face whose enumerated map is
+/// `char_to_glyph`: of the `contested` code points, each whose Unicode answer
+/// ([`Font::unicode_glyph_index`]) is not the enumerated one, with that answer.
 fn unicode_overrides(
     face: &aterm_font::Face<'_>,
     char_to_glyph: &FxHashMap<char, NonZeroU16>,
@@ -588,6 +594,7 @@ pub fn with_cmap_record_last(bytes: &[u8], platform: u16, encoding: u16) -> Opti
 }
 
 /// aterm-font's parse failure, in ttf-parser's wording, as the `&'static str` the call
+/// sites format.
 fn describe(error: aterm_font::FaceParsingError) -> &'static str {
     use aterm_font::FaceParsingError::*;
     match error {
@@ -607,9 +614,12 @@ mod tests {
     use super::{Font, FontSettings, with_cmap_record_last};
 
     /// The characters the Stats Deck drew wrong on Monaco — `·` as `∑`, `×`
+    /// as `◊` — and two more Latin-1 characters the same subtables remap.
     const LATIN_1: [char; 4] = ['\u{B7}', '\u{D7}', '\u{B0}', '\u{E9}'];
 
     /// What the face's Unicode subtables map `ch` to, read off aterm-font one
+    /// subtable at a time: the first that maps it to a glyph the face has, `0`
+    /// for none, and `None` for a face with no Unicode subtable.
     fn unicode_answer(face: &aterm_font::Face<'_>, ch: char) -> Option<u16> {
         let cmap = face.tables().cmap?;
         let mut unicode = cmap
@@ -630,6 +640,9 @@ mod tests {
     }
 
     /// Holds [`Font::unicode_glyph_index`] to [`unicode_answer`] (to the
+    /// enumerated map for a face with no Unicode subtable) over every char any
+    /// subtable of `face` maps, and answers the chars where it is not
+    /// [`Font::lookup_glyph_index`]'s answer.
     fn moved_from_the_enumerated_map(font: &Font, face: &aterm_font::Face<'_>) -> Vec<char> {
         let mut chars = Vec::new();
         if let Some(cmap) = face.tables().cmap {
@@ -656,6 +669,7 @@ mod tests {
     }
 
     /// A MACINTOSH SUBTABLE LISTED AFTER THE UNICODE ONE DOES NOT MOVE A CHAR
+    /// OFF ITS GLYPH.
     #[cfg(feature = "embedded-font")]
     #[test]
     fn a_mac_subtable_listed_last_does_not_remap_latin_1() {
@@ -711,7 +725,7 @@ mod tests {
         }
     }
 
-    /// NOTHING A FACE DRAWS RIGHT TODAY MOVES. The embedded faces carry a Mac
+    /// NOTHING A FACE DRAWS RIGHT TODAY MOVES.
     #[cfg(feature = "embedded-font")]
     #[test]
     fn the_unicode_answer_keeps_every_printable_char_of_the_shipped_faces() {
@@ -734,7 +748,7 @@ mod tests {
         }
     }
 
-    /// MONACO DRAWS LATIN-1 BY ITS UNICODE SUBTABLE. The face that showed the
+    /// MONACO DRAWS LATIN-1 BY ITS UNICODE SUBTABLE.
     #[cfg(target_os = "macos")]
     #[test]
     fn monaco_resolves_latin_1_through_its_unicode_subtable() {

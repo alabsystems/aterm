@@ -76,6 +76,7 @@ pub struct Connection {
     discard: usize,
     broken: bool,
     /// How long [`Connection::send`] may wait for the bus to take its bytes
+    /// ([`Connection::set_send_timeout`]); `None` waits as long as it takes.
     send_timeout: Option<Duration>,
 }
 
@@ -216,7 +217,7 @@ impl Connection {
     }
 
     /// Set the write timeout for [`Connection::send`] (`None` waits indefinitely).
-    pub fn set_send_timeout(&mut self, timeout: Option<Duration>) {
+    pub const fn set_send_timeout(&mut self, timeout: Option<Duration>) {
         self.send_timeout = timeout;
     }
 
@@ -334,6 +335,8 @@ impl Connection {
     }
 
     /// [`Connection::call`] with a deadline for each of its phases: the bus
+    /// takes the call whole by `send_by`, and the peer answers it by
+    /// `answer_by`.
     fn call_until(
         &mut self,
         msg: Message,

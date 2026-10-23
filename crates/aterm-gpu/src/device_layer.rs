@@ -21,6 +21,7 @@ use crate::metal::ffi as mtl;
 use crate::metal::resources::{MetalResourceDevice, SealedTexture, SharedBuffer};
 
 /// The crossing refusal: a `what` minted by one backend arm reached `verb` of
+/// another.
 #[cfg(multi_arm)]
 #[cold]
 #[track_caller]
@@ -469,7 +470,7 @@ impl DeviceHandle<'_> {
             .unwrap_or_else(|e| panic!("device layer: {label}: {e}"))
     }
 
-    /// The one buffer constructor behind the three roles. Metal storage is
+    /// The one buffer constructor behind the three roles.
     fn try_create_buffer(
         &self,
         label: &'static str,
@@ -1476,6 +1477,7 @@ pub(crate) fn submit_host_readable(
 }
 
 /// The raw command buffer [`submit_host_readable`] appends: a
+/// `TRANSFER_WRITE -> HOST_READ` buffer barrier per readback.
 #[cfg(all(wgpu_arm, unix, not(target_vendor = "apple")))]
 fn host_read_barrier(
     device: &wgpu::Device,
@@ -1518,6 +1520,7 @@ fn host_read_barrier(
 }
 
 /// Off the Vulkan cells (Metal on macOS, DX12 on Windows) a completed command
+/// buffer's writes to a mapped readback buffer reach the host without one.
 #[cfg(all(wgpu_arm, not(all(unix, not(target_vendor = "apple")))))]
 fn host_read_barrier(
     _device: &wgpu::Device,
@@ -1529,6 +1532,9 @@ fn host_read_barrier(
 #[cfg(all(test, wgpu_arm, unix, not(target_vendor = "apple")))]
 mod host_read_tests {
     /// A Vulkan readback's submit carries the host-read barrier: wgpu hands
+    /// the raw encoder over and the barrier is recorded, so the fix cannot
+    /// lapse into a silent no-op, and two readbacks in one submit (a
+    /// recording and a still of one present) get theirs too.
     #[test]
     fn a_vulkan_readback_submit_carries_the_host_read_barrier() {
         let ctx = crate::GpuContext::new()
@@ -1564,6 +1570,9 @@ mod host_read_tests {
 }
 
 /// GL arm of `try_read_back`: read `texture`'s `width` x `height` RGBA8
+/// texels at the wgpu arm's 256-byte stride and unpack them into an
+/// `aterm_render::Frame` with the shared byte contract
+/// ([`crate::frame_from_padded_rgba`]).
 #[cfg(gl_arm)]
 pub(crate) fn gl_try_read_back(
     dev: &GlDevice,
@@ -1585,6 +1594,8 @@ mod tests {
     use std::sync::Arc;
 
     /// Every route outside `metal/` by which a texture minted in loss domain 2
+    /// could reach a domain-1 encode or present (alias view, copy destination,
+    /// a second swapchain's drawable and alias, cross present) refuses by name.
     #[test]
     fn no_texture_launders_across_loss_domains() {
         use crate::metal::encoder::{EncodeSession, RenderPassDesc, StoreAction};
@@ -1706,6 +1717,7 @@ mod tests {
     }
 
     /// The Metal arm's length guards: a short row band and an overlong buffer
+    /// write both fail the layer's assert before `replaceRegion:` / `memcpy`.
     #[test]
     fn the_metal_arm_refuses_short_uploads_and_oversized_writes() {
         let Some(mint) = mint() else {

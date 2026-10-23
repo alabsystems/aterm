@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Settings ▸ Messages page's model without a host: a [`Desk`] answers the seam and
-//! the builder runs over a real [`MessageCenter`].
+//! The Settings ▸ Messages page's model without a host: a [`Desk`] answers the seam and the builder runs over a real [`MessageCenter`].
 
 use crate::center::MessageCenter;
 use crate::log::{LogLine, LogRecord, MessageLog};
@@ -294,9 +293,7 @@ fn the_projection_is_newest_first_in_the_chips_order_with_the_hosts_facts() {
 /// login three times): a story told on — a keyed row in new words, a row of
 /// another key that replaced it, a record the owner read that a later row tells
 /// on — is ONE entry, the latest, in its current words; the counts and the chips
-/// count it once. NEGATIVE CONTROLS: a record whose replacement the ring no longer
-/// holds, or one replaced "back" by an earlier record, stays its own row
-/// (`replaced`), and an unrelated record stands.
+/// count it once.
 #[test]
 fn a_story_told_on_is_one_row_in_its_latest_words() {
     let now = Instant::now();
@@ -314,7 +311,6 @@ fn a_story_told_on_is_one_row_in_its_latest_words() {
             now,
         )
         .id;
-    // The sign-in, read; the same key in new words; another key's next state.
     let si = c
         .post(
             notice("Login expired in tab 1", "n.s-1.si", "Finish signing in"),
@@ -363,8 +359,6 @@ fn a_story_told_on_is_one_row_in_its_latest_words() {
         [("harness".to_string(), 1), ("system".to_string(), 1)],
         "counted once"
     );
-    // Each record told on names the entry standing for it now, a chain
-    // followed to its head, so a host keeps open what moved on.
     assert_eq!(
         page.told_on,
         [(si2.raw(), ca.raw()), (si.raw(), ca.raw())],
@@ -372,8 +366,6 @@ fn a_story_told_on_is_one_row_in_its_latest_words() {
     );
     assert_eq!(page.standing_for(si.raw()), Some(ca.raw()));
     assert_eq!(page.standing_for(other.raw()), None, "its own entry");
-    // A record of another tab, withdrawn: the replay control below names it
-    // replaced by an earlier record.
     let late = c
         .post(
             notice("Login expired in tab 2", "n.s-2.si", "Finish signing in"),
@@ -382,7 +374,6 @@ fn a_story_told_on_is_one_row_in_its_latest_words() {
         )
         .id;
     assert!(c.withdraw(late, now));
-    // NEGATIVE CONTROL: a replacement the ring no longer holds.
     let mut ring = MessageLog::empty();
     let mut head = c.log().get(si).expect("the record").clone();
     head.state = crate::LogState::Posted;
@@ -406,9 +397,6 @@ fn a_story_told_on_is_one_row_in_its_latest_words() {
         .expect("its successor is gone: its own row");
     assert_eq!(row.state_words(), "replaced");
     assert!(page.told_on.is_empty(), "it stands for itself");
-    // NEGATIVE CONTROL: a file that says a record was replaced by an EARLIER
-    // one (no build of this center writes it; the page reads any file) keeps
-    // both rows: the earlier record cannot stand for a later one.
     let mut ring = MessageLog::empty();
     let mut back = c.log().get(late).expect("the record").clone();
     back.state = crate::LogState::Posted;
@@ -432,14 +420,7 @@ fn a_story_told_on_is_one_row_in_its_latest_words() {
     assert_eq!(ids, [late.raw(), other.raw()], "told back: both rows");
 }
 
-/// A FAILURE IS TOLD ON ONLY BY A FAILURE. A script's `sev=error key=build`
-/// row replaced while it still stood by a retry under its key, which then
-/// finished `ok`, stays its own row in Problems (`replaced`), as it would had
-/// its row folded first: whether a failure is listed never hangs on when the
-/// next word came. NEGATIVE CONTROLS: a failure told again in new words by a
-/// failure is one row, and stays one once that failure is fixed under `✓`
-/// (the successor was POSTED an error, whatever it shows now); a warning
-/// replaced by anything is one row.
+/// A FAILURE IS TOLD ON ONLY BY A FAILURE.
 #[test]
 fn a_failure_is_told_on_only_by_a_failure() {
     let now = Instant::now();
@@ -481,7 +462,6 @@ fn a_failure_is_told_on_only_by_a_failure() {
     assert_eq!(page.severity_counts(None), (2, 1), "in Problems");
     assert!(page.told_on.is_empty());
 
-    // NEGATIVE CONTROL: a failure told again by a failure, then fixed.
     let mut c = center(now);
     let first = c
         .post(
@@ -510,7 +490,6 @@ fn a_failure_is_told_on_only_by_a_failure() {
     let ids: Vec<u64> = page.entries.iter().map(|e| e.id).collect();
     assert_eq!(ids, [again.raw()], "still one row once fixed");
     assert_eq!(page.standing_for(first.raw()), Some(again.raw()));
-    // ...and so after a relaunch: its `posted` line keeps how it was told.
     let mut ring = MessageLog::empty();
     ring.replay_all(
         c.log()
@@ -521,7 +500,6 @@ fn a_failure_is_told_on_only_by_a_failure() {
     let ids: Vec<u64> = relaunched.entries.iter().map(|e| e.id).collect();
     assert_eq!(ids, [again.raw()], "replayed: one row");
 
-    // NEGATIVE CONTROL: a warning replaced by a retry is one row.
     let mut c = center(now);
     let _warned = c
         .post(
@@ -541,9 +519,6 @@ fn a_failure_is_told_on_only_by_a_failure() {
     let ids: Vec<u64> = page.entries.iter().map(|e| e.id).collect();
     assert_eq!(ids, [retry.raw()], "one row");
 
-    // A late-park boot missed both posts. The live successor was restated
-    // before capture: its current mark never replaces its original mark.
-    // A later row posted Info and restated Error is still no failure successor.
     for (posted, current) in [
         (Severity::Error, Severity::Warn),
         (Severity::Error, Severity::Info),
@@ -638,8 +613,7 @@ fn a_failure_is_told_on_only_by_a_failure() {
 /// A STORY'S ROW STARTS WHEN THE STORY DID: a lost login told as a sign-in,
 /// cancelled 40 minutes on and back 5 minutes after that is one row whose
 /// meta line reads the sign-in's clock and `took 45 min` (never the cancel's
-/// 5), while its lead column keeps its own stamp. NEGATIVE CONTROL: an
-/// unrelated record keeps its own start.
+/// 5), while its lead column keeps its own stamp.
 #[test]
 fn a_story_told_on_starts_when_its_first_record_did() {
     const MIN: u64 = 60_000;
@@ -684,7 +658,6 @@ fn a_story_told_on_starts_when_its_first_record_did() {
         row.meta_words(NOW, 0),
         format!("{} \u{00b7} took 45 min", words::local_words(NOW, start, 0))
     );
-    // NEGATIVE CONTROL: the unrelated record.
     let own = page.entry(other.raw()).expect("its own row");
     assert_eq!(own.began_unix_ms, own.at_unix_ms);
 }
@@ -743,7 +716,6 @@ fn install_now_follows_the_hosts_staged_build_and_the_sentence_is_the_hosts() {
     );
     assert!(install(&page), "that build staged");
     assert_eq!(page.entry(staged.raw()).unwrap().sentences, 2);
-    // A decision answered: its label in the meta words, and not offered again.
     let answered = c
         .post(
             Message::new(tags::PRIVACY, Severity::Info, "Allow Full Disk Access?")
@@ -770,8 +742,7 @@ fn install_now_follows_the_hosts_staged_build_and_the_sentence_is_the_hosts() {
 }
 
 /// On a retired record an upgrade word whose tab the host no longer has is dropped; one
-/// whose upgrade stands but no longer takes the word is offered disabled. A live row keeps
-/// every word.
+/// whose upgrade stands but no longer takes the word is offered disabled.
 #[test]
 fn a_word_for_a_session_that_is_gone_is_not_offered() {
     let now = Instant::now();
@@ -790,7 +761,6 @@ fn a_word_for_a_session_that_is_gone_is_not_offered() {
             now,
         )
         .id;
-    // Live: every word offered, pressable only where the host takes it.
     let page = MessagesState::of(&c, &Desk::default());
     let words_of = |page: &MessagesState, id: MessageId| {
         page.entry(id.raw())
@@ -806,10 +776,8 @@ fn a_word_for_a_session_that_is_gone_is_not_offered() {
         "a live row keeps its words"
     );
     assert!(c.resolve(tab, Outcome::Ok, now));
-    // Retired, its tab gone: nothing offered.
     let page = MessagesState::of(&c, &Desk::default());
     assert!(words_of(&page, tab).is_empty());
-    // s-1 stands but moved on: its words stay, disabled, but for one it takes.
     let page = MessagesState::of(
         &c,
         &Desk {
@@ -926,8 +894,7 @@ fn a_navigation_is_pressable_only_where_the_host_performs_one() {
 
 /// Chips merge by their words, so a script tag spelled as an aterm chip's words (`updates`)
 /// reads as the script wrote it, a chip of its own; other script tags are capitalized
-/// (`search` → `Search`, `ci` → `CI`). Over a real center, the Updates filter admits
-/// aterm's `update` record alone. Control: aterm's own pairs still share a chip.
+/// (`search` → `Search`, `ci` → `CI`).
 #[test]
 fn a_scripts_tag_never_reads_as_one_of_aterms_chips() {
     for (script, own) in [
@@ -944,8 +911,6 @@ fn a_scripts_tag_never_reads_as_one_of_aterms_chips() {
         assert_eq!(tag_words(script), script, "{script}");
         assert!(!same_chip(script, own), "{script} under {own}'s chip");
     }
-    // Every chip's words as a script would tag them, wherever that is a tag
-    // and not one of aterm's own.
     for own in tags::ALL.iter().map(|t| t.as_str()) {
         let spelled = tag_words(own).to_lowercase();
         if Tag::try_new(&spelled).is_ok() && !tags::ALL.iter().any(|t| t.as_str() == spelled) {
@@ -1025,8 +990,6 @@ fn a_replayed_open_record_is_cut_off_and_a_silent_one_blames_its_reporter() {
     assert_eq!(view.state, "stale");
     assert_eq!(view.state_words(), "still open when aterm stopped");
     assert_eq!(view.glyph, '\u{2139}', "the replayed open record's mark");
-    // Control: the same record while live keeps its working mark, and a
-    // mark that is not a working one is kept when cut off.
     assert_eq!(
         cut_off_mark(replayed.glyph, Severity::Info, "live").ch(),
         '\u{21bb}'
@@ -1035,14 +998,12 @@ fn a_replayed_open_record_is_cut_off_and_a_silent_one_blames_its_reporter() {
         cut_off_mark(Severity::Warn.default_glyph(), Severity::Warn, "stale").ch(),
         '\u{26a0}'
     );
-    // A row this process retired Stale keeps its words.
     let mut silent = replayed.clone();
     silent.retired_unix_ms = Some(61_000);
     assert_eq!(
         MessageView::of(&silent, None, None, None, &Desk::default()).state_words(),
         "stopped reporting after 1 min"
     );
-    // Quit through the center: the percent it reached, the severity's mark.
     let now = Instant::now();
     let mut c = center(now);
     let render = c
@@ -1114,7 +1075,6 @@ fn a_stamp_from_tomorrow_is_todays() {
     const DAY: u64 = 86_400_000;
     let now = NOW;
     let mut entries: Vec<MessageView> = (38..=40).rev().map(|id| entry_at(id, now)).collect();
-    // Past the reader's midnight (the reader is at 15:53 UTC).
     entries[0].at_unix_ms = now + 9 * 3_600_000;
     entries[1].at_unix_ms = now - 60_000;
     entries[2].at_unix_ms = now - 120_000;
@@ -1139,8 +1099,7 @@ fn a_stamp_from_tomorrow_is_todays() {
 }
 
 /// An old open exception is listed first under its own day, and the log under it starts
-/// again from today, so a day can head both the open run and the log. Control: with no
-/// open exception the sections are a running minimum (one header a day).
+/// again from today, so a day can head both the open run and the log.
 #[test]
 fn an_old_open_exception_keeps_its_own_day_header() {
     const DAY: u64 = 86_400_000;
@@ -1215,7 +1174,6 @@ fn a_headed_list_says_the_local_time_of_a_past_row() {
     let flat = MessagesClock::of(&[&today], NOW, 0);
     assert!(!flat.headed);
     assert_eq!(flat.when(today.at_unix_ms), "3 h ago");
-    // 15:53 UTC is 08:53 at UTC-7: the same instant, another local day line.
     let west = MessagesClock::of(&[&today], NOW, -25_200);
     assert_eq!(west.offset_s, -25_200);
     assert_eq!(west.today, words::local_day(NOW, -25_200));
@@ -1248,7 +1206,7 @@ fn copy_text_of_a_view_is_the_engines() {
 
 /// A line of [`crate::page::wire_lines`]' grammar read back as a page would:
 /// its kind word, then each field split at its first `=` and unescaped (the
-/// log codec's inverse). One line never carries a `\n`.
+/// log codec's inverse).
 fn read_page_line(line: &str) -> (String, Vec<(String, String)>) {
     assert!(!line.contains('\n') && !line.contains('\r'), "{line:?}");
     let mut tokens = line.split('\t');
@@ -1346,7 +1304,6 @@ fn the_page_as_lines_says_every_word_in_one_grammar() {
     let (c, desk) = page_lines_fixture();
     let page = MessagesState::of(&c, &desk);
     let lines = crate::page::wire_lines(&page, &MessagesFilter::default());
-    // Read back as a page reads it: the sentence lines split at US.
     let (kind, fields) = lines
         .iter()
         .map(|l| read_page_line(l))
@@ -1364,14 +1321,11 @@ fn the_page_as_lines_says_every_word_in_one_grammar() {
             "Upgrade now asks it at its next turn end"
         ]
     );
-    // Every word is the engine's own (the page's model, not a second copy).
     let wait = page.entry(4).unwrap();
     assert_eq!(
         page_field(&fields, "state_words"),
         Some(&*wait.state_words())
     );
-    // Copy's text reads back byte for byte, and the meta line is the one an expanded
-    // entry paints.
     assert_eq!(page_field(&fields, "copy"), Some(&*wait.copy_text()));
     assert_eq!(page_field(&fields, "meta"), Some(&*wait.meta_words(NOW, 0)));
     assert_eq!(
@@ -1391,8 +1345,7 @@ fn the_page_as_lines_says_every_word_in_one_grammar() {
 
 /// The lines follow the filter: a tag selects a chip by its words (a deep link to
 /// `packages` lights the chip keyed `toolchain`) and the counts follow it; Problems admits
-/// warnings and errors only; a list of today alone carries no header. The not-saved note
-/// and the log folder appear only while true; an empty log is its head alone.
+/// warnings and errors only; a list of today alone carries no header.
 #[test]
 fn the_page_lines_follow_the_filter_and_the_hosts_facts() {
     let (c, desk) = page_lines_fixture();
@@ -1480,7 +1433,6 @@ fn the_page_lines_follow_the_filter_and_the_hosts_facts() {
     );
     let (_, entry) = read_page_line(&today[4]);
     assert_eq!(page_field(&entry, "when"), Some("10 min ago"));
-    // No filter admits nothing but says so.
     let none = crate::page::wire_lines(
         &page,
         &MessagesFilter {
@@ -1491,7 +1443,6 @@ fn the_page_lines_follow_the_filter_and_the_hosts_facts() {
     assert_eq!(none.len(), 4, "the head and the chips: {none:?}");
     assert!(none[0].contains("\tshown=0\tall=0\tproblems=0\tstatus=0 of 4"));
 
-    // The host's facts: the note and the folder only while true.
     assert!(!alab[0].contains("\tnote=") && !alab[0].contains("\tfolder="));
     let unsaved = MessagesState::of(
         &c,
@@ -1505,7 +1456,6 @@ fn the_page_lines_follow_the_filter_and_the_hosts_facts() {
     let (_, head) = read_page_line(&lines[0]);
     assert_eq!(page_field(&head, "note"), Some(NOT_SAVED));
     assert_eq!(page_field(&head, "folder"), Some("/logs\\aterm"));
-    // A host without the log file: `Open log` offered, not pressable.
     assert!(
         lines.contains(
             &"action\tid=3\tindex=0\tlabel=Open log\tactionable=0\tbutton=Open log\tprimary=0"
@@ -1513,7 +1463,6 @@ fn the_page_lines_follow_the_filter_and_the_hosts_facts() {
         )
     );
 
-    // An empty log: the head alone, and no count line.
     let fresh = center(Instant::now());
     let empty = crate::page::wire_lines(
         &MessagesState::of(&fresh, &Desk::default()),
@@ -1532,7 +1481,7 @@ fn the_page_lines_follow_the_filter_and_the_hosts_facts() {
 
 /// A word carrying the grammar's own separators (TAB, LF, CR, US, the escape's backslash)
 /// reads back whole and never splits a line or a field: a host hands the page words it did
-/// not post. Every line of a kind has its keys in the one fixed order.
+/// not post.
 #[test]
 fn any_word_survives_the_page_lines() {
     let hostile = "a\tb\nc\rd\u{1f}e\\f \\t";
@@ -1636,8 +1585,6 @@ fn any_word_survives_the_page_lines() {
     let (_, e) = &read[2];
     assert_eq!(page_field(e, "title"), Some(hostile));
     assert_eq!(page_field(e, "tag"), Some(hostile));
-    // Copy's text reads back byte for byte: one value whose line breaks ride the
-    // escaping's `\n`, never a US-joined list.
     let copy = entry.copy_text();
     assert!(
         ['\t', '\n', '\r', '\u{1f}', '\\']
@@ -1647,8 +1594,6 @@ fn any_word_survives_the_page_lines() {
     );
     assert_eq!(page_field(e, "copy"), Some(copy.as_str()));
     assert_eq!(page_field(e, "meta"), Some(&*entry.meta_words(NOW, 0)));
-    // Control: a US-joined list would have lost the title's US (`join_us` drops one
-    // inside a line).
     let as_list: Vec<String> = copy.split('\n').map(str::to_string).collect();
     assert_ne!(
         crate::log::split_us(&crate::log::join_us(&as_list)).join("\n"),
@@ -1667,7 +1612,6 @@ fn any_word_survives_the_page_lines() {
     assert_eq!(page_field(a, "button"), Some("Open\tlog\n"));
     assert_eq!(page_field(a, "index"), Some("3"));
     assert_eq!(page_field(a, "actionable"), Some("1"));
-    // The pop-up names a hostile chip whole.
     let under = crate::page::wire_lines(
         &page,
         &MessagesFilter {
@@ -1681,7 +1625,6 @@ fn any_word_survives_the_page_lines() {
         Some(&*format!("Tag: {}", tag_words(hostile)))
     );
     assert_eq!(page_field(&head, "all_tags_on"), Some("0"));
-    // Control: the same field unescaped would split the line.
     assert!(format!("title={hostile}").split('\t').count() > 1);
 }
 
@@ -1705,9 +1648,6 @@ fn copy_all_is_the_build_information_then_each_entrys_copy_text() {
         copy_all_text("", [&newer]),
         format!("\n\n{}", newer.copy_text())
     );
-    // The build information is taken verbatim: the macOS host's ends in a
-    // line break of its own (`about::provenance_text`), so its first entry
-    // follows two blank lines and the next one a single blank line.
     assert_eq!(
         copy_all_text("aterm\nversion: 0.70.0\n", [&newer, &older]),
         format!(
@@ -1786,7 +1726,6 @@ fn an_open_exception_offers_dismiss_and_the_first_of_several_dismiss_all() {
     let labels: Vec<&str> = open[0].actions.iter().map(|a| a.label).collect();
     assert_eq!(labels[1..], ["Dismiss", "Dismiss all"]);
 
-    // Filed: no dismiss button on the record.
     c.file_digest(stamp(NOW + 3_000), now);
     let after = MessagesState::of(&c, &Desk::default());
     assert!(after.entries.iter().all(|e| e.state != "review"));
@@ -1802,7 +1741,7 @@ fn an_open_exception_offers_dismiss_and_the_first_of_several_dismiss_all() {
 /// An open exception stands above every other record whatever its age, reads the entry's
 /// current words (a restatement is never logged), offers its buttons, and moves the
 /// projection's revision; the page's subtitle says the open items lead (it said "newest
-/// first" over an older open row). NEGATIVE CONTROL: with none open it says newest first.
+/// first" over an older open row).
 #[test]
 fn an_open_exception_stands_first_in_its_current_words() {
     use crate::exceptions::{Entry, Family};
@@ -1834,7 +1773,6 @@ fn an_open_exception_stands_first_in_its_current_words() {
         now,
     );
     assert_eq!(s.posted, 1);
-    // A newer plain record: the exception still stands above it.
     c.post(
         Message::new(tags::UPDATE, Severity::Info, "Checked for updates").hold(Hold::LogOnly),
         stamp(NOW + 1_000),
@@ -1848,8 +1786,6 @@ fn an_open_exception_stands_first_in_its_current_words() {
         "an open exception's buttons are offered"
     );
     assert!(before.entries[1..].iter().all(|e| e.state != "review"));
-    // A restatement changes the entry's words, never the record's: the page reads the
-    // entry's, and the projection's revision moves.
     let s = c.sync_digest(
         &prefix,
         vec![entry("Claude in tab 1 is still behind")],
@@ -1860,7 +1796,6 @@ fn an_open_exception_stands_first_in_its_current_words() {
     let after = MessagesState::of(&c, &Desk::default());
     assert_eq!(after.entries[0].title, "Claude in tab 1 is still behind");
     assert!(after.revision > before.revision);
-    // The page says the open items lead: the list is not newest first.
     assert_eq!(after.subtitle(), crate::page::SUBTITLE_OPEN_FIRST);
     let head = crate::page::wire_lines(&after, &MessagesFilter::default()).remove(0);
     assert!(
@@ -1870,7 +1805,6 @@ fn an_open_exception_stands_first_in_its_current_words() {
         )),
         "{head}"
     );
-    // NEGATIVE CONTROL: with none open the list is newest first, and says so.
     let mut plain = center(now);
     plain.post(
         Message::new(tags::UPDATE, Severity::Info, "Checked for updates").hold(Hold::LogOnly),
@@ -1883,9 +1817,7 @@ fn an_open_exception_stands_first_in_its_current_words() {
 
 /// The page's Primary: the first offered intent while a press can perform it (a pressable
 /// first decline keeps it), else the first later pressable intent that is no decline,
-/// else none. The controls tell the rule from its near misses: "first pressable" would
-/// promote `Skip version` past a dead `Upgrade now` (b), and "first non-decline" would take
-/// the Primary from a pressable first `Not now` (d).
+/// else none.
 #[test]
 fn the_primary_is_the_first_pressable_and_never_a_promoted_decline() {
     use crate::page::primary_index;
@@ -1897,7 +1829,6 @@ fn the_primary_is_the_first_pressable_and_never_a_promoted_decline() {
             declines,
         }
     };
-    // (a) The first offered intent, pressable, leads — whatever follows.
     assert_eq!(
         primary_index(&[
             act(0, "Upgrade now", true, false),
@@ -1906,8 +1837,6 @@ fn the_primary_is_the_first_pressable_and_never_a_promoted_decline() {
         ]),
         Some(0)
     );
-    // (b) A dead first hands the Primary to the first later pressable intent that is no
-    // decline: `Skip version` is passed over.
     assert_eq!(
         primary_index(&[
             act(0, "Upgrade now", false, false),
@@ -1916,7 +1845,6 @@ fn the_primary_is_the_first_pressable_and_never_a_promoted_decline() {
         ]),
         Some(2)
     );
-    // …and a dead later non-decline is passed over too.
     assert_eq!(
         primary_index(&[
             act(0, "Install now", false, false),
@@ -1925,7 +1853,6 @@ fn the_primary_is_the_first_pressable_and_never_a_promoted_decline() {
         ]),
         Some(2)
     );
-    // A dead first decline hands it on the same way.
     assert_eq!(
         primary_index(&[
             act(0, "Not now", false, true),
@@ -1933,7 +1860,6 @@ fn the_primary_is_the_first_pressable_and_never_a_promoted_decline() {
         ]),
         Some(1)
     );
-    // (c) Past a dead first, only declines left pressable: none leads.
     assert_eq!(
         primary_index(&[
             act(0, "Upgrade now", false, false),
@@ -1949,7 +1875,6 @@ fn the_primary_is_the_first_pressable_and_never_a_promoted_decline() {
         ]),
         None
     );
-    // (d) A first decline that is pressable keeps it: the reporter's order leads.
     assert_eq!(
         primary_index(&[
             act(0, "Not now", true, true),
@@ -1957,7 +1882,6 @@ fn the_primary_is_the_first_pressable_and_never_a_promoted_decline() {
         ]),
         Some(0)
     );
-    // Nothing pressable, and nothing offered: none.
     assert_eq!(
         primary_index(&[
             act(0, "Open log", false, false),
@@ -1969,9 +1893,7 @@ fn the_primary_is_the_first_pressable_and_never_a_promoted_decline() {
 }
 
 /// Each `action` line ends `primary=`, `1` on the entry's Primary alone
-/// ([`crate::page::primary_index`]), after every older key. Across entries: a dead first
-/// hands it to a later navigation; only declines left, none leads; a pressable first
-/// decline keeps it.
+/// ([`crate::page::primary_index`]), after every older key.
 #[test]
 fn the_action_lines_carry_the_primary_after_every_older_key() {
     let act = |index: u8, label: &'static str, still_actionable: bool, declines: bool| {
@@ -2022,8 +1944,6 @@ fn the_action_lines_carry_the_primary_after_every_older_key() {
         .map(String::as_str)
         .filter(|line| line.starts_with("action\t"))
         .collect();
-    // Read back as a page reads it: the lines' `primary=1` is the rule's pick,
-    // entry by entry.
     for entry in &page.entries {
         let picked: Vec<usize> = actions
             .iter()
@@ -2046,8 +1966,6 @@ fn the_action_lines_carry_the_primary_after_every_older_key() {
 
 /// `primary=` marks a position in the offered intents, not an `ActionIndex`: an intent
 /// whose moment passed is not offered, so the offered indices can start past 0 and skip.
-/// Here they differ: the first offered intent (`index=1`) leads, and past a dead
-/// `index=1` the pressable `index=2` does.
 #[test]
 fn the_primary_line_marks_a_position_in_the_offered_intents_not_an_action_index() {
     let act = |index: u8, label: &'static str, still_actionable: bool| MessageActionView {
@@ -2095,24 +2013,13 @@ fn the_primary_line_marks_a_position_in_the_offered_intents_not_an_action_index(
     );
 }
 
-/// A ZONE THAT MOVES ITS OFFSET MOVES THE PAGE'S WORDS THEN. The page is
-/// republished for its clock only when a time word moves
-/// ([`MessagesState::words_change_at`]), so that instant must never come late.
-/// Its words are read on the build's offset, and a zone that moves its offset
-/// (daylight saving) re-reads them all at that instant: an entry's local clock
-/// (`7:00 AM` becomes `8:00 AM`) and the midnight its day words turn at. A
-/// record from 2025-09-15 11:00 UTC says its weekday until Sep 22 00:00 at
-/// UTC-8; a zone that springs forward to UTC-7 at 03:30 UTC on Sep 22 owes
-/// the page its publish there, to the second, and one that moves after the
-/// midnight, or never, or cannot be read, keeps the midnight.
+/// A ZONE THAT MOVES ITS OFFSET MOVES THE PAGE'S WORDS THEN.
 #[test]
 fn a_zone_that_moves_its_offset_is_owed_a_publish_when_it_moves() {
     const HOUR_S: i64 = 3_600;
     let mut state = MessagesState::empty();
     state.now_unix_ms = NOW;
     state.utc_offset_s = -8 * HOUR_S;
-    // 6 d 4 h 53 min 20 s before NOW: its next spoken age (`7 days ago`) is
-    // after the midnight, so the midnight is the instant.
     let at = NOW - 536_000_000;
     state.entries = vec![entry_at(1, at)];
     let midnight = NOW + 58_000_000;
@@ -2130,7 +2037,6 @@ fn a_zone_that_moves_its_offset_is_owed_a_publish_when_it_moves() {
         Some(midnight),
         "a zone it cannot read"
     );
-    // Springing forward 4 h 30 min before the midnight.
     let moves_at = midnight - 16_200_000 + 337;
     let owed = state
         .words_change_at(zone(moves_at))
@@ -2144,9 +2050,6 @@ fn a_zone_that_moves_its_offset_is_owed_a_publish_when_it_moves() {
         words::local_words(owed - 1_000, at, -8 * HOUR_S),
         "the entry's local clock reads otherwise there"
     );
-    // A writer's clock far ahead of this one: the words themselves need not
-    // move for months. A pair of offset changes can end back at the build's
-    // offset before that word deadline, but its first change is still owed.
     const DAY_MS: u64 = 86_400_000;
     state.utc_offset_s = 0;
     let future = NOW + 400 * DAY_MS;
@@ -2169,8 +2072,6 @@ fn a_zone_that_moves_its_offset_is_owed_a_publish_when_it_moves() {
         words::local_words(NOW, future, 0),
         "the first offset change changes the future entry's local clock too"
     );
-    // No change in the first day: observe again then, rather than sleeping
-    // through a later pair just because their distant endpoint reads the same.
     let later_zone = |instant: u64| {
         Some(
             if (NOW + 30 * DAY_MS..NOW + 210 * DAY_MS).contains(&instant) {

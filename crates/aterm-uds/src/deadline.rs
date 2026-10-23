@@ -302,11 +302,84 @@ impl std::fmt::Display for RunError {
 impl std::error::Error for RunError {}
 
 /// The first sleep tick of an [`ExitWait`] with no exit descriptor, doubled up to
+/// [`POLL_MAX`] so a tool that takes tens of milliseconds is not rounded up to a fixed tick.
 const POLL_MIN: Duration = Duration::from_millis(1);
 const POLL_MAX: Duration = Duration::from_millis(25);
 
-/// How long [`output_until`] reads the streams after the child exits: a pipe still open past
+/// How long [`output_until`] reads the streams after the child exits: a pipe a descendant
+/// still holds open past it gives what it gave by then. Past it a drain reads on a pipe
+/// nothing else holds ([`Grace`]).
 const DRAIN_GRACE: Duration = Duration::from_millis(250);
+
+/// The bound on reading on past [`DRAIN_GRACE`] a pipe no writer holds: its end is a read
+/// away, so its reader waits on nothing but this process's scheduling (a test binary at full
+/// load left one unscheduled 650 ms and more, and `ps`'s line was lost).
+const SLOW_READER: Duration = Duration::from_secs(60);
+
+/// When a drain of an exited child's stream stops while the stream is open: at `by` while
+/// a descendant may hold its pipe ([`children::descendant_may_hold`]); past `by`, a pipe no
+/// writer holds is read to its end (bounded by [`SLOW_READER`]), and one only something
+/// outside the child's process group holds is read until `until`, the call's deadline. That
+/// holder is a child another thread of this process forked and has not exec'd yet, which
+/// lets go at its exec (a test binary at full load kept one past the grace, and `fish
+/// --version`'s line was refused), or a descendant that left the group.
+struct Grace {
+    by: Instant,
+    until: Instant,
+    /// The exited child's pid, which led its process group.
+    group: Option<u32>,
+}
+
+impl Grace {
+    /// A grace that ends at `by`, for a child whose group is not known.
+    #[cfg(test)]
+    fn at(by: Instant) -> Self {
+        Self {
+            by,
+            until: by,
+            group: None,
+        }
+    }
+
+    /// How much longer past `by` a drain waits for its stream's end, if at all.
+    fn read_on(&self, pipe: Option<&PipeEnd>) -> Option<Duration> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd as _;
+            let pipe = pipe?.as_fd();
+            if children::writers_gone(pipe) {
+                Some(SLOW_READER)
+            } else if children::descendant_may_hold(pipe, self.group) {
+                None
+            } else {
+                Some(self.until.saturating_duration_since(Instant::now()))
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            pipe.map(|pipe| match *pipe {})
+        }
+    }
+}
+
+/// A second descriptor on a child's pipe, which a drain asks past [`DRAIN_GRACE`] whether
+/// anything still holds the pipe open. Nothing asks off Unix.
+#[cfg(unix)]
+type PipeEnd = std::os::fd::OwnedFd;
+#[cfg(not(unix))]
+type PipeEnd = std::convert::Infallible;
+
+/// `stream`'s [`PipeEnd`].
+#[cfg(unix)]
+fn pipe_end(stream: &impl std::os::fd::AsFd) -> Option<PipeEnd> {
+    stream.as_fd().try_clone_to_owned().ok()
+}
+
+/// `stream`'s [`PipeEnd`].
+#[cfg(not(unix))]
+fn pipe_end<T>(_stream: &T) -> Option<PipeEnd> {
+    None
+}
 
 /// Maximum tail bytes retained per output stream by [`output_until`].
 pub const OUTPUT_KEEP: usize = 1024 * 1024;
@@ -342,6 +415,8 @@ pub fn output_until_from(
 }
 
 /// The most time [`output_while_progressing`] lets pass between two reads of its progress
+/// probe (a quarter of its window, when that is shorter): a stall is named within one tick of
+/// its window, and a probe that reads a file's length costs nothing at this rate.
 const PROGRESS_TICK: Duration = Duration::from_millis(100);
 
 /// Runs `cmd` while `progress()` keeps advancing at least once every `window`.
@@ -371,6 +446,9 @@ pub fn output_while_progressing(
 }
 
 /// The one child run behind [`output_until_from`] and [`output_while_progressing`]: each time
+/// the child is found still running, `left` says how long to wait for its exit before looking
+/// again, and zero ends the run (the group is killed and the child reaped,
+/// [`RunError::TimedOut`]).
 fn output_by(
     cmd: &mut Command,
     stdin: Stdio,
@@ -384,8 +462,14 @@ fn output_by(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(RunError::Spawn)?;
-    let stdout = child.stdout.take().map(|s| drain(s, "stdout"));
-    let stderr = child.stderr.take().map(|s| drain(s, "stderr"));
+    let stdout = child.stdout.take().map(|s| {
+        let pipe = pipe_end(&s);
+        drain(s, pipe, "stdout")
+    });
+    let stderr = child.stderr.take().map(|s| {
+        let pipe = pipe_end(&s);
+        drain(s, pipe, "stderr")
+    });
     let (stdout, stderr) = match (stdout.transpose(), stderr.transpose()) {
         (Ok(stdout), Ok(stderr)) => (stdout, stderr),
         (Err(e), _) | (_, Err(e)) => {
@@ -411,8 +495,12 @@ fn output_by(
             }
         }
     };
-    let by = Instant::now() + DRAIN_GRACE;
-    let collect = |drain: Option<Drain>| drain.map(|d| d.collect(by)).unwrap_or_default();
+    let grace = Grace {
+        by: Instant::now() + DRAIN_GRACE,
+        until: Instant::now() + left(),
+        group: Some(child.id()),
+    };
+    let collect = |drain: Option<Drain>| drain.map(|d| d.collect(&grace)).unwrap_or_default();
     Ok(Output {
         status,
         stdout: collect(stdout),
@@ -424,6 +512,7 @@ fn output_by(
 #[derive(Debug)]
 pub struct ExitWait {
     /// Readable once the child has exited; `None` without such a descriptor, or once it has
+    /// reported (it stays readable, and a child not yet reapable must not spin on it).
     #[cfg(unix)]
     fd: Option<std::os::fd::OwnedFd>,
     /// The fallback sleep, doubled up to [`POLL_MAX`].
@@ -480,6 +569,7 @@ impl ExitWait {
 }
 
 /// Kill (`SIGKILL`; on Unix the child's whole process group, which
+/// [`output_until`] made it lead) and reap.
 fn end(child: &mut Child) {
     #[cfg(unix)]
     children::kill_group(child);
@@ -489,6 +579,7 @@ fn end(child: &mut Child) {
 }
 
 /// Reap a killed `child` by `by`, waiting on its exit as the kernel reports
+/// it.
 fn reap_within(child: &mut Child, exit: Option<&mut ExitWait>, by: Instant) {
     let mut fallback;
     let exit = match exit {
@@ -589,24 +680,35 @@ impl Drop for Held {
 }
 
 /// One stream being read on a thread of its own: the tail so far, and a
+/// signal when the stream has ended.
 struct Drain {
     tail: Arc<Mutex<Vec<u8>>>,
     ended: mpsc::Receiver<()>,
+    pipe: Option<PipeEnd>,
 }
 
 impl Drain {
-    /// The tail, once the stream ends or at `by`, whichever is first.
-    fn collect(self, by: Instant) -> Vec<u8> {
-        let _ = self
+    /// The tail, once the stream ends or when `grace` stops it.
+    fn collect(self, grace: &Grace) -> Vec<u8> {
+        let ended = self
             .ended
-            .recv_timeout(by.saturating_duration_since(Instant::now()));
+            .recv_timeout(grace.by.saturating_duration_since(Instant::now()))
+            .is_ok();
+        if !ended && let Some(wait) = grace.read_on(self.pipe.as_ref()) {
+            let _ = self.ended.recv_timeout(wait);
+        }
         std::mem::take(&mut *self.tail.lock().unwrap_or_else(PoisonError::into_inner))
     }
 }
 
-/// Read `stream` to its end on a thread of its own, keeping the tail.
+/// Read `stream` to its end on a thread of its own, keeping the tail; `pipe` is its
+/// [`PipeEnd`].
 #[cfg(not(target_arch = "wasm32"))]
-fn drain(mut stream: impl Read + Send + 'static, which: &str) -> io::Result<Drain> {
+fn drain(
+    mut stream: impl Read + Send + 'static,
+    pipe: Option<PipeEnd>,
+    which: &str,
+) -> io::Result<Drain> {
     let tail = Arc::new(Mutex::new(Vec::new()));
     let theirs = Arc::clone(&tail);
     let (tx, ended) = mpsc::sync_channel(1);
@@ -627,7 +729,7 @@ fn drain(mut stream: impl Read + Send + 'static, which: &str) -> io::Result<Drai
             }
             let _ = tx.send(());
         })?;
-    Ok(Drain { tail, ended })
+    Ok(Drain { tail, ended, pipe })
 }
 
 #[cfg(test)]
@@ -644,6 +746,7 @@ mod tests {
     use super::{Gate, Refused};
 
     /// A copy's age is awake time since its exec when it is stamped, wall-clock time since its
+    /// directory changed when not, and a copy a program ran from goes at once.
     #[test]
     fn a_copy_ages_on_the_awake_clock_from_its_exec() {
         use super::{EXEC_STAMP, FIRST_EXEC_HANG, RAN, copy_wait_left_at, stamp_exec};
@@ -690,6 +793,124 @@ mod tests {
     const DEADLINE: Duration = Duration::from_millis(200);
     /// A wait for something that must happen: a hang detector, not a budget.
     const HANG: Duration = Duration::from_secs(60);
+
+    /// A reader that first waits for its release, as one the scheduler has not run yet.
+    #[cfg(unix)]
+    pub(super) struct Late<R> {
+        pub(super) held: mpsc::Receiver<()>,
+        pub(super) reader: R,
+    }
+
+    /// The pid of a child that led a process group of its own, exited and reaped: a group
+    /// nothing is left in.
+    #[cfg(unix)]
+    pub(super) fn an_empty_group() -> u32 {
+        let mut child = crate::spawnfd::command("/bin/sh")
+            .args(["-c", "exit 0"])
+            .process_group(0)
+            .spawn()
+            .expect("a child");
+        child.wait().expect("reaped");
+        child.id()
+    }
+
+    /// `pipe`'s writer writes `more` and closes a moment from now: a holder outside the
+    /// child's group letting go at its exec.
+    #[cfg(unix)]
+    pub(super) fn lets_go(mut writer: std::io::PipeWriter, more: &'static [u8]) {
+        use std::io::Write as _;
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = writer.write_all(more);
+        });
+    }
+
+    #[cfg(unix)]
+    impl<R: std::io::Read> std::io::Read for Late<R> {
+        fn read(&mut self, into: &mut [u8]) -> std::io::Result<usize> {
+            let _ = self.held.recv_timeout(HANG);
+            self.reader.read(into)
+        }
+    }
+
+    /// A pipe no writer holds is read to its end past the grace, however late its reader
+    /// runs: the grace is for a descendant holding the pipe open, and a reader a loaded
+    /// test binary left unscheduled lost `ps`'s one line. Negative control: a `collect`
+    /// that returns at `by` whatever the pipe gives returns nothing here.
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_no_writer_holds_is_read_to_its_end_past_the_grace() {
+        use std::io::Write as _;
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer
+            .write_all(b"Thu Oct 22 16:44:35 2026\n")
+            .expect("write");
+        drop(writer);
+        let pipe = super::pipe_end(&reader);
+        let (release, held) = mpsc::channel();
+        let drain = super::drain(Late { held, reader }, pipe, "late").expect("reader");
+        // An empty group: a child another test's thread forks meanwhile, holding a copy of
+        // the writer until its exec, is read past too.
+        let grace = super::Grace {
+            by: Instant::now(),
+            until: Instant::now() + HANG,
+            group: Some(an_empty_group()),
+        };
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = release.send(());
+        });
+        assert_eq!(drain.collect(&grace), b"Thu Oct 22 16:44:35 2026\n");
+    }
+
+    /// A pipe only something outside the exited child's group holds is read until it lets
+    /// go, within the call's deadline: a child another thread of this process forked holds
+    /// it until its exec, and a loaded test binary kept one past the grace. Negative
+    /// control: a drain that stops at `by` here returns at most `one `.
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_held_outside_the_childs_group_is_read_until_it_lets_go() {
+        use std::io::Write as _;
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(b"one ").expect("write");
+        let pipe = super::pipe_end(&reader);
+        let drain = super::drain(reader, pipe, "outside").expect("reader");
+        let grace = super::Grace {
+            by: Instant::now(),
+            until: Instant::now() + HANG,
+            group: Some(an_empty_group()),
+        };
+        lets_go(writer, b"two");
+        assert_eq!(drain.collect(&grace), b"one two");
+    }
+
+    /// CONTROL: a pipe held while the exited child's group still has a member (its
+    /// descendant) gives at `by` what it gave by then.
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_held_while_the_childs_group_lives_gives_what_it_gave_by_the_grace() {
+        let mut member = crate::spawnfd::command("/bin/sleep")
+            .arg("600")
+            .process_group(0)
+            .spawn()
+            .expect("a member of the group");
+        let (reader, writer) = std::io::pipe().expect("pipe");
+        let pipe = super::pipe_end(&reader);
+        let drain = super::drain(reader, pipe, "descendant").expect("reader");
+        let begun = Instant::now();
+        let grace = super::Grace {
+            by: Instant::now(),
+            until: Instant::now() + HANG,
+            group: Some(member.id()),
+        };
+        let got = drain.collect(&grace);
+        let waited = begun.elapsed();
+        let _ = member.kill();
+        let _ = member.wait();
+        drop(writer);
+        assert!(got.is_empty(), "{got:?}");
+        assert!(waited < HANG, "waited on a pipe a descendant holds");
+    }
 
     /// Work that reports, on a channel, whether it ever ran.
     fn witness() -> (impl FnOnce() + Send + 'static, mpsc::Receiver<()>) {
@@ -996,10 +1217,13 @@ mod tests {
     }
 
     /// The window the two progress tests hold a child to: short, so a stall is named in well
+    /// under a second.
     #[cfg(unix)]
     const WINDOW: Duration = Duration::from_millis(300);
 
     /// A child that keeps making progress outlives its window and answers: the probe's
+    /// reading moves every quarter window, and after three windows the probe drops the flag
+    /// the child waits for.
     #[cfg(unix)]
     #[test]
     fn a_child_that_keeps_making_progress_outlives_its_window() {
@@ -1032,6 +1256,9 @@ mod tests {
     }
 
     /// A child that stops making progress is killed, with its group, one whole window after
+    /// its LAST step, not one window after it started, and the probe's last reading names the
+    /// step it stopped after: the reading moves on each of the probe's first five looks and
+    /// never again, while the child sleeps for ten minutes.
     #[cfg(unix)]
     #[test]
     fn a_child_that_stops_making_progress_is_killed_one_window_after_its_last_step() {
@@ -1073,6 +1300,7 @@ mod tests {
     }
 
     /// The first child cannot finish until the third has run, which a one-after-another run
+    /// would reach only at the deadline.
     #[cfg(unix)]
     #[test]
     fn several_children_run_at_once_and_each_answers_for_itself() {
@@ -1112,6 +1340,7 @@ mod tests {
     }
 
     /// A child writing more than a pipe holds, on both streams, is drained while it runs and
+    /// keeps the tail past [`OUTPUT_KEEP`].
     #[cfg(unix)]
     #[test]
     fn a_child_writing_more_than_a_pipe_holds_is_drained_while_it_runs() {
@@ -1136,6 +1365,8 @@ mod tests {
     }
 
     /// At the deadline a running child is killed with its group and reaped within `reap`; the
+    /// others keep their own answers (a tool that could not start is a spawn error, not a
+    /// timeout).
     #[cfg(unix)]
     #[test]
     fn at_the_deadline_the_running_child_is_killed_and_reaped_and_the_rest_keep_their_answers() {
@@ -1172,6 +1403,9 @@ mod tests {
     }
 
     /// **A HELD CHILD RUNS ONLY ONCE RESUMED, TO ITS OUTPUT.** Held, the shell is exec'd and
+    /// stopped before its first instruction (`ps`: `T`) and has left no marker;
+    /// [`Held::output_until`] runs it to its status and both streams, as
+    /// [`output_until`] does from a spawn.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_held_child_runs_only_once_resumed_and_one_dropped_never_runs() {

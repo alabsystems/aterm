@@ -1,49 +1,18 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-// The anchor attributes' suite. The crate that mounts it imports the implementation
-// under test: aterm-spec-macros' tests/derive_and_attrs.rs the proc macros,
-// aterm-spec-anchor's tests/attrs.rs whatever that crate exports.
-
 use super::{refines, spec_unmodeled};
 
-// `spec_unmodeled` accepts `reason = ".."`; the item it annotates stays callable and
-// unmodified, and its waiver is among the records the collection test pins.
 #[spec_unmodeled(reason = "platform-specific fast path")]
 fn platform_fast_path() -> &'static str {
     "fast"
 }
-
-// ── EXECUTION EVIDENCE: the fn-entry probe `#[refines]` injects ──────────────
-//
-// The emitter no longer leaves the annotated fn untouched: it prepends
-// `::aterm_spec_anchor::xref::note_entered("<machine>::<action> @ <fn>")` to the body and
-// records that same id on the submitted `RefinementAnchor`. These tests pin the two
-// properties that make that safe to do to ~190 anchors across the tree: the
-// annotated function's BEHAVIOUR is unchanged for every awkward fn shape, and the
-// probe actually fires (so a gate can tell a live seam from a stub).
-//
-// Thread-locality is what makes the assertions below exact: each `#[test]` runs on
-// its own thread, so one test's entries are invisible to another even though the
-// harness runs them in parallel.
 
 use aterm_spec::xref::{
     entered_anchor_count, entered_anchor_ids, refinements, reset_entered_anchors, window_is_armed,
 };
 
 /// Open an evidence window, failing loudly if the reset did not take.
-///
-/// `reset_entered_anchors` returns whether the window is genuinely open precisely so
-/// this cannot be written as a bare call that silently no-ops: a no-op reset leaves
-/// the previous window's entries in place and every assertion below would pass on
-/// stale evidence.
-///
-/// The follow-up check reads `entered_anchor_count`, NOT
-/// `entered_anchor_ids().is_empty()`. The latter was vacuous here for the same reason
-/// it was vacuous in `StepEvidence::step`: `entered_anchor_ids` returns an empty set
-/// on a destroyed TLS slot and on an outstanding borrow, so the assertion held in
-/// exactly the two states it claimed to detect. `Some(0)` is an observation; `None`
-/// is a failure to observe, and fails.
 fn open_window() {
     assert!(
         reset_entered_anchors(),
@@ -211,12 +180,6 @@ fn a_const_fn_anchor_reports_itself_unprobed_rather_than_lying() {
 }
 
 /// THE NON-NESTING RULE, ENFORCED rather than documented.
-///
-/// `StepEvidence::step`'s exit disarms unconditionally, so a window opened INSIDE the
-/// drive closure closes the outer one early: the outer step then snapshots whatever
-/// the inner window recorded and is credited with it. That was a doc comment
-/// ("Windows MUST NOT NEST") with nothing behind it; the arm bit is now re-read after
-/// `drive` returns, so the fail-open is a panic.
 #[test]
 #[should_panic(expected = "was CLOSED while this step ran")]
 fn a_nested_window_panics_instead_of_lending_the_outer_step_its_evidence() {
@@ -228,15 +191,6 @@ fn a_nested_window_panics_instead_of_lending_the_outer_step_its_evidence() {
         });
     });
 }
-
-// ── COLLECTION: every record this file submits is collected exactly once ──────
-//
-// The emitters' records reach `aterm_spec::xref` through a constructor-section
-// registry that runs before `main`. A target where those constructors never run,
-// or a node linked twice, would not fail any test above that looks one anchor up
-// by name; it fails this one. The digest pins this file's records (it leaves
-// `location` out: editing this file moves line numbers, not records), so a change
-// to an anchor above changes it too.
 
 /// FNV-1a over the sorted records, so the whole collected set is pinned by one value.
 fn records_digest(rows: &[String]) -> String {

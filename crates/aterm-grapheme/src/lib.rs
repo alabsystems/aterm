@@ -26,6 +26,7 @@
 //! assert_eq!(info.grapheme_count, 5);
 //! assert_eq!(info.display_width, 5);
 //! ```
+//! use aterm_grapheme::{GraphemeInfo, grapheme_width};
 //!
 //! # Architecture
 //!

@@ -1,59 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `muse-upgrade [tag] [--keep]`: MUSE CODE'S LIVE UPGRADE, LIVE — its quiet
-//! flow (`[harness] upgrade_ask = false`, the default) on the real Muse Code
-//! under a private headless aterm with the harness ON, against the stub's Meta
-//! model API. A lab of its own (`muse-upgrade-<pid>` unless a tag is given).
-//!
-//! THE SCRATCH STORE. The instance's package prefix (`<scratch
-//! home>/Library/Application Support/aterm/pkg`, never the owner's) gets a
-//! store laid as atpkg lays one: `store/muse/<build>/bin/muse` (an APFS clone
-//! of the lab's build), its `<build>.vendor` record and `.ready`, the
-//! `store/muse/current` link, and the `agents/muse` twin that execs it. Muse
-//! Code runs THROUGH THE TWIN, so the process maps the store build and the
-//! harness reads its version off that build's record. A LANDING is atpkg's
-//! file operations in its order: a newer build's tree (a clone of the same
-//! bytes: only the record says it is newer), its record naming a higher
-//! revision-form version at that version's build id, `.ready`, `current`
-//! swapped by a rename, the twin rewritten by a rename to exec it — and then
-//! the ACTIVATION NOTICE atpkg publishes for a live-upgrade row (`muse` is one
-//! since this lane): Muse Code's OWN marker, `activation-notices/muse`
-//! (`atpkg::activation_notice::marker_name`), replaced by a rename (mode
-//! 0600), which the window's host watches for Muse Code's sessions alone. The
-//! host's own log line on it (`an activation notice for Muse Code`) is read as
-//! the proof it noticed.
-//!
-//! 1. **Idle.** Muse takes a turn (`remember the word …`); the build lands;
-//!    the Muse must be restarted onto the new build ON THE SAME SESSION: `ps`
-//!    argv names the new build's directory and `resume <session>`, the
-//!    session's `.session.lock` names the new pid, the ledger reads
-//!    `terminated` … `done:resumed` and NO `continued`, the stub gets no
-//!    request until the lab's own next turn, and that turn's request carries
-//!    the word (the prior turns came back).
-//! 2. **A backgrounded shell.** The stub's script calls `bash` with
-//!    `yield_time_ms` (the shell sent to the background, a `sleep`); a build
-//!    lands while it runs: the Muse must NOT be restarted while the shell runs
-//!    (its pid stands, no `terminated` row), and must be once it ended (the
-//!    `terminated` row after the shell's end), onto the newer build, its
-//!    session kept, nothing typed.
-//! 3. **A busy Muse** (stub mode `slow`): a build lands mid-turn; the Muse
-//!    must NOT be restarted while the turn runs, and must be after it ended.
-//! 4. **A continuously driven Muse** (`[harness] continue = true`, set live):
-//!    a turn of REAL WORK — the stub's answer held past the loop's two
-//!    minutes of busy work ([`LONG_TURN_MS`]), so the loop's turn-end policy
-//!    continues it at once, no short-turn back-off — and a build lands
-//!    mid-turn; at that turn's end the step's first look answers
-//!    `wait:turn-open` (the run's `terminal` comes after the screen reads
-//!    idle), which OWNS the point the loop would continue at, so the restart
-//!    is that turn end's own: no turn reaches the stub between the landing's
-//!    turn and the `terminated` row, and the Muse is restarted onto the newer
-//!    build, its session kept. (With the step's waits owning nothing, the
-//!    loop typed its continuation there and the Muse was busy again.)
-//!
-//! Claude Code's live upgrade is judged by its own tests: nothing of it runs
-//! here. The report names each fact as read. Exit 0 when every phase holds,
-//! 1 when one does not, 3 could not run.
+//! `muse-upgrade [tag] [--keep]`: MUSE CODE'S LIVE UPGRADE, LIVE — its quiet flow (`[harness] upgrade_ask = false`, the default) on the real Muse Code under a private headless aterm with the harness ON, against the stub's Meta model API.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -70,22 +18,17 @@ use crate::{Fail, LAB, Res};
 /// The word the first turn asks Muse Code to remember.
 pub const WORD: &str = "KESTREL-5151";
 
-/// How long phase 4's stub holds its answer: past the turn-end policy's two
-/// minutes of busy work (`TurnEndTiming::min_work`), so the turn is real work
-/// and the loop continues it at once.
+/// How long phase 4's stub holds its answer: past the turn-end policy's two minutes of busy work (`TurnEndTiming::min_work`), so the turn is real work and the loop continues it at once.
 pub const LONG_TURN_MS: i64 = 130_000;
 
-/// The host's line on Muse Code's own activation notice (`harness_host`'s
-/// activation wake).
+/// The host's line on Muse Code's own activation notice (`harness_host`'s activation wake).
 pub const NOTICED: &str = "an activation notice for Muse Code";
 
 fn could_not(m: &str) -> Fail {
     Fail::exit(3, format!("muse-upgrade: COULD NOT RUN: {m}"))
 }
 
-/// The store build id of a revision-form version `x.y.z-R<n>[.<s>]` (atpkg's
-/// `vendor_direct::version`: `2·10^18 + x·10^15 + y·10^12 + z·10^9 + n·10^3 +
-/// s'`, `s'` 0 without `.<s>`, else `s + 1`). `None` for any other spelling.
+/// The store build id of a revision-form version `x.y.z-R<n>[.<s>]` (atpkg's `vendor_direct::version`: `2·10^18 + x·10^15 + y·10^12 + z·10^9 + n·10^3 + s'`, `s'` 0 without `.<s>`, else `s + 1`).
 #[must_use]
 pub fn revision_build_id(version: &str) -> Option<u64> {
     let (plain, rev) = version.split_once("-R")?;
@@ -122,8 +65,7 @@ pub fn revision_build_id(version: &str) -> Option<u64> {
     )
 }
 
-/// `version` with its patch raised by `k` (`1.4.10-R6427.1` → `1.4.11-R6427.1`
-/// for 1): newer in atpkg's revision-aware order.
+/// `version` with its patch raised by `k` (`1.4.10-R6427.1` → `1.4.11-R6427.1` for 1): newer in atpkg's revision-aware order.
 #[must_use]
 pub fn bumped(version: &str, k: u64) -> Option<String> {
     let (plain, rev) = version.split_once("-R")?;
@@ -174,7 +116,7 @@ impl Store {
 
     /// LAND build `version` as atpkg lands one (the module's order): its
     /// tree, its record and `.ready`, `current` swapped, the twin rewritten,
-    /// and the activation notice published. Its program.
+    /// and the activation notice published.
     fn land(&self, version: &str) -> Result<PathBuf, String> {
         let id = revision_build_id(version).ok_or("no build id")?;
         let bin = self.bin(id);
@@ -198,7 +140,6 @@ impl Store {
         std::os::unix::fs::symlink(id.to_string(), &tmp).map_err(|e| format!("current: {e}"))?;
         let current = store.join("current");
         std::fs::rename(&tmp, &current).map_err(|e| format!("current: {e}"))?;
-        // The swap took: the link resolves to this build's directory.
         let resolved = std::fs::canonicalize(&current).map_err(|e| format!("current: {e}"))?;
         let build = bin
             .parent()
@@ -319,9 +260,7 @@ pub(crate) fn ledger(run: &Run, since_ms: i64) -> Vec<(i64, String, String)> {
     rows
 }
 
-/// The host's own upgrade steps that WAITED since `since_ms`, by its journal
-/// (`drive/*.journal.jsonl`: `HOST … upgrade step=wait:<why>`): `(ms, word)`.
-/// What held the restart where it was held: the gate's word at each look.
+/// The host's own upgrade steps that WAITED since `since_ms`, by its journal (`drive/*.journal.jsonl`: `HOST … upgrade step=wait:<why>`): `(ms, word)`.
 pub(crate) fn held_steps(run: &Run, since_ms: i64) -> Vec<(i64, String)> {
     let mut out: Vec<(i64, String)> = std::fs::read_dir(run.state().join("drive"))
         .into_iter()
@@ -377,16 +316,7 @@ const HELD_POLL: Duration = Duration::from_millis(500);
 /// restart killed it is never read as work that ended first.
 const STOOD_AFTER: Duration = Duration::from_millis(400);
 
-/// A RESTART HELD WHILE THE WORK RAN, AND NOT TAKEN WITH ITS END: `(held while
-/// it ran, when it was seen ended)`, looking every [`HELD_POLL`] for at most
-/// `polls` looks, the agent `pid`, the ledger since `since`. `running` says
-/// whether the work runs. A restart that kills the work ends it in the same
-/// moment — its processes go with the agent, its count leaves the footer with
-/// the agent's last frame — so each look asks FIRST whether the agent is gone
-/// (dead, or the `terminated` row written), and work seen ended counts only
-/// where the agent still stands [`STOOD_AFTER`] later: the restart came after
-/// the work's end, never with it. `(true, None)`: the work outlived the looks;
-/// `(false, None)`: the agent was ended first.
+/// A RESTART HELD WHILE THE WORK RAN, AND NOT TAKEN WITH ITS END: `(held while it ran, when it was seen ended)`, looking every [`HELD_POLL`] for at most `polls` looks, the agent `pid`, the ledger since `since`.
 pub(crate) fn held_while(
     run: &Run,
     pid: i32,
@@ -430,9 +360,7 @@ fn held_while_with(
     Ok((true, None))
 }
 
-/// The least time the lab's 40-second work (a `sleep 40` task, a subagent
-/// whose model call the stub holds 40 s) must be seen running from when it
-/// was first seen to its end: one that ended sooner did not run its course.
+/// The least time the lab's 40-second work (a `sleep 40` task, a subagent whose model call the stub holds 40 s) must be seen running from when it was first seen to its end: one that ended sooner did not run its course.
 pub(crate) const RAN_MS: i64 = 35_000;
 
 /// What one restart onto `build` looked like, read off the real thing.
@@ -462,7 +390,6 @@ fn moved_onto(
     let Some((pid, _, words)) = found else {
         return Ok(None);
     };
-    // The quiet carry is the next idle point's: its `done:resumed` row.
     let _ = wait_for(60, || {
         ledger(run, since)
             .iter()
@@ -485,8 +412,7 @@ pub(crate) fn show_rows(rows: &[(i64, String, String)]) {
     }
 }
 
-/// Whether `rows` say a quiet restart: `terminated`, `relaunched`, then
-/// `done:resumed`, and no `continued`.
+/// Whether `rows` say a quiet restart: `terminated`, `relaunched`, then `done:resumed`, and no `continued`.
 pub(crate) fn quiet(rows: &[(i64, String, String)]) -> bool {
     let has = |step: &str| rows.iter().any(|(_, s, _)| s == step);
     has("terminated")
@@ -506,7 +432,6 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         run.muse_ver, run.muse_bin, run.aterm
     );
     let mut failed = Vec::new();
-    // ---- the scratch store, as atpkg lays it, and the shell's environment
     let source_record = source
         .parent()
         .and_then(Path::parent)
@@ -563,7 +488,6 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         store.twin().display()
     );
 
-    // ---- launch through the twin, one turn
     let mut through = run.clone();
     through.muse_bin = store.twin().to_string_lossy().into_owned();
     crate::muse::launch(
@@ -600,7 +524,6 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
     println!("  launched  Muse pid {pid1} from {b1}, session {session}");
     door.await_idle(2000, 60)?;
 
-    // ---- 1. idle: restarted onto the new build, the session kept, nothing typed
     let turns_before = main_turns(&run);
     let t1 = now_ms();
     store
@@ -627,8 +550,6 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         return Ok(false);
     };
     show_rows(&m1.rows);
-    // An observation window for a continuation that must never come: one
-    // would be typed at the resumed Muse's first idle point, already passed.
     stop::sleep(Duration::from_secs(5))?;
     let silent = main_turns(&run) == turns_before;
     println!(
@@ -660,14 +581,11 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
     );
     door.await_idle(2000, 60)?;
 
-    // ---- 2. a backgrounded shell: held while it runs, restarted once it ended
     crate::verbs::set_tool(
         &run,
         r#"{"name":"bash","input":{"command":"echo lab-bg-start; sleep 40; echo lab-bg-end","description":"lab background wait","sandbox_permissions":"require_escalated","yield_time_ms":1000}}"#,
     )?;
     crate::verbs::turn(&door, "toolstart")?;
-    // The approval box the escalated shell raises (Muse Code's own, which the
-    // supervisor escalates to a person): approved, as a person would.
     let child = wait_for(30, || {
         if door.out(&["text"]).contains("Yes, proceed") {
             let _ = door.ctl(&["key", "1"]);
@@ -685,7 +603,6 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         child.is_some(),
         backgrounded.is_some()
     );
-    // While the shell runs: the same Muse, no restart.
     let (held_while_running, ended_at) =
         held_while(&run, m1.pid, t2, 120, || children(m1.pid) > 0)?;
     println!(
@@ -728,7 +645,6 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
     };
     door.await_idle(2000, 90)?;
 
-    // ---- 3. busy: not restarted mid-turn, restarted after it
     crate::verbs::set_mode(&run, "slow")?;
     crate::verbs::turn(&door, "a slow turn")?;
     let busy = door.seen("esc to interrupt", 30)?;
@@ -783,13 +699,9 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         return Ok(false);
     };
 
-    // ---- 4. continue on: the restart takes the turn end the loop would continue at
     crate::verbs::set_harness(&run, &[("continue".to_string(), "true".to_string())])?;
-    // The host reads the policy anew and its worker hands over to one under it.
     stop::sleep(Duration::from_secs(5))?;
     door.await_idle(2000, 90)?;
-    // A turn of real work: the stub holds its answer past the policy's two
-    // minutes, so the loop continues its end at once (no short-turn back-off).
     crate::verbs::set_custom_mode(
         &run,
         "lab-long-turn",
@@ -809,9 +721,6 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
         .land(&v5)
         .map_err(|e| could_not(&format!("landing {v5}: {e}")))?;
     println!("  driven    continue=true, the turn running={busy4}; landed {v5} at {b5}");
-    // The stub logs a turn when its reply is over: the landing's own turn is
-    // one, and a continuation typed at its end would be a second, over
-    // before the restart (which waits for an idle point).
     let mut turns_at_restart = None;
     let mut turn_end4 = None;
     for _ in 0..720 {
@@ -892,8 +801,6 @@ pub fn cmd_muse_upgrade(args: &[String]) -> Res {
     let mut u = crate::lab::UpOpts::from_env();
     u.trust = true;
     u.lifeline = !keep;
-    // No turn-end continuation of the supervisor's: nothing but the
-    // upgrade's own acts is judged, and the quiet flow types nothing.
     u.harness_keys = format!("{}\ncontinue = false", u.harness_keys);
     if let Err(f) = crate::lab::up(&tag, &u) {
         if let Some(m) = &f.msg {
@@ -946,35 +853,25 @@ mod tests {
 
     /// THE JUDGE OF A RESTART HELD WHILE WORK RAN: work seen ended while the
     /// agent still stands, and still stands a moment later, is held and ended
-    /// (`(true, Some)`). NEGATIVE CONTROLS — a restart that killed the work: the
-    /// agent gone at the very look the work reads ended (the restart's kill
-    /// took its processes and its footer with it), or gone at the confirming
-    /// look just after; the agent ended while the work ran; the work
-    /// outliving every look.
+    /// (`(true, Some)`).
     #[test]
     fn work_that_ends_with_the_agent_is_never_read_as_ended_first() {
-        // Ran, then ended; the agent stands at the look and after it.
         assert_eq!(
             judged(&[(false, true), (false, false), (false, true)]),
             (true, Some(1000))
         );
-        // The work reads ended at the look the agent is gone: killed with it.
         assert_eq!(judged(&[(false, true), (true, false)]), (false, None));
-        // Ended, but the agent gone at the confirming look: killed with it.
         assert_eq!(
             judged(&[(false, true), (false, false), (true, true)]),
             (false, None)
         );
-        // The agent ended while the work ran.
         assert_eq!(judged(&[(false, true), (true, true)]), (false, None));
-        // The work outlived every look.
         assert_eq!(judged(&[(false, true); 8]), (true, None));
     }
 
     /// The build id atpkg lays a revision-form version under, as its store
     /// holds them (the scratch-agents copy's `2001004010006427002` is
-    /// `1.4.10-R6427.1`). NEGATIVE CONTROLS: a plain `x.y.z`, a leading zero,
-    /// a component past its range.
+    /// `1.4.10-R6427.1`).
     #[test]
     fn a_revision_versions_build_id_is_atpkgs() {
         assert_eq!(

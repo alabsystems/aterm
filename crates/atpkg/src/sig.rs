@@ -60,6 +60,7 @@ pub enum Reject {
 }
 
 /// Translate the roster tier's verdict into atpkg's: one-to-one and total, with no catch-all,
+/// so a new [`RosterReject`] variant is a compile error here.
 #[inline]
 const fn from_roster(e: RosterReject) -> Reject {
     match e {
@@ -158,6 +159,7 @@ impl TrustedRoster {
     }
 
     /// Steps 8–9: verify one artifact's exact bytes under this roster's live machines;
+    /// revoked and expired ones leave the set before any crypto.
     fn authorize(&self, bytes: &[u8], sig: &[u8]) -> Result<Attribution, Reject> {
         self.roster
             .authorize_appcast(bytes, sig, self.now_unix)
@@ -448,6 +450,7 @@ impl Floor {
     }
 
     /// The advisory lock over [`Self::check_and_record`]'s critical section: `LOCK_EX` on a
+    /// sibling `<floor>.lock` (created `0600`), released on drop.
     fn acquire_file_lock(&self) -> Option<FileLock> {
         let name = self
             .path
@@ -459,11 +462,13 @@ impl Floor {
     }
 
     /// The recorded floor, or `0` if the file is missing or unparseable (fail-open only for
+    /// first contact, per §8).
     fn read_floor(&self) -> u64 {
         self.read_floor_reported().0
     }
 
     /// [`Self::read_floor`]'s value and its corruption verdict, for the caller that must
+    /// rewrite a corrupt file even when the value recorded advances nothing.
     fn read_floor_reported(&self) -> (u64, bool) {
         let (value, corrupt) = self.read_floor_classified();
         if corrupt {
@@ -478,6 +483,7 @@ impl Floor {
     }
 
     /// Whether the floor file is already published at the mode every reader needs
+    /// (`0644` — see [`Self::write`]).
     fn is_published(&self) -> bool {
         match std::fs::symlink_metadata(&self.path) {
             Ok(meta) => {
@@ -500,6 +506,8 @@ impl Floor {
     }
 
     /// Atomically publish `value` to the floor file: refuse a parent dir that is not private
+    /// (CWE-379: another local user could pre-create or swap the file), then write a sibling
+    /// `0600` temp, publish it `0644` and `rename` it over the target.
     fn write(&self, value: u64) -> io::Result<()> {
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
         let meta = std::fs::metadata(parent)?;
@@ -532,6 +540,7 @@ impl Floor {
     }
 
     /// Stage `value` into `tmp` (`0600`, durably synced), publish it `0644`, and `rename` it
+    /// over the floor.
     fn stage_and_publish(&self, tmp: &Path, value: u64) -> io::Result<()> {
         use std::io::Write as _;
 
@@ -599,6 +608,7 @@ mod tests {
     }
 
     /// The roster as it is published: emitted bytes + the paper master's detached
+    /// signature over exactly those bytes.
     fn published(r: &Roster, master_seed: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
         let bytes = r.to_toml().expect("a valid roster emits").into_bytes();
         let sig = sign(master_seed, &bytes);
@@ -635,6 +645,7 @@ mod tests {
     }
 
     /// An unarmed anchor authorizes nothing, not even a roster genuinely signed by a real
+    /// paper master, and refuses before any crypto.
     #[test]
     fn an_unarmed_anchor_is_inert_and_authorizes_nothing() {
         let unarmed = Anchor::of(vec![], 0);
@@ -682,6 +693,7 @@ mod tests {
     }
 
     /// An index signed by a machine not on the roster is refused, though the roster is
+    /// genuine and the signature valid.
     #[test]
     fn an_index_signed_by_a_machine_outside_the_roster_is_refused() {
         let anchor = armed(0);
@@ -700,6 +712,7 @@ mod tests {
     }
 
     /// A revoked machine is refused with its signature never checked: it leaves the candidate
+    /// set in `live()`, so the verdict is `Verify`, not `Revoked`.
     #[test]
     fn a_revoked_machine_is_refused_and_its_signature_is_never_verified() {
         let anchor = armed(0);
@@ -736,6 +749,7 @@ mod tests {
     }
 
     /// An expired machine ages out of the candidate set on its own schedule, with no
+    /// revocation and no master touch.
     #[test]
     fn an_expired_machine_leaves_the_candidate_set() {
         let anchor = armed(0);
@@ -752,6 +766,7 @@ mod tests {
     }
 
     /// A roster signed by a different master is refused under the pinned one, and the
+    /// chain never reaches a parse.
     #[test]
     fn a_roster_signed_by_the_wrong_master_is_refused() {
         let (bytes, sig) = published(&roster(), &OTHER_MASTER_SEED);
@@ -762,6 +777,7 @@ mod tests {
     }
 
     /// A one-byte edit anywhere in the roster is refused: no machine is added without the
+    /// paper master.
     #[test]
     fn a_tampered_roster_is_refused_byte_by_byte() {
         let (bytes, sig) = published(&roster(), &MASTER_SEED);
@@ -778,6 +794,7 @@ mod tests {
     }
 
     /// A rolled-back roster is refused once a newer generation is durably seen, though its
+    /// master signature still verifies.
     #[test]
     fn a_rolled_back_roster_is_refused_by_the_durable_floor() {
         let old = roster();
@@ -790,6 +807,7 @@ mod tests {
     }
 
     /// A lapsed roster is refused, and an unreadable `valid_until` counts as lapsed, not
+    /// absent.
     #[test]
     fn a_lapsed_or_unreadable_roster_window_is_refused() {
         let mut r = roster();
@@ -804,6 +822,7 @@ mod tests {
     }
 
     /// A roster from a format this build does not understand is refused rather than
+    /// misread, and the refusal is post-verify (so it is not a crypto oracle).
     #[test]
     fn a_newer_roster_schema_is_refused_not_misread() {
         let mut r = roster();
@@ -812,6 +831,8 @@ mod tests {
     }
 
     /// An anchor list of nothing but garbage is `BadKey`, never `Verify`: a broken keyset
+    /// must not be reported as "this roster's signature was bad", and must certainly not
+    /// be reported as success.
     #[test]
     fn a_keyset_of_pure_garbage_is_bad_key_not_a_bad_signature() {
         let (bytes, sig) = published(&roster(), &MASTER_SEED);
@@ -827,6 +848,7 @@ mod tests {
     }
 
     /// A one-byte edit anywhere in the index is refused, over the exact raw bytes with no
+    /// normalization: a trailing newline is a different document.
     #[test]
     fn a_tampered_index_is_refused_byte_by_byte() {
         let roster = admit(&armed(0), &roster()).unwrap();
@@ -852,6 +874,8 @@ mod tests {
     }
 
     /// The id bind, both directions: a signature cannot be relabelled as another machine, an
+    /// unattributed index is refused, and an index cannot claim a generation ahead of its
+    /// roster.
     #[test]
     fn the_index_must_name_the_machine_and_generation_that_actually_signed_it() {
         let roster = admit(&armed(0), &roster()).unwrap();
@@ -892,6 +916,8 @@ mod tests {
     }
 
     /// A signature of the wrong length is refused before the crypto, and an index whose
+    /// bytes verify but whose TOML is malformed or from a newer schema is a post-verify
+    /// refusal, not an oracle, since it is decided from authenticated bytes.
     #[test]
     fn cheap_local_gates_and_post_verify_parse_failures_both_fail_closed() {
         let roster = admit(&armed(0), &roster()).unwrap();
@@ -919,6 +945,8 @@ mod tests {
     }
 
     /// A genuine signature over bytes holding 0xFF verifies (a `from_utf8_lossy` first would
+    /// change the bytes), flipping that byte fails, and the parse refuses non-UTF-8 as
+    /// `Malformed` after the signature.
     #[test]
     fn raw_non_utf8_bytes_are_verified_without_lossy_conversion() {
         let roster = admit(&armed(0), &roster()).unwrap();
@@ -949,6 +977,7 @@ mod tests {
     }
 
     /// index_build below the recorded Floor ⇒ Rollback; a higher build advances the
+    /// durable floor (and the file is 0644, readable).
     #[test]
     fn high_water_floor_blocks_rollback_and_advances() {
         let dir = private_tmp_dir("floor");
@@ -972,6 +1001,7 @@ mod tests {
     }
 
     /// What a test runs inside the floor's locked window: between the read and the
+    /// compare → write of an advance, or before a re-base's write.
     type FloorAct = Box<dyn FnOnce(&Path)>;
 
     thread_local! {
@@ -987,6 +1017,7 @@ mod tests {
     }
 
     /// THE RATCHET IS READ AND ADVANCED UNDER ITS LOCK (CWE-362): inside the read →
+    /// compare → write window, a second opener of `<floor>.lock` cannot take it.
     #[cfg(unix)]
     #[test]
     fn the_floor_is_read_and_advanced_under_its_lock() {
@@ -1026,6 +1057,7 @@ mod tests {
     }
 
     /// A ratchet touch that advances nothing does not rewrite the file (on Apple targets a
+    /// rewrite costs two full drive flushes).
     #[cfg(unix)]
     #[test]
     fn an_unchanged_floor_is_not_rewritten() {
@@ -1091,6 +1123,8 @@ mod tests {
     }
 
     /// The build floor binds within its generation and a strictly newer one re-bases it, so
+    /// one machine publishing `index_build = u64::MAX` cannot put the store beyond the index
+    /// that revokes it.
     #[test]
     fn the_build_floor_binds_within_its_generation_and_is_rebased_by_a_newer_one() {
         let floor = BuildFloor {
@@ -1117,6 +1151,7 @@ mod tests {
     }
 
     /// The poisoned-floor scenario, end to end over the durable file: a machine drives the
+    /// floor to the u64 ceiling, and `rebase` — and only `rebase` — brings it back.
     #[test]
     fn rebase_is_the_only_way_a_floor_ever_comes_down() {
         let dir = private_tmp_dir("floor-rebase");
@@ -1133,6 +1168,8 @@ mod tests {
     }
 
     /// A floor file that exists but will not read as a floor is detected as corrupt and still
+    /// reads as `0`: refusing would let a same-uid scribbler wedge the store, and silent
+    /// first contact would reopen a rollback window unannounced.
     #[test]
     fn a_corrupt_floor_file_is_detected_and_still_reads_as_first_contact() {
         let dir = private_tmp_dir("floor-corrupt");
@@ -1166,6 +1203,7 @@ mod tests {
     }
 
     /// An advance that cannot persist keeps the accept but reports the lost advance: the next
+    /// run re-reads the old floor and accepts the same generation again.
     #[cfg(unix)]
     #[test]
     fn a_failed_floor_persist_keeps_the_accept_and_reports_the_lost_advance() {
@@ -1209,6 +1247,7 @@ mod tests {
     }
 
     /// A persist that fails after the temp exists removes the temp: nothing else sweeps
+    /// `<floor>.<pid>.tmp`, so a store that keeps refusing writes would collect one per pid.
     #[test]
     fn a_failed_floor_persist_removes_its_temp_file() {
         let dir = private_tmp_dir("floor-temp-litter");

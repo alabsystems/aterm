@@ -2,28 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm fabric mint-for|halt|inbox|post` — the person side of the fabric.
-//!
-//! ```text
-//! aterm fabric mint-for h-<name>|a-<name> [--out <cap>] [--fleet <F>] [--expires <N>d|<N>h]
-//! aterm fabric halt  --cap-file <cap> <reason>|off
-//! aterm fabric inbox --cap-file <cap> [--peek]
-//! aterm fabric post  --cap-file <cap> to=@<sid>@<node> kind=<k> [re=<off>] [--] <text>
-//! ```
-//!
-//! * **`mint-for`** ([`mint_for`]): mints [`crate::enable::person_grants`] for an `h-` human or
-//!   `a-` service under `<root>/mint.secret` (optional `--expires <N>d|<N>h` stamps `exp=`).
-//!   `--out` writes mode 0600 atomically, refusing symlinks or different existing caps; without
-//!   `--out`, cap lines go to stdout and guidance to stderr.
-//! * **`halt`**: publishes the retained row `/f/<F>/fleet/<person>/halt` (`state=on` or
-//!   `state=off`). Only an `h-` human may halt the fleet; every bridge holds its sessions
-//!   (`hold=1 origin=fleet`) while any human's halt is `on`.
-//! * **`inbox`**: reads `/f/<F>/in/p/<person>/>` through consumer group `/f/<F>/cur/p/<person>/inbox`
-//!   up to the broker head captured at start, then commits once past everything printed (`--peek`
-//!   commits nothing; an unprinted message leaves the cursor uncommitted).
-//! * **`post`**: publishes `/f/<F>/in/<node>/<sid>/<person>/<kind>` (`to=@<sid>@<node>`, since a
-//!   person has no bridge roster to resolve a bare `<sid>`).
-//! * **Sequence**: publishes use the wall-clock nanosecond timestamp below `ACK_SEQ_BASE` as the
-//!   producer sequence and fail if the broker reports `deduped`.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -40,9 +18,7 @@ use crate::fabric::IO_TIMEOUT;
 use crate::render::{safe, TEXT_CAP};
 use crate::transport::{self, Closer, Conn};
 
-/// The kinds a person may `post`. Not `ack` (a receipt is a recipient bridge's
-/// answer to `inbox seen`, carrying a verdict), not `control`, and not
-/// `expired`/`undeliverable` (a bridge RECORDS those).
+/// The kinds a person may `post`.
 pub const PERSON_KINDS: [&str; 5] = ["ask", "answer", "task", "report", "note"];
 
 /// What a person verb was asked to do.
@@ -80,12 +56,8 @@ pub struct PersonCmd {
 }
 
 /// Parse `aterm fabric <verb> …` for `verb` one of `halt`, `inbox`, `post`.
-/// `Ok(None)` is a request for help.
-///
 /// # Errors
-///
-/// An unknown flag, a flag without its value, no `--cap-file`, or the verb's
-/// own arguments missing or malformed.
+/// An unknown flag, a flag without its value, no `--cap-file`, or the verb's own arguments missing or malformed.
 pub fn parse(verb: &str, rest: &[String]) -> Result<Option<PersonCmd>, String> {
     let mut cap_files = Vec::new();
     let mut peek = false;
@@ -101,7 +73,6 @@ pub fn parse(verb: &str, rest: &[String]) -> Result<Option<PersonCmd>, String> {
                     .ok_or_else(|| "--cap-file needs a value".to_string())?,
             ),
             "--peek" if verb == "inbox" => peek = true,
-            // Everything after `--` is the message, flags and all.
             "--" if verb != "inbox" => {
                 literal_at = Some(words.len());
                 words.extend(it.by_ref().cloned());
@@ -204,8 +175,7 @@ fn parse_post(words: &[String], literal_at: Option<usize>) -> Result<Act, String
     })
 }
 
-/// Run one person verb against the broker `cfg` (the `[fabric] command`'s)
-/// names, as the person `cmd`'s cap files are minted for.
+/// Run one person verb against the broker `cfg` (the `[fabric] command`'s) names, as the person `cmd`'s cap files are minted for.
 #[must_use]
 pub fn main(verb: &str, cmd: &PersonCmd, cfg: &Config) -> ExitCode {
     let person = match person_of(&cmd.cap_files, &cfg.fleet) {
@@ -215,11 +185,6 @@ pub fn main(verb: &str, cmd: &PersonCmd, cfg: &Config) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    // ONLY A HUMAN HALTS THE FLEET: every bridge applies a halt row under an
-    // `h-` principal alone (§5.3), so a halt published as an `a-` service
-    // would hold nothing while this verb said the fleet was held. Its ring
-    // carries no halt grant ([`crate::enable::person_grants`]); this says so
-    // by name instead of as the broker's refusal.
     if matches!(cmd.act, Act::Halt(_)) && !person.starts_with("h-") {
         eprintln!(
             "aterm fabric {verb}: {} is not a human: only an `h-<name>` halts the fleet (every \
@@ -249,7 +214,6 @@ pub fn main(verb: &str, cmd: &PersonCmd, cfg: &Config) -> ExitCode {
     };
     match done {
         Ok(()) => ExitCode::SUCCESS,
-        // This side's stdout, not the broker: said without the broker's name.
         Err(e) if e.get_ref().is_some_and(|inner| inner.is::<Unprinted>()) => {
             eprintln!("aterm fabric {verb}: {e}");
             ExitCode::FAILURE
@@ -276,8 +240,7 @@ pub fn main(verb: &str, cmd: &PersonCmd, cfg: &Config) -> ExitCode {
 }
 
 /// An inbox whose mail stdout refused (the reader went away, a full disk): nothing is marked
-/// read, because the mail it could not print was not read. `peek`: a `--peek`, which marks
-/// nothing anyway, so the line does not say so.
+/// read, because the mail it could not print was not read.
 #[derive(Debug)]
 struct Unprinted {
     error: io::Error,
@@ -297,14 +260,9 @@ impl std::fmt::Display for Unprinted {
 
 impl std::error::Error for Unprinted {}
 
-/// The ONE person the cap files bind writes to, on `fleet`: the principal of
-/// every read-write grant whose principal is a person ([`is_person_id`]). A
-/// node's ring (node.cap passed by mistake) names no person.
-///
+/// The ONE person the cap files bind writes to, on `fleet`: the principal of every read-write grant whose principal is a person ([`is_person_id`]).
 /// # Errors
-///
-/// An unreadable cap file, no person's grant, grants for two persons, or a
-/// person's grant on another fleet.
+/// An unreadable cap file, no person's grant, grants for two persons, or a person's grant on another fleet.
 pub fn person_of(cap_files: &[String], fleet: &str) -> Result<String, String> {
     use astream_cap::{Grant, Mode};
     let mut people = BTreeSet::new();
@@ -466,9 +424,6 @@ fn inbox(
     let group = crate::subject::person_inbox_group(&cfg.fleet, person);
     let filter = crate::subject::person_mail_filter(&cfg.fleet, person);
     let (mut conn, closer) = connect_within(cfg, cmd, bounds.request)?;
-    // THE END OF THE MAIL IS THE BROKER'S MARK. A broker that sends none
-    // cannot say "that was all", and an inbox that waited for silence instead
-    // would be a timing guess.
     if !conn.idle_marks()? {
         return Err(io::Error::other(
             "this broker sends no catch-up mark, so it cannot say where the mail ends: it is an \
@@ -480,8 +435,6 @@ fn inbox(
     } else {
         inbox_log_identity(&mut conn)?
     };
-    // The head query (`max = 0`): the snapshot excludes records at this head,
-    // even if later appends keep the subscription continuously busy.
     let (_, (_, end)) = conn.fetch(0, &filter, 0)?;
     let offset = crate::fabric::local_offset();
     eprintln!(
@@ -495,8 +448,6 @@ fn inbox(
         }
     );
     let mut sub = conn.subscribe_group(&group, &filter)?;
-    // A broker that already answered and hung up leaves nothing to bound; its mail
-    // is still read below, and its close ends the inbox in words.
     closer.set_read_timeout(Some(bounds.subscription))?;
     let cap = cmd.cap_files.join(" --cap-file ");
     let mut count = 0usize;
@@ -511,7 +462,6 @@ fn inbox(
                 ))
             }
             Some(Event::Mark { next, .. }) if next >= end => break,
-            // A mark part-way through the scan: the broker is still reading.
             Some(Event::Mark { .. }) => {}
             Some(Event::Delivery {
                 offset: off,
@@ -543,7 +493,6 @@ fn inbox(
                 line.push_str("  text=");
                 line.push_str(&safe(&t.text, TEXT_CAP));
                 line.push('\n');
-                // The reply, spelled out, for the kinds that wait for one.
                 if matches!(t.kind.as_str(), "ask" | "task") && t.from.contains('@') {
                     line.push_str(&format!(
                         "    answer: aterm fabric post --cap-file {cap} to=@{} kind=answer \
@@ -551,8 +500,6 @@ fn inbox(
                         t.from
                     ));
                 }
-                // Read before it is marked read: a reader that went away (`| head -1`) has
-                // not read the rest, so this ends the inbox with nothing committed.
                 out.write_all(line.as_bytes())
                     .and_then(|()| out.flush())
                     .map_err(|error| io::Error::new(error.kind(), Unprinted { error, peek }))?;
@@ -560,9 +507,6 @@ fn inbox(
             }
         }
     }
-    // The subscription is done: end it (the closer's duplicate descriptor
-    // would otherwise hold it open), so the broker's tail is released before
-    // the commit, not when this process exits.
     drop(sub);
     closer.close();
     let read = if count == 0 {
@@ -574,8 +518,6 @@ fn inbox(
         eprintln!("{read}, left unread (--peek)");
         return Ok(());
     }
-    // COMMITTED AFTER IT WAS PRINTED, only through the captured head. A newer
-    // mark cannot include mail that arrived after this snapshot began.
     let Some(upto) = end.checked_sub(1) else {
         eprintln!("{read}");
         return Ok(());
@@ -599,7 +541,7 @@ fn inbox(
 }
 
 /// The identity answered on this connection's attach, or a fresh Hello for an
-/// unguarded connection. A retained witness from another connection proves none.
+/// unguarded connection.
 fn inbox_log_identity(conn: &mut Conn) -> io::Result<Option<astream_broker::LogIdentity>> {
     match conn.seen_log_identity() {
         Some(log) => Ok(Some(log)),
@@ -626,8 +568,6 @@ fn went_silent(e: io::Error, bound: Duration) -> io::Error {
     }
 }
 
-// mint-for
-
 /// `aterm fabric mint-for`'s flags.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MintForOpts {
@@ -637,23 +577,18 @@ pub struct MintForOpts {
     pub out: Option<String>,
     /// `--fleet <F>`: default this host's configured fleet.
     pub fleet: Option<String>,
-    /// `--expires <N>d|<N>h` ([`parse_lifetime`]), as milliseconds: every
-    /// grant is stamped `exp=<now + this>`, and the broker refuses the ring
-    /// from that instant on. `None` mints a ring that never expires.
+    /// `--expires <N>d|<N>h` ([`parse_lifetime`]), as milliseconds: every grant is stamped `exp=<now + this>`, and the broker refuses the ring from that instant on.
     pub expires: Option<u64>,
 }
 
-/// Whether `id` is a PERSON: an `h-` human or an `a-` agent holding its own cap
-/// (§3.2), the principals `mint-for` mints [`crate::enable::person_grants`] for.
+/// Whether `id` is a PERSON: an `h-` human or an `a-` agent holding its own cap (§3.2), the principals `mint-for` mints [`crate::enable::person_grants`] for.
 #[must_use]
 pub fn is_person_id(id: &str) -> bool {
     (id.starts_with("h-") || id.starts_with("a-")) && crate::subject::is_principal(id)
 }
 
 /// `--expires <N>d|<N>h`: a capability lifetime, as milliseconds.
-///
 /// # Errors
-///
 /// Anything but a positive whole number of days or hours, at most ten years.
 pub fn parse_lifetime(word: &str) -> Result<u64, String> {
     const HOUR_MS: u64 = 3_600_000;
@@ -685,8 +620,7 @@ pub fn parse_lifetime(word: &str) -> Result<u64, String> {
 
 /// `grant` with `exp=<exp_ms>` added to its prefix: `rw,p=<P>:` becomes
 /// `rw,p=<P>,exp=<ms>:` and `ro:` becomes `ro,exp=<ms>:` — the grammar
-/// astream-cap reads (`field := "p=" … | "exp=" …`). Every person grant has a
-/// prefix, and the mint re-parses, so a stamp that went wrong fails closed.
+/// astream-cap reads (`field := "p=" … | "exp=" …`).
 fn with_expiry(grant: &str, exp_ms: u64) -> String {
     grant.replacen(':', &format!(",exp={exp_ms}:"), 1)
 }
@@ -750,7 +684,6 @@ pub fn mint_for(opts: &MintForOpts) -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    // The secret, through the one reader (0600, 32+ bytes, its exact bytes).
     let secret_path = p.secret();
     let shown = secret_path.to_string_lossy().into_owned();
     let secret = match crate::transport::read_mint_secret(&shown) {
@@ -789,7 +722,6 @@ pub fn mint_for(opts: &MintForOpts) -> ExitCode {
     }
     let written = match &opts.out {
         None => {
-            // THE CAP IS THE ANSWER: one that did not reach stdout whole is no mint the
             // caller holds, so it is refused before the guidance below says "to stdout".
             if let Err(line) = cap_on_stdout(write_capability_to(&mut io::stdout(), &lines)) {
                 eprintln!("{line}");
@@ -805,8 +737,6 @@ pub fn mint_for(opts: &MintForOpts) -> ExitCode {
             }
         },
     };
-    // THE GUIDANCE, on stderr when the cap itself went to stdout, so a
-    // redirect captures exactly the cap's lines.
     let say = |line: String| {
         if written.is_some() {
             println!("{line}");
@@ -838,9 +768,7 @@ pub fn mint_for(opts: &MintForOpts) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Write a capability result completely and flush it. Unlike incidental diagnostic
-/// printing, every error (including a departed reader) prevents claiming delivery.
-///
+/// Write a capability result completely and flush it.
 /// # Errors
 /// Any write or flush failure; no partial result is certified as delivered.
 pub(crate) fn write_capability_to(out: &mut dyn io::Write, text: &str) -> io::Result<()> {
@@ -896,10 +824,7 @@ fn write_cap(path: &Path, lines: &str, secret: &Path) -> Result<PathBuf, String>
 }
 
 /// What a person does with the cap `mint-for <person>` just made: the
-/// commands, spelled with that cap. Only a human (`h-`) halts, and every node
-/// takes a human's task as a task; an `a-` service's ring has no halt grant,
-/// and its task is one only where `--accept-from` lists it (the bridge's
-/// `accepted`).
+/// commands, spelled with that cap.
 fn person_guidance(person: &str, fleet: &str, broker: &str, cap: &str) -> String {
     let human = person.starts_with("h-");
     let halt = if human {
@@ -930,9 +855,8 @@ fn person_guidance(person: &str, fleet: &str, broker: &str, cap: &str) -> String
 }
 
 /// Make `path` 0600 if it is not: `Ok(None)` when it already was, `Ok(Some(
-/// <old mode>))` when it was changed.
-///
 /// # Errors
+/// Any write or flush failure; no partial result is certified as delivered.
 ///
 /// The stat or the chmod.
 fn private_mode(path: &Path) -> io::Result<Option<u32>> {
@@ -1044,12 +968,12 @@ mod tests {
             }
         );
         for bad in [
-            "--cap-file c to=@s-a kind=note hi",     // no node
-            "--cap-file c to=s-a@n-b kind=note hi",  // no @
-            "--cap-file c to=@s-a@n-b kind=ack hi",  // a bridge's kind
-            "--cap-file c to=@s-a@n-b kind=note",    // no text
-            "--cap-file c kind=note hi",             // no address
-            "--cap-file c to=@s-a@n-b re=x note hi", // not an offset
+            "--cap-file c to=@s-a kind=note hi",
+            "--cap-file c to=s-a@n-b kind=note hi",
+            "--cap-file c to=@s-a@n-b kind=ack hi",
+            "--cap-file c to=@s-a@n-b kind=note",
+            "--cap-file c kind=note hi",
+            "--cap-file c to=@s-a@n-b re=x note hi",
         ] {
             assert!(parse("post", &words(bad)).is_err(), "{bad}");
         }
@@ -1212,9 +1136,7 @@ mod tests {
     }
 
     /// What an inbox waits on against a stand-in broker: every wait a hang
-    /// detector. The stand-in is a thread of this test binary, which a loaded
-    /// machine can starve for longer than an operator's bounds ([`LIVE`]), so
-    /// no wait on it is held to them.
+    /// detector.
     const STAND_IN: Bounds = Bounds {
         request: aterm_spec::wait::MUST_HAPPEN,
         subscription: aterm_spec::wait::MUST_HAPPEN,
@@ -1223,9 +1145,7 @@ mod tests {
     /// A stand-in broker for ONE `inbox` over `conns` connections, at astream's
     /// wire: the head query answers `end`, the group subscription is sent
     /// `tail` (nothing, for an empty one), and every `Commit` is recorded before
-    /// its ack, so once `inbox` returns the record is final. Its returned guard
-    /// cancels accept or an active connection and joins, including on assertion
-    /// unwind.
+    /// its ack, so once `inbox` returns the record is final.
     #[cfg(unix)]
     fn stand_in(
         end: u64,
@@ -1511,9 +1431,7 @@ mod tests {
 
     /// **A CATCH-UP IS READ TO ITS END, NOT TO THE FIRST MARK.** The broker
     /// marks part-way (`next=4`, below the head of 10 the inbox started at),
-    /// then delivers the mail at @7 and marks the end. The inbox prints the mail
-    /// and commits through @9 — the end mark's resume point. Read to the first
-    /// mark it said "no new mail" with mail at @7.
+    /// then delivers the mail at @7 and marks the end.
     #[cfg(unix)]
     #[test]
     fn an_inbox_reads_past_its_progress_marks() {
@@ -1564,16 +1482,7 @@ mod tests {
 
     /// **THE SUBSCRIPTION IS HELD TO ITS OWN BOUND, NOT A REQUEST'S.** A broker
     /// that takes the subscription and then says nothing: the read ends at the
-    /// subscription's bound, in words, with nothing marked read. Held to the
-    /// request's bound instead (two hang detectors here), the subscription
-    /// outlasts the hang detector, which is timed from the subscription's arrival
-    /// alone. That the operator's subscription bound outlasts a request's, so a
-    /// scan longer than a request is read to its end, is [`LIVE`]'s own assertion.
-    /// NOT COVERED: a subscription bound LONGER than the request's, held to the
-    /// shorter of the two (`min` at the `set_read_timeout`) — the live inbox's
-    /// failure. Run, it would wait out a request's bound, which against a stand-in
-    /// must be a hang detector ([`STAND_IN`]); `inbox`'s one `set_read_timeout`
-    /// line, which sets `bounds.subscription` alone, is what holds it.
+    /// subscription's bound, in words, with nothing marked read.
     #[cfg(unix)]
     #[test]
     fn an_inbox_subscription_is_held_to_its_own_bound() {
@@ -1601,7 +1510,7 @@ mod tests {
     /// NOTHING.** Ten records, none the person's: the cursor moves past them
     /// (through @9), so the next inbox does not scan them again — committed
     /// only after mail, an inbox re-scanned the whole bus since the person's
-    /// last message on every run. `--peek` opens no second connection.
+    /// last message on every run.
     #[cfg(unix)]
     #[test]
     fn an_inbox_with_no_new_mail_marks_what_it_scanned_and_peek_marks_nothing() {

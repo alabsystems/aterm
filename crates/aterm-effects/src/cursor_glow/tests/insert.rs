@@ -1,16 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Delivered inserts. A paste or drop reaches the seam as program output
-//! unless the host re-stamps it when the bytes land (enqueue is not
-//! delivery): the host's completed write arms `note_insert_delivered`, and
-//! the seam lays the echo as one sweep joining the cohort.
+//! Delivered-insert admission and placeholder-rewrite tests.
 
 use super::*;
 
 /// The hue walk's step from lit cell `a` to lit cell `b` of `row`: the
-/// continuity oracle. A cell that joined the cohort takes the stop its
-/// column has in it; a cold restart re-anchors at red instead.
+/// continuity oracle.
 fn walk_step(glow: &CursorGlow, row: u16, a: u16, b: u16) -> f32 {
     let at = |col: u16| {
         glow.v2
@@ -23,8 +19,7 @@ fn walk_step(glow: &CursorGlow, row: u16, a: u16, b: u16) -> f32 {
 /// The delivered insert, visible caret: after every stamp has gone stale, an
 /// 11-cell insert echoed as one hop `5 → 16` is licensed under the insert class
 /// and laid as one sweep joining the cohort (the walk steps evenly across
-/// `4 → 5`). It mints no momentum pulse or cue, and keys typed after it
-/// continue the walk.
+/// `4 → 5`).
 #[test]
 fn a_delivered_insert_lays_its_span_as_one_sweep_under_a_visible_caret() {
     let g = geom();
@@ -84,7 +79,6 @@ fn a_delivered_insert_lays_its_span_as_one_sweep_under_a_visible_caret() {
         0,
         "an insert is not typing: no click"
     );
-    // Two keys after the drop continue the walk from the new caret.
     for (i, col) in (17..=18u16).enumerate() {
         let key = at(800 + 100 * i as u64);
         glow.note_typed(key);
@@ -111,8 +105,6 @@ fn a_delivered_insert_lays_its_span_as_one_sweep_under_a_visible_caret() {
 /// The delivered insert, hidden caret (Claude Code's shape): the input
 /// row's print anchor advances 33 cells with the delivered stamp behind
 /// it, bounded by the insert's own width, not the typed coalesce cap.
-/// Licensed, laid `4..37`, the row is not branded, and the three typed
-/// echoes after it still anchor.
 #[test]
 fn a_delivered_insert_lights_a_hidden_caret_tui_at_its_print_anchor() {
     let g = geom();
@@ -131,8 +123,6 @@ fn a_delivered_insert_lights_a_hidden_caret_tui_at_its_print_anchor() {
     glow.observe_print_anchor(Some((11, 4, 3)));
     glow.tick(None, at(125), &c, g, &mut out);
     assert_eq!(glow.spawns(), 2, "phase-1 typed echoes must light");
-    // >250 ms quiet, then the drop: delivered 33 cells wide (the test grid is 40
-    // columns); the TUI echoes the path and the row's end advances 4 -> 37.
     glow.note_insert_delivered(at(420), InsertWidth::Cells(33));
     glow.observe_print_anchor(Some((11, 37, 4)));
     glow.tick(None, at(430), &c, g, &mut out);
@@ -173,13 +163,6 @@ fn a_delivered_insert_lights_a_hidden_caret_tui_at_its_print_anchor() {
 
 /// The placeholder rewrite: after the hidden-caret insert the TUI swaps the
 /// path for `[Image #1] ` and the row's end pulls back 37 -> 15 with no key.
-/// A keyless retreat inside the fresh insert span is the insert's own rewrite
-/// (`licence=rewrite`): the cells at and right of the new caret retract
-/// farthest-first (gone by `12·n + 240` ms plus the fade), the cells left of
-/// it keep their light, and keys after it continue the cohort. The visible-caret
-/// twin runs the same shape through `spawn`. Controls: a Backspace inside the
-/// span keeps its own class; a keyless retreat with no insert span declines and
-/// retires nothing.
 #[test]
 fn the_placeholder_rewrite_retracts_the_ribbon_to_the_new_caret_like_a_kill() {
     let g = geom();
@@ -188,7 +171,6 @@ fn the_placeholder_rewrite_retracts_the_ribbon_to_the_new_caret_like_a_kill() {
     let mut glow = CursorGlow::default();
     let mut out = Vec::new();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
-    // Hidden caret (the anchored lane).
     glow.tick(None, t0, &c, g, &mut out);
     glow.observe_print_anchor(Some((11, 2, 1)));
     glow.tick(None, at(16), &c, g, &mut out);
@@ -202,7 +184,6 @@ fn the_placeholder_rewrite_retracts_the_ribbon_to_the_new_caret_like_a_kill() {
     glow.observe_print_anchor(Some((11, 37, 4)));
     glow.tick(None, at(430), &c, g, &mut out);
     assert_eq!(glow.spawns(), 3, "the insert lights first");
-    // The rewrite: `> [Image #1] ` — the row's end is now 15, keyless.
     glow.observe_print_anchor(Some((11, 15, 5)));
     glow.tick(None, at(730), &c, g, &mut out);
     let last = glow.admission_log().last().expect("a ring row");
@@ -217,9 +198,6 @@ fn the_placeholder_rewrite_retracts_the_ribbon_to_the_new_caret_like_a_kill() {
         "the keyless retreat inside the insert span is the rewrite: {}",
         last.line(at(730))
     );
-    // Keys after the rewrite keep the cohort alive (one finger holds
-    // every cohort in its laying phase) while the retract completes:
-    // 12·22 + 240 = 504 ms of stagger, then the 240 ms fade.
     let mut key_ms = 800u64;
     let mut col = 15u16;
     let mut seq = 6u64;
@@ -250,7 +228,6 @@ fn the_placeholder_rewrite_retracts_the_ribbon_to_the_new_caret_like_a_kill() {
         "the hue continues across the rewrite into the keys after it"
     );
 
-    // Visible-caret twin through `spawn`.
     let mut vis = CursorGlow::default();
     let mut vout = Vec::new();
     three_visible_echoes(&mut vis, t0, &mut vout);
@@ -291,8 +268,6 @@ fn the_placeholder_rewrite_retracts_the_ribbon_to_the_new_caret_like_a_kill() {
         "nothing right of the retyped run survives the rewrite: {lit:?}"
     );
 
-    // Control 1: a Backspace inside the span is the erase's own retract,
-    // never a rewrite.
     let mut bs = CursorGlow::default();
     let mut bout = Vec::new();
     three_visible_echoes(&mut bs, t0, &mut bout);
@@ -308,8 +283,6 @@ fn the_placeholder_rewrite_retracts_the_ribbon_to_the_new_caret_like_a_kill() {
         last.line(at(808))
     );
 
-    // Control 2: a keyless retreat with no insert span behind it is
-    // program output — declined, and it retires nothing.
     let mut cold = CursorGlow::default();
     let mut cout = Vec::new();
     three_visible_echoes(&mut cold, t0, &mut cout);
@@ -329,14 +302,7 @@ fn the_placeholder_rewrite_retracts_the_ribbon_to_the_new_caret_like_a_kill() {
     );
 }
 
-/// The rewrite re-witnesses its row. The content witness retires a
-/// resident cell whose recorded glyph changed, and `[Image #1] ` is
-/// different text over the insert's first eleven cells. The engine's
-/// rewrite arm knows the rewrite is the insert's own, so it forgets the
-/// row's records left of the new caret: the next walk arms the
-/// placeholder's glyphs instead of retiring the cells under them, and the
-/// suffix's records fall out of the walk as its cells leave. A later
-/// re-lay of the row with other text still retires the placeholder's cells.
+/// The rewrite re-witnesses its row.
 #[test]
 fn the_placeholder_rewrite_re_witnesses_its_row_and_keeps_the_ribbon_whole() {
     let g = geom();
@@ -358,12 +324,10 @@ fn the_placeholder_rewrite_re_witnesses_its_row_and_keeps_the_ribbon_whole() {
         }
         row
     };
-    // The witness sees the path laid, and arms every cell of it.
     let with_path = row_of(&format!("  abc{path}"));
     vis.observe_ribbon_row(3, &with_path);
     vis.tick(Some((3, 37)), at(740), &c, g, &mut out);
     assert_eq!(v2_cols(&vis, 3), (2..37u16).collect());
-    // The program swaps the path for `[Image #1] `: the rewrite.
     let with_placeholder = row_of("  abc[Image #1] ");
     vis.observe_ribbon_row(3, &with_placeholder);
     vis.tick(Some((3, 16)), at(1020), &c, g, &mut out);
@@ -379,8 +343,6 @@ fn the_placeholder_rewrite_re_witnesses_its_row_and_keeps_the_ribbon_whole() {
         0,
         "the rewrite's own placeholder retires nothing"
     );
-    // 280 ms on, the row re-sampled: the cells under the placeholder
-    // keep their light; the suffix drains as a kill.
     vis.observe_ribbon_row(3, &with_placeholder);
     vis.tick(Some((3, 16)), at(1300), &c, g, &mut out);
     let lit = v2_cols(&vis, 3);
@@ -390,8 +352,6 @@ fn the_placeholder_rewrite_re_witnesses_its_row_and_keeps_the_ribbon_whole() {
         dark_in(&vis, 3, 2..16)
     );
     assert_eq!(vis.v2_status().map_or(0, |s| s.retired), 0);
-    // The next key joins the cohort: one continuous walk across the
-    // placeholder, no hole.
     vis.note_typed(at(1400));
     let mut typed = with_placeholder.clone();
     typed[16] = 'a';
@@ -407,10 +367,6 @@ fn the_placeholder_rewrite_re_witnesses_its_row_and_keeps_the_ribbon_whole() {
         (walk_step(&vis, 3, 15, 16) - step).abs() < 1e-4,
         "the hue continues across the placeholder into the key after it"
     );
-    // A re-lay with other text under one cell of the placeholder is not a
-    // retirement (`Witness::shape_verdicts`): a change strictly inside a
-    // standing run is not evidence, so the light stays whole and the record
-    // takes the glyph standing there now.
     let mut other = typed.clone();
     other[12] = '2';
     vis.observe_ribbon_row(3, &other);
@@ -425,9 +381,6 @@ fn the_placeholder_rewrite_re_witnesses_its_row_and_keeps_the_ribbon_whole() {
         (2..17u16).all(|col| lit.contains(&col)),
         "the band is whole across the changed glyph and the run's spaces: {lit:?}"
     );
-    // The witness was re-armed, not disarmed: a re-lay that reaches the
-    // run's end (its last recorded cell, the key typed after the
-    // placeholder) is a suffix and still retires.
     let mut tail = other.clone();
     tail[16] = 'Z';
     vis.observe_ribbon_row(3, &tail);
@@ -445,10 +398,7 @@ fn the_placeholder_rewrite_re_witnesses_its_row_and_keeps_the_ribbon_whole() {
 }
 
 /// Control: the same two hops with no delivery stamp behind them (a
-/// program flood exactly the insert's width) decline. Visible:
-/// `no-fresh-hint`; hidden: no ring row, `spawns` frozen. To the PTY
-/// stream a flood and a paste are the same bytes; the delivery is the only
-/// discriminator.
+/// program flood exactly the insert's width) decline.
 #[test]
 fn a_program_flood_of_the_inserts_width_with_no_delivery_stamp_still_declines() {
     let g = geom();
@@ -574,10 +524,6 @@ fn a_delivered_insert_brands_no_row() {
 /// established, a spinner row's first advance inside the delivery window
 /// is refused, spends nothing, and the licence survives for the input
 /// row's own echo.
-///
-/// Timed so row identity is the only refusal: the spinner is judged 365 ms
-/// after the input row's echo, past `TYPE_HINT_FRESH` (0.25 s), so an
-/// `insert_row_identity` that answers `true` fails at `spawns == 1`.
 #[test]
 fn a_delivered_insert_is_inert_for_a_program_row() {
     let g = geom();
@@ -596,8 +542,6 @@ fn a_delivered_insert_is_inert_for_a_program_row() {
     glow.tick(None, at(245), &c, g, &mut out);
     assert_eq!(glow.spawns(), 1, "the input echo establishes the row");
     glow.note_insert_delivered(at(600), InsertWidth::Cells(11));
-    // The spinner's first-ever advance, inside the window and past the
-    // spoken-for hold: only the row law can refuse it.
     glow.observe_print_anchor(Some((10, 20, 4)));
     glow.tick(None, at(610), &c, g, &mut out);
     let spinner_spends = glow
@@ -608,7 +552,6 @@ fn a_delivered_insert_is_inert_for_a_program_row() {
         .count();
     assert_eq!(spinner_spends, 0, "a program row cannot spend the insert");
     assert_eq!(glow.spawns(), 1);
-    // The input row's own echo spends it.
     glow.observe_print_anchor(Some((12, 14, 5)));
     glow.tick(None, at(620), &c, g, &mut out);
     assert_eq!(glow.spawns(), 2, "the licence survived for the input row");
@@ -661,9 +604,7 @@ fn a_delivered_insert_survives_a_hidden_boundary_while_fresh_and_is_revoked_at_i
 }
 
 /// An insert and a key delivered in one frame: the 12-cell hop is the
-/// 11-cell insert plus the key's own glyph. The surplus is paid from the
-/// press ring (one credit spent, its stamp consumed), all twelve cells
-/// are lit, and the same stamps cannot fund a 13-cell hop.
+/// 11-cell insert plus the key's own glyph.
 #[test]
 fn an_insert_and_a_key_in_one_frame_pay_the_surplus_from_the_press() {
     let g = geom();
@@ -691,8 +632,6 @@ fn an_insert_and_a_key_in_one_frame_pay_the_surplus_from_the_press() {
         0,
         "the key's credit was spent on the surplus"
     );
-    // The key's stamp went with its credit: a program advance after the
-    // hop finds no licence.
     glow.tick(Some((3, 15)), at(130), &c, g, &mut out);
     assert_eq!(glow.spawns(), 1, "the spent press licenses no later hop");
 
@@ -782,8 +721,7 @@ fn a_delivered_insert_mints_nothing_in_every_other_style() {
 /// A receipt that lands after the frame that observed the echo (a
 /// preempted writer thread) still lights the insert: the refused hop of
 /// exactly the insert's width is remembered for one delivery and laid
-/// when the stamp arrives — both lanes. A hop of another width is not
-/// the insert's and stays dark.
+/// when the stamp arrives — both lanes.
 #[test]
 fn a_receipt_that_lands_after_the_echoing_frame_still_lights_the_insert() {
     let g = geom();
@@ -881,11 +819,7 @@ fn line_break_paste(width: InsertWidth, to: (u16, u16)) -> (CursorGlow, Vec<Stri
 /// caret going from `(3, 5)` down to the next row's start `(4, 2)`: the line is
 /// laid as the insert's one sweep `5 → 16` on its own row, the rest of the move
 /// is judged from the line's end as any other (nothing licenses a row change
-/// here), and the keys typed on the new line lay there. The review's lab (2026-10-20) left such a link dark on Claude
-/// Code's composer, a multi-line body of unknown width whose echo crossed a
-/// row. A host that swallows the break echoes the line alone, on its row. The
-/// controls: the same frame priced unknown lays nothing on the line, and a
-/// landing two rows down (not the break's new line) lays nothing either.
+/// here), and the keys typed on the new line lay there.
 #[test]
 fn a_line_pasted_with_its_line_break_lays_the_line_on_its_own_row() {
     let (mut glow, rows) = line_break_paste(InsertWidth::Line(11), (4, 2));

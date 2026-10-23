@@ -1,38 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHERE THE SPACE IS: the Disk lens's read-only survey
-//! (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §7.4).
-//!
-//! When the Disk lens opens ([`crate::App::disk_lens_opened`]) and no survey
-//! started in the last hour (on the wall clock as well as the monotonic one,
-//! so time asleep counts), a thread of its own, at a low QoS and never the
-//! loop's or the vitals probe's, finds the build directories under `$HOME`,
-//! the open panes' working directories and the agents' `CARGO_TARGET_DIR`s
-//! (`aterm_agent::harness::disk::discover::discover` at the shipped bounds,
-//! which never enters `HOME_SKIP`'s guarded folders) within half its 20 s
-//! budget, then sizes them
-//! (`aterm_agent::harness::disk::target::total_bytes_until`) until the budget
-//! is spent. Three or more that sit in one folder under `$HOME` make one row
-//! (`~/aterm-worktrees, 9 target folders`), and the largest eight rows are
-//! kept as the deck's `Hog`s. A size its walk cut short is a floor
-//! (`partial`, printed "≥ 96 GB"); a survey whose search or sizing ran out of
-//! time says so (`cut`).
-//!
-//! A working directory or build directory is a root only where its spelling
-//! alone places it on `$HOME`'s own local volume and outside every place
-//! never looked into ([`roots`]): a path on a removable or network volume, or
-//! in a privacy-guarded folder, is never looked at, not even resolved, since
-//! the look can raise a consent dialog on the owner's screen or block on a
-//! stalled mount.
-//!
-//! It only reads: nothing is removed, and it runs whether or not the harness
-//! is on. It is not the disk watch, so its walks beat nothing
-//! (`aterm_agent::harness::disk::beat::quietly`): a stalled watch is not read
-//! as alive while a survey runs. The vitals probe copies the rows, and whether
-//! a survey runs, into each reading's `DiskFacts` ([`Where::read`]); a cleanup
-//! pass's own hog list wins unless the survey is newer and whole
-//! (`crate::vitals_host`).
+//! Background read-only disk-space survey for the Disk stats lens.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -42,21 +11,20 @@ use aterm_agent::harness::disk::discover::{self, Budget, Origin, Roots, checkout
 use aterm_sysprobe::volumes::Table;
 use aterm_vitals::model::Hog;
 
-/// A survey starts at most once an hour.
+/// Minimum interval between disk surveys.
 pub(crate) const EVERY: Duration = Duration::from_secs(3600);
-/// What one survey may spend, finding and sizing together.
+/// Total wall-clock budget for discovering and sizing build directories.
 pub(crate) const BUDGET: Duration = Duration::from_secs(20);
 /// What finding may spend of it: the rest is the sizing's.
 const FIND_BUDGET: Duration = Duration::from_secs(10);
-/// The rows kept.
+/// Maximum number of largest build-directory rows retained.
 pub(crate) const ROWS: usize = 8;
 /// Build directories sharing a folder under `$HOME` that print as one row.
 const GROUP_AT: usize = 3;
-/// The survey thread's name.
+/// Survey worker thread name.
 pub(crate) const THREAD: &str = "aterm-disk-where";
 
-/// What a survey found: its rows, largest first, when it ended, and whether
-/// it ran out of time.
+/// Completed disk survey results.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Found {
     /// The rows, at most [`ROWS`].
@@ -78,9 +46,7 @@ struct State {
     started: Option<(Instant, Option<i64>)>,
 }
 
-/// The survey's slot: the loop claims it to start one, the survey's thread
-/// leaves its rows in it, and the vitals probe reads them. Its lock is a
-/// leaf, held only to copy.
+/// Shared slot holding the latest disk survey results and running flag.
 #[derive(Debug, Default)]
 pub(crate) struct Where {
     state: Mutex<State>,
@@ -93,8 +59,7 @@ impl Where {
 
     /// Claim a survey at `now` (`wall_ms` on the wall clock, where read):
     /// true, and running from now, when none runs and none started within
-    /// [`EVERY`] of `now` on either clock. The monotonic clock stands still
-    /// while the Mac sleeps; the wall clock counts the night.
+    /// [`EVERY`] of `now` on either clock.
     fn claim(&self, now: Instant, wall_ms: Option<i64>) -> bool {
         let mut s = self.lock();
         let every_ms = EVERY.as_millis() as i64;
@@ -112,7 +77,7 @@ impl Where {
         true
     }
 
-    /// The last survey's rows, and whether one runs now.
+    /// Return the latest survey results and whether a survey is currently running.
     pub(crate) fn read(&self) -> (Option<Found>, bool) {
         let s = self.lock();
         (s.last.clone(), s.running)
@@ -136,10 +101,7 @@ impl Drop for Running {
     }
 }
 
-/// Where a survey looks, as the loop knows it: `$HOME`, and the processes
-/// whose working directories and `CARGO_TARGET_DIR`s it reads on its own
-/// thread (a process's directory and environment are the kernel's to read,
-/// never the loop's).
+/// Root paths and process PIDs inspected by a disk survey.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Ask {
     /// `$HOME`.
@@ -151,11 +113,8 @@ pub(crate) struct Ask {
     pub(crate) agents: Vec<u32>,
 }
 
-/// Start a survey of `ask` on its own thread at `now`, unless one runs or
-/// one started within the hour. Whether one started.
+/// Start a background disk survey on a dedicated thread if none is running or ran within [`EVERY`].
 pub(crate) fn start(slot: &Arc<Where>, ask: Ask, now: Instant, wall_ms: Option<i64>) -> bool {
-    // A unit test's App opens the Disk lens too: its survey finds nothing
-    // rather than walking the developer's home.
     start_with(slot, (now, wall_ms), move || {
         if cfg!(test) {
             Found::default()
@@ -176,8 +135,6 @@ fn start_with(
     if !slot.claim(now, wall_ms) {
         return None;
     }
-    // Below the loop and the probe: it is useful work nobody is blocked on,
-    // and the lens shows the last rows while it runs.
     let spawned = crate::qos::spawn_lane_thread(THREAD, crate::qos::Role::Background, {
         let slot = Arc::clone(slot);
         move || {
@@ -188,8 +145,6 @@ fn start_with(
     match spawned {
         Ok(handle) => Some(handle),
         Err(error) => {
-            // No thread, no guard: the claim ends here. The hour stands, so
-            // a machine out of threads is not asked again at every open.
             aterm_log::warn!("disk survey: the survey thread did not start: {error}");
             slot.lock().running = false;
             None
@@ -204,8 +159,6 @@ fn survey(ask: &Ask) -> Found {
     aterm_agent::harness::disk::beat::quietly(|| {
         let deadline = Instant::now() + BUDGET;
         let table = aterm_sysprobe::volumes::table();
-        // Admit the spelling before resolving it: a remote or unknown
-        // HOME must not become the walk's measured device by being read.
         let home = ask
             .home
             .as_deref()
@@ -253,7 +206,6 @@ fn survey(ask: &Ask) -> Found {
                 );
                 (hogs, spent || found.cut.is_some())
             }
-            // An unread or unplaced HOME is not a completed empty survey.
             None => {
                 return Found {
                     cut: true,
@@ -272,9 +224,7 @@ fn survey(ask: &Ask) -> Found {
 /// Where the survey looks under `home` (canonical): its checkouts, the
 /// working directories `cwds` and the build directories `targets`, each only
 /// where its spelling places it ([`placed`]), on `home`'s device, never
-/// entering a mount point of `table`. No Claude Code scratch root: the
-/// survey reports the folders a person keeps. `device` was read only after
-/// home admission; an unplaced home gives no roots. This helper reads no path.
+/// entering a mount point of `table`.
 fn roots(
     home: &Path,
     cwds: Vec<PathBuf>,
@@ -300,9 +250,7 @@ fn roots(
 /// looked at, not even to resolve it): absolute, outside every place never
 /// looked into ([`checkout::never_looked_at`]: `home`'s privacy-guarded
 /// folders, where removable volumes mount), and on the mount `home` is on in
-/// a complete `table`, one on a local device and not automounted. A path on
-/// another volume (a USB disk, a network share, an automount) can raise a
-/// consent dialog or block on a stalled server at the first look.
+/// a complete `table`, one on a local device and not automounted.
 fn placed(path: &Path, home: &Path, table: &Table) -> bool {
     use aterm_sysprobe::volumes::mount_of;
     let local =
@@ -395,7 +343,7 @@ fn remedy(origin: &Origin) -> &'static str {
     }
 }
 
-/// `path` as the lens prints it: `~/aterm/target` under `home`, else whole.
+/// Format `path` for display (`~/…` when under `home`, else full path).
 pub(crate) fn shown(path: &Path, home: &Path) -> String {
     match path.strip_prefix(home) {
         Ok(rel) if !rel.as_os_str().is_empty() => format!("~/{}", rel.display()),
@@ -449,8 +397,7 @@ mod tests {
     /// T-G15: at most one survey an hour on either clock, and never while
     /// one runs; each runs on its own thread, never the caller's (the loop)
     /// or the vitals probe's; and a survey that ends, or panics, frees the
-    /// slot. An hour asleep counts: the wall clock went on while the
-    /// monotonic one stood still.
+    /// slot.
     #[test]
     fn a_survey_runs_on_its_own_thread_at_most_hourly() {
         let slot = Arc::new(Where::default());
@@ -473,21 +420,16 @@ mod tests {
             }
         })
         .expect("the first survey starts");
-        // Claimed until its thread ends: a second open starts nothing.
         assert!(start_with(&slot, (t0, Some(w0)), Found::default).is_none());
         handle.join().expect("the survey's assertions held");
         let (last, running) = slot.read();
         assert!(!running);
         assert_eq!(last.expect("its rows").hogs[0].path, "~/a/target");
 
-        // Within the hour of the last start on both clocks, or on the one
-        // read: none.
         let within = t0 + EVERY - Duration::from_secs(1);
         let within_ms = w0 + every_ms - 1_000;
         assert!(start_with(&slot, (within, Some(within_ms)), Found::default).is_none());
         assert!(start_with(&slot, (within, None), Found::default).is_none());
-        // An hour on, one; a survey that panics keeps the last rows and frees
-        // the slot for the next hour.
         let later = t0 + EVERY;
         let handle = start_with(&slot, (later, Some(within_ms)), || {
             panic!("a survey that fails")
@@ -498,8 +440,6 @@ mod tests {
         assert!(!running);
         assert_eq!(last.expect("kept").hogs.len(), 1);
         assert!(start_with(&slot, (later, Some(within_ms)), Found::default).is_none());
-        // A night asleep: a second on the monotonic clock, an hour on the
-        // wall clock, and a survey is due.
         let woke = later + Duration::from_secs(1);
         let handle = start_with(&slot, (woke, Some(within_ms + every_ms)), Found::default)
             .expect("an hour on the wall clock, another");
@@ -537,8 +477,6 @@ mod tests {
         }
         let guarded_dir = home.join(guarded).join("proj");
         build_dir(&guarded_dir.join("target"), 90_000);
-        // The checkout's worktrees: one beside `$HOME`, one in a guarded
-        // folder of it.
         let outside = root.join("elsewhere").join("wt");
         worktree(&home.join("proj"), "out", &outside);
         build_dir(&outside.join("target"), 20_000);
@@ -582,8 +520,7 @@ mod tests {
     /// T-G15: a working or build directory is a root only where its spelling
     /// alone places it on `$HOME`'s own local volume, outside the places never
     /// looked into; nothing is placed by an incomplete mount table, or when
-    /// `$HOME` itself is on a network volume. NEGATIVE CONTROL: a directory
-    /// under `$HOME` on its volume is kept.
+    /// `$HOME` itself is on a network volume.
     #[test]
     fn roots_are_only_on_homes_own_local_volume() {
         use aterm_sysprobe::volumes::Mount;
@@ -607,7 +544,6 @@ mod tests {
             complete: true,
             firmlinks: Vec::new(),
         };
-        // Captured placement and device: no home or remote path is read.
         let home = Path::new("/Users//x");
         let kept = |p: &str| placed(Path::new(p), home, &table);
         assert!(kept("/Users//x/proj"), "on home's own volume");
@@ -697,7 +633,6 @@ mod tests {
                 ("~/p0/target", 1000, false),
             ]
         );
-        // Unbounded, twelve directories keep eight rows.
         let (hogs, cut) = rows(
             &all,
             home,

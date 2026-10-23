@@ -2,27 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! The vault's text file (docs/DESIGN-secrets-2026-10-20.md §4): what a person edits.
-//!
-//! [`Document`] keeps the source lines, so programmatic edits ([`Document::add_machine`],
-//! [`Document::set_entry`], …) change only the lines they must and keep every comment and
-//! blank line the owner wrote. [`Document::lockers`] splits the file into one plaintext per
-//! audience (what [`crate::envelope`] encrypts); [`parse_locker`] reads one back.
-//!
-//! Grammar, in brief: LF line ends (a trailing CR is dropped; a CR anywhere else, and a NUL
-//! anywhere, is an error); blank and `#` lines are comments outside a heredoc (a `#` later
-//! in a line is not a comment); `[machines]` holds `name = age1…` (the spaces around `=` are
-//! optional); `[admins]` holds one machine name per line; `[everyone]` and `[host host …]`
-//! hold entries `name=value` (the value is the rest of the line, verbatim), `name<<TAG` …
-//! `TAG`, or `name<<TAG base64` … `TAG`, either heredoc optionally ending ` if-absent` (the
-//! file is written only where none exists: "fill gaps") or ` if-absent=<anchor>` (and only
-//! where the entry named `<anchor>`, another ` if-absent` entry every machine receiving
-//! this one also receives, is not the machine's own: a set of files filled together);
-//! `[join]` (a whole vault's only, so never in a locker) holds at most one of `password = …`,
-//! the join password (`crate::join`), and `open = yes` (an open vault: an admin's subscriber
-//! lets in every machine that asks to join, no password), and a `code-only = age1…` line for
-//! each key an open vault leaves to approval by code (a machine it let go, or one that asked
-//! before it opened). A section may appear more than once; its items accumulate. Errors carry
-//! a 1-based line number and never quote a value.
 
 use crate::SecretBytes;
 use std::collections::{BTreeMap, BTreeSet};
@@ -67,29 +46,20 @@ pub struct Machine {
 /// One secret.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
-    /// Its name: a file name `[A-Za-z0-9][A-Za-z0-9._-]{0,127}` or a home path `~/a/b`
-    /// whose components are such names.
+    /// Its name: a file name `[A-Za-z0-9][A-Za-z0-9._-]{0,127}` or a home path `~/a/b` whose components are such names.
     pub name: String,
     /// Its value.
     pub value: SecretBytes,
     /// The section it came from.
     pub audience: Audience,
-    /// Written only where no file exists yet (a heredoc's ` if-absent`): a machine's own
-    /// file is never replaced, and a file this vault wrote is updated until the machine
-    /// changes it, when it becomes the machine's own.
+    /// Written only where no file exists yet (a heredoc's ` if-absent`): a machine's own file is never replaced, and a file this vault wrote is updated until the machine changes it, when it becomes the machine's own.
     pub if_absent: bool,
-    /// The ` if-absent` entry this one is filled with (a heredoc's ` if-absent=<anchor>`;
-    /// only on an ` if-absent` entry): a gap is filled, and a file the vault filled kept,
-    /// only where the anchor's file is not the machine's own, so files that belong together
-    /// (a release key and the profile that names it) are filled as a set, never beside the
-    /// machine's own. An aterm older than anchors refuses a locker that holds one.
+    /// The ` if-absent` entry this one is filled with (a heredoc's ` if-absent=<anchor>`; only on an ` if-absent` entry): a gap is filled, and a file the vault filled kept, only where the anchor's file is not the machine's own, so files that belong together (a release key and the profile that names it) are filled as a set, never beside the machine's own.
     pub anchor: Option<String>,
 }
 
 /// An open vault's `[join]` line: an admin's subscriber lets in every machine that asks, with
-/// no password and no person at an admin Mac, except a key on a `code-only` line. Only an admin
-/// makes a vault open (`aterm secrets password open`, or the line written in `aterm secrets
-/// edit`); a vault without the line is not.
+/// no password and no person at an admin Mac, except a key on a `code-only` line.
 const OPEN_LINE: &str = "open = yes";
 
 /// A parse failure: the 1-based line and what is wrong, never the line's contents.
@@ -136,17 +106,11 @@ pub struct LockerPlan {
     pub audience: Audience,
     /// The `age1…` recipients of the audience, sorted and deduplicated.
     pub recipients: Vec<String>,
-    /// The audience's sections in this file's syntax, headers included (what
-    /// [`parse_locker`] reads back).
+    /// The audience's sections in this file's syntax, headers included (what [`parse_locker`] reads back).
     pub text: SecretBytes,
 }
 
-/// A parsed, editable vault text. Holds the source, so it is itself a secret: `Debug` is
-/// redacted and the lines are wiped on drop.
-///
-/// Every `Document` but one [`Document::new_vault`] made from an invalid name or recipient
-/// is valid: it parses under [`Document::parse`]'s rules, and an edit that would break them
-/// is refused and changes nothing.
+/// A parsed, editable vault text.
 #[derive(Clone)]
 pub struct Document {
     lines: Vec<String>,
@@ -169,12 +133,9 @@ impl Drop for Document {
 
 /// The largest value, and the largest file.
 pub const MAX_VALUE: usize = 1 << 20;
-/// The largest text file. A vault's version is the tighter bound on what it can publish:
-/// sealed, it holds every entry twice (the admins' locker and its audience's), armored,
-/// within [`crate::envelope::MAX_ENVELOPE`], so about 5.9 MiB of entries.
+/// The largest text file.
 pub const MAX_TEXT: usize = 8 << 20;
-/// The most distinct sets of hosts a vault's sections name: each is sealed in a locker of
-/// its own, beside the admins' and `[everyone]`'s, within [`crate::envelope::MAX_LOCKERS`].
+/// The most distinct sets of hosts a vault's sections name: each is sealed in a locker of its own, beside the admins' and `[everyone]`'s, within [`crate::envelope::MAX_LOCKERS`].
 pub const MAX_HOST_AUDIENCES: usize = crate::envelope::MAX_LOCKERS - 2;
 
 /// The section names that are not host names.
@@ -252,13 +213,7 @@ enum Mode {
 }
 
 impl Document {
-    /// Parse and validate a whole vault text: every section known, every host in an
-    /// audience or `[admins]` declared in `[machines]`, at least one admin, every recipient
-    /// a valid `age1…`, no duplicate machine, recipient, admin, or entry name within one
-    /// audience, no entry name in two host sections that share a host, at most one `[join]`
-    /// line (a strong join password, or an `open` line), heredocs terminated, base64 heredocs
-    /// canonical, names and values within their rules and sizes, at most
-    /// [`MAX_HOST_AUDIENCES`] distinct sets of hosts.
+    /// Parse and validate a whole vault text: every section known, every host in an audience or `[admins]` declared in `[machines]`, at least one admin, every recipient a valid `age1…`, no duplicate machine, recipient, admin, or entry name within one audience, no entry name in two host sections that share a host, at most one `[join]` line (a strong join password, or an `open` line), heredocs terminated, base64 heredocs canonical, names and values within their rules and sizes, at most [`MAX_HOST_AUDIENCES`] distinct sets of hosts.
     pub fn parse(text: &str) -> Result<Document, TextError> {
         let lines = split_lines(text)?;
         match parse_lines(&lines, Mode::Vault) {
@@ -270,10 +225,7 @@ impl Document {
         }
     }
 
-    /// A new vault text: a comment header explaining the format, `[machines]` with this one
-    /// machine, `[admins]` with it, and an empty `[everyone]`. An invalid `machine` or
-    /// `recipient` yields a document that does not validate: its edits are refused, and
-    /// [`Document::parse`] of its [`Document::render`] names the line.
+    /// A new vault text: a comment header explaining the format, `[machines]` with this one machine, `[admins]` with it, and an empty `[everyone]`.
     pub fn new_vault(machine: &str, recipient: &str) -> Document {
         let mut lines: Vec<String> = TEMPLATE.iter().map(|line| (*line).to_string()).collect();
         lines.extend([
@@ -321,9 +273,7 @@ impl Document {
             .map(|(password, _)| password.clone())
     }
 
-    /// Set the join password (`Some`), replacing any, or remove it (`None`). Refuses a weak
-    /// one ([`crate::join::strength`]) without quoting it. Blanks around it are dropped. A
-    /// password set on an open vault closes it: it takes the `open` line's place.
+    /// Set the join password (`Some`), replacing any, or remove it (`None`).
     pub fn set_join_password(&mut self, password: Option<&[u8]>) -> Result<(), TextError> {
         let existing = self.model.join.as_ref().map(|(_, line)| *line);
         let Some(password) = password else {
@@ -349,16 +299,12 @@ impl Document {
         }
     }
 
-    /// Whether the vault is open (`[join]`'s `open = yes`): an admin's subscriber lets in
-    /// every machine that asks, with no password, except a key [`Document::code_only`] names.
+    /// Whether the vault is open (`[join]`'s `open = yes`): an admin's subscriber lets in every machine that asks, with no password, except a key [`Document::code_only`] names.
     pub fn open(&self) -> bool {
         self.model.open.is_some()
     }
 
-    /// Make the vault open (`true`), its line in the join password's place if it has one, or
-    /// close it (`false`), removing the `open` line and leaving a join password be. Either
-    /// leaves the `code-only` lines be, and the state it is already in changes nothing, however its
-    /// line is spelled.
+    /// Make the vault open (`true`), its line in the join password's place if it has one, or close it (`false`), removing the `open` line and leaving a join password be.
     pub fn set_open(&mut self, open: bool) -> Result<(), TextError> {
         match (self.model.open, open) {
             (Some(_), true) | (None, false) => Ok(()),
@@ -378,9 +324,7 @@ impl Document {
         }
     }
 
-    /// The keys an open vault leaves to approval by code (`[join]`'s `code-only` lines), in
-    /// file order: a machine it let go, or one that asked before it opened. Its approver never
-    /// lets one in by itself.
+    /// The keys an open vault leaves to approval by code (`[join]`'s `code-only` lines), in file order: a machine it let go, or one that asked before it opened.
     pub fn code_only(&self) -> Vec<String> {
         self.model
             .code_only
@@ -389,8 +333,7 @@ impl Document {
             .collect()
     }
 
-    /// Name `recipient` on a `code-only` line in `[join]`, unless one does already. Refuses a
-    /// bad recipient. [`Document::add_machine`] removes the line again.
+    /// Name `recipient` on a `code-only` line in `[join]`, unless one does already.
     pub fn add_code_only(&mut self, recipient: &str) -> Result<(), TextError> {
         if !valid_recipient(recipient) {
             return Err(whole(INVALID_RECIPIENT));
@@ -424,8 +367,7 @@ impl Document {
             .find(|entry| entry.audience == audience && entry.name == name)
     }
 
-    /// Whether any entry is anchored (` if-absent=<anchor>`), which an aterm older than
-    /// anchors cannot read.
+    /// Whether any entry is anchored (` if-absent=<anchor>`), which an aterm older than anchors cannot read.
     pub fn anchored(&self) -> bool {
         self.model
             .entries
@@ -433,11 +375,7 @@ impl Document {
             .any(|located| located.entry.anchor.is_some())
     }
 
-    /// One locker per distinct audience that has at least one machine, `[everyone]` first
-    /// (always present, even with no entries, so every machine has a locker that tells it
-    /// it is in), then host audiences in sorted order. A locker's text is one header and
-    /// the audience's entries spelled exactly as in this file, in file order, without
-    /// comments.
+    /// One locker per distinct audience that has at least one machine, `[everyone]` first (always present, even with no entries, so every machine has a locker that tells it it is in), then host audiences in sorted order.
     pub fn lockers(&self) -> Vec<LockerPlan> {
         let mut audiences: BTreeSet<&Audience> = BTreeSet::new();
         for section in &self.model.sections {
@@ -478,9 +416,7 @@ impl Document {
         plans
     }
 
-    /// Append `name = recipient` to `[machines]` (creating the section if absent), and remove
-    /// the `code-only` line naming `recipient`, if any. Refuses a duplicate name or recipient, a
-    /// bad name, or a bad recipient.
+    /// Append `name = recipient` to `[machines]` (creating the section if absent), and remove the `code-only` line naming `recipient`, if any.
     pub fn add_machine(&mut self, name: &str, recipient: &str) -> Result<(), TextError> {
         if !valid_machine_name(name) {
             return Err(whole(INVALID_MACHINE));
@@ -505,7 +441,6 @@ impl Document {
             "[machines]",
             vec![format!("{name} = {recipient}")],
         )?;
-        // A key let in is no longer one left to approval by code.
         let held = next
             .model
             .code_only
@@ -520,12 +455,7 @@ impl Document {
         Ok(())
     }
 
-    /// Remove a machine: its `[machines]` line, its `[admins]` line, and its name from every
-    /// multi-host section header. Refuses (changing nothing) when a section that names only
-    /// this machine holds entries, saying which line, unless `drop_own_sections` is set, in
-    /// which case those sections and their entries are removed too; such a section with no
-    /// entry left (an `unset` of its last) goes with the machine either way. Returns false
-    /// when no such machine. Refuses removing the last admin.
+    /// Remove a machine: its `[machines]` line, its `[admins]` line, and its name from every multi-host section header.
     pub fn remove_machine(
         &mut self,
         name: &str,
@@ -590,7 +520,7 @@ impl Document {
         Ok(true)
     }
 
-    /// Add a machine to `[admins]` (it must be a machine). No-op when already there.
+    /// Add a machine to `[admins]` (it must be a machine).
     pub fn add_admin(&mut self, name: &str) -> Result<(), TextError> {
         if !self
             .model
@@ -610,8 +540,7 @@ impl Document {
         self.append_to(&SectionKind::Admins, "[admins]", vec![name.to_string()])
     }
 
-    /// Remove a machine from `[admins]`. Refuses removing the last admin. Returns false when
-    /// it was not an admin.
+    /// Remove a machine from `[admins]`.
     pub fn remove_admin(&mut self, name: &str) -> Result<bool, TextError> {
         let Some(index) = self
             .model
@@ -633,13 +562,7 @@ impl Document {
         Ok(true)
     }
 
-    /// Set an entry in the section for `audience` (the first such section, created at the
-    /// end if absent): replaces the existing entry's line(s) in place, or appends to the
-    /// section. Picks the spelling: `name=value` for one line of UTF-8 without CR, LF or NUL;
-    /// a text heredoc for UTF-8 ending in LF without CR or NUL; otherwise a base64 heredoc
-    /// with 64-column lines. A heredoc TAG is `END`, or `END1`, `END2`, … if a value line
-    /// equals it. Refuses (changing nothing) what would break the document's rules, such as
-    /// a name another host section sharing a host already sets.
+    /// Set an entry in the section for `audience` (the first such section, created at the end if absent): replaces the existing entry's line(s) in place, or appends to the section.
     pub fn set_entry(
         &mut self,
         audience: &Audience,
@@ -649,11 +572,7 @@ impl Document {
         self.set_entry_with(audience, name, value, false, None)
     }
 
-    /// [`Document::set_entry`], marking the entry ` if-absent` when `if_absent` (always a
-    /// heredoc then: a base64 one for a value a text heredoc cannot hold exactly), and
-    /// anchoring it to the ` if-absent` entry `anchor` names (` if-absent=<anchor>`). An
-    /// anchor without `if_absent`, or one that is not another ` if-absent` entry every host
-    /// receiving this one also receives, is refused.
+    /// [`Document::set_entry`], marking the entry ` if-absent` when `if_absent` (always a heredoc then: a base64 one for a value a text heredoc cannot hold exactly), and anchoring it to the ` if-absent` entry `anchor` names (` if-absent=<anchor>`).
     pub fn set_entry_with(
         &mut self,
         audience: &Audience,
@@ -710,7 +629,7 @@ impl Document {
         }
     }
 
-    /// Remove an entry from the sections for `audience`. Returns false when absent.
+    /// Remove an entry from the sections for `audience`.
     pub fn unset_entry(&mut self, audience: &Audience, name: &str) -> Result<bool, TextError> {
         let Ok(audience) = normalize(audience) else {
             return Ok(false);
@@ -948,8 +867,6 @@ fn parse_lines(lines: &[String], mode: Mode) -> Result<Model, TextError> {
                 i
             }
             SectionKind::Join => {
-                // Read in a plain file too (a locker refuses the header), so an entry
-                // written under [join] by mistake is an error, never silently dropped.
                 let line = parse_join(trimmed, n)?;
                 let password = model.join.as_ref().map(|(_, j)| *j);
                 let (what, same, other) = match &line {
@@ -1001,8 +918,6 @@ fn parse_lines(lines: &[String], mode: Mode) -> Result<Model, TextError> {
         i = last + 1;
     }
     check_duplicates(&model)?;
-    // A locker is one audience's share of what a host receives, so an anchor in it may
-    // name an entry of another locker: the whole text and a plain file are checked.
     if mode != Mode::Locker {
         check_anchors(&model)?;
     }
@@ -1259,8 +1174,7 @@ fn check_duplicates(model: &Model) -> Result<(), TextError> {
 
 /// Every anchor names another ` if-absent` entry of what each host receiving its entry
 /// receives: a host a section names gets `[everyone]`'s entries overridden by name by its
-/// sections', and any other host (one that joins later, too) `[everyone]`'s alone. The
-/// error names the anchored entry's line.
+/// sections', and any other host (one that joins later, too) `[everyone]`'s alone.
 fn check_anchors(model: &Model) -> Result<(), TextError> {
     if model
         .entries
@@ -1275,8 +1189,6 @@ fn check_anchors(model: &Model) -> Result<(), TextError> {
             named.extend(hosts.iter().map(String::as_str));
         }
     }
-    // `None` is every host no section names; first, so an `[everyone]` entry whose anchor
-    // only some hosts get is refused for the hosts that do not.
     for host in std::iter::once(None).chain(named.into_iter().map(Some)) {
         let mut set: BTreeMap<&str, &Located> = BTreeMap::new();
         for located in &model.entries {
@@ -1317,8 +1229,7 @@ fn check_anchors(model: &Model) -> Result<(), TextError> {
     Ok(())
 }
 
-/// Whether `entry`'s anchor, if it has one, is another ` if-absent` entry of what the
-/// machine receiving `entry` receives (`find` looks one up there by name).
+/// Whether `entry`'s anchor, if it has one, is another ` if-absent` entry of what the machine receiving `entry` receives (`find` looks one up there by name).
 pub(crate) fn anchor_received<'a>(
     entry: &Entry,
     find: impl FnOnce(&str) -> Option<&'a Entry>,
@@ -1452,9 +1363,7 @@ fn valid_recipient(text: &str) -> bool {
     crate::age::Recipient::parse(text).is_ok()
 }
 
-/// Read one locker's plaintext (sections and entries only; `[machines]`, `[admins]` and
-/// `[join]` are refused, and hosts are not checked against a machine list). Each entry
-/// keeps its ` if-absent` mark.
+/// Read one locker's plaintext (sections and entries only; `[machines]`, `[admins]` and `[join]` are refused, and hosts are not checked against a machine list).
 pub fn parse_locker(text: &[u8]) -> Result<Vec<Entry>, TextError> {
     let text = match std::str::from_utf8(text) {
         Ok(text) => text,
@@ -1477,9 +1386,7 @@ pub fn parse_locker(text: &[u8]) -> Result<Vec<Entry>, TextError> {
         .collect())
 }
 
-/// Read a plain text file a person keeps themselves (§7): the §4 syntax, with items before
-/// the first header in `[everyone]`, and hosts not checked against `[machines]`. Returns
-/// every entry; [`merge_for`] picks a host's.
+/// Read a plain text file a person keeps themselves (§7): the §4 syntax, with items before the first header in `[everyone]`, and hosts not checked against `[machines]`.
 pub fn parse_plain(text: &[u8]) -> Result<Vec<Entry>, TextError> {
     let text = match std::str::from_utf8(text) {
         Ok(text) => text,
@@ -1502,12 +1409,7 @@ pub fn parse_plain(text: &[u8]) -> Result<Vec<Entry>, TextError> {
         .collect())
 }
 
-/// Merge entries for `host` from several lockers: host-audience entries override
-/// `Everyone` entries of the same name; two host-audience entries of the same name that
-/// both include `host` are an error (naming the entry, not the value), as are two
-/// `Everyone` entries of the same name and an anchor that is not another ` if-absent`
-/// entry of the merged set. Entries whose audience does not include `host` are left out.
-/// Sorted by name.
+/// Merge entries for `host` from several lockers: host-audience entries override `Everyone` entries of the same name; two host-audience entries of the same name that both include `host` are an error (naming the entry, not the value), as are two `Everyone` entries of the same name and an anchor that is not another ` if-absent` entry of the merged set.
 pub fn merge_for(host: &str, entries: Vec<Entry>) -> Result<Vec<Entry>, TextError> {
     let mut everyone: BTreeMap<String, Entry> = BTreeMap::new();
     let mut hosts: BTreeMap<String, Entry> = BTreeMap::new();
@@ -1575,10 +1477,6 @@ fn valid_home_component(component: &str) -> bool {
 const MAX_HOME_PATH: usize = 1024;
 
 /// True when `name` is a valid entry name (file name or `~/` home path).
-///
-/// A home path may not reach into `~/.secrets` (spell such an entry by its file name) or
-/// `~/.config/aterm/secrets` (the vault's own key and state); both are compared without
-/// case, as macOS's default volume does.
 pub fn valid_entry_name(name: &str) -> bool {
     let Some(rel) = name.strip_prefix("~/") else {
         return valid_file_name(name);
@@ -2130,7 +2028,6 @@ mod tests {
         for name in &names[..MAX_HOST_AUDIENCES - 1] {
             source.push_str(&format!("[{name}]\nown=1\n"));
         }
-        // A section of an audience named before adds no locker.
         source.push_str("[m2 m1]\nalso=1\n");
         let mut d = Document::parse(&source).expect("62 sets of hosts");
         assert_eq!(
@@ -2416,9 +2313,7 @@ mod tests {
         assert_eq!(d.machines().len(), 1);
     }
 
-    /// `unset` of a host section's last entry leaves its header. A section with nothing left
-    /// in it holds nothing to lose, so it goes with its machine: revoke's "remove its entries
-    /// first" is a way through.
+    /// `unset` of a host section's last entry leaves its header.
     #[test]
     fn a_section_its_entries_left_goes_with_the_machine() {
         let mut d = Document::parse(&base(
@@ -2496,7 +2391,6 @@ mod tests {
 
     #[test]
     fn no_error_or_debug_output_ever_holds_a_value() {
-        // Not a name, a host, a tag or base64, so no rule could quote it as one.
         let sentinel = "Zq9!sentinel+value";
         let r = recipient(1);
         let head = format!(
@@ -2599,7 +2493,6 @@ mod tests {
         assert_eq!(back.entries(), d.entries());
         assert!(!format!("{d:?} {back:?} {:?}", d.join_password()).contains(&first));
 
-        // Replaced in place, characters the grammar gives meaning to included.
         let second = format!("= #[x] {}", strong("second"));
         d.set_join_password(Some(second.as_bytes()))
             .expect("replaced");
@@ -2611,7 +2504,6 @@ mod tests {
             second.as_bytes()
         );
 
-        // Removed: the line goes, the header stays for the next one, the rest is untouched.
         d.set_join_password(None).expect("removed");
         assert!(d.join_password().is_none());
         assert_eq!(text(&d), format!("{}\n[join]\n", vault()));
@@ -2628,7 +2520,6 @@ mod tests {
             format!("{}\n[join]\npassword = {first}\n", vault())
         );
 
-        // Blanks a `[join]` line pads the password with are not part of it.
         let padded = Document::parse(&base(&format!("[join]\n\t password=\t{first} \x0c\n")))
             .expect("valid");
         assert_eq!(
@@ -2690,8 +2581,6 @@ mod tests {
             "[join]\npassword = {a}\n[everyone]\nx=1\n[join]\npassword = {b}\n"
         )));
         assert_eq!(e.line, 11);
-        // Sections accumulate: an empty [join] beside the one that holds it is fine, and the
-        // password replaced in place stays the only one.
         let mut d = Document::parse(&base(&format!(
             "[join]\n# none here\n[everyone]\nx=1\n[join]\npassword = {a}\n"
         )))
@@ -2711,26 +2600,21 @@ mod tests {
         let pw = strong("pw");
         let mut d = Document::parse(&base(&format!("[join]\npassword = {pw}\n"))).expect("valid");
         assert!(!d.open());
-        // Opening takes the password's place: a vault holds one or the other.
         d.set_open(true).expect("open");
         assert!(text(&d).ends_with("[join]\nopen = yes\n"), "{}", text(&d));
         assert!(d.join_password().is_none());
         let reread = Document::parse(&text(&d)).expect("parses");
         assert!(reread.open());
         assert_eq!(reread.render().as_slice(), d.render().as_slice());
-        // The line it already holds, however spelled, changes nothing.
         let mut spelled = Document::parse(&base("[join]\n  open=yes \n")).expect("valid");
         let before = text(&spelled);
         spelled.set_open(true).expect("same");
         assert_eq!(text(&spelled), before);
-        // A password closes it in the open line's place; closing a vault with a password
-        // leaves the password be.
         d.set_join_password(Some(pw.as_bytes())).expect("set");
         assert!(!d.open());
         assert!(text(&d).ends_with(&format!("[join]\npassword = {pw}\n")));
         d.set_open(false).expect("not open");
         assert!(d.join_password().is_some());
-        // Closing an open vault removes its line and nothing else.
         let mut open =
             Document::parse(&base("[join]\nopen = yes\n[everyone]\nx=1\n")).expect("valid");
         open.set_open(false).expect("close");
@@ -2759,7 +2643,6 @@ mod tests {
             assert_eq!(e.line, 7, "{bad}");
             assert!(e.why.contains("open = yes"), "{bad}: {e}");
         }
-        // Only a whole vault holds it: a locker refuses [join].
         assert!(parse_locker(b"[join]\nopen = yes\n").is_err());
         let mut d = doc();
         d.set_open(true).expect("open");
@@ -2775,7 +2658,6 @@ mod tests {
         let gone = recipient(9);
         let mut d = Document::parse(&base(&format!("[join]\npassword = {pw}\n"))).expect("valid");
         assert!(d.code_only().is_empty());
-        // Named beside the password, once however often it is let go.
         d.add_code_only(&gone).expect("code-only");
         d.add_code_only(&gone).expect("again");
         assert_eq!(d.code_only(), std::slice::from_ref(&gone));
@@ -2784,14 +2666,12 @@ mod tests {
             Document::parse(&text(&d)).expect("parses").code_only(),
             std::slice::from_ref(&gone)
         );
-        // Opening and closing the vault leave it be.
         d.set_open(true).expect("open");
         assert!(text(&d).ends_with(&format!("[join]\nopen = yes\ncode-only = {gone}\n")));
         d.set_open(false).expect("close");
         assert_eq!(d.code_only(), std::slice::from_ref(&gone));
         d.set_join_password(Some(pw.as_bytes())).expect("set");
         assert_eq!(d.code_only(), std::slice::from_ref(&gone));
-        // A bad key is refused, written or parsed, and a key named twice names both lines.
         let before = text(&d);
         assert!(d.add_code_only("age1nope").is_err());
         assert_eq!(text(&d), before);
@@ -2803,13 +2683,11 @@ mod tests {
         )));
         assert_eq!(e.line, 8);
         assert!(e.why.contains("(lines 7 and 8)"), "{e}");
-        // A key let in again is no longer one the vault let go; another one's line stays.
         let other = recipient(8);
         d.add_code_only(&other).expect("code-only");
         d.add_machine("back", &gone).expect("add");
         assert_eq!(d.code_only(), std::slice::from_ref(&other));
         assert!(!text(&d).contains(&format!("code-only = {gone}")));
-        // Never in a locker.
         for plan in d.lockers() {
             let body = std::str::from_utf8(plan.text.as_slice()).expect("utf-8");
             assert!(
@@ -2841,7 +2719,6 @@ mod tests {
                 .all(|e| e.value.as_slice() != pw.as_bytes())
         );
 
-        // A locker that names [join] is refused, wherever the header is.
         let e = parse_locker(format!("[join]\npassword = {pw}\n").as_bytes()).expect_err("refused");
         assert_eq!(e.line, 1);
         let e = parse_locker(format!("[everyone]\na=1\n[join]\npassword = {pw}\n").as_bytes())
@@ -2850,8 +2727,6 @@ mod tests {
         assert!(e.why.contains("[join]"), "{e}");
         assert!(!format!("{e} {e:?}").contains(&pw));
 
-        // A plain file reads [join] as a vault does: the password is no entry, and an entry
-        // written under [join] is an error, never dropped.
         let plain =
             parse_plain(format!("a=1\n[join]\npassword = {pw}\n[everyone]\nb=2\n").as_bytes())
                 .expect("plain");
@@ -2892,7 +2767,6 @@ mod tests {
     #[test]
     fn if_absent_entries_round_trip_in_every_spelling() {
         let cases: Vec<(&str, Vec<u8>, &str)> = vec![
-            // One line: a text heredoc would add a final LF, so it is base64.
             (
                 "one",
                 b"single line".to_vec(),
@@ -2990,7 +2864,6 @@ mod tests {
                 .any(|e| e.name == "gh_token" && e.if_absent)
         );
 
-        // Set again without the flag: the plain spelling comes back, in place.
         d.set_entry(&Audience::Everyone, "gh_token", b"t")
             .expect("set");
         assert!(
@@ -3021,7 +2894,6 @@ mod tests {
             assert_eq!(e.line, 7, "{extra:?}");
             assert!(e.why.contains(why), "{e} for {extra:?}");
         }
-        // A one-line value is the rest of its line, verbatim: it takes no modifier.
         let d = Document::parse(&base(
             "[everyone]\na=v if-absent\nb<<END if-absent \t\nx\nEND\n",
         ))
@@ -3076,7 +2948,6 @@ mod tests {
     #[test]
     fn anchored_entries_are_spelled_parsed_and_reach_the_lockers() {
         let mut d = Document::parse(&base("[everyone]\n")).expect("valid");
-        // Two entries anchored to each other, and a third anchored to one of them.
         d.set_entry_with(&Audience::Everyone, KEY, &[0xff, 0], true, None)
             .expect("key");
         d.set_entry_with(&Audience::Everyone, PROFILE, b"id = 1\n", true, Some(KEY))
@@ -3130,7 +3001,6 @@ mod tests {
             );
         }
 
-        // Set again without an anchor, or without if-absent: the plain spellings return.
         d.set_entry_with(
             &Audience::Everyone,
             "~/.aterm/machine.toml",
@@ -3148,13 +3018,11 @@ mod tests {
     #[test]
     fn an_anchor_is_another_if_absent_entry_its_receivers_all_get() {
         let refused = [
-            // No such entry.
             (
                 "[everyone]\na<<END if-absent=b\nx\nEND\n",
                 7,
                 "anchored to `b`",
             ),
-            // Not an if-absent one.
             (
                 "[everyone]\nb=1\na<<END if-absent=b\nx\nEND\n",
                 8,
@@ -3165,7 +3033,6 @@ mod tests {
                 10,
                 "anchored to `b`",
             ),
-            // Itself, or not an entry name at all.
             (
                 "[everyone]\na<<END if-absent=a\nx\nEND\n",
                 7,
@@ -3186,7 +3053,6 @@ mod tests {
                 7,
                 "names another entry",
             ),
-            // The anchor only some of the entry's receivers get.
             (
                 "[m22]\nb<<END if-absent\n1\nEND\n[everyone]\na<<END if-absent=b\nx\nEND\n",
                 11,
@@ -3197,7 +3063,6 @@ mod tests {
                 10,
                 "host `m3`",
             ),
-            // The modifier keeps its one place.
             (
                 "[everyone]\nb<<END if-absent\n1\nEND\na<<END if-absent=b base64\nEND\n",
                 10,
@@ -3214,7 +3079,6 @@ mod tests {
             assert_eq!(e.line, line, "{e} for {extra:?}");
             assert!(e.why.contains(why), "{e} for {extra:?}");
         }
-        // A host's anchor may be an [everyone] entry, and a base64 heredoc takes one too.
         let d = Document::parse(&base(
             "[everyone]\nb<<END if-absent\n1\nEND\n[m22]\na<<END base64 if-absent=b\nAAEC\nEND\n",
         ))
@@ -3223,7 +3087,6 @@ mod tests {
         assert_eq!(merge_for("m22", d.entries()).expect("merges").len(), 2);
         assert_eq!(merge_for("m3", d.entries()).expect("merges").len(), 1);
 
-        // An edit that would leave an anchor dangling is refused and changes nothing.
         let mut d = Document::parse(&base(
             "[everyone]\nb<<END if-absent\n1\nEND\na<<END if-absent=b\nx\nEND\nc=1\n",
         ))
@@ -3240,8 +3103,6 @@ mod tests {
             assert!(result.is_err(), "{result:?}");
         }
         assert_eq!(text(&d), before);
-        // A locker is one audience's share, so its anchors are not checked on their own; a
-        // merge and a plain file are.
         let locker = parse_locker(b"[m22]\na<<END if-absent=b\nx\nEND\n").expect("locker");
         let e = merge_for("m22", locker).expect_err("dangling");
         assert!(e.why.contains("`a` is anchored to `b`"), "{e}");

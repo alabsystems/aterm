@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The line encoding (§3.2) and the tier table (§3.6): round trips, the
-//! 512-byte refusal, unknown tokens and words, the bus body, and the tier
-//! leak test with its negative control.
+//! The line encoding (§3.2) and the tier table (§3.6).
 
 use aterm_slog::vocab::{
     ACT_WORDS, ASK_WORDS, BOX_WORDS, CAUSE_WORDS, CHANGE_WORDS, CLASS_WORDS, CLS_WORDS, DIR_WORDS,
@@ -41,7 +39,6 @@ fn every_key() -> Vec<Rec> {
                 Cap::Word(list) => Val::Word(list[list.len() - 1]),
                 Cap::U => Val::U(u64::MAX),
                 Cap::I => Val::I(-101),
-                // A broker offset is a host value; a wire id is any other.
                 Cap::Id if key.tier() >= Tier::Host => {
                     Val::Id(ShortId::new("@88231").expect("an id"))
                 }
@@ -144,7 +141,6 @@ fn encode_then_decode_is_lossless_for_every_key() {
         let body = encode_bus(&r, Tier::WireMeta, 2, Some(97)).expect("fits");
         let back = decode_bus(&body).expect("decodes");
         assert_eq!((back.ep, back.ms), (2, Some(97)));
-        // The bus keeps W and W* keys only.
         let key = r.f.iter().next().expect("one field").0;
         if key.tier() <= Tier::WireMeta {
             assert_eq!(back.rec, r, "{body}");
@@ -259,11 +255,9 @@ fn a_bus_bodys_unknown_words_decode_to_a_record_no_bus_class_holds() {
 
 #[test]
 fn oversized_records_are_refused_and_values_clamped() {
-    // Text is clamped to its key's cap on the way in, escapes included.
     let cwd = aterm_slog::BoundedText::new(Key::Cwd, &"中".repeat(400)).expect("text");
     assert!(aterm_slog::field::encoded_len(cwd.as_str()) <= 256);
     assert_eq!(cwd.as_str(), "中".repeat(28), "never half a character");
-    // Three capped texts together pass the record bound: refused.
     let f = Fields::new()
         .text(Key::Cwd, &"/x".repeat(200))
         .and_then(|f| f.text(Key::Title, &"t".repeat(300)))
@@ -274,14 +268,12 @@ fn oversized_records_are_refused_and_values_clamped() {
         Err(EncodeError::TooLarge(n)) => assert!(n > MAX_RECORD_BYTES),
         other => panic!("not refused: {other:?}"),
     }
-    // The same record at the wire tier drops the H and C keys and fits.
     let wire = encode(&r, Tier::Wire).expect("fits without its text");
     assert!(wire.len() <= MAX_RECORD_BYTES);
 }
 
 /// THE TIER LEAK TEST: no H or C key survives `encode(Tier::Wire)`, and no
-/// C key survives `Tier::Host` (the journal's tier). The negative control
-/// marks one H key as W in a copy of the table and watches it leak.
+/// C key survives `Tier::Host` (the journal's tier).
 #[test]
 fn no_host_or_content_key_survives_the_wire_tier() {
     let leaks = |table: &[(Key, Tier, Cap)], tier: Tier| -> Vec<Key> {
@@ -303,7 +295,6 @@ fn no_host_or_content_key_survives_the_wire_tier() {
         assert!(!line.contains("SECRET-TEXT"), "{line}");
     }
 
-    // Negative control: `cwd` marked W leaks at the wire tier.
     let mut doctored: Vec<(Key, Tier, Cap)> = FIELDS.to_vec();
     let row = doctored
         .iter_mut()
@@ -311,8 +302,6 @@ fn no_host_or_content_key_survives_the_wire_tier() {
         .expect("cwd is declared");
     row.1 = Tier::Wire;
     assert_eq!(leaks(&doctored, Tier::Wire), vec![Key::Cwd]);
-    // Negative control (6F-2): a content key marked H leaks at the host
-    // tier, the journal's and the carry's (attention text).
     let mut doctored: Vec<(Key, Tier, Cap)> = FIELDS.to_vec();
     let row = doctored
         .iter_mut()
@@ -374,7 +363,6 @@ fn no_mail_offset_survives_the_bus() {
             .expect("fits")
             .contains(" cause=@88231")
     );
-    // Every key that takes an id: an offset is held only below the bus.
     let off = ShortId::new("@88231").expect("an id");
     for (key, tier, cap) in FIELDS {
         if *cap != Cap::Id {
@@ -410,10 +398,7 @@ fn a_token_is_held_to_its_own_key() {
 }
 
 /// A HARNESS RULE ID CROSSES THE WIRE AS `name.vN`:
-/// the codec is not loosened. The harness producer maps `@` to `.`
-/// (`continue@v1` is written `continue.v1`), which every reader version
-/// decodes; `continue@v1` itself stays refused below the host tier, as an
-/// offset-shaped value is, so the bus guard is unchanged.
+/// the codec is not loosened.
 #[test]
 fn a_rule_id_crosses_the_wire_as_name_dot_version() {
     let f = Fields::new()
@@ -429,8 +414,6 @@ fn a_rule_id_crosses_the_wire_as_name_dot_version() {
     );
     let body = encode_bus(&r, Tier::Wire, 1, Some(1)).expect("fits");
     assert!(body.contains(" rule=continue.v1"), "{body}");
-    // As today: an `@` in a wire id is refused, by `Fields` and by the
-    // decoder alike (the value is dropped, the record kept).
     assert!(Fields::new().id(Key::Rule, "continue@v1").is_err());
     let at = decode(&line.replace("continue.v1", "continue@v1")).expect("the record decodes");
     assert_eq!(
@@ -444,8 +427,6 @@ fn a_rule_id_crosses_the_wire_as_name_dot_version() {
 /// wire number, and every new kind a mark kind.
 #[test]
 fn phase_3b_keys_and_kinds_are_appended_wire_numbers() {
-    // Phase 5 appended one key and one kind after 3B's
-    // (`phase_5_task_key_and_kind_are_appended_and_local`).
     let n = FIELDS
         .iter()
         .position(|r| r.0 == Key::Attention)
@@ -475,9 +456,7 @@ fn phase_3b_keys_and_kinds_are_appended_wire_numbers() {
 
 /// PHASE 5: the `task` kind and its `attention=` key are
 /// appended after 3B's, so no discriminant moved; `task` is a mark kind, and
-/// a task mark is local (never bus class) whatever its fields. Its words
-/// (`state=`, `why=`) are the closed lists' own, so a task mark round-trips
-/// on the line and its words never decode to `unknown`.
+/// a task mark is local (never bus class) whatever its fields.
 #[test]
 fn phase_5_task_key_and_kind_are_appended_and_local() {
     let n = 1 + FIELDS
@@ -589,7 +568,7 @@ fn phase_5_reached_key_is_appended_and_host_only() {
 /// `reached=`, wire words: `prev_end=` a closed word whose list is the
 /// recovery ledger's end tokens (a signal's number in `code=`) and `-` for a
 /// ledger not read, and `key=` a config key's NAME, an id (never text: a
-/// value has no place to go). The link states are closed state words.
+/// value has no place to go).
 #[test]
 fn phase_5_node_log_keys_are_appended_wire_words() {
     let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
@@ -646,9 +625,7 @@ fn phase_5_node_log_keys_are_appended_wire_words() {
 
 /// PHASE 6: `op_by=` is appended after 5J's `key=`, a
 /// HOST id: a turn close's restated opener round-trips at the host tier
-/// and is in no wire or bus body (an edge's raw sid must not cross). AN
-/// OLDER READER SKIPS IT (the R13 rule): to a build without the key the
-/// token is an unknown one, and the close reads as the close without it.
+/// and is in no wire or bus body (an edge's raw sid must not cross).
 #[test]
 fn phase_6_op_by_is_appended_host_only_and_an_older_reader_skips_it() {
     let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
@@ -696,7 +673,6 @@ fn phase_6_op_by_is_appended_host_only_and_an_older_reader_skips_it() {
             "{bus}"
         );
     }
-    // An older reader: `op_by=` is a key it does not know.
     let older = line.replace(" op_by=", " zz_opener=");
     let mut without = r.clone();
     without.f.remove(Key::OpBy);
@@ -707,8 +683,7 @@ fn phase_6_op_by_is_appended_host_only_and_an_older_reader_skips_it() {
 /// the last key, a HOST closed word whose one word is `shared`: an input
 /// mark that says the mark limiter's shared pool's count says so
 /// (`dropped=<n> pool=shared`), round-trips at the host tier and leaves no
-/// trace on the wire. An unknown pool word is refused by the writer, and a
-/// reader puts `unknown` in its place, never `shared`.
+/// trace on the wire.
 #[test]
 fn phase_6_pool_is_appended_host_only_and_closed() {
     let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
@@ -766,10 +741,7 @@ fn phase_6_pool_is_appended_host_only_and_closed() {
 /// 5C-1's `task`, each a mark, none bus class, none a node; the wire keys,
 /// the host keys and the content keys after 6C-6's `pool=` (the last key), in
 /// that order, each at its tier with its cap; `mail` and `burst` the newest
-/// `why=` words; a session's and a program's state words. A record of every
-/// new key round-trips at the content tier, the host tier holds no content
-/// key and the wire none of the host's or content's, and AN OLDER READER
-/// skips each new key and maps each new kind to `unknown` (the R13 rule).
+/// `why=` words; a session's and a program's state words.
 #[test]
 fn phase_6_ring_vocabulary_is_appended_at_its_tiers() {
     let kind_at = |k: Kind| Kind::ALL.iter().position(|x| *x == k);
@@ -784,9 +756,9 @@ fn phase_6_ring_vocabulary_is_appended_at_its_tiers() {
     ];
     let first = kind_at(Kind::Task).map(|i| i + 1).expect("5C-1's kind");
     assert_eq!(
-        &Kind::ALL[first..],
+        &Kind::ALL[first..first + kinds.len()],
         &kinds,
-        "appended after `task`, the last"
+        "appended after `task`"
     );
     let words: Vec<&str> = kinds.iter().map(|k| k.word()).collect();
     assert_eq!(
@@ -873,8 +845,6 @@ fn phase_6_ring_vocabulary_is_appended_at_its_tiers() {
     assert!(Fields::new().word(Key::Origin, "fleet").is_ok());
     assert!(Fields::new().word(Key::Origin, "anyone").is_err(), "closed");
 
-    // One record of each new key (twelve fields at most), at the content
-    // tier and at the tiers below it.
     let wire = Fields::new()
         .u(Key::Build, 7)
         .and_then(|f| f.u(Key::Run, 3))
@@ -929,8 +899,6 @@ fn phase_6_ring_vocabulary_is_appended_at_its_tiers() {
         for planted in ["QZP6REASON1", "QZP6ATTN1", "QZP6TOPIC1", "s-closer9"] {
             assert!(!host.contains(planted), "{planted} below content: {host}");
         }
-        // An older reader: every new key a token it does not know, every new
-        // kind a word it does not know.
         let mut older = content.replace(" program ", " zz-kind-of-phase-9 ");
         for (key, ..) in &rows {
             older = older.replace(
@@ -947,10 +915,7 @@ fn phase_6_ring_vocabulary_is_appended_at_its_tiers() {
 /// PHASE 6 (6F-5 to 6F-7): the keys the ring's rows carry
 /// once each row's writer writes a mark the row's whole payload is read
 /// from, APPENDED after 6F-2's `closer=` (the last key before them), so no
-/// key moves: each in its place, at its tier, with its cap. Each row's mark
-/// round-trips at the content tier; the host tier holds no content key and
-/// the wire no host or content key, the planted sentinels included; AN
-/// OLDER READER skips every one (the R13 rule).
+/// key moves: each in its place, at its tier, with its cap.
 #[test]
 fn phase_6_ring_row_keys_are_appended_at_their_tiers() {
     let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
@@ -997,8 +962,6 @@ fn phase_6_ring_row_keys_are_appended_at_their_tiers() {
         by: Actor::Nobody,
         f,
     };
-    // Each new key on the mark of the row it is read from, with the
-    // content and host sentinels its row can carry.
     let marks = [
         (
             mark(
@@ -1101,8 +1064,7 @@ fn phase_6_ring_row_keys_are_appended_at_their_tiers() {
 /// and the handback's groups, a keyed write's sequence and reply — with
 /// closed words for each list; a pgid is host and a reply content, so the
 /// planted reply is in no line below the content tier and the groups in no
-/// wire line. An older reader skips each new key. NEGATIVE CONTROL: a word
-/// outside a list is refused.
+/// wire line.
 #[test]
 fn phase_6_session_row_keys_are_appended_at_their_tiers() {
     let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
@@ -1128,7 +1090,6 @@ fn phase_6_session_row_keys_are_appended_at_their_tiers() {
         (Key::Build, "build", Tier::Wire, Cap::U),
     ];
     let first = at(Key::Moved).map(|i| i + 1).expect("6F-6's last key");
-    // The last row is 6F-2's `build=`, which 6F-7 is the first to write.
     for (i, (key, word, tier, cap)) in rows[..13].iter().enumerate() {
         assert_eq!(at(*key), Some(first + i), "{key:?} in its place");
         assert_eq!(
@@ -1273,9 +1234,7 @@ fn phase_6_session_row_keys_are_appended_at_their_tiers() {
 /// `reply=`, the last key then, HOST as `holder=` is: a self-claim's act as its
 /// holder told it, an owner token whose `/` and `@` no wire id holds, so the
 /// `harness-act` row is its record whole, an act with no word too
-/// (`word=unknown`). It round-trips at the host tier and leaves no trace on
-/// the wire, and an older reader skips it. NEGATIVE CONTROL: the act is no
-/// `rule=` (a wire id refuses its `/`, and its `@`).
+/// (`word=unknown`).
 #[test]
 fn phase_6_harness_act_is_appended_host_only() {
     let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
@@ -1336,9 +1295,7 @@ fn phase_6_harness_act_is_appended_host_only() {
 /// HOST, a signed integer: the Autopilot pair's timer (whole seconds) on
 /// its `meta` mark, as its `meta-change` row says it, so the row is its
 /// record's; and a meta value (`value=`) holds 256 encoded bytes, every
-/// byte a row's 256-byte payload shows. It round-trips at the host tier,
-/// leaves no trace on the wire, and an older reader skips it. NEGATIVE
-/// CONTROL: a timer before the epoch is no `U`.
+/// byte a row's 256-byte payload shows.
 #[test]
 fn phase_6_land_at_is_appended_host_only() {
     let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
@@ -1391,20 +1348,16 @@ fn phase_6_land_at_is_appended_host_only() {
 /// need is a `shown` mark keyed on the printed tuple: `need=` (6F-9
 /// appends the printed need words, `aterm_types::needs::NeedWord`'s, to
 /// the need vocabulary), and `sev=` and `held=`, appended after
-/// `land_at=`, WIRE closed words, each absent for none. The mark
-/// round-trips; it is LOCAL, no bus class, so the mirror refuses it; and AN
-/// OLDER READER maps the kind to `unknown` and skips the new keys.
-/// NEGATIVE CONTROL: a word outside a list (`-`, a hold's `fleet` origin) is
-/// refused.
+/// `land_at=`, WIRE closed words, each absent for none.
 #[test]
 fn phase_6_shown_keys_are_appended_wire_and_the_mark_is_local() {
     let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
     assert_eq!(at(Key::Sev), at(Key::LandAt).map(|i| i + 1));
     assert_eq!(at(Key::Held), at(Key::Sev).map(|i| i + 1));
     assert_eq!(
-        FIELDS.len(),
-        at(Key::Held).map_or(0, |i| i + 1),
-        "the last key"
+        at(Key::RowKind),
+        at(Key::Held).map(|i| i + 1),
+        "`row=` follows `held=`"
     );
     assert_eq!(
         (Key::Sev.word(), Key::Sev.tier(), Key::Sev.cap()),
@@ -1469,5 +1422,93 @@ fn phase_6_shown_keys_are_appended_wire_and_the_mark_is_local() {
     assert!(
         Fields::new().word(Key::Held, "fleet").is_err(),
         "an origin is no hold word"
+    );
+}
+
+/// A timeline row the log holds as its row alone is a `row` mark, the KIND
+/// appended after `shown` (the last kind) and its two
+/// KEYS after `held=` (the last key), so no discriminant moves: `row=`, the
+/// ring's kind as a WIRE token (a space a `-`), and `row_text=`, the row's
+/// payload, CONTENT, RAM only. The mark round-trips at the content tier at
+/// its longest; it is LOCAL, no bus class, so the mirror refuses it; the
+/// host tier (the journal's and the carry's) holds no `row_text=` and the
+/// wire neither; AN OLDER READER maps the kind to `unknown` and skips both
+/// keys. CONTROL: a host key's text (`text=`) is in the host line, so the
+/// check sees a leak where one is.
+#[test]
+fn phase_6_row_mark_is_appended_local_and_its_text_never_leaves_ram() {
+    assert_eq!(Kind::ALL.last(), Some(&Kind::Row), "the last kind");
+    let kind_at = |k: Kind| Kind::ALL.iter().position(|x| *x == k);
+    assert_eq!(kind_at(Kind::Row), kind_at(Kind::Shown).map(|i| i + 1));
+    assert_eq!(Kind::Row.word(), "row");
+    assert!(Kind::Row.is_mark() && Kind::Row.node_level().is_none());
+    let at = |key: Key| FIELDS.iter().position(|(k, _, _)| *k == key);
+    assert_eq!(at(Key::RowText), at(Key::RowKind).map(|i| i + 1));
+    assert_eq!(
+        FIELDS.len(),
+        at(Key::RowText).map_or(0, |i| i + 1),
+        "the last key"
+    );
+    assert_eq!(
+        (Key::RowKind.word(), Key::RowKind.tier(), Key::RowKind.cap()),
+        ("row", Tier::Wire, Cap::Tok(aterm_slog::Charset::Lower, 32))
+    );
+    assert_eq!(
+        (Key::RowText.word(), Key::RowText.tier(), Key::RowText.cap()),
+        ("row_text", Tier::Content, Cap::Text(360))
+    );
+    // The ring's longest payload (256 bytes), every byte a space, the
+    // encoding's worst: cut to the cap, and still a record that fits.
+    let text = format!("QZP6ROW1 {}", " ".repeat(256));
+    let r = Rec {
+        seq: 4_294_967_296,
+        t: 1_760_545_012_345,
+        op: Op::Mark,
+        node: Node::SESSION,
+        par: None,
+        k: Kind::Row,
+        f: Fields::new()
+            .tok(Key::RowKind, "spare-adopted")
+            .and_then(|f| f.text(Key::RowText, &text))
+            .expect("a row mark's fields"),
+        src: Src::Aterm,
+        conf: Conf::Exact,
+        by: Actor::Aterm,
+    };
+    let content = encode(&r, Tier::Content).expect("the longest fits");
+    assert!(content.len() <= MAX_RECORD_BYTES, "{}", content.len());
+    assert_eq!(decode(&content), Ok(r.clone()), "{content}");
+    assert!(content.contains(" row=spare-adopted row_text=QZP6ROW1"));
+    let host = encode(&r, Tier::Host).expect("fits");
+    let wire = encode(&r, Tier::Wire).expect("fits");
+    for line in [&host, &wire] {
+        assert!(line.contains(" row=spare-adopted "), "{line}");
+        assert!(
+            !line.contains("row_text=") && !line.contains("QZP6ROW1"),
+            "{line}"
+        );
+    }
+    assert!(!r.is_bus_class() && !r.is_turn_class(), "local");
+    assert_eq!(
+        aterm_slog::encode_mirror(&r, Tier::Wire, 1, None, &|_| None),
+        Err(EncodeError::NotBusClass)
+    );
+    let older = content
+        .replace(" row ", " zz-kind-of-phase-9 ")
+        .replace(" row=", " zz_row=")
+        .replace(" row_text=", " zz_row_text=");
+    let read = decode(&older).expect("an older reader still reads it");
+    assert_eq!(read.k, Kind::Unknown, "{older}");
+    assert_eq!(read.f.iter().count(), 0, "both keys skipped: {older}");
+    // CONTROL: a host key's text is in the host line.
+    let mut leaky = r.clone();
+    leaky.f = Fields::new()
+        .text(Key::Text, "QZP6ROW1")
+        .expect("a host text");
+    assert!(
+        encode(&leaky, Tier::Host)
+            .expect("fits")
+            .contains("QZP6ROW1"),
+        "CONTROL: the host tier holds a host key's text"
     );
 }

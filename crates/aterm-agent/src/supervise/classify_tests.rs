@@ -80,6 +80,7 @@ fn the_session_corpus_classifies_as_the_manager_did() {
 }
 
 /// A `>` inside a quoted string is data; a redirect to /dev/null and a descriptor dup are not
+/// writes; an unquoted `>` is.
 #[test]
 fn quotes_hide_redirect_glyphs_but_not_substitutions() {
     assert!(ro("git log --format='%h <%ae> -> %s' | head"));
@@ -132,6 +133,7 @@ fn danger_tokens_anywhere_fail_the_line() {
 }
 
 /// An unknown head is not read-only even with no danger token; keyword laundering (`do
+/// <cmd>`) is seen through; git needs a read subcommand; read subcommands' write forms fail.
 #[test]
 fn segment_heads_must_be_known_reads() {
     assert!(!ro("./deploy.sh"));
@@ -177,6 +179,7 @@ fn segment_heads_must_be_known_reads() {
 }
 
 /// A wrapper's command is the head: each write behind one is refused with its deciding rule,
+/// and the neighbours stay reads.
 #[test]
 fn a_wrapper_cannot_launder_the_program_it_runs() {
     assert_eq!(classify_command("ls | xargs touch").reason, "touch");
@@ -287,6 +290,8 @@ fn git_branch_creation_and_remote_set_branches_are_writes() {
 }
 
 /// Shell arithmetic expands an array subscript held in a variable's value and runs its
+/// substitution from behind an opaque quote: arithmetic on a non-literal is refused, literal
+/// forms stay reads.
 #[test]
 fn arithmetic_that_can_expand_a_subscript_is_not_a_read() {
     for line in [
@@ -331,6 +336,7 @@ fn arithmetic_that_can_expand_a_subscript_is_not_a_read() {
 }
 
 /// Repository-config hazards (`core.fsmonitor`, `diff.external`, textconv)
+/// are checked on the machine (`policy::git_config`), not here.
 #[test]
 fn git_reads_of_a_chosen_repository_or_through_its_drivers_are_refused() {
     for line in [
@@ -348,6 +354,8 @@ fn git_reads_of_a_chosen_repository_or_through_its_drivers_are_refused() {
 }
 
 /// Read tools' write forms: `git branch -v <name>` creates, `sysctl` sets
+/// with `=`/`-w`, `hostname` sets with an operand or `-F`, `file -C` writes
+/// `magic.mgc`, `tree -R` writes `00Tree.html`, and `<>` opens read-write.
 #[test]
 fn the_write_forms_of_system_reads_are_refused() {
     for line in [
@@ -429,6 +437,7 @@ fn a_python_path_cannot_step_out_of_the_allowlist() {
 }
 
 /// The awk program and the sed script are read from the raw words: what
+/// the quote-stripped scan cannot see.
 #[test]
 fn awk_programs_and_sed_scripts_are_read_not_dropped() {
     assert!(!ro("awk 'BEGIN{system(\"rm -rf x\")}'"));
@@ -488,7 +497,7 @@ fn awk_programs_and_sed_scripts_are_read_not_dropped() {
     );
 }
 
-/// AN AWK PROGRAM RUNS OR WRITES IN EVERY SPELLING AWK READS. MEASURED
+/// AN AWK PROGRAM RUNS OR WRITES IN EVERY SPELLING AWK READS.
 #[test]
 fn an_awk_program_that_runs_or_writes_in_any_spelling_is_no_read() {
     for cmd in [
@@ -536,6 +545,7 @@ fn an_awk_program_that_runs_or_writes_in_any_spelling_is_no_read() {
 }
 
 /// SORT AND GIT TAKE AN ABBREVIATED LONG OPTION FOR THE WHOLE ONE
+/// ([`long_option_spells`]).
 #[test]
 fn an_abbreviated_write_option_is_the_write() {
     for cmd in [
@@ -571,6 +581,7 @@ fn an_abbreviated_write_option_is_the_write() {
 }
 
 /// A substitution is a word of its command here too, its body's words a
+/// segment of their own, first; a parameter is a substitution too.
 #[test]
 fn program_words_resolve_quotes_and_split_where_the_segments_do() {
     assert_eq!(
@@ -650,6 +661,8 @@ fn the_measured_bypasses_are_not_read_only() {
 }
 
 /// `git grep -O`/`--open-files-in-pager` runs the pager without a terminal,
+/// in any cluster or abbreviation; `git <sub> --help`, `git --help <sub>`
+/// and `git -h <sub>` run the configured viewer.
 #[test]
 fn git_grep_pager_spellings_and_git_help_are_not_read_only() {
     for cmd in [
@@ -688,6 +701,7 @@ fn git_grep_pager_spellings_and_git_help_are_not_read_only() {
 }
 
 /// Negative controls for the pre-pass: shapes it reads rather than refuses
+/// stay reads.
 #[test]
 fn comments_heredocs_and_quoting_that_only_read_stay_reads() {
     assert!(ro("git log --oneline -3 # what's new"));
@@ -712,6 +726,10 @@ fn comments_heredocs_and_quoting_that_only_read_stay_reads() {
 }
 
 /// A `#` RIGHT AFTER AN ESCAPED BLANK OR NEWLINE OPENS NO COMMENT: the escaped
+/// character is its word's, so the `#` is too, and what follows on the line
+/// runs (MEASURED 2026-10-22: `echo ab\ #; echo RAN`, the same with a tab
+/// after the backslash, and `echo ab\⏎#; echo RAN` each print `RAN` under
+/// `/bin/bash` 3.2 and `/bin/zsh` 5.9).
 #[test]
 fn a_hash_after_an_escaped_blank_or_newline_opens_no_comment() {
     for cmd in [
@@ -735,6 +753,7 @@ fn a_hash_after_an_escaped_blank_or_newline_opens_no_comment() {
 }
 
 /// A program word is judged where it runs: as an argument it is data; at a
+/// head (also behind a wrapper, keyword or substitution) it is the program.
 #[test]
 fn a_program_word_is_judged_only_at_a_head() {
     assert!(ro("grep -rn open src"));
@@ -783,6 +802,7 @@ fn the_added_reads_are_reads_and_their_neighbours_are_not() {
 }
 
 /// `aterm ctl` is read-only by verb and form: `meta` reads and `meta set` writes the owner's
+/// badge; `inbox` reads and `inbox seen` writes.
 #[test]
 fn aterm_forms_are_judged_by_their_full_subform() {
     for read in [
@@ -829,6 +849,9 @@ fn aterm_forms_are_judged_by_their_full_subform() {
 }
 
 /// A manager's worker verbs: the task record, the wait on it, the result and
+/// the survey only read, so a box that runs one is a read; `task mark` writes
+/// the record and `spawn agent=claude` starts a worker on a task, so a box
+/// that runs either goes to a person under `approve = "safe"`.
 #[test]
 fn the_worker_verbs_are_judged_by_their_form() {
     for read in [
@@ -883,6 +906,8 @@ fn the_worker_verbs_are_judged_by_their_form() {
 }
 
 /// `mark` (phase 3A) writes a claim into a session's log: a worker's `aterm
+/// ctl … mark …` box is judged a write, never auto-approved as a read; the
+/// session log's reads (`log`, `brief`, `await log …`) stay reads.
 #[test]
 fn mark_is_not_a_read_only_ctl_verb() {
     for write in [
@@ -948,6 +973,7 @@ fn strip_quotes_keeps_shape() {
 }
 
 /// A substitution is no separator: it is a word of the segment around
+/// it, and its body's segments come first.
 #[test]
 fn split_segments_sees_every_separator() {
     let segs = split_segments("a; b && c || d | e $(f) (g) x `h`\ni \\; j & k 2>&1 &>l m&>n");
@@ -973,6 +999,7 @@ fn split_segments_sees_every_separator() {
 }
 
 /// A command substitution is a word of the command around it and its body a command line of
+/// its own; a command whose name is unreadable cannot be cleared (`R=rm; $R -rf /usr`).
 #[test]
 fn a_substitution_is_a_word_of_the_command_around_it() {
     for (cmd, reason) in MEASURED_SUBSTITUTION_BYPASSES {
@@ -1109,6 +1136,8 @@ fn a_substitution_is_a_word_of_the_command_around_it() {
 }
 
 /// A redirect may precede a command's name or be glued to it by `&>`, and
+/// zsh runs `- cmd` as `cmd`: `2>/dev/null touch M`, `touch&>/dev/null M`
+/// and `- touch M` all run `touch`.
 #[test]
 fn a_redirect_or_a_dash_before_the_name_does_not_hide_it() {
     for (cmd, reason) in [
@@ -1148,6 +1177,10 @@ fn a_redirect_or_a_dash_before_the_name_does_not_hide_it() {
 }
 
 /// A RESERVED WORD IS A KEYWORD ONLY WHERE A COMMAND BEGINS: behind an assignment, a redirect,
+/// zsh's `-`, `timeout` or a wrapper (`env`, `xargs`, `/usr/bin/time` behind an assignment or a
+/// pipe), bash reads it as the command's name and runs a program by that name (MEASURED, bash
+/// 3.2: with an `if` first on `PATH`, `X=1 if true; echo b` ran it; with a `time` first on `PATH`,
+/// `echo x | time if true` ran that `time` with `if true`).
 #[test]
 fn a_reserved_word_behind_an_assignment_or_a_redirect_is_a_program() {
     for cmd in [
@@ -1208,6 +1241,9 @@ fn a_reserved_word_behind_an_assignment_or_a_redirect_is_a_program() {
 }
 
 /// AN OPTION AFTER `time` IS `/usr/bin/time`'S OWN: behind a pipe or an assignment `time` is the
+/// program, whose `-o FILE` writes FILE (MEASURED, bash 3.2: `ls | time -o out.txt ls` and `X=1
+/// time -o out.txt ls` each made `out.txt`). The head check had passed the `-o` as a fragment, so
+/// each line was a read, and Claude Code 2.1.307's too-many box over one would have been approved.
 #[test]
 fn an_option_after_time_is_the_time_programs_own() {
     for cmd in [
@@ -1242,6 +1278,7 @@ fn an_option_after_time_is_the_time_programs_own() {
 }
 
 /// WHAT A WRAPPER OR `time` RUNS IS NEVER A KEYWORD, in [`runs`] as in the head check: `env if
+/// git status` runs a program `if` (the word `env` execs), not `git`, so `runs` names the `if`.
 #[test]
 fn what_a_wrapper_or_time_runs_is_never_a_keyword() {
     let placed = |line: &str| -> String {
@@ -1275,6 +1312,7 @@ fn what_a_wrapper_or_time_runs_is_never_a_keyword() {
 }
 
 /// AN ARITHMETIC EVALUATION IS REFUSED WHOLE ([`ARITHMETIC_RUNS`]): `$((…))` and `((…))` assign
+/// any variable in their list, the second and later too, and evaluate a value's subscript.
 #[test]
 fn an_arithmetic_evaluation_is_refused_whole() {
     for cmd in [
@@ -1319,6 +1357,7 @@ fn an_arithmetic_evaluation_is_refused_whole() {
 }
 
 /// An awk program or sed script supplied by a parameter is refused like one supplied by a
+/// substitution ([`program_words`] marks every expansion).
 #[test]
 fn an_awk_or_sed_program_from_a_parameter_is_not_read() {
     for (cmd, reason) in [
@@ -1372,6 +1411,8 @@ fn an_awk_or_sed_program_from_a_parameter_is_not_read() {
 }
 
 /// A double-quoted `"$(…)"` or `"$X"` cannot split, but its value can start
+/// with `-`, so where a tool reads options it can be the write or run flag
+/// (`sort "$X" f`, `rg x "$(echo --pre=./x.sh)"`).
 #[test]
 fn an_expansion_in_an_option_slot_is_refused_quoted_or_not() {
     for cmd in [
@@ -1425,6 +1466,9 @@ fn an_expansion_in_an_option_slot_is_refused_quoted_or_not() {
 }
 
 /// zsh arithmetic runs substitutions in array subscripts, and evaluates
+/// `printf` arguments under a numeric format, `-t`'s operand in `test`, `[`
+/// and `[[`, `export -i`/`-E`/`-F` values and integer-variable assignments,
+/// from quoted words, named variables, `"$A"` or globbed names.
 #[test]
 fn zsh_arithmetic_that_can_run_a_command_is_not_a_read() {
     for cmd in [
@@ -1484,6 +1528,8 @@ fn zsh_arithmetic_that_can_run_a_command_is_not_a_read() {
 }
 
 /// bash brace-expands `printf {-vS,%s} /etc`, `printf -{vS,-} /etc` and
+/// `printf -v{S,} /etc` into `printf -vS …`, as a glob `-v?` does beside a
+/// file `-vS`; so an unquoted `{` or glob up to the format is refused.
 #[test]
 fn a_brace_or_glob_word_before_printfs_format_may_be_its_v_option() {
     for cmd in [
@@ -1496,7 +1542,10 @@ fn a_brace_or_glob_word_before_printfs_format_may_be_its_v_option() {
     ] {
         let v = classify_command(cmd);
         assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
-        assert!(v.reason.contains("may be a flag"), "{cmd:?}: {v:?}");
+        assert!(
+            v.reason.contains("may be a flag") || v.reason.starts_with("printf -v"),
+            "{cmd:?}: {v:?}"
+        );
     }
     for cmd in [
         "printf '{%s}\\n' x",
@@ -1509,6 +1558,8 @@ fn a_brace_or_glob_word_before_printfs_format_may_be_its_v_option() {
 }
 
 /// An unreadable git argument is refused anywhere before `--`: it may be
+/// the verb (`remote "$(echo add)"`), change the arity (`config` get vs
+/// set) or be a flag (`diff "$(echo --output=f)"`).
 #[test]
 fn a_git_argument_this_check_cannot_read_is_refused_before_the_double_dash() {
     for cmd in [
@@ -1551,6 +1602,7 @@ fn a_git_argument_this_check_cannot_read_is_refused_before_the_double_dash() {
 }
 
 /// A `for` loop assigning [`ZSH_ARITHMETIC_VARS`] evaluates each word as
+/// arithmetic (`for SECONDS in 'path[$(…)]'`).
 #[test]
 fn a_for_loop_over_a_zsh_arithmetic_variable_is_not_a_read() {
     for cmd in [
@@ -1588,6 +1640,8 @@ fn a_for_loop_over_a_zsh_arithmetic_variable_is_not_a_read() {
 }
 
 /// zsh's `~` flag makes a value a pattern and an unquoted `(` in a word is
+/// a glob qualifier; `(e:…:)` and `(+cmd)` run commands during expansion
+/// (`N='/(e:print -u2 X:)'; echo $~N`).
 #[test]
 fn a_glob_qualifier_that_can_run_a_command_is_not_a_read() {
     for cmd in [
@@ -1638,6 +1692,8 @@ fn a_glob_qualifier_that_can_run_a_command_is_not_a_read() {
 }
 
 /// Under `EXTENDED_GLOB` `^`, `#` and `~` glob too: beside files `-t`,
+/// `-vS` and `S=5`, `[ ^-vS ]` is `[ -t S=5 ]`, and `printf %d 8#A` beside a
+/// file `A` reads `A` as arithmetic.
 #[test]
 fn an_extended_glob_word_may_become_a_flag_or_a_name() {
     for cmd in [
@@ -1664,6 +1720,7 @@ fn an_extended_glob_word_may_become_a_flag_or_a_name() {
 }
 
 /// zsh ties arrays to scalars, so `path=DIR ls`, `for path in DIR; do ls`
+/// run `DIR/ls` and `module_path=DIR; echo $terminfo` loads from `DIR`.
 #[test]
 fn a_tied_array_is_assigned_as_its_scalar() {
     for cmd in [
@@ -1695,6 +1752,8 @@ fn a_tied_array_is_assigned_as_its_scalar() {
 }
 
 /// Parameters whose value zsh runs or loads during reads
+/// ([`ZSH_RUNS_A_VALUE`]) and `STTY`: `READNULLCMD=DIR/x; < f` and
+/// `NULLCMD=DIR/x; > /dev/null` run `DIR/x`.
 #[test]
 fn a_parameter_zsh_runs_is_a_hazard() {
     for cmd in [
@@ -1741,6 +1800,8 @@ fn a_parameter_zsh_runs_is_a_hazard() {
 }
 
 /// Inside a `${…}` operand a `$` form expands as it does bare, so the bare
+/// refusals apply there (`${x:-$path[A]}`, `${x:-$~N}`), as do subscripts
+/// behind zsh's flags (`$=A[A]`).
 #[test]
 fn a_dollar_form_inside_a_braced_operand_is_refused_as_it_is_bare() {
     for cmd in [
@@ -1779,6 +1840,8 @@ fn a_dollar_form_inside_a_braced_operand_is_refused_as_it_is_bare() {
 }
 
 /// zsh subscripts special parameters as it does names (`$*[A]`, `$@[A]`,
+/// `$#[A]`… with `A='path[$(cmd)]'`), bare, in `${…}` operands and in
+/// unquoted here-document bodies.
 #[test]
 fn a_subscript_on_a_special_parameter_is_refused() {
     for sub in [
@@ -1825,6 +1888,9 @@ fn a_subscript_on_a_special_parameter_is_refused() {
 }
 
 /// `${NAME:=v}` and `${NAME=v}` assign like `NAME=v`: `${REPORTTIME:=A}`
+/// before a pipe, `${DIRSTACKSIZE:=A}` before a `cd`, `${ERRNO:=A}` alone
+/// run a subscript, and `${NULLCMD:=DIR/x}` acts like `NULLCMD=DIR/x`; also
+/// in here-document bodies.
 #[test]
 fn a_default_assignment_is_judged_as_an_assignment() {
     for cmd in [
@@ -1858,6 +1924,8 @@ fn a_default_assignment_is_judged_as_an_assignment() {
 }
 
 /// [`classify_except_rm`] still judges redirects on the skipped `rm` and
+/// `mktemp` segments: `mktemp > ~/.zshrc; rm -rf /tmp/w/x` (and `>>`, `2>`,
+/// `&>`, `1<>`, quoted targets) truncates a file.
 #[test]
 fn a_redirect_on_a_left_out_segment_is_judged() {
     for cmd in [
@@ -1890,6 +1958,7 @@ fn a_redirect_on_a_left_out_segment_is_judged() {
 }
 
 /// zsh's `printf` decodes Unicode escapes in its format first, so `\u0025d` is `%d` and runs a
+/// subscript; [`numeric_format`] (shared with the rm rule) must see it.
 #[test]
 fn a_unicode_escape_in_a_printf_format_may_be_a_conversion() {
     for format in [
@@ -1976,6 +2045,8 @@ fn sed_capital_i_edits_in_place() {
 }
 
 /// bash's `${!NAME}` expands the variable named by NAME's value, evaluating
+/// its subscript (`A='a[$(…)]'; echo "${!A}"`); refused, in here-documents
+/// too.
 #[test]
 fn a_bash_indirection_is_not_literal() {
     for cmd in [
@@ -2010,6 +2081,7 @@ fn a_bash_indirection_is_not_literal() {
 }
 
 /// zsh runs a command written after a closing `}` or `]]` in the same list (`{ ls } always {
+/// ./p/x }`, `if [[ -n a ]] ./p/x`), which a word reader would take as an argument.
 #[test]
 fn a_word_after_a_closing_brace_is_a_command() {
     for cmd in [
@@ -2050,6 +2122,9 @@ fn a_word_after_a_closing_brace_is_a_command() {
 }
 
 /// Fail-safe regressions of the tests above: a redirect after a closing word
+/// is the compound's own (`{ ls; echo } 2>&1 | head`) and its target is still
+/// judged; a `}` or `]]` with no opener closes nothing; `${!#}` is the last
+/// positional, not an indirection.
 #[test]
 fn a_closing_word_redirect_and_an_unopened_close_stay_reads() {
     for cmd in [
@@ -2095,6 +2170,9 @@ fn a_closing_word_redirect_and_an_unopened_close_stay_reads() {
 }
 
 /// zsh closes a `{` group at a `}` glued to a word's end, unless the word's
+/// own braces balance: `{ echo a} always { cmd }` and `{ echo ${HOME}}
+/// always { cmd }` run `cmd`. Negative controls: balanced braces (`{a,b}`,
+/// `${HOME}`, `{}`), an escaped `}`, and a glued close ending its segment.
 #[test]
 fn a_brace_glued_to_a_word_closes_the_group() {
     for cmd in [
@@ -2134,6 +2212,10 @@ fn a_brace_glued_to_a_word_closes_the_group() {
 }
 
 /// The reads a worker writes are plain; every form known to run a command under zsh is not, by
+/// the character that opens it rather than by a rule of its own, and neither is any expansion
+/// but a plain parameter read or command substitution
+/// ([`a_plain_line_admits_only_the_expansions_zsh_takes_no_further_than_bash`]), so a form
+/// nobody has measured needs one of these characters too.
 #[test]
 fn a_plain_line_expands_nothing() {
     for line in [
@@ -2207,6 +2289,13 @@ fn a_plain_line_expands_nothing() {
 }
 
 /// A PLAIN LINE ADMITS ONLY THE EXPANSIONS ZSH TAKES NO FURTHER THAN BASH (MEASURED 2026-10-22
+/// against `/bin/zsh` 5.9 run as Claude Code's Bash tool runs it, a scratch HOME and ZDOTDIR,
+/// `docs/measured/breaker-transcript-and-zsh-2026-10-22.md`): a parameter read `$NAME` or
+/// `${NAME}`, quoted or not (zsh neither splits nor globs it unquoted; bash does both), and a
+/// command substitution `$(…)` over a plain line (zsh splits and does not glob it; bash globs
+/// too), nested, quoted, and with quotes inside; the classifier still judges what each runs and
+/// which words it feeds (`printf %d "path[$(id)]"` is plain and no read: zsh evaluates printf's
+/// numeric argument as arithmetic).
 #[test]
 fn a_plain_line_admits_only_the_expansions_zsh_takes_no_further_than_bash() {
     for line in [
@@ -2284,5 +2373,237 @@ fn a_plain_line_admits_only_the_expansions_zsh_takes_no_further_than_bash() {
         "echo $(echo /a/b):h",
     ] {
         assert!(plain_zsh_line(line).is_err(), "{line:?} must not be plain");
+    }
+}
+
+/// A write-or-run flag the classifier keys on is still caught when a single
+/// quote, a double quote or a backslash hides it from the quote-stripped scans:
+/// the shell strips the quote before the tool, so the tool writes or runs all
+/// the same (MEASURED 2026-10-22 under `/bin/zsh` 5.9 and `/bin/bash` 3.2 with
+/// macOS `find`/`sort`/`sed` and GNU `gsed`;
+/// `docs/measured/classifier-quoted-flags-2026-10-22.md`). The argv-word scan
+/// ([`argv_flag_hazard`]) reads these where [`danger_scan`] over the
+/// quote-stripped words sees only a blanked `""`.
+///
+/// MUTANT: drop the `argv_flag_hazard` call in `classify_command_with` (or make
+/// `flag_hazard_at` read the quote-stripped words only) and every line here
+/// classifies read-only — this test fails.
+#[test]
+fn a_quoted_or_escaped_write_flag_is_still_a_write() {
+    for cmd in [
+        // find actions, each spelling of the quote.
+        "find . '-delete'",
+        "find . \"-delete\"",
+        "find . \\-delete",
+        "find . '-exec' rm {} ';'",
+        "find . '-execdir' sh {} ';'",
+        "find . '-ok' rm {} ';'",
+        "find . '-fprint' f",
+        "find . '-fls' f",
+        // sed in place; macOS `-I` too.
+        "sed '-i' s/a/b/ f",
+        "sed \"-i\" s/a/b/ f",
+        "sed '-I' s/a/b/ f",
+        "sed -n '-i' s/a/b/ f",
+        // sort / tree output file, long and short.
+        "sort '-o' out in",
+        "sort '--output=out' in",
+        "sort '--compress-program=./cp.sh' -S 1M big",
+        "tree '-o' out.html",
+        // less / more initial command, log file, lesskey.
+        "less '+!id' f",
+        "less '-o' log f",
+        "less '-k' key f",
+        "more '+1' f",
+        // the per-head run-or-write flags.
+        "file '-C' -m m",
+        "rg '--pre' sh x",
+        "rg '--pre=sh' x",
+        "printf '-v' X %s y",
+        // git read subcommands' write/run flags.
+        "git log '--output=x'",
+        "git log '--ext-diff'",
+        "git diff '--textconv'",
+        "printf '-vx[1]' hi",
+        // In a later segment, after `&&`, and inside a substitution.
+        "ls | sort '-o' out",
+        "cd d && find . '-delete'",
+        "echo \"$(find . '-delete')\"",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+    }
+}
+
+/// NEGATIVE CONTROL for [`a_quoted_or_escaped_write_flag_is_still_a_write`]: a quoted operand that
+/// is no flag token stays a read (a word that is exactly one, such as `'-delete'`, is refused as
+/// its unquoted spelling is, whatever program it follows).
+#[test]
+fn quoting_a_data_word_that_is_not_a_flag_stays_a_read() {
+    for cmd in [
+        "cat 'my file'",
+        "git -C 'my dir' status",
+        "git log --format='%h <%ae> -> %s' | head",
+        "grep -n 'rm -rf' notes.md",
+        "echo \"git push later\"",
+        "echo \">\"",
+        "echo '-delete is a word'",
+        "sort in1 in2",
+        "less file.txt",
+        "find . -name '*.rs'",
+        "printf '%s\\n' hello",
+        "git log --format='%H'",
+    ] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+    }
+}
+
+/// The breaker's read-only check of the rest of an rm line
+/// ([`classify_except_rm`]) runs the same argv-word flag scan on its non-rm
+/// segments, so a quoted or escaped write flag there is still a write. NEGATIVE
+/// CONTROL: the same line with a plain read in place of the hidden flag stays
+/// read-only.
+///
+/// MUTANT: drop the argv-word pass in `classify_except_rm` and the first group
+/// classifies read-only — this test fails.
+#[test]
+fn a_quoted_flag_on_the_rest_of_an_rm_line_is_still_a_write() {
+    for cmd in [
+        "find /tmp/w '-delete'; rm -rf /tmp/w/x",
+        "sort '-o' /tmp/w/out /tmp/w/in; rm -rf /tmp/w/x",
+        "sed '-i' s/a/b/ /tmp/w/f && rm -rf /tmp/w/x",
+        "rm -rf /tmp/w/x; find /tmp/w '-exec' rm {} ';'",
+        "rg '--pre' sh x; rm -rf /tmp/w/x",
+        "less '+!id' f; rm -rf /tmp/w/x",
+        "file '-C' x; rm -rf /tmp/w/x",
+        "git remote 'add' x /p; rm -rf /tmp/w/x",
+        "git config '-e'; rm -rf /tmp/w/x",
+    ] {
+        let v = classify_except_rm(cmd, &[] as &[&str]);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+    }
+    for cmd in [
+        "find /tmp/w -type f; rm -rf /tmp/w/x",
+        "sort /tmp/w/in; rm -rf /tmp/w/x",
+        "sed -n p /tmp/w/f && rm -rf /tmp/w/x",
+        "rg x /tmp/w; rm -rf /tmp/w/x",
+        "git remote -v; rm -rf /tmp/w/x",
+        // The rm command itself is the resolver's, not this scan's.
+        "rm -f -- '-delete'",
+    ] {
+        let v = classify_except_rm(cmd, &[] as &[&str]);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+    }
+}
+
+/// A program `find -exec` runs is judged by its own write flags too: `file -C` writes magic.mgc
+/// (MEASURED 2026-10-22). NEGATIVE CONTROL: the same programs reading stay reads.
+#[test]
+fn a_find_exec_programs_write_flag_is_a_write() {
+    for cmd in [
+        "find . -exec file -C {} ;",
+        "find . -exec file --compile {} \\;",
+        "find . -execdir file -C {} +",
+        "find . -ok /usr/bin/file -C -m x {} ;",
+        "find . -exec file '-C' {} ';'",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        assert!(v.reason.contains("file"), "{cmd:?}: {v:?}");
+    }
+    for cmd in [
+        "find . -exec file {} ;",
+        "find . -type f -exec file -b {} \\; -print",
+        "find . -exec grep -l foo {} +",
+    ] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+    }
+}
+
+/// A git read's write form is read on the argv words too, and a remote's verb is its first
+/// operand: each of these wrote (MEASURED 2026-10-22, git 2.54.0). NEGATIVE CONTROL: the
+/// listing forms, quoted or not, stay reads.
+#[test]
+fn a_quoted_git_verb_or_flag_is_still_a_write() {
+    for cmd in [
+        "git remote 'add' x /p",
+        "git remote \"rename\" a b",
+        "git -C 'my dir' remote 'add' x /p",
+        "git remote -v add x /p",
+        "git remote --verbose add x /p",
+        "git config '--edit'",
+        "git config '-e'",
+        "git branch -r '-D' origin/x",
+        "git branch -a '-m' a b",
+        "git branch -a '-c' a c",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+    }
+    for cmd in [
+        "git remote -v",
+        "git remote show origin",
+        "git -C 'my dir' remote -v",
+        "git branch -a",
+        "git branch --list 'feat*'",
+        "git config --get 'user.name'",
+        "git config 'user.name'",
+    ] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
+    }
+}
+
+/// A word the shell may brace-expand or glob into a flag, a verb or another operand is refused
+/// where a flag selects a write: each wrote under zsh 5.9 and bash 3.2 (MEASURED 2026-10-22; the
+/// globs beside a planted file such as `-delete`, `-o.txt`, `-C` or `add`). So is an expansion
+/// past `--` where `--` ends no write (`find`'s primaries, `sysctl`'s `name=value`, a split into
+/// two of uniq's operands or a config set). NEGATIVE CONTROL: words that expand only into their
+/// own literal start (`HEAD~1`, `./*`, `src/*.rs`), globs past `--`, and `{}`.
+#[test]
+fn a_brace_or_glob_word_that_may_become_a_write_flag_is_refused() {
+    for cmd in [
+        "find d -{delete,true}",
+        "find d -del*",
+        "find d '-'del*",
+        "find . -{exec,true} rm {} ;",
+        "sort *.txt",
+        "sed -n 1p *.txt",
+        "uniq *.txt",
+        "uniq a{,2}.txt",
+        "file *",
+        "sysctl k*",
+        "find -- d $X",
+        "uniq -- $X",
+        "sysctl -- \"$X\"",
+        "git remote {add,o} /p",
+        "git remote ad? x /p",
+        "git log --{output,stat}=x",
+        "git config user.{name,email}",
+        "git config -- $X",
+        "git -C {a,b} status",
+    ] {
+        let v = classify_command(cmd);
+        assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+    }
+    for cmd in [
+        "git diff HEAD~1",
+        "git log HEAD^..HEAD",
+        "git log @{u}..",
+        "git log -- *.rs",
+        "find . -name '*.rs'",
+        "find . -name x -exec ls {} +",
+        "ls *.rs",
+        "wc -l *.rs",
+        "file ./*",
+        "file -- *",
+        "sort -- *.txt",
+        "sed -n 1p src/*.rs",
+        "uniq in.txt",
+    ] {
+        let v = classify_command(cmd);
+        assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
     }
 }

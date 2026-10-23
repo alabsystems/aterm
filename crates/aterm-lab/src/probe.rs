@@ -1,42 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Does the lab's jail hold? (`probe [tag] [--replica]`; the selftests run
-//! `--replica`, which never touches the owner's tree.)
-//!
-//! For each WORLD the same checks run twice: outside any sandbox (the control:
-//! is the thing reachable at all?) and inside `sandbox-exec -f <the world's
-//! profile> aterm-lab probe-inside …`, and the two are compared. A denial
-//! counts only where the control got through: a thing this machine does not
-//! have, or one that is unreachable outside the jail too (no privacy consent,
-//! say), proves nothing about the jail and is reported as such.
-//!
-//! * this lab's `jail.sb`, against THIS machine: the owner's real paths and
-//!   live sockets (the lab's own profile when it is up, a fresh render of the
-//!   same rules otherwise); refused under a scratch `HOME` (an agent's run:
-//!   its unjailed controls would stat and open the account's own protected
-//!   entries), where only `--replica` runs;
-//! * a replica home: the same rules rendered for a scratch home that holds
-//!   every entry of the protected list, a socket where the owner's live aterm
-//!   and Claude Code keep theirs, the socket of a second private instance, the
-//!   agents in a replica of aterm's package store (a Codex build with its
-//!   package file, and another build beside it), the scratch's own
-//!   directories and a replica of the user temp dir's xcrun cache, so every
-//!   rule is proven whatever data this machine has. Its run, state and temp
-//!   dirs sit in the lab's state dir (only their own rules deny them there; a
-//!   `/tmp/labprobe.*` path is denied to every jail as a whole), its sockets in
-//!   `/tmp` (socket names are limited to 103 bytes). No jail writes either
-//!   place, so nothing a jail planted is followed by the probe's unjailed
-//!   controls or by the files it builds.
-//!
-//! Nothing leaves the machine and nothing of the owner's is read: the owner's
-//! real tree gets `stat`, `access` and an `open` without a read, the live
-//! sockets get a connect only INSIDE the jail (the control only looks at
-//! them), and the "external" connect is a UDP `connect()`, which sends no
-//! packet. A replica file is read for real. To see the probes still bite after
-//! a change to the profile, delete a line of a rendered profile and probe
-//! again: it must FAIL (do that with a scratch HOME and socket directory, so a
-//! mutant that opens a socket cannot reach the owner's live aterm).
+//! Sandbox probe (`probe [tag] [--replica]`) verifying the lab's `jail.sb` profile.
 
 use std::fs;
 use std::io::{Read as _, Write as _};
@@ -51,7 +16,7 @@ use crate::run::{Run, is_run, take_tag};
 use crate::sys::io_errname;
 use crate::{Fail, Res};
 
-/// What a check wants inside the jail.
+/// Expected outcome of a probe check inside the jail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Want {
     /// The jail refuses it.
@@ -60,60 +25,59 @@ pub enum Want {
     Allowed,
 }
 
-/// One operation, run outside and inside the jail.
+/// Probe operation executed outside and inside the jail.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Op {
-    /// `stat`, then a read (replica) or an open without a read (the owner's tree).
+    /// `stat`, then a read (replica) or an open without a read.
     Reach(String, bool),
-    /// Create (exclusively, then remove), open for appending, or replace by a rename.
+    /// Create, append, or replace a file.
     Write(String, WriteHow),
-    /// Connect to a unix socket; a LIVE one is only looked at outside the jail.
+    /// Connect to a Unix domain socket.
     Unix(String, bool),
-    /// A UDP connect to TEST-NET-1.
+    /// UDP connect to `TEST-NET-1`.
     Udp,
-    /// Bind, listen, connect and accept: in a directory (unix) or on loopback.
+    /// Bind, listen, connect, and accept on a Unix socket or loopback.
     Serve(Option<String>),
     /// `bootstrap_look_up` of a Mach service.
     Mach(String),
-    /// A kernel policy query only: never looks up a service or reads preferences.
+    /// Kernel sandbox policy query for preferences.
     PreferencePolicy(String, String),
-    /// Open and map a parent-owned named shared-memory canary read-only.
+    /// Open and map a parent-owned shared-memory canary read-only.
     #[cfg(test)]
     ShmRead(String),
-    /// `kill(…, 0)` of the parent, self, a child or a grandchild.
+    /// `kill(…, 0)` of the parent, self, child, or grandchild.
     Signal(String),
-    /// Start `/usr/bin/security`, `/usr/bin/open`, `/bin/ps`, or the tripwire
-    /// or the open recorder by their bare names.
+    /// Execute a system utility or lab shim binary.
     Exec(String, String),
-    /// Read and run the Claude Code binary.
+    /// Read and execute the Claude Code binary.
     Claude(String),
-    /// `TIOCSTI` on a terminal of its own.
+    /// `TIOCSTI` ioctl on a self-owned PTY.
     Tiocsti,
-    /// Remove (unlink, rename or rmdir) a thing the unjailed lab trusts, put back at once.
+    /// Unlink, rename, or remove and immediately restore a path.
     Remove(String, RemoveHow),
-    /// A directory's metadata only (`stat`), or its listing.
+    /// Stat or list a directory.
     Meta(String, bool),
 }
 
-/// How [`Op::Write`] writes.
+/// Write mode for [`Op::Write`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriteHow {
     /// Create exclusively, then remove.
     Create,
-    /// Open for appending; nothing is appended.
+    /// Open for appending without writing.
     Append,
-    /// A file of its own renamed over it, the way a writer replaces a file (replica only).
+    /// Rename a temporary file over the target (replica only).
     Replace,
 }
 
-/// How [`Op::Remove`] removes.
+/// Removal mode for [`Op::Remove`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RemoveHow {
-    /// A hard link first, then unlink and link back (the live socket stays bound through its inode).
+    /// Hard-link a backup, unlink, and restore.
     Unlink,
     /// Rename away and back.
     Rename,
-    /// Remove an empty directory and make it again.
+    /// Remove an empty directory and recreate it.
     Rmdir,
 }
 
@@ -355,7 +319,6 @@ fn exec(what: &str, shim: &str, jailed: bool) -> String {
         Err(e) => io_errname(&e),
     };
     match what {
-        // the keychain CLI: inside the jail it cannot start
         "security" if !jailed => {
             if crate::sys::executable("/usr/bin/security") {
                 "yes".into()
@@ -369,7 +332,6 @@ fn exec(what: &str, shim: &str, jailed: bool) -> String {
                 .output(),
             &|_| true,
         ),
-        // the desktop's opener: inside the jail it cannot start (`-h` opens nothing)
         "open" if !jailed => {
             if crate::sys::executable("/usr/bin/open") {
                 "yes".into()
@@ -383,7 +345,6 @@ fn exec(what: &str, shim: &str, jailed: bool) -> String {
                 .output(),
             &|_| true,
         ),
-        // the lab's stand-in for open and BROWSER: answers 0, opens nothing
         "recorder" => rc(
             aterm_uds::spawnfd::command(format!("{shim}/open"))
                 .env_clear()
@@ -393,7 +354,6 @@ fn exec(what: &str, shim: &str, jailed: bool) -> String {
                 .output(),
             &|o| o.status.success(),
         ),
-        // the setuid ps the harness reads process facts through
         "ps" => {
             let me = std::process::id().to_string();
             rc(
@@ -403,7 +363,6 @@ fn exec(what: &str, shim: &str, jailed: bool) -> String {
                 &|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains(&me),
             )
         }
-        // a bare-name call lands on the tripwire, which answers 44
         _ => rc(
             aterm_uds::spawnfd::command("security")
                 .env_clear()
@@ -416,9 +375,7 @@ fn exec(what: &str, shim: &str, jailed: bool) -> String {
     }
 }
 
-/// `TIOCSTI` puts a byte into a terminal's input queue as if typed. A child in
-/// a session of its own takes a PTY it owns as its controlling terminal (the
-/// one terminal `TIOCSTI` is allowed on) and tries; inside the jail it must be refused.
+/// `TIOCSTI` puts a byte into a terminal's input queue as if typed.
 fn tiocsti() -> String {
     let Ok(exe) = std::env::current_exe() else {
         return "no exe".into();
@@ -437,7 +394,7 @@ fn tiocsti() -> String {
     }
 }
 
-/// `aterm-lab probe-tiocsti`: the child half of [`tiocsti`].
+/// Entry point for `aterm-lab probe-tiocsti`.
 #[must_use]
 pub fn tiocsti_child() -> i32 {
     let res = match aterm_pty::open_pty_pair() {
@@ -452,9 +409,7 @@ pub fn tiocsti_child() -> i32 {
 
 /// Remove or move something the unjailed lab trusts (the control socket, its
 /// token, their directory, the scratch's directories), harmlessly: what is
-/// removed is put back at once. A hard link gives it a second name first, so
-/// even the live control socket (bound through its inode) is back under its
-/// own name; a removed directory is made again.
+/// removed is put back at once.
 fn remove(path: &str, how: RemoveHow) -> String {
     let keep = format!("{path}.probe-keep");
     let r = (|| -> std::io::Result<Option<String>> {
@@ -486,55 +441,55 @@ fn remove(path: &str, how: RemoveHow) -> String {
     }
 }
 
-/// One check of a world.
+/// Single probe check specification.
 #[derive(Clone, Debug)]
 pub struct Check {
-    /// What it tries, for the report.
+    /// Human-readable description for the report.
     pub label: String,
-    /// What it wants inside the jail.
+    /// Expected outcome inside the jail.
     pub want: Want,
-    /// The operation.
+    /// Operation to execute.
     pub op: Op,
-    /// Whether the control run outside the jail is meaningful and harmless.
+    /// Whether the unjailed control run is executed.
     pub control: bool,
-    /// Whether a thing that is not there is no failure.
+    /// Whether an absent target is non-fatal.
     pub absent_ok: bool,
 }
 
-/// A world the checks run against.
+/// Target environment against which probe checks run.
 #[derive(Clone, Debug)]
 pub struct World {
-    /// Its name in the report.
+    /// World name in the report.
     pub name: String,
-    /// The replica home (every protected path exists).
+    /// Whether this world is a synthetic replica home.
     pub replica: bool,
-    /// Its home.
+    /// Target home directory.
     pub home: String,
-    /// The caller's separate HOME (a second owned home in the replica).
+    /// Caller's separate `HOME` directory.
     pub caller_home: String,
-    /// Its Claude socket directory.
+    /// Claude socket directory.
     pub cc: String,
-    /// Its run directory.
+    /// Lab run directory.
     pub run: String,
-    /// Its socket directory.
+    /// Lab socket directory.
     pub sockdir: String,
-    /// Its profile.
+    /// Sandbox profile path.
     pub jail: PathBuf,
-    /// The Claude Code binary it allows.
+    /// Allowed Claude Code binary path.
     pub claude: String,
-    /// The Codex binary it allows (empty: none).
+    /// Allowed Codex binary path (empty if none).
     pub codex: String,
-    /// The tripwire's and the open recorder's directory.
+    /// Directory holding the tripwire and `open` recorder shims.
     pub shim: String,
-    /// The lab's state dir (its `runs/` no jailed write may reach).
+    /// Lab state directory.
     pub state: String,
-    /// The lab's own program and source directories.
+    /// Lab program and source directories.
     pub lab_dirs: Vec<String>,
-    /// The aterm the lab's door runs (empty: none).
+    /// `aterm` binary path used by the lab door.
     pub aterm: String,
-    /// The user temp dir whose xcrun cache no jailed process may write.
+    /// Per-user temporary directory containing `xcrun_db`.
     pub usertmp: String,
-    /// The checkout's `target/debug` and `target/release` (physical), where a later `up` may pick an aterm.
+    /// Checkout `target/debug` and `target/release` directories.
     pub build_dirs: Vec<String>,
 }
 
@@ -568,8 +523,7 @@ fn home_canaries(w: &World) -> Vec<String> {
         .collect()
 }
 
-/// The checks of one world; `decoy` is the socket of another private
-/// instance, `other_dirs` another lab's socket dir and another probe's scratch in `/tmp`.
+/// Builds the list of [`Check`]s for `w`.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn plan(w: &World, decoy: &str, other_dirs: &[String]) -> Vec<Check> {
@@ -578,7 +532,6 @@ pub fn plan(w: &World, decoy: &str, other_dirs: &[String]) -> Vec<Check> {
         Some(rest) => format!("{}{rest}", if w.replica { "<replica>" } else { "~" }),
         None => path.to_string(),
     };
-    // the group names the rule a check proves (data, sockets, terminal, network, signals, keychain, writes)
     let mut add = |_group: &'static str,
                    label: String,
                    want: Want,
@@ -594,7 +547,6 @@ pub fn plan(w: &World, decoy: &str, other_dirs: &[String]) -> Vec<Check> {
         });
     };
     use Want::{Allowed, Denied};
-    // -- the owner's data: neither readable nor writable
     for (kind, path) in protected_paths(&w.home, &w.cc) {
         if w.replica {
             let here: Vec<String> = match kind {
@@ -695,8 +647,6 @@ pub fn plan(w: &World, decoy: &str, other_dirs: &[String]) -> Vec<Check> {
             false,
         );
     }
-    // Query the sandbox instead of touching the owner's actual preferences
-    // daemons/domains. The allow-default control must admit each operation.
     for (scope, name) in [
         ("global", "com.apple.cfprefsd.daemon"),
         ("global", "com.apple.cfprefsd.agent"),
@@ -720,7 +670,6 @@ pub fn plan(w: &World, decoy: &str, other_dirs: &[String]) -> Vec<Check> {
         true,
         false,
     );
-    // -- unix sockets: only the lab's own socket dir
     add(
         "sockets",
         format!("connect to the socket of another private instance ({decoy})"),
@@ -767,9 +716,6 @@ pub fn plan(w: &World, decoy: &str, other_dirs: &[String]) -> Vec<Check> {
         true,
         false,
     );
-    // -- the control socket the unjailed client trusts: no removing, no moving, no planting a link in its place
-    // (in the lab's own world these touch the LIVE socket, put back at once: the control run is skipped there,
-    // so the only attempt is the one inside the jail, and the replica's decoys get both)
     for n in ["a.sock", "a.sock.token"] {
         for how in [RemoveHow::Unlink, RemoveHow::Rename] {
             add(
@@ -793,9 +739,6 @@ pub fn plan(w: &World, decoy: &str, other_dirs: &[String]) -> Vec<Check> {
         w.replica,
         false,
     );
-    // -- the scratch's own directories and the project dir, which the lab writes and reads through from outside the
-    // jail: no removing or moving one (a link planted in its place would lead the lab into the owner's data); in the
-    // lab's own world these are the live ones, put back at once, and the control run is skipped, as for the socket
     let scratch = format!("{}/scratch", w.run);
     for n in std::iter::once("").chain(SCRATCH_DIRS.iter().copied()) {
         let (what, path) = if n.is_empty() {
@@ -828,7 +771,6 @@ pub fn plan(w: &World, decoy: &str, other_dirs: &[String]) -> Vec<Check> {
         w.replica,
         false,
     );
-    // -- the terminal: no keystroke into any terminal's input queue
     add(
         "terminal",
         "TIOCSTI on a terminal of its own (puts a byte into the input queue as if typed)".into(),
@@ -837,7 +779,6 @@ pub fn plan(w: &World, decoy: &str, other_dirs: &[String]) -> Vec<Check> {
         true,
         false,
     );
-    // -- network: loopback only
     add(
         "network",
         "UDP connect to 192.0.2.1:9 (TEST-NET-1, not loopback; a connect sends no packet)".into(),
@@ -854,7 +795,6 @@ pub fn plan(w: &World, decoy: &str, other_dirs: &[String]) -> Vec<Check> {
         true,
         false,
     );
-    // -- signals: only the lab's own
     add(
         "signals",
         "signal the process that started the jail (an unjailed process of the same uid)".into(),
@@ -873,7 +813,6 @@ pub fn plan(w: &World, decoy: &str, other_dirs: &[String]) -> Vec<Check> {
             false,
         );
     }
-    // -- keychain: the sandbox answers before it looks the name up, so a denial is exact either way
     for n in MACH_DENY {
         add(
             "keychain",
@@ -900,7 +839,6 @@ pub fn plan(w: &World, decoy: &str, other_dirs: &[String]) -> Vec<Check> {
         true,
         false,
     );
-    // -- the desktop: nothing opens a URL or an app there (a sign-in's browser): Launch Services' open doors, /usr/bin/open
     for n in MACH_DENY_OPEN {
         add(
             "desktop",
@@ -927,7 +865,6 @@ pub fn plan(w: &World, decoy: &str, other_dirs: &[String]) -> Vec<Check> {
         true,
         false,
     );
-    // -- writes: nowhere in the owner's home or the run directory, but the scratch
     add(
         "writes",
         "create a file in the owner's home".into(),
@@ -954,7 +891,6 @@ pub fn plan(w: &World, decoy: &str, other_dirs: &[String]) -> Vec<Check> {
             false,
         );
     }
-    // ... nor in another lab's socket dir or another probe's scratch in /tmp (the lab reads and writes them outside the jail)
     for d in other_dirs {
         let shape = Path::new(d)
             .file_name()
@@ -975,9 +911,6 @@ pub fn plan(w: &World, decoy: &str, other_dirs: &[String]) -> Vec<Check> {
             false,
         );
     }
-    // ... nor the xcrun shims' cache, which /usr/bin/python3, cc, git and the owner's shells trust (the owner's real one:
-    // an open for appending, nothing appended, inside the jail only; the replica's is also replaced and moved, and its
-    // temp dir moved)
     let db = format!("{}/xcrun_db", w.usertmp);
     add(
         "writes",
@@ -1020,9 +953,6 @@ pub fn plan(w: &World, decoy: &str, other_dirs: &[String]) -> Vec<Check> {
             false,
         );
     }
-    // ... nor in what the lab trusts from outside the jail, wherever it sits: the state dir (it reads runs/*/env.sh),
-    // its own program and source, the aterm its door runs; and the state dir's parent stays put (the replica's:
-    // moving the real one is no probe)
     add(
         "writes",
         "create a file in the lab's state dir, runs/ (aterm-lab reads each runs/*/env.sh)".into(),
@@ -1058,8 +988,6 @@ pub fn plan(w: &World, decoy: &str, other_dirs: &[String]) -> Vec<Check> {
             false,
         );
     }
-    // ... nor the builds a later call may run in its place (this checkout's target/debug and target/release; on the
-    // replica home, a checkout outside that home, where only their own rule denies it)
     for d in w.build_dirs.iter().filter(|d| Path::new(d).is_dir()) {
         add(
             "writes",
@@ -1100,7 +1028,6 @@ pub fn plan(w: &World, decoy: &str, other_dirs: &[String]) -> Vec<Check> {
         true,
         false,
     );
-    // -- what the lab keeps working
     add(
         "allowed",
         "run /bin/ps (the setuid ps, outside the sandbox)".into(),
@@ -1127,8 +1054,6 @@ pub fn plan(w: &World, decoy: &str, other_dirs: &[String]) -> Vec<Check> {
             false,
         );
     }
-    // -- the store above the Codex: its build is readable, the directories above it up to aterm's own give their
-    // metadata only (Codex resolves its own path), no listing, and no other build is readable
     if w.replica && !w.codex.is_empty() {
         let build = Path::new(&w.codex)
             .parent()
@@ -1222,20 +1147,20 @@ fn sorted_glob(dir: &str, suffix: &str) -> Vec<String> {
     v
 }
 
-/// How one check came out.
+/// Verdict of a single probe check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
-    /// It held.
+    /// Check passed.
     Ok,
-    /// It did not.
+    /// Check failed.
     Fail,
-    /// The thing is not on this machine (only the replica proves its rule).
+    /// Target is absent on this machine.
     Absent,
-    /// Refused inside, but unreachable outside too: proves nothing.
+    /// Refused inside the jail, but also unreachable outside.
     Unproven,
 }
 
-/// Judge one check from its two outcomes.
+/// Evaluates a [`Check`] from its unjailed and jailed outcomes.
 #[must_use]
 pub fn judge(
     replica: bool,
@@ -1300,7 +1225,6 @@ fn build_replica(w: &World) -> std::io::Result<()> {
             fs::write(&n, "replica\n")?;
         }
     }
-    // the agents under test in the store, a package file beside the Codex's bin/, and another build beside it
     use std::os::unix::fs::PermissionsExt as _;
     for b in [w.claude.clone(), w.codex.clone(), sibling_build(w)] {
         if let Some(d) = Path::new(&b).parent() {
@@ -1316,15 +1240,12 @@ fn build_replica(w: &World) -> std::io::Result<()> {
         )?;
     }
     fs::write(format!("{}/env.sh", w.run), "# replica\n")?;
-    // the xcrun shims' cache, as the system keeps it there
     fs::write(format!("{}/xcrun_db", w.usertmp), "replica\n")?;
-    // empty, so that the control can remove each
     fs::create_dir_all(format!("{}/scratch", w.run))?;
     for n in SCRATCH_DIRS {
         fs::create_dir_all(format!("{}/scratch/{n}", w.run))?;
     }
     fs::create_dir_all(format!("{}/proj", w.sockdir))?;
-    // what the lab's client trusts in a lab's socket directory
     for n in ["a.sock", "a.sock.token"] {
         fs::write(format!("{}/{n}", w.sockdir), "replica\n")?;
     }
@@ -1395,7 +1316,7 @@ fn run_inside(w: &World, checks: &[Check], spec_dir: &Path) -> Result<Vec<String
     Ok(got)
 }
 
-/// `aterm-lab probe-inside <spec>`: the checks of a spec, jailed; one `R\t<outcome>` line each.
+/// Entry point for `aterm-lab probe-inside <spec>`.
 #[must_use]
 pub fn inside_main(args: &[String]) -> i32 {
     let Some(text) = args.first().and_then(|p| fs::read_to_string(p).ok()) else {
@@ -1411,7 +1332,6 @@ pub fn inside_main(args: &[String]) -> i32 {
 
 /// Judge every world and print the report; 0 PASS, 1 FAIL.
 fn judge_worlds(worlds: &[World], base: &Path, o: &mut dyn std::io::Write) -> i32 {
-    // the shape of another agent's private instance, and of another probe's scratch
     let decoy_dir = crate::sys::make_temp_dir("/tmp/at.XXXXXX")
         .unwrap_or_else(|_| base.join("decoy").to_string_lossy().into_owned());
     let other_probe = crate::sys::make_temp_dir("/tmp/labprobe.XXXXXX")
@@ -1433,7 +1353,6 @@ fn judge_worlds(worlds: &[World], base: &Path, o: &mut dyn std::io::Write) -> i3
                 keep.extend(Listener::serve(Path::new(&s)));
             }
         }
-        // a lab that is not up has no socket or token: stand-ins take their places
         let mut made = Vec::new();
         for n in ["a.sock", "a.sock.token"] {
             let path = format!("{}/{n}", w.sockdir);
@@ -1522,16 +1441,10 @@ fn judge_worlds(worlds: &[World], base: &Path, o: &mut dyn std::io::Write) -> i3
     i32::from(fail != 0)
 }
 
-/// `probe [tag] [--replica]`: the lab's own jail when it is up, else a fresh
-/// render of the same profile, and the replica home; `--replica`: the replica
-/// home alone (the same rules, Codex's among them), which never touches the
-/// owner's tree. Under a scratch `HOME` only `--replica` runs
-/// ([`machine_probe_refused`]).
+/// Entry point for `aterm-lab probe [tag] [--replica]`.
 pub fn cmd_probe(args: &[String]) -> Res {
     let mut a = args.to_vec();
     let tag = take_tag(&mut a)?;
-    // an argument that is neither --replica nor a lab that is up is refused: read as a tag, it would leave a
-    // --replica after it unseen and run the probe of this machine, which stats and opens the owner's protected paths
     let mut replica_only = false;
     for x in &a {
         if x == "--replica" {
@@ -1546,10 +1459,10 @@ pub fn cmd_probe(args: &[String]) -> Res {
     probe(&tag, replica_only, &mut std::io::stdout())
 }
 
-/// The probe of lab `tag` with its report captured: (0 PASS / 1 FAIL, the report).
+/// Runs the probe for `tag` and returns `(exit_code, report)`.
 ///
 /// # Errors
-/// The probe could not run.
+/// Returns an error if the probe cannot be set up or executed.
 pub fn run_captured(tag: &str, replica_only: bool) -> Result<(i32, String), Fail> {
     let mut buf: Vec<u8> = Vec::new();
     let rc = probe(tag, replica_only, &mut buf)?;
@@ -1566,8 +1479,6 @@ fn probe(tag: &str, replica_only: bool, o: &mut dyn std::io::Write) -> Res {
     if let Some(why) = machine_probe_refused(p, replica_only) {
         return Err(Fail::die(why));
     }
-    // the replica's sockets (its home, its Claude sockets, its socket dir) need short paths, in /tmp: unix socket
-    // names are limited to 103 bytes; its run, state and temp dirs go into the lab's state dir
     let base = PathBuf::from(
         crate::sys::make_temp_dir("/tmp/labprobe.XXXX")
             .map_err(|e| Fail::die(format!("cannot make a scratch dir in /tmp: {e}")))?,
@@ -1598,9 +1509,7 @@ fn probe(tag: &str, replica_only: bool, o: &mut dyn std::io::Write) -> Res {
 /// Why the probe of THIS machine may not run (`None`: it may): the account's
 /// home is the owner's tree whatever `HOME` says, and the probe's unjailed
 /// controls stat and open every protected entry in it (an open without a
-/// read). A run under a scratch `HOME` ([`crate::paths::Paths::scratch_home`],
-/// every agent's) never touches that tree, so it gets the replica alone, which
-/// proves the same rules (what the selftests run).
+/// read).
 fn machine_probe_refused(p: &crate::paths::Paths, replica_only: bool) -> Option<String> {
     (!replica_only && p.scratch_home()).then(|| {
         format!(
@@ -1662,7 +1571,6 @@ fn probe_in(
                 jail: r.run.join("jail.sb"),
                 claude: r.claude_bin.clone(),
                 codex: r.codex_bin.clone(),
-                // the shim the lab's own agents run under, so its tripwire and recorder links are what is probed
                 shim: r.run.join("shim").to_string_lossy().into_owned(),
                 state: state.clone(),
                 lab_dirs: lab_dirs.clone(),
@@ -1681,7 +1589,6 @@ fn probe_in(
                 fs::create_dir_all(run.join("scratch").join(n))
                     .map_err(|e| Fail::die(e.to_string()))?;
             }
-            // the file the probe tries to append to
             let _ = fs::write(run.join("env.sh"), "");
             let mut spec = crate::jail::Spec::for_lab(
                 &run.to_string_lossy(),
@@ -1777,9 +1684,7 @@ mod tests {
 
     /// UNDER A SCRATCH `HOME` THE PROBE OF THIS MACHINE IS REFUSED: its
     /// controls would stat and open the account's protected entries; the
-    /// replica alone runs. NEGATIVE CONTROLS: from the account's own `HOME`
-    /// (the owner's run) the probe of this machine runs, and `--replica` runs
-    /// under either.
+    /// replica alone runs.
     #[test]
     fn under_a_scratch_home_only_the_replica_is_probed() {
         let top = aterm_tempfile::Builder::new()
@@ -1794,7 +1699,6 @@ mod tests {
         let why = machine_probe_refused(&agent, false).expect("refused under a scratch HOME");
         assert!(why.contains("--replica"), "{why}");
         assert_eq!(machine_probe_refused(&agent, true), None);
-        // NEGATIVE CONTROLS
         let owner = crate::paths::Paths::resolve_with(Some(account.clone()), Some(account.into()));
         assert_eq!(machine_probe_refused(&owner, false), None);
         assert_eq!(machine_probe_refused(&owner, true), None);
@@ -1850,7 +1754,6 @@ mod tests {
             MACH_DENY.len() + MACH_DENY_OPEN.len()
         );
         assert!(p.iter().any(|c| c.label.starts_with("<replica>/.ssh")));
-        // every scratch directory stays put, the store gives metadata only above the Codex's build
         for n in SCRATCH_DIRS {
             assert!(
                 p.iter().any(|c| c.label

@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Metadata-only transcript reads. The whole row is still validated, including
-//! discarded content, but a large tool input/result never becomes a Value tree.
-//! Keep Value's tolerant types and last-key-wins rule: vendor fields with the
-//! wrong shape read as absent, rather than invalidating unrelated metadata.
+//! Metadata-only transcript reads.
 
 use std::fmt;
 
@@ -56,8 +53,6 @@ const MESSAGE_USAGE: Shape = Shape::Object(&[
     ("output_tokens", Shape::Scalar),
     ("cache_creation_input_tokens", Shape::Scalar),
     ("cache_read_input_tokens", Shape::Scalar),
-    // The cache writes by lifetime: one-hour writes list
-    // higher (`usage::TokenUsage::cache_write_1h`).
     (
         "cache_creation",
         Shape::Object(&[
@@ -65,12 +60,6 @@ const MESSAGE_USAGE: Shape = Shape::Object(&[
             ("ephemeral_1h_input_tokens", Shape::Scalar),
         ]),
     ),
-    // What the price table does not price, so the spend
-    // fold counts the message as approximate
-    // (`spend::approx`): fast mode, US-only inference,
-    // web search, a tier other than the standard one, any
-    // iteration but a plain message — an advisor's, a
-    // server-side fallback's (each entry's `type` only).
     ("speed", Shape::Scalar),
     ("inference_geo", Shape::Scalar),
     ("service_tier", Shape::Scalar),
@@ -110,8 +99,7 @@ const CONTENT: Shape = Shape::Seq(&CONTENT_PART);
 /// (`supervise::policy::box_call::pending_calls`): its kind, the call's id,
 /// its tool, the file it names and a Bash call's `command` (the rm breaker's
 /// too-many box is judged by it, `supervise::policy::box_command`), and the
-/// id of the call a result answers. Never the call's other arguments
-/// (`old_string`, `new_string`, `content`) nor the result's content.
+/// id of the call a result answers.
 const CALL_PART: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
     ("id", Shape::Scalar),
@@ -145,8 +133,7 @@ const CALLS: Shape = Shape::Object(&[
 /// kind, the call's id and tool, the id of the call a result answers and
 /// whether it answers with an error, and of the call's arguments only the
 /// two that bound how long it may run — its declared `timeout` and whether
-/// it went to the background. Never what it runs, writes or returns; a part
-/// that is no object is read as null.
+/// it went to the background.
 const FLIGHT_PART: Shape = Shape::Record(&[
     ("type", Shape::Scalar),
     ("id", Shape::Scalar),
@@ -181,15 +168,7 @@ const FLIGHT: Shape = Shape::Object(&[
 /// what it says of the account's usage credits — whether they are on
 /// (`overageStatus`), why not (`overageDisabledReason`), when they come back
 /// (`overageResetsAt`) and whether they were in use (`isUsingOverage`), what
-/// the accounts recorder keeps of them (`upgrade::CreditsWord`). MEASURED on
-/// this machine's transcripts (2026-10-01: every one of the ten rows that
-/// carry the key, Claude Code 2.1.273 and 2.1.283; 2.1.286's row is the
-/// accounts design §1's): `{"status":"rejected","resetsAt":<unix s, an
-/// integer>,"unifiedRateLimitFallbackAvailable":false,
-/// "rateLimitType":"five_hour" | "seven_day","overageStatus":…,
-/// "overageDisabledReason":…,"isUsingOverage":false}`, five of 2.1.273's
-/// with three `lowPriority…` keys besides. None of those other keys is read
-/// by anything here, and none is kept.
+/// the accounts recorder keeps of them (`upgrade::CreditsWord`).
 const QUOTA_LIMITS: Shape = Shape::Object(&[
     ("status", Shape::Scalar),
     ("resetsAt", Shape::Scalar),
@@ -201,12 +180,8 @@ const QUOTA_LIMITS: Shape = Shape::Object(&[
 ]);
 const CONVERSATION: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
-    // `null` on a conversation's first row; read by `supervise/wall_confirm.rs`.
     ("parentUuid", Shape::Scalar),
-    // A confirmed limit notice is remembered by its row id; only a reply after that row ends the
-    // wait (`supervise/wall_confirm.rs`'s `served_since_notice`).
     ("uuid", Shape::Scalar),
-    // The same tail names the conversation that owns a limit notice.
     ("sessionId", Shape::Scalar),
     ("isSidechain", Shape::Scalar),
     ("isMeta", Shape::Scalar),
@@ -214,36 +189,16 @@ const CONVERSATION: Shape = Shape::Object(&[
     ("queueTranscriptOnly", Shape::Scalar),
     ("isApiErrorMessage", Shape::Scalar),
     ("error", Shape::Scalar),
-    // A notice's typed kind (since 2.1.295) and the status it answered: what
-    // names the wall a notice is where its words do not
-    // (`supervise/wall_confirm.rs`'s `transcript_wall`).
     ("apiError", Shape::Scalar),
     ("apiErrorStatus", Shape::Scalar),
     ("timestamp", Shape::Scalar),
     ("subtype", Shape::Scalar),
-    // A `turn_duration` row's count of the background agents and dynamic
-    // workflows the turn ended waiting on: the supervisor's carried wait
-    // (`supervise/wall_confirm.rs`'s `waits_on_background`).
     ("pendingBackgroundAgentCount", Shape::Scalar),
     ("pendingWorkflowCount", Shape::Scalar),
-    // …and how long that turn worked: what a person's exchange retried at
-    // a wall is bounded by (`upgrade::LastTurn::names`).
     ("durationMs", Shape::Scalar),
     ("content", Shape::Scalar),
-    // Who asked a user row's turn (`task-notification`, `auto-continuation`,
-    // `peer`, `human`): Claude Code's own wakes reopen no finished task
-    // (`upgrade::FinishedScan`).
     ("origin", Shape::Object(&[("kind", Shape::Scalar)])),
-    // The turn a user row was written in: a row that asks nothing under the
-    // running turn's id (a Stop hook's feedback) goes on that turn, and a
-    // prompt typed while the agent worked is recorded only as an attachment
-    // absorbed into it (`queued_command`; `upgrade::FinishedScan`).
     ("promptId", Shape::Scalar),
-    // The scheduled task a `/loop`'s wake fired for, stamped on the wake's
-    // user row (the 2.1.252 and 2.1.267 bundles), and the turn's origin
-    // where Claude Code names one (`scheduled`, `auto_continuation`, `peer`;
-    // never a Stop hook's feedback): a turn of its own on a row with no
-    // `promptId` (`upgrade::begins_unnumbered`).
     ("scheduledTaskId", Shape::Scalar),
     ("turnOrigin", Shape::Scalar),
     (
@@ -254,9 +209,6 @@ const CONVERSATION: Shape = Shape::Object(&[
             ("origin", Shape::Object(&[("kind", Shape::Scalar)])),
         ]),
     ),
-    // A system row's level, and the build that wrote a row: the resumed
-    // build's warning that something did not come back
-    // (`upgrade::resumed_build_warned`).
     ("level", Shape::Scalar),
     ("version", Shape::Scalar),
     ("quotaLimits", QUOTA_LIMITS),
@@ -272,8 +224,7 @@ const CONVERSATION: Shape = Shape::Object(&[
 
 /// A tool call or a tool's result as the session log's step fold reads it
 /// (`harness::steps`): its kind, the call's id and tool, the id of the call
-/// a result answers and whether it failed. Never a call's `input`, never a
-/// result's `content`, never a text part's `text`.
+/// a result answers and whether it failed.
 const STEP_PART: Shape = Shape::Record(&[
     ("type", Shape::Scalar),
     ("id", Shape::Scalar),
@@ -290,8 +241,7 @@ const STEP_PARTS: Shape = Shape::Parts(&STEP_PART);
 /// meta and compaction flags, who asked (`origin.kind`), whether Claude Code
 /// began the turn of its own on a row with no `promptId` (`turnOrigin`,
 /// `scheduledTaskId`: `upgrade::begins_unnumbered_by`), and the build and
-/// effort that wrote it. [`STEPS`] adds the content's parts; this, read for
-/// a row that holds no call or result, never visits the content at all.
+/// effort that wrote it.
 const STEPS_BARE_FIELDS: [Field; 18] = [
     ("type", Shape::Scalar),
     ("subtype", Shape::Scalar),
@@ -338,8 +288,7 @@ const STEPS_FIELDS: [Field; 18] = {
 const STEPS: Shape = Shape::Object(&STEPS_FIELDS);
 
 /// What the survey's excerpts read of a part ([`excerpt`]): its kind, a text
-/// part's text, a tool call's name and id, a tool result's call id. Never a
-/// tool's input, a result's content or an image.
+/// part's text, a tool call's name and id, a tool result's call id.
 const EXCERPT_PART: [Field; 5] = [
     ("type", Shape::Scalar),
     ("text", Shape::Scalar),
@@ -369,8 +318,7 @@ const EXCERPT: Shape = Shape::Object(&[
 /// `message.id` — Claude Code writes one row per content block, all under
 /// the message's one id), when it was written (`timestamp`: a turn begun
 /// after the done point is no turn of that done's), the flags that make it
-/// no one's words, and the text blocks. Tool inputs and results are
-/// validated, never kept.
+/// no one's words, and the text blocks.
 const EXCHANGE: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
     ("uuid", Shape::Scalar),
@@ -407,8 +355,7 @@ const CODEX_TOKENS: Shape = Shape::Object(&[
 /// (`harness::codex_rollout::TurnReader`): its stamp, a `session_meta`'s
 /// thread, fork parent and history mode, a `thread_settings_applied`'s
 /// thread, a `turn_context`'s model and service tier, and a `token_count`'s
-/// running total and last turn. Instructions, tool payloads, messages, the
-/// thread settings and the rate limits are validated, never materialized.
+/// running total and last turn.
 const CODEX_SPEND: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
     ("timestamp", Shape::Scalar),
@@ -449,8 +396,7 @@ pub(crate) fn codex_spend(line: &str) -> aterm_json::Result<Value> {
 /// (`ai::codex_limits::opening_account`): its stamp, and of its
 /// `session_meta` the thread, its conversation, its fork parent, its history
 /// mode and the two ids the account key is made from (hashed by the reader,
-/// never kept). The base instructions (about 20 KB) are validated, never
-/// materialized.
+/// never kept).
 const CODEX_META: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
     ("timestamp", Shape::Scalar),
@@ -489,9 +435,7 @@ const CODEX_WINDOW: Shape = Shape::Object(&[
 /// What the Codex limits reader reads of a `token_count`
 /// (`ai::codex_limits::rollout_rate_limits`): its stamp and its
 /// `rate_limits`, every key Codex 0.163.0 writes there but
-/// `normal_model_slug` (design F10). `individual_limit` is kept only as a
-/// scalar: no capture has carried anything but null. The turn's counts
-/// (`info`) are validated, never materialized.
+/// `normal_model_slug` (design F10).
 const CODEX_LIMITS: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
     ("timestamp", Shape::Scalar),
@@ -542,9 +486,7 @@ pub(crate) fn codex_limits(line: &str) -> aterm_json::Result<Value> {
 /// a `thread_settings_applied`'s thread, a turn's id, a call's id, tool and
 /// namespace, a `turn_context`'s model and effort, a turn's duration, the
 /// closed word of a turn's error (never its message), and a `token_count`'s
-/// running total and last turn. A call's arguments and input, a result's
-/// output, messages, instructions, settings, a compaction's history and the
-/// rate limits are validated, never materialized.
+/// running total and last turn.
 const CODEX_STEPS: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
     ("timestamp", Shape::Scalar),
@@ -657,66 +599,47 @@ pub(super) fn metadata(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<Metadata<false>>(line).map(|v| v.0)
 }
 
-/// A `/model` command additionally needs its plain-string content. Block
-/// arrays (tool calls/results) still need no materialized content.
+/// A `/model` command additionally needs its plain-string content.
 pub(super) fn command(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<Metadata<true>>(line).map(|v| v.0)
 }
 
-/// The upgrade/task readers additionally need text blocks and the vendor's
-/// own error/limit metadata, but never tool arguments, images, or results.
+/// The upgrade/task readers additionally need text blocks and the vendor's own error/limit metadata, but never tool arguments, images, or results.
 pub(crate) fn conversation(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<Conversation>(line).map(|v| v.0)
 }
 
-/// The survey's excerpts ([`super::excerpt`]) need a row's discriminants, its
-/// message id, text parts and tool call names and ids, but never a tool's
-/// input or result.
+/// The survey's excerpts ([`super::excerpt`]) need a row's discriminants, its message id, text parts and tool call names and ids, but never a tool's input or result.
 pub(super) fn excerpt(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<Excerpt>(line).map(|v| v.0)
 }
 
-/// The worker's result reader (`super::result`) needs each row's own id, its
-/// conversation's, its message's id and text blocks, never tool payloads.
+/// The worker's result reader (`super::result`) needs each row's own id, its conversation's, its message's id and text blocks, never tool payloads.
 pub(super) fn exchange(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<Exchange>(line).map(|v| v.0)
 }
 
-/// The approval loop needs which calls wait on a result in the conversation's
-/// order, their tools, the files they name and a Bash call's command, but
-/// never what a call writes or a result holds.
+/// The approval loop needs which calls wait on a result in the conversation's order, their tools, the files they name and a Bash call's command, but never what a call writes or a result holds.
 pub(crate) fn calls(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<Calls>(line).map(|v| v.0)
 }
 
-/// The flight fold's read of a row (`super::flight`): which calls of a
-/// subagent wait on a result, their tools and declared timeouts, never what
-/// a call runs or a result holds.
+/// The flight fold's read of a row (`super::flight`): which calls of a subagent wait on a result, their tools and declared timeouts, never what a call runs or a result holds.
 pub(crate) fn flight(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<Flight>(line).map(|v| v.0)
 }
 
-/// The step fold's read of a row that holds a call or a result: ids,
-/// times, flags, usage and the content's parts, never any text.
+/// The step fold's read of a row that holds a call or a result: ids, times, flags, usage and the content's parts, never any text.
 pub(crate) fn steps(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<Steps<true>>(line).map(|v| v.0)
 }
 
-/// The step fold's read of any other row: [`steps`] without the content,
-/// which the parser passes over without building it.
+/// The step fold's read of any other row: [`steps`] without the content, which the parser passes over without building it.
 pub(crate) fn steps_bare(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<Steps<false>>(line).map(|v| v.0)
 }
 
-/// EVERY METADATA READ THE HARNESS MAKES OF ONE CLAUDE CODE TRANSCRIPT ROW:
-/// the row as each reader's shape above keeps it, in a fixed order (`None`
-/// where the line is no row that shape reads). Every reader here decides
-/// what it decides of a row from one of these (module docs: a row is never
-/// read whole), so two rows whose reads are equal read alike to each of
-/// them. What a reduction of a transcript is held to (`aterm-lab reduce`):
-/// a closed word one of these keeps is a word a
-/// committed reader reads, and is kept; a word none keeps is read by
-/// nothing here.
+/// EVERY METADATA READ THE HARNESS MAKES OF ONE CLAUDE CODE TRANSCRIPT ROW: the row as each reader's shape above keeps it, in a fixed order (`None` where the line is no row that shape reads).
 #[must_use]
 pub fn claude_reads(line: &str) -> Vec<Option<Value>> {
     [
@@ -735,9 +658,7 @@ pub fn claude_reads(line: &str) -> Vec<Option<Value>> {
     .collect()
 }
 
-/// [`claude_reads`] for a Codex rollout's line: the spend fold's, the
-/// limits reader's (its first line and its `token_count`s) and the step
-/// fold's shapes.
+/// [`claude_reads`] for a Codex rollout's line: the spend fold's, the limits reader's (its first line and its `token_count`s) and the step fold's shapes.
 #[must_use]
 pub fn codex_reads(line: &str) -> Vec<Option<Value>> {
     [codex_spend, codex_meta, codex_limits, codex_steps]

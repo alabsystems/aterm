@@ -118,6 +118,7 @@ struct Held {
 }
 
 /// Which held slot a newcomer from `source` may take at `now`, every slot being
+/// held: `None` refuses the newcomer.
 fn pick_displaced(held: &[Held], source: IpAddr, now: Instant, grace: Duration) -> Option<usize> {
     let pending = || held.iter().enumerate().filter(|(_, h)| h.unauthenticated);
     let count = |of: IpAddr| pending().filter(|(_, h)| h.source == of).count();
@@ -447,6 +448,7 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     /// The slots' production capacity and rule-2 grace: the fleet
+    /// listener's.
     const CAP: usize = crate::fleet::MAX_SLOTS;
     const GRACE: Duration = crate::fleet::PREAUTH_GRACE;
 
@@ -510,6 +512,8 @@ pub(crate) mod tests {
     }
 
     /// The watchdog's wake, with no TLS and no second end: `finish` on a
+    /// handshake that authenticated early must not wait for the watchdog
+    /// thread to come round on its own.
     #[test]
     fn finishing_an_early_handshake_does_not_wait_out_a_wake_interval() {
         const MAX_FINISH: Duration = Duration::from_millis(20);
@@ -550,8 +554,10 @@ pub(crate) mod tests {
     fn spurious_wakes_neither_shorten_nor_starve_the_watchdog_deadline() {
         const DEADLINE: Duration = Duration::from_millis(150);
         /// Must exceed `CEILING`, or a watchdog whose deadline restarts on every
+        /// wake would simply fire once the hammering stopped and escape the test.
         const HAMMER_BUDGET: Duration = Duration::from_secs(180);
         /// A minute's hang detector (AGENTS.md), never a latency budget: far
+        /// under `HAMMER_BUDGET`, and out of reach of any scheduling noise.
         const CEILING: Duration = MUST_HAPPEN;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -618,6 +624,8 @@ pub(crate) mod tests {
     }
 
     /// `count` idle sockets to one address (a listener's capacity: the
+    /// fleet's [`CAP`]), each sending nothing and reconnected the moment the
+    /// listener closes it, until dropped.
     pub(crate) struct IdleSockets {
         stop: Arc<AtomicBool>,
         threads: Vec<std::thread::JoinHandle<()>>,
@@ -663,6 +671,8 @@ pub(crate) mod tests {
     }
 
     /// Once the listener turned a connection from `target` away at capacity
+    /// (`at_capacity`, its count of those), idle sockets hold every slot: the
+    /// attack is in force.
     pub(crate) fn until_turned_away(at_capacity: &AtomicUsize, target: SocketAddr) {
         let started = Instant::now();
         while at_capacity.load(Ordering::SeqCst) == 0 {
@@ -675,7 +685,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// A listener on `[::]` that also takes IPv4, and the port it took. It
+    /// A listener on `[::]` that also takes IPv4, and the port it took.
     pub(crate) fn dual_stack_listener(test: &str) -> (TcpListener, u16) {
         fn not_run(test: &str, why: &str) -> ! {
             aterm_spec::host::could_not_run(format!("{test}: no dual-stack loopback here ({why})"))
@@ -705,7 +715,7 @@ pub(crate) mod tests {
         (listener, port)
     }
 
-    /// The module doc's rule, case by case, on synthetic addresses. The real-socket
+    /// The module doc's rule, case by case, on synthetic addresses.
     #[test]
     fn a_newcomer_takes_only_an_unauthenticated_slot_by_the_rule() {
         let t0 = Instant::now();
@@ -795,6 +805,8 @@ pub(crate) mod tests {
     }
 
     /// The listener's claim on a connection ([`Evictor::evict`]) cuts one that
+    /// has not authenticated — at once, not at its deadline — and never one
+    /// whose handshake claimed it first.
     #[test]
     fn an_eviction_cuts_only_a_connection_that_has_not_authenticated() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -847,6 +859,8 @@ pub(crate) mod tests {
     }
 
     /// CONFORMANCE (Tier-1) of the REAL listener slots to
+    /// `aterm_models_core::net_slot_displacement_model` (`NetSlotDisplacement`)
+    /// at the production capacity (`Cap` overridden to [`CAP`]).
     #[test]
     fn slots_conform_to_net_slot_displacement() {
         use aterm_models_core::net_slot_displacement_model;
@@ -857,6 +871,8 @@ pub(crate) mod tests {
         type State = BTreeMap<&'static str, i64>;
 
         /// One real connection: the listener's end (kept open, so only the
+        /// watchdog ever closes it), the dialer's end, the watchdog's claim,
+        /// and the slot its handler holds.
         struct Conn {
             _tcp: TcpStream,
             peer: TcpStream,

@@ -1,17 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// ─── Windows shells at a live prompt: the marks a block is made of ───
-//
-// `include!`d into lib.rs's `#[cfg(test)] mod tests` after tests_pwsh_keys.rs; it uses
-// that file's `ConptyShell`, `PowerShellWorld` and `on_each_powershell`.
-//
-// What a command block records (its exit code, its command line) is decided by marks the
-// shell writes while a line runs, so these tests type lines at a real prompt in a ConPTY
-// from aterm-pty, the seam a tab spawns through, and read the marks back from what the
-// console drew. A line ends with Enter, and the next is typed only once the profile's
-// counting prompt has drawn, so no line waits behind another.
-
 /// The `133;D` codes the console drew, in order.
 #[cfg(windows)]
 fn drawn_exit_codes(seen: &[u8]) -> Vec<String> {
@@ -41,13 +30,7 @@ struct ExitStep {
 #[cfg(windows)]
 const CONTROL_C_EXIT: &str = "-1073741510";
 
-/// The lines, in order, and what each must report. A cmdlet failure after a native one is
-/// 1, not the native code `$LASTEXITCODE` still holds (the stale code reported 7 for every
-/// row after the first until a native command succeeded; measured 2026-10-17 on pwsh 7.6.7
-/// and Windows PowerShell 5.1); the same native failure twice is that code twice, whatever
-/// error records the native program left; a line Ctrl+C stopped is STATUS_CONTROL_C_EXIT,
-/// the code `ping` stopped by Ctrl+C exits with, whatever native code came before it; a
-/// lone comment, which runs nothing, is 0; and a line that does not parse is 1.
+/// The lines, in order, and what each must report.
 #[cfg(windows)]
 const EXIT_STEPS: &[ExitStep] = &[
     ExitStep {
@@ -90,7 +73,6 @@ const EXIT_STEPS: &[ExitStep] = &[
         interrupt_after: None,
         code: "1",
     },
-    // A reply line, in any language: `Reply from 127.0.0.1: bytes=32 ...`.
     ExitStep {
         line: "ping -n 60 127.0.0.1",
         interrupt_after: Some("127.0.0.1:"),
@@ -106,7 +88,6 @@ const EXIT_STEPS: &[ExitStep] = &[
         interrupt_after: None,
         code: "1",
     },
-    // A lone comment runs nothing, and `$?` still holds the failure before it.
     ExitStep {
         line: "# just a comment",
         interrupt_after: None,
@@ -117,8 +98,6 @@ const EXIT_STEPS: &[ExitStep] = &[
         interrupt_after: None,
         code: "0",
     },
-    // A line that does not parse runs nothing and leaves `$?` true after a success, but it
-    // failed; with or without a statement, after a success or a failure (it read 0).
     ExitStep {
         line: "}",
         interrupt_after: None,
@@ -149,8 +128,6 @@ const EXIT_STEPS: &[ExitStep] = &[
         interrupt_after: None,
         code: "0",
     },
-    // The same native failure twice while its stderr is redirected: Windows PowerShell 5.1
-    // records each stderr line as a NativeCommandError (the second read 1), pwsh 7 none.
     ExitStep {
         line: "cmd /c \"echo e 1>&2 & exit 7\" 2>&1",
         interrupt_after: None,
@@ -166,8 +143,6 @@ const EXIT_STEPS: &[ExitStep] = &[
         interrupt_after: None,
         code: "1",
     },
-    // pwsh 7.4+ records a native failure as ProgramExitedWithNonZeroCode under this
-    // preference; to Windows PowerShell 5.1 it is an ordinary variable.
     ExitStep {
         line: "$PSNativeCommandUseErrorActionPreference = $true",
         interrupt_after: None,
@@ -192,7 +167,7 @@ const EXIT_STEPS: &[ExitStep] = &[
 
 /// The code a failed line reports, at a live prompt in an aterm tab, on Windows PowerShell
 /// 5.1 and on pwsh 7: see [`EXIT_STEPS`] and the script's "The exit code of a line that
-/// failed". Each Ctrl+C is sent once the line's own output shows it running.
+/// failed".
 #[cfg(windows)]
 #[test]
 fn test_powershell_reports_the_exit_code_of_the_line_that_failed() {
@@ -205,8 +180,6 @@ fn test_powershell_reports_the_exit_code_of_the_line_that_failed() {
             .join("src")
             .join("scripts")
             .join("aterm_shell_integration.ps1");
-        // The user's profile, which a tab runs before the integration: history kept in
-        // this folder and never saved, and the counting prompt.
         let body = [
             format!(
                 "Set-PSReadLineOption -HistorySavePath '{}' -HistorySaveStyle SaveNothing",
@@ -252,7 +225,6 @@ fn test_powershell_reports_the_exit_code_of_the_line_that_failed() {
             let typed = shell.seen.len();
             shell.type_keys(&format!("{}\r", step.line));
             if let Some(running) = step.interrupt_after {
-                // Drawn by the line's own output: no needle is in the line as typed.
                 let deadline = std::time::Instant::now() + ConptyShell::HANG;
                 while !String::from_utf8_lossy(&shell.seen[typed..]).contains(running) {
                     match shell
@@ -290,8 +262,7 @@ fn test_powershell_reports_the_exit_code_of_the_line_that_failed() {
 }
 
 /// Git Bash for the live test: `$ATERM_TEST_GIT_BASH`, else Git for Windows' own `bash.exe`
-/// where it is installed. An override that names nothing is an operator error and fails,
-/// as `aterm_spec::host::test_shell`'s does.
+/// where it is installed.
 #[cfg(windows)]
 fn git_bash_exe() -> Option<PathBuf> {
     if let Some(explicit) = std::env::var_os("ATERM_TEST_GIT_BASH") {
@@ -325,26 +296,20 @@ fn drawn_command_lines(seen: &[u8]) -> Vec<String> {
 }
 
 /// Git Bash records the line as typed and gives a line that opens with a subshell its
-/// block. Each row: the line, the `633;E` it must report (as `__aterm_encode_cmd` writes
-/// it: a space is `\x20`), and its `133;D` code. Measured 2026-10-17 on Git Bash 5.3.9:
-/// `ls /nope` was recorded as its alias, and `(exit 3)` and `( true )` emitted no mark at
-/// all (`block entering exit=-`), while `true && (exit 4)` was recorded as `true`.
+/// block.
 #[cfg(windows)]
 const GIT_BASH_LINES: &[(&str, &str, &str)] = &[
     ("ls /nope-aterm-test", r"ls\x20/nope-aterm-test", "2"),
     ("(exit 3)", r"(exit\x203)", "3"),
     ("true && (exit 4)", r"true\x20&&\x20(exit\x204)", "4"),
     ("( true )", r"(\x20true\x20)", "0"),
-    // A line bash did not save (ignorespace) is the DEBUG trap's, as before: its first
-    // simple command.
     (" echo spaced", r"echo\x20spaced", "0"),
     ("echo done-$((6*7))", r"echo\x20done-$((6*7))", "0"),
 ];
 
 /// A Git Bash tab's blocks at a live prompt in a ConPTY: on bash 5.3+, which Git for
 /// Windows ships, every line bash saved is recorded as typed and starts its block from
-/// PS0, whatever its first command ([`GIT_BASH_LINES`]). Where Git Bash is not installed
-/// the test is skipped, and says so on the stderr handle (see `on_each_powershell`).
+/// PS0, whatever its first command ([`GIT_BASH_LINES`]).
 #[cfg(windows)]
 #[test]
 fn test_git_bash_records_the_typed_line_and_marks_a_subshell_line() {
@@ -360,9 +325,6 @@ fn test_git_bash_records_the_typed_line_and_marks_a_subshell_line() {
         .join("src")
         .join("scripts")
         .join("aterm_shell_integration.bash");
-    // The user's rc: history kept in this folder, an alias the typed line must not be
-    // recorded as, ignorespace, and the prompt numbering its commands. The integration
-    // last, as the loader sources it.
     let rc = dir.join("rc.bash");
     std::fs::write(
         &rc,
@@ -404,7 +366,6 @@ fn test_git_bash_records_the_typed_line_and_marks_a_subshell_line() {
     let skip = shell.seen.len();
     for (n, &(line, _, _)) in GIT_BASH_LINES.iter().enumerate() {
         shell.type_keys(&format!("{line}\r"));
-        // `\#` counts every line run, saved in the history or not.
         shell.wait_for(&format!("G{}>", n + 3), &format!("git bash after {line:?}"));
     }
     let tail = &shell.seen[skip..];
@@ -441,21 +402,7 @@ fn test_git_bash_records_the_typed_line_and_marks_a_subshell_line() {
 
 /// A Git Bash whose `/tmp` went away while it ran still runs every line typed, records it
 /// as typed and gives a line that opens with a subshell its block ([`GIT_BASH_LINES`]),
-/// fresh or with the PS0 a loader of v0.107.0-v0.108.0 left in a running shell. Its
-/// `/tmp` is MSYS2's `usertemp` mount, the TEMP of the session's first MSYS2 process
-/// ([`GIT_BASH`] makes this shell that one, so the folder taken is this test's own), and
-/// `$TMPDIR` is unset, as in a Git Bash tab. Where an MSYS2 process the test did not
-/// start holds the session's `/tmp` (the Git Bash a `cargo test` was typed into), the
-/// test is COULD NOT RUN: it never takes away a folder that is not its own. Measured
-/// 2026-10-21 on Git Bash 5.3.15 before the fix: after `rmdir /tmp`,
-/// each line printed `bash: function_substitute: cannot open anonymous file for output:
-/// No such file or directory`, ran nothing, and drew the same prompt number again: bash
-/// keeps a `${ ...; }` substitution's output in a file it makes in `/tmp`, and PS0's hook
-/// was one.
-/// NEGATIVE CONTROLS, the same day: with PS0's hook `${| ...; }` but the typed line read
-/// by `${ ...; }` whatever the folder, each line ran with no block (the read failed, in
-/// PS0 and again in the DEBUG trap); without the body's rewrite of an older PS0, the
-/// second start ran no line.
+/// fresh or with the PS0 a loader of v0.107.0-v0.108.0 left in a running shell.
 #[cfg(windows)]
 #[test]
 fn test_git_bash_whose_tmp_went_away_runs_every_line_as_typed() {
@@ -567,9 +514,7 @@ const CTRL_J_RECORD: &str = "\x1b[74;36;10;1;8;1_\x1b[74;36;10;0;8;1_";
 
 /// Ctrl+J, as aterm writes it, accepts the line in an aterm tab: the readline layer's
 /// AcceptLine in PSReadLine (5.1's 2.0.0 and pwsh 7's), and readline's accept-line in Git
-/// Bash, which reads the record's LF. The keys after it are a line of their own. Before,
-/// the legacy LF reached PSReadLine as Ctrl+Enter, InsertLineAbove: `alpha`, Ctrl+J, `X`
-/// left `X` on a new line above `alpha` (measured 2026-10-17 on pwsh 7.6.7).
+/// Bash, which reads the record's LF.
 #[cfg(windows)]
 #[test]
 fn test_ctrl_j_accepts_the_line_in_powershell_and_git_bash() {
@@ -642,7 +587,6 @@ fn test_ctrl_j_accepts_the_line_in_powershell_and_git_bash() {
             .lines()
             .filter_map(|line| line.strip_prefix("line="))
             .collect();
-        // Windows PowerShell 5.1 also puts the -Command it started with into history.
         let history = history
             .strip_prefix(&[command.as_str()][..])
             .unwrap_or(&history);
@@ -726,11 +670,7 @@ fn drawn_titles(seen: &[u8]) -> Vec<String> {
 /// `~/.config/git/git-prompt.sh` here, which it sources in its place) loads once, the
 /// login profile once and the `~/.bashrc` it reads once, `login_shell` is on, POSIX mode
 /// is off again, the history file is bash's own `~/.bash_history`, `ENV` is gone, and
-/// the integration is loaded. NEGATIVE CONTROL: the `--rcfile` start it had, from the
-/// same folder, loads Git's prompt more than once and `~/.bashrc` twice, in a non-login
-/// shell (the 2026-10-18 verifier's v4-gitbash-start-loads-git-prompt-three-times;
-/// how many times depends on Git for Windows' own startup files: three then, five
-/// under 2.56.0.windows.2).
+/// the integration is loaded.
 #[cfg(windows)]
 #[test]
 fn test_a_git_bash_tab_starts_as_a_login_git_bash_that_loads_git_prompt_once() {
@@ -752,7 +692,6 @@ fn test_a_git_bash_tab_starts_as_a_login_git_bash_that_loads_git_prompt_once() {
             "__gp_loads=$((${__gp_loads:-0} + 1))\nPS1='[gp]> '\n",
         )
         .expect("git-prompt.sh");
-        // As the `~/.bash_profile` Git for Windows writes beside a lone `~/.bashrc`.
         std::fs::write(
             home.join(".bash_profile"),
             "__profile_runs=$((${__profile_runs:-0} + 1))\ntest -f ~/.bashrc && . ~/.bashrc\n",
@@ -832,12 +771,7 @@ const GIT_BASH_FLAGS_LINE: &str = "__s=\" $(command stty -a | tr '\\n' ' ') \"; 
 /// the next command's tty is sane again and what is typed is echoed: under MSYS2 a vim
 /// killed from outside reports 0, and every line typed after it was run unseen until
 /// `stty sane` (the 2026-10-18 verifier's
-/// v4-gitbash-killed-app-echo-repair-gated-on-status). A quick success still takes no
-/// probe, which is the control: the same raw mode left by a bare `stty` stays, until a
-/// failing command repairs it. The control's line restarts the line's clock after its
-/// `stty` (`__aterm_line_t0`), so it reads as quick however long a loaded host takes
-/// to start `stty`: on 2026-10-20, with the whole suite running in the Windows lane, a
-/// bare `stty raw -echo` once took the second and was repaired.
+/// v4-gitbash-killed-app-echo-repair-gated-on-status).
 #[cfg(windows)]
 #[test]
 fn test_git_bash_repairs_its_tty_after_a_raw_program_that_ran_a_second() {

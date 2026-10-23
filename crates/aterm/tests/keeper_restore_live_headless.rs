@@ -1,56 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE EXACT SCREEN AFTER A CRASH, on real processes (the crash-restore plan §7.3's live
-//! lane): a real keeper (`aterm keeper serve`, this build's binary, so a window's identity
-//! check admits it), a headless instance A with `[keeper] enabled = true` whose session
-//! journals into a shared-memory region the keeper holds, A SIGKILLed, and a second
-//! instance B, booted in the same scratch world, that is offered the session's master and
-//! region and restores the screen.
-//!
-//! * A's shell prints 5,000 numbered lines, enters and leaves the alternate screen, and
-//!   sets bracketed paste and the kitty keyboard flags (one command line, typed once the
-//!   shell has drawn its prompt, and the next prompt awaited); once A's journal has
-//!   caught the idle session up (`status journal_tail=0`, a one-minute hang detector on
-//!   K1's quiet keyframe, never a latency budget), its journal worker has exported the
-//!   whole history into the history ring (`journal_ring_lag=0`, the same detector), and
-//!   the keeper holds its region (`journals=1`), A is SIGKILLed by its own pid. B's
-//!   recovered session says `restore=exact` and `history_lost=0`, and its screen text,
-//!   its modes and, once its import has run after the recovery, its whole scrollback
-//!   (every one of A's history lines, read line by line at the same absolute rows) are
-//!   A's last ones.
-//! * A TAIL REPLAYED ACROSS A REAL CRASH: B runs with its keyframes held after the first
-//!   (`$ATERM_DEBUG_CRASH_JOURNAL_HOLD_KEYFRAMES`), so everything its session prints past
-//!   that keyframe rides the tail. Its shell prints a marker and then blocks in `sleep`,
-//!   so once the marker is on screen nothing more is gathered (the kill races nothing).
-//!   B is SIGKILLed in turn, and a third instance C, offered the same master and the
-//!   region B handed the keeper, replays that tail: `restore=exact` with nothing in
-//!   flight, B's screen and modes. This is the one place the whole pipeline (gather
-//!   count, parse-stage record, replay) is crossed by a real SIGKILL, and it can fail
-//!   only through a wrong restore; it also proves B's COMPANION reached the keeper, since
-//!   C would otherwise be offered A's stale region, or none. The scrollback crosses the
-//!   second crash too: B exported its history ring once its import had put A's lines
-//!   back (and keyframed the renumbering the import made), so C comes back with
-//!   `history_lost=0` and B's whole scrollback.
-//! * THE TURN LEDGER (increment 7): a `turn` driven into A's session is carried into the
-//!   region's control slot (`journal_ledger_lag=0`), and after A's SIGKILL B's `history`
-//!   still finds it, `carried=1`, under its id, with the crash's floor said
-//!   (`unheld_below=`) and B's own turn ids going on past it. A shed region's replacement
-//!   carries it too.
-//! * NEGATIVE CONTROL: the same world with A's journal off through the debug seam
-//!   (`$ATERM_DEBUG_NO_CRASH_JOURNAL`): A settles its claim with no region, and B's
-//!   recovery comes back `restore=meta restore_why=no-region`, the screen blank and the
-//!   turn A recorded not in B's `history`. There A boots before the keeper starts, and its
-//!   session is still recovered: the link registers with the first keeper that answers.
-//! * THE CENSUS ROWS the crash restore's soak judges: through the census's seam
-//!   (`$ATERM_DEBUG_RECOVERY_LEDGER`) every instance writes the row the installed app's cold
-//!   start would, and each says its boot's `keeper=` (`on`, or `absent` for the A that booted
-//!   before its keeper) and its recovery's `restored=` (`1:0:0` exact, `0:0:1` blank).
-//!
-//! Every wait is on a causal event (a ready signal, a status line, the keeper's own
-//! count, a marker or the shell's prompt on screen) under the one-minute hang detector.
-//! The keeper takes no lifeline (its CLI has no such flag): it is SIGKILLed by its guard,
-//! which a panic runs too; the instances hold lifelines (`support/launch_isolation.rs`).
+//! THE EXACT SCREEN AFTER A CRASH, on real processes (the crash-restore plan §7.3's live lane).
 
 #![allow(
     clippy::disallowed_types,
@@ -159,7 +110,7 @@ fn await_keeper(root: &Path, word: &str) {
 }
 
 /// This build's keeper, in the foreground (`serve --no-relaunch`: no window is brought
-/// back, the next launch recovers). Answering once its status names its masters.
+/// back, the next launch recovers).
 fn keeper(root: &Path) -> Proc {
     let log = std::fs::File::create(root.join("keeper.log")).expect("the keeper's log");
     let mut cmd = Command::new(launch_isolation::aterm_executable());
@@ -331,11 +282,7 @@ fn is_prompt(row: &str) -> bool {
 }
 
 /// Wait until the shell reads at a prompt: the last non-blank row below the last row
-/// holding `after` (anywhere, with `None`) is a prompt. The shell's line editor takes the
-/// terminal out of canonical mode BEFORE it draws a prompt, so a line typed after this
-/// is read by the editor alone; a line typed while a command holds the terminal is
-/// echoed by the tty, and again when the editor redisplays it after the prompt, with its
-/// column off by the first echo, which strews the rows that follow.
+/// holding `after` (anywhere, with `None`) is a prompt.
 #[track_caller]
 fn await_prompt(ctl: &mut Ctl, after: Option<&str>) {
     let mut last = Vec::new();
@@ -359,32 +306,23 @@ fn await_prompt(ctl: &mut Ctl, after: Option<&str>) {
 
 /// A's session: the output, then the wait for its journal to have caught up and its region
 /// to be in the keeper's custody (or, under the seam, the keeper holding its claim with no
-/// region). Its screen and modes, read last.
+/// region).
 fn run_a(root: &Path, ctl: &mut Ctl, seam: bool) -> (Vec<String>, BTreeMap<String, String>) {
     if seam {
         await_status(ctl, "journal_off", "seam");
     } else {
         await_status(ctl, "journal", "live");
     }
-    // One line, typed once the shell reads at its first prompt: no keystroke reaches a
-    // terminal the shell has handed to a command.
     await_prompt(ctl, None);
     ctl.type_line(
         "seq -f 'line %g' 1 5000; \
          printf '\\033[?1049h\\033[2Jon the alternate screen\\033[?1049l'; \
          printf '\\033[?2004h\\033[>5u'; echo ARMED-$((40+2))",
     );
-    // The marker the output prints is not the line typed: an await on it waits for the
-    // output, never matching the command's own echo.
     ctl.expect_on_screen("ARMED-42");
-    // Then the prompt the shell draws after it, the last thing it prints: the screen and
-    // modes read below are its last ones.
     await_prompt(ctl, Some("ARMED-42"));
-    // The session is idle at its prompt: once the quiet keyframe has caught it up, a
-    // restore replays nothing and nothing gathered is unprocessed.
     if !seam {
         await_status(ctl, "journal_tail", "0");
-        // And the journal worker has exported the whole history into the ring.
         await_status(ctl, "journal_ring_lag", "0");
     }
     await_keeper(root, "claimed=1");
@@ -420,7 +358,6 @@ const FENCED: &str = "ERR recovery-count-custody unconfirmed";
 
 /// A connection to the instance at `sock` once its recovery-count fence has lifted
 /// ([`FENCED`]): a must-happen wait, each refused connection dropped and a new one asked.
-/// A recovery with no journal to retire is admitted at its first request.
 #[track_caller]
 fn admitted(sock: &str) -> Ctl {
     let mut last = String::new();
@@ -452,7 +389,6 @@ fn a_crashed_window_s_session_comes_back_with_its_exact_screen() {
         modes.get("kitty_keyboard").map(String::as_str),
         Some("none")
     );
-    // A's scrollback, by absolute row.
     let (marker_row, first_screen_row) = located(&mut ctl, "ARMED-42");
     assert_eq!(
         Some(marker_row - first_screen_row),
@@ -473,7 +409,6 @@ fn a_crashed_window_s_session_comes_back_with_its_exact_screen() {
         "premise: A's scrollback reaches its first numbered line"
     );
     drop(ctl);
-    // A's census row: a keeper answered its boot, and it recovered nothing.
     let a_pid = a.child.id();
     let a_row = census_row(&root, a_pid);
     assert_eq!(
@@ -482,8 +417,6 @@ fn a_crashed_window_s_session_comes_back_with_its_exact_screen() {
     );
 
     let (b, mut ctl) = crash_and_recover(&root, a, &[HOLD_KEYFRAMES_SEAM]);
-    // B's: a keeper answered, and the one session it offered came back exactly — the words
-    // the soak judges, as `main_entry` hands them to the census.
     let b_row = census_row(&root, b.child.id());
     assert_eq!(b_row.keeper, Some(KeeperAtLaunch::On));
     assert_eq!(b_row.prev.pid, Some(a_pid), "B's row follows A's");
@@ -508,8 +441,6 @@ fn a_crashed_window_s_session_comes_back_with_its_exact_screen() {
     let (restored_screen, restored_modes) = screen_and_modes(&mut ctl);
     assert_eq!(restored_screen, screen, "the screen is A's last one");
     assert_eq!(restored_modes, modes, "the modes are A's last ones");
-    // The scrollback: every one of A's lines, at the same absolute rows (the restore
-    // continues A's numbering and the import lands below the restored screen's lines).
     assert_eq!(
         located(&mut ctl, "ARMED-42"),
         (marker_row, first_screen_row),
@@ -520,7 +451,6 @@ fn a_crashed_window_s_session_comes_back_with_its_exact_screen() {
     for (row, line) in &a_history {
         assert_eq!(b_history.get(row), Some(line), "history row {row} is A's");
     }
-    // Nothing older than A's history (whose oldest row may be the first there is).
     if let Some(older) = (first_screen_row - a_lines).checked_sub(1) {
         assert!(
             ctl.line(&format!("line {older}")).starts_with("ERR"),
@@ -533,13 +463,7 @@ fn a_crashed_window_s_session_comes_back_with_its_exact_screen() {
         "the import lost nothing"
     );
 
-    // B journals the adopted session in turn, every byte past its first keyframe in the
-    // tail (the seam): a marker, then a `sleep` that holds the terminal, so once the
-    // marker is on screen nothing more is gathered. Its journal worker has exported the
-    // history its import put back (the import's settle opened the export and keyframed
-    // the renumbering), so a second crash keeps the scrollback too.
     await_status(&mut ctl, "journal", "live");
-    // The adopted shell still reads at the prompt A's run waited for.
     await_prompt(&mut ctl, Some("ARMED-42"));
     ctl.type_line("printf 'B-ONLY-%s' 43; sleep 600");
     ctl.expect_on_screen("B-ONLY-43");
@@ -603,10 +527,7 @@ fn history_rows(ctl: &mut Ctl) -> (String, Vec<String>) {
 /// THE TURN LEDGER ACROSS A REAL CRASH (the crash-restore plan's increment 7): a `turn`
 /// driven into A's session, A's journal worker carries the session's ledger into the
 /// region's control slot (`journal_ledger_lag=0`, the one-minute hang detector), and A is
-/// SIGKILLed. B's `history` still finds the turn, `carried=1`, under its id and with its
-/// text, and says the floor below which the crash may have lost turns (`unheld_below=`,
-/// above the carried id: A could have recorded more after its last carry); B's own next
-/// turn takes an id at or past that floor.
+/// SIGKILLed.
 #[test]
 fn a_crashed_window_s_turns_are_still_in_history() {
     let world = world("t");
@@ -662,12 +583,6 @@ fn a_crashed_window_s_turns_are_still_in_history() {
 /// NEGATIVE CONTROL: A's journal off by the seam, so the keeper is told A's session has
 /// no region; B's recovery takes the META rung, the screen blank, and the turn A recorded
 /// is not in B's `history`.
-///
-/// And A boots BEFORE the keeper starts, as a person's first window after a login does
-/// (the keeper is a submitted job no reboot or logout keeps, and `aterm keeper start` in a
-/// tab starts it): A's census row says `keeper=absent`, its link registers the session with
-/// the keeper once it answers, and the kill is one the keeper held — B recovers it. The
-/// soak counts such a kill as held (`restore_soak`'s `no-miss`).
 #[test]
 fn without_a_journal_the_recovery_comes_back_blank() {
     let world = world("n");
@@ -727,11 +642,7 @@ fn without_a_journal_the_recovery_comes_back_blank() {
 /// its history ring away: the session's region is replaced by a fresh one whose ring is
 /// never written (`journal_ring=shedding` until the keeper confirms it read the fresh
 /// region, then `shed`, with fewer `journal_bytes=`), and the keeper takes the
-/// fresh region (`companions_taken=` moves while `journals=1` holds). A is SIGKILLed. B's
-/// recovery is exact, which it can only be from the FRESH region (the one it superseded
-/// says `restore_why=superseded`), with A's screen and modes, and it counts every scrollback
-/// line above the fresh keyframe's bridge lost: B's scrollback is that bridge, and
-/// `history_lost=` the rest of A's lines, exactly.
+/// fresh region (`companions_taken=` moves while `journals=1` holds).
 #[test]
 fn a_session_shed_under_memory_pressure_comes_back_with_its_exact_screen() {
     let world = world("p");
@@ -740,8 +651,6 @@ fn a_session_shed_under_memory_pressure_comes_back_with_its_exact_screen() {
     let (a, sock) = boot(&root, "a", &[]);
     let mut ctl = Ctl::connect(&sock);
     run_a(&root, &mut ctl, false);
-    // A turn whose ledger the region's control slot carries before the shed replaces the
-    // region: the replacement must carry it too (increment 7).
     let turn_id = drive_turn(&mut ctl, "LEDGER-SHED");
     await_prompt(&mut ctl, Some("LEDGER-SHED"));
     await_status(&mut ctl, "journal_ledger_lag", "0");
@@ -765,14 +674,11 @@ fn a_session_shed_under_memory_pressure_comes_back_with_its_exact_screen() {
     let f = fields(&reply);
     assert_eq!(f.get("level"), Some(&"critical"), "{reply}");
     assert_eq!(f.get("rings_shed"), Some(&"1"), "{reply}");
-    // The ring says `shedding` until the keeper confirms it read the replacement region
-    // (its SYNC answer behind the COMPANION), then `shed`: a must-happen wait.
     let shed = await_status(&mut ctl, "journal_ring", "shed");
     assert!(
         number(&shed, "journal_bytes") < number(&before, "journal_bytes"),
         "the ring's pages left the window: {before} / {shed}"
     );
-    // The keeper took the fresh region in place of the old one.
     await_keeper(&root, "companions_taken=2");
     await_keeper(&root, "journals=1");
     let (screen, modes) = screen_and_modes(&mut ctl);
@@ -805,7 +711,6 @@ fn a_session_shed_under_memory_pressure_comes_back_with_its_exact_screen() {
         a_lines - b_lines,
         "every line of A's above the bridge is counted lost: {status}"
     );
-    // The turn, from the fresh region's control slot.
     let (header, rows) = history_rows(&mut ctl);
     assert_eq!(rows.len(), 1, "A's turn: {header} {rows:?}");
     assert_eq!(

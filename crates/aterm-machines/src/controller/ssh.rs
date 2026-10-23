@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `/usr/bin/ssh` with the fleet's key and UUID-pinned host keys, and the bounded fan-out
-//! over many hosts (design §3.1, §4.4, §9).
-//!
-//! Every connection is built here from nothing: `-F /dev/null` keeps the owner's
-//! `~/.ssh/config` (and the system's) out, so no `ForwardAgent`, `ProxyCommand` or
-//! `LocalCommand` written there for other work reaches a lab Mac. OpenSSH takes the FIRST
-//! value it is given for each option, so callers never append an option to override one of
-//! these; they pick the [`Mux`] that builds the set they need.
-//!
-//! The constants below are what `ssh` prints when it, rather than the host, fails (exit status
-//! 255). Each was measured in the VM (macOS 27.0, `OpenSSH_10.3p1, LibreSSL 3.3.6`) with the
-//! options [`base_options`] builds, and is matched as a substring of standard error.
+//! `/usr/bin/ssh` invocation with fleet keys, UUID-pinned host keys, and bounded fan-out.
 
 use super::inventory::{Host, Paths};
 use crate::port::{Cmd, Ran, RunFailed, System};
@@ -23,75 +12,56 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-/// The client: Apple's OpenSSH.
+/// Path to Apple's OpenSSH client.
 pub const SSH: &str = "/usr/bin/ssh";
 
-/// The one row the controller prints, instead of one unreachable row per host, when this
-/// process may not reach the LAN (design §1.10, §9).
+/// Controller report row when Local Network privacy may block LAN access.
 pub const LOCAL_NETWORK_ROW: &str = "controller: aterm has no Local Network access — System \
                                      Settings ▸ Privacy & Security ▸ Local Network";
 
-/// A pinned key that does not match. Measured, after the `@@@` banner:
-/// `@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @` … `Host key for
-/// 0a1b2c3d-0000-4000-8000-000000000001 has changed and you have requested strict checking.`
-/// then `Host key verification failed.` (the alias is printed lowercased).
+/// OpenSSH stderr substring when a pinned host key does not match.
 pub const HOST_KEY_CHANGED: &str = "REMOTE HOST IDENTIFICATION HAS CHANGED!";
 
-/// No key pinned for the alias. Measured: `No ED25519 host key is known for
-/// 0a1b2c3d-0000-4000-8000-000000000001 and you have requested strict checking.` then
-/// `Host key verification failed.`
+/// OpenSSH stderr substring when no host key is pinned for the alias.
 pub const HOST_KEY_UNKNOWN: &str = " host key is known for ";
 
-/// The line both host-key refusals end with. Measured: `Host key verification failed.`
+/// OpenSSH final stderr line on host-key verification failure.
 pub const HOST_KEY_FAILED: &str = "Host key verification failed.";
 
-/// The host did not accept the key. Measured: `admin@127.0.0.1: Permission denied
-/// (publickey,password,keyboard-interactive).`
+/// OpenSSH stderr substring when public-key authentication is denied.
 pub const DENIED: &str = ": Permission denied (";
 
-/// Nothing listens on the port (Remote Login off). Measured: `ssh: connect to host
-/// 127.0.0.1 port 1: Connection refused`
+/// OpenSSH stderr substring when the remote port refuses the connection.
 pub const CONNECTION_REFUSED: &str = ": Connection refused";
 
-/// No answer within `ConnectTimeout`, on-link or off. Measured, 5 s after the start, for an
-/// unused address on the VM's own subnet (`192.168.64.254`) and for `10.255.255.1`:
-/// `ssh: connect to host 192.168.64.254 port 22: Operation timed out`
+/// OpenSSH stderr substring when the connection attempt times out.
 pub const CONNECT_TIMED_OUT: &str = ": Operation timed out";
 
-/// A port that accepted the connection and never spoke SSH. Measured, against a silent
-/// listener: `Connection timed out during banner exchange`
+/// OpenSSH stderr substring when the SSH banner exchange times out.
 pub const BANNER_TIMED_OUT: &str = "Connection timed out during banner exchange";
 
-/// `EHOSTUNREACH`. Measured for `0.0.0.1` and `2001:db8::1`: `ssh: connect to host 0.0.0.1
-/// port 22: No route to host`. This is also what an aterm session's `ssh` got to an on-link
-/// address while macOS's Local Network privacy refused aterm (design §1.10).
+/// OpenSSH stderr substring on `EHOSTUNREACH` (`No route to host`).
 pub const NO_ROUTE: &str = ": No route to host";
 
-/// An on-link address whose ARP (or neighbour) resolution failed: nothing there answers,
-/// as with a sleeping or powered-off Mac. Measured on the VM's subnet for an unused address
-/// (`192.168.64.254`): the first connect times out, the next finds `No route to host`, and
-/// the ones after that, until the neighbour entry expires, `ssh: connect to host
-/// 192.168.64.254 port 22: Host is down`.
+/// OpenSSH stderr substring on `EHOSTDOWN` (`Host is down`).
 pub const HOST_DOWN: &str = ": Host is down";
 
-/// A name nothing resolves. Measured: `ssh: Could not resolve hostname
-/// no-such-mac-zz.local: nodename nor servname provided, or not known`
+/// OpenSSH stderr substring when hostname resolution fails.
 pub const UNRESOLVED: &str = "Could not resolve hostname";
 
-/// How the controller reaches one host.
+/// SSH connection target for one host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
-    /// The admin account.
+    /// Admin account name.
     pub user: String,
-    /// Where to connect.
+    /// Host address or hostname.
     pub address: String,
-    /// The host's UUID, the `HostKeyAlias` its key is pinned under (`None` before enrollment
-    /// has read it).
+    /// Host UUID used as `HostKeyAlias` (`None` before enrollment).
     pub alias: Option<String>,
 }
 
 impl Target {
-    /// The target for an inventory host.
+    /// Builds a [`Target`] from an inventory [`Host`].
     #[must_use]
     pub fn of(host: &Host) -> Self {
         Self {
@@ -101,17 +71,16 @@ impl Target {
         }
     }
 
-    /// `user@address`, the destination `ssh` takes after `--`.
+    /// Formats `user@address` for `ssh` after `--`.
     #[must_use]
     pub fn destination(&self) -> String {
         format!("{}@{}", self.user, self.address)
     }
 
-    /// Whether `ssh` reads the destination as one: no word starts with `-`, and nothing in
-    /// it is a space, an `@` past the one separator, or a control character.
+    /// Validates that `user` and `address` are safe for `ssh`.
     ///
     /// # Errors
-    /// One line naming the bad word.
+    /// Returns a human-readable refusal when `user` or `address` is empty or malformed.
     pub fn check(&self) -> Result<(), String> {
         let word_ok = |w: &str, extra: &[u8]| {
             !w.is_empty()
@@ -134,29 +103,24 @@ impl Target {
     }
 }
 
-/// How a connection uses an OpenSSH control master.
+/// OpenSSH control-master mode for a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mux<'a> {
-    /// No master, no prompt: the fleet key's unattended requests (`hello`, `put`, `apply`).
+    /// No control master and no interactive prompts (`BatchMode=yes`).
     Off,
-    /// Start a master at this path for enrollment: the owner types the admin's password to
-    /// `ssh` once (`BatchMode=no`, public keys off, so a fleet key already authorized on a
-    /// re-enrolled Mac cannot turn the session into its forced command). It ends a minute
-    /// after its last client, so a crashed enrollment leaves no master behind.
+    /// Starts a control master at this socket path for interactive enrollment.
     Master(&'a Path),
-    /// Ride the master at this path. Every authentication method is off, so when the master
-    /// is gone the connection fails (`Permission denied`) instead of opening a new one.
+    /// Connects through an existing control master at this socket path.
     Through(&'a Path),
 }
 
-/// The options every fleet connection carries: the fleet key only, pinned host keys, no
-/// agent or X11 forwarding, keepalives, a short connect timeout, batch mode.
+/// Base OpenSSH `-o` options shared by all fleet connections.
 #[must_use]
 pub fn base_options(paths: &Paths, target: &Target) -> Vec<OsString> {
     options(paths, target, Mux::Off)
 }
 
-/// The options for `target` under `mux`; see [`Mux`] for what each changes.
+/// OpenSSH arguments for `target` under `mux`.
 #[must_use]
 pub fn options(paths: &Paths, target: &Target, mux: Mux<'_>) -> Vec<OsString> {
     build(paths, target, mux)
@@ -176,7 +140,6 @@ fn build(paths: &Paths, target: &Target, mux: Mux<'_>) -> Vec<OsString> {
         "UserKnownHostsFile={}",
         config_path(&paths.known_hosts())
     ));
-    // The controller's known_hosts is the only authority on a host's key.
     set("GlobalKnownHostsFile=/dev/null");
     if let Some(alias) = &target.alias {
         set(&format!("HostKeyAlias={alias}"));
@@ -217,14 +180,7 @@ fn build(paths: &Paths, target: &Target, mux: Mux<'_>) -> Vec<OsString> {
     out
 }
 
-/// `path` as an `-o` value. `ssh` reads `-o` as a config line: it splits a value at blanks
-/// unless it is double-quoted, and expands `%` tokens in these paths. Measured in the VM:
-/// `ControlPath=/tmp/a b/c` failed with `keyword controlpath extra arguments at end of
-/// line`, `UserKnownHostsFile=/tmp/k%h` read `/tmp/kx`, and `IdentityFile="/tmp/ctlx/k%%z
-/// w"` loaded `/tmp/ctlx/k%z w`. So `%` is doubled, and a value holding a blank, a quote, a
-/// backslash or `#` is double-quoted with `"` and `\` escaped. The key goes as
-/// `-o IdentityFile`, not `-i`, for the same reason: `-i` checks the raw path, then
-/// expands it.
+/// `path` as an `-o` value.
 fn config_path(path: &Path) -> String {
     let text = path.to_string_lossy().replace('%', "%%");
     if text
@@ -237,16 +193,10 @@ fn config_path(path: &Path) -> String {
     }
 }
 
-/// The `ssh` that makes one forced-command request (`hello`, `put <sha>`, `apply`, `attach
-/// <run>`, `screen`) of `target`: `ssh -T <base options> -- user@address <command>`. `-T`
-/// asks for no terminal, so the request's bytes pass untouched: `ssh` reads its escape
-/// character only in a session with one (ssh(1), `-e`).
-///
-/// `command` is what the host's dispatcher reads from `SSH_ORIGINAL_COMMAND` and splits on
-/// spaces, so it is refused unless it is printable ASCII on one line.
+/// Builds the [`Cmd`] for a forced-command request on `target`.
 ///
 /// # Errors
-/// [`RunFailed::Refused`] for a target or command `ssh` could misread.
+/// Returns [`Target::check`]'s refusal if the target is invalid.
 pub fn request_cmd(paths: &Paths, target: &Target, command: &str) -> Result<Cmd, RunFailed> {
     target.check().map_err(RunFailed::Refused)?;
     if command.is_empty() || !command.bytes().all(|b| (b' '..=b'~').contains(&b)) {
@@ -262,13 +212,10 @@ pub fn request_cmd(paths: &Paths, target: &Target, command: &str) -> Result<Cmd,
     Ok(ssh_cmd(args))
 }
 
-/// Run one forced-command request ([`request_cmd`]) on `target`, with `stdin` from a file.
-/// Every request goes over SSH, where the host key pinned under the host's UUID
-/// (`HostKeyAlias`, `StrictHostKeyChecking=yes`) decides who answers.
+/// Runs one forced-command request on `target` with `stdin`.
 ///
 /// # Errors
-/// [`RunFailed`] when ssh did not run to completion, or [`RunFailed::Refused`] before it
-/// starts for a target or command `ssh` could misread.
+/// Returns an error if the target is invalid or spawning `ssh` fails.
 pub fn request(
     sys: &dyn System,
     paths: &Paths,
@@ -284,7 +231,7 @@ pub fn request(
     sys.run(&cmd)
 }
 
-/// Why `ssh` itself failed (exit status 255), read from what it printed.
+/// Classification of an OpenSSH transport failure (exit status 255).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Failure {
     /// The host's key is not the one pinned for it.
@@ -308,8 +255,7 @@ pub enum Failure {
 }
 
 impl Failure {
-    /// Whether the host simply could not be reached (design §9's exit status 2), as opposed
-    /// to a refusal that needs the owner (a changed key, a key it no longer accepts).
+    /// Returns whether the failure means the host could not be reached.
     #[must_use]
     pub const fn unreachable(&self) -> bool {
         matches!(
@@ -318,7 +264,7 @@ impl Failure {
         )
     }
 
-    /// One line for a report row.
+    /// Formats a single-line summary for a report row.
     #[must_use]
     pub fn why(&self) -> String {
         match self {
@@ -342,9 +288,7 @@ impl Failure {
         }
     }
 
-    /// [`Failure::why`] for a command that reaches `address` and no other host: none can show
-    /// the LAN is there, so no route to a local address also names Local Network privacy,
-    /// which fails a connection the same way (design §9).
+    /// Formats [`Failure::why`] for a single-host command, noting Local Network privacy when applicable.
     #[must_use]
     pub fn why_alone(&self, address: &str) -> String {
         match self {
@@ -356,17 +300,11 @@ impl Failure {
     }
 }
 
-/// What an exit 255 with nothing on standard error means. Not only `ssh` itself: a command
-/// on the host that dies by a signal ends `ssh` with 255 too (measured in the VM:
-/// `/bin/sh -c 'kill -9 $$'` as the remote command, at `LogLevel=ERROR`, gave exit 255 and
-/// an empty standard error), as does a connection the host closed (`Connection closed by`
-/// is INFO-level, so `LogLevel=ERROR` hides it).
+/// Diagnostic message when `ssh` exits 255 with empty standard error.
 pub const EMPTY_255: &str = "exit 255 and nothing said: the connection closed, or the command on the host died by \
      a signal";
 
-/// What failed, when `ran` is `ssh` failing on its own (exit status 255); `None` for any
-/// other status, which is the host's answer. An empty 255 is [`EMPTY_255`]: it may be the
-/// host's command dying, so it is [`Failure::Other`], never a reachability verdict.
+/// Classifies an OpenSSH failure when `ran` exited with status 255.
 #[must_use]
 pub fn classify(ran: &Ran) -> Option<Failure> {
     if ran.status != Some(255) {
@@ -401,13 +339,7 @@ pub fn classify(ran: &Ran) -> Option<Failure> {
     Some(failure)
 }
 
-/// Whether `address` is one Local Network privacy governs (design §1.10, §9): a `.local`
-/// name, or a private, link-local or unique-local address (a `%zone` suffix allowed).
-///
-/// "Local" is a guess at on-link from the range, not a read of this Mac's interfaces: a
-/// private address reached through a router that answers "host unreachable" finds no route
-/// the same way. One host failing so proves nothing; every host failing so, none answering
-/// or timing out, is the privacy refusal the design names.
+/// Returns whether `address` is governed by macOS Local Network privacy.
 #[must_use]
 pub fn is_local_address(address: &str) -> bool {
     let name = address.trim_end_matches('.').to_ascii_lowercase();
@@ -429,11 +361,7 @@ pub fn is_local_address(address: &str) -> bool {
     }
 }
 
-/// Run `work` for every item of `items`, at most `parallel` at once, and return the results
-/// in input order.
-///
-/// Workers are scoped threads (`parallel`, at least one and at most one per item) that take
-/// the next index from a shared counter, so a slow host holds up one worker, not a batch.
+/// Runs `work` across `items` with at most `parallel` concurrent workers, preserving input order.
 pub fn fan_out<T: Sync, R: Send>(
     items: &[T],
     parallel: usize,
@@ -469,7 +397,7 @@ pub fn fan_out<T: Sync, R: Send>(
         .collect()
 }
 
-/// A [`Cmd`] for `/usr/bin/ssh` with `args`, for callers that build their own argv.
+/// Builds a [`Cmd`] for `/usr/bin/ssh` with `args`.
 #[must_use]
 pub fn ssh_cmd(args: Vec<OsString>) -> Cmd {
     Cmd::new(SSH).args(args)
@@ -519,7 +447,6 @@ mod tests {
         let args = base_options(&paths(), &target());
         let all = strings(&args);
         assert_eq!(&all[..2], ["-F", "/dev/null"]);
-        // Nothing but `-o` pairs after `-F /dev/null`.
         assert_eq!(all.len(), 2 + 2 * os(&args).len(), "{all:?}");
         assert_eq!(
             os(&args),
@@ -547,7 +474,6 @@ mod tests {
 
     #[test]
     fn no_option_is_given_twice_so_none_is_silently_ignored() {
-        // OpenSSH keeps the first value of each option: a duplicate would be dead text.
         for mux in [
             Mux::Off,
             Mux::Master(Path::new("/c/ab12cd34")),
@@ -756,7 +682,6 @@ Host key verification failed.\r\n";
         for (stderr, want) in cases {
             assert_eq!(classify(&ssh_said(stderr)).as_ref(), Some(want), "{stderr}");
         }
-        // Any other status is the host's own answer, not ssh's.
         assert_eq!(classify(&Ran::exit(2, "refused: busy run=7")), None);
         assert_eq!(classify(&Ran::ok("")), None);
     }
@@ -795,7 +720,6 @@ Host key verification failed.\r\n";
                 .why_alone("192.168.64.2")
                 .ends_with(LOCAL_NETWORK_ROW)
         );
-        // Off the LAN, or any other failure, it is the plain row.
         assert_eq!(
             Failure::NoRoute.why_alone("8.8.8.8"),
             Failure::NoRoute.why()
@@ -809,7 +733,6 @@ Host key verification failed.\r\n";
     #[test]
     fn fan_out_keeps_input_order_whatever_order_work_finishes_in() {
         let items: Vec<u64> = (0..50).collect();
-        // Each later item is released first: item i waits until every item above it is done.
         let done = Mutex::new(vec![false; items.len()]);
         let changed = Condvar::new();
         let out = fan_out(&items, items.len(), |&i| {
@@ -831,8 +754,6 @@ Host key verification failed.\r\n";
         let items: Vec<usize> = (0..24).collect();
         let running = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
-        // The first four must be in flight together before any finishes: a fan-out that
-        // ran fewer at once would hang here (the hang detector fails it).
         let gate = Mutex::new(0_usize);
         let opened = Condvar::new();
         let out = fan_out(&items, 4, |&i| {

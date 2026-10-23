@@ -2,40 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! The scheduling band a measured instance runs in (`instance --band`).
-//!
-//! macOS schedules a process by its resource coalition, whose processes share
-//! one performance-controller thread group judged by its recent load, by its
-//! darwin role, and by any QoS clamp its task carries. A LaunchServices
-//! aterm.app heads a coalition of its own, which its shells share, at role
-//! `UI_FOCAL` while it is frontmost, with no clamp: its main thread runs at
-//! priority 46-47 and each shell's at 46 (read on 0.107.0 with
-//! `PROC_PIDCOALITIONINFO`, `getpriority(PRIO_DARWIN_ROLE)` and
-//! `PROC_PIDTHREADID64INFO`). A process an agent starts runs inside the agent's
-//! coalition, beside the agent's builds, so its thread group is judged by
-//! their load, not by aterm's own.
-//!
-//! [`Band::App`], the default of a headless `instance`, starts it as its own
-//! launchd job, loaded from a definition with `ProcessType` `App`
-//! (`launchctl bootstrap gui/<uid>`), the type launchd gives an app's job. The
-//! job's first process is `aterm-lab band` ([`band_main`]): it takes the
-//! world's environment, the lifeline and the log, then execs aterm as an
-//! APP-type task at role `UI_FOCAL`, as launchd spawns an app; aterm keeps the
-//! pid and so heads the job's new coalition, its shells in it.
-//! [`Band::Agent`] is the launch as it always was: a child of this lab, in the
-//! caller's coalition.
-//!
-//! NOT `launchctl submit` (LAG-13, 2026-10-20). A submitted job is
-//! `ProcessType` `Standard`, which launchd clamps to QoS utility, and the clamp
-//! survives the exec as an app: aterm's every thread and each shell's ran at
-//! priority 20, the band of a background daemon and not of aterm.app, and
-//! MEAS-1's first numbers for this band were taken there
-//! (`docs/measured/app-band-2026-10-20.md`).
-//!
-//! The job is KeepAlive: launchd starts its program again whenever it ends.
-//! The instance removes the job by its label when it stops. Should the lab die
-//! first (its lifeline then ends aterm), launchd's restart finds the job's
-//! marker `band.<label>.ran`, or no world at all, and removes the job by its
-//! label instead of starting a second aterm.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Write as _};
@@ -59,10 +25,7 @@ pub enum Band {
 }
 
 impl Band {
-    /// `--band` as given, else the default: the app band for a headless
-    /// instance. A windowed one keeps the agent band: its keeper, not aterm,
-    /// would be the job's process, and the role does not cross a spawn.
-    ///
+    /// `--band` as given, else the default: the app band for a headless instance.
     /// # Errors
     /// An unknown band, or the app band asked of a window.
     pub fn pick(given: Option<&str>, window: bool) -> Result<Band, Fail> {
@@ -88,8 +51,7 @@ impl Band {
     }
 }
 
-/// The darwin role the app band runs at: `PRIO_DARWIN_ROLE_UI_FOCAL`, what
-/// LaunchServices gives the frontmost app.
+/// The darwin role the app band runs at: `PRIO_DARWIN_ROLE_UI_FOCAL`, what LaunchServices gives the frontmost app.
 pub const UI_FOCAL: u64 = 1;
 
 /// `PRIO_DARWIN_ROLE_UI`: the role aterm-pty gives each shell before its exec.
@@ -114,13 +76,9 @@ pub struct Job {
 }
 
 impl Job {
-    /// Start `line` (program first: aterm and its flags, `--lifeline-fd 0`
-    /// among them) as its own launchd job ([`launch`]) with exactly `env`, in
-    /// `cwd`, its output appended to `log`, and wait for it to report its pid.
-    ///
+    /// Start `line` (program first: aterm and its flags, `--lifeline-fd 0` among them) as its own launchd job ([`launch`]) with exactly `env`, in `cwd`, its output appended to `log`, and wait for it to report its pid.
     /// # Errors
-    /// The world's entries could not be made, `launchctl` refused the job, or
-    /// the job never reported (its log says why; the job is removed).
+    /// The world's entries could not be made, `launchctl` refused the job, or the job never reported (its log says why; the job is removed).
     pub fn start(
         dir: &Path,
         line: &[String],
@@ -130,7 +88,6 @@ impl Job {
     ) -> Result<Job, String> {
         let fifo = dir.join(LIFELINE);
         crate::sys::make_fifo(&fifo).map_err(|e| format!("the lifeline FIFO: {e}"))?;
-        // Its own reader, so the open never waits; close-on-exec, so no child holds it.
         let held: OwnedFd = OpenOptions::new()
             .read(true)
             .write(true)
@@ -148,10 +105,8 @@ impl Job {
             n.to_string_lossy()
                 .replace(|c: char| !c.is_ascii_alphanumeric(), "_")
         });
-        // Never a label aterm uses (application.com.aterm.aterm.*, com.aterm.*).
         let label = format!("aterm-lab.instance.{world}.{}", std::process::id());
         launch(dir, &label, line, cwd, log)?;
-        // A hang detector, never a budget: the job writes its pid before its exec.
         let end = Instant::now() + crate::instance::BOOT;
         loop {
             if let Some(pid) = std::fs::read_to_string(dir.join(PID_FILE))
@@ -199,9 +154,7 @@ fn target(label: &str) -> String {
 }
 
 /// Unload the job `label` (`launchctl bootout gui/<uid>/<label>`; it ends the
-/// job's process if one still runs). Named by its domain, not with the legacy
-/// `launchctl remove`, which reads the caller's: a lab started over SSH is in
-/// another domain, and the job would stay.
+/// job's process if one still runs).
 fn remove(label: &str) {
     let _ = aterm_uds::spawnfd::command(LAUNCHCTL)
         .arg("bootout")
@@ -243,15 +196,9 @@ fn job_plist(label: &str, args: &[String]) -> String {
     out
 }
 
-/// Load `line` (program first) as the launchd job `label` in this user's GUI
-/// domain, its first process `aterm-lab band` ([`band_main`]) over `dir`'s
-/// world (its environment file and lifeline FIFO, which the caller made), in
-/// `cwd`, its output appended to `log`. The definition is written to
-/// `dir/band.plist` ([`job_plist`]).
-///
+/// Load `line` (program first) as the launchd job `label` in this user's GUI domain, its first process `aterm-lab band` ([`band_main`]) over `dir`'s world (its environment file and lifeline FIFO, which the caller made), in `cwd`, its output appended to `log`.
 /// # Errors
-/// A path is not UTF-8 (a property list cannot carry it), the definition
-/// could not be written, or `launchctl` refused it.
+/// A path is not UTF-8 (a property list cannot carry it), the definition could not be written, or `launchctl` refused it.
 pub fn launch(
     dir: &Path,
     label: &str,
@@ -301,8 +248,7 @@ pub fn launch(
     Ok(())
 }
 
-/// `aterm-lab band-launch <dir> <label> --cwd DIR --log FILE -- PROGRAM ARGS…`:
-/// [`launch`] alone, over a world the caller made (`tests/band.rs`).
+/// `aterm-lab band-launch <dir> <label> --cwd DIR --log FILE -- PROGRAM ARGS…`: [`launch`] alone, over a world the caller made (`tests/band.rs`).
 #[must_use]
 pub fn launch_main(args: &[String]) -> i32 {
     let usage = || {
@@ -330,14 +276,7 @@ pub fn launch_main(args: &[String]) -> i32 {
     }
 }
 
-/// `aterm-lab band <dir> <label> --cwd DIR --log FILE -- PROGRAM ARGS…`: the
-/// first process of an app-band job ([`Job::start`]). The first time, it
-/// makes the job's marker, writes its pid and becomes PROGRAM as an app does:
-/// an APP-type task at darwin role [`UI_FOCAL`] ([`crate::sys::exec_as_app`]),
-/// with the world's environment, the lifeline on stdin and the log on stdout
-/// and stderr. Any later time (launchd restarting the KeepAlive job once
-/// PROGRAM ended, or a world already removed) it removes the job by its label
-/// and exits 0.
+/// `aterm-lab band <dir> <label> --cwd DIR --log FILE -- PROGRAM ARGS…`: the first process of an app-band job ([`Job::start`]).
 #[must_use]
 pub fn band_main(args: &[String]) -> i32 {
     let usage = || {
@@ -384,8 +323,6 @@ pub fn band_main(args: &[String]) -> i32 {
             return 127;
         }
     };
-    // Non-blocking, so a lab gone before the job started (no writer left)
-    // cannot hold this open: aterm then reads end of file at once and ends.
     let lifeline = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
@@ -413,7 +350,6 @@ pub fn band_main(args: &[String]) -> i32 {
         eprintln!("aterm-lab band: the pid file: {e}");
         return 127;
     }
-    // This process becomes PROGRAM: the lifeline and the log at 0-2, the world's folder.
     let placed = crate::sys::dup_onto(lifeline.as_raw_fd(), 0)
         .and_then(|()| crate::sys::dup_onto(out.as_raw_fd(), 1))
         .and_then(|()| crate::sys::dup_onto(out.as_raw_fd(), 2))
@@ -427,13 +363,7 @@ pub fn band_main(args: &[String]) -> i32 {
     127
 }
 
-/// `aterm-lab band-standin <file>`: the program `tests/band.rs` runs in an
-/// app-band job, in aterm's place. It appends one line per start to `<file>`:
-/// its darwin role; `ok` when setting its own role to `UI` took (as aterm-pty
-/// sets each shell's, which an APP-type task may and a DAEMON-type one may
-/// not) or the error; and the priority a user-interactive request then lands
-/// at ([`crate::sys::ui_request_lands`]: 46 at role `UI`, 20 under launchd's
-/// utility clamp). Then it reads stdin, the lifeline, to its end.
+/// `aterm-lab band-standin <file>`: the program `tests/band.rs` runs in an app-band job, in aterm's place.
 #[must_use]
 pub fn standin_main(args: &[String]) -> i32 {
     let [file] = args else {

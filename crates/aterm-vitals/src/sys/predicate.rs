@@ -1,75 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `await sys` (§13.8): the grammar and its evaluation on one snapshot.
-//!
-//! ```text
-//! await sys <predicate> [for=<dur>] [scope=tab|aterm] [timeout=<ms>]
-//! <predicate> := quiet [<term> …] | <term> [and <term> …]
-//! <term>      := <metric><op><value> | <metric>=<word>[,<word>…]
-//!              | (job|task)=<id> <verdict>[,<verdict>…] | (job|task)=<id> class=<class>[,…]
-//! <op>        := < | <= | > | >= | = | !=
-//! ```
-//!
-//! The machine metrics this crate measures: `cpu` (busy, `%` of the cores or
-//! `c` cores-worth), `cpu.l<n>` / `cpu.<cluster>` (one performance level's
-//! busy `%`), `aterm` and `tab` (cores-worth), `wait` (cores-worth of threads
-//! waiting for a core, own processes), `gpu` (`%`), `mem` (pressure, ordered
-//! `normal < warn < critical`), `swap` (bytes/s in plus out), `decompress`
-//! (per second), `thrash` (`yes`/`no`), `tab.mem` and `aterm.mem` (footprint
-//! bytes), `throttle` (ordered `none < light < heavy < severe`).
-//!
-//! The occupancy facts (`DESIGN-harness-occupancy-2026-10-20.md` §3.1):
-//! `load` (the 1-minute load average per logical core, a bare ratio, as the
-//! fleet's `cpu_busy_pct` reads it but uncapped), `cores_idle` (logical cores
-//! less the 5-minute load, cores-worth, so a one-minute spike does not read
-//! as lost cores), `avail` (bytes the machine can hand out without paging:
-//! free, inactive and purgeable, `build-slot`'s admission figure) and `slots`
-//! (build slots proven free, less those a live orphaned build still fills;
-//! the reply says `slots=<usable>/<n>`). A slot reader that has proven no
-//! slot either way yet is warming, and so is a reading older than
-//! [`SLOTS_FRESH_MS`]. A slot not proven either way may be free or not, so a
-//! `slots` term holds only when it holds whichever way each such slot turns
-//! out: `slots>=1` on the slots proven free, `slots<1` only once no slot is
-//! left unproven that could be free.
-//!
-//! `free` and `disk=` are the volume wait (`aterm-gui`'s `control_disk`),
-//! parsed here like every other term (one grammar,
-//! `DESIGN-harness-occupancy-2026-10-20.md` §3.1): `free>=<size>`,
-//! `free><size>` or `free>=room` (a size needs its unit), `disk=<ok|low|short|
-//! emergency>[,…]`, at most two joined by `and`, with `vol=<path>` and
-//! `timeout=` and nothing else, handed over parsed ([`Parsed::Volume`]). One
-//! that mixes them with machine metrics is refused, since the two waits park
-//! on different boards. `eta`, `growth` and `walk` are design P5's: they wait
-//! on the folder walker's growth, which needs its change feed and walk cache
-//! (§19; the walker `sys disk` reads re-walks on demand only), so each
-//! answers `ERR unavailable <metric> why=not_sampled` at arm time rather
-//! than parking forever.
-//!
-//! The stuck engine's terms read the view the host hangs on each snapshot
-//! (`Snapshot::jobs`): `jobs.stuck`, `jobs.quiet` and `jobs.running` count the
-//! target tab's jobs; `job=<id>` (or `task=<id>`, the agent's task id) names
-//! one of the tab's jobs and waits for one of its verdicts (`done` is
-//! `exited`) or, with `class=`, one of its classes; the two word sets never
-//! mix (§11.7), and a class word given bare is refused as one (`ERR usage:
-//! running is a class`). A job the engine has not seen yet reads as warming;
-//! one that left the view after it exited (a minute on) is read from the
-//! event ring ([`EndedJob`]). An exited job's exit meets `done`, and any other
-//! wait on it, in the view or the ring, is `ERR gone job=<id>` (§13.7) at
-//! once rather than parked to the timeout, as is a job neither the view nor
-//! the ring knows once the engine has looked again ([`Outcome::absent`], the
-//! host's call). `scope=aterm` (Owner-only, the access arm's) widens the `jobs.*`
-//! counts and the job terms from the target's tab to every tab.
-//!
-//! `quiet` is `cpu<25% and wait<0.25 and gpu<10% and throttle=none and
-//! swap<1MB/s`; an explicit term replaces the preset's term for its metric,
-//! and a preset term this host cannot measure drops out, reported as
-//! `skipped=<metric>:<why>`. An explicit term this host cannot measure is
-//! refused (`ERR unavailable <metric> why=<word>`).
-//!
-//! LEVEL-TRIGGERED AND LATCHED: the host re-evaluates on every new snapshot;
-//! `for=<dur>` needs the predicate to hold on consecutive snapshots spanning
-//! `dur` by their stamps ([`Latch`]).
+//! `await sys` (§13.8).
 
 use crate::jobs::{Class, JobRow, Verdict};
 use crate::model::{SlotsUnread, SlotsView, Snapshot, Throttle};
@@ -91,10 +23,7 @@ pub const USAGE: &str = "ERR usage: await sys <predicate> [for=<dur>] [scope=tab
 pub const MIXED: &str = "ERR usage: await sys: free and disk= wait on their volume alone; \
                          wait for the machine terms in a second await\n";
 
-/// A snapshot whose slots were read longer ago than this reads `slots` as
-/// warming: twice the period the host's reader reads them at while a wait
-/// names them (`aterm_sysprobe::slots::PERIOD`; at rest it reads once a
-/// minute).
+/// A snapshot whose slots were read longer ago than this reads `slots` as warming.
 pub const SLOTS_FRESH_MS: u64 = 10_000;
 
 /// `timeout=` when not given, ms (the `await` family's default).
@@ -105,10 +34,9 @@ pub const TIMEOUT_MAX_MS: u64 = 600_000;
 /// What a term compares.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Metric {
-    /// Machine busy: `%` of the cores, or `c` cores-worth.
+    /// Machine busy.
     Cpu,
-    /// One performance level's busy `%`: by index (`l0` the fastest) or by
-    /// its cluster's name; `label` is what the caller typed after `cpu.`.
+    /// One performance level's busy `%`.
     CpuLevel {
         /// `l<n>`'s index.
         index: Option<usize>,
@@ -137,8 +65,7 @@ pub enum Metric {
     AtermMem,
     /// The thermal level.
     Throttle,
-    /// A count of the target tab's jobs (`jobs.stuck`, `jobs.quiet`,
-    /// `jobs.running`).
+    /// A count of the target tab's jobs (`jobs.stuck`, `jobs.quiet`, `jobs.running`).
     Jobs(JobCount),
     /// One job, by its id or its agent task id.
     Job(JobRef),
@@ -346,8 +273,7 @@ impl Op {
 /// What a term wants.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Want {
-    /// A number in the metric's base unit (percent, cores, bytes, bytes/s,
-    /// per second); `cores` marks a `cpu` value given in `c`.
+    /// A number in the metric's base unit (percent, cores, bytes, bytes/s, per second).
     Num {
         /// The comparison.
         op: Op,
@@ -389,13 +315,11 @@ pub struct AwaitSys {
     pub for_ms: u64,
     /// `timeout=`, ms.
     pub timeout_ms: u64,
-    /// `scope=aterm`: the job terms read every tab, not the target's
-    /// (Owner-only).
+    /// `scope=aterm`.
     pub scope_aterm: bool,
 }
 
-/// A job that left the engine's view after it exited, as the host's event
-/// ring remembers its `exited` event.
+/// A job that left the engine's view after it exited, as the host's event ring remembers its `exited` event.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EndedJob {
     /// Its tab's key.
@@ -440,8 +364,7 @@ pub enum Parsed {
     Volume(VolumeWait),
 }
 
-/// A volume's level, as `disk=` names it (the disk watch's levels; the host
-/// maps each to its own).
+/// A volume's level, as `disk=` names it (the disk watch's levels; the host maps each to its own).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiskWord {
     /// `ok`.
@@ -477,13 +400,12 @@ pub enum VolumeTerm {
     Disk(Vec<DiskWord>),
 }
 
-/// The volume wait, parsed: one or two terms, all of which must hold.
+/// The volume wait, parsed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VolumeWait {
     /// The terms.
     pub terms: Vec<VolumeTerm>,
-    /// `vol=` as given (percent-encoded; the host decodes it, and refuses
-    /// one that is not absolute), else the session's own volume.
+    /// `vol=` as given (percent-encoded; the host decodes it, and refuses one that is not absolute), else the session's own volume.
     pub vol: Option<String>,
     /// The caller's patience, ms.
     pub timeout_ms: u64,
@@ -637,8 +559,7 @@ enum Tok {
 }
 
 /// The words after `job=<id>`: verdicts (`done` is `exited`), or `class=`
-/// and classes. A class word given bare is refused as one (§13.7): the two
-/// word sets never mix.
+/// and classes.
 fn job_want(words: &str) -> Result<Want, String> {
     if let Some(classes) = words.strip_prefix("class=") {
         let cs: Option<Vec<Class>> = classes.split(',').map(Class::from_word).collect();
@@ -767,9 +688,7 @@ impl AwaitSys {
     /// Parse the arguments after `await` (`sys <predicate> …`).
     ///
     /// # Errors
-    ///
-    /// The reply refusing it: [`USAGE`], [`MIXED`], or `ERR unavailable
-    /// <metric> why=not_sampled` for a metric this build does not measure.
+    /// The reply refusing it.
     pub fn parse(rest: &str) -> Result<Parsed, String> {
         let mut toks = rest.split_whitespace().peekable();
         if toks.next() != Some("sys") {
@@ -782,11 +701,7 @@ impl AwaitSys {
         let mut for_ms = 0u64;
         let mut timeout_ms = TIMEOUT_DEFAULT_MS;
         let mut scope_aterm = false;
-        // `for=` and `scope=` given: the volume wait takes neither.
         let mut machine_words = false;
-        // `and` joins two terms; after `quiet` terms follow with or without
-        // it. `after_and`: the last word was `and`; `first`: no term or
-        // `quiet` yet.
         let mut after_and = false;
         let mut first = true;
         while let Some(tok) = toks.next() {
@@ -857,7 +772,6 @@ impl AwaitSys {
             if !terms.is_empty() || quiet {
                 return Err(MIXED.to_owned());
             }
-            // One or two terms, with `vol=` and `timeout=` alone.
             if machine_words || volume.len() > 2 {
                 return Err(USAGE.to_owned());
             }
@@ -900,9 +814,7 @@ enum Reading {
     Unavailable(&'static str),
 }
 
-/// The target's sessions, for `tab` and `tab.mem`. A session the snapshot
-/// does not hold yet (the layout reached the probe after it read) is warming:
-/// the target's exit, not its absence from one sample, ends the wait.
+/// The target's sessions, for `tab` and `tab.mem`.
 fn tab_sum(
     s: &Snapshot,
     keys: &[u64],
@@ -1024,7 +936,6 @@ fn read(metric: &Metric, s: &Snapshot, tab_keys: &[u64], cores_want: bool) -> Re
             let Some(l) = s.load else {
                 return Reading::Unavailable("unsupported");
             };
-            // The cores are known once two core readings exist.
             let Some(cores) = s.total_cores().filter(|c| *c > 0) else {
                 return Reading::Warming;
             };
@@ -1040,16 +951,11 @@ fn read(metric: &Metric, s: &Snapshot, tab_keys: &[u64], cores_want: bool) -> Re
         }),
         Metric::Slots => match s.slots {
             None => Reading::Unavailable(SlotsUnread::NotSampled.word()),
-            // Read at rest, before any wait named the slots: the reader reads
-            // them again for this one.
             Some(_) if s.slots_age_ms.is_some_and(|a| a > SLOTS_FRESH_MS) => Reading::Warming,
             Some(SlotsView::Unread(why)) => Reading::Unavailable(why.word()),
-            // The reader reads no slot files as unread; a count of none is
-            // the same fact.
             Some(SlotsView::Read { n: 0, .. }) => {
                 Reading::Unavailable(SlotsUnread::NotSampled.word())
             }
-            // Not one slot proven either way yet: the first read.
             Some(SlotsView::Read { n, pending, .. }) if pending >= n => Reading::Warming,
             Some(SlotsView::Read {
                 free, discounted, ..
@@ -1136,7 +1042,7 @@ fn job_words(job: &JobRef, r: Option<&JobRow>) -> String {
     w
 }
 
-/// A byte count as the reply prints it: `0B`, `310MB`, `1.2GB`.
+/// A byte count as the reply prints it.
 #[must_use]
 pub fn size_word(b: f64) -> String {
     let b = b.max(0.0);
@@ -1196,12 +1102,9 @@ pub struct Outcome {
     pub values: Vec<String>,
     /// `<metric>:<why>` for each preset term that dropped out.
     pub skipped: Vec<String>,
-    /// The refusal of an explicit term this host cannot measure, or of a
-    /// wait on a job that ended without meeting it (`ERR gone job=<id>`).
+    /// The refusal of an explicit term this host cannot measure, or of a wait on a job that ended without meeting it (`ERR gone job=<id>`).
     pub refused: Option<String>,
-    /// The job terms (`job=<id>`, `task=<id>`) whose job neither the view
-    /// nor the ring holds: not read yet, or gone; the host says `ERR gone`
-    /// once the engine has looked again and still not found it.
+    /// The job terms (`job=<id>`, `task=<id>`) whose job neither the view nor the ring holds.
     pub absent: Vec<String>,
 }
 
@@ -1221,7 +1124,6 @@ fn unproven_slots(s: &Snapshot) -> u16 {
 /// each unproven slot turns out.
 fn holds_on_every(op: Op, v: f64, lo: f64, hi: f64) -> bool {
     match op {
-        // No whole count in `lo..=hi` is `v`.
         Op::Ne => v.fract() != 0.0 || !(lo..=hi).contains(&v),
         _ => op.holds(lo, v) && op.holds(hi, v),
     }
@@ -1245,8 +1147,7 @@ pub fn evaluate(wait: &AwaitSys, s: &Snapshot, tab_keys: &[u64]) -> Outcome {
     evaluate_with(wait, s, tab_keys, &[])
 }
 
-/// [`evaluate`], with the jobs that left the view after they exited
-/// (`ended`, from the host's event ring).
+/// [`evaluate`], with the jobs that left the view after they exited (`ended`, from the host's event ring).
 #[must_use]
 pub fn evaluate_with(
     wait: &AwaitSys,
@@ -1285,7 +1186,6 @@ pub fn evaluate_with(
                         _ => false,
                     };
                     if !met {
-                        // It ended without meeting the wait, and never will.
                         out.refused = Some(format!("ERR gone job={}\n", e.id));
                         out.holds = false;
                         return out;
@@ -1304,7 +1204,6 @@ pub fn evaluate_with(
                         _ => false,
                     };
                     if !met && r.verdict == Verdict::Exited {
-                        // It ended without meeting the wait, and never will.
                         out.refused = Some(format!("ERR gone job={}\n", r.id));
                         out.holds = false;
                         return out;
@@ -1348,8 +1247,7 @@ pub fn evaluate_with(
     out
 }
 
-/// `for=`: holds over consecutive snapshots spanning the duration, timed by
-/// their stamps.
+/// `for=`: holds over consecutive snapshots spanning the duration, timed by their stamps.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Latch {
     since_ns: Option<u64>,
@@ -1357,9 +1255,7 @@ pub struct Latch {
 }
 
 impl Latch {
-    /// Feed one snapshot's verdict; returns how long it has held, ms, once
-    /// that spans `for_ms` (at once when `for_ms` is 0). A snapshot already
-    /// seen (the same stamp) changes nothing.
+    /// Feed one snapshot's verdict.
     pub fn step(&mut self, holds: bool, at_ns: u64, for_ms: u64) -> Option<u64> {
         if self.last_ns == Some(at_ns) {
             let since = self.since_ns?;
@@ -1588,7 +1484,6 @@ mod tests {
         ] {
             assert_eq!(AwaitSys::parse(bad), Err(USAGE.to_owned()), "{bad}");
         }
-        // A class word given bare is named as one (§13.7).
         assert_eq!(
             AwaitSys::parse("sys job=a1 running"),
             Err("ERR usage: running is a class; say class=running (verdicts go bare)\n".to_owned())
@@ -1597,7 +1492,6 @@ mod tests {
             AwaitSys::parse("sys job=a1 done,waiting"),
             Err("ERR usage: waiting is a class; say class=waiting (verdicts go bare)\n".to_owned())
         );
-        // scope= is read, not dropped: aterm widens the job terms.
         assert!(!machine("sys jobs.stuck=0").scope_aterm);
         assert!(!machine("sys jobs.stuck=0 scope=tab").scope_aterm);
         assert!(machine("sys jobs.stuck=0 scope=aterm").scope_aterm);
@@ -1634,7 +1528,6 @@ mod tests {
                 exit: Some(0),
             },
         ];
-        // Its exit meets done, by id or by the agent's task id.
         let o = evaluate_with(&machine("sys job=a1 done"), &s, &[7], &ended);
         assert!(o.holds, "{o:?}");
         assert_eq!(o.values, ["job=a1 verdict=exited class=exited exit=3"]);
@@ -1645,20 +1538,14 @@ mod tests {
             &ended,
         );
         assert!(o.holds, "{o:?}");
-        // A wait it can no longer meet is refused at once, not parked.
         let o = evaluate_with(&machine("sys job=a1 stuck"), &s, &[7], &ended);
         assert!(!o.holds);
         assert_eq!(o.refused.as_deref(), Some("ERR gone job=a1\n"));
-        // NEGATIVE CONTROL: another tab's ended job is not this tab's, and
-        // a job nobody knows is absent (the host's grace decides gone).
         let o = evaluate_with(&machine("sys job=a9 done"), &s, &[7], &ended);
         assert!(!o.holds && o.refused.is_none(), "{o:?}");
         assert_eq!(o.absent, ["job=a9"]);
-        // …unless the wait is aterm-wide.
         let o = evaluate_with(&machine("sys job=a9 done scope=aterm"), &s, &[7, 9], &ended);
         assert!(o.holds, "{o:?}");
-        // An exited row still in the view: its exit meets done, and a wait it
-        // can no longer meet is gone at once.
         let mut s2 = s.clone();
         s2.jobs = Some(std::sync::Arc::new(JobsView {
             rows: vec![row("a5", 7, Class::Exited, Verdict::Exited)],
@@ -1674,7 +1561,6 @@ mod tests {
                 .as_deref(),
             Some("ERR gone job=a5\n")
         );
-        // A row still in the view wins over the ring.
         let o = evaluate_with(&machine("sys job=a44120 class=running"), &s, &[7], &ended);
         assert!(o.holds && o.absent.is_empty(), "{o:?}");
     }
@@ -1705,8 +1591,6 @@ mod tests {
             o.values,
             ["job=a40977 verdict=stuck class=waiting wait=tcp quiet_ms=1152000 phi=8.34"]
         );
-        // NEGATIVE CONTROL: the class words do not hold for a verdict, and
-        // another tab's job is not this tab's (it reads as not seen yet).
         let o = evaluate(&machine("sys job=a40977 class=running"), &s, &[7]);
         assert!(!o.holds);
         let o = evaluate(&machine("sys job=a9 stuck"), &s, &[7]);
@@ -1717,7 +1601,6 @@ mod tests {
             !o.holds,
             "the first row by id carrying the task is the stuck one"
         );
-        // A host that reads no jobs refuses the terms at arm.
         s.jobs = None;
         let o = evaluate(&machine("sys jobs.stuck=0"), &s, &[7]);
         assert_eq!(
@@ -1729,7 +1612,6 @@ mod tests {
             o.refused.as_deref(),
             Some("ERR unavailable job why=not_sampled\n")
         );
-        // …and the first sample is only warming.
         s.procs_window_ns = None;
         let o = evaluate(&machine("sys jobs.stuck=0"), &s, &[7]);
         assert!(o.refused.is_none() && !o.holds, "{o:?}");
@@ -1812,7 +1694,6 @@ mod tests {
         ] {
             assert_eq!(AwaitSys::parse(mixed), Err(MIXED.to_owned()), "{mixed}");
         }
-        // `vol=` is the volume wait's alone.
         assert_eq!(AwaitSys::parse("sys cpu<50% vol=/x"), Err(USAGE.to_owned()));
     }
 
@@ -2023,8 +1904,6 @@ mod tests {
             w.terms.iter().map(|t| t.metric.name()).collect::<Vec<_>>(),
             ["slots", "avail", "load", "mem"]
         );
-        // Each takes its own unit and no other. `cpu` keeps §13.8's: a bare
-        // number is refused, not read as percent.
         for bad in [
             "sys avail>=8",
             "sys avail>=8%",
@@ -2038,7 +1917,6 @@ mod tests {
         ] {
             assert_eq!(AwaitSys::parse(bad), Err(USAGE.to_owned()), "{bad}");
         }
-        // The volume wait still never mixes with the machine's.
         assert_eq!(
             AwaitSys::parse("sys free>=5GiB and slots>=1"),
             Err(MIXED.to_owned())
@@ -2063,7 +1941,6 @@ mod tests {
             o.values,
             ["load=0.11", "cores_idle=14.00c", "avail=103GB", "slots=1/3"]
         );
-        // NEGATIVE CONTROL: each term fails on its own side of the line.
         for (text, value) in [
             ("sys load<0.1", "load=0.11"),
             ("sys cores_idle>14", "cores_idle=14.00c"),
@@ -2074,18 +1951,15 @@ mod tests {
             assert!(!o.holds && o.refused.is_none(), "{text}: {o:?}");
             assert_eq!(o.values, [value], "{text}");
         }
-        // Idle cores never read below none, whatever the load.
         let busy = occupancy(4, Some([30.0, 30.0, 30.0]), None, None);
         assert_eq!(
             evaluate(&machine("sys cores_idle<1"), &busy, &[]).values,
             ["cores_idle=0.00c"]
         );
-        // A free slot an orphaned build still fills is not usable.
         let s = occupancy(18, None, None, Some(read_slots(3, 2, 1, 0, 1)));
         let o = evaluate(&machine("sys slots>=1"), &s, &[]);
         assert!(!o.holds && o.refused.is_none(), "{o:?}");
         assert_eq!(o.values, ["slots=0/3"]);
-        // Slots still pending count neither way; one proven free is enough.
         let s = occupancy(18, None, None, Some(read_slots(3, 0, 1, 2, 0)));
         assert!(evaluate(&machine("sys slots>=1"), &s, &[]).holds);
     }
@@ -2126,7 +2000,6 @@ mod tests {
             refused(&s, "sys avail>=8GiB").as_deref(),
             Some("ERR unavailable avail why=unsupported\n")
         );
-        // Every slot still pending, and load before the cores are known, park.
         let mut s = occupancy(18, Some([1.0; 3]), None, Some(read_slots(3, 0, 0, 3, 0)));
         s.cpu = None;
         let o = evaluate(
@@ -2142,18 +2015,13 @@ mod tests {
     }
 
     /// A SLOT NOT PROVEN EITHER WAY may be free or not: a slots term holds
-    /// only when it holds whichever way each turns out. `slots>=1` reads the
-    /// proven free; `slots<1`, `slots=0`, `slots<=0` and `slots!=1` hold only
-    /// once no unproven slot could make them false. NEGATIVE CONTROL: the
-    /// same terms on slots all proven.
+    /// only when it holds whichever way each turns out.
     #[test]
     fn a_slots_term_holds_only_on_slots_proven_either_way() {
         let on = |slots: SlotsView, text: &str| {
             evaluate(&machine(text), &occupancy(18, None, None, Some(slots)), &[]).holds
         };
-        // One slot, unknown (`n` 1, nothing proven): 0 proven free, 1 at most.
         let unknown = read_slots(1, 0, 0, 0, 0);
-        // Three: two pending and one unknown, read once already (no warming).
         let unproven = read_slots(3, 0, 0, 2, 0);
         for text in ["sys slots<1", "sys slots=0", "sys slots<=0", "sys slots!=1"] {
             assert!(!on(unknown, text), "{text} on one unknown slot");
@@ -2162,12 +2030,10 @@ mod tests {
         assert!(!on(unknown, "sys slots>=1"));
         assert!(on(unknown, "sys slots<2"), "even free it is one");
         assert!(on(unproven, "sys slots!=4"), "no count reaches four");
-        // One proven free and one unproven: at least one, at most two.
         let one_or_two = read_slots(3, 1, 1, 1, 0);
         assert!(on(one_or_two, "sys slots>=1"));
         assert!(!on(one_or_two, "sys slots=1"));
         assert!(on(one_or_two, "sys slots<3"));
-        // Negative control: every slot proven, each term reads its count.
         let none_free = read_slots(1, 1, 0, 0, 0);
         for text in ["sys slots<1", "sys slots=0", "sys slots<=0", "sys slots!=1"] {
             assert!(on(none_free, text), "{text} on one held slot");
@@ -2177,8 +2043,7 @@ mod tests {
 
     /// A SLOTS READING THE HOST READ AT REST is older than a wait may judge
     /// by: the snapshot carries its age, and past [`SLOTS_FRESH_MS`] it is
-    /// warming, an unread one included. NEGATIVE CONTROL: the same reading,
-    /// fresh, holds or refuses.
+    /// warming, an unread one included.
     #[test]
     fn a_slots_reading_older_than_the_armed_period_is_warming() {
         let at = |slots: SlotsView, age_ms: Option<u64>| {

@@ -1,52 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! USAGE CREDITS, AND THE VENDOR'S OWN WORD THAT A WINDOW IS FILLING: what
-//! Claude Code says of the account's usage beside the composer, read for the
-//! record. Neither is a wall: with credits on, a turn that crosses a window's
-//! limit goes on, paid for, and the screen says only `Now using usage
-//! credits` (lab E4; the accounts design §3.3). The first is what the
-//! supervisor's credits hold reads (aterm-agent's `turn_end::credits_hold`):
-//! under `[harness] usage_credits = false`, the default since the owner's
-//! , the supervisor types nothing of its own while credits
-//! carry the session, but one probe turn past the reset their notice named
-//! (or at the hold's bound, where none is named). A MODEL Claude Code bills per request with no dialog —
-//! a credits-only model whose consent it stored, or on a tier an admin bills
-//! — draws no footer item: only `<M> is drawing from usage credits`, once a
-//! process, or `<M> is now using usage credits instead of your plan limits`
-//! (READ in the 2.1.301 to 2.1.304 bundles, never captured), read here with
-//! the model they name ([`Credits::model`]).
-//!
-//! Measured on 2.1.300 in the real-Claude lab (`targo --unverified lab`,
-//! crates/aterm-lab; the stub answering every request with the five-hour
-//! window rejected and credits allowed and in use; the fixtures
-//! `claude-2.1.300-credits-*`), the notices are Claude Code's notifications,
-//! drawn right-aligned:
-//! * the inline renderer draws them under the composer's bottom rule, on the
-//!   mode row's right (`⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
-//!   Now using usage credits`) or on a row of their own;
-//! * the fullscreen renderer (`CLAUDE_CODE_NO_FLICKER=1`) draws them in the
-//!   live zone, on the row right above the composer's top rule;
-//! * as credits start, for about ten seconds, `You're now using usage credits
-//!   · Your session limit resets 9:43am (America/Los_Angeles)` (cut with `…`
-//!   at 80 columns), then the lasting `Now using usage credits`.
-//!
-//! The vendor's warning is drawn the same way: `You've used 80% of your
-//! weekly limit · resets Oct 18 at 8:50pm (America/Los_Angeles)` (measured;
-//! its thresholds are the bundle's: the five-hour window at 90% while at most
-//! 72% of it has passed, the week at 75%, 50% and 25% while at most 60%, 35%
-//! and 15% of it has).
-//!
-//! Each is read by PLACE: the RIGHT SEGMENT of a row — the text after its last
-//! run of two or more blanks, or the whole row — that reaches the right edge
-//! (within three columns of the composer's rules), on a footer row, or on a
-//! row of the live zone under the status row that no message a person queued
-//! there holds; the segment OPENS with the vendor's words ([`crate::anchors`]'
-//! `credits.*`, `usage.warning`). A tool's output and the model's words are
-//! the transcript's, above the status row; with no status row nothing above
-//! the composer is read. What can still print the words in place is a
-//! statusLine command of the person's own, at the right edge: a wrong record
-//! at most.
+//! USAGE CREDITS, AND THE VENDOR'S OWN WORD THAT A WINDOW IS FILLING: what Claude Code says of the account's usage beside the composer, read for the record.
 
 /// Which window a notice names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,25 +35,13 @@ impl Window {
 /// Usage credits carry the session ([`in_use`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Credits {
-    /// The notice that they have just STARTED (`You're now using usage
-    /// credits · Your session limit resets 9:43am (…)`), with the window it
-    /// names, if any, and its reset as printed; `None` for the lasting `Now
-    /// using usage credits`, which names neither.
+    /// The notice that they have just STARTED (`You're now using usage credits · Your session limit resets 9:43am (…)`), with the window it names, if any, and its reset as printed; `None` for the lasting `Now using usage credits`, which names neither.
     pub started: Option<Started>,
-    /// The MODEL whose requests they carry, as the notice names it (`Fable
-    /// 5.1`, `Opus`): its per-model forms — `Now using usage credits for
-    /// Opus` with or without its `· Your Opus limit resets 4pm`, `Fable 5.1
-    /// is drawing from usage credits`, `Fable 5.1 is now using usage credits
-    /// instead of your plan limits`. `None`: the account's window, or no
-    /// model named.
+    /// The MODEL whose requests they carry, as the notice names it (`Fable 5.1`, `Opus`): its per-model forms — `Now using usage credits for Opus` with or without its `· Your Opus limit resets 4pm`, `Fable 5.1 is drawing from usage credits`, `Fable 5.1 is now using usage credits instead of your plan limits`.
     pub model: Option<String>,
 }
 
-/// The window credits started past, as their first notice names it: the
-/// session or the weekly window, or none of the two where the notice names a
-/// MODEL's (`Now using usage credits for Opus · Your Opus limit resets 4pm`,
-/// the same notification's per-model form, READ in the 2.1.304 bundle:
-/// `wbo`), its reset that model's.
+/// The window credits started past, as their first notice names it: the session or the weekly window, or none of the two where the notice names a MODEL's (`Now using usage credits for Opus · Your Opus limit resets 4pm`, the same notification's per-model form, READ in the 2.1.304 bundle: `wbo`), its reset that model's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Started {
     pub window: Option<Window>,
@@ -115,18 +58,7 @@ pub struct Warning {
     pub reset: Option<String>,
 }
 
-/// Whether usage credits carry the session, by Claude Code's own notice
-/// (module docs): the lasting `Now using usage credits`, `Now using your
-/// usage allocation`, `Extra usage is now covering your requests` (the end
-/// of lower-priority mode), or the notice they started on — which wins where
-/// both show, for the window it names. The notice's per-model form (`Now
-/// using usage credits for Opus · Your Opus limit resets 4pm`) is the one
-/// they started on, its window the model's ([`Started`]), and names its
-/// model ([`Credits::model`]); so do its bare head and the notices of a
-/// model billed per request with no dialog (`Fable 5.1 is drawing from usage
-/// credits`, `… is now using usage credits instead of your plan limits`:
-/// the segment's END, the model's name before it). `None` with no such
-/// notice, and with no composer frame (a box, a shell).
+/// Whether usage credits carry the session, by Claude Code's own notice (module docs): the lasting `Now using usage credits`, `Now using your usage allocation`, `Extra usage is now covering your requests` (the end of lower-priority mode), or the notice they started on — which wins where both show, for the window it names.
 #[must_use]
 pub fn in_use(rows: &[String]) -> Option<Credits> {
     let mut found: Option<Credits> = None;
@@ -192,7 +124,7 @@ pub fn in_use(rows: &[String]) -> Option<Credits> {
 
 /// A model's name as a notice prints it before its words (`Fable 5.1`,
 /// `Opus`): a few words, no run of blanks, none of the notice's own
-/// separators. `None` for anything else.
+/// separators.
 fn model_name(name: &str) -> Option<String> {
     let name = name.trim();
     let words = name.split(' ').count();
@@ -216,10 +148,7 @@ fn started(rest: &str) -> Started {
     }
 }
 
-/// The vendor's warning that the session or the weekly window is filling
-/// (module docs): `You've used <n>% of your session limit · resets <time>`, or
-/// of the `weekly limit`. `None` for none, for a model's or the credits' own
-/// (`of your Opus limit`, `of your usage credits`), and with no composer frame.
+/// The vendor's warning that the session or the weekly window is filling (module docs): `You've used <n>% of your session limit · resets <time>`, or of the `weekly limit`.
 #[must_use]
 pub fn usage_warning(rows: &[String]) -> Option<Warning> {
     let lead = const { crate::anchors::anchor_text("usage.warning") };

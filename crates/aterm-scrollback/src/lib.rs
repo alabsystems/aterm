@@ -78,8 +78,10 @@ pub struct Scrollback {
     /// Maximum total lines; older lines are discarded past it (None = no limit).
     line_limit: Option<usize>,
     /// Monotonic count of lines dropped by memory-pressure eviction (cold FIFO
+    /// under the byte budget) or lost with a quarantined warm block.
     pressure_evicted_lines: u64,
     /// Monotonic count of history lines that crossed the image retention
+    /// horizon; see [`Self::image_rows_dropped_by_compression`].
     image_rows_dropped_by_compression: u64,
     /// Current memory pressure watermark level.
     watermark_level: WatermarkLevel,

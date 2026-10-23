@@ -17,6 +17,7 @@ fn echoed_a(row: u16, col: u16) -> Option<char> {
 }
 
 /// One complete DRAINED type→echo turn on row 0: arm `ch` at `col`, then confirm it
+/// `rtt` later with the real cursor advanced past it.
 fn echo_turn(p: &mut Predictor, ch: char, col: u16, at: Instant, rtt: Duration) -> Instant {
     assert!(p.predict_char(ch, (0, col), G, 80, at));
     let done = at + rtt;
@@ -102,6 +103,7 @@ fn adaptive_fast_expiry_is_invisible_and_slow_echo_may_display() {
 }
 
 /// The gate is a LATCH: it stops painting only after a SUSTAINED fast run with
+/// nothing in flight.
 #[test]
 fn the_display_gate_closes_only_on_sustained_fast_evidence() {
     let model = aterm_models_core::predictive_echo_visibility_model();
@@ -198,6 +200,8 @@ fn the_display_gate_closes_only_on_sustained_fast_evidence() {
 }
 
 /// Every epoch boundary the shipping predictor recognises is the model's `Submit`
+/// (`confirmed = 0`): the proof belongs to the epoch that ended, so the next `Key`
+/// is invisible on both sides.
 #[test]
 fn every_epoch_boundary_is_the_models_submit() {
     type Boundary = fn(&mut Predictor, Instant) -> (u64, u16);
@@ -269,6 +273,10 @@ fn every_epoch_boundary_is_the_models_submit() {
 }
 
 /// The shipping predictor through the owed-echo scenario: a slow proven line, `n`
+/// typed and painted, the program moving the cursor to the next row 10 ms later
+/// (the guess is flushed while its keystroke is in flight), `n` typed again at the
+/// new cursor `flushed_age` after the first, and the FIRST `n`'s echo landing in
+/// the new guess's cell 60 ms later.
 fn owed_echo_run(flushed_age: Duration) -> (Predictor, Instant, bool) {
     let mut p = Predictor::new(PredictMode::Adaptive);
     let slow = Duration::from_millis(60);
@@ -372,6 +380,9 @@ fn an_owed_echo_proves_nothing_until_its_window_passes() {
 }
 
 /// The shipping predictor through an expiry: a slow proven line `ab`, `c` typed
+/// and painted at the proven cell, no echo within the glitch window, so `c`
+/// expires; then `d` is typed at the live cursor, which still stands on `c`'s
+/// cell.
 fn expiry_run(rule_off: bool) -> bool {
     let mut p = Predictor::new(PredictMode::Adaptive);
     if rule_off {
@@ -393,6 +404,7 @@ fn expiry_run(rule_off: bool) -> bool {
 }
 
 /// EXPIRY OWES: an expired guess's key was sent, so its echo is owed, and when
+/// it comes it lands on the cell the proof names.
 #[test]
 fn expiry_owes_and_voids_the_proof() {
     let model = aterm_models_core::predictive_echo_visibility_model();
@@ -440,6 +452,7 @@ fn sample(row: &[Seen], cursor: u16) -> KeySample<'_> {
 }
 
 /// The press of edit `key` with the cursor at `(0, cursor)` over row 0 showing
+/// `text`.
 fn press(p: &mut Predictor, key: EditKey, text: &str, cursor: u16, at: Instant) -> EditOutcome {
     let row = row_of(text);
     p.predict_edit(key, &sample(&row, cursor), at)
@@ -454,6 +467,9 @@ fn reconcile(p: &mut Predictor, text: &str, cursor: u16, at: Instant) {
 }
 
 /// The edit classes THE CLASS LADDER proves one at a time, each with the rule
+/// that keeps it: `←` (a motion), a glyph typed inside the text (an insert that
+/// shifts the text right of it), a Backspace inside the text (an erase that
+/// shifts it left).
 #[derive(Clone, Copy, Debug)]
 enum EditClass {
     Motion,
@@ -473,6 +489,10 @@ impl EditClass {
 }
 
 /// The shipping predictor through the class ladder for `class`: a slow proven
+/// line typed with its rows and echoed through `reconcile_seen` (so the edit
+/// lane may place an op on it), the cursor walked into the text where the class
+/// needs it (each `←` echoed), the class's first op pressed, its echo, then a
+/// second op of the class.
 fn class_ladder_run(class: EditClass, rule_off: bool) -> (bool, bool, Predictor, Instant) {
     let mut p = Predictor::new(PredictMode::Adaptive);
     if rule_off {
@@ -565,6 +585,8 @@ fn class_ladder_run(class: EditClass, rule_off: bool) -> (bool, bool, Predictor,
 }
 
 /// THE EDIT CLASS, for each class the ladder proves: an op displays only once
+/// an op of its class has echoed in its epoch (a motion, an insert that shifts
+/// the text, an erase that shifts it).
 #[test]
 fn an_edit_displays_only_after_its_class_is_proven() {
     let model = aterm_models_core::predictive_echo_visibility_model();
@@ -628,6 +650,7 @@ fn an_edit_displays_only_after_its_class_is_proven() {
 }
 
 /// The press's sample with the cursor at `(0, cursor)` over `row`, handing
+/// `start` as the shell's authenticated buffer start, in one editor context.
 fn signed(row: &[Seen], cursor: u16, start: Option<InputStart>) -> KeySample<'_> {
     KeySample {
         input_start: start,
@@ -643,6 +666,10 @@ const B: InputStart = InputStart {
 };
 
 /// How a line-edge run starts its line: whether its presses hand the `B`,
+/// whether a line terminator pressed at the prompt before opened THE FIRST
+/// KEY's gate, and whether the rows moved under the screen after it (a shell
+/// on the bottom row, whose Enter's output scrolls the screen: the frame before
+/// the terminator read another content-coordinate generation).
 #[derive(Clone, Copy)]
 struct Start {
     hands_b: bool,
@@ -658,6 +685,7 @@ const WITNESSED: Start = Start {
 };
 
 /// The line a line-edge run starts as `start` says (see [`line_edge_run`]):
+/// `ab` typed and echoed on a slow link, the cursor at its end.
 fn typed_ab(p: &mut Predictor, start: Start) -> Instant {
     let slow = Duration::from_millis(60);
     let mut at = Instant::now();
@@ -686,6 +714,13 @@ fn typed_ab(p: &mut Predictor, start: Start) -> Instant {
 }
 
 /// The shipping predictor through THE LINE EDGE: `ab` typed on a slow link,
+/// after a line terminator at the prompt before when `start.first_key` (so `a`
+/// is THE FIRST KEY), the rows moving under the screen after it when
+/// `start.scrolled`, each press handing the shell's authenticated buffer start
+/// at `(0, 0)` when `start.hands_b`; then Home pressed three times from the end
+/// of the line, each echoed as beginning-of-line (the cursor on `a`), the cursor
+/// walked back to the end between them with `→` (steps the model does not
+/// see).
 fn line_edge_run(off: Option<Rule>, start: Start) -> ([bool; 3], Predictor, Instant) {
     let mut p = Predictor::new(PredictMode::Adaptive);
     if let Some(rule) = off {
@@ -723,6 +758,7 @@ fn line_edge_run(off: Option<Rule>, start: Start) -> ([bool; 3], Predictor, Inst
 }
 
 /// THE LINE EDGE: Home is placed only on a WITNESSED line and shown only once
+/// its binding is LEARNED.
 #[test]
 fn a_line_edge_key_displays_only_when_learned_at_a_witnessed_prompt() {
     let model = aterm_models_core::predictive_echo_visibility_model();
@@ -847,6 +883,10 @@ fn a_line_edge_key_displays_only_when_learned_at_a_witnessed_prompt() {
 }
 
 /// THE FIRST KEY across a scroll: the rows moving under the screen between a
+/// line terminator pressed at a prompt and the next prompt's first key (a
+/// shell on the bottom row, whose Enter's own output scrolls the screen) is the
+/// model's `RowsMoved`, which ends the proof and owes as `Submit` does but
+/// keeps the gate, since a scroll lets no key past the predictor.
 #[test]
 fn a_scroll_keeps_the_first_key_s_gate() {
     let model = aterm_models_core::predictive_echo_visibility_model();

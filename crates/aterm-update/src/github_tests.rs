@@ -69,7 +69,6 @@ fn stage_selection_prefers_the_zip_and_falls_back_to_the_dmg() {
     let zip_digest = "cd".repeat(32);
     let release = web_release(&test_source(), "v0.54.0").unwrap().release;
 
-    // A manifest with no zip selects the DMG.
     let dmg_only = candidate_manifest();
     let chosen = select_stage_artifact(&release, &dmg_only, VERSION).unwrap();
     assert_eq!(chosen.container, Container::Dmg);
@@ -77,8 +76,6 @@ fn stage_selection_prefers_the_zip_and_falls_back_to_the_dmg() {
     assert_eq!(chosen.sha256, dmg_only.sha256);
     assert_eq!(release.assets[chosen.asset_index].name, chosen.name);
 
-    // The manifest carries the zip: the zip wins, carrying ITS digest (not the
-    // DMG's) as the bytes-must-match value.
     let mut zipped = candidate_manifest();
     zipped.zip = Some(zip_name.clone());
     zipped.zip_sha256 = Some(zip_digest.clone());
@@ -88,7 +85,6 @@ fn stage_selection_prefers_the_zip_and_falls_back_to_the_dmg() {
     assert_eq!(chosen.sha256, zip_digest);
     assert_eq!(release.assets[chosen.asset_index].name, chosen.name);
 
-    // Declared but unusable — each falls back, none refuses.
     let mut no_digest = zipped.clone();
     no_digest.zip_sha256 = None;
     let mut noncanonical = zipped.clone();
@@ -103,8 +99,6 @@ fn stage_selection_prefers_the_zip_and_falls_back_to_the_dmg() {
         assert_eq!(chosen.sha256, manifest.sha256, "{label}");
     }
 
-    // The DMG identity proof stays unconditional: a manifest that names a
-    // noncanonical DMG is refused outright even when its zip is perfect.
     let mut bad_dmg = zipped;
     bad_dmg.dmg = "aterm.dmg".into();
     select_stage_artifact(&release, &bad_dmg, VERSION)
@@ -149,7 +143,7 @@ fn the_container_hash_answers_within_its_bound() {
     let fifo = dir.root.join("container.zip");
     let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
         .expect("a scratch path has no NUL");
-    // SAFETY: a valid NUL-terminated path; mkfifo reads it and nothing else.
+    // SAFETY: a valid NUL-terminated path.
     assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo");
     let (tx, rx) = std::sync::mpsc::channel();
     let path = fifo.clone();
@@ -159,18 +153,13 @@ fn the_container_hash_answers_within_its_bound() {
             std::time::Duration::from_millis(500),
         ));
     });
-    // A hang detector, not a latency budget.
     let answer = rx.recv_timeout(std::time::Duration::from_secs(60));
-    // Release the read that never answered, so no thread outlives the test: a
-    // writer's open lets the blocked `open(2)` return and the read see EOF. Opened
-    // without blocking, so a FIFO with no reader left (ENXIO) cannot hang it either.
     let _ = std::os::unix::fs::OpenOptionsExt::custom_flags(
         std::fs::OpenOptions::new().write(true),
         libc::O_NONBLOCK,
     )
     .open(&fifo);
     let _ = hasher.join();
-    // POSITIVE CONTROL: a file that reads answers its digest through the bound.
     let file = dir.root.join("abc");
     std::fs::write(&file, b"abc").unwrap();
     assert_eq!(
@@ -186,7 +175,7 @@ fn the_container_hash_answers_within_its_bound() {
 
 /// Inside a wake's grace (`AfterWakeScope`), a failed container download books
 /// `network` without starting a `pipeline` streak or clearing a standing `stage`
-/// streak. Outside the grace it books `pipeline` and clears `stage`.
+/// streak.
 #[test]
 fn an_asset_fetch_that_fails_just_after_a_wake_books_network() {
     let manifest = candidate_manifest();
@@ -241,7 +230,6 @@ fn a_check_a_person_asks_for_passes_a_full_disks_memo() {
         held.status_line(manifest.build_number)
     );
 
-    // NEGATIVE CONTROLS. A verdict on the same artifact holds against a person.
     let verdict = "codesign --verify (team-pinned requirement) failed: code object is not \
                    signed at all";
     let _ = book_stage_failure(&staging, running, &manifest, verdict, now);
@@ -249,7 +237,6 @@ fn a_check_a_person_asks_for_passes_a_full_disks_memo() {
         stage_backoff(&staging, &manifest, running, now, Asked::Person).is_some(),
         "a verdict is a finding about the build; a person asking changes nothing"
     );
-    // And a quarantine, under a moment memo of the same artifact written after it.
     crate::manifest::FailedMark::clear_backoff(&staging.failed());
     crate::manifest::quarantine_artifact(
         &staging,
@@ -324,8 +311,6 @@ fn the_hash_step_books_a_moment_as_a_moment_and_a_mismatch_as_a_verdict() {
         assert!(FailedMark::read(&staging.failed()).is_some_and(|memo| memo.moment));
         let _ = std::fs::remove_dir_all(&staging.root);
     }
-    // NEGATIVE CONTROLS: a container that cannot be read, and a digest that does
-    // not match, are verdicts on the schedule a verdict keeps.
     let unreadable = aterm_update_core::sha256_file(std::path::Path::new("/nonexistent/container"));
     assert!(unreadable.is_err(), "{unreadable:?}");
     for verdict in [unreadable, Ok("cd".repeat(32))] {
@@ -346,7 +331,6 @@ fn the_hash_step_books_a_moment_as_a_moment_and_a_mismatch_as_a_verdict() {
         );
         let _ = std::fs::remove_dir_all(&staging.root);
     }
-    // And the digest that matches goes on to the stage, booking nothing.
     let (staging, end, reclaimed) = digest_of(Ok(manifest.sha256.to_ascii_uppercase()));
     assert!(end.is_none() && !reclaimed);
     assert!(FailedMark::read(&staging.failed()).is_none());
@@ -388,7 +372,6 @@ fn a_release_withdrawn_while_it_downloaded_ends_the_check_held() {
     );
     let _ = std::fs::remove_dir_all(&staging.root);
 
-    // The quarantine is the same kind of standing record.
     let staging = Staging::scratch("stage-quarantined");
     crate::manifest::quarantine_artifact(
         &staging,
@@ -400,7 +383,6 @@ fn a_release_withdrawn_while_it_downloaded_ends_the_check_held() {
     assert_eq!(end, Ok(None));
     let _ = std::fs::remove_dir_all(&staging.root);
 
-    // NEGATIVE CONTROL: a release nobody withdrew fails the check as before.
     let staging = Staging::scratch("stage-not-withdrawn");
     let end = end_failed_stage(&staging, running, &manifest, refused.into());
     assert_eq!(end, Err(refused.to_string()));
@@ -417,7 +399,6 @@ fn a_full_disk_is_charged_to_neither_the_release_nor_the_download_host() {
 
     let manifest = candidate_manifest();
     let running = manifest.build_number - 1;
-    // The clock the download lane books by (`book_download_failure` reads it).
     let now = crate::install::unix_now_secs();
     let volume = Staging::scratch("full-disk-volume");
     let free = crate::install::free_bytes_at(&volume.root)
@@ -466,8 +447,6 @@ fn a_full_disk_is_charged_to_neither_the_release_nor_the_download_host() {
         for _ in 1..crate::PERSISTENT_AFTER {
             book(&staging, lane);
         }
-        // A disk that STAYS full is throttled as the moment it is — never on a
-        // verdict's schedule, which would hold the release long after it frees.
         let memo = FailedMark::read(&staging.failed()).unwrap_or_else(|| panic!("{lane}: counted"));
         assert!(memo.moment, "{lane}: {memo:?}");
         assert!(
@@ -475,7 +454,6 @@ fn a_full_disk_is_charged_to_neither_the_release_nor_the_download_host() {
                 <= *crate::manifest::MOMENT_BACKOFF_SECS.last().unwrap(),
             "{lane}: {memo:?}"
         );
-        // The streak spans the persistence window (`Health::persistent_class`).
         crate::health::backdate_streaks(&staging.health(), crate::PERSISTENT_SPAN);
         let h = crate::health::Health::read(&staging.health());
         assert_eq!(
@@ -486,7 +464,6 @@ fn a_full_disk_is_charged_to_neither_the_release_nor_the_download_host() {
         let _ = std::fs::remove_dir_all(&staging.root);
     }
 
-    // A write error on a volume with room, and a quota stop, are moments too.
     let staging = Staging::scratch("write-error-with-room");
     let denied = book_download_failure(
         &staging,
@@ -508,9 +485,6 @@ fn a_full_disk_is_charged_to_neither_the_release_nor_the_download_host() {
     );
     assert!(crate::is_passing_refusal(&quota), "{quota}");
 
-    // NEGATIVE CONTROL: a download the host did not serve is still the host's
-    // (asked of the classifier alone: its `pipeline` arm writes the process-wide
-    // delivery note, which a sibling test's status record would read).
     assert!(!aterm_update_core::download_error_is_local_write(
         "curl download failed (exit status: 56): curl: (56) Recv failure: Connection \
          reset by peer"
@@ -538,24 +512,18 @@ fn a_stale_stage_lock_reading_pairs_only_with_the_next_check_that_needs_the_lock
     };
     let booked = || crate::health::Health::read(&staging.health()).pipeline_failures;
 
-    // R's episode: one stale reading, unbooked.
     let first = check();
     assert!(!first.contains(STOPPED_STAGE_HOLDER), "{first}");
-    // Checks that never needed the lock: R covered, then applied.
     for _ in 0..2 {
         StaleStageStamps::check_started();
         StaleStageStamps::check_ended(&path);
     }
-    // R2's episode, same stamp: its first reading is a first reading.
     let again = check();
     assert!(!again.contains(STOPPED_STAGE_HOLDER), "{again}");
     assert_eq!(booked(), 0, "no false stopped-holder failure: {again}");
-    // NEGATIVE CONTROL: the very next check that needs the lock and finds the
-    // same stamp is the second consecutive reading, and is booked.
     let second = check();
     assert!(second.contains(STOPPED_STAGE_HOLDER), "{second}");
     assert_eq!(booked(), 1);
-    // A ledger an older build wrote still reads as the stopped holder here.
     assert!(is_stopped_stage_holder_refusal(
         "stage lock: another aterm process (the lock names pid 4242) holds the update \
          stage lock and has shown no sign of life across two checks"
@@ -573,9 +541,6 @@ fn a_stage_lock_held_by_a_hung_check_in_a_running_aterm_is_booked() {
     static WATCH: CheckerWatch = CheckerWatch::new();
     let wait = std::time::Duration::from_millis(400);
 
-    // `hang` is whether the holder's generation is retired (its heartbeat no
-    // longer the live one) while it holds the lock. The holder's thread runs
-    // throughout, stamping whatever its beat decides.
     let hold = |staging: &Staging, hang: bool| {
         let generation = WATCH.register(1_000);
         assert!(WATCH.beat(generation, CheckerPhase::Checking));
@@ -599,7 +564,6 @@ fn a_stage_lock_held_by_a_hung_check_in_a_running_aterm_is_booked() {
         (holder, release_tx)
     };
 
-    // NEGATIVE CONTROL: a live holder's beat keeps the waiter standing down.
     let staging = Staging::scratch("stage-lock-alive-check");
     let (holder, release) = hold(&staging, false);
     for _ in 0..2 {
@@ -616,7 +580,6 @@ fn a_stage_lock_held_by_a_hung_check_in_a_running_aterm_is_booked() {
     holder.join().unwrap();
     let _ = std::fs::remove_dir_all(&staging.root);
 
-    // The hung holder: running, retired, its beat silent.
     let staging = Staging::scratch("stage-lock-hung-check");
     let (holder, release) = hold(&staging, true);
     let _ = take_stage_lock(&staging, wait);
@@ -647,7 +610,6 @@ fn a_stage_backoff_throttles_the_restage_never_an_already_staged_newer_build() {
     let running = manifest.build_number - 1;
     const NOW: u64 = 1_000_000;
 
-    // Four consecutive stage failures of this candidate: the widest window.
     for _ in 0..4 {
         FailedMark::record_stage_failure(
             &staging.failed(),
@@ -657,17 +619,12 @@ fn a_stage_backoff_throttles_the_restage_never_an_already_staged_newer_build() {
         );
     }
 
-    // Nothing staged: the window stops the re-download, and there is no apply to
-    // skip.
     let backoff =
         stage_backoff(&staging, &manifest, running, NOW, Asked::Schedule).expect("window open");
     assert_eq!(backoff.attempts, 4);
     assert_eq!(backoff.retry_in_secs, RETRY_BACKOFF_SECS[3]);
     assert!(backoff.applicable.is_none());
 
-    // Locally verified stage for a build strictly newer than the running one,
-    // with a digest differing from the manifest's so the download path remains
-    // backed off.
     write_ready(
         &staging,
         manifest.build_number,
@@ -684,8 +641,6 @@ fn a_stage_backoff_throttles_the_restage_never_an_already_staged_newer_build() {
     let applicable = backoff.applicable.as_ref().expect("apply is not gated");
     assert_eq!(applicable.build_number, manifest.build_number);
 
-    // A marker that is not STRICTLY newer is residue, not an update: still nothing
-    // to apply.
     let residue = stage_backoff(
         &staging,
         &manifest,
@@ -698,17 +653,12 @@ fn a_stage_backoff_throttles_the_restage_never_an_already_staged_newer_build() {
         "a marker for the running build is not an applicable update"
     );
 
-    // And the window governs only its own lane's deadline: past it, the re-stage
-    // resumes on its own.
     let past_deadline = NOW + RETRY_BACKOFF_SECS[3];
     assert!(
         stage_backoff(&staging, &manifest, running, past_deadline, Asked::Schedule).is_none(),
         "an expired window throttles nothing"
     );
 
-    // CONTROL: the manifest's own digest on the same published stage covers the
-    // candidate, and no download is due at all. (What makes a stage publishable is
-    // `manifest`'s `publishable_ready_requires_real_directory_and_binds_available_plist`.)
     write_ready(
         &staging,
         manifest.build_number,
@@ -723,21 +673,17 @@ fn a_stage_backoff_throttles_the_restage_never_an_already_staged_newer_build() {
 /// Every removal on the download path is keyed to the CURRENT artifact's name, and
 /// those names carry the version — so a `.part` (or a whole container abandoned
 /// between the finalize rename and the post-stage removal) for a version the channel
-/// has moved past is unreachable by every other code path. The sweep is
-/// the only reclaim, and it runs under the stage lock before the next download.
+/// has moved past is unreachable by every other code path.
 #[test]
 fn download_scratch_from_a_version_the_channel_moved_past_is_reclaimed() {
     let staging = Staging::scratch("download-sweep");
 
-    // Two abandoned versions plus the current one: a killed transfer's `.part` and
-    // a fully-downloaded container that was never staged.
     let stale_part = staging.download.join("aterm-0.52.0-mac.zip.part");
     let stale_container = staging.download.join("aterm-0.53.0-mac.zip");
     let current_part = staging.download.join("aterm-0.54.0-mac.zip.part");
     for leftover in [&stale_part, &stale_container, &current_part] {
         std::fs::write(leftover, b"abandoned bytes").unwrap();
     }
-    // A directory is not scratch we own; the sweep must not recurse into one.
     let bystander = staging.download.join("not-ours");
     std::fs::create_dir_all(bystander.join("keep")).unwrap();
 
@@ -760,15 +706,10 @@ fn download_scratch_from_a_version_the_channel_moved_past_is_reclaimed() {
         "the sweep removes regular files only, never a directory tree"
     );
 
-    // Idempotent, and silent on a download dir that does not exist yet (a first
-    // check on a fresh machine reaches it before anything has created the dir).
     sweep_download_scratch(&staging);
     let _ = std::fs::remove_dir_all(&staging.root);
     sweep_download_scratch(&staging);
 }
-
-// Roster authority on the client transport path: asset fetching, attribution,
-// observed generation reporting, and refusal propagation.
 
 /// Obviously synthetic seeds, distinct from each other so a mix-up between the
 /// master and a machine key cannot pass by coincidence.
@@ -790,7 +731,7 @@ fn attributed_manifest(machine_id: &str, roster_seq: u64) -> Vec<u8> {
 
 /// Everything the owner publishes for one release, with every placement under the
 /// caller's control — which machine is on the roster, which is revoked, which one
-/// signed, and at which generation. The placements ARE the subject of these tests.
+/// signed, and at which generation.
 #[derive(Clone)]
 struct Chain {
     master_pub: String,
@@ -890,9 +831,7 @@ fn a_release_whose_declared_machine_disagrees_with_the_signer_is_refused() {
 }
 
 /// The authoritative appcast must be the tag's own release: a genuine, attributed
-/// appcast naming the tag's DMG under another version is refused. Negative control:
-/// the tag's own version is selected, and its `min_build` reaches the floor as the
-/// signing machine's, so a revocation of that machine takes it back.
+/// appcast naming the tag's DMG under another version is refused.
 #[test]
 fn an_appcast_of_another_version_under_the_tag_is_refused() {
     let signed = |version: &str| {
@@ -931,7 +870,7 @@ fn an_appcast_of_another_version_under_the_tag_is_refused() {
 /// After the chain selected a release and before anything is staged, the check refuses
 /// one whose signed manifest names no container URL under the pointer's tag, and one
 /// whose signer this client's durable revocation set holds, though the roster in hand
-/// lists it. Negative control: a bound release under a floor revoking nobody stands.
+/// lists it.
 #[test]
 fn a_selected_release_unbound_to_its_tag_or_durably_revoked_is_refused() {
     let bound = tag_url(WEB_TAG, "aterm-0.10.0.dmg");
@@ -972,8 +911,6 @@ fn a_selected_release_unbound_to_its_tag_or_durably_revoked_is_refused() {
 /// itself fails `admit`.
 #[test]
 fn the_roster_floor_ratchets_on_observation_not_on_acceptance() {
-    // ACT 1 — the attack the ratchet exists for. Generation 10 revokes m3; m3 itself
-    // signed the release. The release is refused AND generation 10 is observed.
     let revoking = chain(
         &[("m3", M3_SEED_FIXTURE)],
         &["m3"],
@@ -991,7 +928,6 @@ fn the_roster_floor_ratchets_on_observation_not_on_acceptance() {
         Some(10),
         "observing the revoking generation must be reported for the durable ratchet"
     );
-    // And what it revokes reaches the floor, though nothing is attributed.
     let observation = saw_revocation.floor_observation();
     assert_eq!(
         (
@@ -1002,9 +938,6 @@ fn the_roster_floor_ratchets_on_observation_not_on_acceptance() {
         (10, &["m3".to_string()][..], None)
     );
 
-    // ACT 2 — the replay, against the floor ACT 1's observation produced. The seq-9
-    // roster still lists m3 and is still inside its freshness window; with the floor
-    // at 10 it must be refused, and it is NOT an observation (admit failed).
     let pre_revocation = chain(
         &[("m3", M3_SEED_FIXTURE)],
         &[],
@@ -1029,8 +962,6 @@ fn the_roster_floor_ratchets_on_observation_not_on_acceptance() {
         "a roster that failed admission was never observed and must not move the floor"
     );
 
-    // NEGATIVE CONTROL — the same seq-9 roster is accepted below the floor ACT 1
-    // produced, so ACT 2's refusal is the ratchet's doing and not a broken fixture.
     let accepted = run_chain(&pre_revocation, &masters, 9, ROSTER_NOW);
     assert!(accepted.selected.is_some());
     assert_eq!(accepted.observed_roster_seq, Some(9));
@@ -1051,7 +982,6 @@ fn admission_rereads_the_durable_floor_a_concurrent_check_may_have_ratcheted() {
     );
     let masters = [c.master_pub.as_str()];
     let run_with = |snapshot: u64, refreshed_floor: u64| {
-        // The concurrent actor's ratchet, visible only through the re-read.
         let refresh = move || refreshed_floor;
         fetch_authoritative_release(
             Some(web_release(&test_source(), WEB_TAG).unwrap()),
@@ -1065,30 +995,20 @@ fn admission_rereads_the_durable_floor_a_concurrent_check_may_have_ratcheted() {
         )
     };
     let run_with_refresh = |refreshed_floor: u64| run_with(0, refreshed_floor);
-    // The other instance recorded generation 10 mid-download: this seq-9 roster is
-    // superseded and must be refused, stale snapshot notwithstanding.
     let raced = run_with_refresh(10);
     assert!(
         raced.selected.is_none() && raced.manifest_rejected,
         "admission must honour the re-read floor, not the pre-download snapshot"
     );
     assert_eq!(raced.observed_roster_seq, None);
-    // NEGATIVE CONTROL: with the durable floor still at 9, the same chain is
-    // admitted — so the refusal above is the re-read's doing.
     let quiet = run_with_refresh(9);
     assert!(quiet.selected.is_some());
     assert_eq!(quiet.observed_roster_seq, Some(9));
-    // A re-read below the snapshot (a floor that could not be read reads as 0) only
-    // tightens: the snapshot at 10 still refuses generation 9.
     let unread = run_with(10, 0);
     assert!(unread.selected.is_none() && unread.manifest_rejected);
 }
 
-/// A marker written before the attribution fields existed names no machine. A
-/// revocation must LEAVE IT ALONE: "I cannot tell who signed this" is not evidence of
-/// withdrawal, and retiring on it would re-download on every check forever. (The
-/// named cases run end to end in
-/// `a_yanked_or_revoked_stage_is_announced_nowhere_and_retired_by_the_check`.)
+/// A marker written before the attribution fields existed names no machine.
 #[test]
 fn a_revocation_leaves_an_unattributed_stage_alone() {
     let revoked = vec!["m11".to_string()];
@@ -1122,7 +1042,6 @@ fn publish_attributed_stage(staging: &Staging, build: u64, machine: &str) {
 fn a_revoked_machines_floors_are_withdrawn_so_the_next_genuine_release_is_not_held() {
     let staging = Staging::scratch("floor-revocation");
     let floor = || crate::manifest::Floor::read(&staging.floor());
-    // An ordinary history: m3's releases raised a floor and a high-water.
     crate::manifest::Floor::observe_and_write(
         &staging.floor(),
         &crate::manifest::FloorObservation {
@@ -1133,7 +1052,6 @@ fn a_revoked_machines_floors_are_withdrawn_so_the_next_genuine_release_is_not_he
             revoked: &[],
         },
     );
-    // THE THEFT, observed under roster generation 9, which still lists m11.
     let after_theft = observe_floor_and_withdraw(
         &staging,
         1_000,
@@ -1147,7 +1065,6 @@ fn a_revoked_machines_floors_are_withdrawn_so_the_next_genuine_release_is_not_he
     )
     .unwrap();
     assert_eq!(after_theft.min_build, 9_999_999_999, "observed, as before");
-    // …and the thief's build staged here (the stager's high-water ratchet).
     crate::manifest::Floor::observe_and_write(
         &staging.floor(),
         &crate::manifest::FloorObservation {
@@ -1162,7 +1079,6 @@ fn a_revoked_machines_floors_are_withdrawn_so_the_next_genuine_release_is_not_he
         "the genuine release is held while m11 is trusted"
     );
 
-    // THE REVOCATION: generation 10 revokes m11, and m3 cuts build 2_000.
     let revoked = vec!["m11".to_string()];
     let after = observe_floor_and_withdraw(
         &staging,
@@ -1189,13 +1105,10 @@ fn a_revoked_machines_floors_are_withdrawn_so_the_next_genuine_release_is_not_he
         None,
         "the owner's release after the revocation is not held"
     );
-    // A genuine yank and a genuine rollback floor still stand.
     assert!(floor_hold(800, after.min_build, after.high_water).is_some());
     assert!(floor_hold(1_400, after.min_build, after.high_water).is_some());
-    // The revoked machine's stage went with it.
     assert!(Ready::read_published_bundle(&staging).is_none());
 
-    // The revoked machine's word never counts again, even replayed.
     crate::manifest::Floor::observe_and_write(
         &staging.floor(),
         &crate::manifest::FloorObservation {
@@ -1244,8 +1157,6 @@ fn a_cached_pass_does_not_hand_off_to_a_stage_the_check_retired() {
         refusal.as_deref().is_some_and(crate::is_passing_refusal),
         "a retired stage is refused, as the stage's state (a moment): {refusal:?}"
     );
-    // A stage REPLACED by another build is refused as the stage's state too; one
-    // replaced by another COMMIT of the build is a verdict, as the full check's is.
     publish_attributed_stage(&staging, 21, "m3");
     assert!(
         crate::install::handoff_cached_pass_refusal_at(&staging, 20, commit)
@@ -1259,9 +1170,6 @@ fn a_cached_pass_does_not_hand_off_to_a_stage_the_check_retired() {
         crate::install::handoff_cached_pass_refusal_at(&staging, 21, commit),
         None
     );
-    // The marker still names it, but its bundle left the disk (a retirement that
-    // took the bundle first): the stage's state again, a moment,
-    // and still refused.
     std::fs::remove_dir_all(&staging.staged_app).unwrap();
     let refusal = crate::install::handoff_cached_pass_refusal_at(&staging, 21, commit);
     assert!(
@@ -1349,7 +1257,6 @@ fn an_unchanged_head_is_judged_again_when_the_stage_owes_its_roster_confirmation
         panic!("a due confirmation re-judges the unchanged head: {outcome:?}");
     };
     assert_eq!(candidate.release.tag_name, WEB_TAG);
-    // CONTROL: confirmed ten minutes ago, the steady state stands.
     publish_stage_confirmed_at(&staging, "m3", now - 600);
     let (outcome, heads) = acquire_web(&staging, Some(WEB_TAG), || redirect_to(WEB_TAG));
     assert_eq!(heads.len(), 1);
@@ -1357,14 +1264,12 @@ fn an_unchanged_head_is_judged_again_when_the_stage_owes_its_roster_confirmation
         matches!(outcome, Ok(Acquisition::UpToDate { .. })),
         "{outcome:?}"
     );
-    // A stage the running build has passed owes nothing.
     assert!(!stage_owes_roster_reconfirmation(
         &staging,
         20,
         now + 86_400 * 2,
         true
     ));
-    // Nor does any stage on a build with no roster tier.
     assert!(!stage_owes_roster_reconfirmation(
         &staging,
         10,
@@ -1374,26 +1279,7 @@ fn an_unchanged_head_is_judged_again_when_the_stage_owes_its_roster_confirmation
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
-/// Tier-1 for `NativeUpdateRosterFreshness`. Every reachable
-/// state of the model with a stage on disk is laid out in a real staging root —
-/// build 20 by m11, its marker stamped at the state's confirmation tick (a tick
-/// is half the window of the real clock), the floor at the generation that
-/// authorized it; one root per distinct thing the real code reads — and the real
-/// code is asked:
-///
-/// * the swap's gates ([`crate::install::stage_admission_gates`], at the state's
-///   tick) admit the stage exactly when the model's `Swap` is enabled, and the
-///   swap they admit is a `Swap` step;
-/// * the check's observation ([`observe_floor_and_withdraw_at`], under a roster
-///   that revokes m11 once the owner has) leaves the disk in a state the model's
-///   `Check` reaches.
-///
-/// NEGATIVE CONTROLS, in real code: the floor-alone lane (the floor's
-/// withdrawals and the published stage, nothing else) admits a swap the model
-/// refuses — the `Buggy = 1` `SwapOnTheFloorAlone` step into a state
-/// `NoSwapPastTheWindow` refutes; and a confirmation stamped without the roster
-/// ([`crate::install::confirm_roster_authorization`] on a revoked signer's stage)
-/// is `ConfirmWithoutTheRoster`, after which the real gates admit a late swap.
+/// Tier-1 for `NativeUpdateRosterFreshness`.
 #[test]
 fn roster_freshness_conformance() {
     use aterm_spec::interp::State;
@@ -1407,9 +1293,6 @@ fn roster_freshness_conformance() {
             .expect("a model constant")
     };
     let window = constant("F");
-    // A tick is the window over `F`: the model's clock is the gates' clock, and
-    // how often a running check re-reads the roster is the environment's
-    // (`Check` may fire at any tick), not a tick of its own.
     let tick = crate::manifest::ROSTER_FRESHNESS_SECS / u64::try_from(window).unwrap();
     assert_eq!(
         u64::try_from(window).unwrap() * tick,
@@ -1422,7 +1305,6 @@ fn roster_freshness_conformance() {
         let secs = u64::try_from(aterm_types::rfc3339::parse_utc(stamp).unwrap()).unwrap();
         i64::try_from((secs - base) / tick).unwrap()
     };
-    // The stage on disk, build 20 by m11, its marker confirmed at tick `conf`.
     let lay_out = |conf: i64| {
         let staging = Staging::scratch("roster-freshness-t1");
         let ready = publish_stage_confirmed_at(&staging, "m11", at(conf));
@@ -1435,8 +1317,6 @@ fn roster_freshness_conformance() {
         );
         (staging, ready)
     };
-    // What the projection reads of the disk: whether the stage is still published,
-    // and the tick its marker was last confirmed at.
     let read_disk = |staging: &Staging| {
         Ready::read_published_bundle(staging)
             .map(|ready| ready.roster_confirmed_at.as_deref().map(tick_of))
@@ -1462,9 +1342,6 @@ fn roster_freshness_conformance() {
         }
     }
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
-    // Deduplicate real filesystem runs by the state projections they actually
-    // read (`(conf, now)` for swap, `(conf, revoked, now)` for check), reducing
-    // 154 staging roots across 77 states to 21 swap and 42 check roots.
     let mut swap_runs = std::collections::BTreeMap::new();
     let mut check_runs = std::collections::BTreeMap::new();
     let (mut swaps, mut checks, mut floor_alone_late) = (0, 0, None);
@@ -1472,8 +1349,6 @@ fn roster_freshness_conformance() {
         .iter()
         .filter(|state| state["staged"] == 1 && state["swapped"] == 0)
     {
-        // The swap: whether the gates admit the stage, the disk after them, and
-        // whether the floor alone would have.
         let (admitted, disk, floor_alone) = *swap_runs
             .entry((state["conf"], state["now"]))
             .or_insert_with(|| {
@@ -1486,7 +1361,6 @@ fn roster_freshness_conformance() {
                     at(state["now"]),
                 )
                 .is_none();
-                // NEGATIVE CONTROL: the floor-alone lane.
                 let floor_alone = crate::manifest::Floor::read(&staging.floor())
                     .withdraws(ready.build_number, ready.machine_id.as_deref())
                     .is_none()
@@ -1516,7 +1390,6 @@ fn roster_freshness_conformance() {
             floor_alone_late = Some(next);
         }
 
-        // The check.
         let revoked = state["revoked"] == 1;
         let disk = *check_runs
             .entry((state["conf"], revoked, state["now"]))
@@ -1552,8 +1425,6 @@ fn roster_freshness_conformance() {
     let late_swap = floor_alone_late.expect("the floor-alone lane swaps late somewhere");
     assert!(!model.check_invariant("NoSwapPastTheWindow", &late_swap));
 
-    // NEGATIVE CONTROL: a confirmation stamped without the roster. The owner
-    // revoked m11 at tick 0, and two ticks on, a stamp written blind...
     let mut state = model.init_state();
     for action in ["Revoke", "Tick", "Tick"] {
         assert!(model.fire(action, &mut state));
@@ -1575,7 +1446,6 @@ fn roster_freshness_conformance() {
         !model.successors("Check", &state).contains(&blind),
         "a check that read the roster retires it instead"
     );
-    // ...and the real gates then admit a swap the window should have stopped.
     let stamped = Ready::read_published_bundle(&staging).unwrap();
     assert_eq!(
         crate::install::stage_admission_gates(&staging, 10, &stamped, None, at(blind["now"])),
@@ -1601,12 +1471,10 @@ fn a_yanked_or_revoked_stage_is_announced_nowhere_and_retired_by_the_check() {
         &manifest.sha256,
         now,
     );
-    // NEGATIVE CONTROL: with no floor the stage is offered everywhere.
     assert_eq!(applicable_stage(&staging, 10), Some("0.0.20".to_string()));
     let backoff = stage_backoff(&staging, &manifest, 10, now, Asked::Schedule).expect("suppressed");
     assert!(backoff.applicable.is_some());
 
-    // THE YANK, observed but not yet acted on.
     crate::manifest::Floor::observe_and_write(
         &staging.floor(),
         &crate::manifest::FloorObservation {
@@ -1626,7 +1494,6 @@ fn a_yanked_or_revoked_stage_is_announced_nowhere_and_retired_by_the_check() {
         Ready::read_publishable(&staging).is_none(),
         "status says none"
     );
-    // The check that observes it retires the stage, under the apply lock.
     let floor = crate::manifest::Floor::read(&staging.floor());
     observe_floor_and_withdraw(
         &staging,
@@ -1637,7 +1504,6 @@ fn a_yanked_or_revoked_stage_is_announced_nowhere_and_retired_by_the_check() {
     .unwrap();
     assert!(Ready::read_published_bundle(&staging).is_none(), "retired");
 
-    // A REVOKED SIGNER, the same way — and only that signer's stage.
     let staging = Staging::scratch("floor-revokes-stage");
     publish_attributed_stage(&staging, 20, "m3");
     let revoked = vec!["m11".to_string()];
@@ -1736,7 +1602,6 @@ fn a_floor_that_stays_unreadable_is_booked_until_it_is_said() {
     assert_eq!(absent.min_build, 0);
     std::fs::write(staging.floor(), "min_build = 500\nroster_seq = 10\n").unwrap();
     std::fs::set_permissions(staging.floor(), std::fs::Permissions::from_mode(0o000)).unwrap();
-    // Root reads a mode-000 file, and then the premise does not hold.
     let premise = std::fs::read(staging.floor()).is_err();
     let refusals: Vec<_> = (0..crate::PERSISTENT_AFTER)
         .map(|_| floor_snapshot(&staging))
@@ -1751,7 +1616,6 @@ fn a_floor_that_stays_unreadable_is_booked_until_it_is_said() {
             assert!(crate::is_passing_refusal(refusal), "{refusal}");
             assert!(refusal.contains(&floor), "{refusal}");
         }
-        // The streak spans the persistence window (`Health::persistent_class`).
         crate::health::backdate_streaks(&staging.health(), crate::PERSISTENT_SPAN);
         let h = crate::health::Health::read(&staging.health());
         assert_eq!(
@@ -1774,11 +1638,8 @@ fn a_floor_that_stays_unreadable_is_booked_until_it_is_said() {
 
 #[test]
 fn a_release_is_held_when_its_roster_generation_was_superseded_mid_check() {
-    // Quiescent: our own write put the floor at our generation.
     assert!(!roster_authority_superseded(Some(9), 9));
-    // Raced: a concurrent instance recorded 10 — the release's authority is stale.
     assert!(roster_authority_superseded(Some(9), 10));
-    // Inert tier: nothing was observed, nothing can be superseded.
     assert!(!roster_authority_superseded(None, u64::MAX));
 }
 
@@ -1788,7 +1649,6 @@ fn a_release_is_held_when_its_roster_generation_was_superseded_mid_check() {
 /// refusals (lapsed or rolled-back generation, unsupported schema) do not.
 #[test]
 fn a_stale_anchor_names_the_reinstall_and_a_publisher_fault_does_not() {
-    // (A) A roster signed by a master this build does not pin.
     let good = chain(
         &[("m3", M3_SEED_FIXTURE)],
         &[],
@@ -1817,8 +1677,6 @@ fn a_stale_anchor_names_the_reinstall_and_a_publisher_fault_does_not() {
         "an unverifiable roster is the stranded client's arm: {reason}"
     );
 
-    // (B) The publisher's faults keep the publisher wording: a lapsed roster and a
-    //     rolled-back one are refused with a reason that carries NO reinstall.
     let lapsed = run_chain(&good, &masters, 0, 1_900_000_000);
     let reason = lapsed.rejection_reason.as_deref().expect("reason");
     assert!(
@@ -1835,8 +1693,6 @@ fn a_stale_anchor_names_the_reinstall_and_a_publisher_fault_does_not() {
         replayed.manifest_rejected && !is_stale_anchor_refusal(reason),
         "a rolled-back roster is a replay, not a stale anchor: {reason}"
     );
-    // A roster the master signed in a schema this build cannot read is a verdict too,
-    // never a delivery fault to retry.
     let mut newer = good.clone();
     let text = String::from_utf8(newer.roster).unwrap();
     assert_eq!(text.matches("schema = 1\n").count(), 1, "{text}");
@@ -1852,16 +1708,13 @@ fn a_stale_anchor_names_the_reinstall_and_a_publisher_fault_does_not() {
         "{:?}",
         unreadable.rejection_reason
     );
-    // And a verified, accepted release carries no reason at all.
     let accepted = run_chain(&good, &masters, 0, ROSTER_NOW);
     assert!(accepted.selected.is_some() && accepted.rejection_reason.is_none());
 }
 
 /// A downloaded signature that is not 64 bytes (e.g. an HTTP 200 proxy block
 /// page) is classified as a transport/delivery failure (`appcast_fetch_error`)
-/// rather than a stale-anchor or manifest verdict. A malformed appcast signature
-/// is checked after roster admission, so the roster's generation and revocations
-/// are still observed.
+/// rather than a stale-anchor or manifest verdict.
 #[test]
 fn a_signature_that_is_not_signature_shaped_is_a_delivery_fault_not_a_stale_anchor() {
     let base = chain(
@@ -1918,9 +1771,6 @@ fn a_signature_that_is_not_signature_shaped_is_a_delivery_fault_not_a_stale_anch
 /// generation.
 #[test]
 fn the_roster_generation_must_agree_between_the_roster_and_the_signed_manifest() {
-    // The roster is at generation 6; the appcast claims 7 — inside its own signed
-    // bytes, so this is a genuine signature over a claim the roster cannot back:
-    // an OLD roster presented with a NEWER release.
     let lying = chain(
         &[("m3", M3_SEED_FIXTURE)],
         &[],
@@ -1936,9 +1786,6 @@ fn the_roster_generation_must_agree_between_the_roster_and_the_signed_manifest()
         "an appcast may not name a roster generation newer than the one that \
          authorized it"
     );
-    // The roster is at generation 6; the appcast was attributed under 5 — a release
-    // published before a join, now carrying the newer pair: ADMITTED, and the floor
-    // ratchets to the roster's generation (6), not the manifest's.
     let redressed = chain(
         &[("m3", M3_SEED_FIXTURE)],
         &[],
@@ -1955,9 +1802,6 @@ fn the_roster_generation_must_agree_between_the_roster_and_the_signed_manifest()
     assert_eq!(admitted.observed_roster_seq, Some(6));
 }
 
-// Web-lane request counting: pointer HEAD transport and asset downloader
-// closures record every request and verify zero `api.github.com` calls.
-
 /// The release the fixture channel's pointer names.
 const WEB_TAG: &str = "v0.10.0";
 
@@ -1967,8 +1811,7 @@ fn tag_url(tag: &str, name: &str) -> String {
 }
 
 /// The DERIVED tag-specific URL prefix (`…/releases/download/<tag>/`) every GET of
-/// `tag` must carry. (The builder refuses an empty name, so it is taken off a
-/// placeholder.)
+/// `tag` must carry.
 fn tag_prefix(tag: &str) -> String {
     let url = tag_url(tag, "x");
     url[..url.len() - 1].to_string()
@@ -2064,9 +1907,7 @@ impl WebChannel {
 const WEB_BUILD: u64 = 5;
 
 /// Run the check's acquisition against a pointer that answers `answer`, counting
-/// every HEAD it makes. `known` writes a ledger that authorized that tag AS THIS BUILD,
-/// AGAINST THE FIXTURE SOURCE (the only ledger the shortcut may trust). Returns the
-/// outcome and every URL the HEAD transport was asked.
+/// every HEAD it makes.
 fn acquire_web(
     staging: &Staging,
     known: Option<&str>,
@@ -2163,7 +2004,6 @@ fn a_web_lane_check_makes_zero_api_requests_and_only_tag_specific_gets() {
     web_container_url_agrees(&source, &release.tag_name, manifest)
         .expect("the manifest's url names the derived container URL under the tag");
 
-    // The request ledger.
     let prefix = tag_prefix(WEB_TAG);
     assert_eq!(
         gets.len(),
@@ -2206,9 +2046,6 @@ fn an_unchanged_web_head_refetches_a_release_whose_stage_is_lost() {
     let commit = "0123456789abcdef0123456789abcdef01234567";
     write_ready(&staging, 10, commit, &"ab".repeat(32));
     write_bundle_identity(&staging, 10, commit);
-    // The ledger the check writes after this stage, written directly rather than
-    // through the process-global carry (`set_latest_tag` + `record`), which a
-    // concurrently running apply-lane test may clear between the two calls.
     std::fs::write(
         &staging.status,
         format!(
@@ -2247,7 +2084,6 @@ fn every_web_lane_failure_path_ends_without_an_api_request() {
     let staging = Staging::scratch("failures");
     crate::status::clear_check_note();
 
-    // 404: stranded, and the ledger says why.
     crate::unreadable::clear();
     let (outcome, heads) = acquire_web(&staging, None, || {
         Ok(HeadAnswer {
@@ -2262,11 +2098,9 @@ fn every_web_lane_failure_path_ends_without_an_api_request() {
         !staging.health().exists(),
         "a standing state is not a fault"
     );
-    // Reading the channel — with no credential at all — clears the strand.
     note_readable(&test_source());
     assert!(!crate::unreadable::is_stranded());
 
-    // 429 / 5xx: deferred, no health entry, the latch set for the loop.
     for code in [429u16, 503] {
         let (outcome, heads) = acquire_web(&staging, None, || {
             Ok(HeadAnswer {
@@ -2283,8 +2117,6 @@ fn every_web_lane_failure_path_ends_without_an_api_request() {
         assert!(!staging.health().exists(), "{code}: weather is not a fault");
     }
 
-    // A refused redirect (another repository, the same asset name) and a transport
-    // failure: `network`-class, and NOTHING is fetched from the refused location.
     let elsewhere = "https://github.com/someone/aterm/releases/download/v0.10.0/aterm-appcast.toml";
     for (label, answer) in [
         (
@@ -2322,17 +2154,12 @@ fn every_web_lane_failure_path_ends_without_an_api_request() {
             "{label}: booked as network"
         );
     }
-    // A completed read clears the deferral latch the background loop reads.
     note_readable(&test_source());
     assert!(!rate_limited());
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
-/// Invariant (d): the pointer alone can never choose what is installed. The tag it
-/// names must equal `v` + the signed manifest's `version` (the `url` half is
-/// `the_url_bind_accepts_the_source_or_the_compiled_in_channel_and_nothing_else`):
-/// on the real fetch path, a pointer at v0.11.0 whose appcast says 0.10.0 is refused
-/// as a manifest defect, never staged, and every GET is addressed by the pointer's tag.
+/// Invariant (d): the pointer alone can never choose what is installed.
 #[test]
 fn the_pointers_tag_and_the_manifest_version_must_agree() {
     let channel = web_channel(Some(&tag_url(WEB_TAG, "aterm-0.10.0.dmg")));
@@ -2341,7 +2168,6 @@ fn the_pointers_tag_and_the_manifest_version_must_agree() {
     let mut gets = Vec::new();
     let mut download = |url: &str, _max: u64| {
         gets.push(url.to_string());
-        // Serve WEB_TAG's bytes under v0.11.0's derived names.
         let name = url.rsplit('/').next().unwrap().to_string();
         channel.serve(&tag_url(WEB_TAG, &name))
     };
@@ -2365,9 +2191,6 @@ fn a_roster_that_cannot_be_fetched_on_the_web_lane_refuses_as_transport() {
     let source = test_source();
     let channel = web_channel(Some(&tag_url(WEB_TAG, "aterm-0.10.0.dmg")));
     let masters = [channel.master_pub.as_str()];
-    // The roster body, and (one asset over) its master signature: the two halves
-    // an attacker can withhold independently, and two places a fallback could be
-    // bolted on.
     for missing in [
         aterm_update_core::roster::ROSTER_ASSET,
         aterm_update_core::roster::ROSTER_SIG_ASSET,
@@ -2396,7 +2219,6 @@ fn a_roster_that_cannot_be_fetched_on_the_web_lane_refuses_as_transport() {
             "{gets:?}"
         );
     }
-    // …and a web-host 429 on the same leg is the deferrable weather, still refused.
     let mut download = |url: &str, _max: u64| {
         if url.ends_with(aterm_update_core::roster::ROSTER_ASSET) {
             return Err("rate limited (HTTP 429) fetching an asset".to_string());
@@ -2421,14 +2243,12 @@ fn the_shortcut_is_bound_to_the_recording_build_and_source_and_cleared_by_retire
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let staging = Staging::scratch("shortcut-binding");
     let source = test_source();
-    // A pointer that moved past the recorded tag: judged.
     write_ledger(&staging, "v0.9.0", WEB_BUILD, "alabsystems/aterm");
     let (outcome, _) = acquire_web_from(&staging, &source, || redirect_to(WEB_TAG));
     assert!(
         matches!(outcome, Ok(Acquisition::Proceed(_))),
         "{outcome:?}"
     );
-    // The same tag, recorded by another build: re-judged.
     for other in [WEB_BUILD - 1, WEB_BUILD + 1] {
         write_ledger(&staging, WEB_TAG, other, "alabsystems/aterm");
         let (outcome, heads) = acquire_web_from(&staging, &source, || redirect_to(WEB_TAG));
@@ -2438,7 +2258,6 @@ fn the_shortcut_is_bound_to_the_recording_build_and_source_and_cleared_by_retire
             "build {other}: {outcome:?}"
         );
     }
-    // The same tag, recorded against another repository: re-judged.
     write_ledger(&staging, WEB_TAG, WEB_BUILD, "example/mirror");
     let (outcome, heads) = acquire_web_from(&staging, &source, || redirect_to(WEB_TAG));
     assert_eq!(heads.len(), 1);
@@ -2446,7 +2265,6 @@ fn the_shortcut_is_bound_to_the_recording_build_and_source_and_cleared_by_retire
         matches!(outcome, Ok(Acquisition::Proceed(_))),
         "{outcome:?}"
     );
-    // A ledger that recorded no source (an earlier build of this design): re-judged.
     std::fs::write(
         &staging.status,
         format!("schema = 1\ncurrent_build = {WEB_BUILD}\nlatest_tag = {WEB_TAG:?}\n"),
@@ -2457,8 +2275,6 @@ fn the_shortcut_is_bound_to_the_recording_build_and_source_and_cleared_by_retire
         matches!(outcome, Ok(Acquisition::Proceed(_))),
         "{outcome:?}"
     );
-    // This build, this source: the steady state — written the way the check writes
-    // it, through `set_latest_tag` + `record`.
     crate::status::clear_check_note();
     crate::status::set_latest_tag(WEB_TAG, &source, WEB_BUILD, WEB_BUILD);
     crate::status::record(&staging, WEB_BUILD, "staged 0.10.0 (build 10)");
@@ -2468,8 +2284,6 @@ fn the_shortcut_is_bound_to_the_recording_build_and_source_and_cleared_by_retire
         matches!(outcome, Ok(Acquisition::UpToDate { .. })),
         "{outcome:?}"
     );
-    // RETIREMENT ("so the next check re-stages"): the unchanged pointer now
-    // proceeds to a full re-fetch — and every request is still off the API.
     staging.retire_published();
     let (outcome, heads) = acquire_web_from(&staging, &source, || redirect_to(WEB_TAG));
     assert_eq!(heads, vec![evergreen_url()]);
@@ -2544,7 +2358,6 @@ fn a_published_release_verifies_under_the_committed_master_alone() {
     const APPCAST_SIG: &[u8] = include_bytes!("../tests/fixtures/v0.90.0/aterm-appcast.toml.sig");
     const ROSTER: &[u8] = include_bytes!("../tests/fixtures/v0.90.0/aterm-machines.toml");
     const ROSTER_SIG: &[u8] = include_bytes!("../tests/fixtures/v0.90.0/aterm-machines.toml.sig");
-    // 2026-09-21T20:00:00Z, just after the release; the roster is valid far past it.
     const PUBLISHED_AT: i64 = 1_790_020_800;
     let tag = "v0.90.0";
     let serve = |appcast: &'static [u8]| {
@@ -2584,7 +2397,6 @@ fn a_published_release_verifies_under_the_committed_master_alone() {
     assert_eq!(who.machine_id, "m3");
     assert_eq!(fetched.observed_roster_seq, Some(4));
 
-    // Negative control 1: one flipped byte of the appcast refuses.
     let mut tampered = APPCAST.to_vec();
     let last = tampered.len() - 2;
     tampered[last] ^= 0x01;
@@ -2648,7 +2460,6 @@ fn nothing_looks_past_a_head_even_when_every_tag_past_it_would_answer() {
             location: Some(if url == evergreen_url() {
                 tag_url("atpkg-index-44", APPCAST_ASSET)
             } else {
-                // Any other tag's derived appcast: served, as a prerelease's is.
                 "https://release-assets.githubusercontent.com/github-production-release-asset/x"
                     .to_string()
             }),
@@ -2692,17 +2503,12 @@ fn every_build_calls_the_same_head_in_flight() {
         record_source_only_head(&staging, build, &source, head);
         head_in_flight().is_some()
     };
-    // The ledger: build 42 authorized v0.93.0.
     write_ledger(&staging, "v0.93.0", 42, "alabsystems/aterm");
     assert!(!latched(42, "v0.92.0"), "the recording build");
     assert!(!latched(41, "v0.92.0"), "another build, the same answer");
     assert!(latched(42, "v0.94.0"));
     assert!(latched(41, "v0.94.0"));
-    // A head AT the authorized tag (GitHub's `latest` can name a re-published
-    // release) is not above it.
     assert!(!app_build_in_flight("v0.93.0", Some("v0.93.0")));
-    // Through the receipt: the two builds' checks no longer alternate a
-    // count of 0 and 1 on a head below the authorized tag.
     let counts: Vec<u32> = [42, 41, 42, 41]
         .into_iter()
         .map(|build| {
@@ -2713,7 +2519,6 @@ fn every_build_calls_the_same_head_in_flight() {
         })
         .collect();
     assert_eq!(counts, [0, 0, 0, 0]);
-    // Another repository's authorized tag is no answer about this one.
     write_ledger(&staging, "v0.93.0", 42, "someone/else");
     assert!(latched(41, "v0.92.0"));
     let _ = std::fs::remove_dir_all(&staging.root);
@@ -2721,9 +2526,7 @@ fn every_build_calls_the_same_head_in_flight() {
 
 /// The count the quick ladder keys on is the RECEIPT's, machine-wide: consecutive
 /// completed checks that found the same head in flight count up; a deferral, a
-/// check that found none and a different head each end the run. A FAILED check
-/// writes no receipt, so it neither counts nor ends the run: the next completed
-/// check carries the count on (1, fail, 2 — erring toward fewer quick checks).
+/// check that found none and a different head each end the run.
 #[test]
 fn a_head_in_flight_is_counted_on_the_receipt_of_completed_checks_only() {
     let _guard = crate::STRANDED_TEST_LOCK
@@ -2750,10 +2553,8 @@ fn a_head_in_flight_is_counted_on_the_receipt_of_completed_checks_only() {
         Some(("v0.92.0".into(), 3)),
         "a check that staged something still counts the head it found"
     );
-    // A deferral records its own window and no head; the next run starts over.
     assert_eq!(stamp(&healthy, true, v92), None);
     assert_eq!(stamp(&healthy, false, v92), Some(("v0.92.0".into(), 1)));
-    // A failed check leaves the receipt alone, and answers no head.
     let before = std::fs::read(crate::check_receipt::path(&staging)).unwrap();
     assert_eq!(stamp(&Err("dns".into()), false, v92), None);
     assert_eq!(
@@ -2761,17 +2562,14 @@ fn a_head_in_flight_is_counted_on_the_receipt_of_completed_checks_only() {
         before
     );
     assert_eq!(stamp(&healthy, false, v92), Some(("v0.92.0".into(), 2)));
-    // A recorded deferral's machine-wide retreat is kept even when a later leg failed.
     assert!(check_leaves_a_receipt(
         &Err("connection reset".into()),
         true
     ));
-    // A different head is a different release in flight.
     assert_eq!(
         stamp(&healthy, false, Some("v0.93.0")),
         Some(("v0.93.0".into(), 1))
     );
-    // A check that found none ends the run.
     assert_eq!(stamp(&healthy, false, None), None);
     assert_eq!(
         stamp(&healthy, false, Some("v0.93.0")),

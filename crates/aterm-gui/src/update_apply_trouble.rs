@@ -64,16 +64,22 @@ impl PersonRemedy {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ApplyTrouble {
     /// Consecutive failed applies of the artifact on offer (the ledger's
+    /// `apply_failures_for_target`, not the running-build-scoped escalation streak).
     attempts: u32,
     /// The ledger's own `last_apply_error` prose, the raw `apply_failure=` value, kept verbatim
+    /// for the log and the control verb; no rendering here prints it.
     reason: String,
     /// Whether the automatic lane will try again unaided.
     retry: ApplyRetry,
     /// How long until the scheduled retry, when the lane can say, so a six-hour stand-down does
+    /// not read like a two-minute one.
     retry_in: Option<std::time::Duration>,
 }
 
 /// `(full clause, short clause)` for a reason this program does not recognise: true of every
+/// string that reaches this slot (an apply attempted that did not complete) and no guess at a
+/// mechanism ("it did not start" would be wrong for an adoption mismatch or a stale
+/// preflight).
 const GENERIC: (&str, &str) = ("it did not finish installing", "didn\u{2019}t finish");
 
 /// The open tabs' records over what one handover carries, in a person's words.
@@ -81,6 +87,7 @@ pub(crate) const TABS_OVER_HANDOVER: &str =
     "too many tabs were open to move to the new version at once";
 
 /// The apply outcomes this program can name, as `(a substring of a real ledger reason, full
+/// clause, short clause)`.
 const CAUSES: &[(&str, &str, &str)] = &[
     (
         "handoff proof ended ChildDied",
@@ -271,6 +278,7 @@ const CAUSES: &[(&str, &str, &str)] = &[
 ];
 
 /// `(full clause, short clause)` for a ledger reason; an unrecognised one takes [`GENERIC`],
+/// never its own log prose (see [`CAUSES`]).
 fn clauses(reason: &str) -> (String, String) {
     let (full, short) = named_cause(reason).unwrap_or(GENERIC);
     (full.to_string(), short.to_string())
@@ -281,7 +289,7 @@ pub(crate) fn named_clause(reason: &str) -> Option<&'static str> {
     named_cause(reason).map(|(full, _)| full)
 }
 
-/// The [`CAUSES`] row this reason matches, if any. One scan, shared by [`clauses`]
+/// The [`CAUSES`] row this reason matches, if any.
 fn named_cause(reason: &str) -> Option<(&'static str, &'static str)> {
     let reason = reason.trim();
     CAUSES
@@ -291,6 +299,7 @@ fn named_cause(reason: &str) -> Option<(&'static str, &'static str)> {
 }
 
 /// "6 h" / "30 min" / "a minute" — a wait a sentence can contain, at the
+/// precision a person plans around (a stand-down is hours; a retry, minutes).
 fn about(wait: std::time::Duration) -> String {
     let secs = wait.as_secs();
     if secs >= 3600 {
@@ -501,6 +510,7 @@ mod tests {
     ];
 
     /// No reason this program writes survives into any rendering, nor its most alarming words
+    /// ("failed safely", "Commit").
     #[test]
     fn no_reason_this_program_writes_can_reach_a_surface_verbatim() {
         for reason in REAL_LEDGER_REASONS {
@@ -540,6 +550,7 @@ mod tests {
     }
 
     /// Each real reason maps to the right cause, not merely a safe one (a table that matched
+    /// nothing would still pass the test above).
     #[test]
     fn apply_lane_reasons_this_program_can_actually_write_map_to_the_right_cause() {
         let full = |reason: &str| clauses(reason).0;
@@ -682,7 +693,7 @@ mod tests {
         );
     }
 
-    /// An unrecognised reason degrades to one bounded generic clause and does not leak. The
+    /// An unrecognised reason degrades to one bounded generic clause and does not leak.
     #[test]
     fn an_unrecognised_reason_degrades_to_a_safe_generic_clause() {
         for stranger in [
@@ -716,7 +727,7 @@ mod tests {
         );
     }
 
-    /// A CLEAN STAGE IS NOT A FAILURE. Zero attempts is the state of every update
+    /// A CLEAN STAGE IS NOT A FAILURE.
     #[test]
     fn a_clean_stage_reads_as_no_trouble_at_all() {
         assert_eq!(ApplyTrouble::new(0, "", ApplyRetry::Scheduled), None);
@@ -744,6 +755,7 @@ mod tests {
     }
 
     /// The two retry regimes are different sentences: one asks the reader to act, the other to
+    /// do nothing.
     #[test]
     fn the_manual_only_latch_changes_what_the_reader_is_told_to_do() {
         let auto = ApplyTrouble::new(2, "handoff proof ended TimedOut", ApplyRetry::Scheduled)
@@ -781,6 +793,9 @@ mod tests {
     }
 
     /// THE STAND-DOWN HAS A HORIZON (2026-09-14, audit OBS-5): a scheduled retry
+    /// that knows its wait says it at planning precision; one that does not keeps
+    /// the bare promise; and a wait under any other promise is dropped, not
+    /// rendered into a contradiction.
     #[test]
     fn a_scheduled_retry_says_how_long_when_it_knows() {
         use std::time::Duration;
@@ -802,7 +817,7 @@ mod tests {
         );
     }
 
-    /// THE 2026-09-14 INCIDENT, AT THE WORDS. A hand-built, ad-hoc-signed
+    /// THE 2026-09-14 INCIDENT, AT THE WORDS.
     #[test]
     fn observability_audit_a_rollback_source_refusal_names_the_installed_copy_and_the_remedy() {
         let reason = "installed bundle failed pre-park verification: the installed bundle at \
@@ -844,6 +859,9 @@ mod tests {
     }
 
     /// an install whose folder cannot be written is refused before
+    /// the park, as a person's to clear — and the remedy is to move the app or ask an
+    /// administrator, never to reinstall the signed release (which would land in the
+    /// same folder and be refused again).
     #[cfg(target_os = "macos")]
     #[test]
     fn a_non_writable_install_location_names_its_own_remedy() {
@@ -874,6 +892,8 @@ mod tests {
     }
 
     /// The remedy is the standing block's, not the latest reason's: a person's retry can fail
+    /// for an ordinary reason before the folder is asked, and the cause clause says so while
+    /// the next step stays the block's remedy.
     #[test]
     fn a_standing_block_names_its_own_remedy_over_a_later_reason() {
         let passing = "overlap handoff failed safely: staged update failed pre-park \
@@ -921,6 +941,7 @@ mod tests {
     }
 
     /// A check that did not finish is named as a moment, never as the person's to clear, also
+    /// in the older shape that wraps a passing error in the installed-source key.
     #[test]
     fn a_check_that_did_not_finish_is_named_as_a_moment_and_never_a_person_s() {
         let passing = "overlap handoff failed safely: installed bundle failed pre-park \

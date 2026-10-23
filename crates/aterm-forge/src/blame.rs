@@ -966,7 +966,7 @@ fn rs_lines(dir: &Path) -> u64 {
         .sum()
 }
 
-fn yes_no(b: bool) -> &'static str {
+const fn yes_no(b: bool) -> &'static str {
     if b { "YES" } else { "no" }
 }
 

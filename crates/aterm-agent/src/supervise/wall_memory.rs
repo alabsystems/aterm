@@ -16,15 +16,19 @@ use super::*;
 pub(super) const MEMORY_TTL: Duration = Duration::from_secs(24 * 3600);
 
 /// Why a wall's wait ended, as its ledger row ([`RULE_WALL_WAIT_END`]) says it: the screen left
+/// it, the worker worked, another wall replaced it.
 const WALL_LEFT: &str = "the wall left the screen or the worker worked";
 
 /// Duration of background-only busy state before firing a stuck-screen canary (`30m`).
 pub(super) const STUCK_AFTER: Duration = Duration::from_secs(30 * 60);
 
 /// How many times shorter than [`STUCK_AFTER`] the dialog flavour's unit is
+/// ([`Session::dialog_note`]): nothing runs on its screen, so no long background job can explain
+/// it.
 const DIALOG_DIVISOR: u32 = 3;
 
 /// The glyph Claude Code puts before its terminal title while idle (`✳ Claude Code`); a working
+/// agent animates a spinner glyph there instead.
 const IDLE_TITLE_GLYPH: char = '\u{2733}';
 
 /// What the wall's ledger row last said: the notice's placement (`reset_unix=`), the usage tap's reset (`tap_unix=`), the scope and the program.
@@ -40,10 +44,14 @@ pub(super) struct WallMemory {
     /// What was last written to the ledger: `None` before the first write, and again once an act closed the ledger's wall.
     saved: Option<WallRowSaid>,
     /// The wall WAS WRITTEN to the ledger, by this loop
+    /// ([`Session::persist_wall`]) or the one it took the wall up from
+    /// ([`Session::seed_wall_memory`]).
     written: bool,
 }
 
 /// Whether the canary's witness on `p`'s screen is the agent's own title
+/// ([`Witness::Title`]): Claude Code's, which rests on `✳` while it does not
+/// work whatever its screen's words say.
 fn title_witness(p: Program) -> bool {
     match p {
         Program::Claude => true,
@@ -52,15 +60,25 @@ fn title_witness(p: Program) -> bool {
 }
 
 /// What vouches, at each rung of the canary's ladder
+/// ([`Session::stuck_climb`]), that the agent does not work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Witness {
     /// Claude Code's own terminal title rests on `✳` (one `status` read): it
+    /// animates while the agent works, and a screen no reader names says
+    /// nothing either way.
     Title,
     /// agy's or Muse Code's own words stood still since the episode began
+    /// ([`still_words`]): their reader read the turn's end as evidence and
+    /// names the work (`what`, [`ScreenReader::background_wait`]); a turn of
+    /// the agent's own, a draft typed, or other work moves them.
     Words(&'static str),
 }
 
 /// What stands still on agy's or Muse Code's screen while the canary climbs
+/// on their own background work ([`Witness::Words`]): the work their reader
+/// names, the letters of the last rows above the composer (the reply or the
+/// question the turn ended on and the tool rows over it, so a clock's digits
+/// are no change and a turn of the agent's own is one), and the draft.
 fn still_words(reader: &dyn ScreenReader, rows: &[String], what: &str) -> String {
     let mut words = format!("{what}\n");
     if let Some((caret, draft)) = reader.composer(rows) {
@@ -71,6 +89,12 @@ fn still_words(reader: &dyn ScreenReader, rows: &[String], what: &str) -> String
 }
 
 /// THE SCREEN SHOWS NOTHING BUT THE AGENT'S OWN BACKGROUND WORK, its turn
+/// over: Claude Code's by its grammar ([`aterm_phase::background_only`]: no
+/// spinner, no `esc to interrupt`, no message just submitted); any other
+/// agent's by its reader ([`ScreenReader::background_wait`]: a task, a
+/// timer or a subagent in agy's panel, a backgrounded shell or a monitor in
+/// Muse Code's, under a turn that ended; Codex's and Gemini CLI's readers
+/// have no such read).
 fn background_alone(reader: &dyn ScreenReader, rows: &[String]) -> bool {
     match reader.program() {
         Program::Claude => aterm_phase::background_only(rows),
@@ -81,6 +105,7 @@ fn background_alone(reader: &dyn ScreenReader, rows: &[String]) -> bool {
 }
 
 /// A wall the memory is kept for: a limit that resets, whose wait the loop
+/// owns.
 fn is_kept(wall: &aterm_phase::Wall) -> bool {
     wall.kind.reads_limited()
 }
@@ -225,6 +250,9 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// A LIMIT'S TRACK ENDED at this point by no act of the loop's
+    /// ([`TurnEndState::limit_ended`]): the ledger says so and `why`
+    /// ([`approvals::LIMIT_ENDED`], [`WALL_LEFT_NO_TASK`]), and a loop that
+    /// follows takes up no try made before it ([`approvals::usage_attempt`]).
     fn limit_ended_row(&mut self, shown: bool, why: &str, seq: u64) {
         self.ledger_row(RULE_WALL_WAIT_END, Outcome::Waiting, "", why, seq);
         match self.wall_memory.as_mut() {
@@ -238,6 +266,8 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// Remember `wall`, met under `program` (the reader that read it): the
+    /// same wall read again (its rows shift, its footer ticks) changes
+    /// nothing.
     fn remember_wall(&mut self, wall: &aterm_phase::Wall, program: Program, seq: u64) {
         let conversation = self
             .wall_conversation
@@ -279,6 +309,7 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// [`Self::forget_wall`], the ledger's end row saying `why`: written for a
+    /// wall that was written ([`WallMemory::written`]).
     fn forget_wall_because(&mut self, seq: u64, why: &str) {
         if let Some(m) = self.wall_memory.take()
             && m.written
@@ -354,6 +385,7 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// The limit's track and memory whose conversation is `from` take `to`,
+    /// the memory's change persisted.
     fn rescope_limit(&mut self, from: &Conversation, to: &Conversation, seq: u64) {
         self.turn_end.rescope_limit_conversation(from, to);
         let changed = if let Some(m) = self.wall_memory.as_mut()
@@ -470,6 +502,7 @@ pub(super) enum StuckRung {
 
 impl StuckRung {
     /// The rung above this one and the multiple of the ladder's unit it needs
+    /// ([`STUCK_AFTER`]; a third of it for a dialog), or `None` at the top.
     fn next(self) -> Option<(Self, u32)> {
         match self {
             Self::Quiet => Some((Self::Said, 1)),
@@ -525,6 +558,9 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// THE KERNEL'S WORD on the agent's own background work
+    /// ([`IdleHost::background_jobs`]): the call the host's jobs reading says
+    /// has made no progress, or `None` (no host, no reading, or nothing of
+    /// this session's): today's ladder.
     fn no_progress_call(&self) -> Option<super::super::background::BackgroundCall> {
         let host = self.stall_host.as_ref()?;
         match host.background_jobs() {
@@ -587,6 +623,11 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// One climb of the canary's ladder for the episode that began at `at`
+    /// ([`Self::stuck_busy_note`], [`Self::dialog_note`]): when the next rung
+    /// is due — its multiple of `after`, the title not asked within `after`
+    /// — one `status` read is its witness ([`Witness::Title`]; agy's and Muse
+    /// Code's words, [`Witness::Words`], were read on the screen by the
+    /// caller), and the rung is said in `kind`'s and the witness's words.
     fn stuck_climb(
         &mut self,
         screen: &Screen,
@@ -727,6 +768,8 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// The ladder's third rung: `exception` journaled (`EXCEPTION seq=<n>
+    /// kind=<k> when=<w> <why> => <action>`), told to the host, and kept as
+    /// raised for its end's `CLEARED` line ([`Self::stuck_over`]).
     fn raise_stuck(
         &mut self,
         seq: u64,
@@ -773,6 +816,8 @@ impl<C: Ctl> Session<'_, C> {
 }
 
 /// Whether a `status` reply says Claude Code's own title rests: its source is
+/// the program's own (`osc`, not a title the owner pinned) and it opens with
+/// the idle glyph ([`IDLE_TITLE_GLYPH`]).
 fn title_rests(stdout: &str) -> bool {
     let field = |f: &str| crate::supervise::screen::status_field(stdout, f);
     field("subject_source") == Some("osc")
@@ -782,6 +827,8 @@ fn title_rests(stdout: &str) -> bool {
 }
 
 /// Whether a `status` reply names Claude Code as the tab's foreground program
+/// (`program=`), read fresh: the screen of a dialog has no frame to say it,
+/// and a shell left in a swapped tab, Codex or a foreground `vim` are none.
 fn names_claude(stdout: &str) -> bool {
     match crate::supervise::screen::status_field(stdout, "program")
         .and_then(aterm_phase::program_of)
@@ -795,9 +842,11 @@ fn names_claude(stdout: &str) -> bool {
 }
 
 /// How many characters of a screen's last rows the dialog flavour's journal
+/// line carries ([`tail_rows`]).
 const TAIL_ROWS_CHARS: usize = 400;
 
 /// The last five non-blank rows of `rows`, trimmed, joined by ` ⏎ ` (a control character a
+/// space): what a reader is taught the dialog by.
 fn tail_rows(rows: &[String]) -> String {
     let said: Vec<&str> = rows
         .iter()

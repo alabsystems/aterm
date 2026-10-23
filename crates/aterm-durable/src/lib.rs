@@ -6,8 +6,9 @@
 //! [`Flush::ordered_if_same_device`]), with [`seam::Recording`] for test/debug inspection.
 //!
 //! Every application flushes in full, debug builds included (astream 46e7c1b's ruling):
-//! only a test binary that asks ([`plain_durable_flushes_in_tests!`]) takes a plain
-//! `fsync(2)` for its durable flushes on Apple targets.
+//! only a test binary that asks ([`plain_durable_flushes_in_tests!`]), and every process
+//! it starts, astream's broker included, takes a plain `fsync(2)` for its durable flushes
+//! in a debug build on Apple targets (`astream_sys::TEST_PLAIN_FSYNC_ENV`).
 
 use std::fs::File;
 use std::io;
@@ -185,22 +186,25 @@ pub fn durable_data(file: &File) -> io::Result<()> {
 #[inline]
 fn full_or_fsync(file: &File, full: fn(&File) -> io::Result<()>) -> io::Result<()> {
     #[cfg(all(any(test, debug_assertions), target_vendor = "apple"))]
-    if seam::PLAIN.load(std::sync::atomic::Ordering::Relaxed) {
+    if cfg!(test) || astream_sys::test_plain_fsync() {
         return primitive::fsync(file);
     }
     full(file)
 }
 
-/// Make this test binary's durable flushes plain `fsync(2)`s on Apple targets: a crate's
-/// root says `#[cfg(test)] aterm_durable::plain_durable_flushes_in_tests!();`, which
-/// expands to a load-time hook only under `cfg(test)`. Applications keep the full flush.
+/// Make the durable flushes of this test binary, and of every process it starts, plain
+/// `fsync(2)`s in a debug build on Apple targets: a crate's root says
+/// `#[cfg(test)] aterm_durable::plain_durable_flushes_in_tests!();`, which expands only
+/// under `cfg(test)` to a load-time hook that marks the process tree
+/// (`astream_sys::TEST_PLAIN_FSYNC_ENV`). Applications keep the full flush.
 #[macro_export]
 macro_rules! plain_durable_flushes_in_tests {
     () => {
         #[cfg(all(test, target_vendor = "apple"))]
         const _: () = {
             extern "C" fn plain_durable_flushes() {
-                $crate::seam::plain_durable_flushes();
+                // SAFETY: a load-time hook runs before `main`, so before any other thread.
+                unsafe { $crate::seam::plain_durable_flushes() }
             }
             #[used]
             #[unsafe(link_section = "__DATA,__mod_init_func,mod_init_funcs")]
@@ -389,20 +393,20 @@ pub mod seam {
         });
     }
 
-    /// Whether this process's durable flushes are plain `fsync(2)`s (Apple targets):
-    /// from the start in this crate's own tests, and once a test binary's load-time hook
-    /// says so ([`plain_durable_flushes_in_tests!`](crate::plain_durable_flushes_in_tests)).
-    #[cfg(all(any(test, debug_assertions), target_vendor = "apple"))]
-    pub(crate) static PLAIN: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(cfg!(test));
-
-    /// Make this process's durable flushes plain `fsync(2)`s from now on (Apple
-    /// targets, in a test or debug build; elsewhere nothing). Only a test binary's
-    /// load-time hook calls it
-    /// ([`plain_durable_flushes_in_tests!`](crate::plain_durable_flushes_in_tests)).
-    pub fn plain_durable_flushes() {
-        #[cfg(all(any(test, debug_assertions), target_vendor = "apple"))]
-        PLAIN.store(true, std::sync::atomic::Ordering::Relaxed);
+    /// Mark this process, and every process it starts, as a test's
+    /// (`astream_sys::TEST_PLAIN_FSYNC_ENV`): in a debug build on Apple targets their
+    /// durable flushes, and the broker's, are plain `fsync(2)`s. Only
+    /// [`plain_durable_flushes_in_tests!`](crate::plain_durable_flushes_in_tests)'s
+    /// load-time hook calls it.
+    ///
+    /// # Safety
+    /// No other thread may be running: it sets an environment variable.
+    pub unsafe fn plain_durable_flushes() {
+        // SAFETY: the caller runs before any other thread exists.
+        #[cfg(target_vendor = "apple")]
+        unsafe {
+            std::env::set_var(astream_sys::TEST_PLAIN_FSYNC_ENV, "1");
+        }
     }
 }
 
@@ -516,6 +520,7 @@ mod tests {
     }
 
     /// The real primitives on a regular file, and on Unix also on a directory of
+    /// the test volume: the barrier and the full flush.
     #[test]
     fn the_real_barrier_and_full_flush_take_a_file_and_a_directory() {
         let dir = scratch();
@@ -532,6 +537,7 @@ mod tests {
     }
 
     /// The barrier itself, with no fallback behind it, on a regular file and on a directory
+    /// of the test volume (Apple).
     #[cfg(target_vendor = "apple")]
     #[test]
     fn this_volume_takes_the_barrier_on_a_file_and_a_directory() {
@@ -551,6 +557,7 @@ mod tests {
     }
 
     /// What [`primitive::barrier_or_full`] did with one injected barrier answer: its
+    /// result, and how many times it asked the barrier and the full flush.
     #[cfg(target_vendor = "apple")]
     fn barrier_answering(
         answer: std::io::Error,
@@ -579,6 +586,8 @@ mod tests {
     }
 
     /// The four errnos astream-sys reads as a REFUSED barrier (`ENODEV`, `EINVAL`,
+    /// `ENOTTY`, `ENOTSUP`) promise no ordering, so each gets the full flush, whose
+    /// own answer is the result.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_refused_barrier_is_answered_by_the_full_flush() {
@@ -612,6 +621,7 @@ mod tests {
     }
 
     /// THE NEGATIVE CONTROL of the test above: the same harness, with a barrier that
+    /// FAILED rather than was refused.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_failed_barrier_is_returned_and_never_covered_by_a_full_flush() {
@@ -633,6 +643,7 @@ mod tests {
     }
 
     /// The pair [`primitive::barrier`] itself hands [`primitive::barrier_or_full`] on
+    /// Apple: astream-sys's barrier and this crate's real full flush.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn the_shipped_barrier_answers_a_refusal_with_the_real_full_flush() {
@@ -681,6 +692,7 @@ mod tests {
     }
 
     /// Two volumes, where this host has them: `/dev` is its own filesystem on Apple
+    /// and Linux, so a write there is never ordered by a barrier on the temp volume.
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     #[test]
     fn a_later_write_on_another_device_is_durable() {

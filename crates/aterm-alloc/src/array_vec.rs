@@ -408,6 +408,8 @@ impl<T: Clone, const N: usize> Clone for ArrayVec<T, N> {
     }
 
     /// Clones the common prefix in place rather than dropping and rebuilding,
+    /// as upstream does; `wgpu-hal`'s GLES backend calls this on every pipeline
+    /// bind.
     fn clone_from(&mut self, source: &Self) {
         let prefix = if self.len < source.len {
             self.len

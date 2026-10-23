@@ -27,9 +27,13 @@ use aterm_keeper::wire::{Birth, Frame, MarkerRef, MasterHeader};
 use aterm_update::recovery_ledger::KeeperAtLaunch;
 
 /// Whether this process takes part at all: the fast path every call site
+/// reads before anything else, so a window with the keeper off pays one
+/// relaxed load per spawn, close and exit.
 static ON: AtomicBool = AtomicBool::new(false);
 
 /// The update's parent (`0`: none), whose sessions a candidate's adopted sessions
+/// were: set once at boot ([`set_predecessor`]), read by every registration
+/// ([`registration_tag`]).
 #[cfg_attr(not(unix), allow(dead_code))]
 static PREDECESSOR: AtomicU32 = AtomicU32::new(0);
 
@@ -44,6 +48,7 @@ pub(crate) fn set_predecessor(pid: u32) {
 pub(crate) const META_POLL: Duration = Duration::from_millis(250);
 
 /// How long the update worker waits for its PENDING to be written before it
+/// grants anyway (the holder scan is the keeper's independent gate, §5.4).
 #[cfg(unix)]
 const PENDING_WAIT: Duration = Duration::from_secs(1);
 
@@ -167,6 +172,8 @@ static KEEPER_STATE: Mutex<State> = Mutex::new(State {
 });
 
 /// Send `op` (session `session_id`'s, for a candidate's buffer) over `st`: behind every
+/// op still owed, else straight into the live link's queue, or OWED when the queue is
+/// full ([`State::owed`]).
 #[cfg(unix)]
 fn send_in(st: &mut State, session_id: Option<u64>, op: LinkOp) {
     match &st.phase {
@@ -198,6 +205,8 @@ fn send_in(st: &mut State, session_id: Option<u64>, op: LinkOp) {
 }
 
 /// Offer `link` every owed op again, oldest first, until its queue refuses one: `true`
+/// when none is owed any more (a link whose worker has gone writes nothing, so what it
+/// owed goes with it).
 #[cfg(unix)]
 fn flush_owed(link: &KeeperLink, owed: &mut VecDeque<(Option<u64>, LinkOp)>) -> bool {
     while let Some((session_id, op)) = owed.pop_front() {
@@ -225,6 +234,7 @@ fn keeper_state() -> std::sync::MutexGuard<'static, State> {
 }
 
 /// PENDING uses the waited room only after earlier lifecycle ops have entered
+/// the channel.
 #[cfg(unix)]
 fn live_link(state: &Mutex<State>) -> Result<Option<Arc<KeeperLink>>, ()> {
     let mut st = state
@@ -245,7 +255,7 @@ fn live_link_in(st: &mut State) -> Result<Option<Arc<KeeperLink>>, ()> {
     Ok(Some(link))
 }
 
-/// Final exit supersedes external lifecycle work. Already admitted channel
+/// Final exit supersedes external lifecycle work.
 #[cfg(unix)]
 fn quit_link_in(st: &mut State) -> Option<Arc<KeeperLink>> {
     let phase = std::mem::replace(&mut st.phase, Phase::Off);
@@ -346,6 +356,7 @@ impl Drop for Claim {
 }
 
 /// The RELEASEs undischarged [`Claim`]s sent, in order (a test's view of the
+/// obligation, whether or not a link carries them).
 #[cfg(test)]
 static UNCLAIMED_RELEASES: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
 
@@ -359,6 +370,7 @@ pub(crate) fn released_unclaimed(rdev: u64) -> bool {
 }
 
 /// Release offered master `rdev` that became no session: the keeper closes
+/// its copy, and with this window's already closed the shell is hung up.
 fn release_unclaimed(rdev: u64) {
     #[cfg(test)]
     UNCLAIMED_RELEASES
@@ -543,14 +555,19 @@ fn build() -> String {
 }
 
 /// Whether this window's HELLOs state `CAP_JOURNAL`: it registers a crash-restore region beside
+/// each master and reads the regions it is offered (the keeper's companions, `crash_restore`).
 #[cfg(unix)]
 const JOURNAL: bool = true;
 
 /// Whether the keeper this window booted with takes companions: set from the boot
+/// WELCOME's caps.
 #[cfg(unix)]
 static KEEPER_JOURNALS: AtomicBool = AtomicBool::new(true);
 
 /// Development seam `$ATERM_DEBUG_NO_CRASH_JOURNAL` (`aterm_types::dev_seam!`, debug builds
+/// only): a window that journals no session, whatever its keeper takes — every claim settled
+/// with COMPANION_RELEASE — so a live test's negative control sees the restore it makes
+/// without a region (the META rung).
 const NO_JOURNAL_SEAM: &str = "ATERM_DEBUG_NO_CRASH_JOURNAL";
 
 /// Why a session spawned now gets no crash-restore journal (`crash_restore`).
@@ -572,6 +589,9 @@ pub(crate) fn journal_refusal() -> Option<&'static str> {
 }
 
 /// This window's crash marker, as the keeper is told it at HELLO (§5.4): the
+/// keeper keeps it only if it finds the marker there with its lock held, and
+/// after this window's death reads its absence (the exit path unlinked it)
+/// together with `exit(0)` as a quit whose BYE was lost.
 #[cfg(unix)]
 fn marker() -> Option<MarkerRef> {
     use std::os::unix::ffi::OsStrExt as _;
@@ -588,6 +608,8 @@ pub(crate) fn is_update_candidate(overlap_admitted: bool, adopted_a_handoff: boo
 }
 
 /// Whether a launch takes part in its keeper: every windowed launch, and a
+/// headless one only of a build whose keeper is not the installed app's
+/// ([`boot`]'s App-class rule).
 #[cfg_attr(not(unix), allow(dead_code))]
 fn takes_part(headless: bool, installed_keeper: bool) -> bool {
     !(headless && installed_keeper)
@@ -870,6 +892,7 @@ pub(crate) fn valid_sid(s: &str) -> bool {
 }
 
 /// A process's start time in the keeper wire's shape, from the pty crate's
+/// microseconds.
 #[cfg(unix)]
 fn birth_of(micros: u64) -> Birth {
     Birth {
@@ -910,6 +933,7 @@ pub(crate) fn admit_recovered_master(
 }
 
 /// The crash-restore half of an offer: the region the keeper offered with the master,
+/// its poison brake, and the config a restore replays under.
 #[cfg(unix)]
 struct Journaled<'a> {
     companion: Option<aterm_keeper::client::OfferedCompanion>,
@@ -918,6 +942,7 @@ struct Journaled<'a> {
 }
 
 /// [`admit_recovered_journaled`] with no region: the META rung, as before the journal (the
+/// admission's tests).
 #[cfg(all(unix, test))]
 fn admit_recovered(
     master: crate::spawn::HandedMaster,
@@ -1137,6 +1162,8 @@ fn register_unix(session: &crate::Session, prior_claim: bool) -> bool {
 }
 
 /// [`register`] over `st` (the process's link state, or a test's): track session
+/// `session_id`, then send its REGISTER and, right behind it, the op that settles its claim
+/// (its first COMPANION, or COMPANION_RELEASE).
 #[cfg(unix)]
 fn register_in(
     st: &mut State,
@@ -1160,6 +1187,9 @@ pub(crate) fn release_companion(session_id: u64) {
 }
 
 /// [`release_companion`] over `st`: owed on a full queue, never dropped before a BYE
+/// ([`send_in`]),
+/// or the keeper would keep the region the journal stopped writing and restore it after
+/// a crash as if it were the session's last state.
 #[cfg(unix)]
 fn release_companion_in(st: &mut State, session_id: u64) {
     let Some(rdev) = st.tracked.get(&session_id).map(|t| t.rdev) else {
@@ -1542,6 +1572,7 @@ pub(crate) fn bye() {
 }
 
 /// Final quit intent supersedes unsent lifecycle work; the waited-room bound
+/// does not guarantee delivery.
 #[cfg(unix)]
 fn bye_over(state: &Mutex<State>, wait: Duration) {
     let link = quit_link_in(
@@ -1557,6 +1588,8 @@ fn bye_over(state: &Mutex<State>, wait: Duration) {
 }
 
 /// The META pump: one thread, started with the live link, that looks at every
+/// registered terminal every [`META_POLL`] and attempts its META when the
+/// fingerprint or the session's fabric moved.
 #[cfg(unix)]
 fn start_meta_pump() {
     {
@@ -1594,6 +1627,7 @@ pub(crate) fn meta_pass() -> usize {
 }
 
 /// [`meta_pass`] over `state`, building each META with `build` from the
+/// terminal's meta carry and the session's fabric.
 #[cfg(unix)]
 fn meta_pass_over<B>(state: &Mutex<State>, build: B) -> usize
 where
@@ -1739,6 +1773,8 @@ mod tests {
     }
 
     /// A headless launch of the installed app never joins the installed app's keeper; a
+    /// windowed launch does, and so does a dev or test build's headless instance, whose keeper
+    /// is its own.
     #[test]
     fn a_headless_launch_of_the_installed_app_takes_no_part() {
         assert!(!takes_part(true, true));
@@ -1748,6 +1784,7 @@ mod tests {
     }
 
     /// Off means off: with `[keeper] enabled = false` the boot does not dial, and a spawn's
+    /// registration, a close's release, the update's PENDING and the exit's BYE do nothing.
     #[test]
     fn with_the_keeper_off_nothing_registers() {
         let recovery = boot(false, false, false, None);
@@ -1768,6 +1805,7 @@ mod tests {
     }
 
     /// The fingerprint masks the per-frame modes: a TUI's DEC 2026 and `?25` toggles send no
+    /// META, while a real mode change does.
     #[cfg(unix)]
     #[test]
     fn the_fingerprint_ignores_the_per_frame_modes() {
@@ -1800,7 +1838,7 @@ mod tests {
         assert!(parse("[keeper]\nenabled = true\n").keeper_enabled());
     }
 
-    /// P3 REVIEW — A CANDIDATE IS AN ADMITTED PAIR, NOT THE VARIABLES. A
+    /// P3 REVIEW — A CANDIDATE IS AN ADMITTED PAIR, NOT THE VARIABLES.
     #[test]
     fn only_an_admitted_overlap_pair_or_an_adopted_handoff_arms_a_candidate() {
         assert!(
@@ -1813,6 +1851,8 @@ mod tests {
     }
 
     /// A real PTY whose shell leads it: `/bin/sh` parked in a `sleep`, and
+    /// its recorded birth once `record_adopted_shell` proves it leads the
+    /// terminal (it has run `setsid`).
     #[cfg(unix)]
     fn live_pty() -> (aterm_pty::SpawnedShell, u64) {
         // SAFETY: A test process; the trusted-launcher contract trivially holds.
@@ -1894,6 +1934,7 @@ mod tests {
     }
 
     /// The one admission: a master that is not a tty, a live shell's tty, and a shell gone or
+    /// whose pid names another process.
     #[cfg(unix)]
     #[test]
     fn the_admission_takes_a_live_shell_and_refuses_the_rest() {
@@ -2052,6 +2093,7 @@ mod tests {
     }
 
     /// The census's row of a recovery: none when nothing was offered; the refused offers
+    /// counted beside the admitted ones, a recovery that refused every offer included.
     #[cfg(unix)]
     #[test]
     fn a_recovery_s_row_counts_the_offers_it_refused() {
@@ -2067,6 +2109,7 @@ mod tests {
     }
 
     /// META round-trips through the keeper's bound onto the Repaint rung, the
+    /// modes intact and no nonce taken.
     #[cfg(unix)]
     #[test]
     fn a_meta_lands_on_the_repaint_rung_with_its_modes() {
@@ -2091,6 +2134,7 @@ mod tests {
     }
 
     /// The META carries no in-flight output state (`keeper_meta_of` says why), and
+    /// `recovered_checkpoint` takes none, nor a partial sequence, from a META that holds it.
     #[cfg(unix)]
     #[test]
     fn the_meta_carries_no_in_flight_output_state() {
@@ -2158,11 +2202,14 @@ mod tests {
     }
 
     /// A full-screen program's setup, as vim, less, htop and Claude Code send
+    /// it: the alternate screen, DECCKM and the keypad, SGR button mouse,
+    /// bracketed paste, a kitty keyboard push and a scroll region.
     #[cfg(unix)]
     const TUI_SETUP: &[u8] =
         b"\x1b[?1049h\x1b[?1h\x1b=\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[>1u\x1b[2;40r";
 
     /// The old-form META: the sanitized carry as the handoff's JSON, each cursor's stops a
+    /// bool per column.
     #[cfg(unix)]
     fn old_form_meta(t: &Terminal) -> Vec<u8> {
         let mut meta = t.carry_meta_abandoning_partial();
@@ -2173,6 +2220,7 @@ mod tests {
     }
 
     /// `meta` as a window that predates the packed stops reads it: the packed key unknown, so
+    /// each cursor's `tab_stops` is the empty list the packed form writes.
     #[cfg(unix)]
     fn as_an_older_window_reads(meta: &[u8]) -> Vec<u8> {
         let mut value: aterm_json::Value = aterm_json::from_slice(meta).expect("the META is JSON");
@@ -2209,6 +2257,8 @@ mod tests {
     }
 
     /// The META fits at any width (`PackedTabStops`): 200- and 400-column alt-screen sessions
+    /// with custom stops, and a pane once 400 columns wide now 100, each fit and round-trip
+    /// their stops, the one past the width included.
     #[cfg(unix)]
     #[test]
     fn a_wide_alt_screen_meta_fits_and_carries_its_tab_stops() {
@@ -2278,6 +2328,12 @@ mod tests {
     }
 
     /// A META IS BUILT FOR EVERY SESSION (R17-HANDOFF-1): with the stops
+    /// packed, a default session's META does not grow with the width; and the
+    /// worst a session can carry — 4,096 columns with a stop at every one, on
+    /// both screens, a long directory and title, a pushed colour table, marks,
+    /// full kitty stacks, both DECSC slots and counters at their widest — sheds
+    /// to the fixed scalars and still fits, its modes and regions intact and
+    /// its stops the every-8 defaults.
     #[cfg(unix)]
     #[test]
     fn a_meta_is_built_for_every_session() {
@@ -2456,6 +2512,10 @@ mod tests {
     }
 
     /// `meta` with every scalar a shed META keeps at its widest JSON, to bound its size: each
+    /// bool `false` (a byte wider than `true`); each number, and each absent optional one, the
+    /// widest its field takes back unchanged (`u64::MAX`, then `u32::MAX`, `u16::MAX`, `null`
+    /// and `u8::MAX`, tried in that order); each enum its longest name; and the widest
+    /// character sets in every slot.
     #[cfg(unix)]
     fn widest_scalars(
         mut meta: aterm_core::terminal::CheckpointMeta,
@@ -2541,6 +2601,7 @@ mod tests {
     }
 
     /// Version skew, forward: an old-form META (a bool per column for the stops) still
+    /// restores its stops, cursor and modes.
     #[cfg(unix)]
     #[test]
     fn a_meta_an_older_window_sent_still_restores() {
@@ -2563,6 +2624,9 @@ mod tests {
     }
 
     /// Version skew, backward (a rollback, or an older build launched after a newer one
+    /// crashed): a META the old form holds is sent in it byte for byte, and a packed one read
+    /// by an older window keeps every mode and loses only the region, margins and custom stops
+    /// (`PackedTabStops`).
     #[cfg(unix)]
     #[test]
     fn an_older_window_reads_a_new_meta_with_its_modes() {
@@ -2598,7 +2662,7 @@ mod tests {
         );
     }
 
-    /// THE BAND (R17-HANDOFF-1's review, ruled 2026-10-11). Where the whole
+    /// THE BAND (R17-HANDOFF-1's review, ruled 2026-10-11).
     #[cfg(unix)]
     #[test]
     fn where_only_a_shed_old_form_fit_the_meta_goes_packed_and_whole() {
@@ -2663,6 +2727,7 @@ mod tests {
     }
 
     /// A META not sent (not built, no link, a full queue) is retried on the next pass: the
+    /// pump records only the fingerprints it sent.
     #[cfg(unix)]
     #[test]
     fn a_meta_that_was_not_sent_is_retried() {
@@ -2766,7 +2831,7 @@ mod tests {
         }
     }
 
-    /// A FULL QUEUE NEVER DROPS A REPLACED REGION'S CUSTODY (R6). The memory shed hands the
+    /// A FULL QUEUE NEVER DROPS A REPLACED REGION'S CUSTODY (R6).
     #[cfg(unix)]
     #[test]
     fn a_full_queue_hands_a_replaced_regions_custody_back_for_another_offer() {
@@ -2851,6 +2916,7 @@ mod tests {
     }
 
     /// Descriptors of files of their own, each told from another by its inode (every open
+    /// of `/dev/null` shares one), for the owed-op tests: a master, a region.
     #[cfg(unix)]
     struct Files {
         dir: aterm_tempfile::TempDir,
@@ -2886,6 +2952,7 @@ mod tests {
     }
 
     /// What the keeper read, in order, but for [`TestLink::fill`]'s ops: each op's kind, its
+    /// rdev (a PENDING's pid) and the inode of the descriptor it carries (0 for none).
     #[cfg(unix)]
     fn seen(ops: Vec<LinkOp>) -> Vec<(&'static str, u64, u64)> {
         ops.into_iter()
@@ -3061,6 +3128,7 @@ mod tests {
     }
 
     /// A SESSION'S FIRST COMPANION A FULL QUEUE COULD NOT TAKE IS OWED, AND A LATER TICK
+    /// DELIVERS IT (R9 (a)).
     #[cfg(unix)]
     #[test]
     fn a_first_companion_a_full_queue_refused_is_owed_and_a_later_tick_delivers_it() {
@@ -3136,6 +3204,7 @@ mod tests {
     }
 
     /// A COMPANION_RELEASE A FULL QUEUE COULD NOT TAKE IS OWED, AND A LATER TICK DELIVERS IT
+    /// (R9 (a)).
     #[cfg(unix)]
     #[test]
     fn a_companion_release_a_full_queue_refused_is_owed_and_a_later_tick_delivers_it() {
@@ -3181,6 +3250,7 @@ mod tests {
     }
 
     /// PENDING refuses while older lifecycle work is external, even when waited
+    /// room is available.
     #[cfg(unix)]
     #[test]
     fn a_pending_waits_for_older_lifecycle_ops_and_a_bye_ends_them() {

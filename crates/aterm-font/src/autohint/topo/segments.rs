@@ -8,12 +8,6 @@
 // See ../../../LICENSE-FONTATIONS for the upstream license.
 
 //! Segment computation and linking.
-//!
-//! A segment is a series of at least two consecutive points that are
-//! appropriately aligned along a coordinate axis.
-//!
-//! The linking stage associates pairs of segments to form stems and
-//! identifies serifs with a post-process pass.
 
 use super::super::glyf::PointFlags;
 use super::super::{
@@ -24,14 +18,10 @@ use super::super::{
     topo::{Axis, Dimension, Segment, TopoFlags},
 };
 
-// Bounds for score, position and coordinate values.
-// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L1598>
 const MAX_SCORE: i32 = 32000;
 const MIN_SCORE: i32 = -32000;
 
 /// Computes segments for the Latin writing system.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L1537>
 pub(crate) fn compute_segments(
     outline: &mut Outline,
     axis: &mut Axis,
@@ -42,19 +32,10 @@ pub(crate) fn compute_segments(
         return false;
     }
     adjust_segment_heights(outline, axis);
-    // This is never actually executed due to a bug in FreeType
-    // See point 2 at <https://github.com/googlefonts/fontations/issues/1129>
-    // if group != ScriptGroup::Default {
-    //     _detect_round_segments_cjk(outline, axis);
-    // }
     true
 }
 
 /// Link segments to form stems and serifs.
-///
-/// If `max_width` is provided, use it to refine the scoring function.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L1990>
 pub(crate) fn link_segments(
     outline: &Outline,
     axis: &mut Axis,
@@ -70,20 +51,11 @@ pub(crate) fn link_segments(
 }
 
 /// Link segments to form stems and serifs.
-///
-/// If `max_width` is provided, use it to refine the scoring function.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L1990>
 fn link_segments_default(outline: &Outline, axis: &mut Axis, max_width: Option<i32>) {
     let max_width = max_width.unwrap_or_default();
-    // Heuristic value to set up a minimum for overlapping
     let len_threshold = derived_constant(outline.units_per_em, 8).max(1);
-    // Heuristic value to weight lengths
     let len_score = derived_constant(outline.units_per_em, 6000);
-    // Heuristic value to weight distances (not a latin constant since
-    // it works on multiples of stem width)
     let dist_score = 3000;
-    // Compare each segment to the others.. O(n^2)
     let segments = axis.segments.as_mut_slice();
     for ix1 in 0..segments.len() {
         let seg1 = segments[ix1];
@@ -91,37 +63,17 @@ fn link_segments_default(outline: &Outline, axis: &mut Axis, max_width: Option<i
             continue;
         }
         let pos1 = seg1.pos as i32;
-        // Search for stems having opposite directions with seg1 to the
-        // "left" of seg2
         for ix2 in 0..segments.len() {
             let seg1 = segments[ix1];
             let seg2 = segments[ix2];
             let pos2 = seg2.pos as i32;
             if seg1.dir.is_opposite(seg2.dir) && pos2 > pos1 {
-                // Compute distance between the segments
-                // Note: the min/max functions chosen here are intentional
                 let min = seg1.min_coord.max(seg2.min_coord) as i32;
                 let max = seg1.max_coord.min(seg2.max_coord) as i32;
-                // Compute maximum coordinate difference or how much they
-                // overlap
                 let len = max - min;
                 if len >= len_threshold {
-                    // verbatim from FreeType:
-                    // "The score is the sum of two demerits indicating the
-                    //  `badness' of a fit, measured along the segments' main axis
-                    //  and orthogonal to it, respectively.
-                    //
-                    // - The less overlapping along the main axis, the worse it
-                    //   is, causing a larger demerit.
-                    //
-                    // - The nearer the orthogonal distance to a stem width, the
-                    //   better it is, causing a smaller demerit.  For simplicity,
-                    //   however, we only increase the demerit for values that
-                    //   exceed the largest stem width."
-                    // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L2054>
                     let dist = pos2 - pos1;
                     let dist_demerit = if max_width != 0 {
-                        // Distance demerits are based on multiples of max_width
                         let delta = (dist << 10) / max_width - (1 << 10);
                         if delta > 10_000 {
                             MAX_SCORE
@@ -148,8 +100,6 @@ fn link_segments_default(outline: &Outline, axis: &mut Axis, max_width: Option<i
             }
         }
     }
-    // Now compute "serif" segments
-    // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L2109>
     for ix1 in 0..segments.len() {
         let Some(ix2) = segments[ix1].link_ix else {
             continue;
@@ -164,13 +114,9 @@ fn link_segments_default(outline: &Outline, axis: &mut Axis, max_width: Option<i
 }
 
 /// Link segments to form stems and serifs for the CJK script group.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afcjk.c#L848>
 fn link_segments_cjk(outline: &Outline, axis: &mut Axis, scale: i32) {
-    // Heuristic value to set up a minimum for overlapping
     let len_threshold = derived_constant(outline.units_per_em, 8);
     let dist_threshold = fixed_div(64 * 3, scale);
-    // Compare each segment to the others.. O(n^2)
     let segments = axis.segments.as_mut_slice();
     for ix1 in 0..segments.len() {
         let seg1 = segments[ix1];
@@ -178,8 +124,6 @@ fn link_segments_cjk(outline: &Outline, axis: &mut Axis, scale: i32) {
             continue;
         }
         let pos1 = seg1.pos as i32;
-        // Search for stems having opposite directions with seg1 to the
-        // "left" of seg2
         for ix2 in 0..segments.len() {
             let seg1 = segments[ix1];
             let seg2 = segments[ix2];
@@ -191,16 +135,11 @@ fn link_segments_cjk(outline: &Outline, axis: &mut Axis, scale: i32) {
             if dist < 0 {
                 continue;
             }
-            // Compute distance between the segments
-            // Note: the min/max functions chosen here are intentional
             let min = seg1.min_coord.max(seg2.min_coord) as i32;
             let max = seg1.max_coord.min(seg2.max_coord) as i32;
-            // Compute maximum coordinate difference or how much they
-            // overlap
             let len = max - min;
             if len >= len_threshold {
                 let check_seg = |seg: &Segment| {
-                    // Some more magic heuristics...
                     // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afcjk.c#L896>
                     (dist * 8 < seg.score * 9) && (dist * 8 < seg.score * 7 || seg.len < len)
                 };
@@ -219,8 +158,6 @@ fn link_segments_cjk(outline: &Outline, axis: &mut Axis, scale: i32) {
             }
         }
     }
-    // Now compute "serif" segments
-    // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afcjk.c#L917>
     for ix1 in 0..segments.len() {
         let seg1 = segments[ix1];
         if seg1.score >= dist_threshold {
@@ -229,7 +166,6 @@ fn link_segments_cjk(outline: &Outline, axis: &mut Axis, scale: i32) {
         let Some(link1) = seg1.link(segments).copied() else {
             continue;
         };
-        // Unwrap is fine because we checked for existence above
         let link1_ix = seg1.link_ix.unwrap() as usize;
         if link1.link_ix != Some(ix1 as u16) || link1.pos <= seg1.pos {
             continue;
@@ -252,7 +188,6 @@ fn link_segments_cjk(outline: &Outline, axis: &mut Axis, scale: i32) {
                 continue;
             }
             if seg1.len >= seg2.len * 3 {
-                // Again, we definitely have a valid link2
                 let link2_ix = seg2.link_ix.unwrap() as usize;
                 for seg in segments.iter_mut() {
                     let link_ix = seg.link_ix;
@@ -285,10 +220,7 @@ fn link_segments_cjk(outline: &Outline, axis: &mut Axis, scale: i32) {
     }
 }
 
-/// Set the (u, v) values to font unit coords for each point depending
-/// on the axis dimension.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L1562>
+/// Set the (u, v) values to font unit coords for each point depending on the axis dimension.
 fn assign_point_uvs(outline: &mut Outline, dim: Dimension) {
     if dim == Dimension::Horizontal {
         for point in &mut outline.points {
@@ -304,8 +236,6 @@ fn assign_point_uvs(outline: &mut Outline, dim: Dimension) {
 }
 
 /// Build the set of segments for each contour.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L1588>
 fn build_segments(outline: &mut Outline, axis: &mut Axis) -> bool {
     let flat_threshold = outline.units_per_em / 14;
     axis.segments.clear();
@@ -320,8 +250,6 @@ fn build_segments(outline: &mut Outline, axis: &mut Axis) -> bool {
         let mut prev_state = state;
         let mut prev_segment_ix: Option<usize> = None;
         let mut segment_ix = 0;
-        // Check if we're starting on an edge and if so, find
-        // the starting point
         if points[point_ix].out_dir.is_same_axis(major_dir)
             && points[last_ix].out_dir.is_same_axis(major_dir)
         {
@@ -342,11 +270,9 @@ fn build_segments(outline: &mut Outline, axis: &mut Axis) -> bool {
         let mut passed = false;
         loop {
             if on_edge {
-                // Get min and max position
                 let point = points[point_ix];
                 state.min_pos = state.min_pos.min(point.u);
                 state.max_pos = state.max_pos.max(point.u);
-                // Get min and max coordinate and flags
                 let v = point.v;
                 if v < state.min_coord {
                     state.min_coord = v;
@@ -356,7 +282,6 @@ fn build_segments(outline: &mut Outline, axis: &mut Axis) -> bool {
                     state.max_coord = v;
                     state.max_flags = point.flags;
                 }
-                // Get min and max coord of on curve points
                 if point.is_on_curve() {
                     state.min_on_coord = state.min_on_coord.min(point.v);
                     state.max_on_coord = state.max_on_coord.max(point.v);
@@ -366,11 +291,8 @@ fn build_segments(outline: &mut Outline, axis: &mut Axis) -> bool {
                         axis.segments[segment_ix].first_ix != axis.segments[*idx].last_ix
                     });
                     if let Some(prev_segment_ix) = prev_segment_ix {
-                        // The points are the same, so merge the segments
                         let prev_segment = &mut axis.segments[prev_segment_ix];
                         if prev_segment.last_point(points).in_dir == point.in_dir {
-                            // We have identical directions; unify segments
-                            // and update constraints
                             state.min_pos = prev_state.min_pos.min(state.min_pos);
                             state.max_pos = prev_state.max_pos.max(state.max_pos);
                             if prev_state.min_coord < state.min_coord {
@@ -386,12 +308,10 @@ fn build_segments(outline: &mut Outline, axis: &mut Axis) -> bool {
                             prev_segment.last_ix = point_ix as u16;
                             state.apply_to_segment(prev_segment, flat_threshold);
                         } else {
-                            // We have different directions; use the
                             // properties of the longer segment
                             if (prev_state.max_coord - prev_state.min_coord).abs()
                                 > (state.max_coord - state.min_coord).abs()
                             {
-                                // Discard current segment
                                 prev_state.min_pos = prev_state.min_pos.min(state.min_pos);
                                 prev_state.max_pos = prev_state.max_pos.max(state.max_pos);
                                 prev_segment.last_ix = point_ix as u16;
@@ -400,7 +320,6 @@ fn build_segments(outline: &mut Outline, axis: &mut Axis) -> bool {
                                 prev_segment.delta =
                                     compute_mid_delta(prev_state.min_pos, prev_state.max_pos);
                             } else {
-                                // Discard previous segment
                                 state.min_pos = state.min_pos.min(prev_state.min_pos);
                                 state.max_pos = state.max_pos.max(prev_state.max_pos);
                                 let mut segment = axis.segments[segment_ix];
@@ -412,8 +331,6 @@ fn build_segments(outline: &mut Outline, axis: &mut Axis) -> bool {
                         }
                         axis.segments.pop();
                     } else {
-                        // The points are different signifying that we are
-                        // leaving an edge, so create a new segment
                         let segment = &mut axis.segments[segment_ix];
                         segment.last_ix = point_ix as u16;
                         state.apply_to_segment(segment, flat_threshold);
@@ -476,10 +393,7 @@ fn build_segments(outline: &mut Outline, axis: &mut Axis) -> bool {
     true
 }
 
-/// Slightly increase the height of segments when it makes sense to better
-/// detect and ignore serifs.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L1933>
+/// Slightly increase the height of segments when it makes sense to better detect and ignore serifs.
 fn adjust_segment_heights(outline: &mut Outline, axis: &mut Axis) {
     let points = outline.points.as_slice();
     for segment in &mut axis.segments {
@@ -505,14 +419,9 @@ fn adjust_segment_heights(outline: &mut Outline, axis: &mut Axis) {
     }
 }
 
-/// Performs the additional step of detecting round segments for the CJK script
-/// group.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afcjk.c#L818>
+/// Performs the additional step of detecting round segments for the CJK script group.
 fn _detect_round_segments_cjk(outline: &mut Outline, axis: &mut Axis) {
     let points = outline.points.as_slice();
-    // A segment is considered round if it doesn't have successive on-curve
-    // points
     for segment in &mut axis.segments {
         segment.flags &= !TopoFlags::ROUND;
         let mut point_ix = segment.first();
@@ -530,8 +439,6 @@ fn _detect_round_segments_cjk(outline: &mut Outline, axis: &mut Axis) {
             is_prev_on_curve = is_on_curve;
             point_ix = point.next();
             if point_ix == last_ix {
-                // We've reached the last point without two successive
-                // on-curves so we're round
                 segment.flags |= TopoFlags::ROUND;
                 break;
             }
@@ -540,9 +447,6 @@ fn _detect_round_segments_cjk(outline: &mut Outline, axis: &mut Axis) {
 }
 
 /// Capture current and previous state while computing segments.
-///
-/// Values measured along a segment (point.v) are called "coordinates" and
-/// values orthogonal to it (point.u) are called "positions"
 #[derive(Copy, Clone)]
 struct State {
     min_pos: i32,
@@ -557,7 +461,6 @@ struct State {
 
 impl Default for State {
     fn default() -> Self {
-        // <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L1598>
         Self {
             min_pos: MAX_SCORE,
             max_pos: MIN_SCORE,
@@ -575,9 +478,6 @@ impl State {
     fn apply_to_segment(&self, segment: &mut Segment, flat_threshold: i32) {
         segment.pos = compute_mid_pos(self.min_pos, self.max_pos);
         segment.delta = compute_mid_delta(self.min_pos, self.max_pos);
-        // A segment is round if either end point is a
-        // control and the length of the on points in
-        // between fits within a heuristic limit.
         if (!self.min_flags.is_on_curve() || !self.max_flags.is_on_curve())
             && (self.max_on_coord.wrapping_sub(self.min_on_coord)) < flat_threshold
         {

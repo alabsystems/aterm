@@ -115,6 +115,7 @@ pub fn parse_read_args(rest: &str) -> Result<ReadQuery, &'static str> {
 }
 
 /// The `appstatus` progress field for a fill: `<n>/100` rounded to the
+/// nearest percent, `-` for none.
 fn progress_word(fill: Option<u16>) -> String {
     fill.map_or_else(
         || "-".to_string(),
@@ -124,7 +125,7 @@ fn progress_word(fill: Option<u16>) -> String {
 
 /// The `state=` word of a record.
 #[must_use]
-pub fn state_word(rec: &LogRecord, live: Option<&Live>) -> &'static str {
+pub const fn state_word(rec: &LogRecord, live: Option<&Live>) -> &'static str {
     match (live, rec.retired()) {
         (Some(l), _) => {
             if l.msg.hold.is_held() {
@@ -344,11 +345,15 @@ pub(crate) const OWN_TAG_REFUSAL: &str =
 pub(crate) const ACT_IS_THE_HOSTS: &str = "ERR notice: act is pressed by the host";
 
 /// Whether `notice` refuses `tag`: every family aterm reports under
+/// ([`tags::ALL`]) but `script`, the scripts' own.
 fn aterms_own(tag: &Tag) -> bool {
     *tag != tags::SCRIPT && tags::ALL.contains(&tag)
 }
 
 /// The refusal for a glass title fault: `notice: <fault>`, one static string
+/// per fault [`glass_title_fault`] names, in the script author's words: what
+/// is wrong with the title and where the rest goes (` -- `), never the band's
+/// internal name.
 fn title_refusal(fault: &'static str, tail: bool) -> &'static str {
     match (fault, tail) {
         ("a glass title over six words", true) => {
@@ -368,7 +373,7 @@ fn title_refusal(fault: &'static str, tail: bool) -> &'static str {
     }
 }
 
-/// `Err(refusal)` when `title` may not stand on the glass. `tail`: the verb
+/// `Err(refusal)` when `title` may not stand on the glass.
 fn title_form(title: &str, tail: bool) -> Result<(), &'static str> {
     glass_title_fault(title).map_or(Ok(()), |f| Err(title_refusal(f, tail)))
 }
@@ -415,6 +420,9 @@ fn wire_id(s: &str) -> Option<MessageId> {
 }
 
 /// `<title>[ -- <tail>]`, both trimmed; a line that opens with `--` has no
+/// title, and one that ends with its separator has no tail: `Deploy failed -- `
+/// (a script's `"$TITLE -- $DETAIL"` with nothing in `$DETAIL`) is the title
+/// `Deploy failed`.
 fn split_title(rest: &str) -> (&str, &str) {
     let rest = rest.trim_start();
     if rest.trim_end() == "--" {
@@ -431,11 +439,14 @@ fn split_title(rest: &str) -> (&str, &str) {
 }
 
 /// A wire title, detail line, stats or `done`'s words: stripped, then trimmed,
+/// then capped.
 fn clip_words(s: &str, cap: usize) -> String {
     clip(clip(s, usize::MAX).trim(), cap)
 }
 
 /// Options come in any order after the fixed words until the first word
+/// that is none of them: `take` names the options it knows (`Ok(true)`),
+/// refuses a bad one (`Err`), or ends the run (`Ok(false)`).
 fn options(
     mut rest: &str,
     mut take: impl FnMut(&str) -> Result<bool, &'static str>,
@@ -752,7 +763,7 @@ pub enum DoneHow {
 impl DoneHow {
     /// The retirement it records ([`Retired::as_word`] is the reply's word).
     #[must_use]
-    pub fn retired(self) -> Retired {
+    pub const fn retired(self) -> Retired {
         match self {
             Self::Ok => Retired::Resolved(Outcome::Ok),
             Self::Warn => Retired::Resolved(Outcome::Warn),
@@ -962,6 +973,7 @@ impl LaterRequest {
     }
 
     /// The ask: the owner only, the step (on the link's button when there is one), the
+    /// key kept whole, a week's quiet after a dismissal.
     fn ask(&self) -> LaterAsk {
         let then = match self.url.as_deref().and_then(Mover::open_link) {
             Some(mover) => Then::press(mover, &self.step),
@@ -993,6 +1005,7 @@ impl LaterRequest {
 }
 
 /// The refusal for an ask the door would not stand (`need::Ask::fault`), in the
+/// script author's words; `usage` for a fault the parse already answered.
 fn ask_refusal(fault: &'static str, usage: &'static str) -> &'static str {
     match fault {
         "a reason that only says something is pending" => {
@@ -1125,7 +1138,7 @@ pub struct Applied {
 }
 
 impl Applied {
-    fn quiet(reply: String) -> Self {
+    const fn quiet(reply: String) -> Self {
         Self {
             reply,
             paint: Paint::None,
@@ -1138,6 +1151,7 @@ impl Applied {
 #[derive(Clone, Debug, Default)]
 pub struct WireGate {
     /// The mints inside the trailing window, oldest first: when, and the
+    /// title and detail bytes each carried ([`WIRE_BYTES_PER_WINDOW`]).
     mints: VecDeque<(Instant, usize)>,
     /// The `notice act` presses inside the trailing window, oldest first.
     presses: VecDeque<Instant>,
@@ -1150,7 +1164,7 @@ pub struct WireGate {
 impl WireGate {
     /// The armed paced paint — folded into the host's messages deadline.
     #[must_use]
-    pub fn due(&self) -> Option<Instant> {
+    pub const fn due(&self) -> Option<Instant> {
         self.paint_due
     }
 
@@ -1166,6 +1180,7 @@ impl WireGate {
     }
 
     /// Spend one mint carrying `bytes` of title and detail, or say which
+    /// budget is spent and how long until the mint fits.
     fn try_mint(&mut self, now: Instant, bytes: usize) -> Result<(), Busy> {
         while let Some(&(t, _)) = self.mints.front() {
             if later(t, WIRE_MINT_WINDOW) <= now {
@@ -1220,6 +1235,7 @@ impl WireGate {
     }
 
     /// A glass change: paint now if the last wire paint is a frame old, else
+    /// arm the one paced paint at the next frame.
     fn pace(&mut self, center: &MessageCenter, now: Instant) -> Paint {
         match self.last_paint {
             Some(last) if now < later(last, WIRE_PAINT_GAP) => {
@@ -1235,7 +1251,8 @@ impl WireGate {
     }
 
     /// A paint happened in the frame starting at `frame`: it covers any
-    fn painted(&mut self, frame: Instant) {
+    /// paced one.
+    const fn painted(&mut self, frame: Instant) {
         self.last_paint = Some(frame);
         self.paint_due = None;
     }
@@ -1247,6 +1264,8 @@ fn later(t: Instant, d: Duration) -> Instant {
 }
 
 /// A row the wire owns: minted by it, or keyed in its namespace (a carried
+/// keyed wire row's origin is `Carried`, its key still the wire's; a carried
+/// keyless one keeps `Wire`).
 fn is_wire(row: &Live) -> bool {
     row.msg.origin == Origin::Wire
         || row
@@ -1280,6 +1299,7 @@ enum Busy {
 
 impl Busy {
     /// The whole `ERR busy notice: … retry_ms=<ms>` line (the transient
+    /// class drivers back off on; `retry_ms` rounds up).
     fn reply(self) -> String {
         let (what, retry) = match self {
             Self::Mints(d) => (format!("{WIRE_MINTS_PER_WINDOW} new messages a minute"), d),
@@ -1299,6 +1319,7 @@ fn busy_refusal(busy: Busy) -> Applied {
 }
 
 /// The bytes a mint carries against [`WIRE_BYTES_PER_WINDOW`]: its title
+/// and its detail lines, what `messages.log` writes twice.
 fn words_bytes(msg: &Message) -> usize {
     msg.title.len() + msg.detail.iter().map(String::len).sum::<usize>()
 }
@@ -1372,6 +1393,8 @@ fn apply_post(
 }
 
 /// Post a row from the wire (a `post` at warn or error, an `ask`): the
+/// duplicate, the live-row cap and the mint budget, then the post and its
+/// paint.
 fn post_row(
     center: &mut MessageCenter,
     gate: &mut WireGate,
@@ -1422,6 +1445,8 @@ fn digest_full_refusal() -> Applied {
 }
 
 /// File a `notice later` entry: the wire's cap on open entries and the digest's room
+/// for one more, then the mint budget, for a post that opens an entry or changes one's
+/// words (a repeat and a dismissed key's quiet spend nothing), then the post.
 fn apply_later(
     center: &mut MessageCenter,
     gate: &mut WireGate,
@@ -1698,6 +1723,7 @@ mod tests {
     }
 
     /// `appstatus` reads a meter's fill only: a busy row is `progress=-`, like
+    /// any row with no fraction.
     #[test]
     fn activity_rows_compat_ignores_busy_and_lists_the_harness() {
         let now = t0();
@@ -1735,6 +1761,9 @@ mod tests {
     }
 
     /// A live toolchain meter at 50 % and a retired Warn update row render the
+    /// exact strings the status bars did, and toolchain live rows precede
+    /// update ones whatever the glass order (the update row is posted first and
+    /// sits above).
     #[test]
     fn activity_rows_compat_is_byte_identical() {
         let now = t0();
@@ -1851,6 +1880,9 @@ mod tests {
     }
 
     /// `since_ms` never runs ahead of `ago_ms`: both are read off the reply's
+    /// one wall `now`, so a record retired 300 ms into its life reads
+    /// `since_ms = ago_ms − 300` at every read, and a wall clock that moved
+    /// less than the monotonic one clamps to `since_ms <= ago_ms`.
     #[test]
     fn since_ms_never_runs_ahead_of_ago_ms() {
         let now = t0();
@@ -1880,6 +1912,9 @@ mod tests {
     }
 
     /// A carried row's `since_ms` counts from its retirement in this process,
+    /// never from the parent's ingress: a download row stamped 60 s before the
+    /// handoff and superseded 1 s after the seed reads `since_ms` = the read
+    /// delay, and its logged retirement is the seed's wall plus 1 s.
     #[test]
     fn a_carried_rows_since_ms_counts_from_its_retirement_here() {
         let now = t0();
@@ -1980,7 +2015,7 @@ mod tests {
         }
     }
 
-    /// Paging with the last id seen never skips a record. 100 records:
+    /// Paging with the last id seen never skips a record.
     #[test]
     fn paging_since_the_last_id_loses_nothing() {
         let now = t0();
@@ -2091,6 +2126,7 @@ mod tests {
     }
 
     /// A wire post under `tag`, which `notice` itself may refuse: what an
+    /// older build's post, carried or logged, puts in front of the center.
     fn wire_row(
         c: &mut MessageCenter,
         g: &mut WireGate,
@@ -2115,12 +2151,15 @@ mod tests {
     }
 
     /// Reveal every row past its grace and commit the band: what the host's
+    /// settle and grid pass do.
     fn onto_glass(c: &mut MessageCenter, now: Instant) {
         c.settle(now, true);
         c.commit_rows(now, 3);
     }
 
     /// A script posts under `script` or a tag of its own, never under a family
+    /// aterm reports under: the page could not tell its `crash` row from
+    /// aterm's own.
     #[test]
     fn a_script_may_not_post_under_any_of_aterms_families() {
         for own in tags::ALL.iter().filter(|t| ***t != tags::SCRIPT) {
@@ -2390,6 +2429,8 @@ mod tests {
     }
 
     /// The owner's attention rule, for every message the wire can raise: a
+    /// record for news, a row only for a failure or for work with its
+    /// indicator, a glass title in form, and never a capsule.
     #[test]
     fn every_wire_row_earns_its_place_on_the_glass() {
         let now = t0();
@@ -2486,6 +2527,8 @@ mod tests {
     }
 
     /// Sanitising: control and invisible format characters never reach a
+    /// title, a detail line, stats or a label; a title empty after the strip
+    /// is a usage error.
     #[test]
     fn the_wire_strips_what_could_forge_a_row() {
         let Ok(NoticeRequest::Post(p)) = NoticeRequest::parse(
@@ -2527,6 +2570,7 @@ mod tests {
     }
 
     /// A whitespace control is a space before the strip: `Tab\there` is
+    /// never stored as `Tabhere`.
     #[test]
     fn a_tab_on_the_wire_is_a_space() {
         let Ok(NoticeRequest::Post(p)) = NoticeRequest::parse(
@@ -3255,6 +3299,8 @@ mod tests {
     }
 
     /// A loop of `act <id> details` on a row that stays live gets the budget's
+    /// presses and then `ERR busy`, never a repaint, a window and a log line
+    /// per line.
     #[test]
     fn notice_act_presses_are_budgeted() {
         let now = t0();
@@ -3293,6 +3339,7 @@ mod tests {
     }
 
     /// A wire post never folds into a host row, and a host post never into a
+    /// wire row, whatever their words: the wire never restates a host row.
     #[test]
     fn wire_and_host_rows_never_merge_as_duplicates() {
         let now = t0();
@@ -3346,6 +3393,7 @@ mod tests {
     }
 
     /// The mints' title and detail bytes are budgeted, so full-detail records
+    /// cannot rotate `messages.log` over aterm's own lines in minutes.
     #[test]
     fn the_wire_budgets_the_bytes_it_writes() {
         let now = t0();

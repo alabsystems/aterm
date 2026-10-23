@@ -1,31 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A sink's input writer blocked inside ConPTY's `WriteFile`, released, on a
-//! real ConPTY: `Stop paste` ([`BulkMeter::request_stop`])
-//! and a tab's close ([`SinkWriter::sever_input`]) reach the blocked call
-//! (`CancelSynchronousIo`, `aterm_pty::input_release`), a write that begins
-//! after either writes nothing, the close a stopped paste still owes waits for
-//! the program to read, or for the tab to close, and a released write reports
-//! exactly what the program got.
-//!
-//! The console host stops reading input when its output is not read: the
-//! program here writes without end, nothing reads the session's output until
-//! a test says so, and once the output pipe is full the host's next write of
-//! output waits, holding the console. Its input thread then takes one more
-//! read of input (4 KiB) and waits for the console too, so the input pipe
-//! fills and the next write blocks in `WriteFile`: the writer's thread has
-//! I/O pending (`GetThreadIOPendingFlag`), and the session's count of input
-//! writes says which write it is. When the test reads the output, the program
-//! stops writing at the first key it sees and reports every key it read, by
-//! character, after a `Q`. The host takes the paste markers (`ESC [ 200 ~`,
-//! `ESC [ 201 ~`) itself; the program sees the text between them.
-//!
-//! Each test runs under each console host this machine can start
-//! ([`under_each_host`]): the Windows console host every embedder starts with,
-//! and OpenConsole, the window's default; the one whose program is Git Bash
-//! runs under the Windows console host, the host that gets its emoji as
-//! records. The host choice is process-global, so the tests take turns.
+//! ConPTY `WriteFile` cancellation tests for paste stops and tab closes.
 
 #![cfg(windows)]
 
@@ -76,13 +52,11 @@ mod k32 {
     }
 }
 
-/// Whether `thread` has I/O pending: a `WriteFile` it is blocked in. A write
-/// the pipe has room for completes in the call and never shows here.
+/// Whether `thread` has I/O pending: a `WriteFile` it is blocked in.
 fn io_pending<T>(thread: &JoinHandle<T>) -> bool {
     use std::os::windows::io::AsRawHandle;
     let mut pending = 0;
-    // SAFETY: the join handle's thread handle is open while `thread` lives,
-    // and `pending` is a valid out-param.
+    // SAFETY: the join handle's thread handle is open while `thread` lives.
     let ok = unsafe { k32::GetThreadIOPendingFlag(thread.as_raw_handle() as isize, &mut pending) };
     ok != 0 && pending != 0
 }
@@ -149,11 +123,7 @@ impl Tab {
         )
     }
 
-    /// `argv`, a counting program, held as [`Self::held`] holds it. With
-    /// `handshake`, its first output is read as a tab's reader reads it, up to
-    /// the console host's request for win32-input-mode records (which the
-    /// session's guard watches the output for), on this thread, so no read of
-    /// the output is left pending.
+    /// `argv`, a counting program, held as [`Self::held`] holds it.
     fn held_running(host: ConsoleHostKind, argv: &[&str], handshake: bool) -> Self {
         // SAFETY: a test process; the trusted-launcher contract trivially holds.
         let authority = unsafe { aterm_cap::Authority::root_authority() };
@@ -189,7 +159,6 @@ impl Tab {
                 seen.windows(8).any(|w| w == b"\x1b[?9001h")
             });
         }
-        // Nothing reads the output yet, so the peek waits behind no read.
         eventually("the program's output fills the pipe", || {
             aterm_pty::output_waiting_for_test(master).is_some_and(|n| n >= 64 * 1024)
         });
@@ -246,7 +215,6 @@ impl Tab {
                     return tail.to_string();
                 }
             }
-            // The flood is noise: keep what a marker can still be in.
             if self.seen.len() > 1 << 20 {
                 let cut = self.seen.len() - (64 << 10);
                 self.seen.drain(..cut);
@@ -348,8 +316,7 @@ fn paste_on_a_thread(
 /// paste's writer, blocked in ConPTY's `WriteFile`, is released; nothing more
 /// of the paste is written; what the stop owes (the rest of the `€` it cut,
 /// then `ESC [ 201 ~`) is the one write that follows, and it blocks as the
-/// next key would, until the program reads, then lands. The program reads
-/// every `€` sent before the stop, whole, and nothing after it.
+/// next key would, until the program reads, then lands.
 #[test]
 fn stop_paste_releases_a_paste_blocked_in_writefile_and_its_close_waits_for_the_program() {
     under_each_host(stop_paste_releases_a_blocked_paste);
@@ -390,21 +357,13 @@ fn stop_paste_releases_a_blocked_paste(host: ConsoleHostKind) {
 /// console host, where each goes as 72 bytes of records, so a 4 KiB slice of
 /// the paste is a wire larger than the pipe: every write ends between
 /// characters, no larger than the pipe, and the one the stop releases took
-/// none of them. The paste ends `Stopped`, not failed, owing only
-/// `ESC [ 201 ~`, and the program reads exactly the characters its receipt
-/// counts. The reader is the counting PowerShell bash runs (`exec`, which
-/// keeps bash's process as its parent): MSYS2's own console reading takes
-/// records off the queue and writes them back (`resize_guard`'s module docs),
-/// and a bash reading this paste once lost two records and reordered others,
-/// which is the runtime's, not the writes'.
+/// none of them.
 #[test]
 fn stop_paste_of_records_releases_whole_characters_the_receipt_counts() {
     let _serial = HOST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     aterm_pty::set_console_host(ConsoleHostChoice::from_config(Some("inbox")));
-    // Own the entire fixture directory rather than adopting a PID-named file.
-    // Spaces and an apostrophe also exercise the Bash argument's quoting.
     let script_dir = aterm_tempfile::Builder::new()
         .prefix("aterm counter's ")
         .tempdir()
@@ -437,8 +396,6 @@ fn stop_paste_of_records_releases_whole_characters_the_receipt_counts() {
         "the first write: as many characters' records as the pipe's quota holds"
     );
     meter.request_stop();
-    // The released write needed more room than the pipe had left; the
-    // close's six bytes fit it, so the close does not wait for the program.
     let accepted = ended(writer).expect("a receipt, not a failed paste");
     assert_eq!(
         tab.writes(),
@@ -527,10 +484,7 @@ fn a_close_releases_a_blocked_frame(host: ConsoleHostKind) {
 /// A write released in ConPTY's `WriteFile` reports what the program got:
 /// writes of a frame larger than the pipe, one after another as the sink's
 /// Windows body makes them, until a stop releases the blocked one; the program
-/// then reads exactly the bytes the writes reported. (A `WriteFile` larger
-/// than the pipe, cancelled after the host read part of it, reports nothing
-/// written, so `aterm_pty` hands the pipe at most its 64 KiB at a time.) A
-/// write that begins after the stop makes no `WriteFile`.
+/// then reads exactly the bytes the writes reported.
 #[test]
 fn a_released_write_reports_every_byte_the_program_reads() {
     under_each_host(a_released_write_reports_what_was_read);

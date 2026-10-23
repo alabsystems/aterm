@@ -1,36 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! The taskbar jump list's **Recent** directories: which working directories
-//! the owner actually used, kept newest first in aterm's state folder, and the
-//! UI-thread sampler that notices them.
-//!
-//! **What counts as used**: a directory a shell RAN A COMMAND in. Each shell
-//! block carries the cwd its prompt opened in (OSC 7, read by `aterm-core` at
-//! OSC 133 A), and a block that reached C ran a command there — so a tab that
-//! was opened and never typed into, a `cd` with no command after it, and a
-//! cmd.exe tab (prompt-only integration, no C) add nothing. The jump list then
-//! offers the newest few as rows that open a new aterm window there.
-//!
-//! **Cadence**: the sampler rides the per-frame taskbar seam
-//! (`App::sync_taskbar_progress`) and does real work at most every
-//! [`SAMPLE_EVERY`], plus once the moment a window loses focus — the owner
-//! leaving aterm is exactly when the taskbar menu may be opened next. A sample
-//! is one `try_lock` per session and an integer compare (`started_command_seq`),
-//! and walks blocks only for a session that started a command since the last
-//! sample; a contended engine is skipped, never waited on. Everything that can
-//! block — the existence check (a mapped network drive can take seconds), the
-//! file, the shell's `CommitList` — happens on the jump list's own worker
-//! thread (`jumplist_win::install`), which receives the notes over a channel.
-//!
-//! **What is never kept**: anything that is not a local drive path (UNC and
-//! `\\wsl$` shares, a WSL or SSH shell's POSIX cwd, `\\?\UNC\`), a path with a
-//! character Windows forbids in one, and anything at all while Windows' own
-//! "Show recently opened items in Start, Jump Lists and File Explorer" switch
-//! is off (`jumplist_win::recents_tracked`): the worker then deletes the file
-//! and shows no Recent category. A private window (a development build under
-//! its own `ATERM_STATE_HOME`) runs no worker, so it keeps nothing and leaves
-//! the owner's list alone (`jumplist_win::owns_the_jump_list`); a headless
-//! instance has no taskbar seam, so it never samples.
+//! Taskbar jump list Recent directories list and UI-thread command-directory sampler.
 #![cfg(windows)]
 
 use std::cell::RefCell;
@@ -42,11 +12,9 @@ use std::time::{Duration, Instant};
 
 use aterm_types::{BlockState, OutputBlock};
 
-/// How many directories the file keeps. More than [`SHOWN`], so a directory
-/// that is missing today (an unplugged drive) does not cost the list a row.
+/// Maximum number of recent directories persisted on disk.
 pub(crate) const KEEP: usize = 12;
-/// How many rows the Recent category shows (Windows Terminal and VS Code show
-/// five to ten; the shell's own default slot count is ten, tasks included).
+/// Maximum number of recent directories shown in the jump list.
 pub(crate) const SHOWN: usize = 6;
 /// The sampler's resting cadence.
 const SAMPLE_EVERY: Duration = Duration::from_secs(30);
@@ -56,20 +24,10 @@ const NOTES_PER_SESSION: usize = 8;
 /// The longest path kept: a jump list row is not the place for more, and the
 /// file stays a few KB.
 const MAX_PATH_CHARS: usize = 1024;
-/// The file's name in aterm's state folder (`aterm_types::dirs::state_dir`,
-/// `%LOCALAPPDATA%\aterm`).
+/// Filename in `aterm`'s state directory.
 pub(crate) const FILE_NAME: &str = "jumplist-recent.txt";
 
-// The list (pure)
-
-/// `dir` as the one spelling the list keeps, or `None` when it is not a local
-/// drive directory a jump list row could open: `X:\…` with backslashes, no
-/// doubled or trailing separator (but the root's), an upper-case drive letter,
-/// and no `.`/`..` component or name Win32 would rewrite (a trailing dot or
-/// space). A `\\?\C:\…` verbatim path loses its prefix; a UNC path (`\\server`,
-/// `\\wsl$`, `\\?\UNC\`), a POSIX path a WSL or SSH shell reported, a
-/// drive-relative `C:x`, an alternate data stream and a character Windows
-/// forbids in a path are all refused.
+/// Normalizes `dir` to a canonical local-drive path (`X:\…`), or returns `None`.
 pub(crate) fn normalize(dir: &str) -> Option<String> {
     if dir.is_empty()
         || dir.chars().count() > MAX_PATH_CHARS
@@ -91,7 +49,6 @@ pub(crate) fn normalize(dir: &str) -> Option<String> {
         Some(rest) => rest,
         None => unified.as_str(),
     };
-    // `?` was let through the forbidden set above only for the verbatim prefix.
     if path.contains('?') {
         return None;
     }
@@ -116,19 +73,14 @@ pub(crate) fn normalize(dir: &str) -> Option<String> {
     Some(out)
 }
 
-/// Whether two kept spellings name the same directory. NTFS compares names
-/// case-insensitively, so `C:\Src` and `c:\src` are one row.
+/// Returns whether `a` and `b` name the same directory case-insensitively.
 pub(crate) fn same_dir(a: &str, b: &str) -> bool {
     a.chars()
         .flat_map(char::to_lowercase)
         .eq(b.chars().flat_map(char::to_lowercase))
 }
 
-/// `list` with each of `notes` (oldest first) moved to the front — the newest
-/// note ends up first — deduplicated by [`same_dir`], with anything
-/// [`normalize`] refuses dropped, cut to `keep`. A directory already kept
-/// keeps its spelling: PowerShell reports the case as typed, and a row whose
-/// title flipped case with each `cd` would re-commit the list for nothing.
+/// Merges `notes` (oldest first) to the front of `list`, deduplicated by [`same_dir`] and capped at `keep`.
 pub(crate) fn merge(list: &[String], notes: &[String], keep: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(list.len() + notes.len());
     for dir in list.iter().filter_map(|dir| normalize(dir)) {
@@ -147,9 +99,7 @@ pub(crate) fn merge(list: &[String], notes: &[String], keep: usize) -> Vec<Strin
     out
 }
 
-/// `list` without the directories in `gone` (the rows the owner removed from
-/// the jump list: the shell forbids re-adding them, and they stay out until the
-/// owner runs a command there again).
+/// Returns `list` without the directories in `gone`.
 pub(crate) fn without(list: &[String], gone: &[String]) -> Vec<String> {
     list.iter()
         .filter(|dir| !gone.iter().any(|g| same_dir(g, dir)))
@@ -157,9 +107,7 @@ pub(crate) fn without(list: &[String], gone: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The rows to offer: the first `max` of `list` that `is_dir` says exist now.
-/// `is_dir` is injected so the rule is testable; the worker passes
-/// `Path::is_dir`, off the UI thread.
+/// Returns the first `max` directories of `list` for which `is_dir` holds.
 pub(crate) fn shown(list: &[String], is_dir: impl Fn(&str) -> bool, max: usize) -> Vec<String> {
     list.iter()
         .filter(|dir| is_dir(dir))
@@ -168,9 +116,7 @@ pub(crate) fn shown(list: &[String], is_dir: impl Fn(&str) -> bool, max: usize) 
         .collect()
 }
 
-/// The file's list: one directory per line, newest first; blank lines and `#`
-/// comments skipped, and each line held to [`normalize`] again (the file is
-/// the owner's to edit), deduplicated and cut to [`KEEP`].
+/// Parses the recent-directories state file into normalized, deduplicated entries capped at [`KEEP`].
 pub(crate) fn parse(text: &str) -> Vec<String> {
     let lines: Vec<String> = text
         .lines()
@@ -181,7 +127,7 @@ pub(crate) fn parse(text: &str) -> Vec<String> {
     merge(&lines, &[], KEEP)
 }
 
-/// The file's text for `list` ([`parse`]'s inverse).
+/// Serializes `list` as the recent-directories state file text.
 pub(crate) fn render(list: &[String]) -> String {
     let mut text = String::from(
         "# aterm: working directories for the taskbar jump list's Recent rows, newest first\n",
@@ -193,10 +139,7 @@ pub(crate) fn render(list: &[String]) -> String {
     text
 }
 
-/// Each row's visible title: the directory's own name, lengthened by parent
-/// names only where two rows would otherwise read the same (`a\src` and
-/// `b\src`), and the whole path for a drive root or once nothing shorter is
-/// unique. The full path is always the row's tooltip.
+/// Computes disambiguated short display titles for each directory in `dirs`.
 pub(crate) fn titles(dirs: &[String]) -> Vec<String> {
     let parts: Vec<Vec<&str>> = dirs
         .iter()
@@ -227,24 +170,13 @@ pub(crate) fn titles(dirs: &[String]) -> Vec<String> {
     }
 }
 
-/// The front-door arguments of the row for `dir`: `new-window -d "<dir>"`, the
-/// verb that always opens a WINDOW (see `jumplist_win`'s module docs). A drive
-/// root's trailing backslash is doubled so it does not escape the closing quote
-/// under the MSVCRT argv rules (the hazard `explorer_win::verb_command`
-/// documents); [`normalize`] leaves no other trailing backslash and no quote.
+/// Formats the CLI arguments (`new-window -d "<dir>"`) for a jump list row.
 pub(crate) fn row_arguments(dir: &str) -> String {
     let tail = if dir.ends_with('\\') { "\\" } else { "" };
     format!("new-window -d \"{dir}{tail}\"")
 }
 
-// What a session ran (pure)
-
-/// The directories commands ran in, from `blocks` NEWEST FIRST
-/// (`Terminal::all_blocks().rev()`), stopping at the first block at or below
-/// `through` (the newest block a previous read consumed): each block that
-/// reached C (executing or complete) and carries a cwd, at most `cap`, as
-/// `(command start ms, native path)` oldest first. Also the new `through`: the
-/// newest block that ran, so a prompt nothing has run in yet is read again.
+/// Collects up to `cap` command-executed directories from newest-first `blocks` newer than `through`, returned oldest-first with the updated watermark.
 pub(crate) fn fresh_dirs<'a>(
     blocks: impl Iterator<Item = &'a OutputBlock>,
     through: Option<u64>,
@@ -275,8 +207,6 @@ pub(crate) fn fresh_dirs<'a>(
     (dirs, newest)
 }
 
-// The channel to the worker
-
 /// Notes from the UI-thread sampler to the jump list's worker thread: batches
 /// of directories, oldest first.
 struct Mailbox {
@@ -301,20 +231,17 @@ fn mailbox() -> &'static Mailbox {
     })
 }
 
-/// The worker's end of the channel, once per process; the sampler starts
-/// recording when it is taken.
+/// Takes the worker's receiver once per process and enables sampling.
 pub(crate) fn take_notes() -> Option<Receiver<Vec<String>>> {
     let rx = mailbox().rx.lock().ok()?.take()?;
     RECORDING.store(true, Ordering::Release);
     Some(rx)
 }
 
-/// The worker is gone (the shell refused the list): stop sampling.
+/// Stops UI-thread recent-directory sampling.
 pub(crate) fn stop_recording() {
     RECORDING.store(false, Ordering::Release);
 }
-
-// The sampler (UI thread)
 
 #[derive(Clone, Copy)]
 struct Seen {
@@ -337,7 +264,7 @@ thread_local! {
     static SAMPLER: RefCell<Sampler> = RefCell::new(Sampler::default());
 }
 
-/// A closing window's focus record goes with it.
+/// Removes a closing window's focus state from the sampler.
 pub(crate) fn forget_window(hwnd: isize) {
     SAMPLER.with(|s| {
         s.borrow_mut().focused.remove(&hwnd);
@@ -345,11 +272,7 @@ pub(crate) fn forget_window(hwnd: isize) {
 }
 
 impl crate::App {
-    /// One frame of window `hwnd` (focused or not, as the app records it): when
-    /// a sample is due — [`SAMPLE_EVERY`] since the last, or this window just
-    /// lost focus — read every session's new command blocks and hand the
-    /// directories they ran in to the jump list's worker. See the module docs
-    /// for the cost; nothing here blocks.
+    /// Samples newly executed command directories across sessions on cadence or focus loss.
     pub(crate) fn sample_recent_dirs(&self, hwnd: isize, focused: bool) {
         if !RECORDING.load(Ordering::Acquire) {
             return;
@@ -371,7 +294,8 @@ impl crate::App {
             let mut notes: Vec<(u64, String)> = Vec::new();
             for session in self.pool.iter() {
                 let Ok(term) = session.term.try_lock() else {
-                    continue; // contended (or poisoned): the next sample reads it
+                    // contended (or poisoned): the next sample reads it
+                    continue;
                 };
                 let started = term.started_command_seq();
                 let seen = s.seen.get(&session.id).copied();
@@ -391,7 +315,6 @@ impl crate::App {
             if notes.is_empty() {
                 return;
             }
-            // Oldest first across every session, by when each command started.
             notes.sort_by_key(|(at, _)| *at);
             let batch = notes.into_iter().map(|(_, dir)| dir).collect();
             let _ = mailbox().tx.send(batch);
@@ -463,17 +386,14 @@ mod tests {
             merge(&list, &s(&[r"C:\c", r"C:\d"]), KEEP),
             s(&[r"C:\d", r"C:\c", r"C:\a", r"C:\b"])
         );
-        // Case-insensitive dedupe; the kept spelling stays.
         assert_eq!(
             merge(&list, &s(&[r"c:\B"]), KEEP),
             s(&[r"C:\b", r"C:\a", r"C:\c"])
         );
-        // The same directory twice in one batch is one row.
         assert_eq!(
             merge(&[], &s(&[r"C:\x", r"C:\y", r"C:\x"]), KEEP),
             s(&[r"C:\x", r"C:\y"])
         );
-        // Refused notes and stored junk are dropped; duplicates in the store too.
         assert_eq!(
             merge(
                 &s(&[r"C:\a", "/home/me", r"c:\A\"]),
@@ -482,7 +402,6 @@ mod tests {
             ),
             s(&[r"C:\a"])
         );
-        // Capped at `keep`, oldest dropped.
         let many: Vec<String> = (0..20).map(|i| format!(r"C:\d{i}")).collect();
         let merged = merge(&[], &many, KEEP);
         assert_eq!(merged.len(), KEEP);
@@ -528,12 +447,10 @@ mod tests {
             ])),
             s(&["aterm", r"a\src", r"b\src", r"E:\"])
         );
-        // Same leaf and same parent on two drives: the whole path tells them apart.
         assert_eq!(
             titles(&s(&[r"C:\x\src", r"D:\x\src"])),
             s(&[r"C:\x\src", r"D:\x\src"])
         );
-        // Case-insensitive clash.
         assert_eq!(
             titles(&s(&[r"C:\p\Src", r"C:\q\src"])),
             s(&[r"p\Src", r"q\src"])
@@ -557,9 +474,7 @@ mod tests {
             let line = format!("aterm-gui.exe {}", row_arguments(dir));
             let wide = crate::win_ffi::wide(&line);
             let mut argc = 0i32;
-            // SAFETY: `wide` is a NUL-terminated UTF-16 line that outlives the
-            // call; the returned block is read within its `argc` entries, each a
-            // NUL-terminated string, and freed once with LocalFree as documented.
+            // SAFETY: `wide` is a NUL-terminated UTF-16 string and the returned argv block is freed once with `LocalFree`.
             let argv: Vec<String> = unsafe {
                 let block = CommandLineToArgvW(wide.as_ptr(), &mut argc);
                 assert!(!block.is_null());
@@ -579,8 +494,7 @@ mod tests {
 
     /// End to end on the headless app: the shell's own OSC 7 and OSC 133 bytes
     /// reach the worker's channel as the directories commands ran in, each
-    /// once, oldest first. A prompt alone adds nothing, a frame before the
-    /// cadence is due reads nothing, and a focus loss samples at once.
+    /// once, oldest first.
     #[test]
     fn the_sampler_hands_the_worker_where_commands_ran() {
         const HWND: isize = 0x7001;
@@ -603,12 +517,10 @@ mod tests {
         app.sample_recent_dirs(HWND, true);
         app.sample_recent_dirs(HWND, false);
         assert_eq!(notes.try_recv().ok(), Some(s(&[r"C:\src", r"C:\src\b"])));
-        // Nothing ran since: the next focus loss sends nothing.
         app.sample_recent_dirs(HWND, true);
         app.sample_recent_dirs(HWND, false);
         assert!(notes.try_recv().is_err());
         stop_recording();
-        // Not recording: even a focus loss after a new command reads nothing.
         feed(b"\x1b]133;D;0\x07\x1b]133;A\x07PS> \x1b]133;B\x07pwd\r\n\x1b]133;C\x07");
         app.sample_recent_dirs(HWND, true);
         app.sample_recent_dirs(HWND, false);
@@ -645,23 +557,19 @@ mod tests {
             ]
         );
         assert_eq!(through, Some(4), "block 5 has run nothing yet");
-        // Nothing new: nothing read, the mark holds.
         let (dirs, again) = fresh_dirs(blocks.iter().rev(), through, NOTES_PER_SESSION);
         assert!(dirs.is_empty());
         assert_eq!(again, Some(4));
-        // Block 5's command starts: it is read once.
         let mut later = blocks.to_vec();
         later[4].state = BlockState::Executing;
         let (dirs, through) = fresh_dirs(later.iter().rev(), Some(4), NOTES_PER_SESSION);
         assert_eq!(dirs, vec![(500, r"C:\typing".to_owned())]);
         assert_eq!(through, Some(5));
-        // The cap keeps the newest.
         let (dirs, _) = fresh_dirs(blocks.iter().rev(), None, 2);
         assert_eq!(
             dirs,
             vec![(300, r"C:\b".to_owned()), (400, r"C:\c".to_owned())]
         );
-        // A block with no reported cwd counts as read but adds no row.
         let bare = [block(7, BlockState::Complete, None, 700)];
         assert_eq!(
             fresh_dirs(bare.iter().rev(), None, NOTES_PER_SESSION),

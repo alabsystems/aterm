@@ -1,43 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The egress witness (`aterm-lab sampler <run-dir>`, started by `up`,
-//! unjailed): every second it lists the network sockets (`lsof -nP -i`) of
-//! every process in the lab's jail — the stub, the private instance's whole
-//! tree (its shells, the real Claude Code or Codex), what the lab started in
-//! the jail outside that tree (`codex-run`, the agents' `--version`, the
-//! selftests' controls) and whatever any of them left behind (an orphan
-//! launchd adopted, a process in a session of its own). They are found by the
-//! jail's mark ([`crate::sys::jail_pids`]); only when the kernel gives no
-//! answer, by the ppid walk from the stub, the instance and the live roots of
-//! `<run>/jailed.pids`. It appends each NEW endpoint of each process to
-//! `<run>/sockets.log` as `cmd[pid] proto kind endpoint` (the pid says which
-//! process: the tab's Codex or a codex-run's), and each member it saw to
-//! `<run>/members.txt` (`egress` reads the kernel's refusals of those pids).
-//! An endpoint whose host is not loopback also goes to `<run>/egress.log` as
-//! `EXTERNAL …` (it should stay empty: the jail makes such a connect fail
-//! anyway). Each pass also records what those processes hold in a per-user
-//! runtime directory of the shared `/tmp` that none of the variables tried
-//! moves (Muse Code's registry), which `down` takes back
-//! ([`crate::runtime_dirs`]). It lives as
-//! long as the lab, not as one instance: `up` starts it before anything is
-//! jailed and `down` ends it once the jail is empty, and it reads `env.sh`
-//! again at every pass (the instance `restore` starts anew). It
-//! also ends when `env.sh` is gone (an `up` that failed). A lab a verb owns
-//! (not `up`'s) hands it the verb's lifeline (`--lifeline-fd 0`): once that is
-//! cut — the verb ended however it ended, a SIGKILL included — it goes on
-//! until the jail is empty and then ends, never outliving the lab it watches.
-//! A sampler by nature: the kernel offers no event for "a socket was opened
-//! by that tree".
-//!
-//! It also keeps the lab it watches from macOS's `tmp_cleaner`
-//! ([`keep_from_the_cleaner`]): the default state dir sits in `/private/tmp`
-//! ([`crate::paths::state_root`]), which that daemon clears daily of files
-//! nobody read, wrote or changed for three days and of empty directories
-//! nobody changed for as long. A lab left up that long would lose `env.sh`
-//! (its one record: `ps` and `down` would no longer see it, and this witness
-//! would end, leaving its jail running unwatched) and the scratch directories
-//! the profile pins (each, gone, a place a jailed process could put a link).
+//! The egress witness (`aterm-lab sampler <run-dir>`, started by `up`, unjailed): every second it lists the network sockets (`lsof -nP -i`) of every process in the lab's jail — the stub, the private instance's whole tree (its shells, the real Claude Code or Codex), what the lab started in the jail outside that tree (`codex-run`, the agents' `--version`, the selftests' controls) and whatever any of them left behind (an orphan launchd adopted, a process in a session of its own).
 
 use std::collections::BTreeSet;
 use std::io::Write as _;
@@ -58,20 +22,7 @@ const STALE: Duration = Duration::from_secs(24 * 3600);
 /// How often the witness looks for stale entries: hourly, and at its start.
 const KEEP_EVERY: Duration = Duration::from_secs(3600);
 
-/// Keep the live lab at `run_dir` (and its socket dir `sockdir`, when named)
-/// from `tmp_cleaner`, judging staleness as of `now` ([`STALE`]); returns how
-/// many entries it made new. Every regular file of the run dir outside its
-/// `scratch/` (the lab's own: `env.sh`, the profile, its program, its logs;
-/// none a jailed process may write) gets its access time made now, which
-/// moves its change time too, its modification time left as it is; the
-/// directories the profile pins (`scratch/` and its [`SCRATCH_DIRS`], the
-/// socket dir's `proj`) get their modification time made now, and the socket
-/// dir's `a.sock.token` its access time. What jailed code keeps in the
-/// scratch is its own and is left alone. No link is followed: the walk reads
-/// entries as they stand and [`crate::sys::touch_now`] sets an entry's own
-/// times, reaching it through no link.
-///
-/// [`SCRATCH_DIRS`]: crate::protected::SCRATCH_DIRS
+/// Keep the live lab at `run_dir` (and its socket dir `sockdir`, when named) from `tmp_cleaner`, judging staleness as of `now` ([`STALE`]); returns how many entries it made new.
 pub fn keep_from_the_cleaner(run_dir: &Path, sockdir: &str, now: SystemTime) -> usize {
     use crate::sys::{Touch, touch_now};
     let before = now
@@ -129,14 +80,7 @@ pub fn keep_from_the_cleaner(run_dir: &Path, sockdir: &str, now: SystemTime) -> 
     made
 }
 
-/// The `cmd[pid] proto kind endpoint[  EXTERNAL]` lines of `lsof -F pcPtn`
-/// output. `kind` is `conn` for a socket with a peer (`->`), `unbound` for
-/// one bound to no address and no port (`*:*`: it can receive nothing, and
-/// no peer can reach it — the private instance's vitals open one AF_INET
-/// datagram socket per reading to ask each interface's functional type,
-/// `aterm_sysprobe`'s `ioctl_socket`, and the witness caught one as
-/// `aterm[82057] UDP listen *:*` in the 2.1.308 read's `ea8`), and `listen`
-/// for one bound to an address or a port with no peer.
+/// The `cmd[pid] proto kind endpoint[  EXTERNAL]` lines of `lsof -F pcPtn` output.
 #[must_use]
 pub fn endpoints(lsof_f: &str) -> BTreeSet<String> {
     let (mut pid, mut cmd, mut proto) = (String::new(), String::new(), String::new());
@@ -204,8 +148,6 @@ pub fn main(args: &[String]) -> i32 {
         return 2;
     };
     let dir = Path::new(dir);
-    // The verb's lifeline, when it owns the lab: cut, the witness ends once the
-    // jail is empty.
     let cut = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     match args.get(1..) {
         Some([flag, n]) if flag == aterm_uds::lifeline::FLAG => {
@@ -247,7 +189,6 @@ pub fn main(args: &[String]) -> i32 {
     let mut ever: BTreeSet<i32> = BTreeSet::new();
     let mut runtime: BTreeSet<crate::runtime_dirs::Held> = BTreeSet::new();
     let mut kept: Option<std::time::Instant> = None;
-    // env.sh gone: the lab is down (or its `up` failed)
     while let Ok(text) = std::fs::read_to_string(dir.join("env.sh")) {
         let run = Run::parse(&text);
         if kept.is_none_or(|t| t.elapsed() >= KEEP_EVERY) {
@@ -260,7 +201,6 @@ pub fn main(args: &[String]) -> i32 {
             return 0;
         }
         if m.is_empty() {
-            // nothing in the jail yet (or any more): no `lsof -p` of nothing
             std::thread::sleep(Duration::from_secs(1));
             continue;
         }
@@ -305,8 +245,6 @@ mod tests {
         assert!(e.contains(&"claude[2] TCP conn 160.79.104.10:443  EXTERNAL".to_string()));
         assert!(e.contains(&"claude[2] UDP listen [::1]:53".to_string()));
         assert!(e.contains(&"claude[2] UDP unbound *:*".to_string()));
-        // NEGATIVE CONTROLS: a socket bound to every address on a port is
-        // listening, and an unbound one is never external
         let f = "p3\ncaterm\nPUDP\nn*:*\nn*:5353\nPTCP\nn*:8080\n";
         let e: Vec<String> = endpoints(f).into_iter().collect();
         assert_eq!(
@@ -343,11 +281,7 @@ mod tests {
     /// time made now, their modification time kept; the directories the
     /// profile pins (`scratch/`, its `SCRATCH_DIRS`, the socket dir's `proj`)
     /// get their modification time made now, so the cleaner's own `find`
-    /// would take none of them. NEGATIVE CONTROLS: a fresh lab is left alone
-    /// (nothing made new, no event for an agent watching a directory); a file
-    /// jailed code keeps in the scratch, a directory there no profile rule
-    /// pins (the cleaner would still take it) and the target of a link in the
-    /// run dir keep their old times.
+    /// would take none of them.
     #[test]
     fn a_live_lab_is_kept_from_the_tmp_cleaner() {
         use std::os::unix::fs::MetadataExt as _;
@@ -386,7 +320,6 @@ mod tests {
         }
         std::os::unix::fs::symlink(&outside, run.join("link")).unwrap();
         let sockdir = sock.display().to_string();
-        // NEGATIVE CONTROL: a fresh lab is left alone
         assert_eq!(keep_from_the_cleaner(&run, &sockdir, SystemTime::now()), 0);
         let old = SystemTime::now() - Duration::from_secs(5 * 24 * 3600);
         let old_s = i64::try_from(
@@ -452,7 +385,6 @@ mod tests {
         let after = cleaner_would_take(&top.0);
         assert!(pinned.is_disjoint(&after), "{after:?}");
         assert!(made >= own.len() + pinned.len(), "{made}");
-        // NEGATIVE CONTROLS: the jail's own, an unpinned directory, a link's target
         assert_eq!(
             meta(&jailed).atime(),
             old_s,

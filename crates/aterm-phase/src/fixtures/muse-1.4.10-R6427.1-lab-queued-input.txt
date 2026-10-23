@@ -1,0 +1,21 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-22, `aterm ctl text` of a private headless aterm (144x50, aterm 0.114.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · the stub's reply held 4 s (a custom mode with delay_ms), a second prompt typed and entered 1.5 s into the first turn: the first reply drawn whole, the status row gone, the second prompt under it as Muse Code's queued-input row with its branch, and the footer's right saying steering the running turn — the end-of-turn review's pause before the queue is drained · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  Muse Code 1.4.10
+
+❯ measure round 1
+
+◆ Hi! I am the local lab stub, not a model. (reply 1)
+
+❯ write the parser round 1
+
+◆ Here is the report.
+  • check 1 passed
+  • check 2 passed
+  Nothing left: the parser is committed and pushed to origin/main.
+
+◆ Queued input · ↑ to edit
+└ write the landing report round 2
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review                                                            steering the running turn

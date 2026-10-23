@@ -1,59 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The stub's claude.ai account routes: the bodies a subscriber's Claude Code
-//! reads its plan and its limits from, in the shapes the managed 2.1.301
-//! bundle parses them, each answered from the `--account-file` (`account TAG
-//! …` writes it; re-read at every request).
-//!
-//! * `GET /api/oauth/usage` — the usage body, whatever its query: Claude Code
-//!   names three reads of it (`/api/oauth/usage` when `/usage` opens,
-//!   `?at_wall=1&skip_spend=1` at a wall, `?cedar_ember=1&skip_spend=1` for a
-//!   reset used away from one), and the log names which. The windows
-//!   `five_hour`, `seven_day`, `seven_day_oauth_apps`, `seven_day_opus`,
-//!   `seven_day_sonnet` and `cinder_cove` are each `{utilization, resets_at}`
-//!   (a percent and an ISO instant), both keys present and either null: the
-//!   bundle's schema `TS`, which a cached copy (`cachedUsageUtilization`) is
-//!   read back through, refuses a window that lacks one, and with it the
-//!   whole copy (the live read is not checked against it). `limits[]`
-//!   (`{kind, group, percent, resets_at, severity, is_active, scope}`, `scope`
-//!   `{model, surface}` each `{display_name}`; a `weekly_scoped` row whose
-//!   `scope.model.display_name` is on the server's allowlist is the panel's
-//!   `Current week (<name>)`), `extra_usage` (`{is_enabled, monthly_limit,
-//!   used_credits, utilization, currency, disabled_reason}`, cents), the
-//!   credit blocks `cinder_cove` (a bare window, drawn `Claude Code and Cowork
-//!   credit` with its `resets_at` as the subtext) and `wattle_ember` (that
-//!   window plus `label`, `limit_dollars`, `used_dollars`,
-//!   `remaining_dollars` and `periods[]` of `{starts_at, ends_at}`, drawn
-//!   under its `label`, else `Credit`), and the two limit-reset programs a
-//!   wall reads: `juniper_tide` (the session reset: `eligible`, `arm`,
-//!   `available`, `next_available_at`, `weekly_resets_at`, `resets_per_week`)
-//!   and `cedar_ember` (the grants: `eligible`, `at_limit`, `exhausted[]`,
-//!   `grants[]` of `{id, label, resets_total, resets_left, starts_at,
-//!   ends_at, clears[], paused, usable_now, use_requires_limit,
-//!   percent_used, blocking[]}`, `next_grant_id`, `weekly_resets_at`,
-//!   `cooldown_until`).
-//! * `GET /api/oauth/profile` (an OAuth login) and `GET
-//!   /api/claude_cli_profile` (an API key) — the profile that fills
-//!   `.claude.json`'s `oauthAccount`: `account{uuid, email, display_name,
-//!   full_name, created_at}`, `organization{uuid, organization_type,
-//!   rate_limit_tier, seat_tier, has_extra_usage_enabled, billing_type,
-//!   subscription_created_at, plan_display_name, cc_onboarding_flags, …}`.
-//! * `GET /api/claude_cli/bootstrap` — its `oauth_account` block carries the
-//!   tiers `oauthAccount` keeps (`organization_type`,
-//!   `organization_rate_limit_tier`, `user_rate_limit_tier`, `seat_tier`).
-//!
-//! The file is `{"usage": {…}, "profile": {…}, "bootstrap": {…}}`; a route
-//! whose key is missing or null is a 404 in Anthropic's error shape. A string
-//! `"@ISO+N@"` anywhere in a body is the UTC instant N seconds after the answer
-//! (ISO 8601 with milliseconds, as the usage body spells `resets_at`), and
-//! `"@NOW+N@"` that unix second as a number. [`composed`] is the lab's own
-//! body set: every value composed, every name an example.com one.
-//!
-//! What Claude Code 2.1.301 does with these routes behind the lab's base URL
-//! is measured in [`crate::stats`] ("Account stats facts"): it sends none of
-//! them to the stub, because it builds each from its fixed claude.ai API base,
-//! never from `ANTHROPIC_BASE_URL`.
+//! The stub's claude.ai account routes.
 
 use crate::pyjson::J;
 
@@ -108,8 +56,7 @@ impl Route {
     }
 }
 
-/// Which of Claude Code's usage reads a query is, as its bundle names them:
-/// `at_wall` (`at_wall=1`), `cedar_ember` (`cedar_ember=1`), else `plain`.
+/// Which of Claude Code's usage reads a query is, as its bundle names them.
 #[must_use]
 pub fn usage_read(query: &[(String, String)]) -> &'static str {
     let on = |k: &str| query.iter().any(|(n, v)| n == k && v == "1");
@@ -122,8 +69,7 @@ pub fn usage_read(query: &[(String, String)]) -> &'static str {
     }
 }
 
-/// `spec` with every string `"@ISO+N@"` the UTC instant `now + N` (ISO 8601,
-/// milliseconds) and every string `"@NOW+N@"` the unix second `now + N`.
+/// `spec` with every string `"@ISO+N@"` the UTC instant `now + N` (ISO 8601.
 #[must_use]
 pub fn expand(spec: &J, now: i64) -> J {
     let offset = |s: &str, head: &str| -> Option<i64> {
@@ -157,12 +103,7 @@ const ACCOUNT_UUID: &str = "00000000-0000-4000-8000-0000000000a1";
 const ORG_UUID: &str = "00000000-0000-4000-8000-0000000000b1";
 const EMAIL: &str = "ana@example.com";
 
-/// The lab's composed account: a Max 5x subscriber `ana@example.com` with
-/// usage credits on. Its five-hour window at 62.5 % resets in 1 h 25 m, the
-/// week at 71 % in 3 d 4 h; the Fable week (a `weekly_scoped` row) at 40 %;
-/// $41 of $200 of credits used this month; a one-time credit of $50 with
-/// $12.50 used; the session reset used (next available in 4 d); one grant of
-/// two left, usable now, until 5 d from now. Nothing in it is anyone's.
+/// The lab's composed account: a Max 5x subscriber `ana@example.com` with usage credits on.
 #[must_use]
 pub fn composed() -> J {
     const H5: i64 = 5_100;
@@ -323,11 +264,7 @@ pub fn composed() -> J {
     ])
 }
 
-/// The `oauthAccount` Claude Code 2.1.301 keeps in `.claude.json` once it
-/// has read [`composed`]'s profile and bootstrap (the bundle's profile
-/// merge, then the bootstrap's tiers over it): what `claude-json TAG --set
-/// oauthAccount composed` seeds a scratch home with, since behind the lab's
-/// base URL it never reads them itself. `profileFetchedAt` is `now_ms`.
+/// The `oauthAccount` Claude Code 2.1.301 keeps in `.claude.json` once it has read [`composed`]'s.
 #[must_use]
 pub fn composed_oauth_account(now_ms: i64) -> J {
     J::obj([

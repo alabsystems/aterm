@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Windows tests for the build-directory reclaim's Windows half: what NTFS adds to the unix
-//! story — a lock another handle holds with `LockFileEx`, a process working in the directory,
-//! junctions and a folder a volume is mounted on (one tag), a third party's reparse point,
-//! uplifts that are NTFS hard links of an unhashed twin, owners read through each entry's
-//! handle, drives that are not fixed disks, one path in many spellings, and paths past
-//! `MAX_PATH`.
-//!
-//! Every fixture is laid out as cargo lays a build directory ([`lay_target`]) under its own
-//! scratch directory; the only process started is a test's own `cmd.exe`, which ends when its
-//! stdin is closed.
+//! Windows tests for the build-directory reclaim's Windows half.
 
 use super::*;
 use crate::harness::disk::discover;
@@ -122,8 +113,7 @@ fn tag_foreign(path: &Path) {
 const NO_VOLUME: &str = r"\??\Volume{00000000-0000-0000-0000-000000000000}\";
 
 /// Make `path` (a new, empty folder) a folder a volume is mounted on, as
-/// `SetVolumeMountPointW` writes one: the junction's tag onto [`NO_VOLUME`]. Set directly
-/// ([`aterm_dirfd::seam::set_mount_point`]), it needs no administrator and mounts nothing.
+/// `SetVolumeMountPointW` writes one: the junction's tag onto [`NO_VOLUME`].
 fn mount_point(path: &Path) {
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
@@ -191,9 +181,6 @@ fn a_lock_another_handle_holds_keeps_the_profile_and_once_released_only_incremen
 
 /// A whole removal asks the caller, under every lock, whether a process works in the
 /// directory: a `cmd.exe` whose working directory is inside refuses it, and nothing goes.
-/// Once it has exited, with no process using it, the directory goes whole, and the bytes
-/// counted are each file's allocation once — the uplifted `debug\lay.pdb` is an NTFS hard
-/// link of its unhashed `deps\` twin, as cargo uplifts an MSVC binary's, and counts once.
 #[test]
 fn a_process_working_inside_keeps_a_whole_removal_and_once_it_exits_the_directory_goes() {
     let tmp = Tmp::new("win-whole-user");
@@ -347,11 +334,7 @@ fn owner_of(dir: &Path) -> aterm_dirfd::Sid {
 }
 
 /// Owners are read through each entry's own handle: a build directory of this user's
-/// passes the other-user fence of a whole removal. Judged against another user (the seams
-/// substitute identities, never verdicts: a standard user cannot give a file away), its
-/// REAL owners fail it, said by name; and one entry deep inside whose owner reads as
-/// `S-1-5-18`'s fails it alone — in the sizing walk and in the ownership walk alike — and
-/// the whole removal's fences refuse it.
+/// passes the other-user fence of a whole removal.
 #[test]
 fn another_users_entry_keeps_the_directory_from_going_whole() {
     let tmp = Tmp::new("win-owner");
@@ -366,7 +349,6 @@ fn another_users_entry_keeps_the_directory_from_going_whole() {
     let cut = foreign_walk(&t, 3, FOREIGN_WALK_WALL).expect("cut short");
     assert!(cut.contains("more than 3 entries"), "{cut}");
 
-    // Only SYSTEM passes: the owner this user's files really have is another user's.
     let owner = owner_of(&t);
     only_owners_pass(Some(vec![aterm_dirfd::Sid::local_system()]));
     let (_, foreign) = total_bytes_owned(&t);
@@ -394,8 +376,7 @@ fn another_users_entry_keeps_the_directory_from_going_whole() {
 /// A folder a volume is mounted on, inside a build directory, is never removed — that would
 /// unmount the volume — nor entered: it is kept and said as on another device, as unix keeps a
 /// mount point, by an idle reclaim of `incremental/` (its siblings still go) and by a whole
-/// removal (which then leaves the directory). A junction, the same tag onto a path, still goes
-/// as itself ([`a_junction_inside_is_removed_as_itself_and_what_it_points_at_survives`]).
+/// removal (which then leaves the directory).
 #[test]
 fn a_volume_mounted_inside_is_kept_as_another_device() {
     let tmp = Tmp::new("win-mounted");
@@ -497,8 +478,7 @@ fn tier_3_judges_the_file_it_listed_never_one_renamed_into_its_name() {
 /// Only a fixed disk's build caches are reclaimed: a build directory whose volume reads as
 /// not fixed (a removable stick) or of a kind that cannot be read (the drive seam: this
 /// machine has fixed disks only) is no candidate — the report's fences say why — and every
-/// reclaim, of each tier, refuses it before opening anything, everything byte-identical. Read
-/// as fixed again, the same directory is reclaimed.
+/// reclaim, of each tier, refuses it before opening anything, everything byte-identical.
 #[test]
 fn a_build_directory_off_a_fixed_disk_is_never_a_candidate_nor_reclaimed() {
     let tmp = Tmp::new("win-drive");
@@ -597,8 +577,7 @@ fn the_volume_the_watch_measures_is_the_one_the_reclaim_reads() {
 /// reads the measured serial but another volume GUID ([`mark_cloned`]: a sector-cloned disk or
 /// an attached VHD copy keeps its source's serial) is refused by every tier before anything
 /// is opened under it, and so is any build directory while the measured volume's GUID is
-/// unread; nothing is touched. The same judge reclaims an unmarked one on the measured volume.
-/// NEGATIVE CONTROL: without the GUID check every tier would reclaim the clone's.
+/// unread; nothing is touched.
 #[test]
 fn a_clone_of_the_measured_volume_is_refused_by_its_guid() {
     let tmp = Tmp::new("win-cloned-volume");
@@ -668,19 +647,7 @@ fn tree_of(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// A BUILD DIRECTORY IN A REAL CLOUD SYNC ROOT LOSES NOTHING. A scratch folder registered as
-/// a cloud sync root ([`aterm_dirfd::seam::SyncRoot`], as OneDrive registers its folder, with
-/// Documents and Desktop moved into it) holds a checkout's idle build directory, every file
-/// and folder of it made an in-sync placeholder, as a sync client leaves what it uploaded.
-/// This test thread runs in the process's default placeholder mode, which shows each of them
-/// as a plain file or folder — yet the report's own walk of it cannot open it, so it is no
-/// candidate, every tier refuses it before anything is opened under it (the sync root on its
-/// path is a reparse point that is no link), and every byte stays: a delete there would remove
-/// the files from the cloud and every synced device. The report of it, named by hand, and
-/// every refusal say it lies in a cloud sync root ([`IN_SYNC_ROOT`]), not merely that
-/// something on its path is a link (`disk_target_tests`' link cases say that, and never a sync
-/// root). Unregistered on drop, after which it is a plain tree. NEGATIVE CONTROL: with
-/// `aterm-dirfd`'s placeholders left disguised, the same tree is reclaimed.
+/// A BUILD DIRECTORY IN A REAL CLOUD SYNC ROOT LOSES NOTHING.
 #[test]
 fn a_build_directory_in_a_cloud_sync_root_loses_nothing() {
     let tmp = Tmp::new("win-sync-root");
@@ -718,7 +685,6 @@ fn a_build_directory_in_a_cloud_sync_root_loses_nothing() {
     assert_eq!(snapshot(&t, &|_| false), before, "every synced byte stays");
     assert_eq!(aterm_dirfd::seam::thread_placeholder_mode(), 0);
 
-    // NEGATIVE CONTROL: disguised, the sync root is a plain folder and the cache goes.
     aterm_dirfd::seam::leave_placeholders_disguised(true);
     let done = reclaim(&t, &judge(now));
     aterm_dirfd::seam::leave_placeholders_disguised(false);
@@ -815,7 +781,7 @@ fn tier_3_takes_an_unhashed_uplift_only_when_its_twin_is_the_same_artifact() {
 /// A MEASUREMENT, run by hand (`-- --ignored --nocapture reclaim_wall_time`), never a gate:
 /// the wall time of the report walks and of each reclaim over a synthetic build directory of
 /// a realistic size — 20,000 files of 4 KiB (10,000 in `incremental/`, 5,000 in `deps/`,
-/// 5,000 under `.fingerprint/`). It asserts only what went.
+/// 5,000 under `.fingerprint/`).
 #[test]
 #[ignore = "a measurement, run by hand"]
 fn reclaim_wall_time() {

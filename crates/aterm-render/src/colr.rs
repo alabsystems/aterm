@@ -3,20 +3,6 @@
 // Author: Andrew Yates
 
 //! COLR (vector color glyph) rasterization.
-//!
-//! `sbix`/`CBDT` emoji are bitmaps (`glyph_raster_image`); COLR glyphs are outline layers
-//! filled with a palette color (COLRv0) or a gradient (COLRv1) under affine transforms.
-//! aterm-font walks the paint graph through its [`Painter`](aterm_font::colr::Painter)
-//! trait; this module implements it with a small scanline rasterizer into an RGBA8 buffer.
-//!
-//! Solid layers render exactly. Linear, radial and sweep gradients are filled per pixel
-//! from the `ColorLine` stops and extend mode, in paint space through the inverse affine,
-//! with premultiplied stop interpolation. Sweep angles carry the spec's 1.0 bias
-//! (`degrees = v·180 + 180`), 0° at +x, counter-clockwise in y-up font space. Ill-formed
-//! gradient geometry skips the layer, as the spec requires. Clips are ignored and every
-//! composite mode is src-over; layer outlines self-clip, which is enough for emoji. A
-//! PaintGlyph outline is fixed in the space where the PaintGlyph appears: transforms in its
-//! subtree move only the child paint's gradient geometry.
 
 use aterm_font::colr::{ColorStop, CompositeMode, GradientExtend, Paint, Painter};
 use aterm_font::{Face, GlyphId, RgbaColor, Transform};
@@ -153,8 +139,7 @@ const fn rgba_eq(a: RgbaColor, b: RgbaColor) -> bool {
     a.red == b.red && a.green == b.green && a.blue == b.blue && a.alpha == b.alpha
 }
 
-/// Premultiplied-alpha lerp between two straight-alpha colors, returned straight. The
-/// COLRv1 spec prescribes it; it avoids gray fringes toward transparent stops.
+/// Premultiplied-alpha lerp between two straight-alpha colors, returned straight.
 #[inline]
 fn lerp_premul(c0: RgbaColor, c1: RgbaColor, u: f32) -> RgbaColor {
     let (a0, a1) = (f32::from(c0.alpha) / 255.0, f32::from(c1.alpha) / 255.0);
@@ -187,8 +172,7 @@ fn collect_stops(iter: impl Iterator<Item = ColorStop>) -> Vec<(f32, RgbaColor)>
 
 /// Fold the COLRv1 linear-gradient `p2` rotation into a projection vector `q`
 /// with `t(p) = (p − p0)·q / (q·q)`: lines of constant color run parallel to
-/// p0→p2, and `t(p1) = 1`. `None` when the geometry is ill-formed per the spec
-/// (p2 = p0, or p1 on the p0→p2 line — including p1 = p0).
+/// p0→p2, and `t(p1) = 1`.
 #[inline]
 const fn linear_projection(dx: f32, dy: f32, rx: f32, ry: f32) -> Option<(f32, f32)> {
     let r2 = rx * rx + ry * ry;
@@ -223,7 +207,6 @@ impl ColorRamp {
         let (lo, hi) = (first.0, last.0);
         let span = hi - lo;
         if span <= 0.0 {
-            // All stops coincide; the portion above the shared offset shows the
             // last stop, and that is where pad extension lands.
             return last.1;
         }
@@ -314,8 +297,6 @@ impl GradientFill {
                 dy,
                 dr,
             } => {
-                // Solve |p − c(t)| = r(t) with c(t)=c0+t·cd, r(t)=r0+t·dr:
-                // a·t² − 2b·t + c = 0 (the HTML-canvas two-circle equation).
                 let (px, py) = (ux - x0, uy - y0);
                 let a = dx * dx + dy * dy - dr * dr;
                 let b = px * dx + py * dy + r0 * dr;
@@ -384,8 +365,7 @@ struct ColrCanvas<'a> {
     palette: u16,
     foreground: RgbaColor,
     /// The PaintGlyph clip waiting for its fill: the glyph id and the affine current when
-    /// `outline_glyph` ran. COLRv1 fixes the outline in the space where PaintGlyph
-    /// appears, so it is captured then, not read from `cur` at paint time.
+    /// `outline_glyph` ran.
     pending: Option<(GlyphId, Affine)>,
 }
 
@@ -431,11 +411,7 @@ impl ColrCanvas<'_> {
         }
         const SS: usize = 4;
         let (w, h) = (self.w, self.h);
-        // One flat edge list per layer, closed by the `(i + 1) % n` rule. Horizontal edges
-        // never straddle a sample line, so dropping them is exact.
         let mut edges: Vec<(f32, f32, f32, f32)> = Vec::new();
-        // The layer's y extent. `f32::min`/`max` ignore NaN, so a NaN endpoint cannot
-        // poison it.
         let (mut min_y, mut max_y) = (f32::INFINITY, f32::NEG_INFINITY);
         for contour in &contours {
             let n = contour.len();
@@ -453,19 +429,14 @@ impl ColrCanvas<'_> {
         if edges.is_empty() {
             return;
         }
-        // Scan only rows the layer's y extent reaches: outside it no edge straddles a
-        // sample line, so skipping them is exact. The 1-row margin covers the sample
-        // offsets; saturating casts collapse a degenerate extent to an empty range.
         let py_lo = (min_y - 1.0).floor().max(0.0) as usize;
         let py_hi = ((max_y + 1.0).ceil().max(0.0) as usize).min(h);
-        // Scratch buffers reused across rows and sample lines.
         let mut cov = vec![0.0f32; w];
         let mut xs: Vec<(f32, i32)> = Vec::new();
         for py in py_lo..py_hi {
             cov.fill(0.0);
             for s in 0..SS {
                 let sy = py as f32 + (s as f32 + 0.5) / SS as f32;
-                // Collect (x, winding-dir) crossings of all edges at scanline sy.
                 xs.clear();
                 for &(x0, y0, x1, y1) in &edges {
                     if (y0 <= sy && y1 > sy) || (y1 <= sy && y0 > sy) {
@@ -491,8 +462,6 @@ impl ColrCanvas<'_> {
                         FillSource::Gradient(g) => {
                             match g.sample_at(px as f32 + 0.5, py as f32 + 0.5) {
                                 Some(color) => color,
-                                // Undefined gradient region (outside a
-                                // one-sided radial cone): nothing is painted.
                                 None => continue,
                             }
                         }
@@ -503,10 +472,7 @@ impl ColrCanvas<'_> {
         }
     }
 
-    /// Resolve a `Paint` into a fill. Ill-formed gradient geometry (coincident linear
-    /// points, coincident radial circles, an empty sweep) is `None`: the spec says the
-    /// layer does not render. A non-invertible paint transform falls back to the first
-    /// stop. Stops use default (non-variable) coords, matching the outline path.
+    /// Resolve a `Paint` into a fill.
     fn resolve_paint(&self, paint: &Paint) -> Option<FillSource> {
         let (extend, stops, kind) = match paint {
             Paint::Solid(c) => return Some(FillSource::Solid(*c)),
@@ -544,7 +510,6 @@ impl ColrCanvas<'_> {
                 )
             }
             Paint::SweepGradient(g) => {
-                // F2DOT14 angles carry the spec's 1.0 bias: degrees = v·180+180.
                 let start_deg = g.start_angle * 180.0 + 180.0;
                 let sweep_deg = (g.end_angle - g.start_angle) * 180.0;
                 if sweep_deg == 0.0 || !sweep_deg.is_finite() {
@@ -562,11 +527,9 @@ impl ColrCanvas<'_> {
                 )
             }
         };
-        // An empty color line fills with the foreground rather than dropping the layer.
         let Some(&(_, first)) = stops.first() else {
             return Some(FillSource::Solid(self.foreground));
         };
-        // One stop — or several that all carry one color — is a solid fill.
         if stops.iter().all(|s| rgba_eq(s.1, first)) {
             return Some(FillSource::Solid(first));
         }
@@ -583,18 +546,12 @@ impl ColrCanvas<'_> {
 
 impl<'a> Painter<'a> for ColrCanvas<'a> {
     fn outline_glyph(&mut self, glyph_id: GlyphId) {
-        // Snapshot `cur` now: the PaintGlyph clip lives in this space, and a transform
-        // pushed in its subtree moves only the gradient geometry. Fluent's 🔥 depends on
-        // it: warping the outline through its mirroring paint transforms samples the pad
-        // ramps at their alpha-0 ends and all but erases the glyph. Nested PaintGlyph
         // clips are not intersected (the module's src-over simplification).
         self.pending = Some((glyph_id, self.cur));
     }
     fn paint(&mut self, paint: Paint<'a>) {
         match self.resolve_paint(&paint) {
             Some(src) => self.fill_pending(&src),
-            // Ill-formed geometry (`resolve_paint`): the layer does not render; drop the
-            // pending outline so painter state stays sane.
             None => self.pending = None,
         }
     }
@@ -607,8 +564,6 @@ impl<'a> Painter<'a> for ColrCanvas<'a> {
             self.cur = t;
         }
     }
-    // Clip + layer composition beyond src-over are not modeled; the layer outlines
-    // self-clip, so ignoring these renders solid-layer COLR correctly.
     fn push_clip(&mut self) {}
     fn push_clip_box(&mut self, _clipbox: aterm_font::colr::ClipBox) {}
     fn pop_clip(&mut self) {}
@@ -616,9 +571,7 @@ impl<'a> Painter<'a> for ColrCanvas<'a> {
     fn pop_layer(&mut self) {}
 }
 
-/// Rasterize the COLR color glyph `gid` into an `w×h` RGBA8 buffer (fitted by
-/// [`colr_fit`], y-flipped). Returns `None` if `gid` is not a COLR glyph or the
-/// face has no COLR table. Pure + panic-free.
+/// Rasterize the COLR color glyph `gid` into an `w×h` RGBA8 buffer (fitted by [`colr_fit`], y-flipped).
 pub(crate) fn rasterize_colr(face: &Face, gid: GlyphId, w: usize, h: usize) -> Option<Vec<u8>> {
     rasterize_colr_run(face, &[(gid, 0.0, 0.0)], w, h)
 }
@@ -670,8 +623,7 @@ impl UnitBox {
 
 /// The glyph's LAYOUT box: its advance across, and down the face's line
 /// widened to its global ink box, so no glyph of the face loses its top or
-/// its descent. The fit of a face that declares no emoji frame
-/// ([`emoji_frame`]).
+/// its descent.
 fn layout_box(face: &Face, gid: GlyphId) -> Option<UnitBox> {
     let upem = f32::from(face.units_per_em());
     if upem <= 0.0 {
@@ -725,11 +677,7 @@ fn paint_box(face: &Face, gid: GlyphId) -> Option<UnitBox> {
 
 /// The face's EMOJI FRAME: the COLRv1 clip box of its 😀 (U+1F600), the
 /// square a full-size emoji of the face is drawn in, when the face declares
-/// one. Segoe UI Emoji's is 2050 units square, (369, -287)..(2419, 1763) in
-/// a 2812-unit advance, and every full-bleed emoji (😀 ✅ ❌ ⭐ 🚀) shares
-/// it (measured on Windows 11 26200, 2026-10-17); a smaller emoji (⚡, 👍)
-/// clips tighter inside it. `None` for a face without a ClipList, a COLRv0
-/// face, or one with no 😀.
+/// one.
 fn emoji_frame(face: &Face) -> Option<UnitBox> {
     let gid = face.glyph_index('\u{1F600}')?;
     let b = face.tables().colr?.clip_box(gid, &[])?;
@@ -744,20 +692,6 @@ fn emoji_frame(face: &Face) -> Option<UnitBox> {
 
 /// The base transform that draws the font-unit run `glyphs` (each `(gid, x,
 /// y)`: an origin, y up) into a `w × h` pixel box, y down.
-///
-/// ONE SCALE PER FACE, so the emoji of a line read as one size. A single glyph
-/// fits the face's [`emoji_frame`] — or, for a face that declares none, its
-/// [`layout_box`] — into the box with a pixel of air on every side, centred
-/// both ways. Fitting the em square instead put Segoe UI Emoji's ✅ 382 units
-/// right of centre and cut its side and its descent off; fitting the layout
-/// box drew it whole but at 14 of the 18 px a two-cell slot has (both
-/// measured on Windows 11, 2026-10-17). A glyph that paints past the frame
-/// (❤'s clip box is 2419 units wide) shrinks just enough that its paint box
-/// still fits the box, and is kept inside it.
-///
-/// A RUN of several glyphs (a ZWJ family Segoe UI Emoji draws as figures side
-/// by side, the last members with no advance of their own) fits the union of
-/// their paint boxes the same way.
 fn colr_fit(face: &Face, glyphs: &[(GlyphId, f32, f32)], w: usize, h: usize) -> Option<Affine> {
     let mut content: Option<UnitBox> = None;
     for &(gid, x, y) in glyphs {
@@ -780,7 +714,6 @@ fn colr_fit(face: &Face, glyphs: &[(GlyphId, f32, f32)], w: usize, h: usize) -> 
     if !scale.is_finite() || scale <= 0.0 {
         return None;
     }
-    // Centre the frame, then move (never cut) the paint box back inside.
     let inside = |offset: f32, lo: f32, hi: f32, room: f32| {
         if lo + offset < 0.0 {
             -lo
@@ -792,7 +725,6 @@ fn colr_fit(face: &Face, glyphs: &[(GlyphId, f32, f32)], w: usize, h: usize) -> 
     };
     let e = wf / 2.0 - scale * (frame.x_min + frame.x_max) / 2.0;
     let e = inside(e, scale * content.x_min, scale * content.x_max, wf);
-    // y flips: font `y` lands on pixel row `f - scale·y`.
     let f = hf / 2.0 + scale * (frame.y_min + frame.y_max) / 2.0;
     let f = inside(f, -scale * content.y_max, -scale * content.y_min, hf);
     Some(Affine {
@@ -805,10 +737,7 @@ fn colr_fit(face: &Face, glyphs: &[(GlyphId, f32, f32)], w: usize, h: usize) -> 
     })
 }
 
-/// Rasterize the COLR glyphs `glyphs` (each `(gid, x, y)`: its origin in font
-/// units, y up — the shaper's pen plus offsets) into one `w × h` RGBA8 buffer,
-/// fitted by [`colr_fit`]. `None` if any glyph is not a COLR glyph, or the
-/// face has no COLR table. Pure + panic-free.
+/// Rasterize the COLR glyphs `glyphs` (each `(gid, x, y)`: its origin in font units, y up — the shaper's pen plus offsets) into one `w × h` RGBA8 buffer, fitted by [`colr_fit`].
 pub(crate) fn rasterize_colr_run(
     face: &Face,
     glyphs: &[(GlyphId, f32, f32)],
@@ -848,16 +777,12 @@ pub(crate) fn rasterize_colr_run(
         });
         face.paint_color_glyph(gid, 0, fg, &mut canvas)?;
     }
-    // The accumulator holds premultiplied rgb, but `GlyphImage::Rgba` blits as straight
-    // alpha (like the PNG emoji path); un-premultiply so a translucent layer is not
-    // darkened twice (a² instead of a).
     let mut buf = canvas.buf;
     unpremultiply_straight(&mut buf);
     Some(buf)
 }
 
-/// Convert a premultiplied RGBA8 accumulator to straight alpha in place. Opaque and
-/// transparent pixels are already correct and are skipped, so opaque output is byte-exact.
+/// Convert a premultiplied RGBA8 accumulator to straight alpha in place.
 fn unpremultiply_straight(buf: &mut [u8]) {
     for px in buf.as_chunks_mut::<4>().0 {
         let a = u32::from(px[3]);
@@ -911,15 +836,7 @@ mod tests {
         (cols, rows)
     }
 
-    /// WINDOWS' COLOUR EMOJI FIT THEIR BOX WHOLE, AND FILL IT. Segoe UI Emoji
-    /// draws each glyph centered in an advance wider than its em, with
-    /// descents below the line, so the emoji of an agent's reply (✅ ❌ ⭐ ⚡ ⏳
-    /// 😀 🚀 👍, and ⚠ ❤ asked for with VS16), fitted into the Windows
-    /// default's two-cell box (18 x 23 px), keep a clear texel on every side —
-    /// nothing cut off — sit centered across it within a pixel, and the
-    /// full-bleed ones span at least 15 of its 18 columns (the face's emoji
-    /// frame less a pixel of air each side; the layout-box fit drew them 14
-    /// wide). The faces of one frame share one bottom row.
+    /// WINDOWS' COLOUR EMOJI FIT THEIR BOX WHOLE, AND FILL IT.
     #[test]
     #[cfg(windows)]
     fn segoe_ui_emoji_glyphs_draw_whole_and_centred_in_their_box() {
@@ -959,11 +876,7 @@ mod tests {
         );
     }
 
-    /// A ZWJ FAMILY IS ITS MEMBERS SIDE BY SIDE. Segoe UI Emoji shapes 👨‍👩‍👧
-    /// to three colour glyphs, the last with no advance of its own (it stands
-    /// after the woman by its outline alone). Painted at the shaper's pen
-    /// positions in one canvas, the run fits the two-cell box whole: ink in
-    /// each third of it, a clear texel on every side.
+    /// A ZWJ FAMILY IS ITS MEMBERS SIDE BY SIDE.
     #[test]
     #[cfg(windows)]
     fn a_segoe_family_paints_every_member_inside_its_box() {
@@ -1004,16 +917,15 @@ mod tests {
     #[test]
     fn add_span_full_and_partial_coverage() {
         let mut cov = vec![0.0f32; 5];
-        add_span(&mut cov, 1.0, 3.0, 1.0); // pixels 1,2 fully
+        add_span(&mut cov, 1.0, 3.0, 1.0);
         assert_eq!(cov, vec![0.0, 1.0, 1.0, 0.0, 0.0]);
         let mut cov = vec![0.0f32; 5];
-        add_span(&mut cov, 1.5, 2.5, 1.0); // half of 1, half of 2
+        add_span(&mut cov, 1.5, 2.5, 1.0);
         assert!((cov[1] - 0.5).abs() < 1e-6 && (cov[2] - 0.5).abs() < 1e-6);
     }
 
     #[test]
     fn affine_compose_then_apply() {
-        // Translate-then-scale composition matches manual math.
         let scale = Affine {
             a: 2.0,
             b: 0.0,
@@ -1030,7 +942,7 @@ mod tests {
             e: 3.0,
             f: 4.0,
         };
-        let m = scale.then(translate); // apply translate first, then scale
+        let m = scale.then(translate);
         assert_eq!(m.apply(0.0, 0.0), (6.0, 8.0));
     }
 
@@ -1044,10 +956,6 @@ mod tests {
     fn colr_glyph_rasterizes_straight_alpha() {
         let bytes = colr_test_font();
         let face = Face::parse(bytes, 0).expect("valid font");
-        // Every single-solid-layer glyph returns its palette rgb at fully-covered pixels,
-        // with the layer's alpha in the alpha channel. The exact un-premultiply arithmetic
-        // is `unpremultiply_restores_straight_rgb` (this font's translucent solid is black).
-        // The font's first colour glyph is a gradient, so solids are found by probing.
         let fg = RgbaColor::new(0, 0, 0, 255);
         let (mut opaque_checked, mut translucent_checked) = (false, false);
         for gid in (0..face.number_of_glyphs()).map(GlyphId) {
@@ -1068,7 +976,6 @@ mod tests {
             let (w, h) = (48, 48);
             let rgba = rasterize_colr(&face, gid, w, h).expect("COLR glyph rasterizes");
             assert_eq!(rgba.len(), w * h * 4);
-            // Fully-covered pixels land at exactly the layer's alpha.
             let full: Vec<&[u8; 4]> = rgba
                 .as_chunks::<4>()
                 .0
@@ -1106,8 +1013,6 @@ mod tests {
 
     #[test]
     fn unpremultiply_restores_straight_rgb() {
-        // Premultiplied half-transparent orange (straight 200,100,40 at α=128), an opaque
-        // pixel and a transparent one.
         let mut buf = vec![
             100, 50, 20, 128, //
             9, 8, 7, 255, //
@@ -1149,17 +1054,14 @@ mod tests {
     #[test]
     fn color_ramp_pad_repeat_reflect() {
         let two = |e| ramp(e, &[(0.0, (0, 0, 0, 255)), (1.0, (200, 100, 50, 255))]);
-        // The midpoint interpolates each channel linearly.
         let mid = two(GradientExtend::Pad).sample(0.5);
         assert_eq!(
             (mid.red, mid.green, mid.blue, mid.alpha),
             (100, 50, 25, 255)
         );
-        // Pad clamps outside the stop range.
         let p = two(GradientExtend::Pad);
         assert_eq!(p.sample(-1.0).red, 0);
         assert_eq!(p.sample(2.0).red, 200);
-        // Repeat tiles: t=1.25 ≡ 0.25. Reflect mirrors: t=1.25 ≡ 0.75.
         assert_eq!(
             two(GradientExtend::Repeat).sample(1.25).red,
             p.sample(0.25).red
@@ -1172,9 +1074,6 @@ mod tests {
 
     #[test]
     fn stop_interpolation_is_premultiplied() {
-        // Opaque red → transparent blue at u=0.5: the premultiplied midpoint
-        // keeps the straight rgb fully red at half alpha; a straight-space lerp
-        // would muddy it toward (128,0,128).
         let c = lerp_premul(
             RgbaColor::new(255, 0, 0, 255),
             RgbaColor::new(0, 0, 255, 0),
@@ -1185,22 +1084,17 @@ mod tests {
 
     #[test]
     fn linear_projection_respects_p2_rotation() {
-        // p2 perpendicular to p0→p1: plain projection along p0→p1.
         assert_eq!(linear_projection(10.0, 0.0, 0.0, 10.0), Some((10.0, 0.0)));
-        // Skewed p2: constant-colour lines run parallel to p0→p2 —
-        // t(p1) == 1 and t(p0 + r) == 0.
         let (qx, qy) = linear_projection(10.0, 0.0, 5.0, 10.0).expect("well-formed");
         let q2 = qx * qx + qy * qy;
         assert!(((10.0 * qx) / q2 - 1.0).abs() < 1e-5);
         assert!(((5.0 * qx + 10.0 * qy) / q2).abs() < 1e-5);
-        // p1 ON the p0→p2 line (and p2 == p0) are ill-formed per the spec.
         assert_eq!(linear_projection(5.0, 10.0, 5.0, 10.0), None);
         assert_eq!(linear_projection(10.0, 0.0, 0.0, 0.0), None);
     }
 
     #[test]
     fn radial_t_is_radius_fraction() {
-        // Classic concentric radial (r0=0 → r1=10 around the origin).
         let g = GradientFill {
             kind: GradientKind::Radial {
                 x0: 0.0,
@@ -1219,7 +1113,6 @@ mod tests {
         assert_eq!(g.sample_at(0.0, 0.0).expect("defined").red, 0);
         assert_eq!(g.sample_at(5.0, 0.0).expect("defined").red, 100);
         assert_eq!(g.sample_at(0.0, 10.0).expect("defined").red, 200);
-        // Pad extends beyond r1.
         assert_eq!(g.sample_at(30.0, 0.0).expect("defined").red, 200);
     }
 
@@ -1238,9 +1131,9 @@ mod tests {
             ),
             inv: IDENTITY,
         };
-        assert_eq!(g.sample_at(10.0, 0.0).expect("defined").red, 0); // 0°
-        assert_eq!(g.sample_at(0.0, 10.0).expect("defined").red, 100); // 90° CCW
-        assert_eq!(g.sample_at(-10.0, 1e-4).expect("defined").red, 200); // 180°
+        assert_eq!(g.sample_at(10.0, 0.0).expect("defined").red, 0);
+        assert_eq!(g.sample_at(0.0, 10.0).expect("defined").red, 100);
+        assert_eq!(g.sample_at(-10.0, 1e-4).expect("defined").red, 200);
     }
 
     /// Counts multi-colour gradient layers vs solid layers (and the last solid colour)
@@ -1284,9 +1177,7 @@ mod tests {
     }
 
     /// The most distinct colours in any horizontal or vertical run of constant alpha
-    /// (α ≥ 128, ≥ 8 px). Compositing and coverage artefacts scale rgb per alpha, so a flat
-    /// fill stays one colour (rarely 2-3) within such a run while a gradient sweeps many.
-    /// α ≥ 128, not 255: Fluent glyphs such as 🔥 use only translucent stops.
+    /// (α ≥ 128, ≥ 8 px).
     fn max_constant_alpha_run_spread(rgba: &[u8], w: usize, h: usize) -> usize {
         let px = rgba.as_chunks::<4>().0;
         assert_eq!(px.len(), w * h);
@@ -1295,7 +1186,6 @@ mod tests {
                 std::collections::HashSet::new();
             let mut run_alpha = 0u8;
             let mut len = 0usize;
-            // The transparent sentinel forces the final flush.
             for p in seq.chain(std::iter::once([0, 0, 0, 0])) {
                 if p[3] >= 128 && (len == 0 || p[3] == run_alpha) {
                     run_alpha = p[3];
@@ -1303,7 +1193,6 @@ mod tests {
                     len += 1;
                     continue;
                 }
-                // Run ends: alpha changed, dropped below 128, or the sentinel.
                 if len >= 8 {
                     *best = (*best).max(colors.len());
                 }
@@ -1342,7 +1231,6 @@ mod tests {
             if face.paint_color_glyph(gid, 0, fg, &mut probe).is_none() {
                 continue;
             }
-            // Pure-gradient glyphs with few layers only.
             if probe.gradient_layers == 0 || probe.solid_layers != 0 || probe.gradient_layers > 4 {
                 continue;
             }

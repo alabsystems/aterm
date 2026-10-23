@@ -2,32 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Span anchors: the absolute rows the engine's holder fence keeps
-//! (`aterm_core::terminal::holder_fence`), moved by the grid's own row-motion
-//! record instead of by hooks in each VT handler.
-//!
-//! An anchor is one boundary of a span of rows a foreground program wrote: a
-//! [`AnchorRole::Start`] is the span's first row, an [`AnchorRole::End`] the
-//! row after its last. Each rides the choke point that already records the
-//! motion for the band record and the selection:
-//!
-//! | Grid event | Anchor rule |
-//! |---|---|
-//! | a band move (IL/DL, a region scroll, RI at a region top) | translate and clamp inside the band; an End at its start excludes inserted rows |
-//! | the top-anchored archival scroll's splice at `at` | a Start at or after `at` shifts; an End only past `at` |
-//! | a rectangle move, a reset, a rotation, a renumbering | [`AnchorSet::lost`] |
-//! | an alt-screen swap | nothing: the outgoing grid's rows did not move |
-//! | ED3 / `clear_scrollback` | rows below the oldest retained row clamp up to it |
-//! | a width reflow | lent ([`AnchorLend`], `grid::anchor_lend`) |
-//!
-//! The set is empty, and every hook a branch on `live == 0`, until a drawer
-//! runs: zero cost at rest.
+//! Span anchors tracked across grid row motion for the holder fence.
 
 /// The most anchors a grid keeps: eight marks of four spans, two ends each.
 pub const MAX_ANCHORS: usize = 64;
 
-/// A slot in an [`AnchorSet`]. Stable while the anchor lives; a freed slot is
-/// reused by the next [`AnchorSet::place`].
+/// Slot identifier in an [`AnchorSet`], reused after [`AnchorSet::free`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AnchorId(u16);
 
@@ -47,9 +27,7 @@ impl AnchorId {
     }
 }
 
-/// Which boundary of a span an anchor is. The two differ only where rows are
-/// inserted at the anchor (a band insertion or [`AnchorSet::splice`]) and where a rewrap lands it
-/// inside a row (`grid::anchor_lend`): both exclude what they cannot vouch for.
+/// Which boundary of a row span an anchor represents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnchorRole {
     /// The span's first row (inclusive).
@@ -69,16 +47,7 @@ pub struct Anchor {
     pub live: bool,
 }
 
-/// The grid's span anchors, beside the band record in
-/// [`GridPresentationState`](super::GridPresentationState).
-///
-/// `lost` is the fail-closed bit: some row motion moved rows no anchor rule
-/// describes, so every anchor's row may now name other content. The fence
-/// reads it as taint on every mark that holds an anchor, and clears it.
-///
-/// `seal_epoch` counts the events that re-key rows under a fence's seal
-/// (a rewrap's lend, history revealed back onto the screen, a loss): a seal
-/// taken at one epoch speaks only for rows read at the same epoch.
+/// Span anchors tracked in [`GridPresentationState`](super::GridPresentationState).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AnchorSet {
     anchors: Vec<Anchor>,
@@ -102,8 +71,7 @@ impl AnchorSet {
         self.live as usize
     }
 
-    /// Some motion moved rows no anchor rule describes since the fence last
-    /// cleared this ([`Self::clear_lost`]).
+    /// Returns whether an untracked row motion occurred since [`Self::clear_lost`].
     #[must_use]
     #[inline]
     pub const fn lost(&self) -> bool {
@@ -123,8 +91,7 @@ impl AnchorSet {
         self.seal_epoch
     }
 
-    /// Place an anchor at absolute `row`. `None` when [`MAX_ANCHORS`] live:
-    /// the caller fails closed (no span it cannot bound).
+    /// Places an anchor at absolute `row`, or returns `None` when [`MAX_ANCHORS`] live.
     pub fn place(&mut self, row: u64, role: AnchorRole) -> Option<AnchorId> {
         let anchor = Anchor {
             row,
@@ -146,11 +113,7 @@ impl AnchorSet {
         u16::try_from(slot).ok().map(AnchorId)
     }
 
-    /// Free `id` (a no-op for a slot already free). The last one going
-    /// leaves the empty set: no anchor is left to be wrong (the loss goes),
-    /// no seal names a row (the epoch restarts), and the slots are released,
-    /// so a session whose drawers have all gone holds no allocation and
-    /// checkpoints nothing.
+    /// Frees `id`, resetting the set when the last live anchor is removed.
     pub fn free(&mut self, id: AnchorId) {
         if let Some(a) = self.anchors.get_mut(usize::from(id.0))
             && a.live
@@ -173,16 +136,14 @@ impl AnchorSet {
             .filter(|a| a.live)
     }
 
-    /// The live anchor's row (`None` for a freed or unknown slot, which a
-    /// reader treats as lost).
+    /// Returns the live anchor's row, or `None` for a freed or unknown slot.
     #[must_use]
     #[inline]
     pub fn row(&self, id: AnchorId) -> Option<u64> {
         self.get(id).map(|a| a.row)
     }
 
-    /// Move a live anchor to `row` (the fence re-anchoring a span on a full
-    /// clear). `false` for a freed slot.
+    /// Moves a live anchor to `row`, returning `false` for a freed slot.
     #[inline]
     pub fn set_row(&mut self, id: AnchorId, row: u64) -> bool {
         match self.anchors.get_mut(usize::from(id.0)) {
@@ -216,10 +177,7 @@ impl AnchorSet {
         })
     }
 
-    /// Rows `top..=bottom` of the screen whose top row is absolute `base`
-    /// moved by `delta` (a [`RowBandMove`](super::RowBandMove)): an anchor
-    /// inside the band moves with its row, clamped to the band and the row
-    /// after it, where vacated rows are blank.
+    /// Translates and clamps anchors within screen rows `top..=bottom` at `base` by `delta`.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -237,12 +195,9 @@ impl AnchorSet {
         let (top, end) = (i64::from(top), i64::from(bottom) + 1);
         for a in self.anchors.iter_mut().filter(|a| a.live) {
             if (lo..=hi).contains(&a.row) {
-                // An exclusive end at the band start owns none of the rows
-                // inserted there; a Start follows the old first row instead.
                 if a.role == AnchorRole::End && a.row == lo && delta > 0 {
                     continue;
                 }
-                // Inside the band: a screen row, so it fits `i64`.
                 let screen = i64::try_from(a.row - base).unwrap_or(end);
                 let moved = screen.saturating_add(delta).clamp(top, end);
                 a.row = base.saturating_add(moved.unsigned_abs());
@@ -250,11 +205,7 @@ impl AnchorSet {
         }
     }
 
-    /// `inserted` rows were inserted at absolute `at` (the archival scroll's
-    /// [`AbsoluteRowUpdate::Splice`](super::AbsoluteRowUpdate::Splice)): a
-    /// Start at or after `at` shifts, an End only past it, the rule
-    /// `OutputBlock::end_row` keeps, so a span ending at the boundary never
-    /// absorbs the inserted rows.
+    /// Shifts anchors at or past `at` by `inserted` rows for an archival splice.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -279,9 +230,7 @@ impl AnchorSet {
         }
     }
 
-    /// History older than `oldest` was erased (ED3): an anchor below it names
-    /// no row and clamps up to it, so a span wholly in the erased history is
-    /// empty.
+    /// Clamps anchors below `oldest` up to `oldest` after history erasure.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -296,8 +245,7 @@ impl AnchorSet {
         }
     }
 
-    /// Rows moved in a way no anchor rule describes (a rectangle copy or
-    /// shift, a reset, a rotation of rows below history).
+    /// Marks the anchor set lost after an untracked row motion.
     #[inline]
     pub(crate) const fn lose(&mut self) {
         if self.live > 0 {
@@ -306,8 +254,7 @@ impl AnchorSet {
         }
     }
 
-    /// Rows were renumbered outside a lend (a Kitty unscroll, a pullback, a
-    /// renumbering carry or restore): [`Self::lose`].
+    /// Marks the anchor set lost when rows are renumbered outside a lend.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -323,8 +270,7 @@ impl AnchorSet {
         }
     }
 
-    /// Rows were re-keyed under a seal without moving an anchor: history
-    /// revealed back onto the screen, or a lend returned.
+    /// Advances the seal epoch when rows are re-keyed without moving anchors.
     #[inline]
     pub(crate) const fn note_rekeyed(&mut self) {
         if self.live > 0 {
@@ -332,8 +278,7 @@ impl AnchorSet {
         }
     }
 
-    /// Take every anchor out for a lend, leaving an empty set behind (so the
-    /// hooks the lent operation runs touch nothing) that keeps the epoch.
+    /// Takes all anchors for a lend, leaving an empty set at the current epoch.
     #[inline]
     pub(crate) fn take_for_lend(&mut self) -> Self {
         let epoch = self.seal_epoch;
@@ -348,8 +293,7 @@ impl AnchorSet {
         self.anchors.iter_mut().enumerate().filter(|(_, a)| a.live)
     }
 
-    /// Mark the set lost unconditionally on the lend's return (the rewrap
-    /// could not be verified).
+    /// Marks the set lost when a lent rewrap could not be verified.
     #[inline]
     pub(crate) const fn lose_lent(&mut self) {
         self.lose();
@@ -362,10 +306,7 @@ impl AnchorSet {
     }
 }
 
-/// One law of the holder fence switched off, for the writer oracle's
-/// negative controls (`aterm_core::terminal::holder_fence`). Each is a
-/// mutant of the `HolderFence` model (`aterm_models_core`); the release build
-/// reads every knob as off.
+/// Holder-fence negative-control mutation knobs for tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
 pub enum FenceKnob {
@@ -387,11 +328,9 @@ pub enum FenceKnob {
     LayTaintSkipsCursorRow = 1 << 7,
     /// An exec into a drawer inherits the outgoing mark's spans.
     ExecInherits = 1 << 8,
-    /// Suspended marks are evicted by count, live or not: the fence keeps one
-    /// (a liveness control).
+    /// Evicts suspended marks by count regardless of liveness.
     CountEviction = 1 << 9,
-    /// A stop leaves the outgoing mark's `alt_fresh` set, so a reselect
-    /// admits an alternate screen others wrote while it was stopped.
+    /// Preserves `alt_fresh` on stop so reselect admits external alternate-screen writes.
     StopKeepsAltFresh = 1 << 10,
 }
 
@@ -412,8 +351,7 @@ mod knob_state {
         ARMED.with(|a| a.get() & k as u16 != 0)
     }
 
-    /// Run `f` with `k` switched off on this thread, restored afterwards even
-    /// on unwind.
+    /// Runs `f` with `k` armed on this thread and restores the previous state on exit.
     pub fn with_knob<T>(k: FenceKnob, f: impl FnOnce() -> T) -> T {
         struct Restore(u16);
         impl Drop for Restore {
@@ -482,15 +420,12 @@ mod tests {
             (108, AnchorRole::End),   // in the band, pushed off its bottom by IL
             (111, AnchorRole::Start), // below the band
         ]);
-        // Screen base 100, band rows 1..=8, up by 2 (DL at row 1).
         set.band_move(100, 1, 8, -2);
         assert_eq!(set.row(ids[0]), Some(100));
         assert_eq!(set.row(ids[1]), Some(101));
         assert_eq!(set.row(ids[2]), Some(101), "clamped to the band's top");
         assert_eq!(set.row(ids[3]), Some(106));
         assert_eq!(set.row(ids[4]), Some(111));
-        // Down by 3 (IL at row 1): an anchor near the bottom leaves to the row
-        // after the band.
         set.band_move(100, 1, 8, 3);
         assert_eq!(set.row(ids[3]), Some(109), "clamped to bottom + 1");
         assert_eq!(set.row(ids[1]), Some(104));
@@ -522,7 +457,6 @@ mod tests {
         let (mut set, ids) = set_with(&[(20, AnchorRole::End)]);
         with_knob(FenceKnob::SpliceEndAsStart, || set.splice(20, 3));
         assert_eq!(set.row(ids[0]), Some(23));
-        // Restored after the scope.
         assert!(!knob(FenceKnob::SpliceEndAsStart));
     }
 

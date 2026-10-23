@@ -1,38 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! CLAUDE CODE'S `/login` DIALOG, read whole (MEASURED on 2.1.303 in the
-//! real-Claude lab, 2026-10-19: `fixtures/claude-2.1.303-login-*.txt`; the
-//! success state READ in its bundle, no lab can sign in).
-//!
-//! `/login` draws one dialog under the conversation: a full-width rule, the
-//! title `Login` at column two, its body, and `Esc to cancel`. No composer is
-//! drawn while it stands. Its states, in the order a sign-in walks them:
-//!
-//! * THE METHOD PICKER, `Select login method:` over three numbered methods —
-//!   `Claude account with subscription · …`, `Anthropic Console account ·
-//!   …`, `3rd-party platform · …` — the `❯` on the focused one (the first,
-//!   at the dialog's start). A session whose settings force a method skips
-//!   it. Under an environment OAuth token a warning stands above the
-//!   question.
-//! * CONSOLE'S MENU, `How do you want to sign in?`, whose second option MINTS
-//!   AN API KEY in the Console workspace.
-//! * THE BROWSER HAND-OFF: `Opening browser to sign in…` for three seconds,
-//!   then `Browser didn't open? Use the url below to sign in (c to copy)`,
-//!   the URL, and the masked field `Paste code here if prompted >`. The
-//!   sign-in is the person's, in the browser; `c` copies, Esc abandons.
-//! * SUCCESS, `Logged in as <email>` over `Login successful. Press Enter to
-//!   continue…`: the login is saved already, and Enter only closes the
-//!   dialog.
-//! * Every other state ([`LoginScreen::Failed`]): `OAuth error: …` over
-//!   `Press Enter to retry.` (MEASURED: a code exchange the lab's proxy
-//!   refused), a login saved only for now, an account on hold.
-//!
-//! Esc out of any of them before success leaves `❯ /login` over `⎿  Login
-//! interrupted` ([`login_interrupted`]) and the wall it was typed at.
-//!
-//! This reads; it decides nothing. What the harness presses on each is the
-//! supervisor's (`aterm-agent`'s `supervise::policy::login`).
+//! Reader for Claude Code's `/login` dialog states and interrupted-login walls.
 
 use crate::anchors::anchor_text;
 use crate::text::{contains, trim, trim_end};
@@ -92,14 +61,12 @@ impl LoginMethod {
     }
 }
 
-/// The picker's rows: each method's index among its options, and which one
-/// the `❯` stands on.
+/// The picker's rows: each method's index among its options, and which one `❯` stands on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Picker {
     /// The methods in the order drawn (option 1 first).
     pub methods: Vec<LoginMethod>,
-    /// The index into [`Self::methods`] of the focused one: `Some(0)` as the
-    /// dialog opens, anywhere else moved there by a key.
+    /// Index into [`Self::methods`] of the focused option.
     pub focused: Option<usize>,
     /// The dialog's title row, for a key's guard.
     pub title_row: String,
@@ -135,11 +102,7 @@ fn rule(row: &str) -> bool {
     t.chars().count() >= 20 && t.chars().all(|c| c == '─')
 }
 
-/// The `/login` dialog on `rows`, if it is what the screen ends with: the
-/// last full-width rule, the title `Login` the first row under it, no rule
-/// under that (a composer's frame is two rules), and a body this module
-/// knows. `None` for every other screen — the conversation, a composer, any
-/// other dialog.
+/// Parses the `/login` dialog on `rows` if the screen ends with one.
 #[must_use]
 pub fn login_screen(rows: &[String]) -> Option<LoginScreen> {
     let last_rule = rows.iter().rposition(|r| rule(r))?;
@@ -208,9 +171,7 @@ fn anchor_text_of(id: &str) -> &'static str {
     crate::anchors::anchor(id)
 }
 
-/// Whether the last thing said is `⎿  Login interrupted` under `❯ /login`:
-/// the dialog left by Esc (or by its cancel) before its success, the login
-/// still gone.
+/// Whether the last thing said is `⎿  Login interrupted` under `❯ /login`.
 #[must_use]
 pub fn login_interrupted(rows: &[String]) -> bool {
     let said: Vec<&str> = rows
@@ -218,7 +179,6 @@ pub fn login_interrupted(rows: &[String]) -> bool {
         .map(|r| trim_end(r))
         .filter(|r| !r.is_empty())
         .collect();
-    // The composer's frame below it: the rows above its top rule.
     let end = said
         .iter()
         .rposition(|r| r.starts_with('❯') && !r.starts_with("❯ /login"))
@@ -248,27 +208,16 @@ fn said_above(rows: &[String], i: usize) -> Option<usize> {
     rows[..i].iter().rposition(|r| !trim(r).is_empty())
 }
 
-/// THE `/login` THE SCREEN SHOWS, TYPED AT A LOST LOGIN
-/// ([`login_at_wall`]).
+/// A `/login` typed at a lost-login wall ([`login_at_wall`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoginAtWall {
     /// The lost login's words, as its row says them.
     pub message: String,
-    /// A `/login` typed at the same lost login before this one was left:
-    /// `❯ /login` over `⎿  Login interrupted` between the wall's row and it.
+    /// Whether an earlier `/login` at the same wall was interrupted before this one.
     pub left_before: bool,
 }
 
-/// WHETHER THE `/login` THE SCREEN SHOWS WAS TYPED AT A LOST LOGIN: the one
-/// whose dialog stands ([`login_screen`]), or whose `⎿  Login interrupted`
-/// is the last thing said ([`login_interrupted`]). Neither draws the wall's
-/// row as the last thing said — the dialog is drawn under it, and the
-/// interrupt is said after it — so the screen is read as it stood when that
-/// `/login` was typed: the rows above its `❯ /login` (past any `/login` left
-/// at the same wall before it) over an empty composer, read for a wall
-/// ([`crate::wall::wall`]) that is a lost login. `None` for every other
-/// screen: no dialog and no interrupt, or a `/login` typed anywhere but at a
-/// lost login (a person's on a working session, after their own Esc).
+/// Returns the lost-login wall above a standing or interrupted `/login`, if any.
 #[must_use]
 pub fn login_at_wall(rows: &[String]) -> Option<LoginAtWall> {
     let from = if login_screen(rows).is_some() {

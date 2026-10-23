@@ -1,28 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Selections and drag and drop: a seat's `wl_data_device` (the clipboard,
-//! and drags) and `zwp_primary_selection_device_v1` (the primary selection),
-//! the offers the compositor hands them, the sources this client offers, and
-//! the pipes the bytes cross.
-//!
-//! A [`Device`] keeps its offers as the protocol has them: each offer arrives
-//! (`data_offer`) with its MIME types and then becomes the selection or the
-//! drag; a selection replaces the one before it (destroyed), a drag's offer
-//! is destroyed when it leaves undropped, and a dropped one when the client
-//! [finishes](Device::finish_drag) it, or once the client has
-//! [taken it over](Device::take_dropped), when that handle is finished or
-//! dropped. An offer announced and never used is destroyed once a later one
-//! is. A drag's [`DragEvent`]s go to the caller's [`Sink`] as they are heard
-//! ([`crate::sink`]). Reading an offer gives the read end of a pipe whose
-//! write end went to its source; flush the display before reading it, and
-//! read it off the dispatching thread when the source may be this client
-//! (its `send` arrives on the dispatching thread).
-//!
-//! A [`Source`] hands what the compositor asks of it ([`SourceEvent`]) to the
-//! caller's sink the same way: a `send` carries the descriptor to write the
-//! bytes to and close ([`write_detached`] does it on a thread of its own, so
-//! a reader that never reads blocks nothing).
+//! Selections and drag and drop: a seat's `wl_data_device` (the clipboard, and drags) and `zwp_primary_selection_device_v1` (the primary selection), the offers the compositor hands them, the sources this client offers, and the pipes the bytes cross.
 
 use std::ffi::{CStr, CString};
 use std::io::{self, PipeReader, Read, Write};
@@ -43,12 +22,10 @@ use crate::protocols::wp_primary_selection_unstable_v1::{
 use crate::proxy::{Error, EventArg, Listener, Proxy};
 use crate::sink::Sink;
 
-/// The highest `wl_data_device_manager` version bound (smithay-client-toolkit
-/// 0.19.2's, the winit fork's data device until LW.7).
+/// The highest `wl_data_device_manager` version bound (smithay-client-toolkit 0.19.2's, the winit fork's data device until LW.7).
 pub const DATA_DEVICE_VERSION: u32 = 3;
 
-/// The most MIME types one offer keeps; a compositor that announces more is
-/// heard no further.
+/// The most MIME types one offer keeps; a compositor that announces more is heard no further.
 pub const MAX_MIME_TYPES: usize = 256;
 
 /// Which selection.
@@ -60,8 +37,7 @@ pub enum Kind {
     Primary,
 }
 
-/// A device manager: `wl_data_device_manager` or
-/// `zwp_primary_selection_device_manager_v1`.
+/// A device manager: `wl_data_device_manager` or `zwp_primary_selection_device_manager_v1`.
 pub struct Manager {
     kind: Kind,
     proxy: Proxy,
@@ -106,10 +82,7 @@ impl Manager {
 
 impl Drop for Manager {
     fn drop(&mut self) {
-        // SAFETY: the manager this value bound, destroyed once; its devices
-        // and sources are its caller's to end first. wl_data_device_manager
-        // has no destructor request before the core protocol's version 4,
-        // which is never bound.
+        // SAFETY: the manager this value bound, destroyed once; its devices and sources are its caller's to end first. wl_data_device_manager has no destructor request before the core protocol's version 4, which is never bound.
         unsafe {
             match self.kind {
                 Kind::Clipboard => self.proxy.destroy(),
@@ -132,8 +105,7 @@ pub struct OfferInfo {
 /// A drag-and-drop event of a clipboard device.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DragEvent {
-    /// A drag entered `surface`; `offer` is what it carries (`None` for a
-    /// drag within one client that offers nothing).
+    /// A drag entered `surface`; `offer` is what it carries (`None` for a drag within one client that offers nothing).
     Enter {
         serial: u32,
         surface: Option<Proxy>,
@@ -151,8 +123,7 @@ pub enum DragEvent {
     Drop,
 }
 
-/// An offer this device received. Dropping it destroys it, then frees its
-/// listener; the device drops its offers with the book unlocked.
+/// An offer this device received.
 struct OfferSlot {
     kind: Kind,
     proxy: Proxy,
@@ -172,8 +143,7 @@ impl OfferSlot {
 
 impl Drop for OfferSlot {
     fn drop(&mut self) {
-        // SAFETY: an offer this device received, destroyed once; its
-        // listener is freed after.
+        // SAFETY: an offer this device received, destroyed once; its listener is freed after.
         unsafe {
             match self.kind {
                 Kind::Clipboard => wl_data_offer::destroy(self.proxy),
@@ -191,10 +161,7 @@ struct Drag {
     dropped: bool,
 }
 
-/// What a device's listener and the caller share. As `seat::SeatBook`, it is
-/// a leaf of the lock graph: nothing the lock census resolves by name is
-/// called while it is held, and offers are made and destroyed, and the
-/// caller's sink called, with it unlocked.
+/// What a device's listener and the caller share.
 struct DeviceBook {
     /// Every live offer, in arrival order.
     offers: Vec<OfferSlot>,
@@ -254,13 +221,9 @@ pub struct Device {
 }
 
 impl Device {
-    /// The device of `manager`'s kind on `seat`. A clipboard device's drag
-    /// events go to `sink` as they are heard (a primary-selection device
-    /// has none).
-    ///
+    /// The device of `manager`'s kind on `seat`.
     /// # Safety
-    /// `seat` is a live `wl_seat` on the manager's display and outlives the
-    /// device.
+    /// `seat` is a live `wl_seat` on the manager's display and outlives the device.
     pub unsafe fn new(
         manager: &Manager,
         seat: Proxy,
@@ -279,8 +242,7 @@ impl Device {
             selection: None,
             drag: None,
         }));
-        // SAFETY: a device made here, without a listener; the listener is
-        // freed after the device is released (Drop).
+        // SAFETY: a device made here, without a listener; the listener is freed after the device is released (Drop).
         let listener = match unsafe { device_listener(proxy, &device_book, manager.kind, sink) } {
             Ok(l) => l,
             Err(e) => {
@@ -304,9 +266,7 @@ impl Device {
         self.kind
     }
 
-    /// The current selection's offer, as of the last dispatch; `None` when
-    /// nothing is selected (or this client's keyboard is elsewhere: a
-    /// compositor sends the selection to the focused client).
+    /// The current selection's offer, as of the last dispatch; `None` when nothing is selected (or this client's keyboard is elsewhere: a compositor sends the selection to the focused client).
     pub fn selection(&self) -> Option<OfferInfo> {
         let device_book = self
             .device_book
@@ -315,8 +275,7 @@ impl Device {
         device_book.selection.and_then(|o| device_book.info(o))
     }
 
-    /// Ask the selection's source for its bytes as `mime_type`: the read
-    /// end of the pipe they arrive on.
+    /// Ask the selection's source for its bytes as `mime_type`: the read end of the pipe they arrive on.
     pub fn receive_selection(&self, mime_type: &CStr) -> io::Result<PipeReader> {
         let offer = self
             .device_book
@@ -327,8 +286,7 @@ impl Device {
         receive(self.kind, offer, mime_type)
     }
 
-    /// Make `source` the selection (`None` clears it), with the serial of
-    /// the input that asked for it. A source of the other kind is refused.
+    /// Make `source` the selection (`None` clears it), with the serial of the input that asked for it.
     pub fn set_selection(&self, source: Option<&Source>, serial: u32) -> bool {
         if source.is_some_and(|s| s.kind != self.kind) {
             return false;
@@ -357,10 +315,7 @@ impl Device {
             .and_then(|o| device_book.info(o))
     }
 
-    /// Answer the drag over this client: `mime_type` is what a drop would be
-    /// read as (`None`: no drop here), `actions` the actions this client
-    /// takes and `preferred` the one it prefers (version 3). False when no
-    /// drag carries an offer here.
+    /// Answer the drag over this client: `mime_type` is what a drop would be read as (`None`: no drop here), `actions` the actions this client takes and `preferred` the one it prefers (version 3).
     pub fn accept_drag(&self, mime_type: Option<&CStr>, actions: u32, preferred: u32) -> bool {
         let over = self
             .device_book
@@ -383,9 +338,7 @@ impl Device {
         true
     }
 
-    /// Refuse the drag over this client: no type would be read
-    /// (`wl_data_offer.accept` with none), and no actions are named. False
-    /// when no drag carries an offer here.
+    /// Refuse the drag over this client: no type would be read (`wl_data_offer.accept` with none), and no actions are named.
     pub fn reject_drag(&self) -> bool {
         let over = self
             .device_book
@@ -403,11 +356,7 @@ impl Device {
         true
     }
 
-    /// Take over the offer that was dropped on this client: the device
-    /// forgets it, and the caller reads it, then [finishes](Dropped::finish)
-    /// it (or drops it, which destroys it unfinished: a drop that was refused
-    /// must not be finished). `None` when nothing was dropped, or the drop
-    /// carried no offer.
+    /// Take over the offer that was dropped on this client: the device forgets it, and the caller reads it, then [finishes](Dropped::finish) it (or drops it, which destroys it unfinished: a drop that was refused must not be finished).
     pub fn take_dropped(&self) -> Option<Dropped> {
         let slot = {
             let mut device_book = self
@@ -429,8 +378,7 @@ impl Device {
         })
     }
 
-    /// Read the drag's offer as `mime_type`: while it is over this client,
-    /// or after it dropped here.
+    /// Read the drag's offer as `mime_type`: while it is over this client, or after it dropped here.
     pub fn receive_drag(&self, mime_type: &CStr) -> io::Result<PipeReader> {
         let offer = self
             .device_book
@@ -445,8 +393,7 @@ impl Device {
         receive(self.kind, offer, mime_type)
     }
 
-    /// The drop is read: tell the source (`finish`, version 3) and destroy
-    /// the offer.
+    /// The drop is read: tell the source (`finish`, version 3) and destroy the offer.
     pub fn finish_drag(&self) {
         let (drag, slot) = {
             let mut device_book = self
@@ -470,10 +417,7 @@ impl Device {
         drop(slot);
     }
 
-    /// Start a drag from `origin` (a surface of this client the pointer
-    /// pressed on, `serial` that press's) carrying `source`, with `icon` as
-    /// the drag's image. The clipboard device's alone.
-    ///
+    /// Start a drag from `origin` (a surface of this client the pointer pressed on, `serial` that press's) carrying `source`, with `icon` as the drag's image.
     /// # Safety
     /// `origin` and `icon` are live `wl_surface`s of this client's display.
     pub unsafe fn start_drag(
@@ -503,9 +447,7 @@ impl Drop for Device {
             .offers
             .split_off(0);
         drop(offers);
-        // SAFETY: the device this value made, released once (`release`
-        // from version 2, the proxy alone before); its listener is freed
-        // after.
+        // SAFETY: the device this value made, released once (`release` from version 2, the proxy alone before); its listener is freed after.
         unsafe {
             match self.kind {
                 Kind::Clipboard if self.version >= 2 => wl_data_device::release(self.proxy),
@@ -517,8 +459,7 @@ impl Drop for Device {
     }
 }
 
-/// An offer dropped on this client and taken over from its device
-/// ([`Device::take_dropped`]). Dropping it destroys the offer.
+/// An offer dropped on this client and taken over from its device ([`Device::take_dropped`]).
 pub struct Dropped {
     info: OfferInfo,
     slot: Option<OfferSlot>,
@@ -531,8 +472,7 @@ impl Dropped {
         &self.info
     }
 
-    /// Ask the drag's source for its bytes as `mime_type`: the read end of
-    /// the pipe they arrive on.
+    /// Ask the drag's source for its bytes as `mime_type`: the read end of the pipe they arrive on.
     pub fn receive(&self, mime_type: &CStr) -> io::Result<PipeReader> {
         let slot = self
             .slot
@@ -541,14 +481,11 @@ impl Dropped {
         receive(slot.kind, slot.proxy, mime_type)
     }
 
-    /// The drop is read: tell the source (`finish`, version 3), then destroy
-    /// the offer. Only for a drop this client accepted (a type and an
-    /// action): finishing any other is a protocol error.
+    /// The drop is read: tell the source (`finish`, version 3), then destroy the offer.
     pub fn finish(mut self) {
         if let Some(slot) = self.slot.take() {
             if self.version >= 3 {
-                // SAFETY: the live, dropped offer, destroyed only by the
-                // slot's drop just after.
+                // SAFETY: the live, dropped offer, destroyed only by the slot's drop just after.
                 unsafe { wl_data_offer::finish(slot.proxy) };
             }
             drop(slot);
@@ -560,8 +497,7 @@ impl Dropped {
 /// returned.
 fn receive(kind: Kind, offer: Proxy, mime_type: &CStr) -> io::Result<PipeReader> {
     let (reader, writer) = io::pipe()?;
-    // SAFETY: the live offer; libwayland duplicates the descriptor for the
-    // send, and this end closes when `writer` drops.
+    // SAFETY: the live offer; libwayland duplicates the descriptor for the send, and this end closes when `writer` drops.
     unsafe {
         match kind {
             Kind::Clipboard => wl_data_offer::receive(offer, mime_type, writer.as_raw_fd()),
@@ -573,7 +509,6 @@ fn receive(kind: Kind, offer: Proxy, mime_type: &CStr) -> io::Result<PipeReader>
 }
 
 /// Listen to a device.
-///
 /// # Safety
 /// `proxy` is a live device of `kind` this module made, without a listener,
 /// released before the listener is freed.
@@ -597,7 +532,6 @@ unsafe fn device_listener(
 }
 
 /// Listen to an offer: what it says goes to its book.
-///
 /// # Safety
 /// `proxy` is a live offer of `kind` the device received, without a
 /// listener, destroyed before the listener is freed.
@@ -610,8 +544,6 @@ unsafe fn offer_listener(
     // SAFETY: the caller's contract.
     let listener = unsafe {
         proxy.listen(move |_, opcode, args| {
-            // `offer` is opcode 0 in both protocols; primary offers say
-            // nothing else.
             let said = match (opcode, args) {
                 (wl_data_offer::evt::OFFER, [EventArg::Str(Some(mime))]) => {
                     Said::Mime(mime.to_string_lossy().into_owned())
@@ -653,16 +585,13 @@ impl OfferInfo {
     }
 }
 
-/// A device's events. An offer is made, and the offers a change leaves
-/// unheld are ended, with the book unlocked; the drag event it makes, for the
-/// sink.
+/// A device's events.
 fn on_device(
     device_book: &Mutex<DeviceBook>,
     kind: Kind,
     opcode: u32,
     args: &[EventArg<'_>],
 ) -> Option<DragEvent> {
-    // `data_offer` is opcode 0 in both protocols, `selection` 5 and 1.
     let selection_op = match kind {
         Kind::Clipboard => wl_data_device::evt::SELECTION,
         Kind::Primary => primary_device::evt::SELECTION,
@@ -670,8 +599,7 @@ fn on_device(
     let (ended, heard): (Vec<OfferSlot>, Option<DragEvent>) = match (opcode, args) {
         (wl_data_device::evt::DATA_OFFER, [EventArg::NewId(Some(offer))]) => {
             let offer_book = Arc::new(Mutex::new(OfferInfo::default()));
-            // SAFETY: the offer the event made, without a listener; it is
-            // destroyed before its listener is freed (OfferSlot's drop).
+            // SAFETY: the offer the event made, without a listener; it is destroyed before its listener is freed (OfferSlot's drop).
             let listener = unsafe { offer_listener(*offer, &offer_book, kind) };
             let slot = OfferSlot {
                 kind,
@@ -743,7 +671,6 @@ fn on_device(
         }
         (wl_data_device::evt::LEAVE, []) => {
             let mut device_book = device_book.lock().unwrap_or_else(PoisonError::into_inner);
-            // A dropped offer stays until it is finished; any other goes.
             let ended = match device_book.drag.take() {
                 Some(mut d) if d.dropped => {
                     d.left = true;
@@ -764,7 +691,6 @@ fn on_device(
         }
         _ => (Vec::new(), None),
     };
-    // Destroyed as they drop, with the book unlocked.
     drop(ended);
     heard
 }
@@ -796,11 +722,7 @@ pub struct Source {
 }
 
 impl Source {
-    /// A source of `manager`'s kind offering `mime_types`; for a drag,
-    /// `dnd_actions` (`wl_data_device_manager.dnd_action` bits, version 3).
-    /// A selection's source takes none: a compositor refuses a source with
-    /// actions as a selection. What the compositor asks of it goes to
-    /// `sink` as it is heard.
+    /// A source of `manager`'s kind offering `mime_types`; for a drag, `dnd_actions` (`wl_data_device_manager.dnd_action` bits, version 3).
     pub fn new(
         manager: &Manager,
         mime_types: &[&CStr],
@@ -817,8 +739,7 @@ impl Source {
         .ok_or(Error::NoObject)?;
         let cancelled = Arc::new(AtomicBool::new(false));
         let kind = manager.kind;
-        // SAFETY: a source made here, without a listener; it is destroyed
-        // before its listener is freed (Drop).
+        // SAFETY: a source made here, without a listener; it is destroyed before its listener is freed (Drop).
         let listener = match unsafe { source_listener(proxy, &cancelled, kind, sink) } {
             Ok(l) => l,
             Err(e) => {
@@ -852,8 +773,7 @@ impl Source {
         self.kind
     }
 
-    /// Whether the compositor cancelled it (another source replaced it), as
-    /// of the last dispatch.
+    /// Whether the compositor cancelled it (another source replaced it), as of the last dispatch.
     pub fn cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
     }
@@ -861,8 +781,7 @@ impl Source {
 
 impl Drop for Source {
     fn drop(&mut self) {
-        // SAFETY: the source this value made, destroyed once; its listener
-        // is freed after.
+        // SAFETY: the source this value made, destroyed once; its listener is freed after.
         unsafe {
             match self.kind {
                 Kind::Clipboard => wl_data_source::destroy(self.proxy),
@@ -874,8 +793,6 @@ impl Drop for Source {
 }
 
 /// Listen to a source: each request, decoded, goes to `sink` (a
-/// cancellation is also kept, for [`Source::cancelled`]).
-///
 /// # Safety
 /// `proxy` is a live source of `kind` this module made, without a listener,
 /// destroyed before the listener is freed.
@@ -926,9 +843,7 @@ fn source_request(kind: Kind, opcode: u32, args: &[EventArg<'_>]) -> Option<Sour
     })
 }
 
-/// Write `bytes` to `fd` and close it, on a thread of its own: the reader
-/// may be slow, or this very client, reading only once its dispatching
-/// thread is free.
+/// Write `bytes` to `fd` and close it, on a thread of its own: the reader may be slow, or this very client, reading only once its dispatching thread is free.
 pub fn write_detached(fd: OwnedFd, bytes: Vec<u8>) -> io::Result<()> {
     std::thread::Builder::new()
         .name("wayland-selection-write".into())
@@ -1034,7 +949,6 @@ mod tests {
             ),
             None
         );
-        // The primary device's opcodes 2 and up are not drags'.
         assert_eq!(
             on_device(&book, Kind::Primary, wl_data_device::evt::DROP, &[]),
             None

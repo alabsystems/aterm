@@ -2,31 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! 3-mode containment for AI agent isolation: the mode → capabilities policy, and the
-//! spawn-seam actuator that enforces it. [`actuator`]'s module doc states each rule; in short:
-//!
-//! | Mode | Trust | Enforced |
-//! |------|-------|----------|
-//! | **User** | Normal (default) | Nothing beyond the capability-gated spawn; the shell keeps aterm's own resource limits. |
-//! | **Safety** | Reduced | Resource limits, no OS sandbox: soft on POSIX (the shell's rc or its program can raise them), binding on Windows (the Job Object). |
-//! | **Containment** | Hostile | macOS Seatbelt: no network, no task port but a process's own, no mach service lookup but the user and group queries, writes confined to the temp roots, no access to the credential and private-data stores; plus Safety's limits as hard limits. Refuses to start where no OS sandbox exists. |
-//!
-//! The policy tests pin the mapping over all three modes and every ordered pair: a lower mode
-//! never holds more of any capability than a higher one, and Containment holds each at its
-//! floor. The mode is set once per process ([`init_mode`]) and never changes.
-//!
-//! ## Usage
-//!
-//! ```rust
-//! use aterm_containment::{ContainmentMode, ContainmentPolicy, init_mode};
-//!
-//! // At startup (called once by launcher):
-//! init_mode(ContainmentMode::User).expect("mode already set");
-//!
-//! // Anywhere in aterm:
-//! let mode = aterm_containment::mode_or_containment();
-//! let caps = ContainmentPolicy::capabilities(mode);
-//! ```
+//! Three-mode containment policy (`User`, `Safety`, `Containment`) and spawn-seam actuator.
 
 #![warn(missing_docs)]
 #![warn(clippy::pedantic)]
@@ -51,9 +27,6 @@ pub(crate) mod mode;
 pub(crate) mod policy;
 pub mod sbpl;
 
-// `audit` is declared last: the Trust lane (`ship trust run`) verifies roughly in
-// declaration order and stops at the first fail-closed error, and `audit::forward` must
-// carry the unsafe `fmt::Arguments::new` (`aterm_log::__log` takes a `fmt::Arguments`).
 pub(crate) mod audit;
 
 pub use actuator::{
@@ -62,8 +35,6 @@ pub use actuator::{
 };
 pub use audit::{log_denial, log_posture};
 pub use capability::{FsCapability, NetworkCapability, ProcessCapability};
-// The consent tier's types and OS entry points. Its pure helpers and `tccutil_presence`
-// stay under `consent::`, so generic names do not read as the crate's own.
 pub use consent::{
     Attribution, ConsentPosture, DevToolGrant, DevToolList, DevToolListLabel, DevToolListing,
     DevToolProbe, DevToolProbeLabel, DevToolState, DrClass, FdaProbe, FdaScope, FdaState, Folder,
@@ -95,8 +66,6 @@ pub enum InitError {
     },
 }
 
-// Hand-written `Display`/`Error`: a derived or `write!` `fmt` expands a runtime-argument
-// `format_args!`, whose unsafe `fmt::Arguments::new` the Trust lane fails closed on.
 impl std::fmt::Display for InitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -119,8 +88,7 @@ impl std::error::Error for InitError {
     }
 }
 
-/// Initialize the containment mode for this process, once at startup, before any subsystem
-/// queries it. The mode never changes afterwards.
+/// Initializes the containment mode for this process once at startup.
 ///
 /// # Errors
 ///
@@ -146,21 +114,18 @@ pub fn try_current_mode() -> Option<ContainmentMode> {
     MODE.get().copied()
 }
 
-/// Get the current containment mode, defaulting to
-/// [`ContainmentMode::Containment`] (fail-closed, the most restrictive) if
-/// [`init_mode`] was never called.
+/// Returns the current containment mode, defaulting to [`ContainmentMode::Containment`].
 #[inline(always)]
 #[must_use]
 pub fn mode_or_containment() -> ContainmentMode {
     try_current_mode().unwrap_or(ContainmentMode::Containment)
 }
 
-/// Initialize the mode from the launcher's `--containment` flag (`None`: no flag, so
-/// `default`) and return it. No environment variable selects the mode.
+/// Initializes the containment mode from `--containment` (or `default` when `None`).
 ///
 /// # Errors
 ///
-/// The value is not a mode (the caller fails closed), or the mode was already set.
+/// Returns an error if `flag` is not a valid mode or the mode was already initialized.
 pub fn init_mode_from_flag(
     flag: Option<&str>,
     default: ContainmentMode,
@@ -185,7 +150,6 @@ pub enum InitModeFromFlagError {
     Init(InitError),
 }
 
-// Hand-written for the reason given at `InitError`'s `Display`.
 impl std::fmt::Display for InitModeFromFlagError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

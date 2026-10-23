@@ -1,38 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The encoder: multi-pass command buffers. A [`CommandBuffer`] holds several
-//! render passes and blit copies; a [`PassEncoder`] switches pipeline, atlas and
-//! buffers between draws, every bind index supplied by the caller (the pipeline
-//! table's `BindSpec`); [`Submitted::try_outcome`] polls completion instead of
-//! parking the thread.
-//!
-//! # Queue ownership
-//!
-//! `Frame::present`'s ordering argument holds only because command buffers on
-//! one queue schedule in commit order. [`EncodeSession`] owns the process's
-//! render queue, every [`CommandBuffer`] is minted by it, and
-//! [`super::swapchain::Frame::present`] takes `&EncodeSession`, so the encode
-//! path has no second queue. [`EncodeSession::new`] claims its latch
-//! ([`loss::LossLatch::try_bind_encode_session`]) and refuses one already
-//! claimed, so one latch means one queue; drop releases it for the loss
-//! rebuild. Render targets are stamped with their loss domain
-//! (`super::resources`), and [`CommandBuffer::render_pass`] and the copy verbs
-//! refuse a foreign stamp, so work from another session cannot be presented.
-//!
-//! # The loss latch
-//!
-//! [`EncodeSession::begin`] refuses once the latch is lost, before any FFI.
-//! [`Submitted::wait_outcome`] and [`Submitted::try_outcome`] feed the latch
-//! themselves, as [`super::swapchain::PresentTicket`] does; a debug feed
-//! counter makes the feed observable on healthy outcomes.
-//!
-//! # Autorelease discipline
-//!
-//! Entry points that produce autoreleased objects (command buffer, pass
-//! descriptor, encoders) push a pool and retain what must outlive it into
-//! [`Obj`]. Per-draw setters are void messages on live objects and use the
-//! caller's frame pool.
+//! The encoder: multi-pass command buffers.
 
 use std::sync::Arc;
 
@@ -45,20 +14,16 @@ use super::ffi::{
 use super::loss;
 use super::resources::SealedTexture;
 
-/// What a render pass does with its results. Only `Store`: the renderer never
-/// discards an attachment.
+/// What a render pass does with its results.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum StoreAction {
     /// `MTLStoreActionStore` — keep every texel.
     Store,
 }
 
-/// Everything one render pass declares up front. Pipeline, texture and buffer
-/// state lives on [`PassEncoder`] and switches between draws.
+/// Everything one render pass declares up front.
 pub(crate) struct RenderPassDesc<'a> {
-    /// The colour attachment: a sealed texture or a format view of one (the
-    /// sRGB/Unorm pair). [`CommandBuffer::render_pass`] refuses a loss-domain
-    /// stamp that is not the session's.
+    /// The colour attachment: a sealed texture or a format view of one (the sRGB/Unorm pair).
     pub(crate) target: &'a SealedTexture,
     /// What happens to `target`'s existing texels before the first draw.
     pub(crate) load: LoadAction,
@@ -66,16 +31,11 @@ pub(crate) struct RenderPassDesc<'a> {
     pub(crate) store: StoreAction,
     /// `-setViewport:`, or the attachment's full extent when `None`.
     pub(crate) viewport: Option<MtlViewport>,
-    /// `-setScissorRect:`, or the attachment's full extent when `None`,
-    /// validated against the live attachment's extent.
+    /// `-setScissorRect:`, or the attachment's full extent when `None`, validated against the live attachment's extent.
     pub(crate) scissor: Option<MtlScissorRect>,
 }
 
-/// Test-only census of the FFI calls a device-loss refusal must precede: the
-/// `commandBuffer` mints in [`EncodeSession::begin`] and `Frame::present`, and
-/// the swapchain's `nextDrawable`. One-shot helpers in `ffi.rs` are not
-/// counted. Per thread, so parallel tests do not count each other's calls. The
-/// loss tests assert the count stays flat across every refusal.
+/// Test-only census of the FFI calls a device-loss refusal must precede: the `commandBuffer` mints in [`EncodeSession::begin`] and `Frame::present`, and the swapchain's `nextDrawable`.
 #[cfg(test)]
 pub(crate) mod queue_ffi_census {
     use std::cell::Cell;
@@ -95,12 +55,10 @@ pub(crate) mod queue_ffi_census {
     }
 }
 
-/// The owner of the render queue (see the module header). Thread-pinned
-/// raw-pointer holder; not `Send`/`Sync`.
+/// The owner of the render queue (see the module header).
 #[derive(Debug)]
 pub(crate) struct EncodeSession {
-    /// The one `MTLCommandQueue` of the encode and present path. Lent only to
-    /// the blocking one-shot helpers via [`Self::one_shot_queue`].
+    /// The one `MTLCommandQueue` of the encode and present path.
     queue: Obj,
     /// The process device-loss latch every submission answers to.
     latch: Arc<loss::LossLatch>,
@@ -111,10 +69,7 @@ pub(crate) struct EncodeSession {
 }
 
 impl EncodeSession {
-    /// Build the session's queue on `device`. One session per latch: the
-    /// binding is claimed before any FFI, so a second session on a claimed
-    /// latch is an `Err`. Dropping the session releases the claim for the
-    /// device-loss rebuild.
+    /// Build the session's queue on `device`.
     pub(crate) fn new(device: &Device, latch: Arc<loss::LossLatch>) -> Result<Self, String> {
         if !latch.try_bind_encode_session() {
             return Err(
@@ -135,10 +90,7 @@ impl EncodeSession {
         })
     }
 
-    /// Start timing one present: open a `gpu_time` frame (only when a sink
-    /// listens) that every command buffer committed until
-    /// [`Self::seal_gpu_frame`] reports to. A frame left open by a present
-    /// that never sealed is sealed first, so it still settles.
+    /// Start timing one present: open a `gpu_time` frame (only when a sink listens) that every command buffer committed until [`Self::seal_gpu_frame`] reports to.
     pub(crate) fn open_gpu_frame(&self) -> Option<u64> {
         if let Some(stale) = self.gpu_frame.take() {
             stale.seal();
@@ -148,31 +100,26 @@ impl EncodeSession {
         Some(token.serial())
     }
 
-    /// Stop timing the present [`Self::open_gpu_frame`] opened. Command buffers
-    /// committed after this are not part of it.
+    /// Stop timing the present [`Self::open_gpu_frame`] opened.
     pub(crate) fn seal_gpu_frame(&self) {
         if let Some(token) = self.gpu_frame.take() {
             token.seal();
         }
     }
 
-    /// The session's latch, for wiring cross-checks (present compares it to
-    /// the swapchain's by pointer).
+    /// The session's latch, for wiring cross-checks (present compares it to the swapchain's by pointer).
     #[inline]
     pub(crate) const fn latch(&self) -> &Arc<loss::LossLatch> {
         &self.latch
     }
 
-    /// Lend the queue to a blocking one-shot helper ([`super::ffi::
-    /// draw_and_read`], `dispatch_compute`). Sound because those helpers wait
-    /// for completion before returning, and no second queue is constructed.
+    /// Lend the queue to a blocking one-shot helper ([`super::ffi:: draw_and_read`], `dispatch_compute`).
     #[inline]
     pub(crate) const fn one_shot_queue(&self) -> &Obj {
         &self.queue
     }
 
-    /// Mint one command buffer, or refuse before any FFI when the device is
-    /// lost.
+    /// Mint one command buffer, or refuse before any FFI when the device is lost.
     pub(crate) fn begin(&self) -> Result<CommandBuffer<'_>, String> {
         if let Some(reason) = self.latch.reason() {
             return Err(format!(
@@ -183,8 +130,7 @@ impl EncodeSession {
         #[cfg(test)]
         queue_ffi_census::note();
         let _pool = AutoreleasePool::new();
-        // SAFETY: `commandBuffer` returns a +0 buffer owned by the pool; it is
-        // retained to +1 to outlive the pop.
+        // SAFETY: `commandBuffer` returns a +0 buffer owned by the pool; it is retained to +1 to outlive the pop.
         let cb = unsafe {
             let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let raw = get(self.queue.id(), sel(c"commandBuffer"));
@@ -196,14 +142,12 @@ impl EncodeSession {
 
 impl Drop for EncodeSession {
     fn drop(&mut self) {
-        // Free the latch's session slot so a rebuild (the device-loss path)
         // can construct a successor. The queue itself is released by `Obj`.
         self.latch.unbind_encode_session();
     }
 }
 
-/// One command buffer under construction: any number of render passes and
-/// blit copies, in encode order, then [`Self::commit`].
+/// One command buffer under construction: any number of render passes and blit copies, in encode order, then [`Self::commit`].
 #[derive(Debug)]
 pub(crate) struct CommandBuffer<'s> {
     /// +1 on the `MTLCommandBuffer`.
@@ -212,17 +156,11 @@ pub(crate) struct CommandBuffer<'s> {
 }
 
 impl<'s> CommandBuffer<'s> {
-    /// Open one render pass. The [`PassEncoder`] borrows this command buffer
-    /// mutably, so another pass, copy or `commit` cannot be encoded until it
-    /// drops and runs `endEncoding` (Metal's one-live-encoder rule as a type).
-    /// `mem::forget` on the encoder breaks this and raises an exception at the
-    /// next encoder.
+    /// Open one render pass.
     pub(crate) fn render_pass<'cb>(
         &'cb mut self,
         desc: &RenderPassDesc<'_>,
     ) -> Result<PassEncoder<'cb, 's>, String> {
-        // A target stamped with another loss domain would be rendered on a
-        // queue that domain's present does not order against; refuse before
         // any FFI, by pointer identity.
         if !Arc::ptr_eq(desc.target.latch(), &self.session.latch) {
             return Err("render pass refused: the target texture was minted in a \
@@ -232,8 +170,6 @@ impl<'s> CommandBuffer<'s> {
                 .to_owned());
         }
         let target = desc.target.obj();
-        // A pass onto a texture without render-target usage completes silently
-        // without the validation layer; refuse it.
         let usage = super::ffi::texture_usage(target);
         if usage & super::ffi::TEXTURE_USAGE_RENDER_TARGET == 0 {
             return Err(format!(
@@ -254,10 +190,7 @@ impl<'s> CommandBuffer<'s> {
         }
         let StoreAction::Store = desc.store;
         let _pool = AutoreleasePool::new();
-        // SAFETY: the pass descriptor, `colorAttachments`, its subscript and the
-        // encoder are autoreleased into the pool; the encoder is retained to +1
-        // before the pop. Every setter is a message on a live object with its
-        // prototype written out.
+        // SAFETY: the pass descriptor, `colorAttachments`, its subscript and the encoder are autoreleased into the pool; the encoder is retained to +1 before the pop.
         let enc = unsafe {
             let rp_cls = class(c"MTLRenderPassDescriptor");
             let mk: unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id = checked_msg();
@@ -320,10 +253,7 @@ impl<'s> CommandBuffer<'s> {
         self.copy_texture_sub_rect(src, (0, 0), dst, (0, 0), w, h)
     }
 
-    /// Texture to texture, sub-rect with independent origins (scroll band shift,
-    /// scissored present compose). Validated off the live objects: both rects
-    /// in bounds and the formats byte-compatible (identical, or the Unorm/sRGB
-    /// pair).
+    /// Texture to texture, sub-rect with independent origins (scroll band shift, scissored present compose).
     pub(crate) fn copy_texture_sub_rect(
         &mut self,
         src: &SealedTexture,
@@ -333,7 +263,6 @@ impl<'s> CommandBuffer<'s> {
         width: usize,
         height: usize,
     ) -> Result<(), String> {
-        // The copy verbs refuse a foreign loss domain on either side too.
         for (side, tex) in [("source", src), ("destination", dst)] {
             if !Arc::ptr_eq(tex.latch(), &self.session.latch) {
                 return Err(format!(
@@ -361,9 +290,6 @@ impl<'s> CommandBuffer<'s> {
                 "destination rect {width}x{height}+{dx}+{dy} leaves the {dw}x{dh} texture"
             ));
         }
-        // Overlapping same-texture copies are undefined in Metal and accepted
-        // silently by validation, so they are refused; disjoint same-texture
-        // rects stay legal.
         if src.id() == dst.id() {
             let x_overlap = sx < dx + width && dx < sx + width;
             let y_overlap = sy < dy + height && dy < sy + height;
@@ -385,8 +311,7 @@ impl<'s> CommandBuffer<'s> {
             ));
         }
         let _pool = AutoreleasePool::new();
-        // SAFETY: `blitCommandEncoder` returns an autoreleased encoder owned by
-        // the pool through `endEncoding`. The rects were validated above.
+        // SAFETY: `blitCommandEncoder` returns an autoreleased encoder owned by the pool through `endEncoding`.
         unsafe {
             let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let blit = get(self.cb.id(), sel(c"blitCommandEncoder"));
@@ -429,12 +354,7 @@ toTexture:destinationSlice:destinationLevel:destinationOrigin:",
         Ok(())
     }
 
-    /// Texture to buffer readback on any command buffer (submit, keep encoding,
-    /// poll, read).
-    ///
-    /// Validates extent, format-derived minimum stride and destination length,
-    /// as `draw_and_read` does. `readback` must be Shared storage; its bytes are
-    /// meaningful only once this command buffer's outcome is terminal.
+    /// Texture to buffer readback on any command buffer (submit, keep encoding, poll, read).
     pub(crate) fn copy_texture_to_buffer(
         &mut self,
         src: &SealedTexture,
@@ -486,8 +406,7 @@ toTexture:destinationSlice:destinationLevel:destinationOrigin:",
             ));
         }
         let _pool = AutoreleasePool::new();
-        // SAFETY: as `copy_texture_sub_rect` — pooled autoreleased blit
-        // encoder; the copy's stride/extent/length were validated above.
+        // SAFETY: as `copy_texture_sub_rect` — pooled autoreleased blit encoder; the copy's stride/extent/length were validated above.
         unsafe {
             let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let blit = get(self.cb.id(), sel(c"blitCommandEncoder"));
@@ -527,15 +446,13 @@ toTexture:destinationSlice:destinationLevel:destinationOrigin:",
         Ok(())
     }
 
-    /// Commit. The returned [`Submitted`] is the non-blocking handle: wait on
-    /// it, or poll [`Submitted::try_outcome`] while encoding the next frame.
+    /// Commit.
     pub(crate) fn commit(self) -> Submitted {
         // A timed present: the handler must be added before `commit`.
         if let Some(token) = self.session.gpu_frame.get() {
             report_gpu_span(self.cb.id(), token);
         }
-        // SAFETY: `commit` is a void message on the owned command buffer; all
-        // encoders are ended (the `&mut` borrow rule) barring `mem::forget`.
+        // SAFETY: `commit` is a void message on the owned command buffer; all encoders are ended (the `&mut` borrow rule) barring `mem::forget`.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) = checked_msg();
             f(self.cb.id(), sel(c"commit"));
@@ -549,19 +466,12 @@ toTexture:destinationSlice:destinationLevel:destinationOrigin:",
 }
 
 /// Hang `addCompletedHandler:` on the uncommitted `cb`, reporting its
-/// `GPUEndTime - GPUStartTime` to `token`'s frame (`crate::gpu_time`). The
-/// frame is held for the part before the handler can fire; a command buffer
-/// that errored, or a block that could not be built, completes the part as a
-/// failure so the frame is dropped rather than under-reported.
+/// `GPUEndTime - GPUStartTime` to `token`'s frame (`crate::gpu_time`).
 fn report_gpu_span(cb: Id, token: crate::gpu_time::FrameToken<'static>) {
     token.hold();
-    // Defined outside any `unsafe` block so its unsafe operations, the two
-    // clock reads, carry their own scope.
     let handler = move |done: Id| {
         let span = if loss::command_buffer_status(done) == loss::STATUS_COMPLETED {
-            // SAFETY: Metal passes the live, completed command buffer;
-            // `GPUStartTime` and `GPUEndTime` are `CFTimeInterval` (double)
-            // getters, valid once the buffer completed.
+            // SAFETY: Metal passes the live, completed command buffer; `GPUStartTime` and `GPUEndTime` are `CFTimeInterval` (double) getters, valid once the buffer completed.
             let (start_s, end_s) = unsafe {
                 let get: unsafe extern "C-unwind" fn(Id, Sel) -> f64 = checked_msg();
                 (
@@ -575,16 +485,12 @@ fn report_gpu_span(cb: Id, token: crate::gpu_time::FrameToken<'static>) {
         };
         token.complete(span);
     };
-    // SAFETY: `MTLCommandBufferHandler` is `void (^)(id<MTLCommandBuffer>)` —
-    // exactly `(Id) -> ()`, the prototype this block is invoked with. The
-    // closure captures one `Copy` token, does not allocate or panic, and the
-    // sink contract forbids blocking or unwinding.
+    // SAFETY: `MTLCommandBufferHandler` is `void (^)(id<MTLCommandBuffer>)` — exactly `(Id) -> ()`, the prototype this block is invoked with.
     let Some(block) = (unsafe { aterm_objc::RcBlock::new1(handler) }) else {
         token.complete(None);
         return;
     };
-    // SAFETY: `addCompletedHandler:` on an uncommitted buffer copies (retains)
-    // the block, so ours is released independently when `block` drops.
+    // SAFETY: `addCompletedHandler:` on an uncommitted buffer copies (retains) the block, so ours is released independently when `block` drops.
     unsafe {
         let add: unsafe extern "C-unwind" fn(Id, Sel, aterm_objc::BlockPtr) = checked_msg();
         add(cb, sel(c"addCompletedHandler:"), block.as_block_ptr());
@@ -604,19 +510,18 @@ const fn formats_copy_compatible(a: usize, b: usize) -> bool {
     )
 }
 
-/// One open render pass. Every method is a message on the retained encoder;
-/// state persists across draws until changed.
+/// One open render pass.
 #[derive(Debug)]
 pub(crate) struct PassEncoder<'cb, 's> {
     /// +1 on the `MTLRenderCommandEncoder` (retained out of the creation
-    /// pool). `endEncoding` runs exactly once, on drop.
+    /// pool).
     enc: Obj,
     /// The exclusive borrow that keeps this the command buffer's only open
     /// encoder.
     _cb: &'cb mut CommandBuffer<'s>,
     /// Draw state Metal validates only in the debug layer: a draw with no
     /// pipeline crashes the driver, and an instanced draw with no stream
-    /// silently draws nothing. The encoder tracks both and refuses.
+    /// silently draws nothing.
     pipeline_set: std::cell::Cell<bool>,
     /// See [`Self::pipeline_set`]; flipped by [`Self::set_instance_stream`].
     stream_set: std::cell::Cell<bool>,
@@ -637,8 +542,7 @@ impl PassEncoder<'_, '_> {
     /// Fragment texture at `index` (the mid-pass atlas switch).
     #[inline]
     pub(crate) fn set_fragment_texture(&self, tex: &Obj, index: usize) {
-        // SAFETY: plain message on the live encoder; the encoder retains what
-        // it needs for the pass.
+        // SAFETY: plain message on the live encoder; the encoder retains what it needs for the pass.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel, Id, usize) = checked_msg();
             f(
@@ -681,9 +585,7 @@ impl PassEncoder<'_, '_> {
         }
     }
 
-    /// Vertex-stage buffer at `index`, the uniform slot (`cell.metal` and
-    /// `hdr_glow.metal` at 0, `tray.metal` at 2). Not for the instance stream,
-    /// which binds through [`Self::set_instance_stream`]; this refuses that slot.
+    /// Vertex-stage buffer at `index`, the uniform slot (`cell.metal` and `hdr_glow.metal` at 0, `tray.metal` at 2).
     #[inline]
     pub(crate) fn set_vertex_buffer(&self, buf: &Obj, index: usize) -> Result<(), String> {
         if index == super::ffi::INSTANCE_STREAM_SLOT {
@@ -706,16 +608,13 @@ impl PassEncoder<'_, '_> {
         Ok(())
     }
 
-    /// Bind the per-instance stream at [`super::ffi::INSTANCE_STREAM_SLOT`], the
-    /// slot no MSL uniform block uses. Any other index lands on the uniforms.
+    /// Bind the per-instance stream at [`super::ffi::INSTANCE_STREAM_SLOT`], the slot no MSL uniform block uses.
     #[inline]
     pub(crate) fn set_instance_stream(&self, stream: &Obj) {
         self.set_instance_stream_at(stream, 0);
     }
 
-    /// [`Self::set_instance_stream`] at a byte offset, for the bloom extract's
-    /// `extract_first..` sub-stream. The offset must be a multiple of the
-    /// instance stride and inside the buffer.
+    /// [`Self::set_instance_stream`] at a byte offset, for the bloom extract's `extract_first..` sub-stream.
     #[inline]
     pub(crate) fn set_instance_stream_at(&self, stream: &Obj, byte_offset: usize) {
         self.stream_set.set(true);
@@ -735,8 +634,7 @@ impl PassEncoder<'_, '_> {
     /// `-setScissorRect:` mid-pass, for re-scissoring between draw groups.
     #[inline]
     pub(crate) fn set_scissor(&self, sc: MtlScissorRect) {
-        // SAFETY: `MTLScissorRect` travels indirectly per its ffi doc; plain
-        // message on the live encoder.
+        // SAFETY: `MTLScissorRect` travels indirectly per its ffi doc; plain message on the live encoder.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel, MtlScissorRect) = checked_msg();
             f(self.enc.id(), sel(c"setScissorRect:"), sc);
@@ -753,9 +651,7 @@ impl PassEncoder<'_, '_> {
         }
     }
 
-    /// Instanced draw from vertex 0: `(Triangle, 6, n)` for quads, alongside
-    /// [`Self::draw_fullscreen_triangle`] and [`Self::draw_strip_quad`]. A zero
-    /// instance or vertex count encodes as Metal's legal no-op (an empty group).
+    /// Instanced draw from vertex 0: `(Triangle, 6, n)` for quads, alongside [`Self::draw_fullscreen_triangle`] and [`Self::draw_strip_quad`].
     #[inline]
     pub(crate) fn draw_instanced(
         &self,
@@ -777,8 +673,7 @@ impl PassEncoder<'_, '_> {
         self.raw_draw(primitive, vertices, instances)
     }
 
-    /// The 3-vertex fullscreen triangle (`vs_blit`/`vs_fs` synthesize their
-    /// positions from `[[vertex_id]]`; no stream is bound or needed).
+    /// The 3-vertex fullscreen triangle (`vs_blit`/`vs_fs` synthesize their positions from `[[vertex_id]]`; no stream is bound or needed).
     #[inline]
     pub(crate) fn draw_fullscreen_triangle(&self) -> Result<(), String> {
         self.raw_draw(PrimitiveType::Triangle, 3, 1)
@@ -832,9 +727,7 @@ impl Drop for PassEncoder<'_, '_> {
     }
 }
 
-/// A probe-only +1 handle onto a committed command buffer, for the tap ring's
-/// status polling. It never feeds the loss latch; the owning [`Submitted`]
-/// does, so a tap cannot double-book a loss.
+/// A probe-only +1 handle onto a committed command buffer, for the tap ring's status polling.
 #[derive(Debug)]
 pub(crate) struct CbProbe {
     cb: Obj,
@@ -849,8 +742,7 @@ impl CbProbe {
         }
     }
 
-    /// `None` while the command buffer is still in flight, `Some(outcome)`
-    /// once terminal. Feeds nothing (see the type doc).
+    /// `None` while the command buffer is still in flight, `Some(outcome)` once terminal.
     #[inline]
     pub(crate) fn try_terminal(&self) -> Option<loss::CbOutcome> {
         match loss::outcome_of(self.cb.id()) {
@@ -859,11 +751,9 @@ impl CbProbe {
         }
     }
 
-    /// Block until terminal — the tap's `finish` drain, off the hot path by
-    /// definition. Feeds nothing.
+    /// Block until terminal — the tap's `finish` drain, off the hot path by definition.
     pub(crate) fn wait_terminal(&self) -> loss::CbOutcome {
-        // SAFETY: `waitUntilCompleted` is a void message on the owned +1
-        // command buffer; it returns once the status is terminal.
+        // SAFETY: `waitUntilCompleted` is a void message on the owned +1 command buffer; it returns once the status is terminal.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) = checked_msg();
             f(self.cb.id(), sel(c"waitUntilCompleted"));
@@ -872,33 +762,25 @@ impl CbProbe {
     }
 }
 
-// SAFETY: the probe only reads command-buffer status (thread-safe reads) and
-// waits; drop is `objc_release`, which is thread-safe. The tap ring's
-// `WindowGpu` crosses a thread once at startup.
+// SAFETY: the probe only reads command-buffer status (thread-safe reads) and waits; drop is `objc_release`, which is thread-safe.
 unsafe impl Send for CbProbe {}
 
-/// A committed command buffer: the non-blocking completion handle used in
-/// place of `addCompletedHandler:`.
+/// A committed command buffer: the non-blocking completion handle used in place of `addCompletedHandler:`.
 #[derive(Debug)]
 pub(crate) struct Submitted {
     cb: Obj,
     latch: Arc<loss::LossLatch>,
-    /// The classified terminal outcome once one exists. The first terminal
-    /// wait or poll feeds the latch and fills this; later calls answer from it,
-    /// so each command buffer feeds the latch exactly once.
+    /// The classified terminal outcome once one exists.
     settled: std::cell::Cell<Option<loss::CbOutcome>>,
 }
 
 impl Submitted {
-    /// Block until terminal, classify, feed the latch once, return the outcome
-    /// (same contract as [`super::swapchain::PresentTicket::wait_outcome`]).
-    /// Answers from the cache once settled.
+    /// Block until terminal, classify, feed the latch once, return the outcome (same contract as [`super::swapchain::PresentTicket::wait_outcome`]).
     pub(crate) fn wait_outcome(&self) -> loss::CbOutcome {
         if let Some(done) = self.settled.get() {
             return done;
         }
-        // SAFETY: `waitUntilCompleted` is a void message on the owned +1
-        // command buffer; it returns once the status is terminal.
+        // SAFETY: `waitUntilCompleted` is a void message on the owned +1 command buffer; it returns once the status is terminal.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) = checked_msg();
             f(self.cb.id(), sel(c"waitUntilCompleted"));
@@ -906,9 +788,7 @@ impl Submitted {
         self.settle_terminal(loss::outcome_of(self.cb.id()))
     }
 
-    /// Poll: `None` while in flight, `Some(outcome)` once terminal. The first
-    /// terminal answer feeds the latch like [`Self::wait_outcome`]; later calls
-    /// answer from the cache and feed nothing.
+    /// Poll: `None` while in flight, `Some(outcome)` once terminal.
     #[inline]
     pub(crate) fn try_outcome(&self) -> Option<loss::CbOutcome> {
         if let Some(done) = self.settled.get() {
@@ -927,8 +807,7 @@ impl Submitted {
         self.settle(outcome)
     }
 
-    /// Record one classified outcome on the process latch and return it; the
-    /// injection seam, like `PresentTicket::settle`. Uncached.
+    /// Record one classified outcome on the process latch and return it; the injection seam, like `PresentTicket::settle`.
     #[inline]
     pub(crate) fn settle(&self, outcome: loss::CbOutcome) -> loss::CbOutcome {
         self.latch.record(&outcome);
@@ -957,8 +836,7 @@ mod tests {
         let tex = mint
             .texture_2d(PixelFormat::Rgba8Unorm, w, h, TEXTURE_USAGE_SHADER_READ)
             .expect("texture");
-        // SAFETY: managed-storage (non-Private) texture, exact extent and
-        // stride.
+        // SAFETY: managed-storage (non-Private) texture, exact extent and stride.
         unsafe { tex.upload(ffi::MtlRegion::full_2d(w, h), bytes, w * 4) };
         tex
     }
@@ -985,8 +863,7 @@ mod tests {
     /// Texture copies: a full copy reproduces every texel; a sub-rect copy with
     /// distinct origins moves exactly the named bytes and leaves sentinels
     /// outside the destination rect untouched; a Unorm-to-sRGB-view copy moves
-    /// raw bytes 1:1. Every source texel is unique, so origin mistakes land on
-    /// a named texel.
+    /// raw bytes 1:1.
     #[test]
     fn texture_copies_move_exactly_the_named_bytes() {
         let dev = device();
@@ -1008,7 +885,6 @@ mod tests {
 
         let src = uploaded_texture(&mint, W, H, &unique);
 
-        // Full copy: every texel of a sentinel-filled destination becomes src.
         let dst_full = uploaded_texture(&mint, W, H, &sentinel_frame);
         let mut cb = session.begin().expect("cb");
         cb.copy_texture_to_texture(&src, &dst_full)
@@ -1020,7 +896,6 @@ mod tests {
             "the full copy must reproduce the source byte-for-byte"
         );
 
-        // Sub-rect copy: 5x6 from src (3,2) to dst (8,7).
         const CW: usize = 5;
         const CH: usize = 6;
         const SO: (usize, usize) = (3, 2);
@@ -1049,8 +924,6 @@ mod tests {
         }
         assert!(!latch.is_lost());
 
-        // Copying into the sRGB view of a Unorm texture moves raw bytes: the
-        // Unorm base reads back the source's bytes.
         let dst_pair = mint
             .texture_2d(
                 PixelFormat::Rgba8Unorm,
@@ -1120,8 +993,6 @@ mod tests {
             .copy_texture_sub_rect(&t16, (0, 0), &t16, (0, 0), 0, 4)
             .expect_err("empty region");
         assert!(err.contains("empty"), "got: {err}");
-        // The scroll band shift's hazard: a same-texture copy whose rects
-        // overlap is undefined in Metal and passes validation silently.
         let err = cb
             .copy_texture_sub_rect(&t16, (0, 3), &t16, (0, 0), 16, 8)
             .expect_err("overlapping same-texture band");
@@ -1135,7 +1006,6 @@ mod tests {
             .expect_err("4-byte -> 1-byte texels");
         assert!(err.contains("copy-compatible"), "got: {err}");
 
-        // An understated stride: a 16-wide f16 row is 128 bytes, not 16*4.
         let big = dev.new_buffer(128 * 16).expect("big");
         let err = cb
             .copy_texture_to_buffer(&f16, 16, 16, &big, 16 * 4)
@@ -1155,8 +1025,6 @@ mod tests {
             .expect_err("oversized readback region");
         assert!(err.contains("exceeds"), "got: {err}");
 
-        // Every refusal above encoded nothing: the same command buffer still
-        // commits and completes clean.
         assert_eq!(cb.commit().wait_outcome(), loss::CbOutcome::Completed);
         assert!(
             !latch.is_lost(),
@@ -1174,8 +1042,6 @@ mod tests {
         let latch = Arc::new(loss::LossLatch::new());
         let session = EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
 
-        // Healthy first: an empty submit completes without latching, and the
-        // census sees its mint.
         let minted = queue_ffi_census::calls();
         let s0 = session.begin().expect("healthy begin").commit();
         assert_eq!(
@@ -1186,7 +1052,6 @@ mod tests {
         assert_eq!(s0.wait_outcome(), loss::CbOutcome::Completed);
         assert!(!latch.is_lost());
 
-        // Retryable passes through without closing the session.
         let retry = s0.settle(loss::classify(
             loss::STATUS_ERROR,
             Some(loss::ERROR_TIMEOUT),
@@ -1199,7 +1064,6 @@ mod tests {
                 .commit(),
         );
 
-        // The injected loss.
         let lost = s0.settle(loss::classify(
             loss::STATUS_ERROR,
             Some(loss::ERROR_PAGE_FAULT),
@@ -1246,13 +1110,11 @@ mod tests {
             "the refusal names the seal: {err}"
         );
 
-        // The first session still works after the refused construction.
         assert_eq!(
             session.begin().expect("cb").commit().wait_outcome(),
             loss::CbOutcome::Completed
         );
 
-        // Drop frees the slot: the rebuild path constructs a successor.
         drop(session);
         let rebuilt = EncodeSession::new(&dev, Arc::clone(&latch))
             .expect("after the first session drops, the latch is claimable again");
@@ -1270,7 +1132,6 @@ mod tests {
         let latch = Arc::new(loss::LossLatch::new());
         let session = EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
 
-        // Wait first, then poll: the polls answer from the cache.
         let s1 = session.begin().expect("cb 1").commit();
         #[cfg(debug_assertions)]
         let before = latch.fed_count();
@@ -1288,7 +1149,6 @@ mod tests {
              once-feed cache is what keeps per-submit feed counts truthful"
         );
 
-        // Poll first, then wait: the wait answers from the cache.
         let s2 = session.begin().expect("cb 2").commit();
         let polled = loop {
             if let Some(o) = s2.try_outcome() {
@@ -1309,7 +1169,6 @@ mod tests {
             "a wait after the terminal poll answers from the cache"
         );
 
-        // The injection seam stays uncached: every settle feeds.
         #[cfg(debug_assertions)]
         {
             let seam_before = latch.fed_count();
@@ -1351,8 +1210,6 @@ mod tests {
             .texture_2d(PixelFormat::Rgba8Unorm, 8, 8, TEXTURE_USAGE_SHADER_READ)
             .expect("sampled-only");
 
-        // A pass onto a texture with no RENDER_TARGET usage is refused by
-        // name, before any encoder exists.
         let mut cb = session.begin().expect("cb");
         let err = cb
             .render_pass(&RenderPassDesc {
@@ -1370,7 +1227,6 @@ mod tests {
             .expect_err("non-render-target pass must refuse");
         assert!(err.contains("TEXTURE_USAGE_RENDER_TARGET"), "got: {err}");
 
-        // Draw with no pipeline: refused by name, never reaches the driver.
         {
             let pass = cb
                 .render_pass(&RenderPassDesc {
@@ -1393,16 +1249,12 @@ mod tests {
             let err = pass
                 .draw_instanced(PrimitiveType::Triangle, 6, 1)
                 .expect_err("no-pipeline instanced draw must refuse");
-            // The stream check fires first for the instanced form — either
-            // named refusal is correct; the point is it never encodes.
             assert!(
                 err.contains("no instance stream") || err.contains("no pipeline"),
                 "got: {err}"
             );
         }
 
-        // Instanced draw with a pipeline but no stream: the silent-misdraw
-        // class, refused by name. The vertex-id draws stay legal.
         {
             let cell = pipelines::compile_library(&dev, crate::pipeline_table::ShaderLibrary::Cell)
                 .expect("cell library");
@@ -1415,8 +1267,6 @@ mod tests {
             .expect("bg pipeline");
             let pass = cb
                 .render_pass(&RenderPassDesc {
-                    // `Bg` targets the sRGB view; on raw Unorm Metal would abort
-                    // at `setRenderPipelineState:` before the guard under test.
                     target: &target_srgb,
                     load: LoadAction::Load,
                     store: StoreAction::Store,
@@ -1432,7 +1282,6 @@ mod tests {
         }
         drop(cb);
 
-        // `set_vertex_buffer` refuses the instance stream slot.
         let uniform = dev.new_buffer(64).expect("uniform");
         let mut cb = session.begin().expect("cb2");
         {
@@ -1455,8 +1304,6 @@ mod tests {
         }
         drop(cb);
 
-        // An overlapping same-texture copy is refused by name; a disjoint one
-        // completes.
         let mut cb = session.begin().expect("cb3");
         let err = cb
             .copy_texture_sub_rect(&target, (0, 0), &target, (0, 2), 8, 6)

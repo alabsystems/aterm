@@ -211,6 +211,7 @@ impl FleetRoster {
     /// Parse `fleet-accounts.toml` text back into a [`FleetRoster`].
     ///
     /// # Errors
+    /// The generated rows do not admit as one complete roster.
     ///
     /// Returns a human-readable error if the TOML is invalid or any row is
     /// missing required fields.
@@ -516,6 +517,7 @@ fn notes_disqualify(notes: &str) -> bool {
 /// Parse the accounting CSV into a [`FleetRoster`].
 ///
 /// # Errors
+/// The generated rows do not admit as one complete roster.
 ///
 /// Returns an error if the CSV has no header row, no `email` / `claude`
 /// columns, or malformed quoting. LF and CRLF separate records only outside quotes.
@@ -722,8 +724,8 @@ fn read_default_profile_email(env: &Env) -> Option<String> {
     let path = env.claude_profile.as_deref().map(|own| {
         super::profile::effective(own, env.claude_dir().as_deref(), env.claude_custom_oauth)
     })?;
-    let bytes = fs::read(&path).ok()?;
-    let val: Value = aterm_json::from_slice(&bytes).ok()?;
+    let text = read_local_source_text(&path).ok()?;
+    let val: Value = aterm_json::from_str(&text).ok()?;
     val.get("oauthAccount")?
         .get("emailAddress")?
         .as_str()
@@ -1114,7 +1116,7 @@ fn fleet_file_beside(roster: &Path) -> Option<PathBuf> {
 /// `None` where it is missing, is not TOML, or says nothing (as every one
 /// 0.112.0 to 0.115.0 wrote).
 fn fleet_file_opt_in(fleet: &Path) -> Option<OptIn> {
-    let text = fs::read_to_string(fleet).ok()?;
+    let text = read_local_source_text(fleet).ok()?;
     let table: aterm_toml::Table = aterm_toml::from_str(&text).ok()?;
     match table.get(OPT_IN_KEY)?.as_str()? {
         "named" => Some(OptIn::Named),
@@ -1147,6 +1149,7 @@ type Fetch = dyn Fn(&Env, &str) -> Result<String, String> + Sync;
 /// answer is [`NO_SOURCE`].
 ///
 /// # Errors
+/// The generated rows do not admit as one complete roster.
 ///
 /// No source, or the source could not be read or parsed.
 pub fn load_fleet_source(env: &Env, source: Option<&str>) -> Result<FleetRoster, String> {
@@ -1190,6 +1193,10 @@ fn load_fleet_source_with(
 /// `.claude/projects/*/*.jsonl` `"session_context"` `"userEmail"` lines when
 /// external CSV/sheet sources are unreachable or incomplete.
 fn discover_local_fleet(env: &Env) -> Option<FleetRoster> {
+    discover_local_fleet_with_min(env, 2)
+}
+
+fn discover_local_fleet_with_min(env: &Env, min_accounts: usize) -> Option<FleetRoster> {
     let fallback_machine = detect_machine_id(None, env.config.as_deref()).or_else(|| {
         read_default_profile_email(env)
             .as_deref()
@@ -1214,7 +1221,7 @@ fn discover_local_fleet(env: &Env) -> Option<FleetRoster> {
                 };
                 if name_str.starts_with(".claude.json")
                     && entry.file_type().is_ok_and(|ft| ft.is_file())
-                    && let Ok(text) = fs::read_to_string(entry.path())
+                    && let Ok(text) = read_local_source_text(&entry.path())
                     && let Ok(v) = aterm_json::from_str::<Value>(&text)
                     && let Some(em) = v
                         .get("oauthAccount")
@@ -1226,7 +1233,7 @@ fn discover_local_fleet(env: &Env) -> Option<FleetRoster> {
             }
         }
         let muse_auth = home.join(".config/muse/auth.json");
-        if let Ok(text) = fs::read_to_string(muse_auth)
+        if let Ok(text) = read_local_source_text(&muse_auth)
             && let Ok(v) = aterm_json::from_str::<Value>(&text)
             && let Some(providers) = v.get("providers").and_then(Value::as_object)
         {
@@ -1241,7 +1248,7 @@ fn discover_local_fleet(env: &Env) -> Option<FleetRoster> {
         if let Ok(backups) = fs::read_dir(claude_dir.join("backups")) {
             for entry in backups.flatten() {
                 if entry.file_type().is_ok_and(|ft| ft.is_file())
-                    && let Ok(text) = fs::read_to_string(entry.path())
+                    && let Ok(text) = read_local_source_text(&entry.path())
                     && let Ok(v) = aterm_json::from_str::<Value>(&text)
                     && let Some(em) = v
                         .get("oauthAccount")
@@ -1276,15 +1283,13 @@ fn discover_local_fleet(env: &Env) -> Option<FleetRoster> {
             files_with_mtime.sort_by_key(|a| std::cmp::Reverse(a.0));
             files_with_mtime.truncate(32);
             for (_, path) in files_with_mtime {
-                let Ok(f) = fs::File::open(&path) else {
+                let Ok(text) = read_local_source_text(&path) else {
                     continue;
                 };
-                let mut reader = io::BufReader::new(f);
-                let mut line = String::new();
-                while reader.read_line(&mut line).ok().is_some_and(|n| n > 0) {
+                for line in text.lines() {
                     if line.contains("\"session_context\"")
                         && line.contains("\"userEmail\"")
-                        && let Ok(v) = aterm_json::from_str::<Value>(&line)
+                        && let Ok(v) = aterm_json::from_str::<Value>(line)
                         && let Some(user_email) = v
                             .get("attachment")
                             .filter(|a| {
@@ -1300,7 +1305,6 @@ fn discover_local_fleet(env: &Env) -> Option<FleetRoster> {
                     {
                         record_email(tok);
                     }
-                    line.clear();
                 }
             }
         }
@@ -1352,7 +1356,7 @@ fn discover_local_fleet(env: &Env) -> Option<FleetRoster> {
             browser: None,
         });
     }
-    (!accounts.is_empty()).then_some(FleetRoster {
+    (accounts.len() >= min_accounts).then_some(FleetRoster {
         source: "local-claude-transcripts".to_owned(),
         accounts,
     })
@@ -1369,6 +1373,31 @@ fn decode_source_text(bytes: Vec<u8>, source: &str) -> Result<String, String> {
     }
     String::from_utf8(bytes)
         .map_err(|e| format!("account source at {source} is not valid UTF-8: {e}"))
+}
+
+/// Admit local discovery text from the opened regular file, never a FIFO or
+/// an oversized prefix. On Unix the open also refuses the final symbolic link;
+/// other platforms use `astream_sys`'s read-only open.
+fn read_local_source_text(path: &Path) -> io::Result<String> {
+    let file = astream_sys::open_nonblocking(path, astream_sys::Links::Refuse)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "local account source is not a regular file",
+        ));
+    }
+    if metadata.len() > SOURCE_TEXT_MAX_BYTES as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "local account source exceeds the byte limit",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take((SOURCE_TEXT_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    decode_source_text(bytes, &path.to_string_lossy())
+        .map_err(|why| io::Error::new(io::ErrorKind::InvalidData, why))
 }
 
 fn rclone_program() -> &'static str {
@@ -1506,6 +1535,10 @@ struct SyncedAccounts {
     note: Option<String>,
 }
 
+/// The fleet bytes init captured before taking the account lock, or its
+/// absence for a first discovery. Other syncs intentionally replace a source.
+struct FleetSnapshot(Option<Vec<u8>>);
+
 /// How long a sync from the command line waits for `accounts.lock` before it
 /// gives up and says so ([`persist_accounts_sync`]): the host's own bounded
 /// wait ([`accounts::LOCK_LADDER`], two seconds), then sixteen half-second
@@ -1521,8 +1554,9 @@ fn sync_lock_ladder() -> Vec<Duration> {
 
 /// Persist captured sync inputs. Source/profile/transcript discovery happens
 /// before this call; the account lock spans the roster's read/build/write and
-/// the existing state/login transaction. Individual replacements are durable
-/// writes, not an atomic transaction across all these files.
+/// the existing state/login transaction. Init's locally captured fleet also
+/// requires unchanged fleet bytes under that lock. Individual replacements
+/// are durable writes, not an atomic transaction across all these files.
 ///
 /// THE LOCK IS WAITED FOR WITHIN `ladder` ([`accounts::Store::acquire_within`]):
 /// still held after it, the sync fails before it reads or writes anything and
@@ -1535,7 +1569,7 @@ fn persist_accounts_sync(
     (machine, default_email): (&str, Option<&str>),
     standing_walls: &BTreeMap<String, upgrade::StandingWall>,
     now: i64,
-    ladder: &[Duration],
+    (ladder, fleet_snapshot): (&[Duration], Option<&FleetSnapshot>),
 ) -> Result<SyncedAccounts, String> {
     let held = store
         .acquire_within(ladder)
@@ -1549,6 +1583,27 @@ fn persist_accounts_sync(
                 ladder.iter().sum::<Duration>().as_millis()
             )
         })?;
+    let fleet_path = roster_path
+        .parent()
+        .map(|p| p.join(FLEET_ROSTER_FILE))
+        .unwrap_or_else(|| PathBuf::from(FLEET_ROSTER_FILE));
+    if let Some(expected) = fleet_snapshot {
+        let current = match read_local_source_text(&fleet_path) {
+            Ok(text) => Some(text.into_bytes()),
+            Err(why) if why.kind() == io::ErrorKind::NotFound => None,
+            Err(why) => {
+                return Err(format!(
+                    "could not check captured fleet at {}: {why}; nothing was synced",
+                    fleet_path.display()
+                ));
+            }
+        };
+        if current != expected.0 {
+            return Err(
+                "fleet accounts changed after init discovery; nothing was synced".to_owned(),
+            );
+        }
+    }
     let (write_to, keep_mode) = super::cli::roster_target(roster_path)?;
     let existing = Roster::load(&write_to).map_err(|why| {
         format!(
@@ -1565,10 +1620,6 @@ fn persist_accounts_sync(
     }
     let roster_toml = format_roster_toml(&roster)
         .map_err(|why| format!("generated roster refused admission: {why}"))?;
-    let fleet_path = roster_path
-        .parent()
-        .map(|p| p.join(FLEET_ROSTER_FILE))
-        .unwrap_or_else(|| PathBuf::from(FLEET_ROSTER_FILE));
     let (fleet_write_to, fleet_mode) = super::cli::roster_target(&fleet_path)?;
     let fleet_toml = fleet.to_toml_for(Some(opt_in));
     let default_row_label = roster.row_for_login(None).map(|r| r.label.clone());
@@ -1678,16 +1729,18 @@ pub fn run_accounts_sync(
     let how = SyncHow {
         fetch: &fetch_source_text,
         ladder: &sync_lock_ladder(),
+        fleet_snapshot: None,
     };
     run_accounts_sync_with(env, (source, machine_override, json), (out, err), &how)
 }
 
 /// What one sync reads its source with and how long it waits for the lock:
 /// the command line's ([`run_accounts_sync`]), the window's upkeep's
-/// ([`upkeep`]) or a test's.
+/// ([`upkeep`]) or a test's. Init also binds its captured fleet snapshot.
 struct SyncHow<'a> {
     fetch: &'a Fetch,
     ladder: &'a [Duration],
+    fleet_snapshot: Option<&'a FleetSnapshot>,
 }
 
 /// [`run_accounts_sync`] over `how`.
@@ -1749,7 +1802,7 @@ fn run_accounts_sync_with(
         (&machine, default_email.as_deref()),
         &standing_walls,
         env.now,
-        how.ladder,
+        (how.ladder, how.fleet_snapshot),
     ) {
         Ok(saved) => saved,
         Err(why) => {
@@ -2072,6 +2125,7 @@ fn sync_if_missing(
     let how = SyncHow {
         fetch: fx.fetch,
         ladder: &accounts::LOCK_LADDER,
+        fleet_snapshot: None,
     };
     // Handed no source: the sync reads the one configured, as configured, so
     // the fleet file it writes says why ([`OptIn`]) and a key taken out later
@@ -2101,6 +2155,13 @@ pub fn has_init_accounts_source(
     if [FLEET_ROSTER_FILE, "ai-accounts.csv"]
         .into_iter()
         .any(|name| secrets.join(name).is_file())
+    {
+        return true;
+    }
+    if Roster::load(roster_path).is_ok_and(|r| !r.rows.is_empty())
+        && roster_path
+            .parent()
+            .is_some_and(|p| p.join(FLEET_ROSTER_FILE).is_file())
     {
         return true;
     }
@@ -2172,32 +2233,101 @@ pub fn sync_accounts_for_init(
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(FLEET_ROSTER_FILE);
-    let init_source = env
-        .config
-        .as_deref()
-        .and_then(source_key)
-        .or_else(|| {
-            let secrets = home.join(".secrets");
-            [FLEET_ROSTER_FILE, "ai-accounts.csv"]
-                .into_iter()
-                .map(|name| secrets.join(name))
-                .find(|p| p.is_file())
-                .map(|p| p.to_string_lossy().into_owned())
-        })
-        .or_else(|| configured_source(env.config.as_deref(), Some(roster_path)).map(|s| s.source()))
-        .or_else(|| {
-            let local = discover_local_fleet(&env)?;
-            if let Some(parent) = fleet_path.parent() {
-                let _ = fs::create_dir_all(parent);
+    let has_named_fleet = fleet_file_opt_in(&fleet_path) == Some(OptIn::Named);
+    let has_key = env.config.as_deref().and_then(source_key).is_some();
+    let secrets_source = {
+        let secrets = home.join(".secrets");
+        [FLEET_ROSTER_FILE, "ai-accounts.csv"]
+            .into_iter()
+            .map(|name| secrets.join(name))
+            .find(|p| p.is_file())
+            .map(|p| p.to_string_lossy().into_owned())
+    };
+    let mut captured_fleet = None;
+    let mut fleet_snapshot = None;
+    let init_source = if has_key && !has_named_fleet {
+        None
+    } else if let Some(src) = secrets_source {
+        Some(src)
+    } else if configured_source(env.config.as_deref(), Some(roster_path)).is_some() {
+        if has_named_fleet
+            && let Ok(existing_text) = read_local_source_text(&fleet_path)
+            && let Ok(mut existing_fleet) =
+                FleetRoster::from_toml(&existing_text, &fleet_path.display().to_string())
+            && let Some(local) = discover_local_fleet_with_min(&env, 1)
+        {
+            let mut used_labels: BTreeSet<String> = existing_fleet
+                .accounts
+                .iter()
+                .map(|a| a.label.clone())
+                .collect();
+            let mut added = false;
+            for mut acct in local.accounts {
+                if !existing_fleet
+                    .accounts
+                    .iter()
+                    .any(|a| accounts::email_matches(&a.email, &acct.email))
+                {
+                    let base_label = acct.label.clone();
+                    let mut suffix = 2u32;
+                    loop {
+                        if let Some(why) = accounts::label_refusal(&acct.label) {
+                            return Err(format!("discovered account label {} {why}", acct.label));
+                        }
+                        if used_labels.insert(acct.label.clone()) {
+                            break;
+                        }
+                        acct.label = format!("{base_label}-{suffix}");
+                        suffix = suffix.checked_add(1).ok_or_else(|| {
+                            "discovered account label suffixes exhausted".to_owned()
+                        })?;
+                    }
+                    existing_fleet.accounts.push(acct);
+                    added = true;
+                }
             }
-            super::upgrade_models::write_atomic_mode(&fleet_path, &local.to_toml(), Some(0o600))
-                .ok()?;
-            Some(fleet_path.to_string_lossy().into_owned())
-        });
+            if added {
+                captured_fleet = Some((
+                    fleet_path.to_string_lossy().into_owned(),
+                    existing_fleet.to_toml_for(Some(OptIn::Named)),
+                ));
+                fleet_snapshot = Some(FleetSnapshot(Some(existing_text.into_bytes())));
+            }
+        }
+        None
+    } else if fleet_path.is_file() {
+        Some(fleet_path.to_string_lossy().into_owned())
+    } else {
+        discover_local_fleet(&env).map(|local| {
+            let source = fleet_path.to_string_lossy().into_owned();
+            captured_fleet = Some((source.clone(), local.to_toml_for(Some(OptIn::Named))));
+            fleet_snapshot = Some(FleetSnapshot(None));
+            source
+        })
+    };
+    // Discovery stays in memory until the normal sync admits the roster and
+    // account state under its lock. Only that publication path writes files.
+    let fetch = move |env: &Env, source: &str| {
+        if let Some((path, text)) = &captured_fleet
+            && source == path
+        {
+            Ok(text.clone())
+        } else {
+            fetch_source_text(env, source)
+        }
+    };
     let mut out = Vec::new();
     let mut err = Vec::new();
-    if run_accounts_sync(&env, init_source.as_deref(), None, true, &mut out, &mut err)
-        != ExitCode::SUCCESS
+    if run_accounts_sync_with(
+        &env,
+        (init_source.as_deref(), None, true),
+        (&mut out, &mut err),
+        &SyncHow {
+            fetch: &fetch,
+            ladder: &sync_lock_ladder(),
+            fleet_snapshot: fleet_snapshot.as_ref(),
+        },
+    ) != ExitCode::SUCCESS
     {
         let msg = String::from_utf8_lossy(&err).trim().to_owned();
         return Err(if msg.is_empty() {
@@ -2261,15 +2391,16 @@ impl AutoRenewPermit {
         state: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
         label: &str,
         now: Instant,
+        ignore_cooldown: bool,
     ) -> Option<Self> {
         let mut guard = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.in_flight
-            || guard
-                .last_attempt
-                .get(label)
-                .is_some_and(|last| now.saturating_duration_since(*last) < Duration::from_secs(900))
+            || (!ignore_cooldown
+                && guard.last_attempt.get(label).is_some_and(|last| {
+                    now.saturating_duration_since(*last) < Duration::from_secs(900)
+                }))
         {
             return None;
         }
@@ -2548,50 +2679,88 @@ fn auto_renew_next_account(
         file_roster,
         &logins,
         next_row,
-        false,
+        (None, false),
         now,
         fx.renew_guard,
         fx.spawn_renewal,
     )
 }
 
-/// Start a non-blocking staging login for a specific account `target_label` (e.g., when
-/// selected in the Accounts menu), and optionally pin it once verified.
-pub fn auto_renew_account_by_label(
+/// Start a non-blocking staging login for the next un-enrolled successor when
+/// all enrolled accounts stand at a quota wall, allowing the default browser
+/// when no mailbox or dedicated profile is configured (e.g. when the person
+/// chooses `Auto-rotate` in the Accounts menu).
+pub fn auto_renew_next_account_interactive(
     home: &Path,
     state_dir: &Path,
     roster_path: &Path,
-    target_label: &str,
-    pin_after: bool,
     now: i64,
-) {
+) -> bool {
     let Ok(file_roster) = Roster::load(roster_path) else {
-        return;
+        return false;
     };
+    if file_roster.rows.is_empty() {
+        return false;
+    }
     let store = accounts::Store::at(state_dir);
+    let Ok((state, _)) = store.load(now) else {
+        return false;
+    };
     let Ok((logins, _)) = store.load_logins(now) else {
-        return;
+        return false;
     };
-    let roster = accounts::bound(&file_roster, &logins);
-    let Some(next_row) = roster.row(target_label).cloned() else {
-        return;
+    let Some(next_row) = next_auto_renew_target(&file_roster, &state, &logins, now) else {
+        return false;
     };
-    let _ = spawn_row_renewal(
+    spawn_row_renewal(
         home,
         state_dir,
         file_roster,
         &logins,
         next_row,
-        pin_after,
+        (None, true),
         now,
         &AUTO_RENEW_GUARD,
         &spawn_renewal_thread,
-    );
+    )
+}
+
+/// Starts a staging login for a saved explicit selection.
+/// The verified login pins only while this request is still current.
+pub fn auto_renew_account_by_label(
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    request: accounts::PinRequest,
+    now: i64,
+) -> bool {
+    let Ok(file_roster) = Roster::load(roster_path) else {
+        return false;
+    };
+    let store = accounts::Store::at(state_dir);
+    let Ok((logins, _)) = store.load_logins(now) else {
+        return false;
+    };
+    let roster = accounts::bound(&file_roster, &logins);
+    let Some(next_row) = roster.row(request.label()).cloned() else {
+        return false;
+    };
+    spawn_row_renewal(
+        home,
+        state_dir,
+        file_roster,
+        &logins,
+        next_row,
+        (Some(request), true),
+        now,
+        &AUTO_RENEW_GUARD,
+        &spawn_renewal_thread,
+    )
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "row renewal binds paths, rosters, target row, pin flag, clock, admission guard, and spawn seam"
+    reason = "row renewal binds paths, rosters, target row, pin/browser flags, clock, admission guard, and spawn seam"
 )]
 fn spawn_row_renewal(
     home: &Path,
@@ -2599,14 +2768,14 @@ fn spawn_row_renewal(
     file_roster: Roster,
     logins: &accounts::Logins,
     next_row: accounts::Row,
-    pin_after: bool,
+    (pin_request, allow_default_browser): (Option<accounts::PinRequest>, bool),
     now: i64,
     renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
     spawn_renewal: &SpawnRenewal,
 ) -> bool {
     let store = accounts::Store::at(state_dir);
     let mailbox_dir = resolve_mailbox_dir(Some(home), &store);
-    if !pin_after && next_row.browser.is_none() && mailbox_dir.is_none() {
+    if !allow_default_browser && next_row.browser.is_none() && mailbox_dir.is_none() {
         return false;
     }
     let next_label = next_row.label.clone();
@@ -2614,7 +2783,12 @@ fn spawn_row_renewal(
         return false;
     };
     let roster = accounts::bound(&file_roster, logins);
-    let Some(permit) = AutoRenewPermit::claim(renew_guard, &next_label, Instant::now()) else {
+    let Some(permit) = AutoRenewPermit::claim(
+        renew_guard,
+        &next_label,
+        Instant::now(),
+        allow_default_browser,
+    ) else {
         return false;
     };
     let home_owned = home.to_path_buf();
@@ -2623,78 +2797,89 @@ fn spawn_row_renewal(
         permit,
         move || {
             let store = accounts::Store::at(&state_owned);
-            let opener = resolve_opener_link(&home_owned, &store);
-            let browser = match select_auto_renew_browser(
-                next_row.browser.as_deref(),
-                mailbox_dir.as_deref(),
-                opener,
-            ) {
-                Some(b) => b,
-                None if pin_after => super::cli::RenewBrowser::Default,
-                None => return,
-            };
-            let Ok(staging) = store.claim_staging_dir(&next_label) else {
-                return;
-            };
-            let Some(staging_text) = staging.to_str().map(str::to_owned) else {
-                let _ = fs::remove_dir_all(&staging);
-                return;
-            };
-            let env_var = |name: &str| {
-                if name == "HOME" {
-                    return Some(home_owned.as_os_str().to_os_string());
+            let renewed = (|| {
+                let opener = resolve_opener_link(&home_owned, &store);
+                let browser = match select_auto_renew_browser(
+                    next_row.browser.as_deref(),
+                    mailbox_dir.as_deref(),
+                    opener,
+                ) {
+                    Some(b) => b,
+                    None if allow_default_browser => super::cli::RenewBrowser::Default,
+                    None => return false,
+                };
+                let Ok(staging) = store.claim_staging_dir(&next_label) else {
+                    return false;
+                };
+                let Some(staging_text) = staging.to_str().map(str::to_owned) else {
+                    let _ = fs::remove_dir_all(&staging);
+                    return false;
+                };
+                let env_var = |name: &str| {
+                    if name == "HOME" {
+                        return Some(home_owned.as_os_str().to_os_string());
+                    }
+                    std::env::var_os(name)
+                        .or_else(|| (name == "USER").then(|| std::ffi::OsString::from("aterm")))
+                };
+                let Ok(pass_env) = super::cli::auth_check_env(&env_var) else {
+                    let _ = fs::remove_dir_all(&staging);
+                    return false;
+                };
+                let claude_prog = resolve_claude_program(&home_owned);
+                let mut cmd = super::cli::renew_command(
+                    claude_prog.as_os_str(),
+                    &staging_text,
+                    &next_email,
+                    &browser,
+                );
+                cmd.env("HOME", &home_owned)
+                    .env(super::open_url::EMAIL_ENV, &next_email)
+                    .envs(pass_env);
+                if let Some(mailbox) = &mailbox_dir {
+                    cmd.env(super::open_url::MAILBOX_ENV, mailbox);
                 }
-                std::env::var_os(name)
-                    .or_else(|| (name == "USER").then(|| std::ffi::OsString::from("aterm")))
-            };
-            let Ok(pass_env) = super::cli::auth_check_env(&env_var) else {
-                let _ = fs::remove_dir_all(&staging);
-                return;
-            };
-            let claude_prog = resolve_claude_program(&home_owned);
-            let mut cmd = super::cli::renew_command(
-                claude_prog.as_os_str(),
-                &staging_text,
-                &next_email,
-                &browser,
-            );
-            cmd.env("HOME", &home_owned)
-                .env(super::open_url::EMAIL_ENV, &next_email)
-                .envs(pass_env);
-            if let Some(mailbox) = &mailbox_dir {
-                cmd.env(super::open_url::MAILBOX_ENV, mailbox);
-            }
-            let ran = super::align::capture_bounded(cmd, Duration::from_secs(300), 64 * 1024);
-            if !ran.is_ok_and(|cap| cap.code == Some(0)) || !accounts::login_made(&staging) {
-                let _ = fs::remove_dir_all(&staging);
-                return;
-            }
-            let Ok(status_got) = super::cli::status_in_home_within(
-                claude_prog.as_os_str(),
-                &staging_text,
-                &env_var,
-                super::cli::AUTH_CHECK_BUDGET,
-            ) else {
-                let _ = fs::remove_dir_all(&staging);
-                return;
-            };
+                let ran = super::align::capture_bounded(cmd, Duration::from_secs(300), 64 * 1024);
+                if !ran.is_ok_and(|cap| cap.code == Some(0)) || !accounts::login_made(&staging) {
+                    let _ = fs::remove_dir_all(&staging);
+                    return false;
+                }
+                let Ok(status_got) = super::cli::status_in_home_within(
+                    claude_prog.as_os_str(),
+                    &staging_text,
+                    &env_var,
+                    super::cli::AUTH_CHECK_BUDGET,
+                ) else {
+                    let _ = fs::remove_dir_all(&staging);
+                    return false;
+                };
+                let now_done = crate::supervise::limit::unix_now().max(now);
+                complete_staging_renewal(
+                    &store,
+                    &file_roster,
+                    &roster,
+                    &next_row,
+                    &staging,
+                    &staging_text,
+                    &status_got,
+                    now_done,
+                )
+            })();
             let now_done = crate::supervise::limit::unix_now().max(now);
-            let renewed = complete_staging_renewal(
-                &store,
-                &file_roster,
-                &roster,
-                &next_row,
-                &staging,
-                &staging_text,
-                &status_got,
-                now_done,
-            );
-            if renewed && pin_after {
+            if let Some(request) = &pin_request {
+                if !renewed {
+                    let _ = store.cancel_pin_request(request, now_done);
+                    return;
+                }
                 let bound = store.bound(&file_roster, now_done).unwrap_or(file_roster);
                 let enrolled = accounts::enrolled(&bound);
                 let mut note = None;
                 let _ = store.transact_within(&accounts::LOCK_LADDER, now_done, &mut note, |st| {
-                    accounts::pin(st, &bound, &enrolled, &next_label, now_done).map(|ev| vec![ev])
+                    Ok(
+                        accounts::complete_requested_pin(st, &bound, &enrolled, request, now_done)
+                            .into_iter()
+                            .collect(),
+                    )
                 });
             }
         },
@@ -3324,6 +3509,47 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert!(decode_source_text(boundary, "oversized.csv").is_err());
         assert!(decode_source_text(vec![0xff], "invalid-utf8.csv").is_err());
 
+        // Local discovery uses the same whole-source admission. Its opened
+        // descriptor, not an earlier directory entry, must be a bounded file.
+        let owned = aterm_tempfile::Builder::new()
+            .prefix("aterm-account-source-")
+            .tempdir()
+            .expect("exclusive source fixtures");
+        let source = owned.path().join("source.csv");
+        fs::write(&source, &admitted).unwrap();
+        let text = read_local_source_text(&source).expect("the exact boundary is admitted");
+        assert_eq!(text, admitted);
+        let fleet = parse_accounting_csv(&text, "source.csv").unwrap();
+        assert_eq!(fleet.accounts[0].email, "within@example.test");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_len((SOURCE_TEXT_MAX_BYTES + 1) as u64)
+            .unwrap();
+        assert!(read_local_source_text(&source).is_err());
+        fs::write(&source, [0xff]).unwrap();
+        assert!(read_local_source_text(&source).is_err());
+        assert!(read_local_source_text(owned.path()).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            fs::write(&source, "ordinary@example.test").unwrap();
+            let link = owned.path().join("source-link");
+            std::os::unix::fs::symlink(&source, &link).unwrap();
+            assert!(read_local_source_text(&link).is_err());
+            let fifo = owned.path().join("source.fifo");
+            let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            // SAFETY: a NUL-terminated path in this test's exclusive directory;
+            // mkfifo creates a node and retains no pointer. No writer is opened.
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            assert!(read_local_source_text(&fifo).is_err());
+            assert_eq!(
+                read_local_source_text(&source).unwrap(),
+                "ordinary@example.test"
+            );
+        }
+
         // A note's second physical line is still the same account's note.
         // Every existing unusable marker, including suspension, refuses it.
         for ending in ["\n", "\r\n"] {
@@ -3565,7 +3791,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             ("m8", Some("two@example.test")),
             &empty_walls,
             now,
-            &[],
+            (&[], None),
         )
         .expect("publish captured inputs");
         let (adopted, _) = store.load(now).expect("adopted state");
@@ -3619,7 +3845,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             ("m8", None),
             &empty_walls,
             now,
-            &[],
+            (&[], None),
         )
         .expect("preserve the current default without a profile hint");
         assert_eq!(kept.roster.row_for_login(None).unwrap().label, "m8-2");
@@ -3637,7 +3863,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 ("m8", None),
                 &empty_walls,
                 now,
-                &[]
+                (&[], None)
             )
             .is_err()
         );
@@ -3659,7 +3885,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                     ("m8", None),
                     &empty_walls,
                     now,
-                    &[],
+                    (&[], None),
                 )
                 .is_err()
             );
@@ -3678,7 +3904,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 ("m8", None),
                 &empty_walls,
                 now,
-                &[],
+                (&[], None),
             )
             .is_err()
         );
@@ -3697,7 +3923,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 ("m8", None),
                 &empty_walls,
                 now,
-                &[],
+                (&[], None),
             )
             .is_err()
         );
@@ -3719,7 +3945,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             ("m8", None),
             &empty_walls,
             now,
-            &[],
+            (&[], None),
         )
         .unwrap();
 
@@ -3905,7 +4131,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         let now = Instant::now();
         let ran = Arc::new(AtomicBool::new(false));
         let called = Arc::clone(&ran);
-        let permit = AutoRenewPermit::claim(&state, "first", now).expect("admitted");
+        let permit = AutoRenewPermit::claim(&state, "first", now, false).expect("admitted");
         let result = start_auto_renew(
             permit,
             move || called.store(true, Ordering::SeqCst),
@@ -3915,11 +4141,18 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert!(!ran.load(Ordering::SeqCst), "a refused spawn ran nothing");
         assert!(!state.lock().unwrap().in_flight, "refusal releases busy");
         assert!(
-            AutoRenewPermit::claim(&state, "first", now).is_none(),
-            "the per-label cooldown still prevents repeated attempts"
+            AutoRenewPermit::claim(&state, "first", now, false).is_none(),
+            "the per-label cooldown still prevents repeated background attempts"
         );
+        let manual_permit = AutoRenewPermit::claim(&state, "first", now, true)
+            .expect("explicit operator selection bypasses the background cooldown when idle");
+        assert!(
+            AutoRenewPermit::claim(&state, "first", now, true).is_none(),
+            "in_flight still serializes concurrent explicit selections"
+        );
+        drop(manual_permit);
 
-        let permit = AutoRenewPermit::claim(&state, "second", now)
+        let permit = AutoRenewPermit::claim(&state, "second", now, false)
             .expect("spawn refusal cannot block another account");
         let called = Arc::clone(&ran);
         let mut queued = None;
@@ -3934,12 +4167,12 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         .expect("accepted by injected builder");
         assert!(!ran.load(Ordering::SeqCst), "still queued");
         assert!(state.lock().unwrap().in_flight);
-        assert!(AutoRenewPermit::claim(&state, "third", now).is_none());
+        assert!(AutoRenewPermit::claim(&state, "third", now, false).is_none());
         queued.take().expect("queued worker")();
         assert!(ran.load(Ordering::SeqCst), "accepted worker ran");
         assert!(!state.lock().unwrap().in_flight, "completion releases busy");
         let later = now + Duration::from_secs(900);
-        let permit = AutoRenewPermit::claim(&state, "first", later)
+        let permit = AutoRenewPermit::claim(&state, "first", later, false)
             .expect("the original account can retry after its cooldown");
         drop(permit);
         assert!(!state.lock().unwrap().in_flight);
@@ -4465,6 +4698,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             let how = SyncHow {
                 fetch: &*wit.fetch,
                 ladder: &[],
+                fleet_snapshot: None,
             };
             let code = run_accounts_sync_with(
                 &w.env(UPKEEP_NOW),
@@ -4618,6 +4852,22 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 "{text}"
             );
         }
+
+        // A valid marker in an oversized file does not opt this machine in.
+        // The metadata read uses the same whole-file bound as local discovery.
+        let mut oversized = format!("{OPT_IN_KEY} = \"named\"\n#");
+        oversized.push_str(&"x".repeat(SOURCE_TEXT_MAX_BYTES + 1 - oversized.len()));
+        fs::write(w.fleet_file(), oversized).unwrap();
+        assert_eq!(
+            configured_source(Some(&w.aterm_toml()), Some(&w.roster())),
+            None
+        );
+        assert_eq!(
+            upkept(),
+            Upkept::Unconfigured {
+                fleet_file_ignored: true
+            }
+        );
         assert_eq!(wit.fetched(), Vec::<String>::new(), "nothing fetched");
         assert_eq!(wit.spawned(), 0, "no renewal started");
         assert!(!w.roster().exists(), "no roster written");
@@ -4631,6 +4881,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             &SyncHow {
                 fetch: &*wit.fetch,
                 ladder: &[],
+                fleet_snapshot: None,
             },
         );
         assert_eq!(
@@ -4680,6 +4931,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             &SyncHow {
                 fetch: &*wit.fetch,
                 ladder: &[],
+                fleet_snapshot: None,
             },
         );
         assert_eq!(
@@ -4783,6 +5035,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                     &SyncHow {
                         fetch: &fetch,
                         ladder: &[Duration::from_millis(1); 3],
+                        fleet_snapshot: None,
                     },
                 );
                 let _ = tx.send((code, String::from_utf8_lossy(&err).into_owned()));
@@ -4801,5 +5054,244 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         let (code, err) = sync_in_thread(&w);
         assert_eq!(code, ExitCode::SUCCESS, "{err}");
         assert!(w.roster().exists());
+    }
+
+    #[test]
+    fn sync_accounts_for_init_preserves_key_opt_in_and_existing_fleet_roster() {
+        let w = World::new();
+        w.write_config("[fleet]\nmachine = \"m1\"\n");
+        fs::write(
+            w.home.join(".claude.json"),
+            "{\"oauthAccount\":{\"emailAddress\":\"m1@example.test\"}}\n",
+        )
+        .unwrap();
+        assert!(
+            !has_init_accounts_source(&w.home, &w.state, &w.roster(), UPKEEP_NOW),
+            "a single local account without a configured source must not trigger init sync"
+        );
+
+        let csv_path = w.home.join("fleet.csv");
+        fs::write(
+            &csv_path,
+            "email,computer,claude\nm1@example.test,m1,1\nm1-2@example.test,m1,1\nm2@example.test,m2,1\n",
+        )
+        .unwrap();
+        w.write_config(&format!(
+            "[fleet]\naccounts_source = \"{}\"\nmachine = \"m1\"\n",
+            csv_path.display()
+        ));
+        let (machine, m_count, enrolled, f_count) =
+            sync_accounts_for_init(&w.home, &w.state, &w.roster(), UPKEEP_NOW)
+                .expect("init sync from key");
+        assert_eq!(machine, "m1");
+        assert_eq!(m_count, 2);
+        assert_eq!(enrolled, 1);
+        assert_eq!(f_count, 3);
+        assert_eq!(
+            fleet_file_opt_in(&w.fleet_file()),
+            Some(OptIn::Key),
+            "sync_accounts_for_init from [fleet] accounts_source must record opt_in = \"key\""
+        );
+
+        w.write_config("[fleet]\nmachine = \"m1\"\n");
+        assert_eq!(
+            configured_source(Some(&w.aterm_toml()), Some(&w.roster())),
+            None,
+            "removing [fleet] accounts_source must opt the machine out"
+        );
+        assert!(
+            has_init_accounts_source(&w.home, &w.state, &w.roster(), UPKEEP_NOW),
+            "existing accounts.toml + fleet-accounts.toml can be upgraded by explicit init"
+        );
+        let (_, m_count2, _, f_count2) =
+            sync_accounts_for_init(&w.home, &w.state, &w.roster(), UPKEEP_NOW)
+                .expect("init sync from existing fleet-accounts.toml");
+        assert_eq!(m_count2, 2);
+        assert_eq!(
+            f_count2, 3,
+            "init sync must preserve all fleet rows in existing fleet-accounts.toml"
+        );
+        assert_eq!(fleet_file_opt_in(&w.fleet_file()), Some(OptIn::Named));
+    }
+
+    #[test]
+    fn sync_accounts_for_init_merges_newly_signed_in_local_accounts() {
+        let w = World::new();
+        w.write_config("[fleet]\nmachine = \"m27\"\n");
+        fs::write(
+            w.home.join(".claude.json"),
+            "{\"oauthAccount\":{\"emailAddress\":\"sol-m27@example.test\"}}\n",
+        )
+        .unwrap();
+        fs::write(
+            w.home.join(".claude.json.backup"),
+            "{\"oauthAccount\":{\"emailAddress\":\"m27-2@example.test\"}}\n",
+        )
+        .unwrap();
+        let (machine, count, enrolled, fleet_count) =
+            sync_accounts_for_init(&w.home, &w.state, &w.roster(), UPKEEP_NOW)
+                .expect("initial sync from local profiles");
+        assert_eq!(machine, "m27");
+        assert_eq!(count, 2);
+        assert_eq!(enrolled, 1);
+        assert_eq!(fleet_count, 2);
+
+        // User signs into a third account locally; re-running init merges it into
+        // fleet-accounts.toml and accounts.toml without manual TOML editing.
+        fs::remove_file(w.home.join(".claude.json.backup")).unwrap();
+        fs::write(
+            w.home.join(".claude.json"),
+            "{\"oauthAccount\":{\"emailAddress\":\"solar.m27.3@example.test\"}}\n",
+        )
+        .unwrap();
+        let (machine2, count2, _, fleet_count2) =
+            sync_accounts_for_init(&w.home, &w.state, &w.roster(), UPKEEP_NOW + 10)
+                .expect("second sync merges new local account");
+        assert_eq!(machine2, "m27");
+        assert_eq!(count2, 3);
+        assert_eq!(fleet_count2, 3);
+
+        let before = Roster::load(&w.roster()).unwrap();
+        // An address with no machine hint falls back to m27, whose label is
+        // already owned by a different email in the named fleet.
+        fs::write(
+            w.home.join(".claude.json"),
+            "{\"oauthAccount\":{\"emailAddress\":\"new@example.test\"}}\n",
+        )
+        .unwrap();
+        let (_, count, _, fleet_count) =
+            sync_accounts_for_init(&w.home, &w.state, &w.roster(), UPKEEP_NOW + 20)
+                .expect("merge a colliding fallback label");
+        assert_eq!((count, fleet_count), (4, 4));
+        let merged = Roster::load(&w.roster()).unwrap();
+        for row in &before.rows {
+            assert_eq!(merged.row(&row.label).unwrap().email, row.email);
+        }
+        assert_eq!(
+            merged.row("m27-4").unwrap().email.as_deref(),
+            Some("new@example.test")
+        );
+        assert_eq!(merged.row_for_login(None).unwrap().label, "m27-4");
+        let (_, count, _, fleet_count) =
+            sync_accounts_for_init(&w.home, &w.state, &w.roster(), UPKEEP_NOW + 21)
+                .expect("the same discovered email is not another account");
+        assert_eq!((count, fleet_count), (4, 4));
+        assert_eq!(Roster::load(&w.roster()).unwrap(), merged);
+
+        fs::write(
+            w.home.join(".claude.json"),
+            "{\"oauthAccount\":{\"emailAddress\":\"later@example.test\"}}\n",
+        )
+        .unwrap();
+        let roster_bytes = fs::read(w.roster()).unwrap();
+        let fleet_bytes = fs::read(w.fleet_file()).unwrap();
+        let malformed = b"[[account]\nlabel = \"broken\"\n";
+        fs::write(w.roster(), malformed).unwrap();
+        assert!(sync_accounts_for_init(&w.home, &w.state, &w.roster(), UPKEEP_NOW + 30).is_err());
+        assert_eq!(fs::read(w.roster()).unwrap(), malformed);
+        assert_eq!(fs::read(w.fleet_file()).unwrap(), fleet_bytes);
+        fs::write(w.roster(), &roster_bytes).unwrap();
+
+        let store = accounts::Store::at(&w.state);
+        for path in [store.state_file(), store.logins_file()] {
+            let prior = path.exists().then(|| fs::read(&path).unwrap());
+            fs::write(&path, "{\"schema\":999}").unwrap();
+            assert!(
+                sync_accounts_for_init(&w.home, &w.state, &w.roster(), UPKEEP_NOW + 30).is_err()
+            );
+            assert_eq!(fs::read(w.roster()).unwrap(), roster_bytes);
+            assert_eq!(fs::read(w.fleet_file()).unwrap(), fleet_bytes);
+            assert_eq!(fs::read(&path).unwrap(), b"{\"schema\":999}");
+            match prior {
+                Some(bytes) => fs::write(path, bytes).unwrap(),
+                None => fs::remove_file(path).unwrap(),
+            }
+        }
+        let (_, count, _, fleet_count) =
+            sync_accounts_for_init(&w.home, &w.state, &w.roster(), UPKEEP_NOW + 30)
+                .expect("publish after account state admits again");
+        assert_eq!((count, fleet_count), (5, 5));
+
+        // The first local discovery must also wait for admission, rather
+        // than leave a new fleet file behind when the state is refused.
+        let fresh = World::new();
+        fresh.write_config("[fleet]\nmachine = \"m27\"\n");
+        for (file, email) in [
+            (".claude.json", "one@example.test"),
+            (".claude.json.backup", "two@example.test"),
+        ] {
+            fs::write(
+                fresh.home.join(file),
+                format!("{{\"oauthAccount\":{{\"emailAddress\":\"{email}\"}}}}\n"),
+            )
+            .unwrap();
+        }
+        let store = accounts::Store::at(&fresh.state);
+        fs::create_dir_all(&store.dir).unwrap();
+        fs::write(store.state_file(), "{\"schema\":999}").unwrap();
+        assert!(
+            sync_accounts_for_init(&fresh.home, &fresh.state, &fresh.roster(), UPKEEP_NOW).is_err()
+        );
+        assert!(!fresh.roster().exists());
+        assert!(!fresh.fleet_file().exists());
+        assert_eq!(fs::read(store.state_file()).unwrap(), b"{\"schema\":999}");
+        fs::remove_file(store.state_file()).unwrap();
+        let (_, count, _, fleet_count) =
+            sync_accounts_for_init(&fresh.home, &fresh.state, &fresh.roster(), UPKEEP_NOW)
+                .expect("initial discovery publishes after admission");
+        assert_eq!((count, fleet_count), (2, 2));
+
+        // A cooperating sync can replace the fleet after discovery but before
+        // init takes the lock. Exercise that gap through the actual fetch and
+        // publication funnel, without racing threads or sleeps.
+        let captured = fs::read(w.fleet_file()).unwrap();
+        let mut concurrent =
+            FleetRoster::from_toml(std::str::from_utf8(&captured).unwrap(), "captured").unwrap();
+        let mut another = concurrent.accounts[0].clone();
+        another.label = "m27-other".to_owned();
+        another.email = "concurrent@example.test".to_owned();
+        concurrent.accounts.push(another);
+        let replacement = concurrent.to_toml_for(Some(OptIn::Named));
+        let sync_across_change = |w: &World, expected: Option<Vec<u8>>| {
+            let state_dir = w.state.clone();
+            let fleet_path = w.fleet_file();
+            let answer = String::from_utf8(captured.clone()).unwrap();
+            let replacement = replacement.clone();
+            let fetch = move |_: &Env, _: &str| {
+                let store = accounts::Store::at(&state_dir);
+                let _held = store.acquire().unwrap();
+                fs::write(&fleet_path, &replacement).unwrap();
+                Ok(answer.clone())
+            };
+            let expected = FleetSnapshot(expected);
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let source = w.fleet_file().to_string_lossy().into_owned();
+            let code = run_accounts_sync_with(
+                &w.env(UPKEEP_NOW + 40),
+                (Some(&source), None, true),
+                (&mut out, &mut err),
+                &SyncHow {
+                    fetch: &fetch,
+                    ladder: &[],
+                    fleet_snapshot: Some(&expected),
+                },
+            );
+            assert_eq!(code, ExitCode::FAILURE);
+            assert!(String::from_utf8_lossy(&err).contains("changed after init discovery"));
+        };
+        let roster_bytes = fs::read(w.roster()).unwrap();
+        sync_across_change(&w, Some(captured.clone()));
+        assert_eq!(fs::read(w.roster()).unwrap(), roster_bytes);
+        assert_eq!(fs::read(w.fleet_file()).unwrap(), replacement.as_bytes());
+
+        let first = World::new();
+        first.write_config("[fleet]\nmachine = \"m27\"\n");
+        assert!(!first.fleet_file().exists());
+        sync_across_change(&first, None);
+        assert!(!first.roster().exists());
+        assert_eq!(
+            fs::read(first.fleet_file()).unwrap(),
+            replacement.as_bytes()
+        );
     }
 }

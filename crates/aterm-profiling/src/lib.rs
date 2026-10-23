@@ -60,6 +60,7 @@
 //! profiling::function_scope!();
 //! profiling::finish_frame!();
 //! ```
+//! // A scope, and a scope with a data field.
 
 #![no_std]
 // `no_std` as upstream: all three consumers are `#![no_std]`, and a `std`
@@ -83,6 +84,10 @@
 ///     profiling::scope!("inner", format!("iteration {_i}").as_str());
 /// }
 /// ```
+/// profiling::scope!("outer");
+/// for _i in 0..10 {
+///     profiling::scope!("inner", format!("iteration {_i}").as_str());
+/// }
 #[macro_export]
 macro_rules! scope {
     ($name:expr) => {};
@@ -103,6 +108,12 @@ macro_rules! scope {
 ///     profiling::function_scope!(format!("iteration {iteration}").as_str());
 /// }
 /// ```
+/// fn function_a() {
+///     profiling::function_scope!();
+/// }
+/// fn function_b(iteration: u32) {
+///     profiling::function_scope!(format!("iteration {iteration}").as_str());
+/// }
 #[macro_export]
 macro_rules! function_scope {
     () => {};

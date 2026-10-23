@@ -1,48 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The platform verifier over a locally minted fixture corpus, each case with
-//! its measured verdict per platform.
-//!
-//! Exercised here: the Apple arm, accept and reject, offline, and the Unix
-//! arm's chain math ([`the_webpki_chain_math_matches_its_recorded_expectations`]);
-//! the Unix store discovery is in `unix::tests`. The Windows arm is not exercised.
-//!
-//! * **Apple arm** — fully exercised here, accept and reject, offline.
-//! * **Unix arm** — exercised by the same corpus on a Unix host (the `webpki`
-//!   column); its `/etc/ssl/certs` DISCOVERY half is `verifier::unix`'s.
-//! * **Windows arm** — exercised by the same corpus on a Windows host (the
-//!   `windows` column, first measured on Windows 11 26200, 2026-10-17).
-//!
-//! # Two places the platforms genuinely disagree
-//!
-//! Each case records every platform's expectation and the assertion picks by
-//! platform:
-//!
-//! * a leaf with **no `extendedKeyUsage` at all** — RFC 5280 reads an absent EKU
-//!   as unconstrained and webpki and crypt32 follow it; Apple requires an explicit
-//!   `id-kp-serverAuth`;
-//! * a leaf whose `keyUsage` lacks `digitalSignature`.
-//!
-//! Windows also NAMES two rejections its own way: a leaf under a CA:FALSE issuer
-//! as a wrong usage (`CERT_E_WRONG_USAGE`), and a broken signature as an unmapped
-//! rejection (`TRUST_E_CERT_SIGNATURE`). Both stay rejections. The one place it
-//! ACCEPTED where the others refuse — a leaf with no subjectAltName, matched on its
-//! CN — is closed in `verifier::windows`.
-//!
-//! [`extra_anchors_add_to_the_system_set_rather_than_replacing_it`] exists
-//! because `SecTrustSetAnchorCertificatesOnly(true)` instead of `false` is
-//! invisible to every LOCAL fixture: none of them chains to a public root.
-//!
-//! # Time is pinned, and that is not optional
-//!
-//! Every case names its own `now`. Nothing here calls `UnixTime::now()`. Apple
-//! enforces a ~398-day ceiling on TLS leaf validity
-//! (`errSecCertificateValidityPeriodTooLong`), so the corpus CANNOT dodge expiry
-//! by minting a century-long certificate the way `tests/testdata/loopback-cert.der`
-//! does — every leaf here lives about a year, and a test that read the wall
-//! clock would start failing inside one. A red test with a date on it is a test
-//! someone eventually deletes.
+//! Platform TLS certificate verifier tests over a locally minted fixture corpus.
 
 use std::sync::Arc;
 
@@ -51,10 +10,6 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 
 use super::PlatformVerifier;
 use super::test_platform::require_trust_service;
-
-// --- fixtures --------------------------------------------------------------
-// See `src/testdata/tls/README.md` for what each one is and `PROVENANCE.md`
-// beside it for how it was made. All of them are public test data.
 
 const ROOT: &[u8] = include_bytes!("../testdata/tls/root.der");
 const INTER: &[u8] = include_bytes!("../testdata/tls/inter.der");
@@ -83,7 +38,6 @@ const HOST: &str = "test.aterm.invalid";
 /// `wronghost.der`'s own name.
 const OTHER_HOST: &str = "other.aterm.invalid";
 
-// Pinned instants, never the wall clock (see the module docs).
 /// 2025-06-15T12:00:00Z — before the `good` window, inside `expired`'s.
 const T25: u64 = 1_749_988_800;
 /// 2026-06-15T12:00:00Z — inside the `good` window.
@@ -91,14 +45,10 @@ const T26: u64 = 1_781_524_800;
 /// 2027-06-15T12:00:00Z — after the `good` window, inside `future`'s.
 const T27: u64 = 1_813_060_800;
 /// 2026-08-29T06:59:33Z — inside the captured github.com leaf's window
-/// (2026-07-03 → 2026-09-30). Pinning is what stops that fixture rotting.
+/// (2026-07-03 → 2026-09-30).
 const T_GH: u64 = 1_787_986_773;
 
-// --- outcomes --------------------------------------------------------------
-
-/// One verification's result: accept/reject plus the mapped error kinds. Every
-/// other failure is an opaque `Other(..)` in the OS's own words, and asserting
-/// on those would pin a macOS release.
+/// One verification's result: accept/reject plus the mapped error kinds.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Outcome {
     Accept,
@@ -106,8 +56,7 @@ enum Outcome {
     BadEncoding,
     NotValidForName,
     UnknownIssuer,
-    /// The certificate's signature does not check out. webpki says so
-    /// specifically; Apple folds it into "no chain could be built".
+    /// The certificate's signature does not check out.
     BadSignature,
     Revoked,
     /// Extended key usage does not permit server authentication.
@@ -117,15 +66,14 @@ enum Outcome {
 }
 
 impl Outcome {
-    /// Did this verification accept the chain? The only question for the
-    /// security property; everything else is diagnosis.
+    /// Did this verification accept the chain?
     fn accepted(self) -> bool {
         matches!(self, Self::Accept)
     }
 }
 
 /// A silent trustd is the machine's, not a verdict, so it is never counted as
-/// `Rejected` or a failed `Accept`. The gate's own deadline is the hang detector.
+/// `Rejected` or a failed `Accept`.
 const TRUSTD_SILENT: &str =
     "COULD NOT RUN: the process trustd gate was silent — the machine's, not the code's";
 
@@ -140,8 +88,6 @@ fn reduce(result: &Result<rustls::client::danger::ServerCertVerified, rustls::Er
             Ce::UnknownIssuer => Outcome::UnknownIssuer,
             Ce::BadSignature => Outcome::BadSignature,
             Ce::Revoked => Outcome::Revoked,
-            // "The EKU is wrong" arrives as an `Other` carrying
-            // `super::EkuError`, whose `Display` is this exact string.
             Ce::Other(other) if other.to_string() == "certificate had invalid extensions" => {
                 Outcome::Eku
             }
@@ -150,8 +96,6 @@ fn reduce(result: &Result<rustls::client::danger::ServerCertVerified, rustls::Er
         Err(_) => Outcome::Rejected,
     }
 }
-
-// --- driving the verifier ---------------------------------------------------
 
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     crate::tls::init_crypto();
@@ -210,13 +154,7 @@ impl Case {
 }
 
 /// The corpus.
-///
-/// Every reject case is ARMED: it is paired with at least one case that differs
-/// in exactly ONE variable and must ACCEPT. If a rejection were happening for
-/// the wrong reason — a DER that never parsed, a verifier that refuses
-/// everything — the twin fails and says so.
 const CORPUS: &[Case] = &[
-    // --- the positive control, and its two temporal twins ---
     Case {
         what: "the good chain, inside its validity window",
         chain: &[GOOD],
@@ -244,7 +182,6 @@ const CORPUS: &[Case] = &[
         webpki: Outcome::Rejected,
         windows: Outcome::Rejected,
     },
-    // --- expiry, from both sides ---
     Case {
         what: "an expired leaf, at a now past its notAfter",
         chain: &[EXPIRED],
@@ -281,7 +218,6 @@ const CORPUS: &[Case] = &[
         webpki: Outcome::Accept,
         windows: Outcome::Accept,
     },
-    // --- names ---
     Case {
         what: "a leaf for another name, asked for ours",
         chain: &[WRONGHOST],
@@ -327,7 +263,6 @@ const CORPUS: &[Case] = &[
         webpki: Outcome::NotValidForName,
         windows: Outcome::NotValidForName,
     },
-    // --- chain construction ---
     Case {
         what: "a leaf under the intermediate, WITH the intermediate supplied",
         chain: &[VIAINTER, INTER],
@@ -364,7 +299,6 @@ const CORPUS: &[Case] = &[
         webpki: Outcome::UnknownIssuer,
         windows: Outcome::UnknownIssuer,
     },
-    // --- signature integrity: the trap for a verifier that never checks it ---
     Case {
         what: "the good leaf with one signature byte flipped",
         chain: &[TAMPERSIG],
@@ -383,7 +317,6 @@ const CORPUS: &[Case] = &[
         webpki: Outcome::BadSignature,
         windows: Outcome::Rejected,
     },
-    // --- purpose ---
     Case {
         what: "a leaf whose extendedKeyUsage is clientAuth only",
         chain: &[CLIENTONLY],
@@ -411,7 +344,6 @@ const CORPUS: &[Case] = &[
         webpki: Outcome::Accept,
         windows: Outcome::Accept,
     },
-    // --- the wrong-reason control ---
     Case {
         what: "nine bytes that are not a certificate at all",
         chain: &[MALFORMED],
@@ -423,16 +355,12 @@ const CORPUS: &[Case] = &[
     },
 ];
 
-// --- the tests -------------------------------------------------------------
-
 /// Why a non-Apple host cannot run the system-anchored checks: its trust store
 /// does not validate the captured github.com chain.
 const UNANCHORED_GITHUB: &str = "this machine's trust store did not validate the captured \
      github.com chain; see src/testdata/tls/README.md for recapture";
 
-/// The verifier over the fixture root. A target with no platform verifier,
-/// or whose certificate service does not answer ([`require_trust_service`]),
-/// ends COULD NOT RUN.
+/// The verifier over the fixture root.
 fn mine() -> PlatformVerifier {
     let mine = PlatformVerifier::new_with_extra_roots(vec![der(ROOT)], provider()).unwrap_or_else(
         |error| {
@@ -445,7 +373,6 @@ fn mine() -> PlatformVerifier {
 
 #[test]
 fn the_first_party_verifier_matches_its_recorded_expectations() {
-    // The table was measured, not predicted.
     let mine = mine();
     let mut wrong = Vec::new();
     for case in CORPUS {
@@ -467,9 +394,6 @@ fn the_first_party_verifier_matches_its_recorded_expectations() {
 
 #[test]
 fn the_shipped_constructor_trusts_no_fixture_anchor() {
-    // `PlatformVerifier::new`, which `crate::tls::client_config` calls, must not
-    // trust the fixture root. `new_with_extra_roots` being `#[cfg(test)]` is the
-    // structural half; this is the behavioural half.
     require_trust_service();
     let shipped = match PlatformVerifier::new(provider()) {
         Ok(verifier) => verifier,
@@ -492,8 +416,6 @@ fn the_shipped_constructor_trusts_no_fixture_anchor() {
         "the shipped verifier accepted a chain rooted in a fixture CA: {got:?}"
     );
 
-    // The same chain accepts with the anchor: the rejection is about the anchor
-    // set.
     assert!(
         case.run(&mine()).accepted(),
         "the fixture chain must be good; only its anchor is missing"
@@ -502,11 +424,6 @@ fn the_shipped_constructor_trusts_no_fixture_anchor() {
 
 #[test]
 fn the_system_trust_store_is_actually_consulted() {
-    // The control the local corpus cannot provide: a chain a real system anchor
-    // validates, else a verifier that consulted no store would pass. github.com
-    // because `aterm-update-core` fetches from it; `now` is pinned inside the
-    // leaf's window, so it needs recapture only when its anchor leaves the
-    // platform store (`src/testdata/tls/README.md`).
     let real = Case {
         what: "the captured github.com chain, under the system anchors",
         chain: &[GH_LEAF, GH_INT0, GH_INT1],
@@ -534,8 +451,6 @@ fn the_system_trust_store_is_actually_consulted() {
         !wrong_name.run(&mine).accepted(),
         "a real chain was accepted for a name it does not carry"
     );
-    // Apple's store always carries the anchor. A distro store that does not
-    // cannot answer the question: COULD NOT RUN, never a pass.
     if !cfg!(target_vendor = "apple") && !real.run(&mine).accepted() {
         aterm_spec::host::could_not_run(UNANCHORED_GITHUB);
     }
@@ -544,11 +459,6 @@ fn the_system_trust_store_is_actually_consulted() {
 
 #[test]
 fn extra_anchors_add_to_the_system_set_rather_than_replacing_it() {
-    // `SecTrustSetAnchorCertificates` disables every other anchor unless
-    // `SecTrustSetAnchorCertificatesOnly(false)` follows. No local fixture chains
-    // to a public root, so only the captured github.com chain tells add from
-    // replace: with the fixture root as an extra anchor it must still validate
-    // through the system anchors.
     let chain = Case {
         what: "the captured github.com chain, under a verifier with extra anchors",
         chain: &[GH_LEAF, GH_INT0, GH_INT1],
@@ -559,8 +469,6 @@ fn extra_anchors_add_to_the_system_set_rather_than_replacing_it() {
         windows: Outcome::Accept,
     };
     let mine = mine();
-    // Off Apple, a store without the github.com anchor cannot tell add from
-    // replace: COULD NOT RUN, never a pass.
     let accepted = chain.run(&mine).accepted();
     if !cfg!(target_vendor = "apple") && !accepted {
         aterm_spec::host::could_not_run(UNANCHORED_GITHUB);
@@ -573,7 +481,6 @@ fn extra_anchors_add_to_the_system_set_rather_than_replacing_it() {
 
 #[test]
 fn a_parse_failure_is_reported_as_one_and_never_as_a_trust_verdict() {
-    // Kept apart so broken DER handling cannot pass as healthy reject cases.
     let mine = mine();
     for (what, bytes) in [
         ("nine bytes of garbage", MALFORMED),
@@ -598,15 +505,8 @@ fn a_parse_failure_is_reported_as_one_and_never_as_a_trust_verdict() {
 
 #[test]
 fn a_degenerate_server_name_fails_closed_instead_of_disabling_name_checking() {
-    // A NULL hostname to `SecPolicyCreateSSL` switches name checking off (the
-    // same chain is accepted); an empty or wrong name is rejected with -67602.
-    // `apple` cannot pass NULL: a `cf_string` failure is propagated, never
-    // `unwrap_or(ptr::null())`, which every other test here would still pass.
-    // So this asserts the adjacent value a refactor might let through, the empty
-    // name, and that name checking is on at all.
     let mine = mine();
 
-    // Name checking is live: a certificate for another name is refused.
     let mismatch = Case {
         what: "a leaf for another name",
         chain: &[WRONGHOST],
@@ -621,9 +521,6 @@ fn a_degenerate_server_name_fails_closed_instead_of_disabling_name_checking() {
         "name checking is not happening at all"
     );
 
-    // `rustls` cannot build an empty `ServerName`, so the shell's guard is
-    // defence in depth; the platform arm is driven with the degenerate value
-    // directly.
     #[cfg(target_vendor = "apple")]
     {
         let arm = super::apple::Verifier::new(vec![der(ROOT)], provider())
@@ -644,18 +541,11 @@ fn a_degenerate_server_name_fails_closed_instead_of_disabling_name_checking() {
         }
     }
 
-    // And a valid name never renders empty, which is what the shell's guard
-    // relies on being true for every name it does let through.
     assert!(!ServerName::try_from(HOST).unwrap().to_str().is_empty());
 }
 
 #[test]
 fn handshake_signature_verification_is_delegated_to_the_provider() {
-    // Not platform work: the three signature methods must expose exactly the
-    // provider's algorithms.
-    // A verifier that narrowed this set would break handshakes in a way no
-    // certificate fixture can catch. No evaluation happens, so this runs even
-    // where the platform's certificate service does not answer.
     let mine = PlatformVerifier::new(provider()).unwrap_or_else(|error| {
         aterm_spec::host::could_not_run(format!("no platform verifier on this target: {error}"))
     });

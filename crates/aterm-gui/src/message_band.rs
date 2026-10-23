@@ -235,6 +235,7 @@ pub(crate) fn row_inks(c: &BandColors, l: &RowLayout, hc: bool) -> (MeterInks, O
 }
 
 /// The band row and column for a frame pixel, given the geometry — the pure
+/// half of [`App::band_hit_at`].
 fn band_target_for_pixel(
     gx: usize,
     gy: usize,
@@ -336,6 +337,7 @@ impl App {
     }
 
     /// What a press at `target` in window `wid` lands on, through the width
+    /// law at this window's width — the same layout the painter drew.
     fn band_hit(&self, wid: WindowId, target: BandTarget) -> Hit {
         let BandTarget { row, col } = target;
         let Some(cols) = self.windows.get(&wid).map(|ws| usize::from(ws.cols)) else {
@@ -602,6 +604,7 @@ mod tests {
     }
 
     /// The band painted at `center`'s still frame over `p` on the unit grid: the time-free
+    /// picture most of these tests read (a held bar at its data, a busy row's unlit track).
     fn paint_still(
         p: &Presentation,
         theme: Theme,
@@ -612,6 +615,9 @@ mod tests {
     }
 
     /// Every row is exactly `cols` wide and carries its title, the meter is
+    /// laid out as the whole row and leaves no procedural glyph behind, and
+    /// the painter draws no seam (only the composed stack knows which row is
+    /// last: `aterm_render::band::seal_stack`).
     #[test]
     fn paint_rows_are_exactly_cols_wide_and_carry_the_words() {
         let center = two_rows();
@@ -639,6 +645,8 @@ mod tests {
     }
 
     /// Every admitted glyph lands in the glyph cell with text presentation, so the raster path
+    /// never takes its colour-emoji face (`every_admitted_glyph_paints_a_non_blank_cell_headless`
+    /// is the raster half).
     #[test]
     fn every_admitted_glyph_is_text_presentation_in_the_glyph_cell() {
         let now = t0();
@@ -661,6 +669,7 @@ mod tests {
     }
 
     /// Under High Contrast a word on the fill takes `HIGHLIGHTTEXT`, the fill
+    /// is `HIGHLIGHT` whatever the row's severity, and the track is `WINDOW`.
     #[test]
     fn high_contrast_meter_is_highlight_with_highlight_text_on_it() {
         let center = two_rows();
@@ -680,6 +689,7 @@ mod tests {
     }
 
     /// Under Windows High Contrast the capsules are `[label]`, and the hovered one keeps its
+    /// brackets.
     #[test]
     fn high_contrast_draws_capsules_as_brackets() {
         let center = two_rows();
@@ -707,6 +717,7 @@ mod tests {
     }
 
     /// The pixel → row/column map: the band rows under the strip, the column
+    /// from the cell lattice; off the band rows is `None`.
     #[test]
     fn band_target_for_pixel_maps_the_chrome_rows_in_order() {
         let (pad, top) = (4, 10);
@@ -743,6 +754,8 @@ mod tests {
     }
 
     /// The App's own hit test through the window's real cell lattice: every pixel of a painted
+    /// capsule hits, acts and lights that chip; the body acts and lights `Details ›`; the
+    /// overflow row is one link; the rows above and below are not the band.
     #[test]
     fn band_capsules_are_hit_at_the_pixels_they_are_painted_at() {
         let mut app = App::headless_for_test();
@@ -849,6 +862,7 @@ mod tests {
     }
 
     /// One frame of `center`'s motion over `p` at `at` in `look`, painted on
+    /// the unit grid.
     fn frame_at(
         center: &MessageCenter,
         p: &Presentation,
@@ -875,6 +889,8 @@ mod tests {
     }
 
     /// A band in motion: a determinate download, busy work with no fraction (`Meter::busy`:
+    /// the engine decides motion from the meter's state, never the hold), and a held warning
+    /// below them, all committed.
     fn moving_rows(now: Instant) -> (MessageCenter, aterm_messages::MessageId) {
         let mut center = MessageCenter::new(MessageLog::empty(), now);
         let download = center
@@ -917,6 +933,8 @@ mod tests {
     }
 
     /// A held row has no motion and asks for no frame: its
+    /// motion fingerprint is 0 at every frame, and the engine's deadline is
+    /// `None`.
     #[test]
     fn a_held_row_has_no_motion_and_asks_for_no_frame() {
         let now = t0();
@@ -940,6 +958,10 @@ mod tests {
     }
 
     /// High Contrast motion uses only palette inks:
+    /// under every stock High Contrast palette, in the flat look, every frame
+    /// of a moving band — the comet, the bar, the echo — paints every cell's
+    /// ground in the band, the WINDOW track or the HIGHLIGHT fill, never a
+    /// mix between them, and the fill is HIGHLIGHT on the Warn row too.
     #[test]
     fn high_contrast_motion_uses_only_palette_inks() {
         let flat = Look {
@@ -977,6 +999,8 @@ mod tests {
     }
 
     /// Every glyph on a metered row with all three chip roles clears AA on its own cell, with
+    /// the fill's edge under every column and through the glint, the Complete echo and the Fault
+    /// flash, on every builtin scheme.
     #[test]
     fn every_glyph_on_a_metered_row_clears_aa_in_every_frame() {
         use aterm_messages::{

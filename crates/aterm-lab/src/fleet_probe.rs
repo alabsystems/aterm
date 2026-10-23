@@ -1,26 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `fleet-sim`'s own fleet dials, through the product's own client
-//! (`aterm_net::fleet::client_handshake`), as the live lane
-//! `crates/aterm/tests/fleet_live_headless.rs` dials:
-//!
-//! * [`with_proved`] dials as a member does, with the fleet's secret, so a
-//!   verb can be sent as a PROVED peer and its refusal read;
-//! * [`wrong_secret`] dials with another fleet's secret, as a reader of
-//!   another fleet would: the client refuses the listener's proof and sends
-//!   nothing of its own.
-//!
-//! And below the product's client, on the wire itself:
-//!
-//! * [`raw_dial`] is a dialer that sends its proof WHATEVER the listener
-//!   proved, the proof computed here from the wire `aterm_net::fleet`'s module
-//!   doc documents (HKDF and HMAC-SHA256 over the channel exporter, and under
-//!   ALPN `atf/2` the node line after it, `node -`: it proves no node), apart
-//!   from aterm-net's own code: under the fleet's secret it must be answered
-//!   `OK` (the positive control that this dialer speaks the protocol), under
-//!   another secret `NO proof` and the connection closed;
-//! * [`reflected_proof_refused`] sends the listener's own proof line back.
+//! Fleet handshake probes ([`with_proved`], [`wrong_secret`], [`raw_dial`],
+//! [`reflected_proof_refused`]).
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -40,8 +22,7 @@ fn at(port: u16) -> SocketAddr {
 pub trait Rw: Read + Write {}
 impl<T: Read + Write> Rw for T {}
 
-/// Dial `port`, prove `secret` for `op`, and run `f` on the proved stream
-/// with the scope the listener proved.
+/// Dial `port`, prove `secret` for `op`, and run `f` on the proved stream.
 ///
 /// # Errors
 /// The connect or the handshake's own error.
@@ -62,8 +43,7 @@ pub fn with_proved<R>(
     Ok(f(t.stream(), scope))
 }
 
-/// Dial `port` with `secret`, another fleet's: the handshake's error, which
-/// for an honest listener is `ListenerWrongSecret` (this end sent nothing).
+/// Dial `port` with `secret`, another fleet's.
 #[must_use]
 pub fn wrong_secret(port: u16, secret: &FleetSecret) -> Option<FleetError> {
     let tcp = TcpStream::connect_timeout(&at(port), Duration::from_secs(5)).ok()?;
@@ -109,14 +89,7 @@ pub fn read_line(stream: &mut dyn Rw) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&line).into_owned())
 }
 
-/// Confirm a live listener rejects its OWN proof line echoed back: the
-/// listener's reflection guard, end to end (the `aterm_net::fleet` unit test
-/// `a_reflected_proof_is_refused` proves the same property in isolation; this
-/// confirms the built listener carries it). Over the fleet's own pinned TLS
-/// configuration, it reads the listener's `<scope> <tag>` line, sends it back,
-/// and reads the answer. The listener's two role keys differ, so its own tag
-/// is no dialer's tag: the answer must be `NO proof`, and nothing of the
-/// survey follows.
+/// Confirm a live listener rejects its OWN proof line echoed back.
 ///
 /// # Errors
 /// The connect or the TLS handshake failed, or no proof line came.
@@ -140,8 +113,7 @@ pub fn reflected_proof_refused(port: u16) -> Result<String, String> {
     read_line(&mut tls).map_err(|e| format!("read the answer: {e}"))
 }
 
-/// Whether the peer has closed: the next read ends (end of file, or the TLS
-/// end of a shut socket) with nothing more, never by the read's timeout.
+/// Whether the peer has closed: the next read ends with nothing more, never by the read's timeout.
 pub fn closed(stream: &mut dyn Rw) -> bool {
     let mut rest = Vec::new();
     match stream.read_to_end(&mut rest) {
@@ -159,15 +131,7 @@ pub fn closed(stream: &mut dyn Rw) -> bool {
 /// The fleet's RFC 5705 exporter label (`aterm_net::fleet`'s module doc).
 const EXPORTER_LABEL: &[u8] = b"EXPORTER-aterm-fleet-v1";
 
-/// The dialer's proof line for `op` on the channel whose exporter is
-/// `exporter`, under the raw fleet `secret`, as the module doc of
-/// `aterm_net::fleet` documents it: `PRK = HMAC-SHA256(∅, secret)` (HKDF
-/// Extract with an empty salt), `Kc = HMAC-SHA256(PRK, "aterm-fleet/v1
-/// client" ‖ 0x01)` (HKDF-Expand's first block), and the line `<op> SP
-/// hex(HMAC-SHA256(Kc, E ‖ op)) LF`. The HKDF and the HMAC are the shared
-/// ones (astream-digest's, through aterm-digest), the one construction every
-/// fleet member derives with; what this composes apart from aterm-net is the
-/// protocol: the info string, the line and the order, read off the doc.
+/// The dialer's proof line for `op` on the channel whose exporter is `exporter`.
 #[must_use]
 pub fn dialer_proof(secret: &[u8], exporter: &[u8], op: &str) -> String {
     let prk = aterm_digest::hkdf_extract(&[], secret);
@@ -183,15 +147,11 @@ pub struct RawDial {
     pub scope: String,
     /// The listener's answer to the proof sent (`OK`, `NO proof`, …).
     pub answer: String,
-    /// Whether the listener closed the connection after its answer (read
-    /// only after a refusal: after `OK` the stream is the control server's).
+    /// Whether the listener closed the connection after its answer.
     pub closed: bool,
 }
 
-/// Dial `port` and send a `survey` proof under the raw `secret` WITHOUT
-/// verifying the listener's proof first (no honest dialer does that; a
-/// hostile one may): the listener's scope word, its answer, and whether it
-/// then closed the connection.
+/// Dial `port` and send a `survey` proof under `secret` without verifying the listener first.
 ///
 /// # Errors
 /// The connect or the TLS handshake failed, or no proof line came.
@@ -207,15 +167,12 @@ pub fn raw_dial(port: u16, secret: &[u8]) -> Result<RawDial, String> {
     let conn = rustls::ClientConnection::new(aterm_net::fleet::client_config(), name)
         .map_err(|e| e.to_string())?;
     let mut tls = rustls::StreamOwned::new(conn, tcp);
-    // The listener speaks first; reading its line completes TLS.
     let proof = read_line(&mut tls).map_err(|e| format!("no proof line: {e}"))?;
     let scope = proof.split(' ').next().unwrap_or_default().to_owned();
     let exporter = tls
         .conn
         .export_keying_material([0u8; 32], EXPORTER_LABEL, None)
         .map_err(|e| format!("the exporter: {e}"))?;
-    // Under `atf/2` the proof is followed by the dialer's node line, in one
-    // write; this dialer proves no node.
     let mut said = dialer_proof(secret, &exporter, "survey");
     if tls.conn.alpn_protocol() == Some(aterm_net::fleet::ALPN_NODES) {
         said.push_str("node -\n");
@@ -235,11 +192,7 @@ mod tests {
     use super::*;
 
     /// The proof is the documented line: a word, a space, 64 lowercase hex
-    /// digits; another secret, exporter or op makes another tag. And it is the
-    /// tag aterm-net's own derivation was recorded making for the same secret,
-    /// exporter and op (`aterm_net::fleet`'s
-    /// `the_role_keys_and_a_tag_are_the_answers_recorded_before_the_hkdf_moved`),
-    /// composed here from the module doc alone.
+    /// digits; another secret, exporter or op makes another tag.
     #[test]
     fn the_raw_proof_is_one_documented_line_bound_to_secret_exporter_and_op() {
         assert_eq!(

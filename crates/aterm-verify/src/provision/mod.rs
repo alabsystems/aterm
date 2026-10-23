@@ -1,33 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `targo --unverified verify provision [ROW...] [--linux] [--record] [--check]`: the
-//! one verb that puts the tools this checkout pins on this machine
-//! (docs/DESIGN-init-system-2026-10-20.md §4.4, §6.2–§6.4). It is how every
-//! [`aterm_uds::host::Provider::Workspace`] row of `aterm_uds::host::TOOLS` is provided,
-//! and the only route by which one reaches a Mac: never Homebrew, never a hand install.
-//!
-//! A bare run provides every row wanted always ([`ROWS`]): rustup's stock exceptions,
-//! fish (built here from upstream's source), pwsh, binaryen and the browser lane's
-//! browsers. `--linux` adds lima, `--record` adds wasm-bindgen, and naming rows provides
-//! just those. `--check` reads and changes nothing.
-//!
-//! Each row installs into `<user cache>/tooling.noindex/<package>-<version>/` (the
-//! browsers into the browser lane's cache, where the lane looks) beside a `stamp.json`
-//! recording its URL, sha256, version, the host it was placed for and, for a build, its
-//! features. A download (rustup-init's too) goes into an empty directory of its own and
-//! is held to its size and sha256 before anything reads it. A copied executable whose
-//! first run is unproven retains its scratch image on failure ([`place`]). A row already
-//! in place, its stamp the pin's for this host, is left alone; anything else at its path
-//! (no stamp, another pin's, another host's) is replaced, never adopted: nothing ties
-//! bytes found in place to their pin.
-//!
-//! The host is the Mac's own (`macos-aarch64` on Apple silicon, from an x86_64 build
-//! under Rosetta too), so a translated run never swaps a tree the native one placed.
-//!
-//! This verb reads the network: `verify` is offline but for it, `export` and `linux`'s
-//! first provision. Exit: 0 every wanted row is in place, 1 a row failed (or, under
-//! `--check`, is missing), 2 usage, 3 none of the rows asked for is pinned for this host.
+//! Workspace tool provisioning (`targo --unverified verify provision`,
+//! [`aterm_uds::host::Provider::Workspace`], [`ROWS`], [`place`]).
 
 mod fish;
 mod place;
@@ -48,8 +23,7 @@ pub use stable::{FOREIGN_CELL_TARGETS, WasmClause, wasm_clause};
 /// The OS's curl, by absolute path (§6.1 row 10).
 pub(crate) const CURL: &str = "/usr/bin/curl";
 
-/// The name of a row's stamp in its directory, the one the resolver requires beside a
-/// pinned program ([`aterm_uds::host::PIN_STAMP`]).
+/// Stamp filename beside a pinned program ([`aterm_uds::host::PIN_STAMP`]).
 pub const STAMP: &str = aterm_uds::host::PIN_STAMP;
 
 /// What a placed row's `stamp.json` records.
@@ -73,15 +47,12 @@ pub struct Stamp {
     /// What the placed program answered (`fish --version`).
     #[serde(default)]
     pub reports: Option<String>,
-    /// The host it was placed for (`macos-aarch64`): a tree another host's run placed is
-    /// not this one's.
+    /// The host it was placed for (`macos-aarch64`).
     #[serde(default)]
     pub platform: Option<String>,
     /// When it was placed (Unix seconds).
     pub placed: u64,
-    /// Set by the retired adoption, which stamped a copy found in place without holding
-    /// its bytes to the pin: such a stamp is never this pin's placement, and a run
-    /// replaces the copy.
+    /// Set by the retired adoption.
     #[serde(default)]
     pub adopted: bool,
 }
@@ -91,8 +62,7 @@ pub(crate) fn now() -> u64 {
     aterm_time::unix_secs().unwrap_or(0)
 }
 
-/// One child a row runs: the whole of what it is handed, so a test reads the argv and
-/// the environment of a build from the record ([`Host::run`]).
+/// Child command specification recorded for a row ([`Host::run`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Spawn {
     /// The program, by absolute path.
@@ -108,8 +78,7 @@ pub struct Spawn {
 }
 
 impl Spawn {
-    /// The command this spawn is, over the parent environment's variable names `parent`
-    /// (each removal by prefix reads them).
+    /// The command this spawn is, over the parent environment's variable names `parent`.
     #[must_use]
     pub fn command(&self, parent: &[OsString]) -> aterm_uds::spawnfd::Command {
         let mut cmd = aterm_uds::spawnfd::command(&self.program);
@@ -132,11 +101,9 @@ impl Spawn {
     }
 }
 
-/// What the rows do to the outside world, injected so a test stands up any host and
-/// reads what was run.
+/// What the rows do to the outside world.
 pub trait Host {
-    /// Download `url` into `dest`, a new path in an empty directory of its own, giving up
-    /// once the body passes `bytes` (the pin's size), so no server fills the volume.
+    /// Download `url` into `dest`.
     ///
     /// # Errors
     /// The download failed.
@@ -151,8 +118,7 @@ pub trait Host {
     /// Run `spawn` to completion: its stdout.
     ///
     /// # Errors
-    /// It could not start, its output/read or wait failed, or it exited unsuccessfully
-    /// (with its stderr's tail). An error need not prove the child's exit or first exec.
+    /// Spawn, wait, or exit failure (with stderr tail).
     fn run(&self, spawn: &Spawn) -> Result<String, String>;
 
     /// The Trust toolchain's `targo`.
@@ -168,8 +134,7 @@ pub trait Host {
 /// Where a run puts things on this machine, and for which host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Machine {
-    /// `<os>-<arch>` as Rust names them (`macos-aarch64`): the machine's own
-    /// ([`platform_of`]).
+    /// `<os>-<arch>` as Rust names them (`macos-aarch64`): the machine's own ([`platform_of`]).
     pub platform: String,
     /// The tooling cache ([`aterm_uds::host::tooling_dir`]).
     pub tooling: PathBuf,
@@ -282,8 +247,7 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
     Ok(opts)
 }
 
-/// The rows `opts` asks for, in [`ROWS`] order: those named, else each row wanted
-/// always, with `--linux`'s and `--record`'s when their flag is given.
+/// The rows `opts` asks for, in [`ROWS`] order.
 #[must_use]
 pub fn select(opts: &Options) -> Vec<&'static Row> {
     ROWS.iter()
@@ -301,14 +265,12 @@ pub fn select(opts: &Options) -> Vec<&'static Row> {
         .collect()
 }
 
-/// Whether `t.dir` holds a complete placement of its pin: the program in it, and a stamp
-/// that [`Target::admits`].
+/// Whether `t.dir` holds the pinned program and a stamp that [`Target::admits`].
 pub(crate) fn complete(t: &Target) -> bool {
     t.dir.join(&t.exe).is_file() && place::read_stamp(&t.dir).is_some_and(|s| t.admits(&s))
 }
 
-/// Where `row` would be placed on `machine`, with what its stamp must say; `None` for
-/// rows not placed in a directory (rustup) or not pinned here.
+/// Where `row` would be placed on `machine`, with what its stamp must say.
 fn target(row: &Row, machine: &Machine) -> Option<Target> {
     let (os, arch) = machine.os_arch();
     match row.install {
@@ -352,8 +314,7 @@ fn target(row: &Row, machine: &Machine) -> Option<Target> {
     }
 }
 
-/// A row's directory and program, and what its stamp must say: the version, the pinned
-/// sha256 (none for a crate targo builds), the host, and a build's features.
+/// A row's directory and program, and what its stamp must say.
 pub(crate) struct Target {
     dir: PathBuf,
     exe: String,
@@ -364,9 +325,7 @@ pub(crate) struct Target {
 }
 
 impl Target {
-    /// Whether `stamp` records this pin placed for this host: its version, its sha256
-    /// where the pin names one, this host, a build's features exactly, and never a stamp
-    /// the retired adoption wrote.
+    /// Whether `stamp` records this pin placed for this host.
     fn admits(&self, stamp: &Stamp) -> bool {
         !stamp.adopted
             && stamp.version == self.version
@@ -408,8 +367,7 @@ fn not_pinned(row: &Row, machine: &Machine) -> String {
     format!("{}: nothing is pinned for {}", row.name, machine.platform)
 }
 
-/// Where `row` stands on `machine`, read only: in place, missing (with what a run would
-/// do), or not pinned here.
+/// Where `row` stands on `machine`, read only: in place, missing, or not pinned here.
 pub fn check(row: &Row, machine: &Machine, host: &dyn Host) -> State {
     if matches!(row.install, Install::Rustup { .. }) {
         let pin = match stable::wasm_pin_wanted(&machine.repo) {
@@ -487,9 +445,7 @@ pub fn provide(row: &Row, machine: &Machine, host: &dyn Host, say: &mut dyn FnMu
     }
 }
 
-/// The rustup row: [`stable::run`], handed rustup-init at the pin where no rustup is
-/// installed. The installer is fetched into a scratch of its own under the tooling cache
-/// and held to its size and sha256 there before it runs; the scratch goes with the run.
+/// The rustup row: [`stable::run`], handed rustup-init at the pin where no rustup is installed.
 fn rustup_row(
     row: &Row,
     version: &str,
@@ -531,8 +487,7 @@ fn rustup_row(
     }
 }
 
-/// An unpacked row: fetch, check, unpack, hold the tree to `anchor`, keep `keep`, stamp,
-/// place.
+/// An unpacked row: fetch, check, unpack, hold the tree to `anchor`, keep `keep`, stamp, place.
 #[expect(clippy::too_many_arguments, reason = "one row's whole description")]
 fn unpack_row(
     row: &Row,
@@ -602,10 +557,7 @@ fn bindgen_answers(host: &dyn Host, exe: &Path, cwd: &Path) -> Option<String> {
     crate::wasm_glue::reports_pin(&out).then(|| out.trim().to_string())
 }
 
-/// The `--record` row: targo builds the CLI at the pin, `--locked`, from crates.io into a
-/// scratch root that is placed whole. A copy already at the pin with no stamp (the retired
-/// `ship provision` laid one) is replaced, not adopted: nothing ties its bytes to
-/// crates.io, and only the build in the scratch is run before it is stamped.
+/// The `--record` row.
 fn cargo_row(
     row: &Row,
     t: &Target,
@@ -653,10 +605,7 @@ fn cargo_row(
     }
 }
 
-/// A browser row: fetched, checked, unpacked by the OS's own zip reader as the lane always
-/// has (`ditto`, `unzip` off macOS) in a scratch under the tooling cache, held to links
-/// that stay in the tree, stamped and renamed into the browser lane's cache. A copy
-/// already there without this pin's stamp is replaced.
+/// A browser row: fetched.
 fn browser_row(
     engine: Engine,
     t: &Target,
@@ -684,8 +633,6 @@ fn place_browser(
     say: &mut dyn FnMut(&str),
 ) -> Result<(), String> {
     let (os, _) = machine.os_arch();
-    // Under the tooling cache, where the reclaim finds a scratch a killed run left; the
-    // two caches share a volume (`aterm_uds::host::user_cache`), so the rename holds.
     let scratch = place::Scratch::new(&machine.tooling, name)?;
     let zip = place::fetch_checked(host, &scratch, &pin.url, pin.sha256, pin.bytes, say)?;
     let tree = scratch.path().join("tree");
@@ -747,8 +694,7 @@ pub fn line(row: &Row, state: &State) -> String {
     }
 }
 
-/// A whole run: each selected row checked or provided in order, a line each, then the
-/// exit code ([`crate::exit`]).
+/// Check or provision each selected row in order ([`crate::exit`]).
 pub fn run(opts: &Options, machine: &Machine, host: &dyn Host, say: &mut dyn FnMut(&str)) -> i32 {
     let rows = select(opts);
     let mut states = Vec::new();
@@ -811,10 +757,7 @@ fn tail(text: &[u8], n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
-/// The download of `url` into `dest`: the OS's curl reading no `~/.curlrc` (`-q`, first),
-/// https only through every redirect (GitHub's release assets redirect to its CDN),
-/// stopped once the body passes the pin's `bytes`, and giving up on a stalled transfer
-/// rather than hanging.
+/// The download of `url` into `dest`.
 pub(crate) fn fetch_spawn(url: &str, dest: &Path, bytes: u64) -> Spawn {
     let bytes = bytes.to_string();
     Spawn {
@@ -899,10 +842,7 @@ impl Host for System {
     }
 }
 
-/// The host a run provisions for: `<os>-<arch>` as Rust names them, the Mac's own arm64
-/// where this process is an x86_64 build `translated` by Rosetta. A Mac's tools are the
-/// machine's, not one build's: a translated run that asked for Intel trees would replace
-/// the arm64 ones every native run placed (and back), under any program running from them.
+/// The host a run provisions for.
 #[must_use]
 pub fn platform_of(os: &str, arch: &str, translated: bool) -> String {
     if os == "macos" && arch == "x86_64" && translated {
@@ -924,8 +864,7 @@ fn translated() -> bool {
     }
 }
 
-/// This machine's [`Machine`] for the checkout at `repo`; `None` where no `$HOME` names
-/// the caches.
+/// This machine's [`Machine`] for the checkout at `repo`; `None` where no `$HOME` names the caches.
 #[must_use]
 pub fn this_machine(repo: &Path) -> Option<Machine> {
     let home = std::env::var_os("HOME")

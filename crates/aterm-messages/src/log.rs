@@ -18,6 +18,8 @@ use crate::{
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
 
 /// No id at or past this ever raises the sequence: a corrupt line or a
+/// forged carry cannot park `next_id` at the ceiling, where every later
+/// mint would hand out the same saturated id.
 const ID_CEILING: u64 = 1 << 62;
 
 /// The unit separator that joins detail lines and actions inside one value.
@@ -61,7 +63,7 @@ pub enum Retired {
 impl Retired {
     /// The wire's `state=` word: `folded` … `resolved-ok` / `resolved-warn`.
     #[must_use]
-    pub fn as_word(&self) -> &'static str {
+    pub const fn as_word(&self) -> &'static str {
         match self {
             Self::Folded => "folded",
             Self::Stale => "stale",
@@ -199,7 +201,7 @@ impl LogRecord {
 
     /// `true` for a digest entry the owner or the digest itself filed (`Dismissed`, `Answered`, `Unseen`, `Evicted`).
     #[must_use]
-    pub(crate) fn filed_exception(&self) -> bool {
+    pub(crate) const fn filed_exception(&self) -> bool {
         self.later
             && matches!(
                 self.retired(),
@@ -213,6 +215,8 @@ impl LogRecord {
     }
 
     /// The ring keeps a filed exception for [`crate::need::FILED_KEEP`] after its filing
+    /// (not its posting): the fact's quiet span counts from the dismissal, so
+    /// [`LOG_CAP`] later records must not push the dismissal out while it holds.
     #[must_use]
     fn kept_as_filing(&self, since_ms: u64) -> bool {
         self.filed_exception() && self.retired_unix_ms.is_some_and(|t| t >= since_ms)
@@ -226,7 +230,7 @@ impl LogRecord {
 
     /// How it retired, if it has.
     #[must_use]
-    pub fn retired(&self) -> Option<&Retired> {
+    pub const fn retired(&self) -> Option<&Retired> {
         match &self.state {
             LogState::Posted => None,
             LogState::Retired(how) => Some(how),
@@ -261,6 +265,8 @@ pub enum LogLine {
         /// Duplicate posts folded in.
         repeats: u32,
         /// The outcome's mark when the retirement changed it: the severity and glyph
+        /// the record reads under from here (`✓` Success for delivered work, `⚠` Warn
+        /// for work that stopped).
         mark: Option<(Severity, Glyph)>,
     },
     /// A capsule was pressed.
@@ -323,7 +329,7 @@ impl std::error::Error for CodecError {}
 impl LogLine {
     /// The id this line is about, if any.
     #[must_use]
-    pub fn id(&self) -> Option<MessageId> {
+    pub const fn id(&self) -> Option<MessageId> {
         match self {
             Self::Posted(rec) => Some(rec.id),
             Self::Retired { id, .. } | Self::Acted { id, .. } => Some(*id),
@@ -536,6 +542,7 @@ impl Fields {
     }
 
     /// The `how=` word, an answered capsule's label clipped like a title; a
+    /// fold carrying `rec=1` is a record.
     fn how(&self) -> Result<Retired, CodecError> {
         let how = Retired::decode(&self.need("how")?).ok_or(CodecError::BadField("how"))?;
         Ok(match how {
@@ -549,6 +556,8 @@ impl Fields {
 }
 
 /// A loaded `detail=` value under the model's caps: the lines split at US,
+/// each clipped to [`DETAIL_LINE_CAP`], empty ones dropped (as the builder
+/// drops them), at most [`DETAIL_LINES_CAP`].
 fn capped_detail(joined: &str) -> Vec<String> {
     split_us(joined)
         .iter()
@@ -634,13 +643,19 @@ pub(crate) struct FinalWords<'a> {
 pub struct MessageLog {
     ring: VecDeque<LogRecord>,
     /// How many of [`Self::ring`]'s records are the wire's
+    /// ([`LogRecord::wire_owned`], fixed for a record's life: its origin and
+    /// key never change in the ring), kept beside it so an eviction does not
+    /// count the whole ring.
     wire_records: usize,
     next_id: u64,
     pending: VecDeque<(LogLine, Shelf)>,
     dropped: u32,
     /// Replay only: a file id another writer posted again, mapped to the fresh ids its
+    /// later records were loaded under, oldest first, so no two records in the ring
+    /// share an id.
     remapped: BTreeMap<u64, Vec<MessageId>>,
     /// The fresh ids [`Self::remapped`] handed out: a record under one of
+    /// them is not the file's record of that number.
     minted_at_replay: BTreeSet<u64>,
 }
 
@@ -746,11 +761,14 @@ impl MessageLog {
     }
 
     /// The records loaded for file id `file_id`, oldest first: the ring's
+    /// own record of that number (unless a remap minted it), then the ones
+    /// remapped from it.
     fn replay_candidates(&self, file_id: MessageId) -> Vec<MessageId> {
         self.candidates_given(file_id, self.get(file_id).is_some())
     }
 
     /// [`Self::replay_candidates`], given whether the ring `held` a record
+    /// under `file_id`.
     fn candidates_given(&self, file_id: MessageId, held: bool) -> Vec<MessageId> {
         let own = (held && !self.minted_at_replay.contains(&file_id.raw())).then_some(file_id);
         own.into_iter()
@@ -765,6 +783,10 @@ impl MessageLog {
     }
 
     /// Where a replayed line for file id `file_id` merges: the open record
+    /// whose posted title `title` names — the title itself, or one of the
+    /// final words the center derives from it ([`Self::final_words_of`]: a
+    /// delivered row retires `Deployed site`, never `Deploying site`) —
+    /// else the newest open one, else the newest.
     fn replay_target(&self, file_id: MessageId, title: Option<&str>) -> Option<MessageId> {
         let candidates = self.replay_candidates(file_id);
         let open = |id: &MessageId| self.get(*id).is_some_and(|r| !Self::closed_by_a_line(r));
@@ -783,6 +805,8 @@ impl MessageLog {
     }
 
     /// Whether `final_title` (a Retired line's words) can be how a row posted
+    /// as `posted` ended: the posted title kept, or its finished, `— done`,
+    /// stopped or ended form (`center::outcome_title`'s table forms).
     fn final_words_of(posted: &str, final_title: &str) -> bool {
         posted == final_title
             || [
@@ -797,6 +821,7 @@ impl MessageLog {
     }
 
     /// Whether a replayed record was closed by a `Retired` line: its state
+    /// is a retirement other than the Stale every Posted line loads as.
     fn closed_by_a_line(rec: &LogRecord) -> bool {
         matches!(&rec.state, LogState::Retired(how) if *how != Retired::Stale)
     }
@@ -907,6 +932,7 @@ impl MessageLog {
     }
 
     /// Never mint at or below `id` again — unless `id` sits at the ceiling,
+    /// where a corrupt line must not park the sequence.
     fn raise(&mut self, id: MessageId) {
         self.raise_to(id.next().raw());
     }
@@ -918,7 +944,7 @@ impl MessageLog {
         }
     }
 
-    /// Into the ring; past [`LOG_CAP`] the oldest retired record goes. A live row's
+    /// Into the ring; past [`LOG_CAP`] the oldest retired record goes.
     fn push_record(&mut self, rec: LogRecord) {
         if self.ring.len() >= LOG_CAP {
             self.evict_one(rec.stamp.unix_ms);
@@ -928,6 +954,7 @@ impl MessageLog {
     }
 
     /// Make room for one record stamped `at_ms`: the oldest retired wire record once the
+    /// wire holds its share, else the oldest retired record, else the oldest.
     fn evict_one(&mut self, at_ms: u64) {
         let wire_full = self.wire_records >= WIRE_LOG_SHARE;
         let keep_since = at_ms.saturating_sub(crate::need::FILED_KEEP_MS);
@@ -1380,6 +1407,10 @@ pub(crate) mod tests {
     }
 
     /// Encode/decode identity for every field the engine can hold; tabs, newlines,
+    /// backslashes and US in a value ride the escapes without breaking the framing (and
+    /// come back stripped, as `post` would strip them); a truncated line and an `m2`
+    /// line are skipped; ids keep rising after replay; a dead process's unretired Posted
+    /// reads back Stale.
     #[test]
     fn codec_round_trips_every_field_and_skips_junk() {
         let lines = vec![
@@ -1563,7 +1594,32 @@ pub(crate) mod tests {
         assert_eq!(log.len(), 2, "deduped by id");
     }
 
+    /// A vault line's record keeps its System State press on this build. A build older
+    /// than the kind has no arm for it, so it reads the record as this build reads any kind
+    /// it does not know: that capsule goes, the record and its words stay.
+    #[test]
+    fn the_vault_sync_press_reads_back_and_an_older_build_keeps_the_rest() {
+        let mut rec = posted(5);
+        rec.tag = tags::PRIVACY;
+        rec.title = "Joining the secrets vault failed".into();
+        rec.detail = vec![
+            "the secrets vault did not let this Mac in".into(),
+            "Apply in System State with the vault row on and the Mac settings rows off".into(),
+        ];
+        rec.actions = vec![Intent::ReviewVaultSync, Intent::NewWindow];
+        rec.key = Some("privacy.secrets.failed".into());
+        rec.later = true;
+        let line = LogLine::Posted(rec.clone()).encode();
+        assert!(line.contains("review-vault-sync"), "{line}");
+        assert_eq!(LogLine::decode(&line), Ok(LogLine::Posted(rec.clone())));
+
+        let older = line.replace("review-vault-sync", "unknown-kind");
+        rec.actions = vec![Intent::NewWindow];
+        assert_eq!(LogLine::decode(&older), Ok(LogLine::Posted(rec)));
+    }
+
     /// Two instances, one id: one instance posted and retired its id 15, and another,
+    /// whose counter had not seen it, later posted and retired its own 15.
     #[test]
     fn a_closed_records_id_posted_again_is_another_record() {
         let id = MessageId::from_raw(15).unwrap();
@@ -1666,6 +1722,7 @@ pub(crate) mod tests {
     }
 
     /// A Retired line goes to the colliding record whose posted title derives its words
+    /// (`Deploying site` → `Deployed site`, or `— done`), whichever retires first.
     #[test]
     fn a_delivered_retirement_goes_to_the_record_its_finished_words_name() {
         let id = MessageId::from_raw(15).unwrap();
@@ -1749,6 +1806,7 @@ pub(crate) mod tests {
     }
 
     /// Every line about a wire-owned record (its Posted, Retired and Acted) is shelved
+    /// for the wire's file; aterm's own lines, and the `Dropped` gap, for `messages.log`.
     #[test]
     fn every_line_is_shelved_with_its_records_owner() {
         let mut log = MessageLog::empty();
@@ -1801,6 +1859,7 @@ pub(crate) mod tests {
     }
 
     /// A script posting once a second must not push aterm's own history (the crash
+    /// record, a config error) out of the ring.
     #[test]
     fn wire_records_never_push_aterms_own_out_of_the_ring() {
         let retire = |log: &mut MessageLog, rec: LogRecord| {
@@ -1875,6 +1934,8 @@ pub(crate) mod tests {
     }
 
     /// A tool's exception the owner filed (`notice later`, then Dismiss) is the wire's
+    /// record and the fact's memory: inside the wire's share, the script's ordinary
+    /// records go before it.
     #[test]
     fn a_wire_filing_outlives_the_wires_own_churn_inside_its_share() {
         let file = |log: &mut MessageLog, rec: LogRecord, how: Retired| {
@@ -1937,7 +1998,7 @@ pub(crate) mod tests {
         assert_eq!(log.len() - wire_n, LOG_CAP - WIRE_LOG_SHARE);
     }
 
-    /// A message at the crate's own caps reads back from its own line. The caps are in
+    /// A message at the crate's own caps reads back from its own line.
     #[test]
     fn codec_reads_back_a_message_at_the_crates_own_caps() {
         for (name, unit) in [
@@ -1982,6 +2043,8 @@ pub(crate) mod tests {
     }
 
     /// A line cut short mid-append fails to decode wherever the cut lands: a cut inside
+    /// the last field's value would read as a different record (`label=Open`, `rep=1`
+    /// for 12, `n=1` for 12); the `end=` terminator catches it.
     #[test]
     fn a_truncated_last_field_fails_to_decode() {
         let acted = LogLine::Acted {
@@ -2020,6 +2083,7 @@ pub(crate) mod tests {
     }
 
     /// Ids keep rising after replay, including past a replayed id at the ceiling (a
+    /// saturated `next_id` would make every later post share `u64::MAX`).
     #[test]
     fn ids_keep_rising_after_replaying_a_max_id() {
         let mut log = MessageLog::empty();
@@ -2052,6 +2116,7 @@ pub(crate) mod tests {
     }
 
     /// The late-park successor loaded the file at its boot, and its parent kept
+    /// recording until Commit.
     #[test]
     fn a_reloaded_file_merges_what_the_parent_wrote_after_the_boot() {
         let line = |l: LogLine| LogLine::decode(&l.encode()).unwrap();
@@ -2134,6 +2199,8 @@ pub(crate) mod tests {
     }
 
     /// Words the loader takes from the file are capped and sanitized like a
+    /// post's: a hand-edited or hostile line's 5000-char, ESC-bearing,
+    /// newline-bearing title never reaches the ring, `copy_text` or the page.
     #[test]
     fn loaded_records_are_capped_like_posted_ones() {
         let detail: Vec<String> = (0..30)
@@ -2185,6 +2252,9 @@ pub(crate) mod tests {
     }
 
     /// `detail=` on the wire is both `[]` and `[""]`, so `[""]` is
+    /// unrepresentable: the builder drops empty lines, and so does the
+    /// decoder, so no message the engine holds is ambiguous on the wire and
+    /// a compaction is the identity.
     #[test]
     fn a_lone_empty_detail_line_round_trips() {
         let msg = Message::new(tags::SYSTEM, Severity::Info, "t").line("");

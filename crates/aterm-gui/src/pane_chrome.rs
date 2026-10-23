@@ -1,54 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The terminal area's own chrome on Windows: split dividers, the focused
-//! pane's ring, a hollow cursor in every unfocused pane, and the overlay
-//! scrollbar ([`crate::scrollbar`]).
-//!
-//! # Dividers ([`SplitChrome`])
-//!
-//! A split keeps its one-cell gaps (the layout, sizing and drag-to-resize do
-//! not change). `Classic` (macOS, Linux) fills a gap with the seam tone and
-//! inks a half-block beside the focused pane in the foreground. `Fluent`
-//! (Windows) leaves the gap on the terminal background and draws one hairline
-//! down its middle ([`stamp_seam_lines`]): a light box-drawing glyph per gap
-//! cell, so the line is one device pixel at the default cell, joins itself at
-//! every corner and tee, and text on either side keeps half a cell of air from
-//! it. The hairline is always the seam tone; between two pane headers the gap
-//! continues their fill, so a row of headers reads as one bar with a divider
-//! in it. Cells, not overlay quads: the seam is part of every composite (the
-//! glass, `image plain`, recordings) exactly as the slab was.
-//!
-//! # The focus ring ([`push_focus_ring`])
-//!
-//! The pane taking keystrokes is marked on ITS side of each divider it
-//! borders: an accent line of the hairline's weight, one stroke clear of the
-//! shared hairline, inside the gap (Windows Terminal's focused-pane border).
-//! A gap cell has one glyph, and a gap between two panes borders both, so the
-//! ring cannot be the hairline's own colour: inked that way (as it was until
-//! the 2026-10-18 judges' `split-hairline-always-accent`) a two-pane split's
-//! divider was accent along its whole length whichever side had focus. The
-//! ring is pixel paint with the overlays below, so it moves with focus. A pane
-//! with a header has the header's accent rule as the ring's top edge: the
-//! side lines start on the rule and turn into it, an L at each corner
-//! ([`focus_ring_rects`]). An inner pane's scrollbar thumb in the same gap
-//! covers the hairline and grows away from the ring, at rest
-//! ([`scrollbar::rest_span`]) and widened under the pointer with its track
-//! ([`scrollbar::wide_span`]), so a stroke of ground keeps them apart at every
-//! scale and the ring stays whole; it is one tone over the hairline and the
-//! ground ([`scrollbar::over_ground`]).
-//!
-//! # Overlays ([`PaneOverlay`])
-//!
-//! The scrollbar, the focus ring and the unfocused panes' hollow cursors are
-//! pixel paint, not cells: source-over [`GlowQuad`]s appended to the frame's `nova_add` stream
-//! (grid-interior pixels, one quad per row band) after the strip splice
-//! ([`App::splice_pane_overlay`]), taken back by the next splice the way
-//! `crate::claude_card` takes back its light. Their facts are read under the
-//! frame's own terminal holds ([`PaneFacts::read`]), the quads and their
-//! fingerprint built before the repaint decision ([`PaneOverlay::finish`],
-//! folded into the key's `pill_fp`), so an animating fade or a pointer that
-//! only hovers still presents, and an idle window keys `0`.
+//! Terminal split dividers, focus ring, hollow unfocused cursors, and overlay scrollbars.
 
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
@@ -63,12 +16,9 @@ use crate::{App, WindowId};
 /// How a split draws its dividers and marks the pane taking keystrokes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SplitChrome {
-    /// A one-cell slab in the seam tone, a foreground half-block beside the
-    /// focused pane (macOS and Linux, unchanged).
+    /// One-cell seam slab with a foreground half-block beside the focused pane.
     Classic,
-    /// A hairline centred in the gap on the terminal background, an accent
-    /// line on the focused pane's own side of it ([`push_focus_ring`]), and a
-    /// hollow cursor in every other pane (Windows).
+    /// Centred hairline in the gap, accent focus ring, and hollow unfocused cursors.
     Fluent,
 }
 
@@ -133,31 +83,22 @@ impl CellBox {
 pub(crate) struct SeamInks {
     /// The gap's ground: the terminal background.
     pub ground: [u8; 3],
-    /// The ground between two pane headers: the header row's own fill
-    /// (`crate::pane_header::header_colors`), so a row of headers reads as one
-    /// bar across the divider whatever that fill is.
+    /// The ground between two pane headers.
     pub band: [u8; 3],
     /// The hairline.
     pub line: [u8; 3],
-    /// The focus ring beside the hairline on the side of the pane taking
-    /// keystrokes ([`push_focus_ring`]).
+    /// The focus ring beside the hairline on the focused pane's side.
     pub ring: [u8; 3],
 }
 
 impl SeamInks {
-    /// The inks on the grid palette `grid`, with the header band of `header`:
-    /// the seam token (`ChromeTokens::seam_on`, held to 1.5:1) and the accent at
-    /// the 3:1 a focus indicator needs. Under an OS-forced palette (Windows High
-    /// Contrast) the line is the window text and the ring the highlight, each
-    /// held to 3:1 on the terminal's own ground.
+    /// Derives seam inks from the grid and header palettes.
     #[must_use]
     pub(crate) fn derive(
         grid: crate::chrome_band::ChromePalette,
         header: crate::chrome_band::ChromePalette,
     ) -> Self {
         let ground = crate::settings::u32_rgb(grid.theme.bg);
-        // The headers' own fill, not the band's: a header row on the pane's
-        // ground left the gap between two headers a grey notch in it.
         let band = crate::pane_header::header_colors(header).bar_bg;
         match crate::chrome_band::forced_chrome() {
             Some(hc) => SeamInks {
@@ -179,9 +120,7 @@ impl SeamInks {
     }
 }
 
-/// The gap cell a Fluent composite is seeded with: blank on the terminal
-/// background, inked (for when [`stamp_seam_lines`] gives it a glyph) in the
-/// seam tone. `crate::app_render::divider_cell`'s Fluent arm.
+/// Blank Fluent gap cell on the terminal background, inked in the seam tone.
 #[must_use]
 pub(crate) fn seam_ground_cell(p: crate::chrome_band::ChromePalette) -> RenderCell {
     let inks = SeamInks::derive(p, p);
@@ -203,8 +142,7 @@ pub(crate) fn seam_ground_cell(p: crate::chrome_band::ChromePalette) -> RenderCe
     }
 }
 
-/// Where a composite's panes are: each leaf's whole allocation (its header
-/// row included) and the header rows.
+/// Pane allocations and header rows of a composite.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SeamLayout {
     pub allocations: Vec<CellBox>,
@@ -230,8 +168,7 @@ impl SeamLayout {
     }
 }
 
-/// The light box-drawing glyph with arms `up`, `down`, `left`, `right`, or
-/// `None` for none (a lone gap cell stays blank).
+/// Returns the light box-drawing glyph for the given arm directions, if any.
 #[must_use]
 pub(crate) fn seam_glyph(up: bool, down: bool, left: bool, right: bool) -> Option<char> {
     Some(match (up, down, left, right) {
@@ -254,17 +191,7 @@ pub(crate) fn seam_glyph(up: bool, down: bool, left: bool, right: bool) -> Optio
     })
 }
 
-/// Draw the Fluent seam into a freshly filled composite: every gap cell (a
-/// cell in no allocation) of a row this frame writes gets the hairline glyph
-/// its neighbouring gaps call for, in the seam ink, and the header band's
-/// ground between two header rows. The focus ring is not a cell colour
-/// ([`push_focus_ring`]).
-///
-/// Runs after the divider fill and before the pane blits and header paint,
-/// which write only inside allocations, so nothing here is overwritten. A
-/// run that meets the grid's edge carries on to it (the line under the strip
-/// reaches the strip). `keep` is the fill's retention verdict: a retained row
-/// already holds last frame's seam and the same layout.
+/// Stamps Fluent seam hairlines and header-band gaps into a composite.
 pub(crate) fn stamp_seam_lines(
     dst: &mut RenderInput,
     rows: usize,
@@ -300,9 +227,6 @@ pub(crate) fn stamp_seam_lines(
                 if c == 0 { horizontal } else { n_left },
                 if c + 1 == cols { horizontal } else { n_right },
             );
-            // Between two headers the gap carries their band across; beside one
-            // (a header row facing another pane's content) it stays the ground,
-            // or the band would jut past the hairline into that pane.
             let beside_header = c > 0 && header(r, c - 1) && header(r, c + 1);
             let Some(cell) = dst.cells[r].get_mut(c) else {
                 continue;
@@ -321,8 +245,7 @@ pub(crate) fn stamp_seam_lines(
 }
 
 impl App {
-    /// The Fluent seam's inks and layout for `plan`; `None` under
-    /// [`SplitChrome::Classic`], which keeps the slab.
+    /// Returns the Fluent seam inks and layout for `plan`, or `None` under `Classic`.
     pub(crate) fn fluent_seam(&self, plan: &VisibleLeafPlan) -> Option<(SeamInks, SeamLayout)> {
         (split_chrome() == SplitChrome::Fluent && plan.leaves.len() > 1)
             .then(|| (self.seam_inks(), SeamLayout::of(plan)))
@@ -340,39 +263,13 @@ impl App {
 /// The pane a Fluent split's focus ring surrounds ([`push_focus_ring`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FocusRing {
-    /// The focused pane's allocation, header row included, in terminal-grid
-    /// cells.
+    /// The focused pane's allocation, header row included, in terminal-grid cells.
     pub alloc: CellBox,
-    /// The grid row of the pane's header, when it has one: the header's accent
-    /// rule (`crate::pane_header::focus_rule_rows`) is then the ring's top edge.
+    /// Grid row of the pane's header, when it has one.
     pub header_row: Option<usize>,
 }
 
-/// THE FOCUS RING of a Fluent split, as rectangles `(x, y, w, h)` in
-/// terminal-grid pixels of a `grid_rows × grid_cols` grid of `cw × ch` cells
-/// (the chrome rows above excluded): on each side of the focused allocation
-/// that borders a divider gap, an accent line of the hairline's weight on the
-/// pane's own side of that gap's hairline, one stroke clear of it
-/// (`scrollbar::hairline_start`, the renderer's light-line placement). The
-/// lines run the allocation's length and meet in an inner corner where a
-/// vertical and a horizontal divider cross; a side on the window's edge has no
-/// divider and no line.
-///
-/// A pane with a header (`ring.header_row`) has no top line: the header's
-/// accent rule (`crate::pane_header::focus_rule_rows`, drawn across the pane's
-/// columns by its raster) is the ring's top edge. The side lines start on the
-/// rule's top row, and on the rule's rows a stub joins each to the rule's end
-/// at the pane's edge, so line and rule meet in an L. They used to pass each
-/// other: the side line ran up through the header to its top, and the rule
-/// began three pixels to its right at 100% (the 2026-10-18 judge's
-/// `focus-ring-header-corner-notch`). A divider above a header gets no second
-/// accent line over the rule.
-///
-/// At the 9 px Windows cell the hairline is the gap's pixel 4, the ring pixel
-/// 2 beside a pane on its left and pixel 6 beside one on its right: it moves
-/// four pixels when focus crosses the divider, and keeps two pixels of air
-/// from the text and one (pixel 3 or 5) from a resting scrollbar thumb, which
-/// covers the hairline and grows away from it ([`scrollbar::rest_span`]).
+/// Computes the focus-ring rectangles `(x, y, w, h)` in terminal-grid pixels.
 #[must_use]
 pub(crate) fn focus_ring_rects(
     ring: FocusRing,
@@ -395,8 +292,6 @@ pub(crate) fn focus_ring_rects(
     };
     let (left, right) = (alloc.col > 0, alloc.col + alloc.cols < grid_cols);
     let (top, bottom) = (alloc.row > 0, alloc.row + alloc.rows < grid_rows);
-    // The ring's box: each side on its line inside the neighbouring gap, or on
-    // the grid's edge where there is none.
     let x0 = if left {
         px(alloc.col - 1, cw) + vl + 2 * t
     } else {
@@ -407,7 +302,6 @@ pub(crate) fn focus_ring_rects(
     } else {
         px(alloc.col + alloc.cols, cw)
     };
-    // A header's accent rule, `(top, thickness)`: the box's top edge.
     let rule = ring.header_row.map(|row| {
         let (at, thick) = crate::pane_header::focus_rule_rows(ch);
         (px(row, ch).saturating_add(at), thick)
@@ -434,8 +328,6 @@ pub(crate) fn focus_ring_rects(
         rects.push((x1 - t, y0, t, h));
     }
     match rule {
-        // The rule runs across the pane's columns; each side line turns into
-        // it across the gap's pixels between them.
         Some((at, thick)) => {
             let (pane_x0, pane_x1) = (px(alloc.col, cw), px(alloc.col + alloc.cols, cw));
             if left && pane_x0 > x0 + t {
@@ -454,9 +346,7 @@ pub(crate) fn focus_ring_rects(
     rects
 }
 
-/// Append the focus ring of `ring` ([`focus_ring_rects`]) as opaque `rgb`
-/// quads, lifted `lift` pixels by the chrome rows above the grid and cut per
-/// row band.
+/// Appends focus-ring quads for `ring` lifted by `lift` pixels and cut per row band.
 pub(crate) fn push_focus_ring(
     out: &mut Vec<GlowQuad>,
     ring: FocusRing,
@@ -470,9 +360,6 @@ pub(crate) fn push_focus_ring(
     }
 }
 
-/// The side of `lane`'s divider hairline a focus-ring stroke among `ring`
-/// ([`focus_ring_rects`]) runs on beside the lane's track, for the resting
-/// thumb to grow away from ([`scrollbar::rest_span`]); `None` at the window's
 /// edge and in a gap the ring does not reach.
 fn ring_side(
     lane: scrollbar::Lane,
@@ -496,10 +383,7 @@ fn ring_side(
         })
 }
 
-// ---- The overlays -------------------------------------------------------------------
-
-/// One visible terminal pane as the overlays see it, read under the frame's
-/// hold on that pane ([`PaneFacts::read`]).
+/// Per-pane facts read under the frame's hold on that pane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PaneFacts {
     pub session: u64,
@@ -542,30 +426,23 @@ impl PaneFacts {
     }
 }
 
-/// A thumb drag in flight: the pane, and how far below the thumb's top it was
-/// grabbed.
+/// Active scrollbar thumb drag state.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Drag {
     pub session: u64,
     pub grab: f64,
 }
 
-/// What a frame's overlays are drawn from: config, theme and geometry read
-/// before the window borrow ([`App::pane_overlay_inputs`]).
+/// Config, theme, and geometry inputs for building a frame's pane overlays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OverlayInputs {
     /// `scrollbar = true`: draw the overlay scrollbar.
     pub scrollbar: bool,
     /// The Fluent split: draw unfocused panes' hollow cursors.
     pub hollow: bool,
-    /// The Fluent chrome (Windows): a resting thumb is WinUI's thin panning
-    /// indicator, one width and one ink at the window's edge and in a divider
-    /// gap ([`scrollbar::rest_width`], [`scrollbar::rest_alpha`]), and in a gap
-    /// it keeps clear of the ring ([`scrollbar::rest_span`]).
+    /// Whether Fluent scrollbar styling is active.
     pub fluent: bool,
-    /// The Fluent split's focused pane while the window has the keyboard and
-    /// `split_focus_mark` is on: the focus ring ([`push_focus_ring`])
-    /// surrounds it. `None` draws no ring.
+    /// Focused pane for the Fluent focus ring, if active.
     pub ring: Option<FocusRing>,
     /// The ring's ink ([`SeamInks::ring`]).
     pub ring_rgb: [u8; 3],
@@ -578,22 +455,15 @@ pub(crate) struct OverlayInputs {
     pub chrome_rows: usize,
     /// The thumb's ink: the terminal foreground.
     pub ink: [u8; 3],
-    /// The terminal's ground under a divider gap ([`SeamInks::ground`]): a
-    /// Fluent thumb on the gap's hairline is precomposed over it, so it is one
-    /// tone over the line and the ground ([`scrollbar::over_ground`]).
+    /// Terminal ground colour under a divider gap.
     pub ground: [u8; 3],
     /// The fade ramps (`MotionEffect::ScrollPill`); `false` hides binary.
     pub animated: bool,
-    /// The grid the frame lays the bars on ([`crate::app_mouse::GlassGrid`]):
-    /// under any other — a re-grid since, its frame not yet painted — they
-    /// answer no pointer (`App::laid_grid`), since their lanes were laid with
-    /// this frame's cell, inset and columns and the pointer is read with the
-    /// window's.
+    /// Grid geometry the bars were laid on.
     pub laid: Option<crate::app_mouse::GlassGrid>,
 }
 
-/// A window's overlay state: this frame's facts, the quads they make, what
-/// the last splice appended, and the pointer's part in it.
+/// Per-window pane overlay state across frames and pointer interactions.
 #[derive(Debug, Default)]
 pub(crate) struct PaneOverlay {
     facts: Vec<PaneFacts>,
@@ -624,8 +494,6 @@ impl PaneOverlay {
     pub(crate) fn note(&mut self, mut facts: PaneFacts, now: Instant) {
         let before = self.prev.iter().find(|p| p.session == facts.session);
         facts.moved = match before {
-            // A move through history: the offset changed while the history
-            // did not (output under a parked view moves both together).
             Some(p) if p.offset != facts.offset && p.history == facts.history => Some(now),
             Some(p) => p.moved,
             None => None,
@@ -656,17 +524,13 @@ impl PaneOverlay {
         &self.pending
     }
 
-    /// Whether `quad` is one the last splice appended (a test telling the
-    /// overlays from the effects that share their stream).
+    /// Returns whether `quad` was appended by the last overlay splice.
     #[cfg(test)]
     pub(crate) fn painted_quad(&self, quad: &GlowQuad) -> bool {
         self.painted.contains(quad)
     }
 
-    /// Build this frame's quads from its facts and return their fingerprint.
-    /// A pane whose view moved re-arms the window's fade clock (`pill`), so
-    /// the hold and ramp wake the loop; `shown` says whether any bar is still
-    /// fading, the erase-frame flag the wake handler reads.
+    /// Builds this frame's overlay quads from its facts and returns their fingerprint.
     pub(crate) fn finish(
         &mut self,
         inputs: OverlayInputs,
@@ -684,7 +548,6 @@ impl PaneOverlay {
         let m = Metrics::for_cell(cw32, ch32);
         let lift = u32::try_from(inputs.chrome_rows * ch).unwrap_or(u32::MAX);
         let mut fading = false;
-        // Drop a drag or hover whose pane is gone.
         if self
             .drag
             .is_some_and(|d| !self.facts.iter().any(|f| f.session == d.session))
@@ -697,8 +560,6 @@ impl PaneOverlay {
         {
             self.hover = None;
         }
-        // The focus ring first; a thumb, resting or widened, keeps clear of
-        // its strokes (`ring`).
         let grid = (inputs.win_rows, inputs.win_cols);
         let ring = inputs.ring.map_or_else(Vec::new, |ring| {
             push_focus_ring(
@@ -752,14 +613,8 @@ impl PaneOverlay {
                 {
                     let widened = dragging || hovering;
                     let side = ring_side(lane, &ring, m);
-                    // A Fluent thumb on a gap's hairline is one tone over the
-                    // line and the ground: precomposed over what it would
-                    // show over the ground ([`scrollbar::over_ground`]).
                     let on_line = inputs.fluent && !lane.edge;
                     let (x, w, (rgb, alpha)) = if widened {
-                        // Under the pointer: the wide thumb, centred on a
-                        // faint track drawn under it, both kept off the ring
-                        // in a gap beside it ([`scrollbar::wide_span`]).
                         let (tx, tw) = scrollbar::wide_span(lane, m, side);
                         scrollbar::push_bar(
                             &mut self.pending,
@@ -782,8 +637,6 @@ impl PaneOverlay {
                         };
                         (tx + tw.saturating_sub(w) / 2, w, paint)
                     } else {
-                        // At rest: one width and one ink in every lane under
-                        // the Fluent chrome, grown away from the ring in a gap.
                         let (x, w) = scrollbar::rest_span(
                             lane,
                             scrollbar::rest_width(m, inputs.fluent),
@@ -847,11 +700,9 @@ impl PaneOverlay {
     }
 }
 
-/// The unfocused panes' hollow cursor: the pane's own cursor colour, a touch
 /// under opaque so it reads as a mark, not a block.
 const HOLLOW_ALPHA: u8 = 210;
 
-/// Remove each quad of `taken` from `stream` once, wherever it still is (a
 /// producer that refilled the stream since holds none of it).
 fn remove_each_once(stream: &mut Vec<GlowQuad>, taken: &[GlowQuad]) {
     for q in taken {
@@ -862,8 +713,7 @@ fn remove_each_once(stream: &mut Vec<GlowQuad>, taken: &[GlowQuad]) {
 }
 
 impl App {
-    /// What this frame's overlays of window `wid` draw from, or `None` when
-    /// nothing can draw: the scrollbar off and no Fluent split.
+    /// Returns the overlay inputs for window `wid`, or `None` when nothing can draw.
     pub(crate) fn pane_overlay_inputs(
         &self,
         wid: WindowId,
@@ -876,8 +726,6 @@ impl App {
         }
         let ws = self.windows.get(&wid)?;
         let focus = self.motion_focus(wid, ws.focused);
-        // The ring marks a pane only in the window with the keyboard, as the
-        // Classic split's half-block does (`ActivePaneMark::resolve`).
         let ring = (hollow && ws.focused && self.config.split_focus_mark_or_default())
             .then(|| self.active_visible_leaf_plan(wid))
             .flatten()
@@ -919,9 +767,7 @@ impl App {
         })
     }
 
-    /// Take back the overlays the last splice appended to window `wid`'s frame
-    /// and append this frame's, after the strip splice (their rows count the
-    /// chrome rows) and before the bands and cards that paint over them.
+    /// Replaces the previous frame's pane overlay quads on window `wid` with this frame's.
     pub(crate) fn splice_pane_overlay(&mut self, wid: WindowId) {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
@@ -937,10 +783,7 @@ impl App {
         overlay.painted.clone_from(&overlay.pending);
     }
 
-    /// Re-read every visible terminal pane of `plan` and rebuild the overlays,
-    /// for a capture that builds its frame without the redraw's holds
-    /// (`image` on a headless window). Try-locks: a contended pane keeps last
-    /// frame's facts.
+    /// Re-reads visible panes of `plan` and rebuilds overlays for headless capture.
     pub(crate) fn refresh_pane_overlay_for_capture(
         &mut self,
         wid: WindowId,
@@ -986,9 +829,6 @@ impl App {
         overlay.finish(inputs, &mut ws.scroll_pill, &mut ws.pill_shown, now);
     }
 
-    // ---- The pointer ----------------------------------------------------------------
-
-    /// Window pixel `(x, y)` in terminal-grid pixels (the grid's own origin,
     /// the chrome rows above it excluded), unclamped.
     fn grid_pixel(&self, wid: WindowId, x: f64, y: f64) -> (f64, f64) {
         let (fx, fy) = self.window_to_frame(wid, x, y);
@@ -998,10 +838,6 @@ impl App {
         (fx - self.win_pad(wid) as f64, fy - top as f64)
     }
 
-    /// The geometry the last frame laid window `wid`'s bars with, while the
-    /// window still has the grid they were laid on ([`App::laid_grid`]):
-    /// between a re-grid and the frame that lays them again, `None`, so no
-    /// pointer event hovers, grabs, pages or drags a lane laid at a cell,
     /// inset or width the window no longer has.
     fn laid_overlay_inputs(&self, wid: WindowId) -> Option<OverlayInputs> {
         let inputs = self.windows.get(&wid)?.pane_overlay.inputs?;
@@ -1009,7 +845,6 @@ impl App {
         Some(inputs)
     }
 
-    /// The scrollbar under window pixel `(x, y)`: its pane's facts, lane and
     /// thumb, and what part of it is hit.
     fn scrollbar_at(
         &self,
@@ -1047,10 +882,7 @@ impl App {
         }
     }
 
-    /// Pointer motion over the overlay scrollbars of window `wid` at window
-    /// pixel `(x, y)`: a thumb drag in flight scrolls its pane; otherwise the
-    /// bar under the pointer is the hovered one (a change repaints). Returns
-    /// whether the motion is the scrollbar's (no grid hover, no report).
+    /// Handles pointer motion over overlay scrollbars in window `wid`.
     pub(crate) fn scrollbar_pointer_motion(&mut self, wid: WindowId, x: f64, y: f64) -> bool {
         let Some(ws) = self.windows.get(&wid) else {
             return false;
@@ -1079,9 +911,7 @@ impl App {
         }
     }
 
-    /// A left press at the pointer: on a thumb it starts a drag; on the track
-    /// beside the window edge it pages toward the pointer. Returns whether the
-    /// press was the scrollbar's.
+    /// Handles a left mouse press on an overlay scrollbar in window `wid`.
     pub(crate) fn scrollbar_press(&mut self, wid: WindowId) -> bool {
         let Some((x, y)) = self.windows.get(&wid).map(|ws| ws.last_cursor_px) else {
             return false;
@@ -1122,7 +952,6 @@ impl App {
             .and_then(|ws| ws.pane_overlay.drag.take())
             .is_some();
         if ended {
-            // The pointer may have left the bar mid-drag: re-resolve the hover.
             if let Some((x, y)) = self.windows.get(&wid).map(|ws| ws.last_cursor_px) {
                 let hover = self.scrollbar_at(wid, x, y).map(|(f, ..)| f.session);
                 if let Some(ws) = self.windows.get_mut(&wid) {
@@ -1134,7 +963,6 @@ impl App {
         ended
     }
 
-    /// One drag step: put the dragged thumb's top under the pointer, less the
     /// grab, and scroll its pane to the offset that puts it there.
     fn drag_scrollbar(&mut self, wid: WindowId, drag: Drag, x: f64, y: f64) {
         let Some(inputs) = self.laid_overlay_inputs(wid) else {
@@ -1177,9 +1005,6 @@ impl App {
         self.scroll_pane(wid, drag.session, |_| target as usize);
     }
 
-    /// Move pane `session`'s view to the offset `to` makes of its current one,
-    /// as a reader's own motion (`Terminal::scroll_display`, custody recorded),
-    /// and wake the fade. The facts take the new offset at once, so the next
     /// pointer event in the same frame hit-tests the thumb where it now is.
     fn scroll_pane(&mut self, wid: WindowId, session: u64, to: impl FnOnce(usize) -> usize) {
         let Some(term) = self.pool.get(session).map(|s| s.term.clone()) else {
@@ -1188,7 +1013,6 @@ impl App {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
-        // A glide in flight on this pane would ease back over the new place.
         if ws
             .scroll_glide
             .as_ref()

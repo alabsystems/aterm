@@ -11,15 +11,20 @@ use atpkg::caller_shell::ProcArgs;
 use super::upgrade::{self, Dialect};
 
 /// How a starter's process is known to run a row's CLI, and the program a
+/// worker's line types for it ([`starter_of`]).
 #[derive(Clone, Copy)]
 enum Launches {
     /// Claude Code: read by its relaunch's own reader
+    /// (`relaunch::caller_claude`).
     Claude,
     /// A CLI known by its image and argv (`is`), typed by its PATH word:
+    /// Gemini CLI, whose image is `node` running its script.
     Word {
         is: fn(Option<&Path>, &[String]) -> bool,
     },
     /// A CLI whose image is named by its word: its own path, or — where
+    /// `store_build` says it is a build in atpkg's store — atpkg's managed
+    /// twin (the path its relaunch lane types), else the word.
     Image { store_build: fn(&Path) -> bool },
 }
 
@@ -45,12 +50,16 @@ pub struct WorkerCli {
     pub dirs: &'static [&'static str],
     launches: Launches,
     /// The starter's environment a worker's line carries: its relaunch lane's
+    /// own pairs, under the user's home.
     homes: fn(&ProcArgs, &Path) -> Vec<(String, String)>,
     /// The flags of the starter's argv a worker's line carries ([`Starter::args`]):
+    /// the ones its relaunch lane carries that move its config or say how it
+    /// reaches its provider.
     flags: fn(&[String]) -> Result<Vec<String>, String>,
 }
 
 /// No flag of a starter's rides: Claude Code (whose relaunch reads none) and
+/// Gemini CLI (whose homes are its environment's).
 fn no_flags(_: &[String]) -> Result<Vec<String>, String> {
     Ok(Vec::new())
 }
@@ -297,6 +306,7 @@ pub fn line(
 }
 
 /// Whether `name` is an XDG base directory's variable, which the XDG rule
+/// reads as unset where it is empty.
 fn xdg_base(name: &str) -> bool {
     name.starts_with("XDG_") && name.ends_with("_HOME")
 }

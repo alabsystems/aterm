@@ -27,8 +27,10 @@ const CH: usize = 14;
 /// A 120 Hz window's frame train.
 const FRAME_US: u64 = 8_333;
 /// A pixel is ink at this level (premultiplied channel or source-over opacity,
+/// 0..255), below the glass census's 20/255 so a faint stub counts.
 const INK: u8 = 8;
 /// Idle after the last key by which every life has ended: the longest swoosh
+/// is a 1.5 s rest plus 0.79 s (`review_real_bytes.rs`'s `IDLE_CEILING_MS`).
 const IDLE_CEILING_MS: u64 = 2_500;
 
 /// One recorded take and the grid it was recorded at.
@@ -39,6 +41,7 @@ struct Take {
     rows: usize,
     cols: usize,
     /// Command lines pre-fed so a python-pty take's prompt sits mid-grid (the headless takes
+    /// carry their own history).
     preroll: usize,
 }
 
@@ -121,6 +124,7 @@ const BACKHOP: Take = Take {
 };
 
 /// Searches whose match is not at the entry's first column, so zle walks the
+/// caret along the match row: forward, and (the last) back.
 const HOP_TAKES: [Take; 4] = [HOP, HOP2, HOP2_BOTTOM, BACKHOP];
 
 const MULTILINE: Take = Take {
@@ -139,6 +143,7 @@ const MULTILINE_SLOW: Take = Take {
 };
 
 /// bash 3.2's reverse-i-search: the query is echoed inside the prompt row's
+/// `(reverse-i-search)`…`': ` and the caret walks the match on that row.
 const BASH: Take = Take {
     name: "bash",
     src: include_str!("fixtures/bash-isearch-2026-09-24.ptylog"),
@@ -148,6 +153,7 @@ const BASH: Take = Take {
 };
 
 /// A composer take from another program (the recordings other suites replay:
+/// `review_real_bytes.rs`, `codex_particle_replay.rs`), its clock and grid.
 struct Composer {
     name: &'static str,
     src: &'static str,
@@ -177,6 +183,9 @@ const fn codex_wrapped(name: &'static str, src: &'static str) -> Composer {
 }
 
 /// Claude Code's four composer takes, Codex's four, and Claude Code's re-wrap
+/// takes (the seven `claude_wrap_band.rs` replays and `wrap_code_reflow.rs`'s
+/// recording): every shape whose re-anchor lays a cell other than
+/// `landing − 1`.
 const COMPOSERS: [Composer; 16] = [
     claude(
         "claude-insert",
@@ -251,6 +260,7 @@ const COMPOSERS: [Composer; 16] = [
 ];
 
 /// The prompt `owner0@hostmachine0000 aterm % `: its width is the column where
+/// the line and the match start in the python-pty takes.
 const PROMPT_COLS: u16 = 31;
 
 #[derive(Clone)]
@@ -258,6 +268,7 @@ enum Ev {
     Out(Vec<u8>),
     In(Vec<u8>),
     /// A controller `turn` fence (Codex's takes): the app clears the typed
+    /// licence.
     Clear,
 }
 
@@ -312,6 +323,8 @@ fn events_in(fixture: &str, clock: Clock) -> Vec<(u64, Ev)> {
 }
 
 /// Cut one PTY read into the pieces a torn read can stop between: every escape
+/// sequence (CSI to its final byte, OSC to BEL/ST, two-byte ESC), every C0
+/// control, every printable run.
 fn pieces(b: &[u8]) -> Vec<&[u8]> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -382,6 +395,7 @@ enum Tear {
     /// A present after every piece of every read from the Ctrl-R on.
     Every,
     /// Exactly one read (the `n`th output read from the Ctrl-R on) torn once,
+    /// after its first `k` pieces.
     One { n: usize, k: usize },
 }
 
@@ -390,10 +404,16 @@ enum Tear {
 struct Present {
     tear: Tear,
     /// Present only when the host would (on PTY output, a key, and the wake the
+    /// engine asks for: `needs_frame_cadence`, else `next_change_deadline`)
+    /// instead of every 120 Hz frame.
     host_wake: bool,
     /// Hand the engine the print anchor's glyph with the anchor, as
+    /// `app_render.rs` does; `false` feeds the anchor only, and the engine reads
+    /// the caret row's probes.
     anchor_glyph: bool,
     /// Hand over the caret whether or not DECTCEM draws it, as the single-pane
+    /// window does; `false` is the composed, focus and headless paths (drawn
+    /// carets only).
     window_caret: bool,
 }
 
@@ -457,6 +477,7 @@ struct Host {
     blink: u64,
     scroll: Option<ContentScrollState>,
     /// From when the census runs (the Ctrl-R, or a control's first key), and the caret row
+    /// then: a search's match row R.
     census_from: Option<(u64, u16)>,
     /// Printable keys `(µs, glyph)`.
     keys: Vec<(u64, char)>,
@@ -465,24 +486,31 @@ struct Host {
     /// The overlay stream (`out`: the hot edge, sparks) per cell.
     over_lives: BTreeMap<(u16, u16), Life>,
     /// Live (not leaving) ribbon cells and the glyph under each, first/last
+    /// µs seen.
     cells: BTreeMap<(u16, u16, char), (u64, u64)>,
     /// When the search ended (Ctrl-G, Ctrl-C, or an arrow leaving it).
     search_end_us: Option<u64>,
     /// Every row the i-search status row stood on.
     status_rows: BTreeSet<u16>,
     /// Live ribbon cells on the status row while it was the status row, with
+    /// the glyph under each.
     status_cells: BTreeSet<(u16, u16, char)>,
     /// Band ink on the status row at or right of zle's `_`: `(µs, col, ink
+    /// pixels)`.
     beyond: Vec<(u64, u16, u32)>,
     /// Live ribbon cells on the status row at or right of zle's `_`, with
+    /// the glyph under each.
     beyond_cells: Vec<(u16, u16, char)>,
     ring: Vec<Verdict>,
     ring_seen: u64,
     /// `(visible caret, print anchor)` on every frame a new print ended on a row other than
+    /// the visible caret's.
     parked_prints: Vec<((u16, u16), (u16, u16))>,
     /// Of those, the frames whose caret DECTCEM hid — handed over only by
+    /// the single-pane window ([`Present::window_caret`]).
     hidden_parked_prints: usize,
     /// Every visible caret move along the match row while the search ran: zle walking the
+    /// caret to the match's new place.
     match_hops: Vec<((u16, u16), (u16, u16))>,
     /// The visible caret the last frame saw.
     last_cur: Option<(u16, u16)>,
@@ -572,6 +600,8 @@ impl Host {
     }
 
     /// The host's order: `sync_cursor_effect_scroll`, the frame hold's witness rows (the caret's
+    /// row, then every row the ribbon names), the row probe with neighbours, the print anchor
+    /// with its glyph, the tick.
     fn frame(&mut self) {
         let scroll = self.term.content_scroll_state();
         match ContentScrollState::delta_since(self.scroll, scroll) {
@@ -733,6 +763,8 @@ impl Host {
     }
 
     /// Where zle's fake cursor `_` stands: the status row (the first row below
+    /// the match row holding `search:`; two down under a wrapped match) and its
+    /// column.
     fn fake_cursor(&mut self) -> Option<(u16, u16)> {
         let (_, r) = self.census_from?;
         if self.search_end_us.is_some() {
@@ -794,6 +826,11 @@ impl Host {
     }
 
     /// The hint `app_input.rs` stamps for what the keyboard sent: a printable
+    /// key is a typed glyph (`note_typed_expected`); Enter is the Return
+    /// licence; an arrow, ⌥←/⌥→, Home or End is navigation
+    /// (`clear_typed_keeping_hand`, then `note_motion`); Backspace (same disarm)
+    /// erases one priced glyph; Ctrl-R, Ctrl-G and Ctrl-C are the generic
+    /// disarm (`clear_typed`); multi-byte `aterm ctl send` text stamps nothing.
     fn hint(&mut self, bytes: &[u8]) {
         match bytes {
             [b] if (0x20..0x7f).contains(b) => {
@@ -914,7 +951,7 @@ impl Host {
     }
 }
 
-/// Fold quads into per-cell ink pixels. `scratch` is a per-pixel max buffer,
+/// Fold quads into per-cell ink pixels.
 fn fold(quads: &[GlowQuad], g: Geom, scratch: &mut [u8]) -> BTreeMap<(u16, u16), u32> {
     let w = g.cols * CW;
     let h = g.rows * CH;
@@ -1019,6 +1056,7 @@ fn replay(take: Take, present: Present) -> Host {
 }
 
 /// A composer take replayed up to its exit chord (Claude Code's
+/// `\x1b[99;5u`, Codex's Ctrl-C), then rested past every life.
 fn replay_composer(take: &Composer, present: Present) -> Host {
     let mut h = Host::new(take.rows, take.cols, present);
     for (us, ev) in events_in(take.src, take.clock) {
@@ -1035,6 +1073,7 @@ fn replay_composer(take: &Composer, present: Present) -> Host {
 }
 
 /// Every cell the ribbon put on the status row under a glyph the search did
+/// not type (zle's `_` included), and every cell at or right of the `_`.
 fn untyped_status_cells(h: &Host) -> Vec<(u16, u16, char)> {
     assert!(!h.status_rows.is_empty(), "the search drew its status row");
     let typed = h.typed();
@@ -1051,6 +1090,7 @@ fn untyped_status_cells(h: &Host) -> Vec<(u16, u16, char)> {
 }
 
 /// Every read presented whole (one zle redisplay is one write is one read), at 120 Hz and on the
+/// host's wake, the anchor's glyph handed over or not.
 #[test]
 fn whole_reads_lay_no_band_on_the_match_row_or_under_zle_s_fake_cursor() {
     let mut bad = String::new();
@@ -1081,7 +1121,7 @@ fn whole_reads_lay_no_band_on_the_match_row_or_under_zle_s_fake_cursor() {
     assert!(bad.is_empty(), "the owner's shape lit:{bad}");
 }
 
-/// No ink on the match row when the match hops. `hop` (`git log --stat` then
+/// No ink on the match row when the match hops.
 #[test]
 fn a_match_that_hops_along_its_row_lays_no_ink_there() {
     let mut bad = String::new();
@@ -1130,7 +1170,7 @@ fn a_match_that_hops_along_its_row_lays_no_ink_there() {
     );
 }
 
-/// An entry switch shaped like a soft-wrapped caret lays nothing. `a` puts the
+/// An entry switch shaped like a soft-wrapped caret lays nothing.
 #[test]
 fn an_entry_switch_shaped_like_a_soft_wrap_lays_nothing_on_the_match() {
     let mut bad = String::new();
@@ -1185,6 +1225,7 @@ fn an_entry_switch_shaped_like_a_soft_wrap_lays_nothing_on_the_match() {
 }
 
 /// Bash's reverse-i-search retreat lays nothing under the match: bash 3.2,
+/// `echo hello world`, Ctrl-R, `lo w`.
 #[test]
 fn bash_s_reverse_search_retreat_lays_nothing_under_the_match() {
     for present in WHOLE {
@@ -1290,6 +1331,7 @@ fn a_longer_search_lays_no_band_on_cells_nobody_typed() {
 }
 
 /// The wrapped match: an 85-character entry after the 31-column prompt wraps,
+/// so the status row sits under the match's last line.
 #[test]
 fn a_wrapped_match_lays_nothing_under_zle_s_fake_cursor() {
     let h = replay(WRAPPED, APP);
@@ -1318,6 +1360,8 @@ fn a_wrapped_match_lays_nothing_under_zle_s_fake_cursor() {
 }
 
 /// The gates' blast radius: Claude Code's and Codex's composer takes, fed as
+/// the app feeds them (window and composed carets), print off the caret's row
+/// repeatedly, and neither gate refuses anything.
 #[test]
 fn the_gates_refuse_nothing_in_claude_code_s_or_codex_s_composer() {
     let runs: Vec<(&Composer, bool)> = COMPOSERS
@@ -1366,6 +1410,8 @@ fn the_gates_refuse_nothing_in_claude_code_s_or_codex_s_composer() {
 }
 
 /// A hidden caret keeps its lane on every path: a TUI hides the caret, parks it
+/// below its input and draws its own fake cursor after each echo (`> a█`), so
+/// every run ends on a glyph no key typed.
 #[test]
 fn a_hidden_caret_s_echo_is_judged_alike_on_every_path() {
     let lay = |window_caret| {
@@ -1418,6 +1464,7 @@ fn a_hidden_caret_s_echo_is_judged_alike_on_every_path() {
 }
 
 /// Control: the same four keys at the plain prompt light four cells and are
+/// gone by the idle ceiling.
 #[test]
 fn plain_prompt_typing_lights_and_retires_on_the_normal_schedule() {
     let mut h = Host::new(PLAIN.rows, PLAIN.cols, APP);
@@ -1449,6 +1496,7 @@ fn plain_prompt_typing_lights_and_retires_on_the_normal_schedule() {
 }
 
 /// A parked caret's own echo still lights: the program's run on the row below
+/// ends on the key, so each key's cell is laid under its own glyph.
 #[test]
 fn a_parked_caret_s_own_echo_still_lights() {
     let mut h = Host::new(24, 100, APP);
@@ -1474,6 +1522,8 @@ fn a_parked_caret_s_own_echo_still_lights() {
 }
 
 /// Enter hands the line over: `ls` at the prompt on row R, then Enter; the
+/// program draws its input two rows down and parks its visible caret on row R,
+/// echoing keys on the input row.
 #[test]
 fn a_parked_caret_s_own_echo_lights_after_enter_on_the_caret_s_row() {
     let mut h = Host::new(24, 100, APP);
@@ -1514,6 +1564,8 @@ fn a_parked_caret_s_own_echo_lights_after_enter_on_the_caret_s_row() {
 }
 
 /// Typeahead into the minibuffer: two keys pressed before the first echo is
+/// presented both end on `_`; the first is refused by the glyph gate and the
+/// second finds no credit, so nothing is laid under the fake cursor.
 #[test]
 fn typeahead_into_the_minibuffer_lays_nothing() {
     let mut h = Host::new(24, 100, APP);
@@ -1541,6 +1593,8 @@ fn typeahead_into_the_minibuffer_lays_nothing() {
 }
 
 /// A glyph-less press keeps the lane: a wide glyph or IME commit is banked by
+/// cell count alone, so a CJK key echoed below a parked visible caret is laid
+/// as usual though the run ends on its continuation column.
 #[test]
 fn a_wide_glyph_echo_below_a_parked_caret_still_lights() {
     let mut h = Host::new(24, 100, APP);
@@ -1569,9 +1623,16 @@ fn a_wide_glyph_echo_below_a_parked_caret_still_lights() {
 }
 
 /// How long light laid on a torn redisplay may stay on the match row: the
+/// caret's rest (`CursorGlow::TORN_REST_S`, 32 ms) and a frame to see it,
+/// then the recall's retract (`12·n + 240` ms for the one or two cells laid)
+/// and its last frame.
 const RECALL_BOUND_MS: u64 = 330;
 
 /// Band ink on the match row that outlived [`RECALL_BOUND_MS`] — from its
+/// first frame when one read tore, from the search's last key when every
+/// read did (each key then re-lays the match's glyph while the last lay is
+/// still retracting) — and live ribbon cells left on it once the replay
+/// rested.
 fn match_row_kept(h: &Host) -> Vec<String> {
     let r = h.match_row();
     let every = h.present.tear == Tear::Every;
@@ -1593,6 +1654,7 @@ fn match_row_kept(h: &Host) -> Vec<String> {
 }
 
 /// Each of [`OWNER_TAKES`] with a present after every piece of every read, on the 120 Hz train
+/// and on the host's wake: what `law` finds, per replay.
 fn every_tear(law: fn(&Host) -> Vec<String>) -> String {
     let mut bad = String::new();
     for take in OWNER_TAKES {
@@ -1619,6 +1681,8 @@ fn every_tear(law: fn(&Host) -> Vec<String>) -> String {
 }
 
 /// Each owner take's search reads torn at each of their piece boundaries,
+/// one at a time, everything else whole: what `law` finds, per tear, with
+/// how many tears were tried and how many program-row refusals the ring logged.
 fn one_tear(law: fn(&Host) -> Vec<String>) -> (String, usize, usize) {
     let (mut bad, mut tried, mut refused) = (String::new(), 0, 0);
     for take in OWNER_TAKES {
@@ -1663,6 +1727,7 @@ fn one_tear(law: fn(&Host) -> Vec<String>) -> (String, usize, usize) {
 }
 
 /// The existing retention ceiling also holds with a present after every
+/// redisplay fragment.
 #[test]
 fn torn_reads_leave_no_band_on_the_match_row() {
     let bad = every_tear(match_row_kept);
@@ -1670,6 +1735,7 @@ fn torn_reads_leave_no_band_on_the_match_row() {
 }
 
 /// Each possible single tear preserves the retention ceiling and exercises
+/// program-row refusal, rather than passing with an empty fixture.
 #[test]
 fn one_torn_read_at_any_boundary_leaves_no_band_on_the_match_row() {
     let (bad, tried, refused) = one_tear(match_row_kept);
@@ -1724,7 +1790,7 @@ fn one_torn_read_at_any_boundary_lays_no_band_on_the_match_row() {
     );
 }
 
-/// A footer does not displace an established typing row. After an unowned
+/// A footer does not displace an established typing row.
 #[test]
 fn ordinary_typing_keeps_its_row_and_a_classified_boundary_restores_it() {
     let mut h = Host::new(24, 100, APP);
@@ -1770,7 +1836,7 @@ fn ordinary_typing_keeps_its_row_and_a_classified_boundary_restores_it() {
     }
 }
 
-/// A licensed insert's echo puts the hand on its row (`CursorGlow::lay_insert`). A click
+/// A licensed insert's echo puts the hand on its row (`CursorGlow::lay_insert`).
 #[test]
 fn a_licensed_insert_takes_the_hand_s_row() {
     let mut h = Host::new(24, 100, APP);
@@ -1808,7 +1874,7 @@ fn a_licensed_insert_takes_the_hand_s_row() {
     );
 }
 
-/// A recalled lay hands back the doubt it settled. After the Ctrl-R (the generic boundary)
+/// A recalled lay hands back the doubt it settled.
 #[test]
 fn a_recalled_lay_hands_back_the_row_s_doubt() {
     let mut h = Host::new(24, 100, APP);
@@ -1844,7 +1910,7 @@ fn a_recalled_lay_hands_back_the_row_s_doubt() {
     );
 }
 
-/// A row the hand put input on stays its own after the hand moves on. A click leaves the
+/// A row the hand put input on stays its own after the hand moves on.
 #[test]
 fn a_row_the_hand_put_input_on_stays_its_own_after_the_hand_moves_on() {
     for paste in [false, true] {
@@ -1896,7 +1962,7 @@ fn a_row_the_hand_put_input_on_stays_its_own_after_the_hand_moves_on() {
     }
 }
 
-/// The recall's negative control. A highlighter's redraw (the key's echo, then back to the
+/// The recall's negative control.
 #[test]
 fn a_caret_resting_right_of_the_echo_or_behind_a_key_keeps_it() {
     let mut h = Host::new(24, 100, APP);
@@ -1968,6 +2034,7 @@ fn live_cols(h: &Host, row: u16) -> Vec<u16> {
 }
 
 /// The recall's other negative controls, each walking the caret back onto the cell a key just
+/// laid with no key behind the move.
 #[test]
 fn a_keyless_walk_back_onto_a_typed_echo_keeps_it() {
     let mut bad = String::new();
@@ -2045,6 +2112,8 @@ fn a_keyless_walk_back_onto_a_typed_echo_keeps_it() {
 }
 
 /// Whatever the search's replays lit (whole, torn after every piece, or on the host's wake)
+/// retires on the normal clock: no cell is inked `IDLE_CEILING_MS` after the last key, and no
+/// replay's engine sleeps with ink on glass.
 #[test]
 fn isearch_ink_retires_within_the_idle_ceiling() {
     let mut bad = String::new();

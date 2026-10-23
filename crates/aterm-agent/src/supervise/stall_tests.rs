@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// The stall hold (`stall.rs`) over the scripted server. Included from `run_tests.rs`
-// (`mod stall_hold`), so its `Mock` and helpers are in scope.
-
 use crate::harness::resume::AfterRestart;
 
 /// The requests that write into the worker: a key, text, a turn.
@@ -71,9 +68,6 @@ fn ended_with_the_session(lines: &[String], code: u8) {
 #[test]
 fn a_frozen_worker_is_held_and_its_badge_withdrawn() {
     let mut m = box_that_sits();
-    // Read 1 is the box's program, read 2 the escalation's own stall check:
-    // the worker reads its input until then, and from the wait's first probe
-    // on it does not.
     m.input_after = vec![(2, INPUT_STALLED)];
     let (lines, code, journal) = watch_journaled(&mut m, "stall-held");
     assert!(writes(&m).is_empty(), "{:?}", m.requests);
@@ -103,13 +97,10 @@ fn a_frozen_worker_is_held_and_its_badge_withdrawn() {
 }
 
 /// The stall lifts (`input=clear`) while the box is still on screen: `THAWED …` is journaled and
-/// the box decided afresh, badged again. Nothing is pressed meanwhile.
+/// the box decided afresh, badged again.
 #[test]
 fn a_thawed_worker_has_its_point_decided_again() {
     let mut m = box_that_sits();
-    // Reading its input through the box's escalation (reads 1 and 2), stalled
-    // from the wait's first probe (read 3), clear again from its third (read
-    // 5), and the next look thaws.
     m.input_after = vec![(2, INPUT_STALLED), (4, INPUT_CLEAR)];
     let (lines, code, journal) = watch_journaled(&mut m, "stall-thawed");
     assert!(writes(&m).is_empty(), "{:?}", m.requests);
@@ -174,7 +165,7 @@ fn the_host_is_told_the_stall_it_holds_and_that_it_lifted() {
 /// A press refused `ERR busy input-unread …` (the gate fires at 1 s, the stall is published at
 /// 10 s), or written behind unread input (`OK seq=<n> warn=input-unread …`): the next look reads
 /// `status` before pressing again, and the stall published by then holds it: one press, never a
-/// second. Only the refusal is journaled `REFUSED`.
+/// second.
 #[test]
 fn a_press_refused_or_warned_input_unread_reads_status_before_it_presses_again() {
     for (tag, reply, refused) in [
@@ -195,8 +186,6 @@ fn a_press_refused_or_warned_input_unread_reads_status_before_it_presses_again()
         let mut m = fenced(vec![busy_screen(), bash_one_row()]);
         m.vanish_after = Some(4);
         m.key_replies.push_back(reply);
-        // Read 1 is the box's program; from read 2 — the look's own read
-        // after the press — the stall is published.
         m.input_after = vec![(1, INPUT_STALLED)];
         let (lines, code, journal) = watch_journaled(&mut m, tag);
         assert_eq!(writes(&m).len(), 1, "{tag}: {:?}", m.requests);
@@ -207,8 +196,6 @@ fn a_press_refused_or_warned_input_unread_reads_status_before_it_presses_again()
             refused,
             "{tag}: {journal:#?}"
         );
-        // After the press: the next look's read of the screen, and then
-        // `status` — before anything else is decided.
         let key_at = m
             .requests
             .iter()
@@ -254,8 +241,6 @@ fn a_warning_is_read_off_the_first_line_the_server_wrote() {
     );
     assert!(key.warned_input_unread(), "{key:?}");
     let turn = rendered("turn", WARNED_TURN, "row\n");
-    // The shape the transports produce: the verdict (and its warning) on
-    // stderr, stdout the rows alone.
     assert_eq!(turn.stdout, "row\n", "{turn:?}");
     assert!(turn.stderr.contains("warn=input-unread"), "{turn:?}");
     assert!(turn.warned_input_unread(), "{turn:?}");
@@ -280,9 +265,7 @@ fn a_warning_is_read_off_the_first_line_the_server_wrote() {
 }
 
 /// A warned continuation: the `status` before typing saw the worker reading, so the `turn` is
-/// typed, and the server wrote it behind unread input (`warn=` on the verdict). The wait after it
-/// reads `status` first and holds the stall published by then. Negative control: after an
-/// unwarned `turn` no `status` is read, so that stall is not seen.
+/// typed, and the server wrote it behind unread input (`warn=` on the verdict).
 #[test]
 fn a_continuation_warned_input_unread_reads_status_at_the_next_look() {
     let run = |warned: bool| {
@@ -318,7 +301,6 @@ fn a_continuation_warned_input_unread_reads_status_at_the_next_look() {
         let _ = std::fs::remove_dir_all(&dir);
         (m, lines, code, journal)
     };
-    // The requests after the one `turn`, of a run.
     let after_turn = |m: &Mock| -> Vec<String> {
         let at = m
             .requests
@@ -475,7 +457,6 @@ fn hosted_journaled(m: &mut Mock, tag: &str) -> (Vec<String>, Result<(), String>
         })
     };
     let mut out: Vec<u8> = Vec::new();
-    // Recorded and replayed, as every whole run here.
     let from = m.order.len();
     let (tape, mut taped) = memory_tape(m);
     let mut s = taped_session(&mut taped, &tape);
@@ -554,8 +535,6 @@ fn the_windows_host_raises_no_badge_over_a_worker_frozen_under_its_point() {
             "{tag}: {}",
             frozen[0]
         );
-        // Held before the wait's first step: the escalation's read and the
-        // hold's own both come before any `await seq`.
         let first_step = m
             .requests
             .iter()
@@ -587,8 +566,6 @@ fn the_windows_host_raises_no_badge_over_a_worker_frozen_under_its_point() {
 fn the_windows_host_withdraws_the_badge_of_a_worker_that_freezes_under_it() {
     let mut m = Mock::new(vec![busy_screen(), question_screen()]);
     m.vanish_after = Some(4);
-    // Read 1 is the escalation's, before its badge; from the wait's first
-    // probe (read 2) on, the stall is read.
     m.input_after = vec![(1, INPUT_STALLED)];
     let (lines, end, journal) = hosted_journaled(&mut m, "hosted-freezes");
     assert!(writes(&m).is_empty(), "{:?}", m.requests);
@@ -732,7 +709,7 @@ impl IdleHost for Relaunching {
 
 /// A frozen worker under a relaunching host with `stall_term = true` (the default warns:
 /// [`warn_run`]): `input` from the wait's first probe on, `term_after_s` the bound, `tweak` the
-/// rest. Returns the signal and restart requests and the lines said.
+/// rest.
 fn remedy_run(
     input: &'static str,
     relaunches: bool,
@@ -803,9 +780,7 @@ fn remedy_run_as(
 
 /// The default is a warning, not an end: past the bound under a relaunching host, with no hand on
 /// it, no signal but one `STALL-WARNED … ended=no` line and one record for the person naming the
-/// command that ends it, once per episode. Where the host would not carry the act the record names
-/// the resume line the host read, whole (one too long for the detail line gives its bare form,
-/// never a cut id); where the strict remedy would not act nothing is said (the Tier-1 bind below).
+/// command that ends it, once per episode.
 #[test]
 fn a_worker_frozen_past_the_bound_is_warned_about_and_left_running() {
     assert!(!SupervisorConfig::default().stall_term, "the default warns");
@@ -856,8 +831,7 @@ fn a_worker_frozen_past_the_bound_is_warned_about_and_left_running() {
 
 /// With `stall_term`, a worker frozen past `[harness] stall_term_after_s` under a relaunching host
 /// with no hand on it gets `restart pid=<agent> if-stalled quiet=<grace>` (said `RESTARTED …`)
-/// once, and never a `signal kill` of the loop's. Negative control: a lease on the session sends
-/// no signal.
+/// once, and never a `signal kill` of the loop's.
 #[test]
 fn a_worker_frozen_past_the_bound_is_ended_for_its_relaunch() {
     let default = SupervisorConfig::default().stall_term_after_s;
@@ -876,8 +850,6 @@ fn a_worker_frozen_past_the_bound_is_ended_for_its_relaunch() {
         said[0]
     );
 
-    // Negative control: a lease on the session. (The bound, the switch, the
-    // host, a person's hand and a stopped job are the Tier-1 bind's, below.)
     let (signals, lines) = remedy_run(INPUT_STALLED_LONG, true, default, |m| {
         m.hand = "lease:@s-7";
     });
@@ -937,7 +909,6 @@ fn the_remedy_is_the_servers_restart_and_its_refusals_decide() {
         "the warning names what a person can do: {}",
         informed[0]
     );
-    // A server without the verb: `ERR unknown verb`, or `ERR denied` for a verb aimed at a session.
     for older in ["unknown verb (try: help)", "denied"] {
         let (signals, lines) = remedy_run(INPUT_STALLED_LONG, true, default, |m| {
             m.restart_replies.push_back(err(older));
@@ -955,16 +926,13 @@ fn the_remedy_is_the_servers_restart_and_its_refusals_decide() {
 /// Tier-1 of `SupervisorStallRemedy` (aterm-spec `supervisor_stall_remedy_model`): in every
 /// configuration the model reaches with no term sent, the real loop sends the explicit restart
 /// exactly where `Term` is enabled, once per episode (`Thaw` starts a new one), and the default
-/// warning takes the same gate. Negative control: where the `Buggy = 1` model acts under a hand
-/// or kills after the act, the loop sends nothing, or one restart (a survivor's SIGKILL is the
-/// server's).
+/// warning takes the same gate.
 #[test]
 fn tier1_the_real_remedy_signals_exactly_where_the_model_terms() {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     let m = aterm_models_harness::supervisor_stall_remedy_model();
     let mut seen = BTreeSet::new();
     let mut queue = VecDeque::from([m.init_state()]);
-    // (stalled, aged, off, hand, host, beside, rest) → the model terms there.
     let mut configs = BTreeMap::new();
     while let Some(st) = queue.pop_front() {
         if !seen.insert(st.clone()) {
@@ -1029,7 +997,6 @@ fn tier1_the_real_remedy_signals_exactly_where_the_model_terms() {
             "stalled={stalled} aged={aged} off={off} hand={hand} host={host} beside={beside} \
              rest={rest}: {lines:#?}"
         );
-        // The default takes the same gate: never a signal, one warning exactly where `Term` is.
         let (signals, lines, informed) = run(false);
         let warned = lines
             .iter()
@@ -1043,7 +1010,6 @@ fn tier1_the_real_remedy_signals_exactly_where_the_model_terms() {
              rest={rest}: {lines:#?}"
         );
     }
-    // A new episode (thawed, frozen again) gets its own term: the model's `Thaw` forgets it.
     let mut st = m.init_state();
     for action in ["Freeze", "Age", "Term", "Thaw", "Freeze", "Age"] {
         assert!(m.fire(action, &mut st), "{action} at {st:?}");
@@ -1059,7 +1025,6 @@ fn tier1_the_real_remedy_signals_exactly_where_the_model_terms() {
     });
     assert_eq!(signals, [RESTART, RESTART], "{lines:#?}");
 
-    // Negative controls: where the Buggy model signals, the real loop does not.
     let buggy = aterm_spec::interp::with_buggy(&m, 1);
     let mut st = buggy.init_state();
     for action in ["HandOn", "Freeze", "Age"] {
@@ -1085,9 +1050,6 @@ fn tier1_the_real_remedy_signals_exactly_where_the_model_terms() {
         buggy.action_enabled("WaitsForTheRest", &st),
         "a remedy that waits on the record"
     );
-    // The real loop beside a self-claim whose record never rests (a TUI
-    // frozen mid-turn) restarts it all the same: the mutant's wait is not
-    // the code's (the review of 2026-10-16).
     let (signals, ..) = beside_remedy_run(INPUT_STALLED_LONG, true, 600, true, false, |_| {});
     assert_eq!(signals, [RESTART], "beside, its record busy");
 }
@@ -1205,9 +1167,7 @@ fn beside_remedy_run(
 /// agent's record is never read for an idle point (a TUI that stopped
 /// reading its input mid-turn keeps a record that says `busy` for ever; the
 /// review of 2026-10-16), so a record naming no idle point is
-/// restarted too. NEGATIVE CONTROL: behind another supervisor's claim (`ERR
-/// busy supervisor=<holder>`) the same freeze gets none — that supervisor
-/// answers for the session.
+/// restarted too.
 #[test]
 fn beside_a_proven_self_claim_the_stalls_remedy_stands_and_nothing_is_typed() {
     let default = SupervisorConfig::default().stall_term_after_s;
@@ -1267,9 +1227,6 @@ fn beside_a_proven_self_claim_the_stalls_remedy_stands_and_nothing_is_typed() {
     let (remedies, _, typed, _, lines) = run(false);
     assert!(remedies.is_empty(), "behind another holder: {lines:#?}");
     assert_eq!(typed, 0, "{lines:#?}");
-    // Beside, the agent's record names no idle point (frozen mid-turn): the
-    // stall alone decides — restarted once, nothing typed, the record never
-    // asked.
     let (remedies, claims, typed, _, lines, idle_reads) = run_idle(true, false);
     assert_eq!(remedies, [RESTART], "frozen mid-turn: {lines:#?}");
     assert!(claims.is_empty(), "{claims:?}");
@@ -1305,17 +1262,11 @@ const MEMORY_RESTART: &str = "restart pid=4242 quiet=120";
 /// Mac in trouble, this agent the largest) gets aterm's explicit restart
 /// once — the server stamps it and sends `SIGTERM`, and the host's crash
 /// rule relaunches the validated line — and nothing is typed or claimed.
-/// NEGATIVE CONTROLS: the record naming no idle point gets none (asked
-/// again at each step); `[harness] relaunch = false` gets none; a measure
-/// with memory to spare (a warning only) gets none; and a loop with no
-/// self-claim beside it never sends the explicit restart (its own policy
-/// asks its host at its points).
 #[test]
 fn beside_a_proven_self_claim_the_memory_restart_waits_for_the_records_idle_point() {
     use crate::supervise::memory::AgentMemory;
     let run = |beside: bool, idle: bool, memory: AgentMemory, relaunch: bool| {
         let mut m = box_that_sits();
-        // This scripted screen is unchanged between fresh memory reads.
         m.key_gates.push((1, usize::MAX));
         let host = Beside::new(idle, Some(memory));
         let asked = Arc::clone(&host);
@@ -1365,12 +1316,8 @@ fn beside_a_proven_self_claim_the_memory_restart_waits_for_the_records_idle_poin
     assert!(idle_reads >= 2, "asked again at each step: {idle_reads}");
     let (remedies, ..) = run(true, true, trouble, false);
     assert!(remedies.is_empty(), "relaunch off: no restart");
-    // A busy record between eligible samples clears the observation. This
-    // scripted loop uses a zero window; the virtual-clock regression below
-    // covers the shipping elapsed-time minimum separately.
     let (remedies, _, typed, lines, idle_reads) = {
         let mut m = box_that_sits();
-        // This scripted screen is unchanged between fresh memory reads.
         m.key_gates.push((1, usize::MAX));
         m.vanish_after = Some(8);
         let host = Arc::new(Beside {
@@ -1414,20 +1361,12 @@ fn beside_a_proven_self_claim_the_memory_restart_waits_for_the_records_idle_poin
 /// UNDER A PERSON'S HOLD BESIDE A PROVEN SELF-CLAIM (CONTRACT §2 as amended
 /// 2026-10-16: codex-alab KEEPS its claim under a hold and acts on nothing):
 /// the watch-only loop keeps running beside it — it claims nothing and types
-/// nothing — and aterm's remedies keep standing. The stall's explicit restart
-/// (on the stall alone) and the memory ceiling's (at the agent's record's
-/// rest) are asked of the server, which refuses them under the halt (`ERR
-/// halted`) — or under a driver's lease or turn (`restart unavailable:
-/// driver-lease|driver-turn`, the review of 2026-10-16) —
-/// UNCOUNTED: each is asked again at the next step and made once the hand
-/// lifts. NEGATIVE CONTROL: a refusal that never lifts (`restart
-/// unavailable: not-relaunchable`) is counted — one ask, never again.
+/// nothing — and aterm's remedies keep standing.
 #[test]
 fn under_a_hold_beside_a_proven_self_claim_the_remedies_stand_and_nothing_is_typed() {
     let halted = || err("halted reason=owner origin=local");
     let run = |memory: bool, replies: Vec<CtlReply>| {
         let mut m = box_that_sits();
-        // This scripted screen is unchanged between fresh memory reads.
         m.key_gates.push((1, usize::MAX));
         m.vanish_after = Some(8);
         m.hold = "1";
@@ -1481,8 +1420,6 @@ fn under_a_hold_beside_a_proven_self_claim_the_remedies_stand_and_nothing_is_typ
             1,
             "memory={memory}: {lines:#?}"
         );
-        // A driver's lease or turn is another hand the next read may lift:
-        // uncounted too, never the remedy's end for this process.
         let (remedies, _, typed, lines) = run(
             memory,
             vec![
@@ -1496,7 +1433,6 @@ fn under_a_hold_beside_a_proven_self_claim_the_remedies_stand_and_nothing_is_typ
             "memory={memory}: asked again through a lease and a turn: {lines:#?}"
         );
         assert_eq!(typed, 0, "{lines:#?}");
-        // NEGATIVE CONTROL: a refusal no later read lifts is counted.
         let (remedies, _, typed, lines) =
             run(memory, vec![err("restart unavailable: not-relaunchable")]);
         assert_eq!(remedies, [act], "memory={memory}: once: {lines:#?}");
@@ -1504,8 +1440,7 @@ fn under_a_hold_beside_a_proven_self_claim_the_remedies_stand_and_nothing_is_typ
     }
 }
 
-/// A review whose attendance can change between samples. Every effect stays
-/// inside this injected server and host; the restart is only a recorded request.
+/// A review whose attendance can change between samples.
 struct IdleMemoryReview {
     unattended: bool,
 }
@@ -1643,8 +1578,6 @@ fn a_beside_memory_restart_rechecks_the_current_screen_sequence() {
     let first = Instant::now();
     s.beside_memory_remedy_at(actionable_memory(), 7, || first, &opts, &mut review)
         .expect("first idle observation");
-    // The enclosing wait still carries its original Turn. The actual reader
-    // now has a different sequence, including a replacement's reset sequence.
     for current in [8, 1] {
         s.ctl.verb_replies.insert("text", memory_text_at(current));
         s.beside_memory_remedy_at(

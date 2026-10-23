@@ -67,15 +67,19 @@ pub(crate) struct Notice<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct NoticeCenter {
     /// What macOS has said ([`Center`]), read fresh: a bounded wait for the
+    /// center's settings, on the thread that asks.
     #[cfg(target_os = "macos")]
     answer: fn() -> Center,
     /// Hand one notice to the center; `false` when it could not be.
     #[cfg(target_os = "macos")]
     post: fn(&Notice<'_>) -> bool,
     /// Ask macOS to let aterm post as itself, where it has not been asked
+    /// yet, then call `then` (on another thread) once it has answered; a
+    /// `then` dropped uncalled is an ask that could not be made.
     #[cfg(target_os = "macos")]
     ask: fn(Box<dyn FnOnce() + Send>),
     /// Become the center's delegate, so a click comes back (main thread;
+    /// once per process, and only once a read has opened the center).
     #[cfg(target_os = "macos")]
     adopt_clicks: fn(),
 }
@@ -162,6 +166,7 @@ fn inert_post(_notice: &Notice<'_>) -> bool {
 }
 
 /// The inert ask: macOS is not asked, and `then` is dropped uncalled (there
+/// is no answer to read again).
 #[cfg(target_os = "macos")]
 fn inert_ask(_then: Box<dyn FnOnce() + Send>) {
     #[cfg(test)]
@@ -184,6 +189,8 @@ pub(crate) fn take_asks() -> u32 {
 }
 
 /// THE PROTOTYPES the notices state for UserNotifications, named so a test
+/// can hold each to the runtime's own record without the center
+/// (`tests::every_prototype_the_notices_state_is_the_runtimes`).
 #[cfg(target_os = "macos")]
 mod abi {
     use aterm_objc::{BlockPtr, Bool, Id, Sel};
@@ -217,6 +224,7 @@ const FRAMEWORK: &std::ffi::CStr =
     c"/System/Library/Frameworks/UserNotifications.framework/UserNotifications";
 
 /// Load UserNotifications, so its classes register with the runtime; `false`
+/// when it would not load.
 #[cfg(target_os = "macos")]
 fn open_framework() -> bool {
     use std::ffi::{c_char, c_int, c_void};
@@ -224,6 +232,8 @@ fn open_framework() -> bool {
         fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void;
     }
     /// `<dlfcn.h>` on Darwin: bind on first use, keep the framework's C
+    /// symbols out of the global namespace (its classes register with the
+    /// runtime regardless).
     const RTLD_LAZY: c_int = 0x1;
     const RTLD_LOCAL: c_int = 0x4;
     // SAFETY: a NUL-terminated path and a valid mode.
@@ -235,14 +245,19 @@ fn open_framework() -> bool {
 const SESSION_KEY: &str = "aterm.session";
 
 /// The `userInfo` key naming the process that posted the notice: a decimal
+/// pid.
 #[cfg(target_os = "macos")]
 const PID_KEY: &str = "aterm.pid";
 
 /// The existing opaque identity of the exact process that posted the notice
+/// (`control_auth::process_instance_id`), retained with it across PID reuse.
 #[cfg(target_os = "macos")]
 const INSTANCE_KEY: &str = "aterm.instance";
 
 /// A notice's `userInfo`: this process's pid ([`PID_KEY`]) and opaque
+/// incarnation ([`INSTANCE_KEY`]) and, for a notice about a tab, its session
+/// ([`SESSION_KEY`]), each a decimal string — what the live arm's post writes
+/// and the delegate reads back ([`clicks`]).
 #[cfg(target_os = "macos")]
 fn user_info(session: Option<u64>) -> Option<aterm_objc::Id> {
     use aterm_objc::{Id, Obj, checked_msg, class, sel};
@@ -292,12 +307,16 @@ mod live {
     use super::{Center, Notice, abi};
 
     /// What aterm asks to post: `UNAuthorizationOptionAlert`
+    /// (`UNUserNotificationCenter.h`: badge `1 << 0`, sound `1 << 1`, alert
+    /// `1 << 2`).
     const ASK_OPTIONS: usize = 1 << 2;
 
     /// How long a read of the center's settings may take before the last
+    /// answer stands.
     const ANSWER_WAIT: Duration = Duration::from_secs(5);
 
     /// The center, opened once per process ([`open_center`]): its address,
+    /// retained for the process, or `None` where there is none.
     static CENTER: OnceLock<Option<usize>> = OnceLock::new();
 
     /// The last answer read, which stands while a fresh read times out.
@@ -307,6 +326,7 @@ mod live {
     static ADOPTED: AtomicBool = AtomicBool::new(false);
 
     /// Each request's identifier is this process's and unique, so no notice
+    /// replaces another.
     static NEXT_REQUEST: AtomicU64 = AtomicU64::new(0);
 
     fn at(addr: usize) -> Id {
@@ -314,11 +334,14 @@ mod live {
     }
 
     /// The center, opening it on first use: not on the event loop, since
+    /// [`crate::signing_identity::running_bundle_id`] may read the signing
+    /// identity there.
     fn center() -> Option<Id> {
         (*CENTER.get_or_init(open_center)).map(at)
     }
 
     /// Open the center where this process may: windowed, run from an app
+    /// bundle both aterm and Foundation can name, and the framework loads.
     fn open_center() -> Option<usize> {
         if crate::menu::process_is_headless()
             || crate::signing_identity::running_bundle_id().is_none()
@@ -589,6 +612,11 @@ mod live {
 }
 
 /// The center's delegate and what it reads off a response: declared in a test
+/// build too, where a test reads the encodings it registered against the
+/// protocol's (`tests::every_prototype_the_notices_state_is_the_runtimes`)
+/// and sends it a click and a presentation built of stand-ins
+/// (`tests::a_click_on_a_notice_goes_to_its_session`,
+/// `tests::a_notice_shows_while_aterm_is_in_front`).
 #[cfg(target_os = "macos")]
 mod clicks {
     use aterm_objc::send::{send_bool_cls, send_id, send_id_id};
@@ -597,6 +625,8 @@ mod clicks {
     use super::{INSTANCE_KEY, PID_KEY, SESSION_KEY, abi};
 
     /// How a notice shows while aterm is the active app:
+    /// `UNNotificationPresentationOptionList | Banner` (`1 << 3`, `1 << 4`;
+    /// no sound, as aterm asks for none).
     const PRESENT_OPTIONS: usize = (1 << 3) | (1 << 4);
 
     aterm_objc::declare_class! {
@@ -607,6 +637,7 @@ mod clicks {
             protocols: [NSObject, UNUserNotificationCenterDelegate];
 
             /// The owner answered a notice: go to its session if it was a
+            /// click on one of this process's, then tell the center.
             @sel(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:)
             fn did_receive(&self, _center: Id, response: Id, done: BlockPtr) {
                 if let Some(session) = clicked(response) {
@@ -626,6 +657,8 @@ mod clicks {
     }
 
     /// The session a response goes to ([`super::clicked_session`]), read off
+    /// `response.actionIdentifier` and
+    /// `response.notification.request.content.userInfo`.
     fn clicked(response: Id) -> Option<u64> {
         if response.is_null() {
             return None;
@@ -678,6 +711,8 @@ mod tests {
     use super::{Center, DEFAULT_ACTION, clicked_session, status_answer};
 
     /// A CLICK GOES TO THE SESSION ITS NOTICE NAMES, and only a click on one
+    /// this process posted: the default action with this pid and a session
+    /// routes there.
     #[test]
     fn a_response_routes_to_the_session_its_notice_names() {
         let own = 4242;
@@ -722,6 +757,8 @@ mod tests {
     }
 
     /// macOS's authorization status, read: not determined is the ask
+    /// Notify Me makes, denied a refusal, and the three statuses macOS
+    /// delivers under each a grant.
     #[test]
     fn macos_answers_read_as_ask_refuse_or_grant() {
         assert_eq!(status_answer(0), Center::Unasked);
@@ -735,6 +772,8 @@ mod tests {
     }
 
     /// A unit test's center is inert whatever it is asked for: a windowed
+    /// instance's arms are not even compiled into a test build, so the
+    /// center reads absent, posts nothing, and an ask is only counted.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_test_build_never_reaches_the_notification_center() {
@@ -757,6 +796,8 @@ mod tests {
     }
 
     /// EVERY PROTOTYPE THE NOTICES STATE IS THE RUNTIME'S, read without the
+    /// center: the live arms run only in a bundle, where no test reaches them,
+    /// and a release build checks no send at the call.
     #[cfg(target_os = "macos")]
     #[test]
     fn every_prototype_the_notices_state_is_the_runtimes() {
@@ -993,6 +1034,10 @@ mod tests {
     }
 
     /// THE DELEGATE'S CLASS, claiming the host's
+    /// `UNUserNotificationCenterDelegate`, with that protocol: the protocol
+    /// must be the host's before the class claims it, or the claim registers a
+    /// stand-in with no rows that every later reader sees, so each test that
+    /// declares the class asks here first.
     #[cfg(target_os = "macos")]
     fn delegate_class() -> (aterm_objc::ProtocolPtr, aterm_objc::ClassPtr) {
         use aterm_objc::ClassType as _;
@@ -1007,6 +1052,11 @@ mod tests {
     }
 
     /// Stand-ins for what macOS hands the delegate: a response
+    /// (`UNNotificationResponse`) for the notice it answers (`UNNotification`)
+    /// for its request (`UNNotificationRequest`) for its content
+    /// (`UNNotificationContent`), each an `NSObject` subclass made at run time
+    /// that answers only the selectors the delegate reads off that link, with
+    /// the runtime's `-(id)` encoding.
     #[cfg(target_os = "macos")]
     mod stand_ins {
         use aterm_objc::{Id, Obj, Retained};
@@ -1084,6 +1134,7 @@ mod tests {
     }
 
     /// The `userInfo` a post writes for `session` ([`super::user_info`]),
+    /// owned.
     #[cfg(target_os = "macos")]
     fn posted_info(session: Option<u64>) -> Option<aterm_objc::Obj> {
         aterm_objc::autoreleasepool(|_| {
@@ -1093,6 +1144,11 @@ mod tests {
     }
 
     /// A CLICK ON ONE OF aterm's NOTICES GOES TO ITS SESSION, through the
+    /// real delegate: `-userNotificationCenter:didReceiveNotificationResponse:
+    /// withCompletionHandler:` sent to a `NoticeDelegate`, with a response
+    /// built of stand-ins ([`stand_ins`]) around the very `userInfo` a post
+    /// writes ([`super::user_info`]) and a real block for the completion
+    /// handler.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_click_on_a_notice_goes_to_its_session() {
@@ -1102,6 +1158,7 @@ mod tests {
         use aterm_objc::{BlockPtr, Id, RcBlock, Sel, checked_msg, sel};
 
         /// The delegate row's prototype (the prototype test holds the class's
+        /// encoding to the protocol's).
         type DidReceive = unsafe extern "C-unwind" fn(Id, Sel, Id, Id, BlockPtr);
 
         let _ = delegate_class();
@@ -1157,6 +1214,12 @@ mod tests {
     }
 
     /// A NOTICE THAT ARRIVES WHILE aterm IS IN FRONT STILL SHOWS, through the
+    /// real delegate's `-userNotificationCenter:willPresentNotification:
+    /// withCompletionHandler:`, with a stand-in notice about a tab and a real
+    /// block: the handler is handed List | Banner
+    /// (`UNNotificationPresentationOptions`, `1 << 3 | 1 << 4`: no sound, no
+    /// badge), exactly once, and the presentation goes to no tab, since it is
+    /// not a click.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_notice_shows_while_aterm_is_in_front() {

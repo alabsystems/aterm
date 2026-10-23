@@ -172,6 +172,7 @@ impl Paths {
     }
 
     /// The state dir, or the refusal of a relative `$LAB_STATE`: a check that
+    /// makes nothing.
     fn state_named(&self) -> Result<&Path, String> {
         match &self.state_relative {
             Some(s) => Err(format!(
@@ -291,6 +292,8 @@ impl Paths {
 }
 
 /// The aterm a new lab tests, and why `$LAB_ATERM` was not taken: `$LAB_ATERM`,
+/// else the `aterm` beside this program, else this checkout's debug build,
+/// else its release build.
 fn find_aterm(exe: &Path, repo: &Path) -> (Option<PathBuf>, Option<String>) {
     if let Some(a) = std::env::var_os("LAB_ATERM").filter(|a| !a.is_empty()) {
         let a = PathBuf::from(a);
@@ -481,6 +484,7 @@ pub fn guarded(account: &str, caller: &str) -> Vec<String> {
 }
 
 /// A home fence must name an existing physical directory exactly, never a
+/// lossy replacement of its name or the whole filesystem.
 fn home_path(path: Option<&Path>) -> String {
     path.filter(|p| p.is_absolute() && *p != Path::new("/") && p.to_str().is_some())
         .and_then(|p| std::fs::canonicalize(p).ok())
@@ -573,6 +577,8 @@ mod tests {
     }
 
     /// The homes a lab guards are a superset, never a narrowing: the
+    /// account's first, then the caller's `HOME` when it names another, each
+    /// once, an unknown one left out.
     #[test]
     fn the_guarded_homes_are_the_account_s_and_home_s_each_once() {
         assert_eq!(guarded("/Users//o", "/tmp/s"), ["/Users//o", "/tmp/s"]);
@@ -583,6 +589,9 @@ mod tests {
     }
 
     /// THE ACCOUNT'S HOME IS RESOLVED FROM THE ACCOUNT DATABASE, NOT `HOME`: a
+    /// fake account home handed in through the seam ([`Paths::resolve_with`])
+    /// is guarded beside a scratch `HOME`, by its physical path, and is the
+    /// package store's home.
     #[test]
     fn a_fake_account_home_is_guarded_beside_a_scratch_home() {
         let top = aterm_tempfile::Builder::new()
@@ -628,6 +637,10 @@ mod tests {
     }
 
     /// THE LAB'S OWN FACTS ([`paths`]) TAKE THE ACCOUNT'S HOME FROM THE
+    /// ACCOUNT DATABASE: whatever `HOME` the test runs under (a scratch one,
+    /// by this repository's rule, or the account's own), `real_home` is the
+    /// home `getpwuid_r` names, by its physical path; it is guarded, holds the
+    /// store, and `caller_home` is `HOME`'s.
     #[test]
     fn the_lab_s_own_paths_take_the_account_home_from_the_account_database() {
         let want = home_path(aterm_uds::account::home().as_deref());
@@ -652,6 +665,9 @@ mod tests {
     }
 
     /// THE DEFAULT STATE DIR SITS OUTSIDE EVERY HOME, SHORT AND PER CHECKOUT:
+    /// `/private/tmp/at.lab-<uid>/<name>-<hash>`, the name the checkout's own
+    /// in safe letters (at most 16), the hash its whole path's, so two
+    /// worktrees of one name differ; the longest is 56 bytes.
     #[test]
     fn the_default_state_sits_outside_every_home_short_and_per_checkout() {
         let a = default_state(501, Path::new("/Users//o/Developer/aterm"));
@@ -714,6 +730,8 @@ mod tests {
     }
 
     /// THE DEFAULT STATE DIR IS MADE THIS USER'S PRIVATE DIRECTORY: its root
+    /// and its own directory are made 0700, and a looser root of this user's
+    /// is narrowed.
     #[test]
     fn the_default_state_is_made_private_and_a_squatted_root_is_refused() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -758,6 +776,11 @@ mod tests {
     }
 
     /// THE STATE DIR A VERB MAKES THINGS IN IS MADE PRIVATE FIRST, whichever
+    /// verb asks ([`Paths::need_state`]): `fleet-sim` skips the lab's
+    /// up-front check and writes its record under `need_state()`, so a link
+    /// planted at the default's root in the shared `/private/tmp` is refused
+    /// there and nothing is made through it, and a fresh default comes back
+    /// made, mode 0700.
     #[test]
     fn the_state_a_verb_makes_things_in_is_made_private_first() {
         let t = tree("need");
@@ -791,6 +814,8 @@ mod tests {
     }
 
     /// A STATE DIR INSIDE A FENCED HOME IS REFUSED: in the account's home,
+    /// in a scratch `HOME`, the home itself, and a path outside that leads in
+    /// by a link, each naming the home and the default.
     #[test]
     fn a_state_dir_inside_a_home_is_refused_and_one_outside_goes_through() {
         let t = tree("inside");

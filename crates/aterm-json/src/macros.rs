@@ -14,6 +14,13 @@
 /// });
 /// assert_eq!(body.get("stream").and_then(aterm_json::Value::as_bool), Some(false));
 /// ```
+/// let body = aterm_json::json!({
+///     "model": "qwen",
+///     "messages": [{"role": "user", "content": "hi"}],
+///     "stream": false,
+///     "options": {"temperature": 0},
+/// });
+/// assert_eq!(body.get("stream").and_then(aterm_json::Value::as_bool), Some(false));
 ///
 /// `null`, `true` and `false` are recognised as JSON literals; `[...]` and
 /// `{...}` nest; anything else is a Rust expression, converted through

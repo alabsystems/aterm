@@ -2,16 +2,7 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A theme's typography (DTP §3.1): the font families and the numeric and
-//! boolean type knobs a theme file may name, and the value readers the theme
-//! parser uses for them.
-//!
-//! A theme names families and knobs, never a font file, a path or a pixel
-//! size ([`parse_font_name`] refuses anything path-like), and every field is
-//! optional: `None` means "leave the setting alone", so the aterm.toml key of
-//! the same name, then aterm's default, decides it. Numbers are held in fixed
-//! point (thousandths) so the type is `Eq`: the catalog compares theme
-//! catalogs with `==`.
+//! A theme's typography (DTP §3.1).
 
 use crate::scheme::{THEME_KEYS, ThemeKey, ThemeKeyGroup, theme_key_spec};
 
@@ -21,18 +12,14 @@ pub const MAX_THEME_FONT_NAME_CHARS: usize = 128;
 pub const MAX_THEME_FONT_LIST: usize = 8;
 /// Most feature specs a theme's `font_features` may carry.
 pub const MAX_THEME_FEATURES: usize = 16;
-/// The theme format's schema version this aterm writes and reads in full. A
-/// file whose `schema` is newer loads with the keys this aterm does not know
-/// skipped and listed; every key it does know stays strict.
+/// The theme format's schema version this aterm writes and reads in full.
 pub const THEME_SCHEMA_VERSION: u16 = 1;
-/// Most unknown key names a newer-schema file's admission records (the count
-/// is kept in full).
+/// Most unknown key names a newer-schema file's admission records (the count is kept in full).
 pub const MAX_SKIPPED_THEME_KEYS: usize = 16;
 /// Longest recorded unknown key name, in bytes (cut at a char boundary).
 pub const MAX_SKIPPED_THEME_KEY_BYTES: usize = 64;
 
-/// A theme's typography (DTP §3.1): every field optional; `None` means
-/// "don't touch it" (the aterm.toml key, else aterm's default, decides).
+/// A theme's typography: every field optional; `None` means "don't touch it".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ThemeTypography {
     /// The regular face's family.
@@ -43,8 +30,7 @@ pub struct ThemeTypography {
     pub font_family_italic: Option<String>,
     /// The bold-italic face's family.
     pub font_family_bold_italic: Option<String>,
-    /// Families tried, in order, for a character the primary face lacks:
-    /// `1..=`[`MAX_THEME_FONT_LIST`] entries.
+    /// Families tried, in order, for a character the primary face lacks.
     pub fallback_fonts: Option<Vec<String>>,
     /// The family for symbols and Nerd Font icons.
     pub symbol_font: Option<String>,
@@ -54,15 +40,13 @@ pub struct ThemeTypography {
     pub line_height_milli: Option<u16>,
     /// Whether programming ligatures are drawn.
     pub ligatures: Option<bool>,
-    /// OpenType feature specs (`calt`, `-liga`, `ss01=2`), one per entry:
-    /// `1..=`[`MAX_THEME_FEATURES`] entries.
+    /// OpenType feature specs, one per entry: `1..=`[`MAX_THEME_FEATURES`] entries.
     pub font_features: Option<Vec<String>>,
     /// Whether a missing bold or italic face is synthesized.
     pub font_synthetic_style: Option<bool>,
     /// The regular face's weight (`1..=1000`, 400 regular).
     pub font_weight: Option<u16>,
-    /// The text size scale in thousandths (`800..=1250`): it multiplies the
-    /// default (or explicit) font size without making it explicit.
+    /// The text size scale in thousandths (`800..=1250`).
     pub font_size_scale_milli: Option<u16>,
 }
 
@@ -91,8 +75,7 @@ impl ThemeTypography {
         *self == Self::NONE
     }
 
-    /// Whether this sets `key` (always `false` for a key outside the
-    /// typography group).
+    /// Whether this sets `key` (always `false` for a key outside the typography group).
     #[inline]
     #[must_use]
     pub const fn is_set(&self, key: ThemeKey) -> bool {
@@ -135,8 +118,7 @@ impl ThemeTypography {
         }
     }
 
-    /// Fill every field this leaves unset from `other` (a field set here
-    /// stays).
+    /// Fill every field this leaves unset from `other` (a field set here stays).
     pub fn fill_from(&mut self, other: &Self) {
         fn fill<T: Clone>(slot: &mut Option<T>, other: &Option<T>) {
             if slot.is_none() {
@@ -164,9 +146,7 @@ impl ThemeTypography {
         );
     }
 
-    /// `key`'s value as a theme file writes it (`1.15`, `true`,
-    /// `calt, ss02`), or `None` when unset or not a typography key. What
-    /// the native writer emits and the parser reads back to the same value.
+    /// `key`'s value as a theme file writes it, or `None` when unset or not a typography key.
     #[must_use]
     pub fn value_text(&self, key: ThemeKey) -> Option<String> {
         let list = |items: &Vec<String>| items.join(", ");
@@ -189,8 +169,7 @@ impl ThemeTypography {
         }
     }
 
-    /// The canonical keys this sets, in [`THEME_KEYS`] order (for listings,
-    /// accessibility and provenance).
+    /// The canonical keys this sets, in [`THEME_KEYS`] order.
     #[must_use]
     pub fn keys(&self) -> Vec<&'static str> {
         THEME_KEYS
@@ -200,17 +179,13 @@ impl ThemeTypography {
             .collect()
     }
 
-    /// One line for listings and cards: `Berkeley Mono · 1.15× · no
-    /// ligatures`, or `None` when this sets nothing. The family, line height,
-    /// size scale, ligatures and weight are named; any other key set counts
-    /// toward a closing `+N more`.
+    /// One line for listings and cards.
     #[must_use]
     pub fn summary(&self) -> Option<String> {
         self.phrases(false)
     }
 
-    /// [`Self::summary`] in words for a screen reader: `sets font Berkeley
-    /// Mono, line height 1.15, no ligatures` (no `×` or `·` glyphs).
+    /// [`Self::summary`] in words for a screen reader.
     #[must_use]
     pub fn spoken(&self) -> Option<String> {
         self.phrases(true)
@@ -279,8 +254,7 @@ impl ThemeTypography {
     }
 }
 
-/// A thousandths value as the shortest decimal that reads back to it:
-/// `1150` is `1.15`, `1000` is `1.0`, `1005` is `1.005`.
+/// A thousandths value as the shortest decimal that reads back to it.
 #[must_use]
 pub fn milli_text(milli: u16) -> String {
     let mut out = (milli / 1000).to_string();
@@ -308,16 +282,9 @@ pub fn milli_text(milli: u16) -> String {
 pub const FONT_NAME_IS_PATH: &str =
     "font_family names a family, not a file: a theme cannot point at a path";
 
-/// Read one family name. Fail-closed: a theme never names a file, so a value
-/// that is empty, longer than [`MAX_THEME_FONT_NAME_CHARS`], carries a
-/// control character, contains `/` or `\`, starts with `~` or `.`, starts
-/// with a drive letter (`C:`), or ends in a font file extension is refused.
-/// `display:<id>[+<id>]` is a family (the renderer's embedded faces), not a
-/// path, so it is accepted.
-///
+/// Read one family name.
 /// # Errors
 /// The reason, for the parser to place at the key's line.
-// Skip: char iteration and case folding drive absent std bodies; every malformed value is refused (fail-closed).
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn parse_font_name(value: &str) -> Result<String, String> {
     let name = value.trim();
@@ -353,12 +320,9 @@ pub fn parse_font_name(value: &str) -> Result<String, String> {
     Ok(name.to_string())
 }
 
-/// Read a comma-separated list of family names: `1..=`[`MAX_THEME_FONT_LIST`]
-/// entries, none empty, each by [`parse_font_name`].
-///
+/// Read a comma-separated list of family names.
 /// # Errors
 /// The reason, for the parser to place at the key's line.
-// Skip: split/collect drive absent std bodies; every malformed value is refused (fail-closed).
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn parse_font_list(value: &str) -> Result<Vec<String>, String> {
     let mut names = Vec::new();
@@ -378,7 +342,6 @@ pub fn parse_font_list(value: &str) -> Result<Vec<String>, String> {
 }
 
 /// Read `true` or `false`, case-insensitive.
-///
 /// # Errors
 /// The reason, for the parser to place at the key's line.
 pub fn parse_flag(value: &str) -> Result<bool, String> {
@@ -404,14 +367,9 @@ fn range_text(min: &str, max: &str) -> String {
     out
 }
 
-/// Read a decimal with at most three fraction digits as thousandths, by
-/// integer arithmetic only: digits, optionally `.` and 1-3 more digits. No
-/// sign, exponent, `inf` or `nan`. A value outside `[min, max]` (thousandths)
-/// is refused with the range in the reason.
-///
+/// Read a decimal with at most three fraction digits as thousandths, by integer arithmetic only.
 /// # Errors
 /// The reason, for the parser to place at the key's line.
-// Skip: byte iteration and checked arithmetic over absent std bodies; every malformed value is refused (fail-closed).
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn parse_milli(value: &str, min: u16, max: u16) -> Result<u16, String> {
     let text = value.trim();
@@ -456,10 +414,8 @@ pub fn parse_milli(value: &str, min: u16, max: u16) -> Result<u16, String> {
 }
 
 /// Read a whole number in `[min, max]`: digits only, no sign.
-///
 /// # Errors
 /// The reason, for the parser to place at the key's line.
-// Skip: byte iteration and checked arithmetic over absent std bodies; every malformed value is refused (fail-closed).
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn parse_integer(value: &str, min: u16, max: u16) -> Result<u16, String> {
     let text = value.trim();
@@ -486,11 +442,7 @@ pub fn parse_integer(value: &str, min: u16, max: u16) -> Result<u16, String> {
     }
 }
 
-/// Whether `spec` is one OpenType feature spec a theme may carry: `tag`,
-/// `+tag`, `-tag` or `tag=N` (`N` ≤ 65535), the tag 1-4 ASCII
-/// alphanumerics. Every spec this accepts, the renderer's feature reader
-/// (`aterm_types::text_shaping::FontFeature::parse_token`) accepts too.
-// Skip: byte iteration over absent std bodies; every malformed spec is refused (fail-closed).
+/// Whether `spec` is one OpenType feature spec a theme may carry.
 #[cfg_attr(trust_verify, trust::skip)]
 #[must_use]
 pub fn is_feature_spec(spec: &str) -> bool {
@@ -510,13 +462,9 @@ pub fn is_feature_spec(spec: &str) -> bool {
     }
 }
 
-/// Read a feature list: specs separated by commas or spaces
-/// ([`is_feature_spec`]), `1..=`[`MAX_THEME_FEATURES`] of them, no empty
-/// comma entry. Each spec becomes its own entry.
-///
+/// Read a feature list.
 /// # Errors
 /// The reason, for the parser to place at the key's line.
-// Skip: split/collect drive absent std bodies; every malformed value is refused (fail-closed).
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn parse_feature_list(value: &str) -> Result<Vec<String>, String> {
     let mut specs = Vec::new();
@@ -543,7 +491,6 @@ pub fn parse_feature_list(value: &str) -> Result<Vec<String>, String> {
 }
 
 /// Read a `schema` version: a whole number `1..=65535`.
-///
 /// # Errors
 /// The reason, for the parser to place at the key's line.
 pub fn parse_schema(value: &str) -> Result<u16, String> {
@@ -580,8 +527,7 @@ mod tests {
     }
 
     /// Every typography row of the table parses its example into exactly its
-    /// own field, and the package writer reads back equal. Negative control:
-    /// every other typography field stays unset (`keys()` is the one row).
+    /// own field, and the package writer reads back equal.
     #[test]
     fn typography_rows_round_trip() {
         let rows: Vec<_> = THEME_KEYS
@@ -602,7 +548,6 @@ mod tests {
                 let back = parse_theme_str(&written).unwrap_or_else(|e| panic!("{e}\n{written}"));
                 assert_eq!(back, parsed, "{written}");
             }
-            // Clearing the key empties the typography again.
             let mut cleared = parsed.typography.clone();
             cleared.clear(spec.key);
             assert!(cleared.is_empty(), "{}", spec.name);
@@ -634,7 +579,6 @@ mod tests {
                 "{written}"
             );
         }
-        // Negative control: the colours-only writer drops the typography.
         let colours = crate::scheme_import::to_native_conf(
             &parsed.scheme,
             parsed.appearance_declared,
@@ -671,16 +615,13 @@ mod tests {
                 let (got, reason) = error_key_reason(with(&format!("{key} = {value}")));
                 assert_eq!(got.as_deref(), Some(key), "{key} = {value:?}: {reason}");
             }
-            // An empty value is refused too (by the line reader).
             assert!(with(&format!("{key} =")).is_err());
-            // Negative control: family names and the embedded display faces load.
             for good in ["Berkeley Mono", "display:pixel+chunky"] {
                 assert!(with(&format!("{key} = {good}")).is_ok(), "{key} = {good}");
             }
         }
         let (_, reason) = error_key_reason(with("font_family = /Library/Fonts/X.ttf"));
         assert!(reason.contains(FONT_NAME_IS_PATH), "{reason}");
-        // A list entry is held to the same rule, and to no empty entry.
         assert!(with("fallback_fonts = Menlo, /tmp/x.ttf").is_err());
         assert!(with("fallback_fonts = Menlo,,Monaco").is_err());
         let nine = ["Menlo"; MAX_THEME_FONT_LIST + 1].join(", ");
@@ -729,8 +670,6 @@ mod tests {
         assert_eq!(ok("font_weight = 1000").typography.font_weight, Some(1000));
         refused("font_weight = 1001");
         refused("font_weight = 400.5");
-        // The writer's decimal reads back to the same thousandths across the
-        // whole range.
         for milli in 0..=9999u16 {
             assert_eq!(
                 parse_milli(&milli_text(milli), 0, 9999),
@@ -766,8 +705,6 @@ mod tests {
         ] {
             assert!(with(&format!("font_features = {bad}")).is_err(), "{bad}");
         }
-        // Negative control for the law: a spec parse_token takes but the theme
-        // reader refuses exists (a sign with a value), so the subset is real.
         assert!(!is_feature_spec("+ss01=2"));
     }
 
@@ -787,7 +724,6 @@ mod tests {
             count: 1
         }));
         assert_eq!(meta.skipped_keys, vec!["future_key".to_string()]);
-        // Negative controls.
         for body in ["schema = 1\nfuture_key = x", "future_key = x"] {
             let (key, reason) = error_key_reason(with(body));
             assert_eq!(key.as_deref(), Some("future_key"));
@@ -798,7 +734,6 @@ mod tests {
             let (key, _) = error_key_reason(with(bad));
             assert_eq!(key.as_deref(), Some("schema"), "{bad}");
         }
-        // The record is bounded; the count is not.
         let mut body = String::from("schema = 9\n");
         for n in 0..40 {
             body.push_str(&format!("future_{n} = x\n"));
@@ -808,8 +743,6 @@ mod tests {
         assert_eq!(many.skipped_count, 40);
         let long = with(&format!("schema = 2\n{} = x", "k".repeat(200))).expect("loads");
         assert_eq!(long.skipped_keys[0].len(), MAX_SKIPPED_THEME_KEY_BYTES);
-        // An untrusted key's control characters are recorded escaped, never
-        // raw (they reach `theme check` and `theme import` output).
         let evil = with("schema = 999\n\x1b]0;pwned\x07\u{9b}2J = 1").expect("loads");
         assert_eq!(
             evil.skipped_keys,
@@ -858,7 +791,6 @@ mod tests {
         );
         let spoken = parsed.typography.spoken().expect("set");
         assert!(!spoken.contains('×') && !spoken.contains('·'), "{spoken}");
-        // Every value type the table names has a schema label.
         for spec in &THEME_KEYS {
             assert!(!spec.value.label().is_empty());
             if let ThemeValueType::Milli { min, max } = spec.value {

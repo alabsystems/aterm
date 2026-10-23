@@ -45,14 +45,11 @@ fn a_needs_line_in_a_fence_or_named_as_a_thing_is_no_need() {
         assert!(needs_you(tail).is_empty(), "{tail:?}");
         assert_eq!(without_needs(tail), tail, "{tail:?}");
     }
-    // A fence closed before the line leaves it read.
     assert_eq!(
         needs_you("```\nlog\n```\nNEEDS YOU: a decision on the schema"),
         ["a decision on the schema"]
     );
 
-    // The other mark, a shorter run, and a run carrying text are code
-    // inside the current block. Only its matching bare close ends it.
     for (open, inner, close) in [
         ("~~~~markdown", "```", "~~~~"),
         ("````markdown", "~~~", "````"),
@@ -88,14 +85,7 @@ fn a_needs_line_in_a_fence_or_named_as_a_thing_is_no_need() {
 /// a person can give on a line starting NEEDS YOU: and carry on`), in every
 /// act it types and a worker's first prompt, read back where a screen
 /// cannot bound the message (agy) or quoted by a worker, on its row or
-/// wrapped at any word of it. Read as a head, the words after the token stood
-/// as a need nobody said; so did the top row of a reply cut there
-/// (`starting NEEDS YOU: and land the rest`) and the ack's bare token naming
-/// the line (`NEEDS YOU line is on the person's screen now`). NEGATIVE
-/// CONTROLS: the token said — at a line's start, after a sentence, under a
-/// row ending `start` or `starting` with no line's noun before it, opening
-/// the text after `Starting` in capitals, in the bare form before its need,
-/// joined on by `and` below the text's first row — is a need.
+/// wrapped at any word of it.
 #[test]
 fn a_needs_token_a_lines_start_names_is_no_need() {
     for tail in [
@@ -109,13 +99,9 @@ fn a_needs_token_a_lines_start_names_is_no_need() {
         "Put what only a person can give on a line starting\nNEEDS YOU: and carry on.",
         "Put what only a person can give on a line\nstarting NEEDS YOU: and carry on.",
         "Put what only a person can give on a line starting with\nNEEDS YOU: and carry on.",
-        // The top row of a reply cut there: the sentence began above it.
         "starting NEEDS YOU: and land the rest. Once it is all on remote main, defend that",
         "NEEDS YOU: and carry on with\neverything else.\n\nImplemented the parser.",
-        // An owner's rule naming the line, its article on the row above.
         "Never force-push; a\nNEEDS YOU: line is for credentials only.",
-        // aterm's ack, wrapped onto a row of its own: the bare token naming
-        // the line.
         "Your\nNEEDS YOU line is on the person's screen now. Do not wait for it: carry on.",
     ] {
         assert!(
@@ -136,7 +122,6 @@ fn a_needs_token_a_lines_start_names_is_no_need() {
     ] {
         assert_eq!(needs_you(tail), ["the release credential"], "{tail:?}");
     }
-    // A small `and` after the token below the text's first row is a need.
     assert_eq!(
         needs_you("Implemented the parser.\nNEEDS YOU: and the release credential"),
         ["and the release credential"]
@@ -145,8 +130,7 @@ fn a_needs_token_a_lines_start_names_is_no_need() {
 
 /// A NEEDS YOU line in a quote, in ticks, inside a sentence or spelled
 /// `NEED YOU` is a need (each was
-/// lost, and a lost need lands with the need off the screen). NEGATIVE
-/// CONTROLS: the mentions in `a_needs_line_in_a_fence_or_named_as_a_thing_is_no_need`.
+/// lost, and a lost need lands with the need off the screen).
 #[test]
 fn a_needs_line_quoted_ticked_or_inside_a_sentence_is_a_need() {
     for tail in [
@@ -187,12 +171,7 @@ fn needs_are_one_a_line_each_once_and_the_items_under_a_bare_head() {
 }
 
 /// ONE NEED A LINE: a head whose words name a need is that one need, and the list under it is
-/// the report's own. The lab stub's tall reply (`aterm-lab`'s `forever::tall_reply`, Land's L6
-/// and r10's land-d: `NEEDS YOU: rotate the deploy key` over 80 `- check <n> passed` rows) was
-/// read as 80 needs (`NEEDS … count=80`, "(+79 more)"); it names one, and the 80 rows stay in
-/// the words every other reader judges. CONTROLS: two NEEDS YOU lines are two needs; words
-/// ending in a colon introduce the list under them, its items the needs; a bare head takes its
-/// list; a none over a list still reads the list (FAIL TOWARD A KEPT NEED).
+/// the report's own.
 #[test]
 fn a_head_that_names_its_need_is_one_need_over_any_list() {
     let clean = "Nothing left: the parser is committed and pushed to origin/main.";
@@ -210,7 +189,6 @@ fn a_head_that_names_its_need_is_one_need_over_any_list() {
     );
     assert!(!kept.contains("NEEDS YOU"), "{kept}");
     assert_eq!(defense_line(&tall), Some(clean));
-    // CONTROLS.
     assert_eq!(
         needs_you(
             "NEEDS YOU: rotate the deploy key\nNEEDS YOU: approve the release\n- check 1 passed"
@@ -235,9 +213,7 @@ fn a_head_that_names_its_need_is_one_need_over_any_list() {
 /// between them passed over, its wrapped rows joined; with no words under it
 /// at all (another head, a fence, the report's end) it still names a need
 /// ([`UNREAD_NEED`]), so no defense lands beside a head nobody can read as
-/// `nothing`. A paragraph that says none clears, as a `nothing` line does.
-/// NEGATIVE CONTROLS: a quoted or backticked head names nothing, and a bare
-/// head over a list keeps naming the list.
+/// `nothing`.
 #[test]
 fn a_bare_head_names_the_paragraph_under_it_or_a_need_it_cannot_read() {
     let defense = "Nothing left: every branch is merged into the remote main branch and pushed.";
@@ -276,7 +252,6 @@ fn a_bare_head_names_the_paragraph_under_it_or_a_need_it_cannot_read() {
     }
     assert!(says_no_needs("Landed.\nNEEDS YOU:\nNothing."));
     assert!(says_no_needs("Landed.\nNEEDS YOU:\n- none"));
-    // A quoted or ticked bare head takes its paragraph too.
     for tail in [
         format!("{defense}\n> NEEDS YOU:\nThe signing credential."),
         format!("{defense}\n`NEEDS YOU:`\nThe signing credential."),
@@ -291,9 +266,7 @@ fn a_bare_head_names_the_paragraph_under_it_or_a_need_it_cannot_read() {
 
 /// A HEADING AND A DASH OPEN EITHER HEAD: `## NEEDS YOU: …`, `NEEDS YOU — …`,
 /// `## Nothing left:`, `### Nothing left` (a heading that is the head alone)
-/// and `Nothing left to do:` are read as the plain heads are. NEGATIVE
-/// CONTROLS: a word that only begins as the head (`Nothing leftover`,
-/// `NEEDS YOURSELF`), a hyphen inside a word, and prose with no separator.
+/// and `Nothing left to do:` are read as the plain heads are.
 #[test]
 fn a_heading_or_a_dash_opens_either_head() {
     for line in [
@@ -320,7 +293,6 @@ fn a_heading_or_a_dash_opens_either_head() {
     ] {
         assert!(defense_line(tail).is_some(), "{tail:?}");
     }
-    // NEGATIVE CONTROLS.
     for tail in [
         "Nothing leftover: the cache is warm.",
         "Nothing left-handed here.",
@@ -344,9 +316,7 @@ fn a_heading_or_a_dash_opens_either_head() {
 /// heads with nothing under them ([`UNREAD_NEED`]), a head led by an emoji
 /// (`🚨`, `⚠️`) or a task list's checkbox (`- [ ]`), a qualifier in
 /// parentheses (`NEEDS YOU (blocking):`), a double dash (`NEEDS YOU --`), and
-/// the need's words straight after the token. The review of 2026-10-20 found
-/// each read as no need, so a defense landed beside it. NEGATIVE CONTROLS:
-/// the same heads saying none stands clear, and the defense alone lands.
+/// the need's words straight after the token.
 #[test]
 fn every_head_form_names_its_need_beside_a_defense() {
     use crate::supervise::policy::turn_end::clean_defense;
@@ -400,7 +370,6 @@ fn every_head_form_names_its_need_beside_a_defense() {
             assert!(!clean_defense(Some(&tail)), "{tail:?}");
         }
     }
-    // NEGATIVE CONTROLS.
     for none in [
         "🚨 NEEDS YOU: nothing",
         "- [ ] NEEDS YOU: none",
@@ -435,13 +404,7 @@ fn a_wrapped_need_is_joined_and_a_new_sentence_is_not() {
 /// A NONE LINE'S CLAUSE IS READ FOR OPEN WORK ([`without_needs`] keeps it,
 /// the head dropped): `NEEDS YOU: none — all of it is pushed to the branch`
 /// names no need, but what its restatement leaves open (a branch, not main)
-/// is open, under Land's strict reading as on an ordinary line. The recheck
-/// of ea564676a3 found such a clause dropped with the line, so the defense
-/// landed over work left on a branch. A clause that says more than a
-/// restatement (`nothing — the docs fix is parked on a branch for later`)
-/// is a need now ([`none_said`]: FAIL TOWARD A KEPT NEED), and lands
-/// nothing either. NEGATIVE CONTROL: a clause that restates the landing
-/// leaves nothing open, in its place with a capital.
+/// is open, under Land's strict reading as on an ordinary line.
 #[test]
 fn a_none_lines_clause_is_read_for_open_work() {
     use crate::supervise::policy::turn_end::{clean_defense, open_work_strict};
@@ -465,7 +428,6 @@ fn a_none_lines_clause_is_read_for_open_work() {
         assert_eq!(needs_you(&tail).len(), 1, "{tail:?}");
         assert!(!clean_defense(Some(&tail)), "{tail:?}");
     }
-    // NEGATIVE CONTROL: the clause restates the landing.
     let tail = format!("Merged.\nNEEDS YOU: nothing — everything is on main.\n{defense}");
     assert_eq!(
         without_needs(&tail),
@@ -473,8 +435,6 @@ fn a_none_lines_clause_is_read_for_open_work() {
     );
     assert!(clean_defense(Some(&tail)));
 
-    // Opposite case-fold width changes can cancel in total while moving
-    // the first clause boundary. Both orders use the consistent lower copy.
     for (rest, kept) in [
         (
             "no KKKK needed; no ȺȺȺȺȺȺȺȺ needed; all LANDED",
@@ -486,7 +446,6 @@ fn a_none_lines_clause_is_read_for_open_work() {
         ),
         ("no KKKK needed; all LANDED", "All landed"),
         ("no ȺȺȺȺȺȺȺȺ needed; all LANDED", "All landed"),
-        // Width-preserving Unicode and ASCII keep the original spelling.
         ("no Γ needed; all LANDED", "All LANDED"),
         ("no key needed; all LANDED", "All LANDED"),
     ] {
@@ -495,7 +454,6 @@ fn a_none_lines_clause_is_read_for_open_work() {
         assert!(says_no_needs(&line), "{line:?}");
         assert_eq!(without_needs(&line), kept, "{line:?}");
     }
-    // A real request after the same none clauses stays a need.
     let rest = "no KKKK needed; no ȺȺȺȺȺȺȺȺ needed; please sign the release";
     let line = format!("NEEDS YOU: {rest}");
     assert_eq!(needs_you(&line), [rest]);
@@ -504,20 +462,12 @@ fn a_none_lines_clause_is_read_for_open_work() {
 
 /// PROSE THAT WRAPS BEFORE `needs you` IS NO HEAD ([`need_rest`]): a
 /// sentence a screen row cut right before `needs` puts `needs you.` at the
-/// start of a row, and `Needs you? No.` asks. The bare form, with no
-/// separator, is the head only written in capitals as the convention spells
-/// it (or closed by emphasis or a qualifier), and never where punctuation
-/// other than a separator follows the token. The recheck of ea564676a3
-/// found each read as a need (`.`), so the landing was blocked and Cruise
-/// raised it. NEGATIVE CONTROLS: the same words with a separator, in any
-/// case, and the bare head in capitals, are heads.
+/// start of a row, and `Needs you? No.` asks.
 #[test]
 fn prose_wrapped_before_needs_you_is_no_head() {
     use crate::supervise::policy::turn_end::clean_defense;
     let defense = "Nothing left: all of it is merged into the remote main branch.";
     for tail in [
-        // `nothing else`, not `nothing here`: Land's strict reading takes a
-        // none a place qualifies (`nothing here`) for work kept elsewhere.
         format!("Merged the parser and pushed main; nothing else\nneeds you.\n{defense}"),
         format!("{defense} And nothing\nneeds you, the suites pass on main."),
         format!("Merged and pushed main; no step\nneeds you to act.\n{defense}"),
@@ -527,7 +477,6 @@ fn prose_wrapped_before_needs_you_is_no_head() {
         assert!(needs_you(&tail).is_empty(), "{tail:?}");
         assert!(clean_defense(Some(&tail)), "{tail:?}");
     }
-    // NEGATIVE CONTROLS.
     for (line, want) in [
         ("needs you: the signing key", "the signing key"),
         ("NEEDS YOU the signing key", "the signing key"),
@@ -556,7 +505,6 @@ fn a_dashed_or_qualified_head_still_names_a_need() {
             "{line:?}"
         );
     }
-    // A hyphen joined to the head is a word, not a head's end.
     assert!(needs_you("NEEDS YOU-related notes are in the brief.").is_empty());
 }
 
@@ -672,11 +620,7 @@ fn misread(row: &NeedsRow, report: &str, by: &NoneWords<'_>) -> Option<String> {
 /// (`fixtures/needs-table.txt`) reads some row otherwise — a none it held
 /// becomes a phantom need, or a need it kept is lost — so no word is dead
 /// weight, and none can be dropped without the table naming the report it
-/// changes. The reader's own lists misread nothing. Each word's search is
-/// the whole table, the rows that spell the word tried first: one of them
-/// is usually the row it bears. NEGATIVE CONTROL: a reader that takes words
-/// a person is asked for (`just`, `please`, `publish`, `key`, `tag`,
-/// `approve`) as a time a none is said for loses needs on the table.
+/// changes.
 #[test]
 fn every_none_word_is_load_bearing() {
     assert_eq!(misread_by(&NONE_WORDS), Vec::<String>::new());
@@ -712,7 +656,6 @@ fn every_none_word_is_load_bearing() {
         }
     }
     assert!(dead.is_empty(), "words no row of the table needs: {dead:?}");
-    // NEGATIVE CONTROL.
     let loose: Vec<&str> = NONE_TIMES
         .iter()
         .copied()
@@ -734,12 +677,7 @@ fn every_none_word_is_load_bearing() {
 /// `None at this point.`, `nothing to do.`, `nothing else to do.`,
 /// `nothing from my side.`, `zero.`, a dash alone, a none closed by its
 /// sentence's stop with a statement after it, and `you're all set` after a
-/// none. Each raised a phantom need on the person's screen and kept a clean
-/// defense from landing. NEGATIVE CONTROLS: a none word whose clause names
-/// a thing the person could be asked for (`no access to the signing
-/// server`), a `nothing` whose later sentence asks, a `no` before a dash,
-/// a `you` that asks, and a none word that is part of the need's words,
-/// still name a need.
+/// none.
 #[test]
 fn a_none_in_common_words_reads_as_none() {
     use crate::supervise::policy::turn_end::clean_defense;
@@ -767,7 +705,6 @@ fn a_none_in_common_words_reads_as_none() {
         assert!(says_no_needs(&tail), "{x:?}");
         assert!(clean_defense(Some(&tail)), "{x:?}");
     }
-    // NEGATIVE CONTROLS.
     for x in [
         "no access to the signing server",
         "nothing to do until you approve the deploy",
@@ -785,7 +722,6 @@ fn a_none_in_common_words_reads_as_none() {
         assert!(!says_no_needs(&tail), "{x:?}");
         assert!(!clean_defense(Some(&tail)), "{x:?}");
     }
-    // A head alone still heads the list below it: no none.
     assert_eq!(
         needs_you("Merged.\nNEEDS YOU:\n- approve the deploy"),
         ["approve the deploy"]
@@ -795,9 +731,7 @@ fn a_none_in_common_words_reads_as_none() {
 /// A NEEDS-YOU HEAD WITH ITS WORDS HYPHENATED IS A HEAD (the review of
 /// b8/residuals, 2026-10-20): `NEEDS-YOU: approve the deploy` (and the
 /// underscore form) was read as an ordinary line, so the need never
-/// reached the person and the turn's defense could land past it. NEGATIVE
-/// CONTROLS: a hyphenated token in prose with no separator, or one that
-/// runs on into a word, is no head.
+/// reached the person and the turn's defense could land past it.
 #[test]
 fn a_hyphenated_needs_you_head_is_a_head() {
     use crate::supervise::policy::turn_end::clean_defense;
@@ -815,7 +749,6 @@ fn a_hyphenated_needs_you_head_is_a_head() {
     assert!(says_no_needs(&format!(
         "Merged.\nNEEDS-YOU: none\n{defense}"
     )));
-    // NEGATIVE CONTROLS.
     for line in [
         "Needs-you lines are how a report asks.",
         "NEEDS-YOUR review is not the convention.",

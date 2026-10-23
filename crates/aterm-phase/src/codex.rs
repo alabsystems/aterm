@@ -1,52 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Codex's composer, PLACED for the glass and never read: where aterm's glass
-//! draws the program's mark and the harness switch on a Codex pane (its top
-//! line). Presentation only — [`crate::reader::CodexReader`] keeps its
-//! identity-only policy (aterm's Codex screen lane was retired on
-//! 2026-10-16), and no phase, prompt, wall or supervisor decision reads
-//! this.
-//!
-//! **THE COMPOSER** (measured on 0.154.0, the first frame of
-//! `crates/aterm-effects/tests/fixtures/codex-particles-2026-09-16.ptylog`,
-//! [`fixtures::COMPOSER_0_154`]): Codex (ratatui, inline) draws its composer
-//! as a SLAB, three rows erased onto one tint (`48;2;45;47;51` on a dark
-//! ground): a blank pad row, the prompt row — `›` in column 0, a blank, the
-//! draft or the dim placeholder `Ask Codex to do anything` — and a blank pad
-//! row, then its footer (`  ? for shortcuts`) on the pane's own ground.
-//!
-//! ```text
-//! ╰───────────────────────────────────────╯    the session card
-//!                                              a blank row
-//! ·····································        the slab's top pad: the TOP LINE
-//! › Ask Codex to do anything                   the prompt row
-//! ·····································        the slab's bottom pad
-//!   ? for shortcuts                            the footer
-//! ```
-//!
-//! A choice list draws the same `›` as its pointer (`› 1. Yes, continue`,
-//! codex 0.155.1's trust gate), so a row whose `›` points at a numbered
-//! choice is no prompt row. A message already sent stands in the transcript
-//! as its own `›` row on the same tint, padded the same way, so the prompt
-//! is the screen's LAST `›` row in column 0 — and only while nothing under
-//! it is anything but the composer's own rows and its footer, every one
-//! blank or indented: where an approval, a picker or a question dialog
-//! (`  › 1. Short-term`, its pointer at column 2, measured on 0.163.0) takes
-//! the composer's place, or the transcript goes on below a `›` row
-//! (`• Ran ls` in column 0), the last `›` row is a sent message and there is
-//! no composer to name. Text alone never proves the slab: the row
-//! [`composer_pad`] names is a candidate the glass writes on only once the
-//! cells prove it (every cell a blank on one background that is not the
-//! pane's own and is the `›` row's).
+//! Codex composer row placement ([`crate::reader::CodexReader`], [`composer_pad`]).
 
 use crate::text::blank;
 
 /// The prompt glyph, in column 0 (U+203A).
 const PROMPT: char = '›';
 
-/// A prompt row: `›` in column 0, alone or before a blank, and not pointing
-/// at a numbered choice (`› 1. Yes, continue`: digits, `.`, a blank).
+/// A prompt row: `›` in column 0.
 fn is_prompt_row(row: &str) -> bool {
     let Some(rest) = row.strip_prefix(PROMPT) else {
         return false;
@@ -61,15 +23,7 @@ fn is_prompt_row(row: &str) -> bool {
     !(digits > 0 && rest[digits..].starts_with(". "))
 }
 
-/// The row of the composer's top pad (module header): the blank row right
-/// above the prompt row, the LAST row with `›` in column 0. `None` with no
-/// such row; with that row a choice's pointer (`› 1. Yes, proceed`), never
-/// passed over for a sent message's `›` above it; with a row under it that
-/// opens with `›` at any indent (a choice's pointer: a question dialog's
-/// `  › 1. Short-term`) or holds anything in column 0 (the transcript, going
-/// on below a sent message); with the prompt row first on the screen; or
-/// with anything drawn on the row above it. Presentation only: a candidate
-/// whose cells the caller proves before it draws there.
+/// The row of the composer's top pad (module header).
 #[must_use]
 pub fn composer_pad(rows: &[String]) -> Option<usize> {
     let prompt = rows.iter().rposition(|r| r.starts_with(PROMPT))?;
@@ -149,14 +103,6 @@ mod tests {
     /// frame (the card, a blank row, the slab's pad, `›`, the pad, the
     /// footer), and with a draft typed or wrapped, under the same `›`; a
     /// transcript's earlier `›` row is passed over for the last one.
-    /// NEGATIVE CONTROLS: codex 0.155.1's trust gate (`› 1. Yes, continue`,
-    /// a choice's pointer) is refused, and so is a two-digit choice; so is a
-    /// sent message's `›` row, padded like the composer, over what took the
-    /// composer's place — an approval (`› 1. Yes, proceed`), 0.163.0's
-    /// question dialog (its pointer at column 2), the transcript going on
-    /// in column 0; the prompt row with text on the row above it, `›` first
-    /// on the screen, `›` not in column 0, `›` before a word with no blank,
-    /// and a screen with no `›` name no pad.
     #[test]
     fn codex_composer_pad_is_the_row_above_the_prompt() {
         assert_eq!(composer_pad(&working()), Some(1));
@@ -186,13 +132,10 @@ mod tests {
         history.extend(take.iter().cloned());
         assert_eq!(composer_pad(&history), Some(10), "the last `›` row");
 
-        // NEGATIVE CONTROLS.
         assert_eq!(composer_pad(&codex_0_155_trust()), None, "the trust gate");
         let mut choice = codex_0_155_trust();
         choice[5] = "› 12. Yes, continue".to_string();
         assert_eq!(composer_pad(&choice), None, "a two-digit choice");
-        // A sent message over what took the composer's place: its pad is a
-        // blank row above a `›` row, as the composer's is.
         let sent = |under: &[&str]| {
             let mut screen = take[..prompt - 1].to_vec();
             screen.extend(rows(&["", "› fix the tests", ""]));

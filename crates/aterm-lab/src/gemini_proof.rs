@@ -2,39 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! The proofs for Gemini CLI and agy in the lab.
-//!
-//! `gemini-selftest [tag] [--keep]` and `agy-selftest [tag] [--keep]` (about
-//! 30 s each): a lab of its own (the harness off: this is the jail's and the
-//! agent's proof, not the harness's), the REAL agent launched in the tab
-//! against the stub's Gemini API ([`crate::gemini`]: its scratch HOME seeded,
-//! so no sign-in, auth or onboarding screen draws), one turn the stub holds
-//! 3 s, then the witnesses, each with a control that shows it can see — one
-//! whose control saw nothing is UNPROVEN, never ok:
-//!
-//! * NOTHING REACHED GOOGLE: no non-loopback socket of the lab (the egress
-//!   witness, which did see the agent's own process connect to the stub);
-//!   every Gemini API request the stub took carried the lab's fake key, never
-//!   a Google login (there was one); and, for agy, which is handed the
-//!   black-hole proxy, every Google host it asked for was refused there
-//!   (agy asks for its flag and telemetry hosts on every run: none asked is
-//!   unproven);
-//! * THE OWNER'S `~/.gemini` UNTOUCHED, never looked at: no kernel refusal
-//!   names it (the log kept this lab's control refusal, a jailed write into
-//!   the run directory, or its silence is unproven), no process of the agent
-//!   holds a file under it, and the decoy `$HOME/.gemini` of the scratch's
-//!   shell home is as made — while the agent did write under the scratch HOME
-//!   it was given (its control);
-//! * no process of the agent holds any other file of the owner's home outside
-//!   the run directory and its own build ([`crate::selftest::owner_strays`]);
-//! * nothing opened on the desktop (the open recorder; its control, a
-//!   bare-name `open` in the jail, was logged), the isolation probes on a
-//!   replica home with this lab's rules, `twin` refusing a planted link, an
-//!   orphan in the jail found and witnessed, and after `down` nothing left in
-//!   the jail.
-//!
-//! Exit 1 when a check fails. Nothing is typed into a sign-in screen: the
-//! seeds keep every one away, and a screen that is no composer within 60 s
-//! fails the run before any turn is typed.
 
 use std::fs;
 use std::path::Path;
@@ -74,12 +41,7 @@ fn composer_row(agent: Agent) -> &'static str {
     }
 }
 
-/// The Gemini API requests in the stub's log, as `(how many, the auth labels
-/// that are not the lab's fake key)`: every `kind=gemini…` line names the
-/// credentials it carried ([`crate::stub::gemini::credential_label`];
-/// `auth=gemini-key` is [`crate::gemini::LAB_GEMINI_KEY`] alone, and a Google
-/// login would read `jwt:…`, `other(N chars)` or `none`, or beside the key
-/// `gemini-key+…`).
+/// The Gemini API requests in the stub's log, as `(how many, the auth labels that are not the lab's fake key)`.
 #[must_use]
 pub fn gemini_auths(stub_log: &str) -> (usize, Vec<String>) {
     let mut n = 0;
@@ -100,18 +62,14 @@ pub fn gemini_auths(stub_log: &str) -> (usize, Vec<String>) {
     (n, other)
 }
 
-/// The key check (module header): the stub took at least one Gemini API
-/// request — its control: the agent's requests reach the stub's log — and
-/// every one carried the lab's fake key and nothing beside it
-/// ([`gemini_auths`]). No request fails it: the agent was never seen asking.
+/// The key check (module header).
 #[must_use]
 pub fn key_verdict(stub_log: &str) -> Verdict {
     let (n, other) = gemini_auths(stub_log);
     ok(n > 0 && other.is_empty())
 }
 
-/// The hosts the black-hole proxy refused (`PROXY refused: CONNECT
-/// <host>:<port> …` in the stub's log), each once, in the order first asked.
+/// The hosts the black-hole proxy refused (`PROXY refused: CONNECT <host>:<port> …` in the stub's log), each once, in the order first asked.
 #[must_use]
 pub fn proxy_refused(stub_log: &str) -> Vec<String> {
     let mut hosts: Vec<String> = Vec::new();
@@ -136,9 +94,7 @@ pub fn proxy_refused(stub_log: &str) -> Vec<String> {
     hosts
 }
 
-/// agy's proxy check (module header): every Google host agy asked for was
-/// asked of the black hole, which refuses each ([`proxy_refused`]). agy asks
-/// for its flag and telemetry hosts on every run, so none asked is UNPROVEN.
+/// agy's proxy check (module header).
 #[must_use]
 pub fn proxy_verdict(refused: &[String]) -> Verdict {
     if refused.is_empty() {
@@ -148,8 +104,7 @@ pub fn proxy_verdict(refused: &[String]) -> Verdict {
     }
 }
 
-/// Whether the egress witness logged one of `pids` connecting to the stub
-/// (`cmd[pid] TCP conn 127.0.0.1:<port>`).
+/// Whether the egress witness logged one of `pids` connecting to the stub (`cmd[pid] TCP conn 127.0.0.1:<port>`).
 #[must_use]
 pub fn talked(sockets_log: &str, pids: &[i32], port: &str) -> bool {
     let tail = format!("] TCP conn 127.0.0.1:{port}");
@@ -161,12 +116,7 @@ pub fn talked(sockets_log: &str, pids: &[i32], port: &str) -> bool {
     })
 }
 
-/// The egress check (module header): the witness saw one of the agent's
-/// `pids` connect to the stub on `port` ([`talked`]) — its control: it sees
-/// the agent's sockets — and no process of the lab held a socket to a host
-/// that is not loopback: no `EXTERNAL` line in `egress.log`, nor one in
-/// `sockets.log`, where the witness writes each endpoint first
-/// ([`crate::sampler`]). A witness that never saw the agent fails it.
+/// The egress check (module header).
 #[must_use]
 pub fn egress_verdict(sockets_log: &str, egress_log: &str, pids: &[i32], port: &str) -> Verdict {
     let external = egress_log.lines().any(|l| l.contains("EXTERNAL"))
@@ -174,10 +124,7 @@ pub fn egress_verdict(sockets_log: &str, egress_log: &str, pids: &[i32], port: &
     ok(talked(sockets_log, pids, port) && !external)
 }
 
-/// The kernel-refusal check (module header): a refusal naming `~/.gemini`
-/// (`denied`) FAILS it whether or not the log kept this lab's control
-/// refusal; with none, it holds when the log kept the control, and is
-/// UNPROVEN when it dropped it (its silence then shows nothing).
+/// The kernel-refusal check (module header).
 #[must_use]
 pub fn refusals_verdict(denied: &[String], control: bool) -> Verdict {
     if !denied.is_empty() {
@@ -189,13 +136,7 @@ pub fn refusals_verdict(denied: &[String], control: bool) -> Verdict {
     }
 }
 
-/// The owner's-`~/.gemini` check (module header): the decoy changed
-/// (`decoy_kept` false) or a file under `~/.gemini` a process of the agent
-/// holds (`held`, shown by any report, a failed one too) FAILS it, as do no
-/// agent process seen (`pids`) and no write of the agent's own under its
-/// scratch HOME (`wrote`, its control); otherwise it holds when every agent
-/// process gave a complete open-file report (`observed`), and is UNPROVEN
-/// when one did not (its silence then shows nothing).
+/// The owner's-`~/.gemini` check (module header).
 #[must_use]
 pub fn owner_verdict(
     decoy_kept: bool,
@@ -227,8 +168,7 @@ fn seeds(agent: Agent) -> &'static [&'static str] {
     }
 }
 
-/// The entries under the agent's scratch `.gemini` that are none of its
-/// seeds: what the agent wrote there itself (paths relative to it).
+/// The entries under the agent's scratch `.gemini` that are none of its seeds.
 #[must_use]
 pub fn own_writes(agent: Agent, rel: &[String]) -> Vec<String> {
     rel.iter()
@@ -334,7 +274,6 @@ fn cmd(agent: Agent, args: &[String]) -> Res {
             Fail::die(format!("{verb}: up failed: {}", f.msg.unwrap_or_default()))
         }
     })?;
-    // the lab it brought up does not outlive it, however it ends
     let mut t = match checks(agent, &run) {
         Ok(t) => t,
         Err(f) => {
@@ -387,13 +326,8 @@ struct Before {
 fn checks(agent: Agent, run: &Run) -> Result<Before, Fail> {
     let verb = format!("{}-selftest", agent.name());
     crate::gemini::need(run, agent)?;
-    // the owner's homes: the account's, whatever HOME says, and HOME's when it names another
     let watched = Watched::of(crate::paths::paths());
     let decoy0 = decoy_state(run);
-    // The refusals' control: a jailed write into the run directory, which the jail refuses; the unified log keeps
-    // such a report or drops it (on macOS 27 it kept no file refusal), so its silence about ~/.gemini counts only
-    // when it kept the control. The recorder's control: a bare-name `open` in the jail, on the agent's PATH, lands on
-    // the recorder and is logged.
     let ctlname = format!(
         "lab-control-refusal-{}-{}",
         std::process::id(),
@@ -438,7 +372,6 @@ fn checks(agent: Agent, run: &Run) -> Result<Before, Fail> {
                     && l.contains("mode=selftest kind=gemini auth=gemini-key")
             });
     }
-    // the witness must have seen the agent's own connection to the stub, under its pid
     let pids = agent_pids(run, agent);
     let sockets = || fs::read_to_string(run.run.join("sockets.log")).unwrap_or_default();
     for _ in 0..20 {
@@ -482,7 +415,6 @@ fn checks(agent: Agent, run: &Run) -> Result<Before, Fail> {
     }
     let opened = crate::recorder::Witness::read(run, &open_control);
     opened.print();
-    // ~/.gemini: what the kernel refused naming it, what the agent holds open, the decoy, and the agent's own writes
     let mut klog = String::new();
     let mut control = false;
     for _ in 0..3 {
@@ -504,9 +436,6 @@ fn checks(agent: Agent, run: &Run) -> Result<Before, Fail> {
         .filter(|l| owner_gemini.iter().any(|g| l.contains(g.as_str())))
         .take(5)
         .collect();
-    // each agent process's open files, once: what it holds under ~/.gemini, and anywhere else in the owner's home
-    // outside the run directory and its own build
-    // (a file a failed or partial report names is still held; only complete reports prove that none is)
     let roots = lab_roots(run, agent.bin(run), watched.homes());
     let (mut held, mut strays, mut observed) = (Vec::new(), Vec::new(), true);
     for &p in &pids {
@@ -715,9 +644,6 @@ mod tests {
 ";
 
     /// The stub's log says every Gemini API request carried the fake key.
-    /// NEGATIVE CONTROLS: a request with a bearer token or no key is named by
-    /// its label, and a log with no Gemini API request counts none (the check
-    /// then fails: its control saw nothing).
     #[test]
     fn every_gemini_request_names_the_key_it_carried() {
         assert_eq!(gemini_auths(STUB_LOG), (3, Vec::new()));
@@ -738,9 +664,7 @@ mod tests {
     /// selftest's own log passes it, and so does the catalog's GET under the
     /// key; a Google login — a bearer token beside the key, one alone, a
     /// request with no key, each labelled as the stub labels it
-    /// ([`crate::stub::gemini::credential_label`]) — fails it. NEGATIVE
-    /// CONTROL: a log with no Gemini API request fails it too (its control saw
-    /// nothing).
+    /// ([`crate::stub::gemini::credential_label`]) — fails it.
     #[test]
     fn the_key_check_fails_on_any_credential_but_the_labs_key_alone() {
         use crate::stub::gemini::credential_label;
@@ -790,9 +714,7 @@ mod tests {
     /// the sampler's reading of `lsof` — for agy talking to the stub and the
     /// proxy pass it; one socket of the lab's to a Google address, agy's own
     /// or another process's, IPv4 or IPv6, fails it, and so does its line in
-    /// either log alone. NEGATIVE CONTROLS: a witness that never saw the
-    /// agent's pid connect to the stub fails it with no egress at all, and a
-    /// listen on the stub's port is no connection.
+    /// either log alone.
     #[test]
     fn the_egress_check_fails_when_any_socket_leaves_loopback() {
         let (pids, port) = (&[38564][..], "52886");
@@ -841,8 +763,7 @@ mod tests {
 
     /// A refusal naming `~/.gemini` fails the refusals check whether or not
     /// the log kept the control; with none, the check holds only on a kept
-    /// control. NEGATIVE CONTROL: a dropped control never hides a refusal,
-    /// and its silence alone is unproven, never ok.
+    /// control.
     #[test]
     fn a_refusal_naming_gemini_fails_whether_or_not_the_control_was_kept() {
         let denied = ["deny(1) file-read-data /Users//owner/.gemini/settings.json".to_string()];
@@ -860,8 +781,6 @@ mod tests {
     /// THE OWNER'S-`~/.gemini` CHECK FAILS ON A HELD FILE (a failed report's
     /// included), a changed decoy, no agent process or no write of its own;
     /// otherwise it holds only when every open-file report was complete.
-    /// NEGATIVE CONTROL: an incomplete report with nothing held is UNPROVEN,
-    /// never ok.
     #[test]
     fn the_owner_gemini_check_fails_on_a_held_file_and_needs_complete_reports() {
         use crate::selftest::open_files;
@@ -884,7 +803,6 @@ mod tests {
             owner_verdict(true, &[], &[7], &wrote, false),
             Verdict::Unproven
         );
-        // what lsof printed counts as evidence even when it failed, and proves no absence unless it succeeded
         let out = |code, stdout: &[u8], stderr: &[u8]| {
             Ok(std::process::Output {
                 status: std::process::ExitStatus::from_raw(code),
@@ -917,7 +835,7 @@ mod tests {
     }
 
     /// The black-hole proxy's refusals name each host once, in the order first
-    /// asked. NEGATIVE CONTROL: a log the proxy said nothing in names none.
+    /// asked.
     #[test]
     fn the_proxy_names_each_refused_host_once() {
         assert_eq!(
@@ -935,8 +853,7 @@ mod tests {
     }
 
     /// The witness's line for a pid's connection to the stub, any program's
-    /// name. NEGATIVE CONTROLS: another pid, another port, a listen, and a
-    /// pid that is only a prefix of one in the log.
+    /// name.
     #[test]
     fn the_witness_names_the_pid_that_talked_to_the_stub() {
         let log = "13:02:47 agy[38564] TCP conn 127.0.0.1:52886\n\
@@ -950,8 +867,7 @@ mod tests {
     }
 
     /// What the agent wrote under its scratch `.gemini` is everything but the
-    /// lab's own seeds. NEGATIVE CONTROL: a home holding the seeds alone
-    /// shows no write of the agent's.
+    /// lab's own seeds.
     #[test]
     fn the_agents_own_writes_are_what_is_not_a_seed() {
         let v = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();

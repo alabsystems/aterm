@@ -2,97 +2,57 @@
 // Copyright 2026 Andrew Yates
 
 //! What one run measures, read from [`ENV`].
-//!
-//! ONE VARIABLE, WORDS INSIDE IT. `FABRIC_BENCH="out=<dir> samples=200 …"` is
-//! one name the lane sets (`crates/aterm-verify/src/perf/fabric.rs`) and one
-//! grammar this file parses, refusing a word it does not know rather than
-//! measuring something other than what was asked.
-//!
-//! The explicit bench requires this specification; an unset, non-Unicode or
-//! malformed value refuses the run instead of reporting an empty measurement.
 
 use std::path::PathBuf;
 
 /// The variable that names the run.
 pub const ENV: &str = "FABRIC_BENCH";
 
-/// How many posts ONE sender session queues in a burst, at most.
-///
-/// `aterm-gui`'s `OUTBOX_CAP` is 128 waiting posts per session, refused at the
-/// door with `ERR outbox full`. The burst's in-flight window (`run.rs`
-/// `BURST_WINDOW`, under the recipient's 64-row allowance) already keeps fewer
-/// posts than that queued in all, so the cap cannot bind today; the split
-/// keeps it that way on its own. A burst of N comes from `ceil(N / PER_SENDER)`
-/// sessions, so no sender's share — 100, plus the warm-up post each makes
-/// first — could reach the cap even with the window gone, and the bridge
-/// drains several sessions' outboxes, as a burst from many agents makes it.
+/// Maximum posts one sender session queues in a burst.
 pub const PER_SENDER: usize = 100;
 
-/// The largest burst a run takes: 50 sender sessions on one headless instance.
+/// The largest burst a run takes.
 pub const BURST_MAX: usize = 5_000;
 
-/// The largest attach population: sessions spawned on one headless instance.
+/// The largest attach population on one headless instance.
 pub const ATTACH_MAX: usize = 128;
 
-/// One run's knobs. Every count is at least one.
+/// One run's knobs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Spec {
-    /// Where `fabric.json` and `fabric.md` are written.
+    /// Output directory for `fabric.json` and `fabric.md`.
     pub out: PathBuf,
-    /// Which scenario boots a world; all four unless explicitly selected.
+    /// Scenario selection for the run.
     pub scenario: Scenario,
-    /// Measured post -> deliver round trips.
+    /// Measured post-to-deliver round trips.
     pub samples: usize,
-    /// Round trips run first and not measured: the first post on a fresh lane
-    /// resolves its route and creates the bridge's per-session state files.
+    /// Unmeasured warmup round trips.
     pub warmup: usize,
     /// Posts in the burst.
     pub burst: usize,
-    /// Measured request/reply round trips in the ping-pong arm
-    /// (`run/pingpong.rs`), after `warmup` unmeasured ones.
+    /// Measured request/reply round trips in the ping-pong arm.
     pub pingpong: usize,
-    /// The attach populations, ascending: each is measured on one instance as
-    /// it grows, so the list must rise.
+    /// Ascending attach populations.
     pub attach: Vec<usize>,
     /// Bridge restarts measured per population.
     pub rounds: usize,
-    /// What the in-process broker's ack promises ([`Tier`]).
+    /// In-process broker durability tier.
     pub durability: Tier,
-    /// The ordered broker's HORIZON, in milliseconds (`horizon_ms=`): how
-    /// long after the first ack no full flush covers its writer flushes in
-    /// full. `Some` exactly when `durability` is [`Tier::Ordered`]
-    /// ([`ORDERED_HORIZON_MS`] unless named).
+    /// Ordered broker flush horizon in milliseconds.
     pub horizon_ms: Option<u64>,
-    /// Whether each world's broker RETAINS its log by aterm's default rules
-    /// (`retention=on`, what ships: `aterm_link::broker_rules::retain`, set at
-    /// every open as `aterm link broker` sets them) or keeps none
-    /// (`retention=off`: a broker from before astream's R4, the harness's
-    /// unretained open). Over an unretaining broker the bridge's `auto` mirror
-    /// stays off as well, so `retention=off` takes both away and [`Log`]
-    /// separates the two.
+    /// Whether each world's broker retains its log by default rules.
     pub retention: bool,
-    /// The bridge's `--log` ([`Log`]): `auto`, what ships, or `off`.
+    /// Bridge `--log` mirror mode.
     pub log: Log,
-    /// IDLE BYSTANDER SESSIONS spawned beside the messaging and ping-pong worlds'
-    /// two (`bystanders=`, default 0, at most [`ATTACH_MAX`]): a node hosting
-    /// more than the two that talk, so the bridge's and aterm's walks over every
-    /// session (the outbox peek's, the drain's roster read) carry them.
+    /// Idle bystander sessions spawned beside the talking sessions.
     pub bystanders: usize,
-    /// THE PACED SUB-PHASE of the ping-pong arm (`paced=`, default
-    /// [`DEFAULT_PACED`], 0 for none): that many more round trips after the
-    /// back-to-back ones, each a fixed gap after the last one's reply, so each
-    /// finds the bridge's loop idle (`run/pingpong.rs`).
+    /// Paced round trips in the ping-pong arm.
     pub paced: usize,
-    /// How often the retaining broker's retention tick runs when no batch asks
-    /// for one sooner, in milliseconds (`retention_interval_ms=`, which the
-    /// bench hands `Broker::set_retention_interval` after the rules). `None`
-    /// keeps astream's minute, what ships. A world lives well under a minute
-    /// and the bench's bytes are far below every rule's bound, so without it
-    /// no tick lands in a measured window. Only on a retaining broker.
+    /// Retaining broker tick interval in milliseconds.
     pub retention_interval_ms: Option<u64>,
 }
 
-/// The scenarios measured in one run. Selecting one does not start the others.
+/// The scenarios measured in one run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Scenario {
     #[default]
@@ -116,11 +76,10 @@ impl Scenario {
         }
     }
 
-    /// Read exactly one scenario name.
+    /// Read a scenario name.
     ///
     /// # Errors
-    ///
-    /// A name outside the five supported words.
+    /// A name outside the supported words.
     pub fn parse(word: &str) -> Result<Self, String> {
         match word {
             "all" => Ok(Self::All),
@@ -135,11 +94,7 @@ impl Scenario {
     }
 }
 
-/// The bridge's `--log` mode, as a run names it (`log=auto|off`): `auto`,
-/// what ships (owner decision D4), mirrors the session
-/// logs' bus class onto the sessions' `ev` faces while the broker retains
-/// them; `off` mirrors nothing. The harness passes `--log off` on the bridge's
-/// `serve` line for `off`, and nothing for `auto`, the bridge's default.
+/// The bridge's `--log` mode (`auto` or `off`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Log {
     #[default]
@@ -148,7 +103,7 @@ pub enum Log {
 }
 
 impl Log {
-    /// The word [`parse`] reads, and the report prints.
+    /// The word [`parse`] reads and the report prints.
     #[must_use]
     pub fn word(self) -> &'static str {
         match self {
@@ -157,11 +112,10 @@ impl Log {
         }
     }
 
-    /// `auto` or `off`, and nothing else. Pure (unit-tested).
+    /// Parse `auto` or `off`.
     ///
     /// # Errors
-    ///
-    /// Any other word, quoted.
+    /// Any other word.
     pub fn parse(word: &str) -> Result<Log, String> {
         match word {
             "auto" => Ok(Log::Auto),
@@ -182,38 +136,10 @@ fn on_off(word: &str) -> Result<bool, String> {
     }
 }
 
-/// aterm's ordered horizon (`aterm_link::durability::ORDERED_HORIZON`, 100 ms),
-/// the one aterm opens an ordered broker with, and so the ordered arm's unless
-/// it names another. Spelled here because this file is std-only (the lane
-/// mounts it); `run.rs` holds the two equal. (Every entry names its own,
-/// `horizon_ms=` in its words: those before aterm took 100 ms say 1000.)
+/// Default ordered broker flush horizon in milliseconds.
 pub const ORDERED_HORIZON_MS: u64 = 100;
 
-/// The durability tier the bench opens its in-process broker at — aterm's
-/// `aterm_link::durability::Durability`, named here in a std-only type
-/// because the lane mounts this file and has no aterm-link dependency
-/// (`run.rs` maps it, and opens the broker with aterm's own options for it:
-/// the tier and, on a weak one, aterm's escalation table).
-///
-/// ORDERED IS THE DEFAULT ARM, because it is what aterm opens its guarded
-/// broker at by default (`aterm_link::durability::default_for`, which
-/// `run.rs` holds this equal to): every ack after an ordering barrier
-/// (`F_BARRIERFSYNC`), and a full flush once the horizon
-/// ([`Spec::horizon_ms`]) has passed since the first ack no full flush
-/// covers — at most the horizon plus a batch and a flush after it — and
-/// before the ack of every record aterm's table escalates; served strict by
-/// astream off macOS and off the boot volume, which the entry's broker line
-/// then says. A bare `verify perf fabric` therefore measures the
-/// configuration aterm ships. STRICT is the baseline the default was gated
-/// against, and every entry's yardstick unit: every ack after a full flush
-/// (`F_FULLFSYNC` on macOS), what a person's message costs on a strict
-/// broker, and the default arm of every entry written before the 2026-10-20
-/// re-gate: compare a bare entry with one of those through
-/// `durability=strict`, never bare to bare. RELAXED is the ceiling: the
-/// batch's page-cache write and no flush at all, the bound a cheaper durable
-/// tier could approach and never pass. All three go through the same guarded
-/// open (the same capability checks); the bridge's own state-file writes are
-/// not the broker's and stay as they are in every arm.
+/// The durability tier for the bench's in-process broker.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Tier {
     Strict,
@@ -223,7 +149,7 @@ pub enum Tier {
 }
 
 impl Tier {
-    /// The word [`parse`] reads, and the report prints.
+    /// The word [`parse`] reads and the report prints.
     #[must_use]
     pub fn word(self) -> &'static str {
         match self {
@@ -233,12 +159,10 @@ impl Tier {
         }
     }
 
-    /// `strict`, `ordered` or `relaxed`, and nothing else. Pure
-    /// (unit-tested).
+    /// Parse `strict`, `ordered` or `relaxed`.
     ///
     /// # Errors
-    ///
-    /// Any other word, quoted.
+    /// Any other word.
     pub fn parse(word: &str) -> Result<Tier, String> {
         match word {
             "strict" => Ok(Tier::Strict),
@@ -251,7 +175,7 @@ impl Tier {
     }
 }
 
-/// The defaults: what `verify perf fabric` runs with no option.
+/// Default sample count for `verify perf fabric`.
 pub const DEFAULT_SAMPLES: usize = 200;
 pub const DEFAULT_WARMUP: usize = 3;
 pub const DEFAULT_BURST: usize = 500;
@@ -267,9 +191,7 @@ impl Spec {
         self.burst.div_ceil(PER_SENDER)
     }
 
-    /// The spec as the words [`parse`] reads, for the report: an ordered
-    /// arm's with its horizon, so the entry says which arm it is and
-    /// reproduces it.
+    /// Formats the spec as key=value words that [`parse`] reads.
     #[must_use]
     pub fn words(&self) -> String {
         let attach: Vec<String> = self.attach.iter().map(usize::to_string).collect();
@@ -301,18 +223,10 @@ impl Spec {
     }
 }
 
-/// Parse `out=<dir> [samples=<n>] [warmup=<n>] [burst=<n>] [pingpong=<n>]
-/// [attach=<n>,<n>,…] [rounds=<n>] [bystanders=<n>] [paced=<n>] [retention=on|off] [log=auto|off]
-/// [retention_interval_ms=<n>] [durability=strict|ordered|relaxed]
-/// [horizon_ms=<n>] [scenario=all|messaging|pingpong|attach|handoff]`. Pure (unit-tested).
+/// Parse a `FABRIC_BENCH` specification string.
 ///
 /// # Errors
-///
-/// A word that is not one of those, a count that is not a positive integer
-/// (`warmup` and `horizon_ms` may be 0), a durability that is not a
-/// [`Tier`], a horizon for a tier that is not ordered, a retention interval
-/// on a broker that does not retain, a burst past [`BURST_MAX`], an attach
-/// list that does not rise or passes [`ATTACH_MAX`], or no `out=`.
+/// Unknown words, invalid counts or options, or missing `out=`.
 pub fn parse(raw: &str) -> Result<Spec, String> {
     let mut out = None;
     let mut spec = Spec {
@@ -414,10 +328,9 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
     Ok(spec)
 }
 
-/// The required run [`ENV`] names.
+/// Parse [`Spec`] from [`ENV`].
 ///
 /// # Errors
-///
 /// Missing, non-Unicode or malformed input.
 pub fn from_env() -> Result<Spec, String> {
     let raw = std::env::var(ENV)
@@ -457,7 +370,6 @@ mod tests {
             (true, Log::Auto, None),
             "what ships: the default rules at every open, the auto mirror, astream's minute"
         );
-        // The words it reports are the words that reproduce it.
         let again = parse(&format!("out=/tmp/x {}", spec.words())).expect("round trip");
         assert_eq!(again, spec);
     }
@@ -496,18 +408,18 @@ mod tests {
             );
         }
         for bad in [
-            "samples=5",           // no out=
-            "out=/o samples=0",    // not positive
-            "out=/o burst=x",      // not a number
-            "out=/o pingpong=0",   // not positive
-            "out=/o pingpong=-1",  // not a number
-            "out=/o attach=8,1",   // does not rise
-            "out=/o attach=1,1",   // repeats
-            "out=/o attach=1,999", // past ATTACH_MAX
-            "out=/o burst=999999", // past BURST_MAX
-            "out=/o speed=11",     // unknown
-            "out=/o samples",      // not key=value
-            "out=",                // empty out
+            "samples=5",
+            "out=/o samples=0",
+            "out=/o burst=x",
+            "out=/o pingpong=0",
+            "out=/o pingpong=-1",
+            "out=/o attach=8,1",
+            "out=/o attach=1,1",
+            "out=/o attach=1,999",
+            "out=/o burst=999999",
+            "out=/o speed=11",
+            "out=/o samples",
+            "out=",
             "out=/o scenario=",
             "out=/o scenario=Pingpong",
             "out=/o scenario=pingpong,attach",
@@ -534,8 +446,6 @@ mod tests {
                 (retention, log, every),
                 "{words}"
             );
-            // The report's words carry them, so an entry says which broker
-            // and which mirror it measured, and reproduces them.
             let said = spec.words();
             assert!(
                 said.contains(&format!(
@@ -558,7 +468,6 @@ mod tests {
             "log=on",
             "retention_interval_ms=0",
             "retention_interval_ms=soon",
-            // A tick is a retaining broker's alone.
             "retention=off retention_interval_ms=1000",
         ] {
             let err = parse(&format!("out=/o {bad}")).expect_err(bad);
@@ -578,14 +487,10 @@ mod tests {
             assert_eq!(spec.durability, tier, "{word}");
             assert_eq!(spec.horizon_ms, None, "{word}: no horizon");
             assert_eq!(tier.word(), word);
-            // The report's words carry the tier, so an entry says what its
-            // acks promised and reproduces it.
             assert!(spec.words().ends_with(&format!(" durability={word}")));
             let again = parse(&format!("out=/o {}", spec.words())).expect("round trip");
             assert_eq!(again, spec);
         }
-        // Ordered carries its horizon: aterm's unless named, and the words say
-        // it, so the 1 s and the 100 ms arms read apart.
         let ordered = parse("out=/o durability=ordered").expect("ordered");
         assert_eq!(
             (ordered.durability, ordered.horizon_ms),
@@ -600,7 +505,6 @@ mod tests {
             parse(&format!("out=/o {}", fast.words())).expect("round trip"),
             fast
         );
-        // A horizon is the ordered tier's alone — the default arm's, unnamed.
         for bad in [
             "durability=strict horizon_ms=100",
             "durability=relaxed horizon_ms=100",
@@ -615,8 +519,6 @@ mod tests {
             Some(1000)
         );
         assert!(parse("out=/o durability=ordered horizon_ms=soon").is_err());
-        // Only the three words, spelled exactly: a near miss is refused rather
-        // than measured at a tier nobody asked for.
         for bad in [
             "Strict",
             "RELAXED",
@@ -629,9 +531,9 @@ mod tests {
             assert!(err.contains("durability="), "{bad}: {err}");
         }
     }
+
     /// B10's two knobs: idle bystander sessions beside the talking two, and
-    /// the ping-pong arm's paced rounds. Both reach the words and reproduce;
-    /// a bystander count past what one instance carries is refused.
+    /// the ping-pong arm's paced rounds.
     #[test]
     fn the_bystanders_and_the_paced_rounds_are_named_and_reproduce() {
         use super::*;
@@ -661,7 +563,6 @@ mod tests {
                 "{words}"
             );
         }
-        // NEGATIVE CONTROLS.
         for bad in [
             "bystanders=-1",
             "bystanders=x",

@@ -1,24 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The words every surface prints: the three scope sentences (design "At a
-//! glance"), and the compact figures the Deck draws beside its bars. One
-//! function per figure, so the Deck, accessibility, `aterm ctl sys` and an
-//! agent read the same text.
-//!
-//! Units: memory in binary GiB/MiB (what Activity Monitor shows), disk in
-//! decimal TB/GB (what Finder shows), CPU in cores-worth (`2.3c`: 2.3 cores
-//! busy for the interval). An unread figure is left out, never printed as 0.
-//!
-//! The heat table's words (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §6,
-//! §7.5, §8.4, §12, "v2" below) follow: each row's amount ladders
-//! ([`amount_forms`]), its aterm and Tab cells ([`scope_forms`]), its Details
-//! clauses ([`details`]), its state in words for where Details is absent
-//! ([`state`], rule S), and the sentence a screen reader says and ⌘C copies
-//! ([`row_sentence`]). They name no colour and draw no glyph: a phrase
-//! carries an [`InkKind`] and a [`Mark`], which the painter maps onto its
-//! inks and prims. Where macOS and Linux word a fact differently the
-//! [`Platform`] is a parameter, so both are read and tested on any host.
+//! Human-readable formatting, amount ladders, Details clauses, and spoken sentences for system vitals.
 
 use crate::history::Filling;
 use crate::jobs::Verdict;
@@ -30,20 +13,20 @@ use crate::peaks::{NET_LEARN_S, TOKENS_LEARN_S};
 use crate::ring::BUCKET_MS;
 use crate::trend::Motion;
 
-/// The noise gate for a cores-worth figure's motion: a tenth of a core.
+/// Noise gate for CPU core-count motion (`0.1` cores).
 pub const CORES_GATE: f32 = 0.1;
-/// The noise gate for a footprint's motion, GiB.
+/// Noise gate for memory footprint motion (`0.05` GiB).
 pub const FOOTPRINT_GATE_GIB: f32 = 0.05;
-/// The noise gate for one core's or the GPU's busy fraction: 4 points.
+/// Noise gate for single-core or GPU busy fraction (`0.04`).
 pub const LOAD_GATE: f32 = 0.04;
 
-/// Cores-worth to one decimal: `3.1`.
+/// Format a CPU core count to one decimal place.
 #[must_use]
 pub fn cores(c: f32) -> String {
     format!("{:.1}", c.max(0.0))
 }
 
-/// Bytes in binary units for memory: `310 MiB`, `2.3 GiB`, `17.7 GiB`.
+/// Format memory bytes in binary `MiB` or `GiB`.
 #[must_use]
 pub fn mem(bytes: u64) -> String {
     const MIB: f64 = 1024.0 * 1024.0;
@@ -58,13 +41,13 @@ pub fn mem(bytes: u64) -> String {
     }
 }
 
-/// GiB to one decimal without the unit: `17.7`.
+/// Format bytes as `GiB` to one decimal place without a unit suffix.
 #[must_use]
 pub fn gib_figure(bytes: u64) -> String {
     format!("{:.1}", bytes as f64 / f64::from(1u32 << 30))
 }
 
-/// Physical memory as people name it: `32 GiB` (whole when it is whole).
+/// Format physical memory total in `GiB` (integer when exact).
 #[must_use]
 pub fn gib_total(bytes: u64) -> String {
     let g = bytes as f64 / f64::from(1u32 << 30);
@@ -75,7 +58,7 @@ pub fn gib_total(bytes: u64) -> String {
     }
 }
 
-/// Bytes in decimal units for disk: `1.81 TB`, `412 GB`, `9.4 GB`.
+/// Format disk bytes in decimal `GB` or `TB`.
 #[must_use]
 pub fn disk(bytes: u64) -> String {
     let b = bytes as f64;
@@ -95,8 +78,7 @@ fn motion_suffix(m: Motion) -> String {
     m.word().map(|w| format!(", {w}")).unwrap_or_default()
 }
 
-/// The Global sentence: `Global: 3.1 of 10 cores busy, rising; GPU 4%;
-/// memory 17.7 of 32 GiB used, pressure normal; swap 0; disk 1.81 TB free.`
+/// Format the Global scope summary sentence.
 #[must_use]
 pub fn global_sentence(s: &Snapshot) -> String {
     let mut parts = Vec::new();
@@ -137,8 +119,7 @@ pub fn global_sentence(s: &Snapshot) -> String {
     format!("Global: {}.", parts.join("; "))
 }
 
-/// The aterm sentence: `aterm: 1.6 cores, 52% of busy; 2.3 GiB, rising; 17
-/// processes.`
+/// Format the `aterm` scope summary sentence.
 #[must_use]
 pub fn aterm_sentence(s: &Snapshot) -> String {
     let Some(a) = s.aterm.as_ref() else {
@@ -165,7 +146,7 @@ pub fn aterm_sentence(s: &Snapshot) -> String {
     format!("aterm: {}.", parts.join("; "))
 }
 
-/// A tab's sentence: `Tab 2: claude; 0.9 cores; 310 MiB.`
+/// Format a single tab's summary sentence.
 #[must_use]
 pub fn tab_sentence(t: &TabView) -> String {
     let mut parts = Vec::new();
@@ -188,7 +169,7 @@ pub fn tab_sentence(t: &TabView) -> String {
     format!("{}: {}.", t.label, parts.join("; "))
 }
 
-/// The compact CPU figure the Deck draws: `3.1c/10▴`.
+/// Format the compact Deck CPU figure (`3.1c/10▴`).
 #[must_use]
 pub fn cores_figure(level: f32, total: Option<usize>, motion: Motion) -> String {
     let mut s = format!("{}c", cores(level));
@@ -208,9 +189,7 @@ const MIB: f64 = 1_048_576.0;
 /// Decimal units by power of 1000, from bytes up (v2 §6.0).
 const DEC_UNITS: [&str; 7] = ["B", "kB", "MB", "GB", "TB", "PB", "EB"];
 
-/// Whose wording a phrase follows where the platforms differ (v2 §6.1,
-/// §6.4, §6.7). It is a parameter rather than a build setting, so every
-/// platform's words can be read and tested on any host.
+/// Target OS platform for platform-specific resource wording.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Platform {
     /// macOS.
@@ -224,7 +203,7 @@ pub enum Platform {
 }
 
 impl Platform {
-    /// The platform this build runs on.
+    /// Return the [`Platform`] of the current build target.
     #[must_use]
     pub const fn host() -> Self {
         if cfg!(target_os = "linux") {
@@ -236,7 +215,7 @@ impl Platform {
         }
     }
 
-    /// Its name as a sentence says it.
+    /// Platform display name (`"macOS"`, `"Linux"`, `"Windows"`).
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -246,8 +225,7 @@ impl Platform {
         }
     }
 
-    /// The machine as the deck names it: "this Mac", "this computer" off
-    /// macOS (v2 §3.5).
+    /// Machine noun phrase (`"this Mac"` or `"this computer"`).
     #[must_use]
     pub const fn machine(self) -> &'static str {
         match self {
@@ -262,7 +240,7 @@ impl Platform {
     }
 }
 
-/// How the words are said: the platform's wording and the local clock.
+/// Platform wording and local UTC offset for formatting vitals text.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Locale {
     /// Whose wording.
@@ -272,8 +250,7 @@ pub struct Locale {
     pub utc_offset_s: i64,
 }
 
-/// The ink a phrase is drawn in, by role. The painter maps each onto its
-/// [`crate::ink::VitalsInks`]; the words name no colour.
+/// Semantic ink role for a vitals phrase.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum InkKind {
     /// Primary text.
@@ -291,8 +268,7 @@ pub enum InkKind {
     Over,
 }
 
-/// A vector mark drawn before a phrase or in a row's well (v2 §10). The
-/// chrome faces lack these glyphs, so the painter draws each from prims.
+/// Vector status mark drawn before a phrase or in a row's well.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Mark {
     /// ◢: the disk is low, filling or stuck.
@@ -315,7 +291,7 @@ pub enum Mark {
     Down,
 }
 
-/// Which amount ladder a layout draws (v2 §6.0 "Amount ladders").
+/// Amount-column width ladder (`Det`, `Cols`, `NoCols`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Ladder {
     /// Details shows (wide, mid with Details, fwide with Details), so the
@@ -328,7 +304,7 @@ pub enum Ladder {
     NoCols,
 }
 
-/// One Details clause (v2 §6.0 rule D).
+/// Single Details column clause with priority, folding forms, spoken text, and mark.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Clause {
     /// Its forms, longest first.
@@ -382,8 +358,7 @@ impl Clause {
     }
 }
 
-/// A row's state in words, for where Details is absent (v2 §6.0 rule S) and
-/// for the fslim header (§4.4).
+/// Row state summary words for layouts without Details and for the `fslim` header.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateWords {
     /// The state the words say: the row's worst.
@@ -405,17 +380,16 @@ pub struct StateWords {
     pub ink: InkKind,
 }
 
-/// One scope cell's forms: an aterm or a Tab figure.
+/// Candidate text forms (longest first) and ink for an `aterm` or `Tab` scope cell.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScopeCell {
-    /// The forms, longest first. A figure that does not fit shortens its
-    /// number, never its label.
+    /// The forms, longest first.
     pub forms: Vec<String>,
     /// Its ink: words for a figure, words2 for a phrase saying there is none.
     pub ink: InkKind,
 }
 
-/// A row's aterm and Tab cells (v2 §6).
+/// Scope cells for a resource row (`Each` column or a single `Span`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScopeForms {
     /// A cell in each column.
@@ -429,8 +403,7 @@ pub enum ScopeForms {
     Span(ScopeCell),
 }
 
-/// Parts of a whole printed together (v2 §6.0 "Rounding"), from
-/// [`parts_of`].
+/// Whole and part figures rounded to a shared decimal unit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Parts {
     /// The whole's figure: `2.00`.
@@ -443,7 +416,6 @@ pub struct Parts {
 
 /// `v` rounded half up to a whole number (v2 §6.0).
 fn half_up(v: f64) -> f64 {
-    // The nudge rounds a half that binary floating point stores a hair low
     // (12.5 % of 0.125 as 12.499…) up, as the reader expects.
     (v + 0.5 + 1e-9).floor()
 }
@@ -491,7 +463,7 @@ fn sig_unit(sig: u64, e: u32) -> (u32, &'static str) {
     (2 - lead % 3, DEC_UNITS[(lead / 3) as usize])
 }
 
-/// A whole number with its thousands grouped: `16,000`.
+/// Format an integer with comma thousands separators.
 #[must_use]
 pub fn grouped(n: u64) -> String {
     let digits = n.to_string();
@@ -528,22 +500,19 @@ fn rate_lone(v: f64) -> String {
     }
 }
 
-/// A rate printed alone, in decimal megabytes ([`rate_lone`]): `writes 38
-/// MB/s`, the lens's `rustc ×9 in Tab 3, 31 MB/s`, `5.1 MB/s`.
+/// Format a standalone byte rate in decimal `MB/s`.
 #[must_use]
 pub fn rate_mb_lone(bytes_per_s: f64) -> String {
     format!("{} MB/s", rate_lone(bytes_per_s / 1e6))
 }
 
-/// Bytes per second in decimal megabytes (v2 §6.0): `2.1 MB/s`, `410
-/// MB/s`.
+/// Format a byte rate against capacity in decimal `MB/s`.
 #[must_use]
 pub fn rate_mb(bytes_per_s: f64) -> String {
     format!("{} MB/s", rate_figure(bytes_per_s / 1e6))
 }
 
-/// Bytes in decimal units at three significant digits, rounded half up (v2
-/// §6.0): `2.00 TB`, `885 GB`, `41.2 GB`.
+/// Format bytes in decimal units to three significant digits.
 #[must_use]
 pub fn bytes_dec(bytes: u64) -> String {
     let (sig, e) = sig3(bytes);
@@ -551,13 +520,7 @@ pub fn bytes_dec(bytes: u64) -> String {
     format!("{} {unit}", point(sig, dec))
 }
 
-/// A byte figure printed alone, in decimal units at two significant digits,
-/// whole from ten of the unit, rounded half up (v2 §6.0): `41 GB`, `885
-/// GB`, `1.2 TB`, `8.6 GB`. Every lone figure the deck, its Details and the
-/// lens print takes this form ("low, 41 GB free", "freed 41 GB", "warns
-/// below 69 GB free"), so one quantity reads the same wherever it is
-/// printed; the compact amount's freed form is sized for it (§19 item 2).
-/// Only parts printed with their whole take three digits ([`parts_of`]).
+/// Format standalone bytes in decimal units to two significant digits.
 #[must_use]
 pub fn bytes_lone(bytes: u64) -> String {
     let (sig, e) = sig3(bytes);
@@ -565,8 +528,6 @@ pub fn bytes_lone(bytes: u64) -> String {
     if dec == 0 {
         return format!("{} {unit}", point(sig, 0));
     }
-    // Two digits: one decimal fewer than three print, rounded from the
-    // bytes, and 9.96 GB is "10 GB", not "10.0 GB".
     let q = 10u128.pow(e + 1);
     let mut n = u64::try_from((u128::from(bytes) + q / 2) / q).unwrap_or(u64::MAX);
     let mut dec = dec - 1;
@@ -577,14 +538,7 @@ pub fn bytes_lone(bytes: u64) -> String {
     format!("{} {unit}", point(n, dec))
 }
 
-/// Parts of `whole` printed together (v2 §6.0): the whole rounded to three
-/// significant digits, each part in the whole's unit and decimal places, and
-/// the last part the whole less the others, so the printed parts sum
-/// (`1.11 TB used · 0.89 TB free · 2.00 TB`). The parts are rounded by
-/// largest remainder: each is rounded down, and the units the whole has left
-/// go one each to the parts with the largest remainders (the earlier on a
-/// tie), so with any number of parts each is within one unit of its value.
-/// The parts are meant to sum to `whole`.
+/// Format `whole` and `parts` in `whole`'s decimal unit so the parts sum to the whole.
 #[must_use]
 pub fn parts_of(whole: u64, parts: &[u64]) -> Parts {
     let (sig, e) = sig3(whole);
@@ -614,8 +568,7 @@ pub fn parts_of(whole: u64, parts: &[u64]) -> Parts {
     }
 }
 
-/// A count in thousands or millions (v2 §6.0): `3.1k`, `127k`, `1.2M`;
-/// whole under 1000 (`897`).
+/// Format a token or event count with `k` or `M` suffixes.
 #[must_use]
 pub fn tokens_k(n: f64) -> String {
     let n = n.max(0.0);
@@ -635,7 +588,7 @@ pub fn tokens_k(n: f64) -> String {
     format!("{:.0}G", half_up(n / 1e9))
 }
 
-/// A duration in round words (v2 §7.2): `~34 min`, `~5 h`, `~2 days`.
+/// Format an approximate duration (`~34 min`, `~5 h`, `~2 days`).
 #[must_use]
 pub fn duration_approx(secs: f64) -> String {
     let secs = secs.max(0.0);
@@ -651,9 +604,7 @@ pub fn duration_approx(secs: f64) -> String {
     format!("~{d:.0} {}", if d < 1.5 { "day" } else { "days" })
 }
 
-/// A share as the % column prints it (v2 §6.0): a whole percent rounded half
-/// up, `<1%` under half a percent, `0%` for exactly none, `100%` past full
-/// (the over mark carries the excess), and `–` when unknown.
+/// Format a `[0.0, 1.0]` share for the `%` column (`0%`, `<1%`, `12%`).
 #[must_use]
 pub fn pct(share: Option<f32>) -> String {
     let Some(p) = share.map(|s| f64::from(s) * 100.0).filter(|p| !p.is_nan()) else {
@@ -668,8 +619,7 @@ pub fn pct(share: Option<f32>) -> String {
     }
 }
 
-/// `at_unix_ms` as local `HH:MM`, with the weekday (`Thu 09:00`) when it is
-/// not the local day of `now_unix_ms` (v2 §6.0).
+/// Format `at_unix_ms` as local `HH:MM` (with weekday prefix when on a different local day).
 #[must_use]
 pub fn clock(at_unix_ms: i64, now_unix_ms: i64, utc_offset_s: i64) -> String {
     const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -686,7 +636,7 @@ pub fn clock(at_unix_ms: i64, now_unix_ms: i64, utc_offset_s: i64) -> String {
     }
 }
 
-/// A row's name as the deck prints it.
+/// Display name for resource row `res`.
 #[must_use]
 pub const fn resource_name(res: Resource) -> &'static str {
     match res {
@@ -726,11 +676,7 @@ fn of_slash(ladder: Ladder, of: String, slash: String) -> Vec<String> {
     }
 }
 
-/// The amount cell's forms, longest first (v2 §6.1–§6.7): `17.7 of 18
-/// cores`. Every form names its unit (Processes' bare `897/16,000` on macOS
-/// takes its row's name as its unit), and all but the last resorts name the
-/// denominator. Empty while the row has no reading. `facts` gives Disk
-/// today's freed tally.
+/// Candidate text forms (longest first) for a row's amount cell under `ladder`.
 #[must_use]
 pub fn amount_forms(
     res: Resource,
@@ -928,7 +874,6 @@ fn tokens_amount(view: &ResourceView, ladder: Ladder) -> Vec<String> {
                 "learning".into(),
             ],
         },
-        // The model never measures tokens against a fixed capacity.
         (CapBasis::Fixed, _) => Vec::new(),
     }
 }
@@ -972,11 +917,7 @@ fn processes_amount(view: &ResourceView, ladder: Ladder, platform: Platform) -> 
     }
 }
 
-/// A row's aterm and Tab cells (v2 §6): the scope figures in the row's unit
-/// (`6.8 cores`, `writes 38 MB/s`, `3.1k/min`), or one phrase spanning
-/// both where no scope can have a figure (`no per-app figure`, `writes not
-/// read on Linux`). `view.tab` is the window's front tab's
-/// ([`Snapshot::resource`]).
+/// Candidate text forms for a row's `aterm` and `Tab` scope cells.
 #[must_use]
 pub fn scope_forms(res: Resource, view: &ResourceView, loc: &Locale) -> ScopeForms {
     let span = |forms: Vec<String>| {
@@ -1027,9 +968,6 @@ fn scope_cell(res: Resource, fig: &ScopeFig) -> ScopeCell {
         }
         Resource::Disk => writes_forms(v),
         Resource::Tokens => vec![format!("{}/min", tokens_k(v))],
-        // The figure counts the scope's processes on every platform: the
-        // sweep reads no thread count, so Linux's cells say processes where
-        // its row says threads.
         Resource::Processes => {
             let n = half_up(v) as u64;
             let unit = plural(n, "process", "processes");
@@ -1053,8 +991,6 @@ fn writes_forms(bytes_per_s: f64) -> Vec<String> {
         return vec!["writes 0".into()];
     }
     let mut forms = vec![format!("writes {}", rate_mb_lone(bytes_per_s))];
-    // Under 10 MB/s the figure keeps a tenth; a column too narrow for it
-    // takes the whole number (`writes 5 MB/s`).
     if (1.0..10.0).contains(&(half_up(mb * 10.0) / 10.0)) {
         forms.push(format!("writes {} MB/s", grouped(half_up(mb) as u64)));
     }
@@ -1085,9 +1021,7 @@ fn state_mark(res: Resource, state: State) -> (Mark, InkKind) {
     }
 }
 
-/// What a row's well holds (v2 §6.0 "Well"): the mark of its worst state;
-/// with none, Network's binding direction (↓ receiving, ↑ sending) in
-/// words2; else nothing.
+/// Well mark and ink for resource row `res`.
 #[must_use]
 pub fn well(res: Resource, view: &ResourceView) -> Option<(Mark, InkKind)> {
     if let Some(s) = view.state {
@@ -1103,9 +1037,7 @@ pub fn well(res: Resource, view: &ResourceView) -> Option<(Mark, InkKind)> {
     })
 }
 
-/// The sentence a row's strip holds instead of cells (v2 §6.2, §6.6), its
-/// forms longest first for rule F: the GPU with no reading in the hour,
-/// Tokens while learning its peak.
+/// Strip-spanning status sentence forms when a resource has no live cells (e.g., idle GPU or no agents).
 #[must_use]
 pub fn strip_words(res: Resource, snap: &Snapshot) -> Option<Vec<String>> {
     let view = &snap.resources[res.index()];
@@ -1152,7 +1084,6 @@ fn disk_free(snap: &Snapshot) -> Option<u64> {
 }
 
 /// A volume's level clause and word (v2 §6.4): `low, 41 GB free` / `low`.
-/// `None` at the Ok level.
 fn level_words(level: DiskLevel, free: Option<u64>) -> Option<(State, String, String)> {
     let free = free.map(|b| format!(", {} free", bytes_lone(b)));
     let free = free.as_deref().unwrap_or("");
@@ -1176,7 +1107,7 @@ fn level_words(level: DiskLevel, free: Option<u64>) -> Option<(State, String, St
 
 /// The Disk row's states in Details order (v2 §6.4): filling within the
 /// hour, then the home volume's level, other volumes, sessions stuck on a
-/// full disk and a stalled watch. Only filling is known with the watch off.
+/// full disk and a stalled watch.
 fn disk_states(snap: &Snapshot, loc: &Locale) -> Vec<DiskSaid> {
     let facts = &snap.facts;
     let mut out = Vec::new();
@@ -1196,7 +1127,6 @@ fn disk_states(snap: &Snapshot, loc: &Locale) -> Vec<DiskSaid> {
     let Some(w) = facts.disk.as_ref().filter(|d| d.watch) else {
         return out;
     };
-    // The level clause leads, or follows the filling clause without a mark.
     if let Some((state, form, word)) = w.level.and_then(|l| level_words(l, disk_free(snap))) {
         let lead = out.is_empty();
         out.push(DiskSaid {
@@ -1209,8 +1139,6 @@ fn disk_states(snap: &Snapshot, loc: &Locale) -> Vec<DiskSaid> {
             mark: lead.then_some(Mark::Low),
         });
     }
-    // Another volume the watch judges warns, whatever its level, as the
-    // row's well has it.
     for (name, level, free) in &w.others {
         if let Some((_, form, word)) = level_words(*level, Some(*free)) {
             let lead = out.is_empty();
@@ -1270,8 +1198,7 @@ struct JobSaid {
 }
 
 /// The jobs engine's marks in the well's order, each with its count: `1
-/// stuck`, `3 zombies`, `2 quiet`, `1 waiting for you`, `1 stopped`. Only
-/// zombies in one of aterm's tabs count, as in the well.
+/// stuck`, `3 zombies`, `2 quiet`, `1 waiting for you`, `1 stopped`.
 fn job_marks(snap: &Snapshot) -> Vec<JobSaid> {
     let Some(jobs) = snap.jobs.as_deref() else {
         return Vec::new();
@@ -1322,10 +1249,7 @@ fn times_words(n: u64) -> String {
     }
 }
 
-/// A row's state in words (v2 §6.0 rule S), for where Details is absent and
-/// for the fslim header; `None` for a calm row and for the rows that have no
-/// state (CPU, Network, Tokens). Several states say the worst; between
-/// equals, the one Details puts first.
+/// State summary words for resource row `res` when abnormal.
 #[must_use]
 pub fn state(res: Resource, snap: &Snapshot, loc: &Locale) -> Option<StateWords> {
     let view = &snap.resources[res.index()];
@@ -1367,7 +1291,6 @@ pub fn state(res: Resource, snap: &Snapshot, loc: &Locale) -> Option<StateWords>
             (top.state, top.forms, top.word, top.label)
         }
         Resource::Processes => {
-            // The worst mark names the state; the long clause lists them all.
             let marks = job_marks(snap);
             let first = marks.first()?;
             let mut clauses = vec![first.words.clone()];
@@ -1386,8 +1309,6 @@ pub fn state(res: Resource, snap: &Snapshot, loc: &Locale) -> Option<StateWords>
     };
     let (mark, ink) = state_mark(res, state);
     let amount_forms = match res {
-        // A state outranks the freed figure, and a bare used figure is the
-        // last resort before the state alone.
         Resource::Disk => match disk_shapes(view) {
             Some((Some((_, slash)), alone)) => vec![slash, alone],
             Some((None, alone)) => vec![alone],
@@ -1406,8 +1327,7 @@ pub fn state(res: Resource, snap: &Snapshot, loc: &Locale) -> Option<StateWords>
     })
 }
 
-/// A row's Details clauses in priority order (v2 §6.1–§6.7): state clauses
-/// first, kept; then the facts by priority, each with its short forms.
+/// Priority-ordered Details clauses for resource row `res`.
 #[must_use]
 pub fn details(res: Resource, snap: &Snapshot, loc: &Locale) -> Vec<Clause> {
     let mut out = match res {
@@ -1429,8 +1349,6 @@ fn cpu_details(snap: &Snapshot, loc: &Locale) -> Vec<Clause> {
     if let (Some(load), Some(n)) = (snap.facts.load1, view.capacity) {
         let l = fixed(load, 1);
         let on = format!("load {l} on {n:.0} cores");
-        // Linux's load counts threads waiting on disk too, so it is never
-        // called waiting for a core there.
         let waiting = half_up(load - n);
         out.push(if loc.platform != Platform::Linux && waiting >= 1.0 {
             let w = waiting as u64;
@@ -1603,8 +1521,6 @@ fn disk_details(snap: &Snapshot, loc: &Locale) -> Vec<Clause> {
         ),
         None => {}
     }
-    // The free figure, unless the level clause already says it ("low, 41 GB
-    // free"): a figure is never said twice, in the Details drawn or spoken.
     let level_says_free = facts
         .disk
         .as_ref()
@@ -1638,7 +1554,6 @@ fn growth(delta: f64) -> Clause {
         return Clause::new(4, vec!["steady".into()])
             .said("Used held steady over the last 10 minutes.".into());
     }
-    // A figure printed alone, as the lens's growth line prints it.
     let fig = bytes_lone(delta.abs() as u64);
     let (sign, verb) = if delta > 0.0 {
         ('+', "grew")
@@ -1652,8 +1567,7 @@ fn growth(delta: f64) -> Clause {
 }
 
 /// Network's learning clause (v2 §6.5 p0), while its capacity is the link's
-/// because 24 hours are not yet read. A network that learned its peak but
-/// has none left in the 7 days measures against the link without one.
+/// because 24 hours are not yet read.
 fn network_learning(snap: &Snapshot) -> Option<Clause> {
     let view = &snap.resources[Resource::Network.index()];
     if !matches!(view.basis, CapBasis::Link | CapBasis::Learning)
@@ -1681,7 +1595,6 @@ fn network_learning(snap: &Snapshot) -> Option<Clause> {
 fn network_details(snap: &Snapshot) -> Vec<Clause> {
     let view = &snap.resources[Resource::Network.index()];
     let mut out: Vec<Clause> = network_learning(snap).into_iter().collect();
-    // The other direction, with its own capacity.
     let (other, mark, word, verb) = if second_binds(view) {
         (Some(view.first()), Mark::Down, "down", "Receiving")
     } else {
@@ -1769,15 +1682,12 @@ fn processes_details(snap: &Snapshot) -> Vec<Clause> {
         .into_iter()
         .enumerate()
         .map(|(i, m)| {
-            // The worst mark is the row's state: it leads and keeps.
             let c = Clause::new(if i == 0 { 0 } else { 1 }, vec![m.words])
                 .marked(Some(m.mark))
                 .inked(m.ink);
             if i == 0 { c.kept() } else { c }
         })
         .collect();
-    // The count the amount does not print: this user's, or the machine's
-    // when this user's binds.
     let first = view.first();
     if let Some(second) = view.second.as_ref() {
         let (who, s) = if second.binds {
@@ -1799,11 +1709,7 @@ fn processes_details(snap: &Snapshot) -> Vec<Clause> {
     out
 }
 
-/// The Disk lens's "Wrong?" answer (v2 §7.5): "No." with how long the free
-/// space lasts, or "Yes." with the first true fact of: the level at low or
-/// under, sessions stuck, full within a day, the watch stalled, another
-/// volume low; then what aterm is doing about it. `None` with the watch off,
-/// where the lens hides it (§7.6).
+/// Format the Disk lens `Wrong?` diagnostic line.
 #[must_use]
 pub fn disk_wrong(snap: &Snapshot, loc: &Locale) -> Option<String> {
     let d = snap.facts.disk.as_ref().filter(|d| d.watch)?;
@@ -1877,8 +1783,6 @@ pub fn disk_wrong(snap: &Snapshot, loc: &Locale) -> Option<String> {
         no.push_str(" No session is stuck on a full disk.");
         return Some(no);
     };
-    // What aterm does about it: it cleans its build caches under the
-    // cleaning line, and says where that line is above it.
     let action = match (d.level, d.floor) {
         (Some(DiskLevel::Short | DiskLevel::Emergency | DiskLevel::EmergencyFiles), _) => {
             " aterm is cleaning its build caches.".to_string()
@@ -1892,8 +1796,7 @@ pub fn disk_wrong(snap: &Snapshot, loc: &Locale) -> Option<String> {
     Some(format!("Yes. {fact}{action}"))
 }
 
-/// The space line (v2 §7.5): `1.11 TB used · 0.89 TB free · 2.00 TB`, the
-/// parts rounded so they sum to the whole.
+/// Format the Disk lens used/free/total volume space line.
 #[must_use]
 pub fn disk_space_line(v: &VolumeSample) -> String {
     let free = v.available.min(v.total);
@@ -1922,8 +1825,7 @@ const SPOKEN_UNITS: [(&str, &str, &str); 13] = [
     ("h", "hours", "hour"),
 ];
 
-/// A phrase as a screen reader should say it (v2 §12): unit symbols spelled
-/// out, `·` as a comma, and every figure through [`speak_figure`].
+/// Expand abbreviations, symbols, and units in `text` for screen readers.
 #[must_use]
 pub fn speak(text: &str) -> String {
     let text = text.replace(" · ", ", ");
@@ -1945,7 +1847,7 @@ pub fn speak(text: &str) -> String {
 /// A figure as a reader says it: `~34` "about 34", `12%` "12 percent",
 /// `<1%` "less than 1 percent", `3.1k` "3.1 thousand", `1.2M` "1.2 million",
 /// `3.1k/min` "3.1 thousand per minute", `2.1/11.8` "2.1 of 11.8", `≥` "at
-/// least". Anything else is said as written.
+/// least".
 fn speak_figure(w: &str) -> String {
     let digit = |s: &str| s.starts_with(|c: char| c.is_ascii_digit());
     if w == "≥" {
@@ -2154,14 +2056,7 @@ fn of_ten_minutes(n: usize) -> String {
     }
 }
 
-/// A row's sentence (v2 §12): the accessibility Meter's value description,
-/// what ⌘C in the lens copies and what `sys` prints. In order: the % of its
-/// capacity with the amount, the aterm and Tab figures (`tab` is the
-/// window's front tab), the last 10 minutes, and every Details clause:
-///
-/// `CPU 98 percent of capacity: 17.7 of 18 cores. aterm 6.8 cores, Tab 2 0.1
-/// cores. Steady near 98 percent. Over capacity 8 of the last 10 minutes. 8
-/// waiting for a core, load 25.7 on 18 cores.`
+/// Full spoken and copied accessibility summary sentence for resource row `res`.
 #[must_use]
 pub fn row_sentence(res: Resource, snap: &Snapshot, tab: Option<u64>, loc: &Locale) -> String {
     let name = resource_name(res);
@@ -2324,8 +2219,6 @@ mod tests {
         );
         assert_eq!(cores_figure(0.9, None, Motion::Steady), "0.9c");
     }
-
-    // The heat table's words (v2).
 
     use crate::history::Rates;
     use crate::jobs::{Class, Consumer, Findings, JobKind, JobRow, JobsView, Tick, ZombieParent};
@@ -2639,8 +2532,6 @@ mod tests {
                 ],
             }
         };
-        // Every form names its unit (the bare macOS process count's unit is
-        // its row's name).
         let names_unit = |res: Resource, form: &str, loc: &Locale| match res {
             Resource::Cpu => form.contains("cores"),
             Resource::Gpu => form.contains("busy") && form.contains('%'),
@@ -2663,7 +2554,6 @@ mod tests {
                         assert!(names_unit(res, form, &loc), "{res:?}: {form}");
                     }
                 }
-                // Nothing read: nothing said, never a zero.
                 let blank = ResourceView::default();
                 for ladder in [Det, Cols, NoCols] {
                     assert!(amount_forms(res, &blank, &facts, ladder, &loc).is_empty());
@@ -2671,8 +2561,6 @@ mod tests {
             }
         }
 
-        // Disk: nothing freed (or the watch off) drops the freed forms; under
-        // a terabyte the figures are gigabytes.
         let disk = row(1.11e12, 2e12);
         let calm = RowFacts::default();
         assert_eq!(
@@ -2690,8 +2578,6 @@ mod tests {
             strings(&["512 of 994 GB used"])
         );
 
-        // Network: on the link while learning, and the send direction when it
-        // binds.
         let mut link = row(2.1e6, 22.9e6);
         link.basis = CapBasis::Link;
         link.second = Some(series(0.3e6, 22.9e6, false));
@@ -2707,11 +2593,9 @@ mod tests {
             strings(&["3.0 of 4.2 MB/s peak"])
         );
 
-        // Tokens while learning its peak.
         let mut learning = row(3_100.0, 1.0);
         learning.capacity = None;
         learning.basis = CapBasis::Learning;
-        // Every ladder ends in a form short enough for fnarrow's amount.
         for ladder in [Det, Cols] {
             assert_eq!(
                 amount_forms(Resource::Tokens, &learning, &calm, ladder, &MAC),
@@ -2727,7 +2611,6 @@ mod tests {
             amount_forms(Resource::Tokens, &learning, &calm, NoCols, &MAC),
             strings(&["aterm 3.1k/min, learning", "3.1k/min, learning", "3.1k/min"])
         );
-        // With no agent read yet, it says it learns rather than print a zero.
         learning.now = None;
         assert_eq!(
             amount_forms(Resource::Tokens, &learning, &calm, NoCols, &MAC),
@@ -2739,7 +2622,6 @@ mod tests {
             ])
         );
 
-        // Processes: this user's limit binds, and says so.
         let mut yours = row(897.0, 16_000.0);
         yours.second = Some(series(900.0, 10_666.0, true));
         assert_eq!(
@@ -2760,8 +2642,6 @@ mod tests {
         );
         assert_eq!(bytes_dec(9_995_000_000), "10.0 GB");
         assert_eq!(bytes_dec(99), "99 B");
-        // A figure printed alone: two digits, whole from ten of the unit,
-        // so the deck, its Details and the lens print one quantity alike.
         assert_eq!(bytes_lone(41_240_000_000), "41 GB");
         assert_eq!(bytes_lone(69_000_000_000), "69 GB");
         assert_eq!(bytes_lone(885_300_000_000), "885 GB");
@@ -2782,7 +2662,6 @@ mod tests {
             disk_space_line(&vol(2_000_000_000_000, 890_000_000_000)),
             "1.11 TB used · 0.89 TB free · 2.00 TB"
         );
-        // Trouble: free 0.04 and used 1.96, summing to the whole.
         assert_eq!(
             disk_space_line(&vol(2_000_000_000_000, 44_800_000_000)),
             "1.96 TB used · 0.04 TB free · 2.00 TB"
@@ -2797,8 +2676,6 @@ mod tests {
             ),
             strings(&["1.96/2.00 TB used"])
         );
-        // Parts printed together always sum to their whole, whatever the
-        // split and the unit.
         let quanta = |s: &str| s.replace('.', "").parse::<u64>().expect("a figure");
         for whole in [
             99u64,
@@ -2813,8 +2690,6 @@ mod tests {
             for split in [0.001, 0.1234, 0.5, 0.8765, 0.999] {
                 let a = (whole as f64 * split) as u64;
                 let b = (whole - a) / 3;
-                // Two equal parts round the same way, both up when either
-                // does.
                 let c = a.min(whole - a) / 2;
                 for parts in [[a, b, whole - a - b], [c, c, whole - 2 * c]] {
                     let p = parts_of(whole, &parts);
@@ -2828,9 +2703,6 @@ mod tests {
                 }
             }
         }
-        // Two parts that both round up would pass the whole: the largest
-        // remainder takes the unit left, and each part stays within one
-        // unit of its value.
         assert_eq!(
             parts_of(12_345, &[6_150, 6_150, 45]),
             Parts {
@@ -2839,8 +2711,6 @@ mod tests {
                 unit: "kB",
             }
         );
-        // Four halves: the two units left go to the first two parts, where
-        // rounding each but the last up would leave the last 1.5 units short.
         assert_eq!(
             parts_of(1_020, &[255, 255, 255, 255]).parts,
             strings(&["0.26", "0.26", "0.25", "0.25"])
@@ -2910,8 +2780,6 @@ mod tests {
             each(Resource::Memory, fig(5.0 * GIB), fig(0.18 * GIB), &MAC),
             (words(&["5.0 GiB"]), words(&["0.18 GiB"]))
         );
-        // A rate printed alone is whole from 10 (§6.0), and keeps a tenth
-        // under it, with the whole number to fall back on.
         assert_eq!(
             each(Resource::Disk, fig(38.4e6), fig(0.04e6), &MAC),
             (words(&["writes 38 MB/s"]), words(&["writes 0"]))
@@ -2923,8 +2791,6 @@ mod tests {
                 words(&["writes 0.2 MB/s"])
             )
         );
-        // A writes figure that does not fit shortens its number, never its
-        // label.
         assert_eq!(
             each(Resource::Disk, fig(410e6), fig(0.2e6), &MAC).0,
             words(&["writes 410 MB/s", "writes 0.41 GB/s", "writes 0.4 GB/s"])
@@ -2942,8 +2808,6 @@ mod tests {
             each(Resource::Processes, fig(42.0), fig(1.0), &MAC),
             (words(&["42 processes", "42"]), words(&["1 process", "1"]))
         );
-        // The sweep counts processes, not threads, so Linux's cells say so
-        // although its row counts threads.
         assert_eq!(
             each(Resource::Processes, fig(212.0), fig(3.0), &LINUX),
             (
@@ -2951,7 +2815,6 @@ mod tests {
                 words(&["3 processes", "3"])
             )
         );
-        // Not read yet is a dash, never a zero.
         assert_eq!(
             each(
                 Resource::Cpu,
@@ -2961,7 +2824,6 @@ mod tests {
             ),
             (words2("–"), words2("–"))
         );
-        // No scope can have a figure: one phrase spans both columns.
         let span = |res: Resource, why: NoFigure, loc: &Locale| {
             let view = ResourceView {
                 aterm: missing(why),
@@ -2992,7 +2854,6 @@ mod tests {
     fn rule_s_says_each_state_in_words() {
         let words = |s: &Snapshot, res: Resource| state(res, s, &MAC).expect("a state");
 
-        // Memory: pressure, with the compact amount.
         let mut s = snap();
         let mut mem = row(112.6 * GIB, 128.0 * GIB);
         mem.state = Some(State::Warn);
@@ -3010,8 +2871,6 @@ mod tests {
             }
         );
 
-        // Disk filling within the hour and low: filling leads, and the
-        // amount drops its freed figure.
         let mut s = disk_trouble();
         s.facts.disk.as_mut().expect("facts").stuck = 0;
         s.resources[Resource::Disk.index()].state = Some(State::Warn);
@@ -3027,7 +2886,6 @@ mod tests {
                 ink: InkKind::Warn,
             }
         );
-        // Two sessions stuck on a full disk are worse than either.
         let w = words(&disk_trouble(), Resource::Disk);
         assert_eq!((w.state, w.ink), (State::Critical, InkKind::Critical));
         assert_eq!(
@@ -3038,8 +2896,6 @@ mod tests {
                 "Disk 2 stuck"
             )
         );
-        // Low alone, and an emergency of file slots that prints no free
-        // figure.
         let mut s = disk_trouble();
         s.facts.filling = None;
         s.facts.disk = Some(watch(DiskLevel::Low));
@@ -3062,7 +2918,6 @@ mod tests {
             )
         );
 
-        // Processes: the worst mark, then every mark.
         assert_eq!(
             words(&processes_trouble(), Resource::Processes),
             StateWords {
@@ -3076,7 +2931,6 @@ mod tests {
             }
         );
 
-        // GPU: a reset during this run.
         let mut s = snap();
         let mut gpu = row(12.0, 100.0);
         gpu.state = Some(State::Warn);
@@ -3093,7 +2947,6 @@ mod tests {
             )
         );
 
-        // A calm row, and the rows that have no state, say none.
         let mut s = snap();
         for res in Resource::ALL {
             let mut v = row(1.0, 2.0);
@@ -3121,9 +2974,6 @@ mod tests {
         use InkKind::{Critical, Warn, Words, Words2};
         let f = |forms: &[&str]| strings(forms);
 
-        // Disk in trouble: filling under the hour outranks the level clause,
-        // which follows it without a mark; both and the stuck sessions keep.
-        // The level clause says the free figure, so p5 does not repeat it.
         assert_eq!(
             shape(&details(Resource::Disk, &disk_trouble(), &MAC)),
             vec![
@@ -3159,8 +3009,6 @@ mod tests {
                 ),
             ]
         );
-        // Filling within the day but not the hour sits at p2, after a stalled
-        // watch, which keeps; growth that shrank says so.
         let mut s = disk_trouble();
         s.facts.filling = Some(Filling {
             secs: 5.0 * 3600.0,
@@ -3193,8 +3041,6 @@ mod tests {
                 (5, false, None, Words, f(&["45 GB free"])),
             ]
         );
-        // With the harness off there is no level, no stuck count and no
-        // freed tally, whatever the facts still carry; "where" still shows.
         let mut s = disk_trouble();
         s.facts.filling = None;
         s.facts.disk_rates = Rates::default();
@@ -3226,7 +3072,6 @@ mod tests {
             "no state the watch would judge"
         );
 
-        // Memory under pressure.
         let mut s = snap();
         s.mem = Some(MemView {
             sample: MemSample {
@@ -3254,8 +3099,6 @@ mod tests {
             (0, false, None, Words2, f(&["pressure normal"]))
         );
 
-        // Processes: the worst mark keeps; this user's count is the fact the
-        // amount does not print.
         assert_eq!(
             shape(&details(Resource::Processes, &processes_trouble(), &MAC)),
             vec![
@@ -3272,8 +3115,6 @@ mod tests {
             ]
         );
 
-        // CPU: the run queue in macOS's words and in Linux's; the busiest
-        // program grouped by name.
         let mut s = snap();
         set(&mut s, Resource::Cpu, row(17.7, 18.0));
         s.facts.load1 = Some(25.7);
@@ -3320,8 +3161,6 @@ mod tests {
             ]
         );
 
-        // Network while it learns its peak: the learning clause, the other
-        // direction and the link.
         let mut s = snap();
         let mut net = row(2.1e6, 22.9e6);
         net.basis = CapBasis::Link;
@@ -3361,9 +3200,6 @@ mod tests {
                 ),
             ]
         );
-        // Learned, with no peak left in the 7 days (a week away): on the
-        // link without a learning clause, and with no link nothing to
-        // measure against.
         s.facts.net_read_s = NET_LEARN_S;
         let clauses = details(Resource::Network, &s, &MAC);
         assert!(
@@ -3386,7 +3222,6 @@ mod tests {
             strings(&["2.1 MB/s, no peak in 7 days"])
         );
 
-        // Tokens: the plan as a dated fact, else a plain "not read".
         let mut s = snap();
         s.facts.tokens_in = Some(410_000.0);
         s.facts.plan = Some(PlanFact {
@@ -3424,7 +3259,6 @@ mod tests {
             vec![input, (2, false, None, Words2, f(&["plan limit not read"]))]
         );
 
-        // GPU: a reset keeps and leads; no reading, no Details.
         let mut s = snap();
         set(&mut s, Resource::Gpu, row(12.0, 100.0));
         s.facts.gpu_resets = Some((1, NOW - 28 * MIN_MS));
@@ -3459,7 +3293,6 @@ mod tests {
 
     #[test]
     fn row_sentences() {
-        // CPU, over its maximum for most of the window.
         let mut s = snap();
         let mut cpu = steady(row(17.7, 18.0), 48);
         cpu.aterm = fig(6.8);
@@ -3473,7 +3306,6 @@ mod tests {
              core, load 25.7 on 18 cores."
         );
 
-        // Disk in trouble.
         assert_eq!(
             row_sentence(Resource::Disk, &disk_trouble(), Some(2), &MAC),
             "Disk 98 percent of capacity: 1.96 of 2.00 terabytes used. aterm writes 38 \
@@ -3484,7 +3316,6 @@ mod tests {
              gigabytes."
         );
 
-        // Network learning its peak on the link's rate.
         let mut s = snap();
         let mut net = steady(row(2.1e6, 22.9e6), 0);
         net.basis = CapBasis::Link;
@@ -3508,7 +3339,6 @@ mod tests {
              second."
         );
 
-        // Tokens learning its peak, the plan not read, no agent in the tab.
         let mut s = snap();
         let mut tokens = steady(row(3_100.0, 1.0), 0);
         tokens.capacity = None;
@@ -3524,8 +3354,6 @@ mod tests {
              Tab 2 has no agent. Plan limit not read."
         );
 
-        // Columns not read: under a minute in seconds, else whole minutes,
-        // and never all 10 while one was read.
         let unread_said = |unread: usize| {
             let mut s = snap();
             let mut cpu = steady(row(9.0, 18.0), 0);
@@ -3549,7 +3377,6 @@ mod tests {
             assert!(got.contains(said), "{unread}: {got}");
         }
 
-        // Before the first snapshot, and a row with no reading.
         assert_eq!(
             row_sentence(Resource::Cpu, &Snapshot::default(), None, &MAC),
             "CPU: reading."
@@ -3599,7 +3426,6 @@ mod tests {
             disk_wrong(&s, &MAC)
                 .is_some_and(|w| w.starts_with("Yes. 2 sessions are stuck on a full disk."))
         );
-        // With the watch off the lens hides "Wrong?".
         s.facts.disk.as_mut().expect("facts").watch = false;
         assert_eq!(disk_wrong(&s, &MAC), None);
     }
@@ -3620,7 +3446,6 @@ mod tests {
         tokens.basis = CapBasis::Learning;
         set(&mut s, Resource::Tokens, tokens);
         s.facts.tokens_read_s = 60;
-        // Longest first, down to a form a narrow strip holds whole (rule F).
         assert_eq!(
             strip_words(Resource::Tokens, &s),
             Some(strings(&[

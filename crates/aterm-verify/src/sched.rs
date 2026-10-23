@@ -1,45 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Running stages concurrently while the ladder still reads top to bottom.
-//!
-//! The scheduler models two kinds of contention:
-//!
-//! * A [`Lane`] is a contended resource — in practice a cargo target directory.
-//!   Two cargo invocations against the same target dir do not corrupt anything
-//!   (cargo takes a file lock), they just queue — so "running them concurrently"
-//!   would buy nothing and cost the ability to reason about the run. Stages in a
-//!   lane run in declared order, one at a time. The side lanes have target dirs
-//!   of their own under the run's, so they genuinely overlap the main lane's
-//!   compile.
-//!
-//! * An EXCLUSIVE stage runs with nothing else in flight. The measuring tests
-//!   and the GUI smoke are judged by the clock: paint takes, frames per
-//!   second, input→present latency, sync timeout-releases. A run that
-//!   decided "present starvation — frames=12 (< 15)" while a lint saturated the
-//!   other cores would be reporting the run, not the build. The two lab lanes
-//!   (the codex-alab proof and the Linux VM) load the machine, so they run
-//!   alone too, the Linux lane as the last barrier.
-//!
-//! * An AFTER-STAGES stage waits for every stage it names
-//!   ([`StageSpec::after_stages`]): the doctests and `spec-check`, which run in a
-//!   lane of their own beside the test run, await the test compile
-//!   ([`crate::plan::Lane::AfterCompile`]). Those are its AWAITED stages
-//!   ([`awaited`]), and they are always declared BEFORE it ([`check_waits`]).
-//!
-//! Scheduling rule, in full: stage *i* may start when every earlier stage in its
-//! own lane has finished, no earlier exclusive stage is unfinished, every stage
-//! *i* awaits has finished, and — if *i* is itself exclusive — nothing at all is
-//! running.
-//!
-//! That rule cannot deadlock. Take the lowest-indexed unfinished stage *i*: every
-//! earlier stage has finished, so its lane predecessors are done, no earlier
-//! exclusive stage is pending, and every stage it awaits — each declared before it
-//! — is done. If *i* is exclusive, nothing else is running either: a later stage
-//! could not have started while *i*, an earlier exclusive stage, was unfinished.
-//! So *i* is startable, and progress is guaranteed
-//! (`no_starvation_and_no_deadlock` below model-checks that against the real
-//! plans).
+//! Concurrent stage scheduler ([`Lane`], [`StageSpec::after_stages`],
+//! [`crate::plan::Lane::AfterCompile`], [`awaited`], [`check_waits`]).
 
 use std::sync::{Condvar, Mutex};
 
@@ -55,8 +18,7 @@ struct State {
     results: Vec<Option<Report>>,
 }
 
-/// Can stage `i` start right now? Pure, so the rule is testable without
-/// threads; `plan`'s tests ask it directly.
+/// Can stage `i` start right now? Pure, so the rule is testable without threads.
 #[must_use]
 pub(crate) fn ready(
     specs: &[StageSpec],
@@ -71,27 +33,20 @@ pub(crate) fn ready(
     let me = &specs[i];
     let blocked = specs.iter().take(i).zip(done).any(|(earlier, finished)| {
         !finished
-            // I am exclusive, so nothing earlier may be outstanding.
             && (me.exclusive
-                // An earlier exclusive stage is a barrier in both directions;
-                // without this a steady trickle of pure stages could starve it.
                 || earlier.exclusive
-                // An earlier stage in my lane still holds the resource. `Pure`
-                // is no resource, so pure stages run beside each other.
                 || (earlier.lane == me.lane && me.lane != Lane::Pure))
     });
     !blocked && !(me.exclusive && running > 0) && awaited(specs, i).all(|j| done[j])
 }
 
-/// The stages `i` waits for: every stage its [`StageSpec::after_stages`] names,
-/// all declared before it ([`check_waits`]).
+/// Stages `i` waits for ([`StageSpec::after_stages`], [`check_waits`]).
 pub fn awaited(specs: &[StageSpec], i: usize) -> impl Iterator<Item = usize> + '_ {
     let me = &specs[i];
     (0..i).filter(move |&j| me.after_stages.contains(&specs[j].id))
 }
 
-/// What keeps the no-deadlock argument above true: a stage awaits only stages
-/// declared before it.
+/// What keeps the no-deadlock argument above true: a stage awaits only stages declared before it.
 ///
 /// # Errors
 /// Names the first stage that awaits itself or a stage declared after it.
@@ -107,10 +62,7 @@ pub fn check_waits(specs: &[StageSpec]) -> Result<(), String> {
     Ok(())
 }
 
-/// Run every stage under the rule above, calling `on_report` in declared order
-/// as each stage's turn to be printed arrives, and return the reports in that
-/// order. `run` runs on a worker thread per stage; it must not assume it is
-/// alone unless its spec says `exclusive`.
+/// Run every stage under the rule above.
 pub fn run_stages<R, P>(specs: &[StageSpec], run: R, mut on_report: P) -> Vec<Report>
 where
     R: Fn(&StageSpec) -> Report + Sync,
@@ -120,8 +72,6 @@ where
     if n == 0 {
         return Vec::new();
     }
-    // A plan that could deadlock is a verify defect, caught by the plan tests;
-    // failing loudly here beats a run that hangs silently.
     if let Err(why) = check_waits(specs) {
         panic!("aterm-verify plan defect: {why}");
     }
@@ -159,8 +109,6 @@ where
             });
         }
 
-        // The printer: hand out finished stages strictly in declared order, so a
-        // fast pure stage never jumps the compile it was scheduled beside.
         for i in 0..n {
             let mut g = state.lock().expect("scheduler mutex");
             while g.results[i].is_none() {
@@ -237,7 +185,6 @@ mod tests {
             spec(StageId::LibcOracle, "libc", Lane::LibcOracleTarget, false),
             spec(StageId::Forge, "forge", Lane::Pure, false),
             spec(StageId::ForeignCells, "cells", Lane::CellsTarget, false),
-            // A side-lane feature build at t0, beside the test compile.
             spec(
                 StageId::CheckersCompile,
                 "checkers",
@@ -337,7 +284,6 @@ mod tests {
         let reports = run_stages(
             &specs,
             |s| {
-                // Pure stages finish instantly; the compile takes its time. The
                 // ladder must not reorder because of it.
                 if s.lane == Lane::MainTarget {
                     std::thread::sleep(Duration::from_millis(40));
@@ -430,10 +376,7 @@ mod tests {
 
     /// Drive the scheduler's rule without threads: start every stage that is
     /// ready (re-checking after each start, as the real waiters do), then finish
-    /// one running stage chosen by `pick`. Panics on a state where stages remain
-    /// but nothing runs and nothing can start — a deadlock — and on any start
-    /// beside an exclusive stage: one that measures timing runs on an idle
-    /// machine.
+    /// one running stage chosen by `pick`.
     fn model_check(specs: &[StageSpec], mut pick: impl FnMut(&[usize]) -> usize) {
         let n = specs.len();
         let (mut started, mut done) = (vec![false; n], vec![false; n]);
@@ -463,10 +406,6 @@ mod tests {
 
     #[test]
     fn no_starvation_and_no_deadlock() {
-        // Every reachable interleaving makes progress, and nothing runs beside
-        // an exclusive stage ([`model_check`]), over the shape above and every
-        // real plan, finishing the running stages oldest-first, newest-first
-        // and in a scrambled order.
         let mut shapes = vec![plan_shape()];
         for checks in selections() {
             for scope in [
@@ -492,7 +431,7 @@ mod tests {
     }
 
     /// A stage that awaits itself or a later stage is refused: the two could
-    /// wait for each other. Each wait the CLI plans points back.
+    /// wait for each other.
     #[test]
     fn a_plan_that_could_deadlock_is_refused() {
         let mut specs = plan_shape();
@@ -502,8 +441,6 @@ mod tests {
         let mut specs = plan_shape();
         specs[fmt].after_stages = vec![StageId::Formatting];
         assert!(check_waits(&specs).is_err(), "a wait on itself");
-        // Two stages each waiting on the other's lane mate would never start;
-        // the check refuses the plan before a run could hang on it.
         let cycle = vec![
             StageSpec {
                 after_stages: vec![StageId::Forge],

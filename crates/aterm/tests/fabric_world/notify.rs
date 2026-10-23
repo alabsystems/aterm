@@ -50,6 +50,7 @@ impl Watch {
     }
 
     /// The `--exec` line every test uses unless it says otherwise: one line per
+    /// notification, carrying the three facts the assertions read.
     fn appender(&self) -> String {
         format!(
             "printf '%s dup=%s sup=%s\\n' \"$ATERM_NOTIFY_OFFSET\" \"$ATERM_NOTIFY_DUP\" \
@@ -144,6 +145,7 @@ impl Watch {
     }
 
     /// The persisted count of rate-dropped notifications the human has not been
+    /// told about yet.
     fn suppressed(&self) -> u64 {
         std::fs::read_to_string(self.state.join("notify/suppressed"))
             .ok()
@@ -193,6 +195,7 @@ fn raise_attention(fleet: &Fleet, who: &str, seq: u64, text: &str) -> u64 {
 }
 
 /// Publish one presence row for `who` carrying `fields` verbatim, and answer
+/// its offset.
 fn presence_row(fleet: &Fleet, who: &str, seq: u64, fields: &str) -> u64 {
     let subject = format!("/f/{FLEET}/pub/n-alpha/{who}/presence");
     let body = format!("v=1 t={seq} {fields}");
@@ -212,6 +215,7 @@ fn offset_of(line: &str) -> u64 {
 }
 
 /// **THE RUNG.** One command per matching offset, and the second run of the
+/// notifier over the same records runs nothing at all.
 #[test]
 fn the_command_runs_exactly_once_per_matching_offset_across_a_restart() {
     let fleet = Fleet::boot("notify-once");
@@ -269,6 +273,7 @@ fn the_command_runs_exactly_once_per_matching_offset_across_a_restart() {
 }
 
 /// **A STANDING ATTENTION PAGES ONCE, HOWEVER OFTEN ITS ROW IS REWRITTEN**
+/// (r3-22).
 #[test]
 fn a_republished_standing_attention_pages_nobody_and_a_reraise_after_a_clear_does() {
     let fleet = Fleet::boot("notify-standing");
@@ -484,6 +489,7 @@ fn a_follow_mode_notifier_survives_a_kill_and_neither_repeats_nor_misses() {
 }
 
 /// A follow-mode reader may have a deep, slow backlog while another selector
+/// has a fresh halt.
 #[test]
 fn a_slow_attention_catch_up_does_not_put_halt_behind_its_whole_backlog() {
     let fleet = Fleet::boot("notify-parallel-catchup");
@@ -527,7 +533,7 @@ fn a_slow_attention_catch_up_does_not_put_halt_behind_its_whole_backlog() {
     );
 }
 
-/// `--since=head` is an initial cut, not a fresh cut on every restart. Follow
+/// `--since=head` is an initial cut, not a fresh cut on every restart.
 #[test]
 fn follow_since_head_keeps_its_initial_cut_across_an_idle_restart() {
     let fleet = Fleet::boot("notify-head-restart");
@@ -548,6 +554,8 @@ fn follow_since_head_keeps_its_initial_cut_across_an_idle_restart() {
 }
 
 /// Tier-1 for `NotifyFollowCheckpoint`: the reader can offer a page mark after
+/// handing its last record to the executor, while that record's command is
+/// still running.
 #[test]
 fn a_page_checkpoint_waits_for_the_last_notification_command() {
     let fleet = Fleet::boot("notify-page-checkpoint");
@@ -638,6 +646,9 @@ fn a_page_checkpoint_waits_for_the_last_notification_command() {
 }
 
 /// **Every selector is a real broker filter, read with the cap that holds
+/// it.** `ask:h-andrew` is an ask ADDRESSED TO h-andrew — the subject a
+/// session's `post to=h-andrew kind=ask` lands on — read with h-andrew's own
+/// ring (`mint-for h-andrew`); `halt` with node.cap's fleet grant.
 #[test]
 fn ask_and_halt_select_the_records_they_name_and_nothing_else() {
     let fleet = Fleet::boot("notify-sel");
@@ -761,6 +772,7 @@ fn a_command_that_did_not_deliver_does_not_clear_the_suppressed_count() {
 }
 
 /// **ON A BROKER THAT SERVES ORDERED, A FOLLOWER PAGES AN ATTENTION ROW ONLY
+/// ONCE IT IS DURABLE** (`aterm_link::notify`'s module doc).
 #[test]
 fn an_ordered_brokers_attention_pages_once_it_is_durable() {
     let mut opts = harness::broker_opts(aterm_link::durability::Durability::Ordered);

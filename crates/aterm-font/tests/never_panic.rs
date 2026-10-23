@@ -1,20 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A font is untrusted input: a malformed face returns errors and `None`s,
-//! never a panic, a hang or an out-of-bounds read. This mutates real faces
-//! (each outline format the crate reads) and asks every query of every
-//! glyph, at the default instance and at hostile coordinates. The test
-//! profile keeps overflow checks on, so an arithmetic overflow is a panic
-//! here even where a release build would wrap.
-//!
-//! Mutations land inside one table at a time (a random byte anywhere in a
-//! 300 KB file almost always lands in glyph data the queries never reach),
-//! plus truncations and directory damage. The generator is a fixed LCG: a
-//! failure names its seed face and round, and replays.
-//!
-//! `fuzz/` holds the coverage-guided target for the same surface (STOCK
-//! EXCEPTION: cargo-fuzz needs a stock nightly).
+//! A font is untrusted input: a malformed face returns errors and `None`s, never a panic, a hang or an out-of-bounds read.
 
 use aterm_font::colr::{ClipBox, CompositeMode, Paint, Painter};
 use aterm_font::{Face, GlyphId, OutlineSink, PointKind, PointSink, RgbaColor, Tag, Transform};
@@ -107,23 +94,21 @@ impl<'a> Painter<'a> for Count {
 
 /// A minimal sfnt around a CFF2 table whose glyphs are `programs`: `head`,
 /// `hhea`, `maxp` and `CFF2` (a Top DICT naming the CharStrings and an empty
-/// item variation store, no subroutines). No CFF2 face can be committed (the
-/// only ones at hand are Apple's), so this is the CFF2 seed every host has.
+/// item variation store, no subroutines).
 fn synthetic_cff2(programs: &[&[u8]]) -> Vec<u8> {
     let be16 = |v: usize| (v as u16).to_be_bytes();
     let be32 = |v: usize| (v as u32).to_be_bytes();
-    // The CFF2 table.
     let top_len = 12;
     let globals = 5 + top_len;
     let vstore = globals + 4;
     let vstore_bytes: Vec<u8> = [
-        &be16(2 + 2 + 4 + 2 + 4 + 4 + 6)[..], // length
-        &be16(1),                             // format
-        &be32(12),                            // region list, from the store
-        &be16(1),                             // one ItemVariationData
-        &be32(16),                            // at 16
-        &[0, 0, 0, 0],                        // region list: 0 axes, 0 regions
-        &[0, 0, 0, 0, 0, 0],                  // 0 items, 0 word deltas, 0 regions
+        &be16(2 + 2 + 4 + 2 + 4 + 4 + 6)[..],
+        &be16(1),
+        &be32(12),
+        &be16(1),
+        &be32(16),
+        &[0, 0, 0, 0],
+        &[0, 0, 0, 0, 0, 0],
     ]
     .concat();
     let char_strings = vstore + vstore_bytes.len();
@@ -135,10 +120,10 @@ fn synthetic_cff2(programs: &[&[u8]]) -> Vec<u8> {
     cff.push(29);
     cff.extend(be32(vstore));
     cff.push(24);
-    cff.extend(be32(0)); // no global subroutines
+    cff.extend(be32(0));
     cff.extend(&vstore_bytes);
     cff.extend(be32(programs.len()));
-    cff.push(2); // 16-bit offsets
+    cff.push(2);
     let mut at = 1;
     cff.extend(be16(at));
     for p in programs {
@@ -151,9 +136,7 @@ fn synthetic_cff2(programs: &[&[u8]]) -> Vec<u8> {
     sfnt(programs.len(), &[(b"CFF2", &cff)])
 }
 
-/// An sfnt of `glyphs` glyphs holding `extra` plus a minimal `head` (1000
-/// units per em, short `loca` offsets), `hhea` (one metric) and `maxp` 0.5,
-/// its directory sorted by tag.
+/// An sfnt of `glyphs` glyphs holding `extra` plus a minimal `head` (1000 units per em, short `loca` offsets), `hhea` (one metric) and `maxp` 0.5, its directory sorted by tag.
 pub(crate) fn sfnt(glyphs: usize, extra: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
     let be16 = |v: usize| (v as u16).to_be_bytes();
     let be32 = |v: usize| (v as u32).to_be_bytes();
@@ -191,23 +174,18 @@ pub(crate) fn sfnt(glyphs: usize, extra: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
 /// ttf-parser 0.25.1 never returns from a `GSUB` extension subtable (type 7)
 /// whose wrapped type is 7 again and whose offset points at itself: it
 /// follows the extension forever (measured 2026-10-15 against the registry
-/// crate: a release build spins at 100% CPU on this 8-byte subtable). The
-/// spec forbids an extension of an extension; here it is a malformed
-/// subtable, and the well-formed extension beside it still resolves.
+/// crate: a release build spins at 100% CPU on this 8-byte subtable).
 #[test]
 fn a_gsub_extension_of_an_extension_is_malformed() {
-    // GSUB 1.0: empty ScriptList (at 10) and FeatureList (12); LookupList at
-    // 14 with two type-7 lookups. Lookup 0's extension names type 7 at offset
-    // 0 (itself); lookup 1's names type 1 (single, format 1, delta +1) at 8.
     let mut gsub: Vec<u8> = vec![0, 1, 0, 0, 0, 10, 0, 12, 0, 14];
     gsub.extend([0, 0, 0, 0]);
-    gsub.extend([0, 2, 0, 6, 0, 22]); // LookupList at 14: lookups at +6, +22
-    gsub.extend([0, 7, 0, 0, 0, 1, 0, 8]); // lookup 0 at 20: extension at +8
-    gsub.extend([0, 1, 0, 7, 0, 0, 0, 0]); // at 28: format 1, type 7, offset 0
-    gsub.extend([0, 7, 0, 0, 0, 1, 0, 8]); // lookup 1 at 36: extension at +8
-    gsub.extend([0, 1, 0, 1, 0, 0, 0, 8]); // at 44: format 1, type 1, at +8
-    gsub.extend([0, 1, 0, 6, 0, 1]); // at 52: single format 1, coverage +6, delta 1
-    gsub.extend([0, 1, 0, 1, 0, 0]); // coverage format 1: glyph 0
+    gsub.extend([0, 2, 0, 6, 0, 22]);
+    gsub.extend([0, 7, 0, 0, 0, 1, 0, 8]);
+    gsub.extend([0, 1, 0, 7, 0, 0, 0, 0]);
+    gsub.extend([0, 7, 0, 0, 0, 1, 0, 8]);
+    gsub.extend([0, 1, 0, 1, 0, 0, 0, 8]);
+    gsub.extend([0, 1, 0, 6, 0, 1]);
+    gsub.extend([0, 1, 0, 1, 0, 0]);
     let bytes = sfnt(2, &[(b"GSUB", &gsub)]);
     let face = Face::parse(&bytes, 0).expect("the synthetic face parses");
     let lookups = face.tables().gsub.expect("GSUB parses").lookups;
@@ -232,12 +210,7 @@ fn a_gsub_extension_of_an_extension_is_malformed() {
 
 /// A `COLR` v1 paint graph whose paint tables share children: glyph 1 is a
 /// `PaintColrLayers` of two layers that both name the next level's
-/// `PaintColrLayers`, `depth` levels down to a `PaintSolid`. Every offset on a
-/// path is distinct, so the cycle check never fires, and a walk of every path
-/// visits `2^depth` paints: ttf-parser 0.25.1 does exactly that (by reading;
-/// `colr.rs`'s `PaintColrLayers` arm recurses into each layer), which at depth
-/// 60 never returns. aterm-font stops after `MAX_PAINT_VISITS` (2^16) paint
-/// tables and keeps what it painted.
+/// `PaintColrLayers`, `depth` levels down to a `PaintSolid`.
 fn shared_paint_graph(depth: u32) -> Vec<u8> {
     let be16 = |v: u32| (v as u16).to_be_bytes();
     let be32 = |v: u32| v.to_be_bytes();
@@ -245,21 +218,19 @@ fn shared_paint_graph(depth: u32) -> Vec<u8> {
     let layer_list = base_list + 10;
     let paints = layer_list + 4 + 8 * depth;
     let mut colr: Vec<u8> = Vec::new();
-    colr.extend(be16(1)); // version 1
-    colr.extend(be16(0)); // no v0 base glyphs
+    colr.extend(be16(1));
+    colr.extend(be16(0));
     colr.extend(be32(0));
-    colr.extend(be32(0)); // no v0 layers
+    colr.extend(be32(0));
     colr.extend(be16(0));
     colr.extend(be32(base_list));
     colr.extend(be32(layer_list));
-    colr.extend(be32(0)); // no clip list
-    colr.extend(be32(0)); // no delta-set index map
-    colr.extend(be32(0)); // no item variation store
-    // BaseGlyphList: glyph 1 paints the first level.
+    colr.extend(be32(0));
+    colr.extend(be32(0));
+    colr.extend(be32(0));
     colr.extend(be32(1));
     colr.extend(be16(1));
     colr.extend(be32(paints - base_list));
-    // LayerList: layers 2i and 2i+1 both name level i+1 (the leaf last).
     colr.extend(be32(2 * depth));
     for i in 0..depth {
         let next = paints + 6 * (i + 1) - layer_list;
@@ -267,12 +238,11 @@ fn shared_paint_graph(depth: u32) -> Vec<u8> {
         colr.extend(be32(next));
     }
     for i in 0..depth {
-        colr.push(1); // PaintColrLayers
+        colr.push(1);
         colr.push(2);
         colr.extend(be32(2 * i));
     }
-    colr.extend([2, 0, 0, 0x40, 0]); // PaintSolid: palette entry 0, alpha 1
-    // CPAL: one palette of one colour.
+    colr.extend([2, 0, 0, 0x40, 0]);
     let mut cpal: Vec<u8> = Vec::new();
     for v in [0u16, 1, 1, 1] {
         cpal.extend(v.to_be_bytes());
@@ -300,11 +270,8 @@ fn a_colr_graph_that_shares_children_is_walked_within_a_budget() {
         );
         count.0
     };
-    // Each path ends in one `paint` call.
     let _ = aterm_font::take_spent();
     assert_eq!(painted(8), 256, "a small shared graph paints every path");
-    // The measurement seam (`take_spent`, debug builds) counts the paint
-    // tables walked: level i's 2^i, the 256 leaves of level 8 among them.
     assert_eq!(aterm_font::take_spent().paint_tables, (1 << 9) - 1);
     let deep = painted(60);
     assert!(
@@ -338,13 +305,7 @@ impl<'a> Painter<'a> for Sweeps {
 
 /// A `COLR` variation index base within N of `u32::MAX` wraps to the low
 /// delta-set entries, as upstream's release build does (its debug build
-/// panics there). Glyph 12 of `colr_1_variable.ttf` is one
-/// `PaintVarSweepGradient` whose base sits at file offset 0x511f (7 as
-/// committed); every axis is set to its maximum. The answers are registry
-/// ttf-parser 0.25.1's, release build, recorded 2026-10-16 in a scratch crate
-/// outside the workspace; before the fix aterm-font gave the later deltas 0
-/// (angles -1 and 1 at base 0xFFFF_FFFE) and differed from upstream on 128
-/// of 70,629 such mutations of the face's `COLR`.
+/// panics there).
 #[test]
 fn a_colr_delta_index_past_u32_max_wraps_as_upstream_release_does() {
     let path = format!(
@@ -409,9 +370,7 @@ fn enumerated(bytes: &[u8]) -> u64 {
 /// groups each naming all of Unicode (12 KB) and 8,000 format 4 segments
 /// each naming the whole BMP (64 KB) would call back 1.1 billion and 524
 /// million times; enumeration stops once it has made one call per code
-/// point the format can name. Disjoint groups, as the spec requires, never
-/// reach that, so a well-formed table enumerates as ttf-parser does (the
-/// reader corpus's `cmap.sub` answers).
+/// point the format can name.
 #[test]
 fn overlapping_cmap_groups_enumerate_once_per_code_point() {
     let groups = 1000u32;
@@ -434,9 +393,9 @@ fn overlapping_cmap_groups_enumerate_once_per_code_point() {
     let ends = (0..segments).map(|i| if i + 1 == segments { 0xFFFF } else { 0xFFFE });
     let starts = (0..segments).map(|i| if i + 1 == segments { 0xFFFF } else { 0 });
     f4.extend(ends.flat_map(u16::to_be_bytes));
-    f4.extend([0, 0]); // reservedPad
+    f4.extend([0, 0]);
     f4.extend(starts.flat_map(u16::to_be_bytes));
-    f4.extend((0..2 * segments).flat_map(|_| [0u8, 0])); // idDelta, idRangeOffset
+    f4.extend((0..2 * segments).flat_map(|_| [0u8, 0]));
     assert_eq!(enumerated(&sfnt(1, &[(b"cmap", &cmap(&f4))])), 0x10000);
 }
 
@@ -448,8 +407,7 @@ fn n(v: i32) -> u8 {
 /// ttf-parser 0.25.1 panics, in debug and release builds alike, on a CFF2
 /// charstring whose `blend` meets an empty stack: its argument stack pops
 /// unchecked (measured 2026-10-15 against the registry crate, on an SF India
-/// glyph whose first byte was made `blend`). Here it is a malformed glyph,
-/// even when well-formed drawing follows it (glyph 3).
+/// glyph whose first byte was made `blend`).
 #[test]
 fn cff2_blend_on_an_empty_stack_is_an_error() {
     let triangle: &[u8] = &[n(10), n(10), 21, n(50), n(0), 5, n(0), n(50), 5];
@@ -467,7 +425,6 @@ fn cff2_blend_on_an_empty_stack_is_an_error() {
         }),
         "the well-formed glyph draws"
     );
-    // A CFF2 glyph's last contour is left open (no `endchar` to close it).
     assert_eq!(sink.0, 3, "move and two lines");
     assert_eq!(face.outline_glyph(GlyphId(1), &mut sink), None);
     assert_eq!(face.outline_glyph(GlyphId(2), &mut sink), None);
@@ -476,12 +433,10 @@ fn cff2_blend_on_an_empty_stack_is_an_error() {
 
 /// An OpenType `kern` table of one format 2 subtable whose left-class,
 /// right-class and array offsets (from the subtable start, its 6-byte header
-/// included) are `offsets`. Well formed they are `[14, 20, 26]`: glyph 10 is
-/// left class 26 (the array's one row), glyph 20 right class 2 (the row's
-/// second value), and the array is `[-7, -9]`.
+/// included) are `offsets`.
 fn kern_format_2(offsets: [u16; 3]) -> Vec<u8> {
     let mut kern: Vec<u8> = vec![0, 0, 0, 1, 0, 0, 0, 30, 2, 1];
-    kern.extend(2u16.to_be_bytes()); // rowWidth
+    kern.extend(2u16.to_be_bytes());
     for v in offsets.into_iter().chain([10, 1, 26, 20, 1, 2]) {
         kern.extend(v.to_be_bytes());
     }
@@ -514,9 +469,7 @@ impl PointSink for Xs {
 /// Crafted tables at the edges of their fields' ranges, where the arithmetic
 /// leaves its integer type, answer as ttf-parser 0.25.1's code at each site
 /// does (a refusal or the format's fallback), never with a panic: the test
-/// profile keeps overflow checks on. A well-formed neighbour in each table
-/// shows the table is read. Each edge needs two fields to agree, which the
-/// fuzz below does not reach.
+/// profile keeps overflow checks on.
 #[test]
 fn crafted_table_edges_answer_as_upstream() {
     type Answer = fn() -> Vec<Option<i64>>;
@@ -530,15 +483,11 @@ fn crafted_table_edges_answer_as_upstream() {
                     ([14, 20, 26], 10, 20),
                     ([14, 20, 26], 10, 5),
                     ([14, 20, 26], 5, 20),
-                    // Read from the data start, rowWidth would be the first
-                    // glyph and glyph 3 left class 26.
                     ([2, 20, 26], 3, 20),
                     ([14, 2, 26], 10, 20),
                     ([14, 20, 2], 10, 20),
                     ([14, 20, 6], 5, 5),
-                    // Left class 0, though right class 26 alone reaches the array.
                     ([14, 14, 26], 5, 10),
-                    // Left class 26 against array offset 32, less the header: 26.
                     ([14, 20, 32], 10, 20),
                 ]
                 .map(|(offsets, left, right)| kerning(&kern_format_2(offsets), left, right))
@@ -560,9 +509,6 @@ fn crafted_table_edges_answer_as_upstream() {
             "gvar: a point inferred between touched points 40,000 or 50,000 units apart \
              (past i16) is not moved",
             || {
-                // One tuple at full weight: private point numbers 0 and 3,
-                // x deltas 0 and +40, y deltas zero; points 1 and 2 are
-                // inferred (IUP).
                 let mut iup = Vec::new();
                 for v in [1u16, 10, 8, 0xA000, 0x4000] {
                     iup.extend(v.to_be_bytes());
@@ -599,9 +545,6 @@ fn crafted_table_edges_answer_as_upstream() {
             "COLR v0: a layer range ending past u16::MAX is refused, not cut at the last \
              record",
             || {
-                // 65,535 layer records, each glyph 3 in the foreground colour.
-                // Glyph 1 is layer 0; glyph 2's one layer is index 0xFFFF, one
-                // past the last.
                 let (mut colr, mut cpal) = (Vec::new(), Vec::new());
                 for v in [0u16, 2, 0, 14, 0, 26, 0xFFFF, 1, 0, 1, 2, 0xFFFF, 1] {
                     colr.extend(v.to_be_bytes());
@@ -646,8 +589,6 @@ fn crafted_table_edges_answer_as_upstream() {
             "GDEF mark glyph set, coverage format 2: a coverage index past u16::MAX is not \
              covered",
             || {
-                // GDEF 1.2 with only a mark glyph set: one coverage, glyphs
-                // 7..=8 from coverage index 0xFFFF.
                 let mut gdef = Vec::new();
                 for v in [1u16, 2, 0, 0, 0, 0, 14, 1, 1, 0, 8, 2, 1, 7, 8, 0xFFFF] {
                     gdef.extend(v.to_be_bytes());
@@ -666,9 +607,6 @@ fn crafted_table_edges_answer_as_upstream() {
              or 65,536 glyphs, is refused, whatever ranges follow",
             || {
                 use crate::bounded_work::index;
-                // Two glyphs (each `endchar`) and a charset of ranges from
-                // SID 1 (then 2), each glyph count less one in the range's
-                // last byte or two.
                 let names = index(&[b"A".to_vec()], false);
                 let at = 4 + names.len() + 19 + 4;
                 let charsets: [&[u8]; 5] = [
@@ -682,14 +620,14 @@ fn crafted_table_edges_answer_as_upstream() {
                     .map(|charset| {
                         let mut top = vec![29];
                         top.extend(u32::try_from(at).expect("small").to_be_bytes());
-                        top.extend([15, 29]); // charset, then CharStrings
+                        top.extend([15, 29]);
                         let char_strings = at + charset.len();
                         top.extend(u32::try_from(char_strings).expect("small").to_be_bytes());
                         top.push(17);
                         let mut cff = vec![1, 0, 4, 4];
                         cff.extend(&names);
                         cff.extend(index(&[top], false));
-                        cff.extend([0, 0, 0, 0]); // empty String and Global Subr INDEXes
+                        cff.extend([0, 0, 0, 0]);
                         cff.extend(charset);
                         cff.extend(index(&[vec![14], vec![14]], false));
                         let bytes = sfnt(2, &[(b"CFF ", &cff)]);
@@ -705,8 +643,6 @@ fn crafted_table_edges_answer_as_upstream() {
         (
             "avar: a coordinate past the last mapping is shifted by that mapping",
             || {
-                // One axis, `wght` 100..=400..=900, and a malformed map with
-                // no +1.0 record: -1.0 -> -1.0, 0.5 -> 0.25.
                 let mut fvar = Vec::new();
                 for v in [1u16, 0, 16, 2, 1, 20, 0, 8] {
                     fvar.extend(v.to_be_bytes());
@@ -731,7 +667,6 @@ fn crafted_table_edges_answer_as_upstream() {
                     })
                     .to_vec()
             },
-            // 0.5 maps to 0.25 and 1.0 to 1.0 - 0.5 + 0.25, in F2DOT14.
             &[Some(0x1000), Some(0x3000)],
         ),
     ];
@@ -740,8 +675,7 @@ fn crafted_table_edges_answer_as_upstream() {
     }
 }
 
-/// The seed faces: one per outline format. The committed ones run on every
-/// host; a Mac adds its CFF2 (SF India) and CID-keyed CFF (Hiragino) faces.
+/// The seed faces: one per outline format.
 fn seeds() -> Vec<(&'static str, Vec<u8>)> {
     let render = format!("{}/../aterm-render", env!("CARGO_MANIFEST_DIR"));
     let mut out = Vec::new();
@@ -761,7 +695,6 @@ fn seeds() -> Vec<(&'static str, Vec<u8>)> {
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("committed face {path}: {e}"));
         out.push((label, bytes));
     }
-    // CFF2 on every host: a synthetic face with blends, moves and curves.
     let curve: &[u8] = &[n(5), n(5), 21, n(10), n(20), n(30), n(40), n(50), n(60), 8];
     let blended: &[u8] = &[n(10), n(20), n(2), 16, 21, n(3), n(4), 5];
     out.push((
@@ -774,7 +707,6 @@ fn seeds() -> Vec<(&'static str, Vec<u8>)> {
             "CFF CID",
             "/System/Library/Fonts/Supplemental/STIXTwoMath.otf",
         ),
-        // `bloc`/`bdat` bitmaps, and an AAT state-machine `kern` and `MVAR`.
         ("bdat", "/System/Library/Fonts/Monaco.ttf"),
         ("kern format 1", "/System/Library/Fonts/GeezaPro.ttc"),
         ("EBDT", "/System/Library/Fonts/Supplemental/Courier New.ttf"),
@@ -784,10 +716,7 @@ fn seeds() -> Vec<(&'static str, Vec<u8>)> {
             out.push((label, bytes));
         }
     }
-    // Glyphs past 32 `gvar` tuples, whose tuples live on the heap.
     out.push(("gvar past 32 tuples", crate::gvar_tuples::past_32_face()));
-    // `CBLC`/`CBDT`, Linux's colour bitmaps, on every host: no committed
-    // face carries them.
     out.push(("CBLC/CBDT synthetic", crate::synthetic_tables::cbdt_face()));
     out
 }
@@ -944,8 +873,7 @@ const CHARSTRING_OPS: &[u8] = &[
     30, 31, 247, 251, 255,
 ];
 
-/// One mutation of `seed`. `glyph_programs` are the seed's charstrings (empty
-/// for a TrueType face).
+/// One mutation of `seed`.
 fn mutate(
     seed: &[u8],
     targets: &[Target],
@@ -954,9 +882,6 @@ fn mutate(
 ) -> Vec<u8> {
     let mut b = seed.to_vec();
     match rng.below(10) {
-        // Rewrite inside one glyph's charstring: an operator where an
-        // operand or operator was (often its first byte, on an empty
-        // stack), or a run of number prefixes.
         2..=5 if !glyph_programs.is_empty() => {
             let (start, end) = glyph_programs[rng.below(glyph_programs.len())];
             for _ in 0..1 + rng.below(3) {
@@ -968,20 +893,16 @@ fn mutate(
                 b[i] = CHARSTRING_OPS[rng.below(CHARSTRING_OPS.len())];
             }
         }
-        // Truncate.
         0 => {
             let at = rng.below(b.len());
             b.truncate(at);
         }
-        // Damage the directory or a header.
         1 => {
             for _ in 0..1 + rng.below(4) {
                 let i = rng.below(b.len().min(512));
                 b[i] = rng.next() as u8;
             }
         }
-        // Damage the inside of one table the crate reads: bytes, words set
-        // to the values parsers trip on, and charstring operators.
         _ => {
             let t = targets[rng.below(targets.len())];
             for _ in 0..1 + rng.below(8) {
@@ -1058,7 +979,6 @@ fn exercise(bytes: &[u8], rng: &mut Lcg, glyph_cap: u16) -> u64 {
         let Ok(mut face) = Face::parse(bytes, index) else {
             continue;
         };
-        // Hostile instances: every axis at a random, extreme or non-finite value.
         let axes: Vec<Tag> = face.variation_axes().into_iter().map(|a| a.tag).collect();
         if !axes.is_empty() && rng.below(3) != 0 {
             for tag in axes {
@@ -1168,7 +1088,6 @@ fn exercise(bytes: &[u8], rng: &mut Lcg, glyph_cap: u16) -> u64 {
             let _ = face.glyph_index(ch);
             let _ = face.glyph_variation_index(ch, '\u{FE0F}');
         }
-        // The shaper over the same face, at the same hostile instance.
         sink.0 += shape_strings(face.clone());
         for g in 0..face.number_of_glyphs().min(glyph_cap) {
             let g = GlyphId(g);
@@ -1201,7 +1120,6 @@ fn exercise(bytes: &[u8], rng: &mut Lcg, glyph_cap: u16) -> u64 {
                 }
             }
         }
-        // Past the end.
         for g in [face.number_of_glyphs(), u16::MAX] {
             let _ = face.outline_glyph(GlyphId(g), &mut sink);
             let _ = face.glyph_hor_advance(GlyphId(g));
@@ -1263,17 +1181,6 @@ fn seeds_answer() {
 }
 
 /// Mutated seeds never panic.
-///
-/// The round counts are load-bearing (2026-10-17): of seventeen planted
-/// one-line overflow mutations of aterm-font, these rounds caught five on a
-/// macOS host (one through a system face); 128 rounds a face (48 for a big
-/// one), with a generator per face, caught three and missed the CFF INDEX
-/// offset `n - 1` and the `glyf` point count `endpoints.last() + 1`.
-///
-/// The mutations are made in one fixed sequence, one generator over every
-/// seed in order, and each round's queries run on a pool: a round is
-/// independent of every other (its bytes and its own generator are fixed
-/// before it runs), so the pool asks exactly what one thread would.
 #[test]
 fn mutated_faces_never_panic() {
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get().div_ceil(2));
@@ -1317,9 +1224,6 @@ fn mutated_faces_never_panic() {
                 !label.starts_with("CFF") || !glyph_programs.is_empty(),
                 "seed `{label}`: no charstrings found to mutate"
             );
-            // Every glyph (a mutated charstring or glyph record is reached
-            // only by drawing that glyph, up to 2048 of them), over fewer
-            // rounds for a big face.
             let rounds = if seed.len() > 1 << 20 { 150 } else { 400 };
             for round in 0..rounds {
                 let bytes = mutate(&seed, &targets, &glyph_programs, &mut rng);

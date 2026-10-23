@@ -68,6 +68,7 @@ impl Owned {
             child_ceiling: None,
             remove_env: &[],
             add_env: &[],
+            stage_groups: None,
         };
         // Reuse the production factory: own process group, null stdin, and no
         // taskpolicy wrapper because this command is not marked demoted.

@@ -1528,29 +1528,45 @@ pub fn audit_dead_negative_controls(configs: &[Model]) -> Result<usize, String> 
                 .map(|dial| interp::with_buggy(config, dial))
         })
         .collect();
-    let mut stepped: BTreeSet<&'static str> = BTreeSet::new();
-    let mut fires_lawfully: BTreeSet<&'static str> = BTreeSet::new();
-    for mutant in &mutants {
-        let open: Vec<&'static str> = dead.difference(&stepped).copied().collect();
+    // The mutants are walked at once. A verdict on one action does not depend on which others a
+    // walk watches, so `stepped` is the same set in any order; `fires_lawfully` is read only
+    // for actions no mutant steps, which every walk watched.
+    let verdicts: Mutex<(BTreeSet<&'static str>, BTreeSet<&'static str>)> = Mutex::default();
+    let open = || -> Vec<&'static str> {
+        let held = verdicts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        dead.difference(&held.0).copied().collect()
+    };
+    crate::check::each(&mutants, |mutant| {
+        let open = open();
         if open.is_empty() {
-            break;
+            return;
         }
-        for (d, verdict) in open.iter().zip(interp::violation_steps(mutant, &open)) {
+        let steps = interp::violation_steps(mutant, &open);
+        let mut held = verdicts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (stepped, fires_lawfully) = &mut *held;
+        for (d, verdict) in open.into_iter().zip(steps) {
             match verdict {
                 Some(true) => stepped.insert(d),
                 Some(false) => fires_lawfully.insert(d),
                 None => false,
             };
         }
-    }
-    let fired_under: Vec<std::cell::OnceCell<BTreeSet<&'static str>>> =
-        mutants.iter().map(|_| std::cell::OnceCell::new()).collect();
-    let baseline_of: Vec<std::cell::OnceCell<Result<usize, (interp::State, &'static str)>>> =
-        mutants.iter().map(|_| std::cell::OnceCell::new()).collect();
-    for d in &dead {
-        if stepped.contains(d) {
-            continue;
-        }
+    });
+    let (stepped, fires_lawfully) = verdicts
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fired_under: Vec<std::sync::OnceLock<BTreeSet<&'static str>>> =
+        mutants.iter().map(|_| std::sync::OnceLock::new()).collect();
+    let baseline_of: Vec<std::sync::OnceLock<Result<usize, (interp::State, &'static str)>>> =
+        mutants.iter().map(|_| std::sync::OnceLock::new()).collect();
+    let unstepped: Vec<&'static str> = dead.difference(&stepped).copied().collect();
+    // Each action's isolation is its own; the first failing action, in name order, is the
+    // error.
+    let isolations = crate::check::each(&unstepped, |&d| -> Result<(), String> {
         if !fires_lawfully.contains(d)
             && !mutants.iter().zip(&fired_under).any(|(mutant, fired)| {
                 fired
@@ -1580,15 +1596,15 @@ pub fn audit_dead_negative_controls(configs: &[Model]) -> Result<usize, String> 
             let mut alone = mutant.clone();
             alone
                 .actions
-                .retain(|a| !dead.contains(a.name) || a.name == *d);
+                .retain(|a| !dead.contains(a.name) || a.name == d);
             let (verdict, fired) = interp::bmc_fired(&alone);
             fires_alone |= fired.contains(d);
             verdict.is_err()
         });
         if isolated {
-            continue;
+            return Ok(());
         }
-        return Err(match unsafe_baseline.filter(|_| !any_safe) {
+        Err(match unsafe_baseline.filter(|_| !any_safe) {
             Some((state, invariant)) => format!(
                 "{}: action `{d}` is no violation step, and with every dead action removed \
                  each mutant still violates (`{invariant}` at {state:?}) — another branch \
@@ -1607,8 +1623,9 @@ pub fn audit_dead_negative_controls(configs: &[Model]) -> Result<usize, String> 
                  proves nothing",
                 m.name
             ),
-        });
-    }
+        })
+    });
+    isolations.into_iter().collect::<Result<(), String>>()?;
     Ok(dead.len())
 }
 
@@ -2467,14 +2484,19 @@ pub fn sweep_faults(configs: &[Model]) -> Vec<String> {
             ));
         }
     }
-    let mut caught: BTreeSet<&'static str> = BTreeSet::new();
-    for config in configs {
-        for dial in m.mutant_dials() {
-            caught.extend(interp::violated_within_budget(&interp::with_buggy(
-                config, dial,
-            )));
-        }
-    }
+    let mutants: Vec<Model> = configs
+        .iter()
+        .flat_map(|config| {
+            m.mutant_dials()
+                .into_iter()
+                .map(|dial| interp::with_buggy(config, dial))
+        })
+        .collect();
+    let caught: BTreeSet<&'static str> =
+        crate::check::each(&mutants, interp::violated_within_budget)
+            .into_iter()
+            .flatten()
+            .collect();
     for inv in &m.invariants {
         match (inv.kind, caught.contains(inv.name)) {
             (InvariantKind::Claim, false) => faults.push(format!(

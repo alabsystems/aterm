@@ -2,64 +2,34 @@
 // Copyright 2026 Andrew Yates
 
 //! Pure ordering policy for automatic application of a staged update.
-//!
-//! The host owns wall-clock instants and the durable updater ledger. This module owns the
-//! decisions that must survive event reordering (a stage wake arms intent even during a manual
-//! check, active work waits without consuming it, a physical handoff failure becomes
-//! manual-only) and the ladder: for an artifact armed some time ago, what the terminal has to
-//! look like before the readers park.
-//!
-//! # The law (docs/DESIGN-auto-apply-ladder-2026-09-21.md)
-//!
-//! A verified staged build applies by itself, in place, with every shell preserved, within a
-//! minute of being armed ([`LANDS_WITHIN`] plus [`SWITCH_ALLOWANCE`]), even on a machine that
-//! is never idle. Activity (keystrokes, PTY output, focus) may delay the landing inside that
-//! bound but never disables the lane or makes it manual-only; only a physical handoff failure
-//! does, on its own bounded budget. Each phase is a preference for a comfortable moment with
-//! an end measured in seconds: the freeze it spares is about 0.4 s and loses no keystroke.
 
 use std::time::Duration;
 
-/// How long the lane holds out for a machine-wide idle moment (no HID input, no keystroke in
-/// an aterm window, every live session's output quiet): a few quiet-epoch polls, so an idle
-/// machine lands invisibly at the first and a busy one loses seconds.
+/// How long the lane holds out for a machine-wide idle moment (no HID input, no keystroke in an aterm window, every live session's output quiet): a few quiet-epoch polls, so an idle machine lands invisibly at the first and a busy one loses seconds.
 pub(crate) const PREFER_IDLE_WINDOW: Duration = Duration::from_secs(3);
 
-/// How long after that the lane still waits for a gap in the terminal's own output while an
-/// aterm window is focused, so a stream the person is watching does not skip a beat. Bounded,
-/// because the freeze that would interrupt it is about 300-450 ms.
+/// How long after that the lane still waits for a gap in the terminal's own output while an aterm window is focused, so a stream the person is watching does not skip a beat.
 pub(crate) const PREFER_OUTPUT_GAP_WINDOW: Duration = Duration::from_secs(7);
 
-/// How long after that the lane still waits for a gap between keystrokes: nobody types for
-/// most of a minute without a 2.5 s pause. Past it the lane lands regardless; input typed
-/// during the freeze is queued and replayed after Commit, never swallowed.
+/// How long after that the lane still waits for a gap between keystrokes: nobody types for most of a minute without a 2.5 s pause.
 pub(crate) const KEYS_ONLY_WINDOW: Duration = Duration::from_secs(45);
 
-/// When the ladder stops waiting: from this long after arming, the next poll starts the
-/// attempt whatever the terminal is doing (only a consent warm-up or a restore relaunch still
-/// holds it). It ends early enough for the switch ([`SWITCH_ALLOWANCE`]) to have the new build
-/// running within the minute every surface quotes.
+/// When the ladder stops waiting: from this long after arming, the next poll starts the attempt whatever the terminal is doing (only a consent warm-up or a restore relaunch still holds it).
 pub(crate) const LANDS_WITHIN: Duration = Duration::from_secs(
     PREFER_IDLE_WINDOW.as_secs() + PREFER_OUTPUT_GAP_WINDOW.as_secs() + KEYS_ONLY_WINDOW.as_secs(),
 );
 
-/// What the switch takes once an attempt starts: the next poll (500 ms), the new process's
-/// launch (1.3-1.4 s measured), the park and the freeze (0.3-0.45 s), with room for a busier
-/// machine.
+/// What the switch takes once an attempt starts: the next poll (500 ms), the new process's launch (1.3-1.4 s measured), the park and the freeze (0.3-0.45 s), with room for a busier machine.
 pub(crate) const SWITCH_ALLOWANCE: Duration = Duration::from_secs(5);
 
-// "Within a minute" is what the surfaces say: the ladder and the switch after it must fit.
 const _: () = assert!(LANDS_WITHIN.as_secs() + SWITCH_ALLOWANCE.as_secs() <= 60);
 
-/// Where on the ladder an armed artifact stands, as a function of how long ago
-/// it was armed. Monotone in that duration: a phase, once reached, is never
-/// left except by the next one.
+/// Where on the ladder an armed artifact stands, as a function of how long ago it was armed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ApplyPhase {
     /// Park only at a machine-wide idle moment.
     PreferIdle,
-    /// Park at a gap between keystrokes and, while an aterm window is focused, a gap in the
-    /// output of every session shown in its active tab.
+    /// Park at a gap between keystrokes and, while an aterm window is focused, a gap in the output of every session shown in its active tab.
     PreferOutputGap,
     /// Park at a gap between keystrokes; output is not consulted.
     KeysOnly,
@@ -79,8 +49,7 @@ impl ApplyPhase {
         }
     }
 
-    /// What the lane is waiting for in this phase, for the log line that
-    /// announces the phase.
+    /// What the lane is waiting for in this phase, for the log line that announces the phase.
     #[must_use]
     pub(crate) fn waits_for(self) -> &'static str {
         match self {
@@ -111,47 +80,28 @@ pub(crate) fn apply_phase(since_armed: Duration) -> ApplyPhase {
 /// The facts about the terminal that the ladder reads, sampled at one instant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ActivityFacts {
-    /// `App::automatic_update_activity_quiet`: one quiet epoch since the last
-    /// input, PTY output or structural event, machine-wide.
+    /// `App::automatic_update_activity_quiet`: one quiet epoch since the last input, PTY output or structural event, machine-wide.
     pub(crate) quiet: bool,
-    /// `App::update_apply_hands_off_keys`: no keystroke landed in an aterm
-    /// window inside the typing gap.
+    /// `App::update_apply_hands_off_keys`: no keystroke landed in an aterm window inside the typing gap.
     pub(crate) hands_off_keys: bool,
-    /// `App::automatic_update_output_quiet`: every session shown in the active
-    /// tab of a focused OS window has PTY output at least one quiet epoch old
-    /// (a background tab, an unfocused window or a zoomed-away split does not
-    /// count).
+    /// `App::automatic_update_output_quiet`: every session shown in the active tab of a focused OS window has PTY output at least one quiet epoch old (a background tab, an unfocused window or a zoomed-away split does not count).
     pub(crate) output_quiet: bool,
-    /// `App::any_os_window_focused`: an aterm window has keyboard focus, so the
-    /// user is looking at this terminal.
+    /// `App::any_os_window_focused`: an aterm window has keyboard focus, so the user is looking at this terminal.
     pub(crate) focused: bool,
-    /// `App::update_apply_warmup_holds`: a folder-access warm-up the person started is still
-    /// running, so a macOS consent dialog may be up. Refused in every phase, `Land` included:
-    /// landing over a dialog they asked for would throw away their answer. Capped by
-    /// `[privacy] warmup_hold_ms`.
+    /// `App::update_apply_warmup_holds`: a folder-access warm-up the person started is still running, so a macOS consent dialog may be up.
     pub(crate) consent_warmup: bool,
-    /// `HostHandle::restored_pending`: a cold restore's agents are still being relaunched in
-    /// the tabs it reopened. Refused in every phase, `Land` included: landing mid-queue
-    /// interrupts relaunches the reopened layout just promised. The host bounds it
-    /// (`harness_host::RESTORED_HOLD`); past that the update lands and the successor carries
-    /// the rest.
+    /// `HostHandle::restored_pending`: a cold restore's agents are still being relaunched in the tabs it reopened.
     pub(crate) harness_restored_pending: bool,
 }
 
 /// The refusal that means only the person's typing holds the park.
 const TYPING_REFUSAL: &str = "a keystroke landed in an aterm window inside the typing gap";
 
-/// The refusal while a cold restore's agents are still being relaunched
-/// ([`ActivityFacts::harness_restored_pending`]).
+/// The refusal while a cold restore's agents are still being relaunched ([`ActivityFacts::harness_restored_pending`]).
 pub(crate) const RESTORED_PENDING_REFUSAL: &str =
     "the agents of the tabs a restore reopened are still being relaunched";
 
-/// The log line the restored agents' hold earns at a poll for `build`, if any: once when
-/// `holding` begins (the hold and its bound) and once when it ends; `said` records which was
-/// said last. Without it, a hold that refuses even `Land` for up to
-/// [`crate::harness_host::RESTORED_HOLD`] would sit silent after the phase line promised a
-/// landing at the next poll (deferrals log only at debug). `update status` shows it as
-/// `apply_held=`.
+/// The log line the restored agents' hold earns at a poll for `build`, if any: once when `holding` begins (the hold and its bound) and once when it ends; `said` records which was said last.
 pub(crate) fn restored_hold_line(build: u64, holding: bool, said: &mut bool) -> Option<String> {
     match (holding, *said) {
         (true, false) => {
@@ -173,10 +123,7 @@ pub(crate) fn restored_hold_line(build: u64, holding: bool, said: &mut bool) -> 
     }
 }
 
-/// Why the automatic lane will not park in `phase` given `facts`, or `None` when it may. One
-/// predicate for both places that ask, each re-reading the facts at its own instant: the entry
-/// (`apply_native_update`, before a successor launches) and the park (`prelaunch_park_admitted`,
-/// with the successor booted and holding). Explicit lanes never ask.
+/// Why the automatic lane will not park in `phase` given `facts`, or `None` when it may.
 #[must_use]
 pub(crate) fn automatic_park_refusal(
     phase: ApplyPhase,
@@ -210,7 +157,7 @@ pub(crate) struct ArmFacts {
     pub(crate) armed_exact: bool,
     /// A physical failure latched this exact artifact manual-only.
     pub(crate) manual_only_exact: bool,
-    /// Build of the sticky manual-only artifact, if any. Older wakes are stale.
+    /// Build of the sticky manual-only artifact, if any.
     pub(crate) manual_only_build: Option<u64>,
     pub(crate) incoming_build: u64,
 }
@@ -223,12 +170,7 @@ pub(crate) enum ArmDecision {
     Set(u64),
 }
 
-/// Whether arming `incoming_build` owes the candidate's pre-park read (its verdict and the
-/// handoff policy it seals) now: whenever it is newer than the running build and nothing armed
-/// outranks it, not only when the automatic lane takes it. A person's Install on the fork lane
-/// parks before its worker verifies, so with `auto_apply = false` (`Clear`) or a manual-only
-/// latch (`SuppressManualOnly`) a policy first read there would come after the capture it
-/// forbids. `Keep` reads nothing: an armed intent at least as new was read when it was set.
+/// Whether arming `incoming_build` owes the candidate's pre-park read (its verdict and the handoff policy it seals) now: whenever it is newer than the running build and nothing armed outranks it, not only when the automatic lane takes it.
 #[cfg(any(unix, test))]
 #[must_use]
 pub(crate) fn arm_reads_candidate(
@@ -243,9 +185,7 @@ pub(crate) fn arm_reads_candidate(
     }
 }
 
-/// Reduce one durable stage notification into persistent intent. Active updater
-/// work is intentionally not an input: ordering may delay application, never
-/// erase knowledge that a newer build arrived.
+/// Reduce one durable stage notification into persistent intent.
 #[must_use]
 pub(crate) fn arm(facts: ArmFacts) -> ArmDecision {
     if !facts.enabled {
@@ -271,30 +211,18 @@ pub(crate) fn arm(facts: ArmFacts) -> ArmDecision {
     ArmDecision::Set(facts.incoming_build)
 }
 
-/// What the lane knows, at one look, about a structural latch (automatic apply converged on
-/// build N's bytes after two handoffs the bytes answered for). The host owns the clock, the
-/// disk and the boot sentinel; this is the decision over what they said.
+/// What the lane knows, at one look, about a structural latch (automatic apply converged on build N's bytes after two handoffs the bytes answered for).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StructuralLatchFacts {
-    /// The latch's one re-sample is still owed and its deadline, a day after convergence, has
-    /// passed.
+    /// The latch's one re-sample is still owed and its deadline, a day after convergence, has passed.
     pub(crate) resample_due: bool,
-    /// The latch's one re-sample is still owed, due or not: the convergence notice promises it
-    /// ("it tries again by itself in 24 h").
+    /// The latch's one re-sample is still owed, due or not: the convergence notice promises it ("it tries again by itself in 24 h").
     pub(crate) resample_owed: bool,
-    /// A verified download strictly newer than the latched activation, not yet offered the
-    /// install path. Filled only for a latch on the installed activation: on the download side
-    /// a newer download is imported as the stage and arms by itself.
+    /// A verified download strictly newer than the latched activation, not yet offered the install path.
     pub(crate) unspent_newer_download: Option<u64>,
-    /// A verified download strictly newer than the latched activation is on disk, but its
-    /// retire was refused and the retry deadline has not passed: not offered now, yet it still
-    /// outranks the re-sample. Filled for the activation only, like
-    /// [`Self::unspent_newer_download`].
+    /// A verified download strictly newer than the latched activation is on disk, but its retire was refused and the retry deadline has not passed: not offered now, yet it still outranks the re-sample.
     pub(crate) newer_download_waiting: bool,
-    /// Whether one more launch of the latched build keeps its boot trial under
-    /// the revert threshold: `Some(false)` when that launch would be the one
-    /// `check_boot_health` reverts on, `None` when the sentinel's count has not
-    /// been measured yet.
+    /// Whether one more launch of the latched build keeps its boot trial under the revert threshold: `Some(false)` when that launch would be the one `check_boot_health` reverts on, `None` when the sentinel's count has not been measured yet.
     pub(crate) trial_room: Option<bool>,
 }
 
@@ -303,39 +231,17 @@ pub(crate) struct StructuralLatchFacts {
 pub(crate) enum StructuralLatchDecision {
     /// Nothing new: the latch stands as it is.
     Hold,
-    /// Release the latch for one automatic attempt at the latched build: its re-sample came
-    /// due and the boot trial has room for the launch.
+    /// Release the latch for one automatic attempt at the latched build: its re-sample came due and the boot trial has room for the launch.
     Release,
-    /// The re-sample is due but would be the launch the boot trial reverts on, or is still
-    /// promised on a trial measured with no room: the latch stays, loses its deadline, and the
-    /// host says so. Every launch left is the reverting one, so a later look would say the same.
+    /// The re-sample is due but would be the launch the boot trial reverts on, or is still promised on a trial measured with no room: the latch stays, loses its deadline, and the host says so.
     HoldForTrial,
-    /// The re-sample is due and the trial has not been measured: decide again
-    /// at the next observation, spending nothing.
+    /// The re-sample is due and the trial has not been measured: decide again at the next observation, spending nothing.
     Unmeasured,
-    /// A verified download strictly newer than the latched activation is on disk: retire the
-    /// activation from the install path (`aterm_update::supersede_installed_activation`) so the
-    /// ordinary staged lane applies the newer build. It launches nothing, so it spends no launch
-    /// of the latched build, and it outranks a due re-sample, which would launch the older one.
+    /// A verified download strictly newer than the latched activation is on disk: retire the activation from the install path (`aterm_update::supersede_installed_activation`) so the ordinary staged lane applies the newer build.
     Supersede { newer: u64 },
 }
 
-/// The structural latch's way out. Two events move a latch, including one on the installed
-/// activation, where every launched-lane failure lands:
-///
-/// * a verified download strictly newer than the latched activation supersedes it: the running
-///   build gives the install path back and the ordinary staged lane applies the newer build,
-///   with a boot trial of its own. Another attempt at the latched build cannot do this, since
-///   its successor is the handoff's authorized target and refuses to boot-apply past itself
-///   (`aterm_update::apply_staged_if_ready`);
-/// * the latch's one re-sample, due a day after convergence, earns one more automatic attempt
-///   at the latched build, never at the boot trial's expense: a structural `ChildDied` keeps
-///   its counted launch, and an automatic attempt must not be the launch the sentinel reverts
-///   on (`STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS < MAX_BOOT_ATTEMPTS`). A re-sample the trial
-///   cannot afford is held and said, and not promised past the count that rules it out.
-///
-/// A refused retire gives its release back until a retry deadline; while it waits it still
-/// outranks the re-sample. With neither event the latch stands until the Version menu's apply.
+/// The structural latch's way out.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -414,8 +320,6 @@ pub(crate) fn structural_latch(facts: StructuralLatchFacts) -> StructuralLatchDe
         return StructuralLatchDecision::Supersede { newer };
     }
     if facts.newer_download_waiting {
-        // A newer build is on its way: the re-sample of the older one waits behind it, but one
-        // promised on a trial measured with no room is withdrawn now, as with nothing newer.
         return if facts.resample_owed && facts.trial_room == Some(false) {
             StructuralLatchDecision::HoldForTrial
         } else {
@@ -423,7 +327,6 @@ pub(crate) fn structural_latch(facts: StructuralLatchFacts) -> StructuralLatchDe
         };
     }
     if !facts.resample_due {
-        // Nothing earned, but a re-sample promised on a trial with no room is withdrawn.
         return if facts.resample_owed && facts.trial_room == Some(false) {
             StructuralLatchDecision::HoldForTrial
         } else {
@@ -445,13 +348,9 @@ pub(crate) struct PollFacts {
     pub(crate) target_build: u64,
     pub(crate) work_active: bool,
     pub(crate) applying: bool,
-    /// The terminal has observed neither user input nor PTY output for the
-    /// host's short monotonic quiet epoch, and no undispatched OS input/output
-    /// latch is pending.
+    /// The terminal has observed neither user input nor PTY output for the host's short monotonic quiet epoch, and no undispatched OS input/output latch is pending.
     pub(crate) activity_quiet: bool,
-    /// Where the artifact stands on the ladder ([`apply_phase`]). In
-    /// [`ApplyPhase::PreferIdle`] activity defers; in every later phase the
-    /// poll attempts and the finer gates decide at the park.
+    /// Where the artifact stands on the ladder ([`apply_phase`]).
     pub(crate) phase: ApplyPhase,
     pub(crate) staged_ready: bool,
     pub(crate) staged_build: Option<u64>,
@@ -471,10 +370,7 @@ pub(crate) enum WaitReason {
 pub(crate) enum PollDecision {
     Clear,
     Wait(WaitReason),
-    /// Apply this exact staged artifact now. `quiet` reports whether the
-    /// machine was actually idle at the poll; `phase` is the ladder phase the
-    /// attempt is authorized under, which the host carries to the park gate
-    /// through the apply mode.
+    /// Apply this exact staged artifact now.
     Attempt {
         build: u64,
         quiet: bool,
@@ -482,7 +378,7 @@ pub(crate) enum PollDecision {
     },
 }
 
-/// Decide one event-loop poll. Every `Wait` retains the caller-owned intent.
+/// Decide one event-loop poll.
 #[must_use]
 pub(crate) fn poll(facts: PollFacts) -> PollDecision {
     if !facts.enabled || facts.current_build >= facts.target_build {
@@ -494,8 +390,6 @@ pub(crate) fn poll(facts: PollFacts) -> PollDecision {
     if facts.work_active || facts.applying {
         return PollDecision::Wait(WaitReason::WorkActive);
     }
-    // Prefer a quiet moment, but only for the first phase. Waiting past it is
-    // indistinguishable from never updating.
     if facts.phase == ApplyPhase::PreferIdle && !facts.activity_quiet {
         return PollDecision::Wait(WaitReason::Activity);
     }
@@ -528,9 +422,7 @@ pub(crate) enum AttemptDisposition {
     ManualOnly,
 }
 
-/// Only cheap native-state blocks receive a bounded retry. A returned physical
-/// handoff failure may already have parked readers and touched updater artifacts;
-/// it is manual-only so no timer can repeat expensive process work indefinitely.
+/// Only cheap native-state blocks receive a bounded retry.
 #[must_use]
 pub(crate) fn finish(result: AttemptResult) -> AttemptDisposition {
     match result {
@@ -580,8 +472,6 @@ mod tests {
             arm_reads_candidate(arm(on), 11, 10),
             "the automatic lane, as before"
         );
-        // Negative controls: nothing newer than the running build, and an
-        // armed intent at least as new (read when it was set).
         assert!(!arm_reads_candidate(arm(off(10)), 10, 10));
         assert!(!arm_reads_candidate(arm(off(9)), 9, 10));
         let kept = ArmFacts {
@@ -747,7 +637,6 @@ mod tests {
                 "{phase:?}"
             );
         }
-        // A later phase relaxes the idleness preference and no other gate.
         for stalled in [
             PollFacts {
                 work_active: true,

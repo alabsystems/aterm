@@ -1,67 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **THE AUTOCOMPACT OFFER** — Claude Code's own dialog ` We recommend
-//! compacting earlier` (2.1.302: component `dbe`, title `G8e`, footer `Q8e`,
-//! scheduled as `autocompact-offer`), read whole.
-//!
-//! Claude Code raises it by itself at an idle turn end (nothing loading,
-//! nothing queued, the last turn `completed`) once the context passes the
-//! server's trigger (200k by default), for a claude.ai subscriber on a 1M
-//! model. It is drawn in the permission frame (`ka`: a full-width `─` rule,
-//! the title one column in) in place of the composer, its body two columns
-//! further in, then an unnumbered Select (`hideIndexes`, the vendor `❯` on
-//! the focused row) of two options in a server-chosen order —
-//!
-//! * the ACCEPT row, `Autocompact at ‹ <size> › tokens` (`‹`/`›` are U+2039 and
-//!   U+203A; ←/→ step `<size>` along the server's size list, 300k…900k by
-//!   default), optionally over a description `This conversation is at <n>, so
-//!   it will be summarized on your next message.`;
-//! * the KEEP row, `Keep auto (<w> tokens)` or `Keep <w> tokens` —
-//!
-//! and the footer `↑/↓ choose · ←/→ change size · enter confirm · esc not now`
-//! (a `More text above: …` warning may sit under it). Its key-hint items
-//! carry no ` to `, so the generic finder ([`crate::prompt`]'s `find_box`)
-//! never saw a box there: the screen read as non-authoritative idle with no
-//! composer, and the session waited for a person.
-//!
-//! [`offer_box`] reads it only when ALL of these hold, and otherwise leaves
-//! the screen to the other readers exactly as before:
-//!
-//! 1. the last non-blank row (or the one over the `More text above` warning)
-//!    is exactly the footer, and no composer frame is on the screen (the
-//!    dialog replaces it, so a transcript quoting one is never one);
-//! 2. the nearest full-width rule over the footer (`─`, or the fullscreen
-//!    panel's `▔`) is followed by exactly the title, at column one to three
-//!    (a position label `n of m` beside it allowed);
-//! 3. every non-blank row from the title to the footer is drawn at the
-//!    title's column or further in;
-//! 4. the last block over the footer is exactly two option rows — one accept,
-//!    one keep, at one pointer column, exactly one of them under `❯` — with
-//!    only the accept row's description rows between or under them;
-//! 5. the body over them asks `Want to autocompact at <size> tokens instead?`
-//!    with the accept row's own size.
-//!
-//! The `Press <key> again to exit` footer (an exit pending), a screen-reader
-//! render (no footer at all), a size in words the vendor never draws
-//! ([`accept_size`]) or a label in any other words is no such dialog: a
-//! person's.
-//!
-//! THE SIZES ARE THE SERVER'S. 2.1.304 reads the list from a served flag
-//! (`tengu_binary_music`): any ascending integers under 1M that hold its
-//! default, up to two more than the built-in [`LADDER`] — so a served list
-//! of eight or nine sizes holds one off the ladder. Each is drawn in the
-//! vendor's compact words (`mr`: `350k`, `350.5k`, `1m`), and every one of
-//! them is read; a reader of the ladder alone left a dialog showing `450k`
-//! unread, its walk stalled with no word to anyone.
+//! Claude Code autocompact offer reader ([`crate::prompt`], [`offer_box`], [`accept_size`],
+//! [`LADDER`]).
 
 use crate::prompt::{Opt, PromptKind, PromptV2, Role, Select};
 
-/// The sizes Claude Code's stepper offers BY DEFAULT, in kilo-tokens
-/// (2.1.302: the default of the payload's `sizes`, 300k to 900k, only those
-/// under the model's window). A served list may hold others ([`accept_size`]
-/// reads them all); this ladder bounds what `[harness] autocompact_offer`
-/// may name.
+/// Default autocompact stepper sizes in kilo-tokens ([`accept_size`]).
 pub const LADDER: [u32; 7] = [300, 400, 500, 600, 700, 800, 900];
 
 /// Which of the offer's two options the `❯` is on.
@@ -80,14 +25,12 @@ pub struct Offer {
     pub accept: usize,
     /// The keep option's index in [`PromptV2::options`].
     pub keep: usize,
-    /// The size the accept row offers now, in TOKENS as drawn (`400000` of
-    /// `‹ 400k ›`, `350500` of `‹ 350.5k ›`): [`size_words`] draws it back.
+    /// Token threshold currently shown on the accept row ([`size_words`]).
     pub tokens: u32,
     pub focused: OfferFocus,
 }
 
-/// `Autocompact at ‹ 400k › tokens` → `Some(400000)`: the accept row's label
-/// exactly, its size in tokens ([`size_tokens`]).
+/// Parse `Autocompact at ‹ 400k › tokens` into its size in tokens ([`size_tokens`]).
 #[must_use]
 pub fn accept_size(label: &str) -> Option<u32> {
     let accept = const { crate::anchors::anchor_text("autocompact.accept") };
@@ -98,12 +41,7 @@ pub fn accept_size(label: &str) -> Option<u32> {
     size_tokens(size)
 }
 
-/// A size in the words Claude Code draws it in, as tokens: `400k` →
-/// `400000`, `350.5k` → `350500`, `1m` → `1000000`. 2.1.304 draws a size
-/// (an integer under 1M) as the en-US compact number, one decimal, `.0`
-/// dropped, lower-cased (`mr`): one to three digits, no leading zero, an
-/// optional one-digit decimal other than `0`, then `k` — or `1m`, the
-/// rounding of 999950 and up. Any other words are `None`.
+/// A size in the words Claude Code draws it in, as tokens.
 #[must_use]
 pub fn size_tokens(text: &str) -> Option<u32> {
     if text == "1m" {
@@ -126,9 +64,7 @@ pub fn size_tokens(text: &str) -> Option<u32> {
     Some(whole.parse::<u32>().ok()? * 1000 + tenth * 100)
 }
 
-/// `tokens` in the words Claude Code draws a size in ([`size_tokens`]'s
-/// inverse on its words): `400000` → `400k`, `350500` → `350.5k`, a million
-/// or more → `1m`.
+/// `tokens` in the words Claude Code draws a size in ([`size_tokens`]'s inverse on its words).
 #[must_use]
 pub fn size_words(tokens: u32) -> String {
     if tokens >= 1_000_000 {
@@ -140,8 +76,7 @@ pub fn size_words(tokens: u32) -> String {
     }
 }
 
-/// `Keep auto (1m tokens)` → `auto (1m tokens)`; `Keep 500k tokens` →
-/// `500k tokens`: the keep row's label exactly.
+/// `Keep auto` → `auto`; `Keep 500k tokens` → `500k tokens`: the keep row's label exactly.
 fn keep_current(label: &str) -> Option<&str> {
     let rest = label.strip_prefix("Keep ")?;
     let amount = |t: &str| {
@@ -166,8 +101,7 @@ fn keep_current(label: &str) -> Option<&str> {
 /// How the description the vendor draws under the accept row opens.
 const DESCRIPTION: &str = "This conversation is at ";
 
-/// An option's label less a description drawn on its own row after two
-/// spaces or more: `(label, description)`.
+/// An option's label less a description drawn on its own row after two spaces or more.
 fn strip_inline(drawn: &str) -> (&str, Option<&str>) {
     match drawn.find(&format!("  {DESCRIPTION}")) {
         Some(at) => (
@@ -178,9 +112,7 @@ fn strip_inline(drawn: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// One option row: `(pointer column, focused, label)`. The focused row is
-/// `❯ <label>` with the `❯` at the pointer column; an unfocused one is the
-/// label two columns further in.
+/// One option row: `(pointer column, focused, label)`.
 fn option_row(row: &str) -> Option<(usize, bool, &str)> {
     let col = crate::phase::leading_spaces(row);
     let t = crate::text::trim(row);
@@ -205,9 +137,7 @@ fn is_title_row(row: &str) -> bool {
         })
 }
 
-/// THE AUTOCOMPACT OFFER on `rows` (module header), as the box
-/// [`crate::prompt::parse_prompt_v2`] answers; `None` unless every condition
-/// holds.
+/// Parse an autocompact offer box from `rows` ([`crate::prompt::parse_prompt_v2`]).
 pub(crate) fn offer_box(rows: &[String]) -> Option<PromptV2> {
     use crate::phase::{has_composer_frame, is_rule, leading_spaces};
     let footer_text = const { crate::anchors::anchor_text("autocompact.footer") };
@@ -236,8 +166,6 @@ pub(crate) fn offer_box(rows: &[String]) -> Option<PromptV2> {
     {
         return None;
     }
-    // The option block: the non-blank rows over the footer, walked up to the
-    // blank row that ends the body.
     let mut block: Vec<usize> = Vec::new();
     let mut i = footer;
     while i > title + 1 {
@@ -256,8 +184,6 @@ pub(crate) fn offer_box(rows: &[String]) -> Option<PromptV2> {
     let mut pointer_col: Option<usize> = None;
     let mut size = None;
     let mut current = None;
-    // The accept row's description, once begun: its rows up to the next
-    // option.
     let mut described: Vec<&str> = Vec::new();
     let mut in_description = false;
     for &r in &block {
@@ -269,8 +195,6 @@ pub(crate) fn offer_box(rows: &[String]) -> Option<PromptV2> {
             accept_size(strip_inline(label).0).is_some() || keep_current(label).is_some()
         });
         let Some((pc, is_focused, drawn)) = opt else {
-            // Not an option: only the accept row's description, further in
-            // than the pointer.
             let starts = after_accept && t.starts_with(DESCRIPTION) && described.is_empty();
             if !(starts || in_description) || leading_spaces(&rows[r]) < pointer_col? + 2 {
                 return None;
@@ -287,7 +211,6 @@ pub(crate) fn offer_box(rows: &[String]) -> Option<PromptV2> {
         if let Some(d) = inline {
             described.push(d);
         }
-        // One accept row and one keep row: a second of either is no offer.
         let again = match accept_size(label) {
             Some(s) => size.replace(s).is_some(),
             None => keep_current(label).is_some_and(|c| current.replace(c.to_string()).is_some()),
@@ -311,7 +234,6 @@ pub(crate) fn offer_box(rows: &[String]) -> Option<PromptV2> {
     if options.len() != 2 || !options.iter().any(|o| o.focused) {
         return None;
     }
-    // The body asks for the accept row's own size.
     let body: Vec<&str> = rows[title + 1..body_end]
         .iter()
         .map(|r| crate::text::trim(r))
@@ -334,7 +256,6 @@ pub(crate) fn offer_box(rows: &[String]) -> Option<PromptV2> {
         .unwrap_or_default();
     Some(PromptV2 {
         kind: PromptKind::AutocompactOffer,
-        // The title less a position label, as every box's title is read.
         title: const { crate::anchors::anchor_text("autocompact.title") }.to_string(),
         command_rows: Vec::new(),
         description_rows: 0,
@@ -346,8 +267,6 @@ pub(crate) fn offer_box(rows: &[String]) -> Option<PromptV2> {
         path: None,
         options,
         select: Select::ArrowsEnter,
-        // Esc is `not now`, which counts toward the vendor's ask limit: no
-        // cancel is offered to any caller.
         cancel: None,
         question: None,
         span: (title, last),
@@ -359,8 +278,7 @@ pub(crate) fn offer_box(rows: &[String]) -> Option<PromptV2> {
 }
 
 impl PromptV2 {
-    /// THE AUTOCOMPACT OFFER read whole ([`Offer`]): `None` for any other box,
-    /// or an offer whose two options are not one accept and one keep row.
+    /// THE AUTOCOMPACT OFFER read whole ([`Offer`]).
     #[must_use]
     pub fn autocompact_offer(&self) -> Option<Offer> {
         if self.kind != PromptKind::AutocompactOffer || self.options.len() != 2 {

@@ -1,65 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The successor's boot around its claim: what it may do before the outgoing
-//! process has handed anything over (docs/DESIGN-warm-successor-2026-09-29.md,
-//! "The derived model and invariants").
+//! The successor's boot around its claim.
 
 use aterm_spec::derive::*;
 
-/// `NativeUpdateSuccessorWarmBeforeClaim`: a successor may warm before its claim — spawn
-/// threads, present into hidden windows — but may not mutate the process environment once a
-/// thread exists, own anything the outgoing process still owns, show anything, or let a warm
-/// present prove.
-///
-/// `phase`: 0 Launched, 1 Warming (after the handoff snapshot, before the dial), 2 Dialled, 3
-/// Claimed, 4 Adopted, 5 Proved, 6 Committed, 7 Exited.
-///
-/// `HandoffEnv` (aterm-gui's `handoff_env.rs`) makes the first invariant hold by construction:
-/// `Capture` is the one environment mutation, in `Launched` before any `SpawnWarm`, and the
-/// claimed descriptors land in the snapshot rather than in `environ`. `PublishToEnv` (dead at
-/// `Buggy = 0`) writes them into the process environment after the claim: a data race once a
-/// thread can exist before the claim.
-///
-/// The order (aterm-gui's `warm_prologue`, placed by `warm_order`): on the launched lane the
-/// claim-independent prologue — config, fonts, the backend worker, the first window's Metal
-/// shader warm — runs before the dial (`SpawnWarm`, then `WarmDone` when its main-thread section
-/// returns), and the dial, which the outgoing process parks on, comes after it. The shader warm
-/// is one more `SpawnWarm` thread: it fills the per-user Metal compiler cache, which the
-/// outgoing process does not own, and only the attach after the claim waits on it, bounded.
-/// Four facts bound that order:
-///
-/// * `relative_socket`: an explicit relative control socket's intake restores the parent's
-///   binding directory with a `chdir` (`PrepareSocketDir`), whose contract is a single-threaded
-///   process. That launch keeps the late order — `SpawnLate`, after the intake — which
-///   `NoCwdChangeAfterSpawn` pins.
-/// * `build_size_ok`: before the dial the backend is built at the advisory launch hint's font
-///   size; a hint the authenticated carry contradicts (`StaleHint`) is re-selected at the join
-///   (`Reshape`) before any carried screen is presented (`CarriedPresentAtCarriedSize`). A stale
-///   hint costs a warm, never a frame at the wrong size.
-/// * `config_current`: before the dial the warm reads `aterm.toml` and the files it names (the
-///   theme file, the path feeds); the automatic lane then holds the dial up to its hold cap
-///   (120 s) while the outgoing process stays live and may apply an edit (`ConfigEdit`), so its
-///   park carries screens sized and coloured under a config the warm never read. After the
-///   intake the successor re-stamps the files; a change re-runs the config half of the warm at
-///   the files as they stand (`Rewarm`) before any carried screen is presented
-///   (`CarriedPresentUnderCurrentConfig`). Unchanged files keep the early warm.
-/// * `warm_done`: the prologue waits on no thread it spawned — the dial never joins the backend
-///   worker (`PrologueJoinsNoThread`). `WarmDone` is weakly fair because it is straight-line
-///   main-thread work; the liveness claim
-///   ([`native_update_successor_warm_before_claim_liveness`]) is that every successor proves or
-///   exits, and `JoinWorkerBeforeDial` breaks both.
-///
-/// Each other `Buggy = 1` mutant is its own action, so none masks another: `BindWhileWarming`
-/// takes an owned resource (the control socket) before the claim; `RevealPlaceholder` shows a
-/// warm window over the frozen parent; `WarmProves` lets a warm present stand for the carried
-/// screens; `FoldHint` folds the advisory launch hint into the digests;
-/// `WarmBeforeDialOnRelativeSocket` warms before the dial on the one shape whose intake changes
-/// directory; `PresentAtHintedSize` presents the carried screens at a stale hint's size;
-/// `PresentUnderStaleConfig` presents them under the config the early warm read after the
-/// outgoing process applied an edit. Tier-1 (aterm-gui's `seamless::handoff_env_conformance`)
-/// drives the real snapshot, dial and intake, the order, miss and re-warm decisions, and the
-/// hint's exclusion from the adoption proof; the rest is waived there by name.
+/// `NativeUpdateSuccessorWarmBeforeClaim`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_successor_warm_before_claim_model() -> Model {
@@ -83,36 +29,26 @@ pub fn native_update_successor_warm_before_claim_model() -> Model {
             var build_size_ok = 1;
             var config_current = 1;
 
-            // The environment: this launch's control socket is an explicit
-            // relative path (decided by its flags, before anything runs).
             action RelativeSocket when (phase == 0 && relative_socket == 0) {
                 relative_socket = 1;
             }
-            // The one environment mutation: read and clear every handoff name,
-            // while no thread exists.
             action Capture when (phase == 0) {
                 captured = 1;
                 env_mut_after_spawn = threads_spawned;
                 phase = 1;
             }
-            // The warm prologue before the dial: never on the relative shape.
             action SpawnWarm when (phase == 1 && threads_spawned == 0 && relative_socket == 0) {
                 threads_spawned = 1;
             }
-            // Its main-thread section returns, waiting on none of its threads.
             action WarmDone when (phase == 1 && threads_spawned == 1 && warm_done == 0) {
                 warm_done = 1;
             }
             action WarmPresent when (phase == 1 && warm_presented == 0) {
                 warm_presented = 1;
             }
-            // The environment: the launch hint the backend was built at is not
-            // what the carry will say (a zoom during the hold, a hostile hint).
             action StaleHint when (phase == 1 && relative_socket == 0 && build_size_ok == 1) {
                 build_size_ok = 0;
             }
-            // The environment: after the early warm read `aterm.toml`, and
-            // before its park, the outgoing process applies an edit to it.
             action ConfigEdit when (
                 phase > 0 && phase <= 2 && threads_spawned == 1 && config_current == 1
             ) {
@@ -136,27 +72,21 @@ pub fn native_update_successor_warm_before_claim_model() -> Model {
             action Adopt when (phase == 3 && owned_taken == 1) {
                 phase = 4;
             }
-            // The relative shape's intake: `chdir` to the parent's directory.
             action PrepareSocketDir when (
                 phase == 4 && relative_socket == 1 && socket_dir_ready == 0
             ) {
                 socket_dir_ready = 1;
                 cwd_mut_after_spawn = threads_spawned;
             }
-            // The late order: the prologue after the intake.
             action SpawnLate when (
                 phase == 4 && relative_socket == 1 && socket_dir_ready == 1 && threads_spawned == 0
             ) {
                 threads_spawned = 1;
                 warm_done = 1;
             }
-            // A warm miss, corrected at the backend join.
             action Reshape when (phase == 4 && build_size_ok == 0) {
                 build_size_ok = 1;
             }
-            // The config moved during the hold: the config half of the warm
-            // runs again after the intake, at the file as it stands and the
-            // carry's font — so its build size is the launch size too.
             action Rewarm when (phase == 4 && config_current == 0) {
                 config_current = 1;
                 build_size_ok = 1;
@@ -177,7 +107,6 @@ pub fn native_update_successor_warm_before_claim_model() -> Model {
                 phase = 6;
             }
 
-            // Mutants, dead at Buggy = 0.
             action PublishToEnv when (Buggy == 1 && phase == 3 && env_mut_after_spawn == 0) {
                 env_mut_after_spawn = threads_spawned;
             }
@@ -213,8 +142,6 @@ pub fn native_update_successor_warm_before_claim_model() -> Model {
             ) {
                 carried_presented = 1;
             }
-            // (liveness) The prologue joins the backend worker before it dials,
-            // and the worker never finishes (a GPU driver that does not answer).
             action JoinWorkerBeforeDial when (
                 Buggy == 1 && phase == 1 && threads_spawned == 1 && warm_done == 0
             ) {
@@ -233,28 +160,12 @@ pub fn native_update_successor_warm_before_claim_model() -> Model {
             invariant CarriedPresentAtCarriedSize: carried_presented == 0 || build_size_ok == 1;
             invariant CarriedPresentUnderCurrentConfig:
                 carried_presented == 0 || config_current == 1;
-            // `warm_done = 2` is a prologue parked on a thread it spawned.
             invariant PrologueJoinsNoThread: warm_done <= 1;
         }
     }
 }
 
-/// [`native_update_successor_warm_before_claim_model`]'s progress claim: every successor proves
-/// or exits — the warm before the dial can delay the dial, never withhold it.
-///
-/// Fairness, each an assumption someone owns:
-///
-/// * `Capture`, `SpawnWarm`, `WarmDone`, `Dial` — the prologue is straight-line main-thread work
-///   that joins none of its threads, and the dial follows it;
-/// * `ClaimFail`, weakly fair — the claim's deadlines (`CLAIM_DIAL_BUDGET`/`GRANT_HOLD_BUDGET`)
-///   end every claim not granted; the grant itself (`ClaimOk`) is the outgoing process's and is
-///   assumed nothing;
-/// * `TakeOwned`, `Adopt`, `PrepareSocketDir`, `SpawnLate`, `Reshape`, `Rewarm`, `RealPresent`,
-///   `Prove` — the successor's own boot after the claim. `ConfigEdit` is the outgoing process's
-///   and is assumed nothing.
-///
-/// `JoinWorkerBeforeDial` breaks it alone: a prologue that waits on its backend worker before
-/// dialling hangs with the worker, and only the outgoing process's dial budget ends it.
+/// [`native_update_successor_warm_before_claim_model`]'s progress claim.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::liveness(native_update_successor_warm_before_claim_model)]

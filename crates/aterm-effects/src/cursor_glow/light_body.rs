@@ -1,57 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE LIGHT-GROUND LAW: every emitter has a light mode of its own. Additive
-//! light cannot show on white paper, so on a light ground each style draws
-//! its own shape as ink: its body source-over UNDER the letters (the
-//! `glow_under` stream, so glyphs keep full contrast on top) and held inside
-//! the row it marks, its small accents in conservative ink over the text.
-//!
-//! The ink under the letters is solved against the theme's own text and
-//! background ([`light_body_ink`]): a body may darken the paper only as far
-//! as leaves the theme's text legible over it at [`BODY_CONTRAST_BAR`], the
-//! bar the rainbow family's dark bed is solved against, read here as a
-//! minimum brightness instead of a maximum. A strength (alpha) cap alone is
-//! no legibility rule: saturated blue under near-black text at the old fixed
-//! cap measured 1.97:1.
-//!
-//! One primitive per shape, shared by every emitter so two bodies cannot
-//! drift apart: [`push_ink_ellipse`] (a round glow or coma held in its row)
-//! and [`reink_quads`] (any beam rasterized in white, re-inked at its own
-//! anti-aliased coverage).
+//! THE LIGHT-GROUND LAW: every emitter has a light mode of its own.
 
 use super::*;
 use crate::color_math::relative_luminance;
 
-/// The contrast bar every legibility ceiling in the cursor family is solved
-/// against: the theme's text over the light a body lays under it, 5.25:1
-/// (the rainbow ribbon's L3). On a dark ground it caps how bright the bed may
-/// composite; on a light one it floors how dark the ink may.
+/// The contrast bar every legibility ceiling in the cursor family is solved against: the theme's text over the light a body lays under it, 5.25:1 (the rainbow ribbon's L3).
 pub(crate) const BODY_CONTRAST_BAR: f32 = 5.25;
 
-/// The margin past [`BODY_CONTRAST_BAR`] for the emitter's own rounding (one
-/// level of composite rounding and one Bayer level of dither).
+/// The margin past [`BODY_CONTRAST_BAR`] for the emitter's own rounding (one level of composite rounding and one Bayer level of dither).
 pub(crate) const BODY_CONTRAST_GUARD: f32 = 0.05;
 
-/// The darkest a light-ground body may composite, in WCAG relative
-/// luminance: the theme's text keeps [`BODY_CONTRAST_BAR`] (plus the guard)
-/// over it. A function of the foreground alone.
+/// The darkest a light-ground body may composite, in WCAG relative luminance: the theme's text keeps [`BODY_CONTRAST_BAR`] (plus the guard) over it.
 #[inline]
 #[must_use]
 pub(crate) fn light_body_floor(theme_fg: u32) -> f32 {
     light_floor_at(theme_fg, BODY_CONTRAST_BAR + BODY_CONTRAST_GUARD)
 }
 
-/// The darkest a light-ground mark may composite, in WCAG relative
-/// luminance, for `theme_fg` to keep `bar` over it.
+/// The darkest a light-ground mark may composite, in WCAG relative luminance, for `theme_fg` to keep `bar` over it.
 #[inline]
 #[must_use]
 pub(crate) fn light_floor_at(theme_fg: u32, bar: f32) -> f32 {
     bar * (relative_luminance(theme_fg) + 0.05) - 0.05
 }
 
-/// A walk toward white by `w`: `c + w · (255 − c)`. Channel differences
-/// survive unscaled, so the hue direction is kept and only saturation falls.
+/// A walk toward white by `w`: `c + w · (255 − c)`.
 #[inline]
 const fn toward_white(rgb: u32, w: f32) -> u32 {
     let ch16 = ((rgb >> 16) & 0xff) as f32;
@@ -70,11 +45,7 @@ const fn over_at(bg: u32, ink: u32, a: u8) -> u32 {
     aterm_render::over_premul(bg & 0x00FF_FFFF, premul_rgb(ink, a), a) & 0x00FF_FFFF
 }
 
-/// The opacity `0..=255` at which source-over `ink` on `theme_bg` leaves
-/// `theme_fg` `keep` of its contrast on the bare paper, composited as the
-/// renderer composites a quad. A light ground's ink darkens the paper with
-/// its opacity, so the answer is bisected; an ink that keeps it even opaque
-/// answers 255.
+/// The opacity `0..=255` at which source-over `ink` on `theme_bg` leaves `theme_fg` `keep` of its contrast on the bare paper, composited as the renderer composites a quad.
 #[must_use]
 pub(crate) fn light_alpha_keeping(ink: u32, theme_fg: u32, theme_bg: u32, keep: f32) -> f32 {
     use crate::color_math::{relative_luminance_table, relative_luminance_with};
@@ -102,28 +73,13 @@ pub(crate) fn light_alpha_keeping(ink: u32, theme_fg: u32, theme_bg: u32, keep: 
     f32::from(lo)
 }
 
-/// THE LIGHT BODY'S INK: `rgb`'s vivid ink ([`light_ink_bold`], the most
-/// chroma one ink weight allows), walked toward white only as far as the
-/// body's composite at its strongest opacity `a_max` over `theme_bg` must be
-/// lifted for `theme_fg` to keep [`BODY_CONTRAST_BAR`] over it
-/// ([`light_body_floor`]). A weaker coverage only composites lighter on a
-/// light ground, so the solve at `a_max` holds across the whole fade.
-///
-/// The light exception, mirroring the dark bed's `BED_LUMA_MIN`: where the
-/// bar would lift the body past the point it still reads as a colour against
-/// the ground (`ribbon::seen`) — a theme whose own text-to-ground contrast is
-/// under the bar, as Solarized Light's 4.1:1 is, or one with mid-grey text —
-/// the body takes the palest ink that still reads, the most its text can be
-/// given while the body shows.
+/// THE LIGHT BODY'S INK: `rgb`'s vivid ink ([`light_ink_bold`], the most chroma one ink weight allows), walked toward white only as far as the body's composite at its strongest opacity `a_max` over `theme_bg` must be lifted for `theme_fg` to keep [`BODY_CONTRAST_BAR`] over it ([`light_body_floor`]).
 #[must_use]
 pub(crate) fn light_body_ink(rgb: u32, theme_fg: u32, theme_bg: u32, a_max: u8) -> u32 {
     light_ink_over_floor(rgb, theme_bg, a_max, light_body_floor(theme_fg))
 }
 
-/// [`light_body_ink`]'s solve against any `floor` (a WCAG relative
-/// luminance the composite at `a_max` over `theme_bg` keeps): `rgb`'s vivid
-/// ink walked toward white only as far as that floor asks, with the same
-/// light exception. [`light_body_ink`] is this at [`light_body_floor`].
+/// [`light_body_ink`]'s solve against any `floor` (a WCAG relative luminance the composite at `a_max` over `theme_bg` keeps): `rgb`'s vivid ink walked toward white only as far as that floor asks, with the same light exception.
 #[must_use]
 pub(crate) fn light_ink_over_floor(rgb: u32, theme_bg: u32, a_max: u8, floor: f32) -> u32 {
     let ink = light_ink_bold(rgb & 0x00FF_FFFF);
@@ -141,8 +97,6 @@ pub(crate) fn light_ink_over_floor(rgb: u32, theme_bg: u32, a_max: u8, floor: f3
         return ink;
     }
     let bisect = |pass: &dyn Fn(f32) -> bool, want_low: bool| {
-        // `pass` is monotone in `w`: false then true (`want_low`: the least
-        // passing `w`) or true then false (the greatest passing `w`).
         let (mut lo, mut hi) = (0.0f32, 1.0f32);
         for _ in 0..FRESH_INK_GLYPH_BISECT {
             let mid = 0.5 * (lo + hi);
@@ -172,20 +126,10 @@ pub(crate) fn light_ink_over_floor(rgb: u32, theme_bg: u32, a_max: u8, floor: f3
     toward_white(ink, w_bar.min(w_seen))
 }
 
-/// The quad budget one light mark may spend past the stream's length: an
-/// ellipse is one slab per eighth of a cell across and one quad per pixel row
-/// down, about a thousand quads for the widest crown at a Retina cell.
+/// The quad budget one light mark may spend past the stream's length: an ellipse is one slab per eighth of a cell across and one quad per pixel row down, about a thousand quads for the widest crown at a Retina cell.
 pub(crate) const LIGHT_MARK_QUADS: usize = 4096;
 
-/// A soft round mark of `ink` under the letters, centred on `(cx, cy)`:
-/// `left` and `right` of it (equal for a symmetric mark; Lumen's glow
-/// reaches further back over the letters just typed than ahead), `reach`
-/// above and below (held inside the row that holds `cy`, so the lines around
-/// stay clean), `peak` opaque at the centre and melting to nothing at the
-/// rim. Eighth-cell slabs, so the falloff never shows as steps. The one round
-/// body every light glow shares (Lumen's crown, the comet's coma and
-/// nucleus, the typing glow, the comet's debris), so two of them cannot
-/// drift apart.
+/// A soft round mark of `ink` under the letters, centred on `(cx, cy)`: `left` and `right` of it (equal for a symmetric mark; Lumen's glow reaches further back over the letters just typed than ahead), `reach` above and below (held inside the row that holds `cy`, so the lines around stay clean), `peak` opaque at the centre and melting to nothing at the rim.
 #[allow(
     clippy::too_many_arguments,
     reason = "stream + geometry + centre + both radii + ink + peak + budget: the ellipse IS this \
@@ -215,10 +159,7 @@ pub(crate) fn push_ink_ellipse(
     );
 }
 
-/// A round coma of `ink` around `(cx, cy)`, `r` px across its radius and held
-/// in its row: a disc at `fill` opacity inside a rim `rim_w` px wide at `rim`
-/// opacity, one scanline at a time, its outer edge anti-aliased. Source-over
-/// under the letters like every light body ([`push_ink_ellipse`]).
+/// A round coma of `ink` around `(cx, cy)`, `r` px across its radius and held in its row: a disc at `fill` opacity inside a rim `rim_w` px wide at `rim` opacity, one scanline at a time, its outer edge anti-aliased.
 #[allow(
     clippy::too_many_arguments,
     reason = "the ring's parameter set: centre, radius, rim, ink, two opacities, budget"
@@ -241,8 +182,6 @@ pub(crate) fn push_ink_ring(
     let row_top = oy + ((cy - oy) / chf).floor() * chf;
     let y0 = (cy - r).max(row_top).floor() as i32;
     let y1 = (cy + r).min(row_top + chf).ceil() as i32;
-    // One horizontal span `[a, b)` at opacity `alpha`: its whole pixels as
-    // one quad, each part-covered end pixel at its covered share.
     let span = |under: &mut Vec<GlowQuad>, y: i32, a: f32, b: f32, alpha: f32| {
         if b <= a || alpha < 1.0 {
             return;
@@ -285,13 +224,7 @@ pub(crate) fn push_ink_ring(
     }
 }
 
-/// [`push_ink_ellipse`] with its opacity scaled along x: `share(x0, x1)` is
-/// the share `0..=1` of the mark kept at a sample whose neighbourhood spans
-/// window x `x0..x1` (one sample's spacing either side of it), so a sample
-/// next to anything held back is held back too and the slabs between two
-/// samples never ramp past the lower one's share inside it. The typing glow
-/// keeps its ink off the letters this way
-/// (`the_light_glow_keeps_the_newest_letter_within_half_a_point`).
+/// [`push_ink_ellipse`] with its opacity scaled along x: `share(x0, x1)` is the share `0..=1` of the mark kept at a sample whose neighbourhood spans window x `x0..x1` (one sample's spacing either side of it), so a sample next to anything held back is held back too and the slabs between two samples never ramp past the lower one's share inside it.
 #[allow(
     clippy::too_many_arguments,
     reason = "the ellipse's parameter set and its share along x"
@@ -311,7 +244,6 @@ pub(crate) fn push_ink_ellipse_shaped(
         return;
     }
     let chf = geom.ch as f32;
-    // Inside the row that holds the centre.
     let row_top = f32::from(geom.origin_y) + ((cy - f32::from(geom.origin_y)) / chf).floor() * chf;
     let available = (cy - row_top).min(row_top + chf - cy).max(0.0);
     soft_ellipse(
@@ -367,7 +299,6 @@ fn soft_ellipse(
     });
     for (i, v) in verts.iter_mut().enumerate() {
         let (u, x) = us_xs[i];
-        // The ellipse's height at this x, and a falloff toward its rim.
         let round = (1.0 - u * u).max(0.0).sqrt();
         let r = (reach * round).max(0.5);
         v.x = x;
@@ -382,10 +313,7 @@ fn soft_ellipse(
     ribbon_beam(out, geom.beam_clip(), &verts, 1.0, stride, budget, blend);
 }
 
-/// Re-ink quads rasterized in WHITE (so each channel is the coverage that lit
-/// it) as source-over ink at that coverage, capped at `cap`: the light-ground
-/// form of any additive beam, its own anti-aliasing intact. `ink_at` picks
-/// each quad's ink (a run's colour along its path, or one ink for all).
+/// Re-ink quads rasterized in WHITE (so each channel is the coverage that lit it) as source-over ink at that coverage, capped at `cap`: the light-ground form of any additive beam, its own anti-aliasing intact.
 #[inline]
 pub(crate) fn reink_quads(quads: &mut [GlowQuad], cap: u8, ink_at: impl Fn(&GlowQuad) -> u32) {
     for q in quads {
@@ -399,7 +327,6 @@ pub(crate) fn reink_quads(quads: &mut [GlowQuad], cap: u8, ink_at: impl Fn(&Glow
             continue;
         }
         let ink = ink_at(q);
-        // A quad is additive at both ends or source-over at both ends.
         let (a, a2) = (a.max(1), a2.max(1));
         let c1 = premul_rgb(ink, a);
         q.color = c1;
@@ -409,15 +336,12 @@ pub(crate) fn reink_quads(quads: &mut [GlowQuad], cap: u8, ink_at: impl Fn(&Glow
     }
 }
 
-/// The light ground one frame draws on: the theme's text and paper, which
-/// every under-letter body solves its ink against.
+/// The light ground one frame draws on: the theme's text and paper, which every under-letter body solves its ink against.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LightGround {
     pub(crate) fg: u32,
     pub(crate) bg: u32,
-    /// Test-only: answer the bare vivid ink ([`light_ink_bold`]), never
-    /// solved against the text (`CursorGlow::light_ground`'s negative
-    /// control).
+    /// Test-only: answer the bare vivid ink ([`light_ink_bold`]), never solved against the text (`CursorGlow::light_ground`'s negative control).
     #[cfg(test)]
     pub(crate) unsolved: bool,
 }
@@ -435,10 +359,7 @@ impl LightGround {
         }
     }
 
-    /// [`light_body_ink`] on this ground at the body ceiling
-    /// ([`LIGHT_BODY_ALPHA_CAP`], opaque): the bodies under the letters
-    /// stack (a crown over a tail over the typing glow), and a stack of one
-    /// ink composites toward the ink itself, so the ink alone keeps the bar.
+    /// [`light_body_ink`] on this ground at the body ceiling ([`LIGHT_BODY_ALPHA_CAP`], opaque): the bodies under the letters stack (a crown over a tail over the typing glow), and a stack of one ink composites toward the ink itself, so the ink alone keeps the bar.
     #[inline]
     #[must_use]
     pub(crate) fn body_ink(self, rgb: u32) -> u32 {
@@ -464,8 +385,6 @@ mod tests {
     /// bar over it on every light theme that can meet the bar (a sweep of
     /// foregrounds from black to mid grey on white and cream), and on one
     /// that cannot (Solarized Light) it is still a colour the eye picks out.
-    /// Negative control: the old fixed recipe (bold ink at the body cap) puts
-    /// near-black text under 3:1 over pure blue.
     #[test]
     fn the_light_body_keeps_the_theme_text_at_the_bar_over_it() {
         let a = LIGHT_BODY_ALPHA_CAP as u8;
@@ -490,7 +409,6 @@ mod tests {
                         crate::rainbow_kitty::ribbon::seen(blend, bg),
                         "{rgb:06x} still reads as a colour on {bg:06x}"
                     );
-                    // Dark text (the light themes aterm ships): the bar holds.
                     if grey <= 0x33 {
                         assert!(
                             contrast(fg, blend) >= BODY_CONTRAST_BAR,
@@ -501,15 +419,11 @@ mod tests {
                 }
             }
         }
-        // Solarized Light: the bar is out of reach, the body still shows.
         let (fg, bg) = (0x0065_7B83, 0x00FD_F6E3);
         for rgb in hues {
             let blend = over_at(bg, light_body_ink(rgb, fg, bg, a), a);
             assert!(crate::rainbow_kitty::ribbon::seen(blend, bg), "{rgb:06x}");
         }
-        // Negative control: the old tall ribbon's recipe (conservative ink at
-        // the over-text ceiling, never solved against the text) puts
-        // near-black text under 3:1 over its blue.
         let old = over_at(
             0x00FF_FFFF,
             light_ink(0x0000_00FF),

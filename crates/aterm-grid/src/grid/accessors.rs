@@ -236,7 +236,7 @@ impl Grid {
             .union(crate::SelectionDamage::Band { lo_abs, hi_abs });
     }
 
-    /// The absolute row the cursor is on. Frame-invariant, so output can
+    /// The absolute row the cursor is on.
     #[must_use]
     #[inline]
     fn cursor_absolute_row(&self) -> u64 {

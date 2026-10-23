@@ -287,7 +287,7 @@ pub fn exec_dir(layout: &Layout, program: &str) -> PathBuf {
     layout.prefix.join("store").join(program).join("exec")
 }
 
-/// The stable launch path for an ALab primary and its agent twin. For a non-ALab build,
+/// The stable launch path for an ALab primary and its agent twin.
 fn twin_exec(layout: &Layout, program: &str, target: &Path, primary: AgentPrimary) -> PathBuf {
     if cfg!(not(unix)) || crate::alab::agent(program).is_none() {
         return target.to_path_buf();
@@ -329,6 +329,7 @@ pub fn twin_target(layout: &Layout, program: &str) -> Option<PathBuf> {
 }
 
 /// [`twin_target`]'s mapping of one exec target: an [`exec_dir`] entry reads back as the
+/// file it names.
 fn unstable_spelling(layout: &Layout, program: &str, raw: PathBuf) -> PathBuf {
     if raw.parent() == Some(exec_dir(layout, program).as_path())
         && let Ok(named) = std::fs::read_link(&raw)
@@ -339,6 +340,7 @@ fn unstable_spelling(layout: &Layout, program: &str, raw: PathBuf) -> PathBuf {
 }
 
 /// What an agent program's `bin/` shim forwards to, as `agents/` may name it
+/// ([`agent_primary`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AgentPrimary {
     /// A build in an agent program's store tree.
@@ -348,6 +350,9 @@ enum AgentPrimary {
 }
 
 /// What `target`, the forward of `program`'s `bin/` shim, is when an `agents/` twin may name
+/// it: a build in an agent program's store tree, or a file inside the program's recorded
+/// dev-link checkout ([`crate::linkmode::linked_checkout`]), so a dev link also wins at the
+/// front of `PATH`.
 fn agent_primary(layout: &Layout, program: &str, target: &Path) -> Option<AgentPrimary> {
     if crate::ops::store_build_of(&layout.prefix, target)
         .is_some_and(|(owner, _)| crate::stub::is_agent_program(&owner))
@@ -361,6 +366,7 @@ fn agent_primary(layout: &Layout, program: &str, target: &Path) -> Option<AgentP
 }
 
 /// The turn every reconcile and sweep of `agents/` takes, before
+/// [`crate::lay::PUBLICATION_TURN`].
 static AGENTS_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A fixture may park a real agent-shim read or write for its own prefix only.
@@ -432,6 +438,7 @@ pub(crate) mod agents_checkpoint {
 }
 
 /// [`shim_is_rendered`] for an `agents/` twin: the bytes the twin renderer lays for
+/// `target`, `env` and its `prelude` ([`platform::twin_executable_to_env`]).
 fn twin_is_rendered(
     shim: &Path,
     target: &Path,
@@ -445,6 +452,8 @@ fn twin_is_rendered(
 }
 
 /// Whether `shim` holds, byte for byte, what the one shim renderer
+/// (`platform::shim_executable_to_env`) lays for `target` and `env` now: the half of the
+/// reconciles' "already right" that target and environment cannot see.
 fn shim_is_rendered(shim: &Path, target: &Path, env: &crate::shim_env::ShimEnv) -> bool {
     if cfg!(not(unix)) {
         return true;
@@ -630,6 +639,7 @@ pub(crate) fn refused_name_shim(layout: &Layout, name: &str, shim: &Path) -> Opt
 }
 
 /// The `bin/` shims [`refused_name_shim`] names (`program`: only those into that program's
+/// store), as (file name, path), by name.
 fn refused_name_entries(layout: &Layout, program: Option<&str>) -> Vec<(String, PathBuf)> {
     let Ok(entries) = crate::ops::read_bin_dir(layout) else {
         return Vec::new();
@@ -670,6 +680,9 @@ pub(crate) fn remove_refused_name_shims(layout: &Layout, program: Option<&str>) 
 }
 
 /// Remove `bin/` shims this program owns that point at a different build (tools a newer
+/// build dropped from `exposes`), and every alias of this program's no longer wanted
+/// (`aliases` is [`Aliases::Off`], or its base is neither in `installed` nor another tool of
+/// this build).
 fn prune_stale_shims(layout: &Layout, build_dir: &Path, installed: &[ToolName], aliases: Aliases) {
     let _publication = crate::lay::PUBLICATION_TURN
         .lock()
@@ -775,6 +788,7 @@ mod tests {
     }
 
     /// A prefix of the SYSTEM shape: a scratch prefix this thread's
+    /// [`Layout::is_system_prefix`] answers yes for ([`crate::store::system_shape`]).
     #[cfg(unix)]
     fn system_prefix_fixture(label: &str) -> crate::testdir::ScratchLayout {
         let layout = temp_prefix(label);
@@ -796,6 +810,7 @@ mod tests {
     }
 
     /// The `bin/` path a shim for `name` would occupy, for the refusal tests, where
+    /// `ToolName::new` is `None` and `Layout::shim` cannot name it.
     fn refused_shim_path(layout: &Layout, name: &str) -> PathBuf {
         layout
             .bin_dir()
@@ -836,6 +851,7 @@ mod tests {
     }
 
     /// [`prune_stale_shims`] is the one predicate here that deletes from the user's `PATH`:
+    /// this pins exactly which shapes of a real `bin/` a prune of `ay@19` removes.
     #[cfg(unix)]
     #[test]
     fn the_prune_deletes_exactly_the_stale_and_leaves_everything_else() {
@@ -957,6 +973,7 @@ mod tests {
     }
 
     /// Two programs activated in turn each keep their own `current`, the per-program
+    /// witness `gc::live_builds` reads.
     #[test]
     fn two_programs_on_one_channel_each_keep_their_own_current() {
         let layout = temp_prefix("two-progs");
@@ -1012,6 +1029,12 @@ mod tests {
     }
 
     /// aterm-spec's store discovery (`aterm_spec::verify::resolve_store_shim`) mirrors this
+    /// crate's shim format rather than depending on it, so every shape is laid through
+    /// atpkg's writer and read back through aterm-spec's reader:
+    /// * the plain stub, one with exports, and one routed through an exec root resolve to
+    ///   the store file (the first `exec '` line);
+    /// * a tombstone, a pending stub and a stub whose build was reclaimed read as absent:
+    ///   the probe runs before PATH, so any of them answering would shadow a working tool.
     #[cfg(unix)]
     #[test]
     fn aterm_spec_discovery_reads_every_shim_atpkg_lays() {
@@ -1120,6 +1143,7 @@ mod tests {
     }
 
     /// `bin/`'s mode follows the prefix shape: a `$HOME` prefix keeps it `0700`, and every
+    /// activation entry point leaves it at the mode this layout gives its own directories.
     #[cfg(unix)]
     #[test]
     fn a_home_shaped_prefix_keeps_bin_private() {
@@ -1146,6 +1170,8 @@ mod tests {
     }
 
     /// The regression, and the only assertion that can tell the two shapes apart: under a
+    /// root-owned SYSTEM prefix, activation must publish `bin/` at
+    /// `0755`.
     #[cfg(unix)]
     #[test]
     fn a_system_shaped_prefix_publishes_bin_traversable() {
@@ -1171,6 +1197,7 @@ mod tests {
     }
 
     /// `undo_activation` removes exactly the doomed build's `current` link and shims; a
+    /// bystander program activated afterwards keeps both.
     #[test]
     fn undo_activation_unwinds_only_the_doomed_build() {
         let layout = temp_prefix("undo");
@@ -1204,6 +1231,8 @@ mod tests {
     }
 
     /// The shim environment (design S7) rides on every shim `install_tools_env` lays,
+    /// primary and alias, and an env-carrying shim resolves, prunes, sweeps, undoes and
+    /// uninstalls like a plain one; a re-lay without env leaves no exports.
     #[test]
     fn env_shims_resolve_prune_undo_and_uninstall_like_plain_ones() {
         let layout = temp_prefix("env-shims");
@@ -1282,6 +1311,8 @@ mod tests {
     }
 
     /// A partial lay keeps the aliases of the tools it did not name: `atpkg unlink`'s
+    /// restore (`cli::restore_installed_shims`) lays only the names the dev link owned — one,
+    /// by `cli::default_link_bins` — at the build the other tools are live at.
     #[test]
     fn a_partial_lay_keeps_the_aliases_of_this_builds_other_tools() {
         let layout = temp_prefix("partial-lay-aliases");
@@ -1327,6 +1358,7 @@ mod tests {
     }
 
     /// `reconcile_aliases` mirrors the primary's environment onto the alias it lays,
+    /// rewrites an alias whose env drifted from its primary's, and leaves an agreeing one.
     #[test]
     fn reconcile_aliases_mirrors_the_primary_env() {
         let layout = temp_prefix("env-alias-reconcile");
@@ -1361,6 +1393,8 @@ mod tests {
     }
 
     /// "Already right" means the bytes too: an alias and a twin that forward and export
+    /// right but differ from the render (in production, the exec-root guard a plain shim
+    /// lacks, `crate::compat`) are re-laid, and a second reconcile writes neither.
     #[cfg(unix)]
     #[test]
     fn a_reconcile_relays_an_alias_or_twin_whose_bytes_differ_and_then_writes_nothing() {
@@ -1419,6 +1453,8 @@ mod tests {
     }
 
     /// Installing an agent program lays `agents/<tool>` beside `bin/<tool>` (same target,
+    /// same env); nothing else lands in `agents/`, and the twin follows its primary across an
+    /// update, a tombstone, an undo and an uninstall.
     #[cfg(unix)]
     #[test]
     fn an_agent_program_gets_a_front_of_path_twin_that_follows_its_primary() {
@@ -1524,6 +1560,7 @@ mod tests {
     }
 
     /// THE TWIN CARRIES NO LANDING PRELUDE, and `bin/` carries the same bytes (outside aterm
+    /// `bin/claude` IS the managed name).
     #[cfg(unix)]
     #[test]
     fn the_agents_twin_carries_the_self_update_block_and_no_landing_prelude() {
@@ -1627,6 +1664,10 @@ mod tests {
     }
 
     /// The prelude never strands the tool, under a real `/bin/sh`: `update` and `install
+    /// latest --force` as the first argument go to the embedded atpkg as `__selfupdate claude
+    /// <prefix> -- <args>`; `--probe`, `-p update` and `--debug install` run the store build;
+    /// with the embedded atpkg gone `update` runs the store build, silent, exit 0, never an
+    /// older `atpkg` on `PATH`.
     #[cfg(unix)]
     #[test]
     fn the_twin_prelude_runs_the_store_build_when_the_embedded_atpkg_is_gone() {
@@ -1752,6 +1793,8 @@ mod tests {
     }
 
     /// The twin is best-effort and agent-store-only: with `agents/` unmakeable, an `ay` and
+    /// a `claude` install still succeed and lay `bin/`; a `bin/codex` resolving into a
+    /// non-agent store tree earns no twin, the same predicate the sweep applies.
     #[cfg(unix)]
     #[test]
     fn the_agents_twin_is_best_effort_and_agent_store_only() {
@@ -1801,6 +1844,7 @@ mod tests {
     }
 
     /// The alias policy is read off the signed index entry: ALab's own (no `system`)
+    /// aliases; an agent program, a system-satisfiable member and an unlisted name do not.
     #[test]
     fn the_alias_policy_follows_the_index_entry() {
         let program = |system: Option<&str>| crate::manifest::Program {
@@ -1830,6 +1874,8 @@ mod tests {
     }
 
     /// `alab-<tool>` is laid beside every `<tool>` shim of an ALab program, forwarding to
+    /// the same executable (`active_builds` still sees one build, `active_tools` lists the
+    /// primaries and `active_aliases` the aliases); a program under `Aliases::Off` gets none.
     #[test]
     fn an_alab_program_gets_an_alias_beside_every_shim_forwarding_to_the_same_target() {
         let layout = temp_prefix("alias-lay");
@@ -1900,6 +1946,9 @@ mod tests {
     }
 
     /// Aliases follow their primaries through every sweep: a dropped tool's alias is pruned
+    /// with it, a re-shim moves the alias to the new build, a policy flip to `Off` sweeps
+    /// the aliases of that program and nothing else, `undo_activation` and `uninstall`
+    /// take them with the build.
     #[test]
     fn aliases_are_pruned_swept_undone_and_uninstalled_with_their_primary() {
         let layout = temp_prefix("alias-sweep");
@@ -1961,6 +2010,8 @@ mod tests {
     }
 
     /// An up-to-date program (the pipeline short-circuits, so `install_tools` never runs)
+    /// gets its aliases from the pass's reconcile: laid when missing, left alone when right,
+    /// swept under `Off`, and never written over a file this manager did not lay.
     #[test]
     fn reconcile_lays_the_aliases_of_an_already_installed_program() {
         let layout = temp_prefix("alias-reconcile");
@@ -2002,6 +2053,7 @@ mod tests {
     }
 
     /// The Windows `.cmd` alias: the resume-proof frame, then a forward to the primary's
+    /// `.exe` that ends the batch on that line.
     #[test]
     fn the_cmd_alias_forwards_to_the_primary_exe() {
         let target = Path::new(r"C:\Users\me\.aterm\pkg\store\ay\18\bin\ay.exe");

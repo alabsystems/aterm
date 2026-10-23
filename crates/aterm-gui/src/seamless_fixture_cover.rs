@@ -1,34 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHICH FIELDS A SET OF VALUES WRITES, read off their serde derives: the
-//! cross-version guard checks only the shapes its desks carry, so a field the
-//! producer can write but no desk does is a field the next consumer's parse is
-//! never held to.
-//!
-//! [`FieldCover::walk`] serializes a value into nothing and records, for every
-//! struct it passes through, which fields were written with a value and which
-//! were not: skipped by `skip_serializing_if`, or written as `None`, an empty
-//! list or an empty table, and every externally tagged variant it wrote. A
-//! field is written when any value walked wrote it. The derive is the only
-//! list: a field added to a carried struct is in the next walk with no table
-//! to update. A variant is on no list a serializer sees, so
-//! [`FieldCover::settle_variants`] reads each value back with a name no
-//! variant has in each place it wrote one, and every enum that refuses it
-//! there names all its variants, taken or not, and an internally tagged one
-//! names itself too. A walk sees only what its values reach: a struct no
-//! value reaches is in no list, so a new struct needs a desk that carries it
-//! (the fixture README).
-//!
-//! [`DeskFields`] walks what a release's desks wrote — each manifest, its
-//! layout sidecar, every carried screen's engine state and every session's
-//! control sidecar (its turn ledger, archive and session log) — and the
-//! generator records it beside them as `fields.toml`. The hold
-//! ([`DeskFields::uncovered`]): every field of every struct a desk reaches is
-//! written by a desk, or named as one no handoff writes; and each release's
-//! file is the baseline for the next, so every field and variant the newest
-//! recorded release's desks wrote is still written by a desk here, reached or
-//! not. Anything else stops the generator until a desk writes it.
+//! WHICH FIELDS A SET OF VALUES WRITES, read off their serde derives: the cross-version guard checks only the shapes its desks carry, so a field the producer can write but no desk does is a field the next consumer's parse is never held to.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -43,12 +16,7 @@ use serde::ser::{
     SerializeTupleStruct, SerializeTupleVariant, Serializer,
 };
 
-/// The fields every value walked so far wrote, and the ones some value
-/// passed over, as `Struct.field` (`Enum::Variant.field` for a struct
-/// variant), and the variants of the enums they reach, as `Enum::Variant`:
-/// written when some value took it, passed over when none did (a walk names
-/// the externally tagged variants it wrote; [`Self::settle_variants`] the
-/// rest). A struct no value reached is in neither.
+/// The fields every value walked so far wrote, and the ones some value passed over, as `Struct.field` (`Enum::Variant.field` for a struct variant), and the variants of the enums they reach, as `Enum::Variant`: written when some value took it, passed over when none did (a walk names the externally tagged variants it wrote; [`Self::settle_variants`] the rest).
 #[derive(Default)]
 pub(crate) struct FieldCover {
     written: BTreeSet<String>,
@@ -67,8 +35,7 @@ impl FieldCover {
             .expect("walking a value writes nothing that can fail");
     }
 
-    /// [`Self::walk`] a value of a record's own type, and keep it for
-    /// [`Self::settle_variants`].
+    /// [`Self::walk`] a value of a record's own type, and keep it for [`Self::settle_variants`].
     pub(crate) fn read<T: Serialize + serde::de::DeserializeOwned>(&mut self, value: &T) {
         self.walk(value);
         self.docs
@@ -76,24 +43,7 @@ impl FieldCover {
         self.reread = Some(reread::<T>);
     }
 
-    /// Name, as passed over, every variant of every enum the values
-    /// [`Self::read`] reach that none of them took, and, as written, every
-    /// one some value took that the walk could not name (an internally tagged
-    /// enum's, whose tag is a string to a serializer).
-    ///
-    /// An enum's variants are on no list a serializer sees: its own
-    /// `Deserialize` names them when it refuses one it does not know. So each
-    /// place a value wrote a string, or a table of one key, is read back once
-    /// with that string or key replaced by one no enum has, and every enum
-    /// that refused it there names its variants, inside an internally tagged
-    /// or untagged enum's buffered content too, and inside a lenient field
-    /// that reads a refusal as its default. A place is a path with its list
-    /// positions erased, so each place is read back once, from the first
-    /// value that has it, and what every value wrote there is what the enum
-    /// took. An enum is named by the walk (its externally tagged variants are
-    /// `Enum::Variant` there); an internally tagged one by its own refusal of
-    /// a table that is not one (the table holding its tag, read back as
-    /// `false`); and any other by its variants, `{A|B}`.
+    /// Name, as passed over, every variant of every enum the values [`Self::read`] reach that none of them took, and, as written, every one some value took that the walk could not name (an internally tagged enum's, whose tag is a string to a serializer).
     pub(crate) fn settle_variants(&mut self) {
         let Some(reread) = self.reread else {
             return;
@@ -111,7 +61,6 @@ impl FieldCover {
             let mut doc = self.docs[place.doc].clone();
             put(place.at(&mut doc));
             REFUSED.with(|refused| refused.borrow_mut().clear());
-            // The read is meant to fail; what matters is who refused.
             let _ = reread(Doc(doc));
             REFUSED.with(std::cell::RefCell::take)
         };
@@ -201,10 +150,7 @@ impl FieldCover {
 /// The file each release's desks record their fields in, beside the desks.
 pub(crate) const FIELDS_FILE: &str = "fields.toml";
 
-/// What a release's desks wrote, record by record: the manifest
-/// (`SessionHandoff`, its window, messages and held panes included), the
-/// layout sidecar (`RestoreManifest`), and the engine state of every carried
-/// screen (`CheckpointMeta`, the held panes' too).
+/// What a release's desks wrote, record by record: the manifest (`SessionHandoff`, its window, messages and held panes included), the layout sidecar (`RestoreManifest`), and the engine state of every carried screen (`CheckpointMeta`, the held panes' too).
 #[derive(Default)]
 pub(crate) struct DeskFields {
     manifest: FieldCover,
@@ -284,7 +230,6 @@ impl DeskFields {
                 self.layout.read(&layout);
                 continue;
             }
-            // The manifest: the attempt's nonce on its first line, then the TOML.
             let (_, body) = text
                 .split_once('\n')
                 .unwrap_or_else(|| panic!("{label} opens with its nonce"));
@@ -341,17 +286,6 @@ impl DeskFields {
     }
 
     /// What these desks leave uncovered, one `<record> <field> (<why>)` each:
-    ///
-    /// * every field or variant a desk here passes over and no desk writes,
-    ///   unless `unhanded` names it, as `(record, field)`: one no handoff
-    ///   writes (the update's producer never sets it: retired, or written only
-    ///   by another writer of the struct), which no desk can;
-    /// * every field or variant `baseline`'s desks wrote that no desk here
-    ///   writes, reached or not (a desk that stops carrying a shape stops
-    ///   writing every field and variant only it wrote), unless `unhanded`
-    ///   names it (retired since);
-    /// * every `unhanded` row a desk here writes, or that names no field a
-    ///   desk here passes over or `baseline`'s desks wrote.
     pub(crate) fn uncovered(
         &self,
         baseline: Option<&Recorded>,
@@ -394,10 +328,7 @@ impl DeskFields {
     }
 }
 
-/// The newest release under `root` that recorded its desks' fields
-/// (`vX.Y.Z/fields.toml`), by version, and what it recorded; never
-/// `this_run`, the directory the caller is writing (the hand-run fallback
-/// writes `v<release>/` under `root`), which would be its own baseline.
+/// The newest release under `root` that recorded its desks' fields (`vX.Y.Z/fields.toml`), by version, and what it recorded; never `this_run`, the directory the caller is writing (the hand-run fallback writes `v<release>/` under `root`), which would be its own baseline.
 pub(crate) fn newest_recorded(root: &Path, this_run: &Path) -> Option<(String, Recorded)> {
     let this_run = std::fs::canonicalize(this_run).ok();
     let version = |name: &str| -> Option<Vec<u64>> {
@@ -1233,7 +1164,7 @@ mod tests {
     /// Every variant of every enum a value reaches is named, taken or not:
     /// an externally tagged one's inside an internally tagged enum's buffered
     /// content, an internally tagged one's under its own name, and one a
-    /// lenient field reads a refusal past. What any value took is taken.
+    /// lenient field reads a refusal past.
     #[test]
     fn every_variant_of_an_enum_a_value_reaches_is_named_taken_or_not() {
         let mut cover = FieldCover::default();

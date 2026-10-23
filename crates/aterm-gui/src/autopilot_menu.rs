@@ -1236,7 +1236,7 @@ impl App {
             (pad, grid_top),
         );
         // The card's own marks (`BandIcon::glass_mark`: its `○ ● ⤓`, the fact
-        // menus' `◉ ◈ ⌂ ◐`), drawn as the glass draws its own and after the
+        // menus' `◉ ◈ ⌂ ◆ ◐`), drawn as the glass draws its own and after the
         // scrub, which takes every drawn icon on the card; recorded in the
         // harness card's record, so every strip of it (the top of a frame, of
         // a compose, of the footer's splice) takes them back and a closed card

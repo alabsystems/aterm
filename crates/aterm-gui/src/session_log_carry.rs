@@ -1,38 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE SESSION LOG ACROSS A SEAMLESS UPDATE, host side (design §5.2, phase
-//! 2A): the producers' own state, which rides the log's carry as its `host`
-//! lines (`aterm_slog::Log::carry` passes them through unread), and the
-//! successor's adoption of a carried log.
-//!
-//! Records and the fold are not enough for the successor to go on as the
-//! predecessor would have: a command running across the update must close
-//! with its own D (its block, its run), an agent mid-turn must stay in that
-//! turn (its run, its tracker and the settle it may have armed), and a name
-//! the resolver gave just before the update must still open its run. So the
-//! carry holds, one line each:
-//!
-//! ```text
-//! state v=1 origin=<k> opened=<wall> root=<pgid> last_blk=<id|-> csnap=<base>,<cursor|-> cmd_end=<wall|-> arrivals=<n>
-//! cmd blk=<id> node=<r> wall_from=<wall|-> child_end=<wall|->
-//! fg pgid=<p> node=<r> name_fp=<hex>         (the group's latest name, fingerprinted)
-//! agent pgid=<p> node=<r> who=<program> by_screen=<0|1>
-//! tracker …                                         (aterm_slog::TurnTracker::carry_line)
-//! typed input=<seq>,<wall> [input_by=<actor>] [input_cause=<id>] ctl=<seq>,<actor>,<ledger>,<wall> [ctl_cause=<id>]
-//! pending pgid=<p> name=<pct|-> word=<w> detail=<pct|-> at=<wall> seq=<n>
-//! ```
-//!
-//! Every stamp crosses as its wall time and is rebased onto the successor's
-//! clocks (`aterm_slog::rebase`); an input or `ctl turn` older than the
-//! attribution window is left out at the export and dropped at the adoption
-//! (it can attribute nothing). Each line is read on its own: one that does
-//! not read, or names a node the carried log does not hold open, drops that
-//! piece only, and RECONCILE then closes, innermost first, `out=gone`, every
-//! node the log holds open that no piece holds, so a partial host state never
-//! leaves a node open for good. A line about the session's own open instant
-//! is never needed for correctness: the successor's `opened_wall` is the
-//! carried one when the `state` line reads, else the adoption instant.
+//! THE SESSION LOG ACROSS A SEAMLESS UPDATE, host side (design §5.2, phase 2A).
 
 use aterm_slog::{
     ATTRIBUTION_MS, Actor, CarryAdopt, CarryError, CarryStats, Close, Conf, Kind, Log, Lvl, Node,
@@ -43,9 +12,7 @@ use aterm_slog::{CarryBudget, CarryOut, CarrySnapshot, PreparedCarry};
 
 use super::{AgentRun, CSnap, CmdRun, FgRun, LogCarry, PendingName, SessionLog, Typed};
 
-/// What the handoff worker takes of a session's log under its timeline lock
-/// ([`SessionLog::carry_source`]): the log's snapshot and the producers'
-/// lines. Cut and encoded after the lock is released ([`Self::encode`]).
+/// What the handoff worker takes of a session's log under its timeline lock.
 #[cfg(any(unix, test))]
 #[derive(Clone, Debug)]
 pub(crate) struct SlogCarrySource {
@@ -55,16 +22,13 @@ pub(crate) struct SlogCarrySource {
 
 #[cfg(any(unix, test))]
 impl SlogCarrySource {
-    /// The carry within `budget`, or `None` for a closed session or a
-    /// mandatory part exceeding its bounds. Each call encodes anew; the
-    /// handoff's export prepares once ([`Self::prepare`]).
+    /// The carry within `budget`.
     #[cfg(test)]
     pub(crate) fn encode(&self, budget: CarryBudget) -> Option<CarryOut> {
         self.snapshot.encode(budget, &self.host)
     }
 
-    /// Every record's carry line encoded, once, after the timeline's lock is
-    /// released: the source every cut of this session's carry is made from.
+    /// Every record's carry line encoded, once, after the timeline's lock is released.
     pub(crate) fn prepare(self) -> PreparedSlogCarry {
         PreparedSlogCarry {
             prepared: self.snapshot.prepare(),
@@ -88,22 +52,17 @@ impl PreparedSlogCarry {
         self.prepared.skeleton(&self.host)
     }
 
-    /// The carry within `budget`, or `None` for a closed session or a
-    /// mandatory part exceeding its bounds.
+    /// The carry within `budget`.
     pub(crate) fn encode(&self, budget: CarryBudget) -> Option<CarryOut> {
         self.prepared.encode(budget, &self.host)
     }
 
-    /// The bus mirror's cursor and head under the fence this carry's take
-    /// set (`aterm_slog::PreparedCarry::mirror_prior`); `None` for a log
-    /// nothing mirrored.
+    /// The bus mirror's cursor and head under the fence this carry's take set.
     pub(crate) fn mirror_prior(&self) -> Option<aterm_slog::Prior> {
         self.prepared.mirror_prior()
     }
 
-    /// The detail past the skeleton, at most: its line bytes and records
-    /// (`aterm_slog::PreparedCarry::detail_bytes`), known without encoding
-    /// any of it.
+    /// The detail past the skeleton, at most.
     pub(crate) fn detail(&self) -> (usize, usize) {
         (self.prepared.detail_bytes(), self.prepared.detail_records())
     }
@@ -118,9 +77,7 @@ fn opt_wall(v: Option<u64>) -> String {
 /// (`-` for none): the free text a `pending` line carries (a program's name,
 /// a verdict's word and detail) is the screen's or the resolver's, of any
 /// length, and a line past the carry's per-line bound would be left out
-/// whole (`aterm_slog::CARRY_MAX_LINE`). With [`PENDING_NAME_MAX`],
-/// [`PENDING_WORD_MAX`] and [`PENDING_DETAIL_MAX`], a `pending` line is within
-/// it even if every byte takes three.
+/// whole (`aterm_slog::CARRY_MAX_LINE`).
 #[cfg(any(unix, test))]
 fn pct_or_dash(v: Option<&str>, max: usize) -> String {
     match v {
@@ -137,17 +94,12 @@ fn pct_or_dash(v: Option<&str>, max: usize) -> String {
     }
 }
 
-/// The most bytes of a waiting name's program name that cross (more than any
-/// program name a resolver gives).
+/// The most bytes of a waiting name's program name that cross.
 pub(super) const PENDING_NAME_MAX: usize = 200;
-/// The most bytes of a waiting name's verdict word that cross (a word is a
-/// few letters).
+/// The most bytes of a waiting name's verdict word that cross (a word is a few letters).
 pub(super) const PENDING_WORD_MAX: usize = 32;
-/// The most bytes of a waiting name's verdict detail that cross (a box's
-/// kind or a wall's reset; the run records at most `Key::Detail`'s 48).
+/// The most bytes of a waiting name's verdict detail that cross.
 pub(super) const PENDING_DETAIL_MAX: usize = 64;
-// A `pending` line at its widest, every byte taking three, its numbers at
-// their widest, within the receiver's per-line bound with its `host ` tag.
 const _: () = assert!(
     "host pending pgid=-2147483648 name= word= detail= at=18446744073709551615 seq=18446744073709551615"
         .len()
@@ -188,28 +140,16 @@ fn origin_word(k: Kind) -> &'static str {
     k.word()
 }
 
-/// The host line that tells a successor this process journals the session up
-/// to the carried head (phase 2B). A 2A receiver skips it (`read_host`'s
-/// unknown tags).
+/// The host line that tells a successor this process journals the session up to the carried head.
 pub(crate) const JOURNAL_HOST_LINE: &str = "journal v=1";
 
 impl SessionLog {
-    /// THE HANDOFF WORKER'S TAKE of this log, under the timeline lock: the
-    /// log's carry snapshot and the producers' lines; and from now on the
-    /// log's readers are fenced at it (`aterm_slog::Log::fence_reads`) until
-    /// the update commits (this process exits) or stands down
-    /// ([`Self::lift_read_fence`]).
+    /// THE HANDOFF WORKER'S TAKE of this log, under the timeline lock.
     #[cfg(any(unix, test))]
     pub(crate) fn carry_source(&mut self) -> SlogCarrySource {
         let now = self.now();
-        // The program's newest state its bucket held is written before the
-        // fence: the successor's bucket starts full and holds none of it.
-        // So is the newest shown tuple (6F-9), which the carry then names.
         self.flush_program(now);
         self.flush_shown(now);
-        // The bus mirror's state first (`session_log_mirror::sync`): a
-        // replaced bus log's cursor never crosses, and while the node mirrors
-        // the carry numbers the bus class even of a log no take reached.
         let snapshot = self.mirror_log().carry_snapshot();
         let host = self.host_lines(now);
         self.log.fence_reads();
@@ -223,10 +163,6 @@ impl SessionLog {
     }
 
     /// The producers' state as carry lines (this module's format), at `now`.
-    /// First, when this process's journal writer is running (it drains each
-    /// fenced log to its fence before the Commit), `journal v=1`: the
-    /// successor's journal starts after the carried head. First, because a
-    /// carry keeps host lines only within its bound.
     #[cfg(any(unix, test))]
     pub(crate) fn host_lines(&self, now: Stamp) -> Vec<String> {
         let mut out = Vec::new();
@@ -237,7 +173,6 @@ impl SessionLog {
             || "-".to_string(),
             |c| format!("{},{}", c.base, opt_wall(c.cursor)),
         );
-        // The remaining marks' last values ride as additive tokens (words, tenths and fingerprints, never text).
         out.push(format!(
             "state v=1 origin={} opened={} root={} last_blk={} csnap={csnap} cmd_end={} arrivals={}{}",
             origin_word(self.origin),
@@ -273,14 +208,11 @@ impl SessionLog {
             ));
             out.push(a.tracker.carry_line(now));
         }
-        // Only what can still attribute a turn crosses.
         let fresh = |at: Stamp| aterm_slog::attributes(at, now);
         let input = self.typed.input.filter(|(.., at)| fresh(*at));
         let ctl = self.typed.ctl.filter(|(.., at)| fresh(*at));
         if input.is_some() || ctl.is_some() {
             let mut s = String::from("typed");
-            // The input's sender and cause ride as their own tokens (phase
-            // 3A), so a 2A line (none: a person's) still reads.
             if let Some((seq, by, cause, at)) = input {
                 s.push_str(&format!(" input={seq},{}", at.wall_ms));
                 if by != Actor::Human {
@@ -298,10 +230,6 @@ impl SessionLog {
             }
             out.push(s);
         }
-        // The waiting names last: each line is read on its own, and the
-        // lines above, present whenever their producer holds state, fit the
-        // carry's host bytes at their worst (`session_log_tests`), so a
-        // burst of wide names costs only names.
         for p in &self.pending {
             out.push(format!(
                 "pending pgid={} name={} word={} detail={} at={} seq={}",
@@ -316,11 +244,7 @@ impl SessionLog {
         out
     }
 
-    /// THE CARRIED ADOPTION: continue the predecessor's log from its carry
-    /// at the next epoch, its seqs above the manifest's count, and its
-    /// producers' state as far as each line reads; then [`Self::reconcile`].
-    /// The handoff mark names the predecessor's `build` when the update said
-    /// it (phase 6, 6F-7). The caller has the uncarried path for an `Err`.
+    /// THE CARRIED ADOPTION.
     pub(crate) fn adopt_carried(
         &mut self,
         lines: &[String],
@@ -337,15 +261,9 @@ impl SessionLog {
             at,
         };
         let (log, host, stats) = Log::from_carry_built(lines, a, build)?;
-        // A carried successor's epoch is its predecessor's plus one,
-        // held without being issued: every later issue is above it.
         self.epochs.note(log.ep());
         self.replace_log(log);
         self.origin = Kind::Adopt;
-        // The predecessor journaled the session up to the carried head:
-        // this process's journal starts after it. Without the
-        // line (its journal off, stopped, or an older build) this process
-        // journals the carried records itself; a reader shows each once.
         if host.iter().any(|l| l == JOURNAL_HOST_LINE) {
             self.journal_start = Some(stats.head);
         }
@@ -359,10 +277,6 @@ impl SessionLog {
     /// one that does not read, or names a node the carried log does not hold
     /// open as that piece would, is dropped.
     fn read_host(&mut self, host: &[String], at: Stamp) {
-        // Without the `state` line the session's open instant is the
-        // adoption's: a block that finished before it is passed over (the
-        // predecessor logged it, or nobody can say), and every later one is
-        // logged.
         self.opened_wall = Some(at.wall_ms);
         let open_run = |log: &Log, n: Node| log.is_open(n) && n.lvl == Lvl::Run;
         let mut tracker_line: Option<&str> = None;
@@ -394,7 +308,6 @@ impl SessionLog {
                             "restore" => Kind::Restore,
                             _ => Kind::Adopt,
                         };
-                        // Read whole, then put back.
                         self.opened_wall = Some(opened.unwrap_or(at.wall_ms));
                         self.root_pgid = root;
                         self.last_blk = last_blk;
@@ -410,8 +323,6 @@ impl SessionLog {
                              it goes on from the adoption"
                         );
                     }
-                    // The remaining marks' last values (phase 3B): absent
-                    // from an older line, so unknown, and written afresh.
                     self.observed
                         .read_carry(|k| kv(line, k).map(str::to_string));
                 }
@@ -493,15 +404,12 @@ impl SessionLog {
                 _ => {}
             }
         }
-        // The tracker belongs to the agent run it names.
         if let Some(a) = self.agent.as_mut() {
             match tracker_line
                 .and_then(|l| TurnTracker::from_carry_line(l, at))
                 .filter(|t| t.run() == a.node)
             {
                 Some(t) => a.tracker = t,
-                // No tracker: the run stays; its turns start over, a turn the
-                // carried log holds open under it closes in the reconcile.
                 None => a.tracker = TurnTracker::new(a.node),
             }
         }
@@ -509,8 +417,7 @@ impl SessionLog {
 
     /// Close, innermost first and `out=gone`, every node the adopted log
     /// holds open that no producer holds (nor anything beneath it): a carried
-    /// command whose block line did not read, a turn no tracker knows. What a
-    /// producer holds stays open and closes when its own signal comes.
+    /// command whose block line did not read, a turn no tracker knows.
     fn reconcile(&mut self, at: Stamp) {
         let mut held: Vec<Node> = Vec::new();
         held.extend(self.cmd.map(|c| c.node));

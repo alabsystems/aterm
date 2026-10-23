@@ -28,12 +28,15 @@ const fn lerp(t: f32, p0: Point, p1: Point) -> Point {
 pub const FLATTEN_SAGITTA_PX: f32 = 1.0 / 255.0;
 
 /// `(4·t)²` — the squared second difference at which a quadratic's own chord
+/// already meets [`FLATTEN_SAGITTA_PX`], so it flattens to a single line.
 const ONE_LINE_DEVSQ: f32 = (4.0 * FLATTEN_SAGITTA_PX) * (4.0 * FLATTEN_SAGITTA_PX);
 
 /// `1/(4·t)` — the factor that turns a second difference into the square of the
+/// segment count that meets [`FLATTEN_SAGITTA_PX`].
 const INV_FOUR_SAGITTA: f32 = 1.0 / (4.0 * FLATTEN_SAGITTA_PX);
 
 /// Hard ceiling on the segments one curve may flatten to, so a hostile outline costs a
+/// wrong shape rather than a hung frame.
 const MAX_FLATTEN_SEGMENTS: usize = 4096;
 
 /// Signed-area coverage accumulation grid of `width` by `height` cells.
@@ -41,6 +44,8 @@ pub struct Rasterizer {
     width: usize,
     height: usize,
     /// `width * height` accumulators plus a short tail of slack, so a span that
+    /// ends exactly at the right edge has somewhere to deposit its final cell
+    /// without a bounds check on the hot path.
     a: Vec<f32>,
 }
 

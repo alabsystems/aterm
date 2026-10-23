@@ -27,6 +27,7 @@ const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
 const BOOT: [u8; 16] = *b"aterm-sim-B01-bt";
 
 /// The connection a world producer's writes ride ([`Event::Publish`]): the
+/// journal's connections count from 1.
 const WORLD: u64 = 0;
 
 /// One step of a script, played on both arms.
@@ -91,8 +92,10 @@ struct Real {
     durability: Durability,
     boot: Boot,
     /// Producers whose `/a/will` record the log holds: what an open fires,
+    /// one firing each.
     will_producers: BTreeSet<u64>,
     /// Wills queued to this broker's writer since its open: what
+    /// `wills_settled` must reach before the log is read again.
     queued: u64,
     dir: Scratch,
 }
@@ -404,6 +407,7 @@ impl Model {
     }
 
     /// The next frame of tail `c`, `Ok(None)` at its end, or what the model
+    /// said instead of either.
     fn deliver(&mut self, c: u64) -> Result<Option<Response>, String> {
         let stream = self.conns.get_mut(&c).expect("a model tail");
         match read_frame(stream) {
@@ -451,6 +455,7 @@ fn table(tier: Tier) -> Escalation {
 }
 
 /// Whether the record `req` writes is escalated on the real arm: its subject
+/// or group rules (an unguarded broker binds no principal).
 fn escalated(table: &Escalation, req: &Request) -> bool {
     match req {
         Request::Publish { subject, .. } => table.escalates(subject, &bus::Kind::Plain, None),
@@ -504,6 +509,7 @@ fn class(msg: &str) -> &'static str {
 }
 
 /// One answer as the comparison reads it ([module docs](self)), with a `Mark`'s
+/// durable head apart for the law.
 fn project(tier: Tier, resp: &Response) -> (String, Option<(Option<u64>, u64)>) {
     match resp {
         Response::PublishAck { offset, deduped } => {
@@ -673,6 +679,8 @@ fn answer(
 }
 
 /// THE DOOR'S JOURNAL of a world, as a script: each connection, request,
+/// delivery and end as it happened, a world producer's writes on a connection
+/// of their own, and the restarts.
 fn replay(journal: &[Event]) -> Vec<Step> {
     let mut steps = Vec::new();
     let mut world_dialled = false;
@@ -1215,6 +1223,10 @@ pub(crate) mod long {
 }
 
 /// THE WORLDS whose journals are replayed: one per tier, and each with the
+/// mirror off and on ([`super::world::Opts::seed`]'s alternation), on one
+/// device that never loses power, a broker that answers every ack at once,
+/// and a disk that never fails: what a restart may lose and when an ack is
+/// read are the law check's and the held-ack worlds' (module docs).
 fn journalled(seed: u64, tier: Tier) -> super::world::Outcome {
     let opts = super::world::Opts {
         tier: Some(tier),
@@ -1229,6 +1241,7 @@ fn journalled(seed: u64, tier: Tier) -> super::world::Outcome {
 }
 
 /// **THE MODEL ANSWERS EVERY SCRIPT AS ASTREAM'S BROKER DOES**, on every
+/// tier: each verb the bridge sends and each edge astream defines for it.
 #[test]
 fn the_model_answers_every_script_as_astreams_broker_does() {
     let mut failed = Vec::new();
@@ -1254,6 +1267,8 @@ fn the_model_answers_every_script_as_astreams_broker_does() {
 }
 
 /// **THE MODEL HOLDS ASTREAM'S SUBJECT BUDGET AND FETCH SCAN BOUND**, on a
+/// log long enough to reach each (Relaxed: the bounds are the same on every
+/// tier, and a Strict flush per batch would only cost time).
 #[test]
 fn the_model_holds_astreams_subject_budget_and_fetch_scan_bound() {
     let mut failed = Vec::new();
@@ -1273,6 +1288,7 @@ fn the_model_holds_astreams_subject_budget_and_fetch_scan_bound() {
 }
 
 /// **WHAT REAL BRIDGES SENT, ASTREAM ANSWERS AS THE MODEL DID**: the door's
+/// journal of seeded worlds, replayed on both arms.
 #[test]
 fn what_real_bridges_sent_astream_answers_as_the_model_did() {
     let mut failed = Vec::new();
@@ -1310,6 +1326,9 @@ fn what_real_bridges_sent_astream_answers_as_the_model_did() {
 }
 
 /// **NEGATIVE CONTROL: A MODEL THAT FORGETS ITS DEDUP OR ITS WILL FENCE, OR
+/// CHANGES A BINARY PAYLOAD, IS CAUGHT** by the scripts that hold it
+/// ([`ArmMutant::FreshDedup`], [`ArmMutant::NoWillFence`],
+/// [`ArmMutant::AlterPayload`]), and by the journal of a world.
 #[test]
 fn a_model_that_forgets_its_dedup_or_its_will_fence_is_caught() {
     for (mutant, script, what) in [

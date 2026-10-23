@@ -115,6 +115,7 @@ pub enum BarBase {
 }
 
 /// The band's fallback warn hue on a light ground, where the theme's ANSI pair
+/// cannot seed it ([`status_inks`]).
 const WARN_LIGHT: [u8; 3] = [0x9A, 0x67, 0x00];
 /// …on a dark ground.
 const WARN_DARK: [u8; 3] = [0xF1, 0xFA, 0x8C];
@@ -130,6 +131,10 @@ pub const STATUS_LIGHTNESS_GAP: f64 = 0.10;
 pub const STATUS_DISTANCE: f64 = 0.12;
 
 /// The seed of a status ink (warn or error): the theme's own ANSI slot where
+/// it carries a colour (`OkLCh` chroma at least
+/// [`crate::palette::BORROW_CHROMA`], the line a meter borrows a hue at), so
+/// a Solarized or Nord band warns in its own yellow and red; otherwise the
+/// fixed fallback for the ground's polarity.
 fn status_seed(slot: Option<[u8; 3]>, fallback: [u8; 3]) -> [u8; 3] {
     slot.filter(|c| crate::palette::chroma(*c) >= crate::palette::BORROW_CHROMA)
         .unwrap_or(fallback)
@@ -158,6 +163,7 @@ fn status_inks(ansi: Option<AnsiHues>, bar_bg: [u8; 3], light: bool) -> ([u8; 3]
 }
 
 /// One warn/error pair floored to AA on `bar_bg` and held
+/// [`STATUS_LIGHTNESS_GAP`] apart (see [`status_inks`]).
 fn status_pair(warn: [u8; 3], error: [u8; 3], bar_bg: [u8; 3]) -> ([u8; 3], [u8; 3]) {
     const AA: f64 = 4.5;
     let up = lifts(bar_bg);
@@ -180,17 +186,21 @@ fn status_pair(warn: [u8; 3], error: [u8; 3], bar_bg: [u8; 3]) -> ([u8; 3], [u8;
 }
 
 /// Whether an ink on `bg` reads by being lighter than it: white reaches at
+/// least the contrast black does.
 fn lifts(bg: [u8; 3]) -> bool {
     contrast(WHITE, bg) >= contrast(BLACK, bg)
 }
 
 /// `c` at `OkLCh` lightness `l`, its hue and chroma kept (chroma given up
+/// only to stay in gamut, [`from_oklch`]).
 fn at_lightness(c: [u8; 3], l: f64) -> [u8; 3] {
     let (_, ch, h) = oklch(c);
     from_oklch(l, ch, h)
 }
 
 /// `c` floored to `target`:1 on `bg` by the least move of its `OkLCh`
+/// lightness, up (`up`) or down, at constant hue and chroma: a red stays a
+/// red rather than washing to pink.
 fn lightness_floor(c: [u8; 3], bg: [u8; 3], target: f64, up: bool) -> [u8; 3] {
     if contrast(c, bg) >= target {
         return c;
@@ -392,6 +402,7 @@ pub fn contrast(a: [u8; 3], b: [u8; 3]) -> f64 {
 }
 
 /// `aterm_types::Rgb`'s relative luminance per WCAG 2.0: unfused (see
+/// [`contrast`]).
 #[inline]
 fn rgb_luminance(c: [u8; 3]) -> f64 {
     #[inline]
@@ -461,6 +472,8 @@ pub fn forced_ink(ink: [u8; 3], on: [u8; 3]) -> [u8; 3] {
 }
 
 /// The hovered capsule's fill: `bar_bg` moved toward `fg`, 0.30 and on in
+/// steps of 0.05 until it stands [`HOVER_RISE`]:1 from `rest` (a resting
+/// chip's fill), while `ink` still clears WCAG AA on it.
 fn capsule_hover_fill(bar_bg: [u8; 3], fg: [u8; 3], ink: [u8; 3], rest: [u8; 3]) -> [u8; 3] {
     const AA: f64 = 4.5;
     for step in 6..=14u8 {
@@ -702,6 +715,7 @@ pub(crate) fn mix_u8(a: [u8; 3], b: [u8; 3], t: u8) -> [u8; 3] {
 }
 
 /// `OkLCh` → sRGB bytes, giving up chroma (never lightness or hue) until the
+/// colour is inside the sRGB gamut.
 #[allow(
     clippy::excessive_precision,
     clippy::unreadable_literal,
@@ -808,6 +822,8 @@ pub fn paint_band(
 pub(crate) struct RowInks<'a> {
     band: [u8; 3],
     /// Each column's surface (the mean over its pixels, what the cell record
+    /// carries), and whether it lies on the fill's side of the row; `None` on
+    /// an unmetered row.
     meter: Option<&'a [([u8; 3], bool)]>,
     hc: bool,
     /// The High Contrast ink for a word on the fill (`HIGHLIGHTTEXT`).
@@ -851,6 +867,8 @@ impl RowInks<'_> {
     }
 
     /// `ink` as a word at column `x` wears it: the row's one ink for its
+    /// side ([`InkPlan`]); under High Contrast the system's `HIGHLIGHTTEXT`
+    /// on the fill and the forced ink floor elsewhere.
     fn ink(&self, x: usize, ink: [u8; 3]) -> [u8; 3] {
         if self.meter.is_none() {
             return ink;
@@ -889,6 +907,9 @@ impl RowInks<'_> {
 pub const WORD_AA: f64 = 4.5;
 
 /// A chip face's `(ink, fill)`: under High Contrast the system's inks (a lit
+/// chip its hover pair, a resting one WINDOWTEXT on the band); an outlined
+/// Primary the inside's ground and its accent label ([`outlined_inks`]);
+/// every other chip its own AA pair ([`chip_inks`]).
 fn chip_face_inks(c: &BandInks, chip: ChipFace) -> ([u8; 3], [u8; 3]) {
     match chip.form {
         ChipForm::Forced if chip.lit => match chip.role {
@@ -1154,6 +1175,7 @@ pub fn crisp_on_fill(c: &BandInks, fill: [u8; 3], inks: &MeterInks) -> [u8; 3] {
 }
 
 /// The one ink over a stalled bar's dim slate ([`crisp_on_fill`]'s
+/// counterpart for the stall's state).
 fn crisp_on_stalled(c: &BandInks, fill: [u8; 3], inks: &MeterInks) -> [u8; 3] {
     let stalled = LinInks::of(inks).rgb(Tone::STALLED.into());
     floor_word(fill_ink(c, fill), stalled, fill_anchor(stalled))
@@ -1260,6 +1282,8 @@ pub fn glint_step(fill: [u8; 3], words: [u8; 3], rail: bool) -> [u8; 3] {
 const GLINT_DL: f64 = 0.085;
 
 /// Whether a row's glint belongs in the rail band: its full-height step
+/// away from the fill's words would read under ΔE 6 (a fill already near the
+/// end of the scale its words are not on).
 fn glint_needs_rail(c: &BandInks, fill: [u8; 3], inks: &MeterInks) -> bool {
     let _ = c;
     delta_e(inks.glint, fill) < 6.0
@@ -1305,6 +1329,8 @@ pub fn outlined_inks(c: &BandInks, lit: bool) -> OutlinedInks {
 }
 
 /// How far a lit outlined Primary's inside moves from the band toward the
+/// accent, in linear light: a tint that says "under the pointer" and leaves
+/// the bar the only solid accent on the row.
 const OUTLINE_LIT_TINT: f64 = 0.18;
 
 /// A chip's `(ink, fill, bold)` off High Contrast, every label at AA on its own fill, over the band, the track or the fill, resting or lit.
@@ -1337,12 +1363,13 @@ pub(crate) fn chip_inks(
 mod tests {
     use super::*;
 
-    /// The former dark/light rule, verbatim: Rec. 601 luma above 150 in
+    /// The former dark/light rule, verbatim: Rec.
     fn luma_is_light(c: [u8; 3]) -> bool {
         0.299 * f32::from(c[0]) + 0.587 * f32::from(c[1]) + 0.114 * f32::from(c[2]) > 150.0
     }
 
     /// A floor whose anchor the surface's luma alone picks: the foil for the
+    /// mid-grey negative control.
     fn luma_anchored_floor(c: [u8; 3], bg: [u8; 3], target: f64) -> [u8; 3] {
         let anchor = if luma_is_light(bg) {
             [0, 0, 0]
@@ -1356,6 +1383,9 @@ mod tests {
     }
 
     /// Over a lattice of surfaces (every grey and a colour cube) and inks, at
+    /// 3:1 and AA, `ensure_contrast` clears `target` wherever black or white
+    /// does, never loses the contrast it started with, and leaves an ink that
+    /// already clears it untouched.
     #[test]
     fn the_floor_is_met_whenever_either_pole_can_meet_it() {
         let greys = (0..=255u8).map(|g| [g, g, g]);
@@ -1391,6 +1421,9 @@ mod tests {
     }
 
     /// Warn and error speak the theme's own ANSI yellow and red (slots 3 and
+    /// 1), floored to AA on the band at their own hue, where those slots
+    /// carry a colour; a monochrome palette's grey slots leave the fixed
+    /// fallbacks in place.
     #[test]
     fn warn_and_error_seed_from_the_themes_ansi_yellow_and_red() {
         let theme = ThemeInks {
@@ -1422,6 +1455,10 @@ mod tests {
     }
 
     /// Every built-in theme, on every band ground a host draws: the error ink
+    /// keeps a colour after its floor, warn and error stand apart in lightness
+    /// (warn the lighter on either polarity: lifted above error on a dark
+    /// band, error pushed below it on a light one) and in `OkLab`, and both
+    /// clear AA.
     #[test]
     fn warn_and_error_stay_coloured_and_a_lightness_step_apart_on_every_builtin() {
         use crate::palette::{NEAR_GREY_CHROMA, chroma, oklab_distance};
@@ -1477,6 +1514,9 @@ mod tests {
     }
 
     /// Negative control for the property above: Nord's red floored by an sRGB
+    /// mix toward white ([`ensure_contrast`]) comes out a grey-pink under the
+    /// near-grey line and closer to the floored yellow than [`STATUS_DISTANCE`];
+    /// the lightness floor keeps it a red.
     #[test]
     fn an_srgb_mix_floor_washes_a_red_the_lightness_floor_keeps() {
         use crate::palette::{NEAR_GREY_CHROMA, chroma, oklab_distance};
@@ -1491,6 +1531,9 @@ mod tests {
     }
 
     /// Negative control for the lattice law: on a mid-grey bar (`#939393`, the
+    /// message band of a mid-tone theme) the luma-anchored floor pushes the
+    /// secondary label (`#535353`) to white, 3.07:1, under AA, though black
+    /// clears it; [`ensure_contrast`] reaches AA on the label's own (dark) side.
     #[test]
     fn a_mid_grey_bar_floors_its_label_on_the_side_that_reaches_aa() {
         let (bar, label) = ([0x93; 3], [0x53; 3]);
@@ -1501,6 +1544,9 @@ mod tests {
     }
 
     /// Every colour a pole-ink law is checked on: every grey, an RGB
+    /// lattice (every 15th level per channel, ends included), the colour
+    /// the luma rule failed worst (`#01ff00`) and the nearest tie
+    /// (`#cf0dcc`).
     fn pole_sweep() -> Vec<[u8; 3]> {
         let levels: Vec<u8> = (0..=255u8).step_by(15).collect();
         let mut out: Vec<[u8; 3]> = (0..=255u8).map(|g| [g, g, g]).collect();
@@ -1516,6 +1562,7 @@ mod tests {
     }
 
     /// Does `is_light`'s pole ink (black on light, white on dark) clear
+    /// √21 and read at least as well as the other pole on `c`?
     fn pole_ink_reads_best(is_light: fn([u8; 3]) -> bool, c: [u8; 3]) -> bool {
         let (ink, other) = if is_light(c) {
             (BLACK, WHITE)
@@ -1526,6 +1573,8 @@ mod tests {
     }
 
     /// THE POLE INK READS BEST: on every swept surface the ink
+    /// [`bg_is_light`] implies clears √21 ≈ 4.58:1 and out-contrasts the
+    /// other pole.
     #[test]
     fn bg_is_light_picks_the_pole_ink_that_reads_best() {
         let sweep = pole_sweep();
@@ -1544,6 +1593,9 @@ mod tests {
     }
 
     /// THE GREYS TURN LIGHT ONCE, AT THE POLE: along the grey ramp the
+    /// classifier changes value exactly once, dark to light, between
+    /// `#757575` and `#767676` — the first grey where black (4.62:1) beats
+    /// white (4.54:1).
     #[test]
     fn the_greys_turn_light_once_at_the_pole() {
         let ramp: Vec<bool> = (0..=255u8).map(|g| bg_is_light([g; 3])).collect();
@@ -1559,6 +1611,10 @@ mod tests {
     }
 
     /// The forced mapping (Windows High Contrast, CSS forced-colors): the band
+    /// is BTNFACE, the well WINDOW, the meter HIGHLIGHT on a WINDOW track,
+    /// every ink WINDOWTEXT, the lit chips HIGHLIGHT with HIGHLIGHTTEXT; a
+    /// well that shares the band's tone gets a border, and nothing
+    /// theme-derived survives (no pastel edge).
     #[test]
     fn the_forced_palette_maps_each_system_colour_to_its_role() {
         let hc = ForcedPalette {

@@ -6,10 +6,10 @@
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-/// One tar block. Every header is exactly this, and every entry's content is
+/// One tar block.
 const BLOCK: usize = 512;
 
-/// The largest GNU-longname / PAX extension body this reader will read. Its length is
+/// The largest GNU-longname / PAX extension body this reader will read.
 const MAX_EXTENSION_BODY: u64 = 1024 * 1024;
 
 /// The tar typeflag byte, as the entry kinds this reader distinguishes.
@@ -49,7 +49,7 @@ pub struct Header {
     raw: [u8; BLOCK],
 }
 
-/// Byte offsets of the POSIX ustar header fields. Named rather than inlined,
+/// Byte offsets of the POSIX ustar header fields.
 mod field {
     /// `name`: 100 bytes.
     pub const NAME: (usize, usize) = (0, 100);
@@ -78,12 +78,14 @@ fn bad(what: &str) -> io::Error {
 
 impl Header {
     /// A field's raw bytes, or an empty slice if the offsets were ever wrong: never an
+    /// index panic.
     #[inline]
     fn field(&self, (off, len): (usize, usize)) -> &[u8] {
         self.raw.get(off..off + len).unwrap_or(&[])
     }
 
     /// A field's bytes with the trailing NUL/space padding removed — the form
+    /// every text field is stored in.
     #[inline]
     fn trimmed(&self, spec: (usize, usize)) -> &[u8] {
         let f = self.field(spec);
@@ -91,19 +93,19 @@ impl Header {
         f.get(..end).unwrap_or(&[])
     }
 
-    /// Is this a POSIX ustar header, i.e. does `prefix` mean anything? Magic and version,
+    /// Is this a POSIX ustar header, i.e. does `prefix` mean anything?
     #[inline]
     fn is_ustar(&self) -> bool {
         self.field(field::MAGIC) == b"ustar\0" && self.field(field::VERSION) == b"00"
     }
 
-    /// Is this a GNU header (magic `"ustar "`, version `" \0"`)? It shares the first 345
+    /// Is this a GNU header (magic `"ustar "`, version `" \0"`)?
     #[inline]
     fn is_gnu(&self) -> bool {
         self.field(field::MAGIC) == b"ustar " && self.field(field::VERSION) == b" \0"
     }
 
-    /// Is this a header whose extension typeflags (`L`, `K`, `x`) are meaningful? With
+    /// Is this a header whose extension typeflags (`L`, `K`, `x`) are meaningful?
     #[inline]
     fn is_recognized(&self) -> bool {
         self.is_ustar() || self.is_gnu()
@@ -186,7 +188,7 @@ impl Header {
         Ok(acc)
     }
 
-    /// Does the header's own checksum match its bytes? The sum is the unsigned total of all
+    /// Does the header's own checksum match its bytes?
     fn checksum_ok(&self) -> bool {
         let Ok(stored) = self.stored_checksum() else {
             return false;
@@ -211,6 +213,7 @@ impl Header {
     }
 
     /// The path bytes this header alone declares: `prefix/name` on a ustar
+    /// header with a non-empty prefix, otherwise `name`.
     fn path_bytes(&self) -> Vec<u8> {
         let name = self.trimmed(field::NAME);
         if self.is_ustar() {
@@ -285,13 +288,17 @@ impl<R: Read> Archive<R> {
 pub struct Entries<'a, R> {
     inner: &'a mut R,
     /// Bytes of the previous entry (unread content + its block padding) that
+    /// must be discarded before the next header can be read.
     skip: u64,
     /// Set once the end marker or a clean EOF has been seen; the walk then
+    /// yields nothing forever, so a caller that keeps asking cannot re-enter
+    /// the parser on trailing bytes.
     finished: bool,
 }
 
 impl<'a, R: Read> Entries<'a, R> {
     /// Discard exactly `n` bytes through a fixed stack buffer, so an attacker's declared
+    /// size costs time proportional to the bytes that exist, never memory.
     fn discard(&mut self, mut n: u64) -> io::Result<()> {
         let mut buf = [0u8; BLOCK];
         while n > 0 {
@@ -341,6 +348,9 @@ impl<'a, R: Read> Entries<'a, R> {
     }
 
     /// Read an extension header's body (`size` bytes plus its block padding): the only
+    /// variable-length thing this parser holds in memory, so it is streamed in fixed
+    /// blocks and grown, never pre-allocated from the declared size, and capped at
+    /// [`MAX_EXTENSION_BODY`].
     fn read_extension_body(&mut self, size: u64) -> io::Result<Vec<u8>> {
         let mut body: Vec<u8> = Vec::new();
         let mut buf = [0u8; BLOCK];
@@ -504,10 +514,12 @@ struct PaxRecords {
     /// A `linkpath` record — the entry's real link target.
     link: Option<Vec<u8>>,
     /// A `size` record — the entry's real content length, overriding the
+    /// header's `size` field.
     size: Option<u64>,
 }
 
 /// Split one PAX record (`"<len> <key>=<value>"`, newline already removed) into key and
+/// value.
 fn pax_record(line: &[u8]) -> Option<(&[u8], &[u8])> {
     let sp = line.iter().position(|&b| b == b' ')?;
     let digits = line.get(..sp)?;
@@ -521,6 +533,7 @@ fn pax_record(line: &[u8]) -> Option<(&[u8], &[u8])> {
 }
 
 /// Parse a PAX extended-header body into the records this reader acts on: records split on
+/// newlines, one per line.
 fn parse_pax(body: &[u8]) -> PaxRecords {
     let mut out = PaxRecords::default();
     let mut size_settled = false;
@@ -552,6 +565,7 @@ pub struct Entry<'e, 'a, R> {
     path: PathBuf,
     link_name: Option<PathBuf>,
     /// The entry's effective content length: the header's `size` field, or the PAX `size`
+    /// record where one overrode it ([`Entry::entry_size`]).
     size: u64,
     /// Content bytes not yet handed to the caller.
     remaining: u64,
@@ -622,6 +636,8 @@ impl<R: Read> Entry<'_, '_, R> {
 
 impl<R: Read> Read for Entry<'_, '_, R> {
     /// Hand out content bytes, and never more than the header declared: the
+    /// entry ends at its own size, so a caller reading to EOF cannot walk into
+    /// the next header.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.remaining == 0 {
             return Ok(0);
@@ -652,6 +668,7 @@ mod tests {
     }
 
     /// Fill in a header's checksum field the way every writer does: the
+    /// unsigned sum of all 512 bytes with the field itself read as spaces.
     fn seal(h: &mut [u8; 512]) {
         h[148..156].fill(b' ');
         let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
@@ -755,6 +772,7 @@ mod tests {
     }
 
     /// A reader that hands out at most `chunk` bytes per `read` call, as a zstd decoder
+    /// does in the shipped path: the proof that every loop honours the `Read` contract.
     struct Dribble<'a> {
         bytes: &'a [u8],
         chunk: usize,
@@ -822,6 +840,7 @@ mod tests {
     }
 
     /// A ustar `prefix` joins to `name` with a slash — and only on a POSIX
+    /// header.
     #[test]
     fn golden_prefix_is_posix_ustar_only() {
         for (magic, version, expected) in [
@@ -843,6 +862,7 @@ mod tests {
     }
 
     /// A GNU long name replaces the header's, and exactly one trailing NUL
+    /// comes off — an interior NUL is part of the name.
     #[test]
     fn golden_gnu_long_name_drops_one_trailing_nul() {
         for (label, body, expected) in [
@@ -867,6 +887,7 @@ mod tests {
     }
 
     /// A PAX `size` record decides the entry's length and therefore where the
+    /// next header begins.
     #[test]
     fn golden_pax_size_overrides_the_header_field() {
         let rec = pax("size", "4");
@@ -888,6 +909,7 @@ mod tests {
     }
 
     /// `Entry::entry_size` is the effective size; `header().entry_size()` is
+    /// the raw field.
     #[test]
     fn golden_effective_and_raw_sizes_are_both_reachable() {
         let rec = pax("size", "4");
@@ -910,6 +932,7 @@ mod tests {
     }
 
     /// The first record of a repeated key wins, and a malformed record neither
+    /// ends the scan nor suppresses what follows it.
     #[test]
     fn golden_pax_precedence_and_recovery() {
         let cases: Vec<(&str, Vec<u8>, &str)> = vec![
@@ -1021,6 +1044,7 @@ mod tests {
     }
 
     /// A base-256 `size` reads the low eight bytes of the 12-byte field and
+    /// ignores everything above them.
     #[test]
     fn golden_base256_size_reads_the_low_eight_bytes() {
         let mut h = header("x.txt", b'0', 0);
@@ -1061,6 +1085,7 @@ mod tests {
     }
 
     /// The checksum is the unsigned byte sum only: a header that passes the signed rule and
+    /// fails the unsigned one is refused.
     #[test]
     fn a_signed_only_checksum_is_refused() {
         let mut h = header("x.txt", b'0', 0);
@@ -1082,6 +1107,8 @@ mod tests {
     }
 
     /// Every loop honours the `Read` contract rather than assuming a full
+    /// buffer: the same archive through a one-byte-at-a-time reader must decode
+    /// identically.
     #[test]
     fn a_dribbling_reader_decodes_identically() {
         let rec = pax("size", "4");
@@ -1104,6 +1131,7 @@ mod tests {
     }
 
     /// A stream that stops mid-archive is an error, not a short archive —
+    /// except between entries, where it is a clean end.
     #[test]
     fn truncation_is_an_error_inside_an_entry_and_clean_between_them() {
         let mut v = Vec::new();
@@ -1122,6 +1150,8 @@ mod tests {
     }
 
     /// An extension header describing an entry that never arrives is a
+    /// rejection, not a silently shorter archive — at EOF and at the end
+    /// marker alike.
     #[test]
     fn a_dangling_extension_header_is_refused() {
         for (label, tail) in [("eof", Vec::new()), ("end marker", end())] {
@@ -1142,6 +1172,7 @@ mod tests {
     }
 
     /// An extension typeflag with neither magic is an ordinary entry, and a
+    /// `g` header is an ordinary entry whatever its magic.
     #[test]
     fn unrecognized_and_global_headers_are_ordinary_entries() {
         let body = b"real/name.txt\0".to_vec();
@@ -1183,6 +1214,7 @@ mod tests {
     }
 
     /// `mode` and `chksum` are octal-only; a high-bit value in either is a
+    /// malformed field, not a base-256 number.
     #[test]
     fn mode_and_checksum_reject_the_base256_form() {
         let mut h = header("x.txt", b'0', 0);
@@ -1211,6 +1243,8 @@ mod tests {
     }
 
     /// A size within a block of `u64::MAX` cannot be advanced past, and that is
+    /// a refusal before the entry is yielded — not one entry followed by a
+    /// failure, which would be a different entry list from any other reader's.
     #[test]
     fn an_unadvanceable_size_is_refused_before_the_entry() {
         let mut h = header("x.txt", b'0', 0);
@@ -1222,6 +1256,8 @@ mod tests {
     }
 
     /// An entry hands out exactly its declared bytes and never reads into the
+    /// next header, and an entry the caller never reads is still skipped
+    /// correctly — the shape the extractor uses for directories and hardlinks.
     #[test]
     fn content_is_bounded_and_unread_content_is_skipped() {
         let mut v = Vec::new();

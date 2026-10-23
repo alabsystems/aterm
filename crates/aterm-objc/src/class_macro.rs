@@ -113,8 +113,10 @@ macro_rules! declare_class {
         #[repr(C)]
         $vis struct $name {
             /// The instance's real storage belongs to the Objective-C runtime;
+            /// this type is a zero-sized marker at that address, never a value.
             _opaque: [u8; 0],
             /// Makes the type `!Send`/`!Sync`: every declared class in aterm is
+            /// main-thread AppKit state.
             _not_thread_safe: ::core::marker::PhantomData<*const u8>,
         }
 

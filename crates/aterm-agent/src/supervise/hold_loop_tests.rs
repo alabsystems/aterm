@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// WHY LAND STILL HOLDS, TOLD BY THE LOOP (`docs/DESIGN-harness-autopilot-2026-10-15.md`
-// §12.3.3 item 2): what a recording host is told through
-// `IdleHost::land_held` — by the loop's one teller (`Session::tell_hold`),
-// where the face is told (each start, each point folded in, each live read
-// of someone else's turn), at each act's ledger row, at an Off park, and
-// `None` at the loop's end where a hold was told — only where the hold
-// moved. And a tape recorded before the door replays in acts mode. Each
-// behaviour has its negative control. Included from `run_tests.rs` (`mod
-// hold_loop`), so the `Mock` and its helpers are in scope.
-
 use crate::harness::acts::{HoldLeg, LandHeld, TaskFace};
 use crate::supervise::policy::turn_end::{RULE_LAND, RULE_LAND_NUDGE};
 
@@ -202,12 +192,7 @@ fn hold(since: Option<i64>, nudges: u32, legs: Option<&[HoldLeg]>) -> LandHeld {
 /// legs; its yield tells the legs that held it (no defense); the nudge's
 /// row tells the new count at once; the nudge's yield, held the same way,
 /// tells nothing (two equal points, one call); someone else's turn read live
-/// drops the legs, one call; and the next nudge's row counts two. NEGATIVE
-/// CONTROLS, as mutants of the loop (the slice's commit names each): a
-/// teller asked at every point, its move unchecked, tells the equal points
-/// twice; one never asked where the face is told tells nothing past the
-/// rows. That each tell comes before the next point, not only in this
-/// order, is [`a_land_acts_row_and_a_live_read_are_told_before_any_point`]'s.
+/// drops the legs, one call; and the next nudge's row counts two.
 #[test]
 fn the_hold_is_told_once_per_move_and_at_each_nudge() {
     let host = Arc::new(Holds::default());
@@ -245,8 +230,6 @@ fn the_hold_is_told_once_per_move_and_at_each_nudge() {
         ],
         "{lines:#?}"
     );
-    // Told beside the face, before any point: the start's face first, then
-    // its hold.
     assert_eq!(
         host.told().get(..2),
         Some(&[Told::Face(TaskFace::Open), Told::Hold(None)][..])
@@ -257,14 +240,9 @@ fn the_hold_is_told_once_per_move_and_at_each_nudge() {
 /// item 2): a session gone at its first wait after the nudge is typed, no
 /// read of the nudge's turn, was told the nudge's count; one gone while
 /// someone else's turn runs, read live and never ended, was told its legs
-/// dropped. Neither waits for a point that never comes. NEGATIVE CONTROLS
-/// (mutants of the loop): a teller asked only where the face is told
-/// leaves the count one behind; one beside `fold_point`'s call alone, not
-/// inside `tell_face`, leaves the last yield's legs standing.
+/// dropped.
 #[test]
 fn a_land_acts_row_and_a_live_read_are_told_before_any_point() {
-    // The instruction's yield sits until the nudge is typed; the session
-    // is gone at the first wait after it.
     let host = Arc::new(Holds::default());
     let mut m = scripted(
         vec![
@@ -291,9 +269,6 @@ fn a_land_acts_row_and_a_live_read_are_told_before_any_point() {
         host.told()
     );
 
-    // The nudge's yield read, then someone else's turn, read live (the
-    // script of the test above, to that turn); the session is gone before
-    // its end.
     let host = Arc::new(Holds::default());
     let mut screens = a_landing_with_someone_elses_turn();
     screens.truncate(7);
@@ -354,13 +329,10 @@ fn ledger(tag: &str, rows: &[String], journal: &[String]) -> (PathBuf, PathBuf) 
 /// the hold it seeds (the instruction row's stamp, one nudge, unread) and
 /// nothing again until it moves; a restart over a landing (its face told
 /// at the start's later site, once the session's word is read) tells none;
-/// a fresh start tells none. NEGATIVE CONTROL (a mutant of the loop): a
-/// `tell_start_face` without the hold's teller tells nothing at the start,
-/// and the seeded hold first after the first point.
+/// a fresh start tells none.
 #[test]
 fn each_start_tells_the_seed_once() {
     let min = |n: u64| Duration::from_secs(60 * n);
-    // A seeded episode.
     let (land_row, since) = ledger_row(RULE_LAND, "land", min(10));
     let (nudge_row, _) = ledger_row(RULE_LAND_NUDGE, "still landing", min(5));
     let (dir, path) = ledger("seeded", &[land_row, nudge_row], &[]);
@@ -383,8 +355,6 @@ fn each_start_tells_the_seed_once() {
         "told once: {told:#?}"
     );
 
-    // A restart over a landing (the journal's `DONE` note of the
-    // instruction's yield): its face, then no hold.
     let (land_row, _) = ledger_row(RULE_LAND, "land", min(10));
     let at = crate::supervise::journal::unix_ms() - i64::try_from(min(9).as_millis()).unwrap();
     let note = crate::supervise::journal::JournalRecord::of_line(at, None, LANDED_NOTE, None);
@@ -402,7 +372,6 @@ fn each_start_tells_the_seed_once() {
     );
     assert_eq!(host.holds(), [None], "{tells:#?}");
 
-    // A fresh start, nothing to seed: none, once.
     let host = Arc::new(Holds::default());
     let mut m = scripted(vec![ended(PROGRESS)], "off", Vec::new());
     let _ = run(&mut m, &host, None);
@@ -411,11 +380,7 @@ fn each_start_tells_the_seed_once() {
 
 /// THE HOLD ENDS AT A LANDING, told beside the face as it moves (§12.3.3):
 /// the instruction's yield names open work (held, read); the nudge's clean
-/// defense lands it — told none right after `landed`. (A person's own
-/// exchange moves the face the same way, through the same teller: the
-/// Tier-1 walk, `supervise_conformance_land.rs`, holds the hold told there
-/// to none.) NEGATIVE CONTROL: the nudge's yield naming open work again
-/// lands nothing, and the hold stands, read.
+/// defense lands it — told none right after `landed`.
 #[test]
 fn the_hold_ends_at_a_landing() {
     let landing = |last: &str| {
@@ -442,7 +407,6 @@ fn the_hold_ends_at_a_landing() {
         [Told::Face(TaskFace::Landed), Told::Hold(None)],
         "{told:#?}\n{lines:#?}"
     );
-    // NEGATIVE CONTROL: open work named again holds it.
     let (told, lines) = landing(OPEN_DEFENSE);
     let last = told.iter().rev().find_map(|t| match t {
         Told::Hold(h) => Some(*h),
@@ -496,8 +460,7 @@ fn read_hold(st: &mut crate::supervise::policy::turn_end::TurnEndState) {
 /// hold told, then the park's first act (`off_stood`, which ends the
 /// episode with no point folded in) tells none; a hold told, then the
 /// loop's end (`release_attention`) tells none; a loop that told none tells
-/// nothing at its end. NEGATIVE CONTROLS (mutants of the loop): without the
-/// park's tell, or the end's, the window keeps the hold.
+/// nothing at its end.
 #[test]
 fn the_hold_is_told_gone_at_an_off_park_and_at_the_loops_end() {
     let mut notes = Alone;
@@ -520,7 +483,6 @@ fn the_hold_is_told_gone_at_an_off_park_and_at_the_loops_end() {
         assert!(told[0].is_some_and(|h| h.read), "{told:#?}");
         assert_eq!(told[1], None, "at_off={at_off}");
     }
-    // A loop that told no hold tells nothing at its end.
     let mut m = Mock::new(vec![idle_screen()]);
     let host = Arc::new(Holds::default());
     {
@@ -535,14 +497,7 @@ fn the_hold_is_told_gone_at_an_off_park_and_at_the_loops_end() {
 /// CRUISE CHOSEN AT A HELD POINT ENDS THE HOLD AS ITS ACT IS TYPED (the
 /// third review of 3b): the instruction typed, its yield names open work
 /// (held, read), and the owner switches the session to Cruise just as that
-/// yield is drawn. The point is folded in under the word last read (Land:
-/// the hold read is told), then decided under the word read fresh: Cruise's
-/// act, typed and ledgered, tells none at its row — the screen has not
-/// moved since (no live read of the act's turn, which would tell it a read
-/// later), and the session is gone at the first wait after it. NEGATIVE
-/// CONTROL (a mutant of the loop, the landing commit names it): a
-/// `ledger_row` that tells the hold at Land's own rows alone leaves the read
-/// hold told under Cruise.
+/// yield is drawn.
 #[test]
 fn a_cruise_act_at_a_held_point_tells_the_hold_gone_as_it_is_typed() {
     let host = Arc::new(Holds::default());
@@ -591,13 +546,7 @@ fn a_cruise_act_at_a_held_point_tells_the_hold_gone_as_it_is_typed() {
 /// another mode (a box's `meta` under Cruise, no reading of the switch
 /// folded in yet) tells none, the episode kept, and the word read Land
 /// again tells the hold again; a word left to the table's tells the
-/// episode's hold. Behind another supervisor's claim the hold is told none
-/// (2b's rule for the needs: that loop keeps the episode), and the claim
-/// back tells it again. NEGATIVE CONTROLS: the word read Land again, and
-/// the claim given back, each tell the kept hold, so it was the word and
-/// the claim that made it none; and a mutant of the loop that tells
-/// whatever the episode keeps (no `hold_is_ours`) keeps the hold told
-/// under Cruise and behind the claim (the landing commit names it).
+/// episode's hold.
 #[test]
 fn a_hold_is_told_none_outside_land_and_behind_another_claim() {
     let reply = |word: &str| format!("OK title=- autopilot={word}\n");
@@ -664,11 +613,7 @@ fn a_hold_is_told_none_outside_land_and_behind_another_claim() {
 /// A TAPE RECORDED BEFORE THE HOLD'S DOOR (§12.7, "the engine lift"): the
 /// recorded run of [`the_hold_is_told_once_per_move_and_at_each_nudge`]'s
 /// script with its `host.land_held` outputs taken off, as a build before
-/// them taped it. In acts mode it is REPRODUCED, every act taken, the tells
-/// the only records the replay could not match (`unmatched_outputs`,
-/// nothing dropped, repeated, keyed or tainted); a strict replay diverges,
-/// and at `host.land_held`, the new call. NEGATIVE CONTROL: the tape as
-/// recorded replays strict and in acts mode exactly (`assert_replays`).
+/// them taped it.
 #[test]
 fn an_old_tape_replays_in_acts_mode_and_strictly_differs_at_the_hold() {
     use crate::supervise::tape::replay::{Options, replay};

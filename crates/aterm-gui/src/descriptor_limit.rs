@@ -7,9 +7,11 @@
 use crate::handoff_env::HandoffName;
 
 /// The soft `RLIMIT_NOFILE` a launched successor raises itself to before it
+/// dials (never above its hard limit).
 const SUCCESSOR_DESCRIPTOR_FLOOR: u64 = 4096;
 
 /// The lane a successor's sessions arrive on, for the record its raise leaves
+/// ([`settle_incoming_descriptor_limit`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SuccessorLane {
     /// Over the rendezvous, to a LaunchServices-launched successor.
@@ -66,6 +68,11 @@ pub(crate) fn raised_soft_limit(soft: u64, hard: u64) -> Option<u64> {
 }
 
 /// The soft `RLIMIT_NOFILE` this process was LAUNCHED with, recorded by the
+/// first [`raise_descriptor_limit_for_claim`] that moved it — a claim's, a
+/// park's or a recovery's — or adopted from a predecessor that carried it
+/// ([`adopt_carried_launcher_limit`]); unset when the limit was never raised
+/// (a Dock launch that has not yet attempted an update, a limit that already
+/// had room).
 static LAUNCHER_SOFT_NOFILE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
 /// The soft descriptor limit a shell this process spawns must be handed back.
@@ -74,6 +81,7 @@ pub(crate) fn launcher_soft_descriptor_limit() -> Option<u64> {
 }
 
 /// The soft `RLIMIT_NOFILE` this process would hold had no PARK raised it;
+/// 0 when it holds no park's raise.
 static PARK_RAISED_FROM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// See [`PARK_RAISED_FROM`].
@@ -82,6 +90,7 @@ pub(crate) fn park_raised_from() -> Option<u64> {
 }
 
 /// The raise this process now holds is one a claim or a recovery makes
+/// whatever a park did before it (see [`PARK_RAISED_FROM`]).
 fn forget_park_raise() {
     PARK_RAISED_FROM.store(0, std::sync::atomic::Ordering::Relaxed);
 }
@@ -95,9 +104,12 @@ pub(crate) const ENV_LAUNCHER_NOFILE: HandoffName =
     HandoffName::new("ATERM_HANDOFF_LAUNCHER_NOFILE");
 
 /// v0.100.0's build (`RELEASES.ledger`; no v0.99.0 was cut): the first
+/// release that takes [`ENV_LAUNCHER_NOFILE`] out of its environment at its
+/// capture (06b06e74e).
 const TAKES_LAUNCHER_NOFILE_FROM_BUILD: u64 = 1_790_807_622;
 
 /// v0.101.0's build: the first release that takes [`ENV_PARK_RAISED_FROM`]
+/// out of its environment (ddaf83ae2f, after v0.100.0 was cut).
 const TAKES_PARK_RAISED_FROM_BUILD: u64 = 1_791_501_389;
 
 /// Name [`ENV_LAUNCHER_NOFILE`] on a successor's `command` whose image keeps this process's soft.
@@ -134,6 +146,8 @@ pub(crate) fn forget_stray_limits(env: &mut crate::handoff_env::HandoffEnv, upda
 }
 
 /// A carried launcher limit this process may adopt: a number, and never above
+/// the soft limit it runs at (`soft`) — it only ever gives the shells LESS
+/// than this process has, which is the one direction the raise moved.
 fn carried_launcher_limit(carried: Option<&str>, soft: u64) -> Option<u64> {
     carried?
         .parse::<u64>()
@@ -245,6 +259,8 @@ pub(crate) struct OlderImageLimit {
 }
 
 /// The soft limit an image of `target_build`, started by a process of `build`
+/// that runs at `soft`, is started at — `None` to leave it the limit it
+/// inherits: only an older target, and only under a park's raise.
 fn older_image_soft_limit(
     target_build: u64,
     build: u64,
@@ -259,6 +275,7 @@ fn older_image_soft_limit(
 
 impl OlderImageLimit {
     /// What an image of `target_build` is started at by this process of
+    /// `build` ([`older_image_soft_limit`] over this process's limits).
     fn toward(target_build: u64, build: u64) -> Option<Self> {
         let mut limit = libc::rlimit {
             rlim_cur: 0,
@@ -277,6 +294,7 @@ impl OlderImageLimit {
     }
 
     /// The first descriptor at or above [`Self::soft`] that an `exec` keeps:
+    /// open, and not close-on-exec.
     fn inheritable_at_or_above(&self) -> Option<libc::c_int> {
         let floor = libc::c_int::try_from(self.soft).unwrap_or(libc::c_int::MAX);
         (floor..self.table).find(|fd| {
@@ -286,7 +304,7 @@ impl OlderImageLimit {
         })
     }
 
-    /// Set this process's soft limit to `soft`, the hard one as it is. A
+    /// Set this process's soft limit to `soft`, the hard one as it is.
     fn set_soft(&self, soft: u64) -> std::io::Result<()> {
         let limit = libc::rlimit {
             rlim_cur: soft,
@@ -481,6 +499,8 @@ pub(crate) mod tests {
     }
 
     /// Mark every descriptor at or above `floor` close-on-exec: what a busy
+    /// test run leaked into a child of the test binary there is not the
+    /// desk's, and a window at that limit could hold none.
     fn mark_close_on_exec_at_or_above(floor: u64) {
         let floor = i32::try_from(floor).expect("a descriptor number");
         for fd in floor..aterm_uds::spawnfd::descriptor_bound() {
@@ -495,6 +515,9 @@ pub(crate) mod tests {
     }
 
     /// The soft descriptor limit a fork-lane successor of `target_build`,
+    /// started by this process of `build` and handed `inherited`, runs at —
+    /// read by a stand-in's own `ulimit -n`, through the lane's own hook
+    /// ([`start_older_image_at_its_limit`]).
     fn successor_soft_nofile(
         target_build: u64,
         build: u64,
@@ -671,6 +694,7 @@ pub(crate) mod tests {
     }
 
     /// EVERY LANE SETTLES ITS DESCRIPTOR LIMIT IN ONE PLACE (
+    /// U9).
     #[test]
     fn every_lane_settles_its_descriptor_limit_in_one_place() {
         fn soft_limit() -> u64 {
@@ -720,7 +744,7 @@ pub(crate) mod tests {
         assert_eq!(park_raised_from(), None, "and the record stays the claim's");
     }
 
-    /// A STRAY LAUNCHER LIMIT IS NOBODY'S. A window
+    /// A STRAY LAUNCHER LIMIT IS NOBODY'S.
     #[test]
     fn only_an_updates_launch_adopts_a_carried_launcher_limit() {
         const ROLE: &str = "ATERM_TEST_STRAY_LIMIT_ROLE";
@@ -790,6 +814,7 @@ pub(crate) mod tests {
     }
 
     /// ONLY A TARGET THAT TAKES THE NAMES IS TOLD THEM:
+    /// a successor built before a name leaves it in its shells' environment.
     #[test]
     fn only_a_target_that_takes_the_names_is_told_them() {
         const V0_98_0: u64 = 1_790_607_299;

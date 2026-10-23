@@ -2,44 +2,22 @@
 // Copyright 2026 Andrew Yates
 
 //! Recovery ledger — records how each run of the installed app ended.
-//!
-//! One row is written per windowed launch of the installed app and per update
-//! successor at its commit. Each row records the launch (pid, birth, build,
-//! version) and classifies the run before it: how it ended ([`EndClass`]), its
-//! build and version, how long it ran ([`Uptime`]), whether the main-thread
-//! watchdog's last word for it was an unended stall ([`Tri`]), the last
-//! memory-pressure level the OS reported ([`Pressure`]), and how many launches
-//! the updater's boot trial had counted against its build. `aterm doctor`
-//! summarizes the ledger via [`doctor_lines`].
-//!
-//! Stored at [`LEDGER_FILE_NAME`] in [`aterm_types::dirs::logs_dir`] (`0600`),
-//! one space-separated `key=value` line per row, newest last, trimmed to the
-//! newest [`KEEP_ROWS`] once it passes [`TRIM_AT_BYTES`]. Unparseable lines are
-//! skipped.
 
 use std::path::{Path, PathBuf};
 
-/// The ledger's file name in the log directory. Deliberately not `crash-*.log`: the
-/// crash scan reads every non-empty file of that shape as a crash report.
+/// The ledger's file name in the log directory.
 pub const LEDGER_FILE_NAME: &str = "recovery-ledger.log";
 
 /// How many rows a trim keeps (the newest).
 pub const KEEP_ROWS: usize = 256;
 
-/// A ledger larger than this is trimmed to [`KEEP_ROWS`] after the append that
-/// crossed it. A row is about 250 bytes, so this is roughly twice [`KEEP_ROWS`].
+/// A ledger larger than this is trimmed to [`KEEP_ROWS`] after the append that crossed it.
 pub const TRIM_AT_BYTES: u64 = 128 * 1024;
 
-/// The most bytes [`read_rows`] reads — the tail of an oversized file, so no
-/// read in the log directory is unbounded.
+/// The most bytes [`read_rows`] reads — the tail of an oversized file, so no read in the log directory is unbounded.
 pub const MAX_READ_BYTES: u64 = 512 * 1024;
 
 /// The format version every row this build writes carries (`v=1`).
-///
-/// New fields ride as optional keys under the same version (`started_us=`,
-/// `restored=`, …): every reader skips a row whose version is not its own, so a
-/// new version would hide newer rows from an older build that a crash-looping
-/// update reverts to. An older row lacks the key and still parses.
 pub const ROW_VERSION: u32 = 1;
 
 /// The ledger's path in `logs_dir`.
@@ -57,21 +35,15 @@ pub fn default_ledger_path() -> Option<PathBuf> {
 /// How a run ended, as the next launch could tell from what it left behind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EndClass {
-    /// It removed its crash marker on an exit path: a quit, an update's exit, a
-    /// refused start. The marker is removed by every `exit(3)` and every clean `_exit`.
+    /// It removed its crash marker on an exit path: a quit, an update's exit, a refused start.
     Clean,
     /// It handed its sessions to an update successor: the successor's own row says so.
     Handoff,
-    /// No crash signal was caught and no exit path ran: SIGKILL (Force Quit, jetsam, a
-    /// harness), a kernel kill, power loss, or SIGTERM/SIGINT/SIGHUP, whose handler
-    /// (aterm-gui's `owned_endpoint`) only removes the control socket, token and alias before
-    /// re-raising. Its empty marker outlived it.
+    /// No crash signal was caught and no exit path ran: SIGKILL (Force Quit, jetsam, a harness), a kernel kill, power loss, or SIGTERM/SIGINT/SIGHUP, whose handler (aterm-gui's `owned_endpoint`) only removes the control socket, token and alias before re-raising.
     Killed,
-    /// A fatal signal the handler caught (SIGSEGV 11, SIGABRT 6, SIGBUS 10, SIGILL 4,
-    /// SIGFPE 8); the number is what the handler wrote into the marker.
+    /// A fatal signal the handler caught (SIGSEGV 11, SIGABRT 6, SIGBUS 10, SIGILL 4, SIGFPE 8); the number is what the handler wrote into the marker.
     Signal(u8),
-    /// It filed a Rust panic report. (A panic on a background thread that the run
-    /// survived files one too — the same reading the crash banner makes.)
+    /// It filed a Rust panic report.
     Panic,
     /// It was still alive when this launch started (a second instance).
     Running,
@@ -112,8 +84,7 @@ impl EndClass {
         })
     }
 
-    /// Whether this end is one the person did not ask for — the class the keeper
-    /// exists for. `Unknown` is not counted: it is missing evidence, not a death.
+    /// Whether this end is one the person did not ask for — the class the keeper exists for.
     #[must_use]
     pub fn is_unexpected(self) -> bool {
         matches!(self, Self::Killed | Self::Signal(_) | Self::Panic)
@@ -220,8 +191,7 @@ impl Pressure {
 pub struct Uptime {
     /// Seconds from its birth to its end.
     pub secs: u64,
-    /// `true` when the end is only a lower bound — the run's last log line, for a run
-    /// whose death left no time of its own (a SIGKILL). Written `<secs>+`.
+    /// `true` when the end is only a lower bound — the run's last log line, for a run whose death left no time of its own (a SIGKILL).
     pub at_least: bool,
 }
 
@@ -242,8 +212,7 @@ pub struct PrevRun {
     pub stall: Tri,
     /// The last memory-pressure level reported to it.
     pub pressure: Pressure,
-    /// Launches the boot sentinel had counted against its build when this row was
-    /// written (0: no boot trial pending for that build).
+    /// Launches the boot sentinel had counted against its build when this row was written (0: no boot trial pending for that build).
     pub trial: u32,
 }
 
@@ -290,23 +259,7 @@ impl LaunchKind {
     }
 }
 
-/// How a launch's keeper recovery brought its screens back (`aterm-gui`'s
-/// `crash_restore`), summing the per-session `status` fields across every
-/// session offered by a keeper. Each token is optional on its own (an older row
-/// lacking a key still parses; a malformed value rejects the row):
-///
-/// * `restored=<exact>:<screen>:<meta>`: how many sessions came back exactly, as a screen
-///   with a loss counted, or blank (the META rung);
-/// * `restore_lost=<in_flight_lost>:<tail_overflows>:<marks_lost>:<resizes_unjournaled>`:
-///   the PTY bytes read and never processed, the sessions whose tail overflowed, the
-///   verified marks left in a tail, and the resizes nothing journaled, over every session;
-/// * `restore_why=<word>:<n>,…`: how many sessions each `status restore_why=` word named
-///   (every rung but exact; `-` when every session was exact), in word order;
-/// * `restore_history=<lines>:<sessions>`: the scrollback lines the restores could not bring
-///   back (each session's first `status history_lost=`), and how many sessions lost any;
-/// * `restore_refused=<n>` (written when non-zero): the sessions a keeper offered that this
-///   launch refused and released (unreadable tag, missing session id, reused pid, or non-tty
-///   fd). A recovery that refused every offer writes `restored=0:0:0` beside it.
+/// How a launch's keeper recovery brought its screens back (`aterm-gui`'s `crash_restore`), summing the per-session `status` fields across every session offered by a keeper.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Restores {
     /// Sessions whose screen came back exactly.
@@ -384,8 +337,7 @@ impl Restores {
         parts.next().is_none().then_some(())
     }
 
-    /// `word:n,…`, or `-` for none. A word that could break the token (empty, or holding
-    /// a separator the line cannot carry) is written `?`.
+    /// `word:n,…`, or `-` for none.
     fn why_token(&self) -> String {
         if self.whys.is_empty() {
             return "-".to_string();
@@ -420,30 +372,17 @@ impl Restores {
     }
 }
 
-/// Whether the launch that wrote a row kept its terminals with a PTY keeper (`keeper=`):
-/// the state of its keeper link (`aterm-gui`'s `keeper_link`) when the row was written.
-/// The crash restore's soak ([`crate::restore_soak`]) reads it, because a ledger of
-/// recoveries alone cannot tell a run with no keeper from one whose keeper took its
-/// terminals and then failed to give them back, nor say how long the keeper has been on.
-/// Optional on the row like [`Restores`]: an older row has none and still parses, and a
-/// word this build cannot read refuses the row rather than misread it.
+/// Whether the launch that wrote a row kept its terminals with a PTY keeper (`keeper=`): the state of its keeper link (`aterm-gui`'s `keeper_link`) when the row was written.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum KeeperAtLaunch {
-    /// The link is off: `[keeper] enabled` is absent or false, or the build has no code
-    /// identity to check a keeper by (it fails closed). Nothing was registered.
+    /// The link is off: `[keeper] enabled` is absent or false, or the build has no code identity to check a keeper by (it fails closed).
     #[default]
     Off,
-    /// The link is on and no keeper answered the boot HELLO (none running, or one that
-    /// is not this build's): terminals are registered once one answers. The link polls
-    /// (`aterm_keeper::client::LINK_POLL`, backing off to 5 s), so a keeper started
-    /// while the run lives (`aterm keeper start` in one of its tabs) holds every terminal
-    /// within seconds: such a run's kill is one its keeper held.
+    /// The link is on and no keeper answered the boot HELLO (none running, or one that is not this build's): terminals are registered once one answers.
     Absent,
-    /// The link is on and a keeper answered the boot HELLO: every terminal is registered
-    /// with it.
+    /// The link is on and a keeper answered the boot HELLO: every terminal is registered with it.
     On,
-    /// The link is on, in an update's successor, which says no boot HELLO and registers
-    /// what it adopted at its Commit, with whichever keeper answers then.
+    /// The link is on, in an update's successor, which says no boot HELLO and registers what it adopted at its Commit, with whichever keeper answers then.
     Armed,
 }
 
@@ -487,10 +426,7 @@ pub struct Row {
     pub pid: u32,
     /// The launch's birth (Unix seconds, the kernel's record where there is one).
     pub started: u64,
-    /// The microseconds within [`Self::started`] of the kernel's birth record
-    /// (`started_us=`), when the row's writer had one: with [`Self::pid`] it names the
-    /// process exactly, where the second alone matches a pid reused within it. `None`
-    /// on a row an older build wrote, or a birth that came from the clock.
+    /// The microseconds within [`Self::started`] of the kernel's birth record (`started_us=`), when the row's writer had one: with [`Self::pid`] it names the process exactly, where the second alone matches a pid reused within it.
     pub started_us: Option<u32>,
     /// The launch's build number.
     pub build: u64,
@@ -500,16 +436,14 @@ pub struct Row {
     pub launch: LaunchKind,
     /// The run before it.
     pub prev: PrevRun,
-    /// The launch's keeper link ([`KeeperAtLaunch`]); `None` on a row an older build
-    /// wrote.
+    /// The launch's keeper link ([`KeeperAtLaunch`]); `None` on a row an older build wrote.
     pub keeper: Option<KeeperAtLaunch>,
-    /// How this launch's keeper recovery brought its screens back, when it recovered
-    /// any ([`Restores`]).
+    /// How this launch's keeper recovery brought its screens back, when it recovered any ([`Restores`]).
     pub restores: Option<Restores>,
 }
 
 /// A value token with no space, `=`, or control character in it — the one shape the
-/// line format can carry. Anything else is written `?`.
+/// line format can carry.
 fn clean_token(value: &str) -> &str {
     if !value.is_empty()
         && value
@@ -535,9 +469,7 @@ fn parse_opt_u64(token: &str) -> Option<Option<u64>> {
 }
 
 impl Row {
-    /// Whether this row is the process born `started` (Unix seconds) and `started_us`
-    /// (its microseconds, when known) with `pid`: to the microsecond when both sides
-    /// carry it, else to the second — a pid reused within the second matches only then.
+    /// Whether this row is the process born `started` (Unix seconds) and `started_us` (its microseconds, when known) with `pid`: to the microsecond when both sides carry it, else to the second — a pid reused within the second matches only then.
     #[must_use]
     pub fn is_process(&self, pid: u32, started: u64, started_us: Option<u32>) -> bool {
         self.pid == pid
@@ -628,7 +560,6 @@ impl Row {
             at: get("at")?.parse().ok()?,
             pid: get("pid")?.parse().ok()?,
             started: get("started")?.parse().ok()?,
-            // Optional (an older row has none); one out of range refuses the row.
             started_us: match get("started_us") {
                 None => None,
                 Some(token) => Some(token.parse().ok().filter(|us| *us < 1_000_000)?),
@@ -649,12 +580,10 @@ impl Row {
                 pressure: Pressure::parse(get("prev_pressure")?)?,
                 trial: get("prev_trial")?.parse().ok()?,
             },
-            // Optional (an older row has none); one this build cannot read refuses the row.
             keeper: match get("keeper") {
                 None => None,
                 Some(token) => Some(KeeperAtLaunch::parse(token)?),
             },
-            // Optional (an older row has none); one this build cannot read refuses the row.
             restores: match get("restored") {
                 None => None,
                 Some(token) => {
@@ -684,9 +613,7 @@ pub fn parse_rows(text: &str) -> Vec<Row> {
     text.lines().filter_map(Row::parse).collect()
 }
 
-/// The ledger's rows, oldest first; empty when there is no ledger or it cannot be
-/// read. Reads at most [`MAX_READ_BYTES`] — the tail of a larger file, from its first
-/// whole line — and only a regular file (never a FIFO, a device or a symlink's target).
+/// The ledger's rows, oldest first; empty when there is no ledger or it cannot be read.
 #[must_use]
 pub fn read_rows(path: &Path) -> Vec<Row> {
     read_text(path)
@@ -694,10 +621,7 @@ pub fn read_rows(path: &Path) -> Vec<Row> {
         .unwrap_or_default()
 }
 
-/// The doctor's ledger read: a missing ledger is empty history, while an unreadable
-/// file or an unrecognized complete row is missing evidence, not a clean history.
-/// Unlike [`read_rows`], this never silently discards a failed read or malformed row.
-///
+/// The doctor's ledger read: a missing ledger is empty history, while an unreadable file or an unrecognized complete row is missing evidence, not a clean history.
 /// # Errors
 /// The read error, or a row this build cannot interpret.
 pub fn read_rows_checked(path: &Path) -> std::io::Result<Vec<Row>> {
@@ -725,8 +649,7 @@ fn read_text(path: &Path) -> std::io::Result<String> {
     read_opened_text(open_for_read(path)?)
 }
 
-/// Admission and the tail bound belong to the descriptor actually read. The
-/// path can name a different object by the time its nonblocking open completes.
+/// Admission and the tail bound belong to the descriptor actually read.
 fn read_opened_text(mut file: std::fs::File) -> std::io::Result<String> {
     use std::io::{Read as _, Seek as _, SeekFrom};
     let meta = file.metadata()?;
@@ -765,15 +688,7 @@ fn open_for_read(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::File::open(path)
 }
 
-/// Append `row` to the ledger at `path` (created `0600`), then trim it to the newest
-/// [`KEEP_ROWS`] when it has passed [`TRIM_AT_BYTES`].
-///
-/// Two launches can race (an update successor and a manual start), so the append and the
-/// trim run under an `flock` on the ledger, tried without waiting for about a second; an
-/// append that cannot get it still writes its line with one `O_APPEND` write (whole on a
-/// local volume) and skips the trim. A trim replaces the file by rename, so a writer that
-/// locked the old inode re-opens the path.
-///
+/// Append `row` to the ledger at `path` (created `0600`), then trim it to the newest [`KEEP_ROWS`] when it has passed [`TRIM_AT_BYTES`].
 /// # Errors
 /// The open or the write failed.
 #[cfg(unix)]
@@ -789,11 +704,7 @@ pub fn append_row(path: &Path, row: &Row) -> std::io::Result<()> {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(path)?;
-        // Bound after `file`, so it drops first on every exit — the `continue`, the
-        // `?` and the return all release the lock before the descriptor closes.
         let lock = lock_briefly(&file);
-        // A trim that renamed a new file over the path between our open and our lock
-        // left us holding the retired inode: go round and open the path again.
         let same_inode = match (file.metadata(), std::fs::symlink_metadata(path)) {
             (Ok(ours), Ok(now)) => ours.ino() == now.ino() && ours.dev() == now.dev(),
             _ => false,
@@ -835,8 +746,7 @@ fn lock_briefly(file: &std::fs::File) -> Option<LedgerLock<'_>> {
 /// A held [`lock_briefly`], released via `LOCK_UN` on drop rather than by
 /// `close` alone: `flock` lives on the open file description, and a child
 /// forked concurrently holds its inherited copy of the descriptor until `exec`
-/// (`O_CLOEXEC` closes at exec, not fork). `LOCK_UN` releases the lock across
-/// every copy of the open file description.
+/// (`O_CLOEXEC` closes at exec, not fork).
 #[cfg(unix)]
 struct LedgerLock<'a>(&'a std::fs::File);
 
@@ -848,7 +758,7 @@ impl Drop for LedgerLock<'_> {
 }
 
 /// Rewrite the ledger at `path` with its newest [`KEEP_ROWS`] rows, by a `0600`
-/// temporary beside it renamed over it. The caller holds the ledger's lock.
+/// temporary beside it renamed over it.
 #[cfg(unix)]
 fn trim_locked(path: &Path) {
     use std::io::Write as _;
@@ -894,8 +804,7 @@ pub struct Summary {
     pub since: Option<u64>,
     /// How many of the classified runs ended each way, in [`EndClass`] order.
     pub ends: Vec<(EndClass, usize)>,
-    /// Of the unexpected ends, how many had an unended stall, and how many critical
-    /// memory pressure, as their last word.
+    /// Of the unexpected ends, how many had an unended stall, and how many critical memory pressure, as their last word.
     pub unexpected_stalled: usize,
     /// See [`Self::unexpected_stalled`].
     pub unexpected_critical: usize,
@@ -943,10 +852,7 @@ pub fn summarize(rows: &[Row]) -> Summary {
     summary
 }
 
-/// The ledger as the fact of `aterm doctor`'s `recovery:` row — its lines, without
-/// the label, which the row prints once — and whether any recorded run ended
-/// unexpectedly (a note there, never a failure: a past crash is not a reason to
-/// refuse to launch). `rows` is [`read_rows`]'s answer for `path`.
+/// The ledger as the fact of `aterm doctor`'s `recovery:` row — its lines, without the label, which the row prints once — and whether any recorded run ended unexpectedly (a note there, never a failure: a past crash is not a reason to refuse to launch).
 #[must_use]
 pub fn doctor_lines(rows: &[Row], path: &Path) -> (Vec<String>, bool) {
     let summary = summarize(rows);
@@ -1120,10 +1026,7 @@ mod tests {
 
     /// A row carries the kernel's birth microseconds (`started_us=`) beside its
     /// second under the same row version; an older row without the key still
-    /// parses (`None`), and an out-of-range value rejects the row. When both
-    /// sides carry microseconds, `is_process` matches to the microsecond so a
-    /// pid reused within the same second does not match; when either side lacks
-    /// microseconds, it matches to the second.
+    /// parses (`None`), and an out-of-range value rejects the row.
     #[test]
     fn a_row_names_its_process_to_the_microsecond() {
         let mut r = row(1_790_500_000, 4242, prev(EndClass::Clean));
@@ -1214,7 +1117,6 @@ mod tests {
             }),
             "a row with the rungs alone"
         );
-        // A row from before the history ring: the three tokens, no fourth.
         let before_ring = line.replace(" restore_history=1200:2", "");
         assert_eq!(
             Row::parse(&before_ring).and_then(|row| row.restores),
@@ -1404,9 +1306,6 @@ mod tests {
             "legacy parsing is unchanged"
         );
 
-        // A nonblocking open after the path's regular-file observation may
-        // actually yield a FIFO. Reject the opened object even with no writer,
-        // where a read would otherwise return EOF and invent empty history.
         let fifo = dir.join("replacement.fifo");
         let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         // SAFETY: an owned scratch pathname, a NUL-terminated name and mode only.
@@ -1414,9 +1313,6 @@ mod tests {
         assert!(read_opened_text(open_for_read(&fifo).unwrap()).is_err());
         assert!(read_rows_checked(&fifo).is_err());
 
-        // The same opened inode can shrink after a caller's earlier metadata
-        // observation. Its current length, not that old bound, must decide the
-        // tail offset; seeking past this malformed row would falsely look empty.
         std::fs::File::create(&path)
             .unwrap()
             .set_len(MAX_READ_BYTES + 4096)
@@ -1427,8 +1323,6 @@ mod tests {
         assert_eq!(read_opened_text(opened).unwrap(), "unreadable row\n");
         assert!(read_rows_checked(&path).is_err());
 
-        // A later rename does not change the identity being admitted/read.
-        // Read the retained valid handle, while the new pathname is malformed.
         let valid = format!("{}\n", expected.to_line());
         std::fs::write(&path, &valid).unwrap();
         let opened = open_for_read(&path).unwrap();
@@ -1461,8 +1355,6 @@ mod tests {
         let path = ledger_path(&dir);
         let mut n: u32 = 0;
         let mut grown = 0;
-        // Append until the file crosses TRIM_AT_BYTES and the append trims it: the
-        // one append after which the file is shorter than before.
         loop {
             n += 1;
             append_row(&path, &row(u64::from(n) + 10, n, prev(EndClass::Clean))).expect("append");
@@ -1513,7 +1405,6 @@ mod tests {
         let refused = open().try_lock().is_err();
         assert!(refused, "a held ledger lock refuses a second description");
         let childs_copy = file.try_clone().expect("dup the ledger's descriptor");
-        // Released by `LOCK_UN` (the guard's drop), then closed, while the copy lives.
         drop(held);
         drop(file);
         let probe = open();

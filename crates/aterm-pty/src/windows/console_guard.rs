@@ -24,9 +24,13 @@ pub(crate) const FLAG: &str = "--conpty-input-guard";
 pub(crate) const LEAVE_FLAG: &str = "--conpty-leave-alt-screen";
 
 /// The most hex digits a carry's command line takes (half as many bytes of VT): well
+/// inside `CreateProcessW`'s 32767 characters.
 const CARRY_HEX_MAX: usize = 24_000;
 
 /// What the leave client writes after the switch so the prompt the shell drew on the
+/// dead screen comes along (aterm-core's `Terminal::dead_alt_screen_carry`), and the
+/// cursor (0-based row and column of the screen) the host must still have for it to
+/// apply: one the shell moved since was composed for a screen that is gone.
 #[derive(Debug, PartialEq, Eq)]
 struct Carry {
     row: u16,
@@ -56,6 +60,8 @@ const USAGE: u8 = 64;
 const CLIENT_WAIT_MS: u32 = 1000;
 
 /// How long the client waits for the console to take the size its session last
+/// sent before it writes anyway (the resize went out over the signal pipe before
+/// the client was started, so it is normally already in).
 const SIZE_WAIT: Duration = Duration::from_millis(250);
 
 /// The front door's hook: when this process was started as one of a tab's console clients ([`FLAG`], [`LEAVE_FLAG`]), do its one write and return the exit code; otherwise `None`, and the caller carries on.
@@ -99,6 +105,7 @@ fn client_args(args: &[OsString]) -> Option<Client> {
 }
 
 /// A carry's three arguments: the cursor row and column, then the VT as hex (its UTF-8
+/// bytes, two lowercase or uppercase digits each).
 fn carry_args(row: &OsString, col: &OsString, hex: &OsString) -> Option<Carry> {
     let num = |a: &OsString| a.to_str()?.parse::<u16>().ok();
     let hex = hex.to_str()?;
@@ -134,6 +141,7 @@ fn hex_decode(hex: &str) -> Option<Vec<u8>> {
 }
 
 /// `CONIN$` or `CONOUT$` of this process's console, for reading and writing
+/// (`INVALID_HANDLE_VALUE` inside when there is none).
 fn open_console(name: &str) -> Handle {
     let name = wide_nul(OsStr::new(name));
     // SAFETY: a NUL-terminated name and no template; the handle is owned below.
@@ -151,6 +159,10 @@ fn open_console(name: &str) -> Handle {
 }
 
 /// The leave client's body: write [`LEAVE_SEQUENCE`] to the console's active
+/// screen buffer, the dead app's alternate one, turning VT processing on for
+/// that buffer first if the app left it off (the buffer goes with the switch),
+/// then the `carry` when [`carry_applies`]: one write, so nothing the shell
+/// writes lands between the switch and the prompt it brings.
 fn write_leave(carry: Option<&Carry>) -> u8 {
     let conout = open_console("CONOUT$");
     if conout.raw() == ffi::INVALID_HANDLE_VALUE {
@@ -192,11 +204,15 @@ fn write_leave(carry: Option<&Carry>) -> u8 {
 }
 
 /// Whether the leave writes `carry`: only while the host's cursor (`cursor`, `None`
+/// when unread) is the one the carry was composed for, since a shell that moved it
+/// since drew on a screen the carry does not show, and only when the shell reads raw
+/// (`line_mode`, `None` when unread).
 fn carry_applies(carry: &Carry, cursor: Option<(u16, u16)>, line_mode: Option<bool>) -> bool {
     cursor == Some((carry.row, carry.col)) && line_mode == Some(false)
 }
 
 /// The host's cursor on its active screen buffer, as the 0-based row and column of
+/// its window; `None` when it cannot be read.
 fn host_cursor(conout: &Handle) -> Option<(u16, u16)> {
     let mut info = ffi::CONSOLE_SCREEN_BUFFER_INFO::default();
     // SAFETY: a live console output handle and an out-param.
@@ -210,6 +226,7 @@ fn host_cursor(conout: &Handle) -> Option<(u16, u16)> {
 }
 
 /// Whether the console's input is in line mode (`ENABLE_LINE_INPUT`): the shell at
+/// its prompt reads with a cooked `ReadConsoleW`.
 fn shell_reads_in_line_mode() -> Option<bool> {
     let conin = open_console("CONIN$");
     if conin.raw() == ffi::INVALID_HANDLE_VALUE {
@@ -224,6 +241,7 @@ fn shell_reads_in_line_mode() -> Option<bool> {
 }
 
 /// The client's body: once its console's window is `cols`x`rows` (or
+/// [`SIZE_WAIT`] has passed), write one `MENU_EVENT`.
 fn write_guard(cols: i16, rows: i16) -> u8 {
     let (conin, conout) = (open_console("CONIN$"), open_console("CONOUT$"));
     if conin.raw() == ffi::INVALID_HANDLE_VALUE {
@@ -265,6 +283,8 @@ pub fn set_console_client(exe: Option<PathBuf>) {
 }
 
 /// `aterm.exe` beside the running executable, looked for once: the console
+/// image the front door ships next to the windowed one, and the running image
+/// itself for a console-image process.
 fn client_exe() -> Option<PathBuf> {
     #[cfg(any(test, debug_assertions))]
     if let Some(exe) = CLIENT_OVERRIDE.lock_or_recover().clone() {
@@ -351,6 +371,9 @@ pub(super) fn runtime_in_tab(s: &WinSession) -> bool {
 }
 
 /// [`runtime_in_tab`] over injected lookups: a process in `job`, the tab's
+/// first process `root` (0 for none), or one below it in `tree()` ((pid,
+/// parent) pairs, read only when neither of the others matched; `born` gives
+/// a process's start, see [`below`]) for which `is_runtime` holds.
 fn tab_runs_a_posix_runtime(
     job: &[u32],
     root: u32,
@@ -410,6 +433,7 @@ pub(super) fn below(
 }
 
 /// When process `pid` started (its creation time, in 100 ns ticks since
+/// 1601), or `None` when it cannot be opened: gone, or another user's.
 fn created_at(pid: u32) -> Option<u64> {
     // SAFETY: plain OpenProcess; the handle is owned below.
     let process =
@@ -452,6 +476,7 @@ pub(super) fn process_tree() -> Vec<(u32, u32)> {
 }
 
 /// Whether process `pid` runs on the MSYS2 or Cygwin runtime
+/// (`policy::runs_a_posix_runtime`, by its image path).
 fn runs_a_posix_runtime(pid: u32) -> bool {
     image_of(pid).is_some_and(|image| policy::runs_a_posix_runtime(&image, Path::is_file))
 }

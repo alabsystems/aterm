@@ -1,29 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The native face's client (design §6.1, §6.4, §6.5; slice N2): `amacs FILE`
-//! in an aterm tab hands each file to the window hosting the tab and waits,
-//! SILENTLY, until its Editor view is gone.
-//!
-//! Nothing is written to the caller's terminal on success: Claude Code's
-//! redraw counts its own lines, and a line from its `$EDITOR` would shift
-//! them. Only a failure says anything, on stderr.
-//!
-//! Each file is realpathed (a missing file's parent, plus its name), so the
-//! window, whose working directory is not the caller's, is handed an absolute
-//! name, and encoded with the engine's one file-URI codec
-//! ([`amacs::protocol::uri::path_to_file_uri`]), the spelling the server
-//! decodes. Several files are edited one after another; `+LINE[:COL]` puts
-//! the caret of the file after it. `for=` names the program the edit is for
-//! (its header row shows it, N3): the parent process's file name.
-//!
-//! An interrupt (C-c in the caller's terminal) ends the client by SIGINT's
-//! default action, which the shell reports as 130. Nothing is sent: the view
-//! and the person's typing stay, and the server orphans the ticket once its
-//! waiter has been gone a few seconds (design D-9).
-//!
-//! The window is a [`Window`] (the control socket, or a test's stand-in) and
-//! the terminal a plain writer, so a run is checked byte for byte.
+//! Native editor face client (`amacs FILE` in an aterm tab).
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -34,14 +12,13 @@ use aterm_ctl::edit::{AwaitErr, EditErr};
 
 use crate::decide::{self, Face, Handoff};
 
-/// The status of a run whose server went away with no successor to take the
-/// wait: [`aterm_ctl::EXIT_REPLACED`].
+/// Exit status when the server disappeared with no successor ([`aterm_ctl::EXIT_REPLACED`]).
 pub const EXIT_REPLACED: u8 = aterm_ctl::EXIT_REPLACED;
 
-/// The one-line synopsis a usage error repeats.
+/// One-line usage synopsis.
 pub const SYNOPSIS: &str = "usage: amacs [--wait | --no-wait] [-nw | --tty] [+LINE[:COL]] FILE...";
 
-/// `amacs --help` (and `aterm edit --help`).
+/// Help text for `amacs --help` and `aterm edit --help`.
 pub const HELP: &str = "\
 amacs - aterm's editor (`aterm edit` is the same command)
 
@@ -80,36 +57,35 @@ EXIT STATUS:
     130  interrupted (C-c): the view stays open in the window
 ";
 
-/// One file to edit, and where its caret lands.
+/// File to edit and its initial caret position.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
     pub path: PathBuf,
-    /// A 1-based line and, optionally, column.
+    /// 1-based line and optional column.
     pub line: Option<(u32, Option<u32>)>,
 }
 
-/// A command line that edits.
+/// Parsed `amacs` edit command-line arguments.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Args {
-    /// `-nw` / `--tty`.
+    /// Whether `-nw` or `--tty` was passed.
     pub tty: bool,
     pub wait: bool,
     pub no_wait: bool,
     pub targets: Vec<Target>,
 }
 
-/// What a command line asks for.
+/// Parsed `amacs` command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     Help,
     Edit(Args),
 }
 
-/// Read `amacs`'s arguments (argv after the program name).
+/// Parses `amacs` command-line arguments after the program name.
 ///
 /// # Errors
-///
-/// The usage error to print, without the `amacs: ` lead.
+/// Returns the usage error message without the `amacs: ` prefix.
 pub fn parse_args(args: &[OsString]) -> Result<Command, String> {
     let mut parsed = Args::default();
     let mut position: Option<(u32, Option<u32>)> = None;
@@ -177,33 +153,18 @@ fn parse_position(spec: &str) -> Option<(u32, Option<u32>)> {
     }
 }
 
-/// `path`'s realpath as a `file://` URI, and whether the file is missing:
-/// the name amacs-files opens it by ([`amacs_files::host::open_path`]), so
-/// the window is handed the file the terminal face would edit. A missing
-/// file is named by its directory's realpath plus its own name, so a
-/// symlinked directory resolves either way.
+/// Resolves `path`'s realpath as a `file://` URI and reports whether the file is missing.
 ///
 /// # Errors
-///
-/// Why the path names no file the window could be handed (no such directory,
-/// a dangling symbolic link, a path that is not UTF-8), worded for a person.
+/// Returns a human-readable error if `path` cannot be resolved to a valid target.
 pub fn target_uri(path: &Path) -> Result<(String, bool), String> {
     let (real, uri) = amacs_files::host::open_path(path)
         .map_err(|e| format!("{}: {}", path.display(), crate::tui::host_error(path, &e)))?;
-    // `open_path` names an existing file by its realpath, and a missing one
-    // by its directory's: only the second is absent.
     let missing = std::fs::symlink_metadata(&real).is_err();
     Ok((uri, missing))
 }
 
-/// The `for=` word for the program at `program`: its file name (less a
-/// Windows `.exe`), kept to `[A-Za-z0-9._-]` and 32 characters; `None` when
-/// nothing is left.
-///
-/// The name is read as its own bytes, never through a lossy conversion: a
-/// word byte is ASCII, and every byte of a name that is not ASCII (on Windows,
-/// of its WTF-8) is `0x80` or above, so the word is exactly the name's ASCII
-/// word characters, whatever else the name holds.
+/// Extracts the `[A-Za-z0-9._-]` `for=` token (up to 32 bytes) from `program`'s file name.
 #[must_use]
 pub fn for_word(program: Option<&Path>) -> Option<String> {
     let name = program?.file_name()?.as_encoded_bytes();
@@ -223,9 +184,7 @@ pub fn for_word(program: Option<&Path>) -> Option<String> {
 }
 
 trust_contract_fn! {
-    /// A byte the `for=` wire word may hold, `[A-Za-z0-9._-]`: the alphabet
-    /// the engine's request parser checks, so a word built from these bytes
-    /// is never the reason a window refuses the edit. Proved for every byte.
+    /// Returns whether `byte` is a valid `for=` wire word byte (`[A-Za-z0-9._-]`).
     #[must_use]
     pub fn is_for_word_byte(byte: u8) -> bool
     clauses [ensures result == ((byte >= 48 && byte <= 57)
@@ -237,9 +196,6 @@ trust_contract_fn! {
     }
 }
 
-// Spec `for-word-byte` (SPECS.md): for every byte, the class is exactly
-// `0-9`, `A-Z`, `a-z`, `.`, `_`, `-` (ASCII 48-57, 65-90, 97-122, 46, 95,
-// 45). Kernel-checked against the compiled body.
 verify_island! {
     clean {
         theorem is_for_word_byte_is_the_class (b : UInt8) :
@@ -252,7 +208,7 @@ verify_island! {
     }
 }
 
-/// The executable of this process's parent, the program the edit is for.
+/// Returns the executable path of this process's parent.
 #[must_use]
 pub fn parent_program() -> Option<PathBuf> {
     #[cfg(unix)]
@@ -266,23 +222,21 @@ pub fn parent_program() -> Option<PathBuf> {
     }
 }
 
-/// The window an edit is handed to.
+/// Window backend that opens and awaits editor views.
 pub trait Window {
-    /// Ask for a fresh Editor view of the file.
+    /// Requests a fresh Editor view of the file.
     ///
     /// # Errors
-    ///
-    /// Why no view opened.
+    /// Returns why no view opened.
     fn edit(&mut self, request: &EditRequest) -> Result<EditOk, EditErr>;
-    /// Wait until the opened view is gone.
+    /// Waits until the opened view closes.
     ///
     /// # Errors
-    ///
-    /// Why the wait ended without the edit's outcome.
+    /// Returns why the wait ended without an edit outcome.
     fn await_edit(&mut self, opened: &EditOk) -> Result<EditOutcome, AwaitErr>;
 }
 
-/// The window hosting session `sid`, over its control socket.
+/// Window hosting session `sid` over its control socket.
 pub struct SessionWindow {
     pub sid: String,
 }
@@ -297,19 +251,18 @@ impl Window for SessionWindow {
     }
 }
 
-/// How the native face's run ended.
+/// Outcome of a native editor client run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ending {
-    /// Every file was handed over and, unless `--no-wait`, its view closed.
+    /// All files were handed over and (unless `--no-wait`) their views closed.
     Done,
-    /// The window would not take the file at `from` in the targets (`why`):
-    /// it and the files after it are the terminal's.
+    /// The window declined the file at `from`, falling back to the terminal for remaining files.
     Terminal { why: String, from: usize },
-    /// Stop with this status; anything to say is already said.
+    /// Exit immediately with this status code.
     Exit(u8),
 }
 
-/// The handoff row an `edit` failure is ([`decide::after_handoff`]).
+/// Maps an [`EditErr`] to its [`Handoff`] classification.
 #[must_use]
 pub fn handoff_of(error: &EditErr) -> Handoff {
     match error {
@@ -319,9 +272,7 @@ pub fn handoff_of(error: &EditErr) -> Handoff {
     }
 }
 
-/// Hand each of `args`' files to `window` in turn and, unless `--no-wait`,
-/// wait for its view to close. `tty` is where the caller sees this process
-/// write (its stderr): only a failure writes there.
+/// Hands each file in `args` to `window` and awaits completion unless `--no-wait` is set.
 pub fn edit_files(
     args: &Args,
     for_word: Option<&str>,
@@ -341,8 +292,6 @@ pub fn edit_files(
             line: target.line,
             create: missing,
             for_word: for_word.map(str::to_string),
-            // `--no-wait` says so on the wire, so the server does not hold the
-            // caller's session for an edit nothing waits on (design §6.7).
             wait: !args.no_wait,
         };
         let opened = match window.edit(&request) {
@@ -359,13 +308,10 @@ pub fn edit_files(
                         say(tty, line.trim_start_matches("amacs: "));
                         Ending::Exit(code)
                     }
-                    // An error never opens a view.
                     Face::Native => Ending::Exit(1),
                 };
             }
         };
-        // The request said `wait=0`: the view opened holding nothing, and
-        // nobody waits on its ticket.
         if args.no_wait {
             continue;
         }
@@ -373,7 +319,6 @@ pub fn edit_files(
             Ok(outcome) => match outcome.result {
                 EditResult::Finished => decide::WAIT_FINISHED,
                 EditResult::Closed => decide::WAIT_CLOSED,
-                // The person said abort; there is nothing to add.
                 EditResult::Aborted => decide::WAIT_ABORTED,
             },
             Err(error) => {
@@ -394,8 +339,7 @@ pub fn edit_files(
     Ending::Done
 }
 
-/// One `amacs: …` line on `tty`; a terminal that cannot take it has nobody
-/// to tell.
+/// Writes an `amacs: …` diagnostic line to `tty`.
 pub(crate) fn say(tty: &mut dyn Write, line: &str) {
     let _ = writeln!(tty, "amacs: {line}");
 }
@@ -459,8 +403,7 @@ mod tests {
 
     /// THE CALLER'S TERMINAL SEES NOTHING when the edits succeed: two files,
     /// each opened, waited on and closed, one after another, and not one
-    /// byte written. NEGATIVE CONTROL: a wait whose server went away says so
-    /// there and ends 75, so the sink does see what the client writes.
+    /// byte written.
     #[test]
     fn success_writes_zero_bytes_to_the_tty() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -567,7 +510,6 @@ mod tests {
         assert!(window.asked[0].wait, "a waiting request holds its caller");
         assert!(tty.0.is_empty());
 
-        // A wait the window refused ends the run 1 too, saying why.
         let mut window = StandIn {
             asked: Vec::new(),
             waited: Vec::new(),
@@ -580,7 +522,6 @@ mod tests {
         let said = String::from_utf8_lossy(&tty.0);
         assert!(said.ends_with("ERR no such ticket\n"), "{said}");
 
-        // So does a wait whose session cannot be framed: nothing was sent.
         let mut window = StandIn {
             asked: Vec::new(),
             waited: Vec::new(),
@@ -603,9 +544,7 @@ mod tests {
     /// The file the window is handed is the realpath's, percent-encoded into
     /// one wire token: a symlinked directory and a symlinked file resolve to
     /// what they name, spaces and `#` are escaped, and the URI decodes back to
-    /// the realpath. A missing file is its directory's realpath plus its
-    /// name, and says it is missing (`create=1`). NEGATIVE CONTROL: a missing
-    /// directory names nothing.
+    /// the realpath.
     #[cfg(unix)]
     #[test]
     fn realpath_and_percent_encoding_of_symlinked_and_spaced_paths() {
@@ -651,8 +590,7 @@ mod tests {
     }
 
     /// The command line: flags anywhere before `--`, `+LINE[:COL]` for the
-    /// next file only, `--` making every later word a file. Usage errors:
-    /// an unknown flag, a bad or dangling position, both waits, no file.
+    /// next file only, `--` making every later word a file.
     #[test]
     fn the_command_line_reads_flags_positions_and_files() {
         assert_eq!(parse_args(&os(&["a", "--help"])), Ok(Command::Help));
@@ -714,8 +652,6 @@ mod tests {
         assert_eq!(for_word(Some(Path::new(&long))).map(|w| w.len()), Some(32));
         assert_eq!(for_word(Some(Path::new("/bin/+++"))), None);
         assert_eq!(for_word(None), None);
-        // A name that is not UTF-8 keeps its ASCII word bytes and drops the
-        // rest, as a lossy reading of it would have.
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt as _;
@@ -726,9 +662,7 @@ mod tests {
 
     /// The client's word alphabet is the engine's: for every byte, a `for=`
     /// word of it formats exactly when [`is_for_word_byte`] keeps it, so a
-    /// word [`for_word`] builds is never why a request does not send. The
-    /// proved contract fixes the class; this ties it to the parser in
-    /// another crate, which no contract here can reach.
+    /// word [`for_word`] builds is never why a request does not send.
     #[test]
     fn the_word_byte_class_is_the_engines_for_word_alphabet() {
         let request = |word: String| EditRequest {

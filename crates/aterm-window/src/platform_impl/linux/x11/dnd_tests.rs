@@ -4,51 +4,7 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-//! The XDND target against a stand-in source on its own connection, which drags over a window
-//! of the backend while the test pumps its event loop.
-//!
-//! An XDND drag's data is the answer to that drag's own request. A GTK 4 source (Nautilus 46)
-//! answers `XdndSelection` asynchronously, so the answer can come after the drag left, or after
-//! the next drag began. Upstream took any answer as the current drag's: a late one lit the drop
-//! highlight with no drag in progress, and became the next drag's data, which then never asked
-//! for its own and dropped the earlier drag's paths. A drop that came before its data dropped
-//! nothing and told the source it was accepted. [`a_drags_data_is_the_answer_to_its_own_request`]
-//! plays both orders:
-//!
-//! - the first drag leaves before its answer comes; the answer comes during the second drag,
-//!   which still asks for and drops its own file;
-//! - a third drag drops before its answer, and the drop is delivered and finished once it comes.
-//! - an INCR drag leaves, then its old chunk and terminator arrive after the next drag's INCR
-//!   header. Each conversion owns another requestor: the old writes fail with BadWindow and
-//!   cannot populate or complete the new drop, which waits for its own file.
-//!
-//! The second drag must ask for its own data: the old implementation treated the late answer
-//! as its own and never asked. Without the early-drop branch in `XdndDrop`, the third drag
-//! finishes with nothing dropped. The INCR overlap's negative control is the old shared
-//! requestor: the old writes succeed instead of being refused.
-//!
-//! [`a_dropped_path_is_the_one_the_source_named`]: a symlink dropped is the link, and a GNOME
-//! screenshot's name keeps its spaces. Upstream canonicalized each path, which put the link's
-//! target in its place.
-//!
-//! [`a_list_drops_its_local_files_and_a_drag_of_none_is_refused`]: upstream accepted every drag
-//! that offered `text/uri-list` (a copy cursor, `XdndFinished` accepted) and dropped nothing
-//! unless every entry was an existing local file. Here a list's local files drop and the other
-//! entries are skipped; a list with none (web links, trash, network shares) is refused once its
-//! data comes and at each position after, and a drop of it anyway finishes refused. Its negative
-//! controls: failing the whole list on one entry, the hovers never come; without the refusal
-//! sent when the data comes, the wait for it ends the test; with the drop finished accepted
-//! whatever the data, the last assertion of the second drag fails. Its third drag pins that a
-//! drag of selected text stays refused: `WindowEvent` carries files only.
-//!
-//! [`a_list_too_large_for_one_property_comes_in_incr_chunks`]: GTK answers a list over 256 KiB
-//! (Nautilus's Select All in a large folder) with an ICCCM INCR property, which upstream's
-//! typed read failed, so nothing dropped. Here the list comes in 64 KiB chunks and its 5000
-//! files hover and drop. Its negative controls: without the INCR branch in `selection_notify`,
-//! the window never takes the first chunk and the wait for it ends the test; without the
-//! transfer in `Dnd::request`'s guard, a position during the transfer asks for the data again.
-//!
-//! They run where `$DISPLAY` names an X server; elsewhere they say SKIP and return.
+//! The XDND target against a stand-in source on its own connection.
 
 use std::path::{Path, PathBuf};
 use std::sync::MutexGuard;
@@ -95,7 +51,6 @@ struct Source {
 }
 
 impl Source {
-    /// A conversion on a child of this test's target, not another client's request for the
     /// selection we own. A requestor destroyed before we read its request is no longer ours.
     fn for_target(&self, request: &SelectionRequest) -> bool {
         request.selection == self.selection
@@ -205,7 +160,6 @@ impl Source {
     }
 }
 
-/// `path` as a `file://` URI, escaped as GLib's `g_filename_to_uri` escapes it: every byte but
 /// the unreserved ones and `/` (a space is `%20`).
 fn file_uri(path: &Path) -> String {
     use std::os::unix::ffi::OsStrExt;
@@ -220,7 +174,6 @@ fn file_uri(path: &Path) -> String {
     uri
 }
 
-/// A window of the backend and a drag source over it, on `$DISPLAY`. The window holds the
 /// shared connection's turn while it lives. Fields drop in order: the window before its loop.
 struct Rig {
     _window: Window,
@@ -321,7 +274,6 @@ impl Rig {
         self.source.now(&mut self.got)
     }
 
-    /// Pump the window's event loop and read the source's events until `done` finds what it
     /// waits for in them, failing the test after [`HANG`].
     fn until<R>(&mut self, what: &str, mut done: impl FnMut(&[Seen], &[XEvent]) -> Option<R>) -> R {
         let Rig { event_loop, source, seen, got, .. } = self;
@@ -348,8 +300,6 @@ impl Rig {
             });
             while let Some(packet) = source.conn.poll_for_event().unwrap() {
                 match XEvent::parse(&packet) {
-                    // Another client's request (on a desk, the window manager reads a new
-                    // owner's targets): refused, so it waits for nothing.
                     Ok(XEvent::SelectionRequest(r)) if !source.for_target(&r) => {
                         source.refuse(&r);
                     },
@@ -378,11 +328,9 @@ impl Rig {
         self.until("the drop's finish", |_, got| finished_with(got, finished))
     }
 
-    /// Begin answering `request` in ICCCM INCR chunks, as GTK answers a list over 256 KiB: an
     /// `INCR` property of `size`, whose deletion asks for the first chunk ([`Rig::chunk`]).
     fn begin_incr(&mut self, request: &SelectionRequest, size: usize) {
         let source = &self.source;
-        // An INCR owner watches the requestor's property for its deletions.
         source
             .conn
             .send_void(xproto::change_window_attributes(
@@ -405,7 +353,6 @@ impl Rig {
         source.notify(request, request.property);
     }
 
-    /// Wait until the window has taken the property `n` times (the INCR property, then each
     /// chunk), then put `chunk` there.
     fn chunk(&mut self, request: &SelectionRequest, n: usize, chunk: &[u8]) {
         let (window, property) = (request.requestor, request.property);
@@ -490,7 +437,6 @@ fn a_drags_data_is_the_answer_to_its_own_request() {
     };
     let (first, second, third) = (file("AAA-first"), file("BBB-second"), file("CCC-third"));
 
-    // The first drag asks for its data and leaves before the answer.
     let t1 = rig.now();
     rig.source.enter();
     rig.source.position(t1);
@@ -498,7 +444,6 @@ fn a_drags_data_is_the_answer_to_its_own_request() {
     rig.source.leave();
     rig.until("the first drag's end", |seen, _| seen.contains(&Seen::Cancelled).then_some(()));
 
-    // The answer comes during the second drag, which asks for and drops its own file.
     std::thread::sleep(Duration::from_millis(2));
     let t2 = rig.now();
     rig.source.enter();
@@ -517,7 +462,6 @@ fn a_drags_data_is_the_answer_to_its_own_request() {
         "the late answer is nobody's: only the second drag's file is hovered and dropped"
     );
 
-    // The third drag drops before its answer; the drop is delivered once it comes.
     rig.clear();
     std::thread::sleep(Duration::from_millis(2));
     let t3 = rig.now();
@@ -529,8 +473,6 @@ fn a_drags_data_is_the_answer_to_its_own_request() {
     assert!(rig.finish(), "the third drop is accepted");
     assert_eq!(rig.seen, [Seen::Dropped(third)], "the early drop delivers its file once it comes");
 
-    // An INCR drag leaves after its header was consumed. Its source can still hold the old
-    // conversion and try to put chunks there after another drag's INCR header was consumed.
     rig.clear();
     let t4 = rig.now();
     rig.source.enter();
@@ -553,9 +495,6 @@ fn a_drags_data_is_the_answer_to_its_own_request() {
         (deletions(got, new.requestor, new.property) >= 1).then_some(())
     });
     rig.source.drop(t5);
-    // Both writes actually reach the server AFTER B's header. With the old shared app-window
-    // requestor they succeed and feed B; the old round's destroyed, never-reused id refuses
-    // both. Its destruction precedes B's creation on the backend's one connection.
     for chunk in [b"file:///stale-from-the-first-incr\r\n".as_slice(), b"".as_slice()] {
         let error = rig
             .source
@@ -584,8 +523,6 @@ fn a_drags_data_is_the_answer_to_its_own_request() {
     assert!(rig.finish(), "the new INCR drop finishes with its own file");
     assert_eq!(rig.seen, [Seen::Dropped(current)]);
 
-    // No Position preceded this drop, so it asks for data here. The real id admission
-    // refuses synchronously: no response can arrive, and the source must be finished now.
     rig.clear();
     let t6 = rig.now();
     let xconn = rig._window.xconn.clone();
@@ -602,7 +539,6 @@ fn a_drags_data_is_the_answer_to_its_own_request() {
 fn a_dropped_path_is_the_one_the_source_named() {
     let Some(mut rig) = Rig::new() else { return };
     let scratch = aterm_tempfile::tempdir().expect("a scratch dir");
-    // GNOME names a screenshot with spaces; the link beside it has a non-ASCII name.
     let shot = scratch.path().join("Screenshot from 2026-07-23 11-12-52.png");
     std::fs::write(&shot, b"").expect("a file to drag");
     let link = scratch.path().join("Ünïcødé link");
@@ -636,11 +572,8 @@ fn a_list_drops_its_local_files_and_a_drag_of_none_is_refused() {
     let scratch = aterm_tempfile::tempdir().expect("a scratch dir");
     let shot = scratch.path().join("Screenshot from 2026-07-23 11-12-52.png");
     std::fs::write(&shot, b"").expect("a file to drag");
-    // Never made: the path is the source's to name, and nothing reads the filesystem.
     let gone = scratch.path().join("gone.txt");
 
-    // Local files among a web link, trash, a path that is not UTF-8 and a network share: the
-    // local files drop, the rest are skipped.
     let t1 = rig.now();
     rig.source.enter();
     rig.source.position(t1);
@@ -667,8 +600,6 @@ fn a_list_drops_its_local_files_and_a_drag_of_none_is_refused() {
     );
     assert!(statuses(&rig.got, rig.source.status).iter().all(|&accept| accept));
 
-    // No local file (a Firefox link, Nautilus Trash, Other Locations): refused once the data
-    // comes, with no position after it; refused at the next position; refused if dropped anyway.
     rig.clear();
     std::thread::sleep(Duration::from_millis(2));
     let t2 = rig.now();
@@ -687,7 +618,6 @@ fn a_list_drops_its_local_files_and_a_drag_of_none_is_refused() {
     assert!(!rig.finish(), "a drop of no local file is refused");
     assert_eq!(rig.seen, [], "nothing hovers or drops");
 
-    // Selected text (no `text/uri-list`): refused at its position, its data never asked for.
     rig.clear();
     std::thread::sleep(Duration::from_millis(2));
     let t3 = rig.now();
@@ -704,7 +634,6 @@ fn a_list_drops_its_local_files_and_a_drag_of_none_is_refused() {
 #[test]
 fn a_list_too_large_for_one_property_comes_in_incr_chunks() {
     let Some(mut rig) = Rig::new() else { return };
-    // Select All in a folder of 5000 screenshots: a list over 256 KiB, which GTK sends INCR.
     let folder = Path::new("/home/someone/Pictures/Screenshots of a long week");
     let paths: Vec<PathBuf> = (0..5000)
         .map(|i| {
@@ -723,7 +652,6 @@ fn a_list_too_large_for_one_property_comes_in_incr_chunks() {
     for (n, piece) in pieces.iter().enumerate() {
         rig.chunk(&request, n + 1, piece);
         if n == 1 {
-            // A position while the list comes in neither asks for it again nor refuses it.
             rig.source.position(t);
         }
     }

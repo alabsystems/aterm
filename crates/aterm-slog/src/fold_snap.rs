@@ -1,66 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The fold's snapshot (design §5.2, phase 2A): the [`Fold`] as text lines a
-//! carried log crosses a seamless update in, and back.
-//!
-//! A carried log cannot rebuild its fold from the records it carries: the
-//! carry sheds records, and refolding a subset changes totals, needs, claims
-//! and the last closed nodes ("eviction never changes the state"). So the
-//! fold crosses as it stands, field by field, each with the confidence and
-//! seq that put it there: every record after it has a higher seq, so the
-//! confidence law (§3.7) decides exactly as it would have.
-//!
-//! Lines (`fold` then a tag; values percent-encoded where they are text):
-//!
-//! ```text
-//! fold v=1 as_of=<seq> ep=<e> rev=<n> last_t=<ms> mail_open=<n>
-//! fold phase word=<w> src=<s> conf=<c> t=<ms>        (and `fold shell …`)
-//! fold totals turns=<n> done=<n> … appr_by=<a,b,c,d> tools=<10 counts> … [mail_amb=<n>] [mlh=1] [mlw=<off>:<t>,…]
-//! fold open <node> <kind> [par=<node>] by=<a> src=<s> conf=<c> t=<ms> [mloff=<off> mlconf=<c>]
-//! fold last <slot> <node> <kind> out=<w> dur_ms=<n> [opened_t=<ms>] t=<ms> by=<a> opened_by=<a> src=<s> conf=<c> [mloff=<off> mlconf=<c>]
-//! fold closed <node> <kind> out=<w> …                (the session's own close)
-//! fold f <owner> <key> <conf> <seq> <value>          (owner: t<i>, l<slot>, c)
-//! fold need <word> <node> kind=<k> since=<seq> t=<ms> src=<s> conf=<c> by=<a> [detail=<pct>]
-//! fold verdict word=<w> by=<a> t=<ms> seq=<seq> [as=<pct>] [re=<id>] [t…] [p…]
-//! fold label text=<pct> by=<a> t=<ms> until=<ms> seq=<seq> [as=<pct>] [re=<id>] [t…] [p…]
-//! ```
-//!
-//! A claim line holds the newest claim of any author; the newest of a
-//! trusted author rides the same line as `t`-prefixed
-//! tokens (`tword=`/`ttext=`, `tby=`, `tt=`, `tuntil=`, `tseq=`, `tas=`,
-//! `tre=`) when it is another claim, so a reader that does not know them
-//! skips them; none means the trusted one is the line's own claim when its
-//! author is trusted, and none otherwise. The newest of a PROVEN author (the
-//! harness's, `Actor::is_proven`) rides it the same way as `p`-prefixed
-//! tokens when it is not the trusted one; none means it is the trusted one
-//! when that author is proven, and none otherwise.
-//!
-//! A turn's heuristic mail link (phase 5, ruling T10a: `super::mail`) rides
-//! its own `fold open` or `fold last` line as `ml`-prefixed tokens, and the
-//! turns that found mail ambiguous ride the totals line as `mail_amb=`
-//! (T10c), both only when there is one: a reader that does not know them
-//! skips them (the R13 rule), and a snapshot without them reads with no link
-//! and no ambiguity.
-//!
-//! THE MAIL LATCH AND THE WAITING MAILS (
-//! T10a) ride the totals line too, as `ml`-prefixed tokens and only when
-//! there is something to say: `mlh=1` while mail was delivered since the last
-//! `human` mark of an input that reached the program, and `mlw=<off>:<t>,…`
-//! for the delivered `kind=task` mails no turn has taken, oldest first, at
-//! most [`MAX_MAIL_WAITING`]. So mail delivered before a seamless update is
-//! still answered by the person's next keystroke after it, and still links
-//! the successor's next turn. An older build skips them (the R13 rule) and
-//! reads a fold that holds neither, as before; this build reads a snapshot
-//! without them (3B's, 6C-4's) the same way. Waiting mail implies the latch
-//! (the record that queues one sets the other, and what clears the latch
-//! clears the mail), so `mlw=` without `mlh=1` refuses the snapshot. A
-//! closed session's summary keeps neither ([`Fold::closed_snapshot`]): it
-//! waits for no turn.
-//!
-//! Reading back is bounded and fail-closed: a line this build does not read,
-//! a value of the wrong shape, more needs, open nodes or fields than a fold
-//! holds, refuses the whole snapshot ([`SnapError`]).
+//! The fold's snapshot (design §5.2, phase 2A): the [`Fold`] as text lines a carried log crosses a seamless update in, and back.
 
 use std::fmt::Write as _;
 
@@ -86,8 +27,7 @@ pub enum SnapError {
     Line,
     /// More needs, open nodes, closed slots or fields than a fold holds.
     Bound,
-    /// An open node the log the fold crossed with does not hold open as
-    /// the fold says: refused, never repaired.
+    /// An open node the log the fold crossed with does not hold open as the fold says: refused, never repaired.
     Log,
 }
 
@@ -174,10 +114,7 @@ fn push_link(s: &mut String, link: Option<MailLink>) {
 }
 
 /// A turn's mail link from its line's `ml` tokens (after `skip` words), if
-/// it carries them. A link is heuristic and nothing else (
-/// `HeuristicStaysHeuristic`): this build's writer says `mlconf=heuristic`,
-/// so any other confidence is no line it wrote and refuses the snapshot,
-/// as every malformed token does; a carried link never reads back certain.
+/// it carries them.
 fn read_link(line: &str, skip: usize) -> Result<Option<MailLink>, SnapError> {
     match opt_num::<u64>(line, skip, "mloff")? {
         None => Ok(None),
@@ -203,13 +140,6 @@ fn push_mail(s: &mut String, latch: bool, waiting: &[MailWaiting]) {
 }
 
 /// The mail latch and the waiting mails from the totals line's `ml` tokens.
-/// `mlh=` says `1` and nothing else, and `mlw=` holds one to
-/// [`MAX_MAIL_WAITING`] `<off>:<t>` pairs: any other shape is no line this
-/// build wrote, and refuses the snapshot, as every malformed token does.
-/// So does waiting mail without the latch: the `mail dir=in` that queues a
-/// task mail sets the latch, and a reached `human` mark or a reset clears
-/// both, so no fold holds one without the other, and a successor handed it
-/// would link a mail its person already answered (T39).
 fn read_mail(line: &str) -> Result<(bool, Vec<MailWaiting>), SnapError> {
     let latch = match get(line, 2, "mlh") {
         None => false,
@@ -343,8 +273,6 @@ fn claim_line(tag: &str, any: &Claim, trusted: Option<&Claim>, proven: Option<&C
     if let Some(t) = trusted.filter(|t| t.seq != any.seq) {
         push_claim(&mut s, "t", t);
     }
-    // What a reader derives with no `p…` tokens: the trusted claim when its
-    // author is proven (`read_claim_line`).
     let derived = trusted.or(Some(any)).filter(|c| c.by.is_proven());
     if let Some(p) = proven.filter(|p| derived.is_none_or(|d| d.seq != p.seq)) {
         push_claim(&mut s, "p", p);
@@ -420,16 +348,13 @@ fn read_claim_line(line: &str, label: bool) -> Result<ClaimSlots, SnapError> {
 }
 
 impl Fold {
-    /// The fold as `fold …` lines, deterministic (the snapshot this module
-    /// documents): what a carry crosses a seamless update with.
+    /// The fold as `fold …` lines, deterministic (the snapshot this module documents): what a carry crosses a seamless update with.
     #[must_use]
     pub fn snapshot(&self) -> Vec<String> {
         self.snapshot_lines(true)
     }
 
-    /// [`Fold::snapshot`] without the mail latch and the waiting mails: a
-    /// closed session's summary (`Log::closed_summary`), which waits for no
-    /// turn.
+    /// [`Fold::snapshot`] without the mail latch and the waiting mails: a closed session's summary (`Log::closed_summary`), which waits for no turn.
     #[must_use]
     pub(crate) fn closed_snapshot(&self) -> Vec<String> {
         self.snapshot_lines(false)
@@ -543,11 +468,8 @@ impl Fold {
     }
 
     /// The fold a [`Fold::snapshot`] wrote.
-    ///
     /// # Errors
-    ///
-    /// A [`SnapError`] for anything this build does not read; the whole
-    /// snapshot is refused, never a part.
+    /// A [`SnapError`] for anything this build does not read; the whole snapshot is refused, never a part.
     pub fn from_snapshot(lines: &[&str]) -> Result<Fold, SnapError> {
         let mut it = lines.iter();
         let head = it.next().ok_or(SnapError::Version)?;
@@ -696,27 +618,14 @@ impl Fold {
         for (slot, n) in fold.st.needs.iter_mut().zip(needs) {
             *slot = Some(n);
         }
-        // In the order the turns opened, as the fold made them.
         fold.links.sort_by_key(|(n, _)| *n);
         fold.links.dedup_by_key(|(n, _)| *n);
         fold.reproject();
         Ok(fold)
     }
 
-    /// WHETHER THIS FOLD AGREES WITH ITS LOG'S OPEN PATH,
-    /// as a carry or a closed summary crosses the two: every node the
-    /// fold tracks open is open in `open` (the log's open path), of the same
-    /// kind and so at its level, at most once, and under the parent the log
-    /// holds it under — the deepest open node above it, or the session. A
-    /// fold that says more than its log holds would outlive the log's close
-    /// (the close finds the first copy and leaves the other, or finds none),
-    /// so it is refused whole and the successor starts over after its
-    /// handoff gap; nothing is guessed. A node the log holds open that the
-    /// fold does not track is no disagreement: a fold may drop one past its
-    /// bound.
-    ///
+    /// WHETHER THIS FOLD AGREES WITH ITS LOG'S OPEN PATH, as a carry or a closed summary crosses the two: every node the fold tracks open is open in `open` (the log's open path), of the same kind and so at its level, at most once, and under the parent the log holds it under — the deepest open node above it, or the session.
     /// # Errors
-    ///
     /// [`SnapError::Log`] at the first open node that disagrees.
     pub(crate) fn agrees_with_open(&self, open: &[crate::log::OpenEntry]) -> Result<(), SnapError> {
         for (i, o) in self.tracked.iter().enumerate() {

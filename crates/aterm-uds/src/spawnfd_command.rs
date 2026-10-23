@@ -50,7 +50,7 @@ impl fmt::Debug for Stdio {
 }
 
 impl From<OwnedFd> for Stdio {
-    /// This descriptor, placed at the slot's number. The command keeps it
+    /// This descriptor, placed at the slot's number.
     fn from(fd: OwnedFd) -> Self {
         Self(Kind::Fd(fd))
     }
@@ -93,6 +93,7 @@ impl From<io::PipeWriter> for Stdio {
 }
 
 /// `std`'s `CommandEnv`: the edits a command makes to the environment it
+/// will copy at the spawn.
 #[derive(Debug, Default)]
 struct Env {
     clear: bool,
@@ -118,12 +119,17 @@ impl Env {
     }
 
     /// Whether the child's `PATH` may differ from this process's: std's `have_changed_path`,
+    /// the test that sends a bare name from `posix_spawnp` (which searches this process's
+    /// `PATH`) to `execvp`.
     #[cfg(target_vendor = "apple")]
     fn saw_path(&self) -> bool {
         self.clear || self.vars.contains_key(OsStr::new("PATH"))
     }
 
     /// The child's whole environment: this process's as it stands (in
+    /// `environ`'s order) when nothing was edited, else this process's (or
+    /// none, after `env_clear`) with the edits applied, sorted by key —
+    /// exactly the block `std` hands the child.
     #[cfg(target_vendor = "apple")]
     fn capture(&self) -> Vec<(OsString, OsString)> {
         if !self.clear && self.vars.is_empty() {
@@ -160,6 +166,8 @@ pub struct Command {
     pgroup: Option<i32>,
     setsid: bool,
     /// The SPI that makes the child its own responsible process, when asked
+    /// ([`Self::disclaim_responsibility`]): always [`DISCLAIM_SPI`] but in a
+    /// test that names one no image exports.
     disclaim: Option<&'static CStr>,
     /// Start the child stopped at its exec ([`Self::start_suspended`]).
     suspended: bool,
@@ -302,6 +310,7 @@ impl Command {
     }
 
     /// The group the spawn asks for: none beside `setsid` when the group
+    /// asked is `0`, which the session gives anyway.
     fn group(&self) -> Option<i32> {
         self.pgroup.filter(|&pgroup| !(self.setsid && pgroup == 0))
     }
@@ -514,6 +523,8 @@ impl Child {
 }
 
 /// Read two pipes to their ends at once: `poll` both, read whichever is
+/// ready, and once one ends read the other to its end — `std`'s
+/// `read_output`.
 fn read2(
     mut out: ChildStdout,
     out_buf: &mut Vec<u8>,
@@ -745,6 +756,7 @@ impl Command {
 }
 
 /// A `std` child: on drop collected if it has exited, else handed to
+/// [`crate::reaper`].
 #[cfg(not(target_vendor = "apple"))]
 #[derive(Debug)]
 struct Handle {
@@ -811,6 +823,7 @@ impl Drop for Handle {
 #[cfg(not(target_vendor = "apple"))]
 impl Stdio {
     /// The same mode as `std`'s; a descriptor is duplicated, so the command
+    /// keeps its own for a later spawn, as `std` keeps one.
     fn to_std(&self) -> io::Result<std::process::Stdio> {
         Ok(match &self.0 {
             Kind::Inherit => std::process::Stdio::inherit(),
@@ -872,6 +885,7 @@ impl Command {
     }
 
     /// The `std` command this one is: [`super::InheritNothing`]'s strip
+    /// first, then the empty mask and the session in one more hook.
     fn forked(&self) -> io::Result<super::StdCommand> {
         use super::InheritNothing as _;
         use std::os::unix::process::CommandExt as _;

@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The CLI, end to end, over a synthetic repo: plan, scheduler, stages, the
-//! per-check lines and the exit code, driven by `#!/bin/sh` stand-ins for the
-//! toolchain and the binaries the checks drive.
+//! End-to-end CLI contract tests over a synthetic repository using `#!/bin/sh` stand-ins.
 #![cfg(unix)]
 
-// The shared fixture half, mounted once by `tests/contract.rs`.
 use crate::common;
 
 use std::fs;
@@ -77,8 +74,6 @@ impl FakeRepo {
             scratch,
             home,
         };
-        // Every binary the CLI builds and then DRIVES, present and passing, so
-        // an unrelated test never reads a missing binary as a finding.
         for rel in driven_stubs() {
             me.driver_stub(&rel, 0);
         }
@@ -293,7 +288,6 @@ fn the_in_process_checks_refuse_a_root_that_is_not_an_aterm_checkout() {
 fn a_skip_fails_nothing_except_under_release() {
     let repo = FakeRepo::new();
     repo.with_stage2("exit 0");
-    // No targo-tippy beside the stand-in targo: the lint is a named skip.
     let (dev, code) = repo.run(&[Check::Lint, Check::Export], Scope::workspace());
     assert_eq!(code, exit::PASS, "{dev}");
     assert_eq!(labels_with(&dev, "skip").len(), 1, "{dev}");
@@ -306,8 +300,6 @@ fn a_skip_fails_nothing_except_under_release() {
 
 #[test]
 fn a_run_with_no_driver_fails_closed() {
-    // The bare machine: the test compile COULD NOT RUN, and the checks that
-    // need the driver skip by name.
     let repo = FakeRepo::new();
     let (ladder, code) = repo.run(&land(), Scope::workspace());
     assert_eq!(code, exit::COULD_NOT_RUN, "{ladder}");
@@ -325,11 +317,7 @@ fn a_failing_driver_fails_every_stage_that_drives_it_and_nothing_else() {
     let (ladder, code) = repo.run(&land(), Scope::workspace());
 
     assert_eq!(code, exit::FAILED, "{ladder}");
-    // Every stage that drives targo fails (test compile, doctests, libc,
-    // spec, export…); the in-process checks are not in `land()`.
     assert!(labels_with(&ladder, "FAIL").len() >= 4, "{ladder}");
-    // The test run never starts after a failed compile, and is no skip: a
-    // COULD NOT RUN row.
     assert!(
         labels_with(&ladder, "NOT RUN")
             .iter()
@@ -345,9 +333,6 @@ fn a_scoped_run_narrows_the_driver_where_the_check_reads_the_selection() {
     let (ladder, code) = repo.run(&land(), Scope::crate_only("aterm-grid"));
 
     assert_eq!(code, exit::PASS, "{ladder}");
-    // Led by the main lane's build dir: the fixture's root is outside its HOME,
-    // so the shim's cache steps aside and the intermediates go to
-    // `<target>/build.noindex`, out of Spotlight.
     let lead = format!(
         "argv: --config build.build-dir='{}/target/build.noindex' ",
         repo.root.display()
@@ -370,10 +355,7 @@ fn a_scoped_run_narrows_the_driver_where_the_check_reads_the_selection() {
 /// test compile's own selection (`--workspace` here) and this binary as its
 /// doc driver, which skips the pass of the library whose docs hold no doctest,
 /// saying so, and becomes the stage2's trustdoc for the one whose docs hold
-/// one, with `RUSTDOC` back on trustdoc and its own variables gone. A failing
-/// pass fails the row. The stand-in targo plays cargo's doc loop: a
-/// `Doc-tests` header and a `$RUSTDOC --test` pass per library, each with its
-/// `CARGO_PKG_NAME`.
+/// one, with `RUSTDOC` back on trustdoc and its own variables gone.
 #[test]
 fn the_doctests_run_rustdoc_only_where_a_doctest_lives_over_the_test_compiles_selection() {
     let repo = FakeRepo::new();
@@ -450,10 +432,7 @@ fn the_doctests_run_rustdoc_only_where_a_doctest_lives_over_the_test_compiles_se
 /// leave `cargo build` at 0 — and nothing that decided nothing is green: the
 /// redraw harness's `0` passes, `1` is a finding, `2` (no event loop) could not
 /// run; and on macOS the event drive's untrapped signal death is the finding it
-/// exists to make. The
-/// stand-in dies by `SIGKILL`: the ladder reads every signal death alike, and
-/// a `SIGABRT` makes macOS write a crash report on every run. The exit-code
-/// tables themselves are `stages`' unit tests.
+/// exists to make.
 #[test]
 fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
     let repo = FakeRepo::new();
@@ -486,9 +465,7 @@ fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
     }
 }
 
-/// The objc drives stage runs every row, whatever one row did. A driver whose
-/// build failed and a driver that found a defect each leave their own rows,
-/// and every other driver still runs and says so.
+/// The objc drives stage runs every row, whatever one row did.
 #[test]
 fn the_objc_drives_run_every_row_after_a_failure() {
     if !cfg!(target_os = "macos") {
@@ -535,16 +512,7 @@ const COMPILE_RED: &str = "echo 'error[E0425]: cannot find value `gone` in this 
 /// header and, when the argv carries the recording runner, executes the runner
 /// with the binary's argv from the binary's package directory with
 /// `CARGO_PKG_NAME` set — or, with no runner (the serial child), runs the
-/// binary itself and prints cargo's re-run line after a failure. `extra` is
-/// shell run first for `--tests`, so a test can bend the recording pass.
-/// `bins` are `(package, target flag, name)`; each binary's body is
-/// `bodies(name)`.
-///
-/// The `targo` bakes in the repo's paths, so it goes in as data behind the one
-/// shared stand-in text ([`FakeRepo::with_stage2_body`]) so each repo does not
-/// create a fresh executable inode waiting on macOS assessment. Calling it
-/// again replaces the `targo` (a case that bends the recording pass
-/// differently), so one repo serves every case.
+/// binary itself and prints cargo's re-run line after a failure.
 fn with_recording_cargo(repo: &FakeRepo, bins: &[(&str, &str, &str)], extra: &str) {
     let deps = repo.root.join("target/debug/deps");
     fs::create_dir_all(&deps).expect("mkdir");
@@ -617,13 +585,6 @@ exit 0"#
 /// The test binaries run several at a time, end to end, through the real recorder
 /// (`aterm-verify --record-test-binary`, the binary this package builds) and a
 /// stand-in cargo that runs it the way cargo runs a runner.
-///
-/// Pinned: the binaries ran two at a time (two of them meet: each waits for
-/// the other to have started) with the whole thread count each, as cargo's
-/// own run gives it; every binary ran in its own package's directory (two
-/// packages here) with the environment cargo gave its runner; the compile's JSON is gone from
-/// the ladder; and the one failed test is itemized under cargo's own re-run
-/// spec, from the combined log's shape.
 #[test]
 fn the_test_binaries_run_as_cargo_recorded_them_two_at_a_time() {
     let repo = FakeRepo::new();
@@ -657,8 +618,6 @@ fn the_test_binaries_run_as_cargo_recorded_them_two_at_a_time() {
              args=$*\"\ntouch '{m}/running/{name}'\n{rest}\nrm -f '{m}/running/{name}'\n"
         )
     };
-    // Each binary bakes in the marks' path, so they are data behind the shared
-    // stand-in rather than fresh executable inodes.
     let write = |name: &str, text: String| {
         common::standin_body(&deps.join(format!("{name}-1")), &text);
     };
@@ -749,24 +708,15 @@ fn the_test_binaries_run_as_cargo_recorded_them_two_at_a_time() {
 /// the serial `--tests` child instead, and says why — cargo announcing a
 /// binary the recorder never saw, or the recorder failing — and a pass in
 /// which the recorder never ran (a runner the caller's config names outranks
-/// ours) is judged as the serial run it was. In every case the tests ran and
-/// the one failure is decided exactly once.
+/// ours) is judged as the serial run it was.
 #[test]
 fn a_recording_that_does_not_add_up_falls_back_to_cargos_serial_run() {
     let bins = [("fixture", "--test b", "b"), ("fixture", "--test c", "c")];
-    // cargo announcing a binary the recorder never saw; the recorder failing;
-    // a runner from the caller's config outranking the recorder.
     let cases = [
         "echo '     Running tests/ghost.rs (target/debug/deps/ghost-1)' >&2",
         "if [ -n \"$cfg\" ]; then cfg=$(printf '%s' \"$cfg\" | sed 's#\",\"/#\",\"/nonexistent/#'); fi",
         "cfg=''",
     ];
-    // One repo for the three cases. What differs between them is only `extra`,
-    // which bends the recording pass and is the stand-in cargo's own body
-    // ([`with_recording_cargo`] replaces it): the two binaries are the same text
-    // in every case, each run reads a record directory of its own and removes
-    // it, and a case leaves nothing the next one reads. A repo each would buy
-    // nothing the cases could tell apart.
     let repo = FakeRepo::new();
     let deps = repo.root.join("target/debug/deps");
     for (name, code, verdict) in [("b", 101, "FAILED"), ("c", 0, "ok")] {
@@ -778,7 +728,6 @@ fn a_recording_that_does_not_add_up_falls_back_to_cargos_serial_run() {
                 .to_string()
         };
         let (passed, nfailed) = if code == 0 { (1, 0) } else { (0, 1) };
-        // Data behind the shared stand-in, like the stand-in cargo's body.
         common::standin_body(
             &deps.join(format!("{name}-1")),
             &format!(
@@ -817,14 +766,7 @@ fn a_recording_that_does_not_add_up_falls_back_to_cargos_serial_run() {
     }
 }
 
-/// A runner that runs no test is no pass. A runner for the host named in a
-/// cargo config or the environment (`CARGO_TARGET_<TRIPLE>_RUNNER`) outranks
-/// the run's `cfg(all())` recording runner, so the recording pass is judged as
-/// the serial run it was — or, when it printed no result, the serial child
-/// runs, through the same runner. One that runs nothing exits 0 for every
-/// binary, which would read `ok` with no test run. Here the stand-in cargo's runner is
-/// outranked (`cfg=''`) and each binary "runs" as such a runner would: it
-/// prints nothing and exits 0. The row is COULD NOT RUN, and says why.
+/// A runner that runs no test is no pass.
 #[test]
 fn a_runner_that_ran_no_test_is_could_not_run_never_ok() {
     let repo = FakeRepo::new();

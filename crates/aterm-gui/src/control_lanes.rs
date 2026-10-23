@@ -78,6 +78,7 @@ pub(super) struct LaneLimits {
 const SUBSCRIPTION_BUSY_LINE: &[u8] = b"ERR subscription capacity busy; retry\n";
 
 /// How many times in a row the parker's loop may panic, with no pass completed
+/// between them, before it stops (see the module doc).
 #[cfg(unix)]
 const PARKER_PANICS_IN_A_ROW: usize = 3;
 
@@ -86,6 +87,7 @@ const PARKER_PANICS_IN_A_ROW: usize = 3;
 const TAKING_SPAN: Duration = Duration::from_secs(1);
 
 /// The room a connection's read buffer ([`Unread`]) makes for the next read
+/// from its peer once it is full, and so about the most one read takes.
 const READ_BUFFER: usize = 8 * 1024;
 
 /// Parked byte budget per request lane (`MAX_CONTROL_REPLY_LINE_BYTES`, 64 MiB across 8 lanes).
@@ -93,6 +95,8 @@ const READ_BUFFER: usize = 8 * 1024;
 const PARKED_BYTES_PER_LANE: usize = aterm_types::control_verbs::MAX_CONTROL_REPLY_LINE_BYTES;
 
 /// An unsent answer, or a request still arriving, at least this long leaves the
+/// heap while its connection is parked ([`Outbox::spill`],
+/// [`Unread::room_for_the_request`]).
 #[cfg(unix)]
 const SPILL_FROM: usize = 16 << 10;
 
@@ -129,6 +133,7 @@ pub(super) fn held(buffered: &[u8], authenticated: bool) -> Held {
 }
 
 /// Whether `buffered` holds what a lane serves next: a whole request, or a
+/// frame's header nobody has acted on yet.
 fn servable(buffered: &[u8], authenticated: bool, header_done: bool) -> bool {
     match held(buffered, authenticated) {
         Held::Whole => true,
@@ -141,16 +146,21 @@ fn servable(buffered: &[u8], authenticated: bool, header_done: bool) -> bool {
 #[derive(Default)]
 pub(super) struct Outbox {
     /// The answer's bytes, in order: moved in as they were built, never copied
+    /// into a buffer kept for the next answer.
     segments: VecDeque<Segment>,
     /// Bytes of the front segment the peer has taken.
     sent: usize,
     /// Close the connection once the answer is delivered: its request ended it.
     then_close: bool,
     /// Released once the last byte is out, or never will be: a seamless
+    /// update's Commit waits on it ([`super::ReplyWire`]).
     written: Option<ReplyWritten>,
     /// An artifact answer's handoff ([`super::PendingHandoff`]): dropped with
+    /// the outbox however the connection ends, failing closed.
     handoff: Option<PendingHandoff>,
     /// The answer is one the exit (or an update's Commit) waits for
+    /// ([`super::FinalReplies`]): its request can end the process, or wrote
+    /// into a session's input.
     final_reply: Option<super::FinalReply>,
 }
 
@@ -158,8 +168,10 @@ pub(super) struct Outbox {
 enum Segment {
     Bytes(Vec<u8>),
     /// A secret-bearing line (`askpass`), in its own guarded storage: moved
+    /// here, never copied, and scrubbed as it drops.
     Secret(aterm_uds::sudo::WireBuffer),
     /// The unsent rest of a large answer, moved off the heap as its
+    /// connection parked ([`Outbox::spill`]).
     #[cfg(unix)]
     Spilled(Spill),
 }
@@ -182,6 +194,8 @@ impl Outbox {
     }
 
     /// Move the unsent tail of a large answer (`>= SPILL_FROM`) into an anonymous
+    /// mapping ([`Spill`]) before parking so heap pages are freed on the serving
+    /// lane and `munmap`ped on completion.
     #[cfg(unix)]
     fn spill(&mut self) {
         if !self
@@ -278,6 +292,7 @@ impl Outbox {
     }
 
     /// Whether the answer is out and the line that acknowledges its challenge
+    /// is still owed.
     fn awaiting_ack(&self) -> bool {
         matches!(&self.handoff, Some(PendingHandoff::Acknowledged(ack)) if ack.on_wire)
     }
@@ -289,6 +304,7 @@ impl Outbox {
     }
 
     /// What the bytes the peer `sent` after the challenge say
+    /// ([`super::ack_verdict`]); `None` when no acknowledgement is owed.
     fn ack_verdict(&self, sent: &[u8], ended: bool) -> Option<bool> {
         match &self.handoff {
             Some(PendingHandoff::Acknowledged(ack)) if ack.on_wire => {
@@ -402,6 +418,8 @@ impl Outbox {
     }
 
     /// The last byte is out: the latch is released, the exit no longer waits
+    /// for the answer, a write-only permit goes, and a guarded reply now awaits
+    /// its acknowledgement.
     fn drained(&mut self) {
         drop(self.written.take());
         drop(self.final_reply.take());
@@ -462,6 +480,9 @@ impl Write for Outbox {
 }
 
 /// Bytes a parked connection holds off the heap, in an anonymous mapping of
+/// their own of a fixed length: a large answer's unsent rest
+/// ([`Outbox::spill`]), or a large request while it arrives
+/// ([`Unread::room_for_the_request`]).
 #[cfg(unix)]
 struct Spill {
     base: std::ptr::NonNull<u8>,
@@ -476,6 +497,7 @@ unsafe impl Send for Spill {}
 #[cfg(unix)]
 impl Spill {
     /// A fresh mapping of `len` zeroed bytes, or `None` when none can be made
+    /// (or `len` is 0).
     fn zeroed(len: usize) -> Option<Self> {
         if len == 0 {
             return None;
@@ -501,6 +523,7 @@ impl Spill {
     }
 
     /// A fresh mapping of `len` bytes (no fewer than `bytes` holds) that
+    /// starts with a copy of `bytes`.
     fn copy_of(bytes: &[u8], len: usize) -> Option<Self> {
         let mut spill = Self::zeroed(len.max(bytes.len()))?;
         spill.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
@@ -531,6 +554,7 @@ impl Drop for Spill {
 }
 
 /// What gathering a request from a peer, without waiting, came to (only a
+/// parker's lanes gather: unix).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(unix), allow(dead_code))]
 enum Gathered {
@@ -548,8 +572,11 @@ enum Gathered {
 #[derive(Default)]
 pub(super) struct Unread {
     /// Initialized storage: `at..end` is unread, and `end..` is room for the
+    /// next read, zeroed once when the storage grows rather than per read.
     bytes: Vec<u8>,
     /// The storage instead of `bytes` (empty meanwhile) while a large request
+    /// is held off the heap, with room for the whole of it; unmapped once it
+    /// is served, or if it outgrows its room.
     #[cfg(unix)]
     mapped: Option<Spill>,
     at: usize,
@@ -571,6 +598,7 @@ impl Unread {
     }
 
     /// What `at` and `end` index: the mapping while there is one, else
+    /// `bytes`.
     fn storage(&self) -> &[u8] {
         #[cfg(unix)]
         if let Some(mapped) = &self.mapped {
@@ -587,7 +615,7 @@ impl Unread {
         self.at == self.end
     }
 
-    /// `amount` bytes are served. An emptied buffer keeps its storage for the
+    /// `amount` bytes are served.
     fn consume(&mut self, amount: usize) {
         self.at = self.end.min(self.at + amount);
         if self.at == self.end {
@@ -603,7 +631,7 @@ impl Unread {
         }
     }
 
-    /// Room for the next read. Once little is left, what was served goes and
+    /// Room for the next read.
     fn room(&mut self) -> &mut [u8] {
         #[cfg(unix)]
         if self
@@ -668,6 +696,9 @@ impl Unread {
     }
 
     /// As its connection parks: no storage at all when nothing is unread (its
+    /// next request is read into storage made then), and a large request a
+    /// lane began to read off the heap ([`Self::room_for_the_request`], as the
+    /// parker's own reads would).
     #[cfg(unix)]
     fn hold_only_what_is_owed(&mut self, authenticated: bool) {
         if self.is_empty() {
@@ -678,6 +709,7 @@ impl Unread {
     }
 
     /// Allocate a [`Spill`] mapping when an incoming frame or long line reaches
+    /// [`SPILL_FROM`] so slow peers do not pin heap pages while parked.
     #[cfg(unix)]
     fn room_for_the_request(&mut self, authenticated: bool) {
         let carried = self.as_slice();
@@ -712,6 +744,7 @@ impl Unread {
     }
 
     /// Read what the peer has sent, until `enough(unread)` or nothing more is
+    /// there.
     #[cfg(unix)]
     fn gather(&mut self, stream: &CtlStream, enough: impl Fn(&[u8]) -> bool) -> Gathered {
         self.gather_with(stream, enough, |_| {})
@@ -772,6 +805,7 @@ impl<'a> LaneReader<'a> {
     }
 
     /// Put `line` back at the head of what is unread: the verb a `TOKEN`
+    /// handshake folds in, served as the connection's first request.
     fn put_back_line(&mut self, line: &[u8]) {
         self.unread.put_back_line(line);
     }
@@ -809,6 +843,8 @@ impl BufRead for LaneReader<'_> {
 }
 
 /// Cached `O_NONBLOCK` state of a connection descriptor (non-blocking while
+/// parked or gathering/delivering on a lane; blocking during handler execution;
+/// `None` when unknown).
 #[derive(Clone, Copy, Debug, Default)]
 struct SocketMode(Option<bool>);
 
@@ -853,6 +889,8 @@ pub(super) fn mode_switches_here() -> u64 {
 }
 
 /// A connection's claim to its own serial, and the release of whatever was
+/// bound to it, as a drop guard: when the connection ends (closed, flipped to
+/// push, dropped by a lane's unwind or by the parker) its claims go with it.
 struct ConnTenure {
     id: u64,
     claimed: bool,
@@ -878,35 +916,48 @@ pub(super) struct Conn {
     caller: Option<Arc<crate::typed_by::Caller>>,
     tenure: ConnTenure,
     /// Bytes read from the peer and not served yet, read first wherever the
+    /// connection lands ([`LaneReader`]): the requests a request lane had read
+    /// past the wait it moved to a wait lane, or what has come of the next
+    /// request while it is not whole (the parker adds to it as more arrives).
     carry: Unread,
     /// Its descriptor's `O_NONBLOCK`, as the lanes last set it.
     mode: SocketMode,
     /// The part of its last answer the peer has not taken yet, and what must
+    /// last until it is out (or, for a guarded artifact, acknowledged).
     reply: Outbox,
     /// The frame header at the head of [`Self::carry`] has been acted on
+    /// ([`LaneService::frame_header`]): only its whole body wakes it now.
     header_done: bool,
     /// Until the handshake: when the parker drops the connection if its first
+    /// line is still not whole (`AUTH_READ_TIMEOUT` from admission).
     expires: Option<Instant>,
     /// When its peer last sent or took a byte or a lane last served it: of
+    /// the parked connections, the one with the oldest is the STALEST, closed
+    /// first when room is needed ([`stalest`]).
     #[cfg_attr(not(unix), allow(dead_code))]
     stirred: Instant,
     /// When its peer last took bytes of an answer it was owed while parked
+    /// (the room it made woke the parker): within [`TAKING_SPAN`] of a byte
+    /// budget pass, a peer TAKING its answer, closed for the budget only
+    /// after every holder that is not ([`Lanes::keep_parked_bytes_within`]).
     #[cfg_attr(not(unix), allow(dead_code))]
     taking: Option<Instant>,
     /// Held from parking until a request lane takes it back.
     parked: Option<Slot>,
-    /// Held from admission until the connection ends (or flips to push). Last,
+    /// Held from admission until the connection ends (or flips to push).
     _open: Slot,
 }
 
 impl Conn {
     /// When the parker drops the connection if it is still parked: its
+    /// handshake's lifetime, or its answer's handoff deadline.
     #[cfg(unix)]
     fn deadline(&self) -> Option<Instant> {
         self.expires.or_else(|| self.reply.deadline())
     }
 
     /// Shut down both socket halves via [`aterm_uds::hangup::hang_up`], release
+    /// connection claims, and free the open slot.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -936,6 +987,7 @@ impl Conn {
     }
 
     /// A request lane takes a resumed connection back: its parking slot is
+    /// free again.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -950,6 +1002,8 @@ impl Conn {
 }
 
 /// The request lanes' work: a freshly accepted connection (holding the open
+/// slot its admission took), or a parked one that turned readable (boxed, so
+/// every queued job is the size of a stream, not of a connection's buffers).
 enum Job {
     Fresh(CtlStream, Slot),
     #[cfg_attr(
@@ -970,9 +1024,11 @@ enum Here {
     Closed,
     Subscribe(Request, Scope),
     /// Between requests — idle, or waiting on its peer for the rest of its
+    /// next request or to take the rest of its answer: park it.
     #[cfg_attr(not(unix), allow(dead_code))]
     Idle,
     /// A wait read on a request lane: move it, with what the lane had read past
+    /// it in [`Conn::carry`].
     Wait(Request),
 }
 
@@ -984,6 +1040,7 @@ struct Push {
 }
 
 /// A lane set grown one thread at a time up to `max`, and kept: the wait lanes
+/// and the subscription lanes.
 struct GrowPool<J> {
     /// Its threads' name, each suffixed with its index.
     name: &'static str,
@@ -994,6 +1051,7 @@ struct GrowPool<J> {
 
 struct GrowState<J> {
     /// Jobs for threads serving nothing: one is queued only while more threads
+    /// serve nothing than jobs are queued.
     queue: VecDeque<J>,
     /// Threads started or starting.
     threads: usize,
@@ -1002,6 +1060,7 @@ struct GrowState<J> {
 }
 
 /// A job handed to the one thread started for it ([`GrowPool::submit`]),
+/// which serves it first.
 struct Handed<J>(Arc<Mutex<Option<J>>>);
 
 impl<J> Handed<J> {
@@ -1019,6 +1078,7 @@ impl<J> Handed<J> {
 }
 
 /// Run before each wait lane's spawn, with no lock held: the scheduling
+/// tests' slow or failing spawn.
 #[cfg(test)]
 type WaitSpawnHook = Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>;
 
@@ -1041,6 +1101,7 @@ impl<J> GrowPool<J> {
     }
 
     /// Start threads with nothing to serve yet, by `start`, until the pool has
+    /// `count` (never more than `max`).
     fn reserve(
         &self,
         count: usize,
@@ -1064,6 +1125,7 @@ impl<J> GrowPool<J> {
     }
 
     /// Dispatch `job` to an idle thread or spawn a new one (without holding the pool
+    /// lock) up to `max`.
     fn submit(
         &self,
         job: J,
@@ -1097,6 +1159,7 @@ impl<J> GrowPool<J> {
     }
 
     /// One thread's life: the job handed to it when it was started for one,
+    /// then each job it takes, a panic costing only that job.
     fn work(&self, first: Option<Handed<J>>, serve: impl Fn(J)) {
         if let Some(first) = first {
             // `submit` counted this thread running its job before it started.
@@ -1131,6 +1194,7 @@ impl<J> GrowPool<J> {
     }
 
     /// Its work (queued, or handed to a starting thread, plus running), its
+    /// threads, and how many of them serve nothing.
     #[cfg(test)]
     #[cfg_attr(not(unix), allow(dead_code))]
     fn census(&self) -> (usize, usize, usize) {
@@ -1162,20 +1226,28 @@ struct Parker {
     /// Connections parked now, at most `limits.open`.
     parked: Arc<Slots>,
     /// What was handed to the parker and not yet taken — `None` once it has
+    /// STOPPED, which a lane parking a connection and admission at the cap
+    /// read under this lock (so nothing is handed over after the stop's last
+    /// look) and answer by keeping the connection, or turning it away.
     inbox: Mutex<Option<Inbox>>,
     /// What the parked connections held at the end of the parker's last pass,
+    /// in bytes ([`Conn::held_bytes`]).
     held: AtomicUsize,
     /// Of the parked connections at the end of the parker's last pass, those
+    /// that did not give way ([`Conn::gives_way`]): the tests' census.
     #[cfg(test)]
     spared: AtomicUsize,
     /// Held by a test to keep the parker from taking what it is handed
+    /// ([`Lanes::parker_pause`]).
     #[cfg(test)]
     pause: Mutex<()>,
     /// Whether the parker still polls: `inbox.is_some()`, readable without the
+    /// lock by admission and [`Lanes::parker_runs`].
     running: AtomicBool,
     /// The write end of the parker's bell (non-blocking): a byte wakes its poll.
     bell: std::os::unix::net::UnixStream,
     /// Panics to raise in the parker's loop, one per pass, before it looks at
+    /// what woke it — the scheduling tests' injected failure.
     #[cfg(test)]
     faults: AtomicUsize,
 }
@@ -1187,6 +1259,7 @@ struct Inbox {
     /// Connections parked between requests.
     parked: Vec<Conn>,
     /// Fresh connections admitted at the cap, each to take the place of the
+    /// stalest parked connection ([`Lanes::take_the_stalest_place`]).
     fresh: Vec<CtlStream>,
 }
 
@@ -1199,16 +1272,20 @@ pub(super) struct Lanes {
     /// Request lanes serving a wait right now (bounded by `limits.inline`).
     inline: Arc<Slots>,
     /// Connections open now: bounded by `limits.open` while a parker runs,
+    /// and by the request lanes when none does.
     open: Arc<Slots>,
     #[cfg(unix)]
     parker: OnceLock<Arc<Parker>>,
     service: OnceLock<Arc<dyn LaneService>>,
     /// The scheduling tests' own [`super::FinalReplies`]
+    /// ([`Self::count_final_replies_on`]); the instance's otherwise.
     #[cfg(all(test, unix))]
     final_replies: OnceLock<&'static super::FinalReplies>,
     /// How long a fresh connection has to make its handshake line whole
+    /// (milliseconds): `AUTH_READ_TIMEOUT`, short in the tests.
     handshake_ms: AtomicU64,
     /// What the parked connections may hold at once, in bytes:
+    /// [`PARKED_BYTES_PER_LANE`] per request lane, small in the tests.
     #[cfg(unix)]
     parked_bytes_max: AtomicUsize,
     /// The negative control's switch ([`Self::keep_pipelined_waits`]).
@@ -1393,6 +1470,10 @@ impl Lanes {
     }
 
     /// Admission at the cap: hand the fresh connection to the parker, which
+    /// places it ([`Self::take_the_stalest_place`]); or hand it back for the
+    /// busy reply — every request lane taken by work (as below the cap), no
+    /// parker, or as many fresh ones already waiting as there are parked
+    /// connections (each is owed one).
     #[cfg(unix)]
     #[cfg_attr(
         any(test, debug_assertions),
@@ -1433,6 +1514,7 @@ impl Lanes {
     }
 
     /// A freshly admitted connection holding the open slot `open`, its
+    /// handshake's lifetime counted from now.
     fn fresh_conn(&self, stream: CtlStream, open: Slot) -> Conn {
         let now = Instant::now();
         Conn {
@@ -1529,6 +1611,7 @@ impl Lanes {
     }
 
     /// Start one thread of a grown lane set, `name`d, to live `lane`, serving
+    /// `first` first when it was started for a job.
     fn grow<J: Send + 'static>(
         self: &Arc<Self>,
         name: String,
@@ -1556,6 +1639,7 @@ impl Lanes {
     }
 
     /// Hand `conn` and `request` to an idle or newly spawned wait lane, or return
+    /// `Err` at capacity so the caller can serve or refuse it inline.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1575,6 +1659,7 @@ impl Lanes {
     }
 
     /// The scheduling tests' hook ([`Self::before_wait_spawn`]), run with no
+    /// lock held.
     #[cfg(test)]
     fn run_wait_spawn_hook(&self) -> std::io::Result<()> {
         let hook = self
@@ -1599,6 +1684,7 @@ impl Lanes {
     }
 
     /// Serve a connection that flipped to push on a subscription lane: an idle
+    /// one, or a new one while the cap allows.
     fn subscribe(self: &Arc<Self>, push: Push) {
         if let Err(push) = self
             .subscriptions
@@ -1611,6 +1697,7 @@ impl Lanes {
     }
 
     /// Carry one connection until it leaves this lane: closed, flipped to push,
+    /// parked, or moved to a wait lane.
     fn drive(self: &Arc<Self>, mut conn: Conn, mut request: Option<Request>, lane: Lane) {
         let mut may_park = true;
         let mut may_defer = true;
@@ -1812,6 +1899,8 @@ impl Lanes {
     }
 
     /// A request lane takes one of the `limits.inline` places for a wait no
+    /// wait lane can take, held while it serves the wait; `None` when every
+    /// place is taken (the wait is refused: [`refuse_wait`]).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1870,6 +1959,7 @@ impl Lanes {
     }
 
     /// Hand an idle or partial connection to the parker in non-blocking mode,
+    /// or return `Err` to keep it on the lane if the parker has stopped.
     #[cfg(unix)]
     #[cfg_attr(
         any(test, debug_assertions),
@@ -1962,6 +2052,9 @@ impl Lanes {
     }
 
     /// The parker's thread: its loop, restarted over the SAME parked set after
+    /// a panic (a connection moved out of the set when the panic came is closed
+    /// by the unwind, as a lane's own connection is), until it cannot go on —
+    /// then [`Self::stop_parker`], never a silent exit with connections inside.
     #[cfg(unix)]
     fn parker_thread(&self, parker: &Parker, listen: &std::os::unix::net::UnixStream) {
         let mut parked: Vec<Conn> = Vec::new();
@@ -1988,6 +2081,7 @@ impl Lanes {
     }
 
     /// The parker cannot go on: no connection parks from now on (as without a parker), and
+    /// every connection it holds, polled or not yet, is closed.
     #[cfg(unix)]
     fn stop_parker(&self, parker: &Parker, parked: Vec<Conn>, why: &str) {
         let arrivals = {
@@ -2011,6 +2105,10 @@ impl Lanes {
     }
 
     /// The parker's loop: one `poll(2)` over every parked connection and the
+    /// bell, over the `parked` set [`Self::parker_thread`] keeps across a
+    /// restart — `POLLOUT` for one whose peer owes it room for an answer,
+    /// `POLLIN` for the rest, and no longer than until the first deadline (a
+    /// handshake's, an artifact handoff's) runs out.
     #[cfg(unix)]
     fn parker_loop(
         &self,
@@ -2090,6 +2188,7 @@ impl Lanes {
     }
 
     /// Act on what woke a parked connection (`events`, or its deadline
+    /// running out at `now`); `Some` hands it back to stay parked.
     #[cfg(unix)]
     fn wake(&self, mut conn: Conn, events: libc::c_short, now: Instant) -> Option<Conn> {
         let mut took = false;
@@ -2128,6 +2227,7 @@ impl Lanes {
     }
 
     /// A parked connection turned readable: back to the request lanes' queue,
+    /// behind whatever runs, holding its parking slot until a lane takes it.
     #[cfg(unix)]
     #[cfg_attr(
         any(test, debug_assertions),
@@ -2154,12 +2254,15 @@ enum Next {
     /// Not whole yet, and nothing more there now: the parker gathers the rest.
     Park,
     /// A frame's header, or a line too long for any request, was refused, its
+    /// answer in the outbox: close.
     Refused,
     /// Nothing more will come, or the connection failed.
     Closed,
 }
 
 /// The connection's next request, without waiting for its peer: served from
+/// what `reader` holds once it is whole, with what the peer has already sent
+/// gathered in first.
 fn next_request(
     reader: &mut LaneReader<'_>,
     mode: &mut SocketMode,
@@ -2199,6 +2302,7 @@ fn next_request(
 }
 
 /// The request line `reader` holds next, read on a lane: one too long for any
+/// request is answered in the outbox ([`Next::Refused`]), never a bare close.
 fn read_next_line(reader: &mut LaneReader<'_>, reply: &mut Outbox) -> Next {
     let mut refusal = Vec::new();
     match read_authenticated_request_line(reader, &mut refusal) {
@@ -2212,6 +2316,7 @@ fn read_next_line(reader: &mut LaneReader<'_>, reply: &mut Outbox) -> Next {
 }
 
 /// [`Unread::gather`] on a lane: its socket stops blocking first, and stays so
+/// for the delivery and the park that follow.
 #[cfg(unix)]
 fn gather_here(
     reader: &mut LaneReader<'_>,
@@ -2235,6 +2340,7 @@ fn gather_here(
 }
 
 /// Deliver the outbox from a lane while the parker can have the rest: what
+/// the peer takes now, the socket non-blocking.
 fn deliver_here(
     stream: &CtlStream,
     mode: &mut SocketMode,
@@ -2257,11 +2363,16 @@ enum Step {
 #[cfg(unix)]
 impl Conn {
     /// The bytes it holds of its peer's and for its peer: the answer not yet
+    /// taken and what has come of its next request, as allocated or mapped.
     fn held_bytes(&self) -> usize {
         self.carry.held() + self.reply.held()
     }
 
     /// Let go of every buffer it holds no byte in — an idle connection holds
+    /// none (its next answer is made on a lane, in a buffer of its own) — and
+    /// move a large unsent answer off the heap ([`Outbox::spill`]), and a
+    /// large request a lane began to read before it parked
+    /// ([`Unread::room_for_the_request`], as the parker's own reads would).
     fn hold_only_what_is_owed(&mut self) {
         if self.reply.owed() {
             self.reply.spill();
@@ -2270,6 +2381,7 @@ impl Conn {
     }
 
     /// Whether a fresh client at the connection cap may evict this parked connection
+    /// (authenticated and holding no live supervisor/drive claim).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -2290,12 +2402,14 @@ impl Conn {
         self.scope.is_some() && !self.has_live_claim()
     }
 
-    /// Whether a claim still ends with it. The tenure's cleanup flag stays set
+    /// Whether a claim still ends with it.
     fn has_live_claim(&self) -> bool {
         self.tenure.claimed && self.tenure.service.has_live_claim(self.tenure.id)
     }
 
     /// Close it to make room for another: its peer sees the hang-up any close
+    /// is, and its open and parked slots are handed over to the connection
+    /// taking its place (`None`, both given back, if it held no parked one).
     fn give_up_place(mut self) -> Option<(Slot, Slot)> {
         aterm_uds::hangup::hang_up(&self.stream);
         let place = self.parked.take();
@@ -2336,6 +2450,8 @@ impl Conn {
     }
 
     /// Read what has come of the line that acknowledges a guarded artifact,
+    /// and settle it once that says anything: the guard released, or
+    /// quarantined.
     fn ack_parked(&mut self) -> Step {
         let reply = &self.reply;
         let gathered = self.carry.gather(&self.stream, |sent| {
@@ -2352,6 +2468,7 @@ impl Conn {
     }
 
     /// Read what its peer has sent of its next request, until it is whole or
+    /// nothing more is there.
     fn gather_parked(&mut self) -> Step {
         let (authenticated, header_done) = (self.scope.is_some(), self.header_done);
         match self.carry.gather_with(
@@ -2368,6 +2485,9 @@ impl Conn {
 }
 
 /// How long the parker may wait before the first deadline it holds runs out
+/// (a handshake's, an artifact handoff's): a `poll(2)` timeout in
+/// milliseconds, rounded up so it never wakes early; -1 (no limit) when no
+/// connection it holds has one.
 #[cfg(unix)]
 fn until_a_deadline(parked: &[Conn], now: Instant) -> libc::c_int {
     parked
@@ -2383,6 +2503,7 @@ fn until_a_deadline(parked: &[Conn], now: Instant) -> libc::c_int {
 #[cfg(unix)]
 impl Lanes {
     /// Move what lanes handed the parker into its polled set, then place each
+    /// fresh connection admitted at the cap.
     fn take_arrivals(&self, parker: &Parker, parked: &mut Vec<Conn>) {
         let fresh = {
             #[cfg(test)]
@@ -2400,6 +2521,7 @@ impl Lanes {
     }
 
     /// Place a connection admitted at the cap into a freed slot or by evicting the
+    /// stalest parked connection that [`Conn::gives_way`], or reply busy.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -2460,6 +2582,8 @@ impl Lanes {
     }
 
     /// Enforce the parked byte budget by closing the stalest byte-holding connections
+    /// (sparing active readers and claim holders until last, and never evicting the
+    /// sole byte holder).
     fn keep_parked_bytes_within(&self, parked: &mut Vec<Conn>) -> usize {
         let budget = self.parked_bytes_max.load(Ordering::Acquire);
         let holds = |conn: &Conn| conn.held_bytes() > 0;
@@ -2494,6 +2618,7 @@ impl Lanes {
 #[cfg(unix)]
 impl<T> BoundedDispatch<T> {
     /// Whether a fresh admission would find a request lane now: the cap
+    /// admits one only then ([`Lanes::admit_at_the_cap`]).
     fn has_room(&self) -> bool {
         self.outstanding.load(Ordering::Acquire) < self.capacity.load(Ordering::Acquire)
     }
@@ -2515,6 +2640,8 @@ fn stalest<R: Ord + Copy>(parked: &[Conn], rank: impl Fn(&Conn) -> Option<R>) ->
 static EVICTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Count one parked connection closed to make room for `why`, and say so in
+/// the log at the first, second, fourth, eighth… so a process squatting the
+/// cap shows there without a line per client it displaced.
 #[cfg(unix)]
 fn note_eviction(why: &str) {
     let count = EVICTIONS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -2526,6 +2653,8 @@ fn note_eviction(why: &str) {
 }
 
 /// Answer a fresh connection the parker cannot place with the busy reply,
+/// without waiting: it never got as far as a request, and its empty send
+/// buffer takes the line.
 #[cfg(unix)]
 fn turn_away(stream: &CtlStream) {
     crate::control_listener::note_busy_reply();
@@ -2549,6 +2678,7 @@ impl Parker {
 }
 
 /// A wait no lane may take (every wait lane taken and the request lanes' wait budget
+/// spent) is answered busy at once: nothing was served, and the client may send it again.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -2562,6 +2692,7 @@ fn refuse_wait(out: &mut Outbox) {
 }
 
 /// A parked connection's peer hung up with nothing left to read: closed where
+/// it is, its tenure (and any claim bound to it) ended with it.
 #[cfg(unix)]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -2576,6 +2707,7 @@ fn close_parked(conn: Conn) {
 }
 
 /// The serving thread's view of the connection it carries, which a
+/// connection-scoped claim binds to ([`super::serving_connection`]).
 struct Serving<'a> {
     claimed: &'a mut bool,
 }
@@ -2605,6 +2737,9 @@ mod outbox_spill_tests {
     use std::io::Read as _;
 
     /// An answer the socket does not take at once leaves the heap as its
+    /// connection parks: its heap segments are let go, one mapping holds
+    /// exactly the unsent rest, every byte arrives in order, and the mapping
+    /// goes once it is delivered.
     #[test]
     fn a_large_unsent_answer_leaves_the_heap_and_arrives_whole() {
         let (server, mut peer) = CtlStream::pair().expect("private control pair");
@@ -2680,6 +2815,10 @@ mod outbox_delivery_tests {
     use std::io::Read as _;
 
     /// A secret-bearing answer (`askpass`) reaches its peer byte for byte
+    /// through a real socket, and once it is out the outbox holds none of it:
+    /// it was moved into its own guarded segment (`WireBuffer`, scrubbed as it
+    /// drops), never copied into an ordinary byte segment, and that segment
+    /// went as soon as its last byte was taken.
     #[test]
     fn a_secret_answer_is_delivered_whole_and_kept_nowhere() {
         let (server, mut peer) = CtlStream::pair().expect("private control pair");

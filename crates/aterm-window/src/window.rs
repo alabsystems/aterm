@@ -211,7 +211,7 @@ impl WindowAttributes {
 
     /// Sets whether the window will be initially visible or hidden.
     #[inline]
-    pub fn with_visible(mut self, visible: bool) -> Self {
+    pub const fn with_visible(mut self, visible: bool) -> Self {
         self.visible = visible;
         self
     }
@@ -532,6 +532,13 @@ impl Window {
 
     /// Whether the window manager shows the window tiled.
     #[inline]
+    #[cfg_attr(
+        not(any(x11_platform, wayland_platform)),
+        expect(
+            clippy::missing_const_for_fn,
+            reason = "The Linux backends dispatch through runtime window state."
+        )
+    )]
     pub fn is_tiled(&self) -> bool {
         let _span = tracing::debug_span!("aterm_window::Window::is_tiled",).entered();
         #[cfg(any(x11_platform, wayland_platform))]

@@ -118,7 +118,7 @@ fn one_positional(operands: &Operands, what: &str) -> Result<String, String> {
     }
 }
 
-fn appearance_word(appearance: Appearance) -> &'static str {
+const fn appearance_word(appearance: Appearance) -> &'static str {
     match appearance {
         Appearance::Dark => APPEARANCE_VALUES[0],
         Appearance::Light => APPEARANCE_VALUES[1],
@@ -184,7 +184,7 @@ enum Severity {
 }
 
 impl Severity {
-    fn word(self) -> &'static str {
+    const fn word(self) -> &'static str {
         match self {
             Self::Error => "error",
             Self::Warning => "warning",
@@ -206,7 +206,7 @@ struct Diagnostic {
 }
 
 impl Diagnostic {
-    fn error(code: &'static str, message: String) -> Self {
+    const fn error(code: &'static str, message: String) -> Self {
         Self {
             severity: Severity::Error,
             code,

@@ -282,15 +282,21 @@ pub fn version_number(name: &str) -> Option<Vec<u64>> {
 }
 
 /// The digest cache's schema: 2 since a file's identity is the one export's
+/// full width ([`Stamp::id`]).
 const HASH_SCHEMA: u64 = 2;
 
 /// What a file's own handle says of it: a digest stands while none of it
+/// moved — its length, last write, creation, and its identity, so a file
+/// renamed over the one read is read anew.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Stamp {
     len: u64,
     written_ns: Option<u64>,
     created_ns: Option<u64>,
     /// The file's volume and number, as the one identity export reads them
+    /// ([`aterm_sysprobe::volumes::FileId`]: `st_dev` and `st_ino`; on
+    /// Windows the 64-bit volume serial and the 128-bit file id, read from
+    /// the open handle, [`aterm_sysprobe::volumes::file_id_of_handle`]).
     id: Option<(u64, u128)>,
 }
 
@@ -311,6 +317,7 @@ impl Stamp {
 }
 
 /// The identity of the file open as `file` (read as `meta`), by the one
+/// export's width ([`Stamp::id`]).
 fn file_id(
     file: &std::fs::File,
     meta: &std::fs::Metadata,

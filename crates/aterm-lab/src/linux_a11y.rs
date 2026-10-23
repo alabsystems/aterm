@@ -226,6 +226,7 @@ pub fn spoken(log: &str) -> Vec<String> {
 }
 
 /// What Orca spoke of the three a row wants: the frame's name and the
+/// terminal's text, which it must have spoken, and the typed line's output.
 struct Spoke<'a> {
     named: &'a str,
     text: &'a str,
@@ -242,6 +243,7 @@ fn never(speech: &[String], what: &str) -> String {
 }
 
 /// The frame's name, the terminal's text (the prompt) before anything of the
+/// typed line, and the typed line's output if Orca spoke it.
 fn spoke<'a>(speech: &'a [String], frame: &str) -> Result<Spoke<'a>, String> {
     let named = speech
         .iter()
@@ -365,6 +367,7 @@ impl Cell<'_> {
     }
 
     /// A test run as a row: judged on its tally, a skip and what Rosetta
+    /// could not run read from its uncaptured output.
     fn test_row(&self, title: &str, name: &str, args: &[&str]) -> Row {
         println!("\n=== {}: {title} ===", self.tag);
         let mut env = self.env.clone();
@@ -383,6 +386,7 @@ impl Cell<'_> {
     }
 
     /// An acceptance bench run as a row (`cargo bench --profile test`, so it
+    /// builds as the tests do), judged by [`measured`].
     fn bench_row(&self, title: &str, name: &str, [package, bench, target]: [&str; 3]) -> Row {
         println!("\n=== {}: {title} ===", self.tag);
         let mut env = self.env.clone();
@@ -608,6 +612,7 @@ pub(crate) fn portal_up(up: &Up) -> Result<(), String> {
 }
 
 /// One of aterm-gui's rows: an ordeal of the bus under Xvfb, or Orca on one
+/// of its screens.
 #[derive(Clone, Copy)]
 enum GuiRow {
     Ordeal(Ordeal),
@@ -685,6 +690,7 @@ pub(crate) fn gui_rows(cell: &Cell<'_>, built: bool, rows: &mut Vec<Row>) -> Res
 }
 
 /// Set at-spi2-core's `org.a11y.Status.ScreenReaderEnabled`, which Orca's
+/// presence says to applications.
 fn screen_reader(up: &Up, on: bool) -> linux::Out {
     up.sh(&[
         "busctl".into(),
@@ -700,6 +706,7 @@ fn screen_reader(up: &Up, on: bool) -> linux::Out {
 }
 
 /// aterm-gui's aterm.log in `gui`'s scratch world (the XDG state dir's
+/// `aterm/logs`, under its HOME).
 fn log_path(gui: &Gui<'_>) -> String {
     format!("{}/home/.local/state/aterm/logs/aterm.log", gui.dir)
 }
@@ -715,6 +722,7 @@ fn run_line(gui: &Gui<'_>, line: &str, echo: &str) -> Result<(), String> {
 }
 
 /// Wait in the guest for `n` lines holding `text` in `path`: `Err` naming
+/// `what` after a minute.
 fn wait_lines(gui: &Gui<'_>, path: &str, text: &str, n: usize, what: &str) -> Result<(), String> {
     if gui.up.sh(&guest::wait_lines(path, text, n, HANG_SECS)).ok() {
         Ok(())
@@ -724,6 +732,7 @@ fn wait_lines(gui: &Gui<'_>, path: &str, text: &str, n: usize, what: &str) -> Re
 }
 
 /// `lane-bus atspi-walk` of aterm-gui (process `pid`), again until it reads
+/// the window and `echo` ([`read_back`]) or a minute passed: the last walk.
 fn walk_until(gui: &Gui<'_>, pid: &str, echo: &str) -> String {
     let argv = vec![
         "env".to_string(),
@@ -749,6 +758,7 @@ fn walk_until(gui: &Gui<'_>, pid: &str, echo: &str) -> String {
 }
 
 /// The accessibility bus's `dbus-daemon` (at-spi2-core's `accessibility.conf`)
+/// of the guest user (whose uid names its runtime dir): its pid.
 fn bus_daemon(up: &Up) -> Result<String, String> {
     let uid = up.runtime.rsplit('/').next().unwrap_or_default();
     let out = up.sh(&[
@@ -784,6 +794,7 @@ fn signal(up: &Up, signal: &str, pid: &str) -> Result<(), String> {
 }
 
 /// Start aterm-gui under Xvfb in `gui`'s world, end its accessibility bus as
+/// `ordeal` says, and judge the rejoin: the row's verdict and detail.
 fn drive(gui: &Gui<'_>, arch: Arch, ordeal: Ordeal, results: &Path) -> (Verdict, String) {
     if let Err(e) = gui.prepare() {
         return (Verdict::NotRun, format!("scratch world: {e}"));
@@ -822,6 +833,8 @@ fn drive(gui: &Gui<'_>, arch: Arch, ordeal: Ordeal, results: &Path) -> (Verdict,
 }
 
 /// How systemd says aterm-gui's unit ended (or that it runs still), read
+/// before the row stops it: its state, its `Result` (`success`,
+/// `core-dump`, `signal`, …) and its main process's exit code and status.
 fn unit_end(gui: &Gui<'_>) -> String {
     let out = gui.up.sh(&[
         "systemctl".into(),
@@ -853,6 +866,8 @@ pub fn translator_abort(arch: Arch, ended: &str, stderr: &str) -> Option<String>
 }
 
 /// A failed row's verdict: NOT RUN when the translator ended aterm-gui
+/// ([`translator_abort`]), since the row then decided nothing about aterm,
+/// as a test the translator cannot run is not run; else FAIL.
 fn translated_away(arch: Arch, ended: &str, stderr: &str, detail: String) -> (Verdict, String) {
     match translator_abort(arch, ended, stderr) {
         Some(abort) => (
@@ -925,6 +940,8 @@ fn ordeal_run(gui: &Gui<'_>, ordeal: Ordeal, stderr: &str) -> Result<Evidence, S
 }
 
 /// With the bus's daemon frozen: flood the screen until the publisher says
+/// the bus stopped reading, then end the flood and see its last line drawn
+/// while the daemon is still frozen.
 fn frozen(gui: &Gui<'_>, log: &str) -> Result<(), String> {
     gui.expect(&["send", FLOOD], &|r| r.starts_with("OK"))?;
     gui.expect(&["key", "enter"], &|r| r.starts_with("OK"))?;
@@ -992,22 +1009,27 @@ pub type Var = (String, String);
 pub(crate) struct Mutter {
     pid: String,
     /// `DISPLAY` and `XAUTHORITY`: its Xwayland, and the authority file
+    /// Mutter wrote for it.
     x: Vec<Var>,
     /// `WAYLAND_DISPLAY`, as its socket's absolute path.
     wayland: Var,
 }
 
-/// The Orca rows' Mutter's unit, and its Wayland socket's name. The lane's
+/// The Orca rows' Mutter's unit, and its Wayland socket's name.
 const MUTTER_ORCA: &str = "aterm-lane-mutter-orca";
 
 /// Where the command Mutter runs once up writes what Mutter gave it.
 const MUTTER_ENV: &str = "/tmp/aterm-lane-mutter-orca.env";
 
 /// That command: the display variables Mutter set for it, written whole to
+/// `$0`, then held, since Mutter ends when its command does.
 const MUTTER_COMMAND: &str = "env | grep -E '^(DISPLAY|XAUTHORITY|WAYLAND_DISPLAY)=' \
                               >\"$0.part\" && mv \"$0.part\" \"$0\"; exec sleep infinity";
 
 /// Headless Mutter with its Xwayland, as a lane unit, once it ran its
+/// command: Mutter picks the X display's number and writes an authority file
+/// for it, and says both only to the command it runs (`mutter … --
+/// COMMAND`).
 fn mutter_up(up: &Up) -> Result<Mutter, String> {
     let _ = up.sh(&["rm".into(), "-f".into(), MUTTER_ENV.into()]);
     let unit = guest::Unit {
@@ -1105,6 +1127,9 @@ pub fn seat_keys(line: &str) -> Vec<String> {
 }
 
 /// An Orca row: speech-dispatcher on its dummy module and Orca as lane
+/// units, then aterm-gui on `screen` focused and typed into; what
+/// speech-dispatcher queued judged by [`heard`] ([`heard_keyless`] where
+/// Orca hears no key).
 fn orca(
     gui: &Gui<'_>,
     arch: Arch,
@@ -1185,6 +1210,7 @@ enum On<'a> {
 
 impl On<'_> {
     /// What an X client of the screen is told: Xvfb's display, or Mutter's
+    /// Xwayland and its authority file.
     fn x(self, up: &Up) -> Vec<(String, String)> {
         match self {
             On::Xvfb => vec![Display::Xvfb.client_env(&up.runtime)],
@@ -1202,6 +1228,9 @@ fn x_client(x: &[(String, String)], argv: &[&str]) -> Vec<String> {
 }
 
 /// Start the speech sink, Orca and aterm-gui on `on`, give aterm-gui's
+/// window the keyboard focus, type a line, and wait until Orca had its
+/// output spoken, or (Wayland) left it unspoken: the frame's name the walk
+/// read.
 fn orca_run(gui: &Gui<'_>, on: On<'_>, speechd_log: &str, debug: &str) -> Result<String, String> {
     let up = gui.up;
     let d = &gui.dir;
@@ -1457,6 +1486,7 @@ mod tests {
     use super::*;
 
     /// A walk of aterm-gui as lane-bus prints it (the baseline's xvfb walk,
+    /// 2026-10-17), with `text` the terminal's.
     fn walk(text: &str) -> String {
         format!(
             "apps 1\n\
@@ -1548,6 +1578,7 @@ mod tests {
     }
 
     /// A bench's output as aterm-conformance's bench support prints it, the
+    /// publisher's log interleaved, with `rows` (name, status, detail).
     fn bench(rows: &[(&str, &str, &str)], summary: &str) -> String {
         let mut text =
             String::from("[DEBUG] accessibility: publishing on the AT-SPI bus as :1.4\n");

@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the update notice's reader. The measured notices are the
-//! recorded screens'; every other notice here is built from the anchors
-//! (the drift canary holds the literal ones to the store binary), never
-//! typed as prose.
+//! Tests for the update notice's reader.
 
 use super::*;
 use crate::anchors::anchor_text;
@@ -15,8 +12,7 @@ use crate::turn::{launch_card_place, launch_card_scan, launch_card_scrolled, lau
 /// rows, as the captures they copy were.
 const WIDE: usize = 120;
 
-/// The notice's summary for a build of `changes` (`Updated to latest. Got
-/// …`), as 2.1.304's `ty` composes it.
+/// The notice's summary for a build of `changes` (`Updated to latest.
 fn summary(changes: &str) -> String {
     format!("{}{changes}", anchor_text("notice.updated"))
 }
@@ -232,9 +228,7 @@ const UNPLACED: [&str; 6] = [
 /// pane's width: each of [`PLACED`] where it was recorded, its text at
 /// column 2 — the 44-column capture's wrapped details row and the narrow
 /// card's hard-broken link among them — and every other screen with a
-/// placed card has none. NONE ELSEWHERE: every screen with a row at the
-/// Box's column that opens with the summary is one of [`PLACED`], or one of
-/// [`UNPLACED`], with no card placed.
+/// placed card has none.
 #[test]
 fn every_recorded_update_notice_is_placed_under_its_card() {
     let updated = format!("{INDENT}{}", anchor_text("notice.updated"));
@@ -278,14 +272,7 @@ fn every_recorded_update_notice_is_placed_under_its_card() {
     );
 }
 
-/// THE HARD BREAK, MEASURED. On the narrow card's captures at 34, 33 and 31
-/// columns the details row's link (33 cells) is longer than the Box (the
-/// pane less its padding), and the vendor breaks it inside itself on a row
-/// filled to the pane's edge: read at the pane's own width, the notice is
-/// the vendor's whole. NEGATIVE CONTROLS, each leaving it bare: the same
-/// rows read on a pane one column wider (the broken row then stops short
-/// of the edge — a break wrap-ansi never makes), a link broken short of the
-/// edge, and a break inside a word that would fit on a row of its own.
+/// THE HARD BREAK, MEASURED.
 #[test]
 fn a_link_broken_at_the_panes_edge_is_the_vendors_wrap() {
     for (name, cols) in [
@@ -323,30 +310,17 @@ fn a_link_broken_at_the_panes_edge_is_the_vendors_wrap() {
         ]);
         notice_at(&screen, cols)
     };
-    // The vendor's: the link filling the Box, one cell over it on the next.
     assert_eq!(broken(link.len() - 1, cols).map(|p| p.rows), Some(3));
-    // Broken short of the pane's edge.
     assert_eq!(broken(link.len() - 2, cols), None);
-    // A link that fits the Box is wrapped whole, never broken.
     assert_eq!(broken(link.len() - 1, cols + 1), None);
     assert_eq!(broken(link.len() - 1, 0), None);
 }
 
-/// THE VENDOR'S SHAPE, OR NOTHING. A bare `Updated to latest.`, a summary
-/// wrapped onto two rows and a details row word-wrapped onto two (`…changelog
-/// for` / `details`, as a narrow pane wraps it) are read; NEGATIVE CONTROLS,
-/// each of which leaves the vendor's notice bare: the details row reworded,
-/// the details row broken inside a word, its wrapped tail reworded or off
-/// the Box's column, the details row spread over three rows, a wrap cut by
-/// the screen's bottom edge, the summary quoted in a person's message (`❯`),
-/// the notice under something said (`⏺`: the walk stops there), the notice
-/// past the reach, a notice cut by the screen's bottom edge, the summary off
-/// the Box's column, and a summary with no details row under it.
+/// THE VENDOR'S SHAPE, OR NOTHING.
 #[test]
 fn a_notice_is_refused_unless_it_is_the_vendors_shape() {
     let details = anchor_text("notice.updated_details");
     let [head, tail] = measured_notice();
-    // The measured shape, one row under the card.
     let measured = card_over(&[String::new(), head.clone(), tail.clone()]);
     assert_eq!(
         notice_on(&measured),
@@ -357,7 +331,6 @@ fn a_notice_is_refused_unless_it_is_the_vendors_shape() {
             end: 74
         })
     );
-    // A bare summary.
     let bare = card_over(&[
         String::new(),
         boxed(anchor_text("notice.updated")),
@@ -372,8 +345,6 @@ fn a_notice_is_refused_unless_it_is_the_vendors_shape() {
             end: 2 + details.len()
         })
     );
-    // A summary wrapped onto two rows at the Box's column: the notice ends
-    // past its widest row, the summary's first.
     let first = boxed(&summary(" Got 33 features, 240 bugfixes, and 103"));
     let wrapped = card_over(&[
         String::new(),
@@ -391,15 +362,12 @@ fn a_notice_is_refused_unless_it_is_the_vendors_shape() {
             end: first.len()
         })
     );
-    // Right at the card's last row, and trailing blanks after each row.
     let tight = card_over(&[format!("{head}   "), format!("{tail}  ")]);
     assert_eq!(notice_on(&tight).map(|p| (p.top, p.end)), Some((4, 74)));
     let (link, words) = details
         .split_once(" for")
         .expect("the details row's link and its words");
     let words = crate::text::trim(words);
-    // The details row word-wrapped onto two rows under a wrapped summary, as
-    // the 44-column capture draws it: the notice spans all four.
     let narrow = card_over(&[
         String::new(),
         first.clone(),
@@ -417,7 +385,6 @@ fn a_notice_is_refused_unless_it_is_the_vendors_shape() {
             end: first.len()
         })
     );
-    // Wrapped after the link, its widest row the link's.
     let after_link = card_over(&[
         String::new(),
         boxed(anchor_text("notice.updated")),
@@ -533,7 +500,6 @@ fn a_notice_is_refused_unless_it_is_the_vendors_shape() {
     ] {
         assert_eq!(notice_on(&screen), None, "{why}: {screen:#?}");
     }
-    // Garbage never panics.
     let card = launch_card_place(&measured).expect("the card");
     for screen in [Vec::new(), rows(&[""]), measured[..2].to_vec()] {
         for cols in [0, 1, WIDE, usize::MAX] {
@@ -552,11 +518,7 @@ fn a_notice_is_refused_unless_it_is_the_vendors_shape() {
 /// rewritten — blanked, a summary's head, the details row, a person's
 /// words, a streamed `⏺` row, a wrapped continuation — whenever the check
 /// keeps the old reading, scanning the new rows under the same card gives
-/// exactly it. Not vacuous: most rewrites keep the reading (rows above the
-/// card's foot and below the scan's last row, a stop row streamed over),
-/// and a rewrite inside what the scan read does not. CONTROL: dropping the
-/// stop row's glyph test, or the bound at the scan's last row, keeps
-/// readings the scan disagrees with (mutation-checked).
+/// exactly it.
 #[test]
 fn a_kept_notice_scan_is_the_scans() {
     let [head, tail] = measured_notice();
@@ -606,12 +568,10 @@ fn a_kept_notice_scan_is_the_scans() {
         kept > moved && moved > 0 && stopped > 0,
         "most rewrites keep the reading: {kept} kept, {moved} moved, {stopped} over a stop row"
     );
-    // No row read: nothing moves it.
     let card = launch_card_place(&card_over(&[])).expect("the card");
     let edge = update_notice_scan(&card_over(&[]), &card, WIDE);
     assert_eq!((edge.read_to, edge.place), (None, None));
     assert!(update_notice_unmoved(&card_over(&[]), &edge, &[0, 3]));
-    // Garbage indices never panic.
     let _ = update_notice_unmoved(&[], &edge, &[usize::MAX]);
 }
 
@@ -661,13 +621,7 @@ fn whole_scrolled_card() -> (Vec<String>, CardPlace, Vec<String>) {
 /// (`launch_card_scrolled`): its model and working-directory rows at 29
 /// rows, its working directory's alone at 28 (from the whole card, and from
 /// the scrolled one kept in turn), and the notice is read under them,
-/// whole. With none of the card left (27 rows) nothing is: the vendor's
-/// notice goes bare. NEGATIVE CONTROLS, each reading nothing: a reply of
-/// Claude's quoting the notice with no card over it, the card's rows quoted
-/// at a message's indent over the quoted notice, another card's last rows
-/// (another working directory), the kept card scrolled back whole (a banner
-/// on the screen), the card's rows with no blank row under them, and a kept
-/// place at another text column.
+/// whole.
 #[test]
 fn a_scrolled_card_anchors_its_notice() {
     let (whole, kept, words) = whole_scrolled_card();
@@ -752,9 +706,7 @@ fn a_scrolled_card_anchors_its_notice() {
 /// (`launch_card_scrolled_unmoved`): on the 29-row capture, each row in
 /// turn rewritten — blanked, a banner row, a person's words, another card
 /// row — whenever the check keeps the scrolled card, reading the rows again
-/// finds exactly it. Not vacuous: rewrites under the card's rows and the
-/// blank row under them keep it, and rewrites of those rows, or a banner
-/// drawn anywhere, do not.
+/// finds exactly it.
 #[test]
 fn a_kept_scrolled_card_is_the_reads() {
     let (_, kept, words) = whole_scrolled_card();

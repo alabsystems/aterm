@@ -41,6 +41,37 @@ struct KeyProbe {
     digit: Digit,
 }
 
+/// `rows` with their last `deny this request in M:SS,` row `ticks` seconds lower (never below 0:00).
+fn ticked_countdown(rows: &[String], ticks: u64) -> (Vec<String>, Option<u64>) {
+    let mut out = rows.to_vec();
+    let Some(at) = out
+        .iter()
+        .rposition(|r| r.contains("deny this request in "))
+    else {
+        return (out, None);
+    };
+    let Some((head, tail)) = out[at].split_once("deny this request in ") else {
+        return (out, None);
+    };
+    let Some((m, s)) = tail
+        .split_once(',')
+        .and_then(|(time, _)| time.split_once(':'))
+    else {
+        return (out, None);
+    };
+    let (Ok(m), Ok(s)) = (m.parse::<u64>(), s.parse::<u64>()) else {
+        return (out, None);
+    };
+    let left = (m * 60 + s).saturating_sub(ticks);
+    let rest = tail.split_once(',').map_or("", |(_, r)| r);
+    out[at] = format!(
+        "{head}deny this request in {}:{:02},{rest}",
+        left / 60,
+        left % 60
+    );
+    (out, Some(left))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ServerLaunch {
     id: u64,
@@ -128,6 +159,15 @@ struct Mock {
     stall_sleep: Option<Duration>,
     dead_after_turns: Option<usize>,
     title: Option<String>,
+    /// The titles the next reads report, one each; the last stands after them.
+    titles: VecDeque<Option<String>>,
+    /// A title pinned over the program's: `status`'s `subject=`; `title` still the program's.
+    pinned: Option<String>,
+    /// `title` refused, as by a host without the verb.
+    title_refused: bool,
+    /// For the next `await idle` waits, one each: how long until its screen holds still, the
+    /// wait latching then or timing out at its step, whichever comes first.
+    idle_after: VecDeque<Duration>,
     cursor_col: Option<usize>,
     attention: Option<String>,
     foreign_attention: Option<String>,
@@ -151,6 +191,12 @@ struct Mock {
     reads: Vec<(usize, &'static str)>,
     uncounted: usize,
     idle_never: bool,
+    tick_ms: Option<u64>,
+    redraws_move_gen: bool,
+    countdown_ticks: bool,
+    countdown_reads: BTreeMap<usize, u64>,
+    countdown_left: Option<u64>,
+    stall_after_read: BTreeMap<usize, Duration>,
     tick_at_key: usize,
     ticks: Option<Duration>,
     read_at: Option<Instant>,
@@ -176,7 +222,12 @@ struct Mock {
     backspace_replies: VecDeque<CtlReply>,
     human_ms: Option<u64>,
     hand: &'static str,
+    hand_from: BTreeMap<usize, &'static str>,
+    gen_skipped: usize,
+    seq_waits_run_out: usize,
+    hand_during_idle: Option<(&'static str, &'static str)>,
     human_seq: Option<u64>,
+    human_seq_from: BTreeMap<usize, u64>,
     human_seq_on: BTreeMap<usize, Option<u64>>,
     submits_on: BTreeMap<usize, u64>,
     open_on: std::collections::BTreeSet<usize>,
@@ -608,6 +659,10 @@ impl Mock {
             round_trip: Duration::ZERO,
             after_call: None,
             title: None,
+            titles: VecDeque::new(),
+            pinned: None,
+            title_refused: false,
+            idle_after: VecDeque::new(),
             stalls: 0,
             idle_skips_busy: false,
             by_index: BTreeMap::new(),
@@ -665,6 +720,12 @@ impl Mock {
             reads: Vec::new(),
             uncounted: 0,
             idle_never: false,
+            tick_ms: None,
+            redraws_move_gen: false,
+            countdown_ticks: false,
+            countdown_reads: BTreeMap::new(),
+            countdown_left: None,
+            stall_after_read: BTreeMap::new(),
             tick_at_key: 0,
             ticks: None,
             read_at: None,
@@ -690,7 +751,12 @@ impl Mock {
             backspace_replies: VecDeque::new(),
             human_ms: None,
             hand: "-",
+            hand_from: BTreeMap::new(),
+            hand_during_idle: None,
+            seq_waits_run_out: 0,
+            gen_skipped: 0,
             human_seq: None,
+            human_seq_from: BTreeMap::new(),
             human_seq_on: BTreeMap::new(),
             submits_on: BTreeMap::new(),
             open_on: std::collections::BTreeSet::new(),
@@ -858,6 +924,11 @@ impl Mock {
     }
     fn status_line(&mut self) -> String {
         self.status_reads += 1;
+        if self.pinned.is_none()
+            && let Some(title) = self.titles.pop_front()
+        {
+            self.title = title;
+        }
         if self.person_at_status == Some(self.status_reads)
             && let Some(n) = self.human_seq.as_mut()
         {
@@ -909,7 +980,11 @@ impl Mock {
             human.push(' ');
             human.push_str(&launch.status(self.human_seq));
         }
-        let title = self.title.as_deref().map_or_else(String::new, |t| {
+        let (subject, source) = match &self.pinned {
+            Some(pin) => (Some(pin.as_str()), "pin"),
+            None => (self.title.as_deref(), "osc"),
+        };
+        let title = subject.map_or_else(String::new, |t| {
             let enc: String = t
                 .bytes()
                 .map(|b| {
@@ -920,12 +995,22 @@ impl Mock {
                     }
                 })
                 .collect();
-            format!(" subject={enc} subject_source=osc")
+            format!(" subject={enc} subject_source={source}")
         });
+        let hand = self
+            .hand_from
+            .range(..=self.reads.len())
+            .next_back()
+            .map_or(self.hand, |(_, h)| *h);
+        let generation = if self.redraws_move_gen {
+            format!(" gen=1.{}", self.seq)
+        } else {
+            String::new()
+        };
         format!(
             "OK schema=1 sid={} phase=running hold={} fabric={} program={} agent={}{input} \
-             seq={} hand={}{human}{title}\n",
-            self.status_sid, self.hold, self.fabric, self.program, self.agent, self.seq, self.hand
+             seq={}{generation} hand={hand}{human}{title}\n",
+            self.status_sid, self.hold, self.fabric, self.program, self.agent, self.seq
         )
     }
     fn measured_cell(&self, tail: &[&str]) -> Option<String> {
@@ -1109,7 +1194,16 @@ impl Mock {
             self.card_first_served = None;
         }
         let first = tail.map_or(0, |n| self.screens[i].len().saturating_sub(n));
-        let rows: Vec<String> = self.screens[i][first..]
+        let shown = if self.countdown_ticks {
+            let reads = self.countdown_reads.entry(i).or_insert(0);
+            let (rows, left) = ticked_countdown(&self.screens[i], *reads);
+            *reads += 1;
+            self.countdown_left = left;
+            rows
+        } else {
+            self.screens[i].clone()
+        };
+        let rows: Vec<String> = shown[first..]
             .iter()
             .map(|r| format!("\"{}\"", r.replace('\\', "\\\\").replace('"', "\\\"")))
             .collect();
@@ -1158,6 +1252,9 @@ impl Mock {
             (None, _) => self.human.remove(0),
         };
         self.reads.push((i, stamp));
+        if let Some((_, &n)) = self.human_seq_from.range(..=self.reads.len()).next_back() {
+            self.human_seq = Some(n);
+        }
         let mut human = if stamp.is_empty() {
             String::new()
         } else {
@@ -1881,6 +1978,14 @@ impl Mock {
             self.turned = true;
             self.turns += 1;
         }
+        if verb == "await"
+            && tail.first() == Some(&"idle")
+            && let Some((quiet, hand)) = self.hand_during_idle
+            && tail.get(1) == Some(&quiet)
+        {
+            self.hand = hand;
+            self.hand_from.clear();
+        }
         if self.dead_after_turns.is_some_and(|n| self.turns > n) {
             return Ok(err("exited"));
         }
@@ -1924,6 +2029,9 @@ impl Mock {
                 self.panel_seen();
                 self.reset_seen();
                 self.after_gone.push(after_gone);
+                if let Some(stall) = self.stall_after_read.remove(&self.reads.len()) {
+                    run_nap(self.waits.as_deref(), stall);
+                }
                 Ok(ok(&body))
             }
             "modes" if self.alt_screen.is_some() => {
@@ -2061,6 +2169,10 @@ impl Mock {
                 if let Some(r) = self.replies.pop_front() {
                     return Ok(r);
                 }
+                if self.keys > 0 && self.seq_waits_run_out > 0 {
+                    self.seq_waits_run_out -= 1;
+                    return Ok(timeout());
+                }
                 if self.parked(tail) {
                     return Ok(err("exited"));
                 }
@@ -2087,7 +2199,46 @@ impl Mock {
                 if self.served < self.screens.len() && !stale {
                     return Ok(ok("OK seq\n"));
                 }
+                // The countdown on the last screen ticks: the next second.
+                if self.countdown_ticks && !stale && self.countdown_left.is_some_and(|l| l > 0) {
+                    return Ok(ok("OK seq\n"));
+                }
                 Ok(self.stall(tail))
+            }
+            "await" if tail.first() == Some(&"idle") && !self.idle_after.is_empty() => {
+                let asked = tail
+                    .iter()
+                    .position(|a| *a == "timeout")
+                    .and_then(|i| tail.get(i + 1))
+                    .and_then(|ms| ms.parse::<u64>().ok())
+                    .map_or(Duration::ZERO, Duration::from_millis);
+                let still = self.idle_after.pop_front().unwrap_or_default();
+                run_nap(self.waits.as_deref(), still.min(asked));
+                Ok(if still <= asked {
+                    ok("OK idle\n")
+                } else {
+                    timeout()
+                })
+            }
+            "await"
+                if tail.first() == Some(&"idle")
+                    && self.tick_ms.is_some_and(|tick| {
+                        tail.get(1)
+                            .and_then(|ms| ms.parse::<u64>().ok())
+                            .is_none_or(|ms| ms >= tick)
+                    }) =>
+            {
+                let asked = tail
+                    .iter()
+                    .position(|a| *a == "timeout")
+                    .and_then(|i| tail.get(i + 1))
+                    .and_then(|ms| ms.parse::<u64>().ok())
+                    .unwrap_or(0);
+                run_nap(self.waits.as_deref(), Duration::from_millis(asked.min(50)));
+                if self.redraws_move_gen {
+                    self.seq += 1;
+                }
+                Ok(timeout())
             }
             "await" if tail.first() == Some(&"idle") && self.idle_never => {
                 let asked = tail
@@ -2202,6 +2353,7 @@ impl Mock {
                         return Ok(bare_err());
                     }
                     if fence != format!("1.{}", self.seq) {
+                        self.gen_skipped += 1;
                         return Ok(ok(&format!("OK skipped reason=changed seq={}\n", self.seq)));
                     }
                     tail = &tail[1..];
@@ -2340,6 +2492,19 @@ impl Mock {
             "status" => {
                 let line = self.status_line();
                 Ok(ok(&line))
+            }
+            // The program's own OSC title, whatever is pinned over it.
+            "title" if tail.is_empty() && self.title_refused => {
+                Ok(err("unknown verb 'title' (help lists them)"))
+            }
+            "title" if tail.is_empty() => {
+                if let Some(title) = self.titles.pop_front() {
+                    self.title = title;
+                }
+                Ok(ok(&format!(
+                    "OK {}\n",
+                    self.title.as_deref().unwrap_or_default()
+                )))
             }
             "help" if tail.first() == Some(&"send") && self.help_send.is_some() => {
                 Ok(ok(&self.help_send.clone().unwrap_or_default()))
@@ -3325,6 +3490,364 @@ fn a_read_still_open_after_the_rereads_is_output_arriving() {
     );
 }
 
+/// An idle read with no evidence is no point until it has stood (I1 of
+/// `docs/measured/idle-no-evidence-2026-10-22.md`). MEASURED: Muse Code 1.4.10's status row
+/// still bare after its glyph cycled (`◈ Thinking`), read idle with no evidence under its
+/// composer. Read once and the turn runs on: the turn's end decides. One that stands is the
+/// point NO_EVIDENCE_HOLD after its first read, whether it holds still, animates, or changes
+/// just before the hold ends and then animates (a settle latched at 0.99 s, the next running to
+/// its cap: 2.49 s before each settle was capped). NEGATIVE CONTROL: an end with evidence is the
+/// point at its one read. MUTANTS: the hold never taken; a hold that never ends; a hold not ended
+/// by a busy read; the settles not capped.
+#[test]
+fn an_idle_read_with_no_evidence_is_no_point_until_it_holds_still() {
+    use aterm_phase::muse::fixtures as u;
+    use aterm_phase::prompt::fixtures::screen;
+    let cycled = screen(u::BUSY_FIRST_FRAME_CYCLED);
+    let busy = screen(u::BUSY_1_4_10);
+    let end = screen(u::END_OF_TURN_1_4_10);
+    let reader = aterm_phase::Program::Muse.reader();
+    assert_eq!(reader.phase(&cycled), Phase::Idle);
+    assert!(
+        !reader.phase_authoritative(&cycled, &Phase::Idle),
+        "no evidence"
+    );
+    assert_eq!(reader.phase(&busy), Phase::Busy);
+    assert!(
+        reader.phase_authoritative(&end, &Phase::Idle),
+        "the end is evidence"
+    );
+    // The turn as read, the requests, and the time from the first read to the point.
+    // `await gone` judged on the screen to come, as the server does: a busy screen after a busy
+    // one holds the wait its whole step.
+    let run_idle = |screens: Vec<Vec<String>>, idle_after: &[Duration]| {
+        let mut m = Mock::new(screens);
+        m.gone_on_next = true;
+        m.stall_sleep = Some(Duration::from_secs(60));
+        m.idle_after = idle_after.iter().copied().collect();
+        let clock = virtual_clock();
+        m.run_on(&clock);
+        let mut s = session(&mut m, None);
+        s.set_fx(Fx::over(ClockSource::Scripted(Arc::clone(&clock))));
+        let started = s.fx.mono();
+        let t = s.await_turn(Duration::from_secs(60)).expect("turn");
+        let took = s.fx.since(started);
+        (t, m.requests, took)
+    };
+    let run = |screens: Vec<Vec<String>>| run_idle(screens, &[]);
+    // The request after the first read: the short settle where that read was held.
+    let after_first_read = |requests: &[String]| {
+        let first = requests
+            .iter()
+            .position(|r| r.starts_with("text"))
+            .expect("a read");
+        requests.get(first + 1).cloned().unwrap_or_default()
+    };
+    let (t, requests, _) = run(vec![cycled.clone(), busy.clone(), end.clone()]);
+    assert_eq!(
+        (t.phase, &t.screen.rows),
+        (Phase::Idle, &end),
+        "the turn's end decides: {requests:#?}"
+    );
+    assert!(
+        after_first_read(&requests).starts_with("await idle 500"),
+        "{requests:#?}"
+    );
+    // A busy read between two such readings ends the first: the second's hold starts afresh,
+    // though the busy reads between stood longer than the hold.
+    let (t, requests, took) = run(vec![
+        cycled.clone(),
+        busy.clone(),
+        busy.clone(),
+        busy,
+        cycled.clone(),
+        end.clone(),
+    ]);
+    assert_eq!(
+        (t.phase, &t.screen.rows),
+        (Phase::Idle, &end),
+        "the turn's end decides: {requests:#?}"
+    );
+    assert!(took > NO_EVIDENCE_HOLD * 2, "{took:?} {requests:#?}");
+    // The same reading standing is the point once it stood the hold.
+    let (t, requests, took) = run(vec![cycled.clone()]);
+    assert_eq!(t.phase, Phase::Idle, "{requests:#?}");
+    assert!(
+        cycled.ends_with(&t.screen.rows),
+        "the frame read (its tail): {requests:#?}"
+    );
+    let told = NO_EVIDENCE_HOLD..NO_EVIDENCE_HOLD + Duration::from_millis(20);
+    assert!(told.contains(&took), "{took:?} {requests:#?}");
+    let reads = requests.iter().filter(|r| r.starts_with("text")).count();
+    assert!(reads >= 2, "read again before it is taken: {requests:#?}");
+    // Told as the hold ends, however the settles between go: a screen that holds still (each
+    // settle latching at 0.5 s), one that animates (none latching), and one that changed 0.49 s
+    // into the first settle (latching at 0.99 s) and then animates.
+    let never = Duration::from_secs(10);
+    for (idle_after, reads_then) in [
+        (
+            vec![Duration::from_millis(500), Duration::from_millis(500)],
+            3,
+        ),
+        (vec![never], 2),
+        (vec![Duration::from_millis(990), never], 3),
+    ] {
+        let (t, requests, took) = run_idle(vec![cycled.clone()], &idle_after);
+        assert_eq!(t.phase, Phase::Idle, "{idle_after:?}: {requests:#?}");
+        assert!(
+            told.contains(&took),
+            "{idle_after:?}: {took:?} {requests:#?}"
+        );
+        let reads = requests.iter().filter(|r| r.starts_with("text")).count();
+        assert_eq!(reads, reads_then, "{idle_after:?}: {requests:#?}");
+    }
+    // NEGATIVE CONTROL: an end with evidence, at its first read.
+    let (t, requests, _) = run(vec![end.clone()]);
+    assert_eq!(
+        (t.phase, &t.screen.rows),
+        (Phase::Idle, &end),
+        "{requests:#?}"
+    );
+    let reads = requests.iter().filter(|r| r.starts_with("text")).count();
+    assert_eq!(reads, 1, "{requests:#?}");
+}
+
+/// Muse Code's end under its running title is held until the title rests (I2 of
+/// `docs/measured/idle-no-evidence-2026-10-22.md`). MEASURED: after the reply Muse Code 1.4.10
+/// runs its end-of-turn review (0.5 to 4.4 s measured) with the reply's end whole and nothing
+/// else moving; only its title's spinner (`⠙ proj`, `⠹ proj`, …) says the run goes on, and the
+/// title rests (`proj`) at the run's end. The read is held, one `title` read each, until the
+/// title rests, and so under a pinned title (a hold that read `status`'s `subject=` never held a
+/// pinned tab, `ie-fb`). NEGATIVE CONTROLS: a resting title and no title are the point at the
+/// first read; Claude Code's reader asks none. A title that never rests is held TITLE_HOLD.
+/// MUTANTS: no hold; a hold with no cap; the pinned subject read.
+#[test]
+fn a_muse_end_under_its_running_title_is_held_until_the_title_rests() {
+    use aterm_phase::muse::fixtures as u;
+    use aterm_phase::prompt::fixtures::screen;
+    let end = screen(u::END_OF_TURN_1_4_10);
+    let run_pinned = |rows: &[String], titles: &[Option<&str>], pinned: Option<&str>| {
+        let mut m = Mock::new(vec![rows.to_vec()]);
+        m.titles = titles.iter().map(|t| t.map(str::to_string)).collect();
+        m.pinned = pinned.map(str::to_string);
+        let clock = virtual_clock();
+        m.run_on(&clock);
+        let mut s = session(&mut m, None);
+        s.set_fx(Fx::over(ClockSource::Scripted(Arc::clone(&clock))));
+        let started = s.fx.mono();
+        let t = s.await_turn(Duration::from_secs(300)).expect("turn");
+        let took = s.fx.since(started);
+        drop(s);
+        let unread = m.titles.len();
+        (t, m.requests, took, unread)
+    };
+    let run = |rows: &[String], titles: &[Option<&str>]| {
+        let (t, requests, took, _) = run_pinned(rows, titles, None);
+        (t, requests, took)
+    };
+    // Reads of a title, by either verb that can tell one.
+    let reads = |r: &[String]| r.iter().filter(|r| *r == "title" || *r == "status").count();
+    let turning = [Some("⠙ proj"), Some("⠹ proj"), Some("⠸ proj"), Some("proj")];
+    for pinned in [None, Some("land-d")] {
+        let (t, requests, _, unread) = run_pinned(&end, &turning, pinned);
+        assert_eq!(
+            (t.phase, &t.screen.rows, t.timed_out),
+            (Phase::Idle, &end, false),
+            "{pinned:?}"
+        );
+        // Told once the title rested, not before: every title of the run read.
+        assert_eq!(unread, 0, "{pinned:?}: {requests:#?}");
+        assert_eq!(reads(&requests), 4, "{pinned:?}: {requests:#?}");
+        let first = requests
+            .iter()
+            .position(|r| r == "title" || r == "status")
+            .expect("a read of the title");
+        assert!(
+            requests[first..]
+                .iter()
+                .filter(|r| r.starts_with("await idle 500"))
+                .count()
+                >= 3,
+            "each held read waits the short settle: {pinned:?}: {requests:#?}"
+        );
+    }
+    // NEGATIVE CONTROLS.
+    for titles in [[Some("proj")], [None]] {
+        let (t, requests, _) = run(&end, &titles);
+        assert_eq!((t.phase, &t.screen.rows), (Phase::Idle, &end), "{titles:?}");
+        assert_eq!(reads(&requests), 1, "{titles:?}: {requests:#?}");
+    }
+    let claude = idle_screen();
+    let (t, requests, _) = run(&claude, &[Some("⠙ proj")]);
+    assert_eq!(t.phase, Phase::Idle);
+    assert_eq!(reads(&requests), 0, "{requests:#?}");
+    // The hang detector: a title that never rests.
+    let (t, requests, took) = run(&end, &[Some("⠙ proj")]);
+    assert_eq!(
+        (t.phase, &t.screen.rows, t.timed_out),
+        (Phase::Idle, &end, false)
+    );
+    assert!(reads(&requests) > 4, "{requests:#?}");
+    assert!(
+        took >= TITLE_HOLD && took < TITLE_HOLD + Duration::from_secs(5),
+        "{took:?}"
+    );
+}
+
+/// The title hold's run under one held end, counted for the screens and titles it serves.
+struct TitleRun {
+    turn: Turn,
+    requests: Vec<String>,
+    took: Duration,
+    unread: usize,
+    noted: Vec<String>,
+}
+
+#[derive(Default)]
+struct Noted(Vec<String>);
+
+impl Review for Noted {
+    fn approved(&mut self, _seq: u64, _command: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn review(&mut self, _turn: &Turn) -> Result<bool, String> {
+        Ok(false)
+    }
+    fn say(&mut self, _line: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn note(&mut self, line: &str) {
+        self.0.push(line.to_string());
+    }
+    fn unattended(&self) -> bool {
+        false
+    }
+}
+
+fn title_run(screens: Vec<Vec<String>>, titles: &[&str], refused: bool) -> TitleRun {
+    let mut m = Mock::new(screens);
+    m.gone_on_next = true;
+    m.stall_sleep = Some(Duration::from_secs(60));
+    m.titles = titles.iter().map(|t| Some((*t).to_string())).collect();
+    m.title_refused = refused;
+    let clock = virtual_clock();
+    m.run_on(&clock);
+    let mut s = session(&mut m, None);
+    s.set_fx(Fx::over(ClockSource::Scripted(Arc::clone(&clock))));
+    let started = s.fx.mono();
+    let mut noted = Noted::default();
+    let turn = s
+        .await_turn_from(
+            Duration::from_secs(600),
+            true,
+            &mut Saw::default(),
+            None,
+            None,
+            &mut noted,
+        )
+        .expect("turn");
+    let took = s.fx.since(started);
+    drop(s);
+    TitleRun {
+        turn,
+        requests: m.requests,
+        took,
+        unread: m.titles.len(),
+        noted: noted.0,
+    }
+}
+
+fn title_reads(requests: &[String]) -> usize {
+    requests.iter().filter(|r| *r == "title").count()
+}
+
+/// The title hold's hang detector counts from the hold now running: a busy read ends a hold. A
+/// turn whose first end-of-turn review was held, then worked on past TITLE_HOLD (Muse Code's
+/// `◆ Double checking` going on into more work), is held again at its next review until the
+/// title rests: every title read and nothing noted. NEGATIVE CONTROL: the same turn with no busy
+/// spell between holds the one end until the title rests. MUTANT: a hold a busy read does not
+/// end takes the second review's pause as the end at its first read, its titles unread.
+#[test]
+fn a_title_hold_is_counted_from_the_review_it_holds() {
+    use aterm_phase::muse::fixtures as u;
+    use aterm_phase::prompt::fixtures::screen;
+    let end = screen(u::END_OF_TURN_1_4_10);
+    let busy = screen(u::BUSY_1_4_10);
+    let turning = ["⠙ proj", "⠹ proj", "⠸ proj", "proj"];
+    let mut screens = vec![end.clone()];
+    screens.extend(std::iter::repeat_n(busy, 40));
+    screens.push(end.clone());
+    let r = title_run(screens, &turning, false);
+    assert_eq!(
+        (r.turn.phase, &r.turn.screen.rows, r.turn.timed_out),
+        (Phase::Idle, &end, false),
+        "{:#?}",
+        r.requests
+    );
+    assert!(r.took > TITLE_HOLD, "{:?}", r.took);
+    assert_eq!(
+        (r.unread, title_reads(&r.requests)),
+        (0, 4),
+        "{:#?}",
+        r.requests
+    );
+    assert!(r.noted.is_empty(), "{:#?}", r.noted);
+    // NEGATIVE CONTROL.
+    let r = title_run(vec![end.clone()], &turning, false);
+    assert_eq!(
+        (r.turn.phase, r.unread, title_reads(&r.requests)),
+        (Phase::Idle, 0, 4)
+    );
+}
+
+/// What the title hold holds, what it reads as no run, and what it notes (I2 of
+/// `docs/measured/idle-no-evidence-2026-10-22.md`). MEASURED: Muse Code 1.4.10's reply that ends
+/// on a question (`Which do you prefer (1 or 2)?`), read as a question: under a running title it
+/// is held as an idle end is, so no answer is typed into the review. A `title` the host refuses
+/// says no run: the end is told at its first read. A title still turning TITLE_HOLD into the
+/// hold lets the end be taken with one NOTE; a title that rests notes nothing. MUTANTS: a hold of
+/// idle reads alone takes the question in the review; a refused read taken as a running title
+/// holds the end TITLE_HOLD; the NOTE never written.
+#[test]
+fn a_title_hold_holds_a_question_and_notes_its_hang() {
+    use aterm_phase::muse::fixtures as u;
+    use aterm_phase::prompt::fixtures::screen;
+    let asks = screen(u::REPLY_WRAPPED_50_1_4_10);
+    let end = screen(u::END_OF_TURN_1_4_10);
+    assert_eq!(
+        aterm_phase::Program::Muse.reader().phase(&asks),
+        Phase::Question
+    );
+    let r = title_run(vec![asks.clone()], &["⠙ proj", "⠹ proj", "proj"], false);
+    assert_eq!(
+        (r.turn.phase, &r.turn.screen.rows),
+        (Phase::Question, &asks)
+    );
+    assert_eq!(
+        (r.unread, title_reads(&r.requests)),
+        (0, 3),
+        "{:#?}",
+        r.requests
+    );
+    // A refused title: no run, the end at its first read.
+    let r = title_run(vec![end.clone()], &["⠙ proj"], true);
+    assert_eq!((r.turn.phase, &r.turn.screen.rows), (Phase::Idle, &end));
+    assert_eq!(title_reads(&r.requests), 1, "{:#?}", r.requests);
+    assert!(r.took < Duration::from_secs(1), "{:?}", r.took);
+    // The hang detector's NOTE, once; none where the title rests.
+    let r = title_run(vec![end.clone()], &["⠙ proj"], false);
+    assert_eq!((r.turn.phase, r.turn.timed_out), (Phase::Idle, false));
+    assert!(r.took >= TITLE_HOLD, "{:?}", r.took);
+    assert_eq!(r.noted.len(), 1, "{:#?}", r.noted);
+    assert!(
+        r.noted[0].contains("title still said its run goes on 60 s into the hold"),
+        "{:#?}",
+        r.noted
+    );
+    let r = title_run(vec![end], &["⠙ proj", "proj"], false);
+    assert!(r.noted.is_empty(), "{:#?}", r.noted);
+}
+
 struct MarkFake {
     sent: Vec<String>,
     reply: CtlReply,
@@ -3339,7 +3862,7 @@ impl Ctl for MarkFake {
 
 #[test]
 fn a_refused_act_mark_latches_the_rest_off() {
-    let first = "@s-1 mark - act word=approve rule=read-only.classify-v5";
+    let first = "@s-1 mark - act word=approve rule=read-only.classify-v6";
     for (err, latched) in [
         ("ERR unknown verb 'mark' (help lists them)", true),
         ("ERR usage: mark <node|-> <kind> [word=<w>] …", true),
@@ -3356,7 +3879,7 @@ fn a_refused_act_mark_latches_the_rest_off() {
         };
         let mut s = Session::new(&mut fake, Some("@s-1".to_string()));
         s.act_marks
-            .queue("act word=approve rule=read-only.classify-v5".to_string());
+            .queue("act word=approve rule=read-only.classify-v6".to_string());
         s.act_marks.queue("act word=escalate".to_string());
         s.send_act_marks();
         s.act_marks.queue("act word=deny rule=write.v1".to_string());
@@ -3408,7 +3931,7 @@ fn supervise_auto_approves_reads_guarded_and_hands_over_writes() {
             "@s-9 key if-human=7 if-gen=1.101 if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
             "@s-9 await seq 101 timeout 20000",
             "@s-9 text --json tail=40",
-            "@s-9 mark - act word=approve rule=read-only.classify-v5",
+            "@s-9 mark - act word=approve rule=read-only.classify-v6",
             "@s-9 await idle 500 timeout 1500",
             "@s-9 text --json tail=40",
             "@s-9 status",
@@ -3559,7 +4082,7 @@ fn the_same_box_is_never_pressed_twice_on_an_unchanged_screen() {
             "key if-human=7 if-gen=1.101 if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
             "await seq 101 timeout 20000",
             "text --json tail=40",
-            "mark - act word=approve rule=read-only.classify-v5",
+            "mark - act word=approve rule=read-only.classify-v6",
         ],
         "{:?}",
         m.requests
@@ -3999,6 +4522,103 @@ fn render_prompt_prints_the_notes_after_the_description_and_before_classify() {
     assert!(!out.contains("\nnote "), "{out}");
 }
 
+/// A box's `classify` word (the EVENT line's `classify=`, the phase lines'
+/// `classify`) is the read-only rule's verdict over every reading of the
+/// box's rows ([`readings_read_only`]), not the classifier's word on the
+/// joined command: the MEASURED 2.1.307 too-many box (`echo` and 65
+/// `$(true)` wrapped into barred rows), whose joined command the classifier
+/// reads as a read, is `not-read-only` on its newline reading; a one-row
+/// `echo \  #; tee x` (a read to the classifier, a `tee x` write under the
+/// blank the screen cannot show) is `not-read-only` as not read as drawn.
+///
+/// NEGATIVE CONTROL: the one-row `git log --oneline -5` box says
+/// `read-only` on both lines.
+#[test]
+fn a_boxs_classify_word_is_the_read_only_rules_verdict_on_its_readings() {
+    use crate::supervise::classify::classify_command;
+    let turn_for = |rows: Vec<String>| Turn {
+        phase: worker_phase(&rows),
+        screen: Screen {
+            rows,
+            ..Screen::default()
+        },
+        timed_out: false,
+    };
+    let mut too_many = aterm_phase::prompt::fixtures::screen(
+        aterm_phase::prompt::fixtures::BOX_RM_TOO_MANY_NO_RM_2_1_307,
+    );
+    too_many.extend(composer("  ? for shortcuts"));
+    let tee: Vec<String> = bash_one_row()
+        .into_iter()
+        .map(|r| {
+            if r == "   git log --oneline -5" {
+                "   echo \\  #; tee x".to_string()
+            } else {
+                r
+            }
+        })
+        .collect();
+    for (rows, why) in [
+        (too_many, "not read-only (newline reading): "),
+        (tee, "not read as drawn ("),
+    ] {
+        let turn = turn_for(rows);
+        assert_eq!(turn.phase, Phase::Prompt);
+        let p = by_screen(&turn).prompt(&turn.screen.rows).expect("the box");
+        assert!(classify_command(&p.command).read_only, "{}", p.command);
+        let event = event_line(&turn, &[]);
+        assert!(
+            event.contains(&format!(" kind=bash classify=not-read-only:{why}")),
+            "{event}"
+        );
+        let out = render_phase(&turn, by_screen(&turn), &[]);
+        assert!(
+            out.contains(&format!("\nclassify not-read-only {why}")),
+            "{out}"
+        );
+    }
+    // NEGATIVE CONTROL
+    let turn = turn_for(bash_one_row());
+    let event = event_line(&turn, &[]);
+    assert!(
+        event.contains(" kind=bash classify=read-only command=git log"),
+        "{event}"
+    );
+    let out = render_phase(&turn, by_screen(&turn), &[]);
+    assert!(out.contains("\nclassify read-only\n"), "{out}");
+}
+
+/// A Bash box whose rows were not read whole (the box parsed, its v2 rows
+/// not: no verdict) is never called read-only on the phase lines: `classify
+/// not-read-only the box's command was not read whole`.
+///
+/// NEGATIVE CONTROL: the same prompt with the rule's `Ok` verdict says
+/// `classify read-only`, and a box of another kind says no `classify`.
+#[test]
+fn a_bash_box_not_read_whole_is_never_called_read_only() {
+    let bash = Prompt {
+        kind: PromptKind::Bash,
+        command: "git log --oneline -5".to_string(),
+        description: String::new(),
+        notes: Vec::new(),
+        options: vec![(1, "Yes".to_string()), (2, "No".to_string())],
+    };
+    let out = render_prompt(&bash, None, None);
+    assert!(
+        out.contains("\nclassify not-read-only the box's command was not read whole\n"),
+        "{out}"
+    );
+    assert!(!out.contains("classify read-only"), "{out}");
+    // NEGATIVE CONTROL
+    let out = render_prompt(&bash, None, Some(Ok(())));
+    assert!(out.contains("\nclassify read-only\n"), "{out}");
+    let other = Prompt {
+        kind: PromptKind::Other,
+        ..bash
+    };
+    assert!(!render_prompt(&other, None, None).contains("classify"));
+}
+
 #[test]
 fn drive_phase_names_agy_and_muse_background_work() {
     use aterm_phase::agy::fixtures::lab as a;
@@ -4402,7 +5022,7 @@ fn nothing_happens_after_the_budget() {
     assert_eq!(m.requests.len(), 9, "nothing read after: {:?}", m.requests);
     assert_eq!(
         m.requests.last().map(String::as_str),
-        Some("mark - act word=approve rule=read-only.classify-v5")
+        Some("mark - act word=approve rule=read-only.classify-v6")
     );
 }
 
@@ -5489,7 +6109,8 @@ fn a_jump_of_30_points_is_a_compaction_and_a_box_is_not() {
         lines,
         [
             "EVENT context seq=101 9% until auto-compact",
-            "EVENT prompt seq=102 kind=bash classify=not-read-only:rm command=rm -rf target",
+            "EVENT prompt seq=102 kind=bash classify=not-read-only:not read-only (space reading): rm \
+             command=rm -rf target",
             "EVENT compacted seq=105",
             "EVENT idle seq=106 ⏺ Pushed.",
             "EXIT session gone (await seq 106 failed: aterm-ctl: ERR exited)",
@@ -8371,6 +8992,13 @@ mod engine {
     mod box_key {
         use super::*;
         include!("run_box_key_tests.rs");
+    }
+    /// A hold never runs a box into the vendor's auto-deny
+    /// (`run_box_hold_tests.rs`, `DENY_MARGIN`), over this module's box
+    /// helpers, with its Tier-1 bind to `SupervisorBoxHold`.
+    mod box_hold {
+        use super::*;
+        include!("run_box_hold_tests.rs");
     }
 }
 

@@ -1,57 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Who holds a draft journal, and the two ways a journal nobody holds leaves
-//! `drafts/`: its last holder's release, and the launch sweep
-//! (`docs/NATIVE_TAB_APPS_DESIGN.md` §5.11).
-//!
-//! THE OWNER IDENTITY. Every process with a journal store is an OWNER: a random
-//! id whose lease (`drafts/.owners/<id>.lease`) it holds locked for its whole
-//! life, so the lease is acquirable exactly when the owner is gone, crashed or
-//! not. Every image this process publishes carries, on the file itself (an
-//! extended attribute on unix, an alternate data stream on Windows:
-//! [`OWNERS_MARK`]), the set of owners that hold it, bound to the image's
-//! bytes: the publisher, plus — only when the image it replaces held these same
-//! bytes — that image's live owners, because a process appends to an image only
-//! while its bytes are the ones it last made durable (every write preflights the
-//! exact fingerprint). A re-seat that finds its own bytes still there joins
-//! their set ([`adopt`]). So every live process that can write an image is
-//! named on it. A publication whose holders cannot all be named (it replaces
-//! these same bytes under no set, or its store has no owner) is marked
-//! [`UNKNOWN_HOLDERS`], and a mark bound to other bytes names nobody: neither is
-//! ever taken.
-//!
-//! A RELEASE ([`settle_releases`]). A process that lets a document go (§5.10)
-//! no longer writes its journal, so it leaves the image's owner set; an image
-//! that then names no live owner and holds no draft goes at once, with its lock
-//! file. A released document's image is opened on the event loop, where its
-//! document was let go, and settled off it: a later open of the same file in
-//! this process republishes a new file, which the settle (pinned to the file it
-//! opened) never touches.
-//!
-//! THE SWEEP ([`sweep_unheld_journals`], at launch, on a background thread)
-//! removes a keyed image only when all of these hold, the last two re-checked
-//! under the journal lock against the very file it read:
-//! - it carries an owner set bound to its bytes — an image without one was
-//!   written by an aterm from before this identity (which names nobody) and is
-//!   never swept;
-//! - every owner on it is gone (its lease acquirable, or removed by a sweep that
-//!   acquired it);
-//! - it holds no draft ([`super::holds_no_draft`]): the file as opened or last
-//!   saved, nothing the file did not once hold.
-//!
-//! So neither ever takes an image a live process holds — a process stays named
-//! on every image it can still write, Suspended documents' included, until it
-//! releases that document or exits — and never an unsaved draft. A preserved
-//! copy, a legacy journal and an image that does not decode are never touched.
-//! A clean image taken between an open's inspection and its initialization
-//! changes nothing that open decided: `initialize` publishes over its absence
-//! ([`super::JournalOpenDecision`]). Both unlink a journal's lock file only
-//! while holding it, and every taker of a journal lock proves, once it holds
-//! it, that the lock's name still names the file it locked (`with_journal_lock`).
-//!
-//! Unix and Windows. Elsewhere the parent's stub marks nothing, so nothing is
-//! taken.
+//! Who holds a draft journal, and the two ways a journal nobody holds leaves `drafts/`: its last holder's release, and the launch sweep (`docs/NATIVE_TAB_APPS_DESIGN.md` §5.11).
 
 use std::collections::BTreeSet;
 use std::fs::{self, File};
@@ -67,9 +17,7 @@ use crate::native_document_io::parse_hex16;
 /// The directory beside the journals that holds every owner's lease.
 const OWNERS_DIR: &str = ".owners";
 
-/// At most this many owners on one image. A set past it (more live processes
-/// than ever share one document) is not written, so that image is marked
-/// [`UNKNOWN_HOLDERS`] and never taken: dropping an owner would let it go.
+/// At most this many owners on one image.
 const MAX_OWNERS: usize = 32;
 
 /// The mark naming an image's owners: `<the image's fingerprint>:<id>,<id>…`,
@@ -82,15 +30,12 @@ const OWNERS_MARK: &std::ffi::CStr = c"user.aterm.draft-owners";
 const OWNERS_MARK: &str = "com.aterm.draft-owners";
 
 /// The mark of a publication whose holders cannot all be named: never taken.
-/// Written, not left off, because a Windows replace keeps a replaced file's
-/// streams where the replacement has none.
 const UNKNOWN_HOLDERS: &[u8] = b"?";
 
 /// Room for a fingerprint and [`MAX_OWNERS`] ids, with their separators.
 const MARK_CAPACITY: usize = 17 + MAX_OWNERS * 17;
 
-/// This process's lease as a journal owner, held (locked) for as long as the
-/// host lives — in production, the process's life.
+/// This process's lease as a journal owner, held (locked) for as long as the host lives — in production, the process's life.
 #[derive(Debug)]
 pub(crate) struct JournalOwner {
     id: JournalOwnerId,
@@ -103,10 +48,7 @@ impl JournalOwner {
     }
 }
 
-/// Take a fresh owner identity under `root`: a lease file created exclusively,
-/// locked, and proved still linked at its name — a sweep that probed it between
-/// the create and the lock (and so took it for a dead owner's) unlinks it, and
-/// then another id is tried. Nothing names an id before this returns it.
+/// Take a fresh owner identity under `root`: a lease file created exclusively, locked, and proved still linked at its name — a sweep that probed it between the create and the lock (and so took it for a dead owner's) unlinks it, and then another id is tried.
 pub(crate) fn establish(root: &Path) -> Result<JournalOwner, String> {
     let dir = root.join(OWNERS_DIR);
     super::create_private_dir(&dir).map_err(|error| format!("journal owners: {error}"))?;
@@ -149,15 +91,12 @@ fn owners_dir_of(image: &Path) -> Option<PathBuf> {
 }
 
 /// Whether owner `id` is still running: its lease exists and someone holds it.
-/// Anything this cannot tell (an unreadable lease, a lock that errs) counts as
-/// alive, which only keeps an image.
 fn owner_alive(owners: &Path, id: JournalOwnerId) -> bool {
     let lease = match sys::open_regular(&owners.join(id.lease_name())) {
         Ok(lease) => lease,
         Err(error) => return error.kind() != std::io::ErrorKind::NotFound,
     };
     match crate::native_document_host::HeldAdvisoryLock::try_lock(lease) {
-        // Released by `LOCK_UN` as the guard drops, here.
         Ok(_probe) => false,
         Err(_) => true,
     }
@@ -167,7 +106,7 @@ fn owner_alive(owners: &Path, id: JournalOwnerId) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum OwnerMark {
     /// No owner set: written by an aterm from before owner identity, or marked
-    /// [`UNKNOWN_HOLDERS`]. Holders unknown: never taken.
+    /// [`UNKNOWN_HOLDERS`].
     Unmarked,
     /// The owners of the image whose bytes have this fingerprint.
     Owners(ContentFingerprint, BTreeSet<JournalOwnerId>),
@@ -236,8 +175,7 @@ fn read_mark(path: &Path, file: &File) -> OwnerMark {
 }
 
 /// Write `owners` of the image whose bytes are `image` onto `file`, which
-/// `path` names. A refusal (a volume without extended attributes or streams)
-/// leaves the mark it had.
+/// `path` names.
 fn write_mark(
     path: &Path,
     file: &File,
@@ -253,8 +191,7 @@ fn write_mark(
 /// observed as `expected`, under the journal lock), held by `owner` — and, when
 /// the image it replaces already holds exactly these bytes, by that image's
 /// live owners too: any of them may be appending to these bytes, so the claim
-/// carries over. An image of the same bytes whose holders cannot be named
-/// leaves this publication's unknown too, as does a store with no owner.
+/// carries over.
 fn publication_mark(
     path: &Path,
     expected: JournalImageGeneration,
@@ -281,10 +218,7 @@ fn publication_mark(
     format_mark(bytes, &owners).unwrap_or_else(|| UNKNOWN_HOLDERS.to_vec())
 }
 
-/// Mark `temporary` (at `temporary_path`), about to be published over `path`,
-/// with [`publication_mark`], and return that mark for
-/// [`confirm_publication`]. A temporary that cannot be marked publishes
-/// unmarked on unix (a new file has no attribute).
+/// Mark `temporary` (at `temporary_path`), about to be published over `path`, with [`publication_mark`], and return that mark for [`confirm_publication`].
 pub(super) fn mark_publication(
     temporary: &File,
     temporary_path: &Path,
@@ -300,13 +234,7 @@ pub(super) fn mark_publication(
     mark
 }
 
-/// `path` was just published from a temporary marked `mark`, under the
-/// journal lock: make the image carry exactly that mark. A unix rename moves
-/// the temporary's own file, attribute and all, so there is nothing to do; a
-/// Windows `ReplaceFileW` keeps the replaced file's streams where the
-/// replacement has none (a temporary that could not be marked), so the mark is
-/// read back and written again where it differs, and dropped where it cannot
-/// be (an unmarked image is never taken).
+/// `path` was just published from a temporary marked `mark`, under the journal lock: make the image carry exactly that mark.
 pub(super) fn confirm_publication(path: &Path, mark: &[u8]) {
     #[cfg(windows)]
     {
@@ -326,10 +254,7 @@ pub(super) fn confirm_publication(path: &Path, mark: &[u8]) {
     let _ = (path, mark);
 }
 
-/// A re-seat found the image it last published (bytes `image`) still in place:
-/// join its owner set, so the image names this process even when another wrote
-/// these same bytes since. An image whose holders are unknown stays so. Under
-/// the journal lock.
+/// A re-seat found the image it last published (bytes `image`) still in place: join its owner set, so the image names this process even when another wrote these same bytes since.
 pub(super) fn adopt(path: &Path, image: ContentFingerprint, owner: Option<JournalOwnerId>) {
     let (Some(owner), Some(owners_dir)) = (owner, owners_dir_of(path)) else {
         return;
@@ -347,15 +272,11 @@ pub(super) fn adopt(path: &Path, image: ContentFingerprint, owner: Option<Journa
     owners.insert(owner);
     if let Err(error) = write_mark(path, &file, image, &owners) {
         aterm_log::debug!("draft journal owner set not joined: {error}");
-        // Unnamed, this process could lose an image it writes: unknown instead.
         let _ = sys::write_mark(path, &file, UNKNOWN_HOLDERS);
     }
 }
 
-/// A keyed journal a release or a sweep may take, as one look found it: its
-/// open file, which pins it, and the stamp that look read. The decision is made
-/// under the journal lock only while the name still names that very file,
-/// unmodified ([`Self::settle`]).
+/// A keyed journal a release or a sweep may take, as one look found it: its open file, which pins it, and the stamp that look read.
 pub(super) struct Candidate {
     path: PathBuf,
     key: JournalDocumentKey,
@@ -376,7 +297,7 @@ impl Candidate {
     }
 
     /// The fingerprint of its bytes, and whether they decode to a journal that
-    /// holds no draft. Reads the open file, once.
+    /// holds no draft.
     fn read_image(&self) -> Option<(ContentFingerprint, bool)> {
         use std::io::Read as _;
 
@@ -392,9 +313,7 @@ impl Candidate {
     /// Under the journal lock, on the very file read (bytes `image`, `clean`
     /// when they hold no draft): take `leaving` off its owner set, then remove
     /// it with its lock file when it is clean and every owner left on it is
-    /// gone; otherwise write the smaller set. Nothing when the name no longer
-    /// names that file unmodified, or its mark does not name these bytes (or
-    /// `leaving`). Whether it was removed.
+    /// gone; otherwise write the smaller set.
     fn settle(
         self,
         owners: &Path,
@@ -419,11 +338,8 @@ impl Candidate {
                 return Ok(false);
             }
             if clean && set.iter().all(|id| !owner_alive(owners, *id)) {
-                // Closed first: Windows keeps a file a handle still holds.
                 drop(file);
                 fs::remove_file(&path).map_err(|error| error.to_string())?;
-                // Held, so any writer that waits on it finds, once it holds
-                // it, that the name is gone, and opens it afresh.
                 let _ = fs::remove_file(journal_lock_path(&path)?);
                 return Ok(true);
             }
@@ -437,16 +353,12 @@ impl Candidate {
     }
 }
 
-/// This process let go of the document whose journal is at `path`
-/// (`DocumentJournalStore::forget`): open that image as it is now, on the
-/// event loop (one open and one stat), for [`settle_releases`].
+/// This process let go of the document whose journal is at `path` (`DocumentJournalStore::forget`): open that image as it is now, on the event loop (one open and one stat), for [`settle_releases`].
 pub(super) fn released(path: PathBuf, key: JournalDocumentKey) -> Option<Candidate> {
     Candidate::open(path, key)
 }
 
-/// Settle every journal `owner` let go of ([`Candidate::settle`], leaving
-/// its owner set): on a background thread, which reads each image once; inline
-/// in tests.
+/// Settle every journal `owner` let go of ([`Candidate::settle`], leaving its owner set): on a background thread, which reads each image once; inline in tests.
 pub(super) fn settle_releases(owner: JournalOwnerId, released: Vec<Candidate>) {
     let settle = move || {
         for candidate in released {
@@ -463,7 +375,6 @@ pub(super) fn settle_releases(owner: JournalOwnerId, released: Vec<Candidate>) {
     #[cfg(not(test))]
     if let Err(error) = crate::qos::spawn_lane_thread(
         "aterm-journal-release",
-        // Not `Housekeeping`: it takes journal locks an open contends for.
         crate::qos::Role::Background,
         settle,
     ) {
@@ -478,21 +389,17 @@ pub(crate) struct JournalSweep {
     pub(crate) removed: usize,
     /// Keyed journals kept: held, unsaved, unmarked or unreadable.
     pub(crate) kept: usize,
-    /// Leftovers of writers that are gone: a lock file whose journal is gone, a
-    /// publication's temporary.
+    /// Leftovers of writers that are gone: a lock file whose journal is gone, a publication's temporary.
     pub(crate) leftovers: usize,
     /// Leases of owners that are gone.
     pub(crate) dead_owners: usize,
 }
 
-/// Start [`sweep_unheld_journals`] over `root` on a background thread: no
-/// window or open waits on it, and each journal it takes is one no live process
-/// holds.
+/// Start [`sweep_unheld_journals`] over `root` on a background thread: no window or open waits on it, and each journal it takes is one no live process holds.
 #[cfg(not(test))]
 pub(crate) fn spawn_launch_sweep(root: PathBuf) {
     let spawned = crate::qos::spawn_lane_thread(
         "aterm-journal-sweep",
-        // Not `Housekeeping`: it takes journal locks an open contends for.
         crate::qos::Role::Background,
         move || {
             let sweep = sweep_unheld_journals(&root);
@@ -506,11 +413,7 @@ pub(crate) fn spawn_launch_sweep(root: PathBuf) {
     }
 }
 
-/// The launch sweep (module docs): every keyed journal in `root` that carries
-/// an owner set, whose owners are all gone and that holds no draft is removed
-/// with its lock file; then the leftovers of writers that are gone, and the
-/// leases of owners that are gone. Never a preserved copy, a legacy journal, a
-/// draft, or an image whose holders it cannot name.
+/// The launch sweep (module docs): every keyed journal in `root` that carries an owner set, whose owners are all gone and that holds no draft is removed with its lock file; then the leftovers of writers that are gone, and the leases of owners that are gone.
 pub(crate) fn sweep_unheld_journals(root: &Path) -> JournalSweep {
     let mut sweep = JournalSweep::default();
     let owners = root.join(OWNERS_DIR);
@@ -521,7 +424,6 @@ pub(crate) fn sweep_unheld_journals(root: &Path) -> JournalSweep {
         .flatten()
         .filter_map(|entry| entry.file_name().into_string().ok())
         .collect();
-    // The lock files of the images swept here went with them.
     let mut gone_locks = BTreeSet::new();
     for name in &names {
         let Some(key) = keyed_image_key(name) else {
@@ -547,7 +449,7 @@ pub(crate) fn sweep_unheld_journals(root: &Path) -> JournalSweep {
 
 /// The sweep's lock-free look at the keyed journal at `path`: a candidate
 /// when its mark names only owners that are gone, on exactly its bytes, and
-/// those hold no draft. Only [`Candidate::settle`], under the lock, removes it.
+/// those hold no draft.
 fn sweep_candidate(
     path: &Path,
     key: JournalDocumentKey,
@@ -555,7 +457,6 @@ fn sweep_candidate(
 ) -> Option<(Candidate, ContentFingerprint)> {
     let candidate = Candidate::open(path.to_path_buf(), key)?;
     let mark = read_mark(path, &candidate.image);
-    // Before its bytes are read: no owner set, or a live owner, keeps it.
     let OwnerMark::Owners(_, set) = &mark else {
         return None;
     };
@@ -635,7 +536,7 @@ fn sweep_leftover(root: &Path, name: &str) -> bool {
 }
 
 /// Remove the lease of every owner that is gone: acquired, still linked at its
-/// name, unlinked while held. A live owner's lease is never acquirable.
+/// name, unlinked while held.
 fn sweep_dead_owners(owners: &Path) -> usize {
     let Ok(entries) = fs::read_dir(owners) else {
         return 0;
@@ -743,8 +644,7 @@ mod sys {
         file: &File,
         value: &mut [u8],
     ) -> std::io::Result<Option<usize>> {
-        // SAFETY: `file` is open for the call, the name is a NUL-terminated
-        // constant, and `value` is a live buffer of the length passed.
+        // SAFETY: `file` is open for the call, the name is a NUL-terminated constant, and `value` is a live buffer of the length passed.
         #[cfg(target_os = "macos")]
         let read = unsafe {
             libc::fgetxattr(
@@ -780,8 +680,7 @@ mod sys {
     }
 
     pub(super) fn write_mark(_path: &Path, file: &File, value: &[u8]) -> std::io::Result<()> {
-        // SAFETY: `file` is open for the call, the name is a NUL-terminated
-        // constant, and `value` outlives it with the length passed.
+        // SAFETY: `file` is open for the call, the name is a NUL-terminated constant, and `value` outlives it with the length passed.
         #[cfg(target_os = "macos")]
         let written = unsafe {
             libc::fsetxattr(
@@ -878,8 +777,7 @@ mod sys {
 
     pub(super) fn stamp(file: &File) -> std::io::Result<Stamp> {
         let mut information = std::mem::MaybeUninit::<ByHandleFileInformation>::uninit();
-        // SAFETY: `file` owns a live handle and the out pointer addresses
-        // writable storage for exactly one BY_HANDLE_FILE_INFORMATION.
+        // SAFETY: `file` owns a live handle and the out pointer addresses writable storage for exactly one BY_HANDLE_FILE_INFORMATION.
         let ok = unsafe {
             GetFileInformationByHandle(file.as_raw_handle().cast(), information.as_mut_ptr())
         };
@@ -945,8 +843,7 @@ mod sys {
         PathBuf::from(stream)
     }
 
-    /// The mark on the file `path` names into `value`: its length, or `None`
-    /// when it has none. One byte past `value` is refused as unreadable.
+    /// The mark on the file `path` names into `value`: its length, or `None` when it has none.
     pub(super) fn read_mark(
         path: &Path,
         _file: &File,

@@ -165,7 +165,7 @@ impl EchoKind {
 
     /// The echo a retirement leaves by default.
     #[must_use]
-    pub(crate) fn for_retired(how: &Retired) -> Option<Self> {
+    pub(crate) const fn for_retired(how: &Retired) -> Option<Self> {
         match how {
             Retired::Resolved(Outcome::Ok) => Some(Self::Complete),
             Retired::Resolved(Outcome::Warn) => Some(Self::Fault),
@@ -214,7 +214,7 @@ pub struct Echo {
 impl Echo {
     /// The load slot the row laid out, for the echo to keep.
     #[must_use]
-    pub fn slot(&self) -> Loads {
+    pub const fn slot(&self) -> Loads {
         match self.load {
             Some(l) if !self.load_slot.is_empty() => self.load_slot.with(l),
             Some(_) => Loads::ALL,
@@ -342,13 +342,13 @@ impl Live {
 
     /// `true` while not on glass.
     #[must_use]
-    pub fn is_queued(&self) -> bool {
+    pub const fn is_queued(&self) -> bool {
         self.on_glass_since.is_none()
     }
 
     /// `true` for work in flight whose indicator moves.
     #[must_use]
-    pub(crate) fn is_animated(&self) -> bool {
+    pub(crate) const fn is_animated(&self) -> bool {
         match &self.msg.meter {
             Some(m) if m.busy => true,
             Some(m) => m.fill_permille.is_some() && matches!(self.msg.hold, Hold::Live { .. }),
@@ -364,13 +364,13 @@ impl Live {
 
     /// Live progress: work in flight with its animated indicator.
     #[must_use]
-    pub(crate) fn is_progress(&self) -> bool {
+    pub(crate) const fn is_progress(&self) -> bool {
         self.is_animated()
     }
 
     /// The activity byte the fingerprint folds and the motion epoch keys.
     #[must_use]
-    pub fn activity(&self) -> u8 {
+    pub const fn activity(&self) -> u8 {
         match &self.msg.meter {
             Some(m) if m.fill_permille.is_some() => 1,
             Some(m) if m.busy => 2,
@@ -657,7 +657,7 @@ impl MessageCenter {
 
     /// The display frame period the fine motion is read.
     #[must_use]
-    pub fn refresh(&self) -> Duration {
+    pub const fn refresh(&self) -> Duration {
         self.refresh
     }
 
@@ -1495,7 +1495,7 @@ impl MessageCenter {
     }
 
     /// Hand in the windows' chrome regrow floor ([`crate::chrome`]).
-    pub fn set_regrow_floor(&mut self, floor: Option<Instant>) {
+    pub const fn set_regrow_floor(&mut self, floor: Option<Instant>) {
         self.regrow_floor = floor;
     }
 
@@ -1512,7 +1512,7 @@ impl MessageCenter {
 
     /// The committed row count.
     #[must_use]
-    pub fn committed_rows(&self) -> u16 {
+    pub const fn committed_rows(&self) -> u16 {
         self.committed_rows
     }
 
@@ -1837,7 +1837,7 @@ impl MessageCenter {
 
     /// Whether a new live row can be added without exceeding the live-row cap.
     #[must_use]
-    pub fn has_live_capacity(&self) -> bool {
+    pub const fn has_live_capacity(&self) -> bool {
         self.live.len() < MAX_LIVE
     }
 
@@ -1860,7 +1860,7 @@ impl MessageCenter {
 
     /// The log.
     #[must_use]
-    pub fn log(&self) -> &MessageLog {
+    pub const fn log(&self) -> &MessageLog {
         &self.log
     }
 
@@ -1877,7 +1877,7 @@ impl MessageCenter {
 
     /// Bumps on every observable change.
     #[must_use]
-    pub fn revision(&self) -> u64 {
+    pub const fn revision(&self) -> u64 {
         self.revision
     }
 
@@ -1888,13 +1888,13 @@ impl MessageCenter {
 
     /// The gate a page reads to know it is out of date.
     #[must_use]
-    pub fn projection_revision(&self) -> u64 {
+    pub const fn projection_revision(&self) -> u64 {
         self.revision.wrapping_add(self.digest.revision())
     }
 
     /// Changes on every live restatement.
     #[must_use]
-    pub fn motion_input_epoch(&self) -> u64 {
+    pub const fn motion_input_epoch(&self) -> u64 {
         self.motion_input_epoch
     }
 
@@ -2453,13 +2453,13 @@ impl MessageCenter {
 
     /// Moves only when an exception is added, changed or filed.
     #[must_use]
-    pub fn digest_revision(&self) -> u64 {
+    pub const fn digest_revision(&self) -> u64 {
         self.digest.revision()
     }
 
     /// How many messages the door demoted to a record.
     #[must_use]
-    pub fn demotions(&self) -> u32 {
+    pub const fn demotions(&self) -> u32 {
         self.demotions
     }
 
@@ -2579,7 +2579,7 @@ impl MessageCenter {
     }
 
     /// How many exceptions are open.
-    pub(crate) fn digest_len(&self) -> usize {
+    pub(crate) const fn digest_len(&self) -> usize {
         self.digest.len()
     }
 

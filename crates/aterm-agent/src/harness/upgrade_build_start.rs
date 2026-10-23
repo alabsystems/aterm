@@ -18,6 +18,7 @@ pub use crate::harness::upgrade::BUILD_FAILS;
 pub const PROBE_GAP_S: u64 = 15 * 60;
 
 /// How many failures one note remembers by their record ([`Note::stops`]),
+/// newest last: enough to tell a record saved again from a new failure.
 const STOPS_KEPT: usize = 16;
 
 /// What loads the build's program without starting a session (see the module docs).
@@ -109,11 +110,16 @@ impl Note {
     }
 
     /// Whether a probe run since a failure noted passed: a move failure
+    /// after it makes the note [`Note::blind`] ([`note_failure`]).
     fn proved_since_a_failure(&self) -> bool {
         self.failures != 0 && self.proved()
     }
 
     /// Whether a probe since the latest failure ran the build and it exited
+    /// with a failure — the one finding of a crash's probe that holds the
+    /// upgrade's own moves off a build no move has failed on ([`starts_with`]):
+    /// one that could not run it, or did not see it end in time, says
+    /// nothing of the build.
     fn found_exiting(&self) -> bool {
         self.probed_for == self.failures
             && self.probed_at != 0
@@ -122,6 +128,7 @@ impl Note {
     }
 
     /// Whether a probe run since the latest failure did not pass, within
+    /// [`PROBE_GAP_S`] of `now`.
     fn refused_lately(&self, now: u64) -> bool {
         self.probed_for == self.failures
             && self.probed_at != 0
@@ -130,6 +137,7 @@ impl Note {
 }
 
 /// Where the note of build `version` in install `source` lives; `None` for a
+/// word that is no plain name (nothing outside the directory is named).
 fn path(opts: &Opts, source: &str, version: &str) -> Option<PathBuf> {
     let plain = |w: &str| {
         !w.is_empty()
@@ -175,6 +183,8 @@ pub fn note(opts: &Opts, session: &str, before: Option<&St>, st: &St, now: u64) 
 }
 
 /// The failure `before` noted that `st` takes back: its own `no-resume` stop
+/// ([`St::failed_start`], not a kept one) reopened as a relaunch that landed after all
+/// ([`St::reopen_landed`], to [`Phase::Relaunched`]), so the build did start.
 fn taken_back(before: &St, st: &St) -> Option<FailedStart> {
     let failed = before.failed_start()?;
     let own = matches!(&before.phase, Phase::Failed(why) if why == "no-resume");
@@ -182,6 +192,8 @@ fn taken_back(before: &St, st: &St) -> Option<FailedStart> {
 }
 
 /// Withdraws [`taken_back`]'s failure from its build's note: no longer counted, the blindness it
+/// caused lifted ([`Note::blinded_by`]), and a probe that covered every failure still covers every
+/// one left.
 fn retract(opts: &Opts, session: &str, failed: &FailedStart, st: &St) {
     let Some(mut note) = load(opts, &failed.source, &failed.to) else {
         return;
@@ -228,6 +240,9 @@ fn retract(opts: &Opts, session: &str, failed: &FailedStart, st: &St) {
 }
 
 /// Notes the failure `session`'s record carries ([`St::failed_start`]) against its build, once
+/// per failure ([`Note::stops`]): a record saved again, a new process that keeps the stop
+/// ([`St::keep_stop`]) and a restart's record carrying it ([`St::kept_by_restart`]) are the same
+/// failure.
 fn note_failure(opts: &Opts, session: &str, st: &St, now: u64) {
     let Some(failed) = st.failed_start() else {
         return;
@@ -319,6 +334,7 @@ pub fn proved_named(
 }
 
 /// The build a start probe runs and its note is filed under: its program,
+/// its version as its record spells it, its install's word.
 struct Build<'a> {
     exe: &'a Path,
     version: String,
@@ -354,6 +370,7 @@ thread_local! {
 }
 
 /// [`run_probe`] in a test: the probe its thread names ([`PROBE`]), else
+/// the real one.
 #[cfg(test)]
 fn run_probe(exe: &Path) -> Probe {
     match PROBE.with(|named| named.borrow().clone()) {

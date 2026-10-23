@@ -1,36 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm itself: aterm.app once per Mac from the controller's cached release zip, the CLI and PATH for each listed user from a pinned install.sh, and optionally the ALab toolset (design §8).
-//!
-//! Three kinds of item:
-//!
-//! * **`aterm.app`**: the release zip, checked the way install.sh checks it: expanded with
-//!   `ditto -x -k` into the stage, one `aterm.app` in it, `codesign --verify --deep
-//!   --strict` against Developer ID team A66A9P66Z7, Gatekeeper, bundle id
-//!   `com.aterm.aterm` and the pinned version; then given to `[aterm] owner`:staff and
-//!   rename-swapped into `/Applications`. The owner owns it so the in-app updater, which
-//!   swaps the bundle in place, keeps working; an installed aterm newer than the pin is
-//!   that updater's work and counts as done. A running copy keeps running the replaced
-//!   build until it quits, so a swap under a running aterm waits for an idle Mac
-//!   ([`Ctx::disrupt`]).
-//! * **`aterm.cli@<user>`**: the release's own install.sh, pinned by SHA-256, run as the
-//!   user with `--no-app`: it links `~/.local/bin/aterm` to
-//!   `/Applications/aterm.app/Contents/MacOS/aterm`. The agent feeds the root-only cached
-//!   copy on standard input (`bash -s`), so the user never needs to read the agent's
-//!   cache, the same way `curl … | bash` runs it. install.sh wires PATH only through the
-//!   toolset's shell hook, so with `toolset` off it is also run `--no-toolchain` (which
-//!   records `[packages] auto_install = false` for the user) and lays down the link alone
-//!   (VM: it printed that `~/.local/bin` is not on PATH).
-//! * **`aterm.toolset@<user>`**: `aterm pkg install --default-set --wait-lock 1800` as the
-//!   user. Done is `aterm pkg doctor --json` complete (exit 0) with its toolset row ok:
-//!   doctor alone checks the store against the signed index's default set (its cached
-//!   copy, offline), where `aterm pkg list` can only say what is installed. Not done is a
-//!   change named by each doctor row that fails it (a broken shim as much as a missing
-//!   set), or by the toolset row of a set removed on purpose, a decline the owner's
-//!   baseline lifts; a report that contradicts its exit, one at another schema, or no
-//!   report, is no answer. atpkg's exits 75 (another run holds the store lock past the
-//!   wait) and 69 (offline) stand aside as `Blocked`.
+//! `aterm.app`, per-user CLI, and default toolset installation ([`Ctx::disrupt`]).
 
 use super::apps::{
     Notes, Signed, Stage, account, bundle_info, cached_verified, clear_stage, ditto_unzip,
@@ -46,8 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-/// The Developer ID team that signs every official aterm release (install.sh's
-/// `OFFICIAL_TEAM_ID`).
+/// The Developer ID team that signs every official aterm release (install.sh's `OFFICIAL_TEAM_ID`).
 pub const TEAM_ID: &str = "A66A9P66Z7";
 
 /// The release bundle's identifier.
@@ -56,10 +26,10 @@ pub const BUNDLE_ID: &str = "com.aterm.aterm";
 /// Where aterm.app is installed.
 pub const APP: &str = "/Applications/aterm.app";
 
-/// The one executable, which `~/.local/bin/aterm` links to.
+/// Path to the bundled executable linked by `~/.local/bin/aterm`.
 pub const EXE: &str = "/Applications/aterm.app/Contents/MacOS/aterm";
 
-/// `staff`, the group install.sh's own installs leave aterm.app in.
+/// Default group (`staff`) for `/Applications/aterm.app`.
 pub const STAFF_GID: u32 = 20;
 
 /// atpkg's exit when another run holds the store lock past `--wait-lock`.
@@ -71,8 +41,7 @@ pub const ATPKG_OFFLINE: i32 = 69;
 /// install.sh without the toolset: the link, man pages and completions.
 const CLI_BUDGET: Duration = Duration::from_secs(600);
 
-/// install.sh with the toolset, or `pkg install --default-set`: up to 30 minutes queued
-/// behind another atpkg run, then about 3.2 GB from github.com.
+/// install.sh with the toolset, or `pkg install --default-set`.
 const TOOLSET_BUDGET: Duration = Duration::from_secs(3 * 3600);
 
 /// The table.
@@ -99,12 +68,10 @@ pub struct Table {
     pub toolset: Option<bool>,
 }
 
-/// The items `table` asks for: `aterm.app`, then `aterm.cli@<user>` for each CLI user,
-/// then (with `toolset = true`) `aterm.toolset@<user>` for each.
+/// Expand the items requested by `table`.
 ///
 /// # Errors
-/// One line naming what cannot be expanded: no owner, an account this Mac does not have,
-/// a malformed version or SHA-256.
+/// Returns a one-line message if the owner, account, version, or SHA-256 is invalid.
 pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     if let Some(v) = &table.version
         && !is_version(v)
@@ -167,8 +134,7 @@ pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     Ok(items)
 }
 
-/// Whether `v` is a canonical `MAJOR.MINOR.PATCH`: three decimal numbers, no leading
-/// zero (install.sh's tag rule).
+/// Whether `v` is a canonical `MAJOR.MINOR.PATCH`.
 #[must_use]
 pub fn is_version(v: &str) -> bool {
     let parts: Vec<&str> = v.split('.').collect();
@@ -180,8 +146,7 @@ pub fn is_version(v: &str) -> bool {
         })
 }
 
-/// Whether version `have` is `want` or newer, compared number by number; a version that
-/// is not all numbers only matches itself.
+/// Whether version `have` is `want` or newer, compared number by number.
 #[must_use]
 pub fn at_least(have: &str, want: &str) -> bool {
     let nums = |s: &str| {
@@ -318,7 +283,6 @@ impl Item for App {
                     ),
                 };
             }
-            // Only the owner differs: a chown, which needs no artifact and disturbs no one.
             Ok(Installed::Current { version, uid }) => {
                 return Probe::Change {
                     from: format!("aterm {version}, owned by uid {uid}"),
@@ -507,9 +471,6 @@ impl Item for Cli {
     }
 
     fn after(&self) -> Vec<String> {
-        // With the toolset on, install.sh runs without `--no-toolchain` and lays the
-        // toolset down itself (`aterm pkg seed` + `pkg update`), which needs what
-        // `aterm.toolset@<user>` needs.
         if self.toolset {
             vec!["aterm.app".into(), "developer.command-line-tools".into()]
         } else {
@@ -641,19 +602,10 @@ impl Item for Toolset {
     }
 }
 
-/// The id of atpkg's toolset row in `aterm pkg doctor --json` (`atpkg::converge`), whose
-/// value says how many programs are active.
+/// Identifier of the toolset row in `aterm pkg doctor --json` (`atpkg::converge`).
 const DOCTOR_TOOLSET_ROW: &str = "base.pkg.toolset";
 
-/// The toolset's state from what `aterm pkg doctor --json` answered as `user` (design §4.5,
-/// A29). Exit 0 with a report whose rule held and whose toolset row is ok is done. A toolset
-/// doctor does not count against its exit, one removed on purpose (a decline, a note), is a
-/// change: the fleet's consent is the owner's baseline, which lifts a decline (§3.2). Exit 1
-/// with a report whose rule failed is a change, named by each row that fails it
-/// ([`aterm_converge::ItemReport::fails_surface`]), a broken shim as much as a missing set.
-/// Anything else is no answer: a doctor that could not look (HOME unset), a report that
-/// contradicts its own exit, one this agent cannot read (another schema, not a check, no
-/// toolset row), or an aterm older than `--json`, which refuses the flag as usage (exit 2).
+/// The toolset's state from what `aterm pkg doctor --json` answered as `user` .
 fn doctor_says(ran: &Ran, user: &str, to: String) -> Probe {
     let unusable = |what: String| Probe::Unusable {
         why: format!("aterm pkg doctor --json as {user}: {what}"),
@@ -670,7 +622,6 @@ fn doctor_says(ran: &Ran, user: &str, to: String) -> Probe {
             ran.describe()
         ));
     };
-    // Unknown keys parse, so a later schema would be judged by this one's rules: refused.
     if report.schema != aterm_converge::SCHEMA {
         return unusable(format!(
             "{}; its report is schema {}, and this agent reads schema {}",
@@ -769,19 +720,16 @@ mod tests {
     /// install.sh `--no-app --no-toolchain` as admin from a root-only stdin, VM, stdout.
     const INSTALL_SH_OUT: &str = "install.sh: linked aterm 0.105.0 -> /Users//admin/.local/bin/aterm (follows the app's updates)\ninstall.sh: --no-toolchain: /Users//admin/.config/aterm/aterm.toml already says `auto_install = false` — left as it is\n";
 
-    /// `aterm pkg doctor --json` as admin over an empty store: exit 1, the toolset row the
-    /// one that fails it beside three advisories.
+    /// `aterm pkg doctor --json` as admin over an empty store.
     const DOCTOR_EMPTY: &str = r#"{"schema":1,"mode":"check","complete":false,"items":[{"id":"base.pkg.path","family":"pkg","title":"the managed bin/ on PATH","outcome":"planned","from":"managed bin/ is not on PATH here","to":"on PATH","effect":"now","layer":"base","class":"person","explain":{"why":"managed bin/ is not on PATH here; a new aterm shell adds it, or add: export PATH=\"$PATH:/Users//admin/Library/Application Support/aterm/pkg/bin\"","remedy":{"command":"export PATH=\"$PATH:/Users//admin/Library/Application Support/aterm/pkg/bin\""}}},{"id":"base.shell.hooks","family":"shell","title":"the shell.d hooks","outcome":"planned","from":"shell.d hooks not generated yet (an install writes them)","to":"present","effect":"now","layer":"base","class":"relay","explain":{"why":"shell.d hooks not generated yet (an install writes them)","remedy":"repair"}},{"id":"base.pkg.toolset","family":"pkg","title":"the ALab toolset","outcome":"planned","from":"no ALab programs are installed","to":"the ALab default set, installed","effect":"now","layer":"base","class":"install","explain":{"why":"no ALab programs are installed","remedy":{"command":"aterm pkg install --default-set"}},"essential":true}]}"#;
 
     /// `aterm pkg doctor --json` over this Mac's full toolset: exit 0, one advisory.
     const DOCTOR_FULL: &str = r#"{"schema":1,"mode":"check","complete":true,"items":[{"id":"base.pkg.path","family":"pkg","title":"the managed bin/ on PATH","outcome":"planned","from":"managed bin/ is not on PATH here","to":"on PATH","effect":"now","layer":"base","class":"person","explain":{"why":"managed bin/ is not on PATH here; a new aterm shell adds it, or add: export PATH=\"$PATH:/Users//admin/Library/Application Support/aterm/pkg/bin\"","remedy":{"command":"export PATH=\"$PATH:/Users//admin/Library/Application Support/aterm/pkg/bin\""}}},{"id":"base.pkg.toolset","family":"pkg","title":"the ALab toolset","outcome":"ok","to":"12 program(s) active","effect":"now","detail":"12","layer":"base","class":"install","essential":true}]}"#;
 
-    /// `aterm pkg doctor --json` over a full toolset with one shim whose build is gone:
-    /// exit 1 with the toolset row ok, the shim row the one that fails it.
+    /// `aterm pkg doctor --json` over a full toolset with one shim whose build is gone.
     const DOCTOR_BROKEN_SHIM: &str = r#"{"schema":1,"mode":"check","complete":false,"items":[{"id":"base.pkg.shims@cargo","family":"pkg","title":"the bin/ shim cargo","outcome":"planned","from":"broken bin shim /Users//admin/Library/Application Support/aterm/pkg/bin/cargo","to":"forwarding to a build in the store","effect":"now","layer":"base","class":"relay","explain":{"why":"broken bin shim /Users//admin/Library/Application Support/aterm/pkg/bin/cargo","remedy":"repair"},"essential":true},{"id":"base.pkg.toolset","family":"pkg","title":"the ALab toolset","outcome":"ok","to":"12 program(s) active","effect":"now","detail":"12","layer":"base","class":"install","essential":true}]}"#;
 
-    /// `aterm pkg doctor --json` over a store whose toolset was removed on purpose (`aterm pkg
-    /// uninstall --all`, Settings): exit 0, the toolset row a note.
+    /// Simulate `aterm pkg doctor --json` when the toolset was removed intentionally.
     const DOCTOR_DECLINED: &str = r#"{"schema":1,"mode":"check","complete":true,"items":[{"id":"base.pkg.toolset","family":"pkg","title":"the ALab toolset","outcome":"not-applicable","why":"the ALab toolset was removed on this machine (`aterm pkg install --default-set` reinstalls it)","effect":"now","layer":"base","class":"install","explain":{"why":"the ALab toolset was removed on this machine (`aterm pkg install --default-set` reinstalls it)","remedy":{"command":"aterm pkg install --default-set"}},"essential":true}]}"#;
 
     fn plistbuddy(bundle: &str, key: &str) -> String {
@@ -822,7 +770,6 @@ mod tests {
         let items = expand(&t, &ctx).unwrap();
         let ids: Vec<String> = items.iter().map(|i| i.id()).collect();
         assert_eq!(ids, ["aterm.app", "aterm.cli@admin", "aterm.toolset@admin"]);
-        // install.sh lays the toolset down itself when it is on.
         assert_eq!(
             items[1].after(),
             ["aterm.app", "developer.command-line-tools"]
@@ -854,7 +801,6 @@ mod tests {
     #[test]
     fn a_release_aterm_at_or_past_the_pin_owned_by_its_owner_is_ok() {
         let sys = Fake::root();
-        // The VM's aterm.app had moved on to 0.105.0 (team A66A9P66Z7) while the pin said 0.104.0.
         installed(&sys, "0.105.0", 501);
         let ctx = ctx_with(&sys, &[], false);
         let items = expand(&table(), &ctx).unwrap();
@@ -1076,7 +1022,6 @@ mod tests {
             cli.command(Path::new("/c/x")).display(),
             "admin$ /bin/bash -s -- --no-app"
         );
-        // And through the engine: the link appears, the read-back sees it.
         let sys = Fake::root();
         let script = b"main \"$@\"\n";
         let sha = sha_of(script);
@@ -1151,7 +1096,6 @@ mod tests {
         assert_eq!(rows[0].outcome, Outcome::Blocked, "{:?}", rows[0]);
         assert!(rows[0].why.as_deref().unwrap().contains("exit 75"));
         assert!(!rows[0].outcome.is_failure());
-        // Installed: doctor exits 0.
         let sys = Fake::root();
         sys.file(EXE, b"");
         sys.on(doctor, out_status(1, DOCTOR_EMPTY));
@@ -1199,12 +1143,9 @@ mod tests {
 
     #[test]
     fn a_doctor_exit_1_with_no_failing_row_is_no_answer() {
-        // atpkg's doctor exits 1 without a word when HOME is unset: that is not "not done".
         let doctor = "admin$ /Applications/aterm.app/Contents/MacOS/aterm pkg doctor --json";
         let mut t = table();
         t.toolset = Some(true);
-        // Nothing on stdout, and a report that claims the exit rule held, or names no row
-        // that fails it: each is no answer, never "not done".
         let complete = DOCTOR_FULL;
         let unnamed = DOCTOR_FULL.replace(r#""complete":true"#, r#""complete":false"#);
         for (ran, says) in [

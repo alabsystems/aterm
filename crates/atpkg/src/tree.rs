@@ -79,6 +79,7 @@ pub(crate) fn symlink_line(rel_bytes: &[u8], target_sha_hex: &str) -> Vec<u8> {
 }
 
 /// The one line framer: `<rel> 0x00 <mode-slot> 0x00 <digest> 0x0A`; the mode slot is the
+/// only thing a symlink line fills differently.
 fn framed_line(rel_bytes: &[u8], mode_slot: &[u8], digest_hex: &str) -> Vec<u8> {
     let cap = rel_bytes
         .len()
@@ -99,6 +100,8 @@ fn framed_line(rel_bytes: &[u8], mode_slot: &[u8], digest_hex: &str) -> Vec<u8> 
 }
 
 /// Recursively collect one canonical entry line per regular file and symlink under `dir`,
+/// hashing each file through the caller's single reusable `buf`; `modes` is the
+/// declared-mode record [`tree_root_declared`] folds where the inode stores no bits.
 fn walk(
     root: &Path,
     dir: &Path,
@@ -200,6 +203,7 @@ pub(crate) fn file_sha256(path: &Path) -> io::Result<String> {
 }
 
 /// [`file_sha256`] against a caller-owned read buffer — the per-file body, with the
+/// buffer hoisted out of the hot per-file frame.
 fn file_sha256_with(path: &Path, buf: &mut [u8]) -> io::Result<String> {
     let mut h = BulkSha256::new();
     read_chunks(path, buf, |chunk| h.update(chunk))?;
@@ -295,6 +299,10 @@ mod tests {
     }
 
     /// [`BulkSha256`] gives the scalar reference's digest (archive digests and tree roots
+    /// are signed, cross-version contracts): FIPS 180-4's published vectors, then
+    /// pseudo-random messages split in two at each awkward boundary (empty, one byte, the
+    /// padding's 55/56, a block's 63/64/65, past a 64 KiB read buffer) and fed in runs of
+    /// awkward chunk sizes.
     #[test]
     fn bulk_sha256_is_the_reference_digest() {
         let bulk = |parts: &[&[u8]]| {
@@ -357,6 +365,9 @@ mod tests {
     }
 
     /// The cross-version byte contract pinned to a literal, computed independently from the
+    /// documented format (`sort(<relpath> 0x00 <octal mode> 0x00 <hex sha256> 0x0A)`,
+    /// concatenated, SHA-256): the recompute tests stay green if the primitive, framing or
+    /// sort changes, and signed manifests embed roots from earlier releases.
     #[test]
     fn tree_root_matches_the_pinned_cross_version_vector() {
         const GOLDEN: &str = "e44608970d54f90c4d54ad7852b174304b86395b89f59b3fcc04a11ae22e38e0";
@@ -387,6 +398,7 @@ mod tests {
     }
 
     /// The relpath slot is `/`-separated on every platform, though `Path::join` spells the
+    /// separator `\` on Windows.
     #[test]
     fn rel_line_bytes_spell_the_separator_as_a_slash() {
         let rel = Path::new("bin").join("sub").join("claude.exe");
@@ -398,6 +410,8 @@ mod tests {
     }
 
     /// A signed one-file row (`bin/claude.exe`, mode `0755`) folds to its signed root from
+    /// exactly that line, and the same content under a `\` separator and a `0` mode folds
+    /// to the different digest a client with those spellings produced.
     #[test]
     fn the_measured_windows_claude_row_folds_from_the_declared_line() {
         const CONTENT: &str = "0e4195524b73eb77efbdf3e2b36de5322a29f0ca575dfd2d9b4f946b1d425469";
@@ -485,6 +499,7 @@ mod tests {
     }
 
     /// A symlink is digested by its raw target bytes, never followed or skipped, and the
+    /// digest moves exactly when the target string moves; a dangling link is a good line.
     #[cfg(unix)]
     #[test]
     fn a_symlink_is_digested_by_its_target_bytes_and_never_followed() {
@@ -516,6 +531,8 @@ mod tests {
     }
 
     /// The symlink line pinned to a literal computed independently from the documented
+    /// format, `sort(<relpath> 0x00 symlink 0x00 <hex sha256(target bytes)> 0x0A ...)`
+    /// concatenated and hashed, over `real` (content `x`, mode 0644) and `link -> real`.
     #[cfg(unix)]
     #[test]
     fn symlink_tree_root_matches_the_pinned_cross_version_vector() {

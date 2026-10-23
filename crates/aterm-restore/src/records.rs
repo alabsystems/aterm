@@ -71,8 +71,8 @@ pub enum TailRecord<'a> {
     Superseded,
 }
 
-/// A policy's byte. `ResizePolicy` is non-exhaustive: a policy this build does not know is
-fn policy_byte(policy: ResizePolicy) -> u8 {
+/// A policy's byte.
+const fn policy_byte(policy: ResizePolicy) -> u8 {
     match policy {
         ResizePolicy::Native => 0,
         ResizePolicy::ConPty => 1,
@@ -80,7 +80,7 @@ fn policy_byte(policy: ResizePolicy) -> u8 {
     }
 }
 
-fn policy_of(byte: u8) -> Option<ResizePolicy> {
+const fn policy_of(byte: u8) -> Option<ResizePolicy> {
     match byte {
         0 => Some(ResizePolicy::Native),
         1 => Some(ResizePolicy::ConPty),
@@ -89,7 +89,7 @@ fn policy_of(byte: u8) -> Option<ResizePolicy> {
 }
 
 impl TailRecord<'_> {
-    fn kind(&self) -> u8 {
+    const fn kind(&self) -> u8 {
         match self {
             Self::Bytes { .. } => KIND_BYTES,
             Self::Resize { .. } => KIND_RESIZE,
@@ -109,7 +109,7 @@ impl TailRecord<'_> {
 
     /// Unpadded payload byte length.
     #[must_use]
-    pub fn payload_len(&self) -> usize {
+    pub const fn payload_len(&self) -> usize {
         match self {
             Self::Bytes { bytes, .. } => bytes.len(),
             Self::Resize { .. } => RESIZE_PAYLOAD,
@@ -120,7 +120,7 @@ impl TailRecord<'_> {
 
     /// Total 8-byte-aligned record byte length in the ring.
     #[must_use]
-    pub fn encoded_len(&self) -> usize {
+    pub const fn encoded_len(&self) -> usize {
         TAIL_RECORD_HEADER.saturating_add(pad8(self.payload_len()))
     }
 
@@ -192,7 +192,7 @@ pub struct TailHeader {
 impl TailHeader {
     /// Decode a 16-byte header for validation by [`decode_tail_payload`].
     #[must_use]
-    pub fn read(bytes: &[u8; TAIL_RECORD_HEADER]) -> Self {
+    pub const fn read(bytes: &[u8; TAIL_RECORD_HEADER]) -> Self {
         let [
             kind,
             flags,
@@ -390,6 +390,7 @@ fn one_step(bytes: &[u8], seq: u64) -> Result<&[u8], StepFault> {
 }
 
 /// Decompress a size-prepended LZ4 block whose size is at most `max`, allocating only
+/// after the bound holds and only fallibly.
 fn bounded_lz4(input: &[u8], max: usize) -> Option<Vec<u8>> {
     let (size, rest) = aterm_lz4::uncompressed_size(input).ok()?;
     if size > max {
@@ -596,6 +597,9 @@ impl std::fmt::Display for KeyframeFault {
 }
 
 /// The strict per-line bounds a grid record is decoded under at `cols`: at most
+/// `cols * 256` content bytes (one 256-byte grapheme unit a cell), and a record of at
+/// most the handoff's cap (`16 KiB + cols * 512`) plus one OSC 8 link span a column at
+/// the ingestion ceilings (`max_linked_record_bytes`).
 fn line_caps(cols: u16) -> (usize, usize, usize) {
     let cells = usize::from(cols);
     let content_cap = cells.saturating_mul(256);
@@ -610,6 +614,7 @@ fn line_caps(cols: u16) -> (usize, usize, usize) {
 }
 
 /// Decode a grid blob strictly: at most `max_records` records at `cols`, each under
+/// [`line_caps`], no trailing bytes.
 fn strict_records(blob: &[u8], max_records: usize, cols: u16) -> Option<usize> {
     let (cells, content_cap, record_cap) = line_caps(cols);
     deserialize_lines_strict(blob, max_records, cells, content_cap, record_cap).map(|l| l.len())
@@ -805,6 +810,7 @@ pub fn decode_keyframe(record: &[u8], seq: u64) -> Result<Keyframe, KeyframeFaul
 }
 
 /// The meta, read as the screen carry reads one: JSON, an object naming every required
+/// key, then the typed form.
 fn parse_meta(bytes: &[u8]) -> Result<CheckpointMeta, KeyframeFault> {
     let text = std::str::from_utf8(bytes).map_err(|_| KeyframeFault::Meta)?;
     let value: aterm_json::Value = aterm_json::from_str(text).map_err(|_| KeyframeFault::Meta)?;
@@ -843,7 +849,7 @@ pub struct HistoryIdentity {
 impl HistoryIdentity {
     /// Extract the [`HistoryIdentity`] from `fence`.
     #[must_use]
-    pub fn of(fence: &HistoryFence) -> Self {
+    pub const fn of(fence: &HistoryFence) -> Self {
         Self {
             renumber_epoch: fence.renumber_epoch,
             clear_gen: fence.clear_gen,
@@ -981,6 +987,7 @@ impl HistoryChunk {
     }
 
     /// The decompressed frame's bound: what its line count and width allow, under the
+    /// absolute frame budget.
     fn frame_bound(&self, frame_budget: usize) -> Result<usize, ChunkFault> {
         let (_, _, record_cap) = line_caps(self.identity.cols);
         let n = usize::try_from(self.n_lines).map_err(|_| ChunkFault::Frame)?;

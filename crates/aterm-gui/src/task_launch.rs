@@ -24,6 +24,7 @@ pub(crate) const TASK_MAX: usize = aterm_types::control_verbs::MAX_TASK_BYTES;
 pub(crate) const FIRST_PROMPT_WAIT: Duration = Duration::from_secs(20);
 
 /// The child deadline for `fish --version` ([`fish_says`]); complete-output
+/// capture also retains the helper's bounded drain/reap reserves.
 const VERSION_WAIT: Duration = Duration::from_secs(5);
 
 /// The reply to a worker's spawn of `agent` that carried no task frame.
@@ -36,6 +37,7 @@ fn no_frame(agent: &str) -> String {
 
 thread_local! {
     /// The task frame the serve loop read for the request this thread is
+    /// serving ([`CarriedTask`]).
     static FRAME: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
 }
 
@@ -198,6 +200,10 @@ pub(crate) fn task_text(
 }
 
 /// `task` with every line that draws as a blank row left out (one of white
+/// space alone, Unicode's as agy's reader reads a blank row — `U+00A0`,
+/// `U+3000`, `U+2000`..`U+200A` and the rest — or of characters that draw
+/// nothing: controls and the zero-width ones, [`draws_nothing`]), each other
+/// line as given.
 fn without_blank_lines(task: &[u8]) -> Vec<u8> {
     task.split_inclusive(|&b| b == b'\n')
         .filter(|line| !String::from_utf8_lossy(line).chars().all(draws_nothing))
@@ -207,6 +213,11 @@ fn without_blank_lines(task: &[u8]) -> Vec<u8> {
 }
 
 /// Whether `c` draws nothing a reader of the row could tell from a blank
+/// cell: white space (Unicode's `White_Space`, what `aterm_phase`'s readers
+/// trim), a control character, or a zero-width format character (the soft
+/// hyphen, the zero-width space, joiners and marks `U+200B`..`U+200F`, the
+/// word joiner and invisible operators `U+2060`..`U+2064`, the byte-order
+/// mark).
 fn draws_nothing(c: char) -> bool {
     c.is_whitespace()
         || c.is_control()
@@ -294,7 +305,7 @@ impl TaskSeed {
         })
     }
 
-    /// The exclusive file write and its ownership handover. The filesystem
+    /// The exclusive file write and its ownership handover.
     fn write_in_using(
         &self,
         dir: &Path,
@@ -353,16 +364,20 @@ impl TaskSeed {
 }
 
 /// The name of session `sid`'s task file in the tasks directory: a new
+/// record is rev 1.
 fn task_file_name(sid: &SessionId) -> String {
     format!("{}-1.txt", sid.as_str())
 }
 
 /// The name of a Gemini CLI worker `sid`'s own trusted-folders file in the
+/// tasks directory ([`TaskSeed::with_trust_file`]).
 fn trust_file_name(sid: &SessionId) -> String {
     format!("{}-1.trust.json", sid.as_str())
 }
 
 /// Whether `name` is one of session `sid`'s result files in the tasks
+/// directory: `<sid>-<rev>.result.md` or its sidecar `<sid>-<rev>.result.src`
+/// (`aterm_agent::harness::result::snapshot`, one pair per published done).
 fn is_result_file_of(name: &str, sid: &SessionId) -> bool {
     let Some(stem) = name
         .strip_suffix(".result.md")
@@ -376,6 +391,8 @@ fn is_result_file_of(name: &str, sid: &SessionId) -> bool {
 }
 
 /// The most names one retire reads of the tasks directory: far past what
+/// its own sweeps leave there (a task file per live worker, a result pair
+/// per done it published).
 const TASKS_DIR_SCAN: usize = 65_536;
 
 /// Remove session `sid`'s task files once the session is gone (`App::retire_session_registration`, the tail of every close; a quit's [`retire_task_files_at_quit`]).
@@ -414,11 +431,14 @@ fn retire_task_files_in(dir: &Path, store: &Store, parked: &[SessionId]) {
 }
 
 /// [`retire_task_file`] in the tasks directory `dir`: none there, or no
+/// directory, is no error.
 fn retire_task_file_in(dir: &Path, sid: &SessionId) {
     retire_files_in(dir, std::slice::from_ref(sid));
 }
 
 /// Remove each of `sids`' task file and result files from the tasks
+/// directory `dir`, the directory read once; none there, or no directory,
+/// is no error.
 fn retire_files_in(dir: &Path, sids: &[SessionId]) {
     if sids.is_empty() {
         return;
@@ -602,6 +622,9 @@ fn run_worker_launch(work: &Launch) {
 }
 
 /// Keep what the launcher did with the worker's line on its timeline
+/// (`SessionTimeline::worker_launch`): the startup deadline's stall says it
+/// (`harness_host::startup_mark_with`), so a worker that never started tells
+/// a line typed and lost from one never typed.
 fn note_launch(ctx: &SessionCtx, note: String) {
     ctx.timeline
         .lock()
@@ -610,6 +633,8 @@ fn note_launch(ctx: &SessionCtx, note: String) {
 }
 
 /// Wait for the worker's shell to draw its first prompt — the newest command
+/// block one whose line editor reads (OSC 133 `B`: `blocks` says `entering`)
+/// — for at most [`FIRST_PROMPT_WAIT`], woken by its output.
 fn await_first_prompt(work: &Launch) -> Result<PromptFence, &'static str> {
     let deadline = Instant::now() + FIRST_PROMPT_WAIT;
     let sub = crate::session_watch::Subscription::single(&work.ctx.watchers);
@@ -714,6 +739,7 @@ pub(crate) fn type_launch_line(
 }
 
 /// Mark the worker's task `stalled why=shell`, nothing typed, and say why in
+/// the log and on its timeline ([`note_launch`]).
 fn stall(work: &Launch, why: &str) {
     note_launch(&work.ctx, format!("never typed ({why})"));
     stall_task(&work.ctx, work.local, why);
@@ -752,6 +778,7 @@ pub(crate) fn trusted_here(
 }
 
 /// The directory of the group in front of the worker's own terminal (its
+/// shell, at its first prompt), as the kernel tells it.
 fn shell_cwd(store: &Store, ctx: &SessionCtx) -> Option<PathBuf> {
     let pid = u32::try_from(starter_front(store, ctx)?).ok()?;
     aterm_sysprobe::process_cwd(pid)
@@ -786,6 +813,7 @@ enum Found {
     /// The status sweep's group ran it.
     Named,
     /// The starter's terminal's front group ran it; the sweep had not named
+    /// it yet.
     Front,
     /// None: the plain word under the shell's own.
     Plain,
@@ -793,6 +821,7 @@ enum Found {
 
 impl Found {
     /// The words the launch line's log names its program with, `agent` the
+    /// worker's.
     fn words(self, agent: aterm_phase::Program) -> String {
         let product = agent.product();
         match self {
@@ -807,6 +836,9 @@ impl Found {
 }
 
 /// The program, homes and login a worker's line carries: the starter's own
+/// agent of `cli`'s kind where the starter's session runs one
+/// (`aterm_agent::harness::worker::starter`, of [`starter_group`]), else
+/// `cli`'s plain word under the shell's own — with where it was found.
 fn worker_starter_of(
     work: &Launch,
     cli: &aterm_agent::harness::worker::WorkerCli,
@@ -837,6 +869,9 @@ fn worker_starter_of(
 }
 
 /// The group in front of the session's terminal now (`tcgetpgrp` on its PTY
+/// master, read under the registry's read guard so the fd is the session's
+/// own): the starter's, or the worker's own shell's; `None` for a session
+/// that is gone, or where none can be read.
 #[cfg(unix)]
 fn starter_front(store: &Store, ctx: &SessionCtx) -> Option<i32> {
     let g = store.read().unwrap_or_else(|p| p.into_inner());
@@ -856,6 +891,8 @@ fn starter_front(_store: &Store, _ctx: &SessionCtx) -> Option<i32> {
 }
 
 /// A fish program as a worker's spawn finds it: its path, and the file's
+/// length and modification time there, so a fish upgraded in place is asked
+/// again ([`fish_key`]).
 type FishKey = (PathBuf, u64, Option<std::time::SystemTime>);
 
 /// What a fish's `--version` came to ([`fish_answers`]).
@@ -866,6 +903,7 @@ enum FishSaid {
     /// It named its version: whether that takes `$(…)`.
     Version(bool),
     /// It named none (it did not start, did not answer within
+    /// [`VERSION_WAIT`], or said something else): not known to be old.
     Nothing,
 }
 
@@ -877,6 +915,8 @@ fn fish_answers() -> &'static Mutex<std::collections::HashMap<FishKey, FishSaid>
 }
 
 /// `shell`'s [`FishKey`]; `None` for a path that names no file (a bare
+/// `fish`, which the shell's own search resolves): such a fish is asked by
+/// every launcher and remembered by none.
 fn fish_key(shell: &Path) -> Option<FishKey> {
     let meta = std::fs::metadata(shell)
         .ok()
@@ -938,6 +978,8 @@ pub(crate) fn fish_answered(shell: &Path) -> Option<Option<bool>> {
 }
 
 /// Whether the fish at `shell` takes `$(…)`, for a worker's launcher: the
+/// version it named before ([`fish_known_old`]'s question, or another
+/// launcher's), else asked now on the launcher's own thread and remembered.
 fn fish_answer(shell: &Path) -> bool {
     let key = fish_key(shell);
     if let Some(key) = &key
@@ -956,6 +998,8 @@ fn fish_answer(shell: &Path) -> bool {
 }
 
 /// What the fish at `shell` says of its version (`--version`), with a
+/// child deadline of [`VERSION_WAIT`] and proven bounded stdout EOF through
+/// the existing complete-output helper; otherwise [`FishSaid::Nothing`].
 fn fish_says(shell: &Path) -> FishSaid {
     let mut cmd = aterm_uds::spawnfd::command(shell);
     cmd.arg("--version");
@@ -974,6 +1018,7 @@ fn fish_says(shell: &Path) -> FishSaid {
 }
 
 /// Whether `fish --version`'s answer (`fish, version 3.7.1`) names 3.4 or
+/// later; `None` when it names no version.
 fn fish_version_takes_dollar_paren(said: &str) -> Option<bool> {
     let version = said.split_whitespace().last()?;
     let mut parts = version.split(|c: char| !c.is_ascii_digit());

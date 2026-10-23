@@ -16,6 +16,9 @@ use super::*;
 use crate::WindowId;
 
 /// Publish the successor's handoff environment for `outgoing` as the fork
+/// lane does: its manifest, nonce and fds, the layout sidecar at
+/// `layout_path`, the two pipe ends, this process as the parent (with its birth
+/// record where it has one) and `build` as the target.
 fn publish_successor_env(
     outgoing: &OutgoingHandoff,
     layout_path: &std::path::Path,
@@ -43,17 +46,19 @@ fn publish_successor_env(
 }
 
 /// A private scratch HOME and runtime dir for one desk ([`ScratchEnv`]), set before its App is
+/// built, so nothing the App or the manifest writer touches lands in the real home.
 fn enter_scratch(label: &str) -> ScratchEnv {
     // Every caller holds ENV_LOCK for its whole body.
     ScratchEnv::home(&format!("app-{label}"))
 }
 
 /// A PTY pair, both ends close-on-exec from birth: no child another test
+/// spawns meanwhile holds either end past its exec.
 fn openpty() -> (i32, i32) {
     aterm_pty::open_pty_pair().expect("open_pty_pair")
 }
 
-/// Every session of a desk on its own real, quiet PTY. The capture polls a
+/// Every session of a desk on its own real, quiet PTY.
 #[derive(Default)]
 struct DeskPtys {
     pairs: Vec<(u64, i32, i32)>,
@@ -61,6 +66,9 @@ struct DeskPtys {
 
 impl DeskPtys {
     /// A new window's first session, on its PTY before the window is
+    /// installed: `install_window_state` registers only a session with a real
+    /// master, and a session missing from the registry is missing from the
+    /// manifest, which the writer then refuses as inconsistent.
     fn window_session(&mut self, id: u64) -> crate::Session {
         let (master, slave) = openpty();
         let mut session = crate::stub_session(id);
@@ -70,6 +78,7 @@ impl DeskPtys {
     }
 
     /// Every other pooled session (tabs and splits register whatever their
+    /// master), each on its own PTY.
     fn attach_rest(&mut self, app: &mut crate::App) {
         let mut ids: Vec<u64> = app
             .pool
@@ -91,6 +100,7 @@ impl DeskPtys {
     }
 
     /// Unhook every master from its stub session before the App drops (the
+    /// sink never owned it), then close both ends.
     fn release(self, mut app: crate::App) {
         for (id, _, _) in &self.pairs {
             if let Some(pooled) = app.pool.sessions.get_mut(id) {
@@ -110,8 +120,10 @@ impl DeskPtys {
 struct Crossed {
     sessions: usize,
     /// Carried as the engine's own exact carry at the depth carried — the Full
+    /// rung, or VisibleOnly (history dropped, screen exact).
     exact: usize,
     /// Carried exact but for the hyperlinks of line records over the wire's
+    /// record cap: the StrippedLinks rung.
     stripped_links: usize,
     history_lines: u64,
     /// The window carry the parent wrote, as the successor read it back.
@@ -119,16 +131,21 @@ struct Crossed {
     /// The screens as carried — and, asserted, as adopted.
     screens: Vec<(u64, TerminalCheckpoint)>,
     /// The history carry (`crate::handoff_history`), run as the fork lane's
+    /// worker runs it: the records the join named a scrollback sidecar on…
     history_sidecars: usize,
     /// …the adopted sessions that took one (asserted: every named one)…
     history_adopted: usize,
     /// …and the scrollback lines the join counted as left behind, over every
+    /// record (`history_dropped`)…
     history_dropped: u64,
     /// …of which the successor read as withheld by a handoff policy
+    /// (`SessionRecord::history_withheld` → `AdoptedHistory::withheld`): the
+    /// new version's request, not a failure.
     history_withheld: u64,
 }
 
 /// The park → write → adopt pipeline over a whole App, with every assertion
+/// the property makes, labelled `at` (which names the seed).
 fn hand_over(app: &mut crate::App, at: &str) -> Crossed {
     hand_over_as(app, at, None, Carried::Exact)
 }
@@ -139,10 +156,13 @@ enum Carried {
     /// Every screen at an exact rung — the property of an honest desk.
     Exact,
     /// Every screen blank, marked for a redraw, with no control carry — what a
+    /// successor's handoff policy of `carry = "repaint"` asks for.
     Blank,
 }
 
 /// [`hand_over`] for the attempt `attempt`: the park reads the successor's
+/// handoff policy for that ticket through `App::park_policy`, the call both
+/// lanes make at their park, and every screen must cross as `carried` says.
 fn hand_over_as(
     app: &mut crate::App,
     at: &str,
@@ -439,18 +459,23 @@ fn hand_over_as(
 }
 
 /// Four real Mac displays
+/// (`capture_budget_reservation_tests::every_full_screen_display_geometry_is_admitted_for_a_pool_of_panes`),
+/// in physical pixels at 2x.
 const DISPLAYS: [(u32, u32); 4] = [(3024, 1964), (3456, 2234), (5120, 2880), (6016, 3384)];
 
 /// What a maximized window gives up on those displays: a 37 pt notched menu
+/// bar and a 70 pt Dock, at 2x.
 const MAXIMIZED_CHROME_PX: u32 = 74 + 140;
 
-/// The font sizes a desk is sampled at. Below 8 px, three full-screen 6K
+/// The font sizes a desk is sampled at.
 const FONT_PX: std::ops::RangeInclusive<u32> = 8..=48;
 
 /// The largest pool a desk is built with.
 const MAX_SESSIONS: usize = 12;
 
 /// Give window `wid` a real chrome (pad 24, pad_top 4, head 80 at scale 2) at
+/// `font_px`, then size it to `size` through the GUI's resize path
+/// (`App::on_resize` → the grid law → every pane).
 fn size_window(
     app: &mut crate::App,
     wid: WindowId,
@@ -464,6 +489,7 @@ fn size_window(
 }
 
 /// A real chrome (pad 24, pad_top 4, head 80 at scale 2) on window `wid`, at
+/// `font_px`: what the grid law reads.
 fn set_chrome(app: &mut crate::App, wid: WindowId, font_px: u32) {
     let ws = app.windows.get_mut(&wid).expect("the window");
     ws.metrics.pad = 24;
@@ -473,6 +499,12 @@ fn set_chrome(app: &mut crate::App, wid: WindowId, font_px: u32) {
 }
 
 /// Case 0's window: a 99x338 grid at the park, with the band at
+/// `capture_band` rows, on the 5K display at the largest font that fits that
+/// grid there: the display's own width where it gives 338 columns (24 px of the
+/// headless macOS cell box, 15x28 px, which is not CoreText's, so the display's
+/// full-screen height alone gives 101), else the narrowest window that does (a
+/// face whose cell is taller for its width, as Linux's bundled one is, fits 99
+/// rows of 338 columns only at a smaller font).
 fn field_report_window(
     app: &mut crate::App,
     wid: WindowId,
@@ -507,6 +539,9 @@ fn field_report_window(
 }
 
 /// The message band's committed rows move to `rows`, and every window re-grids
+/// by the one law, as `App::sync_message_band_rows` and
+/// `App::regrid_for_chrome_rows` do (the latter's per-window `on_resize`
+/// spelled out, since a headless window has no surface for it to find).
 fn set_band_rows(app: &mut crate::App, rows: u16, sizes: &[(WindowId, PhysicalSize<u32>)]) {
     app.message_band_rows = rows;
     for (wid, size) in sizes {
@@ -515,6 +550,7 @@ fn set_band_rows(app: &mut crate::App, rows: u16, sizes: &[(WindowId, PhysicalSi
 }
 
 /// One desk: its App (every session on a PTY), the window sizes it was built
+/// at, and a sentence describing it for a failure message.
 struct Desk {
     app: crate::App,
     ptys: DeskPtys,
@@ -523,6 +559,9 @@ struct Desk {
 }
 
 /// Build the desk `seed` names: 1 to 3 windows, each of 1 to 4 tabs with 0 to
+/// 2 splits a tab in random directions, at most [`MAX_SESSIONS`] sessions; a
+/// display, shape and font per window; the band at 0 or 1 row (the park finds
+/// it toggled).
 fn build_desk(seed: u64, field_report: bool) -> (Desk, impl FnMut() -> u64) {
     let mut next = xorshift(seed);
     let mut app = crate::App::headless_for_test();
@@ -621,7 +660,7 @@ fn build_desk(seed: u64, field_report: bool) -> (Desk, impl FnMut() -> u64) {
     )
 }
 
-/// Prints the replay line if a desk fails, from wherever it panicked. A case
+/// Prints the replay line if a desk fails, from wherever it panicked.
 struct ReplayOnPanic {
     case: usize,
     seed: u64,
@@ -640,6 +679,7 @@ impl Drop for ReplayOnPanic {
 }
 
 /// What the capture property's desks came to: the handovers' census and the
+/// states the walk reached, summed over the cases a process ran.
 #[derive(Default)]
 struct DeskCensus {
     sessions: usize,
@@ -669,7 +709,7 @@ impl DeskCensus {
         )
     }
 
-    /// The census on a shard's `line`, or `None` if `line` carries none. The
+    /// The census on a shard's `line`, or `None` if `line` carries none.
     fn parse(line: &str) -> Option<Self> {
         let fields: Vec<u64> = line
             .split_once(Self::PREFIX)?
@@ -713,6 +753,7 @@ impl DeskCensus {
 }
 
 /// One desk of the capture property: case `case`'s seeded desk built, walked,
+/// parked and handed over, every assertion made, its census added to `census`.
 fn app_capture_case(case: usize, census: &mut DeskCensus) {
     const BASE_SEED: u64 = 0x00A7_E5C0_91D6_5EED;
 
@@ -802,7 +843,7 @@ fn app_capture_case(case: usize, census: &mut DeskCensus) {
     ptys.release(app);
 }
 
-/// Every desk the GUI can build hands every session over exactly. Forty seeded desks, each a
+/// Every desk the GUI can build hands every session over exactly.
 #[test]
 fn every_app_desk_the_gui_can_build_hands_every_session_over_exactly() {
     const CASES: usize = 40;
@@ -872,7 +913,7 @@ fn every_app_desk_the_gui_can_build_hands_every_session_over_exactly() {
     }
 }
 
-/// A pinned desk: one window, two tabs at 56x149 by the GUI's grid law. Tab 1 is a shell with
+/// A pinned desk: one window, two tabs at 56x149 by the GUI's grid law.
 #[test]
 fn the_owners_desk_hands_both_sessions_over_at_the_full_rung() {
     let Some(_env) = env_alone() else { return };
@@ -1006,6 +1047,10 @@ fn the_owners_desk_hands_both_sessions_over_at_the_full_rung() {
 }
 
 /// Seed the App's pre-verification cache with a passed check of `attempt`'s
+/// candidate whose bundle carried the handoff policy `text`, through the
+/// handoff worker's own publisher (`PreverifyPublisher`, built from the
+/// attempt and narrowed by the same `adopt`), and return what the park will
+/// follow.
 fn seed_passed_preverification(
     app: &crate::App,
     attempt: &crate::native_updater_service::ApplyAttemptTicket,
@@ -1023,6 +1068,7 @@ fn seed_passed_preverification(
 }
 
 /// The successor's signed handoff policy steers the whole park, the escape hatch for a producer
+/// bug the carry ladder cannot see.
 #[test]
 fn a_successor_policy_of_repaint_carries_every_session_blank_and_every_one_adopts() {
     let Some(_env) = env_alone() else { return };
@@ -1200,14 +1246,18 @@ enum HeldPlan {
     /// The park's own export, as the worker takes it.
     Export,
     /// None: the attempt hands to a successor older than this build, which
+    /// takes a held pane's screen alone (by design).
     OlderSuccessor,
     /// None: the successor's policy carries no scrollback (by request).
     Withheld,
     /// None, though one was offered: the export never reached the panes (it
+    /// could not start, or had not got to them) — a failure.
     NotExported,
 }
 
 /// One park of `app` written out as the worker writes it (the held panes'
+/// screens included) and read back by a successor of `shape`: what it made
+/// of the handoff, and the proof the parent waits for.
 fn hand_over_held(
     app: &mut crate::App,
     shape: ReceiverShape,
@@ -1321,6 +1371,7 @@ fn attempt_files(nonce: &str, suffix: &str) -> Vec<std::path::PathBuf> {
 }
 
 /// A pane kept open by `--hold` after its command exited keeps its final
+/// screen across an update while another session is live.
 #[test]
 fn a_held_exited_pane_keeps_its_screen() {
     let Some(_env) = env_alone() else { return };
@@ -1768,7 +1819,7 @@ fn a_held_exited_pane_keeps_its_screen() {
     ptys.release(app);
 }
 
-/// A HELD PANE'S TURN LEDGER CROSSES. A pane a
+/// A HELD PANE'S TURN LEDGER CROSSES.
 #[test]
 fn a_held_panes_turn_ledger_crosses_the_update() {
     let Some(_env) = env_alone() else { return };
@@ -1883,6 +1934,8 @@ fn a_held_panes_turn_ledger_crosses_the_update() {
 }
 
 /// The control for [`a_held_exited_pane_keeps_its_screen`]: the same held
+/// pane with no screen carried (a manifest with no `held` key) is a
+/// placeholder, and the restore places everything else exactly.
 #[test]
 fn an_older_producers_held_pane_is_still_its_placeholder() {
     let Some(_env) = env_alone() else { return };
@@ -1987,6 +2040,9 @@ fn an_older_producers_held_pane_is_still_its_placeholder() {
 }
 
 /// A held pane's failure the person had seen stays seen across an update, and its exit is not
+/// replayed as news: the producer carries whether the failure was seen
+/// (`HeldPaneCarry::failure_seen`), and the successor records the carried exit as the status it
+/// is, not a `status-change` event.
 #[test]
 fn a_held_panes_seen_failure_stays_seen_across_the_update() {
     let Some(_env) = env_alone() else { return };
@@ -2168,6 +2224,12 @@ fn a_held_panes_seen_failure_stays_seen_across_the_update() {
 }
 
 /// WHAT THE OWNER WAS TOLD AND HAS SEEN CROSSES THE UPDATE
+/// (`SessionRecord::status_seen`): the park stamps each session's status item
+/// memory on its manifest record (`App::status_carry_rows`), the shipping
+/// writer writes it, and this build's successor reads it back by sid — the
+/// asking session's told need, and the done its owner looked at, by when its
+/// task entered it — and, on the manifest itself
+/// (`SessionHandoff::fleet_told`), the fleet need its herald told.
 #[test]
 fn what_the_owner_was_told_and_has_seen_crosses_the_update() {
     use crate::status_item::StatusCarry;
@@ -2268,6 +2330,13 @@ fn what_the_owner_was_told_and_has_seen_crosses_the_update() {
 }
 
 /// THE AUTOPILOT'S END RIDES THE PARK, THE WIRE AND THE INTAKE TO THE
+/// SUCCESSOR'S GLASS (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.2.3,
+/// item 8; the review of `c5af3a7507`): an end nobody saw, standing on
+/// session 0's glass, is stamped by the test park (the fork lane's mirror,
+/// `park_desk_for_test`), written by the shipping writer and read back by
+/// the successor's real intake (`take_incoming_as`): the App's carry by sid
+/// (`IncomingHandoff::end_carry`, `seamless::end_carry_of`) and the adopted
+/// shell's row (`Adopted::autopilot_end`).
 #[test]
 fn the_autopilot_end_rides_the_park_and_the_intake_to_the_successor() {
     use crate::harness_end_carry::{CarriedEnd, EndCarry};

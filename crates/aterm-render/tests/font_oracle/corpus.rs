@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The std-only half of the font oracle: the corpus line format, the FNV-1a
-//! digest every answer is written with, and the table of faces the corpus
-//! records. `probe.rs` (the rustybuzz half) and `tests/font_oracle/recorder`
-//! include it by `#[path]`, and so do `aterm-font`'s replay (TF.3 of
-//! docs/AUDIT-third-party-2026-10-15.md) and aterm-render's CoreText emoji
-//! replay (TF.6); `reader.rs`, the reader half, and `shaper.rs`, aterm-font's
-//! shaping half, read it as `super::corpus`.
-//!
-//! So this file names only `std`.
+//! Font oracle corpus format, FNV-1a digest, and face table.
 
 use std::fmt::Write as _;
 
@@ -55,17 +47,14 @@ impl Fnv {
 }
 
 /// The key a face's answers are filed under: the FNV-1a 64 of the whole font
-/// file. A system font that is absent, or that an OS update replaced, has no
-/// lines under its current key, so its old answers are skipped, never failed.
+/// file.
 pub(crate) fn file_key(bytes: &[u8]) -> String {
     let mut h = Fnv::new();
     h.bytes(bytes);
     h.hex()
 }
 
-/// Where a face file lives. `Repo` paths are relative to aterm-render's
-/// manifest directory and are always present; `System` paths are the host's
-/// own fonts, which are never committed (their licences forbid it).
+/// Where a face file lives.
 #[derive(Clone, Copy)]
 pub(crate) enum Origin {
     Repo(&'static str),
@@ -142,7 +131,6 @@ const fn sys(
 /// `COLOR_EMOJI_CANDIDATES` in `src/lib.rs`) plus the script faces the macOS
 /// coverage scan reaches for Arabic, Hebrew and Devanagari.
 pub(crate) const FACES: &[FaceFile] = &[
-    // Bundled: the Linux/Windows default stack and the selectable families.
     repo(
         "JetBrainsMono-Regular",
         "assets/bundled/JetBrainsMono-Regular.ttf",
@@ -212,12 +200,6 @@ pub(crate) const FACES: &[FaceFile] = &[
         READ | HINT,
     )
     .of("IosevkaTerm-Regular"),
-    // The Windows default since 2026-10-16, Iosevka Term Semibold: subsets of
-    // the SemiBold and ExtraBold cuts and their italics, without `calt`, so
-    // the run shaper reaches them only under a configured `frac`, `numr` or
-    // `dnom`. Their hinting answers were recorded on Windows 2026-10-16,
-    // where the recorder answered every committed face's lines as recorded
-    // on macOS.
     repo(
         "IosevkaTerm-SemiBold",
         "assets/bundled/IosevkaTerm-SemiBold.ttf",
@@ -261,9 +243,6 @@ pub(crate) const FACES: &[FaceFile] = &[
         "assets/SymbolsNerdFontMono-Regular.ttf",
         READ | HINT,
     ),
-    // The display faces (`assets/game`): `font_family = "display:<id>"`
-    // makes one the primary (`display_face_mix_for_family`). Cinzel is the
-    // committed variable face; Chewy has no GSUB, so the gate never shapes it.
     repo(
         "Cinzel-var",
         "assets/game/Cinzel-var.ttf",
@@ -280,8 +259,6 @@ pub(crate) const FACES: &[FaceFile] = &[
         READ | PRIMARY,
     ),
     repo("Monocraft", "assets/game/Monocraft.ttf", READ | PRIMARY),
-    // Test fixtures: the ligature suites' JetBrains Mono, and the COLR v1 test
-    // fonts (no system face on macOS carries COLR).
     repo(
         "fixture-jetbrains-mono",
         "tests/fixtures/jetbrains-mono.ttf",
@@ -293,14 +270,11 @@ pub(crate) const FACES: &[FaceFile] = &[
         "tests/fixtures/colr_1_variable.ttf",
         READ,
     ),
-    // The one committed CFF face (OFL), so every host replays CFF outlines
-    // and their grid fit.
     repo(
         "fixture-NotoSansSunuwar",
         "tests/fixtures/NotoSansSunuwar-Regular.otf",
         READ | HINT,
     ),
-    // macOS: the primary candidates and their styled siblings.
     sys(
         "SFNSMono",
         "/System/Library/Fonts/SFNSMono.ttf",
@@ -345,8 +319,6 @@ pub(crate) const FACES: &[FaceFile] = &[
         &[0],
         READ | PRIMARY,
     ),
-    // `styled_sibling_paths` finds Courier New's styled faces as separate
-    // files (`<stem> Bold`, `<stem> Italic`, `<stem> Bold Italic`).
     sys(
         "CourierNew-Bold",
         "/System/Library/Fonts/Supplemental/Courier New Bold.ttf",
@@ -368,7 +340,6 @@ pub(crate) const FACES: &[FaceFile] = &[
         READ,
     )
     .of("CourierNew"),
-    // macOS: the colour face and the fallback, symbol and script faces.
     sys(
         "AppleColorEmoji",
         "/System/Library/Fonts/Apple Color Emoji.ttc",
@@ -403,32 +374,12 @@ pub(crate) const FACES: &[FaceFile] = &[
     sys("SFArabic", "/System/Library/Fonts/SFArabic.ttf", &[0], READ),
     sys("GeezaPro", "/System/Library/Fonts/GeezaPro.ttc", &[0], READ),
     sys("Kohinoor", "/System/Library/Fonts/Kohinoor.ttc", &[0], READ),
-    // The SF India collection: one variable CFF2 face per Indic script, the
-    // only CFF2 outlines a Mac ships (TF.3: `aterm-font`'s CFF2 interpreter
-    // is held to them, at every instance `reader_instances` picks).
     sys(
         "SFIndia",
         "/System/Library/Fonts/SFIndia.ttc",
         &[0, 1, 2, 3, 4, 5, 6, 7, 8],
         READ | HINT,
     ),
-    // Linux and Windows: the colour faces, the CJK face aterm's Linux fallback
-    // chain loads (CFF), and a CFF2 candidate, recorded when the corpus is
-    // blessed on a host that has them. An absent path records nothing.
-    //
-    // Recorded in the Linux lane (Ubuntu 24.04, L-FONTS of
-    // docs/AUDIT-third-party-2026-10-15.md, 2026-10-19): Noto Color Emoji
-    // 2.047 (`fonts-noto-color-emoji`) is the CBDT build, with `GSUB` and no
-    // `GPOS` or `COLR`, and its `shape` lines came from the recorder's
-    // `shape` mode on rustybuzz. Every emoji case shapes to one glyph with no
-    // offset (VS15 adds a zero-advance glyph), so there is no mark for
-    // `GPOS` MarkBase, or rustybuzz's fallback placement, to position, and
-    // aterm-font's shaper carves neither. `fonts-noto-cjk` 1:20230817
-    // installs static CFF collections only (Noto Sans CJK Regular is ten
-    // faces, five regions' Sans and Sans Mono); Ubuntu ships no variable CJK
-    // build, so the CFF2 path below is absent there (Noto ships it as
-    // `*-VF.otf.ttc`; the `*-VF.ttf.ttc` build is TrueType).
-    // Segoe UI Emoji waits on a bless on Windows.
     sys(
         "NotoColorEmoji",
         "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
@@ -463,9 +414,7 @@ pub(crate) const FACES: &[FaceFile] = &[
 
 /// The clusters `Renderer::shape_cluster` shapes on the colour face: the
 /// `emoji.*` case of every [`EMOJI`] face's `shape` lines, with no features
-/// and no coordinates. `tests/font_oracle.rs` answers them with aterm-font's
-/// shaper, and the recorder's `shape` mode records them with rustybuzz on a
-/// host whose colour face no bless has recorded yet.
+/// and no coordinates.
 pub(crate) const EMOJI_CASES: &[(&str, &str)] = &[
     ("emoji.grin", "\u{1F600}"),
     ("emoji.heart-vs16", "\u{2764}\u{FE0F}"),
@@ -507,23 +456,10 @@ pub(crate) const EMOJI_CASES: &[(&str, &str)] = &[
 
 /// The faces whose `read` answers live in `reader-gvar-alloc.txt`, not
 /// `reader.txt`: each has glyphs with more than 32 `gvar` tuples, which
-/// ttf-parser 0.25.1 draws only under its `gvar-alloc` feature. aterm's Linux
-/// build turned that on (winit's `wayland-csd-adwaita` -> sctk-adwaita ->
-/// ab_glyph, until LW.5 retired the three), its macOS, Windows and wasm builds
-/// did not, and without it such a
-/// glyph has no outline at any instance. `tests/font_oracle.rs` reads
-/// ttf-parser as `-p aterm-render` resolves it (no `gvar-alloc`), so these
-/// faces are recorded by the recorder, which builds it with the feature; a
-/// replay of `reader.txt` there shows no `FACES` face answers differently
-/// with it. Measured 2026-10-16 over every face in `/System/Library/Fonts`,
-/// `/Library/Fonts` and this crate's assets: these four are the only ones.
-// Read by the recorder and aterm-font's replay; `tests/font_oracle.rs` never
-// records these faces.
+/// ttf-parser 0.25.1 draws only under its `gvar-alloc` feature.
 #[allow(dead_code)]
 pub(crate) const GVAR_ALLOC_FACES: &[FaceFile] = &[
-    // SF Pro: 2,590 of its 2,954 glyphs.
     sys("SFNS", "/System/Library/Fonts/SFNS.ttf", &[0], READ),
-    // 268, 43 and 64 glyphs; one composite in #2 has a component that does.
     sys(
         "ADTNumeric",
         "/System/Library/Fonts/ADTNumeric.ttc",
@@ -637,7 +573,7 @@ pub(crate) fn pin(answer: String) -> String {
 }
 
 /// One corpus line: eight TAB-separated fields, the last of which is the
-/// answer. Everything before it is the case's identity and its inputs.
+/// answer.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Line {
     /// `shape` (rustybuzz), `read` (ttf-parser), `font` (aterm's `font::Font`)

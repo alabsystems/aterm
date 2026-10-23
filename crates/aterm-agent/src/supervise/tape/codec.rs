@@ -1,45 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A TAPE'S ITEMS, AS BYTES: what a records frame holds ([`super::frame`]),
-//! one item after another.
-//!
-//! An item is an astream [`EffectRecord`] — a clock read, a random word, a
-//! file read or its failure, a monotonic read, a reply door's round trip, an
-//! output, a raised flag — or one of aterm's own beside them: a [`Item::Note`]
-//! a reader of the tape wants and a replay skips, a [`Mark`] in the run, and
-//! the run's [`End`]. A reply door's crossing and a raised flag's first true
-//! read carry a [`Stamp`]: where the clocks stood when the door was crossed,
-//! which an acts-mode replay runs its virtual time on, so a build that reads
-//! the clock more often still replays.
-//!
-//! The encoding (the replay plan's §6.2), chosen so a busy hour of a
-//! supervising loop — the same screen read every twenty seconds, the same few
-//! doors, clocks a few milliseconds apart — costs little:
-//! * every integer is a LEB128 varint, a signed one zigzagged first;
-//! * a name (a door, a note's kind, a path's root) is spelled the first time a
-//!   file uses it and referred to by number after that: [`Encoder`] and
-//!   [`Decoder`] each keep the file's table, which starts empty;
-//! * a `Mono` or `Clock` read is stored as the difference from the previous
-//!   one of its kind, and a stamp as the difference from the previous stamp —
-//!   a step of a few milliseconds is two or three bytes. Differences wrap, so
-//!   every value round-trips, a clock that steps back included;
-//! * a reply door's reply and an output's bytes are stored against the
-//!   previous body under the same key ([`super::delta`]): a screen that did not
-//!   change is one byte, a screen whose bottom rows did is its middle;
-//! * an I/O error's kind is one byte of a fixed table ([`KINDS`]); a kind the
-//!   table does not hold (a newer standard library's) is written as `Other`,
-//!   a documented loss;
-//! * a path under one of the run's roots (`@ledger/s-1.jsonl`, the header's
-//!   spelling) is its root's name, interned, and the rest.
-//!
-//! The decoder's state crosses frames (the name table, the clocks, the
-//! bodies), so a tape decodes from its start, frame after frame; a frame is
-//! taken whole or not at all ([`super::recover`]).
-//!
-//! Also here, the control lane's own request and reply forms
-//! ([`ctl_request`], [`ctl_reply`]): the bytes a `ctl` door's `Exchange`
-//! carries, which the recorder writes and a replay reads back.
+//! Tape item codec ([`super::frame`], [`EffectRecord`], [`Item::Note`], [`Mark`], [`End`],
+//! [`Stamp`], [`Encoder`], [`Decoder`], [`super::delta`], [`KINDS`], [`super::recover`],
+//! [`ctl_request`], [`ctl_reply`]).
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -49,10 +13,7 @@ use astream_effects::EffectRecord;
 use super::delta;
 use crate::supervise::CtlReply;
 
-/// Where the clocks stood when a door was crossed: the monotonic clock in
-/// nanoseconds since the tape's origin, and the wall clock in Unix
-/// milliseconds. Read from the loop's clocks without advancing them (a test's
-/// scripted clock jumps at its next READ, and a recorder must not move it).
+/// Where the clocks stood when a door was crossed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Stamp {
     pub mono_ns: u64,
@@ -62,19 +23,16 @@ pub struct Stamp {
 /// One item of a tape ([module docs](self)).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
-    /// An effect the loop crossed a door for, astream's own record; with the
-    /// clocks' stamp when the recorder took one (a reply door, a raised flag).
+    /// An effect the loop crossed a door for, astream's own record.
     Effect {
         record: EffectRecord,
         stamp: Option<Stamp>,
     },
-    /// Something a reader of the tape wants and a replay never consumes: a
-    /// turn-end fold's state, the context a `why` answer prints.
+    /// Something a reader of the tape wants and a replay never consumes.
     Note { kind: String, text: String },
     /// A mark in the run; it closes its frame, so it is on disk at once.
     Mark(Mark),
-    /// The run's end; it closes its frame, and its frame is the one the tape
-    /// is made durable after.
+    /// The run's end; it closes its frame, and its frame is the one the tape is made durable after.
     End(End),
 }
 
@@ -106,8 +64,7 @@ impl Item {
         }
     }
 
-    /// Whether this item closes the frame it is in: a mark and the end are
-    /// written at once.
+    /// Whether this item closes the frame it is in: a mark and the end are written at once.
     #[must_use]
     pub fn closes_frame(&self) -> bool {
         matches!(self, Self::Mark(_) | Self::End(_))
@@ -117,13 +74,9 @@ impl Item {
 /// A mark in the run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mark {
-    /// A door reached inside another door's live call ran live and was taped
-    /// nowhere: what the outer door answered already holds its effect (the
-    /// nesting rule, the replay plan's §4.4). Written once per pair.
+    /// A door reached inside another door's live call ran live and was taped nowhere.
     Nested { inner: String, outer: String },
-    /// The run reached its cap: the effect at ordinal `door` (counting every
-    /// effect from the tape's first, 0-based) and everything after it are not
-    /// on the tape. Nothing follows this mark.
+    /// The run reached its cap.
     Truncated { door: u64 },
 }
 
@@ -132,16 +85,13 @@ pub enum Mark {
 pub enum End {
     /// The loop returned; `how` is its outcome as the run said it.
     Returned { how: String },
-    /// The loop was suspended for a seamless update: the successor's run opens
-    /// a tape of its own.
+    /// The loop was suspended for a seamless update: the successor's run opens a tape of its own.
     Suspended,
     /// The loop unwound: a panic, with its message.
     Unwound { message: String },
 }
 
-/// A frame's bytes that are not the items they claim to be: a writer's bug,
-/// or a tape from a build whose items this one does not read. Never damage —
-/// a damaged frame fails its checksum before its items are read.
+/// A frame's bytes that are not the items they claim to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodecError {
     /// The offset in the frame's raw bytes.
@@ -155,7 +105,6 @@ impl std::fmt::Display for CodecError {
     }
 }
 
-// The item tags. Zero is no item. The high bit says a stamp follows the tag.
 const CLOCK: u8 = 1;
 const RAND: u8 = 2;
 const FILE: u8 = 3;
@@ -169,23 +118,17 @@ const MARK: u8 = 10;
 const END: u8 = 11;
 const STAMPED: u8 = 0x80;
 
-// A path's forms: as it is, a root alone (`@ledger`), or under a root
-// (`@ledger/s-1.jsonl`).
 const PATH_VERBATIM: u8 = 0;
 const PATH_ROOT: u8 = 1;
 const PATH_UNDER: u8 = 2;
 
-// A mark's and an end's forms.
 const MARK_NESTED: u8 = 0;
 const MARK_TRUNCATED: u8 = 1;
 const END_RETURNED: u8 = 0;
 const END_SUSPENDED: u8 = 1;
 const END_UNWOUND: u8 = 2;
 
-/// THE ERROR KINDS' TABLE: a failed file read's kind as one byte. Append-only,
-/// as every code a tape holds must keep meaning what it meant: a kind added to
-/// the standard library takes the next code. A kind not here is written as
-/// `Other` (code 0), and a code this build does not know reads as `Other`.
+/// THE ERROR KINDS' TABLE: a failed file read's kind as one byte.
 pub(crate) const KINDS: [(u8, ErrorKind); 39] = [
     (0, ErrorKind::Other),
     (1, ErrorKind::NotFound),
@@ -236,8 +179,7 @@ pub(crate) fn kind_code(kind: ErrorKind) -> u8 {
         .map_or(0, |(code, _)| *code)
 }
 
-/// The kind `code` stands for ([`KINDS`]); `Other` for a code this build
-/// does not know.
+/// The kind `code` stands for ([`KINDS`]); `Other` for a code this build does not know.
 pub(crate) fn kind_of(code: u8) -> ErrorKind {
     KINDS
         .iter()
@@ -368,9 +310,7 @@ impl<'a> Input<'a> {
     }
 }
 
-/// A path's root and what is under it, when it is written under one of the
-/// header's roots (`@<root>` or `@<root>/<rest>`, `Roots::encode`'s
-/// spelling); `None` for any other path, one starting `@@` included.
+/// A path's root and what is under it.
 fn rooted(path: &str) -> Option<(&str, Option<&str>)> {
     let rest = path.strip_prefix('@')?;
     if rest.starts_with('@') {
@@ -490,8 +430,7 @@ impl Encoder {
         }
     }
 
-    /// A name: its number once the file has spelled it, else zero and the
-    /// name, which takes the next number.
+    /// A name: its number once the file has spelled it.
     fn name(&mut self, name: &str, out: &mut Vec<u8>) {
         if let Some(id) = self.names.get(name) {
             put_varint(out, id.saturating_add(1));
@@ -522,13 +461,11 @@ impl Encoder {
     }
 }
 
-/// What a file's decoder carries from one item to the next: the
-/// [`Encoder`]'s state, rebuilt from the bytes.
+/// What a file's decoder carries from one item to the next: the [`Encoder`]'s state.
 #[derive(Debug, Default)]
 pub(crate) struct Decoder {
     names: Vec<String>,
-    /// The bytes of every name in `names`: what the table holds, which a
-    /// reader counts against its bound (`super::recover::HELD_MAX`).
+    /// The bytes of every name in `names`.
     spelled: usize,
     clock: u64,
     mono: u64,
@@ -680,9 +617,7 @@ impl Decoder {
     }
 }
 
-/// THE CONTROL LANE'S REQUEST, as an `Exchange`'s request bytes: the count of
-/// its words, then each word length first. A replay compares these bytes, so
-/// the words are kept exactly.
+/// THE CONTROL LANE'S REQUEST, as an `Exchange`'s request bytes.
 #[must_use]
 pub fn ctl_request(args: &[&str]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -696,7 +631,6 @@ pub fn ctl_request(args: &[&str]) -> Vec<u8> {
 /// [`ctl_request`]'s words, read back.
 ///
 /// # Errors
-///
 /// Bytes [`ctl_request`] did not write.
 pub fn ctl_args(request: &[u8]) -> Result<Vec<String>, CodecError> {
     let mut input = Input::new(request);
@@ -714,17 +648,7 @@ pub fn ctl_args(request: &[u8]) -> Result<Vec<String>, CodecError> {
 const REPLY_OK: u8 = 0;
 const REPLY_ERR: u8 = 1;
 
-/// THE CONTROL LANE'S REPLY, as an `Exchange`'s reply bytes: `0`, the exit
-/// code, the stderr length first, then the stdout to the end; or `1` and a
-/// transport error's text to the end.
-///
-/// The stdout goes LAST, unprefixed, so a screen read's reply begins with the
-/// same bytes as the last one did until the screen itself differs: a reply is
-/// stored against the previous one under its request by their common prefix
-/// and suffix ([`super::delta`]), and a stdout length ahead of the screen
-/// would differ whenever the screen's length did and end that prefix three
-/// bytes in. (The replay plan's §6.2 lists the fields as code, stdout,
-/// stderr; the order is what changed, for that reason.)
+/// Control lane `Exchange` reply bytes ([`super::delta`]).
 #[must_use]
 pub fn ctl_reply(reply: &Result<CtlReply, String>) -> Vec<u8> {
     let mut out = Vec::new();
@@ -750,7 +674,6 @@ pub fn ctl_reply(reply: &Result<CtlReply, String>) -> Vec<u8> {
 /// [`ctl_reply`]'s reply, read back.
 ///
 /// # Errors
-///
 /// Bytes [`ctl_reply`] did not write.
 pub fn ctl_reply_of(bytes: &[u8]) -> Result<Result<CtlReply, String>, CodecError> {
     let mut input = Input::new(bytes);

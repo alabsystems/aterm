@@ -2,34 +2,21 @@
 // Copyright 2026 Andrew Yates
 
 //! [`Ast`] → NFA [`Program`], under a hard ceiling.
-//!
-//! A Thompson construction emitted right-to-left: each fragment is compiled knowing the
-//! instruction it continues to, so concatenation is a fold from the end with no
-//! back-patching. The loops (`*`, `+`, `{n,}`) are the exception: an [`Inst::Jump`]
-//! placeholder is reserved first and overwritten with the real [`Inst::Split`] once the
-//! body's entry is known.
-//!
-//! There is one instruction per code point a pattern can consume, so `x{n}` costs `n`
-//! instructions and a thirteen-byte pattern can ask for a multi-megabyte automaton. The
-//! `size_limit` budget is charged in bytes on every instruction pushed (see
-//! [`INST_COST`]), so an oversized pattern fails early instead of allocating.
 
 use crate::Error;
 use crate::parse::{Assertion, Ast, ClassSet};
 use crate::pikevm::Thread;
 
-/// One NFA instruction. `next`/`a`/`b` are indices into [`Program::insts`].
+/// One NFA instruction.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Inst {
     /// Consume exactly this code point, then go to `next`.
     Char { c: char, next: usize },
     /// Consume one code point from `Program::classes[class]`, then go to `next`.
     Class { class: usize, next: usize },
-    /// Zero width: follow `a` first, then `b`. Order *is* the match priority.
+    /// Zero width: follow `a` first, then `b`.
     Split { a: usize, b: usize },
-    /// Zero width, unconditional. Only the placeholder a loop reserves before its body's
-    /// entry is known, then overwritten with a [`Split`](Self::Split), so a finished
-    /// program holds none; every walk handles it anyway.
+    /// Zero width, unconditional.
     Jump { next: usize },
     /// Zero width, conditional on the surrounding text.
     Assert { kind: Assertion, next: usize },
@@ -37,32 +24,25 @@ pub(crate) enum Inst {
     Match,
 }
 
-/// Bytes one instruction is charged against `size_limit`: the instruction plus, in each
-/// of the Pike VM's two thread lists, a `Thread` slot and a generation stamp.
+/// Bytes one instruction is charged against `size_limit`: the instruction plus, in each of the Pike VM's two thread lists, a `Thread` slot and a generation stamp.
 pub(crate) const INST_COST: usize =
     size_of::<Inst>() + 2 * (size_of::<Thread>() + size_of::<u32>());
 
-/// A compiled pattern: instructions, the class table they index, and the
-/// prefilter.
+/// A compiled pattern: instructions, the class table they index, and the prefilter.
 #[derive(Debug)]
 pub(crate) struct Program {
     pub(crate) insts: Vec<Inst>,
     pub(crate) classes: Vec<ClassSet>,
     pub(crate) start: usize,
-    /// The prefilter, when one can be armed. See [`Prefilter`].
+    /// The prefilter, when one can be armed.
     pub(crate) first: Option<Prefilter>,
-    /// Every path out of `start` passes a `\A` before it can consume or accept,
-    /// so the pattern can only match at offset 0. See [`start_anchored`].
+    /// Every path out of `start` passes a `\A` before it can consume or accept, so the pattern can only match at offset 0.
     pub(crate) start_anchored: bool,
-    /// `classes[i]`'s membership over U+0000..U+007F, one bit per code point, parallel to
-    /// `classes`. Kept apart from `ClassSet` for locality (sixteen bytes per class in the
-    /// hot loop), and because a `ClassSet` is mutated while parsing (ranges added, folded,
-    /// negated): built once the classes are frozen, the bitmap cannot go stale.
+    /// `classes[i]`'s membership over U+0000..U+007F, one bit per code point, parallel to `classes`.
     pub(crate) class_ascii: Vec<u128>,
 }
 
 /// Compile `ast` into a program of at most `size_limit` bytes.
-///
 /// # Errors
 /// [`Error::CompiledTooBig`] once the program passes the ceiling.
 pub(crate) fn compile(ast: &Ast, size_limit: usize) -> Result<Program, Error> {
@@ -88,9 +68,6 @@ pub(crate) fn compile(ast: &Ast, size_limit: usize) -> Result<Program, Error> {
 }
 
 /// Membership of `set` over U+0000..U+007F, one bit per code point.
-///
-/// The whole answer, not a hint: negation and the perl classes are folded in, so the
-/// caller never consults the set as well.
 fn ascii_bitmap(set: &ClassSet) -> u128 {
     let mut bits: u128 = 0;
     for code in 0u32..128 {
@@ -168,27 +145,6 @@ impl Compiler {
     }
 
     /// Emit a quantified subexpression.
-    ///
-    /// `x*` takes one of two shapes, chosen by whether the body can match the empty
-    /// string, as `regex` does:
-    ///
-    /// * Non-nullable body: one split is both entry and loop head. Every iteration
-    ///   consumes, so the loop never returns to its head without progress.
-    /// * Nullable body: an entry split plus the post-body split. With one shared split,
-    ///   `(|a)*` returns to the head having consumed nothing, a state already entered at
-    ///   this position, so that path dies and the `a` branch wrongly wins; the post-body
-    ///   split's exit arm instead reaches `Match` first.
-    ///
-    /// The two-split shape for every star would be a different bug: the extra hop reorders
-    /// the exit against the body's alternatives when a thread resumes mid-body
-    /// (`(.*?){2,}\b` on `" ab"` must end at 1, not 3).
-    ///
-    /// The mandatory copies stop at a fixed point. `size_limit` is charged per push, so a
-    /// `min` replaying a body that emits nothing (`(?:){n}`, `(?:a{0}){n}`) would loop
-    /// `min` times without consulting it, and `(?:(?:){4294967295}){4294967295}` would
-    /// never finish. [`Compiler::emit`] returns `next` unchanged exactly when it emitted
-    /// nothing (every push returns a fresh, larger index), so the first no-op copy ends
-    /// the loop; the emitted program is the same.
     fn emit_repeat(
         &mut self,
         node: &Ast,
@@ -198,7 +154,6 @@ impl Compiler {
         next: usize,
     ) -> Result<usize, Error> {
         match max {
-            // `x{n,}`: one self-re-entering body behind the mandatory copies.
             None => {
                 let post = self.push(Inst::Jump { next })?;
                 let body = self.emit(node, post)?;
@@ -207,7 +162,6 @@ impl Compiler {
                     let mut entry = body;
                     for _ in 0..min - 1 {
                         let copy = self.emit(node, entry)?;
-                        // A body that emits nothing is a fixed point; see above.
                         if copy == entry {
                             break;
                         }
@@ -218,14 +172,8 @@ impl Compiler {
                 if matches_empty(node) {
                     return self.push(split(body, next, greedy));
                 }
-                // Non-nullable body: the loop head doubles as the entry, so
-                // hand the same split back rather than emitting a second.
                 Ok(post)
             }
-            // `x{n,m}` — a chain of m-n nested optionals, then the n mandatory
-            // copies. Building the chain right to left makes every optional's
-            // bail-out land on the same `next`, which is what "skip one, skip
-            // all the rest" requires.
             Some(max) => {
                 let mut entry = next;
                 for _ in 0..max.saturating_sub(min) {
@@ -234,7 +182,6 @@ impl Compiler {
                 }
                 for _ in 0..min {
                     let copy = self.emit(node, entry)?;
-                    // Same fixed point as the `{n,}` arm above.
                     if copy == entry {
                         break;
                     }
@@ -246,8 +193,7 @@ impl Compiler {
     }
 }
 
-/// Can `ast` match the empty string? Decides which of the two `x*` shapes
-/// [`Compiler::emit_repeat`] uses, and nothing else.
+/// Can `ast` match the empty string?
 fn matches_empty(ast: &Ast) -> bool {
     match ast {
         Ast::Empty | Ast::Assert(_) => true,
@@ -269,21 +215,11 @@ const fn split(body: usize, exit: usize, greedy: bool) -> Inst {
 }
 
 /// What a match can begin with: the search's fast path over uninteresting text.
-///
-/// `pcs` are the consuming instructions a match's first code point can come from;
-/// `lead_bytes` marks the leading UTF-8 byte of every such code point, so a position is
-/// rejected with one array lookup. Both are supersets: the search skips a position only
-/// when nothing here could match there, so an over-broad prefilter costs time, never a
-/// match.
 #[derive(Debug)]
 pub(crate) struct Prefilter {
     pub(crate) pcs: Box<[usize]>,
     pub(crate) lead_bytes: [bool; 256],
-    /// The same marking for the second code point, when every path has one; `None` for a
-    /// pattern that can stop after its first. It pays for a common lead byte: `(?i)ERROR`
-    /// marks `E` and `e`, about a tenth of terminal output, and nearly all those positions
-    /// fail on the second character, which one more lookup rejects before the simulation
-    /// is entered.
+    /// The same marking for the second code point, when every path has one; `None` for a pattern that can stop after its first.
     pub(crate) second_bytes: Option<[bool; 256]>,
 }
 
@@ -293,10 +229,6 @@ const MAX_FIRST: usize = 16;
 /// The consuming instructions reachable from `starts` without consuming
 /// anything: the epsilon closure, stopped at the first thing that eats a code
 /// point.
-///
-/// `None` when the closure reaches [`Inst::Match`] — the pattern can stop here,
-/// so there is no code point to filter on — or when it grows past
-/// [`MAX_FIRST`].
 fn consuming_closure(insts: &[Inst], starts: &[usize]) -> Option<Vec<usize>> {
     let mut seen = vec![false; insts.len()];
     let mut stack: Vec<usize> = starts.to_vec();
@@ -347,11 +279,6 @@ fn mark_leads(insts: &[Inst], classes: &[ClassSet], pcs: &[usize]) -> Option<[bo
 }
 
 /// What the code point after the first can begin with, when every path has one.
-///
-/// The instructions' `next` is reached only once the first code point is consumed, so the
-/// closure there holds what is consumed second. If it reaches `Match`, the pattern can
-/// stop after one code point: [`consuming_closure`] returns `None` and the filter stays
-/// disarmed.
 fn second_set(insts: &[Inst], classes: &[ClassSet], first_pcs: &[usize]) -> Option<[bool; 256]> {
     let nexts: Vec<usize> = first_pcs
         .iter()
@@ -368,10 +295,6 @@ fn second_set(insts: &[Inst], classes: &[ClassSet], first_pcs: &[usize]) -> Opti
 }
 
 /// Compute [`Program::first`]: what a match can begin with, if that is knowable.
-///
-/// Walks through assertions: they consume nothing, so assuming each holds only widens the
-/// set, and `\bcommit` and `^ERROR` keep a fast path. `None` when the pattern can match
-/// the empty string (every position can begin a match) or the set passes [`MAX_FIRST`].
 fn first_set(insts: &[Inst], classes: &[ClassSet], start: usize) -> Option<Prefilter> {
     let out = consuming_closure(insts, &[start])?;
     let mut lead_bytes = [false; 256];
@@ -398,11 +321,6 @@ fn first_set(insts: &[Inst], classes: &[ClassSet], start: usize) -> Option<Prefi
 }
 
 /// Compute [`Program::start_anchored`]: can this pattern match only at offset 0?
-///
-/// True when every path out of `start` reaches a `\A` before anything that consumes or
-/// accepts; unlike [`first_set`], which walks through assertions, this stops at `\A`.
-/// Only [`Assertion::StartText`] anchors: `(?m)^` holds after every newline. Reaching
-/// [`Inst::Match`] (`^a|`, the empty pattern) means it can match empty at any offset.
 fn start_anchored(insts: &[Inst], start: usize) -> bool {
     let mut seen = vec![false; insts.len()];
     let mut stack = vec![start];
@@ -416,7 +334,6 @@ fn start_anchored(insts: &[Inst], start: usize) -> bool {
         }
         *slot = true;
         match insts.get(pc) {
-            // Anchored on this path: whatever follows runs only at 0.
             Some(&Inst::Assert {
                 kind: Assertion::StartText,
                 ..
@@ -426,7 +343,6 @@ fn start_anchored(insts: &[Inst], start: usize) -> bool {
                 stack.push(b);
             }
             Some(&Inst::Jump { next } | &Inst::Assert { next, .. }) => stack.push(next),
-            // Consumes, or accepts, with no `\A` behind it.
             Some(&Inst::Char { .. } | &Inst::Class { .. } | &Inst::Match) | None => return false,
         }
     }
@@ -465,7 +381,6 @@ mod tests {
         assert_eq!(second("(?i)ERROR"), Some(vec!['R', 'r']));
         assert_eq!(second("[ab]c"), Some(vec!['c']));
         assert_eq!(second("ab|cd"), Some(vec!['b', 'd']));
-        // Assertions consume nothing, so the second code point is still `o`.
         assert_eq!(second(r"c\bo"), Some(vec!['o']));
 
         for pattern in [
@@ -485,8 +400,7 @@ mod tests {
     }
 
     /// The ASCII bitmap is consulted instead of its class, so the two must agree over all
-    /// of ASCII. The cases cover negation, symbolic perl classes, fold before negate
-    /// (`(?i)[^k]`), and classes above or spanning the ASCII boundary.
+    /// of ASCII.
     #[test]
     fn the_ascii_bitmap_agrees_with_the_class_it_stands_in_for() {
         for pattern in [
@@ -533,8 +447,7 @@ mod tests {
     }
 
     /// `start_anchored` lets the search stop walking, so a false positive is a missed
-    /// match. Each negative contains a `^` yet has a path to a consuming instruction or
-    /// `Match` that does not pass one.
+    /// match.
     #[test]
     fn start_anchored_is_exact_about_which_patterns_can_only_match_at_zero() {
         for pattern in [
@@ -557,20 +470,15 @@ mod tests {
             );
         }
         for pattern in [
-            // An unanchored branch.
             r"a|^b",
             r"^a|b",
             r"(^|x)y",
             r"(?:^)|a",
-            // A loop or an option that can be skipped entirely, so `Match` is
-            // reachable without the assertion.
             r"(^a)*",
             r"(?:^a)?b",
-            // `(?m)^` is `StartLine`, satisfied after every newline.
             r"(?m)^a",
             r"(?m:^)a",
             r"(?:(?m)^)a",
-            // No `^` at all, and the empty pattern, which matches everywhere.
             r"a",
             r"\bcommit",
             r"",
@@ -607,7 +515,6 @@ mod tests {
                     "{pattern:?} marked continuation byte {b:#04x}"
                 );
             }
-            // Anything the pattern can start with must survive the byte test.
             for cp in [
                 0u32,
                 b'a'.into(),

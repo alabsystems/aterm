@@ -1,18 +1,14 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! [`Tools`]: every external program a pack runs (the build driver, a compiler's `-vV`,
-//! the smoke and hello probes, `strip`, `codesign`, `lipo`, [`super::relocate`]), each
-//! spelled once in [`HostTools`]. [`super::pack`] and [`super::bundle`] call nothing else,
-//! so their tests drive a fake over crafted trees, with no build, signing service or
-//! toolchain on the box.
+//! External tool runner for package builds ([`Tools`], [`HostTools`],
+//! [`super::relocate`], [`super::pack`], [`super::bundle`]).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// The hang detector on a call that can block forever (`codesign` waiting on `trustd`, a
-/// compiler's `-vV`, a smoke probe, a `git` network step): never a latency budget.
+/// Hang-detector deadline for external tool calls that could block indefinitely.
 pub const HANG: Duration = Duration::from_secs(60);
 
 /// One child to run.
@@ -30,8 +26,7 @@ pub struct Run {
     pub env_remove: Vec<String>,
     /// Variables set for it.
     pub env: Vec<(String, OsString)>,
-    /// A hang detector: the child (and its process group) is killed past it. `None` for
-    /// a build, which takes as long as it takes.
+    /// A hang detector: the child (and its process group) is killed past it.
     pub deadline: Option<Duration>,
 }
 
@@ -98,8 +93,7 @@ impl Ran {
         self.code == Some(0)
     }
 
-    /// Whether the program actually executed: it exited with a code below 126 (126 and
-    /// 127 are the shell's "cannot execute" / "not found", and a signal is a crash).
+    /// Whether the program actually executed.
     #[must_use]
     pub fn executed(&self) -> bool {
         self.code.is_some_and(|c| c < 126)
@@ -134,47 +128,37 @@ impl std::fmt::Display for RunError {
 
 /// Every external program a pack runs.
 pub trait Tools {
-    /// Run a child to completion.
-    ///
+    /// Run a child to completion ([`RunError`]).
     /// # Errors
     ///
     /// [`RunError`] when it could not start or outran its deadline.
     fn run(&self, run: &Run) -> Result<Ran, RunError>;
 
-    /// Drop symbols from one object in place: `strip <file>` for a plain pack's bins,
-    /// `strip -x -S <file>` (debug stabs and local symbols; exported globals stay) for a
-    /// bundle's Mach-Os.
-    ///
+    /// Drop symbols from one object in place.
     /// # Errors
     ///
     /// Why it failed.
     fn strip(&self, file: &Path, locals_and_debug: bool) -> Result<(), String>;
 
-    /// Re-sign one Mach-O ad hoc (`codesign -f -s -`): `strip` regenerates only a
-    /// linker-signed signature, and arm64 kills a binary whose signature is invalid.
-    ///
+    /// Re-sign one Mach-O ad hoc (`codesign -f -s -`).
     /// # Errors
     ///
     /// Why it failed, or that the signing service did not answer.
     fn resign(&self, file: &Path) -> Result<(), String>;
 
-    /// Whether two Mach-Os are the same program once both code signatures are removed
-    /// (copies; the inputs are untouched).
-    ///
+    /// Whether two Mach-O binaries are identical after stripping code signatures.
     /// # Errors
     ///
     /// When the comparison could not be made.
     fn same_unsigned(&self, a: &Path, b: &Path) -> Result<bool, String>;
 
     /// Write the `arch` slice of a fat Mach-O to `out` (`lipo -thin`).
-    ///
     /// # Errors
     ///
     /// Why it failed.
     fn thin(&self, file: &Path, arch: &str, out: &Path) -> Result<(), String>;
 
     /// Pack-time relocation (`crate::artifact::relocate::relocate_stage`, donors already admitted).
-    ///
     /// # Errors
     ///
     /// The relocator's refusal.
@@ -186,7 +170,6 @@ pub trait Tools {
 }
 
 /// A compiler's `-vV`, bounded — the probe the client's lineage checker takes.
-///
 /// # Errors
 ///
 /// The text of why it did not answer.
@@ -206,7 +189,7 @@ pub fn version(tools: &dyn Tools, compiler: &Path) -> Result<String, String> {
     }
 }
 
-/// The tools of the machine this runs on.
+/// Host implementation of [`Tools`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HostTools;
 

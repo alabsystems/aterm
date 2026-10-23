@@ -34,6 +34,7 @@ impl Realm {
 }
 
 /// How many producers one session remembers marks for, per [`Realm`]; headroom
+/// over the handful of drivers a session sees.
 const PRODUCER_CAP: usize = 64;
 
 /// The state of the sequence at a producer's high-water mark.
@@ -43,7 +44,7 @@ enum Tip {
     Running,
     /// It ran and answered `OK` — a replay is a duplicate.
     Applied,
-    /// It ran and did not answer `OK`. It may or may not have reached the PTY,
+    /// It ran and did not answer `OK`.
     Unknown,
 }
 
@@ -60,7 +61,7 @@ struct Mark {
 #[derive(Default)]
 pub(crate) struct PtyIdem {
     marks: Mutex<HashMap<(Realm, u64), Mark>>,
-    /// Feeds `Mark::used`. Only the order matters (it picks the LRU victim), so an
+    /// Feeds `Mark::used`.
     clock: AtomicU64,
 }
 
@@ -71,7 +72,7 @@ pub(crate) struct Key {
     seq: u64,
 }
 
-/// The usage line every malformed key answers. One string, so the grammar is
+/// The usage line every malformed key answers.
 const USAGE: &str = "ERR usage: id=<epoch>:<producer>:<seq>\n";
 
 /// The answer to a well-formed key minted for another launch of the session: the head drivers key on, and where the live epoch is read.
@@ -101,14 +102,15 @@ pub(crate) fn parse_key(value: &str, live: LaunchNonce) -> Result<Key, String> {
     Ok(Key { producer, seq })
 }
 
-/// The claim one attempt holds while it runs. Settled by [`guarded`]; a drop
+/// The claim one attempt holds while it runs.
 struct Claim<'a> {
     idem: &'a PtyIdem,
     realm: Realm,
     key: Key,
-    /// The mark this claim displaced, restored on release. `None` when this
+    /// The mark this claim displaced, restored on release.
     prior: Option<Mark>,
     /// Set once the claim has been settled or released, so `Drop` knows there is
+    /// nothing left to decide.
     done: bool,
 }
 
@@ -120,6 +122,7 @@ impl Claim<'_> {
     }
 
     /// This attempt was refused before any byte could move: give the sequence
+    /// back so the driver's retry is a first attempt, not a duplicate.
     fn released(mut self) {
         self.idem.release(self.realm, self.key, self.prior);
         self.done = true;
@@ -145,7 +148,7 @@ impl PtyIdem {
         self.clock.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Reserve `key`'s sequence in `realm`, or answer for it. `dup` is the
+    /// Reserve `key`'s sequence in `realm`, or answer for it.
     fn claim(&self, realm: Realm, key: Key, dup: &str) -> Claimed<'_> {
         let used = self.tick();
         let slot = (realm, key.producer);
@@ -213,7 +216,7 @@ impl PtyIdem {
         })
     }
 
-    /// Move this claim's tip, only while the claim still owns the mark. A live claim
+    /// Move this claim's tip, only while the claim still owns the mark.
     fn settle(&self, realm: Realm, key: Key, tip: Tip) {
         let used = self.tick();
         let mut marks = self.marks.lock().unwrap_or_else(|p| p.into_inner());
@@ -227,6 +230,7 @@ impl PtyIdem {
     }
 
     /// Give the sequence back, restoring whatever this claim displaced — again
+    /// only while the claim still owns the mark.
     fn release(&self, realm: Realm, key: Key, prior: Option<Mark>) {
         let slot = (realm, key.producer);
         let mut marks = self.marks.lock().unwrap_or_else(|p| p.into_inner());
@@ -262,6 +266,8 @@ impl PtyIdem {
 }
 
 /// The answer `mark` gives for `key`, or `None` when `key` is above the mark and
+/// the decision is the caller's ([`PtyIdem::claim`] still refuses one while the
+/// producer has an attempt in flight).
 fn consumed_answer(mark: Mark, key: Key, dup: &str) -> Option<String> {
     if key.seq < mark.high_water {
         // to resolve an old in-doubt.
@@ -286,18 +292,21 @@ impl Drop for Claim<'_> {
     }
 }
 
-/// Whether `reply` is a refusal that cannot have followed a write. Two prefixes,
+/// Whether `reply` is a refusal that cannot have followed a write.
 fn refused_before_any_write(reply: &str) -> bool {
     // `ERR denied` (authority) are decided before any byte moves; see the module doc.
     reply.starts_with("ERR busy") || reply.starts_with("ERR denied")
 }
 
 /// `OK skipped`: a guarded attempt (`key if=<re>`, `send if=<re>`) whose guard
+/// matched no visible row, or its fenced twins `reason=changed` (`if-gen=`,
+/// `if-fp=`: the screen moved) and `reason=person` (`if-human=`: a person keyed
+/// since the read).
 fn skipped_by_guard(reply: &str) -> bool {
     reply.starts_with("OK skipped")
 }
 
-/// The `OK` a duplicate is answered with, in the framing the verb declares. A
+/// The `OK` a duplicate is answered with, in the framing the verb declares.
 fn dup_reply(verb: &str) -> String {
     use aterm_types::control_verbs::Framing;
     match aterm_types::control_verbs::framing_of(verb, verb) {
@@ -397,6 +406,7 @@ pub(crate) fn record_in_doubt(ctx: &SessionCtx, verb: &str, key: Key, reply: &st
 #[cfg(test)]
 mod tests {
     /// Only a keyed attempt with nothing to type is refused; an unkeyed empty
+    /// write and a keyed non-empty one both pass through to the claim.
     #[test]
     fn only_a_keyed_empty_payload_is_refused_before_the_claim() {
         assert_eq!(
@@ -415,6 +425,8 @@ mod tests {
     }
 
     /// A producer with an attempt in flight is refused, not displaced, so the running
+    /// attempt's outcome survives and a later release cannot reinstate an
+    /// unsettleable `Running` tip.
     #[test]
     fn a_running_producer_is_refused_rather_than_displaced() {
         const DUP: &str = "OK dup=1\n";

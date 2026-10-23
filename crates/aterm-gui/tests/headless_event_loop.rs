@@ -1,38 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The macOS display-free event loop (`--headless`), driven in-process on the
-//! main thread: it delivers every proxy's events promptly, honours `WaitUntil`,
-//! keeps the main dispatch queue serviced, answers no monitor, theme or window —
-//! and never creates the `NSApplication` whose initialisation opens a
-//! WindowServer connection.
-//!
-//! `harness = false` (see `Cargo.toml`): the loop runs the main thread's run
-//! loop, and libtest runs every test on a worker (`pthread_main_np()` is 0 there,
-//! `--test-threads=1` included), so this is a `main` that fails on the first
-//! broken promise. One process, one loop: winit refuses a second.
-//!
-//! It speaks libtest's command line for its one test, `headless_event_loop`
-//! (the [`libtest`] module below). Positional filters and `--skip` select as
-//! libtest's do (substring; whole name under `--exact`), `--ignored` filters it
-//! out, `--list` names it, and a run prints libtest's `running N tests` /
-//! `test <name> ... ok|FAILED` / `test result:` lines for `aterm_verify::libtest`.
-//! A failure exits 101. Unrecognized options return an error.
-//!
-//! Checks:
-//!
-//! * `NSApp` stays nil. AppKit's global is set only by `+[NSApplication
-//!   sharedApplication]`, and reading it creates nothing.
-//! * Every clone of a proxy wakes the loop. CoreFoundation treats run-loop
-//!   sources with equal order, callbacks, and `info` as one set member, so
-//!   clones must share or distinguish their wake mechanism. The posting thread
-//!   waits for each event's acknowledgement before sending the next so no later
-//!   wake can rescue an earlier lost one.
-//! * A worker's `aterm_objc::run_on_main` (`dispatch_sync_f` onto the main
-//!   queue) returns while the loop waits.
-//! * A `WaitUntil` deadline is slept, not spun, and reports `ResumeTimeReached`.
-//! * No monitor, no primary monitor, no system theme, and `create_window` is an
-//!   error (each would otherwise open a WindowServer connection).
+//! The macOS display-free event loop (`--headless`), driven in-process on the main thread.
 
 fn main() {
     let cli = match libtest::Cli::parse(std::env::args().skip(1)) {
@@ -42,8 +11,6 @@ fn main() {
             std::process::exit(libtest::ERROR_EXIT);
         }
     };
-    // Off macOS the test does not exist, as a `#[cfg(target_os = "macos")]
-    // #[test]` would not: nothing to list, nothing run, nothing filtered.
     let exists = cfg!(target_os = "macos");
     if cli.list {
         cli.print_list(exists);
@@ -68,14 +35,6 @@ fn run_the_test() {
 
 /// libtest's command line and output, for the one test this binary holds —
 /// only as much as a one-test binary needs, and an ERROR for the rest.
-///
-/// Mirrors `library/test/src/cli.rs` and `formatters/pretty.rs` (upstream
-/// libtest): `--opt value` and `--opt=value` are one option; a test is selected
-/// when it matches ANY positional filter (or there is none), matches no
-/// `--skip`, and is not dropped by `--ignored` (only ignored tests run then);
-/// `--bench` without `--test` reports a plain test `ignored`; `-q` and
-/// `--format terse` shorten `--list`. The run's lines are libtest's pretty
-/// ones, whatever format was asked: aterm-verify reads those.
 mod libtest {
     use std::sync::{Mutex, OnceLock};
     use std::time::Instant;
@@ -140,8 +99,6 @@ mod libtest {
                             ));
                         }
                     },
-                    // Scheduling and display: one test, run on the main thread,
-                    // printing uncaptured, has nothing for these to change.
                     "--include-ignored"
                     | "--nocapture"
                     | "--no-capture"
@@ -240,9 +197,6 @@ mod libtest {
         }
 
         pub fn finish(self) {
-            // Before the `ok`: a watchdog that fires now prints its failure whole,
-            // and one that fires after it blocks until the process ends (the
-            // guard is never released), so no FAILED can follow the `ok`.
             let held = VERDICT.lock();
             let (passed, ignored) = match (self.selected, self.force_ignored) {
                 (false, _) => (0, 0),
@@ -267,9 +221,7 @@ mod libtest {
         }
     }
 
-    /// The failed verdict, printed once — by whichever thread (the loop, the
-    /// posting worker, the watchdog) found the broken promise first — and the
-    /// process ends with libtest's failure code.
+    /// The failed verdict, printed once.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn fail(why: &str) -> ! {
         let _held = VERDICT.lock();
@@ -312,8 +264,8 @@ mod macos {
     }
 
     fn ns_app_exists() -> bool {
-        // SAFETY: a plain read of AppKit's exported pointer-sized global; the
-        // volatile read keeps it from being folded across the loop's run.
+        // SAFETY: a plain read of AppKit's exported pointer-sized global; the volatile read keeps
+        // it from being folded across the loop's run.
         unsafe { !std::ptr::read_volatile(&raw const NSApp).is_null() }
     }
 
@@ -403,8 +355,6 @@ mod macos {
                     if clone.send_event(Ev::Clone(i, Instant::now())).is_err() {
                         fail("the loop closed while clones were still posting");
                     }
-                    // Nothing else is in flight: only THIS clone's wake can
-                    // deliver the event the ack answers.
                     match acks.recv_timeout(HANG) {
                         Ok(got) if got == i => {}
                         Ok(got) => fail(&format!("clone {i} was answered by an ack for {got}")),
@@ -415,7 +365,6 @@ mod macos {
                         )),
                     }
                 }
-                // A main-queue round trip while the loop waits on its run loop.
                 let answer = aterm_objc::run_on_main(|_mt| 7_u32);
                 let _ = clones[0].send_event(Ev::MainQueueAnswered(answer));
             });

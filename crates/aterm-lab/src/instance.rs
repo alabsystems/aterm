@@ -153,6 +153,7 @@ fn private_home_roots(home: &Path) -> std::io::Result<()> {
 }
 
 /// Keep the platform's existing state location explicit; disk and proof
+/// readers already name this same root under the private HOME.
 fn private_state_home(home: &Path) -> PathBuf {
     #[cfg(target_os = "macos")]
     return home.join("Library/Application Support/aterm");
@@ -185,6 +186,7 @@ pub struct Launch {
 }
 
 /// An instance's process: this lab's child (the agent band), or its own
+/// launchd job (the app band).
 enum Proc {
     Child(Child),
     Job(Job),
@@ -240,7 +242,7 @@ impl Reply {
     }
 }
 
-/// A terminal's explicit selector from the instance-local roster. Native tabs
+/// A terminal's explicit selector from the instance-local roster.
 fn terminal_selector(roster: &str) -> Option<String> {
     roster
         .lines()
@@ -770,7 +772,7 @@ struct ColdCopy {
 /// `--pages cold`: `aterm` copied into the world (its whole bundle when it is a bundle's
 /// # Errors
 /// The copy, its run or its eviction failed, or a page of it stayed resident (or it had none,
-/// which proves nothing). A copy whose run gave no proof keeps the world (removing a file
+/// which proves nothing).
 fn cold_copy(world: &mut World, aterm: &Path) -> Result<ColdCopy, Fail> {
     let aterm = std::fs::canonicalize(aterm)
         .map_err(|e| format!("instance: cannot resolve {}: {e}", aterm.display()))?;
@@ -876,6 +878,7 @@ pub fn config_after(config: &str, harness: bool, after: &[String]) -> String {
 }
 
 /// Whether a `messages live` reply names a row still in its reveal's grace
+/// (`reveal=pending`: a standing ask's two seconds), not yet on the band.
 fn reveal_pending(rows: &str) -> bool {
     rows.lines()
         .any(|row| row.starts_with("message ") && row.split(' ').any(|w| w == "reveal=pending"))
@@ -904,6 +907,7 @@ fn await_band(inst: &Instance) -> Result<(), Fail> {
 }
 
 /// Run each control verb (split on whitespace: a quoted multi-word value is
+/// not one word) against `inst`, printing its reply.
 fn run_verbs(inst: &Instance, verbs: &[String]) {
     for verb in verbs {
         let words: Vec<&str> = verb.split_whitespace().collect();
@@ -1128,6 +1132,8 @@ mod cold_copy_tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     /// `--pages cold` given a link (`~/.local/bin/aterm`) copies the file it names, which then
+    /// holds every page out of the cache; a copied link would launch the original warm and hold
+    /// no page of its own.
     #[test]
     fn a_cold_copy_of_a_link_is_the_file_it_names_with_no_page_resident() {
         let world_source = World::new(CONFIG_OFF).expect("fixture world");
@@ -1226,6 +1232,7 @@ mod band_tests {
     use super::reveal_pending;
 
     /// A row in its reveal's grace holds the frame; none, or only revealed
+    /// rows, let it go.
     #[test]
     fn a_row_in_its_grace_holds_the_frame_and_nothing_else_does() {
         let row = |tail: &str| {
@@ -1248,6 +1255,7 @@ mod bell_off_tests {
     use super::*;
 
     /// The root `bell_sound` of an `aterm.toml` text, as aterm's own TOML
+    /// parser reads it (`None`: no such key, or no document at all).
     fn root_bell(text: &str) -> Option<bool> {
         aterm_toml::from_str::<aterm_toml::Value>(text)
             .ok()?
@@ -1256,6 +1264,7 @@ mod bell_off_tests {
     }
 
     /// Every lab world's `aterm.toml` starts with the audible bell off, and
+    /// keeps the lanes-off tables it was given.
     #[test]
     fn a_lab_world_starts_with_the_audible_bell_off() {
         assert_eq!(
@@ -1277,6 +1286,7 @@ mod bell_off_tests {
     }
 
     /// A `bell_sound` the caller sets at the root (`instance --toml`) is the
+    /// one the file holds, once.
     #[test]
     fn a_bell_the_caller_sets_stands_alone() {
         let asked = config_with(&["bell_sound = true".to_string()]);
@@ -1290,6 +1300,8 @@ mod bell_off_tests {
     }
 
     /// Only the root key is the caller's choice: a `bell_sound` inside a
+    /// table is some other key, and the root one still goes in, ahead of
+    /// every table, where TOML files it at the root.
     #[test]
     fn a_bell_sound_inside_a_table_is_not_the_root_key() {
         let text = bell_off("[x]\nbell_sound = true\n");

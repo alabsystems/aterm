@@ -1,59 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Claude Code light beside aterm's footer: the permission mode, the one
-//! setting the owner always expects on. Claude Code draws its own effort tag
-//! and fast mode's `↯`, and thinking never changes, so none of them has a light.
-//!
-//! The light is drawn only while the mode differs from what the owner expects
-//! ([`deviates`]), while a toggle is in flight, or while its answer is on show;
-//! at rest nothing is drawn and Claude's own rows are whole. Bypass and auto are
-//! both expected ([`Mode::is_expected`]): from any other mode the light's one
-//! action presses forward through Claude's cycle to the nearest of them, never
-//! away from one.
-//!
-//! THE OVERRIDE, FOR ONE MARK THAT IS NOT A LIGHT (owner, 2026-10-15: "I
-//! need some visual indicator that the claude code session is being wrapped
-//! and a way to toggle on and off to show the improvement";
-//! `docs/DESIGN-harness-autopilot-2026-10-15.md` §2.3). The host draws the
-//! session's Autopilot chip beside the light AT REST, whenever its footer
-//! draws and a harness host exists (the `⚙` once beside it is gone: owner,
-//! 2026-10-19, "remove the settings button in the harness"). It is aterm's
-//! own state, read from nothing Claude Code draws, so it is the host's chip
-//! and never a [`Light`]; the permission-mode light STAYS DEVIATIONS ONLY.
-//!
-//! aterm keeps no copy of the vendor's setting that could disagree with it: the
-//! light is read from the mode pill (`footer::PILLS`) and toggled by shift+tab;
-//! aterm's own presses after the click go only while Claude is idle. A pill this
-//! build cannot name (renamed, or cut by a narrow pane) reads
-//! [`LightState::Unknown`] and cannot be clicked; a box or menu keeps the last
-//! mode read ([`Reading::fold`]). Each press must be answered within
-//! [`SETTLE_MS`], and the next goes only on an answer read, never on a timer: a
-//! renamed pill greys the light out and can never make aterm press keys into a
-//! screen it no longer understands.
+//! The Claude Code light beside aterm's footer: the permission mode, the one setting the owner always expects on.
 
 use crate::harness::footer;
 
-/// How long one shift+tab of a mode return may take to show on Claude's screen
-/// before the host calls it failed. A ceiling: a pill redraw lands within a
-/// frame or two.
+/// How long one shift+tab of a mode return may take to show on Claude's screen before the host calls it failed.
 pub const SETTLE_MS: u64 = 2500;
 
-/// How many shift+tab presses a mode toggle may spend on its way back to an
-/// expected mode. Claude's cycle (2.1.283) is default → accept edits → plan →
-/// bypass (when the session allows it) → auto (when available) → default;
-/// don't ask leads on to default. The nearest expected mode is at most three
-/// presses from manual, four from don't ask. The host also stops a search
-/// when the cycle comes round to a mode it has already shown, naming the mode
-/// it stopped in; this bound is the backstop.
+/// How many shift+tab presses a mode toggle may spend on its way back to an expected mode.
 pub const MAX_MODE_PRESSES: u8 = 5;
 
-/// One light of the row; the permission mode is the only one. The host keeps
-/// hover, keyboard selection, hit targets and titles per light.
+/// One light of the row; the permission mode is the only one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Light {
-    /// Claude's permission mode, one setting whatever its pill names: on in an
-    /// expected mode ([`Mode::is_expected`]: bypass or auto), off otherwise.
+    /// Claude's permission mode, one setting whatever its pill names: on in an expected mode ([`Mode::is_expected`]: bypass or auto), off otherwise.
     Mode,
 }
 
@@ -61,8 +22,7 @@ impl Light {
     /// Every light, in the order the row draws them.
     pub const ALL: [Light; 1] = [Light::Mode];
 
-    /// The light's word on its chip while its state is not known; the mode
-    /// light's chip names its mode ([`Mode::word`]) once one is.
+    /// The light's word on its chip while its state is not known; the mode light's chip names its mode ([`Mode::word`]) once one is.
     #[must_use]
     pub fn word(self) -> &'static str {
         match self {
@@ -86,8 +46,7 @@ pub enum LightState {
     On,
     /// The setting is off.
     Off,
-    /// No screen has shown it yet, or the pill drawn is one this module does
-    /// not know (a box over the composer keeps the last state shown).
+    /// No screen has shown it yet, or the pill drawn is one this module does not know (a box over the composer keeps the last state shown).
     Unknown,
 }
 
@@ -109,8 +68,7 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// The mode a pill's anchor id (`mode.auto`, [`footer::pill_indicator`])
-    /// names.
+    /// The mode a pill's anchor id (`mode.auto`, [`footer::pill_indicator`]) names.
     #[must_use]
     pub fn of_indicator(id: &str) -> Option<Mode> {
         Some(match id {
@@ -124,15 +82,13 @@ impl Mode {
         })
     }
 
-    /// Whether the owner expects this mode: bypass (auto-approve) or auto. A
-    /// session in either is as expected and is never pressed away from.
+    /// Whether the owner expects this mode: bypass (auto-approve) or auto.
     #[must_use]
     pub fn is_expected(self) -> bool {
         matches!(self, Mode::Bypass | Mode::Auto)
     }
 
-    /// The mode's short word, as the light names it: `bypass`, `auto`,
-    /// `accept edits`, `don't ask`, `plan`, `manual`.
+    /// The mode's short word, as the light names it: `bypass`, `auto`, `accept edits`, `don't ask`, `plan`, `manual`.
     #[must_use]
     pub fn word(self) -> &'static str {
         match self {
@@ -145,14 +101,7 @@ impl Mode {
         }
     }
 
-    /// The mode's word where Claude's pill reads aterm's words on the glass
-    /// (`relabelled`: the host relabelled the pill this frame, drawing
-    /// [`footer::YOLO_ON`] over the bypass pill and [`footer::YOLO_OFF`] over
-    /// manual mode's, under its relabel gate and only where the glass took
-    /// it): the light beside the pill names the state as the pill does, so
-    /// one state has one name on screen. Bypass and manual take the pill's
-    /// label there; every other mode, and every pill left as Claude drew it,
-    /// its own [`Self::word`].
+    /// The mode's word where Claude's pill reads aterm's words on the glass (`relabelled`: the host relabelled the pill this frame, drawing [`footer::YOLO_ON`] over the bypass pill and [`footer::YOLO_OFF`] over manual mode's, under its relabel gate and only where the glass took it): the light beside the pill names the state as the pill does, so one state has one name on screen.
     #[must_use]
     pub fn word_on_glass(self, relabelled: bool) -> &'static str {
         match self {
@@ -162,9 +111,7 @@ impl Mode {
         }
     }
 
-    /// How a title names the mode as a place (`stopped in plan mode`): the
-    /// word and ` mode`, but a relabelled pill's label alone (`stopped in
-    /// YOLO off`), which is a state already ([`Self::word_on_glass`]).
+    /// How a title names the mode as a place (`stopped in plan mode`): the word and ` mode`, but a relabelled pill's label alone (`stopped in YOLO off`), which is a state already ([`Self::word_on_glass`]).
     #[must_use]
     pub fn named_on_glass(self, relabelled: bool) -> std::borrow::Cow<'static, str> {
         let word = self.word_on_glass(relabelled);
@@ -175,8 +122,7 @@ impl Mode {
         }
     }
 
-    /// The pill glyph Claude draws before the mode, from the vendor's table
-    /// (`footer::PILLS`): `⏸` for plan and manual, `⏵⏵` for the rest.
+    /// The pill glyph Claude draws before the mode, from the vendor's table (`footer::PILLS`): `⏸` for plan and manual, `⏵⏵` for the rest.
     #[must_use]
     pub fn glyph(self) -> &'static str {
         footer::PILLS
@@ -185,8 +131,7 @@ impl Mode {
             .map_or("", |pill| pill.glyph)
     }
 
-    /// The mode's own ink where Claude gives it one (bypass's red, auto's
-    /// warning amber); `None` draws it in the row's plain ink.
+    /// The mode's own ink where Claude gives it one (bypass's red, auto's warning amber); `None` draws it in the row's plain ink.
     #[must_use]
     pub fn hue(self) -> Option<[u8; 3]> {
         match self {
@@ -197,35 +142,24 @@ impl Mode {
     }
 }
 
-/// What one Claude Code screen says about the light's setting and the turn,
-/// read off the engine where a toggle's next press is decided and for a live
-/// upgrade's note; a frame folds in [`read_lights`] instead.
+/// What one Claude Code screen says about the light's setting and the turn, read off the engine where a toggle's next press is decided and for a live upgrade's note; a frame folds in [`read_lights`] instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Screen {
-    /// The permission mode its pill names (every mode draws one, default
-    /// included: `⏸ manual mode on`). `None` when no pill this build knows is
-    /// under the composer.
+    /// The permission mode its pill names (every mode draws one, default included: `⏸ manual mode on`).
     pub mode: Option<Mode>,
-    /// A pill is drawn under the composer, known or not: a row opening with a
-    /// pill glyph (`footer::opens_with_pill_glyph`), a cut one included.
+    /// A pill is drawn under the composer, known or not: a row opening with a pill glyph (`footer::opens_with_pill_glyph`), a cut one included.
     pub pill: bool,
     /// Claude is mid-turn (`aterm_phase::phase::busy_signal`, hard).
     pub busy: bool,
-    /// The pill stands after vim INSERT's indicator (`footer::vim_insert`:
-    /// `  -- INSERT -- ⏵⏵ auto mode on …`, MEASURED on 2.1.304): the pill
-    /// names its mode as on any mode row, and the composer takes keys
-    /// through vim.
+    /// The pill stands after vim INSERT's indicator (`footer::vim_insert`: `  -- INSERT -- ⏵⏵ auto mode on …`, MEASURED on 2.1.304): the pill names its mode as on any mode row, and the composer takes keys through vim.
     pub vim_insert: bool,
 }
 
-/// Read `rows` (one pane, top to bottom). `None` without a composer frame.
+/// Read `rows` (one pane, top to bottom).
 #[must_use]
 pub fn read_screen(rows: &[String]) -> Option<Screen> {
     let (_, bottom) = aterm_phase::phase::composer_rules(rows)?;
     let Reading { mode, pill } = reading_under(rows, bottom);
-    // A turn in flight, by the phase reader's rule (the spinner, `Still
-    // working`, `esc to interrupt`, …); a background monitor alone (`soft`) is
-    // not a turn.
     let busy = aterm_phase::phase::busy_signal(rows).is_some_and(|b| !b.soft);
     let vim_insert =
         footer::pill_row_under(rows, bottom).is_some_and(|r| footer::vim_insert(&rows[r]));
@@ -237,19 +171,14 @@ pub fn read_screen(rows: &[String]) -> Option<Screen> {
     })
 }
 
-/// What the lights show of `rows`: [`read`] of [`read_screen`], without the
-/// turn. `None` without a composer frame. This is what a frame folds in; the
-/// turn ([`Screen::busy`]) is read only off the engine, where a toggle's next
-/// press is decided, never off a painted frame.
+/// What the lights show of `rows`: [`read`] of [`read_screen`], without the turn.
 #[must_use]
 pub fn read_lights(rows: &[String]) -> Option<Reading> {
     let (_, bottom) = aterm_phase::phase::composer_rules(rows)?;
     Some(reading_under(rows, bottom))
 }
 
-/// [`read_lights`] given the composer's bottom rule the caller has found (row
-/// `bottom`): it reads only the rows under the rule, for the pill with its
-/// `(shift+tab to cycle)` hint whole or cut (`footer::pill_row_under`).
+/// [`read_lights`] given the composer's bottom rule the caller has found (row `bottom`): it reads only the rows under the rule, for the pill with its `(shift+tab to cycle)` hint whole or cut (`footer::pill_row_under`).
 #[must_use]
 pub fn reading_under(rows: &[String], bottom: usize) -> Reading {
     let row = footer::pill_row_under(rows, bottom);
@@ -283,8 +212,7 @@ impl Reading {
         pill: false,
     };
 
-    /// `light`'s state: the mode light is On in an expected mode
-    /// ([`Mode::is_expected`]) and Off in any other.
+    /// `light`'s state: the mode light is On in an expected mode ([`Mode::is_expected`]) and Off in any other.
     #[must_use]
     pub fn state(&self, light: Light) -> LightState {
         match light {
@@ -298,10 +226,7 @@ impl Reading {
         }
     }
 
-    /// Fold a newer screen reading in. With no pill drawn (a box over the
-    /// composer, a menu under it) the mode shown stays, so the light does not
-    /// flicker under every dialog; a drawn pill this build cannot name reads
-    /// Unknown.
+    /// Fold a newer screen reading in.
     pub fn fold(&mut self, newer: &Reading) {
         if newer.mode.is_some() || newer.pill {
             self.mode = newer.mode;
@@ -309,10 +234,7 @@ impl Reading {
     }
 }
 
-/// Whether `light` shows something the owner does not expect: the one reason
-/// a light is drawn at rest, and the one state a click acts in. A light this
-/// screen does not show never deviates: nothing is drawn, or pressed, on a
-/// guess.
+/// Whether `light` shows something the owner does not expect: the one reason a light is drawn at rest, and the one state a click acts in.
 #[must_use]
 pub fn deviates(light: Light, reading: &Reading) -> bool {
     reading.state(light) == LightState::Off
@@ -327,8 +249,7 @@ pub fn read(screen: Option<&Screen>) -> Reading {
     })
 }
 
-/// shift+tab, as a terminal sends it: the mode light's one input. Safe with a
-/// draft in the composer; Claude's mode cycle does not touch it.
+/// shift+tab, as a terminal sends it: the mode light's one input.
 pub const SHIFT_TAB: &[u8] = b"\x1b[Z";
 
 #[cfg(test)]
@@ -371,7 +292,6 @@ mod tests {
             assert!(s.pill && s.mode.is_none(), "{row:?}");
             assert_eq!(fold_from_bypass(Some(&s)), LightState::Unknown, "{row:?}");
         }
-        // Control: a known pill moves it.
         let plan = read_screen(&screen(&rule, "  \u{23F8} plan mode on")).unwrap();
         assert_eq!(fold_from_bypass(Some(&plan)), LightState::Off);
     }
@@ -388,7 +308,6 @@ mod tests {
             ),
             ("  \u{23F5}\u{23F5} auto mode on (shift+tab to", Mode::Auto),
             ("  \u{23F8} plan mode on (shift+tab to", Mode::Plan),
-            // Cut mid-word: still the pill this build names.
             ("  \u{23F5}\u{23F5} auto mode on (shif", Mode::Auto),
         ];
         for (row, mode) in cases {
@@ -402,8 +321,7 @@ mod tests {
     /// THE LIGHT NAMES THE STATE AS THE PILL DOES (review C8): under the
     /// relabel's gate bypass reads `YOLO on` and manual `YOLO off`, the pill's
     /// own labels, and a title names them as states (`YOLO off`, no `mode`
-    /// after it). NEGATIVE CONTROL: outside the gate, and for every other mode
-    /// inside it, the light keeps Claude's word.
+    /// after it).
     #[test]
     fn the_lights_word_follows_the_pill_relabel_and_only_under_its_gate() {
         assert_eq!(Mode::Bypass.word_on_glass(true), footer::YOLO_ON);
@@ -468,8 +386,6 @@ mod tests {
                 continue;
             };
             let got = read(Some(&s));
-            // The mode light is definite exactly when a pill this build knows
-            // is there.
             let pill = footer::mode_row(&rows).is_some();
             assert!(
                 (got.state(Light::Mode) != LightState::Unknown) == pill,
@@ -492,8 +408,7 @@ mod tests {
 
     /// On every recorded screen in `aterm-phase`'s fixtures, [`read_lights`] is
     /// [`read`] of [`read_screen`], and [`reading_under`] the composer's bottom
-    /// rule gives the same reading. Control: the corpus holds screens with a
-    /// composer and screens without.
+    /// rule gives the same reading.
     #[test]
     fn the_lights_reading_is_the_screens_without_its_turn() {
         let dir =
@@ -528,8 +443,7 @@ mod tests {
     /// The drift canary: every recorded footer screen of every Claude Code
     /// build (`claude-<version>-footer-*.txt` in aterm-phase's fixtures, from
     /// `aterm-lab footers`) has a composer, a mode row under it and a pill read
-    /// as a mode. The directory is read, so new captures are judged as they
-    /// land.
+    /// as a mode.
     #[test]
     fn every_captured_footer_screen_of_every_build_is_read() {
         let dir =
@@ -641,8 +555,7 @@ mod tests {
     /// mode and turn it was captured in, the mode row under the composer's
     /// rule, with the vendor's `← for agents` hint gone from the rows drawn
     /// past its first 10 s and the bypass row's effort tag wrapped onto a row
-    /// of its own. NEGATIVE CONTROL: the same screen with its mode row blanked
-    /// reads no mode.
+    /// of its own.
     #[test]
     fn the_lab_footer_screens_read_as_measured() {
         let cases: [(&str, Mode, bool); 8] = [

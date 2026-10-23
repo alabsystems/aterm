@@ -4,10 +4,6 @@
 use super::*;
 
 /// A due read is already in flight when the owner switches Claude Code off.
-/// Its answer cannot start an upgrade or become a step the loop applies;
-/// another agent's worker (agy's) continues under the same policy. Channels
-/// order the edit and answer. (Re-homed from Codex, whose worker watches
-/// only and reads nothing due since the Codex screen lane's retirement.)
 #[test]
 fn switching_one_agent_off_fences_an_inflight_idle_read() {
     switch_off_during_idle(false);
@@ -142,8 +138,7 @@ fn switch_off_during_idle(in_step: bool) {
 }
 
 /// Even the harness's own restart is no permission to relaunch after the
-/// agent was switched off while the exit's status read waited. Turning it
-/// back on admits fresh work; it cannot revive the stopped worker's claim.
+/// agent was switched off while the exit's status read waited.
 #[test]
 fn switching_off_revokes_a_restart_exit_read_already_inflight() {
     for commit in [false, true] {
@@ -205,8 +200,7 @@ fn revoke_exit_read(commit: bool) {
     assert!(a.relaunched.lock().unwrap().is_empty());
 }
 
-/// A restored attempt is also a claim. Its account read may return after an
-/// off/on edit, but the removed queue entry can never type a relaunch line.
+/// A restored attempt is also a claim.
 #[test]
 fn switching_off_revokes_a_cold_relaunch_read_already_inflight() {
     let world = Arc::new(World::default());
@@ -252,8 +246,7 @@ fn switching_off_revokes_a_cold_relaunch_read_already_inflight() {
 }
 
 /// The worker life boundaries are driven directly so the host cannot reap
-/// between the handover, edit, and late body return. These are the real
-/// hand_over/set_config/stopped paths, with no timing-dependent absence check.
+/// between the handover, edit, and late body return.
 #[test]
 fn an_off_on_edit_revokes_a_policy_handover_before_the_body_returns() {
     for revoke in [false, true] {
@@ -287,7 +280,7 @@ fn an_off_on_edit_revokes_a_policy_handover_before_the_body_returns() {
 }
 
 /// A relaunch request began before off and returns a live new snapshot after
-/// on. That old worker cannot create a fresh landing watch from its answer.
+/// on.
 #[test]
 fn an_off_on_edit_revokes_an_inflight_exit_attempt_result() {
     let (host, job, _workers, mut hooks) = revocation_fixture();
@@ -343,8 +336,7 @@ fn an_off_on_edit_revokes_an_inflight_exit_attempt_result() {
     );
 }
 
-/// A landing's watch can outlive its worker. Revocation must visit that kept
-/// claim too; there is no live StopHandle left to revoke for it.
+/// A landing's watch can outlive its worker.
 #[test]
 fn an_off_on_edit_revokes_an_orphaned_landing_claim() {
     let (host, job, _workers, hooks) = revocation_fixture();
@@ -412,8 +404,7 @@ fn an_off_on_edit_revokes_an_inflight_restored_landing_read() {
     );
 }
 
-/// A successor can load a different policy from the outgoing process. Its
-/// handoff snapshot is not permission to watch an agent disabled at launch.
+/// A successor can load a different policy from the outgoing process.
 #[test]
 fn a_handed_snapshot_cannot_admit_an_agent_disabled_at_startup() {
     let world = Arc::new(World::default());
@@ -440,8 +431,7 @@ fn a_handed_snapshot_cannot_admit_an_agent_disabled_at_startup() {
 /// CLAUDE CODE SWITCHED OFF TURNS THE ACCOUNTS OFF ([`Switches::set`]):
 /// its logins are what they are for ([`accounts_for`]), so neither the
 /// rotation nor the login lifecycle acts, and nothing of the accounts is
-/// read ([`Switches::accounts_live`]). NEGATIVE CONTROL: Codex switched off
-/// leaves both as they were.
+/// read ([`Switches::accounts_live`]).
 #[test]
 fn claude_code_switched_off_turns_the_accounts_off() {
     let under = |cfg: &SupervisorConfig| {
@@ -469,10 +459,7 @@ fn claude_code_switched_off_turns_the_accounts_off() {
 /// THE REOPENED LAYOUT'S ROW ASKS THE ADMISSION OF EACH AGENT IT CARRIED
 /// ([`HostHandle::relaunches_restored_of`]): with Codex switched off, a
 /// restored Claude Code is relaunched and a restored Codex is not, as the
-/// restored queue decides ([`restored_allowed`]). Muse Code, agy and Gemini
-/// CLI are relaunched (their relaunch lanes), and each switched off is not.
-/// NEGATIVE CONTROLS: with all on, every agent is; with `[harness] relaunch =
-/// false`, none is.
+/// restored queue decides ([`restored_allowed`]).
 #[test]
 fn the_reopened_row_asks_each_agents_admission() {
     use aterm_agent::harness::upgrade::Agent;
@@ -510,19 +497,7 @@ fn the_reopened_row_asks_each_agents_admission() {
 /// AN AGENT SWITCHED OFF IN THE TAB ENDS THE EXIT LEFT TO THE HOST: a
 /// Claude Code's worker is ended by a Commit's stop with its agent's exit
 /// left to the host ([`Kept::unwatched`]), and the person starts a Codex,
-/// switched off, in that tab before the Commit fails. The Codex is in no
-/// pass's `wanted`, so the exit is handed ([`unwatched_exits`]) and read as
-/// a crash (the Claude Code's record survives: a Codex's start sweeps
-/// none), its relaunch waiting for the shell's prompt; the program-change
-/// stop ends that read ([`host_pass`]). When the Codex exits, nothing is
-/// relaunched into the tab the person moved on in: no worker, no mark.
-///
-/// FAILS WITHOUT THE FIX: that stop passed over a worker whose `stop` was
-/// set already, and the Claude Code was relaunched once the Codex exited
-/// (left `(1, false)`).
-///
-/// NEGATIVE CONTROL: the Claude Code gone and nothing started in the tab —
-/// the exit is read and relaunched once.
+/// switched off, in that tab before the Commit fails.
 #[test]
 fn an_agent_switched_off_in_the_tab_ends_the_exit_left_to_the_host() {
     for codex in [true, false] {
@@ -532,8 +507,6 @@ fn an_agent_switched_off_in_the_tab_ends_the_exit_left_to_the_host() {
         a.set(&[("s-a", Program::Claude)]);
         let mut h = a.hooks();
         h.acts.relaunch_restored = Arc::new(|_, _, _, _| "refused:inert".to_string());
-        // The line types nothing while another program holds the tab, as the
-        // live one waits for its shell's prompt.
         let (world, line) = (Arc::clone(&a), Arc::clone(&h.acts.relaunch));
         h.acts.relaunch = Arc::new(move |sid, pid, snap, left, upgrade, asked| {
             if world.agent_in(sid).is_some_and(|(now, _)| now != snap.pid) {
@@ -573,10 +546,8 @@ fn an_agent_switched_off_in_the_tab_ends_the_exit_left_to_the_host() {
         host.resume_restored();
         host.relaunch_stranded(&|_| "in tab 1".to_string());
         if codex {
-            // A whole pass after the exit's read, the Codex still named.
             until("the exit read", || a.exit_looks.load(Ordering::SeqCst) > 0);
             passes(2, "two passes with the Codex in front", false);
-            // The Codex exits.
             a.set(&[]);
             passes(2, "two passes after it exits, no worker left", true);
             assert_eq!(
@@ -614,8 +585,6 @@ fn revocation_fixture() -> (HostHandle, WorkerJob, Workers, Hooks) {
     let mut hooks = hooks(&world, Arc::new(|_| BodyEnd::Stopped));
     hooks.acts.open = Arc::new(|_| true);
     hooks.acts.exited = Arc::new(|_, _| true);
-    // No automatic host thread: each life boundary below is called by the
-    // test, under the same policy and stop handles as a real worker.
     let host = HostHandle::start(on(), false, true, hooks.clone());
     let mut worker = idle_worker();
     worker.agent = Program::Claude;
@@ -656,17 +625,7 @@ fn revocation_fixture() -> (HostHandle, WorkerJob, Workers, Hooks) {
 
 /// A WORKER IS REFUSED EXACTLY WHERE THIS HOST WOULD NOT CARRY IT
 /// ([`worker_unsupervised`]: `spawn agent=<word>`'s `ERR unsupervised:
-/// <switch>`). For each table the verdict is what the real host does with a
-/// newborn worker — a Claude Code, Gemini CLI, agy or Muse Code session
-/// with no `autopilot` word of its own: under each switch named no worker
-/// runs for it — the master switch (and `headless = false` in a headless
-/// instance) starts no host at all, the worker's agent's own table admits
-/// none, an Autopilot default of `off` reads it Off — while the same host
-/// carries the session beside it that the switch leaves on (a Codex tab; a
-/// Claude tab whose own word is `cruise`). NEGATIVE CONTROLS: the default, a
-/// headless instance under it, `headless = false` in a windowed one,
-/// another agent's table off (Codex's, and another worker agent's) and a
-/// `land` default all carry the worker.
+/// <switch>`).
 #[test]
 fn a_worker_is_refused_exactly_where_the_host_would_not_carry_it() {
     const WORKER: &str = "s-worker";
@@ -767,16 +726,13 @@ fn a_worker_is_refused_exactly_where_the_host_would_not_carry_it() {
 /// overtaken ([`RestoredAttempt::agent_seen`]) as for an agent the host
 /// supervises — no worker is that Codex's, but a person started it there,
 /// and the relaunch typed once it exits would bring back a conversation
-/// that person moved on from. NEGATIVE CONTROL: with nothing named in the
-/// tab, the same passes mark nothing.
+/// that person moved on from.
 #[test]
 fn an_agent_switched_off_overtakes_a_restored_relaunch_of_its_tab() {
     for named in [true, false] {
         let a = Arc::new(Acting::default());
         a.open.lock().unwrap().insert("s-a".to_string());
         let mut h = a.hooks();
-        // Its retry held an hour ([`holding_retries`]), so the passes below
-        // look at it between its steps.
         h.acts.relaunch_restored = Arc::new(|_, _, _, _| {
             hold_this_steps_retry();
             "wait:shell-prompt".to_string()
@@ -817,15 +773,7 @@ fn an_agent_switched_off_overtakes_a_restored_relaunch_of_its_tab() {
 /// AN AGENT ENDED WHILE ITS OWN SWITCH HOLDS IT OFF IS FORGOTTEN, as one
 /// ended under Off is ([`forget_left_while_switched_off`]): switching Claude
 /// Code off revokes its worker without handing it the exit, so no worker's
-/// exit path forgets what was read of it. Once the roster names no agent in
-/// the tab and its process holds the tab no more (the person's `/exit`, the
-/// shell back), the host forgets the kept snapshot and its publication —
-/// what the crash journal and the restart, logout and shutdown layouts put
-/// on the tab's leaf. FAILS WITHOUT THE FIX: the ended conversation stayed
-/// published, and the next launch with Claude Code switched on again resumed
-/// it. NEGATIVE CONTROLS: while the switched-off agent still runs in its
-/// tab, and while a pass cannot name it but it still holds the tab (a
-/// misread), both stand.
+/// exit path forgets what was read of it.
 #[test]
 fn an_agent_ended_while_switched_off_is_forgotten() {
     const SID: &str = "s-ended-switched-off";
@@ -844,14 +792,11 @@ fn an_agent_ended_while_switched_off_is_forgotten() {
     until("its worker revoked", || host.live().is_empty());
     let kept = Arc::clone(&host.shared.kept.lock().unwrap()[SID]);
     a.passes();
-    // NEGATIVE CONTROL: its agent runs, switched off: what was read stands.
     assert!(published_snapshot(SID).is_some(), "published while it runs");
     assert!(
         kept.lock().unwrap().snapshot.is_some(),
         "kept while it runs"
     );
-    // NEGATIVE CONTROL: a pass that cannot name it while it still holds its
-    // tab (a misread) forgets nothing.
     *a.holds.lock().unwrap() = Some(true);
     a.set(&[]);
     a.passes();
@@ -860,13 +805,11 @@ fn an_agent_ended_while_switched_off_is_forgotten() {
         "a misread forgets nothing"
     );
 
-    // The person ended it; the tab is at its shell.
     *a.holds.lock().unwrap() = Some(false);
     a.passes();
     assert!(published_snapshot(SID).is_none(), "unpublished");
     assert!(kept.lock().unwrap().snapshot.is_none(), "forgotten");
 
-    // Switched on again on the bare shell: nothing to relaunch.
     host.set_config(on());
     a.passes();
     assert!(host.live().is_empty(), "no agent, no worker");
@@ -882,10 +825,7 @@ fn an_agent_ended_while_switched_off_is_forgotten() {
 /// THE HOST'S ADMISSION IS THE POLICY'S, AGENT BY AGENT
 /// ([`Admission::of`]): every agent the master switch admits but those their
 /// own tables switch off, built from the off list alone, so a new
-/// [`Program`] is admitted with no list of agents in the host. Every
-/// program is read ([`Program::ALL`]), each agent switched off alone, and
-/// every agent at once. NEGATIVE CONTROLS: the master switch off admits
-/// none, and switching one agent off leaves the others admitted.
+/// [`Program`] is admitted with no list of agents in the host.
 #[test]
 fn the_hosts_admission_is_the_policys_agent_by_agent() {
     let agents: Vec<Program> = Program::ALL
@@ -932,19 +872,10 @@ fn the_hosts_admission_is_the_policys_agent_by_agent() {
 /// Code's conversation stays kept and published after the person replaces it
 /// in its tab with a Codex — no worker of the Codex is admitted to follow it
 /// — so the restart and crash layouts would carry the Claude Code into a tab
-/// the person moved on in, resumed at the next launch. With its worker gone
-/// and nothing of it left to read, the pass forgets it. NEGATIVE CONTROLS:
-/// the same snapshot stands under a tab the roster names its own agent in,
-/// under an unnamed tab no process holds while its own agent is admitted
-/// (only another agent is switched off), while an exit of it is still left
-/// to the host to read, while a watch on its process has read no exit (it
-/// may live, suspended behind the agent in front) and while a watch read one
-/// it still hands.
+/// the person moved on in, resumed at the next launch.
 #[test]
 fn an_agent_that_left_for_a_switched_off_one_is_forgotten() {
     const SID: &str = "s-left-for-codex";
-    // The host's state alone: its thread is ended first, so no pass of its
-    // own reads the kept map this test writes.
     let host = HostHandle::for_supervised_test(Vec::new(), Arc::new(|_| BodyEnd::Stopped));
     host.shutdown_and_join();
     let a = Arc::new(Acting::default());
@@ -974,15 +905,11 @@ fn an_agent_that_left_for_a_switched_off_one_is_forgotten() {
     };
     let standing = || kept.lock().unwrap().snapshot.is_some();
 
-    // NEGATIVE CONTROL: the roster names Claude Code's own switched-off self.
     forget(&named(Program::Claude), Program::Claude);
     assert!(standing(), "its own agent runs");
-    // NEGATIVE CONTROL: unnamed and not held, but only Codex is switched off:
-    // an admitted agent's exit is its worker's to read, never forgotten here.
     *a.holds.lock().unwrap() = Some(false);
     forget(&HashMap::new(), Program::Codex);
     assert!(standing(), "Claude Code is admitted");
-    // NEGATIVE CONTROL: an exit of it still left to the host to read.
     kept.lock().unwrap().unwatched = Some(Unwatched {
         agent: Program::Claude,
         group: 4242,
@@ -1000,25 +927,20 @@ fn an_agent_that_left_for_a_switched_off_one_is_forgotten() {
         }),
         read: read.then_some(ExitRecord::Unread),
     };
-    // NEGATIVE CONTROL: a watch on its process that has read no exit.
     kept.lock().unwrap().exit_watch = Some(watch(false, false));
     forget(&named(Program::Codex), Program::Codex);
     assert!(standing(), "its process may live");
-    // NEGATIVE CONTROL: a watch that read its exit and still hands it.
     kept.lock().unwrap().exit_watch = Some(watch(true, true));
     forget(&named(Program::Codex), Program::Codex);
     assert!(standing(), "its exit is handed first");
-    // Its watch read the exit and hands nothing: the process is gone.
     kept.lock().unwrap().exit_watch = Some(watch(true, false));
 
-    // A switched-off Codex runs where the Claude Code was.
     forget(&named(Program::Codex), Program::Codex);
     assert!(!standing(), "forgotten");
     assert!(published_snapshot(SID).is_none(), "unpublished");
 }
 
-/// The process probe runs outside Kept. A new handoff watch on that same
-/// process is a new claim, even though its PID and start stamp did not move.
+/// The process probe runs outside Kept.
 #[test]
 fn a_same_process_handoff_watch_armed_during_forget_is_kept() {
     forget_after_switch_edit(true);
@@ -1038,8 +960,6 @@ fn forget_after_switch_edit(arm_watch: bool) {
         let hooks = hooks(&world, Arc::new(|_| BodyEnd::Stopped));
         let mut off = on();
         off.off.push(Program::Claude);
-        // No host loop races this fixture: only the actual public handoff
-        // writer below arms a watch. Suspended is the handoff's normal state.
         let host = HostHandle::start(off, false, true, hooks.clone());
         let snapshot = snap(&sid);
         let kept = Arc::new(Mutex::new(Kept {
@@ -1092,7 +1012,6 @@ fn forget_after_switch_edit(arm_watch: bool) {
             )
         };
         let published = published_snapshot(&sid).is_some();
-        // Disarm the owned watch before any assertion can fail.
         host.shutdown_and_join();
         publish_snapshot_for_test(&sid, None);
         assert_eq!(

@@ -6,15 +6,15 @@
 //! one row of every timeline kind (`control`'s `wire_goldens`, beside the
 //! `timeline` and `exits` goldens), from no watermark, past an id, and from
 //! a watermark below the retained low (the `GAP` line), every row through
-//! its production writer but the two the script names. Nothing is masked:
-//! a frame carries no clock.
+//! its production writer but the three the script names. Nothing is masked:
+//! a frame carries no clock. The digest reads the session log's view: the retained low is the log's, past its record bound (the third
+//! section, re-blessed for that alone: its flood and its `GAP` count).
 //!
 //! NEGATIVE CONTROL: the script with one payload byte planted fails it.
 
 use super::drain_timeline_events;
 use crate::control::wire_goldens::{scripted, title};
 use crate::session_store::{new_store, test_handle};
-use crate::session_timeline::TIMELINE_CAP;
 
 /// The `events` digest's timeline frames the golden holds: from no
 /// watermark, past id 6, and from a watermark below the retained low.
@@ -26,16 +26,18 @@ fn events_text(plant: bool) -> String {
         let high = drain_timeline_events(&h.ctx.timeline.lock().unwrap(), "5", wm, &mut frames);
         out.push_str(&format!("> watermark={name} -> {high:?}\n{frames}"));
     }
-    // A watcher fallen behind the ring: TIMELINE_CAP rows the digest skips,
-    // then three it carries, each through its production writer (the drift
-    // flush's title, the `meta` verb, the agent sweep's publication, a delivery).
+    // A watcher fallen behind the session log (the view every reader
+    // reads): rows past the log's record bound, which the digest skips
+    // and the log's batch evicts the oldest of, then three it carries, each
+    // through its production writer (the drift flush's title, the `meta`
+    // verb, the agent sweep's publication, a delivery).
     let store = new_store();
     let b = test_handle(6);
     store
         .write()
         .unwrap_or_else(|p| p.into_inner())
         .register(b.clone());
-    for i in 0..TIMELINE_CAP {
+    for i in 0..aterm_slog::MAX_RECORDS {
         assert!(
             b.ctx
                 .timeline
@@ -113,8 +115,8 @@ const EVENTS_GOLDEN: &str = concat!(
     "EVENT 5 fetch off=40\n",
     "EVENT 5 topic add news since=head\n",
     "EVENT 5 closing reason=ctl-close by=ctl\n",
-    "> watermark=1 (below the low) -> Some(516)\n",
-    "GAP 6 events-dropped=3\n",
+    "> watermark=1 (below the low) -> Some(2052)\n",
+    "GAP 6 events-dropped=257\n",
     "EVENT 6 meta field=attention value=vim%20build\n",
     "EVENT 6 agent idle rev=1 gen=0.2 fp=00000000000000bb\n",
     "EVENT 6 inbox 1 from=s-a kind=ask off=44\n",

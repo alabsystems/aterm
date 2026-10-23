@@ -12,12 +12,13 @@ description = "How aterm finishes a write: durable (on stable media at return, F
 
 # Std-only apart from the barrier itself, so a dependency-free crate (aterm-primer)
 # can finish its writes here and still pull no third-party code: astream-sys has no
-# dependencies, and its one cordoned module of four FFI calls (`fcntl`,
+# dependencies, and its one cordoned module of five FFI calls (`fcntl`, `fsync`,
 # `sysctlbyname`, `poll`, `signal`; astream claim `os.cordon`) is the only `unsafe`
 # the barrier needs. This crate calls `barrier_sync` (`fcntl(F_BARRIERFSYNC)`) and
-# `barrier_refused` alone, on files and on directories (`ordered_dir`), and never
-# installs the `SIGHUP` handler. Only Apple targets have an ordering-only flush, so
-# only they compile it.
+# `barrier_refused`, on files and on directories (`ordered_dir`), and reads and sets
+# the test mark (`test_plain_fsync`, `TEST_PLAIN_FSYNC_ENV`); it never installs the
+# `SIGHUP` handler. Only Apple targets have an ordering-only flush, so only they
+# compile it.
 [target.'cfg(target_vendor = "apple")'.dependencies]
 astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
 

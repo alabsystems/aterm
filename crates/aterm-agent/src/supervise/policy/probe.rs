@@ -47,6 +47,7 @@ pub trait PolicyProbe: Send + Sync + std::fmt::Debug {
     ) -> Result<Option<String>, String>;
 
     /// `comps` with every symbolic link resolved (the Read rule's resolver);
+    /// `None` for a dangling link or a refused look.
     fn real_components(&self, comps: &[String]) -> Option<Vec<String>>;
 
     /// Where the absolute path `comps` leads on the disk as the kernel walks it for `rm`.
@@ -91,6 +92,9 @@ pub trait PolicyProbe: Send + Sync + std::fmt::Debug {
     fn owner_asks(&self, worker: &WorkerEnv, launch: &Path) -> Result<Vec<OwnerAsk>, String>;
 
     /// Where the worker's Bash tool may stand beyond `cwd`, from Claude
+    /// Code's transcripts under its directory
+    /// ([`crate::harness::footer::shell_cwds`]); empty where its directory
+    /// cannot be named.
     fn shell_cwds(&self, worker: &WorkerEnv, cwd: &Path) -> Vec<PathBuf>;
 }
 
@@ -238,6 +242,8 @@ impl PolicyProbe for NoLook {
 }
 
 /// How a probe's REQUEST is written ([module docs](self)): each path as the
+/// run's roots write it (`path`), the worker by its digest under the tape's
+/// `seed`.
 struct Requests<'a> {
     path: &'a dyn Fn(&Path) -> Vec<u8>,
     seed: u64,
@@ -286,6 +292,7 @@ impl Requests<'_> {
     }
 
     /// A git view asked for: the worker, the directory, and where the worker
+    /// may write.
     fn git_view(&self, worker: &WorkerEnv, dir: &Path, writes: &WorkerWrites<'_>) -> Vec<u8> {
         let worker = self.worker(worker);
         let mut fields = vec![
@@ -448,6 +455,7 @@ impl KeyedProbe {
     }
 
     /// The answer to the request `write` writes at `door`, or `unrecorded`
+    /// with why.
     fn answer<A: TapeValue>(
         &self,
         door: &str,
@@ -553,7 +561,7 @@ pub(crate) enum Answer<T> {
     Err(String),
 }
 
-/// `value` as JSON bytes. The mirrors below hold strings, numbers, booleans and
+/// `value` as JSON bytes.
 fn json<T: Serialize>(value: &T) -> Vec<u8> {
     aterm_json::to_vec(value).unwrap_or_default()
 }
@@ -626,6 +634,7 @@ impl TapeValue for Result<OnDisk, String> {
 }
 
 /// The worker as a tape holds it: its digest (sixteen hex digits) and pid,
+/// never a variable.
 impl TapeValue for Result<WorkerEnv, String> {
     fn to_tape(&self) -> Vec<u8> {
         answer(self, |w| (format!("{:016x}", w.digest(0)), w.pid()))
@@ -658,6 +667,7 @@ struct ViewWire {
 
 impl ViewWire {
     /// `view` projected — again, whatever handed it here: a tape never holds
+    /// more of a view than the projection keeps.
     fn of(view: &GitView) -> Self {
         let v = view.project();
         Self {

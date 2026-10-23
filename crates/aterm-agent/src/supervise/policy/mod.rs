@@ -20,9 +20,8 @@
 //! * [`box_call`]: transcript candidates matching a box's possible tool and
 //!   file, which lift a settings hold only where the screen draws the box
 //!   under the Edit tool's own call row too.
-//! * [`box_command`]: a pending transcript command that draws the same rows
-//!   as a barred Bash box. Shape and stability do not bind it to this box;
-//!   its reading never removes another possible screen reading.
+//! * [`box_command`]: what the screen cannot show of a Bash box's command
+//!   (a blank a tab or a row's end hides), which no reading may turn on.
 //! * [`git_config`]: what a git read would load that can run a program.
 //! * [`probe`]: the one door the approval policy looks at the machine by
 //!   ([`PolicyProbe`]), at the level of what it concluded — so a harness tape

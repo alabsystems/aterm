@@ -1,23 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FLEET DOCUMENT FROM A URL (docs/DESIGN-ai-connections-2026-10-16.md §6.3).
-//!
-//! The owner keeps one fleet document for every machine, signs it with a key only they hold
-//! (`aterm ai fleet keygen`, `aterm ai fleet sign`), and serves it and its `.sig` side by side
-//! from any HTTPS address. Each machine names the address in `[ai] fleet` and PINS the
-//! signer's public key in `[ai] fleet_key`, so the address alone can never change what a
-//! machine trusts:
-//!
-//! * fetched over HTTPS only, size-capped (`aterm_update_core::download_bytes`), at most
-//!   every [`FETCH_EVERY_S`] unless a person asks;
-//! * verified (Ed25519 over the exact bytes, the updater's own verifier) before it is parsed;
-//! * carrying a `seq` that never goes down (a server cannot hand back an older document) and,
-//!   optionally, a `valid_until` past which it is not used;
-//! * kept, with its signature, at `<state>/ai/fleet/`, and verified again at every read, so
-//!   the machine keeps the last good document while offline and a tampered copy is refused.
-//!
-//! A document read from a local path is verified the same way when `[ai] fleet_key` is set.
+//! Signed fleet configuration fetching, Ed25519 verification, and local cache management.
 
 use std::path::{Path, PathBuf};
 
@@ -85,8 +69,7 @@ pub fn verify(doc: &[u8], sig: &[u8], key: &str) -> Result<(), String> {
         .map_err(|_| "its signature does not verify under [ai] fleet_key".to_string())
 }
 
-/// The document's own `seq` (required for a document from a URL) and `valid_until` (unix
-/// seconds or RFC 3339), read from its top level.
+/// Reads top-level `seq` and `valid_until` metadata from a fleet TOML document.
 ///
 /// # Errors
 ///
@@ -215,7 +198,6 @@ pub fn held(ai_dir: &Path, url: &str, key: &str, now: i64) -> Result<String, Str
         .ok_or("its held copy is gone")?;
     let sig = std::fs::read(dir.join(SIG_FILE)).map_err(|_| "its held signature is gone")?;
     verify(doc.as_bytes(), &sig, key).map_err(|why| format!("its held copy: {why}"))?;
-    // The expiry is the signed document's own, not the record's.
     let (_, valid_until) = meta(&doc).map_err(|why| format!("its held copy: {why}"))?;
     let _ = state;
     if let Some(until) = valid_until.filter(|t| *t < now) {
@@ -281,9 +263,7 @@ fn write_private(dir: &Path, name: &str, text: &str) -> std::io::Result<()> {
     crate::harness::upgrade_models::write_atomic(&dir.join(name), text)
 }
 
-/// Fetches the document at `url` and its `<url>.sig`, verifies it under `key`, and holds it
-/// when it is newer than (or as new as) the one held. `force` asks even within
-/// [`FETCH_EVERY_S`] of the last try. A failure leaves the held document as it was.
+/// Fetches `<url>` and `<url>.sig`, verifies them under `key`, and updates the cache.
 pub fn fetch(
     ai_dir: &Path,
     url: &str,
@@ -374,7 +354,6 @@ pub fn fetch(
         );
     }
     let same = state.seq == Some(seq);
-    // The signature is held as base64 text, whichever form it was served in.
     let sig_text = sig_bytes(&sig)
         .and_then(|b| aterm_codec::base64::encode(&b).ok())
         .unwrap_or_default();

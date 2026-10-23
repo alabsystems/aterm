@@ -10,6 +10,7 @@ use aterm_core::terminal::Terminal;
 use crate::human_input::HumanInputStamp;
 
 /// The command words a mark can witness: the programs whose folder-trust
+/// dialog the harness answers.
 const AGENTS: [&str; 2] = ["claude", "codex"];
 
 /// What a mark says ([`LaunchWitness::read`]).
@@ -93,6 +94,8 @@ impl LaunchWitness {
     }
 
     /// THE MARK, under the terminal lock right after a slice is processed,
+    /// `started_before` the engine's started-command count read in the same
+    /// hold before the slice.
     fn at_hold(
         &self,
         t: &Terminal,
@@ -212,6 +215,8 @@ impl LaunchWitness {
 }
 
 /// The wall clock, unix ms: a mark's instant ([`Started::at_ms`]), which is
+/// compared with the kernel's start of a process (unix seconds), so it is
+/// the wall clock, not this process's monotonic one.
 fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -221,6 +226,8 @@ fn now_unix_ms() -> u64 {
 }
 
 /// The program a command line starts, when it is one of [`AGENTS`]: the
+/// basename of its first word exactly, so a wrapper (`exec claude`, `env …`)
+/// or an assignment names none.
 fn agent_word(line: &str) -> Option<&'static str> {
     let first = line.split_whitespace().next()?;
     let name = first.rsplit('/').next()?;
@@ -233,6 +240,8 @@ mod tests {
     use crate::human_input::Gesture;
 
     /// A terminal whose host required and authorized the shell's nonce (every
+    /// aterm-spawned integrated shell), at a signed prompt, and the hex its
+    /// marks carry.
     fn signed_prompt() -> (Terminal, String) {
         let nonce = [0x5Au8; 32];
         let hex: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
@@ -244,6 +253,7 @@ mod tests {
     }
 
     /// What zsh's preexec writes for `line` once the person's Enter is read
+    /// (`aterm_shell_integration.zsh`): 633;E, then 133;C, each signed.
     fn preexec(line: &str, hex: &str) -> Vec<u8> {
         format!("\x1b]633;E;{line};id={hex}\x07\x1b]133;C;id={hex}\x07").into_bytes()
     }
@@ -259,6 +269,7 @@ mod tests {
     }
 
     /// One parse-stage hold over `bytes`, as the reader takes it: the slice
+    /// and its mark under the lock, then the screen read with it released.
     fn hold(term: &Mutex<Terminal>, bytes: &[u8], person: &HumanInputStamp, w: &LaunchWitness) {
         let unread = {
             let mut t = term.lock().expect("term");
@@ -278,6 +289,10 @@ mod tests {
     }
 
     /// THE POSITIVE PATH at the parse stage: `claude⏎` typed and its signed
+    /// command start parsed records the count of that Enter as `person`, with
+    /// its id and word, on a screen showing no box — and the dialog Claude
+    /// Code then draws does not change it, while a gesture counted after the
+    /// mark's hold makes every later read say `since`.
     #[test]
     fn a_signed_command_start_records_the_count_at_its_hold() {
         let (t, hex) = signed_prompt();
@@ -311,6 +326,11 @@ mod tests {
     }
 
     /// Each premise's negative control: a box on screen at the mark is
+    /// `boxed`; a first word no rule covers (a wrapper, a path to another
+    /// program, an assignment) is `other`; a last gesture that was not a plain
+    /// Enter (a letter after it, or none at all: a controller's line) is
+    /// `typed`; an unsigned session and a slice with no command start record
+    /// nothing; a newer mark replaces an older one.
     #[test]
     fn every_premise_missing_is_a_word_other_than_person() {
         let at_mark = |before: &str, line: &str, gestures: &[Gesture]| {
@@ -402,6 +422,9 @@ mod tests {
     }
 
     /// THE LAUNCH'S INSTANT is every mark's, whatever its word: a command no
+    /// rule covers (`sh run-gemini.sh`, a controller's line) is started at
+    /// the wall clock its hold read, with the person count loaded there; a
+    /// newer command's start replaces both.
     #[test]
     fn every_command_start_notes_its_instant_and_count() {
         let (t, hex) = signed_prompt();
@@ -447,6 +470,9 @@ mod tests {
     }
 
     /// The mark is taken IN the hold that parsed the command start, never
+    /// after it: a gesture counted between that hold and the screen's
+    /// reading after the lock is outside the mark (`since`), and a mark whose
+    /// reading is still owed reads `pending`, never `person`.
     #[test]
     fn the_count_is_the_holds_and_an_unread_mark_is_pending() {
         let (mut t, hex) = signed_prompt();

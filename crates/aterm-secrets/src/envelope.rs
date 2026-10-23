@@ -2,47 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! The signed envelope a vault URL serves (docs/DESIGN-secrets-2026-10-20.md §5).
-//!
-//! ```text
-//! alab-vault/1
-//! name: alab
-//! seq: 7
-//! time: 1792530000
-//! signer: <padded base64, 32 bytes>
-//! [previous-signer: <padded base64, 32 bytes>]   (one pair per key rotation, oldest first)
-//! [endorsement: <padded base64, 64 bytes>]
-//! locker: admin
-//! -----BEGIN AGE ENCRYPTED FILE-----
-//! …
-//! -----END AGE ENCRYPTED FILE-----
-//! locker: 1
-//! …
-//! signature: <padded base64, 64 bytes>
-//! ```
-//!
-//! The signature is Ed25519 (ring) over every byte before the `signature:` line. This module
-//! knows nothing of what a locker holds: [`crate::client`] encrypts and decrypts them.
-//!
-//! The `previous-signer` and `endorsement` pairs are the handoff chain: every key the vault
-//! signed with before `signer`, oldest first, each with its signature over the key after it
-//! (the next pair's `previous-signer`, and for the last pair `signer`). Every version carries
-//! the whole chain, so a machine pinned to any key the vault ever had follows it to `signer`,
-//! however many rotations it slept through, and so does a new Mac whose build pins the
-//! vault's first key. A vault that never rotated carries no pair; one that rotated once
-//! carries one, exactly as before chains. A chain only grows: a reader and the server refuse
-//! a version that drops or changes a link of the one they hold ([`Envelope::check_extends`]),
-//! so a rotation by a build that carried only the latest link cannot cut the vault off from
-//! its first key.
-//!
-//! The grammar has exactly one spelling of every envelope: each header once, in this order
-//! (the handoff pairs at most [`MAX_HANDOFF`] times), `key: value` with one space; numbers in
-//! decimal without leading zeros; keys and signatures in canonical padded base64
-//! ([`crate::b64`]); LF line ends and no CR anywhere; a locker label `admin` or a decimal
-//! from 1 without leading zeros, each label at most once; an armored block from its exact
-//! `BEGIN` line to its exact `END` line, every line between them 1 to 64 characters of the
-//! base64 alphabet (what else the armor must be is [`crate::age::dearmor`]'s to judge); and
-//! the `signature:` line last, followed by exactly one LF. Errors name the line and what is
-//! wrong, never its text.
 
 use crate::{Error, b64};
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
@@ -53,8 +12,7 @@ pub const MAGIC: &str = "alab-vault/1";
 pub const MAX_ENVELOPE: usize = 16 << 20;
 /// The most lockers accepted.
 pub const MAX_LOCKERS: usize = 64;
-/// The most handoff pairs accepted: one per key rotation in the vault's life. A vault that
-/// rotated this often is made again (`aterm secrets create`), not rotated once more.
+/// The most handoff pairs accepted: one per key rotation in the vault's life.
 pub const MAX_HANDOFF: usize = 64;
 
 /// The armor's first line (C2SP age.md).
@@ -88,9 +46,7 @@ pub struct Envelope {
     pub time: u64,
     /// The signing key.
     pub signer: [u8; 32],
-    /// The handoff chain: every key `signer` replaced, oldest first, each with its
-    /// endorsement of the key after it (the last one's, of `signer`). Empty until the vault
-    /// first rotates.
+    /// The handoff chain: every key `signer` replaced, oldest first, each with its endorsement of the key after it (the last one's, of `signer`).
     pub handoff: Vec<([u8; 32], [u8; 64])>,
     /// The lockers, in file order.
     pub lockers: Vec<Locker>,
@@ -122,20 +78,11 @@ pub enum Pin {
     Same,
     /// Signed by a later key the handoff chain leads to from the pinned one: re-pin to this.
     Rotated([u8; 32]),
-    /// The pin gave way to the key this build names ([`Retired::gives_way`]), and the signer
-    /// is that key or one the chain leads to from it: re-pin to this. What was held under the
-    /// old pin floors nothing, since the admin removed may have signed it.
+    /// The pin gave way to the key this build names ([`Retired::gives_way`]), and the signer is that key or one the chain leads to from it: re-pin to this.
     Replaced([u8; 32]),
 }
 
-/// What a build knows of the keys the ALab vault rotated away from (§5). Every admin held
-/// the vault key, so an admin a rotation removed keeps a copy of the key it replaced and can
-/// still sign with it, or endorse a key of its own with it. Nothing such a key signs is taken
-/// again, and a pin that is such a key, or was reached through such a key's endorsement of a
-/// key this build does not know, gives way to the key that replaced it, so a fork the
-/// removed admin endorses is not followed, nor kept by a machine that followed it before the
-/// build knew. A retired key stays in the handoff chain: its endorsement of the key after it
-/// is what lets a machine pinned before it follow.
+/// What a build knows of the keys the ALab vault rotated away from (§5).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Retired {
     /// Keys no reader and no server takes an envelope signed by ([`crate::ALAB_RETIRED`]).
@@ -146,8 +93,7 @@ pub(crate) struct Retired {
 
 #[cfg(test)]
 thread_local! {
-    /// What [`Retired::compiled`] answers on this thread instead, in a test of a flow that
-    /// reaches it (a client's sync, a join) as if this build retired keys.
+    /// What [`Retired::compiled`] answers on this thread instead, in a test of a flow that reaches it (a client's sync, a join) as if this build retired keys.
     pub(crate) static TEST_RETIRED: std::cell::RefCell<Option<Retired>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -176,12 +122,7 @@ impl Retired {
         self.current.as_ref() == Some(key) || self.keys.contains(key)
     }
 
-    /// Whether a pin reached through `followed` (the keys before it, oldest first: the handoff
-    /// chain of the version that moved the pin there) gives way to [`Retired::current`]: the
-    /// pin is retired, or a retired key in that lineage endorsed a key this build does not
-    /// know. The vault's own successor of a retired key is retired too or the current one, so
-    /// such an endorsement is the removed admin's, made with its copy (a fork), and whatever
-    /// the lineage reached from it is the fork's too, however it was signed since.
+    /// Whether a pin reached through `followed` (the keys before it, oldest first: the handoff chain of the version that moved the pin there) gives way to [`Retired::current`]: the pin is retired, or a retired key in that lineage endorsed a key this build does not know.
     pub(crate) fn gives_way(&self, pin: &[u8; 32], followed: &[[u8; 32]]) -> bool {
         self.keys.contains(pin)
             || (0..followed.len()).any(|index| {
@@ -194,9 +135,7 @@ impl Retired {
 /// One handoff pair: a key the vault signed with, and its endorsement of the key after it.
 pub type Link = ([u8; 32], [u8; 64]);
 
-/// What a reader holds of a vault, for [`verify_for_reader`]: the version it last took, and
-/// that version's signer and handoff chain while it still has the version itself, which a
-/// newer one must carry on ([`Envelope::check_extends`]).
+/// What a reader holds of a vault, for [`verify_for_reader`]: the version it last took, and that version's signer and handoff chain while it still has the version itself, which a newer one must carry on ([`Envelope::check_extends`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Floor {
     /// The seq held.
@@ -205,8 +144,7 @@ pub struct Floor {
     pub digest: [u8; 32],
     /// Its signer and handoff chain, when the reader still has it.
     pub chain: Option<([u8; 32], Vec<Link>)>,
-    /// Whether the reader applied it: the same envelope again is [`Verdict::Unchanged`] when
-    /// it did, [`Verdict::New`] when it holds it unapplied ([`Floor::below`]).
+    /// Whether the reader applied it: the same envelope again is [`Verdict::Unchanged`] when it did, [`Verdict::New`] when it holds it unapplied ([`Floor::below`]).
     pub applied: bool,
 }
 
@@ -231,9 +169,7 @@ impl Floor {
         }
     }
 
-    /// The floor of an envelope the reader holds whole but has not applied: that envelope
-    /// reads as new, every older one and another at its seq are refused, and a next one must
-    /// carry its handoff chain on.
+    /// The floor of an envelope the reader holds whole but has not applied: that envelope reads as new, every older one and another at its seq are refused, and a next one must carry its handoff chain on.
     pub fn below(envelope: &Envelope) -> Floor {
         Floor {
             applied: false,
@@ -251,8 +187,7 @@ pub enum Verdict {
     Unchanged,
 }
 
-/// The next version to publish. Exhausting the admitted u64 sequence is an error,
-/// never a panic or a wrap to an older version.
+/// The next version to publish.
 #[cfg(any(unix, test))]
 pub(crate) fn next_seq(seq: u64) -> crate::Result<u64> {
     seq.checked_add(1).ok_or_else(|| {
@@ -260,9 +195,7 @@ pub(crate) fn next_seq(seq: u64) -> crate::Result<u64> {
     })
 }
 
-/// True when `name` is a vault name: `[a-z0-9][a-z0-9-]{0,62}`. The server's paths and a
-/// URL's last segment are held to this too, so a name never reaches a file system path
-/// with a `/` or a `.` in it.
+/// True when `name` is a vault name: `[a-z0-9][a-z0-9-]{0,62}`.
 pub fn valid_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     !bytes.is_empty()
@@ -282,9 +215,7 @@ pub fn valid_label(label: &str) -> bool {
             && label.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// Check one armored block's delimiters and lines: the exact `BEGIN` line, at least one line
-/// of 1 to 64 characters of the base64 alphabet, the exact `END` line, and a final LF. The
-/// armor's own rules (full 64-column lines, canonical padding) are the age module's.
+/// Check one armored block's delimiters and lines: the exact `BEGIN` line, at least one line of 1 to 64 characters of the base64 alphabet, the exact `END` line, and a final LF.
 pub fn check_armor(armored: &str) -> crate::Result<()> {
     let Some(body) = armored.strip_suffix('\n') else {
         return Err(Error::new("armored block: does not end with LF"));
@@ -403,10 +334,7 @@ fn key_bytes<const N: usize>(text: &str, what: &str) -> crate::Result<[u8; N]> {
         })
 }
 
-/// Parse an envelope's structure: the magic line, each header once and in order, labels
-/// unique (`admin` at most once), each armored block well-delimited, the `signature:` line
-/// last followed by exactly one LF, sizes within [`MAX_ENVELOPE`] and [`MAX_LOCKERS`].
-/// Refuses CR anywhere.
+/// Parse an envelope's structure: the magic line, each header once and in order, labels unique (`admin` at most once), each armored block well-delimited, the `signature:` line last followed by exactly one LF, sizes within [`MAX_ENVELOPE`] and [`MAX_LOCKERS`].
 pub fn parse(bytes: &[u8]) -> crate::Result<Envelope> {
     if bytes.len() > MAX_ENVELOPE {
         return Err(Error::new(format!(
@@ -535,10 +463,7 @@ pub fn parse(bytes: &[u8]) -> crate::Result<Envelope> {
     })
 }
 
-/// Render and sign: the exact bytes [`parse`] reads back, signed with the Ed25519 key whose
-/// seed is `seed`. A handoff chain with any link whose endorsement does not verify (its key's
-/// signature over the next key, for this name) is refused: every reader pinned at or before
-/// that link would refuse the envelope.
+/// Render and sign: the exact bytes [`parse`] reads back, signed with the Ed25519 key whose seed is `seed`.
 pub fn sign(unsigned: &Unsigned, seed: &[u8; 32]) -> crate::Result<Vec<u8>> {
     let signer = signer_public(seed)?;
     if let Some(link) = broken_link(&unsigned.handoff, 0, &unsigned.name, &signer) {
@@ -627,8 +552,6 @@ pub(crate) fn sign_unchecked(unsigned: &Unsigned, seed: &[u8; 32]) -> crate::Res
         b64::encode_padded(signature.as_ref())
     ));
     let bytes = text.into_bytes();
-    // What was signed must be what every reader parses: refuse rather than publish an
-    // envelope nobody would accept (too large, for one).
     parse(&bytes)?;
     Ok(bytes)
 }
@@ -653,8 +576,7 @@ fn handoff_message(name: &str, new_signer: &[u8; 32]) -> String {
     )
 }
 
-/// The previous key's endorsement of a new one: an Ed25519 signature by `old_seed` over
-/// `alab-vault/1 handoff\n<name>\n<new signer, padded base64>\n`.
+/// The previous key's endorsement of a new one: an Ed25519 signature by `old_seed` over `alab-vault/1 handoff\n<name>\n<new signer, padded base64>\n`.
 pub fn endorse(old_seed: &[u8; 32], name: &str, new_signer: &[u8; 32]) -> crate::Result<[u8; 64]> {
     if !valid_name(name) {
         return Err(Error::new(
@@ -690,10 +612,7 @@ fn broken_link(handoff: &[Link], from: usize, name: &str, signer: &[u8; 32]) -> 
     (from..handoff.len()).find(|&index| !link_holds(handoff, index, name, signer))
 }
 
-/// A short fingerprint of a signing key for people to compare: the first 10 bytes of its
-/// SHA-256 as `xxxx-xxxx-xxxx-xxxx-xxxx` lowercase hex. A key confirmed by it is pinned, so
-/// it carries the 80 bits a machine's join code does against a key minted to match. An
-/// older build shows the first four groups.
+/// A short fingerprint of a signing key for people to compare: the first 10 bytes of its SHA-256 as `xxxx-xxxx-xxxx-xxxx-xxxx` lowercase hex.
 pub fn fingerprint(public: &[u8; 32]) -> String {
     let digest = aterm_digest::Sha256::digest(public);
     let mut out = String::with_capacity(24);
@@ -731,8 +650,7 @@ impl Envelope {
             })
     }
 
-    /// Refuse an envelope whose signer is a retired key ([`Retired`]); a retired key as a
-    /// `previous-signer` is not refused.
+    /// Refuse an envelope whose signer is a retired key ([`Retired`]); a retired key as a `previous-signer` is not refused.
     pub(crate) fn check_signer(&self, retired: &Retired) -> crate::Result<()> {
         if retired.keys.contains(&self.signer) {
             return Err(Error::new(format!(
@@ -743,16 +661,7 @@ impl Envelope {
         Ok(())
     }
 
-    /// Check the signer against a pin reached through `followed` (the keys before it, oldest
-    /// first; empty for a pin set at join). A signer among [`crate::ALAB_RETIRED`] is refused.
-    /// Then [`Pin::Same`] when the signer is the pin, or [`Pin::Rotated`] when the pin is a
-    /// `previous-signer` of the handoff chain and every link from it on verifies (for this
-    /// `name`): the pin endorsed a key that endorsed, in turn, the signer. Links before the
-    /// pin are not this reader's to judge. A pin that is among [`crate::ALAB_RETIRED`], or was
-    /// reached through a retired key's fork, gives way to [`crate::ALAB_SIGNER`] first, since
-    /// the admin removed could endorse a key of its own with the retired one; the chain is
-    /// followed from that key instead, and a signer it leads to is [`Pin::Replaced`]. Anything
-    /// else is an error naming both fingerprints.
+    /// Check the signer against a pin reached through `followed` (the keys before it, oldest first; empty for a pin set at join).
     pub fn check_pin(&self, pin: &[u8; 32], followed: &[[u8; 32]]) -> crate::Result<Pin> {
         self.check_pin_with(pin, followed, &Retired::compiled())
     }
@@ -812,9 +721,7 @@ impl Envelope {
         }
     }
 
-    /// Whether this version's chain names one of `keys` handing off and a link from there on
-    /// does not verify: no key of the vault's endorsed what it claims, so the version is
-    /// forged (or damaged), whoever signed it.
+    /// Whether this version's chain names one of `keys` handing off and a link from there on does not verify: no key of the vault's endorsed what it claims, so the version is forged (or damaged), whoever signed it.
     #[cfg(unix)]
     pub(crate) fn forges_handoff_from(&self, keys: &[[u8; 32]]) -> bool {
         self.handoff
@@ -825,9 +732,7 @@ impl Envelope {
             })
     }
 
-    /// The keys of this version's chain its signer was reached from, oldest first: each one
-    /// from whose link on every endorsement verifies. A key before a link that does not is
-    /// not among them, though the chain names it (before a reader's pin, nothing judged it).
+    /// The keys of this version's chain its signer was reached from, oldest first: each one from whose link on every endorsement verifies.
     #[cfg(unix)]
     pub(crate) fn reached_from(&self) -> Vec<[u8; 32]> {
         let start = (0..self.handoff.len())
@@ -849,14 +754,7 @@ impl Envelope {
         }
     }
 
-    /// Refuse a version that does not carry on the handoff chain of the version held, signed
-    /// by `held_signer` and carrying `held`: every link of `held` must come, in order, right
-    /// before `held_signer`'s own link (last, when `held_signer` signed this one too). A chain
-    /// only grows, a rotation appending a link and any other publish carrying it unchanged,
-    /// so a version that drops a link is a build before chains rotating (it carried the
-    /// latest link alone) and would cut every machine pinned before the link off the vault.
-    /// Links before `held`'s first are taken: they are history the held version had lost,
-    /// which an admin's copy put back ([`Envelope::chain_carried_on`]).
+    /// Refuse a version that does not carry on the handoff chain of the version held, signed by `held_signer` and carrying `held`: every link of `held` must come, in order, right before `held_signer`'s own link (last, when `held_signer` signed this one too).
     pub(crate) fn check_extends(&self, held_signer: &[u8; 32], held: &[Link]) -> crate::Result<()> {
         let Some(at) = self.handoff_of(held_signer) else {
             return Err(Error::new(format!(
@@ -880,12 +778,7 @@ impl Envelope {
         }
     }
 
-    /// The handoff chain an admin's next version carries after opening this one while it
-    /// held a version signed by `held_signer` carrying `held`: this one's own when it carries
-    /// `held` on ([`Envelope::check_extends`]), or, when this one only dropped links from the
-    /// front of `held` (a rotation by a build before chains, through a server that took it),
-    /// `held` with this one's links from `held_signer` on, so the next version restores what
-    /// was dropped. Any other difference is refused as `check_extends` refuses it.
+    /// The handoff chain an admin's next version carries after opening this one while it held a version signed by `held_signer` carrying `held`: this one's own when it carries `held` on ([`Envelope::check_extends`]), or, when this one only dropped links from the front of `held` (a rotation by a build before chains, through a server that took it), `held` with this one's links from `held_signer` on, so the next version restores what was dropped.
     #[cfg(any(unix, test))]
     pub(crate) fn chain_carried_on(
         &self,
@@ -912,14 +805,7 @@ impl Envelope {
     }
 }
 
-/// Everything a reader checks before it decrypts, in order: the structure, `name` equals
-/// `expect_name`, the signer is not retired and the pin, reached through `followed`, holds
-/// ([`Envelope::check_pin`]), the signature, and the version against what it holds (`held`):
-/// newer is [`Verdict::New`] when it also carries on the held version's handoff chain
-/// ([`Envelope::check_extends`]), the same seq with the same digest is
-/// [`Verdict::Unchanged`], the same seq with other bytes or a lower seq is an error (a
-/// rollback or a forked vault). A pin that gave way ([`Pin::Replaced`]) judges nothing by
-/// `held`: the admin removed may have signed it, with any seq.
+/// Everything a reader checks before it decrypts, in order: the structure, `name` equals `expect_name`, the signer is not retired and the pin, reached through `followed`, holds ([`Envelope::check_pin`]), the signature, and the version against what it holds (`held`): newer is [`Verdict::New`] when it also carries on the held version's handoff chain ([`Envelope::check_extends`]), the same seq with the same digest is [`Verdict::Unchanged`], the same seq with other bytes or a lower seq is an error (a rollback or a forked vault).
 pub fn verify_for_reader(
     bytes: &[u8],
     expect_name: &str,
@@ -987,8 +873,7 @@ pub(crate) fn verify_for_reader_with(
     Ok((envelope, pin, verdict))
 }
 
-/// A syntactically valid armored block around `bytes` (not an age file: the envelope
-/// never looks inside). For tests of this module and the server's.
+/// A syntactically valid armored block around `bytes` (not an age file: the envelope never looks inside).
 #[cfg(test)]
 pub(crate) fn test_armor(bytes: &[u8]) -> String {
     let encoded = b64::encode_padded(bytes);
@@ -1002,8 +887,7 @@ pub(crate) fn test_armor(bytes: &[u8]) -> String {
     out
 }
 
-/// The handoff chain of a vault named `name` that signed with `seeds` in turn: every key but
-/// the last, each with its endorsement of the next. For tests of this module and the server's.
+/// The handoff chain of a vault named `name` that signed with `seeds` in turn: every key but the last, each with its endorsement of the next.
 #[cfg(test)]
 pub(crate) fn test_chain(name: &str, seeds: &[[u8; 32]]) -> Vec<([u8; 32], [u8; 64])> {
     seeds
@@ -1146,7 +1030,6 @@ mod tests {
         assert_eq!(pin, Pin::Rotated(public(&NEW)));
         assert_eq!(verdict, Verdict::New);
         assert_eq!(envelope.handoff, vec![(public(&OLD), endorsement)]);
-        // Re-pinned, the next envelope by the new key alone is the same signer.
         let next = sign(&unsigned(5), &NEW).expect("signed");
         let (_, pin, _) = verify_for_reader(
             &next,
@@ -1157,7 +1040,6 @@ mod tests {
         )
         .expect("accepted");
         assert_eq!(pin, Pin::Same);
-        // And the old key no longer verifies an envelope the new one signs without a handoff.
         assert!(verify_for_reader(&next, "alab", &public(&OLD), &[], None).is_err());
     }
 
@@ -1174,13 +1056,11 @@ mod tests {
         let error = verify_for_reader(&bytes, "alab", &public(&OLD), &[], None).unwrap_err();
         assert!(error.0.contains("endorsement"), "{error}");
 
-        // An endorsement the stranger made, claiming to be the pinned key's.
         let forged = endorse(&STRANGER, "alab", &public(&NEW)).expect("endorsed");
         rotated.handoff = vec![(public(&OLD), forged)];
         let bytes = sign_unchecked(&rotated, &NEW).expect("rendered");
         assert!(verify_for_reader(&bytes, "alab", &public(&OLD), &[], None).is_err());
 
-        // An endorsement of a different new key.
         let other_key = endorse(&OLD, "alab", &public(&STRANGER)).expect("endorsed");
         rotated.handoff = vec![(public(&OLD), other_key)];
         let bytes = sign_unchecked(&rotated, &NEW).expect("rendered");
@@ -1188,7 +1068,7 @@ mod tests {
     }
 
     /// The seeds of a vault whose key rotated `rotations` times: the first made it, the last
-    /// signs now. None is OLD, NEW or STRANGER.
+    /// signs now.
     fn seeds(rotations: usize) -> Vec<[u8; 32]> {
         (0..=rotations)
             .map(|index| [0x40 + u8::try_from(index).expect("small"); 32])
@@ -1205,8 +1085,6 @@ mod tests {
 
     #[test]
     fn no_handoff_and_one_handoff_are_spelled_byte_for_byte_as_before_chains() {
-        // The vault m22 serves and every reader of it speak this format. The digests are of
-        // what the encoder before handoff chains (8481872747) made of these fixed inputs.
         let none = sign(&unsigned(7), &OLD).expect("signed");
         assert_eq!(
             hex_digest(&none),
@@ -1272,7 +1150,6 @@ mod tests {
         let seeds = seeds(3);
         let mut broken = unsigned(9);
         broken.handoff = chain(&seeds);
-        // The middle key endorsed a key of a stranger's, not the one after it.
         broken.handoff[1].1 = endorse(&seeds[1], "alab", &public(&STRANGER)).expect("endorsed");
         let error = sign(&broken, &seeds[3]).expect_err("sign refuses it");
         assert!(error.0.contains("handoff 2 of 3"), "{error}");
@@ -1281,12 +1158,10 @@ mod tests {
             let error = verify_for_reader(&bytes, "alab", &public(seed), &[], None).unwrap_err();
             assert!(error.0.contains("endorsement of handoff 2 of 3"), "{error}");
         }
-        // A reader pinned after the break follows the links it trusts and judges no other.
         let (_, pin, _) =
             verify_for_reader(&bytes, "alab", &public(&seeds[2]), &[], None).expect("followed");
         assert_eq!(pin, Pin::Rotated(public(&seeds[3])));
 
-        // A link dropped or two swapped break the chain just as surely.
         let mut dropped = unsigned(9);
         dropped.handoff = chain(&seeds);
         dropped.handoff.remove(1);
@@ -1315,7 +1190,6 @@ mod tests {
         let error = sign(&long, &seeds[MAX_HANDOFF + 1]).expect_err("65 handoffs");
         assert!(error.0.contains("more than 64 handoffs"), "{error}");
 
-        // Parse counts pairs before it judges them: a 65th is refused whoever signed it.
         let pair = format!(
             "previous-signer: {}\nendorsement: {}\n",
             b64::encode_padded(&[1u8; 32]),
@@ -1351,9 +1225,6 @@ mod tests {
             verify_for_reader_with(bytes, "alab", &pin, &[], None, retired).map(|(_, pin, _)| pin)
         };
 
-        // The admin a rotation removed signs with its copy of the old key: a build that does
-        // not know the key is retired takes it (the control); one that does refuses it,
-        // whatever the reader pinned.
         let direct = sign(&unsigned(9), &OLD).expect("signed");
         assert_eq!(
             verify(&direct, public(&OLD), &Retired::default()),
@@ -1364,8 +1235,6 @@ mod tests {
             assert!(error.0.contains("rotated away from"), "{error}");
         }
 
-        // Or it endorses a key of its own with the old one: a reader still pinned to the old
-        // key would follow that fork, so its pin gives way to the key that replaced it.
         let mut fork = unsigned(9);
         let endorsement = endorse(&OLD, "alab", &public(&STRANGER)).expect("endorsed");
         fork.handoff = vec![(public(&OLD), endorsement)];
@@ -1376,8 +1245,6 @@ mod tests {
         );
         assert!(verify(&fork, public(&OLD), &retired).is_err());
 
-        // The vault itself, signed by the key that replaced the retired one, which stays in
-        // its chain: followed from the retired pin, the same signer under the new one.
         let mut real = unsigned(9);
         let endorsement = endorse(&OLD, "alab", &public(&NEW)).expect("endorsed");
         real.handoff = vec![(public(&OLD), endorsement)];
@@ -1387,13 +1254,11 @@ mod tests {
             Ok(Pin::Replaced(public(&NEW)))
         );
         assert_eq!(verify(&real, public(&NEW), &retired), Ok(Pin::Same));
-        // A version with no chain still moves a reader off the retired pin.
         let bare = sign(&unsigned(10), &NEW).expect("signed");
         assert_eq!(
             verify(&bare, public(&OLD), &retired),
             Ok(Pin::Replaced(public(&NEW)))
         );
-        // With no key named to replace it, a retired pin trusts nothing.
         let unreplaced = Retired {
             keys: vec![public(&OLD)],
             current: None,
@@ -1403,8 +1268,6 @@ mod tests {
 
     #[test]
     fn a_pin_the_removed_admin_led_a_reader_to_gives_way_and_what_it_held_floors_nothing() {
-        // The vault rotated OLD to NEW, and the admin that rotation removed kept OLD. Before a
-        // build retired OLD, a reader still pinned to it took what that admin served it.
         let retired = Retired {
             keys: vec![public(&OLD)],
             current: Some(public(&NEW)),
@@ -1426,7 +1289,6 @@ mod tests {
             envelope.handoff.iter().map(|(key, _)| *key).collect()
         };
 
-        // (a) A fork: OLD endorsed a key of the removed admin's, which signs with any seq.
         let mut fork = unsigned(1000);
         fork.handoff = vec![(
             public(&OLD),
@@ -1439,8 +1301,6 @@ mod tests {
         assert_eq!(pin, Pin::Rotated(public(&STRANGER)));
         let held = Floor::of(&taken);
         let followed = keys(&taken);
-        // A build that does not know OLD is retired keeps the fork's key (the control); one
-        // that does lets it give way, and the fork's seq 1000 does not floor the vault's 10.
         let (unaware, aware) = verify(&real, public(&STRANGER), &followed, &held);
         assert!(
             unaware
@@ -1451,18 +1311,15 @@ mod tests {
             "{unaware:?}"
         );
         assert_eq!(aware, Ok((Pin::Replaced(public(&NEW)), Verdict::New)));
-        // Nothing the fork's key signs later is taken either.
         let mut later = unsigned(1001);
         later.handoff = taken.handoff.clone();
         let later = sign(&later, &STRANGER).expect("signed");
         let (unaware, aware) = verify(&later, public(&STRANGER), &followed, &held);
         assert_eq!(unaware, Ok((Pin::Same, Verdict::New)));
         assert!(aware.is_err());
-        // Only the lineage tells: the same pin with none recorded keeps the fork's key.
         let (_, aware) = verify(&real, public(&STRANGER), &[], &held);
         assert!(aware.is_err());
 
-        // (b) A version OLD signed with a seq no real version reaches.
         let high = parse(&sign(&unsigned(1 << 62), &OLD).expect("signed")).expect("parsed");
         let (unaware, aware) = verify(&real, public(&OLD), &[], &Floor::of(&high));
         assert!(
@@ -1471,8 +1328,6 @@ mod tests {
         );
         assert_eq!(aware, Ok((Pin::Replaced(public(&NEW)), Verdict::New)));
 
-        // A pin the vault's own chain led to stands, and what it holds floors as ever, also
-        // past the keys this build knows.
         let real = parse(&real).expect("parsed");
         let (_, aware) = verify(real.raw(), public(&NEW), &keys(&real), &Floor::of(&real));
         assert_eq!(aware, Ok((Pin::Same, Verdict::Unchanged)));
@@ -1510,11 +1365,8 @@ mod tests {
             verify_for_reader(bytes, "alab", &pin, &[], Some(held))
                 .map(|(_, pin, verdict)| (pin, verdict))
         };
-        // The reader holds the vault at its second key, carrying the one link from the first.
         let held = Floor::of(&parse(&version(5, &full[..1], &seeds[1])).expect("parsed"));
 
-        // A build before chains rotating to the third key carried its own link alone, which
-        // would cut off every machine pinned to the first key.
         let cut = version(6, &full[1..], &seeds[2]);
         let error = read(&cut, key(1), &held).unwrap_err();
         assert!(
@@ -1522,25 +1374,20 @@ mod tests {
             "{error}"
         );
         assert!(error.0.contains(&fingerprint(&key(0))), "{error}");
-        // The control: a reader that no longer has its copy judges only seq and digest.
         assert_eq!(
             read(&cut, key(1), &Floor::version(held.seq, held.digest)),
             Ok((Pin::Rotated(key(2)), Verdict::New))
         );
-        // A rotation that appends is taken.
         assert_eq!(
             read(&version(6, &full, &seeds[2]), key(1), &held),
             Ok((Pin::Rotated(key(2)), Verdict::New))
         );
-        // The same signer carries the chain unchanged.
         let error = read(&version(6, &[], &seeds[1]), key(1), &held).unwrap_err();
         assert!(error.0.contains("handoff 1 of 1"), "{error}");
         assert_eq!(
             read(&version(6, &full[..1], &seeds[1]), key(1), &held),
             Ok((Pin::Same, Verdict::New))
         );
-        // A link changed, not dropped: another key's endorsement of the second key, which
-        // verifies, in place of the first key's.
         let mut changed = full.clone();
         changed[0] = (
             public(&STRANGER),
@@ -1548,8 +1395,6 @@ mod tests {
         );
         let error = read(&version(6, &changed, &seeds[2]), key(1), &held).unwrap_err();
         assert!(error.0.contains("handoff 1 of 1"), "{error}");
-        // Links put back before the held chain's first are taken: a reader that holds the cut
-        // version takes the one that restores what it dropped.
         let held = Floor::of(&parse(&cut).expect("parsed"));
         assert_eq!(
             read(&version(7, &full, &seeds[2]), key(2), &held),
@@ -1568,8 +1413,6 @@ mod tests {
             unsigned.handoff = handoff.to_vec();
             parse(&sign(&unsigned, seed).expect("signed")).expect("parsed")
         };
-        // The admin held the vault at the third key; a build before chains rotated it to the
-        // fourth carrying only the third key's link.
         let cut = opened(&full[2..], &seeds[3]);
         let restored = cut.chain_carried_on(&key(2), &held).expect("restored");
         assert_eq!(restored, full);
@@ -1579,8 +1422,6 @@ mod tests {
         let (_, pin, _) =
             verify_for_reader(&next, "alab", &key(0), &[], None).expect("the first key follows");
         assert_eq!(pin, Pin::Rotated(key(3)));
-        // A version that carries the chain on keeps its own; one by the held signer that
-        // dropped links gets them back.
         assert_eq!(
             opened(&full, &seeds[3]).chain_carried_on(&key(2), &held),
             Ok(full.clone())
@@ -1589,7 +1430,6 @@ mod tests {
             opened(&[], &seeds[2]).chain_carried_on(&key(2), &held),
             Ok(held.clone())
         );
-        // A link changed, not dropped, is not the admin's to undo.
         let mut changed = full[1..].to_vec();
         changed[0] = (
             public(&STRANGER),
@@ -1625,7 +1465,6 @@ mod tests {
             verify_for_reader(&eight, "alab", &pin, &[], Some(&held)).expect("newer");
         assert_eq!(verdict, Verdict::New);
 
-        // The wire format admits the last u64 version: it can be read, but not advanced.
         let penultimate = sign(&unsigned(u64::MAX - 1), &OLD).expect("signed");
         let held = Floor::of(&parse(&penultimate).expect("parsed"));
         let last_seq = next_seq(held.seq).expect("last successor");
@@ -1655,7 +1494,6 @@ mod tests {
 
     #[test]
     fn the_grammar_has_one_spelling() {
-        // The control: an unedited re-signing parses.
         parse(&resigned(str::to_owned)).expect("control");
         let long = format!("{}\n", "A".repeat(65));
         let previous_alone = format!(
@@ -1710,7 +1548,6 @@ mod tests {
             });
             assert!(parse(&bytes).is_err(), "{what} was accepted");
         }
-        // A missing END line swallows the rest.
         let bytes =
             resigned(|text| text.replacen(&format!("{ARMOR_END}\nlocker: 1\n"), "locker: 1\n", 1));
         assert!(parse(&bytes).is_err());

@@ -1,35 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHAT A READER ASKS OF A TAPE WITHOUT REPLAYING IT: the items one line
-//! each (`aterm drive tape cat`), each decision with the screen it judged,
-//! the act that followed and the journal line that said it (`tape show
-//! --decisions`, "why did it press 2?" answered from the tape alone), and
-//! what the tape cost (`tape stats`: bytes, doors, decisions, kB an hour).
-//!
-//! A tape is read from its binary form ([`super::recover`]) or its text
-//! ([`super::text`]), whichever the file holds. A damaged tape is refused,
-//! naming where, unless the reader asks for its whole frames before the
-//! damage (`--salvage`, [`super::recover::salvage`]); a torn tail — the end
-//! of a run that crashed — is read up to the tear and said.
-//!
-//! Everything here is a pure function of the tape: no session is asked,
-//! no file but the tape is read, and the answers are structured values
-//! ([`Decision`], [`Stats`]) a test compares field by field, rendered as
-//! text only at the edge.
-//!
-//! **What is printed is printable.** A tape is read in a terminal, and by
-//! an agent that reads what the terminal shows; a tape shared or kept in a
-//! corpus is one somebody else may have made. So every text the renderers
-//! take off a tape — a screen's rows, a request's words, a reply, a journal
-//! line, a door's or a note's name, a path, how the run ended — is printed
-//! with every character a terminal acts on written out ([`shown`], aterm's
-//! one rendering of another party's text for a terminal,
-//! [`aterm_codec::tty`]), never as the bytes a terminal would act on: an
-//! OSC 52 clipboard write, a title, a hyperlink, a cursor move, a bidi
-//! override or a line of its own. These views are for reading; the exact
-//! bytes are `cat --text`'s, which escapes them its own way
-//! ([`super::text`]).
+//! Pure readers and terminal-safe formatters for recorded harness tapes.
 
 use std::collections::BTreeMap;
 
@@ -55,13 +27,11 @@ pub struct Tape {
     pub frames: Option<usize>,
 }
 
-/// The tape whose bytes are `bytes`: binary or text. A damaged tape is
-/// refused unless `salvage` keeps the frames before the damage.
+/// Parses a binary or text tape from `bytes`, optionally salvaging frames before damage.
 ///
 /// # Errors
 ///
-/// Damage (without `salvage`), a newer format, bytes that are no tape, or
-/// text that does not read — each said.
+/// Returns an error if `bytes` is damaged (without `salvage`), unsupported, or malformed.
 pub fn open(bytes: &[u8], salvage: bool) -> Result<Tape, String> {
     if let Some(text) = bytes
         .strip_prefix(b"atape-text ")
@@ -97,8 +67,7 @@ pub fn open(bytes: &[u8], salvage: bool) -> Result<Tape, String> {
     })
 }
 
-/// What a reader is told of where `tape` ended, if anything: a torn tail or
-/// damage salvaged past.
+/// Returns a note describing a torn or salvaged tail on `tape`, if any.
 #[must_use]
 pub fn tail_note(tape: &Tape) -> Option<String> {
     match &tape.tail {
@@ -112,13 +81,7 @@ pub fn tail_note(tape: &Tape) -> Option<String> {
     }
 }
 
-/// `text` as it is printed ([module docs](self)): every character a
-/// terminal acts on or reorders the line around
-/// ([`aterm_codec::tty::is_active`]: C0 — a newline and a tab among them, a
-/// field's own line break being a forged line of the reader's — DEL, C1,
-/// the bidi controls and the line separators) written out in aterm's one
-/// spelling ([`aterm_codec::tty::push_escape`]: `\n`, `\x1b`, `\u{009b}`);
-/// everything else as it is.
+/// Escapes active terminal and bidi characters in `text` for safe terminal display.
 #[must_use]
 pub fn shown(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -173,8 +136,7 @@ fn words_shown(words: &[String]) -> String {
     shown(&words.join(" "))
 }
 
-/// `tape`'s items, one line each, an effect numbered by its ordinal (the
-/// number a decision's mark and a truncation name): what `tape cat` prints.
+/// Formats `tape`'s items as one line each for `tape cat`.
 #[must_use]
 pub fn skim(tape: &Tape) -> String {
     let mut out = String::new();
@@ -241,12 +203,10 @@ pub fn skim(tape: &Tape) -> String {
     out
 }
 
-/// One decision on a tape, with what it judged and what followed it
-/// ([module docs](self)).
+/// One recorded decision on a tape, with the judged screen and follow-up action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decision {
-    /// The mark's door: `decide.approval`, `decide.question` or
-    /// `decide.turn_end`.
+    /// The mark's door (`decide.approval`, `decide.question`, or `decide.turn_end`).
     pub door: String,
     /// The mark's index among the tape's items.
     pub item: usize,
@@ -264,16 +224,13 @@ pub struct Decision {
     pub act: Option<Vec<String>>,
     /// That act's reply, as one line.
     pub reply: Option<String>,
-    /// The first line the loop journaled (or, with no journal, printed)
-    /// after the mark, before the next decision.
+    /// The first journaled or printed line after the mark before the next decision.
     pub journal: Option<String>,
 }
 
-/// Every decision on `tape`, in order ([module docs](self)). A mark that
-/// does not read is skipped.
+/// Extracts every valid decision from `tape` in order.
 #[must_use]
 pub fn decisions(tape: &Tape) -> Vec<Decision> {
-    // The item index of each effect, by ordinal.
     let effects: Vec<usize> = tape
         .items
         .iter()
@@ -378,7 +335,6 @@ pub fn render_decisions(decisions: &[Decision]) -> String {
     }
     let mut out = String::new();
     for (n, d) in decisions.iter().enumerate() {
-        // Every text here came off the tape: printed as `shown` writes it.
         out.push_str(&format!(
             "decision {} at item {}: {} rule={}\n  outcome: {}\n",
             n + 1,
@@ -415,13 +371,11 @@ pub fn render_decisions(decisions: &[Decision]) -> String {
 pub struct DoorStats {
     /// Its records.
     pub records: usize,
-    /// The bytes those records carry, decoded (a request and its reply; an
-    /// output's bytes): what the tape stores against before its delta and
-    /// compression.
+    /// Decoded byte count carried by those records before delta and compression.
     pub raw: usize,
 }
 
-/// What a tape cost ([module docs](self)).
+/// Size, item counts, and rate statistics for a tape.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stats {
     /// The tape's size as stored.
@@ -435,11 +389,9 @@ pub struct Stats {
     pub doors: BTreeMap<String, DoorStats>,
     /// Decisions' marks, by door.
     pub decisions: BTreeMap<String, usize>,
-    /// The run's span: the latest monotonic reading on the tape (a `Mono`
-    /// record or a stamp), in nanoseconds since its origin.
+    /// Span of the run in nanoseconds from origin to the latest monotonic reading.
     pub span_ns: u64,
-    /// The tape's size per hour of its span, in kB (1000 bytes); `None` for
-    /// a tape that spans no time.
+    /// Stored tape size per hour of span in kB (1000 bytes), or `None` if zero span.
     pub kb_per_hour: Option<f64>,
     /// How the run ended, if the tape says.
     pub end: Option<String>,
@@ -490,9 +442,6 @@ pub fn stats(tape: &Tape) -> Stats {
             }
             Item::End(e) => {
                 end = Some(match e {
-                    // Its first line: a supervise's end carries its review
-                    // under its exit code (`replay::supervise_end`), and
-                    // `tape cat` shows the whole of it.
                     End::Returned { how } => {
                         format!("returned {}", how.lines().next().unwrap_or(""))
                     }

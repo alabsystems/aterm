@@ -1,45 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-dirfd` against `std`: the same system calls made through `std::fs`
-//! (and, for the flagged renames, their documented semantics).
-//!
-//! This is security machinery. `pinned_dir.rs` exists because a `PathBuf` is a
-//! claim about one instant, and a same-uid process can rename an ancestor and
-//! leave a symlink at the old pathname before a worker writes. So the tests here
-//! are not "does `openat` open a file"; they are:
-//!
-//! * **Same answer, same errno.** Every operation is scripted through BOTH
-//!   against two IDENTICAL directory trees, and the comparison covers the
-//!   result, the exact `errno` of every failure, AND a full recursive snapshot
-//!   of the tree afterwards (type, permission bits, link count, size).
-//! * **Inode identity, the basis of every TOCTOU check.** `same_identity()` in
-//!   `pinned_dir.rs` reads exactly two fields — `st_dev` and `st_ino` — and
-//!   every "is this still the same directory / child / file" guard is built on
-//!   them. The two fixture trees have different absolute inode numbers, so they
-//!   are compared RELATIONALLY: each run interns the `(dev, ino)` pairs it sees
-//!   and reports the first-seen index, so both sides must agree that
-//!   two hard links to one inode are the SAME identity and that two files are
-//!   DIFFERENT ones. `identity_fields_agree_bit_for_bit` pins the absolute
-//!   values on top of that, over one shared descriptor.
-//! * **The TOCTOU property itself.** A retained directory descriptor must keep
-//!   addressing the inode it was opened on, even after the pathname it came from
-//!   has been made to point somewhere else. That is checked directly, on both
-//!   implementations, with the swap performed between the open and the use.
-//! * **`Dir::read_from` must not steal the caller's descriptor, and must not
-//!   SHARE its offset.** `fdopendir` takes ownership of what it is handed and
-//!   `closedir` closes it, so a naive implementation silently closes the
-//!   retained pin; a `dup`-based one keeps the pin alive but shares its file
-//!   offset, so two streams over one pin split the directory between them. Both
-//!   are tested — the second by interleaving two live streams entry by entry
-//!   over a directory big enough to cross the `readdir` buffer.
-//!
-//! Both implementations run against real filesystems, because every property
-//! being tested — link counts, rename atomicity, the resolution window — only
-//! exists on one.
-//!
-//! Unix only, as the half it drives is (`src/unix.rs`); the Windows half is
-//! tested on real NTFS trees in `tests/windows.rs`.
+//! `aterm-dirfd` against `std`: the same system calls made through `std::fs` (and, for the flagged renames, their documented semantics).
 
 #![cfg(unix)]
 
@@ -52,8 +14,6 @@ use std::os::unix::fs::{
 use std::path::{Path, PathBuf};
 
 use aterm_dirfd as mine;
-
-// Comparable results
 
 /// Every operation reduces to this, so comparing two runs compares everything
 /// an implementation could get wrong: the verdict, the exact errno, and any
@@ -84,12 +44,6 @@ enum Outcome {
 
 /// Interned `(st_dev, st_ino)` pairs, so inode identity can be compared across
 /// two DIFFERENT fixture trees.
-///
-/// The absolute numbers necessarily differ between the trees, but the RELATION
-/// must not: two hard links to one inode have to intern to the same token in
-/// both runs, two distinct files to different ones, and re-opening a name has
-/// to return the token it returned before. That relation is the whole of
-/// `same_identity()`.
 #[derive(Default)]
 struct Identities(Vec<(u64, u64)>);
 
@@ -114,8 +68,6 @@ fn mine_flags_dir() -> mine::OFlags {
 fn mine_flags_file() -> mine::OFlags {
     mine::OFlags::RDONLY | mine::OFlags::NOFOLLOW | mine::OFlags::NONBLOCK | mine::OFlags::CLOEXEC
 }
-
-// The scripted operations
 
 /// One step of a script, written once and executed by both sides.
 #[derive(Debug, Clone)]
@@ -211,8 +163,6 @@ fn run_mine(root: &OwnedFd, op: &Op, ids: &mut Identities) -> Outcome {
         Op::Link(from, to) => unit(mine::linkat(root, from, root, to, AtFlags::empty())),
         Op::Chmod(name, bits) => match mine::openat(root, name, mine_flags_file(), Mode::empty()) {
             Ok(fd) => {
-                // Reconstruct the requested bits from the shared constants so
-                // both arms ask for exactly the same permission set.
                 let mut m = mine::Mode::empty();
                 if bits & 0o400 != 0 {
                     m |= mine::Mode::RUSR;
@@ -309,7 +259,6 @@ fn run_reference(root: &Path, op: &Op, ids: &mut Identities) -> Outcome {
         Op::Unlink(name) => unit(std::fs::remove_file(root.join(name))),
         Op::Rmdir(name) => unit(std::fs::remove_dir(root.join(name))),
         Op::Rename(from, to) => unit(std::fs::rename(root.join(from), root.join(to))),
-        // The flagged renames by their documented semantics.
         Op::RenameNoReplace(from, to) => {
             if !exists(from) {
                 Outcome::Failed(libc::ENOENT)
@@ -346,14 +295,7 @@ fn run_reference(root: &Path, op: &Op, ids: &mut Identities) -> Outcome {
     }
 }
 
-// Fixtures and snapshots
-
 /// Build the identical starting tree both sides are driven over.
-///
-/// It deliberately includes the awkward cases: a symlink pointing at a
-/// directory and one pointing at a file (both of which `O_NOFOLLOW` must
-/// refuse), a dangling symlink, a non-empty directory, and a file with two
-/// links (so a link-count assertion means something).
 fn build_tree(root: &Path) {
     use std::os::unix::fs::symlink;
     std::fs::create_dir_all(root.join("dir")).unwrap();
@@ -428,12 +370,7 @@ fn compare_script(label: &str, script: &[Op]) {
     );
 
     let fa = open_root_mine(&pa);
-    // Non-vacuity: a script that only ever failed (or only ever succeeded)
-    // would compare two implementations agreeing about nothing interesting.
-    // Every script here must exercise BOTH verdicts.
     let (mut failures, mut successes) = (0usize, 0usize);
-    // One identity table PER RUN: the trees have different inode numbers, so
-    // what must match is the pattern of sameness, not the numbers.
     let (mut ia, mut ib) = (Identities::default(), Identities::default());
     for (i, op) in script.iter().enumerate() {
         let ra = run_mine(&fa, op, &mut ia);
@@ -455,8 +392,6 @@ fn compare_script(label: &str, script: &[Op]) {
         "{label}: script is vacuous — {successes} successes, {failures} failures",
     );
 }
-
-// The scripts
 
 /// Opens, including every way one is supposed to FAIL: a symlink under
 /// `O_NOFOLLOW`, a file opened `O_DIRECTORY`, a directory opened as a file, an
@@ -488,12 +423,6 @@ fn opens_agree_including_every_refusal() {
 
 /// `fstat` fields, the type predicates built on them, and — the part that
 /// matters most — inode IDENTITY.
-///
-/// The order is deliberate. `twolinks` and `twolinks-b` are two names for one
-/// inode, so both sides must report the SAME identity token for them
-/// and a DIFFERENT one for `file`; re-stating `file` at the end must return the
-/// token it returned first. That relation is exactly what `same_identity()`
-/// decides every TOCTOU question with.
 #[test]
 fn stats_agree_on_every_field_read_including_inode_identity() {
     compare_script(
@@ -513,10 +442,7 @@ fn stats_agree_on_every_field_read_including_inode_identity() {
 
 /// The relational check above cannot see a change to how the raw platform
 /// fields are WIDENED, because both sides of it are produced by the same
-/// conversion. So `st_dev` and `st_ino` are also compared absolutely, over one
-/// shared descriptor and one shared tree, where the numbers must be equal and
-/// not merely consistent. `st_dev` is `i32` on Darwin and the widening is a
-/// cast; this is the test that notices if that cast ever changes meaning.
+/// conversion.
 #[test]
 fn identity_fields_agree_bit_for_bit() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -541,8 +467,6 @@ fn identity_fields_agree_bit_for_bit() {
             "{name}: st_dev/st_ino must match std exactly",
         );
     }
-    // ...and the pair really does discriminate: the hard links share it, the
-    // distinct files do not.
     let id = |name: &str| {
         let s = mine::openat(&fd, name, mine_flags_file(), mine::Mode::empty())
             .and_then(|f| mine::fstat(&f))
@@ -606,9 +530,7 @@ fn flagged_renames_agree() {
     compare_script(
         "renameat_with",
         &[
-            // NOREPLACE must SUCCEED into a free name...
             Op::RenameNoReplace("file", "published"),
-            // ...and REFUSE an occupied one, leaving both names in place.
             Op::RenameNoReplace("published", "twolinks"),
             Op::RenameNoReplace("missing", "nope"),
             Op::RenameNoReplace("dir", "empty"),
@@ -626,8 +548,6 @@ fn directory_listings_agree() {
             Op::Mkdir("zz"),
             Op::ReadDir,
             Op::Unlink("file"),
-            // Failures interleaved with the listings: a refused mutation must
-            // leave the directory contents exactly as they were, in both.
             Op::Unlink("file"),
             Op::Rmdir("dir"),
             Op::ReadDir,
@@ -638,18 +558,6 @@ fn directory_listings_agree() {
 }
 
 /// TWO live streams over ONE descriptor must each see the WHOLE directory.
-///
-/// This is the test that a `dup`-based `Dir::read_from` fails. A duplicate
-/// shares the original's open file description and therefore its offset, so two
-/// streams built that way consume one shared position: each returns roughly
-/// half the entries, with no error anywhere, and a second `read_from` that
-/// rewinds restarts a stream already in flight. The callers are exactly the
-/// shape that triggers it — a pinned directory is `Clone` over one
-/// `Arc<OwnedFd>` and is read from more than one place.
-///
-/// The directory is deliberately larger than any plausible `readdir` buffer, and
-/// the two streams are advanced ONE ENTRY AT A TIME so they are genuinely
-/// interleaved rather than merely both alive.
 #[test]
 fn two_interleaved_streams_over_one_descriptor_each_see_every_entry() {
     const N: usize = 2000;
@@ -714,15 +622,7 @@ fn a_removed_directory_reads_as_empty() {
     );
 }
 
-// The properties the callers actually depend on
-
 /// Reading a directory must not consume the caller's descriptor.
-///
-/// `fdopendir` takes ownership of the descriptor it is handed and `closedir`
-/// closes it. An implementation that passes the caller's fd straight through
-/// would close the retained pin the whole design rests on — and would then fail
-/// in a way that looks like a filesystem error, not a bug. Both implementations
-/// must keep the descriptor usable afterwards.
 #[test]
 fn reading_a_directory_leaves_the_callers_descriptor_usable() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -746,13 +646,7 @@ fn reading_a_directory_leaves_the_callers_descriptor_usable() {
     );
 }
 
-/// THE property. A retained directory descriptor keeps addressing the inode it
-/// was opened on, even after the pathname it came from has been repointed at a
-/// different directory. Both implementations must write into the ORIGINAL.
-///
-/// This is the attack `pinned_dir` exists to defeat: another same-uid process
-/// renames an ancestor and drops a replacement (or a symlink) at the old name
-/// between the check and the use.
+/// THE property.
 #[test]
 fn a_retained_descriptor_never_follows_a_swapped_pathname() {
     let base = aterm_tempfile::tempdir().unwrap();
@@ -761,13 +655,10 @@ fn a_retained_descriptor_never_follows_a_swapped_pathname() {
     std::fs::create_dir(&real).unwrap();
     std::fs::create_dir(&decoy).unwrap();
 
-    // Pin the real directory, then swap the pathname out from under it.
     let pinned = open_root_mine(&real);
     std::fs::rename(&real, base.path().join("moved-away")).unwrap();
     std::fs::rename(&decoy, &real).unwrap();
 
-    // Writing through the pin must land in the ORIGINAL directory, which is
-    // now called `moved-away` — never in the decoy now sitting at `target`.
     let outcome = run_mine(
         &pinned,
         &Op::CreateExclusive("witness"),

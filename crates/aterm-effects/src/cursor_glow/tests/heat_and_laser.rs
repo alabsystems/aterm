@@ -14,7 +14,6 @@ fn sustained_typing_outshines_relaxed_typing() {
     let t0 = Instant::now();
     let mut out = Vec::new();
 
-    // Relaxed: one single-cell advance every 500 ms.
     let mut slow = CursorGlow::default();
     let mut t = t0;
     slow.tick(Some((2, 0)), t, &c, g, &mut out);
@@ -26,7 +25,6 @@ fn sustained_typing_outshines_relaxed_typing() {
     let slow_lum = lum(&out);
     assert!(slow_lum > 0, "relaxed typing still glows (faintly)");
 
-    // Sustained fast: one advance every 50 ms.
     let mut fast = CursorGlow::default();
     let mut t = t0;
     fast.tick(Some((2, 0)), t, &c, g, &mut out);
@@ -79,7 +77,7 @@ fn laser_jump_strikes_lightning() {
     let mut glow = CursorGlow::default();
     glow.tick(Some((3, 5)), t0, &c, g, &mut out);
     glow.note_synthetic_move(t0);
-    glow.tick(Some((1, 38)), t0, &c, g, &mut out); // a real jump = a strike
+    glow.tick(Some((1, 38)), t0, &c, g, &mut out);
     assert!(
         glow.bolts.len() >= 3,
         "a jump forges a main channel + branch forks, got {}",
@@ -135,15 +133,13 @@ fn laser_jump_strikes_lightning() {
 }
 
 /// A raw Ctrl-A/Home timestamp forges no laser strike because it is not
-/// movement provenance. The same geometry under an explicit synthetic
-/// candidate still exercises the strike morphology.
+/// movement provenance.
 #[test]
 fn laser_navigation_forges_no_strike() {
     let g = geom();
     let c = cfg(GlowStyle::Laser, true);
     let t0 = Instant::now();
     let mut out = Vec::new();
-    // A timestamp-only relocation: no strike, no flare slam.
     let mut nav = CursorGlow::default();
     nav.tick(Some((2, 35)), t0, &c, g, &mut out);
     nav.note_navigation(t0 + Duration::from_millis(5));
@@ -164,7 +160,6 @@ fn laser_navigation_forges_no_strike() {
         "and never slams the flare ({})",
         nav.flare
     );
-    // The same explicitly scripted jump still strikes.
     let mut jump = CursorGlow::default();
     jump.tick(Some((2, 35)), t0, &c, g, &mut out);
     jump.note_synthetic_move(t0 + Duration::from_millis(5));
@@ -181,11 +176,7 @@ fn laser_navigation_forges_no_strike() {
     );
 }
 
-/// Sparkle on a light page: its grains are ink, not light. After a warm run
-/// the particle pass lays no additive quad, and every grain it draws (motes,
-/// the light star, the crescent and the mini-comet dash) is source-over ink
-/// inside the over-text ceiling. Negative control: the same run on a dark
-/// page lays the additive shower.
+/// Sparkle on a light page: its grains are ink, not light.
 #[test]
 fn sparkle_grains_on_a_light_page_are_ink_not_light() {
     let g = geom();
@@ -252,11 +243,6 @@ struct FlashCounter {
 
 /// The flashes every pixel of a frame stream saw: per pixel, the times (s)
 /// its flashes began.
-///
-/// A pixel that shows the ground while its counter rests at the ground's own
-/// low reads nothing new (no lower low, no rise), so a frame reads, per row,
-/// only the pixels off the ground and the ones whose counters have not come
-/// back to rest; every pixel it passes over would have kept its count.
 struct FlashMeter {
     pixels: Vec<FlashCounter>,
     onsets: Vec<Vec<f32>>,
@@ -363,8 +349,7 @@ impl FlashMeter {
 
 /// Lightning on a dark ground, through the frames a 120 Hz display shows:
 /// a storm of jumps between two cells five times a second, then a hot typing
-/// run at seventeen keys a second. Returns the most flashes any pixel of the
-/// bolt stream began in one second, and the bolts forged.
+/// run at seventeen keys a second.
 fn lightning_flashes(unlimited: bool) -> (usize, usize) {
     let g = geom();
     let mut c = cfg(GlowStyle::Laser, true);
@@ -385,7 +370,6 @@ fn lightning_flashes(unlimited: bool) -> (usize, usize) {
         glass.add_quads(&bolts);
         meter.sample(&glass, at.saturating_duration_since(t0).as_secs_f32());
     };
-    // Every event, then the 120 Hz frames until the next one.
     let mut events: Vec<(u64, (u16, u16), bool)> = Vec::new();
     for k in 0..13u64 {
         let caret = if k % 2 == 0 { (4, 34) } else { (1, 3) };
@@ -419,12 +403,9 @@ fn lightning_flashes(unlimited: bool) -> (usize, usize) {
 /// "a lightning bolt or flashing yellow", 2026-07-14): a bolt is born at full
 /// strength and only burns out, and strikes and crackles together are born
 /// at most three a second, so no pixel flashes more than three times in any
-/// second however the cursor jumps or however hot the typing. The negative
-/// control forges every bolt the dice ask for: the same storm then flashes a
-/// pixel more often, so the meter can see a strobe.
+/// second however the cursor jumps or however hot the typing.
 #[test]
 fn lightning_flashes_no_pixel_more_than_three_times_a_second() {
-    // One peak per bolt: full at birth, never brighter again.
     let mut last = bolt_flash(0.0);
     assert_eq!(last, 1.0, "a bolt is born at full strength");
     for i in 1..=1000 {
@@ -456,10 +437,7 @@ fn lightning_flashes_no_pixel_more_than_three_times_a_second() {
 /// Lightning on a light ground is ink, never light: a jump strike and a hot
 /// typing run with `dark_theme: false` emit no additive quad and no additive
 /// halo in any stream, and the strike really paints (source-over quads in the
-/// under-ink stream, where the letters it crosses draw over it). Its darkest
-/// pixel, where a fork crosses the channel, still leaves a dark foreground
-/// drawn over it 4.5:1, on the violet default and on a black trail colour
-/// (whose vivid ink would otherwise come back black).
+/// under-ink stream, where the letters it crosses draw over it).
 #[test]
 fn laser_on_a_light_ground_is_ink_never_light() {
     for color in [LASER_DEFAULT_COLOR, 0x0000_0000] {
@@ -541,8 +519,7 @@ fn laser_on_light(color: u32) {
 /// A typing crackle crosses the newest letters, so on a dark ground it spends
 /// the streak's over-ink budget: where a crackle runs straight through a
 /// letter at full intensity, the stroke under its axis keeps 4.5:1 against
-/// the counters beside it on the reference pair. The negative control is the
-/// same crackle with the budget off, which buries the stroke.
+/// the counters beside it on the reference pair.
 #[test]
 fn a_crackle_keeps_the_letter_it_crosses_readable() {
     let g = geom();
@@ -566,7 +543,6 @@ fn a_crackle_keeps_the_letter_it_crosses_readable() {
         let (mut quads, mut verts) = (Vec::new(), Vec::new());
         glow.emit_bolts(born, &c, g, &mut quads, &mut verts, &mut Vec::new());
         assert!(!quads.is_empty(), "the crackle draws");
-        // One stroke column under the axis, its counters a few pixels aside.
         let mut glass = Glass::new(g, c.theme_bg);
         for y in 34..47 {
             glass.px[y * glass.w + 80] = c.theme_fg;
@@ -589,15 +565,7 @@ fn a_crackle_keeps_the_letter_it_crosses_readable() {
 }
 
 /// The typing streak on a dark ground through the frames a 120 Hz display
-/// shows: forty keys along one row at seventeen a second, then the fade. Each
-/// frame composites the streak and its crown (re-emitted after the tick, with
-/// the over-ink account reopened so the streak spends it first, as in the
-/// tick) over the ground: the bed under the letters, the typed letters laid
-/// in as they land when `text`, then the light. The row probe says what the
-/// row holds (the letters when `text`, blank ground otherwise), so on bare
-/// ground the beam runs over air at full strength. Returns the most flashes
-/// any pixel began in one second. `knobs` is the trail's `(duration ms,
-/// length cells)`.
+/// shows: forty keys along one row at seventeen a second, then the fade.
 fn typing_streak_flashes(style: GlowStyle, chords: bool, text: bool, knobs: (u64, usize)) -> usize {
     let g = tall_geom();
     let mut c = cfg(style, true);
@@ -665,23 +633,12 @@ fn typing_streak_flashes(style: GlowStyle, chords: bool, text: bool, knobs: (u64
 /// crown flash no pixel more than [`TWINKLE_FLASH_BOUND_HZ`] times in any
 /// second, on bare ground and over the letters being typed, at the default
 /// trail (260 ms, 24 cells) and the longest (2 s, 48 cells), for every
-/// streaked style the bolt meter does not already cover. A one-row run keeps
-/// every sample, so each cell holds its own coverage while the keys land.
-/// Negative control: the same bursts with each typed run straightened into
-/// one chord (`streak_chords_rows`, the old geometry) re-flare the cells
-/// inside the run at the typing rate, because each tail sample's expiry
-/// re-interpolates the chord: the meter counts more flashes there for lumen,
-/// comet, sparkle and fire. (A dark fire's streak lays no light over its
-/// letters any more, so its chorded run there has nothing to re-flare.)
-///
-/// [`TWINKLE_FLASH_BOUND_HZ`]: crate::effect_util::TWINKLE_FLASH_BOUND_HZ
+/// streaked style the bolt meter does not already cover.
 #[test]
 fn the_typing_streak_flashes_no_pixel_more_than_three_times_a_second() {
     use GlowStyle::{Comet, Fire, Laser, Lumen, Phaser, Sparkle};
     let bound = crate::effect_util::TWINKLE_FLASH_BOUND_HZ;
     let (default, longest) = ((260, 24), (2_000, 48));
-    // (style, chorded, over its letters, knobs): every bound case, then the
-    // controls' chorded runs, each run once.
     let mut cases = Vec::new();
     for style in [Lumen, Laser, Comet, Sparkle, Phaser, Fire] {
         for knobs in [default, longest] {
@@ -693,8 +650,6 @@ fn the_typing_streak_flashes_no_pixel_more_than_three_times_a_second() {
     for style in [Lumen, Comet, Sparkle, Fire] {
         cases.push((style, true, false, default));
     }
-    // Each run is its own engine, meter and clock, so they run side by side,
-    // on no more threads than libtest gives the binary.
     let worst = crate::test_pool::par_map(&cases, |&(style, chords, text, knobs)| {
         typing_streak_flashes(style, chords, text, knobs)
     });
@@ -722,11 +677,6 @@ fn the_typing_streak_flashes_no_pixel_more_than_three_times_a_second() {
 
 /// A JUMP STRIKE HOLDS ITS LIGHT OVER THE TEXT IT CROSSES: an Enter at the
 /// bottom of a full screen strikes up through the lines it just printed.
-/// With those lines handed over as the frame's cells, the strike's light
-/// over their cells is its own hue at the crackle's over-ink ceiling (no
-/// white-hot core there, half a cell clear of the air it eases in from),
-/// while over the blank row it crosses it keeps its white-hot punch. Negative control: the same strike with the budget off
-/// lays its white core and full coverage over the letters too.
 #[test]
 fn a_jump_strike_holds_its_light_over_the_text_it_crosses() {
     use aterm_core::terminal::RenderCell;
@@ -743,9 +693,6 @@ fn a_jump_strike_holds_its_light_over_the_text_it_crosses() {
         .map(|c| if c < 32 { 'm' } else { ' ' })
         .collect();
     let blank = vec![' '; g.cols];
-    // The light over the text cells and over the blank row: the most
-    // channel-max level a bolt quad lays there, and whether it is whitened
-    // (its least channel close to its most).
     let strike = |unbudgeted: bool| {
         let mut glow = CursorGlow {
             streak_unbudgeted: unbudgeted,
@@ -774,8 +721,6 @@ fn a_jump_strike_holds_its_light_over_the_text_it_crosses() {
             let least = ((q.color >> 16) & 0xff)
                 .min((q.color >> 8) & 0xff)
                 .min(q.color & 0xff);
-            // Row 2: text above and below it too, so no light eases in
-            // from the air within half a cell.
             if row == 2 && (2..30).contains(&col) {
                 over_text = over_text.max(level);
                 white_on_text |= level > 40 && least * 10 > level * 7;

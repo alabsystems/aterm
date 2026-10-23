@@ -1,33 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The worker's report, as `aterm drive ledger` and the loop's report count
-//! read it: what the worker said since your turn, in full, not just what is
-//! still on its screen. Claude Code runs on the alternate screen
-//! and repaints in place, so rows that scroll off are gone; the host keeps them
-//! (the alt-screen archive, read with `offscreen`), and every `turn` records
-//! where the archive stood (`history`'s `arch=<origin>:<last>`).
-//!
-//! One read, `offscreen since=<mark> screen=1`, returns the rows archived after
-//! the mark and the screen under one lock, with `back=` (how many screen rows
-//! repeat archived ones). The join is the archived rows, then the screen's
-//! rows down to where its transcript ends ([`ScreenReader::transcript_end`]:
-//! Claude Code's [`transcript_end`]), less the repeats, kept verbatim.
-//!
-//! The report opens at your turn's `❯` row: the last one whose text begins
-//! with the first [`MARKER_CHARS`] characters of the ledger's text (whitespace
-//! ignored), or a `[Pasted text #N +L lines]` row for a paste. Without a turn
-//! in the ledger it opens at the last `❯` row; a [`ReportOpts::since`] mark
-//! opens after an archived row.
-//!
-//! `complete=1` says nothing was lost: the start was found, the archive is the
-//! one the mark named, the worker is on the alternate screen, no gap or
-//! eviction lies after the start, and [`ReportOpts::max_rows`] held every
-//! row; otherwise `reason=` says why. A host without the archive gets the
-//! screen alone (`reason=no-archive`).
-//!
-//! Every report is read in Claude Code's grammar: aterm reads no Codex
-//! screen, and a worker on the main screen gets `reason=main-screen`.
+//! The worker's report, as `aterm drive ledger` and the loop's report count read it.
 
 use std::fmt;
 
@@ -37,14 +11,13 @@ use super::blocks::{View, view_rows};
 use super::phase::transcript_end;
 use super::run::{Ctl, CtlReply, Fail, Session};
 
-/// [`ReportOpts::max_rows`]' default: the most archived rows one report reads.
+/// [`ReportOpts::max_rows`]' default.
 pub const DEFAULT_MAX_ROWS: usize = 8000;
 /// How many `history` records a report reads first to find the newest
 /// SUBMITTED turn; when they are all the window harness's own or unsubmitted
 /// it reads the whole ledger ([`Session::ledger_turn`]).
 const HISTORY_DEPTH: usize = 8;
-/// How many characters of the turn's text (whitespace aside) its `❯` row must
-/// begin with.
+/// How many characters of the turn's text (whitespace aside) its `❯` row must begin with.
 pub const MARKER_CHARS: usize = 60;
 /// The caret Claude Code's user rows open with, and any reader's without one.
 const CLAUDE_CARET: char = '❯';
@@ -56,13 +29,10 @@ const PASTE_CHARS: usize = 200;
 /// been cut, so its newlines are a lower bound of the paste's.
 const LEDGER_CUT_BYTES: usize = 500;
 
-/// A position in a session's alt-screen archive: `<origin>:<index>` as
-/// `history`'s `arch=` and a report's `last=` print it and `offscreen since=`
-/// takes it; a bare `<index>` names no origin.
+/// A position in a session's alt-screen archive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Mark {
-    /// The archive's host-assigned origin (unique per aterm process that
-    /// started the archive, and kept by a self-update that carries it).
+    /// The archive's host-assigned origin (unique per aterm process that started the archive, and kept by a self-update that carries it).
     pub origin: Option<u64>,
     /// The archived row index (0 = before the first row).
     pub index: u64,
@@ -108,8 +78,7 @@ pub struct ReportOpts {
     pub since: Option<Mark>,
     /// The most archived rows read.
     pub max_rows: usize,
-    /// Which of the rows are printed
-    /// ([`Report::render_view`]); the rows read are the same.
+    /// Which of the rows are printed ([`Report::render_view`]).
     pub view: View,
 }
 
@@ -126,9 +95,9 @@ impl Default for ReportOpts {
 /// Where a report starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Marker {
-    /// Your newest submitted `turn`: its `❯` row, found by its text.
+    /// Your newest submitted `turn`.
     Ledger,
-    /// No turn in the ledger: the last `❯` row.
+    /// No turn in the ledger.
     UserRow,
     /// `--since`: right after that archived row.
     Since,
@@ -147,24 +116,17 @@ impl Marker {
 /// Why a report is not complete, in the order the header lists them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Reason {
-    /// The host has no `offscreen`, its archive is off (`enabled=0`), or the
-    /// client relays no header: the screen alone.
+    /// The host has no `offscreen`, its archive is off (`enabled=0`), or the client relays no header.
     NoArchive,
-    /// The worker is not on the alternate screen: not a fullscreen app, or it
-    /// left; the archive holds nothing of what it prints now.
+    /// The worker is not on the alternate screen.
     MainScreen,
-    /// The archive is not the one the mark named: the host restarted since,
-    /// or handed the session to a new instance that could not carry the
-    /// archive (one that can keeps it and its origin).
+    /// The archive is not the one the mark named.
     ArchiveReset,
-    /// Rows after the start were evicted, or a gap (a redraw with no overlap,
-    /// a resize, a reset) lies after it. A resize as a self-update's new
-    /// instance takes over is one that loses nothing (rows may repeat).
+    /// Rows after the start were evicted, or a gap (a redraw with no overlap, a resize, a reset) lies after it.
     ArchiveGap,
-    /// More archived rows than `--max-rows`: the middle is missing.
+    /// More archived rows than `--max-rows`.
     MaxRows,
-    /// Your turn's `❯` row was not found (nor a last `❯` row): the report is
-    /// everything read, from the top.
+    /// Your turn's `❯` row was not found (nor a last `❯` row).
     MarkerNotFound,
 }
 
@@ -184,7 +146,7 @@ impl Reason {
 /// What the worker said since your turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
-    /// Why it is not complete; empty when it is.
+    /// Why it is not complete.
     pub reasons: Vec<Reason>,
     pub marker: Marker,
     /// The ledger turn it starts from (`marker=ledger`).
@@ -195,8 +157,7 @@ pub struct Report {
     pub archived: usize,
     /// How many of `rows`, after those, came from the screen.
     pub screen: usize,
-    /// The newest archived row read, to hand to `--since` next time (`None`
-    /// without an archive).
+    /// The newest archived row read, to hand to `--since` next time (`None` without an archive).
     pub last: Option<Mark>,
 }
 
@@ -206,8 +167,7 @@ impl Report {
         self.reasons.is_empty()
     }
 
-    /// `report complete=<0|1> [reason=<r>[,<r>…]] marker=<m> turn=<id|-> rows=<n>
-    /// archived=<a> screen=<s> last=<origin:i|->`.
+    /// `report complete=<0|1> [reason=<r>[,<r>…]] marker=<m> turn=<id|-> rows=<n> archived=<a> screen=<s> last=<origin:i|->`.
     pub fn header(&self) -> String {
         let mut out = format!("report complete={}", u8::from(self.complete()));
         if !self.reasons.is_empty() {
@@ -237,11 +197,7 @@ impl Report {
         out
     }
 
-    /// [`Self::render`] for `view`: `View::All` is exactly it; `--final` and
-    /// `--messages` print the same header with ` view=<final|messages>
-    /// kept=<n>` after it — `rows=` still counts every row the report holds —
-    /// a `--` line, then only the rows the view keeps, read in Claude Code's
-    /// grammar ([`super::blocks::view_rows`]).
+    /// [`Self::render`] for `view`.
     pub fn render_view(&self, view: View) -> String {
         if view == View::All {
             return self.render();
@@ -263,19 +219,15 @@ pub struct LedgerTurn {
     pub id: u64,
     /// The submit verifiably landed.
     pub submitted: bool,
-    /// Who typed it (`by=`: `harness`, `ctl`, `bridge`, a sid, `-`); `-` from
-    /// a host that predates the field.
+    /// Who typed it (`by=`: `harness`, `ctl`, `bridge`, a sid, `-`).
     pub by: String,
-    /// Where the archive stood when the turn started (a host that predates
-    /// the archive prints none).
+    /// Where the archive stood when the turn started (a host that predates the archive prints none).
     pub arch: Option<Mark>,
     /// What was typed (pct-decoded; the ledger keeps up to 512 bytes).
     pub text: String,
 }
 
-/// The records of a `history` reply (`turn <id> submitted=<0|1> … arch=<o>:<l>
-/// text=<pct>` per line); any other line (a raw reply's `OK <n>`) is skipped.
-/// `text=` is the free-text tail, so the line is cut there first.
+/// The records of a `history` reply (`turn <id> submitted=<0|1> … arch=<o>:<l> text=<pct>` per line).
 pub fn parse_history(body: &str) -> Vec<LedgerTurn> {
     body.lines().filter_map(parse_turn_line).collect()
 }
@@ -305,10 +257,7 @@ fn parse_turn_line(line: &str) -> Option<LedgerTurn> {
 
 /// The turn a report starts from: the newest one whose submit landed, else
 /// the newest (a turn that never landed may sit in the composer; its mark
-/// still says where the archive stood when it was typed). The window
-/// harness's own turns (`by=harness`: its `keep going`, its done check, the
-/// upgrade's notice) are never it: the report answers what the worker was
-/// asked, not the harness's nudge.
+/// still says where the archive stood when it was typed).
 fn newest_turn(turns: Vec<LedgerTurn>) -> Option<LedgerTurn> {
     let mut turns: Vec<LedgerTurn> = turns.into_iter().filter(|t| t.by != "harness").collect();
     let at = turns
@@ -321,7 +270,7 @@ fn newest_turn(turns: Vec<LedgerTurn>) -> Option<LedgerTurn> {
 /// Decode the control protocol's `%XX` escape, under the name this crate's parsers import.
 pub(crate) use aterm_codec::pct::decode as pct_decode;
 
-/// One `offscreen … screen=1` reply: the header's fields and the two halves.
+/// One `offscreen … screen=1` reply.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Offscreen {
     /// Index of `archived[0]` (`last + 1` when nothing came).
@@ -332,22 +281,18 @@ pub struct Offscreen {
     pub lost: u64,
     /// Gaps with `after >= since`.
     pub breaks: u64,
-    /// How many rows the screen shows again from the archive: screen rows
-    /// `pin..pin+back` are archived rows `back_at..` (`back_at`/`pin` 0 when
-    /// the host does not say).
+    /// How many rows the screen shows again from the archive.
     pub back: usize,
     pub back_at: u64,
     pub pin: usize,
     pub origin: u64,
-    /// The host's archive is recording (`enabled=0` says it is off: nothing
-    /// that scrolled away was kept).
+    /// The host's archive is recording (`enabled=0` says it is off: nothing that scrolled away was kept).
     pub enabled: bool,
     /// The worker is on the alternate screen.
     pub alt: bool,
     /// More archived rows than the page held.
     pub more: bool,
-    /// The screen half caught the program's DEC 2026 frame unfinished (`frame=open`,
-    /// read under the rows' lock, as `text --json`'s `"frame":"open"`).
+    /// The screen half caught the program's DEC 2026 frame unfinished (`frame=open`, read under the rows' lock, as `text --json`'s `"frame":"open"`).
     pub frame_open: bool,
     pub archived: Vec<String>,
     pub screen: Vec<String>,
@@ -356,19 +301,13 @@ pub struct Offscreen {
 /// Why an `offscreen` reply could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OffscreenError {
-    /// No `OK <n> first=… last=…` header anywhere (an `aterm ctl` that prints only a
-    /// line-framed verb's rows), or the header alone with its rows dropped (an `aterm ctl`
-    /// that frames `offscreen` like a status line): the rows cannot be placed.
+    /// Missing `OK <n> first=… last=…` header, or header alone with its rows dropped.
     NoHeader,
     /// A header that does not describe the rows that came.
     Bad(String),
 }
 
-/// Read an `offscreen` reply. `aterm ctl` prints the rows on stdout and the
-/// header on stderr (`aterm-ctl: OK <n> first=…`, as it does for `inbox`); a
-/// raw client carries the header as stdout's first line. `<n>` counts every
-/// line that follows, the screen's `screen_rows=` included: the archived rows
-/// are the first `n - screen_rows`.
+/// Read an `offscreen` reply.
 pub fn parse_offscreen(reply: &CtlReply) -> Result<Offscreen, OffscreenError> {
     let stdout: Vec<&str> = reply.stdout.lines().collect();
     let from_stderr = reply.stderr.lines().find_map(|l| {
@@ -400,8 +339,6 @@ pub fn parse_offscreen(reply: &CtlReply) -> Result<Offscreen, OffscreenError> {
         }
     };
     if payload.len() != n {
-        // The header on stdout and nothing after it: a client that framed the
-        // reply as a status line and dropped every row — the rows are lost to
         // this reader, not malformed.
         if !header_on_stderr && payload.is_empty() {
             return Err(OffscreenError::NoHeader);
@@ -433,8 +370,7 @@ pub fn parse_offscreen(reply: &CtlReply) -> Result<Offscreen, OffscreenError> {
     })
 }
 
-/// `OK <n> key=value…` with a `last=` field: the count and the fields. Words
-/// without `=` (`aterm ctl`'s `(offscreen: no results)` note) are ignored.
+/// `OK <n> key=value…` with a `last=` field: the count and the fields.
 fn header(line: &str) -> Option<(usize, Vec<(&str, &str)>)> {
     let rest = line.trim().strip_prefix("OK ")?;
     let mut words = rest.split_whitespace();
@@ -458,14 +394,7 @@ pub(super) struct Joined {
     pub(super) upto: u64,
 }
 
-/// Join an `offscreen … screen=1` read: every archived row, then the screen's
-/// rows to where `reader` says its transcript ends
-/// ([`ScreenReader::transcript_end`]; Claude Code's: [`transcript_end`]), less
-/// the ones it re-shows from the archive that this read got — screen row
-/// `pin + m` is archived row `back_at + m` for `m < back`, so a pinned header
-/// above them stays, and a re-shown row the read did not get (a page cut short
-/// by `--max-rows`, a row from before the mark) is kept from the screen: a
-/// duplicate, never a loss.
+/// Join an `offscreen … screen=1` read.
 pub(super) fn join(off: &Offscreen, reader: &dyn ScreenReader) -> Joined {
     let count = u64::try_from(off.archived.len()).unwrap_or(u64::MAX);
     let upto = if count > 0 {
@@ -497,10 +426,7 @@ pub(super) fn join(off: &Offscreen, reader: &dyn ScreenReader) -> Joined {
     }
 }
 
-/// A user row: `❯` in column 0, then whitespace. Claude Code's own `❯` rows —
-/// a prompt's options (`❯ 1. Yes`) — are indented, and its composer is in the
-/// live zone, which [`transcript_end`] already cut; so a message that starts
-/// with `1.` is still a user row.
+/// A user row: `❯` in column 0, then whitespace.
 pub(super) fn is_user_row(row: &str) -> bool {
     user_row(row, CLAUDE_CARET)
 }
@@ -512,10 +438,7 @@ fn user_row(row: &str, caret: char) -> bool {
         .is_some_and(|rest| rest.starts_with(char::is_whitespace))
 }
 
-/// The first `need` non-whitespace characters of the user block at `at`: its
-/// caret row (the caret dropped), then the rows it wrapped onto (indented, or
-/// blank), up to the first row back in column 0 (the worker's `⏺`, a done
-/// row).
+/// The first `need` non-whitespace characters of the user block at `at`.
 pub(super) fn user_text(rows: &[String], at: usize, need: usize) -> String {
     let mut chars = rows[at].chars();
     chars.next();
@@ -532,16 +455,12 @@ pub(super) fn user_text(rows: &[String], at: usize, need: usize) -> String {
         .collect()
 }
 
-/// Whether `text` may show as a `[Pasted text …]` row: it has a line break,
-/// or is long.
+/// Whether `text` may show as a `[Pasted text …]` row.
 pub(super) fn paste_like(text: &str) -> bool {
     text.contains('\n') || text.chars().count() >= PASTE_CHARS
 }
 
-/// Whether the paste row `row` can be `text`: its `+N lines` (when it says)
-/// counts the text's line breaks, give or take one (a trailing break, lines
-/// against breaks) — and at most N+1 of them when the ledger may have cut the
-/// text short.
+/// Whether the paste row `row` can be `text`.
 pub(super) fn paste_fits(row: &str, text: &str) -> bool {
     let Some(n) = row
         .split_once(" +")
@@ -587,12 +506,7 @@ fn find_start(rows: &[String], marker: Marker, text: Option<&str>, caret: char) 
                     .copied()
                     .find(|&i| user_text(rows, i, need) == want)
             };
-            // A short turn is never a paste: an earlier turn's paste row is
-            // not where it starts (it may be queued under the status row).
             let text = text.unwrap_or("");
-            // Only the last paste row can be the newest turn's; one that does
-            // not fit it is another paste, and an older one further up is
-            // never reached for.
             by_text.or_else(|| {
                 paste_like(text).then_some(())?;
                 let at = users.iter().rev().copied().find(|&i| {
@@ -683,7 +597,6 @@ fn assess(
     let gaps = off.lost > 0 || off.breaks > 0;
     let mut recheck = None;
     match (marker, start) {
-        // Everything after the given row counts, up to the gap at it.
         (Marker::Since, _) => {
             if gaps {
                 reasons.push(Reason::ArchiveGap);
@@ -701,32 +614,21 @@ fn assess(
             }
             reasons.push(Reason::MarkerNotFound);
         }
-        // The start is an archived row k: the rows after it came oldest first
-        // from k on, so none of them was evicted at the read (eviction takes
-        // the oldest). A gap after the mark may still lie before k — the one
-        // a resize or a redraw left just before the turn began — so a gap
-        // counted here is placed against k by a second read.
         (_, Some(s)) if s < joined.archived => {
             if off.breaks > 0 {
                 recheck = Some(joined.first + u64::try_from(s).unwrap_or(u64::MAX));
             }
-            // A tail read (no ledger turn) left out older rows, none after the start; an
-            // oldest-first page left out newer ones.
             if off.more && marker == Marker::Ledger {
                 reasons.push(Reason::MaxRows);
             }
         }
-        // The start is on the screen: every row reported came from the one
-        // snapshot.
         (_, Some(_)) => {}
     }
     (reasons, recheck)
 }
 
 impl<C: Ctl> Session<'_, C> {
-    /// What the worker said since your newest submitted turn (or
-    /// [`ReportOpts`]'s `since`), the archive's rows and the screen's joined
-    /// (see the module doc).
+    /// Worker output since the newest submitted turn (or [`ReportOpts`] `since`), joining archive and screen rows.
     pub fn report(&mut self, opts: &ReportOpts) -> Result<Report, String> {
         self.gather_report(opts).map_err(String::from)
     }
@@ -744,7 +646,6 @@ impl<C: Ctl> Session<'_, C> {
             let screen = self.full_screen()?;
             return Ok(screen_only(marker, turn, text.as_deref(), &screen.rows));
         };
-        // Every report is read in Claude Code's grammar (the module doc).
         let joined = join(&off, Program::Claude.reader());
         let start = find_start(&joined.rows, marker, text.as_deref(), CLAUDE_CARET);
         let (mut reasons, recheck) = assess(&off, &joined, marker, mark, start);
@@ -769,13 +670,7 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// The turn a report starts from ([`newest_turn`]); `None` when there is
-    /// none, or the host has no `history`. The newest [`HISTORY_DEPTH`]
-    /// records first (`history 8`): a submitted one not the harness's ends
-    /// the search there. A window of only the harness's own turns (one row
-    /// per `keep going`, done check and `/usage`) or unsubmitted ones reads
-    /// the whole ledger (`history`, at most 512 records), so a run of them
-    /// since the manager's turn never sends the report to the newest `❯`
-    /// row — the harness's own.
+    /// none, or the host has no `history`.
     fn ledger_turn(&mut self) -> Result<Option<LedgerTurn>, Fail> {
         let depth = HISTORY_DEPTH.to_string();
         let Some(near) = self.history_read(&["history", &depth])? else {
@@ -801,8 +696,7 @@ impl<C: Ctl> Session<'_, C> {
 
     /// The one read: `offscreen since=<mark> max=<n> screen=1` — oldest first
     /// from the mark — or, with no mark to start from, the newest `<n>`
-    /// (`tail=`). `None`: the host has no `offscreen`, or the client relayed
-    /// no header to place the rows by.
+    /// (`tail=`).
     fn offscreen_snapshot(
         &mut self,
         marker: Marker,
@@ -819,7 +713,6 @@ impl<C: Ctl> Session<'_, C> {
         args.extend(from.as_deref());
         args.push(&max_arg);
         args.push("screen=1");
-        // The screen half is a whole frame's (`frame=open` read again after `await frame`).
         self.whole_frame(|s| {
             let r = s.call(&args)?;
             if r.ok() {
@@ -840,8 +733,7 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// Whether a gap lies after archived row `k` (`offscreen since=<origin>:<k>
-    /// max=1`). Read after the snapshot, so a gap that came since counts too:
-    /// never a gap missed. A reply that says nothing certain is a gap.
+    /// max=1`).
     fn gap_after(&mut self, origin: u64, k: u64) -> Result<bool, Fail> {
         let since = format!("since={origin}:{k}");
         let r = self.call(&["offscreen", &since, "max=1"])?;
@@ -861,9 +753,7 @@ impl<C: Ctl> Session<'_, C> {
     }
 }
 
-/// The host does not know the verb: an older build answers `ERR unknown verb`
-/// (or, for a verb aimed at another session, `ERR denied` — an unknown verb
-/// has no op class to authorize), a usage line or a bare `ERR`.
+/// The host does not know the verb.
 pub(super) fn without_verb(r: &CtlReply) -> bool {
     r.unknown_form() || r.is_err("unknown verb") || r.is_err("denied")
 }

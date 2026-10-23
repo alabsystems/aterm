@@ -50,7 +50,7 @@ impl Lab {
             .unwrap();
     }
 
-    /// Dispatch `event` to the view; what it did.
+    /// Dispatch `event` to the view.
     pub(super) fn dispatch_outcome(
         &mut self,
         event: AppEvent,
@@ -64,7 +64,7 @@ impl Lab {
         self.service.snapshot().text.to_string()
     }
 
-    /// Invoke `action`; the patch it emits, if any.
+    /// Invoke `action`.
     pub(super) fn invoke(
         &mut self,
         action: &str,
@@ -87,8 +87,7 @@ impl Lab {
         })
     }
 
-    /// Invoke `action` and carry the patch it emits through the real service,
-    /// as the host does: the result, then the new snapshot.
+    /// Invoke `action` and carry the patch it emits through the real service, as the host does.
     pub(super) fn commit(&mut self, action: &str, value: Option<SemanticInput>) -> ConfigPatch {
         let (patch, operation) = self
             .invoke(action, value)
@@ -96,15 +95,13 @@ impl Lab {
         self.carry(patch, operation)
     }
 
-    /// Invoke `action` as a press does, and carry the patch it emits, if it
-    /// writes, through the real service as [`Self::commit`] does.
+    /// Invoke `action` as a press does, and carry the patch it emits, if it writes, through the real service as [`Self::commit`] does.
     pub(super) fn press(&mut self, action: &str) -> Option<ConfigPatch> {
         let (patch, operation) = self.invoke(action, None)?;
         Some(self.carry(patch, operation))
     }
 
-    /// Carry `patch` through the real service, as the host does: the
-    /// result, then the new snapshot.
+    /// Carry `patch` through the real service, as the host does.
     pub(super) fn carry(&mut self, patch: ConfigPatch, operation: OperationId) -> ConfigPatch {
         let (snapshot, undo) = apply_real_config_patch(&mut self.service, &patch);
         self.runtime
@@ -126,8 +123,7 @@ impl Lab {
         patch
     }
 
-    /// Dispatch `event` and carry the patch it emits through the real
-    /// service, as [`Self::commit`] does for an action.
+    /// Dispatch `event` and carry the patch it emits through the real service, as [`Self::commit`] does for an action.
     pub(super) fn commit_event(&mut self, event: AppEvent) -> ConfigPatch {
         let outcome = self
             .runtime
@@ -247,8 +243,7 @@ impl Lab {
         compile_settings_view(&self.runtime, self.instance, self.view, cx)
     }
 
-    /// Every screen of the list in a `width`x`height` window, from its top
-    /// to the last one it scrolls to ([`each_screen_of`]).
+    /// Every screen of the list in a `width`x`height` window, from its top to the last one it scrolls to ([`each_screen_of`]).
     pub(super) fn each_screen(
         &mut self,
         width: f32,
@@ -365,7 +360,6 @@ fn a_switch_turned_back_to_its_default_removes_its_key() {
         SettingsState::display_value(lab.state().field_by_key(key).unwrap()),
         "true"
     );
-    // A click with no value toggles back the same way.
     lab.commit(&format!("settings/set/{key}"), None);
     let patch = lab.commit(&format!("settings/set/{key}"), None);
     assert_eq!(patch.edits[0].value, None);
@@ -374,8 +368,7 @@ fn a_switch_turned_back_to_its_default_removes_its_key() {
 
 /// A slider moved back to its default removes its key, as a switch does: no
 /// `window_padding = 12.0` left behind, no "Changed", nothing on Modified —
-/// by a set value (a drag or click) and by the arrow keys alike. CONTROL: a
-/// value off the default is written.
+/// by a set value (a drag or click) and by the arrow keys alike.
 #[test]
 fn a_slider_moved_back_to_its_default_removes_its_key() {
     let key = prefs::EDIT_WINDOW_PADDING;
@@ -395,7 +388,6 @@ fn a_slider_moved_back_to_its_default_removes_its_key() {
     assert_eq!(lab.text(), "");
     assert!(!lab.state().is_explicit(key));
 
-    // The arrow keys on the focused slider, Right then Left.
     lab.state_mut().navigate(SettingsRoute::WindowTabs);
     lab.state_mut().common.last_focus = Some(UiKey::new(format!("settings/control/{key}")));
     let patch = lab.commit_event(AppEvent::TextInput(TextInputEvent::Right { extend: false }));
@@ -411,8 +403,7 @@ fn a_slider_moved_back_to_its_default_removes_its_key() {
 }
 
 /// A row whose key is written in aterm.toml says Changed and has a Reset on
-/// its own page, after its control; a row at its default has neither. Reset
-/// removes exactly that key.
+/// its own page, after its control; a row at its default has neither.
 #[test]
 fn a_changed_row_offers_reset_on_its_own_page() {
     let mut lab = Lab::new("cursor_blink = false\nscrollback_lines = 5000\n");
@@ -446,9 +437,6 @@ fn a_changed_row_offers_reset_on_its_own_page() {
     );
     assert_eq!(lab.text(), "scrollback_lines = 5000\n");
 
-    // The theme's own pair, written (what Follow system writes over an unset
-    // theme): neither slot is off its side's default, so the Follow system
-    // row carries the theme's Reset, on its page and on Modified.
     for route in [SettingsRoute::Appearance, SettingsRoute::Modified] {
         let mut lab = Lab::new("theme = \"dark:Default,light:Default Light\"\n");
         lab.state_mut().navigate(route);
@@ -676,8 +664,6 @@ fn modified_offers_reset_all_and_names_what_it_resets() {
     );
     assert!(lab.invoke("settings/reset-all", None).is_none());
     assert!(!lab.state().reset_all_confirmation);
-    // `future_thing` is still listed with its own Reset, so "nothing to
-    // reset" would be false: the words say what Reset All leaves.
     assert_eq!(
         lab.state().feedback.as_deref(),
         Some("Reset All leaves keys only in aterm.toml. Use Reset on each row.")
@@ -686,7 +672,6 @@ fn modified_offers_reset_all_and_names_what_it_resets() {
         button.label,
         "Reset All: keys only in aterm.toml stay; use Reset on each row"
     );
-    // The palette's Reset All is off with the button.
     assert!(
         lab.runtime
             .commands(lab.instance, lab.view)
@@ -695,7 +680,6 @@ fn modified_offers_reset_all_and_names_what_it_resets() {
             .any(|command| command.id.as_str() == "settings/reset-all" && !command.enabled)
     );
 
-    // Once nothing at all is changed, it says so.
     let mut empty = Lab::new("");
     empty.state_mut().navigate(SettingsRoute::Modified);
     assert!(empty.invoke("settings/reset-all", None).is_none());
@@ -707,8 +691,7 @@ fn modified_offers_reset_all_and_names_what_it_resets() {
 /// never "selected" as a single choice is, saying what its own page's switch
 /// says (name, value, credit or why a fourth is refused); no pop-up of raw
 /// mixes; inside its row at a phone width; and a switch changes only its
-/// face. On the old builder they were single-choice segment buttons with no
-/// description.
+/// face.
 #[test]
 fn modified_display_face_is_a_toggle_per_face() {
     for source in [
@@ -813,11 +796,6 @@ fn a_long_modified_row_puts_its_facts_on_a_second_line() {
         })
         .collect::<Vec<_>>()
         .join(" ");
-    // When the change applies is always the second line's; the default is
-    // on whichever line has the room, whole. Where Universal Control does
-    // nothing (every platform but macOS, `row_available_here`), the row says
-    // that there instead, in the platform note's own words, and claims no
-    // timing.
     let availability = SettingsAvailability::for_state(lab.state());
     let first_fact = if row_available_here(key, availability) {
         "Applies at the next ALab tools check".to_string()
@@ -862,7 +840,6 @@ fn a_modified_theme_slot_names_its_default_as_a_theme() {
             ("light", aterm_types::Appearance::Light),
         ] {
             let label = label(side);
-            // It still names the theme Reset returns the slot to.
             assert!(
                 label.ends_with(&format!(
                     ": {}",
@@ -876,8 +853,7 @@ fn a_modified_theme_slot_names_its_default_as_a_theme() {
 }
 
 /// A themes-folder theme goes by the name its card shows, not its file id,
-/// in the status and in Undo's words. Negative control: a built-in's id is
-/// its name (`undo_names_the_change_and_what_it_restored`).
+/// in the status and in Undo's words.
 #[test]
 fn a_kept_folder_theme_is_named_by_its_display_name() {
     let mut lab = Lab::new("theme = \"Dracula\"\n");
@@ -939,7 +915,6 @@ fn undo_names_the_change_and_what_it_restored() {
         Some("Restored Color theme: Nord")
     );
 
-    // A Follow system pair reads as its two sides, not its raw value.
     lab.commit(
         &format!("settings/set/{}", prefs::EDIT_THEME),
         Some(SemanticInput::Text(
@@ -955,14 +930,12 @@ fn undo_names_the_change_and_what_it_restored() {
         lab.state().feedback.as_deref(),
         Some("Restored Color theme: Nord")
     );
-    // No theme at all is Default, and says so.
     lab.commit(&format!("settings/reset/{}", prefs::EDIT_THEME), None);
     assert_eq!(
         lab.state().feedback.as_deref(),
         Some("Color theme reset to Default")
     );
     lab.undo().expect("Undo is offered");
-    // One theme on both sides is named once.
     lab.commit(
         &format!("settings/set/{}", prefs::EDIT_THEME),
         Some(SemanticInput::Text(
@@ -997,7 +970,6 @@ fn undo_goes_with_the_status_that_named_it() {
     lab.commit(&blink, Some(SemanticInput::Bool(false)));
     assert!(lab.undo_offered());
 
-    // Another message replaces the status: no Undo, and Cmd-Z does nothing.
     lab.state_mut().feedback = Some("Discarded 1 unsaved Settings draft.".to_string());
     assert!(!lab.undo_offered());
     assert!(
@@ -1007,14 +979,12 @@ fn undo_goes_with_the_status_that_named_it() {
     assert!(lab.undo().is_none());
     assert_eq!(lab.text(), "cursor_blink = false\n");
 
-    // A new page clears it.
     lab.commit(&blink, Some(SemanticInput::Bool(true)));
     assert!(lab.undo_offered());
     lab.state_mut().navigate(SettingsRoute::Terminal);
     assert!(lab.state().last_undo.is_none());
     assert!(!lab.undo_offered());
 
-    // While named, Cmd-Z is the same Undo.
     lab.commit(&blink, Some(SemanticInput::Bool(false)));
     lab.undo_with(AppEvent::TextInput(TextInputEvent::Undo))
         .expect("Cmd-Z undoes the named change");
@@ -1023,7 +993,7 @@ fn undo_goes_with_the_status_that_named_it() {
 
 /// A value that cannot be saved writes nothing and offers no Undo; the row
 /// says why in its own words, never its config key, and keeps the typed text
-/// to correct. A good value then saves and clears the error.
+/// to correct.
 #[test]
 fn an_invalid_value_keeps_the_draft_and_says_why_under_its_row() {
     let mut lab = Lab::new("");
@@ -1043,8 +1013,6 @@ fn an_invalid_value_keeps_the_draft_and_says_why_under_its_row() {
         ("lots", "must be a whole number, 0 or more"),
         ("-5", "must be 0 or more"),
         ("5000000000", "must be at most 4294967295"),
-        // Too long for i64 is still a whole number: it says which end it
-        // passed, never that it is not a number.
         ("99999999999999999999", "must be at most 4294967295"),
         ("-99999999999999999999", "must be 0 or more"),
         ("99999999999999999999x", "must be a whole number, 0 or more"),
@@ -1095,7 +1063,7 @@ fn an_invalid_value_keeps_the_draft_and_says_why_under_its_row() {
 
 /// The Manual page is worth landing on: one line of what Manual is, where
 /// aterm.toml lives with Open, Show and Copy path, and the keys only it
-/// holds. A view nobody armed shows no folder; it names it.
+/// holds.
 #[test]
 fn the_manual_page_names_the_file_and_lists_the_keys_only_it_holds() {
     let mut lab = Lab::new("agents_auto_prime = false\nfuture_thing = 5\n");
@@ -1119,7 +1087,6 @@ fn the_manual_page_names_the_file_and_lists_the_keys_only_it_holds() {
             .label,
         "~/.config/aterm/aterm.toml"
     );
-    // A compact page shows no subtitle, so the card says what Manual is.
     let compact = lab.compile(744.0, 420.0);
     assert!(
         compact
@@ -1193,7 +1160,6 @@ fn the_manual_page_names_the_file_and_lists_the_keys_only_it_holds() {
         .unwrap();
     assert_eq!(lab.state().feedback.as_deref(), Some("Path copied"));
 
-    // Unarmed: no path to show or copy.
     let mut bare = Lab::new("");
     bare.state_mut().navigate(SettingsRoute::Manual);
     let compiled = bare.compile(1_200.0, 820.0);
@@ -1207,8 +1173,7 @@ fn the_manual_page_names_the_file_and_lists_the_keys_only_it_holds() {
 /// file there, the file itself — never its folder — goes to the file
 /// viewer to be selected, and only its yes is "Showed aterm.toml"; before
 /// the file exists, its folder is shown and the status says so; a viewer
-/// that selects nothing leaves the path named. The live arm's seams are the
-/// real reveal and folder open.
+/// that selects nothing leaves the path named.
 #[test]
 fn show_in_finder_selects_the_file_and_says_only_what_it_showed() {
     use std::sync::Mutex;
@@ -1278,8 +1243,7 @@ fn show_in_finder_selects_the_file_and_says_only_what_it_showed() {
 }
 
 /// A suffix used to distinguish two normalized keys may already be another
-/// authored key. Both pages still compile and show every row, without moving
-/// the plain keys that were distinct to begin with.
+/// authored key.
 #[test]
 fn manual_key_suffix_collisions_keep_every_authored_row_renderable() {
     for route in [SettingsRoute::Manual, SettingsRoute::Modified] {
@@ -1339,7 +1303,6 @@ fn undo_names_the_old_value_when_the_snapshot_arrives_first() {
     );
     assert_eq!(lab.text(), "[sparkle_words.feline]\nenabled = false\n");
 
-    // Reset All of one setting names it the same way.
     let mut lab = Lab::new("theme = \"Nord\"\n");
     lab.invoke("settings/reset-all", None);
     lab.commit_snapshot_first("settings/reset-all-confirm", None);
@@ -1394,7 +1357,6 @@ fn the_offer_after_an_undo_is_a_redo_that_says_so() {
     assert_eq!(restored, source, "Undo gives back the file, byte for byte");
     assert_eq!(lab.state().feedback.as_deref(), Some("Restored 3 settings"));
     assert_eq!(lab.undo_button_label().as_deref(), Some("Redo"));
-    // Cmd-Z asks for an undo; what is offered is a redo, so nothing happens.
     assert!(
         lab.undo_with(AppEvent::TextInput(TextInputEvent::Undo))
             .is_none(),
@@ -1402,7 +1364,6 @@ fn the_offer_after_an_undo_is_a_redo_that_says_so() {
     );
     assert_eq!(lab.text(), restored);
 
-    // The Redo button, pressed, redoes the reset and says so.
     lab.undo().expect("Redo is offered");
     assert_eq!(lab.text(), "");
     assert_eq!(lab.state().feedback.as_deref(), Some("Reset 3 settings"));
@@ -1411,7 +1372,6 @@ fn the_offer_after_an_undo_is_a_redo_that_says_so() {
 
 /// A change made elsewhere to a key the offered change wrote takes the
 /// status and its Undo away: the status no longer says what the file holds.
-/// A change to another key leaves them, as that Undo still works.
 #[test]
 fn an_outside_change_to_its_keys_takes_the_undo_away() {
     let mut lab = Lab::new("cursor_blink = false\n");
@@ -1423,13 +1383,11 @@ fn an_outside_change_to_its_keys_takes_the_undo_away() {
     assert!(lab.undo_offered());
     let status = lab.state().feedback.clone().expect("the change is named");
 
-    // Another key: the offer stands.
     let unrelated = format!("{}theme = \"Nord\"\n", lab.text());
     lab.external(&unrelated);
     assert!(lab.undo_offered(), "an unrelated change keeps the Undo");
     assert_eq!(lab.state().feedback.as_ref(), Some(&status));
 
-    // The style itself, changed in aterm.toml: the offer goes.
     let restyled = lab.text().replace("\"comet\"", "\"lumen\"");
     assert_ne!(restyled, lab.text(), "the fixture changes the style");
     lab.external(&restyled);
@@ -1492,12 +1450,10 @@ fn a_style_round_trip_from_effects_off_leaves_no_redundant_master() {
 /// default style and the typing glow turned on are writes of no value, yet
 /// the writer takes the retired switch out for them (the other successor
 /// pinned to what the file drew), so the page sends them, names what
-/// changed on screen, and its Undo puts the old switch back. Both rows the
-/// old switch holds off show as changed, and their Reset takes it out too.
+/// changed on screen, and its Undo puts the old switch back.
 #[test]
 fn the_default_style_and_the_glow_are_chosen_over_the_retired_switch() {
     if !crate::app_config::DEFAULT_DECORATIVE_EFFECTS {
-        // Where effects are off by default `cursor_trail = false` reads as
         // the defaults, so there is nothing to choose.
         return;
     }
@@ -1505,7 +1461,6 @@ fn the_default_style_and_the_glow_are_chosen_over_the_retired_switch() {
     let style = prefs::EDIT_CURSOR_TRAIL_STYLE;
     let glow = prefs::EDIT_CURSOR_MOMENTUM_GLOW;
 
-    // The default style, from the Cursor Styles list.
     let mut lab = Lab::new(legacy);
     assert!(
         lab.state().is_explicit(style),
@@ -1535,7 +1490,6 @@ fn the_default_style_and_the_glow_are_chosen_over_the_retired_switch() {
         Some("Restored Cursor style: Off")
     );
 
-    // The typing glow turned on.
     let mut lab = Lab::new(legacy);
     lab.commit(
         &format!("settings/set/{glow}"),
@@ -1560,7 +1514,6 @@ fn the_default_style_and_the_glow_are_chosen_over_the_retired_switch() {
         "{status}"
     );
 
-    // Each row's Reset takes the old switch out, the other row kept.
     for key in [style, glow] {
         let mut lab = Lab::new(legacy);
         lab.state_mut().navigate(SettingsRoute::CursorMotion);
@@ -1583,8 +1536,6 @@ fn the_default_style_and_the_glow_are_chosen_over_the_retired_switch() {
         }
     }
 
-    // Negative control: `cursor_trail = true` over the default style reads
-    // as the defaults, so neither row is changed.
     let lab = Lab::new("cursor_trail = true\n");
     assert!(!lab.state().is_explicit(style));
     assert!(!lab.state().is_explicit(glow));
@@ -1616,13 +1567,9 @@ fn keep_tools_up_to_date_is_turned_on_over_the_retired_switch() {
 /// WHAT A STYLE'S PREVIEW SHOWS IS WHAT ITS PRESS SAVES, from every old
 /// Classic spelling: for each listed style, the style and trail colour the
 /// preview draws while the row is tried are the ones the saved file draws.
-/// Leaving a `classic mono` for Comet saves Comet in its own pale blue, as
-/// the preview showed, never a cursor colour the person never chose.
 #[test]
 fn a_tried_style_saves_what_its_preview_shows_from_an_old_classic() {
     use aterm_effects::cursor_glow::GlowStyle;
-    // What a cursor draws: its style, Classic's one-colour face, its colour
-    // (Off draws none, so no colour).
     let drawn = |raw: &str, color: aterm_effects::cursor_fx::TrailColor| {
         let presentation = crate::app_config::resolve_trail_presentation(raw);
         let style = presentation.style.style;
@@ -1659,8 +1606,6 @@ fn a_tried_style_saves_what_its_preview_shows_from_an_old_classic() {
                 1.0,
             )
             .expect("the Cursor Styles preview");
-            // Classic over its old spelling is no trial: the list's check is
-            // on it, and the preview shows what pressing it keeps.
             let shown = drawn(&spec.cursor.trail_style_raw, spec.cursor.color);
             lab.commit(&cursor_style_row_key(style), None);
             let saved: Config = aterm_toml::from_str(&lab.text()).unwrap();
@@ -1680,8 +1625,6 @@ fn a_tried_style_saves_what_its_preview_shows_from_an_old_classic() {
 /// SAYS: for every choice and switch Settings draws, unset, the words after
 /// "now" ([`effective_value_words`]) are its row control's value — a choice
 /// in its picker's or segment's words with "(default)", a switch On or Off.
-/// Negative control: a config token placeholder ("auto (default)") is no
-/// row's words.
 #[test]
 fn every_unset_choice_and_switch_reads_now_as_its_row_says() {
     let mut lab = Lab::new("");
@@ -1732,8 +1675,7 @@ fn every_unset_choice_and_switch_reads_now_as_its_row_says() {
 /// with all word effects switched off, Reset on Keyword kitties takes its
 /// own `false` out, and its switch reads Off before and after, so the status
 /// says it was reset and is still Off and why, never "turned on" or
-/// "inactive"; Undo and Redo name what the switch shows, Off. Negative
-/// control: with the word effects on, the same Reset turns it on.
+/// "inactive"; Undo and Redo name what the switch shows, Off.
 #[test]
 fn a_reset_that_leaves_a_keyword_toy_held_off_says_it_is_still_off() {
     let source = "[sparkle_words]\nenabled = false\n[sparkle_words.feline]\nenabled = false\n";
@@ -1772,10 +1714,7 @@ fn a_reset_that_leaves_a_keyword_toy_held_off_says_it_is_still_off() {
 /// effects, Sparkle words or Keyword kitties switch that reads Off says that
 /// turning it on turns Serious Mode off, and its press writes Serious Mode
 /// away, where nothing can sound as well (Linux, Windows: the note beside
-/// "Audio unavailable"). Negative control: Music effects saved On on
-/// Modified reads On, is "inactive" because of Serious Mode (or of no audio
-/// output), never says its press turns Serious Mode off, and its press keeps
-/// Serious Mode.
+/// "Audio unavailable").
 #[test]
 fn every_top_effect_switch_under_serious_mode_says_what_its_press_does() {
     let leaves = |patch: &ConfigPatch| {
@@ -1849,9 +1788,6 @@ fn every_top_effect_switch_under_serious_mode_says_what_its_press_does() {
         SettingsAvailability::for_state(state),
         state.presented_motion.get(),
     );
-    // Held back by Serious Mode — or, where nothing can sound
-    // (`trail_audio::output_available`), by that, the one reason a setting
-    // does nothing that its row gives.
     assert!(
         effect_note_contains(
             &effect,
@@ -1886,7 +1822,6 @@ fn resets_name_the_default_in_plain_words() {
     lab.commit("settings/wallpaper/detach", None);
     assert_eq!(lab.text(), "");
     assert_eq!(lab.state().feedback.as_deref(), Some("Wallpaper removed"));
-    // Modified names the default the same way.
     assert_eq!(default_value_label(prefs::EDIT_WALLPAPER), Some("No image"));
 }
 
@@ -1894,9 +1829,7 @@ fn resets_name_the_default_in_plain_words() {
 /// the next ALab tools check while Keep ALab tools up to date is on, and with
 /// it off (a retired `auto_update = false` too) once a day, at a new window
 /// or session, since no package pass runs; Leave as is when saved, so it says
-/// no timing, and its segment none either. The row, its control, the status
-/// after a save and Manual's help say it in the same words. Negative
-/// control: Keep on keeps the tools-check words.
+/// no timing, and its segment none either.
 #[test]
 fn universal_control_says_when_off_lands_by_the_keep_switch() {
     use prefs::ApplicationTiming::{DailyLaunchApply, NextToolsCheck};
@@ -1934,10 +1867,6 @@ fn universal_control_says_when_off_lands_by_the_keep_switch() {
             .collect();
         (format!("{visual} {painted}"), control, segments)
     };
-    // The row and its control say when Off lands only where Universal Control
-    // does anything (macOS, `row_available_here`); elsewhere they say it does
-    // nothing here and name no timing, while the timing itself, the status
-    // after a save and the Keep switch's flip below hold on every platform.
     let actuates = row_available_here(key, SettingsAvailability::for_state(Lab::new("").state()));
     for (source, timing) in [
         (
@@ -1984,8 +1913,6 @@ fn universal_control_says_when_off_lands_by_the_keep_switch() {
                 "{source}: control {control:?}"
             );
         }
-        // The segment not saved says when choosing it would land: Off its
-        // timing (by the Keep switch), Leave as is none.
         for label in &segments {
             if label.contains("Leave") {
                 assert!(
@@ -1994,7 +1921,6 @@ fn universal_control_says_when_off_lands_by_the_keep_switch() {
                 );
             }
         }
-        // The status after saving Off says the same words.
         let state = lab.state();
         let patch = ConfigPatch {
             edits: vec![ConfigEdit {
@@ -2024,7 +1950,6 @@ fn universal_control_says_when_off_lands_by_the_keep_switch() {
             );
         }
     }
-    // An unsaved patch that turns Keep on with it flips the words.
     let lab = Lab::new("[packages]\nenabled = false\n[machine]\nuniversal_control = \"leave\"\n");
     let state = lab.state();
     let patch = ConfigPatch {
@@ -2051,9 +1976,7 @@ fn universal_control_says_when_off_lands_by_the_keep_switch() {
 /// A NUMBER SETTINGS NAMES FOR A ROW IS ONE THE ROW TAKES BACK: the bound a
 /// refusal names is spelled as the field takes it (plain digits), so typing
 /// that bound saves, and the status, Reset and placeholder spell their
-/// numbers the same way. Negative control: the grouped spelling the refusal
-/// used to show is still refused, so grouping cannot come back without the
-/// writer taking it.
+/// numbers the same way.
 #[test]
 fn a_number_a_row_names_is_one_it_takes_back() {
     let key = prefs::EDIT_SEARCH_HISTORY_LINES;
@@ -2183,9 +2106,7 @@ fn choose_font(lab: &mut Lab, label: &str) -> Option<(ConfigPatch, OperationId)>
 /// "Other…" with the field empty while the font is unset, choosing
 /// Automatic while unset, choosing the saved font again, and Return in an
 /// empty unset number field send no patch, leave the file alone, claim no
-/// "reset to", and close what they opened. Negative controls: a name typed
-/// into Other… is written and named, and clearing a saved font removes it
-/// and says so.
+/// "reset to", and close what they opened.
 #[test]
 fn a_commit_of_what_the_file_holds_writes_nothing_and_claims_nothing() {
     let mut lab = Lab::new("");
@@ -2234,7 +2155,6 @@ fn a_commit_of_what_the_file_holds_writes_nothing_and_claims_nothing() {
     assert!(lab.state().choice_picker.is_none(), "the picker closes");
     assert_eq!(lab.state().feedback, None);
 
-    // An empty, unset number field: Return writes nothing.
     lab.invoke(&format!("settings/set/{}", prefs::EDIT_SCROLLBACK), None);
     let submitted = lab
         .runtime
@@ -2253,7 +2173,6 @@ fn a_commit_of_what_the_file_holds_writes_nothing_and_claims_nothing() {
     );
     assert_eq!(lab.state().feedback, None);
 
-    // Negative control: a typed name is written, and its status names it.
     choose_font(&mut lab, "Other");
     lab.dispatch(AppEvent::TextInput(TextInputEvent::Commit(
         "Menlo".to_string(),
@@ -2274,7 +2193,6 @@ fn a_commit_of_what_the_file_holds_writes_nothing_and_claims_nothing() {
         "the saved font again"
     );
     assert!(lab.state().choice_picker.is_none());
-    // Negative control: Automatic over a saved font removes it, and says so.
     let (patch, _) = choose_font(&mut lab, "Automatic").expect("a real change writes");
     assert_eq!(patch.edits[0].value, None);
 }
@@ -2318,7 +2236,6 @@ fn the_page_writes_a_default_value_as_a_removal() {
     assert_eq!(patch.edits[0].value, None, "the page sends the removal");
     assert_eq!(lab.text(), "");
     assert_eq!(lab.state().raw_value(prefs::EDIT_WINDOW_THEME), None);
-    // Already absent: the default again writes nothing.
     assert!(
         lab.invoke(
             &format!("settings/set/{}", prefs::EDIT_WINDOW_THEME),
@@ -2327,9 +2244,6 @@ fn the_page_writes_a_default_value_as_a_removal() {
         .is_none()
     );
 
-    // A real number field (not a slider): its typed default is submitted
-    // text even though the durable patch removes the key. Both Return and
-    // semantic SetValue retire only their unchanged draft on success.
     let key = prefs::EDIT_SCROLLBACK;
     let set = format!("settings/set/{key}");
     let type_draft = |lab: &mut Lab, text: &str| {
@@ -2400,7 +2314,6 @@ fn the_page_writes_a_default_value_as_a_removal() {
         }
     }
 
-    // A number set while a different draft is held owns none of that draft.
     let mut lab = Lab::new("scrollback_lines = 5000\n");
     type_draft(&mut lab, "9000");
     let unrelated = lab.state().field_inputs[key].clone();
@@ -2440,12 +2353,7 @@ fn a_reset_keeps_the_comment_under_a_tables_last_key_with_its_table() {
 /// ONE KEY, ONE CLASSIFICATION ON EVERY SURFACE: a written key Modified
 /// draws as a row is a row Search draws too, and a written key Modified
 /// lists among the keys only aterm.toml holds is in Search's aterm.toml card
-/// too — never a row on one and an aterm.toml key on the other. The keys
-/// with an audited consumer and a home are rows (the renderer, replay, the
-/// shell's priority, the window's size and badge); the ones without
-/// (typography tuning, the old word-effects master, rain tuning) are
-/// aterm.toml keys on both. (Modified used to admit every registry key while
-/// Search admitted only the audited ones.)
+/// too — never a row on one and an aterm.toml key on the other.
 #[test]
 fn a_written_setting_is_the_same_row_in_search_and_modified() {
     let source = "gpu = false\nfocus_boost = false\ntemporal_recording = true\ncolumns = 96\nshow_build_badge = false\nstem_gamma = 1.2\nsparkle_words.enabled = false\n[matrix_rain]\nfps = 20\n";

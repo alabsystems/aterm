@@ -1,33 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `selftest [tag] [--keep]`: the whole proof in one command (about 25 s). It
-//! brings a lab up, launches Claude Code in the first tab (the harness answers
-//! the folder-trust dialog), arms the session-survey card live (the flag
-//! written until Claude Code's `ConfigChange` hook reports it re-read its
-//! settings: [`crate::settings_witness`]), takes one `hi` turn the stub
-//! answers, lets the harness dismiss the card, then checks nine things,
-//! takes the lab down and checks a tenth and an eleventh: the TUI drew its composer; the stub
-//! answered and the TUI shows the reply; the card showed, went, `DISMISSED
-//! survey` was journaled and the composer was left empty (the harness's `0` is
-//! timed and printed, not required); no non-loopback socket was seen, and the
-//! egress witness did see Claude Code talk to the stub (a witness that saw
-//! nothing proves nothing); the keychain tripwire was reached by Claude Code
-//! and never saw the owner's un-suffixed items; nothing was opened on the
-//! desktop (the open recorder, which Claude Code's launch line makes its
-//! `BROWSER` and its log, logged nothing; its control, a bare-name `open` in
-//! the jail, was logged: [`crate::recorder`]); the isolation probes pass on a
-//! replica home (nothing of the owner's is touched); `twin` refuses the
-//! scratch's `home/Library` made a link to a decoy from inside the jail and
-//! writes nothing through it; an orphan in the jail (a jailed shell's child
-//! that launchd adopted) is found by the jail's mark and seen by the witness
-//! connecting to the stub; after `down` nothing in the jail is alive, asked
-//! of the kernel by its mark; and the harness tapes the instance recorded of
-//! its hosted loops (`crate::tape`), kept by `down`, each replay from
-//! themselves alone. However it ends (a failed check, ^C, TERM)
-//! the lab comes down; a SIGKILL ends its processes through their lifeline,
-//! and `down` then removes its run directory (`ps` lists it).
-
+//! `selftest [tag] [--keep]`: end-to-end lab self-test driving Claude Code, [`crate::settings_witness`], and jail/stray checks.
 use std::fs;
 use std::time::Duration;
 
@@ -38,7 +12,7 @@ use crate::lab::UpOpts;
 use crate::run::Run;
 use crate::{Fail, Res, stop};
 
-/// `selftest [tag] [--keep]`.
+/// Runs `selftest [tag] [--keep]`.
 pub fn cmd_selftest(args: &[String]) -> Res {
     let (mut tag, mut keep) = ("selftest".to_string(), false);
     for a in args {
@@ -52,7 +26,6 @@ pub fn cmd_selftest(args: &[String]) -> Res {
         return Err(Fail::die(format!("bad tag '{tag}'")));
     }
     stop::install();
-    // the lab ends with this run, however it ends, unless it is kept
     let o = UpOpts {
         lifeline: !keep,
         ..UpOpts::from_env()
@@ -92,11 +65,6 @@ pub fn cmd_selftest(args: &[String]) -> Res {
                 bad += 1;
                 println!("  FAIL {label}");
             }
-            // The harness's tapes (`crate::tape`): the instance recorded each
-            // hosted loop it ran, the survey cycle ended each as it finished
-            // (its session's Autopilot off: `crate::tape::end_loops`), `down`
-            // kept them with the logs, and each must run again from itself
-            // alone: REPRODUCED.
             let tapes = crate::tape::replay_all(&k.join("drive").join("tapes"));
             let failed: Vec<String> = tapes
                 .iter()
@@ -129,7 +97,6 @@ pub fn cmd_selftest(args: &[String]) -> Res {
                 println!("  FAIL {label}");
             }
         }
-        // the lab is ours to end on any way out: the next selftest finds nothing standing
         (Err(_), _) => {
             let _ = crate::lab::down(&tag, false);
         }
@@ -145,21 +112,17 @@ pub fn cmd_selftest(args: &[String]) -> Res {
     }
 }
 
-/// What the checks found: how many ran, how many failed, and the jail's
-/// members before `down` (the last check asks after them).
+/// Summary of selftest check counts and pre-teardown jail PIDs.
 pub struct Checks {
-    /// Checks run.
+    /// Number of checks executed.
     pub n: u32,
-    /// Checks failed.
+    /// Number of failed checks.
     pub bad: u32,
-    /// The jail's members by its mark, the orphan control among them.
+    /// Jail member PIDs recorded before teardown.
     pub before: Vec<i32>,
 }
 
-/// The selftests' orphan control: a jailed shell starts a child and exits at
-/// once, so launchd adopts the child and no ppid leads from the lab to it any
-/// more (what a Bash tool's `nohup … &` or a run's leftover becomes). The
-/// child holds a connection to the stub for two minutes. Its pid.
+/// Spawns a jailed orphan control process adopted by `launchd` and returns its PID.
 #[must_use]
 pub fn jail_orphan(run: &Run) -> i32 {
     let bin = run.run.join("bin/aterm-lab").to_string_lossy().into_owned();
@@ -191,7 +154,7 @@ fn witnessed(run: &Run, pid: i32) -> bool {
         .any(|l| l.ends_with(&want))
 }
 
-/// Whether launchd adopted `pid`, the jail's mark finds it, and the witness logged its connection.
+/// Returns whether `pid` was adopted by `launchd`, carries the jail mark, and was logged by the egress witness.
 #[must_use]
 pub fn orphan_seen(run: &Run, pid: i32) -> bool {
     for _ in 0..20 {
@@ -209,7 +172,7 @@ pub fn orphan_seen(run: &Run, pid: i32) -> bool {
         && witnessed(run, pid)
 }
 
-/// What of the jail of `mark`, and of `pids`, is still alive (nothing within 5 s: empty).
+/// Returns any processes in `mark` or `pids` still alive after 5 seconds.
 #[must_use]
 pub fn jail_left(mark: &str, pids: &[i32]) -> String {
     let mut left = String::new();
@@ -232,7 +195,7 @@ pub fn jail_left(mark: &str, pids: &[i32]) -> String {
     left
 }
 
-/// The jail's members by its mark, as `pid ppid command` rows for the report.
+/// Formats `pids` as `pid ppid command` rows.
 #[must_use]
 pub fn members_table(pids: &[i32]) -> String {
     if pids.is_empty() {
@@ -251,9 +214,7 @@ pub fn members_table(pids: &[i32]) -> String {
         .unwrap_or_default()
 }
 
-/// Validate the existing lsof report shape after capture. This text check
-/// does not establish EOF: only `complete_open_files` receives that proof. A
-/// failed, malformed or capture-ceiling report remains unknown.
+/// Validates `lsof -Fn` output shape and returns its text if non-empty.
 #[must_use]
 pub fn lsof_report(
     pid: i32,
@@ -270,19 +231,16 @@ pub fn lsof_report(
     (text.starts_with(&format!("p{pid}\n")) && text.ends_with('\n')).then_some(text)
 }
 
-/// One open-file observation of a process ([`observe_open_files`]).
+/// Open-file observation for a process ([`observe_open_files`]).
 #[derive(Debug, Default)]
 pub struct OpenFiles {
-    /// Whatever `lsof -Fn` printed: a failed or partial report still shows
-    /// the files it names, and a file held is evidence however it was shown.
+    /// Captured `lsof -Fn` output.
     pub text: String,
-    /// Whether strict stdout capture and the report-shape checks both
-    /// succeeded: only that can prove an absence.
+    /// Whether strict stdout capture and shape validation both succeeded.
     pub complete: bool,
 }
 
-/// A diagnostic (legacy tail-capture) report. Its positive paths remain
-/// evidence, but without an EOF certificate it cannot prove an absence.
+/// Builds an uncertified diagnostic [`OpenFiles`] report.
 #[cfg(test)]
 #[must_use]
 pub fn open_files(
@@ -307,8 +265,7 @@ fn describe_open_files(
     }
 }
 
-/// A result from the strict stdout capture lane: only its success proves
-/// stdout reached EOF without discarded bytes or a read error.
+/// Builds a certified [`OpenFiles`] report from strict stdout capture.
 #[must_use]
 pub fn complete_open_files(
     pid: i32,
@@ -320,11 +277,7 @@ pub fn complete_open_files(
     }
 }
 
-/// The open files of one of this lab's observed agent processes
-/// ([`complete_open_files`]). The existing strict capture bounds execution
-/// and stdout storage and rejects read errors, missing EOF and overflow.
-/// Stderr remains diagnostic; the shared child/grace/cleanup contract applies.
-/// No installed agent, provider or owner file is executed or opened.
+/// Observes open files of agent process `pid` via `lsof` ([`complete_open_files`]).
 #[must_use]
 pub fn observe_open_files(pid: i32) -> OpenFiles {
     let mut cmd = aterm_uds::spawnfd::command("/usr/sbin/lsof");
@@ -338,50 +291,37 @@ pub fn observe_open_files(pid: i32) -> OpenFiles {
     )
 }
 
-/// The owner's homes a witness watches: every home the lab guards (the
-/// account's, whatever `HOME` says, and the caller's `HOME` when it names
-/// another: [`crate::paths::Paths::guarded_homes`]). Made only from the lab's
-/// facts ([`Watched::of`]), so no witness picks its own.
+/// Owner home directories watched by lab witnesses ([`crate::paths::Paths::guarded_homes`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Watched(Vec<String>);
 
 impl Watched {
-    /// The homes `p` guards.
+    /// Collects the home directories guarded by `p`.
     #[must_use]
     pub fn of(p: &crate::paths::Paths) -> Watched {
         Watched(p.guarded_homes())
     }
 
-    /// Each watched home.
+    /// Returns the watched home paths.
     #[must_use]
     pub fn homes(&self) -> &[String] {
         &self.0
     }
 
-    /// `<home>/<rel>` in each watched home ([`owner_dirs`]).
+    /// Returns `<home>/<rel>` for each watched home ([`owner_dirs`]).
     #[must_use]
     pub fn dirs(&self, rel: &str) -> Vec<String> {
         owner_dirs(&self.0, rel)
     }
 }
 
-/// `<home>/<rel>` in each of the owner's `homes` (the account's, and `$HOME`'s
-/// when it names another: [`crate::paths::Paths::guarded_homes`]): where a
-/// witness looks for the owner's own copy of a directory (`.codex`,
-/// `.gemini`, Muse Code's) that the lab's agents must never touch.
+/// Returns `<home>/<rel>` for each home in `homes` ([`crate::paths::Paths::guarded_homes`]).
 #[must_use]
 pub fn owner_dirs(homes: &[String], rel: &str) -> Vec<String> {
     homes.iter().map(|h| format!("{h}/{rel}")).collect()
 }
 
-/// The roots of the owner's homes `homes` (every home the lab guards:
-/// [`crate::paths::Paths::guarded_homes`]) an agent of `run` may hold files
-/// under: the run directory (its scratch HOME, its launcher) and, for a binary
-/// `bin` in aterm's package store of one of them (which keeps the managed
-/// agents in the owner's home, and of which the jail re-allows only that
-/// build), the build it sits in (the directory above `bin/`). A binary
-/// anywhere else adds only itself: the directory two above `~/bin/muse` is
-/// the home.
+/// Returns the allowed path prefixes inside `homes` for an agent in `run`.
 #[must_use]
 pub fn lab_roots(run: &Run, bin: &str, homes: &[String]) -> Vec<String> {
     let build = std::path::Path::new(bin)
@@ -398,12 +338,7 @@ pub fn lab_roots(run: &Run, bin: &str, homes: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The files an `lsof -Fn` report names in any of the owner's homes `homes`
-/// (the account's, and `$HOME`'s when it names another:
-/// [`crate::paths::Paths::guarded_homes`]) that lie under none of `allowed`
-/// ([`lab_roots`]): what an agent holds of the owner's that the lab never
-/// handed it, each once. The jail denies writes there but reads only of what
-/// is on its protected list, so a file named here is a gap in that list.
+/// Returns files in `lsof_fn` under `homes` that fall outside `allowed`.
 #[must_use]
 pub fn owner_strays(lsof_fn: &str, homes: &[String], allowed: &[String]) -> Vec<String> {
     let below = |path: &str, root: &str| {
@@ -423,10 +358,7 @@ pub fn owner_strays(lsof_fn: &str, homes: &[String], allowed: &[String]) -> Vec<
     out
 }
 
-/// The strays check: a file of the owner's home outside the lab's roots that
-/// an agent process holds ([`owner_strays`]) fails it; with none, it holds
-/// when each agent process seen (`pids`) gave a complete open-file report
-/// (`observed`), and is UNPROVEN otherwise.
+/// Evaluates the stray-file check across `strays`, `pids`, and `observed` ([`owner_strays`]).
 #[must_use]
 pub fn strays_verdict(strays: &[String], pids: &[i32], observed: bool) -> Verdict {
     if !strays.is_empty() {
@@ -440,10 +372,7 @@ pub fn strays_verdict(strays: &[String], pids: &[i32], observed: bool) -> Verdic
 
 /// Run the cycle and the witnesses.
 fn checks(run: &Run) -> Result<Checks, Fail> {
-    // the recorder's control first: a bare-name open in the jail, the shim leading its PATH, is logged
     let open_control = crate::recorder::control(run);
-    // The cycle is the scenario runner's: it attaches to this lab, launches Claude Code, takes the "hi" turn,
-    // forces the survey card live and judges it from the frame stream. 0 held, 1 not, 2 no composer.
     println!("== survey cycle (aterm-lab scn's selftest cycle)");
     let cycle = crate::scn::run_selftest(&run.tag)?;
     let door = Door::new(run)?;
@@ -471,7 +400,6 @@ fn checks(run: &Run) -> Result<Checks, Fail> {
     }
     println!("== keychain tripwire (the account is masked)");
     print!("{}", crate::verbs::security_masked(run));
-    // Claude Code's launch line names the recorder's log and makes it its BROWSER
     let opened = crate::recorder::Witness::read(run, &open_control);
     opened.print();
     println!(
@@ -565,11 +493,7 @@ mod tests {
 
     /// A file of the owner's home that the lab never handed the agent is a
     /// stray: Muse Code 1.4.10's `session-names.db`, opened with HOME pointed
-    /// at the scratch. NEGATIVE CONTROLS: the run directory (the scratch HOME),
-    /// the agent's own build in the package store, a sibling whose name only
-    /// begins like the home, and paths outside the home are not. A binary
-    /// elsewhere in the home (`LAB_MUSE=~/bin/muse`) allows only itself, never
-    /// the directory two above it (the home).
+    /// at the scratch.
     #[test]
     fn a_file_of_the_owners_home_outside_the_lab_is_a_stray() {
         let home = &["/Users//o".to_string()];
@@ -602,7 +526,6 @@ mod tests {
             owner_strays(&clean, home, &allowed).is_empty(),
             "the control"
         );
-        // an agent outside the home (Homebrew's Gemini CLI) adds no root in it, and the home itself held is a stray
         let gemini = lab_roots(
             &run,
             "/opt/homebrew/Cellar/gemini-cli/0.46.0/libexec/bin/gemini",
@@ -619,7 +542,6 @@ mod tests {
             owner_strays("p7\nfcwd\nn/Users//o\n", home, &gemini),
             ["/Users//o"]
         );
-        // a binary two below the home, or elsewhere in it outside the store, allows itself and nothing beside it
         for own in [
             "/Users//o/bin/muse",
             "/Users//o/.local/bin/muse",
@@ -634,7 +556,6 @@ mod tests {
                 "{own}"
             );
         }
-        // the store itself is no build: a binary at store/bin/x allows only itself
         let at_top = "/Users//o/Library/Application Support/aterm/pkg/store/bin/x";
         assert_eq!(
             lab_roots(&run, at_top, home),
@@ -645,9 +566,7 @@ mod tests {
     /// UNDER A SCRATCH `HOME` THE ACCOUNT'S HOME IS WATCHED TOO: a file of the
     /// account's own home (the account database's) an agent holds is a stray
     /// whatever `HOME` said, as is one of the scratch home's, and an agent in
-    /// the account's package store keeps its own build. NEGATIVE CONTROL: the
-    /// witness of `$HOME` alone (the lab before this) sees nothing of the
-    /// account's.
+    /// the account's package store keeps its own build.
     #[test]
     fn under_a_scratch_home_a_file_of_the_account_home_is_a_stray() {
         let account = "/Users//o".to_string();
@@ -678,7 +597,6 @@ mod tests {
                 "/private/tmp/s/home/.zsh_history"
             ]
         );
-        // NEGATIVE CONTROL: $HOME's witness alone misses the account's file, and its roots miss the store's build
         let env_only = crate::paths::guarded("", &scratch);
         assert_eq!(
             owner_strays(&lsof, &env_only, &lab_roots(&run, bin, &env_only)),
@@ -696,8 +614,6 @@ mod tests {
     /// and the scratch one, so the Codex, Gemini and agy witnesses look for
     /// `.codex` and `.gemini` in both, the Muse Code witness looks for its
     /// directories in both, and a file of either an agent holds is a stray.
-    /// NEGATIVE CONTROL: the facts of a run from the account's own `HOME`
-    /// watch that one home, and the scratch's files are nothing of the owner's.
     #[test]
     fn the_witnesses_watch_every_home_the_lab_guards() {
         let top = aterm_tempfile::Builder::new()
@@ -739,7 +655,6 @@ mod tests {
                 format!("{s}/.config/muse/auth.json")
             ]
         );
-        // NEGATIVE CONTROL: a run from the account's own HOME
         let own = Watched::of(&crate::paths::Paths::resolve_with(
             Some(account.clone()),
             Some(account.into()),
@@ -758,8 +673,7 @@ mod tests {
 
     /// THE STRAYS CHECK FAILS ON A STRAY whatever else it saw, holds on a
     /// complete report of every agent process with none, and is UNPROVEN with
-    /// no agent process or an incomplete report. NEGATIVE CONTROL: those two
-    /// shapes are never ok.
+    /// no agent process or an incomplete report.
     #[test]
     fn the_strays_check_fails_on_a_stray_and_needs_a_complete_report() {
         let stray = vec!["/Users//o/Library/Application Support/Muse/x".to_string()];
@@ -803,7 +717,6 @@ mod tests {
             assert!(!seen.complete && seen.text.is_empty());
             assert_eq!(strays_verdict(&[], &[7], seen.complete), Verdict::Unproven);
         }
-        // A diagnostic prefix naming a held owner file is still positive evidence.
         let held = open_files(7, Ok(out(b"p7\nn/Users//owner/private.txt\n")));
         assert_eq!(
             strays_verdict(

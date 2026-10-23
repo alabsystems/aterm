@@ -1,58 +1,93 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE TIMELINE AS A VIEW OF THE SESSION LOG:
-//! the rows a session's `timeline` prints, read off its log's own
-//! records instead of a ring of their own.
-//!
-//! - **The grammar** ([`rows_of`]) is the ring's: each record a row prints
-//!   becomes that row's `(kind, payload)`, the whole payload, and a record
-//!   no row prints becomes none. It is the session log's row rule too
-//!   ([`row_span`], installed by `SessionLog` on every log it holds,
-//!   `aterm_slog::Log::keep_rows`): a record the grammar prints is flagged
-//!   as it is appended and takes the next dense row ids, so no writer can
-//!   write a row the view does not hold.
-//! - **The view** ([`timeline_rows`]) is this epoch's flagged records,
-//!   oldest first, as the ring's events: id, the record's process-clock
-//!   reading (6F-1), kind and payload (cut by the ring's own 256-byte rule).
-//!   A carried record is no row (the ring was never carried either).
-//! - **The holes** ([`timeline_rows_since`]): a row id the log issued and
-//!   no longer holds (an eviction past the row floor, the program share) is
-//!   counted, so a reader past it is told a `GAP`, as the ring's digest
-//!   tells its drop-oldest loss; so is an update's jump past a
-//!   predecessor's id, as the digest tells it. A reader's id above every id
-//!   the log passed (a crashed window's, U13) reads from the first row, as
-//!   the ring's `since` answers it.
-//!
-//! Each kind of plan section 0.1 the view prints equals the ring's rows by
-//! its rule (`session_log_overlap_tests`): row for record, or, for
-//! `program-state`, the log's retention rule (U39). The ids equal the
-//! ring's while every ring row is a record's: a ring-only row (a dev build's
-//! holder and card rows, `job-change`, `spare adopted`) or a program move
-//! the log coalesced moves the ring's count past the view's.
+//! THE TIMELINE AS A VIEW OF THE SESSION LOG.
 
-use aterm_slog::{Fields, Key, Kind, Node, Op, Rec, Val};
+use std::sync::Arc;
 
-// THE READERS' HALF (`TimelineView`, `timeline_rows`, `timeline_rows_since`)
-// is test-only until 6G-3 moves the ring's readers onto it: an
-// `expect(dead_code)` on a reader that calls another is unfulfilled under
-// the cross cells' compiler, which counts the caller's expectation as a use
-// (`verify cells`, the review of 6G-2).
-#[cfg(test)]
+use aterm_slog::{Fields, Key, Kind, Log, Node, Op, Rec, Val};
+
 use crate::session_timeline::{TimelineEvent, clamp_payload};
-#[cfg(test)]
-use aterm_slog::Log;
 
-/// The session log's row rule (`aterm_slog::RowRule`): how many rows
-/// [`rows_of`] prints of `r`.
+/// The session log's row rule (`aterm_slog::RowRule`): how many rows [`rows_of`] prints of `r`.
 pub(crate) fn row_span(r: &Rec) -> u8 {
     u8::try_from(rows_of(r).len()).unwrap_or(u8::MAX)
 }
 
-/// What a reader past a row id is shown: the rows after it, oldest first,
-/// and how many row ids between it and the log's head the log no longer
-/// holds.
+/// A warm spare adopted into a tab (`crate::spare`): `tier= age_ms= rc_ms=`.
+pub(crate) const SPARE_ADOPTED: &str = "spare adopted";
+
+/// THE ROWS THE LOG HOLDS AS THEIR ROW ALONE: the timeline kinds whose fact no other mark names, each a `row` mark.
+pub(crate) const ROW_ONLY: [&str; 13] = [
+    crate::sys_host::JOB_CHANGE,
+    SPARE_ADOPTED,
+    crate::claude_footer::REGISTRY_READ,
+    "holder-edge",
+    "holder-image",
+    "holder-named",
+    "holder-claim",
+    "holder-adopt",
+    "card-seen",
+    "card-row",
+    "card-decorated",
+    "card-armed",
+    "card-bare",
+];
+
+/// Every timeline kind of plan section 0.1: what a test's hand-written `row` mark may name beside [`ROW_ONLY`].
 #[cfg(test)]
+pub(crate) const SECTION_0_1: [&str; 25] = [
+    "spawned",
+    "closing",
+    "state-change",
+    crate::session_timeline::TITLE_CHANGE,
+    crate::session_timeline::CWD_CHANGE,
+    crate::session_timeline::META_CHANGE,
+    "agent-change",
+    "task-change",
+    crate::session_status::STATUS_CHANGE,
+    crate::session_timeline::HUMAN,
+    "render",
+    "modes-restored",
+    "in-doubt",
+    "handoff",
+    crate::session_timeline::HARNESS_ACT,
+    crate::session_timeline::PROGRAM_STATE,
+    crate::harness_policy_verb::HARNESS_POLICY_EVENT,
+    "inbox",
+    "inbox-seen",
+    "post",
+    "post-landed",
+    "hold",
+    "fetch",
+    "topic",
+    "hold-advisory",
+];
+
+/// A kind as a `row` mark's `row=` token: a space a `-` (the token's
+/// charset holds none).
+pub(crate) fn row_token(kind: &str) -> String {
+    kind.replace(' ', "-")
+}
+
+/// Whether `token` spells `kind` ([`row_token`]), with no allocation.
+fn spells(token: &str, kind: &str) -> bool {
+    token.len() == kind.len()
+        && token
+            .bytes()
+            .zip(kind.bytes())
+            .all(|(t, k)| t == k || (k == b' ' && t == b'-'))
+}
+
+/// The kind a `row` mark's token names, if it names one.
+fn row_kind(token: &str) -> Option<&'static str> {
+    let known = ROW_ONLY.iter();
+    #[cfg(test)]
+    let known = known.chain(SECTION_0_1.iter());
+    known.copied().find(|k| spells(token, k))
+}
+
+/// What a reader past a row id is shown.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TimelineView {
     /// The row ids past the reader's the log issued and no longer holds.
@@ -61,52 +96,203 @@ pub(crate) struct TimelineView {
     pub(crate) rows: Vec<TimelineEvent>,
 }
 
-/// THE VIEW: the log's rows of this epoch, oldest first, as the ring's
-/// events.
+/// THE VIEW: the log's rows of this epoch, oldest first, as the ring's events.
 #[cfg(test)]
 pub(crate) fn timeline_rows(log: &Log) -> Vec<TimelineEvent> {
     timeline_rows_since(log, None).rows
 }
 
-/// THE VIEW past row id `after` (`None`: from the first), and the holes it
-/// crosses on its way to the log's head ([`aterm_slog::Log::rows_lost_between`]).
-/// A reader's id is read as the ring reads it, whichever process issued it:
-///
-/// - **Above every id this log passed** ([`aterm_slog::Log::row_head`]): no
-///   id of this count but another process's, the window a keeper's crash
-///   recovery restarted at 1 from (U13), so the reader reads from the first
-///   row, as `SessionTimeline::since` answers it, with this log's own holes.
-/// - **Below the first id this log issued** ([`aterm_slog::Log::row_first`],
-///   once it issued one): the predecessor's, across an update; the ids
-///   between it and this log's first are told lost too, as the ring's
-///   digest tells the update's `HANDOFF_ID_RESERVE` jump
-///   (`GAP <sid> events-dropped=`), so a watcher re-reads what it follows.
-#[cfg(test)]
+/// THE VIEW past row id `after`, and the holes it crosses on its way to the log's head.
 pub(crate) fn timeline_rows_since(log: &Log, after: Option<u64>) -> TimelineView {
-    let head = log.row_head();
-    let after = after.filter(|&a| a <= head);
-    let from = after.unwrap_or(0);
-    let mut rows = Vec::new();
-    for row in log.rows() {
-        for (id, (kind, payload)) in (row.id..).zip(rows_of(row.rec)) {
-            if id > from {
-                rows.push(TimelineEvent {
-                    id,
-                    t_ms: row.mono,
-                    kind,
-                    payload: clamp_payload(payload),
-                });
+    let copy = ViewCopy::of(log, after, 0);
+    TimelineView {
+        lost: copy.lost,
+        rows: copy.rows(),
+    }
+}
+
+/// THE VIEW'S RECORDS past a reader's id, as a reader takes them under the
+/// timeline's lock: each row record's first id, its process-clock reading
+/// and the record itself (an `Arc` clone, no text formatted), newest
+/// first, and the holes counted ([`TimelineView::lost`]). Formatted after
+/// the lock is released ([`ViewCopy::rows`]).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ViewCopy {
+    /// As [`TimelineView::lost`].
+    pub(crate) lost: u64,
+    /// The reader's id as read (0: from the first row).
+    from: u64,
+    /// At most this many of the newest rows (0: every one).
+    keep: usize,
+    /// `(first id, mono, record)`, oldest first.
+    recs: Vec<(u64, u64, Arc<Rec>)>,
+}
+
+impl ViewCopy {
+    /// The rows of `log` past `after` (the newest `keep` of them; 0: all),
+    /// walked from the newest down to the reader's id only: a read costs
+    /// the rows it is shown, never the log's whole ring.
+    pub(crate) fn of(log: &Log, after: Option<u64>, keep: usize) -> ViewCopy {
+        Self::walk(log, after, keep, true)
+    }
+
+    /// [`Self::of`], counted as a reader's walk (`counted`: a test's work
+    /// count, `crate::work_counts`) or not (the debug cross-check's).
+    fn walk(log: &Log, after: Option<u64>, keep: usize, counted: bool) -> ViewCopy {
+        #[cfg(not(test))]
+        let _ = counted;
+        let head = log.row_head();
+        let after = after.filter(|&a| a <= head);
+        let from = after.unwrap_or(0);
+        // The ids this log issued in (lo, head], as `rows_lost_between`
+        // counts them, and those it holds, counted on the same walk.
+        let lo = from.max(log.row_first().saturating_sub(1));
+        let (mut held, mut taken) = (0u64, 0usize);
+        let mut recs = Vec::new();
+        for row in log.rows().rev() {
+            let last = row.id + u64::from(row.span) - 1;
+            if last <= from {
+                break;
+            }
+            #[cfg(test)]
+            if counted {
+                crate::work_counts::retained_record_touched();
+            }
+            let (a, b) = (row.id.max(lo + 1), last.min(head));
+            if b >= a {
+                held += b - a + 1;
+            }
+            if keep == 0 || taken < keep {
+                taken += usize::try_from(last - row.id.max(from + 1) + 1).unwrap_or(usize::MAX);
+                recs.push((row.id, row.mono, Arc::clone(row.rec)));
             }
         }
+        recs.reverse();
+        let jumped = match after {
+            Some(a) if log.rows_issued() > 0 => log.row_first().saturating_sub(1).saturating_sub(a),
+            _ => 0,
+        };
+        ViewCopy {
+            lost: jumped.saturating_add(head.saturating_sub(lo).saturating_sub(held)),
+            from,
+            keep,
+            recs,
+        }
     }
-    let jumped = match after {
-        Some(a) if log.rows_issued() > 0 => log.row_first().saturating_sub(1).saturating_sub(a),
-        _ => 0,
-    };
-    TimelineView {
-        lost: jumped.saturating_add(log.rows_lost_between(from, head)),
-        rows,
+
+    /// The rows, oldest first, formatted by the grammar ([`rows_of`]) and
+    /// cut by the ring's rule ([`clamp_payload`]).
+    pub(crate) fn rows(&self) -> Vec<TimelineEvent> {
+        let mut out = Vec::new();
+        for (first, mono, rec) in &self.recs {
+            for (id, (kind, payload)) in (*first..).zip(rows_of(rec)) {
+                if id > self.from {
+                    out.push(TimelineEvent {
+                        id,
+                        t_ms: *mono,
+                        kind,
+                        payload: clamp_payload(payload),
+                    });
+                }
+            }
+        }
+        if self.keep > 0 && out.len() > self.keep {
+            out.drain(..out.len() - self.keep);
+        }
+        out
     }
+}
+
+/// The view's rows newest first, as `(kind, process-clock ms)`: the tab
+/// chrome's tail (`session_chrome::timeline_tail`), which stops at the rows
+/// it keeps, so the walk goes no further than that.
+pub(crate) fn newest_first(log: &Log) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+    log.rows().rev().flat_map(|row| {
+        rows_of(row.rec)
+            .into_iter()
+            .rev()
+            .map(move |(kind, _)| (kind, row.mono))
+    })
+}
+
+/// THE RING HELD TO THE VIEW (a debug build's check, not a gate), by each
+/// kind's rule, over what both hold:
+///
+/// - **Exact** (every kind but `program-state`): the view's rows from its
+///   newest hole up (ids the log issued and no longer holds,
+///   [`aterm_slog::Log::rows_lost_between`]) are the ring's newest rows of
+///   those kinds, whole payload, in order, newest aligned: the ring keeps
+///   its newest 512, the log its own floor, so the shorter of the two is
+///   held. The `human` rows the log's burst marks still owe the ring
+///   (`owed`, paid at the ring's next row) stand at the ring's end, and a
+///   ring row after the session close (one the closed log refused) is no
+///   row of the view.
+/// - **Retention** (`program-state`): the view's newest row is the
+///   ring's newest, unless a coalesced state is `pending` in its run's
+///   bucket (written later).
+///
+/// A view whose newest rows the log no longer holds has nothing to align,
+/// and passes. `Err` names the first disagreement.
+#[cfg(debug_assertions)]
+pub(crate) fn ring_against_view<'r>(
+    ring: impl Iterator<Item = &'r TimelineEvent>,
+    owed: u32,
+    log: &Log,
+    pending: bool,
+) -> Result<(), String> {
+    use crate::session_timeline::{HUMAN, PROGRAM_STATE};
+    let whole = ViewCopy::walk(log, None, 0, false).rows();
+    if log.rows_lost_between(whole.last().map_or(0, |e| e.id), log.row_head()) > 0 {
+        return Ok(());
+    }
+    let start = (1..whole.len())
+        .rev()
+        .find(|&i| log.rows_lost_between(whole[i - 1].id, whole[i].id - 1) > 0)
+        .unwrap_or(0);
+    let view: Vec<(&str, &str)> = whole[start..]
+        .iter()
+        .map(|e| (e.kind, &*e.payload))
+        .collect();
+    let mut ring: Vec<(&str, &str)> = ring.map(|e| (e.kind, &*e.payload)).collect();
+    if let Some(end) = ring
+        .iter()
+        .rposition(|r| *r == ("state-change", "state=closed"))
+    {
+        ring.truncate(end + 1);
+    }
+    ring.extend((0..owed).map(|_| (HUMAN, "")));
+    let ve: Vec<(&str, &str)> = view
+        .iter()
+        .copied()
+        .filter(|r| r.0 != PROGRAM_STATE)
+        .collect();
+    let re: Vec<(&str, &str)> = ring
+        .iter()
+        .copied()
+        .filter(|r| r.0 != PROGRAM_STATE)
+        .collect();
+    let k = ve.len().min(re.len());
+    let (ve, re) = (&ve[ve.len() - k..], &re[re.len() - k..]);
+    if let Some(i) = (0..k).rev().find(|&i| ve[i] != re[i]) {
+        return Err(format!(
+            "the view's row {} from its newest {:?} is not the ring's {:?}",
+            k - i,
+            ve[i],
+            re[i]
+        ));
+    }
+    if !pending {
+        let v = view.iter().rev().find(|r| r.0 == PROGRAM_STATE);
+        let r = ring.iter().rev().find(|r| r.0 == PROGRAM_STATE);
+        if let (Some(v), Some(r)) = (v, r)
+            && v != r
+        {
+            return Err(format!(
+                "the view's newest program row {v:?} is not the ring's {r:?}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A field of a record, as text (`-` when it is not set).
@@ -124,12 +310,7 @@ fn raw(f: &Fields, key: Key) -> &str {
     f.get_str(key).unwrap_or("-")
 }
 
-/// THE GRAMMAR: one record as the timeline rows it stands for, oldest
-/// first, each `(kind, payload)` whole (a reader cuts it by the ring's own
-/// rule, [`crate::session_timeline::clamp_payload`]): none, one, or the
-/// session close's two (`closing` and the last `state-change`, in that
-/// order, written in one hold as the ring's are; the first only for a close
-/// that names its reason, as the ring's `closing` row is).
+/// THE GRAMMAR.
 pub(crate) fn rows_of(r: &Rec) -> Vec<(&'static str, String)> {
     let row = |k: &'static str, p: String| vec![(k, p)];
     if r.node == Node::SESSION {
@@ -149,10 +330,7 @@ pub(crate) fn rows_of(r: &Rec) -> Vec<(&'static str, String)> {
                 rows.extend(row("state-change", "state=closed".to_string()));
                 return rows;
             }
-            // The registration: the open (a carried session's is its
-            // `state carried=1` mark, below).
             Op::Open => return row("spawned", format!("state={}", text(&r.f, Key::State))),
-            // An uncarried handoff's loss, or a keeper's crash adoption's.
             Op::Gap if matches!(r.f.get_word(Key::Why), Some("handoff" | "crash")) => {
                 return row("handoff", handoff_row(&r.f));
             }
@@ -203,13 +381,8 @@ fn project_mark(r: &Rec) -> Option<(&'static str, String)> {
                 ),
             )
         }
-        // The burst marks: the mail latch's own mark, no
-        // burst's, says `why=mail` and is no row.
         Kind::Human if f.get_word(Key::Why) == Some("mail") => return None,
         Kind::Human => ("human", String::new()),
-        // Phase 6: the four rows whose rule differed, as
-        // the view prints them. The title and the directory as their marks
-        // hold them (a cleared directory `-`).
         Kind::Title => (
             crate::session_timeline::TITLE_CHANGE,
             format!(
@@ -225,9 +398,6 @@ fn project_mark(r: &Rec) -> Option<(&'static str, String)> {
                     .map_or_else(|| "-".to_string(), crate::control::pct_encode)
             ),
         ),
-        // A meta field's value, or the attention text beside its `fp=` (the
-        // content tier), `-` for none; the Autopilot pair's timer. A
-        // successor's restore (`carried=1`) is a row as any write is.
         Kind::Meta => (
             crate::session_timeline::META_CHANGE,
             format!(
@@ -242,8 +412,6 @@ fn project_mark(r: &Rec) -> Option<(&'static str, String)> {
                 }
             ),
         ),
-        // A self-claim's act, whole (`harness_act=`, the review of 6F-7),
-        // and its holder; a relaunch's act (`src=aterm`) is no row's.
         Kind::Act if r.src == aterm_slog::Src::Mark => (
             crate::session_timeline::HARNESS_ACT,
             format!(
@@ -252,7 +420,6 @@ fn project_mark(r: &Rec) -> Option<(&'static str, String)> {
                 raw(f, Key::Holder)
             ),
         ),
-        // `exit=` is the log's `code=`, as a command's is (5C-1).
         Kind::Task => (
             "task-change",
             format!(
@@ -279,8 +446,6 @@ fn project_mark(r: &Rec) -> Option<(&'static str, String)> {
                 text(f, Key::Off)
             ),
         ),
-        // Phase 6 (6F-5): the ring-only facts, as marks; a carried
-        // session's registration is its `spawned` row (6F-7).
         Kind::State if f.get_u(Key::Carried) == Some(1) => {
             ("spawned", format!("state={}", text(f, Key::State)))
         }
@@ -298,8 +463,6 @@ fn project_mark(r: &Rec) -> Option<(&'static str, String)> {
             ),
         ),
         Kind::MailFetch => ("fetch", format!("off={}", text(f, Key::Off))),
-        // Phase 6 (6F-6): the fabric rows, whole. A broadcast's `to=` is
-        // its topic's fingerprint on the record, the name beside it.
         Kind::Mail if f.get_word(Key::Dir) == Some("out") => {
             let to = match (raw(f, Key::To).strip_prefix("say:"), f.get(Key::TopicName)) {
                 (Some(_), Some(_)) => format!("say:{}", raw(f, Key::TopicName)),
@@ -378,7 +541,11 @@ fn project_mark(r: &Rec) -> Option<(&'static str, String)> {
                 _ => format!("drop {}", raw(f, Key::TopicName)),
             },
         ),
-        // Phase 6 (6F-7): the session rows, whole.
+        // A row the log holds as its row alone; a token no kind spells is no row.
+        Kind::Row => (
+            row_kind(f.get_str(Key::RowKind)?)?,
+            f.get_str(Key::RowText).unwrap_or("").to_string(),
+        ),
         Kind::Handoff => ("handoff", handoff_row(f)),
         Kind::Render => ("render", render_row(f)),
         Kind::Modes => {
@@ -412,11 +579,6 @@ fn project_mark(r: &Rec) -> Option<(&'static str, String)> {
                 crate::control::pct_encode(f.get_str(Key::Reply).unwrap_or(""))
             ),
         ),
-        // The program's own report: kept under the log's
-        // own retention rule (64 a run, a flap past the run's bucket
-        // coalesced into the next mark), so its rows are the ring's by that
-        // rule, not row for record. A report that went away (`none`) is the
-        // ring's `-`.
         Kind::Program => (
             crate::session_timeline::PROGRAM_STATE,
             format!(

@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for [`super`]: the price table, the home-wide fold, the dollar
-//! figures and a Codex conversation's sum, against composed transcripts and
-//! rollouts in temp homes this test writes (never a real one) and composed
-//! price tables read by the real loader.
-
+//! Tests for [`super`]: price table loading, home-wide transcript folding, dollar spend, and Codex rollout aggregation.
 use std::fs;
 use std::io::Write as _;
 
@@ -82,7 +78,7 @@ fn table() -> PriceTable {
 }
 
 /// One assistant row as Claude Code writes it (key names as on 2.1.30x),
-/// with `extra` spliced into its usage, and its newline. `id` empty: none.
+/// with `extra` spliced into its usage, and its newline.
 fn row(id: &str, model: &str, at: i64, t: TokenUsage, extra: &str) -> String {
     let id = if id.is_empty() {
         String::new()
@@ -135,8 +131,6 @@ fn close(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-9
 }
 
-// The price table
-
 #[test]
 fn price_table_prices_only_what_the_caller_supplied() {
     let spend = TokenUsage {
@@ -156,7 +150,6 @@ fn price_table_prices_only_what_the_caller_supplied() {
     let usd = table
         .message_usd("claude-fable-5-1", &spend)
         .expect("priced");
-    // 3 + 7.5 + 0.75 + 1.2
     assert!((usd - 12.45).abs() < 1e-9, "{usd}");
     assert_eq!(
         table.message_usd("claude-fable-5", &spend),
@@ -183,7 +176,6 @@ fn price_table_prices_only_what_the_caller_supplied() {
         }),
     );
     assert_eq!(nan.message_usd("m", &spend), None);
-    // NEGATIVE CONTROL: the same row with valid prices prices.
     let good = PriceTable::new().with(
         "m",
         ModelPrice::flat(Rates {
@@ -224,8 +216,7 @@ const SPLIT_ROW: &str = r#"{"type":"assistant","message":{"id":"msg_s","model":"
 
 /// THE ONE-HOUR WRITES ARE PRICED AT THEIR OWN RATE: 800 of the row's
 /// 1000 writes are one-hour ones, so it lists 200 × $3.75 + 800 × $6 (+
-/// the input), not 1000 × $3.75. Negative control: the same counts with no
-/// split price every write at the five-minute rate.
+/// the input), not 1000 × $3.75.
 #[test]
 fn one_hour_cache_writes_are_priced_at_their_rate() {
     let mut t = TranscriptUsage::new();
@@ -236,7 +227,6 @@ fn one_hour_cache_writes_are_priced_at_their_rate() {
     let want = (10.0 * 3.0 + 200.0 * 3.75 + 800.0 * 6.0) / 1e6;
     let one = table.message_usd("m", &m.tokens()).expect("priced");
     assert!((one - want).abs() < 1e-12, "{one} != {want}");
-    // NEGATIVE CONTROL: no split, every write at the five-minute rate.
     let unsplit = TokenUsage {
         cache_write_1h: 0,
         ..m.tokens()
@@ -247,8 +237,7 @@ fn one_hour_cache_writes_are_priced_at_their_rate() {
 }
 
 /// NEVER A GUESS: tokens in a class the row has no rate for make the
-/// request unpriced, and a model with no row is unpriced. Negative
-/// control: the same request without those tokens is priced.
+/// request unpriced, and a model with no row is unpriced.
 #[test]
 fn a_class_without_a_rate_leaves_the_request_unpriced() {
     let no_writes = PriceTable::new().with(
@@ -267,7 +256,6 @@ fn a_class_without_a_rate_leaves_the_request_unpriced() {
     };
     assert_eq!(no_writes.message_usd("gpt-x", &wrote), None);
     assert_eq!(no_writes.message_usd("gpt-y", &wrote), None, "no row");
-    // NEGATIVE CONTROL.
     let read = TokenUsage {
         input: 100,
         cache_read: 1000,
@@ -278,8 +266,7 @@ fn a_class_without_a_rate_leaves_the_request_unpriced() {
 }
 
 /// A final streamed row may reveal the cache-write lifetime without adding
-/// another token. If that lifetime has no price, its unpriced delta must
-/// suppress capacity even though the aggregate cache-write delta is zero.
+/// another token.
 #[test]
 fn a_late_unpriced_one_hour_split_suppresses_capacity() {
     let home = Home::new("late-unpriced-hour");
@@ -345,7 +332,6 @@ fn a_late_unpriced_one_hour_split_suppresses_capacity() {
     assert_eq!(figure.capacity, Err(Why::Unpriced));
     assert_eq!(figure.left, Err(Why::Unpriced));
 
-    // The same real transcript is priceable when the supplied table has both rates.
     let mut priced = Spend::new(home.path(), &table());
     assert_eq!(
         priced
@@ -400,9 +386,7 @@ fn a_prompt_over_the_tier_pays_the_long_rates_request_by_request() {
 
 /// THE SHIPPED TABLE (`prices.toml`) loads, is dated, and every row names
 /// the public page it was read from; ids are exact (an alias or a
-/// `[1m]` spelling is unpriced). The loader is strict: an unknown key, a
-/// missing source or price, a negative price, a bad date each refuse the
-/// whole table. Negative control: the shipped text itself is accepted.
+/// `[1m]` spelling is unpriced).
 #[test]
 fn the_shipped_table_loads_dated_and_sourced_and_the_loader_is_strict() {
     let shipped = PRICES_TOML;
@@ -468,11 +452,9 @@ fn the_shipped_table_loads_dated_and_sourced_and_the_loader_is_strict() {
     }
 }
 
-// The fold
-
 /// THE HOME-WIDE FOLD COUNTS SUBAGENTS (the design's F15): the main
 /// transcript, a subagent's beside it and a workflow's nested deeper are all
-/// summed. Negative control: the main transcript alone holds a third.
+/// summed.
 #[test]
 fn the_home_fold_counts_every_transcript_subagents_included() {
     let home = Home::new("subagents");
@@ -496,7 +478,6 @@ fn the_home_fold_counts_every_transcript_subagents_included() {
     assert_eq!((report.files, report.messages), (3, 3));
     let all = everything(&spend, now);
     assert!(close(all.usd, 3.0), "{}", all.usd);
-    // NEGATIVE CONTROL: a home with only the main transcript.
     let alone = Home::new("main-only");
     append(
         &alone.transcript("-proj/sess.jsonl"),
@@ -510,8 +491,7 @@ fn the_home_fold_counts_every_transcript_subagents_included() {
 /// THE FOLD'S DEADLINE BOUNDS THE WALK TOO (design §4.1: `accounts stats`
 /// folds for at most [`super::super::cli::STATS_FOLD_S`]): a fold whose
 /// deadline has passed lists nothing more and says its walk was cut, so the
-/// discovery of a large home cannot run past the budget. NEGATIVE CONTROL:
-/// no deadline, the walk finds the transcript.
+/// discovery of a large home cannot run past the budget.
 #[test]
 fn the_folds_deadline_stops_its_walk() {
     let home = Home::new("walk-deadline");
@@ -529,7 +509,6 @@ fn the_folds_deadline_stops_its_walk() {
     assert!(report.walk_cut, "{report:?}");
     assert_eq!(report.files, 0, "{report:?}");
     assert!(!report.complete());
-    // NEGATIVE CONTROL.
     let report = spend.fold_claude_home(&table(), now, Limits::none());
     assert!(!report.walk_cut && report.complete(), "{report:?}");
     assert_eq!((report.files, report.messages), (1, 1));
@@ -537,8 +516,7 @@ fn the_folds_deadline_stops_its_walk() {
 
 /// ONE MESSAGE, ONE COUNT, AT ITS LARGEST: a streamed message's rows repeat
 /// its id with growing output, within one fold and across two (the id is
-/// kept in the cursor between them). Negative control: the same rows with no
-/// id count three messages and every row's output.
+/// kept in the cursor between them).
 #[test]
 fn a_message_counts_once_at_its_largest_even_across_folds() {
     let home = Home::new("dedupe");
@@ -568,7 +546,6 @@ fn a_message_counts_once_at_its_largest_even_across_folds() {
     let all = everything(&spend, now);
     assert_eq!((all.messages, all.tokens.output), (1, 80));
     assert!(close(all.usd, 80.0 * 10.0 / 1e6));
-    // NEGATIVE CONTROL: no ids, no dedupe.
     let bare = Home::new("dedupe-control");
     let path = bare.transcript("-p/s.jsonl");
     for n in [10, 50, 80] {
@@ -582,7 +559,7 @@ fn a_message_counts_once_at_its_largest_even_across_folds() {
 
 /// THE COST RULE: a second fold of the same spend reads only what was
 /// appended (plus the one boundary byte), and an unchanged home reads
-/// nothing. Negative control: a spend started fresh reads the whole file.
+/// nothing.
 #[test]
 fn a_second_fold_reads_only_the_appended_bytes() {
     let home = Home::new("appended");
@@ -602,26 +579,22 @@ fn a_second_fold_reads_only_the_appended_bytes() {
     let mut again = spend_of(&home);
     let first = again.fold_claude_home(&table(), now, Limits::none());
     assert_eq!(first.read, first_rows.len() as u64);
-    // Unchanged: not even opened.
     assert_eq!(
         again.fold_claude_home(&table(), now, Limits::none()).read,
         0
     );
-    // Appended: those bytes and the boundary byte.
     let more = row("msg_new", "claude-opus-5-5", now - 50, mtok_in(), "");
     append(&path, &more);
     let second = again.fold_claude_home(&table(), now, Limits::none());
     assert_eq!(second.read, more.len() as u64 + 1);
     assert_eq!(second.messages, 1);
     assert!(close(everything(&again, now).usd, 21.0));
-    // NEGATIVE CONTROL: no cursor, the whole file.
     let mut fresh_spend = spend_of(&home);
     let whole = fresh_spend.fold_claude_home(&table(), now, Limits::none());
     assert_eq!(whole.read, (first_rows.len() + more.len()) as u64);
 }
 
-/// A failed directory read is not a complete empty home. In particular it
-/// cannot discard the per-file streaming state which a later append needs.
+/// A failed directory read is not a complete empty home.
 #[test]
 fn an_incomplete_walk_keeps_the_streaming_cursor_until_the_home_is_readable() {
     let home = Home::new("walk-refused");
@@ -650,8 +623,6 @@ fn an_incomplete_walk_keeps_the_streaming_cursor_until_the_home_is_readable() {
         1
     );
 
-    // Keep the real transcript intact while making its directory unreadable as
-    // a directory. This needs no permission tricks or timing-dependent race.
     let projects = home.path().join("projects");
     let parked = home.path().join("projects-held");
     fs::rename(&projects, &parked).expect("park the scratch projects directory");
@@ -675,7 +646,6 @@ fn an_incomplete_walk_keeps_the_streaming_cursor_until_the_home_is_readable() {
             assert_eq!((sum.messages, sum.tokens.input), (1, 100));
             fs::remove_file(&projects).expect("remove only the owned projects link");
         }
-        // A link within the admitted root is still skipped as before.
         symlink(other.path().join("projects"), parked.join("linked"))
             .expect("link inside the scratch projects directory");
     }
@@ -790,9 +760,7 @@ fn a_budgeted_fold_reaches_the_same_sums_as_one_unbounded() {
 
 /// A TRANSCRIPT REWRITTEN IN PLACE is folded again from its start: what it
 /// had counted is known by its ids and not counted again, and a message new
-/// to it is. Negative control: the same refold with the counted ids
-/// forgotten (the home's, and the transcript's own) counts the rewritten
-/// rows again.
+/// to it is.
 #[test]
 fn a_rewritten_transcript_is_folded_again_never_counted_twice() {
     let rewrite = |label: &str, forget: bool| {
@@ -813,8 +781,6 @@ fn a_rewritten_transcript_is_folded_again_never_counted_twice() {
                 cursor.ids.clear();
             }
         }
-        // Shorter than the offset folded to (a tenth of the tokens, a digit
-        // fewer), with a message new to it.
         let tenth = TokenUsage {
             input: 100_000,
             ..TokenUsage::default()
@@ -833,7 +799,6 @@ fn a_rewritten_transcript_is_folded_again_never_counted_twice() {
     assert!(close(everything(&spend, now).usd, 2.1));
     let again = spend.fold_claude_home(&table(), now, Limits::none());
     assert_eq!((again.read, again.refolded, again.messages), (0, 0, 0));
-    // NEGATIVE CONTROL.
     let (control, report, now) = rewrite("rewritten-control", true);
     assert_eq!((report.refolded, report.messages), (1, 2));
     assert!(close(everything(&control, now).usd, 3.1));
@@ -841,8 +806,6 @@ fn a_rewritten_transcript_is_folded_again_never_counted_twice() {
 
 /// A MESSAGE STREAMING WHEN ITS FILE IS FOLDED AGAIN is still raised by its
 /// later rows: the ids the transcript held stand through the refold.
-/// Negative control: the same refold with the transcript's ids forgotten
-/// (the home's still known) drops the message's output.
 #[test]
 fn a_message_streaming_through_a_refold_is_still_raised() {
     let refold = |label: &str, forget: bool| {
@@ -860,7 +823,6 @@ fn a_message_streaming_through_a_refold_is_still_raised() {
                 cursor.ids.clear();
             }
         }
-        // Shorter than the offset folded to: msg_a's row gone.
         fs::write(&main, &first).expect("rewrite");
         let report = spend.fold_claude_home(&table(), now, Limits::none());
         assert_eq!((report.refolded, report.messages), (1, 0));
@@ -872,7 +834,6 @@ fn a_message_streaming_through_a_refold_is_still_raised() {
     let all = refold("refold-open", false);
     assert_eq!(all.messages, 2);
     assert!(close(all.usd, 3.0), "{}", all.usd);
-    // NEGATIVE CONTROL.
     let all = refold("refold-open-control", true);
     assert!(close(all.usd, 2.0), "{}", all.usd);
 }
@@ -880,8 +841,7 @@ fn a_message_streaming_through_a_refold_is_still_raised() {
 /// ONE MESSAGE, ONE COUNT IN THE HOME: a transcript that repeats messages
 /// another one counted (a copy a fork or a resume could write) adds only
 /// its own, across two folds of one spend and in one fold that reads the
-/// copy first. Negative control: the home's counted ids forgotten
-/// between the folds, the copies count again.
+/// copy first.
 #[test]
 fn a_message_another_transcript_repeats_counts_once_in_the_home() {
     let home = Home::new("copies");
@@ -902,12 +862,10 @@ fn a_message_another_transcript_repeats_counts_once_in_the_home() {
     let report = later.fold_claude_home(&table(), now, Limits::none());
     assert_eq!((report.messages, report.duplicates), (1, 2));
     assert!(close(everything(&later, now).usd, 3.0));
-    // In one fold, the copy (the newer file) read first.
     let mut once = spend_of(&home);
     let report = once.fold_claude_home(&table(), now, Limits::none());
     assert_eq!((report.messages, report.duplicates), (3, 2));
     assert_eq!(everything(&once, now), everything(&later, now));
-    // NEGATIVE CONTROL.
     let mut control = spend.clone();
     control.seen.clear();
     assert_eq!(
@@ -921,8 +879,7 @@ fn a_message_another_transcript_repeats_counts_once_in_the_home() {
 
 /// BUCKETS are five minutes wide back to the horizon, and nothing past it
 /// is kept: time passing drops what leaves the horizon and merges nothing,
-/// so a sum over old spend is as fine as one over new. Negative control:
-/// past the horizon, the buckets and their ids are gone.
+/// so a sum over old spend is as fine as one over new.
 #[test]
 fn buckets_are_five_minutes_wide_back_to_the_horizon() {
     let home = Home::new("buckets");
@@ -957,7 +914,6 @@ fn buckets_are_five_minutes_wide_back_to_the_horizon() {
     spend.expire(later);
     let kept: Vec<i64> = spend.buckets().map(|(start, _)| start).collect();
     assert_eq!(kept, starts, "a week on, still five minutes wide");
-    // The old message's own five minutes hold it, a week on.
     let old = five(now - 8 * 3600);
     let alone = spend.sum(
         Span {
@@ -969,15 +925,13 @@ fn buckets_are_five_minutes_wide_back_to_the_horizon() {
     );
     assert_eq!(alone.messages, 1);
     assert_eq!(spend.seen.len(), 2, "the counted ids, the gone one's not");
-    // NEGATIVE CONTROL.
     spend.expire(now + HORIZON_S + 3600);
     assert_eq!(spend.buckets().count(), 0, "all past the horizon");
     assert!(spend.seen.is_empty(), "and their ids");
 }
 
 /// NEVER A GUESS: a model with no row is counted and named, its dollars
-/// unknown, and more than 1% of a class unpriced says so. Negative control:
-/// the same tokens on a priced model are priced and say nothing.
+/// unknown, and more than 1% of a class unpriced says so.
 #[test]
 fn an_unknown_model_is_unpriced_never_guessed() {
     let home = Home::new("unpriced");
@@ -998,7 +952,6 @@ fn an_unknown_model_is_unpriced_never_guessed() {
     assert!(close(all.usd, 1.0), "only the priced model's dollar");
     assert_eq!(all.unpriced["claude-opus-9"].input, 1_000_000);
     assert!(all.unpriced_over());
-    // NEGATIVE CONTROL.
     let known = Home::new("priced");
     append(
         &known.transcript("-p/s.jsonl"),
@@ -1012,10 +965,7 @@ fn an_unknown_model_is_unpriced_never_guessed() {
 
 /// WHAT THE TABLE DOES NOT PRICE is counted approximate: fast mode, US-only
 /// inference, a web search, a tier other than the standard one, an
-/// advisor's iterations. Negative control: the standard words, no search,
-/// the empty `inference_geo` and `iterations` Claude Code writes where the
-/// server sent none (2.1.294's lab rows; its default usage in 2.1.301), and
-/// a message's own iteration, are not.
+/// advisor's iterations.
 #[test]
 fn fast_mode_us_inference_web_search_tiers_and_advisors_are_approximate() {
     let home = Home::new("approx");
@@ -1123,14 +1073,11 @@ fn a_spend_priced_by_another_table_is_folded_again() {
     assert_eq!(spend.prices_as_of(), "2026-11-01");
 }
 
-// The dollar figures
-
 /// A spend with `usd` of opus spend placed at each `(at, usd)`.
 fn spend_at(rows: &[(i64, f64)], now: i64) -> Spend {
     let home = Home::new("figures");
     let mut spend = spend_of(&home);
     for &(at, usd) in rows {
-        // $1 per million input tokens on opus.
         let tokens = TokenUsage {
             input: (usd * 1e6) as u64,
             ..TokenUsage::default()
@@ -1183,13 +1130,10 @@ fn ask<'a>(now: i64, reading: Option<Reading>) -> Ask<'a> {
 
 /// `C = $(window start, t_r] ÷ u(t_r)` and `left = C × (1 − u_now)`: spend
 /// after the reading never enters `C`, even in the bucket the reading falls
-/// in (only buckets that end by it count). A `u_now` from before the window
-/// is no `u_now` of it: the reading stands in. Negative control: counting the
-/// later spend gives another figure.
+/// in (only buckets that end by it count).
 #[test]
 fn capacity_divides_the_spend_to_the_reading_by_its_use() {
     let now = 1_792_000_000 - 1_792_000_000 % 3600;
-    // The reading at :38, $5 more at :39, in the same five-minute bucket.
     let reading_at = now - 22 * 60;
     let spend = spend_at(
         &[
@@ -1210,12 +1154,9 @@ fn capacity_divides_the_spend_to_the_reading_by_its_use() {
     let left = f.left.expect("a left");
     assert!(close(left.usd, 20.0));
     assert_eq!(left.age_s, 60);
-    // A newest reading from the window before: the reading is u_now.
     a.newest = Some(tap(900, now - 6 * HOUR));
     let left = figure(&spend, &a).left.expect("a left");
     assert!(close(left.usd, 30.0) && left.age_s == 22 * 60, "{left:?}");
-    // NEGATIVE CONTROL: a numerator that does not stop at the reading takes
-    // the later $5, which shares the reading's bucket.
     let to_bucket = spend.sum(
         Span {
             from: now + HOUR - FIVE_H,
@@ -1230,9 +1171,7 @@ fn capacity_divides_the_spend_to_the_reading_by_its_use() {
 /// A WEEK'S CAPACITY IS SUMMED FROM ITS FIVE-MINUTE BUCKETS, days after the
 /// spend: a reading 35 minutes into an hour three days back holds the $6
 /// served at :25 and not the $4 at :50, once time has passed and the spend
-/// file has been through `expire`. Negative control: a reading at :26, in
-/// the $6's own five minutes, holds neither (only whole buckets count), so
-/// it has no capacity: `low`.
+/// file has been through `expire`.
 #[test]
 fn a_weeks_capacity_is_summed_from_its_five_minute_buckets() {
     let now = 1_792_000_000 - 1_792_000_000 % 3600;
@@ -1250,14 +1189,11 @@ fn a_weeks_capacity_is_summed_from_its_five_minute_buckets() {
     let c = f.capacity.expect("a capacity");
     assert!(close(c.usd, 24.0), "{} != 6 / 0.25", c.usd);
     assert_eq!(f.left, Err(Why::Stale), "u_now is three days old");
-    // NEGATIVE CONTROL.
     assert_eq!(week(hour + 26 * 60).capacity, Err(Why::Low));
 }
 
 /// A RESET USED INSIDE THE WINDOW starts the numerator (and the spent figure)
-/// at its epoch: the vendor refilled the window there. A reading from before
-/// the epoch is no reading of this window. Negative control: without the
-/// epoch the earlier spend counts.
+/// at its epoch: the vendor refilled the window there.
 #[test]
 fn a_reset_used_inside_the_window_starts_at_its_epoch() {
     let now = 1_792_000_000 - 1_792_000_000 % 3600;
@@ -1270,7 +1206,6 @@ fn a_reset_used_inside_the_window_starts_at_its_epoch() {
     assert!(close(f.capacity.expect("a capacity").usd, 50.0));
     a.reading = Some(tap(900, epoch - 60));
     assert_eq!(figure(&spend, &a).capacity, Err(Why::NoReading));
-    // NEGATIVE CONTROL.
     let mut plain = ask(now, Some(tap(100, now - 10 * 60)));
     plain.epoch_at = None;
     assert!(close(
@@ -1280,9 +1215,7 @@ fn a_reset_used_inside_the_window_starts_at_its_epoch() {
 }
 
 /// USAGE CREDITS SERVED IN THE WINDOW: `C` and `left` print `on-credits`,
-/// whenever in the window they served; what was spent still shows. No share
-/// of a bucket is split off as credit spend. Negative control: the same
-/// window with no credits has its capacity.
+/// whenever in the window they served; what was spent still shows.
 #[test]
 fn credits_served_in_the_window_suppress_the_capacity() {
     let now = 1_792_000_000 - 1_792_000_000 % 3600;
@@ -1302,7 +1235,6 @@ fn credits_served_in_the_window_suppress_the_capacity() {
         (f.capacity.err(), f.left.err()),
         (Some(Why::OnCredits), Some(Why::OnCredits))
     );
-    // NEGATIVE CONTROL.
     let plain = figure(&spend, &ask(now, Some(tap(500, now - 10 * 60))));
     assert!(close(plain.capacity.expect("a capacity").usd, 40.0));
 }
@@ -1318,9 +1250,7 @@ fn each_empty_figure_says_why() {
         let f = figure(&spend, a);
         (f.capacity.err(), f.left.err())
     };
-    // NEGATIVE CONTROL: a good reading.
     assert_eq!(why(&ask(now, r(250))), (None, None));
-    // Rolling: no reset known.
     let mut rolling = ask(now, r(250));
     rolling.resets_at = None;
     let f = figure(&spend, &rolling);
@@ -1330,22 +1260,16 @@ fn each_empty_figure_says_why() {
         why(&ask(now, None)),
         (Some(Why::NoReading), Some(Why::NoReading))
     );
-    // Before the window.
     assert_eq!(
         why(&ask(now, Some(tap(250, now - 5 * HOUR)))).0,
         Some(Why::NoReading)
     );
-    // Low: under 5 whole, under 1 in tenths.
     assert_eq!(why(&ask(now, r(44))).0, Some(Why::Low));
     let mut tenths = ask(now, r(44));
     tenths.tenths_seen = true;
     assert_eq!(why(&tenths), (None, None));
     tenths.reading = r(9);
     assert_eq!(why(&tenths).0, Some(Why::Low));
-    // Low too when no whole bucket of spend comes before the reading, as at
-    // a window's start: $8 in its first five minutes, read at 1.2% inside
-    // them, would give C = $0 and $0 left. Once that bucket has ended, the
-    // same $8 has a capacity.
     let start = now + HOUR - FIVE_H;
     let first = spend_at(&[(start + 20, 8.0)], now);
     let mut early = ask(now, Some(tap(12, start + 250)));
@@ -1358,11 +1282,9 @@ fn each_empty_figure_says_why() {
     early.now = start + 310;
     let c = figure(&first, &early).capacity.expect("a capacity");
     assert!(close(c.usd, 8.0 / 0.014), "{}", c.usd);
-    // At the limit: C stands, nothing is left.
     let mut full = ask(now, r(250));
     full.newest = r(1000);
     assert_eq!(why(&full), (None, Some(Why::AtLimit)));
-    // Stale: older than a tenth of the window, or a silent machine.
     let mut old = ask(now, r(250));
     old.newest = Some(tap(300, now - FIVE_H / 10 - 1));
     assert_eq!(why(&old), (None, Some(Why::Stale)));
@@ -1371,7 +1293,6 @@ fn each_empty_figure_says_why() {
     let mut silent = ask(now, r(250));
     silent.machines.silent = 1;
     assert_eq!(why(&silent), (None, Some(Why::Stale)));
-    // Unattributed over 1%; an API key seen.
     let mut shared = ask(now, r(250));
     shared.attribution = Attribution::Unattributed { share: 0.02 };
     assert_eq!(why(&shared).0, Some(Why::Unattributed));
@@ -1380,8 +1301,6 @@ fn each_empty_figure_says_why() {
     let mut keyed = ask(now, r(250));
     keyed.api_key_seen = true;
     assert_eq!(why(&keyed), (Some(Why::ApiKeySeen), Some(Why::ApiKeySeen)));
-    // Unpriced over 1% of a class; unpriced spend alone is `unpriced` too,
-    // not `low`.
     let unknown = Message {
         at: now - 2 * HOUR,
         model: "claude-opus-9",
@@ -1445,8 +1364,7 @@ fn the_error_bar_is_the_readings_resolution() {
     assert!(close(wall.usd, 10.0) && close(wall.pm_pct, 0.0));
 }
 
-/// THE FABLE BUCKET's dollars are its models' only. Negative control: the
-/// whole window holds both.
+/// THE FABLE BUCKET's dollars are its models' only.
 #[test]
 fn the_fable_bucket_sums_only_fable_models() {
     let now = 1_792_000_000 - 1_792_000_000 % 3600;
@@ -1470,11 +1388,9 @@ fn the_fable_bucket_sums_only_fable_models() {
     assert!(close(figure(&spend, &ask(now, None)).used.usd, 6.0));
 }
 
-// The rows of one message, each message's price, cursors, the seam
-
 /// A message's first row as Claude Code 2.1.300 writes it while the message
 /// streams: no `speed` (nor `server_tool_use` or `iterations`, which [`row`]
-/// writes only as `extra`). A later row carries them, with the final usage.
+/// writes only as `extra`).
 fn first_streamed(row: &str) -> String {
     assert!(row.contains(r#","speed":"standard""#));
     row.replacen(r#","speed":"standard""#, "", 1)
@@ -1484,10 +1400,7 @@ fn first_streamed(row: &str) -> String {
 /// once: fast mode said on its last row only, both rows read in one fold; a
 /// web search said on the last row a fold later; a last row that adds
 /// nothing but `speed`; an advisor's iterations on the last row only, after
-/// a first row with Claude Code's empty `iterations`. Negative control: a
-/// message fast on both rows counts once, its first row folded a fold
-/// before; a standard one whose rows carry the empty `iterations` and then
-/// its own iteration is not approximate.
+/// a first row with Claude Code's empty `iterations`.
 #[test]
 fn a_message_is_approximate_when_any_row_of_it_says_so() {
     let home = Home::new("approx-late");
@@ -1502,7 +1415,6 @@ fn a_message_is_approximate_when_any_row_of_it_says_so() {
     let whole = mtok_in().plus(&out(100_000));
     let fast = r#","speed":"fast""#;
     let empty = r#","iterations":[]"#;
-    // Fast mode said on the last row only, both rows read in one fold.
     append(
         &main,
         &first_streamed(&row("msg_f", opus, now - 60, mtok_in(), "")),
@@ -1511,7 +1423,6 @@ fn a_message_is_approximate_when_any_row_of_it_says_so() {
     spend.fold_claude_home(&table(), now, Limits::none());
     assert_eq!(counts(&spend), (1, 1));
     assert!(close(everything(&spend, now).usd, 2.0), "at the base rates");
-    // A web search said on the last row, a fold later.
     append(
         &main,
         &first_streamed(&row("msg_w", opus, now - 50, mtok_in(), "")),
@@ -1520,13 +1431,11 @@ fn a_message_is_approximate_when_any_row_of_it_says_so() {
     assert_eq!(counts(&spend), (2, 1));
     let search = r#","server_tool_use":{"web_search_requests":1}"#;
     append(&main, &row("msg_w", opus, now - 50, whole, search));
-    // A last row that adds nothing but `speed`.
     append(
         &main,
         &first_streamed(&row("msg_z", opus, now - 40, mtok_in(), "")),
     );
     append(&main, &row("msg_z", opus, now - 40, mtok_in(), fast));
-    // An advisor's iterations on the last row only.
     let advisor = r#","iterations":[{"type":"message"},{"type":"advisor_message","model":"claude-opus-5-5"}]"#;
     append(
         &main,
@@ -1535,7 +1444,6 @@ fn a_message_is_approximate_when_any_row_of_it_says_so() {
     append(&main, &row("msg_a", opus, now - 35, whole, advisor));
     spend.fold_claude_home(&table(), now, Limits::none());
     assert_eq!(counts(&spend), (4, 4));
-    // NEGATIVE CONTROL.
     append(&main, &row("msg_b", opus, now - 30, mtok_in(), fast));
     spend.fold_claude_home(&table(), now, Limits::none());
     append(&main, &row("msg_b", opus, now - 30, whole, fast));
@@ -1545,7 +1453,6 @@ fn a_message_is_approximate_when_any_row_of_it_says_so() {
     );
     let own = r#","iterations":[{"type":"message"}]"#;
     append(&main, &row("msg_s", opus, now - 20, whole, own));
-    // A server-side fallback served this one: two models in one message.
     let fallback = r#","iterations":[{"type":"message","model":"claude-fable-5-1"},{"type":"fallback_message","model":"claude-opus-5-5"}]"#;
     append(
         &main,
@@ -1558,9 +1465,7 @@ fn a_message_is_approximate_when_any_row_of_it_says_so() {
 
 /// EACH MESSAGE IS PRICED ON ITS OWN, a model priced by prompt length too:
 /// two requests under the tier, a session's and its subagent's in one
-/// bucket, price at the base rates however large their sum. Negative
-/// control: the same two requests priced as one pass the tier and price
-/// otherwise.
+/// bucket, price at the base rates however large their sum.
 #[test]
 fn each_message_is_priced_on_its_own() {
     let tiered = format!(
@@ -1588,7 +1493,6 @@ fn each_message_is_priced_on_its_own() {
     let all = everything(&spend, now);
     assert_eq!(all.messages, 2);
     assert!(close(all.usd, 0.12), "{}", all.usd);
-    // NEGATIVE CONTROL.
     let as_one = prices
         .message_usd(haiku, &short.plus(&short))
         .expect("priced");
@@ -1596,8 +1500,7 @@ fn each_message_is_priced_on_its_own() {
 }
 
 /// A retained cache-read token is priced below the prompt tier but has no
-/// rate above it. Only the prompt's one-token growth reveals that the WHOLE
-/// request is unpriced; it must not leave its earlier dollars behind.
+/// rate above it.
 fn repricing_table(price_long_cache: bool) -> PriceTable {
     let cache = if price_long_cache {
         "cache_read = 2.0"
@@ -1621,7 +1524,6 @@ fn below_repricing_tier() -> TokenUsage {
 
 #[test]
 fn a_stream_that_becomes_unpriced_retires_its_whole_prior_price() {
-    // Positive control first: a complete long row reprices the request normally.
     for priced in [true, false] {
         let home = Home::new("repricing");
         let now = now();
@@ -1631,8 +1533,6 @@ fn a_stream_that_becomes_unpriced_retires_its_whole_prior_price() {
         let model = "claude-haiku-5-5";
         let first = below_repricing_tier();
         append(&path, &row("msg_stream", model, at, first, ""));
-        // Another message shares the bucket; invalidating the stream cannot
-        // subtract its dollars, tokens or count.
         append(
             &path,
             &row("msg_other", "claude-opus-5-5", at, mtok_in(), ""),
@@ -1725,8 +1625,6 @@ fn unpricing_a_stream_corrects_its_old_buckets_without_backdating_later_spend() 
             None,
         );
         if priced {
-            // The final tier surcharge happened after this reading. Keeping a
-            // stable first-bucket total would falsely inflate its numerator.
             assert!(
                 close(earlier.usd, 2.101001),
                 "later spend moved before its reading: {earlier:?}"
@@ -1750,7 +1648,6 @@ fn a_later_fully_priced_tier_resolves_unknown_tokens_without_backdating_dollars(
     let now = now();
     let at = now.div_euclid(BUCKET_S) * BUCKET_S - 3 * BUCKET_S;
     let later = at + 2 * BUCKET_S;
-    // The reverse of the missing-long-rate case: only the long tier prices reads.
     let mut prices = repricing_table(true);
     prices
         .rows
@@ -1800,8 +1697,7 @@ fn written_at(path: &Path, at: i64) {
 
 /// A TRANSCRIPT PAST THE HORIZON keeps no cursor, though another transcript
 /// of its session is live; written again, it is read from its start, and a
-/// message the home already counted is not counted again. Negative control:
-/// with the home's counted ids forgotten, it is.
+/// message the home already counted is not counted again.
 #[test]
 fn a_transcript_past_the_horizon_lets_its_cursor_go() {
     let run = |label: &str, forget: bool| {
@@ -1833,11 +1729,8 @@ fn a_transcript_past_the_horizon_lets_its_cursor_go() {
         (report.messages, report.duplicates)
     };
     assert_eq!(run("past", false), (1, 1));
-    // NEGATIVE CONTROL.
     assert_eq!(run("past-control", true), (2, 0));
 }
-
-// A Codex conversation
 
 use crate::harness::codex_rollout::fixtures::{context, count, meta};
 
@@ -1889,9 +1782,7 @@ fn rollout(home: &Home, thread: &str) -> PathBuf {
 /// A CODEX TURN AS A MESSAGE: its cached input is a cache read and out of
 /// its input, so no cached token is priced twice, and the prompt a long row
 /// is decided on is OpenAI's `input_tokens`; a cache write, a service tier,
-/// or parts past the input make it approximate. Negative control: a turn
-/// that wrote nothing to the cache, named no tier and whose parts fit is
-/// exact.
+/// or parts past the input make it approximate.
 #[test]
 fn a_codex_turn_maps_into_one_message() {
     use crate::harness::codex_rollout::{Turn, TurnTokens};
@@ -1921,7 +1812,6 @@ fn a_codex_turn_maps_into_one_message() {
     );
     assert!(!m.approx, "NEGATIVE CONTROL: exact");
     assert_eq!(m.tokens.prompt(), 900);
-    // Under the long threshold the base rates, over it the long ones.
     let prices = codex_table();
     let base = (300.0 * 2.0 + 600.0 * 0.2 + 10.0 * 20.0) / 1e6;
     assert!(close(
@@ -1935,7 +1825,6 @@ fn a_codex_turn_maps_into_one_message() {
         prices.message_usd(m.model, &m.tokens).expect("priced"),
         long
     ));
-    // A cache write is a part of the input, and approximate.
     let t = turn(900, 600, 100, false);
     let m = codex_message(&t);
     assert_eq!((m.tokens.input, m.tokens.cache_write), (200, 100));
@@ -1956,8 +1845,6 @@ fn a_codex_turn_maps_into_one_message() {
 /// TWO THREADS SERVED THE SAME COUNTS are two turns (one prompt run twice,
 /// as a script runs `codex exec`, or the lab's stub): their fingerprints
 /// match, and the conversation does not deduplicate across rollouts by it.
-/// Negative control: the two turns' fingerprints are one, so a fold keyed by
-/// that fingerprint alone would count one.
 #[test]
 fn two_threads_served_the_same_counts_each_count() {
     use crate::harness::codex_rollout::{Row, TurnReader};
@@ -1981,7 +1868,6 @@ fn two_threads_served_the_same_counts_each_count() {
         u64::MAX,
     );
     assert_eq!(conversation.turns, 2);
-    // NEGATIVE CONTROL.
     let key = |text: &str| {
         let mut reader = TurnReader::default();
         text.lines()

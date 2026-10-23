@@ -1,46 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE MUSE CODE LIVE UPGRADE, ITS I/O HALF: the quiet flow's one step
-//! ([`upgrade_visit`]) at the idle point the window's host parked its loop at
-//! ([`super::super::super::upgrade_muse_live`] is the pure half, and says
-//! what was measured). For the tab's foreground Muse Code TUI:
-//!
-//! 1. **Behind** ([`behind`]): the build it runs (its mapped executable, a
-//!    store build) against the build the managed twin execs, each by its store
-//!    record's version, in atpkg's revision-aware order; never `--version`.
-//! 2. **The look** ([`look_at`]): no hold, no hand, no unread input and no
-//!    person within the grace; its reader's idle reading (Idle,
-//!    authoritative, no wall — its own background work reads busy) and an
-//!    empty composer; its session's log and its subagents' closed from this
-//!    process's start on (G-M1, G-M2: a turn, a task, a queued item, an
-//!    unreadable or unproved log each hold it); no descendant process at all
-//!    (G-M3). One wait word each ([`upgrade_muse_live::gate`]).
-//! 3. **The build proved to start** (`build_start::proved_named`: `<twin>
-//!    --help`, measured safe in a scratch HOME; a probe out of time — Muse's
-//!    auth lock held elsewhere — is no proof).
-//! 4. **The line planned** before anything ends it: a launch the relaunch
-//!    cannot carry is never restarted (`skip:<why>`).
-//! 5. **The claim** ([`claim_record`], G-M4): the tab's record names the
-//!    process, its session, the twin and the upgrade's cause, in flight, ON
-//!    DISK BEFORE THE SIGNAL — so its `143` and clean `session.end` are the
-//!    upgrade's own restart (`relaunch::ended_by_restart`), carried by the
-//!    host's exit watch, never read as someone's graceful end. A failed write
-//!    waits (`wait:claim-unwritten`) and sends no signal. Then the last
-//!    look again (the same process, its lock still naming it, the gate still
-//!    open), else the record put back as it was (`wait:changed-before-signal`).
-//! 6. **SIGTERM** (`terminate`: one server-side decision that refuses under a
-//!    hold or a person's input within the grace), then **the relaunch**: the
-//!    lane's own (`relaunch_held`: the exit, the shell's prompt, the session's
-//!    lock free, `<twin> … resume <uuid>` typed), adopted by the new process
-//!    that leads the tab, and carried on QUIETLY: nothing is typed after, the
-//!    record done once the session's `.session.lock` names the new process
-//!    (`done:resumed`).
-//!
-//! The ask flow never runs here: `[harness] upgrade_ask` is read by Claude
-//! Code's lane alone, and at a background break (`opts.background`) nothing
-//! of this step acts (`wait:break`). A hand-run sweep (no roster of its own)
-//! moves no Muse Code.
+//! THE MUSE CODE LIVE UPGRADE, ITS I/O HALF: the quiet flow's one step ([`upgrade_visit`]) at the idle point the window's host parked its loop at ([`super::super::super::upgrade_muse_live`] is the pure half, and says what was measured).
 
 use std::path::{Path, PathBuf};
 
@@ -55,18 +16,14 @@ use super::{
     MuseKernel, carry_in_flight_with, composer_empty, key, ledger, mz, plan, relaunch_held,
 };
 
-/// The install word a Muse Code build's start note is filed under
-/// (`build_start::proved_named`): its own, so a Claude Code build of the same
-/// spelling is never another's.
+/// The install word a Muse Code build's start note is filed under (`build_start::proved_named`): its own, so a Claude Code build of the same spelling is never another's.
 pub(super) const SOURCE: &str = "muse-managed";
 
 /// The wait word of a step at the agent's background break: nothing ends a
 /// Muse Code there (the restart is the next idle point's).
 const AT_BREAK: &str = "wait:break";
 
-/// The foreground leader of tab `tab` by the host's roster (`tabs`), where it
-/// is a Muse Code: its pid. A leader whose program cannot be read, or that is
-/// no `muse`, is not this lane's (`None`).
+/// The foreground leader of tab `tab` by the host's roster (`tabs`), where it is a Muse Code: its pid.
 pub(super) fn leader(tabs: &[LiveTab], tab: &str, k: &dyn MuseKernel) -> Option<u32> {
     let pid = u32::try_from(tabs.iter().find(|t| t.sid == tab)?.fgpgid?).ok()?;
     let named = |p: &Path| p.file_name().and_then(|n| n.to_str()) == Some(mz::PROGRAM);
@@ -77,14 +34,12 @@ pub(super) fn leader(tabs: &[LiveTab], tab: &str, k: &dyn MuseKernel) -> Option<
     muse.then_some(pid)
 }
 
-/// A move owed: the version the running build's record names, the twin's
-/// build's, and the twin a relaunch types.
+/// A move owed: the version the running build's record names, the twin's build's, and the twin a relaunch types.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Move {
     /// The running build's version (its store record).
     pub(super) running: String,
-    /// The twin's build's version (its store record): newer by
-    /// [`live::moves_onto`].
+    /// The twin's build's version (its store record): newer by [`live::moves_onto`].
     pub(super) target: String,
     /// The managed twin (`<prefix>/agents/muse`) the relaunch types.
     pub(super) twin: PathBuf,
@@ -98,12 +53,7 @@ fn build_record(exe: &Path) -> Option<String> {
     live::build_version(&version, Some(dir)).map(|_| version)
 }
 
-/// THE MOVE `exe` (the running Muse Code's mapped executable) IS OWED onto
-/// the build the managed twin `twin` execs: `Ok(Some)` where the twin's
-/// build is strictly newer by atpkg's revision-aware order of their store
-/// records; `Ok(None)` for a process run from no store build (another
-/// install: nothing managed moves it), no twin, or a build not newer;
-/// `Err(word)` where a record cannot be read (`no-version`).
+/// THE MOVE `exe` (the running Muse Code's mapped executable) IS OWED onto the build the managed twin `twin` execs: `Ok(Some)` where the twin's build is strictly newer by atpkg's revision-aware order of their store records; `Ok(None)` for a process run from no store build (another install: nothing managed moves it), no twin, or a build not newer; `Err(word)` where a record cannot be read (`no-version`).
 pub(super) fn behind(exe: &Path, twin: Option<PathBuf>) -> Result<Option<Move>, &'static str> {
     if !mz::store_build(exe) {
         return Ok(None);
@@ -126,11 +76,7 @@ pub(super) fn behind(exe: &Path, twin: Option<PathBuf>) -> Result<Option<Move>, 
     }))
 }
 
-/// [`super::super::due`]'s answer for a tab a Muse Code leads (`None`: not
-/// this lane's tab): `Yes` while its build is behind the twin's, `No` when
-/// current (or no TUI, or no managed build), `Unread` where its process or a
-/// build record cannot be read. A relaunch of this tab in flight is
-/// [`super::super::in_flight`]'s, asked before.
+/// [`super::super::due`]'s answer for a tab a Muse Code leads (`None`: not this lane's tab): `Yes` while its build is behind the twin's, `No` when current (or no TUI, or no managed build), `Unread` where its process or a build record cannot be read.
 pub(in super::super) fn upgrade_due(opts: &Opts, tabs: &[LiveTab]) -> Option<Due> {
     upgrade_due_with(
         opts,
@@ -165,19 +111,14 @@ pub(super) fn upgrade_due_with(
     })
 }
 
-/// Whether a Muse Code leads tab `opts.only_sid` ([`super::super::note_behind`]'s
-/// lane answer): its lane mints no ladder state (the quiet flow has none), so
-/// nothing is noted for it.
+/// Whether a Muse Code leads tab `opts.only_sid` ([`super::super::note_behind`]'s lane answer): its lane mints no ladder state (the quiet flow has none), so nothing is noted for it.
 pub(in super::super) fn leads(opts: &Opts, tabs: &[LiveTab]) -> bool {
     opts.only_sid
         .as_deref()
         .is_some_and(|tab| leader(tabs, tab, &super::super::Live).is_some())
 }
 
-/// The Muse Code lane's share of one sweep ([`super::super::lanes`]): the
-/// quiet flow's step for tab `opts.only_sid`, where a Muse Code leads it by
-/// the host's own roster. A pass with no roster of its own (the CLI's sweep)
-/// moves no Muse Code.
+/// The Muse Code lane's share of one sweep ([`super::super::lanes`]): the quiet flow's step for tab `opts.only_sid`, where a Muse Code leads it by the host's own roster.
 pub(in super::super) fn upgrade_pass(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> {
     let Some(tabs) = live_tabs else {
         return Vec::new();
@@ -206,14 +147,7 @@ fn modified_us(meta: &std::fs::Metadata) -> Option<u64> {
 /// A second's slack on a file's clock against the log's own.
 const CLOCK_SLACK_US: u64 = 1_000_000;
 
-/// G-M1 AND G-M2 OVER THE SESSION'S LOGS (the session's `.session.lock` is
-/// `lock`; the process `pid`, started at `started_ms` by the kernel): its own
-/// `session.jsonl`, this process's part of it ([`live::quiet_log`]), then
-/// every `subagent/<id>/session.jsonl` beside it from that part's start on
-/// ([`live::open_work`]). A subagent whose log is older than the part holds
-/// nothing of this process; one that cannot be read — and a session log that
-/// cannot — is [`Open::Unreadable`]: FAIL CLOSED. No kernel start
-/// (`started_ms` 0) proves no part ([`Open::Unproved`]).
+/// G-M1 AND G-M2 OVER THE SESSION'S LOGS (the session's `.session.lock` is `lock`; the process `pid`, started at `started_ms` by the kernel): its own `session.jsonl`, this process's part of it ([`live::quiet_log`]), then every `subagent/<id>/session.jsonl` beside it from that part's start on ([`live::open_work`]).
 pub(super) fn log_look(lock: &Path, pid: u32, started_ms: u64) -> Result<(), Open> {
     if started_ms == 0 {
         return Err(Open::Unproved);
@@ -236,8 +170,6 @@ pub(super) fn log_look(lock: &Path, pid: u32, started_ms: u64) -> Result<(), Ope
         match std::fs::metadata(&sub_log) {
             Ok(meta) if older(&meta) => continue,
             Ok(_) => {}
-            // No log: a subagent of an earlier process holds nothing of this
-            // one; one made since is unproved, and fails closed.
             Err(_) => match std::fs::metadata(&path) {
                 Ok(meta) if older(&meta) => continue,
                 _ => return Err(Open::Unreadable),
@@ -249,25 +181,14 @@ pub(super) fn log_look(lock: &Path, pid: u32, started_ms: u64) -> Result<(), Ope
     Ok(())
 }
 
-/// G-M1'S SCREEN HALF: whether Muse Code's own reader reads `rows` as the
-/// quiet restart's idle point — Idle AUTHORITATIVELY and no wall. A turn its
-/// reader cannot place, one that ended on a fault (`A configuration problem
-/// stopped this turn.`), and the screen Muse leaves as it exits read `(Idle,
-/// false)`; a final server error, a refused key and the sign-in wall read
-/// idle WITH A WALL (measured fixtures). Either way a message only a person
-/// can act on stands there, and a restart would bury it under the resumed
-/// screen. Its own background panel reads busy (`aterm_phase::muse::phase`).
+/// G-M1'S SCREEN HALF: whether Muse Code's own reader reads `rows` as the quiet restart's idle point — Idle AUTHORITATIVELY and no wall.
 #[must_use]
 pub(super) fn screen_idle(rows: &[String]) -> bool {
     aterm_phase::muse::phase(rows) == (aterm_phase::Phase::Idle, true)
         && aterm_phase::muse::wall(rows).is_none()
 }
 
-/// THE LOOK FROM WHAT WAS READ: the person's hold, the screen's rows
-/// (`None`: unread, which reads neither idle nor empty), its composer's
-/// emptiness (asked only of a screen that was read), the session's logs and
-/// the process's descendants. The one composition [`look_at`] makes and the
-/// Tier-1 bind replays.
+/// THE LOOK FROM WHAT WAS READ: the person's hold, the screen's rows (`None`: unread, which reads neither idle nor empty), its composer's emptiness (asked only of a screen that was read), the session's logs and the process's descendants.
 #[must_use]
 pub(super) fn look_of(
     held: bool,
@@ -285,10 +206,7 @@ pub(super) fn look_of(
     }
 }
 
-/// THE LOOK AT MUSE CODE `pid` IN `tab` the quiet flow's gate takes
-/// ([`live::gate`]): the hold and the person (`held`, under the grace), the
-/// screen by Muse's own reader ([`screen_idle`]) and its composer, the
-/// session's logs ([`log_look`]) and its descendants ([`look_of`]).
+/// THE LOOK AT MUSE CODE `pid` IN `tab` the quiet flow's gate takes ([`live::gate`]): the hold and the person (`held`, under the grace), the screen by Muse's own reader ([`screen_idle`]) and its composer, the session's logs ([`log_look`]) and its descendants ([`look_of`]).
 pub(super) fn look_at(
     opts: &Opts,
     c: &mut Client,
@@ -309,14 +227,7 @@ pub(super) fn look_at(
     )
 }
 
-/// THE CLAIM (G-M4): the record the quiet restart writes BEFORE its SIGTERM,
-/// from the snapshot `snap` of the Muse Code it ends and the move `mv` — the
-/// process, its shell and tab, its session and the homes its line carries,
-/// its launch's argv and its session's workspace, the twin, the versions,
-/// and the UPGRADE'S cause (empty: [`super::super::super::relaunch::ends_its_agent`]),
-/// in flight ([`Phase::Exiting`]) and quiet: what makes its exit the
-/// upgrade's own (`relaunch::ended_by_restart`) and what the relaunch plans
-/// its line from. `None` for a snapshot of no Muse Code or with no session.
+/// THE CLAIM (G-M4): the record the quiet restart writes BEFORE its SIGTERM, from the snapshot `snap` of the Muse Code it ends and the move `mv` — the process, its shell and tab, its session and the homes its line carries, its launch's argv and its session's workspace, the twin, the versions, and the UPGRADE'S cause (empty: [`super::super::super::relaunch::ends_its_agent`]), in flight ([`Phase::Exiting`]) and quiet: what makes its exit the upgrade's own (`relaunch::ended_by_restart`) and what the relaunch plans its line from.
 pub(super) fn claim_record(
     snap: &super::super::super::relaunch::Snapshot,
     mv: &Move,
@@ -338,7 +249,6 @@ pub(super) fn claim_record(
         from: mv.running.clone(),
         to: mv.target.clone(),
         source: "managed".to_string(),
-        // The upgrade's own: ends its agent ([`relaunch::ends_its_agent`]).
         cause: String::new(),
         quiet: true,
         salt: now,
@@ -352,17 +262,7 @@ fn lock_names(lock: &Path, pid: u32) -> bool {
     std::fs::read_to_string(lock).is_ok_and(|body| mz::lock_pid(&body) == Some(pid))
 }
 
-/// THE QUIET FLOW'S STEP for tab `opts.only_sid` over the host's roster
-/// `tabs` (the module's steps 1–6), the twin `twin` and the kernel `k`.
-/// `None`: no Muse Code leads the tab and none of its relaunches is in
-/// flight there (not this lane's). The words:
-/// `current` (nothing newer, or nothing managed); `wait:<why>` (the gate's,
-/// the build's proof, the socket, the claim's last look, the signal's
-/// refusal, `break` at a background break); `skip:<why>` (a launch no
-/// relaunch carries, a tab's own program); `terminated` once signalled and
-/// the relaunch's own words after it (`adopted`, `done:resumed`, a wait the
-/// host's exit watch carries on); a relaunch of this tab in flight is
-/// carried by the lane's own rules.
+/// THE QUIET FLOW'S STEP for tab `opts.only_sid` over the host's roster `tabs` (the module's steps 1–6), the twin `twin` and the kernel `k`.
 #[allow(clippy::too_many_lines)]
 pub(super) fn upgrade_visit(
     opts: &Opts,
@@ -380,11 +280,6 @@ pub(super) fn upgrade_visit(
         to: "-".to_string(),
         step: String::new(),
     };
-    // A relaunch of this tab in flight — the upgrade's own, or a crash's —
-    // is carried by its lane's rules, never begun again, WHOEVER LEADS THE
-    // TAB NOW: between the SIGTERM and the typed line its shell does, and a
-    // successor carrying the restart across a hand-off of aterm's own
-    // ([`super::super::in_flight`] lists it) meets it there.
     if let Some(st) =
         load(opts, &session_key).filter(|st| st.agent == Agent::Muse && st.in_flight())
     {
@@ -418,7 +313,6 @@ pub(super) fn upgrade_visit(
     if opts.background {
         return Some(said(r, AT_BREAK));
     }
-    // Its shell's foreground job, else nothing would take the terminal back.
     let shell = match super::super::foreground_shell(k.job(pid)) {
         Ok(shell) => shell,
         Err("not-a-shell-job") => return Some(said(r, "skip:not-a-shell-job")),
@@ -448,8 +342,6 @@ pub(super) fn upgrade_visit(
     let Some(mut st) = claim_record(&snap, &mv, now) else {
         return Some(said(r, "wait:no-session"));
     };
-    // The line the relaunch types, planned before anything ends the agent: a
-    // launch it cannot carry is never restarted.
     match plan(opts, &st, k) {
         Ok(_) => {}
         Err(super::NoPlan::Wait(why)) => return Some(said(r, format!("wait:{why}"))),
@@ -461,9 +353,6 @@ pub(super) fn upgrade_visit(
     if opts.dry_run {
         return Some(said(r, "would-restart"));
     }
-    // The harness's hand on the tab from the last look to the relaunched
-    // Muse's first idle point: no other writer lands in the dying agent or
-    // the bare shell.
     let Some(mut hand) = Hand::take(&mut c, &tab) else {
         return Some(said(r, "wait:held"));
     };
@@ -472,9 +361,6 @@ pub(super) fn upgrade_visit(
         hand.give_back(&mut c);
         return Some(said(r, "wait:claim-unwritten"));
     }
-    // THE LAST LOOK, the claim on disk: the same process, its session's lock
-    // still naming it, still its shell's foreground job in this tab, and the
-    // gate still open.
     let still = k.alive(pid)
         && k.process_start(pid)
             .map(|s| super::super::squash(&s))

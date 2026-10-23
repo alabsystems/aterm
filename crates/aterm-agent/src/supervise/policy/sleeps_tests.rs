@@ -30,11 +30,7 @@ fn stamp(asleep: Duration, boot: Option<[u8; 16]>) -> SleepStamp {
 /// upper-case, Linux's `boot_id` lower-case) reads as the same boot, so a
 /// count a row of either case carries compares with this loop's, and each is
 /// written back in its own case — this host's boot in this host's kernel's
-/// ([`Boot::kernel`]). NEGATIVE CONTROL: the all-zero id a damaged answer
-/// reads as, a digit short, a stray character and the name a test once used
-/// are no boot at all — two counts both read from the all-zero text compare
-/// as no boot, where comparing the text would have called them one and
-/// counted the sleep between them.
+/// ([`Boot::kernel`]).
 #[test]
 fn a_boot_is_its_bytes_however_a_row_spelled_it() {
     let upper = "4D5A1B2C-3E4F-5061-7283-94A5B6C7D8E9";
@@ -108,7 +104,7 @@ fn a_boot_is_its_bytes_however_a_row_spelled_it() {
 /// that wrote the kernel's text into a row read it (`sysctl -n
 /// kern.bootsessionuuid` on macOS, `/proc/sys/kernel/random/boot_id` on
 /// Linux) — so such a build, which compares the text, matches a row this one
-/// writes. The wait is a hang detector.
+/// writes.
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
 #[test]
 fn this_hosts_boot_is_written_as_its_kernel_spells_it() {
@@ -130,12 +126,7 @@ fn this_hosts_boot_is_written_as_its_kernel_spells_it() {
 /// A SLEEP PLACED EXACTLY IS WHOLLY INSIDE A SPAN OR NONE OF IT: a turn
 /// begins and ends awake, so a 30-minute sleep the system's record places is
 /// all inside a span that holds it, and none inside one that holds half of
-/// it (the span reaches past the turn) or none. Known only to lie in a
-/// window an hour long, it may lie inside as far as the span's stretch of
-/// that window reaches. THE LEAST that must lie inside a span: all of a
-/// placed sleep's stretch inside it; of the unplaced one, what the window
-/// outside the span cannot hold — none of it where the window outside is as
-/// long as the sleep.
+/// it (the span reaches past the turn) or none.
 #[test]
 fn a_sleep_placed_exactly_is_wholly_inside_a_span_or_none_of_it() {
     let exact = Sleep {
@@ -176,27 +167,19 @@ fn a_sleep_placed_exactly_is_wholly_inside_a_span_or_none_of_it() {
 /// the Mac asleep 30 minutes from its Enter (`30m 3s`) held the sleep; ten
 /// minutes of work before the same sleep (`10m 0s`, ended as the Mac went to
 /// sleep) held none of it; the done row's minute widens the span by its
-/// minute; a span is never read as more sleep than it is long. NEGATIVE
-/// CONTROL: an empty book reads every span whole.
+/// minute; a span is never read as more sleep than it is long.
 #[test]
 fn a_turns_span_holds_the_sleep_that_lies_inside_it() {
     let mut book = SleepBook::default();
     assert_eq!(book.in_turn(mins(40), T, T), InTurn::default(), "CONTROL");
-    // The Mac asleep from T + 1 s for 30 minutes, measured between the
-    // loop's reads at T + 1 s and T + 30 min + 2 s.
     book.add(mins(30), T + 1000, T + 30 * MIN + 2000);
     let answered = Duration::from_secs(30 * 60 + 3);
     let end = T + 30 * MIN + 3000;
     assert_eq!(book.in_turn(answered, end, end).most, mins(30));
-    // Ten minutes of work that ended as the Mac went to sleep.
     assert_eq!(book.in_turn(mins(10), T, T), InTurn::default());
-    // The done row's clock names T's minute only: up to a minute of the
-    // sleep may lie inside the span, and no more — and none must.
     let read = book.in_turn(mins(10), T, T + 59_000);
     assert!(read.most <= Duration::from_secs(59), "{read:?}");
     assert_eq!(read.least, Duration::ZERO);
-    // Never more than the span: two sleeps that may each fill a 20-minute
-    // span hold 20 minutes of it.
     book.add(mins(30), T + 40 * MIN, T + 75 * MIN);
     book.add(mins(30), T + 45 * MIN, T + 80 * MIN);
     assert_eq!(
@@ -208,12 +191,7 @@ fn a_turns_span_holds_the_sleep_that_lies_inside_it() {
 /// A SLEEP THAT ENDED BEFORE A TURN BEGAN IS NO PART OF IT: the Mac slept
 /// eight hours, the system's record placing it; a person woke it and pressed
 /// Enter five seconds after the wake, and their turn worked 620 s, its done
-/// row naming the minute it ended 30 s into. That minute's span reaches back
-/// 25 s into the sleep, but a turn begins and ends awake: the sleep is
-/// wholly outside it. Read as far as the span reached, 25 s of it were taken
-/// off the turn: a 595 s turn, a person's own exchange, where it was a job.
-/// CONTROL: the Enter five seconds before the same sleep, the done row
-/// counting it, holds it all.
+/// row naming the minute it ended 30 s into.
 #[test]
 fn a_sleep_that_ended_before_a_turn_began_is_no_part_of_it() {
     let woke = T;
@@ -238,16 +216,7 @@ fn a_sleep_that_ended_before_a_turn_began_is_no_part_of_it() {
 
 /// THE LEAST SLEEP THAT MUST LIE INSIDE A TURN, for whether a person's
 /// keystroke is inside it ([`InTurn::least`]), where the most that can is
-/// for the work it is judged by ([`InTurn::most`]). A sleep the ledger
-/// counts but cannot place, an hour somewhere in ten, may lie wholly inside
-/// a 328 s turn there, and none of it must; one that filled all but ten
-/// minutes of those ten hours must fill all but ten minutes of a 30-minute
-/// turn (to the done row's second); a sleep placed exactly inside a turn must lie inside it. The done
-/// row shows a span past an hour to the minute (`9h 0m`): a turn that
-/// worked 9h 0m 20s from an Enter 10 s before an eight-hour sleep, ending
-/// at the start of its minute, holds the sleep — its span read as the row
-/// shows it, the sleep began before it. The least is never more than the
-/// most.
+/// for the work it is judged by ([`InTurn::most`]).
 #[test]
 fn a_turn_holds_at_least_the_sleep_that_must_lie_inside_it() {
     let act = T;
@@ -293,16 +262,12 @@ fn a_turn_holds_at_least_the_sleep_that_must_lie_inside_it() {
 /// THE SLEEP BEFORE A LOOP'S FIRST LOOK: the system's last sleep is placed
 /// exactly; the ledger's count since the last act, on the same boot, is that
 /// sleep where it fell since the act, and the rest lies between the act and
-/// it. So a follower attached after one sleep since the act places it
-/// exactly (nothing more is written); after two, the earlier lies before
-/// the last; with no record of the system's (Linux), the whole count lies
-/// between the act and the look.
+/// it.
 #[test]
 fn a_followers_take_up_places_what_the_system_and_the_ledger_say() {
     let act = T;
     let look = T + 60 * MIN;
     let then = stamp(mins(100), Some(BOOT_A));
-    // One sleep since the act, 30 minutes, the system's last.
     let mut one = SleepBook::default();
     let last = Some((T + 5 * MIN, T + 35 * MIN));
     let took = one.take_up(
@@ -321,7 +286,6 @@ fn a_followers_take_up_places_what_the_system_and_the_ledger_say() {
             to_ms: T + 35 * MIN
         }]
     );
-    // Two: 10 minutes more, before the last.
     let mut two = SleepBook::default();
     two.take_up(
         look,
@@ -344,7 +308,6 @@ fn a_followers_take_up_places_what_the_system_and_the_ledger_say() {
             }
         ]
     );
-    // No system record: the count lies between the act and the look.
     let mut counted = SleepBook::default();
     counted.take_up(
         look,
@@ -367,8 +330,6 @@ fn a_followers_take_up_places_what_the_system_and_the_ledger_say() {
 /// count), a count on another boot, a boot neither names, a machine that
 /// keeps no count; the system's last sleep is still placed (it needs no
 /// ledger), and one that ended after the look (no sleep before it) is not.
-/// NEGATIVE CONTROL: the same count on the same boot writes the sleep, and
-/// says nothing is unknown.
 #[test]
 fn a_take_up_with_nothing_to_say_keeps_the_reading_as_it_was() {
     let act = T;

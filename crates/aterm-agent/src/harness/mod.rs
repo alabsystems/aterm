@@ -86,6 +86,7 @@ pub(crate) fn one_line(text: &str, max: usize) -> String {
 }
 
 /// Whether [`one_line`] would hand `text` back as it is: printable ASCII, no
+/// space at either end and no two together.
 fn is_one_line_already(text: &str) -> bool {
     let mut spaced = true;
     for &b in text.as_bytes() {
@@ -101,6 +102,9 @@ fn is_one_line_already(text: &str) -> bool {
 struct FakeInstanceLease;
 
 /// How many fixtures may be open at once ([`FakeInstanceLease`]): four under
+/// a soft descriptor limit below a thousand — macOS's default is 256, and the
+/// 18-worker suite peaked at 226 descriptors with no bound — and no bound
+/// where the process may hold a thousand or more.
 #[cfg(all(test, unix))]
 fn fake_instance_bound() -> usize {
     static BOUND: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -350,6 +354,8 @@ mod alab_marker_cross_tests;
 #[cfg(test)]
 pub(crate) mod host_path {
     /// `posix`, a test's absolute POSIX path, as one this host reads as
+    /// absolute: itself on Unix, on Windows the same path on drive `C:`
+    /// (`/s/main.1` is `C:/s/main.1`, its separators kept).
     pub(crate) fn abs(posix: &str) -> String {
         debug_assert!(
             posix.starts_with('/'),
@@ -363,6 +369,8 @@ pub(crate) mod host_path {
     }
 
     /// `path` as the inside of a JSON string (its quotes not included), as
+    /// Claude Code and Codex write a path: a Windows path's backslashes
+    /// escaped.
     pub(crate) fn json(path: &std::path::Path) -> String {
         let quoted = aterm_json::to_string(&path.display().to_string()).expect("a string");
         quoted[1..quoted.len() - 1].to_owned()

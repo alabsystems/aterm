@@ -26,16 +26,21 @@ pub use crate::io::encode_for_disk;
 
 pub const DEFAULT_DOCUMENT_LIMIT: usize = 32 * 1024 * 1024;
 /// Saves and their proof observations share the document open/refresh ceiling, so Manual
+/// can still open and repair a config above the 512 KiB semantic-admission cap; only a
+/// buffer grown past this limit is refused at save preflight.
 const MAX_ATOMIC_SAVE_BYTES: usize = DEFAULT_DOCUMENT_LIMIT;
 /// [`DEFAULT_DOCUMENT_LIMIT`] as a byte count the contracted predicates compare.
 const DOCUMENT_LIMIT_LEN: u64 = DEFAULT_DOCUMENT_LIMIT as u64;
 const _: () =
     assert!(DOCUMENT_LIMIT_LEN == 33_554_432 && MAX_ATOMIC_SAVE_BYTES == DEFAULT_DOCUMENT_LIMIT);
 /// The most a bounded read reserves before it reads: the sentinel byte of a
+/// read at the document limit.
 const READ_RESERVE_CEILING: usize = DEFAULT_DOCUMENT_LIMIT + 1;
 
 trust_contract_fn! {
     /// Whether `len` bytes are past the document limit (32 MiB,
+    /// [`DEFAULT_DOCUMENT_LIMIT`]), which no save may write: the preflight
+    /// refuses such a buffer before it takes the lock.
     #[must_use]
     fn exceeds_document_limit(len: u64) -> bool
     clauses [ensures result == (len > 33554432) by exceeds_document_limit_is_threshold]
@@ -115,13 +120,14 @@ pub struct AtomicFileTarget {
 }
 
 /// One additional spelling admitted for a canonical document already open in
+/// this process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LogicalPathBinding {
     logical_path: PathBuf,
     logical_symlinks: Vec<LogicalSymlinkBinding>,
 }
 
-/// Stable identity of one admitted symlink in a config path. `path` and `destination`
+/// Stable identity of one admitted symlink in a config path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LogicalSymlinkBinding {
     path: PathBuf,
@@ -234,6 +240,10 @@ pub enum AtomicCommitResult {
 }
 
 /// A failed step of a commit: its account, for a log, and the I/O error
+/// behind it with what the step was doing ([`SaveCause`]), which is what a
+/// caller words for a person (a folder that is not writable, a full disk);
+/// `None` is a refusal of the step's own (a hostile lock entry, a target
+/// with no parent, an observation that moved).
 #[derive(Debug)]
 struct StepFailure {
     message: String,
@@ -373,6 +383,8 @@ pub fn admit_local_file_opts(
 }
 
 /// A missing document is created in a directory that exists: a first save
+/// writes one file and never makes the directories above it, and fails if the
+/// directory is gone by then ([`Directories::Existing`]).
 fn require_existing_directory(path: &Path) -> Result<(), DocumentHostError> {
     let Some(parent) = path.parent() else {
         return Err(DocumentHostError::NotAFile);
@@ -448,6 +460,8 @@ pub enum DocumentHostError {
     SymlinkComponent {
         path: PathBuf,
         /// The link names no file: the final component of a path to open
+        /// is a symbolic link whose target does not exist ([`open_path`]),
+        /// not a link met on the way to a file (which a retry may pass).
         dangling: bool,
     },
     TargetRetargeted,
@@ -459,6 +473,7 @@ pub enum DocumentHostError {
 }
 
 /// How a refused read of a file that is not there ends its message; the one
+/// spelling [`DocumentHostError::refusal_word`] reads `missing` from.
 const MISSING_SUFFIX: &str = " does not exist";
 
 impl DocumentHostError {
@@ -560,6 +575,7 @@ struct DocumentPersistence {
 struct ObservedDocumentImage {
     version: ObservedFileVersion,
     /// The text as the document holds it, which `version`'s encoding maps to
+    /// the file's bytes.
     bytes: Arc<[u8]>,
     /// The text a fresh read of those bytes admits, where it is not `bytes`.
     reread: Option<Arc<[u8]>>,
@@ -576,6 +592,7 @@ impl ObservedDocumentImage {
     }
 
     /// Whether `text` is this version's text, as the document holds it or as a
+    /// fresh read of its bytes gives it: either way the same file bytes.
     fn holds(&self, text: &str) -> bool {
         self.bytes.as_ref() == text.as_bytes() || self.reread.as_deref() == Some(text.as_bytes())
     }
@@ -587,6 +604,7 @@ impl ObservedDocumentImage {
 }
 
 /// Which texts an observation of the same bytes keeps the document's reading
+/// and mapping for ([`DocumentPersistenceStore::accept_observation`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SameReading {
     /// The document's reading or a fresh read's: the buffer is left as it is.
@@ -596,6 +614,7 @@ enum SameReading {
 }
 
 /// The text admission reads back from the bytes a document holding `text`
+/// with `encoding` saves, when that is not `text` itself.
 fn fresh_reading(text: &[u8], encoding: DiskEncoding) -> Option<Arc<[u8]>> {
     let unmarked_mark = !encoding.bom && text.starts_with(&crate::io::UTF8_BOM);
     let held_crlf = matches!(encoding.eol, crate::io::LineEnding::Lf)
@@ -1002,6 +1021,8 @@ pub fn execute_granted_save(grant: &DocumentGrant, plan: &SavePlan) -> AtomicSav
 }
 
 /// A file's bytes as its buffer holds them ([`Decoded`]): the byte order mark
+/// comes off and is remembered, the rest must be UTF-8, and a file whose every
+/// line break is CRLF is held with LF ([`Decoded::hold`]).
 fn decode_utf8(bytes: Vec<u8>) -> Result<Decoded, DocumentHostError> {
     // The BOM arm decodes the bytes after the mark into a new String rather than
     if let [b0, b1, b2, text @ ..] = bytes.as_slice()
@@ -1016,6 +1037,7 @@ fn decode_utf8(bytes: Vec<u8>) -> Result<Decoded, DocumentHostError> {
 
 trust_contract_fn! {
     /// Whether a file's first three bytes are the UTF-8 byte order mark, EF BB BF
+    /// (U+FEFF), the one prefix admission takes off before the text is decoded.
     #[must_use]
     fn is_utf8_bom(b0: u8, b1: u8, b2: u8) -> bool
     clauses [ensures result == (b0 == 239 && (b1 == 187 && b2 == 191)) by is_utf8_bom_is_ef_bb_bf]
@@ -1039,6 +1061,8 @@ pub fn file_uri_path(uri: &str) -> Result<PathBuf, DocumentHostError> {
 }
 
 /// RFC 8089 drive paths carry one URI root slash (`/C:/...`) which is not a
+/// Windows path root; [`amacs::protocol::uri::windows_drive_path_text`] holds
+/// the rule, which `file_uri_path` applies on Windows.
 #[cfg(test)]
 fn windows_file_uri_path_text(decoded: &str) -> Result<String, DocumentHostError> {
     amacs::protocol::uri::windows_drive_path_text(decoded).map_err(DocumentHostError::from)
@@ -1162,7 +1186,7 @@ fn open_regular_read(path: &Path) -> Result<RegularReadHandle, DocumentHostError
     Ok(RegularReadHandle::Open { file, metadata })
 }
 
-/// Classify one failed `read(2)` on an already-open regular file. `EDEADLK` is
+/// Classify one failed `read(2)` on an already-open regular file.
 fn read_error(path: &Path, error: std::io::Error) -> DocumentHostError {
     #[cfg(unix)]
     if error.raw_os_error() == Some(libc::EDEADLK) {
@@ -1360,6 +1384,7 @@ fn normalize_process_temp_root(path: &Path) -> Result<PathBuf, DocumentHostError
 }
 
 /// Walk one absolute path component by component and hand every component that exists to
+/// `visit`, with its `symlink_metadata`.
 fn walk_path_components<F>(path: &Path, mut visit: F) -> Result<(), DocumentHostError>
 where
     F: FnMut(&Path, &fs::Metadata) -> Result<(), DocumentHostError>,
@@ -1389,6 +1414,7 @@ where
 }
 
 /// Whether a failure to stat a *root* component should be walked past instead of
+/// failing the admission.
 #[cfg(windows)]
 fn root_stat_is_tolerable(error: &std::io::Error) -> bool {
     const ERROR_INVALID_FUNCTION: i32 = 1;
@@ -1417,6 +1443,7 @@ fn reject_symlink_components(path: &Path) -> Result<(), DocumentHostError> {
 }
 
 /// Collect every existing symbolic-link component in the caller's logical
+/// spelling.
 fn logical_symlink_bindings(path: &Path) -> Result<Vec<LogicalSymlinkBinding>, DocumentHostError> {
     let mut bindings = Vec::new();
     walk_path_components(path, |prefix, metadata| {
@@ -1515,6 +1542,7 @@ pub fn observe_file(path: &Path, content_limit: usize) -> Result<ObservedFileVer
 }
 
 /// [`observe_file`], its failure keeping the I/O error behind a refused read
+/// for a commit to report ([`StepFailure::read`]).
 fn observe_target(path: &Path, content_limit: usize) -> Result<ObservedFileVersion, StepFailure> {
     let opened = open_regular_read(path).map_err(|error| StepFailure::read(&error))?;
     let RegularReadHandle::Open { mut file, metadata } = opened else {
@@ -1622,6 +1650,7 @@ fn write_lock_not_regular(path: &Path) -> String {
 }
 
 /// The save lock every commit of `path` (in `parent`) takes, a hidden
+/// sibling of it.
 fn save_lock_path(path: &Path, parent: &Path) -> PathBuf {
     let name = path.file_name().unwrap_or_else(|| OsStr::new("document"));
     parent.join(format!(".{}.aterm-write.lock", name.to_string_lossy()))
@@ -1633,6 +1662,7 @@ pub fn save_lock_of(path: &Path) -> Option<PathBuf> {
 }
 
 /// What a failed open of the save lock at `path` was doing: opening the lock
+/// already there (another user's, say), or making it in the folder.
 fn lock_open_touch(path: &Path) -> SaveTouch {
     if fs::symlink_metadata(path).is_ok() {
         SaveTouch::Lock
@@ -1642,6 +1672,7 @@ fn lock_open_touch(path: &Path) -> SaveTouch {
 }
 
 /// Open one sibling write lock without following or waiting on its final
+/// component.
 #[cfg(unix)]
 fn open_write_lock(path: &Path) -> Result<File, StepFailure> {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -1796,8 +1827,9 @@ pub fn commit_atomic_bytes_ordered(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Directories {
     /// Make any that are missing: a config file belongs where its folder does
+    /// (`~/.config/aterm`), which the first write may have to make.
     Create,
-    /// Make none: a document's save writes its one file. A missing directory
+    /// Make none: a document's save writes its one file.
     Existing,
 }
 
@@ -1892,6 +1924,7 @@ impl Drop for HeldAdvisoryLock {
 }
 
 /// The save path's rendering of [`acquire_advisory_lock_within`]: same loop, same
+/// rules, this module's vocabulary.
 fn acquire_write_lock_within(
     lock_file: File,
     budget: std::time::Duration,
@@ -1918,6 +1951,7 @@ fn acquire_write_lock(lock_file: File) -> Result<HeldAdvisoryLock, StepFailure> 
 const PREFLIGHT_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Take the write lock and prove the target is still the generation the plan was built
+/// on.
 fn lock_and_verify_target(
     baseline: &AtomicFileBaseline,
     directories: Directories,
@@ -2368,6 +2402,7 @@ mod tests {
     }
 
     /// A well-formed URI of a missing file, absolute on the host (`/definitely/…` is not
+    /// absolute on Windows, where it would fail as `NotAbsolute` instead).
     const MISSING_DOC_URI: &str = if cfg!(windows) {
         // /C:/definitely/missing/aterm-doc.md"
         "file:///C:/definitely/missing/aterm-doc.md"
@@ -2377,6 +2412,7 @@ mod tests {
     };
 
     /// The walk admits a canonicalized path, whose first component on Windows is the
+    /// verbatim prefix `\\?\C:` that must not be stat-ed (`walk_path_components`).
     #[test]
     fn component_walk_admits_a_canonicalized_path() {
         let path = unique_file("canonical-walk", b"walk\n");
@@ -2395,6 +2431,7 @@ mod tests {
     }
 
     /// `normalize_process_temp_root` hands the walk an already-canonical path too, so a
+    /// temp-rooted document (this module's fixtures included) must be admitted end to end.
     #[test]
     fn component_walk_admits_a_process_temporary_root_path() {
         let path = unique_file("temporary-walk", b"walk\n");
@@ -2425,6 +2462,7 @@ mod tests {
     }
 
     /// One document opened the way a face opens one: admitted, granted for
+    /// writing, held in a store and registered for saving.
     struct OpenDocument {
         grants: DocumentGrantStore,
         persistence: DocumentPersistenceStore,
@@ -2499,6 +2537,7 @@ mod tests {
     }
 
     /// `amacs NEWFILE` and `create=1`: a missing file admits as an empty text
+    /// and nothing touches the disk until the first save, which creates it.
     #[test]
     fn missing_with_allow_missing_is_empty_and_first_save_creates() {
         let path = unique_file("allow-missing", b"");
@@ -2535,6 +2574,7 @@ mod tests {
     }
 
     /// The first save's baseline is "no file": a file another writer created
+    /// since the admission is a conflict, and is left as that writer left it.
     #[test]
     fn first_save_refuses_if_the_file_appeared() {
         let path = unique_file("missing-then-appeared", b"");
@@ -2551,6 +2591,7 @@ mod tests {
     }
 
     /// Without `allow_missing` a missing file is refused as before; with it, a
+    /// missing DIRECTORY still is, since a save makes one file and no folders.
     #[test]
     fn missing_without_allow_missing_is_refused() {
         let path = unique_file("missing-refused", b"");
@@ -2609,6 +2650,7 @@ mod tests {
     }
 
     /// A file whose every line ends in CRLF is held with LF and saved with
+    /// CRLF, a line typed into it included; a byte order mark beside it stays.
     #[test]
     fn crlf_file_round_trips_with_lf_in_buffer() {
         for (name, mark) in [("crlf", &b""[..]), ("crlf-bom", &crate::io::UTF8_BOM[..])] {
@@ -2648,6 +2690,11 @@ mod tests {
     }
 
     /// A save refused because the file changed under the buffer is refused
+    /// again until the disk's version is taken; taken by an overwrite, the
+    /// next save writes the buffer with the mapping the buffer holds it with,
+    /// whatever the new bytes would read as: a CRLF buffer over an LF file
+    /// keeps its CRLF, and a mixed buffer (its CRs in the text) over a CRLF
+    /// file gains no second CR.
     #[test]
     fn an_overwrite_keeps_the_buffers_mapping() {
         for (name, read, theirs, ours, written) in [
@@ -2696,6 +2743,7 @@ mod tests {
     }
 
     /// One line feed without a CR before it keeps the whole file as it is: its
+    /// CRs stay in the text, and saves write the text's own bytes.
     #[test]
     fn mixed_eol_is_byte_exact() {
         for (name, bytes) in [
@@ -2770,6 +2818,8 @@ mod tests {
     }
 
     /// A buffer held as it is can save bytes that a fresh read takes another
+    /// way: every break CRLF reads back with LF, and a leading U+FEFF reads
+    /// back as a mark.
     #[test]
     fn a_save_read_back_another_way_is_unchanged() {
         for (name, start, held, reading, encoding) in [
@@ -2904,6 +2954,8 @@ mod tests {
     }
 
     /// A reload makes the fresh read the buffer's text, so it brings that
+    /// read's mapping, which writes the same bytes back; a reload of the
+    /// buffer's own reading keeps the mapping that reading cannot tell.
     #[test]
     fn a_reload_takes_the_fresh_reading_and_its_mapping() {
         let path = unique_file("reload-crlf", b"");
@@ -2951,6 +3003,7 @@ mod tests {
     }
 
     /// The draft-journal fingerprint is the admitted text's, which is not the
+    /// file's own when admission took a mark or CRs off.
     #[test]
     fn the_observed_text_fingerprint_is_the_admitted_texts() {
         let bytes = b"\xef\xbb\xbfone\r\ntwo\r\n";
@@ -2980,6 +3033,8 @@ mod tests {
     }
 
     /// A document's save makes no folder: the first save of a missing file
+    /// fails once its directory is gone, and a saved file whose directory went
+    /// with it is an existence conflict.
     #[test]
     fn a_document_save_makes_no_folder() {
         let root = unique_file("no-folder", b"");
@@ -3024,6 +3079,7 @@ mod tests {
     }
 
     /// A never-saved document's file is still absent on a refresh: no change,
+    /// through the missing-baseline refresh.
     #[test]
     fn a_missing_document_refreshes_as_missing_until_its_file_appears() {
         let path = unique_file("missing-refresh", b"");
@@ -3064,6 +3120,8 @@ mod tests {
     }
 
     /// `open_path` hands admission a spelling with no symbolic link in it: an
+    /// existing file's realpath, or a missing one's directory realpath plus
+    /// its name.
     #[cfg(unix)]
     #[test]
     fn open_path_resolves_a_symlinked_parent() {
@@ -3123,6 +3181,8 @@ mod tests {
     }
 
     /// The main thread's dataless-file policy is OFF (aterm-diskwalk's `iopol`),
+    /// so an evicted iCloud Drive item's first `read(2)` returns `EDEADLK`
+    /// instead of blocking.
     #[cfg(unix)]
     #[test]
     fn edeadlk_on_read_is_reported_as_not_downloaded() {
@@ -3149,6 +3209,7 @@ mod tests {
     }
 
     /// Admission then grant composes to the synchronous open: admission is a pure function
+    /// of the URI, granting is the store's only mutation, and admitting twice mints one grant.
     #[test]
     fn admission_then_grant_matches_the_synchronous_open() {
         let path = unique_file("two-phase", b"# split\n");
@@ -3214,6 +3275,7 @@ mod tests {
     }
 
     /// `is_utf8_bom` is proved (SPECS.md); this holds the decoder around it:
+    /// only a whole leading BOM comes off, and what follows is still checked.
     #[test]
     fn decoding_takes_off_one_leading_bom_and_still_checks_the_rest() {
         let decode = |bytes: &[u8]| decode_utf8(bytes.to_vec()).map(|decoded| decoded.text);
@@ -3237,6 +3299,7 @@ mod tests {
     }
 
     /// A budget the clock cannot add to now is no ceiling: the wait neither
+    /// panics working out its deadline nor gives up while the lock is held.
     #[test]
     fn a_lock_budget_past_the_clock_waits_without_a_ceiling() {
         let path = unique_file("unbounded-lock-budget", b"");
@@ -3322,6 +3385,7 @@ mod tests {
     }
 
     /// The actual regression: a holder that releases INSIDE the budget is ridden out
+    /// instead of refusing the save.
     #[test]
     fn a_transient_save_lock_holder_is_ridden_out_instead_of_refusing_the_save() {
         let path = unique_file("transient-save-lock", b"before");
@@ -3383,6 +3447,7 @@ mod tests {
     }
 
     /// The save lock is free the instant its hold drops, even while a copy of the holder's
+    /// description lives (standing in for a shell forked mid-save).
     #[test]
     fn a_released_save_lock_is_free_while_a_forked_copy_of_it_lives() {
         let path = unique_file("save-lock-forked-copy", b"before");
@@ -3409,6 +3474,8 @@ mod tests {
     }
 
     /// Every document under `$TMPDIR` on macOS begins with the `/var` symlink, so this pins
+    /// that `normalize_process_temp_root` rewrites it; without the rewrite it fails with
+    /// `SymlinkComponent`.
     #[test]
     fn temporary_root_document_resolves_despite_the_var_compatibility_symlink() {
         let path = unique_file("temp-root-normalize", b"body");
@@ -3426,6 +3493,7 @@ mod tests {
     }
 
     /// A path outside the temporary root claims no symlink exemption, so the rewrite
+    /// leaves it untouched.
     #[test]
     fn paths_outside_the_temporary_root_are_not_rewritten() {
         let outside = PathBuf::from("/usr/share/aterm-does-not-exist/doc.md");
@@ -3611,6 +3679,7 @@ mod tests {
     }
 
     /// A save the person makes is durable, file and entry; the empty config file a
+    /// missing one is created as is only ordered (aterm-durable's counting seam).
     #[test]
     fn a_save_is_durable_and_a_created_config_file_only_ordered() {
         use aterm_durable::seam::Recording;

@@ -76,6 +76,7 @@ impl FgCutter {
     }
 
     /// The park after the last pre-park sample ended without the watch: that
+    /// sample's offset is clean.
     fn settle(&mut self) {
         if let Some(parked) = self.parked.take() {
             self.clean = parked;
@@ -259,6 +260,7 @@ impl FgOwners {
     }
 
     /// Whether `owner` armed an input-hijacking bit that is still in force
+    /// ([`program_evidence::INPUT`](aterm_core::terminal::program_evidence::INPUT)).
     fn owns_input(&self, owner: i32) -> bool {
         use aterm_core::terminal::program_evidence::INPUT;
         self.owner.iter().enumerate().any(|(bit, &o)| {
@@ -268,6 +270,8 @@ impl FgOwners {
     }
 
     /// The groups whose liveness [`Self::orphaned_by`] may need: every
+    /// owner of an input-hijacking bit still in force (`to` and unknown
+    /// owners excepted), each once, in bit order.
     fn suspects(&self, to: i32) -> impl Iterator<Item = i32> {
         let mut out = [0i32; aterm_core::terminal::program_evidence::COUNT];
         let mut n = 0;
@@ -459,6 +463,7 @@ pub(crate) fn group_has_stopped_member(master: i32, pgid: i32) -> bool {
 }
 
 /// Linux: [`group_has_stopped_member`]'s session-bounded walk, with the
+/// whole-table walk as the fallback.
 #[cfg(target_os = "linux")]
 fn linux_group_has_stopped_member(master: i32, pgid: i32) -> bool {
     let stopped = |pid: i32| {
@@ -504,6 +509,8 @@ pub(crate) fn linux_children(pid: i32) -> Option<Vec<i32>> {
 }
 
 /// How many processes the session walk visits at most: a session with more
+/// than this is not one a terminal tab runs, and past it the walk answers
+/// what it found so far.
 #[cfg(any(target_os = "linux", test))]
 const TREE_CAP: usize = 4096;
 
@@ -516,6 +523,7 @@ fn parse_children(list: &str) -> impl Iterator<Item = i32> + '_ {
 }
 
 /// Whether `hit` holds for `root` or any of its descendants, breadth first,
+/// visiting at most `cap` processes.
 #[cfg(any(target_os = "linux", test))]
 fn tree_any(
     root: i32,
@@ -542,6 +550,7 @@ fn tree_any(
 }
 
 /// macOS: list the group (`proc_listpgrppids`), then read each member's
+/// status ([`darwin_member_status`], `PROC_PIDT_SHORTBSDINFO`).
 #[cfg(target_os = "macos")]
 fn darwin_group_has_stopped_member(pgid: i32) -> bool {
     unsafe extern "C" {
@@ -551,9 +560,10 @@ fn darwin_group_has_stopped_member(pgid: i32) -> bool {
             buffersize: libc::c_int,
         ) -> libc::c_int;
     }
-    /// `SSTOP` from `<sys/proc.h>`. Pinned by
+    /// `SSTOP` from `<sys/proc.h>`.
     const SSTOP: u32 = aterm_uds::process::BsdShortInfo::SSTOP;
     /// A foreground job with more members than this is not one a terminal
+    /// runs; past it the listing is read as far as it goes.
     const MAX_MEMBERS: usize = 4096;
     let mut capacity = 64_usize;
     let pids = loop {
@@ -585,6 +595,7 @@ fn darwin_member_status(pid: i32) -> Option<(u32, i32)> {
 }
 
 /// Linux: whether one `/proc/<pid>/stat` line is a stopped (`T`, or `t` for a trace stop)
+/// member of group `pgid`.
 #[cfg(any(target_os = "linux", test))]
 fn proc_stat_is_stopped_in(stat: &str, pgid: i32) -> bool {
     let Some((_, rest)) = stat.rsplit_once(')') else {
@@ -649,6 +660,7 @@ pub(crate) fn restored_payload(
 }
 
 /// Tier-1 bind for `ForegroundHandback`'s `Exec` and `ObserveExec`: the
+/// cutter through every reachable state of the model.
 #[cfg(test)]
 #[path = "foreground_handback_exec_conformance.rs"]
 mod exec_conformance;
@@ -764,6 +776,8 @@ mod tests {
     }
 
     /// An Exec edge (the running leader replaced its image) cuts at the last
+    /// clean offset, not at the poll that heard it, and lays the new run at
+    /// that poll: the bytes between are no holder's.
     #[test]
     fn foreground_handback_cutter_cuts_an_exec_at_the_last_clean_poll() {
         let mut c = FgCutter::new(JOB);
@@ -800,6 +814,7 @@ mod tests {
     }
 
     /// A Group edge (the `exec`ed process leads the group now in front) cuts
+    /// where a sampled one would: the last sample that showed the old group.
     #[test]
     fn foreground_handback_cutter_cuts_a_kqueue_group_edge_at_the_last_same_sample() {
         let mut c = FgCutter::new(SHELL);
@@ -820,6 +835,8 @@ mod tests {
     }
 
     /// Only an `exec` that enters or leaves the terminal's holder, and that the
+    /// gather calls card-relevant, is an edge; the rest fold into the sampled
+    /// cut, and a batch keeps at most one edge.
     #[test]
     fn foreground_handback_cutter_folds_every_other_process_event() {
         const MEMBER: i32 = 201;
@@ -884,6 +901,7 @@ mod tests {
     }
 
     /// A bit re-armed over the shell's (a one-shot's `?1000h` parsed as the shell's, then a
+    /// job's `?1003h`) moves to the re-armer, so the job's death hands it back.
     #[test]
     fn foreground_handback_owners_give_a_re_armed_bit_to_its_re_armer() {
         let dead = |pids: &'static [i32]| move |p: i32| pids.contains(&p);
@@ -911,6 +929,7 @@ mod tests {
     }
 
     /// A gone group owning only display bits (`tput civis`, `tput smcup`, `tput smcup; cmd`)
+    /// orphans nothing; one owning an input bit orphans all of its bits.
     #[test]
     fn foreground_handback_a_display_only_one_shot_orphans_nothing() {
         const TPUT: i32 = 500;
@@ -961,6 +980,8 @@ mod tests {
     }
 
     /// The pre-lock probe asks each group the locked handback can ask about once (`from`
+    /// included even when it also owns bits), never the new holder or a display-only owner;
+    /// a group not probed reads as alive.
     #[test]
     fn foreground_handback_probe_edge_asks_each_group_once_before_the_lock() {
         const TPUT: i32 = 500;
@@ -998,6 +1019,7 @@ mod tests {
     }
 
     /// The Linux member walk: breadth first from the session leader, at most `TREE_CAP`
+    /// processes, `None` (fall back) only when the leader's own children cannot be listed.
     #[test]
     fn foreground_handback_session_tree_walk_is_bounded() {
         assert_eq!(
@@ -1062,6 +1084,7 @@ mod tests {
     }
 
     /// The orphan rule: a gone leader with a stopped member is a stopped job, with only running
+    /// members a killed one; a live leader never asks for the member listing.
     #[test]
     fn foreground_handback_a_gone_leader_with_a_stopped_member_is_not_orphaned() {
         assert!(!group_orphaned(true, || true), "Ctrl-Z on `producer | tui`");
@@ -1099,6 +1122,8 @@ mod tests {
     }
 
     /// The real process table, a group whose leader exited while a member lives: as the
+    /// holder it is gone while the member runs, not while it is stopped, and gone again once
+    /// resumed; as a bystander only once its last member is.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn foreground_handback_a_stopped_member_of_a_leaderless_group_is_seen() {
@@ -1189,6 +1214,7 @@ mod tests {
     }
 
     /// A member owned by another user reads back (`PROC_PIDTBSDINFO` would refuse it with
+    /// `EPERM`).
     #[cfg(target_os = "macos")]
     #[test]
     fn foreground_handback_another_users_member_status_reads_back() {
@@ -1222,6 +1248,7 @@ mod tests {
 }
 
 /// `foreground_handback_ownership` environment actions, each waived where its Tier-1
+/// (`foreground_handback_conformance`) binds it.
 #[cfg(all(any(test, debug_assertions), unix))]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "foreground_handback_ownership",
@@ -1243,6 +1270,7 @@ mod tests {
 fn ownership_scope_waivers() {}
 
 /// `foreground_handback` actions no one function of the host performs, each
+/// waived where its Tier-1 binds it.
 #[cfg(all(any(test, debug_assertions), unix))]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "foreground_handback",

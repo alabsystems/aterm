@@ -1,58 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A BOX TALLER THAN THE PANE, READ WHOLE FROM THE HISTORY. Claude Code's
-//! inline renderer draws on the MAIN screen, and writes a box taller than the
-//! pane whole: its head scrolls into the main screen's history, right above
-//! the screen, and runs straight into it. MEASURED 2026-10-17 on 2.1.302 in an
-//! 80x18 lab pane (a 30-row `touch` command): `search '^──────────' regex`
-//! found the box's top rule in the history, and `line` read its title, its
-//! description and its command rows down to the row above the screen's first,
-//! with no gap; the screen's generation did not move while the box sat; a
-//! focus move redrew the screen in place, the head left as it was; and each
-//! later box (the next call, or the second of two parallel calls) was written
-//! whole under the transcript rows its predecessor's answer added, so an
-//! older box's head lies above those rows, never against the screen.
-//!
-//! The screen's tail alone cannot say what a cut box asks (two measured boxes
-//! end in the same five rows and need opposite answers:
-//! `policy::approval`'s module doc, "A box taller than the pane"), so the
-//! head is read from the history and the box decided whole
-//! ([`Session::box_from_history`]) — only where the join proves itself: the
-//! session's program Claude Code and the box no question, on the main screen
-//! (the fullscreen renderer draws on the alternate screen, which has no
-//! history, and its archive never held such a box's head: the alternate
-//! archive's read was dropped for gluing an older box's head on), the read
-//! the whole grid with its generation; the top rule nearest above the screen
-//! found by `search` (a reply that may have left out newer rows is no
-//! answer), every row from it to the screen read by `line`, the screen's
-//! generation and rows the same after the reads, and the rows joined read as
-//! ONE box from that rule to the screen's foot, its options on the screen the
-//! cut's own ([`joined_box`]). Anything else is the cut, held as before. A
-//! press made on the whole box is fenced on the screen's generation and
-//! guarded on a row of it the screen shows (`approval_loop`,
-//! `whole_box_decision`).
+//! Whole-box reconstruction from main-screen history
+//! ([`Session::box_from_history`], [`joined_box`]).
 
 use super::*;
 use crate::supervise::report::decimal;
 use aterm_ctl::SEARCH_DEPTH_NOTE;
 
-/// The most rows above the screen a box's head is read from: a box further up
-/// than this is held as a cut one.
+/// The most rows above the screen a box's head is read from.
 pub(super) const HEAD_ROWS: u64 = 400;
 
-/// What the `search` for a box's top rule matches: a row that opens with the
-/// rule Claude Code draws over its boxes (and its composer), a run of `─`
-/// from column 0.
+/// What the `search` for a box's top rule matches.
 pub(super) const TOP_RULE: &str = "^──────────";
 
 impl<C: Ctl> Session<'_, C> {
-    /// The box `reading` read off `screen`, its head off the screen
-    /// ([`aterm_phase::prompt::PromptV2::head_off_screen`]), read whole with
-    /// the history above the screen (module docs): the rows joined, from the
-    /// box's top rule to the screen's last row, and their reading. `None`
-    /// wherever the join does not prove itself; the cut is then decided as it
-    /// is (held).
+    /// Reconstruct a box off `screen` ([`aterm_phase::prompt::PromptV2::head_off_screen`]).
     pub(super) fn box_from_history(
         &mut self,
         screen: &Screen,
@@ -87,25 +50,19 @@ impl<C: Ctl> Session<'_, C> {
             if self.unserved(&r) {
                 return Err(Fail::Lost(format!("line failed: {}", r.stderr.trim())));
             }
-            // `ERR evicted`, `ERR unreadable`, `ERR out of range`, a host
-            // without the verb: no head.
             let Some(text) = head_row(&r) else {
                 return Ok(None);
             };
             head.push(text);
         }
-        // The screen unchanged under the reads: the history read is the one
-        // drawn with it, and the press is fenced on that generation.
         let (now, _) = self.read_once()?;
-        if now.generation != screen.generation || now.rows != screen.rows {
+        if !same_box(&now.rows, &screen.rows) {
             return Ok(None);
         }
         Ok(joined_box(&head, &screen.rows, cut, screen.cursor_col))
     }
 
-    /// Whether the session draws on the ALTERNATE screen (`modes`'
-    /// `alt_screen=true` row); a reply that names none is not known to be the
-    /// main screen, and is `true`.
+    /// Whether the session draws on the ALTERNATE screen (`modes`' `alt_screen=true` row).
     pub(super) fn alt_screen_now(&mut self) -> Result<bool, Fail> {
         let r = self.call(&["modes"])?;
         if self.unserved(&r) {
@@ -115,17 +72,15 @@ impl<C: Ctl> Session<'_, C> {
     }
 }
 
+/// Whether `now` matches `screen` ([`super::approval_loop::box_identity`], [`head_rows`]).
+pub(crate) fn same_box(now: &[String], screen: &[String]) -> bool {
+    super::approval_loop::box_identity(now) == super::approval_loop::box_identity(screen)
+}
+
 /// The request [`Session::box_from_history`] finds a box's top rule with.
 pub(crate) const SEARCH: [&str; 3] = ["search", TOP_RULE, "regex"];
 
-/// The history's rows a box's head is read from, by what the reply to
-/// [`SEARCH`] says: from the top rule nearest above the screen down to the
-/// row above the screen's first. `None` where the reply proves no such
-/// rule — refused, a reply that may have left out newer rows, no screen's
-/// first row named, no rule above it, or one more than [`HEAD_ROWS`] up —
-/// and the cut is held. The loop's one reader of the reply, and a tape
-/// reader's (`tape::explain`, which rebuilds the loop's join from the
-/// replies a tape holds).
+/// History rows for a box's head from the [`SEARCH`] reply ([`HEAD_ROWS`]).
 pub(crate) fn head_rows(search: &CtlReply) -> Option<std::ops::Range<u64>> {
     if !search.ok() || unsearched(search) == Unsearched::Anywhere {
         return None;
@@ -135,9 +90,7 @@ pub(crate) fn head_rows(search: &CtlReply) -> Option<std::ops::Range<u64>> {
     (first - top <= HEAD_ROWS).then_some(top..first)
 }
 
-/// The row a `line` reply reads: its text, or `None` for a reply that read
-/// none (`ERR evicted`, `ERR unreadable`, `ERR out of range`, a host without
-/// the verb), where the join is given up. Shared as [`head_rows`] is.
+/// Text of a `line` reply, or `None` when unreadable ([`head_rows`]).
 pub(crate) fn head_row(line: &CtlReply) -> Option<String> {
     if !line.ok() {
         return None;
@@ -158,15 +111,7 @@ fn hit_rows(stdout: &str) -> impl Iterator<Item = u64> + '_ {
     })
 }
 
-/// The box `cut`, read off `screen` with its head off it, read WHOLE from
-/// `head` — the history's rows from the top rule nearest above the screen
-/// down to the screen's first row — joined over `screen`: the joined rows and
-/// their reading, where they are one box. The join must read as one box, not
-/// cut, opening on the row under that rule — so every row joined is the
-/// box's own: a row a repaint left between them (a transcript row, a banner,
-/// an older frame's rule or footer) moves the box's top off it — no question,
-/// ending where the cut ends, the options it draws on the screen the cut's
-/// own, on the cut's rows (an option above the screen is the head's).
+/// The box `cut`, read off `screen` with its head off it, read WHOLE from `head`.
 #[must_use]
 pub(crate) fn joined_box(
     head: &[String],
@@ -179,8 +124,6 @@ pub(crate) fn joined_box(
     let reading = aterm_phase::read(Some("claude"), &rows, Some(cursor_col));
     let whole = reading.prompt.as_ref()?;
     let h = head.len();
-    // The options drawn on the screen, by their rows on it: the whole box's
-    // under the head, the cut's own.
     let options = |p: &aterm_phase::PromptV2, shift: usize| -> Vec<_> {
         p.options
             .iter()
@@ -194,20 +137,14 @@ pub(crate) fn joined_box(
     one.then_some((rows, reading))
 }
 
-/// What a `search` reply says it did not search, by its ` incomplete` header
-/// marker (a raw client's header, the first line of stdout; `aterm ctl`'s, on
-/// stderr when nothing matched) or the note `aterm ctl` prints for it
-/// ([`aterm_ctl::search_incomplete_note`], on stderr); the worst one wins.
+/// What a `search` reply did not search ([`aterm_ctl::search_incomplete_note`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Unsearched {
     /// Nothing: the hits are every row that matches.
     Nothing,
-    /// History OLDER than the rows searched (the depth cap: a bare `
-    /// incomplete`, or ` older` alone): every newer row was searched.
+    /// History older than the rows searched (the depth cap).
     Older,
-    /// Rows anywhere: the match cap, a rewrap (only the screen searched), a
-    /// long line not searched to its end, the terminal changed mid-search, or
-    /// a qualifier or note this reader does not know.
+    /// Rows anywhere: the match cap.
     Anywhere,
 }
 
@@ -217,24 +154,17 @@ fn unsearched(r: &CtlReply) -> Unsearched {
     let header = |tail: &str| {
         let mut words = tail.split_whitespace();
         let n = words.next().and_then(decimal);
-        // The qualifiers end where a client's own note on the header begins
-        // (`aterm ctl`'s ` (search: no results)` on a reply with no hits);
-        // `screen_first=` places the screen and says nothing of what was left
-        // out ([`search_screen_first`]).
         let words: Vec<&str> = words
             .take_while(|w| !w.starts_with('('))
             .filter(|w| !w.starts_with("screen_first="))
             .collect();
         match words.as_slice() {
             [] => Unsearched::Nothing,
-            // An older server marks the match limit bare too.
             ["incomplete"] if n.is_some_and(|n| n >= 100_000) => Unsearched::Anywhere,
             ["incomplete"] => Unsearched::Older,
             ["incomplete", causes @ ..] if causes.iter().all(|c| *c == "older") => {
                 Unsearched::Older
             }
-            // Any other cause, or a qualifier this reader does not know (a
-            // future server's), may have left out newer rows.
             _ => Unsearched::Anywhere,
         }
     };
@@ -262,12 +192,7 @@ fn unsearched(r: &CtlReply) -> Unsearched {
     worst
 }
 
-/// The live screen's first absolute row in the frame a `search` reply
-/// searched: its header's one `screen_first=<row>` (a raw client's header, the
-/// first line of stdout; `aterm ctl`'s, on stderr). `None` for a reply with no
-/// header, none or a malformed one, or two: an older host or client cannot
-/// tell a logical-line hit from a physical continuation row that starts with
-/// the caret. What the reply left out is [`unsearched`]'s.
+/// First absolute row of the live screen in a `search` reply ([`unsearched`]).
 pub(super) fn search_screen_first(reply: &CtlReply) -> Option<u64> {
     let raw = reply
         .stderr

@@ -14,6 +14,7 @@ use crate::claude_lights::autopilot_title;
 type Switch = (&'static str, fn(&mut App, bool));
 
 /// 2026-10-16 14:05:00 UTC, a Friday: the wall second the tests' acts
+/// arrive around, read in UTC.
 const T0_UNIX: i64 = 1_792_159_500;
 
 /// An act's arrival `ms` after `t0` (`unix` moving with it), in UTC.
@@ -31,6 +32,11 @@ fn trail(g: &SessionGlass) -> Vec<Act> {
 }
 
 /// COALESCING, ON AN INJECTED CLOCK (§9.2.1): five acts in a second give
+/// ONE label, showing the newest, which ends at the first + 3 s — the dwell
+/// is never extended, so a stream cannot hold it lit; an act at +10 s lights
+/// nothing (the quiet), and one at +15 s does; a three-key dialog in 200 ms
+/// lights one label and leaves one trail entry, and so does one whose keys
+/// come 1.8 s apart, as the real dialog's do.
 #[test]
 fn the_ticker_coalesces_a_burst_into_one_label_per_quiet() {
     let t0 = Instant::now();
@@ -111,6 +117,11 @@ fn the_ticker_coalesces_a_burst_into_one_label_per_quiet() {
 }
 
 /// A RUN OF ONE ACT IS ONE ENTRY PER BURST, NEVER ONE FOREVER (§9.2.1): an
+/// approval every 2.5 s for a minute — each a repeat within the dwell of
+/// the one before — is a new trail entry, with its own clock time, once
+/// [`BURST`] has passed since its entry's first act, and the label lights
+/// again once the quiet has passed; the newest entry's clock is the run's
+/// late time, not its first.
 #[test]
 fn a_run_of_one_act_is_a_new_entry_past_the_burst() {
     let t0 = Instant::now();
@@ -140,6 +151,11 @@ fn a_run_of_one_act_is_a_new_entry_past_the_burst() {
 }
 
 /// A QUESTION DIALOG'S LABEL STAYS UP A DWELL PAST ITS LAST KEY (§9.2.7):
+/// the dialog covers the composer while its keys are pressed — no chip and
+/// no label is drawn there — so the label its first key lit is kept up
+/// [`DWELL`] past each later key: a two-question dialog's three keys 1.8 s
+/// apart (Claude Code 2.1.301) keep it lit until 3 s after the third, one
+/// label and one trail entry.
 #[test]
 fn a_dialogs_label_stays_up_a_dwell_past_its_last_key() {
     let t0 = Instant::now();
@@ -174,6 +190,10 @@ fn a_dialogs_label_stays_up_a_dwell_past_its_last_key() {
 }
 
 /// THE NEWEST ACT IS SPOKEN BY THE TITLE'S RULE (§9.2.1, §9.0 "Nothing goes
+/// stale on the glass"): `Last: approved at 14:05.` on its own date, with
+/// its whole weekday read on another (`on Friday`), and nothing at all a day
+/// and a minute after it — the screen reader's description never reads an
+/// old act as today's.
 #[test]
 fn the_newest_act_is_spoken_by_the_titles_rule() {
     let t0 = Instant::now();
@@ -204,6 +224,7 @@ fn the_newest_act_is_spoken_by_the_titles_rule() {
 }
 
 /// AN ACT THAT MAY NOT LIGHT goes into the trail alone: no label, no
+/// deadline, no quiet started — so the next act that may light does.
 #[test]
 fn an_act_that_may_not_light_keeps_only_its_trail_entry() {
     let t0 = Instant::now();
@@ -220,6 +241,7 @@ fn an_act_that_may_not_light_keeps_only_its_trail_entry() {
 }
 
 /// The App with a harness host, so its session 0 runs under the table's
+/// Cruise; the guard shuts the host down.
 struct Hosted(crate::harness_host::HostHandle);
 
 impl Drop for Hosted {
@@ -247,6 +269,8 @@ fn acts(app: &mut App, on: bool) {
 }
 
 /// SERIOUS MODE AND `acts = false` EACH LIGHT NOTHING AND KEEP THE TRAIL
+/// (§9.2.1), and so does a session the harness carries no work for (Off):
+/// no label, no deadline, the newest act still the chip's `last`.
 #[test]
 fn serious_mode_and_acts_off_light_nothing_and_keep_the_trail() {
     let t0 = Instant::now();
@@ -301,6 +325,9 @@ fn serious_mode_and_acts_off_light_nothing_and_keep_the_trail() {
 }
 
 /// THE TRAIL AS THE TITLE LISTS IT (§9.2.1), and the whole and short titles
+/// with 0, 1 and 3 acts: newest first, each with the clock time it arrived;
+/// an act from another local date with its weekday (`Thu 23:58`); one older
+/// than a day left out.
 #[test]
 fn the_trail_title_lists_clock_times_weekdays_and_never_a_day_old_act() {
     let t0 = Instant::now();
@@ -389,6 +416,9 @@ fn the_trail_title_lists_clock_times_weekdays_and_never_a_day_old_act() {
 }
 
 /// IDLE TO ZERO (§9.2.5): after the dwell the glass is v1's at rest but for
+/// its trail — no label, nothing armed, and the footer's Autopilot term back
+/// at its rest value — and `expire_harness_acts` with nothing lit reads no
+/// clock.
 #[test]
 fn after_the_dwell_nothing_is_armed_and_the_term_is_at_rest() {
     let t0 = Instant::now();
@@ -415,6 +445,7 @@ fn after_the_dwell_nothing_is_armed_and_the_term_is_at_rest() {
 }
 
 /// THE WAIT NEVER RE-ARMS THE WAKE THAT CAME (§9.2.3 item 6): what the loop
+/// folds on its way to a wait is the NEXT instant the glass needs.
 #[test]
 fn the_wait_never_rearms_the_label_end_that_woke_the_loop() {
     let (mut app, _host) = hosted();
@@ -444,6 +475,7 @@ fn the_wait_never_rearms_the_label_end_that_woke_the_loop() {
 }
 
 /// The task's face, told, is kept for the frame with its clock; told again
+/// it is no move; told unknown over no trail it leaves no entry.
 #[test]
 fn the_task_face_is_kept_for_the_frame() {
     let mut app = App::headless_for_test();
@@ -470,6 +502,10 @@ fn the_task_face_is_kept_for_the_frame() {
 }
 
 /// A TASK'S FACE IS STAMPED WITH THE WALL CLOCK (unix ms, as the timeline
+/// keeps it): told through the window's one door for harness facts, the
+/// face's time is the wall's now, so its clock time on the chip and the page
+/// (`landed 17:42`) is the time it landed — never the process's age read as
+/// a time of 1970.
 #[test]
 fn a_task_face_is_stamped_with_the_wall_clock() {
     let wall_ms = || {
@@ -501,6 +537,12 @@ fn a_task_face_is_stamped_with_the_wall_clock() {
 }
 
 /// A STAMP NAMES ITS DAY SO IT CANNOT BE READ AS ANOTHER (§10.2.3, item 3;
+/// the honest chip's review): read against its own day, or with
+/// no day read, the bare clock; within the six days before `today` its
+/// weekday (`Sat 17:58` on a Friday, six days back); a week or more back its
+/// date (`11 Oct 17:58` on the Friday after, where the weekday would be
+/// today's own), with the year where that differs; and after `today` (a
+/// clock set back) its date, never a weekday read as past.
 #[test]
 fn a_stamp_names_its_day_so_it_cannot_be_read_as_another() {
     const FRI: i64 = 20_007;
@@ -545,6 +587,12 @@ fn paused(h: u16, m: u16, day: i64, short: u8) -> PauseGlass {
 }
 
 /// THE PAUSE IN ITS WORDS (`docs/DESIGN-harness-autopilot-2026-10-15.md`
+/// §10.5.1): a clock time, never a countdown — `pausing until 18:41 after 3
+/// short turns` in the title, `pausing until 18:41 (3 short turns in a
+/// row)` on the page, `Pausing until 18:41.` spoken; one short turn (the
+/// first point seen) said as `a short turn`; a pause that ends past
+/// midnight names that day's weekday (`Sat 00:12`, spoken `Saturday at
+/// 00:12`), and with no day read for the build the clock stands alone.
 #[test]
 fn the_pause_is_said_as_a_clock_time_with_its_streak() {
     let p = paused(18, 41, FRI, 3);
@@ -594,6 +642,9 @@ fn the_pause_is_said_as_a_clock_time_with_its_streak() {
 }
 
 /// THE PAUSE ON THE GLASS (§10.5.3, item 4): told, it is kept for the
+/// chip's title with its end's clock, and it moves the trail's generation
+/// — the footer's term moves while someone reads the title, and at rest it
+/// moves NOTHING (no face moved: a frame at rest keys nothing new).
 #[test]
 fn a_pause_moves_the_read_title_and_nothing_at_rest() {
     use crate::claude_lights::glass_bits;
@@ -631,6 +682,11 @@ fn a_pause_moves_the_read_title_and_nothing_at_rest() {
 }
 
 /// THE TITLE WITH A PAUSE, IN EACH OF ITS FORMS (§10.5.1): the whole title
+/// carries ` · pausing until 18:41 after 3 short turns` after the
+/// explanation and before the trail, sized in (its ` · ` is four bytes); the
+/// first leaner form (no trail) keeps it, v1's words give it up, the forms
+/// that keep the clicks give it up with the explanation (§10.2.7), and the
+/// short title is the mode phrase alone.
 #[test]
 fn the_title_carries_the_pause_in_its_whole_and_first_leaner_forms() {
     use crate::claude_lights::lean_titles;
@@ -732,6 +788,9 @@ fn the_title_carries_the_pause_in_its_whole_and_first_leaner_forms() {
 }
 
 /// A STAMP'S MINUTE READS BACK AS ITS INSTANT (`Stamp::unix_ms`, `Stamp::at`'s
+/// inverse to the minute): the wall time the menu bar's Done for you row
+/// ages from where the timeline no longer holds an end's instant names the
+/// very clock and day the end showed.
 #[test]
 fn a_stamps_minute_reads_back_as_its_instant() {
     let Some(stamp) = crate::harness_glass::Stamp::at(1_760_978_545) else {

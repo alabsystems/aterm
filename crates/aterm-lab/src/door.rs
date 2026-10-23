@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE door to a lab's aterm: every control-socket call the lab makes, as a
-//! client process or in process, passes these three rules. The socket is
-//! exactly the one `env.sh` names for the lab (`<sockdir>/a.sock`, shaped
-//! `/tmp/at.*/a.sock`, in a directory this user owns, neither it nor its token
-//! a link); no flag may stand before the verb (the client lets a later
-//! `--sock` win); and the client's environment is scrubbed and points at the
-//! lab's scratch, never at the owner's state. The shape alone cannot tell the
-//! lab's socket from another agent's private instance (they share it): the
-//! jail does. Spawned clients enter the run's recorded jail before aterm
-//! starts; a scratch HOME alone does not confine services that use the uid.
+//! THE door to a lab's aterm: every control-socket call the lab makes, as a client process or in process, passes these three rules.
 
 use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
@@ -40,9 +31,7 @@ pub struct Door<'a> {
 }
 
 impl<'a> Door<'a> {
-    /// The door of `run`: the aterm `up` recorded for it (its jail pins that
-    /// file), never a new pick.
-    ///
+    /// The door of `run`: the aterm `up` recorded for it (its jail pins that file), never a new pick.
     /// # Errors
     /// The lab records no aterm.
     pub fn new(run: &'a Run) -> Result<Door<'a>, String> {
@@ -59,7 +48,6 @@ impl<'a> Door<'a> {
     }
 
     /// The rules of the socket (module docs).
-    ///
     /// # Errors
     /// Which rule the socket broke.
     pub fn check_socket(&self) -> Result<(), String> {
@@ -127,7 +115,6 @@ impl<'a> Door<'a> {
     }
 
     /// `aterm ctl <args>` against this lab, captured.
-    ///
     /// # Errors
     /// A rule refused it, or the client could not start.
     pub fn ctl(&self, args: &[&str]) -> Result<Reply, String> {
@@ -144,9 +131,7 @@ impl<'a> Door<'a> {
         })
     }
 
-    /// `aterm ctl <args>` against this lab with `input` on its standard
-    /// input (a worker's task for `spawn agent=claude … -`), captured.
-    ///
+    /// `aterm ctl <args>` against this lab with `input` on its standard input (a worker's task for `spawn agent=claude … -`), captured.
     /// # Errors
     /// A rule refused it, or the client could not start.
     pub fn ctl_input(&self, args: &[&str], input: &[u8]) -> Result<Reply, String> {
@@ -159,12 +144,10 @@ impl<'a> Door<'a> {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("could not run {}: {e}", self.aterm.display()))?;
-        // the pipe closes at the end of the statement: the client reads to EOF
         let wrote = child
             .stdin
             .take()
             .map_or(Ok(()), |mut pipe| pipe.write_all(input));
-        // waited on whatever the write came to: no client is left unreaped
         let out = child
             .wait_with_output()
             .map_err(|e| format!("could not run {}: {e}", self.aterm.display()))?;
@@ -183,7 +166,6 @@ impl<'a> Door<'a> {
     }
 
     /// `aterm ctl <args>` against this lab, on this process's own terminal; its status.
-    ///
     /// # Errors
     /// A rule refused it, or the client could not start.
     pub fn ctl_inherit(&self, args: &[&str]) -> Result<i32, String> {
@@ -196,9 +178,6 @@ impl<'a> Door<'a> {
     }
 
     /// `aterm drive --socket <sock> <args>` (the hosted loop's own reader).
-    /// `aterm drive` runs its control client as its own `ctl` verb
-    /// (`aterm_agent::own_exe`), so this lab's aterm is the client too.
-    ///
     /// # Errors
     /// A rule refused it, or the client could not start.
     pub fn drive(&self, args: &[&str]) -> Result<Reply, String> {
@@ -218,7 +197,6 @@ impl<'a> Door<'a> {
     }
 
     /// `aterm harness ledger --sock <sock> @<sid>`, both streams.
-    ///
     /// # Errors
     /// A rule refused it, or the client could not start.
     pub fn harness_ledger(&self, sid: &str) -> Result<String, String> {
@@ -240,7 +218,6 @@ impl<'a> Door<'a> {
     }
 
     /// One authenticated control connection to the lab, in this process.
-    ///
     /// # Errors
     /// A rule refused it, or the connection or its token failed.
     pub fn connect(&self) -> Result<aterm_agent::RelayClient<aterm_uds::CtlStream>, String> {
@@ -249,11 +226,7 @@ impl<'a> Door<'a> {
             .map_err(|e| format!("cannot reach {}: {e}", self.run.sock))
     }
 
-    /// `await match <re>` on the lab's screen for up to `secs`: whether a row
-    /// matched. The wire never quotes, so white space and `=` in the pattern
-    /// travel as `\xNN` escapes, which the server's regex reads as the same
-    /// characters.
-    ///
+    /// `await match <re>` on the lab's screen for up to `secs`: whether a row matched.
     /// # Errors
     /// Interrupted, a rule refused it, the connection failed, or the server refused the pattern.
     pub fn await_match(&self, pattern: &str, secs: u64) -> Result<bool, Fail> {
@@ -261,25 +234,20 @@ impl<'a> Door<'a> {
     }
 
     /// `await gone <re>`: whether, within `secs`, no row matches any more.
-    ///
     /// # Errors
     /// As [`Door::await_match`].
     pub fn await_gone(&self, pattern: &str, secs: u64) -> Result<bool, Fail> {
         self.await_level("gone", pattern, Duration::from_secs(secs))
     }
 
-    /// `await idle <quiet_ms>`: whether, within `secs`, the screen went
-    /// `quiet_ms` without output (a settle, never a fixed pause).
-    ///
+    /// `await idle <quiet_ms>`: whether, within `secs`, the screen went `quiet_ms` without output (a settle, never a fixed pause).
     /// # Errors
     /// As [`Door::await_match`].
     pub fn await_idle(&self, quiet_ms: u64, secs: u64) -> Result<bool, Fail> {
         self.await_level(&format!("idle {quiet_ms}"), "", Duration::from_secs(secs))
     }
 
-    /// [`Door::await_match`] where only an interrupt is an error: a refused or
-    /// broken wait reads as "not seen", which every caller then reports.
-    ///
+    /// [`Door::await_match`] where only an interrupt is an error: a refused or broken wait reads as "not seen", which every caller then reports.
     /// # Errors
     /// Interrupted.
     pub fn seen(&self, pattern: &str, secs: u64) -> Result<bool, Stopped> {
@@ -293,9 +261,7 @@ impl<'a> Door<'a> {
     }
 
     /// One `await <kind> <pattern>` held for up to `total`, as short waits
-    /// with an interrupt check between them: a ^C ends it within a slice. A
-    /// `match`/`gone` level that holds is latched by the next slice; an `idle`
-    /// slice is a second longer than the quiet it asks for, so it can latch.
+    /// with an interrupt check between them: a ^C ends it within a slice.
     fn await_level(&self, kind: &str, pattern: &str, total: Duration) -> Result<bool, Fail> {
         let quiet = kind
             .strip_prefix("idle ")

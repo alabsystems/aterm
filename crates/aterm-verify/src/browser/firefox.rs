@@ -1,37 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The browser lane's second engine: Firefox (Gecko), headless. Chromium is
-//! not the only browser that runs the web modules, and WebGL2 off Chromium
-//! goes through another implementation of it.
-//!
-//! The lane pins Playwright's build of Firefox, a zip it unpacks into a user
-//! cache as it does chrome-headless-shell (Mozilla ships Firefox for macOS
-//! as a disk image to install), for macOS on Apple silicon and for Ubuntu
-//! 24.04 on aarch64 (the Linux lane's guest). `-headless` runs it with no
-//! window; on Linux it still makes its WebGL context on an X display
-//! ([`display_missing`]). Nothing
-//! drives it over a protocol: it opens the cpu page with
-//! `?post=1&next=gpu,worker` on its command line, and each page POSTs its
-//! answer to the lane's server ([`super::serve::Server::answer`]) and opens
-//! the next.
-//!
-//! In order, the lane takes `ATERM_FIREFOX` (any Firefox executable), then
-//! the pinned build in this machine's cache (`verify provision` puts it
-//! there). Neither is a COULD NOT RUN naming the fetch.
+//! Headless Firefox (Gecko) discovery, profile setup, and launch helpers for the browser lane.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-/// Playwright's Firefox build the lane pins (Firefox 155.0, built
-/// 2026-09-02; Playwright 1.63.0 installs it).
+/// Pinned Playwright Firefox build number.
 pub(crate) const BUILD: &str = "1543";
 
 /// The Firefox version that build is.
 pub(crate) const VERSION: &str = "155.0";
 
-/// One platform's pinned archive: its file name on Playwright's CDN, sha256
-/// and size measured on the download, and the executable inside it.
+/// Platform archive metadata for a pinned Firefox build.
 pub(crate) struct Pinned {
     pub platform: &'static str,
     pub archive: &'static str,
@@ -40,11 +21,7 @@ pub(crate) struct Pinned {
     pub binary: &'static str,
 }
 
-/// The pinned archives, one per platform the lane has run Firefox on. The
-/// build for x86_64 Linux (`firefox-ubuntu-24.04.zip`) gave no answer in 280 s
-/// under Rosetta in the Linux lane's guest, with or without its sandboxes, so
-/// it is not pinned: no x86_64 Linux host has run it
-/// (docs/measured/linux-browser-2026-10-20.md).
+/// Pinned Firefox archives per supported platform.
 pub(crate) const PINNED: [Pinned; 2] = [
     Pinned {
         platform: "mac-arm64",
@@ -65,8 +42,7 @@ pub(crate) const PINNED: [Pinned; 2] = [
 /// The environment variable naming a Firefox to run instead.
 pub(crate) const FIREFOX_ENV: &str = "ATERM_FIREFOX";
 
-/// The fix a run without a Firefox names, where `pinned` (this host has a
-/// pin `verify provision` can fetch).
+/// Remediation hint when Firefox is unavailable.
 pub(crate) fn fix_for(pinned: bool) -> &'static str {
     if pinned {
         "targo --unverified verify provision, or set ATERM_FIREFOX to a Firefox executable"
@@ -89,13 +65,7 @@ pub(crate) fn platform_for(os: &str, arch: &str) -> Option<&'static str> {
     }
 }
 
-/// Why Firefox can make no WebGL2 context on `os` with `display` (the
-/// `DISPLAY` it would inherit), if it cannot. On Linux it makes the context
-/// on an X display even under `-headless`: measured with build 1543 on
-/// Ubuntu 24.04 aarch64, with no `DISPLAY` every context failed ("tryNativeGL
-/// … Exhausted GL driver options"), and under an Xvfb it drew on Mesa's
-/// llvmpipe, still with no window. So a Linux host without a display is NOT
-/// RUN, never a page that fails.
+/// Returns a skip reason if `os` requires an X11 `DISPLAY` that is unset or empty.
 pub(crate) fn display_missing(os: &str, display: Option<&OsStr>) -> Option<String> {
     (os == "linux" && display.is_none_or(OsStr::is_empty)).then(|| {
         "Firefox on Linux makes its WebGL2 context on an X display, even headless, and \
@@ -167,17 +137,7 @@ pub(crate) fn find() -> Result<Firefox, String> {
     }
 }
 
-/// The lane's profile preferences (its `user.js`). The unmasked renderer
-/// names the adapter as Chromium's does (Firefox otherwise reports a
-/// family, "Apple M1, or similar"); WebGL is forced past Firefox's driver
-/// blocklist, which refuses WebGL2 on Mesa's llvmpipe ("AllowWebgl2:false
-/// restricts context creation on this system", measured in the Linux lane's
-/// guest), and the session is held to the adapter it names all the same;
-/// `performance.now()` keeps its
-/// microseconds (Firefox otherwise rounds the page's timings to 1 ms);
-/// fingerprinting protection, which can perturb a canvas readback, is off;
-/// colour management is off, so a canvas copy is not converted; and
-/// nothing first-run, updating or reporting starts.
+/// Profile `user.js` preferences for headless WebGL2 verification.
 pub(crate) const PREFS: &str = "\
 user_pref(\"webgl.sanitize-unmasked-renderer\", false);
 user_pref(\"webgl.force-enabled\", true);
@@ -194,8 +154,7 @@ user_pref(\"datareporting.policy.dataSubmissionEnabled\", false);
 user_pref(\"toolkit.telemetry.reportingpolicy.firstRun\", false);
 ";
 
-/// A fresh profile at `profile`: emptied, then holding [`PREFS`] and the
-/// empty home [`launch_env`] gives Firefox ([`home_of`]).
+/// Initializes a fresh Firefox profile directory at `profile` with [`PREFS`].
 pub(crate) fn make_profile(profile: &Path) -> Result<(), String> {
     remove_home(&home_of(profile));
     let _ = std::fs::remove_dir_all(profile);
@@ -211,12 +170,7 @@ pub(crate) fn home_of(profile: &Path) -> PathBuf {
     profile.join("home")
 }
 
-/// Remove the scratch `home` Firefox ran under. Foundation gives the
-/// folders it makes in a home (`Library`, `Downloads`) an access list that
-/// denies their deletion (`group:everyone deny delete`, as on the real
-/// ~/Library), so on macOS the lists are stripped first (`chmod -R -N`):
-/// without that the folders, and the verify run's scratch directory around
-/// them, outlive the run.
+/// Removes the scratch `home` directory used by Firefox.
 pub(crate) fn remove_home(home: &Path) {
     if !home.exists() {
         return;
@@ -232,12 +186,7 @@ pub(crate) fn remove_home(home: &Path) {
     let _ = std::fs::remove_dir_all(home);
 }
 
-/// Firefox's environment: `vars` (this process's) with its home moved to
-/// `home`. On macOS Firefox finds its Application Support and Caches
-/// folders through Foundation, which reads `CFFIXED_USER_HOME`, not `HOME`:
-/// with the real home it leaves empty `Firefox` folders in both in the
-/// owner's ~/Library on every run, `-profile` or not (measured with build
-/// 1543; `HOME` alone moved neither). `HOME` moves the rest.
+/// Builds Firefox's environment with `HOME` and `CFFIXED_USER_HOME` pointed at `home`.
 pub(crate) fn launch_env(
     vars: impl IntoIterator<Item = (OsString, OsString)>,
     home: &Path,
@@ -252,8 +201,7 @@ pub(crate) fn launch_env(
     env
 }
 
-/// Firefox's arguments: headless (no window), its own instance on the
-/// private `profile`, opening `url`.
+/// Returns headless Firefox command-line arguments for `profile` and `url`.
 pub(crate) fn launch_args(profile: &Path, url: &str) -> Vec<OsString> {
     vec![
         "-headless".into(),
@@ -264,9 +212,7 @@ pub(crate) fn launch_args(profile: &Path, url: &str) -> Vec<OsString> {
     ]
 }
 
-/// Whether `user_agent`, what the lane's pages report, is Firefox's: a
-/// Chromium named by `ATERM_FIREFOX` answers its pages too, and is not a
-/// Firefox session.
+/// Returns whether `user_agent` identifies a Gecko/Firefox browser.
 pub(crate) fn is_firefox(user_agent: &str) -> bool {
     user_agent.contains("Gecko/")
         && user_agent.contains("Firefox/")
@@ -308,7 +254,6 @@ mod tests {
         );
     }
 
-    /// Headless and on its own profile, opening the page; the profile holds
     /// the prefs, and a second profile made over it starts empty again.
     #[test]
     fn firefox_runs_headless_on_a_fresh_profile() {
@@ -326,7 +271,6 @@ mod tests {
         assert!(prefs.contains("\"webgl.sanitize-unmasked-renderer\", false"));
     }
 
-    /// Firefox's home, for POSIX and for Foundation, is the scratch one, set
     /// once each; the rest of the environment passes through.
     #[test]
     fn firefox_runs_under_a_scratch_home() {
@@ -348,7 +292,6 @@ mod tests {
         assert_eq!(get("PATH"), ["/bin"]);
     }
 
-    /// A home whose folders Foundation locked against deletion is removed
     /// all the same; plain removal cannot (the negative control).
     #[cfg(target_os = "macos")]
     #[test]
@@ -372,7 +315,6 @@ mod tests {
         assert!(!home.exists());
     }
 
-    /// Linux needs an X display for WebGL2, set and not empty; macOS needs
     /// none.
     #[test]
     fn firefox_on_linux_needs_a_display() {
@@ -390,7 +332,6 @@ mod tests {
         assert!(fix_for(false).contains(FIREFOX_ENV));
     }
 
-    /// A Firefox user agent is Firefox's and names its product; Chromium's,
     /// which also says "like Gecko", is not.
     #[test]
     fn only_firefox_s_user_agent_is_firefox() {

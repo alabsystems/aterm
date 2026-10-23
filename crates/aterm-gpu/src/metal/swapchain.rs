@@ -28,8 +28,9 @@ unsafe extern "C" {
     fn CGColorSpaceGetName(space: *mut c_void) -> *const c_void;
     fn CGColorSpaceRelease(space: *mut c_void);
     /// `kCGColorSpaceExtendedLinearSRGB` (scRGB): linear transfer, sRGB
+    /// primaries, unclamped components.
     static kCGColorSpaceExtendedLinearSRGB: *const c_void;
-    /// `kCGColorSpaceSRGB`, the SDR present's space. Set explicitly because an
+    /// `kCGColorSpaceSRGB`, the SDR present's space.
     static kCGColorSpaceSRGB: *const c_void;
 }
 
@@ -42,6 +43,7 @@ unsafe fn cf_string_text(name: *const c_void) -> Option<String> {
 }
 
 /// `CGSize`: two `double`s, passed and returned in `v0`/`v1` on
+/// `aarch64-apple-darwin` like [`super::ffi::ClearColor`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct CgSize {
@@ -74,26 +76,29 @@ unsafe impl aterm_objc::Encode for CgRect {
     const ENCODING: &'static str = "{CGRect={CGPoint=dd}{CGSize=dd}}";
 }
 
-/// Everything one swapchain configure sets. `Self::aterm_present` builds the
+/// Everything one swapchain configure sets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SwapchainConfig {
     /// The layer `pixelFormat`: [`PixelFormat::Bgra8Unorm`] (SDR) or
+    /// [`PixelFormat::Rgba16Float`] (EDR); anything else is rejected.
     pub(crate) format: PixelFormat,
     /// `drawableSize`, in pixels. Explicit, never derived from layer bounds.
     pub(crate) width: usize,
     pub(crate) height: usize,
     /// `framebufferOnly`: `true` gives lossless drawable compression but no
+    /// sampling or blit access.
     pub(crate) framebuffer_only: bool,
-    /// `displaySyncEnabled`. `false` is wgpu's `Immediate`, the shipped macOS
+    /// `displaySyncEnabled`.
     pub(crate) display_sync: bool,
-    /// `maximumDrawableCount`. Legal range `[2, 3]` (`CAMetalLayer.h:104-108`;
+    /// `maximumDrawableCount`.
     pub(crate) maximum_drawables: usize,
-    /// `CALayer.opaque`. `false` for the `PostMultiplied` translucent
+    /// `CALayer.opaque`.
     pub(crate) opaque: bool,
 }
 
 impl SwapchainConfig {
     /// The production macOS values: `framebufferOnly` on, display sync off
+    /// (Immediate), 3 drawables, opaque.
     #[cfg(test)]
     pub(crate) const fn aterm_present(format: PixelFormat, width: usize, height: usize) -> Self {
         Self {
@@ -137,16 +142,19 @@ impl SwapchainConfig {
     }
 }
 
-/// One configured `CAMetalLayer` and what every acquire needs. Thread-pinned
+/// One configured `CAMetalLayer` and what every acquire needs.
 #[derive(Debug)]
 pub(crate) struct Swapchain {
     /// The +1 layer. Owned; released on drop.
     layer: Obj,
     /// Keeps the attachment parent alive through deferred retirement, even when
+    /// NSView releases its layer during close.
     parent: Option<Obj>,
     /// Whether [`Self::attached`] parented the layer, and drop must unparent.
     is_attached: bool,
     /// Change gate for [`Self::sync_layer_geometry`]: the `(contentsScale,
+    /// width, height)` last written, or `None` before the first sync (always
+    /// on the standalone shape).
     applied_geometry: Option<(f64, usize, usize)>,
     format: PixelFormat,
     width: usize,
@@ -177,7 +185,7 @@ impl Swapchain {
         })
     }
 
-    /// A swapchain parented under `parent` (any `CALayer`). Adds one sublayer
+    /// A swapchain parented under `parent` (any `CALayer`).
     pub(crate) fn attached(
         device: &Device,
         parent: &Obj,
@@ -206,6 +214,8 @@ impl Swapchain {
     }
 
     /// Adopt the parent layer's `contentsScale`, so a drawable pixel is a
+    /// display pixel; a fresh `CAMetalLayer` defaults to 1.0, which on a 2x
+    /// display draws the grid at twice its size and soft.
     pub(crate) fn sync_layer_geometry(&mut self) {
         if !self.is_attached {
             return;
@@ -252,6 +262,7 @@ impl Swapchain {
     }
 
     /// The `contentsScale` read back off the live layer, not echoed from
+    /// [`Self::applied_geometry`].
     #[cfg(test)]
     pub(crate) fn contents_scale(&self) -> f64 {
         let _pool = AutoreleasePool::new();
@@ -355,6 +366,7 @@ impl Swapchain {
     }
 
     /// Apply a new config to the live layer instead of rebuilding the
+    /// `Swapchain` (resize, HDR flip, `COPY_SRC` arming).
     pub(crate) fn reconfigure(
         &mut self,
         device: &Device,
@@ -404,6 +416,7 @@ impl Swapchain {
     }
 
     /// The raw acquire: `nextDrawable` under a pool, both objects retained to
+    /// +1.
     fn raw_next_drawable(&self) -> Option<(Obj, Obj)> {
         acquire_drawable(&self.layer).map(OwnedDrawable::into_parts)
     }
@@ -535,7 +548,7 @@ impl Drop for Swapchain {
     }
 }
 
-/// A retained `CAMetalLayer` used only for `nextDrawable`. The owner defers
+/// A retained `CAMetalLayer` used only for `nextDrawable`.
 pub(crate) struct LayerAcquire {
     layer: Option<Obj>,
 }
@@ -609,6 +622,7 @@ pub(crate) struct Frame<'sc> {
     /// +1 on the `CAMetalDrawable` (retained out of the acquire pool).
     drawable: Obj,
     /// +1 on the drawable's texture — the colour attachment this frame
+    /// renders into.
     texture: Obj,
     /// The exclusive borrow that is the frame boundary.
     swapchain: &'sc mut Swapchain,
@@ -616,12 +630,15 @@ pub(crate) struct Frame<'sc> {
 
 impl Frame<'_> {
     /// The drawable's texture: the render-pass colour attachment (and, when
+    /// the layer is not `framebufferOnly`, a legal blit source for readback).
     #[inline]
     pub(crate) const fn texture(&self) -> &Obj {
         &self.texture
     }
 
     /// The drawable's texture as a sealed render target stamped with this
+    /// swapchain's loss domain, the only form the encoder's write verbs
+    /// accept; a session on a different latch is refused there.
     pub(crate) fn render_target(&self) -> super::resources::SealedTexture {
         // SAFETY: retaining a live +1 texture.
         let obj =
@@ -636,6 +653,7 @@ impl Frame<'_> {
     }
 
     /// `-[CAMetalDrawable layer]`, the layer this drawable came from; the
+    /// stacking test compares it with [`Swapchain::layer_ptr`].
     #[cfg(test)]
     pub(crate) fn drawable_layer_ptr(&self) -> Id {
         // SAFETY: object getter (+0 borrow, compared by pointer only).
@@ -646,6 +664,8 @@ impl Frame<'_> {
     }
 
     /// Present the frame: a fresh command buffer from the session's queue with
+    /// `presentDrawable:` registered before `commit` (wgpu-hal's shape), so
+    /// presentation cannot fire before the drawable's rendering is scheduled.
     pub(crate) fn present(self, session: &encoder::EncodeSession) -> Result<PresentTicket, String> {
         // The loss may land between acquire and present. Refuse before touching
         if let Some(reason) = self.swapchain.latch.reason() {
@@ -715,16 +735,21 @@ unsafe fn register_presented_handler(drawable: Id) {
 }
 
 /// The committed present's command buffer, retained so its status can be
+/// awaited and classified, plus the latch handle so the classification always
+/// reaches the latch.
 #[derive(Debug)]
 pub(crate) struct PresentTicket {
     cb: Obj,
     latch: Arc<loss::LossLatch>,
     /// The classified terminal outcome once one exists: the first terminal
+    /// wait or poll feeds the latch and fills this; later ones answer from it
+    /// (as in [`encoder::Submitted`]).
     settled: std::cell::Cell<Option<loss::CbOutcome>>,
 }
 
 impl PresentTicket {
     /// Block until the present's command buffer completes, classify it via
+    /// [`loss::outcome_of`] and feed the latch.
     pub(crate) fn wait_outcome(&self) -> loss::CbOutcome {
         if let Some(done) = self.settled.get() {
             return done;
@@ -737,7 +762,7 @@ impl PresentTicket {
         self.settle_terminal(loss::outcome_of(self.cb.id()))
     }
 
-    /// Poll: `None` while in flight, `Some(outcome)` once terminal. The first
+    /// Poll: `None` while in flight, `Some(outcome)` once terminal.
     pub(crate) fn try_outcome(&self) -> Option<loss::CbOutcome> {
         if let Some(done) = self.settled.get() {
             return Some(done);
@@ -754,7 +779,7 @@ impl PresentTicket {
         self.settle(outcome)
     }
 
-    /// Record one classified outcome on the process latch and return it. Also
+    /// Record one classified outcome on the process latch and return it.
     pub(crate) fn settle(&self, outcome: loss::CbOutcome) -> loss::CbOutcome {
         self.latch.record(&outcome);
         outcome
@@ -771,6 +796,7 @@ mod tests {
     };
 
     /// [`Swapchain::colorspace_name`]'s CFString is read by its counted UTF-16
+    /// units.
     #[test]
     fn a_colorspace_name_is_read_whole() {
         let _pool = ffi::AutoreleasePool::new();
@@ -783,6 +809,7 @@ mod tests {
     }
 
     /// The config refuses exactly what `CAMetalLayer` would throw on (or never
+    /// vend a drawable for), with the reason in the message.
     #[test]
     fn the_config_rejects_what_the_layer_would_throw_on() {
         let ok = SwapchainConfig::aterm_present(PixelFormat::Bgra8Unorm, 16, 16);
@@ -808,6 +835,7 @@ mod tests {
     }
 
     /// The standalone shape has no parent, so the sync is a no-op and must not
+    /// crash on a nil `superlayer`.
     #[test]
     fn a_standalone_swapchain_has_no_parent_to_adopt_a_scale_from() {
         let dev = device();
@@ -832,6 +860,8 @@ mod tests {
     }
 
     /// The 112-byte `Blit` uniform (`shaders/blit.metal`'s `struct Blit`) as
+    /// `repr(C)`; size checked against
+    /// [`crate::metal::blit::UNIFORM_BYTES`] at the fill site.
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct BlitUniformBytes {
@@ -857,6 +887,7 @@ mod tests {
     }
 
     /// Injected loss end to end through production plumbing: a real present's
+    /// ticket, an injected `PageFault` via [`PresentTicket::settle`], then:
     #[test]
     fn an_injected_loss_latches_and_every_later_acquire_and_present_refuses_fast() {
         use crate::metal::loss::{
@@ -961,6 +992,9 @@ mod tests {
     }
 
     /// Reconfigure storm: every axis the renderer reconfigures (sizes, both
+    /// formats, `opaque`, `framebufferOnly`, `displaySyncEnabled`,
+    /// `maximumDrawableCount`), 12 reconfigures of one live layer with an
+    /// acquire and present after each.
     #[test]
     fn a_reconfigure_storm_lands_every_axis_live_and_the_pool_follows() {
         use crate::metal::encoder::EncodeSession;
@@ -1365,6 +1399,7 @@ mod tests {
     }
 
     /// A second latch and session cross-wired with the first are refused at
+    /// every crossing:
     #[test]
     fn the_two_latch_cross_wired_present_has_no_remaining_shape() {
         use crate::metal::encoder::{EncodeSession, RenderPassDesc, StoreAction};
@@ -1487,6 +1522,7 @@ mod tests {
     }
 
     /// A raw foreign `CAMetalLayer` (the wgpu leftover) with device and
+    /// `drawableSize` set and `framebufferOnly` off.
     fn foreign_metal_layer(dev: &Device, w: usize, h: usize) -> Obj {
         let _pool = AutoreleasePool::new();
         // SAFETY: `alloc`/`init` is +1 and property setters use documented types.
@@ -1517,6 +1553,7 @@ mod tests {
     }
 
     /// Stacking: our swapchain and a live foreign `CAMetalLayer` under one
+    /// parent, both with drawables in flight:
     #[test]
     fn a_present_beside_a_live_foreign_metal_layer_touches_only_its_own_layer() {
         use crate::pipeline_table::Pipeline;
@@ -1727,6 +1764,7 @@ mod tests {
     }
 
     /// One present ticket feeds the latch exactly once across wait and poll,
+    /// however mixed; the injection seam stays uncached.
     #[test]
     fn a_present_ticket_feeds_the_latch_exactly_once_however_asked() {
         use crate::metal::loss::{CbOutcome, LossLatch};
@@ -1781,6 +1819,7 @@ mod tests {
     }
 
     /// With a sink installed, each present delivers one presented-handler
+    /// sample (on glass or skipped; an unparented layer may read `Skipped`).
     #[test]
     fn a_present_delivers_a_glass_sample_once_a_sink_listens() {
         use crate::metal::loss::{CbOutcome, LossLatch};

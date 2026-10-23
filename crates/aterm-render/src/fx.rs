@@ -1,31 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE ART REGISTRY (`docs/DESIGN-card-engine-2026-10-19.md` §4.7): the one
-//! place an effect turns its pictures into [`FxArt`]s, and the CPU painting a
-//! tool or a test draws fx layers and glow quads with.
-//!
-//! [`registry`] is process-wide and content-addressed: an art is interned by
-//! its 128-bit id ([`FxArt::id`]), so two producers (two cards, two windows)
-//! that build the same picture share one `Arc`, and a GPU atlas that keys
-//! residency on the id uploads it once. It holds its arts weakly: an art no
-//! producer keeps any more is dropped, and built again on demand.
-//!
-//! The builders are pure and OFF the frame path: an emitter builds its arts
-//! once (per cell size, for the harness card) and draws them frame after
-//! frame by palette alone.
-//!
-//! * [`indexed`]: art strings to an Index8 art, `'.'` transparent.
-//! * [`pieces`]: ordered rectangles (a star's needles, nucleus, points and
-//!   glints) to a [`PieceArt`], in two forms. FOLDED, one Index8 art whose
-//!   texel names the CLASS of the pixel (the pieces covering it, in order),
-//!   for a frame whose every piece ink is additive: its palette holds each
-//!   class's `add_sat` sum, exact because a saturating sum of non-negative
-//!   terms is associative. PEELED, `D` Index8 arts where art `j` names the
-//!   `j`-th piece covering each pixel: drawn in order, each with the pieces'
-//!   inks, they fold every pixel through `over_premul` in exactly the order
-//!   the pieces were laid, so they are exact for any inks.
-//! * [`rgba`]: premultiplied RGBA texels to an Rgba8Premul art.
+//! THE ART REGISTRY (`docs/DESIGN-card-engine-2026-10-19.md` §4.7): the one place an effect turns its pictures into [`FxArt`]s, and the CPU painting a tool or a test draws fx layers and glow quads with.
 
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
@@ -61,11 +37,7 @@ pub fn registry() -> &'static FxRegistry {
 }
 
 impl FxRegistry {
-    /// `art` interned: the live `Arc` of an art with the same id, size, kind
-    /// and bytes when one is held anywhere in the process, else `art` itself,
-    /// now held (weakly) for the next producer. An id shared by different
-    /// bytes (a 128-bit collision) keeps the art already held and hands back
-    /// `art` unshared.
+    /// `art` interned: the live `Arc` of an art with the same id, size, kind and bytes when one is held anywhere in the process, else `art` itself, now held (weakly) for the next producer.
     pub fn intern(&self, art: FxArt) -> Arc<FxArt> {
         let mut t = self.arts.lock().unwrap_or_else(PoisonError::into_inner);
         let id = art.id();
@@ -116,11 +88,7 @@ fn art_dimensions(w: usize, h: usize) -> Option<(u16, u16, usize)> {
     Some((w, h, usize::from(w).checked_mul(usize::from(h))?))
 }
 
-/// An Index8 art from art strings: one row a string, every row as long as
-/// the first, `'.'` transparent (texel 0) and `chars[k]` texel `k + 1`, so a
-/// sprite of it at palette base `ink` paints `chars[k]` in entry `ink + k`.
-/// Interned. `None` for a ragged row, a byte neither `'.'` nor in `chars`,
-/// more than 255 characters, or a side past [`aterm_core::render::FX_ART_MAX_SIDE`].
+/// An Index8 art from art strings: one row a string, every row as long as the first, `'.'` transparent (texel 0) and `chars[k]` texel `k + 1`, so a sprite of it at palette base `ink` paints `chars[k]` in entry `ink + k`.
 #[must_use]
 pub fn indexed(rows: &[&str], chars: &[u8]) -> Option<Arc<FxArt>> {
     count_build();
@@ -149,9 +117,7 @@ pub fn indexed(rows: &[&str], chars: &[u8]) -> Option<Arc<FxArt>> {
     Some(registry().intern(art))
 }
 
-/// An Rgba8Premul art of `w × h` texels (`R, G, B, A` bytes, premultiplied,
-/// row-major). Interned. `None` when the bytes are not `w · h · 4` long or a
-/// side is too long.
+/// An Rgba8Premul art of `w × h` texels (`R, G, B, A` bytes, premultiplied, row-major).
 #[must_use]
 pub fn rgba(w: u16, h: u16, premul: impl Into<Box<[u8]>>) -> Option<Arc<FxArt>> {
     count_build();
@@ -159,9 +125,7 @@ pub fn rgba(w: u16, h: u16, premul: impl Into<Box<[u8]>>) -> Option<Arc<FxArt>> 
     Some(registry().intern(art))
 }
 
-/// Ordered rectangles as art ([`pieces`]): the folded and the peeled forms of
-/// one picture, both laid with their top-left texel at [`Self::origin`] in
-/// the pieces' own space.
+/// Ordered rectangles as art ([`pieces`]): the folded and the peeled forms of one picture, both laid with their top-left texel at [`Self::origin`] in the pieces' own space.
 #[derive(Clone, Debug)]
 pub struct PieceArt {
     origin: (i32, i32),
@@ -171,8 +135,7 @@ pub struct PieceArt {
 }
 
 impl PieceArt {
-    /// Where the arts' top-left texel lies in the pieces' space: a sprite
-    /// that lays the pieces at `(x, y)` sits at `(x + origin.0, y + origin.1)`.
+    /// Where the arts' top-left texel lies in the pieces' space: a sprite that lays the pieces at `(x, y)` sits at `(x + origin.0, y + origin.1)`.
     #[inline]
     #[must_use]
     pub const fn origin(&self) -> (i32, i32) {
@@ -186,16 +149,14 @@ impl PieceArt {
         &self.folded
     }
 
-    /// Each class's member pieces, in the order they were laid (a piece id
-    /// once per covering piece): class `k − 1` for folded texel `k`.
+    /// Each class's member pieces, in the order they were laid (a piece id once per covering piece): class `k − 1` for folded texel `k`.
     #[inline]
     #[must_use]
     pub const fn classes(&self) -> &[Box<[u8]>] {
         &self.classes
     }
 
-    /// The peeled arts: in art `j`, texel `id + 1` names the `j`-th piece
-    /// covering the pixel (piece id `id`), `0` where fewer cover it.
+    /// The peeled arts: in art `j`, texel `id + 1` names the `j`-th piece covering the pixel (piece id `id`), `0` where fewer cover it.
     #[inline]
     #[must_use]
     pub const fn peeled(&self) -> &[Arc<FxArt>] {
@@ -210,10 +171,7 @@ impl PieceArt {
     }
 }
 
-/// The folded and the peeled arts of the rectangles `laid`, in order, each
-/// with its piece id (`0..=254`: a peeled texel is `id + 1`), interned
-/// (design §4.7). An empty rectangle is skipped. `None` with nothing to lay,
-/// an id of 255, more than 255 classes, or a hull past the art's longest side.
+/// The folded and the peeled arts of the rectangles `laid`, in order, each with its piece id (`0..=254`: a peeled texel is `id + 1`), interned (design §4.7).
 #[must_use]
 pub fn pieces(laid: &[(PxRect, u8)]) -> Option<PieceArt> {
     count_build();
@@ -227,7 +185,6 @@ pub fn pieces(laid: &[(PxRect, u8)]) -> Option<PieceArt> {
     let w = usize::try_from(i64::from(hull.x1) - i64::from(hull.x0)).ok()?;
     let h = usize::try_from(i64::from(hull.y1) - i64::from(hull.y0)).ok()?;
     let (w16, h16, len) = art_dimensions(w, h)?;
-    // Each pixel's covering pieces, in the order laid.
     let mut cover: Vec<Vec<u8>> = vec![Vec::new(); len];
     for &(r, id) in laid.iter().filter(|(r, _)| !r.is_empty()) {
         for y in r.y0..r.y1 {
@@ -276,8 +233,7 @@ pub fn pieces(laid: &[(PxRect, u8)]) -> Option<PieceArt> {
 
 /// The most exact rectangles [`cover`] retains before merging: an art whose
 /// row bands need more is covered by the one rectangle round
-/// its drawing texels. This bounds the retained merge input; the candidate
-/// unions still sort and no sharp time bound is claimed.
+/// its drawing texels.
 const COVER_EXACT_MAX: usize = 2048;
 
 /// Whether texel `i` of `art` can write a byte: an Index8 texel above 0, an
@@ -354,28 +310,7 @@ fn run_union(a: &[(u32, u32)], b: &[(u32, u32)]) -> Vec<(u32, u32)> {
     out
 }
 
-/// A COVER of `art` (design §4.7 as built): at most `max` texel rectangles
-/// (at least one), pairwise disjoint, whose union holds every texel that can
-/// write a byte ([`draws`]). A sprite of the art drawn as one item per
-/// rectangle, each the rectangle's pixels ([`cover_px`]) as its clip, draws
-/// exactly the bytes the whole sprite draws, since no texel is in two items
-/// and every texel left out writes nothing, while no fragment runs over the
-/// rest of its box: an outline round a picture (the card's rim) is a few
-/// percent of its box.
-///
-/// Bands of rows, each its column runs: first the exact cover (each row's
-/// runs, consecutive rows of the same runs one band), then, while it holds
-/// more than `max` rectangles, the step that adds the least area for each
-/// rectangle it saves, of three: a band's two nearest runs as one, or two
-/// neighbouring bands as one (over the rows between them too), of their
-/// runs' union or of the one run round them both. Each rectangle is last
-/// cut to the rows of its run that draw. Bands share no row and a band's
-/// runs no column, so the rectangles never meet.
-/// Pure; the rim producer builds it on its first ask. The merge cost grows with the
-/// retained runs (its candidate unions sort); no sharp time bound is claimed.
-/// More than [`COVER_EXACT_MAX`] exact rectangles falls back while collecting,
-/// with only one row of additional scratch, to the drawing hull. Empty when
-/// nothing draws.
+/// A COVER of `art` (design §4.7 as built): at most `max` texel rectangles (at least one), pairwise disjoint, whose union holds every texel that can write a byte ([`draws`]).
 #[must_use]
 pub fn cover(art: &FxArt, max: usize) -> Box<[PxRect]> {
     let (w, h) = (usize::from(art.w()), usize::from(art.h()));
@@ -406,8 +341,6 @@ pub fn cover(art: &FxArt, max: usize) -> Box<[PxRect]> {
         match bands.last_mut() {
             Some(b) if b.y1 == y as u32 && b.runs == runs => b.y1 += 1,
             _ => {
-                // The exact count only grows: a later row can extend the last
-                // band but cannot retire an earlier band. Switch to the hull
                 // before keeping more, with only this one row of scratch live.
                 if count + runs.len() > COVER_EXACT_MAX {
                     return drawing_hull(art);
@@ -422,8 +355,6 @@ pub fn cover(art: &FxArt, max: usize) -> Box<[PxRect]> {
         }
     }
     while count > max {
-        // The cheapest step: the least area added per rectangle saved,
-        // compared as cross products (exact); the first of equals.
         let mut best: Option<(u64, u64, usize, Step)> = None;
         let mut consider = |added: u64, saved: u64, at: usize, step: Step| {
             if saved == 0 {
@@ -450,7 +381,6 @@ pub fn cover(art: &FxArt, max: usize) -> Box<[PxRect]> {
                 };
                 let (was, union_area) = (b.area() + next.area(), width(&union) * rows);
                 consider(union_area - was, (n - union.len()) as u64, i, Step::Join);
-                // Both as one run: always saves, so a cover can always shrink.
                 let hull = u64::from(union[union.len() - 1].1 - union[0].0) * rows;
                 consider(hull - was, n as u64 - 1, i, Step::Hull);
             }
@@ -491,11 +421,7 @@ pub fn cover(art: &FxArt, max: usize) -> Box<[PxRect]> {
     out.into_boxed_slice()
 }
 
-/// The item-local pixels a sprite of a `w × h` art drawn at `dw × dh`
-/// (mirrored under `flip_x`) lays texel rectangle `t` on, by pixel law F:
-/// pixel `l` reads texel `⌊l·w / dw⌋`, so the columns reading `[t0, t1)` are
-/// `[⌈t0·dw / w⌉, ⌈t1·dw / w⌉)`, and under `flip_x` those reading
-/// `[w − t1, w − t0)`; the rows alike. Empty for an empty art.
+/// The item-local pixels a sprite of a `w × h` art drawn at `dw × dh` (mirrored under `flip_x`) lays texel rectangle `t` on, by pixel law F: pixel `l` reads texel `⌊l·w / dw⌋`, so the columns reading `t0, t1)` are `⌈t0·dw / w⌉, ⌈t1·dw / w⌉)`, and under `flip_x` those reading `w − t1, w − t0)`; the rows alike.
 #[inline]
 #[must_use]
 pub const fn cover_px(t: PxRect, (w, h): (u16, u16), (dw, dh): (u16, u16), flip_x: bool) -> PxRect {
@@ -514,12 +440,9 @@ pub const fn cover_px(t: PxRect, (w, h): (u16, u16), (dw, dh): (u16, u16), flip_
     }
     #[inline]
     const fn up(v: i32, n: u16, d: u16) -> i32 {
-        // Non-negative: the ceiling is the floor of `v·d + n − 1`.
         let v = clamp_i32(v, n as i32) as i64;
         ((v * (d as i64) + (n as i64) - 1) / (n as i64)) as i32
     }
-    // Clamp arbitrary public edges, including EVERYWHERE's MIN/MAX, before
-    // subtracting them. Mirroring an unclamped MIN would overflow i32.
     let (tx0, tx1) = (clamp_i32(t.x0, w as i32), clamp_i32(t.x1, w as i32));
     let (tx0, tx1) = if flip_x {
         (w as i32 - tx1, w as i32 - tx0)
@@ -534,11 +457,7 @@ pub const fn cover_px(t: PxRect, (w, h): (u16, u16), (dw, dh): (u16, u16), flip_
     )
 }
 
-/// Paint `layers` onto `px` (`frame.w × frame.h`, row-major) as the CPU
-/// renderer composites them, every band open: slot by slot (Under, Glow,
-/// Over), each slot's Exact layers before its Linear ones, minus
-/// `occluders`. The renderers' own slicer and stamp, without a renderer: for
-/// a tool or a test that wants an effect's pixels.
+/// Paint `layers` onto `px` (`frame.w × frame.h`, row-major) as the CPU renderer composites them, every band open: slot by slot (Under, Glow, Over), each slot's Exact layers before its Linear ones, minus `occluders`.
 pub fn paint_layers(px: &mut [u32], frame: &FxFrame, layers: &[FxLayer], occluders: &[PxRect]) {
     if frame
         .w
@@ -564,11 +483,7 @@ pub fn paint_layers(px: &mut [u32], frame: &FxFrame, layers: &[FxLayer], occlude
     }
 }
 
-/// Paint `quads` onto `px` (`w × h`, row-major) by the glow streams' one law
-/// (`Renderer::draw_flat_add`'s span loop: per column the ramp between the
-/// quad's ends, `over_premul`, additive at alpha 0), each moved by `off` and
-/// cut at the buffer's edges, with no row gate. What a quad stream puts on
-/// the glass, for a tool or a test to hold fx layers to.
+/// Paint `quads` onto `px` (`w × h`, row-major) by the glow streams' one law (`Renderer::draw_flat_add`'s span loop: per column the ramp between the quad's ends, `over_premul`, additive at alpha 0), each moved by `off` and cut at the buffer's edges, with no row gate.
 pub fn paint_quads(px: &mut [u32], w: usize, h: usize, quads: &[GlowQuad], off: (usize, usize)) {
     if w.checked_mul(h).is_none_or(|len| px.len() < len) {
         return;
@@ -668,7 +583,6 @@ mod tests {
 
     /// AN ART IS INTERNED ONCE: the same picture built twice, while either is
     /// held, is one `Arc`; dropped by every producer, it is built afresh.
-    /// CONTROL: another byte is another art.
     #[test]
     fn an_art_is_interned_once() {
         let a = indexed(&["ab.", ".ba"], b"ab").expect("an art");
@@ -717,8 +631,6 @@ mod tests {
     /// random ground equal, byte for byte, the folded art under each class's
     /// `add_sat` sum where every ink is additive, and the peeled arts drawn
     /// in order under the pieces' inks for translucent and opaque inks.
-    /// NEGATIVE CONTROL: the fold, given translucent inks, is not the laying
-    /// (source-over does not reorder), which is why the peel exists.
     #[test]
     fn the_fold_and_the_peel_are_exact() {
         let (w, h) = (64usize, 64usize);
@@ -746,7 +658,6 @@ mod tests {
                     .collect();
                 let mut want = ground.clone();
                 lay_in_order(&mut want, w, &laid, &inks, at);
-                // The fold: each class's members summed.
                 let sums: Vec<FxInk> = art
                     .classes()
                     .iter()
@@ -756,8 +667,6 @@ mod tests {
                                 crate::add_sat(s, inks[usize::from(id)].color) & 0x00FF_FFFF
                             }))
                         } else {
-                            // A fold of over inks has no exact class ink:
-                            // the last member's stands in, as a careless
                             // fold would.
                             inks[usize::from(*m.last().expect("a member"))]
                         }
@@ -839,7 +748,6 @@ mod tests {
                     FxTexels::Rgba8Premul | FxTexels::Rgba8Straight => {
                         let a = (next() % 256) as u8;
                         let c = if on { [a / 2, a / 3, a, a] } else { [0; 4] };
-                        // A premultiplied texel of no alpha still adds light.
                         let c = if on && next().is_multiple_of(5) {
                             [40, 0, 9, 0]
                         } else {
@@ -855,8 +763,7 @@ mod tests {
 
     /// One frame of `art` at `(x, y)` scaled to `dw × dh` (mirrored under
     /// `flip`) on a random ground: the whole sprite once, then one item per
-    /// rectangle of `clips` (item-local pixels, each an item's clip). The
-    /// two buffers.
+    /// rectangle of `clips` (item-local pixels, each an item's clip).
     fn whole_and_covered(
         art: &Arc<FxArt>,
         clips: &[PxRect],
@@ -903,9 +810,7 @@ mod tests {
     /// and drawn as one item per cover rectangle (its pixels the item's
     /// clip), are the same bytes on a random ground; the rectangles are at
     /// most `max`, inside the art, pairwise disjoint, and hold every texel
-    /// that draws. NEGATIVE CONTROLS: a cover short of its last rectangle,
-    /// and rectangles laid by the floor of `t·dw / w` instead of its ceiling,
-    /// each lose bytes on some frame.
+    /// that draws.
     #[test]
     fn a_cover_draws_its_sprites_bytes() {
         let mut next = rng(0xC0_7E2);
@@ -964,7 +869,6 @@ mod tests {
                     let (whole, covered) = whole_and_covered(&art, short, at, &ground, &palette);
                     short_breaks += usize::from(whole != covered);
                 }
-                // CONTROL: the floor's mapping, laid by hand.
                 let down = |v: i32, n: u16, d: u16| v * i32::from(d) / i32::from(n);
                 let floor: Vec<PxRect> = rects
                     .iter()
@@ -993,8 +897,6 @@ mod tests {
         );
         assert!(floor_breaks > 0, "CONTROL: the floor's mapping loses bytes");
 
-        // Public rectangles may carry unbounded or out-of-domain edges. Both
-        // mirrors keep the full sprite's bytes after clipping to the art.
         let art = Arc::new(FxArt::new(4, 3, FxTexels::Index8, vec![1; 12]).unwrap());
         let ground = vec![0x12_34_56; 48 * 48];
         let palette = [FxInk::over(0xAA_BB_CC, 255)];
@@ -1061,7 +963,6 @@ mod tests {
         assert_eq!(cover(&art, 1).len(), 1, "one rectangle: the box");
         let blank = FxArt::new(4, 4, FxTexels::Index8, vec![0; 16]).expect("an art");
         assert!(cover(&blank, 8).is_empty());
-        // Past COVER_EXACT_MAX runs the cover is the box round them.
         let checks = |w: usize, h: usize| {
             let data: Vec<u8> = (0..w * h)
                 .map(|i| u8::from((i % w + i / w).is_multiple_of(2)))
@@ -1079,8 +980,6 @@ mod tests {
             COVER_EXACT_MAX,
             "CONTROL: 2048 runs are each a rectangle"
         );
-        // The collector overflows before this final isolated row is seen. The
-        // fallback must still scan the whole art, not return its prefix hull.
         let mut late = vec![0u8; 128 * 70];
         for (i, byte) in late[..128 * 64].iter_mut().enumerate() {
             *byte = u8::from((i % 128 + i / 128).is_multiple_of(2));

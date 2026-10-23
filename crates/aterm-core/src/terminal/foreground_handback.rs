@@ -156,6 +156,8 @@ impl Terminal {
     }
 
     /// The shared body of [`Self::foreground_handback_scoped`] (`owned` = the
+    /// gate's verdict, `manual` false) and [`Self::manual_handback`] (both
+    /// true).
     fn handback(&mut self, owned: bool, manual: bool) -> Option<ForegroundHandback> {
         let clock = ClockReading::now();
         let mut bytes: Vec<u8> = Vec::new();
@@ -211,6 +213,8 @@ impl Terminal {
     }
 
     /// The manual reset's colour step: exactly the OSC resets that clear what a
+    /// program set over the configured colours ([`Self::program_color_overrides`]),
+    /// each ST-terminated, and `"colors"` when there was any.
     fn manual_colour_reset(&self, bytes: &mut Vec<u8>, reverted: &mut Vec<&'static str>) {
         let o = self.color.capture_overrides();
         let start = bytes.len();
@@ -232,6 +236,7 @@ impl Terminal {
     }
 
     /// Phase A of [`Self::foreground_handback`]: the byte plan's steps 1–12,
+    /// computed from the live state (nothing is processed here).
     fn handback_phase_a(&self, bytes: &mut Vec<u8>, reverted: &mut Vec<&'static str>) {
         let m = self.modes;
         let cfg = self.configured_modes;

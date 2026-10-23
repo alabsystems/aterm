@@ -1,18 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A dark-theme weight nudge (`font_weight_dark_nudge`) never re-grids: a
-//! light↔dark theme flip leaves the cell box unchanged at EVERY size a window
-//! of the renderer can be asked for, not only at the size that happens to be
-//! active when the nudge is decided. A window on a display of another scale,
-//! or a zoom, asks [`Renderer::cell_geometry`] at another px, and a box that
-//! moved there resizes that tab's PTY.
+//! Tests verifying that `font_weight_dark_nudge` never changes cell geometry across sizes.
 
 use super::*;
 
 const WGHT: u32 = u32::from_be_bytes(*b"wght");
 
-/// The sizes the box is compared at: what windows at 1x, 1.5x, 2x and 3x of
 /// the common font sizes ask for, and the 9 px the defect was found at.
 const SIZES: [f32; 12] = [
     9.0, 11.0, 12.0, 13.5, 16.0, 18.0, 19.5, 24.0, 27.0, 32.0, 36.0, 48.0,
@@ -29,8 +23,6 @@ fn light() -> Theme {
     }
 }
 
-/// The checked-in variable face (Cinzel, `wght` 400..900) as a user's own
-/// font file: one byte of padding, so it is not the bundled display face.
 /// Its `'M'` advance moves with `wght` (it is not monospaced).
 fn cinzel() -> Vec<u8> {
     let mut bytes = include_bytes!("../assets/game/Cinzel-var.ttf").to_vec();
@@ -57,7 +49,6 @@ fn moved_at(a: &[CellGeometry], b: &[CellGeometry]) -> Vec<f32> {
         .collect()
 }
 
-/// A renderer over `bytes` at `px` on the default (dark) theme, configured
 /// with `requests` and `nudge`.
 fn configured(bytes: &[u8], px: f32, requests: &[(u32, f32)], nudge: f32) -> Renderer {
     let mut r = Renderer::from_bytes(bytes, px, Theme::default()).expect("parses");
@@ -66,22 +57,6 @@ fn configured(bytes: &[u8], px: f32, requests: &[(u32, f32)], nudge: f32) -> Ren
     r
 }
 
-/// The reviewer's case (2026-10-16): Cinzel at `wght` 500 with a nudge of
-/// 100. Its 600 instance has the 500 instance's box at 16 px but not at 9 px,
-/// so a gate that compares the two boxes at the active size alone admits the
-/// nudge at 16 px and a theme flip then moves the box of a window at 9 px.
-/// Whatever size is active when the nudge is decided, a flip either way now
-/// moves no box at any size, and the kept answers are what the face derives.
-///
-/// NEGATIVE CONTROL: the 600 instance's own box does move against the 500
-/// one's at some size in [`SIZES`] while it holds at 16 px, so the one-size
-/// gate would have admitted it there (measured before the fix: built at
-/// 16 px, the flip to light moved the box at 9 and 27 px).
-///
-/// Held twice, and mutation-checked: the gate refuses this nudge (restoring
-/// the one-size gate fails the next test), and the box is derived from the
-/// un-nudged instance whatever the gate admits (deriving it from the drawn
-/// instance fails the SF Mono test's "derives nothing"). Undoing both fails
 /// this one.
 #[test]
 fn a_theme_flip_moves_no_cell_box_at_any_size() {
@@ -121,18 +96,6 @@ fn a_theme_flip_moves_no_cell_box_at_any_size() {
     }
 }
 
-/// For these configurations the nudge is decided the same at every active
-/// size: the same configuration resolves the same dark-theme instance, and a
-/// dark→dark theme change made while another size is active keeps it.
-///
-/// Not every configuration: the advance check (`dark_nudge_permitted`, the
-/// 0.25 px gate a model is bound to) is still measured at the active size,
-/// so a weight on a rounding plateau of the face's advances can draw a
-/// different weight at different active sizes —
-/// `a_nudge_decided_by_size_still_moves_no_box` pins that the GRID never
-/// follows it.
-///
-/// NEGATIVE CONTROL: before the fix Cinzel 500 + 100 resolved 500 at 9 px
 /// and 600 at 16 px.
 #[test]
 fn the_nudge_does_not_depend_on_the_active_size() {
@@ -166,12 +129,6 @@ fn the_nudge_does_not_depend_on_the_active_size() {
     }
 }
 
-/// THE GRID NEVER FOLLOWS THE ADVANCE CHECK'S SIZE: Cinzel at `wght` 600
-/// with a nudge of 5 sits on a rounding plateau of its advances, so the
-/// check admits the nudge at small active sizes and refuses it at larger
-/// ones — the drawn weight depends on the size active when it is decided —
-/// yet the cell box at every size in [`SIZES`] is the plain configuration's
-/// either way, since the box is derived from the un-nudged instance.
 /// CONTROL: the decision really does differ between two active sizes.
 #[test]
 fn a_nudge_decided_by_size_still_moves_no_box() {
@@ -194,20 +151,12 @@ fn a_nudge_decided_by_size_still_moves_no_box() {
     );
 }
 
-/// The system SF Mono, a variable face every macOS ships: monospaced, so its
 /// instances share one `'M'` advance and one set of line metrics.
 #[cfg(target_os = "macos")]
 fn sf_mono() -> Vec<u8> {
     std::fs::read("/System/Library/Fonts/SFNSMono.ttf").expect("macOS ships SFNSMono.ttf")
 }
 
-/// A nudge whose instance keeps the face's metrics is kept (SF Mono, 400 →
-/// 500 on a dark theme), and the theme is not an input of the cell box: a
-/// flip either way changes the instance the glyphs are drawn at, moves no box
-/// at any size, and derives nothing — the answers kept for four windows'
-/// sizes stay kept, and they are what the face derives now.
-///
-/// NEGATIVE CONTROL: a write that is an input of the box (the line height)
 /// derives each kept size again.
 #[cfg(target_os = "macos")]
 #[test]

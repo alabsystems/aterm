@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The parser and its `serde::Deserializer`: RFC 8259 under the rules the
-//! crate docs list (one value then end-of-input, bounded nesting, duplicate
-//! keys delivered to the visitor).
+//! RFC 8259 JSON parser and `serde::Deserializer`.
 
 use std::borrow::Cow;
 
@@ -12,28 +10,21 @@ use serde::de::{self, IntoDeserializer as _, Visitor};
 
 use crate::error::{Error, Result};
 
-/// Maximum nesting depth, matching `serde_json`'s default. Reached by arrays
-/// and objects alike; the count is the deserializer's own recursion, which is
-/// what a stack overflow would come from.
+/// Maximum container nesting depth (`128`, matching `serde_json`).
 pub const RECURSION_LIMIT: u32 = 128;
 
-/// A JSON deserializer over a byte slice.
+/// JSON deserializer over a byte slice.
 pub struct Deserializer<'de> {
     input: &'de [u8],
     pos: usize,
     depth: u32,
     /// Refuse an integer literal too wide for `u64`/`i64` instead of widening
     /// it to `f64`.
-    ///
-    /// OFF for `from_str`/`from_slice`, which must read what a server sent the
-    /// way `serde_json` reads it: a 30-digit integer in a wire document IS a
-    /// float to both. ON for [`crate::to_value`], whose contract is a LOSSLESS
-    /// round-trip through the text form — see the note there.
     exact_integers: bool,
 }
 
 impl<'de> Deserializer<'de> {
-    /// Build a deserializer over `input`.
+    /// Creates a deserializer over `input`.
     #[inline]
     #[must_use]
     pub const fn from_slice(input: &'de [u8]) -> Self {
@@ -45,8 +36,7 @@ impl<'de> Deserializer<'de> {
         }
     }
 
-    /// As [`Self::from_slice`], but an integer literal that does not fit
-    /// `u64`/`i64` is an ERROR rather than an `f64`.
+    /// Creates a deserializer that rejects integers wider than `u64`/`i64` instead of widening to `f64`.
     #[inline]
     pub(crate) const fn exact(input: &'de [u8]) -> Self {
         Self {
@@ -69,12 +59,11 @@ impl<'de> Deserializer<'de> {
     }
 
     #[inline]
-    fn bump(&mut self) {
+    const fn bump(&mut self) {
         self.pos = self.pos.saturating_add(1);
     }
 
-    /// Skip RFC 8259 whitespace: space, tab, newline, carriage return. Nothing
-    /// else — a JSON comment is not whitespace, and neither is a form feed.
+    /// Skip RFC 8259 whitespace: space, tab, newline, carriage return.
     #[inline]
     fn skip_ws(&mut self) {
         while let Some(byte) = self.peek() {
@@ -116,7 +105,6 @@ impl<'de> Deserializer<'de> {
     #[inline]
     fn enter(&mut self) -> Result<()> {
         self.depth = self.depth.saturating_add(1);
-        // As `serde_json`: 127 nested containers parse, 128 do not.
         if self.depth >= RECURSION_LIMIT {
             return Err(self.err("recursion limit exceeded"));
         }
@@ -124,11 +112,11 @@ impl<'de> Deserializer<'de> {
     }
 
     #[inline]
-    fn leave(&mut self) {
+    const fn leave(&mut self) {
         self.depth = self.depth.saturating_sub(1);
     }
 
-    /// Everything after the parsed value must be whitespace.
+    /// Verifies that only whitespace remains after the parsed value.
     pub(crate) fn end(&mut self) -> Result<()> {
         self.skip_ws();
         if self.pos >= self.input.len() {
@@ -138,13 +126,7 @@ impl<'de> Deserializer<'de> {
         }
     }
 
-    // ── strings ────────────────────────────────────────────────────────────
-
     /// Parse a string body, the opening quote already consumed.
-    ///
-    /// Returns a BORROWED slice whenever the body contains no escapes, which is
-    /// the overwhelmingly common case and what keeps struct deserialization
-    /// allocation-free for every field name.
     fn parse_string_body(&mut self) -> Result<Cow<'de, str>> {
         let start = self.pos;
         loop {
@@ -161,12 +143,10 @@ impl<'de> Deserializer<'de> {
                     };
                 }
                 b'\\' => break,
-                // RFC 8259: unescaped control characters are not allowed.
                 0x00..=0x1F => return Err(self.err("control character in string")),
                 _ => self.bump(),
             }
         }
-        // Escaped: build an owned string, starting from what was already scanned.
         let head = self.input.get(start..self.pos).unwrap_or(&[]);
         let mut out = match core::str::from_utf8(head) {
             Ok(text) => String::from(text),
@@ -207,7 +187,6 @@ impl<'de> Deserializer<'de> {
     }
 
     /// Validate a discarded string without allocating its decoded contents.
-    /// Escapes and UTF-8 use the same checks as the materializing reader.
     fn skip_string_body(&mut self) -> Result<()> {
         let mut chunk = self.pos;
         loop {
@@ -255,9 +234,6 @@ impl<'de> Deserializer<'de> {
             return Ok(ch);
         }
         let first = self.parse_hex4()?;
-        // A surrogate half is only meaningful as part of a pair; a lone one is
-        // not a character and cannot be encoded, so it is refused rather than
-        // silently replaced.
         let ch = if (0xD800..0xDC00).contains(&first) {
             if self.peek() != Some(b'\\') {
                 return Err(self.err("unpaired high surrogate in \\u escape"));
@@ -271,7 +247,6 @@ impl<'de> Deserializer<'de> {
             if !(0xDC00..0xE000).contains(&second) {
                 return Err(self.err("invalid low surrogate in \\u escape"));
             }
-            // U+10000 + ((hi - D800) << 10) + (lo - DC00).
             let hi = u32::from(first).saturating_sub(0xD800);
             let lo = u32::from(second).saturating_sub(0xDC00);
             let combined = 0x1_0000u32
@@ -298,32 +273,19 @@ impl<'de> Deserializer<'de> {
                 b'A'..=b'F' => u16::from(byte.saturating_sub(b'A')).saturating_add(10),
                 _ => return Err(self.err("invalid hex digit in \\u escape")),
             };
-            // Four hex digits never exceed u16, so neither op saturates.
             value = value.wrapping_mul(16).wrapping_add(digit);
             self.bump();
         }
         Ok(value)
     }
 
-    // ── numbers ────────────────────────────────────────────────────────────
-
     /// Validate a JSON number against the grammar and classify it.
-    ///
-    /// An integer that fits `u64`/`i64` stays an integer; anything else — a
-    /// fraction, an exponent, or a magnitude past 64 bits — becomes `f64`,
-    /// which is exactly where `serde_json` draws the line.
-    ///
-    /// The exact text and whether it carried a fraction or an exponent come
-    /// back too: the 128-bit entry points need them to widen an integer the
-    /// `f64` classification would have rounded.
     fn parse_number(&mut self) -> Result<Parsed<'de>> {
         let start = self.pos;
         let negative = self.peek() == Some(b'-');
         if negative {
             self.bump();
         }
-        // int = "0" / digit1-9 *DIGIT — a leading zero may not be followed by
-        // more digits.
         match self.peek() {
             Some(b'0') => {
                 self.bump();
@@ -375,11 +337,6 @@ impl<'de> Deserializer<'de> {
         if !floating {
             if negative {
                 if let Ok(value) = text.parse::<i64>() {
-                    // `-0` is not the integer zero to `serde_json`: with no
-                    // fraction and no exponent it still parses as the FLOAT
-                    // negative zero, so `Value` renders it `-0.0` AND a typed
-                    // `u64` field REFUSES it. Kept as its own case so the
-                    // f64 conversion below cannot lose the sign.
                     return Ok(wrap(if value == 0 {
                         Num::NegZero
                     } else {
@@ -390,21 +347,11 @@ impl<'de> Deserializer<'de> {
                 return Ok(wrap(Num::Unsigned(value)));
             }
             if self.exact_integers {
-                // Strict mode: an integer literal past 64 bits would become an
-                // f64 below, which is exactly the rounding `to_value` must not
                 // do silently.
                 return Err(self.err("number out of range"));
             }
         }
-        // Out of integer range, or genuinely fractional. `f64::from_str` accepts
-        // a superset of the JSON grammar, but the grammar was already enforced
-        // above, so this only ever sees a valid number.
         match text.parse::<f64>() {
-            // A magnitude past `f64::MAX` is refused rather than quietly
-            // becoming infinity — JSON cannot represent infinity, so a document
-            // that reads back as `null` would not be the document that was
-            // parsed. Underflow to zero is NOT refused: `1e-400` is zero to
-            // every JSON reader, `serde_json` included.
             Ok(value) if value.is_infinite() => Err(self.err("number out of range")),
             Ok(value) => Ok(wrap(Num::Float(value))),
             Err(_) => Err(self.err("invalid number")),
@@ -412,10 +359,6 @@ impl<'de> Deserializer<'de> {
     }
 
     /// Hand a parsed number to `visitor`.
-    ///
-    /// `-0` goes to this visitor as floating negative zero, as in `serde_json`:
-    /// `from_str::<u64>("-0")` is an error. The separate `deserialize_wide`
-    /// entry point accepts it as integer zero for `i128`.
     fn visit_number<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value> {
         let parsed = self.parse_number()?;
         Self::dispatch(parsed.value, visitor)
@@ -432,10 +375,6 @@ impl<'de> Deserializer<'de> {
     }
 
     /// Consume the closing bracket of an array or object.
-    ///
-    /// Anything else means the visitor stopped early with elements left over —
-    /// a three-element JSON array read into a `[u8; 2]`, say — which is an
-    /// error, not a truncation.
     fn end_container(&mut self, close: u8, what: &str) -> Result<()> {
         if self.peek_value()? == close {
             self.bump();
@@ -473,8 +412,6 @@ impl<'de> Deserializer<'de> {
                 return visitor.visit_u128(wide);
             }
         }
-        // Not an integer of this signedness and width: the ordinary dispatch
-        // reports the type error the visitor would have reported anyway.
         Self::dispatch(parsed.value, visitor)
     }
 
@@ -501,7 +438,6 @@ impl<'de> Deserializer<'de> {
                     }
                     if !first {
                         self.expect(b',', "`,` or `]`")?;
-                        // A trailing comma is not JSON.
                         if self.peek_value()? == b']' {
                             return Err(self.err("trailing comma in array"));
                         }
@@ -591,14 +527,6 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
                     de: self,
                     first: true,
                 });
-                // The closing bracket is consumed HERE, not by the access, and
-                // that placement is load-bearing. A `Vec` visitor drains the
-                // sequence, but the visitor for `[u8; 8]` — or any tuple —
-                // takes exactly N elements and returns, so an access that ate
-                // the `]` on the way out would work for one and leave a stray
-                // bracket for the other. Closing outside means both end in the
-                // same state, and it is also what makes `[1,2,3]` into a
-                // two-element array an error rather than a silent truncation.
                 let out = match out {
                     Ok(value) => self.end_container(b']', "`,` or `]`").map(|()| value),
                     Err(error) => Err(error),
@@ -746,8 +674,6 @@ impl<'de> de::SeqAccess<'de> for SeqAccess<'_, 'de> {
         &mut self,
         seed: T,
     ) -> Result<Option<T::Value>> {
-        // `]` ends the sequence but is NOT consumed here — see the note in
-        // `deserialize_any`.
         let byte = self.de.peek_value()?;
         if byte == b']' {
             return Ok(None);
@@ -775,9 +701,6 @@ impl<'de> de::MapAccess<'de> for MapAccess<'_, 'de> {
     type Error = Error;
 
     fn next_key_seed<K: de::DeserializeSeed<'de>>(&mut self, seed: K) -> Result<Option<K::Value>> {
-        // `}` ends the object but is NOT consumed here — same reason as
-        // `SeqAccess`, so a visitor that stops early and one that drains leave
-        // the parser in the same place.
         let byte = self.de.peek_value()?;
         if byte == b'}' {
             return Ok(None);
@@ -814,12 +737,7 @@ impl<'de> Deserializer<'de> {
     }
 }
 
-/// An object key's text. Object keys are always JSON strings, so a key type
-/// that is not a string (an integer, a `bool`, a newtype or `Option` over one)
-/// is read through [`TextKeyDeserializer`], which reads it back from exactly
-/// the text the serializer spells it with (`"7"`, `"-3"`, `"true"`) and from
-/// no other: `"007"`, `"+7"`, `"-0"` and `"True"` reach the visitor as the
-/// strings they are, which it refuses.
+/// An object key's text.
 struct Key<'de> {
     text: Cow<'de, str>,
 }
@@ -899,12 +817,10 @@ impl<'de> de::VariantAccess<'de> for EnumAccess<'_, 'de> {
     }
 }
 
-/// Deserialize a `T` from JSON bytes, requiring that the whole input is ONE
-/// value.
+/// Deserializes a `T` from JSON bytes, requiring the entire input to be a single value.
 ///
 /// # Errors
-/// Any syntax error, any `Deserialize` failure, nesting past
-/// [`RECURSION_LIMIT`], or trailing data after the value.
+/// Returns an error on invalid JSON, trailing tokens, or visitor refusal.
 #[inline]
 pub fn from_slice<'de, T: serde::Deserialize<'de>>(input: &'de [u8]) -> Result<T> {
     let mut de = Deserializer::from_slice(input);
@@ -913,8 +829,7 @@ pub fn from_slice<'de, T: serde::Deserialize<'de>>(input: &'de [u8]) -> Result<T
     Ok(value)
 }
 
-/// Deserialize a `T` from a JSON string, borrowing from it where the target
-/// type allows.
+/// Deserializes a `T` from a JSON string.
 ///
 /// # Errors
 /// As [`from_slice`].

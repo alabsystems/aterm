@@ -1,15 +1,15 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Laying executables (the `bin/` shims, their `agents/` twins and `alab-` aliases, the
-//! pending stubs, the reroute stubs, the tombstones) through one writer:
-//! [`write_in_process`], and [`write_regenerable`] for a file every seed lays again.
+//! Laying executables (the `bin/` shims, their `agents/` twins and `alab-` aliases, the pending
+//! stubs, the reroute stubs, the tombstones) through one writer: [`write_in_process`], and
+//! [`write_regenerable`] for a file every seed lays again.
 
 use std::ffi::OsStr;
 use std::io;
 use std::path::PathBuf;
 
-/// One executable to lay: where, and what bytes. Always mode `0755`, always temp+rename.
+/// One executable to lay: where, and what bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Executable {
     /// The destination path.
@@ -28,35 +28,15 @@ impl Executable {
     }
 }
 
-/// Write one executable: a dotted sibling temp (`.<name>.lay-<pid>-<seq>`, never swept by
-/// the reroute dir's walk; the sequence keeps two lays of one name in one process off each
-/// other's temp), the bytes, mode `0755` set explicitly (so a restrictive umask cannot lay
-/// a shim only its owner can run in a system prefix), a flush, then `rename(2)` over the
-/// destination, so a shim on the user's PATH is never briefly absent or half-written. Only
-/// the rename takes [`PUBLICATION_TURN`]: the staging before it is this writer's own file.
-///
-/// The flush is [`aterm_durable::ordered`] (on Apple targets `F_BARRIERFSYNC`): a real
-/// shim, a tombstone or a trust exec root's re-render is what a terminal outside aterm
-/// runs next, and no launch re-lays it before then, so its bytes must land before its
-/// name. This writer does not flush the shim's parent after the rename, so it does
-/// not promise that publication survives a power loss. A later `gc` full flush of the
-/// build-store parent covers that directory and earlier fsync-submitted I/O on its
-/// device; it does not submit this other, unflushed directory's rename. Thus the
-/// restored Durable cleanup does not establish a never-dangling PATH guarantee.
-/// This missing parent-publication persistence also existed with the former full-file flush.
+/// Write one executable.
 pub fn write_in_process(file: &Executable) -> io::Result<()> {
     write_with(file, aterm_durable::ordered)
 }
 
-/// [`write_in_process`] for a file the next seed lays again when it is missing or its bytes
-/// differ (a pending stub, its `agents/` twin, a reroute stub, the reroute directory's
-/// marker): the same temp, mode and `rename(2)`, flushed with a plain `fsync(2)`
-/// ([`crate::platform::sync_file_contents`]) instead of the drive-cache barrier. The data
-/// still reaches the drive before the rename names it, so a kernel panic cannot leave an
-/// empty file under the name; a power loss can lose the newest lay, and the next seed
-/// re-lays it (`stub::stub_is_current`, the reroute byte compare). A first seed lays ~35 of
-/// these; the barrier, ~4 ms each, would add ~140 ms and hold up most of the first launch's
-/// other flushes, growing writes, creates and renames on the volume while each runs.
+/// [`write_in_process`] for a file the next seed lays again when it is missing or its bytes differ
+/// (a pending stub, its `agents/` twin, a reroute stub, the reroute directory's marker): the same
+/// temp, mode and `rename(2)`, flushed with a plain `fsync(2)`
+/// ([`crate::platform::sync_file_contents`]) instead of the drive-cache barrier.
 pub fn write_regenerable(file: &Executable) -> io::Result<()> {
     write_with(file, crate::platform::sync_file_contents)
 }
@@ -69,12 +49,7 @@ pub(crate) fn staged_at(dest: &std::path::Path, name: &str, seq: u64) -> PathBuf
     dest.with_file_name(format!(".{name}.lay-{}-{seq}", std::process::id()))
 }
 
-/// Whether a directory entry is the temp of a lay THIS process has in flight: staged, not
-/// yet renamed over its destination (every failing lay removes its own temp, so one named
-/// for this pid is mid-publish). The walks that hold [`PUBLICATION_TURN`] to sweep `bin/`
-/// and `agents/` leave it to its writer, which renames it the moment the turn is free:
-/// removing it would fail that lay, where before the staging left the turn the lay simply
-/// ran after the sweep. A temp another process left is no lay of this one, and is swept.
+/// Whether a directory entry is the temp of a lay THIS process has in flight.
 pub(crate) fn in_flight_here(entry: &OsStr) -> bool {
     entry
         .to_str()
@@ -88,12 +63,8 @@ pub(crate) fn in_flight_here(entry: &OsStr) -> bool {
         })
 }
 
-/// Serializes every executable publication in the process (a lay's rename, or a removal)
-/// with a reconcile's read of a primary and its publish of what that read selected. Lock
-/// order: `activate::AGENTS_TURN`, then this. A writer stages its bytes before it asks for
-/// this and releases it before it asks for an agents reconcile; a reconcile holds both and
-/// writes through [`write_in_publication_turn`]. Held for a rename, not a flush: every
-/// lay in the process (a test binary's thousand stores included) waits on it.
+/// Serializes every executable publication in the process (a lay's rename, or a removal) with a
+/// reconcile's read of a primary and its publish of what that read selected.
 pub(crate) static PUBLICATION_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The one writer: stages the bytes with the caller's flush `sync` (a sibling temp only
@@ -114,20 +85,17 @@ fn write_with(file: &Executable, sync: fn(&std::fs::File) -> io::Result<()>) -> 
     publish(file, &tmp)
 }
 
-/// The ordered writer while the caller holds [`PUBLICATION_TURN`] across the read that
-/// selected these bytes. Reacquiring the turn here would deadlock that reconcile.
+/// The ordered writer while the caller holds [`PUBLICATION_TURN`] across the read that selected
+/// these bytes.
 pub(crate) fn write_in_publication_turn(
     file: &Executable,
     _turn: &std::sync::MutexGuard<'_, ()>,
 ) -> io::Result<()> {
-    // Ordered, as [`write_in_process`]: the old shim or the new one.
     let tmp = stage(file, aterm_durable::ordered)?;
     publish(file, &tmp)
 }
 
-/// Remove a primary under [`PUBLICATION_TURN`]: a reconcile that already read it finishes
-/// before the removal, or reads the absence after it, and never recreates the target it
-/// captured.
+/// Remove a primary under [`PUBLICATION_TURN`].
 pub(crate) fn remove_in_process(path: &std::path::Path) -> io::Result<()> {
     let _turn = PUBLICATION_TURN
         .lock()
@@ -181,8 +149,6 @@ fn stage(file: &Executable, sync: fn(&std::fs::File) -> io::Result<()>) -> io::R
 
 /// Rename a [`stage`]d temp over `file`'s destination; the temp is removed if that fails.
 fn publish(file: &Executable, tmp: &std::path::Path) -> io::Result<()> {
-    // Windows `rename` does not replace an existing file (the same brief window the
-    // Windows shim writer documents; a shim there is per-user and serialized).
     #[cfg(windows)]
     let _ = std::fs::remove_file(&file.path);
     if let Err(e) = std::fs::rename(tmp, &file.path) {
@@ -192,7 +158,6 @@ fn publish(file: &Executable, tmp: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
 
-// The tests check a Unix mode, so the module is Unix-only.
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

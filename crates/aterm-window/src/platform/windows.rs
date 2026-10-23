@@ -148,7 +148,39 @@ pub trait EventLoopBuilderExtWindows {
     /// Whether to enable process-wide DPI awareness.
     fn with_dpi_aware(&mut self, dpi_aware: bool) -> &mut Self;
 
+    // The example is compiled code: the win32 oracle (`verify cells`) reads the
+    // `windows_sys` names it uses, and aterm-win32 carries the two accelerator
+    // functions for it.
     /// A callback to be executed before dispatching a win32 message to the window procedure.
+    /// Return true to disable winit's internal message dispatching.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use windows_sys::Win32::UI::WindowsAndMessaging::{ACCEL, CreateAcceleratorTableW, TranslateAcceleratorW, DispatchMessageW, TranslateMessage, MSG};
+    /// use aterm_window::event_loop::EventLoop;
+    /// #[cfg(target_os = "windows")]
+    /// use aterm_window::platform::windows::EventLoopBuilderExtWindows;
+    ///
+    /// let mut builder = EventLoop::builder();
+    /// #[cfg(target_os = "windows")]
+    /// builder.with_msg_hook(|msg|{
+    ///     let msg = msg as *const MSG;
+    /// #   let accels: Vec<ACCEL> = Vec::new();
+    ///     let translated = unsafe {
+    ///         TranslateAcceleratorW(
+    ///             (*msg).hwnd,
+    ///             CreateAcceleratorTableW(accels.as_ptr() as _, 1),
+    ///             msg,
+    ///         ) == 1
+    ///     };
+    ///     translated
+    /// });
+    /// ```
+    /// # use windows_sys::Win32::UI::WindowsAndMessaging::{ACCEL, CreateAcceleratorTableW, TranslateAcceleratorW, DispatchMessageW, TranslateMessage, MSG};
+    /// use aterm_window::event_loop::EventLoop;
+    /// #[cfg(target_os = "windows")]
+    /// use aterm_window::platform::windows::EventLoopBuilderExtWindows;
     fn with_msg_hook<F>(&mut self, callback: F) -> &mut Self
     where
         F: FnMut(*const c_void) -> bool + 'static;
@@ -221,6 +253,11 @@ pub trait WindowExtWindows {
     /// ## Example
     ///
     /// ```no_run
+    /// # use aterm_window::window::Window;
+    /// # fn scope(window: Window) {
+    /// use std::thread;
+    /// use aterm_window::platform::windows::WindowExtWindows;
+    /// use aterm_window::raw_window_handle::HasWindowHandle;
     #[cfg(feature = "rwh_06")]
     unsafe fn window_handle_any_thread(
         &self,
@@ -325,7 +362,7 @@ pub trait WindowAttributesExtWindows {
     /// This sets `WS_EX_NOREDIRECTIONBITMAP`.
     fn with_no_redirection_bitmap(self, flag: bool) -> Self;
 
-    /// Enables or disables drag and drop support (enabled by default). Will interfere with other
+    /// Enables or disables drag and drop support (enabled by default).
     fn with_drag_and_drop(self, flag: bool) -> Self;
 
     /// Whether show or hide the window icon in the taskbar.

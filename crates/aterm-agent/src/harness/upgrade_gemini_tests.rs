@@ -25,8 +25,6 @@ fn launch(rest: &[&str]) -> Vec<String> {
 
 /// The process Gemini CLI runs as is told by its script, under `node`: typed
 /// by name (the PATH link), by path (the bundle), npm's `bin/gemini`.
-/// NEGATIVE CONTROLS: the child (its first argument a node flag), a Claude
-/// Code under node, and a `gemini` script under another runtime are none.
 #[test]
 fn the_process_is_node_running_gemini_clis_script() {
     let node = std::path::Path::new("/opt/homebrew/Cellar/node/26.3.0/bin/node");
@@ -68,9 +66,6 @@ fn the_process_is_node_running_gemini_clis_script() {
 /// prompt again (`--resume`, `--session-id`, `--session-file`, `-i`, a
 /// positional prompt), and resumes the witnessed session as `--resume
 /// <uuid>`, every word kept as typed.
-/// NEGATIVE CONTROLS: a switch's `false` is never dropped as a positional
-/// (the relaunch is never looser), and the launch's session is never the one
-/// typed.
 #[test]
 fn a_relaunch_carries_the_runs_choices_and_drops_what_names_the_session() {
     let old = "00000000-1111-4222-8333-444444444444";
@@ -121,7 +116,6 @@ fn a_relaunch_carries_the_runs_choices_and_drops_what_names_the_session() {
         ]))
     );
     assert_eq!(argv_session(&args).as_deref(), Some(old));
-    // A switch takes a bare `true`/`false`: `--yolo false` stays off.
     assert_eq!(
         rewrite_argv(&launch(&["--yolo", "false", "hello"]), Some(S1)),
         Ok(argv(&["--yolo", "false", "--resume", S1]))
@@ -130,8 +124,6 @@ fn a_relaunch_carries_the_runs_choices_and_drops_what_names_the_session() {
         rewrite_argv(&launch(&["-y", "--model", "x"]), None),
         Ok(argv(&["-y", "--model", "x"]))
     );
-    // `--resume` alone (the newest) takes no flag after it; a session id
-    // given as `--session-id` and an import are replaced alike.
     assert_eq!(
         rewrite_argv(&launch(&["--resume", "--debug"]), Some(S1)),
         Ok(argv(&["--debug", "--resume", S1]))
@@ -148,7 +140,6 @@ fn a_relaunch_carries_the_runs_choices_and_drops_what_names_the_session() {
             "{words:?}"
         );
     }
-    // A positional naming a subcommand, past a first positional, is a prompt.
     assert_eq!(
         rewrite_argv(&launch(&["hello", "mcp"]), None),
         Ok(Vec::new())
@@ -221,8 +212,7 @@ fn a_tui_is_every_launch_but_a_one_shot() {
     }
 }
 
-/// The session an argv names, by its full UUID only. NEGATIVE CONTROLS: an
-/// index, `latest`, a custom id and a resume with no value name none.
+/// The session an argv names, by its full UUID only.
 #[test]
 fn an_argv_names_a_session_by_its_full_uuid_alone() {
     for (words, want) in [
@@ -279,8 +269,6 @@ fn the_gemini_directory_follows_its_cli_home_then_its_home() {
         S1
     ));
 }
-
-// ---------------------------------------------------------------- the records
 
 /// A header line as 0.46.0 writes one.
 fn header(session: &str, at: &str) -> String {
@@ -351,11 +339,7 @@ fn file<'a>(name: &'a str, text: &'a str) -> ChatsFile<'a> {
 /// record for record): after a turn and resume 1 (its rewrite bumps the
 /// turn-holding file), the pick holds the turn — SAFE; after resume 2 with no
 /// turn between (its duplicate newest), the pick is that empty duplicate —
-/// UNSAFE, which typed would bring the session back without its turn. A
-/// turn taken into the duplicate then splits the history — UNSAFE. A session
-/// that never took a turn is NO-TURNS; no file of it is NO-FILE; a legacy
-/// `.json` of it cannot be folded. NEGATIVE CONTROL: a tie on `lastUpdated`
-/// keeps the earlier name, as the CLI's sorted pass does.
+/// UNSAFE, which typed would bring the session back without its turn.
 #[test]
 fn the_precheck_folds_the_sessions_files_as_the_cli_does() {
     let turns_after_1 = chain_a_turns(Some("2026-10-17T18:22:40.322Z"));
@@ -415,7 +399,6 @@ fn the_precheck_folds_the_sessions_files_as_the_cli_does() {
         precheck(&[file(&legacy, "{}"), file(&n_dup1, &dup1)], S1),
         Precheck::Unreadable(legacy.clone())
     );
-    // A tie keeps the earlier name: the turn file, dated as the duplicate.
     let tie_turns = lines(&[
         header(S1, "2026-10-17T18:21:34.531Z"),
         context("2026-10-17T18:21:34.532Z", "ctx1"),
@@ -457,8 +440,6 @@ fn the_fold_follows_the_clis_records() {
     assert!(f.turns.is_empty() && !f.valid);
 }
 
-// ---------------------------------------------------------------- the witness
-
 /// Unix ms of the measured tab's parent start (18:28:18.0 UTC).
 const START: u64 = 1_792_261_698_000;
 
@@ -473,36 +454,21 @@ fn at(ms_after_start: u64) -> String {
 
 /// THE START-TIME RULE NAMES THE ONE SESSION BEGUN SINCE THE PROCESS
 /// STARTED: a fresh launch's file, a resume's duplicate, a resume whose
-/// header was appended to its own minute's file. Anything else names none:
-/// no header yet, two (a `/clear` since, another launch since), another
-/// Gemini CLI started at the same moment, an id that is no UUID or another
-/// project's, an argv naming another session, and another session's file
-/// moved since (an in-TUI `/resume` switching onto it: a `$set.sessionId`
-/// no stamped write follows, written since — a summary written after it
-/// hides nothing; or a turn taken in it since). NEGATIVE CONTROLS: the
-/// summary a start writes into an older file, an old switch written before
-/// the start or followed by a stamped write, and a `--resume` launch's switch
-/// a later start's summary follows (its header with it), move nothing.
+/// header was appended to its own minute's file.
 #[test]
 fn the_start_time_rule_names_one_session_begun_since_the_start() {
     let older = chain_a_turns(None);
     let n_older = "session-2026-10-17T18-21-11edd4f1.jsonl";
     let launch_file = duplicate(S2, &at(900));
     let n_launch = "session-2026-10-17T18-28-88409a32.jsonl";
-    // The duplicate of the `--resume` whose switch the older file holds,
-    // begun before the start.
     let resumed_dup = duplicate(S1, "2026-10-17T18:25:10.000Z");
     let n_resumed_dup = "session-2026-10-17T18-25-11edd4f1.jsonl";
-    // The rule over `files` (those written since the start), each switch's
-    // session read over `all` (every file the project holds).
     let rule = |files: &[ChatsFile<'_>], all: &[ChatsFile<'_>]| {
         witness(files, START, HASH, None, false, &|s| {
             resumes_account_for_switches(all, s)
         })
     };
     let w = |files: &[ChatsFile<'_>]| rule(files, files);
-    // A fresh launch: its own file, an older one the start wrote a summary
-    // into after an old `--resume`'s switch, that resume's duplicate older.
     let summary_since = ChatsFile {
         name: n_older,
         text: &older,
@@ -516,22 +482,17 @@ fn the_start_time_rule_names_one_session_begun_since_the_start() {
         ),
         Ok(S2.to_string())
     );
-    // The same switch with no resume's header beside it is an in-TUI
-    // `/resume`'s, the start's summary written after it (the start's
-    // background summary of that older session, `generateAndSaveSummary`).
     assert_eq!(
         w(&[summary_since, launch]),
         Err(NoWitness::AnotherMoved),
         "a summary after a switch hides it"
     );
     assert_eq!(w(&[]), Err(NoWitness::NoHeader));
-    // A `/clear` since: a second header.
     let cleared = duplicate("03f274bd-1111-4222-8333-444444444444", &at(60_000));
     assert_eq!(
         w(&[launch, file("session-x-03f274bd.jsonl", &cleared)]),
         Err(NoWitness::TwoHeaders)
     );
-    // A resume appended to its own minute's file: one header since.
     let appended = format!("{older}{}", duplicate(S1, &at(800)));
     let none = |_: &str| false;
     assert_eq!(
@@ -570,8 +531,6 @@ fn the_start_time_rule_names_one_session_begun_since_the_start() {
         Err(NoWitness::NotTyped),
         "another project's header"
     );
-    // An in-TUI `/resume` onto the older session: a switch appended since,
-    // beyond the one its old resume's header accounts for.
     let switched = format!("{older}{{\"$set\":{{\"sessionId\":\"{S1}\"}}}}\n");
     let switched_since = ChatsFile {
         name: n_older,
@@ -583,15 +542,12 @@ fn the_start_time_rule_names_one_session_begun_since_the_start() {
         rule(&[switched_since, launch], &[switched_since, launch, dup]),
         Err(NoWitness::AnotherMoved)
     );
-    // The same switch written before the start: an old resume's.
     let switched_before = ChatsFile {
         name: n_older,
         text: &switched,
         mtime_ms: Some(START - 60_000),
     };
     assert_eq!(w(&[switched_before, launch]), Ok(S2.to_string()));
-    // A switch a stamped write followed (a resume's rewrite, before the
-    // start): that write tells when, and the switch came before it.
     let rewritten = format!(
         "{}{{\"$set\":{{\"lastUpdated\":\"2026-10-17T18:25:10.030Z\"}}}}\n",
         lines(&[
@@ -607,13 +563,11 @@ fn the_start_time_rule_names_one_session_begun_since_the_start() {
         mtime_ms: Some(START + 920),
     };
     assert_eq!(w(&[rewritten_since, launch]), Ok(S2.to_string()));
-    // A turn taken in the older session since.
     let turned = format!("{older}{}\n", turn(&at(30_000), "u7", "g7"));
     assert_eq!(
         w(&[file(n_older, &turned), launch]),
         Err(NoWitness::AnotherMoved)
     );
-    // Turns of its own session move nothing.
     let own = format!("{launch_file}{}\n", turn(&at(30_000), "u8", "g8"));
     assert_eq!(w(&[file(n_launch, &own)]), Ok(S2.to_string()));
 }
@@ -622,10 +576,7 @@ fn the_start_time_rule_names_one_session_begun_since_the_start() {
 /// process that died before writing its own header, and another launch of
 /// the project begun 30 s after its start (gone since, or never seen as
 /// started together), is never read as running that launch's session
-/// (`late-header`). NEGATIVE CONTROLS: its own header at the window's last
-/// millisecond names it, a late one naming the very session its argv names
-/// is that session (a loaded machine's own), and a `/clear` after its own
-/// header is still two.
+/// (`late-header`).
 #[test]
 fn a_lone_header_begun_later_than_its_own_could_be_names_none() {
     let none = |_: &str| false;
@@ -673,9 +624,7 @@ fn a_lone_header_begun_later_than_its_own_could_be_names_none() {
 /// switch, whatever unstamped records follow it (a start's background
 /// summary, the process's own `$set.summary` or `$set.directories`, a
 /// `$rewindTo`); a stamped write after it (a message, a `$set.lastUpdated`, a
-/// header) ends it. The switches onto a session are all `--resume` launches'
-/// only where its headers outnumber them, over its own files alone, every one
-/// read and none a legacy `.json`.
+/// header) ends it.
 #[test]
 fn a_trailing_switch_is_read_through_unstamped_records_and_counted_against_headers() {
     let switch = format!(r#"{{"$set":{{"sessionId":"{S1}"}}}}"#);
@@ -706,7 +655,6 @@ fn a_trailing_switch_is_read_through_unstamped_records_and_counted_against_heade
     for stamped in [message, bump, appended.as_str()] {
         assert_eq!(with(&[stamped]), None, "{stamped}");
     }
-    // Counted against its headers.
     let turns = lines(&base);
     let n_turns = format!("session-2026-10-17T18-21-{}.jsonl", &S1[..8]);
     let dup = duplicate(S1, "2026-10-17T18:25:10.000Z");
@@ -734,7 +682,6 @@ fn a_trailing_switch_is_read_through_unstamped_records_and_counted_against_heade
         ],
         S1
     ));
-    // Another session's file is not its, whatever it holds.
     let n_other = format!("session-2026-10-17T18-26-{}.jsonl", &S2[..8]);
     let other = duplicate(S1, "2026-10-17T18:26:00.000Z");
     assert!(!resumes_account_for_switches(
@@ -743,17 +690,12 @@ fn a_trailing_switch_is_read_through_unstamped_records_and_counted_against_heade
     ));
 }
 
-// ---------------------------------------------------------------- the exit
-
 /// The exit table: `0` and `130` clean; `41`, `42`, `44`, `52`-`55` a refused
 /// start; `1` and a signal death nothing catches (`137` measured) a crash; a
 /// stop signal's status stopped; anything else (the parent ignores TERM, HUP
-/// and INT) no witness. The relaunch line's own word reads `1`, `126` and
-/// `127` as refusals too.
+/// and INT) no witness.
 #[test]
 fn the_exit_table_tells_a_crash_from_a_refusal_and_an_end() {
-    // The signal rows are Unix's (libc's signals): elsewhere no status is a
-    // signal's death or stop, so `137` is an end no witness tells.
     #[cfg(unix)]
     for (status, want) in [
         (137, ExitKind::Crashed),
@@ -795,12 +737,7 @@ fn the_exit_table_tells_a_crash_from_a_refusal_and_an_end() {
 /// A WORKER'S OWN RESTART NAMES THE ID IT REFUSED ([`restart_id`]): `42`
 /// from a launch under `--session-id <uuid>` (a worker's line: the id, then
 /// its attached first prompt), the id whichever way it is written — the
-/// caller holds it to the start-time rule. NEGATIVE CONTROLS: any other
-/// status (`1` a crash, `0`, `199` the restart's own code, which the parent
-/// never relays); `42` from a launch under no `--session-id`, one naming a
-/// session to resume (`--resume`, bare or by id, `-r`) or a file to import
-/// (`--session-file`), and one whose id is no UUID; and the status alone,
-/// which is a refusal ([`exit_kind`]).
+/// caller holds it to the start-time rule.
 #[test]
 fn a_workers_own_restart_names_the_id_it_refused() {
     let worker = launch(&[
@@ -834,9 +771,7 @@ fn a_workers_own_restart_names_the_id_it_refused() {
 
 /// A WORKER'S TRUSTED-FOLDERS FILE IS READ OFF A RECORD'S WORDS BY NAME
 /// ([`trusted_folders_of_words`]), where absolute: what its relaunch carries
-/// while the file stands. NEGATIVE CONTROLS: a record's homes still keep
-/// none ([`env_of_words`]); a relative file, and a record naming none, give
-/// none.
+/// while the file stands.
 #[test]
 fn a_workers_trusted_folders_file_is_read_off_its_record() {
     let words = env_words(&[
@@ -864,17 +799,11 @@ fn a_workers_trusted_folders_file_is_read_off_its_record() {
     );
 }
 
-// ---------------------------------------------------------------- the line
-
 /// The homes a line carries: `GEMINI_CLI_HOME` where set, `HOME` where it is
 /// another than the user's, and a worker's own trusted-folders file where an
 /// absolute one is set (its relaunch stays trusted in its folder alone);
 /// read back from a record by name alone, which keeps no trusted-folders
-/// file (the live worker's, removed with its session). The line a person is
-/// told cds to the project and resumes by the full UUID, behind those homes.
-/// The told line never names the trusted-folders file. NEGATIVE CONTROLS:
-/// the user's own `HOME` is not carried, nor a relative trusted-folders
-/// file, and no line is told for an id that is no UUID.
+/// file (the live worker's, removed with its session).
 #[test]
 fn the_line_carries_the_homes_and_the_person_is_told_where_to_run_it() {
     let user = std::path::Path::new("/Users//me");
@@ -930,8 +859,6 @@ fn the_line_carries_the_homes_and_the_person_is_told_where_to_run_it() {
         Vec::<(String, String)>::new(),
         "a relative one"
     );
-    // The line a person is told names no worker's trusted-folders file: it
-    // goes with the worker's session, and the person's own trust stands.
     assert_eq!(
         told_line(S1, &trusted, "/w/p").as_deref(),
         Some(format!("cd /w/p && GEMINI_CLI_HOME=/g/home gemini --resume {S1}").as_str())
@@ -951,8 +878,6 @@ fn the_line_carries_the_homes_and_the_person_is_told_where_to_run_it() {
                 .as_str()
         )
     );
-    // A cd only to one folder: never one that climbs, nor on Windows a
-    // drive-relative one; a drive's own root path is one.
     assert_eq!(
         told_line(S1, &[], "/w/../p").as_deref(),
         Some(format!("gemini --resume {S1}").as_str())
@@ -981,8 +906,7 @@ fn the_line_carries_the_homes_and_the_person_is_told_where_to_run_it() {
 /// ANSWERED — MEASURED in the lab (0.46.0, 2026-10-21, a launch under
 /// `--session-id` and no first prompt in a folder it did not trust; the
 /// lab's scratch home path elided to `/lab/gemini-home`): its header and the
-/// CLI's own `<session_context>`, nothing else. Its `Trust folder` restarted
-/// it onto this file and the restart was refused (`42`).
+/// CLI's own `<session_context>`, nothing else.
 const TURNLESS_SESSION: &str = concat!(
     r##"{"sessionId":"22222222-3333-4444-8555-666666666666","projectHash":"db63f153cf1f3aa6fe8af943ea8677baf866f81f77f020c6f1fce682f46d9db2","startTime":"2026-10-22T05:07:59.626Z","lastUpdated":"2026-10-22T05:07:59.626Z","kind":"main"}"##,
     "\n",
@@ -995,10 +919,7 @@ const TURNLESS_SESSION: &str = concat!(
 /// restart holds no turn ([`Precheck::NoTurns`]: its `<session_context>` is
 /// the CLI's, no person's message), and [`carries_first_prompt`] reads the
 /// launch's `-i`/`--prompt-interactive` (either spelling), a positional and
-/// words after `--`. NEGATIVE CONTROLS: the same file with a turn after it is
-/// SAFE; a launch of flags alone (its `--session-id`, `--model`, a
-/// `--resume`, a switch's `false`, a bare `--`) carries none, and an argv
-/// the table cannot read is held to carry one.
+/// words after `--`.
 #[test]
 fn a_restart_before_the_first_turn_leaves_no_turn_and_its_prompt_is_read() {
     let id = "22222222-3333-4444-8555-666666666666";

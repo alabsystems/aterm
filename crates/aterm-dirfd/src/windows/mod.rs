@@ -33,6 +33,7 @@ pub use std::os::windows::io::{
 pub struct Errno(pub i32);
 
 /// Bit 29 of a Win32 error code: the customer bit, set by no system code, so
+/// this crate's own refusals can never collide with one.
 const CUSTOMER: i32 = 0x2000_0000;
 
 impl Errno {
@@ -142,6 +143,11 @@ impl std::fmt::Display for Errno {
 impl std::error::Error for Errno {}
 
 /// A system code becomes `io::Error::from_raw_os_error`, so its kind is
+/// std's, EXCEPT where std's kind would be `ErrorKind::NotFound` for a code
+/// other than [`Errno::NOENT`] — `ERROR_PATH_NOT_FOUND`,
+/// `ERROR_INVALID_DRIVE`, `ERROR_BAD_NETPATH`, `ERROR_BAD_NET_NAME`, and
+/// whatever std's table adds — which a caller would read as "gone" (module
+/// docs).
 impl From<Errno> for std::io::Error {
     fn from(e: Errno) -> Self {
         if e.own_text().is_some() {
@@ -573,6 +579,8 @@ pub fn volume_guid<Fd: AsHandle>(fd: Fd) -> Result<String> {
 }
 
 /// The lowercase `{…}` GUID a `\\?\Volume{…}\…` path (UTF-16) starts with,
+/// or `None` when it starts with no such name: `{`, 32 hexadecimal digits
+/// grouped 8-4-4-4-12 by `-`, `}`.
 fn guid_of_volume_path(path: &[u16]) -> Option<String> {
     const HEAD: &str = r"\\?\Volume{";
     let text = String::from_utf16(path).ok()?;
@@ -669,6 +677,7 @@ impl Sid {
 
 impl std::fmt::Display for Sid {
     /// `S-<revision>-<authority>-<sub-authority>…`, the authority in decimal
+    /// (hex past 32 bits, as `ConvertSidToStringSidW` writes it).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (Some(&revision), Some(authority)) = (self.0.first(), self.0.get(2..8)) else {
             return f.write_str("S-?");
@@ -730,9 +739,12 @@ pub fn owner<Fd: AsHandle>(fd: Fd) -> Result<Sid> {
 }
 
 /// Whether `OBJ_DONT_REPARSE` is still passed: cleared once a kernel refuses
+/// it (module docs).
 static DONT_REPARSE: AtomicU32 = AtomicU32::new(ffi::OBJ_DONT_REPARSE);
 
 /// `NtCreateFile` of the one-component `name` (empty: `dir` itself) relative
+/// to `dir`, sharing everything, never reparsing, synchronous, without backup
+/// intent: every open in this module but a volume root's.
 fn nt_open(
     dir: BorrowedHandle<'_>,
     name: &[u16],
@@ -801,6 +813,7 @@ fn nt_open(
 }
 
 /// Refuse a reparse point `kind` describes: a link as [`Errno::LOOP`], any
+/// other as [`Errno::FOREIGN_REPARSE`].
 const fn refuse_reparse(kind: FileType) -> Result<()> {
     if kind.is_link() {
         Err(Errno::LOOP)
@@ -937,6 +950,8 @@ pub fn pin(path: &Path) -> Result<OwnedHandle> {
 }
 
 /// Check that the DOS device `name` (`C:`, `Volume{…}`) is a device and not
+/// an alias of a share or a path ([`pin`]), asking the object manager only:
+/// nothing here reads a file system or waits on a network.
 fn volume_device(name: &OsStr) -> Result<()> {
     let wide: Vec<u16> = name.encode_wide().chain([0]).collect();
     let mut target = vec![0u16; 1024];
@@ -964,6 +979,7 @@ fn volume_device(name: &OsStr) -> Result<()> {
 }
 
 /// Whether the object-manager target `target` names a device itself:
+/// `\Device\` (any case) and one non-empty name.
 fn is_volume_device(target: &[u16]) -> bool {
     let head: Vec<u16> = r"\device\".encode_utf16().collect();
     let lower = |unit: u16| {
@@ -982,6 +998,7 @@ fn is_volume_device(target: &[u16]) -> bool {
 }
 
 /// Whether `fd` is open on the root directory of its volume: its
+/// `FileNameInfo`, the path within the volume, is `\`.
 fn is_volume_root(fd: BorrowedHandle<'_>) -> Result<bool> {
     let mut buf = [0u32; 1 + 32];
     // SAFETY: `fd` is live.
@@ -1014,6 +1031,7 @@ fn is_volume_root(fd: BorrowedHandle<'_>) -> Result<bool> {
 }
 
 /// Open the volume root spelled `root` (verbatim, trailing `\`) as itself,
+/// and refuse it unless it is its volume's root directory.
 fn open_root(root: &OsStr) -> Result<OwnedHandle> {
     let wide: Vec<u16> = root.encode_wide().chain([0]).collect();
     let mut old = 0;
@@ -1172,6 +1190,7 @@ fn mounts_volume(fd: BorrowedHandle<'_>, kind: FileType) -> Result<bool> {
 }
 
 /// Whether the NT name `target` is a volume's GUID name, `\??\Volume{…`
+/// (any case) — a volume mount point's target, never a junction's.
 fn is_volume_name(target: &[u16]) -> bool {
     let head: Vec<u16> = r"\??\volume{".encode_utf16().collect();
     target.len() > head.len()
@@ -1186,6 +1205,7 @@ fn is_volume_name(target: &[u16]) -> bool {
 }
 
 /// Delete the file `handle` is open on: the POSIX disposition, or the legacy
+/// one where the file system has no extended class.
 fn dispose(handle: BorrowedHandle<'_>) -> Result<()> {
     let set = |class: i32, info: *const c_void, len: usize| -> Result<()> {
         // SAFETY: `handle` is live and `info` points at `len` readable bytes of `class`'s input.
@@ -1347,7 +1367,7 @@ impl Dir {
         })
     }
 
-    /// Run the next listing query into `buf`: `Ok(false)` at the end. Each
+    /// Run the next listing query into `buf`: `Ok(false)` at the end.
     fn fill(&mut self) -> Result<bool> {
         let Some(handle) = self.handle.as_ref() else {
             return Ok(false);
@@ -1485,6 +1505,7 @@ thread_local! {
 }
 
 /// Whether this thread reads listings with `FileIdBothDirectoryInfo` and
+/// deletes with the legacy disposition ([`seam::legacy_classes`]).
 fn legacy() -> bool {
     #[cfg(any(test, debug_assertions))]
     {
@@ -1620,6 +1641,8 @@ pub mod seam {
     }
 
     /// An `HRESULT` as this crate's result: a failure carrying a Win32 code
+    /// (`HRESULT_FROM_WIN32`'s `0x8007xxxx`) as that code, any other as the
+    /// raw `HRESULT`.
     fn hresult(hr: ffi::HRESULT) -> Result<()> {
         if hr >= 0 {
             Ok(())

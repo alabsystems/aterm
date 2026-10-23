@@ -1,94 +1,23 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `--yolo` alias, and yolo by default: on every managed agent name, a launch
-//! runs with every approval and sandbox off — aterm's posture is that AIs have
-//! full access to do the work (owner ruling). Each vendor CLI spells
-//! that posture differently (claude and agy `--dangerously-skip-permissions`,
-//! codex `--dangerously-bypass-approvals-and-sandbox`, muse four switches), and
-//! claude and agy refuse the literal
-//! `--yolo` outright (measured 2026-10-19: claude 2.1.304 "unknown option
-//! '--yolo'", agy 1.4.2 "flags provided but not defined: -yolo"; codex 0.163
-//! and muse 1.4.11 parse it natively). The policy is the vendor row's
-//! ([`Policy`], from [`crate::vendor_direct::VendorSpec::yolo_flags`] and its
-//! siblings), compiled, never taken from the index — the rule `shim_env` follows.
-//!
-//! [`decide`] is the whole argv rule, ahead of a literal `--`:
-//!
-//! 1. An exact `--yolo` is replaced in place by the row's flags ([`Launch::Flag`]).
-//!    A flag already present is never added twice — codex refuses its bypass flag
-//!    repeated (exit 2, measured 0.163).
-//! 2. Else, a launch whose posture is already decided — any of the row's markers
-//!    ([`Policy::markers`]: its permission-mode, sandbox and approval words, in
-//!    every spelling its parser gives them, attached short forms and `=value`
-//!    forms included) — runs exactly as typed ([`Launch::AsTyped`]). That is
-//!    what keeps the default from silently upgrading a launch that chose a
-//!    restriction, the harness's own resume lines among them: claude's carry
-//!    `--permission-mode`, codex's its bypass, sandbox or config words, so they
-//!    pass untouched.
-//! 3. Else the flags are injected by default ([`Launch::Default`]): at the front,
-//!    behind a word in [`Policy::after`] (muse's `exec`/`resume` take its
-//!    switches only there), and never on a word in [`Policy::skip`] (tool
-//!    subcommands take none; a resume's posture is the session's own). A
-//!    `--yolo` typed ahead of an [`Policy::after`] word expands behind it for
-//!    the same reason. Unknown leading option arity leaves the launch as typed;
-//!    a value must never be guessed to be a prompt or subcommand. The same
-//!    refusal applies to an explicit alias needing that behind-word placement.
-//!
-//! Every rewritten launch — by the flag or by default — prints the command as
-//! run once on stderr ([`echo_line`]/[`default_echo_line`], every word
-//! single-quoted); an as-typed launch prints nothing. The channels:
-//!
-//! * The twin's block ([`crate::platform::sh_yolo_prelude`], after the self-update
-//!   block in [`crate::platform::twin_prelude`], in `agents/` and in `bin/`)
-//!   applies [`decide`] to its own `"$@"` in pure `/bin/sh` before the store
-//!   `exec`. No atpkg is consulted, so the default holds with no package manager
-//!   reachable. The self-update block stands ahead of it, so an update verb is
-//!   answered there and never reaches the default.
-//! * `atpkg run` (`aterm claude --yolo`, `cli::cmd_run`) execs past the shim, so
-//!   it applies [`decide`] itself — on every platform, like its self-update arm.
-//!   On Windows the `.cmd` twin carries no block (a batch line cannot rewrite
-//!   `%*` inertly; [`crate::platform::twin_prelude`]), so there only the `aterm
-//!   <tool>` lane carries the default.
-//! * The process that runs never carries `--yolo` in its argv, so what the
-//!   harness reads back for a resume or a live upgrade is the vendor's own
-//!   flags; no other lane learns a new word.
-//!
-//! With any required behind-word position established, a bare `--yolo`
-//! anywhere ahead of a literal `--` is the alias — including where a prompt
-//! operand would be (`claude -p
-//! --yolo` asks for yolo mode with no prompt, not for the prompt "--yolo"; spell
-//! a literal one after `--`). The escape from the default is the vendor's own
-//! vocabulary: type the posture you want (`--permission-mode plan`, `--sandbox
-//! workspace-write`, `--approval-mode on-request`) and the launch runs as typed.
-//! There is no environment knob, deliberately: a posture this broad is decided
-//! per launch and echoed, never inherited silently from a parent shell.
-//!
-//! Scope: the managed copies only. A copy of the user's own ahead on `PATH`
-//! never runs through a twin and is never rewritten
-//! (`docs/DESIGN-which-copy-runs-2026-08-27.md` rule 1). Gemini CLI is not
-//! covered: it is deprecated upstream, and Google's lane here is agy
-//! (Antigravity), a managed row.
+//! The `--yolo` alias, and yolo by default.
 
 /// The word the alias claims, exactly as typed.
 pub const WORD: &str = "--yolo";
 
-/// What a by-the-flag echo starts with: `aterm: --yolo: running 'claude'
-/// '--dangerously-skip-permissions' …`.
+/// What a by-the-flag echo starts with.
 pub const ECHO_PREFIX: &str = "aterm: --yolo: running ";
 
-/// What a by-default echo starts with: `aterm: yolo (default): running
-/// 'claude' …` — its own words, so a reader can tell an asked-for launch from a
-/// defaulted one at a glance.
+/// What a by-default echo starts with.
 pub const DEFAULT_ECHO_PREFIX: &str = "aterm: yolo (default): running ";
 
-/// One program's yolo policy: the four row fields together ([`policy_of`]).
+/// One program's yolo policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Policy {
     /// The vendor flags the posture expands to.
     pub flags: &'static [&'static str],
-    /// Tokens that already decide the posture (module doc, rule 2); an entry
-    /// ending in `=` matches by prefix.
+    /// Tokens that already decide the posture (module doc, rule 2).
     pub markers: &'static [&'static str],
     /// First words the injection goes behind (rule 3).
     pub after: &'static [&'static str],
@@ -106,8 +35,7 @@ impl Policy {
     };
 }
 
-/// `program`'s yolo policy: its vendor row's fields, [`Policy::NONE`] for a
-/// program with no row.
+/// `program`'s yolo policy.
 #[must_use]
 pub fn policy_of(program: &str) -> Policy {
     crate::vendor_direct::spec(program).map_or(Policy::NONE, |row| Policy {
@@ -124,21 +52,14 @@ pub fn flags_of(program: &str) -> &'static [&'static str] {
     policy_of(program).flags
 }
 
-/// Whether `f` may be embedded in the twin's `sh` block as an expansion flag: a
-/// long flag of lowercase letters, digits and hyphens after `--`
-/// ([`crate::selfupdate::is_shell_safe_verb`]'s word shape behind the dashes).
-/// The renderer refuses the whole block over one failing flag, so a row can
-/// never lay a twin whose block breaks the `exec`.
+/// Whether `f` may be embedded in the twin's `sh` block as an expansion flag.
 #[must_use]
 pub fn is_shell_safe_flag(f: &str) -> bool {
     f.strip_prefix("--")
         .is_some_and(crate::selfupdate::is_shell_safe_verb)
 }
 
-/// Whether `m` may be embedded in the block as a posture marker: a short flag
-/// (`-s`), a long flag (either vendor case: `--allowedTools` is Claude's own
-/// spelling beside `--allowed-tools`), or either's `=` prefix spelling
-/// (`--sandbox=`).
+/// Whether `m` may be embedded in the block as a posture marker.
 #[must_use]
 pub fn is_shell_safe_marker(m: &str) -> bool {
     let word = m.strip_suffix('=').unwrap_or(m);
@@ -157,9 +78,7 @@ pub fn is_shell_safe_marker(m: &str) -> bool {
 /// Whether `token` is decided by `marker`, in every spelling the vendors'
 /// parsers give the same flag: a long flag also matches its `--flag=value`
 /// form, and a short flag also matches its attached forms (`-sread-only`,
-/// `-a=never`: clap takes the rest of the token as the value). Matching is by
-/// flag name, never by a prefix of a longer name (`--sandboxed` is not
-/// `--sandbox`).
+/// `-a=never`: clap takes the rest of the token as the value).
 fn marker_matches(marker: &str, token: &str) -> bool {
     if let Some(word) = marker.strip_suffix('=') {
         return token.len() > word.len()
@@ -176,15 +95,7 @@ fn marker_matches(marker: &str, token: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('='))
 }
 
-/// Leading options whose arity this word scan knows. Both `decide` and the
-/// shell renderer consume this classification; it is deliberately incomplete.
-/// Unknown (including variable) arity preserves the launch instead of guessing.
-/// Codex's single values follow its CLI's shared options; Muse's `--model`
-/// follows the existing `upgrade_muse` one-value reader. A posture marker still
-/// preserves the launch independently of whether its arity is known here. A
-/// program whose build runs the vendor's own executable under its name
-/// ([`crate::vendor_direct::VendorSpec::aliases`]: `codex-old` is OpenAI's
-/// `codex`) is that executable's CLI and takes its options.
+/// Leading options whose arity this word scan knows.
 pub(crate) fn word_options(program: &str) -> (&'static [&'static str], &'static [&'static str]) {
     let cli = crate::vendor_direct::spec(program)
         .and_then(|row| row.aliases.iter().find(|(name, _)| *name == program))
@@ -215,7 +126,6 @@ pub(crate) fn word_options(program: &str) -> (&'static [&'static str], &'static 
 }
 
 /// The actual argument position of the first word, past known leading values.
-/// `Err` means that neither a word nor the absence of one is established.
 fn first_word(program: &str, policy: &Policy, head: &[String]) -> Result<Option<usize>, ()> {
     let (values, switches) = word_options(program);
     let mut value = false;
@@ -246,16 +156,13 @@ fn first_word(program: &str, policy: &Policy, head: &[String]) -> Result<Option<
 pub enum Launch {
     /// The argv as typed, nothing printed.
     AsTyped,
-    /// `--yolo` was typed: the rewritten argv, echoed with [`ECHO_PREFIX`].
+    /// `--yolo` was typed.
     Flag(Vec<String>),
-    /// Nothing decided the posture: the rewritten argv, echoed with
-    /// [`DEFAULT_ECHO_PREFIX`].
+    /// Nothing decided the posture.
     Default(Vec<String>),
 }
 
-/// Decide `program args…` under the module doc's rules. The `sh` block is this
-/// function's twin; the platform tests hold the two to the same argv out for the
-/// same argv in.
+/// Decide `program args…` under the module doc's rules.
 #[must_use]
 pub fn decide(program: &str, args: &[String]) -> Launch {
     let policy = policy_of(program);
@@ -269,13 +176,9 @@ pub fn decide(program: &str, args: &[String]) -> Launch {
     if word.is_err() && (!explicit || !policy.after.is_empty()) {
         return Launch::AsTyped;
     }
-    // An explicit in-place expansion needs no subcommand position. Muse's
-    // behind-word expansion does, so uncertainty above preserves that argv.
     let word = word.ok().flatten();
     let after = word.is_some_and(|i| policy.after.contains(&head[i].as_str()));
     if explicit {
-        // Replace each --yolo with the flags not already present (and not just
-        // emitted); ahead of an `after` word, the flags wait behind it.
         let mut present: Vec<&str> = head.iter().map(String::as_str).collect();
         let fresh = |out: &mut Vec<String>, present: &mut Vec<&str>| {
             for flag in policy.flags {
@@ -312,8 +215,6 @@ pub fn decide(program: &str, args: &[String]) -> Launch {
         return Launch::AsTyped;
     }
     if let Some(i) = word {
-        // The self-update verbs skip too, on every lane: an update shape is
-        // decided by that intercept first (`claude update --help` forwards to
         // the vendor), and the default must not land on the forward.
         if policy.skip.contains(&head[i].as_str())
             || crate::selfupdate::verbs_of(program).contains(&head[i].as_str())
@@ -343,10 +244,7 @@ fn line(prefix: &str, program: &str, args: &[String]) -> String {
     s
 }
 
-/// The one stderr line a by-the-flag launch prints (no trailing newline): the
-/// command as run, the program's managed name first, every word single-quoted
-/// by the shim's one quoting rule ([`crate::platform::sh_quote_str`]) so the
-/// line is copy-paste runnable.
+/// The one stderr line a by-the-flag launch prints (no trailing newline).
 #[must_use]
 pub fn echo_line(program: &str, args: &[String]) -> String {
     line(ECHO_PREFIX, program, args)
@@ -356,6 +254,33 @@ pub fn echo_line(program: &str, args: &[String]) -> String {
 #[must_use]
 pub fn default_echo_line(program: &str, args: &[String]) -> String {
     line(DEFAULT_ECHO_PREFIX, program, args)
+}
+
+/// Environment variable set when `--no-harness` or `--no-alab-harness` is passed on an agent launch.
+pub const NO_HARNESS_ENV: &str = "ATERM_NO_HARNESS";
+
+/// Strip `--no-harness` and `--no-alab-harness` ahead of a literal `--` for an
+/// agent program, returning `Some(stripped)` when at least one was removed.
+#[must_use]
+pub fn strip_no_harness(program: &str, args: &[String]) -> Option<Vec<String>> {
+    if !crate::stub::is_agent_program(program) {
+        return None;
+    }
+    let end = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    if !args[..end]
+        .iter()
+        .any(|a| matches!(a.as_str(), "--no-harness" | "--no-alab-harness"))
+    {
+        return None;
+    }
+    let mut out = Vec::with_capacity(args.len());
+    for (i, arg) in args.iter().enumerate() {
+        if i < end && matches!(arg.as_str(), "--no-harness" | "--no-alab-harness") {
+            continue;
+        }
+        out.push(arg.clone());
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -410,9 +335,6 @@ mod tests {
                     row.program
                 );
             }
-            // A word may sit in both lists (muse's `resume`): `after` says
-            // where an explicit `--yolo` expands, `skip` says the default
-            // never lands there — the session owns that launch's posture.
         }
         assert_eq!(policy_of("ay"), Policy::NONE);
         assert_eq!(policy_of("nosuch"), Policy::NONE);
@@ -456,7 +378,6 @@ mod tests {
         assert!(marker_matches("--sandbox", "--sandbox"));
         assert!(marker_matches("--sandbox", "--sandbox=read-only"));
         assert!(!marker_matches("--sandbox", "--sandboxed=1"));
-        // A short flag's attached spellings are the same flag to clap.
         for token in ["-s", "-sread-only", "-s=read-only"] {
             assert!(marker_matches("-s", token), "{token}");
         }
@@ -483,7 +404,6 @@ mod tests {
                 "hi"
             ]))
         );
-        // Already present: the word drops, no second copy (codex refuses it).
         assert_eq!(
             decide(
                 "codex",
@@ -499,7 +419,6 @@ mod tests {
                 "x"
             ]))
         );
-        // muse: ahead of `exec` the expansion lands behind it, from either side.
         let muse_exec = Launch::Flag(argv(&[
             "exec",
             "--disable-approval",
@@ -514,7 +433,6 @@ mod tests {
             decide("muse", &argv(&["--yolo", "exec", "--yolo", "x"])),
             muse_exec
         );
-        // A switch typed by hand is not repeated; the rest still land.
         assert_eq!(
             decide("muse", &argv(&["--disable-sandbox", "--yolo"])),
             Launch::Flag(argv(&[
@@ -528,8 +446,6 @@ mod tests {
             decide("claude", &argv(&["--yolo", "--", "--yolo"])),
             Launch::Flag(argv(&["--dangerously-skip-permissions", "--", "--yolo"]))
         );
-        // A model value may itself be `exec`: only the actual word receives
-        // the switches, wherever the explicit alias preceded it.
         for args in [
             argv(&["--yolo", "--model", "exec", "exec", "x"]),
             argv(&["--model", "exec", "--yolo", "exec", "x"]),
@@ -539,8 +455,6 @@ mod tests {
             expected.push("x".to_string());
             assert_eq!(decide("muse", &args), Launch::Flag(expected));
         }
-        // Without an established word position, an unknown Muse option
-        // cannot authorize moving the alias in front of a possible command.
         assert_eq!(
             decide(
                 "muse",
@@ -548,7 +462,6 @@ mod tests {
             ),
             Launch::AsTyped
         );
-        // Front/in-place-only policies still honor an explicit alias.
         assert_eq!(
             decide("codex", &argv(&["--new-option", "value", "--yolo"])),
             Launch::Flag(argv(&[
@@ -562,8 +475,6 @@ mod tests {
     /// `codex-old` is OpenAI's `codex` under its own name (its row's alias):
     /// it takes codex's options, so every launch decides exactly as codex's —
     /// a known option's value is stepped over to the word behind it.
-    ///
-    /// NEGATIVE CONTROL: a name with no row knows no options.
     #[test]
     fn an_aliased_program_decides_as_the_cli_it_runs() {
         assert_eq!(word_options("codex-old"), word_options("codex"));
@@ -678,7 +589,6 @@ mod tests {
                     "thread-id",
                 ]),
             ),
-            // Unknown/variable arity and missing values preserve the argv.
             (
                 "codex",
                 argv(&["--new-option", "value", "resume", "thread-id"]),
@@ -716,8 +626,6 @@ mod tests {
                 "{program} {args:?}"
             );
         }
-        // A consumed model value is neither a resume nor a prompt, even if
-        // it spells one. A literal separator still protects the tail.
         for args in [
             argv(&["--model", "resume", "fix this"]),
             argv(&["--model=resume", "fix this"]),
@@ -768,5 +676,21 @@ mod tests {
             "aterm: yolo (default): running 'agy' '--dangerously-skip-permissions' \
              '-p' 'it'\\''s $x' ''"
         );
+        assert_eq!(
+            strip_no_harness("agy", &argv(&["--no-harness", "-p", "hi"])),
+            Some(argv(&["-p", "hi"]))
+        );
+        assert_eq!(
+            strip_no_harness(
+                "claude",
+                &argv(&["--no-alab-harness", "--", "--no-harness"])
+            ),
+            Some(argv(&["--", "--no-harness"]))
+        );
+        assert_eq!(
+            strip_no_harness("agy", &argv(&["--", "--no-harness"])),
+            None
+        );
+        assert_eq!(strip_no_harness("ay", &argv(&["--no-harness"])), None);
     }
 }

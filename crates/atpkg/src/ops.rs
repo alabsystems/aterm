@@ -1,10 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Local store operations behind the read and maintenance verbs: `which`, `list` and
-//! `uninstall`. They work on the on-disk [`Layout`] only (no network, no signatures).
-//! `uninstall` is fail-closed: it removes a path only after confirming it resolves inside
-//! the managed prefix, so a tampered symlink cannot make it delete elsewhere.
+//! Local store operations behind the read and maintenance verbs: `which`, `list` and `uninstall`.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -13,16 +10,12 @@ use std::path::{Path, PathBuf};
 use crate::Layout;
 use crate::store::ToolName;
 
-/// List `bin/` — the one door every scan in this module and in [`crate::activate`] goes
-/// through.
+/// List `bin/` — the one door every scan in this module and in [`crate::activate`] goes through.
 pub(crate) fn read_bin_dir(layout: &Layout) -> io::Result<std::fs::ReadDir> {
     std::fs::read_dir(layout.bin_dir())
 }
 
-/// Resolve `tool` to the store path its `bin/<tool>` shim points at (`atpkg which`), e.g.
-/// `…/store/<program>/<build>/bin/<tool>`, or `None` when there is no shim. A raw `&str`
-/// because this is a CLI query: a name [`crate::store::shim_allowed`] refuses could never
-/// have a shim, so it answers `None` without touching the filesystem.
+/// Resolve `tool` to the store path its `bin/<tool>` shim points at (`atpkg which`), e.g. `…/store/<program>/<build>/bin/<tool>`, or `None` when there is no shim.
 #[must_use]
 pub fn which(layout: &Layout, tool: &str) -> Option<PathBuf> {
     crate::platform::resolve_shim(&layout.shim(&ToolName::new(tool)?))
@@ -31,10 +24,7 @@ pub fn which(layout: &Layout, tool: &str) -> Option<PathBuf> {
 /// The file to exec for `tool` on the verbs that run it without its shim (`atpkg run
 /// <tool>`, hence `aterm <tool>`, and the upstream-name reroute, `clippy` → `tippy`):
 /// [`which`]'s store target, or its clone under the build's exec root when
-/// [`crate::compat::route_for_shim`] finds one for this shim. Those verbs skip the routed
-/// shim's guard line, so this gives the answer the guard would (on a trust build whose
-/// `bin/rustc` is a separate copy of `trustc`, tippy's sibling check otherwise fails). [`which`]
-/// is unchanged: gc, doctor and `atpkg which` read the store.
+/// [`crate::compat::route_for_shim`] finds one for this shim.
 fn exec_path(layout: &Layout, tool: &str) -> Option<PathBuf> {
     let shim = layout.shim(&ToolName::new(tool)?);
     let target = crate::platform::resolve_shim(&shim)?;
@@ -46,10 +36,7 @@ fn exec_path(layout: &Layout, tool: &str) -> Option<PathBuf> {
 /// `<build>.shim-env` sidecar, [`crate::shim_env::read_sidecar`], which the pass re-asserts
 /// on a shim that lost it, [`crate::activate::reassert_shim_env`]), or, for a build that
 /// declares none, what the shim as laid exports (add-only: an absent sidecar is no evidence
-/// the exports should go). [`crate::shim_env::ShimEnv::NONE`] for a name with no shim. The
-/// declaration comes first because a shim laid plain has nothing to copy. Every value passed
-/// [`crate::shim_env::ShimEnv::admit`], so none names `PATH`, the loader's variables or a
-/// runtime's.
+/// the exports should go).
 fn exec_env(layout: &Layout, tool: &str) -> crate::shim_env::ShimEnv {
     let Some(name) = ToolName::new(tool) else {
         return crate::shim_env::ShimEnv::NONE;
@@ -66,10 +53,7 @@ fn exec_env(layout: &Layout, tool: &str) -> crate::shim_env::ShimEnv {
     }
 }
 
-/// A tool as its shim would run it, for a door that execs PAST the shim — `atpkg run` and
-/// the reroute's DIRECT rows: the file (`exec_path`) and what to export before the exec
-/// (`exec_env`). The one way out of this module to either half, so no door can take the
-/// path without the environment (`atpkg run` once did, audit 2026-09-23).
+/// A tool as its shim would run it, for a door that execs PAST the shim — `atpkg run` and the reroute's DIRECT rows: the file (`exec_path`) and what to export before the exec (`exec_env`).
 #[derive(Debug, PartialEq, Eq)]
 pub struct Managed {
     /// The file to exec.
@@ -87,13 +71,7 @@ pub fn managed(layout: &Layout, tool: &str) -> Option<Managed> {
     })
 }
 
-/// One listing of `bin/`, resolved once: per entry, the [`ToolName`] its file name spells
-/// and the target its shim forwards to, shared by the reading passes.
-///
-/// Not for a predicate that deletes: the directory can change between capture and decision,
-/// and a stale target widens a deletion's reach, so every site that removes a file
-/// ([`crate::activate::prune_stale_shims`], [`crate::activate::undo_activation`],
-/// [`crate::activate::sweep_agents_dir`]) lists the directory itself when it decides.
+/// One listing of `bin/`, resolved once: per entry, the [`ToolName`] its file name spells and the target its shim forwards to, shared by the reading passes.
 pub(crate) struct BinScan {
     entries: Vec<BinEntry>,
 }
@@ -121,8 +99,6 @@ impl BinScan {
                     .file_name()
                     .to_str()
                     .and_then(crate::store::ToolName::from_shim_file),
-                // `resolve_shim`, not `read_link`: a shim is a stub script (`sh`, or `.cmd`
-                // on Windows), and only a legacy one is a symlink.
                 target: crate::platform::resolve_shim(&e.path()),
             });
         }
@@ -142,9 +118,7 @@ impl BinScan {
     }
 }
 
-/// Parse `(program, build)` out of a shim target like
-/// `…/store/<program>/<build>/bin/<tool>` — the component right after `store` and the
-/// numeric one after it. `None` if the path isn't a store shim target.
+/// Parse `(program, build)` out of a shim target like `…/store/<program>/<build>/bin/<tool>` — the component right after `store` and the numeric one after it.
 pub(crate) fn program_build_of_target(target: &Path) -> Option<(String, u64)> {
     let comps: Vec<&std::ffi::OsStr> = target.iter().collect();
     let i = comps.iter().position(|c| *c == "store")?;
@@ -153,16 +127,7 @@ pub(crate) fn program_build_of_target(target: &Path) -> Option<(String, u64)> {
     Some((program, build))
 }
 
-/// Parse `(program, build)` out of a path that must lie inside `prefix`'s store
-/// (`<prefix>/store/<program>/<build>[/…]`); `None` for anything else.
-///
-/// The anchored counterpart of [`program_build_of_target`], and the one every deleting
-/// predicate must use: that one finds the first component named `store`, so
-/// `/Users//x/src/store/ay/18/bin/ay` (a dev checkout) parses as `("ay", 18)`. Stripping
-/// `<prefix>/store` admits only paths inside this store, and `..` fails for free (a
-/// `ParentDir` component is not `Normal`).
-/// Public for the image classifier (`crate::image`), which anchors a running process's
-/// executable the same way.
+/// Parse `(program, build)` out of a path that must lie inside `prefix`'s store (`<prefix>/store/<program>/<build>[/…]`); `None` for anything else.
 #[must_use]
 pub fn store_build_of(prefix: &Path, target: &Path) -> Option<(String, u64)> {
     let rel = target.strip_prefix(prefix.join("store")).ok()?;
@@ -178,14 +143,7 @@ pub fn store_build_of(prefix: &Path, target: &Path) -> Option<(String, u64)> {
 }
 
 #[must_use]
-/// The command names `program`'s installed build puts on `PATH`, read from the shims (what a
-/// user invokes, and what `atpkg unlink` restores) rather than a manifest that could
-/// disagree after a partial install.
-///
-/// A set in `read_dir` order: callers that care sort. `None` when the program has no shims,
-/// distinct from `Some(vec![])`, so a caller can refuse rather than link nothing. The
-/// `alab-<tool>` aliases ([`crate::activate::Aliases`]) derive from the primaries and are
-/// left out: a sysroot dev link requires every name here in the checkout's `bin/`.
+/// The command names `program`'s installed build puts on `PATH`, read from the shims (what a user invokes, and what `atpkg unlink` restores) rather than a manifest that could disagree after a partial install.
 pub fn installed_exposes(layout: &Layout, program: &str) -> Option<Vec<String>> {
     let shims = read_bin_dir(layout).ok()?;
     let mut out = Vec::new();
@@ -199,11 +157,6 @@ pub fn installed_exposes(layout: &Layout, program: &str) -> Option<Vec<String>> 
         if owner != program {
             continue;
         }
-        // The TOOL's name, never the shim file's: every reader treats an expose as a tool
-        // (`bin/<name>` + the exe suffix in a sysroot link, `ToolName::new` for the
-        // tombstone test, `which`'s "exposes" list). On unix the two are one spelling; on
-        // Windows the file is `ay.cmd`, and a sysroot link then looked for
-        // `bin/ay.cmd.exe` in the checkout and refused every one (found 2026-09-29).
         let name = shim.file_name().to_string_lossy().into_owned();
         let tool = ToolName::from_shim_file(&name);
         if tool.as_ref().is_some_and(ToolName::is_alias) {
@@ -214,36 +167,21 @@ pub fn installed_exposes(layout: &Layout, program: &str) -> Option<Vec<String>> 
     if out.is_empty() { None } else { Some(out) }
 }
 
-/// The active build of each program: the build its `bin/` shims point into. Unlike
-/// [`list_installed`] (every complete build dir, including one staged but never
-/// activated), this is what is live on `PATH`, so [`crate::gate::decide`] never mistakes a
-/// staged build for the running one.
-///
-/// A derived view, not a GC authority: when a program's shims disagree the fold is
-/// last-write-wins over `read_dir` order. [`crate::gc::live_builds`] resolves the
-/// `store/<program>/current` link for deletion and requires this view to agree with it.
+/// The active build of each program: the build its `bin/` shims point into.
 pub fn active_builds(layout: &Layout) -> BTreeMap<String, u64> {
     active_builds_in(&BinScan::capture(layout))
 }
 
-/// [`active_builds`] over a listing already taken, for a pass that also asks
-/// [`active_tools_in`] of it. The `presence` stat below is not part of the snapshot: whether
-/// the store is still there is what goes stale, and this map must agree with
-/// [`crate::gc::live_builds`].
+/// [`active_builds`] over a listing already taken, for a pass that also asks [`active_tools_in`] of it.
 #[must_use]
 pub(crate) fn active_builds_in(scan: &BinScan) -> BTreeMap<String, u64> {
     let mut out = BTreeMap::new();
     for target in scan.targets() {
-        // A shim that names a build is not a build that is there, so the target is stat'd
-        // and `list`, `which` and `doctor` agree
-        // (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md). Only proved absence drops
-        // it: a store this user may execute but not stat (EACCES, EPERM, EIO) is still
         // there ([`crate::store::Presence`]).
         if crate::store::presence(target).is_absent() {
             continue;
         }
         if let Some((program, build)) = program_build_of_target(target) {
-            // Last write wins (`read_dir` order where a program's tools disagree): never
             // make a destructive decision from this number.
             out.insert(program, build);
         }
@@ -251,29 +189,19 @@ pub(crate) fn active_builds_in(scan: &BinScan) -> BTreeMap<String, u64> {
     out
 }
 
-/// The tool names whose `bin/` shims point into `store/<program>/<build>/`: the set a
-/// rollback must re-point or drop. Sorted; empty if `bin/` is unreadable or nothing points
-/// in.
-///
-/// [`ToolName`]s, not file names: callers feed them back through `Layout::shim` /
-/// `install_tools` / `install_tombstone_shim`, which re-append the platform suffix, so a raw
-/// `bin/` entry would double it (`bin/ay.cmd.cmd`). Primaries only; the `alab-<tool>`
-/// aliases are [`active_aliases`].
+/// The tool names whose `bin/` shims point into `store/<program>/<build>/`: the set a rollback must re-point or drop.
 #[must_use]
 pub fn active_tools(layout: &Layout, program: &str, build: u64) -> Vec<ToolName> {
     active_names_in(&BinScan::capture(layout), program, build, false)
 }
 
-/// [`active_tools`] over a `bin/` listing already taken. See [`BinScan`] for why no caller
-/// that deletes is given one.
+/// [`active_tools`] over a `bin/` listing already taken.
 #[must_use]
 pub(crate) fn active_tools_in(scan: &BinScan, program: &str, build: u64) -> Vec<ToolName> {
     active_names_in(scan, program, build, false)
 }
 
-/// The `alab-<tool>` alias names whose `bin/` shims point into `store/<program>/<build>/`:
-/// the counterpart of [`active_tools`], for passes that treat an alias exactly like its
-/// primary (tombstoning a revoked build, the rollback verb's policy probe). Sorted.
+/// The `alab-<tool>` alias names whose `bin/` shims point into `store/<program>/<build>/`: the counterpart of [`active_tools`], for passes that treat an alias exactly like its primary (tombstoning a revoked build, the rollback verb's policy probe).
 #[must_use]
 pub fn active_aliases(layout: &Layout, program: &str, build: u64) -> Vec<ToolName> {
     active_names_in(&BinScan::capture(layout), program, build, true)
@@ -296,10 +224,7 @@ fn active_names_in(scan: &BinScan, program: &str, build: u64, aliases: bool) -> 
     out
 }
 
-/// List installed `(program, build)` pairs by walking `store/<program>/<build>/`
-/// (`atpkg list`), sorted by program then build. A build directory is recognised by
-/// [`crate::store::parse_build_name`], the store's canonical rule, so a name this manager
-/// never wrote (`+19/`, `019/`) is not an installed build.
+/// List installed `(program, build)` pairs by walking `store/<program>/<build>/` (`atpkg list`), sorted by program then build.
 #[must_use]
 pub fn list_installed(layout: &Layout) -> Vec<(String, u64)> {
     let mut out = Vec::new();
@@ -318,11 +243,7 @@ pub fn list_installed(layout: &Layout) -> Vec<(String, u64)> {
         if let Ok(builds) = std::fs::read_dir(prog.path()) {
             for b in builds.flatten() {
                 let bname_os = b.file_name();
-                // The store's canonical recogniser, not `u64::from_str` (which takes a
-                // leading `+` and zeros): the number addresses a directory through
-                // `Layout::build_dir`'s canonical name, so `+19/` must not read as `19/`.
                 if let Some(n) = bname_os.to_str().and_then(crate::store::parse_build_name) {
-                    // Only complete builds count: a tree a crash left partial has no
                     // marker, and counting it would report up to date and never repair it.
                     if crate::store::build_is_complete(&b.path()) {
                         out.push((pname.clone(), n));
@@ -335,15 +256,7 @@ pub fn list_installed(layout: &Layout) -> Vec<(String, u64)> {
     out
 }
 
-/// The shape rule [`uninstall`] applies before touching anything: `program` must be exactly
-/// one normal path component (not empty, `.` or `..`, and holding no `/`, `\` or NUL), the
-/// shape `store::shim_allowed` enforces minus its deny-list. Its own function so a caller
-/// that records an intent before the destructive steps (the CLI's removed marker) can ask
-/// first.
-///
-/// The one-component clause is the Windows half: `C:`, `C:x` and `C:..` carry no separator,
-/// yet a drive-prefixed component replaces the whole base in `Path::join`
-/// (`…\pkg\store`.join("C:x") is `C:x`). On Unix the earlier clauses already imply it.
+/// The shape rule [`uninstall`] applies before touching anything: `program` must be exactly one normal path component (not empty, `.` or `..`, and holding no `/`, `\` or NUL), the shape `store::shim_allowed` enforces minus its deny-list.
 pub(crate) fn uninstall_name_shape(program: &str) -> io::Result<()> {
     if program.is_empty()
         || program == "."
@@ -367,21 +280,12 @@ pub(crate) fn uninstall_name_shape(program: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Uninstall `program` (`atpkg uninstall <program>`): remove every `bin/` and `agents/`
-/// shim pointing into its store tree, then `store/<program>/` (its `current` link with it)
-/// and its exec roots under `<prefix>/compat/<program>/` ([`crate::compat`]).
-///
-/// Fail-closed: the store tree is removed only when it lies inside the prefix, and only
-/// shims resolving into it are removed, so a tampered symlink cannot redirect a delete.
+/// Uninstall `program` (`atpkg uninstall <program>`): remove every `bin/` and `agents/` shim pointing into its store tree, then `store/<program>/` (its `current` link with it) and its exec roots under `<prefix>/compat/<program>/` ([`crate::compat`]).
 pub fn uninstall(layout: &Layout, program: &str) -> io::Result<()> {
-    // Validate the name before building any path: the lexical `starts_with` check below
-    // keeps `..` tokens and cannot stop a traversal (`../../tmp/victim`) on its own.
     uninstall_name_shape(program)?;
 
     let prog_store = layout.prefix.join("store").join(program);
 
-    // 1. Remove shims whose target (`resolve_shim`, not `read_link`: see
-    //    `BinScan::capture`) points into this program's store tree.
     for dir in [layout.bin_dir(), layout.agents_dir()] {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -395,18 +299,10 @@ pub fn uninstall(layout: &Layout, program: &str) -> io::Result<()> {
             }
         }
     }
-    // Sweep `agents/` again for anything the predicate could not resolve: it is first on
-    // every PATH, so nothing may outlive its primary there.
     crate::activate::sweep_agents_dir(layout);
 
-    // 2. Reclaim the store tree (its `current` link with it), only inside the prefix and
-    //    only after every build under it is unmarked: an interrupt partway through the long
-    //    `remove_dir_all` would otherwise leave `<n>.ready` markers vouching for
-    //    half-emptied builds that `list_installed` counts and `flow::rollback` switches
-    //    onto. Unmarked, they are incomplete trees `gc`'s partial arm reclaims.
     if prog_store.starts_with(&layout.prefix) && prog_store.exists() {
         crate::store::unmark_program_builds(&prog_store);
-        // A single-binary build's `bin/` is sealed (`store::seal_bin`): unseal each.
         if let Ok(entries) = std::fs::read_dir(&prog_store) {
             for entry in entries.flatten() {
                 crate::store::unseal_bin(&entry.path());
@@ -415,8 +311,6 @@ pub fn uninstall(layout: &Layout, program: &str) -> io::Result<()> {
         std::fs::remove_dir_all(&prog_store)?;
     }
 
-    // 3. The program's exec roots (`<prefix>/compat/<program>`), after the tree: they are
-    //    clones of the builds just removed, and step 1 removed every shim routing into them.
     crate::compat::remove_program(layout, program)?;
     Ok(())
 }
@@ -440,7 +334,6 @@ mod tests {
     fn install(layout: &Layout, program: &str, build: u64) -> PathBuf {
         let dir = layout.build_dir(program, build);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
-        // The concrete executable the shim forwards to (`<program>.exe` on Windows).
         std::fs::write(
             dir.join("bin").join(tool(program).exe_file()),
             b"#!/bin/true\n",
@@ -454,13 +347,12 @@ mod tests {
         )
         .unwrap();
         activate_build(layout, &dir).unwrap();
-        // A real install marks the build complete as its last step (verify_and_stage).
         crate::store::mark_build_ready(&dir).unwrap();
         dir
     }
 
     /// An interrupted uninstall (^C, SIGTERM, an EACCES in the walk) leaves no `<n>.ready`
-    /// marker beside a half-emptied tree. One unremovable subtree simulates the interrupt.
+    /// marker beside a half-emptied tree.
     #[cfg(unix)]
     #[test]
     fn an_interrupted_uninstall_leaves_no_build_still_vouched_for() {
@@ -469,7 +361,6 @@ mod tests {
         let doomed = install(&l, "trust", 8595);
         assert!(crate::store::build_is_complete(&keep));
         assert!(crate::store::build_is_complete(&doomed));
-        // Make one subtree unremovable so the walk aborts inside the program store.
         std::fs::set_permissions(keep.join("bin"), std::fs::Permissions::from_mode(0o500)).unwrap();
         let outcome = uninstall(&l, "trust");
         let aborted = keep.join("bin").join(tool("trust").exe_file()).is_file();
@@ -479,7 +370,6 @@ mod tests {
             "the fixture must make the removal abort partway, or it proves nothing: \
              aborted={aborted} outcome={outcome:?}"
         );
-        // Neither build may still read as installed.
         for (n, dir) in [(8590u64, &keep), (8595, &doomed)] {
             assert!(
                 !crate::store::build_is_complete(dir),
@@ -498,7 +388,6 @@ mod tests {
     #[test]
     fn partial_build_without_marker_is_not_listed() {
         let l = layout("partial");
-        // Simulate a crash mid-extract: files present, but no completeness marker.
         let dir = l.build_dir("ay", 18);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         std::fs::write(dir.join("bin/ay"), b"partial").unwrap();
@@ -507,7 +396,6 @@ mod tests {
             list_installed(&l).is_empty(),
             "partial (marker-less) build is not installed"
         );
-        // Once marked complete, it is listed.
         crate::store::mark_build_ready(&dir).unwrap();
         assert_eq!(list_installed(&l), vec![("ay".into(), 18)]);
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -523,12 +411,10 @@ mod tests {
             store_build_of(prefix, Path::new("/p/store/ay/18/bin/ay")),
             Some(("ay".to_string(), 18))
         );
-        // The build dir itself (no trailing path) parses too.
         assert_eq!(
             store_build_of(prefix, Path::new("/p/store/ay/18")),
             Some(("ay".to_string(), 18))
         );
-        // Outside the prefix — the unanchored `program_build_of_target` says yes to this one.
         assert_eq!(
             store_build_of(prefix, Path::new("/other/store/ay/18")),
             None
@@ -538,7 +424,6 @@ mod tests {
             Some(("ay".to_string(), 18)),
             "the unanchored parser is why the anchored one has to exist"
         );
-        // Shapes the store never writes: no build, a non-numeric build, a `..` escape.
         assert_eq!(store_build_of(prefix, Path::new("/p/store/ay")), None);
         assert_eq!(store_build_of(prefix, Path::new("/p/store/ay/head")), None);
         assert_eq!(store_build_of(prefix, Path::new("/p/store/../ay/18")), None);
@@ -555,7 +440,6 @@ mod tests {
             Some(17),
             "precondition: a real install is live"
         );
-        // Remove the store build the shim points at, leaving the shim.
         std::fs::remove_dir_all(l.build_dir("ay", 17)).unwrap();
         assert!(
             crate::platform::resolve_shim(&l.shim(&tool("ay"))).is_some(),
@@ -610,16 +494,13 @@ mod tests {
     #[test]
     fn active_builds_reflects_the_shim_not_a_staged_inactive_build() {
         let l = layout("active");
-        install(&l, "ay", 17); // ay@17 is live (shim -> ay/17)
-        // ay@18 staged and marked complete, but not activated (no shim repoint).
+        install(&l, "ay", 17);
         let staged = l.build_dir("ay", 18);
         std::fs::create_dir_all(staged.join("bin")).unwrap();
         std::fs::write(staged.join("bin/ay"), b"#!/bin/true\n").unwrap();
         crate::store::mark_build_ready(&staged).unwrap();
 
-        // list_installed sees the newest complete build (18), activated or not.
         assert!(list_installed(&l).contains(&("ay".to_string(), 18)));
-        // active_builds sees what is live on PATH: ay@17.
         assert_eq!(active_builds(&l).get("ay").copied(), Some(17));
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
@@ -631,7 +512,6 @@ mod tests {
         install(&l, "ny", 9);
         assert_eq!(active_tools(&l, "ay", 18), vec![tool("ay")]);
         assert_eq!(active_tools(&l, "ny", 9), vec![tool("ny")]);
-        // A build no shim points into yields nothing.
         assert!(active_tools(&l, "ay", 17).is_empty());
         assert!(active_tools(&l, "nope", 1).is_empty());
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -684,7 +564,6 @@ mod tests {
             !l.prefix.join("store/ay").exists(),
             "program store dir removed"
         );
-        // The program's `current` link went with its store tree, not left dangling.
         assert!(std::fs::symlink_metadata(l.program_current("ay")).is_err());
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
@@ -693,16 +572,11 @@ mod tests {
     fn uninstall_rejects_path_traversal_names() {
         let l = layout("uninstall-traversal");
 
-        // A directory outside the prefix that a `..` escape would reach
-        // (`prefix.parent().parent()/<victim>`), named per process because concurrent
-        // suites share the temp dir.
         let name = format!("atpkg-victim-do-not-delete-{}", std::process::id());
         let victim = l.prefix.parent().unwrap().join(&name);
         let _ = std::fs::remove_dir_all(&victim);
         std::fs::create_dir_all(victim.join("keep")).unwrap();
 
-        // Lexically `prefix/store/../../<victim>` starts with `prefix`, so a `starts_with`
-        // guard alone would let `remove_dir_all` escape.
         let traversal = format!("../../{name}");
         let err = uninstall(&l, &traversal).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
@@ -711,7 +585,6 @@ mod tests {
             "out-of-prefix directory must NOT be deleted by a traversal program name"
         );
 
-        // A bare `..` would otherwise resolve `store/..` to the prefix itself and wipe it.
         let err = uninstall(&l, "..").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(
@@ -719,7 +592,6 @@ mod tests {
             "managed prefix must survive `uninstall ..`"
         );
 
-        // Other unsafe shapes are refused too, with no filesystem effect.
         for bad in ["", ".", "a/b", "a\\b", "x\0y"] {
             assert_eq!(
                 uninstall(&l, bad).unwrap_err().kind(),
@@ -727,9 +599,6 @@ mod tests {
             );
         }
 
-        // A drive-relative name carries no separator, yet on Windows the join leaves the
-        // prefix (`store.join("C:x")` is `C:x`), so the shape rule refuses it there. On Unix
-        // it is an ordinary directory name inside the store.
         for drive in ["C:", "C:x", "C:.."] {
             let escapes = !l.prefix.join("store").join(drive).starts_with(&l.prefix);
             assert_eq!(

@@ -1,36 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Build provenance (version, commit, build number and time, compiler, and a content signature
-//! of the running binary) for the native Settings `/about` route ([`about_fields`]) and
-//! `aterm ctl version` ([`control_line`]).
-//!
-//! Every build fact is the binary's [`BuildStamp`], compiled into `crates/aterm` and installed
-//! first thing in `main`; this library compiles none in. [`binary_signature`] is the running
-//! code's code directory hash on macOS (a hash of the executable elsewhere), so a signed `.app`
-//! binary and the bare `target/release` one differ.
+//! Build provenance for the Settings `/about` route and `aterm ctl version`.
 
 use aterm_types::version::BuildStamp;
 use std::sync::OnceLock;
 
 pub(crate) const AUTHOR_ATTRIBUTION: &str = "By Andrew Yates";
 pub(crate) const COMPANY: &str = "ALab";
-/// aterm's one tagline: the About hero paints it and Copy Build Information
-/// copies it (the `tagline` row), so the two say the same sentence. Short
-/// enough to keep every word whole in a phone-width hero column.
+/// Application tagline shown in About and Copy Build Information.
 pub(crate) const TAGLINE: &str = "Fast, hardened, introspectable.";
 pub(crate) const AUTHOR_COMPANY_BYLINE: &str = "By Andrew Yates · ALab";
-/// The author's short form, the last rung of the native About byline's fit ladder: the full
-/// [`aterm_types::identity::AUTHOR`] measures 164.6 pt at the Body step under 2× Dynamic Type,
-/// over the 164.0 pt hero column a 240 pt host gives it.
+/// Short author name for narrow About bylines.
 pub(crate) const AUTHOR_SHORT: &str = "A. Yates";
-/// The project site (`alab.systems`) About links from its byline and shows in its `Website`
-/// row, from the one identity every surface shares.
+/// Project website domain.
 pub(crate) const SITE: &str = aterm_types::identity::SITE;
 
 /// The stamp this crate's test binary reads: a clean, stamped Trust build, so the suite is
-/// deterministic. The commit is a recognisable non-commit; the build number is a 2065 epoch,
-/// above every release fixture the tests name and below `CFBundleVersion`'s 2^32 limit.
+/// deterministic.
 #[cfg(test)]
 const TEST_STAMP: BuildStamp = BuildStamp {
     app_version: env!("CARGO_PKG_VERSION"),
@@ -51,10 +38,7 @@ const TEST_STAMP: BuildStamp = BuildStamp {
 };
 
 /// The running binary's build facts: the stamp `crates/aterm` installs first thing in `main`
-/// (`aterm_types::version`), read by every accessor here. A process whose `main` installed
-/// none (the dev-only `aterm-gui` bin and its examples) reads [`BuildStamp::UNSTAMPED`]
-/// (`unknown`, build `0`), which the handoff refuses outside `debug_assertions`; this crate's
-/// test binary reads `TEST_STAMP`.
+/// (`aterm_types::version`), read by every accessor here.
 fn stamp() -> &'static BuildStamp {
     #[cfg(test)]
     let unstamped = &TEST_STAMP;
@@ -63,29 +47,25 @@ fn stamp() -> &'static BuildStamp {
     aterm_types::version::installed().unwrap_or(unstamped)
 }
 
-/// Application identity shared across the one binary: `[workspace.package]
-/// version`, as written, in every build.
+/// Workspace package version.
 #[must_use]
 pub(crate) fn version() -> &'static str {
     stamp().app_version
 }
 
-/// Short git commit the binary was built from, with a `-dirty` suffix when the
-/// working tree had uncommitted changes. `"unknown"` when git was unavailable at
-/// build time (e.g. a source tarball).
+/// Short git commit hash, with `-dirty` when built from a modified tree.
 #[must_use]
 pub(crate) fn git_commit() -> &'static str {
     stamp().git_commit
 }
 
-/// Full source identity for authenticated native-artifact probes. Unlike the
-/// display abbreviation this binds all forty hexadecimal commit characters.
+/// Full 40-hex git commit hash, or `"unknown"`.
 #[must_use]
 pub(crate) fn git_commit_full() -> &'static str {
     stamp().git_commit_full
 }
 
-/// `"true"` when the build's tree was dirty.
+/// `"true"` when the build tree was dirty.
 #[must_use]
 pub(crate) fn git_dirty() -> &'static str {
     stamp().git_dirty
@@ -99,88 +79,67 @@ pub(crate) fn build_time() -> &'static str {
     stamp().build_time
 }
 
-/// Monotonic build number: the updater's ordering and the macOS `CFBundleVersion`, independent
-/// of the display version. A release's is the number `ship release` claims in the append-only
-/// `RELEASES.ledger` (`max(last + 1, unix_now)`) and pins via `SOURCE_DATE_EPOCH`; a dev build
-/// uses HEAD's committer epoch, the same scale, so dev and release builds stay ordered.
+/// Monotonic build number.
 #[must_use]
 pub(crate) fn build_number() -> &'static str {
     stamp().build_number
 }
 
-/// Commits since the newest release tag at build time (`"0"` when git or the tag was
-/// unavailable): the third slot of a dev build's version in
-/// [`crate::menu::version_signature`]. A release's third slot is always 0.
+/// Commits since the newest release tag at build time.
 #[must_use]
 pub(crate) fn dev_commits() -> &'static str {
     stamp().dev_commits
 }
 
-/// Whether a release lane produced this binary: `ship release` and the Linux release lane set
-/// `ATERM_RELEASE_BUILD` for the binary crate's compile and no ordinary build does. Read by
-/// display surfaces only (the `· DEV` mark of [`crate::menu::version_signature`]); no Windows
-/// lane sets it. It carries no version: every build reports [`version`].
+/// Returns whether a release lane produced this binary.
 #[must_use]
 pub(crate) fn is_release_build() -> bool {
     stamp().release_build
 }
 
-/// Full first line of the producing compiler's `-vV`, e.g.
-/// `rustc 1.96.0 (ac68faa20 2026-05-25) (Homebrew)` or
-/// `rustc 1.99.0-dev (2b118046a 2026-07-29) (trustc)`: trustc leads with `rustc` because
-/// version-sniffing build scripts expect it, and names itself in the parenthetical.
+/// First line of the producing compiler's `-vV` output.
 #[must_use]
 pub(crate) fn compiler_version_line() -> &'static str {
     stamp().compiler_version_line
 }
 
-/// The producing compiler's full commit hash (`commit-hash:` from `-vV`), or `"unknown"`: it
-/// tells two toolchains of the same release apart.
+/// Producing compiler's full commit hash, or `"unknown"`.
 #[must_use]
 pub(crate) fn compiler_commit() -> &'static str {
     stamp().compiler_commit
 }
 
-/// The producing compiler's host triple (`host:` from `-vV`).
+/// Producing compiler's host triple.
 #[must_use]
 pub(crate) fn compiler_host() -> &'static str {
     stamp().compiler_host
 }
 
-/// Trust's own version, the `trust:` line of the compiler's `-vV` (e.g. `0.1.0`). Not the
-/// `1.99.0-dev` in [`compiler_version_line`]: that is the Rust release Trust is compatible
-/// with, kept rustc-shaped because cargo, build scripts and rustup parse `rustc <release>`.
-/// `""` when the compiler reported no such line (upstream rustc, or an older Trust).
+/// Trust toolchain version from `-vV`, or `""` for upstream Rust.
 #[must_use]
 pub(crate) fn compiler_trust_version() -> &'static str {
     stamp().compiler_trust_version
 }
 
-/// Compiler flavor: `"r"` upstream Rust, `"t"` Trust. `crates/aterm/src/compiler_probe.rs`
-/// decides it from the `-vV` self-identification, `/trust/` in the `RUSTC` path or
-/// `RUSTUP_TOOLCHAIN=trust`; no build-environment override can flip it.
+/// Compiler flavor (`"r"` upstream Rust, `"t"` Trust).
 #[must_use]
 pub(crate) fn compiler_flavor() -> &'static str {
     stamp().compiler_flavor
 }
 
-/// Cargo profile the binary was compiled under (`"debug"`/`"release"`).
+/// Cargo build profile (`"debug"` or `"release"`).
 #[must_use]
 pub(crate) fn build_profile() -> &'static str {
     stamp().build_profile
 }
 
-/// `"on"` iff the Trust verification pipeline was in the binary's compile, else
-/// `"off"`.
+/// `"on"` if compiled with the Trust verification pipeline, else `"off"`.
 #[must_use]
 pub(crate) fn trust_verify() -> &'static str {
     stamp().trust_verify
 }
 
-/// Lowercase SHA-256 fingerprint of the raw paper master key, the one anchor that authorizes
-/// a release, or all zeros when none is pinned (a fork). `build.rs` derives it from the
-/// committed `aterm_update_core::pins::PAPER_MASTER_PUBKEYS[0]`, never from the environment;
-/// the release cutter cross-checks it against the runtime diagnostics and the committed master.
+/// Lowercase SHA-256 fingerprint of the release master key, or all zeros when unset.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const EMBEDDED_UPDATE_PIN_SHA256: &str = env!("ATERM_UPDATE_PIN_SHA256");
 
@@ -199,15 +158,13 @@ const fn update_pin_record_bytes(value: &str) -> [u8; 64] {
     record
 }
 
-/// Linker-retained, fixed-format release-authority record. Its own Mach-O section lets the
-/// release cutter find it structurally, never by a byte-substring match.
+/// Linker-retained, fixed-format release-authority record.
 #[cfg(target_vendor = "apple")]
 #[used]
 #[unsafe(link_section = "__DATA,__aterm_upin")]
 static ATERM_UPDATE_PIN_RECORD: [u8; 64] = update_pin_record_bytes(EMBEDDED_UPDATE_PIN_SHA256);
 
-/// Short (8-hex) slug of the producing compiler's commit, for the `compiler` row and
-/// `trustc_commit=`. `"unknown"` when the toolchain didn't report a hash (e.g. some distro builds).
+/// Short (8-hex) commit slug of the producing compiler.
 #[must_use]
 pub(crate) fn compiler_commit_short() -> &'static str {
     let commit = compiler_commit();
@@ -218,10 +175,7 @@ pub(crate) fn compiler_commit_short() -> &'static str {
     }
 }
 
-/// The display version: `[workspace.package] version` (`MAJOR.MINOR.0`), the same in release
-/// and dev builds; build number, commit, compiler and build time are their own rows. Display
-/// only: `aterm_update::check_now` takes no version, selection is by release tag and the
-/// apply gate is [`build_number`].
+/// Display version (`[workspace.package] version`).
 #[must_use]
 pub(crate) fn version_display() -> &'static str {
     version()
@@ -251,12 +205,7 @@ fn toolchain_display() -> String {
     }
 }
 
-/// One human line of compiler provenance for About and `--diagnose`, e.g. `Trust 0.1.0 ·
-/// trustc 3a3e781f · compatible with Rust 1.99.0-dev · release · trust_verify on`, or
-/// `Rust 1.96.0 · rustc ac68faa2 · release · trust_verify off` for upstream. It leads with
-/// the toolchain's own name and version and states the Rust release as a separate labelled
-/// fact, so the rustc-shaped token never reads as Trust's version. The release cutter's
-/// provenance gate keys on the leading `Trust`.
+/// Single-line compiler provenance summary for About and `--diagnose`.
 #[must_use]
 pub(crate) fn compiler_summary() -> String {
     let slug = compiler_commit_short();
@@ -276,18 +225,7 @@ pub(crate) fn compiler_summary() -> String {
     }
 }
 
-/// A content signature of the running code, 16 hex digits, computed once; `"unknown"` if
-/// nothing can be read. A fingerprint to tell builds apart, not a cryptographic attestation.
-///
-/// On macOS it is the head of the running slice's code directory hash ([`running_cdhash`]),
-/// what `codesign -dvvv` prints as `CDHash=`. The code directory hashes every page of the
-/// slice and the signature's identity, so any two builds differ, and so do a signed `.app`
-/// binary and the bare `target/release` one. Elsewhere, and where the kernel has no code
-/// directory (an unsigned x86_64 build), it is an FxHash of `current_exe()`'s bytes.
-///
-/// NOT THE FILE ON MACOS (2026-10-20, r6 sweep #19): hashing the file read all of it on every
-/// start, both slices of the universal binary (120.7 MB of disk reads with its pages cold, and
-/// 120 MB of heap and copying with them warm), beside the main thread's own page-ins.
+/// 16-hex content signature of the running binary, or `"unknown"`.
 #[must_use]
 pub(crate) fn binary_signature() -> &'static str {
     static SIG: OnceLock<String> = OnceLock::new();
@@ -304,9 +242,7 @@ pub(crate) fn binary_signature() -> &'static str {
     .as_str()
 }
 
-/// Whether [`binary_signature`] reads and hashes the whole executable (tens of MB): off macOS,
-/// and on a macOS build the kernel holds no code directory for (an unsigned x86_64 dev build,
-/// since only arm64 links signed). The control server then computes it once off its lanes.
+/// Returns whether [`binary_signature`] hashes the executable file on disk.
 #[must_use]
 pub(crate) fn binary_signature_reads_the_file() -> bool {
     #[cfg(target_os = "macos")]
@@ -319,7 +255,6 @@ pub(crate) fn binary_signature_reads_the_file() -> bool {
 /// (`csops(getpid(), CS_OPS_CDHASH)`), so no file is read; `None` when it has none.
 #[cfg(target_os = "macos")]
 fn running_cdhash() -> Option<[u8; 20]> {
-    // xnu `bsd/sys/codesign.h`: the op, and the one buffer size it answers (`CS_CDHASH_LEN`).
     const CS_OPS_CDHASH: u32 = 5;
     unsafe extern "C" {
         /// `int csops(pid_t, unsigned int ops, void *useraddr, size_t usersize)`; no SDK
@@ -339,40 +274,29 @@ fn running_cdhash() -> Option<[u8; 20]> {
     (rc == 0).then_some(cdhash)
 }
 
-/// Structured `(key, value)` provenance rows: the one source the native `/about` route paints,
-/// `controls about` serialises and its Copy action puts on the clipboard
-/// ([`crate::about::provenance_text`]), so its pixels and its text cannot disagree.
+/// Structured `(key, value)` provenance rows for `/about` and Copy Build Information.
 #[must_use]
 pub(crate) fn about_fields() -> Vec<(&'static str, String)> {
     let mut fields = vec![
         ("tagline", TAGLINE.to_string()),
         ("author", AUTHOR_ATTRIBUTION.to_string()),
         ("company", COMPANY.to_string()),
-        // The byline's link, the `Website` row and "Open Project Site".
         ("site", SITE.to_string()),
         ("version", version_display().to_string()),
         ("build", build_number().to_string()),
         ("commit", git_commit().to_string()),
         ("built", build_time().to_string()),
-        // The running slice's arch: with the universal binary's mixed flavors (arm64 Trust,
-        // x86_64 upstream), `arch` and `compiler` together say what runs.
         ("arch", std::env::consts::ARCH.to_string()),
         ("compiler", compiler_summary()),
         ("signature", binary_signature().to_string()),
     ];
-    // Which copy runs: a few stats and at most one small plist read per other copy, observed
-    // on every open, so a copy installed since launch shows.
     if let Some(copy) = aterm_update::which_copy::observe() {
         fields.extend(which_copy_rows(&copy));
     }
     fields
 }
 
-/// The which-copy About rows (`docs/DESIGN-which-copy-runs-2026-08-27.md`): `running`, the
-/// running bundle's path (the executable off macOS), and, when another `aterm.app` sits in one
-/// of the usual places, `another copy` with the sentence `aterm --version` prints. Both are
-/// spelled by `aterm_update::which_copy`, so the surfaces cannot drift; several copies share
-/// the row, ` · `-separated, where the metadata card wraps.
+/// Returns the `running` and `another copy` rows from a which-copy report.
 #[must_use]
 pub(crate) fn which_copy_rows(
     copy: &aterm_update::which_copy::WhichCopy,
@@ -390,12 +314,7 @@ pub(crate) fn which_copy_rows(
     rows
 }
 
-/// The `aterm ctl version` reply: one greppable `key=value` line of the running build's
-/// provenance. Keys are additive and keep their meaning. `trustc=`, `trustc_commit=` and
-/// `trustc_host=` name the compiler on every slice (on the upstream x86_64 compat slice its
-/// stock compiler, marked `flavor=r`); `trustc=` and `rust_compat=` carry the rustc-shaped
-/// release token, and `trust=` is Trust's own version (`none` on an upstream build,
-/// `unreported` when the compiler predates the `trust:` line). The updater orders by `build=`.
+/// Formats the `aterm ctl version` single-line `key=value` reply.
 #[must_use]
 pub(crate) fn control_line() -> String {
     let flavor = compiler_flavor();
@@ -409,13 +328,9 @@ pub(crate) fn control_line() -> String {
     let host = compiler_host();
     let profile = build_profile();
     let verify = trust_verify();
-    // `update_pin_sha256=`: the paper master this build trusts. A pure function of a
-    // compiled-in const, so it is computed once, not on every `version` probe.
     static UPDATE_PIN_FINGERPRINT: OnceLock<String> = OnceLock::new();
     let update_pin_sha256 =
         UPDATE_PIN_FINGERPRINT.get_or_init(aterm_update::compiled_update_pin_sha256);
-    // `objc_contained=`: NSExceptions `aterm_objc::exception` caught inside declared
-    // Objective-C methods in this process (each also an ERROR line in aterm.log); `0` off macOS.
     #[cfg(target_os = "macos")]
     let objc_contained = aterm_objc::contained_count();
     #[cfg(not(target_os = "macos"))]
@@ -531,7 +446,6 @@ mod tests {
                 .map(str::trim_end)
                 .unwrap_or_else(|| panic!("no {key} in {line}"))
         };
-        // `rust_compat=` carries the same token as `trustc=`.
         assert_eq!(value("rust_compat="), value("trustc="));
         assert_eq!(value("rust_compat="), compiler_release());
         match compiler_flavor() {
@@ -558,7 +472,6 @@ mod tests {
         ] {
             assert!(line.contains(&format!(" {key}")), "has {key}: {line}");
         }
-        // key=value framing: no value may smuggle a space (would break grep/awk use).
         assert!(
             line.trim_end()
                 .split(' ')
@@ -571,9 +484,7 @@ mod tests {
     /// On macOS the signature is the head of the running code's code directory hash, which
     /// the kernel holds from the exec, not a hash of the file: re-derived here from this test
     /// binary's embedded signature (SHA-256 over its SHA-256 code directory, the cdhash
-    /// `codesign -dvvv` prints), which an FxHash of the executable's bytes never equals. A
-    /// test binary linked unsigned (x86_64 links no signature) gives the kernel none to hold:
-    /// its signature is the file's FxHash, the one the control server computes off its lanes.
+    /// `codesign -dvvv` prints), which an FxHash of the executable's bytes never equals.
     #[cfg(target_os = "macos")]
     #[test]
     fn signature_is_the_running_code_directory_hash() {
@@ -581,8 +492,6 @@ mod tests {
         let le = |o: usize| u32::from_le_bytes(exe[o..o + 4].try_into().expect("4 bytes"));
         let be = |b: &[u8], o: usize| u32::from_be_bytes(b[o..o + 4].try_into().expect("4 bytes"));
         assert_eq!(le(0), 0xfeed_facf, "a thin 64-bit Mach-O");
-        // The load commands follow the 32-byte `mach_header_64`; LC_CODE_SIGNATURE is 0x1d,
-        // a `linkedit_data_command` whose data is the signature's superblob.
         let mut at = 32;
         let mut blob = None;
         for _ in 0..le(16) {

@@ -666,6 +666,8 @@ pub(crate) struct ModelResult {
 }
 
 /// The display a result quotes right at `rest`'s start: in backticks (2.1.267
+/// on) or ANSI bold (2.1.201 to 2.1.222), with the rest after its closing
+/// quote.
 fn quoted_display(rest: &str) -> Option<(String, &str)> {
     let (display, after) = if let Some(quoted) = rest.strip_prefix('`') {
         let end = quoted.find('`')?;
@@ -709,6 +711,8 @@ pub(crate) fn strip_sgr(text: &str) -> std::borrow::Cow<'_, str> {
 }
 
 /// How far into a `/fast` result (SGR stripped, in UTF-16 code units, as JavaScript's `indexOf`
+/// counts) Claude's classifier takes the `Fast mode ON · model set to `` phrase (Claude Code
+/// 2.1.283): room for the icon and a space.
 const FAST_ON_LEAD: usize = 4;
 
 /// What a `type:user` row's content says about the model, when it is one of Claude Code's own model results.
@@ -747,6 +751,8 @@ pub(crate) fn model_result_of(content: &str) -> Option<ModelResult> {
 }
 
 /// The model display a `/model` result row names: Claude's own `type:user`
+/// row whose content is a `Set model to` result ([`model_result_of`]), the
+/// choice [`live_model`] reads.
 fn model_command_display(line: &str) -> Option<String> {
     if !line.contains(aterm_phase::anchor("model.set")) {
         return None;
@@ -854,6 +860,8 @@ pub fn hand_model(
 }
 
 /// The timestamp of the newest main-chain answer or `/model` result in
+/// `tail` ([`model_command_display`]): what says a process has run since it
+/// started.
 fn newest_row_at(tail: &str) -> Option<u64> {
     tail.lines()
         .filter(|l| l.contains("\"assistant\"") || model_command_display(l).is_some())
@@ -1145,6 +1153,8 @@ pub enum ModelVerdict {
         /// The live model.
         from: String,
         /// The newest model of its family on offer ([`family_successor`],
+        /// `[1m]` kept), or, with none newer, the list's target
+        /// ([`list_target`]).
         to: String,
     },
     /// Leave it, and why (one word for the report).
@@ -1210,6 +1220,7 @@ pub fn model_due(
 }
 
 /// Never twice, never after a failure: `model-applied-before` when this harness already moved the
+/// conversation to `to`, `model-failed-before` when it asked for `to` once and it did not take.
 fn spent(record: &ModelRecord, to: &str) -> Option<&'static str> {
     if record.applied.iter().any(|a| base_id(a) == base_id(to)) {
         Some("model-applied-before")
@@ -1221,6 +1232,8 @@ fn spent(record: &ModelRecord, to: &str) -> Option<&'static str> {
 }
 
 /// Whether a person chose `live` (of `family`), which the list never moves across families: a
+/// launch `--model` this harness did not put there, a `/model` (now, or remembered,
+/// [`ModelRecord::human`]), or a saved default of that family (an id, or an alias like `opus`).
 fn chosen_by_hand(
     live: &LiveModel,
     family: &str,
@@ -1707,6 +1720,8 @@ mod tests {
     }
 
     /// Only Claude's own result row is a `/model` choice: the phrase quoted in
+    /// an answer, a tool's output or a person's prompt is text, and the answer
+    /// that quotes it is still an answer.
     #[test]
     fn a_quoted_model_result_is_text_not_a_choice() {
         let b = baked(
@@ -1833,6 +1848,9 @@ mod tests {
     }
 
     /// Where "newest of the family" comes from: the installed build's own
+    /// `latest_per_family` (so a family the list never named, Sonnet here,
+    /// still moves) and the list, each only when the build knows it and the
+    /// account may run it.
     #[test]
     fn what_is_offered_is_what_the_installed_build_knows_and_the_person_allows() {
         let list = Priority::seed(0);
@@ -1890,6 +1908,7 @@ mod tests {
     }
 
     /// Step 1, same family first: whatever the list ranks, a newer model of
+    /// the conversation's own family on offer is the move.
     #[test]
     fn the_model_rule_moves_within_the_family_first() {
         let list = Priority::seed(0);
@@ -2043,6 +2062,8 @@ mod tests {
     }
 
     /// Step 2, then the priority list: only when nothing newer of its family
+    /// is on offer, a model nobody chose moves up the list across families,
+    /// and a deliberate choice never does.
     #[test]
     fn with_nothing_newer_in_its_family_the_list_moves_only_a_model_nobody_chose() {
         let list = Priority::seed(0);
@@ -2197,6 +2218,8 @@ mod tests {
     }
 
     /// Why, in the notices: a move within the family is the family's, a move
+    /// across it can only be the list's, and an id outside the grammar says
+    /// neither.
     #[test]
     fn the_reason_a_move_is_said_with_is_read_from_the_two_ids() {
         assert_eq!(
@@ -2235,6 +2258,7 @@ mod tests {
     }
 
     /// A record without the due clock parses with nothing due, so the first due visit starts the
+    /// clock instead of reading zero as due since 1970.
     #[test]
     fn a_record_without_the_due_clock_parses_as_nothing_due() {
         let old = r#"{"applied":[],"set":"","set_at":0,"failed":[],"human":"","last_seq":3,"seq_since_s":4}"#;
@@ -2271,6 +2295,7 @@ mod tests {
     }
 
     /// A hand-chosen model replaces the launch's `--model`: a `/model` newer than the last answer
+    /// as its display maps (1M window included), or the recorded choice while it still runs.
     #[test]
     fn a_model_chosen_by_hand_is_carried_only_where_it_is_not_the_launchs() {
         let live = |id: &str, by_command: bool| LiveModel {
@@ -2314,6 +2339,7 @@ mod tests {
     }
 
     /// Launched `--model opus`, a `/model` pick of what `opus` names is no hand choice (carrying it
+    /// would pin the full id).
     #[test]
     fn a_pick_of_what_the_launch_alias_names_is_no_hand_choice() {
         let live = |id: &str, by_command: bool| LiveModel {
@@ -2372,6 +2398,7 @@ mod tests {
     }
 
     /// A `/model` or recorded choice older than the process is not this process's hand choice (a
+    /// launch alias leaves [`live_model_at`] no flag to read instead).
     #[test]
     fn a_model_command_older_than_the_process_is_no_hand_choice() {
         let b = baked(
@@ -2442,6 +2469,7 @@ mod tests {
     }
 
     /// `settings.json` is parsed as Claude Code parses it: a leading byte-order mark is dropped, so
+    /// a marked file's allowlist and default count; an empty or blank file sets nothing.
     #[test]
     fn a_marked_settings_file_keeps_its_allowlist_and_default() {
         let u = parse_user_settings(
@@ -2482,6 +2510,11 @@ mod tests {
     }
 
     /// THE PLANS THAT BILL A MODEL TO USAGE CREDITS ([`credits_billed`]): Fable
+    /// on credits only, or past the date the plan's Fable limits end — and,
+    /// failing closed (the review of 2026-10-19, P4), where that date or the
+    /// plan did not read; a family a stored consent bills with no dialog, or
+    /// that `tengu_calm_seal` bills to credits only (P1) — by id or by alias
+    /// ([`billed_to_credits`]).
     #[test]
     fn a_plan_bills_fable_to_usage_credits_only_where_its_profile_says() {
         use super::super::profile::{FablePlan, parse};
@@ -2550,6 +2583,8 @@ mod atomic_write_tests {
     }
 
     /// Each atomic write names its flush (aterm-durable's counting seam): the plain
+    /// one stays durable, the ordered one and the seeding of an absent list are only
+    /// ordered, and a list that is present is read, not written.
     #[test]
     fn the_atomic_writes_name_their_flush() {
         use aterm_durable::{Flush, seam::Recording};

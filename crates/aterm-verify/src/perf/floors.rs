@@ -2,24 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The FLOOR lanes: each runs an `aterm-bench` example in a release
-//! subprocess, reads the one JSON line it prints, and holds every gated metric
-//! to a floor derived from its committed baseline in `crates/aterm-verify/perf/golden/`.
-//!
-//! aterm is a NO-CI, MULTI-MACHINE repo: boxes of different speeds share one
-//! committed baseline, and a run may land on a throttled laptop. So a floor
-//! must catch a CATASTROPHIC regression (an algorithmic blow-up, a debug-build
-//! slip, lock contention) while NEVER failing a normal or slower machine:
-//!
-//! * MEASURE the shipped build: `targo --unverified run --release`, never this
-//!   debug-built CLI.
-//! * MEDIAN-OF-N after warmup, inside each harness: one scheduler hiccup cannot
-//!   move a median.
-//! * A GENEROUS RATIO: a metric fails only below `baseline * PASS_RATIO`.
-//! * A FRESH CHECKOUT IS NEVER BLOCKED: with no baseline the lane reports the
-//!   number and says it judged nothing.
-//!
-//! The tight same-box comparison is the trend ledger's job ([`super::trend`]).
+//! Release performance floor lanes against committed golden baselines ([`super::trend`]).
 
 use std::path::{Path, PathBuf};
 
@@ -29,18 +12,10 @@ use super::trend::utc_date;
 use super::workspace_root;
 use super::{LaneRun, Status, TrendSample};
 
-/// The pass threshold as a fraction of the recorded baseline: a metric fails
-/// iff `measured < baseline * PASS_RATIO`.
-///
-/// 0.45 lets a box run at 45% of the baseline's speed (~2.2x slower) and pass:
-/// measured cross-box and throttled spreads sit inside ~1.5x, while a debug
-/// build or an algorithmic blow-up costs 5x-50x. The deterministic allocation
-/// gates (`mem_budget`, `perf_scaling`) are the precise guards; this is the
-/// coarse wall-clock floor.
+/// The pass threshold as a fraction of the recorded baseline.
 pub(crate) const PASS_RATIO: f64 = 0.45;
 
-/// Where the committed baselines and the trend ledger live: beside this
-/// crate's sources, so an exported tree carries its own data.
+/// Where the committed baselines and the trend ledger live.
 pub(crate) fn golden_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("perf/golden")
 }
@@ -48,7 +23,7 @@ pub(crate) fn golden_dir() -> PathBuf {
 /// The verdict of comparing one fresh number against its baseline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Verdict {
-    /// No usable baseline (missing, non-finite or <= 0): judged nothing.
+    /// No usable baseline (missing, non-finite or <= 0).
     NoBaseline,
     /// `measured >= baseline * ratio`.
     Pass,
@@ -56,8 +31,7 @@ pub(crate) enum Verdict {
     Fail,
 }
 
-/// Pure threshold comparison. Returns the floor too, so callers can print it.
-/// The boundary is inclusive: a measurement exactly at the floor passes.
+/// Pure threshold comparison.
 pub(crate) fn compare(baseline: f64, measured: f64, ratio: f64) -> (Verdict, f64) {
     if !baseline.is_finite() || baseline <= 0.0 {
         return (Verdict::NoBaseline, 0.0);
@@ -86,8 +60,7 @@ fn object(text: &str) -> Option<Value> {
 
 /// The committed baseline at `path`: `Ok(None)` when there is none (a fresh
 /// checkout judges nothing and says so), an error when it exists but `parse`
-/// cannot use it. An unusable baseline fails rather than reading as absent,
-/// so a key added without its recorded value cannot switch a lane off.
+/// cannot use it.
 fn read_baseline<T>(
     path: &Path,
     parse: impl FnOnce(&Value) -> Result<T, String>,
@@ -103,8 +76,6 @@ fn read_baseline<T>(
         .map_err(|why| format!("{} {why}", path.display()))
 }
 
-// The throughput lane.
-
 /// The `perf_harness` report, and the shape persisted to its baseline.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PerfReport {
@@ -116,8 +87,7 @@ pub(crate) struct PerfReport {
     pub warmup: u64,
 }
 
-/// A [`PerfReport`] from the harness line or a baseline; `None` if any field
-/// is missing.
+/// A [`PerfReport`] from the harness line or a baseline.
 pub(crate) fn parse_report(json: &Value) -> Option<PerfReport> {
     Some(PerfReport {
         median_mbps: number(json, "median_mbps")?,
@@ -129,8 +99,7 @@ pub(crate) fn parse_report(json: &Value) -> Option<PerfReport> {
     })
 }
 
-/// The committed baseline for a [`PerfReport`]. `pass_ratio` is recorded for
-/// readers; the lane judges with [`PASS_RATIO`].
+/// The committed baseline for a [`PerfReport`].
 pub(crate) fn baseline_json(r: &PerfReport, ratio: f64, comment: &str) -> String {
     format!(
         "{{\n  \"_comment\": {},\n  \"median_mbps\": {:.3},\n  \"min_mbps\": {:.3},\n  \"max_mbps\": {:.3},\n  \"workload_bytes\": {},\n  \"n\": {},\n  \"warmup\": {},\n  \"pass_ratio\": {:.3}\n}}\n",
@@ -159,7 +128,7 @@ fn quoted(s: &str) -> String {
     aterm_json::to_string(&Value::String(s.to_string())).unwrap_or_else(|_| "\"\"".to_string())
 }
 
-/// THROUGHPUT: the median clears `baseline * PASS_RATIO`.
+/// Throughput: the median clears `baseline * PASS_RATIO`.
 pub(crate) fn gate_throughput(record: bool) -> LaneRun {
     let report = match measure_example("perf_harness").and_then(|json| {
         parse_report(&json).ok_or_else(|| format!("perf_harness JSON lacks a field: {json:?}"))
@@ -230,31 +199,23 @@ fn compare_against_baseline(path: &Path, report: &PerfReport) -> LaneRun {
     }
 }
 
-// KEYED lanes: the harness emits flat JSON and every listed key gets its own
-// floor. Keys are bigger-is-better; a missing key makes the whole report
-// unparseable (never "the missing metric passed").
-
 /// A keyed floor lane.
 pub(crate) struct FloorLane {
     /// The lane's name in the trend ledger's `lane/metric` column.
     pub lane: &'static str,
     /// The `aterm-bench` example that measures it.
     pub example: &'static str,
-    /// The gated keys (bigger-is-better); other keys in the report are
-    /// informational.
+    /// The gated keys (bigger-is-better).
     pub keys: &'static [&'static str],
     /// The baseline's file name under [`golden_dir`].
     pub baseline_file: &'static str,
     /// The `_comment` a first recording writes.
     pub comment: &'static str,
-    /// The CLI lane name, which every message names it by (`lane` can differ
-    /// for trend continuity: `scroll-scrub` trends as `scroll`).
+    /// The CLI lane name.
     pub cli: &'static str,
 }
 
-/// Per-corpus hostile-input floors: one floor PER CORPUS, so an SGR-interning
-/// regression (style_churn) cannot hide behind a healthy ASCII number. The
-/// keys mirror `aterm-bench/examples/pathological_harness.rs`.
+/// Per-corpus hostile-input floors.
 pub(crate) const PATHOLOGICAL_LANE: FloorLane = FloorLane {
     lane: "pathological",
     example: "pathological_harness",
@@ -273,11 +234,7 @@ pub(crate) const PATHOLOGICAL_LANE: FloorLane = FloorLane {
     cli: "pathological",
 };
 
-/// Scrollback-scrub read-path floors: tiered compressed scrollback pays tier
-/// decode on the scrub path where an all-RAM scrollback pays pointer math.
-/// Jump-to-top is jumps/sec so every key is bigger-is-better. The windowed half
-/// is the `scroll` arena lane. The keys mirror
-/// `aterm-bench/examples/scroll_scrub_harness.rs`.
+/// Scrollback-scrub read-path floors.
 pub(crate) const SCROLL_LANE: FloorLane = FloorLane {
     lane: "scroll",
     example: "scroll_scrub_harness",
@@ -339,14 +296,7 @@ pub(crate) const RESIZE_LANE: FloorLane = FloorLane {
     cli: "resize",
 };
 
-/// CRASH-RESTORE floor (the crash-restore plan §6 and §7.3; `crates/aterm-restore`): what
-/// the journal costs the parse thread and what a restore costs the next window. The keys
-/// mirror `aterm-bench/examples/crash_restore_harness.rs`: the parse thread's throughput
-/// with the tail tap on, keyframes per second (capture, encode and copy) for a shell, a
-/// full-screen program over a saved primary and a shell with a 256- and a 512-line bridge,
-/// and restores per second of a keyframe plus a 256 KiB tail. The tap's overhead ratio is an
-/// absolute fence ([`TAIL_TAP_RATIO_FENCE`]), not a ratio floor: it is already a ratio. Named
-/// `crash-restore` because `restore` is the serialize-and-replay lane.
+/// Crash-restore floor (`crates/aterm-restore`).
 pub(crate) const CRASH_RESTORE_LANE: FloorLane = FloorLane {
     lane: "crash-restore",
     example: "crash_restore_harness",
@@ -367,18 +317,10 @@ pub(crate) const CRASH_RESTORE_LANE: FloorLane = FloorLane {
     cli: "crash-restore",
 };
 
-/// The tail tap's ABSOLUTE fence: with the tap on, the parse thread keeps at least this
-/// fraction of its throughput on the throughput corpus (the plan's floor). The tap copies
-/// each PTY byte once into the region after `process`; measured 0.993-0.995 on an M5 Max
-/// (a word-at-a-time copy measured 0.75 and a double copy 0.93, which this fence catches).
-/// It holds with no baseline, like the resize fences.
+/// The tail tap's absolute fence.
 pub(crate) const TAIL_TAP_RATIO_FENCE: f64 = 0.97;
 
-/// ZSTD-DECODE floor (docs/AUDIT-third-party-2026-10-15.md ZC.4): decoded MB/s
-/// of `aterm_zstd::Decoder`, atpkg's `.tar.zst` reader, over five frames the
-/// zstd 1.5.7 CLI wrote (aterm-zstd's recorded answers, so no encoder runs and
-/// the input never drifts). The keys mirror
-/// `aterm-bench/examples/zstd_decode_harness.rs`.
+/// ZSTD-decode floor: decoded mb/s of `aterm_zstd::Decoder`, atpkg's `.tar.zst` reader.
 pub(crate) const ZSTD_LANE: FloorLane = FloorLane {
     lane: "zstd",
     example: "zstd_decode_harness",
@@ -391,24 +333,7 @@ pub(crate) const ZSTD_LANE: FloorLane = FloorLane {
     cli: "zstd",
 };
 
-/// EFFECTS (docs/DESIGN-card-engine-2026-10-19.md, lane B0): what a frame of the rectangle
-/// effects costs on scripted scenes (the harness card's episode, the settled card under typing,
-/// the cursor glow under a typist, inline streaming that scrolls the card), through the real
-/// emitters, the CPU rasterizer and the GPU presenter. The keys mirror
-/// `aterm-bench/examples/effects_harness.rs`, which also reports every figure the gated lanes
-/// B5 and B6 are judged on (the pass-economy ablation's `pass_cost_pct`, `build_stage_pct`).
-///
-/// The floors are on the figures a shared desk's load does not move: the GPU time of each
-/// scene CALIBRATED against a reference full-repaint frame drawn in the same seconds (`_gpu_rel`,
-/// within 1.11x across invocations at loads of 17 to 93 on 14 cores, while the absolute GPU
-/// time is bimodal with the GPU's clock), and the CPU WORK per frame of the producer, the CPU
-/// raster and the GPU encode as instructions retired (`_per_ginsn`, frames per 10^9
-/// instructions, within 1.05x run to run). Time on the CPU, even the thread's own CPU time
-/// against the same reference, swung 1.55-1.75x between invocations at loads of 17 to 36 (the
-/// reference's 14.6 MB repaint follows the memory contention, the scenes' small kernels do
-/// not), which broke the same-box trend's 0.70; it is reported, not gated. The reference
-/// shares the presenter's text work with every scene, so `ref_text_gpu_rel` floors the
-/// reference itself against a blank full repaint drawn beside it.
+/// Effects: what a frame of the rectangle effects costs on scripted scenes.
 pub(crate) const EFFECTS_LANE: FloorLane = FloorLane {
     lane: "effects",
     example: "effects_harness",
@@ -425,8 +350,7 @@ pub(crate) const EFFECTS_LANE: FloorLane = FloorLane {
     cli: "effects",
 };
 
-/// The effects lane's gated keys, each written once: the GPU keys (`_gpu_rel`) and the CPU
-/// work keys (`_per_ginsn`); the full lane is both.
+/// The effects lane's gated keys.
 macro_rules! effects_keys {
     (gpu: [$($gpu:literal),* $(,)?], cpu: [$($cpu:literal),* $(,)?] $(,)?) => {
         const EFFECTS_GPU_KEYS: &[&str] = &[$($gpu),*];
@@ -475,18 +399,11 @@ const EFFECTS_CPU_LANE: FloorLane = FloorLane {
 /// The features the effects harness is built with: its pass-economy ablation is a dev seam.
 const EFFECTS_FEATURES: &[&str] = &["dev-seams"];
 
-/// The 42s-freeze-class ABSOLUTE fences. Unlike the ratio floors these hold on
-/// a fresh checkout with no baseline: a synchronous O(history) rewrap costs
-/// seconds, far past either cap, while the measured worsts (73 ms ring, 18.6 ms
-/// tiered-sync on an M5 Max; a slow box ~2-3x) sit far below.
-///
-/// The tiered cap is ~5x the measured worst on purpose: the offloading
-/// resize's synchronous phase must stay VIEWPORT-bounded, and O(history) work
-/// leaking back costs hundreds of ms at the harness's 110k-line depth.
+/// The 42s-freeze-class absolute fences.
 pub(crate) const RESIZE_RING_WORST_CAP_MS: f64 = 5_000.0;
 pub(crate) const RESIZE_TIERED_SYNC_WORST_CAP_MS: f64 = 100.0;
 
-/// The gated values of `json`, in key order; `None` if ANY key is missing.
+/// The gated values of `json`, in key order.
 pub(crate) fn parse_keyed(lane: &FloorLane, json: &Value) -> Option<Vec<(&'static str, f64)>> {
     lane.keys
         .iter()
@@ -494,8 +411,7 @@ pub(crate) fn parse_keyed(lane: &FloorLane, json: &Value) -> Option<Vec<(&'stati
         .collect()
 }
 
-/// A keyed lane's committed baseline (hand-rendered: one key per line, so a
-/// re-record diffs line by line).
+/// A keyed lane's committed baseline.
 pub(crate) fn keyed_baseline_json(values: &[(&str, f64)], ratio: f64, comment: &str) -> String {
     let mut s = format!("{{\n  \"_comment\": {},\n", quoted(comment));
     for (key, v) in values {
@@ -505,11 +421,7 @@ pub(crate) fn keyed_baseline_json(values: &[(&str, f64)], ratio: f64, comment: &
     s
 }
 
-/// The `_comment` a re-record writes: the committed note, grown by a dated
-/// marker, or `default` when there is none. `true` when a note was carried.
-///
-/// The committed note is the only record of how a floor was earned (which box,
-/// which date, why), so a re-record keeps it rather than replacing it.
+/// The `_comment` a re-record writes.
 pub(crate) fn carried_comment(
     previous: Option<&Value>,
     default: &str,
@@ -547,8 +459,7 @@ fn write_baseline(path: &Path, text: &str) -> LaneRun {
     }
 }
 
-/// Run an `aterm-bench` example in release and return its JSON report (the
-/// last stdout line that starts with `{`).
+/// Run an `aterm-bench` example in release and return its JSON report.
 pub(crate) fn measure_example(example: &str) -> Result<Value, String> {
     measure_example_with(example, &[])
 }
@@ -711,8 +622,7 @@ pub(crate) fn gate_keyed(lane: &FloorLane, record: bool) -> LaneRun {
     }
 }
 
-/// CRASH-RESTORE: the ratio floors, the tail tap's absolute fence (which holds with no
-/// baseline), and a line naming every key the harness reported that nothing judges.
+/// Crash-restore: the ratio floors, the tail tap's absolute fence (which holds with no baseline).
 pub(crate) fn gate_crash_restore(record: bool) -> LaneRun {
     match measure_example(CRASH_RESTORE_LANE.example) {
         Ok(json) => judge_crash_restore(&json, record),
@@ -739,8 +649,7 @@ fn judge_crash_restore(json: &Value, record: bool) -> LaneRun {
     run
 }
 
-/// EFFECTS: the calibrated floors, judged on the keys the harness's GPU clock allows, after a
-/// host with no GPU skips. Every other key is the record.
+/// Effects: the calibrated floors, judged on the keys the harness's GPU clock allows.
 pub(crate) fn gate_effects(record: bool) -> LaneRun {
     match measure_example_with(EFFECTS_LANE.example, EFFECTS_FEATURES) {
         Ok(json) => judge_effects(&json, record),
@@ -765,11 +674,7 @@ fn judge_effects(json: &Value, record: bool) -> LaneRun {
 }
 
 /// The lane that judges an effects report, and what this host could not measure for it; or the
-/// run that ends it before any baseline is read. The harness names its GPU clock (`metal`,
-/// `wgpu`, `none`) and its CPU counter (`instructions`, `none`): a host with no GPU skips, as
-/// does one with neither, a report that names either one not is refused, and only a host with
-/// both may record (half the keys would overwrite the committed floors of the other half and
-/// retire them).
+/// run that ends it before any baseline is read.
 fn effects_lane(
     json: &Value,
     record: bool,
@@ -819,8 +724,7 @@ fn effects_lane(
     Ok((lane, missing))
 }
 
-/// The tail tap's fence: a missing ratio is a breach (an unmeasured cost is not a small
-/// one).
+/// The tail tap's fence: a missing ratio is a breach (an unmeasured cost is not a small one).
 pub(crate) fn tail_tap_fence(json: &Value) -> Result<(), String> {
     match number(json, "tail_tap_ratio") {
         Some(v) if v >= TAIL_TAP_RATIO_FENCE => {
@@ -850,9 +754,7 @@ const RESIZE_INVERTED_TREND_KEYS: [&str; 7] = [
     "deep_wrapall_step_worst_ms",
 ];
 
-/// RESIZE/REWRAP: the ratio floors, the absolute fences (which hold with no
-/// baseline at all), the inverted trend samples, and a line naming every key
-/// the harness reported that nothing here judges.
+/// Resize/rewrap: the ratio floors, the absolute fences (which hold with no baseline at all).
 pub(crate) fn gate_resize(record: bool) -> LaneRun {
     let json = match measure_example(RESIZE_LANE.example) {
         Ok(j) => j,
@@ -889,16 +791,13 @@ fn judge_resize(json: &Value, record: bool) -> LaneRun {
         .filter(|k| !RESIZE_LANE.keys.contains(k) && !RESIZE_INVERTED_TREND_KEYS.contains(k))
         .collect();
     if !ungated.is_empty() {
-        // Several are the run's shape (ring_lines, n, warmup); converge_stale_width
-        // is a correctness outcome nothing here refuses. Which deserve a floor is
         // an owner call; the log says they were not judged.
         eprintln!("    UNGATED — reported, not judged: {}", ungated.join(", "));
     }
     run
 }
 
-/// The absolute worst-case fences; each finding is one breach. A missing key
-/// is a breach: an unmeasured latency is not a small one.
+/// The absolute worst-case fences.
 pub(crate) fn resize_fences(json: &Value) -> Vec<String> {
     let mut findings = Vec::new();
     for (key, cap) in [
@@ -1080,7 +979,6 @@ mod tests {
                 SEARCH_LANE.keys[0]
             )]
         );
-        // With every value non-positive the lane judged nothing at all.
         std::fs::write(
             &path,
             keyed_baseline_json(&[("restore_median_hz", 0.0)], PASS_RATIO, "c"),
@@ -1177,7 +1075,6 @@ mod tests {
             tail_tap_fence(&json("{\"tail_tap_mbps\":500.0}")).is_err(),
             "missing is a breach"
         );
-        // The fence holds with no baseline: a fresh checkout judges it and nothing else.
         let mut s = String::from("{\"tail_tap_ratio\":0.5,");
         for key in CRASH_RESTORE_LANE.keys {
             s.push_str(&format!("\"{key}\":10.0,"));
@@ -1250,8 +1147,7 @@ mod tests {
     }
 
     /// A host judges what it can measure and names the rest unjudged: no GPU clock, the CPU
-    /// work keys; no instruction counter, the GPU keys; neither, a skip. Only a host with both
-    /// may record (asked of the lane choice, which reads and writes no baseline).
+    /// work keys; no instruction counter, the GPU keys; neither, a skip.
     #[test]
     fn an_effects_host_is_judged_on_what_it_measures_and_records_only_with_both() {
         let full = effects_report(

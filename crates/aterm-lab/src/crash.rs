@@ -1,62 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `crash [tag] [--gap SECS] [--keep-tree]`: aterm crashes under a lab that
-//! is up and comes back on the same state, the step of a crash the agent
-//! lives through. `restore` judges a cold restore on a lab of its own;
-//! `crash` is the one step, on the lab a driver brought up, and judges
-//! nothing: what the next instance and its loop do is the driver's to read
-//! (`journal`, `ctl TAG ls`, the harness ledger).
-//!
-//! It SIGKILLs the lab's OWN instance: the pid `env.sh` records
-//! (`INSTANCE_PID`), and only while that pid is still the lab's
-//! ([`crate::lab::names_this_lab`], the test `down` makes: alive, its command
-//! line on the lab's socket or run directory), never a process found by
-//! name. A recorded pid that is not the lab's (it ended, or the system has
-//! given it to another process) is refused: nothing is killed and nothing
-//! started, exit 1. So is a lab whose egress witness is not running
-//! ([`crate::procs::need_witness`]): nothing more starts in its jail.
-//!
-//! Before the kill it says the Claude Code registered under the instance
-//! (its pid and conversation); under the headless-restore seam
-//! (`LAB_RESTORE=1`) it first waits, 30 s at most, until the crash journal
-//! names that conversation, as `restore` does, and says whether it did. The
-//! instance is then SIGKILLed and must end within 30 s: reaped, or a zombie
-//! its reaper has not collected yet (the instance of a lab `up` made is
-//! launchd's child once `up` has exited, and `kill(pid, 0)` answers for a
-//! zombie). One that does not end is a failure, and nothing is relaunched.
-//!
-//! Its tree (what the instance had started, read before the kill, each pid
-//! with its start time) is ended or kept:
-//!
-//! * without `--keep-tree`, one of them still alive 15 s after (the same
-//!   process: its pid and its start time) is said and SIGKILLed by pid, as
-//!   `restore` ends it: it would hold the conversation;
-//! * with `--keep-tree`, nothing of it is touched, and what still lives 2 s
-//!   after is listed. Under a PTY keeper (`keeper = { enabled = true }` in
-//!   `LAB_ATERM_TOML`, `aterm keeper serve` run outside the jail on the lab's
-//!   environment, and `LAB_INSTANCE_ENV='TMPDIR=/tmp'` so both find its
-//!   socket: [`crate::lab::instance_env`]) the keeper holds their terminals,
-//!   so the agent lives through the crash and the next instance takes its
-//!   session back.
-//!
-//! Then the gap, `--gap SECS` (0 unless given, a day at most), with no
-//! instance; then the relaunch, `restore`'s
-//! ([`crate::restore::relaunch_instance`]): the socket and its token cleared
-//! from outside the jail and the instance started on the same record (state,
-//! socket, grid, jail, and the `LAB_INSTANCE_ENV` `up` took:
-//! [`crate::lab::instance_vars`], [`crate::lab::instance_argv`]), with no
-//! lifeline: the instance of a lab `up` made outlives the verb, until `down`.
-//! `env.sh` records the new pid.
-//!
-//! Exit 0 once the new instance is up; 1 refused or failed (above, or the
-//! relaunch did not come up); 2 usage. Interrupted after the kill, it says
-//! that the lab is left with no instance (`down` takes it down).
-//!
-//! The process operations are injected ([`Ops`]): [`Live`] makes them, and
-//! the tests' fake kills nothing and never sleeps. Measured with it:
-//! `docs/measured/real-claude-lab-2026-10-15.md`, "A crash that leaves the
-//! agent running".
+//! `crash [tag] [--gap SECS] [--keep-tree]`.
 
 use std::time::Duration;
 
@@ -88,7 +33,6 @@ struct Asked {
 }
 
 /// `crash`'s words (the tag already taken); `Ok(None)` for `-h`/`--help`.
-///
 /// # Errors
 /// An unknown word, or a `--gap` with no whole number of seconds up to a day.
 fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
@@ -118,19 +62,16 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
     Ok(Some(a))
 }
 
-/// A process of the instance's tree as it was read before the kill: its pid
-/// and its start time, which tell it from a later process given the pid.
+/// A process of the instance's tree as it was read before the kill.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Proc {
     pid: i32,
     start: String,
 }
 
-/// The process operations a crash makes, injected so its tests kill nothing
-/// and never sleep.
+/// The process operations a crash makes, injected so its tests kill nothing and never sleep.
 pub(crate) trait Ops {
     /// The lab's egress witness runs ([`crate::procs::need_witness`]).
-    ///
     /// # Errors
     /// It does not.
     fn witness(&mut self, run: &Run) -> Result<(), String>;
@@ -151,13 +92,10 @@ pub(crate) trait Ops {
     /// Now, in milliseconds since the epoch.
     fn now_ms(&mut self) -> i64;
     /// Wait `d`.
-    ///
     /// # Errors
     /// Interrupted.
     fn sleep(&mut self, d: Duration) -> Result<(), Fail>;
     /// Start the lab's instance again ([`crate::restore::relaunch_instance`]):
-    /// when the launch began and when its socket came up.
-    ///
     /// # Errors
     /// It did not come up.
     fn relaunch(
@@ -201,7 +139,6 @@ fn poll<O: Ops>(
 }
 
 /// Re-read the recorded instance's current lab membership before using its pid.
-/// This observation is not an atomic process handle: the final check and signal still race.
 fn require_instance(run: &Run, pid: i32, ops: &mut impl Ops) -> Result<(), Fail> {
     if ops.names_lab(run, pid) {
         return Ok(());
@@ -214,14 +151,11 @@ fn require_instance(run: &Run, pid: i32, ops: &mut impl Ops) -> Result<(), Fail>
 }
 
 /// The crash of lab `run`'s instance, the gap and the relaunch.
-///
 /// # Errors
 /// Refused (the recorded pid is no process of the lab, its witness is not
 /// running), the instance did not end, interrupted, or the relaunch did not
 /// come up.
 fn crash(run: &mut Run, a: &Asked, ops: &mut impl Ops) -> Result<Crashed, Fail> {
-    // A WINDOWED LAB (`forever --window`) is not crashed: the pid it records
-    // may be the keeper that holds its window's lifeline, whose SIGKILL would
     // leave the window's aterm running beside the relaunch.
     if crate::lab::windowed(run) {
         return Err(Fail::usage(format!(
@@ -250,12 +184,9 @@ fn crash(run: &mut Run, a: &Asked, ops: &mut impl Ops) -> Result<Crashed, Fail> 
         }
         None => println!("crash: no Claude Code registered under the instance"),
     }
-    // The journal wait may have outlived the recorded instance. Do not inspect
-    // another process's tree on the strength of the entry check.
     require_instance(run, old, ops)?;
     let tree = ops.tree(old);
     let t_end = ops.now_ms();
-    // The tree read may itself take time; re-read custody closest to the signal.
     require_instance(run, old, ops)?;
     ops.kill(old);
     after_kill(run, a, ops, old, &tree, t_end).inspect_err(|f| {
@@ -315,7 +246,6 @@ fn after_kill(
         println!("crash: the gap, {} s, no instance", a.gap);
         ops.sleep(Duration::from_secs(a.gap))?;
     }
-    // restore's relaunch, unarmed: the instance of a lab `up` made outlives this verb
     let (_, t_up) = ops.relaunch(run, "crash", false, t_end)?;
     println!(
         "crash: instance {old} SIGKILLed at {t_end} ms; instance {} up at {t_up} ms, {} after",
@@ -664,8 +594,7 @@ mod tests {
     }
 
     /// A WINDOWED LAB IS NEVER CRASHED: its recorded pid may be its window's
-    /// keeper, whose SIGKILL leaves the aterm running. CONTROL: the same lab
-    /// headless is crashed and relaunched.
+    /// keeper, whose SIGKILL leaves the aterm running.
     #[test]
     fn a_windowed_lab_is_never_crashed() {
         let keep = Asked::default();
@@ -714,8 +643,6 @@ mod tests {
         };
         assert_eq!(crash(&mut lab(), &keep, &mut f).unwrap_err().code, 1);
         assert!(f.ev.is_empty(), "{:?}", f.ev);
-        // The recorded instance can end while the existing journal wait runs.
-        // Refuse before reading a tree under the now-unowned numeric pid.
         let mut f = Fake {
             ours_until: Some(1_001_000),
             desk_from: Some(1_002_000),
@@ -732,8 +659,6 @@ mod tests {
         assert!(f.kills().is_empty());
         assert!(f.relaunches().is_empty());
 
-        // The tree read is another operation between the wait and the kill.
-        // Check custody again after it, rather than signalling its stale pid.
         let mut f = Fake {
             lose_in_tree: true,
             ..fake()
@@ -744,7 +669,6 @@ mod tests {
         assert!(f.kills().is_empty());
         assert!(f.relaunches().is_empty());
 
-        // CONTROL: the same lab with its pid its own is crashed
         let mut f = fake();
         assert!(crash(&mut lab(), &keep, &mut f).is_ok());
         assert_eq!(f.kills()[0], INSTANCE);
@@ -816,7 +740,6 @@ mod tests {
                         .unwrap(),
                 }]
             );
-            // the kill's stamp is when the instance was SIGKILLed
             assert_eq!(did.t_end, 1_000_000);
         }
     }
@@ -860,7 +783,6 @@ mod tests {
         .unwrap();
         assert_eq!(f.kills(), vec![INSTANCE]);
         assert_eq!(did.kept, vec![4250]);
-        // CONTROL: a tree that ends with the instance is not waited on 15 s
         let mut f = Fake {
             tree_ends: HashMap::from([(4243, 0), (4250, 0)]),
             ..fake()
@@ -904,7 +826,6 @@ mod tests {
         };
         let did = crash(&mut lab(), &Asked::default(), &mut f).unwrap();
         assert_eq!((did.t_end, f.desk_asked), (1_000_000, 0));
-        // a journal that never names it is said, and the crash goes on
         let mut f = Fake {
             desk_from: None,
             ..fake()

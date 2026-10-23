@@ -2,18 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! PNG encoding: chunk framing, per-row filter selection, and the zlib stream.
-//!
-//! Everything aterm writes is 8-bit — framebuffer screenshots, the macOS
-//! window capture, palette fixtures — so the encoder covers 8-bit
-//! Grayscale/RGB/RGBA/Indexed with optional `PLTE`, `tRNS` and `sRGB`, and
-//! refuses anything else at [`Encoder::write_header`] rather than emitting a
-//! file it cannot describe.
-//!
-//! The pixels stream through: each scanline is filtered as it arrives and the
-//! compressed stream goes to the sink as `IDAT` chunks of `IDAT_CHUNK` bytes
-//! while it is produced. Beside its input and its sink the encoder holds
-//! [`encoder_scratch_len`] bytes, and its output is at most
-//! [`max_encoded_len`].
 
 use std::io::Write;
 
@@ -23,44 +11,31 @@ use crate::{BitDepth, ColorType, EncodingError, SIGNATURE, SrgbRenderingIntent, 
 
 /// The `IDAT` payload the writer emits each time the compressor has produced
 /// this much: the compressed stream goes to the sink as it is made and is
-/// never held whole. A stream shorter than this is one `IDAT`. The
-/// specification permits any split, and every decoder concatenates.
+/// never held whole.
 const IDAT_CHUNK: usize = 64 * 1024;
 
 /// Bytes a chunk adds around its payload: length, type and CRC.
 const CHUNK_FRAMING: usize = 12;
 
-/// The most bytes [`Encoder`] writes for an 8-bit `width` x `height` image of
-/// `color_type`, whatever its pixels and its optional chunks: the signature,
-/// `IHDR`, a full `PLTE` and `tRNS`, `sRGB`, `IEND`, and the `IDAT` chunks of
-/// a zlib stream in which every filtered byte costs its longest fixed-Huffman
-/// code (9 bits; a match never costs more per byte it covers). `None` when the
-/// geometry overflows.
+/// The most bytes [`Encoder`] writes for an 8-bit `width` x `height` image of `color_type`.
 #[must_use]
 #[inline]
 pub fn max_encoded_len(width: u32, height: u32, color_type: ColorType) -> Option<usize> {
     let stride = row_bytes(width, color_type.samples(), BitDepth::Eight.bits())?;
     let filtered = stride.checked_add(1)?.checked_mul(height as usize)?;
-    // Block header (3 bits), every byte at 9 bits, end-of-block (7 bits),
-    // padded to a byte; then the 2-byte zlib header and the 4-byte Adler-32.
     let block = filtered.checked_mul(9)?.checked_add(3 + 7)?.div_ceil(8);
     let zlib = block.checked_add(2 + 4)?;
     let idat = zlib.checked_add(zlib.div_ceil(IDAT_CHUNK).checked_mul(CHUNK_FRAMING)?)?;
     let fixed = SIGNATURE.len()
-        + (CHUNK_FRAMING + 13) // IHDR
-        + (CHUNK_FRAMING + 1) // sRGB
-        + (CHUNK_FRAMING + 768) // PLTE
-        + (CHUNK_FRAMING + 256) // tRNS
-        + CHUNK_FRAMING; // IEND
+        + (CHUNK_FRAMING + 13)
+        + (CHUNK_FRAMING + 1)
+        + (CHUNK_FRAMING + 768)
+        + (CHUNK_FRAMING + 256)
+        + CHUNK_FRAMING;
     idat.checked_add(fixed)
 }
 
-/// The most bytes a [`Writer`] holds beside its input and its sink while it
-/// encodes `width`-pixel rows of `color_type`: the current and previous
-/// scanline, the filter's candidate and chosen rows, the compressed bytes
-/// waiting to fill an `IDAT` ([`pending_capacity`], one allocation that never
-/// grows), and the compressor's fixed state. `None` when the geometry
-/// overflows.
+/// The most bytes a [`Writer`] holds beside its input and its sink while it encodes `width`-pixel.
 #[must_use]
 #[inline]
 pub fn encoder_scratch_len(width: u32, color_type: ColorType) -> Option<usize> {
@@ -74,10 +49,7 @@ pub fn encoder_scratch_len(width: u32, color_type: ColorType) -> Option<usize> {
 /// [`stream_rows`] never outgrows: each flush leaves less than [`IDAT_CHUNK`],
 /// and one row's write then adds at most the row, its filter byte and the
 /// lookahead the compressor held back before it at 9 bits a byte (a match
-/// never costs more per byte it covers). The 6 bytes past them are the
-/// accumulator's partial byte, the end-of-block code with its pad, and the
-/// Adler-32, so `finish` (at most the held-back lookahead and that tail) fits
-/// the same room. `None` when the geometry overflows.
+/// never costs more per byte it covers).
 #[inline]
 fn pending_capacity(stride: usize) -> Option<usize> {
     let row_out = stride
@@ -101,7 +73,7 @@ pub struct Encoder<W: Write> {
 }
 
 impl<W: Write> Encoder<W> {
-    /// Start a `width` x `height` PNG. Defaults to 8-bit grayscale.
+    /// Start a `width` x `height` PNG.
     #[inline]
     pub const fn new(sink: W, width: u32, height: u32) -> Self {
         Self {
@@ -134,8 +106,7 @@ impl<W: Write> Encoder<W> {
         self.srgb = Some(intent);
     }
 
-    /// Set the `PLTE` palette (RGB triples). Required for
-    /// [`ColorType::Indexed`].
+    /// Set the `PLTE` palette (RGB triples).
     #[inline]
     pub fn set_palette(&mut self, palette: impl Into<Vec<u8>>) {
         self.palette = Some(palette.into());
@@ -148,11 +119,8 @@ impl<W: Write> Encoder<W> {
     }
 
     /// Write the signature and header chunks.
-    ///
     /// # Errors
-    /// [`EncodingError::Parameter`] for geometry or a colour-type/bit-depth
-    /// pair PNG forbids, or an indexed image with no palette;
-    /// [`EncodingError::Io`] if the sink refuses a write.
+    /// [`EncodingError::Parameter`] for geometry or a colour-type/bit-depth pair PNG forbids.
     pub fn write_header(mut self) -> Result<Writer<W>, EncodingError> {
         if self.width == 0 || self.height == 0 {
             return Err(EncodingError::Parameter("zero image dimension"));
@@ -205,9 +173,6 @@ impl<W: Write> Encoder<W> {
         ihdr[4..8].copy_from_slice(&self.height.to_be_bytes());
         ihdr[8] = self.bit_depth as u8;
         ihdr[9] = self.color_type as u8;
-        // compression = deflate, filter = adaptive, interlace = none. aterm
-        // never WRITES an interlaced PNG: it buys nothing for a file that is
-        // decoded whole, and it would quadruple this encoder's surface.
         ihdr[10] = 0;
         ihdr[11] = 0;
         ihdr[12] = 0;
@@ -228,7 +193,6 @@ impl<W: Write> Encoder<W> {
             rows: self.height as usize,
             expected,
             pending,
-            // Filter distance to the pixel on the left, rounded up to a byte.
             bytes_per_pixel: (self.color_type.samples() * self.bit_depth.bits() as usize)
                 .div_ceil(8)
                 .max(1),
@@ -255,21 +219,15 @@ pub struct Writer<W: Write> {
     /// Filter distance to the pixel on the left.
     bytes_per_pixel: usize,
     /// Palette entry count for an INDEXED image, so the samples can be checked
-    /// against it. `None` for every other colour type.
+    /// against it.
     palette_entries: Option<usize>,
     wrote_data: bool,
 }
 
 impl<W: Write> Writer<W> {
-    /// Write the whole image. `data` must be exactly the size the header
-    /// implies: `height * row_bytes`. Both checks run before anything is
-    /// written, so a refused buffer leaves the writer as it was.
-    ///
+    /// Write the whole image.
     /// # Errors
-    /// [`EncodingError::WrongDataSize`] if the buffer does not match the
-    /// declared geometry, [`EncodingError::Parameter`] on a second call or on an
-    /// indexed sample past the end of the palette, or [`EncodingError::Io`] from
-    /// the sink.
+    /// [`EncodingError::WrongDataSize`] if the buffer does not match the declared geometry.
     pub fn write_image_data(&mut self, data: &[u8]) -> Result<(), EncodingError> {
         if self.wrote_data {
             return Err(EncodingError::Parameter(
@@ -282,8 +240,6 @@ impl<W: Write> Writer<W> {
                 got: data.len(),
             });
         }
-        // An index past the palette is not a legal PNG. Output is 8-bit, so
-        // one byte is one index.
         if let Some(entries) = self.palette_entries
             && let Some(&worst) = data.iter().max()
             && usize::from(worst) >= entries
@@ -300,18 +256,9 @@ impl<W: Write> Writer<W> {
         })
     }
 
-    /// Write the image a scanline at a time: `row(y, buf)` appends scanline
-    /// `y`'s `row_bytes` to the empty `buf`, for `y` in `0..height`. Each row
-    /// is filtered and compressed as it arrives, so the image is never held
-    /// whole, filtered or compressed.
-    ///
+    /// Write the image a scanline at a time.
     /// # Errors
-    /// [`EncodingError::WrongDataSize`] names a row that is not `row_bytes`
-    /// long (`expected` and `got` are that row's), [`EncodingError::Parameter`]
-    /// on a second call or on an indexed sample past the end of the palette,
-    /// and [`EncodingError::Io`] from the sink. An error after the first row
-    /// may leave `IDAT` chunks in the sink: the file is incomplete, the writer
-    /// closes nothing over it, and the caller discards it.
+    /// [`EncodingError::WrongDataSize`] names a row that is not `row_bytes` long (`expected` and.
     pub fn write_rows(
         &mut self,
         mut row: impl FnMut(usize, &mut Vec<u8>),
@@ -344,11 +291,8 @@ impl<W: Write> Writer<W> {
     }
 
     /// Write `IEND` and flush.
-    ///
     /// # Errors
-    /// [`EncodingError::Io`] if the sink refuses the final write;
-    /// [`EncodingError::Parameter`] after a failed image-data write, whose
-    /// file is incomplete.
+    /// [`EncodingError::Io`] if the sink refuses the final write.
     pub fn finish(mut self) -> Result<(), EncodingError> {
         let Some(mut sink) = self.sink.take() else {
             return Err(EncodingError::Parameter(
@@ -362,7 +306,6 @@ impl<W: Write> Writer<W> {
 
 impl<W: Write> Drop for Writer<W> {
     fn drop(&mut self) {
-        // Call sites rely on drop closing the file. A failure here cannot be
         // reported; a best-effort IEND beats a file silently missing one.
         if let Some(mut sink) = self.sink.take() {
             let _ = write_chunk(&mut sink, b"IEND", &[]);
@@ -382,8 +325,7 @@ struct Geometry {
 }
 
 /// Filter each row as `row` supplies it, compress it, and hand the sink every
-/// full `IDAT` as it fills; then the rest of the stream. The compressed bytes
-/// wait in the one allocation of `pending` bytes the stream was born with.
+/// full `IDAT` as it fills; then the rest of the stream.
 fn stream_rows<W: Write>(
     sink: &mut W,
     geometry: Geometry,
@@ -398,7 +340,6 @@ fn stream_rows<W: Write>(
     } = geometry;
     let mut filter = RowFilter::new(stride, bytes_per_pixel);
     let mut cur = Vec::with_capacity(stride);
-    // The row above the first is zeros.
     let mut prev = vec![0u8; stride];
     let mut zlib = ZlibStream::with_output_capacity(pending);
     for y in 0..rows {
@@ -410,8 +351,6 @@ fn stream_rows<W: Write>(
                 got: cur.len(),
             });
         }
-        // An index past the palette is not a legal PNG. Output is 8-bit, so
-        // one byte is one index.
         if let Some(entries) = palette_entries
             && let Some(&worst) = cur.iter().max()
             && usize::from(worst) >= entries
@@ -534,7 +473,6 @@ fn apply_filter(kind: u8, cur: &[u8], prev: &[u8], bpp: usize, out: &mut [u8]) {
         3 => {
             for i in 0..cur.len() {
                 let left = if i >= bpp { u16::from(cur[i - bpp]) } else { 0 };
-                // `as u8` is the specified truncation of the floor average.
                 out[i] = cur[i].wrapping_sub(((left + u16::from(prev[i])) / 2) as u8);
             }
         }

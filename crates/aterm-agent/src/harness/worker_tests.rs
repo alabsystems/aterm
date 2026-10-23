@@ -26,17 +26,7 @@ fn proc_args(argv: &[&str], env: &[&str]) -> ProcArgs {
 /// the folder is the trusted one), `--model <m>`, Gemini CLI's
 /// `--session-id <id>`, then the task file's text with its trailing
 /// newlines trimmed: Claude Code's and Muse Code's after `--`, Gemini CLI's
-/// and agy's as the attached value of `--prompt-interactive=`. The task
-/// holds lines, both quotes, a `$(…)` and backticks the shell must not run,
-/// and a leading `-`. The homes the line carries reach the program's
-/// environment, and so does Gemini CLI's own trusted-folders file (no
-/// other row names one). The argv each relaunch lane reads back off that
-/// process drops the task (a crashed worker is never handed it again) and
-/// Gemini CLI's session id (the relaunch resumes it by `--resume`), and
-/// keeps the trust flag.
-/// NEGATIVE CONTROL: the same line with the operand's double quotes taken
-/// off splits the task into many arguments (so the one-argument check can
-/// see a split).
+/// and agy's as the attached value of `--prompt-interactive=`.
 #[cfg(unix)]
 #[test]
 fn every_workers_first_line_hands_the_task_over_as_one_argument() {
@@ -57,8 +47,6 @@ fn every_workers_first_line_hands_the_task_over_as_one_argument() {
     if !cfg!(target_os = "macos") {
         shells.retain(|(_, sh)| Path::new(sh).exists());
     }
-    // (row, the argv its stand-in must get, the home var the line carries,
-    // the argv a relaunch lane keeps of the process).
     let prompt_flag = format!("--prompt-interactive={trimmed}");
     let session = "0b5c6c33-1f7e-4a59-9d2a-6f1e2d3c4b5a";
     let trust_file = tmp.path().join("trust.json");
@@ -107,8 +95,6 @@ fn every_workers_first_line_hands_the_task_over_as_one_argument() {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
-        // The system's assessment of the stand-in's first exec, under its own
-        // hang detector.
         aterm_spec::wait::first_exec(&exe, &[]);
         let starter = Starter {
             exe: exe.clone(),
@@ -159,7 +145,6 @@ fn every_workers_first_line_hands_the_task_over_as_one_argument() {
             expected.extend([home, trust.as_bytes(), b"".as_slice()]);
             assert_eq!(got, expected, "{agent:?} under {shell}: {line}");
             assert!(!ran.exists(), "{shell} ran the task's text");
-            // The control: unquoted, the substitution splits.
             let unquoted = line
                 .replace(
                     r#""$(command cat -- "$ATERM_TASK_FILE")""#,
@@ -177,8 +162,6 @@ fn every_workers_first_line_hands_the_task_over_as_one_argument() {
                 "{agent:?} under {shell}: the unquoted control did not split ({split})"
             );
         }
-        // What each lane carries into a relaunch of that very process: the
-        // task never; the trust flag where its CLI keeps it.
         let args: Vec<String> = want.iter().map(|a| (*a).to_string()).collect();
         let process = |head: &[&str]| -> Vec<String> {
             head.iter()
@@ -215,13 +198,7 @@ fn every_workers_first_line_hands_the_task_over_as_one_argument() {
 /// only where the worker's shell stands in its trusted folder; GEMINI CLI'S
 /// FOLDER IS TRUSTED BY A FILE OF ITS OWN, never `--skip-trust` (which
 /// trusts every folder for every Gemini CLI the worker's tools start), and
-/// its session is the line's own (`--session-id`). Claude Code and agy carry
-/// none of these (their dialog is the window harness's rule's). A model
-/// opening with `-` is refused: Gemini CLI's yargs and Muse Code's clap read
-/// it as a flag and exit.
-/// NEGATIVE CONTROLS: no model named, no `--model`; a folder that is not the
-/// trusted one, no trust flag; no file or id handed over, none named; a
-/// model with a `-` inside it is a model.
+/// its session is the line's own (`--session-id`).
 #[test]
 fn model_and_the_trust_are_each_clis_own() {
     let file = Path::new("/state/tasks/s-1-1.trust.json");
@@ -297,7 +274,6 @@ fn model_and_the_trust_are_each_clis_own() {
 /// A WORKER'S TRUSTED-FOLDERS FILE TRUSTS ITS ONE FOLDER and no other:
 /// Gemini CLI's `trustedFolders.json` form, the folder spelled as given
 /// whatever it holds (quotes, a backslash, a space), `TRUST_FOLDER`.
-/// NEGATIVE CONTROL: the folder's parent is no key of it.
 #[test]
 fn a_workers_trusted_folders_file_names_its_folder_alone() {
     let folder = r#"/w/a "quoted" \ proj"#;
@@ -316,7 +292,6 @@ fn a_workers_trusted_folders_file_names_its_folder_alone() {
 /// A NEW SESSION'S ID IS A VERSION-4 UUID the Gemini CLI lane types back
 /// (`upgrade_gemini::is_session_uuid`), whatever the random bytes: all zero
 /// and all ones each get the version and variant bits.
-/// NEGATIVE CONTROL: the bytes as given, unmasked, are no version-4 id.
 #[test]
 fn a_new_session_id_is_a_version_four_uuid() {
     for bytes in [[0u8; 16], [0xff; 16], *b"0123456789abcdef"] {
@@ -338,12 +313,7 @@ fn a_new_session_id_is_a_version_four_uuid() {
 /// after the program: agy's `--gemini_dir` and `--app_data_dir` (its login
 /// and conversations move with them), Muse Code's `--provider`, `--preset`,
 /// `--base-url` and `-c`/`--config` (where its task goes), each with its
-/// value, in the starter's order. A Muse Code argv holding a flag no table
-/// knows refuses the line rather than start the worker on a default
-/// provider.
-/// NEGATIVE CONTROLS: the starter's other flags (`--model`, `--yolo`, its
-/// first prompt) stay behind; Gemini CLI's and Claude Code's rows carry
-/// none; without a starter none ride ([`WorkerCli::plain`]).
+/// value, in the starter's order.
 #[test]
 fn a_starters_config_and_provider_flags_ride_its_workers_line() {
     let user = Path::new("/Users//u");
@@ -430,7 +400,6 @@ fn a_starters_config_and_provider_flags_ride_its_workers_line() {
     .expect("a Muse Code starter");
     let err = line(muse, Dialect::Zsh, &s, &Fresh::default()).expect_err("an unread argv");
     assert!(err.contains("--brand-new-flag"), "{err}");
-    // NEGATIVE CONTROLS.
     let gemini = row(Program::Gemini);
     let s = starter_of(
         gemini,
@@ -452,11 +421,7 @@ fn a_starters_config_and_provider_flags_ride_its_workers_line() {
 /// THE HOMES A STARTER'S OWN AGENT CARRIES are its relaunch lane's, each
 /// directory absolute or the line refused: Gemini CLI's `GEMINI_CLI_HOME`
 /// and another `HOME`, agy's other `HOME`, Muse Code's XDG homes and other
-/// `HOME`. NEGATIVE CONTROLS: the user's own `HOME` and another CLI's
-/// variables are not carried; a relative home refuses the line rather than
-/// name another folder under the worker's `cwd=`.
-/// One starter case: the agent, its process's argv, and the homes its line
-/// carries.
+/// `HOME`.
 type HomesCase = (
     Program,
     &'static [&'static str],
@@ -510,7 +475,6 @@ fn a_starters_homes_are_its_lanes_and_absolute() {
             .map(|(n, v)| (n.as_str(), v.as_str()))
             .collect();
         assert_eq!(got, want, "{agent:?}");
-        // Under the user's own HOME, no HOME rides.
         let own = proc_args(argv, &["HOME=/Users//u"]);
         let s = starter_of(cli, Some(image), &own, user, || None).expect("a starter");
         assert!(
@@ -518,8 +482,6 @@ fn a_starters_homes_are_its_lanes_and_absolute() {
             "{agent:?}: {:?}",
             s.env
         );
-        // A relative directory refuses the line; an empty XDG base
-        // directory is unset (the XDG rule), and rides as the starter had it.
         for var in cli.dirs {
             let with = |value: &str| Starter {
                 exe: PathBuf::from(cli.word),
@@ -541,8 +503,6 @@ fn a_starters_homes_are_its_lanes_and_absolute() {
             }
         }
     }
-    // A starter Gemini CLI's own trusted-folders file (its own spawn's) is
-    // its relaunch's to carry, never a worker's of it.
     let gemini = row(Program::Gemini);
     let args = proc_args(
         &["node", "/opt/homebrew/bin/gemini"],
@@ -566,7 +526,6 @@ fn a_starters_homes_are_its_lanes_and_absolute() {
     )
     .expect("a Gemini CLI starter");
     assert!(s.env.is_empty(), "{:?}", s.env);
-    // Claude Code's row keeps its own reader and its own refusal.
     let claude = row(Program::Claude);
     assert!(starter_of(claude, None, &proc_args(&["claude"], &env), user, || None).is_none());
     let rel = Starter {
@@ -580,9 +539,7 @@ fn a_starters_homes_are_its_lanes_and_absolute() {
 /// THE STARTER'S PROGRAM RIDES ONLY WHERE THE STARTER RUNS THE SAME CLI: an
 /// agy or Muse Code image as it is, a store build as atpkg's managed twin
 /// (the word where there is none), Gemini CLI by its PATH word whatever node
-/// runs it. NEGATIVE CONTROLS: another CLI's image, a `node` running another
-/// script and a twin never asked of a non-store image are no starter of the
-/// row's.
+/// runs it.
 #[test]
 fn a_starters_program_rides_only_where_it_runs_the_same_cli() {
     let user = Path::new("/Users//u");

@@ -1,90 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE DETERMINISTIC FABRIC SIMULATION, stage 1: one REAL bridge, every door
-//! of it ([`crate::fx`]) answered by a seeded world, so an interleaving is a
-//! seed and a failing seed replays exactly.
-//!
-//! ## What is real and what is simulated
-//!
-//! REAL: the whole bridge — [`crate::bridge::Bridge`]'s constructor, its
-//! `start` and every `pass` of its loop, every handler, the state dir's code
-//! ([`crate::state::StateDir`], on a scratch directory), astream's client
-//! (`astream_broker::Client`, speaking astream's own wire through
-//! `astream_broker::proto`), the mailbox, the pipeline, the reader rule
-//! ([`crate::bridge::reader_took`]).
-//!
-//! SIMULATED, each behind its door:
-//! * the CLOCKS: a virtual monotonic clock and wall clock ([`Clock`]), moved
-//!   only by the bridge's own parks ([`Process::idle`]) and the scheduler;
-//! * the BROKER ([`bus`]): an in-memory model of astream's broker, served over
-//!   astream's wire, whose every restart is held to astream's power-loss law
-//!   P2-P7 (`astream-broker` `crash_sim.rs`; [`bus::law_check`]) — among the
-//!   cuts it draws a lost suffix of unescalated acked records under Ordered
-//!   or Relaxed, announced by a generation move with lineage. Not every
-//!   outcome the law allows is drawn, nor every clause checked ([`bus`]'s
-//!   module doc): P1 holds by construction, P2 is checked as a prefix (not at
-//!   a batch boundary), P8's rot — refused, or cut with a move — is not
-//!   modelled, and a weak tier's generation move after a crash off the boot
-//!   volume is never drawn; and in half the worlds it answers some acks
-//!   after the records they name are readable ([`bus`]'s held acks), the
-//!   order the bridge's non-blocking loop (aterm-0) must survive;
-//! * the STATE DIR'S DEVICE ([`device`]): the state dir's writes go to a
-//!   scratch directory and are journalled, and a power cut rewrites the
-//!   directory to an image aterm-durable's contract allows (a durable write
-//!   and a flushed directory entry kept, an atomic-only write kept or lost,
-//!   whole or — POSIX's worst case, which the committed device draws — TORN, which
-//!   the bridge now survives by setting a torn file aside;
-//!   an unflushed unlink kept or lost: a landed post's in-flight
-//!   entry brought back and republished behind its sender's later posts,
-//!   which the bridge now closes by retiring an earlier boot's entries) —
-//!   and, in every other eight seeds, a device that FAILS WRITES (sim item
-//!   S7): `EIO` and `ENOSPC` on a write, a rename, a flush or an unlink, a
-//!   durable replace renamed with its flush failed, an append cut part-way,
-//!   a disk full for spells, until the settle phase's clean disk;
-//! * ATERM'S ENDPOINT ([`endpoint`]): a model of the verb lane's bridge plane
-//!   (`deliver` with its `off=` dedup, `outbox` and its retirements, receipts,
-//!   `hold`, `link log` with lane 3's `continues=`, the roster, a session's
-//!   `status` and `meta`, and the bus mirror's `log-take` and `log-landed`
-//!   over REAL session logs, `aterm_slog::Log`), served on a socket pair by a
-//!   thread that only ever answers the bridge's own requests;
-//! * the PUSH LANE: aterm's `EVENT` lines are queued into the bridge's mailbox
-//!   by the scheduler itself;
-//! * a SIBLING under the node id, in worlds of its own: a copy of the state
-//!   dir's bridge, played by the scheduler (or, racing an attach, by the
-//!   broker inside one of the node's will requests) as its rows on the bus
-//!   under the node's producer and the copy's mark — its attach, its
-//!   session's row, its will — so the bridge's ghost sweep meets another
-//!   state dir's rows, at an incarnation this dir took too in the racing world
-//!   (a ghost row whose writer's successors all died inside the
-//!   sweep's patience stood for good, which the bridge closes by reading the
-//!   state dir's mark on the row, and never a sibling's);
-//! * the ENTROPY: the back-off's jitter is the seed's.
-//!
-//! ## Why it is deterministic
-//!
-//! One thread runs the scheduler and the bridge; the bridge never blocks on a
-//! door (a park moves the virtual clock instead). The endpoint thread answers
-//! only a request the bridge has just written and is blocked on, so its every
-//! action is a rendezvous. No reader thread exists: a subscription is pumped
-//! into the mailbox by the scheduler ([`Core::pump`]), when the seed says its
-//! reader ran. Every choice — what arrives, when the broker restarts and how,
-//! where a kill lands, which image a power cut leaves — is drawn from the
-//! seed's stream, and the trace ([`Core::trace`]) records each one, so two runs
-//! of a seed are compared trace for trace ([`world`]'s replay test).
-//!
-//! ## Kills land at the explicit operation hooks
-//!
-//! Each bus request, each verb-lane request and each state-dir write passes
-//! [`Process::step`] before and after it. The scheduler arms a countdown, and
-//! the step it reaches kills the process there: it is marked dead (its later
-//! writes are refused, its connections end and their wills fire) and the
-//! bridge's stack is unwound by a payload no panic hook sees
-//! ([`std::panic::resume_unwind`], [`SimKill`]). That is a `kill -9` at that
-//! hook: a request written and not answered, or a reply read and not acted
-//! on. State-dir hooks surround a complete logical mutation; they do not
-//! inject a kill between its actual rename and directory flush. This is an
-//! operation-boundary model, not equivalence to every kernel SIGKILL point.
+//! THE DETERMINISTIC FABRIC SIMULATION, stage 1.
 
 pub(crate) mod bus;
 pub(crate) mod conform;
@@ -106,8 +23,7 @@ use crate::fx::{BusCloser, Write};
 use crate::mailbox::{Mailbox, Source};
 use crate::transport::Conn;
 
-/// Lock a mutex of the simulation, through a poison: a kill unwinds through
-/// the bridge, never while one of these is held, but a failing assertion may.
+/// Lock a mutex of the simulation, through a poison.
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -116,8 +32,7 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Debug)]
 pub(crate) struct SimKill;
 
-/// The seed's stream: splitmix64, so a seed names one sequence of draws on
-/// every machine and build.
+/// The seed's stream.
 #[derive(Clone, Debug)]
 pub(crate) struct Rng(u64);
 
@@ -157,8 +72,7 @@ impl Rng {
         items.get(i)
     }
 
-    /// An independent stream for one purpose, so adding a draw to one purpose
-    /// does not shift every other's.
+    /// An independent stream for one purpose, so adding a draw to one purpose does not shift every other's.
     pub(crate) fn fork(&mut self, salt: u64) -> Rng {
         Rng(self.next_u64() ^ salt.wrapping_mul(0xd6e8_feb8_6659_fd93))
     }
@@ -218,10 +132,7 @@ pub(crate) struct Core {
     trace: Mutex<Vec<String>>,
     /// The bridge rules this world switched off ([`crate::fx::Fx::mutant`]).
     pub(crate) mutants: Mutex<BTreeSet<world::Mutant>>,
-    /// What the broker held unanswered for a process when it PARKED with
-    /// nothing queued ([`Process::idle`]): `(offset, subject, body)` of each
-    /// record whose ack was still in its batch's flush. The oracle's idle law
-    /// reads and empties it after every step.
+    /// What the broker held unanswered for a process when it PARKED with nothing queued ([`Process::idle`]).
     pub(crate) idle_held: Mutex<Vec<(u64, String, Vec<u8>)>>,
 }
 
@@ -288,8 +199,7 @@ impl Core {
         lock(&self.kill).armed = None;
     }
 
-    /// The readers whose next read has something to answer — a frame, or the
-    /// connection's end — in the order they were handed over.
+    /// The readers whose next read has something to answer.
     pub(crate) fn readable(&self) -> Vec<(u64, Source)> {
         lock(&self.readers)
             .iter()
@@ -298,9 +208,7 @@ impl Core {
             .collect()
     }
 
-    /// RUN ONE READER ONCE: read its subscription and do with the read what a
-    /// reader thread does ([`crate::bridge::reader_took`]). The reader is gone
-    /// once it stops. `false` when there was no such reader.
+    /// RUN ONE READER ONCE.
     pub(crate) fn pump(&self, conn: u64) -> bool {
         let reader = {
             let mut readers = lock(&self.readers);
@@ -339,8 +247,7 @@ impl Core {
     }
 }
 
-/// ONE SIMULATED BRIDGE PROCESS: what its doors ([`crate::fx::Fx::sim`]) answer
-/// from, and whether it is still alive.
+/// ONE SIMULATED BRIDGE PROCESS.
 #[derive(Debug)]
 pub(crate) struct Process {
     pub(crate) core: Arc<Core>,
@@ -360,10 +267,7 @@ impl Process {
         })
     }
 
-    /// RUN `op` AS A READ THAT MUST NOT WAIT ([`crate::fx::Fx::unwaited`]):
-    /// while it runs, this process's bus reads answer "not yet" for an answer
-    /// the broker still holds ([`bus`]'s held acks) instead of releasing it.
-    /// Set back however `op` ends, an unwind included.
+    /// RUN `op` AS A READ THAT MUST NOT WAIT ([`crate::fx::Fx::unwaited`]).
     pub(crate) fn trying<T>(&self, op: impl FnOnce() -> T) -> T {
         struct Unset<'a>(&'a AtomicBool);
         impl Drop for Unset<'_> {
@@ -391,8 +295,7 @@ impl Process {
         self.alive.load(Ordering::SeqCst)
     }
 
-    /// END THIS PROCESS as a `kill -9` would: dead from now on, its readers
-    /// gone, and every broker connection it held ended (their wills fire).
+    /// END THIS PROCESS as a `kill -9` would.
     pub(crate) fn kill(&self) {
         if self.alive.swap(false, Ordering::SeqCst) {
             self.core.drop_readers(self.pid);
@@ -408,11 +311,7 @@ impl Process {
         self.core.wall_ms()
     }
 
-    /// The loop parked `wait` with nothing queued: the virtual time passes.
-    /// First, what the broker still holds unanswered for this process is
-    /// noted for the oracle's idle law ([`Core::idle_held`]): a sender's
-    /// answer in a batch's flush while the loop goes to sleep is one nothing
-    /// will read before the idle backstop's grace.
+    /// The loop parked `wait` with nothing queued.
     pub(crate) fn idle(&self, wait: Duration) {
         let held = self.core.broker.held_for(self.pid);
         if !held.is_empty() {
@@ -432,7 +331,7 @@ impl Process {
         bus::dial(self)
     }
 
-    /// A subscription handed to its reader: queued for the scheduler's pump.
+    /// A subscription handed to its reader.
     pub(crate) fn reader(
         &self,
         sub: astream_broker::AnySubscription,
@@ -458,10 +357,7 @@ impl Process {
         });
     }
 
-    /// ONE I/O STEP of this process, named `at`: where an armed kill lands.
-    /// Nothing for a process already dead (its unwinding destructors still do
-    /// I/O, and each is refused where it is made) or a thread already
-    /// unwinding.
+    /// ONE I/O STEP of this process, named `at`.
     pub(crate) fn step(&self, at: &str) {
         if !self.alive() || std::thread::panicking() {
             return;
@@ -488,9 +384,7 @@ impl Process {
         }
     }
 
-    /// The state dir is about to make `w`: refused for a dead process, a kill
-    /// may land before it, and the device may fail it with nothing made
-    /// ([`device`]'s write errors).
+    /// The state dir is about to make `w`.
     pub(crate) fn disk_before(&self, w: Write<'_>) -> std::io::Result<()> {
         if !self.alive() {
             return Err(std::io::Error::new(
@@ -510,9 +404,7 @@ impl Process {
         Ok(())
     }
 
-    /// The state dir made `w`: the device journals what the media may hold
-    /// of it — and may fail its last step after its effect ([`device`]'s
-    /// write errors), which the dir returns — and a kill may land after it.
+    /// The state dir made `w`.
     pub(crate) fn disk_after(&self, w: Write<'_>) -> std::io::Result<()> {
         let made = self.core.device.made(w);
         if let Err(e) = &made {

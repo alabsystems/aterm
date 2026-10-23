@@ -862,6 +862,7 @@ impl NamedKey {
     /// assert_eq!(NamedKey::Enter.to_text(), Some("\r"));
     /// assert_eq!(NamedKey::F20.to_text(), None);
     /// ```
+    /// use aterm_window::keyboard::NamedKey;
     #[inline]
     pub const fn to_text(&self) -> Option<&'static str> {
         match self {
@@ -885,6 +886,7 @@ impl Key {
     /// assert_eq!(Key::Named(NamedKey::Enter).to_text(), Some("\r"));
     /// assert_eq!(Key::Named(NamedKey::F20).to_text(), None);
     /// ```
+    /// use aterm_window::keyboard::{Key, NamedKey};
     #[inline]
     pub fn to_text(&self) -> Option<&str> {
         match self {

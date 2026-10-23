@@ -21,6 +21,7 @@ fn junction(target: &Path, link: &Path) {
 }
 
 /// The roots of a search of `home` alone, on its volume (its serial and its
+/// GUID, as the host's look sets them), the machine's mount table in force.
 fn home_roots(home: &Path) -> Roots {
     Roots {
         home: Some(home.to_path_buf()),
@@ -32,6 +33,7 @@ fn home_roots(home: &Path) -> Roots {
 }
 
 /// What `roots` finds, as the one path key spells each (any spelling of one
+/// folder reads alike), sorted.
 fn found_keys(roots: &Roots) -> Vec<String> {
     let found = discover(roots, Budget::SHIPPED);
     assert_eq!(found.cut, None, "{:?}", found.notes);
@@ -51,6 +53,8 @@ fn key(path: &Path) -> String {
 }
 
 /// Make `top`, under the sync root `root`, and every file and folder under
+/// it a placeholder of `root` — in sync, its data local: what a sync client
+/// leaves of a tree it uploaded.
 fn placeholders(root: &aterm_dirfd::seam::SyncRoot, top: &Path) {
     let mut made = vec![top.to_path_buf()];
     let mut i = 0;
@@ -71,6 +75,7 @@ fn placeholders(root: &aterm_dirfd::seam::SyncRoot, top: &Path) {
 }
 
 /// Set the attributes `add` on the folder at `path` (as a cloud client or an
+/// archiver would), opened as itself.
 fn add_folder_attributes(path: &Path, add: u32) {
     use std::os::windows::fs::OpenOptionsExt as _;
     /// `FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES`.
@@ -86,6 +91,10 @@ fn add_folder_attributes(path: &Path, add: u32) {
 }
 
 /// A SCRATCH HOME'S CHECKOUTS ARE FOUND, ITS PROFILE'S OWN TREES NEVER LOOKED
+/// INTO: a checkout's `target\` and a workspace's `crates\target\` (two
+/// levels down) are found; `AppData`, `OneDrive`, `OneDrive - Contoso` and
+/// `onedrive-backup` (every `OneDrive*`, any case) are never entered, nor is
+/// a folder whose attributes say a look would fetch it (offline).
 #[test]
 fn a_scratch_homes_checkouts_are_found_and_its_cloud_and_appdata_folders_never_entered() {
     let tmp = Tmp::new("discover-win-home");
@@ -115,6 +124,7 @@ fn a_scratch_homes_checkouts_are_found_and_its_cloud_and_appdata_folders_never_e
 }
 
 /// Make the empty folder at `path` a reparse point that is no link (a tag of no
+/// filter's: to a look, a placeholder whose provider is not running), opened as itself.
 fn foreign_reparse_point(path: &Path) {
     use std::os::windows::fs::OpenOptionsExt as _;
     /// `FILE_FLAG_BACKUP_SEMANTICS`: what opens a folder.
@@ -128,6 +138,9 @@ fn foreign_reparse_point(path: &Path) {
 }
 
 /// A FOLDER THAT IS A REPARSE POINT BUT NO LINK (a cloud placeholder, to std
+/// a plain folder) is never listed by the walk; one that fetches on access
+/// neither, and one that is both reads as one that fetches: nothing opens it,
+/// not even to ask whether it is a sync root.
 #[test]
 fn a_reparse_point_that_is_no_link_is_never_listed() {
     let tmp = Tmp::new("discover-win-reparse");
@@ -161,7 +174,7 @@ fn a_reparse_point_that_is_no_link_is_never_listed() {
     );
 }
 
-/// A CHECKOUT IN A REAL CLOUD SYNC ROOT IS NEVER OFFERED. A scratch folder
+/// A CHECKOUT IN A REAL CLOUD SYNC ROOT IS NEVER OFFERED.
 #[test]
 fn a_checkout_in_a_cloud_sync_root_is_never_offered() {
     let tmp = Tmp::new("discover-win-sync-root");
@@ -204,6 +217,7 @@ fn a_checkout_in_a_cloud_sync_root_is_never_offered() {
 }
 
 /// THE WALK LISTS WITH CLOUD PLACEHOLDERS EXPOSED WHILE IT LIVES, whatever
+/// mode its thread ran in.
 #[test]
 fn the_walk_lists_with_cloud_placeholders_exposed_while_it_lives() {
     use aterm_dirfd::seam::thread_placeholder_mode;
@@ -245,7 +259,7 @@ fn the_walk_lists_with_cloud_placeholders_exposed_while_it_lives() {
     drop(root);
 }
 
-/// NOTHING IN A CLOUD SYNC ROOT IS READ INTO, FROM ANY ROOT. A real sync
+/// NOTHING IN A CLOUD SYNC ROOT IS READ INTO, FROM ANY ROOT.
 #[test]
 fn nothing_in_a_cloud_sync_root_is_read_into_from_any_root() {
     use aterm_sysprobe::paths::is_under;
@@ -347,6 +361,9 @@ fn nothing_in_a_cloud_sync_root_is_read_into_from_any_root() {
 }
 
 /// THE SEARCH STAYS ON THE MEASURED VOLUME BY ITS GUID TOO: with the
+/// measured serial but another volume's GUID (a cloned disk keeps its
+/// source's serial) nothing is on the measured volume, and nothing is with
+/// the GUID unread.
 #[test]
 fn the_search_stays_on_the_volume_of_the_measured_guid() {
     use crate::harness::disk::target::VolumeGuid;
@@ -372,6 +389,10 @@ fn the_search_stays_on_the_volume_of_the_measured_guid() {
 }
 
 /// ONE FOLDER, ONE ROW, WHATEVER SPELLS IT: a working directory given plain,
+/// in another case and verbatim (`\\?\`, as `canonicalize` answers), an
+/// agent's `CARGO_TARGET_DIR` in capitals, and `$HOME`'s own walk all reach
+/// one build directory, recorded once by its file id ([`identity`], the
+/// 128-bit id of the one identity export).
 #[test]
 fn every_spelling_of_one_build_directory_is_one_row() {
     let tmp = Tmp::new("discover-win-spellings");
@@ -412,6 +433,9 @@ fn every_spelling_of_one_build_directory_is_one_row() {
 }
 
 /// A JUNCTION IS NEVER A SECOND ROW AND NEVER LEADS OUT OF THE FENCE: a
+/// junction among `$HOME`'s children to a checkout is not walked again (a
+/// link is never a checkout), and a checkout's `target` junction to another
+/// checkout's build directory is that one row.
 #[test]
 fn a_junction_is_never_a_second_row_and_never_followed_into_another_mount() {
     let tmp = Tmp::new("discover-win-junction");
@@ -448,6 +472,9 @@ fn a_junction_is_never_a_second_row_and_never_followed_into_another_mount() {
 }
 
 /// ONLY THE THREE MEASURED IMAGES ARE PLATFORM SERVICES, each exactly where
+/// the system keeps it — `ctfmon.exe` and `taskhostw.exe` in System32,
+/// `DefenderSessionHelper.exe` in a version folder of Defender's platform —
+/// in any spelling the key reads alike.
 #[test]
 fn only_the_measured_images_where_the_system_keeps_them_are_platform_services() {
     let system = Path::new(r"C:\Windows\System32");
@@ -499,6 +526,8 @@ fn only_the_measured_images_where_the_system_keeps_them_are_platform_services() 
 }
 
 /// AN UNREADABLE PROCESS KEEPS A DIRECTORY UNLESS IT IS ONE OF THE MEASURED
+/// SERVICES: a scan whose only unreadable processes are the three passes;
+/// NEGATIVE CONTROLS: one more, unnamed or of another image, keeps it.
 #[test]
 fn an_unreadable_process_keeps_a_directory_unless_it_is_a_measured_service() {
     use aterm_uds::holders::PathScan;
@@ -535,6 +564,11 @@ fn an_unreadable_process_keeps_a_directory_unless_it_is_a_measured_service() {
 }
 
 /// THE CLAUDE CENSUS TELLS THE SAME MEASURED SERVICES APART, AND NO OTHER:
+/// an exec record the census cannot read is no Claude Code only when its
+/// image is exactly one of the three (`ctfmon.exe`, `taskhostw.exe` in the
+/// system's `System32`, Defender's helper in a version folder of its
+/// platform), the three the in-use scan measured refusing every same-user
+/// reader (2026-10-19), never a folder alone.
 #[test]
 fn the_claude_census_passes_over_only_the_measured_services() {
     let system = super::super::win::system_directory().expect("System32");
@@ -583,6 +617,9 @@ fn the_claude_census_passes_over_only_the_measured_services() {
 }
 
 /// A NATIVE WINDOWS CLAUDE CODE IS READ AS ONE, its exec record read: the
+/// installer's `~\.local\bin\claude.exe` named by its image or only by the
+/// full path PowerShell hands as `argv[0]`, npm's `claude.cmd` shim, and
+/// node running npm's `claude-code` package.
 #[test]
 fn a_native_windows_claude_code_is_read_as_one() {
     let read = |pid: u32, exe: Option<&str>, argv: &[&str]| Process {
@@ -635,6 +672,7 @@ fn a_native_windows_claude_code_is_read_as_one() {
 }
 
 /// A process the census reads as running the image `exe`, exec'd as `argv` (its exec path
+/// `argv[0]`), in a project folder.
 fn running(pid: u32, exe: &Path, argv: &[&str]) -> Process {
     Process {
         pid,
@@ -652,6 +690,7 @@ fn running(pid: u32, exe: &Path, argv: &[&str]) -> Process {
 }
 
 /// The pids among `processes` [`census_of`] calls Claude Codes, Claude Code's temp root
+/// `scratch`, sorted.
 fn claude_pids(processes: Vec<Process>, scratch: Option<&Scratch>) -> Vec<u32> {
     let census = census_of(processes, None, scratch).expect("every exec record was read");
     let mut pids: Vec<u32> = census.claudes.iter().map(|c| c.pid).collect();
@@ -660,6 +699,9 @@ fn claude_pids(processes: Vec<Process>, scratch: Option<&Scratch>) -> Vec<u32> {
 }
 
 /// Claude Code's temp root `root` given by hand ([`Scratch`]), on a mount table of one local
+/// fixed `C:\`, its 8.3 short names spelled long by a stand-in for the file system: the folder
+/// `\\?\C:\Users\ANDREW~1` (any case) is `\\?\C:\Users\Andrew Yates`, and nothing else is
+/// spelled — a short name it does not know is gone, or never was.
 fn scratch_at(root: &str) -> Scratch {
     use aterm_sysprobe::volumes::{Mount, Table};
     fn spelled(through: &Path) -> Option<PathBuf> {
@@ -689,7 +731,7 @@ fn scratch_at(root: &str) -> Scratch {
     }
 }
 
-/// A PROGRAM RUN FROM A CLAUDE CODE SCRATCHPAD IS NO CLAUDE CODE. Windows' Claude Code temp
+/// A PROGRAM RUN FROM A CLAUDE CODE SCRATCHPAD IS NO CLAUDE CODE.
 #[test]
 fn a_program_run_from_a_claude_scratchpad_is_no_claude_code() {
     let text = |p: &Path| p.to_str().expect("UTF-8").to_owned();
@@ -748,6 +790,10 @@ fn a_program_run_from_a_claude_scratchpad_is_no_claude_code() {
 }
 
 /// THE CENSUS PLACES A SCRATCHPAD BY THIS ENVIRONMENT'S TEMP ROOT ([`claude_census`]'s own,
+/// [`Scratch::read`]), whatever `%TEMP%` is: a program in Claude Code's temp root as the census
+/// spells it (long) and as the environment spells it ([`claude_tmp_root`]: short where `%TEMP%`
+/// carries 8.3 names, inside another `claude` folder where `%TEMP%` lies in one, such as a
+/// Claude Code scratchpad) is no Claude Code.
 #[test]
 fn the_census_places_a_scratchpad_by_this_environments_temp_root() {
     let scratch = Scratch::read().expect("Windows has a temp root");
@@ -777,7 +823,7 @@ fn the_census_places_a_scratchpad_by_this_environments_temp_root() {
     );
 }
 
-/// A CLOUD SYNC ROOT THE `$HOME` SEARCH MEETS IS SAID, ONCE EACH. `$HOME`'s child `Synced`, a
+/// A CLOUD SYNC ROOT THE `$HOME` SEARCH MEETS IS SAID, ONCE EACH.
 #[test]
 fn a_cloud_sync_root_the_home_search_meets_is_said_once_each() {
     let tmp = Tmp::new("discover-win-sync-note");
@@ -832,6 +878,9 @@ fn a_cloud_sync_root_the_home_search_meets_is_said_once_each() {
 }
 
 /// A RUNNING CLAUDE CODE HOLDS ITS PROJECT AS WINDOWS SPELLS ITS FOLDER: the
+/// kernel's working directory with a trailing separator, in another case,
+/// verbatim, or inside one of its worktrees (`\.claude\worktrees\<name>`,
+/// which holds every project at or under its repository).
 #[test]
 fn a_running_claude_holds_its_project_in_any_windows_spelling() {
     let at = |cwd: &str| RunningClaude {
@@ -866,6 +915,9 @@ fn a_running_claude_holds_its_project_in_any_windows_spelling() {
 }
 
 /// AN OWNER OWNS ONLY WHAT LIES INSIDE ITS FOLDER, IN ANY SPELLING: a build
+/// directory under a session's folder, the folder named plain and the build
+/// directory verbatim, is the owner's; NEGATIVE CONTROLS: the folder itself
+/// and one beside it are not.
 #[test]
 fn an_owner_owns_what_lies_inside_its_folder_in_any_spelling() {
     let tmp = Tmp::new("discover-win-owns");
@@ -914,6 +966,8 @@ fn an_owner_owns_what_lies_inside_its_folder_in_any_spelling() {
 }
 
 /// A directory's device is its volume's 64-bit serial, the one a reading
+/// of that volume names; a path that cannot be read has none, and a home
+/// that cannot be read is placed nowhere.
 #[test]
 fn a_windows_directory_is_on_its_volumes_serial() {
     use aterm_sysprobe::volumes;
@@ -940,6 +994,14 @@ fn a_windows_directory_is_on_its_volumes_serial() {
 }
 
 /// A RUNNING WINDOWS PROCESS IS READ AS THE CENSUS READS IT, its exec record
+/// whole: a stand-in Claude Code (a copy of the system's `cmd.exe` in a
+/// scratch `claude\` folder, a component that names one, [`claude_code`]),
+/// started in a scratch project with a `USERPROFILE` and a `HOME` naming two
+/// different folders, reads as a Claude Code homed by its `USERPROFILE` (the
+/// variable its `os.homedir()` reads there, measured:
+/// [`super::super::accounts::HOMEDIR_ENV`]), standing in the project (its
+/// process parameters' working directory) with its start read; the census
+/// holds the project and reads `<USERPROFILE>\.claude`.
 #[test]
 fn a_running_claude_code_is_read_whole_and_homed_by_its_userprofile() {
     use std::os::windows::process::CommandExt as _;
@@ -1003,6 +1065,11 @@ fn a_running_claude_code_is_read_whole_and_homed_by_its_userprofile() {
 }
 
 /// A MEASUREMENT, run by hand (`-- --ignored --nocapture
+/// the_claude_census_of_this_account`), never a gate: every process of this
+/// account read as the census reads it ([`read_process`]), how many read
+/// whole, which did not (by image, and whether the census can tell it,
+/// [`told`]), which it calls a Claude Code (by pid, image, working directory
+/// and Claude Code directory), and the census itself, timed.
 #[test]
 #[ignore = "a measurement, run by hand"]
 fn the_claude_census_of_this_account() {

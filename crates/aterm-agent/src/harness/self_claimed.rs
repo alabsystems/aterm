@@ -12,7 +12,7 @@ use super::codex_alab;
 /// Supported `codex-alab` session record schema version.
 pub const RECORD_VERSION: u64 = 1;
 
-/// Maximum serialized record size. Reads admit only regular files and never
+/// Maximum serialized record size.
 const RECORD_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Ledger filename for handled crash witnesses under `<state>/drive/`.
@@ -114,6 +114,7 @@ pub fn idle_point(record: &Record) -> bool {
 }
 
 /// The live process `pid`'s `$CODEX_HOME` (canonical) and its own facts,
+/// from its exec record; `None` where that cannot be read.
 fn live_of(pid: u32) -> Option<(PathBuf, Live)> {
     let args = atpkg::caller_shell::process_args(pid)?;
     let live = Live {
@@ -164,6 +165,8 @@ pub fn read_first_frame(pid: u32, start: &str) -> Option<FirstFrame> {
 }
 
 /// `point` of the process `pid` started at `start`'s own record, read only
+/// while that very process runs (looked at before the read and again after
+/// it), the record naming that pid.
 fn read_live<T>(pid: u32, start: &str, point: fn(&Record) -> Option<T>) -> Option<T> {
     use super::restart_stamp::alive_as;
     if !alive_as(pid, start) {
@@ -329,6 +332,7 @@ pub fn record_path(home: &Path, pid: u32) -> PathBuf {
 }
 
 /// The `$CODEX_HOME` a process started with `codex_home`/`home` uses:
+/// `CODEX_HOME`, else `$HOME/.codex`; canonical where it exists.
 fn codex_home_of(codex_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
     let dir = codex_home
         .map(PathBuf::from)
@@ -342,6 +346,7 @@ fn codex_home_of(codex_home: Option<&str>, home: Option<&str>) -> Option<PathBuf
 }
 
 /// atpkg's managed Codex twin, where one is configured and the build it execs
+/// is ALab's ([`codex_alab::alab_bytes`]).
 fn managed_alab_twin() -> Option<PathBuf> {
     let twin = atpkg::store::resolve_configured()?
         .agents_dir()

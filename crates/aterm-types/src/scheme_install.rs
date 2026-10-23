@@ -2,17 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Installing an imported theme into the themes folder: the one write path
-//! behind `aterm theme import` and Settings' "Import…".
-//!
-//! [`crate::scheme_import`] converts text and touches no file. This module is
-//! the file half around it: it reads one local file (never a URL) up to the
-//! theme-file bound, picks the theme's id (the caller's name, else the file's
-//! stem; never a built-in's name), checks that the native file it is about to
-//! write reads back to the converted theme, and writes it atomically into the
-//! themes folder. Without `replace` an existing theme of that id is left
-//! alone. Both front ends call [`install_theme_file`], so the command line and
-//! the window cannot disagree about what an import writes.
+//! Atomic theme installer ([`install_theme_file`], [`crate::scheme_import`]).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -38,11 +28,9 @@ pub struct InstalledTheme {
 /// Why an import wrote nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallError {
-    /// The request itself is wrong (a URL, a bad or built-in id): nothing was
-    /// read.
+    /// The request itself is wrong (a URL, a bad or built-in id): nothing was read.
     Refused(String),
-    /// A theme with this id is already in the themes folder, and the
-    /// import was not asked to replace it.
+    /// A theme with this id is already in the themes folder.
     Exists(PathBuf),
     /// The file could not be read or converted, or the write failed.
     Failed(String),
@@ -59,16 +47,10 @@ impl core::fmt::Display for InstallError {
 
 impl std::error::Error for InstallError {}
 
-/// Convert the theme at `path` and write it into `theme_dir` as
-/// `<id>.conf`, where `id` is `name` or else the file's stem. `theme_dir` is
-/// `None` when no themes folder could be found.
+/// Convert the theme at `path` and write it into `theme_dir` as `<id>.conf`.
 ///
 /// # Errors
-///
-/// [`InstallError::Refused`] before anything is read when `path` is a URL or
-/// the id is unusable; [`InstallError::Failed`] when the file cannot be read
-/// or converted, the result does not read back unchanged, or the write fails
-/// (including an existing theme of that id without `replace`).
+/// [`InstallError::Refused`] on an invalid request, or [`InstallError::Failed`] on I/O failure.
 pub fn install_theme_file(
     path: &Path,
     name: Option<&str>,
@@ -78,14 +60,9 @@ pub fn install_theme_file(
     install_with(path, name, name, replace, theme_dir)
 }
 
-/// Import the theme at `path` as a NEW theme, the way a window's "Import…"
-/// does: the id is the file's stem, or the stem with ` (imported)` after it
-/// when the stem is a built-in's name (a kitty `Nord.conf`, say), and the
-/// theme keeps its own display name. An existing theme of that id is never
-/// replaced.
+/// Import the theme at `path` as a NEW theme, the way a window's "Import…" does.
 ///
 /// # Errors
-///
 /// As [`install_theme_file`].
 pub fn install_theme_file_as_new(
     path: &Path,
@@ -103,9 +80,7 @@ pub fn install_theme_file_as_new(
     install_with(path, id.as_deref(), None, false, theme_dir)
 }
 
-/// The import: `id` is the theme's id (else the file's stem); `rename` is
-/// the scheme a multi-scheme source is picked by and the display name the
-/// theme takes (else its own).
+/// The import: `id` is the theme's id (else the file's stem).
 fn install_with(
     path: &Path,
     id: Option<&str>,
@@ -120,7 +95,6 @@ fn install_with(
         )));
     }
 
-    // The id: `name`, else the file's stem.
     let id = match id {
         Some(id) => id.to_string(),
         None => match path.file_stem().map(|stem| stem.to_str()) {
@@ -162,8 +136,6 @@ fn install_with(
         report.format.label()
     );
     let text = report.to_native_conf(&[&header_source]);
-    // The written file must read back as exactly what was converted: the
-    // native parser is the only reader the window has.
     let expected = ParsedTheme::colours_only(
         report.scheme.clone(),
         report.appearance_declared,
@@ -190,8 +162,6 @@ fn install_with(
         ));
     };
     let dest = dir.join(format!("{id}.conf"));
-    // Checked even with `replace`: replacing `<id>.conf` would still leave
-    // the other-case file beside it, and the catalog loads neither.
     if let Some(other) = case_variant(dir, &id) {
         return Err(InstallError::Failed(case_collision_message(&other, &id)));
     }
@@ -205,10 +175,7 @@ fn install_with(
     })
 }
 
-/// A themes-folder file whose name is `<id>.conf` in another ASCII case. The
-/// catalog refuses every file of such a pair (it cannot tell which one
-/// `theme = "<id>"` means), so a writer that adds the second file breaks the
-/// first. `None` when there is none, or the folder cannot be read.
+/// A themes-folder file whose name is `<id>.conf` in another ASCII case.
 #[must_use]
 pub fn case_variant(dir: &Path, id: &str) -> Option<PathBuf> {
     let wanted = format!("{id}.conf");
@@ -234,13 +201,10 @@ pub fn case_collision_message(other: &Path, id: &str) -> String {
     )
 }
 
-/// Read a regular file, refusing one larger than the theme bound before
-/// reading it (and reading at most one byte past the bound, should it grow).
+/// Read a regular file, refusing one larger than the theme bound before reading it.
 ///
 /// # Errors
-///
-/// The reason, as text, when the file is missing, not regular, unreadable or
-/// over the bound.
+/// The reason, as text, when the file is missing, not regular, unreadable or over the bound.
 pub fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
     let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
     if !metadata.is_file() {
@@ -263,17 +227,10 @@ pub fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// Write `bytes` to `dest` through a temporary file in the same folder, so a
-/// reader (the window's catalog) sees the old file or the whole new one,
-/// never a part. Without `replace` an existing `dest` is left alone: the new
-/// file is linked in under that name only if the name is free. Every theme
-/// file aterm writes (`import`, `new`, `export`, Settings' "Import…") goes
-/// through here.
+/// Write `bytes` to `dest` through a temporary file in the same folder.
 ///
 /// # Errors
-///
-/// [`InstallError::Exists`] when `dest` is taken and `replace` is false;
-/// [`InstallError::Failed`] when the write fails.
+/// [`InstallError::Exists`] if `dest` exists without `replace`, or [`InstallError::Failed`].
 pub fn write_atomically(
     dir: &Path,
     dest: &Path,
@@ -290,9 +247,6 @@ pub fn write_atomically(
     let failed =
         |path: &Path, e: std::io::Error| InstallError::Failed(format!("{}: {e}", path.display()));
     std::fs::create_dir_all(dir).map_err(|e| failed(dir, e))?;
-    // The catalog skips this exclusively created staging directory. Its
-    // guard removes only our own stage on every error; no predictable old
-    // entry is adopted, overwritten or removed.
     let stage = aterm_tempfile::Builder::new()
         .prefix(".theme-import-")
         .tempdir_in(dir)
@@ -303,48 +257,28 @@ pub fn write_atomically(
         .create_new(true)
         .open(&tmp)
         .map_err(|e| failed(&tmp, e))?;
-    // Durable: the person imported this theme and is told so.
     let written = file
         .write_all(bytes)
         .and_then(|()| aterm_durable::durable(&file));
-    // Windows must release the file before rename; the directory guard
-    // remains responsible for any unpublished payload.
     drop(file);
     written.map_err(|e| failed(&tmp, e))?;
     if replace {
         again_while_refused(|| std::fs::rename(&tmp, dest)).map_err(|e| failed(dest, e))
     } else {
-        // Only an exclusive operation can publish without replacement: a
         // theme may appear after any check that the name is free.
         publish_new(&tmp, dest, |from, to| std::fs::hard_link(from, to))
     }
 }
 
-/// How many times [`again_while_refused`] tries the replace again; the waits
-/// between the tries grow by a millisecond each, about half a second in all.
+/// How many times [`again_while_refused`] tries the replace again.
 #[cfg(windows)]
 const REFUSED_TRIES: u64 = 30;
 
-/// `ERROR_SHARING_VIOLATION` and `ERROR_LOCK_VIOLATION`, which std maps to
-/// no [`std::io::ErrorKind`] of their own.
+/// `ERROR_SHARING_VIOLATION` and `ERROR_LOCK_VIOLATION` (unmapped in [`std::io::ErrorKind`]).
 #[cfg(windows)]
 const HELD_OS_ERRORS: [i32; 2] = [32, 33];
 
-/// `op`, tried again while Windows refuses it because another process holds
-/// one of its files; elsewhere, `op` once.
-///
-/// POSIX `rename(2)` replaces a name whoever has it open. `MoveFileExW`
-/// refuses while another process holds either file without delete sharing,
-/// and a file written moments before is exactly what a virus scanner or the
-/// search indexer is reading: `install_round_trips_in_a_scratch_folder`
-/// (aterm-theme-pack) failed about one run in ten on Windows with "Access is
-/// denied" on the rewrite right after a write. The old theme held answers
-/// `ERROR_ACCESS_DENIED` (5); the stage file just written held answers
-/// `ERROR_SHARING_VIOLATION` (32, "being used by another process"). Such a
-/// hold ends in milliseconds, so the replace is tried again, briefly, the
-/// way `atpkg::vendor_direct::durable::again_while_refused` does; a refusal
-/// that outlasts the tries (a real denial, a directory in the way) is the
-/// caller's error as before.
+/// `op`, tried again while Windows refuses it because another process holds one of its files.
 fn again_while_refused<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
     #[cfg(windows)]
     {
@@ -370,9 +304,7 @@ fn again_while_refused<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io
     }
 }
 
-/// Link `tmp` in as `dest` only if `dest` is free. A filesystem that cannot
-/// link fails closed: falling back to a rename could clobber a theme another
-/// writer created after the name was checked.
+/// Link `tmp` in as `dest` only if `dest` is free.
 fn publish_new(
     tmp: &Path,
     dest: &Path,
@@ -410,7 +342,6 @@ mod tests {
     /// A refused replace is tried again on Windows until it goes through,
     /// and a refusal that never lifts is still the caller's error after a
     /// bounded number of tries; any other error is returned at once.
-    /// Elsewhere the operation runs once.
     #[test]
     fn a_refused_replace_is_tried_again_only_on_windows_and_only_so_often() {
         use std::io::{Error, ErrorKind};
@@ -441,8 +372,6 @@ mod tests {
         #[cfg(not(windows))]
         assert_eq!(calls, 1);
 
-        // The stage file held by a scanner: `ERROR_SHARING_VIOLATION` and
-        // `ERROR_LOCK_VIOLATION`, which carry no kind of their own.
         for code in [32, 33] {
             let mut calls = 0u64;
             let out = again_while_refused(|| {
@@ -465,8 +394,6 @@ mod tests {
             }
         }
 
-        // Negative control: another error is never retried, by kind or by
-        // raw code (`ERROR_FILE_NOT_FOUND`).
         let others: [fn() -> Error; 2] = [
             || Error::from(ErrorKind::NotFound),
             || Error::from_raw_os_error(2),
@@ -490,8 +417,6 @@ mod tests {
         std::fs::write(&tmp, "new theme").unwrap();
 
         let failed = publish_new(&tmp, &dest, |_, dest| {
-            // A second writer may take the destination while publication is
-            // attempted. Its contents belong to that writer.
             std::fs::write(dest, "other writer")?;
             Err(std::io::ErrorKind::Unsupported.into())
         });
@@ -513,12 +438,6 @@ mod tests {
     }
 
     /// An arbitrary export filename can be our usual temporary basename.
-    /// Publication and cleanup must leave the complete destination behind,
-    /// including when the destination is spelled without its `.` parent. That
-    /// spelling names the working directory, so it runs in a re-exec of this
-    /// test whose working directory is a scratch folder: never the folder the
-    /// test binary was started in (the crate's source under `cargo test`, a
-    /// read-only mount on the Linux lane).
     #[test]
     fn publication_keeps_a_destination_named_like_its_temporary_file() {
         const BARE_NAME: &str = "ATERM_TYPES_SCHEME_INSTALL_BARE_NAME";
@@ -573,8 +492,6 @@ mod tests {
             said.contains("1 passed"),
             "the re-exec ran no test:\n{said}"
         );
-        // The bare name landed in the re-exec's working directory, whole, and
-        // the staging folder went with publication.
         let left: Vec<_> = std::fs::read_dir(&cwd)
             .unwrap()
             .map(|entry| entry.unwrap().path())
@@ -608,7 +525,6 @@ mod tests {
 
         let again = install_theme_file_as_new(&source, Some(&themes));
         assert_eq!(again, Err(InstallError::Exists(installed.dest.clone())));
-        // Negative control: the command line's explicit name does rename.
         let named = install_theme_file(&source, Some("mine"), false, Some(&themes)).unwrap();
         let parsed =
             scheme::parse_theme_str(&std::fs::read_to_string(&named.dest).unwrap()).unwrap();
@@ -640,7 +556,6 @@ mod tests {
             .collect();
         assert_eq!(names, ["Harbour.conf"], "nothing was written");
         assert_eq!(std::fs::read_to_string(&existing).unwrap(), KITTY);
-        // Negative control: a name that is no case variant installs.
         install_theme_file(&source, Some("Lighthouse"), false, Some(&themes)).unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }

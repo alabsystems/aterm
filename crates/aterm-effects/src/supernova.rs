@@ -44,6 +44,8 @@ pub const COMBO_CHANCE_STEP: u8 = 30;
 pub const COMBO_EXTREME_LEVEL: u32 = 5;
 
 /// Per-level tier windows `(flash_end, nova_end)` over the high half's `% 1000`
+/// bucket, indexed by `min(level, COMBO_EXTREME_LEVEL) - 1` (level 0 uses the
+/// base row).
 const COMBO_TIER_WINDOWS: [(u64, u64); COMBO_EXTREME_LEVEL as usize] = [
     (TIER_FLASH_END, TIER_NOVA_END),
     (500, 850),
@@ -205,6 +207,7 @@ pub struct SuperCounts {
 }
 
 /// A budgeted, grid-clamped, row-band-splitting [`GlowQuad`] sink; this
+/// module's own copy of `nova::QuadSink`.
 struct QuadSink<'a> {
     out: &'a mut Vec<GlowQuad>,
     grid_w: i32,
@@ -276,6 +279,7 @@ const fn ease_out(q: f32) -> f32 {
 /// Warm detonation core tint.
 const WASH_CORE: u32 = 0x00FF_EED2;
 /// The light-theme veil / dark-crown stamp tone (near-black warm violet — the
+/// Singularity's own Over tone family).
 const VEIL_TONE: u32 = 0x001A_1022;
 
 /// Emit one supernova frame's additive quads (charge motes / wash / crown / double ring) under `budget`.
@@ -461,6 +465,7 @@ fn scale_rgb_floor(rgb: u32, numerator: u32, denominator: u32) -> u32 {
 }
 
 /// Charge mote `k`'s px position at progress `p` (0..1): a spiral converging on
+/// the word centre, shared by the dark and light paths.
 #[inline]
 fn charge_mote_pos(env: &SuperEnv, k: usize, p: f32) -> (i32, i32) {
     let s = crate::genome::mix(env.seed ^ (k as u64).wrapping_mul(0xA24B_AED4_963E_E407));
@@ -474,6 +479,7 @@ fn charge_mote_pos(env: &SuperEnv, k: usize, p: f32) -> (i32, i32) {
 }
 
 /// The 8-point star crown, additive (dark themes): 4 axes (2 orthogonal + 2
+/// diagonal), 3 tapered segments per point ⇒ ≤ 8 × 3 + 2 = 26 ≤ 50 quads.
 #[inline]
 fn emit_crown_quads(sink: &mut QuadSink<'_>, env: &SuperEnv, env_a: f32) {
     let reach = env.r_max;
@@ -501,6 +507,7 @@ fn emit_crown_quads(sink: &mut QuadSink<'_>, env: &SuperEnv, env_a: f32) {
 }
 
 /// One ring as ≤ [`SUPER_RING_BANDS`] row-band chord pairs (annulus geometry:
+/// ≤ 2 chords per band).
 #[inline]
 fn emit_ring_chords(sink: &mut QuadSink<'_>, env: &SuperEnv, r: f32, thick: f32, premul: u32) {
     if r <= 1.0 {
@@ -747,16 +754,20 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
 }
 
 /// The population the eclipse bound governs, by blend and glyph: light-theme
+/// charge motes and debris are Over too but must not be darkened with the veil.
 #[inline]
 const fn is_shade(d: &WordDecoration) -> bool {
     matches!(d.blend, DecoBlend::Over) && matches!(d.glyph, DecoGlyph::Shade)
 }
 
 /// Slot count of [`peak_shade_probe`]'s stack table: 2x the emitter's Shade
+/// ceiling (≤ 200 veil + 24 crown; the ≤ 16 fringe stamps live in a disjoint
+/// window).
 const SHADE_TAB_BITS: u32 = 9;
 const SHADE_TAB: usize = 1 << SHADE_TAB_BITS;
 
 /// The worst per-`(row, col)` aggregate Shade alpha in one pass: per-cell sums
+/// accumulate in a fixed linear-probe table on the stack.
 #[inline]
 fn peak_shade_probe(decos: &[WordDecoration]) -> u32 {
     const EMPTY: u64 = u64::MAX;
@@ -785,6 +796,9 @@ fn peak_shade_probe(decos: &[WordDecoration]) -> u32 {
 }
 
 /// The quadratic peak scan: the reference [`peak_shade_probe`] is tested
+/// against, and the fallback for Shade populations past the probe table's
+/// admission (unreachable from `emit_super_decos`, which caps Shade at
+/// [`MAX_VEIL_CELLS`] veil + 24 crown + 16 fringe, but kept total).
 fn peak_shade_quadratic(decos: &[WordDecoration]) -> u32 {
     decos
         .iter()
@@ -801,7 +815,7 @@ fn peak_shade_quadratic(decos: &[WordDecoration]) -> u32 {
         .unwrap_or(0)
 }
 
-/// Bound the eclipse's full-cell source-over opacity per host cell. Every
+/// Bound the eclipse's full-cell source-over opacity per host cell.
 #[inline]
 fn bound_shade_opacity(decos: &mut [WordDecoration]) {
     if decos.is_empty() {
@@ -871,6 +885,7 @@ mod tests {
     }
 
     /// [`r_max_for`] is the engine clamp `min(6 rows, grid_h / 2)` with the
+    /// 1 px floor, so tests never use radii the engine cannot produce.
     #[test]
     fn r_max_for_matches_engine_clamp() {
         assert_eq!(r_max_for(20, 64 * 20), 6.0 * 20.0);
@@ -879,6 +894,8 @@ mod tests {
     }
 
     /// Structural budget: `S_max ≤ 900` at `ch ∈ {14, 20, 40, 56}` over every
+    /// 10 ms step, both themes, 64 and 160 viewport rows, and the budgeted
+    /// emission equals the unbounded one (the cap never binds).
     #[test]
     fn super_budget_s_max_bound() {
         for ch in [14i32, 20, 40, 56] {
@@ -915,6 +932,7 @@ mod tests {
     }
 
     /// The deco stream stays within the host cap: veil ≤ 200, light charge ≤ 12,
+    /// debris ≤ 40, never above 256 in one phase.
     #[test]
     fn super_deco_stream_bounded() {
         for light in [false, true] {
@@ -970,6 +988,7 @@ mod tests {
     }
 
     /// Theme branch: a dark-bg detonation uses the bounded additive wash,
+    /// a light-bg one rides the Over deco stream (the eclipse) instead.
     #[test]
     fn detonation_is_theme_branched() {
         let t = 500u64;
@@ -996,6 +1015,8 @@ mod tests {
     }
 
     /// A rolled supernova must not whiten the frame: at the phase peak both
+    /// theme branches stay within the overlay bound, with negative controls
+    /// showing each limiter binds.
     #[test]
     fn detonation_has_a_hard_aggregate_readability_ceiling() {
         let t = 500;
@@ -1054,6 +1075,11 @@ mod tests {
     }
 
     /// The probe-table peak equals [`peak_shade_quadratic`] over the deployed
+    /// emission space (every 10 ms × both themes × deployed cell heights × both
+    /// row counts) and over hand-built edge cases: crown-on-veil duplicates,
+    /// Over non-Shade and Add-blend Shade impostors, an alpha-zero stamp, the
+    /// `(u16::MAX, u16::MAX)` key beside the empty sentinel, and a population
+    /// past `SHADE_TAB / 2` that must take the fallback.
     #[test]
     fn shade_peak_probe_is_bit_identical_to_quadratic_reference() {
         fn reference_bound(decos: &mut [WordDecoration]) {
@@ -1152,6 +1178,7 @@ mod tests {
     }
 
     /// The limiter is one frame-wide scale, not per-row normalization, so
+    /// falloff ratios survive.
     #[test]
     fn overlap_bound_preserves_falloff_and_finds_crossed_edges() {
         let quad = |row, x, y, w, h, color| GlowQuad {
@@ -1191,6 +1218,10 @@ mod tests {
     }
 
     /// The edge sweep equals the exhaustive probe over the deployed emission
+    /// space (every 10 ms × both themes × {64, 160} rows × deployed cell
+    /// heights) and over hand-built edge cases: half-open retirement, shared
+    /// start edges, duplicates, zero-extent quads, and a hottest point that is
+    /// neither quad's corner.
     #[test]
     fn peak_sweep_is_bit_identical_to_exhaustive_probe() {
         fn exhaustive(quads: &[GlowQuad]) -> u32 {
@@ -1280,6 +1311,8 @@ mod tests {
     }
 
     /// On a viewport taller than [`MAX_WASH_ROWS`] the wash window centres on
+    /// the blast row (clamped to the grid), so a detonation at the bottom
+    /// washes the word's row.
     #[test]
     fn wash_window_centers_on_blast_row() {
         let rows = 200i32;
@@ -1309,6 +1342,7 @@ mod tests {
     }
 
     /// Light themes emit charge motes and debris as `DecoBlend::Over`; the dark
+    /// theme keeps its additive output.
     #[test]
     fn light_charge_and_debris_ride_over_stream() {
         let (dark, light) = (env(20, false, 64), env(20, true, 64));
@@ -1343,6 +1377,8 @@ mod tests {
     }
 
     /// The tier decode is independent of the detonate decode: among draws
+    /// that detonate at 30%, the tier split is the split over every draw, so
+    /// the tiers do not skew with `chance_pct`.
     #[test]
     fn the_tier_decode_is_independent_of_the_detonate_decode() {
         let mut all = [0u32; 3];
@@ -1386,6 +1422,8 @@ mod tests {
     }
 
     /// The combo ladder is monotone: P(Nuke) rises, P(Flash) falls to zero,
+    /// level 5 and above is Nuke on every draw, and the chance tops out at 100
+    /// without lifting a configured 0.
     #[test]
     fn combo_ladder_climbs_to_guaranteed_nuke() {
         let n = 1_000u64;

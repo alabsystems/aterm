@@ -125,6 +125,7 @@ fn is_act_record(record: &EffectRecord) -> bool {
 }
 
 /// A wait's kind (the word after `await`: `seq`, `agent`, `gone` …) and its
+/// timeout in milliseconds, when it names one.
 fn wait_of(request: &[u8]) -> (Option<String>, Option<u64>) {
     let words: Vec<String> = codec::ctl_args(request)
         .unwrap_or_default()
@@ -141,6 +142,7 @@ fn wait_of(request: &[u8]) -> (Option<String>, Option<u64>) {
 }
 
 /// A wait's TARGET: its words, its timeout (the loop's schedule, not what it
+/// waits for) left out — `await seq 102`.
 fn wait_key(request: &[u8]) -> Vec<String> {
     let words: Vec<String> = codec::ctl_args(request)
         .unwrap_or_default()
@@ -160,6 +162,8 @@ fn wait_key(request: &[u8]) -> Vec<String> {
 }
 
 /// A housekeeping request's KIND: its verb's words, its values left out —
+/// `meta set supervisor`, `meta unset supervisor`, `story` — what a request
+/// in other words is answered by when its very words are not on the tape.
 fn housekeeping_kind(request: &[u8]) -> Vec<String> {
     let words: Vec<String> = codec::ctl_args(request)
         .unwrap_or_default()
@@ -174,6 +178,7 @@ fn housekeeping_kind(request: &[u8]) -> Vec<String> {
 }
 
 /// A control lane's success, saying nothing: what housekeeping no record of
+/// its kind answered is answered with.
 fn lane_success() -> Vec<u8> {
     codec::ctl_reply(&Ok(crate::supervise::CtlReply {
         code: 0,
@@ -257,6 +262,8 @@ pub(crate) struct ActsCursor {
     /// The loop has strayed from the tape in this segment.
     strayed: bool,
     /// The virtual clocks: where the last record consumed stood (monotonic ns
+    /// since the tape's origin; wall ns since the epoch), the sleeps served
+    /// since, and the last monotonic value served (it never runs back).
     base_mono: u64,
     base_wall: i64,
     slept_mono: u64,
@@ -269,15 +276,22 @@ pub(crate) struct ActsCursor {
     pub(crate) idle: u64,
     pub(crate) account: ActsAccount,
     /// Where each round trip sits, by its door and request; each door's
+    /// round trips; each wait by its kind; each file read by its path —
+    /// every list ascending, so a lookup is a halving, never a walk of the
+    /// segment (a candidate stuck asking again in a long segment asks up to
+    /// the progress guard's count of times).
     by_request: BTreeMap<(String, Vec<u8>), Vec<usize>>,
     by_door: BTreeMap<String, Vec<usize>>,
     waits: BTreeMap<Option<String>, Vec<usize>>,
     by_path: BTreeMap<String, Vec<usize>>,
     /// Each wait by its door and target ([`wait_key`]): where the same wait
+    /// sits whatever its timeout.
     wait_keys: BTreeMap<(String, Vec<String>), Vec<usize>>,
     /// Each housekeeping round trip by its door and kind
+    /// ([`housekeeping_kind`]).
     housekeeping: BTreeMap<(String, Vec<String>), Vec<usize>>,
     /// The round trips and file reads a candidate may ask (every one but an
+    /// output's): where the tape is spent ([`ActsCursor::spent`]).
     askable: Vec<usize>,
 }
 
@@ -512,6 +526,8 @@ impl ActsCursor {
     }
 
     /// The segment's closing act, when the tape holds the wait `list` names
+    /// only past it — what the recorded run waited for only once it had taken
+    /// that act.
     fn skipped(&self, list: Option<&Vec<usize>>) -> Option<usize> {
         let closing = self.closing()?;
         first_in(list, closing + 1, self.records.len()).map(|_| closing)
@@ -523,6 +539,12 @@ impl ActsCursor {
     }
 
     /// A DERIVED PROBE's answer from before the cursor: the latest round trip
+    /// at `door` asking `request` that astream-effects' keyed rule admits at
+    /// `seen = pos` — [`astream_effects::keyed_hit_within_cutoff`], the very
+    /// predicate [`astream_effects::KeyedView::lookup`] admits a recorded
+    /// answer by, so a change of astream's admission rule is acts mode's too
+    /// (`a_keyed_answer_is_astreams_at_every_cursor` holds the two equal at
+    /// every position of a generated tape).
     fn keyed(&self, door: &str, request: &[u8]) -> Option<usize> {
         let list = self.asked(door, request)?;
         let admitted =
@@ -653,6 +675,7 @@ impl ActsCursor {
     }
 
     /// A SLEEP whose request is its length in nanoseconds: the identical
+    /// sleep under the cursor, else virtual time.
     fn sleep(&mut self, request: &[u8]) -> Served {
         if self.pos < self.records.len() && self.holds(self.pos, doors::SLEEP, request) {
             let at = self.pos;

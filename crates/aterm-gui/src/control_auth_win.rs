@@ -79,6 +79,8 @@ pub(crate) fn peer_check(stream: &CtlStream) -> Result<(), String> {
 }
 
 /// Hand-rolled advapi32/kernel32 FFI for the control-directory owner check + DACL
+/// hardening — the Windows analog of the Unix SEC-3 owner gate + `0700` chmod —
+/// and the elevated posture.
 mod acl {
     #![allow(non_snake_case, reason = "Win32 API names are camel-case by contract")]
 
@@ -101,10 +103,12 @@ mod acl {
     const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
     const TOKEN_QUERY: u32 = 0x0008;
     /// `TOKEN_INFORMATION_CLASS::TokenOwner`: the default owner of objects this process
+    /// creates, the user SID for a standard user and the Administrators SID when elevated.
     const TOKEN_OWNER_CLASS: u32 = 4;
     /// `TOKEN_INFORMATION_CLASS::TokenUser` — the user the token runs as.
     const TOKEN_USER_CLASS: u32 = 1;
     /// Enough to open another process's token for a query; granted on a
+    /// same-user process even when it is elevated.
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
     const ERROR_ACCESS_DENIED: u32 = 5;
     const ERROR_ALREADY_EXISTS: u32 = 183;
@@ -256,6 +260,7 @@ mod acl {
     }
 
     /// The current process token's `TokenOwner` blob (the returned buffer owns the
+    /// SID the pointer at its head references).
     fn current_token_owner_info() -> Option<Vec<u8>> {
         // SAFETY: GetCurrentProcess returns a pseudo-handle, always valid.
         token_info(unsafe { GetCurrentProcess() }, TOKEN_OWNER_CLASS)
@@ -308,6 +313,7 @@ mod acl {
     }
 
     /// The `class` blob of `process`'s token (the buffer owns any SID the
+    /// pointer at its head references).
     fn token_info(process: Handle, class: u32) -> Option<Vec<u8>> {
         let mut token: Handle = 0;
         // SAFETY: `process` is a live (or pseudo) process handle; TOKEN_QUERY only.
@@ -339,6 +345,8 @@ mod acl {
     }
 
     /// The `PSID` at the head of a `TokenOwner`/`TokenUser` blob
+    /// (`TOKEN_OWNER.Owner` / `TOKEN_USER.User.Sid`, the first pointer-sized
+    /// field).
     fn sid_ptr(buf: &[u8]) -> *mut c_void {
         if buf.len() < std::mem::size_of::<*mut c_void>() {
             return null_mut();
@@ -397,6 +405,8 @@ mod acl {
     }
 
     /// Replace `dir`'s DACL with a protected (non-inheriting) full-access grant to the owning
+    /// principal, LocalSystem and Builtin Administrators: the Unix `0700` analogue, whatever
+    /// ACL the directory inherited.
     fn harden_dacl(wide: &mut [u16], owner_sid: *mut c_void) -> io::Result<()> {
         let mut sid_str: *mut u16 = null_mut();
         // SAFETY: `owner_sid` is a valid SID from our own token blob.
@@ -560,6 +570,8 @@ mod acl {
     }
 
     /// The elevated control directories this process holds open (the module
+    /// docs), without `FILE_SHARE_DELETE`: neither they nor any directory above
+    /// them can be renamed or removed while it runs.
     static PINNED: Mutex<Vec<(PathBuf, File)>> = Mutex::new(Vec::new());
 
     /// Give `dir` the elevated posture ([`ELEVATED_DIR_SDDL`]), creating it with that descriptor when absent (its parents are created as ordinary directories).
@@ -616,7 +628,7 @@ mod acl {
         }
     }
 
-    /// `CreateDirectoryW` with `sd`. A directory already there is not an error:
+    /// `CreateDirectoryW` with `sd`.
     fn create_dir_with(dir: &Path, sd: &Descriptor) -> io::Result<()> {
         let wide = to_wide(dir);
         let mut attributes = SecurityAttributes {
@@ -702,6 +714,7 @@ mod acl {
     }
 
     /// Write the parts of `sd` that `info` names onto the object `handle` is
+    /// open on (`SetSecurityInfo`).
     fn apply(handle: &File, sd: &Descriptor, info: u32) -> io::Result<()> {
         let owner = if info & OWNER_SECURITY_INFORMATION != 0 {
             sd.owner()?
@@ -745,6 +758,10 @@ mod tests {
     }
 
     /// The elevation law on the descriptors themselves (`AccessCheck`): an
+    /// elevated token of this user gets everything on the elevated directory and
+    /// token file; the same user's UNELEVATED token — Administrators deny-only,
+    /// Medium integrity, built here whatever this process is — gets nothing, not
+    /// even the right to read the descriptor.
     #[test]
     fn the_elevated_descriptors_admit_an_elevated_token_and_refuse_the_unelevated_twin() {
         let elevated = aterm_uds::elevation::is_elevated();
@@ -782,7 +799,7 @@ mod tests {
         }
     }
 
-    /// Each layer holds alone. The High label refuses a Medium token reads and
+    /// Each layer holds alone.
     #[test]
     fn the_label_and_the_owner_rights_entry_each_refuse_the_unelevated_twin() {
         let twin = tokens::unelevated_twin();
@@ -812,6 +829,7 @@ mod tests {
     }
 
     /// The kernel gate under the token: afunix checks the socket FILE's DACL at
+    /// `connect`.
     #[test]
     fn a_socket_under_the_elevated_entries_refuses_an_unelevated_connect() {
         let dir = std::env::temp_dir().join(format!("aterm-elev-sock-{}", std::process::id()));
@@ -839,6 +857,9 @@ mod tests {
     }
 
     /// Fail closed: an unelevated process cannot make the elevated directory or
+    /// token file at all (it cannot name Administrators the owner, nor label
+    /// High), and nothing is left behind; and a directory it made where an
+    /// elevated instance looks is refused untouched, never adopted.
     #[test]
     fn an_elevated_dir_is_never_made_or_adopted_without_elevation() {
         let elevated = aterm_uds::elevation::is_elevated();
@@ -880,6 +901,9 @@ mod tests {
     }
 
     /// The owner check across an elevation (`docs/WINDOWS_PARAGON_DESIGN.md` §5.7
+    /// and §8), on the real security API and without one: descriptors built from
+    /// SDDL stand in for the folder's owner through the injected owner read
+    /// (`acl::verify_owner_and_harden_with`).
     #[test]
     fn the_owner_check_refuses_a_folder_across_elevations() {
         let me = tokens::own_user_sid();
@@ -948,7 +972,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The protected DACL, read back from a real directory. A child of a folder
+    /// The protected DACL, read back from a real directory.
     #[test]
     fn the_hardened_dacl_is_protected_and_shuts_everyone_else_out() {
         let me = tokens::own_user_sid();
@@ -987,6 +1011,8 @@ mod tests {
     }
 
     /// The elevated owner check (`acl::elevated_owner_verdict`) over
+    /// descriptors built from SDDL: only Administrators and SYSTEM, the owners
+    /// no unelevated process can give a directory, pass.
     #[test]
     fn the_elevated_owner_check_takes_only_administrators_or_system() {
         let me = tokens::own_user_sid();
@@ -1009,6 +1035,9 @@ mod tests {
     }
 
     /// The pin: a directory held open the way an elevated control directory is
+    /// cannot be renamed, nor can any directory above it, so the directory
+    /// whose owner was verified is the one its path names for as long as the
+    /// handle lives; once it is closed the rename goes through.
     #[test]
     fn a_held_directory_cannot_be_renamed_nor_can_its_parents() {
         let base = std::env::temp_dir().join(format!("aterm-elev-pin-{}", std::process::id()));
@@ -1024,6 +1053,7 @@ mod tests {
     }
 
     /// Tokens to ask `AccessCheck` with: this process's own, its unelevated
+    /// twin, and its elevated twin where the account has one.
     mod tokens {
         #![allow(non_snake_case, reason = "Win32 API names are camel-case by contract")]
 
@@ -1208,6 +1238,7 @@ mod tests {
         }
 
         /// An identification-level impersonation copy of `token`, which is what
+        /// `AccessCheck` takes.
         fn for_access_check(token: &Token) -> Token {
             let mut handle: isize = 0;
             // SAFETY: `token` is live with TOKEN_DUPLICATE; the out pointer is a local.
@@ -1236,17 +1267,22 @@ mod tests {
         }
 
         /// This user's token as an UNELEVATED process of theirs holds it,
+        /// whatever this process is: Administrators and "local account and
+        /// member of Administrators" deny-only, Medium integrity.
         pub(super) fn unelevated_twin() -> Token {
             restricted(&["S-1-5-32-544", "S-1-5-114"])
         }
 
         /// A token of SOMEONE ELSE on this machine: the unelevated twin with the
+        /// user's own SID deny-only too, so only the groups every local user
+        /// holds (Everyone, Users, Authenticated Users, INTERACTIVE…) remain.
         pub(super) fn stranger() -> Token {
             let me = own_user_sid();
             restricted(&[me.as_str(), "S-1-5-32-544", "S-1-5-114"])
         }
 
         /// This process's token with each SID in `deny_only` made deny-only, at
+        /// Medium integrity.
         fn restricted(deny_only: &[&str]) -> Token {
             let base = process_token(
                 TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT,
@@ -1303,6 +1339,8 @@ mod tests {
         }
 
         /// This user's ELEVATED token: this process's own when it runs elevated,
+        /// else its linked token where the account has one (an administrator
+        /// under UAC; identification level, all `AccessCheck` needs).
         pub(super) fn elevated_twin() -> Option<Token> {
             if aterm_uds::elevation::is_elevated() {
                 return Some(own());
@@ -1327,6 +1365,8 @@ mod tests {
         }
 
         /// What `token` is granted (`MAXIMUM_ALLOWED`; 0 when nothing) on an
+        /// object with descriptor `sddl`, with a group added, which
+        /// `AccessCheck` requires and which grants nothing.
         pub(super) fn granted(sddl: &str, token: &Token) -> u32 {
             let at = sddl.find("D:").expect("a DACL");
             let sddl = format!("{}G:SY{}", &sddl[..at], &sddl[at..]);
@@ -1367,11 +1407,14 @@ mod tests {
         }
 
         /// The SID `token`'s objects are owned by (`TokenOwner`), as text: the
+        /// user for an unelevated token, Administrators for an elevated one under
+        /// Windows' default owner policy.
         pub(super) fn token_owner_sid(token: &Token) -> String {
             token_sid(token, TOKEN_OWNER_CLASS)
         }
 
         /// The SID at the head of `token`'s `class` blob (`TOKEN_USER`,
+        /// `TOKEN_OWNER`), as text.
         fn token_sid(token: &Token, class: u32) -> String {
             let mut len: u32 = 0;
             // SAFETY: a null buffer of length 0 asks for the length.
@@ -1413,6 +1456,7 @@ mod tests {
         }
 
         /// The owner and DACL of the file or directory at `path`, as SDDL, read
+        /// back through the same API that wrote them.
         pub(super) fn sddl_of(path: &Path) -> String {
             let wide: Vec<u16> = path.as_os_str().encode_wide().chain(once(0)).collect();
             let mut psd: *mut c_void = null_mut();
@@ -1449,6 +1493,7 @@ mod tests {
         }
 
         /// The DACL part of `sddl`: its control flags (`P` for protected, `AI`…)
+        /// and its entries, each `(…)`.
         pub(super) fn dacl_parts(sddl: &str) -> (String, Vec<String>) {
             let dacl = &sddl[sddl.find("D:").expect("a DACL") + 2..];
             let dacl = dacl.split("S:").next().unwrap_or(dacl);

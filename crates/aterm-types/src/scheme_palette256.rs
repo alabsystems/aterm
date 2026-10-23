@@ -3,25 +3,6 @@
 // Author: Andrew Yates
 
 //! The 256-colour palette a theme derives from its own colours.
-//!
-//! Slots 16-255 of the xterm palette are a 6×6×6 colour cube and a 24-step
-//! grey ramp whose values are fixed (`#FF0000`, `#080808`, …), so a program
-//! that paints in them ignores the theme. A theme that opts in
-//! (`palette_generate = true`) gets them from [`generated_extended_palette`]
-//! instead: the cube's black and white corners are the theme's own darkest
-//! and lightest colours ([`palette_anchors`]), its six colour corners are the
-//! theme's bright row, the grey ramp runs from the dark anchor to the light
-//! one, and everything between is interpolated in `OkLab` at xterm's own
-//! spacing.
-//!
-//! The dark anchor is `color0` or `color15`, whichever is darker, never the
-//! background: on a light theme the background is light, and a cube anchored
-//! there (Ghostty's rule) would put index 16 ("black") on the page colour, so
-//! text drawn in it would vanish. It is not simply `color0` → `color15`
-//! either: a light theme's bright white is its darkest ink (aterm's own Aterm
-//! Day and Linen), and a cube between two dark inks would have no light
-//! colours at all. So dark slots stay dark and light slots light on every
-//! theme.
 
 use crate::Rgb;
 use crate::scheme_signature::oklab;
@@ -32,21 +13,11 @@ pub const XTERM_CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
 /// How many slots the derivation fills: 16 through 255.
 pub const EXTENDED_SLOTS: usize = 240;
 
-/// The ANSI slot of each colour corner of the cube, by corner bits
-/// `r<<2 | g<<1 | b` (`0` and `7`, black and white, are the anchors):
-/// bright blue, bright green, bright cyan, bright red, bright magenta,
 /// bright yellow.
 const CORNER_SLOTS: [usize; 8] = [0, 12, 10, 14, 9, 13, 11, 15];
 
-/// The derivation's dark and light anchors, the cube's black and white
-/// corners and the grey ramp's ends: dark is `ansi[0]` or `ansi[15]`,
-/// whichever has the lower `OkLab` lightness (`ansi[0]` on a tie); light is
-/// the lightest of `ansi[0]`, `ansi[7]`, `ansi[15]`, `foreground` and
-/// `background` (the first of them on a tie). On a dark theme that is
-/// normally `color0` and `color15`; on a light theme, its darkest ink and its
-/// page.
+/// The derivation's dark and light anchors.
 #[must_use]
-// Skip: f64 transcendental bodies absent; pure, total, no indexing past the fixed array.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn palette_anchors(ansi: &[Rgb; 16], foreground: Rgb, background: Rgb) -> (Rgb, Rgb) {
     let l = |c: Rgb| oklab(c).0;
@@ -65,16 +36,6 @@ pub fn palette_anchors(ansi: &[Rgb; 16], foreground: Rgb, background: Rgb) -> (R
 }
 
 /// Slots 16-255 derived from a theme's colours: element `k` is slot `16 + k`.
-///
-/// With `(dark, light) = palette_anchors(ansi, foreground, background)`,
-/// cube slot `16 + 36r + 6g + b` (`r, g, b ∈ 0..6`) interpolates trilinearly
-/// in `OkLab` over the corners `dark` (16), `ansi[9]` (196), `ansi[10]`
-/// (46), `ansi[11]` (226), `ansi[12]` (21), `ansi[13]` (201), `ansi[14]`
-/// (51) and `light` (231), each axis at `t = XTERM_CUBE_LEVELS[v] / 255`; a
-/// slot whose every `t` is 0 or 1 is its corner, byte for byte. Grey slot
-/// `232 + i` interpolates `dark` to `light` at `t = (8 + 10i) / 255`. A
-/// result outside sRGB keeps its lightness and hue and loses chroma until it
-/// fits. Pure and deterministic.
 #[must_use]
 pub fn generated_extended_palette(
     ansi: &[Rgb; 16],
@@ -92,7 +53,6 @@ pub fn generated_extended_palette(
             let (r, g, b) = (k / 36, (k % 36) / 6, k % 6);
             let edge = |v: usize| v == 0 || v == 5;
             if edge(r) && edge(g) && edge(b) {
-                // The exact-corner rule: no OkLab round trip.
                 let bits =
                     (usize::from(r == 5) << 2) | (usize::from(g == 5) << 1) | usize::from(b == 5);
                 corners[bits & 7]
@@ -107,7 +67,6 @@ pub fn generated_extended_palette(
 }
 
 /// A cube level's interpolation fraction.
-// Skip: f64 arithmetic — the float-interval lane.
 #[inline]
 #[cfg_attr(trust_verify, trust::skip)]
 fn level_t(v: usize) -> f64 {
@@ -115,7 +74,6 @@ fn level_t(v: usize) -> f64 {
 }
 
 /// The trilinear `OkLab` blend of the eight corners at cube levels `rgb`.
-// Skip: f64 transcendental bodies absent; pure, total, no indexing past the fixed arrays.
 #[cfg_attr(trust_verify, trust::skip)]
 fn cube_slot(labs: &[(f64, f64, f64); 8], rgb: [usize; 3]) -> Rgb {
     let t = rgb.map(level_t);
@@ -137,7 +95,6 @@ fn cube_slot(labs: &[(f64, f64, f64); 8], rgb: [usize; 3]) -> Rgb {
 }
 
 /// Grey slot `232 + i`: `ansi[0]` to `ansi[15]` at xterm's grey level.
-// Skip: f64 transcendental bodies absent; pure, total, no indexing.
 #[cfg_attr(trust_verify, trust::skip)]
 fn grey_slot(black: &(f64, f64, f64), white: &(f64, f64, f64), i: usize) -> Rgb {
     let level = 8.0 + 10.0 * f64::from(u8::try_from(i).unwrap_or(23));
@@ -158,7 +115,6 @@ fn grey_slot(black: &(f64, f64, f64), white: &(f64, f64, f64), i: usize) -> Rgb 
 )]
 #[inline]
 #[must_use]
-// Skip: f64 transcendental bodies absent; pure, total, no indexing.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn oklab_to_linear(lab: (f64, f64, f64)) -> (f64, f64, f64) {
     let (l, a, b) = lab;
@@ -173,17 +129,13 @@ pub fn oklab_to_linear(lab: (f64, f64, f64)) -> (f64, f64, f64) {
     )
 }
 
-/// How far outside `[0, 1]` a linear channel may sit and still count as in
 /// gamut: float noise on a colour that round-trips, far under half a step.
 const GAMUT_EPSILON: f64 = 1e-7;
 
 /// Bisection steps toward the largest in-gamut chroma.
 const CHROMA_STEPS: u32 = 20;
 
-/// The sRGB colour of an `OkLab` point: outside the gamut, the same
-/// lightness and hue at the largest chroma that fits (a fixed bisection),
 /// then encoded and rounded half up.
-// Skip: f64 transcendental bodies absent; pure, total, no indexing.
 #[cfg_attr(trust_verify, trust::skip)]
 fn oklab_to_rgb(lab: (f64, f64, f64)) -> Rgb {
     let in_gamut = |c: (f64, f64, f64)| {
@@ -212,7 +164,6 @@ fn oklab_to_rgb(lab: (f64, f64, f64)) -> Rgb {
         } else {
             1.055 * v.powf(1.0 / 2.4) - 0.055
         };
-        // In [0, 255.5], so the cast is exact after the floor and the clamp.
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
@@ -257,8 +208,6 @@ mod tests {
             name: "saturated".into(),
             ..ColorScheme::default()
         };
-        // Full-gamut primaries at the corners: blends between them leave
-        // sRGB in OkLab, so this one exercises the chroma reduction.
         saturated.ansi[0] = Rgb::new(0x20, 0x20, 0x20);
         saturated.ansi[9] = Rgb::new(0xff, 0x00, 0x00);
         saturated.ansi[10] = Rgb::new(0x00, 0xff, 0x00);
@@ -283,10 +232,6 @@ mod tests {
     const COLOUR_CORNERS: [(u8, usize); 6] =
         [(196, 9), (46, 10), (226, 11), (21, 12), (201, 13), (51, 14)];
 
-    /// Spec `scheme-generated-palette`: the cube's eight corners are the
-    /// theme's anchors and bright row, byte for byte, and a light theme's
-    /// white corner is its page while its black corner stays dark ink.
-    /// Negative control: with the flag off, slot 196 is xterm's `#FF0000`,
     /// not the theme's bright red.
     #[test]
     fn generated_corners_are_the_theme_anchors() {
@@ -340,11 +285,6 @@ mod tests {
         ls.windows(2).all(|w| w[0] < w[1])
     }
 
-    /// Spec `scheme-generated-palette`: the grey ramp rises in lightness from
-    /// the dark anchor to the light one on every theme, light ones included,
-    /// and swapping `color0` and `color15` leaves it unchanged. NEGATIVE
-    /// CONTROL: the naive `color0` → `color15` ramp on Aterm Day (whose
-    /// bright white is its darkest ink) does not rise, so the test sees
     /// direction.
     #[test]
     fn grey_ramp_follows_black_to_white() {

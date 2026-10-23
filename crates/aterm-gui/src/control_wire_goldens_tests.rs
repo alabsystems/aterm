@@ -15,7 +15,10 @@
 //! The script writes each row through its production writer ([`scripted`]
 //! names them), so a writer whose bytes move moves these goldens; only the
 //! two rows whose writers no unit test reaches (`fetch`, `hold-advisory`)
-//! are hand-written, and named.
+//! and the update's `handoff` (whose writer starts the log over) are
+//! hand-written, and named. The replies are read from the session log's
+//! view, so a hand-written row is a `row` mark and its ring row
+//! (`SessionTimeline::record_hand_row`).
 //!
 //! NEGATIVE CONTROLS: the script with one payload byte planted fails each
 //! golden.
@@ -68,13 +71,15 @@ pub(crate) fn title(plant: bool) -> &'static str {
 /// rest, recorded as the sweep records it); a person's key
 /// ([`crate::app_input::note_person`]); the manual reset's
 /// [`crate::manual_reset::record`]; [`crate::pty_idem::record_in_doubt`];
-/// the update's [`crate::spawn::mark_handoff_gap`]; the policy cell's
+/// the policy cell's
 /// [`crate::harness_policy_verb::record_policy_move`]; and the fabric's
 /// verbs (a delivery, its `inbox seen`, a post answering it, its landing, a
 /// hold, a topic). HAND-WRITTEN, the two rows whose writers no unit test
 /// reaches (the overlap table names them, `every_named_difference_still_holds`):
 /// `fetch` (the bridge's fetch) and `hold-advisory` (the bridge's lost-link
-/// advisory).
+/// advisory); and the update's `handoff`, whose writer
+/// ([`crate::spawn::mark_handoff_gap`]) starts the session log over, so the
+/// view, which every reader reads, would begin at it.
 pub(crate) fn scripted(plant: bool) -> SessionHandle {
     let store = new_store();
     let h = test_handle(5);
@@ -129,6 +134,11 @@ pub(crate) fn scripted(plant: bool) -> SessionHandle {
             crate::session_status::STATUS_CHANGE,
             crate::session_status::status_event_payload(&failed),
         );
+        // THE SESSION LOG's typed `status` mark, in the same hold, as the
+        // sweep writes it (the view prints the row from it).
+        let at = tl.slog().now();
+        tl.slog_mut()
+            .observe_status(crate::session_status::status_facts(&failed), at);
     }
     let _ = crate::app_input::note_person(&ctx, crate::human_input::Gesture::Other);
     let _ = ctx
@@ -153,15 +163,20 @@ pub(crate) fn scripted(plant: bool) -> SessionHandle {
     let key = crate::pty_idem::parse_key(&format!("{}:3:9", ctx.nonce.to_hex()), ctx.nonce)
         .expect("a key");
     let _ = crate::pty_idem::record_in_doubt(&ctx, "send", key, "ERR busy\n");
-    crate::spawn::mark_handoff_gap(
-        &ctx.timeline,
-        &ctx.cast,
-        &ctx.temporal,
-        Some(7),
-        0,
-        crate::session_log::LogAdopt::default(),
-        false,
-    );
+    // HAND-WRITTEN: the update's row, whose writer
+    // (`spawn::mark_handoff_gap`) starts the session log over, so a
+    // successor's view begins at it; this one session keeps its rows on
+    // either side of it.
+    ctx.timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .record_hand_row(
+            "handoff",
+            crate::session_timeline::HandoffGap {
+                from_build: Some(7),
+            }
+            .payload(),
+        );
     {
         let mut tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         let _ = tl.note_harness_act("approve", "codex-alab", aterm_slog::Actor::Ctl);
@@ -199,7 +214,7 @@ pub(crate) fn scripted(plant: bool) -> SessionHandle {
     {
         let mut tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         // HAND-WRITTEN: the bridge's fetch, which no unit test reaches.
-        tl.record("fetch", "off=40".to_string());
+        tl.record_hand_row("fetch", "off=40".to_string());
     }
     assert_eq!(
         ctx.fabric.topic_add("news", "head", &ctx.timeline),
@@ -209,7 +224,7 @@ pub(crate) fn scripted(plant: bool) -> SessionHandle {
         let mut tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         // HAND-WRITTEN: the bridge's lost-link advisory, which no unit test
         // reaches.
-        tl.record(
+        tl.record_hand_row(
             "hold-advisory",
             "1 reason=bridge-lost origin=fabric".to_string(),
         );

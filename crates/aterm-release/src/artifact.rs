@@ -2,22 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! The release's bundle, built once.
-//!
-//! A release builds its unsigned universal `aterm.app` once, both slices from the snapshot
-//! of the reserved release commit (`buildplan::run`, [`crate::snapshot`]), and keeps it in
-//! the clone's release cache, `<clone>-release.noindex/artifacts/<key>/`.
-//! `verify release --app <app>` judges these bytes, and the cut signs, notarizes and
-//! packages a byte copy of them ([`copy_bundle`]): what was verified is what ships. The
-//! cut never builds.
-//!
-//! Entries are keyed by what the bundle was built as ([`key`]): version, build number,
-//! release commit (which fixes every source byte and, through the lockfile, every vendored
-//! one) and both compilers' commits. A key held complete is never built again.
-//!
-//! [`COMPLETE_FILE`] is written last: a directory without it is an unfinished build,
-//! removed and rebuilt; one with it is re-proved on every read (executable and
-//! [`bundle_digest`] against the record), and changed bytes are refused, never reused or
-//! shipped.
 
 use std::path::{Path, PathBuf};
 
@@ -42,8 +26,7 @@ pub struct Identity {
     pub commit: String,
 }
 
-/// The two compilers a build runs: the native slice's Trust `trustc` and the x86_64
-/// slice's upstream stable `rustc`, each by its `-vV` commit-hash.
+/// The two compilers a build runs: the native slice's Trust `trustc` and the x86_64 slice's upstream stable `rustc`, each by its `-vV` commit-hash.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Compilers {
     pub trustc: String,
@@ -75,16 +58,13 @@ pub struct Complete {
     pub archs: String,
     /// The executable's own `--diagnose` `compiler:` line.
     pub compiler_line: String,
-    /// SHA-256 of `aterm.app/Contents/MacOS/aterm`: what the verified record names, and
-    /// what the cut's copy must still be before it signs.
+    /// SHA-256 of `aterm.app/Contents/MacOS/aterm`: what the verified record names, and what the cut's copy must still be before it signs.
     pub macho_sha256: String,
     /// [`bundle_digest`] of the whole bundle.
     pub bundle_digest: String,
     #[serde(default)]
     pub slices: Vec<SliceRecord>,
-    /// The published index run the bytes compiled in (`buildplan::index_hint_now`), when
-    /// the build found one: a guess its fresh installs' first discovery round follows. Not
-    /// in the [`key`]: a resumed release reuses the bytes whatever the channel did since.
+    /// The published index run the bytes compiled in (`buildplan::index_hint_now`), when the build found one: a guess its fresh installs' first discovery round follows.
     #[serde(default)]
     pub index_hint: Option<String>,
 }
@@ -118,15 +98,13 @@ pub fn app_in(dir: &Path) -> PathBuf {
 }
 
 /// The store: `<clone>-release.noindex/artifacts`.
-///
 /// # Errors
 /// The clone's cache cannot be made or named.
 pub fn store(repo: &Path) -> Result<PathBuf, String> {
     Ok(CacheRoot::for_repo(repo)?.artifacts())
 }
 
-/// The key a bundle of `identity`, built with `compilers`, is kept under: SHA-256 over
-/// [`SCHEMA`] and each input, NUL-separated, lowercase hex.
+/// The key a bundle of `identity`, built with `compilers`, is kept under: SHA-256 over [`SCHEMA`] and each input, NUL-separated, lowercase hex.
 #[must_use]
 pub fn key(identity: &Identity, compilers: &Compilers) -> String {
     let mut h = aterm_digest::Sha256::new();
@@ -145,11 +123,7 @@ pub fn key(identity: &Identity, compilers: &Compilers) -> String {
     aterm_codec::hex::encode_lower(&h.finalize())
 }
 
-/// The digest of a bundle: SHA-256 over [`SCHEMA`] and, for every entry under `app`
-/// sorted by relative path, `path NUL kind NUL mode NUL content-sha256-or-link-target
-/// NUL` — relative paths only, so a byte copy elsewhere digests the same, and every
-/// file, link and mode of the bundle is in it.
-///
+/// The digest of a bundle: SHA-256 over [`SCHEMA`] and, for every entry under `app` sorted by relative path, `path NUL kind NUL mode NUL content-sha256-or-link-target NUL` — relative paths only, so a byte copy elsewhere digests the same, and every file, link and mode of the bundle is in it.
 /// # Errors
 /// An entry that cannot be read.
 pub fn bundle_digest(app: &Path) -> Result<String, String> {
@@ -206,9 +180,7 @@ fn mode_of(_meta: &std::fs::Metadata) -> u32 {
     0
 }
 
-/// SHA-256 of a file, lowercase hex — the one hasher every digest here uses
-/// (`dmg::sha256_file`).
-///
+/// SHA-256 of a file, lowercase hex — the one hasher every digest here uses (`dmg::sha256_file`).
 /// # Errors
 /// The file cannot be read.
 pub fn file_sha256(path: &Path) -> Result<String, String> {
@@ -216,19 +188,15 @@ pub fn file_sha256(path: &Path) -> Result<String, String> {
 }
 
 /// The SHA-256 of `app`'s executable.
-///
 /// # Errors
 /// It cannot be read.
 pub fn macho_sha256(app: &Path) -> Result<String, String> {
     file_sha256(&app.join("Contents/MacOS/aterm"))
 }
 
-/// The complete entry `key` holds in `store`, its bytes re-proved: `Ok(None)` when there
-/// is none (no directory, or a build that did not finish).
-///
+/// The complete entry `key` holds in `store`, its bytes re-proved: `Ok(None)` when there is none (no directory, or a build that did not finish).
 /// # Errors
-/// A record that does not parse or names another key, and bytes that are not the
-/// record's — changed after the build, so never reused and never shipped.
+/// A record that does not parse or names another key, and bytes that are not the record's — changed after the build, so never reused and never shipped.
 pub fn read(store: &Path, key: &str) -> Result<Option<Complete>, String> {
     let dir = store.join(key);
     let record = dir.join(COMPLETE_FILE);
@@ -252,7 +220,6 @@ pub fn read(store: &Path, key: &str) -> Result<Option<Complete>, String> {
 }
 
 /// `app`'s bytes are `complete`'s: the executable's digest and the whole bundle's.
-///
 /// # Errors
 /// Either differs, named, with what it is now.
 pub fn prove(complete: &Complete, app: &Path) -> Result<(), String> {
@@ -281,8 +248,7 @@ pub fn prove(complete: &Complete, app: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// This Mac's physical memory in bytes (`sysctl -n hw.memsize`); `None` when it will not
-/// say.
+/// This Mac's physical memory in bytes (`sysctl -n hw.memsize`); `None` when it will not say.
 pub(crate) fn host_memory_bytes() -> Option<u64> {
     let out = std::process::Command::new("/usr/sbin/sysctl")
         .args(["-n", "hw.memsize"])
@@ -300,9 +266,7 @@ pub(crate) fn host_memory_bytes() -> Option<u64> {
         .filter(|&bytes: &u64| bytes > 0)
 }
 
-/// Whether the two slices may build at once: the newest complete build's recorded slice
-/// peaks, summed, fit in three quarters of `memory`. With no record or no memory figure
-/// they build at once (the 128 GiB publishers always hold both).
+/// Whether the two slices may build at once: the newest complete build's recorded slice peaks, summed, fit in three quarters of `memory`.
 #[must_use]
 pub fn slices_fit(store: &Path, memory: Option<u64>) -> bool {
     let Some(memory) = memory else {
@@ -328,18 +292,7 @@ pub fn slices_fit(store: &Path, memory: Option<u64>) -> bool {
     peaks <= memory / 4 * 3
 }
 
-/// Build the bundle of `identity` (the one build a release makes) unless the store holds
-/// it complete, whose re-proved record is then returned. Before building: the universal
-/// gate (this builder can build the x86_64 slice and run it under Rosetta) and the disk
-/// floor. Then both slices at once (or one after the other where the last build's peaks
-/// would not fit, [`slices_fit`]) into a fresh entry, and [`COMPLETE_FILE`] written last,
-/// durably. Every slice must embed the updater pin the committed paper master fixes
-/// (`publish::expected_embedded_update_pin`).
-///
-/// An entry whose bytes changed after its build is removed and built again: before a claim
-/// nothing rests on it, and after a claim the cut never calls this but refuses such bytes
-/// ([`read`]).
-///
+/// Build the bundle of `identity` (the one build a release makes) unless the store holds it complete, whose re-proved record is then returned.
 /// # Errors
 /// The gate's refusal, the build's, and any write of the entry.
 pub fn build(repo: &Path, identity: &Identity) -> Result<Complete, String> {
@@ -438,7 +391,6 @@ pub fn build(repo: &Path, identity: &Identity) -> Result<Complete, String> {
 }
 
 /// The compilers this machine's build runs now.
-///
 /// # Errors
 /// Either compiler cannot be asked for its commit.
 pub fn compilers() -> Result<Compilers, String> {
@@ -479,10 +431,7 @@ fn write_complete(dir: &Path, complete: &Complete) -> Result<(), String> {
     })
 }
 
-/// A byte copy of the store's bundle at `to` (which must not exist), re-proved against the
-/// record before anything signs it, so the cut signs the bytes `verify release` judged.
-/// Files keep their bytes and modes, links their targets; nothing else is carried.
-///
+/// A byte copy of the store's bundle at `to` (which must not exist), re-proved against the record before anything signs it, so the cut signs the bytes `verify release` judged.
 /// # Errors
 /// A copy that fails, or bytes that differ from the record.
 pub fn copy_bundle(complete: &Complete, from: &Path, to: &Path) -> Result<(), String> {
@@ -496,13 +445,7 @@ pub fn copy_bundle(complete: &Complete, from: &Path, to: &Path) -> Result<(), St
     prove(complete, to)
 }
 
-/// Copy the build's records from the store entry `dir` into `dist` for the cut:
-/// `aterm.dSYM` (the provenance record looks for it), the never-published symbolication
-/// archive `aterm-<v>-dSYM.zip`, and the x86_64 slice's execution record
-/// `aterm-<v>-x86_64-probe.txt`. Each replaces what `dist` held under its name; one the
-/// build did not make (a failed dsymutil skips the dSYM) is removed, so no stale record
-/// rides along.
-///
+/// Copy the build's records from the store entry `dir` into `dist` for the cut: `aterm.dSYM` (the provenance record looks for it), the never-published symbolication archive `aterm-<v>-dSYM.zip`, and the x86_64 slice's execution record `aterm-<v>-x86_64-probe.txt`.
 /// # Errors
 /// A copy or a removal that fails.
 pub fn place_records(dir: &Path, dist: &Path, version: &str) -> Result<(), String> {
@@ -528,7 +471,7 @@ pub fn place_records(dir: &Path, dist: &Path, version: &str) -> Result<(), Strin
 }
 
 /// Remove every entry of `store` but those in `keep`: a release keeps only the bundle it is
-/// building or signing. An entry that cannot be removed is reported and left.
+/// building or signing.
 fn prune(store: &Path, keep: &[&str]) {
     let Ok(entries) = std::fs::read_dir(store) else {
         return;
@@ -628,16 +571,7 @@ fn short(sha: &str) -> &str {
     sha.get(..12).unwrap_or(sha)
 }
 
-/// `targo --unverified ship build`: the one build of a release bundle into the release
-/// cache, or the complete one found there, its bytes re-proved. It builds:
-///
-/// * The `ship release` build step, which runs it as its child: the candidate this
-///   clone's unfinished release journal reserved (`release.toml` [reserved]) — its
-///   build number and release commit;
-/// * with no release in progress (no journal, or a finished one): HEAD's bundle under
-///   a provisional number — `max(HEAD's ledger tail + 1, now)`, claimed nowhere — the
-///   bundle `verify measure --app <app>` judges between releases.
-///
+/// `targo --unverified ship build`: the one build of a release bundle into the release cache, or the complete one found there, its bytes re-proved.
 /// # Errors
 /// A release in progress that has not reserved yet, and [`build`]'s.
 pub fn run_build(repo: &Path) -> Result<(), crate::ledger::Error> {
@@ -688,9 +622,7 @@ pub fn run_build(repo: &Path) -> Result<(), crate::ledger::Error> {
     Ok(())
 }
 
-/// HEAD's bundle under a provisional number, read from HEAD's objects: its workspace
-/// version (`X.Y.0`), and `max(tail + 1, now)` over its own ledger — claimed nowhere.
-///
+/// HEAD's bundle under a provisional number, read from HEAD's objects: its workspace version (`X.Y.0`), and `max(tail + 1, now)` over its own ledger — claimed nowhere.
 /// # Errors
 /// git, a version that is not `X.Y.0`, or a ledger that does not parse.
 pub fn provisional_identity(

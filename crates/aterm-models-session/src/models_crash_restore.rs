@@ -1,69 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CRASH-RESTORE JOURNAL (the crash-restore plan, §2.4, §2.7 and §7.1):
-//! one session's shared-memory region across its writer, the window W that
-//! journals its engine, and the window W' that restores the session after W
-//! dies without a word (a SIGKILL, a jetsam kill, a Force Quit, a crash).
-//!
-//! W writes three things into the region under single-writer commit words:
-//! a KEYFRAME (the engine's checkpoint, two slots written alternately), the
-//! raw engine input since that keyframe (the TAIL, a ring bounded by a floor
-//! word and a commit word) and a history ring. A process that dies loses no
-//! store it already made to shared memory, so the only hazard is a death in
-//! the middle of an update; every protocol publishes the data before the
-//! commit word that admits it. W' maps the region read-only after the keeper
-//! proves W dead, picks the newest valid keyframe, replays the tail past it
-//! into a scratch engine, and adopts the result. A restore that dies (a
-//! poisoned slice in the tail, or a poisoned keyframe) is retried at most
-//! once without the tail and then falls back to the blank META rung: the
-//! keeper's `attempts` counter is the brake.
-//!
-//! Bytes are abstracted to UNITS: one unit is one slice of PTY output, which
-//! the gather thread reads (`Gather`), the parse thread processes (`Slice`;
-//! `SliceClear` is a slice holding an ED3 or RIS) and then appends to the
-//! tail (`Commit`, which moves the floor first when the ring is full: `Cap`
-//! units fit).
+//! Formal model of the crash-restore shared-memory journal.
 
 use aterm_spec::derive::Model;
 
-/// One session's region across its writer W and a restorer, bytes abstracted
-/// to units (`aterm-restore`: `JournalWriter` on W's side, `recover` on W''s).
-///
-/// State. The stream: `g` units gathered, `p` processed by the engine, `t`
-/// committed to the tail; `floor` (units below it may be overwritten).
-/// The keyframe writer: `seq` (the next keyframe's sequence number),
-/// `to_b` (the slot the next keyframe goes to), `writing` (a keyframe copy is
-/// in progress). Each slot `a`/`b`: `ok` (its commit word admits it), `full`
-/// (its bytes are a complete record), `seq`, `at` (the tail position it was
-/// captured at: its `tail_from`), `state` (the units the engine had processed
-/// then) and `gen` (the engine's clear generation then). The history:
-/// `gen` (the engine's clear generation), `ring_gen` (the identity the history
-/// ring was last reset to), `clear_at` (the unit that held the one clear).
-/// The death and the restore: `live`, `poison` (some slice of the tail kills
-/// a restorer that replays it), `kpoison` (the keyframe itself kills any
-/// restorer), `attempts` (the keeper's count of restorers that died),
-/// `full_tries`, `restored`, `r` (the units the restored engine reflects),
-/// `rgen`, `exact`, `imported`, and the evidence flags `torn` (a restore
-/// chose a slot whose bytes were not whole), `wrong` (it replayed tail bytes
-/// that had been overwritten) and `resurrected` (it imported history from
-/// before a clear the restored engine had seen).
-///
-/// Invariants. `NeverAhead`: a restore never reflects output the engine had
-/// not processed. `ExactIsTrue`: a restore that says it is exact reflects
-/// exactly what was gathered. `TornNeverChosen`, `NoWrongReplay`,
-/// `ClearedNeverResurrected`, and `PoisonBounded`: a poisoned region costs at
-/// most one full try.
-///
-/// `Buggy`, one defect each: 1 the commit word stored before the copy ·
-/// 2 no floor before an overwrite · 3 `exact` ignores the gather counter ·
-/// 4 the history join without the identity check · 5 no attempts brake ·
-/// 6 a keyframe that does not rebase the tail (its `tail_from` is the other
-/// slot's).
-///
-/// Tier-0 is `tests/derived_crash_restore.rs`; Tier-1
-/// (`aterm-restore/src/conformance_region.rs`) drives the real writer over a
-/// store that dies at every primitive store and runs the real `recover`.
+/// Returns the crash-restore shared-memory journal model.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn crash_restore_journal_model() -> Model {

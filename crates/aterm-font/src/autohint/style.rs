@@ -22,18 +22,9 @@ use crate::Tag;
 pub struct GlyphStyle(pub(super) u16);
 
 impl GlyphStyle {
-    // The following flags roughly correspond to those defined in FreeType
-    // here: https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afglobal.h#L76
-    // but with different values because we intend to store "meta style"
-    // information differently.
     const STYLE_INDEX_MASK: u16 = 0xFF;
     const UNASSIGNED: u16 = Self::STYLE_INDEX_MASK;
-    // A non-base character, perhaps more commonly referred to as a "mark"
     const NON_BASE: u16 = 0x100;
-    // (skrifa's DIGIT bit, 0x200, marked the ASCII digits for the fitted
-    // advance of monospaced digits; aterm keeps advances linear.)
-    // Used as intermediate state to mark when a glyph appears as GSUB output
-    // for a given script
     const FROM_GSUB_OUTPUT: u16 = 0x8000;
 
     /// Returns true if this glyph doesn't have an assigned style.
@@ -62,14 +53,6 @@ impl GlyphStyle {
     }
 
     fn maybe_assign(&mut self, other: Self) {
-        // FreeType walks the style array in order so earlier styles
-        // have precedence. Since we walk the cmap and binary search
-        // on the full range mapping, our styles are mapped in a
-        // different order. This check allows us to replace a currently
-        // mapped style if the new style index is lower which matches
-        // FreeType's behavior.
-        //
-        // Note that we keep the extra bits because FreeType allows
         // setting the NON_BASE bit to an already mapped style.
         if other.0 & Self::STYLE_INDEX_MASK <= self.0 & Self::STYLE_INDEX_MASK {
             self.0 = (self.0 & !Self::STYLE_INDEX_MASK) | other.0;
@@ -84,12 +67,7 @@ impl GlyphStyle {
         self.0 &= !Self::FROM_GSUB_OUTPUT;
     }
 
-    /// Assign a style if we've been marked as GSUB output _and_ the
-    /// we don't currently have an assigned style.
-    ///
-    /// This also clears the GSUB output bit.
-    ///
-    /// Returns `true` if this style was applied.
+    /// Assign a style if we've been marked as GSUB output _and_ the we don't currently have.
     pub(super) fn maybe_assign_gsub_output_style(&mut self, style: &StyleClass) -> bool {
         let style_ix = style.index as u16;
         if self.0 & Self::FROM_GSUB_OUTPUT != 0 && self.is_unassigned() {
@@ -112,34 +90,21 @@ impl Default for GlyphStyle {
 const UNMAPPED_STYLE: u8 = 0xFF;
 
 /// Maps glyph identifiers to glyph styles.
-///
-/// Also keeps track of the styles that are actually used so we can allocate
-/// an appropriately sized metrics array.
 #[derive(Debug)]
 pub(crate) struct GlyphStyleMap {
     /// List of styles, indexed by glyph id.
     styles: Vec<GlyphStyle>,
     /// Maps an actual style class index into a compacted index for the
     /// metrics table.
-    ///
-    /// Uses `0xFF` to signify unused styles.
     metrics_map: [u8; MAX_STYLES],
     /// Number of metrics styles in use.
     metrics_count: u8,
 }
 
 impl GlyphStyleMap {
-    /// Computes a new glyph style map for the given glyph count and character
-    /// map.
-    ///
-    /// Roughly based on <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afglobal.c#L126>
-    ///
-    /// A face whose `GSUB` walk runs past its budget gets the styles it
-    /// would without the table: none of what the walk reached before the
-    /// cut.
+    /// Computes a new glyph style map for the given glyph count and character map.
     pub fn new(glyph_count: u32, shaper: &Shaper) -> Self {
         let lookup_count = shaper.lookup_count() as usize;
-        // One bit per lookup: the lookups already visited.
         let mut bytes = vec![0u8; lookup_count.div_ceil(8)];
         let map = Self::new_inner(glyph_count, shaper, VisitedLookupSet::new(&mut bytes));
         if !shaper.refused() {
@@ -158,8 +123,6 @@ impl GlyphStyleMap {
             metrics_map: [UNMAPPED_STYLE; MAX_STYLES],
             metrics_count: 0,
         };
-        // Step 1: compute styles for glyphs covered by OpenType features
-        // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afglobal.c#L233>
         for style in super::style::STYLE_CLASSES {
             if style.feature.is_some()
                 && shaper.compute_coverage(
@@ -172,16 +135,11 @@ impl GlyphStyleMap {
                 map.use_style(style.index);
             }
         }
-        // Step 2: compute styles for glyphs contained in the cmap
-        // cmap entries are sorted so we keep track of the most recent range to
-        // avoid a binary search per character
         let mut last_range: Option<(usize, StyleRange)> = None;
         for (ch, gid) in shaper.charmap().mappings() {
             let Some(style) = map.styles.get_mut(gid.to_u32() as usize) else {
                 continue;
             };
-            // Charmaps enumerate in order so we're likely to encounter at least
-            // a few codepoints in the same range.
             if let Some(last) = last_range {
                 if last.1.contains(ch) {
                     style.maybe_assign(last.1.style);
@@ -203,8 +161,6 @@ impl GlyphStyleMap {
                 last_range = Some((ix, range));
             }
         }
-        // Step 3a: compute script based coverage
-        // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afglobal.c#L239>
         for style in super::style::STYLE_CLASSES {
             if style.feature.is_none()
                 && shaper.compute_coverage(
@@ -217,9 +173,6 @@ impl GlyphStyleMap {
                 map.use_style(style.index);
             }
         }
-        // Step 3b: compute coverage for "default" script which is always set
-        // to Latin in FreeType
-        // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afglobal.c#L248>
         let default_style = &STYLE_CLASSES[StyleClass::LATN];
         if shaper.compute_coverage(
             default_style,
@@ -229,10 +182,6 @@ impl GlyphStyleMap {
         ) {
             map.use_style(default_style.index);
         }
-        // Step 4: Assign a default to all remaining glyphs
-        // For some reason, FreeType uses Hani as a default fallback style so
-        // let's do the same.
-        // <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afglobal.h#L69>
         let mut need_hani = false;
         for style in map.styles.iter_mut() {
             if style.is_unassigned() {
@@ -270,8 +219,6 @@ impl GlyphStyleMap {
     fn use_style(&mut self, style_ix: usize) {
         let mapped = &mut self.metrics_map[style_ix];
         if *mapped == UNMAPPED_STYLE {
-            // This the first time we've seen this style so record
-            // it in the metrics map
             *mapped = self.metrics_count;
             self.metrics_count += 1;
         }
@@ -288,25 +235,21 @@ impl Default for GlyphStyleMap {
     }
 }
 
-/// Determines which algorithms the autohinter will use while generating
-/// metrics and processing a glyph outline.
+/// Determines which algorithms the autohinter will use while generating metrics and processing.
 #[derive(Copy, Clone, PartialEq, Eq, Default, Debug)]
 pub enum ScriptGroup {
     /// All scripts that are not CJK or Indic.
-    ///
-    /// FreeType calls this Latin.
     #[default]
     Default,
     Cjk,
     Indic,
 }
 
-/// Defines the basic properties for each script supported by the
-/// autohinter.
+/// Defines the basic properties for each script supported by the autohinter.
 #[derive(Clone, Debug)]
 pub struct ScriptClass {
     /// The name of the script class.
-    #[allow(dead_code)] // the generated table's label, read by Debug
+    #[allow(dead_code)]
     pub name: &'static str,
     /// Group that defines how glyphs belonging to this script are hinted.
     pub group: ScriptGroup,
@@ -320,23 +263,17 @@ pub struct ScriptClass {
     pub blues: &'static [(&'static str, BlueZones)],
 }
 
-/// Defines the basic properties for each style supported by the
-/// autohinter.
-///
-/// There's mostly a 1:1 correspondence between styles and scripts except
-/// in the cases where style coverage is determined by OpenType feature
-/// coverage.
+/// Defines the basic properties for each style supported by the autohinter.
 #[derive(Clone, Debug)]
 pub struct StyleClass {
     /// The name of the style class.
-    #[allow(dead_code)] // the generated table's label, read by Debug
+    #[allow(dead_code)]
     pub name: &'static str,
     /// Index of self in the STYLE_CLASSES array.
     pub index: usize,
     /// Associated Unicode script.
     pub script: &'static ScriptClass,
-    /// OpenType feature tag for styles that derive coverage from layout
-    /// tables.
+    /// OpenType feature tag for styles that derive coverage from layout tables.
     #[allow(unused)]
     pub feature: Option<Tag>,
 }
@@ -361,7 +298,6 @@ impl StyleRange {
     }
 }
 
-// The following are helpers for generated code.
 const fn base_range(first: u32, last: u32, style_index: u16) -> StyleRange {
     StyleRange {
         first,

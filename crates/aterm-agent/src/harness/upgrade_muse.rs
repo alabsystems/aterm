@@ -27,6 +27,7 @@ enum Arity {
     /// A switch.
     None,
     /// Exactly one value: the next token whatever it looks like, or attached
+    /// (`--model=x`).
     One,
 }
 
@@ -42,6 +43,7 @@ enum Fate {
 }
 
 /// Muse Code's root options (`muse --help`, 1.4.10-R6427.1), each with its
+/// fate on a relaunch.
 const FLAGS: &[(&str, Arity, Fate)] = &[
     ("--agents", Arity::One, Fate::Keep),
     ("--approval-judge", Arity::One, Fate::Drop),
@@ -83,6 +85,7 @@ const FLAGS: &[(&str, Arity, Fate)] = &[
 ];
 
 /// `resume`'s own option: the most recent session in the workspace, never
+/// typed (the witness names the session).
 const RESUME_LAST: &str = "--last";
 
 fn flag(name: &str) -> Option<(Arity, Fate)> {
@@ -92,7 +95,7 @@ fn flag(name: &str) -> Option<(Arity, Fate)> {
         .map(|(_, a, f)| (*a, *f))
 }
 
-/// Muse Code's subcommands (`muse --help`, 1.4.10, and clap's `help`). Only
+/// Muse Code's subcommands (`muse --help`, 1.4.10, and clap's `help`).
 const SUBCOMMANDS: &[&str] = &[
     "resume",
     "exec",
@@ -121,6 +124,8 @@ fn maybe_option(tok: &str) -> bool {
 }
 
 /// An option token's name and whether its value is attached
+/// (`--model=x`): a short option is never written attached here (`-cX` is
+/// no form [`FLAGS`] knows, so it refuses as unknown).
 fn option_name(tok: &str) -> (&str, bool) {
     match tok.split_once('=') {
         Some((name, _)) if name.starts_with("--") => (name, true),
@@ -129,6 +134,7 @@ fn option_name(tok: &str) -> (&str, bool) {
 }
 
 /// One launch's argv, read: the root options it carries (verbatim, in
+/// order) and what it asked of `resume`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Read {
     /// The kept options, each with its value.
@@ -194,6 +200,8 @@ fn read(argv: &[String]) -> Result<Read, ArgvRefusal> {
 }
 
 /// The root options that say HOW A MUSE CODE RUN REACHES ITS PROVIDER: its
+/// provider, its preset, its base URL and its per-run settings, each carried
+/// by a relaunch ([`FLAGS`]).
 const PROVIDER_FLAGS: &[&str] = &["--provider", "--preset", "--base-url", "-c", "--config"];
 
 /// Extract the root provider options (`--provider`, `--preset`, `--base-url`, `-c`, `--config`) from `argv`.
@@ -251,6 +259,7 @@ fn is_one_shot_flag(name: &str) -> bool {
 }
 
 /// A one-shot flag or a subcommand other than `resume` anywhere before `--`,
+/// read without the flag table (an unknown flag may or may not take a value).
 fn one_shot_or_tool(argv: &[String]) -> bool {
     argv.iter()
         .skip(1)
@@ -342,6 +351,8 @@ pub fn exit_kind(status: i64) -> ExitKind {
 }
 
 /// One session log line's top-level `payload_type` and the line, parsed —
+/// only a line that names one of `kinds` at all, so the records between
+/// (most of a long log) cost a substring scan and no parse.
 fn record_of(line: &str, kinds: &[&str]) -> Option<(String, Value)> {
     if !kinds.iter().any(|k| line.contains(k)) {
         return None;

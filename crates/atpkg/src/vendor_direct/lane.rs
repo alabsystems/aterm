@@ -195,6 +195,7 @@ pub(crate) enum Revoked {
 
 impl Revoked {
     /// What the signed policy says of ALab-built `program`'s `build`, or `None` when it
+    /// revokes nothing of it.
     fn of(policy: &Policy, program: &str, build: u64) -> Option<Self> {
         if policy.is_legacy_yanked(program, build) {
             Some(Self::Yanked)
@@ -839,6 +840,7 @@ pub(crate) fn plan_one_with(
 }
 
 /// The checks between a verified candidate and its download: the signed `buildDate`
+/// (known only now), the first-seen digest log, the stage-refusal memo and admission.
 fn admit_candidate(lane: &Lane<'_>, pending: Pending, inputs: &super::decide::Inputs<'_>) -> Step {
     let spec = pending.spec;
     let c = &pending.candidate;
@@ -1118,6 +1120,8 @@ fn land(
 }
 
 /// After a failed move off a yanked build: the retained admissible build when there is
+/// one; a tombstone only when the head was proven inadmissible (`head_refused`) — never
+/// while an admissible build may exist.
 fn yank_fallback(
     lane: &Lane<'_>,
     inputs: &super::decide::Inputs<'_>,
@@ -1153,6 +1157,7 @@ fn yank_fallback(
 }
 
 /// Re-activate the retained vendor build `to` (`previous`) off the yanked active one,
+/// shimming the table's exposes only.
 fn roll_back(
     lane: &Lane<'_>,
     program: &str,
@@ -1185,6 +1190,9 @@ fn roll_back(
 }
 
 /// The verdict for an active ALab `build` the source rule keeps ([`crate::alab`]): kept
+/// while the signed policy revokes nothing of it — its shims laid back first when a
+/// tombstone or a lost shim hid it — else rolled back onto the newest retained ALab build
+/// below it that nothing revokes, else tombstoned.
 fn keep_alab(lane: &Lane<'_>, spec: &'static VendorSpec, build: u64) -> Verdict {
     let (layout, program) = (lane.layout, spec.program);
     let what = crate::alab::build_words(layout, program, build);
@@ -1221,6 +1229,7 @@ fn keep_alab(lane: &Lane<'_>, spec: &'static VendorSpec, build: u64) -> Verdict 
 }
 
 /// The verdict for a head that was not read: refused for what it said, else unreachable,
+/// with what the host answered instead when it answered.
 fn unread_head(head: &Head, keeping: Installed) -> Verdict {
     match head {
         Head::Refused(why) => Verdict::Refused {
@@ -1237,6 +1246,7 @@ fn unread_head(head: &Head, keeping: Installed) -> Verdict {
 }
 
 /// Record the lane's verdict on the program's stamp: a signed-yank move lowers the
+/// high-water to where it landed; every other verdict only ever raises it.
 fn finish(lane: &Lane<'_>, outcome: Outcome) -> Outcome {
     let line = outcome.line();
     let verdict = line.strip_prefix("atpkg: ").unwrap_or(&line);
@@ -1263,6 +1273,8 @@ fn finish(lane: &Lane<'_>, outcome: Outcome) -> Outcome {
 }
 
 /// The active build as [`decide`] reads it: a complete vendor build with its record, a
+/// complete legacy index build, or nothing (an incomplete build is re-staged, never
+/// called current).
 fn installed_of(layout: &Layout, program: &str, active: Option<u64>) -> Installed {
     let Some(build) = active else {
         return Installed::Nothing;
@@ -1284,6 +1296,7 @@ fn installed_of(layout: &Layout, program: &str, active: Option<u64>) -> Installe
 }
 
 /// The newest retained vendor build below the active vendor build that a rollback lands on
+/// under `policy` ([`rollback_lands_on`]) — the only rollback target a yank may move to.
 fn previous_of(
     layout: &Layout,
     policy: &Policy,
@@ -1299,6 +1312,7 @@ fn previous_of(
 }
 
 /// The retained complete vendor builds of `program` below store build `below`, newest
+/// first.
 fn retained_below(layout: &Layout, program: &str, below: u64) -> Vec<InstalledView> {
     let mut views: Vec<InstalledView> = crate::ops::list_installed(layout)
         .into_iter()
@@ -1312,6 +1326,8 @@ fn retained_below(layout: &Layout, program: &str, below: u64) -> Vec<InstalledVi
 }
 
 /// The retained complete legacy index builds of `program` below store build `below`,
+/// newest first: the build a first vendor install replaced, which gc keeps as the one
+/// below live.
 fn retained_legacy_below(layout: &Layout, program: &str, below: u64) -> Vec<u64> {
     let mut builds: Vec<u64> = crate::ops::list_installed(layout)
         .into_iter()
@@ -1432,6 +1448,7 @@ pub(crate) fn roll_back_by_hand(
 }
 
 /// A legacy index build's version, and the tree root for this lane's triple when it names
+/// one, from its signed manifest under the caller's verified index; `None` without one.
 fn legacy_facts(lane: &Lane<'_>, program: &str, build: u64) -> Option<(Version, Option<String>)> {
     let index = lane.legacy_index?;
     let repo = index
@@ -1445,6 +1462,7 @@ fn legacy_facts(lane: &Lane<'_>, program: &str, build: u64) -> Option<(Version, 
 }
 
 /// Keep what legacy index build `build`'s signed manifest says in the program's stamp: its
+/// version, and its signed root when it names one.
 fn keep_legacy_facts(
     layout: &Layout,
     program: &str,
@@ -1655,6 +1673,7 @@ pub(crate) mod world {
     pub(crate) const CODEX_DL: &str = "https://github.com/openai/codex/releases/download/";
 
     /// The triple the tests resolve for: the real host's OS and architecture, so
+    /// the CLI's native selection and the fixture's signed artifacts agree.
     pub(crate) fn triple() -> &'static str {
         match (cfg!(target_os = "macos"), cfg!(target_arch = "aarch64")) {
             (true, true) => "aarch64-apple-darwin",
@@ -1675,6 +1694,7 @@ pub(crate) mod world {
     }
 
     /// `bin/<name>` as this host's shim runs it: `bin/<name>.exe` on Windows, where a
+    /// payload lands under the executable spelling (`ToolName::exe_file`).
     pub(crate) fn bin(name: &str) -> String {
         format!("bin/{name}{}", crate::platform::EXE_SUFFIX)
     }
@@ -1765,6 +1785,8 @@ pub(crate) mod world {
     type SignedDoc = (Vec<u8>, Vec<u8>);
 
     /// One of [`Fake`]'s fields: a lock, since a pass works its fetcher from several threads
+    /// at once ([`Fetcher::shared`]), with `RefCell`'s and `Cell`'s calls so the tests read
+    /// it like either.
     #[derive(Default)]
     pub(crate) struct Shared<T>(std::sync::RwLock<T>);
 
@@ -1808,6 +1830,7 @@ pub(crate) mod world {
         /// A signed index (bytes, signature) the index lane may resolve.
         pub index: Shared<Option<(Vec<u8>, Vec<u8>)>>,
         /// With no index published, its host answers with a refusal (a 403) rather than not
+        /// at all: a rate-limited or revoked-token machine, never an offline one.
         pub index_refused: Shared<bool>,
         /// How many times the index was asked for.
         pub index_reads: Shared<u32>,
@@ -1856,6 +1879,7 @@ pub(crate) mod world {
         }
 
         /// Publish the signed pkg manifest of `program`'s legacy index build `build`,
+        /// naming vendor `version`.
         pub(crate) fn publish_legacy_pkg(&self, program: &str, build: u64, version: &str) {
             let body = format!(
                 "schema = 2\nprogram = \"{program}\"\nversion = \"{version}\"\n\
@@ -1869,6 +1893,8 @@ pub(crate) mod world {
         }
 
         /// [`Fake::publish_legacy_pkg`] with an artifact for this triple, as a legacy index
+        /// build shipped one — what an index lane could fetch if it ever planned a vendor
+        /// program (its `download` panics, so a test sees the attempt).
         #[cfg(unix)]
         pub(crate) fn publish_legacy_pkg_with_artifact(
             &self,
@@ -1894,6 +1920,7 @@ pub(crate) mod world {
         }
 
         /// [`Fake::publish_legacy_pkg`], its one artifact for `target` carrying the signed
+        /// `tree_root` `root` — what the lane keeps for a rollback to that build.
         pub(crate) fn publish_legacy_pkg_rooted(
             &self,
             program: &str,
@@ -1906,6 +1933,8 @@ pub(crate) mod world {
         }
 
         /// Publish the signed pkg manifest of index program `program` at `build`, its one
+        /// artifact for `target` carrying the signed `tree_root` `root` — what an index
+        /// pass's root recovery reads.
         #[cfg(unix)]
         pub(crate) fn publish_pkg_root(&self, program: &str, build: u64, target: &str, root: &str) {
             self.publish_pkg_kind(program, build, target, root, "binary");
@@ -1925,6 +1954,7 @@ pub(crate) mod world {
         }
 
         /// The signed pkg manifest of `program` at `build`, naming `version`, its one
+        /// artifact of `kind` for `target` carrying the signed `tree_root` `root`.
         fn publish_pkg_with(
             &self,
             program: &str,
@@ -1960,6 +1990,7 @@ pub(crate) mod world {
         }
 
         /// Publish claude `version` as Anthropic's latest: the head, a manifest signed by
+        /// the test key naming `payload`'s digest and size, and the payload.
         pub(crate) fn publish_claude(&self, version: &str, payload: &[u8]) {
             self.publish_claude_dated(version, payload, "2026-09-21T20:55:27Z");
         }
@@ -2000,6 +2031,7 @@ pub(crate) mod world {
         }
 
         /// Publish codex `version`: a tarball of `files` (`(path, bytes, mode)`), its
+        /// `SHA256SUMS` on GitHub and the release JSON (the head) agreeing on its digest.
         pub(crate) fn publish_codex(&self, version: &str, files: &[(&str, &[u8], u32)]) {
             let tarball = tarball(files);
             let digest = sha(&tarball);
@@ -2023,6 +2055,7 @@ pub(crate) mod world {
         }
 
         /// The codex tree a genuine package lays: the entry, a helper, and data — one
+        /// executable-mode data file among it, as 0.156.0 ships.
         pub(crate) fn publish_codex_default(&self, version: &str) {
             let codex = native_exe(&format!("codex {version}"));
             let helper = native_exe("rg");
@@ -2198,6 +2231,8 @@ pub(crate) mod world {
     }
 
     /// A signed index (bytes, machine signature) valid until `valid_until`, naming `ay` (an
+    /// ALab program with no published build), `claude` and `codex`, its stable channel
+    /// pinning all three with `yanked` as given.
     pub(crate) fn signed_index(
         index_build: u64,
         valid_until: &str,
@@ -2435,6 +2470,7 @@ mod tests {
     }
 
     /// Publish agy `version` holding `exe`: the Run manifest and the bucket's copy agreeing
+    /// on the tarball's sha512.
     fn publish_agy(f: &Fake, version: &str, exe: &[u8]) -> String {
         let tarball = world::tarball(&[("antigravity", exe, 0o755)]);
         let (_, dir, file) = resolve::agy_platform(world::triple()).unwrap();
@@ -2453,6 +2489,7 @@ mod tests {
     }
 
     /// Publish muse `version` as `exe` on Meta's channel, the release manifest at the
+    /// client-built URL naming its sha256 and size.
     fn publish_muse(f: &Fake, version: &str, exe: &[u8]) {
         let Some((key, file)) = resolve::muse_platform(world::triple()) else {
             aterm_uds::host::could_not_run(format!(
@@ -2480,6 +2517,8 @@ mod tests {
     }
 
     /// agy end to end: the Run manifest and the bucket's copy agree, so the gzip tar's one
+    /// file lands at `bin/agy` under the sha512 they name (recorded under its own key), and
+    /// every shim exports the value that turns agy's own updater off.
     #[test]
     fn a_fresh_agy_lands_its_one_file_under_the_sha512_both_google_hosts_name() {
         let l = world::layout("fresh-agy");
@@ -2515,6 +2554,7 @@ mod tests {
     }
 
     /// Where muse is served, the channel names a revision-form version, the release manifest
+    /// at the client-built URL its sha256 and size, and the raw binary lands at `bin/muse`.
     #[test]
     fn muse_lands_where_it_is_served_and_is_unavailable_elsewhere() {
         let elsewhere = "x86_64-unknown-linux-gnu";
@@ -2592,6 +2632,8 @@ mod tests {
     }
 
     /// Every refusal before the payload — a bad signature, a document redirected off its
+    /// host, a codex SHA256SUMS that disagrees with the release JSON, a malformed tag —
+    /// stages nothing, shims nothing, and never downloads, this pass or the next.
     #[test]
     fn a_refused_document_stages_nothing_and_downloads_nothing() {
         type Publish = Box<dyn Fn(&Fake)>;
@@ -2693,7 +2735,7 @@ mod tests {
         }
     }
 
-    /// A payload that does not match its authenticated digest is refused at stage. The
+    /// A payload that does not match its authenticated digest is refused at stage.
     #[test]
     fn a_digest_mismatch_is_refused_memoized_and_never_downloaded_again() {
         let l = world::layout("digest");
@@ -2731,6 +2773,8 @@ mod tests {
     }
 
     /// A digest mismatch may be this machine's own transfer — a `.part` resumed over a
+    /// torn tail — so it is never remembered as the vendor's: the next pass that fetches
+    /// the signed bytes lands them.
     #[test]
     fn a_digest_mismatch_heals_when_the_bytes_do() {
         let l = world::layout("digest-heal");
@@ -2750,6 +2794,8 @@ mod tests {
     }
 
     /// A host that answers without the document — a 404 while the vendor is still
+    /// publishing, a 403, a TLS refusal — judged nothing: kept at quietly, never counted,
+    /// and never the proof that disables a yanked build.
     #[test]
     fn a_document_the_host_does_not_serve_is_no_verdict() {
         let l = world::layout("unserved");
@@ -2793,6 +2839,7 @@ mod tests {
     }
 
     /// A first-seen digest log that cannot be read is not an empty one: nothing is
+    /// fetched, and the log is left as it is.
     #[test]
     fn an_unreadable_digest_log_fetches_nothing() {
         let l = world::layout("digest-log");
@@ -2810,6 +2857,7 @@ mod tests {
     }
 
     /// A signed-yank rollback lays the table's exposes only — never a shim for another
+    /// executable the retained build's `bin/` happens to hold.
     #[cfg(unix)]
     #[test]
     fn a_rollback_shims_the_tables_exposes_only() {
@@ -2867,6 +2915,8 @@ mod tests {
     }
 
     /// A codesign timeout is `Verdict::Deferred`, not a failure: the installed build is kept,
+    /// nothing is memoized, the verified archive is carried, and the next pass lands it with
+    /// no download.
     #[test]
     fn a_signature_check_that_did_not_finish_defers_and_the_next_pass_lands_it() {
         let l = world::layout("deferred");
@@ -2936,6 +2986,7 @@ mod tests {
     }
 
     /// A yanked installed version is the one sanctioned move — to an admissible head,
+    /// else back to the retained build — and the high-water follows the signed move.
     #[test]
     fn a_yanked_installed_version_moves_to_the_head_or_rolls_back() {
         let l = world::layout("yank-installed");
@@ -3007,6 +3058,7 @@ mod tests {
     }
 
     /// The genuine codex shape: an executable-mode data file is demoted before the gate,
+    /// the record's root is the root of the tree as it stands, and the entry keeps its bits.
     #[cfg(unix)]
     #[test]
     fn a_codex_tree_is_demoted_gated_and_recorded_as_it_stands() {
@@ -3042,6 +3094,7 @@ mod tests {
     }
 
     /// An interpreter script in a vendor tree never runs: the darwin gate refuses the
+    /// tree; elsewhere it lands without its execute bits.
     #[cfg(unix)]
     #[test]
     fn a_script_in_a_codex_tree_is_refused_or_demoted() {
@@ -3072,6 +3125,11 @@ mod tests {
     }
 
     /// CODEX-OLD LANDS OPENAI'S BUILD UNDER ITS OWN NAME, end to
+    /// end on a scratch store: OpenAI's own package, read from OpenAI's head under codex's
+    /// pins, lands in `codex-old`'s own store with its entry cloned to `bin/codex-old` — a
+    /// regular file holding exactly OpenAI's `bin/codex` bytes at its mode, beside the
+    /// vendor's entry left as it shipped — and the `bin/` shim and the `agents/` twin run that
+    /// clone.
     #[test]
     fn codex_old_lands_openais_build_under_its_own_name() {
         let l = world::layout("codex-old");
@@ -3142,6 +3200,8 @@ mod tests {
     }
 
     /// THE GATE JUDGES THE CLONE AS A MACH-O OF ITS OWN: a codesign verdict refusing
+    /// `bin/codex-old` alone refuses the landing — nothing swapped in, nothing shimmed —
+    /// though OpenAI's own entry passes.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_gate_judges_codex_olds_clone_as_a_mach_o_of_its_own() {
@@ -3183,6 +3243,8 @@ mod tests {
     }
 
     /// A PACKAGE WITH NO ENTRY TO CLONE lands nothing: OpenAI's tree without `bin/codex`
+    /// fails `codex-old`'s landing before the swap, its shim never laid — never a shim
+    /// running a file that is not there, on any platform.
     #[test]
     fn a_codex_package_without_its_entry_lands_no_codex_old() {
         let f = Fake::default();
@@ -3201,6 +3263,7 @@ mod tests {
     }
 
     /// Staging names carry the version, so a `.part` left by another version is never
+    /// resumed as this one's — it is swept, and the bytes landed are the signed ones.
     #[test]
     fn a_stale_part_of_another_version_is_not_resumed() {
         let l = world::layout("part");
@@ -3226,6 +3289,9 @@ mod tests {
     }
 
     /// A legacy index build whose version cannot be read (no index verifies) is replaced by
+    /// the vendor's verified head on the unattended lane, never kept waiting on the index:
+    /// the floor is at or above every legacy pin, so it is no downgrade, and a head below the
+    /// floor is still refused.
     #[test]
     fn a_legacy_index_build_is_replaced_with_no_index_and_no_line_names_a_vendor_id() {
         let l = world::layout("legacy");
@@ -3266,6 +3332,8 @@ mod tests {
     }
 
     /// A legacy build's version, read once under a verified index, is kept: the next pass
+    /// needs no index to know the build is at the head, and none to move off it when the
+    /// head moves.
     #[test]
     fn a_read_legacy_version_is_kept_and_no_later_pass_needs_the_index() {
         let l = world::layout("legacy-kept");
@@ -3321,6 +3389,8 @@ mod tests {
     }
 
     /// A legacy root nothing holds (an older client's first vendor install or stamp rewrite
+    /// dropped it) is read from the build's signed manifest by the next pass holding a
+    /// verified index, and kept; no later pass asks again, and none asks with no index.
     #[test]
     fn a_legacy_root_nothing_holds_is_read_from_its_signed_manifest_once() {
         let l = world::layout("legacy-root-owed");
@@ -3388,6 +3458,8 @@ mod tests {
     }
 
     /// An unread legacy build above the ceiling is kept by the unattended lane with a line
+    /// that says why, until its version is read (then judged like any other) or a person
+    /// asks.
     #[test]
     fn an_unread_legacy_build_above_the_ceiling_waits_for_its_version_or_a_person() {
         let above = claude().legacy_ceiling + 1;
@@ -3459,6 +3531,9 @@ mod tests {
     }
 
     /// An index that no longer names the program still vouches for its legacy builds: the
+    /// roster signs the manifest and the index repo holds it, so a legacy build above the
+    /// ceiling is read and moves to the head, never kept unread for want of a
+    /// `[programs.claude]` block.
     #[test]
     fn a_legacy_build_is_read_under_an_index_that_no_longer_names_its_program() {
         let above = claude().legacy_ceiling + 1;
@@ -3513,6 +3588,8 @@ mod tests {
     }
 
     /// The head is a hint read in one short attempt (the fetcher's `vendor_head`); the
+    /// documents behind it — and the head asked again after a 304 whose document the lane
+    /// needs — are read patiently (`vendor_get`).
     #[test]
     fn the_head_is_read_short_and_the_documents_patiently() {
         let l = world::layout("head-bounds");
@@ -3553,6 +3630,8 @@ mod tests {
     }
 
     /// A program uninstalled after this machine ran a newer build installs the vendor's
+    /// latest when the vendor pulls that build back: with nothing installed the high-water
+    /// does not bind — the floor alone does.
     #[test]
     fn a_fresh_install_is_bounded_by_the_floor_not_the_high_water() {
         let l = world::layout("fresh-hw");
@@ -3574,6 +3653,7 @@ mod tests {
     }
 
     /// A 304 whose last head the machine never landed (a download failed last pass) asks
+    /// again unconditionally and lands it.
     #[test]
     fn an_unchanged_head_that_never_landed_is_fetched_again() {
         let l = world::layout("retry");
@@ -3598,6 +3678,9 @@ mod tests {
     }
 
     /// A vendor re-cutting a published version is a supply-chain signal, never an update:
+    /// the first authenticated digest seen for a version binds it — logged before a byte
+    /// moves wherever the documents alone vouch for it, so a download that failed still
+    /// binds it.
     #[test]
     fn a_same_version_digest_change_is_refused() {
         for (spec, version) in [
@@ -3635,6 +3718,8 @@ mod tests {
     }
 
     /// muse's digest comes from the host that serves its bytes, so only the Developer ID
+    /// team pin vouches for it: bytes the pin refuses log nothing, and Meta's genuine build
+    /// of that version lands after them.
     #[test]
     fn a_muse_digest_is_logged_only_once_the_team_pin_passed_its_bytes() {
         let l = world::layout("muse-pin");

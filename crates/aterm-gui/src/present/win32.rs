@@ -1,58 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Windows CPU presenter: GDI. The frame is a top-down 32-bit DIB section
-//! whose words are aterm's `0x00RRGGBB` as they are stored, selected into a
-//! memory DC, and a present `BitBlt`s it to the window. It replaces softbuffer
-//! 0.4.8's Win32 backend (docs/AUDIT-third-party-2026-10-15.md,
-//! linux-windowing LW.3) and keeps its protocol, so the window shows what it
-//! showed:
-//!
-//! - one buffer, a DIB section (`BI_BITFIELDS`, masks `0x00FF0000`,
-//!   `0x0000FF00`, `0x000000FF`) in a DC compatible with the window's;
-//! - a present `BitBlt`s (`SRCCOPY`) each damaged rectangle to the same place
-//!   on the window, then validates the whole client area (`ValidateRect`), so
-//!   Windows sends no `WM_PAINT` for what was drawn;
-//! - the buffer's age is 1 once it was presented and 0 when new; a resize to
-//!   the size it has keeps it.
-//!
-//! Where it differs, on purpose:
-//!
-//! - A failure is an error, never a panic: GDI refusing a DC or a bitmap
-//!   (softbuffer asserted), an acquire before the first resize (softbuffer
-//!   panicked), a damage rectangle past GDI's coordinates (refused before
-//!   anything is drawn; softbuffer had drawn the rectangles before it), and a
-//!   `BitBlt` that fails (softbuffer ignored it; here the commit fails and the
-//!   next present copies in full).
-//! - A present ends with `GdiFlush`, so no batched `BitBlt` still reads the
-//!   section when aterm paints the next frame into it, and a batched copy
-//!   that failed fails the commit; softbuffer did not flush.
-//! - A present also copies what Windows asks to be repainted (the client
-//!   area's update rectangle, within the buffer) before it validates the
-//!   client area. softbuffer copied the damage alone and validated all of
-//!   it, so the rows a window gained after the last whole present, there
-//!   when aterm presents only its damage, were validated undrawn
-//!   (`tests::rows_the_window_gains_after_a_present_are_drawn_by_the_next`).
-//!   The buffer holds the whole frame, so any of it is the frame's to show.
-//! - The window's DC is got from `GetDC` for each present (and each new
-//!   buffer) and released after it. softbuffer held the one `GetDC` gave for
-//!   its surface's life, but the class has no `CS_OWNDC`, so that is a
-//!   common DC, which Windows documents as got and released per use.
-//! - Windows draws nothing of the window past the virtual screen's edge: the
-//!   rows a window has there are drawn when they come on screen and Windows
-//!   asks for them, which the update rectangle above answers once aterm
-//!   presents for the `WM_PAINT` (`App::note_owed_repaint`). The window
-//!   smoke's launch at 150 % moves its window down past the edge and back to
-//!   hold that (docs/measured/windows-lw3-2026-10-21.md).
-//! - A buffer is deselected from its DC before it is deleted, the order GDI
-//!   documents; softbuffer deleted the bitmap while it was still selected
-//!   and then the DC. Neither keeps a replaced buffer: over 200 resizes
-//!   neither's GDI objects grow (`tests::a_resize_frees_the_buffer_it_replaces`;
-//!   softbuffer's count in docs/measured/windows-lw3-2026-10-21.md).
-//! - DCs are made and freed on the calling thread, the window's, as `GetDC`
-//!   and `ReleaseDC` want; softbuffer ran a thread of its own for them so its
-//!   surface could be `Send`. aterm presents on the window's thread, and this
-//!   presenter is not `Send`.
+//! The Windows CPU presenter: GDI.
 
 use std::ffi::c_void;
 use std::num::NonZeroU32;
@@ -80,11 +29,9 @@ pub(crate) enum Win32PresentError {
     WindowDc(std::io::Error),
     /// A size past GDI's `i32` extents, or a buffer past the address space.
     Size(u32, u32),
-    /// GDI refused this call while making a buffer (its handles or memory
-    /// are spent).
+    /// GDI refused this call while making a buffer (its handles or memory are spent).
     Gdi(&'static str),
-    /// A damage rectangle past GDI's `i32` coordinates (softbuffer's
-    /// `DamageOutOfRange`).
+    /// A damage rectangle past GDI's `i32` coordinates (softbuffer's `DamageOutOfRange`).
     Damage(DamageRect),
     /// `BitBlt` refused this rectangle.
     Blit(DamageRect),
@@ -140,7 +87,7 @@ fn gdi_rect(rect: &DamageRect) -> Option<(i32, i32, i32, i32)> {
 }
 
 /// Flush even when a later copy failed: an earlier batched copy may still
-/// read the section. Preserve the first copy error when the flush fails too.
+/// read the section.
 fn flush_present_blits(
     copy: impl FnOnce() -> Result<(), Win32PresentError>,
     flush: impl FnOnce() -> bool,
@@ -207,7 +154,6 @@ impl Dib {
             header: BITMAPINFOHEADER {
                 biSize: size_of::<BITMAPINFOHEADER>() as u32,
                 biWidth: width,
-                // Negative: top-down, row 0 first, as aterm's frame is.
                 biHeight: -height,
                 biPlanes: 1,
                 biBitCount: 32,
@@ -217,8 +163,7 @@ impl Dib {
             masks: MASKS,
         };
         let mut bits: *mut c_void = ptr::null_mut();
-        // SAFETY: `info` is a BITMAPINFOHEADER followed by its three masks,
-        // as BI_BITFIELDS reads it; `bits` receives the section's pixels.
+        // SAFETY: `info` is a BITMAPINFOHEADER followed by its three masks, as BI_BITFIELDS reads.
         let bitmap = unsafe {
             CreateDIBSection(
                 dc,
@@ -248,14 +193,12 @@ impl Dib {
             }),
             _ => {
                 // SAFETY: what was made above, never selected or already
-                // refused, so each delete succeeds or frees nothing.
                 unsafe {
                     if !bitmap.is_null() {
                         DeleteObject(bitmap);
                     }
                     DeleteDC(dc);
                 }
-                // A section without pixels is CreateDIBSection's refusal too.
                 Err(Win32PresentError::Gdi(
                     if bitmap.is_null() || pixels.is_none() {
                         "CreateDIBSection"
@@ -270,8 +213,7 @@ impl Dib {
 
 impl Drop for Dib {
     fn drop(&mut self) {
-        // SAFETY: the DC and bitmap are this buffer's; `held` is what the DC
-        // held. Deselected first: GDI refuses to delete a selected bitmap.
+        // SAFETY: the DC and bitmap are this buffer's; `held` is what the DC held.
         unsafe {
             SelectObject(self.dc, self.held);
             DeleteObject(self.bitmap);
@@ -281,8 +223,7 @@ impl Drop for Dib {
 }
 
 /// The window's DC for one use: `GetDC`'s common DC, released when this is
-/// dropped. Its clip is the window's as it was when it was got, so it is
-/// got again for each present rather than held.
+/// dropped.
 struct WindowDc {
     hwnd: HWND,
     dc: HDC,
@@ -309,28 +250,22 @@ impl Drop for WindowDc {
     }
 }
 
-/// A GDI surface on one window: its buffer, presented through the window's
-/// DC got for each present. [`Win32Presenter`] is this over a winit window;
-/// the tests make one over a window of their own.
+/// A GDI surface on one window: its buffer, presented through the window's DC got for each present.
 pub(crate) struct GdiSurface {
     hwnd: HWND,
     buffer: Option<Dib>,
 }
 
 impl GdiSurface {
-    /// A surface on `hwnd`, which must give a DC now (and is asked again
-    /// for each present).
-    ///
+    /// A surface on `hwnd`, which must give a DC now (and is asked again for each present).
     /// # Safety
-    ///
     /// `hwnd` is a window of this thread that outlives the surface.
     pub(crate) unsafe fn new(hwnd: HWND) -> Result<Self, Win32PresentError> {
         drop(WindowDc::get(hwnd)?);
         Ok(Self { hwnd, buffer: None })
     }
 
-    /// The buffer `width` x `height`: a new one when the size changed, which
-    /// replaces the old only once it is made.
+    /// The buffer `width` x `height`.
     pub(crate) fn resize(
         &mut self,
         width: NonZeroU32,
@@ -354,8 +289,7 @@ impl GdiSurface {
         Ok(())
     }
 
-    /// Whether the window has an update region: what Windows asks to be
-    /// repainted, which a present copies ([`exposed_rect`]).
+    /// Whether the window has an update region.
     pub(crate) fn owes_repaint(&self) -> bool {
         // SAFETY: this surface's window; a null rectangle asks only whether.
         unsafe { GetUpdateRect(self.hwnd, ptr::null_mut(), 0) != 0 }
@@ -393,7 +327,6 @@ pub(crate) struct Win32Frame<'a> {
 
 impl Win32Frame<'_> {
     fn dib(&self) -> &Dib {
-        // `buffer_mut` hands a frame out only over a buffer.
         self.surface
             .buffer
             .as_ref()
@@ -410,8 +343,7 @@ impl CpuPresenter for Win32Presenter {
 
     fn new(window: Arc<Window>) -> Result<Self, Self::Error> {
         let hwnd = hwnd_of(&window).ok_or(Win32PresentError::NotWin32)?;
-        // SAFETY: `window` owns `hwnd` and is dropped after the surface; the
-        // window is made on the thread that presents to it.
+        // SAFETY: `window` owns `hwnd` and is dropped after the surface; the window is made on.
         let surface = unsafe { GdiSurface::new(hwnd) }?;
         Ok(Self {
             surface,
@@ -446,9 +378,7 @@ impl DerefMut for Win32Frame<'_> {
     fn deref_mut(&mut self) -> &mut [u32] {
         let dib = self.dib();
         let (pixels, len) = (dib.pixels, dib.len);
-        // SAFETY: as `deref`, borrowed mutably through the frame, which holds
-        // the surface mutably; GDI reads the section only inside a present,
-        // which flushes GDI's batch before it returns.
+        // SAFETY: as `deref`, borrowed mutably through the frame, which holds the surface.
         unsafe { std::slice::from_raw_parts_mut(pixels.as_ptr(), len) }
     }
 }
@@ -499,21 +429,16 @@ impl CpuFrameBuffer for Win32Frame<'_> {
                 Ok(())
             },
             || {
-                // An earlier BitBlt may be batched even when a later one
-                // failed. Flush before the frame can be painted again or
-                // its DC is released, including that error path.
                 // SAFETY: a call on this thread's GDI batch.
                 unsafe { GdiFlush() != 0 }
             },
         );
         if let Err(error) = copied {
-            // What the window shows is no longer known to be the buffer.
             dib.presented = false;
             return Err(error);
         }
         drop(window);
-        // SAFETY: this surface's window; a null rectangle is its whole client
-        // area.
+        // SAFETY: this surface's window; a null rectangle is its whole client area.
         unsafe {
             ValidateRect(surface.hwnd, ptr::null());
         }

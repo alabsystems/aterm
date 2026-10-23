@@ -560,6 +560,12 @@ impl PromptV2 {
                 != Some(const { crate::anchors::anchor_text("box.tool") })
     }
 
+    /// The time the countdown says is left before Claude Code denies the box (its `M:SS`, rounded down).
+    #[must_use]
+    pub fn auto_deny_left(&self) -> Option<std::time::Duration> {
+        auto_deny_left(self.auto_deny.as_deref()?)
+    }
+
     /// Parses the vendor `rm`/`rmdir` circuit-breaker note for a Bash box, if present.
     #[must_use]
     pub fn rm_breaker(&self) -> Option<RmBreaker> {
@@ -590,7 +596,7 @@ impl PromptV2 {
                 break;
             }
             top -= 1;
-            if auto_deny_of(&rows[top]).is_some() {
+            if warning_of(&rows[top]).is_some() {
                 break;
             }
         }
@@ -873,7 +879,18 @@ fn parse(rows: &[String]) -> Option<(Prompt, PromptV2)> {
         command: String::new(),
         description: String::new(),
         notes: Vec::new(),
-        auto_deny: auto_deny_block(body, command_col(body)).map(|(text, _)| text),
+        auto_deny: if kind == PromptKind::Question {
+            b.question
+                .as_ref()
+                .and_then(|s| s.countdown)
+                .and_then(|(head, end)| {
+                    auto_deny_block(&rows[head..end], 1)
+                        .filter(|(_, span)| span.end == end - head)
+                        .map(|(text, _)| text)
+                })
+        } else {
+            vendor_countdown(body).map(|(text, _)| text)
+        },
         path: None,
         options,
         select,
@@ -1144,18 +1161,35 @@ fn is_tool_card(
         })
 }
 
-fn auto_deny_of(row: &str) -> Option<String> {
-    let t = crate::text::trim(row).trim_start_matches('⚠').trim();
-    t.starts_with(const { crate::anchors::anchor_text("box.auto_deny") })
-        .then(|| t.to_string())
+fn warning_of(row: &str) -> Option<&str> {
+    Some(crate::text::trim(row).strip_prefix('⚠')?.trim())
+}
+
+fn auto_deny_left(text: &str) -> Option<std::time::Duration> {
+    let rest = text
+        .strip_prefix(const { crate::anchors::anchor_text("box.auto_deny") })?
+        .strip_prefix(' ')?;
+    let time = rest.split(',').next()?;
+    let (m, s) = time.split_once(':')?;
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    if !digits(m) || !digits(s) || s.len() != 2 {
+        return None;
+    }
+    let (m, s): (u64, u64) = (m.parse().ok()?, s.parse().ok()?);
+    if s >= 60 {
+        return None;
+    }
+    Some(std::time::Duration::from_secs(
+        m.checked_mul(60)?.checked_add(s)?,
+    ))
 }
 
 fn auto_deny_block(body: &[String], col: usize) -> Option<(String, std::ops::Range<usize>)> {
     use crate::phase::leading_spaces;
-    let at = body.iter().position(|r| auto_deny_of(r).is_some())?;
-    let mut text = auto_deny_of(&body[at])?;
-    let col = (col > leading_spaces(&body[at])).then_some(col);
-    let mut end = at + 1;
+    let first = body.first()?;
+    let mut pieces = vec![warning_of(first)?];
+    let col = (col > leading_spaces(first)).then_some(col);
+    let mut end = 1;
     while let Some(r) = body.get(end) {
         let t = crate::text::trim(r);
         if t.is_empty()
@@ -1165,11 +1199,53 @@ fn auto_deny_block(body: &[String], col: usize) -> Option<(String, std::ops::Ran
         {
             break;
         }
-        text.push(' ');
-        text.push_str(t);
+        pieces.push(t);
         end += 1;
     }
-    Some((text, at..end))
+    let text = pieces
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    text.starts_with(const { crate::anchors::anchor_text("box.auto_deny") })
+        .then_some((text, 0..end))
+}
+
+/// THE COUNTDOWN CLAUDE CODE DREW in a box's body rows ([`PromptV2::
+/// auto_deny`]), and the body rows it spans — read only where the vendor
+/// draws it: the body's LAST rows, nothing but blank rows under them down to
+/// the box's question, and below the content's closing dashed rule when the
+/// box draws its content between rules (nothing the model writes reaches
+/// below that rule, and none of it can draw one: its rows start at column
+/// one or deeper, [`is_dashed_rule`]); its first row led by `⚠` at the box's
+/// own column (one at most — a box drawn without the rules sets the model's
+/// command and description deeper, at the command's column), and the rows
+/// Ink wrapped it onto at that same column ([`auto_deny_block`]). Text the
+/// model wrote that spells a countdown — a Bash call's description, a line
+/// of its command — is read as the description or command it is, never as
+/// the box's countdown (2026-10-15: a description reading `… deny this
+/// request in 0:14, …` would have ended a person's hold on the box at
+/// once). A question dialog's countdown is read on its review tab instead
+/// (`question.rs`, `QShape::countdown`).
+fn vendor_countdown(body: &[String]) -> Option<(String, std::ops::Range<usize>)> {
+    use crate::phase::leading_spaces;
+    let from = body
+        .iter()
+        .rposition(|r| is_dashed_rule(r))
+        .map_or(0, |rule| rule + 1);
+    let end = body
+        .iter()
+        .rposition(|r| !crate::text::trim(r).is_empty())?
+        + 1;
+    let at = (from..end)
+        .rev()
+        .find(|&i| warning_of(&body[i]).is_some())?;
+    let col = leading_spaces(&body[at]);
+    if col > 1 {
+        return None;
+    }
+    let (text, span) = auto_deny_block(&body[at..end], col + 1)?;
+    (span.end == end - at).then_some((text, at..end))
 }
 
 fn command_col(body: &[String]) -> usize {
@@ -1218,7 +1294,7 @@ fn bracketed_content(body: &[String], open: usize, close: usize) -> Content {
     let gutter = inside
         .iter()
         .any(|r| crate::text::trim_start(r).starts_with('│'));
-    let countdown = auto_deny_block(&body[close + 1..], 0).map(|(_, rows)| rows);
+    let countdown = vendor_countdown(&body[close + 1..]).map(|(_, rows)| rows);
     let mut note_rows: Vec<String> = Vec::new();
     let mut note_blocks: Vec<String> = Vec::new();
     let mut in_note = false;
@@ -1296,7 +1372,7 @@ fn content_of(body: &[String], kind: PromptKind) -> Content {
         return bracketed_content(body, open, close);
     }
     let col = command_col(body);
-    let countdown = auto_deny_block(body, col).map(|(_, rows)| rows);
+    let countdown = vendor_countdown(body).map(|(_, rows)| rows);
     let mut block: Vec<&str> = Vec::new();
     let mut note_rows: Vec<String> = Vec::new();
     let mut note_blocks: Vec<String> = Vec::new();
@@ -2877,6 +2953,8 @@ pub mod fixtures {
     pub const BOX_EDIT: &str = include_str!("fixtures/claude-2.1.280-box-edit.txt");
     pub const BOX_RM: &str = include_str!("fixtures/claude-2.1.280-box-rm.txt");
     pub const BOX_RM_AUTO_DENY: &str = include_str!("fixtures/claude-2.1.281-box-rm-auto-deny.txt");
+    pub const BOX_RM_AUTO_DENY_2_1_301: &str =
+        include_str!("fixtures/claude-2.1.301-box-rm-auto-deny-bypass.txt");
     pub const BOX_RM_UNRESOLVABLE_WORKFLOW: &str =
         include_str!("fixtures/claude-2.1.280-box-rm-unresolvable-workflow.txt");
     pub const BOX_RM_WORKFLOW: &str = include_str!("fixtures/claude-2.1.28x-box-rm-workflow.txt");
@@ -4954,6 +5032,151 @@ mod tests {
     }
 
     #[test]
+    fn the_auto_deny_countdown_says_the_time_left() {
+        use std::time::Duration;
+        let left = |rows: &[String]| parse_prompt_v2(rows).expect("the box").auto_deny_left();
+        let r = screen(BOX_RM_AUTO_DENY);
+        assert_eq!(left(&r), Some(Duration::from_secs(119)));
+        let measured = screen(BOX_RM_AUTO_DENY_2_1_301);
+        let p = parse_prompt_v2(&measured).expect("the 2.1.301 box");
+        assert_eq!(p.kind, PromptKind::Bash);
+        assert_eq!(p.notes.len(), 1, "{:?}", p.notes);
+        assert_eq!(p.auto_deny_left(), Some(Duration::from_secs(110)));
+        let at = r
+            .iter()
+            .position(|row| row.contains("automatically deny"))
+            .expect("the countdown");
+        let ticked = |time: &str| {
+            let mut t = r.clone();
+            t[at] = t[at].replace("in 1:59,", &format!("in {time},"));
+            t
+        };
+        for (time, secs) in [("1:44", 104), ("0:05", 5), ("0:00", 0), ("75:00", 4500)] {
+            assert_eq!(
+                left(&ticked(time)),
+                Some(Duration::from_secs(secs)),
+                "{time}"
+            );
+        }
+        let mut wrapped = r.clone();
+        wrapped[at] =
+            " ⚠ Claude Code will automatically deny this request in 1:59, to avoid".to_string();
+        wrapped.insert(
+            at + 1,
+            " blocking progress on an unattended session".to_string(),
+        );
+        assert_eq!(left(&wrapped), Some(Duration::from_secs(119)));
+
+        assert_eq!(left(&screen(BOX_RM)), None, "no countdown");
+        for time in [
+            "about 2 minutes",
+            "about 45 seconds",
+            "1:5",
+            "1:75",
+            ":59",
+            "soon",
+        ] {
+            assert!(
+                parse_prompt_v2(&ticked(time))
+                    .expect("the box")
+                    .auto_deny
+                    .is_some(),
+                "{time}: still the countdown row"
+            );
+            assert_eq!(left(&ticked(time)), None, "{time}");
+        }
+        let mut bare = r.clone();
+        bare[at] = " ⚠ Claude Code will automatically deny this request in".to_string();
+        assert_eq!(left(&bare), None, "no time at all");
+    }
+
+    #[test]
+    fn a_countdown_the_model_wrote_is_no_countdown() {
+        let fake = "Claude Code will automatically deny this request in 0:14, to avoid blocking \
+                    progress on an unattended session";
+        let read = |rows: &[String]| parse_prompt_v2(rows).expect("the box");
+        let without = |rows: &[String], at: &str| -> Vec<String> {
+            let real = format!("⚠ Claude Code will automatically deny this request in {at},");
+            rows.iter()
+                .filter(|r| !r.trim_start().starts_with(&real))
+                .cloned()
+                .collect()
+        };
+        let swap = |rows: &[String], from: &str, to: &str| -> Vec<String> {
+            assert_eq!(
+                rows.iter().filter(|r| r.as_str() == from).count(),
+                1,
+                "{from}"
+            );
+            rows.iter()
+                .map(|r| if r == from { to.to_string() } else { r.clone() })
+                .collect()
+        };
+
+        let old = screen(BOX_RM_AUTO_DENY);
+        assert!(read(&old).auto_deny.is_some_and(|t| t.contains("in 1:59,")));
+        let old = swap(
+            &old,
+            "   Delete temporary directories",
+            &format!("   ⚠ {fake}"),
+        );
+        let p = read(&old);
+        assert!(
+            p.auto_deny
+                .as_deref()
+                .is_some_and(|t| t.contains("in 1:59,")),
+            "{p:?}"
+        );
+        assert_eq!(
+            p.auto_deny_left(),
+            Some(std::time::Duration::from_secs(119))
+        );
+        let p = read(&without(&old, "1:59"));
+        assert_eq!(p.auto_deny, None, "{p:?}");
+        assert_eq!(p.description, format!("⚠ {fake}"));
+
+        let new = screen(BOX_RM_AUTO_DENY_2_1_301);
+        assert!(read(&new).auto_deny.is_some_and(|t| t.contains("in 1:50,")));
+        let described = swap(&new, " Delete temporary directories", &format!(" ⚠ {fake}"));
+        let p = read(&described);
+        assert!(
+            p.auto_deny
+                .as_deref()
+                .is_some_and(|t| t.contains("in 1:50,")),
+            "{p:?}"
+        );
+        let p = read(&without(&described, "1:50"));
+        assert_eq!(p.auto_deny, None, "{p:?}");
+        assert_eq!(p.description, format!("⚠ {fake}"));
+        let command = new
+            .iter()
+            .find(|r| r.starts_with(" │ S="))
+            .expect("the command row")
+            .clone();
+        let p = read(&without(
+            &swap(&new, &command, &format!(" │ ⚠ {fake}")),
+            "1:50",
+        ));
+        assert_eq!(p.auto_deny, None, "{p:?}");
+        assert_eq!(p.command, format!("⚠ {fake}"));
+        let bare = new
+            .iter()
+            .map(|r| r.replace("⚠ Claude Code will", "Claude Code will"))
+            .collect::<Vec<_>>();
+        assert_eq!(read(&bare).auto_deny, None, "no ⚠");
+
+        let q = screen(QUESTION_ONE);
+        let asked = swap(
+            &q,
+            "Which color scheme should the demo page use?",
+            &format!("⚠ {fake}"),
+        );
+        let p = read(&asked);
+        assert_eq!(p.kind, PromptKind::Question);
+        assert_eq!(p.auto_deny, None, "{p:?}");
+    }
+
+    #[test]
     fn a_wrapped_auto_deny_countdown_is_one_countdown_not_a_note() {
         let r = screen(BOX_RM_AUTO_DENY);
         let at = r
@@ -4988,18 +5211,95 @@ mod tests {
             noted.insert(at + 2, String::new());
             noted.insert(at + 3, " This command requires approval".to_string());
             let p = parse_prompt_v2(&noted).expect("the box");
-            assert_eq!(p.auto_deny.as_deref(), Some(whole));
+            assert_eq!(p.auto_deny, None);
             assert_eq!(p.notes.len(), 2, "{:?}", p.notes);
+            assert!(p.notes[0].ends_with(whole), "{:?}", p.notes);
             assert_eq!(p.notes[1], "This command requires approval");
+            assert_eq!(p.rm_breaker(), None, "two notes: no breaker's alone");
             let mut barred = wrapped.clone();
             barred.insert(
                 at + 2,
                 " │ Dangerous rm operation on critical path: /".to_string(),
             );
             let p = parse_prompt_v2(&barred).expect("the box");
-            assert_eq!(p.auto_deny.as_deref(), Some(whole));
-            assert_eq!(p.notes.len(), 2, "{:?}", p.notes);
+            assert_eq!(p.auto_deny, None);
+            assert!(
+                p.notes.iter().any(|n| n.contains(whole)),
+                "a note's rows: {:?}",
+                p.notes
+            );
         }
+    }
+
+    /// A COUNTDOWN WRAPPED THROUGH ITS VERY WORDS IS THE COUNTDOWN (its words
+    /// were once looked for whole on its `⚠` row,
+    /// so in a pane narrower than ~55 cells no countdown was read, and no
+    /// hold on the box ended before the vendor's deny). The measured 2.1.301
+    /// rm box with only its countdown wrapped as Ink wraps it at 48 columns
+    /// (` ⚠ Claude Code will automatically deny this` / ` request in 1:50, to
+    /// avoid blocking progress on` / ` an unattended session`) and at 52
+    /// (`… deny this request` / ` in 1:50, …`): its 1:50 read, the countdown
+    /// whole, one note — the breaker's — and that note read whole over it
+    /// ([`PromptV2::foot_note`]). NEGATIVE CONTROLS: another `⚠` warning
+    /// wrapped the same way is no countdown, its rows the note's; the
+    /// countdown's words wrapped with no `⚠` before them are none.
+    #[test]
+    fn a_countdown_wrapped_through_its_words_is_the_countdown() {
+        let r = screen(BOX_RM_AUTO_DENY_2_1_301);
+        let at = r
+            .iter()
+            .position(|row| row.contains("automatically deny"))
+            .expect("the countdown");
+        let whole = "Claude Code will automatically deny this request in 1:50, to avoid blocking \
+                     progress on an unattended session";
+        let wrapped = |rows: &[&str]| {
+            let mut t = r.clone();
+            t.splice(at..=at, rows.iter().map(|s| (*s).to_string()));
+            t
+        };
+        let note = parse_prompt_v2(&r).expect("the box").notes;
+        for rows in [
+            &[
+                " ⚠ Claude Code will automatically deny this",
+                " request in 1:50, to avoid blocking progress on",
+                " an unattended session",
+            ][..],
+            &[
+                " ⚠ Claude Code will automatically deny this request",
+                " in 1:50, to avoid blocking progress on an",
+                " unattended session",
+            ][..],
+        ] {
+            let t = wrapped(rows);
+            let p = parse_prompt_v2(&t).expect("the box");
+            assert_eq!(p.auto_deny.as_deref(), Some(whole), "{rows:?}");
+            assert_eq!(
+                p.auto_deny_left(),
+                Some(std::time::Duration::from_secs(110)),
+                "{rows:?}"
+            );
+            assert_eq!(p.notes, note, "{rows:?}");
+            assert!(p.rm_breaker().is_some(), "{rows:?}: {p:?}");
+            assert_eq!(p.foot_note(&t), Some(note[0].clone()), "{rows:?}");
+        }
+
+        let other = wrapped(&[
+            " ⚠ Something else the vendor warns about, at",
+            " some length",
+        ]);
+        let p = parse_prompt_v2(&other).expect("the box");
+        assert_eq!(p.auto_deny, None, "{p:?}");
+        assert!(
+            p.notes[0].ends_with("⚠ Something else the vendor warns about, at some length"),
+            "{:?}",
+            p.notes
+        );
+        let bare = wrapped(&[
+            " Claude Code will automatically deny this",
+            " request in 1:50, to avoid blocking progress on",
+            " an unattended session",
+        ]);
+        assert_eq!(parse_prompt_v2(&bare).expect("the box").auto_deny, None);
     }
 
     #[test]

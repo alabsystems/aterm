@@ -44,6 +44,7 @@ impl std::fmt::Debug for ConfigSnapshot {
 pub(crate) type DiskFaults = Arc<[aterm_agent::harness::cli::DiskFault]>;
 
 /// [`DiskFaults`] of `text`, computed wherever [`parse_values`] runs on it: at load, on the
+/// host worker for a disk observation, and in the reducer for a patch.
 fn parse_disk_faults(text: &str) -> DiskFaults {
     aterm_agent::harness::cli::disk_faults(text).into()
 }
@@ -153,7 +154,7 @@ struct UndoRecord {
     token: UndoToken,
     before: Vec<(String, Option<String>)>,
     after: Vec<(String, Option<String>)>,
-    /// The admitted text just before the patch and just after it. Undo
+    /// The admitted text just before the patch and just after it.
     before_text: Arc<str>,
     after_text: Arc<str>,
 }
@@ -591,6 +592,8 @@ impl VersionedConfigService {
     }
 
     /// The patch's own validation and optimistic concurrency: a known base
+    /// revision, unique non-empty keys, no asset-source key, and every touched
+    /// key unchanged since its base revision with its expectation current.
     fn check_patch(&self, request: &ConfigPatchRequest) -> Result<(), ConfigPatchResult> {
         if request.base_revision == 0 || request.base_revision > self.revision {
             return Err(self.rejected("invalid base revision"));
@@ -645,6 +648,10 @@ impl VersionedConfigService {
     }
 
     /// Admit `next` as the new text, the one revision bump a patch or an undo
+    /// makes: validate the whole typed config before any state moves, rewrap
+    /// the sparkle and wallpaper assets it changed, stamp the revision on
+    /// every key in `touched` and every key whose value moved, and record the
+    /// undo of exactly this transition.
     fn admit_text(&mut self, next: String, touched: &BTreeSet<String>) -> ConfigPatchResult {
         if next == self.text {
             return ConfigPatchResult::Unchanged {
@@ -946,6 +953,8 @@ fn parse_values(text: &str) -> Result<BTreeMap<String, String>, String> {
 }
 
 /// Whether `merged` reads as `current` with the patch from `before` to
+/// `after` taken back out: every leaf the patch moved as `before` held it,
+/// every other leaf as `current` holds it ([`leaf_values`]).
 fn reads_as_reverted(merged: &str, after: &str, before: &str, current: &str) -> bool {
     let (Ok(merged), Ok(after), Ok(before), Ok(current)) = (
         leaf_values(merged),
@@ -971,6 +980,7 @@ fn reads_as_reverted(merged: &str, after: &str, before: &str, current: &str) -> 
 }
 
 /// The values of `text`'s leaves — every key whose value is not a table —
+/// under their dotted paths, as [`parse_values`] names them.
 fn leaf_values(text: &str) -> Result<BTreeMap<String, String>, String> {
     fn walk(values: &mut BTreeMap<String, String>, path: &str, item: &aterm_toml::edit::Item) {
         if let Some(table) = item.as_table_like() {
@@ -992,6 +1002,9 @@ fn leaf_values(text: &str) -> Result<BTreeMap<String, String>, String> {
 }
 
 /// `current` with the change from `before` to `after` taken back out, line
+/// for line: the three-way merge of `after` (the base both texts grew from),
+/// `before` (what the undo wants there) and `current` (the file now, with a
+/// later change of its own).
 fn merge_reverting(after: &str, before: &str, current: &str) -> Option<String> {
     let base: Vec<&str> = after.split_inclusive('\n').collect();
     let wanted: Vec<&str> = before.split_inclusive('\n').collect();
@@ -1026,6 +1039,7 @@ fn merge_reverting(after: &str, before: &str, current: &str) -> Option<String> {
 }
 
 /// One difference between two line lists: `base[start..end]` became
+/// `other[other_start..other_end]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LineHunk {
     start: usize,
@@ -1035,6 +1049,7 @@ struct LineHunk {
 }
 
 /// The shortest edit from `base` to `other` as hunks in base order (Myers'
+/// O((N+M)D) greedy diff over whole lines).
 fn line_hunks(base: &[&str], other: &[&str]) -> Option<Vec<LineHunk>> {
     const MAX_DIFFERENCES: usize = 512;
     let (n, m) = (base.len(), other.len());
@@ -1129,6 +1144,7 @@ pub(crate) fn join_config_key_path(parent: &str, segment: &str) -> String {
 }
 
 /// Insert `item`'s value at `path` and, for header or inline tables, recurse into
+/// each child under `path.child`.
 fn project_item(values: &mut BTreeMap<String, String>, path: &str, item: &aterm_toml::edit::Item) {
     if let Some(table) = item.as_table_like() {
         for (child, child_item) in table.iter() {
@@ -1139,6 +1155,8 @@ fn project_item(values: &mut BTreeMap<String, String>, path: &str, item: &aterm_
 }
 
 /// How `raw`, written for `key`, reads among [`ConfigSnapshot::values`] —
+/// the projection a patch's expectation is compared in (`12` for a typed
+/// `12.0`) — or `None` where the writer refuses it.
 fn holds(key: &str, held: Option<&String>, expected: Option<&str>) -> bool {
     match (held, expected) {
         (None, None) => true,
@@ -1241,6 +1259,7 @@ mod tests {
     }
 
     /// A patch whose base was never published (zero, or the revision the write would
+    /// produce) is refused before anything moves.
     #[test]
     fn a_base_revision_the_service_never_published_is_refused_without_a_write() {
         let mut service =
@@ -1270,6 +1289,10 @@ mod tests {
     }
 
     /// `aterm ctl settings set cursor_trail_style …` and a Settings re-commit
+    /// reduce through this service: an alias released configs carry (`rainbow
+    /// kitty`), a hidden canonical (`classic mono`) and the Settings label
+    /// `lightning` all apply and save as their canonical name; a near miss is
+    /// refused without a write.
     #[test]
     fn settings_set_accepts_trail_aliases() {
         for (input, written) in [
@@ -1678,6 +1701,10 @@ mod tests {
     }
 
     /// A TYPE VALUE THE THEME SETS OTHERWISE IS KEPT, EVEN AT ATERM'S DEFAULT:
+    /// under a theme that sets the line height (1.15), `line_height = 1.0`
+    /// is what keeps the theme's off, so it stays written, whether the theme
+    /// is already in aterm.toml or comes in the same patch (Keep colours
+    /// only writes the theme and its pins together).
     #[test]
     fn a_default_over_a_themes_type_value_stays_written() {
         let catalog = |extra: &str| {
@@ -1726,6 +1753,9 @@ mod tests {
     }
 
     /// AN EXPECTATION NAMES A VALUE, NOT ITS SPELLING: a patch expecting
+    /// `line_height` at `1.0` lands over the file's `1` (the writer's
+    /// spelling of the `1.0` a press on its way chose), as does one
+    /// expecting the exact text.
     #[test]
     fn an_expectation_names_a_value_not_its_spelling() {
         let patch = |source: &str, expected: Option<&str>| {
@@ -1756,6 +1786,9 @@ mod tests {
     }
 
     /// A VALUE EQUAL TO ITS DEFAULT IS WRITTEN AS A REMOVAL, by every writer
+    /// the service serves: for every Settings key with an unset value,
+    /// writing that value to an empty file changes nothing, and writing it
+    /// over another value removes the key.
     #[test]
     fn a_default_value_is_written_as_a_removal() {
         let fields = crate::prefs::editable_fields(&crate::app_config::Config::default());
@@ -1872,6 +1905,8 @@ mod tests {
     }
 
     /// AN ALIAS OF THE DEFAULT IS THE DEFAULT: the writer stores `kitty` as
+    /// `rainbow kitty pet`, so the rule that writes a default as a removal
+    /// judges the stored spelling, not the typed one.
     #[test]
     fn an_alias_of_the_default_style_is_written_as_a_removal() {
         let default = crate::app_config::default_cursor_trail_style();
@@ -1929,6 +1964,9 @@ mod tests {
     }
 
     /// A VALUE THE KEY ALREADY HOLDS IS NO WRITE, whoever sends it (`aterm
+    /// ctl settings set font_px 14` over the file's `font_px = 14`): the
+    /// patch is Unchanged, no revision or Undo is minted, and the person's
+    /// line keeps its spelling and its comment.
     #[test]
     fn a_value_the_key_already_holds_is_no_write() {
         let source = "font_px = 14  # projector\nbidi = \"disabled\"\n";
@@ -1977,6 +2015,8 @@ mod tests {
     }
 
     /// The file a reset-and-undo test starts from: root keys with a comment
+    /// above one and an inline comment on another, tables in an authored
+    /// order, a comment above a table's key and one under a table's last key.
     const AUTHORED: &str = "\
 # note
 font_px = 14  # projector
@@ -2002,6 +2042,9 @@ enabled = false
 ";
 
     /// UNDO RESTORES THE FILE, NOT THE VALUES: a reset of several keys, then
+    /// Undo, gives back the exact bytes (every key where it stood, every
+    /// comment with the key it described, `14` still spelled `14`); Undo of
+    /// that Undo gives back the reset text, and once more the original.
     #[test]
     fn undo_of_a_reset_restores_the_file_byte_for_byte() {
         let mut service = VersionedConfigService::new(AUTHORED.into()).unwrap();
@@ -2041,6 +2084,9 @@ enabled = false
     }
 
     /// After an unrelated change, Undo takes back only its own lines: the
+    /// reset `font_px` returns where it stood with the comment above it and
+    /// its inline comment, and a hand edit made since (a changed value and a
+    /// new comment elsewhere) keeps its bytes.
     #[test]
     fn undo_after_an_unrelated_edit_reverts_only_its_own_lines() {
         let mut service = VersionedConfigService::new(AUTHORED.into()).unwrap();
@@ -2081,6 +2127,8 @@ enabled = false
     }
 
     /// The line merge Undo uses: the later change and the reverted change
+    /// both stand where they touch different lines, and lines both touched
+    /// are refused (the caller writes the values back instead).
     #[test]
     fn the_reverting_merge_keeps_both_changes_or_refuses() {
         let before = "a\nb\nc\nd\n";
@@ -2251,7 +2299,7 @@ enabled = false
         let _ = std::fs::remove_file(config_path);
     }
 
-    /// An authored empty collection is still an authored value. Clearing it
+    /// An authored empty collection is still an authored value.
     #[test]
     fn undo_restores_authored_empty_collections() {
         for (key, authored) in [
@@ -2403,6 +2451,8 @@ enabled = false
     }
 
     /// The value the service reports for a cleared palette (the slot table in
+    /// either spelling, the `palette` array) is what Undo writes back, and it
+    /// lands as the same TOML, so the file still loads.
     #[test]
     fn a_reported_palette_value_writes_back_as_toml() {
         for text in [
@@ -2531,6 +2581,8 @@ include = ["nested"]
     }
 
     /// Depth-2 dotted keys behave like depth-1: `sparkle_words.profanity.enabled` gets
+    /// its own entry, a stale expectation conflicts while the current one applies, and
+    /// blank-revert removes the leaf and the tables it left bare at both depths.
     #[test]
     fn depth_two_dotted_key_projection_occ_and_blank_revert() {
         let values = parse_values(

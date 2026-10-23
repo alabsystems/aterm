@@ -1,40 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Text for a terminal: the one rendering every aterm CLI uses before bytes
-//! another party chose reach a terminal.
-//!
-//! A terminal ACTS ON some characters and REORDERS text around others. A body
-//! another party wrote (a fabric peer's mail, a remote's reply, a program's
-//! screen text) printed raw runs as the READER's terminal's instructions: an
-//! OSC retitles the reader's tab or writes its clipboard, a cursor-up and an
-//! erase rewrite the header line above it into a forged one, and a bidi
-//! override reorders what is left. [`is_active`] names that class; [`safe`]
-//! (and [`SafeStream`], its form for a body that arrives in pieces) shows each
-//! such character as text instead, and [`push_escape`] is the one spelling.
-//!
-//! The rendering is for a person's eyes, never a pipe or a file: a caller
-//! escapes only when its destination is a terminal, so what a pipe or a file is
-//! given stays byte-exact. Printable text — every other character, non-ASCII
-//! included — is unchanged, and so are `\n` and `\t`, so lines stay lines.
-//!
-//! Users: `aterm-ctl` (every byte it prints to a terminal), [`one_line`] (the
-//! one-line form, which names `\n`, `\t` and `\\` itself: `aterm_link::render::safe`
-//! for the bus, `aterm ctl survey` for its excerpts) and the control wire's JSON
-//! escape ([`crate::json`]).
-//!
-//! The function lives here, in the
-//! leaf `aterm-ctl`, `aterm-agent`, `aterm-control` and `aterm-link` all depend
-//! on already, so no crate gains an edge, and no edge runs upward (`aterm-ctl`
-//! depending on `aterm-agent` or `aterm-link` would invert the client under its
-//! users).
+//! Text for a terminal.
 
-/// Whether a terminal acts on `c`, or reorders or breaks the line around it:
-/// every C0 control (U+0000-U+001F, `\n` and `\t` included — a caller that
-/// keeps them says so), DEL, every C1 control (U+0080-U+009F: a terminal that
-/// executes UTF-8 C1 reads U+009B as CSI), the bidi marks (U+061C ALM, U+200E
-/// LRM, U+200F RLM), embeddings and overrides (U+202A-U+202E) and isolates
-/// (U+2066-U+2069), and the line and paragraph separators U+2028/U+2029.
+/// Whether a terminal acts on `c`, or reorders or breaks the line around it.
 #[must_use]
 #[inline]
 pub const fn is_active(c: char) -> bool {
@@ -48,10 +17,7 @@ pub const fn is_active(c: char) -> bool {
         || (u >= 0x2066 && u <= 0x2069)
 }
 
-/// Append `c`'s escape to `out`: `\n`, `\r` and `\t` by name, every other C0
-/// control and DEL as `\xNN`, and anything else as `\u{NNNN}` — lowercase hex,
-/// at least four digits, Rust's `\u{…}` spelling and `{:04x}`'s digits. Meant
-/// for an [`is_active`] character; total for any.
+/// Append `c`'s escape to `out`.
 pub fn push_escape(out: &mut String, c: char) {
     match c {
         '\n' => out.push_str("\\n"),
@@ -60,8 +26,6 @@ pub fn push_escape(out: &mut String, c: char) {
         c if (c as u32) < 0x20 || c == '\u{7f}' => push_byte_escape(out, c as u8),
         c => {
             let u = c as u32;
-            // Six nibbles hold any scalar; the leading zeros past four are not
-            // written.
             let skip = if u > 0xf_ffff {
                 0
             } else if u > 0xffff {
@@ -86,10 +50,7 @@ fn push_byte_escape(out: &mut String, b: u8) {
     crate::hex::push_lower(out, &[b]);
 }
 
-/// `bytes` for a terminal: lines and tabs kept, every other [`is_active`]
-/// character escaped ([`push_escape`]), and each byte that is not UTF-8 as
-/// `\xNN`. Printable text is unchanged, so the common body comes back
-/// borrowed.
+/// `bytes` for a terminal.
 #[must_use]
 pub fn safe(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
     if let Ok(text) = std::str::from_utf8(bytes)
@@ -104,20 +65,7 @@ pub fn safe(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
-/// Text that can only ever be ONE line of ordinary characters: the form a
-/// record another party wrote takes beside a label it must not forge
-/// (`aterm_link::render::safe`, the bus's; `aterm ctl survey`'s excerpts).
-///
-/// Escaped, never dropped: a backslash doubled, and every [`is_active`]
-/// character in [`push_escape`]'s spelling — `\n`, `\r` and `\t` by name too,
-/// so a line stays one line, and an unescaped U+202E cannot reorder the line
-/// and move a label with no control byte at all. Truncated to `cap`
-/// CHARACTERS with a trailing `…`.
-///
-/// `trust=` is reserved, rendered `trust\=` wherever the text spells it: one
-/// logical line can still wrap, and `trust=human` just past a wrap point would
-/// start a row with a forged label. A real backslash is already doubled, so
-/// the single backslash in `trust\=` can only be this escape.
+/// Text that can only ever be ONE line of ordinary characters.
 #[must_use]
 pub fn one_line(text: &str, cap: usize) -> String {
     let mut out = String::with_capacity(text.len().min(cap.saturating_mul(4)));
@@ -132,9 +80,6 @@ pub fn one_line(text: &str, cap: usize) -> String {
             c => out.push(c),
         }
     }
-    // The reserved token, after the character escaping so the two rules cannot
-    // interfere: nothing above can produce the letters `trust=`, and nothing
-    // here can produce a control byte.
     if out.contains("trust=") {
         out = out.replace("trust=", "trust\\=");
     }
@@ -148,10 +93,7 @@ const fn needs_escape(c: char) -> bool {
     is_active(c) && c != '\n' && c != '\t'
 }
 
-/// [`safe`] for a body that arrives in pieces (a socket read, a `write` call):
-/// a UTF-8 character cut at the end of one piece is held until the next
-/// completes it, so the pieces render exactly as the whole would.
-/// [`SafeStream::finish`] ends the body, escaping a cut that nothing completed.
+/// [`safe`] for a body that arrives in pieces (a socket read, a `write` call).
 #[derive(Debug, Default, Clone)]
 pub struct SafeStream {
     /// The start of a character the last piece cut (at most three bytes).
@@ -175,7 +117,6 @@ impl SafeStream {
     pub fn push(&mut self, piece: &[u8], out: &mut String) {
         let mut piece = piece;
         if self.held > 0 {
-            // The held start, then as much of `piece` as could complete it.
             let mut joint = [0u8; 6];
             let held = self.held.min(self.carry.len());
             let take = piece.len().min(joint.len() - held);
@@ -184,8 +125,6 @@ impl SafeStream {
             let joint = &joint[..held + take];
             let used = render(joint, out);
             if used < held {
-                // Still cut: `piece` was too short to complete it, so all of
-                // it is held now (at most three bytes together).
                 self.hold(&joint[used..]);
                 return;
             }
@@ -196,8 +135,7 @@ impl SafeStream {
         self.hold(&piece[used.min(piece.len())..]);
     }
 
-    /// End the body: a character still cut is not one, so its bytes are
-    /// escaped as `\xNN`.
+    /// End the body: a character still cut is not one, so its bytes are escaped as `\xNN`.
     #[inline]
     pub fn finish(&mut self, out: &mut String) {
         let held = self.held.min(self.carry.len());
@@ -225,7 +163,6 @@ fn render(bytes: &[u8], out: &mut String) -> usize {
             Ok(text) => (text, None),
             Err(e) => {
                 let (head, _) = rest.split_at(e.valid_up_to());
-                // `head` is valid UTF-8 by `valid_up_to`.
                 (std::str::from_utf8(head).unwrap_or(""), Some(e.error_len()))
             }
         };
@@ -239,14 +176,12 @@ fn render(bytes: &[u8], out: &mut String) -> usize {
         at += valid.len();
         match bad {
             None => break,
-            // Bytes that start no character: each shown as itself.
             Some(Some(n)) => {
                 for &b in bytes.iter().skip(at).take(n) {
                     push_byte_escape(out, b);
                 }
                 at += n;
             }
-            // A character cut at the end: held until more input or `finish`.
             Some(None) => return at,
         }
     }
@@ -323,7 +258,6 @@ mod tests {
                 s.finish(&mut out);
                 assert_eq!(out, want, "cut at {cut}");
             }
-            // One byte at a time.
             let mut out = String::new();
             let mut s = SafeStream::new();
             for b in whole {

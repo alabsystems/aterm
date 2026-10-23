@@ -1,54 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CRASH RESTORE'S SOAK — whether the crash restore has run long enough on the daily
-//! driver, and brought enough real kills back exactly, for the PTY keeper to be turned on by
-//! default (keeper P4, `docs/DESIGN-pty-keeper-2026-09-26.md` §7;
-//! `docs/DESIGN-crash-restore-2026-10-20.md` §7).
-//!
-//! WHAT IT READS. The recovery ledger ([`crate::recovery_ledger`]) and nothing else: one row
-//! per windowed launch of the installed app, which says how the run before it ended, the
-//! launch's keeper link (`keeper=`, [`KeeperAtLaunch`]), and, for a launch a keeper offered
-//! sessions, how their screens came back and how many it refused (`restored=`,
-//! `restore_refused=`, [`Restores`]). A row is written on the machine the app runs on, so the
-//! soak is that machine's; a dev build, a test and a headless launch write none.
-//!
-//! WHAT IT JUDGES ([`Criterion`], each against a [`Bar`]):
-//!
-//! * `keeper-on`: the keeper LINK has been on (`[keeper] enabled = true`), without a launch
-//!   that had it off, for at least [`Bar::min_days`] up to now — the setting the plan soaks
-//!   under, not a keeper running every day. A launch whose keeper did not answer at boot
-//!   (`keeper=absent`) does not break the streak (its link registers with the next keeper
-//!   that answers); one with the link off, or a row from a build before `keeper=`, does. The
-//!   report counts the streak's launches a keeper answered apart from those none did.
-//! * `real-kills`: at least [`Bar::min_kills`] launches recovered sessions after a run that
-//!   ended unexpectedly (killed, a fatal signal, a panic: `EndClass::is_unexpected`). A
-//!   recovery after a quit or a handoff is not a kill, and neither is one after a run whose
-//!   end the ledger cannot say (no evidence left, still running, no earlier row).
-//! * `exact`: of the sessions a keeper offered those launches, at least
-//!   [`Bar::min_exact_permille`] came back exactly (`restore=exact`); a refused one counts
-//!   against it.
-//! * `none-blank`: none of them came back blank (the META rung: no region, a region that
-//!   could not be read, the poison brake, the memory budget).
-//! * `no-miss`: no kill the keeper held went unrecovered: no kill of a run whose keeper link
-//!   was on was followed by a launch whose keeper answered and that recovered nothing, and
-//!   no session a keeper offered after a kill was refused. A run whose link found no keeper
-//!   at boot (`keeper=absent`) counts as held: its link registers every terminal with the
-//!   first keeper that answers while it lives (`aterm keeper start` in one of its tabs is
-//!   the common way a keeper starts during the opt-in soak). The one case that reads as a
-//!   miss and was not is a keeper started only after such a run died; the gate errs toward
-//!   NOT MET there, and the miss names the killed run's pid to look at.
-//!
-//! What it reports and does not judge: the losses the crash-restore plan's §8 waits on
-//! (bytes read and never processed, overflowed tails, scrollback lines), and every
-//! `restore_why=` word. And one precondition no ledger can show: the real-Claude lab's read
-//! of Claude Code after a restore that was not exact (Q1), which is a lab run, not a row
-//! (read on Claude Code 2.1.304, `docs/measured/real-claude-lab-2026-10-15.md`: it repaints
-//! its visible screen in place and never reprints its transcript; a new build is read again).
-//!
-//! It decides nothing: P4 is not built, and when it is, its brief runs this
-//! (`targo --unverified verify soak`). The judgement is a pure function of the rows and the
-//! clock, so the tests drive it with rows of their own.
+//! THE CRASH RESTORE'S SOAK.
 
 use crate::recovery_ledger::{EndClass, KeeperAtLaunch, Restores, Row};
 
@@ -59,16 +12,11 @@ pub struct Bar {
     pub min_days: u64,
     /// Launches that recovered sessions after an unexpected end.
     pub min_kills: u32,
-    /// Of the sessions those launches recovered, the share that came back exactly, in
-    /// thousandths.
+    /// Of the sessions those launches recovered, the share that came back exactly, in thousandths.
     pub min_exact_permille: u32,
 }
 
-/// The bar keeper P4 waits on. Two weeks spans a person's ordinary use (updates, a
-/// logout, a reboot, the odd Force Quit); three kills are the fewest that are not one
-/// incident; nine in ten exact is the plan's exactness envelope (`docs/DESIGN-crash-
-/// restore-2026-10-20.md` §4: agents and shells restore exactly, a flood at the moment of
-/// death does not). Not a measurement: a decision, here so it is stated once.
+/// The bar keeper P4 waits on.
 pub const P4: Bar = Bar {
     min_days: 14,
     min_kills: 3,
@@ -105,9 +53,7 @@ pub struct Soak {
     pub rows: usize,
     /// The oldest row of the current keeper-on streak, when the newest row's link is on.
     pub streak_since: Option<u64>,
-    /// Launches in that streak whose keeper answered at boot (`keeper=on`), whose link was
-    /// armed for an update's Commit (`keeper=armed`), and whose keeper did not answer
-    /// (`keeper=absent`).
+    /// Launches in that streak whose keeper answered at boot (`keeper=on`).
     pub streak_on: u32,
     /// See [`Self::streak_on`].
     pub streak_armed: u32,
@@ -117,17 +63,13 @@ pub struct Soak {
     pub kills_recovered: u32,
     /// Those recoveries summed ([`Restores`]: rungs, losses, words).
     pub restores: Restores,
-    /// Of [`Self::kills_recovered`], how many lost bytes in flight, and how many lost
-    /// scrollback: the plan's §8 signals for a gather-stage tail and a disk tier.
+    /// Of [`Self::kills_recovered`], how many lost bytes in flight, and how many lost scrollback.
     pub kills_in_flight: u32,
     /// See [`Self::kills_in_flight`].
     pub kills_history: u32,
-    /// Launches that recovered sessions after a run that ended on purpose (a quit whose
-    /// sessions the keeper kept, a handoff): reported, never counted as a kill.
+    /// Launches that recovered sessions after a run that ended on purpose.
     pub other_recoveries: u32,
-    /// Launches that recovered sessions after a run whose end the ledger cannot say (no
-    /// evidence left, still running, no earlier row): reported, never counted as a kill,
-    /// though one may have been.
+    /// Launches that recovered sessions after a run whose end the ledger cannot say.
     pub unclassified_recoveries: u32,
     /// Kills the keeper should have brought back and did not.
     pub misses: Vec<Miss>,
@@ -142,8 +84,7 @@ impl Soak {
         self.criteria.iter().all(|c| c.met)
     }
 
-    /// The report, one line each: the criteria, the losses, what is not judged here, and
-    /// the verdict last.
+    /// The report, one line each.
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
         let mut lines: Vec<String> = self
@@ -206,7 +147,6 @@ impl Soak {
     }
 }
 
-/// Whether a row's link counts toward the streak: on, armed or absent (the link was on,
 /// whatever answered it).
 fn streak_link(row: &Row) -> Option<KeeperAtLaunch> {
     row.keeper.filter(|k| k.link_on())
@@ -226,11 +166,9 @@ fn percent(p: u32) -> String {
     format!("{}.{}%", p / 10, p % 10)
 }
 
-/// Fold `rows` (oldest first, as [`crate::recovery_ledger::read_rows`] returns them) into the
-/// soak, judged against `bar` at `now` (Unix seconds).
+/// Fold `rows` into the soak, judged against `bar` at `now`.
 #[must_use]
 pub fn judge(rows: &[Row], now: u64, bar: &Bar) -> Soak {
-    // The streak: back from the newest row while each row's link was on.
     let mut streak_since = None;
     let (mut on, mut armed, mut absent) = (0u32, 0u32, 0u32);
     for row in rows.iter().rev() {
@@ -258,7 +196,6 @@ pub fn judge(rows: &[Row], now: u64, bar: &Bar) -> Soak {
         match (&row.restores, killed) {
             (Some(r), true) => {
                 // A recovery that refused every offer brought nothing back: its refusals
-                // count against `exact` and `no-miss`, and it is no recovered kill.
                 if r.recovered() > 0 {
                     kills_recovered = kills_recovered.saturating_add(1);
                     kills_in_flight =
@@ -276,9 +213,6 @@ pub fn judge(rows: &[Row], now: u64, bar: &Bar) -> Soak {
             }
             (None, true) if row.keeper == Some(KeeperAtLaunch::On) => {
                 // The killed run's own row, when the ledger still holds it: was its keeper
-                // link on? Then its terminals were registered with whichever keeper answered
-                // it, at boot (`on`), at its Commit (`armed`) or since (`absent`: the link
-                // registers with the first keeper that answers).
                 let Some(killed_pid) = row.prev.pid else {
                     continue;
                 };
@@ -295,8 +229,6 @@ pub fn judge(rows: &[Row], now: u64, bar: &Bar) -> Soak {
                     });
                 }
             }
-            // No recovery and no kill, a kill no keeper answered after, or a recovery
-            // after a run that did not end unexpectedly that refused every offer.
             _ => {}
         }
     }
@@ -336,7 +268,6 @@ pub fn judge(rows: &[Row], now: u64, bar: &Bar) -> Soak {
             bar.min_kills
         ),
     });
-    // Every session a keeper offered after a kill: the refused ones came back on no rung.
     let sessions = restores.recovered().saturating_add(restores.refused);
     let exact = permille(restores.exact, sessions);
     criteria.push(Criterion {
@@ -403,7 +334,6 @@ pub fn judge(rows: &[Row], now: u64, bar: &Bar) -> Soak {
     }
 }
 
-/// Add one recovery's [`Restores`] to a running sum (the `restore_why` words by word, in
 /// the order each was first seen).
 fn add(sum: &mut Restores, r: &Restores) {
     sum.exact = sum.exact.saturating_add(r.exact);

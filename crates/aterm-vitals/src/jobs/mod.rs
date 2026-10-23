@@ -1,40 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Stuck processes and jobs (`docs/DESIGN-system-awareness-2026-10-16.md`
-//! §11): what each job in a tab is doing, and whether anyone should worry.
-//!
-//! The unit is a **job**, never a process: a per-process test misfires on
-//! every compiler driver (the `clang` driver reads 0 CPU while `cc1` works).
-//! The verdict comes from naming the wait with kernel facts and from who waits
-//! for the job, because no counter separates a legitimate wait from a stuck
-//! one.
-//!
-//! The host calls [`Jobs`] once per probe tick, in two steps:
-//!
-//! 1. [`Jobs::plan`] over the cheap process sweep and the tabs names the
-//!    processes to read in detail (each tab's shell, its descendants, the
-//!    members this engine remembers, and the consumers of detached jobs) and
-//!    which of them need their descriptors;
-//! 2. the host reads them (`aterm_sysprobe::jobs::JobsReader::read_all`) and
-//!    hands the readings to [`Jobs::absorb`], which returns one [`JobsView`]:
-//!    a [`JobRow`] per job (its [`Class`], [`Wait`], quiet age, φ, closed
-//!    [`Verdict`] and the no-progress word beside it) and the per-process
-//!    [`Findings`].
-//!
-//! * [`units`]: job units (§11.3): the shell's foreground and background
-//!   jobs, detached children (an agent's tool calls, by the general law: a
-//!   child that leads its own session with no terminal is a job whose
-//!   consumer is its parent), orphans, and the members each keeps.
-//! * [`wait`]: naming the wait from kernel facts (Tier A, §11.5) and mapping a
-//!   sampled stack's leaf frame (Tier B, §11.8).
-//! * [`step`]: one job's tick — progress (§11.4), the class with its
-//!   hysteresis (§11.5), legitimacy (§11.6), φ and the verdict (§11.7).
-//! * [`wire`]: the `sys jobs` row text (§11.10) and the person's sentence.
-//!
-//! Pure: the host owns the clock (`at_ms`, its monotonic milliseconds) and the
-//! OS. These types mirror `aterm_sysprobe::jobs`' readings field for field so
-//! the host's conversion is a move, and this crate keeps no dependency.
+//! Stuck processes and jobs: what each job in a tab is doing, and whether anyone should worry.
 
 pub mod step;
 pub mod units;
@@ -51,8 +18,7 @@ pub use step::{Fault, Progress, Tick, Track};
 pub use units::Jobs;
 pub use wait::{TierB, map_leaf_frame};
 
-/// How long a job reads RUNNING after a progress event (the `quiet_after`
-/// window, `session_status.rs`).
+/// How long a job reads RUNNING after a progress event.
 pub const RUNNING_WINDOW_MS: u64 = 5_000;
 /// How long an exited job keeps its row.
 pub const EXITED_KEEP_MS: u64 = 60_000;
@@ -64,38 +30,26 @@ pub const MU_PRIOR_MS: u64 = 60_000;
 pub const PHI_QUIET_MILLI: u64 = 3_000;
 /// φ × 1000 below which a quiet job reads fine again.
 pub const PHI_QUIET_LEAVE_MILLI: u64 = 2_500;
-/// φ × 1000 at which a stuck-capable job reads stuck, and an agent's quiet
-/// call with no CPU reads `no_progress`.
+/// φ × 1000 at which a stuck-capable job reads stuck.
 pub const PHI_STUCK_MILLI: u64 = 8_000;
-/// CPU a minute (Σ over the members, ns) under which an agent's call quiet
-/// at φ ≥ 8 reads `no_progress` over its suspect run: 1 ms, the hung-call
-/// design's first bound (D2). Measured so far (2026-10-20, `proc_pid_rusage`
-/// over 60 s): a live `targo --unverified test` call's waiting members used
-/// 0 ns. A hung test binary itself is not yet measured.
+/// CPU per minute below which a job makes no CPU progress.
 pub const NO_PROGRESS_CPU_NS_PER_MIN: u64 = 1_000_000;
-/// How long a zombie must have been seen before it is a zombie class or a
-/// finding: the normal exit-to-reap window is skipped.
+/// How long a zombie must have been seen before it is a zombie class or a finding.
 pub const ZOMBIE_AGE_MS: u64 = 10_000;
-/// How long a thread must have been in an uninterruptible wait to be named
-/// `kernel` or counted as D-state.
+/// How long a thread must have been in an uninterruptible wait to be named `kernel`.
 pub const KERNEL_WAIT_MS: u64 = 10_000;
-/// How long an agent's foreground call follows or listens before it is
-/// "never returns".
+/// How long an agent's foreground call follows or listens before it is "never returns".
 pub const NEVER_RETURNS_MS: u64 = 10_000;
-/// How long an orphan must burn a core with no side writes to be a
-/// busy-silent orphan finding.
+/// How long an orphan must burn a core with no side writes to be a busy-silent orphan finding.
 pub const BUSY_ORPHAN_MS: u64 = 600_000;
 /// The intervals a job's own μ is the median of (the last ones).
 pub const OWN_RING: usize = 32;
-/// Intervals a job needs before its own median is its μ (and before it
-/// teaches its command class).
+/// Intervals a job needs before its own median is its μ (and before it teaches its command class).
 pub const OWN_MIN: usize = 3;
 /// Command classes remembered (least recently used dropped).
 pub const CLASS_TABLE: usize = 256;
 /// Completed jobs' medians a class keeps.
 pub const CLASS_RING: usize = 16;
-
-// What the host reads
 
 /// A process's scheduling state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -117,8 +71,7 @@ pub enum ProcState {
     Unknown,
 }
 
-/// One process from the cheap sweep of the whole table
-/// (`aterm_sysprobe::procs::ProcessReading`).
+/// One process from the cheap sweep of the whole table (`aterm_sysprobe::procs::ProcessReading`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SweepProc {
     /// Its pid.
@@ -254,9 +207,7 @@ pub enum FdKind {
         dev: u64,
         /// Its inode.
         ino: u64,
-        /// Whether the bytes appended since the reader's last look hold a line
-        /// feed; `None` when nothing was appended, at a first look, or when the
-        /// file is not one the reader may open (its growth counts unverified).
+        /// Whether the bytes appended since the reader's last look hold a line feed.
         lf_tail: Option<bool>,
     },
     /// A character device.
@@ -270,8 +221,7 @@ pub enum FdKind {
         handle: u64,
         /// The other end's handle (Linux: the same inode).
         peer: u64,
-        /// The pipe state word (Darwin: `0x8` a reader waits, `0x10` a writer
-        /// waits); `None` where the OS gives none or lane L7 is off.
+        /// The pipe state word; `None` where the OS gives none or lane L7 is off.
         status: Option<u32>,
         /// Bytes queued in this end's buffer.
         queued: Option<u64>,
@@ -330,8 +280,7 @@ pub struct JobProc {
     pub uid: Option<u32>,
     /// Its short name (`p_comm`, `comm`).
     pub name: String,
-    /// Its executable's basename (`proc_pidpath`, `/proc/<pid>/exe`): the
-    /// name rows print (§13.3), `name` where `None`.
+    /// Its executable's basename: the name rows print, `name` where `None`.
     pub exe: Option<String>,
     /// Its state.
     pub state: ProcState,
@@ -429,11 +378,9 @@ pub enum Consumer {
     PersonBg,
     /// An agent's foreground tool call: the agent waits for it.
     AgentFg,
-    /// An agent's background call (run in the background, or promoted at a
-    /// timeout).
+    /// An agent's background call (run in the background, or promoted at a timeout).
     AgentBg,
-    /// An agent, foreground or background unknown: treated like background, so
-    /// no "never returns" is said without evidence.
+    /// An agent, foreground or background unknown.
     Agent,
     /// Nobody: an orphan.
     Nobody,
@@ -465,16 +412,14 @@ pub struct CallHint {
     pub promoted_ms: Option<u64>,
     /// The agent's task id for it.
     pub task: Option<String>,
-    /// The call's command line (its `eval '…'` argv after quote removal), for
-    /// the command class.
+    /// The call's command line (its `eval '…'` argv after quote removal), for the command class.
     pub command: Option<String>,
 }
 
 /// A Tier B naming the host made for one job, on request (§11.8).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NamedWait {
-    /// A pid of the job: its leader, the group in front of its block, or
-    /// the member whose stack was sampled.
+    /// A pid of the job.
     pub leader: u32,
     /// The mapped word.
     pub word: TierB,
@@ -514,8 +459,7 @@ pub struct JobTab {
 /// The machine, as the host reads it this tick.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Machine {
-    /// `Contention::factor_milli`: thresholds stretch by this (1000 = idle,
-    /// at most 10,000).
+    /// `Contention::factor_milli`: thresholds stretch by this (1000 = idle, at most 10,000).
     pub stretch_milli: u32,
     /// The machine reads `thrashing` (§9.2).
     pub thrashing: bool,
@@ -579,18 +523,14 @@ pub struct Want {
     pub fds: bool,
 }
 
-// What the engine says
-
 /// What kind of unit a job is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum JobKind {
-    /// The shell's foreground job (an OSC 133 command, or without shell
-    /// integration the foreground group that is not the shell's).
+    /// The shell's foreground job.
     Shell,
     /// Another group in the tab's session.
     ShellBg,
-    /// A detached child: an agent's tool call, or any child that leads its own
-    /// session with no terminal.
+    /// A detached child.
     AgentCall,
     /// What lived on after its job ended.
     Orphan,
@@ -609,8 +549,7 @@ impl JobKind {
     }
 }
 
-/// A job's class (§11.5): what it is doing. A different word set from
-/// [`Verdict`], and never a stand-in for one.
+/// A job's class (§11.5): what it is doing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Class {
     /// No live member.
@@ -670,8 +609,7 @@ impl Class {
     }
 }
 
-/// The closed verdict set (§11.7): exactly these nine words, in `sys`,
-/// `await sys`, the skill and every chip.
+/// The closed verdict set (§11.7).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Verdict {
     /// Nothing to say.
@@ -689,8 +627,7 @@ pub enum Verdict {
     Slow,
     /// φ ≥ 8 on a stuck-capable class, or the gate's published stall.
     Stuck,
-    /// An agent's foreground call that follows or listens: it never returns
-    /// by itself.
+    /// An agent's foreground call that follows or listens: it never returns by itself.
     NeverReturns,
     /// No live member (kept [`EXITED_KEEP_MS`]).
     Exited,
@@ -726,8 +663,7 @@ impl Verdict {
         }
     }
 
-    /// The verdict a wire word names; `done` is `await sys`'s alias of
-    /// `exited`.
+    /// The verdict a wire word names; `done` is `await sys`'s alias of `exited`.
     #[must_use]
     pub fn from_word(w: &str) -> Option<Self> {
         if w == "done" {
@@ -736,8 +672,7 @@ impl Verdict {
         Self::ALL.into_iter().find(|v| v.word() == w)
     }
 
-    /// The mark a chip or row draws (§11.7 "Shown as"); `None` for a verdict
-    /// shown as words alone or not at all.
+    /// The mark a chip or row draws; `None` for a verdict shown as words alone or not at all.
     #[must_use]
     pub const fn mark(self) -> Option<char> {
         match self {
@@ -845,8 +780,7 @@ pub struct Wait {
     pub name: WaitName,
     /// How it counts, the pipe's peer decided.
     pub standing: Standing,
-    /// The process it names: the pipe's writer or reader, the server's
-    /// consumer.
+    /// The process it names: the pipe's writer or reader, the server's consumer.
     pub peer: Option<u32>,
     /// The waiting process.
     pub leaf: u32,
@@ -925,8 +859,7 @@ impl MuFrom {
 /// One job, as the engine sees it this tick.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobRow {
-    /// Its id, stable per session: `a<leader pid>` an agent call, `b<block>`
-    /// an OSC 133 command, `j<leader pid>` a shell job, `o<pid>` an orphan.
+    /// Its id, stable per session.
     pub id: String,
     /// The tab it belongs to.
     pub tab: u64,
@@ -942,8 +875,7 @@ pub struct JobRow {
     pub pgid: u32,
     /// The leader's pid and start.
     pub leader: (u32, Option<u64>),
-    /// The process the row names: the waiting leaf for a wait, else the
-    /// leader.
+    /// The process the row names: the waiting leaf for a wait, else the leader.
     pub exe: String,
     /// Live members.
     pub members: usize,
@@ -963,8 +895,7 @@ pub struct JobRow {
     pub zombies: Option<Zombies>,
     /// How it counts this tick.
     pub standing: Option<Standing>,
-    /// Quiet age, ms: the suspect quiet for a suspect job, the wait's age for
-    /// a legitimate one.
+    /// Quiet age, ms: the suspect quiet for a suspect job, the wait's age for a legitimate one.
     pub quiet_ms: Option<u64>,
     /// φ × 1000 (0 for a legitimate wait; `None` where φ is not used).
     pub phi_milli: Option<u64>,
@@ -974,10 +905,7 @@ pub struct JobRow {
     pub mu_from: Option<MuFrom>,
     /// The verdict.
     pub verdict: Verdict,
-    /// An agent's call quiet at φ ≥ 8 whose members used under
-    /// [`NO_PROGRESS_CPU_NS_PER_MIN`] over its suspect run (the hung-call
-    /// design's D2): a word derived beside the verdict, never a verdict of its
-    /// own, so the verdict stays quiet.
+    /// An agent's call quiet at φ ≥ 8 whose members used under [`NO_PROGRESS_CPU_NS_PER_MIN`].
     pub no_progress: bool,
     /// The suspect episode this verdict belongs to (each says a rank once).
     pub episode: u32,
@@ -1089,20 +1017,12 @@ pub struct JobsView {
     pub demand: Demand,
     /// Lanes that are off, as `lane_off:<name>` words for `sys jobs --json`.
     pub lanes_off: Vec<&'static str>,
-    /// The tabs PARKED ON THE PERSON'S READ this tick, ascending: each has a
-    /// live job, and every live job of it holds the foreground at the
-    /// person's own terminal read (`tty-raw` or `tty-password` named from a
-    /// mode word stamped after its last terminal output, no key queued,
-    /// whatever its class) and is neither stuck nor capable of suspicion, so
-    /// the tab adds no demand. The host reads it to judge its output edges
-    /// (design §6.1: a parked screen's own redraws start no job). Not on the
-    /// wire.
+    /// The tabs PARKED ON THE PERSON'S READ this tick, ascending.
     pub parked_tabs: Vec<u64>,
 }
 
 impl JobsView {
-    /// The row with this id (ids are unique per tab; a live row before an
-    /// exited one of another tab).
+    /// The row with this id.
     #[must_use]
     pub fn row(&self, id: &str) -> Option<&JobRow> {
         self.rows
@@ -1118,11 +1038,7 @@ impl JobsView {
     }
 }
 
-// The command class table (μ learned per command)
-
-/// The command class of a command line: the basename of its first word
-/// (skipping `NAME=value` assignments), at most 32 bytes, plus the job kind.
-/// A general rule with no per-program table.
+/// The command class of a command line.
 #[must_use]
 pub fn command_class(command: &str, kind: JobKind) -> String {
     let word = command
@@ -1148,9 +1064,7 @@ fn is_assignment(w: &str) -> bool {
     }
 }
 
-/// Learned μ per command class: each class keeps the medians of its last
-/// [`CLASS_RING`] completed jobs; [`CLASS_TABLE`] classes, least recently
-/// used dropped. Not persisted (O13).
+/// Learned μ per command class.
 #[derive(Clone, Debug, Default)]
 pub struct ClassTable {
     rows: HashMap<String, (u64, VecDeque<u64>)>,
@@ -1215,9 +1129,7 @@ pub fn median(values: impl IntoIterator<Item = u64>) -> u64 {
     v[(v.len() - 1) / 2]
 }
 
-/// φ × 1000 for `quiet_ms` against `mu_ms`: `t / (μ · ln 10)`, the
-/// exponential phi-accrual form (the log-odds that progress should have
-/// arrived by now).
+/// φ × 1000 for `quiet_ms` against `mu_ms`: `t /`, the exponential phi-accrual form.
 #[must_use]
 pub fn phi_milli(quiet_ms: u64, mu_ms: u64) -> u64 {
     let den = u128::from(mu_ms.max(1)) * 2_302_585;

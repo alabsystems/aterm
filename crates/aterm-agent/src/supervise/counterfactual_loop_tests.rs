@@ -1,14 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// COUNTERFACTUALS OVER A RECORDED LOOP (`run_tests.rs`'s
-// `counterfactual_loop` module, the replay plan's T9): runs of the loop's
-// engine recorded over the scripted worker under `approve = "all"` — a Read
-// outside every allowed root, which only "all" presses, and a read-only Bash
-// box, which every policy presses — then replayed under another policy. Every
-// assertion is on the structured `Report` (`tape::report`), never its
-// rendering.
-
 use crate::supervise::fx::plant_clock_read;
 use crate::supervise::tape::acts::Candidate;
 use crate::supervise::tape::doors;
@@ -109,11 +101,7 @@ fn divergent_act(report: &Report) -> Option<(Option<&ActSide>, Option<&ActSide>)
     }
 }
 
-/// WOULD IT HAVE PRESSED UNDER "SAFE"? The run recorded under "all" pressed
-/// both boxes; replayed under `approve = "safe"`, the candidate takes another
-/// act at the first press — it escalates the Read instead — and the replay
-/// stops there: DIVERGED, a decision, the recorded press and the candidate's
-/// badge both said, and the decision before each.
+/// WOULD IT HAVE PRESSED UNDER "SAFE"?
 #[test]
 fn a_safe_policy_diverges_at_the_press_all_took() {
     let (bytes, keys) = recorded();
@@ -226,8 +214,7 @@ fn an_extra_clock_read_passes_acts_and_drifts_strict() {
 /// THE HOSTED LOOP'S TAPE — what `aterm drive replay` replays in a shipped
 /// build: a hosted run under the default policy ("all") pressed the Read;
 /// under `approve = "safe"` the candidate escalates it instead, and the
-/// replay stops at the press. Under its own policy the same tape reproduces
-/// (the equivalence suite holds every hosted tape to that, exactly).
+/// replay stops at the press.
 #[test]
 fn a_hosted_tape_diverges_under_safe_at_the_press() {
     let dir = crate::supervise::test_scratch_path("ledger", "counterfactual-hosted");
@@ -450,10 +437,7 @@ fn worked_turn(said: &str) -> Vec<String> {
 
 /// AUTOPILOT OFF WHERE THE RECORDED RUN PRESSED: the candidate parks — it
 /// gives its claim back, a release the recorded run made only at its end —
-/// and never presses. Housekeeping is never compared (the plan's §5.1), so
-/// that release is answered, not STALE, and the replay stops at the press
-/// the candidate never takes: DIVERGED, a decision, the recorded press and
-/// the recorded decision named.
+/// and never presses.
 #[test]
 fn a_candidate_that_parks_diverges_at_the_press_it_never_takes() {
     let (bytes, _) = recorded();
@@ -510,14 +494,7 @@ fn a_hosted_candidate_that_parks_diverges_at_the_press() {
 
 /// THE CONTINUATION SWITCHED OFF: a run that typed Cruise's continuation
 /// (`config::CONTINUE_TEXT`, `[aterm harness] Autopilot is Cruise: keep
-/// going. …`) at a turn's end (`continue@v1`), replayed with
-/// `continue = false` — the candidate decides nothing there and goes on to
-/// wait for the screen after the continuation, which the recorded run waited
-/// for only once it had typed. The replay stops at the continuation the
-/// candidate went on without: DIVERGED, a decision, the recorded
-/// `turn … <CONTINUE_TEXT>` and the recorded decision named — not STALE at
-/// the wait. Its negative control: the strict replay of the same tape
-/// reproduces.
+/// going.
 #[test]
 fn a_candidate_that_skips_the_continuation_diverges_at_it() {
     let mut m = Mock::new(vec![
@@ -607,13 +584,7 @@ fn without_the_end(items: &mut Vec<crate::supervise::tape::codec::Item>) {
 
 /// A TAPE WITH NO END in acts mode: the recorded run stands for one that did
 /// not press the Bash box and went on running (its press removed, and then
-/// its end). A candidate that does press there takes an act past the
-/// recorded run's last while records are left on the tape: DIVERGED, with
-/// or without the end — never ENDED, which says everything on the tape was
-/// taken. The negative control: a run killed right after its last press
-/// (everything after it cut, the end too) replayed under its own policy
-/// takes every act, and the tape is spent where the candidate asks past it:
-/// ENDED.
+/// its end).
 #[test]
 fn a_tape_with_no_end_is_ended_only_when_spent() {
     for tape in [
@@ -647,8 +618,7 @@ fn a_tape_with_no_end_is_ended_only_when_spent() {
 /// THE SHADOW SAYS WHAT IT COULD NOT DECIDE: on another build, under the
 /// recorded policy, every box is decided again and as recorded, but no turn
 /// end is — so the exit is 3 (the tape cannot say there), never the 0 of
-/// "every point decided as recorded". The negative control: the same tape
-/// on its own build, every point decided again, exits 0.
+/// "every point decided as recorded".
 #[test]
 fn a_shadow_that_could_not_decide_every_point_exits_3() {
     let (bytes, _, _) = recorded_under_header(|text| {
@@ -675,10 +645,6 @@ fn a_shadow_that_could_not_decide_every_point_exits_3() {
     let (bytes, _) = recorded();
     assert_eq!(shadowed(&bytes, &[]).code(), 0);
 
-    // The recorded full-power fallback did not need any disk evidence for
-    // this outside-root read. Adding its root makes the candidate need a
-    // lookup absent from the tape; its conservative fallback is not a known
-    // policy difference and cannot taint later rows.
     let read: Vec<String> = read_box()
         .into_iter()
         .map(|row| row.replace("~/.ssh/config", "/outside/project/readme.txt"))

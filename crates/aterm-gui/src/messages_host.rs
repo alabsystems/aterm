@@ -854,6 +854,7 @@ impl App {
                 | Intent::OpenConfigEditor { .. }
                 | Intent::OpenPath { .. }
                 | Intent::OpenLink { .. }
+                | Intent::ReviewVaultSync
         );
         let performed = self.perform_intent_inner(wid, id, intent, now);
         if navigation && performed && self.messages.mark_seen(id, now) {
@@ -968,6 +969,7 @@ impl App {
             },
             Intent::StopPaste { session } => self.stop_paste(session),
             Intent::EndRecovered => self.end_recovered_sessions() > 0,
+            Intent::ReviewVaultSync => self.review_vault_sync_in_window(wid),
             Intent::ShowTab { .. } => false,
             Intent::ShowSession {
                 window, session, ..
@@ -1073,15 +1075,17 @@ impl App {
             Intent::ApplyUpdate { build } => self.apply_press_applies(id, *build),
             _ => false,
         };
-        let feedback = |performed| act_feedback(&intent, performed, applies);
-        if self.perform_intent(wid, id, intent.clone()) {
-            MessageActOutcome::Performed {
-                feedback: feedback(true),
-            }
+        let performed = self.perform_intent(wid, id, intent.clone());
+        // A System State press says whether the review it opened shows the vault sync's rows.
+        let applies = applies
+            || (performed
+                && intent == Intent::ReviewVaultSync
+                && self.native_runtime.system_state_shows_vault_sync());
+        let feedback = act_feedback(&intent, performed, applies);
+        if performed {
+            MessageActOutcome::Performed { feedback }
         } else {
-            MessageActOutcome::Refused {
-                feedback: feedback(false),
-            }
+            MessageActOutcome::Refused { feedback }
         }
     }
 

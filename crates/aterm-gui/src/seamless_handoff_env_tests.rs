@@ -1,27 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tier-1 for `NativeUpdateSuccessorWarmBeforeClaim` (aterm-spec's
-//! `native_update_successor_warm_before_claim_model`): the real snapshot and intake, driven as a
-//! successor runs them, projected onto the model and checked step by step (each real step admitted
-//! by the named action, every invariant on every state).
-//!
-//! The harness measures what it projects: `captured` (no handoff name left in the process
-//! environment after `HandoffEnv::capture`), `threads_spawned`, `env_mut_after_spawn` (a canary
-//! under every handoff name, planted after the spawn, moves on any set, unset or read-and-clear,
-//! and a plain read would feed the intake a canary, which authenticates nothing), `claim_ok` and
-//! `owned_taken`. The launched lane (macOS) claims over a real `Rendezvous` whose
-//! outgoing end is a thread of this process; the fork lane (unix) prearms and checks the proof
-//! against the parent's expectation. `warm_order`, `warm_miss_px` and `warm_config_moved` are bound
-//! to the `SpawnWarm`, `Reshape`/`RealPresent` and `Rewarm`/`RealPresent` guards, and the intake
-//! under a stale or hostile hint still proves the parent's expectation (`HintNotInProof`). The
-//! negative controls replay the retired env transport (admitted only as the `Buggy`
-//! `PublishToEnv`) and a hint folded into the proof.
-//!
-//! Not driven, and waived by name in `handoff_env`: the warm prologue itself (it builds a GPU
-//! device), the window's reveal and presents, the relative shape's `chdir` (driven by
-//! `control_socket_identity`'s suites) and Prove/Commit (bound by
-//! `NativeUpdateSeamlessHandoffOwnership`'s Tier-1).
+//! Conformance tests for `NativeUpdateSuccessorWarmBeforeClaim`.
 
 #[cfg(target_os = "macos")]
 use super::tests::StagedHandoff;
@@ -142,13 +122,10 @@ fn this_build() -> String {
     )
 }
 
-/// [`pipe_pair`] with both ends owned. The fork-lane intake adopts the ends it is handed (the ready
-/// write end, the commit read end) and closes them on drop, so a test publishes those with
-/// `into_raw_fd()` and drops the others: each number has one closer.
+/// [`pipe_pair`] with both ends owned.
 fn owned_pipe(label: &str) -> (OwnedFd, OwnedFd) {
     let (read, write) = pipe_pair(label);
-    // SAFETY: pipe(2) just returned both numbers to this thread; nothing else
-    // holds them.
+    // SAFETY: Pipe(2) just returned both numbers to this thread; nothing else holds them.
     unsafe { (OwnedFd::from_raw_fd(read), OwnedFd::from_raw_fd(write)) }
 }
 
@@ -174,8 +151,6 @@ fn the_launched_lane_claims_into_the_snapshot_and_adopts_without_touching_the_en
     let own = unsafe { libc::getpid() };
     let parent = AttestedParent::attest_live_for_test(own).expect("this process attests");
 
-    // The launch environment a LaunchServices successor is started with: the out-of-band shape
-    // (no descriptor numbers), as `app_launch_successor::begin_launch` writes it.
     for key in HANDOFF_ENV_KEYS {
         aterm_log::env::unset(key);
     }
@@ -191,7 +166,6 @@ fn the_launched_lane_claims_into_the_snapshot_and_adopts_without_touching_the_en
     aterm_log::env::set(crate::handoff_rendezvous::ENV_PROOF_TERM, "device");
     aterm_log::env::set(crate::control_socket_identity::ENV_IDENTITY, "");
 
-    // Capture.
     let launched = Observed::default();
     let mut env = HandoffEnv::capture();
     let captured = Observed {
@@ -201,7 +175,6 @@ fn the_launched_lane_claims_into_the_snapshot_and_adopts_without_touching_the_en
     };
     step(&model, launched, captured, "Capture");
 
-    // SpawnWarm: a real thread; canaries from here on.
     let (stop, warm) = spawn_warm_thread();
     let planted = plant_canaries();
     let warming = Observed {
@@ -209,8 +182,6 @@ fn the_launched_lane_claims_into_the_snapshot_and_adopts_without_touching_the_en
         ..captured
     };
     step(&model, captured, warming, "SpawnWarm");
-    // WarmDone: the prologue's main-thread section returns without joining
-    // the thread it spawned — the stand-in stays parked through the dial.
     let warming = {
         let done = Observed {
             warm_done: true,
@@ -220,8 +191,6 @@ fn the_launched_lane_claims_into_the_snapshot_and_adopts_without_touching_the_en
         done
     };
 
-    // Dial: the real `claim_incoming` over the snapshot, against the real
-    // listener, whose outgoing end is a thread of this process.
     assert_eq!(
         crate::handoff_rendezvous::take_device_proof_term(&mut env),
         Some(true),
@@ -237,21 +206,18 @@ fn the_launched_lane_claims_into_the_snapshot_and_adopts_without_touching_the_en
                 deadline,
                 &|| false,
             )?;
-            // SAFETY: descriptors this test owns for the length of the call.
+            // SAFETY: Descriptors this test owns for the length of the call.
             let sessions = entries
                 .iter()
                 .map(|(id, fd, pid)| (*id, *pid, unsafe { BorrowedFd::borrow_raw(*fd) }))
                 .collect::<Vec<_>>();
-            // SAFETY: as above.
+            // SAFETY: As above.
             let (ready, commit) = unsafe {
                 (
                     BorrowedFd::borrow_raw(ready_write),
                     BorrowedFd::borrow_raw(commit_read),
                 )
             };
-            // Handed back and dropped once the claim returned; the real outgoing process drops
-            // it as soon as the grant is sent (pinned by handoff_rendezvous's
-            // `a_grant_whose_connection_closes_at_once_is_still_claimed`).
             let granted = peer.transfer(&staged.nonce, &sessions, ready, commit, deadline, None);
             Ok::<_, crate::handoff_rendezvous::RendezvousError>((peer, granted))
         });
@@ -260,14 +226,10 @@ fn the_launched_lane_claims_into_the_snapshot_and_adopts_without_touching_the_en
             &nonce,
             crate::handoff_rendezvous::ClaimDeadlines {
                 dial: deadline,
-                // Past the accept's deadline: the gate side's is the one hang
-                // detector.
                 grant: deadline + aterm_spec::wait::MUST_HAPPEN,
             },
             Some(parent),
         );
-        // The outgoing half's accept is judged first: a successor held for `trustd` is the
-        // machine's, before its claim's end is judged.
         let (peer, granted) = crate::handoff_rendezvous::admitted(
             outgoing.join().expect("the outgoing half"),
             "the successor presents its claim",
@@ -291,7 +253,6 @@ fn the_launched_lane_claims_into_the_snapshot_and_adopts_without_touching_the_en
         "the dial never waited on the warm thread (JoinWorkerBeforeDial)"
     );
 
-    // ClaimOk: the grant lands in the snapshot where the fork lane's arrive.
     assert_eq!(claimed.session_count(), 2);
     claimed.into_intake().install(&mut env);
     let claim_ok = Observed {
@@ -304,7 +265,6 @@ fn the_launched_lane_claims_into_the_snapshot_and_adopts_without_touching_the_en
     };
     step(&model, dialled, claim_ok, "ClaimOk");
 
-    // TakeOwned: the unchanged intake, over the snapshot.
     assert!(incoming_offered_in(&env));
     assert!(
         staged.manifest_path.exists(),
@@ -318,7 +278,6 @@ fn the_launched_lane_claims_into_the_snapshot_and_adopts_without_touching_the_en
     };
     step(&model, claim_ok, owned, "TakeOwned");
 
-    // Adopt: the target, both channels and the socket witness, admitted.
     let target = take_target_identity_from(&mut env).expect("this build is the target");
     let adopted_fds = incoming
         .adopted
@@ -383,8 +342,6 @@ fn a_failed_claim_owns_nothing_and_touches_no_environment() {
     let _restore = restore_all();
     let model = native_update_successor_warm_before_claim_model();
     let staged = stage_outgoing_handoff("p1-refused", 1, None);
-    // A path in the private dir with no listener behind it: bound, then dropped
-    // (which unlinks it), as an outgoing process that gave up leaves it.
     let path = crate::handoff_rendezvous::Rendezvous::bind(&staged.nonce)
         .expect("bind the rendezvous")
         .path()
@@ -490,8 +447,6 @@ fn the_fork_lane_intake_from_the_snapshot_proves_what_the_parent_expects() {
         !env.present(ENV_PARENT_PID),
         "the parent's identity is typed state"
     );
-    // The boot apply's re-exec would carry exactly what is still held, then
-    // the attestation.
     let exec = prearmed.final_exec_env_with(&env);
     assert!(exec.iter().any(|(key, _)| key == ENV_FDS.name()));
     assert!(exec.iter().any(|(key, _)| key == ENV_PARENT_PID.name()));
@@ -540,7 +495,6 @@ fn the_fork_lane_intake_from_the_snapshot_proves_what_the_parent_expects() {
         "no process-environment access after the spawn"
     );
 
-    // `ready` and `commit` own the two published ends (see `owned_pipe`).
     drop((ready, commit, incoming, ready_read, commit_write));
     let _ = stop.send(());
     warm.join().expect("the warm thread");
@@ -548,9 +502,7 @@ fn the_fork_lane_intake_from_the_snapshot_proves_what_the_parent_expects() {
 }
 
 /// Negative control: the retired transport, which wrote the claimed descriptors into the process
-/// environment (three `set_var`s), a data race once a thread is alive. Replayed, the canaries see
-/// it and the model admits the step only as its `Buggy` `PublishToEnv`, which breaks
-/// `NoEnvMutationAfterSpawn`; a projection blind to env writes would fail this test.
+/// environment (three `set_var`s), a data race once a thread is alive.
 #[cfg(unix)]
 #[test]
 fn the_retired_env_transport_is_the_caught_mutant() {
@@ -564,7 +516,6 @@ fn the_retired_env_transport_is_the_caught_mutant() {
     let _env_snapshot = HandoffEnv::capture();
     let (stop, warm) = spawn_warm_thread();
     let planted = plant_canaries();
-    // After Capture, SpawnWarm, Dial and the claim (the harness's walk above).
     let claimed = Observed {
         phase: CLAIMED,
         captured: true,
@@ -574,7 +525,6 @@ fn the_retired_env_transport_is_the_caught_mutant() {
         ..Observed::default()
     };
     assert!(!claimed.env_mut_after_spawn);
-    // The retired transport's three writes.
     aterm_log::env::set(ENV_FDS, "0=9:4000");
     aterm_log::env::set(ENV_READY_FD, "10");
     aterm_log::env::set(ENV_COMMIT_FD, "11");
@@ -601,9 +551,7 @@ fn the_retired_env_transport_is_the_caught_mutant() {
 
 /// The real `warm_order` over every socket shape a launched successor can carry is the model's
 /// `SpawnWarm` guard: before the dial exactly where the model lets a thread exist before the dial,
-/// never on the relative shape, whose intake `chdir`s. Negative control: warming before the dial
-/// on that shape is only the `Buggy` mutant, and the walk breaks `NoCwdChangeAfterSpawn` at the
-/// `chdir`.
+/// never on the relative shape, whose intake `chdir`s.
 #[test]
 fn the_real_warm_order_is_the_models_spawn_guard() {
     let model = native_update_successor_warm_before_claim_model();
@@ -636,7 +584,6 @@ fn the_real_warm_order_is_the_models_spawn_guard() {
             "{explicit:?}: only the relative shape keeps the late order"
         );
         if relative {
-            // Negative control: warm before the dial on the relative shape.
             let mut run = captured.clone();
             assert!(!model.action_enabled("WarmBeforeDialOnRelativeSocket", &run));
             assert!(buggy.fire("WarmBeforeDialOnRelativeSocket", &mut run));
@@ -649,8 +596,6 @@ fn the_real_warm_order_is_the_models_spawn_guard() {
             );
         }
     }
-    // A cold launch and the fork lane carry no rendezvous: they keep the late
-    // order whatever the socket (the model is the launched lane's).
     for explicit in [None, Some("/tmp/at.x/a.sock"), Some("a.sock")] {
         assert_eq!(
             crate::warm_order(false, explicit),
@@ -665,15 +610,12 @@ const CAPTURED_PHASE: i64 = 1;
 /// A stale hint costs a warm, never a frame: the real hint parser, build font
 /// (`launch_font_for_zoom`, what the prologue builds at), launch font (`successor_font_px`, from
 /// the carry) and miss decision (`warm_miss_px`) decide the model's `Reshape`/`RealPresent`
-/// guards. A matching hint builds at the carried size and presents; a stale or hostile one is
-/// re-selected first.
+/// guards.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_stale_hint_is_reselected_before_any_carried_present() {
     use crate::handoff_warm_hint::WarmHint;
     let model = native_update_successor_warm_before_claim_model();
-    // A carry holds the px-at-1x pair this build writes (`size`) and the device
-    // pair for an older successor (`device`); an older parent wrote `device` alone.
     let carry =
         |device: Option<(u32, u32)>, size: Option<(u32, u32)>| crate::session_store::WindowCarry {
             rows: 30,
@@ -698,27 +640,21 @@ fn a_stale_hint_is_reselected_before_any_carried_present() {
     let older = (Some((28_000, 24_000)), None);
     const ZOOM_HINT: &str =
         "w1;windows=1;sessions=1;cols=100;rows=30;px=28000;reset=24000;size=14000;sizereset=12000";
-    // (hint on the wire, the carry the park then writes, a miss expected)
     let cases = [
         ("w1;windows=1;sessions=1;cols=100;rows=30", unzoomed, false),
         (ZOOM_HINT, zoomed, false),
-        // An older parent: device px in the hint and the carry alike.
         (
             "w1;windows=1;sessions=1;cols=100;rows=30;px=28000;reset=24000",
             older,
             false,
         ),
-        // Zoomed during the hold: the hint said unzoomed.
         ("w1;windows=1;sessions=1;cols=100;rows=30", zoomed, true),
-        // Unzoomed during the hold: the hint said zoomed.
         (ZOOM_HINT, unzoomed, true),
-        // Hostile: a size outside the zoom's bounds is no zoom, so no miss.
         (
             "w1;windows=1;sessions=1;cols=100;rows=30;px=999999;reset=24000",
             unzoomed,
             false,
         ),
-        // Unreadable: warms at the config's size, like no hint.
         ("w9;px=28000", zoomed, true),
     ];
     for (wire, (device, size), miss_expected) in cases {
@@ -726,7 +662,6 @@ fn a_stale_hint_is_reselected_before_any_carried_present() {
             .map_or_else(crate::app_config::CarriedZoom::default, |hint| {
                 hint.carried_zoom()
             });
-        // A window launch builds unscaled; its attach selects its scale's px.
         let built = crate::app_config::launch_font_for_zoom(12.0, zoom).build_px(None);
         let launch =
             crate::app_config::successor_font_px(12.0, Some(&carry(device, size))).build_px(None);
@@ -765,19 +700,12 @@ fn a_stale_hint_is_reselected_before_any_carried_present() {
             miss.is_none(),
             "{wire}: no carried present at a stale hint's size"
         );
-        // After the join's re-selection the build size is the launch size.
         let reshaped = miss.unwrap_or(built);
         assert!(crate::warm_miss_px(reshaped, launch).is_none());
     }
 }
 
-/// A config edit during the hold is warmed again before any carried present. Between the read
-/// `main_entry` takes before the early warm and `warm_config_moved` after the intake, the outgoing
-/// process leaves `aterm.toml` alone, saves the same bytes, or changes the font as a Settings save
-/// does (a new file renamed over the old). A re-warm is due exactly when the early warm's config is
-/// not the one the outgoing process parked under: the model's `Rewarm`/`RealPresent` guards.
-/// Negative control: the `Buggy` `PresentUnderStaleConfig` breaks
-/// `CarriedPresentUnderCurrentConfig`.
+/// A config edit during the hold is warmed again before any carried present.
 #[test]
 fn a_config_edit_during_the_hold_is_warmed_again_before_any_carried_present() {
     use crate::native_config_service::VersionedConfigService;
@@ -791,7 +719,6 @@ fn a_config_edit_during_the_hold_is_warmed_again_before_any_carried_present() {
         std::fs::rename(&staged, &path).expect("rename it over aterm.toml");
     };
     let font_px = |service: &VersionedConfigService| service.snapshot().config.font_px;
-    // (what the hold did to the file, the font the outgoing process parked under)
     let holds = [
         ("an idle hold", None, 14.0),
         ("the same bytes saved again", Some("font_px = 14.0\n"), 14.0),
@@ -799,14 +726,12 @@ fn a_config_edit_during_the_hold_is_warmed_again_before_any_carried_present() {
     ];
     for (hold, edit, parked_px) in holds {
         save("font_px = 14.0\n");
-        // Before the dial: the read, then the early warm's own.
         let read = crate::WarmConfigRead::take(Some(&path));
         assert!(read.text.is_some(), "{hold}: the file reads");
         let warmed = VersionedConfigService::load_path(&path).expect("the warm's read");
         if let Some(text) = edit {
             save(text);
         }
-        // After the intake.
         let moved = crate::warm_config_moved(&read, Some(&path));
         assert_eq!(
             moved,
@@ -814,7 +739,6 @@ fn a_config_edit_during_the_hold_is_warmed_again_before_any_carried_present() {
             "{hold}: a re-warm exactly when the early warm read another config"
         );
         if moved {
-            // The re-warm reads the file as it stands: the parked config.
             let rewarmed = VersionedConfigService::load_path(&path).expect("the re-warm's read");
             assert_eq!(font_px(&rewarmed), Some(parked_px), "{hold}");
         }
@@ -847,9 +771,7 @@ fn a_config_edit_during_the_hold_is_warmed_again_before_any_carried_present() {
 
 /// A theme-file edit during the hold is warmed again too, though `aterm.toml` never moves: the
 /// config names a user theme, and the theme's file is saved (renamed over) while this successor
-/// holds its dial. The real read (`WarmConfigRead::take`), early warm (`warm_config`, headless) and
-/// decision after the intake (`warm_config_moved`) re-warm onto the edited theme. Control: an idle
-/// hold keeps the early warm.
+/// holds its dial.
 #[test]
 fn a_theme_file_edit_during_the_hold_is_warmed_again() {
     let dir = aterm_tempfile::tempdir().expect("scratch dir");
@@ -891,8 +813,7 @@ fn a_theme_file_edit_during_the_hold_is_warmed_again() {
 }
 
 /// The hint never reaches the proof: the real intake over a snapshot with no hint, a stale one and
-/// a hostile one computes the proof the outgoing process expects, every time. Negative control: a
-/// hint folded into the layout digest (the mutant `FoldHint`) proves something else.
+/// a hostile one computes the proof the outgoing process expects, every time.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_hint_never_reaches_the_adoption_proof() {
@@ -928,7 +849,6 @@ fn the_hint_never_reaches_the_adoption_proof() {
         assert!(env_is_clear(), "{label}: the hint left the process too");
         let prearmed = prearm_incoming_fds_from(&mut env);
         assert!(!prearmed.rejects_boot(), "{label}");
-        // What main_entry does before the dial: the hint leaves the snapshot.
         let taken = crate::handoff_warm_hint::take_from(&mut env);
         assert_eq!(
             taken.is_ok_and(|hint| hint.is_some()),
@@ -948,8 +868,6 @@ fn the_hint_never_reaches_the_adoption_proof() {
             .iter()
             .map(|item| (item.local_id, item.master.raw(), item.pid))
             .collect::<Vec<_>>();
-        // Negative control: the same proof with the hint folded into the layout digest (the
-        // model's `FoldHint`) is not the parent's.
         if let (Some(hint), Some(layout), Some(screen)) =
             (hint, incoming.layout_digest, incoming.screen_digest)
         {
@@ -992,12 +910,9 @@ fn the_hint_never_reaches_the_adoption_proof() {
             prearmed.parent_pid(),
         );
         assert!(commit.is_some(), "{label}");
-        // `ready` and `commit` own the two published ends (see `owned_pipe`).
         drop((ready, commit, incoming, ready_read, commit_write));
         staged.teardown();
     }
-    // In the model: the fold is admitted only as the mutant, and breaks
-    // `HintNotInProof`.
     let model = native_update_successor_warm_before_claim_model();
     let adopted = Observed {
         phase: 4,
@@ -1020,23 +935,7 @@ fn the_hint_never_reaches_the_adoption_proof() {
 }
 
 /// A FORK-LANE SUCCESSOR MAKES ROOM FOR THE SESSIONS IT ADOPTS (
-/// U9). A successor forked by a producer that never raised its soft descriptor
-/// limit — any build before the park raise raise, started from the Dock at
-/// launchd's 256 — inherits that limit, and each session it adopts then costs
-/// three descriptors more than the master it was handed: its reader's wake pipe
-/// and its exit witness's `kqueue` (`aterm_uds::exitwatch`). Only the launched
-/// lane's claim raised the limit, so from a few dozen sessions the fork lane's
-/// successor ran out of descriptors after Commit.
-///
-/// Driven in a child of the test binary whose soft limit leaves 96 to spare —
-/// launchd's 256 in miniature — through the steps `main_entry` runs on the fork
-/// lane, in its order (the snapshot, the prearm, the descriptor limit, the
-/// intake), and then the descriptors each adopted session opens.
-///
-/// LINUX TOO: the fork lane is POSIX, and until the limit's settle left
-/// `handoff_rendezvous` (macOS's) a Linux fork-lane successor kept its
-/// producer's limit, so the wake pipes ran out there as well (Linux has no exit
-/// witness to open).
+/// U9).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_fork_lane_successor_makes_room_for_the_sessions_it_adopts() {
@@ -1071,21 +970,19 @@ fn a_fork_lane_successor_makes_room_for_the_sessions_it_adopts() {
     let incoming = take_incoming_from(&mut env);
     assert_eq!(incoming.adopted.len(), SESSIONS, "every session is adopted");
 
-    // What each adopted session opens: its reader's wake pipe and its exit
-    // witness (watching this process, which is alive).
     let mut pipes = Vec::new();
     #[cfg_attr(not(target_vendor = "apple"), allow(unused_mut))]
     let mut witnesses: Vec<aterm_uds::exitwatch::ExitWatch> = Vec::new();
     for index in 0..incoming.adopted.len() {
         let mut fds = [0i32; 2];
-        // SAFETY: plain pipe(2) into a valid 2-slot out-array.
+        // SAFETY: Plain pipe(2) into a valid 2-slot out-array.
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
             panic!(
                 "adopted session {index} of {SESSIONS}: its wake pipe could not open: {}",
                 std::io::Error::last_os_error()
             );
         }
-        // SAFETY: pipe(2) just returned both numbers; nothing else holds them.
+        // SAFETY: Pipe(2) just returned both numbers; nothing else holds them.
         pipes.push(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) });
         #[cfg(target_vendor = "apple")]
         {

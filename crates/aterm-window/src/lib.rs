@@ -32,6 +32,7 @@ mod cursor_icon;
 pub mod event;
 pub mod event_loop;
 /// The shadow margin around a client-decorated Wayland window (pixels and geometry; tested on
+/// every host, shown only by the Wayland backend).
 #[cfg(any(test, wayland_platform))]
 #[cfg_attr(not(wayland_platform), allow(dead_code))]
 mod frame_shadow;

@@ -1,48 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Frames the zstd 1.5.7 CLI and pzstd 1.5.7 wrote, kept as recorded answers
-//! for the decoder: each `tests/recorded/cli/*.zst` file, the input it was
-//! made from (regenerated here from `support`), and the SHA-256 and length
-//! of what it decodes to.
-//!
-//! The set covers what the decoder must accept from real producers: the
-//! packers' `zstd -19` from a pipe (no content size, checksum, an 8 MiB
-//! window), `--ultra -22 --long=27` (a 128 MiB window declared), a negative
-//! level without a checksum, a 1 KiB window (blocks smaller than 128 KiB),
-//! a file input (a single-segment frame with its content size), pzstd's
-//! skippable-framed multi-frame output, and the empty frame; and two shapes
-//! the ZC.4 level sweep reached only while libzstd was its encoder: RLE
-//! sequence tables whose codes carry extra bits, and a match 9 MiB back,
-//! past any window but a long one (the recorded sweep, sweep.rs, has the
-//! first; this file alone has the second).
-//!
-//! Recorded 2026-10-15 (docs/AUDIT-third-party-2026-10-15.md ZC.4) with
-//! Homebrew's zstd/pzstd v1.5.7. A scratch crate outside the workspace wrote
-//! each input with `support::{words, mixed, repetitive, one_code,
-//! far_repeat}`, then:
-//!
-//! ```text
-//! zstd -q -19 -c < words-96k.bin > words-96k.19.zst
-//! zstd -q --ultra -22 --long=27 -c < words-96k.bin > words-96k.ultra22-long27.zst
-//! zstd -q --fast=5 --no-check -c < words-32k.bin > words-32k.fast5-nocheck.zst
-//! zstd -q -19 --zstd=wlog=10 -c < words-48k.bin > words-48k.19-wlog10.zst
-//! zstd -q -19 -f mixed-300k.bin -o mixed-300k.19-file.zst
-//! pzstd -q -p 2 -1 -f repetitive-2700k.bin -o repetitive-2700k.pzstd1.zst
-//! zstd -q -c < /dev/null > empty.zst
-//! zstd -q --ultra -22 -c < one-code.bin > one-code.ultra22.zst
-//! zstd -q --ultra -22 --long=27 -c < far-repeat-9m.bin > far-repeat-9m.ultra22-long27.zst
-//! ```
-//!
-//! and `zstd -dc <f> | shasum -a 256` gave the digests below, equal to each
-//! input's own. libzstd decoded every file to its input, and refused each
-//! one byte short, here until ZC.6 took it out of the graph (13f0e82be);
-//! these files outlive it.
-//!
-//! [`aterm_zstd::Decoder`] is held to the same rows: every file decodes to
-//! its input, read whole or a few bytes at a time, alone or all back to back
-//! with a skippable frame between, and every cut of a file inside a frame is
-//! refused.
+//! Frames the zstd 1.5.7 CLI and pzstd 1.5.7 wrote, kept as recorded answers for the decoder.
 
 use crate::support;
 
@@ -147,11 +106,7 @@ fn every_recorded_input_regenerates_to_its_digest() {
 }
 
 /// The two shapes the set was extended for are in it, so decoding them is
-/// not vacuous. `one-code`'s second block declares 24 sequences (byte 24)
-/// with all three tables RLE (modes byte `0x54`), their codes literal length
-/// 16, offset 7 and match length 34, each with extra bits. `far-repeat`
-/// declares a 2^27 window (descriptor `0x88`) and holds its 16 KiB of noise
-/// twice in less than twice its size: the second copy is a match 9 MiB back.
+/// not vacuous.
 #[test]
 fn the_recorded_set_holds_rle_codes_with_extra_bits_and_a_far_match() {
     let one_code = frame("one-code.ultra22.zst");
@@ -207,14 +162,11 @@ fn the_decoder_decodes_every_recorded_frame_to_its_input() {
 /// [`Decoder::require_checksum`] refuses the one recorded frame written
 /// without a checksum (`--no-check`: bit 2 of its descriptor clear), at its
 /// header and before any of its content, and reads every other file as the
-/// plain decoder does. The plain decoder reading that frame (above) is the
-/// negative control.
+/// plain decoder does.
 #[test]
 fn require_checksum_refuses_only_the_frame_written_without_one() {
     for r in RECORDED {
         let zst = frame(r.file);
-        // The first zstd frame's descriptor; pzstd writes a 12-byte
-        // skippable frame first.
         let first = if zst[..4] == MAGIC.to_le_bytes() {
             0
         } else {
@@ -270,18 +222,12 @@ fn the_decoder_reads_the_recorded_frames_as_one_stream() {
 
 /// What each zstd frame of a multi-frame file holds, in order: pzstd split
 /// its 2,700,000-byte input at 2 MiB (`zstd -dc` of the file cut after its
-/// first frame gave 2,097,152 bytes; zstd 1.5.7, 2026-10-16, ZC.6). Every
-/// other file is one frame holding all of its input.
+/// first frame gave 2,097,152 bytes; zstd 1.5.7, 2026-10-16, ZC.6).
 const FRAME_CONTENT: &[(&str, &[usize])] =
     &[("repetitive-2700k.pzstd1.zst", &[2_097_152, 602_848])];
 
 /// Cut anywhere inside a frame, a file is an early end: never a panic, never
-/// a partial success. A cut at a frame boundary past the first (after
-/// pzstd's skippable frame, or between its frames) is a shorter stream: it
-/// decodes to exactly the content of the frames before the cut
-/// ([`FRAME_CONTENT`]; libzstd agreed at every cut while it was the
-/// oracle). Cuts: the first and last 64 bytes, 64 spread through the rest,
-/// and every frame boundary.
+/// a partial success.
 #[test]
 fn the_decoder_refuses_every_recorded_frame_cut_short() {
     for r in RECORDED {
@@ -293,7 +239,6 @@ fn the_decoder_refuses_every_recorded_frame_cut_short() {
             .find(|f| f.0 == r.file)
             .map_or_else(|| vec![r.len], |f| f.1.to_vec());
         assert_eq!(sizes.iter().sum::<usize>(), r.len, "{}", r.file);
-        // Each boundary, and the content of every zstd frame before it.
         let mut held = 0;
         let mut sizes = sizes.into_iter();
         let ends: Vec<(usize, usize)> = frame_ends(&zst)

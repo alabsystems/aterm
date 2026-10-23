@@ -19,6 +19,10 @@ use crate::session_timeline::SessionTimeline;
 use crate::{App, WindowId};
 
 /// The ring kinds the log equals row for record, the whole payload (T19's
+/// exact pairs: as built at 5B-6, `task-change` since 5C-3 writes its mark;
+/// `human` a superset from 5D-4 to 6F-8; `harness-act` since the review of
+/// 6F-7, its act whole at `harness_act=` and an act with no word a record
+/// too).
 const EXACT: [&str; 24] = [
     "agent-change",
     crate::session_status::STATUS_CHANGE,
@@ -47,6 +51,8 @@ const EXACT: [&str; 24] = [
 ];
 
 /// The exact pairs 5B-6's scripted session writes
+/// ([`the_ring_and_the_log_agree_on_the_exact_pairs`]); the others are
+/// [`DRIVEN`]'s, each through its own writer.
 const SCRIPTED: [&str; 7] = [
     "agent-change",
     crate::session_status::STATUS_CHANGE,
@@ -57,36 +63,15 @@ const SCRIPTED: [&str; 7] = [
     "human",
 ];
 
-/// Every timeline kind of plan §0.1.
-const SECTION_0_1: [&str; 25] = [
-    "spawned",
-    "closing",
-    "state-change",
-    "title-change",
-    "cwd-change",
-    "meta-change",
-    "agent-change",
-    "task-change",
-    crate::session_status::STATUS_CHANGE,
-    "human",
-    "render",
-    "modes-restored",
-    "in-doubt",
-    "handoff",
-    "harness-act",
-    "program-state",
-    crate::harness_policy_verb::HARNESS_POLICY_EVENT,
-    "inbox",
-    "inbox-seen",
-    "post",
-    "post-landed",
-    "hold",
-    "fetch",
-    "topic",
-    "hold-advisory",
-];
+/// Every timeline kind of plan §0.1 (the view's own list, which a hand-written
+/// row may name).
+use crate::session_timeline_view::SECTION_0_1;
 
 /// One record as the ring rows it pairs with: the view's grammar
+/// ([`crate::session_timeline_view::rows_of`]), each payload cut by the
+/// ring's own rule, 256 bytes never inside an escape
+/// ([`crate::session_timeline::clamp_payload`]): a view prints the ring's
+/// grammar, its bound too.
 fn project(r: &Rec) -> Vec<(String, String)> {
     crate::session_timeline_view::rows_of(r)
         .into_iter()
@@ -100,6 +85,7 @@ fn project(r: &Rec) -> Vec<(String, String)> {
 }
 
 /// THE VIEW's rows ([`crate::session_timeline_view::timeline_rows`], 6G-2)
+/// as the ring's `(kind, payload)`, oldest first.
 pub(crate) fn overlap_rows(log: &Log) -> Vec<(String, String)> {
     crate::session_timeline_view::timeline_rows(log)
         .into_iter()
@@ -108,6 +94,8 @@ pub(crate) fn overlap_rows(log: &Log) -> Vec<(String, String)> {
 }
 
 /// The view's grammar over every record of `log`, `drop` taken out of each
+/// first (the negative control's lossy view: a grammar blind to `why=`
+/// prints the mail latch's own mark, which the view's does not flag).
 fn overlap_rows_without(log: &Log, drop: Option<Key>) -> Vec<(String, String)> {
     projected(log.window(), drop)
 }
@@ -136,6 +124,7 @@ fn only(rows: Vec<(String, String)>, kinds: &[&str]) -> Vec<(String, String)> {
 }
 
 /// The ring's rows of `kinds`, oldest first, as `(kind, payload)`: the
+/// whole payload, nothing dropped.
 fn ring_rows(tl: &SessionTimeline, kinds: &[&str]) -> Vec<(String, String)> {
     tl.since(None)
         .filter(|e| kinds.contains(&e.kind))
@@ -148,6 +137,8 @@ fn ring_rows(tl: &SessionTimeline, kinds: &[&str]) -> Vec<(String, String)> {
 pub(crate) type Rows = Vec<(String, String)>;
 
 /// The log's view of the exact pairs and the ring's rows of them, oldest
+/// first, for a test outside this module to hold equal (the T2 races' order,
+/// the review of 6F-8): row for record, in order.
 #[cfg(unix)]
 pub(crate) fn exact_view_and_ring(tl: &SessionTimeline) -> (Rows, Rows) {
     (
@@ -157,6 +148,15 @@ pub(crate) fn exact_view_and_ring(tl: &SessionTimeline) -> (Rows, Rows) {
 }
 
 /// THE EXACT PAIRS AGREE (T19): over one scripted session, through each
+/// row's production writer — the status sweep's published transitions (a
+/// failing command, then a prompt), the agent publication (each verdict,
+/// one with no screen stamp), a person's burst (an exact pair again since
+/// 6F-8), two bridge deliveries (and a redelivery, which
+/// writes neither) and a worker's task moved through `task mark` and the
+/// supervisor's attention (and a repeated mark, which writes neither; its
+/// `meta-change` row's text the mark's `attn_text=`, since 6F-8) — the
+/// log's records of the exact pairs, projected, are the ring's rows of those
+/// kinds, in order.
 #[test]
 fn the_ring_and_the_log_agree_on_the_exact_pairs() {
     let mut app = App::headless_for_test();
@@ -263,6 +263,7 @@ fn the_ring_and_the_log_agree_on_the_exact_pairs() {
 }
 
 /// A person's burst, a delivered mail, then the same person typing on
+/// inside that 30 s burst, twice (T39's latch), on session `local`.
 fn drive_human_at(local: u64) -> (SessionHandle, Seen) {
     let (h, store) = rig(local);
     let hand = super::super::tests::hand_clock(&h.ctx.timeline);
@@ -288,6 +289,11 @@ fn drive_human() -> Seen {
 }
 
 /// THE `human` ROWS ARE THE BURST MARKS (T39): a
+/// person's burst, a delivered mail, then the same person typing on inside
+/// that 30 s burst, twice ([`drive_human_at`]): the ring keeps one `human`
+/// row (the burst's); the log holds its mark and one more `human` mark, the
+/// mail latch's (the first input after the mail), which says `why=mail`;
+/// the input after that writes neither.
 #[test]
 fn the_human_rows_are_the_burst_marks_and_the_latchs_own_says_why() {
     let (h, _seen) = drive_human_at(61);
@@ -338,13 +344,19 @@ fn the_human_rows_are_the_burst_marks_and_the_latchs_own_says_why() {
 }
 
 /// How a timeline kind and the log differ (T19's named differences; the lossy rows and the rows on another trigger are
+/// exact pairs, and a retention rule is the one difference left).
 #[derive(Clone, Copy, Debug)]
 enum Diff {
     /// A record (`<op> <kind>`) for every row the log keeps, which it keeps
+    /// under the named rule (phase 6, 6F-4; U39): the driven call writes at
+    /// least one, never more records than rows, and its newest record is
+    /// the newest row ([`retained_row`]); row for row under the rule's rate
+    /// ([`the_program_marks_keep_the_rows_under_their_retention_rule`]).
     Retention(&'static str, &'static str),
 }
 
 /// A `program` record line as the `program-state` row it keeps: `state=<w>
+/// kind=<ask|->`, `none` read as the row's `-`.
 fn retained_row(line: &str) -> String {
     let state = match value(line, "state") {
         Some("none") | None => "-",
@@ -381,6 +393,7 @@ const KNOWN_DIFFERENCES: &[Known] = &[Known {
 }];
 
 /// What one driven call wrote: the ring's rows, and the log's records at
+/// the content tier (`recs`, as lines; `log`, as records).
 #[derive(Clone, Debug, Default)]
 struct Seen {
     rows: Vec<(String, String)>,
@@ -518,6 +531,8 @@ fn drive_closing() -> Seen {
 }
 
 /// The registry's every state move: back to spawning (a test handle is
+/// alive), its reader's first read, the exit, then the close (whose
+/// `state=closed` row is the session close's).
 fn drive_state() -> Seen {
     let (h, store) = rig(43);
     during(&h.ctx.timeline, || {
@@ -533,6 +548,9 @@ fn drive_state() -> Seen {
 }
 
 /// What the drift flush (`App::observe_title_drift`, the production path
+/// of `title-change` and `cwd-change`) wrote for `reports`, each an engine
+/// report (an OSC 2 title, an OSC 7 directory) read past the debounce, on
+/// the App's front session.
 fn drifted(reports: &[&[u8]]) -> Seen {
     let mut app = App::headless_for_test();
     let session = app
@@ -555,6 +573,7 @@ fn drifted(reports: &[&[u8]]) -> Seen {
 }
 
 /// A title, a spinner frame over it, another frame (no move: no row, no
+/// mark, the title's cadence since 6F-8), another title, then none.
 fn drive_title() -> Seen {
     drifted(&[
         b"\x1b]2;vim build\x07",
@@ -566,6 +585,8 @@ fn drive_title() -> Seen {
 }
 
 /// A TITLE AT ITS PRODUCER'S BOUNDS (6F-8): longer than the mark's
+/// `title=` holds, of characters each an escape in the row, then one with
+/// a hidden character: the row prints the title as the mark holds it.
 fn drive_title_at_its_bounds() -> Seen {
     let (h, _store) = rig(71);
     let long = format!("vim {}end", "t\u{e9} ".repeat(80));
@@ -586,6 +607,8 @@ fn drive_cwd() -> Seen {
 }
 
 /// A seamless update's successor reading the directory its predecessor
+/// marked (its fingerprint carried: no row, no mark, since 6F-8), then a
+/// new one, then none (`cwd=-`).
 fn drive_cwd_successor() -> Seen {
     let (h, store) = rig(45);
     h.ctx
@@ -603,6 +626,8 @@ fn drive_cwd_successor() -> Seen {
 }
 
 /// A DIRECTORY AT ITS PRODUCER'S BOUNDS (6F-8): longer than the mark's
+/// `cwd=` holds, of characters each an escape in the row, then one with a
+/// hidden character: the row prints the directory as the mark holds it.
 fn drive_cwd_at_its_bounds() -> Seen {
     let (h, _store) = rig(72);
     let long = format!("/tmp/{}end", "d \u{e9}/".repeat(80));
@@ -622,6 +647,7 @@ fn meta_lines(h: &SessionHandle, store: &Store, lines: &[&str]) {
 }
 
 /// The attention through the `meta` verb (set, another text, unset: its
+/// row's text the mark's `attn_text=` since 6F-8), and a plain field.
 fn drive_meta() -> Seen {
     let (h, store) = rig(46);
     during(&h.ctx.timeline, || {
@@ -639,6 +665,9 @@ fn drive_meta() -> Seen {
 }
 
 /// A META VALUE AT ITS PRODUCER'S BOUNDS (6F-8): the longest description
+/// the `meta` verb takes, of characters each an escape in the row, then
+/// the longest attention text: each row shows 256 bytes, every one of them
+/// the mark's.
 fn drive_meta_at_its_bounds() -> Seen {
     let (h, store) = rig(73);
     let unit = "d\u{e9} ";
@@ -658,6 +687,9 @@ fn drive_meta_at_its_bounds() -> Seen {
 }
 
 /// The Autopilot pair through its writer (`apply_autopilot`, the `meta`
+/// verb's and the window's): a timed Cruise, its timer moved alone (a move
+/// of the pair, its mark `land_at=` since 6F-8), the timer dropped, then
+/// off.
 fn drive_autopilot() -> Seen {
     let (h, _store) = rig(74);
     during(&h.ctx.timeline, || {
@@ -680,6 +712,10 @@ fn drive_autopilot() -> Seen {
 }
 
 /// A seamless update's successor restoring what its predecessor held (the
+/// carried identity, `restore_carried_meta`, and the keyed attention,
+/// `seed_carried_claims`): each restore a row, its mark `carried=1` (the
+/// value the log last said: no news) since 6F-8; then a new
+/// value, a move.
 fn drive_meta_successor() -> Seen {
     use crate::session_timeline::{MetaEdit, MetaField, write_attention_owned};
     let (h, store) = rig(75);
@@ -719,6 +755,7 @@ fn drive_meta_successor() -> Seen {
 }
 
 /// Every kind of render transition: a run's (into the risk, signed, and
+/// healed) and an epoch's (into it, healed, and healed while still open).
 fn drive_render() -> Seen {
     use crate::resize_epoch::{EpochBy, ProgramClass};
     use crate::resize_ledger::Transition as T;
@@ -765,6 +802,7 @@ fn drive_render() -> Seen {
 }
 
 /// A person's reset and a verb's that reverted nothing, then a handback
+/// through the reader's own recorder and one that put nothing back.
 fn drive_modes() -> Seen {
     use crate::manual_reset::{ResetReport, ResetSource};
     let (h, _store) = rig(49);
@@ -805,6 +843,8 @@ fn drive_in_doubt() -> Seen {
 }
 
 /// A seamless update's successor, carried and not (each past the
+/// predecessor's records: the ring is never carried), then a shell the PTY
+/// keeper held through a crash: each one's handoff and registration.
 fn drive_handoff() -> Seen {
     let mut all = Seen::default();
     for carry in [true, false] {
@@ -856,6 +896,10 @@ fn drive_program() -> Seen {
 }
 
 /// THE PROGRAM MARKS KEEP THE ROWS UNDER THEIR RETENTION RULE (6F-4; U39):
+/// moves a second apart (under the run's bucket) are the ring's rows, row
+/// for record, in order; a burst of 60 at one instant is past it, and once a
+/// token frees the log's newest program mark is the ring's newest row,
+/// with the states it replaced counted.
 #[test]
 fn the_program_marks_keep_the_rows_under_their_retention_rule() {
     use aterm_core::terminal::program_state::{ProgramBlockedKind, ProgramStateWord as W};
@@ -952,6 +996,7 @@ fn delivered(local: u64) -> (SessionHandle, Store) {
 }
 
 /// Every `inbox seen` (6F-6): a verdict decided, the same again (moved
+/// nothing: `moved=0`), and a bare seen past it on a second row.
 fn drive_inbox_seen() -> Seen {
     let (h, store) = delivered(54);
     let line = format!(
@@ -984,6 +1029,7 @@ fn post(h: &SessionHandle) {
 }
 
 /// A post with every option (6F-6), then a broadcast on a topic: its
+/// `to=say:<topic>` is the topic's fingerprint on the record.
 fn drive_post() -> Seen {
     let (h, _store) = rig(55);
     during(&h.ctx.timeline, || {
@@ -1018,6 +1064,9 @@ fn post_again(h: &SessionHandle) {
 }
 
 /// Whether `post`'s reply says post `id` is queued, whatever the link: `OK
+/// <id>`, or a refusal of the wait that names the queued id (`ERR fabric
+/// absent id=<id>` with no bridge, `ERR timeout id=<id>` while a parallel
+/// test's link section has one up).
 pub(super) fn queued(reply: &str, id: u64) -> bool {
     let named = format!("id={id}");
     reply.starts_with(&format!("OK {id}")) || reply.split_whitespace().any(|t| t == named)
@@ -1052,6 +1101,7 @@ fn drive_topic() -> Seen {
 }
 
 /// A bridge attached to `store` and its link up: the fabric's `connected`
+/// (inside [`crate::fabric::with_link_reset`]).
 pub(super) fn link_up(store: &Store) -> crate::fabric::BridgeGeneration {
     let generation = crate::fabric::next_bridge_generation();
     crate::fabric::bridge_attached(generation);
@@ -1066,6 +1116,9 @@ pub(super) fn link_up(store: &Store) -> crate::fabric::BridgeGeneration {
 }
 
 /// THE FETCH'S OWN WRITER (`inbox get @<off>`): a read the ring cannot
+/// answer parks, writing its `fetch` row as it parks (the watchers' ring a
+/// one-minute hang detector), and the bridge's `fetched= err=no-record`
+/// answer ends it (inside [`crate::fabric::with_link_reset`]).
 pub(super) fn fetch_answered(h: &SessionHandle, store: &Store, off: u64) {
     let watcher = crate::session_watch::Subscription::single(&h.ctx.watchers);
     let ctx = Arc::clone(&h.ctx);
@@ -1101,6 +1154,8 @@ fn drive_fetch() -> Seen {
 }
 
 /// THE ADVISORY'S OWN WRITER: a bridge that governed the session (a
+/// delivery) is lost, and by default nothing is held: an advisory is put
+/// (inside [`crate::fabric::with_link_reset`]).
 fn drive_advisory() -> Seen {
     crate::fabric::with_link_reset(|| {
         let (h, store) = rig(64);
@@ -1120,6 +1175,7 @@ fn drive_advisory() -> Seen {
 }
 
 /// The longest principal of `class` the grammar admits: its prefix and
+/// [`aterm_types::fabric_grammar::PRINCIPAL_NAME_MAX`] bytes of `fill`.
 fn longest(class: &str, fill: &str) -> String {
     format!(
         "{class}-{}",
@@ -1128,6 +1184,8 @@ fn longest(class: &str, fill: &str) -> String {
 }
 
 /// MAIL AT ITS PRODUCER'S BOUNDS (the review of 6F-6): a delivery from the
+/// longest sender the grammar admits (`s-<32>@n-<32>`, 69 bytes), then its
+/// `inbox seen` with a verdict, which names that sender too.
 fn drive_mail_at_its_bounds() -> Seen {
     let (h, store) = rig(66);
     let from = format!("{}@{}", longest("s", "c"), longest("n", "d"));
@@ -1148,6 +1206,11 @@ fn drive_mail_at_its_bounds() -> Seen {
 }
 
 /// A POST AT ITS PRODUCER'S BOUNDS (the review of 6F-6): to the longest
+/// address (`@s-<32>@n-<32>`), of the longest kind, `re=` and `dl=` at their
+/// widest, through sixteen hops of the longest principal (559 bytes) and
+/// with a 64-byte key — a record the hops leave no room in, so they are cut
+/// there, its row cut by the ring's 256 bytes — then a broadcast whose row
+/// shows 233 bytes of the same hops.
 fn drive_post_at_its_bounds() -> Seen {
     let via = vec![longest("n", "v"); aterm_types::fabric_grammar::VIA_MAX_HOPS].join(",");
     let (h, _store) = rig(67);
@@ -1174,6 +1237,11 @@ fn drive_post_at_its_bounds() -> Seen {
 }
 
 /// A HOLD AT ITS PRODUCER'S BOUNDS (the review of 6F-6): an owner's local
+/// hold whose reason is a flood of `%` (each the caller's literal percent,
+/// its own escape: 42 of them), then the fleet's hold over it, by the
+/// bridge (the longest record's author), whose reason is 42 escapes and two
+/// bytes (128 bytes, 212 encoded: the cap), both standing
+/// (`hold_origin=fleet,local`), then each lifted by its own.
 fn drive_hold_at_its_bounds() -> Seen {
     use crate::fabric::HoldIssuer::{Bridge, Owner};
     let (h, store) = rig(68);
@@ -1195,6 +1263,8 @@ fn drive_hold_at_its_bounds() -> Seen {
 }
 
 /// A KEYED WRITE IN DOUBT AT ITS PRODUCER'S BOUNDS (the review of 6F-7): a
+/// reply whose words are longer than the log's `reply=` holds, and one with
+/// a hidden character: the row prints the words as the mark holds them.
 fn drive_in_doubt_at_its_bounds() -> Seen {
     let (h, _store) = rig(69);
     let key = |seq: u64| {
@@ -1210,12 +1280,21 @@ fn drive_in_doubt_at_its_bounds() -> Seen {
 }
 
 /// Every mode this test can leave on: the kitty keyboard (main and alt), the
+/// alternate screen, mouse reports and their encoding, focus, size and
+/// colour-scheme reports, the alternate scroll off, the xterm keyboard,
+/// cursor and keypad keys, backarrow, num lock, meta and alt sending escape,
+/// insert, newline, reverse video, the DEC graphics in G0 shifted into GL, a
+/// hidden cursor, an open hyperlink, origin mode, margins and a region, a
+/// palette colour, synchronized output, and a sequence cut short.
 const MODES_ON: &[u8] = b"\x1b[>1u\x1b[?1049h\x1b[>1u\x1b[?1000h\x1b[?1006h\x1b[?1004h\
     \x1b[?2048h\x1b[?2031h\x1b[?1007l\x1b[>4;2m\x1b[>4;1f\x1b[?1h\x1b=\x1b[?67h\x1b[?1035h\
     \x1b[?1036h\x1b[?1039h\x1b[4h\x1b[20h\x1b[?5h\x1b(0\x0e\x1b[?25l\x1b]8;;http://x\x1b\\\
     \x1b[?6h\x1b[?69h\x1b[2;10s\x1b[2;10r\x1b]4;1;rgb:00/00/00\x1b\\\x1b[?2026h\x1b[1";
 
 /// A HANDBACK AT ITS PRODUCER'S BOUNDS (the review of 6F-7): a terminal a
+/// program left with [`MODES_ON`], handed back through the reader's own
+/// recorder with the engine's own list of what it put back, longer than the
+/// row's payload shows.
 fn drive_modes_at_its_bounds() -> Seen {
     let mut t = aterm_core::terminal::Terminal::new(24, 80);
     t.process(MODES_ON);
@@ -1234,6 +1313,8 @@ fn drive_modes_at_its_bounds() -> Seen {
 }
 
 /// A kind that left [`KNOWN_DIFFERENCES`] for [`EXACT`] (phase 6, 6F-5 to
+/// 6F-7), with its row's own writer, driven, and a key its projection
+/// cannot do without (the negative control's).
 struct Driven {
     row: &'static str,
     drive: fn() -> Seen,
@@ -1395,6 +1476,9 @@ const DRIVEN: &[Driven] = &[
 ];
 
 /// EVERY EXACT KIND AGREES THROUGH ITS OWN WRITER (phase 6, 6F-5 to 6F-8):
+/// each [`DRIVEN`] kind's writer, driven as production runs it, writes rows
+/// whose every exact pair is a record of the log, projected, row for record
+/// and in order: the whole payload.
 #[test]
 fn every_exact_kind_agrees_through_its_own_writer() {
     for kind in EXACT {
@@ -1426,6 +1510,12 @@ fn every_exact_kind_agrees_through_its_own_writer() {
 }
 
 /// THE SESSION ROWS' WORDS ARE THE LOG'S (6F-7): each word a session row
+/// prints for a field its mark carries as a closed word is in that key's
+/// list, so the mark always carries it and the projection prints the
+/// row's word — a render epoch's program class and healer (an open
+/// epoch's `-` is no word, and its mark has no `healed_by=`), a reset's
+/// source, and a close's reason (the session close's `out=` for each
+/// `ExitReason`).
 #[test]
 fn the_session_rows_words_are_the_logs() {
     use crate::manual_reset::ResetSource;
@@ -1460,6 +1550,9 @@ fn the_session_rows_words_are_the_logs() {
 }
 
 /// THE TABLE IS WHOLE: every kind of §0.1 is an exact pair or a named
+/// difference, once (since 6F-8 no superset kind is left); the kinds are the ones 5B-5's script writes (one row
+/// of each, the goldens' script), and every fabric kind the code lists
+/// ([`crate::fabric::FABRIC_EVENT_KINDS`]) is among them.
 #[test]
 fn every_timeline_kind_is_an_exact_pair_or_a_named_difference() {
     let mut named: Vec<&str> = EXACT
@@ -1492,6 +1585,9 @@ fn every_timeline_kind_is_an_exact_pair_or_a_named_difference() {
 }
 
 /// EVERY NAMED DIFFERENCE STILL HOLDS, through its row's own writer: a
+/// step that closes one (a field the record now carries, a record on the
+/// row's own trigger) turns this red, and its row moves to [`EXACT`] in the
+/// same commit.
 #[test]
 fn every_named_difference_still_holds() {
     let mut errs = Vec::new();
@@ -1568,6 +1664,8 @@ fn exact_of(rows: &[(u64, String, String)]) -> Vec<(String, String)> {
 }
 
 /// THE RETENTION RULE (6F-4; U39) the view's `program-state` rows keep
+/// the ring's by, over the same span: no more of them than the ring's, and
+/// the newest the ring's newest.
 fn program_rule(
     view: &[(u64, String, String)],
     ring: &[(u64, String, String)],
@@ -1600,8 +1698,10 @@ fn program_rule(
 #[derive(Clone, Copy)]
 struct Hold<'a> {
     /// The first ring id of the view's epoch (the ring's `handoff` row's,
+    /// for a log that started over there).
     from: u64,
     /// Every row (`false`: the ring dropped its oldest, so the two are
+    /// held over the ring's span, from its oldest exact row).
     whole: bool,
     /// The ids too: every ring row is a record's, so each id is the ring's.
     ids: bool,
@@ -1610,6 +1710,10 @@ struct Hold<'a> {
 }
 
 /// THE VIEW AGAINST THE RING (6G-2): over the same span, the view's exact
+/// rows are the ring's, whole payload, in order; its `program-state` rows
+/// keep the ring's by their retention rule ([`program_rule`]); and, held to
+/// the ids, the view is the ring row for row: the writers' one-hold order,
+/// no ring row standing where the view has none.
 fn view_against_ring(tl: &SessionTimeline, hold: Hold<'_>) -> Result<(), String> {
     let view = view_ids(tl.slog().log());
     let mut ring: IdRows = ring_ids(tl)
@@ -1646,6 +1750,7 @@ fn view_against_ring(tl: &SessionTimeline, hold: Hold<'_>) -> Result<(), String>
 }
 
 /// A published status transition, as the status sweep records it: the
+/// ring's row and the log's mark in one hold.
 fn status_move(g: &mut SessionTimeline, failed: bool) {
     use crate::session_status::{Confidence, Outcome, Phase, Status};
     let status = Status {
@@ -1693,6 +1798,10 @@ fn shell_run(g: &mut SessionTimeline) {
 }
 
 /// Every writer of a row and its record, interleaved on one session, round
+/// `round`: a directory, the agent's verdict, the title, a task through
+/// `task mark`, a person's burst (its row paid by the next row), a
+/// self-claim's act, a status transition, a program report, the
+/// supervisor's attention and a delivered mail.
 fn every_writer(h: &SessionHandle, store: &Store, round: u64) {
     use aterm_core::terminal::program_state::ProgramStateWord as W;
     {
@@ -1759,39 +1868,36 @@ const BY_ID: Hold<'static> = Hold {
     hand_written: &[],
 };
 
-/// THE VIEW IS THE RING OVER 5B-5's SCRIPT (6G-2): the goldens' session,
+/// THE VIEW IS THE RING OVER THE GOLDENS' SCRIPT, row for row by id, every kind through its writer.
 #[test]
 fn the_view_is_the_ring_over_the_goldens_script() {
     let h = crate::control::wire_goldens::scripted(false);
-    let g = h.ctx.timeline.lock().unwrap();
-    let from = g
-        .since(None)
-        .rfind(|e| e.kind == "handoff")
-        .map(|e| e.id)
-        .expect("the update's row");
-    let hold = Hold {
-        from,
-        whole: true,
-        ids: false,
-        hand_written: &["fetch", "hold-advisory"],
-    };
-    view_against_ring(&g, hold).unwrap_or_else(|e| panic!("{e}"));
+    let mut g = h.ctx.timeline.lock().unwrap();
+    view_against_ring(&g, BY_ID).unwrap_or_else(|e| panic!("{e}"));
     let view = view_ids(g.slog().log());
     let kinds: Vec<&str> = view.iter().map(|r| r.1.as_str()).collect();
-    assert_eq!(kinds.first(), Some(&"handoff"), "{kinds:?}");
+    assert_eq!(kinds.first(), Some(&"spawned"), "{kinds:?}");
+    for kind in ["handoff", "fetch", "hold-advisory"] {
+        assert!(kinds.contains(&kind), "{kind}: {kinds:?}");
+    }
     assert!(kinds.contains(&crate::session_timeline::PROGRAM_STATE));
     assert_eq!(kinds[kinds.len() - 2..], ["closing", "state-change"]);
-    let every = Hold {
-        hand_written: &[],
-        ..hold
-    };
+    g.record(
+        "hold-advisory",
+        "2 reason=bridge-lost origin=fabric".to_string(),
+    );
     assert!(
-        view_against_ring(&g, every).is_err(),
-        "NEGATIVE CONTROL: the hand-written rows are the ring's alone"
+        view_against_ring(&g, BY_ID).is_err(),
+        "NEGATIVE CONTROL: a ring row with no record is the ring's alone"
     );
 }
 
 /// THE VIEW IS THE RING ACROSS A SEAMLESS UPDATE, carried and not, and
+/// after a crash adoption, row for row BY ID (the writers' one-hold
+/// order): the predecessor's view is its ring; the successor's first row,
+/// its `handoff`, takes the id its ring's does, past every id the
+/// predecessor handed out (the count its manifest carried); and every
+/// writer after it keeps the two equal.
 #[test]
 fn the_view_is_the_ring_across_an_update_and_a_crash_adoption() {
     for carry in [true, false] {
@@ -1841,15 +1947,19 @@ fn the_view_is_the_ring_across_an_update_and_a_crash_adoption() {
 }
 
 /// What the ring's own digest tells a watcher at `after`
+/// ([`crate::subscribe::drain_timeline_events`]): its `GAP
+/// events-dropped=` count, 0 for none.
 fn ring_gap(tl: &SessionTimeline, after: Option<u64>) -> u64 {
     let mut out = String::new();
-    let _ = crate::subscribe::drain_timeline_events(tl, "7", after, &mut out);
+    let _ = crate::subscribe::drain_ring_events(tl, "7", after, &mut out);
     out.lines()
         .find_map(|l| l.strip_prefix("GAP 7 events-dropped="))
         .map_or(0, |n| n.parse().expect("a count"))
 }
 
 /// Every reader's id in `anchors` against the ring: the view past it is the
+/// ring's `since` past it, by id, and its `lost` the GAP the ring's digest
+/// tells.
 fn readers_against_ring(
     tl: &SessionTimeline,
     case: &str,
@@ -1888,6 +1998,14 @@ fn readers_against_ring(
 }
 
 /// EVERY READER IS TOLD WHAT THE RING TELLS IT (6G-2, the review of 6G-2):
+/// across a seamless update, carried and not, and a keeper's crash
+/// recovery, a reader at every id (none, each of the predecessor's, the
+/// reserve between, each of the successor's, its head and past it, and a
+/// crashed window's 65,536 above) is shown the rows the ring's `since`
+/// shows it, by id, and told the GAP the ring's digest tells: the update's
+/// jump past the predecessor's id is a loss (`events-dropped=65536`, so a
+/// watcher re-reads its topics, T22), and a crashed window's id above the
+/// recovery's head reads from its first row (U13).
 #[test]
 fn the_view_tells_every_reader_what_the_ring_tells_it() {
     use crate::session_timeline::HANDOFF_ID_RESERVE;
@@ -1949,6 +2067,12 @@ fn the_view_tells_every_reader_what_the_ring_tells_it() {
 }
 
 /// A KEEPER'S RECOVERY NAMES ITS ROWS APART (6G-1's `(epoch, id)`, the
+/// review of 6G-1): a shell the PTY keeper held through two crashes of its
+/// window within one wall second is recovered twice, each through the
+/// production adoption (`spawn::mark_handoff_gap`, `keeper` set, its tag
+/// naming the crashed log's epoch: `Epochs::crash`); each recovery's epoch
+/// is past the one before, so the three windows' rows, keyed by epoch and
+/// id, are disjoint.
 #[test]
 fn a_keeper_recovery_names_its_rows_apart_by_epoch() {
     let keyed = |h: &SessionHandle| -> std::collections::BTreeSet<(u32, u64)> {
@@ -2004,6 +2128,8 @@ fn a_keeper_recovery_names_its_rows_apart_by_epoch() {
 }
 
 /// THE VIEW IS THE RING OF A CLOSED SESSION, row for row by id, over
+/// three rounds of every writer: its close's two rows (`closing`, the last
+/// `state-change`) the session close's two ids.
 #[test]
 fn the_view_is_the_ring_of_a_closed_session() {
     let (h, store) = rig(74);
@@ -2047,6 +2173,11 @@ fn the_view_is_the_ring_of_a_closed_session() {
 }
 
 /// THE VIEW UNDER A FLOOD (6G-2 over 6G-1's floor): 10^4 status changes,
+/// 600 directory moves and 300 program flaps (one each 430 ms, past the
+/// run's bucket), interleaved with 1500 runs, then 500 runs more: the ring
+/// keeps its newest 512 rows, and over their span the view's exact rows
+/// are the ring's, whole, its program rows the ring's by their retention
+/// rule once the pending state is written; the view keeps the floor's 512.
 #[test]
 fn the_view_is_the_ring_under_a_flood() {
     use aterm_core::terminal::program_state::{ProgramBlockedKind, ProgramStateWord as W};
@@ -2143,6 +2274,10 @@ fn the_view_is_the_ring_under_a_flood() {
 }
 
 /// A HOLE REPORTS A GAP (6G-2): 3000 directory moves, more rows than the
+/// log holds, so it takes its oldest: a reader from the start is told how
+/// many row ids it crosses that the log no longer holds, every id it is not
+/// shown, and a reader past the newest hole is told none and shown every
+/// row after it.
 #[test]
 fn a_hole_in_the_view_reports_a_gap() {
     use crate::session_timeline_view::timeline_rows_since;
@@ -2180,6 +2315,10 @@ fn a_hole_in_the_view_reports_a_gap() {
 }
 
 /// THE ROW FOLLOWS ITS RECORD for a self-claim's act (6G-2; the residual
+/// the review of 6F-7 named): a burst of 40 acts at one instant, past the
+/// actor's mark bucket, writes a `harness-act` row for each act the log
+/// recorded and none for one the limiter refused, so the view is the ring
+/// row for row.
 #[test]
 fn an_act_the_limiter_refuses_is_no_row() {
     let (h, _store) = rig(77);
@@ -2196,6 +2335,240 @@ fn an_act_the_limiter_refuses_is_no_row() {
     view_against_ring(&g, BY_ID).unwrap_or_else(|e| panic!("{e}"));
 }
 
+/// The debug cross-check's verdict on `g`, with the `human` rows the ring owes as `owed`.
+fn held(g: &SessionTimeline, owed: u32) -> Result<(), String> {
+    crate::session_timeline_view::ring_against_view(
+        g.since(None),
+        owed,
+        g.slog().log(),
+        g.slog().program_pending(),
+    )
+}
+
+/// THE VIEW'S READS RUN THE CROSS-CHECK, which holds the ring to the view by each kind's rule.
+#[test]
+fn every_reader_reads_the_view_and_the_ring_is_held_to_it() {
+    let (h, store) = rig(81);
+    every_writer(&h, &store, 0);
+    every_writer(&h, &store, 1);
+    {
+        let mut g = h.ctx.timeline.lock().unwrap();
+        let at = g.slog().now();
+        g.slog_mut().human_input(true, at);
+        let owed = g.slog().burst_rows_owed();
+        assert_eq!(owed, 1, "CONTROL: the burst's row is owed, not paid");
+        assert_eq!(held(&g, owed), Ok(()));
+        assert!(
+            held(&g, 0).is_err(),
+            "NEGATIVE CONTROL: the owed row not counted"
+        );
+        // Each reader's read runs the check and reads the view.
+        let view = crate::session_timeline_view::timeline_rows(g.slog().log());
+        assert_eq!(g.view_copy(None, 0).rows(), view);
+        assert_eq!(g.view_since(None).rows, view);
+        assert_eq!(g.view_head(), view.last().map(|e| e.id));
+        let tail: Vec<(&str, u64)> = g.view_newest_first().collect();
+        let want: Vec<(&str, u64)> = view.iter().rev().map(|e| (e.kind, e.t_ms)).collect();
+        assert_eq!(tail, want);
+        let mut frames = String::new();
+        let _ = crate::subscribe::drain_timeline_events(&g, "7", None, &mut frames);
+        assert!(frames.ends_with("EVENT 7 human\n"), "{frames}");
+        g.pay_burst_rows();
+        assert_eq!(held(&g, g.slog().burst_rows_owed()), Ok(()));
+        // A program flap past the bucket: the newest state is pending in
+        // the log, newer than its newest mark, and the rule waits for it.
+        for _ in 0..40 {
+            for state in [
+                aterm_core::terminal::program_state::ProgramStateWord::Working,
+                aterm_core::terminal::program_state::ProgramStateWord::Done,
+            ] {
+                let _ = g.note_program_state(Some(program_report(state, None)));
+            }
+        }
+        assert!(g.slog().program_pending(), "CONTROL: a state is pending");
+        assert_eq!(held(&g, 0), Ok(()));
+    }
+    // Closed: a late ring row after the close is the ring's alone.
+    store
+        .write()
+        .unwrap()
+        .deregister_local_as(81, ExitReason::CtlClose, ExitActor::Ctl);
+    {
+        let mut g = h.ctx.timeline.lock().unwrap();
+        status_move(&mut g, false);
+        assert_eq!(held(&g, 0), Ok(()), "a row past the close");
+    }
+    // NEGATIVE CONTROLS on an open session.
+    let (h, store) = rig(83);
+    every_writer(&h, &store, 0);
+    {
+        let mut g = h.ctx.timeline.lock().unwrap();
+        assert_eq!(held(&g, 0), Ok(()));
+        g.record(
+            crate::session_timeline::PROGRAM_STATE,
+            "state=blocked kind=-".to_string(),
+        );
+        assert!(!g.slog().program_pending());
+        let stale = held(&g, 0).expect_err("NEGATIVE CONTROL: a stale newest program row");
+        assert!(stale.contains("program"), "{stale}");
+        let _ = g.note_program_state(Some(program_report(
+            aterm_core::terminal::program_state::ProgramStateWord::Blocked,
+            None,
+        )));
+        // The view drops the newest row: its writer skipped its record.
+        g.record(
+            crate::session_status::STATUS_CHANGE,
+            "phase=running outcome=none exit_code=- signal=- confidence=exact".to_string(),
+        );
+        let dropped = held(&g, 0).expect_err("NEGATIVE CONTROL: the view drops the newest row");
+        assert!(dropped.contains("status-change"), "{dropped}");
+    }
+    let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let g = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        g.view_copy(None, 0).rows().len()
+    }));
+    let why = read.expect_err("NEGATIVE CONTROL: a reader's read under test panics");
+    let why = why.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(why.contains("THE RING AND THE VIEW DISAGREE"), "{why}");
+}
+
+/// THE ROWS THE LOG HOLDS AS THEIR ROW ALONE: each row-only kind is one `row` mark the view prints whole.
+#[test]
+fn every_row_only_kind_is_a_row_mark_the_view_prints_whole() {
+    use crate::session_timeline_view::ROW_ONLY;
+    let (h, _store) = rig(84);
+    let mut g = h.ctx.timeline.lock().unwrap();
+    for (i, kind) in ROW_ONLY.into_iter().enumerate() {
+        let before = g.view_head();
+        let payload = format!("n={i} tier=warm age_ms=12 at%20b QZP6ROW{i}");
+        let _ = g.record_row(kind, payload.clone());
+        let shown = g.view_since(before);
+        let rows: Vec<(u64, &str, &str)> = shown
+            .rows
+            .iter()
+            .map(|e| (e.id, e.kind, &*e.payload))
+            .collect();
+        assert_eq!(
+            rows,
+            [(before.unwrap_or(0) + 1, kind, payload.as_str())],
+            "{kind}"
+        );
+        let rec = g.slog().log().window().last().cloned().expect("its mark");
+        assert_eq!((rec.op, rec.k), (Op::Mark, Kind::Row), "{kind}");
+        assert_eq!(
+            rec.f.get_str(Key::RowKind),
+            Some(crate::session_timeline_view::row_token(kind).as_str())
+        );
+        let host = aterm_slog::encode(&rec, Tier::Host).expect("encodes");
+        assert!(
+            !host.contains("QZP6ROW") && !host.contains("row_text"),
+            "{host}"
+        );
+        let mut frames = String::new();
+        let _ = crate::subscribe::drain_timeline_events(&g, "7", before, &mut frames);
+        let want = if kind == crate::sys_host::JOB_CHANGE {
+            format!("EVENT 7 job {payload}\n")
+        } else {
+            String::new()
+        };
+        assert_eq!(frames, want, "{kind}");
+    }
+    let before = g.view_head();
+    let at = g.slog().now();
+    let fields = aterm_slog::Fields::new()
+        .tok(Key::RowKind, "no-such-row")
+        .and_then(|f| f.text(Key::RowText, "x=1"))
+        .expect("fields");
+    g.slog_mut()
+        .log_mut_for_tests()
+        .mark(
+            aterm_slog::Mark::new(Kind::Row, aterm_slog::Src::Aterm, aterm_slog::Conf::Exact)
+                .at(Node::SESSION)
+                .fields(fields),
+            at,
+        )
+        .expect("a row mark no kind spells");
+    assert_eq!(g.view_head(), before, "no id for a token no kind spells");
+    // NEGATIVE CONTROL: the text at the host tier is in the host line.
+    let rec = g.slog().log().window().last().cloned().expect("the mark");
+    let mut leaky = rec.clone();
+    leaky.f = aterm_slog::Fields::new()
+        .text(Key::Text, "QZP6ROW1")
+        .expect("a host text");
+    assert!(
+        aterm_slog::encode(&leaky, Tier::Host)
+            .expect("encodes")
+            .contains("QZP6ROW1")
+    );
+}
+
+/// Session 0's timeline in a headless App.
+fn app_timeline(app: &App) -> Arc<Mutex<SessionTimeline>> {
+    app.store
+        .read()
+        .unwrap()
+        .by_local(0)
+        .expect("session 0")
+        .ctx
+        .timeline
+        .clone()
+}
+
+/// THE TAB CHROME'S TAIL READS THE VIEW: a row the ring evicted is still the menu's.
+#[test]
+fn the_tab_chromes_tail_reads_the_view() {
+    use crate::session_chrome::TabMenuEntry;
+    use crate::session_timeline::TIMELINE_CAP;
+    let mut app = App::headless_for_test();
+    let tl = app_timeline(&app);
+    {
+        let mut g = tl.lock().unwrap();
+        assert!(g.record_cwd_change(Some("/private/tmp/x")));
+        for i in 0..=TIMELINE_CAP {
+            let _ = g.record_hand_row("topic", format!("add t{i} since=head"));
+        }
+        assert!(
+            g.since(None).all(|e| e.kind != "cwd-change"),
+            "PRECONDITION: the ring evicted the move"
+        );
+    }
+    let menu = app.tab_context_menu_model(WindowId(0), 0);
+    assert!(
+        menu.iter().any(
+            |e| matches!(e, TabMenuEntry::Header(row) if row.starts_with("changed directory ·"))
+        ),
+        "the tail is the view's: {menu:?}"
+    );
+}
+
+/// THE TAB CHROME'S CACHE KEY IS THE VIEW'S HEAD: a burst's `human` row the ring owes moves it.
+#[test]
+fn the_tab_chromes_cache_key_is_the_views_head() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let tl = app_timeline(&app);
+    let titles = app.tab_titles(wid);
+    let _ = app.tab_chrome_ext(wid, &titles);
+    {
+        let mut g = tl.lock().unwrap();
+        let at = g.slog().now();
+        g.slog_mut().human_input(true, at);
+        assert_eq!(
+            g.slog().burst_rows_owed(),
+            1,
+            "PRECONDITION: the ring owes it"
+        );
+    }
+    let _ = app.tab_chrome_ext(wid, &titles);
+    let head = tl.lock().unwrap().view_head();
+    assert!(head.is_some());
+    assert_eq!(
+        app.session_chrome.get(&0).map(|c| c.high_id),
+        head,
+        "the chrome recomposed at the view's head"
+    );
+}
+
 /// The `by=` an actor's close should say, under 3A's R1.
 fn by_r1(actor: &ExitActor) -> String {
     match actor {
@@ -2207,8 +2580,10 @@ fn by_r1(actor: &ExitActor) -> String {
     }
 }
 
-/// The closed index's session close for `local`: `(out, code, by)`.
-fn index_close(app: &App, local: u64) -> Option<(String, Option<i64>, String)> {
+/// What the closed index's log of `local` says of its session close: `(out,
+/// code, by)`, and, from a skeleton, the close's `mono` (a summary reads back
+/// from text, which keeps no clock).
+fn index_close(app: &App, local: u64) -> Option<(String, Option<i64>, String, Option<u64>)> {
     let source = app
         .store
         .read()
@@ -2216,6 +2591,7 @@ fn index_close(app: &App, local: u64) -> Option<(String, Option<i64>, String)> {
         .closed_logs()
         .by_local(local)?
         .source();
+    let skeleton = matches!(source, crate::session_log::ClosedSource::Skeleton(_));
     let log = source.into_log()?;
     let r = log
         .window()
@@ -2229,51 +2605,101 @@ fn index_close(app: &App, local: u64) -> Option<(String, Option<i64>, String)> {
         r.f.get_word(Key::Out)?.to_string(),
         code,
         r.by.word().to_string(),
+        skeleton.then(|| log.mono_of(r.seq)).flatten(),
     ))
 }
 
-/// Whether every roster `Exited` row and the closed index agree, `out_of`
-fn exits_agree(
-    app: &App,
-    out_of: fn(ExitReason) -> &'static str,
-    unindexed: &[u64],
-) -> Result<usize, String> {
-    let rows: Vec<crate::session_store::RosterRecord> = app
-        .store
+/// The roster's `Exited` rows, oldest first.
+fn exited(app: &App) -> Vec<crate::session_store::RosterRecord> {
+    app.store
         .read()
         .unwrap()
         .roster_since(0)
         .filter(|r| r.change == RosterChange::Exited)
         .cloned()
+        .collect()
+}
+
+/// Whether the closed index answers every roster `Exited` row of `rows`: one
+/// slot each, in the rows' order, saying every field the row does, and its
+/// log's session close the same `out=` (`out_of` naming each reason's),
+/// `code=`, `by=` and, from a skeleton, instant. Returns how many agreed.
+fn exits_agree(
+    app: &App,
+    rows: &[crate::session_store::RosterRecord],
+    out_of: fn(ExitReason) -> &'static str,
+) -> Result<usize, String> {
+    let exits: Vec<crate::session_log::ClosedExit> = app
+        .store
+        .read()
+        .unwrap()
+        .closed_logs()
+        .exits_since(0)
+        .cloned()
         .collect();
-    let mut agreed = 0;
-    for row in &rows {
-        let got = index_close(app, row.local_id);
-        if unindexed.contains(&row.local_id) {
-            if got.is_some() {
-                return Err(format!("{}: a keep=None close is indexed", row.local_id));
-            }
-            continue;
+    let (held, said): (Vec<u64>, Vec<u64>) = (
+        exits.iter().map(|e| e.seq).collect(),
+        rows.iter().map(|r| r.seq).collect(),
+    );
+    if held != said {
+        return Err(format!(
+            "the index holds seqs {held:?}, the roster {said:?}"
+        ));
+    }
+    for (row, exit) in rows.iter().zip(&exits) {
+        let says = (
+            row.t_ms,
+            row.sid.as_str(),
+            row.local_id,
+            row.reason,
+            row.exit_code,
+            &row.actor,
+        );
+        let holds = (
+            exit.t_ms,
+            exit.sid.as_str(),
+            exit.local_id,
+            exit.reason,
+            exit.exit_code,
+            &exit.actor,
+        );
+        if says != holds {
+            return Err(format!(
+                "seq {}: the roster says {says:?}, the index {holds:?}",
+                row.seq
+            ));
         }
         let want = (
             out_of(row.reason).to_string(),
             row.exit_code.map(i64::from),
             by_r1(&row.actor),
         );
-        if got.as_ref() != Some(&want) {
+        let Some((out, code, by, mono)) = index_close(app, row.local_id) else {
+            return Err(format!("local {}: no log attached", row.local_id));
+        };
+        if (&out, &code, &by) != (&want.0, &want.1, &want.2) {
             return Err(format!(
-                "local {} ({:?} by {:?}): the roster says {want:?}, the index {got:?}",
-                row.local_id, row.reason, row.actor
+                "local {} ({:?} by {:?}): the roster says {want:?}, the log {:?}",
+                row.local_id,
+                row.reason,
+                row.actor,
+                (out, code, by)
             ));
         }
-        agreed += 1;
+        if mono.is_some_and(|m| m != row.t_ms) {
+            return Err(format!(
+                "local {}: the close at {mono:?}, the row at {}",
+                row.local_id, row.t_ms
+            ));
+        }
     }
-    Ok(agreed)
+    Ok(rows.len())
 }
 
-/// THE ROSTER AND THE CLOSED INDEX AGREE (plan 5B-6, P2): every reason ×
+/// THE ROSTER AND THE CLOSED INDEX AGREE on every reason and actor, the last close, interleaved.
 #[test]
 fn the_roster_and_the_closed_index_agree_on_every_exit() {
+    use crate::session_log::{ClosedKeep, ClosedSource};
     let mut app = App::headless_for_test();
     let minted = aterm_session::SessionId::generate().as_str().to_string();
     assert!(aterm_session::is_minted_sid(&minted));
@@ -2286,7 +2712,7 @@ fn the_roster_and_the_closed_index_agree_on_every_exit() {
         ExitActor::Unknown,
     ];
     let mut n = 0u64;
-    let mut close = |app: &mut App, reason, actor: ExitActor, keep| {
+    let mut open = |app: &mut App| {
         let local = app.next_session_id;
         app.push_stub_tab(WindowId(0), crate::stub_session(local));
         {
@@ -2304,30 +2730,84 @@ fn the_roster_and_the_closed_index_agree_on_every_exit() {
                 .unwrap()
                 .note_exit_code(local, Some(i32::try_from(n).unwrap_or(1)));
         }
+        local
+    };
+    let close = |app: &mut App, local, reason, actor: ExitActor, keep| {
         let _closing = CloseAttribution::enter(reason, actor);
         app.retire_session_registration_keeping(local, keep);
-        local
     };
     for reason in ExitReason::ALL {
         for actor in &actors {
-            let _ = close(
-                &mut app,
-                reason,
-                actor.clone(),
-                Some(crate::session_log::ClosedKeep::Skeleton),
-            );
+            let local = open(&mut app);
+            close(&mut app, local, reason, actor.clone(), ClosedKeep::Skeleton);
         }
     }
-    let unindexed = close(&mut app, ExitReason::UiClose, ExitActor::Human, None);
-    let shipped = exits_agree(&app, ExitReason::as_str, &[unindexed]);
-    assert_eq!(shipped, Ok(36), "{shipped:?}");
+    // The app's last close keeps its summary alone.
+    let last = open(&mut app);
+    close(
+        &mut app,
+        last,
+        ExitReason::UiClose,
+        ExitActor::Human,
+        ClosedKeep::Summary,
+    );
+    // Two closes interleaved: the second whole between the first's two
+    // store writes (under the first's attribution, which is outermost).
+    let (first, second) = (open(&mut app), open(&mut app));
+    crate::app_tabs::CLOSE_BETWEEN_WRITES.with(|b| {
+        *b.borrow_mut() = Some(Box::new(move |app: &mut App| {
+            app.retire_session_registration_keeping(second, ClosedKeep::Skeleton);
+        }));
+    });
+    close(
+        &mut app,
+        first,
+        ExitReason::CtlClose,
+        ExitActor::Ctl,
+        ClosedKeep::Skeleton,
+    );
+    assert!(
+        crate::app_tabs::CLOSE_BETWEEN_WRITES.with(|b| b.borrow().is_none()),
+        "PRECONDITION: the second close ran between the first's writes"
+    );
+    let rows = exited(&app);
+    let at = |local: u64| rows.iter().position(|r| r.local_id == local);
+    let (Some(a), Some(b)) = (at(first), at(second)) else {
+        panic!("both interleaved closes are in the roster: {rows:?}");
+    };
+    assert_eq!(b, a + 1, "the first's deregister minted the lower seq");
+    let shipped = exits_agree(&app, &rows, ExitReason::as_str);
+    assert_eq!(shipped, Ok(39), "{shipped:?}");
+    assert!(
+        app.store
+            .read()
+            .unwrap()
+            .closed_logs()
+            .by_local(last)
+            .is_some_and(|e| matches!(e.source(), ClosedSource::Summary(_))),
+        "the app's last close is indexed from its summary"
+    );
+    // NEGATIVE CONTROLS.
     let swapped = |r: ExitReason| match r {
         ExitReason::CtlClose => "ui-close",
         ExitReason::UiClose => "ctl-close",
         other => other.as_str(),
     };
-    assert!(exits_agree(&app, swapped, &[unindexed]).is_err());
-    assert!(exits_agree(&app, ExitReason::as_str, &[]).is_err());
+    assert!(exits_agree(&app, &rows, swapped).is_err());
+    let mut later = rows.clone();
+    later[0].t_ms += 1;
+    assert!(exits_agree(&app, &later, ExitReason::as_str).is_err());
+    let unminted = rows
+        .iter()
+        .position(|r| r.actor == ExitActor::Sid("s-driver".into()))
+        .expect("an unminted closer");
+    let mut other_closer = rows.clone();
+    other_closer[unminted].actor = ExitActor::Unknown;
+    assert_eq!(by_r1(&ExitActor::Unknown), by_r1(&rows[unminted].actor));
+    assert!(exits_agree(&app, &other_closer, ExitReason::as_str).is_err());
+    let mut pair = rows.clone();
+    pair.swap(a, b);
+    assert!(exits_agree(&app, &pair, ExitReason::as_str).is_err());
 }
 
 /// The `ctl story` word a told verb has, `None` for a presence verb.
@@ -2338,6 +2818,7 @@ fn told_word(verb: StoryVerb) -> Option<&'static str> {
 }
 
 /// The seq of the record that opened `log`'s epoch (its first record
+/// naming it), 0 for a log that names none.
 fn epoch_start(log: &Log) -> u64 {
     let ep = u64::from(log.ep());
     log.window()
@@ -2359,6 +2840,8 @@ fn story_marks(log: &Log, from: u64) -> Vec<(String, String)> {
 }
 
 /// Whether presence's told points are `told` (each `(seq, verb, teller)`)
+/// and the log's epoch holds exactly one `story` mark per told point by
+/// its teller, in order (T17: no inequality).
 fn story_agrees(
     told: &[(u64, StoryVerb, Actor)],
     points: &[(u64, StoryVerb)],
@@ -2392,6 +2875,9 @@ fn story_agrees(
 }
 
 /// EACH TOLD POINT IS ONE STORY MARK BY ITS TELLER (T17): five points told
+/// through `App::tell_story_by` by four tellers (the harness, an Owner
+/// client, a minted session, the person) are presence's told points, in
+/// order, and the epoch's `story` marks, one each, `by=` the teller.
 #[test]
 fn each_told_point_is_one_story_mark_by_its_teller() {
     let mut app = App::headless_for_test();

@@ -1,26 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! The abrew prefix: layout, installed-keg scan, receipts, pins, lock.
-//!
-//! Design: `docs/DESIGN-abrew-2026-10-19.md` §2. The cellar is truth:
-//! an installed formula is a `Cellar/<name>/<version>` directory with an
-//! `INSTALL_RECEIPT.json`; `state.json` is a rebuilt-on-demand index,
-//! never the source a decision is made from.
+
+//! `abrew` prefix layout, installed-keg census, receipts, pins, and single-writer lock.
 
 use std::path::{Path, PathBuf};
 
-/// Environment override for the whole prefix (tests, private instances).
+/// Environment variable overriding the `abrew` prefix root.
 pub const PREFIX_ENV: &str = "ABREW_PREFIX";
-/// The filename whose presence under the prefix means `abrew off`.
+/// Marker filename under the prefix root that disables `abrew`.
 pub const DISABLED_FILE: &str = "disabled";
 
-/// One installed keg (formula) or cask payload.
+/// Installed formula keg or cask payload record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Installed {
     pub name: String,
     pub version: String,
     pub kind: Kind,
-    /// Every receipt-admitted version (old versions kept until cleanup).
+    /// Receipt-admitted installed versions.
     pub versions: Vec<String>,
 }
 
@@ -40,9 +36,7 @@ impl Kind {
     }
 }
 
-/// A set-but-unusable `ABREW_PREFIX`, spelled for one warning line:
-/// silently falling through to the real prefix would aim a scratch
-/// run's writes at the owner's actual cellar.
+/// Returns a warning line when `ABREW_PREFIX` is set to an unusable value.
 #[must_use]
 pub fn prefix_env_warning() -> Option<String> {
     let p = std::env::var_os(PREFIX_ENV)?;
@@ -57,9 +51,7 @@ pub fn prefix_env_warning() -> Option<String> {
     }
 }
 
-/// Refuse overlap with a real Homebrew tree, or an uncertain physical location.
-/// Existing ancestors are resolved before comparing an uncreated suffix. Raw `..`
-/// is refused: collapsing it lexically would disagree with symlink traversal.
+/// Returns whether `root` overlaps a real Homebrew prefix or has an uncertain physical path.
 #[must_use]
 pub fn overlaps_real_brew_prefix(root: &Path) -> bool {
     overlaps_brew_roots(
@@ -87,8 +79,6 @@ fn overlaps_brew_roots(root: &Path, real: &[&Path]) -> bool {
 }
 
 /// Resolve only existing directories; never create or open a destination's contents.
-/// Recheck the observed chain and missing suffix before returning. This is admission,
-/// not an atomic filesystem transaction with independent writers after the check.
 fn physical_destination(path: &Path) -> Option<PathBuf> {
     if !path.is_absolute()
         || path
@@ -143,17 +133,14 @@ fn physical_destination(path: &Path) -> Option<PathBuf> {
     Some(physical.join(suffix))
 }
 
-/// The abrew prefix layout.
+/// The `abrew` prefix layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prefix {
     pub root: PathBuf,
 }
 
 impl Prefix {
-    /// Resolve the prefix: `ABREW_PREFIX` (absolute, non-empty), else
-    /// `<atpkg prefix>/abrew` from the resolved store layout, else
-    /// `~/.abrew` so a bare `atpkg-abrew` still runs on a machine where
-    /// aterm has laid nothing yet.
+    /// Resolves the prefix from `ABREW_PREFIX`, the store layout, or `~/.abrew`.
     #[must_use]
     pub fn resolve() -> Prefix {
         if let Some(p) = std::env::var_os(PREFIX_ENV) {
@@ -173,7 +160,7 @@ impl Prefix {
         }
     }
 
-    /// A prefix rooted at an explicit path (tests).
+    /// Creates a prefix rooted at `root`.
     #[must_use]
     pub fn at(root: &Path) -> Prefix {
         Prefix {
@@ -230,7 +217,7 @@ impl Prefix {
         self.disabled_path().exists()
     }
 
-    /// Create the standing directories. Idempotent.
+    /// Creates the standing prefix directories idempotently.
     pub fn ensure(&self) -> Result<(), String> {
         let directories = [
             self.root.clone(),
@@ -265,20 +252,18 @@ impl Prefix {
         ensure_directories(&directories)
     }
 
-    /// Prepare metadata storage without initializing the installation layout.
+    /// Prepares the API metadata cache directory.
     pub(super) fn ensure_api_cache(&self) -> Result<(), String> {
         ensure_directories(&[self.root.clone(), self.cache(), self.cache().join("api")])
     }
 
-    /// Every installed keg of one kind, sorted by name. Read-only callers keep
-    /// the historical best-effort scan; destructive callers require its checked form.
+    /// Returns all installed packages of `kind`, sorted by name.
     #[must_use]
     pub fn installed(&self, kind: Kind) -> Vec<Installed> {
         self.scan_installed(kind, false).unwrap_or_default()
     }
 
-    /// The complete physical-directory census used before deletion. An unreadable
-    /// row or aliased directory is unknown, not evidence that no dependent exists.
+    /// Returns the checked installed census of `kind`, failing on unreadable or aliased entries.
     pub(super) fn installed_checked(&self, kind: Kind) -> Result<Vec<Installed>, String> {
         self.scan_installed(kind, true)
     }
@@ -325,10 +310,6 @@ impl Prefix {
             } else {
                 raw_name.to_string_lossy().into_owned()
             };
-            // Staging dirs left by an interrupted run are scratch,
-            // never installed rows: a killed pour must not wedge
-            // every later command (found live). Readers do not see
-            // them; anonymous leftovers are retained without a custody witness.
             if is_staging_name(&name) {
                 continue;
             }
@@ -402,13 +383,13 @@ impl Prefix {
         Ok(out)
     }
 
-    /// The installed record for one name, if any version stands.
+    /// Returns the installed record for `name`, if any version is admitted.
     #[must_use]
     pub fn installed_one(&self, kind: Kind, name: &str) -> Option<Installed> {
         self.installed(kind).into_iter().find(|i| i.name == name)
     }
 
-    /// A conflict can be absent only after both installed censuses are complete.
+    /// Returns the first name in `names` already installed as a formula or cask.
     pub(super) fn installed_conflict(&self, names: &[String]) -> Result<Option<String>, String> {
         if names.is_empty() {
             return Ok(None);
@@ -425,10 +406,7 @@ impl Prefix {
         }))
     }
 
-    /// The admitted version named by this engine's pin marker. A foreign file,
-    /// link outside this package, or dangling/unowned target grants no ownership.
-    /// The version `opt/<name>` points at, proven the same way as
-    /// a pin: exact own-shape target into an owned, receipted keg.
+    /// Returns the owned version that `opt/<name>` links to, if valid.
     #[must_use]
     pub fn optlinked_version(&self, name: &str) -> Option<String> {
         if !super::valid_component(name) {
@@ -474,11 +452,7 @@ impl Prefix {
     }
 
     #[must_use]
-    /// The tap-qualified identity `list --full-name` prints: the
-    /// receipt's `full_name` when it is qualified, else the official
-    /// tap for the kind (homebrew/core API rows and cask tokens
-    /// record the short name; receipts predating the field fall back
-    /// the same way).
+    /// Returns the tap-qualified name for `inst`.
     pub fn full_name(&self, inst: &Installed) -> String {
         let dir = match inst.kind {
             Kind::Formula => self.keg(&inst.name, &inst.version),
@@ -495,10 +469,7 @@ impl Prefix {
         }
     }
 
-    /// A retained version's admitted tap identity, for destructive decisions.
-    /// Unlike `full_name`, an unreadable or malformed receipt never becomes
-    /// an official-tap fallback. Legacy receipts with no field, and the
-    /// official API's exact short name, keep their established identity.
+    /// Returns the checked tap-qualified name for `name`@`version`.
     pub(super) fn full_name_checked(
         &self,
         kind: Kind,
@@ -566,8 +537,7 @@ impl Prefix {
         self.pinned_version(name).is_some()
     }
 
-    /// Any standing marker protects a formula from automatic deletion. Only
-    /// NotFound proves absence; a failed lookup must not become "not pinned".
+    /// Returns whether `name` has a pin entry, failing on inspection errors other than `NotFound`.
     pub(super) fn is_pinned_checked(&self, name: &str) -> Result<bool, String> {
         if !super::valid_component(name) {
             return Err("abrew: invalid formula name".to_string());
@@ -587,11 +557,7 @@ impl Prefix {
         }
     }
 
-    /// Whether the Pinned/<name> entry is a dangling symlink of
-    /// abrew's own shape (into this Cellar's <name> kegs) whose
-    /// target keg is gone. Such a link holds no owner bytes and
-    /// may be replaced/removed; a foreign file or an outward
-    /// symlink at the pin path is never touched.
+    /// Returns whether `Pinned/<name>` is a dangling symlink into this cellar's `<name>` kegs.
     pub(super) fn pin_link_dangling_ours(&self, name: &str) -> bool {
         if !super::valid_component(name) {
             return false;
@@ -612,9 +578,6 @@ impl Prefix {
         let Some(version) = target.file_name().and_then(|v| v.to_str()) else {
             return false;
         };
-        // Only the missing keg itself qualifies: lexical descendants can escape
-        // through `..`, and a live unowned keg or a dangling version symlink is
-        // still foreign. Failed inspection is not evidence of absence.
         let keg = self.keg(name, version);
         super::valid_cask_version(version)
             && target == keg
@@ -622,8 +585,7 @@ impl Prefix {
                 if error.kind() == std::io::ErrorKind::NotFound)
     }
 
-    /// Pin the current admitted keg. An occupied marker is replaced only when
-    /// it already names an admitted keg or a missing keg of this package.
+    /// Pins `name` to its current admitted keg.
     pub fn pin(&self, name: &str) -> Result<(), String> {
         if !super::valid_component(name) {
             return Err(format!("abrew: invalid formula name {name}"));
@@ -637,8 +599,6 @@ impl Prefix {
         let link = dir.join(name);
         match std::fs::symlink_metadata(&link) {
             Ok(_) if self.is_pinned(name) || self.pin_link_dangling_ours(name) => {
-                // A live owned pin refreshes; a dangling pin of
-                // ours (keg hand-deleted, then reinstalled) must
                 // not block re-pinning forever.
                 std::fs::remove_file(&link).map_err(|e| format!("abrew: {e}"))?;
             }
@@ -661,15 +621,13 @@ impl Prefix {
         self.ensure()?;
         let link = self.root.join("Pinned").join(name);
         if self.pinned_version(name).is_none() && !self.pin_link_dangling_ours(name) {
-            // A dangling pin of ours is still removable — refusing
             // would strand it forever short of a manual rm.
             return Err(format!("abrew: {name} has no owned pin"));
         }
         std::fs::remove_file(&link).map_err(|e| format!("abrew: {e}"))
     }
 
-    /// Write an install receipt into a keg/cask dir. Receipts are the
-    /// durable record `doctor` rebuilds state from.
+    /// Writes `INSTALL_RECEIPT.json` into `dir`.
     pub fn write_receipt(&self, dir: &Path, fields: &[(&str, &str)]) -> Result<(), String> {
         self.ensure()?;
         let mut s = String::from("{\n");
@@ -680,8 +638,6 @@ impl Prefix {
             s.push_str(&format!("  \"{}\": \"{}\"", json_escape(k), json_escape(v)));
         }
         s.push_str("\n}\n");
-        // The ownership readers admit at most 64KiB; never publish a receipt
-        // which those readers cannot recognize after a successful install.
         if s.len() > 64 * 1024 {
             return Err("abrew: install receipt exceeds the 64KiB reader limit".to_string());
         }
@@ -689,10 +645,7 @@ impl Prefix {
             .map_err(|e| format!("abrew: cannot write receipt in {}: {e}", dir.display()))
     }
 
-    /// Restore owned payloads from an interrupted same-version reinstall.
-    /// The writer lock excludes a cooperating live writer; the payload's
-    /// receipt supplies its destination identity. Anonymous staging directories
-    /// and any payload that cannot be restored are retained.
+    /// Restores owned payloads stranded by an interrupted same-version reinstall.
     pub fn restore_stale_asides(&self) {
         for (base, kind) in [
             (self.cellar(), Kind::Formula),
@@ -716,11 +669,7 @@ impl Prefix {
 
     /// Restore a stranded same-version-reinstall aside: the staging
     /// dir's `payload` is the live keg, set aside by a run that died
-    /// before publishing its replacement. Restored only under the
-    /// identity its own owned receipt claims, only when no live keg
-    /// stands there now (a replacement that did publish wins), and
-    /// never through a symlinked payload or parent. Keep the surrounding
-    /// directory and every payload that cannot be restored.
+    /// before publishing its replacement.
     fn restore_aside(&self, kind: Kind, staging: &Path) {
         let payload = staging.join("payload");
         if !std::fs::symlink_metadata(&payload)
@@ -751,7 +700,7 @@ impl Prefix {
         }
     }
 
-    /// Rebuild `state.json` (a cache) from the cellar and caskroom.
+    /// Rebuilds `state.json` from the cellar and caskroom.
     pub fn rebuild_state(&self) -> Result<(), String> {
         self.ensure()?;
         let mut rows = Vec::new();
@@ -772,17 +721,14 @@ impl Prefix {
     }
 }
 
-/// Exchange an admitted complete directory, or publish a first one without
-/// replacing any entry that appeared after preflight. Unsupported filesystems
-/// leave both names in place.
+/// Atomically exchanges or publishes `staged` at `dest`.
 pub(super) fn publish_directory(staged: &Path, dest: &Path, replace: bool) -> std::io::Result<()> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         use std::os::unix::ffi::OsStrExt as _;
         let staged = std::ffi::CString::new(staged.as_os_str().as_bytes())?;
         let dest = std::ffi::CString::new(dest.as_os_str().as_bytes())?;
-        // SAFETY: both paths are live NUL-terminated strings. These calls
-        // exchange directory entries without dereferencing Rust memory.
+        // SAFETY: `staged` and `dest` are valid NUL-terminated C strings.
         #[cfg(target_os = "macos")]
         let status = unsafe {
             libc::renamex_np(
@@ -825,8 +771,7 @@ pub(super) fn publish_directory(staged: &Path, dest: &Path, replace: bool) -> st
     }
 }
 
-/// Publish complete metadata without following an existing final link. The
-/// stage is exclusively created, and its guard removes only our own scratch.
+/// Atomically writes `bytes` to `path` via an exclusive staging file.
 pub(super) fn write_metadata(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     let parent = path.parent().ok_or_else(|| {
@@ -850,11 +795,8 @@ pub(super) fn write_metadata(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(staged, path)
 }
 
-/// Existing canonical layout bases must be real directories. Missing bases
-/// can be created after all existing ones pass, without following a final link.
+/// Existing canonical layout bases must be real directories.
 fn ensure_directories(directories: &[PathBuf]) -> Result<(), String> {
-    // Vet every existing canonical base before creating any. Parent aliases
-    // such as /var -> /private/var are unaffected.
     for directory in directories {
         real_base(directory)?;
     }
@@ -868,10 +810,7 @@ fn ensure_directories(directories: &[PathBuf]) -> Result<(), String> {
 /// Whether a directory name is abrew scratch rather than state:
 /// `aterm_tempfile`'s default staging prefix, worn by every scratch
 /// dir abrew makes inside the prefix (pour staging, download
-/// scratch, reinstall asides). Exercised by
-/// `staging_dirs_are_invisible_to_the_installed_census`, which stages through a
-/// real `TempDir`: if the default prefix ever changes, that test
-/// fails instead of this check silently going stale.
+/// scratch, reinstall asides).
 fn is_staging_name(name: &str) -> bool {
     name.starts_with(".tmp")
 }
@@ -889,10 +828,7 @@ fn real_base(path: &Path) -> Result<(), String> {
     }
 }
 
-/// A directory alone is not an installed package. Only the receipt this engine
-/// writes, naming this exact package/version, admits it to mutation and cleanup.
-/// Whether the owned receipt for `name`@`version` says it was installed
-/// on request (vs pulled in as a dependency).
+/// Returns whether the receipt in `dir` marks the package as installed on request.
 #[must_use]
 pub(super) fn receipt_on_request(dir: &Path) -> bool {
     let Ok(bytes) =
@@ -911,8 +847,7 @@ pub(super) fn receipt_on_request(dir: &Path) -> bool {
 
 /// The (name, version) an owned receipt in `dir` claims, when the
 /// receipt is abrew's and both are single safe components — the
-/// identity a stranded reinstall aside is restored under. Anything
-/// else (foreign, malformed, unsafe spelling) restores nothing.
+/// identity a stranded reinstall aside is restored under.
 fn receipt_identity(dir: &Path, kind: Kind) -> Option<(String, String)> {
     let bytes =
         crate::metadata_io::read_bounded_regular(&dir.join("INSTALL_RECEIPT.json"), 64 * 1024)
@@ -933,9 +868,7 @@ fn receipt_identity(dir: &Path, kind: Kind) -> Option<(String, String)> {
     Some((name.to_string(), version.to_string()))
 }
 
-/// One string field of the receipt in `dir`, if the receipt reads
-/// and parses. Ownership checks stay with [`owned_receipt`]; this
-/// only reads.
+/// Reads string field `key` from `INSTALL_RECEIPT.json` in `dir`.
 pub(super) fn receipt_word(dir: &Path, key: &str) -> Option<String> {
     let bytes =
         crate::metadata_io::read_bounded_regular(&dir.join("INSTALL_RECEIPT.json"), 64 * 1024)
@@ -965,8 +898,7 @@ pub(super) fn owned_receipt(dir: &Path, kind: Kind, name: &str, version: &str) -
         && word("version") == Some(version)
 }
 
-/// Symlink `link` to the directory `target` (Unix). On other platforms a
-/// plain copy is never right for a keg link, so it is an error.
+/// Creates a directory symlink `link -> target`.
 pub fn symlink_dir(target: &Path, link: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -980,12 +912,12 @@ pub fn symlink_dir(target: &Path, link: &Path) -> Result<(), String> {
     }
 }
 
-/// Symlink `link` to the file `target` (Unix).
+/// Creates a file symlink `link -> target`.
 pub fn symlink_file(target: &Path, link: &Path) -> Result<(), String> {
     symlink_dir(target, link)
 }
 
-/// Escape a string for a JSON string literal (the small writer above).
+/// Escapes `s` for inclusion in a JSON string literal.
 #[must_use]
 pub fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -1003,8 +935,7 @@ pub fn json_escape(s: &str) -> String {
     out
 }
 
-/// The abrew single-writer lock. The kernel releases it after a crash; the
-/// rendezvous file stays in place so another holder can never be unlinked.
+/// Single-writer file lock for an `abrew` prefix.
 pub struct Lock {
     _file: crate::lock::Flock,
 }
@@ -1014,16 +945,13 @@ impl Lock {
         Self::within(prefix, std::time::Duration::from_secs(60))
     }
 
-    /// The lock only if free right now: diagnostics must never wait
-    /// behind (or fail because of) a live writer they exist to diagnose.
+    /// Attempts to acquire the prefix lock without blocking.
     pub fn try_acquire(prefix: &Prefix) -> Option<Lock> {
         Self::within(prefix, std::time::Duration::ZERO).ok()
     }
 
     fn within(prefix: &Prefix, limit: std::time::Duration) -> Result<Lock, String> {
         prefix.ensure()?;
-        // Claim the legacy rendezvous first: checking it only after the
-        // flock lets an old binary claim it in between and write beside us.
         let legacy = prefix.root.join(".abrew-lock.d");
         match std::fs::symlink_metadata(&legacy) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1049,8 +977,6 @@ impl Lock {
         })?;
         let file = crate::lock::Flock::lock_within(file, limit, &path)
             .map_err(|error| format!("abrew: cannot take lock {}: {error}", path.display()))?;
-        // An earlier binary may still own the old directory rendezvous. Age
-        // cannot prove its writer dead; preserve the claim and refuse migration.
         let legacy = prefix.root.join(".abrew-lock.d");
         match std::fs::symlink_metadata(&legacy) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Lock { _file: file }),
@@ -1083,12 +1009,10 @@ mod tests {
         assert!(overlaps_brew_roots(&brew.join("new/abrew"), &roots));
         assert!(overlaps_brew_roots(tmp.path(), &roots));
         assert!(!overlaps_brew_roots(&own.join("new/abrew"), &roots));
-        // Lexical parents are refused before resolving any possible alias.
         assert!(overlaps_brew_roots(&own.join("../brew"), &roots));
         let alias = tmp.path().join("alias");
         symlink_dir(&brew, &alias).unwrap();
         assert!(overlaps_brew_roots(&alias.join("new/abrew"), &roots));
-        // The Homebrew root itself may be reached through an alias.
         assert!(overlaps_brew_roots(&brew.join("new"), &[alias.as_path()]));
         let dangling = tmp.path().join("dangling");
         symlink_dir(&tmp.path().join("absent"), &dangling).unwrap();
@@ -1120,27 +1044,20 @@ mod tests {
         .unwrap();
         p.pin("tool").unwrap();
         assert!(p.is_pinned("tool"));
-        // The keg vanishes (hand-deleted): the pin dangles, is
-        // inert, and unpin must still be able to remove it.
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(!p.is_pinned("tool"));
         p.unpin("tool").unwrap();
         assert!(std::fs::symlink_metadata(p.root.join("Pinned/tool")).is_err());
-        // A foreign regular file at the pin path is not ours.
         std::fs::write(p.root.join("Pinned/foreign"), b"keep").unwrap();
         assert!(p.unpin("foreign").is_err());
         assert_eq!(
             std::fs::read(p.root.join("Pinned/foreign")).unwrap(),
             b"keep"
         );
-        // Nor is a symlink pointing outside this Cellar.
         symlink_dir(std::path::Path::new("/tmp"), &p.root.join("Pinned/outward")).unwrap();
         assert!(p.unpin("outward").is_err());
         assert!(std::fs::symlink_metadata(p.root.join("Pinned/outward")).is_ok());
 
-        // A same-Cellar spelling alone is no ownership: a live unowned keg,
-        // an escaping target and an existing version symlink must all survive
-        // both mutations, even with an admitted version available for pin.
         std::fs::create_dir_all(&dir).unwrap();
         p.write_receipt(
             &dir,
@@ -1170,8 +1087,6 @@ mod tests {
         ];
         for live_alias in [false, true] {
             if live_alias {
-                // A receipt-looking foreign target still cannot turn a version
-                // symlink into an admitted physical keg through `/` or `/.`.
                 std::fs::create_dir_all(&absent).unwrap();
                 std::fs::write(absent.join("owner-note"), b"keep").unwrap();
                 std::fs::write(
@@ -1193,8 +1108,6 @@ mod tests {
         assert_eq!(std::fs::read(live.join("owner-note")).unwrap(), b"keep");
         assert_eq!(std::fs::read(absent.join("owner-note")).unwrap(), b"keep");
         assert_eq!(std::fs::read_link(&version_link).unwrap(), absent);
-        // Removing the whole package directory is recoverable too: its missing
-        // parent is accepted, while linked or unreadable parents still refuse.
         std::fs::remove_file(&version_link).unwrap();
         std::fs::remove_dir_all(p.cellar().join("tool")).unwrap();
         for version in ["1.0", "1,2"] {
@@ -1210,7 +1123,6 @@ mod tests {
         let tmp = aterm_tempfile::tempdir().unwrap();
         let p = Prefix::at(tmp.path());
         p.ensure().unwrap();
-        // A tap formula: the receipt's qualified identity wins.
         let dir = p.keg("tool", "1.0");
         std::fs::create_dir_all(&dir).unwrap();
         p.write_receipt(
@@ -1225,8 +1137,6 @@ mod tests {
         .unwrap();
         let inst = p.installed_one(Kind::Formula, "tool").unwrap();
         assert_eq!(p.full_name(&inst), "someone/tap/tool");
-        // A core formula records the short name; the official tap
-        // is supplied for display.
         let dir = p.keg("wget", "1.25");
         std::fs::create_dir_all(&dir).unwrap();
         p.write_receipt(
@@ -1241,7 +1151,6 @@ mod tests {
         .unwrap();
         let inst = p.installed_one(Kind::Formula, "wget").unwrap();
         assert_eq!(p.full_name(&inst), "homebrew/core/wget");
-        // A receipt predating the field falls back the same way.
         let dir = p.cask_dir("firefox", "128.0");
         std::fs::create_dir_all(&dir).unwrap();
         p.write_receipt(
@@ -1273,18 +1182,12 @@ mod tests {
             ],
         )
         .unwrap();
-        // A killed pour's staging, made the way the pour makes it:
-        // a real TempDir inside the cellar holding a receipt-less
-        // keg-shaped subtree. `.keep()` survives the "kill".
         let staged = aterm_tempfile::TempDir::new_in(p.cellar()).unwrap().keep();
         std::fs::create_dir_all(staged.join("go/1.27.3")).unwrap();
-        // The checked census must not wedge on it, in either kind.
         let checked = p.installed_checked(Kind::Formula).unwrap();
         assert_eq!(checked.len(), 1);
         assert_eq!(checked[0].name, "hello");
         assert!(p.installed_checked(Kind::Cask).unwrap().is_empty());
-        // A staging-shaped version row inside a real keg is skipped,
-        // not an "incomplete row" error.
         let stray = p.cellar().join("hello").join(".tmp1234_deadbeef_0");
         std::fs::create_dir_all(&stray).unwrap();
         let checked = p.installed_checked(Kind::Formula).unwrap();
@@ -1296,9 +1199,6 @@ mod tests {
         let tmp = aterm_tempfile::tempdir().unwrap();
         let p = Prefix::at(tmp.path());
         p.ensure().unwrap();
-        // The aside a killed same-version reinstall leaves: the live
-        // keg (receipt and all) at <staging>/payload, nothing at the
-        // live path.
         let aside = |receipt: &[(&str, &str)], marker: &str| {
             let staged = aterm_tempfile::TempDir::new_in(p.cellar()).unwrap().keep();
             let payload = staged.join("payload");
@@ -1336,8 +1236,6 @@ mod tests {
         let checked = p.installed_checked(Kind::Formula).unwrap();
         assert_eq!(checked.len(), 1);
         assert_eq!(checked[0].name, "hello");
-        // When a replacement did publish, it wins; the older payload
-        // is retained and the live keg is untouched.
         std::fs::write(live.join("MARKER"), "new-keg").unwrap();
         let staged = aside(
             &[
@@ -1357,7 +1255,6 @@ mod tests {
             std::fs::read_to_string(live.join("MARKER")).unwrap(),
             "new-keg"
         );
-        // A foreign receipt restores nothing.
         let staged = aside(
             &[
                 ("installed_by", "another"),
@@ -1458,10 +1355,6 @@ mod tests {
             std::fs::remove_file(&marker).unwrap();
             std::os::unix::fs::symlink(p.keg("wget", "missing"), &marker).unwrap();
             assert!(!p.is_pinned("wget"));
-            // A dangling pin of abrew's own shape (into this
-            // Cellar, keg gone) holds no owner bytes: pin replaces
-            // it and unpin removes it, instead of stranding the
-            // name forever. Foreign entries above still refuse.
             p.pin("wget").unwrap();
             assert_eq!(p.pinned_version("wget").as_deref(), Some("1.25.0"));
             p.unpin("wget").unwrap();

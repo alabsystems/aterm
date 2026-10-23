@@ -1,66 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm fabric brief` (`docs/DESIGN-session-log-2026-10-15.md` §5.5):
-//! a bounded fold of the session logs the bus mirror put on the
-//! fleet's `ev` faces, with record contents from the BUS ALONE, no file
-//! written, under whatever caps this host's `[fabric] command` (or
-//! `--cap-file`) reads `pub/>` with. Configuration discovery reuses `tail`'s
-//! path and can inspect local control endpoints; the fold reads no session
-//! records from them.
-//!
-//! THE READER'S VIEW IS THE LAW: each body is decoded
-//! (`aterm_slog::decode_bus`) into the view of its `(node, sid, ep)` — one per
-//! seq space (a newer space, a crash recovery's or an uncarried
-//! update's, is a fresh fold, partial until it holds its first record or a
-//! snapshot) — which shows each `(ep, seq)` once, unions the covers, and
-//! folds in seq order whatever order the bus holds the bodies in. A `v=1`
-//! body (the bridge's own verdicts) and any other version is counted
-//! `opaque=` and left alone; a `v=2` body that is not what this build's
-//! mirror publishes (a record outside its bus class, a cover past any seq)
-//! is `foreign=` and never folded, and a key above the bus's tier is
-//! stripped (`aterm_slog::bus`). A well-formed record outside this build's
-//! bus class still holds its `ms` — one whose kind, operation or node level
-//! this build does not know among them: a newer writer's wider class or new
-//! word is no hole.
-//!
-//! BOUNDED: the window is the last `--window` records of the log (65,536 by
-//! default, at most 1,048,576); it is read in pages of at most [`PAGE_MAX`]
-//! rows (each page's scan the broker's `FETCH_SCAN_MAX`), continuing on the
-//! page's mark until the window is read, so one reply is at most
-//! a page of bodies (each at most 512 bytes: half a MiB). At most
-//! [`SESSIONS_MAX`] sessions and nodes are retained: a wider roster or
-//! record window refuses the read with an error, rather than silently
-//! returning a subset. The whole successful brief is held to `--budget`
-//! tokens (`used=` counts every line under the header): each session, newest
-//! first, gets its share of what is left, its head line alone when its share
-//! holds no more, and the sessions past the budget are `more=sessions:<k>`.
-//!
-//! THE MACHINE FORM (`--json`): the same
-//! fold as ONE JSON object, its `sessions` one object per session, newest
-//! first, in a closed schema of ids, closed words and counts only —
-//! `node`, `sid` (the session's face, as the bus names it), `this` (whether
-//! the node is the one this host's state dir names), `ep`, `need` (the most
-//! urgent observed need's word, `brief`'s own, or null) and its `detail`
-//! (a wall's reset, a failure's exit code, or null), `open` (the open
-//! path's `level` and `kind`, run first), `mail_in` and `mail_out`,
-//! `last_seq`, `age_s` (how old the fold's newest record is, or null) and
-//! `partial` (the `why=` words). Like the text, it prints no host or content
-//! field: the bus never carried one. It is held to the same `--budget`: each
-//! session's object counts its tokens, and the sessions past the budget are
-//! `more`. The Overview's "On the fabric" group reads it.
-//!
-//! A session without its close is `partial why=node-gone` when
-//! its node's presence ended (`state=gone`, its will) or its own presence
-//! row is an earlier incarnation's than the node's live one (a crash or a
-//! quit, then a relaunch that never re-announced it), and `partial
-//! why=no-close` when its own presence says it exited: a quit, a crash or a
-//! lost tail took what the bus never got. One that lost records no snapshot
-//! it holds folds past is `partial why=lost`. An `ms` neither a record nor a
-//! cover holds, from the first the window reaches (the whole space when the
-//! window reaches the log's start or the space's), is printed `holes=`, loss
-//! nobody said (the broker's clamp, a retention); the window's own cut is
-//! `partial why=no-start`, never a hole.
+//! `aterm fabric brief` (`docs/DESIGN-session-log-2026-10-15.md` §5.5).
 
 use std::collections::BTreeMap;
 use std::io;
@@ -104,9 +45,7 @@ pub struct BriefOpts {
 
 impl BriefOpts {
     /// `aterm fabric brief …`'s words read.
-    ///
     /// # Errors
-    ///
     /// An unknown flag, a missing value, or a value out of its bound.
     pub fn parse(rest: &[String]) -> Result<BriefOpts, String> {
         let mut o = BriefOpts::default();
@@ -208,8 +147,6 @@ impl Read {
                         "fabric brief exceeds {SESSIONS_MAX} nodes; narrow it with @<sid>@<node>"
                     )));
                 }
-                // The last-value walk normally delivers one row per node;
-                // updating an existing entry also keeps this helper bounded.
                 self.node_inc.remove(node);
                 self.nodes_gone.retain(|n| n != node);
                 if gone {
@@ -295,8 +232,6 @@ fn read(cfg: &Config, opts: &BriefOpts) -> io::Result<Read> {
         _ => format!("/f/{fleet}/pub/*/*/ev"),
     };
     let mut r = Read::default();
-    // THE ROSTER, from presence's last values: who is live, who exited, and
-    // which nodes' presence ended (their will fired).
     transport::walk_last(&mut conn, &format!("/f/{fleet}/pub/*/*/presence"), |rec| {
         let (_, subject, body) = rec;
         if let Some((node, sid)) = owner(fleet, subject, "presence") {
@@ -315,10 +250,6 @@ fn read(cfg: &Config, opts: &BriefOpts) -> io::Result<Read> {
     r.from = head.saturating_sub(window);
     let mut at = r.from;
     while at < head && r.pages < WINDOW_MAX / u64::from(PAGE_MAX) + 16 {
-        // A RETAINING BROKER (astream R4, `aterm link broker`'s default rules)
-        // keeps the `ev` faces for a bounded window: a window that reaches
-        // below what it keeps reads from its floor, and the fold starts there
-        // (a session whose open went with it is seeded from its next snapshot).
         let ((rows, (next, _)), floor) = transport::fetch_kept(&mut conn, at, &ev, PAGE_MAX)?;
         if let Some(floor) = floor {
             r.from = r.from.max(floor);
@@ -380,7 +311,7 @@ fn shown(r: &Read) -> (Vec<Held<'_>>, usize) {
 
 /// Why a session's newest fold is partial: its seed's word, then its close
 /// missing although its node or its own presence says it is gone (the
-/// module doc). Empty when it is whole.
+/// module doc).
 fn partial_why(
     r: &Read,
     node: &str,
@@ -402,7 +333,6 @@ fn partial_why(
 fn render(cfg: &Config, opts: &BriefOpts, r: &Read, now_ms: u64) -> String {
     let budget = opts.budget.unwrap_or(BUDGET_DEFAULT);
     let (shown, mut more) = shown(r);
-    // The `more=` line's own room is kept back from the start.
     let budget_lines = budget.saturating_sub(line_tokens("more=sessions:99999"));
     let (mut lines, mut used, mut partial, mut folded) = (Vec::new(), 0usize, 0usize, 0usize);
     let (mut dup, mut reordered, mut foreign) = (0u64, 0u64, 0u64);
@@ -413,9 +343,6 @@ fn render(cfg: &Config, opts: &BriefOpts, r: &Read, now_ms: u64) -> String {
         let (fold, seed) = space.fold_seeded();
         let st = fold.state();
         let why = partial_why(r, node, s, seed, st.closed.is_some());
-        // Loss nobody said, from the first `ms` the window reaches: one that
-        // does not reach the space's start (nor the log's) cut it, which
-        // `no-start` says.
         let from = if r.from == 0 || space.holds_start() {
             1
         } else {
@@ -442,7 +369,6 @@ fn render(cfg: &Config, opts: &BriefOpts, r: &Read, now_ms: u64) -> String {
         if s.spaces.len() > 1 {
             head.push_str(&format!(" spaces={}", s.spaces.len()));
         }
-        // THE BUDGET, held whole: this session's share of what is left.
         let left = budget_lines.saturating_sub(used);
         let head_t = line_tokens(&head);
         if head_t > left {
@@ -454,10 +380,7 @@ fn render(cfg: &Config, opts: &BriefOpts, r: &Read, now_ms: u64) -> String {
         let mut body_t = 0usize;
         let room = share - head_t;
         if room >= BODY_MIN_TOKENS {
-            // No mail links: the mail marks a link is read from never
-            // cross the bus, so a peer's brief never guesses one.
             let b = aterm_slog::brief(sid, space.records(), None, st, &[], room, now_ms);
-            // The session's own lines, not its reply header.
             body = b.text.lines().skip(1).map(|l| safe(l, 512)).collect();
             body_t = body.iter().map(|l| line_tokens(l)).sum();
             if body_t > room {
@@ -551,7 +474,7 @@ fn session_json(
 
 /// The brief's machine form (`--json`, the module doc): one object, its
 /// `sessions` newest first while their objects fit the budget, the rest
-/// counted `more`. `this` is the node this host's state dir names.
+/// counted `more`.
 fn render_json(
     cfg: &Config,
     opts: &BriefOpts,
@@ -569,7 +492,6 @@ fn render_json(
         };
         let mut one = String::new();
         obj.render(&mut one);
-        // Its comma's room counted with it, as a text line's newline is.
         let t = line_tokens(&one);
         if used + t > budget {
             more += shown.len() - i;
@@ -606,8 +528,7 @@ fn render_json(
     out
 }
 
-/// `aterm fabric brief [@<sid>[@<node>]] [--window <n>] [--budget <tokens>]
-/// [--cap-file <path>] [--json]`.
+/// aterm fabric brief [@<sid>[@<node>]] [--window <n>] [--budget <tokens>] [--cap-file <path>].
 #[must_use]
 pub fn brief_main(opts: &BriefOpts) -> ExitCode {
     let cfg = match crate::fabric::configured_for_reads() {

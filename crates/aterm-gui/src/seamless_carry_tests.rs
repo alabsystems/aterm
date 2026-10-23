@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The control carry across a real handoff: `write_outgoing` with sidecars,
-//! the successor's `take_incoming`, the adoption proof, and what drivers read
-//! afterwards — `history`, `offscreen`, and the harness's report reader
-//! (`Session::report`) itself. Plus
-//! the rollback lane: the same new sender handing off to a receiver built
-//! BEFORE the carry, proof and all.
+//! Seamless handoff control-carry, sidecar, and rollback lane tests.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -21,8 +16,6 @@ use crate::handoff_carry::{self, ControlCarry};
 use crate::handoff_history::tests::history as shell_history;
 use crate::session_store::SessionRecord;
 use crate::turn_ledger::{ArchMark, TurnBy, TurnLedger, TurnRecord};
-
-// ------------------------------------------------ the receiver before the carry
 
 /// `SessionRecord` exactly as the last build before the control carry declared
 /// it: no `control`.
@@ -76,7 +69,6 @@ pub(super) fn pre_carry_parse(toml: &str) -> Option<SessionHandoff> {
         window: old.window,
         connections: old.connections,
         next_turn_id: None,
-        // That build wrote no `outgoing_build`.
         outgoing_build: None,
         held: Vec::new(),
         sessions: old
@@ -94,7 +86,6 @@ pub(super) fn pre_carry_parse(toml: &str) -> Option<SessionHandoff> {
                 icon: r.icon,
                 role: r.role,
                 attention: r.attention,
-                // That build had no question policy to carry.
                 questions: None,
                 autopilot: None,
                 land_at: None,
@@ -134,8 +125,6 @@ pub(super) fn pre_carry_parse(toml: &str) -> Option<SessionHandoff> {
         machine_names: Vec::new(),
     })
 }
-
-// ------------------------------------------------------------- the fake app
 
 const ROWS: u16 = 30;
 const COLS: u16 = 100;
@@ -213,7 +202,6 @@ fn live_engine(origin: u64) -> Terminal {
 const TURN_TEXT: &str = "count to 60 for me";
 
 /// The old process: the app answered one turn with `n` numbered rows.
-/// Returns its engine and ledger, as `SessionCtx` shares them.
 fn old_session(app: &mut FakeApp, n: usize) -> (Arc<Mutex<Terminal>>, Arc<Mutex<TurnLedger>>) {
     let mut t = live_engine(ORIGIN);
     t.process(b"\x1b[?1049h");
@@ -232,8 +220,6 @@ fn old_session(app: &mut FakeApp, n: usize) -> (Arc<Mutex<Terminal>>, Arc<Mutex<
         by: TurnBy::Ctl,
         carried: false,
     });
-    // The turn: its mark first, as `cmd_turn` takes it, then the echo of the
-    // message and the answer.
     let arch = ArchMark::of(&t);
     app.say(&mut t, [format!("❯ {TURN_TEXT}")]);
     app.say(&mut t, numbered(1..=n));
@@ -302,8 +288,7 @@ fn this_build() -> Option<String> {
 }
 
 /// Publish the staged handoff to the "successor" (this process), run
-/// `consume` as it, and close the channels. `consume` gets the pipes' ends it
-/// may need and returns what the test reads.
+/// `consume` as it, and close the channels.
 fn as_successor<T>(staged: &StagedHandoff, consume: impl FnOnce(i32) -> T) -> T {
     let (ready_read, ready_write) = pipe_pair("ready");
     let (commit_read, commit_write) = pipe_pair("commit");
@@ -333,8 +318,6 @@ fn ctl_files(staged: &StagedHandoff) -> Vec<std::path::PathBuf> {
         })
         .collect()
 }
-
-// --------------------------------------- the report reader (`Session::report`)
 
 /// A `Ctl` over the real verbs: `history` from the session's ledger,
 /// `offscreen` from its engine — the replies a raw client reads.
@@ -416,8 +399,6 @@ fn a_report_across_a_handoff_has_every_row_and_no_chrome() {
         ctl_files(&staged).is_empty(),
         "the receiver deleted the sidecar"
     );
-    // Past it by one overlap reserve: the producer may mint ids after writing
-    // the count, and those must not be minted again here.
     assert!(
         crate::control::turn_ids_minted() >= minted + crate::control::TURN_ID_RESERVE,
         "turn ids continue above the carried count and its overlap"
@@ -426,7 +407,6 @@ fn a_report_across_a_handoff_has_every_row_and_no_chrome() {
     let (mut t, ledger, outcome) = adopt(&carry.screens[0], Some(control));
     assert_eq!(outcome, Some(AltArchiveImport::Exact));
 
-    // The app repaints what it showed, then goes on.
     t.process(&app.frame(ROWS, COLS));
     app.say(&mut t, numbered(n + 1..=n + m));
 
@@ -501,9 +481,7 @@ fn a_report_across_a_handoff_and_a_resize_says_gap_and_loses_nothing() {
 /// into `Adopted::log`), and the product's own adoption (`spawn::adopted_log`
 /// taking the lines off the sidecar, then `spawn::mark_handoff_gap`)
 /// continues it: the same records, the next epoch, the overlap's seqs above
-/// the manifest's count. NEGATIVE CONTROL: the same adoption with the
-/// sidecar's member gone starts over, `gap why=handoff`, its seq still above
-/// the count.
+/// the manifest's count.
 #[test]
 fn the_session_log_crosses_the_real_files() {
     let Some(_env) = env_alone() else { return };
@@ -529,7 +507,6 @@ fn the_session_log_crosses_the_real_files() {
         .window()
         .map(|r| aterm_slog::encode(r, aterm_slog::Tier::Host).unwrap())
         .collect();
-    // The manifest's draw, as `SessionHandoff::from_store` takes it.
     let (ids, seq) = {
         let mut g = timeline.lock().unwrap();
         (g.handoff_log_ids(), g.handoff_log_seq())
@@ -597,7 +574,6 @@ fn the_session_log_crosses_the_real_files() {
     let mark = recs.last().unwrap();
     assert_eq!(mark.k, aterm_slog::Kind::Handoff);
     assert_eq!(mark.seq, seq + 1, "above the manifest's count");
-    // NEGATIVE CONTROL: without the member, the log starts over.
     let fresh = adopt(stripped);
     assert_eq!(fresh.len(), 1, "{fresh:?}");
     assert_eq!(
@@ -628,8 +604,6 @@ fn the_carry_round_trips_the_ledger_and_the_archive_tail() {
     let h = host(t, ledger);
     let after =
         crate::control::cmd_offscreen(&h.term, &crate::frame_memo::FrameSlot::default(), &since);
-    // The header's seq= is the engine's own content counter; everything else
-    // — origin, indices, rows, gaps — is the same archive.
     let strip_seq = |s: &str| {
         s.split_whitespace()
             .filter(|w| !w.starts_with("seq=") && !w.starts_with("epoch="))
@@ -681,11 +655,7 @@ fn a_repainted_session_keeps_its_ledger_and_archive_rows() {
 /// a session this receiver degrades because its
 /// screen meta did not parse adopts onto a blank engine — no checkpoint at
 /// all, the one degrade that has none — and keeps its archive rows as well
-/// as its ledger. The engine is put back by the product's own call
-/// (`spawn::hydrate_adopted_engine`), which installed the control carry
-/// only beside a restored screen and dropped it here: `history` named
-/// `arch=<old origin>:<n>` marks that `offscreen` then read from the start
-/// of a fresh archive, and the report reader lost the turn's rows.
+/// as its ledger.
 #[test]
 fn a_receiver_degraded_screen_without_a_meta_keeps_its_archive_rows() {
     let Some(_env) = env_alone() else { return };
@@ -800,9 +770,6 @@ fn a_bad_sidecar_only_drops_the_carry() {
     type Spoil = fn(&StagedHandoff, &std::path::Path);
     let spoils: [(&str, Spoil); 6] = [
         ("missing", |_, p| std::fs::remove_file(p).unwrap()),
-        // The manifest's stamp names more than a sidecar may hold: dropped
-        // unread (the manifest bytes are hashed by no one, so rewriting them
-        // is what a different sender would have written).
         ("stamped-oversized", |staged, _| {
             let body = std::fs::read_to_string(&staged.manifest_path).unwrap();
             let (nonce, toml) = body.split_once('\n').unwrap();
@@ -866,9 +833,7 @@ fn the_proof_digests_do_not_see_the_sidecar() {
     let mut app = FakeApp::new();
     let (term, turns) = old_session(&mut app, 30);
     let mut with = outgoing(&term, &turns, Some(7));
-    // The foreground holder rides the record, and is in neither digest either.
     with.fg_holders = vec![(0, 4242)];
-    // So does the render debt.
     with.render_debts = vec![(0, aterm_core::terminal::RenderDebt::of_rows(-1, 0))];
     let without = StageCarry {
         screens: with.screens.clone(),
@@ -897,10 +862,7 @@ fn the_proof_digests_do_not_see_the_sidecar() {
 }
 
 /// The rollback lane over a real handoff: this sender, sidecars and turn-id
-/// count included, hands off to a receiver built before the carry. It adopts
-/// every session, proves what the parent expects, and never opens a `.ctl`,
-/// which the sender unlinks once the proof checks out (as
-/// `run_handoff_decision` does).
+/// count included, hands off to a receiver built before the carry.
 #[test]
 fn a_new_sender_hands_off_to_a_receiver_built_before_the_carry() {
     let Some(_env) = env_alone() else { return };
@@ -917,7 +879,7 @@ fn a_new_sender_hands_off_to_a_receiver_built_before_the_carry() {
                 .expect("the older receiver adopts and proves");
         assert!(ready.signal_proof(proof), "ProofReady is published");
         let mut wire = [0u8; READY_WIRE_LEN];
-        // SAFETY: bounded read into a live fixed buffer from our own pipe.
+        // SAFETY: Bounded read into a live fixed buffer from our own pipe.
         let read = unsafe { libc::read(ready_read, wire.as_mut_ptr().cast(), wire.len()) };
         assert_eq!(
             read, READY_WIRE_LEN as isize,
@@ -986,19 +948,12 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
             icon: None,
             role: None,
             attention: None,
-            // Set on purpose: a worker's question policy stays with it across
-            // the update.
             questions: Some("recommended".to_string()),
-            // Set on purpose too: an Off session stays Off across the update.
             autopilot: Some("off".to_string()),
             land_at: None,
             control: Some(handoff_carry::stamp(b"{}")),
             frozen_path: true,
-            // Non-empty on purpose: the topic set is consent, and this
-            // roundtrip proves a seamless update keeps it.
             topics: vec!["build.failed head".to_string(), "sat-comp @42".to_string()],
-            // The foreground handback's holder: a record scalar, so it crosses
-            // at every rung, and an old reader skips it.
             fg_holder: Some(4242),
             rekey: false,
             loader: false,
@@ -1012,8 +967,6 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
             claim_known: false,
             attention_owners: Vec::new(),
             viewport_from_bottom: None,
-            // The render debt owed the alternate screen: a record scalar an
-            // old reader skips.
             render_debt: Some("-1,0".to_string()),
             render_debt_cut: 0,
             fabric: Default::default(),
@@ -1057,8 +1010,6 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
         wire.contains("render_debt = \"-1,0\"") && !old_wire.contains("render_debt"),
         "the render debt rides this build's wire and an old reader drops it"
     );
-    // Every question-policy word — the priority words among them — rides
-    // this build's wire as written.
     for word in crate::session_timeline::QUESTIONS_POLICY_WORDS {
         let mut one = new.clone();
         one.sessions[0].questions = Some(word.to_string());
@@ -1092,8 +1043,7 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
 /// The render debt crosses the handoff only onto a carried alternate screen:
 /// the successor's `Adopted` carries what the parent's record stamped, and
 /// nothing when the record has no key, the screen was carried blank (the
-/// program repaints), or the session is on the main screen. Seeded onto a
-/// restored engine it is the engine's debt again; the first full clear zeroes it.
+/// program repaints), or the session is on the main screen.
 #[test]
 fn the_render_debt_crosses_the_handoff_and_only_onto_a_carried_alt_screen() {
     let Some(_env) = env_alone() else { return };
@@ -1121,7 +1071,6 @@ fn the_render_debt_crosses_the_handoff_and_only_onto_a_carried_alt_screen() {
         render_debts: Vec::new(),
     };
 
-    // The producer stamped it: the successor's adoption carries it.
     let staged = stage_carry_handoff("render-debt-with", &with);
     let adopted = as_successor(&staged, |_| take_incoming().adopted);
     assert_eq!(
@@ -1148,22 +1097,17 @@ fn the_render_debt_crosses_the_handoff_and_only_onto_a_carried_alt_screen() {
     );
     staged.teardown();
 
-    // A record without the key: nothing is carried (a debt-free predecessor,
-    // or one that predates the field).
     let staged = stage_carry_handoff("render-debt-without", &without);
     let adopted = as_successor(&staged, |_| take_incoming().adopted);
     assert_eq!(adopted[0].render_debt, None);
     staged.teardown();
 
-    // Negative control: a screen carried blank on purpose (the program is
-    // asked to repaint) has no screen the debt is about.
     let staged = stage_ladder_handoff("render-debt-repaint", &with, &[0]);
     let adopted = as_successor(&staged, |_| take_incoming().adopted);
     assert!(adopted[0].repaint);
     assert_eq!(adopted[0].render_debt, None);
     staged.teardown();
 
-    // Negative control: the main screen owes nothing, whatever a record says.
     let mut shell = live_engine(ORIGIN);
     shell.process(b"$ ls\r\n");
     let main = StageCarry {
@@ -1193,8 +1137,6 @@ fn the_startup_sweep_retires_only_a_dead_senders_files() {
         "seamless-9999-aaaa.layout.toml",
         "seamless-9999-aaaa.s0.grid",
         "seamless-9999-aaaa.s0.ctl",
-        // The restore machinery's hidden siblings of the layout: its lock, and a
-        // temporary a crash left mid-publish.
         ".seamless-9999-aaaa.layout.toml.aterm-restore.lock",
         ".seamless-9999-aaaa.layout.toml.aterm-write-9999-1-0.tmp",
     ];
@@ -1223,7 +1165,6 @@ fn the_startup_sweep_retires_only_a_dead_senders_files() {
     }
     assert!(dir.join("seamless-9999-dir").is_dir());
 
-    // And the production predicate: a reaped child's pid is dead, ours is not.
     let mut child = aterm_uds::spawnfd::command("true").spawn().unwrap();
     let pid = child.id();
     child.wait().unwrap();
@@ -1355,17 +1296,15 @@ fn a_fifo_at_the_sidecar_path_does_not_stall_the_adoption() {
     let fifo = files[0].clone();
     std::fs::remove_file(&fifo).unwrap();
     let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
-    // SAFETY: a NUL-terminated path; mkfifo only creates the node.
+    // SAFETY: A NUL-terminated path; mkfifo only creates the node.
     assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
     let outcome = as_successor(&staged, |_| {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(child_proof_from(take_incoming()));
         });
-        // A hang detector, not a latency budget: a blocked open never returns.
         let got = rx.recv_timeout(std::time::Duration::from_secs(60));
         if got.is_err() {
-            // Release the open blocked on the FIFO so the thread can finish.
             use std::os::unix::fs::OpenOptionsExt as _;
             let _ = std::fs::OpenOptions::new()
                 .write(true)
@@ -1385,8 +1324,6 @@ fn a_fifo_at_the_sidecar_path_does_not_stall_the_adoption() {
     assert!(!fifo.exists(), "the FIFO is consumed like any sidecar");
     staged.teardown();
 }
-
-// ------------------------------------------------------------- continuity
 
 /// The freeze and the worker, with the freeze's `differ` choice: past half
 /// its budget the freeze leaves the differ's state out.
@@ -1522,7 +1459,6 @@ fn history_stops_saying_a_floor_once_the_lost_turns_would_have_aged_out() {
     let h = host(live_engine(1), handoff_carry::adopted_ledger(None));
     let floor = h.ctx.turns.lock().unwrap().unheld_below();
     assert!(floor > minted);
-    // The worker's next turn, the first id this process mints.
     h.ctx.turns.lock().unwrap().push(history_rec(floor, false));
     let before = format!("since={}", minted - 10);
     let reply = crate::control::cmd_history(&h.ctx, &before);
@@ -1539,7 +1475,6 @@ fn history_stops_saying_a_floor_once_the_lost_turns_would_have_aged_out() {
         floor,
         "carried on by a second update"
     );
-    // One turn short of LEDGER_CAP: a ledger carried whole still held them.
     let cap = crate::turn_ledger::LEDGER_CAP as u64;
     for id in floor + 1..floor + cap - 1 {
         h.ctx.turns.lock().unwrap().push(history_rec(id, false));
@@ -1593,7 +1528,6 @@ fn history_on_a_halved_ledger_says_its_floor() {
         reply.starts_with(&format!("OK 1 unheld_below={minted}\nturn {minted} ")),
         "{reply}"
     );
-    // An anchor at the floor lost nothing.
     let past = format!("since={}", minted - 1);
     assert!(
         crate::control::cmd_history(&h.ctx, &past).starts_with("OK 1\n"),
@@ -1604,12 +1538,10 @@ fn history_on_a_halved_ledger_says_its_floor() {
 /// A `subscribe … events since-turn=<n>` resumed after a handoff that could
 /// not carry the session's ledger is told the turns up to the carried count
 /// are gone (`GAP … events-resync=`), as when records are evicted or a carried
-/// ledger was halved. A ledger carried whole, with no turn in it, tells nothing.
+/// ledger was halved.
 #[test]
 fn a_since_turn_resume_after_a_dropped_ledger_is_told_of_the_loss() {
     let minted = crate::control::turn_ids_minted() + 50;
-    // `take_incoming`: past the manifest's `next_turn_id` by one overlap
-    // reserve.
     crate::control::raise_turn_ids(crate::seamless::intake_turn_floor(minted));
     let resume = |local: u64, ledger: TurnLedger| -> String {
         let store = crate::session_store::new_store();
@@ -1643,7 +1575,6 @@ fn a_since_turn_resume_after_a_dropped_ledger_is_told_of_the_loss() {
         );
         String::from_utf8_lossy(&sink).into_owned()
     };
-    // The control: a carried ledger halved to its newest record.
     let mut halved = ControlCarry {
         turns: vec![history_rec(minted, true)],
         unheld_below: minted,
@@ -1658,14 +1589,12 @@ fn a_since_turn_resume_after_a_dropped_ledger_is_told_of_the_loss() {
         told.contains(&format!("GAP 8 events-resync={minted}")),
         "{told:?}"
     );
-    // The ledger dropped whole: turns minted-9..=minted are just as gone.
     let out = resume(9, handoff_carry::adopted_ledger(None));
     assert!(
         out.contains("GAP 9 events-resync="),
         "turns {}..={minted} were lost with the ledger: {out:?}",
         minted - 9
     );
-    // Carried whole, and empty: nothing was lost, nothing is said.
     let quiet = resume(
         10,
         handoff_carry::adopted_ledger(Some(&mut ControlCarry::default())),
@@ -1697,10 +1626,7 @@ impl FakeApp {
 
 /// The first turn driven after an update, at the same size: someone scrolls
 /// the worker's app back past the turns' marks (120 rows before them were
-/// typed with no `turn`) and down again, mid-turn. The carry reaches as far
-/// back as the differ can point, so the adopted engine recognizes the re-shown
-/// rows as the old one does: `offscreen since=<turn mark>` reads the same rows
-/// from both.
+/// typed with no `turn`) and down again, mid-turn.
 #[test]
 fn a_scroll_back_past_the_turns_marks_after_a_handoff_archives_nothing_twice() {
     let mut app = FakeApp::new();
@@ -1738,7 +1664,6 @@ fn a_scroll_back_past_the_turns_marks_after_a_handoff_archives_nothing_twice() {
     let (mut t, _, outcome) = adopt(&checkpoint, Some(control));
     assert_eq!(outcome, Some(AltArchiveImport::Exact));
     let mut old = Arc::try_unwrap(term).ok().unwrap().into_inner().unwrap();
-    // Turn 42, driven after the update.
     let arch = ArchMark::of(&t);
     assert_eq!(arch, ArchMark::of(&old));
     let mut both = |bytes: &[u8]| {
@@ -1751,7 +1676,6 @@ fn a_scroll_back_past_the_turns_marks_after_a_handoff_archives_nothing_twice() {
         app.doc.push(l);
         both(&app.frame(ROWS, COLS));
     }
-    // Back 75 rows (past the turns' marks), three a frame, and down again.
     let top = app.doc.len() - (usize::from(ROWS) - 5);
     let mut views: Vec<usize> = (1..=25).map(|k| top - 3 * k).collect();
     views.extend((0..25).rev().map(|k| top - 3 * k));
@@ -1791,8 +1715,6 @@ fn a_scroll_back_past_the_turns_marks_after_a_handoff_archives_nothing_twice() {
     );
     assert!(o[0].contains(" lost=0 breaks=0 "), "{}", o[0]);
 }
-
-// ------------------------------------------------ the history carry, real wire
 
 /// A shell tab with a deep history — far past the screen carry's 256 lines.
 fn deep_shell(lines: usize) -> Arc<Mutex<Terminal>> {
@@ -1886,7 +1808,6 @@ fn the_history_carry_crosses_the_real_wire_outside_the_proof() {
     let history = std::mem::take(&mut adopted[0].history);
     assert!(history.carry.is_some(), "the carry rides the adoption");
     assert_eq!((history.dropped, history.lost), (0, 0));
-    // The adopt, then the import after Commit.
     let mut history = history;
     let successor = Arc::new(Mutex::new(Terminal::new(ROWS, COLS)));
     crate::spawn::hydrate_adopted_engine(
@@ -1937,9 +1858,7 @@ fn a_receiver_built_before_the_history_carry_skips_it_and_proves() {
 }
 
 /// THE HANDOFF FIXTURE GENERATOR: what this release's producer writes for
-/// every required desk and its rendezvous transport. Ordinary tests exercise
-/// it in private child processes; the release cut supplies output destinations
-/// and its reserved build stamp (`tests/fixtures/handoff/README.md`).
+/// every required desk and its rendezvous transport.
 #[cfg(test)]
 #[path = "seamless_fixture_generator_tests.rs"]
 mod fixture_generator;

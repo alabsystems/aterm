@@ -1,19 +1,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! [`ReleaseHost`]: every operation the producer performs on GitHub releases, as one
-//! trait. The production adapter ([`gh::GhCli`]) is the only code that runs `gh`; tests
-//! drive [`fake::FakeHost`], an in-memory host that can play a draft, a one-shot HTTP 500,
-//! an unreachable owner and a private repo.
-//!
-//! Two rules are structural rather than tested:
-//! * every [`ReleaseHost::create`] is a prerelease that never takes `/releases/latest`
-//!   (that pointer belongs to the app release);
-//! * nothing replaces a published asset except a [`Replace::Clobber`] upload, which only
-//!   the staging owner's convergence and the Linux lane's manifest extension ask for.
+//! [`ReleaseHost`] trait and types for GitHub release operations.
 
 pub mod agh;
-/// The tests' host: never in a release build, which the lane's snapshot is.
+/// In-memory fake host for tests and debug builds.
 #[cfg(any(test, debug_assertions))]
 pub mod fake;
 pub mod gh;
@@ -40,8 +31,7 @@ impl Slug {
         }
     }
 
-    /// The unmetered, anonymous download-host URL of one release asset — what every
-    /// client fetches.
+    /// Returns the anonymous download-host URL of a release asset.
     #[must_use]
     pub fn download_url(&self, tag: &str, asset: &str) -> String {
         format!(
@@ -86,8 +76,7 @@ pub enum Probe {
 pub enum HostError {
     /// The release (or asset) does not exist: an answer.
     NotFound,
-    /// The host could not be reached or answered something else (a 500, a rate limit).
-    /// Not an answer: a caller must never read it as "absent".
+    /// The host could not be reached or returned a transient error.
     Unreachable(String),
     /// The host refused the operation (an asset that already exists, a bad token).
     Refused(String),
@@ -106,11 +95,9 @@ impl std::fmt::Display for HostError {
 /// Whether an upload may replace an asset that is already there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Replace {
-    /// Never: an asset that appeared meanwhile is another publisher's, and the upload
-    /// fails loudly.
+    /// Never replace an existing asset.
     Never,
-    /// Replace: the staging owner's own partial publish converging, or the Linux lane
-    /// extending a manifest it has proven is a byte-prefix extension.
+    /// Replace an existing asset when converging staging or extending a manifest.
     Clobber,
 }
 
@@ -127,12 +114,10 @@ pub trait ReleaseHost {
     ///
     /// # Errors
     ///
-    /// [`HostError::NotFound`] when there is none — an answer, unlike
-    /// [`HostError::Unreachable`].
+    /// [`HostError::NotFound`] when absent, or [`HostError::Unreachable`] on failure.
     fn release(&self, slug: &Slug, tag: &str) -> Result<Release, HostError>;
 
-    /// Download `assets` of release `tag` into `dir`, replacing a partial file an
-    /// earlier attempt left there.
+    /// Downloads `assets` of release `tag` into `dir`.
     ///
     /// # Errors
     ///
@@ -172,20 +157,17 @@ pub trait ReleaseHost {
         replace: Replace,
     ) -> Result<(), HostError>;
 
-    /// Publish the draft `tag` (it stays a prerelease) — the step a killed create never
-    /// reached.
+    /// Publishes the draft release `tag` as a prerelease.
     ///
     /// # Errors
     ///
     /// Why the edit failed.
     fn publish_draft(&self, slug: &Slug, tag: &str) -> Result<(), HostError>;
 
-    /// What the anonymous download host answers for one asset (HEAD, no redirect
-    /// followed) — how a client sees it.
+    /// Probes the anonymous download host for one asset without following redirects.
     fn probe_public(&self, slug: &Slug, tag: &str, asset: &str) -> Probe;
 
-    /// GET one asset from the download host into `dest`, at most `cap` bytes (removed
-    /// again unless [`Probe::Present`]; an asset over the cap is never present).
+    /// Fetches one asset from the download host into `dest`, up to `cap` bytes.
     fn fetch_public(&self, slug: &Slug, tag: &str, asset: &str, dest: &Path, cap: u64) -> Probe;
 
     /// Clone `slug` into `dest` (the lanes' scratch clones of the program repos).
@@ -195,24 +177,17 @@ pub trait ReleaseHost {
     /// Why the clone failed.
     fn clone_repo(&self, slug: &Slug, dest: &Path) -> Result<(), HostError>;
 
-    /// How long a caller waits before retrying an operation this host did not answer
-    /// ([`HostError::Unreachable`]). Zero unless the host is a real network service: an
-    /// in-memory host answers the same instantly, and a test never sleeps.
+    /// Pause duration before retrying an [`HostError::Unreachable`] operation.
     fn retry_pause(&self) -> Duration {
         Duration::ZERO
     }
 
-    /// Whether this identity reads with no credential: no token file, so `gh` has nothing
-    /// to read the API with on a keyless builder. Then the channel head is found and
-    /// fetched on the anonymous download host, as a client finds it
-    /// ([`crate::quad::head_build`]).
+    /// Returns whether this identity reads without credentials.
     fn reads_anonymously(&self) -> bool {
         false
     }
 
-    /// Bring the scratch clone `dir` of `slug` up to date as this identity: every branch
-    /// into `refs/remotes/origin/*`, and the tags. A clone's own `origin` is never fetched
-    /// by name, because git would authenticate with whatever credential is ambient.
+    /// Updates the scratch clone `dir` of `slug` as this identity.
     ///
     /// # Errors
     ///

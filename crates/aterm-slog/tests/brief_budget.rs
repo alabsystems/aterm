@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `brief` (§7.4): its shape, its budget and its shedding order.
+//! Budget, level-shedding, and refinement conformance tests for `brief`.
 
 use aterm_slog::{
     Actor, Amend, BoxWord, BriefInput, Close, Conf, Cursor, Fields, Key, Kind, Limits, Log, Mark,
@@ -36,8 +36,6 @@ fn session(turns: u64) -> (Log, u64) {
             ms += 50;
             tr.observe(&mut log, v, None, at(ms));
         }
-        // A mark worth a line (a person's hands; a bell gives none since
-        // phase 3B).
         if i % 3 == 0 {
             log.mark(
                 Mark::new(Kind::Human, Src::Input, Conf::Strong).by(Actor::Human),
@@ -146,8 +144,6 @@ fn brief_stays_within_its_budget() {
 /// THE FLOOR IS THE FIT AT ZERO, RENDERED ONCE: over sessions of 1 to 120
 /// turns, read whole, past a cursor and across an epoch (a gap line),
 /// `Briefing::floor` is byte for byte `fit` at budget 0, the one-line form.
-/// NEGATIVE CONTROL: the one-line form fitted at budget 1 differs from it,
-/// in its header's budget alone, so the equality reads the whole reply.
 #[test]
 fn briefing_floor_is_its_fit_at_zero() {
     for turns in [1, 5, 30, 120] {
@@ -164,7 +160,6 @@ fn briefing_floor_is_its_fit_at_zero() {
             assert_eq!(floor, briefing.fit("s-1", 0, now), "{turns} turns");
             assert_eq!(floor.level, 4, "{}", floor.text);
 
-            // NEGATIVE CONTROL.
             let one = briefing.fit("s-1", 1, now);
             assert_eq!(one.level, 4, "{}", one.text);
             assert_ne!(one.text, floor.text);
@@ -206,7 +201,6 @@ fn brief_sheds_in_order() {
             0 => assert!(steps > 1 && ranges == 0 && marks > 0),
             1 => assert!(steps < full_steps && ranges == 0 && marks > 0, "{}", b.text),
             2 => assert!(ranges > 0 && marks > 0, "{}", b.text),
-            // Marks first, then the oldest turn lines: the newest stays.
             3 => assert!(
                 marks == 0 && lines.iter().any(|l| l.starts_with("t30 ")),
                 "{}",
@@ -330,9 +324,7 @@ fn brief_keeps_the_open_turn_its_window_lacks() {
 /// (`ledger=7`) settles, and later turns evict its open record while its
 /// close stays; the close restates `ledger=` (5F-4a) and its opener as
 /// `op_by=harness`, so the brief's line for it still says `by=harness
-/// ledger=7`. NEGATIVE CONTROLS (scratch reverts): a close without
-/// `op_by=` loses `by=`; a brief that reads `ledger=` only from the open
-/// loses `ledger=`.
+/// ledger=7`.
 #[test]
 fn a_harness_turn_whose_open_was_evicted_still_briefs_its_author_and_ledger() {
     let mut log = Log::with_limits(1, Limits::new(20, 1 << 20).expect("a 20-record ring"));
@@ -440,9 +432,7 @@ fn turn_line_of(log: &Log, t: Node, ms: u64) -> String {
 /// the newest closed turn's link); a `kind=note` mail, two task mails (the
 /// fold's `mail_amb=`, T10c), a person's turn and a turn naming its cause
 /// print none, the cause staying `cause=@9`; and no record `log` prints
-/// names the link. NEGATIVE CONTROLS (scratch reverts): a renderer that
-/// writes the token without its suffix fails here, in the conformance
-/// walk and in the `.seq` corpus; one that never writes it fails here.
+/// names the link.
 #[test]
 fn a_turn_after_one_task_mail_briefs_it_as_a_guess() {
     let (mut log, t, ms) = mail_then_turn(&[("task", 9)], Actor::Ctl, None);
@@ -531,8 +521,7 @@ fn brief_sheds_old_turn_lines_before_the_session() {
 /// THE GAP IS THE READ'S, NEVER INFERRED: a brief over a window narrowed to
 /// the records past a cursor (or one node's subtree) reports no loss when its
 /// read crossed none, however late its first seq; the gap a read did cross is
-/// printed as `log` prints it. NEGATIVE CONTROL: the same narrowed window
-/// with the read's gap says it.
+/// printed as `log` prints it.
 #[test]
 fn a_narrowed_window_reports_only_the_gap_its_read_crossed() {
     let (log, now) = session(3);
@@ -557,8 +546,7 @@ fn a_narrowed_window_reports_only_the_gap_its_read_crossed() {
 }
 
 /// A phase nothing has observed carries no reliability suffix: `?` is a
-/// claim's, and nothing claimed anything. NEGATIVE CONTROL: an observed phase
-/// keeps its `[src+]`.
+/// claim's, and nothing claimed anything.
 #[test]
 fn an_unobserved_phase_claims_nothing() {
     let mut log = Log::new(1);
@@ -618,7 +606,6 @@ fn a_source_or_landing_mark_gives_no_brief_line() {
     let after = log.brief("s-7bd6", 2000, now).text;
     let body = |t: &str| t.lines().skip(1).map(str::to_string).collect::<Vec<_>>();
     assert_eq!(body(&after), body(&before), "{after}");
-    // Negative control: a person's input is worth a line.
     log.mark(
         Mark::new(Kind::Human, Src::Input, Conf::Strong).by(Actor::Human),
         at(9_001),
@@ -674,7 +661,6 @@ fn brief_reads_an_exact_refinement_and_never_a_strong_one() {
     let p = format!("p{} ", tool.n);
     assert!(line(&log, &t).starts_with(&format!("t{} done ", turn.n)));
     assert!(line(&log, &p).contains(" gone "), "{}", line(&log, &p));
-    // Strong refinements are records, never the outcome.
     amend(
         &mut log,
         turn,
@@ -697,7 +683,6 @@ fn brief_reads_an_exact_refinement_and_never_a_strong_one() {
         line(&log, &t)
     );
     assert!(line(&log, &p).contains(" gone "), "{}", line(&log, &p));
-    // Exact ones refine them.
     amend(
         &mut log,
         turn,
@@ -720,7 +705,6 @@ fn brief_reads_an_exact_refinement_and_never_a_strong_one() {
         line(&log, &t)
     );
     assert!(line(&log, &p).contains(" error "), "{}", line(&log, &p));
-    // A late rollup (tools the transcript saw after the screen's close).
     amend(
         &mut log,
         turn,
@@ -740,10 +724,6 @@ fn brief_reads_an_exact_refinement_and_never_a_strong_one() {
 /// busy agent session's brief, every 3B mark written on every turn, holds
 /// every line it holds without them, at every budget; mail is the `mail in ·
 /// out` line and `act` and `story` one count line, both the first lines shed.
-/// Phase 6's ring kinds (6F-2) are among them: none is a line, and since
-/// 6F-9 (U26) the `shown` marks are one more count line, shed with them.
-/// NEGATIVE CONTROL: the count lines are there when they fit, and a pre-3B
-/// mark (a person's input) still is a line.
 #[test]
 fn the_3b_marks_leave_the_brief_as_it_was() {
     let (mut base, now) = session(12);
@@ -779,7 +759,6 @@ fn the_3b_marks_leave_the_brief_as_it_was() {
             Kind::Act => f.word(Key::Word, "approve"),
             Kind::Story => f.word(Key::Word, "approved"),
             Kind::Cwd => f.text(Key::Cwd, "/w/repo"),
-            // Phase 6's ring facts (6F-2): no line either.
             Kind::State => f.word(Key::State, "alive"),
             Kind::Policy => f.id(Key::Gen, "7"),
             Kind::Topic => f.id(Key::Fp, "0a1b2c3d4e5f6071"),
@@ -793,6 +772,10 @@ fn the_3b_marks_leave_the_brief_as_it_was() {
             Kind::Shown => f
                 .word(Key::Need, "approval")
                 .and_then(|f| f.word(Key::Sev, "decide")),
+            // The row the log holds as its row alone: no line either.
+            Kind::Row => f
+                .tok(Key::RowKind, "job-change")
+                .and_then(|f| f.text(Key::RowText, "exited job=j41 class=exited rev=1")),
             _ => Ok(f),
         }
         .expect("fields")
@@ -825,6 +808,7 @@ fn the_3b_marks_leave_the_brief_as_it_was() {
         Kind::Program,
         Kind::MailFetch,
         Kind::Shown,
+        Kind::Row,
     ];
     for i in 0..12u64 {
         for k in kinds {
@@ -835,8 +819,6 @@ fn the_3b_marks_leave_the_brief_as_it_was() {
                 at(20_000 + i),
             )
             .expect("a 3B mark");
-            // The base takes as many records a brief never showed (an
-            // agent mark), so both headers name the same `as_of`.
             base.mark(
                 Mark::new(Kind::Agent, Src::Screen, Conf::Strong).at(run),
                 at(20_000 + i),
@@ -877,8 +859,7 @@ fn the_3b_marks_leave_the_brief_as_it_was() {
 /// a self-supervised agent's acts (`meta set harness_act`, written as
 /// `act` marks by the connection's actor, `src=mark conf=claim`) leave the
 /// brief with every line it had without them, plus `acts N · stories 0`,
-/// which is shed first. NEGATIVE CONTROL: the count line is there when it
-/// fits.
+/// which is shed first.
 #[test]
 fn a_codex_alab_sessions_acts_are_one_count_line_shed_first() {
     let (mut base, now) = session(6);
@@ -906,7 +887,6 @@ fn a_codex_alab_sessions_acts_are_one_count_line_shed_first() {
             at(ms),
         )
         .expect("an act mark");
-        // As many records a brief never shows, so both name one `as_of`.
         base.mark(
             Mark::new(Kind::Agent, Src::Screen, Conf::Strong).at(run),
             at(ms),
@@ -934,10 +914,7 @@ fn a_codex_alab_sessions_acts_are_one_count_line_shed_first() {
 
 /// A RELAUNCHED SESSION (plan 5F-2's case of [`a_relaunched_sessions_acts_are_one_count_line_shed_first`]):
 /// [`session`]'s run, the agent exiting on its open box, then a relaunched
-/// agent's run with two turns. With `acts`, the hosted lanes' marks between
-/// the two runs (`act word=relaunch rule=<row> by=harness src=aterm
-/// conf=strong`: the relaunch, then the carry-on it typed); without, as
-/// many records a brief never shows, so both name one `as_of`.
+/// agent's run with two turns.
 fn relaunched(acts: bool) -> (Log, u64) {
     let (mut log, _) = session(6);
     let run = log.state().run().expect("the run").node;
@@ -988,8 +965,7 @@ fn relaunched(acts: bool) -> (Log, u64) {
 /// the hosted lanes' `act word=relaunch` marks (`by=harness
 /// src=aterm conf=strong`) leave the brief with every line it had without
 /// them — both runs, their turns and the exit — plus `acts 2 · stories 0`,
-/// which is shed first. NEGATIVE CONTROL: the count line is there when it
-/// fits.
+/// which is shed first.
 #[test]
 fn a_relaunched_sessions_acts_are_one_count_line_shed_first() {
     let (base, now) = relaunched(false);
@@ -1080,8 +1056,7 @@ fn tx_amend(log: &mut Log, run: Node, tx: Option<(Node, Kind, Fields)>, ms: u64)
 /// [`session`] with what a Claude Code transcript adds (`tx`): two tool
 /// steps in each turn, one of them amended `out=error`, each closed turn
 /// amended with its vendor duration and tokens, and three tool steps open
-/// in the open turn. The base takes as many records a brief never shows,
-/// so both name the same ids.
+/// in the open turn.
 fn tx_session(turns: u64, tx: bool) -> (Log, u64) {
     let mut log = Log::new(2);
     let run = agent_session(&mut log, 0);
@@ -1176,9 +1151,6 @@ fn the_transcript_sheds_before_what_the_brief_held_without_it() {
             }
             continue;
         }
-        // Not as it read without the transcript: then it holds every line
-        // that did (a line by its id; a turn's carries the transcript's
-        // numbers), and something of the transcript's.
         let ids: Vec<String> = wl.iter().map(|l| id(l)).collect();
         for l in &bl {
             assert!(

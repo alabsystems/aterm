@@ -1,45 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE MARK LIMITER (design §7.4, phase 3A): `mark` is rate-limited per
-//! (session, author) at one claim a second with bursts of [`MARK_BURST`],
-//! and over the limit the verb answers `ERR busy retry_ms=`.
-//!
-//! Pure and clockless: the host passes its monotonic milliseconds. A bucket
-//! holds thousandths of a token and refills one token per
-//! [`MARK_REFILL_MS`], up to the burst.
-//!
-//! THE AUTHORS. The harness, the bridge, the Owner's clients
-//! (`ctl`) and the person each have a bucket of their own, outside every
-//! table, so no flood of other authors delays them. Sessions (edge sources)
-//! share [`MARK_ACTORS`] named buckets; a slot is reused only when its
-//! bucket is full and idle (never while it is in debt, which would refill
-//! it), and every session past them shares one overflow bucket, as does an
-//! author no connection names. An Owner can mint any number of edges, so the
-//! table is bounded and a flood of minted sources marks at most as fast as
-//! the named slots and the overflow together allow, whatever their number.
-//!
-//! THE MARKS A BUCKET WAS SHORT OF: a host that counts
-//! a mark instead of making it, its author's bucket short
-//! ([`MarkLimiter::note_short`]), keeps the count, and the next mark the
-//! same author makes says it ([`MarkLimiter::owed`], [`MarkLimiter::said`]):
-//! a trusted actor's in its own bucket, a session's in its named slot while
-//! it holds one. A named slot owing a count is given to another session only
-//! when no free slot or idle slot owing nothing is left, and its count then
-//! goes with its last holder, not with the slot.
-//!
-//! THE OVERFLOWED AUTHORS' OWN COUNTS: the
-//! authors past the named slots (the sessions past the table, and `-`,
-//! `aterm` and a vendor) share the overflow bucket's tokens, but not their
-//! counts: [`MARK_OWED_AUTHORS`] owed-only entries, one per such author,
-//! each a count and no tokens, keep what each was short of, so each one's
-//! next mark says its own `dropped=`. A session that takes a named slot
-//! takes its entry's count into it. The table is bounded (an Owner can mint
-//! any number of edges): past it, the entry noted least recently spills its
-//! count into the SHARED POOL (the overflow bucket's own count), which an
-//! overflowed author with no entry of its own says, marked as the pool's
-//! ([`Owed::Shared`], `pool=shared` on the host's mark), never as its own.
-//! So no author's count rides another author's mark as that author's.
+//! THE MARK LIMITER (design §7.4, phase 3A).
 
 use std::collections::VecDeque;
 
@@ -51,8 +13,7 @@ pub const MARK_BURST: u32 = 20;
 pub const MARK_REFILL_MS: u64 = 1000;
 /// The named buckets sessions share before the overflow.
 pub const MARK_ACTORS: usize = 16;
-/// The overflowed authors whose short counts are kept apart:
-/// past them, the shared pool.
+/// The overflowed authors whose short counts are kept apart: past them, the shared pool.
 pub const MARK_OWED_AUTHORS: usize = 32;
 
 /// A bucket's full level, in thousandths of a token.
@@ -122,12 +83,9 @@ enum Slot {
 /// What an author's next mark says ([`MarkLimiter::owed`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Owed {
-    /// The author's own count (`0`: nothing to say): its trusted bucket's,
-    /// its named slot's, or its owed-only entry's.
+    /// The author's own count: its trusted bucket's, its named slot's, or its owed-only entry's.
     Own(u64),
-    /// The shared pool's count, which an overflowed author with no count of
-    /// its own says for the authors the owed-only table spilled: never as
-    /// its own (`pool=shared`).
+    /// The shared pool's count.
     Shared(u64),
 }
 
@@ -205,8 +163,6 @@ impl MarkLimiter {
         {
             return Slot::Named(i);
         }
-        // A free slot, or an idle one owing nothing; else an idle one whose
-        // count goes unsaid (module doc).
         let free = self
             .named
             .iter_mut()
@@ -222,11 +178,6 @@ impl MarkLimiter {
         match free {
             Some(i) => {
                 if take {
-                    // The new holder brings its entry's count, and leaves
-                    // the table first: its room is the last holder's, whose
-                    // count goes with it, to its own entry. Owed first, a
-                    // full table would spill the new holder's own count
-                    // into the pool when it was the least recently noted.
                     let brought = self.take_entry(by).unwrap_or(0);
                     if let Some((last, b)) = self.named[i]
                         && b.short > 0
@@ -258,9 +209,7 @@ impl MarkLimiter {
     }
 
     /// `n` more marks `by`, an author with no named slot, was short of: its
-    /// entry, now the most recently noted. A new entry past
-    /// [`MARK_OWED_AUTHORS`] spills the least recently noted one's count
-    /// into the shared pool.
+    /// entry, now the most recently noted.
     fn owe(&mut self, by: Actor, n: u64) {
         if n == 0 {
             return;
@@ -274,8 +223,7 @@ impl MarkLimiter {
         self.owed_only.push_back((by, count));
     }
 
-    /// The bucket of `slot`. A named slot is filled before it is spent
-    /// from ([`Self::slot`] with `take`); an empty one reads as the overflow.
+    /// The bucket of `slot`.
     const fn bucket(&mut self, slot: Slot) -> &mut Bucket {
         match slot {
             Slot::Harness => &mut self.harness,
@@ -290,33 +238,24 @@ impl MarkLimiter {
         }
     }
 
-    /// Whether `by` may mark at `now_mono_ms`: `Err(retry_ms)`, how long until
-    /// it may, when its bucket is short of a token. Spends nothing.
-    ///
+    /// Whether `by` may mark at `now_mono_ms`.
     /// # Errors
-    ///
     /// `retry_ms` while `by`'s bucket holds less than one token.
     pub fn peek(&mut self, by: &Actor, now_mono_ms: u64) -> Result<(), u64> {
         let slot = self.slot(by, now_mono_ms, false);
         match slot {
-            // A slot not yet taken is a full bucket.
             Slot::Named(i) if !self.holds(i, by) => Ok(()),
             _ => self.bucket(slot).peek(now_mono_ms),
         }
     }
 
-    /// Spend one of `by`'s tokens at `now_mono_ms` (after its mark was
-    /// appended: a token is spent only by a mark that was).
+    /// Spend one of `by`'s tokens at `now_mono_ms`.
     pub fn spend(&mut self, by: &Actor, now_mono_ms: u64) {
         let slot = self.slot(by, now_mono_ms, true);
         self.bucket(slot).spend(now_mono_ms);
     }
 
-    /// `by` was short of a token at `now_mono_ms` and its mark was counted,
-    /// not made: one more in its own count, which its next mark says
-    /// ([`Self::owed`]). A session that holds no slot yet takes one as
-    /// [`Self::spend`] would; an author past the named slots counts in its
-    /// owed-only entry (the module doc).
+    /// `by` was short of a token at `now_mono_ms` and its mark was counted, not made.
     pub fn note_short(&mut self, by: &Actor, now_mono_ms: u64) {
         match self.slot(by, now_mono_ms, true) {
             Slot::Overflow => self.owe(*by, 1),
@@ -327,12 +266,7 @@ impl MarkLimiter {
         }
     }
 
-    /// What `by`'s next mark says ([`Self::note_short`], [`Self::said`]): its
-    /// own count (a trusted actor's bucket's, the named slot's it holds, or
-    /// its owed-only entry's), else, for an author past the named slots with
-    /// none, the shared pool's. A session that holds no slot while one is
-    /// there to take (free, or idle) says its entry's count or nothing,
-    /// never that slot's last holder's or the pool's.
+    /// What `by`'s next mark says ([`Self::note_short`], [`Self::said`]).
     pub fn owed(&mut self, by: &Actor, now_mono_ms: u64) -> Owed {
         match self.slot(by, now_mono_ms, false) {
             Slot::Named(i) if !self.holds(i, by) => Owed::Own(self.entry(by).unwrap_or(0)),
@@ -344,8 +278,7 @@ impl MarkLimiter {
         }
     }
 
-    /// A mark from `by` said what [`Self::owed`] gave it: that count alone
-    /// starts again from zero.
+    /// A mark from `by` said what [`Self::owed`] gave it: that count alone starts again from zero.
     pub fn said(&mut self, by: &Actor, now_mono_ms: u64) {
         match self.slot(by, now_mono_ms, false) {
             Slot::Named(i) if !self.holds(i, by) => {

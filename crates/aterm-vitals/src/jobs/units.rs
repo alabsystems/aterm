@@ -1,33 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Job units (§11.3), their members, and the per-tick pass that turns
-//! readings into rows.
-//!
-//! * **Shell foreground job.** An OSC 133 block (`b<block>`), keyed by the
-//!   block: it opens at `C` and its members are the shell that runs the
-//!   command line, whatever runs in the shell's own group, and each group the
-//!   terminal puts in front while the block is open, command after command
-//!   (`make && make test` is one job; so is every `sleep` of a typed
-//!   `while :; do sleep 0.5; done`). The shell alone holding the terminal is
-//!   its own `read` builtin (or the moment between two commands). Without
-//!   shell integration the unit is "the foreground group that is not the
-//!   shell's"; its id is then `j<pgid>` (no block names it). It closes at
-//!   `D`, or when Ctrl-Z returns the prompt: the stopped group becomes a
-//!   background job keeping its id and quiet clock, and `fg` makes it the
-//!   next block's foreground job again.
-//! * **Shell background jobs.** Every other group of the shell's descendants
-//!   (`j<pgid>`). PTY output is credited only to a sole writer.
-//! * **Detached child jobs.** A process in the tab that leads its own session
-//!   with no terminal is a job whose consumer is its parent (`a<pid>`): an
-//!   agent's tool calls, without naming any agent. Its members are its
-//!   descendants; a nested detached child is its own job.
-//! * **Orphans.** What lives on after its job ended (`o<pid>`), with consumer
-//!   nobody: per-process findings only, no φ.
-//!
-//! Membership is kept: a process first seen as a member stays one, by
-//! `(pid, start)`, after it is reparented (the ledger's rule), and another
-//! unit never takes it.
+//! Per-tab job units, member tracking, and per-tick stuck-process evaluation.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -49,16 +23,16 @@ const CHURN_WORK_NS_PER_S: u64 = 50_000_000;
 /// Bytes new children wrote that make churn "with work".
 const CHURN_WROTE: u64 = 64 * 1024;
 
-/// One remembered member.
+/// Remembered process member of a job.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Member {
-    /// Its start, compared for equality.
+    /// Process start identity.
     pub start: Option<u64>,
-    /// Its counters at the last reading.
+    /// Counters from the last reading.
     pub counters: Option<JobCounters>,
-    /// Its name.
+    /// Process display name.
     pub name: String,
-    /// When it was first seen, host ms.
+    /// Host timestamp (ms) when first observed.
     pub first_ms: u64,
 }
 
@@ -153,7 +127,7 @@ struct TabFacts {
     bg_units: usize,
 }
 
-/// The stuck-process engine: one per instance, fed each probe tick.
+/// Per-instance stuck-process evaluation engine.
 #[derive(Clone, Debug, Default)]
 pub struct Jobs {
     jobs: Vec<Job>,
@@ -166,14 +140,13 @@ pub struct Jobs {
 }
 
 impl Jobs {
-    /// An engine with nothing seen.
+    /// Creates an empty [`Jobs`] engine.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// The same engine with a defect injected into its step: the conformance
-    /// test's negative controls (§17).
+    /// Injects a conformance negative-control `fault`.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn with_fault(mut self, fault: Fault) -> Self {
@@ -192,22 +165,18 @@ impl Jobs {
         }
     }
 
-    /// The learned command classes.
+    /// Returns the learned command-class table.
     #[must_use]
     pub fn classes(&self) -> &ClassTable {
         &self.classes
     }
 
-    /// Teach a command class a median interval, as a completed job would
-    /// (the host replays a persisted table this way; tests seed it).
+    /// Records a median progress interval for `class`.
     pub fn learn(&mut self, class: &str, median_ms: u64) {
         self.classes.learn(class, median_ms);
     }
 
-    /// Which processes to read in detail this tick, and which need their
-    /// descriptors: each tab's shell, its descendants (descriptors for the
-    /// leaves and for every member of a detached job), the members this
-    /// engine remembers, and each detached job's consumer (for `serves`).
+    /// Plans which processes require detailed and descriptor readings this tick.
     #[must_use]
     pub fn plan(&self, sweep: &[SweepProc], tabs: &[JobTab]) -> Vec<Want> {
         let by_pid: HashMap<u32, &SweepProc> = sweep.iter().map(|p| (p.pid, p)).collect();
@@ -250,7 +219,7 @@ impl Jobs {
             .collect()
     }
 
-    /// One tick: every job's row, the findings and the demand.
+    /// Evaluates one probe tick and returns job rows, findings, and next-tick demand.
     #[expect(
         clippy::too_many_lines,
         reason = "one pass over the tick, in the order the design states it"
@@ -272,8 +241,6 @@ impl Jobs {
                 }
         };
 
-        // How processes in each job counted last tick (a pipe's peer in
-        // another job counts as its job does).
         let mut elsewhere_all: HashMap<u32, (usize, Standing)> = HashMap::new();
         for (i, j) in self.jobs.iter().enumerate() {
             let Some(row) = j.row.as_ref().filter(|_| j.exited_ms.is_none()) else {
@@ -290,7 +257,6 @@ impl Jobs {
             }
         }
 
-        // Claims: a live job keeps its alive members.
         let mut claimed: HashMap<u32, usize> = HashMap::new();
         for (i, j) in self.jobs.iter().enumerate() {
             if j.exited_ms.is_some() {
@@ -303,7 +269,6 @@ impl Jobs {
             }
         }
 
-        // Discover this tick's units and give each its job.
         let mut matched: BTreeSet<usize> = BTreeSet::new();
         let mut tab_facts: HashMap<u64, TabFacts> = HashMap::new();
         let mut assigned: HashMap<usize, Vec<u32>> = HashMap::new();
@@ -325,8 +290,6 @@ impl Jobs {
                     && u.block.is_some()
                     && let Some(i) = resumed(&u, &claimed, &self.jobs)
                 {
-                    // `fg` brought a parked job back: that job is the
-                    // block's foreground job, its id and quiet clock kept.
                     let j = &mut self.jobs[i];
                     j.kind = JobKind::Shell;
                     j.consumer = Consumer::PersonFg;
@@ -338,9 +301,6 @@ impl Jobs {
                         .extend(free.iter().copied().filter(|p| Some(*p) != u.shell));
                     continue;
                 }
-                // A block's job opens at `C` whatever runs in it (the shell
-                // itself for its own `read`); any other unit needs a live
-                // member nobody else holds.
                 let any_live = u.block.is_some()
                     || free
                         .iter()
@@ -364,16 +324,11 @@ impl Jobs {
                 if u.key.start.is_some() && j.key.start.is_none() {
                     j.key.start = u.key.start;
                 }
-                // A shell job moves between the foreground and the background;
-                // an agent's call stays one. (Its leader exited unreaped is a
-                // zombie, never detached, so it groups by its process group
-                // here: it is still the call, now exited.)
                 if j.kind != JobKind::AgentCall || u.kind == JobKind::AgentCall {
                     j.kind = u.kind;
                     j.consumer = u.consumer;
                 }
                 if j.kind != JobKind::AgentCall {
-                    // The group in front of a block changes command by
                     // command.
                     j.pgid = u.pgid;
                 }
@@ -388,7 +343,6 @@ impl Jobs {
             }
         }
 
-        // Tier B namings handed this tick.
         for tab in &tick.tabs {
             for n in &tab.named {
                 if let Some(j) = self.jobs.iter_mut().find(|j| {
@@ -404,7 +358,6 @@ impl Jobs {
             }
         }
 
-        // Each live job's tick.
         let tabs: HashMap<u64, &JobTab> = tick.tabs.iter().map(|t| (t.key, t)).collect();
         let mut orphans: Vec<Job> = Vec::new();
         let n = self.jobs.len();
@@ -442,7 +395,6 @@ impl Jobs {
             let elsewhere = scene_elsewhere(i);
             let job = &mut self.jobs[i];
 
-            // Members: the remembered and this tick's, alive.
             let prev: MemberMap = job.members.clone();
             let first_tick = job.last_tick_ms.is_none();
             let mut now: MemberMap = BTreeMap::new();
@@ -473,7 +425,6 @@ impl Jobs {
             }
             let zombie = |pid: &u32| sweep.get(pid).is_some_and(|s| s.state == ProcState::Zombie);
 
-            // Has the unit ended?
             let block_closed = job.block.is_some_and(|b| {
                 tab.and_then(|t| t.block.as_ref())
                     .is_none_or(|blk| blk.id != b || !blk.open)
@@ -490,9 +441,6 @@ impl Jobs {
                 && job.block.is_some()
                 && let Some((sp, _)) = &stopped_member
             {
-                // Ctrl-Z returned the prompt: the stopped group is a
-                // background job now, its id and quiet clock carried; the
-                // shell is the prompt's again.
                 let g = facts
                     .get(sp)
                     .map(|f| f.pgid)
@@ -525,7 +473,6 @@ impl Jobs {
             }
             let exited = ended || live.is_empty();
             if exited {
-                // What lives on after its job ended, the tab's shell aside.
                 let shell_pid = tab.map_or(0, |t| t.shell_pid);
                 let survivors: MemberMap = now
                     .iter()
@@ -537,7 +484,6 @@ impl Jobs {
                 }
             }
 
-            // The evidence.
             let dt = job.last_tick_ms.map_or(0, |l| at.saturating_sub(l));
             let floor = job.last_tick_ms.unwrap_or_else(|| {
                 tab.and_then(|t| t.block.as_ref())
@@ -568,8 +514,6 @@ impl Jobs {
                         side += delta(c.logical_writes, p.logical_writes);
                         pageins += delta(c.pageins, p.pageins);
                     }
-                    // A member read for the first time since a refused or
-                    // absent reading: its baseline, its CPU since unknown.
                     None if prev.contains_key(pid) => rebased = true,
                     None if !first_tick => {
                         births += 1;
@@ -609,7 +553,6 @@ impl Jobs {
                 }
                 job.pty_bytes = Some(t.output_bytes);
             }
-            // The output file: fds 1 and 2 on a regular file.
             let mut files: HashMap<(u64, u64), (u64, bool, bool)> = HashMap::new();
             for pid in &live {
                 for f in facts.get(pid).and_then(|f| f.fds.as_deref()).unwrap_or(&[]) {
@@ -669,7 +612,6 @@ impl Jobs {
                 progress = Some((Progress::InputConsumed, s));
             }
 
-            // Stopped, zombies, the wait.
             let parked = matches!(job.kind, JobKind::Shell | JobKind::ShellBg)
                 && tf.tpgid == Some(tf.shell_pgid);
             let stopped = stopped_member.map(|(pid, name)| Stop { parked, pid, name });
@@ -679,8 +621,6 @@ impl Jobs {
             let gate = tab.map_or(InputGate::default(), |t| t.input);
             let shell_pid = tab.map_or(0, |t| t.shell_pid);
             let shell_name = sweep.get(&shell_pid).map_or("", |s| s.name.as_str());
-            // The shell holds the terminal with nothing of the block running
-            // under it: its own `read` (or the moment between two commands).
             let builtin = job.shell.is_some()
                 && tf.tpgid == Some(tf.shell_pgid)
                 && live.iter().all(|p| Some(*p) == job.shell);
@@ -701,7 +641,6 @@ impl Jobs {
             let wait = wait::name_job(&scene, &jf, &leaves, (shell_pid, shell_name));
             job.person_read = matches!(wait.name, WaitName::TtyRaw | WaitName::TtyPassword);
 
-            // A Tier B naming holds until progress or exit.
             if job.named.is_some() && job.track.last_progress_ms != job.named_progress {
                 job.named = None;
             }
@@ -745,8 +684,6 @@ impl Jobs {
                 fault,
             };
             let out = step::classify_tick(&mut job.track, &ev, &cx);
-            // The name the row prints, taken before the members are replaced
-            // (an exited job keeps the last one it printed).
             let leader_name = match now_name(job, &live, &sweep, &facts) {
                 Some(n) if !exited || job.last_name.is_empty() => n,
                 _ => job.last_name.clone(),
@@ -758,7 +695,6 @@ impl Jobs {
                 job.exited_ms = Some(at);
             }
 
-            // A busy-silent orphan: a core or more, no side writes, 10 min.
             if job.kind == JobKind::Orphan
                 && dt > 0
                 && !refused
@@ -811,9 +747,6 @@ impl Jobs {
             }
         }
         self.jobs.extend(orphans);
-        // An exited job keeps its row a minute, unless a live job now
-        // answers to its id (a reused pid): ids stay unique per tab, and the
-        // stale one is gone.
         let live_ids: BTreeSet<(u64, String)> = self
             .jobs
             .iter()
@@ -1166,10 +1099,6 @@ fn discover(
             shell: None,
         });
     }
-    // The open block is the shell's foreground job (§11.3): the shell that
-    // runs the command line, whatever runs in its own group (a command
-    // substitution), and the group in front, command after command
-    // (`make && make test`, each `sleep` of a typed loop).
     let block = tab.block.as_ref().filter(|b| b.open);
     let front = tf.tpgid.filter(|g| *g != tf.shell_pgid && *g != 0);
     if let Some(b) = block {
@@ -1411,17 +1340,7 @@ fn named_standing(
 }
 
 /// How soon to look again: fast while anything runs or can accrue, slow for
-/// legitimate waits that are not the person's, idle otherwise. A job that
-/// holds the foreground at the person's own terminal read (`at_person`: its
-/// tab and id, [`Job::person_read`]) is the person's wait even while it
-/// makes progress the terminal does not show (a full-screen program at its
-/// prompt appending to its own log, as agy 1.4.0 does every 5 s while its
-/// telemetry is refused): it can accrue nothing while it reads keys, so it
-/// is watched again at its next terminal output that moves its screen (the
-/// host's edge; a redraw while the terminal still says it waits, at most once
-/// a floor, design §6.1), as the design's "a session parked at a raw-mode
-/// prompt: 0 job samples until its next PTY output" says; one that stalls or
-/// spins is still watched fast.
+/// legitimate waits that are not the person's, idle otherwise.
 fn demand_of(rows: &[JobRow], at_person: &BTreeSet<(u64, &str)>) -> Demand {
     let mut d = Demand::Idle;
     for r in rows.iter().filter(|r| r.verdict != Verdict::Exited) {
@@ -1453,9 +1372,7 @@ fn watched_fast(r: &JobRow) -> bool {
 /// The tabs whose every live job holds the foreground at the person's own
 /// terminal read (`at_person`, [`Job::person_read`]) and is not watched fast
 /// ([`watched_fast`], [`demand_of`]'s own exception), ascending:
-/// [`JobsView::parked_tabs`]. A tab with any other live job (a background
-/// one, an agent's call, a canonical read) is not parked, nor one with no
-/// live job.
+/// [`JobsView::parked_tabs`].
 fn parked_tabs(rows: &[JobRow], at_person: &BTreeSet<(u64, &str)>) -> Vec<u64> {
     let mut parked = BTreeSet::new();
     let mut not = BTreeSet::new();

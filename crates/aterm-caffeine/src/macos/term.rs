@@ -30,7 +30,7 @@ static WAKE: AtomicI32 = AtomicI32::new(-1);
 static SENDER: AtomicI32 = AtomicI32::new(0);
 
 /// Whether a SIGTERM from `sender` is the system's: launchd's (pid 1) or the kernel's (0).
-pub(super) fn sent_by_the_system(sender: libc::pid_t) -> bool {
+pub(super) const fn sent_by_the_system(sender: libc::pid_t) -> bool {
     sender <= 1
 }
 

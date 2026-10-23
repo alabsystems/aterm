@@ -1,43 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! DOWNLOAD AHEAD: the set completion's next archives, fetched while the pass stages the
-//! one in hand.
-//!
-//! The set completion lands one install unit at a time on the pass's thread — download,
-//! digest, extract, flip — and the link sat idle through every digest, extract and flip
-//! (measured on a first run: the trust archive's extract and the trust flip alone left it
-//! idle for about ten seconds, with the rest of the set still to fetch). One thread of its
-//! own now fetches the plan's archives in the order the pass will want them, at most
-//! [`AHEAD_BYTES`] ahead of it, and the pass takes each one when it reaches the member
-//! ([`claim`]).
-//!
-//! It moves BYTES only, through the same lane, into the same file, under the same cap as the
-//! pass would: [`super::fetch_artifact`] with the signed row's `size`, into
-//! `staging/<program>/<asset>` and its `.part`. The pass verifies what it takes exactly as
-//! it verifies its own download — the signed digest before any parse, the signed
-//! `tree_root` after the extract ([`super::verify_and_stage`]) — so a prefetched archive is
-//! never a shortcut past a gate. Everything that moves the store stays on the pass's thread:
-//! the stage, the flip, the status rows, the fault tally. A download that failed here does
-//! not stop the lane, and is not the pass's answer: the lane goes on to the next archive, and
-//! the pass fetches the failed one itself when it reaches it — continuing its `.part` — and
-//! counts that download's own fault, if any (`note_fetch_fault`), so the offline verdict
-//! reads one tally as before. One dropped transfer on a flaky link costs that archive a
-//! second try, not the rest of the set its download ahead.
-//!
-//! What it fetches is decided before any byte moves ([`Ahead::plan`]): every member of a
-//! unit, admitted as the pass will admit it (the pin, the verified manifest bound to it, the
-//! row, its apply strategy, its digest-refusal memo), or nothing of that unit. Which comes
-//! next follows the pass: the unit it is in first, then the units it has yet to reach in
-//! plan order re-sorted by the bump file — the reorder the pass applies between units — so
-//! a bump moves only what has not started. An archive bigger than the budget is fetched
-//! only once the pass asks for it, which bounds what this ever holds on disk beyond the
-//! pass's own unit ([`Ahead::reserve`]).
-//!
-//! The moment its last archive is in is news to the pass's other lanes: the link is then
-//! free of the set's bytes, and the set completion's agents take it while the pass is still
-//! extracting and flipping ([`Ahead::all_fetched`], asked after every download that lands —
-//! the pass's own of an archive this lane failed included, [`fetched_inline`]).
+//! DOWNLOAD AHEAD: the set completion's next archives, fetched while the pass stages the one in hand.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -52,9 +16,7 @@ use crate::manifest::Channel;
 use crate::sig::TrustedIndex;
 use crate::store::Layout;
 
-/// The most bytes fetched ahead of the pass and not yet taken by it. Enough for the rest of
-/// the ALab set (about 360 MB beside the trust archive) to arrive while the trust archive
-/// extracts and the toolchain flips; an archive bigger than this waits for the pass.
+/// The most bytes fetched ahead of the pass and not yet taken by it.
 const AHEAD_BYTES: u64 = 512 << 20;
 
 /// One archive the pass will want: a member's signed row, admitted as the pass admits it.
@@ -106,8 +68,7 @@ struct State {
     halted: bool,
 }
 
-/// The set completion's download-ahead lane: the jobs, and where each stands. The pass
-/// thread enters it ([`Ahead::enter`]) and one thread works it ([`Ahead::work`]).
+/// The set completion's download-ahead lane: the jobs, and where each stands.
 pub(crate) struct Ahead {
     jobs: Vec<Job>,
     /// The most bytes fetched ahead and not yet taken ([`AHEAD_BYTES`]).
@@ -125,12 +86,7 @@ enum Next {
 }
 
 impl Ahead {
-    /// The jobs for `units` — the plan's `(unit, members)` in plan order, each unit's members
-    /// in member order — or `None` when there is nothing to fetch ahead. A unit is fetched
-    /// whole or not at all: every member must have its pin to install, a manifest verified
-    /// and bound to it, a row for `triple` this client would admit and stage, and no
-    /// digest-refusal memo holding it. Any miss leaves the unit to the pass, which meets the
-    /// same refusal itself; nothing here can make a member install that would not have.
+    /// The jobs for `units` — the plan's `(unit, members)` in plan order, each unit's members in member order — or `None` when there is nothing to fetch ahead.
     pub(crate) fn plan(
         fetcher: &dyn Fetcher,
         layout: &Layout,
@@ -181,9 +137,7 @@ impl Ahead {
         }))
     }
 
-    /// What this lane can hold on disk beyond the pass's own unit, at most: the archives it
-    /// may fetch ahead, up to its budget. The set completion starts it only on a volume that
-    /// holds the set's peak AND this.
+    /// What this lane can hold on disk beyond the pass's own unit, at most: the archives it may fetch ahead, up to its budget.
     pub(crate) fn reserve(&self) -> u64 {
         self.jobs
             .iter()
@@ -193,11 +147,7 @@ impl Ahead {
             .min(self.budget)
     }
 
-    /// The worker: fetch job after job until none is left to fetch or the lane halts. Run on
-    /// a thread of its own inside the pass (its store lock, its progress pass lent to it),
-    /// with `fetcher` shared; the pass thread enters the lane before it stages anything.
-    /// `landed` is told, on this thread, after each archive this lane fetched is in, and
-    /// after each the pass fetched itself once this lane's download of it failed.
+    /// The worker: fetch job after job until none is left to fetch or the lane halts.
     pub(crate) fn work(&self, fetcher: &dyn Fetcher, layout: &Layout, landed: &dyn Fn(&Self)) {
         self.work_with_bump(fetcher, landed, || crate::progress::read_bump(layout));
     }
@@ -216,14 +166,11 @@ impl Ahead {
                 told = now_in;
                 landed(self);
             }
-            // Read outside the lock, every time a job is chosen: a person's bump reorders
-            // what has not started, as the pass's own read between units does.
             let bump = read_bump();
             let i = match self.next(&bump) {
                 Next::Fetch(i) => i,
                 Next::Again => continue,
                 Next::Exit => {
-                    // An inline success can land after the loop's count and before next's
                     // final locked decision. Tell it before leaving, outside the lock.
                     if self.archives_in() > told {
                         landed(self);
@@ -238,9 +185,6 @@ impl Ahead {
             state.fetched[i] = matches!(answer, Some(Ok(())));
             state.slots[i] = match answer {
                 Some(Ok(())) => Slot::Done,
-                // NOT A HALT: the next archive is fetched as planned, and this one is the
-                // pass's to fetch when it reaches it ([`Ahead::claim`]), its own fault counted
-                // there if its download fails too.
                 Some(Err(_)) => Slot::Failed,
                 None => Slot::Dropped,
             };
@@ -256,10 +200,7 @@ impl Ahead {
             .map_or(0, |state| state.fetched.iter().filter(|f| **f).count())
     }
 
-    /// Whether every archive this lane holds is in, each fetched by this lane — whatever the
-    /// pass has made of them since — and it holds archives of each of `units`. Never for a
-    /// unit it holds nothing of, or an archive it skipped, left behind or failed: the pass
-    /// fetches those itself, and only it knows when they are in.
+    /// Whether every archive this lane holds is in, each fetched by this lane — whatever the pass has made of them since — and it holds archives of each of `units`.
     pub(crate) fn all_fetched(&self, units: &[usize]) -> bool {
         let Ok(state) = self.state.lock() else {
             return false;
@@ -291,7 +232,6 @@ impl Ahead {
             return Next::Exit;
         }
         let Some(i) = self.pick(&state, bump) else {
-            // Nothing left to start. The pass's own download of an archive this lane failed
             // is still news to tell ([`fetched_inline`]): wait for it, until the pass is done.
             if state
                 .slots
@@ -323,7 +263,6 @@ impl Ahead {
     /// for; else the rest of the unit it is in, in member order; else the first member of the
     /// next unit it will reach — plan order, re-sorted by `bump` as the pass re-sorts its
     /// remainder (bumped units first, earliest mention first, plan order the tiebreak).
-    /// `None` when nothing is left to start.
     fn pick(&self, state: &State, bump: &[String]) -> Option<usize> {
         if let Some(i) = state.slots.iter().position(|s| matches!(s, Slot::Wanted)) {
             return Some(i);
@@ -354,24 +293,13 @@ impl Ahead {
         units.into_iter().find_map(queued_in)
     }
 
-    /// On the pass thread: take `program`'s archive at `dl` from this lane. `Some(Ok(()))` when
-    /// this lane fetched it — waiting for it when it is still moving, or when it had not
-    /// started and the lane is idle, which then fetches it at once. `None` when the pass
-    /// fetches it itself, as it would with no lane: no such job, a lane that halted or is
-    /// busy with another archive, a job it skipped — or one whose download here failed,
-    /// which the pass then tries itself (reporting a success, [`fetched_inline`]).
-    ///
-    /// A job for `program` at ANOTHER path — a singleton's own resolve found a newer pin
-    /// than the plan's — never stands in for the pass's archive, and never moves beside it:
-    /// both would land in `staging/<program>/`, where each download's partial sweep takes
-    /// the other's `.part`. One not started never will; one moving is waited out first.
+    /// On the pass thread: take `program`'s archive at `dl` from this lane.
     fn claim(&self, program: &str, dl: &Path) -> Option<Result<(), String>> {
         let i = self.jobs.iter().position(|j| j.program == program)?;
         let ours = self.jobs[i].dl == dl;
         let mut state = self.state.lock().ok()?;
         state.claimed[i] = true;
         state.current = Some(self.jobs[i].unit);
-        // The budget moved (this job's bytes are the pass's now), and so did the unit.
         self.changed.notify_all();
         loop {
             match std::mem::replace(&mut state.slots[i], Slot::Taken) {
@@ -389,7 +317,6 @@ impl Ahead {
                     state.slots[i] = Slot::Wanted;
                     self.changed.notify_all();
                 }
-                // Left `Taken`: the pass fetches it, and this lane never will.
                 Slot::Queued
                 | Slot::Wanted
                 | Slot::Failed
@@ -401,8 +328,7 @@ impl Ahead {
         }
     }
 
-    /// On the pass thread, once it is done with `unit` — landed, refused, skipped or
-    /// aborted: what of it has not started never will.
+    /// On the pass thread, once it is done with `unit` — landed, refused, skipped or aborted: what of it has not started never will.
     pub(crate) fn passed(&self, unit: usize) {
         let Ok(mut state) = self.state.lock() else {
             return;
@@ -417,10 +343,7 @@ impl Ahead {
         self.changed.notify_all();
     }
 
-    /// `program → asset` for every archive this lane fetched, or began to, that the pass never
-    /// took — a unit it aborted before reaching the member. Read after the worker is joined:
-    /// the caller adds them to the pass's resolved assets, so the pass-end gc spares the
-    /// archive (or its `.part`) and the next pass reuses it ([`super::carried_archive`]).
+    /// `program → asset` for every archive this lane fetched, or began to, that the pass never took — a unit it aborted before reaching the member.
     pub(crate) fn untaken(&self) -> Vec<(String, String)> {
         let Ok(state) = self.state.lock() else {
             return Vec::new();
@@ -434,8 +357,7 @@ impl Ahead {
     }
 
     /// On the pass thread: its own download of `program`'s archive at `dl` — one this lane's
-    /// download failed ([`Slot::Inline`]) — is in. The archive counts as fetched, and the
-    /// worker tells `landed` so ([`Ahead::work`]).
+    /// download failed ([`Slot::Inline`]) — is in.
     fn fetched_inline(&self, program: &str, dl: &Path) {
         let Some(i) = self
             .jobs
@@ -455,8 +377,7 @@ impl Ahead {
         }
     }
 
-    /// On the pass thread: route its member fetches through this lane ([`claim`]) until the
-    /// guard drops, which halts the lane.
+    /// On the pass thread: route its member fetches through this lane ([`claim`]) until the guard drops, which halts the lane.
     pub(crate) fn enter(self: &Arc<Self>) -> Entered {
         PASS.with(|pass| *pass.borrow_mut() = Some(Arc::clone(self)));
         Entered(Arc::clone(self))
@@ -470,9 +391,7 @@ impl Ahead {
     }
 }
 
-/// The pass thread's hold on its lane ([`Ahead::enter`]): dropped — the loop over, or a
-/// panic unwinding it — it halts the lane, so the worker ends after the archive it has in
-/// hand and the scope that runs it can join it.
+/// The pass thread's hold on its lane ([`Ahead::enter`]): dropped — the loop over, or a panic unwinding it — it halts the lane, so the worker ends after the archive it has in hand and the scope that runs it can join it.
 pub(crate) struct Entered(Arc<Ahead>);
 
 impl Drop for Entered {
@@ -505,16 +424,12 @@ thread_local! {
     static PASS: std::cell::RefCell<Option<Arc<Ahead>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// On the pass thread, where it would fetch `program`'s archive to `dl`: the answer of the
-/// lane's download of it ([`Ahead::claim`]), or `None` to fetch it here as always — which is
-/// every call off a thread that entered a lane.
+/// On the pass thread, where it would fetch `program`'s archive to `dl`: the answer of the lane's download of it ([`Ahead::claim`]), or `None` to fetch it here as always — which is every call off a thread that entered a lane.
 pub(crate) fn claim(program: &str, dl: &Path) -> Option<Result<(), String>> {
     PASS.with(|pass| pass.borrow().clone())?.claim(program, dl)
 }
 
-/// On the pass thread, after its own download of `program`'s archive to `dl` succeeded: news
-/// for the lane when its download of that archive had failed ([`Ahead::fetched_inline`]);
-/// nothing anywhere else.
+/// On the pass thread, after its own download of `program`'s archive to `dl` succeeded: news for the lane when its download of that archive had failed ([`Ahead::fetched_inline`]); nothing anywhere else.
 pub(crate) fn fetched_inline(program: &str, dl: &Path) {
     if let Some(lane) = PASS.with(|pass| pass.borrow().clone()) {
         lane.fetched_inline(program, dl);
@@ -541,9 +456,6 @@ fn job(
         return None;
     }
     let artifact = pkg.artifact_for(triple)?;
-    // Legacy github-release rows may have no compressed size. Their cap of
-    // zero means the fetcher's own ceiling, so they cannot spend zero bytes
-    // of this lane's reserve. Leave their whole unit to the inline pass.
     if artifact.size == 0 {
         return None;
     }
@@ -585,16 +497,12 @@ fn fetch_ahead(fetcher: &dyn Fetcher, job: &Job) -> Option<Result<(), String>> {
         crate::freespace::available_bytes(&job.dl),
     )
     .ok()?;
-    // At most one partial and one archive per program between passes, and they are the
-    // ones this download continues or replaces — the sweep the pass makes before its own.
     sweep_foreign_partials(&job.dl);
     crate::progress::note_build(&job.program, job.pinned);
     let watch = crate::progress::watch_download(&job.program, &job.dl, job.artifact.size);
     let fetched = fetch_artifact(fetcher, &job.program, &job.repo, &job.artifact, &job.dl);
     drop(watch);
     match &fetched {
-        // The row waits for the pass at its whole size: the poller's last look was before
-        // the end, or after the `.part` became the archive (which it reads as nothing).
         Ok(()) => crate::progress::note_downloaded(&job.program, job.artifact.size),
         Err(_) => {
             let _ = std::fs::remove_file(&job.dl);
@@ -682,7 +590,6 @@ mod callback_tests {
         lane.work_with_bump(
             &NoFetch,
             &|seen| {
-                // A callback may re-enter this exact lane: no state lock is held.
                 assert!(seen.all_fetched(&[0]));
                 count.set(count.get() + 1);
             },

@@ -1,0 +1,66 @@
+schema = 2
+
+[[windows]]
+rows = 55
+cols = 149
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [1043, 784]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 0
+key = true
+
+[[windows.tabs]]
+kind = "leaf"
+cwd = "/home/dev/src/aterm"
+title = "claude"
+focused = true
+local_id = 0
+
+[[windows.tabs]]
+kind = "leaf"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+focused = true
+local_id = 1
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 0
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 1
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "claude"
+local_id = 0
+sid = "s-00000000010000000000"
+log_ep = 1792719622
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+local_id = 1
+sid = "s-00000000010000010101"
+log_ep = 1792719623

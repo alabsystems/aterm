@@ -224,7 +224,7 @@ impl Attempt {
     }
 
     /// Whether the last [`TRIES`] tries failed, so the next waits for a change.
-    fn held(&self) -> bool {
+    const fn held(&self) -> bool {
         self.failures >= TRIES
     }
 }

@@ -247,6 +247,7 @@ impl Glyph {
         '\u{2296}', // ⊖ a removal in flight
     ];
     /// Retired glyphs and what they read back as, for a record an older build logged or
+    /// carried (`·` was the removal's lead glyph).
     const RETIRED: &'static [(char, char)] = &[('\u{00b7}', '\u{2296}')];
     /// What stands in for a glyph outside the set.
     pub const FALLBACK: Glyph = Glyph('!');
@@ -404,9 +405,13 @@ pub enum Intent {
     },
     /// Close every tab whose shell the PTY keeper held through the last run's crash.
     EndRecovered,
+    /// Open System State with its review set for the vault sync: a navigation beside the vault
+    /// lines' step, so a press never answers them.
+    ReviewVaultSync,
 }
 
 /// `Show tab N` for tabs 1–9, the only numbers a tab strip shows by number
+/// (labels are static: the reader and the capsule share one table).
 const SHOW_TAB: [&str; 10] = [
     "Show tab",
     "Show tab 1",
@@ -468,6 +473,7 @@ impl Intent {
             }
             Self::AgentUpgrade { word, .. } => word.label(),
             Self::EndRecovered => "End sessions",
+            Self::ReviewVaultSync => "System State",
         }
     }
 
@@ -502,6 +508,7 @@ impl Intent {
                 UpgradeWord::Skip => "Skip",
             },
             Self::EndRecovered => "End",
+            Self::ReviewVaultSync => "System",
         }
     }
 
@@ -606,6 +613,7 @@ impl Intent {
                 escape_field(tab)
             ),
             Self::EndRecovered => "end-recovered".to_string(),
+            Self::ReviewVaultSync => "review-vault-sync".to_string(),
         }
     }
 
@@ -617,6 +625,7 @@ impl Intent {
             "details" if payload.is_empty() => Some(Self::Details),
             "new-window" if payload.is_empty() => Some(Self::NewWindow),
             "end-recovered" if payload.is_empty() => Some(Self::EndRecovered),
+            "review-vault-sync" if payload.is_empty() => Some(Self::ReviewVaultSync),
             "open-settings" => Some(Self::OpenSettings {
                 route: unescape_payload(payload),
             }),
@@ -688,6 +697,7 @@ impl Intent {
 }
 
 /// [`escape_payload`] with the codec's own separator escaped too: a field
+/// between two `:`s.
 fn escape_field(s: &str) -> String {
     escape_payload(s).replace(':', "%3A")
 }
@@ -761,6 +771,7 @@ pub(crate) fn every_intent() -> Vec<Intent> {
         },
         Intent::NewWindow,
         Intent::EndRecovered,
+        Intent::ReviewVaultSync,
         Intent::StopPaste { session: 3 },
         Intent::ShowTab { tab: 2, window: 7 },
         Intent::ShowSession {
@@ -792,6 +803,7 @@ pub(crate) fn every_intent() -> Vec<Intent> {
 }
 
 /// `%` and every control character as `%XX`, so a payload can never carry
+/// the codec's separators; everything else verbatim (a path stays readable).
 fn escape_payload(s: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(s.len());
@@ -929,6 +941,7 @@ impl Hold {
 }
 
 /// What the engine's own tests, and a host's tests, build bare persistent
+/// rows from.
 #[cfg(any(test, debug_assertions))]
 impl Hold {
     /// A standing hold.
@@ -1015,6 +1028,7 @@ impl Meter {
 }
 
 /// The fill span a whole-number count in the stats' first clause allows: `3 of 4 tabs` →
+/// `(750, 1000)`, `(A/B, (A+1)/B)` in permille, the whole bar once the count is complete.
 fn count_span(stats: &str) -> Option<(u16, u16)> {
     let (done, total) = count_of(stats)?;
     let at = |n: u64| {
@@ -1403,13 +1417,13 @@ impl Message {
 
     /// What the message is to the person.
     #[must_use]
-    pub fn need(&self) -> &Need {
+    pub const fn need(&self) -> &Need {
         &self.need
     }
 
     /// `true` when the message keeps a band row past a glance.
     #[must_use]
-    pub fn persists(&self) -> bool {
+    pub const fn persists(&self) -> bool {
         self.hold.persists()
     }
 
@@ -1422,6 +1436,9 @@ impl Message {
     }
 
     /// The reason and the action as the first two detail lines, so the band's excerpt is
+    /// the reason and Details opens on the action, but only for a message that brought no
+    /// detail of its own: a builder that wrote its lines (`gpu_lost`, the screen-reader
+    /// row) wrote them to be read in that order.
     fn lead_with(&mut self, why: &str, then: &str) {
         if !self.detail.is_empty() {
             return;
@@ -1504,6 +1521,7 @@ impl Message {
     }
 
     /// `true` when the message has capsules and every one of them declines
+    /// ([`Intent::is_snooze`]): they fix nothing.
     fn declines_only(&self) -> bool {
         !self.actions.is_empty() && self.actions.iter().all(Intent::is_snooze)
     }
@@ -1517,7 +1535,7 @@ impl Message {
 
     /// The load this work is ([`Message::primary`]).
     #[must_use]
-    pub fn primary_load(mut self, l: Load) -> Self {
+    pub const fn primary_load(mut self, l: Load) -> Self {
         self.primary = Some(l);
         self.loads = self.loads.with(l);
         self
@@ -1525,14 +1543,14 @@ impl Message {
 
     /// A record about a previous run ([`Message::retrospective`]).
     #[must_use]
-    pub fn retrospective(mut self) -> Self {
+    pub const fn retrospective(mut self) -> Self {
         self.retrospective = true;
         self
     }
 
     /// The band paints the title alone.
     #[must_use]
-    pub fn no_excerpt(mut self) -> Self {
+    pub const fn no_excerpt(mut self) -> Self {
         self.excerpt = false;
         self
     }
@@ -1570,7 +1588,7 @@ impl Message {
 
     /// Not on the glass until `d` after the post (the progress grace).
     #[must_use]
-    pub fn reveal_after(mut self, d: Duration) -> Self {
+    pub const fn reveal_after(mut self, d: Duration) -> Self {
         self.reveal_after = Some(d);
         self
     }
@@ -1645,14 +1663,14 @@ impl Message {
 
     /// The glyph.
     #[must_use]
-    pub fn glyph(mut self, g: Glyph) -> Self {
+    pub const fn glyph(mut self, g: Glyph) -> Self {
         self.glyph = g;
         self
     }
 
     /// The origin.
     #[must_use]
-    pub(crate) fn origin(mut self, o: Origin) -> Self {
+    pub(crate) const fn origin(mut self, o: Origin) -> Self {
         self.origin = o;
         self
     }
@@ -1733,6 +1751,7 @@ mod tests {
     use super::*;
 
     /// The tag vocabulary is closed and every word in it is a tag; the glyph set admits
+    /// the band's glyphs and nothing else.
     #[test]
     fn tags_and_glyphs_are_closed_sets() {
         for tag in tags::ALL {
@@ -1761,7 +1780,7 @@ mod tests {
         assert!(Severity::Info > Severity::Success);
     }
 
-    /// Invariant 23: one label table. Every variant has a non-empty label
+    /// Invariant 23: one label table.
     #[test]
     fn labels_are_one_table() {
         for intent in every_intent() {
@@ -1839,6 +1858,7 @@ mod tests {
             "not-now:maybe",
             "teleport:home",
             "new-window:1",
+            "review-vault-sync:1",
             "show-session:0:1:s-x",
             "show-session:1:no:s-x",
             "show-session:1:1:",
@@ -1854,6 +1874,11 @@ mod tests {
         assert_eq!(
             Intent::decode("show-tab:2:7"),
             Some(Intent::ShowTab { tab: 2, window: 7 })
+        );
+        assert_eq!(
+            Intent::decode("review-vault-sync"),
+            Some(Intent::ReviewVaultSync),
+            "records already written name it so"
         );
         let stable = Intent::ShowSession {
             tab: 2,
@@ -1881,6 +1906,8 @@ mod tests {
     }
 
     /// `Open in browser` round-trips a web page's address, and the decoder drops every
+    /// address the wire's `url=` would refuse: a log line or a carry is text, and the
+    /// button opens what it names.
     #[test]
     fn an_open_link_decodes_only_an_https_page() {
         for url in [
@@ -1938,6 +1965,7 @@ mod tests {
     }
 
     /// A busy meter never carries a fill (`normalized` clears the flag where one arrives),
+    /// and its stats are clipped like any meter's.
     #[test]
     fn a_busy_meter_never_carries_a_fill() {
         let m = Meter::busy("45 MB");
@@ -1973,6 +2001,7 @@ mod tests {
     }
 
     /// `in_flight` declares a busy meter, or marks a fill-less one busy, and keeps a fill;
+    /// `normalized` never invents an indicator (a Live row that declared none is still).
     #[test]
     fn in_flight_declares_busy_and_normalized_invents_nothing() {
         let live = Hold::Live {
@@ -2002,6 +2031,7 @@ mod tests {
     }
 
     /// The builder caps everything, and `normalized` re-applies the caps to a
+    /// literal.
     #[test]
     fn the_builder_and_normalized_apply_every_cap() {
         let long = "x".repeat(TITLE_CAP + 40);

@@ -26,7 +26,7 @@ statusmenu --- at=7
 statusmenu "To look at (1)" enabled=no at=8
 statusmenu "Claude Code is not installed" enabled=yes checked=no at=9
 statusmenu "Notify Me When I’m Needed" enabled=yes checked=no tip="One notice when something needs you, never for a wait." at=10
-presence rim=decide pressing=@s-aa pill="◇ needs you: rotate the deploy key · 12s""#;
+presence rim=decide pressing=@s-aa pill="""#;
 
 /// `inspect app/v1 view <id> text` of Settings ▸ Harness, two sessions.
 const PAGE: &str = r#"text key="harness/status/row/sessions" role=Group label="Sessions: 2 of 2 supervised · 1 need you"

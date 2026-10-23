@@ -49,6 +49,8 @@ const ENGINE_BANNED: &[(&str, Bound, &str)] = &[
 ];
 
 /// The `std` modules a grouped import (`use std::{fs, net::TcpStream};`) may
+/// not name in an engine crate, which the path needles above miss: the group
+/// splits `std::` from the module.
 const ENGINE_STD_MODULES: &[(&str, &str)] = &[
     ("fs", "the filesystem"),
     ("net", "a socket"),
@@ -56,13 +58,15 @@ const ENGINE_STD_MODULES: &[(&str, &str)] = &[
 ];
 
 /// The platform frameworks, read on the text view: a framework is linked or
+/// opened by a name in a literal (`link(name = "AppKit")`, a
+/// `/System/Library/Frameworks/Metal.framework` path).
 const ENGINE_FRAMEWORKS: &[(&str, Bound)] = &[
     ("CoreText", Bound::Sub),
     ("Metal", Bound::Word),
     ("AppKit", Bound::Sub),
 ];
 
-/// Is `rel` an engine crate's shipped default build? Test code (any path
+/// Is `rel` an engine crate's shipped default build?
 fn engine_shipped(rel: &str) -> bool {
     if !ENGINE_CRATES.iter().any(|c| rel.starts_with(c)) {
         return false;
@@ -83,6 +87,9 @@ pub(super) fn test_path(rel: &str) -> bool {
 }
 
 /// The files that are test code by their parent's say, whatever their names:
+/// every out-of-line module a file declares at its top level inside an item
+/// whose `cfg` proves it test-only (`#[cfg(test)] mod rig;`, its `#[path]`
+/// followed), and everything in that module's own directory.
 fn declared_test_modules(corpus: &Corpus, prefixes: &[&str]) -> Vec<String> {
     let mut out = Vec::new();
     for parent in corpus.under(prefixes) {
@@ -118,6 +125,7 @@ fn declared_test_modules(corpus: &Corpus, prefixes: &[&str]) -> Vec<String> {
 }
 
 /// The module a body-less `mod` item declares (`pub(crate) mod rig;` gives
+/// `rig`), when `code` is one.
 fn out_of_line_mod(code: &str) -> Option<&str> {
     let mut rest = code.trim();
     if let Some(after) = rest.strip_prefix("pub") {
@@ -148,6 +156,9 @@ fn path_attr(text: &str) -> Option<&str> {
 }
 
 /// The corpus file `mod name;` in `parent` loads: `path` against the parent's
+/// directory, else `name.rs` or `name/mod.rs` in the parent's module directory
+/// (its own directory for a `lib.rs`, `main.rs` or `mod.rs`, else the one its
+/// stem names).
 fn module_file(corpus: &Corpus, parent: &str, name: &str, path: Option<&str>) -> Option<String> {
     let (dir, file) = parent.rsplit_once('/')?;
     let candidates = match path {
@@ -253,6 +264,8 @@ fn engine_platform(tree: &Tree<'_>, out: &mut Vec<Finding>) {
 }
 
 /// Every first segment of a `std::{…}` group in a file's code: its 1-based
+/// line and the segment (`use std::{fs, io::{self, Read}};` gives `fs` and
+/// `io`), however the group wraps.
 fn grouped_std_modules(code: &str) -> Vec<(usize, &str)> {
     let b = code.as_bytes();
     let mut out = Vec::new();
@@ -290,6 +303,7 @@ fn grouped_std_modules(code: &str) -> Vec<(usize, &str)> {
 }
 
 /// `link(name =`, spaces allowed: a link attribute however it is reached
+/// (`#[cfg_attr(…, link(name = "m"))]`, or its line inside a wrapped one).
 fn links_by_name(code: &str) -> bool {
     hits(code, "link", Bound::Word).any(|at| {
         after_ws(&code[at + 4..], "(")
@@ -324,6 +338,7 @@ fn renderer_terminal(tree: &Tree<'_>, out: &mut Vec<Finding>) {
 }
 
 /// `aterm_core::…Terminal`, or `Terminal` as a borrowed, annotated or returned
+/// type (`&Terminal`, `: Terminal`, `-> Terminal`).
 fn names_terminal(code: &str) -> Option<&'static str> {
     let b = code.as_bytes();
     for at in hits(code, "Terminal", Bound::Sub) {
@@ -371,6 +386,7 @@ fn dev_read(tree: &Tree<'_>, out: &mut Vec<Finding>) {
 }
 
 /// `fs::read(` or `fs::read_to_string(` whose first argument is a `/dev/…`
+/// literal.
 fn reads_a_device(line: Line<'_>) -> bool {
     hits(line.code, "fs::read", Bound::Sub).any(|at| {
         let mut rest = &line.code[at + "fs::read".len()..];
@@ -390,6 +406,7 @@ fn reads_a_device(line: Line<'_>) -> bool {
 }
 
 /// The query APIs whose first call opens a SkyLight connection and makes
+/// WindowServer preflight the calling binary on its main thread.
 const INPUT_PROBES: &[&str] = &[
     "modifierFlags_class",
     "NSEvent modifierFlags",
@@ -425,6 +442,10 @@ fn input_probe(tree: &Tree<'_>, out: &mut Vec<Finding>) {
 }
 
 /// aterm-gui's source (the window crate's and its split-out libraries',
+/// `crates/aterm-gui-*`), aterm-cli's, amacs's host crates (`crates/amacs-*`:
+/// its file admission and its terminal program), which run in those two
+/// processes, and the disk walker's, which stats every path it is handed and
+/// so must take its deny set from consent too.
 const PROTECTED_SCOPE: &[&str] = &[
     "crates/aterm-gui/src/",
     "crates/aterm-gui-",
@@ -470,6 +491,8 @@ fn protected_folder(tree: &Tree<'_>, out: &mut Vec<Finding>) {
 }
 
 /// The protected-folder shape `text` holds: a `~/<home dir>`, `/Volumes`,
+/// `Library/Containers|CloudStorage`, a bare `Containers`/`CloudStorage`
+/// component, or a basename join (`join("Documents")`).
 fn protected_path(text: &str) -> Option<String> {
     for dir in PROTECTED_HOME_DIRS {
         let path = format!("~/{dir}");
@@ -532,6 +555,7 @@ fn runloop_scope(rel: &str) -> bool {
 }
 
 /// The absorbed winit (`crates/aterm-window`), whose run loop the rule exists
+/// for; its scope, so a rename that empties it is reported.
 const WINDOW_SOURCE: &[&str] = &["crates/aterm-window/src/"];
 
 fn runloop_timer(tree: &Tree<'_>, out: &mut Vec<Finding>) {
@@ -590,6 +614,7 @@ fn keeper_gui(tree: &Tree<'_>, out: &mut Vec<Finding>) {
 }
 
 /// A GUI framework named in a link attribute (`name = "AppKit"`), or a GUI
+/// API by name.
 fn links_gui(text: &str) -> Option<String> {
     for (at, _) in text.match_indices("name") {
         if at > 0 && is_word(text.as_bytes()[at - 1]) {
@@ -609,10 +634,11 @@ fn links_gui(text: &str) -> Option<String> {
         .map(|n| format!("names `{n}`"))
 }
 
-/// The keeper's own source. aterm-uds, which it links, maps regions for the windows (the
+/// The keeper's own source.
 const KEEPER_OWN: &[&str] = &["crates/aterm-keeper/src/"];
 
 /// The mapping calls by NAME: what a local `extern` declaration in the keeper (whose OS half
+/// declares its own calls, `src/sys.rs`) would spell, which no clippy path can name.
 const KEEPER_MAPS: &[(&str, Bound)] = &[
     ("mmap", Bound::Word),
     ("munmap", Bound::Word),
@@ -653,6 +679,7 @@ const RESTORE_OWN: &[&str] = &["crates/aterm-restore/src/"];
 /// The crash restore's crate, as a closure names it.
 const RESTORE_CRATE: &str = "crates/aterm-restore";
 /// The crates that carry bytes off the host: the fabric's link, the fleet's TLS proof,
+/// listener and relay, the HTTP stream, and the window's fabric endpoint.
 const OFF_HOST_CRATES: &[&str] = &[
     "crates/aterm-link",
     "crates/aterm-net",
@@ -661,6 +688,7 @@ const OFF_HOST_CRATES: &[&str] = &[
 ];
 
 /// What reaches a socket: std's and aterm-uds's socket types, the calls by name, and
+/// the off-host crates themselves.
 const SOCKET_APIS: &[(&str, Bound)] = &[
     ("std::net", Bound::Sub),
     ("UnixStream", Bound::Word),
@@ -750,7 +778,7 @@ const GUI_CRATES: &[&str] = &[
     "crates/aterm-effects",
 ];
 
-/// Is `dep` (a dependency name) a GUI crate from outside the workspace? One of
+/// Is `dep` (a dependency name) a GUI crate from outside the workspace?
 fn is_external_gui(dep: &str) -> bool {
     matches!(dep, "winit" | "core-graphics" | "cocoa" | "wgpu") || dep.starts_with("objc")
 }
@@ -765,6 +793,8 @@ pub(super) const KEEPER_GUI_DEPS: Rule = Rule {
 };
 
 /// One step of the keeper's closure walk: a workspace crate, read by its
+/// manifest (normal edges only), or a `Cargo.lock` package, read by its lock
+/// entry; each with the chain that reached it.
 enum Hop {
     Member(String),
     Locked(usize),
@@ -936,6 +966,8 @@ fn std_command(tree: &Tree<'_>, out: &mut Vec<Finding>) {
 }
 
 /// The door one line of code opens on the alias: `StdCommand::new`, a rename
+/// (`StdCommand as …`) or a re-alias (`type … = StdCommand`, its path spelled
+/// or not).
 fn std_command_door(code: &str) -> Option<&'static str> {
     for at in hits(code, "StdCommand", Bound::Word) {
         let rest = &code[at + "StdCommand".len()..];
@@ -962,6 +994,7 @@ fn std_command_door(code: &str) -> Option<&'static str> {
 }
 
 /// `s` without the `a::b::` path (spaces allowed, a leading `::` too) and
+/// the spaces that end it.
 fn path_prefix_trimmed(s: &str) -> &str {
     let mut s = s.trim_end();
     while let Some(r) = s.strip_suffix("::") {
@@ -1046,6 +1079,7 @@ fn flock_line(line: Line<'_>) -> Option<&'static str> {
 }
 
 /// The 1-based lines of `syscall(<digit>…` calls in a file's code, the call
+/// spanning lines or not.
 fn syscalls_by_number(code: &str) -> Vec<usize> {
     let mut out = Vec::new();
     for at in hits(code, "syscall", Bound::Sub) {
@@ -1064,9 +1098,14 @@ fn syscalls_by_number(code: &str) -> Vec<usize> {
 }
 
 /// The supervisor's source: the loop and everything it calls in its own
+/// module (the policy under `policy/` included).
 const SUPERVISE: &[&str] = &["crates/aterm-agent/src/supervise/"];
 
 /// The supervisor files a direct clock read belongs in: the door itself and
+/// the tape behind it; the transport, which sits BELOW the loop's `Ctl` door
+/// (its socket timeouts are the request's, and a tape holds the request's
+/// reply, not them); and the mail lane, its own thread with its own injected
+/// clock (`mail::task_with_clock`), which a tape refuses outright.
 const SUPERVISE_CLOCK_HOMES: &[&str] = &[
     "crates/aterm-agent/src/supervise/fx.rs",
     "crates/aterm-agent/src/supervise/tape/",
@@ -1089,7 +1128,7 @@ pub(super) enum ClockShape {
     PathCall,
 }
 
-/// Each direct clock read or sleep, its shape, and what it is. Read on the
+/// Each direct clock read or sleep, its shape, and what it is.
 const SUPERVISE_CLOCKS: &[(&str, ClockShape, &str)] = &[
     ("Instant::now", ClockShape::Named, "the monotonic clock"),
     ("SystemTime::now", ClockShape::Named, "the wall clock"),
@@ -1147,6 +1186,13 @@ const SUPERVISE_CLOCKS: &[(&str, ClockShape, &str)] = &[
 ];
 
 /// PHASE 2 (the recorder, the replay plan's T4): the other values the loop
+/// observes that its door records — this process's id (the claim's holder,
+/// resolved once into a setup), a delivery handed over by another thread (the
+/// mail lane's: `Fx::try_recv_mail`, `Fx::recv_mail_timeout`), and the
+/// approval ledger's readers and its bound,
+/// which read or cut a file by its path (the loop reads the ledger ONCE through
+/// `Fx::read_text` and hands the text to the `approvals::*_in` forms; it cuts
+/// through `Fx::bound`).
 const SUPERVISE_READS: &[(&str, ClockShape, &str)] = &[
     (
         "process::id",
@@ -1216,10 +1262,17 @@ const SUPERVISE_READS: &[(&str, ClockShape, &str)] = &[
 ];
 
 /// The `fn`s a phase-2 read belongs in, by file (under the supervisor), name
+/// and needle: the holder's resolution (`claim::default_holder`, read where a
+/// setup is made, so a replay names the recorded holder and never this
+/// process).
 const SUPERVISE_READ_HOMES: &[(&str, &str, &str)] =
     &[("claim.rs", "default_holder", "process::id")];
 
 /// The wall readers' own `fn`s, by file (under the supervisor) and name:
+/// `limit::unix_now{,_ms}` and `journal::unix_ms` wrap the system's wall
+/// clock — that is what each is for, and the crate's callers outside the
+/// supervisor read them too — so each body is the WALL clock's home, and the
+/// rule is about their callers.
 const SUPERVISE_READER_HOMES: &[(&str, &str)] = &[
     ("journal.rs", "unix_ms"),
     ("limit.rs", "unix_now"),
@@ -1227,6 +1280,11 @@ const SUPERVISE_READER_HOMES: &[(&str, &str)] = &[
 ];
 
 /// PHASE 3 (the policy probe, the replay plan's T5): the looks at the
+/// machine itself — the filesystem, a process, the kernel, the zone, the
+/// environment — which the approval policy and the loop make only through a
+/// derived door, so a harness tape holds what each concluded
+/// (`policy::probe::PolicyProbe`, handed out by `Fx::policy_probe`; the
+/// loop's own `Fx::tz_offset`, `Fx::zone_offset`, `Fx::local_offset_at`).
 const SUPERVISE_LOOKS: &[(&str, ClockShape, &str)] = &[
     ("fs", ClockShape::PathCall, "the filesystem (`std::fs`)"),
     ("File", ClockShape::PathCall, "a file opened (`File::open`)"),
@@ -1346,12 +1404,19 @@ const SUPERVISE_LOOKS: &[(&str, ClockShape, &str)] = &[
 ];
 
 /// The supervisor files every look belongs in: the policy probe's live arm,
+/// where the policy's looks were moved unchanged, and the probe's door itself
+/// (`policy/probe.rs`), which names the live probe it wraps.
 const SUPERVISE_LOOK_FILES: &[&str] = &[
     "crates/aterm-agent/src/supervise/policy/probe_live.rs",
     "crates/aterm-agent/src/supervise/policy/probe.rs",
 ];
 
 /// The `fn`s a phase-3 look belongs in, by file (under the supervisor) and
+/// name, each with why: the LIVE BODIES of the derived doors, which run
+/// below their door so a tape holds only what they concluded; the readers the
+/// window's host shares; the outputs a door already records (the journal's
+/// file, the notes line, the ledger's bound); and the setup read once before
+/// the loop runs.
 const SUPERVISE_LOOK_HOMES: &[(&str, &str, &str)] = &[
     ("policy/git_config.rs", "git", GIT_VIEW),
     ("policy/git_config.rs", "view_at", GIT_VIEW),
@@ -1397,9 +1462,12 @@ const OUTPUT: &str = "an output a door already records";
 const BY_PATH: &str = "read by its path for the host or the CLI, never by the loop";
 
 /// The reasons a [`SUPERVISE_LOOK_HOMES`] row gives for a derived door's LIVE
+/// BODY: code that runs below its door, so that a tape holds what it
+/// concluded and a replay answers the door without running it.
 const LIVE_BODY: &[&str] = &[GIT_VIEW, WORKER_LIVE, SETTINGS, SHELL, ZONE];
 
 /// One `fn` of a live body ([`live_readers`]): the home file it is in, its
+/// module's name, its own, and how it can be called, read off its signature.
 struct LiveReader<'t> {
     rel: &'t str,
     module: &'t str,
@@ -1407,10 +1475,18 @@ struct LiveReader<'t> {
     /// It takes `self`: called `.name(…)` or by a type's path.
     method: bool,
     /// Visible outside its module (`pub`, `pub(crate)`, …): a call from
+    /// another file is the guard's to see; a private one's is the compiler's.
     public: bool,
 }
 
 /// THE LIVE BODIES, read from the code rather than listed: in each file that
+/// holds a live body's home ([`SUPERVISE_LOOK_HOMES`] rows whose reason is in
+/// [`LIVE_BODY`]), every `fn` that reaches a home through the file's own
+/// calls (`super::graph::reach`, by name, as `test-appkit-door` reads a
+/// file), or calls another home file's live body, is part of that live body
+/// — its entry included (`shell_startup::read`, `claude_settings::owner_asks`,
+/// `WorkerEnv::raw_git_view`) — until nothing more is
+/// reached.
 fn live_readers<'t>(tree: &'t Tree<'_>) -> Vec<LiveReader<'t>> {
     let mut files: Vec<(&SourceFile, Vec<&'static str>)> = Vec::new();
     for &(home, name, why) in SUPERVISE_LOOK_HOMES {
@@ -1486,6 +1562,8 @@ fn live_readers<'t>(tree: &'t Tree<'_>) -> Vec<LiveReader<'t>> {
 }
 
 /// Whether the shipped `fn name` of `file` takes `self`, and whether it is
+/// visible outside its module: read from its signature, the `fn` line to the
+/// line that opens its body (or ends a declaration).
 fn signature(file: &SourceFile, name: &str) -> Option<(bool, bool)> {
     let attributed = super::graph::attribute(file);
     let start = attributed.iter().position(|l| {
@@ -1510,6 +1588,9 @@ fn signature(file: &SourceFile, name: &str) -> Option<(bool, bool)> {
 }
 
 /// The live body of ANOTHER file one line of code in the supervisor file
+/// `rel` calls, if any ([`live_readers`]): a method by `.name(…)` or a type's
+/// path (`WorkerEnv::raw_git_view`), a free `fn` by its module's path
+/// (`shell_startup::read`, `super::limit::zone_offset_at`).
 fn live_call<'r, 't>(
     code: &str,
     rel: &str,
@@ -1610,6 +1691,8 @@ pub(super) fn use_leaves(stmt: &str) -> Vec<UseLeaf<'_>> {
 }
 
 /// One use tree below the path `prefix`: a group (`head::{a, b::{c}}`) is
+/// each of its members below `prefix::head`; a leaf is a path, a glob or
+/// `self`, renamed or not.
 fn use_tree<'s>(tree: &'s str, prefix: &[&'s str], out: &mut Vec<UseLeaf<'s>>) {
     let tree = tree.trim();
     if let Some(open) = tree.find('{') {
@@ -1690,6 +1773,7 @@ pub(super) fn type_alias(code: &str) -> Option<UseLeaf<'_>> {
 }
 
 /// THE CLOCK READ, SLEEP OR PHASE-2 READ ONE IMPORTED NAME BINDS where the
+/// line view cannot see it, if any: the needle, and the finding's detail.
 fn imported_read(
     leaf: &UseLeaf<'_>,
     by_path: &std::collections::BTreeSet<&str>,
@@ -1757,6 +1841,8 @@ fn imported_read(
 }
 
 /// The free live body of another file a `use` statement imports, if any: by
+/// its module's path (`use super::shell_startup::read;`) or in a group of that
+/// module (`shell_startup::{ShellStartup, read}`, across lines).
 fn live_import<'r, 't>(
     stmt: &str,
     rel: &str,
@@ -1933,6 +2019,7 @@ fn supervise_fx(tree: &Tree<'_>, out: &mut Vec<Finding>) {
 }
 
 /// A phase-3 finding's detail for a live body `r` called or imported above
+/// its door.
 fn live_bypass(r: &LiveReader<'_>, how: &str) -> String {
     format!(
         "{how} {}, the live body of a derived door, above its door: its look reaches no \
@@ -1943,9 +2030,13 @@ fn live_bypass(r: &LiveReader<'_>, how: &str) -> String {
 }
 
 /// The approval ledger's module: its readers by path are found by the
+/// convention every one of them keeps ([`ledger_by_path`]).
 const SUPERVISE_LEDGER: &str = "crates/aterm-agent/src/supervise/approvals.rs";
 
 /// The ledger's BY-PATH READERS: each `fn X` of its module that has an
+/// `fn X_in` beside it — `X(path, …)` is `X_in` over the file read by its
+/// path, for the window's host and the CLI, and the loop reads the file once
+/// through `Fx::read_text` and hands the text to `X_in`.
 fn ledger_by_path<'t>(tree: &'t Tree<'_>) -> std::collections::BTreeSet<&'t str> {
     let Some(file) = tree.corpus.get(SUPERVISE_LEDGER) else {
         return std::collections::BTreeSet::new();
@@ -1963,6 +2054,8 @@ fn ledger_by_path<'t>(tree: &'t Tree<'_>) -> std::collections::BTreeSet<&'t str>
 }
 
 /// The ledger reader by path ([`ledger_by_path`]) one line of code calls
+/// through its module's path (`approvals::open_wall(…)`, or passes as a fn
+/// item), if any — never its `_in` form, a name the path only begins.
 fn ledger_read<'a>(code: &str, by_path: &std::collections::BTreeSet<&'a str>) -> Option<&'a str> {
     for at in hits(code, "approvals::", Bound::Sub) {
         if at > 0 && is_word(code.as_bytes()[at - 1]) {
@@ -1978,6 +2071,7 @@ fn ledger_read<'a>(code: &str, by_path: &std::collections::BTreeSet<&'a str>) ->
 }
 
 /// The lines of a file that belong to a phase-3 look's home `fn`
+/// ([`SUPERVISE_LOOK_HOMES`]: this file's, by name).
 fn look_homes(file: &SourceFile) -> std::collections::BTreeSet<usize> {
     let rel = file.rel.strip_prefix(SUPERVISE[0]).unwrap_or(&file.rel);
     super::graph::attribute(file)
@@ -1994,6 +2088,7 @@ fn look_homes(file: &SourceFile) -> std::collections::BTreeSet<usize> {
 }
 
 /// The lines of a file that belong to a phase-2 read's home `fn` in its own
+/// file ([`SUPERVISE_READ_HOMES`]), each with the needle that home is for.
 fn read_homes(file: &SourceFile) -> std::collections::BTreeMap<usize, &'static str> {
     let rel = file.rel.strip_prefix(SUPERVISE[0]).unwrap_or(&file.rel);
     super::graph::attribute(file)
@@ -2009,6 +2104,8 @@ fn read_homes(file: &SourceFile) -> std::collections::BTreeMap<usize, &'static s
 }
 
 /// The lines of a file that belong to a wall reader's own `fn` in its own
+/// file ([`SUPERVISE_READER_HOMES`]), signature and body: the wall clock's
+/// home, for a [`wall_read`] alone.
 fn reader_homes(file: &SourceFile) -> std::collections::BTreeSet<usize> {
     let rel = file.rel.strip_prefix(SUPERVISE[0]).unwrap_or(&file.rel);
     super::graph::attribute(file)
@@ -2025,6 +2122,9 @@ fn reader_homes(file: &SourceFile) -> std::collections::BTreeSet<usize> {
 }
 
 /// Whether the [`SUPERVISE_CLOCKS`] needle `needle` reads the WALL clock (the
+/// system's time, `SystemTime::now` or a one-word wall reader), which is all a
+/// wall reader's own body is the home of: never a sleep, nor the monotonic
+/// clock.
 fn wall_read(needle: &str) -> bool {
     needle == "SystemTime::now"
         || SUPERVISE_CLOCKS
@@ -2033,6 +2133,8 @@ fn wall_read(needle: &str) -> bool {
 }
 
 /// The direct clock read, sleep or phase-2 read one line of code makes, if
+/// any, and the name that hit: the first word hit of a [`SUPERVISE_CLOCKS`]
+/// or [`SUPERVISE_READS`] name that sits in its [`ClockShape`].
 fn supervise_clock(
     code: &str,
     include: impl Fn(&str) -> bool,
@@ -2045,6 +2147,7 @@ fn supervise_clock(
 }
 
 /// The look at the machine one line of code makes past a derived door, if
+/// any ([`SUPERVISE_LOOKS`], in their [`ClockShape`]s), and the name that hit.
 fn supervise_look(code: &str) -> Option<(&'static str, &'static str)> {
     if starts_use(code) {
         return None;
@@ -2090,6 +2193,7 @@ pub(super) fn first_hit<'a>(
 }
 
 /// Whether `rest`, what follows a [`ClockShape::PathCall`] head, is one or
+/// more `::segment`s and then a call: `::read(`, `::OpenOptions::new()`.
 fn path_called(rest: &str) -> bool {
     let mut rest = rest;
     let mut segments = 0;
@@ -2153,6 +2257,7 @@ fn store_current(tree: &Tree<'_>, out: &mut Vec<Finding>) {
 }
 
 /// `join("current")`, or a `join`/`Path::new`/`PathBuf::from` of a literal
+/// passing through or ending in a `/current` component.
 fn joins_current(line: Line<'_>) -> bool {
     ["join", "Path::new", "PathBuf::from"].iter().any(|door| {
         hits(line.code, door, Bound::Word).any(|at| {
@@ -2266,6 +2371,8 @@ mod tests {
     }
 
     /// The thread, socket and filesystem shapes the path needles miss: a
+    /// `thread::Builder`, a module named inside a grouped `std` import however
+    /// it wraps, and a module's own items imported or called by path.
     #[test]
     fn a_thread_builder_and_a_grouped_std_import_are_found() {
         let src = "use std::{fs, io::{self, Read}};\n\
@@ -2320,6 +2427,8 @@ mod tests {
     }
 
     /// A module its parent declares test-only is test code whatever its name
+    /// (and so is what lies in its own directory); a shipped declaration, one
+    /// nested in an inline module, or a missing file exempts nothing.
     #[test]
     fn a_module_the_parent_declares_test_only_is_test_code() {
         let threaded = "fn rig() { std::thread::scope(|s| { s.spawn(|| ()); }); }\n";
@@ -2732,6 +2841,9 @@ mod tests {
     }
 
     /// A GUI package two registry hops below the keeper's closure is found
+    /// through Cargo.lock, with its chain; a member reached through the lock is
+    /// read by its manifest, so its dev-dependencies (which its lock entry
+    /// lists) are not followed; a dependency the lock lacks is a finding.
     #[test]
     fn the_keepers_closure_is_walked_through_cargo_lock() {
         use crate::scan_set::test_fixtures::{disk_tree, workspace_manifests};
@@ -2913,6 +3025,7 @@ mod tests {
     }
 
     /// Each way the supervisor's code can read a clock or sleep past its
+    /// door, with the line it fires on.
     #[test]
     fn every_clock_read_past_the_supervisors_door_is_found() {
         let cases: &[(&str, &str, usize)] = &[
@@ -3096,6 +3209,8 @@ mod tests {
     }
 
     /// The door's own reads, a value or a field of a reader's name, prose,
+    /// test code, a reader's own definition, the clock's home files and code
+    /// outside the supervisor are silent.
     #[test]
     fn the_door_and_the_clocks_homes_are_silent() {
         let src = "let now = self.fx.mono();\nlet d = self.fx.since(at);\nself.fx.sleep(pause);\n\
@@ -3180,6 +3295,11 @@ mod tests {
     }
 
     /// A WALL READER'S HOME IS ITS OWN `fn`, IN ITS OWN FILE, FOR THE WALL
+    /// READ ALONE: `limit::unix_now{,_ms}` and `journal::unix_ms` read the
+    /// system's wall clock in their bodies, and nothing else there is
+    /// excused — a sleep or a monotonic read in a reader's body is a read past
+    /// the door — and a `fn` of a reader's name anywhere else (a method of
+    /// that name on some type) is no home at all, whatever it reads.
     #[test]
     fn a_wall_readers_home_is_its_own_fn_in_its_own_file_for_the_wall_alone() {
         let limit = "pub fn unix_now() -> i64 {\n    \
@@ -3259,6 +3379,11 @@ mod tests {
     }
 
     /// AN IMPORT THAT KEEPS A CLOCK'S NAME IS SILENT: the module or the type
+    /// brought in under its own name (`use std::thread;`, `Instant`,
+    /// `SystemTime`, the ledger's module and its `_in` readers), a group of
+    /// them, `self` in a group, `as _` (which binds nothing to call), a
+    /// rename of something no clock is named through, a type alias of a
+    /// type that is not a clock, and an import in test code.
     #[test]
     fn an_import_that_keeps_a_clocks_name_is_silent() {
         let src = "use std::thread;\nuse std::time::{Duration, Instant};\n\
@@ -3281,6 +3406,7 @@ mod tests {
     }
 
     /// PHASE 3: each look at the machine made past a derived door is a
+    /// finding, in each shape it is written.
     #[test]
     fn a_look_at_the_machine_past_a_derived_door_is_named() {
         let cases = [
@@ -3367,6 +3493,8 @@ mod tests {
     }
 
     /// PHASE 3's doors, homes and look-alikes are silent: the probe's and
+    /// `Fx`'s own methods, a field or a type of a look's name, an import, a
+    /// `fn` line, a home `fn` in its own file, and the probe's live arm.
     #[test]
     fn the_derived_doors_and_their_homes_are_silent() {
         let doors = "ctx.shell_cwds = ctx.probe.shell_cwds(w, cwd);\n\
@@ -3437,6 +3565,9 @@ mod tests {
     }
 
     /// Stand-ins for the files that hold the policy's live bodies: each home
+    /// `fn` of [`SUPERVISE_LOOK_HOMES`] makes its look, and the entries the
+    /// probe's live arm calls reach a home only through their file's own calls
+    /// (or another home file's), as the real ones do.
     fn live_body_files() -> Vec<(&'static str, &'static str)> {
         vec![
             (
@@ -3486,6 +3617,11 @@ mod tests {
     }
 
     /// A PROBE'S LIVE BODY CALLED FROM ABOVE ITS DOOR IS NAMED: each call the
+    /// policy made before T5 — the shell's startup, the owner's asks, the git
+    /// view and the settings' `env` read off the worker — made again from the
+    /// loop or the policy, and the live probe itself named
+    /// there, is a finding, as is a live body imported to be called bare (on
+    /// one line, or in a group across lines).
     #[test]
     fn a_probes_live_body_called_above_its_door_is_named() {
         let lp = "let s = crate::supervise::policy::shell_startup::read(w, cwd);\n\
@@ -3530,6 +3666,12 @@ mod tests {
     }
 
     /// THE PROBE, ITS LIVE BODIES' OWN FILES AND THEIR PURE NEIGHBOURS ARE
+    /// SILENT: a call of the probe (a method of the same name as a live body
+    /// included), a pure `fn` of a live body's file, a fn that hands an
+    /// injected reader on (`INJECTED`: its call of the home's name is its
+    /// parameter), a type imported from a live body's module, and the chain
+    /// inside the live bodies' files — an entry, the `fn`s it reaches, and a
+    /// call into another home file's live body from one of them.
     #[test]
     fn the_probe_and_its_live_bodies_own_files_are_silent() {
         let policy = "ctx.probe.settings_env(worker, &ctx.cwd)?;\n\
@@ -3564,6 +3706,10 @@ mod tests {
     }
 
     /// THE LEDGER'S READERS BY PATH ARE FOUND BY THEIR CONVENTION: a reader
+    /// beside its `_in` form reads the file in the ledger's module unnamed
+    /// (phase 3's home there) and is named wherever the loop calls it (phase
+    /// 2), while a look in another `fn` of the module, and the `_in` form
+    /// called from the loop, are what they are.
     #[test]
     fn the_ledgers_readers_by_path_are_found_by_their_convention() {
         let ledger = "pub fn awaited_try_in(body: &str) -> u8 {\n    0\n}\n\

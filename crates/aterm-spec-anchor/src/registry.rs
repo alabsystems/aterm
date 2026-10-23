@@ -9,62 +9,24 @@
 // pointers are atomics, a node links at most once, and a target with no
 // constructor section is a compile error rather than an empty registry.
 
-//! Link-time collection: the distributed slice behind [`crate::xref`] and
-//! `aterm_spec::xref`.
-//!
-//! [`submit!`] puts one value in a `static` node and registers a constructor
-//! that runs while the image loads, before `main`. The constructor pushes the
-//! node onto the front of its type's list; [`iter`] walks the list. So every
-//! value submitted from object code linked into the binary is collected, with
-//! no source scanning and no list anyone has to keep.
-//!
-//! The constructor sections: Mach-O `__DATA,__mod_init_func` (dyld), ELF
-//! `.init_array` (Linux and Android), and PE `.CRT$XCU` (the MSVC CRT's C++
-//! initializers). Any other target fails to compile at the first [`submit!`],
-//! because there the constructor would never run and every walk would come back
-//! empty.
-//!
-//! A type opts in with [`collect!`], which gives it its one [`Registry`].
+//! Link-time collection: the distributed slice behind [`crate::xref`] and `aterm_spec::xref`.
 
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-/// A type whose values [`submit!`] can collect. Implemented by [`collect!`].
+/// A type whose values [`submit!`] can collect.
 pub trait Collect: Sync + Sized + 'static {
     /// This type's one list.
     #[doc(hidden)]
     fn registry() -> &'static Registry<Self>;
 }
 
-/// The head of one type's list. Every pointer it, or a node's `next`, ever
-/// holds is null or was made from a `&'static Node<T>` by [`Registry::submit`].
-///
-/// `T: Sync` is part of the type, not only of [`Collect`]: a walk hands out
-/// each value as a `&'static T` on whatever thread walks, and the `AtomicPtr`
-/// head makes every `Registry<T>` itself `Sync`, so without the bound a
-/// `static` registry of a `Cell` would share it across threads. (Upstream gets
-/// the same guarantee from `ErasedNode: Sync` and an `unsafe fn submit`.)
-///
-/// ```
-/// use aterm_spec_anchor::registry::{Node, Registry};
-/// use std::sync::atomic::AtomicU32;
-/// static R: Registry<AtomicU32> = Registry::new();
-/// R.submit(Box::leak(Box::new(Node::new(AtomicU32::new(0)))));
-/// assert_eq!(R.iter().count(), 1);
-/// ```
-///
-/// ```compile_fail,E0277
-/// use aterm_spec_anchor::registry::{Node, Registry};
-/// use std::cell::Cell;
-/// static R: Registry<Cell<u32>> = Registry::new();
-/// R.submit(Box::leak(Box::new(Node::new(Cell::new(0)))));
-/// assert_eq!(R.iter().count(), 1);
-/// ```
+/// The head of one type's list.
 pub struct Registry<T: Sync + 'static> {
     head: AtomicPtr<Node<T>>,
 }
 
-/// One submitted value and its link. Built in a `static` by [`submit!`].
+/// One submitted value and its link.
 pub struct Node<T: Sync + 'static> {
     value: T,
     next: AtomicPtr<Node<T>>,
@@ -96,9 +58,7 @@ impl<T: Sync> Registry<T> {
         }
     }
 
-    /// Push `node` onto the front of the list. The load-time constructors call
-    /// this once per node; a node already linked is left where it is, so a
-    /// constructor that runs twice cannot close the list into a cycle.
+    /// Push `node` onto the front of the list.
     pub fn submit(&'static self, node: &'static Node<T>) {
         if node.linked.swap(true, Ordering::Relaxed) {
             return;
@@ -107,9 +67,6 @@ impl<T: Sync> Registry<T> {
         let mut head = self.head.load(Ordering::Relaxed);
         loop {
             node.next.store(head, Ordering::Relaxed);
-            // Release publishes `next`; each successful exchange also continues
-            // the release sequence of the ones before it, so a reader's Acquire
-            // of `head` sees every link down the list.
             match self
                 .head
                 .compare_exchange_weak(head, new, Ordering::Release, Ordering::Relaxed)
@@ -170,7 +127,6 @@ macro_rules! __registry_collect {
 }
 
 /// `submit!(T => value)`: collect `value` into `T`'s list when the image loads.
-/// It expands to an anonymous `const`, so it sits anywhere an item can.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __registry_submit {

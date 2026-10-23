@@ -69,6 +69,8 @@ const SPAWN_AGENT: &str = anchor_text("rollout.spawn_agent");
 const EXEC_COMMAND: &str = anchor_text("rollout.exec_command");
 
 /// The kinds of row past a copy the fold opens: any other is skipped by its
+/// raw bytes, unparsed (a quote inside a JSON string is escaped, so a
+/// quoted match is a key or a closed word).
 const OPENED: [&str; 9] = [
     TURN_CONTEXT,
     TASK_COMPLETE,
@@ -92,6 +94,7 @@ pub fn tool_class(namespace: Option<&str>, name: &str) -> (&'static str, bool) {
 }
 
 /// A copy that has read no stamp yet ([`Prefix::Copy`]): its burst starts
+/// at the first stamp read.
 const NO_STAMP: i64 = i64::MAX;
 
 /// An id as the fold compares it (never kept).
@@ -115,12 +118,17 @@ pub struct CodexStepFold {
     /// Where the fold stands against a copy.
     prefix: Prefix,
     /// While a fork's copy is read, its own thread's fingerprint: its own
+    /// `thread_settings_applied` ends the copy.
     thread: Option<u64>,
     /// The build its own `session_meta` names, as the log says it
+    /// ([`log_build`]).
     version: Option<StepId>,
     /// THE WRITER: the build of the process writing the rollout now, where
+    /// its reader knows it ([`Self::set_writer`]), its state and how the
+    /// log says it.
     writer: Option<(StepState, Option<StepId>)>,
     /// The state its rows are read at: [`StepState::On`] only on a build
+    /// [`CODEX_MEASURED_BUILDS`] names, matched whole.
     state: StepState,
     /// The largest running total read, a copy's included.
     top: u64,
@@ -305,6 +313,8 @@ impl CodexStepFold {
     }
 
     /// Where the row stands against a copy (module docs): `true` when it is
+    /// the thread's own and is read on, `false` when it steps nothing (a
+    /// copied row, the first row, the line that ends a copy).
     fn past_copy(&mut self, v: &Value, stamp: Option<i64>) -> bool {
         let kind = v.get("type").and_then(Value::as_str);
         let payload = v.get("payload");
@@ -359,6 +369,7 @@ impl CodexStepFold {
     }
 
     /// The steps of one of the thread's own rows, into `out`; `true` when a
+    /// key it reads has the wrong shape (module docs).
     fn row(&mut self, v: &Value, fresh: bool, live: bool, out: &mut Vec<StepEvent>) -> bool {
         let kind = v.get("type").and_then(Value::as_str);
         let payload = v.get("payload");
@@ -494,6 +505,8 @@ impl CodexStepFold {
     }
 
     /// The state of the rows now (rule): the thread's build's,
+    /// and never `On` while its writer runs a build nobody measured
+    /// ([`Self::set_writer`]).
     const fn state(&self) -> StepState {
         match self.writer {
             Some((StepState::Partial, _)) => StepState::Partial,
@@ -507,6 +520,8 @@ impl CodexStepFold {
     }
 
     /// Queue one step; a full queue drops its oldest step that is no
+    /// [`StepEvent::Bind`] or [`StepEvent::Off`], counting it in
+    /// [`StepBatch::overflow`] (the Claude fold's rule).
     fn enqueue_as(&mut self, pos: StepPos, state: StepState, ev: StepEvent) {
         self.queue.push_back(Step { pos, state, ev });
         while self.queue.len() > STEP_QUEUE {

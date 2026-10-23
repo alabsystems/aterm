@@ -2,39 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! THE CAUSES: what holds over one split window (RD §5.3–§5.4).
-//!
-//! A covering cause accounts for part of the busy CPU and opens only above
-//! the floor: it covers at least [`FLOOR_MC`] and a tenth of the busy figure.
-//!
-//! * A named activity ([`ACTIVITIES`], one row: `spotlight`): coalitions led
-//!   by a process Apple vouches for (the platform flag and the platform
-//!   category, [`Voucher::Apple`]) whose signing id is one of the row's, while
-//!   one of its term groups holds. A signing id is a claim its signer chose,
-//!   so under any other voucher it never matches.
-//! * `tab-work`: a tab's live work over the window, one per tab.
-//! * `aterm-work`: aterm itself and its helpers, live, when they are the
-//!   largest part.
-//! * `app-work`: the busiest coalition outside aterm's, when its lead is this
-//!   user's and it is no named activity's member (RD §5.3: "the largest part
-//!   is an own-uid app coalition"; never a smaller own-uid coalition beside a
-//!   busier service's, so `siriactionsd` at 10:32 is no cause).
-//! * `unexplained`: one part's CPU (aterm's, others' or services') that no
-//!   other covering cause covers, at least [`UNEXPLAINED_MC`] and over the
-//!   floor (RD §5.3); it covers the largest such part's, so a small cause
-//!   never stands for a large uncovered one.
-//!
-//! A context covers nothing and holds for a covering cause (RD §5.5):
-//! `startup` (userspace under 30 min old, and at least half the cause's CPU
-//! from coalitions whose lead was born in the 60 s after it started, weighted
-//! by CPU) and `wake` (under 10 min since the wake, a core of deferred work in
-//! the cause, and no `startup`) only for a named activity or `unexplained`
-//! (whose coalitions are its part's that no other cause covers, and none for
-//! aterm's part: aterm's work is never start-up's); `throttled` and
-//! `pressure`, the machine's, for every one, as each snapshot reads them
-//! (`with_machine`). With the lane off no coalition is read, so only
-//! `throttled` and `pressure` can hold.
-//!
-//! Pure: the facts and the snapshot in, the causes out, ranked.
 
 use std::collections::HashSet;
 
@@ -45,8 +12,7 @@ use crate::model::{MemView, Pressure, Snapshot, Thermal, Throttle};
 pub const FLOOR_MC: i64 = 500;
 /// A covering cause's floor as a share of the busy figure, per mille.
 pub const FLOOR_PM: i64 = 100;
-/// `unexplained` holds from this much of one part's CPU no other cause
-/// covers, millicores.
+/// `unexplained` holds from this much of one part's CPU no other cause covers, millicores.
 pub const UNEXPLAINED_MC: i64 = 1000;
 /// `startup` holds while userspace is younger than this, ms.
 pub const STARTUP_AGE_MS: i64 = 30 * 60 * 1000;
@@ -90,8 +56,7 @@ pub enum Term {
     CpuAtLeast(i64),
     /// They read at least this from storage, bytes per second.
     ReadAtLeast(u64),
-    /// At least this share of their QoS time is deferred (maintenance or
-    /// background), per mille.
+    /// At least this share of their QoS time is deferred (maintenance or background), per mille.
     DeferredAtLeast(u16),
 }
 
@@ -105,16 +70,14 @@ impl Term {
     }
 }
 
-/// One named activity: macOS's own work with a name people know and no API
-/// that reports it (RD §5.4).
+/// One named activity: macOS's own work with a name people know and no API that reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Activity {
     /// Its id.
     pub id: ActivityId,
     /// The people's word: `Spotlight`.
     pub word: &'static str,
-    /// Its members' signing ids, matched only under [`Voucher::Apple`]. An id
-    /// not read on a Mac stays out, so it never matches.
+    /// Its members' signing ids, matched only under [`Voucher::Apple`].
     pub members: &'static [&'static str],
     /// It holds when every term of one group holds.
     pub holds: &'static [&'static [Term]],
@@ -122,12 +85,10 @@ pub struct Activity {
     pub cannot: &'static [(&'static str, &'static str)],
 }
 
-/// The named activities. No test holds this table complete: it is data, and
-/// an unread member never matches.
+/// The named activities.
 pub const ACTIVITIES: &[Activity] = &[Activity {
     id: ActivityId::Spotlight,
     word: "Spotlight",
-    // `probes/ident-out-1.txt`: every one platform, category 1.
     members: &[
         "com.apple.mds",
         "com.apple.mds_stores",
@@ -144,8 +105,7 @@ pub const ACTIVITIES: &[Activity] = &[Activity {
     ],
 }];
 
-/// A context: it covers nothing and says when or under what a covering cause
-/// runs.
+/// A context: it covers nothing and says when or under what a covering cause runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Context {
     /// Shortly after userspace started.
@@ -192,8 +152,7 @@ pub enum CauseId {
 }
 
 impl CauseId {
-    /// The wire word: an activity's, `tab-work`, `aterm-work`, `app-work`,
-    /// `unexplained`, or a context's.
+    /// The wire word.
     #[must_use]
     pub fn word(self) -> &'static str {
         match self {
@@ -212,8 +171,7 @@ impl CauseId {
         !matches!(self, Self::Context(_))
     }
 
-    /// Whether `startup` and `wake` can hold for it: a named activity or
-    /// `unexplained`, never a tab's, aterm's or an app's work (RD §5.5).
+    /// Whether `startup` and `wake` can hold for it.
     #[must_use]
     pub fn takes_start(self) -> bool {
         matches!(self, Self::Activity(_) | Self::Unexplained)
@@ -280,14 +238,9 @@ pub struct Candidate {
     pub id: CauseId,
     /// The busy figure it covers, millicores (0 for a context).
     pub covers_mc: i64,
-    /// The coalitions it covers, busiest first: none for a tab's or aterm's
-    /// work, which are processes; for `unexplained`, its part's that no other
-    /// cause covers (none for aterm's part).
+    /// The coalitions it covers, busiest first.
     pub coalitions: Vec<u64>,
-    /// When its work began, by the evidence (unix ms): the earliest lead
-    /// birth among its coalitions, or userspace's start; never when aterm
-    /// noticed. `wake`, `pressure` and `throttled` have none (the wake's time
-    /// is its evidence).
+    /// When its work began, by the evidence (unix ms).
     pub since_ms: Option<i64>,
     /// What it holds on.
     pub evidence: Evidence,
@@ -313,8 +266,7 @@ pub fn above_floor(covers_mc: i64, busy_mc: i64) -> bool {
     covers_mc >= FLOOR_MC && covers_mc * 1000 >= busy_mc * FLOOR_PM
 }
 
-/// The machine's throttle, where it holds: thermal at `light` or above, or
-/// Low Power Mode. The one test `throttled` and a bare `sys why` both read.
+/// The machine's throttle, where it holds: thermal at `light` or above, or Low Power Mode.
 pub(crate) fn throttle(snap: &Snapshot) -> Option<Thermal> {
     snap.thermal
         .filter(|t| t.level >= Throttle::Light || t.low_power == Some(true))
@@ -327,10 +279,7 @@ pub(crate) fn pressed(snap: &Snapshot) -> Option<&MemView> {
         .filter(|m| m.sample.pressure.rank().is_some_and(|r| r >= 1))
 }
 
-/// The machine's own contexts that hold in `snap`, in [`Context::ORDER`]:
-/// `throttled`, then `pressure`. They read no coalition and no window, so
-/// they hold with the lane off and before the first split tick, and
-/// [`super::account()`] reads them off its own snapshot ([`with_machine`]).
+/// The machine's own contexts that hold in `snap`, in [`Context::ORDER`].
 pub(crate) fn machine(snap: &Snapshot) -> Vec<Candidate> {
     let context = |c: Context, evidence: Evidence| Candidate {
         id: CauseId::Context(c),
@@ -382,16 +331,13 @@ fn covered(r: &CoalRow) -> i64 {
     }
 }
 
-/// The causes that hold over `facts`' window, with `snap`'s machine state
-/// (memory pressure, throttle), ranked: covering causes by what they cover,
-/// busiest first, then the contexts in [`Context::ORDER`]. PURE.
+/// The causes that hold over `facts`' window.
 #[must_use]
 pub fn detect(facts: &WhyFacts, snap: &Snapshot) -> Vec<Candidate> {
     detect_as(facts, snap, true)
 }
 
-/// [`detect`], matching activities' signing ids under Apple's voucher only
-/// where `vouched` (a negative control unsets it).
+/// [`detect`], matching activities' signing ids under Apple's voucher only where `vouched`.
 pub(crate) fn detect_as(facts: &WhyFacts, snap: &Snapshot, vouched: bool) -> Vec<Candidate> {
     let split = &facts.split;
     let mut out = if split.via == Via::Coalitions {
@@ -433,12 +379,7 @@ pub(crate) fn detect_as(facts: &WhyFacts, snap: &Snapshot, vouched: bool) -> Vec
     with_machine(out, snap)
 }
 
-/// `causes`, ranked as [`detect()`] ranks them, with the machine's contexts
-/// as `snap` reads them, whatever snapshot they were made on: each covering
-/// cause takes `throttled` and `pressure` where they hold in `snap`, and
-/// they follow as causes of their own. A split tick's causes ride every
-/// snapshot after it, and a reply reads the machine as a bare `sys why`
-/// does, off its own snapshot.
+/// `causes`, ranked as [`detect()`] ranks them, with the machine's contexts as `snap` reads them.
 pub(crate) fn with_machine(mut causes: Vec<Candidate>, snap: &Snapshot) -> Vec<Candidate> {
     let of_machine = |c: Context| matches!(c, Context::Throttled | Context::Pressure);
     causes.retain(|c| !matches!(c.id, CauseId::Context(x) if of_machine(x)));
@@ -515,8 +456,6 @@ fn covering(facts: &WhyFacts, vouched: bool) -> Vec<Candidate> {
     if largest && above_floor(own, busy) {
         out.push(measured(CauseId::AtermWork, own));
     }
-    // The busiest coalition outside aterm's: an app's work when its lead is
-    // this user's and it is no activity's member.
     let app = split
         .rows
         .iter()
@@ -556,8 +495,6 @@ fn covering(facts: &WhyFacts, vouched: bool) -> Vec<Candidate> {
 /// The part (aterm's, others', services') holding the most CPU the covering
 /// causes `covered_by` leave, and how much: a tab's or aterm's own work comes
 /// out of aterm's, a covered coalition's (one of `taken`) out of its part.
-/// Work under the floor is a cause of none, so it stays in its part's, a
-/// tab's live work in aterm's as a small coalition's in services'.
 fn uncovered(split: &CoalSplit, covered_by: &[Candidate], taken: &HashSet<u64>) -> (Part, i64) {
     let mut aterm = split.aterm_mc + split.delegated_mc;
     let (mut others, mut services) = (split.others_mc, split.services_mc);
@@ -593,7 +530,6 @@ fn rows_of<'a>(facts: &'a WhyFacts, c: &Candidate) -> impl Iterator<Item = &'a C
 /// `startup` for `c`: userspace under [`STARTUP_AGE_MS`] old, and at least
 /// half of `c`'s CPU from coalitions whose lead was born within
 /// [`STARTUP_BORN_MS`] of its start, weighted by CPU (never by count).
-/// launchd, born at boot, is not start-up's.
 fn startup(facts: &WhyFacts, c: &Candidate) -> Option<Evidence> {
     let start = facts.userspace_ms?;
     if facts.at_unix_ms - start >= STARTUP_AGE_MS || c.covers_mc <= 0 {

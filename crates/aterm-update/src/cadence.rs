@@ -75,8 +75,11 @@ pub(crate) struct Cadence {
     /// Consecutive checks, ending with the latest, that could not reach the network.
     offline: u32,
     /// Consecutive completed checks, machine-wide, that found the channel head's app build
+    /// in flight, as of this process's latest healthy check; names an [`IN_FLIGHT_RETRY`]
+    /// rung, `0` none.
     in_flight: u32,
     /// While in the future, the next wait ends here (capped by [`Self::cap`], floored by
+    /// [`HOLD_FLOOR`], unjittered) instead of on the doubling ladder.
     hold: Option<Instant>,
 }
 
@@ -168,6 +171,7 @@ impl Cadence {
     }
 
     /// The remaining hold, if one is set and still in the future at `now`; an expired
+    /// hold is simply over (the ladder below applies).
     fn hold_remaining(&self, now: Instant) -> Option<Duration> {
         let until = self.hold?;
         let remaining = until.checked_duration_since(now)?;
@@ -331,7 +335,7 @@ pub(crate) fn wait(cadence: &Cadence, signal: &WakeSignal, seen: u64) -> (Durati
     })
 }
 
-/// [`wait`] over an injected sleep. The next check is published only while the wait
+/// [`wait`] over an injected sleep.
 fn wait_with(
     cadence: &Cadence,
     entropy: u8,
@@ -345,6 +349,8 @@ fn wait_with(
 }
 
 /// When this process's check loop looks next, as Unix seconds (`0`: no wait under way),
+/// set and cleared by [`wait`], read by `crate::next_check_at` for `aterm ctl update
+/// status`'s `next_check=`.
 static NEXT_CHECK_UNIX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Record that the loop's next check is `delay` after `now`.
@@ -376,6 +382,7 @@ pub(crate) enum LogAction {
 pub(crate) struct FailureLog {
     last: Option<String>,
     /// Whether the last emitted line was a warning: a failure first said at INFO is
+    /// warned the moment it stops being expected.
     last_warned: bool,
     /// Failures observed since the last emitted line (the first one included).
     since_emit: u32,
@@ -460,6 +467,11 @@ mod tests {
     const BASE: Duration = Duration::from_secs(75);
 
     /// `max_wait` is what the heartbeat is judged against while the loop waits, so
+    /// a wait longer than it would read as a stall of a healthy loop: swept over
+    /// the shipped interval and a fast test base, every failure depth, the offline
+    /// and in-flight ladders, a hold past the ceiling, a deferral held to its own
+    /// window (`Cadence::deferred`) and every jitter byte, no delay (plus the wake
+    /// settle) exceeds it.
     #[test]
     fn max_wait_bounds_every_delay_the_schedule_can_take() {
         let now = Instant::now();
@@ -527,6 +539,9 @@ mod tests {
     }
 
     /// A network that is not up yet — the boot and wake case — is retried after 20 s,
+    /// 60 s and then the two-minute base (the 5-minute rung never outwaits the ladder),
+    /// and only then does the ordinary ladder take over, from the base interval and
+    /// doubling as before.
     #[test]
     fn an_unreachable_network_is_retried_on_the_short_ladder_then_the_base() {
         let base = Duration::from_secs(INTERVAL_SECS);
@@ -595,7 +610,7 @@ mod tests {
         assert_eq!(c.nominal(), base, "the ordinary ladder's first rung");
     }
 
-    /// A network still coming up after a wake is no fault, whatever it failed on. The
+    /// A network still coming up after a wake is no fault, whatever it failed on.
     #[test]
     fn a_failure_inside_the_wake_grace_takes_the_quick_rungs_at_info_whatever_it_was() {
         let base = Duration::from_secs(INTERVAL_SECS);
@@ -641,6 +656,9 @@ mod tests {
     }
 
     /// A healthy check that found the head's app build in flight waits a minute —
+    /// keyed on the machine-wide count the check receipt carries — for
+    /// [`IN_FLIGHT_CHECKS`] checks, and the ordinary interval after those; a healthy
+    /// check that found none (the negative control, `0`) waits the base interval.
     #[test]
     fn a_head_whose_app_build_is_in_flight_is_rechecked_within_a_minute() {
         let base = Duration::from_secs(INTERVAL_SECS);
@@ -679,6 +697,7 @@ mod tests {
     }
 
     /// The quick wait never waits LONGER than the ordinary one: under a base shorter
+    /// than it, every in-flight wait is the base.
     #[test]
     fn the_in_flight_wait_never_outwaits_the_ordinary_one() {
         let short = Duration::from_secs(45);
@@ -831,6 +850,8 @@ mod tests {
     }
 
     /// The first rung (one base ±20 %) is shorter than the 1.4-base window, so a deferral
+    /// holds its process to the window's end; a rung that outlasts the window keeps its
+    /// jittered wait, and no known window is a plain failure.
     #[test]
     fn a_deferral_never_wakes_inside_its_own_window() {
         let base = Duration::from_secs(INTERVAL_SECS);
@@ -1013,6 +1034,8 @@ mod tests {
     }
 
     /// A day-long wait on a signal another thread posts past the count the waiter
+    /// answered returns `Woke` — through this test's one-minute hang detector, which a
+    /// wait that only watched the clock would trip.
     #[test]
     fn a_posted_wake_ends_the_wait_at_once() {
         static SIGNAL: WakeSignal = WakeSignal::new();

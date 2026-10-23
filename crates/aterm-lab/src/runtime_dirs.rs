@@ -1,44 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The per-user runtime directories an agent under test writes in the shared
-//! `/tmp`, which none of the variables tried moves, and what `down` takes
-//! back from them.
-//!
-//! Muse Code 1.4.10 keeps its local Session registry in
-//! `/private/tmp/tbh-<uid>-rt/muse` whatever `TMPDIR`, `TMP`, `TEMP`,
-//! `XDG_RUNTIME_DIR` or `HOME` say (measured: each pointed into the scratch,
-//! the registry stayed there; `TMPDIR` moves only its other temporary
-//! files). Each process makes a lease `ms-<hex>.sock.lease` (`{"pid": <pid>,
-//! …}`), the socket `ms-<hex>.sock` beside it and a session record
-//! `sessions/<id>.json` (`"process_generation_hint": "pid=<pid>"`). Every Muse
-//! Code of this user shares the directory, the owner's and other labs' among
-//! them; a clean exit usually removes its own three, but not always (leases
-//! of cleanly exited processes were seen left), and a TERM, a HUP or a KILL
-//! (which `down` sends) leaves them: `down` takes back what the record names
-//! whichever way the process ended.
-//!
-//! The witness ([`crate::sampler`]) asks `lsof` each second which entries under
-//! each root the jail's processes hold, and records each with its identity in
-//! `<run>/runtime.txt` (`pid TAB device TAB inode TAB path`); `down` asks once
-//! more before it ends them. Once the jail is empty, `down` removes an entry
-//! when ALL of these hold ([`claims`]), and nothing else: never a directory,
-//! the registry's shared lock, or an entry of a process of another jail.
-//!
-//! * a process of this jail held it (the record);
-//! * it names that process: a lease's `pid`, a session record's
-//!   `process_generation_hint`, or it is the socket of such a lease;
-//! * it was made after the lab came up (its birth time is not before the run
-//!   directory's); and
-//! * the same file (device and inode) of this user still stands at that path,
-//!   reached through no link.
-//!
-//! What the witness never saw (an entry of another shape, a process it missed)
-//! is not taken back, so `muse-selftest` checks from outside the record: a
-//! [`listing`] of the roots before `up` and after `down`, whose difference
-//! ([`new_since`]) may hold only entries naming a live Muse Code outside the
-//! jail and the registry's shared directories and lock (which a first run
-//! makes, and `down` leaves to every Muse Code of this user).
+//! Tracking and cleanup of per-user agent runtime directories in `/tmp`.
 
 use std::collections::BTreeSet;
 use std::io::Write as _;
@@ -127,14 +90,12 @@ pub trait View {
     /// Absence-sensitive entry read: `Err` is unknown, never missing.
     fn inspect(&self, path: &str) -> std::io::Result<Option<Stat>>;
     /// Immediate child paths of a directory; `None` for a non-directory.
-    /// A failed directory read, including any failed entry, is unknown.
     fn children(&self, _path: &str) -> std::io::Result<Option<Scan<Vec<String>>>> {
         Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
     }
 }
 
-/// The real filesystem, read through no link ([`crate::sys::entry_stat`],
-/// [`crate::sys::scratch_read`]).
+/// Real filesystem view that does not follow links.
 pub struct Disk;
 
 impl View for Disk {
@@ -238,7 +199,6 @@ fn shape(rel: &str) -> Option<Shape> {
         .map(|_| Shape::Socket)
 }
 
-/// The root `path` lies below, its path below that root and its shape (None:
 /// below no root, or of no shape).
 fn below<'a>(path: &'a str, roots: &'a [String]) -> Option<(&'a str, &'a str, Shape)> {
     roots.iter().find_map(|r| {
@@ -248,9 +208,7 @@ fn below<'a>(path: &'a str, roots: &'a [String]) -> Option<(&'a str, &'a str, Sh
     })
 }
 
-/// What `down` takes back: the recorded entries that are this run's ([module
-/// docs](self)), each once, in path order. `uid` is this user, `since` the
-/// birth time of the run directory.
+/// Recorded entries belonging to this run (`uid`, born at or after `since`), in path order.
 #[must_use]
 pub fn claims(held: &[Held], roots: &[String], uid: u32, since: i64, fs: &dyn View) -> Vec<Held> {
     let same = |h: &Held, kind: Kind| {
@@ -310,9 +268,7 @@ pub fn read_record(run_dir: &Path) -> Vec<Held> {
     set.into_iter().collect()
 }
 
-/// One pass of the witness: the entries below each root (one that is there)
-/// that `members` hold, appended to the record once each (`seen` holds what
-/// this caller recorded before).
+/// Appends new entries below each root held by `members` to `run_dir`'s record.
 pub fn witness(run_dir: &Path, members: &[i32], seen: &mut BTreeSet<Held>) {
     let live: Vec<String> = members
         .iter()
@@ -363,7 +319,6 @@ pub fn witness(run_dir: &Path, members: &[i32], seen: &mut BTreeSet<Held>) {
     }
 }
 
-/// The birth time of `run_dir`: when the lab came up (unreadable: the far
 /// future, so that nothing is claimed).
 fn run_born(run_dir: &Path) -> i64 {
     crate::sys::entry_stat(run_dir)
@@ -383,8 +338,7 @@ pub fn claimed(run_dir: &Path) -> Vec<Held> {
     claims(&held, &roots(uid), uid, run_born(run_dir), &Disk)
 }
 
-/// Remove what [`claimed`] finds (`down`, once the jail is empty), each only
-/// while it is still the same file; the paths removed.
+/// Removes [`claimed`] entries while their file identity matches, returning removed paths.
 #[must_use]
 pub fn clean(run_dir: &Path) -> Vec<String> {
     claimed(run_dir)
@@ -429,8 +383,7 @@ pub struct Entry {
     pub ino: u64,
 }
 
-/// Every observed entry under the roots, without following links; at most
-/// four directory levels are entered. Unknown reads remain distinguishable.
+/// Lists every observed entry under `roots` up to four directory levels without following links.
 #[must_use]
 pub fn listing(roots: &[String]) -> Scan<BTreeSet<Entry>> {
     listing_with(roots, &Disk)
@@ -479,19 +432,14 @@ fn listing_with(roots: &[String], fs: &dyn View) -> Scan<BTreeSet<Entry>> {
 /// The registry's shared lock, below its root.
 const LOCK: &str = ".session-registry.mutation.lock";
 
-/// What a listing of the roots taken after `down` holds that one taken before
-/// `up` did not ([`new_since`]), by path.
+/// Entries present in a post-`down` listing of the roots that were absent before `up`.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Since {
-    /// What nothing excuses: an entry left behind.
+    /// Unexcused entries left behind.
     pub left: Vec<String>,
-    /// A lease or session record that names a live process `alive` counts as
-    /// another's (the owner's Muse Code, another lab's), or the socket of
-    /// such a lease.
+    /// Entries naming a live process outside the jail (`alive`), or sockets of such leases.
     pub theirs: Vec<String>,
-    /// The registry's shared structure a first run makes when it was not
-    /// there: a root, its `sessions` directory and its mutation lock, which
-    /// every Muse Code of this user shares (so `down` leaves them).
+    /// Shared registry directories and lock files created on first run.
     pub shared: Vec<String>,
     /// Every absence-sensitive entry recheck completed.
     pub complete: bool,
@@ -508,9 +456,7 @@ impl Default for Since {
     }
 }
 
-/// Sort every entry of `after` that is not in `before` (by path and identity)
-/// below one of `roots` into [`Since`]: `alive` says whether a pid an entry
-/// names is a live process outside the jail.
+/// Classifies entries in `after` not present in `before` below `roots` into [`Since`].
 #[must_use]
 pub fn new_since(
     before: &BTreeSet<Entry>,
@@ -531,7 +477,6 @@ pub fn new_since(
     };
     let mut out = Since::default();
     for e in after.difference(before) {
-        // gone since the listing: nothing is left there
         let kind = match fs.inspect(&e.path) {
             Ok(Some(st)) => st.kind,
             Ok(None) => continue,
@@ -565,8 +510,7 @@ pub fn new_since(
     out
 }
 
-/// The post-down observation: keep known leftovers even when another read
-/// was unknown. Both listings, every recheck, and claimed-file reads matter.
+/// Post-`down` diff and standing claimed entries across `before`, `after`, and `claimed`.
 pub fn after_down(
     before: &Scan<BTreeSet<Entry>>,
     after: &Scan<BTreeSet<Entry>>,
@@ -718,24 +662,16 @@ mod tests {
         );
     }
 
-    /// THE LAB TAKES BACK ITS OWN MUSE CODE'S LEASE, SOCKET AND SESSION
-    /// RECORD, AND NOTHING ELSE. NEGATIVE CONTROLS: another process's entries
-    /// that a process of the jail held (a scan of the registry) and that name
-    /// that other process, the registry's shared lock and its directories, an
-    /// entry made before the lab came up, an entry another file replaced since
-    /// the witness saw it, a link in an entry's place, another user's file,
     /// and a socket whose lease is not this run's all stay.
     #[test]
     fn the_lab_takes_back_its_own_muse_code_entries_and_nothing_else() {
         let mut fs = Fake::default();
         let mut rec = muse(&mut fs, 4242, "aa11", "01a1-mine", 10);
-        // the owner's live Muse Code, whose lease and record the jail's process opened while scanning the registry
         let theirs = muse(&mut fs, 777, "bb22", "01a1-theirs", 20);
         rec.extend(theirs.iter().map(|h| Held {
             pid: 4242,
             ..h.clone()
         }));
-        // the registry's own lock and directories
         fs.put(
             &format!("{ROOT}/.session-registry.mutation.lock"),
             30,
@@ -745,7 +681,6 @@ mod tests {
         rec.push(held(4242, 30, ".session-registry.mutation.lock"));
         fs.put(&format!("{ROOT}/sessions"), 31, Kind::Other, "");
         rec.push(held(4242, 31, "sessions"));
-        // a stale lease of an earlier process that had this pid, made before the lab came up
         fs.put(
             &format!("{ROOT}/ms-cc33.sock.lease"),
             40,
@@ -758,14 +693,12 @@ mod tests {
             .0
             .born = UP - 60;
         rec.push(held(4243, 40, "ms-cc33.sock.lease"));
-        // a second Muse Code of this jail, whose lease was since replaced by another file of the same name
         rec.extend(muse(&mut fs, 5151, "dd44", "01a1-second", 50));
         fs.at
             .get_mut(&format!("{ROOT}/ms-dd44.sock.lease"))
             .unwrap()
             .0
             .ino = 99;
-        // a third whose session record is another user's, and a fourth whose lease is now a link
         rec.extend(muse(&mut fs, 6161, "ee55", "01a1-third", 60));
         fs.at
             .get_mut(&format!("{ROOT}/sessions/01a1-third.json"))
@@ -778,8 +711,6 @@ mod tests {
             .unwrap()
             .0
             .kind = Kind::Other;
-        // four more whose lease and record are this run's but whose socket is not the one the witness saw: another
-        // file replaced it, it is another user's, it is no socket, or it was made before the lab came up
         rec.extend(muse(&mut fs, 8181, "a1a1", "01a1-fifth", 80));
         rec.extend(muse(&mut fs, 9191, "b2b2", "01a1-sixth", 90));
         rec.extend(muse(&mut fs, 3131, "c3c3", "01a1-seventh", 100));
@@ -817,9 +748,7 @@ mod tests {
             got.iter()
                 .all(|h| [4242, 5151, 6161, 7171, 8181, 9191, 3131, 2121].contains(&h.pid))
         );
-        // the control: with no record, nothing is claimed
         assert!(claims(&[], &[ROOT.to_string()], UID, UP, &fs).is_empty());
-        // and an entry outside every root is never claimed, whatever it names
         let outside = Held {
             path: "/private/tmp/other/ms-aa11.sock.lease".into(),
             ..rec[0].clone()
@@ -849,20 +778,11 @@ mod tests {
             .collect()
     }
 
-    /// A LISTING BEFORE UP AND AFTER DOWN SHOWS WHAT IS LEFT, whatever the
-    /// witness saw: an entry new since up is left unless it names a live Muse
-    /// Code outside the jail (a lease's `pid`, a record's
-    /// `process_generation_hint`, the socket of such a lease) or is the
-    /// registry's shared structure a first run makes. NEGATIVE CONTROLS: an
-    /// entry of no known shape, a socket whose lease is gone, entries naming
-    /// a dead pid, a `sessions` that is no directory and a lock that is no
-    /// file are left; an entry gone since the listing, an entry outside the
     /// root and one unchanged since up are not counted.
     #[test]
     fn a_listing_before_up_and_after_down_shows_what_is_left() {
         let mut fs = Fake::default();
         let mut before = BTreeSet::new();
-        // the registry as it stood before up: its structure and the owner's live Muse Code (pid 777)
         fs.put(ROOT, 1, Kind::Other, "");
         fs.put(&format!("{ROOT}/sessions"), 2, Kind::Other, "");
         fs.put(&format!("{ROOT}/{LOCK}"), 3, Kind::File, "");
@@ -876,7 +796,6 @@ mod tests {
             ino: h.ino,
         }));
         let mut after = before.clone();
-        // left by this run's Muse Code (pid 4242, dead), and a temporary file of no known shape
         for h in muse(&mut fs, 4242, "aa11", "mine", 10) {
             after.insert(Entry {
                 path: h.path,
@@ -886,7 +805,6 @@ mod tests {
         }
         fs.put(&format!("{ROOT}/ms-aa11.sock.tmp"), 40, Kind::File, "");
         after.insert(ent("ms-aa11.sock.tmp", 40));
-        // another lab's live Muse Code (pid 778), and the owner's record rewritten in place (a new inode)
         for h in muse(&mut fs, 778, "cc33", "other", 30) {
             after.insert(Entry {
                 path: h.path,
@@ -901,7 +819,6 @@ mod tests {
             .ino = 23;
         after.remove(&ent("sessions/theirs.json", 22));
         after.insert(ent("sessions/theirs.json", 23));
-        // a socket whose lease is gone, an entry gone since the listing, one outside the root
         fs.put(&format!("{ROOT}/ms-ee55.sock"), 50, Kind::Socket, "");
         after.insert(ent("ms-ee55.sock", 50));
         after.insert(ent("ms-ff66.sock.lease", 60));
@@ -934,12 +851,10 @@ mod tests {
             ]
         );
         assert!(got.shared.is_empty());
-        // the control: nothing new, nothing counted
         assert_eq!(
             new_since(&before, &before, &[ROOT.to_string()], &fs, &alive),
             Since::default()
         );
-        // a first run made the registry: its root, `sessions` and the lock are shared structure, unless of another kind
         let none = BTreeSet::new();
         let first: BTreeSet<Entry> = [ent("", 1), ent("sessions", 2), ent(LOCK, 3)].into();
         let got = new_since(&none, &first, &[ROOT.to_string()], &fs, &alive);
@@ -952,7 +867,6 @@ mod tests {
         assert_eq!(rels(&got.left), [LOCK, "sessions"]);
     }
 
-    /// Only the three shapes Muse Code makes per process are ever taken: a
     /// name with a path too many, a dot file or a non-hex endpoint is not.
     #[test]
     fn only_a_lease_its_socket_and_a_session_record_have_a_shape() {
@@ -978,7 +892,7 @@ mod tests {
             assert_eq!(shape(not), None, "{not}");
         }
     }
-    /// Actual traversal/recheck/post-down verdict: clean and absent are known;
+
     /// stat, directory and claimed-file errors cannot certify an absence.
     #[test]
     fn a_runtime_absence_needs_every_listing_and_recheck() {
@@ -1009,11 +923,9 @@ mod tests {
             judge(&clean, &dirty, std::slice::from_ref(&h), &fs),
             Verdict::Fail
         );
-        // A genuinely absent claimed file does not count as an unknown read.
         let missing = held(7, 3, "ms-bb.sock");
         assert!(standing_with(std::slice::from_ref(&missing), &fs).complete);
         let mut unexpected = Vec::new();
-        // Each error used to disappear from an ordinary empty/clean result.
         fs.stat_errors.insert(ROOT.to_string());
         let unknown = listing_with(&roots, &fs);
         if judge(&clean, &unknown, &[], &fs) != Verdict::Unproven {
@@ -1036,7 +948,6 @@ mod tests {
         if judge(&clean, &clean, std::slice::from_ref(&h), &fs) != Verdict::Unproven {
             unexpected.push("claimed file");
         }
-        // A directory iterator can keep positive entries and still report an error.
         fs.stat_errors.clear();
         let saved = fs.at.remove(&h.path).unwrap();
         fs.entry_errors.insert(ROOT.to_string());
@@ -1051,7 +962,6 @@ mod tests {
             Verdict::Fail
         );
         fs.entry_errors.clear();
-        // Known positive evidence still fails even with an unrelated unknown.
         fs.stat_errors.clear();
         fs.stat_errors.insert(missing.path.clone());
         let both = [h, missing];

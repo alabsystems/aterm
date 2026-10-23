@@ -14,6 +14,7 @@ use crate::session_store::SessionHandle;
 const CLAUDE: Option<aterm_phase::Program> = Some(aterm_phase::Program::Claude);
 
 /// `h`'s session with `claude` in front under the root shell, its agent run
+/// open and busy (its turn open).
 fn claude_busy(h: &SessionHandle) {
     let mut g = h.ctx.timeline.lock().unwrap();
     g.note_root_group(100);
@@ -63,6 +64,7 @@ fn harness_approve(h: &SessionHandle) -> InputMark {
 }
 
 /// T1's bound: two of the sweep's agent reads at least, so the read that
+/// saw the box go is inside it.
 #[test]
 fn step_act_ms_spans_two_agent_reads() {
     let read = crate::session_status::AGENT_MIN_INTERVAL.as_millis();
@@ -74,6 +76,8 @@ fn step_act_ms_spans_two_agent_reads() {
 }
 
 /// T1 (`ActBindsNextBox`, through the real `InputMark::finish`): an approve
+/// admitted under box 1 whose bytes were written after one screen read
+/// replaced box 1 with box 2 binds neither: both close `passed` by nobody.
 #[cfg(unix)]
 #[test]
 fn an_act_accepted_after_its_box_was_replaced_binds_neither_box() {
@@ -108,6 +112,9 @@ fn an_act_accepted_after_its_box_was_replaced_binds_neither_box() {
 }
 
 /// T2: a person's key that found the timeline held (`note_person`'s
+/// `try_lock` failed) still attributes: the sweep's observe of the box the
+/// key dismissed delivers it first, so the box the harness had approved
+/// closes `by=human out=passed`.
 #[cfg(unix)]
 #[test]
 fn a_person_key_that_found_the_timeline_held_still_attributes() {
@@ -144,6 +151,9 @@ fn a_person_key_that_found_the_timeline_held_still_attributes() {
 }
 
 /// One control input from `actor` with `act`, admitted under an approval
+/// box (or, `question`, a question) that is still open when its bytes are
+/// written (`open`), or that a screen read closed in between, through the
+/// real `InputMark::finish`.
 fn acted_input(
     actor: Actor,
     act: Option<ActWord>,
@@ -210,6 +220,7 @@ fn acted_input(
 }
 
 /// T1's matrix, through the real `InputMark::finish`: every actor × act ×
+/// step × open-or-closed.
 #[cfg(unix)]
 #[test]
 fn every_actor_act_and_step_closes_by_the_input_bound_to_it() {
@@ -258,6 +269,9 @@ fn every_actor_act_and_step_closes_by_the_input_bound_to_it() {
 }
 
 /// T39 through T2's reconcile: the person's first key after delivered mail,
+/// which found the timeline held (`note_person`'s `try_lock` failed), is
+/// still a `human` mark after the mail's, written by the next entry that
+/// reaches the log (here the sweep's agent read).
 #[cfg(unix)]
 #[test]
 fn a_persons_first_key_after_mail_is_marked_though_the_timeline_was_held() {
@@ -299,6 +313,11 @@ fn a_persons_first_key_after_mail_is_marked_though_the_timeline_was_held() {
 }
 
 /// T2's second case (deferred to 5D-5): delivered mail,
+/// then the person's key that found the timeline held, then a later `ctl
+/// turn`: the turn is not the mail's. The held key is the `human` mark
+/// between the two, written by the `ctl turn`'s own reconcile before the
+/// exchange reaches the tracker, and the fold forgets the waiting mail at
+/// it.
 #[cfg(unix)]
 #[test]
 fn a_held_persons_key_after_mail_links_no_later_ctl_turn() {
@@ -359,6 +378,8 @@ fn a_held_persons_key_after_mail_links_no_later_ctl_turn() {
 }
 
 /// THE MAIL A TURN PROBABLY ANSWERED, IN THE VERBS' BRIEFS:
+/// delivered `kind=task` mail, then a `ctl turn` that
+/// names no cause.
 #[cfg(unix)]
 #[test]
 fn the_brief_verbs_name_the_task_mail_a_ctl_turn_probably_answered() {
@@ -416,6 +437,9 @@ fn the_brief_verbs_name_the_task_mail_a_ctl_turn_probably_answered() {
 }
 
 /// The approval box's close after a harness's `approve` (accepted through
+/// the real `InputMark::finish`) and then a person's gesture `ev` through the
+/// seam's class ([`crate::app_input::note_person_event`], no mouse tracking,
+/// the primary screen).
 #[cfg(unix)]
 fn close_after_a_gesture(ev: &crate::input::InputEvent) -> (Option<&'static str>, Actor) {
     let (h, _reader) = testing::owned_handle(0);
@@ -433,6 +457,8 @@ fn close_after_a_gesture(ev: &crate::input::InputEvent) -> (Option<&'static str>
 }
 
 /// A person's gestures, each as the seam receives it: a wheel, a view
+/// scroll, a selecting drag and a click (none reaches a program that
+/// tracks no mouse), and the key `y`.
 fn gestures() -> ([crate::input::InputEvent; 4], crate::input::InputEvent) {
     use crate::input::{InputEvent, PixelOffset, ScrollIntent};
     let wheel = InputEvent::Wheel {
@@ -478,6 +504,9 @@ fn gestures() -> ([crate::input::InputEvent; 4], crate::input::InputEvent) {
 }
 
 /// T1, A GESTURE THAT REACHES NO PROGRAM DISMISSES NO BOX: after the
+/// harness's approve, a person's wheel over the viewport, view scroll,
+/// selecting drag or click leaves the box the harness's (`approved`); only
+/// a gesture that wrote the program bytes is the person's dismissal.
 #[cfg(unix)]
 #[test]
 fn a_gesture_that_reaches_no_program_dismisses_no_box() {
@@ -493,6 +522,8 @@ fn a_gesture_that_reaches_no_program_dismisses_no_box() {
 }
 
 /// T39, A GESTURE THAT REACHES NO PROGRAM ANSWERS NO MAIL: delivered mail,
+/// then (inside a running burst) a person's wheel, view scroll, drag and
+/// click write no `human` mark after it; the key after them writes one.
 #[test]
 fn a_gesture_that_reaches_no_program_answers_no_mail() {
     let h = crate::session_store::test_handle(32);
@@ -528,6 +559,8 @@ fn a_gesture_that_reaches_no_program_answers_no_mail() {
 }
 
 /// THE MAIL LATCH CROSSES A SEAMLESS UPDATE:
+/// mail delivered, then an update before the person touched the
+/// session.
 #[test]
 fn a_persons_first_input_after_an_update_answers_mail_delivered_before_it() {
     let marks_after_handoff = |mailed: bool| {
@@ -587,12 +620,17 @@ fn a_persons_first_input_after_an_update_answers_mail_delivered_before_it() {
 }
 
 /// THE VIEW AGAINST THE RING, IN ORDER (the review of 6F-8): the log's
+/// records of the exact pairs, projected, are the ring's rows of them, row
+/// for record, in order; a `human` row stands where its mark stands, before
+/// the row of the entry whose reconcile delivered the key.
 fn assert_the_view_is_the_ring(g: &crate::session_timeline::SessionTimeline) {
     let (view, ring) = crate::session_log::observed::overlap_tests::exact_view_and_ring(g);
     assert_eq!(view, ring, "the view's order is the ring's");
 }
 
 /// THE VIEW'S `human` ROWS AGAINST THE RING'S:
+/// the ring's `human` rows and the burst marks (every `human` mark but the
+/// mail latch's own, `why=mail`), as counts.
 fn human_rows_and_burst_marks(g: &crate::session_timeline::SessionTimeline) -> (usize, usize) {
     let rows = g.since(None).filter(|e| e.kind == "human").count();
     let marks = g
@@ -606,6 +644,10 @@ fn human_rows_and_burst_marks(g: &crate::session_timeline::SessionTimeline) -> (
 }
 
 /// T2, ONE COUNT DELIVERED ONCE: delivered mail; a person's key that opens
+/// a burst is counted (`note_reaching`, `note_person`'s first half); a
+/// reconciling entry (the status sweep's agent publication) wins the
+/// timeline and delivers it; then the key's own delivery
+/// (`deliver_noted`, its second half) runs.
 #[test]
 fn a_persons_key_a_reconcile_delivered_first_is_marked_once() {
     let h = crate::session_store::test_handle(33);
@@ -646,6 +688,10 @@ fn a_persons_key_a_reconcile_delivered_first_is_marked_once() {
 }
 
 /// T2, A RECONCILE INSIDE A PERSON'S NOTE: delivered mail; a person's key
+/// that opens a burst is counted, and before its class is published (the
+/// one gap in `note_reaching_split`) a reconciling entry (the status
+/// sweep's agent publication) wins the timeline; then the class lands and
+/// the key's own delivery (`deliver_noted`) runs.
 #[test]
 fn a_reconcile_inside_a_persons_note_marks_the_key_once() {
     let h = crate::session_store::test_handle(34);
@@ -687,6 +733,10 @@ fn a_reconcile_inside_a_persons_note_marks_the_key_once() {
 }
 
 /// T2, A MAIL DELIVERY'S RECONCILE (the review of 6F-8): delivered mail; a
+/// person's key that opens a burst is counted; a second mail's delivery
+/// wins the timeline (the fabric's one hook, `record_fact`) and its
+/// reconcile delivers the key, writing the burst's `human` mark before the
+/// second mail's; then the key's own delivery (`deliver_noted`) runs.
 #[test]
 fn a_persons_key_a_mail_delivery_reconciled_first_keeps_the_rings_order() {
     let h = crate::session_store::test_handle(36);
@@ -736,6 +786,11 @@ fn a_persons_key_a_mail_delivery_reconciled_first_keeps_the_rings_order() {
 }
 
 /// T39, A BURST A GESTURE THAT REACHES NO PROGRAM OPENS ANSWERS NO MAIL:
+/// Claude at rest, mail delivered, and the person's first gesture (a burst
+/// opens: the usual moment mail is waiting) is a wheel the program is not
+/// sent: over the viewport, under X10 tracking (press-only), or horizontal
+/// on the alternate screen under DEC 1007 with no tracking (alternate
+/// scroll is vertical only; the host turns DEC 1007 on for every session).
 #[cfg(unix)]
 #[test]
 fn a_burst_a_gesture_that_reaches_no_program_opens_answers_no_mail() {
@@ -839,6 +894,7 @@ fn a_burst_a_gesture_that_reaches_no_program_opens_answers_no_mail() {
 }
 
 /// The class of `ev`, by an exhaustive match: a class added to the seam
+/// fails to build here until [`every_event`] drives it through the table.
 fn class_of(ev: &crate::input::InputEvent) -> &'static str {
     use crate::input::InputEvent as E;
     match ev {
@@ -857,6 +913,16 @@ fn class_of(ev: &crate::input::InputEvent) -> &'static str {
 }
 
 /// Every [`crate::input::InputEvent`] class, each in the shapes whose bytes
+/// differ by mode: keys pressed, repeated and released (a character, an
+/// arrow, Enter, Backspace, a keypad digit and the keypad's Enter, a bare
+/// modifier and a lock that legacy encodes to nothing, plain and with Ctrl,
+/// Alt and Meta), committed text (a control character that kitty's
+/// report-all-keys encodes to nothing, an empty one), a key sequence and an
+/// empty one, mouse presses and releases of three buttons, drags and a
+/// hover, wheels in all four directions with no modifier, Shift and Alt, a
+/// detent and a precise row of one and three lines, a view scroll, pastes
+/// under every framing (text, a line break, and controls only, which the
+/// sanitizer empties), two geometry changes and focus.
 fn every_event() -> Vec<crate::input::InputEvent> {
     use crate::input::{InputEvent, PasteFraming, PixelOffset, ScrollIntent};
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
@@ -976,9 +1042,17 @@ fn every_event() -> Vec<crate::input::InputEvent> {
 }
 
 /// A paste the sanitizer empties: ESC, a C1 CSI and ETX, no character it
+/// keeps.
 const CONTROLS_ONLY: &str = "\x1b\u{9b}\x03";
 
 /// The mode-mirror states of the table, each the bytes a program writes to
+/// set it: no mode; X10, normal, button-event (SGR) and any-event tracking;
+/// the alternate screen without and with DEC 1007, and with DECCKM, X10 or
+/// normal tracking or kitty's every flag on top; focus reporting; bracketed
+/// paste; and each keyboard mode the encoder reads: DECCKM, DECKPAM, VT52,
+/// xterm's modifyOtherKeys 1 and 2 and formatOtherKeys, DECBKM,
+/// altSendsEscape reset, metaSendsEscape, numLock reset, and kitty's
+/// flags 1, 2, 4, 8 and 16 alone and every flag.
 const MIRROR_STATES: [(&str, &[u8]); 29] = [
     ("none", b""),
     ("x10", b"\x1b[?9h"),
@@ -1012,6 +1086,13 @@ const MIRROR_STATES: [(&str, &[u8]); 29] = [
 ];
 
 /// 6A-4 (F10's remainder), WHAT REACHES THE PROGRAM IS WHAT THE
+/// SEAM SENDS, ON EVERY PLATFORM: every person gesture of every
+/// [`crate::input::InputEvent`] class ([`every_event`]), on a fresh terminal
+/// in every mode-mirror state ([`MIRROR_STATES`]), under every platform's
+/// wheel rule ([`crate::input::WheelPlatform::ARMS`]: macOS, the free
+/// desktops, Windows at three lines, "wheel scrolling off" and a page),
+/// goes through the real seam (`input::seam_encode_on`, the one seam core,
+/// the bytes it produced).
 #[test]
 fn what_reaches_the_program_is_what_the_seam_sends_on_every_platform() {
     use crate::input::{InputEvent, WheelPlatform};
@@ -1111,6 +1192,12 @@ fn what_reaches_the_program_is_what_the_seam_sends_on_every_platform() {
 }
 
 /// THE LAW'S ONE EXCEPTION, PINNED (`human_input::reaches_program`'s THE
+/// LAW): under each tracking mode that reports a drag, on one terminal, a
+/// press reaches the program and writes its report; a drag that stays in
+/// the press's cell writes nothing (the encoder's per-cell memo, under the
+/// lock), while the classifier, which reads only the mirror, says it
+/// reached; a drag into the next cell writes and reaches; and a drag back
+/// into that cell again writes nothing.
 #[test]
 fn a_drag_in_its_reports_cell_writes_nothing_and_its_report_had_reached() {
     use crate::input::{InputEvent, PixelOffset, WheelPlatform};

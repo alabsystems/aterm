@@ -1,41 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The GL arm's swapchain: a `GLXWindow` on an X11 window, an EGL window
-//! surface on a Wayland surface, and the present that posts a frame to it.
-//!
-//! A present composes into a stand-in texture the surface owns (the arm's
-//! textures store their top row at row 0; see `super` "Coordinates"), then
-//! [`GlWindowSurface::present`] makes the window surface current, copies the
-//! stand-in into the back buffer with `glBlitFramebuffer`, flipping rows (a
-//! window's default framebuffer counts rows from the bottom), and swaps. The
-//! stand-in is also what the video tap and the presented snapshot read, so
-//! they see exactly the posted bytes.
-//!
-//! * X11 on a GLX device (`super::glx`): `glXCreateWindow` on the window's
-//!   XID with the context's config, whose visual must be the window's. The
-//!   window follows its X11 window's size by itself. GLX reports a failed
-//!   swap or window only as an X error, which the windowing crate logs, so
-//!   the present reads its failures from the binds: a window GLX keeps
-//!   refusing to bind latches the device lost ([`bind_failure_is_loss`]),
-//!   and so does a reset the context reports (`Current::poll_reset`, asked
-//!   at every GLX present before its blit), where either once left the window
-//!   frozen on its last frame with every present dropped.
-//! * X11 on an EGL device, which `GlDevice::on_window_system` no longer
-//!   makes (an X11 device is GLX's or none): `eglCreatePlatformWindowSurface`
-//!   on the window's XID, with the config whose native visual is the
-//!   window's (an EGL surface must match its window's visual). The surface
-//!   follows the window's size by itself.
-//! * Wayland: a `wl_egl_window` from `libwayland-egl.so.1` (opened with
-//!   `dlopen`, like EGL) wraps the `wl_surface`; a resize resizes it.
-//!
-//! The swap interval is the present mode: 1 (wait for the refresh, tear-free)
-//! on an X11 screen no compositing manager composites, where an
-//! unsynchronized post can tear; 0 under an X11 compositing manager, which
-//! composites at its own refresh (a synchronized swap there only blocks the
-//! posting thread, a refresh per window); 0 on Wayland, where the compositor
-//! never tears and a synchronized swap would block on a frame callback a
-//! hidden window never gets.
+//! GL swapchain (`GLXWindow` on X11, EGL window surface on Wayland) and frame presentation
+//! ([`GlWindowSurface::present`], [`bind_failure_is_loss`]). On NVIDIA's GLX under a
+//! compositing manager a window has no `GLXWindow`, which stalls the X server and the GPU
+//! for every client 57 to 90 ms a resize there: its stand-in is read back, only what changed
+//! since the last post, into the frontend's presenter for it ([`crate::FrameSink`]).
 
 use std::ffi::{CStr, c_int, c_void};
 use std::sync::Arc;
@@ -63,8 +33,7 @@ fn window_fns(egl: &EglBinding) -> Result<&'static EglWindowFns, String> {
     static FNS: std::sync::OnceLock<Result<EglWindowFns, String>> = std::sync::OnceLock::new();
     let egl = egl.egl;
     FNS.get_or_init(|| {
-        // SAFETY: eglGetProcAddress returns null or the named function, whose
-        // registry signature the table declares.
+        // SAFETY: eglGetProcAddress returns null or the named function with the registry signature.
         unsafe {
             EglWindowFns::load(&mut |sym: &CStr| -> *const c_void {
                 (egl.fns.get_proc_address)(sym.as_ptr())
@@ -90,7 +59,7 @@ impl WaylandEgl {
     }
 
     fn open() -> Result<WaylandEgl, String> {
-        // SAFETY: a NUL-terminated library name; the handle is never closed.
+        // SAFETY: A NUL-terminated library name; the handle is never closed.
         let handle = unsafe { libc::dlopen(c"libwayland-egl.so.1".as_ptr(), libc::RTLD_LAZY) };
         if handle.is_null() {
             return Err("gl: no libwayland-egl.so.1 on this machine".to_owned());
@@ -112,7 +81,7 @@ impl WaylandEgl {
             sym(c"wl_egl_window_destroy")?,
             sym(c"wl_egl_window_resize")?,
         );
-        // SAFETY: the three symbols' signatures from wayland-egl-core.h.
+        // SAFETY: The three symbols' signatures from wayland-egl-core.h.
         unsafe {
             Ok(WaylandEgl {
                 create: std::mem::transmute::<
@@ -137,12 +106,14 @@ enum Post {
     Egl {
         fns: &'static EglWindowFns,
         surface: EGLSurface,
-        /// The `wl_egl_window` the surface draws into (null on X11),
-        /// destroyed after the EGL surface.
+        /// The `wl_egl_window` the surface draws into (null on X11).
         wl_window: *mut c_void,
     },
     /// A `GLXWindow` of the device's GLX context, on the X11 window `xid`.
     Glx { window: GLXDrawable, xid: u64 },
+    /// No window surface: the stand-in read back into the frontend's
+    /// presenter (the module header's NVIDIA bullet).
+    Readback { sink: Box<dyn crate::FrameSink> },
 }
 
 /// One window's surface, its stand-in and its present mode.
@@ -152,25 +123,23 @@ pub(crate) struct GlWindowSurface {
     /// The size the window was last configured to.
     width: u32,
     height: u32,
-    /// The swap interval (see the module header) and whether the surface has
-    /// been given it (it is set with the surface current, at the first post).
+    /// The swap interval (see the module header) and whether the surface has been given it.
     interval: i32,
     interval_set: bool,
     /// The texture a present composes into, at the configured size.
     standin: Option<GlTexture>,
-    /// The GLX window's failed binds since its last good one, and whether it
-    /// ever bound ([`bind_failure_is_loss`]).
+    /// The GLX window's failed binds since its last good one, and whether it ever bound.
     bind_failures: u32,
     bound: bool,
-    /// A test's answers for the back buffer's size in place of the window
-    /// system's, which lag the buffer as NVIDIA's GLX answer can:
-    /// `asked_size` at every ask, `asked_once` at the next one only.
+    /// A test's answers for the back buffer's size in place of the window.
     #[cfg(test)]
     pub(crate) asked_size: Option<(i32, i32)>,
     #[cfg(test)]
     pub(crate) asked_once: std::cell::Cell<Option<(i32, i32)>>,
-    /// The window the surface draws into, held so it outlives the surface
-    /// (dropped after it).
+    /// A test's order to read a post by readback as `GL_RGBA` (and swap red and blue).
+    #[cfg(test)]
+    pub(crate) read_rgba: bool,
+    /// The window the surface draws into, held so it outlives the surface (dropped after it).
     _window: Box<dyn std::any::Any + Send + Sync>,
 }
 
@@ -190,18 +159,7 @@ const BIND_FAILURES_LOST: u32 = 3;
 /// Whether a GLX window's failed bind latches the device lost, after
 /// `in_a_row` failed binds (this one counted) of a window that `bound_before`
 /// or never did, with the context still binding its own pbuffer
-/// (`context_binds`) or not. A window GLX keeps refusing would otherwise drop
-/// every present while the frontend waits for a loss that never latches, the
-/// window frozen; a lost device sends it to the CPU renderer.
-///
-/// * The context binds nowhere: the context, or the server under it, is gone.
-/// * The window never bound: it never showed a frame and never will
-///   (NVIDIA's `glXCreateWindow` answers a window and fails later).
-/// * [`BIND_FAILURES_LOST`] presents in a row failed: the failure persists.
-///
-/// One failure of a window that posted before kills nothing: a window in
-/// teardown can be refused once. Its dropped present requests a bounded retry
-/// so an otherwise quiet window can reach this threshold too.
+/// (`context_binds`) or not.
 const fn bind_failure_is_loss(in_a_row: u32, bound_before: bool, context_binds: bool) -> bool {
     !context_binds || !bound_before || in_a_row >= BIND_FAILURES_LOST
 }
@@ -233,7 +191,7 @@ fn window_configs(shared: &GlShared, b: &EglBinding) -> Result<Vec<EGLConfig>, S
     ];
     let mut configs = [std::ptr::null_mut(); 64];
     let mut n = 0;
-    // SAFETY: an initialized display, a terminated list, room for 64.
+    // SAFETY: An initialized display, a terminated list, room for 64.
     let ok = unsafe {
         (egl.fns.choose_config)(
             b.display,
@@ -253,7 +211,7 @@ fn window_configs(shared: &GlShared, b: &EglBinding) -> Result<Vec<EGLConfig>, S
 /// One attribute of `config`.
 fn config_attrib(b: &EglBinding, fns: &EglWindowFns, config: EGLConfig, attrib: EGLint) -> EGLint {
     let mut v = 0;
-    // SAFETY: a config of this display and a live out-pointer.
+    // SAFETY: A config of this display and a live out-pointer.
     unsafe {
         (fns.get_config_attrib)(b.display, config, attrib, &raw mut v);
     }
@@ -264,8 +222,7 @@ fn config_attrib(b: &EglBinding, fns: &EglWindowFns, config: EGLConfig, attrib: 
 /// when it has one (a surface must share it); else the configs whose colour
 /// buffer is exactly RGB888 (`EGL_RED_SIZE` is a minimum, so the display also
 /// lists 10-bit configs; a 2101010 back buffer would rescale every byte the
-/// stand-in carries), with alpha 0 or 8. On X11 the window's visual comes
-/// first; on Wayland the opaque (alpha-less) configs do.
+/// stand-in carries), with alpha 0 or 8.
 fn candidate_configs(
     shared: &GlShared,
     b: &EglBinding,
@@ -305,14 +262,15 @@ fn candidate_configs(
 }
 
 impl GlWindowSurface {
-    /// Make the window surface for `native` on `dev`, whose display must be
-    /// the window's (`GlDevice::on_window_system`), at `width` x `height`.
+    /// Make the window surface for `native` on `dev`; a window posted by readback
+    /// ([`Post::Readback`], where [`readback_wanted_on`] says so) is posted through `sink`.
     pub(crate) fn create(
         dev: &GlDevice,
         native: NativeWindow,
         width: u32,
         height: u32,
         window: Box<dyn std::any::Any + Send + Sync>,
+        sink: Option<Box<dyn crate::FrameSink>>,
     ) -> Result<Self, String> {
         let shared = dev.shared();
         let ws = shared
@@ -324,6 +282,28 @@ impl GlWindowSurface {
             _ => return Err("gl: the window is not on the device's window system".to_owned()),
         }
         let (w, h) = (width.max(1), height.max(1));
+        // On X11 a post waits for the refresh (interval 1) so it never tears,
+        // unless a compositing manager composites the window at its own
+        // refresh: a synchronized swap then paces nothing the compositor does
+        // not already, and it blocks the posting thread for a refresh per
+        // window, so every window shared one refresh (three windows streaming
+        // output posted 20 frames a second each, the main thread 99.8% in
+        // swaps; mutter on an NVIDIA Xorg, 2026-10-22). The frontend's frame
+        // clock paces the posts either way.
+        let composited = match (native, ws) {
+            (NativeWindow::X11 { .. }, WindowSystem::X11 { display, screen }) => {
+                #[cfg(not(wgpu_arm))]
+                let composited = super::glx::composited(display as *mut c_void, screen);
+                #[cfg(wgpu_arm)]
+                let composited = {
+                    let _ = (display, screen);
+                    false
+                };
+                Some(composited)
+            }
+            _ => None,
+        };
+        let mut interval = composited.map_or(0, |composited| i32::from(!composited));
         let post = match shared.glx() {
             Some(glx) => {
                 let NativeWindow::X11 {
@@ -333,33 +313,19 @@ impl GlWindowSurface {
                 else {
                     return Err("gl: a GLX device posts only to X11 windows".to_owned());
                 };
-                Post::Glx {
-                    window: glx.create_window(xid, visual)?,
-                    xid,
+                match sink.and_then(attached) {
+                    Some(sink) => {
+                        // Nothing swaps.
+                        interval = 0;
+                        Post::Readback { sink }
+                    }
+                    None => Post::Glx {
+                        window: glx.create_window(xid, visual)?,
+                        xid,
+                    },
                 }
             }
             None => Self::egl_post(shared, native, w, h)?,
-        };
-        // On X11 a post waits for the refresh (interval 1) so it never tears,
-        // unless a compositing manager composites the window at its own
-        // refresh: a synchronized swap then paces nothing the compositor does
-        // not already, and it blocks the posting thread for a refresh per
-        // window, so every window shared one refresh (three windows streaming
-        // output posted 20 frames a second each, the main thread 99.8% in
-        // swaps; mutter on an NVIDIA Xorg, 2026-10-22). The frontend's frame
-        // clock paces the posts either way.
-        let interval = match (native, ws) {
-            (NativeWindow::X11 { .. }, WindowSystem::X11 { display, screen }) => {
-                #[cfg(not(wgpu_arm))]
-                let composited = super::glx::composited(display as *mut c_void, screen);
-                #[cfg(wgpu_arm)]
-                let composited = {
-                    let _ = (display, screen);
-                    false
-                };
-                i32::from(!composited)
-            }
-            _ => 0,
         };
         Ok(Self {
             shared: Arc::clone(shared),
@@ -375,6 +341,8 @@ impl GlWindowSurface {
             asked_size: None,
             #[cfg(test)]
             asked_once: std::cell::Cell::new(None),
+            #[cfg(test)]
+            read_rgba: false,
             _window: window,
         })
     }
@@ -391,7 +359,7 @@ impl GlWindowSurface {
         };
         let wl_window = match (native, wl) {
             (NativeWindow::Wayland { surface }, Some(wl)) => {
-                // SAFETY: the caller's live `wl_surface*`; positive size.
+                // SAFETY: The caller's live `wl_surface*`; positive size.
                 let p = unsafe { (wl.create)(surface, w as c_int, h as c_int) };
                 if p.is_null() {
                     return Err("gl: wl_egl_window_create failed".to_owned());
@@ -414,9 +382,7 @@ impl GlWindowSurface {
         let mut surface = ffi::EGL_NO_SURFACE;
         let mut last_err = String::new();
         for config in candidate_configs(shared, b, fns, native)? {
-            // SAFETY: a config of this display, the native window (alive for
-            // the call; EGL reads the XID or keeps the wl_egl_window, which
-            // outlives the surface), and a terminated attribute list.
+            // SAFETY: A config of this display, the native window.
             surface = unsafe {
                 (fns.create_platform_window_surface)(
                     b.display,
@@ -432,7 +398,7 @@ impl GlWindowSurface {
         }
         if surface == ffi::EGL_NO_SURFACE {
             if let Some(wl) = wl {
-                // SAFETY: the window made above, unused.
+                // SAFETY: The window made above, unused.
                 unsafe { (wl.destroy)(wl_window) };
             }
             return Err(last_err);
@@ -450,17 +416,16 @@ impl GlWindowSurface {
         self.interval > 0
     }
 
-    /// The `GLXWindow` a present binds (`None` on an EGL surface), for a test
-    /// that destroys it behind the surface's back.
+    /// The `GLXWindow` a present binds (`None` on an EGL surface).
     #[cfg(test)]
     pub(crate) const fn glx_window(&self) -> Option<GLXDrawable> {
         match self.post {
             Post::Glx { window, .. } => Some(window),
-            Post::Egl { .. } => None,
+            Post::Egl { .. } | Post::Readback { .. } => None,
         }
     }
 
-    /// Move to `width` x `height`; the next present composes and posts at it.
+    /// Move to `width` x `height`.
     pub(crate) fn resize(&mut self, width: u32, height: u32) {
         let (w, h) = (width.max(1), height.max(1));
         if (w, h) == (self.width, self.height) {
@@ -471,18 +436,17 @@ impl GlWindowSurface {
                 if !wl_window.is_null()
                     && let Ok(wl) = WaylandEgl::get()
                 {
-                    // SAFETY: the window this surface draws into.
+                    // SAFETY: The window this surface draws into.
                     unsafe { (wl.resize)(*wl_window, w as c_int, h as c_int, 0, 0) };
                 }
             }
-            Post::Glx { .. } => {}
+            Post::Glx { .. } | Post::Readback { .. } => {}
         }
         self.width = w;
         self.height = h;
     }
 
-    /// The stand-in at the configured size, minted on `dev` on first use and
-    /// after a resize.
+    /// The stand-in at the configured size, minted on `dev` on first use and after a resize.
     pub(crate) fn standin(&mut self, dev: &GlDevice) -> Result<&GlTexture, String> {
         let fits = self
             .standin
@@ -496,27 +460,41 @@ impl GlWindowSurface {
         Ok(self.standin.as_ref().expect("minted above"))
     }
 
-    /// Post the stand-in: bind the window surface, copy the stand-in into the
-    /// back buffer with its rows flipped and its top-left at the window's
-    /// top-left, and swap; where the window's size moved between the ask and
-    /// the swap, post again ([`REPOSTS`]). `fill` (`0xRRGGBB`, the frame's
-    /// background) covers any part of the back buffer past the size the
-    /// window system answered.
-    /// `Err` names the EGL, GLX or GL failure; a lost context, a reset one and
-    /// a GLX window that keeps refusing its bind are latched on the device.
-    pub(crate) fn present(&mut self, dev: &GlDevice, fill: u32) -> Result<(), GlPresentError> {
+    /// Bind the window surface, blit the stand-in, and swap; a window posted by readback
+    /// hands its presenter the stand-in's `damage` instead (what differs from the last post,
+    /// `None` all of it).
+    pub(crate) fn present(
+        &mut self,
+        dev: &GlDevice,
+        fill: u32,
+        damage: Option<[u32; 4]>,
+    ) -> Result<(), GlPresentError> {
         let standin = self
             .standin
             .as_ref()
             .ok_or("gl: a present with no composed stand-in")?;
         let cur = dev.enter()?;
+        if let Post::Readback { sink } = &mut self.post {
+            // Before anything is posted: a reset context's frame is not.
+            cur.poll_reset("present")?;
+            let fbo = standin.fbo(&cur)?;
+            let size = (standin.width, standin.height);
+            let bgra = dev.caps().bgra_read;
+            #[cfg(test)]
+            let bgra = bgra && !self.read_rgba;
+            return sink
+                .post(size.0, size.1, damage, &mut |words, rect| {
+                    read_standin(&cur, fbo, size, rect, bgra, words)
+                })
+                .map_err(|detail| GlPresentError {
+                    kind: SurfacePresentFailure::Unavailable,
+                    detail,
+                });
+        }
         // A refused interval keeps the driver's default; one note.
         let note = |e: String| {
             crate::stderr_line!("aterm-gpu (gl arm): {e}; keeping the driver's swap interval");
         };
-        // The back buffer's size: an X11 surface follows its window, which a
-        // window manager resizes before the frontend hears of it, so it can
-        // differ from the configured size and is asked at every post.
         let (sw, sh) = match &self.post {
             Post::Egl { fns, surface, .. } => {
                 cur.bind_window(*surface)?;
@@ -529,7 +507,6 @@ impl GlWindowSurface {
                     .egl_binding()
                     .ok_or("gl: an EGL window surface on a GLX device")?;
                 let (mut sw, mut sh) = (0, 0);
-                // SAFETY (both): a surface of this display and a live out-pointer.
                 unsafe {
                     (fns.query_surface)(b.display, *surface, ffi::EGL_WIDTH, &raw mut sw);
                     (fns.query_surface)(b.display, *surface, ffi::EGL_HEIGHT, &raw mut sh);
@@ -540,8 +517,6 @@ impl GlWindowSurface {
                 let glx = cur.glx().ok_or("gl: a GLX window on an EGL device")?;
                 if let Err(e) = glx.bind_window(*window) {
                     self.bind_failures = self.bind_failures.saturating_add(1);
-                    // Whether the context still binds at all: its own pbuffer
-                    // answers (and holds it until the guard releases it).
                     let context_binds = glx.make_current().is_ok();
                     if !bind_failure_is_loss(self.bind_failures, self.bound, context_binds) {
                         return Err(GlPresentError {
@@ -565,7 +540,6 @@ impl GlWindowSurface {
                 }
                 self.bind_failures = 0;
                 self.bound = true;
-                // Before anything is posted: a reset context's frame is not.
                 cur.poll_reset("present")?;
                 if !self.interval_set {
                     glx.swap_interval(*window, self.interval)
@@ -574,6 +548,7 @@ impl GlWindowSurface {
                 }
                 self.ask(glx, *xid)
             }
+            Post::Readback { .. } => unreachable!("posted by readback above"),
         };
         let (tw, th) = (standin.width as i32, standin.height as i32);
         let [_, r, g, b] = fill.to_be_bytes();
@@ -594,20 +569,10 @@ impl GlWindowSurface {
                     return cur.swap(fns, *surface).map_err(Into::into);
                 }
                 Post::Glx { window, xid } => (*window, *xid),
+                Post::Readback { .. } => unreachable!("posted by readback above"),
             };
             let glx = cur.glx().ok_or("gl: a GLX window on an EGL device")?;
             glx.swap(window);
-            // A resize that lands between the ask and the swap loses the
-            // frame: NVIDIA's GLX takes the window's new size at the swap and
-            // posts a fresh back buffer, black, which stays on screen until
-            // the next present (the desk, 2026-10-22: the whole window black
-            // for 60 to 400 ms in a burst of resizes, the back buffer reading
-            // black just after the blit). The size is asked again after the
-            // swap; where it moved, the context is bound afresh, so the driver
-            // takes the new size before the draw, and the stand-in posted
-            // again at once. A steady window pays the one ask, a round trip
-            // (with the one before the draw, as many as the two of
-            // `glXQueryDrawable` this replaced).
             if reposts == REPOSTS || self.ask(glx, xid) == asked {
                 return Ok(());
             }
@@ -649,14 +614,9 @@ fn draw_standin(
     fill: &[f32; 4],
 ) {
     let sw = if sw > 0 { sw } else { tw };
-    // The window's top row is its default framebuffer's last row.
     let top = if sh > 0 { sh } else { th };
     let gl = cur.gl();
-    // SAFETY: the context and the window surface are current; the
-    // stand-in's framebuffer is complete; the blit is colour-only and
-    // NEAREST between equal-sized rects (no filtering, no conversion: the
-    // back buffer and the stand-in are both linear RGBA8); each clear
-    // reads four floats for the one colour buffer.
+    // SAFETY: The context and the window surface are current.
     unsafe {
         (gl.disable)(ffi::GL_SCISSOR_TEST);
         if srgb_views {
@@ -665,14 +625,6 @@ fn draw_standin(
         (gl.color_mask)(ffi::GL_TRUE, ffi::GL_TRUE, ffi::GL_TRUE, ffi::GL_TRUE);
         (gl.bind_framebuffer)(ffi::GL_READ_FRAMEBUFFER, fbo);
         (gl.bind_framebuffer)(ffi::GL_DRAW_FRAMEBUFFER, 0);
-        // The back buffer can be larger than the answered size (the window
-        // grew after the ask, which a burst of resizes makes common), so
-        // the frame lands short and low in a buffer whose bytes past it
-        // read black (the desk's NVIDIA GLX, 2026-10-22: a strip one resize
-        // step wide at the right and at the top, until the next present).
-        // Right of that size and above it the buffer is cleared to the
-        // frame's background; where the answer is right, these scissors
-        // hold no pixel.
         (gl.enable)(ffi::GL_SCISSOR_TEST);
         for [x, y, w, h] in [[sw, 0, PAST, PAST], [0, top, sw, PAST]] {
             (gl.scissor)(x, y, w, h);
@@ -691,10 +643,6 @@ fn draw_standin(
             ffi::GL_COLOR_BUFFER_BIT,
             ffi::GL_NEAREST as u32,
         );
-        // A window larger than the stand-in (it grew before the frontend
-        // heard of it) would show the back buffer's undefined bytes past
-        // the frame: its right column, its bottom row and its corner pixel
-        // are stretched over them instead.
         let extend = |src: [i32; 4], dst: [i32; 4]| {
             (gl.blit_framebuffer)(
                 src[0],
@@ -723,36 +671,144 @@ fn draw_standin(
 
 impl Drop for GlWindowSurface {
     fn drop(&mut self) {
-        // The stand-in first (its GL names), then the surface, then the
-        // Wayland window under it.
         self.standin = None;
         match self.post {
             Post::Egl {
                 surface, wl_window, ..
             } => {
                 if let Some(b) = self.shared.egl_binding() {
-                    // SAFETY: a surface of this display; the arm never leaves
-                    // it current past a guard, so destroying it here is
-                    // immediate.
+                    // SAFETY: A surface of this display.
                     unsafe { (b.egl.fns.destroy_surface)(b.display, surface) };
                 }
                 if !wl_window.is_null()
                     && let Ok(wl) = WaylandEgl::get()
                 {
-                    // SAFETY: the window this surface drew into; the surface
-                    // is gone.
+                    // SAFETY: The window this surface drew into; the surface is gone.
                     unsafe { (wl.destroy)(wl_window) };
                 }
             }
-            // Never current past a guard either; the X11 window under it
-            // outlives it (`_window`).
             Post::Glx { window, .. } => {
                 if let Some(glx) = self.shared.glx() {
                     glx.destroy_window(window);
                 }
             }
+            // The presenter detaches itself.
+            Post::Readback { .. } => {}
         }
     }
+}
+
+/// Whether a window on a GLX whose server's vendor is `vendor` is posted by
+/// readback ([`Post::Readback`]): on NVIDIA's GLX under a compositing manager
+/// (`composited`), on a little-endian client (whose `GL_BGRA_EXT` bytes are
+/// `0x00RRGGBB` words); `forced` (`ATERM_GL_POST`, [`post_override`]) says
+/// `readback` or `window` in its place.
+fn readback_wanted(vendor: &str, composited: bool, forced: Option<&str>) -> bool {
+    match forced {
+        Some("readback") => true,
+        Some("window") => false,
+        _ => cfg!(target_endian = "little") && composited && vendor.starts_with("NVIDIA"),
+    }
+}
+
+/// Whether a window on `dev`'s X11 display is posted by readback
+/// ([`readback_wanted`] of its GLX's vendor and the screen's compositing).
+pub(crate) fn readback_wanted_on(dev: &GlDevice) -> bool {
+    let shared = dev.shared();
+    let (Some(glx), Some(WindowSystem::X11 { display, screen })) =
+        (shared.glx(), shared.window_system())
+    else {
+        return false;
+    };
+    #[cfg(not(wgpu_arm))]
+    let composited = super::glx::composited(display as *mut c_void, screen);
+    #[cfg(wgpu_arm)]
+    let composited = {
+        let _ = (display, screen);
+        false
+    };
+    readback_wanted(glx.server_vendor(), composited, post_override().as_deref())
+}
+
+/// The `ATERM_GL_POST=readback|window` development seam (trimmed): how an X11
+/// window on a GLX device is posted, whatever its vendor and its compositing.
+fn post_override() -> Option<String> {
+    aterm_types::dev_seam!("ATERM_GL_POST").map(|v| v.to_string_lossy().trim().to_owned())
+}
+
+/// `sink`, once it attached; a sink that cannot is noted, and its window gets
+/// a `GLXWindow`.
+fn attached(mut sink: Box<dyn crate::FrameSink>) -> Option<Box<dyn crate::FrameSink>> {
+    match sink.attach() {
+        Ok(()) => Some(sink),
+        Err(e) => {
+            crate::stderr_line!(
+                "aterm-gpu (gl arm): the window's presenter cannot attach ({e}); posting it \
+                 through a GLXWindow"
+            );
+            None
+        }
+    }
+}
+
+/// Read the rectangle `[x0, y0, x1, y1]` (half-open) of the stand-in (`tw` x
+/// `th`, its framebuffer `fbo`) into the same rectangle of `words`, the whole
+/// frame as `0x00RRGGBB` words, rows top first (the stand-in's row 0 is its
+/// top), `tw` words a row; the rest of `words` is left as it was.
+/// `GL_BGRA_EXT` where the context reads it (`bgra`), else `GL_RGBA` with red
+/// and blue swapped after.
+fn read_standin(
+    cur: &super::device::Current<'_>,
+    fbo: ffi::GLuint,
+    (tw, th): (u32, u32),
+    [x0, y0, x1, y1]: [u32; 4],
+    bgra: bool,
+    words: &mut [u32],
+) -> Result<(), String> {
+    if x0 >= x1 || y0 >= y1 || x1 > tw || y1 > th {
+        return Err(format!(
+            "gl: a read of {x0},{y0} to {x1},{y1} from a {tw}x{th} frame"
+        ));
+    }
+    let n = tw as usize * th as usize;
+    let len = words.len();
+    let words = words
+        .get_mut(..n)
+        .ok_or_else(|| format!("gl: a {tw}x{th} frame in a store of {len} words"))?;
+    let (rw, rh) = ((x1 - x0) as usize, (y1 - y0) as usize);
+    let first = y0 as usize * tw as usize + x0 as usize;
+    let gl = cur.gl();
+    // SAFETY: the context is current; the stand-in's framebuffer is complete
+    // and `tw` x `th`, and the rectangle inside it (checked above); a pack of
+    // alignment 4 and row length `tw` with no pack buffer writes `rh` rows of
+    // `rw` four-byte texels from `first`, `tw` apart, the last ending at
+    // `(y1 - 1) * tw + x1 <= tw * th`, inside `words`.
+    unsafe {
+        (gl.bind_buffer)(ffi::GL_PIXEL_PACK_BUFFER, 0);
+        (gl.bind_framebuffer)(ffi::GL_READ_FRAMEBUFFER, fbo);
+        (gl.pixel_storei)(ffi::GL_PACK_ALIGNMENT, 4);
+        (gl.pixel_storei)(ffi::GL_PACK_ROW_LENGTH, tw as c_int);
+        (gl.read_pixels)(
+            x0 as c_int,
+            y0 as c_int,
+            rw as c_int,
+            rh as c_int,
+            if bgra { ffi::GL_BGRA_EXT } else { ffi::GL_RGBA },
+            ffi::GL_UNSIGNED_BYTE,
+            words[first..].as_mut_ptr().cast(),
+        );
+        (gl.pixel_storei)(ffi::GL_PACK_ROW_LENGTH, 0);
+    }
+    cur.check("readback post")?;
+    if !bgra {
+        for row in words[first..].chunks_mut(tw as usize).take(rh) {
+            for w in &mut row[..rw] {
+                // Bytes R, G, B, A are the word 0xAABBGGRR here.
+                *w = (*w & 0xff00_ff00) | ((*w >> 16) & 0xff) | ((*w & 0xff) << 16);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The `ATERM_GPU_PRESENT_MODE=fifo|immediate` development seam, as the swap
@@ -788,13 +844,32 @@ fn present_interval_override() -> Option<i32> {
 mod tests {
     use super::*;
 
+    /// A window is posted by readback on NVIDIA's GLX under a compositing
+    /// manager and nowhere else (Mesa's GLX names its vendor `SGI`); the
+    /// development seam forces either way.
+    #[test]
+    fn only_nvidia_s_composited_glx_posts_by_readback() {
+        let little = cfg!(target_endian = "little");
+        assert_eq!(readback_wanted("NVIDIA Corporation", true, None), little);
+        assert!(
+            !readback_wanted("NVIDIA Corporation", false, None),
+            "no compositing manager"
+        );
+        assert!(!readback_wanted("SGI", true, None), "Mesa's GLX");
+        assert!(readback_wanted("SGI", false, Some("readback")));
+        assert!(!readback_wanted("NVIDIA Corporation", true, Some("window")));
+        assert_eq!(
+            readback_wanted("NVIDIA Corporation", true, Some("other")),
+            little,
+            "an unknown seam value is the default"
+        );
+    }
+
     /// A GLX window's failed bind latches the device lost when the failure
     /// persists ([`BIND_FAILURES_LOST`] presents in a row), when the window
     /// never bound, or when the context cannot bind its own pbuffer either;
     /// one or two failures of a window that posted before, with the context
-    /// still binding, only drop their presents. The live twin, a window whose
-    /// `GLXWindow` was destroyed, is `glx`'s
-    /// `a_window_glx_keeps_refusing_latches_the_device_lost`.
+    /// still binding, only drop their presents.
     #[test]
     fn a_glx_window_s_refused_bind_latches_once_it_persists() {
         assert_eq!(BIND_FAILURES_LOST, 3);

@@ -48,6 +48,7 @@ pub(crate) struct MachineId {
 }
 
 /// Alphanumerics kept, runs of anything else collapsed to one `-`, so a chip
+/// string is safe in a TSV column and readable in a diff.
 fn slug(s: &str) -> String {
     let mut out = String::new();
     let mut pending_sep = false;
@@ -110,6 +111,7 @@ fn platform_uuid() -> Option<String> {
 }
 
 /// The stable, non-identifying machine fingerprint — `None` when no platform
+/// UUID is readable, in which case the hostname is all we have.
 fn platform_fingerprint() -> Option<String> {
     let raw = platform_uuid()?;
     let t = raw.trim();
@@ -125,7 +127,7 @@ fn hostname() -> String {
         .unwrap_or_else(|| "unknown-host".to_string())
 }
 
-/// Chip + logical cores, e.g. `Apple-M5-Max-18c`. Recorded per row so a wrong
+/// Chip + logical cores, e.g. `Apple-M5-Max-18c`.
 fn machine_shape() -> String {
     let chip = if cfg!(target_os = "macos") {
         Command::new("sysctl")
@@ -284,6 +286,7 @@ fn head_sha() -> String {
 }
 
 /// The perf golden dir, relative to the workspace root: a `--record` rewrites its files
+/// before the trend rows are written, so its changes do not make the measured tree dirty.
 const GOLDEN_REL: &str = "crates/aterm-verify/perf/golden/";
 
 /// HEAD's short `sha`, with `+dirty` when `git status --porcelain` names a tracked file outside [`GOLDEN_REL`] that differs from HEAD (or could not be read), so a row measured on uncommitted code does not pass as HEAD's.
@@ -334,6 +337,8 @@ pub(crate) fn rfc3339(secs: u64) -> String {
 }
 
 /// Days past the Unix epoch as a UTC date, without a chrono dependency:
+/// civil-from-days (Howard Hinnant's algorithm, exact for the Gregorian
+/// calendar).
 fn civil_date(days: u64) -> String {
     let z = days as i64 + 719_468;
     let era = z.div_euclid(146_097);
@@ -534,6 +539,8 @@ pub(crate) fn judge_trend(
 }
 
 /// Which toolchain builds a lane's measurement binary — recorded per ledger row so
+/// cross-toolchain drift (a Trust-toolchain bump vs an upstream-stable bump) is
+/// never misread as a same-box perf change.
 fn toolchain_lane(lane: &str) -> &'static str {
     if lane == "wasm" { "stable" } else { "trust" }
 }
@@ -722,6 +729,7 @@ mod tests {
     use super::*;
 
     /// A synthetic box for the pure-judgment tests: a name, and one fixed chip
+    /// so a row this helper writes and a row it judges agree.
     fn box_id(key: &str) -> MachineId {
         MachineId {
             key: key.to_string(),
@@ -732,6 +740,7 @@ mod tests {
     }
 
     /// [`judge_trend`] with no alias table, where the ledger's box column IS
+    /// the box.
     fn judged(ledger: &str, key: &str, samples: &[TrendSample]) -> TrendJudgment {
         judge_trend(ledger, "", &box_id(key), samples)
     }
@@ -784,6 +793,8 @@ mod tests {
     }
 
     /// A re-record declares its lane's new level: the rows it wrote start each
+    /// of that lane's metrics' windows, so the next run is held to the new
+    /// level, not to the best of the level it replaced.
     #[test]
     fn a_re_record_starts_its_lanes_window() {
         let old: String = (0..4)
@@ -1007,6 +1018,7 @@ mod tests {
     }
 
     /// A row names the tree it measured: HEAD's sha alone only when nothing outside the golden
+    /// dir (which a record rewrites) differs from HEAD.
     #[test]
     fn a_row_measured_on_uncommitted_code_says_so() {
         assert_eq!(tree_label("abc", Some("")), "abc");
@@ -1046,6 +1058,7 @@ mod tests {
          m7\tfp:0123456789abcdef\ta different box\n";
 
     /// A rename must not fork a box's history away from itself: both spellings
+    /// land on one key, and a machine the table never mentions on its own.
     #[test]
     fn a_rename_no_longer_forks_a_box_from_its_own_history() {
         assert_eq!(resolve_ledger_box(ALIASES, "m15.local").key(), "m21");
@@ -1078,6 +1091,7 @@ mod tests {
     }
 
     /// THE OTHER HALF, and the one that matters more: an identity nobody
+    /// claimed is NEVER folded into a box that merely looks similar.
     #[test]
     fn an_unclaimed_identity_stands_alone_and_is_never_merged() {
         let r = resolve_ledger_box(ALIASES, "some-other-mac.local");
@@ -1101,6 +1115,7 @@ mod tests {
     }
 
     /// A box that has already written AUTO-KEYED rows keeps them when a human
+    /// finally names it — `box-<digest>` resolves through the `fp:` row.
     #[test]
     fn naming_a_box_adopts_the_rows_it_wrote_before_it_had_a_name() {
         assert_eq!(
@@ -1111,7 +1126,7 @@ mod tests {
         assert!(!resolve_ledger_box(ALIASES, "box-1111111111111111").is_claimed());
     }
 
-    /// THE GUARD ON THE CLAIM. If rows under one box name disagree about the
+    /// THE GUARD ON THE CLAIM.
     #[test]
     fn a_chip_conflict_drops_the_rows_instead_of_comparing_across_machines() {
         let ledger =

@@ -366,6 +366,7 @@ impl OscEventQueue {
     }
 
     /// Drop the oldest events until `events` more events of `bytes` more
+    /// payload bytes fit within both bounds.
     fn shed(&mut self, events: usize, bytes: usize) {
         while self.events.len() + events > Self::MAX_EVENTS || self.bytes + bytes > Self::MAX_BYTES
         {

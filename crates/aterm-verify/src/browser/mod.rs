@@ -1,70 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `verify browser`: both web modules in real headless browsers
-//! (docs/AUDIT-third-party-2026-10-15.md, wasm-platform WP.5 and WP.8: "one
-//! real WebGL2 boot").
-//!
-//! The modules are `verify wasm-smoke`'s dev build ([`crate::wasm_smoke::
-//! build_dev`], a STOCK EXCEPTION: Trust has no wasm32 std), bound for a page
-//! by `verify glue --flavor web`. A loopback server ([`serve`]) serves them
-//! with the pages in `crates/aterm-verify/browser/` and the bundled font.
-//! Each browser session is two rows, the pages' and the worker's:
-//! - Chromium ([`chromium`]) runs headless with its DevTools on two pipes
-//!   ([`cdp`]), once per ANGLE backend WebGL2 can run on: on macOS Metal,
-//!   then SwiftShader (Chromium's software WebGL); elsewhere SwiftShader. A
-//!   session whose GPU page reports another backend's adapter (a browser
-//!   that fell back) is NOT RUN, never a pass.
-//! - Firefox ([`firefox`]) runs headless and is driven by its pages: each
-//!   POSTs its answer to the server and opens the next. A session whose
-//!   pages report another browser's user agent is NOT RUN.
-//! - WebKit ([`webkit`]), Playwright's build on macOS, is driven by its
-//!   pages as Firefox is. Its headless pages live in windows of its own, so
-//!   under `--no-windows` its session is a named skip.
-//!
-//! Three pages, each fed crates/aterm-gpu-web/tests/cpu_gpu_parity.rs's grid,
-//! theme, px, font and content, one line per frame:
-//! - `cpu.html` boots aterm-wasm and hands back each frame's `rgba()`;
-//! - `gpu.html` boots aterm-gpu-web, `await init(canvas)` (aterm-gpu's GL
-//!   arm on WebGL2 through the module's `aterm_gl` imports, wasm-platform
-//!   WP.8), presents each frame with `render()` and hands back the canvas.
-//!   `init` is synchronous: the page reports whether the GPU was ready as
-//!   the call returned, and whether an `init` that throws (on a canvas
-//!   already holding a 2D context) rejects the async fn awaiting it;
-//! - `worker.html` transfers its canvas to a dedicated worker, which runs the
-//!   gpu page's lane there through `init_offscreen(canvas)` (a site that
-//!   renders off the main thread).
-//!
-//! [`judge`] holds each GPU frame to the CPU frame within that test's
-//! tolerance, with a negative control, and the GPU page's `init` report to
-//! both answers. The GPU page then draws a wider grid of attributes, colours,
-//! sprites and an image on a second canvas, and [`recorded`] holds every GPU
-//! frame to the frames the wgpu-WebGL module drew for the same content
-//! (`browser/wgpu-webgl/`, recorded before WP.8): byte for byte on the
-//! recording's adapter (ANGLE Metal on an M4 Pro), within the CPU tolerance
-//! on another. The worker's run is held to all of that too, and to the gpu
-//! page's frames of the same session byte for byte ([`judge::worker`]). A
-//! session after the first is also held to the first's CPU frames, which
-//! must not move (the CPU module draws in wasm), and its GPU frames' distance
-//! from the first's is reported. Each session's GPU frames are written to
-//! `<target>/verify/cells.noindex/browser/<session>/gpu-frames/` (the worker's to
-//! `worker-frames/`), and the timings each page measured, each frame's
-//! readback timed apart from its render, are printed and written to
-//! `<target>/verify/cells.noindex/browser/<session>/timings.json`.
-//!
-//! No browser or no stable wasm32 std is COULD NOT RUN with the fix, never a
-//! pass. In no set.
-//!
-//! The check is two halves a host without Trust can run apart, each a verb
-//! of its own that needs no `targo`: `verify browser-site DIR` builds and
-//! binds both modules and lays the site in DIR ([`site_main`]), and `verify
-//! browser-drive SITE OUT [--engine NAME]...` runs the sessions on a site
-//! laid before, judged as above, their frames and timings in OUT
-//! ([`drive_main`]); WebKit's session, which keeps windows, only when
-//! `--engine webkit` names it. The Linux lane's guest (`targo --unverified lab linux
-//! browser`, docs/LINUX-RUNTIME-LANE.md) drives this Mac's site that way:
-//! the same module bytes, another OS and CPU.
+//! `verify browser`.
 
+//! build_dev`], a STOCK EXCEPTION: Trust has no wasm32 std), bound for a page
+//! by `verify glue --flavor web`.
 pub(crate) mod cdp;
 pub(crate) mod chromium;
 pub(crate) mod firefox;
@@ -266,13 +206,10 @@ impl Engine {
     }
 }
 
-/// Every session's name ([`Engine::name`]), as `browser-drive --engine` takes
-/// it: Chromium's ANGLE backends, then Firefox, then WebKit.
+/// Every session's name ([`Engine::name`]), as `browser-drive --engine` takes it.
 pub(crate) const ENGINES: [&str; 4] = ["metal", "swiftshader", "firefox", "webkit"];
 
-/// The WebKit session's part in a run. Its headless pages keep windows of
-/// their own ([`webkit`]), so it runs only where the caller lets it open
-/// them.
+/// The WebKit session's part in a run.
 enum WebKitRow {
     /// Run it on the WebKit found; without one it is NOT RUN.
     Run(Result<webkit::WebKit, String>),
@@ -283,15 +220,10 @@ enum WebKitRow {
     Off,
 }
 
-/// Build, bind and serve both modules once, then boot the pages in each
-/// browser session: Chromium on each ANGLE backend
-/// ([`chromium::angle_backends`]), then Firefox, then WebKit, which keeps a
-/// window and so is a named skip under `--no-windows`. Two rows per session.
+/// Build, bind and serve both modules once, then boot the pages in each browser session.
 pub fn run(ctx: &Ctx, r: &mut Report) {
     let t0 = Instant::now();
     let (chromium, firefox, webkit) = (chromium::find(), firefox::find(), webkit::find());
-    // Finding a WebKit opens nothing; under `--no-windows` only running it
-    // is skipped, and its skip names the fix for a missing one.
     let webkit_runs = webkit.is_ok() && !ctx.no_windows;
     if let (Err(c), Err(f), false) = (&chromium, &firefox, webkit_runs) {
         let w = match &webkit {
@@ -358,9 +290,7 @@ fn build_site(ctx: &Ctx, r: &mut Report, site: &Path, t0: Instant) -> Option<Cos
 
 /// Boot the pages in each browser session `wanted` names ([`ENGINES`];
 /// empty is every session this host runs): Chromium on each of its ANGLE
-/// backends, then Firefox, then WebKit as `webkit` says. Two rows per
-/// session; a wanted session with no browser, or one this host does not
-/// run, is NOT RUN.
+/// backends, then Firefox, then WebKit as `webkit` says.
 fn sessions(
     r: &mut Report,
     built: &Built,
@@ -496,10 +426,9 @@ fn finish(r: &Report) -> i32 {
     }
 }
 
-/// `verify browser-site DIR`: both modules built (`wasm-smoke`'s dev build,
+/// `verify browser-site DIR`.
 /// rustup stable: a STOCK EXCEPTION) and bound, and the lane's site laid in
-/// DIR: the pages, the spec, the font and each module's glue. Exit 0, 1 on a
-/// failed build or bind, 3 when it could not run.
+/// DIR: the pages, the spec, the font and each module's glue.
 pub fn site_main(args: &[String], cwd: &Path) -> i32 {
     let [dir] = args else {
         eprintln!("verify browser-site: takes one argument, the directory to lay the site in");
@@ -539,12 +468,7 @@ pub fn site_main(args: &[String], cwd: &Path) -> i32 {
     finish(&r)
 }
 
-/// `verify browser-drive SITE OUT [--engine NAME]...`: the lane's sessions
-/// on a site `browser-site` laid ([`sessions`]), judged as `verify browser`
-/// judges, each session's frames and timings in `OUT/<session>/`. It builds
-/// nothing and needs no toolchain: what the Linux lane's guest runs. WebKit's
-/// session keeps windows, so it runs only when `--engine webkit` names it.
-/// Exit 0, 1 when a row failed, 3 when a row could not run.
+/// `verify browser-drive SITE OUT [--engine NAME]...`.
 pub fn drive_main(args: &[String]) -> i32 {
     let usage = |why: String| {
         eprintln!(
@@ -615,10 +539,7 @@ pub fn drive_main(args: &[String]) -> i32 {
 
 /// One session: the pages booted in `engine`'s browser, judged, their frames
 /// and timings written to `<work>/<session>/`, and its two rows (the pages',
-/// then the worker's). A session after the first is also held to `first`'s
-/// CPU frames (the CPU module draws in wasm, so they must not move with the
-/// browser), and its GPU frames' distance from `first`'s is reported. The
-/// session, when one ran.
+/// then the worker's).
 fn session(
     r: &mut Report,
     built: &Built,
@@ -756,8 +677,7 @@ fn session(
 
 /// One GPU run of `session` (the gpu page's, or its worker's) judged: against
 /// the session's CPU frames, its frames written to `frames_dir`, then held
-/// to the wgpu-WebGL `recording`. Its lines go to `r` through `say`; the
-/// failures.
+/// to the wgpu-WebGL `recording`.
 fn held(
     r: &mut Report,
     say: &dyn Fn(String) -> String,
@@ -771,9 +691,6 @@ fn held(
         r.raw(say(line.clone()));
     }
     let mut failures = verdict.failures;
-    // The recorded-frame differential: this run's GPU frames, written where
-    // they can be looked at (and recorded from), then held to the
-    // wgpu-WebGL module's recording.
     let named = named_gpu_frames(gpu);
     let seen = recorded::Recording {
         module: gpu.module.clone(),
@@ -911,7 +828,6 @@ fn timing_line(who: &str, p: &Page) -> String {
         parts.push(format!("frames {} ms", each.join("/")));
     }
     parts.extend(readback_split(t));
-    // A worker's total is its own; the page's adds starting it.
     let own = num("worker_total_ms").or_else(|| num("total_ms"));
     if let Some(v) = own {
         let accounted: f64 = TIMED.iter().filter_map(|k| timed(t, k)).sum();
@@ -1031,7 +947,6 @@ fn drive_chromium(
     let log = work.join("browser.log");
     let (out, err) = log_stdio(&log)?;
     let pipe = || std::io::pipe().map_err(|e| Stop::CouldNotRun(format!("no pipe: {e}")));
-    // The browser reads commands on fd 3 and writes on fd 4.
     let ((cmd_read, cmd_write), (out_read, out_write)) = (pipe()?, pipe()?);
     let mut cmd = LaneCommand::new(&browser.path);
     cmd.args(chromium::launch_args(browser, profile, angle))
@@ -1065,7 +980,6 @@ fn drive_chromium(
     let worker = page(&mut cdp, &server.origin(), "worker");
     let served = server.served();
     drop(server);
-    // Asked to close, the browser exits; one that does not is killed on drop.
     let _ = cdp.call(None, "Browser.close", json!({}));
     let waited = Instant::now();
     while waited.elapsed() < cdp::HANG_DETECTOR {
@@ -1158,7 +1072,7 @@ impl PostedPages {
 /// and environment `launch` gives for the cpu page's URL
 /// (`?post=1&next=gpu,worker`) and its scratch `home`: the cpu page runs its
 /// lane, POSTs its answer and opens the gpu page, which opens the worker
-/// page. Take the three answers and kill the browser by its pid.
+/// page.
 fn drive_by_posts(
     what: &str,
     browser: &Path,
@@ -1187,7 +1101,6 @@ fn drive_by_posts(
             server
                 .answer(kind, || running.ended().is_none())
                 .map_err(|why| match running.ended() {
-                    // A browser gone before the first page answered never ran it.
                     Some(status) if kind == "cpu" => Stop::CouldNotRun(format!(
                         "{what} exited ({status}) before the cpu page answered\n{}",
                         log_tail(&log)
@@ -1244,8 +1157,7 @@ fn posted(kind: &str, body: &[u8]) -> Result<judge::Answer, Stop> {
 }
 
 /// Open `<origin>/<kind>.html` in a fresh tab, wait for its load, run its
-/// lane and close the tab: the parsed answer. A page that throws or hangs is
-/// a finding, its console printed with it.
+/// lane and close the tab: the parsed answer.
 fn page(cdp: &mut cdp::Cdp, origin: &str, kind: &str) -> Result<Page, Stop> {
     let fail = |what: String| Stop::Fail(format!("the {kind} page: {what}"));
     let target = cdp
@@ -1318,8 +1230,7 @@ fn page(cdp: &mut cdp::Cdp, origin: &str, kind: &str) -> Result<Page, Stop> {
     })
 }
 
-/// One pinned browser `verify provision` places in the browser cache
-/// ([`chromium::host_cache_root`]).
+/// One pinned browser `verify provision` places in the browser cache ([`chromium::host_cache_root`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Pin {
     /// What it is, for the run's lines.
@@ -1332,14 +1243,13 @@ pub(crate) struct Pin {
     pub sha256: &'static str,
     /// The archive's size.
     pub bytes: u64,
-    /// Its directory under the cache root: the one the lane looks in.
+    /// Its directory under the cache root.
     pub dir: PathBuf,
     /// Its executable, relative to `dir`.
     pub binary: PathBuf,
 }
 
-/// The pin of `engine` for `(os, arch)` under the browser cache `root`, where the lane
-/// pins one for that host.
+/// The pin of `engine` for `(os, arch)` under the browser cache `root`, where the lane pins one for that host.
 pub(crate) fn pin_for(
     engine: crate::provision::Engine,
     os: &str,
@@ -1441,8 +1351,6 @@ mod tests {
             load_ms: None,
             evaluate_ms: 0.0,
         };
-        // 43 less 5 (frames), 3 (finishes), 3 (copies), 13 (reads), 2
-        // (base64) and 10 (waits).
         assert!(
             timing_line("gpu", &page).ends_with("7.0 in no timed step)"),
             "{}",

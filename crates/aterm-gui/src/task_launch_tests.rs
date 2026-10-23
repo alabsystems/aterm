@@ -75,8 +75,6 @@ fn a_task_is_refused_empty_absent_or_holding_a_nul() {
         .as_bytes()
         .to_vec();
     let from = SessionId::new("s-ab12");
-    // A drive's root on Windows (`C:\`), which `canonicalize` answers
-    // verbatim (`\\?\C:\`): trusted as a person spells it.
     let root = std::env::temp_dir();
     let root = root.ancestors().last().expect("a root").to_string_lossy();
     let order = TaskOrder::of_frame(
@@ -110,8 +108,7 @@ fn a_task_is_refused_empty_absent_or_holding_a_nul() {
 /// The task file is the task, its last line ended, a blank line, then the
 /// one line of fact: it names the starter and the worker's Autopilot, and the
 /// `Nothing left:` defense that ends a Land worker's work, without the retired
-/// token. NEGATIVE CONTROL: a Cruise worker's fact names no defense (no
-/// report ends Cruise). The fact names the spawn's own agent word.
+/// token.
 #[test]
 fn the_task_file_is_the_task_a_blank_line_and_the_fact() {
     let fact = fact_line("s-ab12", Autopilot::Land, "claude");
@@ -159,7 +156,6 @@ fn the_task_file_is_the_task_a_blank_line_and_the_fact() {
         )
         .into_bytes()
     );
-    // With no starter to name, the task alone, its last line ended.
     assert_eq!(
         task_text(b"do it", None, Autopilot::Land, Program::Claude),
         b"do it\n"
@@ -172,11 +168,7 @@ fn the_task_file_is_the_task_a_blank_line_and_the_fact() {
 /// space, an ideographic space, an em space), and a zero-width or control
 /// character draws nothing beside it — so such a line ends agy's message as
 /// an empty one does, the fact line under it read as agy's reply, its
-/// `NEEDS YOU:` with it. Each is dropped. The reader's side is measured:
-/// agy's screen with a no-break-space row between the task and the fact
-/// reads the fact as the reply. NEGATIVE CONTROLS: a line with a word beside
-/// its no-break space is kept, and every other worker keeps the task as
-/// given.
+/// `NEEDS YOU:` with it.
 #[test]
 fn a_line_that_draws_as_a_blank_row_is_dropped_from_an_agy_task() {
     use aterm_phase::agy::fixtures::lab::WORKER_FIRST_PROMPT;
@@ -197,8 +189,6 @@ fn a_line_that_draws_as_a_blank_row_is_dropped_from_an_agy_task() {
             "CONTROL: {agent:?} keeps the task as given"
         );
     }
-    // agy's reader: the measured first turn with its blank row a no-break
-    // space reads the fact under it as the reply, as the empty row does.
     let rows = aterm_phase::prompt::fixtures::screen(WORKER_FIRST_PROMPT);
     let act = rows
         .iter()
@@ -221,20 +211,7 @@ fn a_line_that_draws_as_a_blank_row_is_dropped_from_an_agy_task() {
 }
 
 /// AN AGY WORKER'S FIRST PROMPT HOLDS NO BLANK LINE ([`task_text`],
-/// `WorkerCli::blank_lines`). agy draws a message's blank line as a blank
-/// row, the rows under it two columns in as its reply's
-/// ([`WORKER_FIRST_PROMPT`], measured in `lab forever`'s L15): the worker's
-/// first turn read the fact line as its reply — its `NEEDS YOU:` a need
-/// nobody said, raised as the turn ended (the manager's `await task` woke
-/// on it), and the fact in the worker's result. Its task file drops the
-/// task's blank lines and puts the fact on the line under it: the same
-/// message drawn with no blank row is one message, and the reply under it
-/// is read alone, with no need. NEGATIVE CONTROLS: the measured screen reads
-/// the fact as the reply (its need, raised in `l15a`, now read as the line's
-/// mention); every other worker's task file
-/// keeps the task as given and the blank line before the fact (their screens
-/// mark a reply's head: Claude Code's `⏺`, Gemini CLI's `✦`, Muse Code's
-/// `◆`).
+/// `WorkerCli::blank_lines`).
 #[test]
 fn an_agy_workers_first_prompt_holds_no_blank_line() {
     use aterm_agent::supervise::policy::needs::needs_you;
@@ -259,8 +236,6 @@ fn an_agy_workers_first_prompt_holds_no_blank_line() {
         );
     }
 
-    // The worker's first turn as it ended: its rows up to the Land act's
-    // rule, then the composer.
     let rows = aterm_phase::prompt::fixtures::screen(WORKER_FIRST_PROMPT);
     let act = rows
         .iter()
@@ -274,19 +249,12 @@ fn an_agy_workers_first_prompt_holds_no_blank_line() {
         .position(|r| r.starts_with("> FOREVERLAB-WORKER"))
         .expect("the first prompt");
     let reply = "Implemented the parser module and its unit tests in this turn.";
-    // NEGATIVE CONTROL: as measured, the fact line read as the reply. Its
-    // `NEEDS YOU:` raised the need in `l15a`; the needs reader now reads a
-    // token `a line starting` names as the line's mention
-    // (`needs::names_a_head`, the review of b9/spawn-residuals), so the fact
-    // read as the reply names none — the misread itself stands.
     let misread = said_tail(&first).expect("words");
     assert!(
         misread.starts_with("(Started by `s-146719f2750f4a8f6909`") && misread.ends_with(reply),
         "{misread}"
     );
     assert!(needs_you(&misread).is_empty(), "{misread}");
-    // That message is the old task file drawn: the task, a blank row, the
-    // fact's rows.
     let task = b"FOREVERLAB-WORKER. write the parser for this repository and land it";
     let old = format!(
         "{}\n\n{}",
@@ -302,8 +270,6 @@ fn an_agy_workers_first_prompt_holds_no_blank_line() {
         drawn.join(" "),
         old.split_whitespace().collect::<Vec<_>>().join(" ")
     );
-    // The task file now: no blank line, so the same message is drawn with no
-    // blank row, one message over the reply.
     let now = text(task, Some("s-146719f2750f4a8f6909"), Program::Agy);
     assert!(!now.contains("\n\n"), "{now}");
     assert!(first[user + 1].is_empty(), "the measured blank row");
@@ -323,8 +289,7 @@ fn an_agy_workers_first_prompt_holds_no_blank_line() {
 }
 
 /// A worker's order is under Land unless the spawn said otherwise
-/// ([`WORKER_AUTOPILOT`], [`TaskOrder::under`]). NEGATIVE CONTROL: a spawn's
-/// `autopilot=cruise` is kept.
+/// ([`WORKER_AUTOPILOT`], [`TaskOrder::under`]).
 #[test]
 fn a_worker_is_under_land_unless_its_spawn_says_cruise() {
     assert_eq!(WORKER_AUTOPILOT, Autopilot::Land);
@@ -379,7 +344,6 @@ fn the_task_file_is_private_and_never_overwritten() {
     assert!(!trust.exists(), "the same discard owns its sidecar");
     seed.discard();
 
-    // Cancellation may answer the main thread before the spawner writes.
     let cancelled = TaskSeed::new(b"never started".to_vec()).with_trust_file("/w/late");
     let late = cancelled.clone();
     cancelled.discard();
@@ -391,9 +355,6 @@ fn the_task_file_is_private_and_never_overwritten() {
     assert!(!dir.join(task_file_name(&sid)).exists());
     assert!(!dir.join(trust_file_name(&sid)).exists());
 
-    // Or discard can win after the actual exclusive write but before its
-    // path is published. Interpose it deterministically on the real writer;
-    // no new thread, wait or program is involved.
     let racing = TaskSeed::new(b"cancelled during write".to_vec()).with_trust_file("/w/racing");
     let cancel = racing.clone();
     let sid = SessionId::new("s-0002");
@@ -412,8 +373,6 @@ fn the_task_file_is_private_and_never_overwritten() {
     );
     assert!(racing.write_in(&dir, &sid).is_err(), "discard stays sticky");
 
-    // Dropping the last seed is not cancellation: a successfully spawned
-    // shell may not have reached its first prompt/read of the task file yet.
     let running = TaskSeed::new(b"still needed".to_vec()).with_trust_file("/w/running");
     let path = running.write_in(&dir, &SessionId::new("s-0003")).unwrap();
     let trust = running.trust_file().expect("running sidecar");
@@ -445,8 +404,7 @@ fn a_carried_task_is_taken_once_and_cleared_with_its_request() {
 }
 
 /// A worker's shell is zsh, bash or fish, by its program's name; another is
-/// refused by name. fish is asked its version, and only 3.4 or later takes
-/// the operand.
+/// refused by name.
 #[test]
 fn a_worker_shell_is_zsh_bash_or_a_fish_that_takes_dollar_paren() {
     assert_eq!(worker_dialect(Path::new("/bin/zsh")), Ok(Dialect::Zsh));
@@ -505,12 +463,6 @@ fn a_worker_carries_its_starters_configuration_or_uses_the_plain_command() {
 /// THE ONE ITS STARTER TRUSTED: Muse Code's `--trust-workspace` rides the
 /// line only where the agent has the flag, the spawn named a `cwd=`, and the
 /// shell's own directory, read at its prompt, is exactly that folder.
-/// Gemini CLI has none: its `--skip-trust` trusts every folder for every
-/// Gemini CLI the worker starts ([`TaskSeed::with_trust_file`] trusts its one).
-/// NEGATIVE CONTROLS: an rc file's `cd` elsewhere (or into a folder beneath
-/// it), a directory not read, no `cwd=`, and an agent with no such flag
-/// (Claude Code, Gemini CLI, agy) each trust nothing — and the directory is
-/// not even read where nothing could be trusted.
 #[test]
 fn a_workers_line_trusts_only_the_folder_its_shell_stands_in() {
     let at = |dir: &'static str| move || Some(PathBuf::from(dir));
@@ -534,9 +486,7 @@ fn a_workers_line_trusts_only_the_folder_its_shell_stands_in() {
 
 /// A GEMINI CLI WORKER'S TRUSTED-FOLDERS FILE IS ITS OWN AND PRIVATE: 0600
 /// in a 0700 directory, under its sid, never written over, trusting its one
-/// folder (`aterm_agent::harness::worker::trusted_folders_text`). The close
-/// that removes the task file removes it ([`retire_task_file_in`]).
-/// NEGATIVE CONTROL: another worker's stays.
+/// folder (`aterm_agent::harness::worker::trusted_folders_text`).
 #[cfg(unix)]
 #[test]
 fn a_gemini_workers_trust_file_is_private_and_goes_with_it() {
@@ -572,8 +522,6 @@ fn a_gemini_workers_trust_file_is_private_and_goes_with_it() {
     other.write_in(&dir, &kept).expect("written");
     let other = other.trust_file().expect("other sidecar");
 
-    // A sidecar this seed did not create is neither adopted nor removed.
-    // The old optional-file failure behavior remains an untrusted launch.
     let occupied = SessionId::new("s-0f");
     let sentinel = dir.join(trust_file_name(&occupied));
     std::fs::write(&sentinel, "existing").unwrap();
@@ -593,11 +541,7 @@ fn a_gemini_workers_trust_file_is_private_and_goes_with_it() {
 /// A STARTER THE SWEEP HAS NOT NAMED YET is read from its terminal: a
 /// manager that spawns within half a second of its composer is asked before
 /// the status sweep reads its screen (the workers lab's three silent stalls,
-/// 2026-10-18), and its line then carried plain `claude`. The group in front
-/// of the starter's terminal is followed instead (and `caller_claude` reads
-/// whether it runs a Claude Code); a starter the sweep named as another
-/// agent's program is not followed, and is not read. NEGATIVE CONTROL: the
-/// old rule (no reader, no group) is the `None` the first case refuses.
+/// 2026-10-18), and its line then carried plain `claude`.
 #[test]
 fn a_starter_not_named_yet_is_read_from_its_terminal() {
     use aterm_phase::Program;
@@ -641,8 +585,7 @@ fn a_starter_not_named_yet_is_read_from_its_terminal() {
 /// A WORKER THAT NEVER STARTED SAYS WHAT BECAME OF ITS LINE: the startup
 /// stall's log line names what the launcher noted on the worker's timeline —
 /// typed, with the receipt's word and the program, or never typed and why —
-/// and says so where this process's launcher noted nothing. NEGATIVE
-/// CONTROL: before any note, the words are the never-typed ones.
+/// and says so where this process's launcher noted nothing.
 #[test]
 fn a_stalled_worker_says_whether_its_line_was_typed() {
     let session = crate::stub_session(1);
@@ -674,8 +617,7 @@ fn touch(dir: &Path, name: &str) -> PathBuf {
 /// A closed worker's task file and every result its dones snapshotted
 /// (`<sid>-<rev>.result.md` and `.result.src`) are removed, and only its
 /// own: another session's stay, a sid that merely starts with this one's
-/// included, and so does a file that is no result of it. None there, or no
-/// directory at all, is no error.
+/// included, and so does a file that is no result of it.
 #[cfg(unix)]
 #[test]
 fn a_closed_workers_task_files_are_removed_and_no_other() {
@@ -728,12 +670,7 @@ fn a_closed_workers_task_files_are_removed_and_no_other() {
 
 /// A QUIT removes the task file of every worker it still holds
 /// ([`retire_task_files_at_quit`]): the final exit path closes no session one
-/// by one, so no close would. NEGATIVE CONTROLS: a session with no task
-/// record keeps a file under its name, a file no session here names (a
-/// sibling instance's worker sharing the state folder) stays, and so does
-/// the file of a worker the parked predecessor still owns (an update
-/// candidate quitting before its Commit) — removed once it is this
-/// process's.
+/// by one, so no close would.
 #[cfg(unix)]
 #[test]
 fn a_quit_removes_its_workers_task_files_and_no_other() {
@@ -761,7 +698,6 @@ fn a_quit_removes_its_workers_task_files_and_no_other() {
     let elsewhere = write(&SessionId::new("s-0c"));
     let result = touch(&dir, &format!("{}-2.result.md", worker.sid.as_str()));
     let untasked_result = touch(&dir, &format!("{}-2.result.md", shell.sid.as_str()));
-    // The parked predecessor's worker: kept.
     retire_task_files_in(&dir, &store, std::slice::from_ref(&worker.sid));
     assert!(tasked.exists(), "the predecessor's worker keeps its file");
     assert!(result.exists(), "and its result");

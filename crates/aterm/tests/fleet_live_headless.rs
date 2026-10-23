@@ -25,6 +25,8 @@ use crate::headless_boot::{self, Instance, POLL_GAP, boot_session, ctl, ctl_ok, 
 const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// The stand-in `claude` a worker spawned over the drive runs: `--version`
+/// answers at once (`headless_boot::standin` runs every fake once so), and
+/// any other call exits 0, so its pane's shell draws its next prompt.
 const STANDIN_CLAUDE: &str = "#!/bin/sh\n\
     case \"$1\" in --version) echo '2.1.0 (Claude Code)'; exit 0 ;; esac\n\
     exit 0\n";
@@ -43,6 +45,7 @@ fn hold_a_port() -> (TcpListener, u16) {
 }
 
 /// `state/fleet.key` as `aterm fleet init` writes it: `secret`'s lowercase
+/// hex and a newline, 0600, in the 0700 state root.
 fn write_key(state: &Path, secret: &[u8]) {
     use std::os::unix::fs::PermissionsExt as _;
     let key = state.join(KEY_FILE);
@@ -57,9 +60,12 @@ fn fleet_table(port: u16, allow: &str) -> String {
 }
 
 /// How often this instance's listener tries a held port or an unusable key
+/// again, and reads its served key again: the product's `RETRY` (2 s) through
+/// its development seam.
 const RETRY_MS: &str = "100";
 
 /// A refused boot ends the test COULD NOT RUN, never a pass that checked
+/// nothing (`headless_boot::boot_with`).
 fn boot(port: u16) -> Instance {
     headless_boot::boot_with(
         "aflt",
@@ -125,6 +131,7 @@ fn ask_lines<S: Read + Write>(stream: &mut S, line: &str) -> Vec<String> {
 }
 
 /// Whether the peer has closed: the next read ends (EOF, or the TLS end of a
+/// shut socket), never by the hang detector's timeout.
 fn closed<S: Read>(stream: &mut S) -> bool {
     let mut rest = Vec::new();
     match stream.read_to_end(&mut rest) {
@@ -322,6 +329,7 @@ fn a_fleet_peer_reads_version_and_is_refused_everything_else() {
 }
 
 /// A scratch world of its own (HOME, config, state), removed on drop: a fleet
+/// member with no aterm running.
 struct World(PathBuf);
 
 impl Drop for World {
@@ -331,6 +339,8 @@ impl Drop for World {
 }
 
 /// `aterm fleet <args>` in the scratch world `root` — its HOME and config,
+/// `root/state` the state directory — with `stdin` piped in (or none); its
+/// output once it exits, within the hang detector.
 fn fleet(root: &Path, args: &[&str], stdin: Option<&str>) -> Output {
     let aterm = crate::launch_isolation::aterm_executable();
     #[expect(
@@ -359,11 +369,12 @@ fn fleet(root: &Path, args: &[&str], stdin: Option<&str>) -> Output {
 }
 
 /// `aterm ctl <args>` in the scratch world `root`, as [`fleet`] runs `aterm
+/// fleet`: its output once it exits, within the hang detector.
 fn ctl_in(root: &Path, args: &[&str]) -> Output {
     ctl_fed(root, args, None)
 }
 
-/// [`ctl_in`] with `stdin` its standard input (`None`: nothing). Asked again, a
+/// [`ctl_in`] with `stdin` its standard input (`None`: nothing).
 fn ctl_fed(root: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
     headless_boot::until_served(|| {
         let aterm = crate::launch_isolation::aterm_executable();
@@ -799,6 +810,8 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
 }
 
 /// `aterm ctl --host <args>` in the scratch world `root`: [`ctl_in`] with
+/// `--host` before the request — the step-in, which dials the fleet and no
+/// control socket.
 fn drive_in(root: &Path, host: &str, args: &[&str]) -> Output {
     let mut all = vec!["--host", host];
     all.extend_from_slice(args);
@@ -837,6 +850,8 @@ fn drive_refused(root: &Path, host: &str, args: &[&str]) -> String {
 }
 
 /// THE STEP-IN between two real aterms (§5.1): an issuer, and a member whose
+/// person lets the issuer drive it (`aterm fleet allow drive --from <the
+/// issuer's node>`) and nobody else, its boot session a worker.
 #[test]
 fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
     let (holder, port) = hold_a_port();

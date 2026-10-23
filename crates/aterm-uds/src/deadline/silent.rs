@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test support (test and debug builds, never release ones): whether a macOS service a test
-//! needs answers, and the end of a test that needs one that does not.
-//!
-//! * [`trust_service_silent`] asks once per process, through the shipped [`super::TRUST`]
-//!   gate: one `SecStaticCodeCheckValidity` of the Apple-signed `/usr/bin/true`, whose chain
-//!   `trustd` evaluates. It hangs exactly while `trustd` is wedged (else about 0.24 s); only
-//!   whether there is a verdict matters. A silent service costs the first ask
-//!   [`PROBE_DEADLINE`], and from then on every call through the gate is refused at once.
-//! * [`require_trust_service`] ends the calling test COULD NOT RUN on that silence, and
-//!   [`require_disk_image_service`] on an `hdiutil` run the test made that timed out.
-//!
-//! Only silence refuses: any other probe failure is an answer, and the tests run.
+//! Test support (test and debug builds, never release ones): whether a macOS service a test needs answers, and the end of a test that needs one that does not.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -20,12 +9,10 @@ use std::time::Duration;
 use super::{Refused, TRUST};
 use crate::host::could_not_run;
 
-/// How long the probe waits for `trustd`: about a hundred times its honest answer, and half a
-/// test's one-minute hang detector.
+/// How long the probe waits for `trustd`: about a hundred times its honest answer, and half a test's one-minute hang detector.
 pub const PROBE_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Whether macOS's `trustd` does not answer (asked once per process). Always `false` off
-/// Apple platforms. A test that needs it calls [`require_trust_service`].
+/// Whether macOS's `trustd` does not answer (asked once per process).
 #[must_use]
 pub fn trust_service_silent() -> bool {
     static SILENT: OnceLock<bool> = OnceLock::new();
@@ -35,9 +22,7 @@ pub fn trust_service_silent() -> bool {
     })
 }
 
-/// End the calling test COULD NOT RUN when macOS's `trustd` does not answer
-/// ([`trust_service_silent`]): every code-signing and TLS check waits on it, so the silence
-/// is the machine's, not the code's.
+/// End the calling test COULD NOT RUN when macOS's `trustd` does not answer ([`trust_service_silent`]): every code-signing and TLS check waits on it, so the silence is the machine's, not the code's.
 #[track_caller]
 pub fn require_trust_service() {
     if trust_service_silent() {
@@ -48,9 +33,7 @@ pub fn require_trust_service() {
     }
 }
 
-/// End the calling test COULD NOT RUN when `out` is an `hdiutil` run that failed with
-/// `Operation timed out` (a wedged disk-image service, after about 121 s). Any other
-/// failure is an answer, and returns.
+/// End the calling test COULD NOT RUN when `out` is an `hdiutil` run that failed with `Operation timed out` (a wedged disk-image service, after about 121 s).
 #[track_caller]
 pub fn require_disk_image_service(out: &std::process::Output) {
     if timed_out(out) {
@@ -69,10 +52,7 @@ fn timed_out(out: &std::process::Output) -> bool {
 /// How long a test's own `codesign` may run: a hang detector, never a budget.
 pub const CODESIGN_HANG: Duration = Duration::from_secs(60);
 
-/// Sign `path` ad hoc (`codesign --force --sign -`), as a test does to a copy of an Apple
-/// binary so the kernel lets it run off the system volume. Under [`CODESIGN_HANG`]; ask
-/// [`require_trust_service`] first. Panics, naming why (codesign's exit status, a signal
-/// among them, and its stderr), unless it signed.
+/// Sign `path` ad hoc (`codesign --force --sign -`), as a test does to a copy of an Apple binary so the kernel lets it run off the system volume.
 #[track_caller]
 pub fn sign_ad_hoc(path: &std::path::Path) {
     let out = super::output_until(
@@ -91,19 +71,7 @@ pub fn sign_ad_hoc(path: &std::path::Path) {
     );
 }
 
-/// The kept stand-in of the Apple binary `from`, signed ad hoc ([`sign_ad_hoc`]), for a test
-/// to exec IN PLACE: it runs off the system volume under its own identity (the kernel kills a
-/// copy that keeps Apple's signature, and hides a platform binary's environment from other
-/// processes). One per version of `from`, kept per user, placed once and never removed or
-/// replaced ([`signed_stand_in`]). Off Apple platforms, `from` itself. Panics, naming why,
-/// unless the stand-in is there.
-///
-/// Prefer it to [`ad_hoc_copy`] whenever the test needs no path of its own. macOS assesses the
-/// first exec of a file AFTER the exec, by path (the process waits at `_dyld_start` for the
-/// verdict, and killing it does not end the assessment). macOS 27.0.1's `syspolicyd` crashes
-/// (`SIGSEGV`) when the file it began assessing is unlinked before it re-opens it, and every
-/// exec on the host then awaiting a verdict is stranded at `_dyld_start` until it is killed.
-/// A file that is never removed cannot meet that.
+/// The kept stand-in of the Apple binary `from`, signed ad hoc ([`sign_ad_hoc`]), for a test to exec IN PLACE: it runs off the system volume under its own identity (the kernel kills a copy that keeps Apple's signature, and hides a platform binary's environment from other processes).
 #[must_use]
 #[track_caller]
 pub fn stand_in(from: &std::path::Path) -> std::path::PathBuf {
@@ -120,21 +88,7 @@ pub fn stand_in(from: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
-/// Copy the Apple binary `from` to `to`, signed ad hoc: a plain copy of its [`stand_in`],
-/// for a test that needs the executable at a path of its own (in a bundle, renamed over).
-/// The ad hoc signature is in the file and the kernel checks it there, so a copy runs as the
-/// stand-in does, and only the first stand-in of each version of `from` runs `codesign`, whose
-/// re-signing reads the Apple signature through `trustd` ([`require_trust_service`] is asked
-/// first) — a round trip a loaded machine has stalled past [`CODESIGN_HANG`]. Off Apple
-/// platforms the copy is all. Panics, naming why, unless the copy is made and signed.
-///
-/// The copy is a new file, which macOS assesses on its first exec ([`stand_in`] says why that
-/// matters): remove it, rename over it or remove its directory only once a child has shown it
-/// ran from it, by a line it wrote ([`prints`]; a copy of `cat` and [`cat_echoes`]). An argv,
-/// working directory or `proc_pidpath` read is no such proof: the kernel shows each while the
-/// child still waits for the verdict. A child killed before its proof leaves the file in
-/// place ([`KeptUntilRan`] keeps a directory of copies so). The same holds for any Mach-O a
-/// test copies and execs, a copy of the test binary among them.
+/// Copy the Apple binary `from` to `to`, signed ad hoc: a plain copy of its [`stand_in`], for a test that needs the executable at a path of its own (in a bundle, renamed over).
 #[track_caller]
 pub fn ad_hoc_copy(from: &std::path::Path, to: &std::path::Path) {
     let from = stand_in(from);
@@ -142,17 +96,7 @@ pub fn ad_hoc_copy(from: &std::path::Path, to: &std::path::Path) {
         .unwrap_or_else(|e| panic!("copy {} to {}: {e}", from.display(), to.display()));
 }
 
-/// A directory holding programs a test copied and runs ([`ad_hoc_copy`], a copy of the test
-/// binary, a bundle around one), removed when dropped only once [`KeptUntilRan::ran`] said
-/// every child started from a file under it has shown it ran ([`prints`], [`cat_echoes`], a file
-/// the copy wrote). Dropped before that (a hang detector gave up, an assertion failed) it STAYS,
-/// named on stderr: a child killed before its proof leaves its file in place, because macOS may
-/// still be assessing that file's first exec ([`stand_in`] says what removing it then does to
-/// every launch on the host). Dropped unproven on a path that is not unwinding, it stays and
-/// panics: the test ended without saying its copies ran.
-///
-/// Drop it after the children it covers are killed and reaped (declared before them), or the
-/// directory goes while they still run from it.
+/// A directory holding programs a test copied and runs ([`ad_hoc_copy`], a copy of the test binary, a bundle around one), removed when dropped only once [`KeptUntilRan::ran`] said every child started from a file under it has shown it ran ([`prints`], [`cat_echoes`], a file the copy wrote).
 #[derive(Debug)]
 pub struct KeptUntilRan {
     dir: std::path::PathBuf,
@@ -160,8 +104,7 @@ pub struct KeptUntilRan {
 }
 
 impl KeptUntilRan {
-    /// Take over removing `dir`: a directory the test made, or an `aterm_tempfile::TempDir`'s
-    /// `keep()`.
+    /// Take over removing `dir`: a directory the test made, or an `aterm_tempfile::TempDir`'s `keep()`.
     #[must_use]
     pub fn new(dir: impl Into<std::path::PathBuf>) -> Self {
         Self {
@@ -176,8 +119,7 @@ impl KeptUntilRan {
         &self.dir
     }
 
-    /// Every child started from a file under the directory has shown it ran: it goes when
-    /// dropped.
+    /// Every child started from a file under the directory has shown it ran: it goes when dropped.
     pub fn ran(&mut self) {
         self.ran = true;
     }
@@ -205,17 +147,7 @@ impl Drop for KeptUntilRan {
 /// How long [`cat_echoes`] waits for the echo: the one-minute hang detector, never a budget.
 pub const ECHO_HANG: Duration = Duration::from_secs(60);
 
-/// The proof [`ad_hoc_copy`] asks for before a copied executable goes: `child`, spawned from
-/// the copy with piped stdout, writes the line `line` (lines before it are skipped) within
-/// `hang` ([`ECHO_HANG`] for a copy of a small Apple binary,
-/// [`FIRST_EXEC_HANG`](super::FIRST_EXEC_HANG) for a copy of the test binary), so its exec's
-/// assessment is done and it runs from its file. The rest of its stdout is read and dropped
-/// until it closes, so it never blocks on a full pipe.
-///
-/// Panics, naming why, unless the line came; the child is killed and reaped first, and its
-/// file is left where it is (a caller that removes it on an unwind holds its guard in a
-/// [`std::mem::ManuallyDrop`] until this returns). Never in the shipped wasm module (its
-/// reader thread is what the wasm-process census's OB-12 looks for).
+/// The proof [`ad_hoc_copy`] asks for before a copied executable goes: `child`, spawned from the copy with piped stdout, writes the line `line` (lines before it are skipped) within `hang` ([`ECHO_HANG`] for a copy of a small Apple binary, [`FIRST_EXEC_HANG`](super::FIRST_EXEC_HANG) for a copy of the test binary), so its exec's assessment is done and it runs from its file.
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(unix)]
 #[track_caller]
@@ -266,9 +198,7 @@ fn refused(child: &mut crate::spawnfd::Child, line: &str, why: &str) -> ! {
     );
 }
 
-/// [`prints`] for a copy of `cat`: `child`, spawned with piped stdin and stdout, echoes a line
-/// written to it within [`ECHO_HANG`]. Hands back the child's stdin: the `cat` runs until that
-/// is dropped or the child is killed. Panics as [`prints`] does.
+/// [`prints`] for a copy of `cat`: `child`, spawned with piped stdin and stdout, echoes a line written to it within [`ECHO_HANG`].
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(unix)]
 #[track_caller]
@@ -312,11 +242,7 @@ fn kept_at(cache: &std::path::Path, from: &std::path::Path) -> std::path::PathBu
 }
 
 /// The copy of `from` in `cache` that `sign` signed ([`kept_at`]), made the first time this
-/// version of `from` is asked for. It is signed under a name of its own and then linked into
-/// place whole, so a caller in another test process finds no stand-in (and signs its own) or a
-/// signed one, never a half-written one. A stand-in once placed is never replaced: a process
-/// may be running it while macOS assesses it by path ([`stand_in`]), so a caller that finds
-/// one placed while it signed its own keeps that one and drops its own, which nothing ran.
+/// version of `from` is asked for.
 #[cfg(all(unix, any(target_vendor = "apple", test)))]
 #[track_caller]
 fn signed_stand_in(
@@ -340,7 +266,6 @@ fn signed_stand_in(
         std::process::id(),
         FRESH.fetch_add(1, Ordering::Relaxed)
     ));
-    // The fresh copy never stays: placed (linked) or not, its own name goes.
     struct Fresh<'a>(&'a std::path::Path);
     impl Drop for Fresh<'_> {
         fn drop(&mut self) {
@@ -361,7 +286,6 @@ fn signed_stand_in(
 
 /// One certificate-chained code check; its verdict is discarded.
 #[cfg(target_vendor = "apple")]
-// Skip: bottoms out at Security.framework FFI.
 #[cfg_attr(trust_verify, trust::skip)]
 fn probe() {
     use core::ffi::c_void;
@@ -479,7 +403,6 @@ mod tests {
     /// A stand-in once placed is never replaced: a caller that finds one placed while it
     /// signed its own (another test process's, which may be running it while macOS assesses
     /// it by path) keeps the placed one, file and all, and leaves no copy of its own behind.
-    /// NEGATIVE CONTROL: with nothing placed meanwhile, its own signing is placed.
     #[test]
     fn a_placed_stand_in_is_never_replaced() {
         use std::os::unix::fs::MetadataExt as _;
@@ -523,9 +446,7 @@ mod tests {
     }
 
     /// Only an echo of its line is a `cat`'s proof that it runs: `cat` itself passes and runs
-    /// on until its stdin closes. NEGATIVE CONTROLS: a child that answers another line, one
-    /// that ends without a word, and one spawned without pipes each panic, the child killed and
-    /// reaped first.
+    /// on until its stdin closes.
     #[test]
     fn only_an_echo_proves_a_cat_runs() {
         use crate::spawnfd::{Stdio, command};
@@ -573,9 +494,7 @@ mod tests {
 
     /// Only the line itself is a copied program's proof that it runs: a child that writes other
     /// lines first and then the line passes, and its output after it is read on, so a child
-    /// that writes a megabyte more still ends. NEGATIVE CONTROLS: one that ends without the
-    /// line, one that writes nothing within the hang, and one spawned without a pipe each
-    /// panic, the child killed and reaped first.
+    /// that writes a megabyte more still ends.
     #[test]
     fn only_its_line_proves_a_copied_program_runs() {
         use crate::spawnfd::{Stdio, command};
@@ -628,7 +547,6 @@ mod tests {
 
     /// A directory of copies goes when dropped only once they ran: dropped by a failing test's
     /// unwind it stays, and dropped by a test that never said so it stays and fails that test.
-    /// NEGATIVE CONTROL: the same directory, said to have run, goes.
     #[test]
     fn a_directory_of_copies_goes_only_once_they_ran() {
         let tmp = aterm_tempfile::tempdir().expect("tempdir");

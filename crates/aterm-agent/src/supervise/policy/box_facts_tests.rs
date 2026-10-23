@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::*;
-use crate::supervise::policy::box_command::BoxCommand;
 use crate::supervise::policy::claude_settings::AskKind;
 use crate::supervise::policy::probe::LiveProbe;
 use crate::supervise::run::WorkerSource;
@@ -56,10 +55,6 @@ fn every_fact() -> BoxFacts {
             fell_back: true,
         }),
         box_call: Some("Bash".to_string()),
-        box_command: Some(Ok(BoxCommand {
-            id: "toolu_lab16914d0fee39f3eb".to_string(),
-            command: "echo $(true)\n$(true)".to_string(),
-        })),
         login_carry: true,
         login_back: true,
         login_renewed: true,
@@ -96,16 +91,16 @@ fn facts_read_back_as_written() {
     assert_eq!(back.shell_cwds, facts.shell_cwds);
     assert_eq!(back.worker_agent, Some(aterm_phase::Program::Gemini));
     assert!(text.contains("\"worker_agent\":\"gemini\""), "{text}");
-    assert_eq!(back.box_command, facts.box_command, "the transcript's call");
-    let refused = BoxFacts {
-        box_command: Some(Err("2 calls waiting".to_string())),
-        ..BoxFacts::default()
-    };
-    let (none_taken, _) = read(&written(&refused));
-    assert_eq!(
-        none_taken.box_command, refused.box_command,
-        "why none was taken"
+    // A tape breaker-4's build wrote carries the transcript's call, a field
+    // this build no longer reads: it is ignored, and needs nothing.
+    let old = text.replacen(
+        '{',
+        r#"{"box_command":{"Ok":{"id":"toolu_lab16914d0fee39f3eb","command":"echo x"}},"#,
+        1,
     );
+    let (old_back, old_needs) = read(&old);
+    assert!(old_needs.is_empty(), "{old_needs:?}");
+    assert_eq!(written(&old_back), text, "the old field is dropped");
     let worker = back.worker.expect("read").expect("ok");
     assert_eq!(worker.pid(), Some(4242));
     assert_eq!(
@@ -240,7 +235,6 @@ fn the_context_is_built_from_the_facts_and_the_policy() {
     assert!(ctx.question_fell_back);
     assert_eq!(ctx.python_allow, vec!["x*.py".to_string()]);
     assert_eq!(ctx.box_call.as_deref(), Some("Bash"));
-    assert_eq!(ctx.box_command, facts.box_command);
     assert_eq!(ctx.shell_cwds, facts.shell_cwds);
     assert_eq!(ctx.worker_agent, Some(aterm_phase::Program::Gemini));
 }

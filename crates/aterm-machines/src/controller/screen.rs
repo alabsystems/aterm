@@ -232,6 +232,8 @@ pub fn reprobe(remote: &dyn Remote, step: &PersonStep) -> Probe {
 }
 
 /// The request that runs `program` with `args` as `user` inside `user`'s login session on
+/// the host: root runs `launchctl asuser <uid>`, which runs the user primitive of design §3.5
+/// (`sudo -n -u <user> -H -- env -i …`) around it.
 fn in_session(user: &User, program: &str, args: &[&str]) -> Exec {
     let shell = if user.shell.is_empty() {
         "/bin/zsh"
@@ -371,7 +373,7 @@ fn arm_watch(remote: &dyn Remote, admin: &User) -> Result<String, String> {
     })
 }
 
-/// Disarm the host's screen watch `id` ([`disarm_cmd`]). A watcher that had ended first (it
+/// Disarm the host's screen watch `id` ([`disarm_cmd`]).
 fn disarm_watch(remote: &dyn Remote, say: &dyn Fn(&str), admin: &User, id: &str) {
     let failed = match remote.exec(&disarm_cmd(id)) {
         Ok(ran) if ran.success() => {
@@ -405,7 +407,7 @@ fn disarm_watch(remote: &dyn Remote, say: &dyn Fn(&str), admin: &User, id: &str)
 /// How long a walk with the screen watch armed may go between two requests that ran before it arms the watch again.
 pub const REARM: Duration = Duration::from_secs(watch::QUIET.as_secs() / 2);
 
-/// `screen`'s requests to the host once its screen watch is armed. A watcher that locked
+/// `screen`'s requests to the host once its screen watch is armed.
 struct Watched<'a> {
     remote: &'a dyn Remote,
     clock: &'a dyn Clock,
@@ -414,6 +416,7 @@ struct Watched<'a> {
     /// The last acknowledged arm, retained until its replacement is acknowledged.
     id: RefCell<Option<String>>,
     /// When the last request that ran came back; `None` after a replacement refusal,
+    /// so the next successful request retries it and no live replacement is promised.
     ran: Cell<Option<Duration>>,
 }
 
@@ -694,7 +697,7 @@ fn await_session_observed(
     }
 }
 
-/// Walk `steps` in order. A step that needs the Mac's keyboard is left as
+/// Walk `steps` in order.
 fn walk(flow: &Flow<'_>, admin: &User, steps: &[Step], at_console: bool) -> Vec<Walked> {
     let mut out = Vec::with_capacity(steps.len());
     let mut stopped: Option<String> = None;
@@ -792,6 +795,8 @@ pub enum Session {
         /// Why the lock failed.
         why: String,
         /// Why the last reading did not run, when none saw the login: the wait for it ended
+        /// (a stop, the hang detector) and the reading after that did not run, so whether the
+        /// admin logged in at all is not known.
         unread: Option<String>,
         /// The host's screen watch stays armed, to try the lock itself.
         watched: bool,
@@ -843,7 +848,7 @@ pub struct Screened {
     pub stops: Box<dyn std::any::Any>,
 }
 
-/// Lock the session `admin` logged in to over the relay ([`lock_cmd`]). macOS leaves a login
+/// Lock the session `admin` logged in to over the relay ([`lock_cmd`]).
 fn lock_session(flow: &Flow<'_>, admin: &User, unread: Option<String>, watched: bool) -> Session {
     let why = match flow.remote.exec(&lock_cmd(admin)) {
         Ok(ran) if ran.success() => {
@@ -886,7 +891,7 @@ fn logged_in_line(admin: &User, watched: bool) -> String {
     )
 }
 
-/// After the relay closed: the steps, and the session decided. A session there before the
+/// After the relay closed: the steps, and the session decided.
 fn decide(
     flow: &Flow<'_>,
     admin: &User,
@@ -1135,6 +1140,7 @@ mod tests {
     }
 
     /// A scripted host: replies keyed by the exec's argv, consumed in order, the last one
+    /// repeating; every request recorded.
     #[derive(Default)]
     struct Host<'a> {
         replies: Mutex<BTreeMap<String, Vec<Ran>>>,
@@ -1148,6 +1154,7 @@ mod tests {
         /// Each arm's answer in turn, the last repeating (`armed 1800000000-77` when none).
         arm: Mutex<Vec<Result<Ran, String>>>,
         /// Each disarm's answer in turn, the last repeating (`disarmed 1800000000-77` when
+        /// none).
         disarm: Mutex<Vec<Result<Ran, String>>>,
         /// The port whose relay the lock request is checked against.
         sys: Option<&'a Fake>,
@@ -1408,6 +1415,7 @@ mod tests {
     }
 
     /// Script `host` so Screen Sharing reads on with control: the service enabled, and the
+    /// agent's PostEvent and ScreenCapture rows granted.
     fn screen_sharing_on(host: &Host) {
         host.on(&person::print_disabled_cmd(), Ran::ok(
             "\n\tdisabled services = {\n\t\t\"com.apple.screensharing\" => enabled\n\t\t\"com.openssh.sshd\" => enabled\n\t}\n",
@@ -1430,6 +1438,7 @@ mod tests {
     }
 
     /// What the fake port records for the check, then the stops caught, the relay's open and
+    /// close, and the stops restored once the lock is decided.
     fn relay_calls() -> [String; 5] {
         let cmd = relay_cmd(&paths(), &target()).unwrap().display();
         [
@@ -1935,6 +1944,7 @@ mod tests {
     }
 
     /// Once a relay may have admitted a login, every failed wait still closes it
+    /// and decides the lock from the absence it actually observed.
     #[test]
     fn a_failed_login_wait_keeps_the_session_cleanup_obligation() {
         for newly_logged_in in [false, true] {
@@ -2053,6 +2063,7 @@ mod tests {
     }
 
     /// `screen` over a relay that greets, with Screen Sharing on and aterm's Full Disk Access
+    /// off, then granted at the first re-probe.
     fn screen_fda(host: &Host<'_>, sys: &Fake) -> (Screened, Vec<String>) {
         screen_sharing_on(host);
         host.on(&tcc_aterm(), Ran::ok(ATERM_ROWS_OFF));
@@ -2088,6 +2099,7 @@ mod tests {
     }
 
     /// The host's requests that are the lock or the screen watch's, in order: `lock`, `arm`,
+    /// `disarm <id>`.
     fn lock_and_watch(host: &Host<'_>) -> Vec<String> {
         let lock = lock_cmd(&admin()).argv.join(" ");
         let arm = arm_cmd(&admin()).argv.join(" ");
@@ -2439,6 +2451,7 @@ mod tests {
     }
 
     /// `screen` of the FDA step with `host` and `sys` and the viewer `opener`: what it returned
+    /// and every line it said.
     fn screen_with(
         host: &Host<'_>,
         sys: &Fake,
@@ -2616,6 +2629,7 @@ mod tests {
     }
 
     /// `n` pane opens that do not run, then one that does: a gap of `2n` s between the
+    /// re-probe before them and the open that ran.
     fn opens_after(host: &Host<'_>, n: usize) {
         let mut script: Vec<Result<Ran, String>> = (0..n).map(|_| not_answered()).collect();
         script.push(Ok(Ran::ok("")));
@@ -2883,6 +2897,7 @@ mod tests {
     }
 
     /// The actual request wrapper keeps a previously acknowledged arm through a failed
+    /// replacement, then retires it only after a later request acknowledges the new one.
     #[test]
     fn a_replacement_watch_is_acknowledged_before_the_previous_arm_is_retired() {
         let ordinary = Host::default();

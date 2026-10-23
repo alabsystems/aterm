@@ -57,6 +57,148 @@ impl GlPresentBufs {
     }
 }
 
+/// What a window's post composed beyond the frame's own texels: the blit
+/// that placed the frame on the stand-in, the sizes, and what drew over the
+/// frame. Two posts with the same blit and sizes differ only where the
+/// frame's texels, the effects or the crown did ([`post_damage`]).
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    all(wgpu_arm, not(test)),
+    expect(
+        dead_code,
+        reason = "read by `post_damage`: a build with wgpu posts windows on wgpu"
+    )
+)]
+pub(crate) struct GlPosted {
+    /// The blit's uniform: placement (`content_off`), crop, invert, overlay,
+    /// bands.
+    blit: BlitUniform,
+    /// The frame's size, and the destination's.
+    frame: (u32, u32),
+    dest: (u32, u32),
+    /// What the effects drew over the present copy the blit sampled, frame
+    /// pixels: `Some([0; 4])` nothing (the blit sampled the clean
+    /// offscreen), `None` unbounded.
+    fx: Option<[u32; 4]>,
+    /// The crown's scissor in the blit pass, destination pixels; `[0; 4]`
+    /// where no crown drew.
+    crown: [u32; 4],
+}
+
+/// The stand-in's damage for a post that composed `now` after one that
+/// composed `last`, the offscreen written meanwhile over `dirty`
+/// (`WindowGpu::offscreen_dirty_since_post`): `[x0, y0, x1, y1]` in
+/// destination pixels, or `None` for all of it. All of it where nothing was
+/// posted or the blit or a size moved; otherwise what changed in the frame
+/// (`dirty`, with the effects over the copy at the last post and at this
+/// one) carried through the blit, with both crowns.
+#[cfg_attr(
+    all(wgpu_arm, not(test)),
+    expect(dead_code, reason = "a build with wgpu posts windows on wgpu")
+)]
+fn post_damage(
+    last: Option<&GlPosted>,
+    now: &GlPosted,
+    dirty: Option<[u32; 4]>,
+) -> Option<[u32; 4]> {
+    let last = last?;
+    // Compared as bytes, so a NaN in the uniform is a change too.
+    let same_blit = aterm_bits::bytes_of(&last.blit) == aterm_bits::bytes_of(&now.blit);
+    if !same_blit || last.frame != now.frame || last.dest != now.dest {
+        return None;
+    }
+    let changed = union_rect_opt(union_rect_opt(dirty, last.fx, now.frame), now.fx, now.frame)?;
+    let placed = blit_footprint(&now.blit, changed, now.dest);
+    union_rect_opt(
+        union_rect_opt(Some(placed), Some(last.crown), now.dest),
+        Some(now.crown),
+        now.dest,
+    )
+}
+
+/// Where a change to `rect` of the frame (frame pixels, half-open) shows on
+/// a `dw` x `dh` destination through `blit` (`fs_blit`): frame texel `p` is
+/// the destination pixel whose centre less `content_off` floors to it, inside
+/// `floor` and `ceil` of `rect + content_off`; beside a host-chrome row the
+/// bands repeat the frame's edge texels, so with chrome the change reaches
+/// the whole width. A placement that is not a number reaches everything.
+#[cfg_attr(
+    all(wgpu_arm, not(test)),
+    expect(dead_code, reason = "a build with wgpu posts windows on wgpu")
+)]
+fn blit_footprint(
+    blit: &BlitUniform,
+    [x0, y0, x1, y1]: [u32; 4],
+    (dw, dh): (u32, u32),
+) -> [u32; 4] {
+    let [ox, oy] = blit.content_off;
+    if !ox.is_finite() || !oy.is_finite() {
+        return [0, 0, dw, dh];
+    }
+    if x0 >= x1 || y0 >= y1 {
+        return [0, 0, 0, 0];
+    }
+    let place = |v: u32, o: f32, max: u32, round: fn(f64) -> f64| {
+        round(f64::from(v) + f64::from(o)).clamp(0.0, f64::from(max)) as u32
+    };
+    let (dx0, dx1) = if blit.chrome_y1 > 0.0 {
+        (0, dw)
+    } else {
+        (place(x0, ox, dw, f64::floor), place(x1, ox, dw, f64::ceil))
+    };
+    [
+        dx0,
+        place(y0, oy, dh, f64::floor),
+        dx1,
+        place(y1, oy, dh, f64::ceil),
+    ]
+}
+
+/// What the crown's glow `quads` (frame pixels) cover on the destination:
+/// their bounding box at `content_off` (`vs_hdr_glow` draws each quad at its
+/// rect plus the placement), inside the pass's `(x, y, w, h)` scissor;
+/// `[0; 4]` where they cover nothing. A placement that is not a number
+/// covers the whole scissor.
+fn crown_footprint(
+    quads: &[GlowInstance],
+    [ox, oy]: [f32; 2],
+    (x, y, w, h): (u32, u32, u32, u32),
+) -> [u32; 4] {
+    let scissor = [x, y, x.saturating_add(w), y.saturating_add(h)];
+    if !ox.is_finite() || !oy.is_finite() {
+        return scissor;
+    }
+    let Some([x0, y0, x1, y1]) = quads
+        .iter()
+        .map(|q| q.rect.map(u32::from))
+        .filter(|[_, _, qw, qh]| *qw > 0 && *qh > 0)
+        .map(|[qx, qy, qw, qh]| [qx, qy, qx + qw, qy + qh])
+        .reduce(|a, b| {
+            [
+                a[0].min(b[0]),
+                a[1].min(b[1]),
+                a[2].max(b[2]),
+                a[3].max(b[3]),
+            ]
+        })
+    else {
+        return [0, 0, 0, 0];
+    };
+    let place =
+        |v: u32, o: f32, round: fn(f64) -> f64| round(f64::from(v) + f64::from(o)).max(0.0) as u32;
+    let r = [
+        place(x0, ox, f64::floor).max(scissor[0]),
+        place(y0, oy, f64::floor).max(scissor[1]),
+        place(x1, ox, f64::ceil).min(scissor[2]),
+        place(y1, oy, f64::ceil).min(scissor[3]),
+    ];
+    if r[0] < r[2] && r[1] < r[3] {
+        r
+    } else {
+        [0, 0, 0, 0]
+    }
+}
+
 /// Write `bytes` into an instance stream, growing it geometrically.
 fn upload_glow(
     live: &GlArmLive,
@@ -102,7 +244,9 @@ pub(crate) enum GlDest<'a> {
 impl GpuRenderer {
     /// The GL present body after the frame's encode: compose, effects, card,
     /// blit and crown into `dest` at its size, then the taps' copies. Returns
-    /// whether the present copy was composed (the readback helper samples it).
+    /// whether the present copy was composed (the readback helper samples it)
+    /// and what the compose put on `dest` beyond the frame's texels (a
+    /// window's post reads its damage off it, [`post_damage`]).
     /// `Err` names the failure; the trackers stay conservative.
     #[allow(
         clippy::too_many_arguments,
@@ -120,7 +264,7 @@ impl GpuRenderer {
         (fw, fh): (u32, u32),
         dest: GlDest<'_>,
         translucent: bool,
-    ) -> Result<bool, String> {
+    ) -> Result<(bool, GlPosted), String> {
         let virtual_dims = win.gl_virtual_off.as_ref().map(|t| (t.width, t.height));
         let (dw, dh) = match &dest {
             GlDest::Texture(t) => (t.width, t.height),
@@ -535,6 +679,7 @@ impl GpuRenderer {
         }
         // 5. The blit pass: clear to the live background, the letterbox blit
         //    over the whole destination, then the crown in the same pass.
+        let mut crown_drawn = [0, 0, 0, 0];
         {
             let binds = Pipeline::Blit.spec().binds;
             let clear = crate::device_layer::ClearColor4 {
@@ -558,6 +703,11 @@ impl GpuRenderer {
                 && let Some(scissor) = crown_scissor
                 && let Some((stream, _)) = bufs.crown_stream.as_ref()
             {
+                crown_drawn = crown_footprint(
+                    &self.bloom_glow_scratch[..crown_count as usize],
+                    want.content_off,
+                    scissor,
+                );
                 let crown_binds = Pipeline::SdrGlow.spec().binds;
                 pass.bind_uniform(
                     &bufs.crown,
@@ -574,8 +724,8 @@ impl GpuRenderer {
         frame.submit()?;
         // Bookkeeping after the encode: the copy now differs from the
         // offscreen only where this present wrote over it.
+        let mut fx: Option<[u32; 4]> = Some([0, 0, 0, 0]);
         if use_present_off {
-            let mut fx: Option<[u32; 4]> = Some([0, 0, 0, 0]);
             fx = union_rect_opt(fx, bloom_scissor, (fw, fh));
             if let Some(region) = shimmer_region.as_ref() {
                 fx = union_rect_opt(
@@ -590,6 +740,13 @@ impl GpuRenderer {
             win.offscreen_dirty_since_sync = Some([0, 0, 0, 0]);
             win.present_offscreen_fx = fx;
         }
+        let posted = GlPosted {
+            blit: want,
+            frame: (fw, fh),
+            dest: (dw, dh),
+            fx,
+            crown: crown_drawn,
+        };
         // The taps read the drawn destination back now.
         if win.video.is_some() || win.presented_snapshot.is_some() {
             let capture_color_space = win.capture_color_space();
@@ -618,7 +775,7 @@ impl GpuRenderer {
                 );
             }
         }
-        Ok(use_present_off)
+        Ok((use_present_off, posted))
     }
 
     /// The armed headless present: encode on GL, compose into the resident
@@ -750,7 +907,7 @@ impl GpuRenderer {
             false,
         )?;
         let live = self.gl_arm.as_ref().ok_or("the GL arm is not live")?;
-        let tex = if composed {
+        let tex = if composed.0 {
             win.gl_present_off.as_ref().ok_or("no present copy")?
         } else {
             &win.gl_offscreen.as_ref().ok_or("no GL offscreen")?.tex
@@ -795,6 +952,7 @@ impl GpuRenderer {
         target: W,
         width: u32,
         height: u32,
+        sink: Option<Box<dyn crate::FrameSink>>,
     ) -> Result<GpuSurface, String> {
         use crate::gl::device::WindowSystem;
         use crate::gl::surface::{GlWindowSurface, NativeWindow};
@@ -838,7 +996,10 @@ impl GpuRenderer {
         let width = self.clamp_fb_dim(width.max(1));
         let height = self.clamp_fb_dim(height.max(1));
         let live = self.gl_arm.as_ref().expect("gl_arm_ready above");
-        let gs = GlWindowSurface::create(&live.dev, native, width, height, Box::new(target))?;
+        // The frontend's presenter posts the window where a window surface
+        // would stall the window system (`gl::surface`'s module header).
+        let sink = sink.filter(|_| crate::gl::surface::readback_wanted_on(&live.dev));
+        let gs = GlWindowSurface::create(&live.dev, native, width, height, Box::new(target), sink)?;
         if crate::verbose() {
             crate::stderr_line!(
                 "aterm-gpu: GL window surface, swap interval {}",
@@ -924,7 +1085,7 @@ impl GpuRenderer {
         // Translucency follows the opacity knob where the surface composites
         // non-opaque content (`post_mult`, false on every GL surface today).
         let translucent = self.cpu.background_opacity() < 1.0 && surf.post_mult;
-        let composed = (|| -> Result<(), String> {
+        let composed = (|| -> Result<GlPosted, String> {
             let live = self.gl_arm.as_ref().ok_or("the GL arm is not live")?;
             let standin = gs.standin(&live.dev)?;
             self.gl_compose_present(
@@ -938,18 +1099,32 @@ impl GpuRenderer {
                 GlDest::Texture(standin),
                 translucent,
             )
-            .map(|_| ())
+            .map(|(_, posted)| posted)
         })();
-        if let Err(e) = composed {
-            gl_arm_note(&format!("armed present dropped: the compose failed ({e})"));
-            return Err(SurfacePresentFailure::Validation);
-        }
+        let composed = match composed {
+            Ok(posted) => posted,
+            Err(e) => {
+                gl_arm_note(&format!("armed present dropped: the compose failed ({e})"));
+                return Err(SurfacePresentFailure::Validation);
+            }
+        };
         win.last_present_work_ns =
             u64::try_from(work_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         win.last_present_encode_ns = win.last_present_work_ns;
         let live = self.gl_arm.as_ref().expect("checked above");
         let fill = frame_live_bg(input, self.theme.bg);
-        let posted = win.measure_surface_acquire(|| gs.present(&live.dev, fill));
+        let damage = post_damage(
+            win.gl_posted.as_ref(),
+            &composed,
+            win.offscreen_dirty_since_post,
+        );
+        let posted = win.measure_surface_acquire(|| gs.present(&live.dev, fill, damage));
+        // A refused post leaves the window holding an unknown part of it: the
+        // next is whole.
+        win.gl_posted = posted.is_ok().then_some(composed);
+        if posted.is_ok() {
+            win.offscreen_dirty_since_post = Some([0, 0, 0, 0]);
+        }
         posted.map_err(|e| {
             gl_arm_note(&format!("armed present: the post failed ({e})"));
             e.kind
@@ -965,5 +1140,147 @@ impl GpuRenderer {
             Some(e) => format!("the GL renderer could not start: {e}"),
             None => "the GL renderer could not start".to_owned(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A post of an 800 x 600 frame onto a stand-in of `dest`, placed at
+    /// `content_off`, nothing drawn over it.
+    fn posted(content_off: [f32; 2], dest: (u32, u32)) -> GlPosted {
+        let mut blit = BlitUniform::bell(false);
+        blit.dims = [800.0, 600.0];
+        blit.content_off = content_off;
+        GlPosted {
+            blit,
+            frame: (800, 600),
+            dest,
+            fx: Some([0, 0, 0, 0]),
+            crown: [0, 0, 0, 0],
+        }
+    }
+
+    /// The crown covers its glow quads' bounding box at the blit's placement,
+    /// inside its scissor, not the whole scissor.
+    #[test]
+    fn the_crown_covers_its_quads_not_its_scissor() {
+        let quad = |x, y, w, h| GlowInstance {
+            rect: [x, y, w, h],
+            color: [255; 4],
+            color2: [255; 4],
+        };
+        let scissor = (0, 0, 800, 600);
+        let quads = [
+            quad(100, 40, 20, 30),
+            quad(300, 50, 10, 0),
+            quad(90, 60, 5, 40),
+        ];
+        assert_eq!(
+            crown_footprint(&quads, [0.0, 0.0], scissor),
+            [90, 40, 120, 100],
+            "the box of the quads that draw (an empty one draws nothing)"
+        );
+        assert_eq!(
+            crown_footprint(&quads, [3.0, -50.0], scissor),
+            [93, 0, 123, 50],
+            "placed by content_off, clipped to the scissor"
+        );
+        assert_eq!(
+            crown_footprint(&quads, [0.5, 0.0], (0, 0, 100, 600)),
+            [90, 40, 100, 100],
+            "a fractional placement covers both pixels, inside the scissor"
+        );
+        assert_eq!(crown_footprint(&[], [0.0, 0.0], scissor), [0, 0, 0, 0]);
+        assert_eq!(
+            crown_footprint(&quads, [f32::NAN, 0.0], scissor),
+            [0, 0, 800, 600],
+            "an unplaceable crown covers its scissor"
+        );
+    }
+
+    /// A post sends what changed since the last one and no more: the
+    /// offscreen rows written, moved by the blit's placement, widened to the
+    /// whole width by host chrome (whose bands repeat the frame's edge), with
+    /// the effects and crowns of both posts; and everything where there was
+    /// no last post, the blit or a size moved, or the offscreen's change is
+    /// unknown.
+    #[test]
+    fn a_post_s_damage_is_what_changed_since_the_last() {
+        let row = Some([0, 40, 800, 70]);
+        let fit = posted([0.0, 0.0], (800, 600));
+        assert_eq!(
+            post_damage(None, &fit, row),
+            None,
+            "the first post is whole"
+        );
+        assert_eq!(post_damage(Some(&fit), &fit, row), Some([0, 40, 800, 70]));
+        assert_eq!(
+            post_damage(Some(&fit), &fit, Some([0, 0, 0, 0])),
+            Some([0, 0, 0, 0]),
+            "nothing written, nothing posted"
+        );
+        assert_eq!(
+            post_damage(Some(&fit), &fit, None),
+            None,
+            "unknown is whole"
+        );
+
+        let placed = posted([3.0, 5.0], (806, 610));
+        assert_eq!(
+            post_damage(Some(&placed), &placed, row),
+            Some([3, 45, 803, 75]),
+            "frame pixels land at the blit's placement"
+        );
+        let half = posted([2.5, 0.5], (806, 610));
+        assert_eq!(
+            post_damage(Some(&half), &half, row),
+            Some([2, 40, 803, 71]),
+            "a fractional placement covers both pixels a texel can reach"
+        );
+        let mut chrome = placed;
+        chrome.blit.chrome_y1 = 30.0;
+        assert_eq!(
+            post_damage(Some(&chrome), &chrome, row),
+            Some([0, 45, 806, 75]),
+            "beside chrome the bands repeat the frame's edge: the whole width"
+        );
+
+        let mut flash = fit;
+        flash.blit.flag = 1;
+        assert_eq!(
+            post_damage(Some(&fit), &flash, row),
+            None,
+            "a new blit is whole"
+        );
+        assert_eq!(
+            post_damage(Some(&fit), &posted([0.0, 0.0], (801, 600)), row),
+            None,
+            "a new size is whole"
+        );
+
+        let mut halo = fit;
+        halo.fx = Some([100, 300, 200, 400]);
+        assert_eq!(
+            post_damage(Some(&halo), &fit, row),
+            Some([0, 40, 800, 400]),
+            "an effect gone since the last post is damage"
+        );
+        assert_eq!(
+            post_damage(Some(&fit), &halo, row),
+            Some([0, 40, 800, 400]),
+            "an effect drawn now is damage"
+        );
+        let mut unbounded = fit;
+        unbounded.fx = None;
+        assert_eq!(post_damage(Some(&unbounded), &fit, row), None);
+        let mut crowned = fit;
+        crowned.crown = [10, 500, 20, 520];
+        assert_eq!(
+            post_damage(Some(&crowned), &fit, row),
+            Some([0, 40, 800, 520]),
+            "a crown gone since the last post is damage"
+        );
     }
 }
